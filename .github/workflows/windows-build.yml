@@ -262,8 +262,8 @@ jobs:
           #   하나다 — tauri.windows.conf.json 의 nsis.installMode=currentUser + productName=cys
           #   ⇒ %LOCALAPPDATA%\cys (docs/WINDOWS-UPGRADE-ATOMICITY-CHECKLIST.md:352 와 같은 경로).
           # ★그리고 '방금 그 설치인가'를 동일성 표식으로 못 박는다: NSIS 훅은 **모든 게이트를
-          #   통과한 뒤에만** cys-installed-version.txt 에 ${VERSION} 을 쓴다(nsis-hooks.nsh:784
-          #   cys_post_ok). 그 값이 이번 빌드 버전과 같아야 이 트리가 이번 산출물이다
+          #   통과한 뒤에만** cys-installed-version.txt 에 ${VERSION} 을 쓴다(nsis-hooks.nsh
+          #   label cys_post_ok). 그 값이 이번 빌드 버전과 같아야 이 트리가 이번 산출물이다
           #   (T4-15b 의 $markerOk 선례 · :826). 어긋나면 진단을 찍고 죽는다 — 조용히 넘어가지 않는다.
           $expVer = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
           if (-not $expVer) { throw 'tauri.conf.json version 파싱 실패' }

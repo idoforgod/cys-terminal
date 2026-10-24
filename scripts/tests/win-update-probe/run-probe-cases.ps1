@@ -16,6 +16,8 @@
 #   T2  previous public release installed + its daemon running, policy, new setup.exe /S /UPDATE
 #                                                                                     -> exit 6, installer-owned files and
 #       the uninstall registry key unchanged, daemon pid alive and answering, record names cysd, no probe folder (B7a, B8)
+#   T2-RO the T2 record made read-only, same /S /UPDATE                              -> exit 6, read-only record unchanged,
+#       a %TEMP%\cys-blocked-<tick>.txt record of this attempt ending in record:end + handoff line (B1-F4 fallback)
 #   CTL policy removed: the same /S /UPDATE installs (exit 0, new marker, daemon alive, stale record removed), and a first
 #       install into a fresh folder installs (exit 0)  - the must-differ controls
 #
@@ -242,6 +244,27 @@ try {
         Check 'T2-daemon-alive' ($alive -and $up.code -eq 0) ('pid {0} alive={1} list code={2}' -f $daemonPid, $alive, $up.code)
         Check 'T2-record' (($l -contains ('kept-version:' + $kept)) -and ($l -contains 'handoff:not-needed') -and ($l -contains 'cleanup:ok') -and (@($l | Where-Object { $_ -like 'blocked:*cysd*' }).Count -eq 1)) ($l -join ' | ')
         Check 'T2-no-probe-folder' ((Probe-Dirs $Inst).Count -eq 0) ('left: {0}' -f ((Probe-Dirs $Inst) -join ','))
+
+        # ── T2-RO (B1-F4): the earlier record is read-only -> the refusal still persists a record of THIS
+        #    attempt under a fresh %TEMP% name, and the read-only one is left byte-identical ──
+        $recPath = Join-Path $Inst 'cys-update-blocked.txt'
+        if (Test-Path -LiteralPath $recPath) {
+            $roHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $recPath).Hash
+            Set-ItemProperty -LiteralPath $recPath -Name IsReadOnly -Value $true
+            $t0 = Get-Date
+            $r = Invoke-Exe $Setup '/S /UPDATE' 600
+            $fb = @(Get-ChildItem -LiteralPath $env:TEMP -Filter 'cys-blocked-*.txt' -ErrorAction SilentlyContinue |
+                    Where-Object { $_.LastWriteTime -ge $t0 } | Sort-Object LastWriteTime -Descending)
+            $l = @()
+            if ($fb.Count -gt 0) { $l = Lines-Of (Read-Text $fb[0].FullName); Set-Content -LiteralPath (Join-Path $Ev 't2ro-record.txt') -Value ($l -join "`r`n") }
+            $same = (Get-FileHash -Algorithm SHA256 -LiteralPath $recPath).Hash -eq $roHash
+            Set-ItemProperty -LiteralPath $recPath -Name IsReadOnly -Value $false
+            Check 'T2RO-exit-6' ($r.code -eq 6) ('exit={0}' -f $r.code)
+            Check 'T2RO-readonly-record-untouched' $same 'cys-update-blocked.txt hash unchanged'
+            Check 'T2RO-fallback-record' (($fb.Count -ge 1) -and ($l -contains ('kept-version:' + $kept)) -and ($l -contains 'record:end') -and ($l -contains 'handoff:not-needed')) ('{0} :: {1}' -f ($fb | Select-Object -First 1 -ExpandProperty Name), ($l -join ' | '))
+        } else {
+            $script:Unmeasured.Add('T2-RO: no T2 record to make read-only')
+        }
     }
 } finally {
     if ($policy) {

@@ -473,9 +473,10 @@ Get-Process cys,cysd -ErrorAction SilentlyContinue | Stop-Process -Force
 | P12-b 인앱 업데이트 | 앱의 업데이트 버튼 | 거부 안내창 · 앱이 다시 열림(기록 `handoff:relaunched-ok`) · 세션 그대로 |
 | P12-c 마법사 업그레이드 | 인자 없이 `setup.exe` | Welcome 보다 **먼저** 거부 안내창 · 옛 언인스톨러 실행 0 · 아무것도 안 바뀜 |
 | P12-d 첫 설치 | cys 없는 PC 에서 `setup.exe /S` | exit **6** · `%LOCALAPPDATA%\cys` 없음 · `%TEMP%\cys-install-blocked.txt` 에 `kept-version:none` |
+| P12-e 기록 실패 | P12-a 뒤 `cys-update-blocked.txt` 를 읽기 전용으로 두고 같은 실행 | exit **6** · 읽기 전용 기록 그대로 · `%TEMP%\cys-blocked-<tick>.txt` 에 이번 시도의 기록(`kept-version:<직전 판>`·`record:end`·`handoff:not-needed`) · 어떤 기록도 못 남기면 안내창·콘솔에 `record-write-failed` 와 진단 전체 (`CYS_REC_WRITE`) |
 | 대조 | 정책을 지운 뒤 같은 실행 | 모두 정상 설치(exit 0) · `cys-update-blocked.txt` 남지 않음 |
 
-CI: `windows-build.yml` 의 `win-update-probe` 잡이 P12-a·P12-d·대조를 매 push 에 잰다. P12-b·P12-c
+CI: `windows-build.yml` 의 `win-update-probe` 잡이 P12-a·P12-d·P12-e·대조를 매 push 에 잰다. P12-b·P12-c
 (설계 T2-D·T2-U·T2-G·T2-P)는 안내창을 읽고 닫아야 해서 CI 에서 돌지 않는다 — 이 절이 그 몫이다.
 
 ---

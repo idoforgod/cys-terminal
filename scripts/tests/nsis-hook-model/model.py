@@ -107,11 +107,13 @@ EXPECTED_MACROS = {
     "CYS_FIRSTLINE", "CYS_DEL_RETRY", "CYS_PRIOR_SCAN", "CYS_PROBE_SWEEP_OLD",
     "CYS_PROBE_CLEAN", "CYS_FIND_GUI", "CYS_HANDOFF", "CYS_PROBE_REFUSE",
     "CYS_PROBE_LEAF", "CYS_PROBE_RUN",
+    # WP12 B1 r2 (codex r1 B1-F4): the refusal record is written and read back by these two
+    "CYS_REC_CHECK", "CYS_REC_WRITE",
 }
 # sha256 over the sorted census the mirrors depend on: anchors/tokens + the
 # normalized BODY hashes of the modeled macros/callbacks + POSTINSTALL order
 # (see hook_guard)
-GUARD_PIN = "7ad56c72b9ff3e8d919399b5bc1bd37947cd0d599d38c7d59a0ea1cafeb301fd"  # re-pinned 2026-10-24 for WP12 P1 (new P1 macros; PREINSTALL worker/probe; POSTINSTALL deletes a stale refusal record)
+GUARD_PIN = "24418d0df7117469da20ef95a2184ca1f5ca77a9aa14034d591f8544761d6e9d"  # re-pinned 2026-10-24 for WP12 B1 r2 (P1 bodies only: FIRSTLINE/PRIOR_SCAN/HANDOFF/PROBE_REFUSE, new REC_CHECK/REC_WRITE, PREINSTALL worker token lines removed; no mirrored body moved)
 
 
 def hook_path():
@@ -169,7 +171,7 @@ def p1_structure_check(text):
     if page is None or pre is None or refuse is None or leaf is None:
         return bad + ["a P1 body is missing (cys_probe_page / PREINSTALL / CYS_PROBE_REFUSE / CYS_PROBE_LEAF)"]
     for need in ('/CYSPROBE=', 'nsExec::ExecToStack /TIMEOUT=', '!insertmacro CYS_PROBE_REFUSE',
-                 'OpenMutexW', 'WaitForSingleObject', 'StrCpy $CysMutexHeld "1"'):
+                 'StrCpy $CysMutexHeld "1"'):
         if need not in page:
             bad.append("cys_probe_page lacks %r" % need)
     if not (0 <= page.find("SetErrorLevel 2") < page.find("CreateMutexW")) or \
@@ -222,10 +224,51 @@ def p1_structure_check(text):
     for forbidden in ("taskkill", "KillProcess", "TerminateProcess"):
         if forbidden in ho or forbidden in gui:
             bad.append("the hand-off kills a process: %r" % forbidden)
-    # R2-F2: the worker's liveness mutex and the name the parent checks are the same object
-    if 'CreateMutexW(p 0, i 1, w "Local\\cys$R0")' not in worker or \
-            'w "Local\\cys.cys-probe-$CysProbeTick"' not in page:
-        bad.append("worker liveness mutex and the parent's timeout check do not name the same object")
+    # B1-F1 (replaces the R2-F2 liveness mutex): nsExec returns only after the worker ended, so the
+    # parent decides on the worker's OUTCOME. Leaves count as ended (CONFIRMED=1) only after exit 0 +
+    # result=pass, or exit 6 + result=fail + all three statuses read; every other outcome reaches the
+    # CONFIRMED=0 clean. The retired token must not come back as evidence. (Behaviour: p1_exec.py.)
+    for gone in ("OpenMutexW", "WaitForSingleObject", 'w "Local\\cys'):
+        if gone in page or gone in worker:
+            bad.append("retired worker liveness token is back as termination evidence: %r" % gone)
+    cls = ['StrCmp $R2 "0" 0 cys_pp_c6', 'StrCmp $R5 "pass" cys_pp_classified cys_pp_unclassified',
+           'StrCmp $R2 "6" 0 cys_pp_unclassified', 'StrCmp $R5 "fail" 0 cys_pp_unclassified',
+           'StrCmp $CysPrCysd "missing" cys_pp_unclassified 0',
+           'StrCmp $CysPrCys "missing" cys_pp_unclassified 0',
+           'StrCmp $CysPrApp "missing" cys_pp_unclassified cys_pp_classified',
+           'cys_pp_classified:', '!insertmacro CYS_PROBE_CLEAN "$CysProbeDir" "1"',
+           'cys_pp_unclassified:', '!insertmacro CYS_PROBE_CLEAN "$CysProbeDir" "0"']
+    at = [page.find(x) for x in cls]
+    if -1 in at or at != sorted(at):
+        bad.append("cys_probe_page worker-outcome classification broken (B1-F1): %r" % list(zip(cls, at)))
+    # B1-F2: every process query of the hand-off is bounded, under one deadline, rc kept apart
+    for need in ("System::Call 'kernel32::GetTickCount()i.R8'", "IntCmp $R7 60000 ",
+                 "IntCmp $R7 95000 ", 'StrCmp $R6 "0" 0 cys_ho_qfail_${TAG}',
+                 'StrCpy $CysHandoff "initiator-unknown"'):
+        if need not in ho:
+            bad.append("CYS_HANDOFF lacks %r (B1-F2 bound / query status)" % need)
+    n_exec = ho.count("nsExec::")
+    if n_exec != 1 or ho.count("nsExec::ExecToStack /TIMEOUT=5000 ") != 1:
+        bad.append("CYS_HANDOFF: every nsExec call must carry /TIMEOUT=5000 (%d calls)" % n_exec)
+    # B1-F3: CYS_FIRSTLINE refuses its scratch register as IN/OUT, and no caller passes it
+    fl = _body(text, "macro", "CYS_FIRSTLINE") or ""
+    for need in ('!if "${IN}" == "$R9"', '!if "${OUT}" == "$R9"'):
+        if need not in fl:
+            bad.append("CYS_FIRSTLINE lacks the aliasing guard %r (B1-F3)" % need)
+    if re.search(r"CYS_FIRSTLINE\s+\$R9\b|CYS_FIRSTLINE\s+\S+\s+\$R9\b", text):
+        bad.append("a CYS_FIRSTLINE call passes $R9 (B1-F3)")
+    # B1-F4: the record is written only through CYS_REC_WRITE (checked writes + read-back), and the
+    # dialogs name it only through $CysDetails
+    rw = _body(text, "macro", "CYS_REC_WRITE") or ""
+    if re.search(r'FileOpen \S+ "\$CysRecord" w|FileOpen \S+ "[^"]*blocked[^"]*" w', refuse):
+        bad.append("CYS_PROBE_REFUSE opens a record for writing itself instead of CYS_REC_WRITE (B1-F4)")
+    if refuse.count("!insertmacro CYS_REC_WRITE") != 3 or "IfErrors" not in rw or \
+            "!insertmacro CYS_REC_CHECK" not in rw or rw.find("IfErrors cys_rw_wfail_") < rw.rfind("FileWrite"):
+        bad.append("CYS_REC_WRITE must check the open, every write and a read-back; REFUSE calls it 3x (B1-F4)")
+    mbs = [l.strip() for l in refuse.splitlines() if l.strip().startswith("MessageBox")]
+    if len(mbs) != 3 or any("$CysRecord" in l for l in mbs) or \
+            not all(l.endswith('$CysDetails"') for l in mbs):
+        bad.append("the refusal dialogs must name the record only through $CysDetails (B1-F4)")
     # every P1 Var is used somewhere besides its declaration
     for v in re.findall(r"(?m)^Var\s+(Cys\w+)", text):
         if len(re.findall(r"\$%s\b" % v, text)) < 1:

@@ -576,12 +576,18 @@ FunctionEnd
 ;              own .cys-probe-* folder); (b) silent mode (no pages run) probes inline, before the
 ;              GUI kill and before the template's File lines.
 ;  Probe = extract the three new binaries into $INSTDIR\.cys-probe-<tick> and run each with a
-;  30 s bound: cysd.exe --version must print exactly "cysd V (build ID)" (ID non-empty, no space,
+;  30 s no-output bound: cysd.exe --version must print exactly "cysd V (build ID)" (ID non-empty, no space,
 ;  no ')'), cys.exe --version exactly "cys V", cys-app.exe --cys-probe <file> must write exactly
 ;  "cys-app V" (exit 0 alone never passes). V = this installer's version.
-;  Termination is confirmed, never assumed (R2-F2): a timed-out leaf must become deletable (a
-;  running image cannot be deleted); a timed-out worker must have released its liveness mutex.
-;  Unconfirmed = "cleanup-unconfirmed" in the record, and the install never proceeds.
+;  Termination is confirmed, never assumed (R2-F2 + B1-F1). nsExec returns only after the process it
+;  started has ended: it waits on its own process handle, and after a timeout it calls
+;  TerminateProcess and keeps waiting (Contrib/nsExec/nsexec.c - the same loop in the shipped NSIS
+;  3.11 and in 3.13). /TIMEOUT there is time WITHOUT OUTPUT, not elapsed time: our leaves print one
+;  line and exit, the worker prints nothing. So the worker is gone whenever nsExec returns; a LEAF is
+;  proven ended only when the worker classified it (worker exit 0 with result=pass, or exit 6 with
+;  result=fail and all three statuses) or when its image could be deleted (a running image cannot
+;  be). Unconfirmed = "cleanup-unconfirmed" in the record, the folder stays, and the install never
+;  proceeds.
 ;  Nothing here kills a process by name. Hand-off after a refused in-app update (R2-F1): wait
 ;  (bounded) for the old app to exit, relaunch it, and report relaunched-ok only when a visible
 ;  top-level window belongs to a process whose image path is $INSTDIR\cys-app.exe, twice 5 s apart.
@@ -600,10 +606,22 @@ Var CysKept        ; kept version: marker content | unknown | none
 Var CysKeptShow
 Var CysNewVer
 Var CysRecord
-Var CysHandoff     ; not-needed | relaunched-ok | initiator-did-not-exit | relaunch-not-running
+Var CysHandoff     ; not-needed | relaunched-ok | initiator-did-not-exit | initiator-unknown |
+                   ;   relaunch-not-running
+Var CysHoN         ; hand-off iteration belt (B1-F2: the deadline is the bound, this only ends a stuck clock)
+Var CysRecErr      ; "" or record failures: open-failed:<p> write-failed:<p> not-persisted:<p>
+                   ;   handoff-line-not-written:<p> (B1-F4)
+Var CysDetails     ; dialog "Details": the record path, or the complete diagnostic when none was saved
 
-; first line of IN (cut at CR or LF) -> OUT. Uses $R9.
+; first line of IN (cut at CR or LF) -> OUT. Uses $R9 as scratch, so neither IN nor OUT may be $R9
+; (B1-F3: with $R9 as IN and OUT the position overwrote the text and every marker read as empty).
 !macro CYS_FIRSTLINE IN OUT TAG
+  !if "${IN}" == "$R9"
+    !error "cys: CYS_FIRSTLINE IN must not be $R9 (its scratch register)"
+  !endif
+  !if "${OUT}" == "$R9"
+    !error "cys: CYS_FIRSTLINE OUT must not be $R9 (its scratch register)"
+  !endif
   StrCpy ${OUT} ${IN}
   ${StrLoc} $R9 ${OUT} "$\r" ">"
   StrCmp $R9 "" cys_fl_lf_${TAG} 0
@@ -633,7 +651,7 @@ cys_dr_fail_${TAG}:
 cys_dr_end_${TAG}:
 !macroend
 
-; $CysPrior / $CysKept / $CysKeptShow from the current $INSTDIR (G2-4). Uses $R8 $R9.
+; $CysPrior / $CysKept / $CysKeptShow from the current $INSTDIR (G2-4). Uses $R7 $R8 $R9.
 !macro CYS_PRIOR_SCAN TAG
   StrCpy $CysPrior "0"
   StrCpy $CysKept "none"
@@ -645,11 +663,11 @@ cys_ps_yes_${TAG}:
   ClearErrors
   FileOpen $R8 "$INSTDIR\cys-installed-version.txt" r
   IfErrors cys_ps_done_${TAG}
-  FileRead $R8 $R9
+  FileRead $R8 $R7
   FileClose $R8
-  !insertmacro CYS_FIRSTLINE $R9 $R9 "ps${TAG}"
-  StrCmp $R9 "" cys_ps_done_${TAG} 0
-  StrCpy $CysKept $R9
+  !insertmacro CYS_FIRSTLINE $R7 $R7 "ps${TAG}"
+  StrCmp $R7 "" cys_ps_done_${TAG} 0
+  StrCpy $CysKept $R7
 cys_ps_done_${TAG}:
   ClearErrors
   StrCpy $CysKeptShow "v$CysKept"
@@ -672,10 +690,11 @@ cys_pso_end_${TAG}:
   ClearErrors
 !macroend
 
-; probe dir cleanup (F6 + R2-F2). CONFIRMED=1: every leaf is known to have exited (nsExec saw
-; it end, or a timed-out leaf's image was deleted) -> a deletion failure is probe-dir-left.
-; CONFIRMED=0 (the worker itself timed out): a leaf image that cannot be deleted may still run
-; -> cleanup-unconfirmed. Uses $R7.
+; probe dir cleanup (F6 + R2-F2 + B1-F1). CONFIRMED=1: every leaf is known to have ended (the
+; prober classified each one: nsExec saw it end, or a timed-out leaf's image was deleted) -> a
+; deletion failure is probe-dir-left. CONFIRMED=0 (the worker's outcome does not classify every
+; leaf: timeout, crash, any other exit code, an incomplete result file): a leaf image that cannot
+; be deleted may still run -> cleanup-unconfirmed, and the folder stays. Uses $R7.
 !macro CYS_PROBE_CLEAN DIR CONFIRMED TAG
   StrCpy $CysCleanup "ok"
   !insertmacro CYS_DEL_RETRY "${DIR}\cysd.exe" "${TAG}1"
@@ -735,30 +754,54 @@ cys_fg_end_${TAG}:
 !macroend
 
 ; refused in-app update: bring the kept version back and prove it (F2 + R2-F1). Name-only
-; observation of the initiator; nothing is killed. Uses $R0-$R8.
+; observation of the initiator; nothing is killed. B1-F2: ONE monotonic deadline covers the whole
+; hand-off - GetTickCount at the start, elapsed = now - start in 32-bit arithmetic (correct across
+; the 49.7-day wrap while elapsed < 24.8 days). Every tasklist call carries /TIMEOUT=5000 (nsExec
+; ends it after 5 s without output and returns only once it has ended). A query whose exit code is
+; not 0 is UNKNOWN, never "gone" - its status is kept apart from the text search. The initiator
+; wait stops at 60 s (last query unknown -> initiator-unknown, no relaunch), the window search at
+; 95 s, then one 5 s re-check: the hand-off ends within about 100 s plus one tasklist call (its
+; output time plus at most 5 s without output). $CysHoN only ends a loop whose clock never moves.
+; Uses $R0-$R8.
 !macro CYS_HANDOFF TAG
-  StrCpy $R8 0
+  System::Call 'kernel32::GetTickCount()i.R8'
+  StrCpy $R3 "none"
+  StrCpy $CysHoN 0
 cys_ho_wait_${TAG}:
-  nsExec::ExecToStack 'tasklist /FI "IMAGENAME eq cys-app.exe" /FO CSV /NH'
-  Pop $R7
+  System::Call 'kernel32::GetTickCount()i.R7'
+  IntOp $R7 $R7 - $R8
+  IntCmp $R7 60000 cys_ho_stuck_${TAG} 0 cys_ho_stuck_${TAG}
+  IntOp $CysHoN $CysHoN + 1
+  IntCmp $CysHoN 120 cys_ho_stuck_${TAG} 0 cys_ho_stuck_${TAG}
+  nsExec::ExecToStack /TIMEOUT=5000 'tasklist /FI "IMAGENAME eq cys-app.exe" /FO CSV /NH'
   Pop $R6
-  ${StrLoc} $R7 $R6 "cys-app.exe" ">"
-  StrCmp $R7 "" cys_ho_gone_${TAG} 0
-  IntOp $R8 $R8 + 1
-  IntCmp $R8 120 cys_ho_stuck_${TAG} 0 cys_ho_stuck_${TAG}
+  Pop $R5
+  StrCmp $R6 "0" 0 cys_ho_qfail_${TAG}
+  ${StrLoc} $R4 $R5 "cys-app.exe" ">"
+  StrCmp $R4 "" cys_ho_gone_${TAG} 0
+  StrCpy $R3 "running"
+  Goto cys_ho_next_${TAG}
+cys_ho_qfail_${TAG}:
+  StrCpy $R3 "unknown"
+cys_ho_next_${TAG}:
   Sleep 500
   Goto cys_ho_wait_${TAG}
 cys_ho_stuck_${TAG}:
   StrCpy $CysHandoff "initiator-did-not-exit"
+  StrCmp $R3 "running" cys_ho_end_${TAG} 0
+  StrCpy $CysHandoff "initiator-unknown"
   Goto cys_ho_end_${TAG}
 cys_ho_gone_${TAG}:
   Exec '"$INSTDIR\cys-app.exe"'
-  StrCpy $R8 0
+  StrCpy $CysHoN 0
 cys_ho_find_${TAG}:
   !insertmacro CYS_FIND_GUI "${TAG}f"
   StrCmp $R6 "1" cys_ho_seen_${TAG} 0
-  IntOp $R8 $R8 + 1
-  IntCmp $R8 30 cys_ho_nogui_${TAG} 0 cys_ho_nogui_${TAG}
+  System::Call 'kernel32::GetTickCount()i.R7'
+  IntOp $R7 $R7 - $R8
+  IntCmp $R7 95000 cys_ho_nogui_${TAG} 0 cys_ho_nogui_${TAG}
+  IntOp $CysHoN $CysHoN + 1
+  IntCmp $CysHoN 95 cys_ho_nogui_${TAG} 0 cys_ho_nogui_${TAG}
   Sleep 1000
   Goto cys_ho_find_${TAG}
 cys_ho_seen_${TAG}:
@@ -770,6 +813,72 @@ cys_ho_seen_${TAG}:
 cys_ho_nogui_${TAG}:
   StrCpy $CysHandoff "relaunch-not-running"
 cys_ho_end_${TAG}:
+!macroend
+
+; error flag set unless PATH reads back with the record header as its first line and LAST as its
+; last line (B1-F4: FileClose cannot report a failure - exehead's EW_FCLOSE ignores CloseHandle's
+; result - so persistence is proven by reading the file back). Uses $R5-$R8.
+!macro CYS_REC_CHECK PATH LAST TAG
+  ClearErrors
+  FileOpen $R8 "${PATH}" r
+  IfErrors cys_rc_bad_${TAG}
+  FileRead $R8 $R6
+  IfErrors cys_rc_badc_${TAG}
+  StrCpy $R5 $R6
+cys_rc_loop_${TAG}:
+  ClearErrors
+  FileRead $R8 $R7
+  IfErrors cys_rc_eof_${TAG}
+  StrCpy $R5 $R7
+  Goto cys_rc_loop_${TAG}
+cys_rc_eof_${TAG}:
+  FileClose $R8
+  StrCmpS $R6 "cys installer: new build refused by pre-swap run check (exit 6)$\r$\n" 0 cys_rc_bad_${TAG}
+  StrCmpS $R5 "${LAST}" 0 cys_rc_bad_${TAG}
+  ClearErrors
+  Goto cys_rc_end_${TAG}
+cys_rc_badc_${TAG}:
+  FileClose $R8
+cys_rc_bad_${TAG}:
+  SetErrors
+cys_rc_end_${TAG}:
+!macroend
+
+; write the refusal record to PATH (B1-F4): the open, every write (the error flag stays set after
+; any failed FileWrite) and a read-back are checked. The last line is the fixed ASCII "record:end",
+; so a path in the record that the ANSI code page cannot hold does not fail the read-back.
+; Success: $CysRecord = PATH. Failure: $CysRecord unchanged, the reason appended to $CysRecErr.
+; Uses $R5-$R8.
+!macro CYS_REC_WRITE PATH TAG
+  ClearErrors
+  FileOpen $R8 "${PATH}" w
+  IfErrors cys_rw_open_${TAG}
+  FileWrite $R8 "cys installer: new build refused by pre-swap run check (exit 6)$\r$\n"
+  FileWrite $R8 "blocked:$CysBlocked$\r$\n"
+  FileWrite $R8 "probe:cysd=$CysPrCysd$\r$\n"
+  FileWrite $R8 "probe:cys=$CysPrCys$\r$\n"
+  FileWrite $R8 "probe:cys-app=$CysPrApp$\r$\n"
+  FileWrite $R8 "new-version:$CysNewVer$\r$\n"
+  FileWrite $R8 "kept-version:$CysKept$\r$\n"
+  FileWrite $R8 "cleanup:$CysCleanup$\r$\n"
+  FileWrite $R8 "record:end$\r$\n"
+  IfErrors cys_rw_wfail_${TAG}
+  FileClose $R8
+  !insertmacro CYS_REC_CHECK "${PATH}" "record:end$\r$\n" "${TAG}v"
+  IfErrors cys_rw_vfail_${TAG}
+  StrCpy $CysRecord "${PATH}"
+  Goto cys_rw_end_${TAG}
+cys_rw_wfail_${TAG}:
+  FileClose $R8
+  StrCpy $CysRecErr "$CysRecErr write-failed:${PATH}"
+  Goto cys_rw_end_${TAG}
+cys_rw_vfail_${TAG}:
+  StrCpy $CysRecErr "$CysRecErr not-persisted:${PATH}"
+  Goto cys_rw_end_${TAG}
+cys_rw_open_${TAG}:
+  StrCpy $CysRecErr "$CysRecErr open-failed:${PATH}"
+cys_rw_end_${TAG}:
+  ClearErrors
 !macroend
 
 ; the one refusal path (F2 + G2-4): record, hand-off (in-app update only), message, exit 6.
@@ -785,23 +894,18 @@ cys_rf_b3_${TAG}:
   StrCmp $CysPrApp "pass" cys_rf_rec_${TAG} 0
   StrCpy $CysBlocked "$CysBlocked cys-app"
 cys_rf_rec_${TAG}:
-  StrCpy $CysRecord "$INSTDIR\cys-update-blocked.txt"
-  StrCmp $CysPrior "1" cys_rf_write_${TAG} 0
-  StrCpy $CysRecord "$TEMP\cys-install-blocked.txt"
+  StrCpy $CysRecord ""
+  StrCpy $CysRecErr ""
+  StrCmp $CysPrior "1" cys_rf_upd_${TAG} 0
   RMDir "$INSTDIR"
-cys_rf_write_${TAG}:
-  ClearErrors
-  FileOpen $R9 "$CysRecord" w
-  IfErrors cys_rf_norec_${TAG}
-  FileWrite $R9 "cys installer: new build refused by pre-swap run check (exit 6)$\r$\n"
-  FileWrite $R9 "blocked:$CysBlocked$\r$\n"
-  FileWrite $R9 "probe:cysd=$CysPrCysd$\r$\n"
-  FileWrite $R9 "probe:cys=$CysPrCys$\r$\n"
-  FileWrite $R9 "probe:cys-app=$CysPrApp$\r$\n"
-  FileWrite $R9 "new-version:$CysNewVer$\r$\n"
-  FileWrite $R9 "kept-version:$CysKept$\r$\n"
-  FileWrite $R9 "cleanup:$CysCleanup$\r$\n"
-  FileClose $R9
+  !insertmacro CYS_REC_WRITE "$TEMP\cys-install-blocked.txt" "${TAG}1"
+  Goto cys_rf_fb_${TAG}
+cys_rf_upd_${TAG}:
+  !insertmacro CYS_REC_WRITE "$INSTDIR\cys-update-blocked.txt" "${TAG}2"
+cys_rf_fb_${TAG}:
+  ; fallback under a fresh name, so a read-only or locked earlier record cannot block it
+  StrCmp $CysRecord "" 0 cys_rf_norec_${TAG}
+  !insertmacro CYS_REC_WRITE "$TEMP\cys-blocked-$CysProbeTick.txt" "${TAG}3"
 cys_rf_norec_${TAG}:
   ClearErrors
   StrCpy $CysHandoff "not-needed"
@@ -811,31 +915,52 @@ cys_rf_norec_${TAG}:
   IfErrors cys_rf_hdone_${TAG} 0
   !insertmacro CYS_HANDOFF "${TAG}"
 cys_rf_hdone_${TAG}:
+  StrCmp $CysRecord "" cys_rf_noapp_${TAG} 0
   ClearErrors
   FileOpen $R9 "$CysRecord" a
-  IfErrors cys_rf_noapp_${TAG}
+  IfErrors cys_rf_hfail_${TAG}
   FileSeek $R9 0 END
   FileWrite $R9 "handoff:$CysHandoff$\r$\n"
+  IfErrors cys_rf_hwfail_${TAG}
   FileClose $R9
+  !insertmacro CYS_REC_CHECK "$CysRecord" "handoff:$CysHandoff$\r$\n" "${TAG}h"
+  IfErrors cys_rf_hfail_${TAG} cys_rf_noapp_${TAG}
+cys_rf_hwfail_${TAG}:
+  FileClose $R9
+cys_rf_hfail_${TAG}:
+  StrCpy $CysRecErr "$CysRecErr handoff-line-not-written:$CysRecord"
 cys_rf_noapp_${TAG}:
   ClearErrors
-  DetailPrint "cys: new build refused by pre-swap run check - blocked:$CysBlocked  kept:$CysKept  handoff:$CysHandoff  cleanup:$CysCleanup"
+  ; one complete diagnostic for every channel; a record is named only if it was read back (B1-F4)
+  StrCpy $R0 "blocked:$CysBlocked  probe:cysd=$CysPrCysd probe:cys=$CysPrCys probe:cys-app=$CysPrApp  new-version:$CysNewVer  kept-version:$CysKept  handoff:$CysHandoff  cleanup:$CysCleanup"
+  StrCmp $CysRecord "" cys_rf_dnone_${TAG} 0
+  StrCpy $R1 "record:$CysRecord"
+  StrCpy $CysDetails "Details: $CysRecord"
+  StrCmp $CysRecErr "" cys_rf_dset_${TAG} 0
+  StrCpy $R1 "record:$CysRecord  record-problems:$CysRecErr"
+  StrCpy $CysDetails "Details: $CysRecord (incomplete:$CysRecErr)"
+  Goto cys_rf_dset_${TAG}
+cys_rf_dnone_${TAG}:
+  StrCpy $R1 "record:none  record-write-failed:$CysRecErr"
+  StrCpy $CysDetails "No record file could be saved (record-write-failed:$CysRecErr).$\r$\n$R0"
+cys_rf_dset_${TAG}:
+  DetailPrint "cys: new build refused by pre-swap run check - $R0  $R1"
   System::Call 'kernel32::AttachConsole(i -1)i.r0'
   StrCmp $0 0 cys_rf_nocon_${TAG} 0
   System::Call 'kernel32::GetStdHandle(i -11)i.r0'
-  FileWrite $0 "cys installer REFUSED (exit 6): the new build cannot run on this PC.  blocked:$CysBlocked  kept-version:$CysKept  handoff:$CysHandoff  cleanup:$CysCleanup  record:$CysRecord$\r$\n"
+  FileWrite $0 "cys installer REFUSED (exit 6): the new build cannot run on this PC.  $R0  $R1$\r$\n"
 cys_rf_nocon_${TAG}:
   IfSilent cys_rf_quit_${TAG} 0
   StrCmp $CysPrior "1" cys_rf_mbupd_${TAG} 0
-  MessageBox MB_ICONSTOP "cys was not installed.$\r$\n$\r$\nThe new version (v$CysNewVer) is blocked from running on this PC by a security policy (Smart App Control or similar).$\r$\nBlocked:$CysBlocked$\r$\n$\r$\nDetails: $CysRecord"
+  MessageBox MB_ICONSTOP "cys was not installed.$\r$\n$\r$\nThe new version (v$CysNewVer) is blocked from running on this PC by a security policy (Smart App Control or similar).$\r$\nBlocked:$CysBlocked$\r$\n$\r$\n$CysDetails"
   Goto cys_rf_quit_${TAG}
 cys_rf_mbupd_${TAG}:
   StrCmp $CysHandoff "relaunched-ok" cys_rf_mbok_${TAG} 0
   StrCmp $CysHandoff "not-needed" cys_rf_mbok_${TAG} 0
-  MessageBox MB_ICONSTOP "cys was not updated.$\r$\n$\r$\nThe new version (v$CysNewVer) is blocked from running on this PC by a security policy (Smart App Control or similar).$\r$\nYour current version ($CysKeptShow) is still installed and your terminal sessions are still running.$\r$\ncys could not be reopened automatically ($CysHandoff) - open cys from the Start menu.$\r$\nBlocked:$CysBlocked$\r$\n$\r$\nDetails: $CysRecord"
+  MessageBox MB_ICONSTOP "cys was not updated.$\r$\n$\r$\nThe new version (v$CysNewVer) is blocked from running on this PC by a security policy (Smart App Control or similar).$\r$\nYour current version ($CysKeptShow) is still installed and your terminal sessions are still running.$\r$\ncys could not be reopened automatically ($CysHandoff) - open cys from the Start menu.$\r$\nBlocked:$CysBlocked$\r$\n$\r$\n$CysDetails"
   Goto cys_rf_quit_${TAG}
 cys_rf_mbok_${TAG}:
-  MessageBox MB_ICONSTOP "cys was not updated.$\r$\n$\r$\nThe new version (v$CysNewVer) is blocked from running on this PC by a security policy (Smart App Control or similar).$\r$\nYour current version ($CysKeptShow) is still installed and your terminal sessions are still running.$\r$\nBlocked:$CysBlocked$\r$\n$\r$\nDetails: $CysRecord"
+  MessageBox MB_ICONSTOP "cys was not updated.$\r$\n$\r$\nThe new version (v$CysNewVer) is blocked from running on this PC by a security policy (Smart App Control or similar).$\r$\nYour current version ($CysKeptShow) is still installed and your terminal sessions are still running.$\r$\nBlocked:$CysBlocked$\r$\n$\r$\n$CysDetails"
 cys_rf_quit_${TAG}:
   SetErrorLevel 6
   Quit
@@ -1038,8 +1163,19 @@ cys_pp_readclose:
   FileClose $R4
 cys_pp_readdone:
   ClearErrors
-  StrCmp $R2 "timeout" cys_pp_timeout 0
-  ; the worker ended by itself, so its leaves ended inside it (each bounded and confirmed)
+  ; B1-F1: nsExec has returned, so the worker process has ended (see the header). Its leaves count
+  ; as ended only when the worker classified every one of them: exit 0 with result=pass, or exit 6
+  ; with result=fail and all three statuses read. Timeout, crash, any other exit code or an
+  ; incomplete result file -> CONFIRMED=0: each leaf image must be deletable before the folder goes.
+  StrCmp $R2 "0" 0 cys_pp_c6
+  StrCmp $R5 "pass" cys_pp_classified cys_pp_unclassified
+cys_pp_c6:
+  StrCmp $R2 "6" 0 cys_pp_unclassified
+  StrCmp $R5 "fail" 0 cys_pp_unclassified
+  StrCmp $CysPrCysd "missing" cys_pp_unclassified 0
+  StrCmp $CysPrCys "missing" cys_pp_unclassified 0
+  StrCmp $CysPrApp "missing" cys_pp_unclassified cys_pp_classified
+cys_pp_classified:
   !insertmacro CYS_PROBE_CLEAN "$CysProbeDir" "1" "ppc"
   StrCmp $R2 "0" 0 cys_pp_refuse
   StrCmp $R5 "pass" 0 cys_pp_refuse
@@ -1051,16 +1187,7 @@ cys_pp_passed:
   StrCpy $CysProbeDone "1"
 cys_pp_skip:
   Abort
-cys_pp_timeout:
-  ; R2-F2: the worker holds Local\cys.cys-probe-<tick> until it exits; still held = still alive
-  System::Call 'kernel32::OpenMutexW(i 0x00100000, i 0, w "Local\cys.cys-probe-$CysProbeTick") p .r1'
-  StrCmp $1 "0" cys_pp_to_gone 0
-  System::Call 'kernel32::WaitForSingleObject(p r1, i 5000) i .r2'
-  System::Call 'kernel32::CloseHandle(p r1)'
-  StrCmp $2 "258" 0 cys_pp_to_gone
-  StrCpy $CysCleanup "cleanup-unconfirmed"
-  Goto cys_pp_refuse
-cys_pp_to_gone:
+cys_pp_unclassified:
   ; the worker is gone, but a leaf it started may have been orphaned: unconfirmed unless deletable
   !insertmacro CYS_PROBE_CLEAN "$CysProbeDir" "0" "ppt"
 cys_pp_refuse:
@@ -1104,8 +1231,7 @@ FunctionEnd
   IntOp $R2 0 - $R2
   StrCpy $R3 "$INSTDIR" "" $R2
   StrCmp $R3 "\$R0" 0 cys_pre_badworker
-  ; liveness token for the parent's bounded-termination check (R2-F2) - held until this process exits
-  System::Call 'kernel32::CreateMutexW(p 0, i 1, w "Local\cys$R0") p .r0'
+  ; no liveness token (B1-F1): the parent's nsExec waits on this process's own handle
   !insertmacro CYS_PROBE_RUN "$INSTDIR" "${VERSION}" "pw"
   StrCmp $CysBlocked "" 0 cys_pre_workerno
   SetErrorLevel 0

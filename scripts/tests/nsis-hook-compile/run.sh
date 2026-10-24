@@ -28,6 +28,10 @@
 #        N6 checklist anchor pins — every hook anchor cited by
 #           docs/WINDOWS-UPGRADE-ATOMICITY-CHECKLIST.md exists in the hook, and raw ':NNN'
 #           hook line-number citations are refused (they rotted twice — R2/R3)
+#        N7 CYS_FIRSTLINE refuses $R9 (its scratch register) as IN or OUT (WP12 B1-F3);
+#           a non-aliased control must compile
+#   5. runs the P1 executor (../nsis-hook-exec/p1_exec.py): the REAL P1 macro text of the hook,
+#      executed by a small NSIS-subset interpreter against simulated Windows outcomes (WP12 B1-F1..F4)
 #
 # Env overrides:
 #   MAKENSIS            makensis binary (default: makensis on PATH)
@@ -164,6 +168,39 @@ else
   exit 1
 fi
 
+# N7 — CYS_FIRSTLINE scratch-register aliasing (WP12 B1-F3). The macro uses $R9 as scratch; a
+# caller passing $R9 as IN or OUT had its text overwritten by a position (every prior-version marker
+# read as empty -> kept-version:unknown). The macro must refuse that at compile time; a control with
+# a non-aliased register must still compile, so a refusal cannot come from the scaffold itself.
+n7_compile() { # $1=IN $2=OUT
+  { cat harness.nsi
+    printf '\nFunction cys_n7\n  !insertmacro CYS_FIRSTLINE %s %s "n7"\nFunctionEnd\n' "$1" "$2"
+    printf 'Section "n7"\n  Call cys_n7\nSectionEnd\n'; } > build/harness-n7.nsi
+  "$MAKENSIS" -V2 -WX -INPUTCHARSET UTF8 -NOCD build/harness-n7.nsi 2>&1
+}
+for n7 in 'IN:$R9:$R9' 'OUT:$R6:$R9'; do
+  IFS=: read -r n7_side n7_in n7_out <<< "$n7"
+  set +e; n7_log=$(n7_compile "$n7_in" "$n7_out"); n7_rc=$?; set -e
+  if [ "$n7_rc" -eq 0 ] || ! printf '%s' "$n7_log" | grep -qF "CYS_FIRSTLINE $n7_side must not be \$R9"; then
+    echo "FAIL[N7]: CYS_FIRSTLINE $n7_in $n7_out was not refused with 'CYS_FIRSTLINE $n7_side must not be \$R9' (rc=$n7_rc) - B1-F3 register aliasing is back" >&2
+    printf '%s\n' "$n7_log" | tail -5 >&2
+    exit 1
+  fi
+done
+set +e; n7_log=$(n7_compile '$R6' '$R6'); n7_rc=$?; set -e
+if [ "$n7_rc" -ne 0 ]; then
+  echo "FAIL[N7]: control CYS_FIRSTLINE \$R6 \$R6 did not compile (rc=$n7_rc) - the N7 scaffold is broken, its refusals prove nothing" >&2
+  printf '%s\n' "$n7_log" | tail -5 >&2
+  exit 1
+fi
+rm -f build/harness-n7.nsi
+echo "nsis-hook-compile: N7 OK (CYS_FIRSTLINE refuses \$R9 as IN and as OUT; control \$R6 \$R6 compiles)"
+
 # ── re-verify the positive with restored inputs (negatives must leave no residue) ──
 "$MAKENSIS" -V2 -WX -INPUTCHARSET UTF8 harness.nsi >/dev/null
-echo "nsis-hook-compile: OK (hook compiled, macros inserted, getdllversion oracle exercised, 3 negative controls + token, census and anchor pins verified)"
+
+# ── 5. P1 executor: the hook's REAL P1 macro text run against simulated Windows outcomes
+# (WP12 B1-F1..F4 RED/GREEN cases + controls). Exit 1 = a case failed, 2 = the executor could
+# not run the text - both fail this harness.
+"$PYTHON" ../nsis-hook-exec/p1_exec.py --hook "$HOOK"
+echo "nsis-hook-compile: OK (hook compiled, macros inserted, getdllversion oracle exercised, 3 negative controls + token, census and anchor pins, N7 alias guard, P1 executor cases verified)"
