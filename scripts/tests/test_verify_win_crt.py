@@ -371,7 +371,12 @@ class SacCensusTests(unittest.TestCase):
         return gate.sac_census(self.tree(files), setup=setup, authenticode=lambda _: None)
 
     def base(self):
+        """The measured top-level layout of a real setup.exe extraction (7-Zip 26.05 on the public v0.14.52
+        installer, 2026-10-24): canonical binaries, the hook's *.new.exe staging copies, uninstall.exe,
+        and $PLUGINSDIR plugin DLLs; plus runtime files of several kinds."""
         return {"cysd.exe": make_secdir_pe(), "cys.exe": make_secdir_pe(), "cys-app.exe": make_secdir_pe(),
+                "cysd.new.exe": make_secdir_pe(), "cys.new.exe": make_secdir_pe(), "cys-app.new.exe": make_secdir_pe(),
+                "uninstall.exe": make_secdir_pe(), "$PLUGINSDIR/nsExec.dll": make_secdir_pe(pe32plus=False),
                 "runtime/python/python.exe": make_secdir_pe(64),          # 벤더 서명 — 기록만
                 "runtime/python/_ctypes.pyd": make_secdir_pe(pe32plus=False),
                 "runtime/readme.txt": b"not a pe",
@@ -380,6 +385,7 @@ class SacCensusTests(unittest.TestCase):
     def test_unsigned_tree_passes_and_counts_every_mz_file(self):
         code, rep = self.census(self.base())
         self.assertEqual(code, 0, rep.get("verdict"))
+        self.assertEqual(rep["required"], {n: "ok" for n in gate.SAC_REQUIRED_OWN})
         paths = {r["path"] for r in rep["files"]}
         self.assertIn("runtime/python/_ctypes.pyd", paths, "확장자가 아니라 내용(MZ)으로 열거해야 한다(.pyd)")
         self.assertIn("runtime/odd.dat", paths)
@@ -407,14 +413,60 @@ class SacCensusTests(unittest.TestCase):
     def test_malformed_own_binary_fails_closed(self):
         files = self.base()
         files["cysd.exe"] = b"MZ\x90\x00" + b"x" * 64
+        del files["cysd.new.exe"]
         code, rep = self.census(files)
         self.assertEqual(code, 3, rep.get("verdict"))
 
-    def test_census_without_cysd_is_not_a_census(self):
+    def test_each_required_own_binary_absent_is_red_and_named(self):
+        """review r1 A-F1: every required own binary is checked by name, not only cysd.exe. The list is a
+        literal here, not read from the module under test (a shrunken SAC_REQUIRED_OWN must fail this)."""
+        for name in ("cys.exe", "cysd.exe", "cys-app.exe", "uninstall.exe"):
+            with self.subTest(absent=name):
+                files = self.base()
+                del files[name]
+                files.pop(name.replace(".exe", ".new.exe"), None)   # the staging copy counts as the same binary
+                code, rep = self.census(files)
+                self.assertEqual(code, 6, rep.get("verdict"))
+                self.assertIn(name, rep["verdict"])
+                self.assertEqual(rep["required"][name], "missing")
+
+    def test_required_binary_under_a_changed_layout_name_is_missing_not_ignored(self):
+        """A 7z layout that extracts cys-app.exe under another name must fail closed, not pass."""
         files = self.base()
-        del files["cysd.exe"]
+        files["$_OUTDIR/cys-app-1.exe"] = files.pop("cys-app.exe")
+        del files["cys-app.new.exe"]
         code, rep = self.census(files)
         self.assertEqual(code, 6, rep.get("verdict"))
+        self.assertIn("cys-app.exe", rep["verdict"])
+
+    def test_required_binary_not_mz_is_red_and_named(self):
+        """a non-MZ required file never enters the MZ walk - the inventory must still name it."""
+        files = self.base()
+        files["cys-app.exe"] = b"not a portable executable"
+        del files["cys-app.new.exe"]
+        code, rep = self.census(files)
+        self.assertEqual(code, 3, rep.get("verdict"))
+        self.assertIn("cys-app.exe=non-mz", rep["verdict"])
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root can read a 000 file")
+    @unittest.skipIf(os.name == "nt", "chmod 000 does not make a file unreadable on Windows")
+    def test_required_binary_unreadable_is_red_and_named(self):
+        d = self.tree(self.base())
+        p = os.path.join(d, "cys.exe")
+        os.chmod(p, 0)
+        try:
+            code, rep = gate.sac_census(d, authenticode=lambda _: None)
+        finally:
+            os.chmod(p, 0o644)
+        self.assertEqual(code, 3, rep.get("verdict"))
+        self.assertIn("cys.exe=unreadable", rep["verdict"])
+
+    def test_signed_uninstaller_is_red(self):
+        files = self.base()
+        files["uninstall.exe"] = make_secdir_pe(16)
+        code, rep = self.census(files)
+        self.assertEqual(code, 5, rep.get("verdict"))
+        self.assertIn("uninstall.exe", rep["verdict"])
 
     def test_control_detects_a_blind_reader(self):
         """매 실행 대조의 판별력 — 보안 디렉터리를 못 읽는 판독기로 바꾸면 census 는 6 으로 죽어야 한다."""
@@ -424,7 +476,23 @@ class SacCensusTests(unittest.TestCase):
             code, rep = self.census(self.base())
         finally:
             gate.security_directory = real
-        self.assertEqual((code, rep["control"]), (6, "BLIND"))
+        self.assertEqual(code, 6, rep.get("verdict"))
+        self.assertTrue(rep["control"].startswith("BLIND"), rep["control"])
+
+    def test_control_runs_the_real_verdict(self):
+        """review r1 A-F2: the control goes through sac_verdict - a verdict that never says FAIL(5)
+        (the own-signed refusal removed) must make the control blind, not stay green."""
+        real = gate.sac_verdict
+
+        def no_signed_refusal(rows, inv):
+            return real([dict(r, embedded_signature=False) for r in rows], inv)
+        try:
+            gate.sac_verdict = no_signed_refusal
+            code, rep = self.census(self.base())
+        finally:
+            gate.sac_verdict = real
+        self.assertEqual(code, 6, rep.get("verdict"))
+        self.assertTrue(rep["control"].startswith("BLIND"), rep["control"])
 
     def test_reader_agrees_with_release_verify_on_shared_shapes(self):
         """두 사본(이 파일 · release-verify.py)의 보안 디렉터리 판독이 같은 표본에서 같은 답을 내는가."""

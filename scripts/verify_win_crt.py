@@ -33,8 +33,9 @@
 
 종료 코드: 0=통과 / 1=검사A 위반 / 2=검사B 마커 결손 / 3=PE 파싱 실패(fail-closed) /
           4=입력·추출 오류. 모든 판정 내역을 stdout 에 남긴다(릴리스 로그 증거).
-  --sac-census(0.14.53 WP12 · D6-a): CRT 검사 대신 출하 PE 서명 census 만 한다. 0=통과 / 3=우리 파일 PE 판독 불가 /
-          4=입력·추출 오류 / 5=우리 파일에 Authenticode 서명(서명이 잠든 판 위반) / 6=열거 불성립 또는 매 실행 대조 실패.
+  --sac-census(0.14.53 WP12 · D6-a): CRT 검사 대신 출하 PE 서명 census 만 한다. 0=통과 / 3=우리 파일을 읽을 수 없거나 ·
+          MZ 가 아니거나 · 정상 PE 가 아님(이름 명시) / 4=입력·추출 오류 / 5=우리 파일에 Authenticode 서명(서명이 잠든 판 위반) /
+          6=필수 우리 파일(cys·cysd·cys-app·uninstall) 부재(이름 명시) 또는 매 실행 대조가 눈멂.
 
 사용:
   python3 scripts/verify_win_crt.py --setup release-candidate/cys_X.Y.Z_x64-setup.exe
@@ -248,10 +249,17 @@ def check_markers(tree):
 # cys.exe · cysd.exe · cys-app.exe · uninstall.exe — 훅 스테이징 별칭 포함)에 Authenticode 보안 디렉터리가 있으면
 # 검토되지 않은 서명 경로가 돌았다는 뜻이므로 실패(5)다. 벤더 파일(동봉 런타임)의 서명은 기록만 한다(U2 실측).
 # 열거는 이름이 아니라 **내용**으로 한다 — 확장자와 무관하게 첫 2바이트가 `MZ` 인 모든 파일(.pyd 포함).
-# 매 실행 대조: 보안 디렉터리를 가진 합성 `cysd.exe` 에 같은 규칙을 돌려 붉은 판정이 실제로 나는지 본다 — 서명된 파일을
-# 못 보는 census 는 게이트가 아니다. 보안 디렉터리 판독은 release-verify.py 의 같은 이름 함수와 같은 꼴이다(그 파일은
+# 필수 우리 파일(SAC_REQUIRED_OWN)은 MZ 열거와 별도로 **이름으로** 재고한다 — 없거나 · 읽을 수 없거나 · MZ 가 아니거나 ·
+# 정상 PE 가 아니면 그 이름을 단 적색이다(review r1 A-F1: 종전에는 cysd.exe 만 요구했다).
+# 매 실행 대조: 서명된 cysd.exe 를 가진 합성 트리를 **실제 판정 경로**(sac_rows → sac_inventory → sac_verdict)에 넣어
+# FAIL(5) 가 나는지 본다(review r1 A-F2) — 서명된 우리 파일을 못 보는 census 는 게이트가 아니다. 보안 디렉터리 판독은 release-verify.py 의 같은 이름 함수와 같은 꼴이다(그 파일은
 # 저장소의 다른 파일에 의존하지 않는다는 계약이 있어 공유 모듈로 빼지 않았다 — 두 사본은 각자의 검체가 핀한다).
 SAC_OWN_BINARIES = {"cys.exe", "cysd.exe", "cys-app.exe", "uninstall.exe"}
+# Required from a setup.exe extraction (review r1 A-F1). MEASURED on the public v0.14.52 setup.exe with 7-Zip 26.05
+# (7zz l / x, 2026-10-24 - listing in the WP12 phaseB evidence): the top level holds cys.exe, cysd.exe, cys-app.exe,
+# their hook staging copies *.new.exe, and uninstall.exe (169,146 B, MZ, unsigned) - 7z materialises the makensis
+# uninstaller, so it is required too. canonical_name maps the *.new.exe copies onto the same names.
+SAC_REQUIRED_OWN = ("cys.exe", "cysd.exe", "cys-app.exe", "uninstall.exe")
 SAC_CENSUS_SCHEMA = "cys-win-pe-census/1"
 
 
@@ -322,9 +330,41 @@ def authenticode_status(paths):
         os.remove(lst)
 
 
-def sac_census(tree, setup=None, authenticode=authenticode_status):
-    """D6-a census. 반환: (종료 코드, 보고서 dict). 0 통과 · 3 우리 파일 PE 판독 불가 · 5 우리 파일 서명(잠든 판 위반) ·
-    6 열거 불성립(cysd 미발견) 또는 매 실행 대조 실패."""
+def sac_inventory(tree, required):
+    """Required own binaries, looked up by canonical NAME over every file (not only the MZ ones) —
+    {name: ok | missing | unreadable | non-mz | malformed}. A required file the MZ walk cannot see
+    (absent, renamed by a changed 7z layout, unreadable, not starting with MZ) is named here instead
+    of silently dropping out of the census (review r1 A-F1)."""
+    paths = {}
+    for dirpath, _, files in os.walk(tree):
+        for fn in files:
+            c = canonical_name(fn)
+            if c in required:
+                paths.setdefault(c, []).append(os.path.join(dirpath, fn))
+    status = {}
+    for name in required:
+        found = sorted(paths.get(name, []))
+        st = "ok" if found else "missing"
+        for p in found:
+            try:
+                with open(p, "rb") as f:
+                    head = f.read(2)
+                size = security_directory(p)
+            except OSError:
+                st = "unreadable"
+                break
+            if head != b"MZ":
+                st = "non-mz"
+                break
+            if size is None:
+                st = "malformed"
+                break
+        status[name] = st
+    return status
+
+
+def sac_rows(tree, setup, authenticode):
+    """Census rows: setup.exe (if given) + every MZ file under tree, any extension."""
     entries = []
     if setup:
         entries.append((setup, os.path.basename(setup), True))
@@ -334,7 +374,7 @@ def sac_census(tree, setup=None, authenticode=authenticode_status):
             if os.path.isfile(p) and not os.path.islink(p) and _is_mz(p):
                 entries.append((p, os.path.relpath(p, tree), canonical_name(fn) in SAC_OWN_BINARIES))
     auth = authenticode([p for p, _, _ in entries]) or {}
-    rows, own_signed, own_unparsed = [], [], []
+    rows = []
     for p, rel, own in entries:
         size = security_directory(p)
         st = auth.get(p)
@@ -342,39 +382,63 @@ def sac_census(tree, setup=None, authenticode=authenticode_status):
                      "embedded_signature": None if size is None else size > 0,
                      "authenticode_status": st[0] if st else "UNMEASURED",
                      "signature_type": st[1] if st else "UNMEASURED", "signer_subject": st[2] if st else ""})
-        if own and size is None:
-            own_unparsed.append(rel)
-        elif own and size:
-            own_signed.append(rel)
+    return rows
+
+
+def sac_verdict(rows, inventory):
+    """The one decision (also run on the per-run control): (code, verdict).
+    3 = a required or enumerated own binary is unreadable / not MZ / not a well-formed PE ·
+    5 = an own binary carries an Authenticode signature while signing is dormant ·
+    6 = a required own binary is missing from the tree · 0 = PASS."""
+    broken = ["%s=%s" % (n, s) for n, s in sorted(inventory.items()) if s not in ("ok", "missing")]
+    broken += ["%s=malformed" % r["path"] for r in rows if r["own"] and r["pe"] != "ok"]
+    if broken:
+        return 3, "FAIL(3) own binary is not a usable PE: " + ", ".join(broken)
+    signed = [r["path"] for r in rows if r["own"] and r["embedded_signature"]]
+    if signed:
+        return 5, ("FAIL(5) own binary carries an Authenticode signature while signing is dormant in this "
+                   "release: " + ", ".join(signed))
+    missing = sorted(n for n, s in inventory.items() if s == "missing")
+    if missing:
+        return 6, ("FAIL(6) required own binary missing from the shipped tree: " + ", ".join(missing)
+                   + " - the census did not see what ships (a changed 7z layout fails closed)")
+    return 0, "PASS"
+
+
+def _census_control():
+    """Per-run control through the SAME rows + inventory + verdict path as the real tree (review r1
+    A-F2): a synthetic tree with every required own binary, all unsigned except a signed cysd.exe,
+    must come out FAIL(5). Anything else means the census is blind to a signed own binary."""
+    with tempfile.TemporaryDirectory(prefix="cys-census-control-") as ctl:
+        for name, signed in (("cys.exe", False), ("cysd.exe", True), ("cys-app.exe", False), ("uninstall.exe", False)):
+            with open(os.path.join(ctl, name), "wb") as f:
+                f.write(_census_control_pe(signed))
+        code, _ = sac_verdict(sac_rows(ctl, None, lambda _: None), sac_inventory(ctl, SAC_REQUIRED_OWN))
+    return "red-as-expected" if code == 5 else "BLIND(code=%d)" % code
+
+
+def sac_census(tree, setup=None, authenticode=authenticode_status, required=None):
+    """D6-a census. 반환: (종료 코드, 보고서 dict) — 코드는 sac_verdict 의 정의 그대로, 대조가 눈멀면 6."""
+    required = tuple(required or SAC_REQUIRED_OWN)
+    rows = sac_rows(tree, setup, authenticode)
+    inventory = sac_inventory(tree, required)
     own_found = sorted({canonical_name(os.path.basename(r["path"])) for r in rows if r["own"]})
     report = {"schema": SAC_CENSUS_SCHEMA, "mode": "unsigned", "files": rows, "own_found": own_found,
+              "required": inventory,
               "counts": {"pe_files": len(rows),
                          "embedded_signed": sum(1 for r in rows if r["embedded_signature"]),
-                         "own_signed": len(own_signed), "malformed": sum(1 for r in rows if r["pe"] != "ok")}}
-    # 매 실행 대조 — 같은 규칙이 '서명된 우리 파일'을 실제로 붉게 보는가.
-    with tempfile.TemporaryDirectory(prefix="cys-census-control-") as ctl:
-        fake = os.path.join(ctl, "cysd.exe")
-        with open(fake, "wb") as f:
-            f.write(_census_control_pe())
-        report["control"] = "red-as-expected" if (security_directory(fake) or 0) > 0 else "BLIND"
+                         "own_signed": sum(1 for r in rows if r["own"] and r["embedded_signature"]),
+                         "malformed": sum(1 for r in rows if r["pe"] != "ok")}}
+    report["control"] = _census_control()
     if report["control"] != "red-as-expected":
+        report["verdict"] = "FAIL(6) census control is blind: " + report["control"]
         return 6, report
-    if own_unparsed:
-        report["verdict"] = "FAIL(3) own binary is not a well-formed PE: " + ", ".join(own_unparsed)
-        return 3, report
-    if own_signed:
-        report["verdict"] = ("FAIL(5) own binary carries an Authenticode signature while signing is dormant in this "
-                             "release: " + ", ".join(own_signed))
-        return 5, report
-    if "cysd.exe" not in own_found:
-        report["verdict"] = "FAIL(6) enumeration found no cysd.exe - the census did not see the shipped tree"
-        return 6, report
-    report["verdict"] = "PASS"
-    return 0, report
+    code, report["verdict"] = sac_verdict(rows, inventory)
+    return code, report
 
 
-def _census_control_pe():
-    """보안 디렉터리가 파일 끝 16B 를 가리키는 최소 PE32+ — 매 실행 대조용 표본(서명 바이트 자체는 의미 없다)."""
+def _census_control_pe(signed=True):
+    """최소 PE32+ — signed 이면 보안 디렉터리가 파일 끝 16B 를 가리킨다(매 실행 대조용 표본 · 서명 바이트 자체는 의미 없다)."""
     e_lfanew, opt_size = 0x80, 112 + 8 * 16
     hdr = bytearray(e_lfanew + 4 + 20 + opt_size)
     hdr[0:2] = b"MZ"
@@ -385,6 +449,8 @@ def _census_control_pe():
     opt = e_lfanew + 24
     struct.pack_into("<H", hdr, opt, 0x20B)
     struct.pack_into("<I", hdr, opt + 108, 16)
+    if not signed:
+        return bytes(hdr)
     struct.pack_into("<II", hdr, opt + 112 + 32, len(hdr), 16)
     return bytes(hdr) + b"C" * 16
 
