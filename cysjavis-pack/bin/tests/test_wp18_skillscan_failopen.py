@@ -41,6 +41,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 SELF = os.path.dirname(os.path.abspath(__file__))
 BIN = os.path.normpath(os.path.join(SELF, ".."))
@@ -93,7 +94,9 @@ check("A2 체크리스트 호출에 `2>/dev/null` 0건(C8)",
 m_ck = re.search(r"^PREFLIGHT_TIMEOUT\s*=\s*(\d+)", ck_src, re.M)
 check("A3 checklist PREFLIGHT_TIMEOUT 상수 실재", bool(m_ck), str(m_ck and m_ck.group(1)))
 m_hook = re.search(r"timeout (\d+) \"\$CYS_PY\" \"\$CHK\"", hook_src)
-m_scan = re.search(r"scan_tool, \"all\", \"--json\"\][\s\S]{0,200}?timeout=(\d+)\)", pf_src)
+# ★R2: 상한이 인라인 `timeout=20` 에서 **이름 있는 상수**로 옮겨갔다(검체가 짧게 바꿔 제품
+#   경로를 그대로 태우기 위해서다) — 핀도 그 상수를 읽는다.
+m_scan = re.search(r"^\s*SKILLSCAN_SCAN_TIMEOUT_S\s*=\s*(\d+)", pf_src, re.M)
 if m_hook and m_ck and m_scan:
     outer, mid, inner = int(m_hook.group(1)), int(m_ck.group(1)), int(m_scan.group(1))
     check("A4 상한 서열 innermost-smallest(C7)", outer > mid > inner,
@@ -243,31 +246,34 @@ def rig_pack(scanner_body):
     return tmp, pack, root
 
 
-def c60(scanner_body, patch_timeout=False):
-    """실제 Preflight.c60_gate_wiring() 을 리그 팩에 대해 구동하고 (status, detail) 을 돌려준다."""
+def c60(scanner_body, timeout_s=None, mark_dir=None, worker_sleep=None):
+    """실제 Preflight.c60_gate_wiring() 을 리그 팩에 대해 구동하고 (status, detail) 을 돌려준다.
+
+    timeout_s 를 주면 제품의 **이름 있는 상한**(Preflight.SKILLSCAN_SCAN_TIMEOUT_S)만 짧게 바꾼다 —
+    `subprocess.run` 을 가짜로 바꾸는 종전 방식은 R2 에서 쓸 수 없고, 쓸 이유도 없다: 스캔은 이제
+    `_run_skillscan_all` 의 Popen 으로 돌아가므로 `.run` 을 가로채도 그 경로를 타지 않는다(그 방식을
+    남겨 두면 **아무것도 발화하지 않는 초록**이 된다). 상한만 바꾸면 Popen·killpg·재측정까지
+    **제품 경로 그대로** 돈다. 실제 20s 소진 1회는 증거 파일에 있다(G6b 동형).
+    """
     tmp, pack, root = rig_pack(scanner_body)
     drv = os.path.join(tmp, "drive.py")
     open(drv, "w").write(
-        "import json, subprocess as _sp, sys\n"
+        "import json, sys\n"
         "sys.path.insert(0, %r)\n"
         "import javis_preflight as P\n"
-        "PATCH = %r\n"
-        "if PATCH:\n"
-        "    class _T:\n"
-        "        def __init__(self, real): self._r = real\n"
-        "        def __getattr__(self, n): return getattr(self._r, n)\n"
-        "        def run(self, cmd, *a, **k):\n"
-        "            if isinstance(cmd, (list, tuple)) and any('javis_skillscan.py' in str(c) for c in cmd) \\\n"
-        "                    and 'all' in cmd:\n"
-        "                raise self._r.TimeoutExpired(cmd=cmd, timeout=k.get('timeout', 20))\n"
-        "            return self._r.run(cmd, *a, **k)\n"
-        "    P.subprocess = _T(_sp)\n"
+        "T = %r\n"
+        "if T is not None:\n"
+        "    P.Preflight.SKILLSCAN_SCAN_TIMEOUT_S = T\n"
         "p = P.Preflight(False, [], mode='report')\n"
         "p.c60_gate_wiring()\n"
-        "print(json.dumps(p.results, ensure_ascii=False, default=str))\n" % (BIN, patch_timeout))
+        "print(json.dumps(p.results, ensure_ascii=False, default=str))\n" % (BIN, timeout_s))
     env = {k: v for k, v in os.environ.items() if not k.startswith("CYS_")}
     env.update({"HOME": tmp, "TMPDIR": tmp, "CYS_PACK_DIR": pack, "JAVIS_ROOT": root,
                 "PYTHONDONTWRITEBYTECODE": "1"})
+    if mark_dir:
+        env["WP18_MARK_DIR"] = mark_dir
+    if worker_sleep is not None:
+        env["WP18_SLEEP"] = str(worker_sleep)
     r = subprocess.run([PY, drv], capture_output=True, text=True, env=env, timeout=180)
     rows = json.loads(r.stdout.strip().split("\n")[-1])
     row = [x for x in rows if x["id"] == "C60.gate-wiring"][0]
@@ -287,8 +293,11 @@ SC_CLEAN = ("#!/usr/bin/env python3\nimport json\n"
 st, dt = c60(SC_EMPTY)
 check("D1 빈 stdout+exit 0 → FAIL(종전: 조용한 '차단 0건')", st == "FAIL" and "판독 불가" in dt, dt[:110])
 st, dt = c60(SC_BRACE)
+# ★R2 로 문면이 바뀌었다: 종전엔 "scanned·blocked 키가 없다" 였고, 이제는 값의 **타입**까지 보는
+#   검사가 먼저 걸려 "scanned 가 음이 아닌 정수가 아니다(None)" 로 떨어진다. 행의 뜻은 그대로다 —
+#   빈 객체는 스캔 결과가 아니고, `or "{}"` 폴백을 지우는 것만으로는 막히지 않던 갈래다.
 check("D2 stdout `{}` → FAIL(폴백 삭제만으로는 못 막는 갈래)",
-      st == "FAIL" and "키가 없다" in dt, dt[:110])
+      st == "FAIL" and "scanned" in dt, dt[:110])
 st, dt = c60(SC_RC2)
 check("D3 exit 2 → FAIL(returncode 미확인 봉인)", st == "FAIL" and "exit 2" in dt, dt[:110])
 st, dt = c60(SC_BLOCK)
@@ -297,7 +306,8 @@ check("D4 정상 BLOCK → WARN 이고 스킬 이름을 댄다(C10)",
 st, dt = c60(SC_CLEAN)
 check("D5 정상 clean → 스캔에 대해 조용(거짓 양성 0)",
       st in ("PASS", "WARN") and "skillscan" not in dt, dt[:110])
-st, dt_to = c60(SC_CLEAN, patch_timeout=True)
+SC_SLOW = ("#!/usr/bin/env python3\nimport time\ntime.sleep(20)\n")
+st, dt_to = c60(SC_SLOW, timeout_s=2)
 check("E1 상한 초과 → FAIL 이고 '미완료' 문면(C9 3층)",
       st == "FAIL" and "미완료" in dt_to, dt_to[:130])
 check("E2 상한 초과 문면이 `--fix` 를 처방하지 않는다(G3)", "--fix" not in dt_to, dt_to[:130])
@@ -305,6 +315,65 @@ _, dt_parse = c60(SC_RC2)
 check("E3 세 문면이 서로 구별된다(상한 초과 ≠ 판독 불가 ≠ BLOCK)",
       ("미완료" in dt_to) and ("미완료" not in dt_parse) and ("판독 불가" in dt_parse), "")
 
+
+# ───────────── G. R2(codex r1) — 요약 값의 타입·일관성과 자손 생존 ─────────────
+# ★모두 91067d03 에서 적색이었다(실측): a·b·c 는 조용한 「차단 0건」, d 는 BLOCK 을 WARN 으로
+#   흘렸고, e 는 승인 조회에서 터진 **우연한** TypeError 였다. 통제군 두 개(g·h)가 같이 있어야
+#   이 가드가 정상 판정을 깨지 않았다는 것이 선다.
+def _sc(payload, exit_code=0):
+    return ("#!/usr/bin/env python3\nimport json, sys\nprint(json.dumps(%r))\nsys.exit(%d)\n"
+            % (payload, exit_code))
+
+
+for _name, _body, _need in (
+        ("G1 scanned null → FAIL", _sc({"scanned": None, "blocked": None}), "scanned 가 음이 아닌 정수가 아니다"),
+        ("G2 blocked false → FAIL", _sc({"scanned": 3, "blocked": False}), "blocked 가 리스트가 아니다"),
+        ("G3 exit 1 + blocked [] → FAIL(일관성)", _sc({"scanned": 3, "blocked": []}, 1), "어긋난다"),
+        ("G4 exit 0 + blocked 1건 → FAIL(일관성)", _sc({"scanned": 3, "blocked": ["evil"]}), "어긋난다"),
+        ("G5 blocked 항목이 dict → FAIL(문면이 파이썬 내부가 아니다)",
+         _sc({"scanned": 3, "blocked": [{"n": "evil"}]}, 1), "스킬 이름 문자열이 아니다"),
+        ("G6 scanned true(bool) → FAIL", _sc({"scanned": True, "blocked": []}), "scanned 가 음이 아닌 정수가 아니다"),
+):
+    _st, _dt = c60(_body)
+    check(_name, _st == "FAIL" and _need in _dt, _dt[:120])
+
+_st, _dt = c60(_sc({"scanned": 0, "blocked": []}))
+check("G7 통제군 — 합법적 scanned 0 은 조용하다(유보된 정책을 깨지 않았다)",
+      _st in ("PASS", "WARN") and "skillscan" not in _dt, _dt[:110])
+_st, _dt = c60(_sc({"scanned": 3, "blocked": ["evil-skill"]}, 1))
+check("G8 통제군 — 정상 BLOCK 은 여전히 이름을 댄다(C10)",
+      _st == "WARN" and "evil-skill" in _dt, _dt[:110])
+
+# G9 — 자손 생존 0. 측정 방법에 주의: spawn 워커의 명령줄은 `python -c …` 라서 **이름으로는 못
+#   찾는다**(내 첫 탐지기가 `pgrep -f javis_skillscan.py` 로 0 을 세고 "잔존 없음"을 거짓 보고했다).
+#   그래서 워커가 자기 일을 **끝내야만** 쓰는 표식 파일을 센다 — 효과로 재는 탐지기다.
+POOL_STUB = """#!/usr/bin/env python3
+import os, sys, time
+from concurrent.futures import ProcessPoolExecutor
+MARK = os.environ["WP18_MARK_DIR"]
+def work(i):
+    time.sleep(float(os.environ.get("WP18_SLEEP", "6")))
+    open(os.path.join(MARK, "survived.%d.%d" % (i, os.getpid())), "w").write("x")
+    return i
+if __name__ == "__main__":
+    with ProcessPoolExecutor(max_workers=2) as ex:
+        list(ex.map(work, [1, 2]))
+    print('{"scanned": 2, "blocked": []}')
+"""
+_mark = _tmp("wp18-mark-")
+_st, _dt = c60(POOL_STUB, timeout_s=2, mark_dir=_mark, worker_sleep=6)
+check("G9a 상한 초과가 FAIL 이고 그룹 정리 결과를 적는다", _st == "FAIL" and "잔존" in _dt, _dt[:140])
+time.sleep(8)          # 워커 자신의 sleep(6s)을 넘겨서 — 살아 있었다면 그동안 표식을 쓴다
+_alive = sorted(n for n in os.listdir(_mark) if n.startswith("survived."))
+check("G9b 상한 초과 뒤 살아남은 스캐너 자손 0(R2 MAJOR 2 회귀 핀)",
+      not _alive, "표식 %d건%s" % (len(_alive), (": " + ", ".join(_alive)) if _alive else ""))
+
+# G10 — 가드가 소스에 실재하는가(변이가 지우면 위 행들이 적색이 되지만, 수단 자체도 핀한다)
+_pf_body = _fn_body(pf_src, "_run_skillscan_all")
+check("G10 그룹 생성·그룹 종료·재측정 수단이 스캔 호출에 실재한다",
+      all(tok in _pf_body for tok in ("start_new_session", "killpg", "CREATE_NEW_PROCESS_GROUP",
+                                      "taskkill")) and "os.killpg(proc.pid, 0)" in _pf_body,
+      "POSIX setsid+killpg · Windows 그룹+taskkill(UNMEASURED) · 정리 뒤 재측정")
 
 # ─────────────────────── F. 산출물 동일성·순서·폴백 ───────────────────────
 def fixture_skills():

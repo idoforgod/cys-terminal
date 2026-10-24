@@ -24,6 +24,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -1251,6 +1252,15 @@ def _settings_rmw(settings_path, mutate, indent=2):
                 lock.release()
             except Exception:
                 pass
+
+
+class _SkillscanUnusable(Exception):
+    """WP18 R2: 스캔 결과를 쓸 수 없다는 내부 신호(문면은 이미 probs 에 적힌 상태로 올라온다).
+
+    `subprocess.TimeoutExpired` 를 재사용하지 않는 이유: 같은 try 블록 안의 **형제 호출**
+    (memory 스캐너 probe 60s · card 조회 60s)도 그 예외를 던지므로, 한 칸에 담으면 어느 상한이
+    터졌는지 문면이 갈리지 않는다.
+    """
 
 
 class OnlyUsageError(Exception):
@@ -5246,6 +5256,109 @@ class Preflight:
     # 여기서 닫는다: ①재주입 포이즌 게이트(G3) 배선 ②memory 스캐너 로드 가능(fail-closed는
     # 부트 게이트인 여기 — 런타임 memory 쓰기는 생명선 WARN 유지, G14 층 분리) ③skillscan
     # 집행 스캔 실행 ④mcpgate 스냅샷 diff(rug-pull).
+    # ★WP18 R2(2026-10-24 · codex r1 REVISE 재현 완료) — 이 스캔 호출의 상한을 **이름 있는 상수**로
+    #   둔다: 검체가 상한을 짧게 바꿔 실제 제품 경로를 그대로 태울 수 있고(실측 20s 소진 1회는
+    #   증거 파일에 있다), A4 핀이 이 수를 소스에서 읽어 서열을 센다.
+    SKILLSCAN_SCAN_TIMEOUT_S = 20
+
+    @staticmethod
+    def _skillscan_summary_error(data, returncode):
+        """스캐너 요약이 **쓸 수 있는 것**인지 판정 — 쓸 수 없으면 사유 문자열, 쓸 수 있으면 None.
+
+        ★WP18 R2 MAJOR 1(codex r1 · 이 좌석이 실측 재현): 키 **존재**만 보는 것으로는 부족했다.
+          실측(실제 c60 경로 · 리그 스텁 스캐너):
+            · `{"scanned": null, "blocked": null}`  → WARN(스캔 언급 0) = 조용한 「차단 0건」
+            · `{"scanned": 3, "blocked": false}`    → 같음 (`data.get("blocked") or []` 가 접었다)
+            · exit 1 + `"blocked": []`              → 같음 (exit 1 은 스캐너 계약상 **BLOCK 존재**다 —
+                                                      javis_skillscan.exit_for 가 BLOCK 일 때만 1 을 낸다)
+            · `"blocked": [{...}]`                  → FAIL 이긴 했지만 승인 조회에서 터진 **우연한**
+                                                      TypeError(unhashable dict)였다 — 파이썬 내부 문면이
+                                                      사유로 올라갔다
+          ⇒ 값의 **타입과 일관성**까지 본다. 판정 불가는 「차단 0건」이 아니라 「재지 못함」이다.
+        """
+        if not isinstance(data, dict):
+            return "출력이 JSON 객체가 아니다(%s)" % type(data).__name__
+        scanned = data.get("scanned")
+        # bool 은 int 의 하위형이라 명시 배제한다(True 가 1 로 통과하면 계수가 거짓이 된다).
+        if isinstance(scanned, bool) or not isinstance(scanned, int) or scanned < 0:
+            return "scanned 가 음이 아닌 정수가 아니다(%r)" % (scanned,)
+        blocked = data.get("blocked")
+        if not isinstance(blocked, list):
+            return "blocked 가 리스트가 아니다(%s)" % type(blocked).__name__
+        bad = [b for b in blocked if not isinstance(b, str) or not b.strip()]
+        if bad:
+            return "blocked 항목이 스킬 이름 문자열이 아니다(%d/%d건)" % (len(bad), len(blocked))
+        if returncode == 1 and not blocked:
+            return "exit 1(스캐너 계약상 BLOCK 존재)인데 blocked 가 비어 있다 — 결과가 서로 어긋난다"
+        if returncode == 0 and blocked:
+            return "exit 0(BLOCK 없음)인데 blocked 가 %d건이다 — 결과가 서로 어긋난다" % len(blocked)
+        return None
+
+    @staticmethod
+    def _run_skillscan_all(scan_tool, timeout_s):
+        """`javis_skillscan.py all --json` 을 **자기 프로세스 그룹**에서 돌리고 자손을 남기지 않는다.
+
+        반환: (returncode, stdout, stderr, timed_out, survivors_cleaned)
+
+        ★WP18 R2 MAJOR 2(codex r1 · 이 좌석이 실측 재현): `subprocess.run(timeout=20)` 은 **직속
+          자식만** 죽인다. 0.14.53 부터 스캐너가 ProcessPoolExecutor 를 쓰므로 그 워커들은 부모가
+          죽은 뒤에도 살아 계속 돈다 — 실측: 워커 2개가 시작 30초 뒤(preflight 가 타임아웃을 보고한
+          **10초 뒤**)에 자기 작업을 끝내고 완료 표식을 썼다. 그리고 그 워커들은 **이름으로 못 찾는다**
+          (spawn 워커의 명령줄은 `python -c …` 이고 javis_skillscan.py 가 아니다 — 내 첫 탐지기가
+          `pgrep -f javis_skillscan.py` 로 0 을 세고 "잔존 없음" 을 거짓 보고했다). 유일하게 믿을 수
+          있는 손잡이는 **우리가 이 자식에게 만들어 준 프로세스 그룹**이다.
+          집 안의 선례를 그대로 따른다 — `javis_completion_guard._popen_group`(POSIX setsid+killpg /
+          Windows CREATE_NEW_PROCESS_GROUP + `taskkill /T /F`). ★Windows 경로는 **UNMEASURED**다
+          (이 호스트에 윈도우가 없다) — 수단만 선례와 동일하게 배선한다.
+          죽이는 범위: `start_new_session` 이라 pgid == 자식 pid 이므로 **이 스캔의 자손만** 죽는다
+          (남의 살아 있는 프로세스에 닿지 않는다).
+        """
+        kw = {}
+        if os.name == "posix":
+            kw["start_new_session"] = True            # setsid — 그룹 리더로 스폰
+        else:
+            kw["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        proc = subprocess.Popen([sys.executable, scan_tool, "all", "--json"],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                stdin=subprocess.DEVNULL, text=True, **kw)
+        try:
+            out, err = proc.communicate(timeout=timeout_s)
+            return proc.returncode, out, err, False, False
+        except subprocess.TimeoutExpired:
+            pass
+        # ── 트리 정리(고아 0) ──
+        if os.name == "posix":
+            with contextlib.suppress(OSError):
+                os.killpg(proc.pid, signal.SIGKILL)
+        else:
+            try:
+                subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            except Exception:
+                pass
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        try:
+            out, err = proc.communicate(timeout=5)
+        except Exception:
+            out, err = "", ""
+        # 정리 뒤 **다시 재서** 잔존을 확인한다(성공 종료는 상태가 바뀐 증거가 아니다).
+        survivors = False
+        if os.name == "posix":
+            try:
+                os.killpg(proc.pid, 0)
+                survivors = True
+            except OSError:
+                survivors = False
+            if survivors:
+                for sig in (signal.SIGTERM, signal.SIGKILL):
+                    with contextlib.suppress(OSError):
+                        os.killpg(proc.pid, sig)
+                    time.sleep(0.2)
+        return proc.returncode, out or "", err or "", True, survivors
+
     def c60_gate_wiring(self):
         cid = "C60.gate-wiring"
         if self.skipped(cid):
@@ -5280,8 +5393,17 @@ class Preflight:
             #   (★macOS 에는 timeout(1) 이 없어 이 겹이 아예 없다 — 실측) → ⓑ
             #   javis_checklist.py PREFLIGHT_TIMEOUT=30 → ⓒ 여기. 종전 120 은 바깥보다
             #   커서 훅 경로에서 **발화 불가**였다(40>30>120): preflight 가 30 에 먼저
-            #   죽으니 스캔이 자기 실패를 말할 기회가 없었다. 20 은 ⓑ 보다 작아 어느
-            #   경로에서도 이 스캔이 **자기 사유를 말한다**(부트 경로 300·CI 360 에서도).
+            #   죽으니 스캔이 자기 실패를 말할 기회가 없었다.
+            #   ★R2 정정(codex r1 MINOR · 종전 문면은 과대주장이었다): 20<30 은 「어느 경로에서도
+            #   스캔이 자기 사유를 말한다」를 **보장하지 않는다**. 위 수들은 각기 **호출 1건에
+            #   설정된 상한**이고, ⓑ 의 30 은 preflight **전체**를 덮는 경과 예산이다 — 앞선 검사들
+            #   (memory 스캐너 probe 60s 포함)이 먼저 시간을 쓰면 스캔이 시작될 때 남은 창이 20s
+            #   보다 **작을 수 있다**. 그러면 체크리스트가 preflight 를 먼저 죽이고, 그 경우
+            #   **이 검사의 except 가 돌지 않으므로** 스캔 자신의 사유도, 아래 그룹 정리도 일어나지
+            #   않는다(→ 그때의 스캐너·풀 워커는 체크리스트의 몫이다 · javis_checklist.py 는
+            #   이 티켓 범위 밖이라 고치지 않고 **남은 구멍으로 보고**한다).
+            #   따라서 이 숫자가 보장하는 것은 하나다: **스캔이 자기 창 안에서 끝나지 못하면 그
+            #   사실을 자기가 적고 자손을 정리한다**(preflight 가 살아 있는 동안).
             #   여유는 평균이 아니라 **실측 분포**로 잡는다 — 병렬 런의 바닥은
             #   max(최장 스킬, 총합/워커수)이고 이 호스트 실측에서 최장 스킬(insane-search)
             #   혼자 1.99s, 114 스킬 총합 11.5s ⇒ 바닥 ≈1.99s. 20s = 그 바닥의 약 10배.
@@ -5290,25 +5412,41 @@ class Preflight:
             #     같은 병렬 스캔은 median 5,696 ms · max 6,077 ms 였다 ⇒ 20s 는 그 최악
             #     관측의 3.3배다. 이 기계의 한가한 값(1.6~1.7s)만 보고 상한을 정하지 마라.
             #   풀 기동 실패로 직렬 폴백이면 0.069s/스킬 ⇒ 20s 는 약 288 스킬까지 든다.
-            r = subprocess.run([sys.executable, scan_tool, "all", "--json"],
-                               capture_output=True, text=True, timeout=20)
+            _rc, _out, _err, _timed_out, _survivors = self._run_skillscan_all(
+                scan_tool, self.SKILLSCAN_SCAN_TIMEOUT_S)
+            if _timed_out:
+                # ★C6/C7/R2: 상한 안에 **끝나지 못한 것**이다 — 느린 호스트·고부하의 상한 초과이고,
+                #   BLOCK 판정도 파싱 실패도 아니다. 처방으로 --fix 를 적지 않는다(수리할 결함이
+                #   아니라 다시 재야 하는 상황이다). 자손 정리 결과도 함께 적는다 — 이 줄이
+                #   「죽였다고 믿는다」가 아니라 「죽인 뒤 다시 쟀다」가 되게.
+                probs.append("skillscan 집행 스캔 미완료 — %ds 상한 안에 끝나지 못했다"
+                             "(느린 호스트·고부하). 「BLOCK 0건」이 아니라 「재지 못함」이다 — "
+                             "한가할 때 재측정하라(--only C60.gate-wiring). 스캐너 프로세스 그룹 "
+                             "정리: %s"
+                             % (self.SKILLSCAN_SCAN_TIMEOUT_S,
+                                "잔존 감지 후 추가 종료" if _survivors else "잔존 0(재측정 확인)"))
+                raise _SkillscanUnusable()
             # ★C6(CEO 판정 2026-10-24 — 양보 불가): 종전 `json.loads(r.stdout or "{}")` 는
             #   **빈 출력을 '차단 0건'으로 읽었다** — 보안 게이트가 fail-open 했다.
             #   실측(스텁 스캐너로 이 c60 경로를 실제 구동): 빈 stdout+exit 0 이면 이 검사는
             #   스캔을 **한 줄도 언급하지 않고** WARN 으로 끝났고, stdout 이 `{}` 일 때도
             #   같았다. '차단된 스킬이 없다'와 '결과를 재지 못했다'는 **다른 상태**이며
             #   한 칸에 접히면 안 된다. 그래서 세 겹으로 닫는다 — ⓐ `or "{}"` 폴백 삭제
-            #   ⓑ returncode 확인 ⓒ 출력 형상(scanned·blocked 키) 확인.
+            #   ⓑ returncode 확인 ⓒ 요약의 **값 타입과 일관성** 검증
+            #   (`_skillscan_summary_error` — R2 에서 '키 존재' 에서 올라왔다: 키만 보면
+            #    `{"scanned": null, "blocked": null}` 과 `{"scanned": 3, "blocked": false}` 가
+            #    통과해 조용한 「차단 0건」이 됐다).
             #   exit 1 은 실패가 아니다(BLOCK 존재 = 정상 판정) · exit 2 는 도구 오류다.
-            if r.returncode not in (0, 1):
+            if _rc not in (0, 1):
                 raise ValueError("스캐너 exit %s · stderr: %s"
-                                 % (r.returncode, (r.stderr or "").strip()[:200] or "(없음)"))
-            if not (r.stdout or "").strip():
+                                 % (_rc, (_err or "").strip()[:200] or "(없음)"))
+            if not (_out or "").strip():
                 raise ValueError("스캐너가 출력을 내지 않았다(빈 stdout)")
-            data = json.loads(r.stdout)
-            if not isinstance(data, dict) or "scanned" not in data or "blocked" not in data:
-                raise ValueError("출력에 scanned·blocked 키가 없다 — 스캔 결과가 아니다")
-            blocked = data.get("blocked") or []
+            data = json.loads(_out)
+            _bad = self._skillscan_summary_error(data, _rc)
+            if _bad:
+                raise ValueError(_bad)
+            blocked = data["blocked"]
             if blocked:
                 ack_p = os.path.join(os.environ.get("JAVIS_ROOT") or os.getcwd(),
                                      "_round", "skillscan_acknowledged.json")
@@ -5337,7 +5475,11 @@ class Preflight:
                                  "검토(master/CSO)" % (len(residual), ", ".join(sorted(residual)[:8])))
                 if acked:
                     acked_note = " · BLOCK 승인 %d건(핀 일치)" % len(acked)
+        except _SkillscanUnusable:
+            pass            # 문면은 위에서 이미 probs 에 적었다
         except subprocess.TimeoutExpired:
+            # ★R2: 이 갈래는 이제 **형제 호울**(memory probe 60s · card 60s)의
+            #   상한 초과를 받는다 — 스캔 자신의 상한 초과는 위 `_timed_out` 분기가 적는다.
             # ★C6/C7(CEO): 상한 안에 **끝나지 못한 것**이다 — 느린 호스트·고부하의
             #   **상한 초과(지정 시간 내 분석 미완료)**이고, BLOCK 판정도 파싱 실패도
             #   아니다. 세 상황의 문면을 서로 구별되게 적는다(C9: 층마다 다른 소리).
