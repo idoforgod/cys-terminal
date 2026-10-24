@@ -147,7 +147,7 @@ UNREGISTERED_OK = {n: _BASELINE for n in (
     "test_lane_isolation_v1", "test_memory_desc_drift", "test_mission_boot_command_filter",
     "test_mission_harness_filter", "test_orchestra_ticket_snapshot", "test_orchestra_todo_path",
     "test_org_audit", "test_pack_syntax_warnings", "test_preflight_nlm_pin", "test_preflight_phase1_checks",
-    "test_release_verify", "test_seat_revival", "test_verify_gate", "test_vibecheck", "test_viberoute",
+    "test_seat_revival", "test_verify_gate", "test_vibecheck", "test_viberoute",
 )}
 # ★E(0.14.42 WP-transport · cysd RLIMIT_NOFILE 자체 상향) — 로컬 수용 검체. 기준선 격차가 아니라
 #   **설계상 CI 밖**이다: debug cysd 바이너리 빌드·실데몬·동시 소켓 320개·soft 256 기동 셸 재현이

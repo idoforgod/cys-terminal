@@ -337,5 +337,115 @@ class MarkerTests(unittest.TestCase):
             self.assertEqual(missing, [])
 
 
+def make_secdir_pe(security_size=0, pe32plus=True):
+    """보안 디렉터리(데이터 디렉터리 4)를 원하는 크기로 가진 최소 PE — census(D6-a) 표본. 크기 > 0 이면 파일 끝 바이트를 가리킨다."""
+    e_lfanew, opt_size = 0x80, (112 if pe32plus else 96) + 8 * 16
+    hdr = bytearray(e_lfanew + 4 + 20 + opt_size)
+    hdr[0:2] = b"MZ"
+    struct.pack_into("<I", hdr, 0x3C, e_lfanew)
+    hdr[e_lfanew:e_lfanew + 4] = b"PE\0\0"
+    struct.pack_into("<H", hdr, e_lfanew + 4 + 16, opt_size)
+    opt = e_lfanew + 24
+    struct.pack_into("<H", hdr, opt, 0x20B if pe32plus else 0x10B)
+    struct.pack_into("<I", hdr, opt + (108 if pe32plus else 92), 16)
+    if security_size:
+        struct.pack_into("<II", hdr, opt + (112 if pe32plus else 96) + 32, len(hdr), security_size)
+    return bytes(hdr) + b"S" * security_size
+
+
+class SacCensusTests(unittest.TestCase):
+    """D6-a(0.14.53 WP12) — 출하 PE 서명 census. 이 판은 서명이 잠든 판이라 '우리 파일 서명'이 유일한 붉은 규칙이다.
+    authenticode=lambda _: None 으로 PowerShell 호출을 끊는다(이 검체는 맥·리눅스에서도 돈다 — Windows 상태 판독은
+    windows-latest 의 실제 census 단계가 잰다)."""
+
+    def tree(self, files):
+        d = tempfile.mkdtemp()
+        for rel, data in files.items():
+            p = os.path.join(d, rel)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "wb") as f:
+                f.write(data)
+        return d
+
+    def census(self, files, setup=None):
+        return gate.sac_census(self.tree(files), setup=setup, authenticode=lambda _: None)
+
+    def base(self):
+        return {"cysd.exe": make_secdir_pe(), "cys.exe": make_secdir_pe(), "cys-app.exe": make_secdir_pe(),
+                "runtime/python/python.exe": make_secdir_pe(64),          # 벤더 서명 — 기록만
+                "runtime/python/_ctypes.pyd": make_secdir_pe(pe32plus=False),
+                "runtime/readme.txt": b"not a pe",
+                "runtime/odd.dat": b"MZ but not a PE at all"}
+
+    def test_unsigned_tree_passes_and_counts_every_mz_file(self):
+        code, rep = self.census(self.base())
+        self.assertEqual(code, 0, rep.get("verdict"))
+        paths = {r["path"] for r in rep["files"]}
+        self.assertIn("runtime/python/_ctypes.pyd", paths, "확장자가 아니라 내용(MZ)으로 열거해야 한다(.pyd)")
+        self.assertIn("runtime/odd.dat", paths)
+        self.assertNotIn("runtime/readme.txt", paths)
+        self.assertEqual(rep["counts"]["embedded_signed"], 1)
+        self.assertEqual(rep["counts"]["own_signed"], 0)
+        self.assertEqual(rep["control"], "red-as-expected")
+        self.assertEqual(rep["schema"], gate.SAC_CENSUS_SCHEMA)
+
+    def test_signed_own_binary_is_red_while_signing_is_dormant(self):
+        for name in ("cys.exe", "cysd.exe", "cys-app.exe", "uninstall.exe", "cysd.new.exe", "cys.prev3.exe"):
+            with self.subTest(own=name):
+                files = self.base()
+                files[name] = make_secdir_pe(32)
+                code, rep = self.census(files)
+                self.assertEqual(code, 5, rep.get("verdict"))
+
+    def test_signed_setup_is_red(self):
+        d = tempfile.mkdtemp()
+        setup = os.path.join(d, "cys_0.14.53_x64-setup.exe")
+        open(setup, "wb").write(make_secdir_pe(16))
+        code, rep = self.census(self.base(), setup=setup)
+        self.assertEqual(code, 5, rep.get("verdict"))
+
+    def test_malformed_own_binary_fails_closed(self):
+        files = self.base()
+        files["cysd.exe"] = b"MZ\x90\x00" + b"x" * 64
+        code, rep = self.census(files)
+        self.assertEqual(code, 3, rep.get("verdict"))
+
+    def test_census_without_cysd_is_not_a_census(self):
+        files = self.base()
+        del files["cysd.exe"]
+        code, rep = self.census(files)
+        self.assertEqual(code, 6, rep.get("verdict"))
+
+    def test_control_detects_a_blind_reader(self):
+        """매 실행 대조의 판별력 — 보안 디렉터리를 못 읽는 판독기로 바꾸면 census 는 6 으로 죽어야 한다."""
+        real = gate.security_directory
+        try:
+            gate.security_directory = lambda p: 0 if real(p) is not None else None
+            code, rep = self.census(self.base())
+        finally:
+            gate.security_directory = real
+        self.assertEqual((code, rep["control"]), (6, "BLIND"))
+
+    def test_reader_agrees_with_release_verify_on_shared_shapes(self):
+        """두 사본(이 파일 · release-verify.py)의 보안 디렉터리 판독이 같은 표본에서 같은 답을 내는가."""
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "rv_for_census", os.path.join(os.path.dirname(__file__), "..", "release-verify.py"))
+        rv = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(rv)
+        d = tempfile.mkdtemp()
+        for label, data in (("unsigned32", make_secdir_pe(pe32plus=False)), ("unsigned64", make_secdir_pe()),
+                            ("signed64", make_secdir_pe(24)), ("junk", b"MZ\x90\x00junk" * 4)):
+            p = os.path.join(d, label + ".exe")
+            open(p, "wb").write(data)
+            with self.subTest(sample=label):
+                mine = gate.security_directory(p)
+                try:
+                    theirs = rv.pe_security_directory(p)[1]
+                except rv.VerifyError:
+                    theirs = None
+                self.assertEqual(mine, theirs)
+
+
 if __name__ == "__main__":
     unittest.main()

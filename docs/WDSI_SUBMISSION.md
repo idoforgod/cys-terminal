@@ -6,7 +6,7 @@
 
 | 신호 | 현재 상태 | 판정 |
 |---|---|---|
-| Authenticode 코드서명 | **없음** (`src-tauri/tauri.conf.json` → `bundle.windows = {}`) | ★ 최대 기여 |
+| Authenticode 코드서명 | **없음** — 서명 설정 키(`certificateThumbprint`·`signCommand`) 0건. `src-tauri/tauri.conf.json` 에는 `bundle.windows` 가 없고, `src-tauri/tauri.windows.conf.json` 의 `bundle.windows` 는 `webviewInstallMode`·`nsis` 만 가진다(2026-10-24 재확인 · 0.14.53 은 서명이 잠든 판 · 릴리스 노트 SAC 고지가 기계로 강제된다) | ★ 최대 기여 |
 | PE 버전 리소스·매니페스트·아이콘 | 있음 (`build.rs:206~223`, `winresource`) | 조치 완료 |
 | `%LOCALAPPDATA%` 에 실행파일 배치 후 실행 | 구조상 필수 | 완화 불가 |
 | 예약 작업 + 레지스트리 등록 | 구조상 필수 | 완화 불가 |

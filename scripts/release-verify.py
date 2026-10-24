@@ -60,6 +60,8 @@
   `release-postprocess.py` 는 `git credential fill` 로 토큰을 얻지만 이 스크립트는 얻지 않는다.
   일부러 그렇다 — 내려받기는 워크플로가 `gh` 로 끝내고, 검증기는 (버전, 디렉터리)만의 순수 함수여야
   누구나·어디서나 같은 판정을 재현할 수 있다. 네트워크·토큰·리포 내 다른 파일에 의존하지 않는다.
+  ★(0.14.53 WP12) 입력이 하나 늘었다 — 드래프트 **본문 파일**(`--body-file`, 필수). 본문은 빌드 뒤 사람이 고치는
+  문면이라(실측 v0.14.52) 자산과 따로 받는다. 릴리스 디렉터리 **밖**에 둬야 한다 — 안에 두면 1단계의 미등재 자산이다.
   ★이 자기완결성 덕분에 워크플로가 이 파일 하나만 따로 가져와 쓸 수 있다 —
   `release-publish.yml` 의 2차 체크아웃(`path: .release-tools`, ref = 워크플로 자신의
   `github.sha`)이 그것이다. 발행 대상 태그 트리에 이 파일이 없어도 검증이 성립한다
@@ -68,8 +70,12 @@
 동반 회귀 테스트: `python3 scripts/tests/test_release_verify.py` (합성 픽스처 · 네트워크 불요)
 
 사용:
-  python3 scripts/release-verify.py --version 0.14.19 --release-dir ~/cys-release-backup/v0.14.19-assets
-  python3 scripts/release-verify.py --version 0.14.19 --release-dir reviewed-release --print-assets
+  python3 scripts/release-verify.py --version 0.14.53 --release-dir reviewed-release --body-file "$RUNNER_TEMP/release-body.txt"
+  python3 scripts/release-verify.py --version 0.14.53 --release-dir reviewed-release --body-file body.txt --print-assets
+
+★8단계 Windows SAC 고지(D6-b · 0.14.53): setup.exe 의 PE 보안 디렉터리(Authenticode)가 없어야 하고, 본문과 latest.json
+  notes 가 각각 `<!-- cys-win-sac: unsigned -->` 마커 정확히 하나와 SAC_KEY_PHRASES 두 문구를 실어야 한다. 서명된
+  설치 파일 · signed-* 마커 · 마커 0/2개 · 깨진 PE 헤더는 전부 실패다(서명이 잠든 판 — 부서장 판정 0·4).
 
 종료코드: 0=통과, 1=검증 실패, 2=인자 오류
 """
@@ -80,6 +86,7 @@ import hashlib
 import json
 import os
 import re
+import struct
 import sys
 import zipfile
 import zlib
@@ -145,6 +152,24 @@ ASSET_SHAPES = (
     (".sig",     "minisign-b64"),  # 특수 규칙 — base64 로 풀리고 minisign 헤더여야 한다
     (".json",    "json"),        # 특수 규칙 — 파싱되고 최상위가 객체여야 한다
 )
+
+
+# ★Windows 스마트 앱 컨트롤(SAC) 고지 ↔ 실제 서명 상태 (WP12-WINSAC-0.14.53 · D6-b · 오너 상시 규칙
+#   OWNER-20261023-WIN-SAC-STANDING-CHECK). 0.14.53 은 **서명이 잠든 판**이다(부서장 판정 0 — 오너 자격증명 없음).
+#   그래서 통과는 단 한 상태뿐이다: setup.exe 에 Authenticode 보안 디렉터리가 **없고**(PE 데이터 디렉터리 4 크기 0),
+#   본문과 latest.json notes 가 각각 **정확히 하나**의 `unsigned` 마커와 두 핵심 문구를 싣는다. 그 밖의 전부는 실패다 —
+#   서명된 설치 파일(검토되지 않은 서명 경로가 돌았다는 뜻), signed-unverified·signed-verified 마커, 마커 0개·2개.
+#   문구 정본은 release.yml 의 releaseBody 다 — test_release_verify.py 가 그 문면을 이 검사에 통과시켜 생산자와 관문이
+#   어긋나지 않음을 태그 전에 잰다.
+SAC_TOKEN = "cys-win-sac"
+SAC_MARKER_RE = re.compile(r"<!--\s*cys-win-sac:\s*(.*?)\s*-->", re.S)
+SAC_UNSIGNED = "unsigned"
+SAC_KEY_PHRASES = (
+    "이 판의 cys 설치 파일과 cys 실행파일은 코드 서명이 없습니다",
+    "this release's cys installer and cys executables are not code-signed",
+)
+# PE 헤더는 파일 머리에 있다(실물 e_lfanew 는 수백 바이트). 1 MiB 를 넘는 헤더 위치는 손상으로 본다.
+PE_HEAD_LIMIT = 1 << 20
 
 
 class VerifyError(Exception):
@@ -390,7 +415,89 @@ def check_latest_json(version, files, sums):
     return sorted(platforms)
 
 
-def verify(version, release_dir):
+def pe_security_directory(path):
+    """PE 데이터 디렉터리 4(IMAGE_DIRECTORY_ENTRY_SECURITY)의 (파일 오프셋, 크기). 크기 > 0 = Authenticode 서명 실재.
+
+    ★fail-closed: 헤더가 하나라도 어긋나면 '미서명'으로 기본값을 주지 않고 VerifyError 다 — 잘린·위조된 setup.exe 를
+      미서명으로 읽어 통과시키는 길을 막는다. 유효성(신뢰 체인)은 여기서 보지 않는다(Windows 레그의 일).
+    """
+    size_total = os.path.getsize(path)
+    with open(path, "rb") as fh:
+        head = fh.read(min(size_total, PE_HEAD_LIMIT))
+
+    def bad(why):
+        return VerifyError("windows-sac: %s 는 정상 PE 가 아니다(%s)" % (os.path.basename(path), why))
+
+    if len(head) < 0x40 or head[:2] != b"MZ":
+        raise bad("MZ 머리 없음")
+    e_lfanew = struct.unpack_from("<I", head, 0x3C)[0]
+    if e_lfanew < 0x40 or e_lfanew + 24 > len(head):
+        raise bad("e_lfanew=%d 이 파일 머리 밖" % e_lfanew)
+    if head[e_lfanew:e_lfanew + 4] != b"PE\0\0":
+        raise bad("PE 서명 없음")
+    coff = e_lfanew + 4
+    opt_size = struct.unpack_from("<H", head, coff + 16)[0]
+    opt = coff + 20
+    if opt_size < 2 or opt + opt_size > len(head):
+        raise bad("옵션 헤더 크기 %d 가 파일 밖" % opt_size)
+    magic = struct.unpack_from("<H", head, opt)[0]
+    if magic == 0x10B:      # PE32: NumberOfRvaAndSizes @92, DataDirectory @96
+        n_off, dd = opt + 92, opt + 96
+    elif magic == 0x20B:    # PE32+: NumberOfRvaAndSizes @108, DataDirectory @112
+        n_off, dd = opt + 108, opt + 112
+    else:
+        raise bad("옵션 헤더 magic 0x%X" % magic)
+    sec = dd + 4 * 8
+    if sec + 8 > opt + opt_size:
+        raise bad("데이터 디렉터리 4 가 옵션 헤더 밖")
+    if struct.unpack_from("<I", head, n_off)[0] < 5:
+        raise bad("NumberOfRvaAndSizes < 5")
+    off, size = struct.unpack_from("<II", head, sec)
+    if size and (off == 0 or off + size > size_total):
+        raise bad("보안 디렉터리(오프셋 %d · 크기 %d)가 파일(%d B) 밖" % (off, size, size_total))
+    return off, size
+
+
+def check_sac_text(text, where):
+    """SAC 고지 문면 대조 — 마커는 정확히 하나여야 하고 그 값은 `unsigned`, 두 핵심 문구가 모두 있어야 한다."""
+    n = text.count(SAC_TOKEN)
+    if n == 0:
+        raise VerifyError("windows-sac: %s 에 SAC 고지 마커(<!-- cys-win-sac: unsigned -->)가 없다 — "
+                          "서명 없는 Windows 판은 그 사실을 적지 않으면 공개할 수 없다" % where)
+    if n > 1:
+        raise VerifyError("windows-sac: %s 에 SAC 마커가 %d개다 — 정확히 하나여야 한다" % (where, n))
+    m = SAC_MARKER_RE.search(text)
+    value = m.group(1) if m else None
+    if value is None:
+        raise VerifyError("windows-sac: %s 의 SAC 마커 형식이 깨졌다(`<!-- cys-win-sac: unsigned -->`)" % where)
+    if value.startswith("signed-verified"):
+        raise VerifyError("windows-sac: %s 가 signed-verified 다 — 서명·SAC 검증 고지는 설치 파일 해시·버전·런 id 에 결속된 "
+                          "신뢰된 실 SAC 보고가 필요하며 이 판에서는 지원하지 않는다" % where)
+    if value != SAC_UNSIGNED:
+        raise VerifyError("windows-sac: %s 의 SAC 마커 값 %r 은 이 판에서 허용되지 않는다 — 서명이 잠든 판이라 "
+                          "'unsigned' 만 정직하다" % (where, value))
+    absent = [p for p in SAC_KEY_PHRASES if p not in text]
+    if absent:
+        raise VerifyError("windows-sac: %s 에 SAC 고지 핵심 문구가 없다 — %s" % (where, " / ".join(absent)))
+
+
+def check_windows_sac(version, files, body_text):
+    """D6-b — 공개 대상 setup.exe 의 실제 서명 상태와 사용자가 읽는 두 문면(본문 · latest.json notes)을 대조한다."""
+    setup = "cys_{v}_x64-setup.exe".format(v=version)
+    if setup not in files:
+        # REQUIRED_ASSETS(2단계)가 이미 강제하므로 도달하면 상수 회귀다 — n/a 로 통과시키지 않는다.
+        raise VerifyError("windows-sac: %s 가 없다 — 대조할 대상이 없으면 판정할 수 없다" % setup)
+    _, size = pe_security_directory(files[setup])
+    if size:
+        raise VerifyError("windows-sac: %s 에 Authenticode 서명이 있다(보안 디렉터리 %d B) — 이 판은 서명이 잠든 판이라 "
+                          "서명된 설치 파일은 검토되지 않은 서명 경로가 돌았다는 뜻이다" % (setup, size))
+    check_sac_text(body_text, "릴리스 본문")
+    latest = json.loads(read_text_strict(files["latest.json"], "latest.json"))
+    check_sac_text(latest["notes"], "latest.json notes")
+    return SAC_UNSIGNED
+
+
+def verify(version, release_dir, body_text):
     if not VERSION_RE.match(version):
         raise VerifyError("--version 은 X.Y.Z 여야 한다: %r" % version)
 
@@ -435,6 +542,9 @@ def verify(version, release_dir):
     # ── 7. 업데이터(latest.json) 교차 대조 ──
     platforms = check_latest_json(version, files, sums)
 
+    # ── 8. Windows SAC 고지 ↔ 서명 상태 (D6-b) — latest.json 이 7단계에서 검증된 뒤에 notes 를 읽는다 ──
+    check_windows_sac(version, files, body_text)
+
     return sorted(sums), platforms
 
 
@@ -442,11 +552,14 @@ def main():
     ap = argparse.ArgumentParser(description="릴리스 자산 묶음을 오프라인으로 검증한다")
     ap.add_argument("--version", required=True, help="기대 버전 (X.Y.Z — 태그의 v 를 뗀 값)")
     ap.add_argument("--release-dir", required=True, help="전 자산을 내려받아 둔 디렉터리")
+    ap.add_argument("--body-file", required=True,
+                    help="드래프트 릴리스 본문을 담은 파일(--release-dir **밖**에 둔다 — 안에 두면 미등재 자산이다)")
     ap.add_argument("--print-assets", action="store_true", help="검증된 자산명을 한 줄씩 출력")
     args = ap.parse_args()
 
     try:
-        assets, platforms = verify(args.version, args.release_dir)
+        body_text = read_text_strict(args.body_file, "--body-file")
+        assets, platforms = verify(args.version, args.release_dir, body_text)
     except VerifyError as e:
         print("::error::릴리스 검증 실패 — %s" % e, file=sys.stderr)
         return 1
@@ -459,7 +572,7 @@ def main():
 
     if args.print_assets:
         print("\n".join(assets))
-    print("✅ 릴리스 검증 통과 — %s · 자산 %d종(+%s) · 업데이터 %d행 전부 서명 일치"
+    print("✅ 릴리스 검증 통과 — %s · 자산 %d종(+%s) · 업데이터 %d행 전부 서명 일치 · windows-sac: unsigned 고지 일치"
           % (args.version, len(assets), SUMS_NAME, len(platforms)))
     return 0
 

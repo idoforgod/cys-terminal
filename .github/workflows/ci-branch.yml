@@ -350,6 +350,15 @@ jobs:
                   "so a release or pack-release entry would have nothing to measure. Also run by import from "
                   "test_ci_branch_cysd_step.py.",
               ),
+              "test_release_verify": (
+                  {"ci-branch"},
+                  "scripts/tests/ suite (not a pack suite; 0.14.53 WP12). Hermetic tests of scripts/release-verify.py, the last "
+                  "fail-closed gate before public promotion, now including step 8 (Windows SAC statement vs the installer's real "
+                  "signature state, D6-b). release-publish.yml runs this file as its self-test before every publication, but that "
+                  "workflow is not a lane here; this branch entry makes a regression visible before the tag (the pre-tag procedure "
+                  "requires ci-branch green on the tag SHA). release.yml does not run release-verify.py, and pack-release ships "
+                  "neither the verifier nor anything it reads, so an entry there would have nothing to measure.",
+              ),
               "test_release_windows_help_gate": (
                   {"ci-branch"},
                   "scripts/tests/ suite (not a pack suite; 0.14.52 W-GATE). It reads workflow TEXT only: the Windows packaged "
@@ -1491,6 +1500,17 @@ jobs:
       # ★(0.14.52 · W-GATE) Windows packaged cys.exe --help gate pin, registered by name. It reads the gate step of release.yml
       #   (Windows leg, before every upload) and of windows-build.yml (pre-tag dry run, same body) as text and checks them.
       #   Branch lane only: ALLOWED("test_release_windows_help_gate") in the lane-parity gate above gives the reason. ★No `if:`.
+      # ★(0.14.53 WP12 · D6-b) release-verify.py hermetic suite, registered by name. release-publish.yml runs it as its
+      #   self-test before every publication; this step makes the same file a branch signal before the tag.
+      #   Branch lane only: ALLOWED("test_release_verify") in the lane-parity gate above gives the reason. ★No `if:`.
+      - name: release-verify.py hermetic suite (publication gate incl. Windows SAC statement)
+        shell: bash
+        run: |
+          set -euo pipefail
+          f="scripts/tests/test_release_verify.py"
+          [ -f "$f" ] || { echo "Missing release-verify suite: $f" >&2; exit 1; }
+          PYTHONDONTWRITEBYTECODE=1 python3 "$f"
+
       - name: Windows --help gate step pin (release.yml + windows-build.yml)
         shell: bash
         run: |
