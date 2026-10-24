@@ -5275,9 +5275,35 @@ class Preflight:
         acked_note = ""
         try:
             scan_tool = os.path.join(pack_dir(), "bin", "javis_skillscan.py")
+            # ★C7 상한 서열 — innermost-smallest(WP18 · 2026-10-24). 이 스캔은 겹겹의 상한
+            #   **안쪽**에서 돈다: ⓐ SessionStart 훅 inject-context.sh:352 의 `timeout 40`
+            #   (★macOS 에는 timeout(1) 이 없어 이 겹이 아예 없다 — 실측) → ⓑ
+            #   javis_checklist.py PREFLIGHT_TIMEOUT=30 → ⓒ 여기. 종전 120 은 바깥보다
+            #   커서 훅 경로에서 **발화 불가**였다(40>30>120): preflight 가 30 에 먼저
+            #   죽으니 스캔이 자기 실패를 말할 기회가 없었다. 20 은 ⓑ 보다 작아 어느
+            #   경로에서도 이 스캔이 **자기 사유를 말한다**(부트 경로 300·CI 360 에서도).
+            #   여유는 평균이 아니라 **실측 분포**로 잡는다 — 병렬 런의 바닥은
+            #   max(최장 스킬, 총합/워커수)이고 이 호스트 실측에서 최장 스킬(insane-search)
+            #   혼자 1.99s, 114 스킬 총합 11.5s ⇒ 바닥 ≈1.99s. 20s = 그 바닥의 약 10배.
+            #   풀 기동 실패로 직렬 폴백이면 0.069s/스킬 ⇒ 20s 는 약 288 스킬까지 든다.
             r = subprocess.run([sys.executable, scan_tool, "all", "--json"],
-                               capture_output=True, text=True, timeout=120)
-            data = json.loads(r.stdout or "{}")
+                               capture_output=True, text=True, timeout=20)
+            # ★C6(CEO 판정 2026-10-24 — 양보 불가): 종전 `json.loads(r.stdout or "{}")` 는
+            #   **빈 출력을 '차단 0건'으로 읽었다** — 보안 게이트가 fail-open 했다.
+            #   실측(스텁 스캐너로 이 c60 경로를 실제 구동): 빈 stdout+exit 0 이면 이 검사는
+            #   스캔을 **한 줄도 언급하지 않고** WARN 으로 끝났고, stdout 이 `{}` 일 때도
+            #   같았다. '차단된 스킬이 없다'와 '결과를 재지 못했다'는 **다른 상태**이며
+            #   한 칸에 접히면 안 된다. 그래서 세 겹으로 닫는다 — ⓐ `or "{}"` 폴백 삭제
+            #   ⓑ returncode 확인 ⓒ 출력 형상(scanned·blocked 키) 확인.
+            #   exit 1 은 실패가 아니다(BLOCK 존재 = 정상 판정) · exit 2 는 도구 오류다.
+            if r.returncode not in (0, 1):
+                raise ValueError("스캐너 exit %s · stderr: %s"
+                                 % (r.returncode, (r.stderr or "").strip()[:200] or "(없음)"))
+            if not (r.stdout or "").strip():
+                raise ValueError("스캐너가 출력을 내지 않았다(빈 stdout)")
+            data = json.loads(r.stdout)
+            if not isinstance(data, dict) or "scanned" not in data or "blocked" not in data:
+                raise ValueError("출력에 scanned·blocked 키가 없다 — 스캔 결과가 아니다")
             blocked = data.get("blocked") or []
             if blocked:
                 ack_p = os.path.join(os.environ.get("JAVIS_ROOT") or os.getcwd(),
@@ -5307,8 +5333,17 @@ class Preflight:
                                  "검토(master/CSO)" % (len(residual), ", ".join(sorted(residual)[:8])))
                 if acked:
                     acked_note = " · BLOCK 승인 %d건(핀 일치)" % len(acked)
+        except subprocess.TimeoutExpired:
+            # ★C6/C7(CEO): 상한 안에 **끝나지 못한 것**이다 — 느린 호스트·고부하의
+            #   **상한 초과(지정 시간 내 분석 미완료)**이고, BLOCK 판정도 파싱 실패도
+            #   아니다. 세 상황의 문면을 서로 구별되게 적는다(C9: 층마다 다른 소리).
+            #   처방으로 --fix 를 적지 않는다 — 수리할 결함이 아니라 다시 재야 하는 상황이다.
+            probs.append("skillscan 집행 스캔 미완료 — 20s 상한 안에 끝나지 못했다"
+                         "(느린 호스트·고부하). 「BLOCK 0건」이 아니라 「재지 못함」이다 — "
+                         "한가할 때 재산하라(--only C60.gate-wiring).")
         except Exception as e:
-            probs.append("skillscan 집행 스캔 실행 불가(%s)" % e)
+            probs.append("skillscan 집행 스캔 결과 판독 불가(%s) — 「BLOCK 0건」이 "
+                         "아니라 「재지 못함」이다" % e)
         # (d) mcpgate rug-pull diff — 승인 스냅샷 저장소 기반(스냅샷 없으면 미가동 경고)
         store = os.path.join(os.environ.get("JAVIS_ROOT") or os.getcwd(), "_round", "mcp_approved")
         snaps = sorted(f for f in (os.listdir(store) if os.path.isdir(store) else [])
