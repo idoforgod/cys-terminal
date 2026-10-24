@@ -22,6 +22,8 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
+import struct
 import subprocess
 import sys
 import tempfile
@@ -39,6 +41,42 @@ _spec.loader.exec_module(rv)
 
 V = "0.14.19"
 BASE = "https://github.com/idoforgod/cys-terminal/releases/download/v%s/" % V
+
+
+# ★(0.14.53 WP12 · D6-b) 공개 본문·latest.json notes 가 실어야 하는 SAC 고지 — release.yml releaseBody 의 SAC 블록과
+#   같은 문면이다(그 일치는 test_51 이 release.yml 을 직접 읽어 잰다).
+SAC_BLOCK = (
+    "<!-- cys-win-sac: unsigned -->\n"
+    "**Windows 스마트 앱 컨트롤(SAC):** 이 판의 cys 설치 파일과 cys 실행파일은 코드 서명이 없습니다. "
+    "스마트 앱 컨트롤이 켜진 PC에서는 실행이 막힐 수 있으며, 이 판은 스마트 앱 컨트롤 적용 PC에서 검증하지 않았습니다.\n"
+    "**Windows Smart App Control:** this release's cys installer and cys executables are not code-signed. "
+    "They may be blocked on PCs with Smart App Control on, and this release was not verified on a Smart App Control PC.\n"
+)
+BODY_OK = "cys 터미널 v%s. 설치 안내.\n\n%s" % (V, SAC_BLOCK)
+
+
+def _pe(magic=0x20B, nrva=16, security=(0, 0), e_lfanew=0x80, payload=b""):
+    """최소 PE 머리(섹션 0개) — 데이터 디렉터리 4(보안)를 원하는 값으로. magic 0x20B=PE32+, 0x10B=PE32."""
+    opt_size = (112 if magic == 0x20B else 96) + 8 * nrva
+    hdr = bytearray(e_lfanew + 4 + 20 + opt_size)
+    hdr[0:2] = b"MZ"
+    struct.pack_into("<I", hdr, 0x3C, e_lfanew)
+    hdr[e_lfanew:e_lfanew + 4] = b"PE\0\0"
+    coff = e_lfanew + 4
+    struct.pack_into("<HH", hdr, coff, 0x8664, 0)
+    struct.pack_into("<H", hdr, coff + 16, opt_size)
+    opt = coff + 20
+    struct.pack_into("<H", hdr, opt, magic)
+    struct.pack_into("<I", hdr, opt + (108 if magic == 0x20B else 92), nrva)
+    if nrva >= 5:
+        struct.pack_into("<II", hdr, opt + (112 if magic == 0x20B else 96) + 32, *security)
+    return bytes(hdr) + payload
+
+
+def _signed_pe(payload=b"windows-nsis-installer-payload" * 8):
+    """보안 디렉터리가 파일 끝의 가짜 WIN_CERTIFICATE 16B 를 가리키는 PE — '서명된 설치 파일'의 구조 표본."""
+    head_len = len(_pe())
+    return _pe(security=(head_len + len(payload), 16), payload=payload + b"C" * 16)
 
 
 def _sig_text(tag):
@@ -68,7 +106,9 @@ def write_sums(root):
 
 def build_fixture(root):
     """정상 통과하는 13종 묶음을 합성한다(실물 v0.14.19 의 구조를 축소 재현)."""
-    exe_bytes = b"MZ\x90\x00" + b"windows-nsis-installer-payload" * 8
+    # ★(0.14.53 WP12) setup.exe 는 **정상 PE 머리**를 가져야 한다 — 8단계(D6-b)가 보안 디렉터리를 읽으며, 깨진 머리는
+    #   '미서명'으로 기본값을 주지 않고 실패한다. 종전 바이트(MZ\x90\x00 + 쓰레기)는 이제 test_48a 의 음성 표본이다.
+    exe_bytes = _pe(payload=b"windows-nsis-installer-payload" * 8)
 
     def w(name, data):
         with open(os.path.join(root, name), "wb") as fh:
@@ -102,7 +142,7 @@ def build_fixture(root):
         platforms[key] = {"signature": sigs[asset + ".sig"], "url": BASE + asset}
     w("latest.json", json.dumps({
         "version": V,
-        "notes": "cys %s — 릴리스 안내" % V,
+        "notes": "cys %s — 릴리스 안내\n\n%s" % (V, SAC_BLOCK),
         "pub_date": "2026-08-17T14:36:35Z",
         "platforms": platforms,
     }, ensure_ascii=False).encode())
@@ -115,6 +155,7 @@ class ReleaseVerifyTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.root = build_fixture(self._tmp.name)
+        self.body = BODY_OK
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -131,13 +172,13 @@ class ReleaseVerifyTests(unittest.TestCase):
             json.dump(obj, fh, ensure_ascii=False)
 
     def assert_pass(self):
-        assets, platforms = rv.verify(V, self.root)
+        assets, platforms = rv.verify(V, self.root, self.body)
         return assets, platforms
 
     def assert_fail(self, needle):
         """비영 종료 사유에 needle 이 들어 있어야 한다 — '조용한 통과'를 막는 본체."""
         with self.assertRaises(rv.VerifyError) as cm:
-            rv.verify(V, self.root)
+            rv.verify(V, self.root, self.body)
         self.assertIn(needle, str(cm.exception),
                       "예상 사유 %r 가 아니라 %r 로 죽었다" % (needle, str(cm.exception)))
         return str(cm.exception)
@@ -371,20 +412,123 @@ class ReleaseVerifyTests(unittest.TestCase):
     def test_32_empty_dir(self):
         with tempfile.TemporaryDirectory() as d:
             with self.assertRaises(rv.VerifyError) as cm:
-                rv.verify(V, d)
+                rv.verify(V, d, BODY_OK)
             self.assertIn("비어 있다", str(cm.exception))
 
     def test_33_missing_dir(self):
         with self.assertRaises(rv.VerifyError) as cm:
-            rv.verify(V, os.path.join(self.root, "no-such-dir"))
+            rv.verify(V, os.path.join(self.root, "no-such-dir"), BODY_OK)
         self.assertIn("릴리스 디렉터리가 없다", str(cm.exception))
+
+    # ── 8. Windows SAC 고지 ↔ 서명 상태 (0.14.53 WP12 · D6-b · 부서장 판정 0·4) ──────────
+    def set_setup(self, data):
+        """setup.exe 와 그것을 품은 zip 을 함께 바꾼다(6단계 바이트 동일성은 그대로 성립시킨다)."""
+        name = "cys_%s_x64-setup.exe" % V
+        open(self.p(name), "wb").write(data)
+        with zipfile.ZipFile(self.p("cys_%s_x64-setup.zip" % V), "w") as z:
+            z.writestr(name, data)
+        write_sums(self.root)
+
+    def set_notes(self, notes):
+        latest = self.load_latest()
+        latest["notes"] = notes
+        self.save_latest(latest)
+        write_sums(self.root)
+
+    def test_40_body_without_sac_marker(self):
+        self.body = "cys 터미널 v%s. 설치 안내." % V
+        self.assert_fail("SAC 고지 마커")
+
+    def test_41_body_with_two_markers(self):
+        self.body = BODY_OK + "\n<!-- cys-win-sac: unsigned -->\n"
+        self.assert_fail("SAC 마커가 2개")
+
+    def test_42_body_signed_unverified_refused(self):
+        self.body = BODY_OK.replace("cys-win-sac: unsigned", "cys-win-sac: signed-unverified")
+        self.assert_fail("허용되지 않는다")
+
+    def test_43_body_signed_verified_refused_with_any_run_id(self):
+        for marker in ("cys-win-sac: signed-verified", "cys-win-sac: signed-verified run=123456789"):
+            self.body = BODY_OK.replace("cys-win-sac: unsigned", marker)
+            self.assert_fail("signed-verified")
+
+    def test_44_body_marker_without_each_key_phrase(self):
+        for phrase in rv.SAC_KEY_PHRASES:
+            self.body = BODY_OK.replace(phrase, "")
+            msg = self.assert_fail("핵심 문구")
+            self.assertIn(phrase, msg)
+
+    def test_45_signed_setup_refused_even_with_unsigned_text(self):
+        self.set_setup(_signed_pe())
+        self.assert_fail("Authenticode 서명이 있다")
+
+    def test_46_notes_without_marker(self):
+        self.set_notes("cys %s — 릴리스 안내" % V)
+        self.assert_fail("latest.json notes 에 SAC 고지 마커")
+
+    def test_47_notes_claiming_signed(self):
+        self.set_notes("cys %s\n\n%s" % (V, SAC_BLOCK.replace("cys-win-sac: unsigned",
+                                                                "cys-win-sac: signed-verified run=1")))
+        self.assert_fail("signed-verified")
+
+    def test_48_malformed_pe_fails_closed(self):
+        """깨진 PE 머리는 '미서명'이 아니라 실패다 — 잘린·위조된 설치 파일이 미서명으로 읽혀 통과하는 길을 막는다."""
+        legacy = b"MZ\x90\x00" + b"windows-nsis-installer-payload" * 8      # 종전 픽스처 바이트
+        good = bytearray(_pe(payload=b"p" * 64))
+        no_pe_sig = bytes(good[:0x80]) + b"XX\0\0" + bytes(good[0x84:])
+        bad_magic = bytearray(good)
+        struct.pack_into("<H", bad_magic, 0x80 + 24, 0x0107)
+        cases = {
+            "a-legacy-fixture": legacy,
+            "b-e_lfanew-past-end": _pe(e_lfanew=0x80)[:0x90],
+            "c-no-PE-signature": no_pe_sig,
+            "d-four-data-directories": _pe(nrva=4, payload=b"p" * 64),
+            "e-security-dir-past-end": _pe(security=(len(_pe()), 4096), payload=b"p" * 16),
+            "f-bad-optional-magic": bytes(bad_magic),
+        }
+        for label, data in cases.items():
+            with self.subTest(case=label):
+                self.set_setup(data)
+                self.assert_fail("정상 PE 가 아니다")
+
+    def test_49_pe32_unsigned_passes(self):
+        self.set_setup(_pe(magic=0x10B, payload=b"windows-nsis-installer-payload" * 8))
+        self.assert_pass()
+
+    def test_50_real_unsigned_launchers_parse_as_unsigned(self):
+        """실물 표본(합성 아님) — pip 이 동봉하는 distlib Windows 런처(PE32·PE32+, 미서명)를 파서가 바르게 읽는가."""
+        try:
+            import pip  # noqa: F401
+            d = os.path.join(os.path.dirname(pip.__file__), "_vendor", "distlib")
+        except ImportError:
+            self.skipTest("pip 미설치 — 실물 표본 없음")
+        found = sorted(f for f in os.listdir(d) if f.endswith(".exe")) if os.path.isdir(d) else []
+        if not found:
+            self.skipTest("distlib 런처 없음 — 실물 표본 없음")
+        for f in found:
+            with self.subTest(launcher=f):
+                off, size = rv.pe_security_directory(os.path.join(d, f))
+                self.assertEqual(size, 0, "%s 에 보안 디렉터리가 있다고 읽었다" % f)
+
+    def test_51_body_file_inside_release_dir_is_a_stowaway(self):
+        """본문 파일을 릴리스 디렉터리 안에 두면 1단계 미등재 자산으로 실패한다 — 워크플로는 밖에 둬야 한다(G4.2)."""
+        open(self.p("body.txt"), "w", encoding="utf-8").write(BODY_OK)
+        self.assert_fail("SUMS 에 없는 자산")
 
 
 class ExitCodeContractTests(unittest.TestCase):
     """★워크플로 계약 — `set -euo pipefail` 아래에서 종료코드가 곧 fail-closed 다."""
 
-    def run_cli(self, *args):
-        return subprocess.run([sys.executable, os.path.abspath(_RV_PATH)] + list(args),
+    def run_cli(self, *args, body=BODY_OK):
+        """본문 파일은 릴리스 디렉터리 **밖**의 임시 파일로 넘긴다(워크플로와 같은 배치). body=None 이면 넘기지 않는다."""
+        extra = []
+        if body is not None:
+            fd, path = tempfile.mkstemp(suffix="-release-body.txt")
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(body)
+            self.addCleanup(os.remove, path)
+            extra = ["--body-file", path]
+        return subprocess.run([sys.executable, os.path.abspath(_RV_PATH)] + list(args) + extra,
                               capture_output=True, text=True)
 
     def test_exit_0_on_pass(self):
@@ -413,6 +557,21 @@ class ExitCodeContractTests(unittest.TestCase):
         r = self.run_cli("--version", V)
         self.assertEqual(r.returncode, 2)                 # argparse 사용법 오류
 
+    def test_exit_2_without_body_file(self):
+        """--body-file 은 필수다 — 빠뜨리면 SAC 대조를 건너뛰는 게 아니라 사용법 오류로 죽는다(G4.2)."""
+        with tempfile.TemporaryDirectory() as d:
+            build_fixture(d)
+            r = self.run_cli("--version", V, "--release-dir", d, body=None)
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("--body-file", r.stderr)
+
+    def test_exit_1_when_body_lacks_sac_line(self):
+        with tempfile.TemporaryDirectory() as d:
+            build_fixture(d)
+            r = self.run_cli("--version", V, "--release-dir", d, body="cys 안내만 있는 본문")
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("windows-sac", r.stderr)
+
     def test_print_assets_lists_all_13(self):
         with tempfile.TemporaryDirectory() as d:
             build_fixture(d)
@@ -420,6 +579,59 @@ class ExitCodeContractTests(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stderr)
             listed = [ln for ln in r.stdout.splitlines() if not ln.startswith("✅")]
             self.assertEqual(len(listed), 13)
+
+
+class ReleaseWorkflowSacTextTests(unittest.TestCase):
+    """생산자(release.yml releaseBody)와 관문(check_sac_text)이 같은 문면에 합의하는가 — 태그 전에 잰다.
+
+    태그 레인에서 처음 붉어지면 버전 번호 하나를 태운다. 본문은 tauri-action 이 latest.json notes 로도 옮기므로
+    (실측 M2-b) 이 문면 하나가 8단계 두 대조(본문 · notes)의 출발점이다."""
+
+    def test_52_release_yml_release_body_passes_the_gate(self):
+        wf = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".github", "workflows", "release.yml")
+        src = open(wf, encoding="utf-8").read()
+        self.assertEqual(src.count("releaseBody:"), 1, "releaseBody 키가 정확히 하나여야 한다")
+        m = re.search(r"\n( +)releaseBody: \|\n((?:\1 .*\n|\s*\n)+)", src)
+        self.assertIsNotNone(m, "releaseBody 가 블록 스칼라(|)가 아니다 — SAC 블록을 여러 줄로 실어야 한다")
+        indent = m.group(1) + "  "
+        body = "\n".join(l[len(indent):] if l.startswith(indent) else l.strip() for l in m.group(2).split("\n"))
+        body = body.replace("${{ github.ref_name }}", "v" + V)
+        rv.check_sac_text(body, "release.yml releaseBody")
+        self.assertIn(SAC_BLOCK.strip(), body.strip(), "release.yml 의 SAC 블록이 이 테스트의 SAC_BLOCK 과 다르다")
+
+    def _step_run(self, wf_rel, name):
+        """`- name: <name>` 스텝의 `run: |` 본문(들여쓰기 제거) — 모르는 꼴이면 실패한다(조용히 틀린 본문을 재지 않는다)."""
+        wf = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", wf_rel)
+        lines = open(wf, encoding="utf-8").read().split("\n")
+        heads = [i for i, l in enumerate(lines) if l.strip() == "- name: " + name]
+        self.assertEqual(len(heads), 1, "%s 에 스텝 %r 가 %d개" % (wf_rel, name, len(heads)))
+        ind = lambda t: len(t) - len(t.lstrip(" "))
+        dash = ind(lines[heads[0]])
+        j = heads[0] + 1
+        while j < len(lines) and lines[j].strip() != "run: |":
+            self.assertGreater(ind(lines[j]) if lines[j].strip() else dash + 1, dash, "run: | 전에 스텝이 끝났다")
+            j += 1
+        key = ind(lines[j])
+        block = []
+        j += 1
+        while j < len(lines) and not (lines[j].strip() and ind(lines[j]) <= key):
+            block.append(lines[j])
+            j += 1
+        body_ind = min(ind(l) for l in block if l.strip())
+        return "\n".join(l[body_ind:] for l in block) + "\n"
+
+    def test_53_signing_mode_step_allows_only_unsigned(self):
+        """SM(0.14.53 서명 잠금): 실제 워크플로 스텝 본문을 bash 로 돌린다 — 빈 값·unsigned 만 0, 나머지(test 포함)는 1."""
+        run = self._step_run(".github/workflows/release.yml", "Windows signing mode (dormant - unsigned only in this release)")
+        for value, want in (("", 0), ("unsigned", 0), ("test", 1), ("artifact", 1), ("ca", 1), ("signed", 1)):
+            with self.subTest(WINSIGN_MODE=value):
+                env = dict(os.environ, WINSIGN_MODE=value)
+                r = subprocess.run(["bash", "-c", run], capture_output=True, text=True, env=env)
+                self.assertEqual(r.returncode, want, r.stdout + r.stderr)
+                if want == 0:
+                    self.assertIn("mode=unsigned", r.stdout)
+                else:
+                    self.assertIn("not allowed in this release", r.stderr)
 
 
 class ConstantsSanityTests(unittest.TestCase):

@@ -925,6 +925,25 @@ jobs:
           CYS_PACK_DIR="$(mktemp -d)" cargo test --lib claude_alt_screen -- --test-threads=1
           CYS_PACK_DIR="$(mktemp -d)" cargo test --lib merge3:: -- --test-threads=1
 
+      # ★(0.14.53 WP12 · SM) Windows 서명 모드 결정 — 이 판은 **서명이 잠든 판**이다(부서장 판정 0 · 오너 자격증명 없음 ·
+      #   Req1 서명 배선은 0.14.53 범위 밖으로 잘렸다). 허용 모드는 문자 그대로 {unsigned} 하나 — 태그 push 든
+      #   workflow_dispatch 든, 어떤 값을 설정해도(test 포함) 여기서 붉다. 서명을 켜려면 이 집합을 고치는 검토된 변경과 새
+      #   설계 라운드가 필요하다. 공개 직전 release-verify.py 8단계(D6-b)가 서명된 setup.exe 를 따로 거부한다(이중 잠금).
+      - name: Windows signing mode (dormant - unsigned only in this release)
+        if: matrix.platform == 'windows-latest'
+        shell: bash
+        env:
+          WINSIGN_MODE: ${{ vars.WINSIGN_MODE }}
+        run: |
+          set -euo pipefail
+          case "${WINSIGN_MODE:-}" in
+            ""|unsigned)
+              echo "windows-signing: mode=unsigned (signing is dormant in this release)" ;;
+            *)
+              echo "::error::WINSIGN_MODE='${WINSIGN_MODE}' is not allowed in this release - only 'unsigned' (signing is dormant; enabling it needs a reviewed change and a new design round)" >&2
+              exit 1 ;;
+          esac
+
       - name: Windows 직접 빌드 + CRT gate (VCRUNTIME import sweep + 0.14.1 fix markers · 업로드 전)
         if: matrix.platform == 'windows-latest'
         shell: bash
@@ -985,6 +1004,10 @@ jobs:
           [ "$NEG_RC" -eq 1 ] || { echo "::error::음성 대조 실패 — v0.14.0 은 exit 1(CRT 위반)이어야 한다. got $NEG_RC" >&2; exit 1; }
           echo "$NEG_OUT" | grep -q "markers: 0/" || { echo "::error::음성 대조 실패 — v0.14.0 마커는 0/N 이어야 한다" >&2; exit 1; }
           echo "✓ 음성 대조 통과: v0.14.0 = CRT 위반 검출 + 마커 0/3 (게이트 판별력 실증)"
+          # ④ (0.14.53 WP12 · D6-a) 출하 Windows PE 서명 census — 확장자와 무관하게 MZ 로 시작하는 전 파일 + setup.exe.
+          #   서명이 잠든 판이라 **우리 파일**(setup·cys·cysd·cys-app·uninstall)에 Authenticode 가 있으면 실패(5)다.
+          #   매 실행 대조(합성 서명 PE 가 붉게 읽히는가)가 판별력을 함께 증명한다. 벤더 파일 상태는 로그에 기록만.
+          "$PY" scripts/verify_win_crt.py --setup "${SETUP[0]}" --sac-census --report "$RUNNER_TEMP/windows-signing-report.json"
 
       # ★Windows VERSIONINFO 상시 게이트 (W5-3 · 2026-08-29 — 업로드 전 · 실패 = 빌드 실패, 경고 아님).
       #   왜 영구 게이트인가(훅 워커 실측): ①POSIX makensis 3.12 의 !getdllversion 은 리소스 없는 PE 에
@@ -1096,7 +1119,16 @@ jobs:
           tagName: ${{ github.ref_name }}
           # Phase 2(릴리스 통합·2026-07-03): 소스 repo가 public이 되면서 이 릴리스가 곧 공개 배포다.
           releaseName: 'cys ${{ github.ref_name }}'
-          releaseBody: 'cys 터미널 ${{ github.ref_name }}. macOS는 .dmg, Windows는 -setup.exe를 내려받아 설치하세요. 기존 사용자는 앱 내 Update 버튼으로 자동 갱신됩니다.'
+          # ★(0.14.53 WP12 · Req3) Windows 스마트 앱 컨트롤 고지 — 이 판의 Windows 실행파일은 서명이 없다(위 매트릭스 주석 ·
+          #   부서장 판정 0: 서명은 잠든 판). 이 본문은 latest.json notes 로도 옮겨지고(실측 M2-b), 공개 직전 release-verify.py
+          #   8단계(D6-b)가 본문·notes 둘 다에서 마커 1개 + 두 핵심 문구를 요구한다 — 빼거나 고치면 공개가 막힌다.
+          #   세 레그(macOS 2 · Windows 1)가 같은 본문을 쓴다(레그 순서와 무관하게 같은 문면이 남는다).
+          releaseBody: |
+            cys 터미널 ${{ github.ref_name }}. macOS는 .dmg, Windows는 -setup.exe를 내려받아 설치하세요. 기존 사용자는 앱 내 Update 버튼으로 자동 갱신됩니다.
+
+            <!-- cys-win-sac: unsigned -->
+            **Windows 스마트 앱 컨트롤(SAC):** 이 판의 cys 설치 파일과 cys 실행파일은 코드 서명이 없습니다. 스마트 앱 컨트롤이 켜진 PC에서는 실행이 막힐 수 있으며, 이 판은 스마트 앱 컨트롤 적용 PC에서 검증하지 않았습니다.
+            **Windows Smart App Control:** this release's cys installer and cys executables are not code-signed. They may be blocked on PCs with Smart App Control on, and this release was not verified on a Smart App Control PC.
           releaseDraft: true      # ★v0.14.0(2026-07-28): draft 생성까지만 — 공개 발행·latest 마킹은 오너 승인 후
                                   #   별도 집행(발행=외부 공개 denylist). 구 'false 자동발행'은 승인 게이트와 충돌.
           prerelease: false

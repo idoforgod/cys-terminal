@@ -98,8 +98,13 @@ jobs:
           mkdir reviewed-release
           gh release download "$TAG" -R "$SRC_REPO" --dir reviewed-release
           VERSION="${TAG#v}"
+          # ★(0.14.53 WP12 · D6-b) 사용자가 읽는 드래프트 본문을 검증기에 넘긴다 — 본문은 빌드 뒤 사람이 고치는 문면이다
+          #   (실측 v0.14.52). 릴리스 디렉터리 **밖**($RUNNER_TEMP)에 둔다: 안에 두면 SUMS 미등재 자산으로 1단계에서 죽는다.
+          #   검증기 8단계가 본문·latest.json notes 의 Windows SAC 고지와 setup.exe 의 실제 서명 상태를 대조한다.
+          BODY_FILE="$RUNNER_TEMP/release-body.txt"
+          gh release view "$TAG" -R "$SRC_REPO" --json body --jq .body > "$BODY_FILE"
           python3 .release-tools/scripts/release-verify.py \
-            --version "$VERSION" --release-dir reviewed-release
+            --version "$VERSION" --release-dir reviewed-release --body-file "$BODY_FILE"
           ACTUAL_BUNDLE_SHA256="$(shasum -a 256 reviewed-release/SHA256SUMS.txt | awk '{print $1}')"
           [ "$ACTUAL_BUNDLE_SHA256" = "$EXPECTED_BUNDLE_SHA256" ] || {
             echo "reviewed release digest mismatch" >&2

@@ -33,13 +33,17 @@
 
 종료 코드: 0=통과 / 1=검사A 위반 / 2=검사B 마커 결손 / 3=PE 파싱 실패(fail-closed) /
           4=입력·추출 오류. 모든 판정 내역을 stdout 에 남긴다(릴리스 로그 증거).
+  --sac-census(0.14.53 WP12 · D6-a): CRT 검사 대신 출하 PE 서명 census 만 한다. 0=통과 / 3=우리 파일 PE 판독 불가 /
+          4=입력·추출 오류 / 5=우리 파일에 Authenticode 서명(서명이 잠든 판 위반) / 6=열거 불성립 또는 매 실행 대조 실패.
 
 사용:
   python3 scripts/verify_win_crt.py --setup release-candidate/cys_X.Y.Z_x64-setup.exe
   python3 scripts/verify_win_crt.py --tree <추출된 설치 트리>  [--sevenzip 7zz]
+  python3 scripts/verify_win_crt.py --setup <setup.exe> --sac-census --report windows-signing-report.json
 """
 
 import argparse
+import json
 import os
 import re
 import struct
@@ -239,6 +243,152 @@ def check_markers(tree):
     return missing, cysd
 
 
+# ── D6-a(0.14.53 WP12-WINSAC · 오너 상시 규칙 OWNER-20261023-WIN-SAC-STANDING-CHECK) — 출하 Windows PE 서명 census ──
+# 이 판은 **서명이 잠든 판**이다(부서장 판정 0). 그래서 census 의 붉은 규칙은 하나다: **우리 파일**(setup.exe ·
+# cys.exe · cysd.exe · cys-app.exe · uninstall.exe — 훅 스테이징 별칭 포함)에 Authenticode 보안 디렉터리가 있으면
+# 검토되지 않은 서명 경로가 돌았다는 뜻이므로 실패(5)다. 벤더 파일(동봉 런타임)의 서명은 기록만 한다(U2 실측).
+# 열거는 이름이 아니라 **내용**으로 한다 — 확장자와 무관하게 첫 2바이트가 `MZ` 인 모든 파일(.pyd 포함).
+# 매 실행 대조: 보안 디렉터리를 가진 합성 `cysd.exe` 에 같은 규칙을 돌려 붉은 판정이 실제로 나는지 본다 — 서명된 파일을
+# 못 보는 census 는 게이트가 아니다. 보안 디렉터리 판독은 release-verify.py 의 같은 이름 함수와 같은 꼴이다(그 파일은
+# 저장소의 다른 파일에 의존하지 않는다는 계약이 있어 공유 모듈로 빼지 않았다 — 두 사본은 각자의 검체가 핀한다).
+SAC_OWN_BINARIES = {"cys.exe", "cysd.exe", "cys-app.exe", "uninstall.exe"}
+SAC_CENSUS_SCHEMA = "cys-win-pe-census/1"
+
+
+def security_directory(path):
+    """PE 데이터 디렉터리 4 의 크기(바이트). 0 = Authenticode 서명 없음. 정상 PE 가 아니면 None."""
+    total = os.path.getsize(path)
+    with open(path, "rb") as f:
+        head = f.read(min(total, 1 << 20))
+    if len(head) < 0x40 or head[:2] != b"MZ":
+        return None
+    e_lfanew = struct.unpack_from("<I", head, 0x3C)[0]
+    if e_lfanew < 0x40 or e_lfanew + 24 > len(head) or head[e_lfanew:e_lfanew + 4] != b"PE\0\0":
+        return None
+    coff = e_lfanew + 4
+    opt_size = struct.unpack_from("<H", head, coff + 16)[0]
+    opt = coff + 20
+    if opt_size < 2 or opt + opt_size > len(head):
+        return None
+    magic = struct.unpack_from("<H", head, opt)[0]
+    if magic == 0x10B:
+        n_off, dd = opt + 92, opt + 96
+    elif magic == 0x20B:
+        n_off, dd = opt + 108, opt + 112
+    else:
+        return None
+    sec = dd + 4 * 8
+    if sec + 8 > opt + opt_size or struct.unpack_from("<I", head, n_off)[0] < 5:
+        return None
+    off, size = struct.unpack_from("<II", head, sec)
+    if size and (off == 0 or off + size > total):
+        return None
+    return size
+
+
+def _is_mz(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read(2) == b"MZ"
+    except OSError:
+        return False
+
+
+def authenticode_status(paths):
+    """Windows 에서만: Get-AuthenticodeSignature 를 **한 번** 불러 {경로: (Status, SignatureType, 서명자)}.
+    다른 OS · PowerShell 실패는 None(기록만 UNMEASURED — 붉은 규칙은 이 값에 기대지 않는다)."""
+    if os.name != "nt" or not paths:
+        return None
+    fd, lst = tempfile.mkstemp(suffix="-census-list.txt")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write("\n".join(paths))
+    ps = ("$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); Get-Content -LiteralPath $env:CYS_CENSUS_LIST -Encoding UTF8 | ForEach-Object { "
+          "$s = Get-AuthenticodeSignature -LiteralPath $_; [pscustomobject]@{p=$_; s=[string]$s.Status; "
+          "t=[string]$s.SignatureType; n=$(if ($s.SignerCertificate) { $s.SignerCertificate.Subject } else { '' })} } "
+          "| ConvertTo-Json -Compress")
+    try:
+        r = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-Command", ps], capture_output=True,
+                           text=True, encoding="utf-8", env=dict(os.environ, CYS_CENSUS_LIST=lst), timeout=300)
+        if r.returncode != 0:
+            print(f"  authenticode: UNMEASURED (pwsh exit {r.returncode}: {r.stderr.strip()[:300]})")
+            return None
+        rows = json.loads(r.stdout or "[]")
+        rows = rows if isinstance(rows, list) else [rows]
+        return {row["p"]: (row["s"], row["t"], row["n"]) for row in rows}
+    except (OSError, ValueError, subprocess.TimeoutExpired, KeyError, TypeError) as e:
+        print(f"  authenticode: UNMEASURED ({type(e).__name__}: {e})")
+        return None
+    finally:
+        os.remove(lst)
+
+
+def sac_census(tree, setup=None, authenticode=authenticode_status):
+    """D6-a census. 반환: (종료 코드, 보고서 dict). 0 통과 · 3 우리 파일 PE 판독 불가 · 5 우리 파일 서명(잠든 판 위반) ·
+    6 열거 불성립(cysd 미발견) 또는 매 실행 대조 실패."""
+    entries = []
+    if setup:
+        entries.append((setup, os.path.basename(setup), True))
+    for dirpath, _, files in os.walk(tree):
+        for fn in sorted(files):
+            p = os.path.join(dirpath, fn)
+            if os.path.isfile(p) and not os.path.islink(p) and _is_mz(p):
+                entries.append((p, os.path.relpath(p, tree), canonical_name(fn) in SAC_OWN_BINARIES))
+    auth = authenticode([p for p, _, _ in entries]) or {}
+    rows, own_signed, own_unparsed = [], [], []
+    for p, rel, own in entries:
+        size = security_directory(p)
+        st = auth.get(p)
+        rows.append({"path": rel.replace(os.sep, "/"), "own": own, "pe": "ok" if size is not None else "malformed",
+                     "embedded_signature": None if size is None else size > 0,
+                     "authenticode_status": st[0] if st else "UNMEASURED",
+                     "signature_type": st[1] if st else "UNMEASURED", "signer_subject": st[2] if st else ""})
+        if own and size is None:
+            own_unparsed.append(rel)
+        elif own and size:
+            own_signed.append(rel)
+    own_found = sorted({canonical_name(os.path.basename(r["path"])) for r in rows if r["own"]})
+    report = {"schema": SAC_CENSUS_SCHEMA, "mode": "unsigned", "files": rows, "own_found": own_found,
+              "counts": {"pe_files": len(rows),
+                         "embedded_signed": sum(1 for r in rows if r["embedded_signature"]),
+                         "own_signed": len(own_signed), "malformed": sum(1 for r in rows if r["pe"] != "ok")}}
+    # 매 실행 대조 — 같은 규칙이 '서명된 우리 파일'을 실제로 붉게 보는가.
+    with tempfile.TemporaryDirectory(prefix="cys-census-control-") as ctl:
+        fake = os.path.join(ctl, "cysd.exe")
+        with open(fake, "wb") as f:
+            f.write(_census_control_pe())
+        report["control"] = "red-as-expected" if (security_directory(fake) or 0) > 0 else "BLIND"
+    if report["control"] != "red-as-expected":
+        return 6, report
+    if own_unparsed:
+        report["verdict"] = "FAIL(3) own binary is not a well-formed PE: " + ", ".join(own_unparsed)
+        return 3, report
+    if own_signed:
+        report["verdict"] = ("FAIL(5) own binary carries an Authenticode signature while signing is dormant in this "
+                             "release: " + ", ".join(own_signed))
+        return 5, report
+    if "cysd.exe" not in own_found:
+        report["verdict"] = "FAIL(6) enumeration found no cysd.exe - the census did not see the shipped tree"
+        return 6, report
+    report["verdict"] = "PASS"
+    return 0, report
+
+
+def _census_control_pe():
+    """보안 디렉터리가 파일 끝 16B 를 가리키는 최소 PE32+ — 매 실행 대조용 표본(서명 바이트 자체는 의미 없다)."""
+    e_lfanew, opt_size = 0x80, 112 + 8 * 16
+    hdr = bytearray(e_lfanew + 4 + 20 + opt_size)
+    hdr[0:2] = b"MZ"
+    struct.pack_into("<I", hdr, 0x3C, e_lfanew)
+    hdr[e_lfanew:e_lfanew + 4] = b"PE\0\0"
+    struct.pack_into("<HH", hdr, e_lfanew + 4, 0x8664, 0)
+    struct.pack_into("<H", hdr, e_lfanew + 4 + 16, opt_size)
+    opt = e_lfanew + 24
+    struct.pack_into("<H", hdr, opt, 0x20B)
+    struct.pack_into("<I", hdr, opt + 108, 16)
+    struct.pack_into("<II", hdr, opt + 112 + 32, len(hdr), 16)
+    return bytes(hdr) + b"C" * 16
+
+
 def extract_setup(setup, sevenzip):
     tmp = tempfile.mkdtemp(prefix="cys-crt-gate-")
     cmd = [sevenzip, "x", setup, f"-o{tmp}", "-y"]
@@ -255,6 +405,9 @@ def main():
     src.add_argument("--setup", help="NSIS setup.exe (내부에서 7z 추출)")
     src.add_argument("--tree", help="이미 추출된 설치 트리")
     ap.add_argument("--sevenzip", default="7z", help="7-Zip 실행 파일 (기본 7z, macOS 는 7zz)")
+    ap.add_argument("--sac-census", action="store_true",
+                    help="CRT 검사 대신 D6-a 서명 census 만 한다(0.14.53 WP12 · 종료 0/3/5/6)")
+    ap.add_argument("--report", help="--sac-census 보고서(JSON)를 쓸 경로")
     args = ap.parse_args()
 
     if args.setup:
@@ -269,6 +422,21 @@ def main():
             print(f"트리 없음: {tree}", file=sys.stderr)
             sys.exit(4)
         print(f"== 입력 트리: {tree}")
+
+    if args.sac_census:
+        code, report = sac_census(tree, setup=args.setup)
+        for r in report["files"]:
+            print(f"  pe: {r['path']} own={r['own']} pe={r['pe']} embedded={r['embedded_signature']} "
+                  f"status={r['authenticode_status']} type={r['signature_type']} signer={r['signer_subject'] or '-'}")
+        c = report["counts"]
+        print(f"windows-signing: UNSIGNED n={c['pe_files']} embedded-signed={c['embedded_signed']} "
+              f"own-signed={c['own_signed']} malformed={c['malformed']} own-found={','.join(report['own_found']) or '-'} "
+              f"control={report['control']}")
+        if args.report:
+            with open(args.report, "w", encoding="utf-8") as f:
+                json.dump(report, f, ensure_ascii=False, indent=1)
+        print(f"결과: {report.get('verdict', 'FAIL(6) census control is blind')}")
+        sys.exit(code)
 
     violations, unparsed, allowed, total = check_imports(tree)
     missing, cysd = check_markers(tree)

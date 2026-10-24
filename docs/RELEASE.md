@@ -560,6 +560,15 @@ gh release create v0.2.0 --draft --title "cys 0.2.0" --notes-file docs/RELEASE_N
 - [ ] 신규 머신 시뮬레이션: 빈 HOME에서 `cys list` → 데몬 자동기동 + pack 자동설치 확인
 - [ ] DMG에서 설치 → 앱 실행 → `cys status` 동작
 - [ ] 버전 문자열 **8곳(수동 6 + `Cargo.lock` 2패키지)** 일치 — `sh scripts/version-check.sh vX.Y.Z` rc=0
+- [ ] **★Windows 스마트 앱 컨트롤(SAC) 고지 — 0.14.53 WP12 · 오너 상시 규칙 OWNER-20261023-WIN-SAC-STANDING-CHECK**
+      0.14.53 은 Windows 서명이 잠든 판이다(오너 자격증명 없음). 정직한 고지가 기계로 강제된다:
+      · 드래프트 본문을 손으로 고칠 때 `<!-- cys-win-sac: unsigned -->` 마커 **1개**와 두 핵심 문구
+        (`scripts/release-verify.py` 의 `SAC_KEY_PHRASES`, 한국어·영어)를 지우지 않는다. 문면 정본 = `release.yml` `releaseBody`.
+      · 공개 직전 `release-publish.yml` 이 본문을 `$RUNNER_TEMP/release-body.txt` 로 받아 `release-verify.py --body-file` 8단계로
+        본문·`latest.json` notes·setup.exe 의 실제 서명 상태(PE 보안 디렉터리)를 대조한다 — 어긋나면 공개가 막힌다.
+      · 태그 레인 Windows 레그 CRT 게이트 스텝 ④(`verify_win_crt.py --sac-census`)는 우리 파일(setup·cys·cysd·cys-app·uninstall)에
+        서명이 있으면 업로드 전에 붉다. 같은 census 가 `windows-build` 에서 먼저 돈다(아티팩트 `windows-signing-report`).
+      · `WINSIGN_MODE` 변수는 비워 두거나 `unsigned` — 다른 값은 Windows 레그 첫 스텝에서 붉다.
 - [ ] **★태그 전 사전 게이트 4종 rc=0 — §0-C** (version-check · `sh scripts/win-typecheck.sh` ·
       `python3 scripts/pre-tag-ci-check.py --wait 60` = 같은 SHA 의 ci-branch·windows-build·windows-health success ·
       `bash scripts/scan-pack-secrets.sh` = 팩 콘텐츠 clean)

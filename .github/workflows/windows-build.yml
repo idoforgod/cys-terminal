@@ -195,6 +195,25 @@ jobs:
             target/release/bundle/nsis/*.exe
           if-no-files-found: error
 
+      # ★(0.14.53 WP12 · D6-a 사전 예행) release.yml CRT 게이트 스텝 ④ 와 같은 census 를 브랜치 push 에서 먼저 돌린다 —
+      #   태그 레인에서 처음 붉어지면 버전 하나를 태운다. 서명이 잠든 판이라 우리 파일 서명 = 실패(5). 보고서는 아티팩트로.
+      - name: Windows PE signature census (D6-a dry run - unsigned release)
+        shell: bash
+        run: |
+          set -euo pipefail
+          PY=python; command -v python3 >/dev/null 2>&1 && PY=python3
+          SETUP=(target/release/bundle/nsis/cys_*_x64-setup.exe)
+          [ ${#SETUP[@]} -eq 1 ] && [ -f "${SETUP[0]}" ] || { echo "setup.exe 후보 이상(글롭 미해소 포함): ${SETUP[*]}" >&2; exit 1; }
+          "$PY" scripts/verify_win_crt.py --setup "${SETUP[0]}" --sac-census --report "$RUNNER_TEMP/windows-signing-report.json"
+
+      - name: Upload Windows PE signature census report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-signing-report
+          path: ${{ runner.temp }}/windows-signing-report.json
+          if-no-files-found: warn
+
       # ★Windows VERSIONINFO 상시 게이트 (W5-3 · 2026-08-29 — release.yml 동형 · 실패 = 잡 실패).
       #   훅 신선도 오라클(nsis-hooks.nsh: GetDLLVersion == 컴파일 상수)의 전제 = 세 산출물 모두
       #   수치 VERSIONINFO(VS_FIXEDFILEINFO) 보유 + 릴리스 버전 일치. 리소스 없는 PE(크로스 빌드
