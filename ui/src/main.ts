@@ -6,6 +6,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { imeStep, initialImeState, isHangulText, type ImeEvent } from "./ime";
 import { shellQuote } from "./shellquote";
+import { dupRoleCounts, paneTitle } from "./panetitle";
 import { baseName, insertionText, isStreaming, splitPath, classifyPathCheck, pathCheckToast } from "./ftdrop";
 import { dropPointToCss, dropPlatformFromUserAgent, dropDebugDetail, isDropDebugEnabled } from "./droppoint";
 import {
@@ -2930,9 +2931,8 @@ const imageExtFromMime = (mime: string): string => {
 };
 
 // surface도 번호 대신 이름 — 기본 자동 제목("surface N"·빈 문자열)이면 현재 디렉토리 경로 표시.
-const isAutoTitle = (t: string | null | undefined) => !t || /^surface \d+$/.test(t);
-const paneTitle = (title: string | null | undefined, liveCwd?: string | null) =>
-  isAutoTitle(title) ? liveCwd || "…" : (title as string);
+// ★WP13(0.14.53 · 오너 fix F1): 그 서식은 `./panetitle` 로 옮겼다 — 좌석 번호 접두 `[381] ` 와 같은 역할 중복 표시
+//   ` (2)` 를 **표시 지점 한 곳**에서 붙이고 순수 함수로 검체를 돌리기 위해서다(저장된 제목·OSC 제목 무변경).
 
 // ---------- ★F-01(0.14.52 · U) pane 헤더 역할 점 — 역할색 + 활동 표지 + 접근 문구를 **한 렌더러**가 칠한다 ----------
 // 종전: 모든 역할 점이 무조건 깜박였다(style.css) — 좌석 CLI 가 실제로 일하는지와 무관했다. 이제 깜박임은 데몬이 관측한 '작업 중'에만 붙는다.
@@ -3168,13 +3168,18 @@ async function refreshPaneTitles() {
           adoptedWs = true;
         }
         if (step.evict.length) reanchorAuto(sk, roleOf); // 유령이 빠진 자리의 쏠림을 편다(반박 U3 D7)
+        // ★WP13: 같은 역할이 둘 이상인지는 **이 소켓의 목록**에서 센다(부서마다 master 가 하나씩 있는 것은 중복이 아니다).
+        const dupRoles = dupRoleCounts(r.surfaces);
         for (const s of r.surfaces) {
           const rt = panes.get(paneKey(s.surface_id, sk));
           if (!rt) continue;
           renderUsage(rt.usageEl, s.exited ? null : s.usage); // 종료 pane은 배지 제거 (혼동 방지)
           setRoleDot(rt, s.exited ? null : s.role); // 역할 점도 동일 주기 갱신(★F-01 단일 렌더러 — 활동 표지·사유·나이를 보존)
           if (rt.titleEl.isContentEditable) continue; // 이름 편집 중에는 덮어쓰지 않음
-          rt.titleEl.textContent = paneTitle(s.title, s.live_cwd) + (s.exited ? " [exited]" : "");
+          rt.titleEl.textContent =
+            paneTitle(s.surface_id, s.title, s.live_cwd, s.exited ? undefined : dupRoles.get(s.role ?? "")) +
+            (s.exited ? " [exited]" : "");
+          rt.titleEl.dataset.stored = s.title ?? ""; // ★WP13·R1 이름 변경의 출발값(표시 문자열이 아니라 데몬이 가진 제목)
         }
         // 자동 입양: 그 소켓의 role surface 중 UI에 없는 것 → '같은 소켓을 가진 ws'에만 표출.
         // ★소켓 일치 가드 — 부서A 노드가 부서B 탭에 잘못 입양되는 격리 누수 차단(검증 mustFix).
@@ -3302,7 +3307,8 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
   roleEl.style.display = "none";
   const titleEl = document.createElement("span");
   titleEl.className = "pane-title-text";
-  titleEl.textContent = paneTitle(title);
+  titleEl.textContent = paneTitle(sid, title); // ★WP13 번호는 첫 칠에서부터 · 중복 표시는 다음 갱신 틱에서
+  titleEl.dataset.stored = title ?? ""; // ★WP13·R1 이름 변경이 **보이는 글자**(번호·중복 표시 포함)를 저장하지 않게 원값을 끼워 둔다
   const usageEl = document.createElement("span");
   usageEl.className = "pane-usage";
   // 배지 위 mousedown이 pane 드래그로 번지지 않게 — tooltip(hover) 확인 중 오발 방지
@@ -3342,6 +3348,10 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
         label: "이름 변경",
         action: () => {
           titleEl.contentEditable = "true";
+          // ★WP13·R1: 편집은 **저장된 제목**에서 출발한다. 표시 문자열에는 `[381] ` 접두와 ` (2)` 중복 표시,
+          //   종료 pane 의 ` [exited]` 가 섞여 있어 그대로 커밋하면 그것들이 데몬 제목으로 들어가고 다음 렌더가
+          //   `[381] [381] … (2) (2)` 가 된다(표시 전용 약속이 편집 경로로 깨진다).
+          titleEl.textContent = titleEl.dataset.stored ?? "";
           titleEl.focus();
           window.getSelection()?.selectAllChildren(titleEl);
           const onKey = (ke: KeyboardEvent) => {
