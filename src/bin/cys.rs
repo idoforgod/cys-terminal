@@ -24082,12 +24082,12 @@ const PENDING_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(12
 /// ★(B-428 R2 · codex r1 F1) A hold on the pending file for ONE whole lifecycle — snapshot read → injects → result records →
 /// final rewrite/removal. Every lane shares the file (`pack_state_base`), and a pass that rewrites it from an older snapshot
 /// erased an UNKNOWN another pack-update had recorded since, so the next node loop typed that directive again. Released
-/// when dropped (the OS also drops it when the process dies: no stale lock to break). `None` = no lock was needed: the
-/// directory refuses to create the lock file, and every pending-file write is a rename into (or a removal from) that same
-/// directory, so no pack-update can change the pending file there either — nothing can be lost (the pass's own writes
-/// fail and are refused or reported as before: D1/D2).
+/// when dropped (the OS also drops it when the process dies: no stale lock to break).
+/// ★(B-428 R3 · codex r2) Every value holds a REAL lock — there is no unlocked token: a pass that could not take the lock
+/// is refused instead (`lock_reinject_pending`), because "this directory refuses writes" is only true when it is looked at
+/// and a pass that went on unlocked could outlive it (the directory made writable again while it waits on the daemon).
 struct PendingLock {
-    _file: Option<std::fs::File>,
+    _file: std::fs::File,
 }
 
 impl Drop for PendingLock {
@@ -24095,9 +24095,7 @@ impl Drop for PendingLock {
     /// that "depends upon available system resources" (LockFileEx remarks, Microsoft recommends an explicit unlock) — the
     /// node loop's hold, taken right after the pending pass released its own, must not wait for that.
     fn drop(&mut self) {
-        if let Some(f) = &self._file {
-            let _ = f.unlock();
-        }
+        let _ = self._file.unlock();
     }
 }
 
@@ -24108,7 +24106,8 @@ fn reinject_pending_lock_path(base: &std::path::Path) -> std::path::PathBuf {
 
 /// ★(B-428 R2) Takes the pending lock, waiting at most `wait` (never forever): `File::try_lock` = `flock(LOCK_EX|LOCK_NB)`
 /// on unix, `LockFileEx(EXCLUSIVE|FAIL_IMMEDIATELY)` on Windows, polled every 50 ms. Err = refused, with the lock path:
-/// the caller types and writes nothing and says so (a named, non-zero outcome).
+/// the caller types and writes nothing and says so (a named, non-zero outcome) — when another pack-update holds the lock
+/// for `wait`, AND when the lock cannot be established at all (e.g. the directory refuses to create the lock file).
 fn lock_reinject_pending(base: &std::path::Path, wait: std::time::Duration) -> Result<PendingLock, String> {
     let path = reinject_pending_lock_path(base);
     std::fs::create_dir_all(base).map_err(|e| format!("pending lock: cannot create {}: {e}", base.display()))?;
@@ -24117,16 +24116,17 @@ fn lock_reinject_pending(base: &std::path::Path, wait: std::time::Duration) -> R
         // a read-only lock file still takes an exclusive lock through a read handle (flock / LockFileEx)
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => match std::fs::File::open(&path) {
             Ok(f) => f,
-            // no lock file and the directory refuses one: no writer can change the pending file there (see PendingLock)
-            Err(n) if n.kind() == std::io::ErrorKind::NotFound => return Ok(PendingLock { _file: None }),
-            Err(n) => return Err(format!("pending lock: cannot open {}: {e} / {n}", path.display())),
+            // ★(B-428 R3 · codex r2) no lock file and the directory refuses to create one: REFUSED, never an unlocked go
+            Err(n) => {
+                return Err(format!("the pending lock file {} cannot be created ({e}) or opened ({n})", path.display()))
+            }
         },
         Err(e) => return Err(format!("pending lock: cannot open {}: {e}", path.display())),
     };
     let deadline = std::time::Instant::now() + wait;
     loop {
         match file.try_lock() {
-            Ok(()) => return Ok(PendingLock { _file: Some(file) }),
+            Ok(()) => return Ok(PendingLock { _file: file }),
             Err(std::fs::TryLockError::WouldBlock) => {
                 #[cfg(test)]
                 pending_lock_note_contended(&path);
@@ -25129,8 +25129,10 @@ struct PendingConsumeReport {
     /// discarded with the error any more, so its unknown nodes are named and reach the exit code; every UNKNOWN write
     /// of this pass had its intent on disk before it was typed.
     persist_error: Option<String>,
-    /// ★(B-428 R2) the pass was REFUSED: another pack-update held the pending file for `PENDING_LOCK_WAIT`. Nothing was
-    /// read past the existence check, typed or written; the file is as that other pass leaves it. Degraded, never 0.
+    /// ★(B-428 R2/R3) the pass was REFUSED: the pending lock was not taken (another pack-update held it for
+    /// `PENDING_LOCK_WAIT`, or it could not be established at all). Nothing was typed or written; `kept`, `unknown` and
+    /// `unknown_nodes` describe the file as read before the refusal (a read-only diagnostic — the message names the
+    /// entries left untouched). Degraded, never 0.
     lock_refused: Option<String>,
 }
 
@@ -25510,19 +25512,20 @@ fn consume_reinject_pending(base: &std::path::Path) -> Result<PendingConsumeRepo
 /// ★(B-428 R2 · codex r1 F1) The pending pass as ONE lifecycle under the pending lock: the snapshot is read AFTER the lock
 /// is taken and `pass` (its injects, records and final rewrite from that snapshot) runs before it is released, so no other
 /// pack-update can write between the read and the rewrite — the rewrite can no longer erase an UNKNOWN recorded meanwhile.
-/// No file: nothing to do and nothing locked (the common path stays lock-free). Lock busy for `wait`: `lock_refused` — the
-/// pass is refused, nothing typed or written (degraded via `pending_pass_exit_code`).
+/// No file: nothing to do and nothing locked (the common path stays lock-free). Lock not taken (busy for `wait`, or not
+/// establishable): `lock_refused` — the pass is refused, nothing typed or written (degraded via `pending_pass_exit_code`),
+/// and the report is a read-only diagnostic of the file as it was read (`pending_lock_refused_report`).
 fn consume_reinject_pending_locked(
     base: &std::path::Path,
     wait: std::time::Duration,
     pass: impl FnOnce(&std::path::Path, ReinjectPending) -> Result<PendingConsumeReport, String>,
 ) -> Result<PendingConsumeReport, String> {
-    if read_reinject_pending_doc(base).map_err(|e| e.to_string())?.is_none() {
+    let Some(seen) = read_reinject_pending_doc(base).map_err(|e| e.to_string())? else {
         return Ok(PendingConsumeReport::default());
-    }
+    };
     let _lock = match lock_reinject_pending(base, wait) {
         Ok(lock) => lock,
-        Err(e) => return Ok(PendingConsumeReport { lock_refused: Some(e), ..Default::default() }),
+        Err(e) => return Ok(pending_lock_refused_report(e, &seen)),
     };
     let Some(doc) = read_reinject_pending_doc(base).map_err(|e| e.to_string())? else {
         return Ok(PendingConsumeReport::default());
@@ -25533,6 +25536,24 @@ fn consume_reinject_pending_locked(
         return Ok(PendingConsumeReport::default());
     }
     pass(base, doc)
+}
+
+/// ★(B-428 R3 · codex r2) The report of a pending pass REFUSED for want of the pending lock — a READ-ONLY diagnostic: what
+/// the file held when it was read (`seen`, read before the lock was attempted), nothing typed or written. The unknown and
+/// deferred entries left untouched are counted and named, so a pack-update in this state exits non-zero naming its
+/// unknown nodes (D1) without running any part of the pass unlocked. Pure.
+fn pending_lock_refused_report(err: String, seen: &ReinjectPending) -> PendingConsumeReport {
+    let unknown_nodes: Vec<(u64, String)> = seen.unknown.iter().map(|u| (u.surface_id, u.role.clone())).collect();
+    let mut left: Vec<String> = unknown_nodes.iter().map(|(sid, role)| format!("UNKNOWN surface {sid} ({role})")).collect();
+    left.extend(seen.deferred.iter().map(|(sid, role)| format!("deferred surface {sid} ({role})")));
+    let left = if left.is_empty() { "nothing".to_string() } else { left.join(", ") };
+    PendingConsumeReport {
+        kept: seen.deferred.len(),
+        unknown: unknown_nodes.len(),
+        unknown_nodes,
+        lock_refused: Some(format!("{err}; the pending pass typed and wrote nothing — left untouched: {left}")),
+        ..Default::default()
+    }
 }
 
 
@@ -27547,12 +27568,31 @@ fn pending_persist_failure_warning(err: &str, unknown_nodes: &[(u64, String)]) -
     )
 }
 
-/// ★(B-428 R2) The message for a pack-update refused because another pack-update held the pending file: what was refused,
-/// why (with the lock path), that nothing was applied, typed or written, and what to do. Pure.
-fn pending_lock_refused_warning(step: &str, err: &str) -> String {
+/// ★(B-428 R2/R3) The message for a pack-update refused at its PENDING PASS for want of the pending lock (another
+/// pack-update held it, or it could not be established): what was refused, why (`err` names the lock path and the entries
+/// left untouched), that the new pack was neither fetched nor applied, and what to do. Pure.
+fn pending_lock_refused_warning(err: &str) -> String {
     format!(
-        "pending-lock-busy: {step} REFUSED before anything was applied, typed or written — {err}; another pack-update is \
-         using the pending file: run the update again when it has finished"
+        "pending-lock-refused: pack update REFUSED at its pending re-injection pass — {err}; the new pack was neither \
+         fetched nor applied: run the update again once no other pack-update is running and the directory is writable"
+    )
+}
+
+/// ★(B-428 R3 · codex r2 minor) The message for a pack-update whose APPLY + NODE-LOOP phase was refused for want of the
+/// pending lock. Only that phase is refused — the new pack was not applied and that phase typed and wrote nothing; the
+/// pending pass that ran EARLIER in the same invocation keeps its own effects, reported separately from `s1`. Pure.
+fn pack_apply_lock_refused_warning(err: &str, s1: &PendingConsumeReport) -> String {
+    format!(
+        "pending-lock-refused: the pack apply and node re-injection phase was REFUSED before the apply — {err}; the new \
+         pack was not applied and no node was re-injected by that phase. The pending pass earlier in this run stands as \
+         reported: {} resolved, {} kept, {} unknown (new {}), {} refused{}. Run the update again once no other pack-update \
+         is running and the directory is writable",
+        s1.resolved,
+        s1.kept,
+        s1.unknown,
+        s1.unknown_new,
+        s1.intent_refused,
+        s1.persist_error.as_deref().map(|e| format!(", its final rewrite failed: {e}")).unwrap_or_default()
     )
 }
 
@@ -27582,10 +27622,11 @@ fn run_pack_update(from: Option<String>, manifest_url: Option<String>, dry_run: 
         if !dry_run {
             match consume_reinject_pending(&base) {
                 Ok(c) if c.lock_refused.is_some() => {
-                    // ★(B-428 R2 · codex r1 F1) another pack-update held the pending file for PENDING_LOCK_WAIT: refused before
-                    //   anything is fetched, applied or typed — named, exit 1 (the app shows it as an update error), the update
-                    //   can simply be run again; never a silent skip, never 0
-                    return Err(pending_lock_refused_warning("pack update", c.lock_refused.as_deref().unwrap_or_default()));
+                    // ★(B-428 R2/R3 · codex r1 F1, r2) the pending lock was not taken (held by another pack-update for
+                    //   PENDING_LOCK_WAIT, or not establishable): the pass typed and wrote nothing and the new pack is not
+                    //   fetched or applied — named (with the entries left untouched), exit 1 (the app shows it as an update
+                    //   error), the update can simply be run again; never a silent skip, never 0
+                    return Err(pending_lock_refused_warning(c.lock_refused.as_deref().unwrap_or_default()));
                 }
                 Ok(c) if c.resolved > 0 || c.kept > 0 || c.unknown > 0 || c.persist_error.is_some() => {
                     println!(
@@ -27619,14 +27660,15 @@ fn run_pack_update(from: Option<String>, manifest_url: Option<String>, dry_run: 
 
         // ★(B-428 R2 · codex r1 F1) the node loop and its deferred persist run under the pending lock (one lifecycle). It is
         //   taken here — after the source is fetched, BEFORE the apply — and held to the end: a refusal (another pack-update
-        //   held the file for PENDING_LOCK_WAIT) leaves the pack unapplied, named, exit 1, instead of applied but with live
-        //   nodes left on the old directive. dry-run writes nothing: no lock.
+        //   held the file for PENDING_LOCK_WAIT, or the lock is not establishable) leaves the pack unapplied, named, exit 1,
+        //   instead of applied but with live nodes left on the old directive; the message reports the pending pass that
+        //   already ran in this invocation separately (its effects stand). dry-run writes nothing: no lock.
         let pending_lock = if dry_run {
             None
         } else {
             match lock_reinject_pending(&base, PENDING_LOCK_WAIT) {
                 Ok(lock) => Some(lock),
-                Err(e) => return Err(pending_lock_refused_warning("pack update", &e)),
+                Err(e) => return Err(pack_apply_lock_refused_warning(&e, &consumed)),
             }
         };
 
@@ -50266,6 +50308,8 @@ mod b360_tests {
         first: String,
         first_pending: Option<Result<PendingConsumeReport, String>>,
         calls: Vec<(String, Value)>,
+        /// how many of `calls` pass 1 made (counted when pass 1 returned) — ★R3: a refused pass makes none
+        first_calls: usize,
         unknown_after_first: Vec<Value>,
         deferred_after_first: Vec<Value>,
         unknown_after_all: Vec<Value>,
@@ -50307,6 +50351,7 @@ mod b360_tests {
                 B428Origin::NodeLoop => (format!("{:?}", run_pack_reinject("9.9.9")), None, hash),
             }
         });
+        let first_calls = daemon.calls().len();
         drop(_unlock_dir);
         drop(_unlock_file);
         let (unknown_after_first, deferred_after_first) = (r2p_unknown_entries(&pack.dir), r2p_deferred_entries(&pack.dir));
@@ -50319,6 +50364,7 @@ mod b360_tests {
             first,
             first_pending,
             calls: daemon.calls(),
+            first_calls,
             unknown_after_first,
             deferred_after_first,
             unknown_after_all: r2p_unknown_entries(&pack.dir),
@@ -50411,8 +50457,10 @@ mod b360_tests {
     }
 
     /// D2 · the intent cannot be established (directory and file refuse writes BEFORE the pass): the inject is refused, not
-    /// attempted — zero directive pastes in pass 1 — from either origin; the pending pass counts it (`intent_refused 1`,
-    /// the node kept as it was: still an ordinary deferred entry on disk), the node loop counts it failed.
+    /// attempted — zero directive pastes in pass 1 — from either origin; the node loop counts it failed. ★(B-428 R3 ·
+    /// codex r2) the pending pass cannot take the pending lock in that directory either, so the WHOLE pass is refused
+    /// before any write is attempted (`lock_refused`, naming the lock file and the deferred node left untouched; kept 1,
+    /// no per-node intent refusal), the node still an ordinary deferred entry on disk.
     /// RED on f0ac3b0c: the directive is pasted (pass 1 types it with no record possible).
     #[cfg(unix)]
     #[test]
@@ -50420,14 +50468,24 @@ mod b360_tests {
         let mut failures = Vec::new();
         for origin in [B428Origin::PendingPass, B428Origin::NodeLoop] {
             let run = b428_run(origin, r2c_reply(&pending_err()), false, true, false);
-            let first_pass_directives = b428_first_pass_directives(&run.calls);
+            let first_pass_directives = b428_first_pass_directives(&run);
             if first_pass_directives != 0 {
                 failures.push(format!("{origin:?}: pass 1 typed the directive {first_pass_directives} time(s) with no intent on disk"));
             }
             match origin {
                 B428Origin::PendingPass => {
-                    if b428_count(&run.first, "intent_refused") != Some(1) || b428_count(&run.first, "kept") != Some(1) {
-                        failures.push(format!("{origin:?}: pass 1 does not count the refusal (kept 1, intent_refused 1): {}", run.first));
+                    // read through the Debug text (like every check above the POST-FIX-ONLY marker), so this block still
+                    // compiles on f0ac3b0c, where `lock_refused` and the lock file do not exist yet
+                    let lock = ".pack-reinject-pending.lock";
+                    let refused = run.first.contains("lock_refused: Some(")
+                        && run.first.contains(lock)
+                        && run.first.contains("deferred surface 7 (worker)");
+                    if !refused || b428_count(&run.first, "intent_refused") != Some(0) || b428_count(&run.first, "kept") != Some(1) {
+                        failures.push(format!(
+                            "{origin:?}: pass 1 is not refused as a whole (lock_refused naming {lock} and surface 7, kept 1, \
+                             intent_refused 0): {}",
+                            run.first
+                        ));
                     }
                     if !run.deferred_after_first.iter().any(|d| d["surface_id"] == 7) || !run.unknown_after_first.is_empty() {
                         failures.push(format!(
@@ -50446,24 +50504,12 @@ mod b360_tests {
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
-    /// Directive pastes made by pass 1 of a [`b428_run`]: each pass that talks to the daemon starts with one
-    /// `system.topology` request (a pending pass with no file asks nothing), so pass 1 ends at the second one.
+    /// Directive pastes made by pass 1 of a [`b428_run`]: the requests it made before it returned (`first_calls`).
+    /// ★(B-428 R3) Not "until the second `system.topology`" any more: a pass refused for want of the pending lock makes no
+    /// request at all, so that boundary would hand pass 2's legitimate paste to pass 1 (measured: slot 16, b428_p3 red).
     #[cfg(unix)]
-    fn b428_first_pass_directives(calls: &[(String, Value)]) -> usize {
-        let mut topologies = 0;
-        let mut directives = 0;
-        for (m, p) in calls {
-            if m == "system.topology" {
-                topologies += 1;
-                if topologies == 2 {
-                    break;
-                }
-            }
-            if m == "surface.send_text" && !p["text"].as_str().unwrap_or("").contains(REINJECT_PING_HEAD) {
-                directives += 1;
-            }
-        }
-        directives
+    fn b428_first_pass_directives(run: &B428Run) -> usize {
+        r2p_pastes(&run.calls[..run.first_calls]).0
     }
 
     /// D4 · CONTROL, the normal path (everything writable): a deferred node's inject PASSES → resolved, marked once, the
@@ -50514,15 +50560,16 @@ mod b360_tests {
     // ── B428-POST-FIX-ONLY: the specimens below name items the fix adds (they do not compile on f0ac3b0c) ──────────────
 
     /// D1 · the exit class of a pack-update whose node loop did not run (UpToDate, reinject skipped) is the pending pass's:
-    /// the codex scenario's report (p1) and the persistence-lost report (p2) are DEGRADED (3), never 0, and a refused
-    /// inject (p3) too; CONTROLS: an empty pass, and a pass that only CARRIES an old unknown entry (head's exit rule: no
+    /// the codex scenario's report (p1) and the persistence-lost report (p2) are DEGRADED (3), never 0, and the p3 state
+    /// too (★R3: directory read-only before the pass = the pending lock not establishable = the pass refused, `lock_refused`);
+    /// CONTROLS: an empty pass, and a pass that only CARRIES an old unknown entry (head's exit rule: no
     /// permanent non-zero from an entry nobody can resolve), stay 0. The persistence warning names the node.
     #[cfg(unix)]
     #[test]
     fn b428_d1_the_pending_pass_exit_is_degraded_for_an_unknown_write_or_a_refusal_never_0() {
         let mut failures = Vec::new();
         for (name, lock_at_paste, lock_before, file_ro) in
-            [("codex scenario", false, false, true), ("lost after the write", true, false, false), ("intent refused", false, true, false)]
+            [("codex scenario", false, false, true), ("lost after the write", true, false, false), ("lock not establishable", false, true, false)]
         {
             let run = b428_run(B428Origin::PendingPass, r2c_reply(&pending_err()), lock_at_paste, lock_before, file_ro);
             let Some(Ok(rep)) = run.first_pending else {
@@ -50596,8 +50643,10 @@ mod b360_tests {
     /// into run 2); run 2 = the real pending pass, then the real node loop. The exit comes from `pending_pass_exit_code`
     /// (UpToDate and reinject-skipped arms) and from the Apply arm's expression, copied here; the exact source pin of
     /// b360_r2r_p15 binds that copy to `run_pack_update`. Rows: carried + undetermined → exit 0, reported (unknown 1, node
-    /// named); carried + absent + re-inject UNKNOWN → new 1, exit 3; carried + absent + the entry cannot be written again →
-    /// refused 1, nothing typed, exit 3.
+    /// named); carried + absent + re-inject UNKNOWN → new 1, exit 3; carried + absent + the directory refuses writes →
+    /// ★(B-428 R3 · codex r2) the pending lock cannot be established, so the whole pass is refused (`lock_refused`, the
+    /// carried node still counted and named, nothing typed, exit 3); `run_pack_update` stops there with exit 1 (the R2
+    /// source pin), so the Apply arm is not reached and its copy is not compared for that row.
     #[cfg(unix)]
     #[test]
     fn b428_p5_carried_unknowns_exit_0_and_are_reported_new_unknowns_and_refusals_are_degraded() {
@@ -50606,7 +50655,7 @@ mod b360_tests {
         for (name, ping, reinject, lock, want) in [
             ("carried + undetermined", R2pPing::NoTrace, r2c_ok(json!({})), false, (1, 0, 0, 0, 0)),
             ("carried + absent + re-inject UNKNOWN", R2pPing::NoAck, r2c_reply(&pending_err()), false, (1, 1, 0, 1, degraded)),
-            ("carried + absent + entry not writable", R2pPing::NoAck, r2c_ok(json!({})), true, (1, 0, 1, 0, degraded)),
+            ("carried + absent + directory not writable", R2pPing::NoAck, r2c_ok(json!({})), true, (1, 0, 0, 0, degraded)),
         ] {
             let pack = R2cPack::new();
             let _unlock_dir = B428Unlock(pack.dir.clone(), 0o755);
@@ -50629,9 +50678,18 @@ mod b360_tests {
             let apply_exit =
                 reinject_exit_code(node_loop.failed + pass.intent_refused, node_loop.unknown_new + pass.unknown_new);
             let got = (pass.unknown, pass.unknown_new, pass.intent_refused, directives, pending_exit);
-            if got != (want.0, want.1, want.2, want.3, want.4) || apply_exit != want.4 {
+            // a refused pass never reaches the Apply arm (`run_pack_update` returns exit 1 first): its copy is compared only
+            // for the passes that ran; the refused row must BE refused (and name the carried node)
+            let apply_ok = if lock {
+                pass.lock_refused.as_deref().is_some_and(|m| m.contains("UNKNOWN surface 7 (worker)"))
+            } else {
+                pass.lock_refused.is_none() && apply_exit == want.4
+            };
+            if got != (want.0, want.1, want.2, want.3, want.4) || !apply_ok {
                 failures.push(format!(
-                    "{name}: unknown/new/refused/directives/exit = {got:?}, Apply-arm exit {apply_exit}; want {want:?} · {pass:?}"
+                    "{name}: unknown/new/refused/directives/exit = {got:?}, Apply-arm exit {apply_exit}, lock_refused {:?}; want \
+                     {want:?} · {pass:?}",
+                    pass.lock_refused
                 ));
             }
             let warn = pack_update_unknown_warning(&pack.dir, &pass.unknown_nodes);
@@ -50969,11 +51027,162 @@ mod b360_tests {
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
+    /// ★(B-428 R3 · codex r2 blocking) THE PERMISSION-RECOVERY SPECIMEN (barrier-controlled): B = another lane's pending pass
+    /// (deferred node 31, production lifecycle `consume_reinject_pending_locked` + the real core, pure closures) starts while
+    /// the directory refuses to create the lock file; the directory is made writable again (the operator's normal repair)
+    /// while B is paused after its snapshot read and before its first write — inside its directive composition, the step
+    /// right before its intent record; A = this lane's node loop under the REAL lock (as `run_pack_update` runs it) records
+    /// UNKNOWN A on seat 7; B resumes; then A's next applied version runs. Asserts the retained UNKNOWN entry AND the paste
+    /// count. With no unlocked token B is refused before it reads past its existence check (nothing typed, the deferred node
+    /// named), so A's UNKNOWN survives and A types once. On 36bfd0e1 (the None-lock success) B runs unlocked and its final
+    /// rewrite from the old snapshot removes the file: UNKNOWN A gone, A's version 2 types the directive again.
+    #[cfg(unix)]
+    #[test]
+    fn b428_r3_barrier_an_unlocked_pass_cannot_outlive_a_permission_repair_and_erase_a_locked_peers_unknown() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let pack = R2cPack::new();
+        let _unlock_dir = B428Unlock(pack.dir.clone(), 0o755);
+        let ctl = r2p_ctl(r2c_reply(&pending_err()), R2pPing::NoTrace, true);
+        let daemon = r2p_daemon(ctl, r2p_session(&pack));
+        persist_reinject_pending(&pack.dir, "9.9.9", &[(31, "reviewer-b".to_string())]).unwrap();
+        assert!(!reinject_pending_lock_path(&pack.dir).exists(), "precondition: the lock file does not exist yet");
+        let wait = std::time::Duration::from_secs(30);
+        let (a_done, b_paused, b_done) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let b_typed = Arc::new(AtomicUsize::new(0));
+        // B is spawned INSIDE A's env scope (as in b428_r2_two_pass): its pause must not start counting before A can run
+        let spawn_b = || {
+            let (base, a_done, b_paused, b_done, b_typed) =
+                (pack.dir.clone(), a_done.clone(), b_paused.clone(), b_done.clone(), b_typed.clone());
+            std::thread::spawn(move || {
+                let here_b = PendingHere {
+                    socket: "/private/tmp/cys-dept-b428r3/cys.sock".into(),
+                    status_read: true,
+                    daemon_started_at: Some(1.0),
+                    sessions: Default::default(),
+                };
+                let fleet = vec![json!({"surface_id": 31, "role": "reviewer-b", "state": "idle", "idle_secs": 30, "agent_status": "idle"})];
+                let markers = std::collections::HashMap::new();
+                let r = consume_reinject_pending_locked(&base, wait, |base, doc| {
+                    consume_reinject_pending_core(
+                        base,
+                        &doc.pack_version,
+                        &doc.deferred,
+                        &doc.unknown,
+                        &markers,
+                        &fleet,
+                        |_role| {
+                            b_paused.store(true, Ordering::SeqCst);
+                            let until = std::time::Instant::now() + std::time::Duration::from_secs(120);
+                            while !a_done.load(Ordering::SeqCst) {
+                                assert!(std::time::Instant::now() < until, "specimen stuck: A never finished");
+                                std::thread::sleep(std::time::Duration::from_millis(10));
+                            }
+                            Ok("B-DIRECTIVE".to_string())
+                        },
+                        |_sid| String::new(),
+                        |_sid, _text| {
+                            b_typed.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        },
+                        |_sid, _v, _h| Ok(()),
+                        |_sid| Presence::Undetermined("B has no unknown entry".into()),
+                        |_sid| true,
+                        &here_b,
+                    )
+                    .map_err(|e| e.to_string())
+                });
+                b_done.store(true, Ordering::SeqCst);
+                r
+            })
+        };
+        let (b_rep, unknown_after_b, a1, a2) = r2c_in_env(&daemon, &pack, || {
+            b428_make_unwritable(&pack.dir, 0o555);
+            let b = spawn_b();
+            // B either paused before its first write (an unlocked pass) or already finished (refused)
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(120);
+            while !b_paused.load(Ordering::SeqCst) && !b_done.load(Ordering::SeqCst) {
+                assert!(std::time::Instant::now() < until, "B neither paused nor finished");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            std::fs::set_permissions(&pack.dir, std::fs::Permissions::from_mode(0o755)).expect("the permission repair");
+            let a1 = b428_r2_node_loop(&pack.dir, "9.9.9", wait);
+            a_done.store(true, Ordering::SeqCst);
+            let b_rep = b.join().expect("B panicked").expect("B");
+            let unknown_after_b = r2p_unknown_entries(&pack.dir);
+            let a2 = b428_r2_node_loop(&pack.dir, "9.9.10", wait);
+            (b_rep, unknown_after_b, a1, a2)
+        });
+        let (directives, _pings) = r2p_pastes(&daemon.calls());
+        let has_a = unknown_after_b.iter().any(|u| u["surface_id"] == 7);
+        let lock = reinject_pending_lock_path(&pack.dir).display().to_string();
+        let mut failures = Vec::new();
+        if directives != 1 {
+            failures.push(format!("A's directive pastes = {directives}, want 1 (no blind second copy after B's pass)"));
+        }
+        if !has_a {
+            failures.push(format!("UNKNOWN A is gone after B's pass: {unknown_after_b:?}"));
+        }
+        if (a1.unknown, a1.unknown_new) != (1, 1) {
+            failures.push(format!("A version 1 did not record its UNKNOWN write: {a1:?}"));
+        }
+        if (a2.injected, a2.unknown, a2.unknown_new) != (0, 1, 0) {
+            failures.push(format!("A version 2 did not skip the UNKNOWN seat: {a2:?}"));
+        }
+        if b_typed.load(Ordering::SeqCst) != 0 {
+            failures.push(format!("B typed {} time(s) without the pending lock", b_typed.load(Ordering::SeqCst)));
+        }
+        match &b_rep.lock_refused {
+            Some(m) if m.contains(&lock) && m.contains("deferred surface 31 (reviewer-b)") => {}
+            other => failures.push(format!("B was not refused naming the lock file and its node: {other:?} · {b_rep:?}")),
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// ★(B-428 R3 · codex r2 minor) The apply-phase refusal claims only what that phase did: the new pack not applied, that
+    /// phase typed and wrote nothing — never that the whole invocation did nothing — and it reports the pending pass that
+    /// already ran earlier in the same invocation separately (its counts and a failed final rewrite). The pending-pass
+    /// refusal says the new pack was neither fetched nor applied. Pure.
+    #[test]
+    fn b428_r3_the_apply_phase_refusal_reports_the_earlier_pending_pass_separately() {
+        let s1 = PendingConsumeReport {
+            resolved: 2,
+            kept: 1,
+            unknown: 1,
+            unknown_new: 1,
+            intent_refused: 1,
+            persist_error: Some("/b/.pack-reinject-pending.json: denied".into()),
+            ..Default::default()
+        };
+        let s2 = pack_apply_lock_refused_warning("the pending file stayed locked by another pack-update for 120 s (/b/l)", &s1);
+        let s1_msg = pending_lock_refused_warning("the pending lock file /b/l cannot be created (denied) or opened (absent)");
+        let mut failures = Vec::new();
+        for want in [
+            "apply and node re-injection phase was REFUSED before the apply",
+            "the new pack was not applied",
+            "2 resolved, 1 kept, 1 unknown (new 1), 1 refused",
+            "its final rewrite failed: /b/.pack-reinject-pending.json: denied",
+            "(/b/l)",
+        ] {
+            if !s2.contains(want) {
+                failures.push(format!("the apply-phase message lacks `{want}`: {s2}"));
+            }
+        }
+        if s2.contains("before anything was applied, typed or written") {
+            failures.push(format!("the apply-phase message claims the whole invocation did nothing: {s2}"));
+        }
+        if !s1_msg.contains("REFUSED at its pending re-injection pass") || !s1_msg.contains("neither fetched nor applied") {
+            failures.push(format!("the pending-pass message does not say what was refused: {s1_msg}"));
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
     /// ★(B-428 R2) Wiring pin for what no test can drive (`run_pack_update` needs a source verified against the embedded
     /// keyring): it turns a refused pending pass into an early named error; it takes the pending lock AFTER the source is
     /// resolved and BEFORE the apply, refusing with the named message; the node loop runs only through
-    /// `run_pack_reinject_held` with that held lock; and the unlocked `PendingLock` (no file) is built in exactly one place,
-    /// the unwritable-directory arm of `lock_reinject_pending` — nothing else can hand the node loop a fake hold.
+    /// `run_pack_reinject_held` with that held lock; and (★R3 · codex r2) there is NO unlocked `PendingLock` at all — no
+    /// `Option` field and no `None` construction anywhere — so nothing can hand the node loop a fake hold.
     #[test]
     fn b428_r2_run_pack_update_takes_the_pending_lock_before_the_apply_source_pin() {
         let src = include_str!("cys.rs");
@@ -50983,9 +51192,9 @@ mod b360_tests {
         let mut failures = Vec::new();
         for needle in [
             "Ok(c) if c.lock_refused.is_some() =>",
-            "return Err(pending_lock_refused_warning(\"pack update\", c.lock_refused.as_deref().unwrap_or_default()));",
+            "return Err(pending_lock_refused_warning(c.lock_refused.as_deref().unwrap_or_default()));",
             "match lock_reinject_pending(&base, PENDING_LOCK_WAIT) {",
-            "Err(e) => return Err(pending_lock_refused_warning(\"pack update\", &e)),",
+            "Err(e) => return Err(pack_apply_lock_refused_warning(&e, &consumed)),",
             "match run_pack_reinject_held(&base, &outcome.pack_version, held) {",
         ] {
             if at(needle).is_none() {
@@ -50999,9 +51208,10 @@ mod b360_tests {
         if body.matches("run_pack_reinject(").count() != 0 {
             failures.push("run_pack_update calls the node loop without the held lock".into());
         }
-        let unlocked = format!("PendingLock {{ _file: {} }}", "None");
-        if src.matches(unlocked.as_str()).count() != 1 {
-            failures.push(format!("`{unlocked}` is built {} times (want 1: lock_reinject_pending)", src.matches(unlocked.as_str()).count()));
+        for unlocked in [format!("PendingLock {{ _file: {} }}", "None"), format!("_file: {}<std::fs::File>", "Option")] {
+            if src.matches(unlocked.as_str()).count() != 0 {
+                failures.push(format!("`{unlocked}` occurs {} times (want 0: no unlocked PendingLock)", src.matches(unlocked.as_str()).count()));
+            }
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
