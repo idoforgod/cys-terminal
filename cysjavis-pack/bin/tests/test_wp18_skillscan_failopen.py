@@ -246,7 +246,7 @@ def rig_pack(scanner_body):
     return tmp, pack, root
 
 
-def c60(scanner_body, timeout_s=None, mark_dir=None, worker_sleep=None):
+def c60(scanner_body, timeout_s=None, mark_dir=None, worker_sleep=None, cleanup_result=None):
     """실제 Preflight.c60_gate_wiring() 을 리그 팩에 대해 구동하고 (status, detail) 을 돌려준다.
 
     timeout_s 를 주면 제품의 **이름 있는 상한**(Preflight.SKILLSCAN_SCAN_TIMEOUT_S)만 짧게 바꾼다 —
@@ -264,9 +264,12 @@ def c60(scanner_body, timeout_s=None, mark_dir=None, worker_sleep=None):
         "T = %r\n"
         "if T is not None:\n"
         "    P.Preflight.SKILLSCAN_SCAN_TIMEOUT_S = T\n"
+        "cleanup = %r\n"
+        "if cleanup is not None:\n"
+        "    P.Preflight._run_skillscan_all = staticmethod(lambda *args: (-9, '', '', True, cleanup))\n"
         "p = P.Preflight(False, [], mode='report')\n"
         "p.c60_gate_wiring()\n"
-        "print(json.dumps(p.results, ensure_ascii=False, default=str))\n" % (BIN, timeout_s))
+        "print(json.dumps(p.results, ensure_ascii=False, default=str))\n" % (BIN, timeout_s, cleanup_result))
     env = {k: v for k, v in os.environ.items() if not k.startswith("CYS_")}
     env.update({"HOME": tmp, "TMPDIR": tmp, "CYS_PACK_DIR": pack, "JAVIS_ROOT": root,
                 "PYTHONDONTWRITEBYTECODE": "1"})
@@ -374,6 +377,91 @@ check("G10 그룹 생성·그룹 종료·재측정 수단이 스캔 호출에 �
       all(tok in _pf_body for tok in ("start_new_session", "killpg", "CREATE_NEW_PROCESS_GROUP",
                                       "taskkill")) and "os.killpg(proc.pid, 0)" in _pf_body,
       "POSIX setsid+killpg · Windows 그룹+taskkill(UNMEASURED) · 정리 뒤 재측정")
+
+# ───────── H. R3: identity release and cleanup observation (safe OS doubles) ─────────
+# Execute the actual helper with isolated globals: never signal a real/decoy process.
+import errno
+import signal
+import types
+import javis_preflight as PF
+
+
+def cleanup_case(platform="posix", observation="absent", taskkill="ok", reap=True):
+    events = []
+    class Child:
+        pid = 424242
+        returncode = None
+        released = False
+        calls = 0
+        def communicate(self, timeout):
+            self.calls += 1
+            if self.calls == 1 or not reap:
+                raise subprocess.TimeoutExpired("scanner", timeout)
+            self.released = True
+            self.returncode = -9
+            events.append(("release",))
+            return "", ""
+        def kill(self):
+            events.append(("parent-kill", self.released))
+    child = Child()
+    def killpg(pid, sig):
+        events.append(("signal", sig, child.released))
+        if sig == 0:
+            if observation == "absent":
+                raise ProcessLookupError(errno.ESRCH, "gone")
+            if observation == "eperm":
+                raise PermissionError(errno.EPERM, "denied")
+            if observation == "other":
+                raise OSError(errno.EIO, "probe failed")
+    def run(*args, **kwargs):
+        events.append(("taskkill", child.released))
+        if taskkill == "absent":
+            raise FileNotFoundError("taskkill absent")
+        if taskkill == "timeout":
+            raise subprocess.TimeoutExpired("taskkill", 5)
+        return types.SimpleNamespace(returncode=5 if taskkill == "nonzero" else 0,
+                                     stdout="", stderr="access denied" if taskkill == "nonzero" else "")
+    globs = dict(PF.Preflight._run_skillscan_all.__globals__)
+    globs["os"] = types.SimpleNamespace(name=platform, killpg=killpg)
+    globs["subprocess"] = types.SimpleNamespace(Popen=lambda *a, **k: child, run=run,
+        PIPE=-1, DEVNULL=-3, CREATE_NEW_PROCESS_GROUP=512, TimeoutExpired=subprocess.TimeoutExpired)
+    globs["time"] = types.SimpleNamespace(sleep=lambda _: None)
+    fn = types.FunctionType(PF.Preflight._run_skillscan_all.__code__, globs)
+    result = fn("scanner", 20)
+    return result[4], events
+
+
+_cleanup, _events = cleanup_case(observation="present")
+check("H1 recycled pgid decoy receives zero destructive signals after release",
+      not any(e[0] == "signal" and e[1] != 0 and e[2] for e in _events), repr(_events))
+check("H2 released identity with present group is unknown, not verified original survivors",
+      isinstance(_cleanup, dict) and _cleanup.get("state") == "unknown"
+      and bool(_cleanup.get("reason")), repr(_cleanup))
+for _obs, _expected in (("absent", "verified_empty"), ("eperm", "unknown"), ("other", "unknown")):
+    _cleanup, _events = cleanup_case(observation=_obs)
+    check("H3 POSIX observation " + _obs,
+          isinstance(_cleanup, dict) and _cleanup.get("state") == _expected
+          and bool(_cleanup.get("reason")), repr(_cleanup))
+_cleanup, _events = cleanup_case(observation="present", reap=False)
+check("H4 still-owned present group reports survivors without post-release kill",
+      isinstance(_cleanup, dict) and _cleanup.get("state") == "survivors", repr(_cleanup))
+for _tk in ("ok", "absent", "nonzero", "timeout"):
+    _cleanup, _events = cleanup_case(platform="nt", taskkill=_tk)
+    check("H5 Windows taskkill " + _tk + " remains unknown with outcome",
+          isinstance(_cleanup, dict) and _cleanup.get("state") == "unknown"
+          and "UNMEASURED" in _cleanup.get("reason", "")
+          and (_tk == "ok" or ("5" if _tk == "nonzero" else
+               "FileNotFoundError" if _tk == "absent" else "TimeoutExpired")
+               in _cleanup.get("reason", "")), repr(_cleanup))
+
+# Feed each helper state through the actual C60 FAIL-row renderer.
+for _state, _words in (("verified_empty", "잔존 0(재측정 확인)"),
+                       ("survivors", "잔존 감지(정리 미완료)"),
+                       ("unknown", "잔존 여부 미확인(unknown)")):
+    _st, _dt = c60(SC_CLEAN, cleanup_result={"state": _state, "reason": "R3 observation reason"})
+    check("H6 C60 renders " + _state + " and reason truthfully",
+          _st == "FAIL" and _words in _dt and "R3 observation reason" in _dt
+          and (_state == "verified_empty" or "잔존 0" not in _dt), _dt)
 
 # ─────────────────────── F. 산출물 동일성·순서·폴백 ───────────────────────
 def fixture_skills():
