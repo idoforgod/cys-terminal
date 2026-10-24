@@ -11,6 +11,23 @@
 [env]
 CYS_PACK_DIR = { value = "target/test-pack-sandbox", relative = true, force = false }
 
+# ★WP13(0.14.53 · 헤드 결정 HEAD-RULING-STACK-R2 2026-10-24) 시험 스레드 스택 — debug clap-derive 의
+# 생성기 프레임이 약 2 MiB 를 쓰는데 그것이 **libtest 기본 시험 스레드 스택과 같다**. 그래서 인자 몇 개짜리
+# 서브커맨드 하나가 더해지면 제목과 무관한 clap 파싱 검체들이 한꺼번에 스택을 넘긴다(실측 2026-10-24:
+# 기준선 0 건 → `set-title` 추가 뒤 16 건 · 최소 통과 스택 2,097,152 B → 2,113,536 B).
+#
+# ⚠이 값이 재우는 것은 **cargo 가 띄우는 프로세스의 생성 스레드**뿐이다(= `cargo test`/`cargo run` 아래의
+# libtest 시험 스레드). **메인 스레드는 재우지 못하고**, 바이너리를 직접 실행할 때는 이 env 가 아예 없다
+# ⇒ 제품 질문(사용자가 받는 바이너리가 넘치는가)에 대한 답이 **아니다**. 그 답은 릴리스 바이너리 쪽
+# 관문이 쥔다: 런북 2.8 행(`ulimit -s 1024` 에서 릴리스 cys 의 `--help`·`set-title --help`·
+# `queue list --help`)과 release.yml·windows-build.yml 의 **차단** 포장 cys.exe `--help` 게이트
+# (그 게이트는 RUST_MIN_STACK 을 지우고 돈다). 구조적 축소(clap Args 분리)는 백로그 **B-464**(e7bd3be4 후보).
+#
+# force=false: 호출마다 명시한 값이 이긴다 — windows-health 의 A-ID S5 는 자기 줄에서 8388608 을 이미
+# 지정하고, **기본 스택에서 넘침을 재는** 스텝은 자기 줄에서 2097152 를 지정해 계속 잰다(그 스텝이 없으면
+# 이 봉인은 그 측정을 조용히 끝낸다 — 결정문 조건 3).
+RUST_MIN_STACK = { value = "8388608", force = false }
+
 # CRT 정책 SOT(v0.13.23 백포트 · 2026-07-28) — Windows MSVC 바이너리는 CRT 정적 링크(자기완결).
 # 근거: VCRUNTIME140.dll 부재 머신(VC++ 재배포 패키지 미설치)에서 cysd.exe 가 기동 불능이던
 # 현장 결함(2026-07-28 오너 실기 재현 — "VCRUNTIME140.dll이(가) 없어 코드 실행을 진행할 수

@@ -1479,6 +1479,10 @@ jobs:
           }
           T=queue_list_row_tests::rqfix_f10_queue_list_long_help_documents_the_stderr_notice_line
           cargo_filter_count --bin cys "$T"
-          (unset RUST_MIN_STACK; cargo test --bin cys "$T" -- --exact --test-threads=1; echo "[measure] single test RUST_MIN_STACK=unset rc=$?")
+          # ★WP13(0.14.53 · HEAD-RULING-STACK-R2 조건 3): `.cargo/config.toml [env]` 이 cargo 아래 모든 시험
+          #   스레드에 RUST_MIN_STACK=8388608 을 주입하므로, 셸에서 `unset` 해도 **cargo 가 다시 넣는다**
+          #   (force=false 는 *이미 설정된* 값만 존중한다 — unset 은 미설정이다). 이 스텝은 기본 스택에서
+          #   넘침을 **재는** 것이 존재 이유이므로 기본값을 자기 줄에서 명시해 계속 잰다.
+          (export RUST_MIN_STACK=2097152; cargo test --bin cys "$T" -- --exact --test-threads=1; echo "[measure] single test RUST_MIN_STACK=2097152(libtest default) rc=$?")
           (export RUST_MIN_STACK=8388608; cargo test --bin cys "$T" -- --exact --test-threads=1; echo "[measure] single test RUST_MIN_STACK=8388608 rc=$?")
           exit 0
