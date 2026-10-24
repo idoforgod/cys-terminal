@@ -932,11 +932,12 @@ pub(crate) trait Grammar: Sync {
 }
 
 /// Production grammar registry. Each grammar is derived from the native capture corpus
-/// (`_evidence/dept5-0.14.52-P3-impl/U/validation/f01/FINDINGS-<family>.md`, corpus/INDEX.json sha256 bec81de5…).
+/// (`_evidence/dept5-0.14.52-P3-impl/U/validation/f01/FINDINGS-<family>.md`, corpus/INDEX.json sha256 bec81de5…;
+/// claude r2: `_evidence/dept5-0.14.53-wp11-tabdot-20261023/capture/`).
 /// gemini/agy has no grammar yet: its only route is read-only observation of a live seat (head ruling
 /// 2026-10-16) and no working frame has been observed, so that family stays Unknown (PROVISIONAL).
 pub(crate) fn grammars() -> &'static [&'static dyn Grammar] {
-    static ALL: [&dyn Grammar; 2] = [&CLAUDE_R1, &CODEX_R1];
+    static ALL: [&dyn Grammar; 2] = [&CLAUDE_R2, &CODEX_R1];
     &ALL
 }
 
@@ -969,11 +970,22 @@ fn mask_lead(line: &str, glyphs: &[char]) -> String {
 /// claude 2.1.301 (FINDINGS-claude §2–§5): OSC title `◐|◑ Claude Code` while working (model wait, streaming,
 /// tool — 99.1–100 %), `✳ Claude Code` when idle AND in permission/question panels. The composer is a `❯` row
 /// framed by `─` rules with the (hidden) cursor parked in it; a frame without that structure is mid-redraw.
-pub(crate) struct ClaudeR1;
-pub(crate) static CLAUDE_R1: ClaudeR1 = ClaudeR1;
+/// r2 (WP11, claude 2.1.309): once the session is named the title is `<glyph> <session name>` (◐|◑ working, ✳ resting);
+/// "Claude Code" is only the name before that. r1 required the "Claude Code" suffix, so every named session — every live
+/// seat — classified NoMatch ("incomplete frame") and never showed Working or Waiting (MEASURE.md, capture/grammar-check.json).
+pub(crate) struct ClaudeR2;
+pub(crate) static CLAUDE_R2: ClaudeR2 = ClaudeR2;
 const CLAUDE_SPINNER: [char; 6] = ['·', '✢', '✳', '✶', '✻', '✽'];
 
-impl ClaudeR1 {
+impl ClaudeR2 {
+    /// The (trimmed) title's first character when a space follows it — the claude shape `<glyph> <name>`. Only ◐ ◑ (active) and
+    /// ✳ (resting) lead to a verdict in `classify`; any other glyph ends NoMatch there. The caller trims, so a glyph and a space
+    /// with no name never reaches here (the trailing space is gone).
+    fn title_glyph(title: &str) -> Option<char> {
+        let mut it = title.chars();
+        let glyph = it.next()?;
+        (it.next() == Some(' ')).then_some(glyph)
+    }
     fn is_rule(l: &str) -> bool {
         l.trim_start().starts_with('─')
     }
@@ -1000,21 +1012,19 @@ impl ClaudeR1 {
     }
 }
 
-impl Grammar for ClaudeR1 {
+impl Grammar for ClaudeR2 {
     fn family(&self) -> Family {
         Family::Claude
     }
     fn revision(&self) -> &'static str {
-        "claude-2.1.301-r1"
+        "claude-2.1.309-r2"
     }
     fn classify(&self, v: &View<'_>) -> Verdict {
-        let title = v.title.trim();
-        if !title.ends_with("Claude Code") {
+        let Some(glyph) = Self::title_glyph(v.title.trim()) else {
             return Verdict::NoMatch;
-        }
-        let glyph = title.chars().next();
-        let active = matches!(glyph, Some('◐' | '◑'));
-        let resting = glyph == Some('✳');
+        };
+        let active = matches!(glyph, '◐' | '◑');
+        let resting = glyph == '✳';
         let trimmed = || v.rows.iter().map(|(_, l)| l.trim());
         let permission = trimmed().any(|l| l.starts_with("Esc to cancel · Tab to amend") || l == "Do you want to proceed?");
         let question = trimmed().any(|l| l.starts_with("Enter to select · ↑/↓ to navigate · Esc to cancel"));

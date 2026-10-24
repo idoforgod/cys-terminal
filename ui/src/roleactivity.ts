@@ -1,7 +1,8 @@
 // ★F-01(0.14.52 · U) 역할 점 활동 표시 — 순수 판정 + 바뀐 것만 쓰는 칠하기. 타이머·IPC·전역 상태 0(칠하기 캐시 WeakMap 하나뿐).
 //
 // 무엇을 하나: 데몬이 `surface.list` 의 각 줄에 싣는 `display_activity`(src/bin/cysd/activity.rs `wire_at`)를 믿을 수 있는 만큼만 받아,
-//   점을 다섯 가지 중 하나로 보인다 — 작업 중(깜박임) · 대기(고정) · 입력 대기(구별되는 고정 주의 표지) · 상태 확인 지연(U4-5 · 빈 원) · 모름(빈 원).
+//   점을 일곱 가지 중 하나로 보인다 — 작업 중(채운 원 · 깜박임) · 대기(빈 원 · 고정) · 종료(회색 X) · 입력 대기(마름모) · 상태 확인 지연(U4-5 · 흐린 채운 원) ·
+//   모름(점선 원) · 관측 미지원(가로 막대). ★WP11(0.14.53 · 오너 지시): 작업 중 = 채운 원 + 깜박임, 대기 = 빈 원 + 고정, 죽은 노드 = 회색 X.
 //   역할색은 그대로다(역할색은 role 이 정하고 이 모듈은 상태 표지만 정한다). 알림·토스트·배지·feed 는 만들지 않는다.
 //
 // 시간 계약(DESIGN-U-FROZEN-R3 R3-4 · 헤드 판정 U4-5) — 전부 **단조 시계(ms)** 위의 값이다(벽시계 빼기 금지):
@@ -166,7 +167,20 @@ export class RoleActivityStore {
   }
 }
 
-export type DotView = "working" | "waiting" | "input" | "stale" | "unknown";
+export type DotView = "working" | "waiting" | "input" | "stale" | "unknown" | "dead" | "unobserved";
+
+/** Daemon reason for a family with no grammar (activity.rs `Semantic::UnsupportedFamily`) — that seat can never show working/waiting. */
+export const UNSUPPORTED_FAMILY_REASON = "unsupported family";
+
+/**
+ * ★WP11 dead seat — the same predicate as ctxpick.ts: `exited === true` (pane ended) or `agent_alive === false` (the governance watchdog
+ * observed the agent gone). `agent_alive` null/absent = not measured, never dead. Returns the reason text, or null when alive/unknown.
+ */
+export function deadReason(row: { exited?: unknown; agent_alive?: unknown }): string | null {
+  if (row.exited === true) return "창 종료(exited)";
+  if (row.agent_alive === false) return "에이전트 프로세스 없음";
+  return null;
+}
 export interface DotProjection {
   view: DotView;
   text: string;
@@ -199,6 +213,8 @@ export function projectActivity(rec: ActivityRecord | undefined, nowMs: number, 
     case "waiting_for_input":
       return { view: "input", text: `입력 대기 · ${p.reason}(${p.raw})${tail}` };
     default:
+      if (p.reason === UNSUPPORTED_FAMILY_REASON)
+        return { view: "unobserved", text: `활동 관측 미지원 · ${p.family ?? "?"} CLI 는 작업 중/대기를 구별할 수 없음${tail}` };
       return { view: "unknown", text: `상태 모름 · ${p.reason}${tail}` };
   }
 }
@@ -210,6 +226,8 @@ export const DOT_CLASS: Readonly<Record<DotView, string>> = {
   input: "act-input",
   stale: "act-stale",
   unknown: "act-unknown",
+  dead: "act-dead",
+  unobserved: "act-unobserved",
 };
 
 export interface DotPaint {
@@ -220,7 +238,7 @@ export interface DotPaint {
   /** 접근 문구 — title 과 aria-label 에 같은 값. */
   label: string;
 }
-/** 무역할 셸·종료 좌석 — 종전처럼 숨긴다. */
+/** 무역할 셸 — 종전처럼 숨긴다(★WP11: 역할 좌석의 종료는 숨기지 않고 회색 X 로 보인다 — view "dead"). */
 export const HIDDEN_DOT: DotPaint = { visible: false, color: "", view: "unknown", label: "" };
 
 /** 칠하기 대상의 최소 꼴(HTMLElement 가 만족한다 — 시험은 대역을 쓴다). */
