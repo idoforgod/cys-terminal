@@ -12736,6 +12736,7 @@ mod tests {
 
     include!("caller_matrix_tests.rs");
     include!("checked_submit_sender_tests.rs");
+    include!("wp13_rename_gate_tests.rs");
     include!("checked_submit_sender_dormancy_tests.rs");
     include!("c8_dormancy_proof_tests.rs");
 

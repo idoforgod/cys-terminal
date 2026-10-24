@@ -1071,7 +1071,7 @@ jobs:
           $full = (Resolve-Path -LiteralPath $exe).Path
           Write-Host "[help-gate] $exe sha256=$((Get-FileHash -Algorithm SHA256 -LiteralPath $full).Hash)"
           $failed = @()
-          foreach ($argv in @(@('--help'), @('queue', '--help'), @('queue', 'list', '--help'))) {
+          foreach ($argv in @(@('--help'), @('queue', '--help'), @('queue', 'list', '--help'), @('set-title', '--help'))) {
             $label = $argv -join ' '
             $global:LASTEXITCODE = $null
             $ErrorActionPreference = 'Continue'
