@@ -1014,3 +1014,148 @@ fn c8pp_resumed_success_releases_original_reservation_after_settlement() {
     assert!(!s.inject_reserved());assert!(hold_kind(&s).is_none());
     assert_eq!(events(&fx,"queue.delivered").len(),1);
 }
+
+// WP17: exercise the real queue selection/render/settlement API, so the old implementation
+// fails at the singleton body assertion rather than at an unavailable new helper.
+fn wp17_normal_handoff(fx: &Fx, s: &Arc<Surface>) -> crate::governance::QueueHandoff {
+    let mut result = None;
+    crate::state::test_done_or_no_pty_output(s, || {
+        result = deliver_head_locked(&fx.daemon, s, false, false, None, Some(0), None, None);
+        result.is_some()
+    });
+    result.expect("eligible queue head must progress")
+}
+
+#[test]
+fn wp17_adjacent_commands_are_separate_submissions_and_keep_interval() {
+    let fx = fx("wp17-pair");
+    let s = seat(&fx);
+    let first = enqueue(&fx, &s, "/remote-control test-master");
+    let second = enqueue(&fx, &s, "/model opus");
+    let one = wp17_normal_handoff(&fx, &s);
+    assert_eq!(one.body, "/remote-control test-master", "slash head acquired digest text");
+    assert_eq!(one.merged_ids, vec![first]);
+    assert!(one.written_submitted());
+    assert_eq!(queue_len(&s), 1);
+    assert!(deliver_head_locked(&fx.daemon, &s, false, false, None, Some(0), None, None).is_none(),
+        "command isolation must not bypass delivery pacing");
+    *s.last_queue_delivery_at.lock().unwrap() = Some(Instant::now() - Duration::from_secs(60));
+    let two = wp17_normal_handoff(&fx, &s);
+    assert_eq!(two.body, "/model opus");
+    assert_eq!(two.merged_ids, vec![second]);
+    assert!(two.written_submitted());
+    assert_eq!(queue_len(&s), 0);
+    assert_eq!(events(&fx, "queue.delivered").len(), 2);
+}
+
+#[test]
+fn wp17_text_digest_stops_at_command_without_skipping_it() {
+    let fx = fx("wp17-mixed");
+    let s = seat(&fx);
+    let ids: Vec<_> = ["first", "second", "/model opus", "third", "fourth"]
+        .iter().map(|t| enqueue(&fx, &s, t)).collect();
+    let a = wp17_normal_handoff(&fx, &s);
+    assert_eq!(a.merged_ids, ids[..2]);
+    assert_eq!(a.body, "[큐 다이제스트 2건 · 발신 unknown]\n[1/2] first\n[2/2] second\n");
+    assert_eq!(queue_len(&s), 3);
+    *s.last_queue_delivery_at.lock().unwrap() = Some(Instant::now() - Duration::from_secs(60));
+    let b = wp17_normal_handoff(&fx, &s);
+    assert_eq!(b.body, "/model opus");
+    assert_eq!(b.merged_ids, ids[2..3]);
+    *s.last_queue_delivery_at.lock().unwrap() = Some(Instant::now() - Duration::from_secs(60));
+    let c = wp17_normal_handoff(&fx, &s);
+    assert_eq!(c.merged_ids, ids[3..]);
+    assert_eq!(c.body, "[큐 다이제스트 2건 · 발신 unknown]\n[1/2] third\n[2/2] fourth\n");
+    assert_eq!(queue_len(&s), 0);
+}
+
+#[test]
+fn wp17_multiline_command_is_one_identity_and_byte_preserved() {
+    let fx = fx("wp17-multiline");
+    let s = seat(&fx);
+    let body = " \t/model opus\r\n/remote-control 이름\nprose";
+    let id = enqueue(&fx, &s, body);
+    enqueue(&fx, &s, "later");
+    let d = wp17_normal_handoff(&fx, &s);
+    assert_eq!(d.body, body);
+    assert_eq!(d.merged_ids, vec![id]);
+    assert!(d.written_submitted());
+    assert_eq!(queue_len(&s), 1);
+    assert_eq!(events(&fx, "queue.delivered").len(), 1);
+}
+
+fn wp17_has_admission_record(fx: &Fx, reason: &str) -> bool {
+    std::fs::read_to_string(crate::delivery::ledger_path(&fx.daemon.socket_path)).unwrap()
+        .lines().filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .any(|v| v["slash_command_admission"] == reason)
+}
+
+#[test]
+fn wp17_markerless_command_delivers_and_records_fallback() {
+    let fx = fx("wp17-markerless");
+    let s = seat(&fx);
+    enqueue(&fx, &s, "/model opus");
+    let d = wp17_normal_handoff(&fx, &s);
+    assert_eq!(d.body, "/model opus");
+    assert!(d.written_submitted());
+    assert_eq!(queue_len(&s), 0);
+    assert!(wp17_has_admission_record(&fx, "fallback_markerless"));
+}
+
+#[test]
+fn wp17_unknown_hint_command_delivers_and_records_fallback() {
+    let fx = fx("wp17-hint");
+    let s = seat(&fx);
+    // Cursor immediately after the marker; unknown suggestion is AFTER the cursor.
+    s.parser.lock().unwrap().process("\x1b[2J\x1b[H❯ Unrecognised visual hint\x1b[1;3H".as_bytes());
+    let recheck = crate::governance::ScreenRecheck {
+        marker: Some(vec!["❯".into()]), placeholder: None,
+        gen_at_verdict: s.output_gen.load(Ordering::Acquire), approval_pending: false,
+    };
+    enqueue(&fx, &s, "/model opus");
+    let d = deliver_head_locked(&fx.daemon, &s, false, false, None, Some(0), None, Some(&recheck))
+        .expect("head ruling: unknown hint keeps ordinary gate, not a new hold");
+    assert_eq!(d.body, "/model opus");
+    assert!(d.written_submitted());
+    assert_eq!(queue_len(&s), 0);
+    assert!(wp17_has_admission_record(&fx, "fallback_unrecognized_hint"));
+}
+
+#[test]
+fn wp17_known_empty_command_records_proof_and_draft_then_empty_progresses() {
+    let fx = fx("wp17-empty");
+    let s = seat(&fx);
+    enqueue(&fx, &s, "/model opus");
+    let recheck = crate::governance::ScreenRecheck {
+        marker: Some(vec!["❯".into()]), placeholder: None,
+        gen_at_verdict: s.output_gen.load(Ordering::Acquire), approval_pending: false,
+    };
+    // Same generation deliberately exercises the fresh slash observation, even when the
+    // ordinary handoff recheck considers its saved generation unchanged.
+    s.parser.lock().unwrap().process("\x1b[2J\x1b[H❯ draft".as_bytes());
+    assert!(deliver_head_locked(&fx.daemon, &s, false, false, None, Some(0), None, Some(&recheck)).is_none());
+    assert_eq!(queue_len(&s), 1);
+    assert!(s.inject_track.last_body().is_none());
+    s.parser.lock().unwrap().process("\x1b[2J\x1b[H❯ ".as_bytes());
+    let d = deliver_head_locked(&fx.daemon, &s, false, false, None, Some(0), None, Some(&recheck))
+        .expect("empty observed composer must progress");
+    assert!(d.written_submitted());
+    assert_eq!(queue_len(&s), 0);
+    assert!(wp17_has_admission_record(&fx, "measured_empty"));
+}
+
+#[test]
+fn wp17_markerless_pending_draft_keeps_ordinary_block_then_recovers() {
+    let fx = fx("wp17-pending");
+    let s = seat(&fx);
+    enqueue(&fx, &s, "/model opus");
+    s.pending_input_bytes.store(9, Ordering::Relaxed);
+    assert!(deliver_head_locked(&fx.daemon, &s, true, false, None, Some(9), None, None).is_none(),
+        "fallback must not bypass ordinary pending-input gate, even forced");
+    assert_eq!(queue_len(&s), 1);
+    assert!(s.inject_track.last_body().is_none());
+    s.pending_input_bytes.store(0, Ordering::Relaxed);
+    let d = wp17_normal_handoff(&fx, &s);
+    assert!(d.written_submitted());
+    assert_eq!(queue_len(&s), 0);
+}
