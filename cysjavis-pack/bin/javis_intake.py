@@ -394,7 +394,11 @@ def _arts(it):
 
 
 def _item_state(it, root_for_rel=None):
-    """(state, why) — PAID 또는 OPEN 과 그 사유. ★지불은 기계가 확인한다."""
+    """(state, why) — 세 결말(PAID · OPEN · UNREADABLE) 중 하나와 그 사유. ★지불은 기계가 확인한다.
+    PAID       — 지불 확인: done 은 증거 + artifact 지문 대조 통과, defer 는 사유 + release_condition.
+    OPEN       — 지불 없음·무효: 증거 부족 · 바이트 변경(CHANGED) · 경로 부재(ABSENT) · 임시 경로뿐 · 그 밖의 state.
+    UNREADABLE — done 항목의 지문 기록 artifact 가 실존하나 읽히지 않는다(위 OPEN 사유가 없을 때만). 지불은 무효가
+                 아니며(감사는 지불로 센다) 신원만 재확인할 수 없다 — 감사 종료 코드는 EXIT_UNREADABLE(8)."""
     st = (it.get("state") or "open").strip()
     if st == "done":
         ev = (it.get("evidence") or "").strip()
