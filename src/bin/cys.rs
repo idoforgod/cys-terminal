@@ -30305,14 +30305,32 @@ mod tests {
         std::fs::write(&manifest_path, &bytes).unwrap();
         std::fs::write(from.join("pack-manifest.json.minisig"), sign(&bytes)).unwrap();
         #[cfg(unix)]
-        let node_daemon = if mode == "apply-node-persist" {
+        let fail_node_rewrite = mode == "apply-node-persist";
+        #[cfg(unix)]
+        let node_daemon = if mode == "apply-node-persist" || (mode.starts_with("apply-") && mode.ends_with("-ok")) {
             let path = reinject_pending_path(&base);
+            let node_failed = mode == "apply-node-failed-ok";
+            let node_unknown = mode == "apply-node-new-unknown-ok";
+            if node_failed || node_unknown {
+                std::fs::create_dir_all(pack.join("directives")).unwrap();
+                std::fs::write(pack.join("directives/WORKER_DIRECTIVE.md"), "fixture worker").unwrap();
+                std::fs::write(pack.join("directives/RSI_LEARNING_DIRECTIVE.md"), "fixture RSI").unwrap();
+            }
             let daemon = super::b360_tests::R2cDaemon::start(move |method, _| {
+                if method == "surface.send_text" && (node_failed || node_unknown) {
+                    return json!({"ok": false, "error": {
+                        "code": if node_unknown { cys::ERR_WRITE_OUTCOME_UNKNOWN } else { "rpc_failed" },
+                        "message": "fixture node write result"
+                    }});
+                }
                 let result = match method {
                     "system.topology" => json!({"saved": []}),
+                    "control.dashboard" if node_failed || node_unknown => json!({"fleet": [
+                        {"surface_id": 7, "role": "worker", "state": "idle", "idle_secs": 60, "agent_status": "idle"}
+                    ]}),
                     "control.dashboard" => json!({"fleet": []}),
                     "org.status" => {
-                        std::fs::create_dir_all(&path).unwrap();
+                        if fail_node_rewrite { std::fs::create_dir_all(&path).unwrap(); }
                         json!({"daemon": {"started_at": 1.0}, "surfaces": []})
                     }
                     _ => json!({}),
@@ -30324,10 +30342,10 @@ mod tests {
         } else { None };
         let pending = |_: &std::path::Path| -> Result<PendingConsumeReport, String> {
             Ok(match mode.as_str() {
-                "persist" | "apply-persist" => PendingConsumeReport { persist_error: Some("fixture rewrite refused".into()), ..Default::default() },
-                "new-unknown" => PendingConsumeReport { unknown: 1, unknown_new: 1, ..Default::default() },
-                "carried" => PendingConsumeReport { unknown: 1, ..Default::default() },
-                "refused" => PendingConsumeReport { kept: 1, intent_refused: 1, ..Default::default() },
+                "persist" | "apply-persist" | "apply-persist-ok" => PendingConsumeReport { persist_error: Some("fixture rewrite refused".into()), ..Default::default() },
+                "new-unknown" | "apply-new-unknown-ok" | "apply-new-unknown" => PendingConsumeReport { unknown: 1, unknown_new: 1, ..Default::default() },
+                "carried" | "apply-carried-ok" | "apply-carried" => PendingConsumeReport { unknown: 1, ..Default::default() },
+                "refused" | "apply-refused-ok" | "apply-refused" => PendingConsumeReport { kept: 1, intent_refused: 1, ..Default::default() },
                 _ => PendingConsumeReport::default(),
             })
         };
@@ -30380,15 +30398,42 @@ mod tests {
     fn b428_u9_complete_command_classifies_before_clean_noop_and_publishes_first() {
         use cys::pack_update_result::{parse, PackAction};
         #[cfg_attr(not(unix), allow(unused_mut))]
-        let mut cases = vec![("clean", 0), ("unknown", 0), ("carried", 0), ("persist", 3), ("new-unknown", 3), ("refused", 3), ("apply-persist", 3)];
+        let mut cases = vec![("clean", 0), ("unknown", 0), ("carried", 0), ("persist", 3), ("new-unknown", 3), ("refused", 3), ("apply-persist", 3), ("apply-new-unknown", 3), ("apply-refused", 3), ("apply-carried", 0)];
         #[cfg(unix)]
         cases.push(("apply-node-persist", 3));
+        #[cfg(unix)]
+        cases.extend([
+            ("apply-new-unknown-ok", 3), ("apply-refused-ok", 3), ("apply-persist-ok", 3),
+            ("apply-carried-ok", 0), ("apply-clean-ok", 0),
+            ("apply-node-failed-ok", 3), ("apply-node-new-unknown-ok", 3),
+        ]);
         for (mode, expected) in cases {
             let (rc, output) = b428_u9_command_output(mode);
             assert_eq!(rc, expected, "{mode}: command disposition, not just version gate; {output}");
             assert!(output.starts_with("PACK_UPDATE_OUTCOME "), "{mode}: first command output must be terminal record: {output}");
             let record = parse(&output, rc).unwrap().expect("schema2 record");
             assert_eq!(record.action, if mode.starts_with("apply-") { PackAction::Applied } else { PackAction::NoOp });
+            // Keep the phase facts too: code3 alone cannot prove that the pending report survived.
+            if mode == "new-unknown" || mode == "apply-new-unknown" || mode == "apply-new-unknown-ok" {
+                assert_eq!((record.pending.unknown, record.pending.unknown_new), (1, 1), "{mode}: pending new unknown lost");
+            }
+            if mode == "refused" || mode == "apply-refused" || mode == "apply-refused-ok" {
+                assert_eq!(record.pending.intent_refused, 1, "{mode}: pending refusal lost");
+            }
+            if mode == "persist" || mode == "apply-persist" || mode == "apply-persist-ok" || mode == "apply-node-persist" {
+                assert!(record.pending.persist_failed, "{mode}: persistence failure lost");
+            }
+            if mode == "carried" || mode == "apply-carried" || mode == "apply-carried-ok" {
+                assert_eq!((record.pending.unknown, record.pending.unknown_new), (1, 0), "{mode}: carried unknown lost");
+            }
+            if mode == "apply-node-failed-ok" { assert_eq!(record.pending.failed, 1); }
+            if mode == "apply-node-new-unknown-ok" {
+                assert_eq!((record.pending.node_unknown, record.pending.node_unknown_new), (1, 1));
+            }
+            if mode.ends_with("-ok") { assert!(!record.pending.skipped, "{mode}: fixture must reach Apply+Ok"); }
+            if mode == "apply-persist" || mode == "apply-new-unknown" || mode == "apply-refused" || mode == "apply-carried" {
+                assert!(record.pending.skipped, "{mode}: fixture must reach Apply+Err");
+            }
             assert_eq!(output.lines().filter(|l| l.starts_with("PACK_UPDATE_OUTCOME ")).count(), 1);
             let first = output.lines().next().unwrap();
             assert_eq!(first.contains(" disk_parse=ok"), mode == "clean", "{mode}: legacy success proof leaked");
@@ -47288,10 +47333,13 @@ mod b360_tests {
         persist_reinject_pending(&pack.dir, "9.9.9", &[(7, "worker".to_string())]).unwrap();
         let daemon = r2c_pack_daemon(r2c_reply(&pending_err()));
         let (_rc, out, err) = r2c_child("pack-update", &daemon, &pack.envs());
-        let line = out.lines().find(|l| l.contains("pending reinject 소비")).unwrap_or_default().to_string();
+        let line = err.lines().find(|l| l.contains("pending reinject 소비")).unwrap_or_default().to_string();
         let mut failures = Vec::new();
         if !(line.contains("0 해소") && line.contains("1 미확인")) {
-            failures.push(format!("pending pass line: {line:?}\n{out}"));
+            failures.push(format!("pending pass line: {line:?}\n{err}"));
+        }
+        if out.contains("pending reinject 소비") {
+            failures.push(format!("human pending diagnostic leaked to machine stdout: {out}"));
         }
         let warn = err.lines().find(|l| l.contains("cys reinject --role worker --check")).unwrap_or_default();
         if !(warn.contains("surface 7") || warn.contains("surface:7")) || !warn.contains(".pack-reinject-pending.json") {
@@ -47688,8 +47736,9 @@ mod b360_tests {
     /// record-only. A call-graph pin over the production region (comments/strings blanked, `#[cfg(test)]` items cut): the
     /// transitive callers of the three, stopping at the `run` dispatch, contain none of `run_boot`, `run_restore`,
     /// `run_launch_agent_opts`, `run_launch_agent`, `run_node_recover`.
-    /// Positive controls: the scanner finds the edges it must (run_pack_update → consume_reinject_pending →
-    /// directive_presence, and run_restore → run_launch_agent_opts — a root edge, so it would see a forbidden one).
+    /// The real command proves provider execution/report retention on Unix. The scanner retains the
+    /// consume_reinject_pending → directive_presence and run_restore → run_launch_agent_opts controls,
+    /// and follows the provider/command entry too so indirect wiring cannot hide a forbidden caller.
     /// RED on 11717c44: `directive_presence` does not exist there (its edge control fails); the exclusion itself holds.
     #[test]
     fn b360_r2r_p14_the_reconciliation_is_not_reachable_from_boot_restore_launch_or_node_recover() {
@@ -47699,8 +47748,20 @@ mod b360_tests {
         let fns = r2r_fn_spans(&text, &tests);
         let callers = |n: &str| r2r_callers(&text, &fns, &tests, n);
         let mut failures = Vec::new();
-        if !callers("consume_reinject_pending").contains(&"run_pack_update".to_string()) {
-            failures.push(format!("control: run_pack_update → consume_reinject_pending not found: {:?}", callers("consume_reinject_pending")));
+        // The command now takes an explicit provider. Prove its execution and report retention,
+        // not a lexical direct-call spelling. The child uses the real pending consumer.
+        #[cfg(unix)]
+        {
+            let pack = R2cPack::new();
+            persist_reinject_pending(&pack.dir, "9.9.9", &[(7, "worker".to_string())]).unwrap();
+            let daemon = r2c_pack_daemon(r2c_reply(&pending_err()));
+            let (rc, out, err) = r2c_child("pack-update", &daemon, &pack.envs());
+            let pending = r2p_unknown_entries(&pack.dir);
+            if rc != 1 || pending.len() != 1 || r2c_count(&daemon.calls(), "surface.send_text") != 1
+                || !err.lines().any(|l| l.contains("pending reinject 소비") && l.contains("0 해소") && l.contains("1 미확인"))
+            {
+                failures.push(format!("control: command provider execution/report missing: rc={rc} pending={pending:?} stdout={out} stderr={err}"));
+            }
         }
         if !callers("directive_presence").contains(&"consume_reinject_pending".to_string()) {
             failures.push(format!("control: consume_reinject_pending → directive_presence not found: {:?}", callers("directive_presence")));
@@ -47711,7 +47772,8 @@ mod b360_tests {
         let roots = ["run_boot", "run_restore", "run_launch_agent_opts", "run_launch_agent", "run_node_recover"];
         let mut seen: Vec<String> = Vec::new();
         let mut queue: Vec<String> =
-            ["consume_reinject_pending", "consume_reinject_pending_core", "directive_presence"].map(String::from).to_vec();
+            ["consume_reinject_pending", "consume_reinject_pending_core", "directive_presence", "pending_consumer", "run_pack_update"]
+                .map(String::from).to_vec();
         while let Some(f) = queue.pop() {
             for c in callers(&f) {
                 if c == "run" || seen.contains(&c) {
@@ -47762,6 +47824,8 @@ mod b360_tests {
         for (pending, nodes, want) in [
             (PendingConsumeReport { unknown: 1, ..Default::default() }, ReinjectReport::default(), 0),
             (PendingConsumeReport { unknown: 1, unknown_new: 1, ..Default::default() }, ReinjectReport::default(), 3),
+            (PendingConsumeReport { intent_refused: 1, ..Default::default() }, ReinjectReport::default(), 3),
+            (PendingConsumeReport::default(), ReinjectReport { failed: 1, ..Default::default() }, 3),
             (PendingConsumeReport::default(), ReinjectReport { unknown: 1, ..Default::default() }, 0),
             (PendingConsumeReport::default(), ReinjectReport { unknown: 1, unknown_new: 1, ..Default::default() }, 3),
             (PendingConsumeReport { persist_error: Some("refused".into()), ..Default::default() }, ReinjectReport::default(), 3),
