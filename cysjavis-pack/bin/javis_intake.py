@@ -233,8 +233,9 @@ _WIN_TEMP_ENV = ("TMPDIR", "TEMP", "TMP")
 
 
 _OPEN = open
-# ★`_OPEN` 은 검체 주입구다 — 판독 불가 갈래를 iCloud 도, 그런 파일도 없이 재기 위해 테스트가 이 이름만 대역으로
-#   바꾼다(운영 경로는 그대로 builtin open 이다). 같은 수법을 Windows 경로 판정에서 `os` 대역으로 이미 쓴다.
+_STAT = os.stat
+# ★`_OPEN`·`_STAT` 은 검체 주입구다 — 읽기와 stat 갈래를 실제 dataless 파일 없이 재기 위해 테스트가 대역으로
+#   바꾼다(운영 경로는 builtin open·os.stat). 같은 수법을 Windows 경로 판정에서 `os` 대역으로 이미 쓴다.
 #   ⛔이 도구는 파일을 **내려받거나 실체화하거나 옮기지 않는다**(오너 규칙) — stat 과 read 만 한다.
 
 SF_DATALESS = 0x40000000      # macOS sys/stat.h — 내용이 클라우드로 비워졌다(stat 는 되고 read 는 막힌다)
@@ -266,12 +267,13 @@ def _probe(path):
       OK          : 열고 끝까지 읽었다 — 지문이 있다(신원을 말할 수 있는 유일한 갈래).
       ABSENT      : 경로가 없다.
       NOT_REGULAR : 있으나 정규 파일이 아니다(디렉터리·FIFO·장치) — 열지 않는다(FIFO 는 쓰는 쪽을 기다려 막힌다).
-      UNREADABLE  : 정규 파일인데 open/read 가 OSError 다 — errno 와 (있으면) st_flags 를 싣는다. 크기는 stat 에서
+      UNREADABLE  : darwin SF_DATALESS 면 열지 않고 errno=None; 그 밖의 open/read OSError 는 실제 errno 를 싣는다.
+                    st_flags 를 보존하고 크기는 stat 에서
                     얻는다(★stat 는 dataless 파일에서도 **논리 크기**를 준다 — 그래서 크기 대조는 정황이 된다).
     ⛔OSError 가 아닌 예외(경로가 문자열이 아닌 기록 등)는 여기서 분류하지 않는다 — 호출자가 종전처럼 지문 없음으로 본다.
     """
     try:
-        stt = os.stat(path)
+        stt = _STAT(path)
     except FileNotFoundError:
         return PROBE_ABSENT, None, None, None, None
     except OSError as e:
@@ -280,6 +282,9 @@ def _probe(path):
     flags = getattr(stt, "st_flags", None)
     if not stat.S_ISREG(stt.st_mode):
         return PROBE_NOT_REGULAR, None, None, None, flags
+    if sys.platform == "darwin" and flags is not None and flags & SF_DATALESS:
+        # A failed open can still request hydration. Observe the flag without requesting bytes.
+        return PROBE_UNREADABLE, None, stt.st_size, None, flags
     try:
         with _OPEN(path, "rb") as fh:
             b = fh.read()
@@ -291,7 +296,11 @@ def _probe(path):
 def _unreadable_note(eno, cur_size, rec_size, flags):
     """판독 불가 한 건을 사람 말로 — errno(이름) · st_flags · 크기 대조. ★크기 일치는 **정황**이고 신원이 아니다."""
     name = errno.errorcode.get(eno, "?") if eno is not None else "?"
-    out = "errno %s(%s)%s" % (eno, name, _flags_note(flags))
+    if (sys.platform == "darwin" and eno is None and cur_size is not None
+            and flags is not None and flags & SF_DATALESS):
+        out = "⛔열지 않았다 — stat 에서 SF_DATALESS 를 보고 바이트를 요청하지 않았다%s" % _flags_note(flags)
+    else:
+        out = "errno %s(%s)%s" % (eno, name, _flags_note(flags))
     if cur_size is None:
         out += " · 현재 크기 미측정(stat 도 막혔다)"
     elif rec_size is None:

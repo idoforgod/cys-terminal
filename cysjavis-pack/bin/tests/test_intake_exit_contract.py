@@ -657,6 +657,81 @@ class _DatalessOs:
         return getattr(os, name)
 
 
+
+class StatBeforeOpen(unittest.TestCase):
+    """Inject stat flags only; never create an actual dataless file."""
+
+    def setUp(self):
+        self.m = load_tool()
+        with open(DURABLE, "rb") as fh:
+            self.data = fh.read()
+        self.sha = self.m._digest(self.data)[:16]
+
+    def probe(self, flags, platform):
+        opener = mock.Mock(wraps=open)
+        with mock.patch.object(self.m, "_STAT", return_value=_FakeStat(len(self.data), flags), create=True), \
+             mock.patch.object(self.m, "_OPEN", opener), \
+             mock.patch.object(self.m.sys, "platform", platform):
+            result = self.m._probe(DURABLE)
+        print(json.dumps({"platform": platform, "flags": flags, "probe": result,
+                          "open_calls": opener.call_count}))
+        return result, opener.call_count
+
+    def test_darwin_dataless_never_requests_bytes(self):
+        result, calls = self.probe(SF_DATALESS | UF_COMPRESSED, "darwin")
+        self.assertEqual(result, (self.m.PROBE_UNREADABLE, None, len(self.data), None,
+                                  SF_DATALESS | UF_COMPRESSED))
+        self.assertEqual(calls, 0)
+
+    def test_regular_file_still_opens_and_hashes(self):
+        result, calls = self.probe(0, "darwin")
+        self.assertEqual(result, (self.m.PROBE_OK, self.sha, len(self.data), None, 0))
+        self.assertEqual(calls, 1)
+
+    def test_non_darwin_same_bit_still_opens(self):
+        for platform in ("linux", "win32"):
+            with self.subTest(platform=platform):
+                result, calls = self.probe(SF_DATALESS, platform)
+                self.assertEqual(result, (self.m.PROBE_OK, self.sha, len(self.data), None, SF_DATALESS))
+                self.assertEqual(calls, 1)
+
+    def test_fp_dataless_cannot_create_payment_fingerprint(self):
+        opener = mock.Mock(wraps=open)
+        with mock.patch.object(self.m, "_STAT", return_value=_FakeStat(len(self.data), SF_DATALESS), create=True), \
+             mock.patch.object(self.m, "_OPEN", opener), \
+             mock.patch.object(self.m.sys, "platform", "darwin"):
+            result = self.m._fp(DURABLE)
+        print(json.dumps({"case": "fp", "fingerprint": result, "open_calls": opener.call_count}))
+        self.assertEqual(result, (None, None))
+        self.assertEqual(opener.call_count, 0)
+
+    def test_no_open_note_has_no_fabricated_errno_or_repayment(self):
+        opener = mock.Mock(wraps=open)
+        item = {"state": "done", "evidence": EVIDENCE,
+                "artifacts": [{"path": DURABLE, "sha256_16": self.sha, "size": len(self.data)}]}
+        with mock.patch.object(self.m, "_STAT", return_value=_FakeStat(len(self.data), SF_DATALESS), create=True), \
+             mock.patch.object(self.m, "_OPEN", opener), \
+             mock.patch.object(self.m.sys, "platform", "darwin"):
+            state, why = self.m._item_state(item)
+        print(json.dumps({"case": "note", "state": state, "why": why,
+                          "open_calls": opener.call_count}, ensure_ascii=False))
+        self.assertEqual(state, "UNREADABLE")
+        self.assertIn("열지 않았다", why)
+        self.assertIn("바이트를 요청하지 않았다", why)
+        self.assertNotIn("errno 11", why)
+        self.assertNotIn("재지불", why)
+        self.assertEqual(opener.call_count, 0)
+
+    def test_non_regular_is_rejected_before_dataless(self):
+        opener = mock.Mock(wraps=open)
+        with mock.patch.object(self.m, "_STAT", return_value=_FakeStat(0, SF_DATALESS, mode=0o040755), create=True), \
+             mock.patch.object(self.m, "_OPEN", opener), \
+             mock.patch.object(self.m.sys, "platform", "darwin"):
+            result = self.m._probe(DURABLE)
+        self.assertEqual(result[0], self.m.PROBE_NOT_REGULAR)
+        self.assertEqual(opener.call_count, 0)
+
+
 class UnreadableIsNotChanged(unittest.TestCase):
     """도구를 같은 프로세스로 읽고 운영 경로(_item_state·_evaluate)를 그대로 태운다. 대역은 `create=True` 로 심는다 —
     ★그래서 수리 전 바이트에서도 이 검체가 돌고, 거기서는 붉다(대역을 쓰지 않는 옛 _fp 가 파일을 읽어 PAID 를 낸다)."""
@@ -664,6 +739,12 @@ class UnreadableIsNotChanged(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.m = load_tool()
+
+    def setUp(self):
+        # Keep existing os-proxy fixtures (including the protected size pin) on the new stat seam.
+        patcher = mock.patch.object(self.m, "_STAT", side_effect=lambda *a, **k: self.m.os.stat(*a, **k))
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def item(self, sha, size, path=DURABLE):
         return {"state": "done", "evidence": EVIDENCE,
@@ -695,14 +776,17 @@ class UnreadableIsNotChanged(unittest.TestCase):
         self.assertIn("부재", why)
         self.assertNotIn("변경됐다", why)
 
-    def test_dataless_line_names_errno_and_the_flag(self):
+    def test_dataless_line_reports_no_open_and_the_flag(self):
         sha, size = self.m._fp(DURABLE)
         with mock.patch.object(self.m, "os", _DatalessOs(DURABLE, size, SF_DATALESS | UF_COMPRESSED)), \
-             mock.patch.object(self.m, "_OPEN", _raises(11), create=True):
+             mock.patch.object(self.m, "_OPEN", side_effect=_raises(11)) as opener, \
+             mock.patch.object(self.m.sys, "platform", "darwin"):
             st, why = self.m._item_state(self.item(sha, size))
         self.assertEqual(st, "UNREADABLE", why)
-        self.assertIn("errno 11", why)
+        self.assertIn("열지 않았다", why)
+        self.assertNotIn("errno 11", why)
         self.assertIn("st_flags=0x", why)
+        self.assertEqual(opener.call_count, 0)
 
     def test_flag_names_are_darwin_only(self):
         # U5: 다른 OS 에서도 errno 로 분류는 되고, darwin 전용 비트 해석만 꺼진다.
