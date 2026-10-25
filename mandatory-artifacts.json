@@ -1,0 +1,72 @@
+{
+  "required": [
+    "measurement.json",
+    "input-lock.json",
+    "permit.json",
+    "build-metadata.json",
+    "base-state.json",
+    "base-raw-state.json",
+    "base-logs.json",
+    "log-inventory.json",
+    "channel-capture.json",
+    "cells.json",
+    "log-coverage.json"
+  ],
+  "records": {
+    "measurement.json": {
+      "sha256": "0755fa6652f837a912ec1e376ae27030f38a38304c9470e0e762f217c5c8ae58",
+      "bytes": 347039,
+      "format": "json"
+    },
+    "input-lock.json": {
+      "sha256": "75a1bac10a0eea72040fbcb2f19ba38ad2194564ed9ec77c4854e3722366cff3",
+      "bytes": 666,
+      "format": "json"
+    },
+    "permit.json": {
+      "sha256": "a931751dfabecb387f8b7e03063e442b1463c0ee67aa7427c69ba0c064f049a4",
+      "bytes": 848,
+      "format": "json"
+    },
+    "build-metadata.json": {
+      "sha256": "f99bd8c19c863429e6ff63beb52bdff08f662dba5cfa16aae18f0ad3600352f2",
+      "bytes": 25532,
+      "format": "json"
+    },
+    "base-state.json": {
+      "sha256": "880b6ebcc3617c06c47a7d6cb6b6b9205e23340bf27631b685ff4b9fb073c390",
+      "bytes": 276447,
+      "format": "json"
+    },
+    "base-raw-state.json": {
+      "sha256": "4e15c8cf8472db364c7639ceedfb8d41270f9558d25a2ab91b220e03b179adf3",
+      "bytes": 371737,
+      "format": "json"
+    },
+    "base-logs.json": {
+      "sha256": "49123f9093347d0d39c720e7164d4b1af2696bd1bec07221dcd14fc9fb3db91b",
+      "bytes": 1474,
+      "format": "json"
+    },
+    "log-inventory.json": {
+      "sha256": "e5da89c33742068bb06c705e466565eaa29997ad3ba6b317e7334bc6f8dee654",
+      "bytes": 6395,
+      "format": "json"
+    },
+    "channel-capture.json": {
+      "sha256": "7833e86cab8ea70730c0b7f196a5caceb0c38f57124a93989c7b277c30af2cd1",
+      "bytes": 8796,
+      "format": "json"
+    },
+    "cells.json": {
+      "sha256": "287e622235e96ac48fc3cfbc34d6f01eef612cb68984ffbd6f73073be239889e",
+      "bytes": 515,
+      "format": "json"
+    },
+    "log-coverage.json": {
+      "sha256": "833dfa4dee6a244fecebfb65d620dc5eddf27247e647fbfa45f7e902d6eaf646",
+      "bytes": 98,
+      "format": "json"
+    }
+  }
+}

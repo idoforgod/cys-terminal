@@ -1,0 +1,132 @@
+{
+  "generated": "2026-10-25T09:25:46.562Z",
+  "repository": "idoforgod/cys-terminal",
+  "run_id": "40179883769",
+  "run_attempt": "1",
+  "run_url": "https://github.com/idoforgod/cys-terminal/actions/runs/40179883769",
+  "job": "winmeasure-R1",
+  "os": "windows-2025",
+  "branch": "diag-results/40179883769-1-winmeasure-R1-windows-2025",
+  "node": "v22.23.4",
+  "files": [
+    {
+      "path": "base-3713e7c8f94a445eac1cd8fc9a9d1bad-cdp.json",
+      "bytes": 26843
+    },
+    {
+      "path": "base-52603233d7ee45ff9cc4656e5c1cb06c-cdp.json",
+      "bytes": 26843
+    },
+    {
+      "path": "base-6a7dc2b97e9a436a838c75828c6cff13-cdp.json",
+      "bytes": 26843
+    },
+    {
+      "path": "base-9597e37e844e44a9b85484168d630d38-cdp.json",
+      "bytes": 26843
+    },
+    {
+      "path": "base-a567e763a07a461fb9d49bc7071ec9ae-cdp.json",
+      "bytes": 26843
+    },
+    {
+      "path": "base-logs.json",
+      "bytes": 1474
+    },
+    {
+      "path": "base-pack-observation.json",
+      "bytes": 175326
+    },
+    {
+      "path": "base-pack-request.json",
+      "bytes": 131
+    },
+    {
+      "path": "base-raw-state.json",
+      "bytes": 371737
+    },
+    {
+      "path": "base-state-reduced.json",
+      "bytes": 182178
+    },
+    {
+      "path": "base-state.json",
+      "bytes": 276447
+    },
+    {
+      "path": "build-metadata.json",
+      "bytes": 25532
+    },
+    {
+      "path": "cells.json",
+      "bytes": 515
+    },
+    {
+      "path": "channel-capture.json",
+      "bytes": 8796
+    },
+    {
+      "path": "evidence-receipts.json",
+      "bytes": 2289
+    },
+    {
+      "path": "input-lock.json",
+      "bytes": 666
+    },
+    {
+      "path": "job-start.txt",
+      "bytes": 24
+    },
+    {
+      "path": "log-coverage.json",
+      "bytes": 98
+    },
+    {
+      "path": "log-inventory.json",
+      "bytes": 6395
+    },
+    {
+      "path": "log-win-measure.txt",
+      "bytes": 115
+    },
+    {
+      "path": "logs-base/00000.log",
+      "bytes": 123
+    },
+    {
+      "path": "logs-base/00001.log",
+      "bytes": 1737
+    },
+    {
+      "path": "mandatory-artifacts.json",
+      "bytes": 2075
+    },
+    {
+      "path": "measurement.json",
+      "bytes": 347039
+    },
+    {
+      "path": "permit.json",
+      "bytes": 848
+    },
+    {
+      "path": "SHA256SUMS",
+      "bytes": 2541
+    },
+    {
+      "path": "verdict.json",
+      "bytes": 179
+    },
+    {
+      "path": "winmeasure-citool-lp-initial.json",
+      "bytes": 1972
+    },
+    {
+      "path": "winmeasure-state-initial.json",
+      "bytes": 1465
+    }
+  ],
+  "skipped": [],
+  "inline_files": 25,
+  "blob_files": 4
+}

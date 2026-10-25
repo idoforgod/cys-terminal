@@ -1,0 +1,188 @@
+{
+    "observer_schema":  2,
+    "product_sha":  "4bfc2443b2961acb82a8d1fc27cb5e5c783fd6da",
+    "reading":  "R1",
+    "interval":  {
+                     "start":  1792919957.969,
+                     "end":  1792920345.631
+                 },
+    "phase":  "baseline",
+    "phases":  {
+                   "baseline":  "stopped",
+                   "update":  "not-started",
+                   "post_update":  "not-started",
+                   "old_restart":  "not-applicable"
+               },
+    "channels":  [
+                     {
+                         "id":  "daemon:file",
+                         "phase":  "baseline",
+                         "status":  "unbound",
+                         "bound":  false,
+                         "producer_pid":  null,
+                         "sink":  "",
+                         "collection_ok":  false,
+                         "error":  "required producer/channel is not captured; filenames are not binding proof"
+                     },
+                     {
+                         "id":  "daemon:stdout",
+                         "phase":  "baseline",
+                         "status":  "unbound",
+                         "bound":  false,
+                         "producer_pid":  null,
+                         "sink":  "",
+                         "collection_ok":  false,
+                         "error":  "required producer/channel is not captured; filenames are not binding proof"
+                     },
+                     {
+                         "id":  "daemon:stderr",
+                         "phase":  "baseline",
+                         "status":  "unbound",
+                         "bound":  false,
+                         "producer_pid":  null,
+                         "sink":  "",
+                         "collection_ok":  false,
+                         "error":  "required producer/channel is not captured; filenames are not binding proof"
+                     },
+                     {
+                         "id":  "pack:file",
+                         "phase":  "baseline",
+                         "status":  "unbound",
+                         "bound":  false,
+                         "producer_pid":  null,
+                         "sink":  "",
+                         "collection_ok":  false,
+                         "error":  "required producer/channel is not captured; filenames are not binding proof"
+                     },
+                     {
+                         "id":  "pack:stdout",
+                         "phase":  "baseline",
+                         "status":  "unbound",
+                         "bound":  false,
+                         "producer_pid":  null,
+                         "sink":  "",
+                         "collection_ok":  false,
+                         "error":  "required producer/channel is not captured; filenames are not binding proof"
+                     },
+                     {
+                         "id":  "pack:stderr",
+                         "phase":  "baseline",
+                         "status":  "unbound",
+                         "bound":  false,
+                         "producer_pid":  null,
+                         "sink":  "",
+                         "collection_ok":  false,
+                         "error":  "required producer/channel is not captured; filenames are not binding proof"
+                     },
+                     {
+                         "id":  "app:file",
+                         "phase":  "baseline",
+                         "status":  "unbound",
+                         "bound":  false,
+                         "producer_pid":  null,
+                         "sink":  "",
+                         "collection_ok":  false,
+                         "error":  "required producer/channel is not captured; filenames are not binding proof"
+                     },
+                     {
+                         "id":  "app-base:stdout",
+                         "phase":  "baseline",
+                         "status":  "unbound",
+                         "bound":  false,
+                         "producer_pid":  null,
+                         "sink":  "",
+                         "collection_ok":  false,
+                         "error":  "required producer/channel is not captured; filenames are not binding proof"
+                     },
+                     {
+                         "id":  "app-base:stderr",
+                         "phase":  "baseline",
+                         "status":  "unbound",
+                         "bound":  false,
+                         "producer_pid":  null,
+                         "sink":  "",
+                         "collection_ok":  false,
+                         "error":  "required producer/channel is not captured; filenames are not binding proof"
+                     },
+                     {
+                         "id":  "app-updated:stdout",
+                         "phase":  "post_update",
+                         "status":  "not-started",
+                         "bound":  false,
+                         "producer_pid":  null,
+                         "sink":  "",
+                         "collection_ok":  false,
+                         "error":  "producer phase not started: post_update"
+                     },
+                     {
+                         "id":  "app-updated:stderr",
+                         "phase":  "post_update",
+                         "status":  "not-started",
+                         "bound":  false,
+                         "producer_pid":  null,
+                         "sink":  "",
+                         "collection_ok":  false,
+                         "error":  "producer phase not started: post_update"
+                     },
+                     {
+                         "id":  "installer-base:stdout",
+                         "phase":  "baseline",
+                         "status":  "unbound",
+                         "bound":  false,
+                         "producer_pid":  null,
+                         "sink":  "",
+                         "collection_ok":  false,
+                         "error":  "required producer/channel is not captured; filenames are not binding proof"
+                     },
+                     {
+                         "id":  "installer-base:stderr",
+                         "phase":  "baseline",
+                         "status":  "unbound",
+                         "bound":  false,
+                         "producer_pid":  null,
+                         "sink":  "",
+                         "collection_ok":  false,
+                         "error":  "required producer/channel is not captured; filenames are not binding proof"
+                     },
+                     {
+                         "id":  "installer-candidate:stdout",
+                         "phase":  "update",
+                         "status":  "not-started",
+                         "bound":  false,
+                         "producer_pid":  null,
+                         "sink":  "",
+                         "collection_ok":  false,
+                         "error":  "producer phase not started: update"
+                     },
+                     {
+                         "id":  "installer-candidate:stderr",
+                         "phase":  "update",
+                         "status":  "not-started",
+                         "bound":  false,
+                         "producer_pid":  null,
+                         "sink":  "",
+                         "collection_ok":  false,
+                         "error":  "producer phase not started: update"
+                     },
+                     {
+                         "id":  "app-old-restart:stdout",
+                         "phase":  "old_restart",
+                         "status":  "not-applicable",
+                         "bound":  false,
+                         "producer_pid":  null,
+                         "sink":  "",
+                         "collection_ok":  false,
+                         "error":  "producer phase not applicable to this reading: old_restart"
+                     },
+                     {
+                         "id":  "app-old-restart:stderr",
+                         "phase":  "old_restart",
+                         "status":  "not-applicable",
+                         "bound":  false,
+                         "producer_pid":  null,
+                         "sink":  "",
+                         "collection_ok":  false,
+                         "error":  "producer phase not applicable to this reading: old_restart"
+                     }
+                 ]
+}

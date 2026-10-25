@@ -1,0 +1,13 @@
+{
+  "status": "UNMEASURED",
+  "reasons": [
+    "logs_complete",
+    "baseline",
+    "versions",
+    "daemon",
+    "pack",
+    "seat",
+    "installer_exit",
+    "tracebacks"
+  ]
+}

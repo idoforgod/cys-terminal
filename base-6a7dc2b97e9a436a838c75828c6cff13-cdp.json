@@ -1,0 +1,891 @@
+{
+  "script": "cdp-update.mjs",
+  "node": "v22.23.4",
+  "mode": "uipre",
+  "port": 9333,
+  "started": "2026-10-25T09:23:31.519Z",
+  "finished": "2026-10-25T09:24:31.753Z",
+  "has_native_websocket": true,
+  "ws_impl": null,
+  "has_fetch": true,
+  "targets": null,
+  "discovery": {
+    "attempts": [
+      {
+        "started": "2026-10-25T09:23:31.522Z",
+        "finished": "2026-10-25T09:23:31.533Z",
+        "url": "http://127.0.0.1:9333/json/list",
+        "status": null,
+        "content_type": null,
+        "body": null,
+        "body_truncated": false,
+        "parse_error": null,
+        "exception": {
+          "name": "TypeError",
+          "message": "fetch failed",
+          "code": null,
+          "cause": {
+            "name": "Error",
+            "message": "connect ECONNREFUSED 127.0.0.1:9333",
+            "code": "ECONNREFUSED",
+            "cause": null,
+            "cause_truncated": false
+          },
+          "cause_truncated": false
+        },
+        "target_count": null,
+        "target_types": null,
+        "page_count": null,
+        "attachable_page_count": null,
+        "reason": "endpoint_unavailable"
+      },
+      {
+        "started": "2026-10-25T09:23:33.534Z",
+        "finished": "2026-10-25T09:23:33.536Z",
+        "url": "http://127.0.0.1:9333/json/list",
+        "status": null,
+        "content_type": null,
+        "body": null,
+        "body_truncated": false,
+        "parse_error": null,
+        "exception": {
+          "name": "TypeError",
+          "message": "fetch failed",
+          "code": null,
+          "cause": {
+            "name": "Error",
+            "message": "connect ECONNREFUSED 127.0.0.1:9333",
+            "code": "ECONNREFUSED",
+            "cause": null,
+            "cause_truncated": false
+          },
+          "cause_truncated": false
+        },
+        "target_count": null,
+        "target_types": null,
+        "page_count": null,
+        "attachable_page_count": null,
+        "reason": "endpoint_unavailable"
+      },
+      {
+        "started": "2026-10-25T09:23:35.538Z",
+        "finished": "2026-10-25T09:23:35.539Z",
+        "url": "http://127.0.0.1:9333/json/list",
+        "status": null,
+        "content_type": null,
+        "body": null,
+        "body_truncated": false,
+        "parse_error": null,
+        "exception": {
+          "name": "TypeError",
+          "message": "fetch failed",
+          "code": null,
+          "cause": {
+            "name": "Error",
+            "message": "connect ECONNREFUSED 127.0.0.1:9333",
+            "code": "ECONNREFUSED",
+            "cause": null,
+            "cause_truncated": false
+          },
+          "cause_truncated": false
+        },
+        "target_count": null,
+        "target_types": null,
+        "page_count": null,
+        "attachable_page_count": null,
+        "reason": "endpoint_unavailable"
+      },
+      {
+        "started": "2026-10-25T09:23:37.541Z",
+        "finished": "2026-10-25T09:23:37.543Z",
+        "url": "http://127.0.0.1:9333/json/list",
+        "status": null,
+        "content_type": null,
+        "body": null,
+        "body_truncated": false,
+        "parse_error": null,
+        "exception": {
+          "name": "TypeError",
+          "message": "fetch failed",
+          "code": null,
+          "cause": {
+            "name": "Error",
+            "message": "connect ECONNREFUSED 127.0.0.1:9333",
+            "code": "ECONNREFUSED",
+            "cause": null,
+            "cause_truncated": false
+          },
+          "cause_truncated": false
+        },
+        "target_count": null,
+        "target_types": null,
+        "page_count": null,
+        "attachable_page_count": null,
+        "reason": "endpoint_unavailable"
+      },
+      {
+        "started": "2026-10-25T09:23:39.544Z",
+        "finished": "2026-10-25T09:23:39.547Z",
+        "url": "http://127.0.0.1:9333/json/list",
+        "status": null,
+        "content_type": null,
+        "body": null,
+        "body_truncated": false,
+        "parse_error": null,
+        "exception": {
+          "name": "TypeError",
+          "message": "fetch failed",
+          "code": null,
+          "cause": {
+            "name": "Error",
+            "message": "connect ECONNREFUSED 127.0.0.1:9333",
+            "code": "ECONNREFUSED",
+            "cause": null,
+            "cause_truncated": false
+          },
+          "cause_truncated": false
+        },
+        "target_count": null,
+        "target_types": null,
+        "page_count": null,
+        "attachable_page_count": null,
+        "reason": "endpoint_unavailable"
+      },
+      {
+        "started": "2026-10-25T09:23:41.552Z",
+        "finished": "2026-10-25T09:23:41.554Z",
+        "url": "http://127.0.0.1:9333/json/list",
+        "status": null,
+        "content_type": null,
+        "body": null,
+        "body_truncated": false,
+        "parse_error": null,
+        "exception": {
+          "name": "TypeError",
+          "message": "fetch failed",
+          "code": null,
+          "cause": {
+            "name": "Error",
+            "message": "connect ECONNREFUSED 127.0.0.1:9333",
+            "code": "ECONNREFUSED",
+            "cause": null,
+            "cause_truncated": false
+          },
+          "cause_truncated": false
+        },
+        "target_count": null,
+        "target_types": null,
+        "page_count": null,
+        "attachable_page_count": null,
+        "reason": "endpoint_unavailable"
+      },
+      {
+        "started": "2026-10-25T09:23:43.566Z",
+        "finished": "2026-10-25T09:23:43.568Z",
+        "url": "http://127.0.0.1:9333/json/list",
+        "status": null,
+        "content_type": null,
+        "body": null,
+        "body_truncated": false,
+        "parse_error": null,
+        "exception": {
+          "name": "TypeError",
+          "message": "fetch failed",
+          "code": null,
+          "cause": {
+            "name": "Error",
+            "message": "connect ECONNREFUSED 127.0.0.1:9333",
+            "code": "ECONNREFUSED",
+            "cause": null,
+            "cause_truncated": false
+          },
+          "cause_truncated": false
+        },
+        "target_count": null,
+        "target_types": null,
+        "page_count": null,
+        "attachable_page_count": null,
+        "reason": "endpoint_unavailable"
+      },
+      {
+        "started": "2026-10-25T09:23:45.580Z",
+        "finished": "2026-10-25T09:23:45.581Z",
+        "url": "http://127.0.0.1:9333/json/list",
+        "status": null,
+        "content_type": null,
+        "body": null,
+        "body_truncated": false,
+        "parse_error": null,
+        "exception": {
+          "name": "TypeError",
+          "message": "fetch failed",
+          "code": null,
+          "cause": {
+            "name": "Error",
+            "message": "connect ECONNREFUSED 127.0.0.1:9333",
+            "code": "ECONNREFUSED",
+            "cause": null,
+            "cause_truncated": false
+          },
+          "cause_truncated": false
+        },
+        "target_count": null,
+        "target_types": null,
+        "page_count": null,
+        "attachable_page_count": null,
+        "reason": "endpoint_unavailable"
+      },
+      {
+        "started": "2026-10-25T09:23:47.585Z",
+        "finished": "2026-10-25T09:23:47.588Z",
+        "url": "http://127.0.0.1:9333/json/list",
+        "status": null,
+        "content_type": null,
+        "body": null,
+        "body_truncated": false,
+        "parse_error": null,
+        "exception": {
+          "name": "TypeError",
+          "message": "fetch failed",
+          "code": null,
+          "cause": {
+            "name": "Error",
+            "message": "connect ECONNREFUSED 127.0.0.1:9333",
+            "code": "ECONNREFUSED",
+            "cause": null,
+            "cause_truncated": false
+          },
+          "cause_truncated": false
+        },
+        "target_count": null,
+        "target_types": null,
+        "page_count": null,
+        "attachable_page_count": null,
+        "reason": "endpoint_unavailable"
+      },
+      {
+        "started": "2026-10-25T09:23:49.598Z",
+        "finished": "2026-10-25T09:23:49.600Z",
+        "url": "http://127.0.0.1:9333/json/list",
+        "status": null,
+        "content_type": null,
+        "body": null,
+        "body_truncated": false,
+        "parse_error": null,
+        "exception": {
+          "name": "TypeError",
+          "message": "fetch failed",
+          "code": null,
+          "cause": {
+            "name": "Error",
+            "message": "connect ECONNREFUSED 127.0.0.1:9333",
+            "code": "ECONNREFUSED",
+            "cause": null,
+            "cause_truncated": false
+          },
+          "cause_truncated": false
+        },
+        "target_count": null,
+        "target_types": null,
+        "page_count": null,
+        "attachable_page_count": null,
+        "reason": "endpoint_unavailable"
+      },
+      {
+        "started": "2026-10-25T09:23:51.601Z",
+        "finished": "2026-10-25T09:23:51.603Z",
+        "url": "http://127.0.0.1:9333/json/list",
+        "status": null,
+        "content_type": null,
+        "body": null,
+        "body_truncated": false,
+        "parse_error": null,
+        "exception": {
+          "name": "TypeError",
+          "message": "fetch failed",
+          "code": null,
+          "cause": {
+            "name": "Error",
+            "message": "connect ECONNREFUSED 127.0.0.1:9333",
+            "code": "ECONNREFUSED",
+            "cause": null,
+            "cause_truncated": false
+          },
+          "cause_truncated": false
+        },
+        "target_count": null,
+        "target_types": null,
+        "page_count": null,
+        "attachable_page_count": null,
+        "reason": "endpoint_unavailable"
+      },
+      {
+        "started": "2026-10-25T09:23:53.611Z",
+        "finished": "2026-10-25T09:23:53.612Z",
+        "url": "http://127.0.0.1:9333/json/list",
+        "status": null,
+        "content_type": null,
+        "body": null,
+        "body_truncated": false,
+        "parse_error": null,
+        "exception": {
+          "name": "TypeError",
+          "message": "fetch failed",
+          "code": null,
+          "cause": {
+            "name": "Error",
+            "message": "connect ECONNREFUSED 127.0.0.1:9333",
+            "code": "ECONNREFUSED",
+            "cause": null,
+            "cause_truncated": false
+          },
+          "cause_truncated": false
+        },
+        "target_count": null,
+        "target_types": null,
+        "page_count": null,
+        "attachable_page_count": null,
+        "reason": "endpoint_unavailable"
+      },
+      {
+        "started": "2026-10-25T09:23:55.626Z",
+        "finished": "2026-10-25T09:23:55.627Z",
+        "url": "http://127.0.0.1:9333/json/list",
+        "status": null,
+        "content_type": null,
+        "body": null,
+        "body_truncated": false,
+        "parse_error": null,
+        "exception": {
+          "name": "TypeError",
+          "message": "fetch failed",
+          "code": null,
+          "cause": {
+            "name": "Error",
+            "message": "connect ECONNREFUSED 127.0.0.1:9333",
+            "code": "ECONNREFUSED",
+            "cause": null,
+            "cause_truncated": false
+          },
+          "cause_truncated": false
+        },
+        "target_count": null,
+        "target_types": null,
+        "page_count": null,
+        "attachable_page_count": null,
+        "reason": "endpoint_unavailable"
+      },
+      {
+        "started": "2026-10-25T09:23:57.631Z",
+        "finished": "2026-10-25T09:23:57.632Z",
+        "url": "http://127.0.0.1:9333/json/list",
+        "status": null,
+        "content_type": null,
+        "body": null,
+        "body_truncated": false,
+        "parse_error": null,
+        "exception": {
+          "name": "TypeError",
+          "message": "fetch failed",
+          "code": null,
+          "cause": {
+            "name": "Error",
+            "message": "connect ECONNREFUSED 127.0.0.1:9333",
+            "code": "ECONNREFUSED",
+            "cause": null,
+            "cause_truncated": false
+          },
+          "cause_truncated": false
+        },
+        "target_count": null,
+        "target_types": null,
+        "page_count": null,
+        "attachable_page_count": null,
+        "reason": "endpoint_unavailable"
+      },
+      {
+        "started": "2026-10-25T09:23:59.646Z",
+        "finished": "2026-10-25T09:23:59.647Z",
+        "url": "http://127.0.0.1:9333/json/list",
+        "status": null,
+        "content_type": null,
+        "body": null,
+        "body_truncated": false,
+        "parse_error": null,
+        "exception": {
+          "name": "TypeError",
+          "message": "fetch failed",
+          "code": null,
+          "cause": {
+            "name": "Error",
+            "message": "connect ECONNREFUSED 127.0.0.1:9333",
+            "code": "ECONNREFUSED",
+            "cause": null,
+            "cause_truncated": false
+          },
+          "cause_truncated": false
+        },
+        "target_count": null,
+        "target_types": null,
+        "page_count": null,
+        "attachable_page_count": null,
+        "reason": "endpoint_unavailable"
+      },
+      {
+        "started": "2026-10-25T09:24:01.649Z",
+        "finished": "2026-10-25T09:24:01.650Z",
+        "url": "http://127.0.0.1:9333/json/list",
+        "status": null,
+        "content_type": null,
+        "body": null,
+        "body_truncated": false,
+        "parse_error": null,
+        "exception": {
+          "name": "TypeError",
+          "message": "fetch failed",
+          "code": null,
+          "cause": {
+            "name": "Error",
+            "message": "connect ECONNREFUSED 127.0.0.1:9333",
+            "code": "ECONNREFUSED",
+            "cause": null,
+            "cause_truncated": false
+          },
+          "cause_truncated": false
+        },
+        "target_count": null,
+        "target_types": null,
+        "page_count": null,
+        "attachable_page_count": null,
+        "reason": "endpoint_unavailable"
+      },
+      {
+        "started": "2026-10-25T09:24:03.658Z",
+        "finished": "2026-10-25T09:24:03.659Z",
+        "url": "http://127.0.0.1:9333/json/list",
+        "status": null,
+        "content_type": null,
+        "body": null,
+        "body_truncated": false,
+        "parse_error": null,
+        "exception": {
+          "name": "TypeError",
+          "message": "fetch failed",
+          "code": null,
+          "cause": {
+            "name": "Error",
+            "message": "connect ECONNREFUSED 127.0.0.1:9333",
+            "code": "ECONNREFUSED",
+            "cause": null,
+            "cause_truncated": false
+          },
+          "cause_truncated": false
+        },
+        "target_count": null,
+        "target_types": null,
+        "page_count": null,
+        "attachable_page_count": null,
+        "reason": "endpoint_unavailable"
+      },
+      {
+        "started": "2026-10-25T09:24:05.672Z",
+        "finished": "2026-10-25T09:24:05.673Z",
+        "url": "http://127.0.0.1:9333/json/list",
+        "status": null,
+        "content_type": null,
+        "body": null,
+        "body_truncated": false,
+        "parse_error": null,
+        "exception": {
+          "name": "TypeError",
+          "message": "fetch failed",
+          "code": null,
+          "cause": {
+            "name": "Error",
+            "message": "connect ECONNREFUSED 127.0.0.1:9333",
+            "code": "ECONNREFUSED",
+            "cause": null,
+            "cause_truncated": false
+          },
+          "cause_truncated": false
+        },
+        "target_count": null,
+        "target_types": null,
+        "page_count": null,
+        "attachable_page_count": null,
+        "reason": "endpoint_unavailable"
+      },
+      {
+        "started": "2026-10-25T09:24:07.675Z",
+        "finished": "2026-10-25T09:24:07.676Z",
+        "url": "http://127.0.0.1:9333/json/list",
+        "status": null,
+        "content_type": null,
+        "body": null,
+        "body_truncated": false,
+        "parse_error": null,
+        "exception": {
+          "name": "TypeError",
+          "message": "fetch failed",
+          "code": null,
+          "cause": {
+            "name": "Error",
+            "message": "connect ECONNREFUSED 127.0.0.1:9333",
+            "code": "ECONNREFUSED",
+            "cause": null,
+            "cause_truncated": false
+          },
+          "cause_truncated": false
+        },
+        "target_count": null,
+        "target_types": null,
+        "page_count": null,
+        "attachable_page_count": null,
+        "reason": "endpoint_unavailable"
+      },
+      {
+        "started": "2026-10-25T09:24:09.679Z",
+        "finished": "2026-10-25T09:24:09.682Z",
+        "url": "http://127.0.0.1:9333/json/list",
+        "status": null,
+        "content_type": null,
+        "body": null,
+        "body_truncated": false,
+        "parse_error": null,
+        "exception": {
+          "name": "TypeError",
+          "message": "fetch failed",
+          "code": null,
+          "cause": {
+            "name": "Error",
+            "message": "connect ECONNREFUSED 127.0.0.1:9333",
+            "code": "ECONNREFUSED",
+            "cause": null,
+            "cause_truncated": false
+          },
+          "cause_truncated": false
+        },
+        "target_count": null,
+        "target_types": null,
+        "page_count": null,
+        "attachable_page_count": null,
+        "reason": "endpoint_unavailable"
+      },
+      {
+        "started": "2026-10-25T09:24:11.684Z",
+        "finished": "2026-10-25T09:24:11.685Z",
+        "url": "http://127.0.0.1:9333/json/list",
+        "status": null,
+        "content_type": null,
+        "body": null,
+        "body_truncated": false,
+        "parse_error": null,
+        "exception": {
+          "name": "TypeError",
+          "message": "fetch failed",
+          "code": null,
+          "cause": {
+            "name": "Error",
+            "message": "connect ECONNREFUSED 127.0.0.1:9333",
+            "code": "ECONNREFUSED",
+            "cause": null,
+            "cause_truncated": false
+          },
+          "cause_truncated": false
+        },
+        "target_count": null,
+        "target_types": null,
+        "page_count": null,
+        "attachable_page_count": null,
+        "reason": "endpoint_unavailable"
+      },
+      {
+        "started": "2026-10-25T09:24:13.689Z",
+        "finished": "2026-10-25T09:24:13.690Z",
+        "url": "http://127.0.0.1:9333/json/list",
+        "status": null,
+        "content_type": null,
+        "body": null,
+        "body_truncated": false,
+        "parse_error": null,
+        "exception": {
+          "name": "TypeError",
+          "message": "fetch failed",
+          "code": null,
+          "cause": {
+            "name": "Error",
+            "message": "connect ECONNREFUSED 127.0.0.1:9333",
+            "code": "ECONNREFUSED",
+            "cause": null,
+            "cause_truncated": false
+          },
+          "cause_truncated": false
+        },
+        "target_count": null,
+        "target_types": null,
+        "page_count": null,
+        "attachable_page_count": null,
+        "reason": "endpoint_unavailable"
+      },
+      {
+        "started": "2026-10-25T09:24:15.694Z",
+        "finished": "2026-10-25T09:24:15.696Z",
+        "url": "http://127.0.0.1:9333/json/list",
+        "status": null,
+        "content_type": null,
+        "body": null,
+        "body_truncated": false,
+        "parse_error": null,
+        "exception": {
+          "name": "TypeError",
+          "message": "fetch failed",
+          "code": null,
+          "cause": {
+            "name": "Error",
+            "message": "connect ECONNREFUSED 127.0.0.1:9333",
+            "code": "ECONNREFUSED",
+            "cause": null,
+            "cause_truncated": false
+          },
+          "cause_truncated": false
+        },
+        "target_count": null,
+        "target_types": null,
+        "page_count": null,
+        "attachable_page_count": null,
+        "reason": "endpoint_unavailable"
+      },
+      {
+        "started": "2026-10-25T09:24:17.696Z",
+        "finished": "2026-10-25T09:24:17.698Z",
+        "url": "http://127.0.0.1:9333/json/list",
+        "status": null,
+        "content_type": null,
+        "body": null,
+        "body_truncated": false,
+        "parse_error": null,
+        "exception": {
+          "name": "TypeError",
+          "message": "fetch failed",
+          "code": null,
+          "cause": {
+            "name": "Error",
+            "message": "connect ECONNREFUSED 127.0.0.1:9333",
+            "code": "ECONNREFUSED",
+            "cause": null,
+            "cause_truncated": false
+          },
+          "cause_truncated": false
+        },
+        "target_count": null,
+        "target_types": null,
+        "page_count": null,
+        "attachable_page_count": null,
+        "reason": "endpoint_unavailable"
+      },
+      {
+        "started": "2026-10-25T09:24:19.701Z",
+        "finished": "2026-10-25T09:24:19.702Z",
+        "url": "http://127.0.0.1:9333/json/list",
+        "status": null,
+        "content_type": null,
+        "body": null,
+        "body_truncated": false,
+        "parse_error": null,
+        "exception": {
+          "name": "TypeError",
+          "message": "fetch failed",
+          "code": null,
+          "cause": {
+            "name": "Error",
+            "message": "connect ECONNREFUSED 127.0.0.1:9333",
+            "code": "ECONNREFUSED",
+            "cause": null,
+            "cause_truncated": false
+          },
+          "cause_truncated": false
+        },
+        "target_count": null,
+        "target_types": null,
+        "page_count": null,
+        "attachable_page_count": null,
+        "reason": "endpoint_unavailable"
+      },
+      {
+        "started": "2026-10-25T09:24:21.704Z",
+        "finished": "2026-10-25T09:24:21.705Z",
+        "url": "http://127.0.0.1:9333/json/list",
+        "status": null,
+        "content_type": null,
+        "body": null,
+        "body_truncated": false,
+        "parse_error": null,
+        "exception": {
+          "name": "TypeError",
+          "message": "fetch failed",
+          "code": null,
+          "cause": {
+            "name": "Error",
+            "message": "connect ECONNREFUSED 127.0.0.1:9333",
+            "code": "ECONNREFUSED",
+            "cause": null,
+            "cause_truncated": false
+          },
+          "cause_truncated": false
+        },
+        "target_count": null,
+        "target_types": null,
+        "page_count": null,
+        "attachable_page_count": null,
+        "reason": "endpoint_unavailable"
+      },
+      {
+        "started": "2026-10-25T09:24:23.720Z",
+        "finished": "2026-10-25T09:24:23.721Z",
+        "url": "http://127.0.0.1:9333/json/list",
+        "status": null,
+        "content_type": null,
+        "body": null,
+        "body_truncated": false,
+        "parse_error": null,
+        "exception": {
+          "name": "TypeError",
+          "message": "fetch failed",
+          "code": null,
+          "cause": {
+            "name": "Error",
+            "message": "connect ECONNREFUSED 127.0.0.1:9333",
+            "code": "ECONNREFUSED",
+            "cause": null,
+            "cause_truncated": false
+          },
+          "cause_truncated": false
+        },
+        "target_count": null,
+        "target_types": null,
+        "page_count": null,
+        "attachable_page_count": null,
+        "reason": "endpoint_unavailable"
+      },
+      {
+        "started": "2026-10-25T09:24:25.725Z",
+        "finished": "2026-10-25T09:24:25.726Z",
+        "url": "http://127.0.0.1:9333/json/list",
+        "status": null,
+        "content_type": null,
+        "body": null,
+        "body_truncated": false,
+        "parse_error": null,
+        "exception": {
+          "name": "TypeError",
+          "message": "fetch failed",
+          "code": null,
+          "cause": {
+            "name": "Error",
+            "message": "connect ECONNREFUSED 127.0.0.1:9333",
+            "code": "ECONNREFUSED",
+            "cause": null,
+            "cause_truncated": false
+          },
+          "cause_truncated": false
+        },
+        "target_count": null,
+        "target_types": null,
+        "page_count": null,
+        "attachable_page_count": null,
+        "reason": "endpoint_unavailable"
+      },
+      {
+        "started": "2026-10-25T09:24:27.740Z",
+        "finished": "2026-10-25T09:24:27.741Z",
+        "url": "http://127.0.0.1:9333/json/list",
+        "status": null,
+        "content_type": null,
+        "body": null,
+        "body_truncated": false,
+        "parse_error": null,
+        "exception": {
+          "name": "TypeError",
+          "message": "fetch failed",
+          "code": null,
+          "cause": {
+            "name": "Error",
+            "message": "connect ECONNREFUSED 127.0.0.1:9333",
+            "code": "ECONNREFUSED",
+            "cause": null,
+            "cause_truncated": false
+          },
+          "cause_truncated": false
+        },
+        "target_count": null,
+        "target_types": null,
+        "page_count": null,
+        "attachable_page_count": null,
+        "reason": "endpoint_unavailable"
+      },
+      {
+        "started": "2026-10-25T09:24:29.742Z",
+        "finished": "2026-10-25T09:24:29.743Z",
+        "url": "http://127.0.0.1:9333/json/list",
+        "status": null,
+        "content_type": null,
+        "body": null,
+        "body_truncated": false,
+        "parse_error": null,
+        "exception": {
+          "name": "TypeError",
+          "message": "fetch failed",
+          "code": null,
+          "cause": {
+            "name": "Error",
+            "message": "connect ECONNREFUSED 127.0.0.1:9333",
+            "code": "ECONNREFUSED",
+            "cause": null,
+            "cause_truncated": false
+          },
+          "cause_truncated": false
+        },
+        "target_count": null,
+        "target_types": null,
+        "page_count": null,
+        "attachable_page_count": null,
+        "reason": "endpoint_unavailable"
+      }
+    ],
+    "attachments": []
+  },
+  "chosen_target": null,
+  "attached": false,
+  "tauri_global": null,
+  "page_info": null,
+  "app_version": null,
+  "check_update": null,
+  "check_update_error": null,
+  "listeners": null,
+  "install_update_started_at": null,
+  "install_update_outcome": null,
+  "socket_closed_at": null,
+  "events": {
+    "total": 0,
+    "progress_count": 0,
+    "progress_first": null,
+    "progress_last": null,
+    "non_progress": []
+  },
+  "steps": [
+    {
+      "t": "2026-10-25T09:23:31.520Z",
+      "name": "start",
+      "argv": "--mode uipre --ready-wait-sec 30 --port 9333 --out D:\\a\\_temp\\diag-out --prefix base-6a7dc2b97e9a436a838c75828c6cff13 --max-wait-sec 30",
+      "native_websocket": true
+    },
+    {
+      "t": "2026-10-25T09:24:31.752Z",
+      "name": "targets",
+      "count": 0,
+      "pages": 0
+    }
+  ],
+  "errors": [],
+  "error_summary": "no page target on the debugging port"
+}

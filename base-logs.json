@@ -1,0 +1,33 @@
+{
+    "complete":  false,
+    "count":  2,
+    "tracebacks":  0,
+    "roots":  [
+                  "C:\\Users\\runneradmin\\AppData\\Local\\cys",
+                  "C:\\Users\\runneradmin\\.cys"
+              ],
+    "files":  [
+                  {
+                      "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\office-bridge.log",
+                      "copy":  "D:\\a\\_temp\\diag-out\\logs-base\\00000.log",
+                      "bytes":  123,
+                      "scan_offset":  0,
+                      "sha256":  "A866DB34024342F872BEA34E70C276DF79F0EE3F1976276E4120092C215338AD",
+                      "tracebacks":  0,
+                      "captured":  "2026-10-25T09:25:45.245Z"
+                  },
+                  {
+                      "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\phoenix-restore.log",
+                      "copy":  "D:\\a\\_temp\\diag-out\\logs-base\\00001.log",
+                      "bytes":  1737,
+                      "scan_offset":  0,
+                      "sha256":  "E3B1991F6BB70A91E58B46AFD6ECCB612B84204FA3CC929538A31B83CA9DA54F",
+                      "tracebacks":  0,
+                      "captured":  "2026-10-25T09:25:45.253Z"
+                  }
+              ],
+    "errors":  [
+                   "no log files C:\\Users\\runneradmin\\.cys",
+                   "supplemental file census only; required channel inventory decides completeness"
+               ]
+}
