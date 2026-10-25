@@ -74,6 +74,11 @@ diffy = "0.5.1"
 # 테스트 fixture 전용: minisign keypair 생성·서명(서명 roundtrip 테스트). 런타임 의존 아님.
 [dev-dependencies]
 minisign = "0.7"
+# ★(0.14.53 · U229) 시험 전용 더미 `MasterPty` 가 트레이트와 같은 오류 타입을 이름으로 적기 위해서다.
+# portable-pty 의 `MasterPty` 는 `Result<_, anyhow::Error>` 를 쓰는데 그 `use` 는 비공개이고 재수출도 없다
+# (vendor/portable-pty/src/lib.rs:40·:51) — 전이 의존은 이름으로 참조할 수 없어 `use anyhow::Error` 가 E0433 이다.
+# Cargo.lock 에 이미 anyhow 1.0.102 단일 항목이 있어 같은 인스턴스로 통합되고, dev 의존이므로 릴리스 그래프 밖이다.
+anyhow = "1"
 # Test binaries can hold the real Unix allocator; normal builds do not enable this seam.
 portable-pty = { path = "vendor/portable-pty", features = ["test-support"] }
 

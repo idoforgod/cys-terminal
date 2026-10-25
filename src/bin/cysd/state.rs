@@ -3793,6 +3793,23 @@ pub struct PauseInfo {
 pub struct Daemon {
     pub(crate) receipt_registry: Arc<crate::rpc_receipt::ReceiptRegistry>,
     pub surfaces: Mutex<HashMap<u64, Arc<Surface>>>,
+    /// ★(0.14.53 · U229 · 시험 전용) **이 데몬이 만든** 좌석의 약참조 대장 — 끝정리([`test_stop_daemon`])가
+    /// `surfaces` 맵에서 이미 빠진 좌석에도 닿기 위한 것이다(단언의 범위는 맵이 아니라 `bus` 의
+    /// `surface.created` 전량이므로, 맵만 보는 도달 범위로는 close 선행 소비처를 덮지 못한다).
+    ///
+    /// 【계약 C-1~C-5 · 이 다섯 조문 밖에서 이 필드를 읽거나 쓰지 않는다】
+    /// 1. **소유자는 `Daemon` 인스턴스다** — ⛔전역 `static`·`thread_local` 로 옮기지 마라(한 검체가 데몬을 둘
+    ///    만들어 각각 멈추는 곳이 있어: 그러면 한쪽 끝정리가 다른 데몬의 좌석까지 건드린다). 퇴행 차단은
+    ///    소스 핀 검체 `u229_registry_contract_source_pin` 이 기계로 한다.
+    /// 2. **등재는 생성으로 키잉된다** — `Arc::new(Surface { … })` 지점(저장소 유일) 바로 뒤, `surface.created`
+    ///    발행 **앞**에서 1회 push 한다(O-1). 그래서 어느 순간에도 `등재부 ⊇ 이 데몬의 버스 created 집합`이다.
+    /// 3. **`Weak` 만 담는다** — 강한 참조가 없으므로 등재는 좌석 수명을 연장하지 않는다. reader 스레드가 마지막
+    ///    `Arc` 를 놓으면 좌석은 drop 되고 그 항목은 `upgrade` 실패로 바뀐다(= 정상 경로).
+    /// 4. **비우는 주체는 하나다** — [`test_drain_created_and_release`] 의 `mem::take`(읽기와 비움이 한 동작).
+    ///    `Surface` 쪽에서 등재부를 지우는 경로는 두지 않는다(지우는 주체가 둘이 되고 락 순서가 역전된다).
+    /// 5. **같은 데몬에 끝정리가 두 번 와도 둘째는 무동작이다**(스냅샷이 비어 있다).
+    #[cfg(test)]
+    pub(crate) test_created: Mutex<Vec<std::sync::Weak<Surface>>>,
     pub next_id: AtomicU64,
     pub bus: EventBus,
     pub health_rules: Mutex<Vec<HealthRule>>,
@@ -5339,6 +5356,86 @@ pub(crate) fn test_done_or_quiet_window(
     false
 }
 
+/// ★(0.14.53 · U229 · 시험 전용) 교체용 빈 `MasterPty` — 좌석의 실제 master 를 이것으로 바꿔치워 **원본을 떨어뜨리기**
+/// 위한 그릇이다(그릇 자체는 아무 일도 하지 않는다). `get_size` 가 0×0 을 돌려주므로 검체가 "교체됐는가"를 관측할 수 있다.
+/// 플랫폼 공용(`#[cfg(test)]`)이라 맥에서도 트레이트 충족이 컴파일 시 검사된다 — Windows 전용 `cfg` 항목을 두지 않는다.
+#[cfg(test)]
+struct TestClosedPty;
+
+#[cfg(test)]
+impl MasterPty for TestClosedPty {
+    fn resize(&self, _size: PtySize) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+    fn get_size(&self) -> Result<PtySize, anyhow::Error> {
+        Ok(PtySize { rows: 0, cols: 0, pixel_width: 0, pixel_height: 0 })
+    }
+    fn try_clone_reader(&self) -> Result<Box<dyn std::io::Read + Send>, anyhow::Error> {
+        Ok(Box::new(std::io::empty()))
+    }
+    fn take_writer(&self) -> Result<Box<dyn std::io::Write + Send>, anyhow::Error> {
+        Ok(Box::new(std::io::sink()))
+    }
+    // 아래 넷은 트레이트가 unix 에서만 요구한다(vendor/portable-pty/src/lib.rs:106·113·116·121).
+    // `get_termios` 는 기본 구현이 있어 두지 않는다(nix 타입을 이름 짓지 않는다 = 새 의존 회피).
+    #[cfg(unix)]
+    fn process_group_leader(&self) -> Option<libc::pid_t> {
+        None
+    }
+    #[cfg(unix)]
+    fn as_raw_fd(&self) -> Option<std::os::unix::io::RawFd> {
+        None
+    }
+    #[cfg(unix)]
+    fn tty_name(&self) -> Option<PathBuf> {
+        None
+    }
+}
+
+/// ★(0.14.53 · U229 · 시험 전용) 좌석들의 PTY master 를 [`TestClosedPty`] 로 교체해 **원본을 떨어뜨린다**.
+///
+/// 【무엇을 증명하고 무엇을 증명하지 않는가 — 범위를 좁혀 적는다】
+/// * **Windows(ConPTY)**: 출력 파이프의 쓰기단은 자식이 아니라 conhost 가 쥐고, 그 핸들은 `HPCON` 이 닫힐 때
+///   (`PsuedoCon::drop` → `ClosePseudoConsole`) 닫힌다. `HPCON` 은 `Inner` 안에 있고 master 를 통해서만 도달하므로,
+///   master 원본을 떨어뜨리는 것이 **그 경로를 여는 유일한 수단**이다. 다만 「그래서 reader 가 EOF 를 받는다」는
+///   **Windows 실기 1런으로만 확인되는 거동**이며 이 함수가 보장하는 것이 아니다.
+/// * **unix**: ⛔**교체는 EOF 를 증명하지 않는다.** `try_clone_reader`·`take_writer` 가 master fd 를 각각
+///   **dup** 하므로(`vendor/portable-pty/src/unix.rs:428`·`:437`) reader 는 독립 fd 를 들고 있고, master 원본을
+///   떨어뜨려도 그 fd 는 닫히지 않는다. unix 의 EOF 는 **자식 종료로 slave 최종 참조가 사라질 때** 온다(종전과 같다).
+///   그래서 unix 실행 경로에서는 이 함수가 **아무것도 하지 않는다** — 건드리면 `Surface::pty_master_fd` 캐시가
+///   재사용 가능한 fd 번호가 되어 전경 판정이 엉킬 수 있다.
+///
+/// `windows` 를 **인자로** 받는다(저장소 관용구) — 맥에서 윈도우 갈래의 교체 동작을 검체로 재기 위해서다.
+/// ★`master` 뮤텍스를 쥔 채 원본을 떨어뜨리지 않는다(`ClosePseudoConsole` 이 플러시로 막힐 수 있다).
+#[cfg(test)]
+pub(crate) fn test_release_conpty_on(seats: &[Arc<Surface>], windows: bool) -> usize {
+    if !windows {
+        return 0;
+    }
+    let mut released = 0usize;
+    for s in seats {
+        let mut guard = s.master.lock().unwrap_or_else(|e| e.into_inner());
+        let old = std::mem::replace(&mut *guard, Box::new(TestClosedPty) as Box<dyn MasterPty + Send>);
+        drop(guard);
+        drop(old);
+        released += 1;
+    }
+    released
+}
+
+/// ★(0.14.53 · U229 · 시험 전용) 계약 C-4 의 **비움**과 해제를 한 동작으로 묶은 공유 헬퍼 —
+/// [`test_stop_daemon`] 과 계약 검체가 **같은 이 함수**를 쓴다(검체가 손으로 `take` 를 흉내내지 않는다).
+/// `mem::take` 로 꺼내므로 호출 직후 등재부는 비고, 같은 데몬의 둘째 호출은 스냅샷이 비어 **무동작**이다.
+/// `upgrade` 실패(= 좌석이 이미 drop 됐다 = reader 가 EOF 후처리를 끝냈다)는 **정상**이므로 건너뛴다.
+/// 반환값은 (스냅샷 항목 수, 살아 있어 교체한 좌석 수)다.
+#[cfg(test)]
+pub(crate) fn test_drain_created_and_release(daemon: &Arc<Daemon>, windows: bool) -> (usize, usize) {
+    let snapshot = std::mem::take(&mut *daemon.test_created.lock().unwrap_or_else(|e| e.into_inner()));
+    let alive: Vec<Arc<Surface>> = snapshot.iter().filter_map(std::sync::Weak::upgrade).collect();
+    let released = test_release_conpty_on(&alive, windows);
+    (snapshot.len(), released)
+}
+
 /// ★(0.14.53 · WP2 · B-433) **검체 끝정리 전용** — 상태 디렉터리를 지우기 전에 데몬의 좌석 PTY reader 배경 스레드를
 /// 멈추고 그 EOF 후처리(`park_active_to_restored`/`park_expired_to_restored` → `persist_queue_state` 및
 /// `surface.exited` 발행 · `Arc<Daemon>` 반납) 완료를 결정론적으로 증명하며, `recall_tx` 송신단을 교체해
@@ -5414,6 +5511,12 @@ pub(crate) fn test_stop_daemon(daemon: &Arc<Daemon>) {
             }
         }
     }
+
+    // ★(0.14.53 · U229 · 계약 C-4 의 O-2) `created` 수집(위) **뒤**, 대기 **앞**, `panicking` 가드 **앞**이 이 자리다.
+    //   ⓐ 수집이 먼저이므로 "단언 대상인데 해제되지 않은 좌석"이 생길 수 없고(등재 ⊇ 버스),
+    //   ⓑ 가드보다 앞이므로 패닉 중 `Drop` 에서도 해제만 하고 단언은 그대로 건너뛴다,
+    //   ⓒ unix 에서는 `cfg!(windows)` 가 거짓이라 **무동작**이다(이 함수의 유닉스 결정론은 종전 그대로 자식 종료가 만든다).
+    let _ = test_drain_created_and_release(daemon, cfg!(windows));
 
     let deadline = Instant::now() + std::time::Duration::from_secs(5);
     while Instant::now() < deadline {
@@ -6016,6 +6119,9 @@ impl Daemon {
         let daemon = Arc::new(Daemon {
             receipt_registry: Arc::new(crate::rpc_receipt::ReceiptRegistry::default()),
             surfaces: Mutex::new(HashMap::new()),
+            // ★(U229 계약 C-1) 등재부는 이 인스턴스와 함께 태어나고 함께 사라진다(초기화 지점은 여기 하나다).
+            #[cfg(test)]
+            test_created: Mutex::new(Vec::new()),
             // 영속 트랜스크립트(transcripts.db)의 최대 id 이후부터 발급 — 재시작 시
             // 무관 세션이 같은 surface_id로 recall에 합쳐지는 것을 차단
             next_id: AtomicU64::new(crate::recall::max_surface_id(&socket_path) + 1),
@@ -7225,6 +7331,16 @@ impl Daemon {
         }
         if role.is_some() {
             crate::governance::persist_topology(self);
+        }
+        // ★(0.14.53 · U229 · 시험 전용 · 계약 C-1/C-2 의 O-1) 발행 **앞**에서 약참조로 등재한다 — 이 순서가
+        //   `등재부 ⊇ 버스 created 집합`을 보장하고, 그래서 끝정리가 맵에서 이미 빠진 좌석에도 닿는다.
+        //   `Weak` 이므로 좌석 수명에 영향이 없다. 비시험 빌드에는 이 블록이 **존재하지 않는다**.
+        #[cfg(test)]
+        {
+            self.test_created
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(Arc::downgrade(&surface));
         }
         self.bus.publish(
             "surface.created",
@@ -9066,6 +9182,140 @@ mod tests {
                 .is_ok(),
             "모든 sender drop 시 writer 루프가 종료돼야 한다"
         );
+    }
+
+    /// ★(0.14.53 · U229) **등재부 계약 C-1~C-5 를 집행으로 증명한다** — 산문이 아니라 검체다.
+    /// 플랫폼을 인자로 받는 관용구(`same_dir_on(…, cfg!(windows))` 와 같은 꼴)로 **맥에서 윈도우 갈래의 교체**를
+    /// 집행하고, 비움·멱등·교차 데몬 무접촉·O-1 순서를 모두 관측한다. 끝정리와 **같은 공유 헬퍼**
+    /// (`test_drain_created_and_release`)를 쓴다 — 손으로 `take` 를 흉내내지 않는다.
+    ///
+    /// ⛔이 검체는 "교체했으니 EOF 가 온다"를 주장하지 않는다(unix 는 reader·writer 가 master fd 를 dup 해서
+    /// 들고 있어 교체가 EOF 를 만들지 않는다 — `vendor/portable-pty/src/unix.rs:428`·`:437`). 여기서 재는 것은
+    /// **등재부 계약**이고, ConPTY EOF 는 Windows 실기 1런의 몫이다.
+    #[test]
+    fn u229_registry_contract_is_per_daemon_and_drains_once() {
+        let dir = std::env::temp_dir().join(format!("cys-u229-reg-{}-{}", std::process::id(), now_epoch() as u64));
+        let _ = std::fs::create_dir_all(&dir);
+        let a = Daemon::new(dir.join("a.sock"));
+        let b = Daemon::new(dir.join("b.sock"));
+        let sa = a
+            .create_surface(None, Some("sleep 30".into()), None, None, 24, 80)
+            .expect("A 좌석");
+        let sb = b
+            .create_surface(None, Some("sleep 30".into()), None, None, 24, 80)
+            .expect("B 좌석");
+        let size = |s: &Arc<Surface>| {
+            let g = s.master.lock().unwrap_or_else(|e| e.into_inner());
+            let p = g.get_size().expect("pty size");
+            (p.rows, p.cols)
+        };
+        let registered = |d: &Arc<Daemon>| -> std::collections::BTreeSet<u64> {
+            d.test_created
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter_map(std::sync::Weak::upgrade)
+                .map(|s| s.id)
+                .collect()
+        };
+        let created_on_bus = |d: &Arc<Daemon>| -> std::collections::BTreeSet<u64> {
+            d.bus
+                .replay_after(0)
+                .into_iter()
+                .filter(|e| e.get("name").and_then(|v| v.as_str()) == Some("surface.created"))
+                .filter_map(|e| e.get("surface_id").and_then(|v| v.as_u64()))
+                .collect()
+        };
+
+        // C-1: 생성이 등재한다 — 데몬마다 자기 좌석 하나씩.
+        assert_eq!(registered(&a), [sa.id].into_iter().collect(), "C-1: A 등재부 = A 좌석");
+        assert_eq!(registered(&b), [sb.id].into_iter().collect(), "C-1: B 등재부 = B 좌석");
+        // C-2 의 O-1: 등재 → 발행 순서이므로 **버스 created ⊆ 등재부**다(유계 버스에서 집합 비교).
+        assert!(
+            created_on_bus(&a).is_subset(&registered(&a)),
+            "O-1 위반: 버스에만 있고 등재부에 없는 좌석이 있다(A)"
+        );
+        assert!(
+            created_on_bus(&b).is_subset(&registered(&b)),
+            "O-1 위반: 버스에만 있고 등재부에 없는 좌석이 있다(B)"
+        );
+        assert_eq!((size(&sa), size(&sb)), ((24, 80), (24, 80)), "전제: 둘 다 실제 master");
+
+        // C-4 + 윈도우 갈래: 끝정리와 같은 공유 헬퍼로 A 만 비우고 해제한다.
+        assert_eq!(
+            super::test_drain_created_and_release(&a, true),
+            (1, 1),
+            "C-4: 스냅샷 1건 · 교체 1건"
+        );
+        assert!(registered(&a).is_empty(), "C-4: take 가 등재부를 비운다(비우는 주체는 하나)");
+        assert_eq!(size(&sa), (0, 0), "A 의 master 가 교체됐다(원본이 떨어졌다)");
+        // ★C-5: 교차 데몬 무접촉 — 이 검체의 핵심.
+        assert_eq!(size(&sb), (24, 80), "C-5: 남의 데몬 좌석 master 를 건드렸다");
+        assert_eq!(registered(&b), [sb.id].into_iter().collect(), "C-5: 남의 데몬 등재부가 변했다");
+
+        // C-5(멱등 · 같은 데몬 재호출만 주장한다): 둘째 호출은 스냅샷이 비어 무동작이고 상태를 바꾸지 않는다.
+        assert_eq!(super::test_drain_created_and_release(&a, true), (0, 0), "C-5: 재호출은 무동작");
+        assert_eq!(size(&sa), (0, 0), "C-5: 재호출이 상태를 바꾸지 않는다");
+        assert_eq!(size(&sb), (24, 80), "C-5: 재호출도 남의 데몬을 건드리지 않는다");
+
+        // 끝정리: B 는 손대지 않은 상태로 끝정리에 들어간다(끝정리 자신의 드레인이 플랫폼 값으로 처리한다).
+        super::test_stop_daemon(&a);
+        super::test_stop_daemon(&b);
+        test_rm_rf(&dir);
+    }
+
+    /// ★(0.14.53 · U229 · 계약 C-0/C-1 의 기계 보장) 등재부가 **전역으로 옮겨지는 퇴행**과 **순서 조문 위반**을
+    /// 소스로 못 박는다(실행 검체는 타이밍이 좋으면 지나갈 수 있으므로 구조는 구조로 증명한다 —
+    /// `output_generation_bracket_source_pin` 과 같은 수단).
+    #[test]
+    fn u229_registry_contract_source_pin() {
+        let src = include_str!("state.rs");
+        // ① 선언은 `Daemon` 의 `#[cfg(test)]` 필드이고 담는 것은 `Weak` 다.
+        assert!(
+            src.contains("#[cfg(test)]\n    pub(crate) test_created: Mutex<Vec<std::sync::Weak<Surface>>>,"),
+            "C-1: 등재부 선언이 Daemon 의 #[cfg(test)] Weak 필드가 아니다"
+        );
+        // ② ⛔전역·스레드로컬 금지 — 등재부를 언급하는 **코드** 줄은 static/thread_local 과 섞이지 않는다
+        //    (주석·문서 줄은 건너뛴다 — 이 핀이 재는 것은 선언과 접근 코드이고, 산문에는 금지어 자체를 적는다).
+        for line in src
+            .lines()
+            .filter(|l| l.contains("test_created") && !l.trim_start().starts_with("//"))
+        {
+            assert!(
+                !line.contains("static ") && !line.contains("thread_local"),
+                "C-1 위반(전역화 퇴행): {line}"
+            );
+        }
+        // ③ 비우는 주체는 하나다 — 등재부에 대한 `mem::take` 는 한 번만 나타난다.
+        //    ★바늘을 쪼개 만든다 — 이 줄 자체가 그 패턴을 담으면 핀이 자기를 세어 거짓 적색이 된다.
+        let take_needle = format!("std::mem::take(&mut *daemon.{}", "test_created");
+        assert_eq!(
+            src.matches(take_needle.as_str()).count(),
+            1,
+            "C-4: 비우는 지점이 하나가 아니다"
+        );
+        // ④ O-1: 등재(push)가 `surface.created` 발행보다 **앞**이다.
+        let push = src.find(".push(Arc::downgrade(&surface));").expect("등재 지점");
+        let publish = src.find("            \"surface.created\",").expect("created 발행 지점");
+        assert!(push < publish, "O-1: 등재가 발행보다 뒤에 있다(push={push} publish={publish})");
+        // ⑤ O-2: 끝정리의 드레인이 `created` 수집보다 뒤, 5초 대기와 panicking 가드보다 앞이다.
+        let collect = src.find("        .filter(|e| e.get(\"name\").and_then(|v| v.as_str()) == Some(\"surface.created\"))")
+            .expect("created 수집 지점");
+        let drain = src.find("let _ = test_drain_created_and_release(daemon, cfg!(windows));").expect("드레인 호출");
+        let deadline = src.find("let deadline = Instant::now() + std::time::Duration::from_secs(5);").expect("대기 시한");
+        let guard = src.find("if std::thread::panicking() {").expect("panicking 가드");
+        assert!(
+            collect < drain && drain < deadline && deadline < guard,
+            "O-2: 자리 순서가 [created 수집 → 드레인 → 대기 → panicking 가드] 가 아니다 \
+             (collect={collect} drain={drain} deadline={deadline} guard={guard})"
+        );
+        // ⑥ 해제는 뮤텍스를 놓은 뒤에 원본을 떨어뜨린다(mem::replace → drop(guard) → drop(old)).
+        let rel = src.find("pub(crate) fn test_release_conpty_on").expect("해제 헬퍼");
+        let body = &src[rel..];
+        let replace = body.find("std::mem::replace(&mut *guard,").expect("replace");
+        let dg = body.find("drop(guard);").expect("drop(guard)");
+        let doo = body.find("drop(old);").expect("drop(old)");
+        assert!(replace < dg && dg < doo, "조건 ④: drop 순서가 replace → drop(guard) → drop(old) 가 아니다");
     }
 
     /// ★(0.14.42 · 설계 C D5′ · T9) 화면 모드 미러 — ① 헬퍼: 2004h → true · 2004l → false · 1049 전환에도
