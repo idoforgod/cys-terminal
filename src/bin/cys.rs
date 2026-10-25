@@ -6685,7 +6685,7 @@ fn run(command: Command) -> i32 {
         }
 
         Command::PackUpdate { from, manifest_url, dry_run } => {
-            return run_pack_update(from, manifest_url, dry_run);
+            return run_pack_update(from, manifest_url, dry_run, &cys::packsig::embedded_keyring, &consume_reinject_pending, &mut std::io::stdout().lock());
         }
         Command::PackPlan { force } => return run_pack_plan(force),
         Command::PackMerge {
@@ -23821,6 +23821,8 @@ struct ReinjectReport {
     failed: usize,
     unknown: usize,
     unknown_new: usize,
+    /// The final deferred/unknown rewrite failed; never discard this behind an otherwise clean report.
+    persist_error: Option<String>,
     /// Defer로 판정된 라이브 노드들 — pending 파일에 (surface_id, role)로 영속한다.
     deferred_nodes: Vec<(u64, String)>,
     /// ★(B-360 R2 revise) the unknown entries counted in `unknown` (as persisted in the pending file's `unknown` list).
@@ -24239,14 +24241,10 @@ fn pack_update_reinject_skipped_line(pack_version: &str, reason: &str) -> String
     )
 }
 
-/// reinject 집계 → pack-update 종료코드. failed>0이면 EXIT_REINJECT_DEGRADED(디스크는 반영됐으나
-/// 라이브 일부 미각성 — 성공 침묵 포장 금지), 아니면 0(deferred만 있어도 디스크 반영은 성공이라 0).
-/// ★(B-360 R2 revise · DESIGN §M1.5 + head's exit rule) `new_unknown` = UNKNOWN outcomes created by THIS run's writes
-///   (node loop or a pending-pass re-inject): degraded too (3, not 91: the disk pack WAS updated, and the app reads any
-///   other non-zero as a failed update). Carried-over unknown entries that stay undetermined are REPORTED (pending-pass
-///   line, `PACK_UPDATE_RESULT unknown=`) but are not passed here, so an entry nobody can resolve never makes every later
-///   run non-zero. This is the ONE place pack-update's exit class is decided: carrying UNKNOWN only in the result line
-///   instead would be the one-line change `if failed > 0 {` here.
+/// Count-based reinjection exit: failed or newly unknown writes are degraded (3).
+/// Carried unknowns remain reported without making every later invocation nonzero.
+/// Pending-store/lock and accepted-record outcomes are combined by the terminal classifiers;
+/// this number alone never proves whether the disk pack was applied.
 fn reinject_exit_code(failed: usize, new_unknown: usize) -> i32 {
     if failed > 0 || new_unknown > 0 {
         cys::pack::EXIT_REINJECT_DEGRADED
@@ -24261,7 +24259,7 @@ fn reinject_exit_code(failed: usize, new_unknown: usize) -> i32 {
 /// report (`persist_error`) instead of discarding it. Decided by [`reinject_exit_code`] (the one place). Pure.
 /// ★(B-428 R2) A pass refused for a busy pending lock did nothing and left its work on disk: degraded too.
 fn pending_pass_exit_code(c: &PendingConsumeReport) -> i32 {
-    if c.lock_refused.is_some() {
+    if c.lock_refused.is_some() || c.persist_error.is_some() {
         return cys::pack::EXIT_REINJECT_DEGRADED;
     }
     reinject_exit_code(c.intent_refused, c.unknown_new)
@@ -25140,7 +25138,7 @@ fn run_pack_reinject(new_version: &str) -> Result<ReinjectReport, String> {
         }
     }
     let unknown = unknown_entries.len();
-    Ok(ReinjectReport { injected, skipped, deferred, failed, unknown, unknown_new, deferred_nodes, unknown_entries })
+    Ok(ReinjectReport { injected, skipped, deferred, failed, unknown, unknown_new, persist_error: None, deferred_nodes, unknown_entries })
 }
 
 /// ★(B-360 R2 revise) What one pending pass did — a struct, not the old `(resolved, kept)` tuple, which had no slot for
@@ -25603,11 +25601,12 @@ fn run_pack_reinject_held(
     new_version: &str,
     _held: &PendingLock,
 ) -> Result<ReinjectReport, String> {
-    let rep = run_pack_reinject(new_version);
-    if let Ok(rep) = &rep {
+    let mut rep = run_pack_reinject(new_version);
+    if let Ok(rep) = &mut rep {
         // deferred(busy) 노드 pending 영속 / 없으면 stale 제거(가시화·재시도 SOT).
         if let Err(e) = persist_reinject_pending(base, new_version, &rep.deferred_nodes) {
             eprintln!("[pack-update] ⚠ deferred pending 영속 실패: {e}");
+            rep.persist_error = Some(e.to_string());
         }
     }
     rep
@@ -27632,9 +27631,67 @@ fn pack_apply_lock_refused_warning(err: &str, s1: &PendingConsumeReport) -> Stri
     )
 }
 
-fn run_pack_update(from: Option<String>, manifest_url: Option<String>, dry_run: bool) -> i32 {
-    // 성공 경로는 종료코드(i32)를 싣는다: 0=완전 성공, EXIT_REINJECT_DEGRADED=디스크는 반영됐으나
-    // 라이브 노드 reinject 실패(성공 침묵 포장 금지). 에러 경로(Err)는 외부에서 1로 매핑.
+fn pack_completion_code(pending: &PendingConsumeReport, nodes: Option<&ReinjectReport>, accepted_degraded: bool) -> i32 {
+    if accepted_degraded {
+        return cys::pack::EXIT_ACCEPTED_DEGRADED;
+    }
+    if pending_pass_exit_code(pending) != 0 || nodes.is_some_and(|r| r.persist_error.is_some()) {
+        return cys::pack::EXIT_REINJECT_DEGRADED;
+    }
+    nodes.map(|r| reinject_exit_code(r.failed, r.unknown_new)).unwrap_or(0)
+}
+
+fn pack_terminal_line(
+    outcome: &PackUpdateOutcome,
+    pending: &PendingConsumeReport,
+    nodes: Option<&ReinjectReport>,
+    skipped: bool,
+    dry_run: bool,
+    code: i32,
+    observed: &str,
+) -> Result<String, String> {
+    use cys::pack_update_result::{PackAction, PendingFacts, TerminalRecord};
+    let action = if dry_run { PackAction::Validated } else if outcome.gate == VersionGate::Apply {
+        PackAction::Applied
+    } else { PackAction::NoOp };
+    let disk = observed.split_whitespace().find_map(|s| s.strip_prefix("disk="))
+        .filter(|s| *s != "-").map(str::to_owned);
+    TerminalRecord {
+        action, code, remote: outcome.pack_version.clone(), disk,
+        pending: PendingFacts {
+            failed: nodes.map(|r| r.failed as u64).unwrap_or(0),
+            deferred: nodes.map(|r| r.deferred as u64).unwrap_or(0),
+            unknown: pending.unknown as u64, unknown_new: pending.unknown_new as u64,
+            node_unknown: nodes.map(|r| r.unknown as u64).unwrap_or(0),
+            node_unknown_new: nodes.map(|r| r.unknown_new as u64).unwrap_or(0),
+            pending_kept: pending.kept as u64, intent_refused: pending.intent_refused as u64,
+            persist_failed: pending.persist_error.is_some() || nodes.is_some_and(|r| r.persist_error.is_some()),
+            skipped,
+        },
+        accepted_degraded: !outcome.accepted_recorded && action == PackAction::Applied,
+    }.line()
+}
+
+/// Pending and verification providers are explicit so the complete command can be exercised with
+/// signed fixture packs. The public CLI always supplies the production providers; no environment override.
+fn run_pack_update(
+    from: Option<String>,
+    manifest_url: Option<String>,
+    dry_run: bool,
+    keyring_provider: &dyn Fn() -> Result<cys::packsig::Keyring, String>,
+    pending_consumer: &dyn Fn(&std::path::Path) -> Result<PendingConsumeReport, String>,
+    terminal_output: &mut dyn std::io::Write,
+) -> i32 {
+    // Command-local, fallible line output: unlike std::println!, a broken/partial sink is an
+    // ordinary command error (1), never a successful 0/3 with a missing compatibility record.
+    macro_rules! println {
+        ($($arg:tt)*) => {{
+            writeln!(terminal_output, $($arg)*).map_err(|e| format!("pack terminal output failed: {e}"))?;
+            terminal_output.flush().map_err(|e| format!("pack terminal flush failed: {e}"))?;
+        }};
+    }
+    // 0 is a non-degraded terminal, not proof of freshness or complete activation. Code 3
+    // reports pending/reinject degradation independently of disk action; Err maps to 1.
     let result = (|| -> Result<i32, String> {
         let base = pack_state_base();
         let staging = base.join(".pack-staging");
@@ -27656,7 +27713,7 @@ fn run_pack_update(from: Option<String>, manifest_url: Option<String>, dry_run: 
         //   (`persist_error`) no longer loses its report, so none of this can be dropped on the way to the exit code
         let mut consumed = PendingConsumeReport::default();
         if !dry_run {
-            match consume_reinject_pending(&base) {
+            match pending_consumer(&base) {
                 Ok(c) if c.lock_refused.is_some() => {
                     // ★(B-428 R2/R3 · codex r1 F1, r2) the pending lock was not taken (held by another pack-update for
                     //   PENDING_LOCK_WAIT, or not establishable): the pass typed and wrote nothing and the new pack is not
@@ -27665,7 +27722,7 @@ fn run_pack_update(from: Option<String>, manifest_url: Option<String>, dry_run: 
                     return Err(pending_lock_refused_warning(c.lock_refused.as_deref().unwrap_or_default()));
                 }
                 Ok(c) if c.resolved > 0 || c.kept > 0 || c.unknown > 0 || c.persist_error.is_some() => {
-                    println!(
+                    eprintln!(
                         "[pack-update] pending reinject 소비: {} 해소, {} 잔존, {} 미확인(이번 실행 신규 {}).",
                         c.resolved, c.kept, c.unknown, c.unknown_new
                     );
@@ -27710,7 +27767,7 @@ fn run_pack_update(from: Option<String>, manifest_url: Option<String>, dry_run: 
 
         let now_unix = chrono::Utc::now().timestamp();
         let running = env!("CARGO_PKG_VERSION");
-        let keyring = cys::packsig::embedded_keyring()?;
+        let keyring = keyring_provider()?;
         let outcome = pack_update_from_dir(
             &from_dir,
             &staging,
@@ -27722,26 +27779,23 @@ fn run_pack_update(from: Option<String>, manifest_url: Option<String>, dry_run: 
             !dry_run,
         )?;
 
+        // B428-U9: classify the command BEFORE the pure no-op terminal. The pack decision alone
+        // cannot erase a failed pending pass. Both guard-removal and order-inversion are mutation-tested.
+        if outcome.gate == VersionGate::UpToDate && pending_pass_exit_code(&consumed) != 0 {
+            let code = pending_pass_exit_code(&consumed);
+            println!("{}", pack_terminal_line(&outcome, &consumed, None, false, false, code,
+                &cys::pack::pack_update_uptodate_line(&outcome.pack_version))?);
+            return Ok(code);
+        }
+
         match outcome.gate {
             VersionGate::UpToDate => {
                 println!(
-                    "[pack-update] 이미 최신 — 반영 0 (remote {} ≤ 디스크). no-op.",
-                    outcome.pack_version
+                    "{}",
+                    pack_terminal_line(&outcome, &consumed, None, false, false, 0,
+                        &cys::pack::pack_update_uptodate_line(&outcome.pack_version))?
                 );
-                println!("{}", cys::pack::pack_update_uptodate_line(&outcome.pack_version));
-                if consumed.unknown > 0 {
-                    // ★(B-360 R2 revise) no reinject ran, but the pending pass left nodes unknown: the app reads this
-                    //   count (only the measured one — no unmeasured injected/failed are printed as 0)
-                    println!(
-                        "{} pack_version={} unknown_new={} unknown={}",
-                        cys::pack::REINJECT_RESULT_PREFIX,
-                        outcome.pack_version,
-                        consumed.unknown_new,
-                        consumed.unknown
-                    );
-                }
-                // ★(B-428) never 0 while the pending pass made an UNKNOWN write or refused one
-                return Ok(pending_pass_exit_code(&consumed));
+                return Ok(0);
             }
             VersionGate::BinaryTooOld => {
                 eprintln!(
@@ -27755,14 +27809,16 @@ fn run_pack_update(from: Option<String>, manifest_url: Option<String>, dry_run: 
         }
 
         if dry_run {
-            println!(
+            eprintln!(
                 "[pack-update] dry-run: 검증·게이트 통과(팩 {} 반영 가능) — 디스크 반영·reinject 생략.",
                 outcome.pack_version
             );
+            println!("{}", pack_terminal_line(&outcome, &consumed, None, false, true, 0,
+                &cys::pack::pack_update_uptodate_line(&outcome.pack_version))?);
             return Ok(0);
         }
 
-        println!(
+        eprintln!(
             "[pack-update] 팩 {} 반영 완료 ({} written, {} preserved). 노드 reinject 점검…",
             outcome.pack_version, outcome.written, outcome.kept
         );
@@ -27780,13 +27836,10 @@ fn run_pack_update(from: Option<String>, manifest_url: Option<String>, dry_run: 
         };
         match run_pack_reinject_held(&base, &outcome.pack_version, held) {
             Ok(rep) => {
-                println!(
+                eprintln!(
                     "[pack-update] reinject: {} injected, {} skipped, {} deferred, {} failed, {} unknown.",
                     rep.injected, rep.skipped, rep.deferred, rep.failed, rep.unknown
                 );
-                // 구조화 출력(Tauri 브리지가 failed/deferred를 파싱해 update-warning emit).
-                // ★(B-360 R2 revise) + `unknown=` — `injected` never includes an unknown outcome.
-                println!("{}", pack_update_result_line(&outcome.pack_version, &rep));
                 if rep.unknown > 0 {
                     let nodes: Vec<(u64, String)> =
                         rep.unknown_entries.iter().map(|u| (u.surface_id, u.role.clone())).collect();
@@ -27809,16 +27862,19 @@ fn run_pack_update(from: Option<String>, manifest_url: Option<String>, dry_run: 
                         rep.failed, outcome.pack_version
                     );
                 }
-                if accepted_degraded {
-                    return Ok(cys::pack::EXIT_ACCEPTED_DEGRADED);
-                }
-                // new unknowns of this run only: the node loop's + the pending pass's re-injects (head's exit rule)
-                // ★(B-428) + the pending pass's refused injects (nothing typed: no durable intent)
-                Ok(reinject_exit_code(rep.failed + consumed.intent_refused, rep.unknown_new + consumed.unknown_new))
+                let code = pack_completion_code(&consumed, Some(&rep), accepted_degraded);
+                println!("{}", pack_terminal_line(&outcome, &consumed, Some(&rep), false, false, code,
+                    &cys::pack::pack_update_uptodate_line(&outcome.pack_version))?);
+                // Legacy reinjection details follow, never precede, the terminal compatibility record.
+                println!("{}", pack_update_result_line(&outcome.pack_version, &rep));
+                Ok(code)
             }
             // 데몬 미가동 등으로 reinject 자체를 못 함 — 디스크 반영은 성공(무중단 정책상 0).
             Err(e) => {
                 eprintln!("[pack-update] reinject 스킵(데몬 점검 필요): {e}");
+                let code = pack_completion_code(&consumed, None, accepted_degraded);
+                println!("{}", pack_terminal_line(&outcome, &consumed, None, true, false, code,
+                    &cys::pack::pack_update_uptodate_line(&outcome.pack_version))?);
                 // ★U4-B2③ 구조화 토큰 — 브리지가 '완전 성공'으로 읽지 않게(종료코드는 아래 그대로).
                 println!(
                     "{}",
@@ -30218,6 +30274,150 @@ mod tests {
             }],
             revoked_key_ids: vec![],
         }
+    }
+
+    #[test]
+    #[ignore = "child of the B428-U9 complete-command boundary specimens"]
+    fn b428_u9_command_child() {
+        use std::io::Write;
+        let Ok(mode) = std::env::var("CYS_B428_U9_CHILD") else { return };
+        let base = std::env::temp_dir().join(format!("cys-b428-u9-{}", std::process::id()));
+        let pack = base.join("pack");
+        let from = base.join("from");
+        std::fs::create_dir_all(&pack).unwrap();
+        std::fs::create_dir_all(&from).unwrap();
+        std::env::set_var(cys::pack::ENV_PACK_DIR, &pack);
+        std::env::set_var(cys::pack::ENV_CONFIG_DIR, base.join("config"));
+        std::env::set_var("LOCALAPPDATA", base.join("localappdata"));
+        std::env::set_var(cys::ENV_SOCKET, base.join("absent.sock"));
+        std::env::set_var("CYS_NO_AUTOSTART", "1");
+        if mode != "unknown" {
+            std::fs::write(pack.join(".pack-version"), if mode.starts_with("apply-") { "1.0.0" } else { "2.0.0" }).unwrap();
+        }
+        let (pk, sign) = gen_signer();
+        let now = chrono::Utc::now().timestamp();
+        build_signed_pack(&from, &[("soul.md", "fixture\n")], "TESTKEY", "2.0.0", "0.4.1", now - 1, now + 3600, &sign);
+        // The real command uses today's clock; unlike the old pre-cutover fixture, it needs the signed tar digest.
+        let manifest_path = from.join("pack-manifest.json");
+        let mut manifest: Value = serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["digest"] = json!(sha256_file(&from.join("pack.tar.gz").to_string_lossy()).unwrap());
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        std::fs::write(&manifest_path, &bytes).unwrap();
+        std::fs::write(from.join("pack-manifest.json.minisig"), sign(&bytes)).unwrap();
+        #[cfg(unix)]
+        let node_daemon = if mode == "apply-node-persist" {
+            let path = reinject_pending_path(&base);
+            let daemon = super::b360_tests::R2cDaemon::start(move |method, _| {
+                let result = match method {
+                    "system.topology" => json!({"saved": []}),
+                    "control.dashboard" => json!({"fleet": []}),
+                    "org.status" => {
+                        std::fs::create_dir_all(&path).unwrap();
+                        json!({"daemon": {"started_at": 1.0}, "surfaces": []})
+                    }
+                    _ => json!({}),
+                };
+                json!({"ok": true, "result": result})
+            });
+            std::env::set_var(cys::ENV_SOCKET, &daemon.sock);
+            Some(daemon)
+        } else { None };
+        let pending = |_: &std::path::Path| -> Result<PendingConsumeReport, String> {
+            Ok(match mode.as_str() {
+                "persist" | "apply-persist" => PendingConsumeReport { persist_error: Some("fixture rewrite refused".into()), ..Default::default() },
+                "new-unknown" => PendingConsumeReport { unknown: 1, unknown_new: 1, ..Default::default() },
+                "carried" => PendingConsumeReport { unknown: 1, ..Default::default() },
+                "refused" => PendingConsumeReport { kept: 1, intent_refused: 1, ..Default::default() },
+                _ => PendingConsumeReport::default(),
+            })
+        };
+        println!("B428-U9-OUTPUT");
+        std::io::stdout().flush().unwrap();
+        struct CutWriter { bytes: Vec<u8>, limit: usize, flush_fails: bool }
+        impl Write for CutWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.bytes.len() >= self.limit { return Err(std::io::Error::other("fixture sink refused")); }
+                let n = bytes.len().min(self.limit - self.bytes.len());
+                self.bytes.extend_from_slice(&bytes[..n]);
+                Ok(n)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                if self.flush_fails { Err(std::io::Error::other("fixture flush refused")) } else { Ok(()) }
+            }
+        }
+        let mut cut = CutWriter { bytes: Vec::new(), limit: if mode == "flush-fail" { usize::MAX } else { 5 }, flush_fails: mode == "flush-fail" };
+        let rc = if mode == "write-fail" || mode == "flush-fail" {
+            let rc = run_pack_update(Some(from.to_string_lossy().into_owned()), None, false,
+                &|| Ok(test_keyring("TESTKEY", &pk)), &pending, &mut cut);
+            std::io::stdout().write_all(&cut.bytes).unwrap();
+            rc
+        } else {
+            run_pack_update(Some(from.to_string_lossy().into_owned()), None, false,
+                &|| Ok(test_keyring("TESTKEY", &pk)), &pending, &mut std::io::stdout().lock())
+        };
+        std::io::stdout().flush().unwrap();
+        std::io::stderr().flush().unwrap();
+        #[cfg(unix)]
+        drop(node_daemon);
+        std::process::exit(rc);
+    }
+
+    pub(super) fn b428_u9_command_output(mode: &str) -> (i32, String) {
+        use cys::SpawnPolicy;
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .spawn_policy(cys::ChildLifetime::Attached)
+            .no_autostart()
+            .args(["--exact", "tests::b428_u9_command_child", "--ignored", "--nocapture"])
+            .env("CYS_B428_U9_CHILD", mode)
+            .output().expect("complete command child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        eprintln!("{mode} command stderr: {}", String::from_utf8_lossy(&output.stderr));
+        let body = stdout.split_once("B428-U9-OUTPUT\n").unwrap_or_else(|| panic!("child did not run: {stdout}\n{}", String::from_utf8_lossy(&output.stderr))).1.to_owned();
+        (output.status.code().unwrap_or(-1), body)
+    }
+
+    #[test]
+    fn b428_u9_complete_command_classifies_before_clean_noop_and_publishes_first() {
+        use cys::pack_update_result::{parse, PackAction};
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut cases = vec![("clean", 0), ("unknown", 0), ("carried", 0), ("persist", 3), ("new-unknown", 3), ("refused", 3), ("apply-persist", 3)];
+        #[cfg(unix)]
+        cases.push(("apply-node-persist", 3));
+        for (mode, expected) in cases {
+            let (rc, output) = b428_u9_command_output(mode);
+            assert_eq!(rc, expected, "{mode}: command disposition, not just version gate; {output}");
+            assert!(output.starts_with("PACK_UPDATE_OUTCOME "), "{mode}: first command output must be terminal record: {output}");
+            let record = parse(&output, rc).unwrap().expect("schema2 record");
+            assert_eq!(record.action, if mode.starts_with("apply-") { PackAction::Applied } else { PackAction::NoOp });
+            assert_eq!(output.lines().filter(|l| l.starts_with("PACK_UPDATE_OUTCOME ")).count(), 1);
+            let first = output.lines().next().unwrap();
+            assert_eq!(first.contains(" disk_parse=ok"), mode == "clean", "{mode}: legacy success proof leaked");
+            if expected == 3 { assert!(first.contains(" terminal=degraded "), "{mode}: {first}"); }
+        }
+    }
+
+    #[test]
+    fn b428_u9_node_loop_persistence_and_accepted_priority_are_preserved() {
+        let pending = PendingConsumeReport::default();
+        let nodes = ReinjectReport { persist_error: Some("deferred file rewrite refused".into()), ..Default::default() };
+        assert_eq!(pack_completion_code(&pending, Some(&nodes), false), 3);
+        assert_eq!(pack_completion_code(&pending, Some(&nodes), true), cys::pack::EXIT_ACCEPTED_DEGRADED);
+        let out = PackUpdateOutcome { gate: VersionGate::Apply, pack_version: "2.0.0".into(), written: 1, kept: 0, accepted_recorded: true };
+        let line = pack_terminal_line(&out, &pending, Some(&nodes), false, false, 3, "PACK_UPDATE_OUTCOME disk=2.0.0").unwrap();
+        let decoded = cys::pack_update_result::parse(&line, 3).unwrap().unwrap();
+        assert!(decoded.pending.persist_failed);
+        assert_eq!(decoded.action, cys::pack_update_result::PackAction::Applied);
+    }
+
+    #[test]
+    fn b428_u9_partial_terminal_write_is_error_not_success_or_degraded() {
+        let (rc, output) = b428_u9_command_output("write-fail");
+        assert_eq!(rc, 1);
+        assert_eq!(output, "PACK_", "the control must actually accept a partial prefix before failing");
+        let (rc, output) = b428_u9_command_output("flush-fail");
+        assert_eq!(rc, 1);
+        assert!(output.starts_with("PACK_UPDATE_OUTCOME "));
+        assert!(cys::pack_update_result::parse(&output, rc).is_err(), "a complete-looking record cannot override failed publication");
     }
 
     /// pack-manifest emit(§2-①) — files 키가 PACK+PACK_SKILLS 전부 포함 + sha256이 content_hash
@@ -45820,16 +46020,16 @@ mod b360_tests {
     /// A scripted NDJSON fake daemon: `answer(method, params)` is the whole reply minus `id`; every request is recorded.
     /// The socket sits in its own fresh directory, so the boot lock next to it (`boot_lock_path`) is private too.
     #[cfg(unix)]
-    struct R2cDaemon {
+    pub(super) struct R2cDaemon {
         dir: std::path::PathBuf,
-        sock: std::path::PathBuf,
+        pub(super) sock: std::path::PathBuf,
         calls: R2cCalls,
         server: Option<std::thread::JoinHandle<()>>,
     }
 
     #[cfg(unix)]
     impl R2cDaemon {
-        fn start(mut answer: impl FnMut(&str, &Value) -> Value + Send + 'static) -> Self {
+        pub(super) fn start(mut answer: impl FnMut(&str, &Value) -> Value + Send + 'static) -> Self {
             use std::io::{BufRead, BufReader, Write};
             use std::sync::atomic::{AtomicU64, Ordering};
             static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -46012,7 +46212,7 @@ mod b360_tests {
             "restore" => run_restore(None, false, true),
             "boot" => run_boot(None, true),
             // ★(B-360 R2 revise · area P) no `--from`: the command stops after its pending pass (exit 1)
-            "pack-update" => run_pack_update(None, None, false),
+            "pack-update" => run_pack_update(None, None, false, &cys::packsig::embedded_keyring, &consume_reinject_pending, &mut std::io::stdout().lock()),
             // ★(B-360 R2 revise · area D) the real `cys drain --verify` (exit computed by run_drain_verify)
             "drain-verify" => run(Command::Drain { verify: true, timeout: 2 }),
             // ★(B-360 R2 revise · area E) the save-file gate (S48) and the verifier handshake (S49), not forced
@@ -47532,12 +47732,8 @@ mod b360_tests {
     /// Area P · the head's exit rule: exit 3 reflects THIS run's write outcomes only. A run whose only unknown is CARRIED
     /// (an entry from an earlier run) and stays undetermined after the check exits 0 and still reports the count; a pass
     /// whose re-inject itself comes back UNKNOWN created a new unknown and exits 3. The source half pins that every exit
-    /// decision of `run_pack_update` passes only the `_new` counts to `reinject_exit_code`.
-    /// ★(B-428) Pinned EXACTLY since B-428 routed two of the three decisions through `pending_pass_exit_code`: the Apply
-    /// arm's one call, three `pending_pass_exit_code(&consumed)` calls and that function's one call. The contract was
-    /// re-proven on behaviour first (b428_p5, which drives these exit functions); a new exit path or argument updates this.
-    /// Cannot be red on 11717c44: there UNKNOWN never reaches any count (`unknown_new` and the two-argument
-    /// `reinject_exit_code` do not exist). Positive control: the re-inject-UNKNOWN pass (exit 3).
+    /// The B360 carried/new distinction through the real pending pass and final command reducer.
+    /// B428-U9's full-command specimens additionally pin the route, instead of counting lexical call sites.
     #[cfg(unix)]
     #[test]
     fn b360_r2r_p15_only_this_runs_new_unknowns_reach_the_exit_carried_ones_are_reported() {
@@ -47561,23 +47757,18 @@ mod b360_tests {
                 failures.push(format!("{name}: exit {} want {want_exit}", reinject_exit_code(0, pass.unknown_new)));
             }
         }
-        let src = include_str!("cys.rs");
-        let body_of = |name: &str| {
-            let at = src.find(&format!("\nfn {name}(")).expect(name);
-            &src[at..at + src[at..].find("\n}\n").expect("end")]
-        };
-        let args = |body: &str, callee: &str| -> Vec<String> {
-            body.split(callee).skip(1).map(|c| c[..c.find(')').unwrap_or(c.len())].to_string()).collect()
-        };
-        let update = body_of("run_pack_update");
-        let pinned = [
-            (args(update, "reinject_exit_code("), vec!["rep.failed + consumed.intent_refused, rep.unknown_new + consumed.unknown_new"]),
-            (args(update, "pending_pass_exit_code("), vec!["&consumed"; 3]),
-            (args(body_of("pending_pass_exit_code"), "reinject_exit_code("), vec!["c.intent_refused, c.unknown_new"]),
-        ];
-        for (got, want) in pinned {
-            if got != want {
-                failures.push(format!("an exit decision of run_pack_update changed (carried counts must not reach it): {got:?}, want {want:?}"));
+        // Whole-command routing is covered by the B428-U9 child specimens; keep P15's real pending-pass
+        // behaviour and exercise the aggregate exit reducer without encoding call-site counts.
+        for (pending, nodes, want) in [
+            (PendingConsumeReport { unknown: 1, ..Default::default() }, ReinjectReport::default(), 0),
+            (PendingConsumeReport { unknown: 1, unknown_new: 1, ..Default::default() }, ReinjectReport::default(), 3),
+            (PendingConsumeReport::default(), ReinjectReport { unknown: 1, ..Default::default() }, 0),
+            (PendingConsumeReport::default(), ReinjectReport { unknown: 1, unknown_new: 1, ..Default::default() }, 3),
+            (PendingConsumeReport { persist_error: Some("refused".into()), ..Default::default() }, ReinjectReport::default(), 3),
+            (PendingConsumeReport::default(), ReinjectReport { persist_error: Some("refused".into()), ..Default::default() }, 3),
+        ] {
+            if pack_completion_code(&pending, Some(&nodes), false) != want {
+                failures.push(format!("pending/node exit class differs: pending={pending:?} nodes={nodes:?}, want {want}"));
             }
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
@@ -50644,34 +50835,58 @@ mod b360_tests {
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
-    /// D1 wiring pin (the exit above is only reached if `run_pack_update` routes through it; its UpToDate arm cannot be
-    /// driven by a test — the source must verify against the embedded keyring): in `run_pack_update`, the pending pass's
-    /// report is kept whole (also with only a `persist_error`), the UpToDate arm returns `pending_pass_exit_code(&consumed)`
-    /// and no bare `Ok(0)`, the reinject-skipped arm consults it, and the Apply arm adds the pass's refusals and new
-    /// unknowns to its own.
     #[test]
-    fn b428_d1_run_pack_update_routes_every_pending_only_exit_through_the_pass_report_source_pin() {
-        let src = include_str!("cys.rs");
-        let head = src.find("\nfn run_pack_update(").expect("run_pack_update");
-        let body = &src[head..head + 1 + src[head + 1..].find("\nfn ").expect("next fn")];
-        let mut failures = Vec::new();
-        for needle in [
-            "c.persist_error.is_some() =>",
-            "consumed = c;",
-            "return Ok(pending_pass_exit_code(&consumed));",
-            "if pending_pass_exit_code(&consumed) != 0 {",
-            "Ok(reinject_exit_code(rep.failed + consumed.intent_refused, rep.unknown_new + consumed.unknown_new))",
-        ] {
-            if !body.contains(needle) {
-                failures.push(format!("run_pack_update lacks `{needle}`"));
+    fn b428_u9_persistence_only_is_not_a_successful_pending_pass() {
+        let report = PendingConsumeReport {
+            persist_error: Some("pending file rewrite refused".into()),
+            ..Default::default()
+        };
+        assert_eq!(report.unknown_new, 0);
+        assert_eq!(report.intent_refused, 0);
+        assert_eq!(pending_pass_exit_code(&report), cys::pack::EXIT_REINJECT_DEGRADED);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn b428_u9_node_loop_failed_rewrite_survives_its_ok_report() {
+        for fail_rewrite in [false, true] {
+            let pack = R2cPack::new();
+            let pending_path = reinject_pending_path(&pack.dir);
+            let daemon = R2cDaemon::start(move |method, _| match method {
+                "system.topology" => r2c_ok(json!({"saved": []})),
+                "control.dashboard" => r2c_ok(json!({"fleet": []})),
+                "org.status" => {
+                    // This call is after the loop's pending read, before its final rewrite.
+                    if fail_rewrite { std::fs::create_dir_all(&pending_path).unwrap(); }
+                    r2c_ok(json!({"daemon": {"started_at": 1.0}, "surfaces": []}))
+                }
+                _ => r2c_ok(json!({})),
+            });
+            let report = r2c_in_env(&daemon, &pack, || {
+                let held = lock_reinject_pending(&pack.dir, std::time::Duration::from_secs(1)).unwrap();
+                run_pack_reinject_held(&pack.dir, "2.0.0", &held).expect("loop succeeded; only persistence failed")
+            });
+            assert_eq!((report.failed, report.unknown_new), (0, 0));
+            assert_eq!(report.persist_error.is_some(), fail_rewrite, "real deferred-store failure must survive Ok(report)");
+            assert_eq!(pack_completion_code(&PendingConsumeReport::default(), Some(&report), false), if fail_rewrite { 3 } else { 0 });
+            assert!(!daemon.calls().iter().any(|(m, _)| m == "surface.send_text"));
+        }
+    }
+
+    /// D1 follows the real command through signed fixtures. A bare-zero source ban conflicted with U9;
+    /// removing the guard or putting the no-op terminal before it must fail this behavioural boundary.
+    #[test]
+    fn b428_d1_command_terminal_preserves_pending_failures_before_noop() {
+        for (mode, want) in [("persist", 3), ("new-unknown", 3), ("refused", 3), ("apply-persist", 3), ("carried", 0), ("clean", 0)] {
+            let (code, output) = super::tests::b428_u9_command_output(mode);
+            assert_eq!(code, want, "{mode}: pending failure lost before terminal: {output}");
+            let terminal = cys::pack_update_result::parse(&output, code).unwrap().unwrap();
+            assert_eq!(terminal.code, want);
+            if want == 3 {
+                assert!(output.lines().next().unwrap().contains(" terminal=degraded "));
+                assert!(!output.lines().next().unwrap().contains(" disk_parse=ok"));
             }
         }
-        let up = body.find("VersionGate::UpToDate =>").expect("UpToDate arm");
-        let arm = &body[up..up + body[up..].find("VersionGate::BinaryTooOld").expect("next arm")];
-        if arm.contains("return Ok(0)") {
-            failures.push(format!("the UpToDate arm can still return a bare 0:\n{arm}"));
-        }
-        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     /// The B-360 exit rule (b360_r2r_p15) through the B-428 exit, on BEHAVIOUR: only THIS run's new unknowns, and this run's

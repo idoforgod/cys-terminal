@@ -114,6 +114,18 @@ export function packAfterUpToDate(p: unknown, now: number): PackComp {
   return { s: "disk-unknown", reason: "pack-version-unreadable", detail: disk, remote, at: now };
 }
 
+/** Disk freshness and an incomplete command are independent; the caller must also show its warning. */
+export function packAfterIncomplete(p: unknown, now: number): PackComp {
+  const o = (typeof p === "object" && p !== null ? p : {}) as Record<string, unknown>;
+  const version = str(o.pack_version);
+  if (o.pack_action === "applied" && version) return packAfterInstalled(version, now);
+  return packAfterUpToDate({
+    confirmed: o.pack_action === "no-op" && o.disk_confirmed === true,
+    disk_version: o.disk_version,
+    remote_version: o.remote_version,
+  }, now);
+}
+
 /** 설치할 수 있는 본체 업데이트(실패 중이면 직전 검증 기준 — fail-safe 보존 · stale=true). */
 export function binActionable(st: UpdateState): { version: string; stale: boolean } | null {
   const b = st.bin;

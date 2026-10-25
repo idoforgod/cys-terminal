@@ -27,6 +27,7 @@ import {
   packFromCheck,
   packAfterInstalled,
   packAfterUpToDate,
+  packAfterIncomplete,
   binActionable,
   packActionable,
   deriveUpdateView,
@@ -195,7 +196,7 @@ import {
 import { buildAcctIndex, buildWsAccountGroups, type SeatAcctSig, type AcctIndex } from "./seatacct"; // ★0.14.45 부서 카드 노드별 계정 줄(순수 판정)
 import { planOfficeTab, repairOutcomeOf, type OfficeCtx } from "./officetab"; // 0.14.44 B5·B6 오피스 탭 안내(순수 판정)
 import { alertsQuiet } from "./alertquiet"; // 0.14.51 TOAST 축 — 데몬 이벤트 출처의 사람 싱크를 끄는 단일 판정(순수)
-import { installerLaunchFailure, INSTALLER_LAUNCH_FAILED_TOAST_ID, packUpdatedToast, type PackUpdatedPayload, planUpdateAttemptReport, sacPreflightText, UPDATE_FAILED_TOAST_ID } from "./updatenotice"; // 0.14.43 J2 업데이트 미설치 알림(순수 문구·판정 해석·토스트 id)·설치 전 스마트 앱 컨트롤 고지 · WU 설치 파일 실행 차단 알림
+import { installerLaunchFailure, INSTALLER_LAUNCH_FAILED_TOAST_ID, packUpdatedToast, packIncompleteToast, type PackUpdatedPayload, type PackIncompletePayload, planUpdateAttemptReport, sacPreflightText, UPDATE_FAILED_TOAST_ID } from "./updatenotice"; // 0.14.43 J2 업데이트 미설치 알림(순수 문구·판정 해석·토스트 id)·설치 전 스마트 앱 컨트롤 고지 · WU 설치 파일 실행 차단 알림
 import { buildDeptCreatePlan, predictLegacyDeptName, type DeptCatalog, type DeptRegistry } from "./deptcreate"; // U17
 import {
   deptPendingText,
@@ -10104,6 +10105,14 @@ async function start() {
     const p = (e.payload ?? {}) as { phase?: string };
     if (p.phase === "start")
       stickyToast("upd-pack", "feed", "🔄 무중단 적용 중", "서명검증 → 다운로드 → 원자적 팩 교체 → 노드 reinject…");
+  });
+  await listen("pack-incomplete", (e) => {
+    const p = (e.payload ?? {}) as PackIncompletePayload;
+    dismissToast("upd-pack");
+    updState = { ...updState, pack: packAfterIncomplete(p, Date.now()) };
+    renderUpdateAll();
+    const warning = packIncompleteToast(p);
+    toast("health", warning.title, warning.body);
   });
   await listen("pack-updated", (e) => {
     // ★통합 0.14.41(A4↔B2): A4 가 구 전역(updateAvailable·packUpdateAvailable)을 단일 updState 로

@@ -105,6 +105,19 @@ describe("업데이트 배지 배선 — 단일 상태 · 단일 보기", () => 
     expect(seg).toContain("packAfterInstalled(");
   });
 
+  it("B428-U9 incomplete result always drives a visible warning separately from disk state", () => {
+    const at = code.indexOf('listen("pack-incomplete"');
+    expect(at).toBeGreaterThan(0);
+    const segment = code.slice(at, code.indexOf('listen("pack-updated"', at));
+    expect(segment).toContain("packAfterIncomplete(p");
+    expect(segment).toContain("packIncompleteToast(p)");
+    expect(segment).toContain('toast("health", warning.title, warning.body)');
+    expect(segment).not.toContain("packUpdatedToast(");
+    const prompt = fnBody("promptPackInstall");
+    expect(prompt).toContain('await invoke("install_pack_update"');
+    expect(prompt).not.toMatch(/(?:const|let)\s+\w+\s*=\s*await invoke\("install_pack_update"/);
+  });
+
   it("★(B-360 R3 · W1) pack-updated 리스너는 페이로드를 통째로 packUpdatedToast 에 넘기고 그 제목·본문을 띄운다 — 리스너 안에 완료 문구 사본이 없다", () => {
     const a = code.indexOf('listen("pack-updated"');
     expect(a).toBeGreaterThan(0);
