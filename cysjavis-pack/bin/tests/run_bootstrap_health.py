@@ -6233,6 +6233,10 @@ _U5_PACK_CREATIONFLAGS = {
     "javis_cycle_autopilot.py": 1,     # U5 캡처 전용 _CAPTURE_SPAWN_KW(nt NOWIN)
     "javis_hud_bridge.py": 1,          # NOWIN(브리지 = cysd 가 숨겨 띄운 장수 프로세스 · 0.12.44~)
     "javis_phoenix_win_smoke.py": 2,   # 윈도우 스모크 검체의 CREATE_NO_WINDOW
+    "javis_preflight.py": 1,           # CREATE_NEW_PROCESS_GROUP(창 정책 아님 · 트리 분리 · WP18 R2 4dcd293a) —
+                                       #   선례 javis_completion_guard 와 동급 · 캡처 전용(PIPE/PIPE/DEVNULL) ·
+                                       #   ★Windows 종료 경로 UNMEASURED(열린 셀: _run_skillscan_all 20s 시한 뒤
+                                       #   고아 수 · 유일 측정 레인 windows-health/windows-latest · B-490)
 }
 # 콘솔을 떼어 내거나 새로 여는 수단(자손이 매번 새 창을 받는다) — 팩 어디에도 0건이어야 한다.
 _U5_PACK_DETACH_PY = ("DETACHED_PROCESS", "CREATE_NEW_CONSOLE", "pythonw", "startfile", "0x00000008", "0x00000010")
