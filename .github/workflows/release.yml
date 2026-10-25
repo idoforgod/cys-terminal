@@ -41,13 +41,13 @@ jobs:
   #   릴리스 자산 생산은 그대로 진행됐다. 즉 Windows 부트스트랩 계약이 깨진 채로도 배포 자산이
   #   완성됐고, 발행을 막는 것은 오직 "사람이 적색을 봤기를 바라는 것" 뿐이었다.
   #
-  # ★어떻게 막는가(차단이 실재하는 경로): 이 잡이 실패하면 `pack-artifacts` 가 돌지 않는다
-  #   → 드래프트 릴리스에 `pack.tar.gz` · `pack-manifest.json` · `pack-manifest.json.minisig`
-  #   **3종이 올라가지 않는다** → 공개 발행 레인(release-publish.yml)이 부르는
-  #   `scripts/release-verify.py` 의 `REQUIRED_ASSETS` 에 그 셋이 등재돼 있어 검증이 실패한다
-  #   (`release-verify.py:99-107`). 발행은 그 레인 하나뿐이므로 **공개 발행이 실제로 차단된다.**
-  #   ⚠`build` 잡에는 걸지 않는다 — 걸면 20분짜리 빌드가 windows-health 완주 뒤로 직렬화된다.
-  #     이 잡은 build 와 **병렬**로 폴링하므로 정상 경로의 추가 지연이 사실상 0 이다.
+  # ★어떻게 막는가(차단이 실재하는 경로): `build` 와 `pack-artifacts` 모두 이 잡의 성공을 기다린다.
+  #   → 게이트가 성공하지 않으면 build 매트릭스의 드래프트 생성·릴리스 자산 업로드부터 막힌다.
+  #   → pack-artifacts 는 build 성공도 기다리므로 팩 3종 업로드 역시 막힌다.
+  #   기존 드래프트 자산은 지우거나 재검증하지 않는다. 공개 전 release-publish.yml 의
+  #   정확한 대상 검증은 유지하며, 별도 업로드 워크플로는 이 의존 간선의 범위 밖이다.
+  #   ⚠`build` 잡도 windows-health 완주 뒤에 시작한다 — 그 뒤 매트릭스 3레그는 병렬이다.
+  #     릴리스 선쓰기 차단을 위해 추가 대기를 수용한다. 긴 CI 감독은 좌석을 막지 않고 비동기로 한다.
   #
   # ★fail-closed: 런이 없거나·미완주거나·성공이 아니면 전부 실패다. "재지 않았다" 를 통과로
   #   접는 것이 이 저장소가 반복해 낸 사고의 형태다(러너 '미측정 축 계약'과 같은 교리).
@@ -87,7 +87,7 @@ jobs:
                 jq -r '.[] | "  - conclusion=\(.conclusion) \(.url)"' <<<"$BAD"
                 exit 1
               fi
-              echo "✅ windows-health 성공 확인($NDONE 런) — pack-artifacts 진행 허용"
+              echo "✅ windows-health 성공 확인($NDONE 런) — build 진행 허용; pack-artifacts 는 build 성공도 필요"
               jq -r '.[] | "  - \(.url)"' <<<"$DONE"
               exit 0
             fi
@@ -107,6 +107,7 @@ jobs:
           done
 
   build:
+    needs: windows-health-gate
     strategy:
       fail-fast: false     # 한 타깃이 실패해도 나머지는 계속
       matrix:
