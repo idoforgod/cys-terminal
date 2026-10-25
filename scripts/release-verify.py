@@ -70,8 +70,8 @@
 동반 회귀 테스트: `python3 scripts/tests/test_release_verify.py` (합성 픽스처 · 네트워크 불요)
 
 사용:
-  python3 scripts/release-verify.py --version 0.14.53 --release-dir reviewed-release --body-file "$RUNNER_TEMP/release-body.txt"
-  python3 scripts/release-verify.py --version 0.14.53 --release-dir reviewed-release --body-file body.txt --print-assets
+  python3 scripts/release-verify.py --version 0.14.54 --release-dir reviewed-release --body-file "$RUNNER_TEMP/release-body.txt"
+  python3 scripts/release-verify.py --version 0.14.54 --release-dir reviewed-release --body-file body.txt --print-assets
 
 ★8단계 Windows SAC 고지(D6-b · 0.14.53): setup.exe 의 PE 보안 디렉터리(Authenticode)가 없어야 하고, 본문과 latest.json
   notes 가 각각 `<!-- cys-win-sac: unsigned -->` 마커 정확히 하나와 SAC_KEY_PHRASES 두 문구를 실어야 한다. 서명된
