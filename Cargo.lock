@@ -785,6 +785,7 @@ dependencies = [
 name = "cys-terminal"
 version = "0.14.53"
 dependencies = [
+ "anyhow",
  "base64 0.22.1",
  "chrono",
  "clap",
