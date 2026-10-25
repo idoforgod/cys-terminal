@@ -24,6 +24,7 @@ import path from 'node:path';
 import http from 'node:http';
 import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
+import { discoverCdpTargets, observeCdpStage, cdpException } from '../cdp-discovery.mjs';
 
 function parseArgs(argv) {
   const o = {};
@@ -65,6 +66,7 @@ const R = {
   ws_impl: null,
   has_fetch: typeof fetch !== 'undefined',
   targets: null,
+  discovery: { attempts: [], attachments: [] },
   chosen_target: null,
   attached: false,
   tauri_global: null,
@@ -484,8 +486,11 @@ async function evalJs(expression, { awaitPromise = true, timeoutMs = 30000 } = {
 }
 
 async function listTargets() {
-  const r = await fetch(`http://127.0.0.1:${PORT}/json/list`, { signal: AbortSignal.timeout(5000) });
-  return await r.json();
+  const { targets, record } = await discoverCdpTargets(`http://127.0.0.1:${PORT}/json/list`, { signal: AbortSignal.timeout(5000) });
+  R.discovery.attempts.push(record);
+  save();
+  if (targets === null) throw new Error('CDP discovery: ' + record.reason);
+  return targets;
 }
 
 function rankTargets(list) {
@@ -2773,8 +2778,15 @@ async function main() {
   let chosen = null;
   for (let i = 0; i < ranked.length && !chosen; i++) {
     const t = ranked[i];
+    const attachment = { started: iso(), finished: null, target_id: String(t.id ?? '').slice(0, 1024),
+      url: String(t.url ?? '').slice(0, 1024), stages: [], tauri_probe_errors: [], outcome: null };
+    R.discovery.attachments.push(attachment);
+    save();
     try {
-      await connect(t.webSocketDebuggerUrl);
+      const connection = await observeCdpStage('websocket_connect', () => connect(t.webSocketDebuggerUrl));
+      attachment.stages.push(connection.record);
+      save();
+      if (connection.record.outcome === 'failed') throw connection.error;
       step('connected', { url: t.url, title: t.title, ws_impl: R.ws_impl });
       const until = Date.now() + (i === 0 ? 90000 : 20000);
       let ok = false;
@@ -2786,13 +2798,17 @@ async function main() {
             break;
           }
         } catch (e) {
-          // page may still be loading
+          // Preserve failed probes without interpreting their native cause.
+          attachment.tauri_probe_errors.push({ t: iso(), exception: cdpException(e) });
+          save();
         }
         await sleep(2000);
       }
       if (ok) {
         chosen = t;
+        attachment.outcome = 'attached_tauri';
       } else {
+        attachment.outcome = closed ? 'socket_closed_before_tauri' : 'tauri_not_observed';
         step('no __TAURI__ on target', { url: t.url });
         try {
           ws.close();
@@ -2801,7 +2817,12 @@ async function main() {
         }
       }
     } catch (e) {
+      attachment.outcome = 'attach_failed';
+      attachment.exception = cdpException(e);
       fail('connect ' + t.url, e);
+    } finally {
+      attachment.finished = iso();
+      save();
     }
   }
   if (!chosen) {

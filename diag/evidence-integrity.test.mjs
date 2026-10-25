@@ -36,3 +36,26 @@ for(const part of ['state','seat'])test('R3 old restart '+part+' stream loss sta
  writeChecked(f.root,'measurement.json',run,r);writeChecked(f.root,'r2-state.json',{state:run.old_restart_state,seat:run.old_restart_seat},r);writeChecked(f.root,'launch.json',{completed:true,ok:false},r);writeChecked(f.root,'installer-process-evidence.json',{not_launched:true,exit:null,launch:{completed:true,ok:false}},r);fs.writeFileSync(path.join(f.root,'evidence-receipts.json'),JSON.stringify(r));
  assert.equal(finalize(f.root).status,'UNMEASURED');assert.equal(sealedVerdict(f.root).status,'UNMEASURED');const c=JSON.parse(fs.readFileSync(path.join(f.root,'cells.json')));assert.equal(c.evidence_complete,true);assert.equal(c.logs_complete,true);assert.equal(c.old_restart,null);
  }finally{fs.rmSync(f.root,{recursive:true});}});
+
+import {requiredRecords} from './evidence-integrity.mjs';
+test('GAPS schema2 baseline stop requires early inventory and capture',()=>{
+ const required=requiredRecords({observer_schema:2,baseline_timeout:true});
+ assert(required.includes('log-inventory.json'));assert(required.includes('channel-capture.json'));
+ assert(!requiredRecords({baseline_timeout:true}).includes('log-inventory.json'),'legacy frozen record set is unchanged');
+});
+test('GAPS schema2 missing early capture cannot seal as complete',()=>{const f=fixture();try{
+ const r=completeEvidence(f),run=goodDriver();Object.assign(run,{observer_schema:2,baseline_timeout:true});run.baseline.versions={known:false,value:null,error:'no CDP'};
+ writeChecked(f.root,'measurement.json',run,r);fs.unlinkSync(path.join(f.root,'channel-capture.json'));fs.writeFileSync(path.join(f.root,'evidence-receipts.json'),JSON.stringify(r));
+ assert.equal(finalize(f.root).status,'UNMEASURED');assert.equal(JSON.parse(fs.readFileSync(path.join(f.root,'cells.json'))).evidence_complete,false);
+ assert.equal(sealedVerdict(f.root).status,'UNMEASURED');
+}finally{fs.rmSync(f.root,{recursive:true});}});
+function baselineStopEvidence(f){
+ const r=completeEvidence(f),run=goodDriver();Object.assign(run,{observer_schema:2,baseline_timeout:true});run.baseline.versions={known:false,value:null,error:'no CDP'};
+ const inventory=JSON.parse(fs.readFileSync(new URL('./log-inventory.json',import.meta.url)));
+ const capture={observer_schema:2,product_sha:run.inputs.product_sha,reading:'R1',interval:{start:10,end:20},phase:'baseline',phases:{baseline:'stopped',update:'not-started',post_update:'not-started',old_restart:'not-applicable'},channels:inventory.channels.map(b=>({id:b.id,phase:b.id.startsWith('installer-candidate:')?'update':b.id.startsWith('app-updated:')?'post_update':b.id.startsWith('app-old-restart:')?'old_restart':'baseline',status:b.id.startsWith('app-old-restart:')?'not-applicable':b.id.startsWith('installer-candidate:')||b.id.startsWith('app-updated:')?'not-started':'unbound',bound:false,collection_ok:false,error:'phase not started or channel unbound'}))};
+ for(const [name,obj] of Object.entries({'measurement.json':run,'base-state.json':run.baseline,'log-inventory.json':inventory,'channel-capture.json':capture}))writeChecked(f.root,name,obj,r);
+ fs.writeFileSync(path.join(f.root,'evidence-receipts.json'),JSON.stringify(r));return {r,capture};
+}
+test('GAPS baseline-stop fixture persists inventory and explicit unstarted capture but stays UNMEASURED',()=>{const f=fixture();try{baselineStopEvidence(f);assert.equal(finalize(f.root).status,'UNMEASURED');assert.equal(sealedVerdict(f.root).status,'UNMEASURED');const c=JSON.parse(fs.readFileSync(path.join(f.root,'cells.json')));assert.equal(c.evidence_complete,true);assert.equal(c.logs_complete,false);assert.equal(c.tracebacks,null);const m=JSON.parse(fs.readFileSync(path.join(f.root,'mandatory-artifacts.json')));assert(m.required.includes('channel-capture.json'));}finally{fs.rmSync(f.root,{recursive:true});}});
+for(const bad of ['missing phases','missing reason','missing channel','wrong schema'])test('GAPS schema2 '+bad+' is invalid evidence',()=>{const f=fixture();try{const {r,capture}=baselineStopEvidence(f);if(bad==='missing phases')delete capture.phases;else if(bad==='missing reason')delete capture.channels[0].error;else if(bad==='missing channel')capture.channels.pop();else delete capture.observer_schema;writeChecked(f.root,'channel-capture.json',capture,r);fs.writeFileSync(path.join(f.root,'evidence-receipts.json'),JSON.stringify(r));assert.equal(finalize(f.root).status,'UNMEASURED');assert.equal(JSON.parse(fs.readFileSync(path.join(f.root,'cells.json'))).evidence_complete,false);assert.equal(sealedVerdict(f.root).status,'UNMEASURED');}finally{fs.rmSync(f.root,{recursive:true});}});
+test('GAPS copied unbound inventory still cannot prove coverage',()=>{const f=fixture();try{f.inventory=JSON.parse(fs.readFileSync(new URL('./log-inventory.json',import.meta.url)));assert.deepEqual(logCoverage(f.inventory,f.capture,f.root),{complete:false,tracebacks:null,errors:['unbound inventory/interval']});}finally{fs.rmSync(f.root,{recursive:true});}});

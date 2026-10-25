@@ -15,6 +15,8 @@
   },
   "cdp-update.mjs": {
     "source": "a240cfbfbdf6705be2e75277f84c8b2682a32cca:diag/cdp-update.mjs",
-    "sha256": "ce2ef59f259365d2fc5d510f6b4f99d6e21f6c83bc3ec7a13832fb0365a9ebd1"
+    "sha256": "ce2ef59f259365d2fc5d510f6b4f99d6e21f6c83bc3ec7a13832fb0365a9ebd1",
+    "adapted_sha256": "0792ab6dd2c85086af07d1ee00b5f271c86dca35c89af6009c8c3876a9ec3b3d",
+    "adaptation": "Observer-only discovery/attachment diagnostics via ../cdp-discovery.mjs; bounded diagnostic fields, per-attempt reasons and preserved exceptions; uipre gate unchanged. Original source hash remains sha256."
   }
 }

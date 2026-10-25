@@ -13,10 +13,12 @@ $K_REG=Join-Path $env:windir 'System32\reg.exe'; $K_KEY='HKLM\SYSTEM\CurrentCont
 $script:SacTouched=$false; $script:GhToken=[string]$env:GITHUB_TOKEN
 Remove-Item Env:\GITHUB_TOKEN -ErrorAction SilentlyContinue
 $CTX=@{subjects=@();driver_node=(Get-Command node.exe).Source}
-$RUN=[ordered]@{started=(Get-IsoNow);steps=[ordered]@{};states=[ordered]@{};checkpoints=[ordered]@{};notes=(New-Object 'System.Collections.Generic.List[string]')}
+$RUN=[ordered]@{observer_schema=2;started=(Get-IsoNow);steps=[ordered]@{};states=[ordered]@{};checkpoints=[ordered]@{};notes=(New-Object 'System.Collections.Generic.List[string]')}
 $cells=[ordered]@{reading=$null;input=$false;baseline=$null;installer_exit=$null;versions=$null;daemon=$null;pack=$null;seat=$null;tracebacks=$null;logs_complete=$false;evidence_complete=$false;harness_error=$null;sac_before=$null;sac_after=$null;neg_blocked=$null;pos_allowed=$null;launch_known=$null;launch_blocked=$null;old_restart=$null;old_survives=$null;files_changed=$null;state_complete=$false;restored=$null}
 $script:Install=Join-Path $env:LOCALAPPDATA 'cys'; $script:Pack=Join-Path $env:USERPROFILE '.cys\pack'
 $script:ApplyStart=$null; $script:AuditStarted=$false
+$script:Phase='authorization';$script:Phases=[ordered]@{baseline='not-started';update='not-started';post_update='not-started';old_restart='not-started'}
+$script:InventoryReady=$false
 # Required JSON writes are checked and registered; the vendored best-effort writer is overridden.
 $script:EvidenceReceipts=[ordered]@{}
 function Save-Json([string]$Name,$Object,[int]$Depth=30) {
@@ -68,30 +70,15 @@ function Image-Facts {
     }
     return $o
 }
-function Pack-Facts([string]$Version) {
-    $o=[ordered]@{known=$false;value=$null;error=$null;version=$null;state=$null;manifest=$null;files=@()}
-    try {
-        foreach($name in @('.pack-version','.pack-state.json','.install-manifest.json')){
-            if(-not(Test-Path -LiteralPath (Join-Path $script:Pack $name) -PathType Leaf -ErrorAction Stop)){$o.known=$true;$o.value=$false;$o.reason='missing metadata: '+$name;return $o}
-        }
-        $o.version=(Get-Content -LiteralPath (Join-Path $script:Pack '.pack-version') -Raw -ErrorAction Stop).Trim()
-        $stateText=Get-Content -LiteralPath (Join-Path $script:Pack '.pack-state.json') -Raw -ErrorAction Stop
-        $manifestText=Get-Content -LiteralPath (Join-Path $script:Pack '.install-manifest.json') -Raw -ErrorAction Stop
-        try{$o.state=ConvertFrom-Json $stateText -ErrorAction Stop;$o.manifest=ConvertFrom-Json $manifestText -ErrorAction Stop}
-        catch{$o.known=$true;$o.value=$false;$o.reason='corrupt JSON metadata';return $o}
-        if($o.state -isnot [pscustomobject] -or $o.manifest -isnot [pscustomobject]){$o.known=$true;$o.value=$false;$o.reason='metadata JSON shape invalid';return $o}
-        $bad=0;$count=0
-        foreach($kv in $o.manifest.PSObject.Properties){
-            $f=[IO.Path]::GetFullPath((Join-Path $script:Pack $kv.Name))
-            if(-not $f.StartsWith(([IO.Path]::GetFullPath($script:Pack)+'\'),[StringComparison]::OrdinalIgnoreCase)){$bad++;continue}
-            $exists=Test-Path -LiteralPath $f -PathType Leaf -ErrorAction Stop
-            $h=$null;if($exists){$h=(Get-FileHash -LiteralPath $f -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()}
-            $ok=$exists -and ($h -eq [string]$kv.Value);if(-not $ok){$bad++};$count++
-            $o.files+=@([ordered]@{relative=$kv.Name;expected=$kv.Value;sha256=$h;ok=$ok})
-        }
-        $o.known=$true;$o.value=($o.version -eq $Version -and $count -gt 0 -and $bad -eq 0 -and $o.state.base_version -eq $Version)
-    }catch{$o.known=$false;$o.value=$null;$o.error=$_.Exception.Message}
-    return $o
+function Pack-Facts([string]$Version,[string]$Tag) {
+    # Only the fresh, pinned base embedded-install route has an evidenced absence default.
+    $route='unspecified'
+    if($Tag -eq 'base' -and $Version -eq '0.14.52' -and $RUN.base_pack_absent_before_install -eq $true -and $RUN.base_install.rc -eq 0){$route='fresh-free-embedded-v0.14.52'}
+    Save-Json ($Tag+'-pack-request.json') ([ordered]@{root=$script:Pack;expected=$Version;route=$route}) 10
+    $out=Join-Path $global:DiagOut ($Tag+'-pack-observation.json')
+    & $CTX.driver_node (Join-Path $PSScriptRoot 'driver-observation.mjs') pack (Join-Path $global:DiagOut ($Tag+'-pack-request.json')) $out
+    if($LASTEXITCODE -ne 0){return (Unknown 'pack observer failed')}
+    return (Get-Content -LiteralPath $out -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop)
 }
 function App-Version([string]$Tag) {
     $unique=$Tag+'-'+[Guid]::NewGuid().ToString('N')
@@ -106,7 +93,7 @@ function App-Version([string]$Tag) {
 function Read-State([string]$Version,[string]$Tag) {
     $raw=[ordered]@{expected=$Version;images=$null;marker=$null;failure_file=$null;cli=$null;daemon_binary=$null;ping=$null;identify=$null;cim=$null;app=$null;pack=$null;error=$null}
     try {
-        $raw.images=Image-Facts;$raw.pack=Pack-Facts $Version
+        $raw.images=Image-Facts;$raw.pack=Pack-Facts $Version $Tag
         $markerPath=Join-Path $script:Install 'cys-installed-version.txt'
         if(Test-Path -LiteralPath $markerPath -PathType Leaf -ErrorAction Stop){$raw.marker=(Get-Content -LiteralPath $markerPath -Raw -ErrorAction Stop).Trim()}
         $raw.failure_file=Test-Path -LiteralPath (Join-Path $script:Install 'cys-install-failure.txt') -ErrorAction Stop
@@ -176,9 +163,16 @@ function Seat-Check([string]$Tag) {
 function Capture-RequiredChannels {
     $inventory=Get-Content -LiteralPath (Join-Path $PSScriptRoot 'log-inventory.json') -Raw | ConvertFrom-Json -ErrorAction Stop
     Save-Json 'log-inventory.json' $inventory 30
-    $capture=[ordered]@{product_sha=$RUN.inputs.product_sha;reading=$cells.reading;interval=[ordered]@{start=([DateTimeOffset]::Parse($RUN.started).ToUnixTimeMilliseconds()/1000.0);end=([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()/1000.0)};channels=@()}
+    $capture=[ordered]@{observer_schema=2;product_sha=$RUN.inputs.product_sha;reading=$cells.reading;interval=[ordered]@{start=([DateTimeOffset]::Parse($RUN.started).ToUnixTimeMilliseconds()/1000.0);end=([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()/1000.0)};phase=$script:Phase;phases=$script:Phases;channels=@()}
     foreach($binding in $inventory.channels){
-        $row=[ordered]@{id=$binding.id;bound=$false;producer_pid=$null;sink=$binding.sink;collection_ok=$false;error='required producer/channel is not captured; filenames are not binding proof'}
+        $stage='baseline'
+        if($binding.id -like 'installer-candidate:*'){$stage='update'}
+        elseif($binding.id -like 'app-updated:*'){$stage='post_update'}
+        elseif($binding.id -like 'app-old-restart:*'){$stage='old_restart'}
+        $status='unbound';$reason='required producer/channel is not captured; filenames are not binding proof'
+        if($script:Phases[$stage] -eq 'not-started'){$status='not-started';$reason='producer phase not started: '+$stage}
+        elseif($script:Phases[$stage] -eq 'not-applicable'){$status='not-applicable';$reason='producer phase not applicable to this reading: '+$stage}
+        $row=[ordered]@{id=$binding.id;phase=$stage;status=$status;bound=$false;producer_pid=$null;sink=$binding.sink;collection_ok=$false;error=$reason}
         # Only directly observed redirected streams can be bound here. Other product-created
         # processes retain their real startup behavior; absent stdout/stderr stays UNMEASURED.
         if($binding.id -in @('installer-base:stdout','installer-base:stderr')){
@@ -188,7 +182,7 @@ function Capture-RequiredChannels {
                 $name='installer-base-'+$stream+'.stream';$file=Join-Path $global:DiagOut $name
                 $rawKey='stdout_bytes';if($stream -eq 'err'){$rawKey='stderr_bytes'}
                 [IO.File]::WriteAllBytes($file,[Convert]::FromBase64String([string]$proc[$rawKey]))
-                $row=[ordered]@{id=$binding.id;bound=$true;producer_pid=$proc.pid;sink=$binding.sink;producer_start=$proc.started_epoch;producer_end=$proc.ended_epoch;start=$proc.started_epoch;end=$proc.ended_epoch;collection_ok=$true;copy=$name;bytes=(Get-Item $file).Length;offset=0;end_offset=(Get-Item $file).Length;sha256=(Get-FileHash $file -Algorithm SHA256).Hash.ToLowerInvariant();error=$null}
+                $row=[ordered]@{id=$binding.id;phase=$stage;status='captured';bound=$true;producer_pid=$proc.pid;sink=$binding.sink;producer_start=$proc.started_epoch;producer_end=$proc.ended_epoch;start=$proc.started_epoch;end=$proc.ended_epoch;collection_ok=$true;copy=$name;bytes=(Get-Item $file).Length;offset=0;end_offset=(Get-Item $file).Length;sha256=(Get-FileHash $file -Algorithm SHA256).Hash.ToLowerInvariant();error=$null}
             }
         }
         $capture.channels+=@($row)
@@ -249,6 +243,8 @@ try {
     foreach($name in @('input-lock.json','permit.json','build-metadata.json')){Save-Json $name (Get-Content -LiteralPath (Join-Path $global:DiagOut $name) -Raw | ConvertFrom-Json) 60}
     $RUN.inputs=$inputLock;$RUN.harness_sha=$env:GITHUB_SHA;$RUN.run_id=$env:GITHUB_RUN_ID;$RUN.attempt=$env:GITHUB_RUN_ATTEMPT
     $RUN.environment=[ordered]@{os=(Get-CimInstance Win32_OperatingSystem | Select-Object Caption,Version,BuildNumber);arch=$env:PROCESSOR_ARCHITECTURE;image=$env:ImageVersion}
+    if($cells.reading -eq 'R1'){$script:Phases.old_restart='not-applicable'}
+    Capture-RequiredChannels;$script:InventoryReady=$true # checked early persistence, before any installer
     $initial=Get-SacRealState 'initial';$RUN.initial_sac=$initial
     if($initial.enforced){throw 'UNMEASURED: baseline must be established before SAC is enabled'}
     Initialize-DiagNative;if(-not $global:DiagNativeReady){throw 'native observer unavailable'}
@@ -261,6 +257,8 @@ try {
     $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS='--remote-debugging-port=9333 --remote-allow-origins=*'
     Remove-Item Env:\CYS_UPDATE_MANIFEST_URL -ErrorAction SilentlyContinue
     $null=Must-Permit
+    $RUN.base_pack_absent_before_install=(-not(Test-Path -LiteralPath $script:Pack -ErrorAction Stop))
+    $script:Phase='baseline';$script:Phases.baseline='started'
     $RUN.base_install=Invoke-Proc $inputLock.base_path '/S' 600
     if($RUN.base_install.rc -ne 0){throw 'base installer failed'}
     $baseApp=Start-Process -FilePath (Join-Path $script:Install 'cys-app.exe') -WorkingDirectory $script:Install -PassThru
@@ -269,7 +267,8 @@ try {
     do{$baseline=Read-State '0.14.52' 'base';if(State-Ready $baseline){break};Start-Sleep 5}while((Get-Date) -lt $until)
     $cells.baseline=$null;if($baseline.versions.known -and $baseline.daemon.known -and $baseline.pack.known){$cells.baseline=[bool](State-Ready $baseline)}
     $RUN.base_images=Image-Facts;$RUN.baseline=$baseline;$RUN.base_logs=Capture-Logs 'base'
-    if($cells.baseline -ne $true){$RUN.baseline_timeout=$true;throw 'BASELINE_STOP'}
+    if($cells.baseline -ne $true){$RUN.baseline_timeout=$true;$script:Phases.baseline='stopped';throw 'BASELINE_STOP'}
+    $script:Phases.baseline='completed'
     # Product-root-only audit; do not kill or reset the old daemon.
     foreach($guid in @('{0CCE922B-69AE-11D9-BED3-505054503030}','{0CCE922C-69AE-11D9-BED3-505054503030}')){
         $a=Invoke-Proc 'auditpol.exe' ('/set /subcategory:'+ $guid +' /success:enable') 30
@@ -292,6 +291,7 @@ try {
     $dest=Join-Path $temp 'cys-0.14.53-installer.exe';Copy-Item -LiteralPath $inputLock.candidate_path -Destination $dest
     if((Get-FileHash $dest -Algorithm SHA256).Hash.ToLowerInvariant() -ne $inputLock.candidate_sha256){throw 'candidate copy hash mismatch'}
     $RUN.candidate_copy=$dest;$RUN.candidate_authenticode=(Get-AuthenticodeSignature $dest).Status.ToString()
+    $script:Phase='update';$script:Phases.update='started'
     $script:ApplyStart=(Get-Date).ToUniversalTime();$oldCwd=[Environment]::CurrentDirectory
     try{[Environment]::CurrentDirectory=$script:Install;$call=[DiagNative]::ShellExecStart($dest,'/P /R /UPDATE /ARGS',20000)}finally{[Environment]::CurrentDirectory=$oldCwd}
     $RUN.launch=ConvertTo-CallRecord $call;Save-Json 'launch.json' $RUN.launch 10;$cells.launch_ok=[bool]$call.Ok;$cells.launch_known=($call.Completed -and -not $call.TimedOut)
@@ -304,6 +304,7 @@ try {
     $until=(Get-Date).AddSeconds(600)
     if($call.Ok){do{$audit=Installer-Exit $script:ApplyStart $dest;if($audit.complete){break};Start-Sleep 3}while((Get-Date) -lt $until);$cells.installer_exit=$audit.exit}
     else{$RUN.launch_refused=$true;Save-Json 'installer-process-evidence.json' ([ordered]@{not_launched=$true;launch=$RUN.launch;exit=$null}) 20}
+    $script:Phases.update='completed';$script:Phase='post_update';$script:Phases.post_update='started'
     $RUN.images_after=Image-Facts;$cells.files_changed=$false
     foreach($n in @('cys-app.exe','cys.exe','cysd.exe')){if($RUN.images_after[$n].sha256 -ne $RUN.base_images[$n].sha256){$cells.files_changed=$true}}
     $until=(Get-Date).AddSeconds(300)
@@ -312,16 +313,19 @@ try {
     $RUN.seat=Seat-Check 'after'
     Start-Sleep 60
     $RUN.final_state=Read-State '0.14.53' 'final'
+    $script:Phases.post_update='completed'
     if($cells.reading -eq 'R2'){
         $cells.old_survives=(-not $baseApp.HasExited)
         if(-not $cells.files_changed){
             # Explicit re-launch of the unchanged old image is different from surviving PID.
+            $script:Phase='old_restart';$script:Phases.old_restart='started'
             $restart=Invoke-ProbeCreate (Join-Path $script:Install 'cys-app.exe');$RUN.old_restart_probe=$restart
             if($restart.completed -ne $true){$RUN.old_restart_observer_error="probe incomplete"}
             if($restart.ok){
                 $oldProcess=Start-Process -FilePath (Join-Path $script:Install 'cys-app.exe') -WorkingDirectory $script:Install -PassThru
                 Start-Sleep 5;$oldState=Read-State '0.14.52' 'old-restart';$oldSeat=Seat-Check 'old-restart'
                 $RUN.old_restart_state=$oldState;$RUN.old_restart_seat=$oldSeat
+                $script:Phases.old_restart='completed'
             }
         }
         $st=Get-SacRealState 'after-observation';$RUN.sac_after=$st
@@ -338,6 +342,8 @@ try {
 finally {
     if($script:SacTouched){$RUN.restore=Restore-SacReal 'final';$cells.restored=$RUN.restore.restored;if(-not $cells.restored){$RUN.restore_fallback=Invoke-CmdRestoreFallback}}
     elseif($cells.reading -eq 'R2'){$cells.restored=$false}
+    foreach($phaseName in @($script:Phases.Keys)){if($script:Phases[$phaseName] -eq 'started'){$script:Phases[$phaseName]='stopped'}}
+    if($script:InventoryReady){try{Capture-RequiredChannels}catch{$cells.harness_error='required capture persistence failed: '+$_.Exception.Message}}
     $RUN.finished=Get-IsoNow;Save-Run
     # Preserve processes and files until observations are saved. Disposable runner teardown cleans them.
     $env:GITHUB_TOKEN=$script:GhToken

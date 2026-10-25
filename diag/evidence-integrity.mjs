@@ -2,8 +2,9 @@ import fs from 'node:fs';import path from 'node:path';import {sha256,verdict} fr
 export const CHANNELS=['daemon:file','daemon:stdout','daemon:stderr','pack:file','pack:stdout','pack:stderr','app:file','app-base:stdout','app-base:stderr','app-updated:stdout','app-updated:stderr','installer-base:stdout','installer-base:stderr','installer-candidate:stdout','installer-candidate:stderr'];
 export function requiredRecords(run){
  const common=['measurement.json','input-lock.json','permit.json','build-metadata.json','base-state.json','base-raw-state.json','base-logs.json'];
+ if(run.observer_schema===2)common.push('log-inventory.json','channel-capture.json');
  if(run.baseline_timeout===true)return common;
- return [...common,'launch.json','installer-process-evidence.json','after-state.json','after-raw-state.json','final-state.json','final-raw-state.json','after-seat.json','final-logs.json','log-inventory.json','channel-capture.json',...(run.seed_cells?.reading==='R2'?['r2-state.json']:[])];
+ return [...common,'launch.json','installer-process-evidence.json','after-state.json','after-raw-state.json','final-state.json','final-raw-state.json','after-seat.json','final-logs.json',...(run.observer_schema===2?[]:['log-inventory.json','channel-capture.json']),...(run.seed_cells?.reading==='R2'?['r2-state.json']:[])];
 }
 function safe(root,name){if(path.basename(name)!==name||name==='.'||name==='..')throw Error('invalid evidence name');return path.join(root,name);}
 export function writeChecked(root,name,obj,receipts){
@@ -51,10 +52,27 @@ export function logCoverage(inventory,capture,root){
  }
  return {complete:errors.length===0,tracebacks:errors.length?null:tracebacks,errors};
 }
+function verifyObserverRecords(root,run){
+ if(run.observer_schema!==2)return; // Old frozen evidence retains its original record contract.
+ const read=n=>JSON.parse(fs.readFileSync(safe(root,n),'utf8'));
+ const inv=read('log-inventory.json'),c=read('channel-capture.json');
+ const stages=['baseline','update','post_update','old_restart'];
+ if(c.observer_schema!==2||!stages.every(k=>['not-started','started','completed','stopped','not-applicable'].includes(c.phases?.[k]))||!['authorization',...stages].includes(c.phase))throw Error('phase capture schema');
+ if(!Array.isArray(inv.channels)||!Array.isArray(c.channels)||!inv.channels.length||new Set(inv.channels.map(x=>x.id)).size!==inv.channels.length||c.channels.length!==inv.channels.length)throw Error('phase channel set');
+ for(const b of inv.channels){
+  const rows=c.channels.filter(x=>x.id===b.id);if(rows.length!==1)throw Error('phase channel identity');
+  const r=rows[0];
+  if(!stages.includes(r.phase)||!['not-started','not-applicable','unbound','captured'].includes(r.status))throw Error('phase channel status');
+  if(r.status==='captured'){if(r.bound!==true||r.collection_ok!==true)throw Error('captured channel flags');}
+  else if(r.bound!==false||r.collection_ok!==false||typeof r.error!=='string'||!r.error.trim())throw Error('unstarted/unbound channel reason');
+  if(['not-started','not-applicable'].includes(r.status)&&c.phases[r.phase]!==r.status)throw Error('channel/phase mismatch');
+ }
+}
 export function finalize(root){
  const read=n=>JSON.parse(fs.readFileSync(safe(root,n),'utf8'));
  const run=read('measurement.json'),receipts=read('evidence-receipts.json');
  const proof=verifyRecords(root,requiredRecords(run),receipts);const cells=driverCells(run);
+ try{verifyObserverRecords(root,run);}catch(e){proof.complete=false;proof.errors.push(e.message);}
  if(!run.baseline_timeout)try{const audit=read('installer-process-evidence.json'),launch=read('launch.json');if(launch.ok!==cells.launch_ok||(launch.ok&&audit.exit!==cells.installer_exit))throw Error('driver/audit mismatch');}catch(e){proof.complete=false;proof.errors.push(e.message);}
  let coverage={complete:false,tracebacks:null,errors:['no required capture']};
  try{coverage=logCoverage(read('log-inventory.json'),read('channel-capture.json'),root);}catch(e){coverage.errors=[e.message];}
@@ -71,6 +89,7 @@ export function sealedVerdict(root){
   const run=JSON.parse(fs.readFileSync(safe(root,'measurement.json'))),m=JSON.parse(fs.readFileSync(safe(root,'mandatory-artifacts.json')));
   const required=[...requiredRecords(run),'cells.json','log-coverage.json'];
   if(JSON.stringify([...m.required].sort())!==JSON.stringify([...required].sort()))throw Error('mandatory set mismatch');
+  verifyObserverRecords(root,run);
   const proof=verifyRecords(root,required,m.records);if(!proof.complete)throw Error(proof.errors.join('; '));
   const cells=JSON.parse(fs.readFileSync(safe(root,'cells.json')));
   // Recheck captured bytes too: a later missing stream invalidates a prior zero.
