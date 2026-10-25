@@ -24,7 +24,7 @@
 - **빠진 것 [OUT]**: WP7 홈페이지 전환 도구(B-456 · 홈페이지 전환 도구는 이번 판에서 제외) · 윈도우 코드 서명(오너 요청 1 · 서명 자격 없음) ·
   agy 남은 한도를 사용률로 표시(오너 F4 · 재현 표본 없음) · PowerShell 에 Ctrl+C 전달(오너 F5 뒷부분 · B-459) · 팩 소실의 전면 재설계(B-458) ·
   업데이트 때 팩 소실 완화(WP14L · 오너 F2 · 설계 한 회차 미수용 · B-462) · phoenix 배포 경로의 실행 확인(B-457).
-- **재지 못한 것**: 윈도우 실기 전부 · 스마트 앱 컨트롤 적용 PC · 고정 통합 커밋 `319c2171` 위의 최종 전체 시험 묶음(§7) — §4.
+- **재지 못한 것**: 윈도우 실기 전부 · 스마트 앱 컨트롤 적용 PC · **0.14.52 설치본에서 0.14.53 으로의 윈도우 업데이트 경로**(측정이 baseline 에서 멈춤 · 깨졌다는 뜻이 아니라 재지 못했다는 뜻) · 고정 통합 커밋 `319c2171` 위의 최종 전체 시험 묶음(§7) — §4.
 
 ## 1. 들어간 것
 
@@ -350,6 +350,48 @@
   continuation in the owner's report. The source already emits ETX 0x03 after its guards; the native cause (ConPTY input mode, console mode) is
   unmeasured. No product change in 0.14.53 (WP15 head ruling 1 (d); `LEDGER.md` B-459 row).
 - **No pre-swap run check ships in 0.14.53 (B-483/B-482; Phoenix B-457 remains uncovered):** installer B1 `de2ee33f` and app/shell B2 `c0db2658` are OUT. Silent updater, wizard reinstall, uninstall-first, main/department rotation and Phoenix therefore do not gain this protection. Windows builds remain unsigned; Smart App Control behavior is UNMEASURED. Sources: `JUDGMENT.md, sha256 f72a733f954cabc1096af8cb20e21c60239b9e238c4fbfcd7582f1e3396f47e2, 6643 bytes; internal evidence, not published`, `PARKED.txt, sha256 e582db27a278c5b9ab706a4b88677f6791d69e05ec02941066a574ea22c3c183, 1941 bytes; internal evidence, not published`, `TICKET-NOTES-REV5a-w13.md, sha256 aaecff97b043500017f014b36a2cd3bab2a526ab67d03e9c122008ee9e1a9289, 7131 bytes; internal evidence, not published`.
+- **Windows update from an installed 0.14.52 to 0.14.53 — UNMEASURED, which is not the same statement as "broken":**
+  the one measurement attempted for this path (`windows-measure` run `40173384370`) stopped in its **baseline** stage and
+  never reached the update step, so its `verdict.json` reads `status: UNMEASURED` (reasons: `logs_complete`, `baseline`,
+  `versions`, `daemon`, `pack`, `seat`, `installer_exit`, `tracebacks`). We do **not** know that updating 0.14.52 to
+  0.14.53 on Windows fails, and we do **not** claim that it works: past the baseline, nothing was observed either way.
+  The three named gaps are observer-side, not product findings: the log inventory is written only after the update step,
+  so a baseline stop leaves it absent while the finalizer still reduced its mandatory set; `.pack-state.json` was required
+  by the harness but a normal fresh embedded install legitimately does not create it, so that "failure" was a harness
+  premise; and the CDP version read failed at **target discovery** (`no page target on the debugging port`, five attempts
+  of about 60 s), with the retained evidence insufficient to name a native cause. The observer repair is approved for a
+  later release and is deliberately **not** a 0.14.53 blocker. What *was* measured for Windows here: the signing state.
+  Signing mode is `unsigned`; all **eight** of our own executables in the shipped Windows artifact
+  (`cys_0.14.53_x64-setup.exe`, `cys-app.exe`, `cys-app.new.exe`, `cys.exe`, `cys.new.exe`, `cysd.exe`, `cysd.new.exe`,
+  `uninstall.exe`) read `embedded_signature=false`, `authenticode_status=NotSigned`, `signature_type=None`; and a census
+  of **all 743 PE files inside the installer** counts **163 embedded-signed and 0 of them ours** (malformed 0 — the
+  signed ones are vendor files, recorded in the log and outside the gate). The four required executables all read `ok`,
+  and the same run's control reads `red-as-expected`: a synthesized signed PE was read as signed, so the detector's
+  discrimination was proved in that same run instead of assumed, and the report's `verdict` is `PASS`. That makes
+  "unsigned" a measurement rather than an assertion (`windows-signing-report`, artifact `12578553755`, schema
+  `cys-win-pe-census/1`; re-measured and read by the head on 2026-10-25 20:1x). This is a **signature census, not a
+  Smart App Control measurement**: the signing notice at the top of this document is the published statement, and real
+  Smart App Control enforcement on a Smart App Control PC remains UNMEASURED (see the pre-swap bullet above).
+  If an update does not complete on your PC, the 0.14.52 release stays
+  published and installable, and the previous pack directory is kept at `~/.cys/pack.prev` — the pack-loss limit above
+  describes that route, and this note adds no advice beyond it. Sources: frozen R1 artifact
+  (`PROVENANCE.txt` run `40173384370`, artifact `12591711071`, zip sha256
+  `38b0cdee3603968b90c8bb6349e503ca75762a3a2374be86315b49b233dcd362`; `artifact/verdict.json`) and
+  `DESIGN-NOTE.md, sha256 8d560eeaa17bb70a1eee30fee126edbb201c192cec3fc9f33cb8e664be40c084, 17934 bytes; internal
+  evidence, not published`; the signing artifact and its schema above, as re-measured by the head. A CI result is only
+  the named CI measurement, never a real-user-PC claim.
+- **In 0.14.53 the pending diagnostic prints on stderr (B-428) — a stream change, not a breakage:**
+  the human-readable *pending* diagnostic — the prose line a person reads (find it by its stable text `pending reinject 소비`), not a machine record — is written to
+  **stderr** in this release; the B-428 repair of the pack-update "up to date" report is what settled it there, so
+  the stream this line arrives on is one of the things that changed in 0.14.53.
+  Nothing machine-readable changed: the machine-prefixed records, the exit codes and the UI events are **unchanged**.
+  A census of this repository's consumers of that prose counts **zero product consumers** and **one test consumer**;
+  the Tauri and Python callers parse the machine prefixes, the UI consumes events, and the CI workflows read the exit
+  status — so nothing inside this repository breaks. **Custom scripts outside this repository are UNMEASURED**, and
+  that one cell is the only reason this note exists. **If a script of yours greps that diagnostic on stdout, point it
+  at stderr** — read stderr, or merge the streams with `2>&1`; a script that already keys on the machine prefixes or
+  on the exit code needs no change. Sources: the department's census of in-repository consumers for the B-428 repair
+  (internal evidence, not published).
 - **WP7 not in 0.14.53 (B-456):** the homepage switch tool (B-438) closed at its 3-round cap with residue R3-F1 and stays excluded;
   no download-page state or distribution link is asserted here (`LEDGER.md` B-456 row).
 - **Tab dot (WP11, IN):** gemini/agy seats keep the "unobserved" look (their grammar stays provisional), and one codex seat on the base daemon read
