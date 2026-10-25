@@ -25,10 +25,25 @@ import {
   installerLaunchFailure,
   INSTALLER_LAUNCH_FAILED_TOAST_ID,
   packUpdatedToast,
+  packIncompleteToast,
 } from "./updatenotice";
 import { toastTtl, needsExpiryBanner, GUIDE_TTL_MS } from "./toastttl";
 
 const read = (rel: string) => readFileSync(new URL(rel, import.meta.url), "utf-8");
+
+it("B428-U9 distinguishes applied degradation from no-op without a success claim", () => {
+  const applied = packIncompleteToast({ pack_action: "applied", pack_version: "2.0.0", pending_persist_failed: true });
+  const noop = packIncompleteToast({ pack_action: "no-op", pending_persist_failed: true });
+  expect(applied.body).toContain("디스크에 반영됐습니다");
+  expect(applied.body).not.toContain("반영하지 않았");
+  expect(noop.body).toContain("팩을 교체하지 않았");
+  for (const r of [applied, noop]) {
+    expect(r.title).toBe("팩 후속 처리 미완료");
+    expect(r.body).toContain("대기 기록을 저장하지 못했습니다");
+    expect(r.body).toContain("성공으로 간주하지 않습니다");
+    expect(r.body).not.toContain("노드 reinject 완료");
+  }
+});
 
 /** main.ts 소스(주석 제거본) — 주석에만 적힌 장치로 핀이 통과하지 않게 한다. */
 const stripComments = (s: string): string =>

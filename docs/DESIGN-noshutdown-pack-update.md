@@ -579,6 +579,30 @@ no-op(UpToDate · exit 0)을 GUI 가 "✅ 팩 업데이트 완료"로 보고했�
 **하지 않은 것**: 판정 함수의 lib 이동(D2 — 별도 릴리스), `boot-busy` 재시도(D4 — 새 주기 작업 0 유지), 부서 팩
 (`pack-dept-*`) 표시(R9 — 오너 결정 대기), 팩 매니페스트 URL 테스트 오버라이드 env.
 
+### B428-U9: 팩 판정과 종결 명령 결과의 분리
+
+위 U9의 순수 no-op 종료코드 0과 확인 실패를 최신으로 말하지 않는 규칙은 유지한다.
+pending 실패는 그 종결 분기 **앞에서** 별도 degraded 명령으로 분류한다. 새 UNKNOWN,
+intent 거부, pending 저장 실패(그것만 있는 경우 포함)는 3이며, 이미 있던 UNKNOWN만으로
+영구 비0을 만들지 않는다. Apply 뒤 node-loop의 pending 저장 실패도 보고에서 버리지 않는다.
+커밋된 팩의 accepted-record 실패 코드 4는 별도 계약이며 이 수리에서 바꾸지 않는다.
+
+CLI가 첫 stdout 줄에 정확히 한 개의 schema=2 종결 레코드를 낸다. 불완전한 결과는 구 파서가
+알아보는 `gate=up-to-date` 경로를 사용하되, 구 `disk`·`disk_parse=ok` 증거를 싣지 않는다.
+새 필드는 실제 pack_action과 observed_disk, pending/node 단계별 수치를 보존한다(중복 합산 없음).
+단순한 `gate=degraded`는 구 파서의 applied 폴백으로 빠지므로 사용하지 않는다.
+코드/사실 불일치·중복 필드·늦은 종결 줄은 새 소비자가 거부하며, 출력 실패는 0/3 성공 출구에 도달하지 않는다.
+
+새 GUI는 `pack-incomplete`로 실제 applied/no-op과 후속 처리 실패를 따로 표시한다. 구 GUI의
+unknown 경로는 여전히 `Ok`를 반환하고, applied+degraded에도 "반영하지 않았습니다"라고 표시하는
+문면 한계가 있다. 보이는 불완전이지 완전 호환이 아니다. 구 소비자의 무음 성공을 막는 주체는
+짝 배포가 아니라 CLI의 첫 레코드다. 기본 source/lock/recovery 순서나 자동 재시도 정책은 바꾸지 않는다.
+
+U9 원본 검체는 그대로 둔다. 충돌하던 B428 D1/P15 어휘 핀은 실제 명령 경로 검체로 대체하며,
+가드 제거·분류기 순서 역전은 같은 정상 버전/persist_error 단독 입력에서 적색이어야 한다.
+서명된 fixture를 통과하는 명령 경로와 고정된 구 파서 실행을 분리해 검증한다. 회귀를 찾은 bisect는
+각 스텝에서 대상 검체의 compile(--no-run)과 exact 실행을 했던 것이며, 두 전체 스위트를 돌린 것이 아니다.
+
 ---
 
 ## 부록 A — 실측 근거 인덱스 (file:line)

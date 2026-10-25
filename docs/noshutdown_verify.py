@@ -249,6 +249,35 @@ def parse_pack_update_result(stdout):
     return None
 
 
+def terminal_gate_failures(stdout, returncode):
+    """Require affirmative applied/completed schema-2 evidence; absent fields are not zero."""
+    lines = stdout.splitlines()
+    if not lines or len(lines[0]) > 4096:
+        return ["first terminal record missing/oversized"]
+    words = lines[0].split()
+    if not words or words[0] != "PACK_UPDATE_OUTCOME":
+        return ["first output is not the terminal record"]
+    fields = {}
+    for word in words[1:]:
+        key, sep, value = word.partition("=")
+        if not sep or not value or key in fields:
+            return ["invalid/duplicate terminal field"]
+        fields[key] = value
+    fails = []
+    for key, expected in {"schema": "2", "gate": "applied", "terminal": "applied", "pack_action": "applied", "exit": "0"}.items():
+        if fields.get(key) != expected:
+            fails.append(f"terminal {key} is not {expected}")
+    if returncode != 0:
+        fails.append(f"terminal process exit={returncode}")
+    for key in ("failed", "deferred", "unknown", "new_unknown", "node_unknown", "node_new_unknown", "pending_kept", "intent_refused", "pending_persist", "reinject_skipped", "accepted_degraded"):
+        value = fields.get(key)
+        if value != "0":
+            fails.append(f"terminal {key} is nonzero or unmeasured")
+    if any(line.lstrip().startswith("PACK_UPDATE_OUTCOME") for line in lines[1:]):
+        fails.append("multiple terminal records")
+    return fails
+
+
 def read_manifest_signal(from_dir):
     """테스트 팩 manifest의 directive_hash_changed 명시 신호 → True/False/None(미지정).
 
@@ -314,6 +343,20 @@ def run_self_test():
         print(f"[{'PASS' if cond else 'FAIL'}] self-test: {name}")
         if not cond:
             failures.append(name)
+
+    terminal = ("PACK_UPDATE_OUTCOME gate=applied schema=2 terminal=applied pack_action=applied exit=0 "
+                "failed=0 deferred=0 unknown=0 new_unknown=0 node_unknown=0 node_new_unknown=0 pending_kept=0 "
+                "intent_refused=0 pending_persist=0 reinject_skipped=0 accepted_degraded=0")
+    expect("terminal applied/clean control", terminal_gate_failures(terminal, 0) == [])
+    for field in ("pending_persist", "intent_refused", "new_unknown", "unknown", "node_unknown", "node_new_unknown", "pending_kept"):
+        needle = f" {field}=0"
+        assert terminal.count(needle) == 1
+        expect(f"terminal {field}=1 refuses success", bool(terminal_gate_failures(terminal.replace(needle, f" {field}=1", 1), 0)))
+    expect("terminal absent is unmeasured", bool(terminal_gate_failures("", 0)))
+    expect("terminal missing field is not zero", bool(terminal_gate_failures(terminal.replace(" pending_persist=0", ""), 0)))
+    expect("terminal code3 is not accepted as success", bool(terminal_gate_failures(terminal, 3)))
+    expect("terminal first-line ownership", bool(terminal_gate_failures("progress\n" + terminal, 0)))
+    expect("terminal duplicate key refused", bool(terminal_gate_failures(terminal + " pending_persist=0", 0)))
 
     # PACK_UPDATE_RESULT 파싱.
     r = parse_pack_update_result(
@@ -464,6 +507,8 @@ def main():
     sys.stdout.write(proc.stdout)
     sys.stderr.write(proc.stderr)
     check("pack-update 종료코드 0", proc.returncode == 0, f"exit={proc.returncode}")
+    terminal_failures = terminal_gate_failures(proc.stdout, proc.returncode)
+    check("pack-update 종결 레코드: 실제 반영·미완료 0", not terminal_failures, "; ".join(terminal_failures))
 
     # ★PACK_UPDATE_RESULT 안정 토큰 파싱 — 각성 게이트(failed/deferred)의 1차 근거.
     pack_result = parse_pack_update_result(proc.stdout)

@@ -38,6 +38,7 @@ pub mod license;
 pub mod macos_devtools;
 pub mod merge3;
 pub mod pack;
+pub mod pack_update_result;
 /// 괄호 붙여넣기 울타리 살균·봉투(0.14.42 · 설계 C D1) — 본문 안 `ESC[201~`(C1 형 포함)·끝 미완성
 /// 이스케이프가 봉투를 조기에 닫는 결함의 단일 정의처(cysd 주입 writer·큐 다이제스트·CLI inject_text 공용).
 pub mod paste_fence;

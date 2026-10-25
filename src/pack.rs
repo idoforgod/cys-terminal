@@ -6,20 +6,17 @@ pub const ENV_PACK_DIR: &str = "CYS_PACK_DIR";
 /// cys 전용 CLAUDE_CONFIG_DIR 오버라이드(주로 테스트 격리용). 미설정 시 pack_dir 형제(~/.cys/claude).
 pub const ENV_CONFIG_DIR: &str = "CYS_CONFIG_DIR";
 
-/// pack-update 종료코드: 디스크 팩은 반영됐으나 라이브 노드 reinject에 실패가 있어 일부 노드가
-/// 미각성 상태(이전 지침으로 동작)임을 의미한다. 디스크 반영 자체는 성공이라 롤백하지 않되,
-/// 성공으로 침묵 포장하지 않도록 0/일반실패(1)와 구분되는 신호다. Tauri install_pack_update
-/// 브리지가 이 코드를 보고 pack-updated(디스크 갱신)+update-warning(라이브 미각성)을 함께 emit한다.
+/// pack-update 명령의 pending/reinject 처리가 불완전하다. 이 실행의 디스크 반영 여부는 별도
+/// terminal record로 판정한다(이미 최신인 팩에도 pending 실패가 가능하다). 0으로 숨기지 않고,
+/// 커밋된 팩을 롤백하거나 UNKNOWN 입력을 맹목 재전송하지 않는다.
 pub const EXIT_REINJECT_DEGRADED: i32 = 3;
 /// run_pack_update가 reinject 집계를 stdout에 구조화 출력할 때 쓰는 줄 접두사. 호출자(Tauri
 /// 브리지)가 failed/deferred를 정확히 파싱하도록 사람용 메시지와 별개의 안정 토큰으로 둔다.
 pub const REINJECT_RESULT_PREFIX: &str = "PACK_UPDATE_RESULT";
-/// `cys pack-update` 가 **반영하지 않고 끝난 판정**(UpToDate · no-op · exit 0)을 호출자에게 알리는 줄
-/// 접두사(U9 · 0.14.41). 종전에는 no-op 도 exit 0 이라 GUI 브리지가 "✅ 팩 업데이트 완료"라고 말했다.
-/// 형식(ASCII 한 줄 · 공백 구분 · CRLF 안전하게 trim 파싱):
-///   `PACK_UPDATE_OUTCOME gate=up-to-date remote=<manifest pack_version> disk=<.pack-version> disk_parse=ok|fail`
-/// CLI UpToDate 는 "원격 ≤ 디스크"뿐 아니라 **디스크 판독 실패**(parse 실패 = fail-CLOSED)에서도 나오므로
-/// disk·disk_parse 를 함께 싣는다 — 호출자는 disk_parse=ok ∧ disk ≥ remote 일 때만 "이미 적용됨"이라 말한다.
+/// U9 no-op 결과 줄 접두사. 순수 no-op의 종료코드 0과 confirmed 판정은 유지한다.
+/// 아래 legacy helper는 gate/remote/disk/disk_parse를 출력한다. schema 2의 종결 레코드는
+/// degraded/unknown 명령에도 이 접두사를 쓰되 구 소비자에게 확인된 최신 증거를 노출하지
+/// 않는다(pack_update_result). 디스크 판독 실패를 최신으로 해석하면 안 된다.
 pub const PACK_UPDATE_OUTCOME_PREFIX: &str = "PACK_UPDATE_OUTCOME";
 
 /// 토큰 값 정규화 — 공백·비ASCII 가 섞이면 줄 파싱이 깨지므로 안전 문자만 그대로, 빈 값은 `-`, 그 외 `?`.

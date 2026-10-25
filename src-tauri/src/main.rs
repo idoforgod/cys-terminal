@@ -8216,9 +8216,8 @@ async fn install_pack_update(
              (중복 주입 없음 · 지금 확인하려면 `cys reinject --role <역할> --check`)."
         )
     };
-    // 종료코드 구분: EXIT_REINJECT_DEGRADED = 디스크 팩은 반영됐으나 라이브 노드 reinject 실패
-    // (일부 미각성) — 디스크는 성공이므로 pack-updated를 emit하되 update-warning을 함께 띄운다.
-    // 그 외 비0 = 실제 실패(디스크 미반영) → 구 캐시 유지가 안전하므로 update-error만.
+    // Code 3 is command degradation, not proof of disk application. Code 4 remains B-492's
+    // separate contract: do not infer that every other nonzero means the disk was untouched.
     let degraded = out.status.code() == Some(cys::pack::EXIT_REINJECT_DEGRADED);
     if !out.status.success() && !degraded {
         // ★실패 — "pack-updated"는 emit하지 않는다(구 캐시 유지가 stale 갱신보다 안전). update-error만.
@@ -8227,6 +8226,25 @@ async fn install_pack_update(
             json!({"phase": "pack-update", "message": stderr.clone()}),
         );
         return Err(format!("pack-update 실패: {stderr}"));
+    }
+    let terminal = match required_pack_terminal(&stdout, out.status.code().unwrap_or(-1)) {
+        Ok(t) => Some(t),
+        Err(e) => {
+            let message = format!("팩 처리 결과를 확인하지 못했습니다: {e}. 성공으로 간주하지 않습니다.");
+            let _ = app.emit("update-error", message.clone());
+            return Err(message);
+        }
+    };
+    if let Some(record) = &terminal {
+        if record.action == cys::pack_update_result::PackAction::Validated {
+            return Err("검증-only 결과는 팩 설치 완료가 아닙니다".into());
+        }
+        if record.pending.incomplete() {
+            // NEW GUI keeps actual disk action separate from incomplete pending work. OLD GUI
+            // sees the producer's first-line conservative projection, with no legacy success proof.
+            let _ = app.emit("pack-incomplete", pack_incomplete_payload(record));
+            return Ok(record.disk.clone().unwrap_or_default());
+        }
     }
     // ★U9(0.14.41): CLI 가 반영 없이 끝났으면(UpToDate · no-op · exit 0) "완료"라고 말하지 않는다.
     //   종전에는 exit 0 이면 무조건 pack-updated → "✅ 팩 업데이트 완료"였다(보고서 R5). CLI UpToDate 는
@@ -8261,14 +8279,23 @@ async fn install_pack_update(
             return Ok(tok.disk);
         }
     }
-    // ★디스크 반영 성공(success 또는 degraded) — .pack-version을 읽어 새 팩 버전으로 브로드캐스트(§2-②/§7-③).
-    //   read_board_catalog가 pack_dir의 정적 파일을 읽는 것과 동일 SOT(pack_dir).
-    let pack_version = std::fs::read_to_string(cys::pack::pack_dir().join(".pack-version"))
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
+    // A missing contract must not fall through to "applied" merely because an old sidecar exited 0.
+    let Some(record) = &terminal else {
+        return Err("구 CLI가 팩 반영 여부를 증명하는 종결 계약을 제공하지 않았습니다. 상태를 다시 확인하세요.".into());
+    };
+    if record.action != cys::pack_update_result::PackAction::Applied {
+        return Err("팩 반영 결과와 종결 계약이 일치하지 않습니다".into());
+    }
+    let pack_version = record.remote.clone();
     // 사이드카 구조화 출력에서 reinject failed/deferred 집계 — 라이브 미각성을 사용자에게 경고.
     // ★U4-B2③ 3상 판독: 재주입 자체를 못 한 스킵을 (0,0)=완전 성공으로 읽지 않는다.
-    let reinject = parse_reinject_result(&stdout);
+    let reinject = if record.pending.skipped {
+        ReinjectResult::Skipped { reason: "daemon_rpc_failed".into() }
+    } else {
+        ReinjectResult::Measured {
+            failed: record.pending.failed, deferred: record.pending.deferred, unknown: record.pending.node_unknown,
+        }
+    };
     // ★(B-360 R2 revise) + `unknown` (directive may still land — not re-sent; the next pack-update checks it)
     let (failed, deferred, unknown) = match &reinject {
         ReinjectResult::Measured { failed, deferred, unknown } => (*failed, *deferred, *unknown),
@@ -8328,6 +8355,29 @@ async fn install_pack_update(
         }),
     );
     Ok(pack_version)
+}
+
+fn required_pack_terminal(stdout: &str, code: i32) -> Result<cys::pack_update_result::TerminalRecord, String> {
+    cys::pack_update_result::parse(stdout, code)?
+        .ok_or_else(|| "구 CLI가 필요한 팩 종결 계약을 제공하지 않았습니다; 반영·후속 처리 상태 미확인".into())
+}
+
+fn pack_incomplete_payload(record: &cys::pack_update_result::TerminalRecord) -> Value {
+    json!({
+        "pack_action": record.action.as_str(),
+        "pack_version": record.remote,
+        "disk_version": record.disk,
+        "remote_version": record.remote,
+        "disk_confirmed": record.freshness_confirmed(),
+        "pending_persist_failed": record.pending.persist_failed,
+        "intent_refused": record.pending.intent_refused,
+        "pending_unknown": record.pending.unknown,
+        "node_unknown": record.pending.node_unknown,
+        "reinject_skipped": record.pending.skipped,
+        "reinject_deferred": record.pending.deferred,
+        "pending_kept": record.pending.pending_kept,
+        "reinject_failed": record.pending.failed,
+    })
 }
 
 /// `cys pack-update` 의 no-op 결과 줄(`PACK_UPDATE_OUTCOME …` · 계약 = cys::pack::PACK_UPDATE_OUTCOME_PREFIX).
@@ -8904,6 +8954,10 @@ mod close_surface_tests;
 
 #[cfg(test)]
 mod tests {
+    mod b428_u9_legacy {
+        include!("pack_update_legacy_tests.rs");
+    }
+
     use super::*;
 
     /// ★K2-03(2026-09-17 한글 사용자명 감사) 회귀 핀: UTF-8 BOM 이 붙은 카탈로그/레지스트리를 판독한다.
@@ -12221,6 +12275,54 @@ exit 0
         let arm = &cli[u..e];
         assert!(arm.contains("pack_update_uptodate_line("), "CLI UpToDate 분기에 결과 토큰 줄 부재");
         assert!(arm.contains("return Ok(0);"), "CLI UpToDate 종료코드가 바뀌었다(0 유지 계약)");
+    }
+
+    #[test]
+    fn b428_u9_original_slice_anchors_select_the_real_command_once() {
+        let cli = include_str!("../../src/bin/cys.rs");
+        let command = cli.find("\nfn run_pack_update(").unwrap();
+        let end = command + 1 + cli[command + 1..].find("\nfn ").unwrap();
+        let opening = ["VersionGate::UpToDate => {", "\n                println!("].concat();
+        let starts: Vec<_> = cli.match_indices(&opening).map(|(at, _)| at).collect();
+        assert_eq!(starts.len(), 1, "U9 opening anchor is ambiguous or missing");
+        assert!(starts[0] > command && starts[0] < end, "U9 selected a decoy outside the command");
+        let body = &cli[command..end];
+        assert_eq!(body.matches("VersionGate::BinaryTooOld =>").count(), 1, "U9 closing anchor is ambiguous or missing");
+        let closing = command + body.find("VersionGate::BinaryTooOld =>").unwrap();
+        assert!(closing > starts[0], "U9 slice closes before its real terminal");
+    }
+
+    #[test]
+    fn b428_u9_new_gui_incomplete_payload_keeps_actual_disk_action() {
+        use cys::pack_update_result::{PackAction, PendingFacts, TerminalRecord};
+        for action in [PackAction::NoOp, PackAction::Applied] {
+            let record = TerminalRecord { action, code: 3, remote: "2.0.0".into(), disk: Some("2.0.0".into()),
+                pending: PendingFacts { persist_failed: true, ..Default::default() }, accepted_degraded: false };
+            let parsed = cys::pack_update_result::parse(&record.line().unwrap(), 3).unwrap().unwrap();
+            let payload = pack_incomplete_payload(&parsed);
+            assert_eq!(payload["pack_action"], action.as_str());
+            assert_eq!(payload["pending_persist_failed"], true);
+            assert_eq!(payload["disk_confirmed"], true, "disk fact does not erase incomplete command fact");
+            assert_eq!(payload["pending_unknown"], 0, "no fabricated unknown count to force an old warning");
+        }
+    }
+
+    #[test]
+    fn b428_u9_new_gui_rejects_missing_legacy_and_contradictory_sidecar_contracts() {
+        use cys::pack_update_result::{PackAction, PendingFacts, TerminalRecord};
+        let clean = TerminalRecord { action: PackAction::NoOp, code: 0, remote: "2.0.0".into(), disk: Some("2.0.0".into()), pending: PendingFacts::default(), accepted_degraded: false };
+        let degraded = TerminalRecord { code: 3, pending: PendingFacts { persist_failed: true, ..Default::default() }, ..clean.clone() };
+        let unknown = TerminalRecord { disk: None, ..clean.clone() };
+        for r in [&clean, &degraded, &unknown] {
+            assert_eq!(required_pack_terminal(&r.line().unwrap(), r.code).unwrap(), *r);
+        }
+        for old in ["", "PACK_UPDATE_RESULT failed=0 deferred=0", "PACK_UPDATE_OUTCOME gate=up-to-date remote=2.0.0 disk=2.0.0 disk_parse=ok"] {
+            assert!(required_pack_terminal(old, 0).is_err(), "old producer cannot establish schema2: {old}");
+            assert!(required_pack_terminal(old, 3).is_err());
+        }
+        assert!(required_pack_terminal(&clean.line().unwrap(), 3).is_err());
+        assert!(required_pack_terminal(&degraded.line().unwrap(), 0).is_err());
+        assert!(required_pack_terminal(&unknown.line().unwrap(), 3).is_err());
     }
 
     #[test]

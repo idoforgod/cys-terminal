@@ -6,6 +6,7 @@ import {
   packFromBackend,
   packAfterInstalled,
   packAfterUpToDate,
+  packAfterIncomplete,
   binActionable,
   packActionable,
   deriveUpdateView,
@@ -19,6 +20,13 @@ import {
 // 다시 나올 수 없음을 고정한다 — '최신'은 본체·팩 두 확인이 **모두 성공**했을 때만 나온다.
 
 const T = (ms: number) => `T${ms}`;
+
+test("incomplete command keeps independently established disk facts, never guesses them", () => {
+  expect(packAfterIncomplete({ pack_action: "applied", pack_version: "2.0.0" }, 1)).toEqual({ s: "none", disk: "2.0.0", remote: "2.0.0", at: 1 });
+  expect(packAfterIncomplete({ pack_action: "no-op", disk_confirmed: true, disk_version: "2.0.0", remote_version: "2.0.0" }, 1).s).toBe("none");
+  expect(packAfterIncomplete({ pack_action: "no-op", disk_confirmed: false }, 1).s).toBe("disk-unknown");
+  expect(packAfterIncomplete({}, 1).s).toBe("disk-unknown");
+});
 const at = 1000;
 
 const BINS: BinComp[] = [

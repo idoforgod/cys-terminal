@@ -252,6 +252,37 @@ export interface PackUpdatedPayload {
   reinject_skipped?: boolean; // ★U4-B2③ 재주입 자체를 못 함 — '완료' 단정 금지
 }
 
+export interface PackIncompletePayload {
+  pack_action?: string;
+  pack_version?: string;
+  disk_version?: string;
+  remote_version?: string;
+  disk_confirmed?: boolean;
+  pending_persist_failed?: boolean;
+  intent_refused?: number;
+  pending_unknown?: number;
+  node_unknown?: number;
+  reinject_skipped?: boolean;
+  reinject_deferred?: number;
+  pending_kept?: number;
+  reinject_failed?: number;
+}
+
+/** Never calls a degraded command complete, or claims an already applied pack was not applied. */
+export function packIncompleteToast(p: PackIncompletePayload): { title: string; body: string } {
+  const action = p.pack_action === "applied"
+    ? `팩 ${version(p.pack_version)}은 디스크에 반영됐습니다.`
+    : p.pack_action === "no-op" ? "이번 실행에서 팩을 교체하지 않았습니다." : "팩 반영 여부를 확인하지 못했습니다.";
+  const reasons: string[] = [];
+  if (p.pending_persist_failed === true) reasons.push("대기 기록을 저장하지 못했습니다.");
+  if ((p.intent_refused ?? 0) > 0) reasons.push("영속 의도를 기록하지 못한 지침 입력은 보내지 않았습니다.");
+  if ((p.pending_unknown ?? 0) > 0 || (p.node_unknown ?? 0) > 0) reasons.push("일부 지침의 도달 여부가 미확인입니다. 확인 없이 다시 보내지 않습니다.");
+  if (p.reinject_skipped === true) reasons.push("라이브 노드 재주입을 하지 못했습니다.");
+  if ((p.reinject_failed ?? 0) > 0 || (p.reinject_deferred ?? 0) > 0 || (p.pending_kept ?? 0) > 0) reasons.push("실패하거나 보류된 지침 처리가 남아 있습니다.");
+  if (!reasons.length) reasons.push("후속 처리 결과를 확인하지 못했습니다.");
+  return { title: "팩 후속 처리 미완료", body: `${action} ${reasons.join(" ")} 성공으로 간주하지 않습니다.` };
+}
+
 /**
  * 팩 디스크 반영 뒤 사람에게 보이는 결과 토스트의 제목·본문(문구만 — 띄우는 일은 main.ts 의 `pack-updated` 리스너가 한다).
  *  · 재주입을 못 했으면(skipped) · 일부가 실패·보류·**도달 미확인**이면 "업데이트 완료"·"reinject 완료"라고 말하지 않는다 —
