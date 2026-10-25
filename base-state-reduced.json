@@ -1,0 +1,22 @@
+{
+  "versions": {
+    "known": false,
+    "value": null,
+    "error": "CDP result incomplete"
+  },
+  "daemon": {
+    "known": true,
+    "value": true,
+    "error": null
+  },
+  "pack": {
+    "known": true,
+    "value": false,
+    "error": null,
+    "version": null,
+    "state": null,
+    "manifest": null,
+    "files": [],
+    "reason": "missing metadata: .pack-state.json"
+  }
+}

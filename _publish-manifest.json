@@ -1,0 +1,116 @@
+{
+  "generated": "2026-10-25T07:46:34.847Z",
+  "repository": "idoforgod/cys-terminal",
+  "run_id": "40173384370",
+  "run_attempt": "1",
+  "run_url": "https://github.com/idoforgod/cys-terminal/actions/runs/40173384370",
+  "job": "winmeasure-R1",
+  "os": "windows-2025",
+  "branch": "diag-results/40173384370-1-winmeasure-R1-windows-2025",
+  "node": "v22.23.4",
+  "files": [
+    {
+      "path": "base-184b2e95d6f8406b8b06183ba0befa8d-cdp.json",
+      "bytes": 1155
+    },
+    {
+      "path": "base-323d60245b1d470c8a56ff0b8ccf1163-cdp.json",
+      "bytes": 1155
+    },
+    {
+      "path": "base-4ba65217e1ed4db9a841089828254cd1-cdp.json",
+      "bytes": 1155
+    },
+    {
+      "path": "base-b7cf49d4141a4f3c97c37193f1070903-cdp.json",
+      "bytes": 1155
+    },
+    {
+      "path": "base-c7f60d1765cf488ea58f4871ffc53452-cdp.json",
+      "bytes": 1155
+    },
+    {
+      "path": "base-logs.json",
+      "bytes": 1474
+    },
+    {
+      "path": "base-raw-state.json",
+      "bytes": 10364
+    },
+    {
+      "path": "base-state-reduced.json",
+      "bytes": 380
+    },
+    {
+      "path": "base-state.json",
+      "bytes": 693
+    },
+    {
+      "path": "build-metadata.json",
+      "bytes": 25532
+    },
+    {
+      "path": "cells.json",
+      "bytes": 515
+    },
+    {
+      "path": "evidence-receipts.json",
+      "bytes": 1821
+    },
+    {
+      "path": "input-lock.json",
+      "bytes": 666
+    },
+    {
+      "path": "job-start.txt",
+      "bytes": 24
+    },
+    {
+      "path": "log-coverage.json",
+      "bytes": 156
+    },
+    {
+      "path": "log-win-measure.txt",
+      "bytes": 115
+    },
+    {
+      "path": "logs-base/00000.log",
+      "bytes": 123
+    },
+    {
+      "path": "logs-base/00001.log",
+      "bytes": 1737
+    },
+    {
+      "path": "mandatory-artifacts.json",
+      "bytes": 1689
+    },
+    {
+      "path": "measurement.json",
+      "bytes": 14719
+    },
+    {
+      "path": "permit.json",
+      "bytes": 848
+    },
+    {
+      "path": "SHA256SUMS",
+      "bytes": 2187
+    },
+    {
+      "path": "verdict.json",
+      "bytes": 179
+    },
+    {
+      "path": "winmeasure-citool-lp-initial.json",
+      "bytes": 1972
+    },
+    {
+      "path": "winmeasure-state-initial.json",
+      "bytes": 1465
+    }
+  ],
+  "skipped": [],
+  "inline_files": 24,
+  "blob_files": 1
+}

@@ -1,0 +1,16 @@
+{
+    "reading":  "R1",
+    "plan_sha256":  "ddf2c693c7e93598593a3f06c7c2e77aa8dd8b538efe5baf64fec9bdc8c3ee44",
+    "base_url":  "https://github.com/idoforgod/cys-terminal/releases/download/v0.14.52/cys_0.14.52_x64-setup.exe",
+    "base_sha256":  "03600fd511f44bb79dc24b212978a27a30c255e6de8499f624340dacd227cec7",
+    "candidate_name":  "cys_0.14.53_x64-setup.exe",
+    "candidate_sha256":  "547d0c1aa2ec44962e0a35fd59078a050699b67d2b037d393587f54124eb64cc",
+    "product_sha":  "4bfc2443b2961acb82a8d1fc27cb5e5c783fd6da",
+    "run_id":  40140409094,
+    "run_attempt":  1,
+    "artifact_id":  12579276542,
+    "artifact_name":  "cys-windows-x64-nsis",
+    "base_path":  "D:\\a\\_temp\\diag-work\\base.exe",
+    "candidate_path":  "D:\\a\\_temp\\candidate\\cys-windows-x64-nsis\\cys_0.14.53_x64-setup.exe",
+    "authorized":  true
+}

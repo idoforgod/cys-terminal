@@ -1,0 +1,60 @@
+{
+  "required": [
+    "measurement.json",
+    "input-lock.json",
+    "permit.json",
+    "build-metadata.json",
+    "base-state.json",
+    "base-raw-state.json",
+    "base-logs.json",
+    "cells.json",
+    "log-coverage.json"
+  ],
+  "records": {
+    "measurement.json": {
+      "sha256": "977a63073ab2dbb950769026ae0c4367eb4bf1ceea9b7531ea4dcdb997bcc211",
+      "bytes": 14719,
+      "format": "json"
+    },
+    "input-lock.json": {
+      "sha256": "75a1bac10a0eea72040fbcb2f19ba38ad2194564ed9ec77c4854e3722366cff3",
+      "bytes": 666,
+      "format": "json"
+    },
+    "permit.json": {
+      "sha256": "a931751dfabecb387f8b7e03063e442b1463c0ee67aa7427c69ba0c064f049a4",
+      "bytes": 848,
+      "format": "json"
+    },
+    "build-metadata.json": {
+      "sha256": "f99bd8c19c863429e6ff63beb52bdff08f662dba5cfa16aae18f0ad3600352f2",
+      "bytes": 25532,
+      "format": "json"
+    },
+    "base-state.json": {
+      "sha256": "fe65331fcca678c85a0c1026cd7b190a4d632ca7fb8c1437737e8ffe2c1ebd91",
+      "bytes": 693,
+      "format": "json"
+    },
+    "base-raw-state.json": {
+      "sha256": "d29d223ae210a519c5be6b243c2cd8c6a0af60614fb6dba68626b95ed065a058",
+      "bytes": 10364,
+      "format": "json"
+    },
+    "base-logs.json": {
+      "sha256": "285907951be941044447184d7c1a14c3748e91cc4a3d31c402fe6103f7e00a66",
+      "bytes": 1474,
+      "format": "json"
+    },
+    "cells.json": {
+      "sha256": "287e622235e96ac48fc3cfbc34d6f01eef612cb68984ffbd6f73073be239889e",
+      "bytes": 515,
+      "format": "json"
+    },
+    "log-coverage.json": {
+      "sha256": "6ff61ac536a55f442e94ddaef5f02ed71f012f7bfe9dac0dfa4ef6901b3d9ab1",
+      "bytes": 156,
+      "format": "json"
+    }
+  }
+}

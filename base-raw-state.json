@@ -1,0 +1,207 @@
+{
+    "expected":  "0.14.52",
+    "images":  {
+                   "cys-app.exe":  {
+                                       "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys-app.exe",
+                                       "version":  "0.14.52",
+                                       "sha256":  "6F7902208B9ED4F187E967D45155352330B0925C51C44589195E6FAE62F95DCA",
+                                       "signature":  "NotSigned"
+                                   },
+                   "cys.exe":  {
+                                   "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe",
+                                   "version":  "0.14.52",
+                                   "sha256":  "6625F51D8CACB71BC30F7194918ACA132E735001D5C59F14C231E283857BE8BA",
+                                   "signature":  "NotSigned"
+                               },
+                   "cysd.exe":  {
+                                    "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cysd.exe",
+                                    "version":  "0.14.52",
+                                    "sha256":  "8AF3D2DA6948149BC0863961551ADA3A21F1886D6C3965C7CB7B412B88D3FEE9",
+                                    "signature":  "NotSigned"
+                                }
+               },
+    "marker":  "0.14.52",
+    "failure_file":  false,
+    "cli":  {
+                "file":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe",
+                "args":  "--version",
+                "pid":  5196,
+                "started_epoch":  1792914326.412,
+                "ended_epoch":  1792914326.438,
+                "stdout_complete":  true,
+                "stderr_complete":  true,
+                "stdout_error":  null,
+                "stderr_error":  null,
+                "stdout_truncated":  false,
+                "stderr_truncated":  false,
+                "stdout_bytes":  "Y3lzIDAuMTQuNTIK",
+                "stderr_bytes":  "",
+                "rc":  0,
+                "timedOut":  false,
+                "startError":  null,
+                "out":  "cys 0.14.52\n",
+                "err":  "",
+                "ms":  26,
+                "pipes_not_drained":  false
+            },
+    "daemon_binary":  {
+                          "file":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cysd.exe",
+                          "args":  "--version",
+                          "pid":  7520,
+                          "started_epoch":  1792914326.438,
+                          "ended_epoch":  1792914326.454,
+                          "stdout_complete":  true,
+                          "stderr_complete":  true,
+                          "stdout_error":  null,
+                          "stderr_error":  null,
+                          "stdout_truncated":  false,
+                          "stderr_truncated":  false,
+                          "stdout_bytes":  "Y3lzZCAwLjE0LjUyIChidWlsZCBmMGFjM2IwYzhmYjApCg==",
+                          "stderr_bytes":  "",
+                          "rc":  0,
+                          "timedOut":  false,
+                          "startError":  null,
+                          "out":  "cysd 0.14.52 (build f0ac3b0c8fb0)\n",
+                          "err":  "",
+                          "ms":  14,
+                          "pipes_not_drained":  false
+                      },
+    "ping":  {
+                 "file":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe",
+                 "args":  "ping",
+                 "pid":  1752,
+                 "started_epoch":  1792914326.512,
+                 "ended_epoch":  1792914326.555,
+                 "stdout_complete":  true,
+                 "stderr_complete":  true,
+                 "stdout_error":  null,
+                 "stderr_error":  null,
+                 "stdout_truncated":  false,
+                 "stderr_truncated":  false,
+                 "stdout_bytes":  "cG9uZwo=",
+                 "stderr_bytes":  "",
+                 "rc":  0,
+                 "timedOut":  false,
+                 "startError":  null,
+                 "out":  "pong\n",
+                 "err":  "",
+                 "ms":  42,
+                 "pipes_not_drained":  false
+             },
+    "identify":  {
+                     "file":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe",
+                     "args":  "identify",
+                     "pid":  688,
+                     "started_epoch":  1792914326.557,
+                     "ended_epoch":  1792914326.585,
+                     "stdout_complete":  true,
+                     "stderr_complete":  true,
+                     "stdout_error":  null,
+                     "stderr_error":  null,
+                     "stdout_truncated":  false,
+                     "stderr_truncated":  false,
+                     "stdout_bytes":  "ewogICJjYWxsZXIiOiBudWxsLAogICJkYWVtb25fcGlkIjogNTQ0OCwKICAibGF0ZXN0X3NlcSI6IDQsCiAgInNvY2tldF9wYXRoIjogIlxcXFwuXFxwaXBlXFxjeXMiLAogICJzdGFydGVkX2F0IjogMTc5MjkxNDA3Mi43MDE1ODksCiAgInN1cmZhY2VfY291bnQiOiAxLAogICJ2ZXJzaW9uIjogIjAuMTQuNTIiCn0K",
+                     "stderr_bytes":  "",
+                     "rc":  0,
+                     "timedOut":  false,
+                     "startError":  null,
+                     "out":  "{\n  \"caller\": null,\n  \"daemon_pid\": 5448,\n  \"latest_seq\": 4,\n  \"socket_path\": \"\\\\\\\\.\\\\pipe\\\\cys\",\n  \"started_at\": 1792914072.701589,\n  \"surface_count\": 1,\n  \"version\": \"0.14.52\"\n}\n",
+                     "err":  "",
+                     "ms":  30,
+                     "pipes_not_drained":  false,
+                     "data":  {
+                                  "caller":  null,
+                                  "daemon_pid":  5448,
+                                  "latest_seq":  4,
+                                  "socket_path":  "\\\\.\\pipe\\cys",
+                                  "started_at":  1792914072.701589,
+                                  "surface_count":  1,
+                                  "version":  "0.14.52"
+                              }
+                 },
+    "cim":  {
+                "known":  true,
+                "daemons":  [
+                                {
+                                    "ProcessId":  5448,
+                                    "ExecutablePath":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cysd.exe",
+                                    "CreationDate":  "\/Date(1792914063677)\/"
+                                }
+                            ],
+                "apps":  [
+                             {
+                                 "ProcessId":  1988,
+                                 "ExecutablePath":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys-app.exe",
+                                 "CreationDate":  "\/Date(1792914060406)\/"
+                             }
+                         ]
+            },
+    "app":  {
+                "known":  false,
+                "value":  null,
+                "error":  "CDP result incomplete",
+                "data":  {
+                             "script":  "cdp-update.mjs",
+                             "node":  "v22.23.4",
+                             "mode":  "uipre",
+                             "port":  9333,
+                             "started":  "2026-10-25T07:45:26.682Z",
+                             "finished":  "2026-10-25T07:46:26.878Z",
+                             "has_native_websocket":  true,
+                             "ws_impl":  null,
+                             "has_fetch":  true,
+                             "targets":  null,
+                             "chosen_target":  null,
+                             "attached":  false,
+                             "tauri_global":  null,
+                             "page_info":  null,
+                             "app_version":  null,
+                             "check_update":  null,
+                             "check_update_error":  null,
+                             "listeners":  null,
+                             "install_update_started_at":  null,
+                             "install_update_outcome":  null,
+                             "socket_closed_at":  null,
+                             "events":  {
+                                            "total":  0,
+                                            "progress_count":  0,
+                                            "progress_first":  null,
+                                            "progress_last":  null,
+                                            "non_progress":  [
+
+                                                             ]
+                                        },
+                             "steps":  [
+                                           {
+                                               "t":  "2026-10-25T07:45:26.684Z",
+                                               "name":  "start",
+                                               "argv":  "--mode uipre --ready-wait-sec 30 --port 9333 --out D:\\a\\_temp\\diag-out --prefix base-c7f60d1765cf488ea58f4871ffc53452 --max-wait-sec 30",
+                                               "native_websocket":  true
+                                           },
+                                           {
+                                               "t":  "2026-10-25T07:46:26.877Z",
+                                               "name":  "targets",
+                                               "count":  0,
+                                               "pages":  0
+                                           }
+                                       ],
+                             "errors":  [
+
+                                        ],
+                             "error_summary":  "no page target on the debugging port"
+                         }
+            },
+    "pack":  {
+                 "known":  true,
+                 "value":  false,
+                 "error":  null,
+                 "version":  null,
+                 "state":  null,
+                 "manifest":  null,
+                 "files":  [
+
+                           ],
+                 "reason":  "missing metadata: .pack-state.json"
+             },
+    "error":  null
+}

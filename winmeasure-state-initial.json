@@ -1,0 +1,43 @@
+{
+    "tag":  "initial",
+    "time":  "2026-10-25T07:40:06.271Z",
+    "language_mode":  "FullLanguage",
+    "registry":  {
+                     "rc":  1,
+                     "out":  "ERROR: The system was unable to find the specified registry key or value.",
+                     "present":  false,
+                     "value":  null
+                 },
+    "citool":  {
+                   "rc":  0,
+                   "json_parsed":  true,
+                   "error":  null,
+                   "desktop_policy":  null,
+                   "enforced_names":  [
+
+                                      ],
+                   "verified_and_reputable":  [
+
+                                              ]
+               },
+    "defender":  {
+                     "SmartAppControlState":  "Off",
+                     "SmartAppControlExpiration":  null,
+                     "AMRunningMode":  "Normal",
+                     "RealTimeProtectionEnabled":  false
+                 },
+    "ci_state":  {
+                     "raw":  "native helper not ready",
+                     "options_hex":  null,
+                     "flags":  [
+
+                               ]
+                 },
+    "signals":  {
+                    "registry_is_1":  false,
+                    "citool_desktop_enforced":  false,
+                    "defender_on":  false,
+                    "umci_flag":  false
+                },
+    "enforced":  false
+}

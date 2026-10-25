@@ -1,0 +1,7 @@
+{
+  "complete": false,
+  "tracebacks": null,
+  "errors": [
+    "ENOENT: no such file or directory, open 'D:\\a\\_temp\\diag-out\\log-inventory.json'"
+  ]
+}
