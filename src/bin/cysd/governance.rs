@@ -25438,6 +25438,92 @@ mod tests {
             .expect("clock too young for backdate");
     }
 
+    /// ★D-R2-3 상설 덤프 — ★실패 경로에서만 찍는다(통과 때 출력 0 ⇒ 로그 비용 0).
+    ///
+    /// ★왜 이 칸들인가: `shell_alive` 와 `exited` ★두 칸이 ★축 A/B 를 가른다(맥 실측 2026-10-26 ·
+    /// `state/worker-4/p2a-r2-discriminator/20261026T074007Z/REPORT.md`).
+    ///   · ★축 A(**제품** · 벽시계 역행이 G4 `now - last >= idle_debounce` 를 누른다):
+    ///     `last_idle_alert` 를 ★+10~20µs 미래로 심으면 `master.idle` 이 3 → ★**2** 가 되는데,
+    ///     그때 ★**전 틱이 `shell_alive=true` · `exited=false` 를 유지**한다.
+    ///     ★양성 서명은 ★**`now-last` 가 음수인 틱**이다(맥 실측: 그 틱의 `verdict=(미발행)` ·
+    ///     `now-last=-0.999983` · `exited=false`) — ⛔「B 가 아니다」가 아니라 ★A 자신의 지문이다.
+    ///   · ★축 B(**하네스** · fixture 자식(`sleep 30`)이 틱 ★사이에 죽는다):
+    ///     `master.idle` 이 ★**2** 에서 멈추는 ★그 틱에서 ★**`exited=true`**(또는 `shell_alive=false`)가 된다.
+    ///     ★맥 실측: 그 틱의 `now-last=+0.205218`(★양수) · `exited=true` · `shell_alive` 는 아직 `true`
+    ///     였다 ⇒ ⛔`shell_alive` 단독으로 B 를 판정하지 마라 — ★`exited` 가 B 의 1차 지문이다.
+    ///   ⇒ ★두 서명이 다르므로, ★다음 발화의 덤프 하나로 제품/하네스가 갈린다 —
+    ///     ⛔Windows 런을 기다리되 ★사람이 같은 질문을 다시 하지 않는다(간헐에 기대지 않는 측정).
+    /// ★`verdict` 칸은 ★제품이 스스로 발행한 이벤트로 적는다(⛔테스트가 판정을 재구성하지 않는다):
+    /// `master.idle` 이 1 늘면 `Idle` · `master.deadman` 이 1 늘면 `Dead:<axis>` · 둘 다 그대로면 `(미발행)`.
+    /// ★`now`·`last` 는 `now_epoch()`(= `SystemTime` · ⛔**단조 아님**)이고 `idle_secs` 는 `Instant` 다 —
+    /// 그 비대칭이 축 A 의 전제다. 같은 가족의 다른 deadman 검체도 ★같은 세 줄로 붙일 수 있다
+    /// (`new` → 틱마다 `after_tick` → 개수 단언을 `expect` 로).
+    struct DeadmanTickTrace {
+        role: String,
+        rows: Vec<String>,
+        idle: usize,
+        dead: usize,
+    }
+    impl DeadmanTickTrace {
+        fn new(role: &str) -> Self {
+            Self { role: role.to_string(), rows: Vec::new(), idle: 0, dead: 0 }
+        }
+        /// 한 틱을 돈 ★직후에 부른다.
+        fn after_tick(
+            &mut self,
+            daemon: &Arc<Daemon>,
+            s: &crate::state::Surface,
+            tracker: &DeadmanTracker,
+        ) {
+            let idles = events_named(daemon, "master.idle");
+            let deads = events_named(daemon, "master.deadman");
+            let verdict = if idles.len() > self.idle {
+                "Idle".to_string()
+            } else if deads.len() > self.dead {
+                format!(
+                    "Dead:{}",
+                    deads.last().and_then(|e| e["payload"]["axis"].as_str()).unwrap_or("?")
+                )
+            } else {
+                "(미발행)".to_string()
+            };
+            self.idle = idles.len();
+            self.dead = deads.len();
+            let now = now_epoch();
+            let last = tracker.last_idle_alert.get(&self.role).copied().unwrap_or(0.0);
+            self.rows.push(format!(
+                "  틱{:>2} verdict={:<12} now={:.6} last={:.6} now-last={:+.6}                  shell_alive={:<5} exited={:<5} seat_cache={} idle누적={} deadman누적={}",
+                self.rows.len() + 1,
+                verdict,
+                now,
+                last,
+                now - last,
+                crate::state::pid_alive(s.pid),
+                s.exited.load(AtomicOrdering::Relaxed),
+                s.seat_cache.load(AtomicOrdering::Relaxed),
+                self.idle,
+                self.dead,
+            ));
+        }
+        /// 개수 단언을 이 함수로 감싼다 — ★어긋날 때만 덤프를 찍고, 그 다음 ★원래 단언이 패닉한다
+        /// (⇒ CI 의 패닉 메시지 모양은 ⛔바뀌지 않는다 · 덤프는 그 앞줄에 남는다).
+        fn expect(&self, got: usize, want: usize, what: &str) {
+            if got != want {
+                println!(
+                    "★D-R2-3 덤프(role={} · 틱 {}개) — 판별: 전 틱 shell_alive=true∧exited=false ⇒ 축 A(제품·벽시계) · \
+idle 이 멈춘 틱에서 exited=true∨shell_alive=false ⇒ 축 B(하네스·자식 사망)",
+                    self.role,
+                    self.rows.len()
+                );
+                for r in &self.rows {
+                    println!("{r}");
+                }
+            }
+            assert_eq!(got, want, "{what}");
+        }
+    }
+
+
     /// [핀1·결함 8 박제 — 순수 판정자 진리표] 침묵은 어떤 좌석 상태에서도 Idle 로만 사상되고
     /// DeadCandidate 가 될 수 없다. 실측 시나리오(임계 20s·침묵 21s의 살아있는 zsh) 그대로.
     #[test]
@@ -25553,17 +25639,19 @@ mod tests {
         let (daemon, sid) = deadman_daemon("silence");
         let s = daemon.get_surface(sid).unwrap();
         let mut tracker = DeadmanTracker::default();
+        let mut trace = DeadmanTickTrace::new("master");
         for _ in 0..5 {
             backdate_output(&s, 21);
             check_role_deadman(&daemon, &mut tracker);
+            trace.after_tick(&daemon, &s, &tracker);
         }
-        assert_eq!(
+        trace.expect(
             events_named(&daemon, "master.deadman").len(),
             0,
-            "침묵 단독으로 death 발화 — 결함 8 재발"
+            "침묵 단독으로 death 발화 — 결함 8 재발",
         );
         let idles = events_named(&daemon, "master.idle");
-        assert_eq!(idles.len(), 1, "idle 은 정보성 1건(300s 디바운스)이어야");
+        trace.expect(idles.len(), 1, "idle 은 정보성 1건(300s 디바운스)이어야");
         let e = &idles[0];
         assert_eq!(e["category"], "info", "GUI category 폴백 토스트 레인(watchdog) 낙하 금지");
         let p = &e["payload"];
@@ -25752,20 +25840,23 @@ mod tests {
         let (daemon, sid) = deadman_daemon("secs-zero");
         let s = daemon.get_surface(sid).unwrap();
         let mut tracker = DeadmanTracker::default();
+        let mut trace = DeadmanTickTrace::new("master");
         for _ in 0..4 {
             backdate_output(&s, 1000);
             check_role_deadman(&daemon, &mut tracker);
+            trace.after_tick(&daemon, &s, &tracker);
         }
-        assert_eq!(events_named(&daemon, "master.idle").len(), 0, "0 = idle 비활성");
-        assert_eq!(events_named(&daemon, "master.deadman").len(), 0);
+        trace.expect(events_named(&daemon, "master.idle").len(), 0, "0 = idle 비활성");
+        trace.expect(events_named(&daemon, "master.deadman").len(), 0, "0 = death 미발화");
         s.exited.store(true, AtomicOrdering::Relaxed);
         for _ in 0..3 {
             check_role_deadman(&daemon, &mut tracker);
+            trace.after_tick(&daemon, &s, &tracker);
         }
-        assert_eq!(
+        trace.expect(
             events_named(&daemon, "master.deadman").len(),
             1,
-            "0 이어도 진짜 사망(surface exited)은 발화해야(fail-closed)"
+            "0 이어도 진짜 사망(surface exited)은 발화해야(fail-closed)",
         );
     }
 
@@ -25929,12 +26020,14 @@ mod tests {
         let (daemon, sid) = deadman_daemon("idle-knob");
         let s = daemon.get_surface(sid).unwrap();
         let mut tracker = DeadmanTracker::default();
+        let mut trace = DeadmanTickTrace::new("master");
         for _ in 0..3 {
             backdate_output(&s, 21);
             check_role_deadman(&daemon, &mut tracker);
+            trace.after_tick(&daemon, &s, &tracker);
         }
         let idles = events_named(&daemon, "master.idle");
-        assert_eq!(idles.len(), 3, "idle 디바운스 0 = 매 틱 발화(death 노브와 독립)");
+        trace.expect(idles.len(), 3, "idle 디바운스 0 = 매 틱 발화(death 노브와 독립)");
         assert_eq!(idles[0]["payload"]["debounce_secs"], 0, "payload 는 idle 전용 노브 값");
         assert_eq!(events_named(&daemon, "master.deadman").len(), 0);
     }
