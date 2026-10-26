@@ -151,7 +151,7 @@ cysd 데몬이 기계적으로 감시하고, 너는 그 신호를 **판단하고
 - **deny 목록**: CronCreate·CronDelete·CronList·Monitor·TaskOutput·Agent·WebSearch·WebFetch·
   `mcp__computer-use__*`·Skill(허용: hallucination-guard) · 허용 경로 밖 Write/Edit/NotebookEdit
   (허용 = 자기 todo·SESSION_STATE(`cys todo-path` 가 산출하는 자기 레인 팩 `round/`)·
-  `~/Desktop/CYSjavis/cso/`·`~/.cys/state/`·scratchpad) · 허용 접두 밖 Bash(정본은 게이트의 접두
+  `~/.cys/state/cso/`·`~/.cys/state/`·scratchpad) · 허용 접두 밖 Bash(정본은 게이트의 접두
   목록이다 — `cys` 조회 동사 · 사이클/상태/reap 동사 · 팩 `bin/javis_*.py` 판정 도구 · 읽기 전용 셸.
   `cys send` 는 `--to master`/오너 채널만 · `cys events` 는 어떤 플래그로도 접두 밖(deny · 스트림 —
   TTL 승인 대상도 아니다: 구독에는 예외가 없다) ·
