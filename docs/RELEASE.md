@@ -567,7 +567,7 @@ gh release create v0.2.0 --draft --title "cys 0.2.0" --notes-file docs/RELEASE_N
 - [ ] DMG에서 설치 → 앱 실행 → `cys status` 동작
 - [ ] 버전 문자열 **8곳(수동 6 + `Cargo.lock` 2패키지)** 일치 — `sh scripts/version-check.sh vX.Y.Z` rc=0
 - [ ] **★Windows 스마트 앱 컨트롤(SAC) 고지 — 0.14.53 WP12 · 오너 상시 규칙 OWNER-20261023-WIN-SAC-STANDING-CHECK**
-      0.14.54 는 Windows 서명이 잠든 판이다(오너 자격증명 없음). 정직한 고지가 기계로 강제된다:
+      이 판은 Windows 서명이 잠든 판이다(오너 자격증명 없음). 정직한 고지가 기계로 강제된다:
       · 드래프트 본문을 손으로 고칠 때 `<!-- cys-win-sac: unsigned -->` 마커 **1개**와 두 핵심 문구
         (`scripts/release-verify.py` 의 `SAC_KEY_PHRASES`, 한국어·영어)를 지우지 않는다. 문면 정본 = `release.yml` `releaseBody`.
       · 공개 직전 `release-publish.yml` 이 본문을 `$RUNNER_TEMP/release-body.txt` 로 받아 `release-verify.py --body-file` 8단계로
