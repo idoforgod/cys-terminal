@@ -161,8 +161,12 @@ jobs:
           python3 scripts/copy-drift-check.py --self-test
 
       # ★두 축 모두 ★fail-closed 다 — 2026-10-26 에 허용 ref 단언까지 ★치명으로 올렸다.
-      #   ⒜ **드리프트 비교**(감시 6종) = ★fail-closed(처음부터). 그 축은 측정됐다
-      #      (자기시험 40/40 · 실제 빨강 · 실제 초록 · 1바이트 민감도 전부 실측).
+      #   ⒜ **드리프트 비교**(감시 목록 전수) = ★fail-closed(처음부터). 그 축은 측정됐다
+      #      (자기시험 · 실제 빨강 · 실제 초록 · 1바이트 민감도 전부 실측).
+      #      ⛔**개수를 이 주석에 적지 않는다** — 감시 종수도 자기시험 칸수도 ★코드가 바뀌면
+      #      썩고, 썩은 라벨은 사람이 다시 보지 않는다(2026-10-26 에 이 저장소가 실제로 그렇게
+      #      냈다: 목록이 5→6 인데 도움말 둘이 「5종」에 멈춰 있었다). ★분모는 ★실행 출력이
+      #      스스로 적는다 — 「감시 경로 분모 : N」 과 「self-test N/N PASS」.
       #   ⒝ **허용 ref 단언** = ★`--policy-mode fatal`. ⛔**경고로 시작했고 올렸다**:
       #      ★왜 경고였나 — `GITHUB_TOKEN`(이 잡 권한 `contents: read`)이
       #      `GET /environments/release-production/deployment-branch-policies` 에 도달하는지가
