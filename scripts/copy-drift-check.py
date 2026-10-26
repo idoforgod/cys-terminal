@@ -70,12 +70,17 @@ BASELINE_DEFAULT = "main"
 #     불가 ⇒ `push` 발화로 우회하는 **집행 비용을 이미 물린** 같은 결함이다.
 #   ⛔`scripts/version-check.sh` 는 대상이 아니다 — 발행 레인은 그 파일을 **태그 트리**에서
 #     읽으므로 main 의 사본은 이 레인에서 영원히 실행되지 않는다.
+#   여섯째 = **이 파일 자신**(부서장 판정 2026-10-26 §2). 사유: `copy-drift-watch.yml`(일일 감시)는
+#     **main 사본**의 이 스크립트를 쓴다 ⇒ main 쪽이 낡으면 ★엉뚱한 목록으로 초록을 낸다
+#     = 조용한 실패. ⇒ 그래서 ★목록은 길이만이 아니라 **경로 문자열 전수**로 자기시험이 단언한다
+#     (⛔`len == N` 만 보면 N 개가 **다른 N 개**로 바뀌어도 통과한다).
 WATCHED_PATHS = [
     ".github/workflows/release-publish.yml",
     "scripts/release-verify.py",
     "scripts/tests/test_release_verify.py",
     ".github/workflows/release.yml",
     ".github/workflows/release-postprocess.yml",
+    "scripts/copy-drift-check.py",
 ]
 
 # ★`release-production` 환경의 배포 분기 정책 — 저장소 밖 config 를 저장소 안에서 단언한다.
@@ -86,6 +91,27 @@ EXPECTED_POLICIES = {
     ("feat/bootstrap-identity-hardening", "branch"),
     ("v*", "tag"),
 }
+
+# ★정책 단언의 치명도 — **경고로 시작한다**(부서장 판정 2026-10-26 §1⒥).
+#   사유 셋:
+#     ⓐ ★「측정 불능은 통과도 실패도 아니다」 — `GITHUB_TOKEN`(job 권한 `contents: read`)이
+#        `GET /environments/<env>/deployment-branch-policies` 에 ★도달하는지가 **미측정이다**
+#        (2026-10-26 기준). 문서는 「Anyone with read access」라 하고 이 저장소는 public 이라
+#        될 것으로 보지만 ★그건 추론이다 — 성공시켜 본 호출은 **호스트 PAT** 였고 그 사례는
+#        GITHUB_TOKEN 의 도달을 증명하지 않는다.
+#     ⓑ 403 이면 fail-closed 가 ★**모든 릴리스를 막는다** ⇒ 미측정 칸을 발행 경로에서 치명으로
+#        만들면 ★위험이 제거되지 않고 ★「사람이 게이트를 끄는 것」으로 **이동한다** — 가장 나쁜 착지다.
+#     ⓒ 드리프트 비교(이빨)는 ★측정됐으므로 **fail-closed 그대로**다. 경고가 되는 것은 ★정책 단언 하나뿐이다.
+#
+# ★★날짜 박힌 의무 (⛔「경고로 두고 잊기」는 이 판정이 금지한다)
+#   ⒤2026-10-26 현재 상태: `GITHUB_TOKEN` 의 도달 = ★**측정 불능**.
+#   ⒥무엇을 하면 측정되는가: `copy-drift-watch.yml` 을 `workflow_dispatch` 로 **1회** 돌린다
+#     (그 레인은 릴리스를 막지 않으므로 치명으로 둔다 — 아래 워크플로의 `--policy-mode fatal`).
+#   ⒦★도달이 「가능」으로 측정되면 ⇒ ★**그 측정과 같은 날** `release.yml` 의
+#     `--policy-mode warn` 을 ★`fatal` 로 바꾼다. 그 날짜를 이 주석에 적는다:
+#        치명화 집행일: ____-__-__   (미집행 — 측정 전)
+#   ⒧그 전까지 이 칸은 보고서에 ★「측정 불능 + 무엇을 하면 측정되는가」로 남는다.
+POLICY_MODES = ("warn", "fatal")
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
@@ -220,6 +246,20 @@ def classify_policies(status, payload, detail):
     return "CHANGED", "추가 %s · 사라짐 %s" % (added or "없음", removed or "없음"), actual
 
 
+def policy_failure_count(verdict, mode):
+    """정책 단언이 ★실패 집계에 보태는 수. 경고 모드에서는 ⛔항상 0 이다(릴리스를 막지 않는다).
+
+    ⚠경고 모드가 ⛔「검사하지 않음」이 아니라는 점이 중요하다 — 판정은 그대로 계산되고 그대로
+      출력되며 `::warning::` 으로 밖에 나간다. 바뀌는 것은 **종료코드에 미치는 영향**뿐이다.
+    """
+    if mode not in POLICY_MODES:
+        # ⛔모르는 모드를 조용히 「경고」로 흘리지 않는다.
+        raise ValueError("알 수 없는 --policy-mode: %r (허용 %s)" % (mode, POLICY_MODES))
+    if mode == "warn":
+        return 0
+    return 0 if verdict in ("OK", "SKIPPED") else 1
+
+
 def fmt_set(items):
     return "{" + ", ".join("%s(%s)" % (n, t) for n, t in sorted(items, key=lambda x: (str(x[0]), str(x[1])))) + "}"
 
@@ -242,12 +282,17 @@ def here_blob_sha(repo, ref, path, ref_source, cwd=None):
     raise ValueError("알 수 없는 --ref-source: %r (허용 %s)" % (ref_source, REF_SOURCES))
 
 
-def run(repo, ref, baseline, paths, check_policy, cwd=None, ref_source="git"):
+def run(repo, ref, baseline, paths, check_policy, cwd=None, ref_source="git",
+        policy_mode="warn", environment=ENVIRONMENT_NAME):
     print("=== 사본 드리프트 게이트 (copy-drift-check) ===")
     print("저장소          : %s" % repo)
     print("이쪽(비교 대상) : %s  (출처 %s)" % (ref, ref_source))
     print("저쪽(기준선)    : %s" % baseline)
     print("감시 경로 분모  : %d" % len(paths))     # ★분모를 먼저 선언한다
+    print("정책 단언 치명도: %s%s" % (
+        policy_mode,
+        "  (★경고 — 릴리스를 막지 않는다 · 권한 도달 미측정 · 측정되면 같은 날 fatal 로 올린다)"
+        if policy_mode == "warn" else "  (치명 — 실패가 종료코드에 반영된다)"))
     if os.environ.get("GITHUB_REF_TYPE"):
         print("발화 ref        : ref_type=%s ref_name=%s"
               % (os.environ.get("GITHUB_REF_TYPE"), os.environ.get("GITHUB_REF_NAME")))
@@ -274,29 +319,46 @@ def run(repo, ref, baseline, paths, check_policy, cwd=None, ref_source="git"):
     policy_why = ""
     if check_policy:
         status, payload, detail = api_get(
-            "/repos/%s/environments/%s/deployment-branch-policies" % (repo, ENVIRONMENT_NAME)
+            "/repos/%s/environments/%s/deployment-branch-policies" % (repo, environment)
         )
         policy_verdict, policy_why, actual = classify_policies(status, payload, detail)
-        print("허용 ref 단언   : 기대 %d건 %s" % (len(EXPECTED_POLICIES), fmt_set(EXPECTED_POLICIES)))
+        # ★경고 모드에서도 판정은 그대로 계산·출력된다 — 바뀌는 것은 종료코드 영향뿐이다.
+        lvl = "warning" if policy_mode == "warn" else "error"
+        print("허용 ref 단언   : 환경 %s · 기대 %d건 %s"
+              % (environment, len(EXPECTED_POLICIES), fmt_set(EXPECTED_POLICIES)))
         print("                  실측 %s %s"
               % ("%d건" % len(actual) if actual is not None else "(재지 못함)",
                  fmt_set(actual) if actual is not None else ""))
         if policy_verdict == "OK":
             print("                  ⇒ 일치")
         elif policy_verdict == "CHANGED":
-            print("::error::%s 환경의 허용 ref 가 바뀌었다 — %s" % (ENVIRONMENT_NAME, policy_why))
-            print("::error::이 목록은 저장소 밖 config 다. 의도한 변경이면 "
-                  "scripts/copy-drift-check.py 의 EXPECTED_POLICIES 를 같은 커밋에서 고쳐라.")
+            # ★원인① — 정책이 **바뀌었다**(조회는 됐다).
+            print("::%s::[정책 변경] %s 환경의 허용 ref 가 바뀌었다 — %s"
+                  % (lvl, environment, policy_why))
+            print("::%s::[정책 변경] 이 목록은 저장소 밖 config 다. 의도한 변경이면 "
+                  "scripts/copy-drift-check.py 의 EXPECTED_POLICIES 를 같은 커밋에서 고쳐라." % lvl)
         else:
-            print("::error::허용 ref 를 재지 못했다(⛔정책 변경과 다른 사유다) — %s" % policy_why)
+            # ★원인② — **재지 못했다**(정책이 바뀐 것이 아니다). ⛔두 원인을 같은 말로 적지 않는다:
+            #   빨강/노랑의 원인을 오독하면 사람이 엉뚱한 것을 고친다.
+            print("::%s::[조회 실패] 허용 ref 를 재지 못했다 — ⛔이것은 ★정책 변경이 아니다 — %s"
+                  % (lvl, policy_why))
+            print("::%s::[조회 실패] 토큰 권한·네트워크·환경 이름을 본다. "
+                  "⛔EXPECTED_POLICIES 를 고치지 마라(바뀐 증거가 없다)." % lvl)
+        if policy_mode == "warn" and policy_verdict != "OK":
+            print("::%s::[경고 유지] 이 칸은 ★종료코드에 반영되지 않는다(릴리스를 막지 않는다). "
+                  "★GITHUB_TOKEN 의 도달이 「가능」으로 측정되면 ★그 날 --policy-mode fatal 로 올린다." % lvl)
 
-    failed = tally["DRIFT"] + tally["UNMEASURED"] + (0 if policy_verdict in ("OK", "SKIPPED") else 1)
-    print("=== 집계: 경로 %d 중 일치 %d · 드리프트 %d · 측정 불능 %d · 허용 ref 단언 %s ⇒ 실패 %d건 ==="
-          % (len(paths), tally["OK"], tally["DRIFT"], tally["UNMEASURED"], policy_verdict, failed))
+    policy_failed = policy_failure_count(policy_verdict, policy_mode) if check_policy else 0
+    failed = tally["DRIFT"] + tally["UNMEASURED"] + policy_failed
+    print("=== 집계: 경로 %d 중 일치 %d · 드리프트 %d · 측정 불능 %d · "
+          "허용 ref 단언 %s(%s · 집계 기여 %d) ⇒ 실패 %d건 ==="
+          % (len(paths), tally["OK"], tally["DRIFT"], tally["UNMEASURED"],
+             policy_verdict, policy_mode if check_policy else "skipped", policy_failed, failed))
     if failed:
         print("::error::사본 드리프트 게이트 실패 %d건 — 릴리스 자산 생산을 중단한다(fail-closed)." % failed)
         return 1, rows
-    print("✅ 사본 일치 %d 중 %d · 허용 ref 단언 %s" % (len(paths), tally["OK"], policy_verdict))
+    print("✅ 사본 일치 %d 중 %d · 허용 ref 단언 %s(%s)"
+          % (len(paths), tally["OK"], policy_verdict, policy_mode if check_policy else "skipped"))
     return 0, rows
 
 
@@ -355,18 +417,58 @@ def self_test():
     ok("⑰ branch_policies 가 배열이 아니면 ⇒ UNMEASURED",
        classify_policies(200, {"branch_policies": None}, "")[0] == "UNMEASURED")
 
-    # ④ 감시 목록 자체 — ★분모가 조용히 줄지 않는가
-    ok("⑱ 감시 경로가 5종이다(부서장 판정 §4)", len(WATCHED_PATHS) == 5,
+    # ④ ★감시 목록 자체 — ⛔길이만 보지 않는다. 길이만 단언하면 **N 개가 다른 N 개로 바뀌어도**
+    #    통과한다(부서장 판정 2026-10-26 §2 가 닫으라고 지목한 구멍이다). ⇒ ★경로 문자열을
+    #    **전수·순서까지** 단언한다. 아래 리터럴은 ⛔WATCHED_PATHS 를 참조하지 않는다 —
+    #    참조하면 계기가 자기를 재는 항진명제가 된다. 목록을 고치려면 ★두 곳을 같이 고쳐야 한다.
+    expected_watched = (
+        ".github/workflows/release-publish.yml",
+        "scripts/release-verify.py",
+        "scripts/tests/test_release_verify.py",
+        ".github/workflows/release.yml",
+        ".github/workflows/release-postprocess.yml",
+        "scripts/copy-drift-check.py",
+    )
+    ok("⑱ 감시 경로가 6종이다(부서장 판정 2026-10-26 §2)", len(WATCHED_PATHS) == 6,
        "실측 %d" % len(WATCHED_PATHS))
-    ok("⑲ 중복 경로가 없다", len(set(WATCHED_PATHS)) == len(WATCHED_PATHS))
-    ok("⑳ ⛔version-check.sh 는 감시 대상이 아니다(태그 트리에서 읽는다)",
+    ok("⑲ ★경로 문자열이 전수·순서까지 기대와 같다(⛔길이만이 아니다)",
+       tuple(WATCHED_PATHS) == expected_watched,
+       "차집합 추가=%s 빠짐=%s" % (sorted(set(WATCHED_PATHS) - set(expected_watched)),
+                                   sorted(set(expected_watched) - set(WATCHED_PATHS))))
+    for idx, want in enumerate(expected_watched):
+        got = WATCHED_PATHS[idx] if idx < len(WATCHED_PATHS) else "(없음)"
+        ok("⑲-%d 경로[%d] == %s" % (idx + 1, idx, want), got == want, "실측 %s" % got)
+    ok("⑳ 중복 경로가 없다", len(set(WATCHED_PATHS)) == len(WATCHED_PATHS))
+    ok("㉑ ⛔version-check.sh 는 감시 대상이 아니다(태그 트리에서 읽는다)",
        "scripts/version-check.sh" not in WATCHED_PATHS)
+    ok("㉒ ★이 스크립트 자신이 감시 대상이다(A2 가 main 사본을 쓴다)",
+       "scripts/copy-drift-check.py" in WATCHED_PATHS)
+
+    # ⑥ ★정책 단언의 치명도 — 경고 모드가 ⛔릴리스를 막지 않는가 / 치명 모드는 막는가
+    ok("㉓ ★warn: OK 는 집계 기여 0", policy_failure_count("OK", "warn") == 0)
+    ok("㉔ ★warn: ★CHANGED 도 집계 기여 ⛔0(릴리스를 막지 않는다)",
+       policy_failure_count("CHANGED", "warn") == 0)
+    ok("㉕ ★warn: ★UNMEASURED 도 집계 기여 ⛔0(권한 미측정이 릴리스를 막지 않는다)",
+       policy_failure_count("UNMEASURED", "warn") == 0)
+    ok("㉖ fatal: OK ⇒ 0 · SKIPPED ⇒ 0",
+       policy_failure_count("OK", "fatal") == 0 and policy_failure_count("SKIPPED", "fatal") == 0)
+    ok("㉗ ★fatal: CHANGED ⇒ 1 · UNMEASURED ⇒ 1",
+       policy_failure_count("CHANGED", "fatal") == 1
+       and policy_failure_count("UNMEASURED", "fatal") == 1)
+    try:
+        policy_failure_count("OK", "bogus-mode")
+        mode_raised = False
+    except ValueError:
+        mode_raised = True
+    ok("㉘ ★모르는 --policy-mode 는 ⛔조용히 warn 으로 흐르지 않고 터진다", mode_raised)
+    ok("㉙ 허용 치명도는 warn·fatal 둘뿐이다(argparse 와 같은 상수)",
+       POLICY_MODES == ("warn", "fatal"), "실측 %r" % (POLICY_MODES,))
 
     # ⑤ 이쪽 사본의 출처 분기 — ⛔항진명제로 세지 않는다(실제로 불러 본다 · 네트워크 불요)
     #   git 모드는 **로컬 git** 을 부른다: 없는 경로에 대해 rc 를 담은 사유를 돌려준다.
     missing_sha, missing_why = here_blob_sha(
         "unused/repo", "HEAD", "no/such/path/__copy_drift_selftest__", "git")
-    ok("㉑ ★git 모드가 로컬 git 을 부른다(없는 경로 ⇒ rc 사유 · 네트워크 아님)",
+    ok("㉚ ★git 모드가 로컬 git 을 부른다(없는 경로 ⇒ rc 사유 · 네트워크 아님)",
        missing_sha is None and "rc=" in missing_why, missing_why[:60])
 
     #   ⛔모르는 출처가 조용히 git 으로 흐르면 안 된다 — 터져야 한다.
@@ -375,8 +477,8 @@ def self_test():
         raised = False
     except ValueError:
         raised = True
-    ok("㉒ ★모르는 --ref-source 는 ⛔조용히 git 으로 흐르지 않고 터진다", raised)
-    ok("㉓ 허용 출처는 git·api 둘뿐이다(argparse 와 같은 상수)",
+    ok("㉛ ★모르는 --ref-source 는 ⛔조용히 git 으로 흐르지 않고 터진다", raised)
+    ok("㉜ 허용 출처는 git·api 둘뿐이다(argparse 와 같은 상수)",
        REF_SOURCES == ("git", "api"), "실측 %r" % (REF_SOURCES,))
 
     total = tally["pass"] + tally["fail"]
@@ -395,6 +497,11 @@ def main():
                         help="이쪽 사본을 어디서 읽는가 — git=로컬 트리(태그 레인) · api=원격 ref(일일 감시)")
     parser.add_argument("--path", action="append", default=None,
                         help="감시 경로를 직접 지정(⛔시험용 · 기본은 WATCHED_PATHS 5종)")
+    parser.add_argument("--policy-mode", choices=POLICY_MODES, default="warn",
+                        help="허용 ref 단언의 치명도 — warn=집계에 보태지 않는다(릴리스를 막지 않는다 · 현재 기본) · "
+                             "fatal=실패가 종료코드에 반영된다. ★권한 도달이 측정되면 그 날 fatal 로 올린다")
+    parser.add_argument("--environment", default=ENVIRONMENT_NAME,
+                        help="허용 ref 를 물어볼 환경 이름(기본 %s)" % ENVIRONMENT_NAME)
     parser.add_argument("--no-policy", action="store_true",
                         help="허용 ref 단언을 건너뛴다(⛔시험용 — 레인에서는 쓰지 않는다)")
     parser.add_argument("--json", dest="json_out", default=None, help="판정 결과를 JSON 으로 쓴다")
@@ -407,7 +514,8 @@ def main():
 
     paths = args.path if args.path else WATCHED_PATHS
     code, rows = run(args.repo, args.ref, args.baseline, paths, not args.no_policy,
-                     ref_source=args.ref_source)
+                     ref_source=args.ref_source, policy_mode=args.policy_mode,
+                     environment=args.environment)
     if args.json_out:
         with open(args.json_out, "w", encoding="utf-8") as handle:
             json.dump({"exit": code, "rows": rows}, handle, ensure_ascii=False, indent=2)

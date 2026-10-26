@@ -160,14 +160,31 @@ jobs:
             || { echo "::error::게이트 스크립트가 이 트리에 없다 — 사본 드리프트 자체다"; exit 1; }
           python3 scripts/copy-drift-check.py --self-test
 
-      - name: 사본 드리프트 하드게이트 (main ↔ 이 ref · 내용주소 비교 · fail-closed)
+      # ★치명도가 축마다 다르다 — 섞지 않는다:
+      #   ⒜ **드리프트 비교**(감시 6종) = ★fail-closed. 그 축은 측정됐다(자기시험 38/38 ·
+      #      실제 빨강·실제 초록·1바이트 민감도 전부 실측) ⇒ 빨강이면 자산 생산이 멈춘다.
+      #   ⒝ **허용 ref 단언** = ★`--policy-mode warn`(비치명)으로 **시작**한다.
+      #      사유(부서장 판정 2026-10-26 §1⒥): `GITHUB_TOKEN`(이 잡 권한 `contents: read`)이
+      #      `GET /environments/release-production/deployment-branch-policies` 에 도달하는지가
+      #      ⛔**미측정이다**. 403 이면 fail-closed 가 ★모든 릴리스를 막고, 그러면 위험이
+      #      제거되지 않고 ★「사람이 게이트를 끄는 것」으로 **이동한다** — 가장 나쁜 착지다.
+      #      ★「측정 불능은 통과도 실패도 아니다」 ⇒ 판정은 그대로 계산·출력되고 `::warning::`
+      #      으로 밖에 나가지만 **종료코드에는 반영되지 않는다**.
+      #   ★★날짜 박힌 의무(⛔「경고로 두고 잊기」는 판정이 금지한다):
+      #      ⒤2026-10-26 현재 — 권한 도달 ★측정 불능.
+      #      ⒥무엇을 하면 측정되는가 — `copy-drift-watch.yml` 을 `workflow_dispatch` 로 **1회**
+      #        돌린다(그 레인은 릴리스를 막지 않으므로 거기서는 `--policy-mode fatal`).
+      #      ⒦도달이 「가능」으로 측정되면 ⇒ ★**그 측정과 같은 날** 아래 `warn` 을 `fatal` 로
+      #        바꾸고 그 날짜를 여기 적는다 ⇒ 치명화 집행일: ____-__-__  (미집행 — 측정 전)
+      - name: 사본 드리프트 하드게이트 (main ↔ 이 ref · 내용주소 비교 · 비교는 fail-closed · 정책 단언은 경고)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
           python3 scripts/copy-drift-check.py \
-            --repo "$GITHUB_REPOSITORY" --ref HEAD --baseline main
+            --repo "$GITHUB_REPOSITORY" --ref HEAD --baseline main \
+            --policy-mode warn
 
   build:
     needs: [windows-health-gate, copy-drift-gate]
