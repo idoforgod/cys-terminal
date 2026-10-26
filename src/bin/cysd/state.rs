@@ -8601,12 +8601,13 @@ pub fn auth_blocked_by_recent_health(
     })
 }
 
-/// ⓐ **전 룰**의 매칭 구간을 `‹health-rule›`로 치환하고 200자로 자른다(문자 경계 안전).
-///
-/// 불변식: 반환 문자열은 **어떤 헬스룰에도 매칭되지 않는다**. 발화한 룰 하나만 가리면
-/// 같은 줄에 있는 다른 룰의 트리거가 원문 그대로 새어 나가고(예: 401 은 가렸는데 같은 줄의
-/// `token expired` 는 남는다), 그 문자열이 화면에 다시 찍히는 순간 루프가 부활한다.
-/// 반환값만이 데몬 밖으로 나간다 — 원문 트리거는 어떤 이벤트·원장·표면에도 싣지 않는다.
+/// Replace matches of all rules and cap the output at 200 characters (UTF-8 safe).
+/// A normal return has no remaining match against the supplied rules. If any match
+/// remains after MASK_PASS_CAP passes, return HEALTH_MASK alone, dropping context.
+/// Each pass replaces at most one match per rule: more than MASK_PASS_CAP matches
+/// of one rule that survive truncation and other-rule replacements take this fallback.
+/// A custom runtime rule may match HEALTH_MASK itself; the existing machinery-marker
+/// quarantine blocks alert refiring in that case, rather than a universal no-match guarantee.
 pub(crate) fn mask_health_line(line: &str, rules: &[HealthRule]) -> String {
     let mut out = line.to_string();
     for _ in 0..MASK_PASS_CAP {
