@@ -106,8 +106,71 @@ jobs:
             sleep 30
           done
 
+  # ═══════════════════════════════════════════════════════════════════════════
+  # 잡0-b — 사본 드리프트 하드게이트 (P0-1 · 2026-10-26 · 부서장 판정 A3)
+  #
+  # ★무엇이 결함이었나: `.github/workflows/release-publish.yml` 이 **다섯 판**으로 갈려 있었다
+  #   (main 2,306 B/66줄 · 8,416/144 · 15,161/234 · 21,092/298 · 태그 9,036/149). `main` 사본
+  #   (blob 9338fd0e)은 **2026-07-23 이후 95일** 동안 한 번도 바뀌지 않았고 그 사본에는 일곱이
+  #   없다: `--tag`(⇒ 승격이 draft 의 tag_name 을 `untagged-<sha>` 로 리셋할 수 있다 — 그 복구
+  #   가드가 태그판 `:136-148` 에 흉터로 남아 있다) · `--body-file` · `--json body`(⇒ 윈도우
+  #   서명 고지(SAC) 본문 게이트가 **무력**) · 검증기 자기시험 · `.release-tools` 2차 체크아웃 ·
+  #   그 경로의 검증기 호출 · 승격 후 `tagName` 사후 단언.
+  #   기전은 방치가 아니라 **부분 체리픽**이다 — `d67d8c3`(PR #32)이 `0418f17` 에서 워크플로
+  #   1개만 가져왔고 그 파일이 부르는 `scripts/release-verify.py` 는 따라오지 않았다.
+  #   ⇒ 그 두 파일은 **오늘도 main 에 없다**(HTTP 404 실측).
+  #   ⇒ 그리고 그 스텁은 사문이 아니다: blob `9338fd0e` 는 런 `30073672719`(2026-07-24 ·
+  #     ref `feat/bootstrap-identity-hardening`)에서 **실제 공개 승격을 `--tag` 없이 완주**했다.
+  #
+  # ★무엇이 그 결함을 가리고 있었나: 오늘 `--ref main` 으로 띄우면 `release-production` 환경의
+  #   **배포 분기 정책**이 ref 를 거부해 step 전에 죽는다(실측 런 `33981615346` = 2초 · steps 0).
+  #   그런데 그 정책은 **저장소에 적혀 있지 않은 GitHub 설정**이고 `main` 에는 보호도 룰셋도 없다
+  #   (`branches/main/protection` → 404 · `rulesets` → 0건). ⇒
+  #     ⛔**있는 안전장치가 빠진 안전장치를 가려서 결함을 무해하게 보이게 한다 — 그 가림은
+  #       설계가 아니라 우연이고, 우연은 규범이 아니다.**
+  #   ⇒ 그래서 이 게이트는 **허용 ref 목록까지 단언**한다. 정책에 `main` 이 추가되면(UI 에서
+  #     두 번 클릭으로 가능) 여기서 **빨강**이 된다 — 저장소 밖 config 를 저장소 안으로 끌어온다.
+  #
+  # ★어떻게 막는가(차단이 실재하는 경로): `build` 와 `pack-artifacts` 가 이 잡의 성공을 기다린다
+  #   — 위 `windows-health-gate` 와 **같은 배선**이다. 빨강이면 자산 생산부터 막힌다.
+  # ★비교 기전: 내용주소(blob sha). `GET /contents/<path>?ref=main` 의 `.sha` 는 로컬
+  #   `git rev-parse --verify <ref>:<path>` 와 같은 값이다(실측 3/3 일치) ⇒ 다운로드·재해시·개행
+  #   정규화 없이 **1바이트 차이도 잡는다**.
+  # ★fail-closed: 부재(404)·API 오류·네트워크 실패는 전부 실패다. ⛔「0·빈값·404」를 「같다」로
+  #   접지 않는다 — 그것이 이 저장소가 반복해 낸 사고의 형태다.
+  # ★한계(정직하게 적는다): ⛔**게이트 부재는 게이트가 알릴 수 없다.** 이 게이트를 담지 않은
+  #   선에서 자른 태그는 무검사로 지나간다. 그 완화로 감시 목록에 **이 파일 자신**을 넣었다.
+  # ★예산: ubuntu-latest 1대 · 얕은 체크아웃 1회 + API 6회 · 태그당 1회(빌드 0).
+  copy-drift-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # ★관문 자체가 살아 있는지 먼저 본다 — 합성 픽스처 · 네트워크 불요 · 1초 미만.
+      #   (`release-publish.yml` 의 "Self-test the verifier before trusting it" 과 같은 교리:
+      #    ⛔통째로 비거나 무력화된 게이트가 "조용히 통과"하는 사고를 막는다.)
+      - name: Self-test the drift gate before trusting it
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f scripts/copy-drift-check.py \
+            || { echo "::error::게이트 스크립트가 이 트리에 없다 — 사본 드리프트 자체다"; exit 1; }
+          python3 scripts/copy-drift-check.py --self-test
+
+      - name: 사본 드리프트 하드게이트 (main ↔ 이 ref · 내용주소 비교 · fail-closed)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/copy-drift-check.py \
+            --repo "$GITHUB_REPOSITORY" --ref HEAD --baseline main
+
   build:
-    needs: windows-health-gate
+    needs: [windows-health-gate, copy-drift-gate]
     strategy:
       fail-fast: false     # 한 타깃이 실패해도 나머지는 계속
       matrix:
@@ -1151,7 +1214,7 @@ jobs:
     # ★windows-health 결박(M4-3): 게이트가 빨가면 이 잡이 돌지 않아 팩 3종 자산이
     #   드래프트에 오르지 않고, release-publish 의 release-verify.py REQUIRED_ASSETS
     #   검증이 실패한다 = 공개 발행 차단. 위 windows-health-gate 잡 머리말 참조.
-    needs: [build, windows-health-gate]
+    needs: [build, windows-health-gate, copy-drift-gate]
     runs-on: ubuntu-latest
     env:
       KEY_ID: '39E60A702949D6C3'    # 임베드 키링(cysjavis-pack/trusted-keys.json) key_id — manifest.key_id
