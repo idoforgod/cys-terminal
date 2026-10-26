@@ -8608,6 +8608,11 @@ pub fn auth_blocked_by_recent_health(
 /// of one rule that survive truncation and other-rule replacements take this fallback.
 /// A custom runtime rule may match HEALTH_MASK itself; the existing machinery-marker
 /// quarantine blocks alert refiring in that case, rather than a universal no-match guarantee.
+/// Masking only the firing rule can leak another rule's trigger on the same line
+/// (for example, masking 401 while leaving "token expired"); re-printing that line
+/// revives the alert loop. This is why every rule participates in masking.
+/// Only the returned value leaves the daemon: the raw trigger is never placed on
+/// any event, ledger or surface.
 pub(crate) fn mask_health_line(line: &str, rules: &[HealthRule]) -> String {
     let mut out = line.to_string();
     for _ in 0..MASK_PASS_CAP {
