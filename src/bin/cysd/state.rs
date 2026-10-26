@@ -8639,9 +8639,11 @@ fn default_health_rules() -> Vec<HealthRule> {
             "login_required",
             r"(?i)(please|run).{0,30}(/login|log ?in again)",
         ),
+        // Numeric status requires HTTP context; prose requires an explicit error envelope.
+        // Bare mentions are not state. CLI prefix whitespace is exactly U+0020/U+0009/U+00A0.
         (
             "rate_limited",
-            r"(?i)rate.?limit(ed)?|too many requests|\b429\b",
+            r"(?i)\bHTTP(?:/[0-9]+(?:\.[0-9]+)?)?[ \t]+429(?:[ \t:;]|$)|^[ \t]*(?:api[ \t]+)?error:[ \t]*(?:rate[ _-]?limit(?:ed)?|too many requests)\b|(?:^|[{,])[ \t]*\x22error\x22[ \t]*:[ \t]*\x22(?:rate[ _-]?limit(?:ed)?|too many requests)\b|(?:^|[ \t])level=error[ \t]+msg=\x22(?:rate[ _-]?limit(?:ed)?|too many requests)\b|^[ \t\xA0]*(?:[⎿•!][ \t\xA0]*)?you(?:'ve| have) hit your (?:weekly|usage|monthly spend) limit\b",
         ),
     ];
     defaults
@@ -10635,11 +10637,11 @@ mod tests {
         assert!(m("login_required", "please log in again"));
         assert!(!m("login_required", "you are logged in"));
 
-        // rate_limited — rate limit(ed)? | too many requests | 429
-        assert!(m("rate_limited", "rate limited"));
-        assert!(m("rate_limited", "ratelimit"));
-        assert!(m("rate_limited", "rate-limited"));
-        assert!(m("rate_limited", "too many requests"));
+        // rate_limited — HTTP status or explicit error context; bare prose is not a signal
+        assert!(!m("rate_limited", "rate limited"));
+        assert!(!m("rate_limited", "ratelimit"));
+        assert!(!m("rate_limited", "rate-limited"));
+        assert!(!m("rate_limited", "too many requests"));
         assert!(m("rate_limited", "HTTP 429 Too Many Requests"));
         assert!(!m("rate_limited", "all good, build complete"));
 
@@ -10649,6 +10651,57 @@ mod tests {
             assert_eq!(r.threshold, 3);
             assert_eq!(r.pause_secs, 300);
         }
+    }
+
+    #[test]
+    fn rate_limit_rejects_numeric_and_narrative_mentions() {
+        let rules = default_health_rules();
+        let rule = rules.iter().find(|r| r.name == "rate_limited").unwrap();
+        for line in ["12,429,524", "12,430,040", "4291", "429", "HTTP 4291",
+                     "HTTP 429,524", "rate limit", "rate limited", "ratelimit",
+                     "rate-limited", "too many requests", "We discuss rate limit handling",
+                     "The Error: rate limit text was quoted", "level=info msg=\"rate limit\"",
+                     "We saw You've hit your usage limit in the transcript"] {
+            assert!(!rule.regex.is_match(line), "false limit signal: {line}");
+        }
+    }
+
+    #[test]
+    fn rate_limit_retains_http_and_explicit_error_contexts() {
+        let rules = default_health_rules();
+        let rule = rules.iter().find(|r| r.name == "rate_limited").unwrap();
+        for line in ["HTTP 429 Too Many Requests", "HTTP/1.1 429 Too Many Requests",
+                     "HTTP/2 429", "request failed: HTTP 429: retry later",
+                     "Error: rate limit", "API Error: rate-limited", "Error: too many requests",
+                     r#"{"error":"rate limit"}"#, r#"level=error msg="rate limit" svc=api"#] {
+            assert!(rule.regex.is_match(line), "missed explicit limit signal: {line}");
+        }
+    }
+
+    #[test]
+    fn rate_limit_retains_observed_cli_limit_messages() {
+        // Lane evidence: Claude screen master s103, 2026-10-26 23:07 (recall).
+        // Claude weekly text: feedback_a-quoted-screen-string-needs-a-recency-axis, 2026-10-15.
+        // Codex screen quoted by CEO in dept-5 recall, 2026-10-19 15:01.
+        // These pin message recognition, not the freshness of a visible historical screen.
+        let rules = default_health_rules();
+        let rule = rules.iter().find(|r| r.name == "rate_limited").unwrap();
+        for line in ["You've hit your monthly spend limit", "You have hit your weekly limit",
+                     "You've hit your usage limit", "⎿  You've hit your monthly spend limit"] {
+            assert!(rule.regex.is_match(line), "missed observed CLI limit message: {line}");
+        }
+        // Gemini vendor/screen specimen remains UNMEASURED; generic error contexts are tested above.
+    }
+
+    #[test]
+    fn rate_limit_retains_observed_claude_nbsp_prefix() {
+        // Actual recall prefix: Claude master s103, 2026-10-26 23:07: U+23BF U+0020 U+00A0.
+        let rules = default_health_rules();
+        let rule = rules.iter().find(|r| r.name == "rate_limited").unwrap();
+        assert!(rule.regex.is_match("⎿ \u{00a0}You've hit your monthly spend limit"));
+        assert!(rule.regex.is_match("\u{00a0}You've hit your monthly spend limit"));
+        assert!(!rule.regex.is_match("⎿ \u{202f}You've hit your monthly spend limit"));
+        assert!(!rule.regex.is_match("\u{2003}You've hit your monthly spend limit"));
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -10681,9 +10734,15 @@ mod tests {
     /// 하던 구 로직 그대로다(D5 `ingest_step_pre_refactor` 와 동일 관행: 비교 기준을 코드로 박제).
     /// 이 미러가 매칭하는데 프로덕션 경로가 매칭하지 않으면 = 자기증폭 차단이 실제로 작동한 것.
     fn health_matches_pre_fix(line: &str) -> Vec<String> {
+        // Pin the historical matcher: the current default must not rewrite this control arm.
+        let legacy_rate = Regex::new(r"(?i)rate.?limit(ed)?|too many requests|\b429\b").unwrap();
         default_health_rules()
             .into_iter()
-            .filter(|r| r.regex.is_match(line))
+            .filter(|r| if r.name == "rate_limited" {
+                legacy_rate.is_match(line)
+            } else {
+                r.regex.is_match(line)
+            })
             .map(|r| r.name)
             .collect()
     }
@@ -10928,7 +10987,10 @@ mod tests {
         let judge = |line: &str, rule: &str| -> Option<&'static str> {
             let rules = default_health_rules();
             let r = rules.iter().find(|r| r.name == rule).unwrap();
-            let m = r.regex.find(line).unwrap_or_else(|| panic!("no match: {line}"));
+            // Test discourse classification independently of the narrowed default trigger.
+            let legacy = Regex::new(r"(?i)rate.?limit(ed)?|too many requests|\b429\b").unwrap();
+            let matcher = if rule == "rate_limited" { &legacy } else { &r.regex };
+            let m = matcher.find(line).unwrap_or_else(|| panic!("no match: {line}"));
             alert_discourse_reason(line, m.start(), m.end(), &rules)
         };
         // ① 기계장치 식별자
@@ -10999,7 +11061,12 @@ mod tests {
         feed_lines_collect_alerts(&daemon, &s, INCIDENT_PROSE);
         let sup = daemon.health_suppressed.lock().unwrap();
         let total: u64 = sup.values().sum();
-        assert!(total >= INCIDENT_PROSE.len() as u64 - 2, "억제 집계 누락: {sup:?}");
+        // Bare rate-limit prose is rejected before suppression; count actual candidate matches.
+        let rules = default_health_rules();
+        let expected: usize = INCIDENT_PROSE.iter()
+            .map(|line| rules.iter().filter(|r| r.regex.is_match(line)).count()).sum();
+        assert!(expected > 0, "suppression control must contain matching candidates");
+        assert_eq!(total, expected as u64, "억제 집계 누락: {sup:?}");
         assert!(
             sup.keys().any(|(_, reason)| *reason == "narration-prose"),
             "한글 서술 억제 사유 미기록: {sup:?}"
@@ -11087,8 +11154,9 @@ mod tests {
     fn structured_json_error_is_not_treated_as_quoted_mention() {
         let rules = default_health_rules();
         let judge = |line: &str| {
-            let r = rules.iter().find(|r| r.regex.is_match(line)).unwrap();
-            let m = r.regex.find(line).unwrap();
+            // Quoting semantics are tested on the token itself, even when bare prose no longer triggers.
+            let token = Regex::new(r"(?i)rate.?limit(ed)?").unwrap();
+            let m = token.find(line).unwrap();
             alert_discourse_reason(line, m.start(), m.end(), &rules)
         };
         // ① 구조화 에러 출력(JSON 값 자리·logfmt 값 자리) = 진짜 신호 → 통과(None)

@@ -29035,7 +29035,7 @@ mod tests {
             "Please run /login to continue",
             "401 Unauthorized",
             "your token has expired",
-            "rate limited",
+            "HTTP 429 Too Many Requests",
         ] {
             assert!(
                 hits(bad),

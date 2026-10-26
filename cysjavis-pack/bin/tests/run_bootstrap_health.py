@@ -8082,10 +8082,18 @@ def h_auth_selfloop():
                       ("Please run /login to continue", "login_required"),
                       ("401 Unauthorized", "auth_401"),
                       ("your token has expired", "token_expired"),
-                      ("rate limited", "rate_limited")):
+                      ("HTTP 429 Too Many Requests", "rate_limited"),
+                      ('Error: rate limited', "rate_limited"),
+                      ('{"error":"rate limit"}', "rate_limited"),
+                      ('level=error msg="rate limit" svc=api', "rate_limited")):
         need(want in hits(bad),
              "계측 무효: 합성 표본 %r 이 룰 %s 에 걸리지 않는다 — 이 검체가 재는 대상이 "
              "생산 룰이 아니다" % (bad, want))
+    # C-04 intentionally replaces the old bare-prose positive: only explicit errors are signals.
+    for benign in ("12,429,524", "12,430,040", "4291", "429", "HTTP 4291", "HTTP 429,524",
+                   "rate limit", "rate limited", "We discuss rate limit handling",
+                   'level=info msg="rate limit"', "The Error: rate limit text was quoted"):
+        need("rate_limited" not in hits(benign), "C-04 false limit signal: %r" % benign)
     # auth 인터록이 보는 네 룰이 실제로 이 집합 안에 있어야 검체가 의미를 갖는다.
     interlock = _slice_between(st, "pub const AUTH_INTERLOCK_RULES:", ";", "인터록 룰 목록")
     for r in re.findall(r'"([a-z0-9_]+)"', interlock):
