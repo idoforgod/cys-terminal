@@ -18458,8 +18458,10 @@ mod tests {
         // Wait for the fixture's raw process facts, not merely any startup
         // descendant and not the liveness/tick result that this test measures.
         let mut sys = sysinfo::System::new();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // ★운반체 1 — 이 검체의 10-26 적색이 「느림이 아니라 멈춤」임을 가른 그 계기다(위 doc 참조).
+        let mut margin = PrereqMargin::new("rqfix2_prereq", std::time::Duration::from_secs(5));
         loop {
+            margin.poll();
             sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
             let descendants = collect_descendants(&sys, s.pid);
             let targets: Vec<sysinfo::Pid> = descendants.iter().map(|(pid, _)| sysinfo::Pid::from_u32(*pid)).collect();
@@ -18479,9 +18481,10 @@ mod tests {
                 })
             });
             if ready {
+                margin.ready();
                 break;
             }
-            assert!(std::time::Instant::now() < deadline, "rqfix2 prerequisite: NOTE-bearing sh with a sleep descendant did not appear");
+            assert!(!margin.expired(), "rqfix2 prerequisite: NOTE-bearing sh with a sleep descendant did not appear");
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
         let cmds: Vec<String> = super::collect_descendants_with_cmd(&sys, s.pid).into_iter().map(|(_, c)| c).collect();
@@ -20109,18 +20112,93 @@ mod tests {
         (fg, root)
     }
 
+    /// ★「전제 폴링 + 시한」 가족 공용 ★시한 여유 계기 — ⒜값은 **항상** 모으고 ⒝출력은
+    /// ⒤**실패 때 무조건** · ⒥**통과 때는 env 가 켜졌을 때만** 찍는다.
+    ///
+    /// ★env 이름: **`CYS_RQFIX2_MARGIN`** · ★**기본값(미설정) = 통과 때 출력 0**(= 평시 CI 로그 증가 0).
+    ///   값이 정확히 `"1"` 일 때만 켠다(⛔`"0"`·빈 값·다른 값은 꺼진 것으로 읽는다).
+    ///
+    /// ★왜 `DeadmanTickTrace`(D-R2-3 덤프)와 **모양이 다른가** — ⛔같은 법을 다른 모양에 복사하지 않는다:
+    ///   · 덤프는 ★**실패 경로 전용이 미덕**이다. 거기서 필요한 것은 ★그 한 번의 틱 표이고,
+    ///     통과 때 출력 0 이 로그 비용을 0 으로 만든다.
+    ///   · 이 계기는 ★**분포가 본체**다. 통과 실행의 여유가 모여야 「느림인가 멈춤인가」가 갈린다 —
+    ///     ★실측(2026-10-26 · HEAD/PARENT 각 400회): 정상은 ★2폴·65 ms 로 시한 5,000 ms 의 ★**1.3 %만**
+    ///     쓰고, 두 팔의 ★최댓값조차 시한의 ★**1/50**(99.4 / 95.7 ms)이다 ⇒ ★그래서 10-26 CI 실패
+    ///     (`margin 0`)는 ★분포의 **꼬리가 아니라 밖**이고 ★**5 초 멈춤**이다 ⇒ ⛔**시한 상향은 처방이 아니다.**
+    ///     같은 측정이 ★양 팔 분포의 겹침(중앙 65.654/65.769 · Δ −0.115 ms · p75 동일)으로
+    ///     ★「우리 변경 혐의 없음」을 ⛔실패를 기다리지 않고 확정했다.
+    ///     정본: `~/.cys/state/worker-4/mac-rqfix2-history/20261026T084258Z/REPORT-DEADLINE-MARGIN.md`
+    ///   ⇒ 그래서 ★두 모양을 합쳤다: 통과분은 ★조사할 때만 흐르고, 실패분은 ★언제나 자기를 설명한다.
+    ///
+    /// ★붙이는 법(세 줄): `let mut m = PrereqMargin::new("tag", budget);` → 루프 머리에서 `m.poll();`
+    ///   → 성립 지점에서 `m.ready();` → 시한 검사를 `m.expired()` 로 바꾼다
+    ///   (⇒ ★원래 단언·패닉 문구는 **그대로 둔다** — CI 의 실패 메시지 모양이 바뀌면 분류기가 깨진다).
+    #[cfg(unix)]
+    struct PrereqMargin {
+        tag: &'static str,
+        start: std::time::Instant,
+        deadline: std::time::Instant,
+        polls: u32,
+    }
+    #[cfg(unix)]
+    impl PrereqMargin {
+        fn new(tag: &'static str, budget: std::time::Duration) -> Self {
+            let start = std::time::Instant::now();
+            Self { tag, start, deadline: start + budget, polls: 0 }
+        }
+        /// 루프 머리에서 1회 — 폴 횟수는 ★분포의 두 번째 축이다(소요가 같아도 폴이 적으면 폴이 느린 것이다).
+        fn poll(&mut self) {
+            self.polls += 1;
+        }
+        fn line(&self, ready: bool) -> String {
+            let now = std::time::Instant::now();
+            format!(
+                "PREREQ-MARGIN tag={} ready={} polls={} elapsed_ms={:.3} margin_ms={:.3} budget_ms={:.0}",
+                self.tag,
+                ready,
+                self.polls,
+                self.start.elapsed().as_secs_f64() * 1000.0,
+                self.deadline.saturating_duration_since(now).as_secs_f64() * 1000.0,
+                self.deadline.saturating_duration_since(self.start).as_secs_f64() * 1000.0
+            )
+        }
+        /// 전제 성립 — ★env 가 켜진 때만 찍는다(분포 수집용 · 평시 0줄).
+        fn ready(&self) {
+            if std::env::var("CYS_RQFIX2_MARGIN").as_deref() == Ok("1") {
+                println!("{}", self.line(true));
+            }
+        }
+        /// 시한 초과인가 — ★참이면 env 와 무관하게 ★무조건 찍는다(실패는 언제나 자기를 설명해야 한다).
+        fn expired(&self) -> bool {
+            let over = std::time::Instant::now() >= self.deadline;
+            if over {
+                println!("{}", self.line(false));
+            }
+            over
+        }
+    }
+
     /// 전경 그룹이 원하는 상태가 될 때까지 폴링(≤ 8초)한다 — `want_job` 이면 전경 ≠ 뿌리(작업), 아니면 전경 == 뿌리(셸 프롬프트·작업 제어 없는 자손). 끝내 안 되면 전제 실패로
     /// 패닉한다(결측·환경 한계는 통과가 아니다). 반환 = 그 시점의 전경 그룹 id. **본 단언 전에 이 전제를 먼저 세운다**(실 PTY 검체의 흔들림 방지).
     #[cfg(unix)]
     fn wait_foreground(s: &Arc<crate::state::Surface>, want_job: bool, what: &str) -> i32 {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        // ★운반체 2 — 같은 가족(전제 폴링 + 시한)에 ★세 줄로 붙는다(선언이 아니라 운반체다).
+        //   ★수(2026-10-26 기계 census · 중복 cfg 정의를 합쳐 센다): 이 헬퍼의 **호출 지점 12곳**
+        //   = 시험 10 + 헬퍼 2(`wp5_job_seat` · `r1f_in_job_then_nested_shell_seat`)이고, 그 헬퍼를
+        //   거쳐 ★계기를 얻는 `#[test]` 는 **19건**이다(추이적 닫힘). ⛔「12건」으로 적지 마라 —
+        //   12 는 호출 지점 수이고 검체 수가 아니다.
+        //   ★실행으로도 확인했다: `CYS_RQFIX2_MARGIN=1` 로 19 + 운반체 1 검체 = **20/20** 이
+        //   각각 ≥1 줄을 냈고(합 31줄), env 미설정에서는 20/20 이 **0줄**이었다.
+        let mut margin = PrereqMargin::new("wait_foreground", std::time::Duration::from_secs(8));
         loop {
+            margin.poll();
             let (fg, root) = pty_groups(s);
             let ok = if want_job { fg.is_some() && fg != root } else { fg.is_some() && fg == root };
             if ok {
+                margin.ready();
                 return fg.expect("전경 그룹");
             }
-            if std::time::Instant::now() >= deadline {
+            if margin.expired() {
                 panic!("전제 실패({what}): 전경 그룹이 기대 상태가 되지 않았다 — fg={fg:?} root={root:?} want_job={want_job}");
             }
             std::thread::sleep(std::time::Duration::from_millis(25));
