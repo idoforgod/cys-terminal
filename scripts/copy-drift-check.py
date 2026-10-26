@@ -42,6 +42,10 @@
   부재(404)·API 오류·네트워크 실패는 전부 **실패**다. "재지 않았다"를 통과로 접는 것이
   이 저장소가 반복해 낸 사고의 형태다(`release.yml:59-108` windows-health-gate 와 같은 교리).
 
+★권한 측정 완료 (2026-10-26 · run 40285752606)
+  허용 ref 단언이 `GITHUB_TOKEN` 으로 ★도달해 `OK` 를 냈다 ⇒ 경고 유지 사유가 소멸했고
+  같은 날 `--policy-mode fatal` 로 올렸다(치명화 집행일 2026-10-26).
+
 ★그리고 계기 자신의 함정 하나 (2026-10-26 실측 · 피해 0)
   ⛔`git rev-parse <ref>:<없는 경로>` 는 실패할 때 **인자를 그대로 stdout 에 되돌려 준다**
   (실측: stdout=`main:.github/workflows/release-postprocess.yml` · rc=128). 그래서 rc 를
@@ -92,25 +96,37 @@ EXPECTED_POLICIES = {
     ("v*", "tag"),
 }
 
-# ★정책 단언의 치명도 — **경고로 시작한다**(부서장 판정 2026-10-26 §1⒥).
-#   사유 셋:
-#     ⓐ ★「측정 불능은 통과도 실패도 아니다」 — `GITHUB_TOKEN`(job 권한 `contents: read`)이
-#        `GET /environments/<env>/deployment-branch-policies` 에 ★도달하는지가 **미측정이다**
-#        (2026-10-26 기준). 문서는 「Anyone with read access」라 하고 이 저장소는 public 이라
-#        될 것으로 보지만 ★그건 추론이다 — 성공시켜 본 호출은 **호스트 PAT** 였고 그 사례는
-#        GITHUB_TOKEN 의 도달을 증명하지 않는다.
-#     ⓑ 403 이면 fail-closed 가 ★**모든 릴리스를 막는다** ⇒ 미측정 칸을 발행 경로에서 치명으로
-#        만들면 ★위험이 제거되지 않고 ★「사람이 게이트를 끄는 것」으로 **이동한다** — 가장 나쁜 착지다.
-#     ⓒ 드리프트 비교(이빨)는 ★측정됐으므로 **fail-closed 그대로**다. 경고가 되는 것은 ★정책 단언 하나뿐이다.
+# ★정책 단언의 치명도 — ★**치명(fatal)이다.** 경고로 시작했고 ★2026-10-26 에 올렸다.
 #
-# ★★날짜 박힌 의무 (⛔「경고로 두고 잊기」는 이 판정이 금지한다)
-#   ⒤2026-10-26 현재 상태: `GITHUB_TOKEN` 의 도달 = ★**측정 불능**.
-#   ⒥무엇을 하면 측정되는가: `copy-drift-watch.yml` 을 `workflow_dispatch` 로 **1회** 돌린다
-#     (그 레인은 릴리스를 막지 않으므로 치명으로 둔다 — 아래 워크플로의 `--policy-mode fatal`).
-#   ⒦★도달이 「가능」으로 측정되면 ⇒ ★**그 측정과 같은 날** `release.yml` 의
-#     `--policy-mode warn` 을 ★`fatal` 로 바꾼다. 그 날짜를 이 주석에 적는다:
-#        치명화 집행일: ____-__-__   (미집행 — 측정 전)
-#   ⒧그 전까지 이 칸은 보고서에 ★「측정 불능 + 무엇을 하면 측정되는가」로 남는다.
+# ★왜 경고로 시작했나(기록으로 남긴다 — ⛔지우지 않는다):
+#   `GITHUB_TOKEN`(job 권한 `contents: read`)이
+#   `GET /environments/<env>/deployment-branch-policies` 에 ★도달하는지가 **미측정**이었다.
+#   문서는 「Anyone with read access」라 하고 이 저장소는 public 이라 될 것으로 보였지만
+#   ★그건 추론이었다 — 성공시켜 본 호출은 **호스트 PAT** 였고 그 사례는 GITHUB_TOKEN 의
+#   도달을 증명하지 않는다. 403 이면 fail-closed 가 ★**모든 릴리스를 막고**, 그러면 위험이
+#   제거되지 않고 ★「사람이 게이트를 끄는 것」으로 **이동한다** — 가장 나쁜 착지다.
+#   ⇒ 그래서 ★「측정 불능은 통과도 실패도 아니다」에 따라 **경고**로 두었다.
+#
+# ★★그리고 ★측정됐다 ⇒ ★경고 유지 사유가 **소멸**했다:
+#   ⒤계기: `copy-drift-watch.yml` 을 `workflow_dispatch` 로 1회 — ★**run 40285752606**
+#     (2026-10-26T07:25:58Z · `head_sha=f27879cb` = 동기화가 착지한 main · actor idoforgod).
+#   ⒥그 런의 로그가 적은 것(실측 인용):
+#       `정책 단언 치명도: fatal  (치명 — 실패가 종료코드에 반영된다)`
+#       `허용 ref 단언   : 환경 release-production · 기대 2건 {feat/bootstrap-identity-hardening(branch), v*(tag)}`
+#       `                  실측 2건 {feat/bootstrap-identity-hardening(branch), v*(tag)}`
+#       `… 허용 ref 단언 OK(fatal · 집계 기여 0) …`
+#   ⒦⇒ ★**GITHUB_TOKEN 이 그 API 에 도달했고 정책이 기대와 일치했다**
+#     ⇒ ⛔`UNMEASURED` 가 아니다 ⇒ ★경고로 둘 근거가 없다.
+#
+# ★★치명화 집행일: ★**2026-10-26**   (근거 = 위 run 40285752606 · ★같은 날 집행)
+#   ⇒ `release.yml` 의 게이트 step 이 ★`--policy-mode fatal` 로 돈다(그 파일 주석에도 같은 날짜).
+#   ⇒ 이 파일의 ★기본값도 `fatal` 이다 — ⛔기본값이 `warn` 으로 남으면 손으로 돌린 실행만
+#     조용히 옛 상태를 쓰게 되고, 그게 이 티켓이 고치는 **바로 그 병**이다(사본·기본값 드리프트).
+#
+# ⚠되돌리는 조건(한 줄로 적어 둔다): 이 단언이 ★조회 실패(`UNMEASURED`)로 릴리스를 막기 시작하면
+#   ⛔게이트를 끄지 말고 ★그 조회 실패를 먼저 측정하라 — `[조회 실패]` 와 `[정책 변경]` 은
+#   아래에서 **다른 문장**으로 나온다. 원인이 권한 회수라면 그때 다시 `warn` 으로 내리고
+#   ★그 날짜와 근거를 이 자리에 적는다.
 POLICY_MODES = ("warn", "fatal")
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -283,7 +299,7 @@ def here_blob_sha(repo, ref, path, ref_source, cwd=None):
 
 
 def run(repo, ref, baseline, paths, check_policy, cwd=None, ref_source="git",
-        policy_mode="warn", environment=ENVIRONMENT_NAME):
+        policy_mode="fatal", environment=ENVIRONMENT_NAME):
     print("=== 사본 드리프트 게이트 (copy-drift-check) ===")
     print("저장소          : %s" % repo)
     print("이쪽(비교 대상) : %s  (출처 %s)" % (ref, ref_source))
@@ -291,8 +307,9 @@ def run(repo, ref, baseline, paths, check_policy, cwd=None, ref_source="git",
     print("감시 경로 분모  : %d" % len(paths))     # ★분모를 먼저 선언한다
     print("정책 단언 치명도: %s%s" % (
         policy_mode,
-        "  (★경고 — 릴리스를 막지 않는다 · 권한 도달 미측정 · 측정되면 같은 날 fatal 로 올린다)"
-        if policy_mode == "warn" else "  (치명 — 실패가 종료코드에 반영된다)"))
+        "  (★경고 — 릴리스를 막지 않는다 · ⛔2026-10-26 치명화 이후 이 모드는 예외 경로다)"
+        if policy_mode == "warn"
+        else "  (★치명 — 실패가 종료코드에 반영된다 · 2026-10-26 run 40285752606 으로 권한 도달 측정됨)"))
     if os.environ.get("GITHUB_REF_TYPE"):
         print("발화 ref        : ref_type=%s ref_name=%s"
               % (os.environ.get("GITHUB_REF_TYPE"), os.environ.get("GITHUB_REF_NAME")))
@@ -346,7 +363,8 @@ def run(repo, ref, baseline, paths, check_policy, cwd=None, ref_source="git",
                   "⛔EXPECTED_POLICIES 를 고치지 마라(바뀐 증거가 없다)." % lvl)
         if policy_mode == "warn" and policy_verdict != "OK":
             print("::%s::[경고 유지] 이 칸은 ★종료코드에 반영되지 않는다(릴리스를 막지 않는다). "
-                  "★GITHUB_TOKEN 의 도달이 「가능」으로 측정되면 ★그 날 --policy-mode fatal 로 올린다." % lvl)
+                  "⛔이 모드는 2026-10-26(run 40285752606) 치명화 이후의 ★예외 경로다 — "
+                  "왜 warn 으로 돌렸는지 근거와 날짜가 코드에 적혀 있어야 한다." % lvl)
 
     policy_failed = policy_failure_count(policy_verdict, policy_mode) if check_policy else 0
     failed = tally["DRIFT"] + tally["UNMEASURED"] + policy_failed
@@ -464,11 +482,19 @@ def self_test():
     ok("㉙ 허용 치명도는 warn·fatal 둘뿐이다(argparse 와 같은 상수)",
        POLICY_MODES == ("warn", "fatal"), "실측 %r" % (POLICY_MODES,))
 
+    # ⑦ ★치명화(2026-10-26) 상태 단언 — ⛔기본값이 조용히 옛 상태로 남지 않는가
+    import inspect
+    default_mode = inspect.signature(run).parameters["policy_mode"].default
+    ok("㉚ ★run() 의 기본 치명도가 fatal 이다(권한 측정 후 상태)",
+       default_mode == "fatal", "실측 %r" % (default_mode,))
+    ok("㉛ ★치명화 근거(측정 런 번호)가 ★코드에 적혀 있다",
+       "40285752606" in (__doc__ or ""), "docstring 에 run 번호 기록")
+
     # ⑤ 이쪽 사본의 출처 분기 — ⛔항진명제로 세지 않는다(실제로 불러 본다 · 네트워크 불요)
     #   git 모드는 **로컬 git** 을 부른다: 없는 경로에 대해 rc 를 담은 사유를 돌려준다.
     missing_sha, missing_why = here_blob_sha(
         "unused/repo", "HEAD", "no/such/path/__copy_drift_selftest__", "git")
-    ok("㉚ ★git 모드가 로컬 git 을 부른다(없는 경로 ⇒ rc 사유 · 네트워크 아님)",
+    ok("㉜ ★git 모드가 로컬 git 을 부른다(없는 경로 ⇒ rc 사유 · 네트워크 아님)",
        missing_sha is None and "rc=" in missing_why, missing_why[:60])
 
     #   ⛔모르는 출처가 조용히 git 으로 흐르면 안 된다 — 터져야 한다.
@@ -477,8 +503,8 @@ def self_test():
         raised = False
     except ValueError:
         raised = True
-    ok("㉛ ★모르는 --ref-source 는 ⛔조용히 git 으로 흐르지 않고 터진다", raised)
-    ok("㉜ 허용 출처는 git·api 둘뿐이다(argparse 와 같은 상수)",
+    ok("㉝ ★모르는 --ref-source 는 ⛔조용히 git 으로 흐르지 않고 터진다", raised)
+    ok("㉞ 허용 출처는 git·api 둘뿐이다(argparse 와 같은 상수)",
        REF_SOURCES == ("git", "api"), "실측 %r" % (REF_SOURCES,))
 
     total = tally["pass"] + tally["fail"]
@@ -497,9 +523,10 @@ def main():
                         help="이쪽 사본을 어디서 읽는가 — git=로컬 트리(태그 레인) · api=원격 ref(일일 감시)")
     parser.add_argument("--path", action="append", default=None,
                         help="감시 경로를 직접 지정(⛔시험용 · 기본은 WATCHED_PATHS 5종)")
-    parser.add_argument("--policy-mode", choices=POLICY_MODES, default="warn",
-                        help="허용 ref 단언의 치명도 — warn=집계에 보태지 않는다(릴리스를 막지 않는다 · 현재 기본) · "
-                             "fatal=실패가 종료코드에 반영된다. ★권한 도달이 측정되면 그 날 fatal 로 올린다")
+    parser.add_argument("--policy-mode", choices=POLICY_MODES, default="fatal",
+                        help="허용 ref 단언의 치명도 — fatal=실패가 종료코드에 반영된다(★현재 기본 · "
+                             "2026-10-26 run 40285752606 으로 권한 도달이 측정돼 올렸다) · "
+                             "warn=집계에 보태지 않는다(릴리스를 막지 않는다 · ⛔권한 회수가 측정된 경우에만)")
     parser.add_argument("--environment", default=ENVIRONMENT_NAME,
                         help="허용 ref 를 물어볼 환경 이름(기본 %s)" % ENVIRONMENT_NAME)
     parser.add_argument("--no-policy", action="store_true",
