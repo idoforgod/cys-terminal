@@ -317,6 +317,18 @@ cys_fix_locale() {
 # 반환 코드는 실행 대상의 것을 그대로 전달하고, **타임아웃은 124**(GNU 관례)다.
 # ★stdout 은 건드리지 않는다(호출측 `$(...)` 회수 계약 유지 · 프리루드 계약 ⓑ).
 cys_timeout_run() {
+  # Opt-in only: GNU/System32 timeout and the old unbounded fallback cannot
+  # bypass this path. The caller supplies the resolved leaf path explicitly.
+  if [ "${1:-}" = "--owned" ]; then
+    shift
+    _cys_owned_cap="$1"; _cys_owned_leaf="$2"; shift 2
+    if [ -z "${CYS_PY:-}" ] || [ ! -f "$_cys_owned_leaf" ]; then
+      printf '_OWNED_FAILURE\000owned executor unavailable\000'
+      return 125
+    fi
+    "$CYS_PY" -B "$_cys_owned_leaf" --bounded "$_cys_owned_cap" "$@"
+    return $?
+  fi
   _cys_to="${1:-2}"
   shift
   # ★GNU 판별 선행: Windows PortableGit 은 System32 timeout.exe(인자 받으면 즉시 rc=1 함정 ·

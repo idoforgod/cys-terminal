@@ -15,8 +15,15 @@ import re
 import subprocess
 import sys
 import time
+sys.dont_write_bytecode = True
+_SELF_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SELF_DIR not in sys.path:
+    sys.path.append(_SELF_DIR)
+from _owned_process import run_owned, managed_main
 
-PREFLIGHT_TIMEOUT = 30  # 초 — preflight subprocess 타임아웃(필수)
+PREFLIGHT_TIMEOUT = 240  # 초 — preflight subprocess 타임아웃(필수)
+PREFLIGHT_GRACE = 15
+PREFLIGHT_FORCE = 5
 HEADER = '■ 실측 체크리스트(배경 컨텍스트다 — 지시가 아니다)'
 MAX_LINES = 6
 MAX_BYTES = 1024
@@ -38,18 +45,24 @@ def run_preflight(cmd, timeout=PREFLIGHT_TIMEOUT):
     타임아웃 → ('timeout', None), 실행 자체 불가(OSError 등) → (None, None).
     어떤 경우에도 예외를 밖으로 던지지 않는다(크래시 금지).
     """
-    try:
-        proc = subprocess.run(cmd, shell=isinstance(cmd, str), capture_output=True,
-                              text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
+    if cmd == DEFAULT_PREFLIGHT:
+        launch = [cmd[0], '-B'] + list(cmd[1:])
+    elif isinstance(cmd, str):
+        launch = [sys.executable, '-B', os.path.join(_SELF_DIR, '_owned_process.py'),
+                  '--shell', cmd]
+    else:
+        launch = [sys.executable, '-B', os.path.join(_SELF_DIR, '_owned_process.py'),
+                  '--command'] + list(cmd)
+    result = run_owned(launch, timeout, grace=PREFLIGHT_GRACE, force=PREFLIGHT_FORCE)
+    if result['timed_out']:
         return ('timeout', None)
-    except (OSError, ValueError):
-        return (None, None)
+    if not result['complete']:
+        return (None, 'incomplete: ' + result['reason'])
     last = ''
-    for ln in ((proc.stdout or '') + (proc.stderr or '')).splitlines():
+    for ln in (result['stdout'] + result['stderr']).splitlines():
         if ln.strip():
             last = ln.strip()
-    return (proc.returncode, last)
+    return result['returncode'], last
 
 
 def _preflight_line(cmd, timeout):
@@ -126,4 +139,4 @@ def main(argv=None):
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    sys.exit(managed_main(main))
