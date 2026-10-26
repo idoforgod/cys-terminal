@@ -1,0 +1,231 @@
+name: release-postprocess
+
+# ── 릴리스 후처리 레인 (zip + SHA256SUMS) ─────────────────────────────────────
+# ★왜 생겼나(2026-09-17 · v0.14.37): `scripts/release-postprocess.py` 는 지금까지 **오너 맥에서만**
+#   도는 손절차였다(docs/RELEASE.md 가 "CI 밖의 손절차"라고 적어 둔 그 단계). 그런데 그 스크립트의
+#   5단계 Gatekeeper 게이트는 `xcrun stapler validate` 2축 + SEAL-2 판독을 쓰므로, **그 맥의 Xcode
+#   라이선스 동의가 풀리면 판정 불가(rc=2)로 닫힌다** — 실제로 v0.14.37 에서 그렇게 막혔다.
+#   측정 불능은 통과가 아니므로 `--unsafe-skip-gatekeeper` 로 건너뛰지 않는다(평시·자동 경로 금지).
+#   대신 **게이트를 잴 수 있는 곳에서 잰다.**
+#
+# ★근거의 범위를 정직하게 적는다(성찰 지적): 이 레인이 부르는 게이트는 **둘**이다.
+#   · `scripts/release-gate-gatekeeper.sh`  — release.yml 의 'macOS Gatekeeper 게이트' 스텝이
+#     GitHub macOS 러너에서 이미 green 이다(v0.14.37 런 35186273691 · aarch64·x64 양쪽 success).
+#   · `scripts/verify-gatekeeper-user-path.sh` — 네이티브 아키텍처 DMG 에만 추가로 도는 상위판이고,
+#     **러너 실행 실적이 0건이다**(`grep -rn verify-gatekeeper-user-path .github/` → 없음).
+#     그 스크립트의 ⑥ 은 격리 사본 안에서 동봉 python 을 실제로 exec 하므로 AMFI 가 SIGKILL 할
+#     여지가 있다. 그래서 아래 게이트 로그를 **항상** 요약·아티팩트로 승격해 1회 실행으로
+#     어느 축이 왜 죽었는지 판별되게 한다. 여기서 rc≠0 이면 그것이 발행 금지 신호다.
+#
+# ★이 레인이 만들지 않는 것: 태그·릴리스·공개 승격. 오직 두 자산(zip · SHA256SUMS.txt)만
+#   **draft** 릴리스에 붙인다. 공개 발행은 `release-publish.yml`(오너 승인 환경)의 몫이다.
+#
+# 트리거: `chore/postprocess-*` 브랜치 push (그 브랜치에 이 파일이 있어야 돈다) · workflow_dispatch.
+#   ※ workflow_dispatch 는 이 파일이 **기본 브랜치에 들어간 뒤에만** UI·API 에 노출된다 —
+#     chore 브랜치 단계의 재실행 수단은 push 또는 실패 런 re-run 이다.
+#   입력 tag 를 주지 않으면 브랜치 이름 접미(chore/postprocess-v0.14.37 → v0.14.37)를 쓴다.
+
+on:
+  push:
+    branches: ['chore/postprocess-*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (vX.Y.Z)'
+        required: true
+        type: string
+
+permissions:
+  contents: write # draft 릴리스 자산 조회·다운로드·업로드에 GitHub 이 요구하는 최소 단위
+
+# 자산 교체는 DELETE→POST 라 원자적이지 않다 — 같은 대상에 두 런이 겹치면
+# SHA256SUMS.txt 가 없는 상태로 끝날 수 있다. 취소하지 말고 직렬화한다.
+concurrency:
+  group: release-postprocess-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  postprocess:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      # 태그 확정은 저장소 파일이 필요 없다 — checkout 보다 **앞**에 두어 그 태그를 체크아웃한다
+      # (게이트 도구와 검사 대상 바이트의 세대를 결박한다 · 브랜치 트리로 태그 자산을 재지 않는다).
+      - name: 대상 태그 확정 (fail-closed)
+        id: pick
+        shell: bash
+        env:
+          RAW_TAG: ${{ inputs.tag }} # ★표현식을 스크립트 본문에 직접 보간하지 않는다(개행 주입 차단)
+        run: |
+          set -euo pipefail
+          TAG="${RAW_TAG:-}"
+          if [ -z "$TAG" ]; then
+            TAG="${GITHUB_REF_NAME#chore/postprocess-}" # chore/postprocess-v0.14.37 → v0.14.37
+          fi
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::태그를 확정하지 못했다(입력·브랜치 접미 둘 다 부적합)" >&2
+            exit 2
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "대상 태그: $TAG"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pick.outputs.tag }}
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: git credential 헬퍼 배선 (스크립트 무수정 · github.com 한정)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # release-postprocess.py 는 `git credential fill` 로 토큰을 얻는다(osxkeychain 전제).
+          # 러너에는 키체인 자격이 없으므로 **스크립트를 고치지 않고** 헬퍼만 공급한다.
+          # ★호스트 스코프를 건다 — 스코프 없는 helper 는 이 job 의 **모든 https git 요청**에
+          #   토큰을 내준다(다른 원격으로 새는 경로). 값은 로그에 찍지 않는다.
+          git config --global credential.https://github.com.helper \
+            '!f() { test "$1" = get && printf "username=x-access-token\npassword=%s\n" "$GH_TOKEN"; }; f'
+          printf 'protocol=https\nhost=github.com\n\n' | git credential fill \
+            | sed 's/^password=.*/password=***있음***/'
+
+      - name: 대상이 draft 인지 단언 (공개 릴리스 자산 무승인 교체 차단)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.pick.outputs.tag }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, sys, urllib.request
+          tag, repo = os.environ["TAG"], os.environ["GITHUB_REPOSITORY"]
+          hdr = {"Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                 "Accept": "application/vnd.github+json"}
+          def get(path):
+              return json.load(urllib.request.urlopen(urllib.request.Request(
+                  "https://api.github.com" + path, headers=hdr)))
+          rel = None
+          try:
+              rel = get("/repos/%s/releases/tags/%s" % (repo, tag))  # 공개면 여기서 잡힌다
+          except urllib.error.HTTPError as e:
+              if e.code != 404:
+                  raise
+          if rel is None:  # draft 는 태그 조회로 안 나온다 — 목록에서 찾는다(전 페이지)
+              for page in (1, 2, 3, 4):
+                  for r in get("/repos/%s/releases?per_page=100&page=%d" % (repo, page)):
+                      if r["tag_name"] == tag:
+                          rel = r
+                          break
+                  if rel:
+                      break
+          if rel is None:
+              raise SystemExit("::error::릴리스를 찾지 못했다: %s" % tag)
+          print("릴리스 %s — draft=%s · 자산 %d종" % (tag, rel["draft"], len(rel["assets"])))
+          if not rel["draft"]:
+              raise SystemExit(
+                  "::error::대상이 **공개 릴리스**다 — 이 레인은 draft 에만 자산을 붙인다. "
+                  "공개본 자산 교체는 홈페이지가 참조 중인 SHA256SUMS 를 무승인으로 갈아치운다.")
+          print("✓ draft 확인 — 진행")
+          PY
+
+      - name: 게이트 회귀 그물 (게이트를 발행 근거로 신뢰하기 **직전**)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # release.yml 이 같은 게이트를 부르기 직전에 두는 것과 같은 스텝이다 —
+          # '게이트가 실제로 결함을 잡는지' 를 먼저 증명하고 그 다음에 그 rc 를 신뢰한다.
+          T=scripts/tests/test_release_postprocess_gate.py
+          [ -f "$T" ] || { echo "::error::회귀 그물 부재: $T" >&2; exit 1; }
+          python3 "$T"
+
+      - name: 후처리 실행 (zip + SHA256SUMS · Gatekeeper 게이트 포함 · 업로드)
+        id: post
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.pick.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # ⚠ --unsafe-skip-gatekeeper·--diagnose-degraded-ok 를 붙이지 마라. 이 레인의 존재 이유가
+          #    '게이트를 실제로 도는 곳에서 돌리는 것' 이다(그 부재는 회귀 그물이 기계로 지킨다).
+          python3 scripts/release-postprocess.py "$TAG" --apply 2>&1 | tee /tmp/gate.log
+
+      - name: 게이트 증적 승격 (실패해도 남긴다)
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          [ -f /tmp/gate.log ] || exit 0
+          {
+            echo "### Gatekeeper 게이트 증적"
+            echo ''
+            echo '```'
+            grep -E '^(GATE_MODE=|spctl: |GKTOOL_AXIS=)' /tmp/gate.log || true
+            grep -E '^(PASS|FAIL|SKIP) ' /tmp/gate.log || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gate-log-${{ steps.pick.outputs.tag }}
+          path: /tmp/gate.log
+          if-no-files-found: warn
+
+      - name: 업로드 **되읽기** 검증 + release-publish 입력 산출
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.pick.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # ★반환값은 반영의 증거가 아니다 — 올린 바이트를 **다시 받아** 해시를 잰다.
+          #   release-publish.yml 이 대조하는 값도 '릴리스에서 다시 받은' SHA256SUMS 의 해시다.
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import hashlib, json, os, urllib.request
+          tag, repo = os.environ["TAG"], os.environ["GITHUB_REPOSITORY"]
+          ver = tag.lstrip("v")
+          hdr = {"Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                 "Accept": "application/vnd.github+json"}
+          rel = None
+          for page in (1, 2, 3, 4):
+              body = json.load(urllib.request.urlopen(urllib.request.Request(
+                  "https://api.github.com/repos/%s/releases?per_page=100&page=%d" % (repo, page),
+                  headers=hdr)))
+              for r in body:
+                  if r["tag_name"] == tag:
+                      rel = r
+                      break
+              if rel or not body:
+                  break
+          if rel is None:
+              raise SystemExit("::error::릴리스를 찾지 못했다: %s" % tag)
+          names = {a["name"]: a for a in rel["assets"]}
+          need = ["SHA256SUMS.txt", "cys_%s_x64-setup.zip" % ver]
+          missing = [n for n in need if n not in names]
+          if missing:
+              raise SystemExit("::error::업로드 누락: %s" % ", ".join(missing))
+          a = names["SHA256SUMS.txt"]
+          raw = urllib.request.urlopen(urllib.request.Request(
+              a["url"], headers={"Authorization": hdr["Authorization"],
+                                 "Accept": "application/octet-stream"})).read()
+          if len(raw) != a["size"]:
+              raise SystemExit("::error::SHA256SUMS 크기 불일치: %d != %d" % (len(raw), a["size"]))
+          local = open(os.path.expanduser("~/cys-release-backup/%s-assets/SHA256SUMS.txt" % tag), "rb").read()
+          if raw != local:
+              raise SystemExit("::error::업로드본과 로컬 산출물의 바이트가 다르다(업로드 손상)")
+          digest = hashlib.sha256(raw).hexdigest()
+          print("### 후처리 완료 — %s" % tag)
+          print("")
+          print("올라간 자산 %d종. 되읽기 대조 일치." % len(names))
+          print("")
+          print("`release-publish.yml` 입력값:")
+          print("")
+          print("```")
+          print("release_bundle_sha256=%s" % digest)
+          print("```")
+          PY
