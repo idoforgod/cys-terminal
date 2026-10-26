@@ -25239,7 +25239,7 @@ mod tests {
     /// 공유 락 + 기본값 명시 고정(governance·handlers 의 grace env 터치 테스트와 직렬화).
     #[test]
     fn manual_reap_denial_seven_condition_matrix() {
-        let _g = crate::governance::REAP_ENV_LOCK.lock().unwrap();
+        let _g = crate::governance::REAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env = crate::governance::ReapEnvGuard::set(&[
             ("CYS_REAP_EXITED_GRACE_SECS", "60"),
             ("CYS_REAP_EXITED_NONROLE_GRACE_SECS", "10"),
@@ -25499,7 +25499,7 @@ mod tests {
     /// surface.reaped{reason:"manual_reclaim", by_surface, by_role:"cso"} additive 발행.
     #[test]
     fn reap_allows_privileged_after_grace() {
-        let _g = crate::governance::REAP_ENV_LOCK.lock().unwrap();
+        let _g = crate::governance::REAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env = crate::governance::ReapEnvGuard::set(&[("CYS_REAP_EXITED_GRACE_SECS", "0")]);
         let daemon = claim_daemon();
         let cso = make_surface(&daemon, Some("cso"));
@@ -25545,7 +25545,7 @@ mod tests {
     #[test]
     #[cfg_attr(not(unix), ignore = "윈도우 ConPTY 는 자식이 끝나도 출력 파이프를 닫지 않는다 — reader EOF 로 좌석 종료를 아는 경로는 유닉스 전제")]
     fn reap_denies_queue_nonempty_then_queue_clear_exited_reclaim() {
-        let _g = crate::governance::REAP_ENV_LOCK.lock().unwrap();
+        let _g = crate::governance::REAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env = crate::governance::ReapEnvGuard::set(&[("CYS_REAP_EXITED_GRACE_SECS", "0")]);
         let daemon = claim_daemon();
         let cso = make_surface(&daemon, Some("cso"));

@@ -13254,6 +13254,15 @@ fn maybe_reset_stale_pending_input(
 /// ★G4(W4-C): governance::tests 사설 static 에서 **크레이트 테스트 공용**(pub(crate))으로
 /// 격상 — handlers::tests 의 수동 reap 테스트도 같은 env 를 읽으므로(grace 판정
 /// exited_surface_due 재사용), 모듈별 락 두 개로는 서로를 직렬화하지 못한다.
+/// ★획득은 **관용형 고정**이다 — `REAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())`.
+/// ⛔`.unwrap()` 을 쓰지 마라: 이 락은 `Mutex<()>` 로 **지킬 값이 없고**(env 는 각 검체가
+/// `ReapEnvGuard` 로 자기 값을 세우고 패닉 되감기에서도 되돌린다) 오염은 **전파만** 한다.
+/// ★실측(windows-health 40234570889 a1 · 40206997437 a2 · 2026-10-26): 검체 1건
+/// (`deadman_idle_debounce_knob_separate` 의 `left: 2 right: 3`)이 락을 쥔 채 패닉하자
+/// ★치명형 21 사이트 중 **11건이 `PoisonError` 로 연쇄 사망**해 빨강이 1 → 12 로 불었고,
+/// 관용형 9 사이트는 **0건** 떨어졌다. 로컬 재현(의도된 포이즌너 1건 · `--test-threads=1`):
+/// 치명형 **17 실패 / 0 통과**(PoisonError 16) → 관용형 **1 실패 / 16 통과**(PoisonError 0).
+/// ⇒ ★연쇄가 사라지면 다음 빨강은 **셀 수 있는 빨강**이다.
 #[cfg(test)]
 pub(crate) static REAP_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -18449,8 +18458,10 @@ mod tests {
         // Wait for the fixture's raw process facts, not merely any startup
         // descendant and not the liveness/tick result that this test measures.
         let mut sys = sysinfo::System::new();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // ★운반체 1 — 이 검체의 10-26 적색이 「느림이 아니라 멈춤」임을 가른 그 계기다(위 doc 참조).
+        let mut margin = PrereqMargin::new("rqfix2_prereq", std::time::Duration::from_secs(5));
         loop {
+            margin.poll();
             sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
             let descendants = collect_descendants(&sys, s.pid);
             let targets: Vec<sysinfo::Pid> = descendants.iter().map(|(pid, _)| sysinfo::Pid::from_u32(*pid)).collect();
@@ -18470,9 +18481,10 @@ mod tests {
                 })
             });
             if ready {
+                margin.ready();
                 break;
             }
-            assert!(std::time::Instant::now() < deadline, "rqfix2 prerequisite: NOTE-bearing sh with a sleep descendant did not appear");
+            assert!(!margin.expired(), "rqfix2 prerequisite: NOTE-bearing sh with a sleep descendant did not appear");
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
         let cmds: Vec<String> = super::collect_descendants_with_cmd(&sys, s.pid).into_iter().map(|(_, c)| c).collect();
@@ -20100,18 +20112,93 @@ mod tests {
         (fg, root)
     }
 
+    /// ★「전제 폴링 + 시한」 가족 공용 ★시한 여유 계기 — ⒜값은 **항상** 모으고 ⒝출력은
+    /// ⒤**실패 때 무조건** · ⒥**통과 때는 env 가 켜졌을 때만** 찍는다.
+    ///
+    /// ★env 이름: **`CYS_RQFIX2_MARGIN`** · ★**기본값(미설정) = 통과 때 출력 0**(= 평시 CI 로그 증가 0).
+    ///   값이 정확히 `"1"` 일 때만 켠다(⛔`"0"`·빈 값·다른 값은 꺼진 것으로 읽는다).
+    ///
+    /// ★왜 `DeadmanTickTrace`(D-R2-3 덤프)와 **모양이 다른가** — ⛔같은 법을 다른 모양에 복사하지 않는다:
+    ///   · 덤프는 ★**실패 경로 전용이 미덕**이다. 거기서 필요한 것은 ★그 한 번의 틱 표이고,
+    ///     통과 때 출력 0 이 로그 비용을 0 으로 만든다.
+    ///   · 이 계기는 ★**분포가 본체**다. 통과 실행의 여유가 모여야 「느림인가 멈춤인가」가 갈린다 —
+    ///     ★실측(2026-10-26 · HEAD/PARENT 각 400회): 정상은 ★2폴·65 ms 로 시한 5,000 ms 의 ★**1.3 %만**
+    ///     쓰고, 두 팔의 ★최댓값조차 시한의 ★**1/50**(99.4 / 95.7 ms)이다 ⇒ ★그래서 10-26 CI 실패
+    ///     (`margin 0`)는 ★분포의 **꼬리가 아니라 밖**이고 ★**5 초 멈춤**이다 ⇒ ⛔**시한 상향은 처방이 아니다.**
+    ///     같은 측정이 ★양 팔 분포의 겹침(중앙 65.654/65.769 · Δ −0.115 ms · p75 동일)으로
+    ///     ★「우리 변경 혐의 없음」을 ⛔실패를 기다리지 않고 확정했다.
+    ///     정본: `~/.cys/state/worker-4/mac-rqfix2-history/20261026T084258Z/REPORT-DEADLINE-MARGIN.md`
+    ///   ⇒ 그래서 ★두 모양을 합쳤다: 통과분은 ★조사할 때만 흐르고, 실패분은 ★언제나 자기를 설명한다.
+    ///
+    /// ★붙이는 법(세 줄): `let mut m = PrereqMargin::new("tag", budget);` → 루프 머리에서 `m.poll();`
+    ///   → 성립 지점에서 `m.ready();` → 시한 검사를 `m.expired()` 로 바꾼다
+    ///   (⇒ ★원래 단언·패닉 문구는 **그대로 둔다** — CI 의 실패 메시지 모양이 바뀌면 분류기가 깨진다).
+    #[cfg(unix)]
+    struct PrereqMargin {
+        tag: &'static str,
+        start: std::time::Instant,
+        deadline: std::time::Instant,
+        polls: u32,
+    }
+    #[cfg(unix)]
+    impl PrereqMargin {
+        fn new(tag: &'static str, budget: std::time::Duration) -> Self {
+            let start = std::time::Instant::now();
+            Self { tag, start, deadline: start + budget, polls: 0 }
+        }
+        /// 루프 머리에서 1회 — 폴 횟수는 ★분포의 두 번째 축이다(소요가 같아도 폴이 적으면 폴이 느린 것이다).
+        fn poll(&mut self) {
+            self.polls += 1;
+        }
+        fn line(&self, ready: bool) -> String {
+            let now = std::time::Instant::now();
+            format!(
+                "PREREQ-MARGIN tag={} ready={} polls={} elapsed_ms={:.3} margin_ms={:.3} budget_ms={:.0}",
+                self.tag,
+                ready,
+                self.polls,
+                self.start.elapsed().as_secs_f64() * 1000.0,
+                self.deadline.saturating_duration_since(now).as_secs_f64() * 1000.0,
+                self.deadline.saturating_duration_since(self.start).as_secs_f64() * 1000.0
+            )
+        }
+        /// 전제 성립 — ★env 가 켜진 때만 찍는다(분포 수집용 · 평시 0줄).
+        fn ready(&self) {
+            if std::env::var("CYS_RQFIX2_MARGIN").as_deref() == Ok("1") {
+                println!("{}", self.line(true));
+            }
+        }
+        /// 시한 초과인가 — ★참이면 env 와 무관하게 ★무조건 찍는다(실패는 언제나 자기를 설명해야 한다).
+        fn expired(&self) -> bool {
+            let over = std::time::Instant::now() >= self.deadline;
+            if over {
+                println!("{}", self.line(false));
+            }
+            over
+        }
+    }
+
     /// 전경 그룹이 원하는 상태가 될 때까지 폴링(≤ 8초)한다 — `want_job` 이면 전경 ≠ 뿌리(작업), 아니면 전경 == 뿌리(셸 프롬프트·작업 제어 없는 자손). 끝내 안 되면 전제 실패로
     /// 패닉한다(결측·환경 한계는 통과가 아니다). 반환 = 그 시점의 전경 그룹 id. **본 단언 전에 이 전제를 먼저 세운다**(실 PTY 검체의 흔들림 방지).
     #[cfg(unix)]
     fn wait_foreground(s: &Arc<crate::state::Surface>, want_job: bool, what: &str) -> i32 {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        // ★운반체 2 — 같은 가족(전제 폴링 + 시한)에 ★세 줄로 붙는다(선언이 아니라 운반체다).
+        //   ★수(2026-10-26 기계 census · 중복 cfg 정의를 합쳐 센다): 이 헬퍼의 **호출 지점 12곳**
+        //   = 시험 10 + 헬퍼 2(`wp5_job_seat` · `r1f_in_job_then_nested_shell_seat`)이고, 그 헬퍼를
+        //   거쳐 ★계기를 얻는 `#[test]` 는 **19건**이다(추이적 닫힘). ⛔「12건」으로 적지 마라 —
+        //   12 는 호출 지점 수이고 검체 수가 아니다.
+        //   ★실행으로도 확인했다: `CYS_RQFIX2_MARGIN=1` 로 19 + 운반체 1 검체 = **20/20** 이
+        //   각각 ≥1 줄을 냈고(합 31줄), env 미설정에서는 20/20 이 **0줄**이었다.
+        let mut margin = PrereqMargin::new("wait_foreground", std::time::Duration::from_secs(8));
         loop {
+            margin.poll();
             let (fg, root) = pty_groups(s);
             let ok = if want_job { fg.is_some() && fg != root } else { fg.is_some() && fg == root };
             if ok {
+                margin.ready();
                 return fg.expect("전경 그룹");
             }
-            if std::time::Instant::now() >= deadline {
+            if margin.expired() {
                 panic!("전제 실패({what}): 전경 그룹이 기대 상태가 되지 않았다 — fg={fg:?} root={root:?} want_job={want_job}");
             }
             std::thread::sleep(std::time::Duration::from_millis(25));
@@ -25180,7 +25267,7 @@ mod tests {
     #[test]
     fn exited_surface_due_respects_role_grace() {
         use super::exited_surface_due;
-        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _g = REAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env = ReapEnvGuard::set(&[
             ("CYS_REAP_EXITED_GRACE_SECS", "60"),
             ("CYS_REAP_EXITED_NONROLE_GRACE_SECS", "10"),
@@ -25235,7 +25322,7 @@ mod tests {
     /// phoenix가 desired_roster로 되살려야 하므로. 역할 매핑 정리는 여전히 일어나야 한다.
     #[test]
     fn reap_exited_does_not_tombstone_role() {
-        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _g = REAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let daemon = drill_daemon("reap-exited");
         let id = spawn_role_surface(&daemon, "worker");
         // exited 마킹 + stamp(과거로 둘 필요 없음 — grace 0으로 즉시 회수 대상).
@@ -25429,6 +25516,92 @@ mod tests {
             .expect("clock too young for backdate");
     }
 
+    /// ★D-R2-3 상설 덤프 — ★실패 경로에서만 찍는다(통과 때 출력 0 ⇒ 로그 비용 0).
+    ///
+    /// ★왜 이 칸들인가: `shell_alive` 와 `exited` ★두 칸이 ★축 A/B 를 가른다(맥 실측 2026-10-26 ·
+    /// `state/worker-4/p2a-r2-discriminator/20261026T074007Z/REPORT.md`).
+    ///   · ★축 A(**제품** · 벽시계 역행이 G4 `now - last >= idle_debounce` 를 누른다):
+    ///     `last_idle_alert` 를 ★+10~20µs 미래로 심으면 `master.idle` 이 3 → ★**2** 가 되는데,
+    ///     그때 ★**전 틱이 `shell_alive=true` · `exited=false` 를 유지**한다.
+    ///     ★양성 서명은 ★**`now-last` 가 음수인 틱**이다(맥 실측: 그 틱의 `verdict=(미발행)` ·
+    ///     `now-last=-0.999983` · `exited=false`) — ⛔「B 가 아니다」가 아니라 ★A 자신의 지문이다.
+    ///   · ★축 B(**하네스** · fixture 자식(`sleep 30`)이 틱 ★사이에 죽는다):
+    ///     `master.idle` 이 ★**2** 에서 멈추는 ★그 틱에서 ★**`exited=true`**(또는 `shell_alive=false`)가 된다.
+    ///     ★맥 실측: 그 틱의 `now-last=+0.205218`(★양수) · `exited=true` · `shell_alive` 는 아직 `true`
+    ///     였다 ⇒ ⛔`shell_alive` 단독으로 B 를 판정하지 마라 — ★`exited` 가 B 의 1차 지문이다.
+    ///   ⇒ ★두 서명이 다르므로, ★다음 발화의 덤프 하나로 제품/하네스가 갈린다 —
+    ///     ⛔Windows 런을 기다리되 ★사람이 같은 질문을 다시 하지 않는다(간헐에 기대지 않는 측정).
+    /// ★`verdict` 칸은 ★제품이 스스로 발행한 이벤트로 적는다(⛔테스트가 판정을 재구성하지 않는다):
+    /// `master.idle` 이 1 늘면 `Idle` · `master.deadman` 이 1 늘면 `Dead:<axis>` · 둘 다 그대로면 `(미발행)`.
+    /// ★`now`·`last` 는 `now_epoch()`(= `SystemTime` · ⛔**단조 아님**)이고 `idle_secs` 는 `Instant` 다 —
+    /// 그 비대칭이 축 A 의 전제다. 같은 가족의 다른 deadman 검체도 ★같은 세 줄로 붙일 수 있다
+    /// (`new` → 틱마다 `after_tick` → 개수 단언을 `expect` 로).
+    struct DeadmanTickTrace {
+        role: String,
+        rows: Vec<String>,
+        idle: usize,
+        dead: usize,
+    }
+    impl DeadmanTickTrace {
+        fn new(role: &str) -> Self {
+            Self { role: role.to_string(), rows: Vec::new(), idle: 0, dead: 0 }
+        }
+        /// 한 틱을 돈 ★직후에 부른다.
+        fn after_tick(
+            &mut self,
+            daemon: &Arc<Daemon>,
+            s: &crate::state::Surface,
+            tracker: &DeadmanTracker,
+        ) {
+            let idles = events_named(daemon, "master.idle");
+            let deads = events_named(daemon, "master.deadman");
+            let verdict = if idles.len() > self.idle {
+                "Idle".to_string()
+            } else if deads.len() > self.dead {
+                format!(
+                    "Dead:{}",
+                    deads.last().and_then(|e| e["payload"]["axis"].as_str()).unwrap_or("?")
+                )
+            } else {
+                "(미발행)".to_string()
+            };
+            self.idle = idles.len();
+            self.dead = deads.len();
+            let now = now_epoch();
+            let last = tracker.last_idle_alert.get(&self.role).copied().unwrap_or(0.0);
+            self.rows.push(format!(
+                "  틱{:>2} verdict={:<12} now={:.6} last={:.6} now-last={:+.6}                  shell_alive={:<5} exited={:<5} seat_cache={} idle누적={} deadman누적={}",
+                self.rows.len() + 1,
+                verdict,
+                now,
+                last,
+                now - last,
+                crate::state::pid_alive(s.pid),
+                s.exited.load(AtomicOrdering::Relaxed),
+                s.seat_cache.load(AtomicOrdering::Relaxed),
+                self.idle,
+                self.dead,
+            ));
+        }
+        /// 개수 단언을 이 함수로 감싼다 — ★어긋날 때만 덤프를 찍고, 그 다음 ★원래 단언이 패닉한다
+        /// (⇒ CI 의 패닉 메시지 모양은 ⛔바뀌지 않는다 · 덤프는 그 앞줄에 남는다).
+        fn expect(&self, got: usize, want: usize, what: &str) {
+            if got != want {
+                println!(
+                    "★D-R2-3 덤프(role={} · 틱 {}개) — 판별: 전 틱 shell_alive=true∧exited=false ⇒ 축 A(제품·벽시계) · \
+idle 이 멈춘 틱에서 exited=true∨shell_alive=false ⇒ 축 B(하네스·자식 사망)",
+                    self.role,
+                    self.rows.len()
+                );
+                for r in &self.rows {
+                    println!("{r}");
+                }
+            }
+            assert_eq!(got, want, "{what}");
+        }
+    }
+
+
     /// [핀1·결함 8 박제 — 순수 판정자 진리표] 침묵은 어떤 좌석 상태에서도 Idle 로만 사상되고
     /// DeadCandidate 가 될 수 없다. 실측 시나리오(임계 20s·침묵 21s의 살아있는 zsh) 그대로.
     #[test]
@@ -25536,7 +25709,7 @@ mod tests {
     /// master.deadman 0건 — master.idle(category=info·GUI 폴백 토스트 레인 부재)만 1건(디바운스).
     #[test]
     fn deadman_silence_alone_is_idle_not_death() {
-        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _g = REAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env = ReapEnvGuard::set(&[
             ("CYS_MASTER_DEADMAN_SECS", "20"),
             ("CYS_ROLE_DEADMAN_GRACE_SECS", "0"),
@@ -25544,17 +25717,19 @@ mod tests {
         let (daemon, sid) = deadman_daemon("silence");
         let s = daemon.get_surface(sid).unwrap();
         let mut tracker = DeadmanTracker::default();
+        let mut trace = DeadmanTickTrace::new("master");
         for _ in 0..5 {
             backdate_output(&s, 21);
             check_role_deadman(&daemon, &mut tracker);
+            trace.after_tick(&daemon, &s, &tracker);
         }
-        assert_eq!(
+        trace.expect(
             events_named(&daemon, "master.deadman").len(),
             0,
-            "침묵 단독으로 death 발화 — 결함 8 재발"
+            "침묵 단독으로 death 발화 — 결함 8 재발",
         );
         let idles = events_named(&daemon, "master.idle");
-        assert_eq!(idles.len(), 1, "idle 은 정보성 1건(300s 디바운스)이어야");
+        trace.expect(idles.len(), 1, "idle 은 정보성 1건(300s 디바운스)이어야");
         let e = &idles[0];
         assert_eq!(e["category"], "info", "GUI category 폴백 토스트 레인(watchdog) 낙하 금지");
         let p = &e["payload"];
@@ -25577,7 +25752,7 @@ mod tests {
     /// [핀2] DeadCandidate 연속 1·2회는 무발화, 3회째(기본 CONFIRM_TICKS)에 1회 발화 + misses==3.
     #[test]
     fn deadman_fires_only_after_confirm_ticks() {
-        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _g = REAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env = ReapEnvGuard::set(&[("CYS_ROLE_DEADMAN_GRACE_SECS", "0")]);
         let (daemon, sid) = deadman_daemon("confirm");
         let s = daemon.get_surface(sid).unwrap();
@@ -25600,7 +25775,7 @@ mod tests {
     /// 간헐 프로브 실패가 사망 확증 카운터를 세탁하지 못한다.
     #[test]
     fn deadman_unknown_probe_neither_counts_nor_resets() {
-        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _g = REAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env = ReapEnvGuard::set(&[("CYS_ROLE_DEADMAN_GRACE_SECS", "0")]);
         let (daemon, sid) = deadman_daemon("unknown");
         let s = daemon.get_surface(sid).unwrap();
@@ -25641,7 +25816,7 @@ mod tests {
     /// misses 를 0으로 되돌린다 — 이후 재실패도 3회를 새로 요구.
     #[test]
     fn deadman_agent_recovery_resets_misses() {
-        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _g = REAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env = ReapEnvGuard::set(&[("CYS_ROLE_DEADMAN_GRACE_SECS", "0")]);
         let (daemon, sid) = deadman_daemon("recovery");
         let s = daemon.get_surface(sid).unwrap();
@@ -25666,7 +25841,7 @@ mod tests {
     /// [핀5·요구 e] 좌석 빈사(셸 생존·에이전트 사망)는 axis=agent_dead 로 셸 사망과 구분 노출.
     #[test]
     fn deadman_agent_dead_axis_when_shell_alive() {
-        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _g = REAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env = ReapEnvGuard::set(&[("CYS_ROLE_DEADMAN_GRACE_SECS", "0")]);
         let (daemon, sid) = deadman_daemon("agent-dead");
         let s = daemon.get_surface(sid).unwrap();
@@ -25692,7 +25867,7 @@ mod tests {
     /// [핀6] v2 payload 계약 전 필드 + surface_exited 의 reason 구값 그대로(하위호환 핀).
     #[test]
     fn deadman_payload_contract_v2() {
-        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _g = REAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env = ReapEnvGuard::set(&[("CYS_ROLE_DEADMAN_GRACE_SECS", "0")]);
         let (daemon, sid) = deadman_daemon("payload");
         let s = daemon.get_surface(sid).unwrap();
@@ -25735,7 +25910,7 @@ mod tests {
     /// 사망 판정(fail-closed)은 상시 유지(v1 전체 비활성에서 축소된 유일한 행동 변경).
     #[test]
     fn deadman_secs_zero_disables_idle_only() {
-        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _g = REAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env = ReapEnvGuard::set(&[
             ("CYS_MASTER_DEADMAN_SECS", "0"),
             ("CYS_ROLE_DEADMAN_GRACE_SECS", "0"),
@@ -25743,27 +25918,30 @@ mod tests {
         let (daemon, sid) = deadman_daemon("secs-zero");
         let s = daemon.get_surface(sid).unwrap();
         let mut tracker = DeadmanTracker::default();
+        let mut trace = DeadmanTickTrace::new("master");
         for _ in 0..4 {
             backdate_output(&s, 1000);
             check_role_deadman(&daemon, &mut tracker);
+            trace.after_tick(&daemon, &s, &tracker);
         }
-        assert_eq!(events_named(&daemon, "master.idle").len(), 0, "0 = idle 비활성");
-        assert_eq!(events_named(&daemon, "master.deadman").len(), 0);
+        trace.expect(events_named(&daemon, "master.idle").len(), 0, "0 = idle 비활성");
+        trace.expect(events_named(&daemon, "master.deadman").len(), 0, "0 = death 미발화");
         s.exited.store(true, AtomicOrdering::Relaxed);
         for _ in 0..3 {
             check_role_deadman(&daemon, &mut tracker);
+            trace.after_tick(&daemon, &s, &tracker);
         }
-        assert_eq!(
+        trace.expect(
             events_named(&daemon, "master.deadman").len(),
             1,
-            "0 이어도 진짜 사망(surface exited)은 발화해야(fail-closed)"
+            "0 이어도 진짜 사망(surface exited)은 발화해야(fail-closed)",
         );
     }
 
     /// [핀8] 발화 후 디바운스(기본 300s) 내 동일 role 재발화 억제, 경과 후 재발화.
     #[test]
     fn deadman_debounce() {
-        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _g = REAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env = ReapEnvGuard::set(&[("CYS_ROLE_DEADMAN_GRACE_SECS", "0")]);
         let (daemon, sid) = deadman_daemon("debounce");
         let s = daemon.get_surface(sid).unwrap();
@@ -25786,7 +25964,7 @@ mod tests {
     /// [핀10] grace 창(부트·승계 직후) 내에는 DeadCandidate 도 무카운트 — 오살 방지.
     #[test]
     fn deadman_grace_window() {
-        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _g = REAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env = ReapEnvGuard::set(&[("CYS_ROLE_DEADMAN_GRACE_SECS", "3600")]);
         let (daemon, sid) = deadman_daemon("grace");
         let s = daemon.get_surface(sid).unwrap();
@@ -25804,7 +25982,7 @@ mod tests {
     /// 살아있는 master 를 사망으로 오라벨하는 결함 8 동형 신규 레인의 봉쇄 핀.
     #[test]
     fn deadman_bare_shell_descendant_does_not_arm_vacant_axis() {
-        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _g = REAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env = ReapEnvGuard::set(&[("CYS_ROLE_DEADMAN_GRACE_SECS", "0")]);
         let (daemon, sid) = deadman_daemon("bare-occupied");
         let s = daemon.get_surface(sid).unwrap();
@@ -25848,7 +26026,7 @@ mod tests {
     /// "master silent"로나마 울렸다).
     #[test]
     fn deadman_agent_never_started_axis() {
-        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _g = REAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env = ReapEnvGuard::set(&[("CYS_ROLE_DEADMAN_GRACE_SECS", "0")]);
         let (daemon, sid) = deadman_daemon("never-started");
         let s = daemon.get_surface(sid).unwrap();
@@ -25886,7 +26064,7 @@ mod tests {
     /// 생존으로 반증된다 — sysinfo 매칭이 못 보는 에이전트의 오살 방지(fail-safe).
     #[test]
     fn deadman_agent_never_started_socket_rebuts() {
-        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _g = REAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env = ReapEnvGuard::set(&[("CYS_ROLE_DEADMAN_GRACE_SECS", "0")]);
         let (daemon, sid) = deadman_daemon("never-started-rebut");
         let s = daemon.get_surface(sid).unwrap();
@@ -25911,7 +26089,7 @@ mod tests {
     /// 디바운스와 분리된다 — 기본은 death 노브 체이닝(현행 불변), 설정 시 독립.
     #[test]
     fn deadman_idle_debounce_knob_separate() {
-        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _g = REAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env = ReapEnvGuard::set(&[
             ("CYS_MASTER_DEADMAN_SECS", "20"),
             ("CYS_ROLE_DEADMAN_GRACE_SECS", "0"),
@@ -25920,12 +26098,14 @@ mod tests {
         let (daemon, sid) = deadman_daemon("idle-knob");
         let s = daemon.get_surface(sid).unwrap();
         let mut tracker = DeadmanTracker::default();
+        let mut trace = DeadmanTickTrace::new("master");
         for _ in 0..3 {
             backdate_output(&s, 21);
             check_role_deadman(&daemon, &mut tracker);
+            trace.after_tick(&daemon, &s, &tracker);
         }
         let idles = events_named(&daemon, "master.idle");
-        assert_eq!(idles.len(), 3, "idle 디바운스 0 = 매 틱 발화(death 노브와 독립)");
+        trace.expect(idles.len(), 3, "idle 디바운스 0 = 매 틱 발화(death 노브와 독립)");
         assert_eq!(idles[0]["payload"]["debounce_secs"], 0, "payload 는 idle 전용 노브 값");
         assert_eq!(events_named(&daemon, "master.deadman").len(), 0);
     }
@@ -25934,7 +26114,7 @@ mod tests {
     /// 반증된다 — 활동=생존 증거, 부재는 증거 아님(fail-safe 방향).
     #[test]
     fn deadman_socket_activity_rebuts_agent_death() {
-        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _g = REAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env = ReapEnvGuard::set(&[("CYS_ROLE_DEADMAN_GRACE_SECS", "0")]);
         let (daemon, sid) = deadman_daemon("socket-rebut");
         let s = daemon.get_surface(sid).unwrap();
@@ -25973,7 +26153,7 @@ mod tests {
     /// [핀12] surface 소멸(roles 매핑만 잔존) — axis=surface_gone·reason 구값 보존.
     #[test]
     fn deadman_surface_gone_axis() {
-        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _g = REAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env = ReapEnvGuard::set(&[("CYS_ROLE_DEADMAN_GRACE_SECS", "0")]);
         let daemon = drill_daemon("gone");
         daemon.roles.lock().unwrap().insert("master".into(), 424_242);
@@ -25991,7 +26171,7 @@ mod tests {
     /// [핀13·요구 f] CYS_ROLE_DEADMAN_ROLES CSV 로 role 일반화 — worker 좌석도 동일 절차.
     #[test]
     fn deadman_role_generalization_csv() {
-        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _g = REAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env = ReapEnvGuard::set(&[
             ("CYS_ROLE_DEADMAN_ROLES", "master, worker"),
             ("CYS_ROLE_DEADMAN_GRACE_SECS", "0"),
