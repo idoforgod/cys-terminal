@@ -39,15 +39,16 @@
        안내까지 지운다. 그 회귀는 ⓐ·ⓒ만으로는 통과해 버리므로 ⓑ 로 0건을 즉시 잡는다.
      ★⑤(다운로드 페이지 Defender 섹션)와 **다른 페이지·다른 축**이다 — 어느 쪽도 약화시키지 않는다.
 
-사용: python3 scripts/verify-release-remote.py <신버전> <구버전>      # 정본 — 8축(①~⑧)
-      python3 scripts/verify-release-remote.py <신버전> --no-prev     # 구버전이 없을 때만(① SKIP 명시)
-      python3 scripts/verify-release-remote.py --self-test             # 판정·인자 셀프테스트(무접촉)
-      ★구버전 생략은 **--no-prev 로만** 허용한다(U4 C4-⑦ · 2026-09-23). 종전엔 구버전을 빼먹으면
-        ① 을 조용히 빼고 분모 8→7 로 "7/7 PASS" 를 냈는데, 그 분모가 오너 문서의 합격 문구와 같아
-        **빼먹은 실행이 합격으로 읽혔다**(구버전 문자열 잔존 = 홈페이지 옛 다운로드 링크 사고를 놓침).
-        이제 플래그 없는 생략은 원격 수신 **전에** exit 2 이고, --no-prev 실행은 요약 줄에 "①SKIP" 을 병기한다.
-종료코드: 0 = 전건 통과 · 1 = 하나라도 실패(발행 미완) · 2 = 인자 오류(원격 무접촉)
+사용: python3 scripts/verify-release-remote.py <신버전>               # 공개 목록에서 전임 파생 · 정본 8축
+      python3 scripts/verify-release-remote.py <신버전> <구버전>      # 인자는 파생값과 같아야 한다
+      python3 scripts/verify-release-remote.py <신버전> --no-prev     # ① SKIP · 부분 측정
+      python3 scripts/verify-release-remote.py --self-test           # 오프라인 판정·인자·main 시험
+      ★과거의 조용한 생략(7/7 PASS)은 허용하지 않는다. 구버전 인자가 없으면 파생하며,
+        목록 수신·스키마·완결 실패 또는 전임 부재는 ① FAIL 이다. --no-prev 만 명시적으로 면제한다.
+종료코드: 0 = 정본 8축 전건 통과 · 1 = 축 실패 또는 측정 불능 · 2 = 인자 오류(원격 무접촉)
+          3 = --no-prev 로 ①을 재지 않고 나머지 7축만 통과(정본 합격 아님); 실패는 3보다 우선한다.
 """
+from datetime import datetime
 import hashlib
 import json
 import re
@@ -226,9 +227,307 @@ def get_json(url):
         return None
 
 
+# P9: complete public binary-release inventory; pack-only tags never supply axis ①.
+RELEASES_URL = "https://api.github.com/repos/idoforgod/cys-terminal/releases"
+BINARY_TAG_RE = re.compile(r"v([0-9]+\.[0-9]+\.[0-9]+)")
+PUBLISHED_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
+
+
+def vkey(ver):
+    return tuple(int(n) for n in ver.split("."))
+
+
+def derive_prev(releases, ver):
+    """Pure P1..P7 selector -> (derived | received-empty | fetch/schema-failed, value, reason)."""
+    failed = "fetch/schema-failed"
+    if not isinstance(releases, list):
+        message = " message=%r" % releases.get("message") if isinstance(releases, dict) else ""
+        return failed, None, "P1 release list unavailable/malformed (%s)%s" % (type(releases).__name__, message)
+    # Validate the complete inventory BEFORE selecting. Unrelated tag fields are not our schema.
+    indexed = {}
+    for i, row in enumerate(releases):
+        if not isinstance(row, dict) or not isinstance(row.get("tag_name"), str):
+            return failed, None, "P2 record[%d]: object and string tag_name required" % i
+        tag = row["tag_name"]
+        match = BINARY_TAG_RE.fullmatch(tag)
+        if not match:
+            continue
+        for field in ("draft", "prerelease"):
+            if field not in row or not isinstance(row[field], bool):
+                return failed, None, "P2 record[%d] %s: required boolean %s" % (i, tag, field)
+        pub = row.get("published_at")
+        timestamp = None
+        if pub is not None and not isinstance(pub, str):
+            return failed, None, "P2 record[%d] %s: published_at must be string/null" % (i, tag)
+        if pub:
+            if not PUBLISHED_RE.fullmatch(pub):
+                return failed, None, "P2 record[%d] %s: published_at must be ISO-8601Z" % (i, tag)
+            try:
+                timestamp = datetime.strptime(pub, "%Y-%m-%dT%H:%M:%SZ")
+            except ValueError:
+                return failed, None, "P2 record[%d] %s: invalid calendar/time published_at" % (i, tag)
+        version = match.group(1)
+        key = vkey(version)
+        if key in indexed:
+            return failed, None, "P3 duplicate canonical version %s at records %d/%d" % (version, indexed[key][0], i)
+        indexed[key] = (i, version, row, timestamp)
+    eligible = {}
+    for key, (i, version, row, timestamp) in indexed.items():
+        if row["draft"]:
+            continue
+        if timestamp is None:
+            return failed, None, "P4 record[%d] %s: public record has empty published_at" % (i, version)
+        if row["prerelease"]:
+            continue
+        eligible[key] = (timestamp, version)
+    # Resolve target publication in a separate pass: a late lower-version hotfix may precede it in the response.
+    target = vkey(ver)
+    target_pub = eligible[target][0] if target in eligible else None
+    candidates = []
+    for key, (timestamp, version) in eligible.items():
+        if key >= target:
+            continue
+        if target_pub is not None and timestamp >= target_pub:
+            continue
+        candidates.append((key, timestamp, version))
+    if not candidates:
+        return "received-empty", None, "P7 complete inventory has no preceding stable binary release for %s" % ver
+    return "derived", max(candidates)[2], "P7 latest of %d eligible predecessors" % len(candidates)
+
+
+def fetch_prev(ver):
+    """At most ten 100-record pages; only a short page proves inventory completion."""
+    releases = []
+    for page in range(1, 11):
+        rows = get_json(RELEASES_URL + "?per_page=100&page=%d" % page)
+        if not isinstance(rows, list):
+            state, value, reason = derive_prev(rows, ver)
+            return state, value, "page %d: %s" % (page, reason)
+        if len(rows) > 100:
+            return "fetch/schema-failed", None, "page %d exceeds per_page=100" % page
+        releases.extend(rows)
+        if len(rows) < 100:
+            return derive_prev(releases, ver)
+    return "fetch/schema-failed", None, "release inventory incomplete after 10 full pages"
+
+
 def code(url):
     return subprocess.run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "-A", UA,
                            "-I", "--max-time", "120", url], capture_output=True).stdout.decode()
+
+
+def p9_self_test():
+    """T-1..15, T-34..35 and M3: isolated fixtures exercise the real main, never curl."""
+    import contextlib
+    import io
+    import itertools
+    import types
+    import unittest
+    from unittest.mock import patch
+
+    verifier = types.SimpleNamespace(**globals())
+    VRR = verifier
+    V, OLD = '9.9.55', '9.9.54'
+
+
+    def release(v=OLD, **kw):
+        row = dict(tag_name='v' + v, draft=False, prerelease=False, published_at='2026-10-20T00:00:00Z')
+        row.update(kw)
+        return row
+
+
+    class Remote:
+        """Small synthetic asset bodies; HEAD lengths independently exercise size labels."""
+        def __init__(self, mod, pages=None, residual='', bad=False):
+            self.mod = mod
+            self.pages = pages if pages is not None else [[release()]]
+            self.calls = []
+            self.blobs = {n: n.encode() for n in mod.expected_sums_names(V)}
+            self.four = ['cys_%s_%s' % (V, s) for s in ('aarch64.dmg', 'x64.dmg', 'x64-setup.exe', 'x64-setup.zip')]
+            self.html = ''.join('<a href="/downloads/%s">1MB</a>' % n for n in self.four)
+            self.html += (' ' + V) * 5 + '<p class="dl-hero__winnote">Defender</p>' + residual
+            if bad:
+                self.html += V  # exactly one failed axis (new-version count)
+
+        def get(self, url, **kw):
+            self.calls.append(url)
+            if url == self.mod.SITE + '/':
+                return self.html
+            if url.endswith('/downloads/'):
+                return '<section %s>Defender</section>' % self.mod.DEFENDER_MARKER
+            if url.endswith('/SHA256SUMS.txt'):
+                return ''.join('%s  %s\n' % (hashlib.sha256(b).hexdigest(), n) for n, b in self.blobs.items())
+            raise AssertionError('unexpected GET: ' + url)
+
+        def get_json(self, url):
+            self.calls.append(url)
+            if '/releases?' in url:
+                page = int(url.rsplit('page=', 1)[1])
+                if page > len(self.pages):
+                    raise AssertionError('unexpected release page')
+                return self.pages[page - 1]
+            if url.endswith('/latest.json'):
+                return dict(version=V, platforms={'test': {'url': 'https://example.invalid/v%s/a' % V}})
+            if url.endswith('/pack-manifest.json'):
+                return dict(digest=hashlib.sha256(self.blobs['pack.tar.gz']).hexdigest())
+            raise AssertionError('unexpected JSON: ' + url)
+
+        def run(self, argv, **kw):
+            url = argv[-1]
+            assert url.startswith(self.mod.SITE + '/downloads/'), url
+            return types.SimpleNamespace(stdout=self.blobs[url.rsplit('/', 1)[1]], returncode=0)
+
+        @contextlib.contextmanager
+        def installed(self):
+            with patch.dict(self.mod.main.__globals__, get=self.get, get_json=self.get_json,
+                                clen=lambda u: 1024 * 1024, code=lambda u: '200'), \
+                    patch.object(self.mod.subprocess, 'run', self.run):
+                yield self
+
+
+    class P9Tests(unittest.TestCase):
+        def setUp(self):
+            self.m = VRR
+            self.m.results.clear()
+
+        def run_main(self, args, **kw):
+            remote = Remote(self.m, **kw)
+            out = io.StringIO()
+            with remote.installed(), contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+                rc = self.m.main(['x', V] + args)
+            return rc, out.getvalue(), remote
+
+        def derive(self, rows, want, state='derived', target=V):
+            got = self.m.derive_prev(rows, target)
+            self.assertEqual(got[:2], (state, want), got)
+            return got
+
+        def test_t01_binary_only(self):
+            self.derive([release(), release('9.9.56', tag_name='pack-v9.9.56')], OLD)
+            self.derive([release('9.9.52'), release('9.9.53', tag_name='pack-v9.9.53')], '9.9.52')
+            self.derive([release('9.9.56', tag_name='pack-v9.9.56')], None, 'received-empty')
+            self.derive([release(tag_name='v' + OLD + '\n')], None, 'received-empty')
+
+        def test_t02_draft_with_timestamp(self):
+            self.derive([release('9.9.52'), release('9.9.53', draft=True)], '9.9.52')
+            self.derive([release(draft=True, published_at=None)], None, 'received-empty')
+
+        def test_t03_numeric_order(self):
+            self.derive([release('9.9.9'), release()], OLD)
+
+        def test_t04_target_relative(self):
+            self.derive([release('9.9.52'), release('9.9.56')], '9.9.52', target='9.9.53')
+            self.derive([release(V)], None, 'received-empty')
+
+        def test_t05_t34_late_hotfix_all_orders(self):
+            rows = [release(published_at='2026-10-27T00:00:00Z'), release('9.9.52'),
+                    release(V, published_at='2026-10-26T00:00:00Z')]
+            for order in itertools.permutations(rows):
+                with self.subTest(order=[r['tag_name'] for r in order]):
+                    self.derive(list(order), '9.9.52')
+            self.derive([release(published_at='2026-10-26T00:00:00Z'), rows[2]], None, 'received-empty')
+
+        def test_t06_prerelease(self):
+            self.derive([release('9.9.52'), release(prerelease=True)], '9.9.52')
+
+        def test_t07_invalid_envelopes_and_records(self):
+            for rows in (None, {'message': 'fixture API error'}, [None], ['bad'], [{}], [release(tag_name=4)]):
+                with self.subTest(rows=rows):
+                    self.derive(rows, None, 'fetch/schema-failed')
+            self.assertIn('fixture API error', self.m.derive_prev({'message': 'fixture API error'}, V)[2])
+
+        def test_t08_t09_pagination(self):
+            pack = [release(tag_name='pack-v9.9.%d' % n) for n in range(100)]
+            with patch.dict(self.m.fetch_prev.__globals__, get_json=unittest.mock.Mock(side_effect=[pack, [release()]])):
+                fetch = self.m.fetch_prev.__globals__['get_json']
+                self.assertEqual(self.m.fetch_prev(V)[:2], ('derived', OLD))
+                self.assertTrue(fetch.call_args_list[1].args[0].endswith('per_page=100&page=2'))
+            with patch.dict(self.m.fetch_prev.__globals__, get_json=unittest.mock.Mock(return_value=pack)):
+                fetch = self.m.fetch_prev.__globals__['get_json']
+                self.assertEqual(self.m.fetch_prev(V)[0], 'fetch/schema-failed')
+                self.assertEqual(fetch.call_count, 10)
+            for last in (None, {'message': 'page two error'}, pack + [release()]):
+                with patch.dict(self.m.fetch_prev.__globals__, get_json=unittest.mock.Mock(side_effect=[pack, last])):
+                    self.assertEqual(self.m.fetch_prev(V)[0], 'fetch/schema-failed')
+
+        def test_t10_three_false_passes(self):
+            for prev in ('pack-v9.9.56', '9.9.56', '9.9.52'):
+                with self.subTest(prev=prev):
+                    rc, out, _ = self.run_main([prev], pages=[[release(), release('9.9.52')]], residual=OLD * 2)
+                    self.assertEqual(rc, 1, out)
+                    self.assertIn('FAIL ①ⓑ', out)
+                    self.assertIn('FAIL ① ', out)
+                    rc, out, _ = self.run_main([prev], pages=[[release(), release('9.9.52')]])
+                    self.assertEqual(rc, 1, out)
+                    self.assertIn('FAIL ①ⓑ', out)
+
+        def test_t11_t13_no_prev_partial(self):
+            rc, out, remote = self.run_main(['--no-prev'])
+            self.assertEqual(rc, 3, out)
+            self.assertEqual(len(self.m.results), 7)
+            self.assertNotIn('7/7 PASS', out)
+            self.assertFalse(any('/releases?' in u for u in remote.calls))
+
+        def test_t12_failure_precedes_partial(self):
+            self.assertEqual(self.run_main(['--no-prev'], bad=True)[0], 1)
+
+        def test_t13_canonical_and_failure(self):
+            for args in ([], [OLD]):
+                rc, out, _ = self.run_main(args)
+                self.assertEqual(rc, 0, out)
+                self.assertIn('=== 8/8 PASS ===', out)
+            self.assertEqual(self.run_main([], bad=True)[0], 1)
+            self.assertEqual(self.run_main([OLD], residual=OLD)[0], 1)
+
+        def test_t14_repeated_main(self):
+            with Remote(self.m).installed(), contextlib.redirect_stdout(io.StringIO()):
+                for _ in range(2):
+                    self.assertEqual(self.m.main(['x', V, OLD]), 0)
+                    self.assertEqual(len(self.m.results), 8)
+
+        def test_t15_args_no_network(self):
+            for argv in (['x'], ['x', V, OLD, '--no-prev'], ['x', V, '--bad'], ['x', V, OLD, '1.2.3'], ['x', 'bad']):
+                with patch.dict(self.m.main.__globals__, get=unittest.mock.Mock(side_effect=AssertionError('network')),
+                                get_json=unittest.mock.Mock(side_effect=AssertionError('network'))), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(self.m.main(argv), 2)
+            self.assertEqual(self.run_main([])[0], 0)
+
+        def test_t35_duplicates_and_empty_public(self):
+            for rows in ([release(), release()], [release(published_at=None)], [release(published_at='')]):
+                with self.subTest(rows=rows):
+                    self.derive(rows, None, 'fetch/schema-failed')
+            for rows in ([], [release(draft=True, published_at=None)], [release(tag_name='pack-v9.9.54')], [release('9.9.56')]):
+                self.derive(rows, None, 'received-empty')
+
+        def test_m3_required_booleans_and_calendar(self):
+            bad_rows = []
+            for field in ('draft', 'prerelease'):
+                row = release(); del row[field]; bad_rows.append(row)
+                for value in ('false', 0, None):
+                    bad_rows.append(release(**{field: value}))
+            for value in (123, '2026-99-99T99:99:99Z', '2026-02-29T00:00:00Z', '2026-10-20T24:00:00Z',
+                          '2026-10-20 00:00:00', '2026-10-20T00:00:00Z\n'):
+                bad_rows.append(release(published_at=value))
+            for row in bad_rows:
+                with self.subTest(row=row):
+                    self.derive([row], None, 'fetch/schema-failed')
+                    rc, out, _ = self.run_main([OLD], pages=[[row]])
+                    self.assertEqual(rc, 1, out)
+                    self.assertIn('fetch/schema-failed', out)
+            self.derive([release(published_at='2024-02-29T23:59:59Z')], OLD)
+            self.derive([release(), {'tag_name': 'pack-v9.9.56', 'draft': 'bad', 'published_at': 3}], OLD)
+
+        def test_failed_and_empty_main_are_not_skip(self):
+            for page, state in (([], 'received-empty'), (None, 'fetch/schema-failed'), ({'message': 'fixture API error'}, 'fetch/schema-failed')):
+                rc, out, _ = self.run_main([], pages=[page])
+                self.assertEqual(rc, 1, out)
+                self.assertIn(state, out)
+                self.assertNotIn('SKIP ①', out)
+
+
+    suite = unittest.defaultTestLoader.loadTestsFromTestCase(P9Tests)
+    return unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful()
 
 
 def self_test():
@@ -321,7 +620,7 @@ def self_test():
         ok("⑥ⓖ 기준 목록 = release-verify.py 정본(REQUIRED_ASSETS ∪ 업데이터 자산 ∪ 그 .sig)",
            canon == set(full), "차집합 %s / %s" % (sorted(canon - set(full)), sorted(set(full) - canon)))
 
-    # ── 인자 계약: 구버전 생략은 명시 플래그로만 (U4 C4-⑦ · 2026-09-23) ──
+    # ── 인자 계약: 구버전 생략은 파생, 면제는 명시 --no-prev 로만 ──
     # 종전엔 구버전을 빼먹으면 ① 을 조용히 빼고 분모 8→7 로 "7/7 PASS" 를 냈다 — 오너 문서의 합격
     # 문구("7/7 PASS")와 정확히 일치해 **빼먹은 실행이 합격으로 읽혔다**(홈페이지 옛 링크 잔존 사고를 놓침).
     # 여기서는 main() 을 실제로 부르되 네트워크 함수를 **트립와이어**로 바꿔, 인자 오류가 수신 **전에**
@@ -337,7 +636,7 @@ def self_test():
         for k in saved:
             g[k] = _trip
         for label, argv, want in (
-                ("⑨ⓐ 구버전 생략(플래그 없음)은 수신 전 exit 2", ["x", V], 2),
+                ("⑨ⓐ 신버전 부재는 수신 전 exit 2", ["x"], 2),
                 ("⑨ⓑ 구버전 + --no-prev 동시 지정은 모순 — 수신 전 exit 2", ["x", V, OLD, "--no-prev"], 2),
                 ("⑨ⓒ 모르는 플래그는 수신 전 exit 2", ["x", V, OLD, "--bogus"], 2),
                 ("⑨ⓓ 위치 인자 3개 이상은 수신 전 exit 2", ["x", V, OLD, "1.2.3"], 2)):
@@ -348,7 +647,8 @@ def self_test():
                 rc = "원격 수신 시도(%s)" % e
             ok(label, rc == want and not calls, "rc=%r · 수신 시도 %d회" % (rc, len(calls)))
         # 양성 대조 — 정상 인자(구버전 명시 · --no-prev 명시)는 인자 검사를 **통과**해 수신 단계로 간다.
-        for label, argv in (("⑨ⓔ 구버전 명시는 수신 단계로 진행", ["x", V, OLD]),
+        for label, argv in (("⑨ⓐ 구버전 생략은 파생 수신 단계로 진행", ["x", V]),
+                            ("⑨ⓔ 구버전 명시는 수신 단계로 진행", ["x", V, OLD]),
                             ("⑨ⓕ --no-prev 명시는 수신 단계로 진행", ["x", V, "--no-prev"])):
             del calls[:]
             try:
@@ -358,6 +658,8 @@ def self_test():
             ok(label, rc == "tripwire" and len(calls) == 1, "rc=%r · 수신 시도 %d회" % (rc, len(calls)))
     finally:
         g.update(saved)
+
+    ok("P9 H-02/H-03 offline contract suite", p9_self_test())
 
     total = tally["pass"] + tally["fail"]
     print("\n=== self-test %d/%d PASS (실패 %d건) ===" % (tally["pass"], total, tally["fail"]))
@@ -381,13 +683,13 @@ def parse_args(argv):
     prev = pos[1] if len(pos) > 1 else None
     if prev and no_prev:
         return "구버전(%s)과 --no-prev 를 함께 줬다 — 모순이다(둘 중 하나만)" % prev
-    if not prev and not no_prev:
-        return ("구버전 인자가 없다 — ① 구버전 문자열 0 검사를 조용히 빼고 분모 7 로 합격처럼 보이는 "
-                "실행을 막는다. `<신버전> <구버전>` 으로 돌리거나, 구버전이 정말 없으면 --no-prev 를 명시하라")
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", ver):
+        return "신버전은 숫자 세 자리 버전이어야 한다: %s" % ver
     return ver, prev, no_prev
 
 
 def main(argv):
+    results.clear()
     if "--self-test" in argv[1:]:
         return self_test()
     parsed = parse_args(argv)
@@ -405,12 +707,18 @@ def main(argv):
         check("메인 페이지 수신", False, "빈 응답")
         return 1
 
-    # ① 구버전 0
-    if prev:
-        n = main_html.count(prev)
-        check("① 구버전 문자열 0 (%s)" % prev, n == 0, "발견 %d개" % n)
-    else:
+    # ① always measures the derived predecessor; an explicit argument cannot substitute its own baseline.
+    if no_prev:
         print("SKIP ① 구버전 미지정(--no-prev 명시) — 구버전 문자열 잔존은 이 실행에서 재지 않았다")
+    else:
+        state, derived, reason = fetch_prev(ver)
+        if state != "derived":
+            check("① 전임 공개판 파생", False, "%s: %s; 전임이 정말 없으면 --no-prev 명시" % (state, reason))
+        else:
+            if prev is not None and prev != derived:
+                check("①ⓑ 기준값 정합", False, "인자 %s ≠ 파생 %s — 이 실행은 정본이 아니다" % (prev, derived))
+            n = main_html.count(derived)
+            check("① 구버전 문자열 0 (%s)" % derived, n == 0, "발견 %d개 · %s" % (n, reason))
 
     # ② 신버전 9
     n = main_html.count(ver)
@@ -538,7 +846,9 @@ def main(argv):
         print("\n=== ①SKIP · %d축 통과(8축 중) — 정본 합격 8/8 아님 ===" % npass)
     else:
         print("\n=== %d/%d PASS ===" % (npass, len(results)))
-    return 0 if npass == len(results) else 1
+    if npass != len(results):
+        return 1
+    return 3 if no_prev else 0
 
 
 if __name__ == "__main__":
