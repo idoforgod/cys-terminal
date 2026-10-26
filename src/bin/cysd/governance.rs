@@ -13254,6 +13254,15 @@ fn maybe_reset_stale_pending_input(
 /// ★G4(W4-C): governance::tests 사설 static 에서 **크레이트 테스트 공용**(pub(crate))으로
 /// 격상 — handlers::tests 의 수동 reap 테스트도 같은 env 를 읽으므로(grace 판정
 /// exited_surface_due 재사용), 모듈별 락 두 개로는 서로를 직렬화하지 못한다.
+/// ★획득은 **관용형 고정**이다 — `REAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())`.
+/// ⛔`.unwrap()` 을 쓰지 마라: 이 락은 `Mutex<()>` 로 **지킬 값이 없고**(env 는 각 검체가
+/// `ReapEnvGuard` 로 자기 값을 세우고 패닉 되감기에서도 되돌린다) 오염은 **전파만** 한다.
+/// ★실측(windows-health 40234570889 a1 · 40206997437 a2 · 2026-10-26): 검체 1건
+/// (`deadman_idle_debounce_knob_separate` 의 `left: 2 right: 3`)이 락을 쥔 채 패닉하자
+/// ★치명형 21 사이트 중 **11건이 `PoisonError` 로 연쇄 사망**해 빨강이 1 → 12 로 불었고,
+/// 관용형 9 사이트는 **0건** 떨어졌다. 로컬 재현(의도된 포이즌너 1건 · `--test-threads=1`):
+/// 치명형 **17 실패 / 0 통과**(PoisonError 16) → 관용형 **1 실패 / 16 통과**(PoisonError 0).
+/// ⇒ ★연쇄가 사라지면 다음 빨강은 **셀 수 있는 빨강**이다.
 #[cfg(test)]
 pub(crate) static REAP_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -25180,7 +25189,7 @@ mod tests {
     #[test]
     fn exited_surface_due_respects_role_grace() {
         use super::exited_surface_due;
-        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _g = REAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env = ReapEnvGuard::set(&[
             ("CYS_REAP_EXITED_GRACE_SECS", "60"),
             ("CYS_REAP_EXITED_NONROLE_GRACE_SECS", "10"),
@@ -25235,7 +25244,7 @@ mod tests {
     /// phoenix가 desired_roster로 되살려야 하므로. 역할 매핑 정리는 여전히 일어나야 한다.
     #[test]
     fn reap_exited_does_not_tombstone_role() {
-        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _g = REAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let daemon = drill_daemon("reap-exited");
         let id = spawn_role_surface(&daemon, "worker");
         // exited 마킹 + stamp(과거로 둘 필요 없음 — grace 0으로 즉시 회수 대상).
@@ -25536,7 +25545,7 @@ mod tests {
     /// master.deadman 0건 — master.idle(category=info·GUI 폴백 토스트 레인 부재)만 1건(디바운스).
     #[test]
     fn deadman_silence_alone_is_idle_not_death() {
-        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _g = REAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env = ReapEnvGuard::set(&[
             ("CYS_MASTER_DEADMAN_SECS", "20"),
             ("CYS_ROLE_DEADMAN_GRACE_SECS", "0"),
@@ -25577,7 +25586,7 @@ mod tests {
     /// [핀2] DeadCandidate 연속 1·2회는 무발화, 3회째(기본 CONFIRM_TICKS)에 1회 발화 + misses==3.
     #[test]
     fn deadman_fires_only_after_confirm_ticks() {
-        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _g = REAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env = ReapEnvGuard::set(&[("CYS_ROLE_DEADMAN_GRACE_SECS", "0")]);
         let (daemon, sid) = deadman_daemon("confirm");
         let s = daemon.get_surface(sid).unwrap();
@@ -25600,7 +25609,7 @@ mod tests {
     /// 간헐 프로브 실패가 사망 확증 카운터를 세탁하지 못한다.
     #[test]
     fn deadman_unknown_probe_neither_counts_nor_resets() {
-        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _g = REAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env = ReapEnvGuard::set(&[("CYS_ROLE_DEADMAN_GRACE_SECS", "0")]);
         let (daemon, sid) = deadman_daemon("unknown");
         let s = daemon.get_surface(sid).unwrap();
@@ -25641,7 +25650,7 @@ mod tests {
     /// misses 를 0으로 되돌린다 — 이후 재실패도 3회를 새로 요구.
     #[test]
     fn deadman_agent_recovery_resets_misses() {
-        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _g = REAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env = ReapEnvGuard::set(&[("CYS_ROLE_DEADMAN_GRACE_SECS", "0")]);
         let (daemon, sid) = deadman_daemon("recovery");
         let s = daemon.get_surface(sid).unwrap();
@@ -25666,7 +25675,7 @@ mod tests {
     /// [핀5·요구 e] 좌석 빈사(셸 생존·에이전트 사망)는 axis=agent_dead 로 셸 사망과 구분 노출.
     #[test]
     fn deadman_agent_dead_axis_when_shell_alive() {
-        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _g = REAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env = ReapEnvGuard::set(&[("CYS_ROLE_DEADMAN_GRACE_SECS", "0")]);
         let (daemon, sid) = deadman_daemon("agent-dead");
         let s = daemon.get_surface(sid).unwrap();
@@ -25692,7 +25701,7 @@ mod tests {
     /// [핀6] v2 payload 계약 전 필드 + surface_exited 의 reason 구값 그대로(하위호환 핀).
     #[test]
     fn deadman_payload_contract_v2() {
-        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _g = REAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env = ReapEnvGuard::set(&[("CYS_ROLE_DEADMAN_GRACE_SECS", "0")]);
         let (daemon, sid) = deadman_daemon("payload");
         let s = daemon.get_surface(sid).unwrap();
@@ -25735,7 +25744,7 @@ mod tests {
     /// 사망 판정(fail-closed)은 상시 유지(v1 전체 비활성에서 축소된 유일한 행동 변경).
     #[test]
     fn deadman_secs_zero_disables_idle_only() {
-        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _g = REAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env = ReapEnvGuard::set(&[
             ("CYS_MASTER_DEADMAN_SECS", "0"),
             ("CYS_ROLE_DEADMAN_GRACE_SECS", "0"),
@@ -25763,7 +25772,7 @@ mod tests {
     /// [핀8] 발화 후 디바운스(기본 300s) 내 동일 role 재발화 억제, 경과 후 재발화.
     #[test]
     fn deadman_debounce() {
-        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _g = REAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env = ReapEnvGuard::set(&[("CYS_ROLE_DEADMAN_GRACE_SECS", "0")]);
         let (daemon, sid) = deadman_daemon("debounce");
         let s = daemon.get_surface(sid).unwrap();
@@ -25786,7 +25795,7 @@ mod tests {
     /// [핀10] grace 창(부트·승계 직후) 내에는 DeadCandidate 도 무카운트 — 오살 방지.
     #[test]
     fn deadman_grace_window() {
-        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _g = REAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env = ReapEnvGuard::set(&[("CYS_ROLE_DEADMAN_GRACE_SECS", "3600")]);
         let (daemon, sid) = deadman_daemon("grace");
         let s = daemon.get_surface(sid).unwrap();
@@ -25804,7 +25813,7 @@ mod tests {
     /// 살아있는 master 를 사망으로 오라벨하는 결함 8 동형 신규 레인의 봉쇄 핀.
     #[test]
     fn deadman_bare_shell_descendant_does_not_arm_vacant_axis() {
-        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _g = REAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env = ReapEnvGuard::set(&[("CYS_ROLE_DEADMAN_GRACE_SECS", "0")]);
         let (daemon, sid) = deadman_daemon("bare-occupied");
         let s = daemon.get_surface(sid).unwrap();
@@ -25848,7 +25857,7 @@ mod tests {
     /// "master silent"로나마 울렸다).
     #[test]
     fn deadman_agent_never_started_axis() {
-        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _g = REAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env = ReapEnvGuard::set(&[("CYS_ROLE_DEADMAN_GRACE_SECS", "0")]);
         let (daemon, sid) = deadman_daemon("never-started");
         let s = daemon.get_surface(sid).unwrap();
@@ -25886,7 +25895,7 @@ mod tests {
     /// 생존으로 반증된다 — sysinfo 매칭이 못 보는 에이전트의 오살 방지(fail-safe).
     #[test]
     fn deadman_agent_never_started_socket_rebuts() {
-        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _g = REAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env = ReapEnvGuard::set(&[("CYS_ROLE_DEADMAN_GRACE_SECS", "0")]);
         let (daemon, sid) = deadman_daemon("never-started-rebut");
         let s = daemon.get_surface(sid).unwrap();
@@ -25911,7 +25920,7 @@ mod tests {
     /// 디바운스와 분리된다 — 기본은 death 노브 체이닝(현행 불변), 설정 시 독립.
     #[test]
     fn deadman_idle_debounce_knob_separate() {
-        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _g = REAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env = ReapEnvGuard::set(&[
             ("CYS_MASTER_DEADMAN_SECS", "20"),
             ("CYS_ROLE_DEADMAN_GRACE_SECS", "0"),
@@ -25934,7 +25943,7 @@ mod tests {
     /// 반증된다 — 활동=생존 증거, 부재는 증거 아님(fail-safe 방향).
     #[test]
     fn deadman_socket_activity_rebuts_agent_death() {
-        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _g = REAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env = ReapEnvGuard::set(&[("CYS_ROLE_DEADMAN_GRACE_SECS", "0")]);
         let (daemon, sid) = deadman_daemon("socket-rebut");
         let s = daemon.get_surface(sid).unwrap();
@@ -25973,7 +25982,7 @@ mod tests {
     /// [핀12] surface 소멸(roles 매핑만 잔존) — axis=surface_gone·reason 구값 보존.
     #[test]
     fn deadman_surface_gone_axis() {
-        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _g = REAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env = ReapEnvGuard::set(&[("CYS_ROLE_DEADMAN_GRACE_SECS", "0")]);
         let daemon = drill_daemon("gone");
         daemon.roles.lock().unwrap().insert("master".into(), 424_242);
@@ -25991,7 +26000,7 @@ mod tests {
     /// [핀13·요구 f] CYS_ROLE_DEADMAN_ROLES CSV 로 role 일반화 — worker 좌석도 동일 절차.
     #[test]
     fn deadman_role_generalization_csv() {
-        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let _g = REAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env = ReapEnvGuard::set(&[
             ("CYS_ROLE_DEADMAN_ROLES", "master, worker"),
             ("CYS_ROLE_DEADMAN_GRACE_SECS", "0"),
