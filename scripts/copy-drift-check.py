@@ -65,7 +65,11 @@ import urllib.request
 REPO_DEFAULT = "idoforgod/cys-terminal"
 BASELINE_DEFAULT = "main"
 
-# ★감시 경로 — 부서장 판정 2026-10-26 (HEAD-RULING-P0-1 §4) 으로 5종.
+# ★감시 경로 — ⛔**개수를 여기 적지 않는다.** 세는 곳은 ★아래 리스트 하나뿐이고, 숫자가 필요한
+#   자리는 전부 `len(WATCHED_PATHS)` 에서 **파생**시킨다(도움말·분모 출력). 주석에 박은 수는
+#   목록이 바뀌는 순간 ★썩고, 썩은 라벨은 ★사람이 다시 보지 않는다 — 2026-10-26 에 이 파일이
+#   그 사고를 실제로 냈다(판정 §4 로 5종이던 것이 §2 로 6종이 됐는데 라벨 둘이 5종에 멈춰 있었다).
+#   ★연혁: HEAD-RULING-P0-1 §4 로 처음 정해지고, HEAD-RULING-P0-1-LANDING… §2 로 확장됐다.
 #   앞 셋 = 발행 레인의 **최소 기능 집합**(워크플로 + 검증기 + 그 검증기의 자기시험 대상).
 #     ⇒ 워크플로만 맞추면 D 가 가리키는 파일이 main 에 없어 죽는다.
 #   뒤 둘 = 「게이트 부재는 게이트가 알릴 수 없다」의 완화:
@@ -130,6 +134,12 @@ EXPECTED_POLICIES = {
 POLICY_MODES = ("warn", "fatal")
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+# ★도움말 문구는 ⛔숫자를 손으로 적지 않고 `len(WATCHED_PATHS)` 에서 **파생**시킨다.
+#   그리고 자기시험이 ★이 문구에서 숫자를 **되읽어** 목록 길이와 대조한다(㉟) ⇒ 누가 다시
+#   리터럴로 바꿔 넣으면 그 순간 ★자기시험이 빨갛다. ⛔사람이 다시 보지 않아도 되게 하는 장치다.
+PATH_HELP = ("감시 경로를 직접 지정(⛔시험용 · 기본은 WATCHED_PATHS %d종)"
+             % len(WATCHED_PATHS))
 
 # 이쪽 사본을 읽는 출처 — argparse 의 choices 와 자기시험이 이 한 곳을 본다.
 REF_SOURCES = ("git", "api")
@@ -504,6 +514,24 @@ def self_test():
     except ValueError:
         raised = True
     ok("㉝ ★모르는 --ref-source 는 ⛔조용히 git 으로 흐르지 않고 터진다", raised)
+    # ⑧ ★낡은 라벨 차단 — 「개수」가 ⛔주석·도움말에 박히면 썩고 사람이 다시 보지 않는다.
+    #    (2026-10-26 실측 사고: 목록이 5→6 으로 늘었는데 도움말 둘이 「5종」에 멈춰 있었다.)
+    help_nums = re.findall(r"(\d+)종", PATH_HELP)
+    ok("㉟ ★--path 도움말의 수가 ★len(WATCHED_PATHS) 와 같다(⛔리터럴로 되돌리면 빨강)",
+       help_nums == [str(len(WATCHED_PATHS))],
+       "도움말에서 되읽은 수=%s · 목록 길이=%d" % (help_nums, len(WATCHED_PATHS)))
+    try:
+        own_src = open(__file__, encoding="utf-8").read()
+    except OSError:
+        own_src = ""
+    # ⛔계기가 ★자기를 매치하지 않게 패턴 리터럴을 ★쪼갠다 — 쪼개지 않으면 이 줄 자신이
+    #   「리터럴 도움말이 있다」로 읽혀 ★항상 빨강이 된다(실측 2026-10-26: 실제로 그렇게 났다).
+    literal_help = "help=" + '"' + "감시 경로를 직접 지정"
+    wired = "help=" + "PATH_HELP"
+    ok("㊱ ★--path 가 리터럴 문구가 아니라 help=PATH_HELP 를 쓴다(배선 확인)",
+       wired in own_src and own_src.count(literal_help) == 0,
+       "배선 %s · 리터럴 출현 %d" % (wired in own_src, own_src.count(literal_help)))
+
     ok("㉞ 허용 출처는 git·api 둘뿐이다(argparse 와 같은 상수)",
        REF_SOURCES == ("git", "api"), "실측 %r" % (REF_SOURCES,))
 
@@ -522,7 +550,7 @@ def main():
     parser.add_argument("--ref-source", choices=REF_SOURCES, default="git",
                         help="이쪽 사본을 어디서 읽는가 — git=로컬 트리(태그 레인) · api=원격 ref(일일 감시)")
     parser.add_argument("--path", action="append", default=None,
-                        help="감시 경로를 직접 지정(⛔시험용 · 기본은 WATCHED_PATHS 5종)")
+                        help=PATH_HELP)
     parser.add_argument("--policy-mode", choices=POLICY_MODES, default="fatal",
                         help="허용 ref 단언의 치명도 — fatal=실패가 종료코드에 반영된다(★현재 기본 · "
                              "2026-10-26 run 40285752606 으로 권한 도달이 측정돼 올렸다) · "
