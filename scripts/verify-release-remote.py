@@ -271,6 +271,11 @@ def derive_prev(releases, ver):
         if key in indexed:
             return failed, None, "P3 duplicate canonical version %s at records %d/%d" % (version, indexed[key][0], i)
         indexed[key] = (i, version, row, timestamp)
+    # A published target supplies the time boundary even when it is a prerelease.
+    # Resolve it from validated records before filtering stable predecessor candidates.
+    target = vkey(ver)
+    target_row = indexed.get(target)
+    target_pub = target_row[3] if target_row is not None and not target_row[2]["draft"] else None
     eligible = {}
     for key, (i, version, row, timestamp) in indexed.items():
         if row["draft"]:
@@ -280,9 +285,6 @@ def derive_prev(releases, ver):
         if row["prerelease"]:
             continue
         eligible[key] = (timestamp, version)
-    # Resolve target publication in a separate pass: a late lower-version hotfix may precede it in the response.
-    target = vkey(ver)
-    target_pub = eligible[target][0] if target in eligible else None
     candidates = []
     for key, (timestamp, version) in eligible.items():
         if key >= target:
@@ -426,6 +428,29 @@ def p9_self_test():
                 with self.subTest(order=[r['tag_name'] for r in order]):
                     self.derive(list(order), '9.9.52')
             self.derive([release(published_at='2026-10-26T00:00:00Z'), rows[2]], None, 'received-empty')
+
+        def test_r1_published_prerelease_target_boundary(self):
+            rows = [release(published_at='2026-10-27T00:00:00Z'), release('9.9.52'),
+                    release(V, prerelease=True, published_at='2026-10-26T00:00:00Z')]
+            for order in itertools.permutations(rows):
+                with self.subTest(order=[r['tag_name'] for r in order]):
+                    self.derive(list(order), '9.9.52')
+            # Draft targets, even with a timestamp, have no public-time boundary.
+            rows[2]['draft'] = True
+            self.derive(rows, OLD)
+            self.derive(rows[:2], OLD)  # absent target also has no boundary
+
+        def test_r1_prerelease_target_main_stale_tokens(self):
+            rows = [release(published_at='2026-10-27T00:00:00Z'), release('9.9.52'),
+                    release(V, prerelease=True, published_at='2026-10-26T00:00:00Z')]
+            rc, out, _ = self.run_main([], pages=[rows], residual='9.9.52 ' * 2)
+            self.assertEqual(rc, 1, out)
+            self.assertIn('FAIL ① 구버전 문자열 0 (9.9.52)', out)
+            self.assertIn('발견 2개', out)
+            # Supporting a prerelease target must not reject an otherwise clean page.
+            rc, out, _ = self.run_main([], pages=[rows])
+            self.assertEqual(rc, 0, out)
+            self.assertIn('=== 8/8 PASS ===', out)
 
         def test_t06_prerelease(self):
             self.derive([release('9.9.52'), release(prerelease=True)], '9.9.52')
