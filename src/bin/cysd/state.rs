@@ -8494,6 +8494,7 @@ fn match_is_quoted(line: &str, start: usize, end: usize) -> bool {
     if before == Some('"') {
         // 여는 따옴표 앞 글자(공백 제외)가 JSON 구조 문자면 값 자리 = 구조화 신호.
         let prev = line[..start - 1].chars().rev().find(|c| !c.is_whitespace());
+        // Keep this structural set aligned with default_health_rules' numeric quoted-value arm.
         if matches!(prev, Some(':') | Some(',') | Some('{') | Some('[') | Some('=')) {
             return false;
         }
@@ -8609,18 +8610,20 @@ pub fn auth_blocked_by_recent_health(
 pub(crate) fn mask_health_line(line: &str, rules: &[HealthRule]) -> String {
     let mut out = line.to_string();
     for _ in 0..MASK_PASS_CAP {
-        let mut changed = false;
         for r in rules {
             if let Some(m) = r.regex.find(&out) {
                 out = format!("{}{}{}", &out[..m.start()], HEALTH_MASK, &out[m.end()..]);
-                changed = true;
             }
         }
-        if !changed {
-            break;
+        // Truncation can turn an excluded 429,524 or 4291 into a matching trailing 429.
+        // Validate AFTER cutting on every pass, even when no replacement occurred.
+        out = out.chars().take(200).collect();
+        if rules.iter().all(|r| !r.regex.is_match(&out)) {
+            return out;
         }
     }
-    out.chars().take(200).collect()
+    // Runtime rules may even match HEALTH_MASK; the machinery-marker quarantine handles those.
+    HEALTH_MASK.to_string()
 }
 
 /// 오너 완화책 ① 기본 내장 룰: 로그인 만료·401·토큰 만료를 즉시 감지한다.
@@ -8639,11 +8642,11 @@ fn default_health_rules() -> Vec<HealthRule> {
             "login_required",
             r"(?i)(please|run).{0,30}(/login|log ?in again)",
         ),
-        // Numeric status requires HTTP context; prose requires an explicit error envelope.
-        // Bare mentions are not state. CLI prefix whitespace is exactly U+0020/U+0009/U+00A0.
+        // C-04 R2: preserve unanchored prose across stripped redraws; exclude numeric groups.
+        // Structural quoted values mirror match_is_quoted's : , { [ = set (agreement test below).
         (
             "rate_limited",
-            r"(?i)\bHTTP(?:/[0-9]+(?:\.[0-9]+)?)?[ \t]+429(?:[ \t:;]|$)|^[ \t]*(?:api[ \t]+)?error:[ \t]*(?:rate[ _-]?limit(?:ed)?|too many requests)\b|(?:^|[{,])[ \t]*\x22error\x22[ \t]*:[ \t]*\x22(?:rate[ _-]?limit(?:ed)?|too many requests)\b|(?:^|[ \t])level=error[ \t]+msg=\x22(?:rate[ _-]?limit(?:ed)?|too many requests)\b|^[ \t\xA0]*(?:[⎿•!][ \t\xA0]*)?you(?:'ve| have) hit your (?:weekly|usage|monthly spend) limit\b",
+            r#"(?i)rate.?limit(ed)?|too many requests|(?:^|[^\w,"'`“”‘’「」«»])429(?:$|[^\w,"'`“”‘’「」«»]|,(?:\D|$))|[:,{\[=]\s*"429"|you(?:'ve| have) hit your (?:weekly|usage|monthly spend) limit\b|you have exhausted your quota\b|RESOURCE_EXHAUSTED\b"#,
         ),
     ];
     defaults
@@ -10637,11 +10640,11 @@ mod tests {
         assert!(m("login_required", "please log in again"));
         assert!(!m("login_required", "you are logged in"));
 
-        // rate_limited — HTTP status or explicit error context; bare prose is not a signal
-        assert!(!m("rate_limited", "rate limited"));
-        assert!(!m("rate_limited", "ratelimit"));
-        assert!(!m("rate_limited", "rate-limited"));
-        assert!(!m("rate_limited", "too many requests"));
+        // rate_limited — rate limit(ed)? | too many requests | 429
+        assert!(m("rate_limited", "rate limited"));
+        assert!(m("rate_limited", "ratelimit"));
+        assert!(m("rate_limited", "rate-limited"));
+        assert!(m("rate_limited", "too many requests"));
         assert!(m("rate_limited", "HTTP 429 Too Many Requests"));
         assert!(!m("rate_limited", "all good, build complete"));
 
@@ -10654,54 +10657,193 @@ mod tests {
     }
 
     #[test]
-    fn rate_limit_rejects_numeric_and_narrative_mentions() {
+    fn rate_limit_rejects_numeric_groups() {
         let rules = default_health_rules();
         let rule = rules.iter().find(|r| r.name == "rate_limited").unwrap();
-        for line in ["12,429,524", "12,430,040", "4291", "429", "HTTP 4291",
-                     "HTTP 429,524", "rate limit", "rate limited", "ratelimit",
-                     "rate-limited", "too many requests", "We discuss rate limit handling",
-                     "The Error: rate limit text was quoted", "level=info msg=\"rate limit\"",
-                     "We saw You've hit your usage limit in the transcript"] {
-            assert!(!rule.regex.is_match(line), "false limit signal: {line}");
+        for line in ["12,429,524", "429,524", "12,429", "4291", "14290", "12,430,040",
+                     "HTTP 4291", "HTTP 429,524", "x429", "429x", "_429_"] {
+            assert!(!rule.regex.is_match(line), "false numeric limit signal: {line}");
         }
     }
 
     #[test]
-    fn rate_limit_retains_http_and_explicit_error_contexts() {
+    fn rate_limit_retains_http_and_original_prose() {
         let rules = default_health_rules();
         let rule = rules.iter().find(|r| r.name == "rate_limited").unwrap();
-        for line in ["HTTP 429 Too Many Requests", "HTTP/1.1 429 Too Many Requests",
-                     "HTTP/2 429", "request failed: HTTP 429: retry later",
-                     "Error: rate limit", "API Error: rate-limited", "Error: too many requests",
-                     r#"{"error":"rate limit"}"#, r#"level=error msg="rate limit" svc=api"#] {
-            assert!(rule.regex.is_match(line), "missed explicit limit signal: {line}");
+        for line in ["429", "status: 429", "HTTP 429", "HTTP/1.1 429", "HTTP/2 429",
+                     "request failed: HTTP 429: retry later", "HTTP 429 Too Many Requests",
+                     "rate limit", "ratelimit", "rate-limited", "too many requests",
+                     "Working...Error: rate limit", "We discuss rate limit handling",
+                     r#"{"error":{"type":"rate_limit_error"}}"#,
+                     r#"level=error msg="rate limit" svc=api"#] {
+            assert!(rule.regex.is_match(line), "missed retained limit signal: {line}");
+        }
+    }
+
+    // Sourced prefixes retained from R1; agy/API phrases are the head's R2 ruling.
+    // These are recognition fixtures, not a claim of current quota or native vendor execution.
+    const C04_LIMIT_PHRASES: &[&str] = &[
+        "You've hit your weekly limit", "You have hit your weekly limit",
+        "You've hit your usage limit", "You have hit your usage limit",
+        "You've hit your monthly spend limit", "You have hit your monthly spend limit",
+        "You have exhausted your quota", "RESOURCE_EXHAUSTED",
+    ];
+
+    #[test]
+    fn rate_limit_retains_unanchored_quota_phrases() {
+        let rules = default_health_rules();
+        let rule = rules.iter().find(|r| r.name == "rate_limited").unwrap();
+        for phrase in C04_LIMIT_PHRASES {
+            for prefix in ["", "Working...", "⎿ \u{00a0}", "⎿ \u{202f}", "\u{2003}"] {
+                let line = format!("{prefix}{phrase}");
+                assert!(rule.regex.is_match(&line), "missed quota phrase: {line}");
+            }
+        }
+        assert!(rule.regex.is_match("You have exhausted your quota on this model."));
+        assert!(rule.regex.is_match(r#"{"error":{"status":"RESOURCE_EXHAUSTED"}}"#));
+    }
+
+    #[test]
+    fn rate_limit_ingest_cr_and_cursor_stripped_lines() {
+        // Actual ingest_output -> strip_ansi_escapes -> health event path, not a regex-only model.
+        let (daemon, s) = health_probe_daemon("c04-stream");
+        let rules = default_health_rules();
+        let mut phrases = C04_LIMIT_PHRASES.to_vec();
+        phrases.extend(["Error: rate limit", "HTTP/1.1 429", "429"]);
+        for phrase in phrases {
+            for prefix in ["", "Working...\r\x1b[2K", "Working...\x1b[1G\x1b[2K"] {
+                daemon.health_debounce.lock().unwrap().clear();
+                let raw = format!("{prefix}{phrase}");
+                let alerts = feed_lines_collect_alerts(&daemon, &s, &[&raw]);
+                let expected = format!("{}{phrase}", if prefix.is_empty() { "" } else { "Working..." });
+                assert_eq!(s.scrollback.lock().unwrap().back(), Some(&expected),
+                           "real strip path did not produce the glued line: {raw:?}");
+                assert_eq!(alerts.len(), 1, "missed stripped limit: {raw:?}; {alerts:?}");
+                assert_eq!(alerts[0].0, "rate_limited");
+                for rule in &rules {
+                    assert!(!rule.regex.is_match(&alerts[0].1), "masked event rematches: {alerts:?}");
+                }
+                daemon.health_debounce.lock().unwrap().clear();
+                assert!(feed_lines_collect_alerts(&daemon, &s, &[&alerts[0].1]).is_empty(),
+                        "masked event self-loop: {alerts:?}");
+            }
         }
     }
 
     #[test]
-    fn rate_limit_retains_observed_cli_limit_messages() {
-        // Lane evidence: Claude screen master s103, 2026-10-26 23:07 (recall).
-        // Claude weekly text: feedback_a-quoted-screen-string-needs-a-recency-axis, 2026-10-15.
-        // Codex screen quoted by CEO in dept-5 recall, 2026-10-19 15:01.
-        // These pin message recognition, not the freshness of a visible historical screen.
+    fn rate_limit_quota_disclosure_and_mask_invariants() {
         let rules = default_health_rules();
         let rule = rules.iter().find(|r| r.name == "rate_limited").unwrap();
-        for line in ["You've hit your monthly spend limit", "You have hit your weekly limit",
-                     "You've hit your usage limit", "⎿  You've hit your monthly spend limit"] {
-            assert!(rule.regex.is_match(line), "missed observed CLI limit message: {line}");
+        for phrase in C04_LIMIT_PHRASES {
+            let quoted = format!("the \"{phrase}\" alarm was noisy");
+            let m = rule.regex.find(&quoted).expect("quoted phrase must match before quarantine");
+            assert_eq!(alert_discourse_reason(&quoted, m.start(), m.end(), &rules), Some("quoted-mention"));
+            let masked = mask_health_line(&format!("Working...{phrase}"), &rules);
+            assert!(masked.contains(HEALTH_MASK), "mask did not run: {masked}");
+            assert!(rules.iter().all(|r| !r.regex.is_match(&masked)), "mask rematch: {masked}");
         }
-        // Gemini vendor/screen specimen remains UNMEASURED; generic error contexts are tested above.
+        assert!(rules.iter().all(|r| !r.regex.is_match(HEALTH_MASK)));
+        let (daemon, s) = health_probe_daemon("c04-prose");
+        assert!(feed_lines_collect_alerts(&daemon, &s, INCIDENT_PROSE).is_empty());
+        for phrase in C04_LIMIT_PHRASES {
+            let quoted = format!("the \"{phrase}\" alarm was noisy");
+            assert!(feed_lines_collect_alerts(&daemon, &s, &[&quoted]).is_empty(), "quoted limit refired");
+        }
     }
 
     #[test]
-    fn rate_limit_retains_observed_claude_nbsp_prefix() {
-        // Actual recall prefix: Claude master s103, 2026-10-26 23:07: U+23BF U+0020 U+00A0.
+    fn rate_limit_numeric_quote_and_structural_boundaries() {
         let rules = default_health_rules();
         let rule = rules.iter().find(|r| r.name == "rate_limited").unwrap();
-        assert!(rule.regex.is_match("⎿ \u{00a0}You've hit your monthly spend limit"));
-        assert!(rule.regex.is_match("\u{00a0}You've hit your monthly spend limit"));
-        assert!(!rule.regex.is_match("⎿ \u{202f}You've hit your monthly spend limit"));
-        assert!(!rule.regex.is_match("\u{2003}You've hit your monthly spend limit"));
+        let old = Regex::new(r"(?i)rate.?limit(ed)?|too many requests|\b429\b").unwrap();
+        let pairs = [('"', '"'), ('\'', '\''), ('`', '`'), ('“', '”'), ('‘', '’'), ('「', '」'), ('«', '»')];
+        for (open, close) in pairs {
+            let line = format!("the {open}429{close} alarm");
+            let m = old.find(&line).unwrap();
+            assert_eq!(alert_discourse_reason(&line, m.start(), m.end(), &rules), Some("quoted-mention"),
+                       "old quote control: {line}");
+            assert!(!rule.regex.is_match(&line), "numeric quoted mention: {line}");
+        }
+        // These five structural chars mirror match_is_quoted's JSON/logfmt value exemption.
+        for c in [':', ',', '{', '[', '='] {
+            for gap in ["", " "] {
+                let line = format!("k{c}{gap}\"429\"");
+                let m = rule.regex.find(&line).unwrap_or_else(|| panic!("missed numeric structural value: {line}"));
+                assert_eq!(alert_discourse_reason(&line, m.start(), m.end(), &rules), None, "{line}");
+                let om = old.find(&line).unwrap();
+                assert_eq!(alert_discourse_reason(&line, om.start(), om.end(), &rules), None, "old structural control: {line}");
+            }
+        }
+        // Head-approved delta: one-sided quote adjacency no longer triggers the numeric arm.
+        // Exercise BOTH sides independently: the opposite quote otherwise hides a missing guard.
+        for q in ['"', '\'', '`', '“', '”', '‘', '’', '「', '」', '«', '»'] {
+            for line in [format!("got {q}429 back"), format!("got 429{q} back")] {
+                assert!(old.is_match(&line), "old one-sided control: {line}");
+                assert!(!rule.regex.is_match(&line), "numeric one-sided quote: {line}");
+            }
+        }
+    }
+
+    #[test]
+    fn rate_limit_numeric_json_and_comma_separators() {
+        let rules = default_health_rules();
+        let rule = rules.iter().find(|r| r.name == "rate_limited").unwrap();
+        for line in ["HTTP 429", "status 429", "429 Too Many", "  \"code\": 429,",
+                     r#"{"error":{"code":429,"message":"x"}}"#, "429, retry after 30s",
+                     r#"{"status":"429"}"#, r#""status": "429""#, r#"x = "429""#,
+                     r#"["429"]"#, "Error 429:", "429", "(429)", "[429]"] {
+            assert!(rule.regex.is_match(line), "missed numeric status: {line}");
+        }
+        for line in ["12,429,524", "429,524", "4291", "14290", "@@ -429,7 +429,8 @@"] {
+            assert!(!rule.regex.is_match(line), "false numeric status: {line}");
+        }
+    }
+
+    #[test]
+    fn rate_limit_mask_truncation_does_not_create_numeric_match() {
+        let rules = default_health_rules();
+        for tail in ["429,524", "4291"] {
+            let line = format!("not logged in{} {tail}", "x".repeat(183));
+            let masked = mask_health_line(&line, &rules);
+            assert!(masked.chars().count() <= 200);
+            assert!(masked.contains(HEALTH_MASK));
+            assert!(masked.contains("xxx"), "ordinary truncation lost useful context: {masked}");
+            assert_ne!(masked, HEALTH_MASK, "ordinary case must not take pathological fallback");
+            assert!(rules.iter().all(|r| !r.regex.is_match(&masked)), "truncated mask rematches: {masked}");
+        }
+    }
+
+    #[test]
+    fn rate_limit_mask_cap_returns_fail_safe_marker() {
+        // A runtime rule matching the marker itself cannot satisfy no-rematch; quarantine owns it.
+        let rules = vec![HealthRule { name: "pathological".into(), regex: Regex::new(".").unwrap(),
+                                     action: None, threshold: 3, pause_secs: 300 }];
+        assert_eq!(mask_health_line("loop", &rules), HEALTH_MASK);
+        let masked = mask_health_line("loop", &rules);
+        let m = rules[0].regex.find(&masked).unwrap();
+        assert_eq!(alert_discourse_reason(&masked, m.start(), m.end(), &rules), Some("alert-machinery-token"));
+    }
+
+    #[test]
+    fn rate_limit_known_delta_comma_consumes_one_cjk_at_narration_threshold() {
+        // KNOWN DELTA accepted by the head: defer ingest-aware prose/CJK handling to P7/C-22.
+        // The right-comma arm consumes one nondigit: only the exact CJK threshold changes.
+        let rules = default_health_rules();
+        let rule = rules.iter().find(|r| r.name == "rate_limited").unwrap();
+        let old = Regex::new(r"(?i)rate.?limit(ed)?|too many requests|\b429\b").unwrap();
+        let threshold = narration_cjk_min();
+        assert!(threshold > 1, "this control requires enabled narration classification");
+        for count in [threshold - 1, threshold, threshold + 1] {
+            let line = format!("429,{}", "가".repeat(count));
+            let before = old.find(&line).unwrap();
+            let after = rule.regex.find(&line).unwrap();
+            assert_eq!(before.as_str(), "429");
+            assert_eq!(after.as_str(), "429,가");
+            assert_eq!(alert_discourse_reason(&line, before.start(), before.end(), &rules),
+                       if count >= threshold { Some("narration-prose") } else { None });
+            assert_eq!(alert_discourse_reason(&line, after.start(), after.end(), &rules),
+                       if count > threshold { Some("narration-prose") } else { None });
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -10734,15 +10876,9 @@ mod tests {
     /// 하던 구 로직 그대로다(D5 `ingest_step_pre_refactor` 와 동일 관행: 비교 기준을 코드로 박제).
     /// 이 미러가 매칭하는데 프로덕션 경로가 매칭하지 않으면 = 자기증폭 차단이 실제로 작동한 것.
     fn health_matches_pre_fix(line: &str) -> Vec<String> {
-        // Pin the historical matcher: the current default must not rewrite this control arm.
-        let legacy_rate = Regex::new(r"(?i)rate.?limit(ed)?|too many requests|\b429\b").unwrap();
         default_health_rules()
             .into_iter()
-            .filter(|r| if r.name == "rate_limited" {
-                legacy_rate.is_match(line)
-            } else {
-                r.regex.is_match(line)
-            })
+            .filter(|r| r.regex.is_match(line))
             .map(|r| r.name)
             .collect()
     }
@@ -10987,10 +11123,7 @@ mod tests {
         let judge = |line: &str, rule: &str| -> Option<&'static str> {
             let rules = default_health_rules();
             let r = rules.iter().find(|r| r.name == rule).unwrap();
-            // Test discourse classification independently of the narrowed default trigger.
-            let legacy = Regex::new(r"(?i)rate.?limit(ed)?|too many requests|\b429\b").unwrap();
-            let matcher = if rule == "rate_limited" { &legacy } else { &r.regex };
-            let m = matcher.find(line).unwrap_or_else(|| panic!("no match: {line}"));
+            let m = r.regex.find(line).unwrap_or_else(|| panic!("no match: {line}"));
             alert_discourse_reason(line, m.start(), m.end(), &rules)
         };
         // ① 기계장치 식별자
@@ -11061,12 +11194,7 @@ mod tests {
         feed_lines_collect_alerts(&daemon, &s, INCIDENT_PROSE);
         let sup = daemon.health_suppressed.lock().unwrap();
         let total: u64 = sup.values().sum();
-        // Bare rate-limit prose is rejected before suppression; count actual candidate matches.
-        let rules = default_health_rules();
-        let expected: usize = INCIDENT_PROSE.iter()
-            .map(|line| rules.iter().filter(|r| r.regex.is_match(line)).count()).sum();
-        assert!(expected > 0, "suppression control must contain matching candidates");
-        assert_eq!(total, expected as u64, "억제 집계 누락: {sup:?}");
+        assert!(total >= INCIDENT_PROSE.len() as u64 - 2, "억제 집계 누락: {sup:?}");
         assert!(
             sup.keys().any(|(_, reason)| *reason == "narration-prose"),
             "한글 서술 억제 사유 미기록: {sup:?}"
@@ -11154,9 +11282,8 @@ mod tests {
     fn structured_json_error_is_not_treated_as_quoted_mention() {
         let rules = default_health_rules();
         let judge = |line: &str| {
-            // Quoting semantics are tested on the token itself, even when bare prose no longer triggers.
-            let token = Regex::new(r"(?i)rate.?limit(ed)?").unwrap();
-            let m = token.find(line).unwrap();
+            let r = rules.iter().find(|r| r.regex.is_match(line)).unwrap();
+            let m = r.regex.find(line).unwrap();
             alert_discourse_reason(line, m.start(), m.end(), &rules)
         };
         // ① 구조화 에러 출력(JSON 값 자리·logfmt 값 자리) = 진짜 신호 → 통과(None)

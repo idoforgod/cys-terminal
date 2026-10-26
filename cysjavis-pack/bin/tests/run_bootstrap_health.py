@@ -8067,7 +8067,9 @@ def h_auth_selfloop():
     # 생산 룰 정규식을 state.rs 본문에서 뽑는다(사본 정규식이면 검체가 사문화된다).
     rules_src = _slice_between(st, "fn default_health_rules() -> Vec<HealthRule> {", "\n}\n",
                                "H-AUTH-SELFLOOP 생산 룰 집합")
-    pairs = re.findall(r'"([a-z0-9_]+)",\s*\n?\s*r"((?:[^"\\]|\\.)*)"', rules_src)
+    # Rust r"..." and r#"..."# keep pattern bytes verbatim; closing hashes must match.
+    pairs = [(name, pat) for name, _hash, pat in
+             re.findall(r'"([a-z0-9_]+)",\s*\n?\s*r(#?)"(.*?)"\2', rules_src, re.S)]
     need(len(pairs) >= 5,
          "계측 무효: 생산 헬스룰을 %d건밖에 수확하지 못했다(수확 정규식 파손)" % len(pairs))
     rules = []
@@ -8082,18 +8084,29 @@ def h_auth_selfloop():
                       ("Please run /login to continue", "login_required"),
                       ("401 Unauthorized", "auth_401"),
                       ("your token has expired", "token_expired"),
-                      ("HTTP 429 Too Many Requests", "rate_limited"),
-                      ('Error: rate limited', "rate_limited"),
-                      ('{"error":"rate limit"}', "rate_limited"),
-                      ('level=error msg="rate limit" svc=api', "rate_limited")):
+                      ("rate limited", "rate_limited"),
+                      ("429", "rate_limited"),
+                      ("HTTP/1.1 429", "rate_limited"),
+                      ('  "code": 429,', "rate_limited"),
+                      ('{"error":{"code":429,"message":"x"}}', "rate_limited"),
+                      ('{"status":"429"}', "rate_limited"),
+                      ("429, retry after 30s", "rate_limited"),
+                      ("Working...You've hit your weekly limit", "rate_limited"),
+                      ("You have hit your usage limit", "rate_limited"),
+                      ("You've hit your monthly spend limit", "rate_limited"),
+                      ("Working...You have exhausted your quota", "rate_limited"),
+                      ("RESOURCE_EXHAUSTED", "rate_limited")):
         need(want in hits(bad),
              "계측 무효: 합성 표본 %r 이 룰 %s 에 걸리지 않는다 — 이 검체가 재는 대상이 "
              "생산 룰이 아니다" % (bad, want))
-    # C-04 intentionally replaces the old bare-prose positive: only explicit errors are signals.
-    for benign in ("12,429,524", "12,430,040", "4291", "429", "HTTP 4291", "HTTP 429,524",
-                   "rate limit", "rate limited", "We discuss rate limit handling",
-                   'level=info msg="rate limit"', "The Error: rate limit text was quoted"):
-        need("rate_limited" not in hits(benign), "C-04 false limit signal: %r" % benign)
+    # C-04 R2: only numeric groups are excluded; original unanchored prose is retained.
+    for benign in ("12,429,524", "429,524", "12,429", "4291", "14290", "12,430,040",
+                   "HTTP 4291", "HTTP 429,524"):
+        need("rate_limited" not in hits(benign), "C-04 false numeric limit signal: %r" % benign)
+    for opening, closing in (('"', '"'), ("'", "'"), ('`', '`'), ('“', '”'),
+                             ('‘', '’'), ('「', '」'), ('«', '»')):
+        mention = "the %s429%s alarm" % (opening, closing)
+        need("rate_limited" not in hits(mention), "C-04 quoted numeric signal: %r" % mention)
     # auth 인터록이 보는 네 룰이 실제로 이 집합 안에 있어야 검체가 의미를 갖는다.
     interlock = _slice_between(st, "pub const AUTH_INTERLOCK_RULES:", ";", "인터록 룰 목록")
     for r in re.findall(r'"([a-z0-9_]+)"', interlock):
