@@ -10005,7 +10005,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// ★후계ⓐ(B2 전환 · v2 §6): 벤더 전진 + base 미검증 드리프트 → 치유 불변(healed).
+    /// ★후계ⓐ(B2 전환 · v2 §6) 의 0.14.55 후속: 벤더 전진 + base 미검증 드리프트는 **출처 불명**이라
+    /// 제자리 보존된다(C-07 · 종전 치유 불변을 이 모집단에서 대체).
     /// 픽스처는 의도적으로 base 검증 실패 형상(manifest≠hash(pristine)) — T3 이후에도 L4 healed
     /// 레인 핀으로 영속(병합 성공 레인은 T3 통합 핀이 별도 담당 — 이 핀을 Merge3 기대로 오개정 금지).
     #[test]
@@ -10031,21 +10032,29 @@ mod tests {
         let _ = std::fs::remove_file(pd.join(PRISTINE_DIR).join(sys));
 
         install_staged(false, None).unwrap();
+        // ★0.14.55(C-07 · P3) 이 「치유 불변(B2 후계ⓐ · v2 §6)」을 **이 모집단에서 대체한다**.
+        //   이 형상은 매니페스트 항목이 디스크와도·조상과도(pristine 제거)·임베드와도 다르고,
+        //   디스크 바이트가 내장 과거벤더 표에 없으며, 병합 대기 항목도 없다 = **출처 불명**이다.
+        //   근거: HEAD-DISPOSITION-P3-R3.md "What proceeds" 2 + HEAD-RULING-P3-IMPL-C07-NARROW.md
+        //   항목 1 — "keep in place + report (no heal, no .user parking, no Merge3)".
+        //   ⇒ 종전 치유는 운영자가 쓰지 않은 바이트의 `.user` 백업과 거짓 "healed" 원장 항목을
+        //      만들었다(reviewer1 r2 M3). 쓰기 0 이 새 불변이다.
+        //   ⛔병합 대기 항목이 있는 형상에서는 pinned 수렴이 그대로 돈다(판정 항목 2 · 별 검체).
         assert_eq!(
             std::fs::read_to_string(pd.join(sys)).unwrap(),
-            sys_embed,
-            "★후계ⓐ(B2 전환 · v2 §6): 벤더 전진+base 미검증 드리프트 → 치유 불변(healed)"
-        );
-        assert_eq!(
-            std::fs::read_to_string(pd.join(format!("{sys}.user"))).unwrap(),
             "SYS-EDIT-XYZ",
-            "치유 전 사용자본 보존 파괴 0 불변"
+            "★C-07(0.14.55): 출처 불명 → 제자리 보존(디스크 바이트 무변경)"
+        );
+        assert!(
+            !pd.join(format!("{sys}.user")).exists(),
+            "★C-07: 쓰지 않은 바이트의 .user 백업을 만들지 않는다"
         );
         assert_eq!(
             load_merge_pending(&pd).get(sys).and_then(|e| e["kind"].as_str()),
-            Some("healed"),
-            "원장 kind==healed"
+            None,
+            "★C-07: 거짓 healed 원장 항목을 남기지 않는다"
         );
+        let _ = sys_embed;
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -10189,7 +10198,7 @@ mod tests {
         let bp = dpack.join(PRISTINE_DIR).join(l3);
         std::fs::create_dir_all(bp.parent().unwrap()).unwrap();
         std::fs::write(&bp, l3_base).unwrap();
-        // L4: 벤더 전진 + base 미검증(pristine 제거) — 종전 healed 거동(B2 후계ⓐ 동형).
+        // L4: 벤더 전진 + base 미검증(pristine 제거) — ★0.14.55 부터 제자리 보존(C-07 · 아래 단언 참조).
         std::fs::write(dpack.join(l4), "DEPT-DRIFT-L4\n").unwrap();
         manifest_rewind(l4, "OLD-VENDOR-BASE");
         let _ = std::fs::remove_file(dpack.join(PRISTINE_DIR).join(l4));
