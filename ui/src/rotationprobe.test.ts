@@ -26,6 +26,9 @@ function rig(options: { mainSkew?: boolean; fail?: (call: Call) => unknown; dela
   const badges: { textContent: string; title: string; isConnected: boolean; remove(): void }[] = [];
   let version = "0.14.53";
   let confirm = true;
+  // r1 m4: the departments-only transition needs departments that STOP being skewed, which is
+  // what a successful departments-only retry leaves behind. Defaults to the old behaviour.
+  let deptSkew = true;
   const scope = {
     rotatingDaemon: false, purgingDept: false, factoryResetting: false, resetCompleted: false,
     document: {
@@ -41,7 +44,10 @@ function rig(options: { mainSkew?: boolean; fail?: (call: Call) => unknown; dela
       const failure = options.fail?.(call);
       if (failure !== undefined) throw failure;
       if (cmd === "app_version") return version;
-      if (cmd === "daemon_status") return { version: !args?.socket && options.mainSkew === false ? version : "0.14.52" };
+      if (cmd === "daemon_status") {
+        if (args?.socket) return { version: deptSkew ? "0.14.52" : version };
+        return { version: options.mainSkew === false ? version : "0.14.52" };
+      }
       if (cmd === "list_depts") return { depts: { first: { socket: "s1" }, later: { socket: "s2" } } };
       if (cmd === "drain_verify") return { all_saved: true, nodes: [], pending_loss_warning: [] };
       return { restore_ok: true };
@@ -58,7 +64,8 @@ function rig(options: { mainSkew?: boolean; fail?: (call: Call) => unknown; dela
   const api = new Function("scope", `with (scope) { ${js}\nreturn {checkVersionSkew, manualRotateSkewed, manualRestartAllDaemons, restartAllDaemons, rotateMainDaemon, rotateDeptDaemon}; }`)(scope) as Api;
   const rotations = () => calls.filter((c) => c.cmd === "rotate_daemon" || c.cmd === "rotate_dept_daemon");
   return { api, calls, notices, confirmations, badges, scope, rotations,
-    setVersion: (v: string) => { version = v; }, setConfirm: (v: boolean) => { confirm = v; } };
+    setVersion: (v: string) => { version = v; }, setConfirm: (v: boolean) => { confirm = v; },
+    setDeptSkew: (v: boolean) => { deptSkew = v; } };
 }
 
 describe("WP12 rotation refusal latch", () => {
@@ -261,6 +268,34 @@ describe("WP12 rotation refusal latch", () => {
     expect(cancelled.rotations().length).toBe(0);
     expect(cancelled.calls.some((c) => c.cmd === "drain_verify")).toBe(false);
     expect(cancelled.scope.rotatingDaemon).toBe(false);
+  });
+
+  // ★(r1 m4 · codex-3) The departments-only transition. MB5 - `if (mainSkew &&
+  // rotationIsBlocked(appVer, "main")) heldMain = true;` - was reported as a REDUNDANT guard on
+  // the reasoning that a main refusal latches depts too, so rotationAllBlocked() returns first.
+  // That reasoning misses this transition: a successful departments-only retry deletes ONLY the
+  // depts key, so main stays latched while rotationAllBlocked() is false - and the next tick
+  // reaches the guard. Without it heldMain is false, heldDepts is empty, and clearSkewBadge()
+  // wipes the one badge the user can click to retry main. MB5 is a FORMER TEST GAP, not a
+  // redundant guard; this cell is the specimen that was missing.
+  it("a departments-only retry clears only that latch, and the next tick keeps the main retry badge", async () => {
+    const r = rig({ mainSkew: true, fail: (c) => c.cmd === "rotate_daemon" ? shellRefusal : undefined });
+    // 1. the main arm refuses: BOTH routes latch (a failing native pair is evidence about this build)
+    await r.api.checkVersionSkew();
+    expect(r.rotations().map((c) => c.cmd)).toEqual(["rotate_daemon"]);
+    expect(r.badges.at(-1)?.textContent).toContain("확인 실패");
+    // 2. the badge's departments-only retry: the probe passes, so ONLY the depts key is deleted
+    await r.api.manualRotateSkewed("0.14.53", false, [{ name: "first", socket: "s1" }]);
+    expect(r.calls.filter((c) => c.cmd === "probe_rotation_binaries")
+            .some((c) => c.args?.includeDepartments === true && c.args?.includeMain === false)).toBe(true);
+    // 3. those departments are now on the new version; main is still skewed AND still latched
+    r.setDeptSkew(false);
+    await r.api.checkVersionSkew();
+    // the tick must NOT have been short-circuited by rotationAllBlocked() - main alone is blocked
+    expect(r.rotations().map((c) => c.cmd)).toEqual(["rotate_daemon", "rotate_dept_daemon"]);
+    const badge = r.badges.at(-1);
+    expect(badge?.isConnected).toBe(true);
+    expect(badge?.textContent).toBe("새 실행 파일 확인 실패 · 앱 v0.14.53 — 클릭하여 다시 확인");
   });
 
   it("Error-wrapped refusal uses its message, but mention-only errors do not latch", async () => {

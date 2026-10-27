@@ -107,11 +107,15 @@ EXPECTED_MACROS = {
     "CYS_FIRSTLINE", "CYS_DEL_RETRY", "CYS_PRIOR_SCAN", "CYS_PROBE_SWEEP_OLD",
     "CYS_PROBE_CLEAN", "CYS_FIND_GUI", "CYS_HANDOFF", "CYS_PROBE_REFUSE",
     "CYS_PROBE_LEAF", "CYS_PROBE_RUN",
+    # ★(0.14.55 P4-IMPL r1 · M1) the absolute execution deadline. Its OUTCOMES are pinned
+    # structurally by p1_structure_check and by m1_deadline_model below; its native behaviour
+    # is executed by the windows lane (run-probe-cases.ps1), not here.
+    "CYS_RUN_BOUNDED",
 }
 # sha256 over the sorted census the mirrors depend on: anchors/tokens + the
 # normalized BODY hashes of the modeled macros/callbacks + POSTINSTALL order
 # (see hook_guard)
-GUARD_PIN = "7ad56c72b9ff3e8d919399b5bc1bd37947cd0d599d38c7d59a0ea1cafeb301fd"  # re-pinned 2026-10-24 for WP12 P1 (new P1 macros; PREINSTALL worker/probe; POSTINSTALL deletes a stale refusal record)
+GUARD_PIN = "81e00a40b29932dc5031972d8015035daa664c145fdddaeae64feba5952af969"  # re-pinned 2026-10-28 for P4-IMPL r1 M1 (CYS_RUN_BOUNDED: absolute execution deadline replaces the nsExec inactivity timer on both probe paths; command line passed by register)
 
 
 def hook_path():
@@ -166,9 +170,18 @@ def p1_structure_check(text):
     pre = _body(text, "macro", "NSIS_HOOK_PREINSTALL")
     refuse = _body(text, "macro", "CYS_PROBE_REFUSE")
     leaf = _body(text, "macro", "CYS_PROBE_LEAF")
-    if page is None or pre is None or refuse is None or leaf is None:
-        return bad + ["a P1 body is missing (cys_probe_page / PREINSTALL / CYS_PROBE_REFUSE / CYS_PROBE_LEAF)"]
-    for need in ('/CYSPROBE=', 'nsExec::ExecToStack /TIMEOUT=', '!insertmacro CYS_PROBE_REFUSE',
+    runner = _body(text, "macro", "CYS_RUN_BOUNDED")
+    # ★the runner's own comments EXPLAIN the forms that are forbidden below (that is the point of
+    # them), so every pin on it reads the CODE only - an instrument that matches the comment
+    # describing a defect reports the defect as present.
+    runner_code = None
+    if runner is not None:
+        runner_code = "\n".join(ln for ln in runner.splitlines()
+                                 if not ln.lstrip().startswith(";"))
+    if page is None or pre is None or refuse is None or leaf is None or runner is None:
+        return bad + ["a P1 body is missing (cys_probe_page / PREINSTALL / CYS_PROBE_REFUSE / "
+                      "CYS_PROBE_LEAF / CYS_RUN_BOUNDED)"]
+    for need in ('/CYSPROBE=', '!insertmacro CYS_RUN_BOUNDED', '!insertmacro CYS_PROBE_REFUSE',
                  'OpenMutexW', 'WaitForSingleObject', 'StrCpy $CysMutexHeld "1"'):
         if need not in page:
             bad.append("cys_probe_page lacks %r" % need)
@@ -195,8 +208,46 @@ def p1_structure_check(text):
     for forbidden in ("taskkill", "KillProcess", "Rename ", 'Delete "$INSTDIR\\cys'):
         if forbidden in refuse:
             bad.append("CYS_PROBE_REFUSE touches a process or a canonical file: %r" % forbidden)
+    # ★(0.14.55 P4-IMPL r1 · M1) the probe's bound must be an ABSOLUTE execution deadline on a
+    # handle WE own, not nsExec's inactivity timer. These pins are deliberately about the
+    # MECHANISM: a `/TIMEOUT=` token is a syntax fact and says nothing about elapsed time, which
+    # is exactly the confusion that shipped. Both probe paths must go through CYS_RUN_BOUNDED.
+    for need in ("kernel32::CreateProcessW", "kernel32::WaitForSingleObject",
+                 "kernel32::TerminateProcess", "kernel32::GetExitCodeProcess",
+                 'StrCpy $R7 "cleanup-unconfirmed"', 'StrCpy $R7 "timeout"'):
+        if need not in runner_code:
+            bad.append("CYS_RUN_BOUNDED lacks %r (absolute deadline on an owned handle)" % need)
+    # the kill must itself be bounded: a SECOND wait is what separates a confirmed kill from
+    # cleanup-unconfirmed, so one WaitForSingleObject is not enough.
+    if runner_code.count("kernel32::WaitForSingleObject") < 2:
+        bad.append("CYS_RUN_BOUNDED must wait twice: the deadline, then a bounded kill confirmation")
+    if runner_code.find("kernel32::TerminateProcess") < runner_code.find("kernel32::WaitForSingleObject"):
+        bad.append("CYS_RUN_BOUNDED must wait BEFORE it terminates (the deadline decides the kill)")
+    # the capture must not be a pipe: nothing drains one here, so a chatty child would block on
+    # write and a continuous-output candidate would hang instead of being bounded.
+    for forbidden in ("CreatePipe", "ExecToStack", "ExecToLog", "nsExec"):
+        if forbidden in runner_code:
+            bad.append("CYS_RUN_BOUNDED must own its handle and capture to a file, found %r" % forbidden)
+    if "kernel32::CreateFileW" not in runner_code:
+        bad.append("CYS_RUN_BOUNDED must redirect the child's output to a FILE (bounded capture)")
+    # the command line must reach CreateProcessW through a REGISTER. Every real CMD starts with a
+    # quoted path, and the System plugin ends a quoted inline literal at the first inner quote, so
+    # an inline form would launch a truncated command line.
+    if 't r5' not in runner_code or "StrCpy $5 '${CMD}'" not in runner_code:
+        bad.append("CYS_RUN_BOUNDED must pass the command line by register (t r5), not inline")
+    if 't "${CMD}"' in runner_code:
+        bad.append("CYS_RUN_BOUNDED passes CMD as an inline quoted literal: the System plugin's "
+                   "parser ends it at the first inner quote of the quoted exe path")
+    # the leaf and the GUI worker wrapper must BOTH be bounded this way - the silent /S path is
+    # not protected by the worker's wrapper, which is how the unbounded leaf shipped.
+    if "nsExec" in leaf:
+        bad.append("CYS_PROBE_LEAF must not use nsExec: its /TIMEOUT is an inactivity timer")
+    if text.count("!insertmacro CYS_RUN_BOUNDED") < 2:
+        bad.append("both probe paths (silent inline leaf + GUI worker) must use CYS_RUN_BOUNDED")
+    if re.search(r"nsExec::ExecToStack /TIMEOUT=\d+ '\"\$EXEPATH\"", text):
+        bad.append("the GUI worker wrapper still uses the nsExec inactivity timer")
     # exact (case-sensitive StrCmpS) comparisons of the F3 grammar, and the build-ID character loop
-    for need in ("/TIMEOUT=30000", '"cysd ${VER} (build "', 'StrCmpS $R5 "cys ${VER}"',
+    for need in ('"cysd ${VER} (build "', 'StrCmpS $R5 "cys ${VER}"',
                  'StrCmpS $R5 "cys-app ${VER}"', "StrCmpS $R6 $R4 ", 'StrCmpS $R2 ")" ',
                  "StrCmpS $R4 $R7 ", "CYS_DEL_RETRY"):
         if need not in leaf:
@@ -233,6 +284,53 @@ def p1_structure_check(text):
     return bad
 
 
+def m1_deadline_model():
+    """★(0.14.55 P4-IMPL r1 · M1) the two timer kinds, as elapsed time rather than as a token.
+
+    This is the check that answers the review finding. nsExec's /TIMEOUT is an INACTIVITY timer:
+    it is reset by every write, so a child that keeps printing is never bounded by it. An
+    absolute deadline counts from the start whatever the child prints. Modelled over two output
+    profiles; `None` means the probe never returns.
+
+    It is a model of the two TIMER DISCIPLINES, not of Windows: no process is run here.
+    """
+    bad = []
+
+    def inactivity(profile, limit_ms, horizon_ms):
+        """Return ms at which an inactivity timer fires, or None within the horizon."""
+        t = last = 0
+        while t <= horizon_ms:
+            if t - last >= limit_ms:
+                return t
+            if t in profile:                      # a write resets the timer
+                last = t
+            t += 1
+        return None
+
+    def absolute(limit_ms, horizon_ms):
+        """An absolute deadline cannot depend on the output profile at all."""
+        return limit_ms if limit_ms <= horizon_ms else None
+
+    HORIZON = 600000
+    silent = set()                                 # a quiet hang: writes nothing, ever
+    chatty = set(range(0, HORIZON + 1, 1000))      # one write a second, forever
+
+    # the OLD discipline: bounded for the quiet hang, UNBOUNDED for the chatty one
+    if inactivity(silent, 30000, HORIZON) != 30000:
+        bad.append("model error: an inactivity timer must fire at its limit on a silent child")
+    if inactivity(chatty, 30000, HORIZON) is not None:
+        bad.append("model error: an inactivity timer must NOT fire on a child that keeps writing")
+    # the NEW discipline: the SAME bound for both, which is the whole point
+    for name, prof in (("quiet-hang", silent), ("continuous-output", chatty)):
+        got = absolute(30000, HORIZON)
+        if got != 30000:
+            bad.append("absolute deadline must bound %s at its limit, got %r" % (name, got))
+    # and the outer GUI-worker bound is absolute on the same discipline
+    if absolute(120000, HORIZON) != 120000:
+        bad.append("the GUI worker's outer bound must be absolute too")
+    return bad
+
+
 def hook_guard():
     p = hook_path()
     try:
@@ -240,6 +338,12 @@ def hook_guard():
             text = f.read()
     except OSError as e:
         print("FAIL[guard]: cannot read the hook at %s: %s" % (p, e), file=sys.stderr)
+        sys.exit(2)
+
+    m1 = m1_deadline_model()
+    if m1:
+        print("FAIL[m1]: the probe's execution bound is not absolute:\n  " + "\n  ".join(m1),
+              file=sys.stderr)
         sys.exit(2)
 
     p1 = p1_structure_check(text)

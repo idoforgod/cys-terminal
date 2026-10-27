@@ -602,17 +602,32 @@ Var CysNewVer
 Var CysRecord
 Var CysHandoff     ; not-needed | relaunched-ok | initiator-did-not-exit | relaunch-not-running
 
-; first line of IN (cut at CR or LF) -> OUT. Uses $R9.
+; first line of IN (cut at CR or LF) -> OUT.
+; ★(0.14.55 P4-IMPL r1 · m1) ALIAS-PROOF. The old form used $R9 as BOTH the caller's OUT and
+;   its own ${StrLoc} scratch, and CYS_PRIOR_SCAN calls it with IN == OUT == $R9: ${StrLoc}
+;   wrote the POSITION over the text and the next StrCpy then cut that position by itself.
+;   Measured register trace for a CRLF marker ("0.14.54$\r$\n"): text -> 7 -> 7 -> empty, so a
+;   perfectly good kept version was reported as `unknown` on every CRLF marker.
+;   Now the text is held in a saved scratch, every write to the caller's OUT happens LAST, and
+;   OUT is delivered through the stack - so IN, OUT and the scratch may all be the same register.
 !macro CYS_FIRSTLINE IN OUT TAG
-  StrCpy ${OUT} ${IN}
-  ${StrLoc} $R9 ${OUT} "$\r" ">"
-  StrCmp $R9 "" cys_fl_lf_${TAG} 0
-  StrCpy ${OUT} ${OUT} $R9
+  Push $R0
+  Push $R1
+  StrCpy $R1 ${IN}
+  ${StrLoc} $R0 $R1 "$\r" ">"
+  StrCmp $R0 "" cys_fl_lf_${TAG} 0
+  StrCpy $R1 $R1 $R0
 cys_fl_lf_${TAG}:
-  ${StrLoc} $R9 ${OUT} "$\n" ">"
-  StrCmp $R9 "" cys_fl_done_${TAG} 0
-  StrCpy ${OUT} ${OUT} $R9
+  ${StrLoc} $R0 $R1 "$\n" ">"
+  StrCmp $R0 "" cys_fl_done_${TAG} 0
+  StrCpy $R1 $R1 $R0
 cys_fl_done_${TAG}:
+  Push $R1
+  Exch
+  Pop $R1
+  Exch
+  Pop $R0
+  Pop ${OUT}
 !macroend
 
 ; delete FILE, bounded 10 x 1 s; error flag set if it still exists. Uses $R7.
@@ -672,8 +687,10 @@ cys_pso_end_${TAG}:
   ClearErrors
 !macroend
 
-; probe dir cleanup (F6 + R2-F2). CONFIRMED=1: every leaf is known to have exited (nsExec saw
-; it end, or a timed-out leaf's image was deleted) -> a deletion failure is probe-dir-left.
+; probe dir cleanup (F6 + R2-F2). CONFIRMED=1: every leaf is known to have exited - ★(r1 M1) the
+; oracle is now the leaf's OWN process handle (WaitForSingleObject returned WAIT_OBJECT_0, or a
+; TerminateProcess was confirmed by a second bounded wait), not nsExec's inactivity timer; a
+; timed-out leaf whose image was then deleted also counts -> a deletion failure is probe-dir-left.
 ; CONFIRMED=0 (the worker itself timed out): a leaf image that cannot be deleted may still run
 ; -> cleanup-unconfirmed. Uses $R7.
 !macro CYS_PROBE_CLEAN DIR CONFIRMED TAG
@@ -841,12 +858,123 @@ cys_rf_quit_${TAG}:
   Quit
 !macroend
 
-; one leaf: run EXE with ARGS (30 s bound) and classify into OUT (KIND: cysd | cys | app).
-; Only inserted inside Section Install (VER is the template's ${VERSION} there). Uses $R2-$R9.
+; ── ★(0.14.55 P4-IMPL r1 · M1) an ABSOLUTE execution deadline ──────────────────────────────
+; WHY THIS EXISTS. The leaf used `nsExec::ExecToStack /TIMEOUT=30000`. nsExec's /TIMEOUT is an
+; INACTIVITY timer: it measures time WITHOUT OUTPUT and is reset every time the child writes.
+; A blocked candidate that prints one byte a second therefore NEVER trips it, and in silent mode
+; the PREINSTALL path runs the leaf inline with no outer watchdog - so an update could wait
+; forever. A probe that can hang the installer is worse than no probe. (A `/TIMEOUT=` token in
+; the source is a syntax fact, not an elapsed-time guarantee; do not read one as the other.)
+;
+; WHAT THIS DOES. The child is run under a handle WE own, with a wall-clock bound:
+;   CreateProcessW -> WaitForSingleObject(DEADLINE) -> TerminateProcess -> WaitForSingleObject(KILL)
+; and the second wait is what separates "timeout, child confirmed gone" from "cleanup-unconfirmed".
+; Any wait result other than WAIT_OBJECT_0 is treated as the deadline having passed - fail-closed,
+; so a failed wait can never read as a healthy exit.
+;
+; ★stdout+stderr go to a FILE, never a pipe. Nothing here drains a pipe, so a chatty child would
+;   fill the pipe buffer and block on write - converting "continuous output" into a hang and
+;   losing the very text we classify on. A file never blocks the writer, and we read it BOUNDED
+;   (one line, capped length) rather than slurping whatever the child produced.
+; ⛔It touches no old file and no other process: it owns exactly the one handle it created, and
+;   the only path it can delete is the probe copy the installer itself just extracted.
+;
+; Sets $R7 = "0" | "<rc>" | "timeout" | "cleanup-unconfirmed" | "error"   (the nsExec contract)
+;      $R8 = the child's captured first line, bounded
+; Scratch $0-$5 are saved and restored, so the caller's $R2-$R9 are untouched.
+!macro CYS_RUN_BOUNDED CMD OUTFILE MS KILLMS TAG
+  Push $0
+  Push $1
+  Push $2
+  Push $3
+  Push $4
+  Push $5
+  StrCpy $R7 "error"
+  StrCpy $R8 ""
+  ; ★the command line goes through a REGISTER, never inline as `t "${CMD}"`. Every real CMD here
+  ;   starts with a quoted path ("$EXEPATH" /S ... , "$CysProbeDir\cysd.exe" --version), and the System
+  ;   plugin's own argument parser ends a quoted literal at the first inner quote - an inline form would
+  ;   hand CreateProcessW a truncated command line. `t r5` passes the string by register, unparsed.
+  StrCpy $5 '${CMD}'
+  Delete "${OUTFILE}"
+  ; SECURITY_ATTRIBUTES { nLength = 12, lpSecurityDescriptor = NULL, bInheritHandle = TRUE }
+  System::Call '*(i 12, p 0, i 1) p .r1'
+  StrCmp $1 0 cys_rb_done_${TAG} 0
+  ; GENERIC_WRITE, FILE_SHARE_READ|WRITE, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, inheritable
+  System::Call 'kernel32::CreateFileW(w "${OUTFILE}", i 0x40000000, i 3, p r1, i 2, i 0x80, p 0) p .r2'
+  System::Free $1
+  ; INVALID_HANDLE_VALUE, whichever way the plugin renders the pointer on this build
+  StrCmp $2 "-1" cys_rb_done_${TAG} 0
+  StrCmp $2 "4294967295" cys_rb_done_${TAG} 0
+  StrCmp $2 0 cys_rb_done_${TAG} 0
+  ; STARTUPINFOW (x86, cb = 68). dwFlags = STARTF_USESHOWWINDOW|STARTF_USESTDHANDLES = 0x101.
+  ; wShowWindow = SW_HIDE (0) packs with cbReserved2 (0) in one 32-bit slot. stdin = NULL.
+  System::Call '*(i 68, p 0, p 0, p 0, i 0, i 0, i 0, i 0, i 0, i 0, i 0, i 0x101, i 0, p 0, p 0, p r2, p r2) p .r3'
+  StrCmp $3 0 cys_rb_nosi_${TAG} 0
+  ; PROCESS_INFORMATION { hProcess, hThread, dwProcessId, dwThreadId }
+  System::Call '*(p 0, p 0, i 0, i 0) p .r4'
+  StrCmp $4 0 cys_rb_nopi_${TAG} 0
+  System::Call 'kernel32::CreateProcessW(p 0, t r5, p 0, p 0, i 1, i 0x08000000, p 0, p 0, p r3, p r4) i .r0'
+  System::Call 'kernel32::CloseHandle(p r2)'
+  StrCmp $0 0 cys_rb_nproc_${TAG} 0
+  System::Call '*$4(p .r2, p .r3, i, i)'
+  System::Call 'kernel32::CloseHandle(p r3)'
+  System::Free $4
+  System::Free $3
+  ; ★the bound. Absolute: it counts from here regardless of what the child prints.
+  System::Call 'kernel32::WaitForSingleObject(p r2, i ${MS}) i .r0'
+  StrCmp $0 0 cys_rb_exit_${TAG} 0
+  ; the deadline passed (or the wait itself failed) - kill OUR handle, then bound the kill
+  System::Call 'kernel32::TerminateProcess(p r2, i 1)'
+  System::Call 'kernel32::WaitForSingleObject(p r2, i ${KILLMS}) i .r0'
+  StrCmp $0 0 0 cys_rb_unconf_${TAG}
+  StrCpy $R7 "timeout"
+  Goto cys_rb_close_${TAG}
+cys_rb_unconf_${TAG}:
+  StrCpy $R7 "cleanup-unconfirmed"
+  Goto cys_rb_close_${TAG}
+cys_rb_exit_${TAG}:
+  System::Call 'kernel32::GetExitCodeProcess(p r2, *i .r0)'
+  StrCpy $R7 $0
+cys_rb_close_${TAG}:
+  System::Call 'kernel32::CloseHandle(p r2)'
+  Goto cys_rb_read_${TAG}
+cys_rb_nproc_${TAG}:
+  System::Free $4
+  System::Free $3
+  StrCpy $R7 "error"
+  Goto cys_rb_read_${TAG}
+cys_rb_nopi_${TAG}:
+  System::Free $3
+  System::Call 'kernel32::CloseHandle(p r2)'
+  StrCpy $R7 "error"
+  Goto cys_rb_done_${TAG}
+cys_rb_nosi_${TAG}:
+  System::Call 'kernel32::CloseHandle(p r2)'
+  StrCpy $R7 "error"
+  Goto cys_rb_done_${TAG}
+cys_rb_read_${TAG}:
+  ; bounded capture: one line, at most 1024 characters, whatever the child wrote
+  ClearErrors
+  FileOpen $0 "${OUTFILE}" r
+  IfErrors cys_rb_done_${TAG}
+  FileRead $0 $R8 1024
+  FileClose $0
+cys_rb_done_${TAG}:
+  ClearErrors
+  Pop $5
+  Pop $4
+  Pop $3
+  Pop $2
+  Pop $1
+  Pop $0
+!macroend
+
+; one leaf: run EXE with ARGS under an ABSOLUTE 30 s deadline (M1) and classify into OUT
+; (KIND: cysd | cys | app). Only inserted inside Section Install (VER is the template's
+; ${VERSION} there). Uses $R2-$R9. The 30 s is wall-clock and the 5 s is the kill-confirm wait.
 !macro CYS_PROBE_LEAF DIR EXE ARGS KIND VER OUT TAG
-  nsExec::ExecToStack /TIMEOUT=30000 '"${DIR}\${EXE}" ${ARGS}'
-  Pop $R7
-  Pop $R8
+  !insertmacro CYS_RUN_BOUNDED '"${DIR}\${EXE}" ${ARGS}' "${DIR}\probe-out-${TAG}.txt" 30000 5000 "rb${TAG}"
   StrCmp $R7 "timeout" cys_lf_to_${TAG} 0
   StrCmp $R7 "error" cys_lf_err_${TAG} 0
   StrCmp $R7 "0" cys_lf_rc0_${TAG} 0
@@ -993,9 +1121,16 @@ cys_pp_single:
   StrCpy $CysProbeTick $R1
   StrCpy $CysProbeDir "$INSTDIR\.cys-probe-$CysProbeTick"
   ; the probe-only worker: no pages (/S), no WebView2 section (/UPDATE), its own folder (/D, last)
-  nsExec::ExecToStack /TIMEOUT=120000 '"$EXEPATH" /S /UPDATE /CYSPROBE=.cys-probe-$CysProbeTick /D=$CysProbeDir'
-  Pop $R2
-  Pop $R3
+  ; ★(0.14.55 P4-IMPL r1 · M1) the OUTER bound is absolute too. This wrapper used
+  ;   nsExec::ExecToStack /TIMEOUT=120000, the same INACTIVITY timer as the leaf, so a worker
+  ;   that kept printing could outlive it; and it never protected the direct /S path at all,
+  ;   which is why the leaf itself (above) carries its own absolute bound. Both now do.
+  ; ★the capture file goes in $PLUGINSDIR, not the probe dir: the WORKER creates the probe dir,
+  ;   so it does not exist yet at this point and CreateFileW there would fail the whole call.
+  InitPluginsDir
+  !insertmacro CYS_RUN_BOUNDED '"$EXEPATH" /S /UPDATE /CYSPROBE=.cys-probe-$CysProbeTick /D=$CysProbeDir' "$PLUGINSDIR\cys-worker-out.txt" 120000 5000 "ppw"
+  StrCpy $R2 $R7
+  StrCpy $R3 $R8
   ; read the worker's result (result line is written last; a missing line is a failure)
   StrCpy $CysPrCysd "missing"
   StrCpy $CysPrCys "missing"

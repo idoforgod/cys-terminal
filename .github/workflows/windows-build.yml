@@ -1466,6 +1466,26 @@ jobs:
           ( cd "$D" && grep -E "^[0-9a-f]{64}  cys_${V//./\\.}_x64-setup\.exe\$" SHA256SUMS.txt > one.sum && [ "$(wc -l < one.sum)" -eq 1 ] && sha256sum -c one.sum )
           echo "previous public release: $TAG"
 
+      # 0.14.55 P4-IMPL r1 M1: run-probe-cases.ps1 compiles the shipped CYS_RUN_BOUNDED body and
+      # measures its ABSOLUTE execution deadline natively. That needs makensis, which this job -
+      # unlike `build` - does not get from the tauri bundler. If it is already in the image this is
+      # a no-op; if the install fails the step does NOT throw, because the probe script then
+      # records the M1 cases as UNMEASURED (and the job still fails: UNMEASURED is never a pass).
+      - name: makensis for the M1 bounded-runner cases (no-op if present)
+        shell: powershell
+        run: |
+          $cand = @()
+          foreach ($pair in @(@(${env:ProgramFiles(x86)}, 'NSIS\makensis.exe'), @($env:ProgramFiles, 'NSIS\makensis.exe'), @($env:ProgramData, 'chocolatey\bin\makensis.exe'))) {
+            if ($pair[0]) { $cand += (Join-Path $pair[0] $pair[1]) }
+          }
+          $have = @($cand | Where-Object { Test-Path -LiteralPath $_ })
+          if ($have.Count -gt 0) { Write-Host ('makensis already present: ' + $have[0]); exit 0 }
+          Write-Host 'makensis not in the image - installing NSIS with the preinstalled chocolatey'
+          & choco install nsis -y --no-progress 2>&1 | Out-Host
+          $have = @($cand | Where-Object { Test-Path -LiteralPath $_ })
+          if ($have.Count -gt 0) { Write-Host ('makensis now at ' + $have[0]) } else { Write-Host 'WARNING: makensis still absent - the M1 cases will be recorded UNMEASURED' }
+          exit 0
+
       - name: Pre-swap run check cases (worker calls, T2-F, T2, controls)
         shell: powershell
         run: |
