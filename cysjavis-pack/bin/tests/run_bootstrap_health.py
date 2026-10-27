@@ -6269,10 +6269,14 @@ _U5_PACK_CREATIONFLAGS = {
     "javis_cycle_autopilot.py": 1,     # U5 캡처 전용 _CAPTURE_SPAWN_KW(nt NOWIN)
     "javis_hud_bridge.py": 1,          # NOWIN(브리지 = cysd 가 숨겨 띄운 장수 프로세스 · 0.12.44~)
     "javis_phoenix_win_smoke.py": 2,   # 윈도우 스모크 검체의 CREATE_NO_WINDOW
-    "javis_preflight.py": 1,           # CREATE_NEW_PROCESS_GROUP(창 정책 아님 · 트리 분리 · WP18 R2 4dcd293a) —
-                                       #   선례 javis_completion_guard 와 동급 · 캡처 전용(PIPE/PIPE/DEVNULL) ·
-                                       #   ★Windows 종료 경로 UNMEASURED(열린 셀: _run_skillscan_all 20s 시한 뒤
-                                       #   고아 수 · 유일 측정 레인 windows-health/windows-latest · B-490)
+    "_owned_process.py": 1,            # ★0.14.55 C-03: CREATE_NEW_PROCESS_GROUP|CREATE_NO_WINDOW —
+                                       #   소유 실행기가 **낳는 루트 1곳**(_owned_process.py:293) · 캡처 전용
+                                       #   확인(같은 kw 에 stdout=PIPE·stderr=PIPE·stdin=PIPE — 검체가 요구하는
+                                       #   선행 확인을 실측으로 통과) · 트리 분리는 lifeline 취소·그룹 정리용 ·
+                                       #   ★Windows 종료 경로 UNMEASURED(이 기계는 darwin · 측정 레인은
+                                       #   windows-health/windows-latest) · 선례 javis_completion_guard 와 동급.
+                                       #   종전 항목이던 javis_preflight.py 는 C-03 이 소유 실행기로 옮기면서
+                                       #   creationflags 사용 **0건**이 됐다(실측) — 그래서 뺐다(다시 쓰면 적색).
 }
 # 콘솔을 떼어 내거나 새로 여는 수단(자손이 매번 새 창을 받는다) — 팩 어디에도 0건이어야 한다.
 _U5_PACK_DETACH_PY = ("DETACHED_PROCESS", "CREATE_NEW_CONSOLE", "pythonw", "startfile", "0x00000008", "0x00000010")
@@ -6661,11 +6665,37 @@ def _u15_resolve(lib, env, preset=None):
 
 
 def _u15_fixture_pack(tmp, name="pack"):
-    """체크리스트가 부르는 preflight 를 **스텁**으로 바꾼 최소 팩(실 preflight 는 HOME·데몬을 본다)."""
+    """체크리스트가 부르는 preflight 를 **스텁**으로 바꾼 최소 팩(실 preflight 는 HOME·데몬을 본다).
+
+    ★0.14.55 C-03 후속: 체크리스트의 **임포트 시점 형제 모듈**(`_owned_process`)도 함께 둔다.
+      C-03 이 preflight 를 소유 서브프로세스로 돌리면서 이 의존이 생겼고, 실제 팩은 build.rs 가
+      `git ls-files cysjavis-pack` 전량을 자동 임베드하므로 **추적 파일인 이 모듈을 반드시 싣는다**.
+      이것을 빼 두면 픽스처가 **현실에 존재할 수 없는 팩**을 모형화해 검체가 ModuleNotFoundError 로
+      죽는다(실측: 빼면 rc 1 · 넣으면 rc 0). 단언은 하나도 줄이지 않는다 — 모형을 실물에 맞춘다.
+      ※검체가 재는 대상은 셔임 회피·공백 경로이고, 임포트 가능성은 그 측정의 **전제**다.
+    """
     pack = os.path.join(tmp, name)
+    # ★스텁도 **소유 프로토콜**을 말한다. C-03 이후 실제 `javis_preflight.py` 는
+    #   `managed_main(main)` 으로 끝나 제어 파이프에 DONE 을 보낸다(javis_preflight.py:44·10682).
+    #   `print()` 한 줄짜리 종전 스텁은 DONE 을 보내지 않아 `run_owned` 가
+    #   complete=False / reason='control closed without DONE' 을 내고(실측) 체크리스트가
+    #   'preflight: 실행불가' 로 떨어진다 — 스텁이 **실물이 될 수 없는 팩**을 모형화한 것이다.
+    #   완료 계약(done·무fault·cleanup 검증)은 그대로 두고 모형만 실물에 맞춘다.
     _w(os.path.join(pack, "bin", "javis_preflight.py"),
-       "print('PREFLIGHT-STUB-OK')\n", 0o644)
-    shutil.copy2(os.path.join(BIN_DIR, "javis_checklist.py"), os.path.join(pack, "bin", "javis_checklist.py"))
+       "import os\n"
+       "import sys\n"
+       "sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))\n"
+       "from _owned_process import managed_main\n"
+       "\n"
+       "\n"
+       "def main():\n"
+       "    print('PREFLIGHT-STUB-OK')\n"
+       "    return 0\n"
+       "\n"
+       "\n"
+       "sys.exit(managed_main(main))\n", 0o644)
+    for _rel in ("javis_checklist.py", "_owned_process.py"):
+        shutil.copy2(os.path.join(BIN_DIR, _rel), os.path.join(pack, "bin", _rel))
     return pack
 
 
