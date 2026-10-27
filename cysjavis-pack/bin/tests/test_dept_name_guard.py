@@ -1463,7 +1463,7 @@ class RegistryBom(Base):
 class RotateBinaryProbeFullScript(Base):
     """Host full-script rotation with ONLY the probe's OS selector simulated; native Windows is UNMEASURED."""
 
-    def exercise(self, refused):
+    def exercise(self, refused, cli_blocked=False, unreachable=False, bind_pair=False):
         bindir = os.path.join(self.home, ".local", "bin")
         sock = seed_sock(self.home, "d1")
         with open(sock, "w") as stream:
@@ -1477,6 +1477,9 @@ class RotateBinaryProbeFullScript(Base):
         self.addCleanup(cleanup)
         _write_exec(os.path.join(bindir, "cys"),
                     '#!/bin/sh\n'
+                    'echo "cys:$1" >> "$WP12_CALLS"\n'
+                    'if [ "$WP12_BLOCK_CLI" = 1 ]; then exit 126; fi\n'
+                    'if [ "$1" = ping ] && [ "$WP12_UNREACHABLE" = 1 ]; then exit 1; fi\n'
                     'case "$1" in\n'
                     ' --version) echo "cys 0.14.53"; exit 0 ;;\n'
                     ' ping) [ -e "$CYS_SOCKET" ]; exit $? ;;\n'
@@ -1492,12 +1495,28 @@ class RotateBinaryProbeFullScript(Base):
         shell_env = os.path.join(self.tmp, "probe-os-selector.sh")
         with open(shell_env, "w") as stream:
             stream.write('uname(){ case "${FUNCNAME[*]}" in *probe_rotation_bins*) echo MINGW64 ;; *) /usr/bin/uname "$@" ;; esac; }\n')
-        env = dict(self.env, BASH_ENV=shell_env)
-        rc, out, err = self.run_dept("rotate", "d1", env=env)
-        if refused:
+        args = ["rotate", "d1"]
+        if bind_pair:
+            siblings = os.path.join(self.tmp, "checked-siblings")
+            os.mkdir(siblings)
+            for binary in ("cysd", "cys"):
+                shutil.copy2(os.path.join(bindir, binary), os.path.join(siblings, binary))
+                _write_exec(os.path.join(bindir, binary), "#!/bin/sh\nexit 126\n")
+            args += ["--rotation-pair", os.path.join(siblings, "cysd"), os.path.join(siblings, "cys")]
+        env = dict(self.env, BASH_ENV=shell_env, WP12_CALLS=os.path.join(self.tmp, "rotation.calls"),
+                   WP12_BLOCK_CLI="1" if cli_blocked else "0", WP12_UNREACHABLE="1" if unreachable else "0")
+        rc, out, err = self.run_dept(*args, env=env)
+        if refused or cli_blocked or unreachable:
             self.assertIsNone(victim.poll(), "blocked rotation must preserve old daemon PID")
-            self.assertEqual(rc, 12, out + err)
-            self.assertTrue(err.startswith("new_daemon_blocked:cysd:rc:1"), err)
+            self.assertEqual(rc, 9 if unreachable else 12, out + err)
+            if unreachable:
+                self.assertNotIn("new_daemon_blocked:", err)
+            else:
+                self.assertTrue(err.startswith("new_daemon_blocked:"), err)
+                self.assertEqual(len(err.splitlines()), 1, err)
+            if os.path.exists(env["WP12_CALLS"]):
+                with open(env["WP12_CALLS"]) as calls:
+                    self.assertNotIn("cys:drain", calls.read())
             with open(sock) as stream:
                 self.assertEqual(stream.read(), "old-socket", "blocked rotation must preserve socket bytes")
         else:
@@ -1511,6 +1530,15 @@ class RotateBinaryProbeFullScript(Base):
 
     def test_healthy_pair_rotates(self):
         self.exercise(False)
+
+    def test_explicit_pair_is_used_despite_later_path_shadow(self):
+        self.exercise(False, bind_pair=True)
+
+    def test_blocked_candidate_cli_is_typed_before_ping(self):
+        self.exercise(False, cli_blocked=True)
+
+    def test_healthy_pair_unreachable_daemon_keeps_exit9(self):
+        self.exercise(False, unreachable=True)
 
 
 class RotateBinaryProbe(unittest.TestCase):
@@ -1530,7 +1558,11 @@ class RotateBinaryProbe(unittest.TestCase):
         src = open(DEPT, encoding="utf-8").read()
         m = re.search(r"(?ms)^probe_rotation_bins\(\)\{.*?^\}\n", src)
         assert m, "probe_rotation_bins is missing from cys-dept"
-        cls.fn = m.group(0)
+        bind = re.search(r"(?ms)^rotation_bind_bins\(\)\{.*?^\}\n", src)
+        assert bind, "rotation_bind_bins missing"
+        host = re.search(r"(?ms)^rotation_require_os\(\)\{.*?^\}\n", src)
+        assert host, "rotation_require_os missing"
+        cls.fn = host.group(0) + bind.group(0) + m.group(0)
         cls.src = src
         cls.tmp = tempfile.mkdtemp(prefix="wp12-binprobe-")
 
@@ -1643,12 +1675,18 @@ class RotateBinaryProbe(unittest.TestCase):
                     self.assertIn("PROCEEDED_AFTER_PROBE", result.stdout)
 
     def test_probe_infrastructure_failure_keeps_prefix(self):
-        script = ("set -euo pipefail\nuname(){ echo MINGW64; }\npython3(){ return 1; }\n"
-                  + self.fn + '\nCYSD=missing\nCYS=missing\nprobe_rotation_bins demo\necho PASSED\n')
-        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=5)
-        self.assertEqual(result.returncode, 12)
-        self.assertTrue(result.stderr.startswith("new_daemon_blocked:probe:error"), result.stderr)
-        self.assertNotIn("PASSED", result.stdout)
+        for function, prefix in [
+            ("python3(){ return 1; }", "new_daemon_blocked:pair:path-resolution-failed"),
+            ('python3(){ if [ "$1" = -c ]; then return 1; else command python3 "$@"; fi; }',
+             "new_daemon_blocked:probe:error"),
+        ]:
+            with self.subTest(prefix=prefix):
+                script = ("set -euo pipefail\nuname(){ echo MINGW64; }\n" + function + "\n"
+                          + self.fn + '\nCYSD=/nonexistent/cysd\nCYS=/nonexistent/cys\nprobe_rotation_bins demo\necho PASSED\n')
+                result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 12)
+                self.assertTrue(result.stderr.startswith(prefix), result.stderr)
+                self.assertNotIn("PASSED", result.stdout)
 
     def test_output_io_failure_refuses(self):
         from unittest.mock import patch
@@ -1747,11 +1785,9 @@ class RotateBinaryProbe(unittest.TestCase):
         rot = self.src.index("\n  rotate)\n")
         call = self.src.index('probe_rotation_bins "$name"', rot)
         kill = self.src.index('graceful_kill "$pid"', rot)
-        ident = self.src.index("identify", rot)
-        self.assertTrue(ident < call < kill, "the probe must sit after identify and immediately before graceful_kill")
-        between = self.src[call + len('probe_rotation_bins "$name"'):kill].splitlines()[1:]
-        self.assertTrue(all(not l.strip() or l.strip().startswith("#") for l in between),
-                        "only comments may sit between the probe and graceful_kill: %r" % between)
+        ident = self.src.index('"$CYS" identify', rot)
+        ping = self.src.index('"$CYS" ping', rot)
+        self.assertTrue(call < ping < ident < kill, "probe must precede the first candidate CLI and kill")
         self.assertIn("exit 12", self.fn)
         self.assertNotRegex(self.fn, r"(?m)^\s*(kill|taskkill|graceful_kill)\b", "the probe never kills a daemon")
 

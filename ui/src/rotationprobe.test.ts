@@ -95,8 +95,8 @@ describe("WP12 rotation refusal latch", () => {
   });
 
   it("all typed refusal reasons classify through the real wrappers", async () => {
-    for (const why of ["grammar", "rc:1", "error:5", "timeout", "cleanup-unconfirmed", "worker-error:panic", "output-too-large"]) {
-      for (const bin of ["cysd", "cys", "probe"]) {
+    for (const why of ["grammar", "rc:1", "error:5", "timeout", "cleanup-unconfirmed", "worker-error:panic", "output-too-large", "path-mismatch", "path-resolution-failed", "nonabsolute-path"]) {
+      for (const bin of ["cysd", "cys", "probe", "pair"]) {
         const error = `new_daemon_blocked:${bin}:${why}`;
         const r = rig({ fail: () => error });
         expect(await r.api.rotateMainDaemon(false)).toBe("blocked");

@@ -4274,8 +4274,12 @@ fn maybe_apply_pending_update(app: &AppHandle) {
 /// 대상(CYS_SOCKET), None이면 기본(본부) 소켓. CYS_NO_AUTOSTART=1로 죽은 소켓에 빈 cysd가
 /// autostart되는 것을 막는다(살아있는 대상에만 호출하므로 평시 무영향인 심층방어). 반환=성공 여부.
 async fn run_sidecar_restore(socket: Option<std::path::PathBuf>) -> bool {
+    run_sidecar_restore_using(socket, resolve_sidecar(if cfg!(windows) { "cys.exe" } else { "cys" })).await
+}
+
+async fn run_sidecar_restore_using(socket: Option<std::path::PathBuf>, cys: std::path::PathBuf) -> bool {
     tokio::task::spawn_blocking(move || {
-        let mut cmd = std::process::Command::new(resolve_sidecar(if cfg!(windows) { "cys.exe" } else { "cys" }));
+        let mut cmd = std::process::Command::new(cys);
         cmd.arg("restore").arg("--include-master");
         cmd.env("CYS_NO_AUTOSTART", "1"); // 죽은 소켓에 빈 데몬 autostart 금지(사이드카 CLI 가드)
         if let Some(sock) = socket {
@@ -7633,7 +7637,7 @@ fn binprobe_attach_output(run: BinProbeRun, read: impl FnOnce() -> std::io::Resu
     }
 }
 
-fn binprobe_join_result(result: Result<Result<(), String>, tokio::task::JoinError>) -> Result<(), String> {
+fn binprobe_join_result<T>(result: Result<Result<T, String>, tokio::task::JoinError>) -> Result<T, String> {
     result.map_err(|e| format!("new_daemon_blocked:probe:worker-error:{e}"))?
 }
 
@@ -7641,6 +7645,14 @@ fn binprobe_join_result(result: Result<Result<(), String>, tokio::task::JoinErro
 /// us - the run_capture_with_timeout_in rule). On expiry the child's own handle is killed and its exit is polled for
 /// `term` more; it is never waited on without a bound and never killed by name.
 fn binprobe_run(exe: &std::path::Path, limit: std::time::Duration, term: std::time::Duration) -> BinProbeRun {
+    let mut command = std::process::Command::new(exe);
+    command.arg("--version");
+    no_console(&mut command);
+    binprobe_command_run(command, false, limit, term)
+}
+
+fn binprobe_command_run(mut command: std::process::Command, capture_stderr: bool,
+                        limit: std::time::Duration, term: std::time::Duration) -> BinProbeRun {
     use std::sync::atomic::{AtomicU64, Ordering};
     static BINPROBE_SEQ: AtomicU64 = AtomicU64::new(0);
     let out_path = std::env::temp_dir().join(format!(
@@ -7652,13 +7664,14 @@ fn binprobe_run(exe: &std::path::Path, limit: std::time::Duration, term: std::ti
         Ok(f) => f,
         Err(e) => return BinProbeRun::SpawnError(format!("tempfile:{}", e.raw_os_error().unwrap_or(-1))),
     };
-    let mut command = std::process::Command::new(exe);
-    command
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::from(sink))
-        .stderr(std::process::Stdio::null());
-    no_console(&mut command);
+    let stderr = if capture_stderr {
+        match sink.try_clone() {
+            Ok(file) => std::process::Stdio::from(file),
+            Err(e) => { let _ = std::fs::remove_file(&out_path); return BinProbeRun::SpawnError(format!("tempfile:{e}")); }
+        }
+    } else { std::process::Stdio::null() };
+    command.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(sink)).stderr(stderr);
     let mut child = match command.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -7670,22 +7683,91 @@ fn binprobe_run(exe: &std::path::Path, limit: std::time::Duration, term: std::ti
         BinProbeOp::Poll => child.try_wait().map(|st| st.map(|st| st.code().unwrap_or(-1))),
         BinProbeOp::Kill => child.kill().map(|()| None),
     }, limit, term);
-    let run = binprobe_attach_output(run, || std::fs::File::open(&out_path).and_then(binprobe_read_line));
+    // The resolver is a shell that can own an interpreter child. Confirming the
+    // shell's exit alone cannot certify that whole tree; refuse without claiming it.
+    let run = match (capture_stderr, run) {
+        (true, BinProbeRun::Timeout | BinProbeRun::SpawnError(_)) => BinProbeRun::TimeoutUnconfirmed,
+        (_, run) => run,
+    };
+    let run = if capture_stderr {
+        match run {
+            BinProbeRun::Exited { code, .. } => match std::fs::File::open(&out_path).and_then(binprobe_read_line) {
+                Ok(stdout) => BinProbeRun::Exited { code, stdout },
+                Err(e) => BinProbeRun::SpawnError(format!("output:{e}")),
+            },
+            other => other,
+        }
+    } else { binprobe_attach_output(run, || std::fs::File::open(&out_path).and_then(binprobe_read_line)) };
     let _ = std::fs::remove_file(&out_path);
     run
 }
 
-/// H: probe the pair the next spawn would run. Windows only (the SAC/App Control case); elsewhere a no-op.
+#[derive(Clone, Debug)]
+struct RotationPair { cysd: std::path::PathBuf, cys: std::path::PathBuf }
+
+fn rotation_absolute_executable(path: std::path::PathBuf) -> Result<std::path::PathBuf, String> {
+    let candidate = if path.is_absolute() || path.components().count() != 1 { path }
+    else {
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|dir| dir.join(&path)).find(|p| p.is_file())
+            .ok_or_else(|| "new_daemon_blocked:pair:path-resolution-failed".to_string())?
+    };
+    candidate.canonicalize().map_err(|_| "new_daemon_blocked:pair:path-resolution-failed".to_string())
+}
+
+fn rotation_shell_script() -> Result<String, String> {
+    // Extract ONLY definitions and path selection from the shipped source, not
+    // the installed pack. Older packs need no new verb on the first transition.
+    let source = include_str!("../../cysjavis-pack/bin/cys-dept");
+    let fragment = |begin: &str, end: &str| -> Result<&str, String> {
+        source.split_once(begin).and_then(|(_, rest)| rest.split_once(end)).map(|(body, _)| body)
+            .ok_or_else(|| "new_daemon_blocked:pair:resolver-fragment-missing".to_string())
+    };
+    Ok(format!("set -euo pipefail\n{}\n{}\nrotation_require_os app\nrotation_bind_bins \"$1\" \"$2\" compare\nprintf 'ok\\n'\n",
+        fragment("# WP12-ROTATION-PRELUDE-BEGIN", "# WP12-ROTATION-PRELUDE-END")?,
+        fragment("# WP12-ROTATION-BIND-BEGIN", "# WP12-ROTATION-BIND-END")?))
+}
+
+fn rotation_shell_command(pair: &RotationPair) -> Result<std::process::Command, String> {
+    let mut cmd = std::process::Command::new("bash");
+    inject_runtime_path(&mut cmd);
+    cmd.arg("-c").arg(rotation_shell_script()?).arg("cys-rotation-preflight")
+        .arg(&pair.cysd).arg(&pair.cys);
+    no_console(&mut cmd);
+    Ok(cmd)
+}
+
+fn rotation_check_shell(command: std::process::Command) -> Result<(), String> {
+    let run = binprobe_command_run(command, true, std::time::Duration::from_secs(10), std::time::Duration::from_secs(5));
+    match &run {
+        BinProbeRun::Exited { code: 0, stdout } if stdout == "ok" => Ok(()),
+        BinProbeRun::Exited { stdout, .. } if stdout.starts_with("new_daemon_blocked:") => Err(stdout.clone()),
+        BinProbeRun::Exited { code: 0, .. } => Err("new_daemon_blocked:pair:resolver-output".to_string()),
+        _ => binprobe_decide("probe", &run, env!("CARGO_PKG_VERSION")),
+    }
+}
+
+fn prepare_rotation_binaries_blocking() -> Result<Option<RotationPair>, String> {
+    if !cfg!(windows) { return Ok(None); }
+    let pair = RotationPair {
+        cysd: rotation_absolute_executable(resolve_sidecar("cysd.exe"))?,
+        cys: rotation_absolute_executable(resolve_sidecar("cys.exe"))?,
+    };
+    // Refuse stable PATH shadowing before any main/manual/department drain.
+    rotation_check_shell(rotation_shell_command(&pair)?)?;
+    for (bin, exe) in [("cysd", &pair.cysd), ("cys", &pair.cys)] {
+        let run = binprobe_run(exe, std::time::Duration::from_secs(10), std::time::Duration::from_secs(5));
+        binprobe_decide(bin, &run, env!("CARGO_PKG_VERSION"))?;
+    }
+    Ok(Some(pair))
+}
+
 fn probe_rotation_binaries_blocking() -> Result<(), String> {
-    if !cfg!(windows) {
-        return Ok(());
-    }
-    let v = env!("CARGO_PKG_VERSION");
-    for (bin, exe) in [("cysd", "cysd.exe"), ("cys", "cys.exe")] {
-        let run = binprobe_run(&resolve_sidecar(exe), std::time::Duration::from_secs(10), std::time::Duration::from_secs(5));
-        binprobe_decide(bin, &run, v)?;
-    }
-    Ok(())
+    prepare_rotation_binaries_blocking().map(|_| ())
+}
+
+async fn prepare_rotation_binaries() -> Result<Option<RotationPair>, String> {
+    binprobe_join_result(tokio::task::spawn_blocking(prepare_rotation_binaries_blocking).await)
 }
 
 /// The same H for UI paths that must decide before they drain (manual rotate, restart-all - DESIGN-R2 G1.4).
@@ -7724,14 +7806,16 @@ async fn rotate_dept_daemon(app: AppHandle, name: String, force: bool, skip_drai
     }
     // ★(0.14.53 WP12 · P2 · DESIGN-R2 G1.2) the new on-disk pair must start before anything is drained or stopped.
     //   Blocked = Err("new_daemon_blocked:…"); the department daemon and its sessions stay untouched.
-    probe_rotation_binaries().await?;
+    let pair = prepare_rotation_binaries().await?;
+    let restore_cys = pair.as_ref().map(|p| p.cys.clone()).unwrap_or_else(|| resolve_sidecar("cys"));
     // drain(best-effort): 교대 전 부서 노드에 저장 신호. 부서 소켓 대상(CYS_SOCKET)으로 cys drain 실행
     // (메인 rotate_daemon의 drain 동형·spawn_blocking 패턴 일치). cys drain 자체 watchdog로 hang 시에도 종료.
     // ★skip_drain: verified 재시작은 사전 `cys drain --verify`로 저장 확인됨 → 이중 drain 생략(회귀 0=false).
     if !skip_drain {
         let dsock = sock.to_string_lossy().into_owned();
+        let cys = restore_cys.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            let mut cmd = std::process::Command::new(resolve_sidecar(if cfg!(windows) { "cys.exe" } else { "cys" }));
+            let mut cmd = std::process::Command::new(cys);
             cmd.env(cys::ENV_SOCKET, &dsock);
             cmd.arg("drain");
             no_console(&mut cmd);
@@ -7747,6 +7831,9 @@ async fn rotate_dept_daemon(app: AppHandle, name: String, force: bool, skip_drai
         let mut cmd = std::process::Command::new("bash");
         inject_runtime_path(&mut cmd); // RC-5: 동봉 runtime(bash.exe) PATH 주입
         cmd.arg(&tool).arg("rotate").arg(&n);
+        if let Some(pair) = pair {
+            cmd.arg("--rotation-pair").arg(&pair.cysd).arg(&pair.cys);
+        }
         no_console(&mut cmd);
         cmd.output()
     })
@@ -7773,7 +7860,7 @@ async fn rotate_dept_daemon(app: AppHandle, name: String, force: bool, skip_drai
     // auto-restore가 돌지만 실패할 수 있어(2026-07-12 dept-4 실사고: 콜드부트 복원 FAILED·미가시)
     // 사이드카 restore로 명시 복원한다(방금 rotate로 데몬은 살아있음·run_restore 멱등이라 이미 되살렸으면 no-op).
     // restore_ok를 반환 info에 실어 UI(manualRotateSkewed)가 복원 실패를 삼키지 않게 한다(dept-4 계열 가시화).
-    let restore_ok = run_sidecar_restore(Some(sock.clone())).await;
+    let restore_ok = run_sidecar_restore_using(Some(sock.clone()), restore_cys).await;
     if let Some(obj) = info.as_object_mut() {
         obj.insert("restore_ok".into(), json!(restore_ok));
     }
@@ -9209,6 +9296,119 @@ mod tests {
         assert!(seal < probe && probe < builder, "seal -> probe -> tauri::Builder");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn wp12_r2_shell_shadow_refuses_before_drain_and_preserves_old_process() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let root = std::env::temp_dir().join(format!("wp12-r2-path-{}", std::process::id()));
+        let home = root.join("home");
+        let local = home.join(".local/bin");
+        let siblings = root.join("siblings");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::create_dir_all(&siblings).unwrap();
+        let log = root.join("calls");
+        let write_bin = |path: &std::path::Path, body: &str| {
+            std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let pair = RotationPair { cysd: siblings.join("cysd"), cys: siblings.join("cys") };
+        write_bin(&pair.cysd, "echo 'cysd 0.14.53 (build x)'");
+        write_bin(&pair.cys, &format!("echo \"$1\" >> '{}'; echo 'cys 0.14.53'", log.display()));
+        write_bin(&local.join("cysd"), "exit 126");
+        symlink(&pair.cys, local.join("cys")).unwrap();
+        let socket = root.join("old.sock");
+        std::fs::write(&socket, b"old-serving-socket").unwrap();
+        let mut sleeper = std::process::Command::new("/bin/sleep");
+        sleeper.arg("60");
+        no_console(&mut sleeper);
+        struct Reap(std::process::Child);
+        impl Drop for Reap { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
+        let mut old = Reap(sleeper.spawn().unwrap());
+        let command = || {
+            let mut cmd = rotation_shell_command(&pair).unwrap();
+            cmd.env("HOME", &home).env("PATH", format!("{}:/usr/bin:/bin", siblings.display()));
+            cmd.env_remove("BASH_ENV");
+            cmd
+        };
+        let failed_os = root.join("failed-os.sh");
+        std::fs::write(&failed_os, "uname(){ return 127; }\n").unwrap();
+        let mut os_command = command();
+        os_command.env("BASH_ENV", &failed_os);
+        assert!(rotation_check_shell(os_command).unwrap_err().starts_with("new_daemon_blocked:probe:os-detection-failed"),
+                "OS detection refusal must occur before any drain too");
+        let result = rotation_check_shell(command());
+        assert_eq!(result, Err("new_daemon_blocked:pair:path-mismatch".to_string()), "shadow pair must refuse before drain");
+        if result.is_ok() {
+            let mut drain = std::process::Command::new(&pair.cys);
+            drain.arg("drain"); no_console(&mut drain); let _ = drain.status();
+        }
+        assert!(!log.exists(), "no candidate call or drain before resolution verdict");
+        assert!(old.0.try_wait().unwrap().is_none(), "old daemon must remain alive");
+        assert_eq!(std::fs::read(&socket).unwrap(), b"old-serving-socket");
+        std::fs::remove_file(local.join("cysd")).unwrap();
+        symlink(&pair.cysd, local.join("cysd")).unwrap();
+        assert_eq!(rotation_check_shell(command()), Ok(()), "healthy aliases resolve to the authoritative pair");
+        assert!(!log.exists(), "path preflight does not execute either candidate");
+        drop(old);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wp12_r2_resolver_result_and_cleanup_are_fail_closed() {
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "printf 'cys 0.14.52'"]);
+        no_console(&mut command);
+        assert_eq!(rotation_check_shell(command), Err("new_daemon_blocked:pair:resolver-output".to_string()),
+                   "only the exact resolver ok sentinel can pass");
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "exec sleep 30"]);
+        no_console(&mut command);
+        assert_eq!(binprobe_command_run(command, true, std::time::Duration::from_millis(100), std::time::Duration::from_secs(2)),
+                   BinProbeRun::TimeoutUnconfirmed, "shell exit is not proof about interpreter descendants");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wp12_r2_restore_executes_the_supplied_cli() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("wp12-r2-restore-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let cli = root.join("checked-cli");
+        let log = root.join("calls");
+        let socket = root.join("isolated.sock");
+        std::fs::write(&cli, format!("#!/bin/sh\nprintf '%s|%s|%s' \"$*\" \"$CYS_NO_AUTOSTART\" \"$CYS_SOCKET\" > '{}'\n", log.display())).unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        assert!(runtime.block_on(run_sidecar_restore_using(Some(socket.clone()), cli)), "checked restore CLI must run");
+        assert_eq!(std::fs::read_to_string(log).unwrap(), format!("restore --include-master|1|{}", socket.display()));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn wp12_r2_pair_binding_and_preflight_are_on_the_production_path() {
+        let source = include_str!("main.rs");
+        let production = source.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        let body = |head: &str| {
+            let at = production.find(head).unwrap();
+            &production[at..at + production[at..].find("\n}\n").unwrap()]
+        };
+        let prepare = body("fn prepare_rotation_binaries_blocking(");
+        assert!(prepare.find("rotation_check_shell(rotation_shell_command(&pair)?)?").unwrap()
+            < prepare.find("binprobe_run(exe,").unwrap(), "shell selection checked before candidate execution");
+        let dept = body("async fn rotate_dept_daemon(");
+        assert!(dept.find("let pair = prepare_rotation_binaries().await?;").unwrap()
+            < dept.find(".arg(\"drain\")").unwrap(), "pair binding precedes department drain");
+        assert!(dept.contains("pair.as_ref().map(|p| p.cys.clone())"), "drain uses bound CLI");
+        assert!(dept.contains("let cys = restore_cys.clone();"), "drain clones the same retained CLI");
+        assert!(dept.contains("run_sidecar_restore_using(Some(sock.clone()), restore_cys).await"),
+                "post-rotation restore must keep the checked CLI too");
+        assert!(!body("async fn run_sidecar_restore_using(").contains("resolve_sidecar"), "bound restore never resolves again");
+        assert!(dept.contains("cmd.arg(\"--rotation-pair\").arg(&pair.cysd).arg(&pair.cys)"), "shell receives exactly the checked pair");
+        assert!(body("fn probe_rotation_binaries_blocking(").contains("prepare_rotation_binaries_blocking().map"),
+            "main/manual preflight also checks shell selection");
+    }
+
     #[test]
     fn wp12_binprobe_cleanup_transitions() {
         use std::collections::VecDeque;
@@ -9287,7 +9487,7 @@ mod tests {
                 "worker failure must latch rather than retry");
         assert_eq!(binprobe_join_result(Ok(Ok(()))), Ok(()));
         let blocked = "new_daemon_blocked:cys:timeout".to_string();
-        assert_eq!(binprobe_join_result(Ok(Err(blocked.clone()))), Err(blocked), "refusal text is unchanged");
+        assert_eq!(binprobe_join_result::<()>(Ok(Err(blocked.clone()))), Err(blocked), "refusal text is unchanged");
     }
 
     /// ★(0.14.53 WP12 · P2 · DESIGN-R2 G1.5 T3) H's decision over the shared vector file (also read by the cys-dept
@@ -9367,11 +9567,11 @@ mod tests {
             let at = prod.find(head).unwrap_or_else(|| panic!("{head} missing"));
             &prod[at..at + prod[at..].find("\n}\n").expect("fn end")]
         };
-        let call = "probe_rotation_binaries().await?;";
         for (head, after_guard, laters) in [
             ("async fn rotate_daemon(", "live_sessions:unknown", &[".arg(\"drain\")", "pending_restore_path()", "stop_running_daemon().await"][..]),
             ("async fn rotate_dept_daemon(", "live_sessions:unknown", &[".arg(\"drain\")", ".arg(\"rotate\")"][..]),
         ] {
+            let call = if head.contains("rotate_dept_daemon") { "prepare_rotation_binaries().await?;" } else { "probe_rotation_binaries().await?;" };
             let b = body(head);
             assert_eq!(b.matches(call).count(), 1, "{head}: exactly one H call");
             let at = b.find(call).unwrap();
