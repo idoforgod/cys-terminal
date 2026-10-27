@@ -763,6 +763,60 @@ class PartialMoveFailureTests(Base):
         self.assertTrue(state["observed_after_error"])
 
 
+    def two_call_prelinked_failure(self, replace_destination):
+        s = self.site
+        name = hs.versioned_names(NEW)[0]
+        src = os.path.join(s.stage, "downloads", name)
+        dst = os.path.join(s.docroot, "downloads", name)
+        journal = hs.Journal(os.path.join(s.stage, "two-call.jsonl"))
+        real_link, real_unlink = hs._do_link, hs._do_unlink
+
+        def first_unlink(path):
+            self.assertEqual(path, src)
+            raise OSError(errno.EACCES, "first source unlink fails")
+
+        hs._do_unlink = first_unlink
+        try:
+            with self.assertRaises(hs.Stop) as first:
+                hs.move_files([(src, dst)], journal, "two-call-public-move")
+        finally:
+            hs._do_unlink = real_unlink
+        self.assertEqual(os.stat(src).st_ino, os.stat(dst).st_ino,
+                         "call one must physically create the prelinked pair")
+        self.assertEqual(rd(dst), s.new[name])
+        self.assertEqual(first.exception.code, hs.STOP_PARTIAL)
+
+        def no_second_link(*args):
+            self.fail("the retry must consume the prelinked witness, not create a new link")
+
+        def second_unlink(path):
+            self.assertEqual(path, src)
+            real_unlink(dst)
+            if replace_destination:
+                put(dst, b"FOREIGN")
+            raise OSError(errno.EACCES, "retry source unlink fails after destination changes")
+
+        hs._do_link, hs._do_unlink = no_second_link, second_unlink
+        try:
+            with self.assertRaises(hs.Stop) as retry:
+                hs.move_files([(src, dst)], journal, "two-call-public-move")
+        finally:
+            hs._do_link, hs._do_unlink = real_link, real_unlink
+        self.assertEqual(rd(src), s.new[name], "source must survive both failed unlinks")
+        if replace_destination:
+            self.assertEqual(rd(dst), b"FOREIGN")
+        else:
+            self.assertFalse(os.path.lexists(dst))
+        self.assertEqual(retry.exception.code, hs.STOP_UNKNOWN,
+                         "prelinked retry lost the acknowledged first-call name change")
+
+    def test_two_call_prelinked_replaced_destination_is_not_clean(self):
+        self.two_call_prelinked_failure(replace_destination=True)
+
+    def test_two_call_prelinked_vanished_destination_is_not_clean(self):
+        self.two_call_prelinked_failure(replace_destination=False)
+
+
 class ContentRuleTests(Base):
     """F1 (codex r1): same-size one-byte corruption at offset 100 with the inode kept, after an interrupted forward run, an
     interrupted rollback, a finished switch, and in the old-assets folder. Each test runs its untouched control first: the

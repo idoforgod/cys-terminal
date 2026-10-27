@@ -735,7 +735,7 @@ def move_files(pairs, journal, label, prior=0):
         if d is not None and d.st_ino != s.st_ino:
             raise Stop(STOP_PARTIAL if (moved or prior) else STOP_CLEAN, "%s: %s already exists with other bytes" % (label, dst))
         journal.add(ev="move", phase="before", label=label, src=src, dst=dst, op="link+unlink")
-        linked = False
+        linked = d is not None and d.st_ino == s.st_ino
         try:
             if d is None:
                 _do_link(src, dst)
