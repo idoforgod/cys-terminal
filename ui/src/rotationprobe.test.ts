@@ -145,13 +145,22 @@ describe("WP12 rotation refusal latch", () => {
     expect(r.scope.rotatingDaemon).toBe(false);
   });
 
-  it("empty-target retry still validates before clearing the latch", async () => {
-    const r = rig({ fail: (c) => c.cmd === "probe_rotation_binaries" && (c.args?.includeMain || c.args?.includeDepartments) ? shellRefusal : undefined });
+  // P4 C-08 blocker 1 — AMENDED. The original cell asserted the first probe arguments were
+  // `{ includeMain: true, includeDepartments: true }`, i.e. it pinned the WIDENING of an empty
+  // retry, and that widening is blocker 1's mechanism: a PC with zero departments probed an
+  // unrelated shell-selected pair and latched a healthy main. The cell's stated intent — an
+  // empty retry must not clear a latch without any probe — is preserved and made stricter:
+  // ZERO probe calls, no confirmation modal, and the pre-existing latch still holding after.
+  it("empty-target retry neither probes nor clears a pre-existing latch", async () => {
+    const r = rig({ fail: (c) => c.cmd === "rotate_daemon" ? shellRefusal : undefined });
+    await r.api.checkVersionSkew(); // a main refusal latches both routes (asymmetric, by design)
+    const probesBefore = r.calls.filter((c) => c.cmd === "probe_rotation_binaries").length;
+    const rotationsBefore = r.rotations().length;
     await r.api.manualRotateSkewed("0.14.53", false, []);
-    expect(r.calls.find((c) => c.cmd === "probe_rotation_binaries")?.args).toEqual({ includeMain: true, includeDepartments: true });
+    expect(r.calls.filter((c) => c.cmd === "probe_rotation_binaries").length).toBe(probesBefore);
     expect(r.confirmations.length).toBe(0);
     await r.api.checkVersionSkew();
-    expect(r.rotations().length).toBe(0);
+    expect(r.rotations().length).toBe(rotationsBefore); // the latch survived the empty retry
     expect(r.scope.rotatingDaemon).toBe(false);
   });
 
@@ -189,12 +198,17 @@ describe("WP12 rotation refusal latch", () => {
     expect(r.scope.rotatingDaemon).toBe(false);
   });
 
-  it("a shell-only refusal during manual restart stops later departments and future ticks", async () => {
+  // P4 C-08 blocker 1 — AMENDED. The original cell expected 2 rotations, which pinned the
+  // department -> main latch: one department's shell refusal stopped the healthy main for the
+  // whole app version. That is the behaviour C-08 exists to remove. The department half of the
+  // assertion is unchanged and still load-bearing (the refused department is not retried and
+  // the later department is not reached); what changes is that main continues.
+  it("a shell-only refusal during manual restart stops later departments but not the main", async () => {
     const r = rig({ fail: (c) => c.cmd === "rotate_dept_daemon" && c.args?.name === "first" ? shellRefusal : undefined });
     await r.api.manualRestartAllDaemons();
     expect(r.rotations().map((c) => c.args?.name ?? "main")).toEqual(["main", "first"]);
     await r.api.checkVersionSkew();
-    expect(r.rotations().length).toBe(2);
+    expect(r.rotations().map((c) => c.args?.name ?? "main")).toEqual(["main", "first", "main"]);
     expect(r.scope.rotatingDaemon).toBe(false);
   });
 
@@ -204,17 +218,30 @@ describe("WP12 rotation refusal latch", () => {
     expect(r.rotations().map((c) => c.args?.name ?? "main")).toEqual(["main", "first", "later"]);
     expect(r.scope.rotatingDaemon).toBe(false);
   });
+  // P4 C-08 blocker 1 — HARNESS AMENDED (the product is unchanged by this edit). The design
+  // issues ONE probe call PER ROUTE, so the single `release` slot was overwritten by the
+  // second call and the first promise never settled: the cell timed out at 5000 ms. The gate
+  // below holds every pending probe and, once opened, releases those already waiting and lets
+  // later ones through. The cell still measures what it always measured: while a manual probe
+  // is in flight it owns the guard, so an automatic tick rotates nothing and does not drain.
+  // Do NOT "repair" this by collapsing the two per-route probe calls back into one combined
+  // call — that combined call is exactly blocker 1.
   it("a pending manual probe owns the guard and prevents automatic rotation", async () => {
-    let release: (() => void) | undefined;
-    const r = rig({ delay: (c) => c.cmd === "probe_rotation_binaries"
-      ? new Promise<void>((resolve) => { release = resolve; }) : undefined });
+    let gateOpen = false;
+    const waiting: (() => void)[] = [];
+    const r = rig({ delay: (c) => {
+      if (c.cmd !== "probe_rotation_binaries") return undefined;
+      if (gateOpen) return Promise.resolve();
+      return new Promise<void>((resolve) => { waiting.push(resolve); });
+    } });
     const manual = r.api.manualRestartAllDaemons();
-    for (let i = 0; i < 10 && !release; i++) await Promise.resolve();
-    expect(release === undefined).toBe(false);
+    for (let i = 0; i < 10 && waiting.length === 0; i++) await Promise.resolve();
+    expect(waiting.length).toBeGreaterThan(0);
     await r.api.checkVersionSkew();
     expect(r.rotations().length).toBe(0);
     expect(r.calls.some((c) => c.cmd === "drain_verify")).toBe(false);
-    release!();
+    gateOpen = true;
+    while (waiting.length) waiting.shift()!();
     await manual;
     expect(r.rotations().length).toBe(3);
     expect(r.scope.rotatingDaemon).toBe(false);
