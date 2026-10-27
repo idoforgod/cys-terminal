@@ -4847,8 +4847,16 @@ mod tests {
                 &include_str!("boot_supervisor.rs")
                     [..include_str!("boot_supervisor.rs").find("#[cfg(test)]").unwrap()]
             ),
+            // ★r1 (0.14.55 P8 · 지시 밖 1건 · 보고함) — 이 자리는 **다른 파일**(handlers.rs)을
+            //   자르는 cutter 라 H-07 의 9개 census 밖에 있었다. 0.14.55 P8 이 handlers.rs 의 첫
+            //   조건부-컴파일 속성을 12,784 → 8,534 줄로 당겼고, 그래서 이 핀의 구간이 4,250 줄
+            //   **조용히 줄었다**(마커 8개 전수 출현 수는 두 구간에서 동일해 판정 변화는 0 이었다 —
+            //   b8c9552c 전 검체 초록이 그 실증이다. 단 `wired` 는 2차 생존성도 보므로 그 동일성이
+            //   모든 미래 마커의 증명은 아니다). tests 모듈의 **정확한 앵커**로 원래 구간을 복원한다.
             strip_line_comments(
-                &include_str!("handlers.rs")[..include_str!("handlers.rs").find("#[cfg(test)]").unwrap()]
+                &include_str!("handlers.rs")[..include_str!("handlers.rs")
+                    .find("\n#[cfg(test)]\nmod tests {")
+                    .expect("handlers.rs 의 tests 모듈 앵커 소실")]
             ),
         );
         // ① 실제 빌드 — 주장이 없으니(전부 false) 결손도 없다.

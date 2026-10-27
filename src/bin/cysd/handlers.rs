@@ -8525,15 +8525,23 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
             } else {
                 None
             };
-            // ★H-07 — 이 호출이 본 프로브를 시험 전용 창에 기록한다. **출하 바이트 0**:
-            //   아래 블록은 운영 빌드에 컴파일되지 않는다(릴리스 바이너리 해시 동일성으로 실측).
+            // ★H-07 — 이 호출이 본 프로브를 시험 전용 창에 기록한다. 아래 블록은 `cfg(test)` 라
+            //   **운영 빌드에 컴파일되지 않는다**(거동 변화 없음 · 추가된 제품 코드 0줄 ·
+            //   출하 바이너리의 test 전용 심볼 0 — `impl-w16/BYTE-ROUTE.txt` census [2]·[3]).
+            //   ⛔「출하 바이트 0」·「릴리스 바이너리 해시 동일」은 **틀린 문면이었다**(r1 minor m3):
+            //   두 변종 트리 실험에서 패닉 위치 메타 **753 B** 가 달랐고(크기 동일 46,478,112 B),
+            //   핀 9dbea792 대 끝단의 바이너리 비교는 **미측정**이다. 블록이 프로덕션 함수 **안**에
+            //   있어 그 아래 모든 프로덕션 줄의 file:line:col 이 밀리기 때문이다.
             //   ⚠이 속성이 프로덕션 영역에 들어가면, 파일을 "첫 조건부-컴파일 속성"에서 자르던
-            //   소스 census 핀 아홉 개의 구간이 **조용히 줄어든다**(실측: 처음엔 전부 붉었다).
-            //   그래서 그 아홉 개를 tests 모듈의 **정확한 앵커**로 다시 묶었다 — 커버리지를
+            //   소스 census 핀들의 구간이 **조용히 줄어든다**(실측: 처음엔 전부 붉었다).
+            //   그래서 그것들을 tests 모듈의 **정확한 앵커**로 다시 묶었다 — 커버리지를
             //   잃지 않으면서 이 블록이 여기 설 수 있는 유일한 방법이다.
             #[cfg(test)]
             {
-                record_claim_role_probe(&role, sid, seat_takeover_ok.is_some());
+                record_claim_role_probe(daemon, &role, sid, seat_takeover_ok.is_some());
+                // ★r1 minor m2 — 프로브와 **결정 사이**에 사건을 결정론으로 끼우는 자리.
+                //   임계영역 진입 **전**이므로 훅이 surfaces 락을 잡아도 락 순서를 어기지 않는다.
+                run_after_probe_hook(daemon);
             }
             // ★(W2 · G13) announce 를 **전이 확정 후로 미룬다**. 종전엔 프로브 직후 여기서
             // announce_seat_takeover 를 쐈는데, 그 뒤 임계영역이 not_found·claim_denied 로 조기
@@ -12748,7 +12756,10 @@ fn surface_create_error(bus: &crate::events::EventBus, id: &Value, message: &str
 //
 // ⛔위치가 계약의 일부다 — 이 블록은 tests 모듈 **바로 위**에 있어야 한다. 이 파일의 소스 census
 // 핀들이 프로덕션 구간을 「첫 조건부-컴파일 속성까지」로 정의하기 때문이다(위 호출 지점의 주석).
-// 운영 빌드의 정의는 빈 본문이라 호출이 사라진다(릴리스 바이너리 해시 동일성으로 실측).
+// 이 절 전체가 `cfg(test)` 라 운영 빌드에는 **없다**(호출 지점도 같이 사라진다). ⛔종전 문면
+// 「릴리스 바이너리 해시 동일성으로 실측」은 틀렸다 — r1 minor m3 참조: 측정된 것은 두 변종
+// 트리의 **753 B 패닉 위치 메타 차이**(크기 동일 · 거동 변화 없음 · test 전용 심볼 0)이고,
+// 핀 대 끝단의 바이너리 비교는 **미측정**이다.
 
 #[cfg(test)]
 #[derive(Clone, Debug)]
@@ -12759,13 +12770,16 @@ pub(crate) struct ClaimRoleProbe {
     pub probe: bool,
 }
 
+/// 관찰창의 **거처는 `Daemon` 인스턴스**다(`state.rs` 의 `test_claim_probe`).
+///
+/// ⛔전역 `static` 으로 되돌리지 마라 — 처음에 그렇게 썼고 **실측으로 깨졌다**: 병렬로 도는 다른
+/// 검체의 `claim_role` 이 그 한 칸을 덮어써, 두 검체가 남의 값을 읽고 붉었다(2026-10-27 ·
+/// `cargo test --bin cysd` 기본 병렬 · 직렬 실행과 단일 필터 실행에서는 보이지 않는다).
+/// 이 파일의 `u229` 계약 C-1 이 같은 교훈을 이미 적어 두었고, 여기서 그 값을 다시 지불했다.
 #[cfg(test)]
-pub(crate) static LAST_CLAIM_ROLE_PROBE: std::sync::Mutex<Option<ClaimRoleProbe>> =
-    std::sync::Mutex::new(None);
-
-#[cfg(test)]
-fn record_claim_role_probe(role: &str, surface: u64, probe: bool) {
-    *LAST_CLAIM_ROLE_PROBE
+fn record_claim_role_probe(daemon: &Daemon, role: &str, surface: u64, probe: bool) {
+    *daemon
+        .test_claim_probe
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = Some(ClaimRoleProbe {
         role: role.to_string(),
@@ -12776,10 +12790,50 @@ fn record_claim_role_probe(role: &str, surface: u64, probe: bool) {
 
 /// 관찰창을 비운다 — 호출 직전에 부른다(앞 호출의 값을 읽지 않도록).
 #[cfg(test)]
-pub(crate) fn clear_claim_role_probe() {
-    *LAST_CLAIM_ROLE_PROBE
+pub(crate) fn clear_claim_role_probe(daemon: &Daemon) {
+    *daemon
+        .test_claim_probe
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// ★r1 minor m2 — 프로브와 결정 **사이**에 사건을 끼우는 시험 전용 훅(1회용).
+///
+/// 왜 필요한가: 특권 게이트는 프로브를 락 **밖**에서, 결정을 락 **안**에서 읽는다(락 안에서 전
+/// 프로세스 표를 refresh 하지 않으려는 설계다). 그 사이에 보유자가 종료하면 핸들러는 청구를
+/// **정당하게** 수락하지만 `takeover_committed` 는 None 이고(`!holder_live` 라 승계 갈래로 가지
+/// 않는다) 취소 이벤트도 **발행되지 않는다**(발행 자리가 `holder_live` 갈래 안이다). 즉 `resp.ok`
+/// 는 「승계 확정」이 아니다 — 리뷰어가 소스에서 유도한 반례이고(r1 minor m2), 그 경로를 스레드
+/// 없이 **한 줄기로** 재현하려면 프로브 직후에 상태를 바꿀 자리가 필요하다.
+///
+/// 거처도 데몬이다 ⇒ 키잉이 필요 없다(데몬 인스턴스 = 검체).
+#[cfg(test)]
+pub(crate) fn install_after_probe_hook(daemon: &Daemon, f: Box<dyn Fn() + Send>) {
+    *daemon
+        .test_after_probe_hook
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(f);
+}
+
+#[cfg(test)]
+pub(crate) fn clear_after_probe_hook(daemon: &Daemon) {
+    *daemon
+        .test_after_probe_hook
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// 훅을 **꺼내서**(1회용) 락을 놓은 뒤 실행한다 — 훅 안에서 데몬 락을 잡을 수 있게.
+#[cfg(test)]
+fn run_after_probe_hook(daemon: &Daemon) {
+    let hook = daemon
+        .test_after_probe_hook
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    if let Some(f) = hook {
+        f();
+    }
 }
 
 #[cfg(test)]
@@ -21171,21 +21225,33 @@ mod tests {
         assert_eq!(daemon.roles.lock().unwrap().get("cso-2").copied(), Some(holder), "cso-2 매핑이 넘어갔다");
         // 대조 ①: **명시 승계**(`takeover_empty_seat`) 경로는 게이트가 닫지 않는다 — 답은 좌석
         //   판정(`seat_claimable_now` · 이 프로세스 표의 Empty 여부)을 그대로 따른다.
-        // ★H-07 (0.14.55-P8) — **한 번의 호출에서 세 사실을 읽어** 함의를 단언한다.
+        // ★H-07 (0.14.55-P8) — **이 호출이 본 사실로만** 함의를 단언한다.
         //   종전: `seat_claimable_now` 를 시험이 **다시** 불러(=두 번째 프로브) 그 값과 `resp.ok`
         //   의 **동등**을 단언했다. 두 프로브 사이에 좌석이 바뀌면 적색이 나고, 더 나쁘게는
         //   재검증(`seat_takeover_recheck`)이 승계를 **정당하게** 취소한 경우에도 적색이 난다 —
         //   즉 동등은 이 게이트의 계약이 아니다(설계 R2 §1-2·§1-4).
-        //   지금: probe 는 시험 전용 관찰창에서, recheck 와 final 은 **이미 있는 버스 이벤트**에서
-        //   읽는다(새 응답 필드 0 · 출하 바이트 0 · 두 번째 프로세스 표 조회 0).
+        //
+        //   ★r1 minor m2 (codex-2) — 첫 교정판의 동등 단언도 **여전히 틀렸다**. 두 반례:
+        //     ⒜ 프로브가 거짓인데 보유자가 그 뒤 종료하면 핸들러는 청구를 **정당하게 수락**한다
+        //        (`!holder_live` ⇒ 거부 갈래로 가지 않는다). 그러면 수락(true) ≠ 프로브(false) 라
+        //        동등 단언이 **거짓 적색**을 낸다 — 이 검체는 릴리스 레인의 차단 검체이므로 거짓
+        //        적색은 **태그를 막는다**. 전용 검체가 그 경로를 결정론으로 재현한다:
+        //        `claim_role_accepts_a_holder_that_exits_between_probe_and_decision`.
+        //     ⒝ 취소 이벤트의 **부재**는 「재검증 없음」이 아니다 — 재검증이 승계를 취소해도
+        //        `holder_live` 가 거짓이면 발행 자리에 닿지 못한다. 그래서 수락 갈래에서는
+        //        ⛔recheck 를 **추론하지 않는다**(그 추론 자체를 지웠다).
+        //   지금: `resp.ok` 는 「청구 수락」으로만 읽고(⛔「승계 확정」이 아니다), 프로브는 시험 전용
+        //   관찰창에서 읽고, 재검증 사유는 **실제로 발행되는 갈래**(거부)에서만 읽는다.
+        //   새 응답 필드 0 · 두 번째 프로세스 표 조회 0 · 재시도 0.
         const DEFAULT_CANCEL: &str = "보유자 생존(승계 미요청 또는 좌석 비어있지 않음)";
         let hs = daemon.get_surface(holder).unwrap();   // 대조 ② 에서 쓴다 — ⛔여기서 프로브를 다시 돌리지 않는다
         let before = daemon.bus.replay_after(0).len() as u64;
-        clear_claim_role_probe();
+        clear_claim_role_probe(&daemon);
         let req = Request { id: json!(1), method: "system.claim_role".into(),
             params: json!({"role": "cso-2", "surface_id": attacker, "takeover_empty_seat": true}) };
         let Reply::Single(resp) = dispatch(&daemon, req, Some(pid)) else { panic!("single reply") };
-        let observed = LAST_CLAIM_ROLE_PROBE
+        let observed = daemon
+            .test_claim_probe
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
@@ -21193,24 +21259,41 @@ mod tests {
         assert_eq!((observed.role.as_str(), observed.surface), ("cso-2", attacker),
             "관찰창이 다른 호출의 값을 들고 있다: {observed:?}");
         let fresh: Vec<serde_json::Value> = daemon.bus.replay_after(before).into_iter().collect();
-        // recheck: `role.takeover_cancelled` 의 reason 이 **기본 문자열이 아닐 때만** 재검증 취소다
-        //   (기본 문자열은 "프로브가 아니라고 했다" 를 뜻한다 — 설계 R2 §1-5).
-        let recheck: Option<String> = fresh.iter()
-            .filter(|e| e["name"] == "role.takeover_cancelled")
-            .filter_map(|e| e["payload"]["reason"].as_str().map(str::to_string))
-            .find(|r| r != DEFAULT_CANCEL);
-        let committed = resp["ok"] == json!(true);
-        // final == committed  ⟺  probe == true ∧ recheck == None
-        assert_eq!(committed, observed.probe && recheck.is_none(),
-            "H-07 함의가 깨졌다 — final={committed} probe={} recheck={recheck:?} resp={resp}",
-            observed.probe);
-        // 거부였다면 그 사유가 버스에 실제로 실렸는지도 본다(세 번째 사실의 출처 확인).
-        if !committed {
-            assert!(fresh.iter().any(|e| e["name"] == "role.claim_denied"),
-                "거부인데 role.claim_denied 가 버스에 없다: {fresh:?}");
+        // ★「청구가 수락됐다」 — ⛔「승계가 확정됐다(takeover_committed)」가 아니다.
+        let accepted = resp["ok"] == json!(true);
+        // 결정 시점의 보유자 생사. 이 검체에서 `exited` 를 쓰는 자리는 **아래 대조 ② 한 곳뿐**이고
+        //   그 전까지 아무도 쓰지 않으므로, 지금 거짓이면 호출 중에도 거짓이었다(단조·단일 기록자).
+        let holder_alive = daemon
+            .get_surface(holder)
+            .map(|h| !h.exited.load(Ordering::Relaxed))
+            .unwrap_or(false);
+        if holder_alive {
+            // 전제: 보유자는 살아 있고 청구자와 다른 surface 다 ⇒ 프로덕션의 판정은
+            //   `holder_live == (effective != Some(holder))` 로 줄고,
+            //   `effective == Some(holder) ⟺ 프로브 참 ∧ 재검증 없음` 이다.
+            if accepted {
+                // ⇒ 한 방향만 단언한다: 수락은 **프로브가 참이었음을 함의한다**.
+                //   (재검증이 없었다는 것도 따라오지만 이 갈래에는 관측 가능한 흔적이 없다 ⇒
+                //    ⛔이벤트의 부재를 「재검증 없음」으로 읽지 않는다 — r1 minor m2 ⒝.)
+                assert!(observed.probe,
+                    "살아있는 보유자를 두고 청구가 수락됐는데 이 호출의 프로브는 거짓이었다: resp={resp}");
+            } else {
+                // 거부 갈래에서는 세 번째 사실이 **실제로** 버스에 실린다(기본 문자열 포함).
+                assert!(fresh.iter().any(|e| e["name"] == "role.claim_denied"),
+                    "거부인데 role.claim_denied 가 버스에 없다: {fresh:?}");
+                let reason = fresh.iter()
+                    .filter(|e| e["name"] == "role.takeover_cancelled")
+                    .filter_map(|e| e["payload"]["reason"].as_str().map(str::to_string))
+                    .last()
+                    .expect("거부인데 role.takeover_cancelled 가 버스에 없다");
+                assert_eq!(reason == DEFAULT_CANCEL, !observed.probe,
+                    "거부 사유와 이 호출의 프로브가 어긋난다(기본 문자열 ⟺ 프로브 거짓) — reason={reason:?} probe={}", observed.probe);
+            }
+        } else {
+            // ★죽은 보유자 경로 — 프로브가 무엇이었든 수락이 정당하다(self-heal 보존).
+            assert!(accepted, "죽은 보유자를 두고 청구가 거부됐다: resp={resp}");
         }
-        let claimable = committed;
-        if claimable {
+        if accepted {
             assert_eq!(daemon.roles.lock().unwrap().get("cso-2").copied(), Some(attacker));
             daemon.roles.lock().unwrap().insert("cso-2".into(), holder); // 대조 ② 는 원 보유자 기준
         }
@@ -21226,6 +21309,75 @@ mod tests {
         for r in ["worker", "worker-2", "reviewer-codex", "planner", "csx"] {
             assert!(!privileged_role(r), "{r} 가 특권 집합에 들어갔다");
         }
+    }
+
+    /// ★r1 minor m2 (codex-2 · 2026-10-27) — **프로브와 결정 사이에 보유자가 종료하는** 경로를
+    /// 스레드 없이 결정론으로 재현한다.
+    ///
+    /// 핸들러는 프로브를 락 **밖**에서, 결정을 락 **안**에서 읽는다(프로세스 표 refresh 를 락 안에서
+    /// 돌리지 않기 위한 설계다). 그 사이에 보유자가 종료하면 `holder_live` 가 거짓이 되어 청구는
+    /// **정당하게 수락**되지만 `takeover_committed` 는 None 이고 취소 이벤트도 발행되지 않는다
+    /// (발행 자리가 `holder_live` 갈래 **안**이다). 그래서 두 가지가 따라온다:
+    ///   ⒜ `resp.ok` 는 「청구 수락」이고 ⛔「승계 확정」이 아니다.
+    ///   ⒝ 취소 이벤트의 **부재**는 ⛔「재검증 없음」이 아니다.
+    /// 종전 단언(`수락 == 프로브 ∧ 재검증없음`)은 이 경로에서 **거짓 적색**을 낸다. 이 가족은
+    /// 릴리스 레인의 **차단** 검체이므로 거짓 적색은 곧 태그 차단이다(변이 M9 가 옛 규칙을 이 자리에
+    /// 되돌려 실제로 붉어지는 것을 보인다).
+    ///
+    /// 결정론의 근거 둘 — ①`takeover_empty_seat` 를 **요청하지 않으므로** 프로브는 프로세스 표를
+    /// 아예 보지 않고 구조적으로 거짓이다(이 가족의 옛 flake 원인인 표 의존이 없다) ②종료는
+    /// `AFTER_PROBE_HOOK` 이 프로브 기록 **직후**·임계영역 진입 **전**에 같은 스레드에서 집행한다.
+    #[test]
+    fn claim_role_accepts_a_holder_that_exits_between_probe_and_decision() {
+        let daemon = claim_daemon();
+        // 관찰창과 훅의 거처는 **이 데몬**이므로 다른 검체와 섞이지 않는다(키잉 불요).
+        //   역할 이름은 그래도 이 검체 전용으로 둔다 — 적색 메시지에서 어느 검체인지 바로 읽히고,
+        //   `privileged_role` 의 접두 규칙(`cso*`)에 걸리는지도 아래에서 전제로 단언한다.
+        const ROLE: &str = "cso-h07exit";
+        assert!(privileged_role(ROLE), "전제: 이 역할이 특권 집합 안이어야 게이트 경로를 탄다");
+        let holder = make_surface(&daemon, Some(ROLE));
+        daemon.roles.lock().unwrap().insert(ROLE.into(), holder);
+        let claimant = make_surface(&daemon, Some("worker-9"));
+        let pid = 990_401_u32;
+        bind_caller(&daemon, pid, claimant);
+        let hs = daemon.get_surface(holder).unwrap();
+        assert!(!hs.exited.load(Ordering::Relaxed), "전제: 호출 전 보유자는 살아 있다");
+
+        clear_claim_role_probe(&daemon);
+        let before = daemon.bus.replay_after(0).len() as u64;
+        let doomed = hs.clone();
+        install_after_probe_hook(
+            &daemon,
+            Box::new(move || doomed.exited.store(true, Ordering::Relaxed)),
+        );
+        let resp = claim(&daemon, ROLE, claimant, Some(pid));
+        clear_after_probe_hook(&daemon); // 1회용이지만 ⛔남겨 두지 않는다
+
+        let observed = daemon
+            .test_claim_probe
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .expect("관찰창이 끊겼다 — 이 호출이 프로브를 기록하지 않았다");
+        // ① 기록된 프로브는 **종료 전**의 값이고 구조상 거짓이다(승계 미요청).
+        assert_eq!(
+            (observed.role.as_str(), observed.surface, observed.probe),
+            (ROLE, claimant, false),
+            "프로브 기록이 기대와 다르다: {observed:?}"
+        );
+        // ② 보유자는 **결정 시점에** 죽어 있었다 — 훅이 집행했다(반례 구성의 증거).
+        assert!(hs.exited.load(Ordering::Relaxed), "훅이 돌지 않았다 — 반례가 구성되지 않았다");
+        // ③ 그래도 청구는 수락된다(죽은 보유자 승계 = self-heal 경로 · 게이트가 기능을 닫지 않는다).
+        assert_eq!(resp["ok"], json!(true),
+            "프로브 뒤 종료한 보유자를 두고 청구가 거부됐다: {resp}");
+        assert_eq!(daemon.roles.lock().unwrap().get(ROLE).copied(), Some(claimant),
+            "수락인데 역할 매핑이 넘어가지 않았다");
+        // ④ ⒜⒝의 박제: 수락 경로에는 **승계 확정도 취소 이벤트도 없다**.
+        let fresh: Vec<serde_json::Value> = daemon.bus.replay_after(before).into_iter().collect();
+        assert!(!fresh.iter().any(|e| e["name"] == "role.takeover_cancelled"),
+            "수락 경로인데 취소 이벤트가 발행됐다: {fresh:?}");
+        assert!(!fresh.iter().any(|e| e["name"] == "role.claim_denied"),
+            "수락인데 거부 이벤트가 있다: {fresh:?}");
     }
 
     fn create_surface_rpc(daemon: &Arc<Daemon>, role: Option<&str>, caller_pid: Option<u32>) -> Value {

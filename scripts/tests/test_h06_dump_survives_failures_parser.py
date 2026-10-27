@@ -6,11 +6,15 @@
 보이게 되지만, 파서가 메시지를 **종결자 줄**에서 끊으므로 덤프 한 줄이 종결자처럼 생기면 그 뒤가
 사라진다 — 즉 고치려던 채널을 조용히 반만 고치게 된다.
 
-세 가지를 **실제 파서**로 잰다(설계 T-H06-B 항목 3, R3 §3-4 의 교정판):
+네 가지를 **실제 파서**로 잰다(설계 T-H06-B 항목 3, R3 §3-4 의 교정판 · r1 minor m1 로 ⑴-b 추가):
   ⑴ 원시 음성: 종결자로 시작하는 줄은 **잘려야 한다** — 그것이 파서의 계약이고 결함이 아니다.
      (이 단언이 없으면 ⑶의 통과가 「파서를 약화시켜 얻은 통과」와 구별되지 않는다.)
-  ⑵ 생산자의 인코딩이 실재한다: `governance.rs` 가 접두와 두 토큰 무해화를 실제로 들고 있다.
-  ⑶ 인코딩된 덤프는 **온전히** 도착한다.
+  ⑴-b 원시 음성 2: **접두를 첫 물리 줄에만** 붙인 옛 꼴은 둘째 줄에서 끊긴다 — r1 minor m1 이
+     잡은 실제 결함(리뷰어가 실제 emitter → 실제 파서로 재현)이고, 지금의 LF/CR 인코딩이 막는다.
+  ⑵ 생산자의 인코딩이 실재한다: `governance.rs` 가 접두와 LF·CR·따옴표·`panicked at ` 무해화를
+     실제로 들고 있다(소스 토큰 대조 — 러스트 쪽 거동 단언은
+     `deadman_dump_rows_cannot_be_read_as_a_parser_terminator` 가 **실제 emitter** 로 잰다).
+  ⑶ 인코딩된 덤프는(여러 줄·CR 본문 포함) **온전히** 도착한다.
 
 PyYAML 없이 돈다(CI 의 파이썬에 없다) — `failures.py` 본문을 들여쓰기로 떼어 그대로 실행한다.
 돌연변이 검증용 노브: `H06_GOVERNANCE_RS_UNDER_TEST`, `H06_WINDOWS_HEALTH_YML_UNDER_TEST`.
@@ -104,6 +108,25 @@ def log_with_message(message_lines):
     return "\n".join(head + message_lines + tail)
 
 
+def encode(body):
+    """`governance.rs` 의 `dump_line` **거울** — 접두 + LF/CR/따옴표/`panicked at ` 무해화.
+
+    ⚠거울이라는 사실 자체는 위 ⑵(필수 토큰)이 소스에 대고 붙들고, 산출된 바이트가 **실제
+    파서**를 통과하는지는 ⑶이 잰다. 두 언어를 한 상수로 묶을 수 없어 이 둘이 짝이다.
+    """
+    out = "  "
+    for ch in body:
+        if ch == "\n":
+            out += "\\n"
+        elif ch == "\r":
+            out += "\\r"
+        elif ch == "'":
+            out += "ʼ"
+        else:
+            out += ch
+    return out.replace("panicked at ", "panickedʼat ")
+
+
 def governance_src():
     with open(GOVERNANCE, encoding="utf-8") as fh:
         return fh.read()
@@ -129,6 +152,22 @@ class H06DumpSurvivesParser(unittest.TestCase):
                     "틱 2 이 줄은 사라져야 한다", ours["message"],
                     "종결자 %r 뒤의 줄이 살아남았다 — 파서가 약해졌거나 검체가 틀렸다" % t)
 
+    # ─ ⑴-b ★r1 minor m1 — 「첫 줄에만 접두」는 부족하다(옛 꼴의 음성) ──────────
+    def test_prefix_on_the_first_physical_line_only_still_truncates(self):
+        """줄바꿈이 든 본문을 **인코딩 없이** 실으면 둘째 물리 줄이 종결자로 선다.
+
+        이것이 r1 minor m1 이 잡은 결함이고, 지금의 인코딩이 막는 것이다. 이 음성이 없으면
+        ⑶의 통과가 「원래 안 끊기는 입력이었다」와 구별되지 않는다.
+        """
+        raw = ["  틱 4 verdict=Dead",                                  # 접두 있음(첫 줄)
+               "note: run with `RUST_BACKTRACE=1` environment variable",  # 접두 없음(둘째 줄)
+               "  틱 5 이 줄은 사라져야 한다"]
+        got = run_parser(self.parser, log_with_message(raw))
+        ours = got["panics"][0]
+        self.assertIn("틱 4 verdict=Dead", ours["message"], got)
+        self.assertNotIn("틱 5 이 줄은 사라져야 한다", ours["message"],
+                         "날것 둘째 줄이 메시지를 끊지 않았다 — 파서가 약해졌거나 검체가 틀렸다")
+
     # ─ ⑵ 생산자가 실제로 인코딩한다 ────────────────────────────────────────────
     def test_the_emitter_encodes_every_dump_line(self):
         src = governance_src()
@@ -136,9 +175,13 @@ class H06DumpSurvivesParser(unittest.TestCase):
         required = [
             ('const DUMP_LINE_PREFIX: &\'static str = "  ";', "덤프 접두 상수가 없다 — 인코딩이 사라졌다"),
             ("fn dump_line(body: &str) -> String {", "dump_line 이 없다"),
-            ('.replace(\'\\\'\', "ʼ")', "작은따옴표 무해화가 없다"),
+            ("=> out.push('ʼ')", "작은따옴표 무해화가 없다"),
             ('.replace("panicked at ", "panickedʼat ")',
              "`panicked at ` 무해화가 없다 — 파서의 헤더 종결자는 줄 머리에 고정돼 있지 않다"),
+            # ★r1 minor m1 — 접두는 첫 물리 줄에만 붙는다. 본문의 LF·CR 을 남기면 둘째 줄이
+            #   날것으로 서고 그 줄이 종결자면 메시지가 거기서 끊긴다(아래 ⑴-b 가 그 음성이다).
+            ("'\\n' => out.push_str(", "LF 인코딩이 없다 — 여러 줄 덤프의 둘째 줄이 날것으로 선다"),
+            ("'\\r' => out.push_str(", "CR 인코딩이 없다 — CR 뒤의 글자가 날것 줄로 선다"),
         ]
         missing = [why for token, why in required if token not in src]
         # ⛔`"#[track_caller]" in src` 로 세면 **이 저장소의 주석 본문**에도 그 글자가 있어서 늘
@@ -161,10 +204,16 @@ class H06DumpSurvivesParser(unittest.TestCase):
 
     # ─ ⑶ 인코딩된 덤프는 온전히 도착한다 ───────────────────────────────────────
     def test_encoded_dump_arrives_whole(self):
-        encoded = ["  " + t.replace("'", "ʼ").replace("panicked at ", "panickedʼat ")
-                   for t in TERMINATORS]
+        encoded = [encode(t) for t in TERMINATORS]
+        # ★r1 minor m1 — 줄바꿈이 든 본문도 인코딩되면 **한 물리 줄**로 온전히 도착한다.
+        multiline = [encode("틱 4 verdict=Dead\nnote: run with `RUST_BACKTRACE=1`"),
+                     encode("틱 5 verdict=Dead\r\nfailures:"),
+                     encode("틱 6 a\nb\nstack backtrace:\nc")]
+        for m in multiline:
+            self.assertNotIn("\n", m, "거울 인코더가 줄바꿈을 남겼다: %r" % m)
+            self.assertNotIn("\r", m, "거울 인코더가 CR 을 남겼다: %r" % m)
         rows = ["idles.len() 이 기대와 다르다",
-                "  ★D-R2-3 덤프(role=master · 틱 3개) — 판별: …"] + encoded + [
+                "  ★D-R2-3 덤프(role=master · 틱 3개) — 판별: …"] + encoded + multiline + [
                 "  틱 3 verdict=Idle now=1.0 last=0.0 now-last=+1.0 shell_alive=true exited=false"]
         got = run_parser(self.parser, log_with_message(rows))
         self.assertEqual(len(got["panics"]), 1, got)

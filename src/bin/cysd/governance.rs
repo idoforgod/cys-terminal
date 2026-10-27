@@ -25602,11 +25602,25 @@ mod tests {
             // ⛔파서의 현재 정규식(`thread '…' … panicked at `)에 **딱 맞춰** 인코딩하지 않는다 —
             //   그 식이 조금만 느슨해져도 인코딩이 뚫린다. 더 넓은 쪽(그 꼴의 **어느 조각이든**)을
             //   무해화한다: 작은따옴표와 `panicked at ` 두 토큰 모두.
-            format!(
-                "{}{}",
-                Self::DUMP_LINE_PREFIX,
-                body.replace('\'', "ʼ").replace("panicked at ", "panickedʼat ")
-            )
+            //
+            // ★r1-m1 (codex-2 · 2026-10-27) — 종전엔 접두가 **첫 물리 줄**에만 붙었다. 본문에
+            //   LF·CR 이 들어오면 둘째 물리 줄부터는 접두 없이 날것으로 서고, 그 줄이 `note: `
+            //   처럼 생기면 파서가 거기서 메시지를 끊는다 — 고치려던 채널을 반만 고치는 셈이다.
+            //   리뷰어가 **실제 emitter → 실제 `failures.py`** 로 재현해 잡았다(r1 minor m1).
+            //   ⇒ **줄바꿈 자체를 없앤다**: 덤프 항목 하나 = 정확히 한 물리 줄이라는 불변식을 세우고
+            //   `panic_message` 의 줄 수 단언이 그것을 지킨다. (대안인 「모든 물리 줄에 접두」는
+            //   항목 하나가 여러 줄로 부풀어 그 불변식을 잃고, 줄 수로는 날것 줄바꿈을 분간할 수 없다.)
+            let mut out = String::with_capacity(Self::DUMP_LINE_PREFIX.len() + body.len() + 8);
+            out.push_str(Self::DUMP_LINE_PREFIX);
+            for ch in body.chars() {
+                match ch {
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\'' => out.push('ʼ'),
+                    c => out.push(c),
+                }
+            }
+            out.replace("panicked at ", "panickedʼat ")
         }
 
         /// 덤프 머리글 — 패닉 메시지 안에 실리는 첫 줄(역시 인코딩한다).
@@ -25747,6 +25761,32 @@ idle 이 멈춘 틱에서 exited=true∨shell_alive=false ⇒ 축 B(하네스·�
                 "접두를 붙인 뒤에도 종결자로 읽힌다 — 인코딩이 깨졌다: {encoded:?}"
             );
         }
+        // ⑵-b ★r1 minor m1 — 본문에 **줄바꿈**이 들어온 경우. 접두는 첫 물리 줄에만 붙으므로
+        //     날것 LF·CR 을 흘리면 둘째 물리 줄이 종결자로 그대로 선다(리뷰어가 실제 emitter →
+        //     실제 파서로 재현). 인코딩은 항목 하나를 **한 물리 줄**로 접는다.
+        for body in [
+            "틱 4 verdict=Dead\nnote: run with `RUST_BACKTRACE=1`",
+            "틱 5 verdict=Dead\r\nfailures:",
+            "틱 6 verdict=Dead\rok",
+            "틱 7 a\nb\nstack backtrace:\nc",
+            "틱 8 \nthread 'x' (1) panicked at a.rs:1:1:",
+        ] {
+            let enc = DeadmanTickTrace::dump_line(body);
+            assert!(
+                !enc.contains('\n') && !enc.contains('\r'),
+                "덤프 항목에 날것 줄바꿈이 남았다 — 둘째 물리 줄이 파서의 종결자로 선다: {enc:?}"
+            );
+            assert!(
+                enc.starts_with(DeadmanTickTrace::DUMP_LINE_PREFIX) && !is_terminator(&enc),
+                "줄바꿈 인코딩 뒤에도 종결자로 읽힌다: {enc:?}"
+            );
+            // 내용은 버리지 않는다 — 줄바꿈만 두 글자 표기로 바뀐다(진단 가치 보존).
+            for frag in body.split(['\n', '\r']).filter(|f| !f.is_empty()) {
+                let safe = frag.replace('\'', "ʼ").replace("panicked at ", "panickedʼat ");
+                assert!(enc.contains(&safe), "인코딩이 내용을 버렸다: {frag:?} ∉ {enc:?}");
+            }
+        }
+
         // ⑶ 실제 생산자의 출력: 머리글과 각 행이 접두로 시작하고 종결자가 아니다.
         let mut tr = DeadmanTickTrace::new("master");
         tr.rows.push(DeadmanTickTrace::dump_line("틱 1 verdict=Idle"));
@@ -25754,6 +25794,11 @@ idle 이 멈춘 틱에서 exited=true∨shell_alive=false ⇒ 축 B(하네스·�
         // 자유 문자열에 파서의 헤더 꼴이 그대로 들어온 최악의 경우도 인코딩이 받아낸다.
         tr.rows.push(DeadmanTickTrace::dump_line(
             "틱 3 verdict=Dead:thread 'x' (1) panicked at a.rs:1:1:",
+        ));
+        // ★r1 minor m1 — 줄바꿈이 든 행도 **한 줄**로 들어간다. 아래 ⑷ 의 줄 수 단언이
+        //   이것을 지킨다(날것 LF 가 하나라도 새면 줄 수가 늘어 붉어진다).
+        tr.rows.push(DeadmanTickTrace::dump_line(
+            "틱 4 verdict=Dead\nnote: run with `RUST_BACKTRACE=1`\r\nfailures:",
         ));
         let header = tr.dump_header();
         assert!(header.starts_with(DeadmanTickTrace::DUMP_LINE_PREFIX), "머리글 접두 없음: {header:?}");
