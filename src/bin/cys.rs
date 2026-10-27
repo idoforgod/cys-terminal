@@ -3376,19 +3376,99 @@ enum TeamTokenAction {
     },
 }
 
-// HEAD-RULING-P2-IMPL-PACK-BOUNDARY items 2/6: inferred identity is never child environment.
-static DISCOVERED_CALLER: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-static DISCOVERED_SOCKET: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+// Inferred context belongs only to a command whose consumer contract is transport-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentityConsumer {
+    Identify, Ping, List, Status, SendText, SendKey, SetTitle, SetStatus,
+    UsageRegister, UsageEventStdin, Watch, AttestPin, AttestVerify, ReadScreen,
+    Quiesce, Resize, ClaimRole, EnvironmentOnly,
+}
 
-/// CLI transport only. Explicit environment keeps its priority; library/local-file paths and
-/// children still see their original environment. The daemon never calls this CLI function.
+impl IdentityConsumer {
+    fn permits_inference(self) -> bool {
+        match self {
+            Self::Identify | Self::Ping | Self::List | Self::Status | Self::SendText
+            | Self::SendKey | Self::SetTitle | Self::SetStatus | Self::UsageRegister
+            | Self::UsageEventStdin | Self::Watch | Self::AttestPin | Self::AttestVerify
+            | Self::ReadScreen | Self::Quiesce | Self::Resize | Self::ClaimRole => true,
+            Self::EnvironmentOnly => false,
+        }
+    }
+}
+
+/// Closed recovery set derived from target_surface's consumers plus basic transport queries.
+/// File-based sends and all mixed pack/local-file consumers retain the original environment.
+fn identity_consumer(command: &Command) -> IdentityConsumer {
+    match command {
+        Command::Identify => IdentityConsumer::Identify,
+        Command::Ping => IdentityConsumer::Ping,
+        Command::List => IdentityConsumer::List,
+        Command::Status { .. } => IdentityConsumer::Status,
+        Command::Send { file: None, .. } => IdentityConsumer::SendText,
+        Command::SendKey { .. } => IdentityConsumer::SendKey,
+        Command::SetTitle { .. } => IdentityConsumer::SetTitle,
+        Command::SetStatus { .. } => IdentityConsumer::SetStatus,
+        Command::UsageRegister { .. } => IdentityConsumer::UsageRegister,
+        Command::UsageEventStdin { .. } => IdentityConsumer::UsageEventStdin,
+        Command::Watch { .. } => IdentityConsumer::Watch,
+        Command::Attest { action: AttestAction::Pin { .. } } => IdentityConsumer::AttestPin,
+        Command::Attest { action: AttestAction::Verify { .. } } => IdentityConsumer::AttestVerify,
+        Command::ReadScreen { .. } => IdentityConsumer::ReadScreen,
+        Command::Quiesce { .. } => IdentityConsumer::Quiesce,
+        Command::Resize { .. } => IdentityConsumer::Resize,
+        Command::ClaimRole { .. } => IdentityConsumer::ClaimRole,
+        _ => IdentityConsumer::EnvironmentOnly,
+    }
+}
+
+static ACTIVE_CONSUMER: std::sync::OnceLock<IdentityConsumer> = std::sync::OnceLock::new();
+static DISCOVERED_IDENTITY: std::sync::OnceLock<Option<lane_fallback::Binding>> = std::sync::OnceLock::new();
+
+fn current_consumer() -> IdentityConsumer {
+    ACTIVE_CONSUMER.get().copied().unwrap_or(IdentityConsumer::EnvironmentOnly)
+}
+
+/// Sole reader of discovered identity. New readers/callers are rejected by the production census.
+fn inferred_identity(consumer: IdentityConsumer) -> Option<&'static lane_fallback::Binding> {
+    if !consumer.permits_inference() { return None; }
+    DISCOVERED_IDENTITY.get().and_then(Option::as_ref)
+}
+
 fn socket_path() -> std::path::PathBuf {
-    cli_socket_path(cys::env_compat(cys::ENV_SOCKET), DISCOVERED_SOCKET.get(), cys::default_socket_path)
+    cli_socket_path(cys::env_compat(cys::ENV_SOCKET),
+        inferred_identity(current_consumer()).map(|b| &b.socket), cys::default_socket_path)
 }
 
 fn cli_socket_path(explicit: Option<String>, inferred: Option<&std::path::PathBuf>,
     default: impl FnOnce() -> std::path::PathBuf) -> std::path::PathBuf {
     explicit.map(std::path::PathBuf::from).or_else(|| inferred.cloned()).unwrap_or_else(default)
+}
+
+fn excluded_identity_diagnostic(environment: &std::path::Path, inferred: &std::path::Path) -> Option<String> {
+    (environment != inferred).then(|| format!(
+        "cys: inferred lane {:?} ({:?}) is not used by this command; keeping environment lane {:?} ({:?}); set CYS_SOCKET and CYS_PACK_DIR together to select a lane",
+        cys::lane::lane_key(inferred), inferred, cys::lane::lane_key(environment), environment))
+}
+
+fn initialize_lane_identity(command: &Command) {
+    let consumer = identity_consumer(command);
+    let _ = ACTIVE_CONSUMER.set(consumer);
+    if cys::env_compat(cys::ENV_SOCKET).is_some() { return; }
+    match lane_fallback::discover() {
+        Ok(binding) => {
+            if consumer.permits_inference() {
+                // Inference is not permission to spawn a daemon.
+                AUTOSTART.store(false, std::sync::atomic::Ordering::Relaxed);
+            } else if let Some(line) = excluded_identity_diagnostic(&cys::socket_path(), &binding.socket) {
+                eprintln!("{line}"); // Diagnostic only: original command/target/refusal behavior remains.
+            }
+            let _ = DISCOVERED_IDENTITY.set(Some(binding));
+        }
+        Err(reason) => {
+            let _ = DISCOVERED_IDENTITY.set(None);
+            if consumer.permits_inference() { eprintln!("cys: {reason}; using default socket"); }
+        }
+    }
 }
 
 fn main() {
@@ -3405,22 +3485,7 @@ fn main() {
     if let Some(s) = &cli.socket {
         std::env::set_var(cys::ENV_SOCKET, s);
     }
-    // The fallback is CLI-only and runs once. Pure local diagnostics stay daemon-free.
-    if cys::env_compat(cys::ENV_SOCKET).is_none()
-        && !matches!(cli.command, Command::Lanes | Command::Doctor { .. } | Command::Actions { .. } | Command::PhoenixIdentity) {
-        match lane_fallback::discover() {
-            Ok(binding) => {
-                let _ = DISCOVERED_CALLER.set(binding.surface);
-                let _ = DISCOVERED_SOCKET.set(binding.socket);
-                // A discovered endpoint is borrowed authority, not permission to spawn a daemon.
-                AUTOSTART.store(false, std::sync::atomic::Ordering::Relaxed);
-            }
-            Err(reason) => {
-                let _ = DISCOVERED_CALLER.set(None);
-                eprintln!("cys: {reason}; using default socket");
-            }
-        }
-    }
+    initialize_lane_identity(&cli.command);
     // 순수 프로브 명령은 자동 기동 금지 — "데몬이 떠 있는가"라는 질문의 답을 바꾸면 안 된다
     if matches!(
         cli.command,
@@ -3460,7 +3525,11 @@ fn caller_surface_from_env(env: Option<&str>, fallback: impl FnOnce() -> Option<
 
 /// Explicit socket/env routes also resolve a missing surface, once, without autostart.
 fn resolved_caller_surface() -> Option<u64> {
-    if let Some(value) = DISCOVERED_CALLER.get() { return *value; }
+    let consumer = current_consumer();
+    if !consumer.permits_inference() { return None; }
+    if cys::env_compat(cys::ENV_SOCKET).is_none() {
+        return inferred_identity(consumer).and_then(|binding| binding.surface);
+    }
     static SURFACE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     *SURFACE.get_or_init(|| {
         let socket = socket_path();
@@ -45926,6 +45995,7 @@ mod update_repair_c_row7 {
 /// ★(B-360) A writer-journal refusal must not become seat destruction downstream.
 #[cfg(test)]
 mod b360_tests {
+    include!("cys/consumer_tests.rs");
     use super::*;
 
     /// As `rpc_roundtrip` renders the daemon's error reply (`<code>: <message>`).
