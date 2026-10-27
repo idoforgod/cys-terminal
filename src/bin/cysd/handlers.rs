@@ -21240,10 +21240,18 @@ mod tests {
         //     ⒝ 취소 이벤트의 **부재**는 「재검증 없음」이 아니다 — 재검증이 승계를 취소해도
         //        `holder_live` 가 거짓이면 발행 자리에 닿지 못한다. 그래서 수락 갈래에서는
         //        ⛔recheck 를 **추론하지 않는다**(그 추론 자체를 지웠다).
-        //   지금: `resp.ok` 는 「청구 수락」으로만 읽고(⛔「승계 확정」이 아니다), 프로브는 시험 전용
-        //   관찰창에서 읽고, 재검증 사유는 **실제로 발행되는 갈래**(거부)에서만 읽는다.
-        //   새 응답 필드 0 · 두 번째 프로세스 표 조회 0 · 재시도 0.
-        const DEFAULT_CANCEL: &str = "보유자 생존(승계 미요청 또는 좌석 비어있지 않음)";
+        //
+        //   ★r2 minor m1 (codex-2) — 첫 교정판은 **사후 생사**(`dispatch` 가 돌아온 뒤 읽은
+        //   `exited`)를 결정 시점의 사실로 읽었다. 그것도 틀렸다: `exited` 는 **PTY reader
+        //   스레드가 비동기로** 쓴다(`state.rs` 의 EOF 경로 `surf.exited.store(true, …)`) ⇒
+        //   「프로브 거짓 → 결정 시점 보유자 생존 → 핸들러가 **정당하게 거부** → 그 뒤 자식이
+        //   EOF 로 죽어 exited=true」가 정상 순서이고, 그 순서에서 사후 판독은 죽은-보유자 갈래를
+        //   골라 **정당한 거부를 거짓 적색**으로 만든다. 그래서 ⛔사후 생사를 쓰지 않는다.
+        //   지금: ①**기록된 응답**으로 먼저 가른다 ②거부는 **발행된 이벤트**(claim_denied ·
+        //   takeover_cancelled 사유)로만 검증한다 — 현재 생사와 무관하다 ③수락은 **결정 시점의
+        //   사실인 `role.takeover` 이벤트**(=`takeover_committed` 가 Some 일 때만 발행된다 ·
+        //   :8724)로 가른다. 판정은 `h07_assert_contract` 한 곳이고 대조 검체가 같은 함수를 쓴다.
+        //   새 응답 필드 0 · 두 번째 프로세스 표 조회 0 · 재시도 0 · 프로덕션 거동 변화 0.
         let hs = daemon.get_surface(holder).unwrap();   // 대조 ② 에서 쓴다 — ⛔여기서 프로브를 다시 돌리지 않는다
         let before = daemon.bus.replay_after(0).len() as u64;
         clear_claim_role_probe(&daemon);
@@ -21259,42 +21267,8 @@ mod tests {
         assert_eq!((observed.role.as_str(), observed.surface), ("cso-2", attacker),
             "관찰창이 다른 호출의 값을 들고 있다: {observed:?}");
         let fresh: Vec<serde_json::Value> = daemon.bus.replay_after(before).into_iter().collect();
-        // ★「청구가 수락됐다」 — ⛔「승계가 확정됐다(takeover_committed)」가 아니다.
-        let accepted = resp["ok"] == json!(true);
-        // 결정 시점의 보유자 생사. 이 검체에서 `exited` 를 쓰는 자리는 **아래 대조 ② 한 곳뿐**이고
-        //   그 전까지 아무도 쓰지 않으므로, 지금 거짓이면 호출 중에도 거짓이었다(단조·단일 기록자).
-        let holder_alive = daemon
-            .get_surface(holder)
-            .map(|h| !h.exited.load(Ordering::Relaxed))
-            .unwrap_or(false);
-        if holder_alive {
-            // 전제: 보유자는 살아 있고 청구자와 다른 surface 다 ⇒ 프로덕션의 판정은
-            //   `holder_live == (effective != Some(holder))` 로 줄고,
-            //   `effective == Some(holder) ⟺ 프로브 참 ∧ 재검증 없음` 이다.
-            if accepted {
-                // ⇒ 한 방향만 단언한다: 수락은 **프로브가 참이었음을 함의한다**.
-                //   (재검증이 없었다는 것도 따라오지만 이 갈래에는 관측 가능한 흔적이 없다 ⇒
-                //    ⛔이벤트의 부재를 「재검증 없음」으로 읽지 않는다 — r1 minor m2 ⒝.)
-                assert!(observed.probe,
-                    "살아있는 보유자를 두고 청구가 수락됐는데 이 호출의 프로브는 거짓이었다: resp={resp}");
-            } else {
-                // 거부 갈래에서는 세 번째 사실이 **실제로** 버스에 실린다(기본 문자열 포함).
-                assert!(fresh.iter().any(|e| e["name"] == "role.claim_denied"),
-                    "거부인데 role.claim_denied 가 버스에 없다: {fresh:?}");
-                let reason = fresh.iter()
-                    .filter(|e| e["name"] == "role.takeover_cancelled")
-                    .filter_map(|e| e["payload"]["reason"].as_str().map(str::to_string))
-                    .last()
-                    .expect("거부인데 role.takeover_cancelled 가 버스에 없다");
-                assert_eq!(reason == DEFAULT_CANCEL, !observed.probe,
-                    "거부 사유와 이 호출의 프로브가 어긋난다(기본 문자열 ⟺ 프로브 거짓) — reason={reason:?} probe={}", observed.probe);
-            }
-        } else {
-            // ★죽은 보유자 경로 — 프로브가 무엇이었든 수락이 정당하다(self-heal 보존).
-            assert!(accepted, "죽은 보유자를 두고 청구가 거부됐다: resp={resp}");
-        }
-        if accepted {
-            assert_eq!(daemon.roles.lock().unwrap().get("cso-2").copied(), Some(attacker));
+        h07_assert_contract(&daemon, "cso-2", holder, attacker, &observed, &resp, &fresh);
+        if resp["ok"] == json!(true) {
             daemon.roles.lock().unwrap().insert("cso-2".into(), holder); // 대조 ② 는 원 보유자 기준
         }
         // 대조 ②: 죽은 보유자의 승계는 opt-in 없이 열린다(self-heal 보존 — 게이트가 기능을 닫지 않는다).
@@ -21378,6 +21352,110 @@ mod tests {
             "수락 경로인데 취소 이벤트가 발행됐다: {fresh:?}");
         assert!(!fresh.iter().any(|e| e["name"] == "role.claim_denied"),
             "수락인데 거부 이벤트가 있다: {fresh:?}");
+        // ★r2 — 같은 판정 함수도 통과해야 한다(판정의 자리는 하나다).
+        h07_assert_contract(&daemon, ROLE, holder, claimant, &observed, &resp, &fresh);
+    }
+
+    /// ★H-07 판정의 **단일 자리**(r2 minor m1) — 기록된 응답으로 먼저 가르고, 거부는 **발행된
+    /// 이벤트**로만 검증한다.
+    ///
+    /// ⛔현재 생사(`exited`)를 결정 시점의 사실로 쓰지 않는다. `exited` 의 기록자는 **PTY reader
+    /// 스레드**이고(`state.rs` 의 EOF 경로) 그것은 비동기다 ⇒ 「정당한 거부 **뒤에** 보유자가
+    /// 죽는다」는 정상 순서가 있어서, 사후 판독으로 갈래를 고르면 그 거부를 거짓 적색으로 만든다
+    /// (이 가족은 차단 레인에서 돈다 — 거짓 적색은 태그를 막는다).
+    ///
+    /// 쓰는 사실 셋은 전부 **이 호출에서 나온 것**이다:
+    ///   ①`resp.ok` — 「청구 수락」. ⛔「승계 확정」이 아니다.
+    ///   ②거부 갈래의 `role.claim_denied` · `role.takeover_cancelled{reason}` — 그 갈래에서만
+    ///     발행되므로 거부의 사유는 **항상 관측된다**(기본 문자열 ⟺ 프로브 거짓).
+    ///   ③`role.takeover` — `takeover_committed` 가 Some 일 때**만** 발행된다(:8724) ⇒ 그 자체가
+    ///     **결정 시점**의 사실이고, 그것이 서면 `프로브 참 ∧ 재검증 없음` 이 따라온다.
+    /// 승계 확정 없이 수락된 경우(=보통의 죽은-보유자 경로)에는 프로브에 대해 ⛔아무것도 단언하지
+    /// 않는다 — 결정 시점의 생사를 사후에 알 수 없고, **미측정을 단언으로 메우지 않는다**.
+    fn h07_assert_contract(
+        daemon: &Arc<Daemon>,
+        role: &str,
+        holder: u64,
+        claimant: u64,
+        observed: &ClaimRoleProbe,
+        resp: &Value,
+        fresh: &[Value],
+    ) {
+        const DEFAULT_CANCEL: &str = "보유자 생존(승계 미요청 또는 좌석 비어있지 않음)";
+        let committed_ev = fresh.iter().any(|e| {
+            e["name"] == "role.takeover"
+                && e["payload"]["role"] == json!(role)
+                && e["payload"]["prev_surface"] == json!(holder)
+        });
+        let mapped = daemon
+            .roles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(role)
+            .copied();
+        if resp["ok"] == json!(false) {
+            assert!(fresh.iter().any(|e| e["name"] == "role.claim_denied"),
+                "거부인데 role.claim_denied 가 버스에 없다: {fresh:?}");
+            let reason = fresh.iter()
+                .filter(|e| e["name"] == "role.takeover_cancelled")
+                .filter_map(|e| e["payload"]["reason"].as_str().map(str::to_string))
+                .last()
+                .expect("거부인데 role.takeover_cancelled 가 버스에 없다");
+            assert_eq!(reason == DEFAULT_CANCEL, !observed.probe,
+                "거부 사유와 이 호출의 프로브가 어긋난다(기본 문자열 ⟺ 프로브 거짓) — reason={reason:?} probe={}", observed.probe);
+            assert!(!committed_ev, "거부인데 승계 확정 이벤트가 발행됐다: {fresh:?}");
+            assert_eq!(mapped, Some(holder), "거부인데 역할 매핑이 움직였다: {mapped:?}");
+        } else {
+            assert_eq!(mapped, Some(claimant), "수락인데 역할 매핑이 움직이지 않았다: {mapped:?}");
+            if committed_ev {
+                assert!(observed.probe,
+                    "승계 확정 이벤트가 발행됐는데 이 호출의 프로브는 거짓이었다: resp={resp}");
+            }
+        }
+    }
+
+    /// ★r2 minor m1 (codex-2 · 2026-10-28) — **정당한 거부 뒤에 보유자가 죽는** 순서를 결정론으로
+    /// 재현하는 대조. `exited` 의 기록자가 PTY reader 스레드(비동기)라 이 순서는 실재한다.
+    ///
+    /// 첫 교정판은 `dispatch` 가 돌아온 뒤 `exited` 를 읽어 죽은-보유자 갈래를 골랐고, 그 갈래는
+    /// `수락` 을 요구했다 ⇒ 이 순서에서 **정당한 거부가 거짓 적색**이 된다. 지금 판정은 응답으로
+    /// 먼저 갈라 거부를 발행 이벤트로만 검증하므로 사후 사망에 영향받지 않는다.
+    /// (변이 M10 이 옛 규칙을 되돌려 이 검체가 실제로 붉는 것을 보인다.)
+    ///
+    /// 결정론: 승계를 요청하지 않으므로 프로브는 프로세스 표를 보지 않고 **구조적으로 거짓**이고,
+    /// 보유자는 호출 **뒤에** 내 손으로 종료 표시한다(PTY reader 의 EOF 경로가 하는 그 쓰기다).
+    #[test]
+    fn claim_role_denial_stands_when_the_holder_dies_after_the_decision() {
+        let daemon = claim_daemon();
+        const ROLE: &str = "cso-h07deny";
+        assert!(privileged_role(ROLE), "전제: 이 역할이 특권 집합 안이어야 게이트 경로를 탄다");
+        let holder = make_surface(&daemon, Some(ROLE));
+        daemon.roles.lock().unwrap().insert(ROLE.into(), holder);
+        let claimant = make_surface(&daemon, Some("worker-11"));
+        let pid = 990_501_u32;
+        bind_caller(&daemon, pid, claimant);
+        let hs = daemon.get_surface(holder).unwrap();
+        assert!(!hs.exited.load(Ordering::Relaxed), "전제: 호출 전 보유자는 살아 있다");
+
+        clear_claim_role_probe(&daemon);
+        let before = daemon.bus.replay_after(0).len() as u64;
+        let resp = claim(&daemon, ROLE, claimant, Some(pid));
+        let observed = daemon
+            .test_claim_probe
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .expect("관찰창이 끊겼다 — 이 호출이 프로브를 기록하지 않았다");
+        let fresh: Vec<Value> = daemon.bus.replay_after(before).into_iter().collect();
+        // 전제 확인: 승계 미요청 ⇒ 프로브 거짓 · 살아있는 특권 보유자 ⇒ 거부.
+        assert!(!observed.probe, "승계를 요청하지 않았는데 프로브가 참이다: {observed:?}");
+        assert_eq!(resp["ok"], json!(false),
+            "살아있는 보유자 + 승계 미요청인데 거부가 아니다(자식이 호출 중에 죽었다면 전제가 깨진다): {resp}");
+
+        // ★여기서 PTY reader 의 EOF 경로가 하는 쓰기를 **결정 뒤에** 그대로 한다.
+        hs.exited.store(true, Ordering::Relaxed);
+        // 같은 판정 함수가 **그 뒤에도** 이 거부를 정당하다고 읽어야 한다.
+        h07_assert_contract(&daemon, ROLE, holder, claimant, &observed, &resp, &fresh);
     }
 
     fn create_surface_rpc(daemon: &Arc<Daemon>, role: Option<&str>, caller_pid: Option<u32>) -> Value {
