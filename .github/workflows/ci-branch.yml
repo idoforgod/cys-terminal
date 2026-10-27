@@ -370,6 +370,15 @@ jobs:
                   "re-read text the tag already passed (master decision D-4, ci-branch only); pack-release has no Windows leg "
                   "and nothing to measure.",
               ),
+              "test_homepage_switch": (
+                  {"ci-branch"},
+                  "scripts/tests/ suite (not a pack suite; 0.14.53 B-438). Controls for scripts/homepage-switch.py, the staging "
+                  "verify and ordered, journaled switch of the homepage release. The homepage script uploads that file from the "
+                  "tag tree and runs it on the homepage server at release time; no workflow runs it. Branch lane only: the "
+                  "pre-tag procedure requires ci-branch green on the tag SHA, so a tag tree with a broken switch is not tagged. "
+                  "release and pack-release build and publish the GitHub assets and never run the homepage switch, so an entry "
+                  "there would re-test the same tree with nothing new to measure.",
+              ),
                             "test_verify_win_crt": (
                   {"ci-branch", "release"},
                   "scripts/tests/ 스위트(팩 스위트 아님 · R1-repair 2026-08-29 편입 — 그 전에는 "
@@ -1518,6 +1527,18 @@ jobs:
           set -euo pipefail
           f="scripts/tests/test_release_windows_help_gate.py"
           [ -f "$f" ] || { echo "Missing Windows --help gate step pin: $f" >&2; exit 1; }
+          PYTHONDONTWRITEBYTECODE=1 python3 "$f"
+
+      # ★(0.14.53 · B-438) Homepage switch controls, registered by name: staging verify, the DESIGN s6 move order, guards that stop
+      #   before any public change, SIGKILL/SIGHUP with resume and rollback, the publication primitives and the Python 3.6 floor
+      #   (temp folders only, no network). Branch lane only: ALLOWED("test_homepage_switch") in the lane-parity gate above gives
+      #   the reason. ★No `if:`.
+      - name: Homepage switch controls (staging verify, order, guards, kill/resume/rollback)
+        shell: bash
+        run: |
+          set -euo pipefail
+          f="scripts/tests/test_homepage_switch.py"
+          [ -f "$f" ] || { echo "Missing homepage switch controls: $f" >&2; exit 1; }
           PYTHONDONTWRITEBYTECODE=1 python3 "$f"
 
       # ★(0.14.43 성찰 R1F-PK · S3 minor 8) IOReport 강링크 **산출물** 게이트. E2 가 `hwmon.rs` 의 IOReport 강링크를 dlopen 지연
