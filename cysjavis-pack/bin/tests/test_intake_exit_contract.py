@@ -8,7 +8,7 @@
   E1 OPEN      항목이 열려 있으면 1 · 짧은 증거·부재 artifact·임시 경로만인 pay·조건 없는 defer 는 REFUSED = 1
                · 지불 뒤 증거 바이트가 바뀌면(덧붙임 포함) 다시 1 · 지불된 대장에 add-item 하면 다시 1
                · 정규 파일의 지문을 얻지 못한 새 지불(디렉터리·읽기 불가·FIFO·지불 시점 부재)은 REFUSED = 1 이고
-                 그 자리에 뒤늦게 파일이 생겨도 1 — 지문 면제는 지문 칸 이전의 맨 문자열 기록뿐이다(그쪽은 0 유지)
+                 그 자리에 뒤늦게 파일이 생겨도 1 — 지문 면제는 지문 칸 이전의 맨 문자열 기록뿐이다(그쪽은 EXEMPT 10)
   E2 NO_DENOM  항목 0건 대장 = 2 — ★통과(0)가 아니다
   E3 NO_LEDGER 빈 팩·없는 --id·대상 부재 pay/add-item·빈 루트 audit·다른 좌석의 대장만 있음 = 3
                · 좌석 권위(스텁 cys · POSIX): identify 가 env 를 이긴다 · 재번호된 같은 역할은 자기 대장(0)
@@ -47,6 +47,9 @@ import json
 import ntpath
 import os
 import shutil
+import stat
+import copy
+import hashlib
 import subprocess
 import sys
 import tempfile
@@ -74,7 +77,7 @@ class Rig(unittest.TestCase):
 
     def setUp(self):
         self.assertTrue(os.path.isfile(TOOL), "도구 부재: %s" % TOOL)
-        self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="intake-exit-"))
+        self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="intake-exit-", dir=os.environ.get("P5N_FIXTURE_ROOT")))
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.pack = os.path.join(self.tmp, "pack")
         self.home = os.path.join(self.tmp, "home")
@@ -162,15 +165,16 @@ class E1Open(Rig):
                                          "--evidence", EVIDENCE, "--artifact", DURABLE), "pay #1")
         self.rc(EXIT_OPEN, self.run_tool("status", "--id", "L1b"), "status(1 지불 · 1 열림)")
 
-    def test_short_evidence_is_refused_and_recorded(self):
+    def test_short_evidence_is_refused_and_not_recorded(self):
         self.open_ledger("L1c", ["항목"])
+        before = self.load_ledger("L1c")
         r = self.run_tool("pay", "--id", "L1c", "--item-no", "1", "--evidence", "했다",
                           "--artifact", DURABLE)
         self.rc(EXIT_OPEN, r, "pay(증거 2자)")
         self.assertIn("REFUSED", r.stderr)
         self.assertIn("evidence 2자", r.stderr)
         led = self.load_ledger("L1c")
-        self.assertEqual(led["items"][0]["state"], "done", "거부도 기록돼야 한다")
+        self.assertEqual(led, before, "거부는 대장을 쓰지 않는다")
         self.rc(EXIT_OPEN, self.run_tool("status", "--id", "L1c"), "status(거부 뒤)")
 
     def test_missing_artifact_is_refused(self):
@@ -322,18 +326,18 @@ class DurableRig(Rig):
         self.put("later.log")
         r = self.run_tool("status", "--id", "F4")
         self.rc(EXIT_OPEN, r, "status(부재였던 경로가 생긴 뒤)")
-        self.assertIn("지문을 얻지 못했다", r.stdout)
+        self.assertIn("state=open", r.stdout)
 
-    def test_fingerprinted_file_beside_a_directory_is_paid(self):
-        # 지불은 지문을 얻은 내구 정규 파일 1건이면 성립한다 — 같이 적힌 디렉터리는 지불을 싣지 않을 뿐 막지 않는다.
+    def test_fingerprinted_file_beside_a_directory_is_refused(self):
+        # 선언한 디렉터리 증거는 지문이 없으므로 다른 정규 파일이 있어도 거부한다.
         d = os.path.join(self.work, "a-directory")
         os.makedirs(d)
         self.open_ledger("F5", ["항목"])
-        self.rc(EXIT_PAID, self.pay("F5", d, self.put("proof.log")), "pay(디렉터리 + 정규 파일)")
-        self.rc(EXIT_PAID, self.run_tool("status", "--id", "F5"), "status")
+        self.rc(EXIT_OPEN, self.pay("F5", d, self.put("proof.log")), "pay(디렉터리 + 정규 파일)")
+        self.rc(EXIT_OPEN, self.run_tool("status", "--id", "F5"), "status")
 
-    def test_legacy_bare_string_record_keeps_its_allowance(self):
-        # 지문 칸이 생기기 전의 기록(맨 문자열)은 지문 없이 실존·내구로 지불이 유지된다(소급 검증 불가 표시와 함께).
+    def test_legacy_bare_string_record_is_exempt_not_paid(self):
+        # 맨 문자열 기록은 존재 면제일 뿐 신원이 증명된 PAID 가 아니다.
         art = self.put("legacy.log")
         self.open_ledger("F6", ["항목"])
         led = self.load_ledger("F6")
@@ -341,7 +345,7 @@ class DurableRig(Rig):
         with open(self.ledger_path("F6"), "w", encoding="utf-8") as fh:
             json.dump(led, fh, ensure_ascii=False)
         r = self.run_tool("status", "--id", "F6")
-        self.rc(EXIT_PAID, r, "status(맨 문자열 기록)")
+        self.rc(10, r, "status(맨 문자열 기록)")
         self.assertIn("지문 없음", r.stdout)
 
 
@@ -524,6 +528,11 @@ class _NtOs:
     def __init__(self, env, existing=()):
         self.name, self.path, self.environ = "nt", _NtPath(existing), env
 
+    def stat(self, path):
+        if not self.path.exists(path):
+            raise FileNotFoundError(path)
+        return type('Regular', (), dict(st_mode=stat.S_IFREG | 0o600, st_size=1))()
+
     def __getattr__(self, name):
         return getattr(os, name)
 
@@ -539,8 +548,11 @@ class WindowsTempRoots(unittest.TestCase):
     def setUpClass(cls):
         cls.m = load_tool()
 
+    @contextlib.contextmanager
     def as_windows(self, env, existing=()):
-        return mock.patch.object(self.m, "os", _NtOs(env, existing))
+        fake = _NtOs(env, existing)
+        with mock.patch.object(self.m, "os", fake), mock.patch.object(self.m, "_STAT", fake.stat):
+            yield
 
     def test_temp_only_artifact_is_not_a_payment(self):
         art = WIN_TEMP + r"\proof.log"
@@ -557,11 +569,11 @@ class WindowsTempRoots(unittest.TestCase):
         self.assertEqual(st, "OPEN", why)
         self.assertIn("임시 경로", why)
 
-    def test_durable_artifact_is_still_a_payment(self):
+    def test_durable_bare_artifact_is_exempt(self):
         art = r"C:\Users\x\Documents\proof.log"
         with self.as_windows({"TEMP": WIN_TEMP}, [art]):
             st, why = self.m._item_state({"state": "done", "evidence": EVIDENCE, "artifacts": [art]})
-        self.assertEqual(st, "PAID", why)
+        self.assertEqual(st, "EXEMPT", why)
 
     def test_root_resolution(self):
         cases = [  # (env, 경로, 임시인가)
@@ -887,6 +899,405 @@ class E8UnreadableExit(DurableRig):
         r = self.run_tool("audit", "--roots", self.pack)
         self.rc(EXIT_OPEN, r, "audit(열림 1 + 판독 불가 1)")
         self.assertIn("뒤늦게 받은 항목", r.stdout)
+
+
+
+class P5NIntegrity(Rig):
+    """Real reader/writer regressions; no live ledger or daemon access."""
+    def setUp(self):
+        super().setUp()
+        self.m = load_tool()
+        self.open_ledger("N", ["one", "two"])
+        self.args = type("Args", (), dict(root=self.pack, id="N", item_no=1,
+                    evidence=EVIDENCE, artifact=[DURABLE], reason=REASON,
+                    release_condition="decision"))()
+
+    def bytes(self):
+        with open(self.ledger_path("N"), "rb") as f:
+            return f.read()
+
+    def event(self):
+        sha, size = self.m._fp(DURABLE)
+        return dict(kind="pay", state="done", evidence=EVIDENCE, paid_at="t",
+                    artifacts=[dict(path=DURABLE, sha256_16=sha, size=size, ephemeral=False)])
+
+    def test_p5n_refusals_preserve_previous_payment_bytes(self):
+        self.assertEqual(self.m.cmd_pay(self.args), 0)
+        before = self.bytes()
+        for changes, command in ((dict(evidence="short"), self.m.cmd_pay),
+                                 (dict(evidence=EVIDENCE, artifact=[DURABLE+".absent"]), self.m.cmd_pay),
+                                 (dict(reason="short"), self.m.cmd_defer)):
+            self.args.__dict__.update(changes)
+            with self.subTest(changes=changes), mock.patch.object(self.m, "_write_atomic", wraps=self.m._write_atomic) as write:
+                self.assertEqual(command(self.args), 1)
+                self.assertEqual(self.bytes(), before)
+                write.assert_not_called()
+
+    def test_p5n_append_snapshot_lazy_and_conflict_output(self):
+        original = self.load_ledger("N")
+        original['items'][0]['unknown'] = {'verbatim': [1, 'two']}
+        with open(self.ledger_path("N"), 'w') as f:
+            json.dump(original, f)
+        self.assertEqual(self.m.cmd_pay(self.args), 0)
+        first = self.load_ledger("N")
+        item = first['items'][0]
+        self.assertIn('payments', item)
+        self.assertEqual(item['payments'][0]['kind'], 'legacy_snapshot')
+        self.assertEqual(item['payments'][0]['payload'], original['items'][0])
+        self.assertEqual(first['items'][1], original['items'][1])
+        # A v1 writer's mirror is undecidable even if its current proof looks valid.
+        item.update(dict(state='done', evidence='mirror '+EVIDENCE, artifacts=[DURABLE], paid_at='v1'))
+        with open(self.ledger_path("N"), 'w') as f:
+            json.dump(first, f)
+        st, why = self.m._item_state(item)
+        self.assertEqual(st, 'CONFLICT')
+        self.assertIn('mirror '+EVIDENCE, why)
+        self.assertIn('paid_at', why)
+        self.assertIn('journal', why)
+        snap = {k:v for k,v in item.items() if k != 'payments'}
+        self.assertEqual(self.m.cmd_pay(self.args), 0)
+        final = self.load_ledger("N")['items'][0]
+        self.assertEqual([x['kind'] for x in final['payments']], ['legacy_snapshot','pay','legacy_snapshot','pay'])
+        self.assertEqual(final['payments'][-2]['payload'], snap)
+        self.assertEqual(final['payments'][-2]['provenance'], 'v1 fields, acceptance unproven')
+        self.assertNotIn('state', final)
+
+    def test_p5n_journal_validation_is_in_reader(self):
+        ev = self.event()
+        variants = [None, {}, dict(ev, state='defer'), dict(ev, evidence=12),
+                    dict(ev, artifacts=[DURABLE]), dict(ev, artifacts=[{}]),
+                    dict(ev, paid_at=''), dict(kind='unknown')]
+        for val in (None, 0, 1, 'false'):
+            variants.append(dict(ev, artifacts=[dict(ev['artifacts'][0], ephemeral=val)]))
+        art = dict(ev['artifacts'][0]); art.pop('ephemeral')
+        variants.append(dict(ev, artifacts=[art]))
+        for bad in variants:
+            for entries in ([ev,bad], [bad,ev]):
+                with self.subTest(entries=entries):
+                    self.assertEqual(self.m._item_state({'payments':entries})[0], 'DRIFT')
+        self.assertEqual(self.m._item_state({'payments':[],'state':'done'})[0], 'CONFLICT')
+        self.assertEqual(self.m._item_state({'payments':None})[0], 'DRIFT')
+        self.assertEqual(self.m._item_state({'payments':[dict(kind='legacy_snapshot', payload=ev,
+                         at='t', provenance='v1 fields, acceptance unproven')]})[0], 'OPEN')
+
+    def test_p5n_bare_is_stat_only_exempt(self):
+        with mock.patch.object(self.m, '_OPEN', side_effect=AssertionError('bare opened')) as op, \
+                mock.patch.object(self.m, '_STAT', wraps=self.m._STAT) as stat_call:
+            st, why = self.m._item_state(dict(state='done',evidence=EVIDENCE,artifacts=[DURABLE]))
+            self.assertEqual(st, 'EXEMPT')
+            self.assertEqual(stat_call.call_count, 1)
+            op.assert_not_called()
+        with mock.patch.object(self.m, '_STAT', side_effect=PermissionError(13, 'denied')):
+            self.assertEqual(self.m._item_state(dict(state='done',evidence=EVIDENCE,artifacts=[DURABLE]))[0], 'UNREADABLE')
+
+    def test_p5n_recorded_ephemeral_reaches_fold(self):
+        ev = self.event()
+        vanished = dict(path=DURABLE+'.gone',sha256_16='a'*16,size=1,ephemeral=True)
+        ev['artifacts'].append(vanished)
+        self.assertEqual(self.m._item_state({'payments':[ev]})[0], 'PAID')
+        vanished['ephemeral'] = False
+        self.assertEqual(self.m._item_state({'payments':[ev]})[0], 'OPEN')
+        self.assertEqual(self.m.cmd_pay(self.args), 0)
+        item = self.load_ledger('N')['items'][0]
+        self.assertIs(item['payments'][-1]['artifacts'][0]['ephemeral'], False)
+
+    def test_p5n_foreign_paths_never_probe(self):
+        paths = [r'C:\proof.txt', r'\\server\share\proof', '//server/share/proof', 'relative.txt']
+        with mock.patch.object(self.m, '_STAT', side_effect=AssertionError('foreign stat')):
+            for p in paths:
+                with self.subTest(path=p):
+                    self.assertEqual(self.m._item_state(dict(state='done',evidence=EVIDENCE,artifacts=[p]))[0], 'UNRESOLVABLE')
+
+    @unittest.skipIf(os.name != 'posix', 'search-only permissions require POSIX')
+    def test_p5n_existing_search_only_ancestor_does_not_refuse_pay(self):
+        old = os.path.join(self.tmp, 'pinned-v1.py')
+        shutil.copyfile(os.path.join(TESTS_DIR, 'fixtures', 'intake-v1-9dbea792.txt'), old)
+        os.chmod(self.tmp, 0o111)
+        try:
+            try:
+                fd = os.open(self.tmp, os.O_RDONLY)
+            except PermissionError:
+                pass
+            else:
+                os.close(fd)
+                self.skipTest('this account can read a search-only directory')
+            argv = ('pay','--id','N','--item-no','1','--evidence',EVIDENCE,'--artifact',DURABLE)
+            with mock.patch.dict(globals(), TOOL=old):
+                self.rc(0,self.run_tool(*argv),'pinned v1 search-only ancestor')
+            self.rc(0,self.run_tool(*argv),'new pay search-only ancestor')
+            self.assertEqual(self.m._sync_dir(os.path.dirname(self.ledger_path('N'))),'SYNC_OK')
+            forbidden={self.tmp,self.pack,os.path.join(self.pack,'round')}
+            real_open=os.open; opened=[]
+            def op(p,*args,**kwargs):
+                opened.append(p)
+                self.assertNotIn(p,forbidden,'pre-existing ancestor opened')
+                return real_open(p,*args,**kwargs)
+            with mock.patch.object(self.m.os,'open',side_effect=op):
+                self.assertEqual(self.m.cmd_pay(self.args),0)
+            self.assertIn(os.path.dirname(self.ledger_path('N')),opened)
+        finally:
+            os.chmod(self.tmp, 0o700)
+
+    def test_p5n_precommit_directory_trail_s3p_s3_s6(self):
+        path=self.ledger_path('N'); d=os.path.dirname(path); backup=os.path.join(d,'.preimage')
+        events=[]; make=self.m._make_dirs; replace=os.replace
+        def mkdir(p):
+            events.append(('mkdir',p)); return make(p)
+        def publish(src,dst):
+            events.append(('replace','ledger' if dst==path else 'preimage')); return replace(src,dst)
+        with mock.patch.object(self.m,'_make_dirs',side_effect=mkdir), \
+                mock.patch.object(self.m,'_sync_dir',side_effect=lambda p:(events.append(('sync',p)) or 'SYNC_OK')), \
+                mock.patch.object(self.m.os,'replace',side_effect=publish):
+            self.assertEqual(self.m._write_atomic(path,self.load_ledger('N')),0)
+        self.assertEqual(events,[('mkdir',d),('sync',d),('mkdir',backup),('sync',d),
+                                 ('replace','preimage'),('sync',backup),('replace','ledger'),('sync',d)])
+
+    def test_p5n_s3p_failure_precedes_preimage_creation(self):
+        before=self.bytes(); backup=os.path.join(os.path.dirname(self.ledger_path('N')),'.preimage')
+        with mock.patch.object(self.m,'_sync_dir',return_value='SYNC_FAILED'):
+            self.assertEqual(self.m._write_atomic(self.ledger_path('N'),dict(self.load_ledger('N'),marker='new')),11)
+        self.assertEqual(self.bytes(),before)
+        self.assertFalse(os.path.exists(backup),'S3P must precede preimage directory creation')
+
+    def test_p5n_s6_failure_and_permission_denial(self):
+        path=self.ledger_path('N'); backup=os.path.join(os.path.dirname(path),'.preimage')
+        before=self.bytes(); real_sync=self.m._sync_dir
+        with mock.patch.object(self.m,'_sync_dir',side_effect=lambda d:'SYNC_FAILED' if d==backup else real_sync(d)):
+            self.assertEqual(self.m._write_atomic(path,dict(self.load_ledger('N'),marker='failed')),11)
+        self.assertEqual(self.bytes(),before)
+        real_open=os.open; denied=[]
+        def op(p,*args,**kwargs):
+            if p==backup:
+                denied.append(p); raise PermissionError(13,'S6 denied')
+            return real_open(p,*args,**kwargs)
+        with mock.patch.object(self.m.os,'open',side_effect=op):
+            self.assertEqual(self.m._write_atomic(path,dict(self.load_ledger('N'),marker='unverified')),13)
+        self.assertEqual(denied,[backup])
+        self.assertEqual(self.load_ledger('N')['marker'],'unverified')
+
+    def test_p5n_atomic_write_syncs_and_retains_preimage(self):
+        path = self.ledger_path('N'); before = self.bytes()
+        with mock.patch.object(self.m.os, 'fsync', wraps=os.fsync) as fsync:
+            rc = self.m._write_atomic(path, self.load_ledger('N'))
+            self.assertEqual(rc, 0)
+            self.assertEqual(fsync.call_count, 6)
+        backups = os.listdir(os.path.join(os.path.dirname(path), '.preimage'))
+        self.assertEqual(len(backups), 1)
+        with open(os.path.join(os.path.dirname(path), '.preimage', backups[0]), 'rb') as f:
+            self.assertEqual(f.read(), before)
+
+
+    def test_p5n_durability_outcomes_and_preimage_mismatch(self):
+        path = self.ledger_path('N')
+        original = self.bytes()
+        candidate = self.load_ledger('N'); candidate['test_marker'] = 'new'
+        for mode, expected, committed in [('ok',0,True),('early-unsupported',13,True),
+                                         ('first-sync-fail',11,False),
+                                         ('final-fail',12,True),('final-unsupported',13,True),
+                                         ('windows',0,True)]:
+            with self.subTest(mode=mode):
+                with open(path,'wb') as f: f.write(original)
+                published = [False]; seen = []
+                replace = os.replace
+                def publish(src, dst):
+                    replace(src,dst)
+                    if dst == path: published[0] = True
+                def sync(d):
+                    seen.append(d)
+                    if mode == 'windows': return 'SYNC_NONPOSIX'
+                    if mode == 'early-unsupported' and len(seen)==1: return 'SYNC_UNSUPPORTED'
+                    if mode=='first-sync-fail' and len(seen)==1: return 'SYNC_FAILED'
+                    if published[0]:
+                        if mode=='final-fail': return 'SYNC_FAILED'
+                        if mode=='final-unsupported': return 'SYNC_UNSUPPORTED'
+                    return 'SYNC_OK'
+                with mock.patch.object(self.m,'_sync_dir',side_effect=sync,create=True), \
+                        mock.patch.object(self.m.os,'replace',side_effect=publish), contextlib.redirect_stderr(io.StringIO()) as err:
+                    rc = self.m._write_atomic(path,candidate)
+                self.assertEqual(rc,expected)
+                self.assertEqual(published[0],committed)
+                self.assertEqual(self.bytes()!=original,committed)
+                if mode=='windows':
+                    self.assertIn('COMMITTED/DURABILITY_UNVERIFIED (platform has no directory sync)',err.getvalue())
+        with open(path,'wb') as f:f.write(original)
+        builtin_open = open
+        def corrupt_read(p,*args,**kwargs):
+            if '.preimage' in str(p) and args and args[0]=='rb': return io.BytesIO(b'corrupt')
+            return builtin_open(p,*args,**kwargs)
+        with mock.patch.object(self.m,'open',side_effect=corrupt_read,create=True):
+            self.assertEqual(self.m._write_atomic(path,candidate),11)
+        self.assertEqual(self.bytes(),original)
+
+    def test_p5n_each_published_file_is_flushed_before_replace(self):
+        synced = set(); published = []
+        real_sync, real_replace = os.fsync, os.replace
+        def sync(fd):
+            st = os.fstat(fd)
+            if stat.S_ISREG(st.st_mode): synced.add((st.st_dev, st.st_ino))
+            return real_sync(fd)
+        def replace(src,dst):
+            st = os.stat(src)
+            self.assertIn((st.st_dev,st.st_ino),synced,'published unsynced file')
+            published.append(dst)
+            return real_replace(src,dst)
+        with mock.patch.object(self.m.os,'fsync',side_effect=sync), mock.patch.object(self.m.os,'replace',side_effect=replace):
+            self.assertEqual(self.m._write_atomic(self.ledger_path('N'),self.load_ledger('N')),0)
+        self.assertEqual(len(published),2)
+        self.assertIn('.preimage',published[0])
+        self.assertEqual(published[1],self.ledger_path('N'))
+
+    def test_p5n_file_sync_and_replace_fail_before_commit(self):
+        path=self.ledger_path('N'); before=self.bytes(); candidate=self.load_ledger('N')
+        for fail in ('fsync','replace'):
+            with self.subTest(fail=fail), mock.patch.object(self.m.os,fail,side_effect=OSError(5,'injected')):
+                self.assertEqual(self.m._write_atomic(path,candidate),11)
+            self.assertEqual(self.bytes(),before)
+
+    def test_p5n_sync_classification_and_parent_entry_order(self):
+        self.assertTrue(hasattr(self.m,'_sync_dir'))
+        with mock.patch.object(self.m.os,'fsync',side_effect=OSError(22,'unsupported')):
+            self.assertEqual(self.m._sync_dir(self.tmp),'SYNC_UNSUPPORTED')
+        with mock.patch.object(self.m.os,'open',side_effect=OSError(13,'denied')):
+            self.assertEqual(self.m._sync_dir(self.tmp),'SYNC_UNSUPPORTED')
+        with mock.patch.object(self.m,'os',_NtOs({})), mock.patch.object(self.m.os,'open',side_effect=AssertionError('directory opened')):
+            self.assertEqual(self.m._sync_dir(self.tmp),'SYNC_NONPOSIX')
+        path=os.path.join(self.tmp,'fresh','round','_intake','L.json'); synced=[]; observed=[]
+        replace=os.replace
+        def publish(src,dst):
+            observed.append((dst,list(synced)));return replace(src,dst)
+        with mock.patch.object(self.m,'_sync_dir',side_effect=lambda d:(synced.append(d) or 'SYNC_OK')), \
+                mock.patch.object(self.m.os,'replace',side_effect=publish):
+            self.assertEqual(self.m._write_atomic(path,{'items':[]}),0)
+        before=next(seen for dst,seen in observed if dst==path)
+        self.assertEqual(set(before), {self.tmp, os.path.join(self.tmp,'fresh'),
+                                      os.path.join(self.tmp,'fresh','round'), os.path.dirname(path)})
+        self.assertEqual(set(synced), {self.tmp, os.path.join(self.tmp,'fresh'),
+                                      os.path.join(self.tmp,'fresh','round'), os.path.dirname(path)})
+        self.assertFalse(os.path.exists(os.path.join(os.path.dirname(path),'.preimage')))
+        root = os.path.join(self.tmp,'fresh-open')
+        target = os.path.join(root,'round','_intake','L.json'); synced = []
+        args = type('OpenArgs',(),dict(root=root,id='L',instruction_file=self.instr,item=['new'],source='owner'))()
+        def after_commit(d):
+            synced.append((d,os.path.isfile(target)))
+            return 'SYNC_OK'
+        with mock.patch.object(self.m,'_sync_dir',side_effect=after_commit), \
+                mock.patch.object(self.m,'_seat',return_value=('fixture','1',False)):
+            self.assertEqual(self.m.cmd_open(args),1)
+        self.assertEqual(set(synced[:-1]),{(p,False) for p in (self.tmp,root,os.path.join(root,'round'),os.path.dirname(target))})
+        self.assertEqual(synced[-1],(os.path.dirname(target),True))
+
+    def test_p5n_directory_outcomes_after_commit_are_not_precommit_failures(self):
+        path = self.ledger_path('N'); base = self.load_ledger('N')
+        for operation in ('open','fsync'):
+            for eno, expected in ((13,13),(1,13),(22,13),(5,12)):
+                with self.subTest(operation=operation, errno=eno):
+                    candidate = dict(base, changed=[operation,eno])
+                    published = [False]
+                    real_replace, real_open, real_sync = os.replace, os.open, os.fsync
+                    def replace(src,dst):
+                        real_replace(src,dst)
+                        if dst == path: published[0] = True
+                    def op(p,*args,**kwargs):
+                        if published[0] and operation=='open': raise OSError(eno,'directory open')
+                        return real_open(p,*args,**kwargs)
+                    def sync(fd):
+                        if published[0] and operation=='fsync': raise OSError(eno,'directory fsync')
+                        return real_sync(fd)
+                    with mock.patch.object(self.m.os,'replace',side_effect=replace), \
+                            mock.patch.object(self.m.os,'open',side_effect=op), \
+                            mock.patch.object(self.m.os,'fsync',side_effect=sync):
+                        self.assertEqual(self.m._write_atomic(path,candidate),expected)
+                    self.assertTrue(published[0])
+                    self.assertEqual(self.load_ledger('N')['changed'],[operation,eno])
+
+        # Early unverified outcomes survive S10 success; failed precommit sync aborts.
+        for first, expected in (('SYNC_UNSUPPORTED',13),('SYNC_FAILED',11)):
+            fresh = os.path.join(self.tmp,first,'nested','L.json')
+            seen = []
+            def outcome(d):
+                seen.append((d,os.path.isfile(fresh)))
+                return first if len(seen)==1 else 'SYNC_OK'
+            with mock.patch.object(self.m,'_sync_dir',side_effect=outcome):
+                self.assertEqual(self.m._write_atomic(fresh,{'items':[]}),expected)
+            if first=='SYNC_UNSUPPORTED':
+                self.assertGreater(len(seen),1)
+                self.assertTrue(os.path.isfile(fresh))
+            else:
+                self.assertEqual(len(seen),1)
+                self.assertFalse(os.path.exists(fresh))
+
+    def test_p5n_isolated_import_does_not_write_sibling_bytecode(self):
+        bundle = os.path.join(self.tmp, 'bundle')
+        os.mkdir(bundle)
+        for name in ('javis_intake.py','javis_lock.py'):
+            shutil.copyfile(os.path.join(BIN,name),os.path.join(bundle,name))
+        with mock.patch.dict(globals(), TOOL=os.path.join(bundle,'javis_intake.py')):
+            self.rc(0,self.run_tool('add-item','--id','N','--item','isolated'),'isolated -I without -B')
+        self.assertFalse(os.path.exists(os.path.join(bundle,'__pycache__')))
+
+    def test_p5n_lock_is_nonblocking_and_released(self):
+        spec=importlib.util.spec_from_file_location('lock_for_intake_test',os.path.join(BIN,'javis_lock.py'))
+        lockmod=importlib.util.module_from_spec(spec);spec.loader.exec_module(lockmod)
+        with lockmod.FileLock(self.ledger_path('N')+'.write-lock',owner='test-holder'):
+            for argv in [('add-item','--id','N','--item','blocked'),
+                         ('pay','--id','N','--item-no','1','--evidence',EVIDENCE,'--artifact',DURABLE),
+                         ('defer','--id','N','--item-no','1','--reason',REASON,'--release-condition','later'),
+                         ('stamp','--id','N'),('open','--id','N','--instruction-file',self.instr)]:
+                with self.subTest(command=argv[0]):
+                    r=self.run_tool(*argv)
+                    self.rc(5,r,'writer held')
+                    self.assertIn('holder=',r.stderr)
+                    self.assertEqual(len(self.load_ledger('N')['items']),2)
+        self.rc(0,self.run_tool('add-item','--id','N','--item','after release'),'released')
+        self.assertEqual(len(self.load_ledger('N')['items']),3)
+
+    def test_p5n_residue_old_accepted_and_refused_writers_lose_new_commit(self):
+        """RESIDUE, deliberately still true: v1 never takes the new writer lock."""
+        fixture=os.path.join(TESTS_DIR,'fixtures','intake-v1-9dbea792.txt')
+        with open(fixture,'rb') as f: raw=f.read()
+        self.assertEqual(hashlib.sha256(raw).hexdigest()[:16],'9e312adebd6b3b20')
+        scope={'__name__':'pinned_v1','__file__':fixture}
+        exec(compile(raw,fixture,'exec'),scope)
+        for accepted in (True,False):
+            with self.subTest(old_branch='accepted' if accepted else 'refused'):
+                ev=self.event(); ev['evidence']='A '+EVIDENCE
+                led=self.load_ledger('N');led['items'][0]={'text':'one','payments':[ev]}
+                with open(self.ledger_path('N'),'w') as f:json.dump(led,f)
+                classify=scope['_item_state'];published=[]
+                def interleave(it,root_for_rel=None):
+                    self.args.evidence='B '+EVIDENCE
+                    self.assertEqual(self.m.cmd_pay(self.args),0)
+                    published.append(self.load_ledger('N')['items'][0]['payments'][-1]['evidence'])
+                    return classify(it,root_for_rel)
+                scope['_item_state']=interleave
+                args=copy.copy(self.args);args.evidence=EVIDENCE if accepted else 'no'
+                try: rc=scope['cmd_pay'](args)
+                finally:scope['_item_state']=classify
+                self.assertEqual(rc,0 if accepted else 1)
+                self.assertEqual(published,['B '+EVIDENCE])
+                remaining=self.load_ledger('N')['items'][0]['payments']
+                self.assertEqual(len(remaining),1,'residue unexpectedly changed: inspect old writer')
+                self.assertEqual(remaining[0]['evidence'],'A '+EVIDENCE)
+
+    def test_p5n_conflict_temporal_cases_and_severity(self):
+        ev=self.event()
+        for outcome in ('ABSENT','UNREADABLE','OK'):
+            mirror=dict(ev);mirror['payments']=[ev]
+            with mock.patch.object(self.m,'_probe',return_value=(outcome,None,None,13,None)):
+                st,why=self.m._item_state(mirror)
+            self.assertEqual(st,'CONFLICT',why)
+            self.assertEqual(json.loads(why)['legacy']['paid_at'],'t')
+            self.assertEqual(json.loads(why)['journal'],ev)
+        codes=[0,10,8,14,9,1,2,3,4,7]
+        for i,a in enumerate(codes):
+            for b in codes[i:]:
+                self.assertEqual(self.m._worse(a,b),b)
+                self.assertEqual(self.m._worse(b,a),b)
+        led=self.load_ledger('N');led['items']=[dict(ev,payments=[])];
+        with open(self.ledger_path('N'),'w') as f:json.dump(led,f)
+        for argv in [('status','--id','N'),('audit','--roots',self.pack)]:
+            result=self.run_tool(*argv);self.rc(14,result,'conflict '+argv[0])
+            for word in ('legacy','journal',EVIDENCE):self.assertIn(word,result.stdout)
 
 
 if __name__ == "__main__":

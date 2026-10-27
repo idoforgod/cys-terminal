@@ -29,7 +29,14 @@
                「검사되지 않음」이 아니라 「검사 불가능」이다. 0 과 반드시 구별된다.
   3  NO_LEDGER 이 레인에 접수 기록이 아예 없다. ★빈 대장을 「열린 것 없음」으로 읽지 않는다.
   4  DRIFT     기록된 지시 원문의 다이제스트가 재계산과 다르다(지시가 사후 변조·드리프트).
-  5  USAGE     사용법 오류.
+  5  USAGE     사용법 오류 또는 writer lock busy/unavailable.
+  9  UNRESOLVABLE  이 호스트에서 풀 수 없는 경로 이름 공간(파일 I/O 없음).
+ 10  EXEMPT    맨 문자열 증거: stat 으로 정규 파일 존재만 확인, 신원은 미확립. PAID 아님.
+ 11  NOT_COMMITTED  commit 전 저장 실패; 기존 대장은 그대로.
+ 12  COMMITTED/DURABILITY_UNCONFIRMED  교체 완료, 디렉터리 동기화 실패.
+ 13  COMMITTED/DURABILITY_UNVERIFIED  POSIX 동기화 미지원; 앞 단계의 미검증도 누적.
+ 14  CONFLICT  payments 와 v1 필드 공존; 수락 여부를 추정하지 않고 양쪽을 출력.
+     비 POSIX 디렉터리 동기화 부재: commit rc 0 + 필수 stderr 고지(open 의 의미 exit 는 별도).
   6  SELFTEST  self-test 실패.
   8  UNREADABLE★artifact 가 **있는데 읽히지 않는다**(open/read 가 OSError). ★CHANGED(1) 와 다른 사실이다 —
                읽지 못한 것은 바뀐 것이 아니고 지불의 무효도 아니다. 이 코드는 **열린 항목이 없고** 판독 불가만
@@ -59,6 +66,10 @@
   intake selftest
 """
 import argparse
+import copy
+import functools
+import importlib.util
+import tempfile
 import errno
 import hashlib
 import json
@@ -71,7 +82,7 @@ import time
 
 MIN_EVIDENCE_CHARS = 40      # 지불로 인정하는 증거 최소 길이(문자) — "했다"·"ok" 불통과
 MIN_REASON_CHARS = 20        # 보류 사유 최소 길이
-SCHEMA = 1
+SCHEMA = 2
 ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
 
 EXIT_PAID, EXIT_OPEN, EXIT_NO_DENOM, EXIT_NO_LEDGER, EXIT_DRIFT, EXIT_USAGE, EXIT_SELFTEST = 0, 1, 2, 3, 4, 5, 6
@@ -90,15 +101,12 @@ EXIT_UNATTRIB = 7
 #   신원이 아니다(읽을 수 있는 sha 가 있어야 신원이다).
 EXIT_UNREADABLE = 8
 
-_TAG = {EXIT_PAID: "PAID", EXIT_OPEN: "OPEN", EXIT_NO_DENOM: "NO_DENOM", EXIT_NO_LEDGER: "NO_LEDGER",
-        EXIT_DRIFT: "DRIFT", EXIT_USAGE: "USAGE", EXIT_SELFTEST: "SELFTEST",
-        EXIT_UNATTRIB: "UNATTRIBUTED", EXIT_UNREADABLE: "UNREADABLE"}
-# ★심각도 순서 — 숫자 크기가 아니다. 종전 `max(worst, rc)` 는 0<1<2<3<4<7 이 뜻의 순서와 우연히 같아서
-#   맞았지만, 8 을 그 자리에 넣으면 ★판독 불가 한 건이 **열린 항목**(1)을 가린다(여러 대장을 합산할 때).
-#   ⇒ 뜻의 순서를 명시한다: PAID < UNREADABLE < OPEN < NO_DENOM < NO_LEDGER < DRIFT < UNATTRIBUTED.
-#   기존 코드쌍의 판정은 하나도 바뀌지 않는다(그 여섯의 상대 순서가 그대로다).
-_SEVERITY = {EXIT_PAID: 0, EXIT_UNREADABLE: 1, EXIT_OPEN: 2, EXIT_NO_DENOM: 3,
-             EXIT_NO_LEDGER: 4, EXIT_DRIFT: 5, EXIT_UNATTRIB: 6}
+EXIT_UNRESOLVABLE, EXIT_EXEMPT = 9, 10
+EXIT_NOT_COMMITTED, EXIT_COMMITTED_UNCONFIRMED, EXIT_COMMITTED_UNVERIFIED, EXIT_CONFLICT = 11, 12, 13, 14
+_TAG = dict(enumerate(('PAID', 'OPEN', 'NO_DENOM', 'NO_LEDGER', 'DRIFT', 'USAGE', 'SELFTEST',
+                      'UNATTRIBUTED', 'UNREADABLE', 'UNRESOLVABLE', 'EXEMPT', 'NOT_COMMITTED',
+                      'COMMITTED/DURABILITY_UNCONFIRMED', 'COMMITTED/DURABILITY_UNVERIFIED', 'CONFLICT')))
+_SEVERITY = {code: rank for rank, code in enumerate((0, 10, 8, 14, 9, 1, 2, 3, 4, 7))}
 
 
 def _tag(rc):
@@ -209,13 +217,207 @@ def _now():
     return time.strftime("%Y-%m-%dT%H:%M:%S%z")
 
 
-def _write_atomic(path, obj):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp.%d" % os.getpid()
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(obj, fh, ensure_ascii=False, indent=1)
-        fh.write("\n")
-    os.replace(tmp, path)
+SYNC_OK, SYNC_UNSUPPORTED, SYNC_FAILED, SYNC_NONPOSIX = 'SYNC_OK', 'SYNC_UNSUPPORTED', 'SYNC_FAILED', 'SYNC_NONPOSIX'
+_AUTO_PRIOR = object()
+
+
+def _sync_dir(path):
+    if os.name != 'posix':
+        return SYNC_NONPOSIX
+    unverified = (errno.EACCES, errno.EPERM, errno.EINVAL, errno.ENOTSUP,
+                  getattr(errno, 'EOPNOTSUPP', errno.ENOTSUP), errno.ENOSYS)
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+    except OSError as exc:
+        return SYNC_UNSUPPORTED if exc.errno in unverified else SYNC_FAILED
+    outcome = SYNC_OK
+    try:
+        os.fsync(fd)
+    except OSError as exc:
+        outcome = SYNC_UNSUPPORTED if exc.errno in unverified else SYNC_FAILED
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            outcome = SYNC_FAILED
+    return outcome
+
+
+def _make_dirs(path):
+    """Return new directories in parent-first order; caller syncs each new entry's parent."""
+    missing, cursor = [], os.path.abspath(path)
+    while not os.path.isdir(cursor):
+        missing.append(cursor)
+        parent = os.path.dirname(cursor)
+        if parent == cursor:
+            raise OSError('no existing ancestor for '+path)
+        cursor = parent
+    created = []
+    for d in reversed(missing):
+        try:
+            os.mkdir(d)
+        except FileExistsError:
+            if not os.path.isdir(d):
+                raise
+        else:
+            created.append(d)
+    return created
+
+
+def _write_atomic(path, obj, prior=_AUTO_PRIOR, created_dirs=()):
+    """One commit point; preimages are retained, never an automatic recovery promise."""
+    trail, leftovers = [], []
+    committed = False
+    backup = None
+    def sync(d):
+        outcome = _sync_dir(d)
+        trail.append((d, outcome))
+        if outcome == SYNC_FAILED and not committed:
+            raise OSError('directory sync failed before commit: '+d)
+    def temp_bytes(d, prefix, body):
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=prefix)
+        leftovers.append(tmp)
+        with os.fdopen(fd, 'wb') as f:
+            f.write(body)
+            f.flush()
+            os.fsync(f.fileno())
+        return tmp
+    try:
+        if prior is _AUTO_PRIOR:
+            try:
+                with open(path, 'rb') as f: prior = f.read()
+            except FileNotFoundError:
+                prior = None
+        d = os.path.dirname(os.path.abspath(path))
+        # Only this call's new directory entries need parent syncs. Pre-existing
+        # ancestors may be search-only and are not prerequisites for publication.
+        created = list(created_dirs) + _make_dirs(d)
+        for parent in sorted({os.path.dirname(x) for x in created} - {d}):
+            sync(parent)
+        sync(d)  # S3P: establish our ledger directory before any publication.
+        if prior is not None:
+            backup_dir = os.path.join(d, '.preimage')
+            _make_dirs(backup_dir)
+            sync(d)  # S3: publish the preimage directory's entry first.
+            stamp = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
+            base = os.path.join(backup_dir, '%s.%s-%d' % (os.path.basename(path), stamp, os.getpid()))
+            backup = None
+            for n in range(1000):
+                candidate = base + (('-'+str(n)) if n else '')
+                try:
+                    # Reserve exclusively: never replace someone else's preimage.
+                    fd = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                    os.close(fd)
+                    backup = candidate
+                    break
+                except FileExistsError:
+                    continue
+            if backup is None:
+                raise OSError('preimage name space exhausted')
+            tmp = temp_bytes(backup_dir, '.preimage-', prior)
+            os.replace(tmp, backup)
+            leftovers.remove(tmp)
+            sync(backup_dir)  # S6: preimage entry before ledger replacement.
+            with open(backup, 'rb') as f:
+                if _digest(f.read()) != _digest(prior):
+                    raise OSError('preimage mismatch; ledger untouched')
+        body = (json.dumps(obj, ensure_ascii=False, indent=1)+'\n').encode('utf-8')
+        tmp = temp_bytes(d, '.intake-', body)
+        os.replace(tmp, path)
+        leftovers.remove(tmp)
+        committed = True
+        sync(d)  # S10: failures here describe the already committed ledger.
+    except (OSError, ValueError, TypeError) as exc:
+        rc = EXIT_COMMITTED_UNCONFIRMED if committed else EXIT_NOT_COMMITTED
+        print('%s: %s; owned temporary paths=%s; preimage=%s; sync=%s' % (_tag(rc), exc, leftovers, backup, trail), file=sys.stderr)
+        return rc
+    if any(outcome == SYNC_FAILED for _, outcome in trail):
+        print('COMMITTED/DURABILITY_UNCONFIRMED; sync=%s' % trail, file=sys.stderr)
+        return EXIT_COMMITTED_UNCONFIRMED
+    if any(outcome == SYNC_NONPOSIX for _, outcome in trail):
+        print('COMMITTED/DURABILITY_UNVERIFIED (platform has no directory sync)', file=sys.stderr)
+        return EXIT_PAID
+    if any(outcome != SYNC_OK for _, outcome in trail):
+        print('COMMITTED/DURABILITY_UNVERIFIED; sync=%s' % trail, file=sys.stderr)
+        return EXIT_COMMITTED_UNVERIFIED
+    return EXIT_PAID
+
+
+def _lock_module():
+    # -I omits the script directory and ignores the bytecode environment setting.
+    # Seal before explicitly loading the sibling, including callers without -B.
+    sys.dont_write_bytecode = True
+    spec = importlib.util.spec_from_file_location('intake_writer_lock', os.path.join(os.path.dirname(__file__), 'javis_lock.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _writer(fn):
+    @functools.wraps(fn)
+    def call(a):
+        if fn.__name__ == 'cmd_open' and not ID_RE.match(a.id or ''):
+            print('USAGE invalid ledger id', file=sys.stderr)
+            return EXIT_USAGE
+        path = _path(_root(a.root), a.id)
+        lk = None
+        locked = False
+        try:
+            # Administrative lock metadata may be written; rejected payments never
+            # write the ledger, its preimage, or a candidate temporary file.
+            a._created_dirs = _make_dirs(os.path.dirname(path))
+            try:
+                locks = _lock_module()
+            except (ImportError, OSError) as exc:
+                print('USAGE writer lock unavailable: %s' % exc, file=sys.stderr)
+                return EXIT_USAGE
+            lk = locks.FileLock(path+'.write-lock', owner='intake:'+fn.__name__, blocking=False)
+            result = lk.acquire()
+            if result != locks.ACQUIRED:
+                print('USAGE writer lock %s: %s holder=%s' % (result, lk.detail, lk.blocked_by), file=sys.stderr)
+                return EXIT_USAGE
+            locked = True
+            try:
+                with open(path, 'rb') as f: a._prior = f.read()
+            except FileNotFoundError:
+                a._prior = None
+            if a._prior is not None and fn.__name__ != 'cmd_open':
+                a._loaded = json.loads(a._prior.decode('utf-8'))
+                if (not isinstance(a._loaded, dict) or not isinstance(a._loaded.get('items'), list)
+                        or any(not isinstance(it, dict) for it in a._loaded['items'])):
+                    raise ValueError('ledger object/items malformed')
+            else:
+                a._loaded = None
+            return fn(a)
+        except (OSError, ValueError, UnicodeError) as exc:
+            rc = EXIT_DRIFT if locked else EXIT_USAGE
+            print('%s ledger/lock read failed: %s' % (_tag(rc), exc), file=sys.stderr)
+            return rc
+        finally:
+            if lk is not None:
+                lk.release()
+    return call
+
+
+def _commit(a, path, led):
+    return _write_atomic(path, led, prior=a._prior, created_dirs=a._created_dirs)
+
+
+def _append_event(led, index, event):
+    out = copy.deepcopy(led)
+    item = out['items'][index]
+    legacy = 'payments' not in item
+    if legacy:
+        item['payments'] = []
+    if legacy or any(k in item for k in _MIRROR_KEYS):
+        payload = {k: copy.deepcopy(v) for k, v in item.items() if k != 'payments'}
+        item['payments'].append(dict(kind='legacy_snapshot', payload=payload, at=_now(),
+                                    provenance='v1 fields, acceptance unproven'))
+        for k in _MIRROR_KEYS:
+            item.pop(k, None)
+    item['payments'].append(event)
+    out['schema'] = SCHEMA
+    return out
 
 
 def _load(path):
@@ -390,108 +592,183 @@ def _win_temp_roots(env):
     return out
 
 
-def _arts(it):
-    """artifacts 를 (path, 기록된 sha16|None, 기록된 size|None, legacy) 목록으로 정규화.
-    legacy=True 는 지문 칸이 생기기 전의 기록(맨 문자열)뿐이다 — dict 기록은 지문 칸 이후의 것이다."""
-    out = []
-    for a in (it.get("artifacts") or []):
-        if isinstance(a, dict):
-            out.append((a.get("path"), a.get("sha256_16"), a.get("size"), False))
-        elif a:
-            out.append((a, None, None, True))
-    return out
+_MISSING = object()
+_MIRROR_KEYS = ('state', 'evidence', 'artifacts', 'paid_at', 'defer_reason',
+                'release_condition', 'deferred_at')
+
+
+def _resolvable(path):
+    """Reject foreign/ambiguous namespaces before stat, never resolve a legacy relative path."""
+    p = path.replace('/', '\\')
+    device = p.startswith(('\\\\?\\', '\\\\.\\'))
+    drive = bool(re.match(r'^[A-Za-z]:\\', p))
+    if os.name == 'nt':
+        if device:
+            rest = p[4:]
+            return bool(re.match(r'^[A-Za-z]:\\', rest) or rest.upper().startswith('UNC\\'))
+        return drive or p.startswith('\\\\')
+    return not (device or drive or p.startswith('\\\\') or path.startswith('//')) and path.startswith('/')
+
+
+def _artifact_valid(a, legacy):
+    if isinstance(a, str):
+        return legacy and bool(a.strip())
+    if not isinstance(a, dict) or not isinstance(a.get('path'), str) or not a['path'].strip():
+        return False
+    sha, size = a.get('sha256_16'), a.get('size')
+    if sha is not None and (not isinstance(sha, str) or re.fullmatch(r'[0-9a-fA-F]{16}', sha) is None):
+        return False
+    if size is not None and (type(size) is not int or size < 0):
+        return False
+    return legacy or (sha is not None and size is not None and type(a.get('ephemeral')) is bool)
+
+
+def _arts(it, legacy=True):
+    """Six-field projection; absent ephemeral stays distinct from null."""
+    return [(a, None, None, True, _MISSING, legacy) if isinstance(a, str) else
+            (a.get('path'), a.get('sha256_16'), a.get('size'), False,
+             a.get('ephemeral', _MISSING), legacy) for a in it.get('artifacts', [])]
+
+
+def _entry_valid(e):
+    if not isinstance(e, dict):
+        return False
+    def text(k):
+        return isinstance(e.get(k), str) and bool(e[k].strip())
+    if e.get('kind') == 'legacy_snapshot':
+        return isinstance(e.get('payload'), dict) and text('at') and text('provenance')
+    if e.get('kind') == 'pay':
+        return (e.get('state') == 'done' and isinstance(e.get('evidence'), str)
+                and isinstance(e.get('artifacts'), list) and text('paid_at')
+                and all(_artifact_valid(a, False) for a in e['artifacts']))
+    if e.get('kind') == 'defer':
+        return (e.get('state') == 'defer' and isinstance(e.get('defer_reason'), str)
+                and isinstance(e.get('release_condition'), str) and text('deferred_at'))
+    return False
+
+
+def _journal_state(entries):
+    if not isinstance(entries, list) or any(not _entry_valid(e) for e in entries):
+        return 'DRIFT', 'malformed payments entry; no fallback'
+    if not entries or entries[-1]['kind'] == 'legacy_snapshot':
+        return 'OPEN', 'no proven settlement after legacy_snapshot'
+    return _settlement_state(entries[-1], legacy=False)
 
 
 def _item_state(it, root_for_rel=None):
-    """(state, why) — 세 결말(PAID · OPEN · UNREADABLE) 중 하나와 그 사유. ★지불은 기계가 확인한다.
-    PAID       — 지불 확인: done 은 증거 + artifact 지문 대조 통과, defer 는 사유 + release_condition.
-    OPEN       — 지불 없음·무효: 증거 부족 · 바이트 변경(CHANGED) · 경로 부재(ABSENT) · 임시 경로뿐 · 그 밖의 state.
-    UNREADABLE — done 항목의 지문 기록 artifact 가 실존하나 읽히지 않는다(위 OPEN 사유가 없을 때만). 지불은 무효가
-                 아니며(감사는 지불로 센다) 신원만 재확인할 수 없다 — 감사 종료 코드는 EXIT_UNREADABLE(8)."""
-    st = (it.get("state") or "open").strip()
-    if st == "done":
-        ev = (it.get("evidence") or "").strip()
-        if len(ev) < MIN_EVIDENCE_CHARS:
-            return "OPEN", "evidence %d자 < 최소 %d자" % (len(ev), MIN_EVIDENCE_CHARS)
-        arts = _arts(it)
-        present = [a for a in arts if a[0] and os.path.exists(a[0])]
-        # ★지문 없는 새 기록은 지불을 싣지 않는다(2026-10-20 · B-328 #8 리뷰 R1). 종전은 지문을 얻지 못한 dict 기록
-        #   (디렉터리·읽기 불가·지불 시점 부재)이 맨 문자열 면제로 떨어져 실존만으로 PAID 였다 — 거부된 부재 경로에
-        #   뒤늦게 파일이 생겨도 재지불 없이 PAID 가 됐다. 면제는 지문 칸 이전의 맨 문자열 기록(legacy)에만 준다.
-        unproven = [a for a in present if not a[3] and not a[1]]
-        alive = [a for a in present if a[3] or a[1]]
-        durable = [a for a in alive if not _ephemeral(a[0])]
-        # ★지문 대조 — 기록된 지문이 있는 artifact 는 매번 재계산해 맞춘다.
-        #   ★세 결말을 가른다(WP10 · CEO 지시 2026-10-23): 읽혔는데 지문이 다르면 CHANGED, 경로가 사라졌으면
-        #   ABSENT, 있는데 읽히지 않으면 UNREADABLE. 종전은 뒤의 둘이 첫째로 접혀 재지불 처방을 받았다.
-        drifted, unfingerprinted, unreadable, vanished = [], [], [], []
-        for path, rec_sha, rec_size, _legacy in alive:
-            if not rec_sha:
-                unfingerprinted.append(path)
-                continue
-            try:
+    if not isinstance(it, dict):
+        return 'DRIFT', 'item is not an object'
+    if 'payments' not in it:
+        return _settlement_state(it, legacy=True)
+    entries = it['payments']
+    if not isinstance(entries, list):
+        return 'DRIFT', 'payments is not an array'
+    journal_state, journal_why = _journal_state(entries)
+    if journal_state == 'DRIFT':
+        return journal_state, journal_why
+    if any(k in it for k in _MIRROR_KEYS):
+        mirror = {k: v for k, v in it.items() if k != 'payments'}
+        current, why = _settlement_state(mirror, legacy=True)
+        shape = (mirror.get('state') == 'done' and isinstance(mirror.get('evidence'), str)
+                 and len(mirror['evidence'].strip()) >= MIN_EVIDENCE_CHARS
+                 and isinstance(mirror.get('artifacts'), list)
+                 and any(isinstance(a, dict) and _artifact_valid(a, True)
+                         and a.get('sha256_16') and not _ephemeral(a['path']) for a in mirror['artifacts']))
+        if mirror.get('state') == 'defer':
+            shape = (isinstance(mirror.get('defer_reason'), str) and len(mirror['defer_reason'].strip()) >= MIN_REASON_CHARS
+                     and isinstance(mirror.get('release_condition'), str) and bool(mirror['release_condition'].strip()))
+        detail = dict(legacy=mirror, legacy_write_shape='accepted shape' if shape else 'not an accepted shape',
+                      acceptance='unproven', legacy_current=dict(state=current, why=why),
+                      journal=entries[-1] if entries else None,
+                      journal_current=dict(state=journal_state, why=journal_why))
+        return 'CONFLICT', json.dumps(detail, ensure_ascii=False, sort_keys=True)
+    return journal_state, journal_why
+
+
+def _settlement_state(it, legacy=True):
+    st = it.get('state', 'open')
+    if not isinstance(st, str):
+        return 'DRIFT', 'state must be a string'
+    if st == 'defer':
+        rs, rc = it.get('defer_reason', ''), it.get('release_condition', '')
+        if not isinstance(rs, str) or not isinstance(rc, str):
+            return 'DRIFT', 'defer fields must be strings'
+        if len(rs.strip()) < MIN_REASON_CHARS:
+            return 'OPEN', 'defer_reason %d자 < 최소 %d자' % (len(rs.strip()), MIN_REASON_CHARS)
+        if not rc.strip():
+            return 'OPEN', 'release_condition 공백 — 항목마다 무엇이 막는지 대야 한다'
+        return 'PAID', 'defer: 사유 %d자 + release_condition 선언' % len(rs.strip())
+    if st != 'done':
+        return 'OPEN', 'state=%s (지불 없음)' % st
+    ev = it.get('evidence', '')
+    if not isinstance(ev, str):
+        return 'DRIFT', 'evidence must be a string'
+    records = it.get('artifacts', [])
+    if not isinstance(records, list) or any(not _artifact_valid(a, legacy) for a in records):
+        return 'DRIFT', 'malformed artifact record'
+    if len(ev.strip()) < MIN_EVIDENCE_CHARS:
+        return 'OPEN', 'evidence %d자 < 최소 %d자' % (len(ev.strip()), MIN_EVIDENCE_CHARS)
+    arts = _arts(it, legacy)
+    classes, unreadable, drifted, vanished = [], [], [], []
+    for path, rec_sha, rec_size, bare, ephemeral, old in arts:
+        if not _resolvable(path):
+            classes.append('UNRESOLVABLE'); continue
+        eph = _ephemeral(path) if old else ephemeral
+        if not bare and not rec_sha:
+            classes.append('UNPROVEN'); continue
+        try:
+            if bare:
+                stt = _STAT(path)
+                kind = PROBE_OK if stat.S_ISREG(stt.st_mode) else PROBE_NOT_REGULAR
+                cur_sha, cur_size, eno, flags = None, stt.st_size, None, getattr(stt, 'st_flags', None)
+            else:
                 kind, cur_sha, cur_size, eno, flags = _probe(path)
-            except Exception:
-                # ★R1 수리: `_probe` 는 OSError 만 분류한다. 그 밖의 예외(거대 artifact 의 MemoryError 등)는
-                #   종전 `_fp` 의 `except Exception` 이 삼켜 「지문 불일치 = 변경」이 됐다 — 실측(R1-02 로그):
-                #   수리 직후 바이트에서는 그 예외가 `_item_state` 밖으로 터져 ★대장 하나가 status·audit 전체를
-                #   죽였다. 한 항목의 판독 실패가 다른 대장의 판정을 삼키게 두지 않는다(종전 결말로 되돌린다).
-                kind, cur_sha, cur_size, eno, flags = PROBE_NOT_REGULAR, None, None, None, None
-            if kind == PROBE_UNREADABLE:
-                unreadable.append((path, rec_sha, rec_size, cur_size, eno, flags))
-            elif kind == PROBE_ABSENT:
-                vanished.append((path, rec_sha, rec_size))
-            elif cur_sha != rec_sha:
-                # OK 이면서 지문이 다르다 = 진짜 변경. NOT_REGULAR·분류 불가도 여기로 떨어진다(종전과 같은 결말).
-                drifted.append((path, rec_sha, cur_sha, rec_size, cur_size))
-        if drifted:
-            p0, rs, cs, rz, cz = drifted[0]
-            return "OPEN", ("★증거 바이트가 변경됐다(%d건) — %s: 기록 %s/%sB → 현재 %s/%sB. "
-                            "⛔덧붙임도 변경이다 — 그 절만 떠낸 새 파일로 재지불하라%s"
-                            % (len(drifted), os.path.basename(p0), rs, rz, cs, cz,
-                               (" · (그 밖에 판독 불가 %d건 — 그쪽은 재지불 대상이 아니다)" % len(unreadable))
-                               if unreadable else ""))
-        if vanished:
-            p0, rs, rz = vanished[0]
-            return "OPEN", ("★지불 뒤 artifact 가 사라졌다(%d건) — %s: 기록 %s/%sB 였던 경로가 지금 부재다. "
-                            "재지불하거나 보류 사유를 대라(⛔변경이 아니다 — 경로 부재다)"
-                            % (len(vanished), os.path.basename(p0), rs, rz))
-        if alive and not durable:
-            return "OPEN", ("artifacts %d건이 전부 ★임시 경로다(%s) — 그 디렉터리가 청소되면 지불이 "
-                            "사라진다. 내구 경로 1건 이상을 대라" % (len(alive), str(alive[0][0])[:48]))
-        if not alive:
-            if not arts:
-                return "OPEN", "artifacts 0건 — 경로를 적는 것으로는 지불이 아니다"
-            if unproven:
-                return "OPEN", ("artifacts %d건이 지불 시점에 지문을 얻지 못했다(%s) — 디렉터리·읽기 불가·FIFO·"
-                                "부재였던 경로는 지불이 아니다. 정규 파일로 재지불하라"
-                                % (len(unproven), str(unproven[0][0])[:48]))
-            return "OPEN", "artifacts %d건 전부 디스크 부재(%s)" % (len(arts), str(arts[0][0])[:60])
-        tag = "지문 %d/%d 대조" % (len(alive) - len(unfingerprinted) - len(unreadable), len(alive))
-        if unfingerprinted:
-            tag += " · ⚠지문 없음 %d(소급 검증 불가)" % len(unfingerprinted)
-        if unproven:
-            tag += " · 지문 못 얻은 %d 제외" % len(unproven)
-        if unreadable:
-            # ★지불은 무효가 아니다 — 신원 재확인이 불가능할 뿐이다. ⛔재지불 처방을 찍지 않는다(그것은 증거를
-            #   지어내라는 지시다). 크기 일치는 정황으로만 말한다.
-            p0, rs, rz, cz, eno, flags = unreadable[0]
-            return "UNREADABLE", ("★판독 불가 %d건 — %s: %s. 기록 지문 %s. ⛔지불은 무효가 아니다 — 읽을 수 "
-                                  "있는 sha 없이는 신원이 증명되지 않을 뿐이고, 새 증거를 지어내 메울 일이 "
-                                  "아니다(이 줄은 어떤 처방도 요구하지 않는다). · %s"
-                                  % (len(unreadable), os.path.basename(p0),
-                                     _unreadable_note(eno, cz, rz, flags), rs, tag))
-        return "PAID", "evidence %d자 + artifact 실존 %d/%d(내구 %d) · %s" % (
-            len(ev), len(alive), len(arts), len(durable), tag)
-    if st == "defer":
-        rs = (it.get("defer_reason") or "").strip()
-        rc = (it.get("release_condition") or "").strip()
-        if len(rs) < MIN_REASON_CHARS:
-            return "OPEN", "defer_reason %d자 < 최소 %d자" % (len(rs), MIN_REASON_CHARS)
-        if not rc:
-            return "OPEN", "release_condition 공백 — 항목마다 무엇이 막는지 대야 한다"
-        return "PAID", "defer: 사유 %d자 + release_condition 선언" % len(rs)
-    return "OPEN", "state=%s (지불 없음)" % st
+        except FileNotFoundError:
+            kind, cur_sha, cur_size, eno, flags = PROBE_ABSENT, None, None, None, None
+        except OSError as exc:
+            kind, cur_sha, cur_size, eno, flags = PROBE_UNREADABLE, None, None, exc.errno, None
+        except Exception:
+            kind, cur_sha, cur_size, eno, flags = PROBE_NOT_REGULAR, None, None, None, None
+        if kind == PROBE_UNREADABLE:
+            classes.append('STAT_DENIED' if bare else 'UNREADABLE')
+            unreadable.append((path, rec_sha, rec_size, cur_size, eno, flags))
+        elif kind == PROBE_ABSENT:
+            cl = 'EPHEMERAL_EXPIRED' if not old and rec_sha and ephemeral is True else 'LEGACY_TEMP_GONE' if old and eph else 'ABSENT'
+            classes.append(cl)
+            if cl != 'EPHEMERAL_EXPIRED': vanished.append((path, rec_sha, rec_size))
+        elif kind == PROBE_NOT_REGULAR or (not bare and cur_sha != rec_sha):
+            classes.append('CHANGED' if kind == PROBE_OK else 'NOT_REGULAR')
+            drifted.append((path, rec_sha, cur_sha, rec_size, cur_size))
+        else:
+            classes.append(('EXEMPT_' if bare else 'VERIFIED_') + ('EPHEMERAL' if eph else 'DURABLE'))
+    if not arts:
+        return 'OPEN', 'artifacts 0건 — 경로를 적는 것으로는 지불이 아니다'
+    if drifted:
+        p0, rs, cs, rz, cz = drifted[0]
+        return 'OPEN', ('★증거 바이트가 변경됐다(%d건) — %s: 기록 %s/%sB → 현재 %s/%sB. '
+                        '⛔덧붙임도 변경이다 — 그 절만 떠낸 새 파일로 재지불하라%s' %
+                       (len(drifted), os.path.basename(p0), rs, rz, cs, cz,
+                        (' · (그 밖에 판독 불가 %d건 — 그쪽은 재지불 대상이 아니다)' % len(unreadable)) if unreadable else ''))
+    if vanished:
+        return 'OPEN', '★지불 뒤 artifact 가 사라졌다(%d건) — 디스크 부재 (⛔변경이 아니다 — 경로 부재다)' % len(vanished)
+    if 'UNPROVEN' in classes:
+        return 'OPEN', '지불 시점에 지문을 얻지 못했다 — 디스크 부재·디렉터리·읽기 불가·FIFO는 지불이 아니다'
+    if 'UNRESOLVABLE' in classes:
+        return 'UNRESOLVABLE', 'foreign or relative artifact namespace; no I/O'
+    if unreadable:
+        p0, rs, rz, cz, eno, flags = unreadable[0]
+        return 'UNREADABLE', ('★판독 불가 %d건 — %s: %s. 기록 지문 %s. ⛔지불은 무효가 아니다 — 읽을 수 '
+                             '있는 sha 없이는 신원이 증명되지 않을 뿐이고, 새 증거를 지어내 메울 일이 '
+                             '아니다(이 줄은 어떤 처방도 요구하지 않는다).' %
+                             (len(unreadable), os.path.basename(p0), _unreadable_note(eno, cz, rz, flags), rs))
+    if 'EPHEMERAL_EXPIRED' in classes and 'VERIFIED_DURABLE' not in classes:
+        return 'OPEN', 'expired ephemeral proof requires verified durable proof'
+    if not any(c.endswith('_DURABLE') for c in classes):
+        return 'OPEN', 'artifacts 전부 ★임시 경로다 — 내구 경로 1건 이상을 대라'
+    counts = ', '.join('%s=%d' % (c, classes.count(c)) for c in sorted(set(classes)))
+    if 'VERIFIED_DURABLE' in classes:
+        return 'PAID', 'evidence %d자 + artifact 지문 대조 · %s' % (len(ev.strip()), counts)
+    return 'EXEMPT', '지문 없음 — 신원 미확립(소급 검증 불가) · '+counts
 
 
 def _evaluate(led):
@@ -510,26 +787,23 @@ def _evaluate(led):
     if not items:
         return EXIT_NO_DENOM, ["NO_DENOM  지시는 기록됐으나 항목 목록이 0건 — 분모가 없다"
                                " (★통과가 아니다: 검사 불가능이다)"]
-    paid, open_, unread = [], [], []
+    buckets = {name: [] for name in ('PAID', 'OPEN', 'UNREADABLE', 'UNRESOLVABLE', 'EXEMPT', 'CONFLICT', 'DRIFT')}
+    codes = {name: code for code, name in _TAG.items()}
+    worst = EXIT_PAID
     for i, it in enumerate(items, 1):
         state, why = _item_state(it)
-        row = "  %-5s #%-3d %s  [%s]" % (state, i, (it.get("text") or "")[:72], why)
-        (open_ if state == "OPEN" else unread if state == "UNREADABLE" else paid).append(row)
-    # ★판독 불가 항목은 **지불에 센다**(지불은 무효가 아니다) — 숨기지 않고 그 수를 따로 말한다.
-    lines.append("접수 %d · 지불 %d · 열림 %d%s  (대장 %s · 지시 sha %s)"
-                 % (len(items), len(paid) + len(unread), len(open_),
-                    (" · ★판독 불가 %d(지불 유효 · 신원 재확인 불가)" % len(unread)) if unread else "",
-                    led.get("id"), actual[:16]))
-    lines.extend(open_)
-    lines.extend(unread)
-    lines.extend(paid)
-    if open_:
-        return EXIT_OPEN, lines
-    if unread:
-        return EXIT_UNREADABLE, lines
-    return EXIT_PAID, lines
+        text = it.get('text', '') if isinstance(it, dict) else ''
+        buckets[state].append("  %-5s #%-3d %s  [%s]" % (state, i, str(text)[:72], why))
+        worst = _worse(worst, codes[state])
+    lines.append("접수 %d · 지불 %d · 열림 %d · 판독 불가 %d · 면제 %d · 충돌 %d  (대장 %s · 지시 sha %s)" %
+                 (len(items), len(buckets['PAID'])+len(buckets['UNREADABLE']), len(buckets['OPEN']),
+                  len(buckets['UNREADABLE']),len(buckets['EXEMPT']),len(buckets['CONFLICT']),led.get('id'),actual[:16]))
+    for state in ('DRIFT','OPEN','UNRESOLVABLE','CONFLICT','UNREADABLE','EXEMPT','PAID'):
+        lines.extend(buckets[state])
+    return worst, lines
 
 
+@_writer
 def cmd_open(a):
     root = _root(a.root)
     if not ID_RE.match(a.id or ""):
@@ -558,7 +832,9 @@ def cmd_open(a):
                         "bytes": len(raw), "from_file": os.path.abspath(a.instruction_file)},
         "items": [{"text": t, "state": "open", "added_at": _now()} for t in (a.item or [])],
     }
-    _write_atomic(p, led)
+    commit_rc = _commit(a, p, led)
+    if commit_rc:
+        return commit_rc
     rc, lines = _evaluate(led)
     print("OPENED %s  항목 %d건  →  %s" % (p, len(led["items"]), _tag(rc)))
     for l in lines:
@@ -566,15 +842,18 @@ def cmd_open(a):
     return rc
 
 
+@_writer
 def cmd_add_item(a):
     root = _root(a.root)
     p = _path(root, a.id)
     if not os.path.exists(p):
         print("NO_LEDGER  %s 없다" % p, file=sys.stderr)
         return EXIT_NO_LEDGER
-    led = _load(p)
+    led = copy.deepcopy(a._loaded)
     led.setdefault("items", []).append({"text": a.item, "state": "open", "added_at": _now()})
-    _write_atomic(p, led)
+    commit_rc = _commit(a, p, led)
+    if commit_rc:
+        return commit_rc
     print("ADDED #%d  %s" % (len(led["items"]), a.item[:72]))
     return EXIT_PAID
 
@@ -585,7 +864,7 @@ def _get(a):
     if not os.path.exists(p):
         print("NO_LEDGER  %s 없다" % p, file=sys.stderr)
         return None, None, EXIT_NO_LEDGER
-    led = _load(p)
+    led = copy.deepcopy(a._loaded)
     n = a.item_no
     if not (1 <= n <= len(led.get("items") or [])):
         print("USAGE  --item-no %d 는 1..%d 범위 밖" % (n, len(led.get("items") or [])), file=sys.stderr)
@@ -593,44 +872,48 @@ def _get(a):
     return led, p, None
 
 
-def cmd_pay(a):
+def _settle(a, event):
     led, p, err = _get(a)
     if err is not None:
         return err
-    it = led["items"][a.item_no - 1]
+    item = led['items'][a.item_no - 1]
+    if 'payments' in item and _journal_state(item['payments'])[0] == 'DRIFT':
+        print('DRIFT malformed existing journal', file=sys.stderr)
+        return EXIT_DRIFT
+    # A failed fingerprint is not a malformed persisted journal: it is a refused candidate.
+    if event['kind'] == 'pay' and any(not _artifact_valid(r, False) for r in event['artifacts']):
+        print('REFUSED 지불 시점에 지문을 얻지 못했다 — 디스크 부재·디렉터리·읽기 불가·FIFO', file=sys.stderr)
+        return EXIT_OPEN
+    state, why = _settlement_state(event, legacy=False)
+    if state not in ('PAID', 'UNREADABLE'):
+        print('REFUSED #%d — %s' % (a.item_no, why), file=sys.stderr)
+        return EXIT_OPEN
+    candidate = _append_event(led, a.item_no-1, event)
+    rc = _commit(a, p, candidate)
+    if rc:
+        return rc
+    print('%s #%d %s' % ('PAID' if event['kind']=='pay' else 'DEFERRED', a.item_no, why))
+    return EXIT_PAID
+
+
+@_writer
+def cmd_pay(a):
     recs = []
     for path in (a.artifact or []):
-        sha, size = _fp(path)
-        recs.append({"path": path, "sha256_16": sha, "size": size})
-    it.update({"state": "done", "evidence": a.evidence, "artifacts": recs, "paid_at": _now()})
-    state, why = _item_state(it)
-    # ★거부는 OPEN 에만 (WP10): 지불 직후 그 파일이 읽히지 않게 되는 창에서 UNREADABLE 이 나올 수 있고, 그것은
-    #   「지불되지 않았다」가 아니다. 지불 시점에 읽히지 않았던 artifact 는 지문이 없어 종전처럼 OPEN 이다.
-    if state == "OPEN":
-        print("REFUSED  #%d 는 지불되지 않았다 — %s" % (a.item_no, why), file=sys.stderr)
-        _write_atomic(p, led)   # 기록은 남긴다(거부도 사실이다)
-        return EXIT_OPEN
-    _write_atomic(p, led)
-    print("PAID  #%d  %s" % (a.item_no, why))
-    return EXIT_PAID
+        path = os.path.abspath(path)
+        sha, size = _fp(path) if _resolvable(path) else (None, None)
+        recs.append(dict(path=path, sha256_16=sha, size=size, ephemeral=_ephemeral(path)))
+    return _settle(a, dict(kind='pay', state='done', evidence=a.evidence,
+                           artifacts=recs, paid_at=_now()))
 
 
+@_writer
 def cmd_defer(a):
-    led, p, err = _get(a)
-    if err is not None:
-        return err
-    it = led["items"][a.item_no - 1]
-    it.update({"state": "defer", "defer_reason": a.reason,
-               "release_condition": a.release_condition, "deferred_at": _now()})
-    state, why = _item_state(it)
-    _write_atomic(p, led)
-    if state == "OPEN":
-        print("REFUSED  #%d 보류가 성립하지 않았다 — %s" % (a.item_no, why), file=sys.stderr)
-        return EXIT_OPEN
-    print("DEFERRED  #%d  %s" % (a.item_no, why))
-    return EXIT_PAID
+    return _settle(a, dict(kind='defer', state='defer', defer_reason=a.reason,
+                           release_condition=a.release_condition, deferred_at=_now()))
 
 
+@_writer
 def cmd_stamp(a):
     """귀속 없는 대장에 이 좌석을 기입한다. ★다른 좌석의 대장을 가져가지 못하게 --id 를 요구한다."""
     root = _root(a.root)
@@ -638,7 +921,7 @@ def cmd_stamp(a):
     if not os.path.exists(p):
         print("NO_LEDGER  %s 없다" % p, file=sys.stderr)
         return EXIT_NO_LEDGER
-    led = _load(p)
+    led = copy.deepcopy(a._loaded)
     ob = led.get("opened_by")
     if isinstance(ob, dict) and (ob.get("surface") or ob.get("role")):
         print("USAGE  이미 귀속돼 있다(role=%s surface=%s) — 덮지 않는다"
@@ -649,7 +932,9 @@ def cmd_stamp(a):
         print("USAGE  CYS_ROLE·CYS_SURFACE_ID 가 둘 다 없다 — 좌석을 지어내지 않는다", file=sys.stderr)
         return EXIT_USAGE
     led["opened_by"] = {"role": role, "surface": sid, "pack": root, "stamped_at": _now()}
-    _write_atomic(p, led)
+    commit_rc = _commit(a, p, led)
+    if commit_rc:
+        return commit_rc
     print("STAMPED  %s  role=%s surface=%s" % (a.id, role, sid))
     return EXIT_PAID
 
@@ -700,7 +985,7 @@ def cmd_status(a):
         worst = EXIT_NO_LEDGER
     if a.json:
         print(json.dumps({"root": root, "worst_exit": worst, "ledgers": len(paths),
-                          "judged": judged}, ensure_ascii=False))
+                          "judged": judged, "details": out}, ensure_ascii=False))
     else:
         print("\n".join(out))
     return worst
@@ -733,7 +1018,7 @@ def cmd_audit(a):
             if rc != EXIT_PAID:
                 # ★판독 불가 줄도 떠낸다 — CEO 가 읽는 칸이 audit 이고, 그 줄이 errno·플래그·크기 대조를 싣는다.
                 rows.extend("      " + l.strip() for l in lines[1:]
-                            if l.strip().startswith(("OPEN", "UNREADABLE")))
+                            if l.strip().startswith(("OPEN", "UNREADABLE", "UNRESOLVABLE", "EXEMPT", "CONFLICT", "DRIFT")))
             worst = _worse(worst, rc)
     print("[intake audit] 루트 %d · 최악 exit %d (%s)"
           % (len(roots), worst, _tag(worst)))
@@ -765,12 +1050,12 @@ def cmd_selftest(_a):
     st, why = _item_state({"state": "done", "evidence": "가" * MIN_EVIDENCE_CHARS,
                            "artifacts": ["/nonexistent/path/zzz"]})
     chk(st == "OPEN", "실존하지 않는 artifact 가 지불로 읽혔다")
-    # ⒡ 실존 artifact + 충분한 증거 = 지불
+    # ⒡ 맨 문자열 내구 artifact + 증거 = EXEMPT (신원 미확립)
     #   ★검체를 고쳤다(2026-10-15): 종전은 `NamedTemporaryFile` 을 썼는데 그것은 **임시 경로**라
     #   새 규칙(⒡')과 충돌했다 — 자기검사가 그 충돌을 잡았다. 내구 경로 = 이 파일 자신.
     real = os.path.abspath(__file__)
     st, why = _item_state({"state": "done", "evidence": "가" * MIN_EVIDENCE_CHARS, "artifacts": [real]})
-    chk(st == "PAID", "실존 내구 artifact + 증거가 지불로 인정되지 않았다(%s)" % why)
+    chk(st == "EXEMPT", "맨 문자열 내구 artifact 가 EXEMPT 가 아니다(%s)" % why)
     # ⒡' ★임시 경로만인 지불은 지불이 아니다 (2026-10-15 · CEO 자기 적발)
     import tempfile as _tf
     _fh = _tf.NamedTemporaryFile(delete=False, dir=_tf.gettempdir())
