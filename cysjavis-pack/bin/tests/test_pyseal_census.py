@@ -268,6 +268,12 @@ REFERENCING_FILES = (  # 정렬 key=str(코드포인트 순 · LC_ALL=C sort 와
     #   python 서브프로세스를 하나도 띄우지 않는다(스폰 대상은 전부 `sh`/`dash`/`bash` 런처다) —
     #   따라서 새 python 진입점도 강제점도 아니다. 니들을 보유하는 이유는 단 하나, 프리루드의
     #   봉인(SEAL-1)이 훅 본체까지 **상속되는지 관측**하기 때문이다(PRELUDE-1b).
+    # ★0.14.55 P4 C-08 등재(WP12-B2 rotation probe 포팅 92044e48 로 유입).
+    #   **봉인 점검 결과(등재 = 이 선언)**: 이것은 **진짜 강제점**이다 — 주석·문서 언급이 아니라
+    #   `probe_rotation_bins` 셸 조각을 real bash 로 돌릴 때 자식 env 에 `PYTHONDONTWRITEBYTECODE="1"`
+    #   을 실제로 건다(`:1583`). 그 자식이 python 을 부르는 경로를 포함하므로 봉인이 그 실행에
+    #   **적용된다**. 따라서 니들 보유는 정상이며 이 등재가 맞다.
+    "cysjavis-pack/bin/tests/test_dept_name_guard.py",
     "cysjavis-pack/bin/tests/test_hook_launcher_split.py",
     # ★2026-10-06 0.14.44 WA 등재 — 브리지 스크립트 단독 실행 검체. **봉인 점검 결과(등재 = 이 선언)**:
     #   강제점이 아니라 **밀폐 env 를 짜는 한 줄**이다 — 검체가 `sys.executable` 로 `javis_hud_bridge.py` 를 띄울 때
