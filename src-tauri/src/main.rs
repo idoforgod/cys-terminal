@@ -7736,7 +7736,7 @@ fn rotation_shell_script() -> Result<String, String> {
         source.split_once(begin).and_then(|(_, rest)| rest.split_once(end)).map(|(body, _)| body)
             .ok_or_else(|| "new_daemon_blocked:pair:resolver-fragment-missing".to_string())
     };
-    Ok(format!("set -euo pipefail\n{}\n{}\nrotation_require_os app\nrotation_bind_bins\nprintf 'cys-rotation-pair\\t%s\\t%s\\n' \"$CYSD\" \"$CYS\"\n",
+    Ok(format!("set -euo pipefail\n{}\n{}\nrotation_require_os app\nrotation_bind_bins\nprintf '\\ncys-rotation-pair\\t%s\\t%s\\n' \"$CYSD\" \"$CYS\"\n",
         fragment("# WP12-ROTATION-PRELUDE-BEGIN", "# WP12-ROTATION-PRELUDE-END")?,
         fragment("# WP12-ROTATION-BIND-BEGIN", "# WP12-ROTATION-BIND-END")?))
 }
