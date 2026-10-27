@@ -7805,6 +7805,7 @@ impl Daemon {
                         recent.push_back(json!({
                             "ts": now_epoch(), "surface_id": surface_id,
                             "rule": rule.name, "line": safe_line,
+                            "evidence_kind": "terminal_pattern", "source": "pty_scrollback", "masked": true,
                             // 담화로 분류돼 **경보는 억제**된 항목임을 정직하게 표시한다.
                             // status 보드가 "경보"와 "인터록만"을 구분해 보일 수 있게 하는 유일한 필드.
                             "discourse": discourse,
@@ -7826,7 +7827,9 @@ impl Daemon {
                             "health.alert",
                             "health",
                             Some(surface_id),
-                            json!({"rule": rule.name, "line": safe_line, "masked": true}),
+                            json!({"rule": rule.name, "line": safe_line, "masked": true,
+                                   "evidence_kind": "terminal_pattern", "source": "pty_scrollback",
+                                   "surface_id": surface_id, "observed_at": now_epoch()}),
                         );
                     }
                     // T4-17 조치 바인딩 — 60초 창 내 threshold회 이상 매칭 시에만 발동
@@ -8438,9 +8441,12 @@ pub(crate) const HEALTH_MASK_OPEN: &str = "\u{2039}health-rule";
 /// 유한 시간에 끝난다(그 경우 잔여 매칭은 ⓑ 격리가 받는다).
 const MASK_PASS_CAP: usize = 8;
 
-/// ⓑ 경보 기계장치 식별자 — **우리가 만든 이름**만 넣는다(자연어 낱말 금지). 제3자 CLI 의
-/// 진짜 에러 출력에는 나타날 수 없는 문자열이라 위음성(진짜 고장 은폐) 위험이 없다.
+/// ⓑ Machinery identifiers: only our diagnostic names, never general limit prose.
+/// Require zero added corpus suppression; mixed real-error/machinery lines remain a limitation.
 const ALERT_MACHINERY_MARKERS: &[&str] = &[
+    "alert.rate_limit",
+    "alert.account_rate",
+    "rate_limit:master:",
     HEALTH_MASK_OPEN,
     "health.alert",
     "health.action",
@@ -8548,9 +8554,9 @@ pub(crate) fn alert_discourse_reason(
     None
 }
 
-/// ★T3-G2: 담화 사유 중 **우리 경보의 기계 에코**인가(= 새 정보량 0이라 인터록에도 남기지
-/// 않는 부류인가). `alert-machinery-token` 만 그렇다 — 표식이 전부 우리가 지은 식별자
-/// (`health.alert`·`watchdog.`·`"rule":`·마스크 토큰…)라 제3자 CLI 출력에 나타날 수 없다.
+/// ★T3-G2: does this discourse reason identify our reflected machinery?
+/// Only this class is dropped completely; additions require the measured-corpus differential.
+/// A genuine error concatenated onto a machinery line can still be suppressed.
 ///
 /// 나머지 셋은 **진짜 신호일 수 있다**:
 ///   · `narration-prose` — 한국어로 실패를 보고하는 현지화 CLI·복구 스크립트 출력
@@ -10881,6 +10887,109 @@ mod tests {
             .filter(|r| r.regex.is_match(line))
             .map(|r| r.name)
             .collect()
+    }
+
+    // P7: raw ingestion is exercised without binding a daemon socket.
+    struct P7HealthFixture(Arc<Daemon>);
+    impl Drop for P7HealthFixture {
+        fn drop(&mut self) { test_stop_daemon(&self.0); }
+    }
+
+    fn p7_ingest_case(d: &Arc<Daemon>, s: &Arc<Surface>, text: &str) -> Value {
+        d.recent_health.lock().unwrap().clear();
+        d.health_debounce.lock().unwrap().clear();
+        d.health_suppressed.lock().unwrap().clear();
+        let seq = d.bus.tail(1).first().and_then(|e| e["seq"].as_u64()).unwrap_or(0);
+        // Exercise CR and split CSI without adding an unrelated health trigger.
+        d.ingest_output(s, b"progress\r\x1b[");
+        d.ingest_output(s, b"2K\x1b[31m");
+        d.ingest_output(s, text.as_bytes());
+        d.ingest_output(s, b"\x1b[0m\r\n");
+        let ring = d.recent_health.lock().unwrap().iter().map(|v| {
+            let line = v["line"].as_str().unwrap();
+            assert!(default_health_rules().iter().all(|r| !r.regex.is_match(line)), "masked ring rematched: {line}");
+            json!([v["rule"],v["discourse"],v["line"]])
+        }).collect::<Vec<_>>();
+        let events = d.bus.replay_after(seq).into_iter().filter(|v| v["name"]=="health.alert").map(|v| {
+            let p=&v["payload"];
+            assert!(default_health_rules().iter().all(|r| !r.regex.is_match(p["line"].as_str().unwrap())));
+            json!([p["rule"],p["line"]])
+        }).collect::<Vec<_>>();
+        json!({"ring":ring,"events":events})
+    }
+
+    #[test]
+    fn p7_health_raw_corpus_pipeline() {
+        let (d,s)=health_probe_daemon("p7-corpus");
+        let fixture=P7HealthFixture(d);let d=&fixture.0;
+        // CI has portable fixtures. The release worker supplies the exact measured corpus
+        // through this explicit input; the log declares which population actually ran.
+        let external=std::env::var("P7_CORPUS_FILE").ok();
+        let text=external.as_ref().map(|p|std::fs::read_to_string(p).expect("P7 corpus read"))
+            .unwrap_or_else(|| ["You've hit your monthly spend limit";12].join("\n")+"\nYou have exhausted your quota on this model.\n{\"error\":{\"type\":\"rate_limit_error\"}}\n{\"error\":{\"status\":\"RESOURCE_EXHAUSTED\"}}\n  \"code\": 429,\n{\"error\":{\"code\":429,\"message\":\"x\"}}");
+        let rows=text.lines().collect::<Vec<_>>();assert_eq!(rows.len(),17);
+        let expected = std::env::var("P7_CORPUS_EXPECT").ok().map(|path| {
+            use sha2::Digest;
+            assert!(external.is_some(), "expected corpus requires measured corpus input");
+            let v: Value=serde_json::from_str(&std::fs::read_to_string(path).expect("P7 expectation read")).expect("P7 expectation JSON");
+            assert_eq!(v["corpus_sha256"],format!("{:x}",sha2::Sha256::digest(text.as_bytes())));
+            assert_eq!(v["baseline"],"363ff301");
+            assert_eq!(v["rows"].as_array().unwrap().len(),17);
+            v
+        });
+        println!("P7_CORPUS_POPULATION={}",if external.is_some(){"measured-11+truncated-1+agy-1+api-fixtures-4"}else{"portable-ci-fixtures"});
+        for (i,line) in rows.iter().enumerate(){
+            let outcome=p7_ingest_case(&d,&s,line);
+            if let Some(expected)=&expected {assert_eq!(outcome,expected["rows"][i],"P7 corpus differential row {}",i+1);}
+            println!("P7_CORPUS_ROW={} {}",i+1,outcome);
+        }
+        for (line,reason) in [("이것은 기록된 문장입니다 rate limit", "narration-prose"), ("rate_limited: truncated", "rule-name-mention")] {
+            let outcome=p7_ingest_case(&d,&s,line);
+            assert!(outcome["events"].as_array().unwrap().is_empty());
+            assert_eq!(outcome["ring"][0][1],reason);
+        }
+        // Actual CR/CSI concatenation, structural JSON and truncation/remask controls.
+        for line in ["Working...\x1b[2CHTTP 429 Too Many Requests", "the \"429\" alarm", "{\"status\":\"429\"}"] {
+            let outcome=p7_ingest_case(&d,&s,line);
+            if line.contains("the "){assert_eq!(outcome["events"].as_array().unwrap().len(),0);}
+            else {assert!(!outcome["events"].as_array().unwrap().is_empty());}
+        }
+        let long=format!("rate limit {}4291","x".repeat(183));
+        p7_ingest_case(&d,&s,&long);
+        // Existing limitation: an internal marker glued to a real error drops the entire line.
+        let mixed=p7_ingest_case(&d,&s,"health.alert HTTP 429 Too Many Requests");
+        assert!(mixed["ring"].as_array().unwrap().is_empty());
+        drop(s);
+    }
+
+    #[test]
+    fn p7_health_machinery_controls_drop_before_ring() {
+        let (d,s)=health_probe_daemon("p7-machinery");let fixture=P7HealthFixture(d);let d=&fixture.0;
+        for line in ["alert.rate_limit rate limit","alert.account_rate rate limit","rate_limit:master:7d rate limit"] {
+            assert!(default_health_rules().iter().any(|r|r.regex.is_match(line)));
+            let outcome=p7_ingest_case(&d,&s,line);
+            assert!(outcome["ring"].as_array().unwrap().is_empty(),"machinery entered ring: {outcome}");
+            assert!(outcome["events"].as_array().unwrap().is_empty());
+        }
+        drop(s);
+    }
+
+    #[test]
+    fn p7_health_provenance_and_debounce() {
+        let (d,s)=health_probe_daemon("p7-provenance");let fixture=P7HealthFixture(d);let d=&fixture.0;
+        let seq=d.bus.tail(1).first().and_then(|e|e["seq"].as_u64()).unwrap_or(0);
+        for _ in 0..2 {d.ingest_output(&s,b"HTTP 429 Too Many Requests\n");}
+        let recent=d.recent_health.lock().unwrap().clone();assert_eq!(recent.len(),2);
+        for v in &recent {
+            assert_eq!(v["evidence_kind"],"terminal_pattern");assert_eq!(v["source"],"pty_scrollback");
+            assert_eq!(v["masked"],true);assert!(v["ts"].is_number());assert_eq!(v["surface_id"],s.id);
+        }
+        let events=d.bus.replay_after(seq).into_iter().filter(|e|e["name"]=="health.alert").collect::<Vec<_>>();
+        assert_eq!(events.len(),1);
+        let p=&events[0]["payload"];assert_eq!(p["evidence_kind"],"terminal_pattern");
+        assert_eq!(p["source"],"pty_scrollback");assert_eq!(p["surface_id"],s.id);assert!(p["observed_at"].is_number());
+        assert!(p.get("used_pct").is_none());assert_eq!(p["line"],recent[0]["line"]);assert_eq!(p["masked"],true);
+        drop(s);
     }
 
     /// 격리 데몬 + 역할 surface 하나를 만들어 (daemon, surface) 반환. PTY는 `sleep 30`

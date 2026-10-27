@@ -1033,7 +1033,9 @@ def route_event(ev, world, coal, slug="main", now=None):
             world.set_flag(key, "rate_limited", 90)
         if coal.allow(name, key):
             frames.append({"t": "fx", "kind": "alert", "key": key, "rule": rule,
-                           "line": (p.get("line") or "")[:120]})
+                           "evidence_kind": p.get("evidence_kind") or "unknown",
+                           "source": p.get("source") or "unknown",
+                           "line": ("[terminal_pattern] masked terminal excerpt: " if p.get("evidence_kind") == "terminal_pattern" else "[unknown] masked excerpt: ") + (p.get("line") or "")[:120]})
     elif name == "master.deadman":
         if coal.allow(name, key):
             frames.append({"t": "fx", "kind": "deadman", "key": key,

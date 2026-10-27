@@ -18,6 +18,7 @@
 import os
 import sys
 import unittest
+from unittest.mock import patch
 
 SELF = os.path.dirname(os.path.abspath(__file__))                        # …/bin/tests
 BIN = os.path.dirname(SELF)                                              # cysjavis-pack/bin
@@ -131,6 +132,27 @@ class BacklogGate(unittest.TestCase):
     def test_backlog_master_idle_emits_no_fx(self):
         old = master_idle_event(ts=HB.time.time() - (HB.BACKLOG_FX_SECS + 5))
         self.assertEqual(route(HB.World(), old), [])
+
+
+class P7HealthEvidence(unittest.TestCase):
+    def test_terminal_evidence_survives_bridge(self):
+        ev={"name":"health.alert","surface_id":3,"timestamp":HB.time.time(),
+            "payload":{"rule":"rate_limited","line":"masked excerpt", "evidence_kind":"terminal_pattern","source":"pty_scrollback"}}
+        world=HB.World()
+        with patch.object(HB.time,"time",return_value=1000):
+            ev["timestamp"]=1000
+            frames=route(world,ev)
+        self.assertEqual(world.flags["main@surface:3"]["rate_limited"],1090)
+        self.assertEqual(frames[0].get("source"),"pty_scrollback")
+        self.assertEqual(frames[0].get("evidence_kind"),"terminal_pattern")
+        self.assertIn("[terminal_pattern]",frames[0]["line"])
+        self.assertNotIn("used_pct",frames[0])
+        ev["timestamp"]=HB.time.time()
+        ev["payload"].pop("evidence_kind");ev["payload"].pop("source")
+        legacy=route(HB.World(),ev)[0]
+        self.assertEqual(legacy["evidence_kind"],"unknown")
+        self.assertEqual(legacy["source"],"unknown")
+
 
 
 if __name__ == "__main__":

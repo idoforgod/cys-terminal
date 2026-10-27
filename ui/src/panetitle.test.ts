@@ -131,3 +131,16 @@ describe("WP13 ④ main.ts wiring — the display path really passes the number 
     expect(MAIN).toContain('titleEl.textContent = titleEl.dataset.stored ?? ""'); // entering edit mode
   });
 });
+
+import * as P7Titles from "./panetitle";
+describe("P7 metadata evidence", () => {
+  it("separates launch and observed paths without attributing an account mismatch", () => {
+    expect(typeof P7Titles.paneDetails).toBe("function");
+    const out=P7Titles.paneDetails({title:"my title",cwd:"/fixture/old",effective_cwd:"/fixture/new",account:{state:"mismatch",account_id:"wrong",profile:"observed-profile",recorded_profile:"recorded-profile"}});
+    expect(out).toContain("/fixture/old");expect(out).toContain("/fixture/new");expect(out).not.toContain("wrong");
+    expect(out).toContain("observed-profile");expect(out).toContain("recorded-profile");
+    expect(P7Titles.paneDetails({cwd:"/fixture/old",effective_cwd:null})).toContain("관측된 셸 경로: 확인 불가");
+    for (const bad of [null,undefined,42,[],{}]) expect(typeof P7Titles.paneDetails(bad)).toBe("string");
+    expect(MAIN).toContain("rt.titleEl.title = paneDetails(s)");
+  });
+});

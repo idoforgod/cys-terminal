@@ -12189,6 +12189,11 @@ class _W5Fake:
     def collect_report(self):
         if self.collect_raises:
             raise RuntimeError("주입된 내부 오류")
+        if self.rep is not None and self.ok:
+            self._sample = getattr(self, "_sample", self.rep.get("sampled_at", 0)) + 300
+            self.rep["sampled_at"] = self._sample
+            for m in self.rep.get("role_measurements") or []:
+                m["sampled_at"] = self._sample
         return self.ok, self.rep, self.err
 
     def emit(self, evt_type, fields, surface="auto"):
@@ -12229,16 +12234,16 @@ def _w5_report(nodes=None, live=None, feed=None, sampled_at=1_700_000_000.0, **e
     """
     live = live or []
     live_nodes, idle_nodes, measures = [], [], []
-    for n in live:
+    for i, n in enumerate(live):
         role = n["role"]
         idle = n.get("idle")
-        entry = {"role": role, "state": None, "context_pct": n.get("ctx"),
+        entry = {"role": role, "surface_id": i+1, "created_at": 1, "state": None, "context_pct": n.get("ctx"),
                  "idle_secs": idle, "agent_alive": n.get("alive", True),
                  "status_age_secs": n.get("status_age"), "usage_ctx_tokens": n.get("tokens")}
         live_nodes.append(entry)
         if isinstance(idle, int) and idle >= 300 and n.get("alive", True):
             idle_nodes.append(entry)
-        measures.append({"role": role, "idle_secs": idle if isinstance(idle, int) else None,
+        measures.append({"role": role, "surface_id": i+1, "created_at": 1, "idle_secs": idle if isinstance(idle, int) else None,
                          "sampled_at": sampled_at,
                          "source": "daemon.status.idle_secs" if isinstance(idle, int)
                                    else "unavailable",

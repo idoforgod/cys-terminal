@@ -21397,9 +21397,10 @@ fn run_status(as_json: bool) -> i32 {
         println!("health (최근 {}건):", health.len().min(5));
         for h in health.iter().take(5) {
             println!(
-                "  surface:{} [{}] {}",
+                "  surface:{} [{}] [{}] masked terminal excerpt: {}",
                 h["surface_id"],
                 h["rule"].as_str().unwrap_or("?"),
+                h["evidence_kind"].as_str().unwrap_or("unknown"),
                 h["line"].as_str().unwrap_or("").chars().take(80).collect::<String>(),
             );
         }

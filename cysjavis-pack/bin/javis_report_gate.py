@@ -706,31 +706,76 @@ def node_changes(old_snap, new_snap):
 # 만든다 — ADR-2 스큐 안전(양측은 서로를 전제하지 않는다).
 
 def measurements(report):
-    """role → 권위 레코드 dict. 없으면 live_nodes 에서 파생(source 에 파생 사실을 남긴다)."""
+    """Preserve identity with each reading; a role collision is unavailable."""
     out = {}
-    rms = report.get("role_measurements")
-    if isinstance(rms, list) and rms:
-        for m in rms:
-            role = (m.get("role") or "").lower()
-            if role:
-                out[role] = dict(m, role=role)
-        return out
-    sampled = report.get("sampled_at")
-    for n in report.get("live_nodes") or []:
-        role = (n.get("role") or "").lower()
+    rows = report.get("role_measurements")
+    derived = not (isinstance(rows, list) and rows)
+    if derived:
+        rows = report.get("live_nodes") or []
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get("role"), str):
+            continue
+        role = row["role"].strip().lower()
         if not role:
             continue
-        idle = n.get("idle_secs")
-        out[role] = {
-            "role": role,
-            "idle_secs": idle if isinstance(idle, int) else None,
-            "sampled_at": sampled,
-            "source": "derived.live_nodes" if isinstance(idle, int) else "unavailable",
-            "agent_alive": n.get("agent_alive"),
-            "status_age_secs": n.get("status_age_secs"),
-            "usage_ctx_tokens": n.get("usage_ctx_tokens"),
-        }
+        m = dict(row, role=role)
+        if derived:
+            m["sampled_at"] = report.get("sampled_at")
+            m["source"] = "derived.live_nodes"
+        idle = m.get("idle_secs")
+        if type(idle) is not int or idle < 0:
+            m.update(idle_secs=None, source="unavailable")
+        m["identity_kind"] = "surface" if m.get("surface_id") is not None else "role-only"
+        if role in out and out[role] != m:
+            out[role] = {"role": role, "idle_secs": None, "source": "ambiguous",
+                         "identity_kind": "ambiguous", "sampled_at": None}
+        else:
+            out[role] = m
     return out
+
+
+def update_idle_tracking(counters, ms):
+    """One transition per resolved role, before every node/cooldown guard."""
+    old = counters.get("idle_tracking_v1")
+    old = old if isinstance(old, dict) else {}
+    new = {}
+    for role, m in ms.items():
+        sid, created, sampled = (m.get(k) for k in ("surface_id", "created_at", "sampled_at"))
+        number = lambda v: type(v) in (int, float) and 0 <= v < float("inf")
+        valid = (type(sid) is int and sid >= 0 and number(created) and number(sampled)
+                 and type(m.get("idle_secs")) is int and m["idle_secs"] >= 0)
+        if not valid:
+            new[role] = {"prev_idle_secs": None, "consecutive_idle_cycles": 0,
+                         "unavailable": m.get("source") if m.get("source") in ("ambiguous", "unavailable")
+                         else "identity-or-sample-unavailable"}
+            continue
+        binding = [sid, created]
+        token = [sid, created, sampled]
+        pc = old.get(role)
+        pc = pc if isinstance(pc, dict) else {}
+        previous, streak = pc.get("prev_idle_secs"), pc.get("consecutive_idle_cycles")
+        idle = m["idle_secs"]
+        previous_binding, previous_sample = pc.get("binding"), pc.get("sample")
+        binding_valid = (isinstance(previous_binding, list) and len(previous_binding) == 2
+                         and type(previous_binding[0]) is int and number(previous_binding[1]))
+        previous_sample_valid = (isinstance(previous_sample, list) and len(previous_sample) == 3
+                                 and type(previous_sample[0]) is int and number(previous_sample[1])
+                                 and number(previous_sample[2]) and previous_sample[:2] == binding)
+        continuous = (binding_valid and previous_binding == binding
+                      and type(previous) is int and previous >= 0
+                      and type(streak) is int and streak >= 0 and previous_sample_valid)
+        if continuous and pc.get("sample") == token and previous == idle:
+            new[role] = pc
+            continue
+        # A contradictory reading of the same sample cannot count as continuity.
+        if not continuous or pc.get("sample") == token or idle < IDLE_ALERT_SECS or idle < previous:
+            streak = 0
+        else:
+            streak += 1
+        new[role] = {"binding": binding, "sample": token, "prev_idle_secs": idle,
+                     "consecutive_idle_cycles": streak}
+    counters["idle_tracking_v1"] = new
+    return new
 
 
 def live_role_names(report):
@@ -809,7 +854,7 @@ def node_is_idle(report, node_label):
     if how == "none":
         return None
     vals = [ms[r].get("idle_secs") for r in roles if r in ms]
-    if not vals or any(not isinstance(v, int) for v in vals):
+    if not vals or any(type(v) is not int or v < 0 for v in vals):
         return None
     return all(v >= IDLE_ALERT_SECS for v in vals)
 
@@ -1154,13 +1199,13 @@ def build_stall_warnings(counters, report, cycle_minutes, stall_cycles, now_iso,
     """태스크(노드) 단위 stall 카운터 갱신 + 승격 대상 WARN 생성.
 
     전역 diff 카운터 금지 — 다른 태스크의 변화가 특정 태스크의 정체를 은폐한다(적대 검증 A6).
-    승격 조건: 진행 시그니처 무변화 ≥stall_cycles **AND 담당 노드 idle**(데몬 실측). 노드 busy면
-    정상 장기 라운드(리뷰 40분+ 등)이므로 카운터만 증가·승격 보류(오탐 억제 S1-2).
+    P7: require stable TODO counters AND consecutive identity-bound idle observations
+    AND the measured-silence lower bound. Busy output resets only the idle streak.
 
     ★2026-07-26 수정(유령 stall 무한 발화): 승격 후 재발화에 쿨다운(STALL_COOLDOWN_SECS).
 
     ★W5 §2-C **fail-closed 확증**: last_output 유래 idle 은 **push 확증 입력에서 제거**된다.
-      stall WARN 자체는 종전대로 나가되(ledger+evt+badge), **critical push 승격**은 last_output
+      The P7 observation gate precedes WARN; **critical push 승격**은 last_output
       과 독립인 2차 증거 3종이 **전부** 성립할 때만이다:
         ① todo 시그니처 무변화 ≥ 6주기 (파일시스템 증거 — 이 카운터)
         ② `cys set-status` age > 15분 (자기보고 증거)
@@ -1173,6 +1218,9 @@ def build_stall_warnings(counters, report, cycle_minutes, stall_cycles, now_iso,
     tail = " 기상절차: cys status --json 1콜 점검 병행."
     ms = measurements(report)
     live = set(ms)
+    tracking = update_idle_tracking(counters, ms)
+    missing = {}
+    counters["idle_measurement_missing"] = missing
     for n in report.get("nodes") or []:
         label = n.get("node")
         sig = "%s/%s" % (n.get("done"), n.get("total"))
@@ -1189,20 +1237,25 @@ def build_stall_warnings(counters, report, cycle_minutes, stall_cycles, now_iso,
                             "last_stall_fired": last_stall}
 
         in_progress = n.get("total", 0) > 0 and n.get("done", 0) < n.get("total", 0)
-        if in_progress and count >= stall_cycles:
-            if now_epoch and (now_epoch - last_stall) < STALL_COOLDOWN_SECS:
-                continue              # 쿨다운 창 — 카운터는 계속 증가(다음 발화에 실제 경과 반영)
-            roles, how = resolve_label_roles(label, live)
-            if how == "none":
-                continue              # 조인 불가 → build_label_join_warnings 가 결함으로 노출
+        roles, how = resolve_label_roles(label, live)
+        if how == "none":
+            continue  # Existing label-join diagnostic owns this case.
+        unavailable = [r for r in roles if tracking[r].get("unavailable")]
+        if in_progress and unavailable:
+            missing[label] = {"roles": unavailable, "missing": "idle_identity_or_sample"}
+        if in_progress and count >= stall_cycles and not unavailable:
             idle = node_is_idle(report, label)
-            if idle is False:
-                continue              # 노드 busy → 승격 보류(카운터는 이미 증가)
-            # idle True 또는 None(미지=보수적 시끄러운 쪽으로 승격) → stall WARN
+            if idle is not True:
+                continue
+            streak = min(tracking[r]["consecutive_idle_cycles"] for r in roles)
+            if streak < stall_cycles or any(ms[r]["idle_secs"] < stall_cycles * cycle_minutes * 60 for r in roles):
+                continue
+            if now_epoch and (now_epoch - last_stall) < STALL_COOLDOWN_SECS:
+                continue
             new_nodes[label]["last_stall_fired"] = now_epoch or last_stall
             mins = count * cycle_minutes
-            measured = [ms[r].get("idle_secs") for r in roles if r in ms]
-            measured_idle = max([v for v in measured if isinstance(v, int)] or [0])
+            selected = max((ms[r] for r in roles), key=lambda m: m["idle_secs"])
+            measured_idle = selected["idle_secs"]
             confirm, evidence = stall_confirmation(counters, roles, ms, count, stall_cycles)
             trigger = "stall_confirmed" if confirm is True else "stall"
             stalls.append(apply_policy({
@@ -1210,27 +1263,27 @@ def build_stall_warnings(counters, report, cycle_minutes, stall_cycles, now_iso,
                 "task": "gate-stall-%s" % label,
                 "reason": "stall:%s(%d주기·%s·confirm=%s)"
                           % (label, count, "idle" if idle else "미지", confirm),
-                "wake_body": "[gate] ⚠ stall: %s %d주기(%d분) 무진행·노드 %s — 워커 점검·재지시. "
-                             "근거[%s]%s"
-                             % (label, count, mins, "idle" if idle else "생존미상",
-                                evidence.get("summary", "-"), tail),
+                "wake_body": "[gate] stall: %s TODO 완료 수 %d회 연속 동일; PTY 무출력 %ss "
+                             "(명목 일정 %d분, 사망 판정 아님). 근거[%s]%s"
+                             % (label, count, measured_idle, mins, evidence.get("summary", "-"), tail),
                 "evt_type": "agent.silent",
                 # ★층4 silent_minutes 필드 분리: `silent_minutes` 는 **실측**(권위 레코드) 값이고,
                 #   주기 환산값은 `stall_minutes` 로 따로 싣는다. 두 값을 한 필드에 섞으면
                 #   "무엇을 재서 그렇게 판정했는가"가 소실된다(설계 §2 층4).
                 "evt_fields": {"agent": label,
+                               "measurement_kind": "todo_signature", "nominal_check_minutes": int(mins),
+                               "measurement_role": selected["role"],
                                "silent_minutes": int(measured_idle // 60),
                                "stall_minutes": int(mins), "stall_cycles": int(count),
                                "level": "critical",
-                               "measure_source": (ms.get(roles[0], {}) or {}).get("source")
-                               if roles else "unavailable"},
+                               "measure_source": selected.get("source")},
                 "idem": "gate-stall-%s" % label,
                 # push 승격 시의 재발화 상한 = WARN 자체의 쿨다운과 같은 창(1h).
                 "cooldown": STALL_COOLDOWN_SECS,
-                "stamp": {"measure_source": (ms.get(roles[0], {}) or {}).get("source")
-                          if roles else "unavailable",
-                          "sampled_at": (ms.get(roles[0], {}) or {}).get("sampled_at")
-                          if roles else None,
+                "stamp": {"measure_source": selected.get("source"),
+                          "measurement_kind": "todo_signature", "measurement_role": selected["role"],
+                          "nominal_check_minutes": int(mins),
+                          "sampled_at": selected.get("sampled_at"),
                           "measured_idle_secs": measured_idle,
                           "silent_minutes_derived": int(mins)},
                 "confirm": confirm,
@@ -1241,7 +1294,7 @@ def build_stall_warnings(counters, report, cycle_minutes, stall_cycles, now_iso,
     return stalls
 
 
-def build_measure_warnings(stall_warns):
+def build_measure_warnings(stall_warns, idle_missing=None):
     """§2-C '측정 불가'의 노출 — stall 확증 입력이 하나라도 미측정이면 **배지로 드러낸다**.
 
     ★`build_stall_warnings` 밖에 두는 이유: 그 함수의 반환 계약은 "stall 경고 목록"이고,
@@ -1265,6 +1318,17 @@ def build_measure_warnings(stall_warns):
             "idem": "gate-measure-%s" % label,
             "badge_detail": {"label": label, "missing": ev.get("missing")},
         }))
+    seen = {w["task"] for w in out}
+    for label, evidence in (idle_missing or {}).items():
+        task = "gate-measure-%s" % label
+        if task not in seen:
+            out.append(apply_policy({
+                "trigger": "measure", "task": task, "idem": task,
+                "reason": "idle_unmeasurable:%s" % label,
+                "wake_body": "[gate] 측정 불가: %s PTY 관측 또는 좌석 귀속 미확인" % label,
+                "evt_type": None, "evt_fields": None,
+                "badge_detail": dict(evidence, label=label),
+            }))
     return out
 
 
@@ -2124,7 +2188,7 @@ class Gate:
         stalls = build_stall_warnings(counters, report, self.cycle_minutes,
                                       self.stall_cycles, now_iso, now_epoch)
         warns += stalls
-        warns += build_measure_warnings(stalls)
+        warns += build_measure_warnings(stalls, counters.get("idle_measurement_missing"))
         #   ★§2-C 증거 ③의 차분 기반 이월은 **stall 판정 뒤**에 한다. 앞서 갱신하면 직전 값이
         #     현재 값으로 덮여 델타가 항상 0 이 되고, fail-closed 가 fail-open 으로 뒤집힌다.
         track_usage(counters, report)
@@ -2446,7 +2510,7 @@ def stamp_suffix(stamp):
     if stamp.get("measured_idle_secs") is not None:
         parts.append("idle=%ss" % stamp["measured_idle_secs"])
     if stamp.get("silent_minutes_derived") is not None:
-        parts.append("주기환산=%s분" % stamp["silent_minutes_derived"])
+        parts.append("명목일정=%s분(실측 경과 아님)" % stamp["silent_minutes_derived"])
     return (" [측정 %s]" % " ".join(parts)) if parts else ""
 
 

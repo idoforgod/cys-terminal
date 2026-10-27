@@ -440,9 +440,12 @@ def _measurement_from_node(entry, sampled_at):
     fail-closed 여야 할 게이트가 fail-open 으로 뒤집힌다.
     """
     idle = entry.get("idle_secs")
-    measured = isinstance(idle, int)      # 술어는 `idle_nodes` 선별과 동일(두 기준 금지)
+    measured = type(idle) is int and idle >= 0      # 술어는 `idle_nodes` 선별과 동일(두 기준 금지)
     return {
         "role": entry.get("role"),
+        "surface_id": entry.get("surface_id"),
+        "surface_ref": entry.get("surface_ref"),
+        "created_at": entry.get("created_at"),
         "idle_secs": idle if measured else None,
         "sampled_at": sampled_at,
         "source": MEASURE_SOURCE_IDLE if measured else MEASURE_SOURCE_NONE,
@@ -871,6 +874,9 @@ def build_report(status, extra_dirs, now=None, sampled_at=None):
             ctx_tokens = us.get("ctx_tokens")
             entry = {
                 "role": role,
+                "surface_id": s.get("surface_id"),
+                "surface_ref": s.get("surface_ref"),
+                "created_at": s.get("created_at"),
                 "state": ag.get("state"),
                 "context_pct": ag.get("context_pct"),
                 "idle_secs": idle_secs,
