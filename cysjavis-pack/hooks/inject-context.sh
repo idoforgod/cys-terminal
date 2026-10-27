@@ -11,17 +11,6 @@ if [ "${1:-}" != "--phase" ]; then _CYS_LIB_DEFINE_ONLY=1; CYS_LANE_REDIRECT="";
 . "${BASH_SOURCE[0]%/*}/_lib.sh" 2>/dev/null \
   || . "${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh" 2>/dev/null \
   || { echo "[cys-hook] _lib.sh 소실 — 훅 강등(inject-context)" >&2; exit 0; }
-# Define-only loading skips _lib.sh's own run block, and cys_lane_guard lives in it.
-# The controller must still take the lane decision here: it is routing, not
-# initialization, so it has to happen before any phase is spawned. Run inside a
-# phase instead and the delegated lane hook writes to the owned record channel,
-# where its output is read as records and never reaches the caller's stdout — the
-# controller then sees no SOURCE and exits 0 silently (measured at 491eb0e7; the
-# same case delegates at 9dbea792). The guard's helpers use shell builtins only,
-# so it is safe before cys_resolve_py.
-if [ "${_CYS_LIB_DEFINE_ONLY:-}" = 1 ]; then
-  command -v cys_lane_guard >/dev/null 2>&1 && cys_lane_guard
-fi
 command -v cys_lane_redirect >/dev/null 2>&1 && cys_lane_redirect "$@"
 unset _CYS_LIB_DEFINE_ONLY
 # Interpreter selection uses shell builtins and filesystem predicates only.
@@ -82,46 +71,12 @@ if [ "${1:-}" != "--phase" ]; then
     # Checklist has its own270 allowance; global420 still applies in the leaf.
     [ "$_C03_PHASE" = checklist ] && _C03_ARGS+=(--budget 420)
     _OWNED_FAILURE=""; _OWNED_ELAPSED=0; _OWNED_SPENT=0; _OWNED_RETURNED=""
-    # Records travel through a file, not `done < <(...)`: process substitution is a
-    # bash-only construct that `sh -n` refuses to parse (G-SYNTAX, CS-4① ⓐ POSIX sh).
-    # A pipe is not the alternative — it would put the loop in a subshell and every
-    # value assigned below (SOURCE, OUT, STATE, the budget counters) would be lost to
-    # the code after the loop. The file is created inside a directory made exclusively
-    # for it, on the same grounds as cys_role_cache_write: a predictable name in a
-    # shared tmp can be pre-seeded with a FIFO, and opening that FIFO would hang the
-    # SessionStart hook of every seat.
-    # The sink must not make a writable TMPDIR a precondition for restoration:
-    # process substitution needed no file at all, and B5 of test_wp18_skillscan_failopen
-    # pins that a machine whose TMPDIR cannot be written still runs the checklist
-    # (measured: a single-candidate sink turns that pin red). Walk candidates and take
-    # the first that actually yields a directory; the mkdir/mktemp is the real test,
-    # the -w probe only skips hopeless candidates.
-    _C03_RD=""
-    for _C03_TD in "${TMPDIR:-/tmp}" /tmp /var/tmp "${HOME:-}"; do
-      [ -n "$_C03_TD" ] || continue
-      [ -d "$_C03_TD" ] && [ -w "$_C03_TD" ] || continue
-      if command -v mktemp >/dev/null 2>&1; then
-        _C03_RD="$(mktemp -d "$_C03_TD/cys-ic-rec.XXXXXX" 2>/dev/null)" || _C03_RD=""
-      fi
-      if [ -z "$_C03_RD" ]; then
-        _C03_RD="$_C03_TD/cys-ic-rec.$$.$_C03_PHASE.d"
-        mkdir -m 700 "$_C03_RD" 2>/dev/null || _C03_RD=""
-      fi
-      [ -n "$_C03_RD" ] && break
-    done
-    # No writable record sink means no records, which the unmeasured branch below
-    # already handles; stderr stays on the hook's stderr exactly as it did before.
-    if [ -n "$_C03_RD" ]; then
-      cys_timeout_run --owned "$_C03_CAP" "$_C03_LEAF" "${_C03_ARGS[@]}" -- "${BASH:-/bin/bash}" "$0" --phase "$_C03_PHASE" > "$_C03_RD/rec"
-      while IFS= read -r -d '' _C03_KEY && IFS= read -r -d '' _C03_VALUE; do
-        case "$_C03_KEY" in
-          SOURCE|CWD|SOUL|ROOT|OUT|STATE|STATE_DIR|USED_FALLBACK|DEPT_CTX|DEPT_NO_STATE|DEPT_ROUND|DEPT_STATE_WITHHELD|_IC_ROLE|_IC_ROLE_DONE|_IC_GATE|_OWNED_FAILURE|_OWNED_STARTED|_OWNED_ELAPSED|_OWNED_SPENT|_OWNED_RETURNED)
-            printf -v "$_C03_KEY" '%s' "$_C03_VALUE" ;;
-        esac
-      done < "$_C03_RD/rec"
-      rm -f "$_C03_RD/rec" 2>/dev/null || :
-      rmdir "$_C03_RD" 2>/dev/null || :
-    fi
+    while IFS= read -r -d '' _C03_KEY && IFS= read -r -d '' _C03_VALUE; do
+      case "$_C03_KEY" in
+        SOURCE|CWD|SOUL|ROOT|OUT|STATE|STATE_DIR|USED_FALLBACK|DEPT_CTX|DEPT_NO_STATE|DEPT_ROUND|DEPT_STATE_WITHHELD|_IC_ROLE|_IC_ROLE_DONE|_IC_GATE|_OWNED_FAILURE|_OWNED_STARTED|_OWNED_ELAPSED|_OWNED_SPENT|_OWNED_RETURNED)
+          printf -v "$_C03_KEY" '%s' "$_C03_VALUE" ;;
+      esac
+    done < <(cys_timeout_run --owned "$_C03_CAP" "$_C03_LEAF" "${_C03_ARGS[@]}" -- "${BASH:-/bin/bash}" "$0" --phase "$_C03_PHASE")
     if [ "$_OWNED_RETURNED" != 1 ]; then
       _OWNED_FAILURE="phase owner ended without completion; unmeasured"
       # Missing elapsed evidence cannot refill the shared role/observation
