@@ -824,6 +824,8 @@ def _socket_dept(sock=None):
     base 판정은 _socket_is_base가 별도로 한다. 빈 suffix(cys-dept-/)는 _socket_malformed_dept가
     불량 레인으로 걸러 cmd_run이 명시 실패한다."""
     sock = os.environ.get("CYS_SOCKET", "") if sock is None else sock
+    if _lane_mod is not None and hasattr(_lane_mod, "socket_dept"):
+        return _lane_mod.socket_dept(sock)
     sock = (sock or "").strip()
     if not sock:
         return None
@@ -838,6 +840,8 @@ def _socket_malformed_dept(sock=None):
     이 소켓은 _socket_is_base=False인데 _socket_dept=None이라 어느 레인 계약에도 못 들어가는
     불량 레인이다 — cmd_run이 레인↔팩 가드 계열(exit 8)로 시끄럽게 명시 실패한다."""
     sock = os.environ.get("CYS_SOCKET", "") if sock is None else sock
+    if _lane_mod is not None and hasattr(_lane_mod, "socket_malformed_dept"):
+        return _lane_mod.socket_malformed_dept(sock)
     sock = (sock or "").strip()
     if not sock:
         return False

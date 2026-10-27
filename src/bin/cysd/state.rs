@@ -4062,6 +4062,7 @@ pub struct Daemon {
     pub writer_journal: Mutex<Option<Arc<crate::agent_write::FileJournal>>>,
     /// Requests an earlier daemon run left `writing` without a terminal (restore as PartialUnknown).
     pub writer_inconclusive: Mutex<Vec<crate::agent_write::Inconclusive>>,
+    pub incarnation: String,
     pub started_at: f64,
     /// ★(0.14.31 · 리뷰 R1 · codex major) **단조 기동 기준점**. `started_at`(epoch)은 벽시계라
     /// NTP 보정·수동 시각 변경에 앞뒤로 뛴다 — 경과시간 창(부트 유예·쿨다운·시간당 상한)을
@@ -6116,6 +6117,8 @@ impl Daemon {
         let analytics_conn = crate::analytics::open(&socket_path);
         // C0: 채널 계층 DB(channels.db)도 move 전에 연다. 무결 필수 — open 실패 시 None(모듈 비활성).
         let channels_conn = crate::channels::open(&socket_path);
+        let started_at = now_epoch();
+        let incarnation = seat_token_generation(started_at);
         let daemon = Arc::new(Daemon {
             receipt_registry: Arc::new(crate::rpc_receipt::ReceiptRegistry::default()),
             surfaces: Mutex::new(HashMap::new()),
@@ -6190,7 +6193,8 @@ impl Daemon {
             socket_path,
             writer_journal: Mutex::new(None),
             writer_inconclusive: Mutex::new(Vec::new()),
-            started_at: now_epoch(),
+            started_at,
+            incarnation,
             started_instant: Instant::now(),
             consumption: Mutex::new(Consumption::default()),
             analytics: Mutex::new(analytics_conn),

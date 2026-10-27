@@ -90,6 +90,55 @@ def socket_is_base(sock):
     return len(parts) >= 2 and parts[-2] == "cys"
 
 
+
+def socket_dept(sock):
+    for part in (sock or "").strip().replace("\\", "/").split("/"):
+        if part.startswith("cys-dept-"):
+            return part[len("cys-dept-"):] or None
+    return None
+
+
+def socket_malformed_dept(sock):
+    return "cys-dept-" in (sock or "").strip().replace("\\", "/").split("/")
+
+
+def is_abs_endpoint(s):
+    if not s:
+        return False
+    if s.startswith("/"):
+        return True
+    if "/" in s:
+        return False
+    return any(s.startswith(p) and len(s) > len(p) for p in ("\\\\.\\pipe\\", "\\\\?\\pipe\\"))
+
+
+def classify(sock, registry=None):
+    """Diagnostic mirror of cys::lane::classify; no refusal and no IO."""
+    s = (sock or "").strip()
+    norm = s.replace("\\", "/")
+    reg = "unknown" if registry is None else ("yes" if s in registry else "no")
+    absolute = not s or is_abs_endpoint(s)
+    if not s:
+        cls, reg = "base", "yes"
+    elif socket_malformed_dept(s):
+        cls = "dept_malformed"
+    elif socket_dept(s):
+        cls = "dept:" + socket_dept(s)
+    elif s.startswith("\\\\") or norm.lower().startswith("//./pipe/"):
+        cls = "base(win_pipe)" if socket_is_base(s) else "win_pipe_other"
+        if socket_is_base(s) and registry is not None:
+            reg = "yes"
+    elif socket_is_base(s):
+        cls, reg = "base", "yes"
+    elif not absolute:
+        cls = "not_absolute"
+    elif norm.rsplit("/", 1)[-1] in ("cys", "cys.sock"):
+        cls = "lane_near_miss"
+    else:
+        cls = "isolated"
+    return {"lane_class": cls, "registered": reg, "absolute": absolute}
+
+
 def sanitize_sock_key(sock):
     """소켓 전체 경로 → 파일명 안전 락 키(레인마다 유일). 부서 소켓은 basename(cys.sock)이 동일해
     basename 키를 쓰면 모든 레인이 같은 락 파일을 공유했다 — 전체 경로 새니타이즈로 레인 유일화.
@@ -211,7 +260,8 @@ def _self_test():
     _corpus = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "tests", "fixtures", "lane-key-corpus.json")
     with open(_corpus, encoding="utf-8") as _f:
-        _cases = _json.load(_f)["cases"]
+        _fixture = _json.load(_f)
+        _cases = _fixture["cases"]
     assert len(_cases) >= 15, "코퍼스가 비었거나 잘렸다(%d건) — 무측정 통과 방지" % len(_cases)
     for _c in _cases:
         _got = socket_is_base(_c["sock"])
@@ -220,7 +270,15 @@ def _self_test():
         _lk = lane_key(_c["sock"])
         assert (_lk == "base") is _c["is_base"], (
             "lane_key 가 base 판정과 갈렸다: sock=%r base=%s lane_key=%r" % (_c["sock"], _c["is_base"], _lk))
-    n += len(_cases) * 2
+    assert len(_cases) == 19
+    assert len(_fixture["diagnostic_extras"]) == 22
+    for _c in _cases + _fixture["diagnostic_extras"]:
+        assert lane_key(_c["sock"]) == _c["key_at_9dbea792"], _c
+        assert classify(_c["sock"], [])["lane_class"] == _c["lane_class"], _c
+    assert classify("relative/cys-dept-demo/cys.sock", [])["absolute"] is False
+    assert classify("/tmp/a.sock")["registered"] == "unknown"
+    assert classify("/tmp/a.sock", ["/tmp/a.sock"])["registered"] == "yes"
+    n += len(_cases) * 2 + 2 * (len(_cases) + len(_fixture["diagnostic_extras"])) + 5
     assert socket_is_base("/s/cys-dept-/cys.sock") is False, "빈 부서명이 base로 오판"
     n += 9
     # ⓑ 레인 키 — base 정규화·부서 유일·긴 경로 해시

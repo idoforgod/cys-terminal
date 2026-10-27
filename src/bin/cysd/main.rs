@@ -1380,12 +1380,18 @@ async fn async_main() {
     //   임무 대장(javis_mission)이 이 값을 **세션 결박**에 쓴다 — 데몬이 재기동하면 과거 세션의
     //   오너 임무는 무효가 된다(적발 (a): ts 를 기록만 하고 읽지 않아 과거 임무가 무기한 유효했다).
     //   실패해도 기동을 막지 않는다: 표식 부재는 판독자 쪽에서 'TTL 만 적용'으로 degrade 된다.
-    delivery::write_epoch(&socket_path);
+    delivery::write_epoch(&socket_path, daemon.started_at, &daemon.incarnation);
+    let registry = cys::lane::registry_sockets(&cys::lane::registry_path());
+    let classification = cys::lane::classify(&socket_path.to_string_lossy(), registry.as_deref());
+    if let Some(line) = cys::lane::boot_diagnostic(&socket_path.to_string_lossy(),
+        &cys::default_socket_path().to_string_lossy(), cys::env_compat(cys::ENV_SOCKET).is_some(), &classification) {
+        eprintln!("{line}");
+    }
     // ★R4 fail-open ② 봉합: 기동 표식 1줄을 원장에 append 해 "정상 원장은 절대 0바이트가 아니다"
     //   를 성립시킨다. 이것이 있어야 판독자가 '존재하지만 0바이트 = 손상'을 fail-closed 로
     //   판정할 수 있다(종전엔 빈 파일이 LEDGER_OK 로 통과해, 원장을 비우기만 하면 게이트가 열렸다).
     //   실패는 기동을 막지 않되 **조용히 넘기지 않는다** — 흔적을 stderr 에 남긴다.
-    if let delivery::Outcome::Failed(why) = delivery::write_boot_sentinel(&socket_path) {
+    if let delivery::Outcome::Failed(why) = delivery::write_boot_sentinel(&socket_path, daemon.started_at, &daemon.incarnation) {
         eprintln!(
             "cysd: ★배달 원장 기동 표식 기록 실패({why}) — 판독자가 이 레인 원장을 '손상'으로 \
              볼 수 있다(임무 게이트 fail-closed). 상태 디렉터리 권한을 확인하라."
