@@ -194,6 +194,8 @@ def parse_wire(line, lenient_unknown=False):
 
 def speak(evt_type, payload):
     tpl = SPEAK[evt_type]
+    if evt_type == "agent.silent" and payload.get("measurement_kind") == "todo_signature":
+        tpl = "{agent}의 TODO 완료 수가 {stall_cycles}회 관측 동안 같습니다. PTY 무출력 관측 {silent_minutes}분(사망 판정 아님)."
     if evt_type == "briefing":
         return tpl.format(**payload["counts"])
     safe = {k: (json.dumps(v, ensure_ascii=False) if isinstance(v, (list, dict)) else v)

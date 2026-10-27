@@ -57,6 +57,13 @@ class FakeRunner:
     def collect_report(self):
         if self.collect_raises:
             raise RuntimeError("주입된 내부 오류")
+        # Modern collector fixture: each successful collection has identity and a fresh sample.
+        if self.rep is not None and self.report_ok:
+            self._sample = getattr(self, "_sample", 0) + 300
+            self.rep["sampled_at"] = self._sample
+            for i, row in enumerate(self.rep.get("live_nodes") or []):
+                row.setdefault("surface_id", i + 1)
+                row.setdefault("created_at", 1)
         return self.report_ok, self.rep, self.err
 
     def emit(self, evt_type, fields, surface="auto"):
@@ -921,6 +928,162 @@ class QueueHoldRefresh(unittest.TestCase):
             with open(G.seen_path(t, key), encoding="utf-8") as fh:
                 rec = json.load(fh)
             self.assertEqual(rec["first_ts"], 1_000_000.0, "무관한 보존이 내 TTL 창을 건드렸다")
+
+
+class P7InstrumentTests(unittest.TestCase):
+    def sample(self, idle=2100, sample=1, role='master', sid=7, created=10):
+        return dict(role=role, idle_secs=idle, sampled_at=sample, surface_id=sid,
+                    created_at=created, source='daemon.status.idle_secs',
+                    status_age_secs=1001, usage_ctx_tokens=100)
+
+    def rep(self, *samples, label='master'):
+        return report(nodes=[dict(node=label, done=1, total=2)], role_measurements=list(samples))
+
+    def tick(self, counters, samples, epoch=10000, label='master'):
+        return G.build_stall_warnings(counters, self.rep(*samples, label=label), 5, 6, 'ts', epoch)
+
+    def matured(self):
+        counters={}
+        for i in range(7):
+            warnings=self.tick(counters,[self.sample(2100+i*300,i+1)],10000+i*300)
+        self.assertEqual(len(warnings),1)
+        return counters,warnings
+
+    def test_p7_row7_does_not_fire(self):
+        c={'nodes':{'master':dict(sig='1/2',count=120,last_stall_fired=0)}}
+        self.assertEqual(self.tick(c,[self.sample(560)]),[])
+
+    def test_p7_identity_duplicates_both_orders_and_repeat(self):
+        a=self.sample();b=self.sample(sid=8)
+        for rows in ([a,b],[b,a]):
+            m=G.measurements(self.rep(*rows))['master']
+            self.assertIsNone(m['idle_secs'])
+            self.assertEqual(m['source'],'ambiguous')
+        self.assertEqual(G.measurements(self.rep(a,a))['master']['idle_secs'],2100)
+        b=dict(a,idle_secs=2200)
+        self.assertIsNone(G.measurements(self.rep(a,b))['master']['idle_secs'])
+
+    def test_p7_identity_types_before_duplicate_equality(self):
+        for invalid in (True, 1.0):
+            for ids in ((invalid, 1), (1, invalid)):
+                with self.subTest(ids=ids):
+                    ms = G.measurements(self.rep(*(self.sample(sid=sid) for sid in ids)))
+                    self.assertIsNone(ms['master']['idle_secs'])
+                    self.assertEqual(G.update_idle_tracking({}, ms)['master']['consecutive_idle_cycles'], 0)
+
+    def test_p7_replayed_timestamps_do_not_advance(self):
+        for stamps in ([1000, 1001] * 5, [1000, 1001, 1002, 1000, 1001, 1002]):
+            with self.subTest(stamps=stamps):
+                c = {}
+                high = -1
+                for stamp in stamps:
+                    before = c.get('idle_tracking_v1', {}).get('master', {}).get('consecutive_idle_cycles', 0)
+                    self.assertEqual(self.tick(c, [self.sample(sample=stamp)]), [])
+                    now = c['idle_tracking_v1']['master']
+                    if stamp <= high:
+                        self.assertLessEqual(now['consecutive_idle_cycles'], before)
+                    high = max(high, stamp)
+                    self.assertEqual(now['sample'][2], high)
+        c = {}
+        for stamp in range(1000, 1007):
+            warnings = self.tick(c, [self.sample(sample=stamp)])
+        self.assertEqual(c['idle_tracking_v1']['master']['consecutive_idle_cycles'], 6)
+        self.assertEqual(len(warnings), 1)
+
+    def test_p7_invalid_and_legacy_measurements(self):
+        for v in (None,True,-1,'491'):
+            self.assertIsNone(G.measurements(self.rep(self.sample(v)))['master']['idle_secs'])
+        self.assertEqual(G.measurements(self.rep(self.sample(0)))['master']['idle_secs'],0)
+        c={};legacy=self.sample();legacy.pop('surface_id')
+        for i in range(9):
+            legacy['sampled_at']=i
+            self.assertEqual(self.tick(c,[legacy]),[])
+        self.assertIn('master',c['idle_measurement_missing'])
+
+    def test_p7_monotonic_cycles_reset_before_cooldown(self):
+        c,w=self.matured()
+        self.assertEqual(c['idle_tracking_v1']['master']['consecutive_idle_cycles'],6)
+        self.tick(c,[self.sample(0,8)],12100)
+        self.assertEqual(c['idle_tracking_v1']['master']['consecutive_idle_cycles'],0)
+        self.assertEqual(self.tick(c,[self.sample(560,9)],15000),[])
+        self.tick(c,[self.sample(400,10)],15300)
+        self.assertEqual(c['idle_tracking_v1']['master']['consecutive_idle_cycles'],0)
+
+    def test_p7_persistence_duplicate_and_identity(self):
+        c,_=self.matured();c=json.loads(json.dumps(c))
+        self.tick(c,[self.sample(3900,7)],15000)
+        self.assertEqual(c['idle_tracking_v1']['master']['consecutive_idle_cycles'],6)
+        self.tick(c,[self.sample(5000,8,created=11)],15300)
+        self.assertEqual(c['idle_tracking_v1']['master']['consecutive_idle_cycles'],0)
+
+    def test_p7_family_minimum_and_attribution(self):
+        c={}
+        for i in range(7):
+            a=self.sample(2100+i*300,i+1,'reviewer-a',7)
+            b=self.sample(2400+i*300,i+1,'reviewer-b',8)
+            b['source']='source-b'
+            w=self.tick(c,[a,b],10000+i*300,label='reviewer')
+        self.assertEqual(w[0]['stamp']['measure_source'],'source-b')
+        self.assertEqual(w[0]['evt_fields']['measurement_kind'],'todo_signature')
+        b.update(idle_secs=560,sampled_at=8)
+        a.update(sampled_at=8)
+        self.assertEqual(self.tick(c,[a,b],16000,label='reviewer'),[])
+
+    def test_p7_missing_visible_without_stall(self):
+        c={};self.tick(c,[self.sample(None)])
+        w=G.build_measure_warnings([],c.get('idle_measurement_missing'))
+        self.assertEqual(len(w),1)
+        self.assertIsNone(w[0]['evt_type'])
+        self.assertEqual(w[0]['trigger'],'measure')
+
+    def test_p7_gate_keeps_missing_diagnostic_without_stall(self):
+        with tempfile.TemporaryDirectory() as t:
+            r=FakeRunner(rep=self.rep(self.sample(None)),tasks=[])
+            gate(t,r).run();gate(t,r).run()
+            self.assertIn("gate-measure-master",badges(t))
+            self.assertFalse(any(name=="agent.silent" for name,_ in r.emits))
+
+    def test_p7_typed_event_preserves_legacy_formatter(self):
+        import javis_event as E
+        fields=dict(agent='master',silent_minutes=35,level='critical')
+        legacy=E.speak('agent.silent',fields)
+        typed=E.speak('agent.silent',dict(fields,measurement_kind='todo_signature',stall_cycles=6))
+        self.assertNotEqual(typed,legacy)
+        self.assertNotIn('응답이 없습니다',typed)
+        self.assertIn('6',typed)
+
+    def test_p7_invalid_persisted_sample_starts_at_zero(self):
+        for old in (None, [], [7,10], [8,10,1], [7,10,True], [7,10,float("inf")]):
+            c={"idle_tracking_v1":{"master":{"binding":[7,10],"prev_idle_secs":2100,
+                "consecutive_idle_cycles":6,"sample":old}}}
+            self.tick(c,[self.sample(2400,2)])
+            self.assertEqual(c["idle_tracking_v1"]["master"]["consecutive_idle_cycles"],0)
+
+    def test_p7_boolean_old_binding_never_aliases_surface_one(self):
+        for binding,sample in [([True,1],[1,1,1]),([1,1],[True,1,1]),([1,True],[1,1,1]),([1,1],[1,True,1])]:
+            c={'idle_tracking_v1':{'master':{'binding':binding,'sample':sample,
+                'prev_idle_secs':2100,'consecutive_idle_cycles':6}}}
+            self.tick(c,[self.sample(2400,2,sid=1,created=1)])
+            self.assertEqual(c['idle_tracking_v1']['master']['consecutive_idle_cycles'],0)
+
+    def test_p7_fast_distinct_polls_need_measured_duration(self):
+        c={}
+        for i in range(8):
+            self.assertEqual(self.tick(c,[self.sample(560,i+1)],10000+i),[])
+        self.assertGreaterEqual(c['idle_tracking_v1']['master']['consecutive_idle_cycles'],6)
+
+    def test_p7_new_family_member_cannot_borrow_a_streak(self):
+        c={}
+        for i in range(7):
+            self.tick(c,[self.sample(2400,i+1,'reviewer-a',7)],10000+i*300,label='reviewer')
+        a=self.sample(2400,8,'reviewer-a',7);b=self.sample(2400,8,'reviewer-b',8)
+        self.assertEqual(self.tick(c,[a,b],16000,label='reviewer'),[])
+
+    def test_p7_producer_keeps_identity_and_rejects_bool(self):
+        import javis_report as R
+        m=R._measurement_from_node(self.sample(),123)
+        self.assertEqual((m['surface_id'],m['created_at']),(7,10))
+        self.assertIsNone(R._measurement_from_node(self.sample(True),123)['idle_secs'])
 
 
 if __name__ == "__main__":

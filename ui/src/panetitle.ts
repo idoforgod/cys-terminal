@@ -52,3 +52,17 @@ export const paneTitle = (
     typeof dupCount === "number" && Number.isSafeInteger(dupCount) && dupCount >= 2 ? ` (${dupCount})` : "";
   return `${surfaceTag(sid)}${base}${dup}`;
 };
+
+/** Labels describe their evidence; missing observations never inherit launch metadata. */
+export function paneDetails(value: unknown): string {
+  const row = value && typeof value === "object" ? value as Record<string, unknown> : {};
+  const text = (v: unknown) => typeof v === "string" && v ? v : "확인 불가";
+  const lines = [`이름: ${text(row.title)}`, `시작 경로: ${text(row.cwd)}`, `관측된 셸 경로: ${text(row.effective_cwd)}`];
+  const account = row.account && typeof row.account === "object" ? row.account as Record<string, unknown> : {};
+  if (account.state === "mismatch") {
+    lines.push("계정: 확인되지 않음 (관측 경로와 기록 경로 불일치)",
+      `관측 프로필 경로 (계정 신원 아님): ${text(account.profile)}`,
+      `기록 프로필 경로 (계정 신원 아님): ${text(account.recorded_profile)}`);
+  }
+  return lines.join("\n");
+}

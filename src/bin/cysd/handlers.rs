@@ -6528,6 +6528,10 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
                         "cmd": s.cmd,
                         "cwd": s.cwd,
                         "live_cwd": live_cwd,
+                        "effective_cwd": live_cwd,
+                        "cwd_source": if live_cwd.is_some() { "observed_surface_shell" } else { "unavailable" },
+                        "idle_source": "pty_output_instant",
+                        "idle_secs": s.last_output.lock().unwrap().elapsed().as_secs(),
                         "pid": s.pid,
                         "exited": s.exited.load(Ordering::Relaxed),
                         "created_at": s.created_at,
@@ -10655,6 +10659,9 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
                         "title": s.title.lock().unwrap().clone(),
                         "cwd": s.cwd.clone(),
                         "live_cwd": live_cwd,
+                        "effective_cwd": live_cwd,
+                        "cwd_source": if live_cwd.is_some() { "observed_surface_shell" } else { "unavailable" },
+                        "idle_source": "pty_output_instant",
                         "exited": s.exited.load(Ordering::Relaxed),
                         "idle_secs": s.last_output.lock().unwrap().elapsed().as_secs(),
                         "queue_depth": s.pending_queue.lock().unwrap().len(),
@@ -32589,6 +32596,40 @@ mod tests {
     mod seat_account_0145_status {
         use super::b3_status_tests::b3_rpc;
         use super::*;
+
+        struct P7MetadataFixture(Arc<Daemon>);
+        impl Drop for P7MetadataFixture {
+            fn drop(&mut self) { crate::state::test_stop_daemon(&self.0); }
+        }
+        #[test]
+        fn p7_surface_org_metadata_parity() {
+            let fixture=P7MetadataFixture(claim_daemon());let daemon=&fixture.0;
+            let sid=make_surface(daemon,Some("worker-p7"));
+            let mut rows=Vec::new();
+            for method in ["surface.list","org.status"] {
+                let result=b3_rpc(&daemon,method);
+                let row=result["result"]["surfaces"].as_array().unwrap().iter().find(|r|r["surface_id"]==sid).unwrap();
+                for key in ["idle_source","effective_cwd","cwd_source"] {assert!(row.get(key).is_some(),"{method} missing {key}");}
+                assert_eq!(row["effective_cwd"],row["live_cwd"]);
+                assert_eq!(row["idle_source"],"pty_output_instant");
+                assert!(row["idle_secs"].as_u64().is_some(),"{method} source without measurement");
+                rows.push(json!([row["idle_source"],row["effective_cwd"],row["cwd_source"]]));
+            }
+            assert_eq!(rows[0],rows[1]);
+            // A retained exited surface still has launch cwd, but no live observation.
+            let exited_sid=make_surface(daemon,Some("worker-p7-exited"));
+            let exited=daemon.get_surface(exited_sid).unwrap();
+            assert!(!exited.cwd.is_empty());
+            exited.exited.store(true,Ordering::Relaxed);
+            for method in ["surface.list","org.status"] {
+                let result=b3_rpc(daemon,method);
+                let row=result["result"]["surfaces"].as_array().unwrap().iter().find(|r|r["surface_id"]==exited_sid).unwrap();
+                assert_eq!(row["cwd"],exited.cwd);
+                assert!(row["live_cwd"].is_null(),"{method}: fixture needs no live observation");
+                assert!(row["effective_cwd"].is_null(),"{method}: launch cwd must not substitute for absent live cwd");
+                assert_eq!(row["cwd_source"],"unavailable","{method}");
+            }
+        }
 
         #[test]
         fn surface_list_and_org_status_carry_the_same_seat_account() {

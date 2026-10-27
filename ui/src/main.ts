@@ -6,7 +6,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { imeStep, initialImeState, isHangulText, type ImeEvent } from "./ime";
 import { shellQuote } from "./shellquote";
-import { dupRoleCounts, paneTitle } from "./panetitle";
+import { dupRoleCounts, paneTitle, paneDetails } from "./panetitle";
 import { baseName, insertionText, isStreaming, splitPath, classifyPathCheck, pathCheckToast } from "./ftdrop";
 import { dropPointToCss, dropPlatformFromUserAgent, dropDebugDetail, isDropDebugEnabled } from "./droppoint";
 import {
@@ -3129,6 +3129,11 @@ async function refreshPaneTitles() {
             title: string;
             role: string | null;
             live_cwd: string | null;
+            cwd?: string | null;
+            effective_cwd?: string | null;
+            cwd_source?: string;
+            idle_source?: string;
+            account?: unknown;
             exited: boolean;
             agent_alive?: boolean | null; // ★WP11 deadReason — false = 관측된 사망만(null = 미측정)
             usage?: ObservedUsage | null;
@@ -3190,6 +3195,7 @@ async function refreshPaneTitles() {
           rt.titleEl.textContent =
             paneTitle(s.surface_id, s.title, s.live_cwd, s.exited ? undefined : dupRoles.get(s.role ?? "")) +
             (s.exited ? " [exited]" : "");
+          rt.titleEl.title = paneDetails(s);
           rt.titleEl.dataset.stored = s.title ?? ""; // ★WP13·R1 이름 변경의 출발값(표시 문자열이 아니라 데몬이 가진 제목)
         }
         // 자동 입양: 그 소켓의 role surface 중 UI에 없는 것 → '같은 소켓을 가진 ws'에만 표출.

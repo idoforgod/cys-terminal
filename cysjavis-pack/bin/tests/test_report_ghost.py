@@ -579,7 +579,7 @@ class TestStallCooldown(unittest.TestCase):
     """
 
     GREP = {"nodes": [{"node": "worker", "done": 1, "total": 5}],
-            "live_nodes": [{"role": "worker", "idle_secs": 999,
+            "live_nodes": [{"role": "worker", "idle_secs": 2100, "surface_id": 1, "created_at": 1,
                             "agent_alive": True, "context_pct": 5}],
             "idle_nodes": [{"role": "worker", "idle_secs": 999,
                             "agent_alive": True, "context_pct": 5}]}
@@ -590,6 +590,7 @@ class TestStallCooldown(unittest.TestCase):
         fired = []
         for i in range(n):
             epoch = self.T0 + i * 300 if now_epoch else 0
+            self.GREP["sampled_at"] = self.T0 + i * 300
             if RG.build_stall_warnings(counters, self.GREP, 5, 6, "ts", epoch):
                 fired.append(i)
         return counters, fired
@@ -1003,13 +1004,14 @@ class TestReviewer1Critical3OwnerIsTheLabel(TempPackCase):
         self.write(os.path.join(self.d, "WORKER_TODO.md"),
                    "<!-- javis:todo v1 owner=reviewer-gemini scope=pack status=active -->\n"
                    + boxes(0, 2))
-        status = {"surfaces": [{"role": "reviewer-gemini", "cwd": None, "idle_secs": 999,
+        status = {"surfaces": [{"role": "reviewer-gemini", "cwd": None, "idle_secs": 2100, "surface_id": 1, "created_at": 1,
                                 "agent_alive": True, "status": {}}],
                   "feed": {"pending": 0}, "paused": False}
         rep = RP.build_report(status, [os.path.dirname(self.d)])
         self.assertEqual(RG.node_is_idle(rep, "reviewer-gemini"), True)
         counters, fired = {"nodes": {}}, []
-        for i in range(8):                                   # stall 임계(6주기) 초과
+        for i in range(8):                                   # distinct bound observations
+            rep = RP.build_report(status, [os.path.dirname(self.d)], sampled_at=1_700_000_000+i*300)
             fired += RG.build_stall_warnings(counters, rep, 5, 6, "ts",
                                              1_700_000_000 + i * 300)
         self.assertTrue(fired, "owner 라벨이 stall 조인에 붙지 않았다")
