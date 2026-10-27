@@ -17,6 +17,7 @@ set -euo pipefail
 # 상속해 cys(/opt/homebrew/bin)·claude(~/.local/bin)를 못 찾는다 → 빈 셸의 `cys status`·사용자의 claude
 # 수동 실행 실패·dept cysd 의 claude spawn 실패 = 0 pane. 이 도구가 spawn 하는 모든 자식(cysd·빈 셸·
 # 그 아래 사용자가 실행하는 claude)이 상속하도록 단일 지점에서 로그인 셸 표준 경로를 prepend.
+# WP12-ROTATION-PRELUDE-BEGIN
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin${PATH:+:$PATH}"
 # ★U15(0.14.41): 개발자 도구(CLT) 없는 맥의 좌석에서 부르면 아래 `python3 - <<'PY'` heredoc 40여 곳이
 #   PATH 첫 python3 = /usr/bin 셔임(설치 창 + 비0)으로 풀린다. cysd 는 **그 기계에서만** pane env 에
@@ -42,6 +43,7 @@ CYS="$(command -v cys || { [ -x /opt/homebrew/bin/cys ] && echo /opt/homebrew/bi
 # RC-6(codex R3.1 nit): 인라인 python heredoc이 cys를 literal이 아니라 **해소된 경로**로 실행하도록
 # CYS_BIN을 env로 전파(heredoc은 프로세스 env 상속). dept_classify_idle·alive_sock 등 subprocess가 사용.
 export CYS_BIN="$CYS"
+# WP12-ROTATION-PRELUDE-END
 # RC-6(T3 발견): Windows 번들 embeddable Python은 open() 기본 인코딩이 cp1252(charmap)라 UTF-8(한글)
 # agents.json·directives 읽기가 UnicodeDecodeError로 크래시(부서 seed 실패 등). PYTHONUTF8=1로 전 python
 # heredoc·자식 python을 UTF-8 기본으로 강제(unix 무영향). 개별 open(encoding=) 누락도 이걸로 방어.
@@ -350,6 +352,157 @@ dept_logdir(){
 # RC-6: OS중립 graceful kill — unix=SIGTERM→대기→SIGKILL, Windows(MSYS/Git-Bash)=taskkill(트리·강제).
 # Windows 프로세스는 unix 시그널을 안 받으므로 kill/kill -9가 무효 → taskkill //PID //T //F로 분기
 # (MSYS는 `/PID`를 경로로 변환하므로 `//PID` 형식 사용).
+# ★(0.14.53 WP12 · P2 · DESIGN-R2 G1.3) shell twin of the app's rotation pre-probe (K3 = `cys-dept rotate` run by
+#   any caller). Before rotate kills a working daemon, the pair this script relaunches ($CYSD, $CYS) must start and
+#   print the F3 grammar: `cysd V (build ID)` and `cys V'` with V == V' (one build). Windows only (Smart App Control /
+#   App Control); elsewhere a no-op. A 10 s bound per binary, then a kill of that child and 5 s to confirm it is gone
+#   (codex R2-F2) - python, because timeout(1) on Windows is an unrelated program. Blocked = one stderr line that STARTS
+#   with the machine-readable prefix `new_daemon_blocked:` (codex R2-F3; rotate_dept_daemon passes stderr unchanged to the
+#   UI latch), exit 12. Nothing is killed and the socket is untouched. Vectors: scripts/tests/fixtures/binprobe-vectors.json.
+# WP12-ROTATION-BIND-BEGIN
+# Shared with the app via include_str: resolve the shell selection before drain,
+# or retain an explicit already-probed pair for every later call in this rotation.
+rotation_require_os(){  # <context>
+  local os
+  os="$(uname -s 2>/dev/null)" || os=""
+  if [ -z "$os" ]; then
+    echo "new_daemon_blocked:probe:os-detection-failed [cys-dept] $1: OS detection failed — rotate stopped (daemon unchanged)" >&2
+    exit 12
+  fi
+  ROTATION_OS="$os"
+}
+
+rotation_bind_bins(){  # [checked-cysd checked-cys]
+  local res _rotation_bind_rc=0
+  res="$(python3 - "$CYSD" "$CYS" "${1:-}" "${2:-}" 2>/dev/null <<'ROTATION_PATHS_PY'
+import os, sys
+
+def refuse(reason):
+    print(reason)
+    sys.exit(12)
+
+try:
+    selected = sys.argv[1:3]
+    expected = sys.argv[3:5]
+    if bool(expected[0]) != bool(expected[1]):
+        refuse("incomplete-path-pair")
+    def absolute(path):
+        # MSYS converts POSIX arguments for native Python. realpath also fixes
+        # a relative PATH entry once, before the process can change directory.
+        if not path or any(c in path for c in "\r\n\t"):
+            refuse("nonabsolute-path")
+        path = os.path.realpath(path)
+        if os.name == "nt":
+            slash = chr(92)
+            prefix = slash * 2 + "?" + slash
+            if path.startswith(prefix + "UNC" + slash):
+                path = slash * 2 + path[8:]
+            elif path.startswith(prefix):
+                path = path[4:]
+            path = path.replace(slash, "/")
+        return path
+    if expected[0]:
+        if not all(os.path.isabs(p) for p in expected):
+            refuse("nonabsolute-path")
+        expected = list(map(absolute, expected))
+        selected = expected
+    else:
+        selected = list(map(absolute, selected))
+    print("\t".join(selected))
+except (OSError, ValueError):
+    refuse("path-resolution-failed")
+ROTATION_PATHS_PY
+)" || _rotation_bind_rc=$?
+  # Native interpreter stdout may use CRLF; the CR is a terminator, not a path byte.
+  res="${res%$'\r'}"
+  if [ "$_rotation_bind_rc" -ne 0 ]; then
+    echo "new_daemon_blocked:pair:${res:-path-resolution-failed}" >&2; exit 12
+  fi
+  case "$res" in
+    *"$(printf '\t')"*) ;;
+    *) echo "new_daemon_blocked:pair:path-resolution-failed" >&2; exit 12 ;;
+  esac
+  CYSD="${res%%$'\t'*}"
+  CYS="${res#*$'\t'}"
+  export CYS_BIN="$CYS"
+}
+# WP12-ROTATION-BIND-END
+
+probe_rotation_bins(){  # <name> [authoritative-cysd authoritative-cys]
+  rotation_require_os "$1"
+  case "$ROTATION_OS" in
+    MINGW*|MSYS*|CYGWIN*) ;;
+    *) return 0 ;;
+  esac
+  rotation_bind_bins "${2:-}" "${3:-}"
+  local py res
+  py="$(cat <<'BINPROBE_PY'
+import re, subprocess, sys, tempfile, time
+
+def run(path):
+    with tempfile.TemporaryFile() as out:
+        try:
+            c = subprocess.Popen([path, "--version"], stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.DEVNULL)
+        except OSError as e:
+            return None, "error:%s" % (getattr(e, "winerror", None) or e.errno)
+        def poll_until(seconds):
+            end = time.monotonic() + seconds
+            while True:
+                try:
+                    code = c.poll()
+                except OSError:
+                    return "wait-error"
+                if code is not None:
+                    return code
+                if time.monotonic() >= end:
+                    return None
+                time.sleep(0.05)
+        code = poll_until(10)
+        if code is None or code == "wait-error":
+            try:
+                c.kill()
+            except OSError:
+                pass  # The child may have exited concurrently; only the following poll can confirm that.
+            confirmed = poll_until(5)
+            if confirmed is None or confirmed == "wait-error":
+                return None, "cleanup-unconfirmed"
+            return None, ("timeout" if code is None else "error:wait")
+        if code != 0:
+            return None, "rc:%d" % code
+        try:
+            out.seek(0)
+            first = re.split(rb"[\r\n]", out.read(4097), maxsplit=1)[0]
+            if len(first) > 4096:
+                return None, "error:output-too-large"
+            return first.decode("utf-8", "replace"), None
+        except OSError:
+            return None, "error:output"
+
+line, why = run(sys.argv[1])
+if why:
+    print("cysd:" + why); sys.exit(1)
+d = re.fullmatch(r"cysd ([0-9A-Za-z.+-]+) \(build ([!-(*-~]+)\)", line)
+if not d:
+    print("cysd:grammar"); sys.exit(1)
+line, why = run(sys.argv[2])
+if why:
+    print("cys:" + why); sys.exit(1)
+c = re.fullmatch(r"cys ([0-9A-Za-z.+-]+)", line)
+if not c:
+    print("cys:grammar"); sys.exit(1)
+if d.group(1) != c.group(1):
+    print("pair:version-mismatch"); sys.exit(1)
+print("ok")
+BINPROBE_PY
+)"
+  res="$(python3 -c "$py" "$CYSD" "$CYS" 2>/dev/null)" || true
+  res="${res%$'\r'}"
+  [ "$res" = ok ] && return 0
+  [ -n "$res" ] || res="probe:error"
+  echo "new_daemon_blocked:$res [cys-dept] $1: 새 cysd/cys 실행 확인 실패($res) — rotate 중단(데몬 불변)" >&2
+  exit 12
+}
+
 graceful_kill(){
   local pid="$1"
   case "$(uname -s 2>/dev/null)" in
@@ -2869,6 +3022,15 @@ PY
     #   kill 후 launch 검증 거부 = 데몬 죽고 등재만 남는 반파괴 half-op이 된다 — kill 없이 여기서 exit 2.
     #   grep `--`는 인자 위생(D3(i) — '-' 선두 등재명 옵션 오파싱 봉합, rotate 재확인 게이트 동일).
     validate_dept_name "$name" "rotate <name>" "비정형 등재 — kill 미수행(데몬 불변). 정리는 cys-dept down-sock <sock> 또는 D1(b) 수동 격리로."
+    # The candidate CLI itself may be blocked: probe BEFORE its first ping/identify.
+    # App callers pass the absolute pair checked before their drain; direct calls
+    # bind the script's current selection once. launch_dept keeps these variables.
+    _rotation_cysd=""; _rotation_cys=""
+    if [ "${3:-}" = "--rotation-pair" ]; then
+      if [ "$#" -ne 5 ]; then echo "new_daemon_blocked:pair:incomplete-path-pair" >&2; exit 12; fi
+      _rotation_cysd="$4"; _rotation_cys="$5"
+    fi
+    probe_rotation_bins "$name" "$_rotation_cysd" "$_rotation_cys"
     # ★필수4(B·리뷰): rotate 대상 데몬이 실제 살아있는지 ping으로 먼저 확인(autostart 없는 연결 프로브).
     # ★함정: `cys identify`는 죽은 소켓에서 cysd를 autostart하는 부작용이 있어(스모크 실증) pid가 항상 채워져
     # "미확인" 판정을 못 한다 → ping(연결만·autostart 없음)으로 게이트한다. 미응답=소유자 사망 미확인이므로

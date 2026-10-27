@@ -36,6 +36,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -1457,6 +1458,358 @@ class RegistryBom(Base):
         self.assertIn("newer", reg)
         self.assertIn("keep", reg, "BOM 레지스트리가 RMW 에서 비워짐(기존 등재 소실 · K2-03 회귀)")
         self.assertEqual(reg["keep"], keep, "기존 부서 display_name/account/mission_key/cwd 메타 소실")
+
+
+class RotateBinaryProbeFullScript(Base):
+    """Host full-script rotation with ONLY the probe's OS selector simulated; native Windows is UNMEASURED."""
+
+    def exercise(self, refused, cli_blocked=False, unreachable=False, bind_pair=False):
+        bindir = os.path.join(self.home, ".local", "bin")
+        sock = seed_sock(self.home, "d1")
+        with open(sock, "w") as stream:
+            stream.write("old-socket")
+        write_reg(self.env, {"d1": {"socket": sock, "pack_dir": ""}})
+        victim = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+        def cleanup():
+            if victim.poll() is None:
+                victim.kill()
+            victim.wait(timeout=5)
+        self.addCleanup(cleanup)
+        _write_exec(os.path.join(bindir, "cys"),
+                    '#!/bin/sh\n'
+                    'echo "cys:$1" >> "$WP12_CALLS"\n'
+                    'if [ "$WP12_BLOCK_CLI" = 1 ]; then exit 126; fi\n'
+                    'if [ "$1" = ping ] && [ "$WP12_UNREACHABLE" = 1 ]; then exit 1; fi\n'
+                    'case "$1" in\n'
+                    ' --version) echo "cys 0.14.53"; exit 0 ;;\n'
+                    ' ping) [ -e "$CYS_SOCKET" ]; exit $? ;;\n'
+                    ' identify) echo \'{"daemon_pid":"%s","version":"0.14.53"}\'; exit 0 ;;\n'
+                    ' status) exit 1 ;;\n'
+                    'esac\nexit 0\n' % victim.pid)
+        _write_exec(os.path.join(bindir, "cysd"),
+                    '#!/bin/sh\n'
+                    'if [ "$1" = "--version" ]; then echo "cysd 0.14.53 (build x)"; exit %d; fi\n'
+                    'mkdir -p "$(dirname "$CYS_SOCKET")"\ntouch "$CYS_SOCKET"\nexit 0\n' % (1 if refused else 0))
+        # Keep real host path/termination plumbing, exercising the complete rotate branch and its real probe.
+        # No production function is replaced: uname returns Windows only while inside probe_rotation_bins.
+        shell_env = os.path.join(self.tmp, "probe-os-selector.sh")
+        with open(shell_env, "w") as stream:
+            stream.write('uname(){ case "${FUNCNAME[*]}" in *probe_rotation_bins*) echo MINGW64 ;; *) /usr/bin/uname "$@" ;; esac; }\n')
+        args = ["rotate", "d1"]
+        if bind_pair:
+            siblings = os.path.join(self.tmp, "checked-siblings")
+            os.mkdir(siblings)
+            for binary in ("cysd", "cys"):
+                shutil.copy2(os.path.join(bindir, binary), os.path.join(siblings, binary))
+                _write_exec(os.path.join(bindir, binary), "#!/bin/sh\nexit 126\n")
+            args += ["--rotation-pair", os.path.join(siblings, "cysd"), os.path.join(siblings, "cys")]
+        env = dict(self.env, BASH_ENV=shell_env, WP12_CALLS=os.path.join(self.tmp, "rotation.calls"),
+                   WP12_BLOCK_CLI="1" if cli_blocked else "0", WP12_UNREACHABLE="1" if unreachable else "0")
+        rc, out, err = self.run_dept(*args, env=env)
+        if refused or cli_blocked or unreachable:
+            self.assertIsNone(victim.poll(), "blocked rotation must preserve old daemon PID")
+            self.assertEqual(rc, 9 if unreachable else 12, out + err)
+            if unreachable:
+                self.assertNotIn("new_daemon_blocked:", err)
+            else:
+                self.assertTrue(err.startswith("new_daemon_blocked:"), err)
+                self.assertEqual(len(err.splitlines()), 1, err)
+            if os.path.exists(env["WP12_CALLS"]):
+                with open(env["WP12_CALLS"]) as calls:
+                    self.assertNotIn("cys:drain", calls.read())
+            with open(sock) as stream:
+                self.assertEqual(stream.read(), "old-socket", "blocked rotation must preserve socket bytes")
+        else:
+            self.assertEqual(rc, 0, out + err)
+            self.assertIsNotNone(victim.poll(), "healthy rotation must reach daemon replacement")
+            self.assertTrue(os.path.exists(sock), "healthy rotation must recreate the socket")
+            self.assertIn("rotated d1:", out)
+
+    def test_refusal_keeps_pid_and_socket(self):
+        self.exercise(True)
+
+    def test_healthy_pair_rotates(self):
+        self.exercise(False)
+
+    def test_explicit_pair_is_used_despite_later_path_shadow(self):
+        self.exercise(False, bind_pair=True)
+
+    def test_blocked_candidate_cli_is_typed_before_ping(self):
+        self.exercise(False, cli_blocked=True)
+
+    def test_healthy_pair_unreachable_daemon_keeps_exit9(self):
+        self.exercise(False, unreachable=True)
+
+
+class RotateBinaryProbe(unittest.TestCase):
+    """★(0.14.53 WP12 · P2 · DESIGN-R2 G1.3/G1.5 · codex R2-F2/R2-F3) the shell twin `probe_rotation_bins` in cys-dept.
+
+    The REAL function text runs in bash with `uname` overridden to a Windows value (the gate itself - the case
+    pattern - is pinned below) and mock cysd/cys that print the shared vectors
+    (scripts/tests/fixtures/binprobe-vectors.json, also read by the app's Rust test). Each line is paired with the
+    good line of the other binary, because the twin checks V == V' rather than a known app version."""
+
+    VECTORS = os.path.join(SELF, "..", "..", "..", "scripts", "tests", "fixtures", "binprobe-vectors.json")
+    STDERR_FIXTURE = os.path.join(SELF, "..", "..", "..", "scripts", "tests", "fixtures", "cys-dept-binprobe-stderr.txt")
+    V = "0.14.53"
+
+    @classmethod
+    def setUpClass(cls):
+        src = open(DEPT, encoding="utf-8").read()
+        m = re.search(r"(?ms)^probe_rotation_bins\(\)\{.*?^\}\n", src)
+        assert m, "probe_rotation_bins is missing from cys-dept"
+        bind = re.search(r"(?ms)^rotation_bind_bins\(\)\{.*?^\}\n", src)
+        assert bind, "rotation_bind_bins missing"
+        host = re.search(r"(?ms)^rotation_require_os\(\)\{.*?^\}\n", src)
+        assert host, "rotation_require_os missing"
+        cls.fn = host.group(0) + bind.group(0) + m.group(0)
+        cls.src = src
+        cls.tmp = tempfile.mkdtemp(prefix="wp12-binprobe-")
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def mock(self, name, text, code=0, sleep=0):
+        path = os.path.join(self.tmp, name)
+        _write_exec(path, "#!%s\nimport sys, time\ntime.sleep(%d)\nsys.stdout.buffer.write(%r)\nsys.exit(%d)\n"
+                    % (sys.executable, sleep, text.encode("utf-8"), code))
+        return path
+
+    def probe(self, cysd, cys, windows=True):
+        script = ("set -euo pipefail\n" + ("uname(){ echo MINGW64_NT-10.0-26100; }\n" if windows else "")
+                  + self.fn + 'CYSD=%s\nCYS=%s\nprobe_rotation_bins demo\necho PASSED\n' % (shlex.quote(cysd), shlex.quote(cys)))
+        return subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60,
+                              env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+
+    def fill(self, t, other="9.9.9"):
+        return t.replace("{V}", self.V).replace("{OTHER}", other)
+
+    def test_vectors_accept_and_reject_with_one_prefix_and_exit_12(self):
+        with open(self.VECTORS, encoding="utf-8") as f:
+            vec = json.load(f)
+        good = {"cysd": self.mock("good-cysd", "cysd %s (build 0123456789ab)\n" % self.V),
+                "cys": self.mock("good-cys", "cys %s\n" % self.V)}
+        n = 0
+        for bin_ in ("cysd", "cys"):
+            for kind in ("accept", "reject"):
+                for i, t in enumerate(vec[bin_][kind]):
+                    p = self.mock("%s-%s-%d" % (bin_, kind, i), self.fill(t))
+                    pair = (p, good["cys"]) if bin_ == "cysd" else (good["cysd"], p)
+                    r = self.probe(*pair)
+                    with self.subTest(bin=bin_, kind=kind, text=t):
+                        if kind == "accept":
+                            self.assertEqual((r.returncode, r.stdout.strip()), (0, "PASSED"), r.stderr)
+                        else:
+                            self.assertEqual(r.returncode, 12, r.stdout + r.stderr)
+                            self.assertNotIn("PASSED", r.stdout)
+                            self.assertTrue(r.stderr.startswith("new_daemon_blocked:"), r.stderr)
+                            self.assertIn("rotate 중단(데몬 불변)", r.stderr)
+                    n += 1
+        self.assertGreaterEqual(n, 25, "the vector file looks truncated")
+
+    def test_exit_code_missing_binary_and_version_pair(self):
+        good_cys = self.mock("p-cys", "cys %s\n" % self.V)
+        r = self.probe(self.mock("p-rc", "cysd %s (build x)\n" % self.V, code=3), good_cys)
+        self.assertEqual((r.returncode, r.stderr.split(" ")[0]), (12, "new_daemon_blocked:cysd:rc:3"))
+        r = self.probe(os.path.join(self.tmp, "no-such-cysd"), good_cys)
+        self.assertEqual(r.returncode, 12)
+        self.assertTrue(r.stderr.startswith("new_daemon_blocked:cysd:error:"), r.stderr)
+        r = self.probe(self.mock("p-d", "cysd %s (build x)\n" % self.V), self.mock("p-c2", "cys 0.14.52\n"))
+        self.assertEqual((r.returncode, r.stderr.split(" ")[0]), (12, "new_daemon_blocked:pair:version-mismatch"))
+
+    def test_r2f2_sleeper_is_killed_inside_the_bound(self):
+        t0 = time.monotonic()
+        r = self.probe(self.mock("p-sleep", "cysd %s (build x)\n" % self.V, sleep=60), self.mock("p-c3", "cys %s\n" % self.V))
+        took = time.monotonic() - t0
+        self.assertEqual((r.returncode, r.stderr.split(" ")[0]), (12, "new_daemon_blocked:cysd:timeout"))
+        self.assertLess(took, 17.0, "10 s bound + 5 s confirmation must hold (took %.1fs)" % took)
+
+    def test_non_windows_is_a_no_op(self):
+        r = self.probe(self.mock("p-bad", "", code=1), self.mock("p-bad2", "", code=1), windows=False)
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, "PASSED"), r.stderr)
+
+    def test_r2f3_real_stderr_equals_the_ui_fixture(self):
+        """The UI test (ui/src) classifies this exact text; it must be what the shell really prints."""
+        r = self.probe(self.mock("f-cysd", "", code=1), self.mock("f-cys", "cys %s\n" % self.V))
+        self.assertEqual(r.returncode, 12)
+        with open(self.STDERR_FIXTURE, encoding="utf-8") as f:
+            self.assertEqual(r.stderr, f.read())
+
+    def test_cys_exit_missing_and_oversized_output_refuse(self):
+        d = self.mock("second-d", "cysd %s (build x)\n" % self.V)
+        for path, prefix in [
+            (self.mock("second-rc", "cys %s\n" % self.V, code=4), "new_daemon_blocked:cys:rc:4"),
+            (os.path.join(self.tmp, "missing-second"), "new_daemon_blocked:cys:error:"),
+            (self.mock("second-large", "x" * 4097), "new_daemon_blocked:cys:error:output-too-large"),
+        ]:
+            with self.subTest(prefix=prefix):
+                result = self.probe(d, path)
+                self.assertEqual(result.returncode, 12, "second binary refusal must abort rotation")
+                self.assertTrue(result.stderr.startswith(prefix), result.stderr)
+                self.assertNotIn("PASSED", result.stdout)
+
+    def test_cys_timeout_refuses(self):
+        result = self.probe(self.mock("timeout-d", "cysd %s (build x)\n" % self.V),
+                            self.mock("timeout-c", "cys %s\n" % self.V, sleep=60))
+        self.assertEqual(result.returncode, 12)
+        self.assertTrue(result.stderr.startswith("new_daemon_blocked:cys:timeout"), result.stderr)
+
+    def test_os_detection_failure_refuses_before_any_rotation(self):
+        for uname, blocked in [("return 127", True), ("return 0", True),
+                               ("echo MINGW64_NT", True), ("echo Darwin", False),
+                               ("echo Linux", False), ("echo FreeBSD", False)]:
+            with self.subTest(uname=uname):
+                script = ("set -euo pipefail\nuname(){ " + uname + "; }\n" + self.fn
+                          + '\nCYSD=/nonexistent/cysd.exe\nCYS=/nonexistent/cys.exe\n'
+                          + 'probe_rotation_bins demo\necho PROCEEDED_AFTER_PROBE\n')
+                result = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+                self.assertEqual(result.returncode, 12 if blocked else 0, result)
+                if blocked:
+                    self.assertTrue(result.stderr.startswith("new_daemon_blocked:"), result.stderr)
+                    self.assertNotIn("PROCEEDED_AFTER_PROBE", result.stdout)
+                    if uname.startswith("return"):
+                        self.assertIn("os-detection-failed", result.stderr)
+                else:
+                    self.assertEqual(result.stderr, "")
+                    self.assertIn("PROCEEDED_AFTER_PROBE", result.stdout)
+
+    def test_crlf_interpreter_protocol_accepts_a_healthy_pair(self):
+        shimdir = os.path.join(self.tmp, "crlf-python")
+        os.makedirs(shimdir, exist_ok=True)
+        shim = os.path.join(shimdir, "python3")
+        _write_exec(shim, "#!%s\nimport subprocess,sys\nr=subprocess.run([sys.executable]+sys.argv[1:], stdout=subprocess.PIPE)\nsys.stdout.buffer.write(r.stdout.replace(b'\\r\\n',b'\\n').replace(b'\\n',b'\\r\\n'))\nsys.exit(r.returncode)\n" % sys.executable)
+        d = self.mock("crlf-cysd", "cysd %s (build x)\n" % self.V)
+        c = self.mock("crlf-cys", "cys %s\n" % self.V)
+        script = ("set -euo pipefail\nuname(){ echo MINGW64; }\n" + self.fn
+                  + '\nexport PATH=%s:"$PATH"\nCYSD=%s\nCYS=%s\nprobe_rotation_bins demo\necho PASSED\n'
+                  % (shlex.quote(shimdir), shlex.quote(d), shlex.quote(c)))
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, "CRLF protocol must not refuse a healthy pair: " + result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertIn("PASSED", result.stdout)
+        self.mock("crlf-cys", "cys %s\n" % self.V, code=1)
+        refused = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=20)
+        self.assertEqual(refused.returncode, 12)
+        self.assertTrue(refused.stderr.startswith("new_daemon_blocked:cys:rc:1"), refused.stderr)
+        self.assertEqual(len(refused.stderr.splitlines()), 1, "CRLF refusal must stay one protocol line")
+
+    def test_probe_infrastructure_failure_keeps_prefix(self):
+        for function, prefix in [
+            ("python3(){ return 1; }", "new_daemon_blocked:pair:path-resolution-failed"),
+            ('python3(){ if [ "$1" = -c ]; then return 1; else command python3 "$@"; fi; }',
+             "new_daemon_blocked:probe:error"),
+        ]:
+            with self.subTest(prefix=prefix):
+                script = ("set -euo pipefail\nuname(){ echo MINGW64; }\n" + function + "\n"
+                          + self.fn + '\nCYSD=/nonexistent/cysd\nCYS=/nonexistent/cys\nprobe_rotation_bins demo\necho PASSED\n')
+                result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 12)
+                self.assertTrue(result.stderr.startswith(prefix), result.stderr)
+                self.assertNotIn("PASSED", result.stdout)
+
+    def test_output_io_failure_refuses(self):
+        from unittest.mock import patch
+        program = self.fn.split("<<'BINPROBE_PY'\n", 1)[1].split("\nBINPROBE_PY", 1)[0]
+        ns = {}
+        exec(compile(program.split("\nline, why = run(sys.argv[1])", 1)[0], "cys-dept-binprobe", "exec"), ns)
+        class Output:
+            def __enter__(self): return self
+            def __exit__(self, *_): return False
+            def seek(self, *_): raise OSError("output read failed")
+        class Child:
+            def poll(self): return 0
+        with patch.object(ns["tempfile"], "TemporaryFile", return_value=Output()), \
+             patch.object(ns["subprocess"], "Popen", return_value=Child()):
+            self.assertEqual(ns["run"]("fixture"), (None, "error:output"), "output failure must refuse, never become valid output")
+
+    def test_cleanup_transitions_use_real_python_runner(self):
+        """Inject OS process outcomes into the actual embedded Python, never a copy of its decision logic."""
+        from unittest.mock import patch
+        program = self.fn.split("<<'BINPROBE_PY'\n", 1)[1].split("\nBINPROBE_PY", 1)[0]
+        definitions = program.split("\nline, why = run(sys.argv[1])", 1)[0]
+        ns = {}
+        exec(compile(definitions, "cys-dept-binprobe", "exec"), ns)
+        cases = [
+            ([None, None], "cleanup-unconfirmed"),
+            ([None, 0], "timeout"),
+            ([OSError("wait failed"), None], "cleanup-unconfirmed"),
+            ([OSError("wait failed"), 0], "error:wait"),
+            ([None, OSError("confirmation failed")], "cleanup-unconfirmed"),
+        ]
+        for polls, reason in cases:
+            with self.subTest(polls=str(polls), reason=reason):
+                class Child:
+                    def __init__(self):
+                        self.results = list(polls)
+                        self.events = []
+                    def poll(self):
+                        self.events.append("poll")
+                        answer = self.results.pop(0)
+                        if isinstance(answer, Exception):
+                            raise answer
+                        return answer
+                    def kill(self):
+                        self.events.append("kill")
+                        raise OSError("kill failed")
+                child = Child()
+                # Each deadline expires at its first poll: deterministic, with no sleeping children.
+                clock = iter(range(0, 1000, 20))
+                with patch.object(ns["subprocess"], "Popen", return_value=child), \
+                     patch.object(ns["time"], "monotonic", side_effect=lambda: next(clock)):
+                    self.assertEqual(ns["run"]("fixture"), (None, reason), "cleanup status must reflect confirmation")
+                self.assertEqual(child.events, ["poll", "kill", "poll"], "failed wait/kill must still confirm termination")
+
+    def test_cleanup_refusals_reach_both_binary_emitters(self):
+        import contextlib
+        import io
+        from unittest.mock import patch
+        program = self.fn.split("<<'BINPROBE_PY'\n", 1)[1].split("\nBINPROBE_PY", 1)[0]
+        for target in ("cysd", "cys"):
+            for first, confirmation, reason in [(None, None, "cleanup-unconfirmed"),
+                                                (None, 0, "timeout"),
+                                                (OSError("wait failed"), 0, "error:wait")]:
+                with self.subTest(target=target, reason=reason):
+                    class Child:
+                        def __init__(self, polls):
+                            self.polls = list(polls)
+                        def poll(self):
+                            value = self.polls.pop(0)
+                            if isinstance(value, Exception):
+                                raise value
+                            return value
+                        def kill(self):
+                            raise OSError("kill failed")
+                    def spawn(args, **kwargs):
+                        if target == "cys" and args[0] == "daemon-fixture":
+                            kwargs["stdout"].write(b"cysd 0.14.53 (build x)\n")
+                            return Child([0])
+                        return Child([first, confirmation])
+                    clock = iter(range(0, 1000, 20))
+                    output = io.StringIO()
+                    with patch.object(subprocess, "Popen", side_effect=spawn), \
+                         patch.object(time, "monotonic", side_effect=lambda: next(clock)), \
+                         patch.object(sys, "argv", ["probe", "daemon-fixture", "cli-fixture"]), \
+                         contextlib.redirect_stdout(output):
+                        with self.assertRaises(SystemExit) as exited:
+                            exec(compile(program, "cys-dept-binprobe", "exec"), {})
+                    self.assertEqual(exited.exception.code, 1, "refusal must exit before ok")
+                    self.assertEqual(output.getvalue(), target + ":" + reason + "\n", "refusal must retain binary and reason")
+
+    def test_structure_gate_and_call_site(self):
+        # Behavior of failed/empty and non-Windows selectors is exercised above.
+        self.assertIn('os="$(uname -s 2>/dev/null)" || os=""', self.fn)
+        self.assertIn('    MINGW*|MSYS*|CYGWIN*) ;;\n', self.fn, "Windows selector changed")
+        self.assertIn('    *) return 0 ;;\n', self.fn, "non-Windows no-op changed")
+        self.assertEqual(self.src.count('probe_rotation_bins "$name"'), 1)
+        rot = self.src.index("\n  rotate)\n")
+        call = self.src.index('probe_rotation_bins "$name"', rot)
+        kill = self.src.index('graceful_kill "$pid"', rot)
+        ident = self.src.index('"$CYS" identify', rot)
+        ping = self.src.index('"$CYS" ping', rot)
+        self.assertTrue(call < ping < ident < kill, "probe must precede the first candidate CLI and kill")
+        self.assertIn("exit 12", self.fn)
+        self.assertNotRegex(self.fn, r"(?m)^\s*(kill|taskkill|graceful_kill)\b", "the probe never kills a daemon")
 
 
 if __name__ == "__main__":

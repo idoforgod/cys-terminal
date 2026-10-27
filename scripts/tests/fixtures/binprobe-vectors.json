@@ -1,0 +1,44 @@
+{
+  "_doc": "WP12 (0.14.53) DESIGN-R2 F3/G1.3: one vector set for every --version parser of the pre-swap/rotation run check. Each entry is a full stdout text; parsers take its first line (cut at CR or LF). {V} = the version under test, {OTHER} = a different version. Readers: src-tauri/src/main.rs binprobe tests (H) and cysjavis-pack/bin/tests/test_dept_rotate_binprobe.py (cys-dept shell twin, which pairs each line with the good line of the other binary). The installer parser (nsis-hooks.nsh CYS_PROBE_LEAF) is pinned structurally in scripts/tests/nsis-hook-model/model.py.",
+  "cysd": {
+    "accept": [
+      "cysd {V} (build 0123456789ab)\n",
+      "cysd {V} (build unknown)\r\n",
+      "cysd {V} (build x)",
+      "cysd {V} (build a-b_c.d+e~!)\nsecond line ignored\n"
+    ],
+    "reject": [
+      "",
+      "\ncysd {V} (build x)\n",
+      "cysd {OTHER} (build x)\n",
+      "cysd {V}0 (build x)\n",
+      "cysd {V}\n",
+      "cysd {V} (build )\n",
+      "cysd {V} (build x) trailing\n",
+      "cysd {V} (build a b)\n",
+      "cysd {V} (build a)b)\n",
+      "cysd {V} (build a\tb)\n",
+      "cysd {V} (build é)\n",
+      "CYSD {V} (build x)\n",
+      " cysd {V} (build x)\n",
+      "cysd  {V} (build x)\n"
+    ]
+  },
+  "cys": {
+    "accept": [
+      "cys {V}\n",
+      "cys {V}\r\n",
+      "cys {V}"
+    ],
+    "reject": [
+      "",
+      "cys {OTHER}\n",
+      "cys {V}0\n",
+      "cys {V} extra\n",
+      "cys {V} \n",
+      "CYS {V}\n",
+      "cys\n",
+      "\ncys {V}\n"
+    ]
+  }
+}

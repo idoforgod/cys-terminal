@@ -8046,6 +8046,59 @@ function daemonActionBlocked(): boolean {
 }
 let verSkewBadge: HTMLElement | null = null;
 let skewNoticeShown = false; // C: 세션당 1회 능동 안내 플래그(스큐 해소 시 리셋)
+// WP12: a refusal stops automatic rotation for this app version. Only a
+// successful explicit pre-probe clears it; ordinary errors retain normal retry.
+const rotationBlocked = new Set<string>();
+const rotationBlockNoticeShown = new Set<string>();
+// P4 blocker 1: the latch is per ROUTE, not per app version - a department-arm refusal must
+// not stop the rotation of a healthy main (a PC with zero departments probed an unrelated
+// shell-selected pair and latched the whole version).
+type RotationRoute = "main" | "depts";
+function rotationKey(appVer: string, route: RotationRoute) { return `${appVer}|${route}`; }
+function rotationIsBlocked(appVer: string, route: RotationRoute) { return rotationBlocked.has(rotationKey(appVer, route)); }
+function rotationAllBlocked(appVer: string) { return rotationIsBlocked(appVer, "main") && rotationIsBlocked(appVer, "depts"); }
+function rotationRefused(error: unknown): boolean {
+  const text = error instanceof Error ? error.message : String(error);
+  return text.startsWith("new_daemon_blocked:");
+}
+function noteRotationBlocked(appVer: string, manual = false, route: RotationRoute = "main") {
+  // ASYMMETRIC on purpose. A main-arm refusal still latches BOTH routes (unchanged behaviour:
+  // the native pair failing is evidence about this build). A department-arm refusal latches
+  // ONLY departments - it says nothing about the app's own sidecars, and treating it as
+  // evidence about them is blocker 1 (a PC with no department refused a healthy main).
+  rotationBlocked.add(rotationKey(appVer, route));
+  if (route === "main") rotationBlocked.add(rotationKey(appVer, "depts"));
+  if (manual || !rotationBlockNoticeShown.has(rotationKey(appVer, route))) {
+    rotationBlockNoticeShown.add(rotationKey(appVer, route));
+    toast("health", "새 실행 파일 확인 실패",
+      "새 실행 파일을 실행할 수 있는지 확인하지 못해 남은 교대를 중단했습니다. 차단된 대상의 기존 데몬은 유지됩니다. 상태바 배지나 재시작 버튼으로 다시 확인할 수 있습니다.");
+  }
+}
+async function probeRotationForManual(appVer: string, includeMain = true, includeDepartments = true) {
+  // An empty retry must not clear a latch without any probe - and must NOT widen the scope
+  // either (widening is what probed a department pair on a PC that has no department).
+  if (!includeMain && !includeDepartments) return;
+  // One call per route: a refusal is then attributable to the route that produced it without
+  // adding an arm tag to the machine-readable `new_daemon_blocked:` vocabulary.
+  for (const route of (["main", "depts"] as RotationRoute[])) {
+    if (route === "main" ? !includeMain : !includeDepartments) continue;
+    try {
+      await invoke("probe_rotation_binaries", { includeMain: route === "main", includeDepartments: route === "depts" });
+    } catch (e) {
+      if (rotationRefused(e)) noteRotationBlocked(appVer, true, route);
+      throw e;
+    }
+    rotationBlocked.delete(rotationKey(appVer, route));
+  }
+}
+
+
+// R3 (codex r2 M1): the single place the badge's department targets are built. Every
+// retention path goes through here, and identity is the department NAME - appending the
+// same department twice made one badge retry force two rotations of a freshly restored seat.
+function holdDepts(held: SkewedDept[], add: SkewedDept[]) {
+  for (const d of add) if (!held.some((h) => h.name === d.name)) held.push(d);
+}
 
 interface SkewedDept {
   name: string;
@@ -8054,20 +8107,20 @@ interface SkewedDept {
 
 // rotate_daemon/rotate_dept_daemon 래퍼 — force=false면 백엔드가 세션>0 시 "live_sessions:N"로 거부(=보류).
 // skipDrain: verified 재시작 경로만 true(사전 drain --verify로 저장 확인됨) — 기본 false는 plain drain(회귀 0).
-async function rotateMainDaemon(force: boolean, skipDrain = false): Promise<"ok" | "held" | "err"> {
+async function rotateMainDaemon(force: boolean, skipDrain = false): Promise<"ok" | "held" | "err" | "blocked"> {
   try {
     await invoke("rotate_daemon", { force, skipDrain });
     return "ok";
   } catch (e) {
-    return String(e).includes("live_sessions:") ? "held" : "err";
+    return rotationRefused(e) ? "blocked" : String(e).includes("live_sessions:") ? "held" : "err";
   }
 }
-async function rotateDeptDaemon(name: string, force: boolean, skipDrain = false): Promise<"ok" | "held" | "err"> {
+async function rotateDeptDaemon(name: string, force: boolean, skipDrain = false): Promise<"ok" | "held" | "err" | "blocked"> {
   try {
     await invoke("rotate_dept_daemon", { name, force, skipDrain });
     return "ok";
   } catch (e) {
-    return String(e).includes("live_sessions:") ? "held" : "err";
+    return rotationRefused(e) ? "blocked" : String(e).includes("live_sessions:") ? "held" : "err";
   }
 }
 
@@ -8154,6 +8207,10 @@ function showSkewBadge(
   verSkewBadge.title =
     "업데이트가 적용됐지만 실행 중인 세션(마스터·워커·부서)을 보존하기 위해 기존 데몬이 계속 봉사합니다.\n" +
     "클릭하면 저장(drain) 후 새 버전으로 순차 교대(메인→부서)하고 세션을 복원합니다.";
+  if (rotationIsBlocked(appVer, "main") || rotationIsBlocked(appVer, "depts")) {
+    verSkewBadge.textContent = `새 실행 파일 확인 실패 · 앱 v${appVer} — 클릭하여 다시 확인`;
+    verSkewBadge.title = "자동 교대를 멈췄습니다. 클릭하면 새 실행 파일을 다시 확인하고, 통과한 경우에만 저장 후 교대합니다.";
+  }
   verSkewBadge.onclick = () => void manualRotateSkewed(appVer, heldMain, heldDepts);
 }
 
@@ -8166,22 +8223,43 @@ async function manualRotateSkewed(appVer: string, heldMain: boolean, heldDepts: 
     toast("feed", "교대 불가", daemonActionBlockedMsg());
     return;
   }
-  const nodes = (heldMain ? 1 : 0) + heldDepts.length;
-  const ok = await confirmModal(
-    `데몬 교대 (새 버전 v${appVer})`,
-    `작업 세션이 물려 있는 데몬 ${nodes}개를 새 버전으로 순차 교대(메인→부서)합니다. 저장(drain) 신호 후 ` +
-      `교대하고 세션을 복원합니다. 마지막 미저장분은 손실될 수 있습니다.\n\n지금 교대하시겠습니까?`,
-    "교대",
-  );
-  if (!ok) return;
+  // R2 1D (gemini): an empty retry has nothing to rotate - return BEFORE the probe, the
+  // confirmation modal and clearSkewBadge(). R1 only made probeRotationForManual a no-op,
+  // so a 0-node modal still opened and a successful "rotation of nothing" cleared the badge.
+  if (!heldMain && heldDepts.length === 0) return;
   rotatingDaemon = true;
-  stickyToast("rotate-daemon", "feed", "↻ 데몬 교대", `새 버전 v${appVer}로 교대 중… 저장 후 세션을 복원합니다.`);
   try {
-    if (heldMain) await invoke("rotate_daemon", { force: true, skipDrain: false });
+    await probeRotationForManual(appVer, heldMain, heldDepts.length > 0);
+    const nodes = (heldMain ? 1 : 0) + heldDepts.length;
+    const ok = await confirmModal(
+      `데몬 교대 (새 버전 v${appVer})`,
+      `작업 세션이 물려 있는 데몬 ${nodes}개를 새 버전으로 순차 교대(메인→부서)합니다. 저장(drain) 신호 후 ` +
+        `교대하고 세션을 복원합니다. 마지막 미저장분은 손실될 수 있습니다.\n\n지금 교대하시겠습니까?`,
+      "교대",
+    );
+    if (!ok) return;
+    stickyToast("rotate-daemon", "feed", "↻ 데몬 교대", `새 버전 v${appVer}로 교대 중… 저장 후 세션을 복원합니다.`);
+    // R2 (codex M1 / gemini 1B): the route is latched AT THE STAGE THAT THREW. The outer catch
+    // cannot tell a main refusal from a dept refusal, and R1's `heldMain ? "main" : "depts"`
+    // falsely latched a healthy main whenever heldMain was true.
+    if (heldMain) {
+      try {
+        await invoke("rotate_daemon", { force: true, skipDrain: false });
+      } catch (e) {
+        if (rotationRefused(e)) noteRotationBlocked(appVer, true, "main");
+        throw e;
+      }
+    }
     // 경미2: rotate_dept_daemon이 반환하는 restore_ok=false(교대 후 부서 노드 복원 실패)를 삼키지 않고 승격.
     let deptRestoreFailed = false;
     for (const d of heldDepts) {
-      const info = (await invoke("rotate_dept_daemon", { name: d.name, force: true, skipDrain: false })) as { restore_ok?: boolean };
+      let info: { restore_ok?: boolean };
+      try {
+        info = (await invoke("rotate_dept_daemon", { name: d.name, force: true, skipDrain: false })) as { restore_ok?: boolean };
+      } catch (e) {
+        if (rotationRefused(e)) noteRotationBlocked(appVer, true, "depts");
+        throw e;
+      }
       if (info?.restore_ok === false) deptRestoreFailed = true;
     }
     dismissToast("rotate-daemon");
@@ -8191,7 +8269,12 @@ async function manualRotateSkewed(appVer: string, heldMain: boolean, heldDepts: 
     else toast("watchdog", "✅ 데몬 교대 완료", `데몬이 v${appVer}로 교대됐습니다. 노드 복원이 진행됩니다.`);
   } catch (e) {
     dismissToast("rotate-daemon");
-    toast("health", "데몬 교대 실패", String(e));
+    if (rotationRefused(e)) {
+      // R2: no re-latch here. probeRotationForManual and the rotate stages above latch the
+      // route that actually refused; re-latching by heldMain was gemini 1B's false main latch.
+      const info = document.getElementById("daemon-info");
+      if (info) showSkewBadge(info, appVer, heldMain, "", heldDepts);
+    } else toast("health", "데몬 교대 실패", String(e));
   } finally {
     rotatingDaemon = false;
   }
@@ -8245,21 +8328,18 @@ function drainVerifyReportText(r: DrainVerifyReport): string {
 // skipDrain=true면 rotate가 이중 drain을 생략(verified 경로: 사전 drain --verify로 저장 확인됨),
 // false면 rotate가 plain drain(기존 거동·폴백). 앱 재시작 없음 — GUI는 새 데몬에 자동 재연결.
 // 죽은 부서 소켓은 skip(detectSkew 동형 — 부서 부활은 CSO·피닉스 소유).
-async function restartAllDaemons(skipDrain: boolean): Promise<{ failedDepts: string[]; deptRestoreFailed: boolean }> {
-  await invoke("rotate_daemon", { force: true, skipDrain });
-  // 부서 열거=list_depts(레지스트리 SOT) + daemon_status 생존 확인 — detectSkew 동형(죽은 등재 skip).
-  // ★D5-c: 판독 실패는 빈 목록으로 접되(부서 교대 생략 · 본부만 재시작 · 부서 데몬 무접촉) 사용자 동작이므로 매번 1줄 알린다.
+// P4 blocker 1: ONE enumeration, used by BOTH the probe scope and the rotation loop -
+// enumerating twice can answer differently (a department can appear or die between the two)
+// and that is exactly how a probe scope stops matching what is rotated.
+async function liveDeptRoster(): Promise<{ names: string[]; sockets: Record<string, string> }> {
   let regErr: unknown = null;
-  const reg = (await invoke("list_depts").catch((e) => {
-    regErr = e;
-    return { depts: {} };
-  })) as {
+  const reg = (await invoke("list_depts").catch((e) => { regErr = e; return { depts: {} }; })) as {
     depts?: Record<string, { socket?: string }>;
   };
   if (regErr != null)
     toast("watchdog", "부서 레지스트리를 읽지 못했습니다", `부서 데몬 교대를 건너뜁니다(본부만 재시작 · 부서는 그대로). 사유: ${String(regErr).slice(0, 300)}`);
-  let deptRestoreFailed = false;
-  const failedDepts: string[] = [];
+  const names: string[] = [];
+  const sockets: Record<string, string> = {};
   for (const [name, meta] of Object.entries(reg.depts ?? {})) {
     if (!meta.socket) continue;
     try {
@@ -8267,10 +8347,33 @@ async function restartAllDaemons(skipDrain: boolean): Promise<{ failedDepts: str
     } catch {
       continue; // 죽은/전이 중 부서 소켓 skip(무해)
     }
+    names.push(name);
+    sockets[name] = meta.socket;
+  }
+  return { names, sockets };
+}
+
+async function restartAllDaemons(skipDrain: boolean, roster?: { names: string[]; sockets: Record<string, string> }, appVer_of_restart = ""): Promise<{ failedDepts: string[]; deptRestoreFailed: boolean }> {
+  // R2 1A (gemini): R1 deleted the latch from manualRestartAllDaemons's catch and added none
+  // here, so a rotate refusal AFTER a passing pre-probe latched nothing, showed no toast and
+  // was retried on the next tick. The measured R1 sequence was ["main","first","main","first"].
+  try {
+    await invoke("rotate_daemon", { force: true, skipDrain });
+  } catch (e) {
+    if (rotationRefused(e)) noteRotationBlocked(appVer_of_restart, true, "main");
+    throw e;
+  }
+  // 부서 열거=list_depts(레지스트리 SOT) + daemon_status 생존 확인 — detectSkew 동형(죽은 등재 skip).
+  // ★D5-c: 판독 실패는 빈 목록으로 접되(부서 교대 생략 · 본부만 재시작 · 부서 데몬 무접촉) 사용자 동작이므로 매번 1줄 알린다.
+  const live = roster ?? (await liveDeptRoster());
+  let deptRestoreFailed = false;
+  const failedDepts: string[] = [];
+  for (const name of live.names) {
     try {
       const info = (await invoke("rotate_dept_daemon", { name, force: true, skipDrain })) as { restore_ok?: boolean };
       if (info?.restore_ok === false) deptRestoreFailed = true;
-    } catch {
+    } catch (e) {
+      if (rotationRefused(e)) { noteRotationBlocked(appVer_of_restart, true, "depts"); throw e; }
       failedDepts.push(name);
     }
   }
@@ -8294,15 +8397,23 @@ async function manualRestartAllDaemons() {
   // ★[F3]+A6: purge·완전 초기화 진행 중이거나 **초기화 완료 래치**가 걸렸으면 재시작을 막는다
   // (완료 후 재시작은 pack 없는 유령 데몬을 세워 "설치 직후" 계약을 무음 침식한다).
   if (daemonActionBlocked()) return;
-  const ok = await confirmModal(
-    "데몬 재시작",
-    "재시작 전에 각 노드의 체크포인트(SESSION_STATE·TODO) 저장을 먼저 검증합니다. 검증이 끝나면 데몬(메인+부서)을 " +
-      "다시 켜고 부서·노드의 대화 기억을 트랜스크립트로 복원합니다.\n\n지금 저장을 검증하고 재시작하시겠습니까?",
-    "저장 후 재시작",
-  );
-  if (!ok) return;
+  let appVer = "";
+  let roster: { names: string[]; sockets: Record<string, string> } = { names: [], sockets: {} };
   rotatingDaemon = true;
   try {
+    appVer = (await invoke("app_version")) as string;
+    if (!appVer) throw new Error("앱 버전을 확인하지 못했습니다.");
+    // P4 blocker 1: the probe scope is a measurement, not an assumption - enumerate the live
+    // departments first and probe only the routes this restart will actually rotate.
+    roster = await liveDeptRoster();
+    await probeRotationForManual(appVer, true, roster.names.length > 0);
+    const ok = await confirmModal(
+      "데몬 재시작",
+      "재시작 전에 각 노드의 체크포인트(SESSION_STATE·TODO) 저장을 먼저 검증합니다. 검증이 끝나면 데몬(메인+부서)을 " +
+        "다시 켜고 부서·노드의 대화 기억을 트랜스크립트로 복원합니다.\n\n지금 저장을 검증하고 재시작하시겠습니까?",
+      "저장 후 재시작",
+    );
+    if (!ok) return;
     // 1) 저장 검증(drain --verify) — feature-detect. 미지원/실패 시 plain drain 폴백.
     stickyToast("restart-daemon", "feed", "↻ 저장 검증", "재시작 전 노드 체크포인트(SESSION_STATE)를 검증하는 중…");
     let verify: DrainVerifyReport | null = null;
@@ -8320,7 +8431,7 @@ async function manualRestartAllDaemons() {
       const t = drainVerifyFallbackToast(fallback);
       toast("health", t.title, t.body);
       stickyToast("restart-daemon", "feed", "↻ 데몬 재시작", "저장 후 데몬을 다시 시작하는 중… 부서·노드를 자동 복원합니다.");
-      const { failedDepts, deptRestoreFailed } = await restartAllDaemons(false);
+      const { failedDepts, deptRestoreFailed } = await restartAllDaemons(false, roster, appVer);
       dismissToast("restart-daemon");
       restartResultToast(failedDepts, deptRestoreFailed);
       return;
@@ -8336,7 +8447,7 @@ async function manualRestartAllDaemons() {
     }
     // 3) verified 재시작 — 사전 검증했으므로 rotate는 이중 drain 생략(skipDrain=true).
     stickyToast("restart-daemon", "feed", "↻ 데몬 재시작", "저장 검증 완료 — 데몬을 다시 시작하고 노드를 복원하는 중…");
-    const { failedDepts, deptRestoreFailed } = await restartAllDaemons(true);
+    const { failedDepts, deptRestoreFailed } = await restartAllDaemons(true, roster, appVer);
     dismissToast("restart-daemon");
     // 재시작 창 큐 보존[A3-F3]: 인메모리 미배달 push는 재시작에 유실된다 — 정직하게 고지(무음 유실 금지).
     const pendingLost = (verify?.pending_loss_warning ?? []).reduce((a, p) => a + (p.pending_undelivered || 0), 0);
@@ -8345,7 +8456,7 @@ async function manualRestartAllDaemons() {
     restartResultToast(failedDepts, deptRestoreFailed);
   } catch (e) {
     dismissToast("restart-daemon");
-    toast("health", "데몬 재시작 실패", String(e));
+    if (!rotationRefused(e)) toast("health", "데몬 재시작 실패", String(e));
   } finally {
     rotatingDaemon = false;
   }
@@ -8364,6 +8475,12 @@ async function checkVersionSkew() {
   const info = document.getElementById("daemon-info");
   if (!info) return;
   const { mainSkew, daemonVer, skewedDepts } = await detectSkew(appVer);
+  // Recheck after asynchronous reads: a manual probe/confirmation may now own rotation.
+  if (rotatingDaemon || purgingDept || factoryResetting || resetCompleted) return;
+  if (rotationAllBlocked(appVer)) {
+    showSkewBadge(info, appVer, mainSkew, daemonVer, skewedDepts);
+    return;
+  }
   if (!mainSkew && skewedDepts.length === 0) {
     clearSkewBadge();
     return;
@@ -8376,13 +8493,30 @@ async function checkVersionSkew() {
   const heldDepts: SkewedDept[] = [];
   rotatingDaemon = true;
   try {
-    if (mainSkew) {
+    // R2 1C (gemini) / codex: a route that is SKIPPED because it is blocked must still be
+    // retained in the displayed held set, or the tick ends with nothing held and
+    // clearSkewBadge() wipes the retry badge the user needs to click.
+    if (mainSkew && rotationIsBlocked(appVer, "main")) heldMain = true;
+    if (mainSkew && !rotationIsBlocked(appVer, "main")) {
       const r = await rotateMainDaemon(false);
-      if (r === "held" || r === "err") heldMain = true;
+      if (r === "blocked") {
+        noteRotationBlocked(appVer, false, "main");
+        heldMain = true;
+        holdDepts(heldDepts, skewedDepts);
+      } else if (r === "held" || r === "err") heldMain = true;
     }
-    for (const d of skewedDepts) {
-      const r = await rotateDeptDaemon(d.name, false);
-      if (r === "held" || r === "err") heldDepts.push(d);
+    if (rotationIsBlocked(appVer, "depts")) holdDepts(heldDepts, skewedDepts);
+    if (!rotationIsBlocked(appVer, "depts")) {
+      for (let index = 0; index < skewedDepts.length; index++) {
+        const d = skewedDepts[index];
+        const r = await rotateDeptDaemon(d.name, false);
+        if (r === "blocked") {
+          noteRotationBlocked(appVer, false, "depts");
+          holdDepts(heldDepts, skewedDepts.slice(index));
+          break;
+        }
+        if (r === "held" || r === "err") holdDepts(heldDepts, [d]);
+      }
     }
   } finally {
     rotatingDaemon = false;
@@ -8392,7 +8526,9 @@ async function checkVersionSkew() {
     return;
   }
   showSkewBadge(info, appVer, heldMain, daemonVer, heldDepts);
-  if (!skewNoticeShown) {
+  // The user has already been told by the refusal toast - ANY blocked route suppresses the
+  // generic skew notice. Only the early return above uses the stricter all-routes predicate.
+  if (!rotationIsBlocked(appVer, "main") && !rotationIsBlocked(appVer, "depts") && !skewNoticeShown) {
     // C: 자동 교대가 보류/실패로 남을 때 1회 안내(sticky 아님 — 8초 auto-dismiss)
     skewNoticeShown = true;
     toast("feed", "새 버전 준비", `새 버전 v${appVer} 준비 — 상태바 배지를 눌러 저장 후 교대하세요.`);
