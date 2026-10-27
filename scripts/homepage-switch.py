@@ -20,9 +20,10 @@ Publication uses only two primitives (BAR B4):
 
 Order rule (DESIGN s6): a file flips only after every file it names or vouches for is already in place.
 
-Exit codes: 0 ok | 2 usage | 3 stopped before any public change | 4 stopped after a journaled prefix of moves |
-            5 public state not recognised, or a planned file no longer holds its target bytes, after this run already made a
-              public change (nothing moved by this call; read `status`, then `resume` or `rollback`).
+Exit codes: 0 ok | 2 usage | 3 stopped before any known name change | 4 stopped after a move started, including a linked
+            destination awaiting source unlink | 5 public state not recognised, changed planned bytes after publication,
+            or a failed move whose destination cannot be re-observed or no longer holds the acknowledged link.
+            For 4/5 read `status`, then choose `resume` or `rollback`; neither means that nothing happened.
 
 Content rule (codex r1 F1): an inode number says which name holds the planned file, not that its bytes are still the planned
 ones - an in-place write keeps the inode. Before any public move, every planned file is checked at its CURRENT location (staged
@@ -450,6 +451,21 @@ def check_plan(items, docroot, allow_already=False, label="switch", dev=None):
     return states, ours
 
 
+def _move_error_code(dst, src_ino, prior, linked, dev=None):
+    """Re-observe the destination after a failed move; a successful link is already a name change.
+    Observation also catches a primitive that changed the name before raising. A lost or unreadable
+    destination after an acknowledged link is uncertainty, never evidence that nothing happened."""
+    try:
+        got = _lstat(dst)
+    except OSError:
+        return STOP_UNKNOWN
+    if _is_reg(got) and got.st_ino == src_ino and (dev is None or got.st_dev == dev):
+        return STOP_PARTIAL
+    if linked:
+        return STOP_UNKNOWN
+    return STOP_PARTIAL if prior else STOP_CLEAN
+
+
 def execute(items, docroot, journal, allow_already=False, label="switch", dev=None):
     """Run the planned moves in order. Idempotent: a second call after a kill finishes what is left (resume)."""
     states, ours = check_plan(items, docroot, allow_already, label, dev)
@@ -467,17 +483,19 @@ def execute(items, docroot, journal, allow_already=False, label="switch", dev=No
             dst = os.path.join(docroot, it["dst"])
             op = "unlink-src" if st == PENDING_UNLINK else ("link+unlink" if it["kind"] == "create" else "rename")
             journal.add(ev="move", phase="before", seq=it["seq"], dst=it["dst"], op=op, src_ino=it["src_ino"])
+            linked = False
             try:
                 if st == PENDING_UNLINK:
                     _do_unlink(it["src"])
                 elif it["kind"] == "create":
                     _do_link(it["src"], dst)
+                    linked = True
                     _do_unlink(it["src"])
                 else:
                     _do_rename(it["src"], dst)
             except OSError as e:
                 journal.add(ev="fail", seq=it["seq"], dst=it["dst"], errno=errno.errorcode.get(e.errno, str(e.errno)))
-                code = STOP_PARTIAL if (moved or moved_before) else STOP_CLEAN
+                code = _move_error_code(dst, it["src_ino"], moved or moved_before, linked, dev)
                 raise Stop(code, "%s: move %d %s failed: %s" % (label, it["seq"], it["dst"], e))
             dfs = _fsync_dir(os.path.dirname(dst))
             got = _lstat(dst)
@@ -717,13 +735,16 @@ def move_files(pairs, journal, label, prior=0):
         if d is not None and d.st_ino != s.st_ino:
             raise Stop(STOP_PARTIAL if (moved or prior) else STOP_CLEAN, "%s: %s already exists with other bytes" % (label, dst))
         journal.add(ev="move", phase="before", label=label, src=src, dst=dst, op="link+unlink")
+        linked = False
         try:
             if d is None:
                 _do_link(src, dst)
+                linked = True
             _do_unlink(src)
         except OSError as e:
             journal.add(ev="fail", label=label, dst=dst, errno=errno.errorcode.get(e.errno, str(e.errno)))
-            raise Stop(STOP_PARTIAL if (moved or prior) else STOP_CLEAN, "%s: %s -> %s failed: %s" % (label, src, dst, e))
+            code = _move_error_code(dst, s.st_ino, moved or prior, linked, s.st_dev)
+            raise Stop(code, "%s: %s -> %s failed: %s" % (label, src, dst, e))
         _fsync_dir(os.path.dirname(dst))
         moved += 1
         journal.add(ev="move", phase="after", label=label, dst=dst)

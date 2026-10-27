@@ -19,6 +19,7 @@ Use: python3 scripts/tests/test_homepage_switch.py
 
 import ast
 import contextlib
+import errno
 import hashlib
 import importlib.util
 import io
@@ -30,6 +31,7 @@ import subprocess
 import sys
 import tempfile
 import tokenize
+import types
 import unittest
 
 sys.dont_write_bytecode = True
@@ -646,6 +648,119 @@ class KillResumeRollbackTests(Base):
         self.assertEqual(rc, 4)
         self.assertEqual(rd(os.path.join(s.docroot, dst)), b"FOREIGN", "a new name was overwritten")
         self.assertTrue(os.path.isfile(os.path.join(s.stage, dst)), "the staged file must stay")
+
+
+class PartialMoveFailureTests(Base):
+    """R3-F1: a failed source unlink must not hide a destination name that the link already created."""
+
+    def failed_move(self, engine, fault, prelinked=False, prior=0):
+        s = self.fresh("partial-%s-%s-%s-%s" % (engine, fault, prelinked, prior))
+        name = hs.versioned_names(NEW)[0]
+        src = os.path.join(s.stage, "downloads", name)
+        dst = os.path.join(s.docroot, "downloads", name)
+        if prelinked:
+            # A previous attempt stopped between link and unlink. The next call must see it.
+            ex = hs.load_expect(os.path.join(s.stage, "expect.json"), s.ts)
+            page_table = hs._load_json(os.path.join(s.stage, "pages.json"), "pages.json")
+            items = hs.build_forward_plan(s.stage, s.docroot, s.backup, ex, page_table)
+            hs._write_json_atomic(os.path.join(s.stage, "plan.json"), {"ts": s.ts, "items": items})
+            os.link(src, dst)
+        real_link, real_unlink, real_lstat = hs._do_link, hs._do_unlink, hs._lstat
+        state = {"failed": False, "links": 0, "observed_after_error": []}
+
+        def fail(message):
+            state["failed"] = True
+            raise OSError(errno.EACCES, message)
+
+        def link(a, b):
+            if fault == "before-link":
+                fail("link refused before changing a name")
+            real_link(a, b)
+            state["links"] += 1
+            if fault == "link-raises-after":
+                fail("link created the name, then reported an error")
+
+        def unlink(path):
+            self.assertEqual(path, src, "fault must target the first source unlink")
+            if fault == "vanished":
+                real_unlink(dst)
+            elif fault == "replaced":
+                real_unlink(dst)
+                put(dst, b"FOREIGN")
+            fail("source unlink failed after link")
+
+        def observe(path):
+            if state["failed"] and path == dst:
+                state["observed_after_error"].append(path)
+                if fault == "unreadable":
+                    raise OSError(errno.EIO, "destination observation unavailable")
+                if fault == "other-device":
+                    got = real_lstat(path)
+                    return types.SimpleNamespace(st_mode=got.st_mode, st_ino=got.st_ino, st_dev=got.st_dev + 1)
+            return real_lstat(path)
+
+        hs._do_link, hs._do_unlink, hs._lstat = link, unlink, observe
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                if engine == "execute":
+                    rc = hs.main(s.args("switch"))
+                else:
+                    try:
+                        hs.move_files([(src, dst)], hs.Journal(os.path.join(s.stage, "pairs.jsonl")),
+                                      "fixture-public-move", prior=prior)
+                        rc = 0
+                    except hs.Stop as exc:
+                        rc = exc.code
+        finally:
+            hs._do_link, hs._do_unlink, hs._lstat = real_link, real_unlink, real_lstat
+        self.assertTrue(os.path.isfile(src), "failed unlink must leave the source")
+        self.assertEqual(state["links"], 0 if prelinked or fault == "before-link" else 1)
+        return rc, dst, state, s
+
+    def check_both(self, fault, want, prelinked=False):
+        for engine in ("execute", "move_files"):
+            with self.subTest(engine=engine):
+                rc, dst, state, s = self.failed_move(engine, fault, prelinked)
+                # Establish the filesystem premise BEFORE judging the exit code (including on the old tree).
+                if fault in ("before-link", "vanished"):
+                    self.assertFalse(os.path.lexists(dst))
+                elif fault == "replaced":
+                    self.assertEqual(rd(dst), b"FOREIGN", "foreign bytes must not be changed")
+                else:
+                    self.assertEqual(rd(dst), s.new[os.path.basename(dst)])
+                self.assertEqual(rc, want, "%s/%s chose the wrong stop code" % (engine, fault))
+                self.assertTrue(state["observed_after_error"], "must re-observe the destination after failure")
+
+    def test_first_link_then_unlink_failure_is_partial(self):
+        self.check_both("unlink", hs.STOP_PARTIAL)
+
+    def test_link_error_after_name_creation_is_partial(self):
+        self.check_both("link-raises-after", hs.STOP_PARTIAL)
+
+    def test_successful_link_then_vanished_name_is_unknown(self):
+        self.check_both("vanished", hs.STOP_UNKNOWN)
+
+    def test_successful_link_then_foreign_name_is_unknown(self):
+        self.check_both("replaced", hs.STOP_UNKNOWN)
+
+    def test_unreadable_destination_is_unknown(self):
+        self.check_both("unreadable", hs.STOP_UNKNOWN)
+
+    def test_destination_on_unexpected_device_is_unknown(self):
+        self.check_both("other-device", hs.STOP_UNKNOWN)
+
+    def test_failure_before_link_is_clean(self):
+        self.check_both("before-link", hs.STOP_CLEAN)
+
+    def test_resume_pending_unlink_is_partial(self):
+        self.check_both("unlink", hs.STOP_PARTIAL, prelinked=True)
+
+    def test_move_files_keeps_prior_change_classification(self):
+        rc, dst, state, _s = self.failed_move("move_files", "before-link", prior=1)
+        self.assertEqual(rc, hs.STOP_PARTIAL)
+        self.assertFalse(os.path.lexists(dst))
+        self.assertTrue(state["observed_after_error"])
 
 
 class ContentRuleTests(Base):
