@@ -815,7 +815,7 @@ jobs:
           set -euo pipefail
           # Native Job/spawn/no-console tests; local macOS skips are not evidence.
           # -B protects the staged runtime and pack from bytecode writes.
-          src-tauri/runtime/python/python.exe -B -u cysjavis-pack/bin/tests/test_owned_process.py
+          C03_TEST_BASH="$(cygpath -w "$PWD/src-tauri/runtime/git/bin/bash.exe")" src-tauri/runtime/python/python.exe -B -u cysjavis-pack/bin/tests/test_owned_process.py
 
 
       # macOS 자기완결 런타임 동봉 (RC-20/T6b — 순정 맥=개발도구 없는 소비자. python3·git은 CLT-shim이라

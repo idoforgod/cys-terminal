@@ -41,7 +41,7 @@ _SELF_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SELF_DIR not in sys.path:
     sys.path.append(_SELF_DIR)
 
-from _owned_process import CANCEL as _CANCEL, run_owned, managed_main
+from _owned_process import CANCEL as _CANCEL, run_owned, managed_main, is_managed as _managed_active
 
 
 def _cancel_fence():
@@ -10568,6 +10568,9 @@ def _only_usage_exit(json_mode, mode, detail):
 
 
 def main():
+    if _managed_active() and any(x in sys.argv[1:] for x in ('--self-test', '--seed-trust')):
+        print('managed preflight requires report mode', file=sys.stderr)
+        return 125
     # --self-test 가로채기 — argparse 앞(팩 bin 도구 관례: 인자 스키마와 독립인 자기검증 채널).
 
     if "--self-test" in sys.argv[1:]:
@@ -10600,6 +10603,11 @@ def main():
         ap.error("--dry-run 은 --fix 와 동시 사용 불가")
     mode = ("safe" if args.safe else "dry" if args.dry_run
             else "fix" if args.fix else "report")
+
+    # Validate the parsed mode, including argparse abbreviations such as --fi.
+    if _managed_active() and (mode != "report" or args.allow_irreversible):
+        print('managed preflight requires report mode', file=sys.stderr)
+        return 125
 
     pf = Preflight(fix=args.fix, skips=args.skip, mode=mode,
                    allow_irreversible=args.allow_irreversible, only=args.only)
@@ -10671,4 +10679,4 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(managed_main(main, report_only=True))
+    sys.exit(managed_main(main))

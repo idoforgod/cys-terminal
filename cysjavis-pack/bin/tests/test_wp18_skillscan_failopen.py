@@ -190,7 +190,7 @@ check("B1b 훅은 그래도 exit 0 · 나머지 주입은 살아 있다",
       "exit=%d · 작업기억 본문 주입=%s" % (r.returncode, "WP18 fixture" in r.stdout))
 r, _ = run_hook("import sys\nsys.exit(0)\n")   # 출력 0 · rc 0
 check("B2 빈 출력(rc 0) → 고지 1줄(C8)", LOUD in r.stdout and "출력 없음" in r.stdout,
-      "exit=%d" % r.returncode)
+      "exit=%d stdout=%r stderr=%r" % (r.returncode, r.stdout, r.stderr))
 # ★줄 길이는 경계보다 **크게** 잡는다: 5줄 x 400 B = 2,000 B > 1 KB 라야 `head -c` 가 실제로
 #   자르고, 그래서 경계를 지우는 변이(M7)가 적색이 된다. 종전 100 B 줄은 5줄 합계 531 B 로
 #   경계 아래였고, 변이 검산이 그 사실을 잡아냈다(경계를 재지 못하는 단언이었다).

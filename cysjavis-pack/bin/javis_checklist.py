@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """세션 시작 주입용 실측 체크리스트 래퍼 (LLM 무의존·전부 실측).
 
-기존 javis_preflight.py는 절대 수정하지 않고 subprocess로 호출만 한다.
+Report-only preflight runs through an owned subprocess; standalone CLI output is preserved.
 preflight exit/마지막 줄 + SESSION_STATE 상태 + _round/*_TODO.md 미완 수를
 6줄 이내·1KB 이하 고정 포맷으로 요약한다. 지시가 아니라 배경 컨텍스트다.
 
@@ -10,6 +10,7 @@ preflight exit/마지막 줄 + SESSION_STATE 상태 + _round/*_TODO.md 미완 �
       [--state <SESSION_STATE 경로>] [--round-dir <_round 경로>]
 """
 import argparse
+import locale
 import os
 import re
 import subprocess
@@ -45,6 +46,7 @@ def run_preflight(cmd, timeout=PREFLIGHT_TIMEOUT):
     타임아웃 → ('timeout', None), 실행 자체 불가(OSError 등) → (None, None).
     어떤 경우에도 예외를 밖으로 던지지 않는다(크래시 금지).
     """
+    encoding = 'utf-8' if cmd == DEFAULT_PREFLIGHT else locale.getpreferredencoding(False)
     if cmd == DEFAULT_PREFLIGHT:
         launch = [cmd[0], '-B'] + list(cmd[1:])
     elif isinstance(cmd, str):
@@ -53,7 +55,7 @@ def run_preflight(cmd, timeout=PREFLIGHT_TIMEOUT):
     else:
         launch = [sys.executable, '-B', os.path.join(_SELF_DIR, '_owned_process.py'),
                   '--command'] + list(cmd)
-    result = run_owned(launch, timeout, grace=PREFLIGHT_GRACE, force=PREFLIGHT_FORCE)
+    result = run_owned(launch, timeout, grace=PREFLIGHT_GRACE, force=PREFLIGHT_FORCE, encoding=encoding)
     if result['timed_out']:
         return ('timeout', None)
     if not result['complete']:

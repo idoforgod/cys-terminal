@@ -326,7 +326,14 @@ cys_timeout_run() {
       printf '_OWNED_FAILURE\000owned executor unavailable\000'
       return 125
     fi
-    "$CYS_PY" -B "$_cys_owned_leaf" --bounded "$_cys_owned_cap" "$@"
+    # Bootstrap needs no external path converter. Drive-mounted MSYS paths
+    # have a lexical native spelling; other paths retain ordinary semantics.
+    "$CYS_PY" -B -c 'import os,runpy,sys
+p=sys.argv[1]
+if os.name == "nt" and len(p)>3 and p[0]=="/" and p[2]=="/" and p[1].isalpha():
+    p=p[1]+":"+p[2:]
+sys.argv=[p]+sys.argv[2:]
+runpy.run_path(p,run_name="__main__")' "$_cys_owned_leaf" --bounded "$_cys_owned_cap" "$@"
     return $?
   fi
   _cys_to="${1:-2}"
@@ -1073,11 +1080,15 @@ cys_start_gate_note() {      # stdout: 착수 게이트 1줄(개행 없음) — 
 # ─────────────────────────────────────────────────────────────────────────────
 # 로드 시 자동 적용 (부작용 없음·stdout 무출력)
 # ─────────────────────────────────────────────────────────────────────────────
+# inject-context's controller loads definitions only. Its owned phase performs
+# initialization, including locale/lane file work, inside the ingress budget.
+if [ "${_CYS_LIB_DEFINE_ONLY:-}" != 1 ]; then
 cys_resolve_py >/dev/null 2>&1 || :
 cys_fix_locale >/dev/null 2>&1 || :
 # ★레인 가드는 마지막이다 — 조기 종료(exit 0) 또는 위임 예약(CYS_LANE_REDIRECT 설정 후 return).
 # 실제 exec는 훅 본문의 `cys_lane_redirect "$@"` 줄이 프리루드 `2>/dev/null` 밖에서 한다.
 cys_lane_guard
+fi
 
 # ★반드시 0으로 끝난다(계약 ⓓ) — 비0이면 호출측 loud-skip이 오발동한다.
 :

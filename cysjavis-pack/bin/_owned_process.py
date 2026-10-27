@@ -20,8 +20,23 @@ CANCEL = threading.Event()
 _CONTEXT = None
 
 
+def monotonic():
+    """A machine-wide monotonic coordinate, including macOS Python3.9.
+
+    time.monotonic() on that interpreter subtracts a per-process origin. A
+    deadline passed between processes must use the underlying OS coordinate.
+    """
+    if os.name == 'nt':
+        counter = ctypes.c_int64(); frequency = ctypes.c_int64()
+        api = ctypes.WinDLL('kernel32', use_last_error=True)
+        if not api.QueryPerformanceCounter(ctypes.byref(counter)) or not api.QueryPerformanceFrequency(ctypes.byref(frequency)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return counter.value / frequency.value
+    return time.clock_gettime(time.CLOCK_MONOTONIC)
+
+
 def remaining(deadline):
-    return max(0.0, deadline - time.monotonic())
+    return max(0.0, deadline - monotonic())
 
 
 class Job:
@@ -80,9 +95,10 @@ class Job:
 
     def close(self):
         if self.handle:
-            handle, self.handle = self.handle, None
+            handle = self.handle
             if not self.api.CloseHandle(handle):
                 raise ctypes.WinError(ctypes.get_last_error())
+            self.handle = None
 
 
 def _self_stop(group):
@@ -139,20 +155,33 @@ class Managed:
         threading.Event().wait()
 
 
-def managed_main(main, argv=None, report_only=False):
+def _utf8_stdio():
+    # Managed diagnostic streams have an explicit wire encoding. Standalone
+    # invocation does not change its caller's console/locale behavior.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, 'reconfigure'):
+            stream.reconfigure(encoding='utf-8', errors='replace')
+
+
+def is_managed():
+    return _CONTEXT is not None
+
+
+def managed_main(main, argv=None):
     """CLI entry; consumes private flags only in explicitly managed mode."""
     global _CONTEXT
     args = sys.argv[1:] if argv is None else argv
-    if '--owned-lifeline' not in args:
+    # The owner appends one private trailer. Command arguments before it are
+    # payload, including arguments that happen to spell our private flags.
+    if len(args) < 2 or args[-2] != '--owned-lifeline':
         return main()
-    i = args.index('--owned-lifeline')
+    _utf8_stdio()
+    i = len(args)-2
     try:
         handle = int(args[i + 1])
         del args[i:i + 2]
         if argv is None:
             sys.argv[1:] = args
-        if report_only and any(x in args for x in ('--fix', '--safe', '--dry-run', '--seed-trust', '--self-test')):
-            return 125
         if os.name == 'nt':
             import msvcrt
             handle = msvcrt.open_osfhandle(handle, os.O_WRONLY | os.O_BINARY)
@@ -236,18 +265,18 @@ def _reader(stream, events, label, chunks):
         events.put((label + '-eof', None))
 
 
-def run_owned(cmd, timeout, grace=0.0, force=5.0, cancel=None, managed=True, shell=False, env=None):
+def run_owned(cmd, timeout, grace=0.0, force=5.0, cancel=None, env=None, encoding="utf-8"):
     """Bounded capture. Never poll/reap before teardown of the owned tree.
 
     timeout includes startup/execution; grace+force are shared cleanup allowances.
-    managed=False preserves explicit custom command exit semantics, but cannot
-    claim private completion proof. Such commands still get bounded group cleanup.
+    Every launch requires private admission/completion. Explicit custom commands
+    use the managed command adapter; there is no uncontained launch mode.
     """
-    start = time.monotonic(); execution = start + timeout
+    start = monotonic(); execution = start + timeout
     events = queue.Queue(); chunks = {'out': [], 'err': []}
     eof = set(); frame = b''; done = None; ready = False; fault = None
     proc = None; writer = None; control_read = control_write = None; job = None
-    timed_out = False; teardown = False; cleanup = 'unknown'
+    timed_out = False; teardown = False; cleanup = 'unknown'; readers_started = False
     cancel = cancel or CANCEL
     try:
         if os.name == 'posix' and signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL:
@@ -255,29 +284,28 @@ def run_owned(cmd, timeout, grace=0.0, force=5.0, cancel=None, managed=True, she
         if cancel.is_set():
             raise RuntimeError('cancelled before launch')
         kw = dict(stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True,
-                  stdin=subprocess.PIPE if managed else subprocess.DEVNULL, env=env)
-        launch = list(cmd) if not shell else cmd
+                  stdin=subprocess.PIPE, env=env)
+        launch = list(cmd)
         if os.name == 'posix':
             kw['start_new_session'] = True
         else:
             kw['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
             job = Job()
-        if managed:
-            control_read, control_write = os.pipe()
-            os.set_inheritable(control_read, False)
-            if os.name == 'posix':
-                kw['pass_fds'] = (control_write,)
-                handle = control_write
-            else:
-                import msvcrt
-                handle = msvcrt.get_osfhandle(control_write)
-                os.set_handle_inheritable(handle, True)
-                si = subprocess.STARTUPINFO()
-                si.lpAttributeList = {'handle_list': [handle]}
-                kw['startupinfo'] = si
-            launch += ['--owned-lifeline', str(handle)]
+        control_read, control_write = os.pipe()
+        os.set_inheritable(control_read, False)
+        if os.name == 'posix':
+            kw['pass_fds'] = (control_write,)
+            handle = control_write
+        else:
+            import msvcrt
+            handle = msvcrt.get_osfhandle(control_write)
+            os.set_handle_inheritable(handle, True)
+            si = subprocess.STARTUPINFO()
+            si.lpAttributeList = {'handle_list': [handle]}
+            kw['startupinfo'] = si
+        launch += ['--owned-lifeline', str(handle)]
         try:
-            proc = subprocess.Popen(launch, shell=shell, **kw)
+            proc = subprocess.Popen(launch, **kw)
         finally:
             if control_write is not None:
                 os.close(control_write); control_write = None
@@ -290,9 +318,9 @@ def run_owned(cmd, timeout, grace=0.0, force=5.0, cancel=None, managed=True, she
             job.assign(proc)  # child is waiting: no GO before containment
         for label, stream in [('out', proc.stdout), ('err', proc.stderr)]:
             threading.Thread(target=_reader, args=(stream, events, label, chunks[label]), daemon=True).start()
-        if managed:
-            control = os.fdopen(control_read, 'rb', buffering=0); control_read = None
-            threading.Thread(target=_reader, args=(control, events, 'control', None), daemon=True).start()
+        control = os.fdopen(control_read, 'rb', buffering=0); control_read = None
+        threading.Thread(target=_reader, args=(control, events, 'control', None), daemon=True).start()
+        readers_started = True
         while remaining(execution) > 0:
             if cancel.is_set():
                 fault = 'cancelled'; break
@@ -329,16 +357,13 @@ def run_owned(cmd, timeout, grace=0.0, force=5.0, cancel=None, managed=True, she
                         fault = 'invalid or duplicate control frame'
                 if fault or done is not None:
                     break
-            if not managed and {'out-eof', 'err-eof'} <= eof:
-                break
         else:
             timed_out = True
-        if time.monotonic() >= execution:
+        if monotonic() >= execution:
             timed_out = True
     except Exception as exc:
         fault = str(exc)
     finally:
-        cleanup_end = time.monotonic() + (grace if timed_out or fault else 0) + force
         if writer is not None:
             try:
                 writer.close()
@@ -347,6 +372,21 @@ def run_owned(cmd, timeout, grace=0.0, force=5.0, cancel=None, managed=True, she
             if _CONTEXT is not None:
                 with _CONTEXT.lock:
                     _CONTEXT.downstream.discard(writer)
+        expected_eof = {'out-eof', 'err-eof', 'control-eof'}
+        cooperative_end = monotonic() + (grace if timed_out or fault else 0)
+        while readers_started and remaining(cooperative_end) > 0 and not expected_eof <= eof:
+            try:
+                label, data = events.get(timeout=min(.02, remaining(cooperative_end)))
+            except queue.Empty:
+                continue
+            if label.endswith('-eof'):
+                eof.add(label)
+            elif label == 'error':
+                fault = fault or ('capture error: ' + data)
+            elif label == 'control':
+                fault = fault or 'control frame after cancellation'
+        # A distinct absolute deadline: force/drain/reap cannot borrow grace.
+        cleanup_end = monotonic() + force
         if proc is not None:
             # Group leader is retained even on normal DONE. No poll/wait above.
             try:
@@ -366,11 +406,16 @@ def run_owned(cmd, timeout, grace=0.0, force=5.0, cancel=None, managed=True, she
                 teardown = True
             except Exception as exc:
                 fault = fault or ('tree teardown: ' + str(exc))
+                if job is not None:
+                    try:
+                        job.close()  # kill-on-close fallback, still inside cleanup deadline
+                        job = None
+                    except Exception as close_exc:
+                        fault += '; Job close: ' + str(close_exc)
             try:
                 proc.wait(timeout=remaining(cleanup_end))
             except subprocess.TimeoutExpired:
                 fault = fault or 'reap deadline'
-            expected_eof = {'out-eof', 'err-eof'} | ({'control-eof'} if managed else set())
             if frame:
                 fault = fault or 'partial control frame'
             while remaining(cleanup_end) > 0 and not expected_eof <= eof:
@@ -388,37 +433,44 @@ def run_owned(cmd, timeout, grace=0.0, force=5.0, cancel=None, managed=True, she
                 fault = fault or 'drain deadline'
             if teardown and proc.returncode is not None:
                 if os.name == 'posix':
-                    try:
-                        os.killpg(proc.pid, 0)  # observation only after reap
-                    except ProcessLookupError:
-                        cleanup = 'verified_empty'
-                    except OSError:
-                        pass
+                    # Reaped group numbers have observation authority only. Give
+                    # adopted zombies the remaining window to disappear; never
+                    # signal a group again once its leader has been reaped.
+                    while remaining(cleanup_end) > 0:
+                        try:
+                            os.killpg(proc.pid, 0)
+                        except ProcessLookupError:
+                            cleanup = 'verified_empty'
+                            break
+                        except OSError as exc:
+                            fault = fault or ('group observation: ' + str(exc))
+                            break
+                        time.sleep(min(.01, remaining(cleanup_end)))
+                    if cleanup != 'verified_empty':
+                        fault = fault or 'group absence not verified before cleanup deadline'
                 else:
                     cleanup = 'verified_empty'
         if job is not None:
-            job.close()
+            try:
+                job.close()
+            except Exception as exc:
+                fault = fault or ('Job close: ' + str(exc))
         for fd in (control_read, control_write):
             if fd is not None:
                 os.close(fd)
-    complete = managed and done is not None and not fault and not timed_out and cleanup == 'verified_empty'
+    complete = done is not None and not fault and not timed_out and cleanup == 'verified_empty'
     return {'returncode': done if complete else (proc.returncode if proc else None),
-            'stdout': b''.join(chunks['out']).decode('utf-8', 'replace'),
-            'stderr': b''.join(chunks['err']).decode('utf-8', 'replace'),
+            'diagnostic_returncode': done,
+            'kernel_returncode': proc.returncode if proc else None,
+            'stdout': b''.join(chunks['out']).decode(encoding, 'replace'),
+            'stderr': b''.join(chunks['err']).decode(encoding, 'replace'),
             'timed_out': timed_out, 'complete': complete, 'cleanup': cleanup,
-            'reason': fault or '', 'elapsed': time.monotonic() - start}
+            'reason': fault or '', 'elapsed': monotonic() - start}
 
 
 def command_main():
     """Private execution adapter for an explicit custom command, never eval data."""
     args = sys.argv[1:]
-    if args[0] == '--python':
-        import runpy
-        script, argv = args[1], args[1:]
-        sys.argv = argv
-        sys.path.insert(0, os.path.dirname(os.path.abspath(script)))
-        runpy.run_path(script, run_name='__main__')
-        return 0
     if args[0] == '--shell':
         return subprocess.call(args[1], shell=True, stdin=subprocess.DEVNULL, close_fds=True)
     if args[0] == '--command':
@@ -433,6 +485,7 @@ def bounded_cli():
     budget across multiple phases without resetting it at each subprocess.
     """
     import argparse
+    _utf8_stdio()
     ap = argparse.ArgumentParser()
     ap.add_argument('--bounded', type=float, required=True)
     ap.add_argument('--records', action='store_true')
@@ -443,9 +496,10 @@ def bounded_cli():
     ap.add_argument('--total-budget', type=float, default=float('inf'))
     ap.add_argument('--spent', type=float, default=0)
     ap.add_argument('--managed-command', action='store_true')
+    ap.add_argument('--native-shell', action='store_true')
     ap.add_argument('command', nargs=argparse.REMAINDER)
     args = ap.parse_args()
-    started = time.monotonic()
+    started = monotonic()
     origin = args.start if args.start is not None else started
     cap = min(max(0, args.bounded-args.spent), max(0, args.budget - (started-origin-args.exclude)),
               max(0, args.total_budget-(started-origin)))
@@ -458,7 +512,16 @@ def bounded_cli():
         inputs = queue.Queue()
         def read_input():
             try:
-                inputs.put(sys.stdin.buffer.read())
+                chunks = []
+                # A blocked BufferedReader owns a lock that aborts CPython at
+                # shutdown. Raw reads let this daemon thread end with its owner.
+                fd = sys.stdin.fileno()
+                while True:
+                    chunk = os.read(fd, 65536)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                inputs.put(b''.join(chunks))
             except OSError as exc:
                 inputs.put(exc)
         threading.Thread(target=read_input, daemon=True).start()
@@ -470,7 +533,27 @@ def bounded_cli():
         except (queue.Empty, ValueError):
             result = {'complete': False, 'stdout': '', 'stderr': '',
                       'reason': 'input incomplete (EOF/read deadline)', 'timed_out': True}
-    left = cap - (time.monotonic()-started)
+    if result is None and args.native_shell and os.name == 'nt':
+        # MSYS shell paths are not native CreateProcess executable paths. The
+        # converter is itself owned and charged to this same phase deadline.
+        import shutil
+        converter = shutil.which('cygpath')
+        available = max(0.0, cap-(monotonic()-started))
+        reserve = min(1.0, available/10)
+        if converter and available > reserve and command:
+            native = run_owned([sys.executable, '-B', os.path.abspath(__file__),
+                                '--command', converter, '-w', command[0]],
+                               min(2.0, available-reserve), force=reserve, env=env)
+            path = native['stdout'].rstrip('\r\n')
+            if native['complete'] and native['returncode'] == 0 and path and '\n' not in path and '\r' not in path:
+                command[0] = path
+            else:
+                result = {'complete': False, 'stdout': '', 'stderr': native['stderr'],
+                          'reason': 'native shell path unavailable', 'timed_out': native['timed_out']}
+        else:
+            result = {'complete': False, 'stdout': '', 'stderr': '',
+                      'reason': 'native shell converter unavailable/budget exhausted', 'timed_out': available <= reserve}
+    left = cap - (monotonic()-started)
     reserve = min(1.0, max(0.0, left/10))
     if result is None and left > reserve:
         if not args.managed_command:
@@ -479,11 +562,16 @@ def bounded_cli():
     if result is None:
         result = {'complete': False, 'stdout': '', 'stderr': '',
                   'reason': 'phase budget exhausted; unmeasured', 'timed_out': True}
-    elapsed = time.monotonic()-started
+    elapsed = monotonic()-started
     if args.records:
         if result['complete'] and result.get('returncode') == 0:
             sys.stdout.write(result['stdout'])
         else:
+            # A complete key/value pair is a committed phase checkpoint. Keep
+            # it even if a subsequent file read stalls; drop any partial pair.
+            fields = result['stdout'].split('\0')
+            for i in range(0, len(fields)-2, 2):
+                sys.stdout.write(fields[i]+'\0'+fields[i+1]+'\0')
             sys.stdout.write('_OWNED_FAILURE\0%s\0' % (result['reason'] or 'timeout/incomplete'))
         sys.stdout.write('_OWNED_STARTED\0%.9f\0_OWNED_ELAPSED\0%.9f\0' % (origin, elapsed))
         sys.stdout.write(('_OWNED_SPENT\0%.9f\0_OWNED_RETURNED\0' + '1\0') % (args.spent+elapsed))
@@ -498,4 +586,9 @@ def bounded_cli():
 if __name__ == '__main__':
     # runpy-loaded tools and spawn workers must share this exact context instance.
     sys.modules['_owned_process'] = sys.modules[__name__]
-    sys.exit(bounded_cli() if '--bounded' in sys.argv[1:] else managed_main(command_main))
+    if sys.argv[1:2] == ['--bounded']:
+        sys.exit(bounded_cli())
+    if len(sys.argv) >= 3 and sys.argv[-2] == '--owned-lifeline':
+        sys.exit(managed_main(command_main))
+    print('owned adapter requires admission', file=sys.stderr)
+    sys.exit(125)

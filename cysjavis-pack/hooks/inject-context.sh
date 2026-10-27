@@ -7,10 +7,14 @@
 set +e
 
 # ── 공용 프리루드(CS-4①) — loud-skip: 소실 시 조용히 꺼지지 않고 stderr 1줄 후 강등 ──
-. "$(dirname "$0")/_lib.sh" 2>/dev/null \
+if [ "${1:-}" != "--phase" ]; then _CYS_LIB_DEFINE_ONLY=1; CYS_LANE_REDIRECT=""; fi
+. "${BASH_SOURCE[0]%/*}/_lib.sh" 2>/dev/null \
   || . "${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh" 2>/dev/null \
   || { echo "[cys-hook] _lib.sh 소실 — 훅 강등(inject-context)" >&2; exit 0; }
 command -v cys_lane_redirect >/dev/null 2>&1 && cys_lane_redirect "$@"
+unset _CYS_LIB_DEFINE_ONLY
+# Interpreter selection uses shell builtins and filesystem predicates only.
+[ "${1:-}" = "--phase" ] || cys_resolve_py >/dev/null 2>&1 || :
 
 
 # C-03 fixed phase protocol. NUL-delimited values are never eval/source input.
@@ -46,9 +50,8 @@ if [ "${1:-}" != "--phase" ]; then
   # The shell owns OUT throughout. A failed phase cannot replace cached core.
   _C03_LEAF="${BASH_SOURCE[0]%/*}/../bin/_owned_process.py"
   [ -f "$_C03_LEAF" ] || _C03_LEAF="${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/_owned_process.py"
-  command -v cygpath >/dev/null 2>&1 && _C03_LEAF="$(cygpath -w "$_C03_LEAF")"
   _C03_START=""; _C03_CHECK_SPENT=0; _C03_ANC_SPENT=0
-  OUT=""; SOURCE=""; CWD=""
+  OUT=""; SOURCE=""; CWD=""; _IC_GATE="unknown"
   for _C03_PHASE in ingress role core ancillary checklist post bookkeeping; do
     case "$_C03_PHASE" in
       ingress) _C03_CAP=20 ;;
@@ -61,7 +64,7 @@ if [ "${1:-}" != "--phase" ]; then
     # Emit before optional logging: an unresponsive log cannot hide restoration.
     [ "$_C03_PHASE" = bookkeeping ] && printf '%b' "$OUT"
     export _C03_LEAF CYS_PY SOURCE CWD SOUL ROOT OUT STATE STATE_DIR USED_FALLBACK DEPT_CTX DEPT_NO_STATE DEPT_ROUND DEPT_STATE_WITHHELD _IC_ROLE _IC_ROLE_DONE _IC_GATE
-    _C03_ARGS=(--records --budget 150 --total-budget 420 --exclude "$_C03_CHECK_SPENT")
+    _C03_ARGS=(--records --native-shell --budget 150 --total-budget 420 --exclude "$_C03_CHECK_SPENT")
     [ -n "$_C03_START" ] && _C03_ARGS+=(--start "$_C03_START")
     [ "$_C03_PHASE" = ingress ] && _C03_ARGS+=(--input-env INPUT)
     case "$_C03_PHASE" in role|ancillary) _C03_ARGS+=(--spent "$_C03_ANC_SPENT");; esac
@@ -74,7 +77,12 @@ if [ "${1:-}" != "--phase" ]; then
           printf -v "$_C03_KEY" '%s' "$_C03_VALUE" ;;
       esac
     done < <(cys_timeout_run --owned "$_C03_CAP" "$_C03_LEAF" "${_C03_ARGS[@]}" -- "${BASH:-/bin/bash}" "$0" --phase "$_C03_PHASE")
-    [ "$_OWNED_RETURNED" = 1 ] || _OWNED_FAILURE="phase owner ended without completion; unmeasured"
+    if [ "$_OWNED_RETURNED" != 1 ]; then
+      _OWNED_FAILURE="phase owner ended without completion; unmeasured"
+      # Missing elapsed evidence cannot refill the shared role/observation
+      # allowance. Conservatively spend that category's entire allocation.
+      case "$_C03_PHASE" in role|ancillary) _OWNED_SPENT="$_C03_CAP";; esac
+    fi
     _C03_START="${_OWNED_STARTED:-$_C03_START}"
     case "$_C03_PHASE" in role|ancillary) _C03_ANC_SPENT="$_OWNED_SPENT";; esac
     [ "$_C03_PHASE" = checklist ] && _C03_CHECK_SPENT="$_OWNED_ELAPSED"
@@ -86,7 +94,9 @@ if [ "${1:-}" != "--phase" ]; then
       if [ "$_C03_PHASE" = bookkeeping ]; then
         printf '⚠ restoration bookkeeping unmeasured: %s\n' "$_OWNED_FAILURE"
       else
-        OUT="${OUT}⚠ restoration phase $_C03_PHASE incomplete/unmeasured: $_OWNED_FAILURE\n"
+        _C03_KNOWN="state=${STATE:-unresolved}; soul=${SOUL:-unresolved}"
+        _C03_KNOWN="${_C03_KNOWN//\\/\\\\}"
+        OUT="${OUT}⚠ restoration phase $_C03_PHASE incomplete/unmeasured: $_OWNED_FAILURE ($_C03_KNOWN)\n"
       fi
     fi
     [ "$_C03_PHASE" = ingress ] && [ -z "$SOURCE" ] && exit 0
@@ -200,6 +210,8 @@ SOUL=""
 [ -z "$SOUL" ] && [ -f "$HOME/.claude/soul.md" ] && SOUL="$HOME/.claude/soul.md"   # 레거시 경로
 [ -z "$SOUL" ] && SOUL="$HOME/.cys/pack/soul.md"   # 배포 기본 soul (일반 사용자 · 종전 최종 폴백 불변)
 ROOT="${CYS_ROOT:-$HOME}"
+# Commit known canonical paths before a potentially slow file read.
+printf 'SOUL\0%s\0ROOT\0%s\0' "$SOUL" "$ROOT"
 
 # ---------- L0: soul 절 제목 전수 + 전문 포인터 (startup/resume) ----------
 # B-057 (0.14.50, base-lane H1 form): the old selector `awk '/^## \[/{p=1} p'` matched no heading of
@@ -240,6 +252,8 @@ if { [ "$SOURCE" = "startup" ] || [ "$SOURCE" = "resume" ]; } && [ -f "$SOUL" ];
   OUT="${OUT}\n"
 fi
 
+# Retain the completed soul text even if later state selection/read stalls.
+printf 'OUT\0%s\0' "$OUT"
 # ---------- ★부서 소켓 노드: pack-dept round 정본만 (dept-recovery §8③·R1/R2/R3) ----------
 DIR="$CWD"; STATE=""; STATE_DIR=""; PREV=""; DEPT_CTX=""; DEPT_NO_STATE=""; DEPT_ROUND=""; DEPT_STATE_WITHHELD=""
 # ── G4+G20: 부서 레인 감지 글롭 수리 (명명 부서 + Windows 파이프·백슬래시) ──
@@ -289,6 +303,7 @@ if [ -z "$STATE" ] && [ -z "$DEPT_CTX" ] && [ -f "$ROOT/_round/ACTIVE_PROJECT" ]
   if [ -n "$AP" ] && [ -f "$AP/_round/SESSION_STATE.md" ]; then STATE="$AP/_round/SESSION_STATE.md"; STATE_DIR="$AP"; USED_FALLBACK=1; fi
 fi
 
+printf 'STATE\0%s\0STATE_DIR\0%s\0' "$STATE" "$STATE_DIR"
 if [ -z "$STATE" ] && [ -n "$DEPT_NO_STATE" ]; then
   OUT="${OUT}⚠ 부서 pack round SESSION_STATE 부재/이상환경 — 작업기억 주입 생략(메인 레인 미참조·R2/R3). 부서 정본 생성: cys todo-path.
 "
@@ -459,6 +474,9 @@ case "$SOURCE" in
   compact)        OUT="${OUT}▶ 압축 직후(source=compact): 작업기억 보충 완료. 진행 중 작업 계속.\n";;
 esac
 fi
+
+# Commit the source-specific restore note before optional RSI reads/filters.
+printf 'OUT\0%s\0' "$OUT"
 
 # ---------- RSI 자산 자동 주입 (오너 자동트리거 · startup/resume · master 결정 D1=4·D2=포인터) ----------
 if { [ "$SOURCE" = "startup" ] || [ "$SOURCE" = "resume" ]; } && [ -n "$STATE" ]; then
