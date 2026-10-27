@@ -1275,5 +1275,356 @@ class QueuedReportChannel(_HookEnv):
                 r = self.run_hook("Bash", {"command": cmd}, CYS_ROLE="cso")
                 self.assertTrue(r.denied, "본문의 `--queued` 문자열이 옵션으로 읽혔다: %r" % cmd)
 
+
+# ── C-25 (B-489): 현재 내용을 읽지 못할 때의 상태 파일 상한 ─────────────────────────
+#   설계 정본: round/_evidence/0.14.55-P6/P6-DESIGN-R2.md (sha16 a99a6666649e698f) §3.1.
+#   왜 여기인가: 이 결함의 전부가 **도구별로 다른 판정**이라, 판정기만 부르는 self-test 로는
+#   `Write` 와 `Edit` 가 같은 상태에서 엇갈린다는 사실 자체가 드러나지 않는다. 여기서는 훅을
+#   **실제로 실행**해서 세 도구를 같은 파일·같은 바이트로 민다.
+_CAP = 64 * 1024
+_CAP_DENY_MARK = "상태 파일 상한 초과"
+_CUR_SIZE_CLAIM = re.compile(r"현재 \d+B")
+
+
+class CsoStateCapReadableRowsUnchanged(_HookEnv):
+    """읽을 수 있는 현재 내용에서는 **판정이 하나도 바뀌지 않는다**(회귀 가드).
+
+    C-25 수리가 건드리는 것은 '읽지 못한 경우' 하나뿐이다. 이 클래스가 붉어지면 수리가
+    범위를 넘은 것이다 — 실측된 운영 거부는 전부 이 쪽(읽을 수 있는 현재)이다.
+    """
+
+    def setUp(self):
+        super(CsoStateCapReadableRowsUnchanged, self).setUp()
+        self.env["CYS_ROLE"] = "cso"
+        self.target = self.pack / "round" / "CSO_TODO.md"
+
+    def _payload(self, tool, cur, proj):
+        p = str(self.target)
+        if tool == "Write":
+            return {"file_path": p, "content": "y" * proj}
+        if proj >= cur:
+            old, new = "x", "z" * (proj - cur + 1)
+        else:
+            old, new = "x" * (cur - proj + 1), "z"
+        if tool == "Edit":
+            return {"file_path": p, "old_string": old, "new_string": new}
+        return {"file_path": p, "edits": [{"old_string": old, "new_string": new}]}
+
+    def test_six_readable_rows_keep_their_verdict_on_all_three_tools(self):
+        rows = [("상한 이하·증가", 1000, 2000, False),
+                ("초과·증가", _CAP - 10, _CAP + 10, True),
+                ("초과·축소", _CAP + 5000, _CAP + 10, False),
+                ("초과·동률", _CAP + 10, _CAP + 10, False),
+                ("정확히 상한", 10, _CAP, False),
+                ("1바이트 초과", 10, _CAP + 1, True)]
+        for label, cur, proj, want_deny in rows:
+            for tool in ("Write", "Edit", "MultiEdit"):
+                with self.subTest(row=label, tool=tool):
+                    self.target.write_text("x" * cur, encoding="utf-8")
+                    r = self.run_hook(tool, self._payload(tool, cur, proj))
+                    self.assertEqual(r.rc, 0, r.err)
+                    got = r.denied and _CAP_DENY_MARK in r.reason
+                    self.assertEqual(got, want_deny,
+                                     "%s/%s: 기대 %s 인데 %s (%r)"
+                                     % (label, tool, want_deny, got, r.reason[:160]))
+
+    def test_a_readable_denial_still_prints_the_measured_current_size(self):
+        """읽을 수 있을 때의 문면은 **잰 값**을 계속 싣는다(수리가 정보를 빼앗지 않는다)."""
+        self.target.write_text("x" * (_CAP - 10), encoding="utf-8")
+        r = self.run_hook("Write", {"file_path": str(self.target), "content": "y" * (_CAP + 10)})
+        self.assertTrue(r.denied, r.out)
+        self.assertRegex(r.reason, _CUR_SIZE_CLAIM,
+                         "잰 현재 크기가 문면에서 사라졌다: %r" % r.reason[:200])
+
+
+class CsoStateCapUnreadableCurrent(_HookEnv):
+    """★현재 내용을 **읽지 못할 때** — C-25 의 전부.
+
+    읽지 못하는 상태는 네 가지가 같은 `None` 으로 접힌다(`Ctx.read_text` 가 모든 `OSError` 를
+    접는다): ⒜아직 없는 파일(첫 쓰기) ⒝디렉터리 ⒞권한 ⒟iCloud 축출. 게이트는 **왜** 못 읽었는지
+    모르고 알 필요도 없다 — 아는 것은 '재지 못했다' 하나다.
+
+    계약(설계 §3.1):
+      · `Write`        — 본문 전체가 payload 에 있으므로 **예상 크기만으로** 판정한다.
+                         상한 이하 통과 · 초과 거부 · ⛔잰 적 없는 현재 크기를 **찍지 않는다**.
+      · `Edit`/`MultiEdit` — payload 에 치환 조각뿐이라 결과 크기를 **계산할 수 없다** ⇒ 거부하고,
+                         문면에 **되는 복구 경로**(상한 이하 전체 Write)를 적는다.
+    """
+
+    def setUp(self):
+        super(CsoStateCapUnreadableCurrent, self).setUp()
+        self.env["CYS_ROLE"] = "cso"
+        self.target = self.pack / "round" / "CSO_TODO.md"
+        if self.target.exists():
+            self.target.unlink()
+
+    def _w(self, n):
+        return {"file_path": str(self.target), "content": "y" * n}
+
+    def _e(self, n):
+        return {"file_path": str(self.target), "old_string": "a", "new_string": "b" * n}
+
+    def _m(self, n):
+        return {"file_path": str(self.target),
+                "edits": [{"old_string": "a", "new_string": "b" * n}]}
+
+    # ⒜ 아직 없는 파일 — 가장 흔한 '못 읽음'이고, 축출과 구별되지 않는다
+    def test_write_over_cap_denies_without_inventing_a_current_size(self):
+        r = self.run_hook("Write", self._w(_CAP + 1000))
+        self.assertTrue(r.denied, "상한 초과 전체 쓰기가 통과했다: %r" % r.out)
+        self.assertIn(_CAP_DENY_MARK, r.reason)
+        self.assertNotRegex(r.reason, _CUR_SIZE_CLAIM,
+                            "재지 않은 현재 크기를 측정값처럼 찍었다: %r" % r.reason[:200])
+
+    def test_write_that_would_shrink_also_denies_without_a_size(self):
+        """200 KB 를 70 KB 로 줄이는 쓰기도 **방향을 잴 수 없으므로** 거부된다 — 다만 그 이유를
+        '0 에서 증가'라고 꾸미지 않는다."""
+        r = self.run_hook("Write", self._w(70000))
+        self.assertTrue(r.denied, r.out)
+        self.assertNotRegex(r.reason, _CUR_SIZE_CLAIM, r.reason[:200])
+
+    def test_write_at_or_under_the_cap_is_the_recovery_and_always_passes(self):
+        for n in (100, _CAP - 10, _CAP):
+            with self.subTest(bytes=n):
+                r = self.run_hook("Write", self._w(n))
+                self.assertFalse(r.denied,
+                                 "복구 경로(상한 이하 전체 쓰기)가 막혔다 %dB: %r" % (n, r.reason))
+
+    def test_edit_and_multiedit_are_refused_and_name_the_working_recovery(self):
+        for tool, ti in (("Edit", self._e(_CAP + 1000)), ("MultiEdit", self._m(_CAP + 1000)),
+                         ("Edit", self._e(100)), ("MultiEdit", self._m(100))):
+            with self.subTest(tool=tool, bytes=len(ti.get("new_string", "")) or "multi"):
+                r = self.run_hook(tool, ti)
+                self.assertTrue(r.denied,
+                                "%s 가 읽지 못한 현재 위에서 무판정 통과했다: %r" % (tool, r.out))
+                self.assertIn("Write", r.reason, "복구 경로의 도구 이름이 없다: %r" % r.reason[:200])
+                self.assertIn(str(_CAP), r.reason, "복구 경로의 상한값이 없다: %r" % r.reason[:200])
+                self.assertNotRegex(r.reason, _CUR_SIZE_CLAIM, r.reason[:200])
+
+    def test_the_named_recovery_actually_passes_the_gate(self):
+        """문면이 가리키는 복구가 **실제로 통과**하는지 같은 세계에서 바로 확인한다 —
+        처방을 적어 놓고 그 처방이 막히는 것이 이 결함의 원래 모양이었다."""
+        r1 = self.run_hook("Edit", self._e(_CAP + 1000))
+        self.assertTrue(r1.denied)
+        r2 = self.run_hook("Write", self._w(_CAP))
+        self.assertFalse(r2.denied, "문면이 가리킨 복구가 막혔다: %r" % r2.reason)
+
+    # ⒞ 권한으로 못 읽는 경우 — 같은 분기에 들어간다
+    def test_unreadable_by_permission_takes_the_same_branch(self):
+        self.target.write_text("x" * 200000, encoding="utf-8")
+        os.chmod(str(self.target), 0)
+        self.addCleanup(lambda: os.chmod(str(self.target), 0o600))
+        if os.access(str(self.target), os.R_OK):
+            self.skipTest("이 계정은 0-권한 파일을 읽는다 — 이 축은 여기서 측정 불가")
+        r = self.run_hook("Write", self._w(70000))
+        self.assertTrue(r.denied, r.out)
+        self.assertNotRegex(r.reason, _CUR_SIZE_CLAIM, r.reason[:200])
+        r2 = self.run_hook("Edit", self._e(100))
+        self.assertTrue(r2.denied, "권한으로 못 읽는 현재 위에서 Edit 가 통과했다: %r" % r2.out)
+
+    def test_a_non_state_file_is_untouched_by_the_cap(self):
+        """상한의 대상은 **파일명 접두**다 — 이름이 다르면 없는 파일에 큰 쓰기도 상한에 안 걸린다.
+
+        ⛔자기 레인 팩 `round/` 안에서는 **이름 자체가 경로 규칙**이라(`H:1926-1931`) 비-상태
+          파일이 **경로**에서 먼저 거부된다 — 그 거부를 상한의 거부로 읽으면 선행 단언에서
+          죽는 검체가 된다. 그래서 이름만 보는 축을 재려면 이름이 자유로운 뿌리
+          (`~/.cys/state/cso/`)에서 재야 한다.
+        """
+        d = self.state / "cso"
+        d.mkdir(parents=True, exist_ok=True)
+        other = d / "NOTES.md"
+        r = self.run_hook("Write", {"file_path": str(other), "content": "y" * (_CAP + 1000)})
+        self.assertFalse(r.denied, "상태 파일이 아닌 파일이 막혔다: %r" % r.reason)
+
+    def test_a_non_state_file_inside_round_is_denied_by_the_PATH_rule_not_the_cap(self):
+        """같은 상황의 반대쪽 — 팩 `round/` 의 비-상태 파일은 **경로**로 거부되고, 그 문면은
+        상한의 문면이 아니다(두 사유를 섞어 읽지 않게 핀으로 박아 둔다)."""
+        other = self.pack / "round" / "NOTES.md"
+        r = self.run_hook("Write", {"file_path": str(other), "content": "y" * (_CAP + 1000)})
+        self.assertTrue(r.denied, r.out)
+        self.assertNotIn(_CAP_DENY_MARK, r.reason,
+                         "경로 거부가 상한 거부로 보고됐다: %r" % r.reason[:200])
+
+
+class CsoStateCapRefusalNamesTheRule(_HookEnv):
+    """거부 문면이 **판정을 결정하는 조건 전부**를 말하는가(운영자가 예측할 수 있는가).
+
+    프로즈와 코드가 같은 문자열인지 보는 게이트가 아니라, 제품이 사람에게 **실제로 찍는**
+    문장을 보는 행동 검체다(오너 2026-09-04 게이트 신설 제한).
+    """
+
+    CONDITIONS = [("CSO_ 접두", "CSO_"), ("SESSION_STATE 접두", "SESSION_STATE"),
+                  ("파일명이라는 축", "파일명"), ("역할", "역할 cso"),
+                  ("도구 집합", "Write/Edit/MultiEdit"), ("증가 조건", "증가"),
+                  ("축소·동률 통과", "축소"), ("상한값", str(_CAP)),
+                  ("리다이렉트 규칙", "리다이렉트"), ("읽지 못한 경우", "읽지 못하면")]
+
+    def setUp(self):
+        super(CsoStateCapRefusalNamesTheRule, self).setUp()
+        self.env["CYS_ROLE"] = "cso"
+        self.target = self.pack / "round" / "CSO_TODO.md"
+
+    def test_the_emitted_refusal_names_every_condition(self):
+        self.target.write_text("x" * 1000, encoding="utf-8")
+        r = self.run_hook("Write", {"file_path": str(self.target), "content": "y" * 80000})
+        self.assertTrue(r.denied, r.out)
+        # 처방 경로의 글자가 조건을 말한 것으로 세어지지 않게 먼저 가린다(w15 가 만들고 고친 계기 오류).
+        masked = r.reason.replace("~/.cys/state/cso/logs/", "<path>")
+        missing = [name for name, needle in self.CONDITIONS if needle not in masked]
+        self.assertEqual(missing, [],
+                         "문면이 말하지 않는 조건: %s\n문면: %r" % (missing, r.reason))
+
+
+class CsoStateCapRoleScope(_HookEnv):
+    """상한의 역할 범위는 `cso*` 하나다(헤드 결정 1 · 0.14.55 에서 넓히지 않는다).
+
+    넓히면 master 자신의 `SESSION_STATE` 저장이 막히고, 그것은 봉인표 ②(무clear)다.
+    """
+
+    def setUp(self):
+        super(CsoStateCapRoleScope, self).setUp()
+        self.target = self.pack / "round" / "SESSION_STATE.md"
+        self.target.write_text("x" * 10, encoding="utf-8")
+        self.big = {"file_path": str(self.target), "content": "y" * 200000}
+
+    def test_full_trust_roles_are_never_capped(self):
+        for role in ("master", "worker", "worker-20", "ceo"):
+            with self.subTest(role=role):
+                r = self.run_hook("Write", self.big, CYS_ROLE=role)
+                self.assertFalse(r.denied, "%s 의 200KB 상태 저장이 막혔다: %r" % (role, r.reason))
+
+    def test_cso_variants_do_reach_the_cap(self):
+        for role in ("cso", "cso-1", "cso-dept"):
+            with self.subTest(role=role):
+                r = self.run_hook("Write", self.big, CYS_ROLE=role)
+                self.assertTrue(r.denied, "%s 가 상한에 닿지 않았다" % role)
+                self.assertIn(_CAP_DENY_MARK, r.reason)
+
+
+class CsoCycleSaveIsNeverStranded(_HookEnv):
+    """★사이클 저장이 **출구 없이** 막히지 않는다(봉인표 ② — 거부는 사이클 불씨를 태운다).
+
+    상한 근처의 저장을 CSO·master × Write·Edit × 읽힘·못 읽음으로 전수로 민다. 요구는 두 가지다:
+      ① master 의 사이클 저장은 **어떤 칸에서도** 막히지 않는다(full-trust).
+      ② CSO 의 저장이 막히는 칸에서는 **문면이 되는 복구 경로를 반드시 싣는다** — 막히는 것보다
+         나쁜 것은 '막혔는데 어디로 가야 하는지 모르는 것'이다.
+    """
+
+    SIZES = (60000, _CAP - 1, _CAP, _CAP + 1, 70000)
+
+    def setUp(self):
+        super(CsoCycleSaveIsNeverStranded, self).setUp()
+        self.target = self.pack / "round" / "SESSION_STATE.md"
+
+    SEED = 1000           # 읽히는 칸에서 현재 내용의 바이트 수
+
+    def _payloads(self, n):
+        """결과가 **정확히 n 바이트**가 되는 payload 를 만든다.
+
+        ⛔`old_string="x"` 처럼 한 글자만 바꾸면 결과는 `n` 이 아니라 `SEED-1+n` 이다 — 그러면
+          '상한 이하'라고 적어 둔 칸이 실제로는 상한 초과가 되어, 검체가 제품이 아니라 자기
+          산술을 잰다(이 파일의 첫 실행이 정확히 그렇게 붉었다).
+        """
+        p = str(self.target)
+        return (("Write", {"file_path": p, "content": "y" * n}),
+                ("Edit", {"file_path": p, "old_string": "x" * self.SEED,
+                          "new_string": "z" * n}))
+
+    def test_master_cycle_save_is_never_denied(self):
+        for readable in (True, False):
+            for n in self.SIZES:
+                for tool, ti in self._payloads(n):
+                    with self.subTest(readable=readable, bytes=n, tool=tool):
+                        if readable:
+                            self.target.write_text("x" * self.SEED, encoding="utf-8")
+                        elif self.target.exists():
+                            self.target.unlink()
+                        r = self.run_hook(tool, ti, CYS_ROLE="master")
+                        self.assertFalse(r.denied,
+                                         "master 사이클 저장이 막혔다(%s %dB readable=%s): %r"
+                                         % (tool, n, readable, r.reason))
+
+    def test_every_cso_denial_carries_a_route_out(self):
+        for readable in (True, False):
+            for n in self.SIZES:
+                for tool, ti in self._payloads(n):
+                    with self.subTest(readable=readable, bytes=n, tool=tool):
+                        if readable:
+                            self.target.write_text("x" * self.SEED, encoding="utf-8")
+                        elif self.target.exists():
+                            self.target.unlink()
+                        r = self.run_hook(tool, ti, CYS_ROLE="cso")
+                        if not r.denied:
+                            continue
+                        self.assertIn(_CAP_DENY_MARK, r.reason,
+                                      "상한 외의 사유로 사이클 저장이 막혔다: %r" % r.reason[:200])
+                        self.assertTrue("Write" in r.reason or "이관" in r.reason,
+                                        "거부 문면에 나갈 길이 없다: %r" % r.reason[:200])
+
+    def test_a_readable_under_cap_save_is_never_denied_for_either_role(self):
+        self.target.write_text("x" * self.SEED, encoding="utf-8")
+        for role in ("cso", "master"):
+            for tool, ti in self._payloads(_CAP - 100):
+                with self.subTest(role=role, tool=tool):
+                    r = self.run_hook(tool, ti, CYS_ROLE=role)
+                    self.assertFalse(r.denied,
+                                     "상한 이하 저장이 막혔다(%s/%s): %r" % (role, tool, r.reason))
+
+
+class CsoStateCapSyntheticHome(unittest.TestCase):
+    """C-H1 의 쓰기 뿌리 계약과 C-25 의 상한을 **한 세계에서 함께** 잰다.
+
+    ⛔왜 합성 HOME 인가: `_HookEnv` 의 HOME 은 `tempfile` 가 만든 `/var/folders/…` 아래이고,
+      그 접두는 `ALLOW_PATH_PREFIXES`(H:789-790)와 `cso_write_roots`(H:1871-1880) 안에 있다 —
+      즉 그 리그에서는 **모든 경로가 허용 뿌리**라 Desktop 거부 계약이 **엉뚱한 이유로 통과**한다
+      (설계 §3.6 에 실측으로 적혀 있다). 그래서 쓰기 뿌리를 재는 검체는 합성 HOME 이어야 한다.
+    """
+
+    def setUp(self):
+        source = HOOK.read_text(encoding="utf-8").split("<<'PYEOF'\n", 1)[1]
+        source = source.split('\nif os.environ.get("CAPGATE_SELF_TEST"):', 1)[0]
+        self.ns = {"__name__": "capgate_cap_specimen"}
+        exec(compile(source, str(HOOK), "exec"), self.ns)
+
+    def _ctx(self, reader):
+        return self.ns["Ctx"](home="/w/hm", pack="/w/pack", state="/w/hm/.cys/state",
+                              tempdir="/w/tmp", reader=reader, approver=lambda cmd: False)
+
+    def decide(self, tool, args, reader):
+        return self.ns["decide"](tool, args, "cso", self._ctx(reader))
+
+    def test_ch1_roots_and_c25_cap_hold_together(self):
+        unread = lambda path: None
+        state = "/w/pack/round/CSO_TODO.md"
+        # C-H1: 은퇴한 Desktop 뿌리는 닫혀 있고 로컬 뿌리는 열려 있다
+        self.assertTrue(self.decide("Write", {"file_path": "/w/hm/Desktop/CYSjavis/cso/x",
+                                              "content": "x"}, unread)[0])
+        self.assertFalse(self.decide("Read", {"file_path": "/w/hm/Desktop/CYSjavis/cso/x"},
+                                     unread)[0])
+        self.assertFalse(self.decide("Write", {"file_path": "/w/hm/.cys/state/cso/x",
+                                               "content": "x"}, unread)[0])
+        # C-25: 그 로컬 뿌리 안에서, 못 읽는 현재 위의 세 도구가 **같은 방향**으로 판정된다
+        self.assertFalse(self.decide("Write", {"file_path": state, "content": "y" * _CAP},
+                                     unread)[0])
+        self.assertTrue(self.decide("Write", {"file_path": state, "content": "y" * (_CAP + 1)},
+                                    unread)[0])
+        for ti in ({"file_path": state, "old_string": "a", "new_string": "b"},
+                   {"file_path": state, "edits": [{"old_string": "a", "new_string": "b"}]}):
+            tool = "Edit" if "old_string" in ti else "MultiEdit"
+            self.assertTrue(self.decide(tool, ti, unread)[0],
+                            "%s 가 못 읽는 현재 위에서 무판정 통과했다" % tool)
+
+    def test_readable_current_is_unchanged_in_the_same_world(self):
+        state = "/w/pack/round/CSO_TODO.md"
+        read1000 = lambda path: "x" * 1000
+        self.assertFalse(self.decide("Write", {"file_path": state, "content": "y" * _CAP},
+                                     read1000)[0])
+        self.assertTrue(self.decide("Write", {"file_path": state, "content": "y" * (_CAP + 1)},
+                                    read1000)[0])
+        big = lambda path: "x" * (_CAP + 5000)
+        self.assertFalse(self.decide("Write", {"file_path": state, "content": "y" * (_CAP + 10)},
+                                     big)[0], "읽을 수 있는 축소가 막혔다")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

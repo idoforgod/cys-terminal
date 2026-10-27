@@ -820,9 +820,19 @@ CSO_SKILL_ALLOW = {"hallucination-guard"}
 BUDGET_WARN = 1500
 BUDGET_DENY = 2000
 
-# CSO_TODO 상한(바이트). **초과이고 증가**일 때만 deny(축소는 언제나 허용).
+# CSO_TODO 상한(바이트). 현재 내용을 **읽을 수 있을 때**는 초과이고 증가일 때만 deny(축소는
+# 언제나 허용). 읽지 못할 때의 두 문면은 아래 두 상수다(C-25 · B-489).
 CSO_TODO_CAP = 64 * 1024
 CSO_STATE_BASENAMES = ("CSO_", "SESSION_STATE")
+# ★읽지 못한 현재 위에서의 두 문면 — 잰 적 없는 현재 크기를 **찍지 않는다**(`(현재 0B)` 금지).
+CAP_UNREADABLE_WRITE = ("예상 %dB > 상한 %dB · 현재 파일을 읽지 못해 증가 여부를 재지 못했다"
+                        "(⛔없는 값을 0 으로 접지 않는다) — 상한 이하의 전체 쓰기(Write)는 이 "
+                        "상한을 통과한다")
+CAP_UNREADABLE_EDIT = ("현재 파일을 읽지 못해 Edit/MultiEdit 의 결과 크기를 계산할 수 없다"
+                       "(도구 입력에는 치환 조각만 들어 있다) — 그래서 거부한다. 복구 경로: 같은 "
+                       "파일에 상한 %dB 이하의 전체 내용을 Write 로 한 번 쓰면 이 상한을 통과한다"
+                       "(대상이 쓸 수 있는 일반 파일이고 전체 내용을 알고 있을 때 — 파일시스템 "
+                       "쪽 실패까지 이 상한이 고쳐 주지는 않는다)")
 
 # `cys` 조회/사이클 동사(별도 인자 계약이 없는 것).
 CSO_CYS_VERBS = {
@@ -1955,24 +1965,43 @@ def _apply_edit(text, old, new, replace_all):
 
 
 def todo_cap_verdict(tool, ti, path, ctx):
-    """(deny, detail). **예상 결과 바이트가 상한 초과 이고 증가**일 때만 deny.
+    """(deny, detail). 현재 내용을 **읽을 수 있으면** 예상 결과가 상한 초과 **이고 증가**일 때만 deny.
 
     축소·동률은 언제나 허용한다 — 상한의 목적은 파일이 계속 부푸는 것을 막는 것이지 이미 큰
     파일을 편집 불가로 만들어 로그 이관조차 못 하게 하는 것이 아니다(그 오탐은 봉인표 ②·③
-    방향이다). 현재 내용을 못 읽으면 판정하지 않는다(**결측은 값이 아니다** · 크기 0 으로
-    접지 않는다 — 그러면 없는 증가를 만들어낸다).
+    방향이다).
     ★`replace_all`·MultiEdit 누적은 실제 치환을 적용해 잰다(1바이트 치환 × 1만 회를 1바이트
       증가로 세던 단순식은 codex 반례에서 10KB 를 놓친다).
+
+    ★현재 내용을 **읽지 못하면**(C-25 · B-489): 방향(증가인가)은 잴 수 없다. 그때 무엇을 할 수
+      있는지는 **도구가 보내는 payload 가 무엇을 담고 있느냐**로 갈린다 — 한 규칙으로 묶으면
+      둘 중 하나가 거짓이 된다.
+        · `Write`           본문 **전체**가 payload 에 있다 ⇒ 예상 크기는 **안다**. 그러니
+                            예상 크기만으로 판정한다(상한 이하 통과 · 초과 거부). ⛔현재 크기를
+                            0 으로 접지 않는다 — **결측은 값이 아니다**. 접으면 재지도 않은
+                            `(현재 0B)` 가 운영자에게 측정값처럼 찍힌다.
+        · `Edit`/`MultiEdit` payload 에는 **치환 조각**뿐이라(old/new·edits) 결과 크기는 현재
+                            내용 없이는 **계산할 수 없다** ⇒ 거부하고, 문면에 **되는 복구 경로**
+                            (상한 이하 전체 `Write`)를 적는다. ⛔에이전트가 보내온 크기 값을
+                            믿지 않는다 — 그런 필드는 실제 PreToolUse 입력에 없고, 있다 해도
+                            판정 대상이 스스로 신고한 수다.
+      ⚠복구 경로가 약속하는 것은 **이 상한의 통과**뿐이다(codex r2 m1). 대상이 쓸 수 있는 일반
+        파일이 아니거나 전체 내용을 모르면 그것은 파일시스템·도구 쪽 문제이고 이 상한이 고쳐
+        주지 않는다 — 없는 상태를 지어내 덮어쓰라는 뜻이 아니다.
     """
     if not is_cso_state_file(path):
         return False, ""
     cur_text = ctx.read_text(path)
     if tool == "Write":
-        cur = 0 if cur_text is None else _blen(cur_text)
         projected = _blen(ti.get("content"))
+        if cur_text is None:
+            if projected > CSO_TODO_CAP:
+                return True, (CAP_UNREADABLE_WRITE % (projected, CSO_TODO_CAP))
+            return False, ""
+        cur = _blen(cur_text)
     elif tool in ("Edit", "MultiEdit"):
         if cur_text is None:
-            return False, ""            # 판독 불가 → 무판정
+            return True, (CAP_UNREADABLE_EDIT % CSO_TODO_CAP)
         cur = _blen(cur_text)
         text = cur_text
         edits = ti.get("edits") if tool == "MultiEdit" else [ti]
@@ -2710,7 +2739,13 @@ def _cso_verdict(tool, tool_input, ctx):
             return True, "%s 대상 %r: %s" % (tool, path, why), False
         over, detail = todo_cap_verdict(tool, ti, path, ctx)
         if over:
-            return True, ("상태 파일 상한 초과 — %s. 완료·무행동 로그를 "
+            return True, ("상태 파일 상한 초과 — %s. 이 상한은 역할 cso* 가 파일명이 "
+                          "`CSO_`·`SESSION_STATE` 로 시작하는 상태 파일에 도구 "
+                          "Write/Edit/MultiEdit 로 쓸 때 적용된다. 현재 내용을 읽을 수 "
+                          "있으면 초과이면서 증가하는 경우에만 막는다(축소·동률·상한 이하는 "
+                          "통과). 현재 내용을 읽지 못하면 증가 여부를 잴 수 없으므로 상한 "
+                          "이하의 Write 만 통과하고 Edit/MultiEdit 는 거부한다. 셸 "
+                          "리다이렉트는 크기와 무관하게 거부된다. 완료·무행동 로그를 "
                           "`~/.cys/state/cso/logs/` 로 이관하고 다시 시도하라" % detail), False
         essential = is_cso_state_file(path)
     elif tool == "Bash":
