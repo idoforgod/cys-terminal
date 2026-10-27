@@ -360,8 +360,8 @@ dept_logdir(){
 #   with the machine-readable prefix `new_daemon_blocked:` (codex R2-F3; rotate_dept_daemon passes stderr unchanged to the
 #   UI latch), exit 12. Nothing is killed and the socket is untouched. Vectors: scripts/tests/fixtures/binprobe-vectors.json.
 # WP12-ROTATION-BIND-BEGIN
-# Shared with the app via include_str: compare the shell selection before drain,
-# or bind an explicit already-probed pair for every later call in this rotation.
+# Shared with the app via include_str: resolve the shell selection before drain,
+# or retain an explicit already-probed pair for every later call in this rotation.
 rotation_require_os(){  # <context>
   local os
   os="$(uname -s 2>/dev/null)" || os=""
@@ -372,9 +372,9 @@ rotation_require_os(){  # <context>
   ROTATION_OS="$os"
 }
 
-rotation_bind_bins(){  # [expected-cysd expected-cys] [compare|use]
-  local res
-  res="$(python3 - "$CYSD" "$CYS" "${1:-}" "${2:-}" "${3:-use}" 2>/dev/null <<'ROTATION_PATHS_PY'
+rotation_bind_bins(){  # [checked-cysd checked-cys]
+  local res _rotation_bind_rc=0
+  res="$(python3 - "$CYSD" "$CYS" "${1:-}" "${2:-}" 2>/dev/null <<'ROTATION_PATHS_PY'
 import os, sys
 
 def refuse(reason):
@@ -405,10 +405,6 @@ try:
         if not all(os.path.isabs(p) for p in expected):
             refuse("nonabsolute-path")
         expected = list(map(absolute, expected))
-        if sys.argv[5] == "compare":
-            selected = list(map(absolute, selected))
-            if list(map(os.path.normcase, selected)) != list(map(os.path.normcase, expected)):
-                refuse("path-mismatch")
         selected = expected
     else:
         selected = list(map(absolute, selected))
@@ -416,7 +412,12 @@ try:
 except (OSError, ValueError):
     refuse("path-resolution-failed")
 ROTATION_PATHS_PY
-)" || { echo "new_daemon_blocked:pair:${res:-path-resolution-failed}" >&2; exit 12; }
+)" || _rotation_bind_rc=$?
+  # Native interpreter stdout may use CRLF; the CR is a terminator, not a path byte.
+  res="${res%$'\r'}"
+  if [ "$_rotation_bind_rc" -ne 0 ]; then
+    echo "new_daemon_blocked:pair:${res:-path-resolution-failed}" >&2; exit 12
+  fi
   case "$res" in
     *"$(printf '\t')"*) ;;
     *) echo "new_daemon_blocked:pair:path-resolution-failed" >&2; exit 12 ;;
@@ -495,6 +496,7 @@ print("ok")
 BINPROBE_PY
 )"
   res="$(python3 -c "$py" "$CYSD" "$CYS" 2>/dev/null)" || true
+  res="${res%$'\r'}"
   [ "$res" = ok ] && return 0
   [ -n "$res" ] || res="probe:error"
   echo "new_daemon_blocked:$res [cys-dept] $1: 새 cysd/cys 실행 확인 실패($res) — rotate 중단(데몬 불변)" >&2

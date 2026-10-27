@@ -1674,6 +1674,26 @@ class RotateBinaryProbe(unittest.TestCase):
                     self.assertEqual(result.stderr, "")
                     self.assertIn("PROCEEDED_AFTER_PROBE", result.stdout)
 
+    def test_crlf_interpreter_protocol_accepts_a_healthy_pair(self):
+        shimdir = os.path.join(self.tmp, "crlf-python")
+        os.makedirs(shimdir, exist_ok=True)
+        shim = os.path.join(shimdir, "python3")
+        _write_exec(shim, "#!%s\nimport subprocess,sys\nr=subprocess.run([sys.executable]+sys.argv[1:], stdout=subprocess.PIPE)\nsys.stdout.buffer.write(r.stdout.replace(b'\\r\\n',b'\\n').replace(b'\\n',b'\\r\\n'))\nsys.exit(r.returncode)\n" % sys.executable)
+        d = self.mock("crlf-cysd", "cysd %s (build x)\n" % self.V)
+        c = self.mock("crlf-cys", "cys %s\n" % self.V)
+        script = ("set -euo pipefail\nuname(){ echo MINGW64; }\n" + self.fn
+                  + '\nexport PATH=%s:"$PATH"\nCYSD=%s\nCYS=%s\nprobe_rotation_bins demo\necho PASSED\n'
+                  % (shlex.quote(shimdir), shlex.quote(d), shlex.quote(c)))
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, "CRLF protocol must not refuse a healthy pair: " + result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertIn("PASSED", result.stdout)
+        self.mock("crlf-cys", "cys %s\n" % self.V, code=1)
+        refused = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=20)
+        self.assertEqual(refused.returncode, 12)
+        self.assertTrue(refused.stderr.startswith("new_daemon_blocked:cys:rc:1"), refused.stderr)
+        self.assertEqual(len(refused.stderr.splitlines()), 1, "CRLF refusal must stay one protocol line")
+
     def test_probe_infrastructure_failure_keeps_prefix(self):
         for function, prefix in [
             ("python3(){ return 1; }", "new_daemon_blocked:pair:path-resolution-failed"),

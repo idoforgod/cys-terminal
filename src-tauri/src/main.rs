@@ -7614,15 +7614,29 @@ fn binprobe_observe(
 }
 
 fn binprobe_read_line(reader: impl std::io::Read) -> std::io::Result<String> {
+    binprobe_read_line_limit(reader, 4096)
+}
+
+fn binprobe_read_line_limit(reader: impl std::io::Read, limit: u64) -> std::io::Result<String> {
     use std::io::Read;
     // Only the first version line is used. Cap the read even if descendants retain the output handle.
     let mut bytes = Vec::new();
-    reader.take(4097).read_to_end(&mut bytes)?;
+    reader.take(limit + 1).read_to_end(&mut bytes)?;
     if let Some(end) = bytes.iter().position(|b| *b == b'\r' || *b == b'\n') {
         bytes.truncate(end);
     }
-    if bytes.len() > 4096 {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "version line exceeds 4096 bytes"));
+    if bytes.len() as u64 > limit {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("probe line exceeds {limit} bytes")));
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn binprobe_read_capture(reader: impl std::io::Read, limit: u64) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    reader.take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "resolver output exceeds capture budget"));
     }
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
@@ -7691,7 +7705,7 @@ fn binprobe_command_run(mut command: std::process::Command, capture_stderr: bool
     };
     let run = if capture_stderr {
         match run {
-            BinProbeRun::Exited { code, .. } => match std::fs::File::open(&out_path).and_then(binprobe_read_line) {
+            BinProbeRun::Exited { code, .. } => match std::fs::File::open(&out_path).and_then(|file| binprobe_read_capture(file, 262144)) {
                 Ok(stdout) => BinProbeRun::Exited { code, stdout },
                 Err(e) => BinProbeRun::SpawnError(format!("output:{e}")),
             },
@@ -7702,7 +7716,7 @@ fn binprobe_command_run(mut command: std::process::Command, capture_stderr: bool
     run
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct RotationPair { cysd: std::path::PathBuf, cys: std::path::PathBuf }
 
 fn rotation_absolute_executable(path: std::path::PathBuf) -> Result<std::path::PathBuf, String> {
@@ -7716,64 +7730,106 @@ fn rotation_absolute_executable(path: std::path::PathBuf) -> Result<std::path::P
 }
 
 fn rotation_shell_script() -> Result<String, String> {
-    // Extract ONLY definitions and path selection from the shipped source, not
-    // the installed pack. Older packs need no new verb on the first transition.
+    // Resolve using the shipped selection rule, without a new installed-pack verb.
     let source = include_str!("../../cysjavis-pack/bin/cys-dept");
     let fragment = |begin: &str, end: &str| -> Result<&str, String> {
         source.split_once(begin).and_then(|(_, rest)| rest.split_once(end)).map(|(body, _)| body)
             .ok_or_else(|| "new_daemon_blocked:pair:resolver-fragment-missing".to_string())
     };
-    Ok(format!("set -euo pipefail\n{}\n{}\nrotation_require_os app\nrotation_bind_bins \"$1\" \"$2\" compare\nprintf 'ok\\n'\n",
+    Ok(format!("set -euo pipefail\n{}\n{}\nrotation_require_os app\nrotation_bind_bins\nprintf 'cys-rotation-pair\\t%s\\t%s\\n' \"$CYSD\" \"$CYS\"\n",
         fragment("# WP12-ROTATION-PRELUDE-BEGIN", "# WP12-ROTATION-PRELUDE-END")?,
         fragment("# WP12-ROTATION-BIND-BEGIN", "# WP12-ROTATION-BIND-END")?))
 }
 
-fn rotation_shell_command(pair: &RotationPair) -> Result<std::process::Command, String> {
+fn rotation_shell_command() -> Result<std::process::Command, String> {
     let mut cmd = std::process::Command::new("bash");
     inject_runtime_path(&mut cmd);
-    cmd.arg("-c").arg(rotation_shell_script()?).arg("cys-rotation-preflight")
-        .arg(&pair.cysd).arg(&pair.cys);
+    cmd.arg("-c").arg(rotation_shell_script()?).arg("cys-rotation-preflight");
     no_console(&mut cmd);
     Ok(cmd)
 }
 
-fn rotation_check_shell(command: std::process::Command) -> Result<(), String> {
+fn rotation_pair_from_output(output: &str) -> Result<RotationPair, String> {
+    let record = output.lines().rev().find(|line| line.starts_with("cys-rotation-pair\t"))
+        .ok_or_else(|| "new_daemon_blocked:pair:resolver-output".to_string())?;
+    let fields: Vec<_> = record.split('\t').collect();
+    if fields.len() != 3 || fields[1..].iter().any(|s| s.is_empty() || s.contains(['\r', '\n']) || !std::path::Path::new(s).is_absolute()) {
+        return Err("new_daemon_blocked:pair:resolver-output".to_string());
+    }
+    Ok(RotationPair { cysd: fields[1].into(), cys: fields[2].into() })
+}
+
+fn rotation_check_shell(command: std::process::Command) -> Result<RotationPair, String> {
     let run = binprobe_command_run(command, true, std::time::Duration::from_secs(10), std::time::Duration::from_secs(5));
     match &run {
-        BinProbeRun::Exited { code: 0, stdout } if stdout == "ok" => Ok(()),
-        BinProbeRun::Exited { stdout, .. } if stdout.starts_with("new_daemon_blocked:") => Err(stdout.clone()),
-        BinProbeRun::Exited { code: 0, .. } => Err("new_daemon_blocked:pair:resolver-output".to_string()),
-        _ => binprobe_decide("probe", &run, env!("CARGO_PKG_VERSION")),
+        BinProbeRun::Exited { code: 0, stdout } => rotation_pair_from_output(stdout),
+        BinProbeRun::Exited { stdout, .. } if stdout.lines().any(|line| line.starts_with("new_daemon_blocked:")) =>
+            Err(stdout.lines().rev().find(|line| line.starts_with("new_daemon_blocked:")).unwrap().to_string()),
+        _ => {
+            binprobe_decide("probe", &run, env!("CARGO_PKG_VERSION"))?;
+            Err("new_daemon_blocked:pair:resolver-output".to_string())
+        }
     }
 }
 
-fn prepare_rotation_binaries_blocking() -> Result<Option<RotationPair>, String> {
+fn probe_rotation_pair(pair: &RotationPair, version: &str) -> Result<(), String> {
+    for (bin, exe) in [("cysd", &pair.cysd), ("cys", &pair.cys)] {
+        let run = binprobe_run(exe, std::time::Duration::from_secs(10), std::time::Duration::from_secs(5));
+        binprobe_decide(bin, &run, version)?;
+    }
+    Ok(())
+}
+
+fn prepare_native_rotation_binaries_blocking() -> Result<Option<RotationPair>, String> {
     if !cfg!(windows) { return Ok(None); }
     let pair = RotationPair {
         cysd: rotation_absolute_executable(resolve_sidecar("cysd.exe"))?,
         cys: rotation_absolute_executable(resolve_sidecar("cys.exe"))?,
     };
-    // Refuse stable PATH shadowing before any main/manual/department drain.
-    rotation_check_shell(rotation_shell_command(&pair)?)?;
-    for (bin, exe) in [("cysd", &pair.cysd), ("cys", &pair.cys)] {
-        let run = binprobe_run(exe, std::time::Duration::from_secs(10), std::time::Duration::from_secs(5));
-        binprobe_decide(bin, &run, env!("CARGO_PKG_VERSION"))?;
-    }
+    probe_rotation_pair(&pair, env!("CARGO_PKG_VERSION"))?;
     Ok(Some(pair))
 }
 
-fn probe_rotation_binaries_blocking() -> Result<(), String> {
-    prepare_rotation_binaries_blocking().map(|_| ())
+fn prepare_department_rotation_pair(command: std::process::Command, version: &str) -> Result<RotationPair, String> {
+    let pair = rotation_check_shell(command)?;
+    // Different installations are allowed: probe the selected files, not siblings.
+    probe_rotation_pair(&pair, version)?;
+    Ok(pair)
 }
 
-async fn prepare_rotation_binaries() -> Result<Option<RotationPair>, String> {
-    binprobe_join_result(tokio::task::spawn_blocking(prepare_rotation_binaries_blocking).await)
+fn prepare_department_rotation_binaries_blocking() -> Result<Option<RotationPair>, String> {
+    if !cfg!(windows) { return Ok(None); }
+    prepare_department_rotation_pair(rotation_shell_command()?, env!("CARGO_PKG_VERSION")).map(Some)
 }
 
-/// The same H for UI paths that must decide before they drain (manual rotate, restart-all - DESIGN-R2 G1.4).
+async fn prepare_native_rotation_binaries() -> Result<Option<RotationPair>, String> {
+    binprobe_join_result(tokio::task::spawn_blocking(prepare_native_rotation_binaries_blocking).await)
+}
+
+async fn prepare_department_rotation_binaries() -> Result<Option<RotationPair>, String> {
+    binprobe_join_result(tokio::task::spawn_blocking(prepare_department_rotation_binaries_blocking).await)
+}
+
+fn probe_rotation_targets(include_main: bool, include_departments: bool) -> Result<(), String> {
+    if include_main { prepare_native_rotation_binaries_blocking()?; }
+    if include_departments { prepare_department_rotation_binaries_blocking()?; }
+    Ok(())
+}
+
+/// Manual preflight checks only the routes the UI is about to rotate.
 #[tauri::command]
-async fn probe_rotation_binaries() -> Result<(), String> {
-    binprobe_join_result(tokio::task::spawn_blocking(probe_rotation_binaries_blocking).await)
+async fn probe_rotation_binaries(include_main: Option<bool>, include_departments: Option<bool>) -> Result<(), String> {
+    binprobe_join_result(tokio::task::spawn_blocking(move ||
+        probe_rotation_targets(include_main.unwrap_or(true), include_departments.unwrap_or(true))).await)
+}
+
+/// Windows rotation uses the native path just probed. Normal boot is unchanged.
+fn spawn_rotation_cysd(program: &std::path::Path) -> Result<(), String> {
+    let mut command = std::process::Command::new(program);
+    command.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    no_console(&mut command);
+    command.spawn().map_err(|e| format!("failed to start checked cysd: {e}"))?;
+    Ok(())
 }
 
 /// Preserve script refusals byte-for-byte, including the one machine-readable
@@ -7806,7 +7862,7 @@ async fn rotate_dept_daemon(app: AppHandle, name: String, force: bool, skip_drai
     }
     // ★(0.14.53 WP12 · P2 · DESIGN-R2 G1.2) the new on-disk pair must start before anything is drained or stopped.
     //   Blocked = Err("new_daemon_blocked:…"); the department daemon and its sessions stay untouched.
-    let pair = prepare_rotation_binaries().await?;
+    let pair = prepare_department_rotation_binaries().await?;
     let restore_cys = pair.as_ref().map(|p| p.cys.clone()).unwrap_or_else(|| resolve_sidecar("cys"));
     // drain(best-effort): 교대 전 부서 노드에 저장 신호. 부서 소켓 대상(CYS_SOCKET)으로 cys drain 실행
     // (메인 rotate_daemon의 drain 동형·spawn_blocking 패턴 일치). cys drain 자체 watchdog로 hang 시에도 종료.
@@ -8365,13 +8421,14 @@ async fn rotate_daemon(app: AppHandle, force: bool, skip_drain: bool) -> Result<
     }
     // ★(0.14.53 WP12 · P2 · DESIGN-R2 G1.2) the new on-disk pair must start before the drain, the restore marker and
     //   stop_running_daemon(). Blocked = Err("new_daemon_blocked:…"); the working daemon and its sessions stay.
-    probe_rotation_binaries().await?;
+    let pair = prepare_native_rotation_binaries().await?;
     // drain(best-effort): 교대 전 살아있는 노드에 저장 신호 + 유예 (install_update 3단계 동형).
     // ★skip_drain: verified 재시작 경로는 사전에 `cys drain --verify`로 저장을 확인했으므로 여기서
     // 이중 drain을 생략한다. 기존 무손실 자동교대·수동 '바로 재시작'은 skip_drain=false로 거동 불변(회귀 0).
     if !skip_drain {
-        let _ = tokio::task::spawn_blocking(|| {
-            let mut cmd = std::process::Command::new(resolve_sidecar(if cfg!(windows) { "cys.exe" } else { "cys" }));
+        let cys = pair.as_ref().map(|p| p.cys.clone()).unwrap_or_else(|| resolve_sidecar("cys"));
+        let _ = tokio::task::spawn_blocking(move || {
+            let mut cmd = std::process::Command::new(cys);
             cmd.arg("drain");
             no_console(&mut cmd);
             cmd.status()
@@ -8380,7 +8437,11 @@ async fn rotate_daemon(app: AppHandle, force: bool, skip_drain: bool) -> Result<
     }
     let _ = std::fs::write(pending_restore_path(), "");
     stop_running_daemon().await;
-    ensure_daemon().await?;
+    if let Some(pair) = pair {
+        ensure_daemon_on(&default_socket(), cys::factory_reset::reset_in_progress, || spawn_rotation_cysd(&pair.cysd)).await?;
+    } else {
+        ensure_daemon().await?;
+    }
     // init-pack이 blocking Command::status()라 blocking 풀에서 실행(위 drain 패턴과 일치).
     let app2 = app.clone();
     let _ = tokio::task::spawn_blocking(move || maybe_apply_pending_update(&app2)).await;
@@ -9297,6 +9358,100 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn wp12_r3_healthy_copy_control(department: bool) {
+        use std::os::unix::fs::{PermissionsExt, MetadataExt};
+        let root = std::env::temp_dir().join(format!("wp12-r3-copies-{}-{}", std::process::id(), department));
+        let home = root.join("home with spaces 한글");
+        let local = home.join(".local/bin");
+        let siblings = root.join("siblings with spaces 한글");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::create_dir_all(&siblings).unwrap();
+        let version = env!("CARGO_PKG_VERSION");
+        let pair = RotationPair { cysd: siblings.join("cysd"), cys: siblings.join("cys") };
+        for (bin, path, line) in [
+            ("cysd", &pair.cysd, format!("cysd {version} (build x)")),
+            ("cys", &pair.cys, format!("cys {version}")),
+        ] {
+            std::fs::write(path, format!("#!/bin/sh\necho '{line}'\n")).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let copy = local.join(bin);
+            std::fs::copy(path, &copy).unwrap();
+            assert_eq!(std::fs::read(path).unwrap(), std::fs::read(&copy).unwrap(), "fixture must be byte-identical copies");
+            assert_ne!(path.canonicalize().unwrap(), copy.canonicalize().unwrap(), "copies must have different realpaths");
+            for candidate in [path, &copy] {
+                assert_eq!(binprobe_decide(bin, &binprobe_run(candidate, std::time::Duration::from_secs(2), std::time::Duration::from_secs(1)), version), Ok(()),
+                           "both copies must actually run and satisfy the version grammar");
+            }
+        }
+        let startup = root.join("benign-startup.sh");
+        std::fs::write(&startup, "echo benign-shell-startup\ntrap 'echo benign-shell-exit' EXIT\n").unwrap();
+        let mut cmd = rotation_shell_command().unwrap();
+        cmd.env("HOME", &home).env("PATH", format!("{}:/usr/bin:/bin", siblings.display())).env("BASH_ENV", &startup);
+        let result = if department {
+            prepare_department_rotation_pair(cmd, version)
+        } else {
+            probe_rotation_pair(&pair, version).map(|()| pair.clone())
+        };
+        assert!(result.is_ok(), "{} must accept healthy distinct copies: {result:?}", if department { "department" } else { "main-only" });
+        let selected = result.unwrap();
+        if department {
+            for (selected_path, expected) in [(&selected.cysd, local.join("cysd")), (&selected.cys, local.join("cys"))] {
+                let actual = std::fs::metadata(selected_path).unwrap();
+                let expected = std::fs::metadata(expected).unwrap();
+                assert_eq!((actual.dev(), actual.ino()), (expected.dev(), expected.ino()), "department must retain the shell-selected copy");
+            }
+            let command = || {
+                let mut cmd = rotation_shell_command().unwrap();
+                cmd.env("HOME", &home).env("PATH", format!("{}:/usr/bin:/bin", siblings.display())).env_remove("BASH_ENV");
+                cmd
+            };
+            std::fs::write(local.join("cys"), "#!/bin/sh\nexit 126\n").unwrap();
+            assert_eq!(prepare_department_rotation_pair(command(), version), Err("new_daemon_blocked:cys:rc:126".to_string()),
+                       "selected CLI must be probed too, not the healthy sibling");
+            std::fs::write(local.join("cysd"), "#!/bin/sh\necho 'cysd 0.0.0 (build old)'\n").unwrap();
+            std::fs::write(local.join("cys"), "#!/bin/sh\necho 'cys 0.0.0'\n").unwrap();
+            assert_eq!(prepare_department_rotation_pair(command(), version), Err("new_daemon_blocked:cysd:grammar".to_string()),
+                       "selected pair must match the app version, not merely match each other");
+        } else {
+            assert_eq!(selected, pair, "main must keep its native siblings");
+            std::fs::write(local.join("cysd"), "#!/bin/sh\nexit 126\n").unwrap();
+            assert_eq!(probe_rotation_pair(&pair, version), Ok(()), "unrunnable department shadow must not affect main-only probe");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn wp12_r3_path_records_have_their_own_bounded_budget() {
+        let prefix = if cfg!(windows) { "C:/" } else { "/" };
+        let record = format!("cys-rotation-pair\t{}{}\t{}{}", prefix, "a".repeat(5000), prefix, "b".repeat(5000));
+        assert!(binprobe_read_line(record.as_bytes()).is_err(), "version output keeps its 4096-byte cap");
+        let line = binprobe_read_line_limit(record.as_bytes(), 262144).unwrap();
+        assert!(rotation_pair_from_output(&line).is_ok(), "two paths must not inherit the short version-line cap");
+        assert!(rotation_pair_from_output(&format!("benign prelude\n{record}\nbenign exit\n")).is_ok(), "ordinary shell output is not path data");
+        #[cfg(unix)]
+        {
+            let file = std::env::temp_dir().join(format!("wp12-r3-long-path-record-{}", std::process::id()));
+            std::fs::write(&file, &record).unwrap();
+            let mut cmd = std::process::Command::new("/bin/cat");
+            cmd.arg(&file); no_console(&mut cmd);
+            assert!(rotation_check_shell(cmd).is_ok(), "the real resolver capture must use the path-record budget");
+            std::fs::remove_file(file).unwrap();
+        }
+        assert!(binprobe_read_line_limit(vec![b'x'; 262145].as_slice(), 262144).is_err(), "path output stays bounded");
+        for invalid in ["ok", "cys-rotation-pair\trelative\t/absolute", "cys-rotation-pair\t/one\t", "cys-rotation-pair\t/one\t/two\t/three"] {
+            assert!(rotation_pair_from_output(invalid).is_err(), "malformed path output must refuse: {invalid}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wp12_r3_healthy_copies_main_only() { wp12_r3_healthy_copy_control(false); }
+
+    #[cfg(unix)]
+    #[test]
+    fn wp12_r3_healthy_copies_department() { wp12_r3_healthy_copy_control(true); }
+
+    #[cfg(unix)]
     #[test]
     fn wp12_r2_shell_shadow_refuses_before_drain_and_preserves_old_process() {
         use std::os::unix::fs::{PermissionsExt, symlink};
@@ -9325,19 +9480,19 @@ mod tests {
         impl Drop for Reap { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
         let mut old = Reap(sleeper.spawn().unwrap());
         let command = || {
-            let mut cmd = rotation_shell_command(&pair).unwrap();
+            let mut cmd = rotation_shell_command().unwrap();
             cmd.env("HOME", &home).env("PATH", format!("{}:/usr/bin:/bin", siblings.display()));
             cmd.env_remove("BASH_ENV");
             cmd
         };
         let failed_os = root.join("failed-os.sh");
-        std::fs::write(&failed_os, "uname(){ return 127; }\n").unwrap();
+        std::fs::write(&failed_os, "echo benign-startup\ntrap 'echo benign-exit' EXIT\nuname(){ return 127; }\n").unwrap();
         let mut os_command = command();
         os_command.env("BASH_ENV", &failed_os);
         assert!(rotation_check_shell(os_command).unwrap_err().starts_with("new_daemon_blocked:probe:os-detection-failed"),
                 "OS detection refusal must occur before any drain too");
-        let result = rotation_check_shell(command());
-        assert_eq!(result, Err("new_daemon_blocked:pair:path-mismatch".to_string()), "shadow pair must refuse before drain");
+        let result = prepare_department_rotation_pair(command(), "0.14.53");
+        assert_eq!(result, Err("new_daemon_blocked:cysd:rc:126".to_string()), "selected shadow must be probed and refused before drain");
         if result.is_ok() {
             let mut drain = std::process::Command::new(&pair.cys);
             drain.arg("drain"); no_console(&mut drain); let _ = drain.status();
@@ -9347,8 +9502,8 @@ mod tests {
         assert_eq!(std::fs::read(&socket).unwrap(), b"old-serving-socket");
         std::fs::remove_file(local.join("cysd")).unwrap();
         symlink(&pair.cysd, local.join("cysd")).unwrap();
-        assert_eq!(rotation_check_shell(command()), Ok(()), "healthy aliases resolve to the authoritative pair");
-        assert!(!log.exists(), "path preflight does not execute either candidate");
+        assert_eq!(prepare_department_rotation_pair(command(), "0.14.53"), Ok(pair.clone()), "healthy aliases resolve to the selected pair");
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "--version\n", "only the selected CLI version probe ran, not drain");
         drop(old);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -9360,7 +9515,7 @@ mod tests {
         command.args(["-c", "printf 'cys 0.14.52'"]);
         no_console(&mut command);
         assert_eq!(rotation_check_shell(command), Err("new_daemon_blocked:pair:resolver-output".to_string()),
-                   "only the exact resolver ok sentinel can pass");
+                   "only a valid absolute two-path record can pass");
         let mut command = std::process::Command::new("/bin/sh");
         command.args(["-c", "exec sleep 30"]);
         no_console(&mut command);
@@ -9393,11 +9548,19 @@ mod tests {
             let at = production.find(head).unwrap();
             &production[at..at + production[at..].find("\n}\n").unwrap()]
         };
-        let prepare = body("fn prepare_rotation_binaries_blocking(");
-        assert!(prepare.find("rotation_check_shell(rotation_shell_command(&pair)?)?").unwrap()
-            < prepare.find("binprobe_run(exe,").unwrap(), "shell selection checked before candidate execution");
+        let native = body("fn prepare_native_rotation_binaries_blocking(");
+        assert!(native.contains("probe_rotation_pair(&pair,"), "native pair must be run-probed");
+        assert!(!native.contains("rotation_shell") && !native.contains("department"), "native preparation must not inspect shell selection");
+        let prepare = body("fn prepare_department_rotation_pair(");
+        assert!(prepare.find("let pair = rotation_check_shell(command)?;").unwrap()
+            < prepare.find("probe_rotation_pair(&pair, version)?;").unwrap(), "run the selected shell pair before returning it");
+        assert!(body("fn prepare_department_rotation_binaries_blocking(").contains(
+            "prepare_department_rotation_pair(rotation_shell_command()?, env!(\"CARGO_PKG_VERSION\")).map(Some)"),
+            "department wrapper must use actual shell selection");
+        assert!(body("async fn prepare_department_rotation_binaries(").contains("spawn_blocking(prepare_department_rotation_binaries_blocking)"));
+        assert!(body("async fn prepare_native_rotation_binaries(").contains("spawn_blocking(prepare_native_rotation_binaries_blocking)"));
         let dept = body("async fn rotate_dept_daemon(");
-        assert!(dept.find("let pair = prepare_rotation_binaries().await?;").unwrap()
+        assert!(dept.find("let pair = prepare_department_rotation_binaries().await?;").unwrap()
             < dept.find(".arg(\"drain\")").unwrap(), "pair binding precedes department drain");
         assert!(dept.contains("pair.as_ref().map(|p| p.cys.clone())"), "drain uses bound CLI");
         assert!(dept.contains("let cys = restore_cys.clone();"), "drain clones the same retained CLI");
@@ -9405,8 +9568,13 @@ mod tests {
                 "post-rotation restore must keep the checked CLI too");
         assert!(!body("async fn run_sidecar_restore_using(").contains("resolve_sidecar"), "bound restore never resolves again");
         assert!(dept.contains("cmd.arg(\"--rotation-pair\").arg(&pair.cysd).arg(&pair.cys)"), "shell receives exactly the checked pair");
-        assert!(body("fn probe_rotation_binaries_blocking(").contains("prepare_rotation_binaries_blocking().map"),
-            "main/manual preflight also checks shell selection");
+        let main = body("async fn rotate_daemon(");
+        assert!(main.contains("let pair = prepare_native_rotation_binaries().await?;"), "main-only must use native preparation");
+        assert!(main.contains("spawn_rotation_cysd(&pair.cysd)"), "main spawn uses the checked native daemon");
+        assert!(main.contains("pair.as_ref().map(|p| p.cys.clone())"), "main drain uses checked native CLI");
+        let targets = body("fn probe_rotation_targets(");
+        assert!(targets.contains("if include_main { prepare_native_rotation_binaries_blocking()?; }"));
+        assert!(targets.contains("if include_departments { prepare_department_rotation_binaries_blocking()?; }"));
     }
 
     #[test]
@@ -9525,7 +9693,7 @@ mod tests {
         );
         // off Windows H changes nothing (the probe is the SAC/App Control guard)
         if !cfg!(windows) {
-            assert_eq!(probe_rotation_binaries_blocking(), Ok(()));
+            assert_eq!(probe_rotation_targets(true, true), Ok(()));
         }
     }
 
@@ -9571,7 +9739,7 @@ mod tests {
             ("async fn rotate_daemon(", "live_sessions:unknown", &[".arg(\"drain\")", "pending_restore_path()", "stop_running_daemon().await"][..]),
             ("async fn rotate_dept_daemon(", "live_sessions:unknown", &[".arg(\"drain\")", ".arg(\"rotate\")"][..]),
         ] {
-            let call = if head.contains("rotate_dept_daemon") { "prepare_rotation_binaries().await?;" } else { "probe_rotation_binaries().await?;" };
+            let call = if head.contains("rotate_dept_daemon") { "prepare_department_rotation_binaries().await?;" } else { "prepare_native_rotation_binaries().await?;" };
             let b = body(head);
             assert_eq!(b.matches(call).count(), 1, "{head}: exactly one H call");
             let at = b.find(call).unwrap();

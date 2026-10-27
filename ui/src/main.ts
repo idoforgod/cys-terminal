@@ -8034,8 +8034,10 @@ function noteRotationBlocked(appVer: string, manual = false) {
       "새 실행 파일을 실행할 수 있는지 확인하지 못해 남은 교대를 중단했습니다. 차단된 대상의 기존 데몬은 유지됩니다. 상태바 배지나 재시작 버튼으로 다시 확인할 수 있습니다.");
   }
 }
-async function probeRotationForManual(appVer: string) {
-  await invoke("probe_rotation_binaries");
+async function probeRotationForManual(appVer: string, includeMain = true, includeDepartments = true) {
+  // An empty retry must not clear a version latch without any probe.
+  if (!includeMain && !includeDepartments) { includeMain = true; includeDepartments = true; }
+  await invoke("probe_rotation_binaries", { includeMain, includeDepartments });
   rotationBlocked.delete(appVer);
 }
 
@@ -8165,7 +8167,7 @@ async function manualRotateSkewed(appVer: string, heldMain: boolean, heldDepts: 
   }
   rotatingDaemon = true;
   try {
-    await probeRotationForManual(appVer);
+    await probeRotationForManual(appVer, heldMain, heldDepts.length > 0);
     const nodes = (heldMain ? 1 : 0) + heldDepts.length;
     const ok = await confirmModal(
       `데몬 교대 (새 버전 v${appVer})`,

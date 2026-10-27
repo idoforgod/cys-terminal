@@ -127,6 +127,34 @@ describe("WP12 rotation refusal latch", () => {
     expect(r.notices.length).toBe(2);
   });
 
+  it("main-only manual rotation does not preflight or latch on the department pair", async () => {
+    const r = rig({ fail: (c) => c.cmd === "probe_rotation_binaries" && c.args?.includeDepartments === true ? shellRefusal : undefined });
+    await r.api.manualRotateSkewed("0.14.53", true, []);
+    const probe = r.calls.find((c) => c.cmd === "probe_rotation_binaries");
+    expect(probe?.args).toEqual({ includeMain: true, includeDepartments: false });
+    expect(r.rotations().map((c) => c.cmd)).toEqual(["rotate_daemon"]);
+    expect(r.scope.rotatingDaemon).toBe(false);
+  });
+
+  it("department-only manual rotation does not preflight unrelated native siblings", async () => {
+    const r = rig({ fail: (c) => c.cmd === "probe_rotation_binaries" && c.args?.includeMain === true ? shellRefusal : undefined });
+    await r.api.manualRotateSkewed("0.14.53", false, [{ name: "first", socket: "s1" }]);
+    const probe = r.calls.find((c) => c.cmd === "probe_rotation_binaries");
+    expect(probe?.args).toEqual({ includeMain: false, includeDepartments: true });
+    expect(r.rotations().map((c) => c.args?.name)).toEqual(["first"]);
+    expect(r.scope.rotatingDaemon).toBe(false);
+  });
+
+  it("empty-target retry still validates before clearing the latch", async () => {
+    const r = rig({ fail: (c) => c.cmd === "probe_rotation_binaries" && (c.args?.includeMain || c.args?.includeDepartments) ? shellRefusal : undefined });
+    await r.api.manualRotateSkewed("0.14.53", false, []);
+    expect(r.calls.find((c) => c.cmd === "probe_rotation_binaries")?.args).toEqual({ includeMain: true, includeDepartments: true });
+    expect(r.confirmations.length).toBe(0);
+    await r.api.checkVersionSkew();
+    expect(r.rotations().length).toBe(0);
+    expect(r.scope.rotatingDaemon).toBe(false);
+  });
+
   it("manual restart refusal happens before confirmation, drain and restart; controls stay usable", async () => {
     const r = rig({ fail: (c) => c.cmd === "probe_rotation_binaries" ? shellRefusal : undefined });
     await r.api.manualRestartAllDaemons();
