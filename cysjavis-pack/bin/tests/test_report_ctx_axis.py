@@ -168,8 +168,18 @@ check("텍스트 보고: 실측 60%+ 는 자기보고 값이 아니라 실측 �
       "worker(78% 실측)" in text and "worker(95%" not in text, text)
 check("텍스트 보고: 신선한 자기보고는 '추정' 으로 찍힌다",
       "reviewer(65% 추정)" in text, text)
+# ★범위 교정(P11 D7-R3 · 2026-10-27): 이 단언의 뜻은 **60% 목록에** 없다는 것이다(시험 이름 그대로).
+#   종전엔 보고서 **전문**에서 "cso(" 를 찾았는데, D7-R3 이 값 없는 좌석을 적는 별 줄을 새로 넣으면서
+#   그 줄에 `cso(self-report older than 300s)` 가 정당하게 등장한다. 그래서 단언을 **그 줄 하나로
+#   좁힌다** — 느슨해진 것이 아니다: 60% 줄에 cso·agy 가 들어가면 여전히 깨진다(아래 음성 대조).
+def _ctx60_line(t):
+    return next((l for l in t.split("\n") if "컨텍스트 60%+" in l), "")
+
+
 check("텍스트 보고: 낡은 자기보고·미측정은 60% 목록에 없다",
-      "cso(" not in text and "agy(" not in text, text)
+      "cso(" not in _ctx60_line(text) and "agy(" not in _ctx60_line(text), _ctx60_line(text))
+check("↑ 음성 대조: 60% 줄에 cso 가 섞이면 이 단언은 깨진다(좁힌 뒤에도 변별력이 있다)",
+      "cso(" in _ctx60_line("  • ⚠ 컨텍스트 60%+ 노드: cso(90% 추정) — x"))
 check("텍스트 보고: 죽은 좌석의 동결 실측 82 는 60% 목록에 없다",
       "ghost-exited(" not in text and "ghost-dead(" not in text, text)
 
@@ -283,6 +293,45 @@ check("⑦ 게이트: 가드 좌석만 있고 미해결 10분+ 가 없으면 경
       not [w for w in RG.extract_warnings(only_guard) if w.get("task") == "gate-context"])
 check("⑦ 정규화: 미해결 경과 초는 시간파생(BLACKLIST) — 같은 통보의 경과만 바뀐 보고는 스냅샷이 같다",
       "ctx_fire_pending_age_s" in RG.BLACKLIST_KEYS)
+
+# ── ⑧ D7-R3(P11 / C-30): "현재 쓸 수 있는 값 없음" 한 줄 ───────────────────────────
+# 계약(설계 R3 §1.2): 보고서는 `no current usable context value` 만 적는다 — 수집기가 phase·보존
+#   fire_id·level_pct 를 버리므로 "no automatic threshold input" 은 **낼 수 없다**(CLI 각주 전용).
+#   죽은 행은 적지 않는다. 한정어는 수집기가 이미 싣는 두 값(context_pct · status_age_secs)만 쓴다.
+d7text = RP.render_text(rep)
+check("⑧ 보고: 값 없는 산 좌석이 한 줄로 드러난다(종전엔 아무 줄도 없었다)",
+      "no current usable context value" in d7text, d7text)
+check("⑧ 보고: 낡은 자기보고(301초)는 그 사실을 한정어로 달고 나온다",
+      "cso(self-report older than 300s)" in d7text, d7text)
+check("⑧ 보고: 신고가 아예 없는 좌석은 한정어 없이 이름만",
+      re.search(r"(^|[:,] )agy(,|$)", d7text, re.M) is not None, d7text)
+check("⑧ 보고: 죽은 좌석은 이 줄에 없다(사망은 다른 축)",
+      "ghost-exited" not in d7text.split("no current usable context value")[-1].split("\n")[0]
+      and "ghost-dead" not in d7text.split("no current usable context value")[-1].split("\n")[0], d7text)
+check("⑧ 보고: 측정되는 좌석은 이 줄에 없다",
+      "worker" not in d7text.split("no current usable context value")[-1].split("\n")[0]
+      and "reviewer" not in d7text.split("no current usable context value")[-1].split("\n")[0], d7text)
+check("⑧ 보고: 보고서는 CLI 전용 강한 문장을 **절대** 찍지 않는다",
+      "no automatic threshold input" not in d7text and "guard retains" not in d7text, d7text)
+check("⑧ 보고: 종전 60% 줄·가드 줄은 그대로다(양성 대조)",
+      "worker(78% 실측)" in d7text and "컨텍스트 60%+" in d7text, d7text)
+
+# 헬퍼 단위 — 세 한정어 갈래. age 미상은 전용 행으로 만든다(STATUS 는 건드리지 않는다).
+nv = {n["role"]: q for n, q in RP.ctx_no_value_nodes(rep["live_nodes"])}
+check("⑧ 헬퍼: none 좌석만 담는다(dead·measured·self 제외)",
+      set(nv) == {"cso", "agy"}, str(nv))
+check("⑧ 헬퍼: 301초 → older-than, 신고 없음 → 한정어 없음",
+      nv.get("cso") == "self-report older than 300s" and nv.get("agy") == "", str(nv))
+age_unknown = dict(by_role["agy"], role="ageless", context_pct=61, status_age_secs=None)
+nv2 = dict((n["role"], q) for n, q in RP.ctx_no_value_nodes([age_unknown]))
+check("⑧ 헬퍼: 나이 미상은 '>300초' 와 **다른** 한정어다(두 상태를 합치지 않는다)",
+      nv2.get("ageless") == "self-report age unknown", str(nv2))
+age_float = dict(by_role["agy"], role="floaty", context_pct=61, status_age_secs=301.0)
+nv3 = dict((n["role"], q) for n, q in RP.ctx_no_value_nodes([age_float]))
+check("⑧ 헬퍼: int 가 아닌 나이는 한정어를 만들지 않는다(수집기가 None 으로 접는 형상)",
+      nv3.get("floaty") == "", str(nv3))
+check("⑧ 헬퍼: 가드 좌석도 값이 없으면 담긴다(이 줄은 값에 대한 것이다)",
+      [q for n, q in RP.ctx_no_value_nodes([dict(by_role["agy"], role="g", ctx_guarded=True)])] == [""])
 
 if fails:
     print("FAILED %d: %s" % (len(fails), ", ".join(fails)))

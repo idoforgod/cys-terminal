@@ -124,6 +124,41 @@ def ctx_alert_nodes(live_nodes):
             legacy.append((n, p, src))
     return legacy, pending
 
+
+# ── ★D7-R3(P11 / C-30) 지금 쓸 수 있는 컨텍스트 값이 없는 산 좌석 ──────────────────────────
+# 왜 필요한가: 값이 없는 좌석은 60% 줄에도 가드 줄에도 **안 나온다** — 그래서 보고서를 읽는 사람은
+#   "문제 없음"과 "아무도 재지 않음"을 구별할 수 없었다(C-30). 이 헬퍼는 그 사실만 드러낸다.
+# ★문면 한계(설계 R3 §1.1 이 측정으로 못박은 것): 수집기는 ctx_guard 를 `ctx_guarded`·`ctx_fire_pending`
+#   세 칸으로 줄이고 `phase`·보존된 `fire_id`·`level_pct` 를 **버린다**. 그래서 보고서는 "자동 임계
+#   입력이 없다" 같은 강한 문장을 낼 **데이터 경로가 없다** — 그 문장은 전 행을 보는 CLI 각주 전용이다.
+#   여기서는 `no current usable context value` 까지만 말한다. 더 말하면 보존 기록이 있는 좌석에도
+#   같은 말을 하게 된다(세 상태가 수집기에서 한 모양으로 붕괴한다).
+# 한정어는 **수집기가 이미 싣는 두 값**만 쓴다(새 데이터 경로 0): context_pct · status_age_secs.
+def ctx_no_value_nodes(live_nodes):
+    """[(entry, qualifier)] — `pick_node_ctx` 가 (None, "none") 을 내는 **산** 좌석.
+
+    죽은 좌석((None, "dead"))은 담지 않는다 — 사망은 다른 축이고 종전 처리가 있다.
+    가드 좌석도 담는다: 이 줄은 **값**에 대한 것이지 가드에 대한 것이 아니다.
+    qualifier 는 "" 또는 자기보고의 상태를 적은 짧은 글자다(없으면 빈 문자열).
+    """
+    out = []
+    for n in live_nodes or []:
+        p, src = pick_node_ctx(n)
+        if p is not None or src != "none":
+            continue
+        s = n.get("context_pct")
+        age = n.get("status_age_secs")
+        qual = ""
+        # 자기보고 값이 있는데 쓰이지 못한 경우에만 그 이유를 적는다. 두 이유를 **합치지 않는다**:
+        #   낡음(>300초)과 나이 미상은 서로 다른 사실이다.
+        if isinstance(s, (int, float)):
+            if isinstance(age, int) and age > CTX_SELF_REPORT_MAX_AGE_S:
+                qual = "self-report older than %ds" % CTX_SELF_REPORT_MAX_AGE_S
+            elif age is None:
+                qual = "self-report age unknown"
+        out.append((n, qual))
+    return out
+
 # ── 유령 todo 차단 (2026-07-26 결함 · 공유 폴더 유산 파일이 현재 편대 모수로 유입) ──
 # 근거: cwd/_round 스캔은 "cwd의 _round는 현재 편대 소유"를 가정하나, 역사 있는 공유 프로젝트
 # 폴더에서는 깨진다(07-11~07-20 종결 레인의 todo 4건이 07-26 편대 집계에 유입·301항목 오염).
@@ -1096,6 +1131,13 @@ def render_text(rep):
             roles = ", ".join("%s(%d%% %s)" % (n["role"], p, "실측" if src == "measured" else "추정")
                               for n, p, src in high_ctx)
             lines.append("  • ⚠ 컨텍스트 60%%+ 노드: %s — cycle-agent 집행 검토" % roles)
+    # ★D7-R3(C-30): 값이 없는 좌석을 **사실 한 줄**로 드러낸다. 명령형이 없고, 이벤트·피드·게이트
+    #   입력이 아니다(기존 보고 본문의 한 줄일 뿐). 강한 문장은 여기서 쓰지 않는다 — 위 주석 참조.
+    no_value_ctx = ctx_no_value_nodes(rep["live_nodes"])
+    if no_value_ctx:
+        roles = ", ".join(
+            "%s%s" % (n["role"], ("(%s)" % q) if q else "") for n, q in no_value_ctx)
+        lines.append("  • 컨텍스트 현재값 없음 (no current usable context value): %s" % roles)
     return "\n".join(lines)
 
 

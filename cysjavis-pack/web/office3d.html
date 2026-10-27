@@ -2224,7 +2224,7 @@ function fillPanel(ent){
   title.textContent = `${n.dept_label || ent.deptId} · ${n.role}`;   // 표시는 dept_label — raw 키 비노출
   title.title = n.key;                                                // 키는 불투명 토큰 — tooltip 보조 노출만
   document.getElementById('p-meta').innerHTML =
-    `상태 ${PRESENCE_KO[n.presence]||n.presence} (conf ${n.presence_conf}) · ctx ${n.ctx?.pct??'—'}%`
+    `상태 ${PRESENCE_KO[n.presence]||n.presence} (conf ${n.presence_conf}) · ctx ${n.ctx?.pct==null?'미측정':n.ctx.pct+'%'}`
     + ` · agent ${n.agent||'—'}<br>task: ${n.task||'—'}`
     + (n.flags?.length ? `<br>flags: ${n.flags.join(', ')}` : '');
 }
