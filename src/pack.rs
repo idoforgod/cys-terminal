@@ -2939,7 +2939,7 @@ pub fn plan_install(
         let disk = if exists { std::fs::read_to_string(&path).ok() } else { None };
         let mh_raw = manifest.get(rel).map(String::as_str);
         // ★C-07(0.14.55 · P3): 분류 **직전** 낡은 항목 판정. decide_file_action 의 arm 은 무변경.
-        let stale = classify_stale_entry(rel, scope, disk.as_deref(), mh_raw);
+        let stale = classify_stale_entry(dir, rel, scope, disk.as_deref(), mh_raw);
         let repaired = match &stale {
             StaleEntry::Repaired(h) => Some(h.clone()),
             _ => None,
@@ -3310,16 +3310,25 @@ pub enum StaleEntry {
 /// (이관 D5H-20261027-P3-PRISTINE-MERGE): 디스크 바이트가 무엇인지 모르는 파일에 대해 조상이
 /// 그 파일을 설명한다고 신뢰하는 것이기 때문이다.
 pub fn classify_stale_entry(
+    dir: &Path,
     rel: &str,
     scope: PackScope,
     disk: Option<&str>,
     manifest_hash: Option<&str>,
 ) -> StaleEntry {
+    // ★조상 해시는 **낡음 판정의 가드**다(이관된 pristine-Merge3 확장과 다르다): 항목이 조상과
+    //   같으면 그 항목은 낡은 것이 아니라 **정상적인 드리프트/병합 상태의 기준선**이다.
+    //   이 가드를 빼면 합법적인 로컬 수정(항목==조상 해시 · 건강한 3-way 경로)이 "출처 불명"으로
+    //   오분류돼 3-way 병합이 사라진다(실측: lib 스위트 52건 적색).
+    let pristine_hash = std::fs::read_to_string(dir.join(PRISTINE_DIR).join(rel))
+        .ok()
+        .map(|p| content_hash(&p));
     classify_stale_entry_with(
         rel,
         scope,
         disk,
         manifest_hash,
+        pristine_hash.as_deref(),
         crate::pack_prev_vendor::prev_vendor_hashes(rel),
     )
 }
@@ -3334,6 +3343,7 @@ pub fn classify_stale_entry_with(
     scope: PackScope,
     disk: Option<&str>,
     manifest_hash: Option<&str>,
+    pristine_hash: Option<&str>,
     known: &[&str],
 ) -> StaleEntry {
     if ownership_scoped(rel, scope) != Ownership::System {
@@ -3344,6 +3354,10 @@ pub fn classify_stale_entry_with(
     };
     let dh = content_hash(d);
     if dh == mh {
+        return StaleEntry::Normal;
+    }
+    // 항목이 **조상**과 같으면 낡은 것이 아니다 — 평범한 드리프트/3-way 입력이다.
+    if pristine_hash == Some(mh) {
         return StaleEntry::Normal;
     }
     if known.is_empty() {
@@ -4051,7 +4065,7 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
         let unreadable = exists && disk.is_none();
         let mhash_raw: Option<String> = manifest.get(rel).cloned();
         // ★C-07: 분류 직전 판정 — 기준선 수리 또는 제자리 보존.
-        let stale = classify_stale_entry(rel, scope, disk.as_deref(), mhash_raw.as_deref());
+        let stale = classify_stale_entry(&dir, rel, scope, disk.as_deref(), mhash_raw.as_deref());
         let mhash: Option<String> = match &stale {
             StaleEntry::Repaired(h) => {
                 // 기준선을 **디스크에 실제로 있는 과거 릴리스 해시**로 수리한다 — 그러면 Arm 2 가
@@ -5115,23 +5129,23 @@ mod tests {
 
         // 1) system 아님 → Normal (user 파일은 이 판정의 대상이 아니다)
         assert_eq!(
-            classify_stale_entry_with(userrel, PackScope::Base, Some("x"), Some(&stale), &table),
+            classify_stale_entry_with(userrel, PackScope::Base, Some("x"), Some(&stale), None, &table),
             StaleEntry::Normal
         );
         // 2) 매니페스트 항목 부재 → Normal (레거시 경로 거동 불변)
         assert_eq!(
-            classify_stale_entry_with(sysrel, PackScope::Base, Some("x"), None, &table),
+            classify_stale_entry_with(sysrel, PackScope::Base, Some("x"), None, None, &table),
             StaleEntry::Normal
         );
         // 3) 항목이 디스크와 일치 → Normal (건전)
         let dh = content_hash("x");
         assert_eq!(
-            classify_stale_entry_with(sysrel, PackScope::Base, Some("x"), Some(&dh), &table),
+            classify_stale_entry_with(sysrel, PackScope::Base, Some("x"), Some(&dh), None, &table),
             StaleEntry::Normal
         );
         // 4) 표에 행이 없음 → KeepInPlace("no-row")
         assert_eq!(
-            classify_stale_entry_with(sysrel, PackScope::Base, Some("x"), Some(&stale), &[]),
+            classify_stale_entry_with(sysrel, PackScope::Base, Some("x"), Some(&stale), None, &[]),
             StaleEntry::KeepInPlace("no-row")
         );
         // 5) ★디스크가 표에 있는 과거 릴리스 본 → Repaired(디스크 해시)
@@ -5141,6 +5155,7 @@ mod tests {
                 PackScope::Base,
                 Some(prev_vendor),
                 Some(&stale),
+                None,
                 &table
             ),
             StaleEntry::Repaired(hp.clone())
@@ -5152,6 +5167,7 @@ mod tests {
                 PackScope::Base,
                 Some("the operator wrote this\n"),
                 Some(&stale),
+                None,
                 &table
             ),
             StaleEntry::KeepInPlace("unknown-disk")
@@ -10111,10 +10127,18 @@ mod tests {
         assert_eq!(read(&format!("{l3}.user")), l3_mine, "L3 .user 보존");
         assert_eq!(read(&format!("{l3}.base")), l3_base, "L3 .base 조상 보존");
         assert_eq!(kind(l3).as_deref(), Some("conflicted"), "L3 원장 conflicted");
-        // L4: base 미검증 — 종전 healed(치유 + .user 보존).
-        assert_eq!(read(l4), embed_of(l4), "L4 종전 healed 거동");
-        assert_eq!(read(&format!("{l4}.user")), "DEPT-DRIFT-L4\n", "L4 .user 보존");
-        assert_eq!(kind(l4).as_deref(), Some("healed"), "L4 원장 healed");
+        // L4: base 미검증 — ★0.14.55(C-07 · P3)부터 **제자리 보존 + 보고**다(종전 healed 가 아니다).
+        //   근거: HEAD-DISPOSITION-P3-R3.md "What proceeds" 2 — "unknown disk hash -> keep in place +
+        //   report (no heal, no .user parking, no Merge3)". 이 파일은 매니페스트 항목이 디스크와도
+        //   조상과도 다르고 과거벤더 표에 행이 없다 = **출처를 말할 수 없다**. 종전 거동은 운영자가
+        //   쓰지 않은 바이트의 `.user` 백업과 거짓 "healed" 원장 항목을 만들었다(reviewer1 r2 M3).
+        //   ⇒ 이 검체의 기대값 변경은 거동 완화가 아니라 **구속력 있는 판정의 반영**이다.
+        assert_eq!(read(l4), "DEPT-DRIFT-L4\n", "L4 제자리 보존(디스크 바이트 무변경)");
+        assert!(
+            !dpack.join(format!("{l4}.user")).exists(),
+            "L4 .user 미생성 — 쓰지 않은 바이트의 백업을 만들지 않는다"
+        );
+        assert_eq!(kind(l4), None, "L4 원장 무기록 — 거짓 healed 항목을 남기지 않는다");
         // 릴리스 경계 완주: .pack-version 현행 재기록(잔류 해소).
         assert_eq!(
             std::fs::read_to_string(dpack.join(PACK_VERSION_FILE)).unwrap(),
