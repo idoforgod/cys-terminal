@@ -19,7 +19,7 @@ import { roleDotColor } from "./appearance";
 import { seatPriority, annotateRoles, tidyHoles } from "./seatlayout";
 import { advanceGhostStrikes } from "./wsreconcile";
 import { deptLiveRoles } from "./deptprogress";
-import { dupRoleCounts, paneTitle } from "./panetitle"; // ★WP13 표시 함수(순수) — 대역 대신 진짜를 태운다
+import { dupRoleCounts, paneTitle, paneDetails } from "./panetitle"; // ★WP13 표시 함수(순수) — 대역 대신 진짜를 태운다
 
 declare const Bun: { Transpiler: new (o: { loader: "ts" }) => { transformSync(code: string): string } };
 
@@ -309,7 +309,7 @@ function harness() {
     panes, renderUsage: nothing,
     // ★WP13: refreshPaneTitles 가 쓰는 표시 함수는 이제 ./panetitle 의 순수 함수다(DOM 불필요) — 대역이 아니라
     //   진짜를 넣는다. 서명이 바뀌면(번호 인자) 여기서 ReferenceError/형 오류로 드러난다(이 파일 머리말 ② 규약).
-    paneTitle, dupRoleCounts,
+    paneTitle, paneDetails, dupRoleCounts,
     makePane: async (sid: number, _title: string, sk?: string): Promise<FakeRt> => {
       const rt = makeRt(sid, sk);
       panes.set(paneKey(sid, sk), rt);
