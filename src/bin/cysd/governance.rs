@@ -25699,32 +25699,337 @@ mod tests {
         fn new(role: &str) -> Self {
             Self { role: role.to_string(), rows: Vec::new(), idle: 0, dead: 0 }
         }
+        /// ★integ-7 통합(부서장 판정 `_evidence/0.14.55-INTEG-REHEARSAL/integ-7/HEAD-RULING-INTEG7-P7xP8.md`
+        /// · 2026-10-28) — P7 과 P8 이 **이 계측기 하나**를 각자 다시 썼다(P7: `after_tick` 을 없애고
+        /// `tick` 으로 · P8: 인코딩과 패닉 표면화를 더함). 여기서 **하나로 합친다**. 두 보증을 적어 둔다
+        /// — 어느 한쪽을 지우면 그쪽 검체가 붉는다(변이 2종으로 실측):
+        ///   ⒜ **P7(API·의미)**: 판정 행은 `check_role_deadman_at` 의 **비교자 콜백**에서 받아 적는다.
+        ///      틱 뒤 생존(`shell_alive`·`exited`)만으로는 시계 결함을 귀속할 수 없다 — 그래서 비교자가
+        ///      주는 `epoch`·`mono_elapsed`·`threshold`·`due` 가 행에 들어간다. 그 문장이 덤프 머리글이다.
+        ///   ⒝ **P8(인코딩·실패 표면화)**: 이 함수가 적는 **모든 행**은 `dump_line` 을 거친다 ⇒
+        ///      `windows-health.yml` 의 `failures.py` 가 패닉 메시지를 끊지 못하고, `expect` 가 머리글과
+        ///      행 전부를 `panic_message` 로 패닉 안에 싣는다.
+        /// ⛔P8 의 종전 `after_tick`(이벤트 수로 verdict 를 되짚던 행)은 되살리지 마라 — P7 이 그것을
+        ///   비교자 행으로 대체했고, 호출 자리 4곳이 모두 `tick` 이다.
         fn tick(&mut self, daemon: &Arc<Daemon>, s: &crate::state::Surface, tracker: &mut DeadmanTracker) {
-            super::check_role_deadman_at(daemon, tracker, now_epoch(), Instant::now(),
+            super::check_role_deadman_at(
+                daemon,
+                tracker,
+                now_epoch(),
+                Instant::now(),
                 |role, verdict, epoch, elapsed, threshold, due, alive, exited| {
-                    self.rows.push(format!("decision role={role} verdict={verdict} epoch={epoch} mono_elapsed={elapsed:?} threshold={threshold} due={due:?} shell_alive={alive} exited={exited:?}"));
-                });
-            self.idle=events_named(daemon,"master.idle").len();
-            self.dead=events_named(daemon,"master.deadman").len();
-            self.rows.push(format!("after_tick idle={} death={} shell_alive={} exited={} child_status={:?}",self.idle,self.dead,crate::state::pid_alive(s.pid),s.exited.load(AtomicOrdering::Relaxed),s.child.lock().unwrap_or_else(|e|e.into_inner()).try_wait()));
+                    self.rows.push(Self::dump_line(&format!(
+                        "decision role={role} verdict={verdict} epoch={epoch} mono_elapsed={elapsed:?} threshold={threshold} due={due:?} shell_alive={alive} exited={exited:?}"
+                    )));
+                },
+            );
+            self.idle = events_named(daemon, "master.idle").len();
+            self.dead = events_named(daemon, "master.deadman").len();
+            self.rows.push(Self::dump_line(&format!(
+                "after_tick idle={} death={} shell_alive={} exited={} child_status={:?}",
+                self.idle,
+                self.dead,
+                crate::state::pid_alive(s.pid),
+                s.exited.load(AtomicOrdering::Relaxed),
+                s.child.lock().unwrap_or_else(|e| e.into_inner()).try_wait()
+            )));
         }
-        /// 개수 단언을 이 함수로 감싼다 — ★어긋날 때만 덤프를 찍고, 그 다음 ★원래 단언이 패닉한다
-        /// (⇒ CI 의 패닉 메시지 모양은 ⛔바뀌지 않는다 · 덤프는 그 앞줄에 남는다).
+        /// 덤프 한 줄의 고정 머리 — ⛔두 칸 들여쓰기를 지우지 마라.
+        ///
+        /// `windows-health.yml` 의 `failures.py` 는 패닉 메시지를 **줄 머리**로 끝낸다
+        /// (`note: ` · `stack backtrace:` · `test result:` · `failures:` · `FAILED` · `ok` ·
+        /// `---- … ----` · `^test X … `). 두 칸 들여쓴 줄은 그 어느 것과도 겹치지 않는다.
+        const DUMP_LINE_PREFIX: &'static str = "  ";
+
+        /// 덤프 한 줄을 **인코딩**한다 — 접두 + 작은따옴표 제거.
+        ///
+        /// ★접두만으로는 부족하다(실측: `deadman_dump_rows_cannot_be_read_as_a_parser_terminator`
+        /// 가 처음 돌 때 이걸로 붉었다). 파서의 패닉-헤더 종결자 `SEEN` 은 **줄 머리에 고정돼
+        /// 있지 않다** — `thread '…' … panicked at ` 을 줄 **안 어디서나** 찾는다. 그래서 들여쓴
+        /// 줄도 그 꼴을 품으면 메시지를 끊는다. `role` 과 `verdict`(버스 payload 의 `axis`)는
+        /// 자유 문자열이라 그 꼴이 들어올 수 있다 ⇒ 작은따옴표를 비슷한 글자로 바꿔 `thread '…'`
+        /// 자체가 성립하지 못하게 한다. 내용과 무관한 **구조적** 인코딩이다.
+        fn dump_line(body: &str) -> String {
+            // ⛔파서의 현재 정규식(`thread '…' … panicked at `)에 **딱 맞춰** 인코딩하지 않는다 —
+            //   그 식이 조금만 느슨해져도 인코딩이 뚫린다. 더 넓은 쪽(그 꼴의 **어느 조각이든**)을
+            //   무해화한다: 작은따옴표와 `panicked at ` 두 토큰 모두.
+            //
+            // ★r1-m1 (codex-2 · 2026-10-27) — 종전엔 접두가 **첫 물리 줄**에만 붙었다. 본문에
+            //   LF·CR 이 들어오면 둘째 물리 줄부터는 접두 없이 날것으로 서고, 그 줄이 `note: `
+            //   처럼 생기면 파서가 거기서 메시지를 끊는다 — 고치려던 채널을 반만 고치는 셈이다.
+            //   리뷰어가 **실제 emitter → 실제 `failures.py`** 로 재현해 잡았다(r1 minor m1).
+            //   ⇒ **줄바꿈 자체를 없앤다**: 덤프 항목 하나 = 정확히 한 물리 줄이라는 불변식을 세우고
+            //   `panic_message` 의 줄 수 단언이 그것을 지킨다. (대안인 「모든 물리 줄에 접두」는
+            //   항목 하나가 여러 줄로 부풀어 그 불변식을 잃고, 줄 수로는 날것 줄바꿈을 분간할 수 없다.)
+            let mut out = String::with_capacity(Self::DUMP_LINE_PREFIX.len() + body.len() + 8);
+            out.push_str(Self::DUMP_LINE_PREFIX);
+            for ch in body.chars() {
+                match ch {
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\'' => out.push('ʼ'),
+                    c => out.push(c),
+                }
+            }
+            out.replace("panicked at ", "panickedʼat ")
+        }
+
+        /// 덤프 머리글 — 패닉 메시지 안에 실리는 첫 줄(역시 인코딩한다).
+        fn dump_header(&self) -> String {
+            Self::dump_line(&format!(
+                "★D-R2-3 덤프(role={} · 틱 {}개) — 판별: decision comparator required; \
+after-tick liveness alone does not attribute a clock defect",
+                self.role,
+                self.rows.len()
+            ))
+        }
+
+        /// 패닉 메시지 본문 — **첫 줄은 `what` 그대로**(종전 모양 보존), 그 뒤에 덤프를 잇는다.
+        fn panic_message(&self, what: &str) -> String {
+            let mut s = String::from(what);
+            s.push('\n');
+            s.push_str(&self.dump_header());
+            for r in &self.rows {
+                s.push('\n');
+                s.push_str(r);
+            }
+            s
+        }
+
+        /// 개수 단언을 이 함수로 감싼다 — ★어긋날 때만 덤프를 찍고, 그 다음 ★원래 단언이 패닉한다.
+        ///
+        /// ★T-H06-B (0.14.55-P8) — 두 가지가 바뀌었다. **왜 안전한가를 여기 적어 둔다**(다음 사람이
+        /// 옛 주석만 보고 되돌리지 않도록):
+        ///
+        /// ⑴ **덤프를 `assert_eq!` 메시지 **안에도** 싣는다.** 종전에는 `println!` 로만 나갔고,
+        ///    `win-cysd-failures.json` 은 **패닉 메시지**만 모으므로 JSON 채널에서는 덤프가 보이지
+        ///    않았다. `failures.py` 는 패닉 **헤더**(`thread '…' panicked at <loc>:`)에서 위치를
+        ///    읽고 그 뒤 줄을 종결자가 나올 때까지 메시지로 모은다 ⇒ 메시지를 여러 줄로 늘려도
+        ///    수집 자체는 바뀌지 않는다(실측: 소비자 2곳 census · `r3/exp-failures-parser-r3/`).
+        ///    각 줄은 `DUMP_LINE_PREFIX` 로 종결자와 겹치지 않게 **인코딩**된다.
+        ///    ⛔`println!` 채널은 **지우지 않는다** — 원문 로그를 읽던 습관이 그대로 선다.
+        /// ⑵ **`#[track_caller]`** — 이것이 없으면 Rust 가 `expect` **안쪽**의 `assert_eq!` 위치를
+        ///    보고하므로, 이 파일의 `trace.expect(` 호출 6곳(3개 시험)이 **한 위치로 접힌다**
+        ///    ⇒ `win-cysd-failures.json` 의 `panics[].location` 이 이 가족 전체에서 상수가 된다.
+        ///    붙이면 호출 지점(=시험)이 다시 식별된다.
+        #[track_caller]
         fn expect(&self, got: usize, want: usize, what: &str) {
             if got != want {
-                println!(
-                    "★D-R2-3 덤프(role={} · 틱 {}개) — 판별: decision comparator required; after-tick liveness alone does not attribute a clock defect",
-                    self.role,
-                    self.rows.len()
-                );
+                println!("{}", self.dump_header());
                 for r in &self.rows {
                     println!("{r}");
                 }
             }
-            assert_eq!(got, want, "{what}");
+            assert_eq!(got, want, "{}", self.panic_message(what));
         }
     }
 
+    /// ★integ-7 통합의 **결박**(부서장 판정 5항) — 한 계측기가 P7·P8 두 보증을 **동시에** 들고 있는지
+    /// 센다.
+    ///   ⒜ **P7**: `tick()` 이 판정 비교자에서 받은 **decision 행**을 적는다. 틱 뒤 생존
+    ///     (`shell_alive`·`exited`)만으로는 시계 결함을 귀속할 수 없다는 P7 의 근거가 바로 그 행이고,
+    ///     `epoch`·`mono_elapsed`·`threshold`·`due` 는 **비교자만** 줄 수 있는 값이다.
+    ///   ⒝ **P8**: 그 행들이 **전부 인코딩**돼 `failures.py` 의 종결자로 읽히지 않고, `panic_message`
+    ///     가 머리글과 행 전부를 패닉 안에 싣는다(줄 수 단언이 날것 줄바꿈 누출을 잡는다).
+    ///
+    /// ★왜 **새로** 필요했는가(측정): 통합 전 트리에서 `trace.rows` 에 단언하는 자리는 **0건**이고
+    ///   `p7_*` 검체 6개 중 아무도 그 행을 보지 않는다(그 행들은 실패 시 출력용이었다). 그래서 판정
+    ///   5항의 「decision 행 쓰기를 빼면 P7 검체가 붉는다」가 **성립하지 않았다** — 이 검체가 그 자리를
+    ///   채운다(변이 M-A 로 실측: 이 검체가 그 단언에서 죽는다).
+    #[test]
+    fn p7xp8_tick_records_encoded_decision_rows() {
+        let _g = REAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = ReapEnvGuard::set(&[
+            ("CYS_ROLE_DEADMAN_GRACE_SECS", "0"),
+            ("CYS_ROLE_DEADMAN_CONFIRM_TICKS", "3"),
+        ]);
+        let (daemon, sid) = deadman_daemon("p7xp8-rows");
+        let s = daemon.get_surface(sid).unwrap();
+        // 판정이 반드시 한 번은 나오는 조건 — p7_deadman_trace_records_unconfirmed_death 와 동형.
+        s.exited.store(true, AtomicOrdering::Relaxed);
+        let mut tracker = DeadmanTracker::default();
+        let mut trace = DeadmanTickTrace::new("master");
+        trace.tick(&daemon, &s, &mut tracker);
+        // ⒜ 판정 행이 실재하고, 비교자만 줄 수 있는 칸을 들고 있다.
+        let decisions: Vec<&String> =
+            trace.rows.iter().filter(|r| r.contains("decision role=")).collect();
+        assert!(
+            !decisions.is_empty(),
+            "판정(decision) 행이 없다 — P7 의 비교자 기록이 끊겼다: {:?}",
+            trace.rows
+        );
+        for d in &decisions {
+            for k in ["verdict=", "epoch=", "mono_elapsed=", "threshold=", "due="] {
+                assert!(d.contains(k), "판정 행에 {k} 가 없다: {d}");
+            }
+        }
+        // ⒝ 모든 행이 인코딩됐다 — 접두 · 날것 줄바꿈 0 · 작은따옴표 0(헤더 꼴이 설 수 없다).
+        for r in &trace.rows {
+            assert!(
+                r.starts_with(DeadmanTickTrace::DUMP_LINE_PREFIX),
+                "행에 접두가 없다: {r:?}"
+            );
+            assert!(!r.contains('\n') && !r.contains('\r'), "행에 날것 줄바꿈이 남았다: {r:?}");
+            assert!(!r.contains('\''), "행에 작은따옴표가 남았다: {r:?}");
+        }
+        // 패닉 메시지 = what + 머리글 + 행 전부. 머리글은 P7 의 판별 문장을 들고 있어야 한다.
+        let msg = trace.panic_message("integ-7 결박");
+        let lines: Vec<&str> = msg.split('\n').collect();
+        assert_eq!(lines[0], "integ-7 결박", "첫 줄이 what 이 아니다");
+        assert_eq!(
+            lines.len(),
+            1 + 1 + trace.rows.len(),
+            "머리글+행 수가 맞지 않는다: {lines:?}"
+        );
+        assert!(
+            lines[1].contains("decision comparator required"),
+            "머리글이 P7 의 판별 문장을 들고 있지 않다: {:?}",
+            lines[1]
+        );
+    }
+
+
+    /// ★T-H06-C (0.14.55-P8) — 중독 연쇄 금지의 **정적** 회귀 핀.
+    ///
+    /// `REAP_ENV_LOCK` 은 env 를 만지는 검체를 직렬화한다. 한 검체가 임계영역 안에서 패닉하면
+    /// 뮤텍스가 **중독**되고, 그 뒤 `.unwrap()` 으로 잡는 자리는 전부 연쇄 패닉한다 — 실패 한 건이
+    /// 그 뒤 검체 전부를 `PoisonError` 로 바꿔 **원인 검체를 로그에서 지운다**(이 패키지가 쫓는
+    /// Windows 적색 가족의 한 갈래). 핀의 관용형은 `unwrap_or_else(|e| e.into_inner())` 이고,
+    /// 이 검체는 그 관용형이 **전수** 지켜지는지를 소스에서 센다.
+    ///
+    /// ⛔계기가 자기 자신을 세지 않도록 금지 문자열을 **조각으로 조립**한다(이 검체의 본문에
+    /// 그 문자열이 통째로 있으면 늘 1건이 나온다).
+    #[test]
+    fn reap_env_lock_is_never_acquired_with_a_poisoning_unwrap() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/cysd");
+        let forbidden = format!("REAP_ENV_LOCK.lock().{}()", "unwr\u{61}p");
+        let tolerant = "REAP_ENV_LOCK.lock().unwrap_or_else(";
+        let mut scanned = 0usize;
+        let mut tolerant_sites = 0usize;
+        let mut bad: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(&root).expect("cysd 소스 디렉터리를 열 수 없다") {
+            let path = entry.expect("디렉터리 항목").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("소스를 읽을 수 없다");
+            scanned += 1;
+            tolerant_sites += text.matches(tolerant).count();
+            for (n, line) in text.lines().enumerate() {
+                if line.contains(&forbidden) {
+                    bad.push(format!("{}:{}", path.display(), n + 1));
+                }
+            }
+        }
+        // 계기가 실제로 무언가를 읽었는지부터 — 0 파일을 읽고 0건을 보고하면 측정이 아니다.
+        assert!(scanned >= 5, "cysd 소스를 {scanned}개밖에 읽지 못했다 — 경로가 틀렸다");
+        assert!(
+            tolerant_sites >= 3,
+            "관용형 획득 자리를 {tolerant_sites}곳밖에 찾지 못했다 — 양성 대조가 서지 않는다"
+        );
+        assert!(bad.is_empty(), "중독되는 획득이 남아 있다: {bad:?}");
+    }
+
+    /// ★T-H06-B 항목 2 (0.14.55-P8) — **덤프 생산자의 출력**이 `failures.py` 의 종결자로
+    /// 읽힐 수 없음을 기계로 지킨다. 표본을 하나 찍어 보는 것이 아니라, 모든 행이 공유하는
+    /// `DUMP_LINE_PREFIX` 가 **어떤 종결자 문자열을 뒤에 붙여도** 종결자가 아님을 단언한다
+    /// ⇒ 행 내용이 무엇이든 인코딩이 성립한다.
+    ///
+    /// 종결자 목록의 정본은 `.github/workflows/windows-health.yml` 안의 `failures.py` 이고,
+    /// 파이썬 쪽 짝은 `scripts/tests/test_h06_dump_survives_failures_parser.py` 다
+    /// (그쪽은 **실제 파서**를 돌려 ⑴원시 음성·⑶인코딩된 형태를 잰다).
+    #[test]
+    fn deadman_dump_rows_cannot_be_read_as_a_parser_terminator() {
+        // failures.py 가 패닉 메시지를 끝내는 줄의 전수 형태(그 파일의 `ends` 식과 1:1).
+        let terminators: Vec<String> = vec![
+            "note: ".to_string(),
+            "note: run with `RUST_BACKTRACE=1`".to_string(),
+            "stack backtrace:".to_string(),
+            "test result: FAILED. 1 passed".to_string(),
+            "failures:".to_string(),
+            "FAILED".to_string(),
+            "ok".to_string(),
+            "---- some::test stdout ----".to_string(),
+            "test some::test ... ok".to_string(),
+            "thread 'x' (1) panicked at src/bin/cysd/governance.rs:1:1:".to_string(),
+        ];
+        let is_terminator = |line: &str| -> bool {
+            line.starts_with("note: ")
+                || line.starts_with("stack backtrace:")
+                || line.starts_with("test result:")
+                || line == "failures:"
+                || line == "FAILED"
+                || line == "ok"
+                || (line.starts_with("---- ") && line.ends_with(" ----"))
+                || line.starts_with("test ") && line.contains(" ... ")
+                || line.contains("panicked at ")
+        };
+        // ⑴ 이 판정기는 실제로 붉어질 수 있다 — 종결자 원형은 전부 종결자로 읽혀야 한다.
+        for t in &terminators {
+            assert!(is_terminator(t), "종결자 원형이 종결자로 읽히지 않았다: {t:?}");
+        }
+        // ⑵ 접두를 붙이면 **어느 것도** 종결자가 아니다 ⇒ 행 내용과 무관한 인코딩.
+        for t in &terminators {
+            let encoded = DeadmanTickTrace::dump_line(t);
+            assert!(
+                !is_terminator(&encoded),
+                "접두를 붙인 뒤에도 종결자로 읽힌다 — 인코딩이 깨졌다: {encoded:?}"
+            );
+        }
+        // ⑵-b ★r1 minor m1 — 본문에 **줄바꿈**이 들어온 경우. 접두는 첫 물리 줄에만 붙으므로
+        //     날것 LF·CR 을 흘리면 둘째 물리 줄이 종결자로 그대로 선다(리뷰어가 실제 emitter →
+        //     실제 파서로 재현). 인코딩은 항목 하나를 **한 물리 줄**로 접는다.
+        for body in [
+            "틱 4 verdict=Dead\nnote: run with `RUST_BACKTRACE=1`",
+            "틱 5 verdict=Dead\r\nfailures:",
+            "틱 6 verdict=Dead\rok",
+            "틱 7 a\nb\nstack backtrace:\nc",
+            "틱 8 \nthread 'x' (1) panicked at a.rs:1:1:",
+        ] {
+            let enc = DeadmanTickTrace::dump_line(body);
+            assert!(
+                !enc.contains('\n') && !enc.contains('\r'),
+                "덤프 항목에 날것 줄바꿈이 남았다 — 둘째 물리 줄이 파서의 종결자로 선다: {enc:?}"
+            );
+            assert!(
+                enc.starts_with(DeadmanTickTrace::DUMP_LINE_PREFIX) && !is_terminator(&enc),
+                "줄바꿈 인코딩 뒤에도 종결자로 읽힌다: {enc:?}"
+            );
+            // 내용은 버리지 않는다 — 줄바꿈만 두 글자 표기로 바뀐다(진단 가치 보존).
+            for frag in body.split(['\n', '\r']).filter(|f| !f.is_empty()) {
+                let safe = frag.replace('\'', "ʼ").replace("panicked at ", "panickedʼat ");
+                assert!(enc.contains(&safe), "인코딩이 내용을 버렸다: {frag:?} ∉ {enc:?}");
+            }
+        }
+
+        // ⑶ 실제 생산자의 출력: 머리글과 각 행이 접두로 시작하고 종결자가 아니다.
+        let mut tr = DeadmanTickTrace::new("master");
+        tr.rows.push(DeadmanTickTrace::dump_line("틱 1 verdict=Idle"));
+        tr.rows.push(DeadmanTickTrace::dump_line("틱 2 verdict=(미발행)"));
+        // 자유 문자열에 파서의 헤더 꼴이 그대로 들어온 최악의 경우도 인코딩이 받아낸다.
+        tr.rows.push(DeadmanTickTrace::dump_line(
+            "틱 3 verdict=Dead:thread 'x' (1) panicked at a.rs:1:1:",
+        ));
+        // ★r1 minor m1 — 줄바꿈이 든 행도 **한 줄**로 들어간다. 아래 ⑷ 의 줄 수 단언이
+        //   이것을 지킨다(날것 LF 가 하나라도 새면 줄 수가 늘어 붉어진다).
+        tr.rows.push(DeadmanTickTrace::dump_line(
+            "틱 4 verdict=Dead\nnote: run with `RUST_BACKTRACE=1`\r\nfailures:",
+        ));
+        let header = tr.dump_header();
+        assert!(header.starts_with(DeadmanTickTrace::DUMP_LINE_PREFIX), "머리글 접두 없음: {header:?}");
+        assert!(!is_terminator(&header), "머리글이 종결자로 읽힌다: {header:?}");
+        // ⑷ 패닉 메시지: 첫 줄은 `what` 그대로(종전 모양 보존), 나머지 줄은 전부 안전하다.
+        let msg = tr.panic_message("idles.len() 이 기대와 다르다");
+        let lines: Vec<&str> = msg.split('\n').collect();
+        assert_eq!(lines[0], "idles.len() 이 기대와 다르다", "첫 줄이 what 이 아니다");
+        assert_eq!(lines.len(), 1 + 1 + tr.rows.len(), "머리글+행 수가 맞지 않는다: {lines:?}");
+        for l in &lines[1..] {
+            assert!(
+                l.starts_with(DeadmanTickTrace::DUMP_LINE_PREFIX) && !is_terminator(l),
+                "덤프 줄이 파서를 끊는다: {l:?}"
+            );
+        }
+    }
 
     /// [핀1·결함 8 박제 — 순수 판정자 진리표] 침묵은 어떤 좌석 상태에서도 Idle 로만 사상되고
     /// DeadCandidate 가 될 수 없다. 실측 시나리오(임계 20s·침묵 21s의 살아있는 zsh) 그대로.

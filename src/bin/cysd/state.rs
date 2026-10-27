@@ -3810,6 +3810,23 @@ pub struct Daemon {
     /// 5. **같은 데몬에 끝정리가 두 번 와도 둘째는 무동작이다**(스냅샷이 비어 있다).
     #[cfg(test)]
     pub(crate) test_created: Mutex<Vec<std::sync::Weak<Surface>>>,
+
+    /// ★r1 minor m2 (0.14.55 P8 · 시험 전용) `system.claim_role` 특권 게이트가 **이 호출에서 본**
+    /// 좌석 프로브 하나. 소비처는 `handlers::tests` 의 H-07 가족이고 생산 지점은 그 arm 하나다.
+    ///
+    /// ⛔전역 `static` 으로 옮기지 마라 — 위 `test_created` 의 계약 C-1 과 **같은 이유이며, 여기서는
+    /// 실측으로 확인됐다**: 처음에 전역 1칸으로 두었더니 병렬로 도는 다른 검체의 `claim_role` 이
+    /// 그 칸을 덮어써 두 검체가 **남의 값**을 읽고 붉었다(2026-10-27 · `cargo test --bin cysd` 기본
+    /// 병렬. 직렬 실행과 단일 필터 실행에서는 보이지 않는다 ⇒ 릴리스 레인의 거짓 적색 씨앗이었다).
+    /// 데몬 인스턴스 = 검체이므로, 여기 두면 키잉이 필요 없다.
+    #[cfg(test)]
+    pub(crate) test_claim_probe: Mutex<Option<crate::handlers::ClaimRoleProbe>>,
+
+    /// ★r1 minor m2 (0.14.55 P8 · 시험 전용) 좌석 프로브 **직후**·임계영역 진입 **전**에 1회 도는 훅.
+    /// 「프로브와 결정 사이」의 사건(보유자 종료 등)을 스레드 없이 결정론으로 끼우는 자리다.
+    /// ⛔전역 금지는 위와 같다(한 검체가 데몬을 둘 만드는 자리가 이미 있다).
+    #[cfg(test)]
+    pub(crate) test_after_probe_hook: Mutex<Option<Box<dyn Fn() + Send>>>,
     pub next_id: AtomicU64,
     pub bus: EventBus,
     pub health_rules: Mutex<Vec<HealthRule>>,
@@ -6125,6 +6142,10 @@ impl Daemon {
             // ★(U229 계약 C-1) 등재부는 이 인스턴스와 함께 태어나고 함께 사라진다(초기화 지점은 여기 하나다).
             #[cfg(test)]
             test_created: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            test_claim_probe: Mutex::new(None),
+            #[cfg(test)]
+            test_after_probe_hook: Mutex::new(None),
             // 영속 트랜스크립트(transcripts.db)의 최대 id 이후부터 발급 — 재시작 시
             // 무관 세션이 같은 surface_id로 recall에 합쳐지는 것을 차단
             next_id: AtomicU64::new(crate::recall::max_surface_id(&socket_path) + 1),
