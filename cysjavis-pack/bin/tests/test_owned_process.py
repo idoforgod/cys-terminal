@@ -373,7 +373,7 @@ Path(%r).write_text(str(r))
         self.assertEqual(result.get('diagnostic_returncode'),7)
         self.assertIsNotNone(result.get('kernel_returncode'))
         self.assertNotEqual(result['kernel_returncode'],7)
-        self.assertEqual(result['stdout'],'original summary\n')
+        self.assertEqual(result['stdout'],'original summary'+os.linesep)
 
     def test_timeout_drain_is_bounded_with_held_output(self):
         sys.path.insert(0,str(BIN))
