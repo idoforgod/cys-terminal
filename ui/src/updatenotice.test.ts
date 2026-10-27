@@ -66,16 +66,16 @@ const count = (hay: string, needle: string): number => hay.split(needle).length 
 /**
  * 설치 전 고지 문안 전문 — 모듈의 문구가 바뀌면 이 핀이 빨개진다(손으로 옮긴 사본이 아니라 지시 원문이다).
  * ★R1F-UA(성찰 1회차 · 2026-10-04)로 바뀐 문구다 — 실측(W11/FINDINGS): 스마트 앱 컨트롤이 켜진 PC 에서 막히는 것은 서명도 평판도 없는 파일이고(서명 없는 7-Zip 은 허용됐다),
- * 0.14.43 앱 안의 문구는 **다음 버전으로 올릴 때** 나오는데 그 설치 파일이 서명될지는 지금 모른다 → "지금 cys 설치 파일에는 코드 서명이 없어 막습니다" 같은 단정을 조건문("…없으면")으로 바꿨다.
+ * 앱 안의 문구는 **다음 버전으로 올릴 때** 나오는데 그 설치 파일이 서명될지는 지금 모른다 → "지금 cys 설치 파일에는 코드 서명이 없어 막습니다" 같은 단정을 조건문("…없으면")으로 바꿨다.
  * WU 보충 지시(2026-10-04 · 2차 실측)의 사실은 그대로다: 막히면 앱이 닫히지 않은 채 바로 알리고, 앱을 닫으면 다시 열 때도 막힐 수 있다.
  * (나)는 확인 실행 꺼짐(`CYS_UPDATE_CHECKED_LAUNCH=0`)판 — "막히면 …" 문장 하나만 다르다.
  */
 const SAC_PREFLIGHT =
-  "이 PC 는 Windows '스마트 앱 컨트롤'이 켜져 있습니다. 새 설치 파일에 Windows 가 신뢰하는 코드 서명이나 평판이 없으면 Windows 가 실행을 막습니다(0.14.43 까지의 cys 설치 파일에는 코드 서명이 없습니다). " +
+  "이 PC 는 Windows '스마트 앱 컨트롤'이 켜져 있습니다. 새 설치 파일에 Windows 가 신뢰하는 코드 서명이나 평판이 없으면 Windows 가 실행을 막습니다(현재 배포되는 cys Windows 설치 파일에는 코드 서명이 없습니다). " +
   "막히면 업데이트는 설치되지 않고, 이 앱은 닫히지 않은 채 그 사실을 알려 드립니다. " +
   "그 경우 홈페이지에서 받은 설치 파일도 같은 이유로 막힙니다. 스마트 앱 컨트롤이 켜져 있는 동안에는 이 앱을 닫으면 다시 열 때도 막힐 수 있습니다.";
 const SAC_PREFLIGHT_UNCHECKED =
-  "이 PC 는 Windows '스마트 앱 컨트롤'이 켜져 있습니다. 새 설치 파일에 Windows 가 신뢰하는 코드 서명이나 평판이 없으면 Windows 가 실행을 막습니다(0.14.43 까지의 cys 설치 파일에는 코드 서명이 없습니다). " +
+  "이 PC 는 Windows '스마트 앱 컨트롤'이 켜져 있습니다. 새 설치 파일에 Windows 가 신뢰하는 코드 서명이나 평판이 없으면 Windows 가 실행을 막습니다(현재 배포되는 cys Windows 설치 파일에는 코드 서명이 없습니다). " +
   "막히면 업데이트는 설치되지 않고, 지금 설정(CYS_UPDATE_CHECKED_LAUNCH=0)에서는 이 앱이 알림 없이 닫힙니다. " +
   "그 경우 홈페이지에서 받은 설치 파일도 같은 이유로 막힙니다. 스마트 앱 컨트롤이 켜져 있는 동안에는 이 앱을 닫으면 다시 열 때도 막힐 수 있습니다.";
 const WIN_PARAGRAPH =
@@ -121,10 +121,10 @@ describe("sacPreflightText — 켜짐(on)일 때만 문단", () => {
     const on = sacPreflightText("on") ?? "";
     expect(on.includes("CYS_UPDATE_CHECKED_LAUNCH")).toBe(false);
     expect(on.includes("알림 없이")).toBe(false);
-    // 둘 다 같은 조건문·같은 단정 한정(0.14.43 까지)·같은 꼬리를 가진다
+    // 둘 다 같은 조건문·같은 단정 한정(현재 배포되는 Windows 설치 파일)·같은 꼬리를 가진다
     for (const t of [on, off]) {
       expect(t.includes("코드 서명이나 평판이 없으면 Windows 가 실행을 막습니다")).toBe(true);
-      expect(t.includes("(0.14.43 까지의 cys 설치 파일에는 코드 서명이 없습니다)")).toBe(true);
+      expect(t.includes("(현재 배포되는 cys Windows 설치 파일에는 코드 서명이 없습니다)")).toBe(true);
       expect(t.endsWith("스마트 앱 컨트롤이 켜져 있는 동안에는 이 앱을 닫으면 다시 열 때도 막힐 수 있습니다.")).toBe(true);
     }
   });
@@ -1491,11 +1491,11 @@ describe("★R1F-UA 문구의 정직성 — 옛 단정의 부재 · 조건문 ·
     }
   });
 
-  it("조건문: 설치 전 안내는 두 판 모두 \"…없으면\" 으로 말하고, 서명이 없다는 단정은 \"0.14.43 까지의\" 설치 파일에 한정한다(새 설치 파일의 서명 여부는 받기 전에 알 수 없다)", () => {
+  it("조건문: 설치 전 안내는 두 판 모두 \"…없으면\" 으로 말하고, 서명이 없다는 단정은 현재 배포되는 Windows 설치 파일에 한정한다(새 설치 파일의 서명 여부는 받기 전에 알 수 없다)", () => {
     for (const t of [sacPreflightText("on") ?? "", sacPreflightText("on", false) ?? ""]) {
       expect(t.includes("Windows 가 신뢰하는 코드 서명이나 평판이 없으면 Windows 가 실행을 막습니다")).toBe(true);
       expect(count(t, "코드 서명이 없습니다")).toBe(1); // 서명이 없다는 문장은 한 곳뿐 — 그리고
-      expect(t.includes("(0.14.43 까지의 cys 설치 파일에는 코드 서명이 없습니다)")).toBe(true); // 그것은 지난 설치 파일에 한정한다
+      expect(t.includes("(현재 배포되는 cys Windows 설치 파일에는 코드 서명이 없습니다)")).toBe(true); // 현재 배포되는 Windows 설치 파일에 한정한다
     }
     // 4551·재시작 뒤 알림의 켜짐 줄도 '신뢰하는 서명이나 평판이 없는' 파일에 대한 일반 사실이다
     expect((installerLaunchFailure(LF(4551), "a", "b")?.body ?? "").includes("Windows 가 신뢰하는 코드 서명이나 평판이 없는 프로그램")).toBe(true);
