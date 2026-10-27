@@ -2942,7 +2942,7 @@ pub fn plan_install(
         let mh_raw = manifest.get(rel).map(String::as_str);
         // ★C-07(0.14.55 · P3): 분류 **직전** 낡은 항목 판정. decide_file_action 의 arm 은 무변경.
         let stale =
-            classify_stale_entry(dir, rel, scope, disk.as_deref(), mh_raw, pending_now.contains_key(rel));
+            classify_stale_entry(dir, rel, scope, content, disk.as_deref(), mh_raw, pending_now.contains_key(rel));
         let repaired = match &stale {
             StaleEntry::Repaired(h) => Some(h.clone()),
             _ => None,
@@ -3316,6 +3316,7 @@ pub fn classify_stale_entry(
     dir: &Path,
     rel: &str,
     scope: PackScope,
+    embed: &str,
     disk: Option<&str>,
     manifest_hash: Option<&str>,
     has_pending_entry: bool,
@@ -3333,6 +3334,7 @@ pub fn classify_stale_entry(
         disk,
         manifest_hash,
         pristine_hash.as_deref(),
+        Some(content_hash(embed).as_str()),
         crate::pack_prev_vendor::prev_vendor_hashes(rel),
         has_pending_entry,
     )
@@ -3349,6 +3351,7 @@ pub fn classify_stale_entry_with(
     disk: Option<&str>,
     manifest_hash: Option<&str>,
     pristine_hash: Option<&str>,
+    embed_hash: Option<&str>,
     known: &[&str],
     has_pending_entry: bool,
 ) -> StaleEntry {
@@ -3364,6 +3367,13 @@ pub fn classify_stale_entry_with(
     }
     // 항목이 **조상**과 같으면 낡은 것이 아니다 — 평범한 드리프트/3-way 입력이다.
     if pristine_hash == Some(mh) {
+        return StaleEntry::Normal;
+    }
+    // ★항목이 **임베드**와 같으면 그것은 가능한 가장 새로운 값이다 = 정의상 낡지 않았다.
+    //   이때 디스크가 다른 이유는 **사용자가 고쳤기 때문**이고(vendor 미전진 = L2 kept-drift),
+    //   그 경로의 pinned 거동(제자리 보존 + 원장 kept-drift 계상)은 손대지 않는다.
+    //   이 가드가 없으면 합법적인 L2 가 가로채여 원장 계상이 사라진다(실측: plan=actual 검체 적색).
+    if embed_hash == Some(mh) {
         return StaleEntry::Normal;
     }
     if known.contains(&dh.as_str()) {
@@ -4084,6 +4094,7 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
             &dir,
             rel,
             scope,
+            content,
             disk.as_deref(),
             mhash_raw.as_deref(),
             pending.contains_key(rel),
@@ -5152,24 +5163,24 @@ mod tests {
         // 1) system 아님 → Normal (user 파일은 이 판정의 대상이 아니다)
         assert_eq!(
             classify_stale_entry_with(
-                userrel, PackScope::Base, Some("x"), Some(&stale), None, &table, false
+                userrel, PackScope::Base, Some("x"), Some(&stale), None, None, &table, false
             ),
             StaleEntry::Normal
         );
         // 2) 매니페스트 항목 부재 → Normal (레거시 경로 거동 불변)
         assert_eq!(
-            classify_stale_entry_with(sysrel, PackScope::Base, Some("x"), None, None, &table, false),
+            classify_stale_entry_with(sysrel, PackScope::Base, Some("x"), None, None, None, &table, false),
             StaleEntry::Normal
         );
         // 3) 항목이 디스크와 일치 → Normal (건전)
         let dh = content_hash("x");
         assert_eq!(
-            classify_stale_entry_with(sysrel, PackScope::Base, Some("x"), Some(&dh), None, &table, false),
+            classify_stale_entry_with(sysrel, PackScope::Base, Some("x"), Some(&dh), None, None, &table, false),
             StaleEntry::Normal
         );
         // 4) 표에 행이 없음 → KeepInPlace("no-row")
         assert_eq!(
-            classify_stale_entry_with(sysrel, PackScope::Base, Some("x"), Some(&stale), None, &[], false),
+            classify_stale_entry_with(sysrel, PackScope::Base, Some("x"), Some(&stale), None, None, &[], false),
             StaleEntry::KeepInPlace("no-row")
         );
         // 5) ★디스크가 표에 있는 과거 릴리스 본 → Repaired(디스크 해시)
@@ -5179,6 +5190,7 @@ mod tests {
                 PackScope::Base,
                 Some(prev_vendor),
                 Some(&stale),
+                None,
                 None,
                 &table,
                 false
@@ -5192,6 +5204,7 @@ mod tests {
                 PackScope::Base,
                 Some("the operator wrote this\n"),
                 Some(&stale),
+                None,
                 None,
                 &table,
                 false
@@ -5207,15 +5220,25 @@ mod tests {
                 Some("the operator wrote this\n"),
                 Some(&stale),
                 None,
+                None,
                 &table,
                 true
             ),
             StaleEntry::Normal,
             "병합 대기 항목이 있으면 제자리 보존이 아니다(크래시 창 수렴 보존)"
         );
+        // 7b) ★항목이 임베드와 같으면 낡지 않았다(L2 kept-drift 경로 보존).
+        let he = content_hash("embed-now\n");
+        assert_eq!(
+            classify_stale_entry_with(
+                sysrel, PackScope::Base, Some("user edit\n"), Some(&he), None, Some(&he), &table, false
+            ),
+            StaleEntry::Normal,
+            "항목==hash(embed) 는 가능한 가장 새로운 값 = 낡지 않았다(L2 pinned 거동 보존)"
+        );
         // 8) 행이 없는 경로도 같다 — 항목이 있으면 Normal.
         assert_eq!(
-            classify_stale_entry_with(sysrel, PackScope::Base, Some("x"), Some(&stale), None, &[], true),
+            classify_stale_entry_with(sysrel, PackScope::Base, Some("x"), Some(&stale), None, None, &[], true),
             StaleEntry::Normal,
             "no-row + 병합 대기 항목 → Normal"
         );
