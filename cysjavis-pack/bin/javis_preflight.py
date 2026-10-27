@@ -6794,7 +6794,7 @@ class Preflight:
         · macOS 번들: `<bundle>/Contents/Info.plist` 의 `CFBundleShortVersionString`
           (실측 2026-09-04: 오너 설치본 `/Applications/cys.app` = "0.14.29" · XML plist).
         · 그 외(Windows NSIS 포함): 설치 루트의 `cys-installed-version.txt`.
-          이 마커는 NSIS 훅이 **모든 게이트를 통과한 뒤에만** 쓴다(src-tauri/nsis-hooks.nsh:784
+          이 마커는 NSIS 훅이 **모든 게이트를 통과한 뒤에만** 쓴다(src-tauri/nsis-hooks.nsh
           `cys_post_ok`) — 즉 '마지막으로 실제 반영된 버전'이다. 판정 재료로서는 정보성이지만
           (WINDOWS-UPGRADE-ATOMICITY-CHECKLIST.md:140), 여기서 묻는 것은 '설치가 성공한 버전이
           무엇인가' 하나뿐이라 이 용도에는 정확하다.

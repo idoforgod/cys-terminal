@@ -13,11 +13,19 @@
 ; sidecar/main PEs carrying a real VS_VERSIONINFO resource (make_versioned_pe.py), so the
 ; hook's compile-time `!getdllversion /packed` oracle runs for real (no /noerrors).
 Unicode true
+; Compressor before every include, as in installer.nsi:9-14 - the hook declares a page and its
+; function at include time (WP12 P1), and makensis refuses SetCompressor after that.
+SetCompressor /SOLID lzma
 
 ; ── MUI2 — 템플릿은 훅보다 먼저 include 한다 (installer.nsi:22) — 순서 패리티
 ; ★ 2026-08-29: 이게 없어서 MUI 가 생성하는 .onUserAbort 와의 중복 정의를
 ; 로컬에서 못 잡았고 CI(run 33246693830)까지 갔다. 그 공백을 여기서 메운다.
 !include MUI2.nsh
+; ── FileFunc + StrFunc — the template includes these before the hook too (installer.nsi:23 FileFunc,
+;    :30-32 StrFunc + the ${StrLoc} declaration). The WP12 P1 probe uses ${GetOptions} and ${StrLoc}.
+!include FileFunc.nsh
+!include StrFunc.nsh
+${StrLoc}
 
 ; ── hook include — MUST stay ahead of the template defines below (template parity) ──
 !include "build\nsis-hooks.nsh"
@@ -33,7 +41,6 @@ Name "${PRODUCTNAME} hook harness"
 OutFile "build\harness-setup.exe"
 InstallDir "$TEMP\cys-hook-harness"
 ShowInstDetails show
-SetCompressor /SOLID lzma
 
 ; ── MUI 페이지 + 언어 — MUI_LANGUAGE 가 MUI_FUNCTION_ABORTWARNING 을 통해
 ;    Function .onUserAbort 를 생성한다 (Contrib/Modern UI 2/Interface.nsh:327).

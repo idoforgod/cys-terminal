@@ -8609,11 +8609,36 @@ async fn stop_running_daemon() {
     }
 }
 
+/// ★(0.14.53 WP12 · P1 · DESIGN D2.3/F3) The installer's pre-swap run check runs `cys-app.exe --cys-probe <file>`
+/// to prove that THIS binary can start on the PC (Smart App Control / App Control) before any old file is replaced.
+/// Exactly `[exe, "--cys-probe", <file>]` takes the probe path; zero or two+ extra arguments keep normal startup.
+fn cys_probe_target(argv: &[std::ffi::OsString]) -> Option<&std::ffi::OsStr> {
+    match argv {
+        [_, flag, file] if flag == "--cys-probe" => Some(file.as_os_str()),
+        _ => None,
+    }
+}
+
+/// Writes exactly `cys-app <version>` (no newline) to `target`; exit code 0, or 3 if the file cannot be written.
+/// The installer compares the file content, never the exit code alone (a GUI exe that fell through to the
+/// single-instance plugin would also exit 0 - review G2(3)).
+fn cys_probe_write(target: &std::ffi::OsStr) -> i32 {
+    match std::fs::write(target, format!("cys-app {}", env!("CARGO_PKG_VERSION"))) {
+        Ok(()) => 0,
+        Err(_) => 3,
+    }
+}
+
 fn main() {
     // ★SEAL-1 층3: tauri 런타임(=스레드) 생성 전에 프로세스 env 봉인. GUI 는 이 앱의 **뿌리
     // 프로세스**라 여기서 심으면 cysd·pane·팩 python 까지 전부 상속으로 덮인다(lib.rs SOT).
     // `inject_runtime_path`(층1·2)는 그대로 둔다 — 그쪽은 명시 계약이라 회귀 핀이 걸린다.
     cys::seal_python_bytecode_in_process();
+    // ★(0.14.53 WP12 · P1) installer probe: answer and exit before tauri::Builder, so no window, no
+    //   single-instance forwarding, no daemon. Any other argv is unchanged.
+    if let Some(target) = cys_probe_target(&std::env::args_os().collect::<Vec<_>>()) {
+        std::process::exit(cys_probe_write(target));
+    }
     tauri::Builder::default()
         // ★최선두 등록 필수 — 두 번째 인스턴스는 다른 플러그인·setup이 돌기 전에 기존 창 포커스 후
         // 스스로 종료된다(Win11 cys-app.exe 프로세스 증식 이슈의 증상 차단 · 2026-07-12). 스폰 소스가
@@ -8959,6 +8984,49 @@ mod tests {
     }
 
     use super::*;
+
+    /// ★(0.14.53 WP12 · P1 · BAR B14) `--cys-probe` takes the probe path only with exactly one file argument.
+    #[test]
+    fn wp12_cys_probe_target_takes_exactly_one_file_argument() {
+        let os = |v: &[&str]| v.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+        assert_eq!(cys_probe_target(&os(&["cys-app.exe", "--cys-probe", "C:\\p\\cys-app.ok"])), Some(std::ffi::OsStr::new("C:\\p\\cys-app.ok")));
+        for argv in [
+            os(&["cys-app.exe"]),
+            os(&["cys-app.exe", "--cys-probe"]),
+            os(&["cys-app.exe", "--cys-probe", "a", "b"]),
+            os(&["cys-app.exe", "--other", "a"]),
+            os(&["cys-app.exe", "a", "--cys-probe"]),
+        ] {
+            assert_eq!(cys_probe_target(&argv), None, "{argv:?} must keep normal startup");
+        }
+    }
+
+    /// ★(0.14.53 WP12 · P1) the probe file holds exactly `cys-app <CARGO_PKG_VERSION>` - the string the NSIS probe compares.
+    #[test]
+    fn wp12_cys_probe_write_writes_the_exact_version_line() {
+        let d = std::env::temp_dir().join(format!("cys-wp12-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("cys-app.ok");
+        assert_eq!(cys_probe_write(f.as_os_str()), 0);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), format!("cys-app {}", env!("CARGO_PKG_VERSION")));
+        assert_eq!(cys_probe_write(d.join("no-such-dir").join("x").as_os_str()), 3);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// ★(0.14.53 WP12 · P1) source order: in fn main() the probe branch sits after the bytecode seal and before
+    /// tauri::Builder (so the single-instance plugin is never reached by a probe).
+    #[test]
+    fn wp12_cys_probe_branch_precedes_the_tauri_builder() {
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests {").expect("test module boundary")];
+        let main_at = prod.find("\nfn main() {").expect("fn main");
+        let body = &prod[main_at..];
+        let seal = body.find("cys::seal_python_bytecode_in_process();").expect("seal");
+        let probe = body.find("if let Some(target) = cys_probe_target(").expect("probe branch");
+        let builder = body.find("tauri::Builder::default()").expect("builder");
+        assert!(seal < probe && probe < builder, "seal -> probe -> tauri::Builder");
+    }
 
     /// ★K2-03(2026-09-17 한글 사용자명 감사) 회귀 핀: UTF-8 BOM 이 붙은 카탈로그/레지스트리를 판독한다.
     /// 한국어 Windows 편집기의 "UTF-8(BOM)" 저장이 `serde_json` 에서 문법 오류였다 — 벗기면 파싱되고,
