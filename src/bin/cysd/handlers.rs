@@ -8525,6 +8525,16 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
             } else {
                 None
             };
+            // ★H-07 — 이 호출이 본 프로브를 시험 전용 창에 기록한다. **출하 바이트 0**:
+            //   아래 블록은 운영 빌드에 컴파일되지 않는다(릴리스 바이너리 해시 동일성으로 실측).
+            //   ⚠이 속성이 프로덕션 영역에 들어가면, 파일을 "첫 조건부-컴파일 속성"에서 자르던
+            //   소스 census 핀 아홉 개의 구간이 **조용히 줄어든다**(실측: 처음엔 전부 붉었다).
+            //   그래서 그 아홉 개를 tests 모듈의 **정확한 앵커**로 다시 묶었다 — 커버리지를
+            //   잃지 않으면서 이 블록이 여기 설 수 있는 유일한 방법이다.
+            #[cfg(test)]
+            {
+                record_claim_role_probe(&role, sid, seat_takeover_ok.is_some());
+            }
             // ★(W2 · G13) announce 를 **전이 확정 후로 미룬다**. 종전엔 프로브 직후 여기서
             // announce_seat_takeover 를 쐈는데, 그 뒤 임계영역이 not_found·claim_denied 로 조기
             // return 하면 **일어나지 않은 승계를 통보**한 셈이 됐다(pane 에 오해 메시지 주입 +
@@ -12730,6 +12740,48 @@ fn surface_create_error(bus: &crate::events::EventBus, id: &Value, message: &str
 }
 
 
+// ─── H-07 (0.14.55-P8) 좌석 프로브 관찰창 ──────────────────────────────────────
+// `system.claim_role` 의 시험은 「특권 게이트가 좌석 판정을 따르는가」를 재려고 프로브를 **두 번**
+// 불렀다 — 한 번은 제품이, 한 번은 시험이 `seat_claimable_now` 로. 두 측정 사이에 좌석이 바뀌면
+// 시험은 제품이 아니라 그 사이의 시간을 재고, 그것이 이 행의 적색 가족이다. 이 창은 **같은 호출**
+// 이 본 프로브를 그대로 넘긴다. 나머지 두 사실(recheck · final)은 이미 버스에 있다.
+//
+// ⛔위치가 계약의 일부다 — 이 블록은 tests 모듈 **바로 위**에 있어야 한다. 이 파일의 소스 census
+// 핀들이 프로덕션 구간을 「첫 조건부-컴파일 속성까지」로 정의하기 때문이다(위 호출 지점의 주석).
+// 운영 빌드의 정의는 빈 본문이라 호출이 사라진다(릴리스 바이너리 해시 동일성으로 실측).
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct ClaimRoleProbe {
+    pub role: String,
+    pub surface: u64,
+    /// `seat_takeover_ok.is_some()` — 이 호출이 본 **날 것 그대로의** 프로브.
+    pub probe: bool,
+}
+
+#[cfg(test)]
+pub(crate) static LAST_CLAIM_ROLE_PROBE: std::sync::Mutex<Option<ClaimRoleProbe>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn record_claim_role_probe(role: &str, surface: u64, probe: bool) {
+    *LAST_CLAIM_ROLE_PROBE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(ClaimRoleProbe {
+        role: role.to_string(),
+        surface,
+        probe,
+    });
+}
+
+/// 관찰창을 비운다 — 호출 직전에 부른다(앞 호출의 값을 읽지 않도록).
+#[cfg(test)]
+pub(crate) fn clear_claim_role_probe() {
+    *LAST_CLAIM_ROLE_PROBE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -14933,7 +14985,10 @@ mod tests {
     #[test]
     fn lease_gate_precedes_any_side_effect_in_both_arms() {
         let src = include_str!("handlers.rs");
-        let prod = src.split("#[cfg(test)]").next().expect("프로덕션 구간 분리 실패");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("프로덕션 구간 분리 실패");
         for (arm, path, first_effect) in [
             ("\"surface.create\" => {", "surface.create", "param_dim(&params, \"rows\""),
             ("\"directive.verify\" => {", "directive.verify", "resolve_surface_id(&params)"),
@@ -15370,7 +15425,10 @@ mod tests {
     #[test]
     fn the_nonce_is_armed_at_exactly_one_place() {
         let src = include_str!("handlers.rs");
-        let prod = src.split("#[cfg(test)]").next().expect("프로덕션 구간 분리 실패");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("프로덕션 구간 분리 실패");
         // ★세는 것은 **쓰기**다. 접근 전부를 세면 행 노출 같은 순수 판독이 늘 때마다 이 핀이
         //   이유 없이 깨지고, 그러면 다음 사람이 숫자를 올려 맞추다가 진짜 쓰기 유입을 놓친다.
         assert_eq!(
@@ -18184,7 +18242,9 @@ mod tests {
     #[test]
     fn a2_absorb_order_and_leaf_lock_source_pin() {
         let src = include_str!("handlers.rs");
-        let prod = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커 소실")];
+        let prod = &src[..src
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("테스트 모듈 앵커 소실")];
         let arm = &prod[prod.find("\"surface.send_key\" =>").expect("send_key arm")..];
         let arm = &arm[..arm.find("\"surface.read_text\" =>").expect("다음 arm")];
         let acl = arm.find("check_send_acl(daemon, caller_pid, &surface, &params)").expect("ACL");
@@ -18244,7 +18304,9 @@ mod tests {
     #[test]
     fn a2f1_narrowing_on_both_verdicts_and_observed_outside_gate_source_pin() {
         let src = include_str!("handlers.rs");
-        let prod = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커 소실")];
+        let prod = &src[..src
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("테스트 모듈 앵커 소실")];
         let arm = &prod[prod.find("\"surface.send_key\" =>").expect("send_key arm")..];
         let arm = &arm[..arm.find("\"surface.read_text\" =>").expect("다음 arm")];
         let first = arm.find("let verdict = return_absorb_verdict(").expect("1차 판정");
@@ -18327,7 +18389,9 @@ mod tests {
         //   F1: 제출 CR 보류의 화면 관측(`submit_cr_guard_context`)은 send_key 의 input_gate **밖** · 탐침을 거는 판정은
         //       게이트 안 · 제출 CR 인계 표식(`submit_handed`) 앞이다(게이트 안에서는 pending_input leaf·원자 판독뿐).
         let src = include_str!("handlers.rs");
-        let prod = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커 소실")];
+        let prod = &src[..src
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("테스트 모듈 앵커 소실")];
         let deny = prod.find("fn draft_gate_denied_response(").expect("거부 응답 단일 경로");
         let deny_body = &prod[deny..deny + prod[deny..].find("\n}\n").expect("함수 끝")];
         assert!(
@@ -18362,7 +18426,9 @@ mod tests {
     #[test]
     fn settle_hold_rechecked_inside_input_gate_source_pin() {
         let src = include_str!("handlers.rs");
-        let prod = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커 소실")];
+        let prod = &src[..src
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("테스트 모듈 앵커 소실")];
         let arm = &prod[prod.find("\"surface.send_text\" =>").expect("send_text arm")..];
         let arm = &arm[..arm.find("\"surface.send_key\" =>").expect("다음 arm")];
         let first = arm.find("submit_settle_hold(").expect("1차 분리 보류");
@@ -20727,7 +20793,9 @@ mod tests {
     #[test]
     fn resolve_hit_path_releases_cache_lock_before_start_probe() {
         let src = include_str!("handlers.rs");
-        let prod = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커 소실")];
+        let prod = &src[..src
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("테스트 모듈 앵커 소실")];
         let start = prod
             .find("fn resolve_caller_surface(daemon: &Daemon, caller_pid: u32) -> Option<u64> {")
             .expect("resolve_caller_surface 시그니처 소실");
@@ -21103,13 +21171,45 @@ mod tests {
         assert_eq!(daemon.roles.lock().unwrap().get("cso-2").copied(), Some(holder), "cso-2 매핑이 넘어갔다");
         // 대조 ①: **명시 승계**(`takeover_empty_seat`) 경로는 게이트가 닫지 않는다 — 답은 좌석
         //   판정(`seat_claimable_now` · 이 프로세스 표의 Empty 여부)을 그대로 따른다.
-        let hs = daemon.get_surface(holder).unwrap();
-        let claimable = crate::governance::seat_claimable_now(&hs);
+        // ★H-07 (0.14.55-P8) — **한 번의 호출에서 세 사실을 읽어** 함의를 단언한다.
+        //   종전: `seat_claimable_now` 를 시험이 **다시** 불러(=두 번째 프로브) 그 값과 `resp.ok`
+        //   의 **동등**을 단언했다. 두 프로브 사이에 좌석이 바뀌면 적색이 나고, 더 나쁘게는
+        //   재검증(`seat_takeover_recheck`)이 승계를 **정당하게** 취소한 경우에도 적색이 난다 —
+        //   즉 동등은 이 게이트의 계약이 아니다(설계 R2 §1-2·§1-4).
+        //   지금: probe 는 시험 전용 관찰창에서, recheck 와 final 은 **이미 있는 버스 이벤트**에서
+        //   읽는다(새 응답 필드 0 · 출하 바이트 0 · 두 번째 프로세스 표 조회 0).
+        const DEFAULT_CANCEL: &str = "보유자 생존(승계 미요청 또는 좌석 비어있지 않음)";
+        let hs = daemon.get_surface(holder).unwrap();   // 대조 ② 에서 쓴다 — ⛔여기서 프로브를 다시 돌리지 않는다
+        let before = daemon.bus.replay_after(0).len() as u64;
+        clear_claim_role_probe();
         let req = Request { id: json!(1), method: "system.claim_role".into(),
             params: json!({"role": "cso-2", "surface_id": attacker, "takeover_empty_seat": true}) };
         let Reply::Single(resp) = dispatch(&daemon, req, Some(pid)) else { panic!("single reply") };
-        assert_eq!(resp["ok"], json!(claimable),
-            "명시 승계 경로가 좌석 판정(claimable={claimable})과 다르게 답했다: {resp}");
+        let observed = LAST_CLAIM_ROLE_PROBE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .expect("H-07: 이 호출이 프로브를 기록하지 않았다 — 관찰창이 끊겼다");
+        assert_eq!((observed.role.as_str(), observed.surface), ("cso-2", attacker),
+            "관찰창이 다른 호출의 값을 들고 있다: {observed:?}");
+        let fresh: Vec<serde_json::Value> = daemon.bus.replay_after(before).into_iter().collect();
+        // recheck: `role.takeover_cancelled` 의 reason 이 **기본 문자열이 아닐 때만** 재검증 취소다
+        //   (기본 문자열은 "프로브가 아니라고 했다" 를 뜻한다 — 설계 R2 §1-5).
+        let recheck: Option<String> = fresh.iter()
+            .filter(|e| e["name"] == "role.takeover_cancelled")
+            .filter_map(|e| e["payload"]["reason"].as_str().map(str::to_string))
+            .find(|r| r != DEFAULT_CANCEL);
+        let committed = resp["ok"] == json!(true);
+        // final == committed  ⟺  probe == true ∧ recheck == None
+        assert_eq!(committed, observed.probe && recheck.is_none(),
+            "H-07 함의가 깨졌다 — final={committed} probe={} recheck={recheck:?} resp={resp}",
+            observed.probe);
+        // 거부였다면 그 사유가 버스에 실제로 실렸는지도 본다(세 번째 사실의 출처 확인).
+        if !committed {
+            assert!(fresh.iter().any(|e| e["name"] == "role.claim_denied"),
+                "거부인데 role.claim_denied 가 버스에 없다: {fresh:?}");
+        }
+        let claimable = committed;
         if claimable {
             assert_eq!(daemon.roles.lock().unwrap().get("cso-2").copied(), Some(attacker));
             daemon.roles.lock().unwrap().insert("cso-2".into(), holder); // 대조 ② 는 원 보유자 기준
@@ -25334,7 +25434,9 @@ mod tests {
         // 배선 소스핀: surface.reap arm 몸통 안에서 재검증이 close_surface **앞**에 있다
         // (governance 소스핀 관례 동형 — 로직 무변경 검증 전용).
         let src = include_str!("handlers.rs");
-        let prod = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커 소실")];
+        let prod = &src[..src
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("테스트 모듈 앵커 소실")];
         let arm_at = prod.find("\"surface.reap\" =>").expect("surface.reap arm 소실");
         let arm_body = &prod[arm_at..];
         let recheck_at = arm_body.find("manual_reap_recheck(").expect(
@@ -25383,7 +25485,9 @@ mod tests {
     #[test]
     fn queue_lock_order_contract_no_ab_ba() {
         let src = include_str!("handlers.rs");
-        let prod = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커 소실")];
+        let prod = &src[..src
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("테스트 모듈 앵커 소실")];
         // ① surface.reap: pending 을 쥔 채 restored 를 잡는 한 문장 형태 금지.
         let arm_at = prod.find("\"surface.reap\" =>").expect("surface.reap arm 소실");
         let arm_body = &prod[arm_at..];
