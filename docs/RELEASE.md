@@ -685,11 +685,14 @@ gh release create v0.2.0 --draft --title "cys 0.2.0" --notes-file docs/RELEASE_N
             항진명제가 되고 보조 축이 무력해진다(실측으로 반증된 지점).
 
             ```sh
-            # 정본 = 기계 검사. 6항목 전부를 한 번에 돌린다(⑤ 포함).
-            python3 scripts/verify-release-remote.py <신버전> <구버전>
-            #   ★구버전은 필수다(0.14.41 · U4 C4-⑦) — 빼면 원격 수신 전에 exit 2. 종전엔 ① 을 조용히
-            #     빼고 분모 7 로 'N/7 PASS' 를 냈다. 두 인자를 준 정상 실행의 합격은 **8/8 PASS** 다.
-            #     구버전이 정말 없을 때만 `--no-prev` 를 명시한다(요약 줄에 ①SKIP 병기).
+            # 정본 = 기계 검사. 8축 전부를 측정한다(⑤ 포함).
+            python3 scripts/verify-release-remote.py <신버전>
+            # 공개 릴리스 전체 목록에서 목표보다 오래된 안정 바이너리 전임을 파생한다.
+            # <구버전>을 추가할 수도 있지만 파생값과 다르면 실패다. 팩-only·draft·prerelease는 제외한다.
+            # 이미 공개된 목표는 목표 발행시각보다 이른 판만 비교한다. 목록 불완전·스키마 오류도 실패다.
+            # 종료코드: 0 = 정본 8/8 PASS; 1 = 축 실패 또는 측정 불능; 2 = 인자 오류(수신 전).
+            # 전임이 정말 없을 때만 --no-prev: ①SKIP, 나머지 7축 통과는 exit 3(부분 측정, 정본 아님).
+            # --no-prev라도 다른 축이 실패하면 exit 1이다. 신버전 인자 부재는 exit 2다.
 
             # 손으로 볼 때(참고용) — 대상은 루트가 아니라 /downloads/ 다.
             curl -s https://www.cysinsight.com/downloads/ \
