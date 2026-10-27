@@ -31249,7 +31249,7 @@ mod h_machine_hold_tests {
     /// ★(0.14.52 · S-a C7d) 50 → **52**: class A (S21 withheld Return is Unix-only, `send_settle_applies`) +2 byte-exact
     /// withheld-Return accounting specimens (`send_settle_tests::c7d_*`). Renamed `_of_52`.
     #[test]
-    fn r2f_dm_windows_ignore_attributes_are_exactly_the_decided_set_of_52() {
+    fn r2f_dm_windows_ignore_attributes_are_exactly_the_decided_set_of_55() {
         const REASON_A: &str = "S21 제출 정착·창 위 CR 보류는 유닉스 한정(send_settle_applies)";
         const REASON_B: &str = "윈도우 기본 H 마스크는 draft 축을 끈다(hold_axes_default(true)) — 이 검체는 유닉스 기본(draft 축) 동작을 본다";
         const REASON_C: &str = "좌석 명령이 POSIX 셸 문법";
@@ -31310,8 +31310,15 @@ mod h_machine_hold_tests {
             ("agent_queue_tests", "s4_1_mid_body_transient_loss_resumes_and_submits_once", 'C'),
             ("agent_queue_tests", "s4_1_modal_waits_inside_the_window_then_resumes", 'C'),
             ("agent_queue_tests", "s4_1_resume_window_edges_are_exact", 'C'),
+            // ★(0.14.55 · P4 C-13) class C +3: the Ctrl+C / ETX cells read the bytes the daemon put on the
+            //   wire through the same recorder seat (`stty raw -echo; exec cat > file`), so they are POSIX by
+            //   construction. Their pure-function sibling (the CancelKey verdict) carries no seat and still
+            //   runs on Windows. ⛔The Windows half of C-13 is UNMEASURED and no cell here stands in for it.
+            ("etx_ctrlc_tests", "control_the_rig_does_carry_a_key_to_the_wire", 'C'),
+            ("etx_ctrlc_tests", "ctrl_c_on_a_human_draft_is_refused_and_writes_nothing", 'C'),
+            ("etx_ctrlc_tests", "ctrl_c_reaches_the_wire_as_a_single_etx_byte", 'C'),
         ];
-        assert_eq!(want.len(), 52, "결정한 집합은 52건(24 + 17 + 8 + 3)");
+        assert_eq!(want.len(), 55, "결정한 집합은 55건(24 + 17 + 11 + 3)");
         let needle = concat!("#[cfg_attr(not(unix), ", "ignore = \"");
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/cysd");
         let mut got: Vec<(String, String, char)> = Vec::new();
@@ -31338,8 +31345,8 @@ mod h_machine_hold_tests {
         got.sort();
         let mut want_sorted: Vec<(String, String, char)> = want.iter().map(|(a, b, c)| (a.to_string(), b.to_string(), *c)).collect();
         want_sorted.sort();
-        assert_eq!(got.len(), 52, "윈도우 `ignore` 가 {}건이다(결정 52건) — 새로 더했거나 뺐다: {got:?}", got.len());
-        assert_eq!(got, want_sorted, "윈도우 `ignore` 집합이 결정한 52건과 다르다 — 목록과 `ignore` 사유를 함께 고쳐라");
+        assert_eq!(got.len(), 55, "윈도우 `ignore` 가 {}건이다(결정 55건) — 새로 더했거나 뺐다: {got:?}", got.len());
+        assert_eq!(got, want_sorted, "윈도우 `ignore` 집합이 결정한 55건과 다르다 — 목록과 `ignore` 사유를 함께 고쳐라");
     }
 }
 

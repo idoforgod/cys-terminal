@@ -137,7 +137,7 @@ fn ctrl_c_classifies_as_cancel_key_and_denies_only_on_a_human_draft() {
 /// ★C-13 step 7 — the cell R2 asks for: the daemon's writer thread puts 0x03 on the wire. This is a
 /// statement about OUR code, valid on macOS. It does not say the byte reached a ConPTY client.
 #[test]
-#[cfg_attr(not(unix), ignore = "recorder seat uses POSIX shell syntax (stty/exec cat)")]
+#[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
 fn ctrl_c_reaches_the_wire_as_a_single_etx_byte() {
     let fx = fx("etx-wire");
     let (s, out) = recorder_seat(&fx, "wire");
@@ -153,7 +153,7 @@ fn ctrl_c_reaches_the_wire_as_a_single_etx_byte() {
 /// cancel key is REFUSED and **no byte is written at all**. Without this cell a measurement would
 /// attribute a daemon-side refusal to ConPTY.
 #[test]
-#[cfg_attr(not(unix), ignore = "recorder seat uses POSIX shell syntax (stty/exec cat)")]
+#[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
 fn ctrl_c_on_a_human_draft_is_refused_and_writes_nothing() {
     let fx = fx("etx-refuse");
     let (s, out) = recorder_seat(&fx, "refuse");
@@ -172,7 +172,7 @@ fn ctrl_c_on_a_human_draft_is_refused_and_writes_nothing() {
 /// Control for the cell above: the same rig DOES carry a key to the wire when the gate allows it. Without
 /// this, a zero in the refusal cell could be a broken rig rather than a refusal.
 #[test]
-#[cfg_attr(not(unix), ignore = "recorder seat uses POSIX shell syntax (stty/exec cat)")]
+#[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
 fn control_the_rig_does_carry_a_key_to_the_wire() {
     let fx = fx("etx-control");
     let (s, out) = recorder_seat(&fx, "control");
