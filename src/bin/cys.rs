@@ -51622,12 +51622,30 @@ mod b360_tests {
 /// 바뀐다 — 그 결함은 호출부에서만 재다.
 #[cfg(test)]
 mod p3r1_caller_tests {
-    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
 
+    // ★r2(codex-2 minor) — 이 모듈은 `cfg(test)` 이지만 **unix 게이트가 없었다**. 모듈 머리의
+    //   `use std::os::unix::fs::PermissionsExt;` 와 mode 호출 때문에 **윈도우 타깃 테스트 빌드가
+    //   E0433/E0599 로 깨졌고**(실측 5건), 그러면 이 패키지의 윈도우 테스트 신호가 사라진다.
+    // ⛔모듈 전체를 통째로 게이트하지 않는다 — 그러면 M4 롤백 로직의 윈도우 커버리지가 조용히
+    //   삭제된다(판정 2항). 그래서 **mode 단언만** 게이트하고, 이식 가능한 단언(거부·쓰기 0·
+    //   --force-vendor 강행·근거 부재·user 우회)은 윈도우에서도 **컴파일되고 실행된다**.
+    #[cfg(unix)]
     fn mode_of(p: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
         std::fs::metadata(p).unwrap().permissions().mode() & 0o7777
     }
+
+    /// 픽스처의 mode 설정 — unix 에서는 실제로 세우고, 그 밖에서는 **no-op** 이다.
+    /// 이렇게 두면 픽스처 구성 코드가 양 플랫폼에서 하나로 남고, 플랫폼 분기는 **단언**에만 생긴다.
+    #[cfg(unix)]
+    fn set_mode(p: &Path, m: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+    }
+
+    #[cfg(not(unix))]
+    fn set_mode(_p: &Path, _m: u32) {}
 
     fn rel_of_class(dir: &Path, class: &str) -> &'static str {
         cys::pack::PACK_ALL
@@ -51669,6 +51687,10 @@ mod p3r1_caller_tests {
 
     /// ★M1 — `--to-local` 재승격이 **사용자 오버레이의 mode 를 넓히지 않는다**.
     /// 93354798 에서는 소스 팩의 system 등급을 목적지(local 오버레이)에 넘겨 0644 → 0755 가 됐다.
+    /// ★이 검체는 **전체가 mode 단언**이다(선행 mode 네 가지 → 기대 mode). POSIX 퍼미션이 없는
+    ///   플랫폼에는 지킬 불변식 자체가 없으므로 검체째 `cfg(unix)` 다 — 윈도우에서 사라지는 것은
+    ///   **없는 계약의 검사**이고, M4 롤백의 이식 가능한 단언은 아래 검체에서 그대로 돈다.
+    #[cfg(unix)]
     #[test]
     fn p3r1_m1_to_local_promotion_keeps_the_prior_mode() {
         let _lock = super::tests::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -51713,7 +51735,7 @@ mod p3r1_caller_tests {
             }
             if let Some(m) = prior {
                 std::fs::write(&dest, "older overlay\n").unwrap();
-                std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(m)).unwrap();
+                set_mode(&dest, m);
                 assert_eq!(mode_of(&dest), m, "전제: 선행 mode 를 세웠다");
             }
 
@@ -51757,10 +51779,10 @@ mod p3r1_caller_tests {
             }
             std::fs::write(r.pack.join(rel), disk_bytes).unwrap();
             std::fs::write(prev.join(rel), prev_bytes).unwrap();
-            std::fs::set_permissions(&prev.join(rel), std::fs::Permissions::from_mode(0o755))
-                .unwrap();
-            std::fs::set_permissions(&r.pack.join(rel), std::fs::Permissions::from_mode(0o644))
-                .unwrap();
+            // 보존본은 실행 가능, 대상은 0644 — T25 의 전제. unix 밖에서는 no-op 이고, 그 플랫폼의
+            // 단언은 아래에서 `cfg(unix)` 로 빠진다(픽스처는 한 가지 철자로 남는다).
+            set_mode(&prev.join(rel), 0o755);
+            set_mode(&r.pack.join(rel), 0o644);
             if let Some(h) = prev_manifest {
                 let mut m = std::collections::BTreeMap::new();
                 m.insert(rel.to_string(), h.to_string());
@@ -51792,11 +51814,16 @@ mod p3r1_caller_tests {
             assert_eq!(rc2, 0, "T15b: --force-vendor 는 강행한다");
             assert_eq!(std::fs::read_to_string(r.pack.join(rel)).unwrap(), prev_bytes);
             // T25 — 보존본이 실행 가능하면 그 mode 가 권위다(대상은 0644 였다).
-            assert_eq!(
-                mode_of(&r.pack.join(rel)),
-                0o755,
-                "T25: 실행 가능한 보존본의 mode 가 대상 0644 를 이긴다"
-            );
+            // ★여기만 `cfg(unix)` 다: POSIX 실행비트가 없는 플랫폼에는 이 불변식이 없다. 위의
+            //   거부·쓰기 0·강행 단언은 **윈도우에서도 돈다**(판정 2항의 분리 요구).
+            #[cfg(unix)]
+            {
+                assert_eq!(
+                    mode_of(&r.pack.join(rel)),
+                    0o755,
+                    "T25: 실행 가능한 보존본의 mode 가 대상 0644 를 이긴다"
+                );
+            }
             let _ = std::fs::remove_dir_all(&r._root);
         }
 
