@@ -488,3 +488,81 @@ describe("배선 핀 — main.ts", () => {
     expect(/\.cc-dot\.hollow\s*\{/.test(css)).toBe(true);
   });
 });
+
+// ── D4 (P11 / C-30): CTX 현재값 없음 좌석을 **세어서 툴팁에만** 적는다 ───────────────
+// ★점 색과 worst 는 바뀌지 않는다 — agy 좌석을 가진 작업공간이 영구히 "미확인"으로 물들면
+//   그것은 경보 피로이고, 설계가 명시적으로 금지한 방향이다.
+import { summarizeWsSigs as sumD4, wsSubBits as bitsD4 } from "./seatsig";
+
+const sigD4 = (over: Record<string, unknown> = {}) => ({
+  role: "reviewer-gemini", state: "working", ctx_pct: null as number | null,
+  idle_secs: 1, agent_alive: true, hollow: false, at: 1_000_000, ...over,
+}) as any;
+
+test("D4: 산 좌석의 ctx_pct 가 null 이면 센다(역할 이름과 함께)", () => {
+  const s = sumD4([sigD4(), sigD4({ role: "reviewer-gemini-2" }), sigD4({ role: "master", ctx_pct: 38 })], 1_000_000, 60_000);
+  expect(s.ctxUnmeasuredN).toBe(2);
+  expect(s.ctxUnmeasuredRoles).toEqual(["reviewer-gemini", "reviewer-gemini-2"]);
+});
+
+test("D4: 점 색과 worst 는 영향받지 않는다(경보 피로 금지)", () => {
+  const onlyNull = sumD4([sigD4(), sigD4({ role: "reviewer-gemini-2" })], 1_000_000, 60_000);
+  expect(onlyNull.dot).toBe("working");   // 종전과 같다
+  expect(onlyNull.worst).toBe(0);         // worst 의 뜻은 바뀌지 않는다
+  const withHot = sumD4([sigD4(), sigD4({ role: "master", ctx_pct: 64 })], 1_000_000, 60_000);
+  expect(withHot.worst).toBe(64);
+  expect(withHot.ctxUnmeasuredN).toBe(1);
+});
+
+test("D4: 빈 자리의 동결 null 은 세지 않는다(집계 제외 규칙 그대로)", () => {
+  const s = sumD4([sigD4({ hollow: true }), sigD4({ role: "master", ctx_pct: 38 })], 1_000_000, 60_000);
+  expect(s.ctxUnmeasuredN).toBe(0);
+});
+
+// ★m1(codex r1 · 2026-10-27): 아래 두 시험은 r1 의 결함 두 개를 고정한다.
+//   ⒜ 이 집계는 **사망 확정 좌석을 세지 않는다** — 죽은 좌석의 null 은 "지금 못 재는 중"이 아니라
+//      동결된 빈칸이고, 그 좌석에 대해 할 말은 ❌ 쪽이다(점 색도 그쪽이 가진다).
+//   ⒝ 이 줄은 **툴팁에만** 적힌다 — r1 은 설계가 금지한 보이는 서브라인에도 넣었다.
+test("D4-m1: 사망 확정 좌석의 null 은 세지 않는다(음성 대조 — 산 좌석이면 센다)", () => {
+  const dead = sumD4(
+    [sigD4({ role: "worker-9", agent_alive: false }), sigD4({ role: "master", ctx_pct: 38 })],
+    1_000_000,
+    60_000,
+  );
+  expect(dead.ctxUnmeasuredN).toBe(0);
+  expect(dead.ctxUnmeasuredRoles).toEqual([]);
+  expect(dead.title).not.toContain("CTX 현재값 없음");
+  // 죽음은 종전대로 자기 말로 드러난다 — 이 고침이 ❌ 를 가리지 않는다.
+  expect(dead.dead).toBe(1);
+  expect(dead.dot).toBe("error");
+  // 음성 대조: 같은 좌석의 agent_alive 만 되돌리면 다시 세어진다(제외가 과잉이 아니다).
+  const alive = sumD4(
+    [sigD4({ role: "worker-9", agent_alive: true }), sigD4({ role: "master", ctx_pct: 38 })],
+    1_000_000,
+    60_000,
+  );
+  expect(alive.ctxUnmeasuredN).toBe(1);
+  expect(alive.ctxUnmeasuredRoles).toEqual(["worker-9"]);
+});
+
+test("D4-m1: 드러나는 자리는 툴팁 하나다 — 보이는 서브라인에는 넣지 않는다", () => {
+  const s = sumD4([sigD4(), sigD4({ role: "reviewer-gemini-2" })], 1_000_000, 60_000);
+  // 툴팁에는 있다.
+  expect(s.title).toContain("CTX 현재값 없음 2: reviewer-gemini, reviewer-gemini-2");
+  // 보이는 서브라인에는 **없다**(설계: 툴팁 전용).
+  const bits = bitsD4(s, "");
+  expect(bits.some((b: string) => b.includes("CTX 현재값 없음"))).toBe(false);
+  // 종전 비트는 그대로 산다 — 이 제거가 서브라인 자체를 비우지 않는다.
+  expect(bits[0]).toBe("2 pane");
+  // 보호·가드 문장은 어느 자리에도 없다(이 집계는 값의 유무만 안다).
+  for (const w of ["보호", "protection", "가드", "guard"])
+    expect(`${bits.join(" ")} ${s.title}`).not.toContain(w);
+});
+
+test("D4: 세울 것이 없으면 줄을 만들지 않는다", () => {
+  const s = sumD4([sigD4({ role: "master", ctx_pct: 38 })], 1_000_000, 60_000);
+  expect(s.ctxUnmeasuredN).toBe(0);
+  // ★m1 뒤로는 서브라인에 **항상** 없으므로 그쪽 단언만으로는 공허하다 — 툴팁에서 센다.
+  expect(s.title).not.toContain("CTX 현재값 없음");
+  expect(bitsD4(s, "").some((b: string) => b.startsWith("CTX 현재값 없음"))).toBe(false);
+});

@@ -21209,6 +21209,123 @@ fn ctx_cell(s: &serde_json::Value) -> String {
     }
 }
 
+/// ★D5-R3(P11 / C-30) — `CTX '-'` 가 한 행이라도 있을 때 표 아래에 붙이는 **사람용 각주**의 분류.
+///
+/// 왜 이 분류가 필요한가: `-` 는 "지금 쓸 수 있는 값이 없다"까지만 말한다. 그보다 강한 문장
+/// ("자동 임계 입력이 없다")은 **그 행이 가드 상태 전부를 싣고 있을 때만** 참이다. org.status 행은
+/// 그것을 싣는다(`ctx_guard_wire` 가 네 키를 항상 낸다) — 그래서 CLI 만 이 문장을 낼 수 있고,
+/// 보고서(javis_report)는 수집기가 `phase`·보존된 `fire_id`·`level_pct` 를 버리므로 낼 수 없다.
+///
+/// ★★구현 규칙(설계가 못박은 부분 · 어기면 거짓을 찍는다): 값을 보기 **전에 키 존재를 확인한다**.
+///   serde_json 은 `value["missing"]` 를 **정적 Null** 로 돌려주므로(1.0.150 `value/index.rs`),
+///   색인만 쓰면 "키가 없는 낡은 데몬 행"이 "가드가 비어 있는 행"과 **구별되지 않는다** — 그 순간
+///   이 각주는 측정하지 않은 것을 단언한다. 그래서 `as_object()` + `contains_key` 가 전제다.
+///   ★이 규율은 `ctx_guard` 뿐 아니라 **`status` 에도 똑같이** 적용된다(m1/m2 교정 · codex r1):
+///   `status` 키 부재·`{}`·비객체는 "자기보고가 없다"가 아니라 **모른다**이므로 약한 문면으로 닫는다.
+#[derive(Debug, PartialEq, Eq)]
+enum CtxFooterClass {
+    /// (a)~(d) 전부 성립하고 가드 네 키가 **전부 실려** 있으며 전부 비어 있다.
+    NoThresholdInput,
+    /// (a)(b) 성립 · 네 키 전부 실림 · 그러나 가드가 기록을 쥐고 있다(= 부정하지 않고 한정한다).
+    GuardRetains { phase: String, fire_id: String, level: String },
+    /// 각주의 머리줄 이상은 말할 근거가 없다(키 부재 · 죽은 행 · 값이 있는 행 등).
+    Unstated,
+}
+
+/// `serde_json::Value` 를 각주에 찍을 짧은 글자로 — null 은 숨기지 않고 `null` 로 적는다.
+fn ctx_footer_val(v: Option<&serde_json::Value>) -> String {
+    match v {
+        None => "absent".to_string(),
+        Some(x) if x.is_null() => "null".to_string(),
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(x) => x.to_string(),
+    }
+}
+
+/// org.status 행 하나를 위 세 칸 중 하나로 분류한다(표시 전용 · 판정·상태 변경 없음).
+fn ctx_footer_class(s: &serde_json::Value) -> CtxFooterClass {
+    // (d) 죽은·종료된 행은 머리줄 이상을 말하지 않는다(동결값에 대해 단언하지 않는다).
+    if s.get("exited").and_then(|v| v.as_bool()) == Some(true)
+        || s.get("agent_alive").and_then(|v| v.as_bool()) == Some(false)
+    {
+        return CtxFooterClass::Unstated;
+    }
+    // (a) usage 블록이 **실려 있고** ctx_pct 가 null 이어야 한다. 키 자체가 없으면 모르는 것이다.
+    let Some(usage) = s.get("usage").and_then(|v| v.as_object()) else {
+        return CtxFooterClass::Unstated;
+    };
+    match usage.get("ctx_pct") {
+        Some(v) if v.is_null() => {}
+        _ => return CtxFooterClass::Unstated,
+    }
+    // (b) 자기보고가 없다는 것이 **명시 진술로 실려** 있어야 한다 — 나이는 묻지 않는다(신고된
+    //     순간 가드에 들어갔으므로). ★m1/m2 교정(codex r1): 받아들이는 꼴은 둘뿐이다.
+    //       ⒜ 실려 있는 `status: null`  ⒝ `context_pct` 가 **실려 있고** null 인 객체.
+    //     `status` 키 부재·`{}`·비객체는 "자기보고가 없다"가 아니라 **모른다**이고, 그 위에서
+    //     강한 문장을 내면 측정하지 않은 것을 단언한다 — (c) 의 키 존재 규율과 같은 이유다.
+    match s.get("status") {
+        Some(v) if v.is_null() => {}
+        Some(serde_json::Value::Object(st)) => match st.get("context_pct") {
+            Some(c) if c.is_null() => {}
+            _ => return CtxFooterClass::Unstated,
+        },
+        _ => return CtxFooterClass::Unstated,
+    }
+    // (c) 가드 네 키가 **전부 실려** 있어야 한다. 하나라도 없으면 약한 문면으로 닫는다(fail-closed).
+    let Some(g) = s.get("ctx_guard").and_then(|v| v.as_object()) else {
+        return CtxFooterClass::Unstated;
+    };
+    const KEYS: [&str; 4] = ["phase", "fire_id", "level_pct", "self_report_level_pct"];
+    if !KEYS.iter().all(|k| g.contains_key(*k)) {
+        return CtxFooterClass::Unstated;
+    }
+    let free_empty = g.get("phase").and_then(|v| v.as_str()) == Some("free")
+        && g.get("fire_id").map(|v| v.is_null()).unwrap_or(false)
+        && g.get("level_pct").map(|v| v.is_null()).unwrap_or(false)
+        && g.get("self_report_level_pct").map(|v| v.is_null()).unwrap_or(false);
+    if free_empty {
+        CtxFooterClass::NoThresholdInput
+    } else {
+        CtxFooterClass::GuardRetains {
+            phase: ctx_footer_val(g.get("phase")),
+            fire_id: ctx_footer_val(g.get("fire_id")),
+            level: ctx_footer_val(g.get("level_pct")),
+        }
+    }
+}
+
+/// 표 아래 각주 줄들. 빈 벡터 = 찍을 것 없음(`-` 행이 하나도 없다).
+/// ★ASCII 전용 — 윈도우 콘솔 코드페이지에서 깨지지 않아야 한다(설계 §10/Windows 줄).
+fn ctx_footer_lines(rows: &[serde_json::Value]) -> Vec<String> {
+    if !rows.iter().any(|s| ctx_cell(s) == "-") {
+        return Vec::new();
+    }
+    let mut out = vec!["CTX '-' = no current usable context value.".to_string()];
+    let mut no_input: Vec<String> = Vec::new();
+    let mut retains: Vec<String> = Vec::new();
+    for s in rows {
+        if ctx_cell(s) != "-" {
+            continue;
+        }
+        let role = s.get("role").and_then(|v| v.as_str()).unwrap_or("-").to_string();
+        match ctx_footer_class(s) {
+            CtxFooterClass::NoThresholdInput => no_input.push(role),
+            CtxFooterClass::GuardRetains { phase, fire_id, level } => retains.push(format!(
+                "{role}: no current usable context value; guard retains phase={phase} fire_id={fire_id} level={level}"
+            )),
+            CtxFooterClass::Unstated => {}
+        }
+    }
+    if !no_input.is_empty() {
+        out.push(format!(
+            "no automatic threshold input (as of this read): {}",
+            no_input.join(", ")
+        ));
+    }
+    out.extend(retains);
+    out
+}
+
 /// ★(0.14.51 · S2 §5.4) 상태 칸 — `cys status` 표에 찍는 낱말. **표시 전용**(판정·상태 변경 없음).
 /// 종료·에이전트 부재가 먼저이고, 그 밖에는 상태행의 `state` 를 그대로 쓴다. 단 **묵은 사이클 창**
 /// (`status.window` 가 있고 보류 상한이 지났다)은 맨낱말 `quiescing` 대신 `quiescing (stale Ns)` 로 찍는다 —
@@ -21284,6 +21401,7 @@ fn run_fleet(as_json: bool) -> i32 {
         );
         return 0;
     }
+    let mut all_rows: Vec<Value> = Vec::new();
     for d in &out {
         let disp = d["department"].as_str().unwrap_or("");
         if let Some(e) = d["error"].as_str() {
@@ -21294,6 +21412,8 @@ fn run_fleet(as_json: bool) -> i32 {
             continue;
         }
         let surfaces = d["surfaces"].as_array().cloned().unwrap_or_default();
+        // ★D5-R3: 각주는 부서마다가 아니라 표 전체에 한 번 붙는다 — 행을 모아 둔다.
+        all_rows.extend(surfaces.iter().cloned());
         let working = surfaces
             .iter()
             .filter(|s| s["status"]["state"].as_str() == Some("working"))
@@ -21320,6 +21440,10 @@ fn run_fleet(as_json: bool) -> i32 {
                 task.chars().take(60).collect::<String>()
             );
         }
+    }
+    // ★D5-R3(C-30): 표 전체에 한 번. 낡은 데몬 부서(가드 키 부재)는 약한 문면으로 닫힌다(fail-closed).
+    for line in ctx_footer_lines(&all_rows) {
+        println!("{line}");
     }
     0
 }
@@ -21384,6 +21508,11 @@ fn run_status(as_json: bool) -> i32 {
             queue_mark,
             task.chars().take(40).collect::<String>(),
         );
+    }
+    // ★D5-R3(C-30): `-` 가 한 행이라도 있으면 그 뜻을 사람에게 적어 준다. 종전에는 `-` 만 있고
+    //   그것이 "값이 없다"인지 "문제가 없다"인지 표에 아무 설명이 없었다. `--json` 은 불변이다.
+    for line in ctx_footer_lines(&r["surfaces"].as_array().cloned().unwrap_or_default()) {
+        println!("{line}");
     }
     let pending = r["feed"]["pending"].as_u64().unwrap_or(0);
     if pending > 0 {
@@ -44271,6 +44400,272 @@ mod tests {
         assert_eq!(ctx_cell(&json!({"agent_alive": null, "usage": {"ctx_pct": 82}})), "82%");
         assert_eq!(ctx_cell(&json!({"exited": false, "usage": {"ctx_pct": 82}})), "82%");
         assert_eq!(ctx_cell(&json!({"agent_alive": true, "usage": {"ctx_pct": 82}})), "82%");
+    }
+
+    /// ★D5-R3(P11 / C-30) — 각주 분류의 네 갈래. 설계 R3 §1.3 의 표 그대로다.
+    ///
+    /// 이 시험이 지키는 것은 **한 문장의 진실성**이다: "no automatic threshold input" 은 그 행이 가드
+    /// 상태 전부를 싣고 있을 때만 참이다. 키가 없는 행(낡은 데몬)과 가드가 비어 있는 행은 `serde_json`
+    /// 색인으로는 **구별되지 않으므로**, 분류기는 키 존재를 먼저 본다. 아래 ③④ 가 그 두 경우다.
+    #[test]
+    fn ctx_footer_class_separates_free_empty_retained_incomplete_and_absent_guard() {
+        use serde_json::json;
+        // ① free + 네 키 전부 null → 가장 강한 문장을 낼 수 있는 유일한 상태.
+        let free_empty = json!({"role": "reviewer-gemini", "usage": {"ctx_pct": null}, "status": null,
+            "ctx_guard": {"phase": "free", "fire_id": null, "level_pct": null, "self_report_level_pct": null}});
+        assert_eq!(ctx_footer_class(&free_empty), CtxFooterClass::NoThresholdInput);
+        // ② 가드가 기록을 쥐고 있다 → 부정하지 않고 한정한다.
+        let retained = json!({"role": "worker-11", "usage": {"ctx_pct": null}, "status": null,
+            "ctx_guard": {"phase": "measuring", "fire_id": "prior-fire", "level_pct": 64, "self_report_level_pct": null}});
+        assert_eq!(
+            ctx_footer_class(&retained),
+            CtxFooterClass::GuardRetains {
+                phase: "measuring".to_string(),
+                fire_id: "prior-fire".to_string(),
+                level: "64".to_string(),
+            }
+        );
+        // ③ 키가 모자란 가드(phase 만) → **아무 말도 하지 않는다**. 색인만 쓰면 이 행이 ① 로 읽힌다.
+        let incomplete = json!({"role": "x", "usage": {"ctx_pct": null}, "status": null,
+            "ctx_guard": {"phase": "free"}});
+        assert_eq!(ctx_footer_class(&incomplete), CtxFooterClass::Unstated);
+        // ④ ctx_guard 키 자체가 없다(낡은 데몬 부서) → 역시 아무 말도 하지 않는다.
+        let no_guard = json!({"role": "y", "usage": {"ctx_pct": null}, "status": null});
+        assert_eq!(ctx_footer_class(&no_guard), CtxFooterClass::Unstated);
+    }
+
+    /// (a)(b)(d) 각 조건을 하나씩 거짓으로 만들면 강한 문장이 사라진다 — 조건이 장식이 아님을 보인다.
+    #[test]
+    fn ctx_footer_class_requires_every_condition() {
+        use serde_json::json;
+        let g = json!({"phase": "free", "fire_id": null, "level_pct": null, "self_report_level_pct": null});
+        let base = |usage: serde_json::Value, status: serde_json::Value, extra: Vec<(&str, serde_json::Value)>| {
+            let mut m = serde_json::Map::new();
+            m.insert("role".into(), json!("r"));
+            m.insert("usage".into(), usage);
+            m.insert("status".into(), status);
+            m.insert("ctx_guard".into(), g.clone());
+            for (k, v) in extra {
+                m.insert(k.into(), v);
+            }
+            serde_json::Value::Object(m)
+        };
+        // 기준선 — 성립한다.
+        assert_eq!(
+            ctx_footer_class(&base(json!({"ctx_pct": null}), json!(null), vec![])),
+            CtxFooterClass::NoThresholdInput
+        );
+        // (a) 거짓 — 실측값이 있다.
+        assert_eq!(
+            ctx_footer_class(&base(json!({"ctx_pct": 40}), json!(null), vec![])),
+            CtxFooterClass::Unstated
+        );
+        // (a) 거짓 — usage 블록에 ctx_pct 키가 없다(모르는 것이다).
+        assert_eq!(
+            ctx_footer_class(&base(json!({}), json!(null), vec![])),
+            CtxFooterClass::Unstated
+        );
+        // (a) 거짓 — usage 키 자체가 없다.
+        let mut no_usage = serde_json::Map::new();
+        no_usage.insert("role".into(), json!("r"));
+        no_usage.insert("ctx_guard".into(), g.clone());
+        assert_eq!(
+            ctx_footer_class(&serde_json::Value::Object(no_usage)),
+            CtxFooterClass::Unstated
+        );
+        // (b) 거짓 — 자기보고가 있다. **나이가 아무리 낡아도** 강한 문장은 못 낸다(보수 방향).
+        assert_eq!(
+            ctx_footer_class(&base(
+                json!({"ctx_pct": null}),
+                json!({"context_pct": 61, "age_secs": 9999}),
+                vec![]
+            )),
+            CtxFooterClass::Unstated
+        );
+        // (b) 성립 — status 는 있으나 context_pct 가 null 이다.
+        assert_eq!(
+            ctx_footer_class(&base(
+                json!({"ctx_pct": null}),
+                json!({"context_pct": null, "age_secs": 3}),
+                vec![]
+            )),
+            CtxFooterClass::NoThresholdInput
+        );
+        // (d) 거짓 — 종료·사망 행.
+        assert_eq!(
+            ctx_footer_class(&base(json!({"ctx_pct": null}), json!(null), vec![("exited", json!(true))])),
+            CtxFooterClass::Unstated
+        );
+        assert_eq!(
+            ctx_footer_class(&base(
+                json!({"ctx_pct": null}),
+                json!(null),
+                vec![("agent_alive", json!(false))]
+            )),
+            CtxFooterClass::Unstated
+        );
+    }
+
+    /// ★m2(codex r1 · 2026-10-27) — 조건 (b)는 **명시된 진술**에만 성립한다.
+    ///
+    /// `status` 키가 없거나 `{}` 이거나 객체가 아니면 그것은 "자기보고가 없다"가 아니라 **모른다**다.
+    /// 그 위에서 강한 문장("자동 임계 입력이 없다")을 내면 측정하지 않은 것을 단언하게 된다 — 이 각주가
+    /// `ctx_guard` 쪽에서 이미 막고 있는 결함과 **같은 꼴**이고, r1 은 `status` 쪽에만 그 규율이
+    /// 내려앉지 않았다. 받아들이는 꼴은 둘뿐이다: 실려 있는 `status: null`, 또는 `context_pct` 가
+    /// **실려 있고** null 인 객체.
+    #[test]
+    fn ctx_footer_class_requires_an_explicitly_stated_absent_self_report() {
+        use serde_json::json;
+        let g = json!({"phase": "free", "fire_id": null, "level_pct": null, "self_report_level_pct": null});
+        // status 를 **없는 상태(None)까지** 표현할 수 있는 행 생성기.
+        let row = |status: Option<serde_json::Value>| {
+            let mut m = serde_json::Map::new();
+            m.insert("role".into(), json!("r"));
+            m.insert("usage".into(), json!({"ctx_pct": null}));
+            m.insert("ctx_guard".into(), g.clone());
+            if let Some(s) = status {
+                m.insert("status".into(), s);
+            }
+            serde_json::Value::Object(m)
+        };
+        // ★양성 대조 — 받아들이는 두 꼴은 그대로 강한 문장을 낸다(고침이 참된 경우를 죽이지 않는다).
+        assert_eq!(
+            ctx_footer_class(&row(Some(json!(null)))),
+            CtxFooterClass::NoThresholdInput,
+            "case+1: status:null 이 실려 있다 = 자기보고 부재의 명시 진술"
+        );
+        assert_eq!(
+            ctx_footer_class(&row(Some(json!({"context_pct": null, "age_secs": 3})))),
+            CtxFooterClass::NoThresholdInput,
+            "case+2: context_pct 가 실려 있고 null 이다"
+        );
+        // ① status 키 자체가 없다(낡은 데몬 행) → 모른다.
+        assert_eq!(
+            ctx_footer_class(&row(None)),
+            CtxFooterClass::Unstated,
+            "case-1: status 키 부재는 부재의 진술이 아니다"
+        );
+        // ② status 가 빈 객체 → context_pct 가 실리지 않았으므로 모른다.
+        assert_eq!(
+            ctx_footer_class(&row(Some(json!({})))),
+            CtxFooterClass::Unstated,
+            "case-2: 빈 객체 status 는 context_pct 를 싣지 않았다"
+        );
+        // ③ status 가 객체도 null 도 아니다(형이 어긋난 행) → 모른다.
+        for weird in [json!(0), json!("none"), json!([]), json!(false)] {
+            assert_eq!(
+                ctx_footer_class(&row(Some(weird.clone()))),
+                CtxFooterClass::Unstated,
+                "case-3: status={weird} 는 자기보고 부재의 **명시 진술**이 아니다"
+            );
+        }
+        // ④ 값이 실려 있으면 종전대로 말하지 않는다(나이 무관 · 보수 방향).
+        assert_eq!(
+            ctx_footer_class(&row(Some(json!({"context_pct": 61, "age_secs": 9999})))),
+            CtxFooterClass::Unstated,
+            "case-4: 값이 실려 있으면 나이와 무관하게 말하지 않는다"
+        );
+        // ⑤ 각주 줄 수준에서도 같다 — 머리줄만 나오고 강한 문장은 **한 줄도** 찍히지 않는다.
+        let lines = ctx_footer_lines(&[row(None), row(Some(json!({})))]);
+        assert_eq!(
+            lines,
+            vec!["CTX '-' = no current usable context value.".to_string()],
+            "case-5: 각주 줄 수준에서도 강한 문장은 한 줄도 찍히지 않는다"
+        );
+    }
+
+    /// 각주 줄 자체 — `-` 행이 없으면 **한 줄도 찍지 않는다**(소음 금지), 있으면 머리줄 + 해당 문면.
+    #[test]
+    fn ctx_footer_lines_print_only_when_a_dash_row_exists() {
+        use serde_json::json;
+        // 측정되는 좌석만 있으면 각주가 없다.
+        let measured = vec![json!({"role": "master", "usage": {"ctx_pct": 38}})];
+        assert!(ctx_footer_lines(&measured).is_empty());
+        // `?`(판정 불가) 행만 있어도 각주는 없다 — 각주는 `-` 의 뜻을 설명하는 것이다.
+        let qmark = vec![json!({"role": "m", "exited": true, "usage": {"ctx_pct": 82}})];
+        assert_eq!(ctx_cell(&qmark[0]), "?");
+        assert!(ctx_footer_lines(&qmark).is_empty());
+        // `-` 행 + free-empty 가드 → 머리줄 + 강한 문장(역할 열거).
+        let rows = vec![
+            json!({"role": "master", "usage": {"ctx_pct": 38}}),
+            json!({"role": "reviewer-gemini", "usage": {"ctx_pct": null}, "status": null,
+                   "ctx_guard": {"phase": "free", "fire_id": null, "level_pct": null, "self_report_level_pct": null}}),
+            json!({"role": "reviewer-gemini-2", "usage": {"ctx_pct": null}, "status": null,
+                   "ctx_guard": {"phase": "free", "fire_id": null, "level_pct": null, "self_report_level_pct": null}}),
+        ];
+        let out = ctx_footer_lines(&rows);
+        assert_eq!(out[0], "CTX '-' = no current usable context value.");
+        assert_eq!(
+            out[1],
+            "no automatic threshold input (as of this read): reviewer-gemini, reviewer-gemini-2"
+        );
+        assert_eq!(out.len(), 2);
+        // 보존 가드 행은 한정 문면으로 따로 나오고, 강한 문장에는 들어가지 않는다.
+        let mixed = vec![json!({"role": "worker-11", "usage": {"ctx_pct": null}, "status": null,
+            "ctx_guard": {"phase": "measuring", "fire_id": "f1", "level_pct": 64, "self_report_level_pct": null}})];
+        let out2 = ctx_footer_lines(&mixed);
+        assert_eq!(out2[0], "CTX '-' = no current usable context value.");
+        assert_eq!(
+            out2[1],
+            "worker-11: no current usable context value; guard retains phase=measuring fire_id=f1 level=64"
+        );
+        assert!(!out2.iter().any(|l| l.contains("no automatic threshold input")));
+        // 키가 모자란 행·가드 없는 행은 머리줄만 — 강한 문장도 한정 문장도 찍히지 않는다.
+        let weak = vec![
+            json!({"role": "x", "usage": {"ctx_pct": null}, "status": null, "ctx_guard": {"phase": "free"}}),
+            json!({"role": "y", "usage": {"ctx_pct": null}, "status": null}),
+        ];
+        let out3 = ctx_footer_lines(&weak);
+        assert_eq!(out3, vec!["CTX '-' = no current usable context value.".to_string()]);
+    }
+
+    /// ★각주는 ASCII 전용이다 — 윈도우 콘솔 코드페이지에서 깨지면 사람이 읽을 수 없다(설계 Windows 줄).
+    #[test]
+    fn ctx_footer_lines_are_ascii_only() {
+        use serde_json::json;
+        let rows = vec![
+            json!({"role": "reviewer-gemini", "usage": {"ctx_pct": null}, "status": null,
+                   "ctx_guard": {"phase": "free", "fire_id": null, "level_pct": null, "self_report_level_pct": null}}),
+            json!({"role": "worker-11", "usage": {"ctx_pct": null}, "status": null,
+                   "ctx_guard": {"phase": "measuring", "fire_id": "f1", "level_pct": 64, "self_report_level_pct": null}}),
+        ];
+        let out = ctx_footer_lines(&rows);
+        assert!(!out.is_empty());
+        for l in &out {
+            assert!(l.is_ascii(), "footer line is not ASCII: {l}");
+        }
+    }
+
+    /// ★★변이 대조(설계 R3 §1.3 이 **명시적으로 요구한 음성 시험**): 키 존재 확인을 `serde_json` 색인으로
+    /// 바꾸면 "키가 모자란 가드" 행이 "비어 있는 가드" 로 읽혀 거짓 문장이 찍힌다. 그 변이를 여기서
+    /// **모형으로 재현**해, 색인 판정이 실제로 ③ 을 ① 로 뒤집는다는 것을 보인다 — 즉 위 시험의 ③ 이
+    /// 장식이 아니라 이 결함을 막고 있음을 증명한다.
+    #[test]
+    fn indexing_instead_of_presence_check_would_misread_an_incomplete_guard() {
+        use serde_json::json;
+        let incomplete = json!({"role": "x", "usage": {"ctx_pct": null}, "status": null,
+            "ctx_guard": {"phase": "free"}});
+        // 진짜 구현(키 존재 확인) — 말하지 않는다.
+        assert_eq!(ctx_footer_class(&incomplete), CtxFooterClass::Unstated);
+        // 변이 모형(색인만): serde_json 은 없는 키를 **정적 Null** 로 돌려준다.
+        let g = &incomplete["ctx_guard"];
+        assert!(g["fire_id"].is_null(), "serde_json 색인은 부재 키를 Null 로 돌려준다");
+        assert!(g["level_pct"].is_null());
+        assert!(g["self_report_level_pct"].is_null());
+        let mutant_free_empty = g["phase"].as_str() == Some("free")
+            && g["fire_id"].is_null()
+            && g["level_pct"].is_null()
+            && g["self_report_level_pct"].is_null();
+        // ⇒ 색인 판정은 ③ 을 "free-empty" 로 읽는다. 이것이 막아야 하는 거짓이다.
+        assert!(
+            mutant_free_empty,
+            "색인 판정이 불완전 가드를 free-empty 로 읽지 않는다면 이 변이 모형이 낡았다 — 다시 재라"
+        );
+        // 두 판정이 **갈린다**는 것이 이 시험의 요지다.
+        assert_ne!(
+            mutant_free_empty,
+            ctx_footer_class(&incomplete) == CtxFooterClass::NoThresholdInput
+        );
     }
 
     /// ★WP6-1 소스 대조 핀: CTX 칸 산출은 팩의 정본 선택기(`pick_ctx`)와 같은 규칙을 **헬퍼 하나**로
