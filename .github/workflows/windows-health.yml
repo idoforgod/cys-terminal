@@ -1238,6 +1238,10 @@ jobs:
           CYS_PACK_DIR="$(mktemp -d)" RUST_MIN_STACK=8388608 cargo test --bin cys aid_s5_cli_tests:: -- --test-threads=1
           CYS_PACK_DIR="$(mktemp -d)" python cysjavis-pack/bin/tests/test_phoenix_c6_due.py
           CYS_PACK_DIR="$(mktemp -d)" python cysjavis-pack/bin/tests/test_reap_exited_matrix.py
+          # P4 C-14 (B-490): how many skillscan workers outlive the 20 s preflight deadline.
+          # This is the only lane that measures the Windows arm - the product does not re-measure
+          # there, so the specimen counts for itself and prints C-14-REPORT.
+          CYS_PACK_DIR="$(mktemp -d)" python cysjavis-pack/bin/tests/test_skillscan_orphan_horizon.py
 
       # S2: shipped observer and Windows refusal mapping; native spawn evidence
       # remains separate. Full cysd is nonblocking, so this cell must be blocking.
