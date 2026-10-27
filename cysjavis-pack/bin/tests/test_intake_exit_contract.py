@@ -1026,15 +1026,61 @@ class P5NIntegrity(Rig):
                 self.rc(0,self.run_tool(*argv),'pinned v1 search-only ancestor')
             self.rc(0,self.run_tool(*argv),'new pay search-only ancestor')
             self.assertEqual(self.m._sync_dir(os.path.dirname(self.ledger_path('N'))),'SYNC_OK')
+            forbidden={self.tmp,self.pack,os.path.join(self.pack,'round')}
+            real_open=os.open; opened=[]
+            def op(p,*args,**kwargs):
+                opened.append(p)
+                self.assertNotIn(p,forbidden,'pre-existing ancestor opened')
+                return real_open(p,*args,**kwargs)
+            with mock.patch.object(self.m.os,'open',side_effect=op):
+                self.assertEqual(self.m.cmd_pay(self.args),0)
+            self.assertIn(os.path.dirname(self.ledger_path('N')),opened)
         finally:
             os.chmod(self.tmp, 0o700)
+
+    def test_p5n_precommit_directory_trail_s3p_s3_s6(self):
+        path=self.ledger_path('N'); d=os.path.dirname(path); backup=os.path.join(d,'.preimage')
+        events=[]; make=self.m._make_dirs; replace=os.replace
+        def mkdir(p):
+            events.append(('mkdir',p)); return make(p)
+        def publish(src,dst):
+            events.append(('replace','ledger' if dst==path else 'preimage')); return replace(src,dst)
+        with mock.patch.object(self.m,'_make_dirs',side_effect=mkdir), \
+                mock.patch.object(self.m,'_sync_dir',side_effect=lambda p:(events.append(('sync',p)) or 'SYNC_OK')), \
+                mock.patch.object(self.m.os,'replace',side_effect=publish):
+            self.assertEqual(self.m._write_atomic(path,self.load_ledger('N')),0)
+        self.assertEqual(events,[('mkdir',d),('sync',d),('mkdir',backup),('sync',d),
+                                 ('replace','preimage'),('sync',backup),('replace','ledger'),('sync',d)])
+
+    def test_p5n_s3p_failure_precedes_preimage_creation(self):
+        before=self.bytes(); backup=os.path.join(os.path.dirname(self.ledger_path('N')),'.preimage')
+        with mock.patch.object(self.m,'_sync_dir',return_value='SYNC_FAILED'):
+            self.assertEqual(self.m._write_atomic(self.ledger_path('N'),dict(self.load_ledger('N'),marker='new')),11)
+        self.assertEqual(self.bytes(),before)
+        self.assertFalse(os.path.exists(backup),'S3P must precede preimage directory creation')
+
+    def test_p5n_s6_failure_and_permission_denial(self):
+        path=self.ledger_path('N'); backup=os.path.join(os.path.dirname(path),'.preimage')
+        before=self.bytes(); real_sync=self.m._sync_dir
+        with mock.patch.object(self.m,'_sync_dir',side_effect=lambda d:'SYNC_FAILED' if d==backup else real_sync(d)):
+            self.assertEqual(self.m._write_atomic(path,dict(self.load_ledger('N'),marker='failed')),11)
+        self.assertEqual(self.bytes(),before)
+        real_open=os.open; denied=[]
+        def op(p,*args,**kwargs):
+            if p==backup:
+                denied.append(p); raise PermissionError(13,'S6 denied')
+            return real_open(p,*args,**kwargs)
+        with mock.patch.object(self.m.os,'open',side_effect=op):
+            self.assertEqual(self.m._write_atomic(path,dict(self.load_ledger('N'),marker='unverified')),13)
+        self.assertEqual(denied,[backup])
+        self.assertEqual(self.load_ledger('N')['marker'],'unverified')
 
     def test_p5n_atomic_write_syncs_and_retains_preimage(self):
         path = self.ledger_path('N'); before = self.bytes()
         with mock.patch.object(self.m.os, 'fsync', wraps=os.fsync) as fsync:
             rc = self.m._write_atomic(path, self.load_ledger('N'))
             self.assertEqual(rc, 0)
-            self.assertEqual(fsync.call_count, 3)
+            self.assertEqual(fsync.call_count, 6)
         backups = os.listdir(os.path.join(os.path.dirname(path), '.preimage'))
         self.assertEqual(len(backups), 1)
         with open(os.path.join(os.path.dirname(path), '.preimage', backups[0]), 'rb') as f:
@@ -1046,7 +1092,7 @@ class P5NIntegrity(Rig):
         original = self.bytes()
         candidate = self.load_ledger('N'); candidate['test_marker'] = 'new'
         for mode, expected, committed in [('ok',0,True),('early-unsupported',13,True),
-                                         ('first-sync-fail',12,True),
+                                         ('first-sync-fail',11,False),
                                          ('final-fail',12,True),('final-unsupported',13,True),
                                          ('windows',0,True)]:
             with self.subTest(mode=mode):
@@ -1060,7 +1106,6 @@ class P5NIntegrity(Rig):
                     seen.append(d)
                     if mode == 'windows': return 'SYNC_NONPOSIX'
                     if mode == 'early-unsupported' and len(seen)==1: return 'SYNC_UNSUPPORTED'
-                    self.assertTrue(published[0], 'directory sync before ledger commit')
                     if mode=='first-sync-fail' and len(seen)==1: return 'SYNC_FAILED'
                     if published[0]:
                         if mode=='final-fail': return 'SYNC_FAILED'
@@ -1124,7 +1169,8 @@ class P5NIntegrity(Rig):
                 mock.patch.object(self.m.os,'replace',side_effect=publish):
             self.assertEqual(self.m._write_atomic(path,{'items':[]}),0)
         before=next(seen for dst,seen in observed if dst==path)
-        self.assertEqual(before, [], 'directory sync must follow commit')
+        self.assertEqual(set(before), {self.tmp, os.path.join(self.tmp,'fresh'),
+                                      os.path.join(self.tmp,'fresh','round'), os.path.dirname(path)})
         self.assertEqual(set(synced), {self.tmp, os.path.join(self.tmp,'fresh'),
                                       os.path.join(self.tmp,'fresh','round'), os.path.dirname(path)})
         self.assertFalse(os.path.exists(os.path.join(os.path.dirname(path),'.preimage')))
@@ -1132,13 +1178,13 @@ class P5NIntegrity(Rig):
         target = os.path.join(root,'round','_intake','L.json'); synced = []
         args = type('OpenArgs',(),dict(root=root,id='L',instruction_file=self.instr,item=['new'],source='owner'))()
         def after_commit(d):
-            self.assertTrue(os.path.isfile(target), 'fresh-open parent sync before commit')
-            synced.append(d)
+            synced.append((d,os.path.isfile(target)))
             return 'SYNC_OK'
         with mock.patch.object(self.m,'_sync_dir',side_effect=after_commit), \
                 mock.patch.object(self.m,'_seat',return_value=('fixture','1',False)):
             self.assertEqual(self.m.cmd_open(args),1)
-        self.assertEqual(set(synced),{self.tmp,root,os.path.join(root,'round'),os.path.dirname(target)})
+        self.assertEqual(set(synced[:-1]),{(p,False) for p in (self.tmp,root,os.path.join(root,'round'),os.path.dirname(target))})
+        self.assertEqual(synced[-1],(os.path.dirname(target),True))
 
     def test_p5n_directory_outcomes_after_commit_are_not_precommit_failures(self):
         path = self.ledger_path('N'); base = self.load_ledger('N')
@@ -1164,17 +1210,21 @@ class P5NIntegrity(Rig):
                     self.assertTrue(published[0])
                     self.assertEqual(self.load_ledger('N')['changed'],[operation,eno])
 
-        # An early post-commit outcome remains visible after later successes.
-        for first, expected in (('SYNC_UNSUPPORTED',13),('SYNC_FAILED',12)):
+        # Early unverified outcomes survive S10 success; failed precommit sync aborts.
+        for first, expected in (('SYNC_UNSUPPORTED',13),('SYNC_FAILED',11)):
             fresh = os.path.join(self.tmp,first,'nested','L.json')
             seen = []
             def outcome(d):
-                self.assertTrue(os.path.isfile(fresh))
-                seen.append(d)
+                seen.append((d,os.path.isfile(fresh)))
                 return first if len(seen)==1 else 'SYNC_OK'
             with mock.patch.object(self.m,'_sync_dir',side_effect=outcome):
                 self.assertEqual(self.m._write_atomic(fresh,{'items':[]}),expected)
-            self.assertGreater(len(seen),1)
+            if first=='SYNC_UNSUPPORTED':
+                self.assertGreater(len(seen),1)
+                self.assertTrue(os.path.isfile(fresh))
+            else:
+                self.assertEqual(len(seen),1)
+                self.assertFalse(os.path.exists(fresh))
 
     def test_p5n_isolated_import_does_not_write_sibling_bytecode(self):
         bundle = os.path.join(self.tmp, 'bundle')

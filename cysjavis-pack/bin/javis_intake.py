@@ -272,6 +272,8 @@ def _write_atomic(path, obj, prior=_AUTO_PRIOR, created_dirs=()):
     def sync(d):
         outcome = _sync_dir(d)
         trail.append((d, outcome))
+        if outcome == SYNC_FAILED and not committed:
+            raise OSError('directory sync failed before commit: '+d)
     def temp_bytes(d, prefix, body):
         fd, tmp = tempfile.mkstemp(dir=d, prefix=prefix)
         leftovers.append(tmp)
@@ -290,9 +292,13 @@ def _write_atomic(path, obj, prior=_AUTO_PRIOR, created_dirs=()):
         # Only this call's new directory entries need parent syncs. Pre-existing
         # ancestors may be search-only and are not prerequisites for publication.
         created = list(created_dirs) + _make_dirs(d)
+        for parent in sorted({os.path.dirname(x) for x in created} - {d}):
+            sync(parent)
+        sync(d)  # S3P: establish our ledger directory before any publication.
         if prior is not None:
             backup_dir = os.path.join(d, '.preimage')
-            created.extend(_make_dirs(backup_dir))
+            _make_dirs(backup_dir)
+            sync(d)  # S3: publish the preimage directory's entry first.
             stamp = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
             base = os.path.join(backup_dir, '%s.%s-%d' % (os.path.basename(path), stamp, os.getpid()))
             backup = None
@@ -311,6 +317,7 @@ def _write_atomic(path, obj, prior=_AUTO_PRIOR, created_dirs=()):
             tmp = temp_bytes(backup_dir, '.preimage-', prior)
             os.replace(tmp, backup)
             leftovers.remove(tmp)
+            sync(backup_dir)  # S6: preimage entry before ledger replacement.
             with open(backup, 'rb') as f:
                 if _digest(f.read()) != _digest(prior):
                     raise OSError('preimage mismatch; ledger untouched')
@@ -319,10 +326,7 @@ def _write_atomic(path, obj, prior=_AUTO_PRIOR, created_dirs=()):
         os.replace(tmp, path)
         leftovers.remove(tmp)
         committed = True
-        # Directory durability is an outcome of the committed write, never rc11.
-        targets = {d} | {os.path.dirname(x) for x in created}
-        for target in sorted(targets):
-            sync(target)
+        sync(d)  # S10: failures here describe the already committed ledger.
     except (OSError, ValueError, TypeError) as exc:
         rc = EXIT_COMMITTED_UNCONFIRMED if committed else EXIT_NOT_COMMITTED
         print('%s: %s; owned temporary paths=%s; preimage=%s; sync=%s' % (_tag(rc), exc, leftovers, backup, trail), file=sys.stderr)
