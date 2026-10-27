@@ -2933,13 +2933,16 @@ pub fn plan_install(
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
+    // ★판정 좁힘의 입력 — 루프 밖에서 한 번만 읽는다(파일마다 읽으면 474회 IO 가 된다).
+    let pending_now = load_merge_pending(dir);
     for (rel, content) in items.iter().copied() {
         let path = dir.join(rel);
         let exists = path.exists();
         let disk = if exists { std::fs::read_to_string(&path).ok() } else { None };
         let mh_raw = manifest.get(rel).map(String::as_str);
         // ★C-07(0.14.55 · P3): 분류 **직전** 낡은 항목 판정. decide_file_action 의 arm 은 무변경.
-        let stale = classify_stale_entry(dir, rel, scope, disk.as_deref(), mh_raw);
+        let stale =
+            classify_stale_entry(dir, rel, scope, disk.as_deref(), mh_raw, pending_now.contains_key(rel));
         let repaired = match &stale {
             StaleEntry::Repaired(h) => Some(h.clone()),
             _ => None,
@@ -3315,6 +3318,7 @@ pub fn classify_stale_entry(
     scope: PackScope,
     disk: Option<&str>,
     manifest_hash: Option<&str>,
+    has_pending_entry: bool,
 ) -> StaleEntry {
     // ★조상 해시는 **낡음 판정의 가드**다(이관된 pristine-Merge3 확장과 다르다): 항목이 조상과
     //   같으면 그 항목은 낡은 것이 아니라 **정상적인 드리프트/병합 상태의 기준선**이다.
@@ -3330,6 +3334,7 @@ pub fn classify_stale_entry(
         manifest_hash,
         pristine_hash.as_deref(),
         crate::pack_prev_vendor::prev_vendor_hashes(rel),
+        has_pending_entry,
     )
 }
 
@@ -3345,6 +3350,7 @@ pub fn classify_stale_entry_with(
     manifest_hash: Option<&str>,
     pristine_hash: Option<&str>,
     known: &[&str],
+    has_pending_entry: bool,
 ) -> StaleEntry {
     if ownership_scoped(rel, scope) != Ownership::System {
         return StaleEntry::Normal;
@@ -3360,11 +3366,20 @@ pub fn classify_stale_entry_with(
     if pristine_hash == Some(mh) {
         return StaleEntry::Normal;
     }
-    if known.is_empty() {
-        return StaleEntry::KeepInPlace("no-row");
-    }
     if known.contains(&dh.as_str()) {
         return StaleEntry::Repaired(dh);
+    }
+    // ★판정 승인(HEAD-RULING-P3-IMPL-C07-NARROW.md `9c1f081bab6f4c08`, 항목 1-2):
+    //   제자리 보존은 **둘이 함께** 성립할 때만이다 — 디스크 해시가 표에 없고 **그리고** 그 경로에
+    //   **병합 대기 원장 항목이 없다**. 항목이 있으면 디스크 바이트의 출처는 '불명'이 아니라
+    //   **그 병합**이므로, pinned 크래시 창 수렴(치유 + 병합본 `.user` 보존)이 9dbea792 그대로 돈다.
+    //   이 좁힘이 없으면 같은 상태 서명을 공유하는 merge3 크래시 창 복구 장치가 제거된다
+    //   (치명위험 ③ 자가치유 전멸 · 실측 검체 merge3_crash_windows_converge [W3]).
+    if has_pending_entry {
+        return StaleEntry::Normal;
+    }
+    if known.is_empty() {
+        return StaleEntry::KeepInPlace("no-row");
     }
     StaleEntry::KeepInPlace("unknown-disk")
 }
@@ -4065,7 +4080,14 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
         let unreadable = exists && disk.is_none();
         let mhash_raw: Option<String> = manifest.get(rel).cloned();
         // ★C-07: 분류 직전 판정 — 기준선 수리 또는 제자리 보존.
-        let stale = classify_stale_entry(&dir, rel, scope, disk.as_deref(), mhash_raw.as_deref());
+        let stale = classify_stale_entry(
+            &dir,
+            rel,
+            scope,
+            disk.as_deref(),
+            mhash_raw.as_deref(),
+            pending.contains_key(rel),
+        );
         let mhash: Option<String> = match &stale {
             StaleEntry::Repaired(h) => {
                 // 기준선을 **디스크에 실제로 있는 과거 릴리스 해시**로 수리한다 — 그러면 Arm 2 가
@@ -5129,23 +5151,25 @@ mod tests {
 
         // 1) system 아님 → Normal (user 파일은 이 판정의 대상이 아니다)
         assert_eq!(
-            classify_stale_entry_with(userrel, PackScope::Base, Some("x"), Some(&stale), None, &table),
+            classify_stale_entry_with(
+                userrel, PackScope::Base, Some("x"), Some(&stale), None, &table, false
+            ),
             StaleEntry::Normal
         );
         // 2) 매니페스트 항목 부재 → Normal (레거시 경로 거동 불변)
         assert_eq!(
-            classify_stale_entry_with(sysrel, PackScope::Base, Some("x"), None, None, &table),
+            classify_stale_entry_with(sysrel, PackScope::Base, Some("x"), None, None, &table, false),
             StaleEntry::Normal
         );
         // 3) 항목이 디스크와 일치 → Normal (건전)
         let dh = content_hash("x");
         assert_eq!(
-            classify_stale_entry_with(sysrel, PackScope::Base, Some("x"), Some(&dh), None, &table),
+            classify_stale_entry_with(sysrel, PackScope::Base, Some("x"), Some(&dh), None, &table, false),
             StaleEntry::Normal
         );
         // 4) 표에 행이 없음 → KeepInPlace("no-row")
         assert_eq!(
-            classify_stale_entry_with(sysrel, PackScope::Base, Some("x"), Some(&stale), None, &[]),
+            classify_stale_entry_with(sysrel, PackScope::Base, Some("x"), Some(&stale), None, &[], false),
             StaleEntry::KeepInPlace("no-row")
         );
         // 5) ★디스크가 표에 있는 과거 릴리스 본 → Repaired(디스크 해시)
@@ -5156,7 +5180,8 @@ mod tests {
                 Some(prev_vendor),
                 Some(&stale),
                 None,
-                &table
+                &table,
+                false
             ),
             StaleEntry::Repaired(hp.clone())
         );
@@ -5168,9 +5193,31 @@ mod tests {
                 Some("the operator wrote this\n"),
                 Some(&stale),
                 None,
-                &table
+                &table,
+                false
             ),
             StaleEntry::KeepInPlace("unknown-disk")
+        );
+        // 7) ★판정 승인(C07-NARROW 항목 1-2): 같은 '출처 불명' 상태에 **병합 대기 원장 항목이 있으면**
+        //    디스크 출처는 그 병합이다 → Normal → pinned 크래시 창 수렴이 그대로 돈다.
+        assert_eq!(
+            classify_stale_entry_with(
+                sysrel,
+                PackScope::Base,
+                Some("the operator wrote this\n"),
+                Some(&stale),
+                None,
+                &table,
+                true
+            ),
+            StaleEntry::Normal,
+            "병합 대기 항목이 있으면 제자리 보존이 아니다(크래시 창 수렴 보존)"
+        );
+        // 8) 행이 없는 경로도 같다 — 항목이 있으면 Normal.
+        assert_eq!(
+            classify_stale_entry_with(sysrel, PackScope::Base, Some("x"), Some(&stale), None, &[], true),
+            StaleEntry::Normal,
+            "no-row + 병합 대기 항목 → Normal"
         );
     }
 
@@ -5232,53 +5279,80 @@ mod tests {
 
     /// ★H-08 의 기제: `write_atomic_mode` 는 mode 를 `open(2)` 인자로 넘겨 **umask 로 걸러지고**,
     /// `write_atomic_mode_exact` 는 tmp 디스크립터에 `fchmod` 로 적용해 **umask 와 무관**하다.
-    /// 이 검체가 9dbea792 에서 적색인 이유는 그 판에 `_exact` 가 없다는 것이고, 여기서 녹색인 이유는
-    /// 두 경로의 결과가 **같은 umask 아래에서 갈린다**는 실측이다.
+    ///
+    /// ★격리(판정 C07-NARROW 항목 4-a): umask 는 **프로세스 전역**이고 cargo 는 검체를 같은 프로세스의
+    /// 병렬 스레드로 돌린다 — 락으로는 그 락을 잡지 않는 검체를 막을 수 없다. 그래서 umask 창은
+    /// **자식 프로세스**에서만 열린다: 부모가 자기 테스트 바이너리를 `--exact` 로 재실행하고
+    /// (환경변수가 자식 분기를 고른다) 자식이 파일을 만든 뒤 종료하면, 부모가 그 파일의 mode 를
+    /// 단언한다. 단언은 약화되지 않았다 — 두 umask 에서 정확히 같은 것을 본다.
     #[cfg(unix)]
     #[test]
     fn h08_exact_writer_is_umask_independent_and_plain_writer_is_not() {
         use std::os::unix::fs::PermissionsExt;
-        // umask 는 프로세스 전역이라 다른 테스트와 겹치면 안 된다 — 기존 팩 테스트 락으로 직렬화한다.
-        let _g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        const MARKER: &str = "CYS_H08_UMASK_CHILD";
+        const SHEB: &[u8] = b"#!/usr/bin/env python3\n";
+        const UMASKS: [u32; 2] = [0o111, 0o077];
+
+        if let Ok(base) = std::env::var(MARKER) {
+            // ── 자식: umask 창은 이 프로세스에만 존재한다 ──
+            let base = std::path::PathBuf::from(base);
+            for um in UMASKS {
+                let prev = unsafe { libc::umask(um as libc::mode_t) };
+                let exact = base.join(format!("exact-{um:04o}"));
+                let plain = base.join(format!("plain-{um:04o}"));
+                let a = write_atomic_mode_exact(&exact, SHEB, Some(0o755));
+                let b = write_atomic_mode(&plain, SHEB, Some(0o755));
+                unsafe { libc::umask(prev) };
+                a.expect("exact 쓰기");
+                b.expect("plain 쓰기");
+            }
+            // mode=None 회귀 대조(exact 가 기본 거동을 바꾸지 않는다).
+            write_atomic_mode_exact(&base.join("none-exact"), b"x\n", None).expect("none exact");
+            write_atomic_mode(&base.join("none-plain"), b"x\n", None).expect("none plain");
+            return;
+        }
+
+        // ── 부모: 자식을 띄우고 자식이 만든 파일의 mode 를 단언한다 ──
         let base = std::env::temp_dir().join(format!("cys-h08-umask-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
-        // 디렉터리 자신의 실행비트는 umask 와 무관하게 세워 둔다(없으면 통과 불가 — 리그가 자기를 막는다).
+        // 디렉터리 실행비트는 자식의 umask 와 무관하게 세워 둔다(없으면 자식이 자기를 막는다).
         std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let sheb = b"#!/usr/bin/env python3\n";
-        for um in [0o111u32, 0o077u32] {
-            let prev = unsafe { libc::umask(um as libc::mode_t) };
-            let exact = base.join(format!("exact-{um:04o}"));
-            let plain = base.join(format!("plain-{um:04o}"));
-            let r1 = write_atomic_mode_exact(&exact, sheb, Some(0o755));
-            let r2 = write_atomic_mode(&plain, sheb, Some(0o755));
-            unsafe { libc::umask(prev) };
-            r1.unwrap();
-            r2.unwrap();
-            let m_exact = std::fs::metadata(&exact).unwrap().permissions().mode() & 0o7777;
-            let m_plain = std::fs::metadata(&plain).unwrap().permissions().mode() & 0o7777;
+        let exe = std::env::current_exe().expect("test 바이너리 경로");
+        let st = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "pack::tests::h08_exact_writer_is_umask_independent_and_plain_writer_is_not",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(MARKER, &base)
+            .status()
+            .expect("자식 테스트 프로세스 기동");
+        assert!(st.success(), "자식 프로세스가 실패했다: {st:?}");
+
+        let mode_of = |p: &std::path::Path| {
+            std::fs::metadata(p).unwrap().permissions().mode() & 0o7777
+        };
+        for um in UMASKS {
+            let m_exact = mode_of(&base.join(format!("exact-{um:04o}")));
+            let m_plain = mode_of(&base.join(format!("plain-{um:04o}")));
             assert_eq!(
                 m_exact, 0o755,
                 "umask {um:04o}: exact 판은 요청 mode 를 그대로 세워야 한다 — 실측 {m_exact:04o}"
             );
-            assert_ne!(
-                m_plain, 0o755,
-                "umask {um:04o}: 평문 판은 umask 로 걸러져야 한다(기제 대조) — 실측 {m_plain:04o}"
-            );
             assert_eq!(
                 m_plain,
                 0o755 & !um,
-                "umask {um:04o}: 평문 판의 결과는 정확히 m & !umask 다"
+                "umask {um:04o}: 평문 판의 결과는 정확히 m & !umask 다(기제 대조) — 실측 {m_plain:04o}"
             );
+            assert_ne!(m_plain, 0o755, "umask {um:04o}: 평문 판이 걸러지지 않았다면 대조가 성립하지 않는다");
         }
-        // mode=None 이면 두 경로는 같아야 한다(회귀 방지 — exact 가 기본 거동을 바꾸지 않는다).
-        let a = base.join("none-exact");
-        let b = base.join("none-plain");
-        write_atomic_mode_exact(&a, b"x\n", None).unwrap();
-        write_atomic_mode(&b, b"x\n", None).unwrap();
-        let ma = std::fs::metadata(&a).unwrap().permissions().mode() & 0o7777;
-        let mb = std::fs::metadata(&b).unwrap().permissions().mode() & 0o7777;
-        assert_eq!(ma, mb, "mode=None 에서는 두 경로가 동일해야 한다");
+        assert_eq!(
+            mode_of(&base.join("none-exact")),
+            mode_of(&base.join("none-plain")),
+            "mode=None 에서는 두 경로가 동일해야 한다(회귀 방지)"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
