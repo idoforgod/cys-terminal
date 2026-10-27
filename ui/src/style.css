@@ -423,6 +423,10 @@ body.ws-reordering { cursor: grabbing; -webkit-user-select: none; user-select: n
 .pane .pane-usage { display: flex; gap: 4px; color: #6e7681; font-variant-numeric: tabular-nums; }
 .pane .pane-usage .warn { color: #d29922; }
 .pane .pane-usage .crit { color: #f85149; font-weight: 600; }
+/* ★D1-R2(C-30): 실측값 없음 칸 — 중립 회색 고정. 임계 색(warn/crit)을 **절대** 타지 않는다.
+   .pane-usage 본문 색과 같은 값을 명시해 둔다: 나중에 본문 색이 바뀌어도 이 칸이 경보색으로
+   끌려가지 않게 하는 것이 이 한 줄의 목적이다. */
+.pane .pane-usage .unmeasured { color: #6e7681; font-weight: 400; }
 .pane .pane-usage.stale { opacity: .45; }
 
 /* ───────── T6 Control Center (전용 풀 패널 — 외장 Streamlit 대시보드의 네이티브 이식) ───────── */

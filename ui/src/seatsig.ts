@@ -146,6 +146,13 @@ export type WsSigSummary = {
   idleN: number;
   /** 신선한 산 좌석의 최대 CTX%(없으면 0 — 60% 미만은 표기하지 않는다) */
   worst: number;
+  /**
+   * ★D4(P11 / C-30) 신선한 산 좌석 중 **현재 쓸 수 있는 CTX 값이 없는** 좌석 수.
+   * 점 색·`worst` 에는 영향을 주지 않는다 — 툴팁 한 줄로만 드러난다(경보 피로 금지).
+   * 이 집계가 아는 것은 **값의 유무**뿐이다: 가드·보호에 대해서는 아무 말도 하지 않는다.
+   */
+  ctxUnmeasuredN: number;
+  ctxUnmeasuredRoles: string[];
   /** 이 작업공간 신호 중 가장 최근 수신 시각(낡은 것 포함) · 한 번도 없으면 null */
   lastOkAt: number | null;
   /** 사람용 툴팁(왜 이 색인가) */
@@ -179,6 +186,9 @@ export function summarizeWsSigs(
   const hollowRoles = hollow.map((s) => String(s.role ?? "?"));
   const unreg = live.filter((s) => s.unregistered === true);
   const unregRoles = unreg.map((s) => String(s.role ?? "?"));
+  // ★D4: 빈 자리(hollow)는 `live` 에서 이미 빠져 있다 — 동결된 null 을 "지금 못 재는 좌석"으로 세지 않는다.
+  const ctxUnmeasured = live.filter((s) => typeof s.ctx_pct !== "number");
+  const ctxUnmeasuredRoles = ctxUnmeasured.map((s) => String(s.role ?? "?"));
 
   let dot: WsDot;
   if (fresh.length === 0) dot = "unknown";
@@ -209,6 +219,11 @@ export function summarizeWsSigs(
       lines.push(
         `· 미등록 ${unreg.length}: ${unregRoles.join(", ")} — 등록 에이전트가 없고 셸 아래 프로세스도 보이지 않아 빈 자리인지 판정하지 않습니다(명령을 직접 띄운 pane 이면 정상)`,
       );
+    // ★D4(C-30): 값이 없다는 사실을 **툴팁에만** 적는다. 점 색은 위에서 이미 정해졌고 바뀌지 않는다.
+    if (ctxUnmeasured.length)
+      lines.push(
+        `CTX 현재값 없음 ${ctxUnmeasured.length}: ${ctxUnmeasuredRoles.join(", ")} — 이 좌석들에는 지금 쓸 수 있는 컨텍스트 값이 없습니다`,
+      );
   }
   return {
     dot,
@@ -222,6 +237,8 @@ export function summarizeWsSigs(
     dead,
     idleN,
     worst,
+    ctxUnmeasuredN: ctxUnmeasured.length,
+    ctxUnmeasuredRoles,
     lastOkAt,
     title: lines.join("\n"),
   };
@@ -250,6 +267,8 @@ export function summarizeWsSigsSafe(
       dead: 0,
       idleN: 0,
       worst: 0,
+      ctxUnmeasuredN: 0,
+      ctxUnmeasuredRoles: [],
       lastOkAt: null,
       title: "상태 미확인 — 신호 집계 실패",
     };
@@ -269,6 +288,9 @@ export function wsSubBits(s: WsSigSummary, firstTitle: string): string[] {
     return bits;
   }
   if (s.worst >= 60) bits.push(`CTX ${s.worst}%`);
+  // ★D4(C-30): 값 없음은 수치 칸과 **다른 줄**로 적는다 — 0% 로도, 경보색으로도 접지 않는다.
+  if (s.ctxUnmeasuredN)
+    bits.push(`CTX 현재값 없음 ${s.ctxUnmeasuredN}: ${s.ctxUnmeasuredRoles.join(", ")}`);
   if (s.idleN) bits.push(`💤${s.idleN}`);
   if (s.dead) bits.push(`❌${s.dead}`);
   if (s.hollowN) bits.push(`○빈자리 ${s.hollowN}`);

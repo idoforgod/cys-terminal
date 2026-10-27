@@ -488,3 +488,47 @@ describe("배선 핀 — main.ts", () => {
     expect(/\.cc-dot\.hollow\s*\{/.test(css)).toBe(true);
   });
 });
+
+// ── D4 (P11 / C-30): CTX 현재값 없음 좌석을 **세어서 툴팁에만** 적는다 ───────────────
+// ★점 색과 worst 는 바뀌지 않는다 — agy 좌석을 가진 작업공간이 영구히 "미확인"으로 물들면
+//   그것은 경보 피로이고, 설계가 명시적으로 금지한 방향이다.
+import { summarizeWsSigs as sumD4, wsSubBits as bitsD4 } from "./seatsig";
+
+const sigD4 = (over: Record<string, unknown> = {}) => ({
+  role: "reviewer-gemini", state: "working", ctx_pct: null as number | null,
+  idle_secs: 1, agent_alive: true, hollow: false, at: 1_000_000, ...over,
+}) as any;
+
+test("D4: 산 좌석의 ctx_pct 가 null 이면 센다(역할 이름과 함께)", () => {
+  const s = sumD4([sigD4(), sigD4({ role: "reviewer-gemini-2" }), sigD4({ role: "master", ctx_pct: 38 })], 1_000_000, 60_000);
+  expect(s.ctxUnmeasuredN).toBe(2);
+  expect(s.ctxUnmeasuredRoles).toEqual(["reviewer-gemini", "reviewer-gemini-2"]);
+});
+
+test("D4: 점 색과 worst 는 영향받지 않는다(경보 피로 금지)", () => {
+  const onlyNull = sumD4([sigD4(), sigD4({ role: "reviewer-gemini-2" })], 1_000_000, 60_000);
+  expect(onlyNull.dot).toBe("working");   // 종전과 같다
+  expect(onlyNull.worst).toBe(0);         // worst 의 뜻은 바뀌지 않는다
+  const withHot = sumD4([sigD4(), sigD4({ role: "master", ctx_pct: 64 })], 1_000_000, 60_000);
+  expect(withHot.worst).toBe(64);
+  expect(withHot.ctxUnmeasuredN).toBe(1);
+});
+
+test("D4: 빈 자리의 동결 null 은 세지 않는다(집계 제외 규칙 그대로)", () => {
+  const s = sumD4([sigD4({ hollow: true }), sigD4({ role: "master", ctx_pct: 38 })], 1_000_000, 60_000);
+  expect(s.ctxUnmeasuredN).toBe(0);
+});
+
+test("D4: 툴팁 한 줄로만 드러난다 — 'CTX 현재값 없음 N: <roles>'", () => {
+  const s = sumD4([sigD4(), sigD4({ role: "reviewer-gemini-2" })], 1_000_000, 60_000);
+  const bits = bitsD4(s, "");
+  expect(bits.some((b: string) => b === "CTX 현재값 없음 2: reviewer-gemini, reviewer-gemini-2")).toBe(true);
+  // 보호·가드 문장은 없다(이 집계는 값의 유무만 안다).
+  for (const w of ["보호", "protection", "가드", "guard"]) expect(bits.join(" ")).not.toContain(w);
+});
+
+test("D4: 세울 것이 없으면 줄을 만들지 않는다", () => {
+  const s = sumD4([sigD4({ role: "master", ctx_pct: 38 })], 1_000_000, 60_000);
+  expect(s.ctxUnmeasuredN).toBe(0);
+  expect(bitsD4(s, "").some((b: string) => b.startsWith("CTX 현재값 없음"))).toBe(false);
+});

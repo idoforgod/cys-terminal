@@ -156,6 +156,7 @@ import {
 } from "./trashconfirm";
 import { ccEffectiveZoom } from "./ccscale";
 import { pickCtx, isHotCtx } from "./ctxpick";
+import { badgeCtxPart, fleetCtxCell, barCtxNoValue } from "./ctxrender";
 import {
   SIG_STALE_MS,
   seatState,
@@ -536,8 +537,14 @@ function renderUsage(el: HTMLElement, u: ObservedUsage | null | undefined) {
     return;
   }
   const parts: { text: string; cls: string }[] = [];
-  if (u.ctx_pct !== null && u.ctx_pct !== undefined)
-    parts.push({ text: `CTX ${u.ctx_pct}%`, cls: sevClass(u.ctx_pct, 60, 80) });
+  // ★D1-R2(C-30): 실측값이 없는 좌석의 CTX 가 **조용히 사라지던** 자리다. 규칙은 ctxrender 한 벌이고
+  //   여기서는 그 결과를 그린다 — 값이 있으면 종전과 같은 임계 색(sevClass 동치), 없으면 중립 `CTX —`.
+  const ctxPart = badgeCtxPart(u);
+  let ctxTip: string | null = null;
+  if (ctxPart) {
+    parts.push({ text: ctxPart.text, cls: ctxPart.cls });
+    ctxTip = ctxPart.tip;
+  }
   for (const w of u.rate ?? [])
     parts.push({ text: `${w.label} ${Math.round(w.used_pct)}%`, cls: sevClass(w.used_pct, 70, 90) });
   if (!parts.length) {
@@ -551,6 +558,7 @@ function renderUsage(el: HTMLElement, u: ObservedUsage | null | undefined) {
     el.appendChild(s);
   });
   const tip: string[] = [`${u.agent} 사용량 (관측: ${u.source})`];
+  if (ctxTip) tip.push(ctxTip);
   if (u.ctx_tokens != null && u.ctx_window != null)
     tip.push(`context ${u.ctx_tokens.toLocaleString()} / ${u.ctx_window.toLocaleString()} tokens`);
   for (const w of u.rate ?? []) {
@@ -630,6 +638,17 @@ const CC_STATE: Record<string, { cls: string; label: string }> = {
 };
 const ccEsc = (s: string) =>
   s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]!);
+
+// ★D2-R2(C-30) — Tasks 막대의 "값 없음" 칸 한 벌. 값/문면은 ctxrender(순수·시험 대상)에서 오고,
+//   여기서는 HTML 로만 감싼다. 두 상태를 섞지 않는다: stale=`?` · none=`—`.
+function ctxBarNoValueHtml(src: "stale" | "none"): string {
+  const nv = barCtxNoValue(src);
+  return (
+    `<span class="cc-tbar" style="max-width:130px" title="${ccEsc(nv.title)}">` +
+    `<span class="cc-tbar-track"><span class="cc-tbar-fill" style="width:0%"></span></span>` +
+    `<span class="cc-tbar-pct" style="color:#94a3b8">${ccEsc(nv.value)}</span></span>`
+  );
+}
 const ccFmtTokens = (n: number) => (n >= 10000 ? `${(n / 10000).toFixed(1)}만` : n.toLocaleString());
 // 비용: $1 미만은 4자리(소액 가시), 이상은 2자리.
 const ccMoney = (v: number) => `$${v > 0 && v < 1 ? v.toFixed(4) : v.toFixed(2)}`;
@@ -1937,9 +1956,9 @@ function taskRow(s: any, deptKey: string): string {
   const ctx =
     ctxPct != null
       ? `<span class="cc-tbar" style="max-width:130px"${ctxEst ? ' title="노드 자기보고(추정)"' : ""}><span class="cc-tbar-track"><span class="cc-tbar-fill ${ctxPct >= 80 ? "crit" : ctxPct >= 60 ? "warn" : ""}" style="width:${Math.min(100, ctxPct)}%"></span></span><span class="cc-tbar-pct">${ctxEst ? "≈" : ""}${ctxPct}%</span></span>`
-      : ctxSrc === "stale"
-        ? `<span class="cc-tbar" style="max-width:130px" title="컨텍스트 판정 불가 — 좌석 종료/에이전트 사망(동결값) 또는 실측 없음 · 자기보고 낡음/나이 미상"><span class="cc-tbar-track"><span class="cc-tbar-fill" style="width:0%"></span></span><span class="cc-tbar-pct" style="color:#94a3b8">?</span></span>`
-        : "";
+      // ★D2-R2(C-30): `stale`(?) 과 `none`(—) 을 **갈라서** 그린다. 종전에 `none` 은 빈 칸이라
+      //   "문제 없음"과 구별되지 않았다. 문면은 ctxrender 한 벌에서 온다.
+      : ctxBarNoValueHtml(ctxSrc === "stale" ? "stale" : "none");
   const age = selfReport ? ccAge(st.age_secs ?? 0) : `idle ${s.idle_secs ?? 0}s`;
   const stale = selfReport && (st.age_secs ?? 0) > 120 ? " stale" : "";
   return (
@@ -2576,7 +2595,10 @@ function renderLiveBody(d: any, fleet: any[]) {
       const role = f.role ?? "?";
       const color = CC_ROLE_COLOR[role] ?? "#64748b";
       const st = CC_STATE[f.state] ?? CC_STATE.idle;
-      const ctx = f.usage?.ctx_pct != null ? `<span title="컨텍스트 사용률 — 모델 컨텍스트 창 대비">CTX ${f.usage.ctx_pct}%</span>` : "";
+      // ★D3-R3: 이 화면(control.dashboard)에는 status·exited·agent_alive 가 없다 — pickCtx 로 올리지
+      //   않고 실측값 유무만 말한다. 종전에는 null 이면 칸이 **빈 문자열**로 사라졌다(C-30).
+      const fc = fleetCtxCell(f);
+      const ctx = `<span title="${ccEsc(fc.title)}">${ccEsc(fc.text)}</span>`;
       return `<div class="cc-fleet-row" style="--rc:${color}"><span class="cc-fleet-name">${ccEsc(role)}</span><span class="cc-fleet-agent">${ccEsc(f.agent ?? "")}</span><span class="cc-fleet-ctx">${ctx}</span><span class="cc-dot ${st.cls}"></span><span class="cc-fleet-state">${st.label}</span></div>`;
     })
     .join("");
