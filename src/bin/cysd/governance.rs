@@ -25569,8 +25569,8 @@ mod tests {
             self.dead = deads.len();
             let now = now_epoch();
             let last = tracker.last_idle_alert.get(&self.role).copied().unwrap_or(0.0);
-            self.rows.push(format!(
-                "  틱{:>2} verdict={:<12} now={:.6} last={:.6} now-last={:+.6}                  shell_alive={:<5} exited={:<5} seat_cache={} idle누적={} deadman누적={}",
+            self.rows.push(Self::dump_line(&format!(
+                "틱{:>2} verdict={:<12} now={:.6} last={:.6} now-last={:+.6}                  shell_alive={:<5} exited={:<5} seat_cache={} idle누적={} deadman누적={}",
                 self.rows.len() + 1,
                 verdict,
                 now,
@@ -25581,26 +25581,195 @@ mod tests {
                 s.seat_cache.load(AtomicOrdering::Relaxed),
                 self.idle,
                 self.dead,
-            ));
+            )));
         }
-        /// 개수 단언을 이 함수로 감싼다 — ★어긋날 때만 덤프를 찍고, 그 다음 ★원래 단언이 패닉한다
-        /// (⇒ CI 의 패닉 메시지 모양은 ⛔바뀌지 않는다 · 덤프는 그 앞줄에 남는다).
+        /// 덤프 한 줄의 고정 머리 — ⛔두 칸 들여쓰기를 지우지 마라.
+        ///
+        /// `windows-health.yml` 의 `failures.py` 는 패닉 메시지를 **줄 머리**로 끝낸다
+        /// (`note: ` · `stack backtrace:` · `test result:` · `failures:` · `FAILED` · `ok` ·
+        /// `---- … ----` · `^test X … `). 두 칸 들여쓴 줄은 그 어느 것과도 겹치지 않는다.
+        const DUMP_LINE_PREFIX: &'static str = "  ";
+
+        /// 덤프 한 줄을 **인코딩**한다 — 접두 + 작은따옴표 제거.
+        ///
+        /// ★접두만으로는 부족하다(실측: `deadman_dump_rows_cannot_be_read_as_a_parser_terminator`
+        /// 가 처음 돌 때 이걸로 붉었다). 파서의 패닉-헤더 종결자 `SEEN` 은 **줄 머리에 고정돼
+        /// 있지 않다** — `thread '…' … panicked at ` 을 줄 **안 어디서나** 찾는다. 그래서 들여쓴
+        /// 줄도 그 꼴을 품으면 메시지를 끊는다. `role` 과 `verdict`(버스 payload 의 `axis`)는
+        /// 자유 문자열이라 그 꼴이 들어올 수 있다 ⇒ 작은따옴표를 비슷한 글자로 바꿔 `thread '…'`
+        /// 자체가 성립하지 못하게 한다. 내용과 무관한 **구조적** 인코딩이다.
+        fn dump_line(body: &str) -> String {
+            // ⛔파서의 현재 정규식(`thread '…' … panicked at `)에 **딱 맞춰** 인코딩하지 않는다 —
+            //   그 식이 조금만 느슨해져도 인코딩이 뚫린다. 더 넓은 쪽(그 꼴의 **어느 조각이든**)을
+            //   무해화한다: 작은따옴표와 `panicked at ` 두 토큰 모두.
+            format!(
+                "{}{}",
+                Self::DUMP_LINE_PREFIX,
+                body.replace('\'', "ʼ").replace("panicked at ", "panickedʼat ")
+            )
+        }
+
+        /// 덤프 머리글 — 패닉 메시지 안에 실리는 첫 줄(역시 인코딩한다).
+        fn dump_header(&self) -> String {
+            Self::dump_line(&format!(
+                "★D-R2-3 덤프(role={} · 틱 {}개) — 판별: 전 틱 shell_alive=true∧exited=false ⇒ 축 A(제품·벽시계) · \
+idle 이 멈춘 틱에서 exited=true∨shell_alive=false ⇒ 축 B(하네스·자식 사망)",
+                self.role,
+                self.rows.len()
+            ))
+        }
+
+        /// 패닉 메시지 본문 — **첫 줄은 `what` 그대로**(종전 모양 보존), 그 뒤에 덤프를 잇는다.
+        fn panic_message(&self, what: &str) -> String {
+            let mut s = String::from(what);
+            s.push('\n');
+            s.push_str(&self.dump_header());
+            for r in &self.rows {
+                s.push('\n');
+                s.push_str(r);
+            }
+            s
+        }
+
+        /// 개수 단언을 이 함수로 감싼다 — ★어긋날 때만 덤프를 찍고, 그 다음 ★원래 단언이 패닉한다.
+        ///
+        /// ★T-H06-B (0.14.55-P8) — 두 가지가 바뀌었다. **왜 안전한가를 여기 적어 둔다**(다음 사람이
+        /// 옛 주석만 보고 되돌리지 않도록):
+        ///
+        /// ⑴ **덤프를 `assert_eq!` 메시지 **안에도** 싣는다.** 종전에는 `println!` 로만 나갔고,
+        ///    `win-cysd-failures.json` 은 **패닉 메시지**만 모으므로 JSON 채널에서는 덤프가 보이지
+        ///    않았다. `failures.py` 는 패닉 **헤더**(`thread '…' panicked at <loc>:`)에서 위치를
+        ///    읽고 그 뒤 줄을 종결자가 나올 때까지 메시지로 모은다 ⇒ 메시지를 여러 줄로 늘려도
+        ///    수집 자체는 바뀌지 않는다(실측: 소비자 2곳 census · `r3/exp-failures-parser-r3/`).
+        ///    각 줄은 `DUMP_LINE_PREFIX` 로 종결자와 겹치지 않게 **인코딩**된다.
+        ///    ⛔`println!` 채널은 **지우지 않는다** — 원문 로그를 읽던 습관이 그대로 선다.
+        /// ⑵ **`#[track_caller]`** — 이것이 없으면 Rust 가 `expect` **안쪽**의 `assert_eq!` 위치를
+        ///    보고하므로, 이 파일의 `trace.expect(` 호출 6곳(3개 시험)이 **한 위치로 접힌다**
+        ///    ⇒ `win-cysd-failures.json` 의 `panics[].location` 이 이 가족 전체에서 상수가 된다.
+        ///    붙이면 호출 지점(=시험)이 다시 식별된다.
+        #[track_caller]
         fn expect(&self, got: usize, want: usize, what: &str) {
             if got != want {
-                println!(
-                    "★D-R2-3 덤프(role={} · 틱 {}개) — 판별: 전 틱 shell_alive=true∧exited=false ⇒ 축 A(제품·벽시계) · \
-idle 이 멈춘 틱에서 exited=true∨shell_alive=false ⇒ 축 B(하네스·자식 사망)",
-                    self.role,
-                    self.rows.len()
-                );
+                println!("{}", self.dump_header());
                 for r in &self.rows {
                     println!("{r}");
                 }
             }
-            assert_eq!(got, want, "{what}");
+            assert_eq!(got, want, "{}", self.panic_message(what));
         }
     }
 
+
+    /// ★T-H06-C (0.14.55-P8) — 중독 연쇄 금지의 **정적** 회귀 핀.
+    ///
+    /// `REAP_ENV_LOCK` 은 env 를 만지는 검체를 직렬화한다. 한 검체가 임계영역 안에서 패닉하면
+    /// 뮤텍스가 **중독**되고, 그 뒤 `.unwrap()` 으로 잡는 자리는 전부 연쇄 패닉한다 — 실패 한 건이
+    /// 그 뒤 검체 전부를 `PoisonError` 로 바꿔 **원인 검체를 로그에서 지운다**(이 패키지가 쫓는
+    /// Windows 적색 가족의 한 갈래). 핀의 관용형은 `unwrap_or_else(|e| e.into_inner())` 이고,
+    /// 이 검체는 그 관용형이 **전수** 지켜지는지를 소스에서 센다.
+    ///
+    /// ⛔계기가 자기 자신을 세지 않도록 금지 문자열을 **조각으로 조립**한다(이 검체의 본문에
+    /// 그 문자열이 통째로 있으면 늘 1건이 나온다).
+    #[test]
+    fn reap_env_lock_is_never_acquired_with_a_poisoning_unwrap() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/cysd");
+        let forbidden = format!("REAP_ENV_LOCK.lock().{}()", "unwr\u{61}p");
+        let tolerant = "REAP_ENV_LOCK.lock().unwrap_or_else(";
+        let mut scanned = 0usize;
+        let mut tolerant_sites = 0usize;
+        let mut bad: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(&root).expect("cysd 소스 디렉터리를 열 수 없다") {
+            let path = entry.expect("디렉터리 항목").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("소스를 읽을 수 없다");
+            scanned += 1;
+            tolerant_sites += text.matches(tolerant).count();
+            for (n, line) in text.lines().enumerate() {
+                if line.contains(&forbidden) {
+                    bad.push(format!("{}:{}", path.display(), n + 1));
+                }
+            }
+        }
+        // 계기가 실제로 무언가를 읽었는지부터 — 0 파일을 읽고 0건을 보고하면 측정이 아니다.
+        assert!(scanned >= 5, "cysd 소스를 {scanned}개밖에 읽지 못했다 — 경로가 틀렸다");
+        assert!(
+            tolerant_sites >= 3,
+            "관용형 획득 자리를 {tolerant_sites}곳밖에 찾지 못했다 — 양성 대조가 서지 않는다"
+        );
+        assert!(bad.is_empty(), "중독되는 획득이 남아 있다: {bad:?}");
+    }
+
+    /// ★T-H06-B 항목 2 (0.14.55-P8) — **덤프 생산자의 출력**이 `failures.py` 의 종결자로
+    /// 읽힐 수 없음을 기계로 지킨다. 표본을 하나 찍어 보는 것이 아니라, 모든 행이 공유하는
+    /// `DUMP_LINE_PREFIX` 가 **어떤 종결자 문자열을 뒤에 붙여도** 종결자가 아님을 단언한다
+    /// ⇒ 행 내용이 무엇이든 인코딩이 성립한다.
+    ///
+    /// 종결자 목록의 정본은 `.github/workflows/windows-health.yml` 안의 `failures.py` 이고,
+    /// 파이썬 쪽 짝은 `scripts/tests/test_h06_dump_survives_failures_parser.py` 다
+    /// (그쪽은 **실제 파서**를 돌려 ⑴원시 음성·⑶인코딩된 형태를 잰다).
+    #[test]
+    fn deadman_dump_rows_cannot_be_read_as_a_parser_terminator() {
+        // failures.py 가 패닉 메시지를 끝내는 줄의 전수 형태(그 파일의 `ends` 식과 1:1).
+        let terminators: Vec<String> = vec![
+            "note: ".to_string(),
+            "note: run with `RUST_BACKTRACE=1`".to_string(),
+            "stack backtrace:".to_string(),
+            "test result: FAILED. 1 passed".to_string(),
+            "failures:".to_string(),
+            "FAILED".to_string(),
+            "ok".to_string(),
+            "---- some::test stdout ----".to_string(),
+            "test some::test ... ok".to_string(),
+            "thread 'x' (1) panicked at src/bin/cysd/governance.rs:1:1:".to_string(),
+        ];
+        let is_terminator = |line: &str| -> bool {
+            line.starts_with("note: ")
+                || line.starts_with("stack backtrace:")
+                || line.starts_with("test result:")
+                || line == "failures:"
+                || line == "FAILED"
+                || line == "ok"
+                || (line.starts_with("---- ") && line.ends_with(" ----"))
+                || line.starts_with("test ") && line.contains(" ... ")
+                || line.contains("panicked at ")
+        };
+        // ⑴ 이 판정기는 실제로 붉어질 수 있다 — 종결자 원형은 전부 종결자로 읽혀야 한다.
+        for t in &terminators {
+            assert!(is_terminator(t), "종결자 원형이 종결자로 읽히지 않았다: {t:?}");
+        }
+        // ⑵ 접두를 붙이면 **어느 것도** 종결자가 아니다 ⇒ 행 내용과 무관한 인코딩.
+        for t in &terminators {
+            let encoded = DeadmanTickTrace::dump_line(t);
+            assert!(
+                !is_terminator(&encoded),
+                "접두를 붙인 뒤에도 종결자로 읽힌다 — 인코딩이 깨졌다: {encoded:?}"
+            );
+        }
+        // ⑶ 실제 생산자의 출력: 머리글과 각 행이 접두로 시작하고 종결자가 아니다.
+        let mut tr = DeadmanTickTrace::new("master");
+        tr.rows.push(DeadmanTickTrace::dump_line("틱 1 verdict=Idle"));
+        tr.rows.push(DeadmanTickTrace::dump_line("틱 2 verdict=(미발행)"));
+        // 자유 문자열에 파서의 헤더 꼴이 그대로 들어온 최악의 경우도 인코딩이 받아낸다.
+        tr.rows.push(DeadmanTickTrace::dump_line(
+            "틱 3 verdict=Dead:thread 'x' (1) panicked at a.rs:1:1:",
+        ));
+        let header = tr.dump_header();
+        assert!(header.starts_with(DeadmanTickTrace::DUMP_LINE_PREFIX), "머리글 접두 없음: {header:?}");
+        assert!(!is_terminator(&header), "머리글이 종결자로 읽힌다: {header:?}");
+        // ⑷ 패닉 메시지: 첫 줄은 `what` 그대로(종전 모양 보존), 나머지 줄은 전부 안전하다.
+        let msg = tr.panic_message("idles.len() 이 기대와 다르다");
+        let lines: Vec<&str> = msg.split('\n').collect();
+        assert_eq!(lines[0], "idles.len() 이 기대와 다르다", "첫 줄이 what 이 아니다");
+        assert_eq!(lines.len(), 1 + 1 + tr.rows.len(), "머리글+행 수가 맞지 않는다: {lines:?}");
+        for l in &lines[1..] {
+            assert!(
+                l.starts_with(DeadmanTickTrace::DUMP_LINE_PREFIX) && !is_terminator(l),
+                "덤프 줄이 파서를 끊는다: {l:?}"
+            );
+        }
+    }
 
     /// [핀1·결함 8 박제 — 순수 판정자 진리표] 침묵은 어떤 좌석 상태에서도 Idle 로만 사상되고
     /// DeadCandidate 가 될 수 없다. 실측 시나리오(임계 20s·침묵 21s의 살아있는 zsh) 그대로.
