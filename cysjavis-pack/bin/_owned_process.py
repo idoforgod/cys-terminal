@@ -277,6 +277,7 @@ def run_owned(cmd, timeout, grace=0.0, force=5.0, cancel=None, env=None, encodin
     eof = set(); frame = b''; done = None; ready = False; fault = None
     proc = None; writer = None; control_read = control_write = None; job = None
     timed_out = False; teardown = False; cleanup = 'unknown'; readers_started = False
+    teardown_permission = None
     cancel = cancel or CANCEL
     try:
         if os.name == 'posix' and signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL:
@@ -405,7 +406,12 @@ def run_owned(cmd, timeout, grace=0.0, force=5.0, cancel=None, env=None, encodin
             except ProcessLookupError:
                 teardown = True
             except Exception as exc:
-                fault = fault or ('tree teardown: ' + str(exc))
+                if os.name == 'posix' and isinstance(exc, OSError) and exc.errno == errno.EPERM:
+                    # EOF may have killed the retained leader before our kill.
+                    # Permission refusal is provisional, NEVER proof of absence.
+                    teardown_permission = 'tree teardown: ' + str(exc)
+                else:
+                    fault = fault or ('tree teardown: ' + str(exc))
                 if job is not None:
                     try:
                         job.close()  # kill-on-close fallback, still inside cleanup deadline
@@ -431,7 +437,7 @@ def run_owned(cmd, timeout, grace=0.0, force=5.0, cancel=None, env=None, encodin
                     fault = fault or 'extra terminal control bytes'
             if not expected_eof <= eof:
                 fault = fault or 'drain deadline'
-            if teardown and proc.returncode is not None:
+            if (teardown or teardown_permission is not None) and proc.returncode is not None:
                 if os.name == 'posix':
                     # Reaped group numbers have observation authority only. Give
                     # adopted zombies the remaining window to disappear; never
@@ -440,7 +446,10 @@ def run_owned(cmd, timeout, grace=0.0, force=5.0, cancel=None, env=None, encodin
                         try:
                             os.killpg(proc.pid, 0)
                         except ProcessLookupError:
-                            cleanup = 'verified_empty'
+                            if teardown_permission is None or (
+                                    done is not None and not fault and not timed_out
+                                    and not cancel.is_set() and expected_eof <= eof):
+                                cleanup = 'verified_empty'
                             break
                         except OSError as exc:
                             fault = fault or ('group observation: ' + str(exc))
@@ -450,6 +459,8 @@ def run_owned(cmd, timeout, grace=0.0, force=5.0, cancel=None, env=None, encodin
                         fault = fault or 'group absence not verified before cleanup deadline'
                 else:
                     cleanup = 'verified_empty'
+            if teardown_permission is not None and cleanup != 'verified_empty':
+                fault = (fault + '; ' if fault else '') + teardown_permission
         if job is not None:
             try:
                 job.close()

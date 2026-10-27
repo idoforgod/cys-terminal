@@ -72,8 +72,12 @@ class OwnershipRegression(unittest.TestCase):
         path = self.root / name
         limit = time.monotonic() + 5
         while time.monotonic() < limit:
-            if path.exists():
+            try:
                 pid = int(path.read_text())
+            except (FileNotFoundError, ValueError):
+                # Missing, empty or partial publication is not readiness.
+                pass
+            else:
                 self.extra.append(pid)
                 if os.name == 'nt':
                     import ctypes
@@ -113,7 +117,7 @@ class OwnershipRegression(unittest.TestCase):
     def test_checklist_abrupt_death_closes_descendant(self):
         marker = self.root / 'probe'
         probe = self.root / 'probe.py'
-        probe.write_text("import os,time\nfrom pathlib import Path\nPath(%r).write_text(str(os.getpid()))\ntime.sleep(30)\n" % str(marker))
+        probe.write_text("import os,time\nfrom pathlib import Path\n_marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(os.getpid()));__import__('os').replace(_tmp,_marker)\ntime.sleep(30)\n" % str(marker))
         p = self.start("import sys\nsys.path.insert(0,%r)\nimport javis_checklist as c\nc.run_preflight([sys.executable,'-B',%r],timeout=20)\n" % (str(BIN), str(probe)))
         pid = self.marker('probe')
         p.kill(); p.wait(timeout=3)
@@ -123,7 +127,7 @@ class OwnershipRegression(unittest.TestCase):
     def test_preflight_abrupt_death_closes_scanner(self):
         marker = self.root / 'scan'
         scan = self.root / 'scan.py'
-        scan.write_text("import os,time,sys\nfrom pathlib import Path\nsys.path.insert(0,%r)\ndef main():\n Path(%r).write_text(str(os.getpid()))\n time.sleep(30)\ntry:\n from _owned_process import managed_main\nexcept ImportError:\n main()\nelse:\n managed_main(main)\n" % (str(BIN), str(marker)))
+        scan.write_text("import os,time,sys\nfrom pathlib import Path\nsys.path.insert(0,%r)\ndef main():\n _marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(os.getpid()));__import__('os').replace(_tmp,_marker)\n time.sleep(30)\ntry:\n from _owned_process import managed_main\nexcept ImportError:\n main()\nelse:\n managed_main(main)\n" % (str(BIN), str(marker)))
         p = self.start("import sys\nsys.path.insert(0,%r)\nfrom javis_preflight import Preflight\nPreflight._run_skillscan_all(%r,20)\n" % (str(BIN), str(scan)))
         pid = self.marker('scan')
         p.kill(); p.wait(timeout=3)
@@ -142,13 +146,13 @@ try:
 except ImportError:
  managed_main=lambda main:main()
 def slow_scan(path):
- Path(%r).write_text(str(os.getpid()))
+ _marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(os.getpid()));__import__('os').replace(_tmp,_marker)
  time.sleep(30)
  return {}
 def main():
  multiprocessing.set_start_method('spawn',force=True)
  scanner.scan_skill=slow_scan
- Path(%r).write_text(str(os.getpid()))
+ _marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(os.getpid()));__import__('os').replace(_tmp,_marker)
  return scanner.cmd_all([%r],True)
 if __name__=='__main__':
  managed_main(main)
@@ -181,7 +185,7 @@ def main():
  time.sleep(30)
 if __name__=='__main__': owned.managed_main(main)
 """ % (str(BIN),str(self.root/'late'),
-        "import os,time;from pathlib import Path;Path(%r).write_text(str(os.getpid()));time.sleep(30)" % str(self.root/'late')))
+        "import os,time;from pathlib import Path;_marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(os.getpid()));__import__('os').replace(_tmp,_marker);time.sleep(30)" % str(self.root/'late')))
         sentinel=self.start('import time;time.sleep(30)')
         driver = """import sys
 from pathlib import Path
@@ -278,7 +282,7 @@ Path(%r).write_text(str(r))
     @unittest.skipUnless(os.name == 'nt', 'Windows Job Object: UNMEASURED on this host')
     def test_windows_parent_death_closes_job_without_harming_sibling(self):
         child=self.root/'child.py'
-        child.write_text("import os,sys,time\nfrom pathlib import Path\nsys.path.insert(0,%r)\nfrom _owned_process import managed_main\ndef main():\n Path(%r).write_text(str(os.getpid()))\n time.sleep(30)\nmanaged_main(main)\n" % (str(BIN),str(self.root/'job-child')))
+        child.write_text("import os,sys,time\nfrom pathlib import Path\nsys.path.insert(0,%r)\nfrom _owned_process import managed_main\ndef main():\n _marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(os.getpid()));__import__('os').replace(_tmp,_marker)\n time.sleep(30)\nmanaged_main(main)\n" % (str(BIN),str(self.root/'job-child')))
         sibling=self.start('import time;time.sleep(30)')
         owner=self.start("import sys\nsys.path.insert(0,%r)\nfrom _owned_process import run_owned\nrun_owned([sys.executable,'-B',%r],20)\n" % (str(BIN),str(child)))
         pid=self.marker('job-child');owner.kill();owner.wait(timeout=3)
@@ -289,7 +293,7 @@ Path(%r).write_text(str(r))
     def test_outer_helper_death_reaches_real_checklist_and_preflight(self):
         pack=self.root/'pack';(pack/'bin').mkdir(parents=True)
         preflight=pack/'bin'/'javis_preflight.py'
-        preflight.write_text("import os,sys,time\nfrom pathlib import Path\nsys.path.insert(0,%r)\nfrom _owned_process import managed_main\ndef main():\n Path(%r).write_text(str(os.getpid()))\n Path(%r).write_text(str(os.getppid()))\n time.sleep(30)\nmanaged_main(main)\n" % (str(BIN),str(self.root/'preflight'),str(self.root/'checklist')))
+        preflight.write_text("import os,sys,time\nfrom pathlib import Path\nsys.path.insert(0,%r)\nfrom _owned_process import managed_main\ndef main():\n _marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(os.getpid()));__import__('os').replace(_tmp,_marker)\n _marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(os.getppid()));__import__('os').replace(_tmp,_marker)\n time.sleep(30)\nmanaged_main(main)\n" % (str(BIN),str(self.root/'preflight'),str(self.root/'checklist')))
         owner=self.start("import os,sys\nsys.path.insert(0,%r)\nos.environ['CYS_PACK_DIR']=%r\nfrom _owned_process import run_owned\nrun_owned([sys.executable,'-B',%r],20)\n" % (str(BIN),str(pack),str(BIN/'javis_checklist.py')))
         pf=self.marker('preflight');ck=self.marker('checklist')
         owner.kill();owner.wait(timeout=3)
@@ -335,7 +339,7 @@ Path(%r).write_text(str(r))
         sys.path.insert(0,str(BIN));import _owned_process as owned
         sys.path.insert(0,str(BIN));import javis_checklist as ck
         child=self.root/'held_custom.py'
-        code="import os,time;from pathlib import Path;Path(%r).write_text(str(os.getpid()));time.sleep(30)" % str(self.root/'held-grandchild')
+        code="import os,time;from pathlib import Path;_marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(os.getpid()));__import__('os').replace(_tmp,_marker);time.sleep(30)" % str(self.root/'held-grandchild')
         child.write_text("import subprocess,sys,time\nsubprocess.Popen([sys.executable,'-B','-c',%r])\ntime.sleep(30)\n" % code)
         results=queue.Queue()
         # Start the tested timeout only after the real grandchild exists. This
@@ -396,28 +400,152 @@ Path(%r).write_text(str(r))
         result=run_owned([PYTHON,'-B',str(script)],1,force=1)
         self.assertFalse(result['complete'],result)
 
-    @unittest.skipUnless(os.name == 'posix', 'bash phase fixture')
+    @unittest.skipUnless(os.name == 'posix', 'real core phase fixture')
     def test_core_timeout_keeps_discovered_canonical_path(self):
+        import shutil
+        from unittest.mock import patch
+        sys.path.insert(0,str(BIN));import _owned_process as owned
+        pack=self.root/'pack';(pack/'hooks').mkdir(parents=True)
+        hooks=Path(__file__).resolve().parents[2]/'hooks'
+        for name in ('_lib.sh','inject_gate.py','inject-context.sh'):
+            shutil.copyfile(hooks/name,pack/'hooks'/name)
+        soul=pack/'soul.md';soul.write_text('# soul\n## retained path\n')
+        stubs=self.root/'stubs';stubs.mkdir();started=self.root/'probe-started'
+        wc=stubs/'wc'
+        wc.write_text('#!/bin/sh\n: > "$C03_PROBE_STARTED"\nexec /bin/sleep 30\n');wc.chmod(0o755)
+        env=dict(os.environ,HOME=str(self.root),CYS_PACK_DIR=str(pack),CYS_PY=PYTHON,
+                 SOURCE='startup',CYS_ROLE='master',PATH=str(stubs)+':/usr/bin:/bin',
+                 CYS_ROOT=str(self.root),C03_PROBE_STARTED=str(started))
+        # Force expiration only once the real probe has started, after the
+        # canonical checkpoint. No whole-hook startup time is being asserted.
+        clock=owned.monotonic
+        with patch.object(owned,'monotonic',lambda:clock()+(9 if started.exists() else 0)):
+            result=owned.run_owned([PYTHON,'-B',str(BIN/'_owned_process.py'),'--command',
+                '/bin/bash',str(pack/'hooks'/'inject-context.sh'),'--phase','core'],8,force=1,env=env)
+        self.assertTrue(started.exists(),'controlled probe was never entered')
+        self.assertTrue(result['timed_out'],result)
+        self.assertFalse(result['complete'],result)
+        self.assertIn('SOUL\0%s\0ROOT\0%s\0'%(soul,self.root),result['stdout'])
+
+    @unittest.skipUnless(os.name == 'posix', 'controller checkpoint replay')
+    def test_controller_replays_committed_core_records(self):
         import shutil
         pack=self.root/'pack';(pack/'hooks').mkdir(parents=True);(pack/'bin').mkdir()
         hooks=Path(__file__).resolve().parents[2]/'hooks'
-        for name in ('_lib.sh','inject_gate.py'):
-            shutil.copyfile(hooks/name,pack/'hooks'/name)
-        text=(hooks/'inject-context.sh').read_text().replace('core) _C03_CAP=60','core) _C03_CAP=1')
-        (pack/'hooks'/'inject-context.sh').write_text(text)
-        shutil.copyfile(BIN/'_owned_process.py',pack/'bin'/'_owned_process.py')
-        soul=pack/'soul.md';soul.write_text('# soul\n## retained path\n')
-        stubs=self.root/'stubs';stubs.mkdir()
-        wc=stubs/'wc';wc.write_text('#!/bin/sh\nsleep 5\nexec /usr/bin/wc "$@"\n');wc.chmod(0o755)
-        env=dict(os.environ,HOME=str(self.root),CYS_PACK_DIR=str(pack),CYS_PY=PYTHON,CYS_ROLE='master',
-                 PATH=str(stubs)+':/usr/bin:/bin',CYS_ROOT=str(self.root))
-        p=subprocess.run(['/bin/bash',str(pack/'hooks'/'inject-context.sh')],
-            input=json.dumps({'source':'startup','cwd':str(self.root)}),text=True,
-            capture_output=True,env=env,timeout=8)
-        self.assertEqual(p.returncode,0,p.stderr)
-        self.assertIn('phase core incomplete',p.stdout)
-        self.assertIn(str(soul),p.stdout)
-        self.assertIn('source=startup',p.stdout)
+        shutil.copyfile(hooks/'inject-context.sh',pack/'hooks'/'inject-context.sh')
+        # Test the unchanged controller with deterministic phase records, apart
+        # from the real-core ownership test. A partial pair must not be replayed.
+        (pack/'bin'/'_owned_process.py').touch()
+        (pack/'hooks'/'_lib.sh').write_text('''cys_resolve_py() { CYS_PY=true; }
+cys_timeout_run() {
+  for phase; do :; done
+  case "$phase" in
+    ingress) printf 'SOURCE\\0startup\\0' ;;
+    core) printf 'SOUL\\0/canonical/soul.md\\0_OUT_BAD\\0ignored\\0_OWNED_FAILURE\\0forced timeout\\0PARTIAL' ;;
+  esac
+  [ "$phase" = core ] || printf '_OWNED_RETURNED\\0001\\0'
+}
+''')
+        result=subprocess.run(['/bin/bash',str(pack/'hooks'/'inject-context.sh')],
+            env=dict(os.environ,HOME=str(self.root),CYS_PACK_DIR=str(pack)),capture_output=True,text=True,timeout=8)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('phase core incomplete',result.stdout)
+        self.assertIn('soul=/canonical/soul.md',result.stdout)
+        self.assertNotIn('PARTIAL',result.stdout)
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'Darwin zombie-group EPERM')
+    def test_eof_before_parent_kill_resolves_only_confirmed_absence(self):
+        import errno
+        from unittest.mock import patch
+        sys.path.insert(0,str(BIN));import _owned_process as owned
+        original=owned.os.killpg;refusals=[];signals=[]
+        def after_eof(pid,sig):
+            signals.append(sig)
+            if sig:
+                # The owner has already closed stdin. Keep its Popen unreaped
+                # while the real child's EOF watcher kills its own group.
+                end=time.monotonic()+1
+                while time.monotonic()<end:
+                    try:os.getpgid(pid)
+                    except ProcessLookupError:break
+                    time.sleep(.001)
+                else:self.fail('child did not exit at the EOF barrier')
+            try:return original(pid,sig)
+            except PermissionError as exc:
+                refusals.append(exc.errno);raise
+        script=self.root/'exit.py'
+        script.write_text("import sys\nsys.path.insert(0,%r)\nfrom _owned_process import managed_main\nmanaged_main(lambda:0)\n"%str(BIN))
+        with patch.object(owned.os,'killpg',after_eof):
+            result=owned.run_owned([PYTHON,'-B',str(script)],2,force=.3)
+        self.assertIn(errno.EPERM,refusals,'kernel EPERM path was not exercised')
+        self.assertEqual(signals[0],signal.SIGKILL)
+        self.assertTrue(all(sig==0 for sig in signals[1:]),signals)
+        self.assertTrue(result['complete'],result)
+        self.assertEqual(result['cleanup'],'verified_empty')
+
+    @unittest.skipUnless(os.name == 'posix', 'EPERM negative classifications')
+    def test_eperm_never_clears_other_uncertainty(self):
+        import errno,threading
+        from unittest.mock import patch
+        sys.path.insert(0,str(BIN));import _owned_process as owned
+        for mode in ('persistent-group','observation-permission','cancelled','missing-done','drain-held'):
+            with self.subTest(mode=mode):
+                original=owned.os.killpg;cancel=threading.Event()
+                def refuse(pid,sig):
+                    if sig:
+                        original(pid,sig)
+                        if mode=='cancelled':cancel.set()
+                        raise PermissionError(errno.EPERM,'fixture teardown refusal')
+                    if mode=='persistent-group':return None
+                    if mode=='observation-permission':raise PermissionError(errno.EPERM,'fixture observation refusal')
+                    return original(pid,sig)
+                body='os._exit(0)' if mode=='missing-done' else '0'
+                script=self.root/'negative.py'
+                script.write_text("import os,sys\nsys.path.insert(0,%r)\nfrom _owned_process import managed_main\nmanaged_main(lambda:%s)\n"%(str(BIN),body))
+                reader=owned._reader
+                def hold_eof(stream,events,label,chunks):
+                    if mode=='drain-held' and label=='err':return
+                    return reader(stream,events,label,chunks)
+                with patch.object(owned.os,'killpg',refuse),patch.object(owned,'_reader',hold_eof):
+                    result=owned.run_owned([PYTHON,'-B',str(script)],2,force=.2,cancel=cancel)
+                self.assertFalse(result['complete'],result)
+                if mode in ('persistent-group','observation-permission','drain-held'):
+                    self.assertEqual(result['cleanup'],'unknown',result)
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'native macOS signal permission denial')
+    def test_real_signal_permission_denial_stays_incomplete(self):
+        sandbox=Path('/usr/bin/sandbox-exec')
+        if not sandbox.exists():self.skipTest('sandbox-exec unavailable: real permission UNMEASURED')
+        script=self.root/'denied.py';marker=self.root/'denied-child'
+        script.write_text("""import os,sys,json
+from pathlib import Path
+sys.path.insert(0,%r)
+import _owned_process as owned
+real=owned.subprocess.Popen
+def record(*a,**kw):
+ p=real(*a,**kw)
+ marker=Path(%r);tmp=marker.with_suffix('.tmp');tmp.write_text(str(p.pid));os.replace(tmp,marker)
+ return p
+owned.subprocess.Popen=record
+print(json.dumps(owned.run_owned([sys.executable,'-B',%r],2,force=.3)),flush=True)
+"""%(str(BIN),str(marker),str(self.root/'denied-target.py')))
+        (self.root/'denied-target.py').write_text("import sys,threading\nsys.path.insert(0,%r)\nimport _owned_process as owned\nowned._self_stop=lambda group:threading.Event().wait()\nowned.managed_main(lambda:0)\n"%str(BIN))
+        p=subprocess.Popen([str(sandbox),'-p','(version 1)(allow default)(deny signal)',PYTHON,'-B',str(script)],
+                           stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        self.children.append(p)
+        pid=self.marker('denied-child')
+        try:
+            out,err=p.communicate(timeout=8)
+            self.assertEqual(p.returncode,0,err)
+            result=json.loads(out)
+            self.assertFalse(result['complete'],result)
+            self.assertEqual(result['cleanup'],'unknown',result)
+            self.assertIn('Operation not permitted',result['reason'])
+            self.assertTrue(self.recorded_alive(pid),'permission denial did not leave a live child')
+        finally:
+            # Outside the process-scoped sandbox: only this recorded fixture.
+            try:self.stop_recorded(pid)
+            except ProcessLookupError:pass
 
     @unittest.skipUnless(os.name == 'posix', 'bash logging fixture')
     def test_blocked_logging_cannot_hide_restoration(self):
@@ -483,7 +611,7 @@ Path(%r).write_text(str(r))
     def test_parent_dies_during_popen_return_before_go(self):
         child=self.root/'startup_child.py'
         child.write_text("import sys\nfrom pathlib import Path\nsys.path.insert(0,%r)\nfrom _owned_process import managed_main\ndef main():\n Path(%r).touch()\n return 0\nmanaged_main(main)\n" % (str(BIN),str(self.root/'forbidden-work')))
-        parent=self.start("import os,sys\nfrom pathlib import Path\nsys.path.insert(0,%r)\nimport _owned_process as owned\noriginal=owned.subprocess.Popen\ndef die(*a,**kw):\n p=original(*a,**kw)\n Path(%r).write_text(str(p.pid))\n os._exit(9)\nowned.subprocess.Popen=die\nowned.run_owned([sys.executable,'-B',%r],2)\n" % (str(BIN),str(self.root/'startup-child'),str(child)))
+        parent=self.start("import os,sys\nfrom pathlib import Path\nsys.path.insert(0,%r)\nimport _owned_process as owned\noriginal=owned.subprocess.Popen\ndef die(*a,**kw):\n p=original(*a,**kw)\n _marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(p.pid));__import__('os').replace(_tmp,_marker)\n os._exit(9)\nowned.subprocess.Popen=die\nowned.run_owned([sys.executable,'-B',%r],2)\n" % (str(BIN),str(self.root/'startup-child'),str(child)))
         pid=self.marker('startup-child');parent.wait(timeout=3)
         self.assert_gone(pid)
         self.assertFalse((self.root/'forbidden-work').exists())
@@ -547,7 +675,7 @@ Path(%r).write_text(str(r))
         child=self.root/'job_child.py'
         child.write_text("import sys,time\nsys.path.insert(0,%r)\nfrom _owned_process import managed_main\nmanaged_main(lambda:time.sleep(30))\n" % str(BIN))
         sibling_code="import time;time.sleep(30)"
-        parent=self.start("import sys\nfrom pathlib import Path\nsys.path.insert(0,%r)\nimport _owned_process as owned\nreal=owned.subprocess.Popen\ndef spawn(*args,**kw):\n child=real(*args,**kw)\n sibling=real([sys.executable,'-B','-c',%r],close_fds=True,stdin=owned.subprocess.DEVNULL,stdout=owned.subprocess.DEVNULL,stderr=owned.subprocess.DEVNULL)\n Path(%r).write_text(str(child.pid))\n Path(%r).write_text(str(sibling.pid))\n return child\nowned.subprocess.Popen=spawn\nowned.run_owned([sys.executable,'-B',%r],20)\n" % (str(BIN),sibling_code,str(self.root/'owned-child'),str(self.root/'unrelated'),str(child)))
+        parent=self.start("import sys\nfrom pathlib import Path\nsys.path.insert(0,%r)\nimport _owned_process as owned\nreal=owned.subprocess.Popen\ndef spawn(*args,**kw):\n child=real(*args,**kw)\n sibling=real([sys.executable,'-B','-c',%r],close_fds=True,stdin=owned.subprocess.DEVNULL,stdout=owned.subprocess.DEVNULL,stderr=owned.subprocess.DEVNULL)\n _marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(child.pid));__import__('os').replace(_tmp,_marker)\n _marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(sibling.pid));__import__('os').replace(_tmp,_marker)\n return child\nowned.subprocess.Popen=spawn\nowned.run_owned([sys.executable,'-B',%r],20)\n" % (str(BIN),sibling_code,str(self.root/'owned-child'),str(self.root/'unrelated'),str(child)))
         child_pid=self.marker('owned-child');sibling_pid=self.marker('unrelated')
         parent.kill();parent.wait(timeout=3)
         self.assert_gone(child_pid)
@@ -566,13 +694,13 @@ try:
 except ImportError:
  managed_main=lambda main:main()
 def slow_scan(path):
- Path(%r).write_text(str(os.getpid()))
+ _marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(os.getpid()));__import__('os').replace(_tmp,_marker)
  time.sleep(30)
  return {}
 def main():
  multiprocessing.set_start_method('spawn',force=True)
  scanner.scan_skill=slow_scan
- Path(%r).write_text(str(os.getpid()))
+ _marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(os.getpid()));__import__('os').replace(_tmp,_marker)
  return scanner.cmd_all([%r],True)
 if __name__=='__main__':
  managed_main(main)
@@ -597,7 +725,7 @@ if __name__=='__main__':
     @unittest.skipUnless(os.name == 'posix', 'POSIX C60 late-spawn barrier')
     def test_c60_real_late_spawn_after_fence_is_contained(self):
         script=self.root/'late_c60.py'
-        child_code="import os,time;from pathlib import Path;Path(%r).write_text(str(os.getpid()));time.sleep(30)" % str(self.root/'late-c60')
+        child_code="import os,time;from pathlib import Path;_marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(os.getpid()));__import__('os').replace(_tmp,_marker);time.sleep(30)" % str(self.root/'late-c60')
         script.write_text("import os,sys,time,subprocess\nfrom pathlib import Path\nsys.path.insert(0,%r)\nimport _owned_process as owned\nimport javis_preflight as pf\nstop=owned._self_stop\ndef paused_stop(group):\n while not Path(%r).exists():time.sleep(.005)\n stop(group)\nowned._self_stop=paused_stop\ndef late_probe(*args,**kwargs):\n owned.CANCEL.set()\n child=subprocess.Popen([sys.executable,'-B','-c',%r])\n child.wait()\ndef main():\n pf.subprocess.run=late_probe\n checker=pf.Preflight(fix=False,skips=[])\n checker._run_check_isolated(checker.c60_gate_wiring)\n return 0\nowned.managed_main(main)\n" % (str(BIN),str(self.root/'late-c60'),child_code))
         sibling=self.start('import time;time.sleep(30)')
         parent=self.start("import sys\nsys.path.insert(0,%r)\nfrom _owned_process import run_owned\nrun_owned([sys.executable,'-B',%r],3,force=1)\n" % (str(BIN),str(script)))
@@ -608,7 +736,7 @@ if __name__=='__main__':
     def test_checklist_deadline_cleans_scanner_and_spawn_pool(self):
         skill=self.root/'skills'/'sample';skill.mkdir(parents=True);(skill/'SKILL.md').write_text('# fixture')
         scanner=self.root/'scan_deadline.py'
-        scanner.write_text("import os,sys,time,multiprocessing\nfrom pathlib import Path\nsys.path.insert(0,%r)\nimport javis_skillscan as scanner\nfrom _owned_process import managed_main\ndef slow_scan(path):\n Path(%r).write_text(str(os.getpid()))\n time.sleep(30)\n return {}\ndef main():\n multiprocessing.set_start_method('spawn',force=True)\n scanner.scan_skill=slow_scan\n Path(%r).write_text(str(os.getpid()))\n return scanner.cmd_all([%r],True)\nif __name__=='__main__':managed_main(main)\n" % (str(BIN),str(self.root/'pool-worker'),str(self.root/'deadline-scanner'),str(skill.parent)))
+        scanner.write_text("import os,sys,time,multiprocessing\nfrom pathlib import Path\nsys.path.insert(0,%r)\nimport javis_skillscan as scanner\nfrom _owned_process import managed_main\ndef slow_scan(path):\n _marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(os.getpid()));__import__('os').replace(_tmp,_marker)\n time.sleep(30)\n return {}\ndef main():\n multiprocessing.set_start_method('spawn',force=True)\n scanner.scan_skill=slow_scan\n _marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(os.getpid()));__import__('os').replace(_tmp,_marker)\n return scanner.cmd_all([%r],True)\nif __name__=='__main__':managed_main(main)\n" % (str(BIN),str(self.root/'pool-worker'),str(self.root/'deadline-scanner'),str(skill.parent)))
         preflight=self.root/'preflight_deadline.py'
         preflight.write_text("import sys\nsys.path.insert(0,%r)\nfrom javis_preflight import Preflight\nfrom _owned_process import managed_main\ndef main():\n Preflight._run_skillscan_all(%r,20)\n return 0\nmanaged_main(main)\n" % (str(BIN),str(scanner)))
         parent=self.start("import sys\nfrom pathlib import Path\nsys.path.insert(0,%r)\nimport javis_checklist as ck\nck.DEFAULT_PREFLIGHT=[sys.executable,%r]\nresult=ck.run_preflight(ck.DEFAULT_PREFLIGHT,timeout=2)\nPath(%r).write_text(str(result))\n" % (str(BIN),str(preflight),str(self.root/'deadline-result')))
