@@ -3075,6 +3075,29 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// `.claude.json` 은 실측 0600 이라, 시드가 그것을 0644 로 넓히면 안 된다. 되돌려 chmod 하는
 /// 방식은 넓은 창이 잠깐 열리므로, **처음부터** 목표 mode 로 만든다.
 pub fn write_atomic_mode(path: &Path, bytes: &[u8], mode: Option<u32>) -> std::io::Result<()> {
+    // 거동 불변: enforce=false 는 종전과 **바이트 동일**하다(mode 는 open(2) 인자로만 간다).
+    write_atomic_mode_inner(path, bytes, mode, false)
+}
+
+/// [`write_atomic_mode`] 의 **정확 적용판**(H-08).
+///
+/// 왜 따로 두는가: `write_atomic_mode` 는 mode 를 `OpenOptions::mode()` = **`open(2)` 의 mode 인자**로
+/// 넘기고, 그 값은 **umask 로 걸러진다**(실측: umask 0111 에서 0755 요청 → 0644 · umask 0077 → 0700).
+/// 그 거동은 원래 목적인 **좁히기**(`.claude.json` 0600)에는 해롭지 않다 — umask 는 비트를 **빼기만**
+/// 하므로 좁히는 목표는 umask 와 충돌하지 않는다. 그러나 H-08 의 목표는 **실행비트를 주는 것**이고,
+/// 주는 것은 umask 가 거부할 수 있다. 그래서 이 판은 tmp **디스크립터에 fchmod** 로 적용하고
+/// (chmod(2) 는 umask 무관 — `install_into` 의 실행비트 루프가 이미 `set_permissions` 를 쓰는 이유다)
+/// **rename 전에 fstat 으로 검증**한다. 검증 실패·적용 실패는 **대상을 교체하지 않고** 그대로 올린다.
+pub fn write_atomic_mode_exact(path: &Path, bytes: &[u8], mode: Option<u32>) -> std::io::Result<()> {
+    write_atomic_mode_inner(path, bytes, mode, true)
+}
+
+fn write_atomic_mode_inner(
+    path: &Path,
+    bytes: &[u8],
+    mode: Option<u32>,
+    enforce: bool,
+) -> std::io::Result<()> {
     use std::io::Write;
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent")
@@ -3121,6 +3144,14 @@ pub fn write_atomic_mode(path: &Path, bytes: &[u8], mode: Option<u32>) -> std::i
     let res = (|| -> std::io::Result<()> {
         f.write_all(bytes)?;
         f.sync_all()?; // 파일 본문 fsync (rename 전)
+        // ★H-08: enforce 면 **rename 전에** 목표 mode 를 디스크립터에 적용·검증한다. 여기서 실패하면
+        //   아래 Err 처리가 tmp 를 지우므로 **대상은 손대지 않은 채** 오류가 올라간다(비실행 스크립트를
+        //   조용히 출하하는 것보다 시끄럽게 실패하는 쪽이 옳다).
+        if enforce {
+            if let Some(m) = mode {
+                apply_mode_exact(&f, m)?;
+            }
+        }
         std::fs::rename(&tmp, path)?; // 원자 교체
         Ok(())
     })();
@@ -3160,6 +3191,105 @@ fn create_tmp_with_mode(tmp: &Path, mode: Option<u32>) -> std::io::Result<std::f
 #[cfg(not(unix))]
 fn create_tmp_with_mode(tmp: &Path, _mode: Option<u32>) -> std::io::Result<std::fs::File> {
     std::fs::OpenOptions::new().write(true).create_new(true).open(tmp)
+}
+
+/// tmp 디스크립터에 mode 를 **정확히** 적용하고 즉시 되읽어 검증한다(H-08).
+/// `fchmod(2)` 는 umask 와 무관하므로 `open(2)` 의 mode 인자와 달리 요청값이 그대로 선다.
+/// 되읽기는 mode 를 무시하는 파일시스템에서 **조용한 실패**를 막는다.
+#[cfg(unix)]
+fn apply_mode_exact(f: &std::fs::File, m: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    f.set_permissions(std::fs::Permissions::from_mode(m))?;
+    let got = f.metadata()?.permissions().mode() & 0o7777;
+    if got != (m & 0o7777) {
+        return Err(std::io::Error::other(format!(
+            "mode 적용 검증 실패: 요청 {:04o} 실제 {:04o} — 대상 교체 안 함",
+            m & 0o7777,
+            got
+        )));
+    }
+    Ok(())
+}
+
+/// Windows 에는 POSIX 실행비트가 없다 — `create_tmp_with_mode` 의 `cfg(not(unix))` 쌍과 같은 계약으로
+/// mode 를 받아 **무시**한다(H-08 의 remedy 는 Windows 에서 구조적으로 no-op 이다).
+#[cfg(not(unix))]
+fn apply_mode_exact(_f: &std::fs::File, _m: u32) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// `install_into` 의 실행비트 규칙과 **같은 식**(pack.rs 의 shebang 루프) — 고정 목록은 드리프트한다.
+pub fn exec_mode_for(bytes: &[u8]) -> Option<u32> {
+    if bytes.starts_with(b"#!") {
+        Some(0o755)
+    } else {
+        None
+    }
+}
+
+/// 쓰기 **전** 대상의 현재 mode(없거나 읽을 수 없으면 None). 호출부는 반드시 쓰기 전에 읽어야 한다 —
+/// 쓰기 뒤에 읽으면 tmp+rename 이 이미 mode 를 버린 뒤다.
+pub fn current_mode(path: &Path) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .ok()
+            .map(|m| m.permissions().mode() & 0o7777)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// H-08 의 mode 규칙 **한 곳**(어느 호출부도 규칙을 반복하지 않는다).
+///
+/// - 선행 파일에 **실행비트가 하나라도** 있으면 그 mode 를 **그대로** 유지한다(의도된 0700 을 0755 로
+///   넓히지 않는다).
+/// - 선행 파일에 실행비트가 없고, **system 등급 매니페스트 항목**이며 내용이 `#!` 로 시작하면 **0755 로
+///   복구**한다(`install_into` 와 같은 규칙 · 이전 치유가 0644 로 망가뜨린 대상을 되살린다).
+/// - 그 밖의 선행 파일은 **그대로** 유지한다(사용자가 일부러 비실행으로 둔 파일은 설치기의 일이 아니다).
+/// - 선행 파일이 **없으면** 내용에서 파생한다([`exec_mode_for`]).
+pub fn pack_target_mode(
+    prior: Option<u32>,
+    bytes: &[u8],
+    system_manifest_entry: bool,
+) -> Option<u32> {
+    match prior {
+        Some(p) if p & 0o111 != 0 => Some(p),
+        Some(_) if system_manifest_entry && bytes.starts_with(b"#!") => Some(0o755),
+        Some(p) => Some(p),
+        None => exec_mode_for(bytes),
+    }
+}
+
+/// H-08 의 "system 등급 **매니페스트 항목**인가" 판정 — [`pack_target_mode`] 의 0644→0755 복구 분기를
+/// 그 집합으로만 좁히는 데 쓴다. 매니페스트 밖 파일·user 등급 파일은 사용자가 일부러 비실행으로 둘 수
+/// 있으므로 복구 대상이 아니다(판독 실패 = 복구 안 함 = 안전측).
+pub fn is_system_manifest_entry(dir: &Path, rel: &str) -> bool {
+    if ownership_name_scoped(rel, dir) != "system" {
+        return false;
+    }
+    let Ok(s) = std::fs::read_to_string(dir.join(INSTALL_MANIFEST)) else {
+        return false;
+    };
+    let Ok(m) = serde_json::from_str::<std::collections::BTreeMap<String, String>>(&s) else {
+        return false;
+    };
+    m.contains_key(rel)
+}
+
+/// 팩 **대상** 파일 쓰기(H-08). 사이드카(`<rel>.user`·`.base`·`.pristine`·`.vendor-base`)는 이 함수를
+/// 쓰지 않는다 — 그쪽은 데이터이고 실행되지 않는다(설계의 명시 결정).
+pub fn write_pack_file(
+    path: &Path,
+    bytes: &[u8],
+    prior: Option<u32>,
+    system_manifest_entry: bool,
+) -> std::io::Result<()> {
+    write_atomic_mode_exact(path, bytes, pack_target_mode(prior, bytes, system_manifest_entry))
 }
 
 /// pristine 미러 갱신(best-effort — 3-way 병합의 공통 조상 확보용 자문 데이터).
@@ -4846,6 +4976,107 @@ pub(crate) static PACK_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ───────────────────────── H-08 (0.14.55 · P3) ─────────────────────────
+    /// H-08 의 mode 규칙표(순수 함수 · umask 무관). 설계 R2 section 1-3 의 다섯 행 전부.
+    #[test]
+    fn h08_pack_target_mode_rule_table() {
+        let sheb = b"#!/usr/bin/env python3\n";
+        let plain = b"{\"k\": 1}\n";
+        // A) 실행비트가 있으면 그대로 — 0755 는 0755
+        assert_eq!(pack_target_mode(Some(0o755), sheb, true), Some(0o755));
+        // B) 의도된 0700 을 0755 로 **넓히지 않는다**
+        assert_eq!(pack_target_mode(Some(0o700), sheb, true), Some(0o700));
+        // C) system 매니페스트 항목 + shebang + 실행비트 소실 → 0755 복구
+        assert_eq!(pack_target_mode(Some(0o644), sheb, true), Some(0o755));
+        // C') 같은 0644 shebang 이지만 system 매니페스트 항목이 **아니면** 손대지 않는다
+        assert_eq!(pack_target_mode(Some(0o644), sheb, false), Some(0o644));
+        // D) 선행 파일 없음 + shebang → 0755
+        assert_eq!(pack_target_mode(None, sheb, true), Some(0o755));
+        // E) 선행 파일 없음 + 비-shebang → 파생값 없음(종전 기본 퍼미션)
+        assert_eq!(pack_target_mode(None, plain, true), None);
+        // F) 선행 0644 비-shebang → 그대로
+        assert_eq!(pack_target_mode(Some(0o644), plain, true), Some(0o644));
+        // exec_mode_for 자체
+        assert_eq!(exec_mode_for(sheb), Some(0o755));
+        assert_eq!(exec_mode_for(plain), None);
+    }
+
+    /// ★H-08 의 기제: `write_atomic_mode` 는 mode 를 `open(2)` 인자로 넘겨 **umask 로 걸러지고**,
+    /// `write_atomic_mode_exact` 는 tmp 디스크립터에 `fchmod` 로 적용해 **umask 와 무관**하다.
+    /// 이 검체가 9dbea792 에서 적색인 이유는 그 판에 `_exact` 가 없다는 것이고, 여기서 녹색인 이유는
+    /// 두 경로의 결과가 **같은 umask 아래에서 갈린다**는 실측이다.
+    #[cfg(unix)]
+    #[test]
+    fn h08_exact_writer_is_umask_independent_and_plain_writer_is_not() {
+        use std::os::unix::fs::PermissionsExt;
+        // umask 는 프로세스 전역이라 다른 테스트와 겹치면 안 된다 — 기존 팩 테스트 락으로 직렬화한다.
+        let _g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let base = std::env::temp_dir().join(format!("cys-h08-umask-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        // 디렉터리 자신의 실행비트는 umask 와 무관하게 세워 둔다(없으면 통과 불가 — 리그가 자기를 막는다).
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let sheb = b"#!/usr/bin/env python3\n";
+        for um in [0o111u32, 0o077u32] {
+            let prev = unsafe { libc::umask(um as libc::mode_t) };
+            let exact = base.join(format!("exact-{um:04o}"));
+            let plain = base.join(format!("plain-{um:04o}"));
+            let r1 = write_atomic_mode_exact(&exact, sheb, Some(0o755));
+            let r2 = write_atomic_mode(&plain, sheb, Some(0o755));
+            unsafe { libc::umask(prev) };
+            r1.unwrap();
+            r2.unwrap();
+            let m_exact = std::fs::metadata(&exact).unwrap().permissions().mode() & 0o7777;
+            let m_plain = std::fs::metadata(&plain).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(
+                m_exact, 0o755,
+                "umask {um:04o}: exact 판은 요청 mode 를 그대로 세워야 한다 — 실측 {m_exact:04o}"
+            );
+            assert_ne!(
+                m_plain, 0o755,
+                "umask {um:04o}: 평문 판은 umask 로 걸러져야 한다(기제 대조) — 실측 {m_plain:04o}"
+            );
+            assert_eq!(
+                m_plain,
+                0o755 & !um,
+                "umask {um:04o}: 평문 판의 결과는 정확히 m & !umask 다"
+            );
+        }
+        // mode=None 이면 두 경로는 같아야 한다(회귀 방지 — exact 가 기본 거동을 바꾸지 않는다).
+        let a = base.join("none-exact");
+        let b = base.join("none-plain");
+        write_atomic_mode_exact(&a, b"x\n", None).unwrap();
+        write_atomic_mode(&b, b"x\n", None).unwrap();
+        let ma = std::fs::metadata(&a).unwrap().permissions().mode() & 0o7777;
+        let mb = std::fs::metadata(&b).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(ma, mb, "mode=None 에서는 두 경로가 동일해야 한다");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// ★H-08 호출부 census(T9): 설계가 열거한 **8개 대상 쓰기**가 전부 새 헬퍼를 타고, 사이드카
+    /// (`<rel>.user`·`.vendor-base`)와 `.pristine` 은 종전 writer 를 그대로 쓴다. 새 대상 쓰기를
+    /// `write_atomic` 으로 추가하면 이 검체가 적색이 된다.
+    #[test]
+    fn h08_target_write_site_census() {
+        let src = include_str!("bin/cys.rs");
+        // 대상 쓰기 = write_pack_file 호출. 설계의 8개 사이트와 수가 일치해야 한다.
+        let target_writes = src.matches("cys::pack::write_pack_file(").count();
+        assert_eq!(
+            target_writes, 8,
+            "설계가 열거한 대상 쓰기 8곳이 전부 write_pack_file 을 타야 한다 — 실측 {target_writes}"
+        );
+        // 사이드카·메타데이터 쓰기는 종전 writer 유지(실행비트를 주지 않는다).
+        for needle in [
+            "write_atomic(&dir.join(format!(\"{rel}.user\"))",
+            ".vendor-base",
+        ] {
+            assert!(
+                src.contains(needle),
+                "사이드카 경로가 사라졌다(설계는 무변경을 요구한다): {needle}"
+            );
+        }
+    }
 
     /// ★(0.14.42 · perf R3-6) 임베드 팩 해시 **메모 핀**. PACK_ALL 은 컴파일 타임 상수라 값이 프로세스 수명
     /// 동안 바뀌지 않는다.
