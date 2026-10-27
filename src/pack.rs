@@ -2933,11 +2933,30 @@ pub fn plan_install(
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
+    // ★판정 좁힘의 입력 — 루프 밖에서 한 번만 읽는다(파일마다 읽으면 474회 IO 가 된다).
+    let pending_now = load_merge_pending(dir);
     for (rel, content) in items.iter().copied() {
         let path = dir.join(rel);
         let exists = path.exists();
         let disk = if exists { std::fs::read_to_string(&path).ok() } else { None };
-        let mh = manifest.get(rel).map(String::as_str);
+        let mh_raw = manifest.get(rel).map(String::as_str);
+        // ★C-07(0.14.55 · P3): 분류 **직전** 낡은 항목 판정. decide_file_action 의 arm 은 무변경.
+        let stale =
+            classify_stale_entry(dir, rel, scope, content, disk.as_deref(), mh_raw, pending_now.contains_key(rel));
+        let repaired = match &stale {
+            StaleEntry::Repaired(h) => Some(h.clone()),
+            _ => None,
+        };
+        let mh = repaired.as_deref().or(mh_raw);
+        // ★`!force` 게이트(gemini-3 r1 major 1): 제자리 보존은 **보수 기본 경로**의 판정이다.
+        //   `--force` 는 사용자가 명시적으로 vendor 본을 강제하는 동사이므로, 그 자리에서까지
+        //   분류를 건너뛰면 강제가 조용히 무시된다(적용된 척 0 의 반대 방향 결함).
+        if let (StaleEntry::KeepInPlace(_), false) = (&stale, force) {
+            // ⛔제자리 보존 — 쓰지 않는다. 낡은 항목을 그대로 두면 L4 강제 치유로 떨어지므로
+            //   분류를 건너뛰고 kept-drift 로 계상한다(설계 R3 section 3-2).
+            plan.kept_drift.push(rel.to_string());
+            continue;
+        }
         // ★T3(D9) base lazy 로드 사전 필터 — 이 필터는 **과대포함만 허용**(과소포함=Merge3 침묵
         // 불발) · decide L3 가 최종 판정. 드리프트 파일에서만 pristine read 가 발생한다(전 파일
         // read+hash 2배화 회귀 방지 — 실측 통상 0~10건).
@@ -3075,6 +3094,33 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// `.claude.json` 은 실측 0600 이라, 시드가 그것을 0644 로 넓히면 안 된다. 되돌려 chmod 하는
 /// 방식은 넓은 창이 잠깐 열리므로, **처음부터** 목표 mode 로 만든다.
 pub fn write_atomic_mode(path: &Path, bytes: &[u8], mode: Option<u32>) -> std::io::Result<()> {
+    // 거동 불변: enforce=false 는 종전과 **바이트 동일**하다(mode 는 open(2) 인자로만 간다).
+    write_atomic_mode_inner(path, bytes, mode, false, apply_mode_exact)
+}
+
+/// [`write_atomic_mode`] 의 **정확 적용판**(H-08).
+///
+/// 왜 따로 두는가: `write_atomic_mode` 는 mode 를 `OpenOptions::mode()` = **`open(2)` 의 mode 인자**로
+/// 넘기고, 그 값은 **umask 로 걸러진다**(실측: umask 0111 에서 0755 요청 → 0644 · umask 0077 → 0700).
+/// 그 거동은 원래 목적인 **좁히기**(`.claude.json` 0600)에는 해롭지 않다 — umask 는 비트를 **빼기만**
+/// 하므로 좁히는 목표는 umask 와 충돌하지 않는다. 그러나 H-08 의 목표는 **실행비트를 주는 것**이고,
+/// 주는 것은 umask 가 거부할 수 있다. 그래서 이 판은 tmp **디스크립터에 fchmod** 로 적용하고
+/// (chmod(2) 는 umask 무관 — `install_into` 의 실행비트 루프가 이미 `set_permissions` 를 쓰는 이유다)
+/// **rename 전에 fstat 으로 검증**한다. 검증 실패·적용 실패는 **대상을 교체하지 않고** 그대로 올린다.
+pub fn write_atomic_mode_exact(path: &Path, bytes: &[u8], mode: Option<u32>) -> std::io::Result<()> {
+    write_atomic_mode_inner(path, bytes, mode, true, apply_mode_exact)
+}
+
+fn write_atomic_mode_inner(
+    path: &Path,
+    bytes: &[u8],
+    mode: Option<u32>,
+    enforce: bool,
+    // ★주입 가능한 적용·검증 수단(기본은 `apply_mode_exact`). 제네릭이 아니라 **함수 포인터**인
+    //   이유는 H-CONC-3 핀이 소유자를 `fn <이름>(` 문자열로 해소하기 때문이다 — 제네릭을 붙이면
+    //   정의가 `fn write_atomic_mode_inner<A>(` 가 되어 핀이 소유자를 놓친다(실측된 사각).
+    apply: fn(&std::fs::File, u32) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     use std::io::Write;
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent")
@@ -3121,6 +3167,14 @@ pub fn write_atomic_mode(path: &Path, bytes: &[u8], mode: Option<u32>) -> std::i
     let res = (|| -> std::io::Result<()> {
         f.write_all(bytes)?;
         f.sync_all()?; // 파일 본문 fsync (rename 전)
+        // ★H-08: enforce 면 **rename 전에** 목표 mode 를 디스크립터에 적용·검증한다. 여기서 실패하면
+        //   아래 Err 처리가 tmp 를 지우므로 **대상은 손대지 않은 채** 오류가 올라간다(비실행 스크립트를
+        //   조용히 출하하는 것보다 시끄럽게 실패하는 쪽이 옳다).
+        if enforce {
+            if let Some(m) = mode {
+                apply(&f, m)?;
+            }
+        }
         std::fs::rename(&tmp, path)?; // 원자 교체
         Ok(())
     })();
@@ -3139,8 +3193,14 @@ pub fn write_atomic_mode(path: &Path, bytes: &[u8], mode: Option<u32>) -> std::i
     }
 }
 
-/// tmp 파일 생성 — `mode=Some(m)` 이면 **생성 시점부터** 그 퍼미션이다(사후 chmod 창 0).
+/// tmp 파일 생성 — `mode=Some(m)` 은 `open(2)` 의 mode 인자로 가고 **umask 로 걸러진다**
+/// (실효값 `m & !umask`). 그래서 이 인자만으로는 요청 비트가 선다고 말할 수 없다:
+/// `umask 0111` 아래에서 `Some(0o755)` 는 `0o644` 로 생성된다.
+/// ⇒ **좁히는 쪽**(예: `0o600` 으로 제한)에는 충분하지만, **실행비트를 umask 와 무관하게 세우는
+/// 것**은 [`write_atomic_mode_exact`]/[`apply_mode_exact`](`fchmod` + 되읽기 검증)의 일이다.
 /// `mode=None` 이면 종전과 같은 기본 퍼미션(umask 적용)이다.
+/// <!-- 정정 근거: gemini-3 r1 minor — 종전 문안("생성 시점부터 그 퍼미션이다 · 사후 chmod 창 0")은
+///      umask 필터링 아래에서 거짓이고 P3-DESIGN-R2 §1-1·§9-2, R3 §6 가 이미 정정을 약속했다. -->
 ///
 /// ★H-CONC-3: 두 갈래 모두 `create_new`(O_EXCL)다 — 커널이 이름 유일성을 보증하므로 호출부가
 /// 충돌을 **관측**해 다음 후보로 넘어갈 수 있다. `create`+truncate 는 충돌을 조용히 삼켜 두
@@ -3160,6 +3220,259 @@ fn create_tmp_with_mode(tmp: &Path, mode: Option<u32>) -> std::io::Result<std::f
 #[cfg(not(unix))]
 fn create_tmp_with_mode(tmp: &Path, _mode: Option<u32>) -> std::io::Result<std::fs::File> {
     std::fs::OpenOptions::new().write(true).create_new(true).open(tmp)
+}
+
+/// tmp 디스크립터에 mode 를 **정확히** 적용하고 즉시 되읽어 검증한다(H-08).
+/// `fchmod(2)` 는 umask 와 무관하므로 `open(2)` 의 mode 인자와 달리 요청값이 그대로 선다.
+/// 되읽기는 mode 를 무시하는 파일시스템에서 **조용한 실패**를 막는다.
+#[cfg(unix)]
+fn apply_mode_exact(f: &std::fs::File, m: u32) -> std::io::Result<()> {
+    apply_mode_exact_with(f, m, set_mode_fchmod, observe_mode_fstat)
+}
+
+/// 적용 수단 — `fchmod(2)`(umask 무관).
+#[cfg(unix)]
+fn set_mode_fchmod(f: &std::fs::File, m: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    f.set_permissions(std::fs::Permissions::from_mode(m))
+}
+
+/// 관측 수단 — `fstat(2)`(디스크립터 기준 · 경로 재해석 없음).
+#[cfg(unix)]
+fn observe_mode_fstat(f: &std::fs::File) -> std::io::Result<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    Ok(f.metadata()?.permissions().mode() & 0o7777)
+}
+
+/// [`apply_mode_exact`] 의 **수단 주입판** — 적용·관측을 인자로 받아 검증 분기를 검체로 만든다.
+///
+/// 왜 분리하는가: 이 함수의 불일치 거부는 **mode 를 조용히 무시하는 파일시스템**에 대한 유일한
+/// 방어인데, 실제 그런 파일시스템 없이는 그 분기를 밟을 수 없어 변이가 살아남았다(worker-15 자진
+/// 신고 · codex r1 m1 · gemini-3 r1 major 2-a). 수단을 주입하면 검체가 "chmod 가 아무 일도 하지
+/// 않는" 고장을 **주입**해 거부 경로를 끝까지(쓰기 전 Err · tmp 정리 · 대상 무변경) 밟는다.
+#[cfg(unix)]
+fn apply_mode_exact_with(
+    f: &std::fs::File,
+    m: u32,
+    set: impl Fn(&std::fs::File, u32) -> std::io::Result<()>,
+    observe: impl Fn(&std::fs::File) -> std::io::Result<u32>,
+) -> std::io::Result<()> {
+    set(f, m)?;
+    let got = observe(f)?;
+    if got != (m & 0o7777) {
+        return Err(std::io::Error::other(format!(
+            "mode 적용 검증 실패: 요청 {:04o} 실제 {:04o} — 대상 교체 안 함",
+            m & 0o7777,
+            got
+        )));
+    }
+    Ok(())
+}
+
+/// Windows 에는 POSIX 실행비트가 없다 — `create_tmp_with_mode` 의 `cfg(not(unix))` 쌍과 같은 계약으로
+/// mode 를 받아 **무시**한다(H-08 의 remedy 는 Windows 에서 구조적으로 no-op 이다).
+#[cfg(not(unix))]
+fn apply_mode_exact(_f: &std::fs::File, _m: u32) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// `install_into` 의 실행비트 규칙과 **같은 식**(pack.rs 의 shebang 루프) — 고정 목록은 드리프트한다.
+pub fn exec_mode_for(bytes: &[u8]) -> Option<u32> {
+    if bytes.starts_with(b"#!") {
+        Some(0o755)
+    } else {
+        None
+    }
+}
+
+/// 쓰기 **전** 대상의 현재 mode(없거나 읽을 수 없으면 None). 호출부는 반드시 쓰기 전에 읽어야 한다 —
+/// 쓰기 뒤에 읽으면 tmp+rename 이 이미 mode 를 버린 뒤다.
+pub fn current_mode(path: &Path) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .ok()
+            .map(|m| m.permissions().mode() & 0o7777)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// H-08 의 mode 규칙 **한 곳**(어느 호출부도 규칙을 반복하지 않는다).
+///
+/// - 선행 파일에 **실행비트가 하나라도** 있으면 그 mode 를 **그대로** 유지한다(의도된 0700 을 0755 로
+///   넓히지 않는다).
+/// - 선행 파일에 실행비트가 없고, **system 등급 매니페스트 항목**이며 내용이 `#!` 로 시작하면 **0755 로
+///   복구**한다(`install_into` 와 같은 규칙 · 이전 치유가 0644 로 망가뜨린 대상을 되살린다).
+/// - 그 밖의 선행 파일은 **그대로** 유지한다(사용자가 일부러 비실행으로 둔 파일은 설치기의 일이 아니다).
+/// - 선행 파일이 **없으면** 내용에서 파생한다([`exec_mode_for`]).
+pub fn pack_target_mode(
+    prior: Option<u32>,
+    bytes: &[u8],
+    system_manifest_entry: bool,
+) -> Option<u32> {
+    match prior {
+        Some(p) if p & 0o111 != 0 => Some(p),
+        Some(_) if system_manifest_entry && bytes.starts_with(b"#!") => Some(0o755),
+        Some(p) => Some(p),
+        None => exec_mode_for(bytes),
+    }
+}
+
+/// C-07 (0.14.55 · P3) 한 파일에 대한 낡은 매니페스트 항목 판정.
+///
+/// 이 판정은 **plan/install 분류 바로 앞**에 선다 — `decide_file_action` 의 7개 arm 은
+/// **손대지 않는다**. 고치는 것은 그 함수에 들어가는 **manifest_hash 하나**이고(기준선 수리),
+/// 판정 불가인 경우에만 호출부가 분류를 건너뛰고 제자리 보존을 고른다. arm 을 고치면 같은 사실을
+/// 7곳에 흩뿌리게 되므로 그렇게 하지 않는다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StaleEntry {
+    /// 항목이 건전하거나 이 판정의 범위 밖 — 받은 해시 그대로 분류한다.
+    Normal,
+    /// 항목이 낡았고 **디스크 바이트가 표에 있는 과거 릴리스 본**이다 → 기준선을 그 해시로 수리.
+    /// 그 뒤 Arm 2 가 맞아 `자동 갱신`(비수정 파일의 깨끗한 벤더 갱신)으로 분류된다.
+    Repaired(String),
+    /// 항목이 낡았고 디스크 바이트가 **무엇인지 말할 수 없다**(표에 행이 없거나 어느 행과도 불일치)
+    /// → ⛔**제자리 보존 + 보고**. 쓰지 않고, `.user` 를 만들지 않고, 원장에 적지 않는다.
+    KeepInPlace(&'static str),
+}
+
+/// [`StaleEntry`] 판정. 순수 — IO 는 호출부가 이미 읽은 값으로만 한다.
+///
+/// 규칙(설계 R3 section 3-2 · 보수 분기):
+/// 1. system 등급이 아니면 `Normal` (user·seed-once 는 이 판정의 대상이 아니다)
+/// 2. 매니페스트 항목이 없으면 `Normal` (레거시 경로 — 거동 불변)
+/// 3. 항목이 디스크 해시와 같으면 `Normal` (건전)
+/// 4. 표에 행이 없으면 `KeepInPlace("no-row")`
+/// 5. 디스크 해시가 그 행에 있으면 `Repaired(디스크 해시)`
+/// 6. 그 밖 → `KeepInPlace("unknown-disk")`
+///
+/// ⛔`.pristine` 조상을 근거로 3-way 병합을 고르는 확장은 **이 판에 없다**
+/// (이관 D5H-20261027-P3-PRISTINE-MERGE): 디스크 바이트가 무엇인지 모르는 파일에 대해 조상이
+/// 그 파일을 설명한다고 신뢰하는 것이기 때문이다.
+pub fn classify_stale_entry(
+    dir: &Path,
+    rel: &str,
+    scope: PackScope,
+    embed: &str,
+    disk: Option<&str>,
+    manifest_hash: Option<&str>,
+    has_pending_entry: bool,
+) -> StaleEntry {
+    // ★조상 해시는 **낡음 판정의 가드**다(이관된 pristine-Merge3 확장과 다르다): 항목이 조상과
+    //   같으면 그 항목은 낡은 것이 아니라 **정상적인 드리프트/병합 상태의 기준선**이다.
+    //   이 가드를 빼면 합법적인 로컬 수정(항목==조상 해시 · 건강한 3-way 경로)이 "출처 불명"으로
+    //   오분류돼 3-way 병합이 사라진다(실측: lib 스위트 52건 적색).
+    let pristine_hash = std::fs::read_to_string(dir.join(PRISTINE_DIR).join(rel))
+        .ok()
+        .map(|p| content_hash(&p));
+    classify_stale_entry_with(
+        rel,
+        scope,
+        disk,
+        manifest_hash,
+        pristine_hash.as_deref(),
+        Some(content_hash(embed).as_str()),
+        crate::pack_prev_vendor::prev_vendor_hashes(rel),
+        has_pending_entry,
+    )
+}
+
+/// [`classify_stale_entry`] 의 **표 주입판**. 표를 인자로 받아 완전히 순수해진다.
+///
+/// 왜 분리하는가: 정적 표만으로는 `Repaired` 분기를 검체로 만들 수 없다 — 그 분기를 밟으려면
+/// **해시가 표의 한 행과 같은 내용**이 필요하고, 과거 릴리스의 내용은 런타임에 없다. 표를 주입하면
+/// 검체가 `(내용, hash(내용))` 쌍을 스스로 만들어 여섯 분기를 전부 밟을 수 있다.
+pub fn classify_stale_entry_with(
+    rel: &str,
+    scope: PackScope,
+    disk: Option<&str>,
+    manifest_hash: Option<&str>,
+    pristine_hash: Option<&str>,
+    embed_hash: Option<&str>,
+    known: &[&str],
+    has_pending_entry: bool,
+) -> StaleEntry {
+    if ownership_scoped(rel, scope) != Ownership::System {
+        return StaleEntry::Normal;
+    }
+    let (Some(d), Some(mh)) = (disk, manifest_hash) else {
+        return StaleEntry::Normal;
+    };
+    let dh = content_hash(d);
+    if dh == mh {
+        return StaleEntry::Normal;
+    }
+    // 항목이 **조상**과 같으면 낡은 것이 아니다 — 평범한 드리프트/3-way 입력이다.
+    if pristine_hash == Some(mh) {
+        return StaleEntry::Normal;
+    }
+    // ★항목이 **임베드**와 같으면 그것은 가능한 가장 새로운 값이다 = 정의상 낡지 않았다.
+    //   이때 디스크가 다른 이유는 **사용자가 고쳤기 때문**이고(vendor 미전진 = L2 kept-drift),
+    //   그 경로의 pinned 거동(제자리 보존 + 원장 kept-drift 계상)은 손대지 않는다.
+    //   이 가드가 없으면 합법적인 L2 가 가로채여 원장 계상이 사라진다(실측: plan=actual 검체 적색).
+    if embed_hash == Some(mh) {
+        return StaleEntry::Normal;
+    }
+    // ★디스크가 **현재 임베드**와 같으면 그 바이트의 출처는 '불명'이 아니라 **이번 vendor 본**이다.
+    //   표는 현재 릴리스의 blob 을 **구조적으로 제외**하므로(`scripts/gen_prev_vendor_hashes.py`
+    //   `if o != oid_now:`) hash(embed) 는 어느 행에도 없고, 전진 없는 파일은 행 자체가 없다 ⇒
+    //   아래 `no-row` 로 떨어져 제자리 보존이 되고, 그 결과 `decide_file_action` Arm 1
+    //   (`Some(d) if d == embed` → `Keep { adopt_hash: true }`)과 그 뒤의 `manifest.insert` 가
+    //   **도달 불가**가 돼 낡은 항목이 영구히 수리되지 않는다.
+    //   ⇒ 여기서 `Normal` 을 돌려 Arm 1 이 설계대로 돌게 한다(codex r1 m2 · gemini-3 r1 major 1).
+    //   ⛔C-07 좁힘은 그대로다: 제자리 보존은 여전히 '해시 불명 ∧ 병합 대기 없음' 일 때만이고,
+    //      이 가드는 그 '불명' 집합에서 **알려진 현재 본**을 빼는 것이지 좁힘을 되돌리지 않는다.
+    if embed_hash == Some(dh.as_str()) {
+        return StaleEntry::Normal;
+    }
+    if known.contains(&dh.as_str()) {
+        return StaleEntry::Repaired(dh);
+    }
+    // ★판정 승인(HEAD-RULING-P3-IMPL-C07-NARROW.md `9c1f081bab6f4c08`, 항목 1-2):
+    //   제자리 보존은 **둘이 함께** 성립할 때만이다 — 디스크 해시가 표에 없고 **그리고** 그 경로에
+    //   **병합 대기 원장 항목이 없다**. 항목이 있으면 디스크 바이트의 출처는 '불명'이 아니라
+    //   **그 병합**이므로, pinned 크래시 창 수렴(치유 + 병합본 `.user` 보존)이 9dbea792 그대로 돈다.
+    //   이 좁힘이 없으면 같은 상태 서명을 공유하는 merge3 크래시 창 복구 장치가 제거된다
+    //   (치명위험 ③ 자가치유 전멸 · 실측 검체 merge3_crash_windows_converge [W3]).
+    if has_pending_entry {
+        return StaleEntry::Normal;
+    }
+    if known.is_empty() {
+        return StaleEntry::KeepInPlace("no-row");
+    }
+    StaleEntry::KeepInPlace("unknown-disk")
+}
+
+/// H-08 의 "system 등급 **매니페스트 항목**인가" 판정 — [`pack_target_mode`] 의 0644→0755 복구 분기를
+/// 그 집합으로만 좁히는 데 쓴다. 매니페스트 밖 파일·user 등급 파일은 사용자가 일부러 비실행으로 둘 수
+/// 있으므로 복구 대상이 아니다(판독 실패 = 복구 안 함 = 안전측).
+pub fn is_system_manifest_entry(dir: &Path, rel: &str) -> bool {
+    if ownership_name_scoped(rel, dir) != "system" {
+        return false;
+    }
+    let Ok(s) = std::fs::read_to_string(dir.join(INSTALL_MANIFEST)) else {
+        return false;
+    };
+    let Ok(m) = serde_json::from_str::<std::collections::BTreeMap<String, String>>(&s) else {
+        return false;
+    };
+    m.contains_key(rel)
+}
+
+/// 팩 **대상** 파일 쓰기(H-08). 사이드카(`<rel>.user`·`.base`·`.pristine`·`.vendor-base`)는 이 함수를
+/// 쓰지 않는다 — 그쪽은 데이터이고 실행되지 않는다(설계의 명시 결정).
+pub fn write_pack_file(
+    path: &Path,
+    bytes: &[u8],
+    prior: Option<u32>,
+    system_manifest_entry: bool,
+) -> std::io::Result<()> {
+    write_atomic_mode_exact(path, bytes, pack_target_mode(prior, bytes, system_manifest_entry))
 }
 
 /// pristine 미러 갱신(best-effort — 3-way 병합의 공통 조상 확보용 자문 데이터).
@@ -3829,7 +4142,26 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
         let disk = if exists { std::fs::read_to_string(&path).ok() } else { None };
         // 판정 입력과 동일한 사실(존재하나 읽기 실패) — 소유권 술어를 다시 쓰지 않는다(SOT 분산 금지).
         let unreadable = exists && disk.is_none();
-        let mhash: Option<String> = manifest.get(rel).cloned();
+        let mhash_raw: Option<String> = manifest.get(rel).cloned();
+        // ★C-07: 분류 직전 판정 — 기준선 수리 또는 제자리 보존.
+        let stale = classify_stale_entry(
+            &dir,
+            rel,
+            scope,
+            content,
+            disk.as_deref(),
+            mhash_raw.as_deref(),
+            pending.contains_key(rel),
+        );
+        let mhash: Option<String> = match &stale {
+            StaleEntry::Repaired(h) => {
+                // 기준선을 **디스크에 실제로 있는 과거 릴리스 해시**로 수리한다 — 그러면 Arm 2 가
+                // 맞아 깨끗한 벤더 갱신이 되고, 유령 `.user` 와 거짓 "healed" 원장 항목이 사라진다.
+                manifest.insert(rel.to_string(), h.clone());
+                Some(h.clone())
+            }
+            _ => mhash_raw.clone(),
+        };
         // ★G3 축2(seed-from-base): 부서 soul.md 의 최초 시드는 임베드 템플릿이 아니라 **base 팩의
         // 현행 soul.md 승계**다(부서는 base 헌장 아래에서 태어난다 — 2026-08-21 확정). `!exists`
         // 에만 발동하므로 이후 SeedOnce 불가침과 정합하고, 치환된 content 가 아래 판정·write·
@@ -3849,6 +4181,19 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
             (true, Some(d), Some(m)) if d != content => load_verified_base(&dir, rel, m),
             _ => None,
         };
+        // ★`!force` 게이트(gemini-3 r1 major 1) — plan_install 과 같은 이유로 짝을 맞춘다.
+        if let (StaleEntry::KeepInPlace(reason), false) = (&stale, force) {
+            // ⛔C-07 보수 분기: 디스크 바이트가 과거 릴리스 본이라고 말할 근거가 없다 →
+            //   **제자리 보존 + 보고**. 대상도 `.user` 도 원장도 쓰지 않는다(파일시스템 변화 0).
+            //   종전(설계 R2)은 여기서 L4 강제 치유로 떨어져 운영자가 쓰지 않은 바이트의 `.user`
+            //   백업과 거짓 "healed" 원장 항목을 만들었다(reviewer1 r2 M3).
+            kept += 1;
+            eprintln!(
+                "📌 제자리 보존 '{rel}' — 매니페스트 항목이 낡았고 디스크 바이트의 출처를 \
+                 확인할 수 없습니다({reason}) · 아무것도 쓰지 않았습니다"
+            );
+            continue;
+        }
         match decide_file_action(
             rel, content, exists, disk.as_deref(), mhash.as_deref(), force, scope,
             verified_base.as_deref(),
@@ -3857,9 +4202,11 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                 if adopt_hash {
                     // 디스크 = 임베드: 최신. 매니페스트 공백(구설치본)이면 채택 기록해
                     // 다음 버전부터 자동 갱신 대상이 되게 한다. pristine 승계도 보장.
-                    manifest
-                        .entry(rel.to_string())
-                        .or_insert_with(|| content_hash(content));
+                    // ★C-07 예방: `or_insert_with` 는 **키가 없을 때만** 넣어 이미 있는 낡은 항목을
+                    //   그대로 둔다 — 그것이 세 파일을 낡은 상태로 만든 기제다. 무조건 넣어 불변식을
+                    //   세운다: *매니페스트 항목은 설치·채택된 내용의 해시와 항상 같다*
+                    //   (쓰기 경로가 이미 하는 것과 같다).
+                    manifest.insert(rel.to_string(), content_hash(content));
                     ensure_pristine(&dir, rel, content);
                     // ★T3(D6) 원장 수명 — disk==embed 재일치 합류점: kept-drift·quarantined 는
                     // 제거(new-pending 청소 동형 — 방치 시 유령 계상 영구화 실측), merged·conflicted
@@ -4846,6 +5193,516 @@ pub(crate) static PACK_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ───────────────────────── C-07 (0.14.55 · P3) ─────────────────────────
+    /// C-07 낡은 항목 판정의 **여섯 분기 전부**. 표를 주입하므로 `Repaired` 도 밟는다.
+    #[test]
+    fn c07_classify_stale_entry_six_branches() {
+        // system 등급 rel 하나를 임베드에서 고른다(등급 술어를 검체가 다시 쓰지 않는다).
+        let sysrel = PACK_ALL
+            .iter()
+            .map(|(r, _)| *r)
+            .find(|r| ownership_scoped(r, PackScope::Base) == Ownership::System)
+            .expect("system rel");
+        let userrel = PACK_ALL
+            .iter()
+            .map(|(r, _)| *r)
+            .find(|r| ownership_scoped(r, PackScope::Base) == Ownership::User)
+            .expect("user rel");
+
+        let prev_vendor = "vendor bytes of a previous release\n";
+        let hp = content_hash(prev_vendor);
+        let stale = content_hash("a hash older than both\n");
+        let table: Vec<&str> = vec![hp.as_str()];
+
+        // 1) system 아님 → Normal (user 파일은 이 판정의 대상이 아니다)
+        assert_eq!(
+            classify_stale_entry_with(
+                userrel, PackScope::Base, Some("x"), Some(&stale), None, None, &table, false
+            ),
+            StaleEntry::Normal
+        );
+        // 2) 매니페스트 항목 부재 → Normal (레거시 경로 거동 불변)
+        assert_eq!(
+            classify_stale_entry_with(sysrel, PackScope::Base, Some("x"), None, None, None, &table, false),
+            StaleEntry::Normal
+        );
+        // 3) 항목이 디스크와 일치 → Normal (건전)
+        let dh = content_hash("x");
+        assert_eq!(
+            classify_stale_entry_with(sysrel, PackScope::Base, Some("x"), Some(&dh), None, None, &table, false),
+            StaleEntry::Normal
+        );
+        // 4) 표에 행이 없음 → KeepInPlace("no-row")
+        assert_eq!(
+            classify_stale_entry_with(sysrel, PackScope::Base, Some("x"), Some(&stale), None, None, &[], false),
+            StaleEntry::KeepInPlace("no-row")
+        );
+        // 5) ★디스크가 표에 있는 과거 릴리스 본 → Repaired(디스크 해시)
+        assert_eq!(
+            classify_stale_entry_with(
+                sysrel,
+                PackScope::Base,
+                Some(prev_vendor),
+                Some(&stale),
+                None,
+                None,
+                &table,
+                false
+            ),
+            StaleEntry::Repaired(hp.clone())
+        );
+        // 6) 디스크가 어느 행과도 불일치 → KeepInPlace("unknown-disk") ⛔강제 치유 아님
+        assert_eq!(
+            classify_stale_entry_with(
+                sysrel,
+                PackScope::Base,
+                Some("the operator wrote this\n"),
+                Some(&stale),
+                None,
+                None,
+                &table,
+                false
+            ),
+            StaleEntry::KeepInPlace("unknown-disk")
+        );
+        // 7) ★판정 승인(C07-NARROW 항목 1-2): 같은 '출처 불명' 상태에 **병합 대기 원장 항목이 있으면**
+        //    디스크 출처는 그 병합이다 → Normal → pinned 크래시 창 수렴이 그대로 돈다.
+        assert_eq!(
+            classify_stale_entry_with(
+                sysrel,
+                PackScope::Base,
+                Some("the operator wrote this\n"),
+                Some(&stale),
+                None,
+                None,
+                &table,
+                true
+            ),
+            StaleEntry::Normal,
+            "병합 대기 항목이 있으면 제자리 보존이 아니다(크래시 창 수렴 보존)"
+        );
+        // 7b) ★항목이 임베드와 같으면 낡지 않았다(L2 kept-drift 경로 보존).
+        let he = content_hash("embed-now\n");
+        assert_eq!(
+            classify_stale_entry_with(
+                sysrel, PackScope::Base, Some("user edit\n"), Some(&he), None, Some(&he), &table, false
+            ),
+            StaleEntry::Normal,
+            "항목==hash(embed) 는 가능한 가장 새로운 값 = 낡지 않았다(L2 pinned 거동 보존)"
+        );
+        // 8) 행이 없는 경로도 같다 — 항목이 있으면 Normal.
+        assert_eq!(
+            classify_stale_entry_with(sysrel, PackScope::Base, Some("x"), Some(&stale), None, None, &[], true),
+            StaleEntry::Normal,
+            "no-row + 병합 대기 항목 → Normal"
+        );
+    }
+
+    /// ★T12 (gemini-3 r1 major 1 · codex r1 m2) — **디스크 == 현재 임베드**인데 매니페스트 항목이
+    /// 낡은 상태는 '출처 불명'이 아니다. 표는 현재 릴리스 blob 을 구조적으로 제외하므로
+    /// (`gen_prev_vendor_hashes.py` 의 `if o != oid_now:`) 이 상태는 `no-row` 로 떨어져 제자리
+    /// 보존이 되고, 그러면 Arm 1(`Keep{adopt_hash:true}`) 과 그 뒤의 `manifest.insert` 가 영구히
+    /// 도달 불가가 된다 — 낡은 항목이 **수리되지 않는다**. 분류기와 rig 양쪽에서 잰다.
+    #[test]
+    fn p3r1_m2_disk_equal_to_current_embed_reaches_adoption() {
+        let sysrel = PACK_ALL
+            .iter()
+            .map(|(r, _)| *r)
+            .find(|r| ownership_scoped(r, PackScope::Base) == Ownership::System)
+            .expect("system rel");
+        let embed = "current vendor bytes\n";
+        let he = content_hash(embed);
+        let stale = content_hash("an entry older than both\n");
+        let prev_row = content_hash("some previous release\n");
+        let table: Vec<&str> = vec![prev_row.as_str()];
+
+        // ⓐ 조상 없음(pristine absent) + 낡은 항목 + 디스크==임베드 → Normal(=Arm 1 로 간다)
+        assert_eq!(
+            classify_stale_entry_with(
+                sysrel, PackScope::Base, Some(embed), Some(&stale), None, Some(&he), &table, false
+            ),
+            StaleEntry::Normal,
+            "디스크가 현재 임베드면 '불명' 이 아니다 — 채택 경로로 가야 한다"
+        );
+        // ⓑ 조상 == 현재 임베드 + 낡은 항목 + 디스크==임베드 → Normal
+        assert_eq!(
+            classify_stale_entry_with(
+                sysrel, PackScope::Base, Some(embed), Some(&stale), Some(&he), Some(&he), &table, false
+            ),
+            StaleEntry::Normal
+        );
+        // ⓒ 대조군(유지돼야 하는 것 1) — 운영자 수정본은 여전히 제자리 보존이다.
+        assert_eq!(
+            classify_stale_entry_with(
+                sysrel,
+                PackScope::Base,
+                Some("the operator wrote this\n"),
+                Some(&stale),
+                None,
+                Some(&he),
+                &table,
+                false
+            ),
+            StaleEntry::KeepInPlace("unknown-disk"),
+            "출처 불명 수정본의 제자리 보존(C-07 좁힘)은 그대로여야 한다"
+        );
+        // ⓓ 대조군(유지돼야 하는 것 2) — 병합 대기 항목이 있으면 Normal(크래시 창 수렴 보존).
+        assert_eq!(
+            classify_stale_entry_with(
+                sysrel,
+                PackScope::Base,
+                Some("the operator wrote this\n"),
+                Some(&stale),
+                None,
+                Some(&he),
+                &table,
+                true
+            ),
+            StaleEntry::Normal
+        );
+
+        // ── rig: 낡은 항목이 실제로 수리되는가(plan 과 install 양쪽) ──
+        let _lock = PACK_ENV_LOCK.lock().unwrap();
+        let td = std::env::temp_dir().join(format!(
+            "cys-p3r1-m2-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&td);
+        let pd = td.join("pack");
+        std::fs::create_dir_all(&pd).unwrap();
+        let _env = set_pack_env(&pd, td.join("cfg"));
+        let items = [(sysrel, embed)];
+        install_into(
+            pd.clone(), items.iter().copied(), false, "1.0.0", false, false,
+            pack_scope_of(&pd), None, None,
+        )
+        .unwrap();
+        // 출하된 결함 상태를 만든다: 디스크·조상은 그대로 두고 **매니페스트 항목만** 낡게 한다.
+        let mpath = pd.join(INSTALL_MANIFEST);
+        let mut manifest: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(&std::fs::read_to_string(&mpath).unwrap()).unwrap();
+        manifest.insert(sysrel.to_string(), stale.clone());
+        std::fs::write(&mpath, serde_json::to_string(&manifest).unwrap()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(pd.join(sysrel)).unwrap(),
+            embed,
+            "전제: 디스크는 현재 임베드다"
+        );
+
+        let plan = plan_install(&pd, &items, false, "1.0.1");
+        assert!(
+            plan.kept_drift.is_empty(),
+            "제자리 보존으로 떨어지면 안 된다(그러면 항목이 영구히 낡는다): {:?}",
+            plan.kept_drift
+        );
+        assert_eq!(plan.unchanged, 1, "Arm 1 = 최신(변화 없음) 계상이어야 한다");
+
+        install_into(
+            pd.clone(), items.iter().copied(), false, "1.0.1", false, false,
+            pack_scope_of(&pd), None, None,
+        )
+        .unwrap();
+        let manifest2: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(&std::fs::read_to_string(&mpath).unwrap()).unwrap();
+        assert_eq!(
+            manifest2.get(sysrel),
+            Some(&he),
+            "낡은 항목이 hash(embed) 로 수리돼야 한다(manifest.insert 도달)"
+        );
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// ★`!force` 게이트(gemini-3 r1 major 1 후반) — 제자리 보존 단축은 **보수 기본 경로**의 것이다.
+    /// `--force` 는 사용자가 vendor 본을 명시적으로 강제하는 동사이므로 그 자리에서 분류를 건너뛰면
+    /// 강제가 조용히 무시된다. plan 쪽에서 잰다(install 쪽은 같은 게이트의 짝).
+    #[test]
+    fn p3r1_major1_keep_in_place_short_circuit_is_gated_on_force() {
+        let sysrel = PACK_ALL
+            .iter()
+            .map(|(r, _)| *r)
+            .find(|r| ownership_scoped(r, PackScope::Base) == Ownership::System)
+            .expect("system rel");
+        let embed = "vendor v2\n";
+        let _lock = PACK_ENV_LOCK.lock().unwrap();
+        let td = std::env::temp_dir().join(format!(
+            "cys-p3r1-force-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&td);
+        let pd = td.join("pack");
+        std::fs::create_dir_all(&pd).unwrap();
+        let _env = set_pack_env(&pd, td.join("cfg"));
+        install_into(
+            pd.clone(), [(sysrel, "vendor v1\n")].iter().copied(), false, "1.0.0", false, false,
+            pack_scope_of(&pd), None, None,
+        )
+        .unwrap();
+        // 출처 불명 상태: 디스크는 운영자 바이트, 항목은 낡음, 병합 대기 없음.
+        std::fs::write(pd.join(sysrel), "the operator wrote this\n").unwrap();
+        let mpath = pd.join(INSTALL_MANIFEST);
+        let mut manifest: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(&std::fs::read_to_string(&mpath).unwrap()).unwrap();
+        manifest.insert(sysrel.to_string(), content_hash("an entry older than both\n"));
+        std::fs::write(&mpath, serde_json::to_string(&manifest).unwrap()).unwrap();
+        let items = [(sysrel, embed)];
+
+        let plan_default = plan_install(&pd, &items, false, "1.0.1");
+        assert!(
+            plan_default.kept_drift.iter().any(|r| r == sysrel),
+            "기본 경로(!force)는 제자리 보존이다: {:?}",
+            plan_default.kept_drift
+        );
+        let plan_forced = plan_install(&pd, &items, true, "1.0.1");
+        assert!(
+            !plan_forced.kept_drift.iter().any(|r| r == sysrel),
+            "--force 에서는 단축이 걸리지 않아야 한다(강제의 침묵 무시 금지): {:?}",
+            plan_forced.kept_drift
+        );
+        assert!(
+            plan_forced.heal.iter().any(|r| r == sysrel) || plan_forced.update.iter().any(|r| r == sysrel),
+            "--force 는 분류로 내려가 치유/갱신으로 잡혀야 한다: heal={:?} update={:?}",
+            plan_forced.heal,
+            plan_forced.update
+        );
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// ★T23 (codex r1 m1 · gemini-3 r1 major 2-a) — `apply_mode_exact` 의 **불일치 거부**가
+    /// 실제로 부하를 진다: mode 적용이 조용히 무시되는 고장을 **주입**해 ①`Err` ②rename 전 중단
+    /// (대상 바이트·mode 무변경) ③tmp 정리를 모두 잰다. 이 검체가 worker-15 가 자진 신고한
+    /// 살아남은 변이(M-b = 검증 비교문 제거)를 죽인다.
+    #[cfg(unix)]
+    #[test]
+    fn p3r1_m1_mode_verify_failure_refuses_before_rename() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = std::env::temp_dir().join(format!(
+            "cys-p3r1-t23-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&td);
+        std::fs::create_dir_all(&td).unwrap();
+        let target = td.join("script.sh");
+        std::fs::write(&target, "#!/bin/sh\nold\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        // 주입 고장: **mode 적용이 요청과 다른 결과를 낸다**(관측은 진짜 `fstat`). 되읽기 검증만이
+        //   이것을 잡는다 — 이것이 "mode 를 조용히 무시하는 파일시스템"의 결정론 모형이다.
+        // ⛔문자 그대로의 no-op(`|_f,_m| Ok(())`)은 **umask 에 의존해 거짓 녹색**이 된다: 실측 결과
+        //   umask 022 아래에서는 `create_tmp_with_mode` 의 `open(2)` 가 이미 0755 를 만들어 두어
+        //   검증이 통과해 버렸다(이 검체의 첫 판이 그렇게 녹색이었다). 그래서 적용 결과를 요청과
+        //   **다르게** 만드는 쪽으로 고장을 모형화한다 — 같은 분기를 밟으면서 umask 와 무관하다.
+        fn chmod_wrong_then_verify(f: &std::fs::File, m: u32) -> std::io::Result<()> {
+            apply_mode_exact_with(f, m, |f, _m| set_mode_fchmod(f, 0o600), observe_mode_fstat)
+        }
+        let err = write_atomic_mode_inner(
+            &target,
+            b"#!/bin/sh\nnew\n",
+            Some(0o755),
+            true,
+            chmod_wrong_then_verify,
+        )
+        .expect_err("mode 적용이 무시됐는데 성공을 돌려주면 조용한 실패다");
+        assert!(
+            err.to_string().contains("mode 적용 검증 실패"),
+            "거부 사유가 mode 검증이어야 한다: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "#!/bin/sh\nold\n",
+            "rename 전에 멈췄으므로 대상 바이트는 그대로다"
+        );
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+            0o644,
+            "대상 mode 도 그대로다"
+        );
+        let leftovers: Vec<String> = std::fs::read_dir(&td)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "script.sh")
+            .collect();
+        assert!(leftovers.is_empty(), "실패 경로가 tmp 를 남겼다: {leftovers:?}");
+
+        // 계측 타당성(양성 대조) — 진짜 수단으로는 같은 호출이 성공하고 요청 mode 가 정확히 선다.
+        write_atomic_mode_inner(
+            &target,
+            b"#!/bin/sh\nnew\n",
+            Some(0o755),
+            true,
+            apply_mode_exact,
+        )
+        .expect("진짜 fchmod 경로는 성공해야 한다");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+            0o755
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "#!/bin/sh\nnew\n");
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// 생성된 표가 **실제로** 실려 있고 조회가 돈다(빈 표로 컴파일되면 모든 경로가 no-row 가 되어
+    /// 조용히 "아무것도 안 함"이 되므로, 표의 실재 자체가 검체 대상이다).
+    #[test]
+    fn c07_generated_table_is_present_and_queryable() {
+        let n = crate::pack_prev_vendor::PREV_VENDOR_HASHES.len();
+        assert!(n >= 100, "표 행 수가 비정상적으로 적다: {n}");
+        // 정렬 전제(이진 탐색) — 깨지면 조회가 조용히 빈 슬라이스를 돌려준다.
+        let mut sorted = true;
+        for w in crate::pack_prev_vendor::PREV_VENDOR_HASHES.windows(2) {
+            if w[0].0 >= w[1].0 {
+                sorted = false;
+                break;
+            }
+        }
+        assert!(sorted, "PREV_VENDOR_HASHES 는 rel 로 정렬돼 있어야 한다(이진 탐색 전제)");
+        // 모든 행의 해시는 64자 소문자 hex 여야 한다.
+        for (rel, hs) in crate::pack_prev_vendor::PREV_VENDOR_HASHES {
+            assert!(!hs.is_empty(), "빈 행은 no-row 와 구별되지 않는다: {rel}");
+            for h in *hs {
+                assert!(
+                    h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
+                    "해시 형식 위반 {rel}: {h}"
+                );
+            }
+        }
+        // 표에 있는 첫 행은 조회로 찾을 수 있고, 없는 경로는 빈 슬라이스다.
+        let first = crate::pack_prev_vendor::PREV_VENDOR_HASHES[0].0;
+        assert!(!crate::pack_prev_vendor::prev_vendor_hashes(first).is_empty());
+        assert!(crate::pack_prev_vendor::prev_vendor_hashes("no/such/path.xyz").is_empty());
+    }
+
+    // ───────────────────────── H-08 (0.14.55 · P3) ─────────────────────────
+    /// H-08 의 mode 규칙표(순수 함수 · umask 무관). 설계 R2 section 1-3 의 다섯 행 전부.
+    #[test]
+    fn h08_pack_target_mode_rule_table() {
+        let sheb = b"#!/usr/bin/env python3\n";
+        let plain = b"{\"k\": 1}\n";
+        // A) 실행비트가 있으면 그대로 — 0755 는 0755
+        assert_eq!(pack_target_mode(Some(0o755), sheb, true), Some(0o755));
+        // B) 의도된 0700 을 0755 로 **넓히지 않는다**
+        assert_eq!(pack_target_mode(Some(0o700), sheb, true), Some(0o700));
+        // C) system 매니페스트 항목 + shebang + 실행비트 소실 → 0755 복구
+        assert_eq!(pack_target_mode(Some(0o644), sheb, true), Some(0o755));
+        // C') 같은 0644 shebang 이지만 system 매니페스트 항목이 **아니면** 손대지 않는다
+        assert_eq!(pack_target_mode(Some(0o644), sheb, false), Some(0o644));
+        // D) 선행 파일 없음 + shebang → 0755
+        assert_eq!(pack_target_mode(None, sheb, true), Some(0o755));
+        // E) 선행 파일 없음 + 비-shebang → 파생값 없음(종전 기본 퍼미션)
+        assert_eq!(pack_target_mode(None, plain, true), None);
+        // F) 선행 0644 비-shebang → 그대로
+        assert_eq!(pack_target_mode(Some(0o644), plain, true), Some(0o644));
+        // exec_mode_for 자체
+        assert_eq!(exec_mode_for(sheb), Some(0o755));
+        assert_eq!(exec_mode_for(plain), None);
+    }
+
+    /// ★H-08 의 기제: `write_atomic_mode` 는 mode 를 `open(2)` 인자로 넘겨 **umask 로 걸러지고**,
+    /// `write_atomic_mode_exact` 는 tmp 디스크립터에 `fchmod` 로 적용해 **umask 와 무관**하다.
+    ///
+    /// ★격리(판정 C07-NARROW 항목 4-a): umask 는 **프로세스 전역**이고 cargo 는 검체를 같은 프로세스의
+    /// 병렬 스레드로 돌린다 — 락으로는 그 락을 잡지 않는 검체를 막을 수 없다. 그래서 umask 창은
+    /// **자식 프로세스**에서만 열린다: 부모가 자기 테스트 바이너리를 `--exact` 로 재실행하고
+    /// (환경변수가 자식 분기를 고른다) 자식이 파일을 만든 뒤 종료하면, 부모가 그 파일의 mode 를
+    /// 단언한다. 단언은 약화되지 않았다 — 두 umask 에서 정확히 같은 것을 본다.
+    #[cfg(unix)]
+    #[test]
+    fn h08_exact_writer_is_umask_independent_and_plain_writer_is_not() {
+        use std::os::unix::fs::PermissionsExt;
+        const MARKER: &str = "CYS_H08_UMASK_CHILD";
+        const SHEB: &[u8] = b"#!/usr/bin/env python3\n";
+        const UMASKS: [u32; 2] = [0o111, 0o077];
+
+        if let Ok(base) = std::env::var(MARKER) {
+            // ── 자식: umask 창은 이 프로세스에만 존재한다 ──
+            let base = std::path::PathBuf::from(base);
+            for um in UMASKS {
+                let prev = unsafe { libc::umask(um as libc::mode_t) };
+                let exact = base.join(format!("exact-{um:04o}"));
+                let plain = base.join(format!("plain-{um:04o}"));
+                let a = write_atomic_mode_exact(&exact, SHEB, Some(0o755));
+                let b = write_atomic_mode(&plain, SHEB, Some(0o755));
+                unsafe { libc::umask(prev) };
+                a.expect("exact 쓰기");
+                b.expect("plain 쓰기");
+            }
+            // mode=None 회귀 대조(exact 가 기본 거동을 바꾸지 않는다).
+            write_atomic_mode_exact(&base.join("none-exact"), b"x\n", None).expect("none exact");
+            write_atomic_mode(&base.join("none-plain"), b"x\n", None).expect("none plain");
+            return;
+        }
+
+        // ── 부모: 자식을 띄우고 자식이 만든 파일의 mode 를 단언한다 ──
+        let base = std::env::temp_dir().join(format!("cys-h08-umask-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        // 디렉터리 실행비트는 자식의 umask 와 무관하게 세워 둔다(없으면 자식이 자기를 막는다).
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let exe = std::env::current_exe().expect("test 바이너리 경로");
+        let st = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "pack::tests::h08_exact_writer_is_umask_independent_and_plain_writer_is_not",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(MARKER, &base)
+            .status()
+            .expect("자식 테스트 프로세스 기동");
+        assert!(st.success(), "자식 프로세스가 실패했다: {st:?}");
+
+        let mode_of = |p: &std::path::Path| {
+            std::fs::metadata(p).unwrap().permissions().mode() & 0o7777
+        };
+        for um in UMASKS {
+            let m_exact = mode_of(&base.join(format!("exact-{um:04o}")));
+            let m_plain = mode_of(&base.join(format!("plain-{um:04o}")));
+            assert_eq!(
+                m_exact, 0o755,
+                "umask {um:04o}: exact 판은 요청 mode 를 그대로 세워야 한다 — 실측 {m_exact:04o}"
+            );
+            assert_eq!(
+                m_plain,
+                0o755 & !um,
+                "umask {um:04o}: 평문 판의 결과는 정확히 m & !umask 다(기제 대조) — 실측 {m_plain:04o}"
+            );
+            assert_ne!(m_plain, 0o755, "umask {um:04o}: 평문 판이 걸러지지 않았다면 대조가 성립하지 않는다");
+        }
+        assert_eq!(
+            mode_of(&base.join("none-exact")),
+            mode_of(&base.join("none-plain")),
+            "mode=None 에서는 두 경로가 동일해야 한다(회귀 방지)"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// ★H-08 호출부 census(T9): 설계가 열거한 **8개 대상 쓰기**가 전부 새 헬퍼를 타고, 사이드카
+    /// (`<rel>.user`·`.vendor-base`)와 `.pristine` 은 종전 writer 를 그대로 쓴다. 새 대상 쓰기를
+    /// `write_atomic` 으로 추가하면 이 검체가 적색이 된다.
+    #[test]
+    fn h08_target_write_site_census() {
+        let src = include_str!("bin/cys.rs");
+        // 대상 쓰기 = write_pack_file 호출. 설계의 8개 사이트와 수가 일치해야 한다.
+        let target_writes = src.matches("cys::pack::write_pack_file(").count();
+        assert_eq!(
+            target_writes, 8,
+            "설계가 열거한 대상 쓰기 8곳이 전부 write_pack_file 을 타야 한다 — 실측 {target_writes}"
+        );
+        // 사이드카·메타데이터 쓰기는 종전 writer 유지(실행비트를 주지 않는다).
+        for needle in [
+            "write_atomic(&dir.join(format!(\"{rel}.user\"))",
+            ".vendor-base",
+        ] {
+            assert!(
+                src.contains(needle),
+                "사이드카 경로가 사라졌다(설계는 무변경을 요구한다): {needle}"
+            );
+        }
+    }
 
     /// ★(0.14.42 · perf R3-6) 임베드 팩 해시 **메모 핀**. PACK_ALL 은 컴파일 타임 상수라 값이 프로세스 수명
     /// 동안 바뀌지 않는다.
@@ -9449,7 +10306,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// ★후계ⓐ(B2 전환 · v2 §6): 벤더 전진 + base 미검증 드리프트 → 치유 불변(healed).
+    /// ★후계ⓐ(B2 전환 · v2 §6) 의 0.14.55 후속: 벤더 전진 + base 미검증 드리프트는 **출처 불명**이라
+    /// 제자리 보존된다(C-07 · 종전 치유 불변을 이 모집단에서 대체).
     /// 픽스처는 의도적으로 base 검증 실패 형상(manifest≠hash(pristine)) — T3 이후에도 L4 healed
     /// 레인 핀으로 영속(병합 성공 레인은 T3 통합 핀이 별도 담당 — 이 핀을 Merge3 기대로 오개정 금지).
     #[test]
@@ -9475,21 +10333,29 @@ mod tests {
         let _ = std::fs::remove_file(pd.join(PRISTINE_DIR).join(sys));
 
         install_staged(false, None).unwrap();
+        // ★0.14.55(C-07 · P3) 이 「치유 불변(B2 후계ⓐ · v2 §6)」을 **이 모집단에서 대체한다**.
+        //   이 형상은 매니페스트 항목이 디스크와도·조상과도(pristine 제거)·임베드와도 다르고,
+        //   디스크 바이트가 내장 과거벤더 표에 없으며, 병합 대기 항목도 없다 = **출처 불명**이다.
+        //   근거: HEAD-DISPOSITION-P3-R3.md "What proceeds" 2 + HEAD-RULING-P3-IMPL-C07-NARROW.md
+        //   항목 1 — "keep in place + report (no heal, no .user parking, no Merge3)".
+        //   ⇒ 종전 치유는 운영자가 쓰지 않은 바이트의 `.user` 백업과 거짓 "healed" 원장 항목을
+        //      만들었다(reviewer1 r2 M3). 쓰기 0 이 새 불변이다.
+        //   ⛔병합 대기 항목이 있는 형상에서는 pinned 수렴이 그대로 돈다(판정 항목 2 · 별 검체).
         assert_eq!(
             std::fs::read_to_string(pd.join(sys)).unwrap(),
-            sys_embed,
-            "★후계ⓐ(B2 전환 · v2 §6): 벤더 전진+base 미검증 드리프트 → 치유 불변(healed)"
-        );
-        assert_eq!(
-            std::fs::read_to_string(pd.join(format!("{sys}.user"))).unwrap(),
             "SYS-EDIT-XYZ",
-            "치유 전 사용자본 보존 파괴 0 불변"
+            "★C-07(0.14.55): 출처 불명 → 제자리 보존(디스크 바이트 무변경)"
+        );
+        assert!(
+            !pd.join(format!("{sys}.user")).exists(),
+            "★C-07: 쓰지 않은 바이트의 .user 백업을 만들지 않는다"
         );
         assert_eq!(
             load_merge_pending(&pd).get(sys).and_then(|e| e["kind"].as_str()),
-            Some("healed"),
-            "원장 kind==healed"
+            None,
+            "★C-07: 거짓 healed 원장 항목을 남기지 않는다"
         );
+        let _ = sys_embed;
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -9633,7 +10499,7 @@ mod tests {
         let bp = dpack.join(PRISTINE_DIR).join(l3);
         std::fs::create_dir_all(bp.parent().unwrap()).unwrap();
         std::fs::write(&bp, l3_base).unwrap();
-        // L4: 벤더 전진 + base 미검증(pristine 제거) — 종전 healed 거동(B2 후계ⓐ 동형).
+        // L4: 벤더 전진 + base 미검증(pristine 제거) — ★0.14.55 부터 제자리 보존(C-07 · 아래 단언 참조).
         std::fs::write(dpack.join(l4), "DEPT-DRIFT-L4\n").unwrap();
         manifest_rewind(l4, "OLD-VENDOR-BASE");
         let _ = std::fs::remove_file(dpack.join(PRISTINE_DIR).join(l4));
@@ -9668,10 +10534,18 @@ mod tests {
         assert_eq!(read(&format!("{l3}.user")), l3_mine, "L3 .user 보존");
         assert_eq!(read(&format!("{l3}.base")), l3_base, "L3 .base 조상 보존");
         assert_eq!(kind(l3).as_deref(), Some("conflicted"), "L3 원장 conflicted");
-        // L4: base 미검증 — 종전 healed(치유 + .user 보존).
-        assert_eq!(read(l4), embed_of(l4), "L4 종전 healed 거동");
-        assert_eq!(read(&format!("{l4}.user")), "DEPT-DRIFT-L4\n", "L4 .user 보존");
-        assert_eq!(kind(l4).as_deref(), Some("healed"), "L4 원장 healed");
+        // L4: base 미검증 — ★0.14.55(C-07 · P3)부터 **제자리 보존 + 보고**다(종전 healed 가 아니다).
+        //   근거: HEAD-DISPOSITION-P3-R3.md "What proceeds" 2 — "unknown disk hash -> keep in place +
+        //   report (no heal, no .user parking, no Merge3)". 이 파일은 매니페스트 항목이 디스크와도
+        //   조상과도 다르고 과거벤더 표에 행이 없다 = **출처를 말할 수 없다**. 종전 거동은 운영자가
+        //   쓰지 않은 바이트의 `.user` 백업과 거짓 "healed" 원장 항목을 만들었다(reviewer1 r2 M3).
+        //   ⇒ 이 검체의 기대값 변경은 거동 완화가 아니라 **구속력 있는 판정의 반영**이다.
+        assert_eq!(read(l4), "DEPT-DRIFT-L4\n", "L4 제자리 보존(디스크 바이트 무변경)");
+        assert!(
+            !dpack.join(format!("{l4}.user")).exists(),
+            "L4 .user 미생성 — 쓰지 않은 바이트의 백업을 만들지 않는다"
+        );
+        assert_eq!(kind(l4), None, "L4 원장 무기록 — 거짓 healed 항목을 남기지 않는다");
         // 릴리스 경계 완주: .pack-version 현행 재기록(잔류 해소).
         assert_eq!(
             std::fs::read_to_string(dpack.join(PACK_VERSION_FILE)).unwrap(),

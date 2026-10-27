@@ -26311,7 +26311,12 @@ fn run_pack_merge(
                     return 0;
                 }
                 if confirm(&format!("'{rel}' 을 vendor 신버전으로 교체(내 수정 폐기)?")) {
-                    if let Err(e) = cys::pack::write_atomic(&target, theirs.as_bytes()) {
+                    // H-08: 쓰기 **전** 대상 mode 를 읽어 규칙에 넘긴다(tmp+rename 이 원본 mode 를 버린다).
+                    let prior = cys::pack::current_mode(&target);
+                    let sysent = cys::pack::is_system_manifest_entry(&dir, &rel);
+                    if let Err(e) =
+                        cys::pack::write_pack_file(&target, theirs.as_bytes(), prior, sysent)
+                    {
                         eprintln!("쓰기 실패: {e}");
                         return 1;
                     }
@@ -26367,7 +26372,12 @@ fn run_pack_merge(
                     println!("── 병합 제안 diff (내 수정본 → 병합본) ──");
                     print_unified_diff(&ours, &m);
                     if confirm(&format!("'{rel}' 에 병합본 적용?")) {
-                        if let Err(e) = cys::pack::write_atomic(&target, m.as_bytes()) {
+                        // H-08
+                        let prior = cys::pack::current_mode(&target);
+                        let sysent = cys::pack::is_system_manifest_entry(&dir, &rel);
+                        if let Err(e) =
+                            cys::pack::write_pack_file(&target, m.as_bytes(), prior, sysent)
+                        {
                             eprintln!("쓰기 실패: {e}");
                             return 1;
                         }
@@ -26402,7 +26412,18 @@ fn run_pack_merge(
                 }
                 match std::fs::read_to_string(&user_path) {
                     Ok(content) => {
-                        if let Err(e) = cys::pack::write_atomic(&dest, content.as_bytes()) {
+                        // H-08: 첫 승격은 선행 파일이 없어 내용에서 파생, 재승격은 기존 mode 유지.
+                        let prior = cys::pack::current_mode(&dest);
+                        // ★M1(codex r1 major · 수용): 소유 등급은 **목적지 기준**이다. 대상은
+                        //   `local_dir()` 아래의 **사용자 오버레이**이므로 system 등급이 아니다.
+                        //   종전은 소스 팩의 `is_system_manifest_entry(&dir, &rel)` 를 넘겼고, 그
+                        //   결과 기존 0644 오버레이를 재승격하면 `pack_target_mode` 의
+                        //   0644→0755 복구 분기가 **사용자 파일의 mode 를 넓혔다**(H-08 자신의
+                        //   정확 보존 규칙 위반 · 네이티브 재현됨). prior=None(첫 승격)은 그대로
+                        //   내용에서 파생된다(`exec_mode_for`).
+                        if let Err(e) =
+                            cys::pack::write_pack_file(&dest, content.as_bytes(), prior, false)
+                        {
                             eprintln!("오버레이 쓰기 실패: {e}");
                             return 1;
                         }
@@ -26747,7 +26768,10 @@ fn run_pack_heal(rel: &str, yes: bool) -> i32 {
         }
     }
     // ⑥ 복원 + 3중 전진(manifest·pristine ← embed).
-    if let Err(e) = cys::pack::write_atomic(&target, embed.as_bytes()) {
+    // H-08: 치유가 실행비트를 떨어뜨리지 않는다 — 쓰기 전 mode 를 읽어 규칙에 넘긴다.
+    let prior = cys::pack::current_mode(&target);
+    let sysent = cys::pack::is_system_manifest_entry(&dir, rel);
+    if let Err(e) = cys::pack::write_pack_file(&target, embed.as_bytes(), prior, sysent) {
         eprintln!("복원 쓰기 실패: {e}");
         return 1;
     }
@@ -26811,7 +26835,9 @@ fn run_pack_heal_missing_only(rel: &str) -> i32 {
             return 1;
         }
     }
-    if let Err(e) = cys::pack::write_atomic(&target, embed.as_bytes()) {
+    // H-08: 없던 파일이라 선행 mode 가 없다 — 내장본의 shebang 에서 파생한다(install 과 같은 규칙).
+    let sysent = cys::pack::is_system_manifest_entry(&dir, rel);
+    if let Err(e) = cys::pack::write_pack_file(&target, embed.as_bytes(), None, sysent) {
         eprintln!("복원 쓰기 실패: {e}");
         return 1;
     }
@@ -26881,7 +26907,10 @@ fn run_pack_revert_merge(dir: &std::path::Path, rel: &str, yes: bool) -> i32 {
         eprintln!("백업 쓰기 실패({e}) — fail-closed 거부(무변경)");
         return 1;
     }
-    if let Err(e) = cys::pack::write_atomic(&target, captured.as_bytes()) {
+    // H-08
+    let prior = cys::pack::current_mode(&target);
+    let sysent = cys::pack::is_system_manifest_entry(dir, rel);
+    if let Err(e) = cys::pack::write_pack_file(&target, captured.as_bytes(), prior, sysent) {
         eprintln!("복원 쓰기 실패: {e}");
         return 1;
     }
@@ -27133,7 +27162,10 @@ fn adopt_one(
     }
     // ⑥ 복원 쓰기(disk==소스면 생략).
     if !cleanup_only {
-        cys::pack::write_atomic(&target, source.as_bytes())
+        // H-08: 복권은 치유가 0644 로 떨어뜨린 대상을 되살리는 경로다 — 쓰기 전 mode 를 읽는다.
+        let prior = cys::pack::current_mode(&target);
+        let sysent = cys::pack::is_system_manifest_entry(dir, rel);
+        cys::pack::write_pack_file(&target, source.as_bytes(), prior, sysent)
             .map_err(|e| format!("복원 쓰기 실패: {e}"))?;
     }
     // ⑦ 원장 — pack rel 만 adopted 전환(conflicted 였으면 capture·base_side 승계 — .base 파일
@@ -27335,6 +27367,14 @@ fn unified_diff_via_cmd(vendor: &str, mine: &str, rel: &str) -> Option<String> {
 /// 과거로 되돌리는 신규 소실 사고를 만들므로 v1 은 파일 단위만 지원한다(전량은 오너 결정 보류).
 /// seed-once 경로는 복원 대상에서 제외(상태 불가침 대칭). system 파일 복원본은 kept-drift 로
 /// 제자리 보존됨을 고지 — 영속 경로(--to-local/--propose)로 안내한다.
+/// 보존본(`pack.prev`) **자신의** 매니페스트에 적힌 `rel` 의 해시. 매니페스트 부재·판독 실패·항목
+/// 부재는 모두 `None` = "검증 근거 없음"이다(M4 에서 경고가 아니라 **확인 불가**로 처리된다).
+fn prev_manifest_hash(prev: &std::path::Path, rel: &str) -> Option<String> {
+    let s = std::fs::read_to_string(prev.join(cys::pack::INSTALL_MANIFEST)).ok()?;
+    let m = serde_json::from_str::<std::collections::BTreeMap<String, String>>(&s).ok()?;
+    m.get(rel).cloned()
+}
+
 fn run_pack_rollback(file: Option<String>, yes: bool, force_vendor: bool, force_unsafe_core: bool) -> i32 {
     let dir = cys::pack::pack_dir();
     let prev = cys::pack::pack_prev_dir(&dir);
@@ -27432,6 +27472,45 @@ fn run_pack_rollback(file: Option<String>, yes: bool, force_vendor: bool, force_
             return 1;
         }
     };
+    // ★M4(0.14.55 · P3): **system 등급**의 보존본은 내용을 검증한 뒤에만 쓴다.
+    //   검증 기준 = 보존본 자신의 매니페스트(`pack.prev/.install-manifest.json`) 항목.
+    //   · 항목 있고 **일치** → 복원(종전 거동)
+    //   · 항목 있고 **불일치** → 거부(--force-vendor 로만 강행 · 두 해시를 모두 찍는다)
+    //   · 매니페스트·항목 **부재** → ⛔"확인 불가(unavailable)" — 아무것도 쓰지 않고 내장본 치유 경로 안내.
+    //     설계 R2 는 여기서 경고만 하고 복원을 진행했고, 그 근거로 "헌법 안전핵 게이트가 여전히 돈다"를
+    //     들었다. 그 문장은 이 등급에 **거짓**이다: 그 게이트는 `is_constitution_file(&rel)` 뒤에 있어
+    //     평범한 system `bin/` 스크립트에서는 **실행되지 않는다**(게이트의 존재와 도달 범위는 다른 측정).
+    //   · ⛔검증 안 된 바이트는 **쓰이지 않으므로** H-08 의 실행비트 규칙이 닿을 수 없다 — 코덱스 r2 M4 가
+    //     지적한 "검증 없이 교체되고 새 mode 규칙으로 실행권한까지 받는" 합성을 mode 분기가 아니라
+    //     **쓰기 제거**로 막는다.
+    //   user 등급은 이 검증 대상이 아니다 — 보존본의 user 파일은 매니페스트와 **정당하게** 다르다.
+    if own == "system" {
+        match prev_manifest_hash(&prev, &rel) {
+            Some(expected) => {
+                let actual = cys::pack::content_hash_pub(&String::from_utf8_lossy(&content));
+                if actual != expected && !force_vendor {
+                    eprintln!(
+                        "⛔ 거부: 보존본 '{rel}' 이 보존본 매니페스트와 불일치 — 복원하지 않았습니다.\n\
+                         \x20  보존본 실제 : {actual}\n\
+                         \x20  매니페스트  : {expected}\n\
+                         \x20  강행하려면 --force-vendor 를 명시하십시오."
+                    );
+                    return 1;
+                }
+            }
+            None => {
+                eprintln!(
+                    "⛔ 확인 불가(unavailable): '{rel}' 의 보존본 내용을 검증할 근거가 없습니다(보존본 \
+                     매니페스트 또는 그 항목 부재) — **아무것도 쓰지 않았습니다**.\n\
+                     \x20  system 파일의 인가된 복구 경로는 실행 중인 바이너리의 내장본입니다:\n\
+                     \x20    cys pack-heal --missing-only {rel}   # 파일이 없을 때(있는 파일 무접촉)\n\
+                     \x20    cys pack-heal {rel}                  # 드리프트를 내장본으로 치유\n\
+                     \x20  (검증되지 않은 보존본을 복원하는 경로는 이 판에 없습니다.)"
+                );
+                return 1;
+            }
+        }
+    }
     // ★G3-축3 대칭 지점: 롤백도 '현재본 → 보존본 전량 교체'라 take-new 와 같은 안전핵 소실
     //   벡터다(롤백 '도구'라서 더 위험 — A12 각주와 동일 취지). 헌법 파일이면 현재본(ours)
     //   대비 보존본(theirs)의 ours-only 소실을 같은 술어로 선검증한다(fail-closed).
@@ -27479,7 +27558,13 @@ fn run_pack_rollback(file: Option<String>, yes: bool, force_vendor: bool, force_
     if let Some(parent) = dest.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Err(e) = cys::pack::write_atomic(&dest, &content) {
+    // H-08: 보존본(원본)이 실행 가능하면 그 mode 가 권위다 — 대상은 이전 치유가 0644 로 망가뜨린
+    //   사본일 수 있으므로 **source 를 먼저** 본다.
+    let prior = cys::pack::current_mode(&src)
+        .filter(|m| m & 0o111 != 0)
+        .or_else(|| cys::pack::current_mode(&dest));
+    let sysent = cys::pack::is_system_manifest_entry(&dir, &rel);
+    if let Err(e) = cys::pack::write_pack_file(&dest, &content, prior, sysent) {
         eprintln!("복원 쓰기 실패: {e}");
         return 1;
     }
@@ -52066,5 +52151,251 @@ mod b360_tests {
             }
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+}
+
+/// ★P3-IMPL r1 후속 — **호출부 수준** 검체(codex r1 M1 · gemini-3 r1 major 2-b).
+/// 순수 함수(`pack_target_mode`)가 옳아도 호출부가 잘못된 인자를 넘기면 사용자 파일의 mode 가
+/// 바뀐다 — 그 결함은 호출부에서만 재다.
+#[cfg(test)]
+mod p3r1_caller_tests {
+    use std::path::{Path, PathBuf};
+
+    // ★r2(codex-2 minor) — 이 모듈은 `cfg(test)` 이지만 **unix 게이트가 없었다**. 모듈 머리의
+    //   `use std::os::unix::fs::PermissionsExt;` 와 mode 호출 때문에 **윈도우 타깃 테스트 빌드가
+    //   E0433/E0599 로 깨졌고**(실측 5건), 그러면 이 패키지의 윈도우 테스트 신호가 사라진다.
+    // ⛔모듈 전체를 통째로 게이트하지 않는다 — 그러면 M4 롤백 로직의 윈도우 커버리지가 조용히
+    //   삭제된다(판정 2항). 그래서 **mode 단언만** 게이트하고, 이식 가능한 단언(거부·쓰기 0·
+    //   --force-vendor 강행·근거 부재·user 우회)은 윈도우에서도 **컴파일되고 실행된다**.
+    #[cfg(unix)]
+    fn mode_of(p: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o7777
+    }
+
+    /// 픽스처의 mode 설정 — unix 에서는 실제로 세우고, 그 밖에서는 **no-op** 이다.
+    /// 이렇게 두면 픽스처 구성 코드가 양 플랫폼에서 하나로 남고, 플랫폼 분기는 **단언**에만 생긴다.
+    #[cfg(unix)]
+    fn set_mode(p: &Path, m: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+    }
+
+    #[cfg(not(unix))]
+    fn set_mode(_p: &Path, _m: u32) {}
+
+    fn rel_of_class(dir: &Path, class: &str) -> &'static str {
+        cys::pack::PACK_ALL
+            .iter()
+            .map(|(r, _)| *r)
+            .find(|r| {
+                cys::pack::ownership_name_scoped(r, dir) == class
+                    && !r.ends_with("soul.md")
+                    && !cys::pack::is_constitution_file(r)
+            })
+            .unwrap_or_else(|| panic!("no {class} rel in PACK_ALL"))
+    }
+
+    struct Rig {
+        _root: PathBuf,
+        pack: PathBuf,
+        local: PathBuf,
+        _env: Vec<cys::pack::EnvGuard>,
+    }
+
+    fn rig(tag: &str) -> Rig {
+        let root = std::env::temp_dir().join(format!(
+            "cys-p3r1-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let pack = root.join("pack");
+        let local = root.join("local");
+        std::fs::create_dir_all(&pack).unwrap();
+        std::fs::create_dir_all(&local).unwrap();
+        let env = vec![
+            cys::pack::EnvGuard::set("CYS_PACK_DIR", &pack),
+            cys::pack::EnvGuard::set("CYS_CONFIG_DIR", root.join("cfg")),
+            cys::pack::EnvGuard::set("CYS_LOCAL_DIR", &local),
+        ];
+        Rig { _root: root, pack, local, _env: env }
+    }
+
+    /// ★M1 — `--to-local` 재승격이 **사용자 오버레이의 mode 를 넓히지 않는다**.
+    /// 93354798 에서는 소스 팩의 system 등급을 목적지(local 오버레이)에 넘겨 0644 → 0755 가 됐다.
+    /// ★이 검체는 **전체가 mode 단언**이다(선행 mode 네 가지 → 기대 mode). POSIX 퍼미션이 없는
+    ///   플랫폼에는 지킬 불변식 자체가 없으므로 검체째 `cfg(unix)` 다 — 윈도우에서 사라지는 것은
+    ///   **없는 계약의 검사**이고, M4 롤백의 이식 가능한 단언은 아래 검체에서 그대로 돈다.
+    #[cfg(unix)]
+    #[test]
+    fn p3r1_m1_to_local_promotion_keeps_the_prior_mode() {
+        let _lock = super::tests::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let user_bytes = "#!/bin/sh\nmy own copy\n";
+
+        // 선행 mode 네 가지 — 없음(첫 승격) · 0644 · 0600 · 0700.
+        for (tag, prior, want) in [
+            ("absent", None, 0o755u32), // 첫 승격: 내용(`#!`)에서 파생
+            ("0644", Some(0o644u32), 0o644u32),
+            ("0600", Some(0o600u32), 0o600u32),
+            ("0700", Some(0o700u32), 0o700u32),
+        ] {
+            let r = rig(&format!("tolocal-{tag}"));
+            let rel = rel_of_class(&r.pack, "system");
+            // 소스 팩: 매니페스트에 rel 이 있어야 `is_system_manifest_entry` 가 참이다
+            // (= 결함이 발화하던 전제. 이것이 없으면 이 검체는 공허하게 통과한다).
+            let mut manifest = std::collections::BTreeMap::new();
+            manifest.insert(rel.to_string(), cys::pack::content_hash_pub("vendor\n"));
+            std::fs::write(
+                r.pack.join(cys::pack::INSTALL_MANIFEST),
+                serde_json::to_string(&manifest).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                cys::pack::is_system_manifest_entry(&r.pack, rel),
+                "전제 실패: 소스 팩에서 rel 이 system 매니페스트 항목이어야 한다"
+            );
+            if let Some(p) = r.pack.join(rel).parent() {
+                std::fs::create_dir_all(p).unwrap();
+            }
+            std::fs::write(r.pack.join(format!("{rel}.user")), user_bytes).unwrap();
+            let mut pending = serde_json::Map::new();
+            pending.insert(
+                rel.to_string(),
+                serde_json::json!({"kind":"healed","side":format!("{rel}.user"),"version":"1.0.0"}),
+            );
+            cys::pack::save_merge_pending(&r.pack, &pending);
+
+            let dest = r.local.join(rel);
+            if let Some(p) = dest.parent() {
+                std::fs::create_dir_all(p).unwrap();
+            }
+            if let Some(m) = prior {
+                std::fs::write(&dest, "older overlay\n").unwrap();
+                set_mode(&dest, m);
+                assert_eq!(mode_of(&dest), m, "전제: 선행 mode 를 세웠다");
+            }
+
+            let rc = super::run_pack_merge(
+                Some(rel.to_string()), false, false, false, true, false, true, false, false,
+                false, None,
+            );
+            assert_eq!(rc, 0, "[{tag}] --to-local 승격이 실패했다");
+            assert_eq!(
+                std::fs::read_to_string(&dest).unwrap(),
+                user_bytes,
+                "[{tag}] 오버레이 내용은 사용자본이다"
+            );
+            assert_eq!(
+                mode_of(&dest),
+                want,
+                "[{tag}] 사용자 오버레이의 mode 가 바뀌었다(H-08 의 정확 보존 규칙 위반)"
+            );
+            let _ = std::fs::remove_dir_all(&r._root);
+        }
+    }
+
+    /// ★M4 — `pack-rollback` 의 보존본 검증(T15 불일치 거부 · T30 근거 부재 거부 · T29 user 우회 ·
+    /// T25 보존본이 실행 가능하면 그 mode 가 권위). 9dbea792 에는 이 거동이 **없다**(전량 복원).
+    #[test]
+    fn p3r1_m4_rollback_verifies_the_preserved_copy() {
+        let _lock = super::tests::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_bytes = "#!/bin/sh\npreserved\n";
+        let disk_bytes = "#!/bin/sh\ncurrent on disk\n";
+
+        let setup = |tag: &str, rel: &str, prev_manifest: Option<&str>| -> Rig {
+            let r = rig(tag);
+            let prev = cys::pack::pack_prev_dir(&r.pack);
+            std::fs::create_dir_all(&prev).unwrap();
+            std::fs::write(prev.join(".pack-version"), "1.0.0\n").unwrap();
+            std::fs::write(r.pack.join(".pack-version"), "1.0.1\n").unwrap();
+            for base in [&r.pack, &prev] {
+                if let Some(p) = base.join(rel).parent() {
+                    std::fs::create_dir_all(p).unwrap();
+                }
+            }
+            std::fs::write(r.pack.join(rel), disk_bytes).unwrap();
+            std::fs::write(prev.join(rel), prev_bytes).unwrap();
+            // 보존본은 실행 가능, 대상은 0644 — T25 의 전제. unix 밖에서는 no-op 이고, 그 플랫폼의
+            // 단언은 아래에서 `cfg(unix)` 로 빠진다(픽스처는 한 가지 철자로 남는다).
+            set_mode(&prev.join(rel), 0o755);
+            set_mode(&r.pack.join(rel), 0o644);
+            if let Some(h) = prev_manifest {
+                let mut m = std::collections::BTreeMap::new();
+                m.insert(rel.to_string(), h.to_string());
+                std::fs::write(
+                    prev.join(cys::pack::INSTALL_MANIFEST),
+                    serde_json::to_string(&m).unwrap(),
+                )
+                .unwrap();
+            }
+            r
+        };
+
+        // T15 — 보존본이 보존본 매니페스트와 불일치 → 거부, 쓰기 0.
+        {
+            let r = rig("probe");
+            let rel = rel_of_class(&r.pack, "system");
+            let _ = std::fs::remove_dir_all(&r._root);
+            let r = setup("t15", rel, Some(&cys::pack::content_hash_pub("something else\n")));
+            let rc = super::run_pack_rollback(Some(rel.to_string()), true, false, false);
+            assert_eq!(rc, 1, "T15: 불일치는 거부여야 한다");
+            assert_eq!(
+                std::fs::read_to_string(r.pack.join(rel)).unwrap(),
+                disk_bytes,
+                "T15: 거부 경로는 아무것도 쓰지 않는다"
+            );
+
+            // T15b — 같은 상태에서 --force-vendor 는 강행한다(거부가 영구 벽이 아님을 고정).
+            let rc2 = super::run_pack_rollback(Some(rel.to_string()), true, true, false);
+            assert_eq!(rc2, 0, "T15b: --force-vendor 는 강행한다");
+            assert_eq!(std::fs::read_to_string(r.pack.join(rel)).unwrap(), prev_bytes);
+            // T25 — 보존본이 실행 가능하면 그 mode 가 권위다(대상은 0644 였다).
+            // ★여기만 `cfg(unix)` 다: POSIX 실행비트가 없는 플랫폼에는 이 불변식이 없다. 위의
+            //   거부·쓰기 0·강행 단언은 **윈도우에서도 돈다**(판정 2항의 분리 요구).
+            #[cfg(unix)]
+            {
+                assert_eq!(
+                    mode_of(&r.pack.join(rel)),
+                    0o755,
+                    "T25: 실행 가능한 보존본의 mode 가 대상 0644 를 이긴다"
+                );
+            }
+            let _ = std::fs::remove_dir_all(&r._root);
+        }
+
+        // T30 — 보존본 매니페스트 자체가 없다 → "확인 불가(unavailable)", 쓰기 0.
+        {
+            let r = rig("probe2");
+            let rel = rel_of_class(&r.pack, "system");
+            let _ = std::fs::remove_dir_all(&r._root);
+            let r = setup("t30", rel, None);
+            let rc = super::run_pack_rollback(Some(rel.to_string()), true, false, false);
+            assert_eq!(rc, 1, "T30: 검증 근거가 없으면 거부다");
+            assert_eq!(
+                std::fs::read_to_string(r.pack.join(rel)).unwrap(),
+                disk_bytes,
+                "T30: 확인 불가 경로는 **아무것도 쓰지 않는다**"
+            );
+            // 안내 문면(내장본 치유 경로)을 함께 고정한다 — 거부만 하고 길을 안 알려주면 막힌다.
+            let src = include_str!("cys.rs");
+            assert!(
+                src.contains("확인 불가(unavailable)") && src.contains("cys pack-heal --missing-only"),
+                "T30: 거부 메시지가 pack-heal 복구 경로를 가리켜야 한다"
+            );
+            let _ = std::fs::remove_dir_all(&r._root);
+        }
+
+        // T29 — user 등급은 이 검증의 대상이 아니다(보존본의 user 파일은 정당하게 매니페스트와 다르다).
+        {
+            let r = rig("probe3");
+            let rel = rel_of_class(&r.pack, "user");
+            let _ = std::fs::remove_dir_all(&r._root);
+            let r = setup("t29", rel, None);
+            let rc = super::run_pack_rollback(Some(rel.to_string()), true, false, false);
+            assert_eq!(rc, 0, "T29: user 파일은 매니페스트 검증 없이 복원된다");
+            assert_eq!(std::fs::read_to_string(r.pack.join(rel)).unwrap(), prev_bytes);
+            let _ = std::fs::remove_dir_all(&r._root);
+        }
     }
 }
