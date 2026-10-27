@@ -725,6 +725,11 @@ def measurements(report):
         idle = m.get("idle_secs")
         if type(idle) is not int or idle < 0:
             m.update(idle_secs=None, source="unavailable")
+        # Validate before dict equality: Python equates True/1 and 1.0/1.
+        sid, created = m.get("surface_id"), m.get("created_at")
+        if (type(sid) is not int or sid < 0 or type(created) not in (int, float)
+                or not 0 <= created < float("inf")):
+            m.update(idle_secs=None, source="unavailable")
         m["identity_kind"] = "surface" if m.get("surface_id") is not None else "role-only"
         if role in out and out[role] != m:
             out[role] = {"role": role, "idle_secs": None, "source": "ambiguous",
@@ -764,6 +769,10 @@ def update_idle_tracking(counters, ms):
         continuous = (binding_valid and previous_binding == binding
                       and type(previous) is int and previous >= 0
                       and type(streak) is int and streak >= 0 and previous_sample_valid)
+        # Reject delayed samples without lowering the accepted high-water mark.
+        if continuous and sampled < previous_sample[2]:
+            new[role] = pc
+            continue
         if continuous and pc.get("sample") == token and previous == idle:
             new[role] = pc
             continue

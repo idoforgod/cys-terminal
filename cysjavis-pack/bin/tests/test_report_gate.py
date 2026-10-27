@@ -963,6 +963,33 @@ class P7InstrumentTests(unittest.TestCase):
         b=dict(a,idle_secs=2200)
         self.assertIsNone(G.measurements(self.rep(a,b))['master']['idle_secs'])
 
+    def test_p7_identity_types_before_duplicate_equality(self):
+        for invalid in (True, 1.0):
+            for ids in ((invalid, 1), (1, invalid)):
+                with self.subTest(ids=ids):
+                    ms = G.measurements(self.rep(*(self.sample(sid=sid) for sid in ids)))
+                    self.assertIsNone(ms['master']['idle_secs'])
+                    self.assertEqual(G.update_idle_tracking({}, ms)['master']['consecutive_idle_cycles'], 0)
+
+    def test_p7_replayed_timestamps_do_not_advance(self):
+        for stamps in ([1000, 1001] * 5, [1000, 1001, 1002, 1000, 1001, 1002]):
+            with self.subTest(stamps=stamps):
+                c = {}
+                high = -1
+                for stamp in stamps:
+                    before = c.get('idle_tracking_v1', {}).get('master', {}).get('consecutive_idle_cycles', 0)
+                    self.assertEqual(self.tick(c, [self.sample(sample=stamp)]), [])
+                    now = c['idle_tracking_v1']['master']
+                    if stamp <= high:
+                        self.assertLessEqual(now['consecutive_idle_cycles'], before)
+                    high = max(high, stamp)
+                    self.assertEqual(now['sample'][2], high)
+        c = {}
+        for stamp in range(1000, 1007):
+            warnings = self.tick(c, [self.sample(sample=stamp)])
+        self.assertEqual(c['idle_tracking_v1']['master']['consecutive_idle_cycles'], 6)
+        self.assertEqual(len(warnings), 1)
+
     def test_p7_invalid_and_legacy_measurements(self):
         for v in (None,True,-1,'491'):
             self.assertIsNone(G.measurements(self.rep(self.sample(v)))['master']['idle_secs'])

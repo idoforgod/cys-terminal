@@ -32507,6 +32507,19 @@ mod tests {
                 rows.push(json!([row["idle_source"],row["effective_cwd"],row["cwd_source"]]));
             }
             assert_eq!(rows[0],rows[1]);
+            // A retained exited surface still has launch cwd, but no live observation.
+            let exited_sid=make_surface(daemon,Some("worker-p7-exited"));
+            let exited=daemon.get_surface(exited_sid).unwrap();
+            assert!(!exited.cwd.is_empty());
+            exited.exited.store(true,Ordering::Relaxed);
+            for method in ["surface.list","org.status"] {
+                let result=b3_rpc(daemon,method);
+                let row=result["result"]["surfaces"].as_array().unwrap().iter().find(|r|r["surface_id"]==exited_sid).unwrap();
+                assert_eq!(row["cwd"],exited.cwd);
+                assert!(row["live_cwd"].is_null(),"{method}: fixture needs no live observation");
+                assert!(row["effective_cwd"].is_null(),"{method}: launch cwd must not substitute for absent live cwd");
+                assert_eq!(row["cwd_source"],"unavailable","{method}");
+            }
         }
 
         #[test]
