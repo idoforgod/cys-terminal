@@ -14,8 +14,8 @@ CEO 판정 "a SECURITY GATE THAT FAILS OPEN"):
 접히면 적색이 된다.
 
 핀 목록
-  A 소스 핀  — A1 scoped owned wrapper · A2 체크리스트 호출에 `2>/dev/null` 0건(C8)
-               A3 checklist PREFLIGHT_TIMEOUT == 240 · A4 budget240+15+5<270 (소스에서
+  A 소스 핀  — A1 훅의 `timeout 40` 리터럴 불변(G6a) · A2 체크리스트 호출에 `2>/dev/null` 0건(C8)
+               A3 checklist PREFLIGHT_TIMEOUT == 30 · A4 세 상한의 **서열**(40 > 30 > 20, 소스에서
                파싱 — 손으로 적은 수가 아니다) · A5 `r.stdout or "{}"` 0건(C6 역행 카나리아)
   B 훅       — B1 상한 초과(스텁 `timeout` rc 124)에 고지 1줄 + 훅 exit 0(C9 1층)
                B2 빈 출력(rc 0)에 고지 1줄(C8) · B3 stderr 꼬리가 1KB 이내로 **경계**(G4)
@@ -84,20 +84,25 @@ hook_src = open(HOOK, encoding="utf-8").read()
 pf_src = open(PREFLIGHT, encoding="utf-8").read()
 ck_src = open(CHECKLIST, encoding="utf-8").read()
 
-check("A1 scoped owned helper replaces GNU timeout selection",
-      'cys_timeout_run --owned' in hook_src and 'timeout 40 ' not in hook_src)
-chk_calls = [l for l in hook_src.splitlines() if '\"$CHK\" --state' in l or '\"$CHK\" --state' in l.replace('-B ', '')]
-check("A2 checklist stderr remains captured", len(chk_calls) == 1 and '2>"$_CHK_ERR"' in chk_calls[0])
+check("A1 훅의 `timeout 40` 리터럴 불변(G6a)",
+      hook_src.count('timeout 40 "$CYS_PY" "$CHK"') == 1,
+      "제품 상한을 테스트 편의로 낮추지 않았다는 핀")
+chk_calls = [l for l in hook_src.split("\n") if '"$CHK" --state "$STATE"' in l]
+check("A2 체크리스트 호출에 `2>/dev/null` 0건(C8)",
+      len(chk_calls) == 2 and all("2>/dev/null" not in l for l in chk_calls),
+      "호출 %d개: %s" % (len(chk_calls), " / ".join(l.strip()[:48] for l in chk_calls)))
 m_ck = re.search(r"^PREFLIGHT_TIMEOUT\s*=\s*(\d+)", ck_src, re.M)
-m_grace = re.search(r"^PREFLIGHT_GRACE\s*=\s*(\d+)", ck_src, re.M)
-m_force = re.search(r"^PREFLIGHT_FORCE\s*=\s*(\d+)", ck_src, re.M)
+check("A3 checklist PREFLIGHT_TIMEOUT 상수 실재", bool(m_ck), str(m_ck and m_ck.group(1)))
+m_hook = re.search(r"timeout (\d+) \"\$CYS_PY\" \"\$CHK\"", hook_src)
+# ★R2: 상한이 인라인 `timeout=20` 에서 **이름 있는 상수**로 옮겨갔다(검체가 짧게 바꿔 제품
+#   경로를 그대로 태우기 위해서다) — 핀도 그 상수를 읽는다.
 m_scan = re.search(r"^\s*SKILLSCAN_SCAN_TIMEOUT_S\s*=\s*(\d+)", pf_src, re.M)
-check("A3 checklist service budget240", bool(m_ck) and int(m_ck.group(1)) == 240)
-check("A4 execution240+grace15+force5 < outer270; scanner20 preserved",
-      all((m_ck,m_grace,m_force,m_scan)) and
-      (int(m_ck.group(1)),int(m_grace.group(1)),int(m_force.group(1)),int(m_scan.group(1))) == (240,15,5,20)
-      and 'checklist) _C03_CAP=270' in hook_src
-      and '--budget 150 --total-budget 420' in hook_src)
+if m_hook and m_ck and m_scan:
+    outer, mid, inner = int(m_hook.group(1)), int(m_ck.group(1)), int(m_scan.group(1))
+    check("A4 상한 서열 innermost-smallest(C7)", outer > mid > inner,
+          "훅 %d > checklist %d > skillscan %d (소스에서 파싱)" % (outer, mid, inner))
+else:
+    check("A4 상한 서열 innermost-smallest(C7)", False, "세 상한 중 하나를 소스에서 못 찾았다")
 # ★카나리아의 범위는 **C60 함수 본문**이다. 이유를 둘 다 적는다:
 #   ⓐ 주석·독스트링은 세지 않는다 — 결함을 **설명하는** 줄이 카나리아를 때리면 검사가 자기
 #      문서에 걸려 영구 적색이 된다(선례: mention-grep 이 자기 docstring 에 걸린 건).
@@ -131,17 +136,6 @@ check("A5b 범위 밖 동일 꼴을 **세어 기록**한다(고치지 않는다 
       True, "같은 fail-open 꼴 %d곳: %s" % (len(_elsewhere), _elsewhere))
 
 
-def owned_fixture(body):
-    """Keep pool worker definitions importable under spawn; opt-in entry only."""
-    prefix = "import sys\nsys.path.insert(0,%r)\nfrom _owned_process import managed_main\n" % BIN
-    marker = 'if __name__ == "__main__":'
-    if marker in body:
-        body = body.replace(marker, 'def _fixture_main():', 1)
-    else:
-        body = 'def _fixture_main():\n' + ''.join('    '+line+'\n' for line in body.splitlines())
-    return prefix + body + '\nif __name__ == "__main__":\n    sys.exit(managed_main(_fixture_main))\n'
-
-
 # ─────────────────────────── B. 훅 ───────────────────────────
 def run_hook(chk_body, with_timeout_stub=None, tmpdir_override=None):
     """임시 팩·임시 홈으로 훅을 돌린다. chk_body = 스텁 javis_checklist.py 의 셸 본문.
@@ -154,7 +148,7 @@ def run_hook(chk_body, with_timeout_stub=None, tmpdir_override=None):
     for d in (bindir, pack, work, os.path.join(pack, "bin"), os.path.join(work, "_round")):
         os.makedirs(d, exist_ok=True)
     open(os.path.join(work, "_round", "SESSION_STATE.md"), "w").write("# state\nWP18 fixture\n")
-    _write_exec(os.path.join(pack, "bin", "javis_checklist.py"), owned_fixture(chk_body))
+    _write_exec(os.path.join(pack, "bin", "javis_checklist.py"), chk_body)
     _write_exec(os.path.join(bindir, "cys"), "#!/bin/sh\nexit 0\n")
     if with_timeout_stub is not None:
         # ★G5/G6a: 제품의 `timeout 40` 은 그대로 두고, PATH 의 `timeout` 을 스텁으로 바꿔
@@ -183,14 +177,14 @@ def run_hook(chk_body, with_timeout_stub=None, tmpdir_override=None):
 OK_CHK = ("import sys\n"
           "print('\u25a0 실측 체크리스트(배경)')\nprint('preflight: exit 0 | READY')\n")
 r, _ = run_hook(OK_CHK, with_timeout_stub=124)
-check("B1 unrelated GNU timeout stub cannot intercept owned path", LOUD not in r.stdout and "READY" in r.stdout,
+check("B1 상한 초과(rc 124) → 고지 1줄(C9 1층)", LOUD in r.stdout and "rc=124" in r.stdout,
       "exit=%d · 고지=%s" % (r.returncode, LOUD in r.stdout))
 check("B1b 훅은 그래도 exit 0 · 나머지 주입은 살아 있다",
       r.returncode == 0 and "WP18 fixture" in r.stdout,
       "exit=%d · 작업기억 본문 주입=%s" % (r.returncode, "WP18 fixture" in r.stdout))
 r, _ = run_hook("import sys\nsys.exit(0)\n")   # 출력 0 · rc 0
 check("B2 빈 출력(rc 0) → 고지 1줄(C8)", LOUD in r.stdout and "출력 없음" in r.stdout,
-      "exit=%d stdout=%r stderr=%r" % (r.returncode, r.stdout, r.stderr))
+      "exit=%d" % r.returncode)
 # ★줄 길이는 경계보다 **크게** 잡는다: 5줄 x 400 B = 2,000 B > 1 KB 라야 `head -c` 가 실제로
 #   자르고, 그래서 경계를 지우는 변이(M7)가 적색이 된다. 종전 100 B 줄은 5줄 합계 531 B 로
 #   경계 아래였고, 변이 검산이 그 사실을 잡아냈다(경계를 재지 못하는 단언이었다).
@@ -248,7 +242,7 @@ def rig_pack(scanner_body):
     open(os.path.join(pack, "hooks", "inject-context.sh"), "w").write("# inject_gate.py\n")
     open(os.path.join(pack, "hooks", "inject_gate.py"), "w").write("pass\n")
     open(os.path.join(pack, "bin", "javis_memory.py"), "w").write("_skillscan = object()\n")
-    _write_exec(os.path.join(pack, "bin", "javis_skillscan.py"), owned_fixture(scanner_body))
+    _write_exec(os.path.join(pack, "bin", "javis_skillscan.py"), scanner_body)
     return tmp, pack, root
 
 
@@ -379,17 +373,86 @@ check("G9b 상한 초과 뒤 살아남은 스캐너 자손 0(R2 MAJOR 2 회귀 �
 
 # G10 — 가드가 소스에 실재하는가(변이가 지우면 위 행들이 적색이 되지만, 수단 자체도 핀한다)
 _pf_body = _fn_body(pf_src, "_run_skillscan_all")
-check("G10 scanner routes through the shared owned process implementation",
-      'run_owned(' in _pf_body and "result['complete']" in _pf_body)
+check("G10 그룹 생성·그룹 종료·재측정 수단이 스캔 호출에 실재한다",
+      all(tok in _pf_body for tok in ("start_new_session", "killpg", "CREATE_NEW_PROCESS_GROUP",
+                                      "taskkill")) and "os.killpg(proc.pid, 0)" in _pf_body,
+      "POSIX setsid+killpg · Windows 그룹+taskkill(UNMEASURED) · 정리 뒤 재측정")
 
-# H: lifecycle mechanics moved into the shared leaf. Exercise its real-process
-# assertions rather than mocking the old communicate-only implementation.
-_h = subprocess.run([PY, '-B', os.path.join(SELF, 'test_owned_process.py'),
-                     'OwnershipRegression.test_no_destructive_signal_after_reap',
-                     'OwnershipRegression.test_uncertain_group_observation_is_not_complete'],
-                    capture_output=True, text=True, timeout=30)
-check("H1-H5 identity release and uncertain cleanup (real owned processes)",
-      _h.returncode == 0, _h.stdout + _h.stderr)
+# ───────── H. R3: identity release and cleanup observation (safe OS doubles) ─────────
+# Execute the actual helper with isolated globals: never signal a real/decoy process.
+import errno
+import signal
+import types
+import javis_preflight as PF
+
+
+def cleanup_case(platform="posix", observation="absent", taskkill="ok", reap=True):
+    events = []
+    class Child:
+        pid = 424242
+        returncode = None
+        released = False
+        calls = 0
+        def communicate(self, timeout):
+            self.calls += 1
+            if self.calls == 1 or not reap:
+                raise subprocess.TimeoutExpired("scanner", timeout)
+            self.released = True
+            self.returncode = -9
+            events.append(("release",))
+            return "", ""
+        def kill(self):
+            events.append(("parent-kill", self.released))
+    child = Child()
+    def killpg(pid, sig):
+        events.append(("signal", sig, child.released))
+        if sig == 0:
+            if observation == "absent":
+                raise ProcessLookupError(errno.ESRCH, "gone")
+            if observation == "eperm":
+                raise PermissionError(errno.EPERM, "denied")
+            if observation == "other":
+                raise OSError(errno.EIO, "probe failed")
+    def run(*args, **kwargs):
+        events.append(("taskkill", child.released))
+        if taskkill == "absent":
+            raise FileNotFoundError("taskkill absent")
+        if taskkill == "timeout":
+            raise subprocess.TimeoutExpired("taskkill", 5)
+        return types.SimpleNamespace(returncode=5 if taskkill == "nonzero" else 0,
+                                     stdout="", stderr="access denied" if taskkill == "nonzero" else "")
+    globs = dict(PF.Preflight._run_skillscan_all.__globals__)
+    globs["os"] = types.SimpleNamespace(name=platform, killpg=killpg)
+    globs["subprocess"] = types.SimpleNamespace(Popen=lambda *a, **k: child, run=run,
+        PIPE=-1, DEVNULL=-3, CREATE_NEW_PROCESS_GROUP=512, TimeoutExpired=subprocess.TimeoutExpired)
+    globs["time"] = types.SimpleNamespace(sleep=lambda _: None)
+    fn = types.FunctionType(PF.Preflight._run_skillscan_all.__code__, globs)
+    result = fn("scanner", 20)
+    return result[4], events
+
+
+_cleanup, _events = cleanup_case(observation="present")
+check("H1 recycled pgid decoy receives zero destructive signals after release",
+      not any(e[0] == "signal" and e[1] != 0 and e[2] for e in _events), repr(_events))
+check("H2 released identity with present group is unknown, not verified original survivors",
+      isinstance(_cleanup, dict) and _cleanup.get("state") == "unknown"
+      and bool(_cleanup.get("reason")), repr(_cleanup))
+for _obs, _expected in (("absent", "verified_empty"), ("eperm", "unknown"), ("other", "unknown")):
+    _cleanup, _events = cleanup_case(observation=_obs)
+    check("H3 POSIX observation " + _obs,
+          isinstance(_cleanup, dict) and _cleanup.get("state") == _expected
+          and bool(_cleanup.get("reason")), repr(_cleanup))
+_cleanup, _events = cleanup_case(observation="present", reap=False)
+check("H4 still-owned present group reports survivors without post-release kill",
+      isinstance(_cleanup, dict) and _cleanup.get("state") == "survivors", repr(_cleanup))
+for _tk in ("ok", "absent", "nonzero", "timeout"):
+    _cleanup, _events = cleanup_case(platform="nt", taskkill=_tk)
+    check("H5 Windows taskkill " + _tk + " remains unknown with outcome",
+          isinstance(_cleanup, dict) and _cleanup.get("state") == "unknown"
+          and "UNMEASURED" in _cleanup.get("reason", "")
+          and (_tk == "ok" or ("5" if _tk == "nonzero" else
+               "FileNotFoundError" if _tk == "absent" else "TimeoutExpired")
+               in _cleanup.get("reason", "")), repr(_cleanup))
 
 # Feed each helper state through the actual C60 FAIL-row renderer.
 for _state, _words in (("verified_empty", "잔존 0(재측정 확인)"),
@@ -430,7 +493,6 @@ def scan_arm(root, nopool=False):
     조용히 폴백해 **다른 verdict + 가짜 속도**가 나온다(Secretariat 실측 선례)."""
     tmp = _tmp("wp18-arm-")
     shutil.copy(SCANNER, os.path.join(tmp, "javis_skillscan.py"))
-    shutil.copy(os.path.join(BIN, "_owned_process.py"), os.path.join(tmp, "_owned_process.py"))
     shutil.copy(RULES, os.path.join(tmp, "skillscan_rules.json"))
     if nopool:
         # 표준 `concurrent` 패키지를 가려 `import concurrent.futures` 를 실패시킨다 →

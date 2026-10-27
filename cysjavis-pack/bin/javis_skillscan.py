@@ -857,17 +857,7 @@ def cmd_scan(path, as_json):
     return exit_for(r["verdict"])
 
 
-# This import arms no watcher in ordinary standalone invocations.
-sys.dont_write_bytecode = True
-_SELF_DIR = os.path.dirname(os.path.abspath(__file__))
-if _SELF_DIR not in sys.path:
-    sys.path.append(_SELF_DIR)
-from _owned_process import CANCEL as _CANCEL, managed_main, worker_observer, pool_initializer_args
-
-
 def cmd_all(roots, as_json):
-    if _CANCEL.is_set():
-        return 125
     skills = []
     for root in roots:
         if not os.path.isdir(root):
@@ -888,13 +878,9 @@ def cmd_all(roots, as_json):
     #   ⇒ 상한을 올리는 변경은 이 두 수치를 다시 재서 뒤집은 다음에만 한다.
     try:
         import concurrent.futures as _cf
-        _observer_args = pool_initializer_args()
-        with _cf.ProcessPoolExecutor(max_workers=min(8, (os.cpu_count() or 4)),
-                                     initializer=worker_observer, initargs=_observer_args) as _ex:
+        with _cf.ProcessPoolExecutor(max_workers=min(8, (os.cpu_count() or 4))) as _ex:
             results = list(_ex.map(scan_skill, skills))
     except Exception as _pool_err:
-        if _CANCEL.is_set():
-            return 125
         # ★폴백은 worker-2 가 자기 티켓에서 벗어나 일부러 넣은 것이고(풀이 못 뜨는 환경에서
         #   레인 전체의 부트를 깨뜨리지 않으려고) 그대로 유지한다. WP18 이 더한 것은 **한 줄의
         #   고지**다: 종전엔 조용히 느린 경로로 내려가, 풀이 영영 못 뜨는 기계에서 아무도 그
@@ -906,8 +892,6 @@ def cmd_all(roots, as_json):
         print("[skillscan] 병렬 풀 기동 실패(%s: %s) — 직렬로 폴백한다(결과는 같고 느리다)."
               % (type(_pool_err).__name__, _pool_err), file=sys.stderr)
         results = [scan_skill(s) for s in skills]
-    if _CANCEL.is_set():
-        return 125
     worst = max((SEV_ORDER.get(r["severity"], 3) * -1 for r in results), default=0)
     summary = {"scanned": len(results),
                "by_verdict": {v: sum(1 for r in results if r["verdict"] == v) for v in ("ACCEPT", "REVISE", "BLOCK")},
@@ -1031,4 +1015,4 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(managed_main(main))
+    sys.exit(main())

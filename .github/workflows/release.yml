@@ -661,7 +661,7 @@ jobs:
                    test_role_authority_triage \
                    test_round_stop_reason test_resource_gate test_resource_gate_fleet_cpu test_resource_gate_product_cpu \
                    test_inject_context_role_seat test_inject_context_soul_l0 test_carry_unproven_scope \
-                   test_wp18_skillscan_failopen test_owned_process \
+                   test_wp18_skillscan_failopen \
                    test_skillscan_orphan_horizon \
                    test_wakeup_durable_receipt test_wakeup_park_failure \
                    test_capgate_remeasure_order test_phoenix_p10_lease_split \
@@ -874,17 +874,6 @@ jobs:
             --root "$RT" --out src-tauri/resources/runtime-manifest.json \
             --app-version "$(grep -m1 '"version"' src-tauri/tauri.conf.json | sed -E 's/.*"([0-9][0-9.]*)".*/\1/')" \
             --source win-src
-
-      - name: C-03 owned process native Windows (bundled Python)
-        if: matrix.platform == 'windows-latest'
-        timeout-minutes: 5
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Native Job/spawn/no-console tests; local macOS skips are not evidence.
-          # -B protects the staged runtime and pack from bytecode writes.
-          C03_TEST_BASH="$(cygpath -w "$PWD/src-tauri/runtime/git/bin/bash.exe")" src-tauri/runtime/python/python.exe -B -u cysjavis-pack/bin/tests/test_owned_process.py
-
 
       # macOS 자기완결 런타임 동봉 (RC-20/T6b — 순정 맥=개발도구 없는 소비자. python3·git은 CLT-shim이라
       # 실행 시 개발도구 프롬프트 → 동봉 필수). tauri.conf.json bundle.resources("runtime/")가 이 트리를
@@ -1584,7 +1573,7 @@ jobs:
                    test_role_authority_triage \
                    test_round_stop_reason test_resource_gate test_resource_gate_fleet_cpu test_resource_gate_product_cpu \
                    test_inject_context_role_seat test_inject_context_soul_l0 test_carry_unproven_scope \
-                   test_wp18_skillscan_failopen test_owned_process \
+                   test_wp18_skillscan_failopen \
                    test_skillscan_orphan_horizon \
                    test_wakeup_durable_receipt test_wakeup_park_failure \
                    test_capgate_remeasure_order test_phoenix_p10_lease_split \

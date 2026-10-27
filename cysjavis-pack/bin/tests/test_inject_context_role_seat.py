@@ -199,9 +199,7 @@ def gate_fixture(root, dept=False, state=True, seats=1, daemon="unjudged", check
     if checklist:
         os.makedirs(os.path.join(fx["pack"], "bin"), exist_ok=True)
         with open(os.path.join(fx["pack"], "bin", "javis_checklist.py"), "w", encoding="utf-8") as f:
-            f.write("import sys\nsys.path.insert(0,%r)\nfrom _owned_process import managed_main\n"
-                    "def main():\n open(%r, 'a').write('ran\\n')\n print('CHECKLIST-RAN')\n return 0\n"
-                    "sys.exit(managed_main(main))\n" % (os.path.join(REPO, 'cysjavis-pack', 'bin'), fx["chk"]))
+            f.write("import sys\nopen(%r, 'a').write('ran\\n')\nprint('CHECKLIST-RAN')\n" % fx["chk"])
     return fx
 
 
