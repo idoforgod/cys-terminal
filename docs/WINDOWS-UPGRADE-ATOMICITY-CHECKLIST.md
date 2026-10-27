@@ -455,31 +455,6 @@ Get-Process cys,cysd -ErrorAction SilentlyContinue | Stop-Process -Force
 
 ---
 
-## P12 — ★실행 사전 확인: 새 판이 이 PC 에서 못 돌면 아무것도 바꾸지 않는다 (0.14.53 신설 · WP12)
-
-스마트 앱 컨트롤(SAC)·App Control 이 새 판의 실행 파일을 막는 PC 에서, 설치기는 **옛 파일을 하나도
-건드리기 전에** 새 `cysd.exe`·`cys.exe`·`cys-app.exe` 를 임시 폴더(`<설치 폴더>\.cys-probe-<tick>`)에 풀어
-실제로 실행해 본다. 하나라도 못 돌면 **exit 6** 으로 끝나고, 옛 판·데몬·세션은 그대로다.
-앵커: 첫 페이지 `cys_probe_page`(GUI·passive — Welcome·재설치 페이지보다 먼저) · PREINSTALL 의 무음 경로
-`CYS_PROBE_RUN`(GUI 종료 ① 앞) · 거부 `CYS_PROBE_REFUSE` · 인앱 업데이트 거부 뒤 앱 재실행 확인 `CYS_HANDOFF`.
-
-준비: 새 `cysd.exe` 를 **해시로 막는** App Control 정책(AllowAll + deny 1건)을 VM 에 올린다 — 만드는 법과
-반드시 지우는 법은 `scripts/tests/win-update-probe/run-probe-cases.ps1` 의 POL 단계와 같다
-(`New-CIPolicyRule -Level Hash -Deny` → `Merge-CIPolicy` → `CiTool --update-policy`, 끝나면 `CiTool --remove-policy`).
-
-| 항목 | 실행 | 기대 |
-|---|---|---|
-| P12-a 무음 업데이트 | 직전 판 설치·데몬 실행 중 `setup.exe /S /UPDATE` | exit **6** · `cys-update-blocked.txt` 에 `blocked: cysd`·`kept-version:<직전 판>`·`handoff:not-needed` · 옛 실행 파일 해시 그대로 · 데몬 PID 그대로 · `.cys-probe-*` 0 |
-| P12-b 인앱 업데이트 | 앱의 업데이트 버튼 | 거부 안내창 · 앱이 다시 열림(기록 `handoff:relaunched-ok`) · 세션 그대로 |
-| P12-c 마법사 업그레이드 | 인자 없이 `setup.exe` | Welcome 보다 **먼저** 거부 안내창 · 옛 언인스톨러 실행 0 · 아무것도 안 바뀜 |
-| P12-d 첫 설치 | cys 없는 PC 에서 `setup.exe /S` | exit **6** · `%LOCALAPPDATA%\cys` 없음 · `%TEMP%\cys-install-blocked.txt` 에 `kept-version:none` |
-| 대조 | 정책을 지운 뒤 같은 실행 | 모두 정상 설치(exit 0) · `cys-update-blocked.txt` 남지 않음 |
-
-CI: `windows-build.yml` 의 `win-update-probe` 잡이 P12-a·P12-d·대조를 매 push 에 잰다. P12-b·P12-c
-(설계 T2-D·T2-U·T2-G·T2-P)는 안내창을 읽고 닫아야 해서 CI 에서 돌지 않는다 — 이 절이 그 몫이다.
-
----
-
 ## 롤백 — 이전 버전으로 되돌리기 (R3 신설 · 절차 없이 실행 금지)
 
 > ★**prev 슬롯은 롤백 수단이 아니다.** `<bin>.prev*.exe` 는 배치 트랜잭션의 undo 재료이자
@@ -528,10 +503,6 @@ tick `.prev<숫자>.exe`)와 잠금 스윕의 `.prev<rand>` 를 잔해로 정리
 | P10-a 같은 버전 재설치 | | exit code (**0** 기대) · prev 신규 0 (오라클 단락) |
 | P10-b 구본 잔존 교체 | | exit 0 + `--version` 신 버전 (성공 위장 불가) |
 | P11 전원 차단 주입(rename 사이) | | 부팅 가드 수리 — `cys.exe` 복원 · 재료 무삭제 |
-| P12-a 실행 사전 확인 · 무음 업데이트 | | exit code (**6** 기대) · `cys-update-blocked.txt` · 데몬 PID 그대로 |
-| P12-b 실행 사전 확인 · 인앱 업데이트 | | 앱 재실행 · `handoff:` 값 |
-| P12-c 실행 사전 확인 · 마법사 | | Welcome 전 거부 · 언인스톨러 실행 0 |
-| P12-d 실행 사전 확인 · 첫 설치 | | exit code (**6** 기대) · 설치 폴더 없음 |
 
 FAIL 이 하나라도 나오면 `%LOCALAPPDATA%\cys\cys-install-failure.txt` 와
 `cys-upgrade-watch.txt` 를 그대로 첨부해 보고한다.

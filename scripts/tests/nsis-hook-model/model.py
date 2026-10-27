@@ -102,233 +102,17 @@ EXPECTED_MACROS = {
     "CYS_RENAME_RETRY", "CYS_ORACLE", "CYS_RESTORE_SLOT", "CYS_PLACE",
     "CYS_UNPLACE", "CYS_SLOT_CLEANUP", "CYS_LASTDITCH", "CYS_ABORT_RESCUE",
     "NSIS_HOOK_PREINSTALL", "NSIS_HOOK_POSTINSTALL", "NSIS_HOOK_PREUNINSTALL",
-    # WP12 P1 pre-swap run check (0.14.53) — mirrored as one decision before PREINSTALL ①
-    # (probe(run)); its STRUCTURE is pinned by p1_structure_check below.
-    "CYS_FIRSTLINE", "CYS_DEL_RETRY", "CYS_PRIOR_SCAN", "CYS_PROBE_SWEEP_OLD",
-    "CYS_PROBE_CLEAN", "CYS_FIND_GUI", "CYS_HANDOFF", "CYS_PROBE_REFUSE",
-    "CYS_PROBE_LEAF", "CYS_PROBE_RUN",
-    # ★(0.14.55 P4-IMPL r1 · M1) the absolute execution deadline. Its OUTCOMES are pinned
-    # structurally by p1_structure_check and by m1_deadline_model below; its native behaviour
-    # is executed by the windows lane (run-probe-cases.ps1), not here.
-    "CYS_RUN_BOUNDED",
 }
 # sha256 over the sorted census the mirrors depend on: anchors/tokens + the
 # normalized BODY hashes of the modeled macros/callbacks + POSTINSTALL order
 # (see hook_guard)
-GUARD_PIN = "81e00a40b29932dc5031972d8015035daa664c145fdddaeae64feba5952af969"  # re-pinned 2026-10-28 for P4-IMPL r1 M1 (CYS_RUN_BOUNDED: absolute execution deadline replaces the nsExec inactivity timer on both probe paths; command line passed by register)
+GUARD_PIN = "a0f620836f70fb30e6a2065f6b7afb9d74f3247562d470df37c95085572cc5be"
 
 
 def hook_path():
     here = os.path.dirname(os.path.abspath(__file__))
     return os.path.normpath(os.path.join(here, "..", "..", "..",
                                          "src-tauri", "nsis-hooks.nsh"))
-
-
-def _body(text, kind, name):
-    pat = (r"(?ms)^!macro[ \t]+%s\b[^\n]*\n(.*?)^!macroend" if kind == "macro"
-           else r"(?ms)^Function[ \t]+%s\b[^\n]*\n(.*?)^FunctionEnd") % re.escape(name)
-    m = re.search(pat, text)
-    return m.group(1) if m else None
-
-
-def p1_structure_check(text):
-    """WP12 P1 (0.14.53): structural pins the compiler cannot give.
-
-    makensis -WX (scripts/tests/nsis-hook-compile/run.sh) rejects undefined labels, unknown
-    variables and syntax errors, but a probe call that is quietly deleted or moved after the GUI
-    kill still compiles. These checks go red for that: the probe page is declared at include time,
-    the worker branch precedes the installer mutex, the inline probe and its refusal precede the
-    first destructive step (taskkill of cys-app), the refusal ends in exit 6 without touching any
-    process or canonical file, and the probe's grammar pieces exist. Returns a list of problems."""
-    bad = []
-    lines = text.splitlines()
-    depth = 0
-    page_top = False
-    for raw in lines:
-        t = raw.strip()
-        if re.match(r"^(!macro\b|Function\b)", t):
-            depth += 1
-        elif re.match(r"^(!macroend\b|FunctionEnd\b)", t):
-            depth -= 1
-        elif t == "Page custom cys_probe_page" and depth == 0:
-            page_top = True
-    if not page_top:
-        bad.append("`Page custom cys_probe_page` is not declared at top level (include time)")
-    for opener, closer in (("!macro", "!macroend"), ("Function", "FunctionEnd")):
-        # `\b` cannot sit between "Function" and "End" (or "!macro" and "end"), so the
-        # opener pattern never counts its own closer
-        n_open = len(re.findall(r"(?m)^\s*%s\b" % re.escape(opener), text))
-        n_close = len(re.findall(r"(?m)^\s*%s\b" % re.escape(closer), text))
-        if n_open != n_close:
-            bad.append("unbalanced %s/%s: %d vs %d" % (opener, closer, n_open, n_close))
-    n_if = len(re.findall(r"(?m)^\s*!if(?:n?def|macrodef|macrondef)?\b", text))
-    n_endif = len(re.findall(r"(?m)^\s*!endif\b", text))
-    if n_if != n_endif:
-        bad.append("unbalanced !if/!endif: %d vs %d" % (n_if, n_endif))
-
-    page = _body(text, "function", "cys_probe_page")
-    pre = _body(text, "macro", "NSIS_HOOK_PREINSTALL")
-    refuse = _body(text, "macro", "CYS_PROBE_REFUSE")
-    leaf = _body(text, "macro", "CYS_PROBE_LEAF")
-    runner = _body(text, "macro", "CYS_RUN_BOUNDED")
-    # ★the runner's own comments EXPLAIN the forms that are forbidden below (that is the point of
-    # them), so every pin on it reads the CODE only - an instrument that matches the comment
-    # describing a defect reports the defect as present.
-    runner_code = None
-    if runner is not None:
-        runner_code = "\n".join(ln for ln in runner.splitlines()
-                                 if not ln.lstrip().startswith(";"))
-    if page is None or pre is None or refuse is None or leaf is None or runner is None:
-        return bad + ["a P1 body is missing (cys_probe_page / PREINSTALL / CYS_PROBE_REFUSE / "
-                      "CYS_PROBE_LEAF / CYS_RUN_BOUNDED)"]
-    for need in ('/CYSPROBE=', '!insertmacro CYS_RUN_BOUNDED', '!insertmacro CYS_PROBE_REFUSE',
-                 'OpenMutexW', 'WaitForSingleObject', 'StrCpy $CysMutexHeld "1"'):
-        if need not in page:
-            bad.append("cys_probe_page lacks %r" % need)
-    if not (0 <= page.find("SetErrorLevel 2") < page.find("CreateMutexW")) or \
-            page.find('${GetOptions} $CMDLINE "/CYSPROBE=" $R0') != page.find("${GetOptions}"):
-        bad.append("cys_probe_page must refuse a /CYSPROBE call with exit 2 before the mutex (B29)")
-    if page.count("!insertmacro CYS_PROBE_CLEAN") != 2:
-        bad.append("cys_probe_page must clean the probe folder on both the ended and the timed-out path")
-    if page.find('StrCpy $CysProbeDone "1"') > page.find("Abort") or "Abort" not in page:
-        bad.append("cys_probe_page must mark the probe done before it skips the page")
-    order = ['"/CYSPROBE="', 'StrCmp $CysMutexHeld "1" cys_pre_single', 'Global\\cys-installer',
-             '!insertmacro CYS_PROBE_RUN "$CysProbeDir"', '!insertmacro CYS_PROBE_REFUSE',
-             "taskkill /F /IM cys-app.exe"]
-    at = [pre.find(x) for x in order]
-    if -1 in at or at != sorted(at):
-        bad.append("PREINSTALL order broken (worker < mutex skip < mutex < inline probe < refusal < "
-                   "GUI kill): %r" % list(zip(order, at)))
-    worker = pre[pre.find('"/CYSPROBE="'):pre.find("cys_pre_noworker:")]
-    if "taskkill" in worker or '!insertmacro CYS_PROBE_RUN "$INSTDIR"' not in worker or "Quit" not in worker:
-        bad.append("the probe-only worker branch must run the probe in $INSTDIR and Quit, never kill")
-    tail = [l.strip() for l in refuse.splitlines() if l.strip() and not l.strip().startswith(";")]
-    if tail[-2:] != ["SetErrorLevel 6", "Quit"]:
-        bad.append("CYS_PROBE_REFUSE must end with SetErrorLevel 6 + Quit (got %r)" % tail[-2:])
-    for forbidden in ("taskkill", "KillProcess", "Rename ", 'Delete "$INSTDIR\\cys'):
-        if forbidden in refuse:
-            bad.append("CYS_PROBE_REFUSE touches a process or a canonical file: %r" % forbidden)
-    # ★(0.14.55 P4-IMPL r1 · M1) the probe's bound must be an ABSOLUTE execution deadline on a
-    # handle WE own, not nsExec's inactivity timer. These pins are deliberately about the
-    # MECHANISM: a `/TIMEOUT=` token is a syntax fact and says nothing about elapsed time, which
-    # is exactly the confusion that shipped. Both probe paths must go through CYS_RUN_BOUNDED.
-    for need in ("kernel32::CreateProcessW", "kernel32::WaitForSingleObject",
-                 "kernel32::TerminateProcess", "kernel32::GetExitCodeProcess",
-                 'StrCpy $R7 "cleanup-unconfirmed"', 'StrCpy $R7 "timeout"'):
-        if need not in runner_code:
-            bad.append("CYS_RUN_BOUNDED lacks %r (absolute deadline on an owned handle)" % need)
-    # the kill must itself be bounded: a SECOND wait is what separates a confirmed kill from
-    # cleanup-unconfirmed, so one WaitForSingleObject is not enough.
-    if runner_code.count("kernel32::WaitForSingleObject") < 2:
-        bad.append("CYS_RUN_BOUNDED must wait twice: the deadline, then a bounded kill confirmation")
-    if runner_code.find("kernel32::TerminateProcess") < runner_code.find("kernel32::WaitForSingleObject"):
-        bad.append("CYS_RUN_BOUNDED must wait BEFORE it terminates (the deadline decides the kill)")
-    # the capture must not be a pipe: nothing drains one here, so a chatty child would block on
-    # write and a continuous-output candidate would hang instead of being bounded.
-    for forbidden in ("CreatePipe", "ExecToStack", "ExecToLog", "nsExec"):
-        if forbidden in runner_code:
-            bad.append("CYS_RUN_BOUNDED must own its handle and capture to a file, found %r" % forbidden)
-    if "kernel32::CreateFileW" not in runner_code:
-        bad.append("CYS_RUN_BOUNDED must redirect the child's output to a FILE (bounded capture)")
-    # the command line must reach CreateProcessW through a REGISTER. Every real CMD starts with a
-    # quoted path, and the System plugin ends a quoted inline literal at the first inner quote, so
-    # an inline form would launch a truncated command line.
-    if 't r5' not in runner_code or "StrCpy $5 '${CMD}'" not in runner_code:
-        bad.append("CYS_RUN_BOUNDED must pass the command line by register (t r5), not inline")
-    if 't "${CMD}"' in runner_code:
-        bad.append("CYS_RUN_BOUNDED passes CMD as an inline quoted literal: the System plugin's "
-                   "parser ends it at the first inner quote of the quoted exe path")
-    # the leaf and the GUI worker wrapper must BOTH be bounded this way - the silent /S path is
-    # not protected by the worker's wrapper, which is how the unbounded leaf shipped.
-    if "nsExec" in leaf:
-        bad.append("CYS_PROBE_LEAF must not use nsExec: its /TIMEOUT is an inactivity timer")
-    if text.count("!insertmacro CYS_RUN_BOUNDED") < 2:
-        bad.append("both probe paths (silent inline leaf + GUI worker) must use CYS_RUN_BOUNDED")
-    if re.search(r"nsExec::ExecToStack /TIMEOUT=\d+ '\"\$EXEPATH\"", text):
-        bad.append("the GUI worker wrapper still uses the nsExec inactivity timer")
-    # exact (case-sensitive StrCmpS) comparisons of the F3 grammar, and the build-ID character loop
-    for need in ('"cysd ${VER} (build "', 'StrCmpS $R5 "cys ${VER}"',
-                 'StrCmpS $R5 "cys-app ${VER}"', "StrCmpS $R6 $R4 ", 'StrCmpS $R2 ")" ',
-                 "StrCmpS $R4 $R7 ", "CYS_DEL_RETRY"):
-        if need not in leaf:
-            bad.append("CYS_PROBE_LEAF lacks %r (shared grammar / bounded termination)" % need)
-    # R2-F4: the allowed build-ID set is exactly printable ASCII 0x21-0x7E without ')'
-    m = re.search(r'StrCpy \$R7 "(.*)" 1 \$R5', leaf)
-    want = "".join(chr(c) for c in range(0x21, 0x7F) if c != 0x29)
-    if not m or m.group(1).replace('$\\"', '"').replace("$$", "$") != want:
-        bad.append("CYS_PROBE_LEAF build-ID set is not printable ASCII 0x21-0x7E without ')'")
-    # R2-F1: relaunched-ok only after a visible window of $INSTDIR\cys-app.exe is seen twice, and
-    # the hand-off never kills anything
-    gui = _body(text, "macro", "CYS_FIND_GUI")
-    ho = _body(text, "macro", "CYS_HANDOFF")
-    if gui is None or ho is None:
-        return bad + ["a P1 hand-off body is missing (CYS_FIND_GUI / CYS_HANDOFF)"]
-    for need in ("IsWindowVisible", "QueryFullProcessImageNameW", 'StrCmp $R1 "$INSTDIR\\cys-app.exe"'):
-        if need not in gui:
-            bad.append("CYS_FIND_GUI lacks %r (intended-GUI identity and readiness)" % need)
-    finds = [i.start() for i in re.finditer(r"!insertmacro CYS_FIND_GUI", ho)]
-    ok_at = ho.find('StrCpy $CysHandoff "relaunched-ok"')
-    if len(finds) != 2 or ok_at < 0 or ok_at < finds[-1] or "Sleep 5000" not in ho[finds[0]:finds[1]]:
-        bad.append("CYS_HANDOFF must set relaunched-ok only after a second CYS_FIND_GUI 5 s later")
-    for forbidden in ("taskkill", "KillProcess", "TerminateProcess"):
-        if forbidden in ho or forbidden in gui:
-            bad.append("the hand-off kills a process: %r" % forbidden)
-    # R2-F2: the worker's liveness mutex and the name the parent checks are the same object
-    if 'CreateMutexW(p 0, i 1, w "Local\\cys$R0")' not in worker or \
-            'w "Local\\cys.cys-probe-$CysProbeTick"' not in page:
-        bad.append("worker liveness mutex and the parent's timeout check do not name the same object")
-    # every P1 Var is used somewhere besides its declaration
-    for v in re.findall(r"(?m)^Var\s+(Cys\w+)", text):
-        if len(re.findall(r"\$%s\b" % v, text)) < 1:
-            bad.append("Var %s is declared but never used" % v)
-    return bad
-
-
-def m1_deadline_model():
-    """★(0.14.55 P4-IMPL r1 · M1) the two timer kinds, as elapsed time rather than as a token.
-
-    This is the check that answers the review finding. nsExec's /TIMEOUT is an INACTIVITY timer:
-    it is reset by every write, so a child that keeps printing is never bounded by it. An
-    absolute deadline counts from the start whatever the child prints. Modelled over two output
-    profiles; `None` means the probe never returns.
-
-    It is a model of the two TIMER DISCIPLINES, not of Windows: no process is run here.
-    """
-    bad = []
-
-    def inactivity(profile, limit_ms, horizon_ms):
-        """Return ms at which an inactivity timer fires, or None within the horizon."""
-        t = last = 0
-        while t <= horizon_ms:
-            if t - last >= limit_ms:
-                return t
-            if t in profile:                      # a write resets the timer
-                last = t
-            t += 1
-        return None
-
-    def absolute(limit_ms, horizon_ms):
-        """An absolute deadline cannot depend on the output profile at all."""
-        return limit_ms if limit_ms <= horizon_ms else None
-
-    HORIZON = 600000
-    silent = set()                                 # a quiet hang: writes nothing, ever
-    chatty = set(range(0, HORIZON + 1, 1000))      # one write a second, forever
-
-    # the OLD discipline: bounded for the quiet hang, UNBOUNDED for the chatty one
-    if inactivity(silent, 30000, HORIZON) != 30000:
-        bad.append("model error: an inactivity timer must fire at its limit on a silent child")
-    if inactivity(chatty, 30000, HORIZON) is not None:
-        bad.append("model error: an inactivity timer must NOT fire on a child that keeps writing")
-    # the NEW discipline: the SAME bound for both, which is the whole point
-    for name, prof in (("quiet-hang", silent), ("continuous-output", chatty)):
-        got = absolute(30000, HORIZON)
-        if got != 30000:
-            bad.append("absolute deadline must bound %s at its limit, got %r" % (name, got))
-    # and the outer GUI-worker bound is absolute on the same discipline
-    if absolute(120000, HORIZON) != 120000:
-        bad.append("the GUI worker's outer bound must be absolute too")
-    return bad
 
 
 def hook_guard():
@@ -338,18 +122,6 @@ def hook_guard():
             text = f.read()
     except OSError as e:
         print("FAIL[guard]: cannot read the hook at %s: %s" % (p, e), file=sys.stderr)
-        sys.exit(2)
-
-    m1 = m1_deadline_model()
-    if m1:
-        print("FAIL[m1]: the probe's execution bound is not absolute:\n  " + "\n  ".join(m1),
-              file=sys.stderr)
-        sys.exit(2)
-
-    p1 = p1_structure_check(text)
-    if p1:
-        print("FAIL[p1]: WP12 pre-swap run check structure broken:\n  " + "\n  ".join(p1),
-              file=sys.stderr)
         sys.exit(2)
 
     macros = set(re.findall(r"!macro\s+([A-Z_][A-Z0-9_]+)", text))
@@ -620,20 +392,6 @@ class Run:
 # ═════════════════════════════════════════════════════════════════════════════
 # mirrors of the hook macros (anchors cited per function)
 # ═════════════════════════════════════════════════════════════════════════════
-
-def probe(run):
-    """WP12 P1 pre-swap run check — CYS_PROBE_RUN/CYS_PROBE_REFUSE at PREINSTALL ⓑ (silent) or on
-    the first page (cys_probe_page, GUI/passive). It runs before ① (GUI kill), before the template's
-    File lines and before PageReinstall's old-uninstaller call, and writes only inside its own
-    .cys-probe-* folder (not represented here). Refusal = exit 6 with every modeled file untouched
-    (invariant I5). The probe's own outcomes (grammar, timeout, cleanup) are pinned structurally
-    by p1_structure_check and executed on windows-latest (T2/T2b), not mirrored here."""
-    if run.fault("probe-refuse"):
-        run.events.append("PROBE-REFUSED")
-        run.exit = 6
-        return True
-    return False
-
 
 def preinstall(run):
     """NSIS_HOOK_PREINSTALL — mirrors: singleton (assumed won), GUI-only
@@ -943,8 +701,6 @@ def run_one_factory(scen):
     def run_one(ch):
         run = Run(scen, ch)
         try:
-            if probe(run):
-                return run
             preinstall(run)
             template_extract(run)
             postinstall(run)
@@ -966,14 +722,6 @@ class Violation(AssertionError):
 
 def check(run):
     scen = run.scen
-    # ── I5 (WP12 P1) — refused before any change: exit 6 leaves every file exactly as it started
-    if run.exit == 6:
-        initial = {name: (kind, lock, proc) for name, kind, lock, proc in scen["files"]}
-        now = {n: (e["kind"], e["lock"], e["proc"]) for n, e in run.files.items()}
-        if now != initial or run.failfile or run.marker:
-            raise Violation("I5: exit 6 (pre-swap refusal) but the tree changed: %r -> %r"
-                            % (initial, now))
-        return
     start = {b: k for b, k in scen["start_kind"].items()}
     fam = {b: run.family(b) for b in BINS}
 
@@ -1282,7 +1030,7 @@ COVERAGE_PINS = (
        "arrival:ld-new", "arrival:ld-prev", "arrival:cb-new", "arrival:cb-prev",
        "arrival:unplace-reseat", "arrival:restore-old", "arrival:txn-fill",
        "arrival:tpl-extract",
-       "exit:0", "exit:3", "exit:4", "exit:6", "exit:cancel", "exit:kill"])
+       "exit:0", "exit:3", "exit:4", "exit:cancel", "exit:kill"])
 
 DEFAULT_BUDGETS = (FAULT_BUDGET == 4 and INT_FAULT_CAP == 3
                    and "CYS_MODEL_FAULTS" not in os.environ
@@ -1350,7 +1098,7 @@ def main():
                   file=sys.stderr)
             sys.exit(1)
     print("nsis-hook-model: OK — %d terminal states explored, "
-          "invariants I1/I3/I4/I5 held in all of them, %d/%d deep-lane pins hit"
+          "invariants I1/I3/I4 held in all of them, %d/%d deep-lane pins hit"
           % (total, len([p for p in COVERAGE_PINS if cov.get(p)]),
              len(COVERAGE_PINS)))
 

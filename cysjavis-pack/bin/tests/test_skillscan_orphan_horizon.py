@@ -35,24 +35,22 @@ How it observes (and why not by process name):
     completion while the control survived has a broken detector, and every survivor verdict
     from it is void - which is a different verdict from "no orphans". The control is counted
     separately from the scanner's own workers, since by construction it IS a survivor.
-  * STATES, NOT ONE NUMBER, and ★(r1 m3) the states separate SURVIVAL from COMPLETION:
-      completed_before_return  - its unit finished before the production call came back.
-                                 Whether it outlived the DEADLINE (as against the return)
-                                 is not separable from here, and is not claimed.
-      survived_then_completed  - its completion marker appeared AFTER the production call
-                                 returned. That is a CONFIRMED survivor of the deadline:
-                                 the unit was still running when the bound fired.
-      alive_at_horizon         - no completion marker and the process is still alive at the
-                                 end of the horizon. Also a confirmed survivor.
-      killed_before_completing - no completion marker and the process is gone.
-      unknown                  - `_alive` could not answer (no owned-tree observation on
-                                 this arm, or an OSError). Counted and printed, NEVER
-                                 folded into a measured survivor count.
-    The earlier form labelled EVERY completion marker seen during the horizon "exited" and
-    then computed survivors from alive+unknown only, so four workers that demonstrably
-    outlived the deadline and finished afterwards were reported as 0 orphans (r1 m3).
-    ★A completion marker proves a UNIT FINISHED. It does not prove process exit, so the
-    process is probed separately and the two facts are reported separately.
+  * TWO AXES, NOT ONE NUMBER, reported separately and combined only per worker:
+      completion  before_return | after_return | none   - when the WORK UNIT finished
+      liveness    alive | exited | unknown              - what the PROCESS is at the horizon
+    A worker is a confirmed survivor of the deadline if EITHER axis says so: a completion
+    AFTER the production return means the unit was still running when the bound fired, and a
+    process still alive after the return and its cleanup outlived both. `unknown` is reported
+    only where neither axis could answer, and is never folded into a measured count.
+    Two fixes live here, both from review rounds, both of which produced a false 0:
+      (r1 m3) the old form labelled EVERY completion marker seen during the horizon "exited"
+      and summed survivors from alive+unknown only, so four workers that outlived the
+      deadline and finished afterwards were reported as 0 orphans.
+      (r2 m3) the r1 form then classified `done_before` WITHOUT probing liveness at all, so
+      four workers whose units had finished but whose PROCESSES were all still alive at the
+      horizon were again reported as 0, with complete = true. ★Liveness is now probed for
+      EVERY started worker, `completed_before_return` included.
+    ★A completion marker proves a UNIT FINISHED. It never proves process exit.
 
 What it drives: the real `Preflight._run_skillscan_all`, with the real
 `SKILLSCAN_SCAN_TIMEOUT_S`. The bound is deliberately NOT shortened - the production
@@ -130,47 +128,78 @@ def classify(pids, done_before, done_after, alive, control_key=CONTROL_KEY,
              want_workers=WORKERS):
     """Pure classifier: marker sets + an aliveness oracle -> per-unit states and a summary.
 
-    ★(r1 m3) It is a FUNCTION so that the escaped-worker and no-worker controls can drive it
-    directly, without paying the production timeout again. Nothing here enumerates processes
-    by name and nothing here decides a count from `unknown`.
+    ★(r1 m3) It is a FUNCTION so that the controls can drive it directly, without paying the
+    production timeout again. Nothing here enumerates processes by name and nothing here
+    decides a count from `unknown`.
+
+    ★(r2 m3) LIVENESS IS PROBED FOR EVERY STARTED WORKER, including the ones whose unit had
+    already finished at the return. The r1 form classified `done_before` WITHOUT calling
+    `alive(pid)` at all, and the reviewer's counterexample is exact: four `done_before`
+    markers, a late control and an oracle that answers True for every pid gave
+    survivors = 0 and complete = true while all four worker PROCESSES were alive at the
+    horizon. A pool worker can finish its unit and stay a process - that is what a pool is.
 
       pids        {unit key: pid} from the `started-` markers (the control key included)
       done_before completion markers present when the production call RETURNED
       done_after  completion markers that appeared after that, inside the horizon
       alive       pid -> True / False / None(unknown)
+
+    Two axes, kept SEPARATE in the output and combined only in the per-key state:
+      completion  before_return | after_return | none      (when the UNIT finished)
+      liveness    alive | exited | unknown                  (what the PROCESS is now)
+    A worker is a confirmed survivor of the deadline if EITHER axis says so:
+      * completion == after_return  - the unit was still running when the bound fired, so the
+        process outlived it, whatever the process is doing now; or
+      * liveness == alive           - the process is alive after the production call returned
+        and after its cleanup, so it outlived both.
+    `unknown` is only reported where neither axis could answer - an unknown liveness with a
+    late completion is still a confirmed survivor.
     """
     states = {}
-    exit_probe = {}
+    completion = {}
+    liveness = {}
     for key, pid in pids.items():
         mark = "done-%s.txt" % key
         if mark in done_before:
-            states[key] = "completed_before_return"
+            completion[key] = "before_return"
         elif mark in done_after:
-            # the unit finished late => the process outlived the deadline. Whether it has
-            # since exited is a SEPARATE question, probed and reported separately.
-            states[key] = "survived_then_completed"
-            exit_probe[key] = alive(pid)
+            completion[key] = "after_return"
         else:
-            states[key] = {True: "alive_at_horizon", False: "killed_before_completing",
-                           None: "unknown"}[alive(pid)]
+            completion[key] = "none"
+        liveness[key] = {True: "alive", False: "exited", None: "unknown"}[alive(pid)]
+        states[key] = completion[key] + "+" + liveness[key]
+
     scanner = sorted(k for k in states if k != control_key)
-    counts = {}
+
+    def survivor(k):
+        return completion[k] == "after_return" or liveness[k] == "alive"
+
+    def unresolved(k):
+        # neither axis could place it: no late completion AND no answer about the process
+        return completion[k] != "after_return" and liveness[k] == "unknown"
+
+    counts, comp_counts, live_counts = {}, {}, {}
     for k in scanner:
         counts[states[k]] = counts.get(states[k], 0) + 1
-    confirmed = counts.get("survived_then_completed", 0) + counts.get("alive_at_horizon", 0)
-    unknown = counts.get("unknown", 0)
+        comp_counts[completion[k]] = comp_counts.get(completion[k], 0) + 1
+        live_counts[liveness[k]] = live_counts.get(liveness[k], 0) + 1
+    confirmed = sum(1 for k in scanner if survivor(k))
+    unknown = sum(1 for k in scanner if unresolved(k))
     population_ok = (len(scanner) == want_workers)
     summary = {
         "scanner_workers_started": len(scanner),
         "scanner_workers_intended": want_workers,
         "scanner_population_complete": population_ok,
         "states": counts,
+        "completion_timing": comp_counts,
+        "process_liveness": live_counts,
         "confirmed_survivors_past_the_deadline": confirmed,
+        "survivor_keys": sorted(k for k in scanner if survivor(k)),
         "unknown": unknown,
-        # the count is only a measurement when nothing is unknown AND the population is whole
+        # the count is only a measurement when nothing is unresolved AND the population is whole
         "orphans_surviving_the_deadline": confirmed,
         "orphan_count_is_complete": bool(population_ok and unknown == 0),
-        "still_alive_after_a_late_completion": {k: v for k, v in exit_probe.items()},
+        "liveness_probed_for_every_started_worker": sorted(liveness) == sorted(pids),
     }
     return states, summary
 
@@ -257,13 +286,16 @@ class SkillscanOrphanHorizon(unittest.TestCase):
                     "the deliberately surviving control never wrote its marker: the horizon is too "
                     "short or the control was killed, so ANY survivor verdict from this run is void")
                 # ★the control is a confirmed survivor BY CONSTRUCTION, so the classifier must
-                #   place it there. If it ever lands in completed_before_return or killed_*, the
+                #   place it there. If its completion axis is ever anything but after_return, the
                 #   detector or the boundary snapshot is broken and the run measures nothing.
-                self.assertEqual(
-                    control_state, "survived_then_completed",
+                self.assertTrue(
+                    control_state.startswith("after_return+"),
                     "the control survived the deadline and completed during the horizon, and the "
                     "classifier called it %r: the detector is broken, so this run measures nothing"
                     % (control_state,))
+                # ★(r2 m3) the instrument must have asked about every started worker's process
+                self.assertTrue(summary["liveness_probed_for_every_started_worker"],
+                                "liveness was not probed for every started worker")
                 # ★(r1 m3) the denominator is the SCANNER's population, counted apart from the
                 #   control. `started > 0` was satisfied by the control alone.
                 self.assertTrue(
@@ -297,35 +329,73 @@ class SkillscanOrphanHorizon(unittest.TestCase):
         done_before = set()                                   # nothing had finished at the return
         done_after = set("done-%s.txt" % k for k in ("0", "1", "2", "3", CONTROL_KEY))
         states, summary = classify(pids, done_before, done_after, lambda pid: False)
-        self.assertEqual(states["0"], "survived_then_completed")
-        self.assertEqual(states[CONTROL_KEY], "survived_then_completed")
-        self.assertNotIn("exited", set(states.values()))
-        self.assertEqual(summary["states"].get("survived_then_completed"), 4)
+        self.assertEqual(states["0"], "after_return+exited")
+        self.assertEqual(states[CONTROL_KEY], "after_return+exited")
+        self.assertEqual(summary["completion_timing"], {"after_return": 4})
+        self.assertEqual(summary["states"].get("after_return+exited"), 4)
         self.assertEqual(summary["confirmed_survivors_past_the_deadline"], 4,
                          "four workers completed AFTER the production call returned, so four "
                          "outlived the deadline; a count of 0 here is the m3 defect")
         self.assertEqual(summary["orphans_surviving_the_deadline"], 4)
         self.assertTrue(summary["orphan_count_is_complete"])
-        # the completion marker says the UNIT finished; process exit is a separate fact
-        self.assertEqual(summary["still_alive_after_a_late_completion"]["0"], False)
+        # ★the two axes are reported separately, and a late completion counts as a survivor
+        #   even though the process has since exited - the unit outlived the deadline.
+        self.assertEqual(summary["process_liveness"], {"exited": 4})
+        self.assertEqual(summary["survivor_keys"], ["0", "1", "2", "3"])
         # and a worker that finished BEFORE the return is not a survivor of the return
         states2, summary2 = classify(pids, done_after, set(), lambda pid: False)
-        self.assertEqual(states2["0"], "completed_before_return")
+        self.assertEqual(states2["0"], "before_return+exited")
         self.assertEqual(summary2["confirmed_survivors_past_the_deadline"], 0)
         # one still alive with no marker at all is a survivor too, and `unknown` is not a count
         states3, summary3 = classify({"0": 101, CONTROL_KEY: 199}, set(),
                                      set(["done-%s.txt" % CONTROL_KEY]),
                                      lambda pid: True, want_workers=1)
-        self.assertEqual(states3["0"], "alive_at_horizon")
+        self.assertEqual(states3["0"], "none+alive")
         self.assertEqual(summary3["confirmed_survivors_past_the_deadline"], 1)
         states4, summary4 = classify({"0": 101, CONTROL_KEY: 199}, set(),
                                      set(["done-%s.txt" % CONTROL_KEY]),
                                      lambda pid: None, want_workers=1)
-        self.assertEqual(states4["0"], "unknown")
+        self.assertEqual(states4["0"], "none+unknown")
         self.assertEqual(summary4["confirmed_survivors_past_the_deadline"], 0)
         self.assertEqual(summary4["unknown"], 1)
         self.assertFalse(summary4["orphan_count_is_complete"],
                          "an unknown must make the count incomplete, never a measured 0")
+
+    def test_control_all_four_completed_before_return_but_every_process_is_alive(self):
+        """★(r2 m3 · codex) THE reviewer's counterexample, executed. Four units finished before
+        the production call returned, a late control, and an aliveness oracle that answers True
+        for every pid. The r1 classifier never asked `alive()` about a `done_before` worker, so
+        it reported survivors = 0 with complete = true while all four processes were alive at
+        the horizon. A pool worker finishing its unit is not a dead process."""
+        pids = {"0": 101, "1": 102, "2": 103, "3": 104, CONTROL_KEY: 199}
+        done_before = set("done-%s.txt" % k for k in ("0", "1", "2", "3"))
+        done_after = set(["done-%s.txt" % CONTROL_KEY])
+        states, summary = classify(pids, done_before, done_after, lambda pid: True)
+        # the completion axis is honest: their units DID finish before the return
+        self.assertEqual(summary["completion_timing"], {"before_return": 4})
+        # and the liveness axis is the one the r1 form never asked for
+        self.assertEqual(summary["process_liveness"], {"alive": 4})
+        self.assertEqual(states["0"], "before_return+alive")
+        self.assertEqual(summary["confirmed_survivors_past_the_deadline"], 4,
+                         "all four worker PROCESSES are alive at the horizon, so all four "
+                         "outlived the production deadline; 0 here is the r2 m3 defect")
+        self.assertEqual(summary["orphans_surviving_the_deadline"], 4)
+        self.assertEqual(summary["survivor_keys"], ["0", "1", "2", "3"])
+        # it is a MEASURED 4, not an unknown: both axes answered for every worker
+        self.assertEqual(summary["unknown"], 0)
+        self.assertTrue(summary["orphan_count_is_complete"])
+        self.assertTrue(summary["liveness_probed_for_every_started_worker"])
+        # the mirror case must still read 0: units finished early AND the processes are gone
+        gone_states, gone = classify(pids, done_before, done_after, lambda pid: False)
+        self.assertEqual(gone_states["0"], "before_return+exited")
+        self.assertEqual(gone["confirmed_survivors_past_the_deadline"], 0)
+        self.assertTrue(gone["orphan_count_is_complete"])
+        # ... and an unprobeable process with an early completion stays UNKNOWN, never a 0
+        murky_states, murky = classify(pids, done_before, done_after, lambda pid: None)
+        self.assertEqual(murky_states["0"], "before_return+unknown")
+        self.assertEqual(murky["unknown"], 4)
+        self.assertEqual(murky["confirmed_survivors_past_the_deadline"], 0)
+        self.assertFalse(murky["orphan_count_is_complete"])
 
     def test_control_a_run_where_no_scanner_worker_started_is_incomplete_not_zero(self):
         """★the premise the shipped instrument could not fail: only the control started.
@@ -333,7 +403,7 @@ class SkillscanOrphanHorizon(unittest.TestCase):
         pids = {CONTROL_KEY: 199}
         states, summary = classify(pids, set(), set(["done-%s.txt" % CONTROL_KEY]),
                                    lambda pid: False)
-        self.assertEqual(states[CONTROL_KEY], "survived_then_completed")
+        self.assertEqual(states[CONTROL_KEY], "after_return+exited")
         self.assertEqual(summary["scanner_workers_started"], 0)
         self.assertEqual(summary["scanner_workers_intended"], WORKERS)
         self.assertFalse(summary["scanner_population_complete"],
