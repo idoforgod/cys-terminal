@@ -29899,12 +29899,83 @@ mod tests {
         );
     }
 
+    // Test-only observer for the directory-removal control. The input snapshots are
+    // taken before teardown; classifying them after teardown cannot leak its reader.
+    fn wp5_removed_directory_premise(
+        removal: std::io::Result<()>,
+        remaining: std::io::Result<std::fs::Metadata>,
+    ) -> Result<(), String> {
+        removal.map_err(|error| format!("remove_dir_all failed: {error}"))?;
+        match remaining {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!("directory absence could not be observed: {error}")),
+            Ok(_) => panic!("WP5 control premise: remove_dir_all returned Ok but the directory entry remains"),
+        }
+    }
+
+    fn wp5_require_expected_cleanup_panic(actual: &str, integrity: &str, persistence: &str) {
+        assert!(
+            actual == integrity || actual == persistence,
+            "WP5 unavailable directory control caught an unrelated cleanup panic: {actual}"
+        );
+    }
+
+    #[test]
+    fn wp5_unavailable_removal_does_not_swallow_unrelated_cleanup_panic() {
+        let removal = Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "fixture blocked"));
+        let remaining = Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert!(wp5_removed_directory_premise(removal, remaining).is_err());
+        let caught = std::panic::catch_unwind(|| {
+            wp5_require_expected_cleanup_panic("reader deadline failure", "exact integrity panic", "exact persistence panic");
+        });
+        assert!(caught.is_err(), "UNMEASURED directory control must not turn unrelated cleanup failure green");
+    }
+
+    #[test]
+    fn wp5_unavailable_removal_accepts_only_known_partial_deletion_panics() {
+        wp5_require_expected_cleanup_panic("exact integrity panic", "exact integrity panic", "exact persistence panic");
+        wp5_require_expected_cleanup_panic("exact persistence panic", "exact integrity panic", "exact persistence panic");
+    }
+
+    #[test]
+    fn wp5_removal_observer_rejects_os_failure_even_when_path_is_absent() {
+        let removal = Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "fixture removal denied"));
+        let remaining = Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        let reason = wp5_removed_directory_premise(removal, remaining).expect_err("failed removal is UNMEASURED");
+        assert!(reason.contains("fixture removal denied"));
+    }
+
+    #[test]
+    fn wp5_removal_observer_rejects_unreadable_postcondition() {
+        let remaining = Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "fixture stat denied"));
+        let reason = wp5_removed_directory_premise(Ok(()), remaining).expect_err("unreadable absence is UNMEASURED");
+        assert!(reason.contains("fixture stat denied"));
+    }
+
+    #[test]
+    fn wp5_removal_observer_catches_success_without_removal() {
+        let remaining = std::fs::symlink_metadata(std::env::temp_dir());
+        assert!(remaining.is_ok(), "positive control: temporary directory exists");
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| wp5_removed_directory_premise(Ok(()), remaining)));
+        assert!(caught.is_err(), "claiming successful removal with a surviving entry must fail, not skip");
+    }
+
+    #[test]
+    fn wp5_removal_observer_accepts_checked_real_removal() {
+        let dir = std::env::temp_dir().join(format!("cys-wp5-removal-observer-{}", std::process::id()));
+        std::fs::create_dir(&dir).expect("fresh control directory");
+        let removed = std::fs::remove_dir_all(&dir);
+        let remaining = std::fs::symlink_metadata(&dir);
+        assert_eq!(wp5_removed_directory_premise(removed, remaining), Ok(()));
+    }
+
     /// ★(0.14.53 · WP2 · B-433) `test_stop_daemon` 결정론적 증명 + 역순(디렉터리 선삭제) 거부 대조군:
     /// ① 정상 순서(`test_stop_daemon` → `remove_dir_all`)에서는 PTY reader 가 EOF 후 `park_active_to_restored`
     ///    → `persist_queue_state` 및 `surface.exited` 발행을 마치고 `Arc<Daemon>` 강한 참조를 놓은(strong_count == 1)
     ///    뒤에야 반환하며 `queue.persist_failed` 가 0건이고 `queue_wal_durable()` 이 참이다.
-    /// ② 역순 대조군(배경 스레드 정지 전에 상태 디렉터리를 먼저 지운 경우)에서는 `test_stop_daemon` 이
-    ///    반드시 패닉해 순서 위반/경합을 붉게 잡는다.
+    /// ② Directory-removal control: only checked removal plus observed NotFound permits
+    ///    an exact integrity-panic assertion. OS refusal is explicitly UNMEASURED for
+    ///    this control only; the positive arm and persistence-failure control still run.
     #[test]
     fn wp5_queue_stop_daemon_proves_threads_exited_and_rejects_dir_removal_before_stop() {
         let _ledger = crate::delivery::tests::isolate_state_dir("wp5-stop-daemon-probe");
@@ -29946,16 +30017,54 @@ mod tests {
             let _ = child.kill();
             let _ = child.wait();
         }
-        let bad_dir = bad_daemon.socket_path.parent().expect("임시 dir").to_path_buf();
-        let _ = std::fs::remove_dir_all(&bad_dir);
+        let bad_dir = crate::state::state_dir(&bad_daemon.socket_path);
+        let removed = std::fs::remove_dir_all(&bad_dir);
+        let remaining = std::fs::symlink_metadata(&bad_dir);
+        let intact_at_entry = bad_dir.exists() && bad_dir.join("operator.token").exists();
+        // Snapshot the premise BEFORE teardown, but always stop readers before a
+        // setup assertion or runtime omission can leave this block.
         let caught_dir = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             crate::state::test_stop_daemon(&bad_daemon);
         }));
-        let _ = std::fs::remove_dir_all(&bad_dir);
-        assert!(
-            caught_dir.is_err(),
-            "대조군 1 실패: 배경 스레드 종료 전에 상태 디렉터리를 먼저 지웠는데 test_stop_daemon 이 통과했다"
+        let panic_text = |payload: &(dyn std::any::Any + Send)| {
+            payload.downcast_ref::<String>().cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|text| (*text).to_owned()))
+                .unwrap_or_else(|| "<non-string panic>".to_owned())
+        };
+        let intact_at_exit = bad_dir.exists() && bad_dir.join("operator.token").exists();
+        let persist_failures: Vec<Value> = bad_daemon.bus.replay_after(0).into_iter()
+            .filter(|event| event["name"] == "queue.persist_failed").collect();
+        let expected_integrity = format!(
+            "test_stop_daemon: 배경 스레드를 멈추기 전에 상태 디렉터리({})를 먼저 지웠다(intact_entry={}, intact_exit={}, persist_failed={})",
+            bad_dir.display(), intact_at_entry, intact_at_exit, persist_failures.len()
         );
+        let expected_persistence = format!(
+            "test_stop_daemon: 배경 스레드 정리 중 큐 영속 실패가 발생했다: {persist_failures:?}"
+        );
+        match wp5_removed_directory_premise(removed, remaining) {
+            Ok(()) => {
+                assert!(!intact_at_entry, "WP5 measured absence must reach the helper as missing state");
+                let payload = caught_dir.expect_err("WP5 measured missing directory was accepted by test_stop_daemon");
+                assert_eq!(panic_text(payload.as_ref()), expected_integrity, "WP5 control caught an unrelated panic");
+                eprintln!("[WP5_DIRECTORY_CONTROL_MEASURED] checked removal and exact integrity panic");
+            }
+            Err(reason) => {
+                // Partial deletion can legitimately trip integrity/persistence guards,
+                // but reader deadlines/exit markers/Arc failures must still fail.
+                if let Err(payload) = &caught_dir {
+                    wp5_require_expected_cleanup_panic(
+                        &panic_text(payload.as_ref()), &expected_integrity, &expected_persistence
+                    );
+                }
+                // Runtime omission is NOT a libtest ignored count: an outer `ok`
+                // does not prove this control ran. Windows CI uses --nocapture.
+                eprintln!(
+                    "[WP5_DIRECTORY_CONTROL_UNMEASURED] {}: {}; omitted directory-control assertion, not a coverage PASS; cleanup_panic={:?}",
+                    bad_dir.display(), reason, caught_dir.as_ref().err().map(|p| panic_text(p.as_ref()))
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&bad_dir); // best-effort cleanup, not fault injection
 
         // ③ 영속 실패 대조군(control 2): 배경 스레드가 queue.persist_failed 를 기록한 경우 test_stop_daemon 이 반드시 패닉해야 한다.
         let fail_daemon = isolated_daemon();
