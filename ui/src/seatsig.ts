@@ -147,9 +147,12 @@ export type WsSigSummary = {
   /** 신선한 산 좌석의 최대 CTX%(없으면 0 — 60% 미만은 표기하지 않는다) */
   worst: number;
   /**
-   * ★D4(P11 / C-30) 신선한 산 좌석 중 **현재 쓸 수 있는 CTX 값이 없는** 좌석 수.
-   * 점 색·`worst` 에는 영향을 주지 않는다 — 툴팁 한 줄로만 드러난다(경보 피로 금지).
-   * 이 집계가 아는 것은 **값의 유무**뿐이다: 가드·보호에 대해서는 아무 말도 하지 않는다.
+   * ★D4(P11 / C-30) 신선한 좌석 중 **지금 쓸 수 있는 CTX 값이 없는 산 좌석** 수.
+   * 빈 자리(hollow)와 **사망 확정(agent_alive=false)** 좌석은 빠진다 — 그 좌석의 null 은
+   * "지금 못 재는 중"이 아니라 **동결된 빈칸**이고, 그에 대해 할 말은 ❌ 쪽이 가진다(m1).
+   * 점 색·`worst` 에는 영향을 주지 않고 **툴팁 한 줄로만** 드러난다(경보 피로 금지 ·
+   * 보이는 서브라인에는 넣지 않는다). 이 집계가 아는 것은 **값의 유무**뿐이다: 가드·보호에
+   * 대해서는 아무 말도 하지 않는다.
    */
   ctxUnmeasuredN: number;
   ctxUnmeasuredRoles: string[];
@@ -187,7 +190,9 @@ export function summarizeWsSigs(
   const unreg = live.filter((s) => s.unregistered === true);
   const unregRoles = unreg.map((s) => String(s.role ?? "?"));
   // ★D4: 빈 자리(hollow)는 `live` 에서 이미 빠져 있다 — 동결된 null 을 "지금 못 재는 좌석"으로 세지 않는다.
-  const ctxUnmeasured = live.filter((s) => typeof s.ctx_pct !== "number");
+  // ★m1(codex r1): **사망 확정 좌석도 같은 이유로 뺀다.** `live` 는 hollow 만 걸러 내므로
+  //   agent_alive=false 가 여기까지 들어온다(그 좌석은 `dead` 로 이미 세어지고 점 색도 그쪽이다).
+  const ctxUnmeasured = live.filter((s) => s.agent_alive !== false && typeof s.ctx_pct !== "number");
   const ctxUnmeasuredRoles = ctxUnmeasured.map((s) => String(s.role ?? "?"));
 
   let dot: WsDot;
@@ -288,9 +293,9 @@ export function wsSubBits(s: WsSigSummary, firstTitle: string): string[] {
     return bits;
   }
   if (s.worst >= 60) bits.push(`CTX ${s.worst}%`);
-  // ★D4(C-30): 값 없음은 수치 칸과 **다른 줄**로 적는다 — 0% 로도, 경보색으로도 접지 않는다.
-  if (s.ctxUnmeasuredN)
-    bits.push(`CTX 현재값 없음 ${s.ctxUnmeasuredN}: ${s.ctxUnmeasuredRoles.join(", ")}`);
+  // ★m1(codex r1): 값 없음은 **여기에 쓰지 않는다** — 설계는 툴팁 전용이고(`title` 한 줄),
+  //   r1 이 이 보이는 줄에도 넣은 것이 결함이었다. 수치 칸(`CTX n%`)과 섞이면 사람은 두 칸을
+  //   같은 종류로 읽고, 작업공간 탭 폭은 그만큼 매 렌더 늘어난다.
   if (s.idleN) bits.push(`💤${s.idleN}`);
   if (s.dead) bits.push(`❌${s.dead}`);
   if (s.hollowN) bits.push(`○빈자리 ${s.hollowN}`);
