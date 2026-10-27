@@ -1233,7 +1233,9 @@ cys watch --surface surface:3 --until "DONE"   # scrollback이 regex에 맞을 �
 - `78%` — 실측(데몬이 잰 `usage.ctx_pct`)
 - `78%~` — 자기보고·추정(실측 없음 · `set-status` 신고가 300초 이내로 신선)
 - `?` — 판정 불가(자기보고가 낡음/나이 미상 · 좌석 종료·에이전트 사망으로 동결된 값)
-- `-` — 없음(두 축 다 없음). agy/gemini 좌석은 실측이 없어 `~`/`?` 가 정상
+- `-` — **현재 쓸 수 있는 컨텍스트 값 없음**(실측도, 쓸 수 있는 자기보고도 없음). agy/gemini 좌석은 실측이 없어 이 칸이 정상입니다
+
+`cys status`·`cys fleet` 는 `-` 가 한 행이라도 있으면 표 아래에 `CTX '-' = no current usable context value.` 한 줄을 덧붙입니다. 그 행에 **실측값도 자기보고도 없고 가드가 기록 없이 비어 있을 때만** `no automatic threshold input` 줄을 더하며, 그것은 **그 조회 한 번에 대한 사실**입니다(가드가 기록을 쥐고 있으면 부정하지 않고 `guard retains …` 로 한정하고, 가드 상태를 싣지 않는 낡은 데몬 행에는 아무 말도 덧붙이지 않습니다). 보고서(`javis_report`)는 이 문장을 찍지 않습니다 — 보고서 수집기에는 그 판정에 필요한 가드 상태가 실리지 않기 때문입니다.
 
 실측 `usage.ctx_pct` 의 주 출처는 claude 좌석의 **상태줄**(`cys-statusline.sh` → `cys usage-report-stdin`)입니다.
 v0.14.42 부터 이 보고는 데몬을 **새로 띄우지 않고**, 데몬이 응답하지 않으면 **1초(Windows 2초) 안에 포기**합니다
