@@ -3021,13 +3021,49 @@ def h_conc_3():
     # ★유일 tmp — pid 고정 이름이 되돌아오면 같은 프로세스 두 writer 가 같은 inode 를 공유한다.
     #   ★검사 범위를 **함수 본문**으로 좁힌다: 파일 전체로 보면 재현 프로브(음성 대조군)가 구
     #   규칙 문자열을 일부러 갖고 있어 영구 적색이 된다(대조군을 결함으로 오판하는 자충수).
-    wi = pk.find("pub fn write_atomic_mode(")
-    need(wi > 0, "Rust 원자 쓰기 소유자(write_atomic_mode)를 못 찾았다")
-    wbody = pk[wi:pk.find("\n}\n", wi)]
-    need('.tmp.{}", std::process::id()' not in wbody,
-         "pid 고정 tmp 이름이 되돌아왔다 — 같은 프로세스 두 writer 가 같은 inode 를 공유한다")
-    need("crate::tmp_path_for(" in wbody,
-         "호출마다 유일한 tmp 이름 생성기(A13 공용)를 쓰지 않는다")
+    # ★0.14.55 H-08: 쓰기 소유자가 **위임 한 단계**로 갈라졌다 — `write_atomic_mode`(enforce=false)
+    #   와 `write_atomic_mode_exact`(enforce=true)가 한 본문(`write_atomic_mode_inner`)을 공유한다.
+    #   종전 문안은 `write_atomic_mode` **본문**에서 `crate::tmp_path_for(` 를 찾았으므로, 위임 뒤에는
+    #   그 문자열이 inner 로 옮겨가 이 계약이 **무관측**이 된다(핀의 사각 — 이 검체가 이미 두 번 맞은
+    #   꼴이다: 금지 문장은 있는데 대상 밖). 금지의 근거는 함수 이름이 아니라 **호출마다 유일한 tmp
+    #   이름**이므로 진입점에서 위임을 한 단계 따라가 **실제 소유자 본문**을 단언하고, 진입점이 둘 다
+    #   있으면 **둘 다** 본다(새 진입점이 새 사각을 만들지 못한다). 해소 불가면 진입점 본문으로
+    #   단언한다 = fail-closed.
+    def _writer_owner_body(_entry):
+        _i = pk.find("pub fn %s(" % _entry)
+        if _i <= 0:
+            return None
+        _b = pk[_i:pk.find("\n}\n", _i)]
+        if "crate::tmp_path_for(" in _b:
+            return _b
+        # ★계기가 자기 자신을 집지 않게 한다: 본문 탐색은 **여는 중괄호 뒤**에서 시작하고
+        #   진입점 자신의 이름은 후보에서 제외한다(안 하면 시그니처의 `write_atomic_mode(` 가
+        #   첫 매치가 되어 자기 본문을 "소유자"로 돌려주고 핀이 영구 적색이 된다 — 실측).
+        _after = _b[_b.find("{") + 1:] if "{" in _b else _b
+        _callee = None
+        for _m in re.finditer(r"\b(write_atomic[A-Za-z0-9_]*|create_tmp[A-Za-z0-9_]*)\s*\(", _after):
+            if _m.group(1) != _entry:
+                _callee = _m.group(1)
+                break
+        if _callee is None:
+            return _b
+        _j = pk.find("fn %s(" % _callee)
+        if _j <= 0:
+            return _b
+        return pk[_j:pk.find("\n}\n", _j)]
+
+    _entries = [_e for _e in ("write_atomic_mode", "write_atomic_mode_exact")
+                if pk.find("pub fn %s(" % _e) > 0]
+    need("write_atomic_mode" in _entries, "Rust 원자 쓰기 소유자(write_atomic_mode)를 못 찾았다")
+    for _e in _entries:
+        wbody = _writer_owner_body(_e)
+        need('.tmp.{}", std::process::id()' not in wbody,
+             "%s: pid 고정 tmp 이름이 되돌아왔다 — 같은 프로세스 두 writer 가 같은 inode 를 "
+             "공유한다" % _e)
+        need("crate::tmp_path_for(" in wbody,
+             "%s: 호출마다 유일한 tmp 이름 생성기(A13 공용)를 쓰지 않는다" % _e)
+    notes.append("원자 쓰기 진입점 %d개 모두 유일 tmp 생성기 경유(위임 1단계 추적 · 미해소=진입점 본문)"
+                 % len(_entries))
     ci = pk.find("fn create_tmp_with_mode(")
     need(ci > 0, "tmp 생성기를 못 찾았다")
     cbody = pk[ci:pk.find("\n}\n", ci)]
