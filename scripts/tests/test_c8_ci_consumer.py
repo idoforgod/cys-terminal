@@ -72,7 +72,12 @@ CARGO_IN_TEXT = re.compile(r"(?i)(?<![A-Za-z0-9_.-])cargo(?:\.exe|-nextest)?(?![
 # uses: values in the workflows today (census 2026-10-17, version ignored). Add only an action that cannot run tests
 # (checkout, setup, cache, upload); tauri-apps/tauri-action builds the app and runs no test. Anything else - another
 # action, a local ./ action, a reusable workflow - is refused.
-ALLOWED_ACTIONS = {"actions/cache", "actions/checkout", "actions/setup-python", "actions/upload-artifact",
+# C-09 (P4 D15): actions/download-artifact is added for the win-update-probe job, which consumes
+# the installer the build job uploaded. It transports a file and runs nothing, so it is in the same
+# class as upload-artifact; without this entry ci-branch/macos-rust-pack is red at "C8 CI reader
+# controls" on that one name alone (measured: ci-branch run 40085224060).
+ALLOWED_ACTIONS = {"actions/cache", "actions/checkout", "actions/download-artifact", "actions/setup-python",
+                   "actions/upload-artifact",
                    "dtolnay/rust-toolchain", "oven-sh/setup-bun", "swatinem/rust-cache", "tauri-apps/tauri-action"}
 
 def basename_word(token):

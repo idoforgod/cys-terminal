@@ -167,10 +167,23 @@ try {
     $policyOk = $false
     try {
         if (-not (Test-Path -LiteralPath $allowXml)) { throw 'AllowAll.xml example policy not found' }
+        # C-09 (P4 D11): Merge-CIPolicy needs write access to its -PolicyPaths input, so passing
+        # the example policy IN PLACE under %windir%\schemas\CodeIntegrity\ExamplePolicies throws
+        # UnauthorizedAccessException on a hosted runner and CiTool is never reached at all
+        # (measured: run 40085224043 job 120852489545, 7 of 8 checks passed, this one did not).
+        # Merge from a COPY in the writable work dir - the route the diag lane already proved.
+        # The Test-Path above deliberately still checks the ORIGINAL: a missing example policy is
+        # a different and honest UNMEASURED, and must not be reported as a copy failure.
+        $allowCopy = Join-Path $pd 'AllowAll.xml'
+        try {
+            Copy-Item -LiteralPath $allowXml -Destination $allowCopy -Force -ErrorAction Stop
+        } catch {
+            throw ('AllowAll.xml copy into the work dir failed: ' + $_.Exception.Message)
+        }
         $xml = Join-Path $pd 'cys-wp12-t2.xml'
         $cip = Join-Path $pd 'cys-wp12-t2.cip'
         $rules = New-CIPolicyRule -DriverFilePath $denied -Level Hash -Deny
-        Merge-CIPolicy -PolicyPaths $allowXml -Rules $rules -OutputFilePath $xml | Out-Null
+        Merge-CIPolicy -PolicyPaths $allowCopy -Rules $rules -OutputFilePath $xml | Out-Null
         try {
             Set-CIPolicyIdInfo -FilePath $xml -PolicyName 'CYS-WP12-T2' -ResetPolicyID | Out-Null
         } catch {
