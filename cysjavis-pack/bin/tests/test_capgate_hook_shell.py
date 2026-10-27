@@ -502,6 +502,39 @@ class HookInputHandoff(_HookEnv):
         self.assertEqual(leftovers, [], "임시 입력 파일이 남았다: %s" % leftovers)
 
 
+class CsoLocalWritePaths(unittest.TestCase):
+    """Exercise the real predicate with a synthetic home outside allowed temp roots."""
+
+    def setUp(self):
+        source = HOOK.read_text(encoding="utf-8").split("<<'PYEOF'\n", 1)[1]
+        source = source.split('\nif os.environ.get("CAPGATE_SELF_TEST"):', 1)[0]
+        self.ns = {"__name__": "capgate_path_specimen"}
+        exec(compile(source, str(HOOK), "exec"), self.ns)
+        self.ctx = self.ns["Ctx"](home="/w/hm", pack="/w/pack",
+                                  state="/w/hm/.cys/state", tempdir="/w/tmp",
+                                  reader=lambda path: "", approver=lambda cmd: False)
+
+    def denied(self, tool, args):
+        return self.ns["decide"](tool, args, "cso", self.ctx)[0]
+
+    def test_desktop_writes_denied(self):
+        for tool, args in [("Write", {"file_path": "/w/hm/Desktop/CYSjavis/cso/x", "content": "x"}),
+                           ("Edit", {"file_path": "/w/hm/Desktop/CYSjavis/cso/x", "old_string": "a", "new_string": "b"}),
+                           ("Bash", {"command": 'cys status > "$HOME/Desktop/CYSjavis/cso/x"'})]:
+            with self.subTest(tool=tool):
+                self.assertTrue(self.denied(tool, args))
+
+    def test_local_writes_and_cycle_save_allowed(self):
+        for path in ("/w/hm/.cys/state/cso/x", "/w/pack/round/CSO_TODO.md"):
+            with self.subTest(path=path):
+                self.assertFalse(self.denied("Write", {"file_path": path, "content": "x"}))
+        self.assertFalse(self.denied("Bash", {"command": 'cys status > "$HOME/.cys/state/cso/x"'}))
+
+    def test_desktop_reads_unchanged(self):
+        self.assertFalse(self.denied("Read", {"file_path": "/w/hm/Desktop/CYSjavis/cso/x"}))
+        self.assertFalse(self.denied("Bash", {"command": 'cat "$HOME/Desktop/CYSjavis/cso/x"'}))
+
+
 class NegativeControls(unittest.TestCase):
     """★음성 대조 — 안전 검사를 **지우면** 내장 self-test 가 실패해야 한다.
 
@@ -510,6 +543,10 @@ class NegativeControls(unittest.TestCase):
     """
 
     MUTATIONS = [
+        ("Desktop CSO write root restored",
+         '        os.path.join(ctx.pack, "round"),',
+         '        os.path.join(ctx.pack, "round"),\n'
+         '        os.path.join(ctx.home, "Desktop", "CYSjavis", "cso"),'),
         ("shlex 주석 처리 끄기", '        lex.commenters = ""\n', "        pass\n"),
         ("python 옵션 정확 토큰",
          "            if t in CSO_PY_OK_FLAGS:",

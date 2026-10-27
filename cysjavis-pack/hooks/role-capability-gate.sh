@@ -1873,7 +1873,6 @@ def cso_write_roots(ctx):
     타 레인 팩(`pack-dept-*`)은 이 뿌리 **밖**이라 자동으로 deny 된다."""
     return (
         os.path.join(ctx.pack, "round"),
-        os.path.join(ctx.home, "Desktop", "CYSjavis", "cso"),
         os.path.join(ctx.home, ".cys", "state"),
         ctx.state,
         ctx.tempdir,
@@ -1933,7 +1932,7 @@ def cso_path_allowed(path, ctx):
     for r in cso_write_roots(ctx)[1:]:
         if _under(path, r):
             return True, "허용 경로(%s)" % r
-    return False, "허용 경로 밖(자기 TODO·~/Desktop/CYSjavis/cso/·~/.cys/state/·scratchpad)"
+    return False, "허용 경로 밖(자기 TODO·~/.cys/state/cso/·~/.cys/state/·scratchpad)"
 
 
 def _blen(s):
@@ -2392,7 +2391,7 @@ def cso_bash_verdict(command, ti, ctx):
         # ★리다이렉트 대상은 **변수를 해소한 뒤** 판정한다(0.14.31 성찰 G4 · major):
         #   종전은 원 토큰을 그대로 `cso_path_allowed` 에 넘겼고, `_norm` 은 `$HOME` 을 전개하지
         #   않아 `<cwd>/$HOME/…` 로 정규화했다 — 게이트가 본 경로 ≠ bash 가 쓰는 경로.
-        #   ⓐ 거부 방향(항상): `> "$HOME/Desktop/CYSjavis/cso/logs/s.txt"` 가 리터럴 경로와 달리
+        #   ⓐ 거부 방향(항상): `> "$HOME/.cys/state/cso/logs/s.txt"` 가 리터럴 경로와 달리
         #      deny 됐다(지침 §1-1 문면 `cso_expansion_hazard` 가 **권장하는 철자**가 막혔다).
         #   ⓑ 허용 방향(cwd 가 허용 뿌리일 때): `> "$HOME/.claude/settings.json"`(훅 등록 파일 =
         #      게이트 자기 해제) · `> "$HOME/.cys/state/delivery-ledger.jsonl"` · `> "$CYS_PACK_DIR/
@@ -2712,7 +2711,7 @@ def _cso_verdict(tool, tool_input, ctx):
         over, detail = todo_cap_verdict(tool, ti, path, ctx)
         if over:
             return True, ("상태 파일 상한 초과 — %s. 완료·무행동 로그를 "
-                          "`~/Desktop/CYSjavis/cso/logs/` 로 이관하고 다시 시도하라" % detail), False
+                          "`~/.cys/state/cso/logs/` 로 이관하고 다시 시도하라" % detail), False
         essential = is_cso_state_file(path)
     elif tool == "Bash":
         deny, why, essential = cso_bash_verdict(ti.get("command"), ti, ctx)
@@ -3207,6 +3206,18 @@ def self_test_contracts(fails):
             fails.append("CONTRACT[%s]: 기대 %s 인데 %s (%s)"
                          % (label, "deny" if deny else "allow", "deny" if b else "allow", r))
 
+    # Local CSO writes remain available; the former Desktop write root is retired.
+    want(True, "Write", {"file_path": HOME + "/Desktop/CYSjavis/cso/x", "content": "x"},
+         "Desktop CSO Write denied")
+    want(True, "Bash", {"command": 'cys status > "$HOME/Desktop/CYSjavis/cso/x"'},
+         "Desktop CSO redirect denied")
+    want(False, "Write", {"file_path": HOME + "/.cys/state/cso/x", "content": "x"},
+         "local CSO Write allowed")
+    want(False, "Write", {"file_path": PACK + "/round/CSO_TODO.md", "content": "x"},
+         "CSO cycle save allowed")
+    want(False, "Read", {"file_path": HOME + "/Desktop/CYSjavis/cso/x"},
+         "Desktop CSO Read unchanged")
+
     # 세그먼트 전수 검사 — 첫 세그먼트가 필수라고 전체를 면제하지 않는다.
     want(True, "Bash", {"command": "cys status && cys events"}, "복합: 뒤 세그먼트 deny")
     want(True, "Bash", {"command": "cys status; cys kill 123"}, "복합: `;` 뒤 TTL 동사")
@@ -3311,7 +3322,7 @@ def self_test_contracts(fails):
     # ★G4(0.14.31 성찰): 리다이렉트 대상의 변수는 **해소한 뒤** 판정한다 — 지침 문면이 권장하는
     #   철자가 리터럴 경로와 다른 판정을 받으면 CSO 는 "허용 경로에 로그를 남겨라" 를 따를 수 없다.
     want(False, "Bash",
-         {"command": 'cys read-screen 7 > "$HOME/Desktop/CYSjavis/cso/logs/s.txt"'},
+         {"command": 'cys read-screen 7 > "$HOME/.cys/state/cso/logs/s.txt"'},
          "G4 ⓐ `$HOME` 허용 뿌리 리다이렉트는 리터럴 경로와 같은 판정(오탐 금지)")
     want(False, "Bash", {"command": 'cys status --json > "${HOME}/.cys/state/cso/status.json"'},
          "G4 ⓐ `${HOME}` 자기 작업 트리도 같다")
