@@ -350,6 +350,90 @@ dept_logdir(){
 # RC-6: OS중립 graceful kill — unix=SIGTERM→대기→SIGKILL, Windows(MSYS/Git-Bash)=taskkill(트리·강제).
 # Windows 프로세스는 unix 시그널을 안 받으므로 kill/kill -9가 무효 → taskkill //PID //T //F로 분기
 # (MSYS는 `/PID`를 경로로 변환하므로 `//PID` 형식 사용).
+# ★(0.14.53 WP12 · P2 · DESIGN-R2 G1.3) shell twin of the app's rotation pre-probe (K3 = `cys-dept rotate` run by
+#   any caller). Before rotate kills a working daemon, the pair this script relaunches ($CYSD, $CYS) must start and
+#   print the F3 grammar: `cysd V (build ID)` and `cys V'` with V == V' (one build). Windows only (Smart App Control /
+#   App Control); elsewhere a no-op. A 10 s bound per binary, then a kill of that child and 5 s to confirm it is gone
+#   (codex R2-F2) - python, because timeout(1) on Windows is an unrelated program. Blocked = one stderr line that STARTS
+#   with the machine-readable prefix `new_daemon_blocked:` (codex R2-F3; rotate_dept_daemon passes stderr unchanged to the
+#   UI latch), exit 12. Nothing is killed and the socket is untouched. Vectors: scripts/tests/fixtures/binprobe-vectors.json.
+probe_rotation_bins(){  # <name>
+  local os
+  os="$(uname -s 2>/dev/null)" || os=""
+  case "$os" in
+    MINGW*|MSYS*|CYGWIN*) ;;
+    "")
+      echo "new_daemon_blocked:probe:os-detection-failed [cys-dept] $1: OS detection failed — rotate stopped (daemon unchanged)" >&2
+      exit 12 ;;
+    *) return 0 ;;
+  esac
+  local py res
+  py="$(cat <<'BINPROBE_PY'
+import re, subprocess, sys, tempfile, time
+
+def run(path):
+    with tempfile.TemporaryFile() as out:
+        try:
+            c = subprocess.Popen([path, "--version"], stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.DEVNULL)
+        except OSError as e:
+            return None, "error:%s" % (getattr(e, "winerror", None) or e.errno)
+        def poll_until(seconds):
+            end = time.monotonic() + seconds
+            while True:
+                try:
+                    code = c.poll()
+                except OSError:
+                    return "wait-error"
+                if code is not None:
+                    return code
+                if time.monotonic() >= end:
+                    return None
+                time.sleep(0.05)
+        code = poll_until(10)
+        if code is None or code == "wait-error":
+            try:
+                c.kill()
+            except OSError:
+                pass  # The child may have exited concurrently; only the following poll can confirm that.
+            confirmed = poll_until(5)
+            if confirmed is None or confirmed == "wait-error":
+                return None, "cleanup-unconfirmed"
+            return None, ("timeout" if code is None else "error:wait")
+        if code != 0:
+            return None, "rc:%d" % code
+        try:
+            out.seek(0)
+            first = re.split(rb"[\r\n]", out.read(4097), maxsplit=1)[0]
+            if len(first) > 4096:
+                return None, "error:output-too-large"
+            return first.decode("utf-8", "replace"), None
+        except OSError:
+            return None, "error:output"
+
+line, why = run(sys.argv[1])
+if why:
+    print("cysd:" + why); sys.exit(1)
+d = re.fullmatch(r"cysd ([0-9A-Za-z.+-]+) \(build ([!-(*-~]+)\)", line)
+if not d:
+    print("cysd:grammar"); sys.exit(1)
+line, why = run(sys.argv[2])
+if why:
+    print("cys:" + why); sys.exit(1)
+c = re.fullmatch(r"cys ([0-9A-Za-z.+-]+)", line)
+if not c:
+    print("cys:grammar"); sys.exit(1)
+if d.group(1) != c.group(1):
+    print("pair:version-mismatch"); sys.exit(1)
+print("ok")
+BINPROBE_PY
+)"
+  res="$(python3 -c "$py" "$CYSD" "$CYS" 2>/dev/null)" || true
+  [ "$res" = ok ] && return 0
+  [ -n "$res" ] || res="probe:error"
+  echo "new_daemon_blocked:$res [cys-dept] $1: 새 cysd/cys 실행 확인 실패($res) — rotate 중단(데몬 불변)" >&2
+  exit 12
+}
+
 graceful_kill(){
   local pid="$1"
   case "$(uname -s 2>/dev/null)" in
@@ -2895,6 +2979,8 @@ PY
       #   (자식 cysd·좌석 env 에 나타나지 않는다 — 회귀 핀 J6PreCaptureHygiene ⓑ).
       _CYS_ROTATE_ACCT="$(reg_get_field "$name" account | tail -1)" || _CYS_ROTATE_ACCT=""
     fi
+    # ★(0.14.53 WP12 · P2) the pair this script relaunches must run before the working daemon is killed (exit 12).
+    probe_rotation_bins "$name"
     # 프로세스만 종료(down의 graceful_kill 재사용 — OS중립·Windows taskkill 분기 포함, 신설 분기 없음).
     # graceful_kill이 사망을 동기 확인하므로 아래 launch의 ready 프로브가 죽은 소켓을 새것으로 오인하지 않는다.
     graceful_kill "$pid"

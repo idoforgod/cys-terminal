@@ -1,0 +1,1 @@
+new_daemon_blocked:cysd:rc:1 [cys-dept] demo: 새 cysd/cys 실행 확인 실패(cysd:rc:1) — rotate 중단(데몬 불변)

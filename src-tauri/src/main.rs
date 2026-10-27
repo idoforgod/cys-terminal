@@ -7528,6 +7528,182 @@ async fn dept_live_session_count(sock: &std::path::Path) -> Result<u64, String> 
     Ok(n)
 }
 
+/// ★(0.14.53 WP12 · P2 · DESIGN-R2 G1.2) rotation pre-probe H. Before any rotation drains, writes the restore marker
+/// or stops a working daemon, the on-disk `cysd.exe` and `cys.exe` the next spawn would run (`resolve_sidecar`, the
+/// spawner's path rule) must start and print the F3 grammar for this build. Smart App Control can block an unsigned
+/// build; then nothing is drained or stopped and the caller gets `Err("new_daemon_blocked:<bin>:<reason>")` - the one
+/// machine-readable prefix the UI latch classifies (codex R2-F3). Windows only; elsewhere `Ok(())`.
+#[derive(Debug, PartialEq)]
+enum BinProbeRun {
+    Exited { code: i32, stdout: String },
+    SpawnError(String),
+    /// killed after the bound and confirmed gone
+    Timeout,
+    /// termination attempted but not confirmed within the cleanup bound (codex R2-F2)
+    TimeoutUnconfirmed,
+}
+
+/// First line of a `--version` output (cut at CR or LF) - the same rule as the installer's CYS_FIRSTLINE.
+fn binprobe_first_line(out: &str) -> &str {
+    out.split(['\r', '\n']).next().unwrap_or("")
+}
+
+/// F3: exactly `cysd V (build ID)`, ID = non-empty printable ASCII 0x21-0x7E without `)`.
+fn binprobe_cysd_line_ok(line: &str, v: &str) -> bool {
+    let Some(rest) = line.strip_prefix(&format!("cysd {v} (build ")) else { return false };
+    let Some(id) = rest.strip_suffix(')') else { return false };
+    !id.is_empty() && id.bytes().all(|c| (0x21..=0x7e).contains(&c) && c != b')')
+}
+
+/// F3: exactly `cys V`.
+fn binprobe_cys_line_ok(line: &str, v: &str) -> bool {
+    line == format!("cys {v}")
+}
+
+/// H's decision for one binary (pure; tested on every OS over scripts/tests/fixtures/binprobe-vectors.json).
+fn binprobe_decide(bin: &str, run: &BinProbeRun, v: &str) -> Result<(), String> {
+    let reason = match run {
+        BinProbeRun::Exited { code: 0, stdout } => {
+            let line = binprobe_first_line(stdout);
+            let ok = if bin == "cysd" { binprobe_cysd_line_ok(line, v) } else { binprobe_cys_line_ok(line, v) };
+            if ok {
+                return Ok(());
+            }
+            "grammar".to_string()
+        }
+        BinProbeRun::Exited { code, .. } => format!("rc:{code}"),
+        BinProbeRun::SpawnError(e) => format!("error:{e}"),
+        BinProbeRun::Timeout => "timeout".to_string(),
+        BinProbeRun::TimeoutUnconfirmed => "cleanup-unconfirmed".to_string(),
+    };
+    Err(format!("new_daemon_blocked:{bin}:{reason}"))
+}
+
+// The operation seam keeps real handle ownership in binprobe_run and permits deterministic tests of OS errors.
+#[derive(Debug, PartialEq)]
+enum BinProbeOp { Poll, Kill }
+
+fn binprobe_observe(
+    mut op: impl FnMut(BinProbeOp) -> std::io::Result<Option<i32>>,
+    limit: std::time::Duration,
+    term: std::time::Duration,
+) -> BinProbeRun {
+    let poll = |op: &mut dyn FnMut(BinProbeOp) -> std::io::Result<Option<i32>>, until| loop {
+        match op(BinProbeOp::Poll) {
+            Ok(Some(code)) => return Some(Ok(code)),
+            Ok(None) if std::time::Instant::now() < until => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Ok(None) => return None,
+            Err(e) => return Some(Err(e)),
+        }
+    };
+    let failure = match poll(&mut op, std::time::Instant::now() + limit) {
+        Some(Ok(code)) => return BinProbeRun::Exited { code, stdout: String::new() },
+        Some(Err(e)) => BinProbeRun::SpawnError(format!("wait:{}", e.raw_os_error().unwrap_or(-1))),
+        None => BinProbeRun::Timeout,
+    };
+    // A failed wait does not prove death. A failed kill also does not prove survival: confirm in either case.
+    let _ = op(BinProbeOp::Kill);
+    match poll(&mut op, std::time::Instant::now() + term) {
+        Some(Ok(_)) => failure,
+        _ => BinProbeRun::TimeoutUnconfirmed,
+    }
+}
+
+fn binprobe_read_line(reader: impl std::io::Read) -> std::io::Result<String> {
+    use std::io::Read;
+    // Only the first version line is used. Cap the read even if descendants retain the output handle.
+    let mut bytes = Vec::new();
+    reader.take(4097).read_to_end(&mut bytes)?;
+    if let Some(end) = bytes.iter().position(|b| *b == b'\r' || *b == b'\n') {
+        bytes.truncate(end);
+    }
+    if bytes.len() > 4096 {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "version line exceeds 4096 bytes"));
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn binprobe_attach_output(run: BinProbeRun, read: impl FnOnce() -> std::io::Result<String>) -> BinProbeRun {
+    match run {
+        BinProbeRun::Exited { code: 0, .. } => match read() {
+            Ok(stdout) => BinProbeRun::Exited { code: 0, stdout },
+            Err(e) => BinProbeRun::SpawnError(format!("output:{e}")),
+        },
+        other => other,
+    }
+}
+
+fn binprobe_join_result(result: Result<Result<(), String>, tokio::task::JoinError>) -> Result<(), String> {
+    result.map_err(|e| format!("new_daemon_blocked:probe:worker-error:{e}"))?
+}
+
+/// Run `<exe> --version` with a bound. stdout goes to a temp file (no pipe, so a grandchild holding it cannot block
+/// us - the run_capture_with_timeout_in rule). On expiry the child's own handle is killed and its exit is polled for
+/// `term` more; it is never waited on without a bound and never killed by name.
+fn binprobe_run(exe: &std::path::Path, limit: std::time::Duration, term: std::time::Duration) -> BinProbeRun {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static BINPROBE_SEQ: AtomicU64 = AtomicU64::new(0);
+    let out_path = std::env::temp_dir().join(format!(
+        "cys-binprobe-{}-{}.out",
+        std::process::id(),
+        BINPROBE_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let sink = match std::fs::OpenOptions::new().write(true).create_new(true).open(&out_path) {
+        Ok(f) => f,
+        Err(e) => return BinProbeRun::SpawnError(format!("tempfile:{}", e.raw_os_error().unwrap_or(-1))),
+    };
+    let mut command = std::process::Command::new(exe);
+    command
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(sink))
+        .stderr(std::process::Stdio::null());
+    no_console(&mut command);
+    let mut child = match command.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = std::fs::remove_file(&out_path);
+            return BinProbeRun::SpawnError(e.raw_os_error().map(|c| c.to_string()).unwrap_or_else(|| format!("{:?}", e.kind())));
+        }
+    };
+    let run = binprobe_observe(|op| match op {
+        BinProbeOp::Poll => child.try_wait().map(|st| st.map(|st| st.code().unwrap_or(-1))),
+        BinProbeOp::Kill => child.kill().map(|()| None),
+    }, limit, term);
+    let run = binprobe_attach_output(run, || std::fs::File::open(&out_path).and_then(binprobe_read_line));
+    let _ = std::fs::remove_file(&out_path);
+    run
+}
+
+/// H: probe the pair the next spawn would run. Windows only (the SAC/App Control case); elsewhere a no-op.
+fn probe_rotation_binaries_blocking() -> Result<(), String> {
+    if !cfg!(windows) {
+        return Ok(());
+    }
+    let v = env!("CARGO_PKG_VERSION");
+    for (bin, exe) in [("cysd", "cysd.exe"), ("cys", "cys.exe")] {
+        let run = binprobe_run(&resolve_sidecar(exe), std::time::Duration::from_secs(10), std::time::Duration::from_secs(5));
+        binprobe_decide(bin, &run, v)?;
+    }
+    Ok(())
+}
+
+/// The same H for UI paths that must decide before they drain (manual rotate, restart-all - DESIGN-R2 G1.4).
+#[tauri::command]
+async fn probe_rotation_binaries() -> Result<(), String> {
+    binprobe_join_result(tokio::task::spawn_blocking(probe_rotation_binaries_blocking).await)
+}
+
+/// Preserve script refusals byte-for-byte, including the one machine-readable
+/// prefix consumed by the UI. Ordinary script failures remain ordinary errors.
+fn rotation_script_output(out: std::process::Output) -> Result<std::process::Output, String> {
+    if out.status.success() {
+        Ok(out)
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).into_owned())
+    }
+}
+
 /// 부서 데몬 버전 스큐 세대교체(재기동) — 메인 rotate_daemon의 부서판. `cys-dept rotate <name>`에 일임한다:
 /// 데몬 프로세스만 정지→새 on-disk cysd로 재기동하고 **레지스트리·phoenix 묘비·CEO는 건드리지 않는다**
 /// (down=폐기와 결정적 차이 — CSO 단일소유 부서 생성/폐기 권한 불침범·rotate=순수 재기동). force 가드는
@@ -7546,6 +7722,9 @@ async fn rotate_dept_daemon(app: AppHandle, name: String, force: bool, skip_drai
             Err(_) => return Err("live_sessions:unknown".to_string()),
         }
     }
+    // ★(0.14.53 WP12 · P2 · DESIGN-R2 G1.2) the new on-disk pair must start before anything is drained or stopped.
+    //   Blocked = Err("new_daemon_blocked:…"); the department daemon and its sessions stay untouched.
+    probe_rotation_binaries().await?;
     // drain(best-effort): 교대 전 부서 노드에 저장 신호. 부서 소켓 대상(CYS_SOCKET)으로 cys drain 실행
     // (메인 rotate_daemon의 drain 동형·spawn_blocking 패턴 일치). cys drain 자체 watchdog로 hang 시에도 종료.
     // ★skip_drain: verified 재시작은 사전 `cys drain --verify`로 저장 확인됨 → 이중 drain 생략(회귀 0=false).
@@ -7574,9 +7753,7 @@ async fn rotate_dept_daemon(app: AppHandle, name: String, force: bool, skip_drai
     .await
     .map_err(|e| e.to_string())?
     .map_err(|e| e.to_string())?;
-    if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).to_string());
-    }
+    let out = rotation_script_output(out)?;
     // 이벤트 포워더 재확립 + 새 데몬 identify(버전 확인·UI 스큐 해소 판정). launch_dept_daemon 반환 동형.
     spawn_event_forwarder(app.clone(), sock.clone());
     let mut info = rpc_on(&sock, "system.identify", json!({"caller": "ui"})).await?;
@@ -8099,6 +8276,9 @@ async fn rotate_daemon(app: AppHandle, force: bool, skip_drain: bool) -> Result<
             Err(_) => return Err("live_sessions:unknown".to_string()),
         }
     }
+    // ★(0.14.53 WP12 · P2 · DESIGN-R2 G1.2) the new on-disk pair must start before the drain, the restore marker and
+    //   stop_running_daemon(). Blocked = Err("new_daemon_blocked:…"); the working daemon and its sessions stay.
+    probe_rotation_binaries().await?;
     // drain(best-effort): 교대 전 살아있는 노드에 저장 신호 + 유예 (install_update 3단계 동형).
     // ★skip_drain: verified 재시작 경로는 사전에 `cys drain --verify`로 저장을 확인했으므로 여기서
     // 이중 drain을 생략한다. 기존 무손실 자동교대·수동 '바로 재시작'은 skip_drain=false로 거동 불변(회귀 0).
@@ -8737,6 +8917,7 @@ fn main() {
             update_checked_launch_enabled,
             autotest_patch_install,
             rotate_daemon,
+            probe_rotation_binaries,
             drain_verify,
             install_pack_update,
             launch_dept_daemon,
@@ -9026,6 +9207,227 @@ mod tests {
         let probe = body.find("if let Some(target) = cys_probe_target(").expect("probe branch");
         let builder = body.find("tauri::Builder::default()").expect("builder");
         assert!(seal < probe && probe < builder, "seal -> probe -> tauri::Builder");
+    }
+
+    #[test]
+    fn wp12_binprobe_cleanup_transitions() {
+        use std::collections::VecDeque;
+        use std::io::{Error, ErrorKind};
+        let z = std::time::Duration::ZERO;
+        // First wait fails after spawn; cleanup must still kill and confirm before returning the wait error.
+        for confirmed in [true, false] {
+            let mut steps = VecDeque::from([
+                (BinProbeOp::Poll, Err(Error::new(ErrorKind::Other, "poll failed"))),
+                (BinProbeOp::Kill, Err(Error::new(ErrorKind::PermissionDenied, "kill failed"))),
+                (BinProbeOp::Poll, Ok(if confirmed { Some(0) } else { None })),
+            ]);
+            let got = binprobe_observe(|op| {
+                let (want, result) = steps.pop_front().expect("unexpected process operation");
+                assert_eq!(op, want, "wait failure must kill then confirm");
+                result
+            }, z, z);
+            let want = if confirmed { BinProbeRun::SpawnError("wait:-1".into()) } else { BinProbeRun::TimeoutUnconfirmed };
+            assert_eq!(got, want, "wait-error cleanup confirmation controls the result");
+            assert!(steps.is_empty(), "wait-error cleanup was skipped");
+        }
+        // Timeout plus failed kill still requires confirmation; its return code is never a probe success.
+        for outcome in [Ok(Some(0)), Ok(None), Err(Error::new(ErrorKind::Other, "confirmation failed"))] {
+            let confirmed = matches!(&outcome, Ok(Some(_)));
+            let mut steps = VecDeque::from([
+                (BinProbeOp::Poll, Ok(None)),
+                (BinProbeOp::Kill, Err(Error::new(ErrorKind::PermissionDenied, "kill failed"))),
+                (BinProbeOp::Poll, outcome),
+            ]);
+            let got = binprobe_observe(|op| {
+                let (want, result) = steps.pop_front().expect("unexpected process operation");
+                assert_eq!(op, want, "timeout must kill then confirm");
+                result
+            }, z, z);
+            assert_eq!(got, if confirmed { BinProbeRun::Timeout } else { BinProbeRun::TimeoutUnconfirmed },
+                       "unconfirmed termination must remain distinct");
+            assert!(steps.is_empty(), "timeout cleanup was skipped");
+        }
+        let mut calls = 0;
+        assert_eq!(binprobe_observe(|op| { calls += 1; assert_eq!(op, BinProbeOp::Poll); Ok(Some(7)) }, z, z),
+                   BinProbeRun::Exited { code: 7, stdout: String::new() });
+        assert_eq!(calls, 1, "exited child must not be killed");
+    }
+
+    #[test]
+    fn wp12_binprobe_output_is_bounded_and_read_errors_refuse() {
+        let large = vec![b'x'; 4097];
+        assert!(binprobe_read_line(&large[..]).is_err(), "oversized first line must refuse");
+        let mut good = b"cys 0.14.53\n".to_vec();
+        good.extend(&large);
+        assert_eq!(binprobe_read_line(&good[..]).unwrap(), "cys 0.14.53", "only first line matters");
+        struct Broken;
+        impl std::io::Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(std::io::ErrorKind::Other, "read failed"))
+            }
+        }
+        assert!(binprobe_read_line(Broken).is_err(), "output read failure must refuse");
+        let failed = binprobe_attach_output(BinProbeRun::Exited { code: 0, stdout: String::new() }, || {
+            Err(std::io::Error::new(std::io::ErrorKind::Other, "read failed"))
+        });
+        assert_eq!(failed, BinProbeRun::SpawnError("output:read failed".into()), "runner must propagate output refusal");
+        assert_eq!(binprobe_attach_output(BinProbeRun::TimeoutUnconfirmed, || panic!("unconfirmed child output read")),
+                   BinProbeRun::TimeoutUnconfirmed);
+        assert_eq!(binprobe_attach_output(BinProbeRun::Exited { code: 0, stdout: String::new() }, || Ok("cys 0.14.53".into())),
+                   BinProbeRun::Exited { code: 0, stdout: "cys 0.14.53".into() });
+    }
+
+    #[test]
+    fn wp12_binprobe_join_failure_keeps_refusal_prefix() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let failure = rt.block_on(async {
+            tokio::task::spawn_blocking(|| -> Result<(), String> { panic!("probe worker failed") }).await
+        });
+        assert!(binprobe_join_result(failure).unwrap_err().starts_with("new_daemon_blocked:probe:worker-error:"),
+                "worker failure must latch rather than retry");
+        assert_eq!(binprobe_join_result(Ok(Ok(()))), Ok(()));
+        let blocked = "new_daemon_blocked:cys:timeout".to_string();
+        assert_eq!(binprobe_join_result(Ok(Err(blocked.clone()))), Err(blocked), "refusal text is unchanged");
+    }
+
+    /// ★(0.14.53 WP12 · P2 · DESIGN-R2 G1.5 T3) H's decision over the shared vector file (also read by the cys-dept
+    /// shell twin's test), for this crate's version and a fixed one; every non-pass carries the one UI prefix.
+    #[test]
+    fn wp12_binprobe_decide_over_shared_vectors() {
+        let vectors: Value =
+            serde_json::from_str(include_str!("../../scripts/tests/fixtures/binprobe-vectors.json")).expect("vector file");
+        let mut seen = 0;
+        for v in [env!("CARGO_PKG_VERSION"), "0.14.53"] {
+            let other = if v == "9.9.9" { "9.9.8" } else { "9.9.9" };
+            for bin in ["cysd", "cys"] {
+                for (kind, want_ok) in [("accept", true), ("reject", false)] {
+                    for t in vectors[bin][kind].as_array().expect("vector list") {
+                        let text = t.as_str().unwrap().replace("{V}", v).replace("{OTHER}", other);
+                        let got = binprobe_decide(bin, &BinProbeRun::Exited { code: 0, stdout: text.clone() }, v);
+                        if want_ok {
+                            assert_eq!(got, Ok(()), "{bin} must accept {text:?}");
+                        } else {
+                            assert_eq!(got, Err(format!("new_daemon_blocked:{bin}:grammar")), "{bin} must reject {text:?}");
+                        }
+                        seen += 1;
+                    }
+                }
+            }
+        }
+        assert!(seen >= 50, "the vector file looks truncated ({seen} cases)");
+        let good = BinProbeRun::Exited { code: 3, stdout: "cys 0.14.53\n".into() };
+        assert_eq!(binprobe_decide("cys", &good, "0.14.53"), Err("new_daemon_blocked:cys:rc:3".into()), "exit code is checked first");
+        assert_eq!(binprobe_decide("cysd", &BinProbeRun::SpawnError("1260".into()), "0.14.53"), Err("new_daemon_blocked:cysd:error:1260".into()));
+        assert_eq!(binprobe_decide("cysd", &BinProbeRun::Timeout, "0.14.53"), Err("new_daemon_blocked:cysd:timeout".into()));
+        assert_eq!(
+            binprobe_decide("cys", &BinProbeRun::TimeoutUnconfirmed, "0.14.53"),
+            Err("new_daemon_blocked:cys:cleanup-unconfirmed".into())
+        );
+        // off Windows H changes nothing (the probe is the SAC/App Control guard)
+        if !cfg!(windows) {
+            assert_eq!(probe_rotation_binaries_blocking(), Ok(()));
+        }
+    }
+
+    /// ★(0.14.53 WP12 · P2 · codex R2-F2) the runner's bound covers termination: a sleeper is killed after the limit and
+    /// confirmed gone (Timeout) well inside limit + term; output, exit code and a missing file are classified.
+    #[cfg(unix)]
+    #[test]
+    fn wp12_binprobe_run_bounds_kill_and_classifies() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("cys-wp12-binprobe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let script = |name: &str, body: &str| {
+            let p = d.join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        };
+        let ms = std::time::Duration::from_millis;
+        let t0 = std::time::Instant::now();
+        assert_eq!(binprobe_run(&script("sleeper", "exec sleep 30"), ms(300), ms(3000)), BinProbeRun::Timeout);
+        assert!(t0.elapsed() < ms(3300), "kill + confirmation stayed inside limit + term ({:?})", t0.elapsed());
+        assert_eq!(
+            binprobe_run(&script("ok", "echo 'cysd 0.14.53 (build abc)'"), ms(5000), ms(1000)),
+            BinProbeRun::Exited { code: 0, stdout: "cysd 0.14.53 (build abc)".into() }
+        );
+        assert!(matches!(binprobe_run(&script("rc", "exit 7"), ms(5000), ms(1000)), BinProbeRun::Exited { code: 7, .. }));
+        assert!(matches!(binprobe_run(&d.join("missing"), ms(5000), ms(1000)), BinProbeRun::SpawnError(_)));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// ★(0.14.53 WP12 · P2 · DESIGN-R2 G1.2/G1.5) source order: in both rotate commands H runs after the session guard
+    /// and before the drain, the restore marker and the stop (main) / the cys-dept rotate call (department).
+    #[test]
+    fn wp12_rotation_probe_precedes_drain_marker_and_stop() {
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests {").expect("test module boundary")];
+        let body = |head: &str| {
+            let at = prod.find(head).unwrap_or_else(|| panic!("{head} missing"));
+            &prod[at..at + prod[at..].find("\n}\n").expect("fn end")]
+        };
+        let call = "probe_rotation_binaries().await?;";
+        for (head, after_guard, laters) in [
+            ("async fn rotate_daemon(", "live_sessions:unknown", &[".arg(\"drain\")", "pending_restore_path()", "stop_running_daemon().await"][..]),
+            ("async fn rotate_dept_daemon(", "live_sessions:unknown", &[".arg(\"drain\")", ".arg(\"rotate\")"][..]),
+        ] {
+            let b = body(head);
+            assert_eq!(b.matches(call).count(), 1, "{head}: exactly one H call");
+            let at = b.find(call).unwrap();
+            assert!(b.find(after_guard).unwrap() < at, "{head}: H runs after the session guard");
+            for later in laters {
+                let l = b.find(later).unwrap_or_else(|| panic!("{head}: {later} missing"));
+                assert!(at < l, "{head}: H must precede {later}");
+            }
+        }
+        let registration = prod.find("tauri::generate_handler![").expect("command registration");
+        let handlers = &prod[registration..];
+        let handlers = &handlers[..handlers.find("])").expect("registration end")];
+        assert!(handlers.split(|c: char| c == ',' || c.is_whitespace()).any(|word| word == "probe_rotation_binaries"),
+                "manual pre-probe must be registered");
+
+    }
+
+    #[test]
+    fn wp12_rotation_script_refusal_is_propagated_unchanged() {
+        let stderr = include_bytes!("../../scripts/tests/fixtures/cys-dept-binprobe-stderr.txt");
+        #[cfg(unix)]
+        let failed = { use std::os::unix::process::ExitStatusExt; std::process::ExitStatus::from_raw(12 << 8) };
+        #[cfg(windows)]
+        let failed = { use std::os::windows::process::ExitStatusExt; std::process::ExitStatus::from_raw(12) };
+        let output = |status, bytes: &[u8]| std::process::Output { status, stdout: Vec::new(), stderr: bytes.to_vec() };
+        assert_eq!(rotation_script_output(output(failed, stderr)).unwrap_err(), String::from_utf8_lossy(stderr).into_owned(),
+                   "actual shell exit-12 stderr must reach the UI unchanged");
+        assert_eq!(rotation_script_output(output(failed, b"ordinary error")).unwrap_err(), "ordinary error");
+        #[cfg(unix)]
+        let passed = { use std::os::unix::process::ExitStatusExt; std::process::ExitStatus::from_raw(0) };
+        #[cfg(windows)]
+        let passed = { use std::os::windows::process::ExitStatusExt; std::process::ExitStatus::from_raw(0) };
+        assert!(rotation_script_output(output(passed, b"")).is_ok());
+        let source = include_str!("main.rs");
+        let at = source.find("async fn rotate_dept_daemon(").unwrap();
+        let body = &source[at..at + source[at..].find("\n}\n").unwrap()];
+        assert!(body.contains("let out = rotation_script_output(out)?;"), "wrapper must consume the measured propagation helper");
+    }
+
+    #[test]
+    fn wp12_binprobe_every_failure_uses_the_prefix_for_both_binaries() {
+        for bin in ["cysd", "cys"] {
+            for (run, reason) in [
+                (BinProbeRun::Exited { code: 0, stdout: String::new() }, "grammar"),
+                (BinProbeRun::Exited { code: 7, stdout: String::new() }, "rc:7"),
+                (BinProbeRun::SpawnError("5".into()), "error:5"),
+                (BinProbeRun::SpawnError("tempfile:13".into()), "error:tempfile:13"),
+                (BinProbeRun::SpawnError("wait:-1".into()), "error:wait:-1"),
+                (BinProbeRun::SpawnError("output:read failed".into()), "error:output:read failed"),
+                (BinProbeRun::Timeout, "timeout"),
+                (BinProbeRun::TimeoutUnconfirmed, "cleanup-unconfirmed"),
+            ] {
+                assert_eq!(binprobe_decide(bin, &run, "0.14.53"), Err(format!("new_daemon_blocked:{bin}:{reason}")),
+                           "every refusal must reach the latch: {bin} {reason}");
+            }
+        }
     }
 
     /// ★K2-03(2026-09-17 한글 사용자명 감사) 회귀 핀: UTF-8 BOM 이 붙은 카탈로그/레지스트리를 판독한다.
