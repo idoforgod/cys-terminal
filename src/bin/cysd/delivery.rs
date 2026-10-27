@@ -848,16 +848,20 @@ fn iso_utc(epoch: f64) -> String {
 /// 판독자 계약: `javis_mission.gate()` 는 임무 기록 시점의 `daemon_epoch` 를 대장에 박아 두고,
 /// 판정 시 이 파일을 다시 읽어 **같은 데몬 인스턴스인지** 확인한다. 데몬이 재기동했으면
 /// (= 사실상 새 세션) 과거 임무는 무효다. 파일이 없으면 결박은 degrade 되고 TTL 만 남는다.
-pub fn write_epoch(socket_path: &Path) {
+pub fn write_epoch(socket_path: &Path, started_at: f64, incarnation: &str) {
     let p = epoch_path(socket_path);
     if let Some(d) = p.parent() {
         let _ = std::fs::create_dir_all(d);
     }
-    let epoch = crate::state::now_epoch();
+    let registry = cys::lane::registry_sockets(&cys::lane::registry_path());
+    let classification = cys::lane::classify(&socket_path.to_string_lossy(), registry.as_deref());
     let rec = json!({
         "v": LEDGER_SCHEMA,
-        "daemon_epoch": epoch,
-        "started": iso_utc(epoch),
+        "daemon_epoch": started_at,
+        "incarnation": incarnation,
+        "lane_class": classification.lane_class,
+        "registered": classification.registered,
+        "started": iso_utc(started_at),
         "pid": std::process::id(),
         "socket": socket_path.to_string_lossy(),
     });
@@ -880,7 +884,7 @@ pub fn write_epoch(socket_path: &Path) {
 /// 그래서 `sha256`·`ts_epoch`·`surface` 필드를 전부 채우되, surface 는 어떤 pane 과도 매치되지
 /// 않는 `"-"`(surface id 는 항상 정수 문자열)로 둔다 — 구 판독자는 '남의 pane 배달'로 건너뛰고
 /// `good` 으로 세므로 손상 오판이 나지 않는다.
-pub fn write_boot_sentinel(socket_path: &Path) -> Outcome {
+pub fn write_boot_sentinel(socket_path: &Path, started_at: f64, incarnation: &str) -> Outcome {
     let p = ledger_path(socket_path);
     if let Some(d) = p.parent() {
         if let Err(e) = std::fs::create_dir_all(d) {
@@ -891,6 +895,8 @@ pub fn write_boot_sentinel(socket_path: &Path) -> Outcome {
     //   원장을 통째로 날린다(`.jsonl.1` 이 두 번 덮인다).
     let _lk = ledger_lock();
     rotate_if_needed(&p);
+    let registry = cys::lane::registry_sockets(&cys::lane::registry_path());
+    let classification = cys::lane::classify(&socket_path.to_string_lossy(), registry.as_deref());
     let epoch = crate::state::now_epoch();
     let rec = json!({
         "v": LEDGER_SCHEMA,
@@ -902,7 +908,10 @@ pub fn write_boot_sentinel(socket_path: &Path) -> Outcome {
         "from": Value::Null,
         "chars": 0,
         "preview": "",
-        "daemon_epoch": epoch,
+        "daemon_epoch": started_at,
+        "incarnation": incarnation,
+        "lane_class": classification.lane_class,
+        "registered": classification.registered,
         "pid": std::process::id(),
     });
     append_line(&p, &rec)
@@ -2734,10 +2743,22 @@ pub(crate) mod tests {
     fn epoch_marker_is_atomic_and_parseable() {
         with_state_dir(|_td| {
             let sock = Path::new("/Users/x/.local/state/cys/cys.sock");
-            write_epoch(sock);
+            write_epoch(sock, 1234.5, "4d2-42");
             let v: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(epoch_path(sock)).unwrap()).unwrap();
-            assert!(v["daemon_epoch"].as_f64().unwrap() > 0.0);
+            assert_eq!(v["daemon_epoch"], 1234.5);
+            assert_eq!(v["incarnation"], "4d2-42");
+            assert_eq!(v["lane_class"], "base");
+            assert_eq!(v["registered"], "yes");
+            assert!(matches!(write_boot_sentinel(sock, 1234.5, "4d2-42"), Outcome::Recorded));
+            let body = std::fs::read_to_string(ledger_path(sock)).unwrap();
+            let row: Value = serde_json::from_str(body.lines().last().unwrap()).unwrap();
+            assert_eq!(row["daemon_epoch"], v["daemon_epoch"]);
+            assert_eq!(row["incarnation"], v["incarnation"]);
+            assert_eq!(row["surface"], "-");
+            assert_eq!(row["sha256"], "-");
+            assert_eq!(row["chars"], 0);
+            assert!(row["ts_epoch"].as_f64().unwrap() > 1234.5);
             assert_eq!(v["v"], LEDGER_SCHEMA);
             assert!(!epoch_path(sock).with_extension("json.tmp").exists(), "tmp 잔재 없음");
         });

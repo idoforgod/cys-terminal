@@ -36,6 +36,30 @@ def _mock_cys(mockbin, surface_role="", exit_code=1):
     os.chmod(cysp, 0o755)
 
 
+class DiagnosticClassifierParity(unittest.TestCase):
+    def test_all_41_inputs_use_production_predicates_and_old_keys(self):
+        import importlib.util
+        def load(name):
+            spec = importlib.util.spec_from_file_location(name, os.path.join(BIN, name + ".py"))
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+        lane, boot, role = (load(n) for n in ("javis_lane", "javis_bootstrap", "javis_role"))
+        with open(os.path.join(BIN, "tests", "fixtures", "lane-key-corpus.json")) as f:
+            fixture = json.load(f)
+        rows = fixture["cases"] + fixture["diagnostic_extras"]
+        self.assertEqual(len(rows), 41)
+        for row in rows:
+            s = row["sock"]
+            with self.subTest(socket=s):
+                result = lane.classify(s, [])
+                self.assertEqual(result["lane_class"], row["lane_class"])
+                self.assertEqual(lane.lane_key(s), row["key_at_9dbea792"])
+                self.assertEqual(result["absolute"], not s or role._is_abs_endpoint(s))
+                self.assertEqual(lane.socket_dept(s), boot._socket_dept(s))
+                self.assertEqual(lane.socket_malformed_dept(s), boot._socket_malformed_dept(s))
+
+
 class LanePackGuard(unittest.TestCase):
     """t3 — 부서 소켓 레인이 메인 팩을 쓰면(교차 오염·UT-14) 팀 기동 전 exit 8·시끄러운 실패."""
 

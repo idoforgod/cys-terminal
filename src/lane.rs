@@ -71,6 +71,123 @@ pub fn socket_is_base(sock: &str) -> bool {
     it.next() == Some("cys")
 }
 
+/// Diagnostic classification only. Never used as a boot or delivery gate.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Classification {
+    pub lane_class: String,
+    pub registered: &'static str,
+    pub absolute: bool,
+}
+
+pub fn socket_dept(sock: &str) -> Option<String> {
+    sock.trim().replace('\\', "/").split('/')
+        .find_map(|p| p.strip_prefix("cys-dept-"))
+        .filter(|s| !s.is_empty()).map(str::to_owned)
+}
+
+pub fn socket_malformed_dept(sock: &str) -> bool {
+    sock.trim().replace('\\', "/").split('/').any(|p| p == "cys-dept-")
+}
+
+/// Mirror of javis_role._is_abs_endpoint; drive paths deliberately are not pipe endpoints.
+pub fn is_abs_endpoint(s: &str) -> bool {
+    s.starts_with('/') || (!s.contains('/') && [r"\\.\pipe\", r"\\?\pipe\"].iter()
+        .any(|p| s.starts_with(p) && s.len() > p.len()))
+}
+
+pub fn classify(sock: &str, registry: Option<&[String]>) -> Classification {
+    let s = sock.trim();
+    let norm = s.replace('\\', "/");
+    let mut registered = match registry {
+        None => "unknown",
+        Some(r) if r.iter().any(|v| v == s) => "yes",
+        Some(_) => "no",
+    };
+    let absolute = s.is_empty() || is_abs_endpoint(s);
+    let lane_class = if s.is_empty() {
+        registered = "yes";
+        "base".into()
+    } else if socket_malformed_dept(s) {
+        "dept_malformed".into()
+    } else if let Some(dept) = socket_dept(s) {
+        format!("dept:{dept}")
+    } else if s.starts_with(r"\\") || norm.to_ascii_lowercase().starts_with("//./pipe/") {
+        if socket_is_base(s) {
+            if registry.is_some() { registered = "yes"; }
+            "base(win_pipe)".into()
+        } else { "win_pipe_other".into() }
+    } else if socket_is_base(s) {
+        registered = "yes";
+        "base".into()
+    } else if !absolute { "not_absolute".into() }
+    else if matches!(norm.rsplit('/').next(), Some("cys" | "cys.sock")) { "lane_near_miss".into() }
+    else { "isolated".into() };
+    Classification { lane_class, registered, absolute }
+}
+
+pub fn registry_path() -> PathBuf {
+    std::env::var_os("CYS_DEPTS_JSON").map(PathBuf::from)
+        .unwrap_or_else(|| crate::home_dir().join(".cys/depts.json"))
+}
+
+/// Missing/unreadable/malformed registries remain unknown, not an empty known registry.
+pub fn registry_sockets(path: &Path) -> Option<Vec<String>> {
+    use std::io::Read;
+    if !std::fs::metadata(path).ok()?.is_file() { return None; }
+    let mut text = String::new();
+    std::fs::File::open(path).ok()?.take(1024 * 1024).read_to_string(&mut text).ok()?;
+    let v: serde_json::Value = serde_json::from_str(crate::strip_utf8_bom(&text)).ok()?;
+    Some(v.get("depts")?.as_object()?.values().take(64)
+        .filter_map(|d| d.get("socket")?.as_str())
+        .filter(|s| !s.trim().is_empty()).map(str::to_owned).collect())
+}
+
+pub fn boot_diagnostic(sock: &str, default: &str, explicit: bool, c: &Classification) -> Option<String> {
+    let mirror = explicit && socket_is_base(sock) && sock != default;
+    if !(c.lane_class.starts_with("base") || c.lane_class.starts_with("dept:"))
+        || c.registered == "no" || mirror {
+        Some(format!("cysd: lane class={:?} registered={} absolute={} socket={sock:?} base_mirror={mirror}",
+            c.lane_class, c.registered, c.absolute))
+    } else { None }
+}
+
+/// Read-only inventory. Errors are reported per row rather than presented as zero records.
+pub fn delivery_inventory(dir: &Path) -> std::io::Result<Vec<serde_json::Value>> {
+    use std::io::BufRead;
+    let mut paths = std::fs::read_dir(dir)?.filter_map(Result::ok).map(|e| e.path())
+        .filter(|p| p.file_name().and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("delivery-") && n.ends_with(".jsonl")))
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.into_iter().map(|p| {
+        let epoch = p.with_extension("epoch.json");
+        let meta = std::fs::read_to_string(&epoch).ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+        let mut count = 0u64;
+        let mut newest: Option<(f64, serde_json::Value)> = None;
+        let scan = std::fs::File::open(&p).and_then(|f| {
+            for line in std::io::BufReader::new(f).lines() {
+                let line = line?;
+                if line.trim().is_empty() { continue; }
+                let row: serde_json::Value = serde_json::from_str(&line)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                count += 1;
+                if let Some(t) = row["ts_epoch"].as_f64() {
+                    if newest.as_ref().is_none_or(|(prev, _)| t > *prev) {
+                        newest = Some((t, row["ts"].clone()));
+                    }
+                }
+            }
+            Ok(())
+        });
+        Ok(serde_json::json!({"path": p, "records": if scan.is_ok() {Some(count)} else {None},
+            "error": scan.err().map(|e| e.to_string()), "newest_ts": newest.map(|(_, ts)| ts),
+            "socket": meta.as_ref().map(|v| &v["socket"]),
+            "lane_class": meta.as_ref().map(|v| &v["lane_class"]),
+            "registered": meta.as_ref().map(|v| &v["registered"])}))
+    }).collect()
+}
+
 /// SHA-1 hex — **비암호학적 용도 전용**(파일명 슬러그가 `javis_bootstrap._sanitize_sock_key`
 /// (`hashlib.sha1(...).hexdigest()[:16]`)와 **정확히** 같아야 하기 때문에 존재한다).
 /// 새 크레이트를 들이지 않는다(오프라인 빌드 계약 · sha1 은 Cargo.lock 에 전이로도 없다).
@@ -230,6 +347,61 @@ pub fn epoch_path(socket_path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn p2_classifier_all_corpus_and_extras_preserve_production_keys() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../cysjavis-pack/bin/tests/fixtures/lane-key-corpus.json")).unwrap();
+        assert_eq!(fixture["cases"].as_array().unwrap().len(), 19);
+        assert_eq!(fixture["diagnostic_extras"].as_array().unwrap().len(), 22);
+        for row in fixture["cases"].as_array().unwrap().iter()
+            .chain(fixture["diagnostic_extras"].as_array().unwrap()) {
+            let sock = row["sock"].as_str().unwrap();
+            let c = classify(sock, Some(&[]));
+            assert_eq!(c.lane_class, row["lane_class"], "{sock}");
+            assert_eq!(lane_key(Path::new(sock)), row["key_at_9dbea792"], "{sock}");
+            assert_eq!(c.lane_class.starts_with("base"), socket_is_base(sock), "{sock}");
+        }
+        assert!(!classify("relative/cys-dept-demo/cys.sock", None).absolute);
+        assert_eq!(classify("/tmp/a.sock", None).registered, "unknown");
+        assert_eq!(classify("/tmp/a.sock", Some(&["/tmp/a.sock".into()])).registered, "yes");
+        let c = classify(r"\\.\pipe\cys", Some(&[]));
+        assert!(boot_diagnostic(r"\\.\pipe\cys", r"\\.\pipe\cys", true, &c).is_none());
+        let c = classify("/tmp/cys/cys.sock", Some(&[]));
+        assert!(boot_diagnostic("/tmp/cys/cys.sock", "/real/cys/cys.sock", true, &c).is_some());
+    }
+
+    #[test]
+    fn p2_diagnostic_is_one_physical_line_for_control_characters() {
+        let sock = "/tmp/cys-dept-a\nb/cys.sock";
+        let class = classify(sock, Some(&[]));
+        let line = boot_diagnostic(sock, "/base/cys.sock", true, &class).unwrap();
+        assert_eq!(line.lines().count(), 1);
+        assert!(line.contains(r"\n"));
+    }
+
+    #[test]
+    fn p2_inventory_is_read_only_and_does_not_hide_bad_ledgers() {
+        let root = std::env::temp_dir().join(format!("p2-inventory-{}-{}",std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&root).unwrap();
+        let ledger = root.join("delivery-base.jsonl");
+        std::fs::write(&ledger, "{\"ts_epoch\":2,\"ts\":\"new\"}\n{\"ts_epoch\":1,\"ts\":\"old\"}\n").unwrap();
+        std::fs::write(root.join("delivery-bad.jsonl"), "broken\n").unwrap();
+        let before = std::fs::metadata(&root).unwrap().modified().unwrap();
+        let ledger_before = std::fs::read(&ledger).unwrap();
+        let rows = delivery_inventory(&root).unwrap();
+        assert_eq!(rows.len(),2);
+        let good = rows.iter().find(|v| v["records"] == 2).unwrap();
+        assert_eq!(good["newest_ts"], "new");
+        assert!(good["socket"].is_null());
+        assert!(rows.iter().any(|v| v["records"].is_null() && v["error"].is_string()));
+        assert_eq!(std::fs::metadata(&root).unwrap().modified().unwrap(),before);
+        assert_eq!(std::fs::read(&ledger).unwrap(),ledger_before);
+        assert!(!root.join("delivery-base.epoch.json").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
 
     // ── 아래 두 검체는 `cysd/delivery.rs` 에서 **코드와 함께 옮겨왔다**(B2-c e-1 · 단언 무변경).
     //    주체(sha1 슬러그·긴 경로 키)가 이 모듈로 이사했으므로 검체도 같이 온다.

@@ -1,9 +1,12 @@
 //! cys — the CYSJavis terminal CLI client. 모든 pane 안의 AI가 이 CLI로 동등 노드가 된다.
 //! 예: cys send --surface surface:31 "..." ; cys send-key --surface surface:31 Return
 
+#[path = "cys/lane_fallback.rs"]
+mod lane_fallback;
+
 use clap::{Parser, Subcommand};
 // ★EXIT_BOOT_BUSY 정본은 lib 상수다(GUI cys-app·python javis_bootstrap 과 3자 공유 — 사본 금지).
-use cys::{key_to_bytes, parse_surface_ref, socket_path, surface_ref, ENV_SURFACE_ID, EXIT_BOOT_BUSY};
+use cys::{key_to_bytes, parse_surface_ref, surface_ref, ENV_SURFACE_ID, EXIT_BOOT_BUSY};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 
@@ -35,6 +38,8 @@ enum Command {
     Ping,
     /// Identify daemon + caller (uses AITERM_SURFACE_ID env when inside a surface)
     Identify,
+    /// Read-only delivery ledger inventory, including diagnostic lane identity.
+    Lanes,
     /// ★W1: 이 cys 바이너리 자신의 identity 3필드(build_id·embedded_pack_hash·protocol_version) JSON 출력.
     /// 데몬 불요(컴파일타임 상수 self-report) — phoenix 폴백이 데몬 status 의 동일 3필드와 교차대조한다.
     #[command(name = "phoenix-identity", hide = true)]
@@ -3371,6 +3376,101 @@ enum TeamTokenAction {
     },
 }
 
+// Inferred context belongs only to a command whose consumer contract is transport-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentityConsumer {
+    Identify, Ping, List, Status, SendText, SendKey, SetTitle, SetStatus,
+    UsageRegister, UsageEventStdin, Watch, AttestPin, AttestVerify, ReadScreen,
+    Quiesce, Resize, ClaimRole, EnvironmentOnly,
+}
+
+impl IdentityConsumer {
+    fn permits_inference(self) -> bool {
+        match self {
+            Self::Identify | Self::Ping | Self::List | Self::Status | Self::SendText
+            | Self::SendKey | Self::SetTitle | Self::SetStatus | Self::UsageRegister
+            | Self::UsageEventStdin | Self::Watch | Self::AttestPin | Self::AttestVerify
+            | Self::ReadScreen | Self::Quiesce | Self::Resize | Self::ClaimRole => true,
+            Self::EnvironmentOnly => false,
+        }
+    }
+}
+
+/// Closed recovery set derived from target_surface's consumers plus basic transport queries.
+/// File-based sends and all mixed pack/local-file consumers retain the original environment.
+fn identity_consumer(command: &Command) -> IdentityConsumer {
+    match command {
+        Command::Identify => IdentityConsumer::Identify,
+        Command::Ping => IdentityConsumer::Ping,
+        Command::List => IdentityConsumer::List,
+        Command::Status { .. } => IdentityConsumer::Status,
+        Command::Send { file: None, .. } => IdentityConsumer::SendText,
+        Command::SendKey { .. } => IdentityConsumer::SendKey,
+        Command::SetTitle { .. } => IdentityConsumer::SetTitle,
+        Command::SetStatus { .. } => IdentityConsumer::SetStatus,
+        Command::UsageRegister { .. } => IdentityConsumer::UsageRegister,
+        Command::UsageEventStdin { .. } => IdentityConsumer::UsageEventStdin,
+        Command::Watch { .. } => IdentityConsumer::Watch,
+        Command::Attest { action: AttestAction::Pin { .. } } => IdentityConsumer::AttestPin,
+        Command::Attest { action: AttestAction::Verify { .. } } => IdentityConsumer::AttestVerify,
+        Command::ReadScreen { .. } => IdentityConsumer::ReadScreen,
+        Command::Quiesce { .. } => IdentityConsumer::Quiesce,
+        Command::Resize { .. } => IdentityConsumer::Resize,
+        Command::ClaimRole { .. } => IdentityConsumer::ClaimRole,
+        _ => IdentityConsumer::EnvironmentOnly,
+    }
+}
+
+static ACTIVE_CONSUMER: std::sync::OnceLock<IdentityConsumer> = std::sync::OnceLock::new();
+static DISCOVERED_IDENTITY: std::sync::OnceLock<Option<lane_fallback::Binding>> = std::sync::OnceLock::new();
+
+fn current_consumer() -> IdentityConsumer {
+    ACTIVE_CONSUMER.get().copied().unwrap_or(IdentityConsumer::EnvironmentOnly)
+}
+
+/// Sole reader of discovered identity. New readers/callers are rejected by the production census.
+fn inferred_identity(consumer: IdentityConsumer) -> Option<&'static lane_fallback::Binding> {
+    if !consumer.permits_inference() { return None; }
+    DISCOVERED_IDENTITY.get().and_then(Option::as_ref)
+}
+
+fn socket_path() -> std::path::PathBuf {
+    cli_socket_path(cys::env_compat(cys::ENV_SOCKET),
+        inferred_identity(current_consumer()).map(|b| &b.socket), cys::default_socket_path)
+}
+
+fn cli_socket_path(explicit: Option<String>, inferred: Option<&std::path::PathBuf>,
+    default: impl FnOnce() -> std::path::PathBuf) -> std::path::PathBuf {
+    explicit.map(std::path::PathBuf::from).or_else(|| inferred.cloned()).unwrap_or_else(default)
+}
+
+fn excluded_identity_diagnostic(environment: &std::path::Path, inferred: &std::path::Path) -> Option<String> {
+    (environment != inferred).then(|| format!(
+        "cys: inferred lane {:?} ({:?}) is not used by this command; keeping environment lane {:?} ({:?}); set CYS_SOCKET and CYS_PACK_DIR together to select a lane",
+        cys::lane::lane_key(inferred), inferred, cys::lane::lane_key(environment), environment))
+}
+
+fn initialize_lane_identity(command: &Command) {
+    let consumer = identity_consumer(command);
+    let _ = ACTIVE_CONSUMER.set(consumer);
+    if cys::env_compat(cys::ENV_SOCKET).is_some() { return; }
+    match lane_fallback::discover() {
+        Ok(binding) => {
+            if consumer.permits_inference() {
+                // Inference is not permission to spawn a daemon.
+                AUTOSTART.store(false, std::sync::atomic::Ordering::Relaxed);
+            } else if let Some(line) = excluded_identity_diagnostic(&cys::socket_path(), &binding.socket) {
+                eprintln!("{line}"); // Diagnostic only: original command/target/refusal behavior remains.
+            }
+            let _ = DISCOVERED_IDENTITY.set(Some(binding));
+        }
+        Err(reason) => {
+            let _ = DISCOVERED_IDENTITY.set(None);
+            if consumer.permits_inference() { eprintln!("cys: {reason}; using default socket"); }
+        }
+    }
+}
+
 fn main() {
     // ★SEAL-1 층3: 스레드 생성 전 프로세스 env 봉인 — 이 CLI 가 띄우는 **모든** 자손
     // (`cys run -- <임의명령>`·`launch-agent` 로 뜨는 pane·팩 python 헬퍼)이 상속으로 덮인다.
@@ -3385,6 +3485,7 @@ fn main() {
     if let Some(s) = &cli.socket {
         std::env::set_var(cys::ENV_SOCKET, s);
     }
+    initialize_lane_identity(&cli.command);
     // 순수 프로브 명령은 자동 기동 금지 — "데몬이 떠 있는가"라는 질문의 답을 바꾸면 안 된다
     if matches!(
         cli.command,
@@ -3411,12 +3512,32 @@ fn target_surface(explicit: &Option<String>, to_role: &Option<String>) -> Result
     if let Some(s) = explicit {
         return parse_surface_ref(s).ok_or_else(|| format!("invalid surface ref: {s}"));
     }
-    if let Ok(env) = cys::env_compat(ENV_SURFACE_ID).ok_or(std::env::VarError::NotPresent) {
-        if let Some(id) = parse_surface_ref(&env) {
-            return Ok(id);
-        }
+    if let Some(id) = caller_surface_from_env(cys::env_compat(ENV_SURFACE_ID).as_deref(), resolved_caller_surface) {
+        return Ok(id);
     }
     Err("no --surface/--to given and CYS_SURFACE_ID is not set".into())
+}
+
+/// A malformed explicit value remains an error; only absence permits inference.
+fn caller_surface_from_env(env: Option<&str>, fallback: impl FnOnce() -> Option<u64>) -> Option<u64> {
+    match env { Some(value) => parse_surface_ref(value), None => fallback() }
+}
+
+/// Explicit socket/env routes also resolve a missing surface, once, without autostart.
+fn resolved_caller_surface() -> Option<u64> {
+    let consumer = current_consumer();
+    if !consumer.permits_inference() { return None; }
+    if cys::env_compat(cys::ENV_SOCKET).is_none() {
+        return inferred_identity(consumer).and_then(|binding| binding.surface);
+    }
+    static SURFACE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *SURFACE.get_or_init(|| {
+        let socket = socket_path();
+        lane_fallback::bounded(lane_fallback::BUDGET, move |deadline| {
+            request_on_timeout(&socket, "system.identify", json!({"caller": null}),
+                deadline.saturating_duration_since(std::time::Instant::now()))
+        }).ok().and_then(|v| v["caller"]["surface_id"].as_u64())
+    })
 }
 
 /// 명시된 --surface가 잘못된 형식이면 에러. 미지정(None)은 그대로 통과시켜
@@ -5828,6 +5949,9 @@ fn request_before(
 
 fn run(command: Command) -> i32 {
     let result = match command {
+        Command::Lanes => cys::lane::delivery_inventory(&cys::lane::state_dir())
+            .map(|rows| println!("{}", json!({"ledgers": rows})))
+            .map_err(|e| e.to_string()),
         Command::Ping => request("system.ping", json!({})).map(|r| println!("{}", r.as_str().unwrap_or("pong"))),
         Command::PhoenixIdentity => {
             // 데몬 접속 없이 이 바이너리 자신의 3필드를 출력(phoenix 폴백 identity 대조의 self-report 측).
@@ -17372,7 +17496,7 @@ fn run_claim_role(
         }
     }
     let resp = match opts.deadline {
-        Some(d) => request_on_timeout(&cys::socket_path(), "system.claim_role", params, d),
+        Some(d) => request_on_timeout(&socket_path(), "system.claim_role", params, d),
         None => request("system.claim_role", params),
     };
     match resp {
@@ -28177,6 +28301,22 @@ extern "C" fn scoped_cleanup_handler(sig: libc::c_int) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn p2_socket_precedence_is_explicit_then_process_local_then_default() {
+        let inferred = std::path::PathBuf::from("/dept/socket");
+        assert_eq!(super::cli_socket_path(Some("/explicit/socket".into()), Some(&inferred), || panic!("explicit")), std::path::Path::new("/explicit/socket"));
+        assert_eq!(super::cli_socket_path(None, Some(&inferred), || panic!("inferred")), inferred);
+        assert_eq!(super::cli_socket_path(None, None, || "/default/socket".into()), std::path::Path::new("/default/socket"));
+    }
+
+    #[test]
+    fn p2_surface_environment_precedes_inference_even_when_invalid() {
+        assert_eq!(super::caller_surface_from_env(Some("surface:42"), || panic!("explicit wins")), Some(42));
+        assert_eq!(super::caller_surface_from_env(Some("invalid"), || panic!("invalid must not infer")), None);
+        assert_eq!(super::caller_surface_from_env(None, || Some(7)), Some(7));
+        assert_eq!(super::caller_surface_from_env(None, || None), None);
+    }
+
     use super::*;
 
     /// ★K2-01(2026-09-17 한글 사용자명 감사) 회귀 핀: schtasks XML 의 UserId 는 **Unicode-정확한 env** 에서 나오고,
@@ -46251,6 +46391,7 @@ mod update_repair_c_row7 {
 /// ★(B-360) A writer-journal refusal must not become seat destruction downstream.
 #[cfg(test)]
 mod b360_tests {
+    include!("cys/consumer_tests.rs");
     use super::*;
 
     /// As `rpc_roundtrip` renders the daemon's error reply (`<code>: <message>`).

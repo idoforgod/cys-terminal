@@ -33,99 +33,271 @@
     {
       "sock": "",
       "is_base": true,
-      "why": "소켓 미설정 = base(종전 동작 보존)"
+      "why": "소켓 미설정 = base(종전 동작 보존)",
+      "key_at_9dbea792": "base",
+      "lane_class": "base"
     },
     {
       "sock": "/Users/x/.local/state/cys/cys.sock",
       "is_base": true,
-      "why": "★진짜 기본 소켓 — 반드시 base 여야 기존 delivery-base.jsonl 이 유효하다"
+      "why": "★진짜 기본 소켓 — 반드시 base 여야 기존 delivery-base.jsonl 이 유효하다",
+      "key_at_9dbea792": "base",
+      "lane_class": "base"
     },
     {
       "sock": "/home/x/.local/state/cys/cys.sock",
       "is_base": true,
-      "why": "리눅스 기본 소켓 모양"
+      "why": "리눅스 기본 소켓 모양",
+      "key_at_9dbea792": "base",
+      "lane_class": "base"
     },
     {
       "sock": "/nonexistent/machine/.local/state/cys/cys.sock",
       "is_base": true,
-      "why": "기계 독립 — 존재하지 않는 경로도 모양만 맞으면 base"
+      "why": "기계 독립 — 존재하지 않는 경로도 모양만 맞으면 base",
+      "key_at_9dbea792": "base",
+      "lane_class": "base"
     },
     {
       "sock": "/Users/x/.local/state/cys/cys",
       "is_base": true,
-      "why": "basename `cys`(확장자 없는 변형)도 허용 — 종전 계약 보존"
+      "why": "basename `cys`(확장자 없는 변형)도 허용 — 종전 계약 보존",
+      "key_at_9dbea792": "base",
+      "lane_class": "base"
     },
     {
       "sock": "/Users/x/.cys/state-harness/cys.sock",
       "is_base": false,
-      "why": "★실사고 격리 소켓 ① — 수리 전에는 base 로 접혀 본 레인을 오염시켰다"
+      "why": "★실사고 격리 소켓 ① — 수리 전에는 base 로 접혀 본 레인을 오염시켰다",
+      "key_at_9dbea792": "Users_x_.cys_state-harness_cys.sock",
+      "lane_class": "lane_near_miss"
     },
     {
       "sock": "/var/folders/ab/T/l1-new-1234/cys.sock",
       "is_base": false,
-      "why": "★실사고 격리 소켓 ② — 동일"
+      "why": "★실사고 격리 소켓 ② — 동일",
+      "key_at_9dbea792": "var_folders_ab_T_l1-new-1234_cys.sock",
+      "lane_class": "lane_near_miss"
     },
     {
       "sock": "/Users/x/.local/state/cys-harness/cys.sock",
       "is_base": false,
-      "why": "부모가 `cys` 로 **시작**하지만 `cys` 가 아니다 — 접두 비교로 완화하면 여기서 적색"
+      "why": "부모가 `cys` 로 **시작**하지만 `cys` 가 아니다 — 접두 비교로 완화하면 여기서 적색",
+      "key_at_9dbea792": "Users_x_.local_state_cys-harness_cys.sock",
+      "lane_class": "lane_near_miss"
     },
     {
       "sock": "/Users/x/.local/state/cystest/cys.sock",
       "is_base": false,
-      "why": "동일(접두 완화 탐지)"
+      "why": "동일(접두 완화 탐지)",
+      "key_at_9dbea792": "Users_x_.local_state_cystest_cys.sock",
+      "lane_class": "lane_near_miss"
     },
     {
       "sock": "/Users/x/.local/state/cys2/cys.sock",
       "is_base": false,
-      "why": "동일(접두 완화 탐지)"
+      "why": "동일(접두 완화 탐지)",
+      "key_at_9dbea792": "Users_x_.local_state_cys2_cys.sock",
+      "lane_class": "lane_near_miss"
     },
     {
       "sock": "/Users/x/.cys/cys.sock",
       "is_base": false,
-      "why": "부모가 `.cys` — `cys` 가 아니다"
+      "why": "부모가 `.cys` — `cys` 가 아니다",
+      "key_at_9dbea792": "Users_x_.cys_cys.sock",
+      "lane_class": "lane_near_miss"
     },
     {
       "sock": "/tmp/whatever.sock",
       "is_base": false,
-      "why": "파일명이 다른 커스텀 소켓 — 수리 전후 모두 비-base(회귀 없음)"
+      "why": "파일명이 다른 커스텀 소켓 — 수리 전후 모두 비-base(회귀 없음)",
+      "key_at_9dbea792": "tmp_whatever.sock",
+      "lane_class": "isolated"
     },
     {
       "sock": "/Users/x/.local/state/cys-dept-sales/cys.sock",
       "is_base": false,
-      "why": "부서 레인 — `cys-dept-` 성분 가드(수리 전후 동일)"
+      "why": "부서 레인 — `cys-dept-` 성분 가드(수리 전후 동일)",
+      "key_at_9dbea792": "Users_x_.local_state_cys-dept-sales_cys.sock",
+      "lane_class": "dept:sales"
     },
     {
       "sock": "/Users/x/.local/state/cys-dept-sales/sub/cys.sock",
       "is_base": false,
-      "why": "경로 어디든 `cys-dept-` 성분이 있으면 비-base"
+      "why": "경로 어디든 `cys-dept-` 성분이 있으면 비-base",
+      "key_at_9dbea792": "Users_x_.local_state_cys-dept-sales_sub_cys.sock",
+      "lane_class": "dept:sales"
     },
     {
       "sock": "\\\\.\\pipe\\cys",
       "is_base": true,
-      "why": "Windows 기본 명명 파이프 — 성분 분해 부적합, basename 판정 보존"
+      "why": "Windows 기본 명명 파이프 — 성분 분해 부적합, basename 판정 보존",
+      "key_at_9dbea792": "base",
+      "lane_class": "base(win_pipe)"
     },
     {
       "sock": "\\\\.\\pipe\\cys-harness",
       "is_base": false,
-      "why": "Windows 비기본 파이프"
+      "why": "Windows 비기본 파이프",
+      "key_at_9dbea792": "._pipe_cys-harness",
+      "lane_class": "win_pipe_other"
     },
     {
       "sock": "\\\\.\\pipe\\cys-dept-sales",
       "is_base": false,
-      "why": "Windows 부서 파이프"
+      "why": "Windows 부서 파이프",
+      "key_at_9dbea792": "._pipe_cys-dept-sales",
+      "lane_class": "dept:sales"
     },
     {
       "sock": "/tmp/cys/cys.sock",
       "is_base": true,
       "known_limitation": true,
-      "why": "★알려진 한계 — 기본 트리를 미러한 경로는 부모가 `cys` 라 base 로 접힌다. CYS_STATE_DIR 격리 필수(조건 ①)"
+      "why": "★알려진 한계 — 기본 트리를 미러한 경로는 부모가 `cys` 라 base 로 접힌다. CYS_STATE_DIR 격리 필수(조건 ①)",
+      "key_at_9dbea792": "base",
+      "lane_class": "base"
     },
     {
       "sock": "/var/tmp/mirror/cys/cys.sock",
       "is_base": true,
       "known_limitation": true,
-      "why": "★알려진 한계 — 동일(깊은 경로여도 부모 이름만 본다)"
+      "why": "★알려진 한계 — 동일(깊은 경로여도 부모 이름만 본다)",
+      "key_at_9dbea792": "base",
+      "lane_class": "base"
+    }
+  ],
+  "diagnostic_extras": [
+    {
+      "sock": "cys.sock",
+      "why": "ruling: bare relative",
+      "key_at_9dbea792": "cys.sock",
+      "lane_class": "not_absolute"
+    },
+    {
+      "sock": "./rig.sock",
+      "why": "ruling: dot-relative",
+      "key_at_9dbea792": "._rig.sock",
+      "lane_class": "not_absolute"
+    },
+    {
+      "sock": "relative/cys-dept-demo/cys.sock",
+      "why": "ruling: relative dept path",
+      "key_at_9dbea792": "relative_cys-dept-demo_cys.sock",
+      "lane_class": "dept:demo"
+    },
+    {
+      "sock": "\\\\not-a-pipe",
+      "why": "ruling: malformed pipe prefix",
+      "key_at_9dbea792": "not-a-pipe",
+      "lane_class": "win_pipe_other"
+    },
+    {
+      "sock": "\\\\.\\pipe\\",
+      "why": "ruling: empty pipe name",
+      "key_at_9dbea792": "._pipe",
+      "lane_class": "win_pipe_other"
+    },
+    {
+      "sock": "/Users/x/.local/state/cys-dept-sales/sub/cys.sock",
+      "why": "ruling: dept sub-path",
+      "key_at_9dbea792": "Users_x_.local_state_cys-dept-sales_sub_cys.sock",
+      "lane_class": "dept:sales"
+    },
+    {
+      "sock": "C:\\temp\\cys.sock",
+      "why": "codex: windows drive path",
+      "key_at_9dbea792": "C__temp_cys.sock",
+      "lane_class": "not_absolute"
+    },
+    {
+      "sock": "/tmp/a/b.sock",
+      "why": "codex: collision A",
+      "key_at_9dbea792": "tmp_a_b.sock",
+      "lane_class": "isolated"
+    },
+    {
+      "sock": "/tmp/a_b.sock",
+      "why": "codex: collision B",
+      "key_at_9dbea792": "tmp_a_b.sock",
+      "lane_class": "isolated"
+    },
+    {
+      "sock": "False",
+      "why": "ghost-1 (design shape, generic home)",
+      "key_at_9dbea792": "False",
+      "lane_class": "not_absolute"
+    },
+    {
+      "sock": "/Users/user/.local/state/cys/dept-dept-7/cys.sock",
+      "why": "ghost-2 (design shape, generic home)",
+      "key_at_9dbea792": "Users_user_.local_state_cys_dept-dept-7_cys.sock",
+      "lane_class": "lane_near_miss"
+    },
+    {
+      "sock": "/tmp/does-not-exist-dept-2.sock",
+      "why": "ghost-3 (design shape, generic home)",
+      "key_at_9dbea792": "tmp_does-not-exist-dept-2.sock",
+      "lane_class": "isolated"
+    },
+    {
+      "sock": "/tmp/does-not-exist-dept-4.sock",
+      "why": "ghost-4 (design shape, generic home)",
+      "key_at_9dbea792": "tmp_does-not-exist-dept-4.sock",
+      "lane_class": "isolated"
+    },
+    {
+      "sock": "/Users/user/.local/state/cys/cys.sock",
+      "why": "live base",
+      "key_at_9dbea792": "base",
+      "lane_class": "base"
+    },
+    {
+      "sock": "/Users/user/.local/state/cys-dept-dept-5/cys.sock",
+      "why": "live dept-5 (registered)",
+      "key_at_9dbea792": "Users_user_.local_state_cys-dept-dept-5_cys.sock",
+      "lane_class": "dept:dept-5"
+    },
+    {
+      "sock": "/Users/user/.local/state/cys-dept-dept-42/cys.sock",
+      "why": "dept-42 (unregistered)",
+      "key_at_9dbea792": "Users_user_.local_state_cys-dept-dept-42_cys.sock",
+      "lane_class": "dept:dept-42"
+    },
+    {
+      "sock": "/Users/user/.local/state/cys-dept-/cys.sock",
+      "why": "dept empty name",
+      "key_at_9dbea792": "Users_user_.local_state_cys-dept-_cys.sock",
+      "lane_class": "dept_malformed"
+    },
+    {
+      "sock": "/private/tmp/rig-abc/cys.sock",
+      "why": "isolation rig",
+      "key_at_9dbea792": "private_tmp_rig-abc_cys.sock",
+      "lane_class": "lane_near_miss"
+    },
+    {
+      "sock": "\\\\.\\pipe\\cys",
+      "why": "win pipe base",
+      "key_at_9dbea792": "base",
+      "lane_class": "base(win_pipe)"
+    },
+    {
+      "sock": "\\\\.\\pipe\\cys-dept-dept-5",
+      "why": "win pipe dept",
+      "key_at_9dbea792": "._pipe_cys-dept-dept-5",
+      "lane_class": "dept:dept-5"
+    },
+    {
+      "sock": "\\\\.\\pipe\\cys-dept-",
+      "why": "win pipe malformed dept",
+      "key_at_9dbea792": "._pipe_cys-dept-",
+      "lane_class": "dept_malformed"
+    },
+    {
+      "sock": "/tmp/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.sock",
+      "why": "long path (>160 key)",
+      "key_at_9dbea792": "tmp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-29bb4aca89b434b6",
+      "lane_class": "isolated"
     }
   ]
 }

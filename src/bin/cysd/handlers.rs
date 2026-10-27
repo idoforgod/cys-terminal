@@ -6180,7 +6180,12 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
         }
 
         "system.identify" => {
-            let caller = params.get("caller").cloned().unwrap_or(Value::Null);
+            let mut caller = params.get("caller").cloned().unwrap_or(Value::Null);
+            if caller.is_null() {
+                caller = caller_pid.and_then(|pid| resolve_caller_surface(daemon, pid))
+                    .map(|sid| json!({"surface_id": sid, "surface_ref": cys::surface_ref(sid)}))
+                    .unwrap_or(Value::Null);
+            }
             Reply::Single(ok_response(
                 &id,
                 json!({
@@ -6188,6 +6193,7 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
                     "daemon_pid": std::process::id(),
                     "version": env!("CARGO_PKG_VERSION"),
                     "started_at": daemon.started_at,
+                    "incarnation": daemon.incarnation,
                     "latest_seq": daemon.bus.latest_seq(),
                     "surface_count": daemon.surfaces.lock().unwrap().len(),
                     "caller": caller,
@@ -12741,6 +12747,33 @@ fn surface_create_error(bus: &crate::events::EventBus, id: &Value, message: &str
 mod tests {
     use super::*;
 
+    #[test]
+    fn p2_identify_and_epoch_share_one_incarnation_and_resolve_null_caller() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("p2-identify", r#"{"default":"allow"}"#);
+        let pid = std::process::id();
+        daemon.caller_cache.lock().unwrap().insert(pid,
+            crate::state::CallerCacheEntry::new(Some(7), crate::state::now_epoch(), None, 0));
+        // Delay the writer: daemon construction and record append are different clock samples.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        crate::delivery::write_epoch(&daemon.socket_path, daemon.started_at, &daemon.incarnation);
+        let epoch: Value = serde_json::from_str(&std::fs::read_to_string(
+            crate::delivery::epoch_path(&daemon.socket_path)).unwrap()).unwrap();
+        let Reply::Single(reply) = dispatch(&daemon, Request { id: json!(1),
+            method: "system.identify".into(), params: json!({"caller": null}) }, Some(pid)) else { panic!("single"); };
+        assert_eq!(reply["result"]["incarnation"], epoch["incarnation"]);
+        assert!(epoch["incarnation"].as_str().is_some_and(|s| !s.is_empty()));
+        assert_eq!(reply["result"]["started_at"], epoch["daemon_epoch"]);
+        assert_eq!(reply["result"]["caller"], json!({"surface_id":7,"surface_ref":"surface:7"}));
+        let Reply::Single(no_peer) = dispatch(&daemon, Request { id: json!(2),
+            method: "system.identify".into(), params: json!({"caller": null}) }, None) else { panic!("single"); };
+        assert!(no_peer["result"]["caller"].is_null());
+        crate::state::test_stop_daemon(&daemon);
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+
     include!("caller_matrix_tests.rs");
     include!("checked_submit_sender_tests.rs");
     include!("wp13_rename_gate_tests.rs");
@@ -16442,7 +16475,7 @@ mod tests {
         let sock = std::path::Path::new("/Users/x/.local/state/cys/cys.sock");
         assert!(
             matches!(
-                crate::delivery::write_boot_sentinel(sock),
+                crate::delivery::write_boot_sentinel(sock, 1234.5, "4d2-42"),
                 crate::delivery::Outcome::Recorded
             ),
             "기동 표식 기록 실패"
