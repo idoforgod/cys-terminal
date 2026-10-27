@@ -228,9 +228,9 @@
       "lane_class": "not_absolute"
     },
     {
-      "sock": "/Users/user/.local/state/cys/dept-dept-7/cys.sock",
+      "sock": "/Users/x/.local/state/cys/dept-dept-7/cys.sock",
       "why": "ghost-2 (design shape, generic home)",
-      "key_at_9dbea792": "Users_user_.local_state_cys_dept-dept-7_cys.sock",
+      "key_at_9dbea792": "Users_x_.local_state_cys_dept-dept-7_cys.sock",
       "lane_class": "lane_near_miss"
     },
     {
@@ -246,27 +246,27 @@
       "lane_class": "isolated"
     },
     {
-      "sock": "/Users/user/.local/state/cys/cys.sock",
+      "sock": "/Users/x/.local/state/cys/cys.sock",
       "why": "live base",
       "key_at_9dbea792": "base",
       "lane_class": "base"
     },
     {
-      "sock": "/Users/user/.local/state/cys-dept-dept-5/cys.sock",
+      "sock": "/Users/x/.local/state/cys-dept-dept-5/cys.sock",
       "why": "live dept-5 (registered)",
-      "key_at_9dbea792": "Users_user_.local_state_cys-dept-dept-5_cys.sock",
+      "key_at_9dbea792": "Users_x_.local_state_cys-dept-dept-5_cys.sock",
       "lane_class": "dept:dept-5"
     },
     {
-      "sock": "/Users/user/.local/state/cys-dept-dept-42/cys.sock",
+      "sock": "/Users/x/.local/state/cys-dept-dept-42/cys.sock",
       "why": "dept-42 (unregistered)",
-      "key_at_9dbea792": "Users_user_.local_state_cys-dept-dept-42_cys.sock",
+      "key_at_9dbea792": "Users_x_.local_state_cys-dept-dept-42_cys.sock",
       "lane_class": "dept:dept-42"
     },
     {
-      "sock": "/Users/user/.local/state/cys-dept-/cys.sock",
+      "sock": "/Users/x/.local/state/cys-dept-/cys.sock",
       "why": "dept empty name",
-      "key_at_9dbea792": "Users_user_.local_state_cys-dept-_cys.sock",
+      "key_at_9dbea792": "Users_x_.local_state_cys-dept-_cys.sock",
       "lane_class": "dept_malformed"
     },
     {
