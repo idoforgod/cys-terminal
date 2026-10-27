@@ -224,19 +224,23 @@ _AUTO_PRIOR = object()
 def _sync_dir(path):
     if os.name != 'posix':
         return SYNC_NONPOSIX
+    unverified = (errno.EACCES, errno.EPERM, errno.EINVAL, errno.ENOTSUP,
+                  getattr(errno, 'EOPNOTSUPP', errno.ENOTSUP), errno.ENOSYS)
     try:
         fd = os.open(path, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
-    except OSError:
-        return SYNC_FAILED
+    except OSError as exc:
+        return SYNC_UNSUPPORTED if exc.errno in unverified else SYNC_FAILED
+    outcome = SYNC_OK
     try:
-        try:
-            os.fsync(fd)
-            return SYNC_OK
-        except OSError as exc:
-            unsupported = (errno.EINVAL, errno.ENOTSUP, getattr(errno, 'EOPNOTSUPP', errno.ENOTSUP), errno.ENOSYS)
-            return SYNC_UNSUPPORTED if exc.errno in unsupported else SYNC_FAILED
+        os.fsync(fd)
+    except OSError as exc:
+        outcome = SYNC_UNSUPPORTED if exc.errno in unverified else SYNC_FAILED
     finally:
-        os.close(fd)
+        try:
+            os.close(fd)
+        except OSError:
+            outcome = SYNC_FAILED
+    return outcome
 
 
 def _make_dirs(path):
@@ -248,9 +252,16 @@ def _make_dirs(path):
         if parent == cursor:
             raise OSError('no existing ancestor for '+path)
         cursor = parent
+    created = []
     for d in reversed(missing):
-        os.makedirs(d, exist_ok=True)
-    return list(reversed(missing))
+        try:
+            os.mkdir(d)
+        except FileExistsError:
+            if not os.path.isdir(d):
+                raise
+        else:
+            created.append(d)
+    return created
 
 
 def _write_atomic(path, obj, prior=_AUTO_PRIOR, created_dirs=()):
@@ -261,8 +272,6 @@ def _write_atomic(path, obj, prior=_AUTO_PRIOR, created_dirs=()):
     def sync(d):
         outcome = _sync_dir(d)
         trail.append((d, outcome))
-        if outcome == SYNC_FAILED and not committed:
-            raise OSError('directory sync failed before commit: '+d)
     def temp_bytes(d, prefix, body):
         fd, tmp = tempfile.mkstemp(dir=d, prefix=prefix)
         leftovers.append(tmp)
@@ -278,21 +287,12 @@ def _write_atomic(path, obj, prior=_AUTO_PRIOR, created_dirs=()):
             except FileNotFoundError:
                 prior = None
         d = os.path.dirname(os.path.abspath(path))
-        # Recheck ancestor entries on every attempt: a previous failed attempt may
-        # have created them without making them durable. A later success must earn it.
+        # Only this call's new directory entries need parent syncs. Pre-existing
+        # ancestors may be search-only and are not prerequisites for publication.
         created = list(created_dirs) + _make_dirs(d)
-        parents = {os.path.dirname(x) for x in created}
-        cursor = d
-        while os.path.dirname(cursor) != cursor:
-            parents.add(os.path.dirname(cursor))
-            cursor = os.path.dirname(cursor)
-        for parent in sorted(parents, key=lambda p: (len(p), p)):
-            sync(parent)
-        sync(d)
         if prior is not None:
             backup_dir = os.path.join(d, '.preimage')
-            _make_dirs(backup_dir)
-            sync(d)
+            created.extend(_make_dirs(backup_dir))
             stamp = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
             base = os.path.join(backup_dir, '%s.%s-%d' % (os.path.basename(path), stamp, os.getpid()))
             backup = None
@@ -311,7 +311,6 @@ def _write_atomic(path, obj, prior=_AUTO_PRIOR, created_dirs=()):
             tmp = temp_bytes(backup_dir, '.preimage-', prior)
             os.replace(tmp, backup)
             leftovers.remove(tmp)
-            sync(backup_dir)
             with open(backup, 'rb') as f:
                 if _digest(f.read()) != _digest(prior):
                     raise OSError('preimage mismatch; ledger untouched')
@@ -320,7 +319,10 @@ def _write_atomic(path, obj, prior=_AUTO_PRIOR, created_dirs=()):
         os.replace(tmp, path)
         leftovers.remove(tmp)
         committed = True
-        sync(d)
+        # Directory durability is an outcome of the committed write, never rc11.
+        targets = {d} | {os.path.dirname(x) for x in created}
+        for target in sorted(targets):
+            sync(target)
     except (OSError, ValueError, TypeError) as exc:
         rc = EXIT_COMMITTED_UNCONFIRMED if committed else EXIT_NOT_COMMITTED
         print('%s: %s; owned temporary paths=%s; preimage=%s; sync=%s' % (_tag(rc), exc, leftovers, backup, trail), file=sys.stderr)
