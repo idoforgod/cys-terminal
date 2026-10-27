@@ -7861,6 +7861,11 @@ mod agent_queue_tests;
 #[cfg(test)]
 mod direct_agent_tests;
 
+// P4 C-13: the POSIX half of the Ctrl+C / ETX measurement. The Windows half is UNMEASURED by
+// construction and the module note says so - no cell here stands in for it.
+#[cfg(test)]
+mod etx_ctrlc_tests;
+
 #[cfg(test)]
 mod receipt_framing_tests {
     include!("receipt_framing_tests.rs");
