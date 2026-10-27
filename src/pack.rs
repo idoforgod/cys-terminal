@@ -2937,7 +2937,20 @@ pub fn plan_install(
         let path = dir.join(rel);
         let exists = path.exists();
         let disk = if exists { std::fs::read_to_string(&path).ok() } else { None };
-        let mh = manifest.get(rel).map(String::as_str);
+        let mh_raw = manifest.get(rel).map(String::as_str);
+        // ★C-07(0.14.55 · P3): 분류 **직전** 낡은 항목 판정. decide_file_action 의 arm 은 무변경.
+        let stale = classify_stale_entry(rel, scope, disk.as_deref(), mh_raw);
+        let repaired = match &stale {
+            StaleEntry::Repaired(h) => Some(h.clone()),
+            _ => None,
+        };
+        let mh = repaired.as_deref().or(mh_raw);
+        if let StaleEntry::KeepInPlace(_) = stale {
+            // ⛔제자리 보존 — 쓰지 않는다. 낡은 항목을 그대로 두면 L4 강제 치유로 떨어지므로
+            //   분류를 건너뛰고 kept-drift 로 계상한다(설계 R3 section 3-2).
+            plan.kept_drift.push(rel.to_string());
+            continue;
+        }
         // ★T3(D9) base lazy 로드 사전 필터 — 이 필터는 **과대포함만 허용**(과소포함=Merge3 침묵
         // 불발) · decide L3 가 최종 판정. 드리프트 파일에서만 pristine read 가 발생한다(전 파일
         // read+hash 2배화 회귀 방지 — 실측 통상 0~10건).
@@ -3263,6 +3276,83 @@ pub fn pack_target_mode(
         Some(p) => Some(p),
         None => exec_mode_for(bytes),
     }
+}
+
+/// C-07 (0.14.55 · P3) 한 파일에 대한 낡은 매니페스트 항목 판정.
+///
+/// 이 판정은 **plan/install 분류 바로 앞**에 선다 — `decide_file_action` 의 7개 arm 은
+/// **손대지 않는다**. 고치는 것은 그 함수에 들어가는 **manifest_hash 하나**이고(기준선 수리),
+/// 판정 불가인 경우에만 호출부가 분류를 건너뛰고 제자리 보존을 고른다. arm 을 고치면 같은 사실을
+/// 7곳에 흩뿌리게 되므로 그렇게 하지 않는다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StaleEntry {
+    /// 항목이 건전하거나 이 판정의 범위 밖 — 받은 해시 그대로 분류한다.
+    Normal,
+    /// 항목이 낡았고 **디스크 바이트가 표에 있는 과거 릴리스 본**이다 → 기준선을 그 해시로 수리.
+    /// 그 뒤 Arm 2 가 맞아 `자동 갱신`(비수정 파일의 깨끗한 벤더 갱신)으로 분류된다.
+    Repaired(String),
+    /// 항목이 낡았고 디스크 바이트가 **무엇인지 말할 수 없다**(표에 행이 없거나 어느 행과도 불일치)
+    /// → ⛔**제자리 보존 + 보고**. 쓰지 않고, `.user` 를 만들지 않고, 원장에 적지 않는다.
+    KeepInPlace(&'static str),
+}
+
+/// [`StaleEntry`] 판정. 순수 — IO 는 호출부가 이미 읽은 값으로만 한다.
+///
+/// 규칙(설계 R3 section 3-2 · 보수 분기):
+/// 1. system 등급이 아니면 `Normal` (user·seed-once 는 이 판정의 대상이 아니다)
+/// 2. 매니페스트 항목이 없으면 `Normal` (레거시 경로 — 거동 불변)
+/// 3. 항목이 디스크 해시와 같으면 `Normal` (건전)
+/// 4. 표에 행이 없으면 `KeepInPlace("no-row")`
+/// 5. 디스크 해시가 그 행에 있으면 `Repaired(디스크 해시)`
+/// 6. 그 밖 → `KeepInPlace("unknown-disk")`
+///
+/// ⛔`.pristine` 조상을 근거로 3-way 병합을 고르는 확장은 **이 판에 없다**
+/// (이관 D5H-20261027-P3-PRISTINE-MERGE): 디스크 바이트가 무엇인지 모르는 파일에 대해 조상이
+/// 그 파일을 설명한다고 신뢰하는 것이기 때문이다.
+pub fn classify_stale_entry(
+    rel: &str,
+    scope: PackScope,
+    disk: Option<&str>,
+    manifest_hash: Option<&str>,
+) -> StaleEntry {
+    classify_stale_entry_with(
+        rel,
+        scope,
+        disk,
+        manifest_hash,
+        crate::pack_prev_vendor::prev_vendor_hashes(rel),
+    )
+}
+
+/// [`classify_stale_entry`] 의 **표 주입판**. 표를 인자로 받아 완전히 순수해진다.
+///
+/// 왜 분리하는가: 정적 표만으로는 `Repaired` 분기를 검체로 만들 수 없다 — 그 분기를 밟으려면
+/// **해시가 표의 한 행과 같은 내용**이 필요하고, 과거 릴리스의 내용은 런타임에 없다. 표를 주입하면
+/// 검체가 `(내용, hash(내용))` 쌍을 스스로 만들어 여섯 분기를 전부 밟을 수 있다.
+pub fn classify_stale_entry_with(
+    rel: &str,
+    scope: PackScope,
+    disk: Option<&str>,
+    manifest_hash: Option<&str>,
+    known: &[&str],
+) -> StaleEntry {
+    if ownership_scoped(rel, scope) != Ownership::System {
+        return StaleEntry::Normal;
+    }
+    let (Some(d), Some(mh)) = (disk, manifest_hash) else {
+        return StaleEntry::Normal;
+    };
+    let dh = content_hash(d);
+    if dh == mh {
+        return StaleEntry::Normal;
+    }
+    if known.is_empty() {
+        return StaleEntry::KeepInPlace("no-row");
+    }
+    if known.contains(&dh.as_str()) {
+        return StaleEntry::Repaired(dh);
+    }
+    StaleEntry::KeepInPlace("unknown-disk")
 }
 
 /// H-08 의 "system 등급 **매니페스트 항목**인가" 판정 — [`pack_target_mode`] 의 0644→0755 복구 분기를
@@ -3959,7 +4049,18 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
         let disk = if exists { std::fs::read_to_string(&path).ok() } else { None };
         // 판정 입력과 동일한 사실(존재하나 읽기 실패) — 소유권 술어를 다시 쓰지 않는다(SOT 분산 금지).
         let unreadable = exists && disk.is_none();
-        let mhash: Option<String> = manifest.get(rel).cloned();
+        let mhash_raw: Option<String> = manifest.get(rel).cloned();
+        // ★C-07: 분류 직전 판정 — 기준선 수리 또는 제자리 보존.
+        let stale = classify_stale_entry(rel, scope, disk.as_deref(), mhash_raw.as_deref());
+        let mhash: Option<String> = match &stale {
+            StaleEntry::Repaired(h) => {
+                // 기준선을 **디스크에 실제로 있는 과거 릴리스 해시**로 수리한다 — 그러면 Arm 2 가
+                // 맞아 깨끗한 벤더 갱신이 되고, 유령 `.user` 와 거짓 "healed" 원장 항목이 사라진다.
+                manifest.insert(rel.to_string(), h.clone());
+                Some(h.clone())
+            }
+            _ => mhash_raw.clone(),
+        };
         // ★G3 축2(seed-from-base): 부서 soul.md 의 최초 시드는 임베드 템플릿이 아니라 **base 팩의
         // 현행 soul.md 승계**다(부서는 base 헌장 아래에서 태어난다 — 2026-08-21 확정). `!exists`
         // 에만 발동하므로 이후 SeedOnce 불가침과 정합하고, 치환된 content 가 아래 판정·write·
@@ -3979,6 +4080,18 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
             (true, Some(d), Some(m)) if d != content => load_verified_base(&dir, rel, m),
             _ => None,
         };
+        if let StaleEntry::KeepInPlace(reason) = &stale {
+            // ⛔C-07 보수 분기: 디스크 바이트가 과거 릴리스 본이라고 말할 근거가 없다 →
+            //   **제자리 보존 + 보고**. 대상도 `.user` 도 원장도 쓰지 않는다(파일시스템 변화 0).
+            //   종전(설계 R2)은 여기서 L4 강제 치유로 떨어져 운영자가 쓰지 않은 바이트의 `.user`
+            //   백업과 거짓 "healed" 원장 항목을 만들었다(reviewer1 r2 M3).
+            kept += 1;
+            eprintln!(
+                "📌 제자리 보존 '{rel}' — 매니페스트 항목이 낡았고 디스크 바이트의 출처를 \
+                 확인할 수 없습니다({reason}) · 아무것도 쓰지 않았습니다"
+            );
+            continue;
+        }
         match decide_file_action(
             rel, content, exists, disk.as_deref(), mhash.as_deref(), force, scope,
             verified_base.as_deref(),
@@ -3987,9 +4100,11 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                 if adopt_hash {
                     // 디스크 = 임베드: 최신. 매니페스트 공백(구설치본)이면 채택 기록해
                     // 다음 버전부터 자동 갱신 대상이 되게 한다. pristine 승계도 보장.
-                    manifest
-                        .entry(rel.to_string())
-                        .or_insert_with(|| content_hash(content));
+                    // ★C-07 예방: `or_insert_with` 는 **키가 없을 때만** 넣어 이미 있는 낡은 항목을
+                    //   그대로 둔다 — 그것이 세 파일을 낡은 상태로 만든 기제다. 무조건 넣어 불변식을
+                    //   세운다: *매니페스트 항목은 설치·채택된 내용의 해시와 항상 같다*
+                    //   (쓰기 경로가 이미 하는 것과 같다).
+                    manifest.insert(rel.to_string(), content_hash(content));
                     ensure_pristine(&dir, rel, content);
                     // ★T3(D6) 원장 수명 — disk==embed 재일치 합류점: kept-drift·quarantined 는
                     // 제거(new-pending 청소 동형 — 방치 시 유령 계상 영구화 실측), merged·conflicted
@@ -4976,6 +5091,103 @@ pub(crate) static PACK_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ───────────────────────── C-07 (0.14.55 · P3) ─────────────────────────
+    /// C-07 낡은 항목 판정의 **여섯 분기 전부**. 표를 주입하므로 `Repaired` 도 밟는다.
+    #[test]
+    fn c07_classify_stale_entry_six_branches() {
+        // system 등급 rel 하나를 임베드에서 고른다(등급 술어를 검체가 다시 쓰지 않는다).
+        let sysrel = PACK_ALL
+            .iter()
+            .map(|(r, _)| *r)
+            .find(|r| ownership_scoped(r, PackScope::Base) == Ownership::System)
+            .expect("system rel");
+        let userrel = PACK_ALL
+            .iter()
+            .map(|(r, _)| *r)
+            .find(|r| ownership_scoped(r, PackScope::Base) == Ownership::User)
+            .expect("user rel");
+
+        let prev_vendor = "vendor bytes of a previous release\n";
+        let hp = content_hash(prev_vendor);
+        let stale = content_hash("a hash older than both\n");
+        let table: Vec<&str> = vec![hp.as_str()];
+
+        // 1) system 아님 → Normal (user 파일은 이 판정의 대상이 아니다)
+        assert_eq!(
+            classify_stale_entry_with(userrel, PackScope::Base, Some("x"), Some(&stale), &table),
+            StaleEntry::Normal
+        );
+        // 2) 매니페스트 항목 부재 → Normal (레거시 경로 거동 불변)
+        assert_eq!(
+            classify_stale_entry_with(sysrel, PackScope::Base, Some("x"), None, &table),
+            StaleEntry::Normal
+        );
+        // 3) 항목이 디스크와 일치 → Normal (건전)
+        let dh = content_hash("x");
+        assert_eq!(
+            classify_stale_entry_with(sysrel, PackScope::Base, Some("x"), Some(&dh), &table),
+            StaleEntry::Normal
+        );
+        // 4) 표에 행이 없음 → KeepInPlace("no-row")
+        assert_eq!(
+            classify_stale_entry_with(sysrel, PackScope::Base, Some("x"), Some(&stale), &[]),
+            StaleEntry::KeepInPlace("no-row")
+        );
+        // 5) ★디스크가 표에 있는 과거 릴리스 본 → Repaired(디스크 해시)
+        assert_eq!(
+            classify_stale_entry_with(
+                sysrel,
+                PackScope::Base,
+                Some(prev_vendor),
+                Some(&stale),
+                &table
+            ),
+            StaleEntry::Repaired(hp.clone())
+        );
+        // 6) 디스크가 어느 행과도 불일치 → KeepInPlace("unknown-disk") ⛔강제 치유 아님
+        assert_eq!(
+            classify_stale_entry_with(
+                sysrel,
+                PackScope::Base,
+                Some("the operator wrote this\n"),
+                Some(&stale),
+                &table
+            ),
+            StaleEntry::KeepInPlace("unknown-disk")
+        );
+    }
+
+    /// 생성된 표가 **실제로** 실려 있고 조회가 돈다(빈 표로 컴파일되면 모든 경로가 no-row 가 되어
+    /// 조용히 "아무것도 안 함"이 되므로, 표의 실재 자체가 검체 대상이다).
+    #[test]
+    fn c07_generated_table_is_present_and_queryable() {
+        let n = crate::pack_prev_vendor::PREV_VENDOR_HASHES.len();
+        assert!(n >= 100, "표 행 수가 비정상적으로 적다: {n}");
+        // 정렬 전제(이진 탐색) — 깨지면 조회가 조용히 빈 슬라이스를 돌려준다.
+        let mut sorted = true;
+        for w in crate::pack_prev_vendor::PREV_VENDOR_HASHES.windows(2) {
+            if w[0].0 >= w[1].0 {
+                sorted = false;
+                break;
+            }
+        }
+        assert!(sorted, "PREV_VENDOR_HASHES 는 rel 로 정렬돼 있어야 한다(이진 탐색 전제)");
+        // 모든 행의 해시는 64자 소문자 hex 여야 한다.
+        for (rel, hs) in crate::pack_prev_vendor::PREV_VENDOR_HASHES {
+            assert!(!hs.is_empty(), "빈 행은 no-row 와 구별되지 않는다: {rel}");
+            for h in *hs {
+                assert!(
+                    h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
+                    "해시 형식 위반 {rel}: {h}"
+                );
+            }
+        }
+        // 표에 있는 첫 행은 조회로 찾을 수 있고, 없는 경로는 빈 슬라이스다.
+        let first = crate::pack_prev_vendor::PREV_VENDOR_HASHES[0].0;
+        assert!(!crate::pack_prev_vendor::prev_vendor_hashes(first).is_empty());
+        assert!(crate::pack_prev_vendor::prev_vendor_hashes("no/such/path.xyz").is_empty());
+    }
 
     // ───────────────────────── H-08 (0.14.55 · P3) ─────────────────────────
     /// H-08 의 mode 규칙표(순수 함수 · umask 무관). 설계 R2 section 1-3 의 다섯 행 전부.
