@@ -23,9 +23,10 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 
-BIN = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))          # cysjavis-pack/bin
+BIN =os.path.dirname(os.path.dirname(os.path.abspath(__file__)))          # cysjavis-pack/bin
 sys.path.insert(0, BIN)
 import javis_report_gate as G                                             # noqa: E402
 
@@ -1182,6 +1183,268 @@ class ParseIsoEpochOffsetTest(unittest.TestCase):
         self.assertEqual(G._parse_iso_epoch(1793018388.5), 1793018388.5)
         self.assertIsNone(G._parse_iso_epoch(""))
         self.assertIsNone(G._parse_iso_epoch(None))
+
+
+# ── 0.14.56 PACKTOOLS Phase 4 — deadlock ticket root: D-d · D-b · SHADOW (CEO ruling 4eeea43f Part B) ──
+#   The ticket path below is the REAL one (G.Runner task methods + a javis_task.py subprocess); only the
+#   report, event, wakeup and daemon calls are faked. HOME, the three override names and the publish seam are
+#   pinned per test, so nothing reads or writes a live ~/.cys/state or a live pack.
+class _TaskPathRunner(G.Runner):
+    def __init__(self, pack_bin, state_dir, rep):
+        super().__init__(pack_bin, state_dir)
+        self.rep = rep
+        self.emits, self.enqueues, self.drains, self.sends = [], [], [], []
+        self._wid = 0
+
+    def collect_report(self):
+        self._sample = getattr(self, "_sample", 0) + 300
+        self.rep["sampled_at"] = self._sample
+        for i, row in enumerate(self.rep.get("live_nodes") or []):
+            row.setdefault("surface_id", i + 1)
+            row.setdefault("created_at", 1)
+        return True, self.rep, None
+
+    def emit(self, evt_type, fields, surface="auto"):
+        self.emits.append((evt_type, fields))
+        return 0, "", ""
+
+    def enqueue(self, to, task, reason, idem, payload=None, severity=None):
+        self.enqueues.append((to, task, reason, idem, severity))
+        self._wid += 1
+        return 0, "W-%010x" % self._wid
+
+    def drain(self, target):
+        self.drains.append(target)
+        return 0, 1
+
+    def poll_events(self, after_seq, names, timeout=0):
+        return True, [], after_seq
+
+    def send_queued(self, to, body):
+        self.sends.append((to, body))
+        return 0
+
+
+class DeadlockRootShadowTest(unittest.TestCase):
+    SCOPE = "pack-dept-dept-T"
+
+    def setUp(self):
+        from unittest import mock
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = self._tmp.name
+        self.pack = os.path.join(self.tmp, self.SCOPE)
+        os.makedirs(self.pack)
+        os.symlink(BIN, os.path.join(self.pack, "bin"))
+        self.pack_bin = os.path.join(self.pack, "bin")
+        self.registry = os.path.join(self.pack, "state", "task-roots.json")
+        self.ws = os.path.join(self.tmp, "ws")
+        self.tasks_dir = os.path.join(self.ws, "_round", "tasks")
+        #   A dept-shaped pack name needs a matching CYS_SOCKET or the gate skips the cycle as a foreign
+        #   daemon (foreign_daemon_verdict). Nothing connects to it: every daemon-facing method is faked.
+        env = {"HOME": os.path.join(self.tmp, "home"), "CYS_PACK_DIR": self.pack,
+               "CYS_SOCKET": os.path.join(self.tmp, "cys-dept-dept-T", "cys.sock")}
+        self._env = mock.patch.dict(os.environ, env)
+        self._env.start()
+        for k in ("JAVIS_ROOT", "JAVIS_TASK_ROOT", "CYS_TASK_ROOT", "JAVIS_TASK_PUBLISH_EPHEMERAL",
+                  "CYS_SURFACE_ID", "AITERM_SURFACE_ID", "CYS_ROLE"):
+            os.environ.pop(k, None)
+        self.stale = report(live_nodes=[
+            {"role": "master", "idle_secs": 60, "agent_alive": True, "status_age_secs": 3600},
+            {"role": "cso", "idle_secs": 60, "agent_alive": True, "status_age_secs": 3600}])
+        self.clock = Clock(time.time() + 7200)       # tickets written now are 2 h old to the gate
+
+    def tearDown(self):
+        for d, _, _ in os.walk(self.tmp):
+            try:
+                os.chmod(d, 0o755)
+            except OSError:
+                pass
+        self._env.stop()
+        self._tmp.cleanup()
+
+    # ── helpers ──
+    def jt(self, *argv, publish=True, root=None):
+        env = dict(os.environ, JAVIS_ROOT=root or self.ws, CYS_PACK_DIR=self.pack, CYS_NO_AUTOSTART="1",
+                   JAVIS_TASK_LIVENESS="alive", CYS_PROBE_RUNS=os.path.join(self.tmp, "probe_runs.jsonl"))
+        if publish:
+            env["JAVIS_TASK_PUBLISH_EPHEMERAL"] = "1"
+        return subprocess.run([sys.executable, "-B", os.path.join(BIN, "javis_task.py")] + list(argv),
+                              capture_output=True, text=True, env=env, timeout=60)
+
+    def write_ticket(self, tasks_dir, tid, **extra):
+        os.makedirs(tasks_dir, exist_ok=True)
+        t = {"id": tid, "title": tid, "status": "todo", "owner": None,
+             "created_at": "2026-10-28T00:00:00+0900", "updated_at": "2026-10-28T00:00:00+0900"}
+        t.update(extra)
+        with open(os.path.join(tasks_dir, tid + ".json"), "w", encoding="utf-8") as f:
+            json.dump(t, f)
+
+    def write_registry(self, *roots):
+        os.makedirs(os.path.dirname(self.registry), exist_ok=True)
+        with open(self.registry, "w", encoding="utf-8") as f:
+            json.dump({"v": 1, "roots": {r: {"first_seen": 1, "last_write": 1, "role": None}
+                                         for r in roots}}, f)
+
+    def run_gate(self, runner=None):
+        r = runner or _TaskPathRunner(self.pack_bin, os.path.join(self.tmp, "gate"), self.stale)
+        sd = os.path.join(self.tmp, "gate")
+        for _ in range(2):                              # run 1 is BASELINE (no classification)
+            gate(sd, r, clock=self.clock).run()
+            self.clock.epoch += 300
+        return r, ledger_entries(sd)[-1]
+
+    def shadow(self, entry, source=None):
+        recs = entry.get("deadlock_shadow")
+        self.assertIsInstance(recs, list, "ledger row has no deadlock_shadow list: %r" % sorted(entry))
+        return [x for x in recs if source is None or x.get("source") == source]
+
+    def assert_never_paged(self, r, entry):
+        self.assertEqual([e for e in r.enqueues if e[1] == "gate-deadlock"], [], "shadow enqueued a page")
+        self.assertEqual([e for e in r.emits if e[0] == "agent.silent"], [], "shadow emitted agent.silent")
+        self.assertFalse(any(str(x).startswith("deadlock:") for x in entry.get("reasons") or []),
+                         "the deadlock warn was routed (its reason reached the ledger)")
+
+    # ── D-d: an absent or unreadable source is an INSTRUMENT-FAIL, never a clean zero ──
+    def test_dd_registry_absent_is_instrument_fail(self):
+        r, e = self.run_gate()
+        recs = self.shadow(e, "registry")
+        self.assertEqual(len(recs), 1, recs)
+        self.assertEqual(recs[0]["verdict"], "instrument_fail")
+        self.assertIn("registry_absent", recs[0]["reason"])
+        self.assertNotIn("deadlock_no:no_unassigned_ticket", e.get("reasons") or [])
+
+    def test_dd_published_root_absent_is_instrument_fail(self):
+        self.write_registry(self.tasks_dir)                # published, then gone
+        r, e = self.run_gate()
+        recs = self.shadow(e, "registry")
+        self.assertEqual([(x["root"], x["verdict"]) for x in recs], [(self.tasks_dir, "instrument_fail")])
+        self.assertIn("root_absent", recs[0]["reason"])
+
+    def test_dd_unreadable_root_is_instrument_fail(self):
+        self.write_ticket(self.tasks_dir, "T-1", scope=self.SCOPE)
+        self.write_registry(self.tasks_dir)
+        os.chmod(self.tasks_dir, 0)
+        r, e = self.run_gate()
+        recs = self.shadow(e, "registry")
+        self.assertEqual(recs[0]["verdict"], "instrument_fail")
+        self.assertIn("root_unreadable", recs[0]["reason"])
+
+    def test_dd_unreadable_registry_is_instrument_fail(self):
+        os.makedirs(os.path.dirname(self.registry))
+        with open(self.registry, "w", encoding="utf-8") as f:
+            f.write("{not json")
+        r, e = self.run_gate()
+        recs = self.shadow(e, "registry")
+        self.assertEqual(recs[0]["verdict"], "instrument_fail")
+        self.assertIn("registry_unreadable", recs[0]["reason"])
+
+    # ── D-b: the writer stamps scope and publishes its root; the gate reads only the registry ──
+    def test_db_create_stamps_scope_and_publishes_root(self):
+        p = self.jt("create", "x", "--id", "T-1")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        with open(os.path.join(self.tasks_dir, "T-1.json"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f).get("scope"), self.SCOPE)
+        with open(self.registry, encoding="utf-8") as f:
+            reg = json.load(f)
+        self.assertEqual(reg.get("v"), 1)
+        self.assertEqual(sorted(reg.get("roots") or {}), [os.path.abspath(self.tasks_dir)])
+
+    def test_db_set_status_publishes_root(self):
+        self.assertEqual(self.jt("create", "x", "--id", "T-1").returncode, 0)
+        if os.path.exists(self.registry):                   # create's publish is pinned elsewhere
+            os.remove(self.registry)
+        p = self.jt("set-status", "T-1", "backlog")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertTrue(os.path.isfile(self.registry), "set-status did not publish its root")
+        with open(self.registry, encoding="utf-8") as f:
+            self.assertIn(os.path.abspath(self.tasks_dir), json.load(f)["roots"])
+
+    def test_db_ephemeral_root_not_published_without_seam(self):
+        # Guard (passes on the old bytes too): a test root under a temp prefix must not plant a root that is
+        # gone tomorrow, or every later gate cycle reads a permanent INSTRUMENT-FAIL.
+        p = self.jt("create", "x", "--id", "T-1", publish=False)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertFalse(os.path.exists(self.registry), "an ephemeral root was published")
+
+    def test_db_own_scope_unassigned_would_fire_without_paging(self):
+        self.assertEqual(self.jt("create", "x", "--id", "T-1").returncode, 0)
+        r, e = self.run_gate()
+        recs = self.shadow(e, "registry")
+        self.assertEqual(len(recs), 1, recs)
+        self.assertEqual(recs[0]["root"], os.path.abspath(self.tasks_dir))
+        self.assertEqual((recs[0]["verdict"], recs[0]["reason"]), ("would_fire", "deadlock_yes"))
+        self.assertEqual((recs[0]["attributed"], recs[0]["unattributed"], recs[0]["foreign"]), (1, 0, 0))
+        self.assert_never_paged(r, e)
+        self.assertIn("deadlock_shadow:would_fire=1,no=0,unmeasured=0,instrument_fail=0", e["reasons"])
+
+    def test_db_unscoped_legacy_row_is_unattributed_and_not_fired(self):
+        self.write_ticket(self.tasks_dir, "T-L")             # pre-0.14.56 row: no scope key
+        self.write_registry(os.path.abspath(self.tasks_dir))
+        r, e = self.run_gate()
+        rec = self.shadow(e, "registry")[0]
+        self.assertEqual((rec["verdict"], rec["reason"]), ("no", "deadlock_no:no_unassigned_ticket"))
+        self.assertEqual((rec["attributed"], rec["unattributed"], rec["foreign"]), (0, 1, 0))
+        self.assert_never_paged(r, e)
+
+    def test_db_foreign_scope_row_is_not_fired(self):
+        self.write_ticket(self.tasks_dir, "T-F", scope="pack-dept-dept-OTHER")
+        self.write_registry(os.path.abspath(self.tasks_dir))
+        r, e = self.run_gate()
+        rec = self.shadow(e, "registry")[0]
+        self.assertEqual(rec["verdict"], "no")
+        self.assertEqual((rec["attributed"], rec["unattributed"], rec["foreign"]), (0, 0, 1))
+
+    def test_db_override_env_is_named_in_the_record(self):
+        self.write_ticket(self.tasks_dir, "T-1", scope=self.SCOPE)
+        os.environ["JAVIS_TASK_ROOT"] = self.ws
+        r, e = self.run_gate()
+        recs = self.shadow(e, "override:JAVIS_TASK_ROOT")
+        self.assertEqual([(x["root"], x["verdict"]) for x in recs], [(self.tasks_dir, "would_fire")])
+        self.assertEqual(self.shadow(e, "registry"), [], "the registry was read beside an explicit override")
+
+    # ── B-2: one record per root, each with its own stop reason ──
+    def test_b2_two_roots_one_record_each(self):
+        gone = os.path.join(self.tmp, "gone", "_round", "tasks")
+        self.assertEqual(self.jt("create", "x", "--id", "T-1").returncode, 0)
+        self.assertTrue(os.path.isfile(self.registry), "create did not publish its root")
+        with open(self.registry, encoding="utf-8") as f:
+            reg = json.load(f)
+        reg["roots"][gone] = {"first_seen": 1, "last_write": 1, "role": None}
+        with open(self.registry, "w", encoding="utf-8") as f:
+            json.dump(reg, f)
+        r, e = self.run_gate()
+        got = sorted((x["root"], x["verdict"]) for x in self.shadow(e, "registry"))
+        self.assertEqual(got, sorted([(gone, "instrument_fail"), (os.path.abspath(self.tasks_dir), "would_fire")]))
+        self.assert_never_paged(r, e)
+
+    # ── D-c: an in-memory positive control every cycle; a control that does not fire blinds the verdict ──
+    def test_dc_control_record_every_run(self):
+        r, e = self.run_gate()
+        ctl = self.shadow(e, "control")
+        self.assertEqual([(x["verdict"], x["reason"]) for x in ctl], [("control_fired", "deadlock_yes")])
+        self.assertTrue(G.deadlock_positive_control(self.clock.epoch)[0])
+
+    def test_dc_failed_control_turns_every_root_into_instrument_fail(self):
+        from unittest import mock
+        self.write_ticket(self.tasks_dir, "T-O", scope=self.SCOPE, owner="worker")   # a clean "no"
+        self.write_registry(os.path.abspath(self.tasks_dir))
+        with mock.patch.object(G, "deadlock_positive_control", create=True,
+                               return_value=(False, "deadlock_no:injected")):
+            r, e = self.run_gate()
+        rec = self.shadow(e, "registry")[0]
+        self.assertEqual(rec["verdict"], "instrument_fail")
+        self.assertTrue(rec["reason"].startswith("deadlock_instrument_fail:control"), rec)
+        self.assertIn("deadlock_no:no_unassigned_ticket", rec["reason"], "the per-root stop reason was lost")
+
+    # ── legacy runner (no task_roots): the old single source still answers, shadow only ──
+    def test_legacy_task_snapshot_runner_is_shadow_only(self):
+        old = "2023-11-01T00:00:00+0000"
+        fr = FakeRunner(rep=self.stale, tasks=[{"id": "T-1", "status": "todo", "owner": None,
+                                                "created_at": old, "updated_at": old}])
+        r, e = self.run_gate(fr)
+        recs = self.shadow(e, "legacy:task_snapshot")
+        self.assertEqual([(x["verdict"], x["reason"]) for x in recs], [("would_fire", "deadlock_yes")])
+        self.assert_never_paged(r, e)
 
 
 if __name__ == "__main__":

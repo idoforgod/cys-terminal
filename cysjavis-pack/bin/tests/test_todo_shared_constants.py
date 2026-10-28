@@ -38,6 +38,7 @@ import javis_memory_inject as INJ                                        # noqa:
 import javis_orchestra as ORC                                            # noqa: E402
 import javis_preflight as PFL                                            # noqa: E402
 import javis_report as RP                                                # noqa: E402
+import javis_task as JT                                                  # noqa: E402
 import javis_todo_decl as TD                                             # noqa: E402
 import javis_todo_stamp as ST                                            # noqa: E402
 
@@ -101,6 +102,10 @@ class PackDirEnvKeys(unittest.TestCase):
                          "javis_distill 팩 env 목록이 갈렸다 — 증류 미러 위치 분열(P3)")
         self.assertEqual(RP.PACK_DIR_ENV_KEYS, INJ.PACK_DIR_ENV_KEYS,
                          "javis_memory_inject 팩 env 목록이 갈렸다 — 주입 스캔 위치 분열(P3)")
+        # ★0.14.56 D-b: 티켓 루트 공표·scope 스탬프도 같은 목록으로 쓰는 쪽 팩을 정한다 — 갈리면 공표 대장과
+        #   게이트가 읽는 대장이 다른 팩에 생긴다(게이트는 INSTRUMENT-FAIL:registry_absent 만 본다).
+        self.assertEqual(RP.PACK_DIR_ENV_KEYS, JT.PACK_DIR_ENV_KEYS,
+                         "javis_task 팩 env 목록이 갈렸다 — 루트 공표 대장 위치 분열(0.14.56 D-b)")
 
     def test_preflight_and_bootstrap_resolve_legacy_key(self):
         """★A11 행동 축 — `AITERM_PACK_DIR`만 설정된 환경에서 부트 체인 전원이 같은 팩을 본다."""

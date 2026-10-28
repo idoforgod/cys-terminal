@@ -23,6 +23,8 @@
          · gate-stall-* = ledger+evt+badge, **fail-closed 확증**(§2-C 2차 증거 3종)에서만 push
          · gate-context/gate-feed = push 금지
          · 시스템 데드락(P3)·노드 사망 = push(엣지+쿨다운·디바운스)
+           ★0.14.56: 시스템 데드락은 SHADOW 다 — 판정·대장 기록만 하고 라우팅하지 않는다(push·EVT·badge 0 ·
+             CEO 4eeea43f Part B · `Gate._deadlock_shadow`). 아래 표의 deadlock 행은 enable 을 위해 남긴다.
   층3  발화 정밀화: B4′ alias resolver(라벨→live role 접두 해소) · A3′ 엣지+쿨다운 +
        전달 상태머신(warn=at-most-once / critical=at-least-once, queue.delivered 영수증) ·
        A6′ seen-store(1키 1파일·O_EXCL·TTL·GC) · B7 레인 분리 + foreign-daemon 가드.
@@ -121,6 +123,10 @@ EDGE_COOLDOWN_SECS = 7200            # idle 엣지 재발화 상한 = 1회/2h/ro
 DEADLOCK_COOLDOWN_SECS = 7200        # P3 시스템 데드락 push 쿨다운(설계 층2 표: 엣지+쿨다운 2h)
 DEATH_DEBOUNCE_SECS = 300            # 노드 사망 push 디바운스(설계 층2 표: 5분)
 DEADLOCK_IDLE_SECS = 1800            # P3: 미배정 티켓 미checkout·set-status age 임계(30분)
+# ★0.14.56 D-b: 티켓 루트 공표 대장(쓰는 쪽 javis_task 가 `<pack>/state/` 에 쓴다 · 이름은 그쪽 TASK_ROOTS_FILE 과 같다)
+#   과 명시 운영 오버라이드 이름(우선순위 순 — 종전 Runner 가 읽던 세 이름 그대로).
+TASK_ROOTS_FILE = "task-roots.json"
+TASK_ROOT_OVERRIDE_KEYS = ("JAVIS_TASK_ROOT", "CYS_TASK_ROOT", "JAVIS_ROOT")
 SETSTATUS_STALE_SECS = 900           # §2-C 2차 증거 ②: set-status age > 15분
 SEEN_TTL_SECS = 1800                 # A6′ seen-store TTL(=critical 재enqueue 상한 = TTL당 1)
 # ★성찰 R4 N8 — **재시도 억제 TTL** 과 **미완료 사건의 ID 보존**은 다른 축이다.
@@ -169,7 +175,7 @@ CH_LEDGER, CH_EVT, CH_BADGE, CH_PUSH = "ledger", "evt", "badge", "push"
 #   trigger → (severity, channels). `_route_warn` 은 이 필드만 집행한다.
 #   push 는 **예외적 승격**이고, 승격 자격은 아래 네 갈래뿐이다:
 #     · stall_confirmed  §2-C fail-closed 확증(2차 증거 3종 전부 성립)
-#     · deadlock         §2 층2 P3 술어(last_output 완전 배제)
+#     · deadlock         §2 층2 P3 술어(last_output 완전 배제) — ★0.14.56 SHADOW: 이 행은 라우팅되지 않는다
 #     · death            데몬 deadman 이벤트 소비(게이트 자체 중복 채널 제거)
 #     · master_idle      데몬 master.idle 소비의 **격상층만**(idle≥3×임계 — hung 의심 · G2 W3-C).
 #                        격상 미달 정보층은 warn 자체를 만들지 않으므로 이 표를 타지 않는다.
@@ -191,7 +197,7 @@ CHANNEL_POLICY = {
 
 # 수신 계층(설계 §2 층2): push 1차 수신자는 CSO다. "critical만 master 직송"은 **허가**이지
 # 의무가 아니다 — 어느 trigger 가 master 로 직송되는지는 아래 표(데이터)가 정한다.
-#   · deadlock         → CSO 1줄 push(층2 표 명문)
+#   · deadlock         → CSO 1줄 push(층2 표 명문) — ★0.14.56 SHADOW 동안은 라우팅되지 않는다(enable 대비 보존)
 #   · stall_confirmed  → CSO(2026-08-01 master 재정 ①)
 #   · death            → CSO(2026-08-01 master 재정 ①)
 #   ★2026-08-01 재정 ① — stall_confirmed·death 의 종전 `master` 직송을 **cso** 로 되돌린다.
@@ -1457,6 +1463,50 @@ def build_deadlock_warning(report, tasks, now_epoch):
     }), "deadlock_yes"
 
 
+def split_by_scope(rows, scope):
+    """B-3 레인 귀속 — `(attributed, unattributed, foreign)`. scope 키가 없는(0.14.56 이전) 행은 unattributed 로
+    **세기만** 하고 판정에 넣지 않는다 — 여러 레인이 쓰는 루트에서 그 행으로 울리면 남의 레인 CSO 를 깨운다.
+    scope None(레거시 단일 출처 러너)은 종전대로 전 행 attributed."""
+    rows = [t for t in (rows or []) if isinstance(t, dict)]
+    if scope is None:
+        return rows, [], []
+    att, una, fgn = [], [], []
+    for t in rows:
+        s = t.get("scope")
+        if s is None or s == "":
+            una.append(t)
+        elif s == scope:
+            att.append(t)
+        else:
+            fgn.append(t)
+    return att, una, fgn
+
+
+def deadlock_positive_control(now_epoch):
+    """D-c — 술어가 심어 둔 성립 조건에서 **매 주기** 울리는가 `(fired, reason)`. 순수 계산(메모리 안)이고 결과
+    warn 은 버린다 — 라우팅되지 않으므로 큐 트래픽 0 이다. 울리지 않으면 그 주기의 판정은 INSTRUMENT-FAIL 이다."""
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S+0000", time.gmtime(now_epoch - 4 * DEADLOCK_IDLE_SECS))
+    tickets = [{"id": "PC-0", "status": "todo", "owner": None, "created_at": ts, "updated_at": ts}]
+    rep = {"role_measurements": [{"role": "control", "surface_id": 1, "created_at": 1, "idle_secs": 0,
+                                  "status_age_secs": 4 * DEADLOCK_IDLE_SECS}]}
+    try:
+        warn, reason = build_deadlock_warning(rep, tickets, now_epoch)
+    except Exception as e:                      # noqa: BLE001 — 대조군의 예외도 '울리지 않음'이다
+        return False, "control_raised:%s" % type(e).__name__
+    return (warn is not None and reason == "deadlock_yes"), reason
+
+
+def shadow_verdict(reason):
+    """술어 사유 → shadow 판정 enum(would_fire | no | unmeasured | instrument_fail)."""
+    if reason == "deadlock_yes":
+        return "would_fire"
+    if str(reason).startswith("deadlock_no:"):
+        return "no"
+    if str(reason).startswith("deadlock_unmeasured:"):
+        return "unmeasured"
+    return "instrument_fail"
+
+
 def build_death_warnings(events):
     """노드 사망 — **데몬 deadman 이벤트 소비**(설계 §2 층2: 중복 채널 제거).
 
@@ -1584,10 +1634,15 @@ class Runner:
         # CYS_SOCKET 부재 = 기본 소켓(본사 데몬 기준 정상). 별도 설정 없이 그대로 상속.
         self.wk_env = dict(os.environ, JAVIS_ROOT=state_dir)
         # 티켓 원장 루트는 wakeup 큐 루트와 **다르다**(티켓은 워크스페이스 자산이다).
-        # schedule.json 의 learn 잡 관례와 동형: `JAVIS_ROOT="${JAVIS_ROOT:-$HOME/.cys/state}"`.
-        self.task_root = (os.environ.get("JAVIS_TASK_ROOT") or os.environ.get("CYS_TASK_ROOT")
-                          or os.environ.get("JAVIS_ROOT")
-                          or os.path.join(os.path.expanduser("~"), ".cys", "state"))
+        # ★0.14.56 D-b — 기본 루트는 이제 **쓰는 쪽이 공표한 대장**(`<pack>/state/task-roots.json`)이다.
+        #   종전 기본값 `~/.cys/state` 를 지웠다 — 그것이 결함이었다(실측: 실 루트 9개 중 0개를 덮었고, 없는 루트는
+        #   `javis_task list` 가 rc 0 `[]` 로 답해 깨끗한 0 으로 읽혔다). 아래 세 이름은 **명시 운영 오버라이드**로만
+        #   남고, 쓰면 그 이름이 대장 기록(source=override:<NAME>)에 실린다 — 조용한 기본값이 아니다.
+        self.task_override = next(((k, os.environ[k]) for k in TASK_ROOT_OVERRIDE_KEYS
+                                   if os.environ.get(k)), None)
+        self.task_root = self.task_override[1] if self.task_override else None
+        #   이 게이트의 레인 = 팩 경로 basename(javis_task._pack_scope · javis_report.my_scope 와 같은 규칙).
+        self.scope = os.path.basename(os.path.dirname(os.path.abspath(pack_bin)))
 
     def collect_report(self):
         """(ok, report_dict|None, err|None) — javis_report.py --json subprocess."""
@@ -1741,12 +1796,54 @@ class Runner:
             latest = max(latest, ack_latest)
         return True, events, latest
 
+    def task_roots(self):
+        """D-b — `(source, [tasks_dir…] | None, err)`. 기본 출처는 쓰는 쪽 대장 하나뿐이다.
+
+        오버라이드(세 이름 중 첫 번째)가 있으면 그 하나만 읽는다(source=`override:<NAME>`). 대장이 없거나 읽히지
+        않으면 루트 목록은 None 이고 err 가 사유다 — 호출자는 그것을 INSTRUMENT-FAIL 로 기록한다(D-d: 깨끗한 0 이
+        아니다)."""
+        if self.task_override:
+            name, v = self.task_override
+            return "override:%s" % name, [os.path.abspath(os.path.join(v, "_round", "tasks"))], None
+        reg = os.path.join(os.path.dirname(os.path.abspath(self.pack_bin)), "state", TASK_ROOTS_FILE)
+        try:
+            with open(reg, encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return "registry", None, "registry_absent(%s)" % reg
+        except (OSError, ValueError) as e:
+            return "registry", None, "registry_unreadable(%s)" % type(e).__name__
+        roots = data.get("roots") if isinstance(data, dict) else None
+        if not isinstance(roots, dict):
+            return "registry", None, "registry_unreadable(shape)"
+        if not roots:
+            return "registry", None, "registry_empty"
+        return "registry", sorted(roots), None
+
+    def task_list(self, tasks_dir):
+        """D-d — 공표된 루트 하나를 읽는다 `(ok, rows|None, err)`. 없는 루트·읽을 수 없는 루트는 err 다 — `javis_task
+        list` 는 없는 루트에 rc 0 `[]` 를 내므로(깨끗한 0 으로 위장) 그 전에 여기서 가른다."""
+        if not os.path.isdir(tasks_dir):
+            return False, None, "root_absent"
+        if not os.access(tasks_dir, os.R_OK | os.X_OK):
+            return False, None, "root_unreadable"
+        parent = os.path.dirname(tasks_dir)
+        if os.path.basename(tasks_dir) != "tasks" or os.path.basename(parent) != "_round":
+            return False, None, "root_shape"
+        return self._task_list_at(os.path.dirname(parent))
+
     def task_snapshot(self):
-        """(ok, rows|None, err) — javis_task.py list(전건 JSON). P3 데드락 술어의 원장 증거."""
+        """(ok, rows|None, err) — 오버라이드 루트 하나의 javis_task.py list(레거시 표면 — 외부 대역·호출자 호환).
+        게이트는 `task_roots`·`task_list` 를 쓴다. 오버라이드가 없으면 읽을 루트가 없다(기본값 `~/.cys/state` 제거)."""
+        if self.task_root is None:
+            return False, None, "no_override_root"
+        return self._task_list_at(self.task_root)
+
+    def _task_list_at(self, root):
         script = os.path.join(self.pack_bin, "javis_task.py")
         if not os.path.isfile(script):
             return False, None, "javis_task.py 부재"
-        env = dict(os.environ, JAVIS_ROOT=self.task_root)
+        env = dict(os.environ, JAVIS_ROOT=root)
         try:
             r = subprocess.run([sys.executable, script, "list"],
                                capture_output=True, text=True, timeout=self.timeout, env=env)
@@ -2015,6 +2112,63 @@ class Gate:
         except Exception as e:                  # noqa: BLE001
             return False, None, str(e)[:60]
 
+    def _deadlock_shadow(self, report, now_epoch):
+        """0.14.56 SHADOW(CEO 4eeea43f Part B) — `(records, summary_reasons)`. ⛔ warn 을 만들지 않는다.
+
+        레코드 1건 = 출처×루트 1쌍 + 대조군 1건: `{source, root, verdict, reason, attributed, unattributed, foreign}`.
+        B-2: 판정만이 아니라 **멈춘 사유**를 쌍마다 싣는다(사유 없는 0 이 고치려는 결함 자체다).
+        D-d: 출처·루트를 읽지 못하면 instrument_fail 이지 no 가 아니다. D-c: 대조군이 울리지 않으면 그 주기의 모든
+        루트가 instrument_fail 이고, 루트 자신의 멈춘 사유는 `|` 뒤에 남는다."""
+        ctl_ok, ctl_reason = deadlock_positive_control(now_epoch)
+        records = [{"source": "control", "root": "<control>",
+                    "verdict": "control_fired" if ctl_ok else "instrument_fail",
+                    "reason": ctl_reason if ctl_ok else "deadlock_instrument_fail:control(%s)" % ctl_reason,
+                    "attributed": 1, "unattributed": 0, "foreign": 0}]
+        scope = getattr(self.runner, "scope", None)
+        roots_fn = getattr(self.runner, "task_roots", None)
+        list_fn = getattr(self.runner, "task_list", None)
+        sources = []                            # (source, root, ok, rows, err)
+        if roots_fn is None or list_fn is None:
+            #   레거시 러너(task_snapshot 만 가진 대역) — 종전 단일 출처, 레인 구분 없음.
+            ok, rows, err = self._tasks()
+            sources.append(("legacy:task_snapshot", None, ok, rows, err))
+            scope = None
+        else:
+            try:
+                src, roots, err = roots_fn()
+            except Exception as e:              # noqa: BLE001 — 관측 실패는 INSTRUMENT-FAIL 로 보인다
+                src, roots, err = "registry", None, "task_roots_raised:%s" % type(e).__name__
+            if roots is None:
+                sources.append((src, None, False, None, err))
+            for root in roots or []:
+                try:
+                    ok, rows, lerr = list_fn(root)
+                except Exception as e:          # noqa: BLE001
+                    ok, rows, lerr = False, None, "task_list_raised:%s" % type(e).__name__
+                sources.append((src, root, ok, rows, lerr))
+        for src, root, ok, rows, err in sources:
+            rec = {"source": src, "root": root, "attributed": 0, "unattributed": 0, "foreign": 0}
+            if not ok:
+                rec.update(verdict="instrument_fail",
+                           reason="deadlock_instrument_fail:%s" % (err or "task")[:160])
+            else:
+                att, una, fgn = split_by_scope(rows, scope)
+                rec.update(attributed=len(att), unattributed=len(una), foreign=len(fgn))
+                _, reason = build_deadlock_warning(report, att, now_epoch)   # warn 객체는 버린다(라우팅 0)
+                rec.update(verdict=shadow_verdict(reason), reason=reason)
+                if not ctl_ok:
+                    rec.update(verdict="instrument_fail",
+                               reason="deadlock_instrument_fail:control|%s" % reason)
+            records.append(rec)
+        roots_only = records[1:]
+        count = {v: sum(1 for x in roots_only if x["verdict"] == v)
+                 for v in ("would_fire", "no", "unmeasured", "instrument_fail")}
+        summary = ["deadlock_shadow:would_fire=%(would_fire)d,no=%(no)d,unmeasured=%(unmeasured)d,"
+                   "instrument_fail=%(instrument_fail)d" % count]
+        if not ctl_ok:
+            summary.append("deadlock_instrument_fail:control")
+        return records, summary
+
     def _reconcile_inflight(self, counters, now_epoch):
         """지난 실행의 `inflight` 를 `queue.delivered` 영수증과 대조해 확정한다.
 
@@ -2216,12 +2370,10 @@ class Gate:
                 self._badge(b["key"], b["severity"], b["message"], b["detail"])
         else:
             reasons.append("deadman_poll_unavailable")
-        #   P3 시스템 데드락(last_output 완전 배제)
-        t_ok, tasks, t_err = self._tasks()
-        dl, dl_reason = build_deadlock_warning(report, tasks if t_ok else None, now_epoch)
-        reasons.append(dl_reason if t_ok else "deadlock_unmeasured:%s" % (t_err or "task")[:40])
-        if dl is not None:
-            warns.append(dl)
+        #   P3 시스템 데드락(last_output 완전 배제) — ★0.14.56 SHADOW(CEO 4eeea43f Part B): 출처×루트마다 판정과
+        #   멈춘 사유를 대장에만 남긴다. ⛔ warns 에 넣지 않는다 → push·EVT·badge·enqueue 0(paging enable 은 별도 결정).
+        deadlock_shadow, dl_summary = self._deadlock_shadow(report, now_epoch)
+        reasons += dl_summary
 
         #   조건 해소 → push 엣지 재무장. 이번 주기에 나타나지 않은 push 키는 에피소드가 끝난
         #   것이므로 무장을 되돌린다(엣지의 정의). 되돌리지 않으면 쿨다운 0인 트리거가 영구
@@ -2301,6 +2453,7 @@ class Gate:
                                        "pushes": self._push_log,
                                        "measure_source": report.get("measure_source"),
                                        "sampled_at": report.get("sampled_at"),
+                                       "deadlock_shadow": deadlock_shadow,
                                        "shadow": shadow})
         self._summary(verdict, delivered, reasons + [w["reason"] for w in warns])
         return report
