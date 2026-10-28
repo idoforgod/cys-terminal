@@ -416,16 +416,23 @@ def live_roles(status):
     out = {}
     for s in status.get("surfaces", []):
         role = s.get("role")
-        if not role or s.get("exited"):
-            continue
-        if s.get("agent_alive"):
-            out[role] = True
-            continue
-        st = s.get("status") or {}
-        age = st.get("age_secs")
-        if isinstance(age, (int, float)) and age <= STATUS_FRESH_SECS and st.get("state"):
+        if role and row_alive(s):
             out[role] = True
     return out
+
+
+def row_alive(s):
+    """한 surface 행의 생존 술어 — `live_roles` 와 task-prompt 의 수신 surface 게이트(0.14.56 #6-b)가 함께 쓴다.
+    살아 있다 = 종료되지 않았고(exited 아님) agent_alive 이거나 set-status 자기보고가 신선하다
+    (age<=STATUS_FRESH_SECS·state 존재). 술어를 한 곳에 두는 이유: 역할 단위와 행 단위가 다른 기준으로
+    '살아 있음'을 판정하면 같은 좌석이 두 게이트에서 반대로 읽힌다."""
+    if s.get("exited"):
+        return False
+    if s.get("agent_alive"):
+        return True
+    st = s.get("status") or {}
+    age = st.get("age_secs")
+    return bool(isinstance(age, (int, float)) and age <= STATUS_FRESH_SECS and st.get("state"))
 
 
 def _quiet_alive_roles(status, roles):
@@ -1704,112 +1711,19 @@ def resolve_manifest_phase(manifest, phase_id):
         return None, []
 
 
-# ── todo 선언 블록 v1 (설계 DESIGN_declared-state.md §4-1 · 생산자 P3) ──────────────
-# 유령 todo 사고의 근저원인은 소비자가 파일명·경로·mtime으로 소유권을 **추론**한 것이다.
-# 추론을 없애려면 파일 자신이 소유를 **선언**해야 한다. 그런데 선언을 워커 손기재에 맡기면
-# 실측상 오작성 6종 중 5종(따옴표·값 공백·키 누락·대문자 키·후행 주석)이 미선언으로 떨어진다
-# — 그래서 티켓 발부 시점에 **완성된 한 줄**을 기계 생성해 동봉한다(손기동 자체를 줄인다).
-DECL_VALUE_BAD_RE = re.compile(r"[^A-Za-z0-9._:-]+")
-DECL_VALUE_OK_RE = re.compile(r"^[A-Za-z0-9._:-]+$")
-
-# 파서는 단일 구현이다(재구현 금지 — ADR-2 2언어 파리티 계약의 Python 측). 생성한 선언을
-# 파서에 되먹여 `counted`가 나오는지 확인하는 것이 유일한 계약 준수 증명이다.
-# ⚠팩 부분갱신 스큐(ADR-2)로 파서가 없을 수도 있다 — 그때는 왕복 검증만 생략하고 문법 검사는
-#   그대로 유지한다(여기서 예외를 던지면 팩 스큐 한 번에 위임 전체가 죽는다).
-try:
-    import javis_todo_decl as _decl                                       # noqa: E402
-except Exception:                                                         # pragma: no cover
-    _decl = None
+# ── todo 경로·선언은 수신 좌석이 산출한다 (0.14.56 #6-a) ─────────────────────────
+# 종전(W14 S14)에는 발부자가 `--to` 역할에서 파일명을 만들고 자기 팩의 절대경로와 선언 한 줄을 티켓에
+# 박았다. `--to`(기본 `worker`)와 실제 수신 좌석이 다르면(번호 붙은 워커 · Control Center 의
+# `worker-fresh-<epoch>` 일회용 좌석 · 다른 레인의 좌석) 수신자는 **남의 파일**에 쓰라는 지시를 받았고,
+# 두 번째 선언이 들어간 그 파일은 미선언으로 떨어졌다. 이제 티켓은 파일을 이름 붙이지 않는다 —
+# 수신 좌석이 `cys todo-path`(자기 surface 의 역할 · 자기 팩 · 같은 명명 규칙, src/bin/cys.rs)로 경로를,
+# `cys todo-path --emit-decl` 로 선언을 받는다. S14 불변식(경로와 선언 scope 는 같은 바인딩에서 나온다)은
+# 더 강하게 남는다: 둘 다 수신 좌석의 한 생산자가 만들므로 발부자·수신자 사이의 이원 바인딩이 없다.
+# 선언을 손기재에 맡기지 않는다는 원래 이유도 그대로다 — 생산자가 기계 생성한다(G4 위반은 그쪽에서
+# 시끄럽게 실패한다).
 
 
-def _pack_identity():
-    """팩 **경로**와 **정체성(scope)** 을 한 번의 조회로 **함께** 확정한다.
-
-    ★W14 S14 — 이것이 이 함수의 존재 이유다. 종전에는 티켓의 todo 경로가
-    `${CYS_PACK_DIR:-$HOME/.cys/pack}/round/…` 문자열이라 **워커 셸에서 늦게** 전개되고,
-    같은 티켓의 선언 `scope=`는 **master 프로세스에서 즉시** 확정됐다. 두 바인딩이 같다는
-    보증이 아무 데도 없었다. 실측 재현 — master가 `scope=pack`으로 발부한 티켓을 워커가
-    `pack-dept-dept-1` 팩에서 기록하면 소비자는 `excluded=[('worker','foreign-scope',0,2)]`,
-    `pending_outside=[]`(주인이 명시한 처분이라 면제) → **false QUIET → 세션 주차**다.
-    경로와 정체성은 **같은 시점·같은 값**에서 나와야 한다.
-    """
-    root = os.path.abspath(os.path.normpath(pack_dir()))
-    return root, os.path.basename(root)
-
-
-def decl_value_strict(raw):
-    """**정체성 값**(owner·scope) 검증 — 접지 않고, 폴백도 없다. 위반이면 `None`.
-
-    ★W14 S14 — 종전 `decl_value`는 허용 밖 문자를 `-`로 접고 남는 게 없으면 `"pack"`으로
-    폴백했다. 팩 basename이 G4 문자집합 밖(예: `자비스`)이면 scope가 통째로 `pack`이 되어
-    **그럴듯하지만 틀린 정체성**을 배포했다 — 그 선언을 받은 파일은 진짜 팩에서 `foreign-scope`
-    로 **조용히 배제**된다. 유령을 막으려던 장치가 살아있는 작업을 지우는 정확한 형태다.
-
-    같은 상황에서 스탬프 도구(`javis_todo_stamp.build_decl_line`)는 **정반대로** 시끄럽게
-    실패했다(`선언 생성 실패(bad-token: …)`). 두 생산자가 반대로 행동하는데 어느 쪽이 정본인지
-    계약이 없었고, master 심판은 **시끄러운 쪽**이다 — 추측한 정체성보다 없는 선언이 안전하다
-    (선언이 없으면 소비자가 `unclaimed`로 fail-open 보고한다 · ADR-3).
-    """
-    s = (raw or "").strip()
-    return s if DECL_VALUE_OK_RE.match(s) else None
-
-
-def decl_slug(raw):
-    """**진단 값**(lane) 전용 슬러그 — 여기서만 접는다. 정체성(owner·scope)에는 쓰지 마라.
-
-    lane은 판정에 쓰이지 않는 사람용 표식이라(설계 §4-1 필드 표) 접어도 오배제를 낳지 않는다.
-    남는 게 없으면 빈 문자열이고, 호출자는 그때 **키를 통째로 생략**한다(빈 값은 선언 전체를
-    무효화한다 — G4 값은 1글자 이상).
-    """
-    return DECL_VALUE_BAD_RE.sub("-", (raw or "").strip()).strip("-.:_")
-
-
-def todo_decl_line(to_role, task=None, today=None, scope=None):
-    """티켓에 동봉할 선언 한 줄(v1). 반환 = `(line, None)` 또는 **`(None, 사유)`**.
-
-    키 순서·필수 3종(owner·scope·status)은 설계 §4-1 고정. `scope`는 role 생존이 아니라
-    **팩 정체성**이다 — owner 노드가 죽어도 선언은 파일에 남아 미완 작업이 노드 수명과
-    분리된다. 값은 호출자가 `_pack_identity()`로 확정해 넘기며(경로와 **같은 바인딩**),
-    생략 시 여기서 같은 함수로 조회한다.
-
-    `lane`·`since`는 판정에 쓰지 않는 진단용이라, lane 슬러그가 비면 키를 통째로 생략한다.
-
-    ★실패는 시끄럽다(W14 S14). 정체성 값이 G4를 어기면 접거나 폴백하지 않고 사유를 돌려준다.
-    ★생성물은 **파서에 되먹여** 검증한다(스탬프 도구 `build_decl_line`과 같은 왕복 패턴) —
-      문법 검사식을 여기 다시 적으면 그중 하나는 반드시 뒤처지고, 뒤처진 쪽이 소비자와 갈린다.
-    """
-    if scope is None:
-        _, scope = _pack_identity()
-    owner_v = decl_value_strict(to_role)
-    scope_v = decl_value_strict(scope)
-    if owner_v is None or scope_v is None:
-        bad = "owner=%r" % to_role if owner_v is None else "scope=%r" % scope
-        return None, ("선언 값이 G4 문자집합(`[A-Za-z0-9._:-]+`)을 벗어난다: %s" % bad)
-
-    parts = ["owner=%s" % owner_v, "scope=%s" % scope_v]
-    lane = decl_slug(task)[:48].strip("-.:_")
-    if lane:
-        parts.append("lane=%s" % lane)
-    parts.append("status=active")
-    parts.append("since=%s" % (today or time.strftime("%Y-%m-%d")))
-    line = "<!-- javis:todo v1 %s -->" % " ".join(parts)
-
-    if _decl is not None:                       # 파서 왕복 검증(계약 준수의 유일한 증명)
-        d, diag = _decl.parse(line + "\n")
-        if d is None:
-            return None, "선언 생성 실패(%s: %s)" % (getattr(diag, "code", "?"), diag)
-        if _decl.classify(d, scope_v, lambda s: True) != "counted":
-            return None, "선언 생성 실패(counted 미달)"
-    return line, None
-
-
-def todo_file_name(role):
-    """역할 → todo 파일명. 생산자 3곳(P1 `cys todo-path` · P2 cycle 저장검증 · P3 여기)이
-    **같은 규칙**을 쓴다: 대문자화 + 하이픈→언더스코어."""
-    return "%s_TODO.md" % role.upper().replace("-", "_")
-
-
-def build_task_ticket(task, scope, success, to_role, rules, output_format=None, prereq_block="", dont=None, tier_hint=None, probes=None, task_id=None):
+def build_task_ticket(task, scope, success, to_role, rules, output_format=None, prereq_block="", dont=None, tier_hint=None, probes=None, task_id=None, liveness_note=None):
     """위임 티켓 본문 생성. rules는 필수 — 호출자가 추출 성패를 알고 명시 주입한다
     (기본값 경유의 무경고 폴백 경로 제거 · self-test는 rules 주입으로 밀폐 검증).
     tier_hint(R2 1단계): 권장 실행 등급 정보 1줄(강제 아님·None이면 라인 부재 → byte-identical).
@@ -1818,10 +1732,14 @@ def build_task_ticket(task, scope, success, to_role, rules, output_format=None, 
     는 별개·보완 채널(E1=산출물 파일 `--evidence-artifact`, P3=`--evidence` 텍스트 증거범주·probe 영수증).
     task_id(#10 · PREP #10): 장부(`javis_task.py`) 태스크 id. 지정 시 E1·P3 블록의 `<id>`·`<task-id>`
     **플레이스홀더를 실 id 로 치환**하고 증거 경로도 그 id 로 확정한다. 미지정이면 종전 문안 그대로
-    (byte-identical 하위호환) — 대신 호출부(cmd_task_prompt)가 stderr 1줄로 그 사실을 고지한다."""
+    (byte-identical 하위호환) — 대신 호출부(cmd_task_prompt)가 stderr 1줄로 그 사실을 고지한다.
+    liveness_note(0.14.56 #6-b): 발부 시점에 수신 좌석 생존을 확인하지 못한 사유 1줄(교차 데몬 발부).
+    지정 시 머리 둘째 줄에 싣는다 — 수신자도 그 사실을 본다. None 이면 라인 부재 → byte-identical."""
     bullets = rules
     lines = []
     lines.append("[작업 위임 — 절대 강조 4규칙 포함 · work management 앵커]")
+    if liveness_note:
+        lines.append("⚠ %s" % liveness_note)
     lines.append("작업: %s" % task)
     lines.append("범위(이 파일/범위만 — 무관 파일·repo 배회 금지): %s" % scope)
     # do/don't 쌍: scope=손댈 것(양) · dont=절대 손대지 말 것(음의 경계). 4대 행동지침③ 외과적
@@ -1838,42 +1756,23 @@ def build_task_ticket(task, scope, success, to_role, rules, output_format=None, 
     lines.append("절대 강조 4규칙 (WORKER_DIRECTIVE §3 — 모든 작업에 적용·위반 금지):")
     lines.extend("  " + b for b in bullets)
     lines.append("")
-    # ★W14 S14 — 경로와 선언 `scope`를 **같은 시점·같은 조회**에서 확정한다.
-    #
-    # 종전에는 경로가 `${CYS_PACK_DIR:-$HOME/.cys/pack}/round/…` 문자열이라 **워커 셸에서 늦게**
-    # 전개되고 선언 scope는 **master 프로세스에서 즉시** 확정됐다. 두 바인딩이 같다는 보증이
-    # 없었고, 갈리면 워커가 만든 파일이 자기 팩에서 `foreign-scope`로 **조용히 배제**된다
-    # (실측: excluded=[('worker','foreign-scope',0,2)] · pending_outside=[] → false QUIET → park).
-    # 지금은 master가 확정한 **절대경로**를 티켓에 박는다 — 발부자와 수행자가 같은 팩을 가리킨다.
-    pack_root, scope_id = _pack_identity()
-    todo_path = os.path.join(pack_root, "round", todo_file_name(to_role))
-    lines.append("todo 영속: 이 작업을 \"%s\"에 "
-                 "분해하고 세부 완료마다 체크박스를 갱신하라(진행%% 집계 원천). "
-                 "경로는 발부 시점에 확정된 절대경로다 — 다른 팩에 만들면 집계에서 배제된다."
-                 % todo_path)
-    # ★todo 선언(설계 §4-1) — 집계기는 파일명·경로·mtime이 아니라 이 선언으로 귀속을 판정한다.
-    # 위치 계약(첫 체크박스 이전)은 협상 대상이 아니다: 체크박스 뒤의 선언을 인정하면 본문에
-    # 적힌 문구가 스스로를 무효화하는 자해 경로가 열린다(A2 회귀).
-    decl, why = todo_decl_line(to_role, task, scope=scope_id)
-    if decl is not None:
-        lines.append("todo 선언(위 파일을 새로 만들 때 **첫 체크박스보다 위**, 머리말 첫 줄에 아래 한 줄을 "
-                     "그대로 복사하라 — 집계기는 파일명이 아니라 이 선언으로 소유·귀속을 판정한다. "
-                     "따옴표 추가·값에 공백·키 대문자화는 전부 '미선언'으로 떨어지니 한 글자도 고치지 마라. "
-                     "이미 선언이 있는 파일이면 다시 넣지 마라 — 선언이 2개면 모호성으로 미선언 처리된다. "
-                     "레인·스테이지가 끝나면 `status=active`를 `status=retired`로 바꿔 은퇴를 선언하라):")
-        lines.append("  %s" % decl)
-    else:
-        # ★실패는 시끄럽다(S14). 접어서 그럴듯한 정체성(`scope=pack`)을 배포하지 않는다 —
-        # 틀린 정체성은 살아있는 파일을 남의 레인으로 **조용히** 배제시키고, 그 배제는 QUIET
-        # 불변식의 면제 대상이라 마지막 방어선조차 통과한다. 선언이 아예 없으면 소비자는
-        # `unclaimed`로 fail-open 보고한다(ADR-3) = 시끄럽지만 안전한 쪽이다.
-        sys.stderr.write("javis_orchestra: todo 선언을 생성하지 못했다 — %s "
-                         "(role=%s scope=%s)\n" % (why, to_role, scope_id))
-        lines.append("todo 선언: **생성 실패** — %s. 선언 없이 파일을 만들어라(집계기가 "
-                     "`unclaimed`(미선언)로 시끄럽게 보고한다). 임의로 값을 고쳐 넣지 마라 — "
-                     "틀린 `scope`는 이 파일을 '남의 레인'으로 **조용히** 배제시켜 진행률에서 "
-                     "사라지게 만든다. 팩 이름을 G4 문자집합(`[A-Za-z0-9._:-]+`)으로 바로잡은 뒤 "
-                     "`cys todo-path --emit-decl`로 다시 받아라." % why)
+    # ★0.14.56 #6-a — todo 경로와 선언은 **수신 좌석**의 `cys todo-path` 가 산출한다(파일 머리의 계약 주석).
+    #   발부자는 파일을 이름 붙이지 않는다: `to_role` 은 수신 좌석의 실제 역할과 다를 수 있고(기본 `worker`),
+    #   발부자의 팩은 수신 좌석의 팩과 다를 수 있다(레인을 건너는 발부). 그래서 이 블록은 수신자와 무관하게
+    #   바이트 동일하다 — 두 워커가 같은 지시를 받고 각자 자기 파일을 얻는다.
+    lines.append("todo 영속: 이 작업을 **`cys todo-path`** 가 출력하는 경로에 분해하고 세부 완료마다 "
+                 "체크박스를 갱신하라(진행% 집계 원천). 그 경로는 발부자가 아니라 **네 좌석**이 산출한다 — "
+                 "데몬에 등록된 네 역할의 파일이 네 팩에 있고, 없으면 선언 한 줄과 함께 만들어진다. "
+                 "티켓이나 다른 좌석이 가리키는 파일에 쓰지 마라(같은 레인의 다른 좌석 파일과 충돌한다). "
+                 "`cys todo-path` 가 실패하면 파일을 손으로 만들지 말고 master 에 보고하라.")
+    # 위치 계약(첫 체크박스 이전)은 협상 대상이 아니다: 체크박스 뒤의 선언을 인정하면 본문에 적힌 문구가
+    # 스스로를 무효화하는 자해 경로가 열린다(A2 회귀). 선언 한 줄은 생산자가 기계 생성한다(손기재 금지).
+    lines.append("todo 선언: 그 파일 머리말에 javis:todo 선언이 없으면 `cys todo-path --emit-decl` 이 출력하는 "
+                 "한 줄을 그대로 **첫 체크박스보다 위**, 머리말 첫 줄에 넣어라 — 집계기는 파일명이 아니라 이 "
+                 "선언으로 소유·귀속을 판정한다. 손으로 쓰거나 고치지 마라(따옴표 추가·값에 공백·키 대문자화는 "
+                 "전부 '미선언'으로 떨어진다). 이미 선언이 있는 파일이면 다시 넣지 마라 — 선언이 2개면 모호성으로 "
+                 "미선언 처리된다. 레인·스테이지가 끝나면 `status=active`를 `status=retired`로 바꿔 은퇴를 "
+                 "선언하라.")
     # ★D-14(2026-09-21 결정 · 코드 변경 0): `--queued` 회신 지시는 배포본 REVIEWER_DIRECTIVE:18-22 ·
     #   WORKER_DIRECTIVE:136-139 와 정합한다 — 회신 소실의 실제 의존성은 D-04 가 아니라 D-01(master
     #   좌석 큐 기아)이며, D-01 해소 후 무조치(설계 정본 §5 D-14). soul.md 5항(오너 로컬본)은 별도 규범 결정.
@@ -1926,7 +1825,7 @@ def build_task_ticket(task, scope, success, to_role, rules, output_format=None, 
 
 
 def cmd_task_prompt(args):
-    # 역할명은 kebab-case만 — 오류 메시지·todo 파일명에 그대로 보간되므로 위생 처리(주입 차단).
+    # 역할명은 kebab-case만 — 오류 메시지·launch 안내 명령에 그대로 보간되므로 위생 처리(주입 차단).
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", args.to):
         print("[task-prompt] --to 역할명은 kebab-case(a-z0-9-)만 허용: %r" % args.to,
               file=sys.stderr)
@@ -1936,31 +1835,68 @@ def cmd_task_prompt(args):
     # ★일회용(fresh) 경로 예외(D5/B2): --no-survival-gate면 생략한다 — 워커 surface는 실행 시점에
     #   schedule --fresh가 worker-fresh-*로 생성(+디렉티브 주입)하므로 지금 생존 확인은 의미가 없다.
     #   (raw pane 주입이 아니라 디렉티브 주입 워커이므로 무계약·치명 결함 위험 없음.)
+    # ★0.14.56 #6-b — 생존 게이트는 **티켓이 실제로 갈 surface** 를 잰다. 종전에는 `--to` 역할을 가진 아무 산
+    #   좌석이나 보면 통과했다(수신 surface 는 입력조차 아니었다 — CEO 실측: surface:133 으로 보내는 중에 stderr 가
+    #   `worker`(s126)를 보고했다). `--surface N` 이면 그 행을 `row_alive`(live_roles 와 같은 술어)로 재고, 이 데몬에
+    #   그 행이 없으면 레인을 건너는 발부로 보고 **거부하지 않되** UNVERIFIED 를 stderr 와 티켓 머리에 함께 적는다
+    #   (조용히 통과시키지 않는다). 역할만 주면 그 역할의 산 좌석이 둘 이상일 때 어느 좌석인지 모르므로 거부한다.
+    sid = None
+    surface = getattr(args, "surface", None)
+    if surface is not None:
+        m_sf = re.fullmatch(r"(?:surface:)?([0-9]+)", surface)
+        if not m_sf:
+            print("[task-prompt] --surface 는 N 또는 surface:N 만 허용: %r" % surface, file=sys.stderr)
+            return 2
+        sid = int(m_sf.group(1))
+    liveness_note = None
     if not getattr(args, "no_survival_gate", False):
         status = cys_status()
         if status is None:
             print("[task-prompt] cys status 수집 실패(데몬 미가동?) — `cys ping` 확인 후 재실행. "
                   "대상 생존 미확인 상태로는 티켓을 내지 않는다.", file=sys.stderr)
             return 2
-        if not live_roles(status).get(args.to):
-            print("[task-prompt] 대상 '%s' 미기동 — 티켓 미출력. `cys boot`(4종 의무 기동) 또는 "
-                  "`cys launch-agent --role %s --agent claude`로 기동 후 재실행하라."
-                  % (args.to, args.to), file=sys.stderr)
-            return 1
+        surfaces = status.get("surfaces", [])
+        target = None
+        if sid is not None:
+            rows = [s for s in surfaces if s.get("surface_id") == sid]
+            if not rows:
+                liveness_note = "liveness UNVERIFIED (recipient not on this daemon)"
+                print("[task-prompt] surface:%d — %s: 이 데몬의 status 에 그 surface 가 없다. 거부하지 "
+                      "않고 티켓 머리에 같은 줄을 싣는다." % (sid, liveness_note), file=sys.stderr)
+            elif not any(row_alive(s) for s in rows):
+                print("[task-prompt] 수신 surface:%d('%s') 미기동 — 티켓 미출력. 같은 역할의 다른 좌석이 살아 "
+                      "있어도 그 좌석은 이 티켓의 수신자가 아니다." % (sid, rows[0].get("role") or "?"),
+                      file=sys.stderr)
+                return 1
+            else:
+                target = next(s for s in rows if row_alive(s))
+        else:
+            alive = [s for s in surfaces if s.get("role") == args.to and row_alive(s)]
+            if not alive:
+                print("[task-prompt] 대상 '%s' 미기동 — 티켓 미출력. `cys boot`(4종 의무 기동) 또는 "
+                      "`cys launch-agent --role %s --agent claude`로 기동 후 재실행하라."
+                      % (args.to, args.to), file=sys.stderr)
+                return 1
+            if len(alive) > 1:
+                print("[task-prompt] 역할 '%s' 의 산 좌석이 %d개(%s) — 어느 좌석이 수신자인지 모른다. 티켓 미출력. "
+                      "`--surface N` 으로 수신 좌석을 지정하라."
+                      % (args.to, len(alive), ", ".join("surface:%s" % s.get("surface_id") for s in alive)),
+                      file=sys.stderr)
+                return 1
+            target = alive[0]
         # '정상 작동' 보조 신호: 장기 idle(기본 5분 — CYS_IDLE_SECONDS와 동기)은 hang일 수
         # 있다 — 차단은 아니고 경고만(지시 대기 중인 워커도 idle이므로 alive가 결정 기준,
-        # idle은 §5 능동 점검 트리거). 같은 role의 죽은 stale surface는 건너뛴다.
+        # idle은 §5 능동 점검 트리거). 경고는 수신 좌석 **그 행**의 idle 을 읽는다.
         try:
             idle_thr = int(os.environ.get("CYS_IDLE_SECONDS", "300"))
         except ValueError:
             idle_thr = 300
-        for s in status.get("surfaces", []):
-            if s.get("role") == args.to and s.get("agent_alive"):
-                idle = s.get("idle_secs")
-                if isinstance(idle, (int, float)) and idle >= idle_thr:
-                    print("[task-prompt] 주의: '%s' idle %d초 — hang 여부를 read-screen으로 "
-                          "확인 후 전송하라(§5 능동 점검)." % (args.to, int(idle)), file=sys.stderr)
-                break
+        if target is not None and target.get("agent_alive"):
+            idle = target.get("idle_secs")
+            if isinstance(idle, (int, float)) and idle >= idle_thr:
+                print("[task-prompt] 주의: surface:%s('%s') idle %d초 — hang 여부를 read-screen으로 "
+                      "확인 후 전송하라(§5 능동 점검)." % (target.get("surface_id"), target.get("role"), int(idle)),
+                      file=sys.stderr)
     rules = extract_worker_rules()
     if rules is None:
         print("[task-prompt] 경고: WORKER_DIRECTIVE '절대 강조 4규칙' 추출 실패 또는 "
@@ -1992,7 +1928,7 @@ def cmd_task_prompt(args):
                             prereq_block=prereq, dont=getattr(args, "dont", None),
                             tier_hint=getattr(args, "tier", None),
                             probes=_split_csv(getattr(args, "probes", None)),
-                            task_id=task_id))
+                            task_id=task_id, liveness_note=liveness_note))
     return 0
 
 
@@ -4839,16 +4775,12 @@ def cmd_self_test(args):
         # round-log 표 셀 새니타이즈: 파이프·개행이 제거된다
         assert _cell("a|b\nc") == "a/b c", "_cell 새니타이즈 오류"
         # task-prompt 티켓(밀폐 — rules 명시 주입, 설치본 디렉티브 상태와 무관):
-        # 절대 강조 4규칙·게이트·todo(pack 앵커)·보고 채널이 항상 포함된다
-        # ★W14 S14 — 종전 필수 토큰 `"${CYS_PACK_DIR"`는 **뺐다**. todo 경로를 워커 셸에서 늦게
-        #   전개되는 문자열로 두는 것이 바로 이번에 없앤 이원 바인딩이다(경로=워커 시점 /
-        #   선언 scope=master 시점 → foreign-scope 오배제 → false QUIET). pack 앵커 보장은
-        #   아래 S14 블록이 **발부 시점 절대경로**(`_pack_identity()` + WORKER_TODO.md)로
-        #   더 강하게 핀한다 — 토큰 존재 검사는 그 불변식과 정면으로 모순된다.
+        # 절대 강조 4규칙·게이트·todo(수신 좌석 생산자 `cys todo-path`)·보고 채널이 항상 포함된다
+        # ★0.14.56 #6-a — todo 경로·선언은 수신 좌석의 `cys todo-path` 가 산출한다(아래 블록이 핀한다).
         ticket = build_task_ticket("T", "S", "C", "worker", rules=FALLBACK_RULES)
         for must in ("절대 강조 4규칙", "품질 절대우선", "할루시네이션 방지",
                      "hallucination-guard", "grill-me", "요약·압축 절대 금지", "게이트",
-                     "성공 기준", "WORKER_TODO.md", "보고 채널",
+                     "성공 기준", "`cys todo-path`", "보고 채널",
                      "--queued", "완료 증거(E1 evidence-artifact 게이트", "--evidence-artifact",
                      "done 증거 게이트(P3)"):
             assert must in ticket, "task-prompt 티켓에 '%s' 누락" % must
@@ -4889,43 +4821,34 @@ def cmd_self_test(args):
         assert "성공 기준" not in build_task_ticket("T", "S", None, "worker",
                                                   rules=FALLBACK_RULES), \
             "success 미지정인데 성공 기준 라인 존재"
-        # todo 파일명은 역할명 대문자 변환(reviewer-gemini → REVIEWER_GEMINI_TODO.md)
-        assert "REVIEWER_GEMINI_TODO.md" in build_task_ticket(
-            "T", "S", None, "reviewer-gemini", rules=FALLBACK_RULES), "todo 파일명 역할 변환 오류"
-        # ★todo 선언 v1(설계 §4-1) — 티켓이 문법 위반 선언을 배포하면 파서가 전건 미선언으로
-        # 버려 배선 자체가 무의미해진다. 문법을 여기서 기계로 못박는다(손기재 오류 원천 차단).
-        decl, why = todo_decl_line("reviewer-gemini", "유령 todo 결함 수정 (ghost fix)")
-        assert decl is not None, "선언 생성 실패: %s" % why
-        m_decl = re.fullmatch(r"<!-- javis:todo (v\d+) (.+) -->", decl)
-        assert m_decl and m_decl.group(1) == "v1", "선언 접두·버전 토큰 형식 오류: %r" % decl
-        toks = dict(t.split("=", 1) for t in m_decl.group(2).split())
-        for k in ("owner", "scope", "status"):                      # G5 필수 키 3종
-            assert k in toks, "선언 필수 키 '%s' 누락: %r" % (k, decl)
-        for k, v in toks.items():                                   # G4 키·값 문법
-            assert re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", k), "선언 키 문법 위반: %r" % k
-            assert re.fullmatch(r"[A-Za-z0-9._:-]+", v), "선언 값 문법 위반: %s=%r" % (k, v)
-        assert toks["owner"] == "reviewer-gemini" and toks["status"] == "active", decl
-        assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", toks.get("since", "")), "since 날짜 형식 오류: %r" % decl
-        # lane은 한글·공백을 지운 슬러그(G4 위반 방지) — 남는 게 없으면 키 자체를 생략한다
-        assert toks.get("lane") == "todo-ghost-fix", "lane 슬러그 정규화 오류: %r" % decl
-        assert "lane=" not in todo_decl_line("worker", "유령 결함")[0], \
-            "슬러그가 빈 lane을 빈 값으로 배출(선언 전체 무효화 위험)"
-        # ★W14 S14 — 정체성 값은 **접지 않는다**. 팩 이름이 G4 밖이면 그럴듯한 폴백을
-        # 만들지 말고 시끄럽게 실패해야 한다(스탬프 도구와 같은 정책으로 수렴).
-        bad_line, bad_why = todo_decl_line("worker", "t", scope="자비스")
-        assert bad_line is None and bad_why, "G4 밖 scope를 조용히 접어 배포했다"
-        assert todo_decl_line("워커", "t", scope="pack")[0] is None, "G4 밖 owner를 접어 배포했다"
-        # 경로와 scope는 **같은 바인딩**에서 나온다 — 티켓의 todo 경로는 발부 시점 절대경로다.
-        _pk_root, _pk_scope = _pack_identity()
-        _tk = build_task_ticket("T", "S", None, "worker", rules=FALLBACK_RULES)
-        assert os.path.join(_pk_root, "round", "WORKER_TODO.md") in _tk, \
-            "티켓 todo 경로가 발부 시점 절대경로가 아니다(늦은 전개 = scope 이원 바인딩)"
-        assert "scope=%s" % _pk_scope in _tk, "티켓 선언 scope가 발부 시점 팩과 다르다"
-        assert "${CYS_PACK_DIR" not in _tk.split("todo 영속:")[1].split("\n")[0], \
-            "todo 경로가 여전히 워커 셸에서 늦게 전개된다(S14 재발)"
-        # 티켓 동봉 확인은 날짜 리터럴을 비교하지 않는다(자정 경계에서 since가 갈리는 위조 flake 방지)
-        assert "<!-- javis:todo v1 owner=worker scope=" in build_task_ticket(
-            "T", "S", None, "worker", rules=FALLBACK_RULES), "티켓에 todo 선언 한 줄 누락"
+        # ★0.14.56 #6-a (W14 S14 의 더 강한 형태) — 발부자는 todo 파일·선언·팩을 티켓에 싣지 않는다.
+        #   경로와 선언 scope 는 수신 좌석의 한 생산자(`cys todo-path`·`--emit-decl`)가 함께 만든다 —
+        #   발부자·수신자 사이의 이원 바인딩(S14 가 막던 foreign-scope 오배제의 원인)이 존재하지 않는다.
+        _blocks = []
+        for _role in ("worker", "worker-2", "reviewer-gemini", "worker-fresh-1"):
+            _tk = build_task_ticket("T", "S", None, _role, rules=FALLBACK_RULES)
+            _tl = _tk.splitlines()
+            _s = [k for k, ln in enumerate(_tl) if ln.startswith("todo 영속:")]
+            _e = [k for k, ln in enumerate(_tl) if ln.startswith("보고 채널:")]
+            assert len(_s) == 1 and len(_e) == 1 and _e[0] > _s[0], "todo 블록 경계 오류(%s)" % _role
+            _blk = "\n".join(_tl[_s[0]:_e[0]])
+            assert "`cys todo-path`" in _blk and "cys todo-path --emit-decl" in _blk, \
+                "todo 블록이 수신 좌석 생산자를 지시하지 않는다(%s)" % _role
+            assert "_TODO.md" not in _blk and "${CYS_PACK_DIR" not in _blk, \
+                "발부자가 todo 파일을 이름 붙였다(%s · 0.14.56 #6-a 회귀)" % _role
+            assert "<!-- javis:todo" not in _tk and "scope=" not in _tk, \
+                "발부자 선언이 티켓에 남았다(%s)" % _role
+            assert os.path.abspath(pack_dir()) not in _tk, "발부자 팩 경로가 티켓에 새었다(%s)" % _role
+            assert "첫 체크박스보다 위" in _blk and "status=retired" in _blk, "위치·은퇴 계약 누락(%s)" % _role
+            _blocks.append(_blk)
+        assert len(set(_blocks)) == 1, "todo 블록이 수신자 역할에 따라 달라졌다(발부자가 파일을 고른다)"
+        # ★0.14.56 #6-b — liveness_note 는 머리 둘째 줄에만 실리고, 없으면 byte-동일
+        _ln = build_task_ticket("T", "S", None, "worker", rules=FALLBACK_RULES,
+                                liveness_note="liveness UNVERIFIED (recipient not on this daemon)")
+        assert _ln.splitlines()[1] == "⚠ liveness UNVERIFIED (recipient not on this daemon)", \
+            "UNVERIFIED 줄이 티켓 머리에 없다"
+        assert build_task_ticket("T", "S", None, "worker", rules=FALLBACK_RULES, liveness_note=None) == \
+            build_task_ticket("T", "S", None, "worker", rules=FALLBACK_RULES), "liveness_note=None 이 byte-동일이 아니다"
         # 추출기(순수 함수) 배터리 — 합성 디렉티브 텍스트로 밀폐 검증:
         synth = ("# W\n\n## 7. ★절대 강조 4규칙 — x\n머리말.\n"
                  + "\n".join(FALLBACK_RULES) + "\n\n## 8. 다음\n- 무관\n")
@@ -5867,6 +5790,8 @@ def main():
     tp.add_argument("--scope", required=True, help="작업 대상 파일/범위")
     tp.add_argument("--success", default=None, help="성공 기준 (완료 보고의 검증 기준)")
     tp.add_argument("--to", default="worker", help="위임 대상 역할 (기본 worker)")
+    tp.add_argument("--surface", default=None,
+                    help="수신 surface(N 또는 surface:N) — 생존 게이트가 이 행을 잰다(0.14.56 #6-b). 이 데몬에 없으면 거부하지 않고 liveness UNVERIFIED 를 stderr·티켓 머리에 싣는다. 미지정이면 --to 역할로 재되, 그 역할의 산 좌석이 둘 이상이면 거부한다")
     tp.add_argument("--output-format", default=None,
                     help="산출 형식·구조 (W8 4-part output-format 슬롯 — 예: 'JSON {필드}', '마크다운 표', '보고서 PDF')")
     tp.add_argument("--requires-skills", default=None,
