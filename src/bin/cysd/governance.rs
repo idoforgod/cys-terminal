@@ -24450,7 +24450,28 @@ mod tests {
         *s.last_human_input.lock().unwrap() = None;
         let want_id = s.pending_queue.lock().unwrap().front().unwrap().id.clone();
         let (mut depth, mut starve) = (HashMap::new(), HashMap::new());
+        // ★C-17 observation (P8-DESIGN-R2 §4-2): on the prerequisite failure, print the hold reason the gate
+        //   recorded, the output generation before/after, the output age and the screen tail — separates
+        //   'the product correctly held for seat output' from 'the product wrongly held'. Silent when it passes.
+        let gen_before = s.output_gen.load(AtomicOrdering::Acquire);
+        let t_deliver = std::time::Instant::now();
         deliver_queued(&daemon, &mut depth, &mut starve, &mut HashMap::new());
+        if !s.pending_queue.lock().unwrap().is_empty() {
+            let gen_after = s.output_gen.load(AtomicOrdering::Acquire);
+            let blocked = s.queue_blocked.lock().unwrap().clone().map(|(r, _)| r);
+            let out_age_ms = s.last_output.lock().unwrap().elapsed().as_secs_f64() * 1000.0;
+            let tail: Vec<String> = {
+                let p = s.parser.lock().unwrap_or_else(|e| e.into_inner());
+                p.screen().contents().lines().filter(|l| !l.trim().is_empty()).map(String::from).collect()
+            };
+            let tail: Vec<&String> = tail.iter().rev().take(3).collect();
+            println!(
+                "B1-LEDGER-PREREQ queue_len={} blocked={blocked:?} gen_before={gen_before} gen_after={gen_after} \
+                 last_output_age_ms={out_age_ms:.3} deliver_call_ms={:.3} screen_tail_rev={tail:?}",
+                s.pending_queue.lock().unwrap().len(),
+                t_deliver.elapsed().as_secs_f64() * 1000.0,
+            );
+        }
         assert!(s.pending_queue.lock().unwrap().is_empty(), "배달 전제 미충족");
         let path = crate::delivery::ledger_path(&daemon.socket_path);
         let body = std::fs::read_to_string(&path).expect("배달 원장 파일");
