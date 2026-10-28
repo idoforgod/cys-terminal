@@ -577,11 +577,33 @@ fn s4_1_window_does_not_widen_under_repeated_no_progress_resumes() {
     let window = Duration::from_millis(crate::agent_write::PARTIAL_EXACT_RESUME_WINDOW_MS);
     for k in 1..=5u32 {
         let before = proof.admits.load(Ordering::Acquire);
-        let _ = crate::governance::queue_write_hold_block_at(&fx.daemon, &s, since + Duration::from_secs(4 * k as u64));
-        let what = format!("resumed attempt {k} settled (admits {before}, hold {:?})", s.queue_hold.lock().unwrap().as_ref().map(|h| (h.attempts, h.resuming, h.resume.is_some(), h.next_retry.map(|t| t.saturating_duration_since(since)))));
-        wait_until(&what, || {
-            proof.admits.load(Ordering::Acquire) == before + 1 && s.queue_hold.lock().unwrap().as_ref().is_some_and(|h| !h.resuming)
-        });
+        // ★(0.14.56) Attempt k is made at `since + 4k s`, or later if the hold's own backoff says so: `next_retry` is
+        //   computed from the writer's real clock at settlement, so a fixed injected schedule races real time (a writer
+        //   slower than the schedule's slack made attempt 2 a backoff skip - measured, S4-NEW-K1 10/10 before this line).
+        let next_retry = s.queue_hold.lock().unwrap().as_ref().unwrap().next_retry;
+        let at = next_retry.map_or(since + Duration::from_secs(4 * k as u64), |t| t.max(since + Duration::from_secs(4 * k as u64)));
+        let _ = crate::governance::queue_write_hold_block_at(&fx.daemon, &s, at);
+        let what = format!("resumed attempt {k} at since+{:?} (next_retry since+{:?}) settled (admits {before}, hold {:?})", at.saturating_duration_since(since), next_retry.map(|t| t.saturating_duration_since(since)), s.queue_hold.lock().unwrap().as_ref().map(|h| (h.attempts, h.resuming, h.resume.is_some(), h.next_retry.map(|t| t.saturating_duration_since(since)))));
+        // ★(0.14.56) The attempt is decided on THIS thread: `resuming` is set before the job is handed to the writer, and a
+        //   refusal leaves it false with `attempts` unmoved. So a refusal is visible now and no wait can settle it
+        //   (windows-health: a 10 s wait timed out on exactly that receipt, `(0, false, ..)`). Once handed off, settlement
+        //   is certain; the bound below is a hang guard, not a premise.
+        let (handed, resume) = {
+            let h = s.queue_hold.lock().unwrap();
+            let h = h.as_ref().unwrap();
+            (h.resuming || h.attempts == k, format!("{:?}", h.resume))
+        };
+        assert!(
+            handed,
+            "attempt {k}: the resume was refused before hand-off (candidate cause: backlog D5W-20261028-DSR-REPLY-COUNTED-AS-FOREIGN-WRITE; operands follow) - hold-time {resume}, now input_gen {} inject_track.wrote {} ({what})",
+            s.input_gen.load(Ordering::Acquire),
+            s.inject_track.wrote()
+        );
+        let end = Instant::now() + Duration::from_secs(120);
+        while !(proof.admits.load(Ordering::Acquire) == before + 1 && s.queue_hold.lock().unwrap().as_ref().is_some_and(|h| !h.resuming)) {
+            assert!(Instant::now() < end, "hang guard (120 s): {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
         let h = s.queue_hold.lock().unwrap();
         let h = h.as_ref().unwrap();
         assert_eq!(h.kind, QueueHoldKind::PartialExact);
@@ -593,14 +615,20 @@ fn s4_1_window_does_not_widen_under_repeated_no_progress_resumes() {
         assert_eq!(held_at(), first_held_at, "attempt {k}: the persisted hold age restarted");
     }
     // The backoff is real: right now and at 24 s (the fifth attempt backs off 30 s) no attempt is made.
+    // ★(0.14.56) Proven by the receipt, not by sleeping 200 ms: a hand-off sets `resuming` on this thread before any job
+    //   reaches the writer, and a settled one moves `attempts` - so a slow writer cannot hide an attempt.
+    let no_attempt = |msg: &str| {
+        let receipt = s.queue_hold.lock().unwrap().as_ref().map(|h| (h.resuming, h.attempts));
+        assert!(receipt.is_none_or(|(resuming, attempts)| !resuming && attempts == 5), "{msg} (hold receipt {receipt:?})");
+    };
     let before = proof.admits.load(Ordering::Acquire);
     let _ = crate::governance::queue_write_hold_block(&fx.daemon, &s);
     let _ = crate::governance::queue_write_hold_block_at(&fx.daemon, &s, since + Duration::from_secs(24));
-    std::thread::sleep(Duration::from_millis(200));
+    no_attempt("attempted inside the backoff");
     assert_eq!(proof.admits.load(Ordering::Acquire), before, "attempted inside the backoff");
     // Past the window: no attempt, one notice.
     let _ = crate::governance::queue_write_hold_block_at(&fx.daemon, &s, since + window + Duration::from_millis(1));
-    std::thread::sleep(Duration::from_millis(200));
+    no_attempt("attempted after the window");
     assert_eq!(proof.admits.load(Ordering::Acquire), before, "attempted after the window");
     assert_eq!(events(&fx, "queue.write_held").len(), 1, "one notice at expiry");
     assert!(events(&fx, "queue.delivered").is_empty());

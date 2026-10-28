@@ -25621,10 +25621,31 @@ mod tests {
         assert!(tracker.misses.is_empty());assert!(events_named(&daemon,"master.deadman").is_empty());
         // Stop ONLY this owned fixture child, then expose the shell-pid predicate independently
         // of the already-tested SurfaceExited predicate. Restore the flag before fixture teardown.
+        // ★(0.14.56) No wait on `exited`: its only production setter is the PTY reader on EOF, and EOF
+        //   does not follow the child's death while another process holds the terminal (Windows
+        //   `cmd.exe /C more` — `more` stays attached; windows-health 3/3 "fixture exit not observed").
+        //   Instead the reader is parked BEFORE EOF: it takes `parser` for every chunk and the deadman
+        //   tick never does, so holding it with one echoed chunk in flight keeps the reader from
+        //   writing `exited` while the test reaps the child itself and reads the verdict.
+        //   The gate is taken between chunks (`output_gen` even: the reader bumps it odd before a chunk
+        //   and even after it), so the chunk that turns it odd started after the gate and must wait
+        //   for `parser` — an unrelated chunk already in flight cannot fake or hide the park.
+        let end=Instant::now()+Duration::from_secs(30);
+        let gate=loop {
+            let g=s.parser.lock().unwrap_or_else(|e|e.into_inner());
+            if s.output_gen.load(AtomicOrdering::Acquire)%2==0 {break g;}
+            drop(g);
+            assert!(Instant::now()<end,"the reader never stood between chunks");
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        let gen=s.output_gen.load(AtomicOrdering::Acquire);
+        s.write_tx.send(crate::state::WriteReq::Data(b"x\n".to_vec())).unwrap();
+        while s.output_gen.load(AtomicOrdering::Acquire)==gen {
+            assert!(Instant::now()<end,"no PTY output after one written line: the reader is not parked");
+            std::thread::sleep(Duration::from_millis(5));
+        }
         s.child.lock().unwrap().kill().expect("owned fixture stop");
-        let end=Instant::now()+Duration::from_secs(5);
-        while !s.exited.load(AtomicOrdering::Relaxed) && Instant::now()<end {std::thread::sleep(Duration::from_millis(5));}
-        assert!(s.exited.load(AtomicOrdering::Relaxed),"fixture exit not observed");
+        s.child.lock().unwrap().wait().expect("owned fixture reap");
         assert!(!crate::state::pid_alive(s.pid),"fixture child not reaped");
         struct RestoreExit(Arc<crate::state::Surface>);
         impl Drop for RestoreExit {fn drop(&mut self){self.0.exited.store(true,AtomicOrdering::Relaxed);}}
@@ -25632,6 +25653,10 @@ mod tests {
         s.exited.store(false,AtomicOrdering::Relaxed);
         *s.agent_status.lock().unwrap()=Some(crate::state::AgentStatus{updated_at:now_epoch(),..fresh});
         for _ in 0..3 {check_role_deadman(&daemon,&mut tracker);}
+        // Exact witness: the reader (true only) is parked, the test's own store was false, RestoreExit
+        // runs later — so `false` here proves every tick above read `exited == false`.
+        assert!(!s.exited.load(AtomicOrdering::Relaxed),"the reader wrote `exited` inside the verdict window");
+        drop(gate);
         drop(restore);
         let events=events_named(&daemon,"master.deadman");assert_eq!(events.len(),1);
         assert_eq!(events[0]["payload"]["axis"],"shell_proc_dead");

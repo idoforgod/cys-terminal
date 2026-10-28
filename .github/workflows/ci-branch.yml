@@ -196,6 +196,10 @@ jobs:
                   "bash scripts/check-no-ioreport-link.sh target/debug/cysd":
                       "IOReport 강링크 **산출물** 게이트(otool -L) — 소스 핀(lib `e2_cysd_hwmon_source_has_no_ioreport_strong_link`)은 소스의 모양만 본다. 이 스텝이 지워지거나 `if: false` 가 "
                       "달리면 dlopen 지연 로딩으로 바꾼 E2 의 회귀(그 dylib 이 없는 맥에서 데몬이 main 에 닿기 전에 죽음 = 전 pane 사망)를 **산출물로** 잡는 자리가 브랜치에서 사라진다.",
+                  "python3 scripts/check_wallclock_premise.py":
+                      "0.14.56 SLEEP-PREMISE ratchet: a NEW test (or a changed one) whose verdict rests on a wall-clock premise "
+                      "(a sleep, a short deadline or a window) fails the branch. Without this run line the census's 332 grow unseen. "
+                      "The token is on the run line only, not in the step name (MAJOR-1 above).",
               },
               "release": {
                   "cd ui && bun test":
@@ -407,6 +411,15 @@ jobs:
                   "pack-release 는 팩만 서명·배송하며 이 도구를 실행할 일도 실을 일도 없어, "
                   "편입하면 오히려 근거 없는 목록이 된다(이 게이트 자신의 규율). "
                   "ci-branch = 브랜치 조기 경보 · release = 소비 직전 도구 증명의 2레인 편입.",
+              ),
+              "test_check_wallclock_premise": (
+                  {"ci-branch"},
+                  "scripts/tests/ suite (not a pack suite; 0.14.56 SLEEP-PREMISE-FIX). Controls for scripts/check_wallclock_premise.py: "
+                  "planted new premise tests turn it red; a guard shape, an annotated test and the real tree stay green; a stale baseline "
+                  "entry and a missing baseline are refused. The check reads repository test sources only and is not shipped (build.rs "
+                  "embeds cysjavis-pack only). ci-branch is the gate before a tag: pre-tag-ci-check.py requires a completed, successful "
+                  "ci-branch run at the tag SHA, and docs/RELEASE.md section 0-C makes that check mandatory (rc 0) - so a release or "
+                  "pack-release entry would only repeat the same verdict on the same SHA.",
               ),
           }
           # (2026-08-12 편입 완료: test_bootstrap_chain 을 3레인 전부에 배선 — 위계 폴백의 유일
@@ -1607,6 +1620,26 @@ jobs:
           f="scripts/tests/test_check_no_ioreport_link.py"
           [ -f "$f" ] || { echo "테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
           echo "== test_check_no_ioreport_link (mac) =="
+          python3 "$f"
+
+      # ★(0.14.56 · SLEEP-PREMISE-FIX) Wall-clock premise ratchet. scripts/check_wallclock_premise.py classifies every Rust
+      #   #[test] fn and Python test unit with the SLEEP-PREMISE census rules and fails on a premise test outside
+      #   scripts/wallclock-premise-baseline.txt (new or newly premised) and on a baseline entry that no longer is one (a ratchet:
+      #   the list only shrinks). A reviewed `wallclock: guard <reason>` comment on the deciding line accepts one test, and every
+      #   accepted one is printed and counted. Read-only stdlib Python, no build. ★No `if:` (a check that does not run is green).
+      - name: Wall-clock premise ratchet (new tests must not rest on a sleep or deadline · macOS)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/check_wallclock_premise.py
+
+      - name: Wall-clock premise ratchet controls (planted premises red · tree green · macOS)
+        shell: bash
+        run: |
+          set -euo pipefail
+          f="scripts/tests/test_check_wallclock_premise.py"
+          [ -f "$f" ] || { echo "test file missing: $f (git add?)" >&2; exit 1; }
+          echo "== test_check_wallclock_premise (mac) =="
           python3 "$f"
 
       # ★T6(v2 §12 이월 · merge3 CI 편입): cargo test --lib 완전 레인(macOS). 병합 엔진
