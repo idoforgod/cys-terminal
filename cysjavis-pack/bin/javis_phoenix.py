@@ -124,7 +124,8 @@ def restore_exit_code(result):
         return PHOENIX_EXIT_FAILED
     if verdict in ("UNVERIFIED", "DEGRADED"):
         return PHOENIX_EXIT_DEGRADED
-    # VERIFIED · VERIFIED_FRESH · NOOP · LEASE_HELD → 성공/무해(0)
+    # VERIFIED · VERIFIED_FRESH · VERIFIED_SEAT_ONLY(★D1) · NOOP · LEASE_HELD → 성공/무해(0)
+    #   ★미지의 판정이 여기로 떨어지는 것은 **catch-all** 이다 — 새 값은 위 목록에 이름으로 올린다.
     return PHOENIX_EXIT_OK
 
 # ★Phase 11: 독약 세션(unresumable) fresh-spawn fallback — DRILL_LIVE_4 §15 수리.
@@ -519,6 +520,165 @@ def f1_fresh_verify(rr, row, session_file_exists=None):
     if missing:
         return "unverified", " · ".join(missing), ev
     return "fresh", None, ev
+
+
+# ★D1(defect `D5H-20261028-PHOENIX-PIN-VERIFY-SAME-SOURCE`) — 재개(resume) 역할의 세션 검증.
+#   종전 결함: 기대 핀(`:2895` ← 로스터 병합 `:1650-1652`)과 관측 핀(`_topology_session_for` `:2326-2331`)이
+#   **같은 topology 의 같은 필드**라서 비교가 구조적으로 참이었다 — VERIFIED 가 독립 증거 없이 섰다.
+#   이제 관측은 **좌석 결속 신원**(`status --json`.surfaces[].registered_session_id — SessionStart 훅이 자기
+#   pane 안에서 `usage.register` 로 등록 · 매 등록 덮어씀)이고, 판정은 아래 합(conjunction)이다.
+RESUME_SEAT_BOUND_AGENTS = ("claude",)     # 데몬 계약: codex/gemini 좌석은 이 필드가 null(src/bin/cys.rs:1230)
+#   재관측이 바꿀 수 있는 사유만 되돌린다 — attribution 은 스폰 **전** 자료로 결정되므로 재관측 대상이 아니다.
+RESUME_REOBSERVABLE = ("observe", "compare", "file")
+
+
+def _flat_surface_refs(live_map):
+    """role→[surface…] 맵을 **전 키**(미claim `"-"` 포함 · exited 행 포함)의 surface_ref 평면 집합으로.
+    역할별로 읽으면 역할 재claim 이 '새 pane' 으로 보인다(`:1864` 가 role=null skip 을 P1-6 회귀로 적은 자리)."""
+    if not isinstance(live_map, dict):
+        return None
+    return {s.get("surface") for ss in live_map.values() for s in (ss or []) if isinstance(s, dict)
+            and s.get("surface")}
+
+
+def resumed_verify_outcome(rr, row, agent, entry=None, session_file_exists=None):
+    """재개 예상 역할의 verify 판정(순수 함수) → (outcome, missing_or_None, evidence).
+    outcome: 'verified'(독립 증거 있음) · 'seat_only'(좌석은 살았으나 이 어댑터엔 대화 신원 채널이 없다)
+    · 'unverified'. ★독립 증거 없이는 'verified' 를 낼 수 없다(틀리면 거짓 NOT-verified 방향으로만 틀린다)."""
+    exists = session_file_exists or os.path.exists
+    ev = {"agent": agent, "expected_sid": rr.get("expected_sid"),
+          "registered_now": row.get("registered_session_id") if isinstance(row, dict) else None,
+          "registered_before": rr.get("registered_before"),
+          "registered_before_measured": rr.get("registered_before_measured"),
+          "registered_before_surface": rr.get("registered_before_surface"),
+          "surface_ref": rr.get("surface_ref"),
+          "pre_source": rr.get("pre_spawn_snapshot_source"),
+          "pre_known": rr.get("pre_spawn_snapshot_known"),
+          "pre_enumerated": rr.get("pre_spawn_snapshot_enumerated"),
+          "channel": "registered" if agent in RESUME_SEAT_BOUND_AGENTS else "none"}
+    if not isinstance(row, dict):
+        return "unverified", "status 행 부재(surface 미발견 또는 status --json 실패)", dict(ev, leg="seat")
+    missing = []
+    if row.get("exited") is not False:
+        missing.append("exited≠false")
+    if row.get("agent_alive") is not True:
+        missing.append("agent_alive≠true")
+    if missing:
+        return "unverified", " · ".join(missing), dict(ev, leg="seat")
+    if agent not in RESUME_SEAT_BOUND_AGENTS:
+        return "seat_only", ("이 어댑터(%s)는 좌석이 자기 대화 신원을 등록하지 않는다(데몬 계약상 "
+                             "registered_session_id=null) — 좌석 생존만 확인됨" % agent), dict(ev, leg="channel")
+    if "registered_session_id" not in row:
+        return "unverified", "registered_session_id 키 부재(0.14.31 이전 데몬 — 좌석 결속 신원 관측 불가)", \
+               dict(ev, leg="channel")
+    exp = rr.get("expected_sid")
+    if not isinstance(exp, str) or not exp or not F1_SID_RE.match(exp):
+        return "unverified", "기대 핀 부재·형식 이탈(%r)" % (exp,), dict(ev, leg="pin")
+    if rr.get("resume_mode") == "unknown":
+        return "unverified", "resume 모드 미상(어댑터 resume_arg 판독 실패) — 자기채점 금지", dict(ev, leg="guard")
+    reg = row.get("registered_session_id")
+    if not reg:
+        return "unverified", "좌석 결속 신원 미관측(grace 소진 · SessionStart 등록 전)", dict(ev, leg="observe")
+    if reg != exp:
+        return "unverified", ("좌석 결속 신원 %r ≠ 핀 %r — 재개된 좌석이 기대한 대화를 잇고 있지 않다"
+                              % (reg, exp)), dict(ev, leg="compare")
+    # ★attribution(귀속) — 벽시계를 쓰지 않는다(`created_at` 은 보고·영속 전용 · src/bin/cysd/state.rs:1918).
+    #   ⒜이 restore 가 만든 pane 이거나(스폰 전 스냅샷에 없고 스폰 후에 있다), ⒝등록 신원이 이 restore 중에
+    #   바뀌었다(스폰 전 실측 ≠ 핀). 둘 다 아니면 이전 점유자의 등록일 수 있어 verified 로 올리지 않는다.
+    pre, post, sref = (rr.get("pre_spawn_surface_refs"), rr.get("post_spawn_surface_refs"),
+                       rr.get("surface_ref"))
+    pre_is_observation = (rr.get("pre_spawn_snapshot_source") == "status_json"
+                          and rr.get("pre_spawn_snapshot_known") is True
+                          and rr.get("pre_spawn_snapshot_enumerated") is True
+                          and isinstance(pre, (list, tuple, set)))
+    pre_read_here = (rr.get("registered_before_measured") is True
+                     and rr.get("registered_before_surface") == sref)
+    pane_is_new = (pre_is_observation and isinstance(post, (list, tuple, set)) and sref is not None
+                   and sref not in pre and sref in post and not pre_read_here)
+    transitioned = (pre_read_here and isinstance(rr.get("registered_before"), str)
+                    and rr.get("registered_before") != exp)
+    ev.update(pane_is_new=pane_is_new, transitioned=transitioned,
+              pre_is_observation=pre_is_observation, pre_read_here=pre_read_here)
+    if not (pane_is_new or transitioned):
+        if not pre_is_observation:
+            why = ("스폰 전 스냅샷이 관측이 아니다(출처=%r · 신뢰=%r · 열거=%r) — 부재한 관측을 '부재의 관측'"
+                   "으로 읽지 않는다" % (rr.get("pre_spawn_snapshot_source"),
+                                        rr.get("pre_spawn_snapshot_known"),
+                                        rr.get("pre_spawn_snapshot_enumerated")))
+        elif pre_read_here:
+            why = "이 pane 은 restore 전에 관측됐고 등록 신원이 바뀌지 않았다(이전 점유자 등록 가능)"
+        else:
+            why = "이 pane 은 스폰 전 스냅샷에 이미 있었다"
+        return "unverified", "이 기동에의 귀속 미성립 — %s" % why, dict(ev, leg="attribution")
+    d = rr.get("resume_project_dir")
+    if isinstance(d, str) and d:
+        ev["project_dir_source"] = "journal"
+    else:
+        d = _session_project_dir(entry) if isinstance(entry, dict) and entry else None
+        ev["project_dir_source"] = "derived"
+    if not (isinstance(d, str) and d):
+        return "unverified", "프로젝트 디렉터리 미상 — transcript 실재를 확인할 수 없다", dict(ev, leg="file")
+    if not exists(os.path.join(d, exp + ".jsonl")):
+        return "unverified", "핀 %r 의 transcript 가 지금 없다" % exp, dict(ev, leg="file")
+    return "verified", None, dict(ev, leg="all")
+
+
+def _d1_resume_verdict(socket, j, role, surface, exp, obs, stub, entry):
+    """재개 예상 역할의 판정 한 지점 — stub 은 종전 진리표, prod 는 좌석 결속 증거 합(`resumed_verify_outcome`).
+    저널에 `resume_evidence` 를 남기고 (outcome, reason) 을 돌려준다. 공유 블록에서 결함 3 가드 **뒤**에 온다."""
+    if stub:
+        return legacy_verify_outcome(exp, obs, j["roles"][role].get("resume_mode"))
+    row = _surface_status_row(socket, surface)
+    outcome, missing, ev = resumed_verify_outcome(j["roles"][role], row,
+                                                  (entry or {}).get("agent"), entry=entry)
+    j["roles"][role]["resume_evidence"] = ev
+    if outcome == "verified":
+        reason = ("★재개 확정: 좌석이 **자기 pane 안에서** 등록한 대화 신원 %r 이 핀과 같고, 이 기동에 귀속된다"
+                  "(%s) · transcript 실재(%s). 기대값은 스폰 전 스냅샷에서 고정됐다(자기채점 아님)"
+                  % (ev.get("registered_now"),
+                     "이 restore 가 만든 pane" if ev.get("pane_is_new") else "등록 신원이 이 restore 중 전환",
+                     ev.get("project_dir_source")))
+    elif outcome == "seat_only":
+        reason = ("★좌석만 확인(agent=%s): %s — 좌석 생존은 관측했으나 **같은 대화가 이어졌다는 증거는 없다**"
+                  "(세션 연속성 미측정 · 통과 아님)" % (ev.get("agent"), missing))
+    else:
+        reason = ("★재개 미확정(정직 unverified · leg=%s): %s · 기대=%r 좌석등록=%r. 자기채점 금지 — "
+                  "`cys status --json`(registered_session_id·agent_alive)·`cys read-screen` 으로 확인하라"
+                  % (ev.get("leg"), missing, exp, ev.get("registered_now")))
+    return outcome, reason
+
+
+def restore_final_enum(outcomes):
+    """역할별 outcome → 최종 enum(순수 함수 · 끝단 `:3106-3122` 순서 그대로 + seat_only 한 칸).
+    unverified 가 최우선, 그 다음 fresh(세션 보존 실패를 숨기지 않는다), 그 다음 seat_only,
+    남은 비성공은 FAILED(실 미부활을 '세션 미검증' 으로 뭉개지 않는다 — exit 계약 `:111-112`)."""
+    if not outcomes:
+        return "NOOP"
+    vals = set(outcomes.values())
+    if vals <= {"verified"}:
+        return "VERIFIED"
+    if "unverified" in vals:
+        return "UNVERIFIED"
+    if "fresh" in vals and vals <= {"verified", "fresh", "seat_only"}:
+        return "VERIFIED_FRESH"
+    if "seat_only" in vals and vals <= {"verified", "seat_only"}:
+        return "VERIFIED_SEAT_ONLY"
+    return "FAILED"
+
+
+def deploy_verdict_for(final, completeness):
+    """deploy 판정 매퍼(순수 함수 · 종전 `cmd_deploy` 분기 그대로 + VERIFIED_SEAT_ONLY 를 성공으로 명시).
+    ★D1: 이 값을 성공 집합에 넣지 않으면 codex/gemini 역할 하나가 있는 부서의 **모든 배포**가 DEGRADED(3)로
+    떨어지고 차단기 리셋(`:4248`)도 건너뛴다 — 비차단 drill 은 전부 --stub 이라 어느 레인도 보지 못한다."""
+    if final == "LEASE_HELD":
+        return "LEASE_HELD", 3
+    if completeness == "NOOP" and final == "NOOP":
+        return "COMPLETE", 0
+    if completeness == "COMPLETE" and final in ("VERIFIED", "VERIFIED_FRESH", "VERIFIED_SEAT_ONLY"):
+        return "COMPLETE", 0
+    if completeness == "COMPLETE":
+        return "DEGRADED", 3
+    return "FAILED", 1
 
 
 def f1_result_partition(target_roles, outcomes, roles):
@@ -1953,16 +2113,33 @@ def _live_role_surfaces_from_list(socket):
 # ★codex W3(3): 직전 liveness 관측의 신뢰도(구조 유효성). live_role_surfaces 가 실제 소스를 파싱할 때 갱신되고,
 #   테스트가 live_role_surfaces 를 통째로 몽키패치하면(=실 소스 우회) 직전값(기본 True=신뢰)을 유지한다.
 _LAST_LIVENESS_KNOWN = True
+# ★D1(defect 1 · HEAD-RULING-R3-FINAL 조건1): 직전 liveness 관측의 **출처**와 **열거 여부**.
+#   `known` 만으로는 모자란다 — rc≠0·빈 출력은 `cys list` 폴백이 **빈 맵 + known=True** 로 돌려주고(:1840),
+#   rc 0 + 빈 stdout 은 `json.loads("{}")` 라 구조화 경로가 **surfaces 키를 한 번도 열거하지 않은** 채
+#   known=True 가 된다. 둘 다 '관측된 부재'가 아니라 '부재한 관측'이므로 재개 판정의 증거가 될 수 없다.
+_LAST_LIVENESS_SOURCE = "status_json"      # "status_json" | "list_fallback"
+_LAST_LIVENESS_ENUMERATED = False          # status --json 응답에 "surfaces" 키가 실재했는가
+
+
+def _last_liveness_provenance():
+    """직전 `_live_surfaces_raw` 파싱의 출처·신뢰도·열거 여부(순수 조회 · 재개 판정의 입력)."""
+    return {"source": _LAST_LIVENESS_SOURCE, "known": _LAST_LIVENESS_KNOWN,
+            "enumerated": _LAST_LIVENESS_ENUMERATED}
 
 
 def _live_surfaces_raw(socket):
     """실 liveness 파싱 — status --json(구조화) 우선·실패 시 list 폴백. _LAST_LIVENESS_KNOWN 을 갱신하고 dict 반환."""
-    global _LAST_LIVENESS_KNOWN
+    global _LAST_LIVENESS_KNOWN, _LAST_LIVENESS_SOURCE, _LAST_LIVENESS_ENUMERATED
     st = _status_json(socket)
     if st is None:
         out, known = _live_role_surfaces_from_list(socket)
         _LAST_LIVENESS_KNOWN = known
+        _LAST_LIVENESS_SOURCE, _LAST_LIVENESS_ENUMERATED = "list_fallback", False
         return out
+    # ★D1 조건1: 키의 실재를 **먼저** 기록한다 — rc 0 이어도 빈 stdout 은 `{}` 이고 그 응답은 아무것도
+    #   열거하지 않았다. `st.get("surfaces", [])` 의 기본값은 그 차이를 지운다.
+    _LAST_LIVENESS_SOURCE = "status_json"
+    _LAST_LIVENESS_ENUMERATED = isinstance(st, dict) and "surfaces" in st
     out = {}
     for s in st.get("surfaces", []):
         # 미claim surface 는 status --json 에서 role=null — 구 `cys list` 규약(미claim="-")과 일치시켜 보존한다.
@@ -2948,6 +3125,22 @@ def _run_restore_locked(socket, ticket="default", stub=False, no_breaker=False, 
     #   topology 를 읽으므로 단위가 준다). 한 번이라도 상한에 걸리면(rc=124) 이후 회차는 종전 90s(행 의심).
     _units_view = live
     _restore_hang = False
+    # ★D1: 스폰 **전** 자료는 재시도 회차가 아니라 **이 실행**에 한 번만 찍는다(회차 스냅샷이 덮으면
+    #   귀속 판정이 중간 상태를 보고 '새 pane' 을 선언한다). 출처·신뢰·열거는 같은 파싱의 것이다(:1856-1878).
+    _d1_pre_prov = _last_liveness_provenance()
+    _d1_pre_refs = sorted(_flat_surface_refs(live) or [])
+    _d1_pre_reg = {}          # role → (measured, sid, surface_ref) — 스폰 전 좌석 결속 신원 1회 판독
+    for _role in need:
+        _e = entries.get(_role, {})
+        if _e.get("agent") not in RESUME_SEAT_BOUND_AGENTS:
+            continue
+        _refs = [x["surface"] for x in (live.get(_role) or []) if x.get("surface")]
+        if not _refs:
+            _d1_pre_reg[_role] = (False, None, None)      # pane 자체가 없었다 — 판독 없음(=증거 없음)
+            continue
+        _row_before = _surface_status_row(socket, _refs[0])
+        _d1_pre_reg[_role] = (isinstance(_row_before, dict) and "registered_session_id" in _row_before,
+                              _registered_sid(_row_before), _refs[0])
     while need and attempt <= SPAWN_RETRIES:
         if stub:
             still = []
@@ -3005,6 +3198,22 @@ def _run_restore_locked(socket, ticket="default", stub=False, no_breaker=False, 
                     role_surface[role] = ref
                     j["roles"].setdefault(role, {"stages": {}})["surface"] = ref
                     j["roles"][role]["expected_sid"] = entries.get(role, {}).get("session_id", "")
+                    # ★D1: 재개 판정의 입력 — 스폰 전 스냅샷(출처·신뢰·열거·ref 집합) · 스폰 후 ref 집합 ·
+                    #   스폰 전 좌석 결속 신원(실측 여부까지) · 프로젝트 디렉터리(F-1 전용 게이트 밖에서).
+                    _rr = j["roles"][role]
+                    _rr["pre_spawn_snapshot_source"] = _d1_pre_prov["source"]
+                    _rr["pre_spawn_snapshot_known"] = _d1_pre_prov["known"]
+                    _rr["pre_spawn_snapshot_enumerated"] = _d1_pre_prov["enumerated"]
+                    _rr["pre_spawn_surface_refs"] = _d1_pre_refs
+                    _rr["post_spawn_surface_refs"] = sorted(_flat_surface_refs(live2) or [])
+                    _m, _sid_b, _ref_b = _d1_pre_reg.get(role, (False, None, None))
+                    _rr["registered_before_measured"] = bool(_m)
+                    _rr["registered_before"] = _sid_b
+                    _rr["registered_before_surface"] = _ref_b
+                    _rr["surface_ref"] = ref
+                    if entries.get(role, {}).get("agent") in RESUME_SEAT_BOUND_AGENTS:
+                        _rr["resume_project_dir"] = (fresh_pre[role][1] if role in fresh_pre
+                                                      else _session_project_dir(entries.get(role, {})))
                     if role in resume_mode:
                         j["roles"][role]["resume_mode"] = resume_mode[role]
                     # ★F-1(0.14.31 · 리뷰 R1): cys restore 입력상 fresh **예상** — 결과 플래그(fresh_fallback)가 아니라
@@ -3116,6 +3325,21 @@ def _run_restore_locked(socket, ticket="default", stub=False, no_breaker=False, 
                     sid, ev = stage_observe_registered_session(socket, surface,
                                                                pre_sids=j["roles"][role].get("fresh_pre_sids"))
                     j["roles"][role]["observed_sid_source"] = "registered" if sid else None
+                elif (not stub) and entries.get(role, {}).get("agent") in RESUME_SEAT_BOUND_AGENTS:
+                    # ★D1: 재개 역할도 **좌석 결속** 신원만 관측한다(topology 재핀은 기대값의 출처라 증거가
+                    #   아니다). 스폰 전 실측 신원이 핀과 **다를** 때만 그 stem 을 pre_sids 로 넘겨 관측기가
+                    #   grace 를 끝까지 쓰게 한다(:2382) — 새 pane 이면 훅이 이미 등록해 첫 시도에 잡힌다.
+                    _m, _sid_b, _ref_b = _d1_pre_reg.get(role, (False, None, None))
+                    _exp_now = j["roles"][role].get("expected_sid")
+                    _pre = ([_sid_b] if (_m and isinstance(_sid_b, str) and _sid_b and _sid_b != _exp_now)
+                            else None)
+                    sid, ev = stage_observe_registered_session(socket, surface, pre_sids=_pre)
+                    j["roles"][role]["observed_sid_source"] = "registered" if sid else None
+                elif (not stub) and entries.get(role, {}).get("agent"):
+                    # 좌석 결속 채널이 없는 어댑터(codex/gemini) — 있지도 않은 신원을 폴링하지 않는다.
+                    sid, ev = None, ("좌석 결속 신원 채널 없음(agent=%s · 데몬 계약) — 관측 생략"
+                                     % entries.get(role, {}).get("agent"))
+                    j["roles"][role]["observed_sid_source"] = None
                 else:
                     sid, ev = stage_observe_session(socket, surface, stub, role=role)
                 j["roles"][role]["observed_sid"] = sid
@@ -3213,15 +3437,27 @@ def _run_restore_locked(socket, ticket="default", stub=False, no_breaker=False, 
                           "재료가 없다(핀 비교로 성공을 만들지 않는다). 재검증 대상."
                           % j["roles"][role].get("fresh_scope_stripped"))
             else:
-                # ★리뷰 R3b(codex major): 판정은 순수 함수 하나(`legacy_verify_outcome`) — resume 모드가
-                #   **미상**이면 핀 일치도 verified 가 아니다(stale 신원으로 거짓 verified 가 나던 자리).
-                outcome, reason = legacy_verify_outcome(exp, obs, j["roles"][role].get("resume_mode"))
+                # ★공유 블록 규약(통합 규칙): 결함 3(worker-16)의 가드가 이 else 의 **첫 문장**이고,
+                #   결함 1 의 판정은 그 뒤에 온다. 아래 한 줄 호출이 결함 1 의 전부다(가드 삽입이 기계적).
+                outcome, reason = _d1_resume_verdict(socket, j, role, surface, exp, obs, stub,
+                                                      entries.get(role, {}))
+                if (not stub) and outcome == "unverified":
+                    _leg = (j["roles"][role].get("resume_evidence") or {}).get("leg")
+                    if _leg in RESUME_REOBSERVABLE:
+                        # ★gemini r3 minor: 관측 뒤에 들어온 등록을 저널에 반영하고, resume 단계를 **되돌린
+                        #   뒤**(:3004 가 non-None sid 로 done 을 찍는다) 재관측 플래그를 세운다(:3066 과 같은 순서).
+                        _reg_now = (j["roles"][role].get("resume_evidence") or {}).get("registered_now")
+                        if _reg_now:
+                            obs = _reg_now
+                            j["roles"][role]["observed_sid"] = obs
+                        mark_stage(j, role, "resume", False, "D1 재관측 대상: %s" % _leg)
+                        f1_retry = _leg
             j["roles"][role]["outcome"] = outcome
             j["roles"][role]["verify_reason"] = reason
             # ★P2-3: verify done 은 outcome 이 verified/fresh(성공 부활)일 때만 True. unverified(transient/fork)는
             #   done=False 로 남겨 다음 restore 사이클이 재검증한다 — 과거처럼 unconditional done=True 로 마킹하면
             #   같은 부트 세대 내내 UNVERIFIED 가 고착(재검증 영구 skip)됐다. dedup(pending)이 이 done 을 본다.
-            verify_done = outcome in ("verified", "fresh")
+            verify_done = outcome in ("verified", "fresh", "seat_only")   # ★D1: seat_only 도 확정 — 재검증 무한 반복 방지
             mark_stage(j, role, "verify", verify_done,
                        "M9: expected=%r observed=%r → %s (%s)" % (exp, obs, outcome, reason))
             jevent(j, role, "verify", outcome, "expected=%r observed=%r [%s]" % (exp, obs, reason))
@@ -3240,23 +3476,13 @@ def _run_restore_locked(socket, ticket="default", stub=False, no_breaker=False, 
     #   `fresh_fallback_roles`(독약 강등 · Phase11 의 본래 뜻 · 하네스 `poison_downgraded_to_fresh` 가 poison 집합과 등식 대조)
     #   ∪ `f1_roles`(F-1 세션 부재 fresh). unverified 역할은 어느 성공 목록에도 들지 않는다.
     fresh_roles, fresh_reasons, fresh_fallback_roles, f1_roles = f1_result_partition(target_roles, outcomes, j["roles"])
-    all_verified = target_roles and all(outcomes.get(r) == "verified" for r in target_roles)
-    # ★Phase11: 전원이 verified 또는 fresh(독약→fresh 강등)면 roster 는 부활했다. 단 일부 세션은 보존 못 했으므로
-    #   VERIFIED 로 뭉뚱그리지 않고 VERIFIED_FRESH 로 정직히 구분한다(세션 보존 실패를 숨기지 않는다).
-    all_revived = target_roles and all(outcomes.get(r) in ("verified", "fresh") for r in target_roles)
-    any_unver = any(outcomes.get(r) == "unverified" for r in target_roles)
-    if not target_roles:
-        final = "NOOP"
-    elif all_verified:
-        final = "VERIFIED"
-        breaker_reset(socket)  # 성공 부활은 차단기 창 리셋
-    elif all_revived:
-        final = "VERIFIED_FRESH"    # 전원 부활했으나 일부는 독약 세션→fresh 강등(정직)
-        breaker_reset(socket)       # roster 전원 생존 = 성공 부활 → 차단기 창 리셋
-    elif any_unver:
-        final = "UNVERIFIED"
-    else:
-        final = "FAILED"
+    # ★D1: 최종 enum 은 순수 함수 하나로 — 끝단 순서(종전 all_verified/all_revived/any_unver 3분기) 그대로에
+    #   seat_only 한 칸을 더하고 FAILED 팔을 보존한다. Phase11 의 뜻(전원 verified∪fresh 면 roster 는 부활했고,
+    #   일부 세션을 보존 못 했으므로 VERIFIED 로 뭉개지 않고 VERIFIED_FRESH 로 구분)은 그 함수가 지킨다.
+    final = restore_final_enum({r: outcomes.get(r, "failed") for r in target_roles})
+    if final in ("VERIFIED", "VERIFIED_FRESH", "VERIFIED_SEAT_ONLY"):
+        breaker_reset(socket)       # 성공 부활(세션 보존 실패·미측정 포함)은 차단기 창 리셋
+    seat_only_roles = sorted(r for r in target_roles if outcomes.get(r) == "seat_only")
 
     # ── ★Phase 10: readiness 기반 완결성 판정 (프로세스 존재 아닌 실 ready_marker + surface 생존) ──
     #    phoenix_restore(세션 검증 enum)와 직교하는 차원 — '전원 부활했는가'를 정직하게 답한다.
@@ -3320,6 +3546,10 @@ def _run_restore_locked(socket, ticket="default", stub=False, no_breaker=False, 
         honesty += (" ★F-1 fresh 예상이나 **미확정** 역할=%s: 관문 보류·주입 증거 부재·좌석 결속 새 세션 미확인 등으로 "
                     "각성을 확정하지 못했다(unverified · 침묵 성공 금지). `cys status --json` 의 gate_pending·agent_alive·"
                     "registered_session_id 와 `cys read-screen` 으로 확인하라." % fresh_unverified_roles)
+    if seat_only_roles:
+        honesty += (" ★좌석만 확인된 역할=%s: 이 어댑터는 좌석이 자기 대화 신원을 등록하지 않는다(데몬 "
+                    "계약상 registered_session_id=null) — 좌석은 살아 있으나 **같은 대화가 이어졌다는 증거는 "
+                    "없다**. 세션 연속성은 미측정이다(통과 아님)." % seat_only_roles)
     if fresh_fork_suspect_roles:
         honesty += (" ★fork 의심 역할=%s: 관측된 좌석 결속 세션이 스폰 전에 이미 있던 파일이다 — fresh 가 아니라 기존 "
                     "대화 재개(타 역할 세션이거나 stale 신원)일 수 있다. 그 좌석의 대화를 확인하고 필요하면 재기동하라."
@@ -3340,6 +3570,9 @@ def _run_restore_locked(socket, ticket="default", stub=False, no_breaker=False, 
         "fresh_fork_suspect_roles": fresh_fork_suspect_roles,   # ★리뷰 R1b: 스폰 전 재고에 있던 세션(fork 의심)
         # ★D3: 이번 부팅에 걷어낸 낡은 fresh 표지(역할→사유) — 저널 이벤트만으로는 드릴·지원 전사에서 안 보인다.
         "fresh_scope_stripped": _fresh_scope_stripped,
+        "seat_only_roles": seat_only_roles,     # ★D1: 좌석은 살았으나 대화 연속성은 미측정(채널 없음)
+        "resume_evidence": {r: (j["roles"].get(r, {}).get("resume_evidence") or {})
+                            for r in target_roles if j["roles"].get(r, {}).get("resume_evidence")},
         "ready_roles": ready_roles,
         "ticket": ticket,
         "boot_epoch": _ACTIVE_EPOCH,      # ★Phase6: 이 부활이 판정 기준으로 쓴 세대
@@ -4372,18 +4605,9 @@ def cmd_deploy(args):
     final = restore_res.get("phoenix_restore")
     completeness = restore_res.get("completeness")
     incomplete = restore_res.get("incomplete_roles") or []
-    if final == "LEASE_HELD":
-        # ★P2-7/W1: 재시도 후에도 다른 restore 가 lease 보유 — 이 deploy 의 실패가 아니라 부활 담당 이관.
-        #   FAILED(재시도 소진 미부활)와 구분해 정직 보고. code 3=미확증(escalation 필요)이되 hard fail(1) 아님.
-        verdict, code = "LEASE_HELD", 3
-    elif completeness == "NOOP" and final == "NOOP":
-        verdict, code = "COMPLETE", 0        # 재시작은 됐고 부활 대상 0(전원 이미 생존) — 배포 성공
-    elif completeness == "COMPLETE" and final in ("VERIFIED", "VERIFIED_FRESH"):
-        verdict, code = "COMPLETE", 0
-    elif completeness == "COMPLETE":
-        verdict, code = "DEGRADED", 3        # 전원 부활했으나 일부 세션 미검증(nodes up·session unverified)
-    else:
-        verdict, code = "FAILED", 1          # 일부 역할 미부활(INCOMPLETE) 등 — 정직한 실패
+    # ★D1: 판정 매퍼는 순수 함수 하나(`deploy_verdict_for`) — LEASE_HELD(3) · NOOP/COMPLETE(0) ·
+    #   VERIFIED/VERIFIED_FRESH/VERIFIED_SEAT_ONLY(0) · COMPLETE 인데 세션 미검증(DEGRADED 3) · 그 밖(FAILED 1).
+    verdict, code = deploy_verdict_for(final, completeness)
     if verdict == "COMPLETE" and not args.no_breaker:
         breaker_reset(socket)                # 성공 배포는 차단기 창 리셋
     _dmark(j, "verdict", "ok", "%s (exit %d)" % (verdict, code), epoch=get_boot_epoch(socket))

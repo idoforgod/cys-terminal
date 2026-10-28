@@ -196,6 +196,179 @@ def scenario(name):
         shutil.rmtree(td)
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# D1 — defect `D5H-20261028-PHOENIX-PIN-VERIFY-SAME-SOURCE`: the RESUMED-role path through the real
+# `run_restore(stub=False)`. Everything but `cys`, `sleep` and the event emitter is the shipped code:
+# roster, journal, inventory, the observation stage, the verdict and the enum.
+# Design: DESIGN.md 34f04804 + DESIGN-R2.md 4d7ecb83 + DESIGN-R3.md 30efd72f; HEAD-RULING-R3-FINAL 1-6.
+# ──────────────────────────────────────────────────────────────────────────────
+D1_PIN = "PIN-1"
+
+
+def d1_scenario(name):
+    """One resumed-role restore. `name` selects the shape; every shape is produced by the shipped parser."""
+    td = tempfile.mkdtemp(prefix="phoenix-d1-production-")
+    original_cys, original_sleep, original_emit = m.cys, m.time.sleep, m._emit_evt
+    original_epoch, original_known = m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN
+    original_pack = os.environ.get("CYS_PACK_DIR")
+    try:
+        socket_path = os.path.join(td, "cys.sock")
+        ticket = "d1-" + name
+        agent = "codex" if name == "R4" else "claude"
+        entry = {"role": "worker-1", "agent": agent, "session_id": D1_PIN,
+                 "claude_config_dir": os.path.join(td, "acct"), "cwd": os.path.join(td, "proj"),
+                 "surface_id": 9, "surface_ref": "surface:9"}
+        os.makedirs(entry["cwd"])
+        project_dir = os.path.join(entry["claude_config_dir"], "projects",
+                                   m._claude_project_component(entry["cwd"]))
+        os.makedirs(project_dir)
+        for sid in (D1_PIN, "SID-PREV"):
+            with open(os.path.join(project_dir, sid + ".jsonl"), "w", encoding="utf-8") as f:
+                f.write("{}\n")
+        # the adapter declaration the resume axis reads — in-rig, never the live pack.
+        pack = os.path.join(td, "pack")
+        os.makedirs(pack)
+        with open(os.path.join(pack, "agents.json"), "w", encoding="utf-8") as f:
+            json.dump({"claude": {"resume_arg": "--resume {session_id}"}}, f)
+        os.environ["CYS_PACK_DIR"] = pack
+        m._AGENTS_CACHE.clear()
+        now = m._now()
+        topo = {"entries": [entry], "updated_at": now, "schema_version": 1,
+                "tombstones": [], "tombstones_rev": 0}
+        topo_path = os.path.join(td, "topology.json")
+        with open(topo_path, "w", encoding="utf-8") as f:
+            json.dump(topo, f)
+        journal_path = m.journal_path(socket_path, ticket)
+        calls, sleeps, statuses = [], [], []
+        state = {"alive": False, "status_count": 0, "checks": 0}
+
+        def seat_row(sid, seat="occupied", alive=True):
+            return {"surface_id": 9, "surface_ref": "surface:9", "role": "worker-1", "exited": False,
+                    "agent_alive": alive, "seat": seat, "agent": agent,
+                    "gate_pending": None, "registered_session_id": sid}
+
+        # "warm" = the real in-seat reconnect shape: the pane survives but the agent left, so the SEAT is
+        # empty (javis_phoenix.py:2720-2721 makes that role a revival target) and the dead occupant's
+        # registration is still on it (:2367).
+        warm = name in ("R3a", "R3c", "R6")
+
+        def status_reply():
+            """(rc, stdout) per shape. Every call BEFORE `cys restore` is a pre-spawn observation — the
+            roster merge makes one (:1653-1656) and the target snapshot another (:2708)."""
+            after = {"R1": D1_PIN, "R2": "OTHER-9", "R3a": D1_PIN, "R3b": D1_PIN, "R3c": D1_PIN,
+                     "R4": None, "R5": D1_PIN, "R6": "SID-PREV"}[name]
+            if not state["alive"]:
+                if name == "R3a":
+                    return 1, ""                      # rc != 0 -> the `cys list` fallback decides
+                if name == "R3b":
+                    return 0, ""                      # rc 0 with EMPTY stdout -> {} (no "surfaces" key)
+                pre_rows = ([seat_row(D1_PIN if name == "R3c" else "SID-PREV", seat="empty", alive=False)]
+                            if warm else [])
+                return 0, json.dumps({"daemon": {"started_at": now}, "surfaces": pre_rows})
+            return 0, json.dumps({"daemon": {"started_at": now}, "surfaces": [seat_row(after)]})
+
+        def fake_cys(*args, socket=None, timeout=25):
+            calls.append(args[0])
+            assert socket == socket_path, "CLI escaped the isolated socket"
+            verb = args[0]
+            if verb == "status":
+                state["status_count"] += 1
+                rc, stdout = status_reply()
+                statuses.append((state["status_count"], rc, stdout[:60]))
+                return SimpleNamespace(returncode=rc, stdout=stdout, stderr="")
+            if verb == "list":
+                # R3a: the fallback answers with NOTHING (rc 0, empty) -> ({}, known=True) by :1840
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            if verb == "restore":
+                state["alive"] = True
+                if name == "R5":
+                    # ★the daemon re-pins mid-restore (a qualifying /clear): topology changes under us.
+                    moved = copy.deepcopy(topo)
+                    moved["entries"][0]["session_id"] = "REPINNED-9"
+                    with open(topo_path, "w", encoding="utf-8") as f:
+                        json.dump(moved, f)
+                return SimpleNamespace(returncode=0, stdout="restored worker-1 surface:9", stderr="")
+            if verb == "reinject":
+                state["checks"] += 1
+                return SimpleNamespace(returncode=0, stdout="디렉티브 생존 확인 (ACK 수신)", stderr="")
+            if verb in ("read-screen", "watch"):
+                return SimpleNamespace(returncode=0, stdout="bypass permissions on", stderr="")
+            raise AssertionError("unexpected cys call: %r" % (args,))
+
+        m.cys = fake_cys
+        m.time.sleep = lambda seconds: sleeps.append(seconds)
+        m._emit_evt = lambda *a, **k: None
+        result = m.run_restore(socket_path, ticket=ticket, stub=False, no_breaker=True, print_result=False)
+        with open(journal_path, encoding="utf-8") as f:
+            journal = json.load(f)
+        rr = journal["roles"]["worker-1"]
+        ev = rr.get("resume_evidence") or {}
+        n = "d1 " + name
+
+        check(n + " production backend, one restore, non-destructive",
+              result["backend"] == "production(cys restore)" and calls.count("restore") == 1
+              and not set(calls) & {"close-surface", "kill", "reclaim"})
+        check(n + " took the resume arm (not F-1 fresh)", not rr.get("fresh_expected"))
+        if name == "R1":
+            check(n + " verified: the seat registered the pin on a pane this restore created",
+                  rr["outcome"] == "verified" and result["phoenix_restore"] == "VERIFIED"
+                  and m.restore_exit_code(result) == 0
+                  and ev["pane_is_new"] is True and ev["registered_now"] == D1_PIN)
+            check(n + " provenance journalled: structured, known, enumerated",
+                  rr["pre_spawn_snapshot_source"] == "status_json"
+                  and rr["pre_spawn_snapshot_known"] is True
+                  and rr["pre_spawn_snapshot_enumerated"] is True)
+            check(n + " the compared values come from different writers",
+                  rr["expected_sid"] == D1_PIN and rr["observed_sid"] == D1_PIN
+                  and rr["observed_sid_source"] == "registered")
+            check(n + " the project dir is journalled for the resume path",
+                  rr["resume_project_dir"] == project_dir)
+        if name == "R2":
+            check(n + " stale pin: the seat registered another conversation -> unverified(compare)",
+                  rr["outcome"] == "unverified" and ev["leg"] == "compare"
+                  and result["phoenix_restore"] == "UNVERIFIED" and m.restore_exit_code(result) == 3
+                  and "OTHER-9" in rr["verify_reason"])
+        if name in ("R3a", "R3b", "R3c"):
+            want = {"R3a": "list_fallback", "R3b": "status_json", "R3c": "status_json"}[name]
+            check(n + " attribution refused and the reason names the snapshot",
+                  rr["outcome"] == "unverified" and ev["leg"] == "attribution"
+                  and result["phoenix_restore"] == "UNVERIFIED"
+                  and rr["pre_spawn_snapshot_source"] == want)
+            if name == "R3b":
+                check(n + " ★condition 1: rc 0 with empty stdout is NOT an enumerated snapshot",
+                      rr["pre_spawn_snapshot_enumerated"] is False
+                      and rr["pre_spawn_snapshot_known"] is True)
+            if name == "R3c":
+                check(n + " the measured pre-read equal to the pin outranks the snapshot",
+                      ev["pre_read_here"] is True and ev["pane_is_new"] is False
+                      and rr["registered_before"] == D1_PIN)
+        if name == "R4":
+            check(n + " codex seat: seat_only, never verified, and the enum says so",
+                  rr["outcome"] == "seat_only" and result["phoenix_restore"] == "VERIFIED_SEAT_ONLY"
+                  and m.restore_exit_code(result) == 0
+                  and result["seat_only_roles"] == ["worker-1"] and ev["channel"] == "none")
+            check(n + " and the honesty note names the unmeasured continuity",
+                  "좌석만" in result["honesty_note"] or "seat_only" in result["honesty_note"])
+        if name == "R5":
+            check(n + " the expectation is frozen before the spawn (a mid-restore re-pin cannot move it)",
+                  rr["expected_sid"] == D1_PIN
+                  and json.load(open(topo_path, encoding="utf-8"))["entries"][0]["session_id"] == "REPINNED-9")
+        if name == "R6":
+            check(n + " grace exhausted with a stale stem: compare refuses and the full grace was spent",
+                  rr["outcome"] == "unverified" and ev["leg"] == "compare"
+                  and sleeps.count(m.PHOENIX_SESSION_GRACE_SLEEP) >= m.F1_REGISTERED_GRACE_TRIES - 1)
+        return journal
+    finally:
+        m.cys, m.time.sleep, m._emit_evt = original_cys, original_sleep, original_emit
+        m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN = original_epoch, original_known
+        if original_pack is None:
+            os.environ.pop("CYS_PACK_DIR", None)
+        else:
+            os.environ["CYS_PACK_DIR"] = original_pack
+        m._AGENTS_CACHE.clear()
+        shutil.rmtree(td)
+
+
 def main():
     _results.clear()
     if os.name == "nt":
@@ -203,6 +376,8 @@ def main():
         return 0
     for name in ("S1", "S2", "S3", "S4", "S5"):
         scenario(name)
+    for name in ("R1", "R2", "R3a", "R3b", "R3c", "R4", "R5", "R6"):
+        d1_scenario(name)
     npass = sum(1 for c in _results if c)
     print("\n=== %d/%d PASS ===" % (npass, len(_results)))
     return 0 if npass == len(_results) else 1

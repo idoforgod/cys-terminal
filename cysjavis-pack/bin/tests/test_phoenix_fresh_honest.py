@@ -5,6 +5,7 @@
 """
 import copy
 import importlib.util, json, os, shutil, sys, tempfile
+from types import SimpleNamespace          # d1: scripted cys replies for the snapshot shapes
 
 # 기존 시나리오 하네스처럼 모듈만 적재(바이트코드 파일 생성 방지).
 sys.dont_write_bytecode = True
@@ -685,12 +686,17 @@ def main():
               and mig[0] < scope_call[0] < pend[0] < remark[0])
 
         # D3-8 가드는 핀 판정 함수보다 **먼저** — 검색 범위를 verify 블록으로 한정한다.
+        # ★통합(worker-18 · 결함1 스택 · 헤드 확인됨 2026-10-28): else 팔의 판정 호출이
+        #   `legacy_verify_outcome` 에서 결함1의 `_d1_resume_verdict` 로 바뀐다(stub 은 그 함수 **안에서**
+        #   종전 진리표를 그대로 쓰므로 `return legacy_verify_outcome(` 는 이 패턴에 걸리지 않는다 ⇒ len==1
+        #   유지). 이 행이 지키는 **성질**(가드가 판정보다 먼저)과 세 개수 단언은 그대로다.
         fb_read = find(lambda l: 'fresh_fb = j["roles"][role].get("fresh_fallback", False)' in l)
-        legacy_call = find(lambda l: "outcome, reason = legacy_verify_outcome(exp, obs," in l)
-        guard_line = find(lambda l: "elif fresh_scope_guard_fires(" in l, fb_read[0] - 1, legacy_call[0])
+        verdict_call = find(lambda l: ("outcome, reason = legacy_verify_outcome(exp, obs," in l
+                                       or "outcome, reason = _d1_resume_verdict(" in l))
+        guard_line = find(lambda l: "elif fresh_scope_guard_fires(" in l, fb_read[0] - 1, verdict_call[0])
         check("D3-8 the guard precedes the verdict call, inside the verify block",
-              len(fb_read) == 1 and len(legacy_call) == 1 and len(guard_line) == 1
-              and fb_read[0] < guard_line[0] < legacy_call[0])
+              len(fb_read) == 1 and len(verdict_call) == 1 and len(guard_line) == 1
+              and fb_read[0] < guard_line[0] < verdict_call[0])
 
         # D3-9 F-1 잔여 키도 표지와 함께 걷어낸다.
         j9 = rec(fresh_expected=True, fresh_reason="no_session", fresh_pre_sids=["old"], fresh_pre_dir=td,
@@ -1056,6 +1062,231 @@ def main():
               and not any(k in jf2["roles"]["worker-1"] for k in m.FRESH_MARKER_KEYS)
               and "fresh_epoch" not in jf2["roles"]["worker-1"]
               and rf2["target_roles"] == [] and rf2["per_role_outcome"] == {})
+        # D1 (defect `D5H-20261028-PHOENIX-PIN-VERIFY-SAME-SOURCE`): the resumed-role verdict no longer
+        # compares topology with itself. Rows are prefixed "d1 " so the Windows step log carries an explicit
+        # marker, and the file's own `=== N/N PASS ===` is the positive control (N is computed, never written).
+        # Design: DESIGN.md 34f04804 + DESIGN-R2.md 4d7ecb83 + DESIGN-R3.md 30efd72f + HEAD-RULING-R3-FINAL
+        # conditions 1-6.
+        # ──────────────────────────────────────────────────────────────────────
+        check("d1 surface exists", all(hasattr(m, n) for n in (
+            "resumed_verify_outcome", "_flat_surface_refs", "restore_final_enum",
+            "_last_liveness_provenance", "RESUME_REOBSERVABLE", "RESUME_SEAT_BOUND_AGENTS")))
+        check("d1 reobservable legs", m.RESUME_REOBSERVABLE == ("observe", "compare", "file"))
+        check("d1 seat-bound agents", m.RESUME_SEAT_BOUND_AGENTS == ("claude",))
+
+        # ★M1: both snapshots are the flat ref set over ALL keys of the role-keyed map — the literal "-"
+        #   bucket and exited rows included (javis_phoenix.py:1865/:1869; skipping role=null is a named
+        #   P1-6 regression at :1864).
+        check("d1 flat refs over all keys incl '-' and exited",
+              m._flat_surface_refs({"-": [{"surface": "surface:9", "exited": False}],
+                                    "w": [{"surface": "surface:3", "exited": True}]})
+              == {"surface:9", "surface:3"})
+        check("d1 flat refs of a non-dict is None", m._flat_surface_refs(None) is None)
+
+        d1_live = {"surface_ref": "surface:9", "exited": False, "agent_alive": True,
+                   "gate_pending": None, "registered_session_id": "SID-1", "agent": "claude"}
+        d1_dir = os.path.join(td, "d1proj")
+        os.makedirs(d1_dir, exist_ok=True)
+        with open(os.path.join(d1_dir, "SID-1.jsonl"), "w", encoding="utf-8") as f:
+            f.write("{}\n")
+
+        def d1_rr(**over):
+            base = {"expected_sid": "SID-1", "resume_mode": "effective", "resume_project_dir": d1_dir,
+                    "surface_ref": "surface:9",
+                    "pre_spawn_snapshot_source": "status_json", "pre_spawn_snapshot_known": True,
+                    "pre_spawn_snapshot_enumerated": True,
+                    "pre_spawn_surface_refs": ["surface:3"],
+                    "post_spawn_surface_refs": ["surface:3", "surface:9"],
+                    "registered_before_measured": False, "registered_before": None,
+                    "registered_before_surface": None}
+            base.update(over)
+            return base
+
+        # ★CONDITION 2 — one row per `pre_is_observation` INPUT SHAPE, each produced by the SHIPPED
+        #   `_live_surfaces_raw` (not by a hand-set dict), with its expected leg-7 result.
+        #   The pane is warm in every row (it is in both snapshots) with a stale registration equal to the
+        #   pin, so the ONLY thing that can make leg 7 pass is a genuine "the pane is new" observation.
+        def d1_snapshot(status_rc, status_stdout, list_stdout=""):
+            """Drive the real liveness parser once and return (flat refs, provenance)."""
+            def scripted(*args, socket=None, timeout=25):
+                if args[0] == "status":
+                    return SimpleNamespace(returncode=status_rc, stdout=status_stdout, stderr="")
+                if args[0] == "list":
+                    return SimpleNamespace(returncode=0, stdout=list_stdout, stderr="")
+                raise AssertionError("unexpected cys call in d1 snapshot: %r" % (args,))
+            saved = m.cys
+            try:
+                m.cys = scripted
+                mp = m._live_surfaces_raw("sock-d1")
+            finally:
+                m.cys = saved
+            return m._flat_surface_refs(mp), m._last_liveness_provenance()
+
+        other_rows = [{"surface_id": 3, "surface_ref": "surface:3", "role": "worker-2", "exited": False,
+                       "agent_alive": True, "seat": "occupied", "agent": "claude",
+                       "gate_pending": None, "registered_session_id": "SID-OTHER"}]
+        warm_rows = [{"surface_id": 9, "surface_ref": "surface:9", "role": "worker-1", "exited": False,
+                      "agent_alive": True, "seat": "occupied", "agent": "claude",
+                      "gate_pending": None, "registered_session_id": "SID-1"}]
+        shapes = (
+            # name, status rc, status stdout, list stdout, expect enumerated/known/source, expect leg 7 pass
+            ("status --json rc!=0 -> list fallback (empty, known=True)",
+             1, "", "", {"source": "list_fallback", "known": True, "enumerated": False}, False),
+            ("list fallback structure drift (known=False)",
+             1, "", "junk line with no surface\n", {"source": "list_fallback", "known": False,
+                                                    "enumerated": False}, False),
+            ("rc 0 with EMPTY stdout -> {} (no surfaces key)",
+             0, "", "", {"source": "status_json", "known": True, "enumerated": False}, False),
+            ("rc 0 with JSON lacking 'surfaces'",
+             0, '{"daemon": {"started_at": 1.0}}', "", {"source": "status_json", "known": True,
+                                                        "enumerated": False}, False),
+            ("cold boot: 'surfaces': [] present",
+             0, '{"surfaces": []}', "", {"source": "status_json", "known": True, "enumerated": True}, True),
+            # populated with OTHER surfaces — the provenance is good and the target pane is genuinely absent.
+            ("populated structured snapshot (target pane absent)",
+             0, json.dumps({"surfaces": other_rows}), "", {"source": "status_json", "known": True,
+                                                           "enumerated": True}, True),
+        )
+        for name, rc, out, lst, prov_want, leg7_ok in shapes:
+            refs, prov = d1_snapshot(rc, out, lst)
+            check("d1 provenance: " + name,
+                  prov["source"] == prov_want["source"] and prov["known"] == prov_want["known"]
+                  and prov["enumerated"] == prov_want["enumerated"])
+            # the cold-boot and populated rows are the two that may pass leg 7, and only when the pane is
+            # genuinely absent from the pre-snapshot: give each shape a warm pane for the refusal rows and
+            # an absent pane for the two that should pass.
+            pre = sorted(refs or [])
+            rr = d1_rr(pre_spawn_snapshot_source=prov["source"], pre_spawn_snapshot_known=prov["known"],
+                       pre_spawn_snapshot_enumerated=prov["enumerated"],
+                       pre_spawn_surface_refs=pre if leg7_ok else ["surface:9"],
+                       post_spawn_surface_refs=sorted(set(pre) | {"surface:9"}))
+            outcome, missing, ev = m.resumed_verify_outcome(rr, d1_live, "claude")
+            check("d1 leg7 for shape: " + name,
+                  (outcome == "verified") == leg7_ok
+                  and (leg7_ok or (ev["leg"] == "attribution" and not ev["pane_is_new"])))
+
+        # ★the violating control: the SAME inputs that the fallback shape refuses become `verified` when the
+        #   provenance is forged to claim a structured, known, ENUMERATED snapshot. That is the conjunct the
+        #   head's condition 1 adds, measured as the only difference.
+        refs_fb, prov_fb = d1_snapshot(1, "", "")
+        rr_real = d1_rr(pre_spawn_snapshot_source=prov_fb["source"], pre_spawn_snapshot_known=prov_fb["known"],
+                        pre_spawn_snapshot_enumerated=prov_fb["enumerated"],
+                        pre_spawn_surface_refs=sorted(refs_fb or []),
+                        post_spawn_surface_refs=["surface:9"])
+        rr_forged = dict(rr_real, pre_spawn_snapshot_source="status_json",
+                         pre_spawn_snapshot_known=True, pre_spawn_snapshot_enumerated=True)
+        real_outcome = m.resumed_verify_outcome(rr_real, d1_live, "claude")[0]
+        forged_outcome = m.resumed_verify_outcome(rr_forged, d1_live, "claude")[0]
+        check("d1 violating control: forging the provenance is what buys 'verified'",
+              real_outcome == "unverified" and forged_outcome == "verified")
+
+        # ★the three provenance clauses overlap on the shapes the SHIPPED parser can produce (enumerated is
+        #   only ever set in the structured branch, and that branch always ends known=True), so each clause
+        #   needs a row where it is the ONLY discriminator — otherwise a mutation that drops it stays green
+        #   and the clause is defence in name only. These two forge a CONTRADICTORY provenance (the shape a
+        #   future edit to `_live_surfaces_raw` would produce) and one pins the implication itself.
+        check("d1 shipped parser never yields enumerated with a non-structured source or known=False",
+              all(not prov["enumerated"] or (prov["source"] == "status_json" and prov["known"])
+                  for prov in (d1_snapshot(rc, out, lst)[1] for name, rc, out, lst, _w, _ok in shapes)))
+        check("d1 contradictory provenance: enumerated but source=list_fallback is refused",
+              m.resumed_verify_outcome(
+                  d1_rr(pre_spawn_snapshot_source="list_fallback", pre_spawn_snapshot_enumerated=True,
+                        pre_spawn_surface_refs=[]), d1_live, "claude")[0] == "unverified")
+        check("d1 contradictory provenance: enumerated but known=False is refused",
+              m.resumed_verify_outcome(
+                  d1_rr(pre_spawn_snapshot_known=False, pre_spawn_snapshot_enumerated=True,
+                        pre_spawn_surface_refs=[]), d1_live, "claude")[0] == "unverified")
+
+        # ★B1(c)/R3: a MEASURED pre-read on this surface outranks a snapshot that failed to list it.
+        check("d1 measured pre-read == pin on an empty structured snapshot is refused",
+              m.resumed_verify_outcome(
+                  d1_rr(pre_spawn_surface_refs=[], registered_before_measured=True,
+                        registered_before="SID-1", registered_before_surface="surface:9"),
+                  d1_live, "claude")[0] == "unverified")
+        check("d1 measured transition on this surface is accepted",
+              m.resumed_verify_outcome(
+                  d1_rr(pre_spawn_surface_refs=["surface:9"], post_spawn_surface_refs=["surface:9"],
+                        registered_before_measured=True, registered_before="SID-PREV",
+                        registered_before_surface="surface:9"),
+                  d1_live, "claude")[0] == "verified")
+        check("d1 transition measured on another surface is refused",
+              m.resumed_verify_outcome(
+                  d1_rr(pre_spawn_surface_refs=["surface:9"], post_spawn_surface_refs=["surface:9"],
+                        registered_before_measured=True, registered_before="SID-PREV",
+                        registered_before_surface="surface:77"),
+                  d1_live, "claude")[0] == "unverified")
+
+        # the strict table: every wrong or unknown input, with the leg that refused it.
+        d1_strict = (
+            ("pin stale", d1_rr(), dict(d1_live, registered_session_id="OTHER"), "compare"),
+            ("not registered yet", d1_rr(), dict(d1_live, registered_session_id=None), "observe"),
+            ("registered key absent", d1_rr(),
+             {k: v for k, v in d1_live.items() if k != "registered_session_id"}, "channel"),
+            ("status row absent", d1_rr(), None, "seat"),
+            ("seat exited", d1_rr(), dict(d1_live, exited=True), "seat"),
+            ("agent not alive", d1_rr(), dict(d1_live, agent_alive=False), "seat"),
+            ("pin empty", d1_rr(expected_sid=""), d1_live, "pin"),
+            ("pin not a filename piece", d1_rr(expected_sid="../escape"), d1_live, "pin"),
+            ("resume mode unknown", d1_rr(resume_mode="unknown"), d1_live, "guard"),
+            ("pre snapshot missing", d1_rr(pre_spawn_surface_refs=None), d1_live, "attribution"),
+            ("post snapshot missing", d1_rr(post_spawn_surface_refs=None), d1_live, "attribution"),
+            ("pane already in the pre snapshot", d1_rr(pre_spawn_surface_refs=["surface:9"]), d1_live,
+             "attribution"),
+            ("project dir unknown", d1_rr(resume_project_dir=None), d1_live, "file"),
+        )
+        for name, rr, row, leg in d1_strict:
+            outcome, missing, ev = m.resumed_verify_outcome(rr, row, "claude")
+            check("d1 strict %s -> unverified(%s)" % (name, leg),
+                  outcome == "unverified" and ev["leg"] == leg and missing)
+        check("d1 transcript absent -> unverified(file)",
+              m.resumed_verify_outcome(d1_rr(expected_sid="SID-NOFILE"), dict(
+                  d1_live, registered_session_id="SID-NOFILE"), "claude")[0:1] == ("unverified",))
+        check("d1 no false verified anywhere in the strict table",
+              not any(m.resumed_verify_outcome(rr, row, "claude")[0] == "verified"
+                      for name, rr, row, leg in d1_strict))
+        for agent in ("codex", "gemini", "agy"):
+            outcome, missing, ev = m.resumed_verify_outcome(d1_rr(), d1_live, agent)
+            check("d1 %s has no seat-bound channel -> seat_only" % agent,
+                  outcome == "seat_only" and ev["channel"] == "none" and missing)
+        check("d1 happy resume on a new pane -> verified",
+              m.resumed_verify_outcome(d1_rr(), d1_live, "claude") [0] == "verified")
+        check("d1 project dir derived from the entry when the journal field is absent",
+              m.resumed_verify_outcome(
+                  d1_rr(resume_project_dir=None), d1_live, "claude",
+                  entry={"claude_config_dir": os.path.dirname(d1_dir), "cwd": "/x"}) [0] == "unverified")
+
+        # ★M2: the aggregation keeps the pinned FAILED arm and its order (javis_phoenix.py:3101/:3119-3122).
+        d1_enum = (
+            ({}, "NOOP"),
+            ({"a": "verified"}, "VERIFIED"),
+            ({"a": "verified", "b": "fresh"}, "VERIFIED_FRESH"),
+            ({"a": "fresh", "b": "seat_only"}, "VERIFIED_FRESH"),
+            ({"a": "verified", "b": "seat_only"}, "VERIFIED_SEAT_ONLY"),
+            ({"a": "verified", "b": "unverified"}, "UNVERIFIED"),
+            ({"a": "seat_only", "b": "unverified"}, "UNVERIFIED"),
+            ({"a": "failed"}, "FAILED"),
+            ({"a": "failed", "b": "verified"}, "FAILED"),
+            ({"a": "failed", "b": "seat_only"}, "FAILED"),
+            ({"a": "failed", "b": "unverified"}, "UNVERIFIED"),
+        )
+        for outcomes_in, want in d1_enum:
+            check("d1 enum %s -> %s" % (sorted(set(outcomes_in.values())) or "empty", want),
+                  m.restore_final_enum(outcomes_in) == want)
+        for verdict, code in (("VERIFIED", 0), ("VERIFIED_FRESH", 0), ("VERIFIED_SEAT_ONLY", 0),
+                              ("UNVERIFIED", 3), ("FAILED", 1), ("NOOP", 0)):
+            check("d1 exit code %s -> %d" % (verdict, code),
+                  m.restore_exit_code({"phoenix_restore": verdict}) == code)
+        # the deploy consumer (javis_phoenix.py:4242) must accept the new verdict as COMPLETE/0.
+        for verdict, completeness, want in (
+                ("VERIFIED", "COMPLETE", ("COMPLETE", 0)),
+                ("VERIFIED_FRESH", "COMPLETE", ("COMPLETE", 0)),
+                ("VERIFIED_SEAT_ONLY", "COMPLETE", ("COMPLETE", 0)),
+                ("UNVERIFIED", "COMPLETE", ("DEGRADED", 3)),
+                ("NOOP", "NOOP", ("COMPLETE", 0)),
+                ("LEASE_HELD", "COMPLETE", ("LEASE_HELD", 3)),
+                ("FAILED", "INCOMPLETE", ("FAILED", 1))):
+            check("d1 deploy verdict %s/%s -> %s" % (verdict, completeness, want),
+                  m.deploy_verdict_for(verdict, completeness) == want)
     finally:
         shutil.rmtree(td)
     npass = sum(1 for c in _results if c)
