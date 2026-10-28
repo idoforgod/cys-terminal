@@ -9051,8 +9051,10 @@ const REMEDY_BODY_KILL_SWITCH: &str = "kill-switch 동결 중 — 정체가 아�
 const REMEDY_BODY_SEAT_PAUSE: &str =
     "이 좌석의 큐가 헬스 조치(pause-queue)로 일시정지됐다 — 정해진 시간이 지나면 스스로 풀린다(반복되면 그 창의 출력을 사람이 확인)";
 /// 사람이 쓰던 글이 입력줄에 있다(표 3·6행).
+/// ★(0.14.56 · P1 D1c · head approval of NOTE-wp5-remedy-text.md c4a104a3) "read the screen first": under D1 a claude seat's rows
+/// under the marker can read as a draft while the frame is a selector, so the person reads the screen before submitting or clearing.
 const REMEDY_BODY_HUMAN_DRAFT: &str =
-    "입력줄에 제출되지 않은 글이 있다 — 기계는 지우지 않는다. 사람이 그 창에서 제출하거나 지운다(오너에게 알린다)";
+    "입력줄에 제출되지 않은 글이 있다 — 기계는 지우지 않는다. 먼저 그 창의 화면을 읽는다(글이 아니라 선택 창일 수 있다). 사람이 그 창에서 제출하거나 지운다(오너에게 알린다)";
 
 /// 일시정지 처방 문장(표 1·2행) — `(kill-switch, 일시정지 여부)` → 문장. 둘 다 아니면 `None`. 화면을 읽지 않는 순수 표라 `queue.list`·`org.status` 가
 /// 사유가 기록되지 않은 일시정지 좌석에서도 진단(파서 읽기) 없이 같은 문장을 쓴다.
@@ -21455,6 +21457,7 @@ mod tests {
         let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (_pack, _env) = wp5_env("layout");
         let (daemon, s) = wp5_seat("wp5-layout", "claude");
+        p1_measured(&s); // the D1 contract on either host (head ruling W1)
         let e = daemon.next_queue_entry("[보고] 레이아웃 없음".into(), None, "test");
         s.pending_queue.lock().unwrap().push_back(e);
         paint_screen(&s, &["❯ ", "  Continue with the new plan", "  Esc to cancel"], 0, 2, true);
@@ -21463,11 +21466,27 @@ mod tests {
         assert_eq!(s.pending_queue.lock().unwrap().len(), 1);
         assert_eq!(blocked_reason(&s), BLOCKED_BUSY, "Esc to cancel 조각은 작업 중 어휘로 먼저 거부된다");
         *s.queue_blocked.lock().unwrap() = None;
+        // ★(0.14.56 · P1 D1 · head ruling on Q-suites-17-pins 5fffe0d9, item 3 (i)) On a measured claude seat D1 row 3 reads the rows
+        //   under the marker through the shared composer-region scan: text there is a draft, so the refusal is `input_pending` (it comes
+        //   before the layout refusal) and the queue still holds. The frame may be a selector rather than text, so the remedy tells a
+        //   person to READ THE SCREEN before acting (approved wording, NOTE-wp5-remedy-text.md c4a104a3). A seat D1 does not govern
+        //   (here: configured as a Windows seat, ruling W1) keeps the pin label `alt_screen` - the original intent of this frame.
         paint_screen(&s, &["❯ ", "  Continue with the new plan", "  Some other label"], 0, 2, true);
         quiet_since(&s, 5);
         tick(&daemon);
         assert_eq!(s.pending_queue.lock().unwrap().len(), 1);
-        assert_eq!(blocked_reason(&s), BLOCKED_ALT_SCREEN);
+        assert_eq!(blocked_reason(&s), BLOCKED_INPUT_PENDING);
+        let (code, text) = queue_remedy(BLOCKED_INPUT_PENDING, &queue_block_diag(&daemon, &s));
+        assert_eq!(code, "human_draft", "{text}");
+        let read = text.find("먼저 그 창의 화면을 읽는다(글이 아니라 선택 창일 수 있다).").expect("the remedy says read the screen");
+        let act = text.find("사람이 그 창에서 제출하거나 지운다").expect("the remedy names the action");
+        assert!(read < act, "the remedy says read the screen BEFORE acting: {text}");
+        s.d1_platform.store(false, std::sync::atomic::Ordering::Relaxed);
+        *s.queue_blocked.lock().unwrap() = None;
+        quiet_since(&s, 5);
+        tick(&daemon);
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1);
+        assert_eq!(blocked_reason(&s), BLOCKED_ALT_SCREEN, "a seat D1 does not govern keeps the pin label");
     }
 
     /// CONTRACTS B-1 반례 5종 + codex 설계 검토 반례 — 전부 NotReady(alt-screen 재정의가 열지 않는다).
@@ -29507,6 +29526,7 @@ after-tick liveness alone does not attribute a clock defect",
     /// 한 화면을 좌석에 그리고 큐 틱을 **실제로** 돌려 (남은 큐 길이, 기록된 막힘 사유)를 돌려준다.
     fn instr_tick_outcome(tag: &str, lines: &[String], row: u16, col: u16, alt: bool) -> (usize, String) {
         let (daemon, s) = wp5_seat(tag, "claude");
+        p1_measured(&s); // the D1 contract on either host (head ruling W1)
         let e = daemon.next_queue_entry("[보고] 계측 판 게이트 무변경 검체".into(), None, "test");
         s.pending_queue.lock().unwrap().push_back(e);
         let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
@@ -29517,10 +29537,15 @@ after-tick liveness alone does not attribute a clock defect",
         out
     }
 
-    /// 시험 7 — **게이트 판정 무변경**: 흐림이 섞인 화면과 흐림만 뺀 같은 화면에서 큐 틱의 결과(배달 여부 · 막힘 사유)가 같다(alt · 비-alt 각각).
-    /// 흐림은 칸에만 기억되고 게이트가 읽는 화면 글자·커서·반전에는 닿지 않는다. 한 쌍이라도 다르면 이 판은 내보낼 수 없다.
+    /// 시험 7 — (retired invariant, see below) 흐림이 섞인 화면과 흐림만 뺀 같은 화면에서 큐 틱의 결과(배달 여부 · 막힘 사유)를 잰다(alt · 비-alt 각각).
+    /// ★(0.14.56 · P1 D1 · head ruling on Q-suites-17-pins 5fffe0d9, item 2) RETIRES the ship-gate invariant this test held as
+    /// `instr_gate_verdict_unchanged_by_dim_cells` - "dim cells never change the queue tick's result; if one pair differs this release
+    /// cannot ship", plus "the alt seat's placeholder screen still blocks". D1 makes dim a signal on purpose: a rendered suggestion
+    /// no longer holds a delivery (T-Q1). The same six screen pairs now assert the D1 contract EXACTLY: a pair differs only where a
+    /// D1 row reads the dim run (row 6 Suggestion reads empty; its plain twin is row 7, a Home-moved draft) and agrees everywhere
+    /// else. The retirement is recorded in the stage C report.
     #[test]
-    fn instr_gate_verdict_unchanged_by_dim_cells() {
+    fn instr_gate_dim_changes_the_verdict_only_on_d1_rows() {
         let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (_pack, _env) = wp5_env("instr-gate");
         let m = "❯\u{a0}";
@@ -29533,7 +29558,22 @@ after-tick liveness alone does not attribute a clock defect",
             ("빈 줄 + 흐린 출력 줄", vec![format!("  \x1b[2m흐린 출력 한 줄\x1b[22m"), "".into(), RULE.into(), "❯ ".into(), RULE.into(), STATUS1.into(), STATUS2.into()], 3, 2),
             ("작업 중 표지(흐림)", vec![format!("\x1b[2m✻ Thinking… (esc to interrupt)\x1b[22m"), RULE.into(), "❯ ".into(), RULE.into(), STATUS1.into(), STATUS2.into()], 2, 2),
         ];
+        // The D1 contract, per layout: (with dim, dim stripped) - the same for alt and non-alt. Only layout 0 is a D1 row pair
+        // (row 6 Suggestion -> delivered / row 7 Draft -> held input_pending); every other pair agrees.
+        let delivered = (0usize, String::new());
+        let held = |r: &str| (1usize, r.to_string());
+        let want: Vec<((usize, String), (usize, String))> = vec![
+            (delivered.clone(), held(BLOCKED_INPUT_PENDING)), // 안내문: Suggestion vs Home-moved draft
+            (held(BLOCKED_INPUT_PENDING), held(BLOCKED_INPUT_PENDING)), // a plain run after the cursor in both
+            (held(BLOCKED_INPUT_PENDING), held(BLOCKED_INPUT_PENDING)), // text before the cursor in both
+            (delivered.clone(), delivered.clone()), // dim outside the composer row
+            (delivered.clone(), delivered.clone()), // dim output line
+            (held(BLOCKED_BUSY), held(BLOCKED_BUSY)), // the working indicator, dim or not
+        ];
+        assert_eq!(want.len(), layouts.len());
         let mut table = Vec::new();
+        let mut got_all = Vec::new();
+        let mut want_all = Vec::new();
         for alt in [true, false] {
             for (i, (name, lines, row, col)) in layouts.iter().enumerate() {
                 let twin: Vec<String> = lines.iter().map(|l| instr_strip_dim(l)).collect();
@@ -29541,19 +29581,17 @@ after-tick liveness alone does not attribute a clock defect",
                 let with_dim = instr_tick_outcome(&format!("ig-d{}-{i}", u8::from(alt)), lines, *row, *col, alt);
                 let without = instr_tick_outcome(&format!("ig-p{}-{i}", u8::from(alt)), &twin, *row, *col, alt);
                 table.push(format!("alt={alt} · {name}: 흐림 있음 {with_dim:?} · 흐림 뺌 {without:?}"));
-                assert_eq!(with_dim, without, "alt={alt} · {name}: 흐림 유무로 큐 틱의 결과가 갈렸다 — 게이트 판정이 바뀌었다");
+                got_all.push((alt, i, with_dim, without));
+                want_all.push((alt, i, want[i].0.clone(), want[i].1.clone()));
             }
         }
         println!("INSTR-GATE-TABLE\n{}", table.join("\n"));
-        // 공허 방지 — 이 표 안에 배달된 화면과 막힌 화면이 둘 다 있어야 한다(전부 같은 사유로 막혔다면 게이트의 갈래를 지나지 않은 것이다).
+        assert_eq!(got_all, want_all, "the D1 contract table:\n{}", table.join("\n"));
+        // 공허 방지 — 배달된 화면과 막힌 화면이 둘 다 있고, 흐림 유무로 갈린 쌍이 정확히 D1 행 쌍(안내문 · alt/비-alt)뿐이다.
         assert!(table.iter().any(|l| l.contains("흐림 있음 (0, ")), "배달된 검체가 하나도 없다:\n{}", table.join("\n"));
         assert!(table.iter().any(|l| l.contains("흐림 있음 (1, ")), "막힌 검체가 하나도 없다:\n{}", table.join("\n"));
-        // 오늘 판의 사실 그대로: alt 좌석의 안내문 화면은 여전히 막힌다(이 판은 그것을 풀지 않는다).
-        assert!(
-            table.iter().any(|l| l.starts_with("alt=true · 안내문(흐림): 흐림 있음 (1, ")),
-            "alt 좌석의 안내문 화면이 배달됐다 — 이 판은 큐 막힘의 판정을 바꾸지 않는다:\n{}",
-            table.join("\n")
-        );
+        let differ: Vec<(bool, usize)> = got_all.iter().filter(|(_, _, d, p)| d != p).map(|(a, i, _, _)| (*a, *i)).collect();
+        assert_eq!(differ, vec![(true, 0), (false, 0)], "dim changes the verdict only on the D1 row pair:\n{}", table.join("\n"));
     }
 }
 
