@@ -30,6 +30,24 @@ def alive(pid):
         return False
 
 
+# marker() reads a pid the fixture publishes with os.replace. On Windows that read can hit a sharing race and raise
+# PermissionError (run 3 finding, CEO ruling run-3 s2c/s4): retried there only, within BOTH bounds below.
+MARKER_PERM_ATTEMPTS = 25
+MARKER_PERM_BUDGET_S = 1.0
+
+
+def _start_time(pid):
+    """POSIX identity of a pid: ('ok', start time) | ('gone', None) | ('unavailable', None) when ps cannot answer."""
+    try:
+        r = subprocess.run(['ps', '-o', 'lstart=', '-p', str(pid)], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return ('unavailable', None)
+    out = r.stdout.strip()
+    if out:
+        return ('ok', out)
+    return ('gone', None) if r.returncode != 0 else ('unavailable', None)
+
+
 class OwnershipRegression(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='c03-')
@@ -39,9 +57,13 @@ class OwnershipRegression(unittest.TestCase):
         self.children = []
         self.extra = []
         self.handles = {}
+        self.marker_stats = []
+        self.identities = {}
+        self.not_killed = []
 
     def tearDown(self):
         # Fixture-only identities, retained handles. Never process-name selectors.
+        self._report_marker_stats(sys.stderr)
         for p in self.children:
             if p.poll() is None:
                 p.kill()
@@ -54,6 +76,9 @@ class OwnershipRegression(unittest.TestCase):
                 self.stop_recorded(pid)
             except ProcessLookupError:
                 pass
+        if self.not_killed:
+            sys.stderr.write('marker-identity %s: not-killed %s\n' % (self.id(), ' '.join(self.not_killed)))
+            sys.stderr.flush()
         if os.name == 'nt':
             import ctypes
             for handle in self.handles.values():
@@ -69,30 +94,74 @@ class OwnershipRegression(unittest.TestCase):
         return p
 
     def marker(self, name):
-        path = self.root / name
-        limit = time.monotonic() + 5
+        pid = self._marker_pid(self.root / name, retry_permission=(os.name == 'nt'))
+        self.extra.append(pid)
+        if os.name == 'posix':
+            self.identities[pid] = _start_time(pid)
+        if os.name == 'nt':
+            import ctypes
+            from ctypes import wintypes
+            api=ctypes.windll.kernel32
+            api.OpenProcess.argtypes=[wintypes.DWORD,wintypes.BOOL,wintypes.DWORD]
+            api.OpenProcess.restype=wintypes.HANDLE
+            api.WaitForSingleObject.argtypes=[wintypes.HANDLE,wintypes.DWORD]
+            api.TerminateProcess.argtypes=[wintypes.HANDLE,wintypes.UINT]
+            api.CloseHandle.argtypes=[wintypes.HANDLE]
+            self.handles[pid]=api.OpenProcess(0x100001,False,pid)
+            self.assertTrue(self.handles[pid], 'fixture process handle unavailable')
+        return pid
+
+    def _marker_pid(self, path, *, retry_permission, attempts=MARKER_PERM_ATTEMPTS, budget_s=MARKER_PERM_BUDGET_S,
+                    limit_s=5.0):
+        # Missing, empty or partial publication is not readiness. A PermissionError is retried only when
+        # retry_permission (win32: a read racing the fixture's os.replace); it ends at the attempt bound or the time
+        # bound, whichever comes first, as a FAIL chained to the last error - never a pid, never a pass.
+        # Every call records (name, retries, ms) before it returns or raises; tearDown prints them.
+        start = time.monotonic()
+        limit = start + limit_s
+        retries = 0
+        first_permission = None
+        last_permission = None
+        def record():
+            waited = 0 if first_permission is None else int((time.monotonic() - first_permission) * 1000)
+            self.marker_stats.append((path.name, retries, waited))
         while time.monotonic() < limit:
             try:
                 pid = int(path.read_text())
             except (FileNotFoundError, ValueError):
-                # Missing, empty or partial publication is not readiness.
                 pass
+            except PermissionError as exc:
+                if not retry_permission:
+                    record()
+                    raise
+                retries += 1
+                last_permission = exc
+                now = time.monotonic()
+                if first_permission is None:
+                    first_permission = now
+                bound = ('attempt bound' if retries >= attempts else
+                         'time bound' if now - first_permission >= budget_s else None)
+                if bound:
+                    record()
+                    raise self.failureException(
+                        'marker %s: PermissionError persisted, %s reached after %d attempts / %d ms '
+                        '(bounds: %d attempts, %d ms): %r' % (path.name, bound, retries,
+                        int((now - first_permission) * 1000), attempts, int(budget_s * 1000), exc)) from exc
             else:
-                self.extra.append(pid)
-                if os.name == 'nt':
-                    import ctypes
-                    from ctypes import wintypes
-                    api=ctypes.windll.kernel32
-                    api.OpenProcess.argtypes=[wintypes.DWORD,wintypes.BOOL,wintypes.DWORD]
-                    api.OpenProcess.restype=wintypes.HANDLE
-                    api.WaitForSingleObject.argtypes=[wintypes.HANDLE,wintypes.DWORD]
-                    api.TerminateProcess.argtypes=[wintypes.HANDLE,wintypes.UINT]
-                    api.CloseHandle.argtypes=[wintypes.HANDLE]
-                    self.handles[pid]=api.OpenProcess(0x100001,False,pid)
-                    self.assertTrue(self.handles[pid], 'fixture process handle unavailable')
+                record()
                 return pid
             time.sleep(.02)
-        self.fail('fixture never started: ' + name)
+        record()
+        if last_permission is not None:
+            raise self.failureException(
+                'marker %s: readiness limit %.1f s reached inside a PermissionError streak after %d attempts: %r'
+                % (path.name, limit_s, retries, last_permission)) from last_permission
+        self.fail('fixture never started: ' + path.name)
+
+    def _report_marker_stats(self, stream):
+        if self.marker_stats:
+            stream.write('\nmarker-retries %s: %s\n' % (self.id(), ' '.join('%s=%d/%dms' % st for st in self.marker_stats)))
+            stream.flush()
 
     def recorded_alive(self,pid):
         if os.name == 'nt':
@@ -104,8 +173,20 @@ class OwnershipRegression(unittest.TestCase):
         if os.name == 'nt':
             import ctypes
             ctypes.windll.kernel32.TerminateProcess(self.handles[pid],125)
-        else:
-            os.kill(pid,signal.SIGKILL)
+            return
+        # POSIX: a pid is a number the OS reuses once the process ends. SIGKILL only the process whose start time
+        # still equals the one read when marker() recorded it; an unreadable identity refuses (never kills blind).
+        recorded = self.identities.get(pid, ('unavailable', None))
+        now = _start_time(pid)
+        if now[0] == 'gone':
+            return
+        if recorded[0] != 'ok' or now[0] != 'ok':
+            self.not_killed.append('%d:identity-unavailable' % pid)
+            return
+        if now[1] != recorded[1]:
+            self.not_killed.append('%d:start-time-changed' % pid)
+            return
+        os.kill(pid,signal.SIGKILL)
 
     def assert_gone(self, pid):
         end = time.monotonic() + 3
@@ -1002,9 +1083,11 @@ def task(path):
     if multiprocessing.current_process().name != 'MainProcess' and BR == 'B':
         if name == 'a-blocker':
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            open(os.path.join(TMP, 'blocker-armed'), 'w').close()
             time.sleep(3600)
         if name == 'b-dier':
-            time.sleep(0.5)
+            while not os.path.exists(os.path.join(TMP, 'blocker-armed')):
+                time.sleep(0.01)
             os._exit(3)
     return {'skill': name, 'verdict': 'ACCEPT', 'severity': 'LOW', 'findings': []}
 if __name__ == '__main__':
@@ -1027,6 +1110,7 @@ class PoolBoundedStop(unittest.TestCase):
     setUp = OwnershipRegression.setUp
     tearDown = OwnershipRegression.tearDown
     stop_recorded = OwnershipRegression.stop_recorded
+    _report_marker_stats = OwnershipRegression._report_marker_stats
 
     def run_e2(self, branch, skills=('a-blocker', 'b-dier')):
         root = self.root/'e2skills'
@@ -1177,6 +1261,124 @@ class PoolBoundedStop(unittest.TestCase):
         sys.path.insert(0, str(BIN)); scanner = load('javis_skillscan'); preflight = load('javis_preflight')
         self.assertLess(scanner.POOL_START_DEADLINE_S + 3 * scanner.POOL_STOP_PHASE_S,
                         preflight.Preflight.SKILLSCAN_SCAN_TIMEOUT_S)
+
+
+
+class MarkerReaderContract(unittest.TestCase):
+    # marker() contract (CEO ruling run-3 s4): fail loudly when retries end, bound attempts AND time, print the
+    # retries used every run; POSIX kills only a pid whose identity still matches. Specimens call _marker_pid
+    # directly, so their synthetic pids never reach self.extra, OpenProcess or os.kill.
+    setUp = OwnershipRegression.setUp
+    tearDown = OwnershipRegression.tearDown
+    _marker_pid = OwnershipRegression._marker_pid
+    stop_recorded = OwnershipRegression.stop_recorded
+    _report_marker_stats = OwnershipRegression._report_marker_stats
+
+    def reads(self, script):
+        from unittest.mock import patch
+        calls = []
+        def fake(path_self, *a, **kw):
+            item = script[min(len(calls), len(script) - 1)]
+            calls.append(item)
+            if isinstance(item, type) and issubclass(item, BaseException):
+                raise item('fixture')
+            if callable(item):
+                return item()
+            return item
+        return calls, patch.object(Path, 'read_text', fake)
+
+    def test_transient_permission_error_is_retried_and_counted(self):
+        calls, p = self.reads([PermissionError, PermissionError, PermissionError, '4242'])
+        with p:
+            pid = self._marker_pid(self.root/'m', retry_permission=True)
+        self.assertEqual(pid, 4242)
+        self.assertEqual(self.marker_stats[-1][:2], ('m', 3))
+
+    def test_persistent_permission_error_fails_loudly_after_the_attempt_bound(self):
+        calls, p = self.reads([PermissionError])
+        with p, self.assertRaises(self.failureException) as cm:
+            self._marker_pid(self.root/'m', retry_permission=True)
+        self.assertIsInstance(cm.exception.__cause__, PermissionError)
+        self.assertIn('25 attempts', str(cm.exception))
+        self.assertEqual(self.marker_stats[-1][:2], ('m', 25))
+
+    def test_attempt_bound_ends_the_retries(self):
+        calls, p = self.reads([PermissionError])
+        with p, self.assertRaises(self.failureException) as cm:
+            self._marker_pid(self.root/'m', retry_permission=True, attempts=25, budget_s=600)
+        self.assertEqual(len(calls), 25)
+        self.assertIn('attempt bound', str(cm.exception))
+
+    def test_time_bound_ends_the_retries(self):
+        # budget 0: the time bound is reached at the first PermissionError, with no clock premise. Without a time
+        # bound the call would run to the readiness limit and say so, which fails the assertion below.
+        calls, p = self.reads([PermissionError])
+        with p, self.assertRaises(self.failureException) as cm:
+            self._marker_pid(self.root/'m', retry_permission=True, attempts=100000, budget_s=0.0, limit_s=2.0)
+        self.assertIn('time bound', str(cm.exception))
+        self.assertEqual(len(calls), 1)
+
+    def test_posix_branch_surfaces_permission_error_at_once(self):
+        calls, p = self.reads([PermissionError])
+        with p, self.assertRaises(PermissionError):
+            self._marker_pid(self.root/'m', retry_permission=False)
+        self.assertEqual(len(calls), 1)
+
+    def test_retries_line_is_printed_even_for_zero(self):
+        import io
+        calls, p = self.reads(['55'])
+        with p:
+            self._marker_pid(self.root/'m', retry_permission=True)
+        buf = io.StringIO()
+        OwnershipRegression._report_marker_stats(self, buf)
+        self.assertIn('m=0/', buf.getvalue())
+
+    def test_not_yet_published_is_not_a_permission_retry(self):
+        calls, p = self.reads([FileNotFoundError, FileNotFoundError, '7'])
+        with p:
+            self.assertEqual(self._marker_pid(self.root/'m', retry_permission=True), 7)
+        self.assertEqual(self.marker_stats[-1][:2], ('m', 0))
+
+    def test_readiness_limit_inside_a_permission_streak_names_the_permission_error(self):
+        calls, p = self.reads([FileNotFoundError, FileNotFoundError, FileNotFoundError, PermissionError])
+        with p, self.assertRaises(self.failureException) as cm:
+            self._marker_pid(self.root/'m', retry_permission=True, attempts=100000, budget_s=600, limit_s=1.0)
+        self.assertIn('readiness limit', str(cm.exception))
+        self.assertIsInstance(cm.exception.__cause__, PermissionError)
+
+    @unittest.skipUnless(os.name == 'posix', 'pid identity check is POSIX (Windows kills through the handle)')
+    def test_recorded_pid_is_killed_when_its_identity_matches(self):
+        p = subprocess.Popen([PYTHON, '-c', 'import time; time.sleep(3600)']); self.children.append(p)
+        self.identities[p.pid] = _start_time(p.pid)
+        self.stop_recorded(p.pid)
+        p.wait(timeout=30)  # wallclock: guard 30 s only ends a hang; the verdict is the SIGKILL return code
+        self.assertEqual(p.returncode, -signal.SIGKILL)
+
+    @unittest.skipUnless(os.name == 'posix', 'pid identity check is POSIX (Windows kills through the handle)')
+    def test_kill_refused_when_the_start_time_changed(self):
+        p = subprocess.Popen([PYTHON, '-c', 'import time; time.sleep(3600)']); self.children.append(p)
+        self.identities[p.pid] = ('ok', 'Mon Jan  1 00:00:00 2001')
+        self.stop_recorded(p.pid)
+        self.assertIsNone(p.poll(), 'a pid whose start time changed was killed')
+        self.assertIn('%d:start-time-changed' % p.pid, self.not_killed)
+
+    @unittest.skipUnless(os.name == 'posix', 'pid identity check is POSIX (Windows kills through the handle)')
+    def test_kill_refused_when_identity_is_unavailable(self):
+        from unittest.mock import patch
+        p = subprocess.Popen([PYTHON, '-c', 'import time; time.sleep(3600)']); self.children.append(p)
+        self.identities[p.pid] = _start_time(p.pid)
+        with patch.object(subprocess, 'run', side_effect=PermissionError('fixture: ps blocked')):
+            self.stop_recorded(p.pid)
+        self.assertIsNone(p.poll(), 'a pid with no readable identity was killed')
+        self.assertIn('%d:identity-unavailable' % p.pid, self.not_killed)
+
+    @unittest.skipUnless(os.name == 'posix', 'pid identity check is POSIX (Windows kills through the handle)')
+    def test_gone_pid_is_not_signalled(self):
+        p = subprocess.Popen([PYTHON, '-c', 'pass']); self.children.append(p)
+        p.wait(timeout=30)  # wallclock: guard 30 s only ends a hang of a process that does nothing
+        self.identities[p.pid] = ('ok', 'recorded')
+        self.stop_recorded(p.pid)
+        self.assertEqual(self.not_killed, [])
 
 
 if __name__ == '__main__':
