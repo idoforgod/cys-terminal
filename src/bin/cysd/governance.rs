@@ -8638,13 +8638,30 @@ impl ComposerVerdict {
 /// Adding an adapter requires the T-ADAPT measurement on that adapter.
 pub(crate) const D1_MEASURED_ADAPTERS: &[&str] = &["claude"];
 
-/// Does D1 govern this seat? `agent_meta` is a leaf lock (as in `draft_gate` and `machine_hold_probe`).
+/// ★(0.14.56 · P1 · head ruling W1 0048dfdf) The platform half of D1's scope - the ONE named predicate. Windows (`true`) is not
+/// measured: whether ConPTY passes SGR 2 (the suggestion's dim attribute) through to a Windows claude seat has not been measured,
+/// so there D1 is off and every reader keeps its pin expression (named residue: a Home-moved draft reads empty on Windows, as at
+/// the pin; backlog "ConPTY SGR 2 pass-through: measure on Windows; until then D1 is off on Windows"). A pure table, so a host of
+/// either OS measures both branches (the `PendingInputModel::default_for` precedent).
+pub(crate) fn d1_platform_measured_for(is_windows: bool) -> bool {
+    !is_windows
+}
+
+/// This build's platform half - [`d1_platform_measured_for`] of this OS, one expression. Read once per seat, at creation
+/// (`Surface::d1_platform`).
+pub(crate) fn d1_platform_measured() -> bool {
+    d1_platform_measured_for(cfg!(windows))
+}
+
+/// Does D1 govern this seat? The seat's platform half (`Surface::d1_platform`, from [`d1_platform_measured`]) and a measured
+/// adapter. `agent_meta` is a leaf lock (as in `draft_gate` and `machine_hold_probe`).
 pub(crate) fn d1_governs(s: &crate::state::Surface) -> bool {
-    s.agent_meta
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .is_some_and(|(agent, _)| D1_MEASURED_ADAPTERS.contains(&agent.as_str()))
+    s.d1_platform.load(Ordering::Relaxed)
+        && s.agent_meta
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|(agent, _)| D1_MEASURED_ADAPTERS.contains(&agent.as_str()))
 }
 
 /// ★(0.14.56 · P1 D9 · design r3 §8, CEO KEY PREDICATE rev 2 `3ab21282`) The ONE scope test for master/CEO composers:
@@ -20207,8 +20224,15 @@ mod tests {
         paint_screen(s, &refs, 2, 2, alt);
     }
 
+    /// (b) The measured-platform contract: a D1 specimen configures its seat as measured, so it asserts D1 on a host of either OS
+    /// (a Windows build creates seats with `d1_platform` false - head ruling W1 0048dfdf).
+    fn p1_measured(s: &crate::state::Surface) {
+        s.d1_platform.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     fn p1_seat(tag: &str) -> (Arc<Daemon>, Arc<crate::state::Surface>) {
         let (daemon, s) = wp5_seat(tag, "claude");
+        p1_measured(&s);
         let e = daemon.next_queue_entry("[보고] p1".into(), None, "test");
         s.pending_queue.lock().unwrap().push_back(e);
         (daemon, s)
@@ -20364,6 +20388,7 @@ mod tests {
         let pack = empty_pack_dir("p1-q3");
         let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
         let (_daemon, s) = marker_seat("p1-q3");
+        p1_measured(&s);
         paint_prompt(&s, "", "my own words");
         assert!(!super::composer_measured_empty(&s), "a Home-moved draft must never read as empty");
         paint_prompt_dim(&s, "", "carry on please");
@@ -20378,6 +20403,7 @@ mod tests {
         let pack = empty_pack_dir("p1-g2");
         let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
         let (daemon, s) = marker_seat("p1-g2");
+        p1_measured(&s);
         paint_prompt(&s, "", "my own words");
         assert_eq!(super::draft_gate(&daemon, &s, DirectSendKind::Text), Some(DraftGateDenied::ScreenOccupied));
         paint_prompt_dim(&s, "", "carry on please");
@@ -20392,6 +20418,7 @@ mod tests {
         let pack = empty_pack_dir("p1-h0");
         let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
         let (daemon, s) = marker_seat("p1-h0");
+        p1_measured(&s);
         let axes = super::MachineHoldAxes { draft: true, ..super::MachineHoldAxes::NONE };
         paint_prompt(&s, "", "my own words");
         assert_eq!(super::machine_direct_hold(&daemon, &s, axes), Some(super::MachineHold::Draft));
@@ -20407,6 +20434,7 @@ mod tests {
         let pack = empty_pack_dir("p1-f1");
         let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
         let (_daemon, s) = marker_seat("p1-f1");
+        p1_measured(&s);
         paint_prompt(&s, "", "my own words");
         assert_eq!(super::seat_input_line_visibility(&s), (Some(true), Some(true)));
         paint_prompt_dim(&s, "", "carry on please");
@@ -20452,11 +20480,82 @@ mod tests {
         let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         for (agent, want) in [("claude", true), ("gemini", false), ("codex", false), ("grok", false)] {
             let (_daemon, s) = wp5_seat(&format!("p1-scope-{agent}"), agent);
+            p1_measured(&s);
             assert_eq!(super::d1_governs(&s), want, "{agent}");
             let obs = super::observe_prompt(&s, &["❯".to_string()]);
             assert_eq!(super::composer_reads_empty(&s, &obs, None).is_some(), want, "{agent}");
         }
         assert_eq!(super::D1_MEASURED_ADAPTERS, &["claude"]);
+    }
+    /// W1 (a) (head ruling W1 0048dfdf): a seat configured as a Windows seat (`d1_platform` false) keeps every reader's PIN verdict
+    /// - D1 is inert there. The pin values are the ones measured on 9da2418d (impl/RED-stageAB-on-pin.log, STOP-D1-windows-conpty.md):
+    /// the alt suggestion stall stays (named Windows residue until ConPTY SGR 2 is measured) and a non-alt plain after-cursor run is
+    /// DELIVERED, as at the pin (named Windows residue: a Home-moved draft).
+    #[test]
+    fn p1_w1_windows_seat_keeps_the_pin_readers() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p1-w1a");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap()), ("CYS_QUEUE_STARVE_ALERT_SECS", "0")]);
+        // (layout, after, dim, alt, delivered at the pin, blocked reason at the pin when held)
+        for (label, after, dim, alt, delivered, reason) in [
+            ("alt dim suggestion, box", "carry on please", true, true, false, Some(BLOCKED_ALT_SCREEN)),
+            ("alt plain run, box", "my own words", false, true, false, None),
+            ("non-alt plain run, live layout", "my own words", false, false, true, None),
+            ("non-alt dim suggestion, live layout", "carry on please", true, false, true, None),
+            ("non-alt empty, live layout", "", false, false, true, None),
+        ] {
+            let (daemon, s) = p1_seat(&format!("p1-w1a-{}-{}", alt, after.len()));
+            s.d1_platform.store(false, std::sync::atomic::Ordering::Relaxed);
+            assert!(!super::d1_governs(&s), "{label}: D1 is off on a Windows seat");
+            p1_paint_box(&s, after, dim, alt);
+            let obs = super::observe_prompt(&s, &["❯".to_string()]);
+            assert_eq!(super::composer_reads_empty(&s, &obs, None), None, "{label}: the reader keeps its pin expression");
+            quiet_since(&s, 10);
+            tick(&daemon);
+            let depth = s.pending_queue.lock().unwrap().len();
+            assert_eq!(depth == 0, delivered, "{label}: pin verdict (blocked: {})", blocked_reason(&s));
+            if let Some(r) = reason {
+                assert_eq!(blocked_reason(&s), r, "{label}");
+            }
+        }
+        // The non-queue readers on a Windows seat read a Home-moved draft as at the pin (R-3, R-5, R-6, R-7).
+        let (daemon, s) = marker_seat("p1-w1a-readers");
+        s.d1_platform.store(false, std::sync::atomic::Ordering::Relaxed);
+        paint_prompt(&s, "", "my own words");
+        assert!(super::composer_measured_empty(&s), "R-3 pin: reads empty");
+        assert_eq!(super::draft_gate(&daemon, &s, DirectSendKind::Text), None, "R-5 pin: passes");
+        let axes = super::MachineHoldAxes { draft: true, ..super::MachineHoldAxes::NONE };
+        assert_eq!(super::machine_direct_hold(&daemon, &s, axes), None, "R-6 pin: no draft");
+        assert_eq!(super::seat_input_line_visibility(&s).0, Some(false), "R-7 pin: not visible");
+    }
+
+    /// W1 (c): the platform gate is ONE named predicate. Both branches of the pure table are measured on any host; the wrapper is
+    /// that table of this OS in one expression; a seat takes it at creation; `d1_governs` reads the seat's half first.
+    #[test]
+    fn p1_w1_d1_platform_gate_is_one_named_predicate() {
+        assert!(!super::d1_platform_measured_for(true), "Windows: not measured");
+        assert!(super::d1_platform_measured_for(false), "elsewhere: measured");
+        let body = |src: &str, head: &str| -> String {
+            let i = src.find(head).unwrap_or_else(|| panic!("{head} missing"));
+            let rest = &src[i..];
+            let open = rest.find('{').expect("body start");
+            let close = rest.find("\n}\n").expect("body end (top-level fn)");
+            rest[open + 1..close].split_whitespace().collect::<Vec<_>>().join(" ")
+        };
+        let gov = include_str!("governance.rs");
+        assert_eq!(body(gov, concat!("pub(crate) fn d1_platform_measured_for", "(is_windows: bool) -> bool {")), "!is_windows");
+        assert_eq!(body(gov, concat!("pub(crate) fn d1_platform_measured", "() -> bool {")), "d1_platform_measured_for(cfg!(windows))");
+        assert!(
+            body(gov, concat!("pub(crate) fn d1_governs", "(s: &crate::state::Surface) -> bool {"))
+                .starts_with("s.d1_platform.load(Ordering::Relaxed) && "),
+            "d1_governs reads the seat's platform half first"
+        );
+        let st = include_str!("state.rs");
+        assert_eq!(st.matches(concat!("d1_platform: AtomicBool::new(", "crate::governance::d1_platform_measured()),")).count(), 1);
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_daemon, s) = wp5_seat("p1-w1c", "claude");
+        assert_eq!(s.d1_platform.load(std::sync::atomic::Ordering::Relaxed), super::d1_platform_measured(), "a new seat takes this build's half");
+        assert_eq!(super::d1_governs(&s), super::d1_platform_measured(), "claude seat: governed exactly where measured");
     }
     // ===== end of the P1 behavioural block =====
 

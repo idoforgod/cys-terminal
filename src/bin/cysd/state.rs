@@ -2141,6 +2141,10 @@ pub struct Surface {
     /// writer), 읽기 = surface.list·status·deliver_queued. 승계 게이트만은 캐시를 믿지 않고 그 시점
     /// 프로브를 새로 뜬다(드문 경로·판정이 role 재바인딩을 좌우하므로 stale 금지).
     pub seat_cache: AtomicU8,
+    /// ★(0.14.56 · P1 · head ruling W1 0048dfdf) D1's platform half for this seat - set once at creation from
+    /// `governance::d1_platform_measured()` (false on Windows) and read by `governance::d1_governs`. Instance-owned so a specimen
+    /// configures one seat's platform without a process-global switch.
+    pub d1_platform: AtomicBool,
     /// ★G2(W3-A BLOCK 교정) 좌석 에이전트 엄격 관측 캐시: 이 틱의 신선한 자손 관측에서
     /// **기지(旣知) 에이전트 엄격 매칭**(governance::cmdline_matches_agent_exec — R2 확정
     /// strict 매처)이 잡혔는가. 쓰기 = `governance::refresh_seat_cache` 단독(seat_cache 와
@@ -7232,6 +7236,7 @@ impl Daemon {
             // Unknown의 소비 규약은 "현행 동작 유지"다(§소비처: 큐=배달·승계=거부) — 판정 미도달이
             // 새로운 실패를 만들지 않는다.
             seat_cache: AtomicU8::new(0),
+            d1_platform: AtomicBool::new(crate::governance::d1_platform_measured()),
             // 신생 좌석은 미관측(false) — 첫 watchdog 틱의 엄격 관측이 확정한다(fail-closed).
             seat_agent_cache: AtomicBool::new(false),
             // ★G5-③: 확정 대기 관측은 항상 빈 채로 출발 — claim_role(windows)만이 기록한다.
