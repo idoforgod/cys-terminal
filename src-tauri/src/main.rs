@@ -9465,7 +9465,14 @@ mod tests {
     #[test]
     fn wp12_r2_shell_shadow_refuses_before_drain_and_preserves_old_process() {
         use std::os::unix::fs::{PermissionsExt, symlink};
+        // ★The product binds the pair to the executables **actually used**: rotation_absolute_executable
+        //   canonicalizes (`:7739`) and the shell resolver's realpath does the same (34a979f9). A macOS
+        //   runner's TMPDIR is /var/folders/… — a symlink to /private/var — so a fixture root taken raw
+        //   from temp_dir() can never equal the resolved pair, and `:9522` below compares paths. Resolve
+        //   the root once, before anything derives from it; a canonical TMPDIR makes this a no-op.
         let root = std::env::temp_dir().join(format!("wp12-r2-path-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
         let home = root.join("home");
         let local = home.join(".local/bin");
         let siblings = root.join("siblings");
