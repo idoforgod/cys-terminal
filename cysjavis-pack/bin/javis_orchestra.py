@@ -26,7 +26,7 @@ master가 (a) "4개 노드 다 떴나"를 눈대중 판단, (b) 리뷰 프롬프
                                 리뷰 의뢰 프롬프트를 출력(제약 누락 구조 차단). --success는
                                 구현 위임과 동일한 평가 기준을 리뷰어에게도 투입(N6 영상 양방향 —
                                 "구현할 때도 먹이고 리뷰할 때도 똑같이"). 생략 시 출력 바이트 동일.
-  task-prompt  --task T --scope S [--success C] [--to ROLE] [--dont D]
+  task-prompt  --task T --scope S [--success C] [--to ROLE] [--surface N] [--dont D]
                                 위임 티켓 생성(절대지침 5차 work management 앵커):
                                 ①위임 직전 대상 노드 생존을 결정론 확인(미기동=티켓 미출력 —
                                 "워커 정상 작동 확인 후 작업 지시") ②WORKER §3
