@@ -1858,18 +1858,18 @@ def cmd_task_prompt(args):
         surfaces = status.get("surfaces", [])
         target = None
         if sid is not None:
-            rows = [s for s in surfaces if s.get("surface_id") == sid]
-            if not rows:
+            matched = [s for s in surfaces if s.get("surface_id") == sid]
+            if not matched:
                 liveness_note = "liveness UNVERIFIED (recipient not on this daemon)"
                 print("[task-prompt] surface:%d — %s: 이 데몬의 status 에 그 surface 가 없다. 거부하지 "
                       "않고 티켓 머리에 같은 줄을 싣는다." % (sid, liveness_note), file=sys.stderr)
-            elif not any(row_alive(s) for s in rows):
+            elif not any(row_alive(s) for s in matched):
                 print("[task-prompt] 수신 surface:%d('%s') 미기동 — 티켓 미출력. 같은 역할의 다른 좌석이 살아 "
-                      "있어도 그 좌석은 이 티켓의 수신자가 아니다." % (sid, rows[0].get("role") or "?"),
+                      "있어도 그 좌석은 이 티켓의 수신자가 아니다." % (sid, matched[0].get("role") or "?"),
                       file=sys.stderr)
                 return 1
             else:
-                target = next(s for s in rows if row_alive(s))
+                target = next(s for s in matched if row_alive(s))
         else:
             alive = [s for s in surfaces if s.get("role") == args.to and row_alive(s)]
             if not alive:
