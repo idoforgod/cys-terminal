@@ -21478,22 +21478,23 @@ fn state_cell(s: &serde_json::Value) -> String {
     state.to_string()
 }
 
-/// Tasks Control Center(CLI) — depts.json을 읽어 본부+각 부서 소켓에 org.status를 순회 집계한다.
-/// master 능동 모니터링: 모든 부서의 모든 노드가 지금 하는 업무를 1콜로 본다.
-/// 도달불가 부서는 머리줄(`■ 부서명`)만 표기한다 — 「⚠ 도달불가: 사유」 경고 산문은 TOAST 축이 끈다(`fleet_unreachable_to`·`--json` 의 error 필드는 그대로).
-fn run_fleet(as_json: bool) -> i32 {
-    // RC-7: HOME 미설정(Windows) 함정 회피 — dirs 기반 공용 해소.
-    let home = cys::home_dir().to_string_lossy().into_owned();
+/// `cys fleet` 의 `departments` 행 조립(순수부 — run_fleet 에서 추출). 본부 행이 먼저이고 레지스트리 본문
+/// (`depts.json` 원문 · 못 읽었으면 None)의 `depts` 항목이 뒤따른다. `reach` 는 소켓 하나에 org.status 를
+/// 묻는다(운영 = `request_on` · 시험 = 가짜). 행 키·순서·소켓 폴백은 추출 전과 같다.
+fn fleet_rows(
+    base_sock: std::path::PathBuf,
+    reg_text: Option<&str>,
+    mut reach: impl FnMut(&std::path::Path) -> Result<Value, String>,
+) -> Vec<Value> {
     // v2 부서 한정 키(DESIGN-dept-qualified-keys-v2 §4a): 항목마다 dept(slug=레지스트리 키)·
     // socket(경로 문자열) additive. 본부는 고정 slug "main"·socket=null(기본 소켓 사용).
-    let mut targets: Vec<(std::path::PathBuf, String, String, Value)> =
-        vec![(socket_path(), "본부 · CEO".to_string(), "main".to_string(), Value::Null)];
-    let reg = std::env::var("CYS_DEPTS_JSON")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from(&home).join(".cys/depts.json"));
-    if let Ok(s) = std::fs::read_to_string(&reg) {
+    // X-8 CARRIER Q2: pack_dir additive — 레지스트리 항목의 `pack_dir` 문자열 그대로, 없거나 문자열이 아니면
+    // null. 추정·파생하지 않는다. 본부 행은 null(브리지는 본부에 자기 ROOT 를 쓴다).
+    let mut targets: Vec<(std::path::PathBuf, String, String, Value, Value)> =
+        vec![(base_sock, "본부 · CEO".to_string(), "main".to_string(), Value::Null, Value::Null)];
+    if let Some(s) = reg_text {
         // ★C3-c(2026-09-17 3라운드): BOM 은 lib 공용 `strip_utf8_bom` 으로 벗긴다(drain_verify_targets 와 같은 규약).
-        if let Ok(v) = serde_json::from_str::<Value>(cys::strip_utf8_bom(&s)) {
+        if let Ok(v) = serde_json::from_str::<Value>(cys::strip_utf8_bom(s)) {
             if let Some(depts) = v["depts"].as_object() {
                 for (name, meta) in depts {
                     // RC-4: socket 필드 부재 시 공용 규약으로 폴백(Windows named pipe·unix .sock).
@@ -21504,20 +21505,39 @@ fn run_fleet(as_json: bool) -> i32 {
                     let disp = meta["display_name"].as_str().unwrap_or(name).to_string();
                     // 방출 socket = 실제 도달 소켓과 동일 경로 문자열(브리지가 cys --socket 로 재사용).
                     let sock_str = sock.to_string_lossy().into_owned();
-                    targets.push((sock, disp, name.clone(), Value::String(sock_str)));
+                    let emit_pack = meta["pack_dir"]
+                        .as_str()
+                        .map(|p| Value::String(p.to_string()))
+                        .unwrap_or(Value::Null);
+                    targets.push((sock, disp, name.clone(), Value::String(sock_str), emit_pack));
                 }
             }
         }
     }
     let mut out: Vec<Value> = Vec::new();
-    for (sock, disp, dept, emit_sock) in &targets {
-        match request_on(sock, "org.status", json!({})) {
+    for (sock, disp, dept, emit_sock, emit_pack) in &targets {
+        match reach(sock.as_path()) {
             Ok(r) => out.push(json!({"department": disp, "dept": dept, "socket": emit_sock,
-                                     "surfaces": r["surfaces"].clone()})),
+                                     "pack_dir": emit_pack, "surfaces": r["surfaces"].clone()})),
             Err(e) => out.push(json!({"department": disp, "dept": dept, "socket": emit_sock,
-                                      "error": e, "surfaces": []})),
+                                      "pack_dir": emit_pack, "error": e, "surfaces": []})),
         }
     }
+    out
+}
+
+/// Tasks Control Center(CLI) — depts.json을 읽어 본부+각 부서 소켓에 org.status를 순회 집계한다.
+/// master 능동 모니터링: 모든 부서의 모든 노드가 지금 하는 업무를 1콜로 본다.
+/// 도달불가 부서는 머리줄(`■ 부서명`)만 표기한다 — 「⚠ 도달불가: 사유」 경고 산문은 TOAST 축이 끈다(`fleet_unreachable_to`·`--json` 의 error 필드는 그대로).
+fn run_fleet(as_json: bool) -> i32 {
+    // RC-7: HOME 미설정(Windows) 함정 회피 — dirs 기반 공용 해소.
+    let home = cys::home_dir().to_string_lossy().into_owned();
+    let base_sock = socket_path();
+    let reg = std::env::var("CYS_DEPTS_JSON")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from(&home).join(".cys/depts.json"));
+    let reg_text = std::fs::read_to_string(&reg).ok();
+    let out = fleet_rows(base_sock, reg_text.as_deref(), |sock| request_on(sock, "org.status", json!({})));
     if as_json {
         println!(
             "{}",
@@ -44909,6 +44929,50 @@ mod tests {
         assert!(!prod.contains(&old_form), "CTX 열이 자기보고만 읽는 옛 형태로 되돌아갔다");
         assert_eq!(prod.matches("ctx_cell(&s)").count(), 2,
                    "CTX 칸 산출은 run_status·run_fleet 두 곳뿐이고 둘 다 헬퍼를 써야 한다");
+    }
+
+    /// X-8 CARRIER Q2 — `cys fleet --json` 행 모양 핀. 레지스트리 항목의 `pack_dir` 문자열은 그대로 실리고,
+    /// 없거나 문자열이 아니면 null(키는 있다), 본부 행은 null. 기존 키(department·dept·socket·surfaces·error)·
+    /// 행 순서·물어보는 소켓은 그대로다. 「키 없음」 과 「null」 을 가르려고 키 존재를 `get` 으로 보고 행 전체를
+    /// json! 과 통째로 비교한다(`row["pack_dir"]` 색인은 키가 없어도 Null 을 돌려줘 둘을 못 가른다).
+    #[test]
+    fn fleet_json_rows_carry_registry_pack_dir_or_null() {
+        // 키는 정렬 순서로 적는다 — serde_json 맵이 정렬이든 삽입 순서든 같은 행 순서가 된다.
+        let reg = r#"{"depts":{
+            "dept-1":{"socket":"/rig/d1/cys.sock","pack_dir":"/rig/home/.cys/pack-dept-dept-1","display_name":"부서 하나","role":"dept-master"},
+            "dept-2":{"socket":"/rig/d2/cys.sock","role":"dept-master"},
+            "dept-3":{"socket":"/rig/d3/cys.sock","pack_dir":7},
+            "dept-4":{"socket":"/rig/d4/cys.sock","pack_dir":null}}}"#;
+        let mut asked: Vec<String> = Vec::new();
+        let rows = fleet_rows(std::path::PathBuf::from("/rig/base/cys.sock"), Some(reg), |sock| {
+            asked.push(sock.to_string_lossy().into_owned());
+            if sock == std::path::Path::new("/rig/d2/cys.sock") {
+                Err("connect /rig/d2/cys.sock: refused".to_string())
+            } else {
+                Ok(json!({"surfaces": [{"role": "master"}], "paused": false}))
+            }
+        });
+        assert_eq!(rows.len(), 5, "{rows:?}");
+        let pack = |i: usize| rows[i].as_object().expect("행은 객체").get("pack_dir").cloned();
+        assert_eq!(pack(1), Some(json!("/rig/home/.cys/pack-dept-dept-1")), "레지스트리 pack_dir 문자열이 그대로 실려야 한다: {}", rows[1]);
+        assert_eq!(pack(0), Some(Value::Null), "본부 행: pack_dir 키가 있고 null: {}", rows[0]);
+        assert_eq!(pack(2), Some(Value::Null), "pack_dir 없는 항목: 키가 있고 null: {}", rows[2]);
+        assert_eq!(pack(3), Some(Value::Null), "문자열 아닌 pack_dir: null(추정 금지): {}", rows[3]);
+        assert_eq!(pack(4), Some(Value::Null), "pack_dir null: null: {}", rows[4]);
+        let surf = json!([{"role": "master"}]);
+        assert_eq!(rows, vec![
+            json!({"department": "본부 · CEO", "dept": "main", "socket": null, "pack_dir": null, "surfaces": surf}),
+            json!({"department": "부서 하나", "dept": "dept-1", "socket": "/rig/d1/cys.sock",
+                   "pack_dir": "/rig/home/.cys/pack-dept-dept-1", "surfaces": surf}),
+            json!({"department": "dept-2", "dept": "dept-2", "socket": "/rig/d2/cys.sock", "pack_dir": null,
+                   "error": "connect /rig/d2/cys.sock: refused", "surfaces": []}),
+            json!({"department": "dept-3", "dept": "dept-3", "socket": "/rig/d3/cys.sock", "pack_dir": null, "surfaces": surf}),
+            json!({"department": "dept-4", "dept": "dept-4", "socket": "/rig/d4/cys.sock", "pack_dir": null, "surfaces": surf}),
+        ]);
+        assert_eq!(asked, ["/rig/base/cys.sock", "/rig/d1/cys.sock", "/rig/d2/cys.sock", "/rig/d3/cys.sock", "/rig/d4/cys.sock"]);
+        // 레지스트리를 못 읽음(None) → 본부 행 하나, pack_dir null.
+        let rows = fleet_rows(std::path::PathBuf::from("/rig/base/cys.sock"), None, |_| Ok(json!({"surfaces": []})));
+        assert_eq!(rows, vec![json!({"department": "본부 · CEO", "dept": "main", "socket": null, "pack_dir": null, "surfaces": []})]);
     }
 
     // ═══════════════ U4-B2 (0.14.41) 조용한 통과 드러내기 — Rust CLI 검체 ═══════════════
