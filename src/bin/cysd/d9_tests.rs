@@ -663,6 +663,8 @@ fn d9_creator_g_prime_pin_draft_gate_covers_text_before_the_first_turn() {
 /// process, or no recorded creator at all - an empty shell from new-surface/GUI), a relauncher (restore in-seat,
 /// node-recover) answers the folder-trust gate with no turn yet -> REFUSED, 0 bytes (residual, named; the CLI makes the
 /// refusal loud: restore keeps the seat as gated, node-recover exits 79).
+/// This is branch (h2) only: the fixture seat is agent-backed (seat state Unknown = before any tick, exit flag clear).
+/// Which branch a real relaunch meets is decided by the watchdog tick - see `d9_residual_h_tick_phase_*` below.
 #[test]
 fn d9_residual_h_in_seat_boot_by_a_non_creator_is_refused() {
     let fx = fx("res-h");
@@ -683,4 +685,121 @@ fn d9_residual_h_in_seat_boot_by_a_non_creator_is_refused() {
     let g1 = gen(&m2);
     assert_denied(&ret(&fx, Some(relauncher.0.id()), &m2, json!({"authoritative": true})));
     assert_eq!(gen(&m2), g1, "no creator recorded at all (an empty shell from new-surface) - refused, 0 bytes");
+}
+
+// ─────────────────────────── (h1)/(h2): the tick phase decides an in-seat boot (head ruling on Q-D9-tick-lag) ───────────────────────────
+//
+// `d9_scope` needs `seat_is_agent_backed`, whose two inputs only the watchdog tick writes (every
+// `WATCHDOG_INTERVAL_SECS`): `check_agent_death` sets `agent_exit_notified` when the agent dies and clears it when a live
+// agent is seen; `refresh_seat_cache` writes `seat_cache`. After a relaunch into the same seat the death tick's values
+// stand until the next tick, so for at most one tick period from agent start the seat is out of scope:
+//   (h1) not yet observed -> a non-creator's Return/text takes the pin path (e2e: 8/8 trust confirms accepted);
+//   (h2) observed -> in scope -> refused, 0 bytes (loud to the relauncher).
+// The specimens set the two flags exactly as the tick writes them; nothing waits for a tick.
+
+/// The two values the watchdog tick writes: `observed` = a tick that saw the (relaunched) agent alive; otherwise the death
+/// tick's values. `seat_override` replaces only the seat half (single-flag cells for the mutants).
+fn tick_flags(s: &Arc<Surface>, observed: bool, seat_override: Option<crate::governance::SeatState>) {
+    use crate::governance::SeatState;
+    s.agent_exit_notified.store(!observed, Ordering::Relaxed);
+    let seat = seat_override.unwrap_or(if observed { SeatState::Occupied } else { SeatState::Empty });
+    s.seat_cache.store(seat.as_u8(), Ordering::Relaxed);
+}
+
+/// A master the relauncher did not create, showing the folder-trust gate, with the given tick values.
+fn relaunched_master(fx: &Fx, maker: &Kid, observed: bool, seat: Option<crate::governance::SeatState>) -> Arc<Surface> {
+    let m = master(fx);
+    record_creator(fx, m.id, maker.0.id(), crate::state::peer_start_time(maker.0.id()), 5.0);
+    paint_trust(&m);
+    tick_flags(&m, observed, seat);
+    m
+}
+
+/// (h1) + (h2) on the trust gate, the real transition: the death tick's values (exit flag set, seat Empty) -> the
+/// relauncher's confirm is WRITTEN (pin behaviour); the next tick's values (flag clear, seat Occupied) -> the same caller
+/// on the same kind of seat is REFUSED with 0 bytes.
+/// Mutants: drop `seat_is_agent_backed` from `d9_scope` -> (h1) refused; make the scope ignore both flags -> (h1) refused.
+#[test]
+fn d9_residual_h_tick_phase_decides_the_in_seat_boot_confirm() {
+    use crate::governance::SeatState;
+    let fx = fx("res-h12");
+    let (maker, relauncher) = (kid(), kid());
+    let h1 = relaunched_master(&fx, &maker, false, None);
+    assert_eq!(SeatState::from_u8(h1.seat_cache.load(Ordering::Relaxed)), SeatState::Empty);
+    let g0 = gen(&h1);
+    let r = ret(&fx, Some(relauncher.0.id()), &h1, json!({"authoritative": true}));
+    assert_eq!(r["ok"], json!(true), "(h1) not yet observed: out of d9_scope, the pin path writes the confirm: {r}");
+    assert!(gen(&h1) > g0, "(h1) the confirm was written");
+    let h2 = relaunched_master(&fx, &maker, true, None);
+    let g1 = gen(&h2);
+    assert_denied(&ret(&fx, Some(relauncher.0.id()), &h2, json!({"authoritative": true})));
+    assert_eq!(gen(&h2), g1, "(h2) observed: refused, 0 bytes");
+}
+
+/// Each flag alone moves the seat out of scope (the two inputs of `seat_is_agent_backed`), and the before-any-tick
+/// value (Unknown) counts as observed. Mutants: drop the exit-flag test -> cell 1 refused; drop the Empty test -> cell 2
+/// refused; treat Unknown as Empty -> cell 3 written.
+#[test]
+fn d9_residual_h_tick_phase_each_flag_alone() {
+    use crate::governance::SeatState;
+    let fx = fx("res-h-flags");
+    let (maker, relauncher) = (kid(), kid());
+    for (cell, observed, seat, written) in [
+        (1, false, Some(SeatState::Occupied), true), // exit flag set, seat seen occupied (agent died between the two writes)
+        (2, true, Some(SeatState::Empty), true),     // exit flag clear, seat Empty
+        (3, true, Some(SeatState::Unknown), false),  // flag clear, no seat probe yet (a new surface) -> in scope
+    ] {
+        let m = relaunched_master(&fx, &maker, observed, seat);
+        let g0 = gen(&m);
+        let r = ret(&fx, Some(relauncher.0.id()), &m, json!({"authoritative": true}));
+        if written {
+            assert_eq!(r["ok"], json!(true), "cell {cell}: out of d9_scope, pin path: {r}");
+            assert!(gen(&m) > g0, "cell {cell}: written");
+        } else {
+            assert_denied(&r);
+            assert_eq!(gen(&m), g0, "cell {cell}: 0 bytes");
+        }
+    }
+}
+
+/// The empty Claude composer a just-started agent draws (marker + U+00A0 as the CLI's glyph spacing, rules, status row).
+fn paint_empty_box(m: &Arc<Surface>) {
+    let rule = "\u{2500}".repeat(60);
+    let screen = format!("\x1b[2J\x1b[H\u{273b} Welcome\r\n\r\n{rule}\r\n\u{276f}\u{a0}\r\n{rule}\r\n  ? for shortcuts\x1b[2A\r\x1b[2C");
+    m.parser.lock().unwrap().process(screen.as_bytes());
+}
+
+/// (h1) is out of scope for TEXT too, and what a non-creator key can land on there (head ruling on Q-D9-tick-lag: name
+/// any path to content the operation did not supply). Within the window a non-owner's direct send is NOT converted: the
+/// pin path holds it (`held: awaiting_submit`, 0 bytes) for its own sender's Return. A foreign Return - the relauncher,
+/// another process with another parent - writes one bare CR into the empty composer and leaves that held body unsent.
+/// Queued deliveries are not a path: the queue holds a role seat whose seat state is Empty (`deliver_queued` empty_seat
+/// block), and the same tick writes that state. In (h2) the same send converts to one queue job.
+/// Senders: a pane (worker-1) and an off-pane process whose parent is not this process (a different pair key).
+/// Mutant: let a foreign Return bind the held body -> held count 0.
+#[test]
+fn d9_residual_h1_text_is_held_for_its_sender_within_the_window() {
+    let fx = fx("res-h1-text");
+    let (maker, relauncher, offpane) = (kid(), kid(), grandkid());
+    let _w = pane(&fx, "worker-1", P);
+    for (label, sender) in [("pane", P), ("off-pane", offpane.1)] {
+        let h1 = relaunched_master(&fx, &maker, false, None);
+        paint_empty_box(&h1);
+        let g0 = gen(&h1);
+        let r = send(&fx, Some(sender), &h1, "[보고] window", json!({}));
+        assert_eq!(r["ok"], json!(true), "{label} (h1): {r}");
+        assert_ne!(r["result"]["converted"], json!("one_job"), "{label} (h1) not converted: {r}");
+        assert_eq!(r["result"]["held"], json!("awaiting_submit"), "{label} (h1) the pin path holds the body: {r}");
+        assert_eq!((gen(&h1), held(&h1)), (g0, 1), "{label} (h1) 0 bytes, one held body");
+        assert!(queue_texts(&h1).is_empty(), "{label} (h1) not a queue job");
+        let k = ret(&fx, Some(relauncher.0.id()), &h1, json!({"authoritative": true}));
+        assert_eq!(k["ok"], json!(true), "{label} (h1) the foreign Return takes the pin path: {k}");
+        assert_eq!(k["result"].get("bound"), None, "{label} (h1) the foreign Return binds no held body: {k}");
+        assert_eq!((gen(&h1), held(&h1)), (g0 + 1, 1), "{label} (h1) one bare CR; the held body is still held");
+        let h2 = relaunched_master(&fx, &maker, true, None);
+        paint_empty_box(&h2);
+        let g1 = gen(&h2);
+        assert_converted(&send(&fx, Some(sender), &h2, "[보고] window", json!({})));
+        assert_eq!(gen(&h2), g1, "{label} (h2) converted: nothing written at receipt");
+    }
 }
