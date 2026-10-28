@@ -345,13 +345,17 @@ def main(argv):
         print("산출물: %s" % outdir)
         return 0
 
-    # ── 6a. 업로드 후보 재확인 (H-05 D1-c) — 첫 DELETE 보다 앞 ──
-    #    업로더가 여는 두 파일이 4단계가 검증한 바로 그 바이트인가. 그 사이 무엇이 바꿨다면 올리지 않는다.
-    with open(sums_path, "rb") as fh:
-        if fh.read() != sums_bytes:
-            print("::error::%s 가 자기 검증 뒤에 바뀌었다 — 업로드 거부" % SUMS_NAME, file=sys.stderr)
-            return 1
-    if "%s  %s\n" % (sha256_file(zippath), zipname) not in lines:
+    # ── 6a. 업로드 후보 확정 (H-05 D1-c) — 첫 DELETE 보다 앞 ──
+    #    두 후보를 **한 번** 읽어 4단계가 검증한 바이트인지 대조하고, POST 는 그 읽은 바이트를 그대로 보낸다
+    #    (다시 열지 않는다 — 대조와 전송 사이의 틈, DELETE 뒤 POST 전의 틈을 남기지 않는다).
+    bodies = {}
+    for name in (zipname, SUMS_NAME):
+        with open(os.path.join(outdir, name), "rb") as fh:
+            bodies[name] = fh.read()
+    if bodies[SUMS_NAME] != sums_bytes:
+        print("::error::%s 가 자기 검증 뒤에 바뀌었다 — 업로드 거부" % SUMS_NAME, file=sys.stderr)
+        return 1
+    if "%s  %s\n" % (hashlib.sha256(bodies[zipname]).hexdigest(), zipname) not in lines:
         print("::error::%s 가 %s 의 해당 줄과 다르다 — 업로드 거부" % (zipname, SUMS_NAME), file=sys.stderr)
         return 1
 
@@ -360,8 +364,7 @@ def main(argv):
     for name, ctype in ((zipname, "application/zip"), (SUMS_NAME, "text/plain")):
         if name in existing:      # --clobber 동등: 기존 자산 삭제 후 재업로드
             api("/repos/%s/releases/assets/%d" % (REPO, existing[name]), tok, method="DELETE")
-        with open(os.path.join(outdir, name), "rb") as fh:
-            body = fh.read()
+        body = bodies[name]
         req = urllib.request.Request(up_base + "?name=" + name, method="POST", data=body)
         req.add_header("Authorization", "Bearer " + tok)
         req.add_header("Content-Type", ctype)

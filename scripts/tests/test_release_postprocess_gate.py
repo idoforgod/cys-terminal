@@ -1336,6 +1336,7 @@ class PublishedSumsPreservationH05Tests(unittest.TestCase):
         self.outdir = os.path.join(self.root, self.tag + "-assets")
         self.blobs, self.assets, self.calls = {}, [], []
         self.gate_hook = None
+        self.delete_hook = None
 
     def tearDown(self):
         shutil.rmtree(self.root, ignore_errors=True)
@@ -1375,6 +1376,8 @@ class PublishedSumsPreservationH05Tests(unittest.TestCase):
 
         def fake_api(path, tok, method="GET", data=None, ctype="application/json"):
             self.calls.append((method, path))
+            if method == "DELETE" and self.delete_hook:
+                self.delete_hook()
             return rel if method == "GET" else {}
 
         def fake_download(url, dest, tok):
@@ -1539,6 +1542,15 @@ class PublishedSumsPreservationH05Tests(unittest.TestCase):
         self.assertNotEqual(rc, 0)
         self.assertIn("public-mismatch", out + err)
         self.assertEqual(self.writes(), [])
+
+    def test_h05_14_posted_bytes_are_the_verified_bytes(self):
+        """D1-c: a candidate changed on disk after the check (here: during the first DELETE) must not reach POST."""
+        self.release(with_zip=True, sums=b"0" * 64 + b"  old-asset\n")
+        want = self.regenerated()
+        self.delete_hook = lambda: open(os.path.join(self.outdir, rp.SUMS_NAME), "ab").write(b"tampered\n")
+        rc, out, err = self.run_main(apply_=True, draft=True)
+        posted = [c for c in self.calls if c[0] == "POST" and c[1] == rp.SUMS_NAME]
+        self.assertEqual(posted, [("POST", rp.SUMS_NAME, len(want))], "POST sent bytes other than the verified SUMS")
 
 
 if __name__ == "__main__":
