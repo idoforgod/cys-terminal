@@ -1370,6 +1370,8 @@ class PublishedSumsPreservationH05Tests(unittest.TestCase):
     def run_main(self, apply_=False, draft=True):
         rel = {"tag_name": self.tag, "draft": draft, "assets": self.assets,
                "upload_url": "https://example.invalid/up{?name}"}
+        if draft == "absent":
+            del rel["draft"]
 
         def fake_api(path, tok, method="GET", data=None, ctype="application/json"):
             self.calls.append((method, path))
@@ -1529,6 +1531,14 @@ class PublishedSumsPreservationH05Tests(unittest.TestCase):
         rc, out, err = self.run_main(apply_=True, draft=True)
         self.assertNotEqual(rc, 0)
         self.assertEqual(self.writes(), [], "a zip that no longer matches its SUMS line reached DELETE/POST")
+
+    def test_h05_13_release_without_a_draft_key_is_treated_as_public(self):
+        """D1-b fail-closed: only an explicit draft=true earns the warning; a missing key blocks like public."""
+        self.release(sums=b"0" * 64 + b"  old-asset\n")
+        rc, out, err = self.run_main(apply_=True, draft="absent")
+        self.assertNotEqual(rc, 0)
+        self.assertIn("public-mismatch", out + err)
+        self.assertEqual(self.writes(), [])
 
 
 if __name__ == "__main__":
