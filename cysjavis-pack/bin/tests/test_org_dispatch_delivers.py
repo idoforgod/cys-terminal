@@ -266,6 +266,68 @@ class DispatchDelivers(unittest.TestCase):
         self.assertEqual(len(self._sends()), 1, "absence without a digest was read as lost: " + out)
         self.assertNotEqual(rc, 0, out)
 
+    # ── r2 review gemini1 minor (5-8 c): an unreadable OLD generation must not mask the CURRENT ledger or the queue ──
+    def _unreadable_dot1(self):
+        dot1 = os.path.splitext(os.environ["FAKE_LEDGER"])[0] + ".jsonl.1"
+        os.makedirs(os.path.dirname(dot1), exist_ok=True)
+        with open(dot1, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"origin": "boot", "ts_epoch": time.time() - 3600}) + "\n")
+        os.chmod(dot1, 0)
+        with self.assertRaises(OSError):         # positive control: the generation really cannot be read
+            open(dot1, "rb").close()
+        return dot1
+
+    def test_r2fold_unreadable_dot1_does_not_mask_a_receipt_in_the_current_ledger(self):
+        os.environ["FAKE_MODE"] = "deliver"
+        self.org.dispatch_task(self.task)
+        self._unreadable_dot1()
+        self.assertEqual(self.org.first_ticket_state_of(self.task), "delivered")
+        rc, out = self.org.dispatch_task(self.task)
+        self.assertEqual((rc, len(self._sends())), (0, 1), out)
+        self.assertIn("delivered (existing item, not resent)", out)
+
+    def test_r2fold_unreadable_dot1_with_the_item_pending_reads_pending(self):
+        os.environ["FAKE_MODE"] = "pending"
+        self.org.dispatch_task(self.task)
+        self._unreadable_dot1()
+        self.assertEqual(self.org.first_ticket_state_of(self.task), "pending")
+
+    def test_r2fold_unreadable_dot1_and_nothing_else_settles_it_stays_unknown(self):
+        os.environ["FAKE_MODE"] = "pending"
+        self.org.dispatch_task(self.task)
+        os.remove(os.environ["FAKE_QUEUE"])
+        self._unreadable_dot1()
+        self.assertEqual(self.org.first_ticket_state_of(self.task), "unknown")
+        rc, out = self.org.dispatch_task(self.task)
+        self.assertEqual(len(self._sends()), 1, out)
+        self.assertNotEqual(rc, 0, out)
+
+    def test_r2fold_unreadable_dot1_but_the_current_ledger_covers_the_send_settles_lost(self):
+        os.makedirs(os.path.dirname(os.environ["FAKE_LEDGER"]), exist_ok=True)
+        with open(os.environ["FAKE_LEDGER"], "a", encoding="utf-8") as fh:   # current generation starts before the send
+            fh.write(json.dumps({"origin": "boot", "ts_epoch": time.time() - 600}) + "\n")
+        os.environ["FAKE_MODE"] = "pending"
+        self.org.dispatch_task(self.task)
+        os.remove(os.environ["FAKE_QUEUE"])
+        self._unreadable_dot1()
+        self.assertEqual(self.org.first_ticket_state_of(self.task), "lost")
+        rc, out = self.org.dispatch_task(self.task)
+        self.assertEqual(len(self._sends()), 2, out)
+        self.assertIn("RESEND of lost item", out)
+
+    def test_r2fold_unreadable_current_ledger_is_unknown_without_a_receipt(self):
+        os.environ["FAKE_MODE"] = "pending"
+        self.org.dispatch_task(self.task)
+        os.remove(os.environ["FAKE_QUEUE"])
+        dot1 = os.path.splitext(os.environ["FAKE_LEDGER"])[0] + ".jsonl.1"
+        os.makedirs(os.path.dirname(dot1), exist_ok=True)
+        with open(dot1, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"origin": "boot", "ts_epoch": time.time() - 3600}) + "\n")
+        with open(os.environ["FAKE_LEDGER"], "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"origin": "boot", "ts_epoch": time.time()}) + "\n")
+        os.chmod(os.environ["FAKE_LEDGER"], 0)
+        self.assertEqual(self.org.first_ticket_state_of(self.task), "unknown")
+
     def test_r2_m2_same_second_resend_orders_by_sequence_not_by_nonce(self):
         from unittest import mock
         nonces = iter([b"\xff" * 5, b"\x00" * 5, b"\x11" * 5])

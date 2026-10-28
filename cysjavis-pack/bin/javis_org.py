@@ -864,16 +864,16 @@ def _ticket_receipt(ledger, nonce, start=0, digest=None, sent_at=None):
     preview and the row's queue_entry_id name only the head). The rotated generation (delivery.rs rotate_if_needed:
     <ledger>.jsonl.1, one generation) is read first. 'rotated' = no receipt AND the generations that still exist begin
     after the send — the receipt may have rotated away, so absence proves nothing (never 'lost')."""
-    gens = []
+    gens, bad_cur, bad_old = [], False, False
     for path in (os.path.splitext(ledger)[0] + ".jsonl.1", ledger):
         if not os.path.exists(path):
             continue
         try:
             gens.append(_ledger_rows(path, start if path == ledger else 0))
-        except OSError:
-            return "unreadable"
+        except OSError:   # keep reading: the other generation can still settle it (r2 review minor)
+            bad_cur, bad_old = (True, bad_old) if path == ledger else (bad_cur, True)
     if not gens:
-        return None
+        return "unreadable" if (bad_cur or bad_old) else None
     rows = [r for g in gens for r in g]
     ids = {r.get("queue_entry_id") for r in rows if nonce in (r.get("preview") or "") and r.get("queue_entry_id")}
     if digest:
@@ -884,12 +884,14 @@ def _ticket_receipt(ledger, nonce, start=0, digest=None, sent_at=None):
         hit = r.get("queue_entry_id") in ids or bool(ids & set(r.get("merged_ids") or []))
         if hit and r.get("kind") == "receipt" and isinstance(r.get("delivered_at"), (int, float)):
             return "delivered"
+    if bad_cur:
+        return "unreadable"   # the newest rows could not be read: only a receipt settles it, never absence
     if digest is None:
         return "rotated"   # without the copy's digest a delivery merged into a queue digest is invisible: never 'lost'
     if sent_at is not None and os.path.exists(os.path.splitext(ledger)[0] + ".jsonl.1"):
         first = next((r["ts_epoch"] for g in gens for r in g if isinstance(r.get("ts_epoch"), (int, float))), None)
         if first is None or first > sent_at:
-            return "rotated"
+            return "unreadable" if bad_old else "rotated"   # the readable rows do not reach back to the send
     return None
 
 def _queue_has(sock, nonce, expired=False):
@@ -909,9 +911,9 @@ def _ticket_state(sock, nonce, digest=None, sent_at=None):
     """'delivered' | 'pending' | 'expired' | 'lost' | 'unknown' for an earlier first-ticket send (P1P2-DIRECTIONS)."""
     import javis_lane
     ledger = javis_lane.lane_state_path("delivery", sock)
-    seen = _ticket_receipt(ledger, nonce, digest=digest, sent_at=sent_at)
-    if seen in ("delivered", "unreadable"):
-        return "delivered" if seen == "delivered" else "unknown"
+    if _ticket_receipt(ledger, nonce, digest=digest, sent_at=sent_at) == "delivered":
+        return "delivered"
+    # an unreadable or rotated ledger does not settle it: the queue still can (pending / expired); unknown only below
     for expired, name in ((False, "pending"), (True, "expired")):
         q = _queue_has(sock, nonce, expired)
         if q is None:
