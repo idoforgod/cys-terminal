@@ -22,6 +22,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BIN = os.path.dirname(HERE)
@@ -147,13 +148,35 @@ class DispatchDelivers(unittest.TestCase):
             return []
         return [l for l in open(self.log, encoding="utf-8").read().splitlines() if l.startswith("--socket") and " send " in l]
 
-    # (a) P-1: the caller's turn never sits on a delivery wait
+    # (a) P-1: the caller's turn never sits on a delivery wait. Event check, no clock: the receiver never delivers
+    # (pending), and after the send dispatch_task makes no further observation - no cys call (queue list, status),
+    # no delivery-ledger or queue read (the module's readers, or any open() in the module), no sleep. Waiting for the
+    # receipt needs at least one of them. One ordered stream: the fake cys appends its argv to FAKE_LOG, the wrappers
+    # below append "PY:<name>" to the same file. Not seen: a fixed busy-wait that observes nothing.
     def test_apply_does_not_wait_for_a_slow_receiver(self):
         os.environ["FAKE_MODE"] = "pending"
-        t0 = time.monotonic()
-        rc, out = self.org.dispatch_task(self.task)
-        dt = time.monotonic() - t0
-        self.assertLess(dt, 1.5, "dispatch waited %.1f s for the receiver" % dt)
+
+        def mark(name):
+            with open(self.log, "a", encoding="utf-8") as f:
+                f.write("PY:%s\n" % name)
+
+        for name in ("_ticket_receipt", "_ledger_rows", "_ledger_size", "_queue_has", "_ticket_state"):
+            def wrapped(*a, _real=getattr(self.org, name), _name=name, **k):
+                mark(_name)
+                return _real(*a, **k)
+            setattr(self.org, name, wrapped)
+
+        def recorded_open(file, *a, **k):   # module-scoped: shadows the builtin for javis_org only
+            mark("open:%s" % os.path.basename(str(file)))
+            return open(file, *a, **k)
+        self.org.open = recorded_open
+        with mock.patch.object(self.org.time, "sleep", lambda _s: mark("sleep")):
+            rc, out = self.org.dispatch_task(self.task)
+        with open(self.log, encoding="utf-8") as f:
+            events = f.read().splitlines()
+        sent = [i for i, e in enumerate(events) if e.startswith("--socket") and " send " in e]
+        self.assertEqual(len(sent), 1, events)
+        self.assertEqual(events[sent[0] + 1:], [], "dispatch observed delivery after the send (a wait)")
         self.assertEqual(rc, 0, out)
         self.assertIn("queued", out)
         self.assertEqual(len(self._sends()), 1)
