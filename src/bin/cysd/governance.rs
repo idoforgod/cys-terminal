@@ -25541,25 +25541,10 @@ mod tests {
         let (daemon,sid)=deadman_daemon("p7-zero");let s=daemon.get_surface(sid).unwrap();
         let mut tracker=DeadmanTracker::default();
         tracker.last_idle_alert.insert("master".into(),Instant::now()+Duration::from_secs(100));
-        // ★(0.14.56) Park the PTY reader first (as p7_deadman_socket_rebuttal_vacant_and_shell_dead does): live
-        //   fixture output re-stamps `last_output` between `backdate_output` and the tick's read, so the verdict
-        //   reads Alive, not Idle (windows-health: 2 idle events instead of 3). The reader stamps before it takes
-        //   `parser`, so once it is parked on `parser` with its one chunk stamped, nothing can re-stamp until the
-        //   gate is released; the gate is taken between chunks (`output_gen` even) so that park is provable.
-        let end=Instant::now()+Duration::from_secs(30);
-        let gate=loop {
-            let g=s.parser.lock().unwrap_or_else(|e|e.into_inner());
-            if s.output_gen.load(AtomicOrdering::Acquire)%2==0 {break g;}
-            drop(g);
-            assert!(Instant::now()<end,"the reader never stood between chunks");
-            std::thread::sleep(Duration::from_millis(1));
-        };
-        let gen=s.output_gen.load(AtomicOrdering::Acquire);
-        s.write_tx.send(crate::state::WriteReq::Data(b"x\n".to_vec())).unwrap();
-        while s.output_gen.load(AtomicOrdering::Acquire)==gen {
-            assert!(Instant::now()<end,"no PTY output after one written line: the reader is not parked");
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        // ★(0.14.56) Park the PTY reader first: live fixture output re-stamps `last_output` between
+        //   `backdate_output` and the tick's read, so the verdict reads Alive, not Idle (windows-health:
+        //   2 idle events instead of 3). While parked, nothing can re-stamp (see `park_reader`).
+        let gate=park_reader(&s);
         for _ in 0..3 {backdate_output(&s,21);check_role_deadman(&daemon,&mut tracker);}
         drop(gate);
         assert_eq!(events_named(&daemon,"master.idle").len(),3);
@@ -25573,12 +25558,16 @@ mod tests {
         let (daemon,sid)=deadman_daemon("p7-zero-wall");let s=daemon.get_surface(sid).unwrap();
         let mut tracker=DeadmanTracker::default();let mono=Instant::now();let epoch=now_epoch()+1000.0;
         let mut comparisons=0;
+        // ★(0.14.56) Same race as p7_deadman_zero_debounce_saturates_future_monotonic_seed: a re-stamped
+        //   `last_output` makes the verdict Alive, so no Idle comparison happens. Park the reader first.
+        let gate=park_reader(&s);
         for n in 0..3 {
             assert!(crate::state::pid_alive(s.pid));assert!(!s.exited.load(AtomicOrdering::Relaxed));
             backdate_output(&s,21);
             super::check_role_deadman_at(&daemon,&mut tracker,epoch-n as f64,mono+Duration::from_millis(n),
                 |_,kind,_,_,_,due,_,_| {if kind=="Idle" {assert_eq!(due,Some(true));comparisons+=1;}});
         }
+        drop(gate);
         assert_eq!(comparisons,3);assert_eq!(events_named(&daemon,"master.idle").len(),3);
     }
 
@@ -25590,6 +25579,9 @@ mod tests {
         let (daemon,sid)=deadman_daemon("p7-deadlines");let s=daemon.get_surface(sid).unwrap();
         let mut tracker=DeadmanTracker::default();let t=Instant::now();let epoch=now_epoch()+1000.0;
         let mut decisions=Vec::new();
+        // ★(0.14.56) The idle phase reads `last_output`: park the reader so a re-stamp cannot turn a tick
+        //   Alive. The death phase below is decided by the test's own `exited` store, so it runs unparked.
+        let gate=park_reader(&s);
         for (delta,want) in [(0,1),(299,1),(300,2)] {
             assert!(!s.exited.load(AtomicOrdering::Relaxed));assert!(crate::state::pid_alive(s.pid));
             backdate_output(&s,21);
@@ -25598,6 +25590,7 @@ mod tests {
             assert_eq!(events_named(&daemon,"master.idle").len(),want);
             assert!(events_named(&daemon,"master.deadman").is_empty());
         }
+        drop(gate);
         assert_eq!(decisions.iter().map(|x|x.3).collect::<Vec<_>>(),vec![true,false,true]);
         // Fresh socket status cannot rebut a definite surface-exited axis.
         *s.agent_status.lock().unwrap()=Some(crate::state::AgentStatus{state:"working".into(),context_pct:None,task:None,updated_at:epoch});
@@ -25644,26 +25637,10 @@ mod tests {
         // ★(0.14.56) No wait on `exited`: its only production setter is the PTY reader on EOF, and EOF
         //   does not follow the child's death while another process holds the terminal (Windows
         //   `cmd.exe /C more` — `more` stays attached; windows-health 3/3 "fixture exit not observed").
-        //   Instead the reader is parked BEFORE EOF: it takes `parser` for every chunk and the deadman
-        //   tick never does, so holding it with one echoed chunk in flight keeps the reader from
-        //   writing `exited` while the test reaps the child itself and reads the verdict.
-        //   The gate is taken between chunks (`output_gen` even: the reader bumps it odd before a chunk
-        //   and even after it), so the chunk that turns it odd started after the gate and must wait
-        //   for `parser` — an unrelated chunk already in flight cannot fake or hide the park.
-        let end=Instant::now()+Duration::from_secs(30);
-        let gate=loop {
-            let g=s.parser.lock().unwrap_or_else(|e|e.into_inner());
-            if s.output_gen.load(AtomicOrdering::Acquire)%2==0 {break g;}
-            drop(g);
-            assert!(Instant::now()<end,"the reader never stood between chunks");
-            std::thread::sleep(Duration::from_millis(1));
-        };
-        let gen=s.output_gen.load(AtomicOrdering::Acquire);
-        s.write_tx.send(crate::state::WriteReq::Data(b"x\n".to_vec())).unwrap();
-        while s.output_gen.load(AtomicOrdering::Acquire)==gen {
-            assert!(Instant::now()<end,"no PTY output after one written line: the reader is not parked");
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        //   Instead the reader is parked BEFORE EOF (`park_reader`): holding it with one echoed chunk
+        //   in flight keeps the reader from writing `exited` while the test reaps the child itself and
+        //   reads the verdict.
+        let gate=park_reader(&s);
         s.child.lock().unwrap().kill().expect("owned fixture stop");
         s.child.lock().unwrap().wait().expect("owned fixture reap");
         assert!(!crate::state::pid_alive(s.pid),"fixture child not reaped");
@@ -25712,6 +25689,32 @@ mod tests {
         *s.last_output.lock().unwrap() = std::time::Instant::now()
             .checked_sub(std::time::Duration::from_secs(secs))
             .expect("clock too young for backdate");
+    }
+
+    /// ★(0.14.56) Park the fixture's PTY reader until the returned guard is dropped. The reader bumps
+    /// `output_gen` odd, stamps `last_output`, then takes `parser` for every chunk (even again after it);
+    /// it is the only production writer of `last_output` and of `exited` (on EOF), and the deadman tick
+    /// never takes `parser`. So while the guard lives with one chunk in flight, nothing re-stamps
+    /// `last_output` or writes `exited`. The gate is taken between chunks (`output_gen` even), so the
+    /// chunk that turns it odd started after the gate and must wait for `parser` — an unrelated chunk
+    /// already in flight cannot fake or hide the park. One written line makes that chunk.
+    #[track_caller]
+    fn park_reader(s: &crate::state::Surface) -> std::sync::MutexGuard<'_, vt100::Parser> {
+        let end=Instant::now()+Duration::from_secs(30);
+        let gate=loop {
+            let g=s.parser.lock().unwrap_or_else(|e|e.into_inner());
+            if s.output_gen.load(AtomicOrdering::Acquire)%2==0 {break g;}
+            drop(g);
+            assert!(Instant::now()<end,"the reader never stood between chunks");
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        let gen=s.output_gen.load(AtomicOrdering::Acquire);
+        s.write_tx.send(crate::state::WriteReq::Data(b"x\n".to_vec())).unwrap();
+        while s.output_gen.load(AtomicOrdering::Acquire)==gen {
+            assert!(Instant::now()<end,"no PTY output after one written line: the reader is not parked");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        gate
     }
 
     /// ★D-R2-3 상설 덤프 — ★실패 경로에서만 찍는다(통과 때 출력 0 ⇒ 로그 비용 0).
@@ -26572,10 +26575,13 @@ after-tick liveness alone does not attribute a clock defect",
         let s = daemon.get_surface(sid).unwrap();
         let mut tracker = DeadmanTracker::default();
         let mut trace = DeadmanTickTrace::new("master");
+        // ★(0.14.56) A re-stamped `last_output` makes a tick Alive (no idle event): park the reader first.
+        let gate = park_reader(&s);
         for _ in 0..3 {
             backdate_output(&s, 21);
             trace.tick(&daemon, &s, &mut tracker);
         }
+        drop(gate);
         let idles = events_named(&daemon, "master.idle");
         trace.expect(idles.len(), 3, "idle 디바운스 0 = 매 틱 발화(death 노브와 독립)");
         assert_eq!(idles[0]["payload"]["debounce_secs"], 0, "payload 는 idle 전용 노브 값");
