@@ -53,6 +53,7 @@ mod knobs;
 mod office_bridge;
 mod native_publication;
 mod pending_requests;
+mod phoenix_plan;
 mod policy_loader;
 mod recall;
 mod reclaim;
