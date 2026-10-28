@@ -70,22 +70,7 @@ jobs:
           #   가드다(cysjavis-pack/bin/*.py · 회귀 잠금 tests/test_import_guard.py).
           # ★내용 3줄 동결 — `import site` 를 빼면 pip·site-packages 가 죽어 앱 내 CLI 설치가 붕괴한다.
           printf 'python312.zip\n.\nimport site\n' > "$RT/python/python312._pth"
-          # ── pip 부트스트랩 (embeddable은 pip 미포함 → 'No module named pip' 방지) ──
-          echo "== get-pip (embeddable python pip 부트스트랩) =="
-          curl -fL -o "$RT/python/get-pip.py" "https://bootstrap.pypa.io/get-pip.py"
-          "$RT/python/python.exe" "$RT/python/get-pip.py" --no-warn-script-location
-          rm -f "$RT/python/get-pip.py"
-          # ── uv/uvx 동봉 (serena·nlm-mcp-cli가 uvx 전제 → C20/C43 FAIL 방지). runtime/python은 cysd가 PATH 주입. ──
-          echo "== uv 0.11.26 (x86_64-pc-windows-msvc) 동봉 =="
-          curl -fL -o uv.zip "https://github.com/astral-sh/uv/releases/download/0.11.26/uv-x86_64-pc-windows-msvc.zip"
-          7z x uv.zip -o"$RT/python" -y >/dev/null
-          ls -la "$RT/python/uv.exe" "$RT/python/uvx.exe"
-          # ── node + npm/npx 동봉 (mac 0.7.0 파리티 — 순정 Windows엔 node 부재. runtime/node는 cysd가 PATH 주입) ──
-          echo "== Node.js 22.17.1 (npm/npx — win-x64, mac과 동일 핀) =="
-          curl -fL -o node.zip "https://nodejs.org/dist/v22.17.1/node-v22.17.1-win-x64.zip"
-          7z x node.zip -o"$RT" -y >/dev/null
-          mv "$RT/node-v22.17.1-win-x64" "$RT/node"
-          ls -la "$RT/node/node.exe" "$RT/node/npm.cmd"
+          # DIAG run 3: get-pip / uv / Node.js downloads removed on this branch (unused by the control and DIAG steps - census in _evidence 0.14.56-C03-WIN/run3-census).
           # 라이선스 고지(동봉 재배포 의무).
           mkdir -p "$RT/LICENSES"
           printf 'Bundled runtimes and their licenses:\n- Git for Windows (git): GPLv2 (https://github.com/git-for-windows/git)\n- MSYS2 bash + GNU coreutils: GPLv3\n- CPython (embeddable): PSF License (https://www.python.org)\n- pip (get-pip bootstrap): MIT\n- uv (astral-sh): Apache-2.0 OR MIT (https://github.com/astral-sh/uv)\n- Node.js (+npm/npx): MIT (https://nodejs.org)\nWritten offer for corresponding source: contact the distributor.\n' > "$RT/LICENSES/BUNDLED-RUNTIMES.txt"

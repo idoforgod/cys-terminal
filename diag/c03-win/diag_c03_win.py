@@ -306,6 +306,8 @@ def held_output_case():
 
 
 def main():
+    for _s in (sys.stdout, sys.stderr):  # the Windows runner's stdout is cp1252; captures carry Korean text
+        _s.reconfigure(encoding='utf-8', errors='backslashreplace')
     emit('ENV', {'executable': sys.executable, 'version': sys.version.split()[0], 'platform': sys.platform,
                  'isolated': sys.flags.isolated, 'iter': ITER, 'window_s': WINDOW})
     instrument_ok = True
