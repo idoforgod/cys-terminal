@@ -65,6 +65,7 @@ mod s5_escalation;
 mod schedule;
 mod severity;
 mod skillrun;
+mod spool_watch;
 mod state;
 mod submit_assoc;
 mod teamtoken;
@@ -1416,6 +1417,9 @@ async fn async_main() {
     //   내는 부트 이벤트는 어차피 300s 유예 창에서 보류로 간다.
     //   ★롤백: `CYS_ALERT_ROUTE=0` → 이 태스크가 뜨지 않는다(status 의 alert_route.enabled=false).
     alert_route::spawn(Arc::clone(&daemon));
+    // ★(0.14.56 X-8 CARRIER) every daemon - base and dept, no dept skip - watches the HUD bridge's /health for its OWN
+    //   spool lane and tells its OWN master through the router above (DESIGN-r3 4-2 step 3). Read-only: one GET + one stat a minute.
+    spool_watch::spawn(Arc::clone(&daemon));
     usage::spawn_usage_collector(Arc::clone(&daemon));
     usage::spawn_agy_collector(Arc::clone(&daemon));
     // F-01 (0.14.52) display-only activity observer — its own OS thread; failure leaves dots Unknown.
@@ -1964,10 +1968,7 @@ fn spawn_office_bridge(state_dir: std::path::PathBuf, socket_path: std::path::Pa
     if !script.is_file() {
         return; // 구팩(브리지 미배포) — 다음 팩 업데이트가 채운다.
     }
-    let port: u16 = std::env::var("HUD_PORT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(8642);
+    let port: u16 = crate::office_bridge::bridge_port();
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));

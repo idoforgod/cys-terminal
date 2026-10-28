@@ -528,6 +528,8 @@ pub struct RouteState {
     pub restored_admissions: std::collections::BTreeSet<AlertKey>,
     /// 마지막 접힘 원장 압축 시각(단조 초) — 압축 최소 간격 판정.
     pub last_compact_mono: f64,
+    /// (0.14.56 X-8 CARRIER) the office.spool leg's in-memory part ([`OfficeSpoolMem`]).
+    pub office_spool: OfficeSpoolMem,
 }
 
 /// ★(0.14.31 · 독립 판정 triage X3) **버려도 되는가**는 접기 우선순위([`RouteState::fold_rank`])와
@@ -3325,6 +3327,12 @@ pub fn route_once(daemon: &Arc<Daemon>, item: &AlertItem, now: Now) -> usize {
 
 /// 이벤트 1건 처리(구독 루프·검체 공용 진입점).
 pub fn handle_event(daemon: &Arc<Daemon>, event: &Value, now: Now) {
+    // ★(0.14.56 X-8 CARRIER) the spool watch's observation goes to this daemon's own master (and, on the base, the
+    //   Secretariat digest). Intercepted BEFORE `routable`/`summarize`, so it never enters the CSO pending set.
+    if event.get("name").and_then(Value::as_str) == Some(OFFICE_SPOOL_EVENT) {
+        route_office_spool(daemon, event, now);
+        return;
+    }
     let Some(item) = summarize(event) else {
         return;
     };
@@ -4023,6 +4031,445 @@ async fn pump(daemon: Arc<Daemon>, tx: tokio::sync::mpsc::Sender<Job>) {
                 let _ = tx.try_send(Job::Wake);
             }
         }
+    }
+}
+
+// ───────────────────── X-8 CARRIER (0.14.56): office.spool -> the lane's own master · base -> Secretariat digest ─────────────────────
+//
+// DESIGN-r3 (e04f3f11) 4-2..4-8. `spool_watch` (every daemon, base and dept) reads the HUD bridge's `/health` once a minute,
+// keeps its OWN entries, adds its own checks (W1-W5) and publishes ONE observation named [`OFFICE_SPOOL_EVENT`] on its OWN bus.
+// This router (the same daemon's single executor) intercepts that name before `routable` and delivers through
+// `enqueue_into_seat` to this daemon's own `master` (exact role). On the base daemon the observation also carries the
+// all-lane digest for the Secretariat. Nothing here reads, writes or calls the faulting carrier (the spool files, the bridge
+// process, its port) - `office_spool_router_never_touches_the_faulting_carrier` pins that on this file's production part.
+
+/// Event name the watch publishes (the watch imports this const - the dependency runs one way).
+pub const OFFICE_SPOOL_EVENT: &str = "office.spool";
+/// Per-daemon episode record: `{"<lane>|<state>": {entry_id, rearmed, clear_streak}}` (state dir, atomic write).
+pub const OFFICE_SPOOL_NOTIFIED_FILE: &str = "office-spool-notified.json";
+/// Base daemon only: the last Secretariat digest `{set, epoch, entry_id}` - a restart does not resend it.
+pub const OFFICE_SPOOL_DIGEST_FILE: &str = "office-spool-digest.json";
+/// An episode closes only after this many CONSECUTIVE explicit non-fault reports of its lane (counted in probes; the watch
+/// probes every 60 s, so about 10 minutes while the machine is awake). Absence from an observation never closes it.
+pub const OFFICE_SPOOL_CLOSE_STREAK: u32 = 10;
+/// Secretariat digest: a change within this many seconds of the last digest waits (coalesced) - at most 2 per hour.
+pub const OFFICE_SPOOL_DIGEST_WINDOW_SECS: f64 = 1800.0;
+/// Every digest entry starts with this text - also how "one undelivered digest at most" is checked in the queue.
+pub const OFFICE_SPOOL_DIGEST_PREFIX: &str = "[alert] office.spool digest";
+/// The lane's own master, by exact role (B-439 shape: `RoleGuard::Exact`).
+const OFFICE_SPOOL_MASTER_ROLE: &str = "master";
+/// Secretariat lead first, then the staff (A15-1), each by exact role.
+const OFFICE_SPOOL_DIGEST_ROLES: [&str; 3] = ["worker", "worker-3", "worker-4"];
+
+/// One (lane, state) pair of an observation. `fault` is the ONE decider (the bridge's flag, or `true` for the watch's own
+/// W1-W5); this router never re-derives it from `state`. `hint` (optional) is the watch's own wording for its W checks.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpoolLane {
+    pub lane: String,
+    pub state: String,
+    pub fault: bool,
+    pub hint: Option<String>,
+}
+
+impl SpoolLane {
+    fn id(&self) -> String {
+        format!("{}|{}", self.lane, self.state)
+    }
+}
+
+/// One open episode in the record.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct SpoolEpisode {
+    pub entry_id: String,
+    pub rearmed: bool,
+    pub clear_streak: u32,
+}
+
+/// In-memory part of the office-spool leg (lives in [`RouteState`]; nothing here is a decision input across restarts).
+#[derive(Debug, Default)]
+pub struct OfficeSpoolMem {
+    /// `<episode or "digest">|<reason>` already written to the refused ledger - ONE row per (episode, reason).
+    pub refused_logged: std::collections::BTreeSet<String>,
+    /// Monotonic second of the last digest this boot (the window runs on `Now::mono`; across a restart the record's epoch).
+    pub digest_sent_mono: Option<f64>,
+}
+
+fn parse_spool_lanes(payload: &Value) -> Vec<SpoolLane> {
+    payload
+        .get("lanes")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|e| {
+                    let lane = e.get("lane").and_then(Value::as_str).filter(|s| !s.is_empty())?;
+                    let state = e.get("state").and_then(Value::as_str).filter(|s| !s.is_empty())?;
+                    Some(SpoolLane {
+                        lane: lane.to_string(),
+                        state: state.to_string(),
+                        fault: e.get("fault").and_then(Value::as_bool).unwrap_or(false),
+                        hint: e.get("hint").and_then(Value::as_str).map(str::to_string),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Read the episode record. Missing, unreadable or malformed -> empty (K2: a duplicate notice rather than silence).
+pub fn load_spool_record(daemon: &Arc<Daemon>) -> BTreeMap<String, SpoolEpisode> {
+    let mut rec = BTreeMap::new();
+    let Ok(bytes) = std::fs::read(state_dir(daemon).join(OFFICE_SPOOL_NOTIFIED_FILE)) else {
+        return rec;
+    };
+    let Ok(Value::Object(o)) = serde_json::from_slice::<Value>(&bytes) else {
+        return rec;
+    };
+    for (k, v) in o {
+        let Some(entry_id) = v.get("entry_id").and_then(Value::as_str) else { continue };
+        rec.insert(
+            k,
+            SpoolEpisode {
+                entry_id: entry_id.to_string(),
+                rearmed: v.get("rearmed").and_then(Value::as_bool).unwrap_or(false),
+                clear_streak: v.get("clear_streak").and_then(Value::as_u64).unwrap_or(0).min(u32::MAX as u64) as u32,
+            },
+        );
+    }
+    rec
+}
+
+fn save_spool_record(daemon: &Arc<Daemon>, rec: &BTreeMap<String, SpoolEpisode>) -> std::io::Result<()> {
+    let doc: serde_json::Map<String, Value> = rec
+        .iter()
+        .map(|(k, e)| (k.clone(), json!({"entry_id": e.entry_id, "rearmed": e.rearmed, "clear_streak": e.clear_streak})))
+        .collect();
+    let dir = state_dir(daemon);
+    std::fs::create_dir_all(&dir)?;
+    crate::governance::write_json_atomic(&dir, OFFICE_SPOOL_NOTIFIED_FILE, &Value::Object(doc).to_string())
+}
+
+/// Plain-language reason per state - the master reads this, not the enum.
+fn office_spool_hint(state: &str) -> &'static str {
+    match state {
+        "mismatch" => "this lane's producers write a different spool path than the HUD reader reads",
+        "unknown_pack" => "the fleet registry has no pack_dir for this lane, so its spool is not read",
+        "pack_missing" => "this lane's pack directory does not exist, so its spool is not read",
+        "over_cap" => "more lanes than the reader cap - this lane's spool is not read",
+        "lane_key_collision" => "two fleet rows map to one lane key - neither spool is read",
+        "leaf_missing" => "the bridge cannot load javis_spool_path.py - no spool is read",
+        "fleet_unavailable" => "the bridge got no fleet list within 60 s - no dept spool is read",
+        "bridge_unreachable" => "the HUD bridge gave no usable /health spool report on 3 probes in a row",
+        "not_ready" => "the bridge has not finished its spool self-check after 5 probes",
+        "lane_unobserved" => "the bridge lists no entry for this lane (3 probes in a row) - this lane's spool is not read",
+        "path_disagrees" => "the bridge reads another path than this lane's pack spool",
+        "reader_stalled" => "this lane's spool grows but the reader offset has not moved for 3 probes",
+        _ => "see the HUD bridge /health `spool` entry",
+    }
+}
+
+fn office_spool_text(lanes: &[&SpoolLane], resent: bool) -> String {
+    let items: Vec<String> = lanes
+        .iter()
+        .map(|l| format!("{} {} ({})", l.lane, l.state, l.hint.as_deref().unwrap_or_else(|| office_spool_hint(&l.state))))
+        .collect();
+    let tail = if resent {
+        "re-sent once: the first notice expired unread"
+    } else {
+        "told once per episode by this lane's own daemon; the HUD bridge /health `spool` has the detail; no spool byte is deleted"
+    };
+    format!("[alert] office.spool FAULT: {} | {}", items.join("; "), tail)
+}
+
+/// One master entry; the error is the reason word for the ledger.
+fn office_spool_enqueue(daemon: &Arc<Daemon>, role: &str, text: String) -> Result<(u64, String), &'static str> {
+    let Some(sid) = daemon.roles.lock().unwrap().get(role).copied() else {
+        return Err("no_seat");
+    };
+    enqueue_into_seat(
+        daemon,
+        sid,
+        text,
+        Some(ALERT_FROM.to_string()),
+        ALERT_ORIGIN,
+        CSO_QUEUE_HEADROOM,
+        Some(RoleGuard::Exact(role)),
+        FreezeGuard::DaemonAndSeat,
+        None,
+    )
+    .map(|(entry_id, _)| (sid, entry_id))
+    .map_err(|e| match e {
+        EnqueueErr::SeatGone | EnqueueErr::RoleChanged => "no_seat",
+        EnqueueErr::EmptySeat => "empty_seat",
+        EnqueueErr::QueueFull => "queue_full",
+        EnqueueErr::Frozen => "paused",
+    })
+}
+
+/// ONE refused-ledger row + bus event per (episode or digest, reason); nothing is marked, the next tick retries.
+fn office_spool_refused(daemon: &Arc<Daemon>, keys: &[String], kind: &str, reason: &str, now: Now) {
+    let fresh: Vec<String> = {
+        let mut st = state_lock(daemon);
+        keys.iter()
+            .filter(|k| st.office_spool.refused_logged.insert(format!("{k}|{reason}")))
+            .cloned()
+            .collect()
+    };
+    if fresh.is_empty() {
+        return;
+    }
+    let row = json!({"ts": now.epoch, "kind": kind, "reason": reason, "episodes": fresh,
+                     "note": "not delivered; nothing marked - retried on every observation"});
+    let archived = append_refused(daemon, &[row]);
+    publish_route(
+        daemon,
+        "alert_route.office_spool_undelivered",
+        json!({"kind": kind, "reason": reason, "episodes": fresh,
+               "archived_to": if archived.is_ok() { json!(REFUSED_FILE) } else { Value::Null }}),
+    );
+}
+
+fn office_spool_clear_refused(daemon: &Arc<Daemon>, keys: &[String]) {
+    let mut st = state_lock(daemon);
+    st.office_spool
+        .refused_logged
+        .retain(|k| !keys.iter().any(|id| k.starts_with(&format!("{id}|"))));
+}
+
+fn office_spool_expired_ids(daemon: &Arc<Daemon>, role: &str) -> std::collections::BTreeSet<String> {
+    let sid = daemon.roles.lock().unwrap().get(role).copied();
+    sid.and_then(|s| daemon.get_surface(s))
+        .map(|s| s.expired_queue.lock().unwrap().iter().map(|e| e.id.clone()).collect())
+        .unwrap_or_default()
+}
+
+/// The own-master leg. Returns the number of master entries created (0, 1 or 2) - for tests and the bus event.
+pub fn office_spool_master_leg(daemon: &Arc<Daemon>, lanes: &[SpoolLane], now: Now) -> usize {
+    let before = load_spool_record(daemon);
+    let mut rec = before.clone();
+    let fault_lanes: std::collections::BTreeSet<&str> = lanes.iter().filter(|l| l.fault).map(|l| l.lane.as_str()).collect();
+    let ok_lanes: std::collections::BTreeSet<&str> = lanes.iter().filter(|l| !l.fault).map(|l| l.lane.as_str()).collect();
+    // Close rule: only explicit non-fault reports of the episode's lane count; a lane absent from this observation is untouched.
+    let mut closed = Vec::new();
+    for (id, ep) in rec.iter_mut() {
+        let lane = id.split('|').next().unwrap_or("");
+        if fault_lanes.contains(lane) {
+            ep.clear_streak = 0;
+        } else if ok_lanes.contains(lane) {
+            ep.clear_streak = ep.clear_streak.saturating_add(1);
+            if ep.clear_streak >= OFFICE_SPOOL_CLOSE_STREAK {
+                closed.push(id.clone());
+            }
+        }
+    }
+    for id in &closed {
+        rec.remove(id);
+    }
+    let faults: Vec<&SpoolLane> = lanes.iter().filter(|l| l.fault).collect();
+    // An explicitly non-faulted (lane, state) forgets its ledger-dedupe keys: a LATER undeliverable episode of the same
+    // pair and reason gets its own row again (R2 D2-10). Lanes absent from this observation keep theirs.
+    {
+        let gone: Vec<String> = lanes.iter().filter(|l| !l.fault).map(|l| l.lane.clone()).collect();
+        if !gone.is_empty() {
+            let still: std::collections::BTreeSet<String> = faults.iter().map(|l| l.id()).collect();
+            state_lock(daemon).office_spool.refused_logged.retain(|k| {
+                let lane = k.split('|').next().unwrap_or("");
+                !gone.iter().any(|g| g == lane) || still.iter().any(|id| k.starts_with(&format!("{id}|")))
+            });
+        }
+    }
+    let mut created = 0;
+    // Q-r2-2: ONE entry per observation listing every (lane, state) not yet in the record.
+    let mut new: Vec<&SpoolLane> = Vec::new();
+    for l in &faults {
+        if !rec.contains_key(&l.id()) && !new.iter().any(|n| n.id() == l.id()) {
+            new.push(l);
+        }
+    }
+    if !new.is_empty() {
+        let ids: Vec<String> = new.iter().map(|l| l.id()).collect();
+        match office_spool_enqueue(daemon, OFFICE_SPOOL_MASTER_ROLE, office_spool_text(&new, false)) {
+            Ok((sid, entry_id)) => {
+                for id in &ids {
+                    rec.insert(id.clone(), SpoolEpisode { entry_id: entry_id.clone(), rearmed: false, clear_streak: 0 });
+                }
+                office_spool_clear_refused(daemon, &ids);
+                publish_route(
+                    daemon,
+                    "alert_route.office_spool_to_master",
+                    json!({"episodes": ids, "master_surface": sid, "queue_entry_id": entry_id}),
+                );
+                created += 1;
+            }
+            Err(reason) => office_spool_refused(daemon, &ids, "office_spool_undelivered", reason, now),
+        }
+    }
+    // Re-arm ONCE: the episode's entry expired unread while the fault persists -> one new entry, never again this episode.
+    let expired = office_spool_expired_ids(daemon, OFFICE_SPOOL_MASTER_ROLE);
+    let rearm: Vec<&SpoolLane> = faults
+        .iter()
+        .copied()
+        .filter(|l| rec.get(&l.id()).is_some_and(|e| !e.rearmed && expired.contains(&e.entry_id)))
+        .collect();
+    if !rearm.is_empty() {
+        let ids: Vec<String> = rearm.iter().map(|l| l.id()).collect();
+        match office_spool_enqueue(daemon, OFFICE_SPOOL_MASTER_ROLE, office_spool_text(&rearm, true)) {
+            Ok((sid, entry_id)) => {
+                for id in &ids {
+                    if let Some(e) = rec.get_mut(id) {
+                        e.entry_id = entry_id.clone();
+                        e.rearmed = true;
+                    }
+                }
+                let row = json!({"ts": now.epoch, "kind": "office_spool_expired_renotified", "episodes": ids,
+                                 "queue_entry_id": entry_id});
+                let _ = append_refused(daemon, &[row]);
+                publish_route(
+                    daemon,
+                    "alert_route.office_spool_expired_renotified",
+                    json!({"episodes": ids, "master_surface": sid, "queue_entry_id": entry_id}),
+                );
+                created += 1;
+            }
+            Err(reason) => office_spool_refused(daemon, &ids, "office_spool_undelivered", reason, now),
+        }
+    }
+    if rec != before {
+        if let Err(e) = save_spool_record(daemon, &rec) {
+            // Not saved -> the next observation sees the old record: a duplicate notice rather than silence (K2).
+            publish_route(daemon, "alert_route.office_spool_record_unsaved", json!({"error": e.to_string()}));
+        }
+    }
+    created
+}
+
+/// The digest's fault set, one way for the router and the watch: the bridge's faults + "bridge unreachable", sorted, unique.
+pub fn office_spool_digest_set(digest: &Value) -> Vec<String> {
+    let mut set: Vec<String> = digest
+        .get("faults")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .unwrap_or_default();
+    if digest.get("unreachable").and_then(Value::as_bool).unwrap_or(false) {
+        set.push("bridge unreachable".to_string());
+    }
+    set.sort();
+    set.dedup();
+    set
+}
+
+/// The last digest this daemon delivered: `(set, epoch)`, or None when there is no readable record.
+fn office_spool_recorded_digest(daemon: &Arc<Daemon>) -> Option<(Vec<String>, f64)> {
+    std::fs::read(state_dir(daemon).join(OFFICE_SPOOL_DIGEST_FILE))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|v| {
+            let s = v.get("set")?.as_array()?.iter().filter_map(Value::as_str).map(str::to_string).collect();
+            Some((s, v.get("epoch").and_then(Value::as_f64).unwrap_or(0.0)))
+        })
+}
+
+/// Does this observation give the router anything to do? (DESIGN-r2 1-4: one event a minute "only while something is
+/// faulted".) Yes when a lane is faulted, when an episode is still open in this daemon's record (its lane's explicit ok
+/// reports are what close it), or - base - when the digest set differs from the last delivered one (a change held by the
+/// window or by an undelivered digest must be presented again later, never dropped). A steady all-ok daemon publishes
+/// NOTHING, so a master's unfiltered `cys events` stream carries no per-minute line. An unreadable record says yes (loud).
+pub fn office_spool_wants(daemon: &Arc<Daemon>, payload: &Value) -> bool {
+    let faulted = payload
+        .get("lanes")
+        .and_then(Value::as_array)
+        .is_some_and(|a| a.iter().any(|l| l.get("fault").and_then(Value::as_bool).unwrap_or(false)));
+    if faulted {
+        return true;
+    }
+    match std::fs::read(state_dir(daemon).join(OFFICE_SPOOL_NOTIFIED_FILE)) {
+        Ok(b) => match serde_json::from_slice::<Value>(&b) {
+            Ok(Value::Object(o)) if o.is_empty() => {}
+            _ => return true,
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return true,
+    }
+    match payload.get("digest").filter(|d| d.is_object()) {
+        Some(d) => {
+            let recorded = office_spool_recorded_digest(daemon).map(|(s, _)| s).unwrap_or_default();
+            office_spool_digest_set(d) != recorded
+        }
+        None => false,
+    }
+}
+
+/// The base daemon's Secretariat digest leg. Returns true when a digest entry was queued.
+pub fn office_spool_digest_leg(daemon: &Arc<Daemon>, digest: &Value, now: Now) -> bool {
+    let set = office_spool_digest_set(digest);
+    let last = office_spool_recorded_digest(daemon);
+    match &last {
+        Some((s, _)) if *s == set => return false, // no change
+        None if set.is_empty() => return false,    // nothing at start while the set is empty
+        _ => {}
+    }
+    // Coalescing window: monotonic this boot; across a restart, the record's epoch.
+    let mono = state_lock(daemon).office_spool.digest_sent_mono;
+    let in_window = match (mono, &last) {
+        (Some(m), _) => now.mono - m < OFFICE_SPOOL_DIGEST_WINDOW_SECS,
+        (None, Some((_, e))) => *e > 0.0 && now.epoch >= *e && now.epoch - *e < OFFICE_SPOOL_DIGEST_WINDOW_SECS,
+        (None, None) => false,
+    };
+    if in_window {
+        return false;
+    }
+    let target = {
+        let roles = daemon.roles.lock().unwrap();
+        OFFICE_SPOOL_DIGEST_ROLES.iter().find(|r| roles.contains_key(**r)).copied()
+    };
+    let Some(role) = target else {
+        office_spool_refused(daemon, &["digest".to_string()], "office_spool_digest_undelivered", "no_secretariat", now);
+        return false;
+    };
+    // At most ONE undelivered digest in the Secretariat queue.
+    let waiting = daemon
+        .roles
+        .lock()
+        .unwrap()
+        .get(role)
+        .copied()
+        .and_then(|sid| daemon.get_surface(sid))
+        .is_some_and(|s| s.pending_queue.lock().unwrap().iter().any(|e| e.text.starts_with(OFFICE_SPOOL_DIGEST_PREFIX)));
+    if waiting {
+        return false;
+    }
+    let body = if set.is_empty() { "none (cleared)".to_string() } else { set.join(", ") };
+    let text = format!("{OFFICE_SPOOL_DIGEST_PREFIX} | FAULT: {body} | each lane's own master is told by its own daemon");
+    match office_spool_enqueue(daemon, role, text) {
+        Ok((sid, entry_id)) => {
+            state_lock(daemon).office_spool.digest_sent_mono = Some(now.mono);
+            office_spool_clear_refused(daemon, &["digest".to_string()]);
+            let dir = state_dir(daemon);
+            let _ = std::fs::create_dir_all(&dir);
+            let doc = json!({"set": set, "epoch": now.epoch, "entry_id": entry_id});
+            if let Err(e) = crate::governance::write_json_atomic(&dir, OFFICE_SPOOL_DIGEST_FILE, &doc.to_string()) {
+                publish_route(daemon, "alert_route.office_spool_record_unsaved", json!({"error": e.to_string()}));
+            }
+            publish_route(
+                daemon,
+                "alert_route.office_spool_digest",
+                json!({"role": role, "surface": sid, "queue_entry_id": entry_id, "faults": set}),
+            );
+            true
+        }
+        Err(reason) => {
+            office_spool_refused(daemon, &["digest".to_string()], "office_spool_digest_undelivered", reason, now);
+            false
+        }
+    }
+}
+
+/// The intercept target: an `office.spool` observation from this daemon's own watch.
+fn route_office_spool(daemon: &Arc<Daemon>, event: &Value, now: Now) {
+    let payload = event.get("payload").unwrap_or(&Value::Null);
+    let lanes = parse_spool_lanes(payload);
+    office_spool_master_leg(daemon, &lanes, now);
+    if let Some(d) = payload.get("digest").filter(|d| d.is_object()) {
+        office_spool_digest_leg(daemon, d, now);
     }
 }
 
@@ -9468,5 +9915,322 @@ mod b3_summary_tests {
         for n in [ACCT, SEAT, "alert.weekly_budget"] {
             assert!(routable(n), "{n}");
         }
+    }
+}
+
+// ═════════════════ X-8 CARRIER (0.14.56) - office.spool router leg on the product function ═════════════════
+// These drills use ONLY APIs that exist at 9254af1a (Daemon, seats, `handle_event`, the literal event name and record file
+// name), so the same bytes compile at the pin and FAIL there on behaviour (RED-first evidence; DESIGN-r3 Q1-Q12, T2, T4, T5).
+#[cfg(all(test, unix))]
+mod office_spool_drills {
+    use super::*;
+    use serde_json::json;
+
+    const EV: &str = "office.spool";
+    const REC: &str = "office-spool-notified.json";
+
+    fn daemon_at(tag: &str, sub: &str) -> Arc<Daemon> {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("cys-osd-{}-{}-{}", tag, std::process::id(), n)).join(sub);
+        let _ = std::fs::create_dir_all(&dir);
+        Daemon::new(dir.join("cys.sock"))
+    }
+    fn seat(d: &Arc<Daemon>, role: &str) -> u64 {
+        let s = d.create_surface(None, Some("sleep 30".into()), None, Some(role.into()), 24, 80).expect("create surface");
+        d.roles.lock().unwrap().insert(role.into(), s.id);
+        d.surfaces.lock().unwrap().insert(s.id, s.clone());
+        *s.agent_meta.lock().unwrap() = Some(("claude".into(), "/usr/local/bin/claude".into()));
+        s.id
+    }
+    fn texts(d: &Arc<Daemon>, role: &str) -> Vec<String> {
+        let sid = d.roles.lock().unwrap().get(role).copied();
+        sid.and_then(|s| d.get_surface(s))
+            .map(|s| s.pending_queue.lock().unwrap().iter().map(|e| e.text.clone()).collect())
+            .unwrap_or_default()
+    }
+    fn expire_all(d: &Arc<Daemon>, role: &str) {
+        let sid = d.roles.lock().unwrap().get(role).copied().unwrap();
+        let s = d.get_surface(sid).unwrap();
+        let mut p = s.pending_queue.lock().unwrap();
+        let mut e = s.expired_queue.lock().unwrap(); // lock order pending -> expired (state.rs)
+        while let Some(x) = p.pop_front() {
+            e.push_back(x);
+        }
+    }
+    fn pair(tag: &str) -> (Arc<Daemon>, Arc<Daemon>) {
+        let b = daemon_at(tag, "cys");
+        let d5 = daemon_at(tag, "cys-dept-dept-5");
+        seat(&b, "master");
+        seat(&b, "worker");
+        seat(&d5, "master");
+        (b, d5)
+    }
+    fn lane(l: &str, s: &str, f: bool) -> Value {
+        json!({"lane": l, "state": s, "fault": f})
+    }
+    fn send(d: &Arc<Daemon>, lanes: Vec<Value>, digest: Value, mono: f64) {
+        let ev = json!({"type": "event", "seq": 1, "name": EV, "category": "office_spool", "surface_id": null,
+                        "payload": {"lanes": lanes, "digest": digest}});
+        handle_event(d, &ev, Now::at(mono));
+    }
+    fn send_at(d: &Arc<Daemon>, lanes: Vec<Value>, digest: Value, now: Now) {
+        let ev = json!({"type": "event", "seq": 1, "name": EV, "category": "office_spool", "surface_id": null,
+                        "payload": {"lanes": lanes, "digest": digest}});
+        handle_event(d, &ev, now);
+    }
+
+    /// Q1/Q2/Q3: a dept fault reaches THAT dept's master only; the CEO gets none of it; the Secretariat gets the digest.
+    #[test]
+    fn osd_q1_q3_dept_fault_reaches_own_master_never_the_ceo_and_the_digest_reaches_the_secretariat() {
+        let (b, d5) = pair("q1");
+        send(&d5, vec![lane("dept-5", "mismatch", true)], Value::Null, 400.0);
+        send(&b, vec![lane("main", "ok", false), lane("_bridge", "ok", false), lane("_fleet", "ok", false)],
+             json!({"faults": ["dept-3 pack_missing", "dept-5 mismatch"], "unreachable": false}), 400.0);
+        let (m5, ceo, sec) = (texts(&d5, "master"), texts(&b, "master"), texts(&b, "worker"));
+        println!("OSD-Q1 dept-5 master={m5:?} CEO={ceo:?} Secretariat={sec:?}");
+        assert_eq!(m5.len(), 1, "dept-5's own master is told once");
+        assert!(m5[0].starts_with("[alert] office.spool") && m5[0].contains("dept-5 mismatch") && !m5[0].contains("dept-3"));
+        assert!(ceo.is_empty(), "no dept fault in the CEO inbox (no interim route)");
+        assert_eq!(sec.len(), 1);
+        assert!(sec[0].contains("dept-3 pack_missing") && sec[0].contains("dept-5 mismatch"));
+    }
+
+    /// Q6: the episode record survives a restart - no second notice for the same open episode.
+    #[test]
+    fn osd_q6_restart_does_not_resend_an_open_episode() {
+        let (_b, d5) = pair("q6");
+        send(&d5, vec![lane("dept-5", "mismatch", true)], Value::Null, 400.0);
+        assert_eq!(texts(&d5, "master").len(), 1);
+        assert!(crate::state::state_dir(&d5.socket_path).join(REC).is_file(), "record written");
+        let d5b = Daemon::new(d5.socket_path.clone());
+        seat(&d5b, "master");
+        send(&d5b, vec![lane("dept-5", "mismatch", true)], Value::Null, 10.0);
+        println!("OSD-Q6 after restart new entries={}", texts(&d5b, "master").len());
+        assert_eq!(texts(&d5b, "master").len(), 0);
+    }
+
+    /// Q-r2-2: ONE entry per observation listing every new (lane, state) - never one per pair.
+    #[test]
+    fn osd_one_entry_per_observation_lists_every_new_pair() {
+        let (b, _d5) = pair("qr22");
+        send(&b, vec![lane("main", "pack_missing", true), lane("_fleet", "fleet_unavailable", true),
+                      lane("_bridge", "ok", false)], Value::Null, 400.0);
+        let ceo = texts(&b, "master");
+        println!("OSD-QR22 CEO={ceo:?}");
+        assert_eq!(ceo.len(), 1);
+        assert!(ceo[0].contains("main pack_missing") && ceo[0].contains("_fleet fleet_unavailable"));
+    }
+
+    /// Q9 (+ Q12 by mutation): an expired notice is re-sent ONCE per episode, never again.
+    #[test]
+    fn osd_q9_rearm_once_per_episode() {
+        let (_b, d5) = pair("q9");
+        let f = || vec![lane("dept-5", "mismatch", true)];
+        send(&d5, f(), Value::Null, 400.0);
+        expire_all(&d5, "master");
+        send(&d5, f(), Value::Null, 460.0);
+        let after_rearm = texts(&d5, "master");
+        expire_all(&d5, "master");
+        for i in 0..3 {
+            send(&d5, f(), Value::Null, 520.0 + 60.0 * i as f64);
+        }
+        println!("OSD-Q9 after re-arm={after_rearm:?} pending after 3 more={}", texts(&d5, "master").len());
+        assert_eq!(after_rearm.len(), 1);
+        assert!(after_rearm[0].contains("re-sent once"));
+        assert_eq!(texts(&d5, "master").len(), 0, "never a third entry in one episode");
+    }
+
+    /// Q10: a partial observation (only `_fleet`) neither closes nor re-notifies the `main` episode.
+    #[test]
+    fn osd_q10_partial_observation_does_not_wipe_or_renotify() {
+        let (b, _d5) = pair("q10");
+        send(&b, vec![lane("main", "pack_missing", true)], Value::Null, 400.0);
+        send(&b, vec![lane("_fleet", "fleet_unavailable", true)], Value::Null, 460.0);
+        send(&b, vec![lane("main", "pack_missing", true)], Value::Null, 520.0);
+        let ceo = texts(&b, "master");
+        println!("OSD-Q10 CEO={ceo:?}");
+        assert_eq!(ceo.len(), 2);
+        assert!(ceo[1].contains("_fleet fleet_unavailable") && !ceo[1].contains("main pack_missing"));
+    }
+
+    /// Q11 + T2: a flap is one episode; it closes only after 10 consecutive explicit ok reports (9 are not enough).
+    #[test]
+    fn osd_q11_t2_close_after_exactly_ten_ok_reports() {
+        let (_b, d5) = pair("q11");
+        let f = || vec![lane("dept-5", "mismatch", true)];
+        let ok = || vec![lane("dept-5", "ok", false)];
+        let mut t = 400.0;
+        let mut tick = |d: &Arc<Daemon>, l: Vec<Value>| {
+            t += 60.0;
+            send(d, l, Value::Null, t);
+        };
+        tick(&d5, f());
+        tick(&d5, ok());
+        tick(&d5, f());
+        let after_flap = texts(&d5, "master").len();
+        for _ in 0..9 {
+            tick(&d5, ok());
+        }
+        tick(&d5, f());
+        let after_nine = texts(&d5, "master").len();
+        for _ in 0..10 {
+            tick(&d5, ok());
+        }
+        tick(&d5, f());
+        let after_ten = texts(&d5, "master").len();
+        println!("OSD-Q11 flap={after_flap} after 9 ok + fault={after_nine} after 10 ok + fault={after_ten}");
+        assert_eq!((after_flap, after_nine, after_ten), (1, 1, 2));
+    }
+
+    /// Q7/W7: the digest is sent on change only, a change inside the 30-minute window waits (pinned with the queue empty,
+    /// so only the window can hold it), and a second digest never queues behind an undelivered one (pinned after the window).
+    #[test]
+    fn osd_q7_digest_on_change_coalesced_and_one_undelivered() {
+        let (b, _d5) = pair("q7");
+        let dg = |f: &[&str]| json!({"faults": f, "unreachable": false});
+        let base = vec![lane("main", "ok", false)];
+        let clear = |d: &Arc<Daemon>| d.get_surface(d.roles.lock().unwrap()["worker"]).unwrap().pending_queue.lock().unwrap().clear();
+        send(&b, base.clone(), dg(&[]), 400.0); // empty at start: nothing
+        let at_start = texts(&b, "worker").len();
+        for i in 0..10 {
+            send(&b, base.clone(), dg(&["dept-5 mismatch"]), 460.0 + 60.0 * i as f64);
+        }
+        let after_ten = texts(&b, "worker").len();
+        clear(&b); // delivered
+        send(&b, base.clone(), dg(&["dept-3 pack_missing", "dept-5 mismatch"]), 460.0 + 300.0);
+        let in_window = texts(&b, "worker").len();
+        send(&b, base.clone(), dg(&["dept-3 pack_missing", "dept-5 mismatch"]), 460.0 + 1800.0);
+        let after_window = texts(&b, "worker");
+        send(&b, base.clone(), dg(&["dept-3 pack_missing"]), 460.0 + 1800.0 + 1801.0);
+        let undelivered_waits = texts(&b, "worker").len();
+        clear(&b);
+        send(&b, base.clone(), dg(&["dept-3 pack_missing"]), 460.0 + 1800.0 + 1861.0);
+        let w = texts(&b, "worker");
+        println!("OSD-Q7 start={at_start} ten={after_ten} window={in_window} after_window={after_window:?} undelivered={undelivered_waits} after={w:?}");
+        assert_eq!((at_start, after_ten, in_window, after_window.len(), undelivered_waits, w.len()), (0, 1, 0, 1, 1, 1));
+        assert!(after_window[0].contains("dept-3 pack_missing, dept-5 mismatch"));
+        assert!(w[0].contains("FAULT: dept-3 pack_missing |"));
+        assert!(texts(&b, "master").is_empty(), "the digest never goes to the CEO");
+    }
+
+    /// T5: the digest window holds across a restart (the record's epoch), and a cleared set is said once.
+    #[test]
+    fn osd_t5_digest_window_survives_a_restart_and_cleared_is_said_once() {
+        let (b, _d5) = pair("t5");
+        let dg = |f: &[&str]| json!({"faults": f, "unreachable": false});
+        send_at(&b, vec![], dg(&["dept-5 mismatch"]), Now { mono: 400.0, epoch: 2_000_000_000.0 });
+        assert_eq!(texts(&b, "worker").len(), 1);
+        let b2 = Daemon::new(b.socket_path.clone());
+        seat(&b2, "master");
+        seat(&b2, "worker");
+        send_at(&b2, vec![], dg(&[]), Now { mono: 5.0, epoch: 2_000_000_600.0 });
+        let in_window = texts(&b2, "worker").len();
+        send_at(&b2, vec![], dg(&[]), Now { mono: 2000.0, epoch: 2_000_002_400.0 });
+        let after = texts(&b2, "worker");
+        send_at(&b2, vec![], dg(&[]), Now { mono: 4000.0, epoch: 2_000_004_400.0 });
+        println!("OSD-T5 in_window={in_window} after={after:?} again={}", texts(&b2, "worker").len());
+        assert_eq!(in_window, 0);
+        assert_eq!(after.len(), 1);
+        assert!(after[0].contains("none (cleared)"));
+        assert_eq!(texts(&b2, "worker").len(), 1, "cleared is said once");
+    }
+
+    /// T4: the digest falls back to the Secretariat staff (worker-3) when the lead seat is absent.
+    #[test]
+    fn osd_t4_digest_staff_fallback() {
+        let b = daemon_at("t4", "cys");
+        seat(&b, "master");
+        seat(&b, "worker-3");
+        send(&b, vec![], json!({"faults": ["dept-5 mismatch"], "unreachable": false}), 400.0);
+        println!("OSD-T4 worker-3={:?}", texts(&b, "worker-3"));
+        assert_eq!(texts(&b, "worker-3").len(), 1);
+        assert!(texts(&b, "master").is_empty());
+    }
+
+    /// W6: no master -> nothing marked, ONE ledger row per (episode, reason), delivered once the master exists.
+    #[test]
+    fn osd_w6_undeliverable_is_retried_with_one_ledger_row() {
+        let d5 = daemon_at("w6", "cys-dept-dept-5");
+        let f = || vec![lane("dept-5", "mismatch", true)];
+        send(&d5, f(), Value::Null, 400.0);
+        send(&d5, f(), Value::Null, 460.0);
+        let dir = crate::state::state_dir(&d5.socket_path);
+        let ledger = std::fs::read_to_string(dir.join("alert-route-refused.jsonl")).unwrap_or_default();
+        let rows = ledger.lines().filter(|l| l.contains("office_spool_undelivered")).count();
+        let rec_absent = !dir.join(REC).exists();
+        seat(&d5, "master");
+        send(&d5, f(), Value::Null, 520.0);
+        println!("OSD-W6 ledger rows={rows} record absent before={rec_absent} master after={:?}", texts(&d5, "master"));
+        assert_eq!(rows, 1);
+        assert!(rec_absent);
+        assert_eq!(texts(&d5, "master").len(), 1);
+    }
+
+    /// R2 D2-10: the ledger keeps ONE row per (episode, reason) - and a later episode of the same pair gets its own row.
+    #[test]
+    fn osd_d2_10_a_later_undeliverable_episode_logs_again() {
+        let d5 = daemon_at("d210", "cys-dept-dept-5");
+        let rows = |d: &Arc<Daemon>| {
+            std::fs::read_to_string(crate::state::state_dir(&d.socket_path).join("alert-route-refused.jsonl"))
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| l.contains("office_spool_undelivered"))
+                .count()
+        };
+        send(&d5, vec![lane("dept-5", "mismatch", true)], Value::Null, 400.0);
+        send(&d5, vec![lane("dept-5", "mismatch", true)], Value::Null, 460.0);
+        let one = rows(&d5);
+        send(&d5, vec![lane("dept-5", "ok", false)], Value::Null, 520.0);
+        send(&d5, vec![lane("dept-5", "mismatch", true)], Value::Null, 580.0);
+        println!("OSD-D2-10 rows first episode={one} after a new episode={}", rows(&d5));
+        assert_eq!((one, rows(&d5)), (1, 2));
+    }
+
+    /// K2: an unreadable record means a duplicate notice, never silence.
+    #[test]
+    fn osd_k2_unreadable_record_gives_a_notice_not_silence() {
+        let (_b, d5) = pair("k2");
+        let dir = crate::state::state_dir(&d5.socket_path);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(REC), b"{not json").unwrap();
+        send(&d5, vec![lane("dept-5", "mismatch", true)], Value::Null, 400.0);
+        assert_eq!(texts(&d5, "master").len(), 1);
+    }
+
+    /// R1-1: the watch publishes only when the router has something to do - an all-ok steady state publishes nothing,
+    /// an open episode keeps the ok reports flowing until it closes, a pending digest change is presented until delivered.
+    #[test]
+    fn osd_r1_1_quiet_unless_the_router_has_something_to_do() {
+        let (b, d5) = pair("r11");
+        let ok = json!({"lanes": [lane("dept-5", "ok", false)], "digest": null});
+        let bad = json!({"lanes": [lane("dept-5", "mismatch", true)], "digest": null});
+        let quiet_at_start = !office_spool_wants(&d5, &ok);
+        assert!(office_spool_wants(&d5, &bad));
+        send(&d5, vec![lane("dept-5", "mismatch", true)], Value::Null, 400.0);
+        let open_episode_keeps_reporting = office_spool_wants(&d5, &ok);
+        for i in 0..10 {
+            send(&d5, vec![lane("dept-5", "ok", false)], Value::Null, 460.0 + 60.0 * i as f64);
+        }
+        let quiet_after_close = !office_spool_wants(&d5, &ok);
+        let dg = |f: &[&str]| json!({"lanes": [lane("main", "ok", false)], "digest": {"faults": f, "unreachable": false}});
+        let base_quiet = !office_spool_wants(&b, &dg(&[]));
+        let base_change = office_spool_wants(&b, &dg(&["dept-5 mismatch"]));
+        send(&b, vec![lane("main", "ok", false)], json!({"faults": ["dept-5 mismatch"], "unreachable": false}), 400.0);
+        let base_after_delivery = !office_spool_wants(&b, &dg(&["dept-5 mismatch"]));
+        let cleared_pending = office_spool_wants(&b, &dg(&[]));
+        println!("OSD-R1-1 {quiet_at_start} {open_episode_keeps_reporting} {quiet_after_close} {base_quiet} {base_change} {base_after_delivery} {cleared_pending}");
+        assert!(quiet_at_start && open_episode_keeps_reporting && quiet_after_close);
+        assert!(base_quiet && base_change && base_after_delivery && cleared_pending);
+    }
+
+    /// The observation never enters the CSO pending set and never reaches a CSO seat (non-regression guard).
+    #[test]
+    fn osd_never_routed_to_cso() {
+        let (b, _d5) = pair("cso");
+        seat(&b, "cso");
+        send(&b, vec![lane("main", "pack_missing", true)], json!({"faults": ["main pack_missing"], "unreachable": false}), 400.0);
+        assert!(texts(&b, "cso").is_empty());
+        assert!(state_lock(&b).pending.is_empty());
     }
 }

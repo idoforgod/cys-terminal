@@ -176,11 +176,12 @@ const WIN_STATE_EXACT: [&str; 25] = [
 ];
 
 /// 접두로 잡는 Windows 상태 항목(부서 슬러그 디렉토리·저널/스풀 디렉토리·손상 격리본).
-const WIN_STATE_PREFIX: [&str; 8] = [
+const WIN_STATE_PREFIX: [&str; 9] = [
     "cys-dept-",          // 부서 데몬 슬러그 디렉토리(state.rs pipe_slug 규약)
     "alert-route",        // ★(0.14.31 WP-3 B) alert-route-pending.json · -folded.jsonl(+.1·.corrupt)
     "phoenix",            // phoenix/ · phoenix-embed/
     "office-bridge",      // office-bridge/ · office-bridge.log
+    "office-spool",       // ★(0.14.56 X-8 CARRIER) office-spool-notified.json · office-spool-digest.json (alert_route spool leg)
     "report_gate",        // report_gate*/badges.json 레인
     "cycle_autopilot",    // 사이클 오토파일럿 상태
     "schedule_state.json.corrupt-", // 손상 격리본
@@ -190,7 +191,7 @@ const WIN_STATE_PREFIX: [&str; 8] = [
 /// `write_json_atomic`(governance.rs)이 **실제로 쓰는** 상태 파일 이름 전량.
 /// 임시 잔재(`.{name}.tmp`)의 판정은 이 목록·[`WIN_STATE_EXACT`] 와의 **정확 일치**로만 한다 —
 /// 접두 가족으로 넓히면 임의의 점 파일이 상태로 잡힌다(아래 X14 주석).
-const WIN_STATE_ATOMIC: [&str; 9] = [
+const WIN_STATE_ATOMIC: [&str; 11] = [
     "topology.json",
     "dept_tombstones.json",
     "queue-state.json",
@@ -202,6 +203,9 @@ const WIN_STATE_ATOMIC: [&str; 9] = [
     "queue-blocked.json",
     // ★(성찰 2회차 m-1 · 0.14.44 A4) 승인 묶음 식별자 파일도 `write_json_atomic` 으로 쓴다.
     "approval-lane",
+    // ★(0.14.56 X-8 CARRIER) the spool leg's two records, both written with `write_json_atomic` (alert_route.rs).
+    "office-spool-notified.json",
+    "office-spool-digest.json",
 ];
 
 /// Windows 상태 항목인가 — 정확 이름 · 접두 · **원자쓰기 임시 잔재**의 세 축.
@@ -3975,7 +3979,7 @@ mod r2f_dm_factory_reset {
         for n in ["queue-blocked.json", "queue-blocked.prev.json", "approval-lane"] {
             assert!(WIN_STATE_EXACT.contains(&n), "윈도우 상태 폴더의 {n} 이 정확 일치 목록에 없다");
         }
-        assert_eq!(WIN_STATE_ATOMIC.len(), 9, "원자 쓰기 목록의 길이");
+        assert_eq!(WIN_STATE_ATOMIC.len(), 11, "원자 쓰기 목록의 길이");
         assert!(WIN_STATE_ATOMIC.contains(&"approval-lane"), "approval-lane 이 원자 쓰기 목록에 없다 — `.approval-lane.tmp` 잔재가 설치 파일로 분류된다");
         assert!(is_win_state_name("approval-lane") && is_win_state_name(".approval-lane.tmp"), "승인 묶음 식별자 파일과 그 임시 잔재가 윈도우 상태로 분류돼야 한다");
         assert!(WIN_STATE_ATOMIC.contains(&"queue-blocked.json"), "queue-blocked.json 이 원자 쓰기 목록에 없다 — `.queue-blocked.json.tmp` 잔재가 설치 파일로 분류된다");
@@ -3990,6 +3994,17 @@ mod r2f_dm_factory_reset {
             assert_eq!(set.len(), list.len(), "{label} 에 중복 이름이 있다");
         }
         assert!(CYS_BASE_EXACT.iter().all(|n| !CYS_BASE_EXACT2.contains(n)), "두 ~/.cys 정확 이름 목록이 겹친다");
+    }
+
+    /// (0.14.56 X-8 CARRIER) the spool leg's two daemon records and their atomic-write residues are Windows state - a factory
+    /// reset of a Windows base (state dir = install dir) must not keep them as "install files". Pin-compatible: literals only.
+    #[test]
+    fn x8_office_spool_records_are_windows_state() {
+        for n in ["office-spool-notified.json", "office-spool-digest.json",
+                  ".office-spool-notified.json.tmp", ".office-spool-digest.json.tmp"] {
+            assert!(is_win_state_name(n), "{n} must be classified as Windows daemon state");
+        }
+        assert!(!is_win_state_name(".office-spool-notes.md.tmp"), "an unknown dot file is still kept (fail-safe)");
     }
 
     /// [행동 핀] `~/.cys/.update-attempt.json` 은 완전 초기화 계획에서 **격리**되고, 이름이 비슷한 미등록 파일(`.update-attempt.json.bak` · `.update-attempt-notes.md`)은 **보존**된다(미등록 보존 계약).
