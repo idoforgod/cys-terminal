@@ -636,6 +636,7 @@ def scope_fresh_markers(j, epoch):
             why = "범위 판정 실패(%s) — 표지를 걷어낸다(보존하지 않는다)" % type(_e).__name__
         for k in FRESH_MARKER_KEYS:
             rr.pop(k, None)
+        rr.pop("fresh_epoch", None)   # ★스탬프도 표지와 함께 — 남겨 두면 읽히지 않는 찌꺼기가 된다
         rr["fresh_scope_stripped"] = why
         rr["fresh_scope_epoch"] = epoch               # ⑶ 걷어낸 패스만 표식을 쓴다
         out.append((role, why))
@@ -2914,7 +2915,8 @@ def _run_restore_locked(socket, ticket="default", stub=False, no_breaker=False, 
     _fresh_scope_stripped = dict(scope_fresh_markers(j, _ACTIVE_EPOCH))
     for _r, _why in _fresh_scope_stripped.items():
         jevent(j, _r, "verify", "fresh_scope_stripped",
-               "★D3: 지난 부팅의 fresh 표지를 걷어냈다(%s) — 이번 부팅은 이 역할의 판정 재료가 없다(재검증)" % _why)
+               "★D3: 이번 부팅의 것이 아닌 fresh 표지를 걷어냈다(%s) — 이번 부팅은 이 역할의 판정 재료가 "
+               "없다(재검증)" % _why)
     # dedup(P4): 이 티켓 저널에서 이미 verify까지 done 인 역할은 skip
     pending = [r for r in target_roles if not stage_done(j, r, "verify")]
     log("티켓=%s · 대상역할=%s · 이번 진행=%s (완료 skip=%s)" % (
@@ -3014,6 +3016,11 @@ def _run_restore_locked(socket, ticket="default", stub=False, no_breaker=False, 
                             why = "cli_fresh"
                         j["roles"][role]["fresh_expected"] = True
                         j["roles"][role]["fresh_reason"] = why
+                        # ★D3: 이 표지가 **어느 부팅의 것인지** 함께 적는다 — 이것이 없으면 다음 실행(같은
+                        #   부팅의 재시도 포함)이 자기 표지를 「지난 부팅의 것」으로 걷어낸다. 값은 stage 마킹과
+                        #   같은 `_ACTIVE_EPOCH`(이 함수 선두 :2756 에서 확정) — 한 파일에 '이 부팅' 정의를 둘로
+                        #   두지 않는다.
+                        j["roles"][role]["fresh_epoch"] = _ACTIVE_EPOCH
                         # ★리뷰 R1b: 스폰 전 재고 — verify 의 세션 소유·신선 증거 재료(None = 재고 판정 불가 → 미확정).
                         j["roles"][role]["fresh_pre_dir"] = pre_dir
                         j["roles"][role]["fresh_pre_sids"] = pre_sids
@@ -3061,6 +3068,7 @@ def _run_restore_locked(socket, ticket="default", stub=False, no_breaker=False, 
                 rr["fresh_fallback"] = True          # ★정직: resumed→fresh 강등(세션 보존 포기·의도적 전환)
                 # ★F-1(0.14.31): 세션 부재 예상과 독약 강등을 구분한다.
                 rr["fresh_reason"] = "poison"
+                rr["fresh_epoch"] = _ACTIVE_EPOCH    # ★D3: 이 표지를 쓴 부팅(상단 F-1 블록과 같은 규약)
                 mark_stage(j, role, "spawn", True, "★fresh 강등(독약 세션): " + msg)
                 jevent(j, role, "spawn", "fresh_fallback",
                        "resume %d회 소진→fresh 강등(무 resume 재기동): %s" % (SPAWN_RETRIES, msg))
@@ -3201,8 +3209,8 @@ def _run_restore_locked(socket, ticket="default", stub=False, no_breaker=False, 
                 #   내려보내지 **않는다**(내려보내면 'verified' 가 나와 거짓 VERIFIED 가 된다).
                 #   ⛔결함1(핀 동어반복) 수리가 이 가지 위에 쌓인다 — 그 판정 함수는 이 가드 **뒤**에 온다.
                 outcome = "unverified"
-                reason = ("★D3: 지난 부팅의 fresh 표지를 걷어냈다(%s) — 이번 부팅은 이 역할의 판정 재료가 "
-                          "없다(핀 비교로 성공을 만들지 않는다). 재검증 대상."
+                reason = ("★D3: 이번 부팅의 것이 아닌 fresh 표지를 걷어냈다(%s) — 이번 부팅은 이 역할의 판정 "
+                          "재료가 없다(핀 비교로 성공을 만들지 않는다). 재검증 대상."
                           % j["roles"][role].get("fresh_scope_stripped"))
             else:
                 # ★리뷰 R3b(codex major): 판정은 순수 함수 하나(`legacy_verify_outcome`) — resume 모드가

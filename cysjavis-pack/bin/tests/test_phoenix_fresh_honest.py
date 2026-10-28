@@ -610,6 +610,9 @@ def main():
         #    설계 DESIGN.md(d1a4037e)+R2(7a90a1b5)+R3(14f45914) · 판정문 HEAD-RULING-R3-FINAL(14e0cdd2).
         #    낡은 표지가 증거 0으로 'fresh' 를 만들던 자리와, 걷어낸 역할이 핀 동어반복으로 내려가
         #    거짓 VERIFIED 가 되던 자리를 함께 묶는다.
+        # ★이 절(L)은 **순수 함수** 계약을 묶는다 — `fresh_epoch`·`fresh_scope_epoch` 를 픽스처에 직접 넣는
+        #   줄들은 그 함수의 진리표를 재는 것이고, **제품이 그 값을 쓰는지**는 절 N(실 작성자·실 run_restore)이
+        #   따로 묶는다. 두 절을 섞지 마라: 손으로 넣은 값으로만 통과하는 증명은 제품을 재지 않는다.
         E_OLD, E_NOW, E_NEXT = "sa:1793100000.1", "sa:1793200000.9", "sa:1793300000.5"
         SRC = open(m.__file__ if hasattr(m, "__file__") and m.__file__ else PH, encoding="utf-8").read().splitlines()
 
@@ -865,6 +868,194 @@ def main():
               and m.legacy_verify_outcome("sid-live", "sid-live", "effective")[0] == "verified")
         check("D3-B4 CONTROL the two paths are distinguishable in the journal evidence",
               "D3" in jr_s["roles"]["worker-1"]["stages"]["verify"]["evidence"] and "D3" not in ev_c)
+
+        # ──────────────────────────────────────────────────────────────────────
+        # N: ★D3 **스탬프**를 제품이 직접 쓰는지 — 손으로 넣지 않는다(부서장 구현 판정 1 B1 · 요구 b).
+        #    여기서는 `fresh_epoch` 를 픽스처에 **절대** 적지 않는다. 실 Phase-11 작성자가 쓰고,
+        #    실 scope 패스가 읽고, 실 가드가 판정한다. 세 시도(1·2=같은 세대 · 3=새 세대)를 한 저널로 잇는다.
+        def d3_stamp_run():
+            td3 = tempfile.mkdtemp(prefix="phoenix-d3-stamp-")
+            orig = (m.cys, m.time.sleep, m._emit_evt, m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN,
+                    m.SPAWN_RETRIES, m.SPAWN_SETTLE, m.SPAWN_BACKOFF, m.F1_REGISTERED_GRACE_TRIES)
+            try:
+                sock = os.path.join(td3, "cys.sock")
+                tick = "d3-stamp"
+                entry = {"role": "worker-1", "agent": "claude", "session_id": "sid-poison",
+                         "claude_config_dir": os.path.join(td3, "acct"), "cwd": os.path.join(td3, "proj"),
+                         "surface_id": 7, "surface_ref": "surface:7"}
+                os.makedirs(entry["cwd"])
+                proj = os.path.join(entry["claude_config_dir"], "projects",
+                                    m._claude_project_component(entry["cwd"]))
+                os.makedirs(proj)
+                # 세션 파일이 **있으므로** F-1 fresh 예상이 아니다 → 독약 강등(Phase 11)만이 표지를 쓴다.
+                with open(os.path.join(proj, "sid-poison.jsonl"), "w", encoding="utf-8") as f:
+                    f.write("{}\n")
+                st = {"epoch": 1000.0, "phase": 1, "alive": False, "seat": "empty",
+                      "gate": {"gate": "folder-trust"}}
+                def write_topology():
+                    with open(os.path.join(td3, "topology.json"), "w", encoding="utf-8") as f:
+                        json.dump({"entries": [entry], "updated_at": m._now(), "schema_version": 1,
+                                   "tombstones": [], "tombstones_rev": 0}, f)
+                write_topology()
+                def fake_cys(*a, socket=None, timeout=25):
+                    v, out = a[0], ""
+                    if v == "status":
+                        rows = []
+                        if st["alive"]:
+                            rows = [{"surface_id": 7, "surface_ref": "surface:7", "role": "worker-1",
+                                     "exited": False, "agent_alive": True, "seat": st["seat"],
+                                     "agent": "claude", "gate_pending": st["gate"],
+                                     "registered_session_id": "sid-fresh", "awakened_at": m._now()}]
+                        out = json.dumps({"daemon": {"started_at": st["epoch"]}, "surfaces": rows})
+                    elif v == "restore":
+                        # ★독약: cys restore 는 좌석을 띄우지 못한다(resume 불가) → Phase 11 로 내려간다.
+                        out = "no surface for worker-1"
+                    elif v == "launch-agent":
+                        st["alive"] = True          # ★무 resume 재기동이 좌석을 만든다(Phase 11 의 실 경로)
+                        out = "launched worker-1 surface:7"
+                    elif v == "reinject":
+                        out = "디렉티브 생존 확인 (ACK 수신)"
+                    elif v in ("read-screen", "watch"):
+                        out = "bypass permissions on"
+                    elif v == "list":
+                        out = "surface:7 role=worker-1 pid=7 exited=false\n" if st["alive"] else ""
+                    else:
+                        raise AssertionError("unexpected cys call: %r" % (a,))
+                    return __import__("types").SimpleNamespace(returncode=0, stdout=out, stderr="")
+                m.cys = fake_cys
+                m.time.sleep = lambda _s: None
+                m._emit_evt = lambda *a, **k: None
+                m.SPAWN_RETRIES, m.SPAWN_SETTLE, m.SPAWN_BACKOFF = 1, 0.0, 0.0
+                m.F1_REGISTERED_GRACE_TRIES = 1
+                jp = m.journal_path(sock, tick)
+                res, jr = {}, {}
+                outs = []
+                # attempt 1 — 관문에 갇힌 좌석: 실 작성자가 표지를 쓰고, 좌석 축이 막아 unverified.
+                r1 = m.run_restore(sock, ticket=tick, stub=False, no_breaker=True, print_result=False)
+                j1 = json.load(open(jp, encoding="utf-8"))
+                outs.append((r1, j1))
+                # attempt 2 — **같은 세대**: 좌석이 건강해졌다(관문 통과). 역할은 여전히 target(빈 좌석)이고
+                #   spawn 마킹이 이 세대라 재스폰은 skip → 표지를 **다시 쓰지 않는다** ⇒ 스탬프가 유일한 근거다.
+                st["gate"] = None
+                r2 = m.run_restore(sock, ticket=tick, stub=False, no_breaker=True, print_result=False)
+                outs.append((r2, json.load(open(jp, encoding="utf-8"))))
+                # attempt 3 — **새 세대**(데몬 재시작): 같은 저널, 표지는 지난 부팅의 것 ⇒ 걷어내고 가드가 발화.
+                st["epoch"] = 2000.0
+                r3 = m.run_restore(sock, ticket=tick, stub=False, no_breaker=True, print_result=False)
+                outs.append((r3, json.load(open(jp, encoding="utf-8"))))
+                return outs
+            finally:
+                (m.cys, m.time.sleep, m._emit_evt, m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN,
+                 m.SPAWN_RETRIES, m.SPAWN_SETTLE, m.SPAWN_BACKOFF, m.F1_REGISTERED_GRACE_TRIES) = orig
+                shutil.rmtree(td3, ignore_errors=True)
+
+        (ra, ja), (rb, jb), (rc_, jc) = d3_stamp_run()
+        rra, rrb, rrc = (ja["roles"]["worker-1"], jb["roles"]["worker-1"], jc["roles"]["worker-1"])
+        # D3-S1 ★제품이 스탬프를 쓴다 — 저널에서 되읽은 값이 그 실행의 boot_epoch 과 같다.
+        check("D3-S1 the product writes fresh_epoch and it equals the run's boot_epoch",
+              rra.get("fresh_epoch") is not None and rra["fresh_epoch"] == ra["boot_epoch"]
+              and rra.get("fresh_fallback") is True)
+        # D3-S2 시도 1 — 관문에 갇힌 좌석이면 이 부팅의 표지라도 'fresh' 가 아니다.
+        check("D3-S2 attempt 1: a this-boot marker on a gate-trapped seat is unverified",
+              ra["per_role_outcome"] == {"worker-1": "unverified"}
+              and ra.get("fresh_scope_stripped") == {}
+              and "좌석 증거 미충족" in rra["stages"]["verify"]["evidence"])
+        # D3-S3 시도 2 — 같은 세대: 표지가 scope 패스를 **살아서** 지나가고 좌석 증거로 판정된다.
+        check("D3-S3 attempt 2 in the SAME epoch: the marker survives the pass and is judged on evidence",
+              rb["boot_epoch"] == ra["boot_epoch"]
+              and rb.get("fresh_scope_stripped") == {}
+              and rrb.get("fresh_fallback") is True
+              and rb["per_role_outcome"] == {"worker-1": "fresh"})
+        # D3-S4 시도 3 — 새 세대: 걷어내고 가드가 발화한다(핀 비교로 내려가지 않는다).
+        check("D3-S4 attempt 3 in a NEW epoch: stripped, the guard fires, unverified",
+              rc_["boot_epoch"] != ra["boot_epoch"]
+              and rc_.get("fresh_scope_stripped", {}).get("worker-1", "").startswith("표지 세대")
+              and "fresh_fallback" not in rrc
+              and rc_["per_role_outcome"] == {"worker-1": "unverified"}
+              and "D3" in rrc["stages"]["verify"]["evidence"])
+        # D3-S5 ★사유 문면이 참이어야 한다 — 이 수리가 쓴 표지를 「이 수리 이전 저널」이라고 적지 않는다.
+        check("D3-S5 the strip reason names the epoch mismatch, not a pre-fix journal",
+              "이 수리 이전 저널" not in rc_.get("fresh_scope_stripped", {}).get("worker-1", "")
+              and "≠ 이번 부팅" in rc_.get("fresh_scope_stripped", {}).get("worker-1", ""))
+
+        # ──────────────────────────────────────────────────────────────────────
+        # O: ★D3 스탬프의 **F-1 작성자** 쪽 — 절 N 은 Phase-11 작성자만 태운다. 변이 'F-1 스탬프 제거' 가
+        #    절 N 만으로는 **살아남았다**(09-mutations-stamp.log 1회차) ⇒ 그 작성자를 직접 태우는 세계가 필요하다.
+        #    세션 파일이 **없는** 역할이면 `fresh_expected(entry)` 가 참이라 F-1 블록이 표지를 쓴다.
+        def d3_f1_stamp_run():
+            td4 = tempfile.mkdtemp(prefix="phoenix-d3-f1stamp-")
+            orig = (m.cys, m.time.sleep, m._emit_evt, m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN,
+                    m.SPAWN_SETTLE, m.SPAWN_BACKOFF, m.F1_REGISTERED_GRACE_TRIES)
+            try:
+                sock = os.path.join(td4, "cys.sock")
+                tick = "d3-f1stamp"
+                entry = {"role": "worker-1", "agent": "claude", "session_id": "",
+                         "claude_config_dir": os.path.join(td4, "acct"), "cwd": os.path.join(td4, "proj"),
+                         "surface_id": 7, "surface_ref": "surface:7"}
+                os.makedirs(entry["cwd"])
+                proj = os.path.join(entry["claude_config_dir"], "projects",
+                                    m._claude_project_component(entry["cwd"]))
+                os.makedirs(proj)      # ★세션 파일을 만들지 않는다 → F-1 fresh 예상
+                with open(os.path.join(td4, "topology.json"), "w", encoding="utf-8") as f:
+                    json.dump({"entries": [entry], "updated_at": m._now(), "schema_version": 1,
+                               "tombstones": [], "tombstones_rev": 0}, f)
+                st = {"epoch": 3000.0, "alive": False}
+                def fake_cys(*a, socket=None, timeout=25):
+                    v, out = a[0], ""
+                    if v == "status":
+                        rows = ([{"surface_id": 7, "surface_ref": "surface:7", "role": "worker-1",
+                                  "exited": False, "agent_alive": True, "seat": "occupied", "agent": "claude",
+                                  "gate_pending": None, "registered_session_id": "new1",
+                                  "awakened_at": m._now()}] if st["alive"] else [])
+                        out = json.dumps({"daemon": {"started_at": st["epoch"]}, "surfaces": rows})
+                    elif v == "restore":
+                        st["alive"] = True
+                        with open(os.path.join(proj, "new1.jsonl"), "w", encoding="utf-8") as f:
+                            f.write("{}\n")
+                        out = "restored worker-1 surface:7"
+                    elif v == "reinject":
+                        out = "디렉티브 생존 확인 (ACK 수신)"
+                    elif v in ("read-screen", "watch"):
+                        out = "bypass permissions on"
+                    elif v == "list":
+                        out = "surface:7 role=worker-1 pid=7 exited=false\n" if st["alive"] else ""
+                    else:
+                        raise AssertionError("unexpected cys call: %r" % (a,))
+                    return __import__("types").SimpleNamespace(returncode=0, stdout=out, stderr="")
+                m.cys = fake_cys
+                m.time.sleep = lambda _s: None
+                m._emit_evt = lambda *a, **k: None
+                m.SPAWN_SETTLE, m.SPAWN_BACKOFF = 0.0, 0.0
+                m.F1_REGISTERED_GRACE_TRIES = 1
+                jp = m.journal_path(sock, tick)
+                r1 = m.run_restore(sock, ticket=tick, stub=False, no_breaker=True, print_result=False)
+                j1 = json.load(open(jp, encoding="utf-8"))
+                st["epoch"] = 4000.0          # 데몬 재시작
+                r2 = m.run_restore(sock, ticket=tick, stub=False, no_breaker=True, print_result=False)
+                j2 = json.load(open(jp, encoding="utf-8"))
+                return (r1, j1), (r2, j2)
+            finally:
+                (m.cys, m.time.sleep, m._emit_evt, m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN,
+                 m.SPAWN_SETTLE, m.SPAWN_BACKOFF, m.F1_REGISTERED_GRACE_TRIES) = orig
+                shutil.rmtree(td4, ignore_errors=True)
+
+        (rf1, jf1), (rf2, jf2) = d3_f1_stamp_run()
+        rrf1 = jf1["roles"]["worker-1"]
+        check("D3-F1 the F-1 writer stamps too, and the value equals that run's boot_epoch",
+              rrf1.get("fresh_expected") is True
+              and rrf1.get("fresh_epoch") is not None
+              and rrf1["fresh_epoch"] == rf1["boot_epoch"]
+              and rf1.get("fresh_scope_stripped") == {})
+        # ★실측으로 정정한 기대: 이 세계의 두 번째 실행에서 역할은 **살아 있다**(좌석 점유) ⇒ 부활 대상이
+        #   아니고(`target_roles` 공집합 · NOOP) verify 자체가 돌지 않는다. 그래서 여기서 재는 것은 **스탬프
+        #   불일치가 실제로 표지를 걷어내는가**이고, 가드 발화는 역할이 계속 대상으로 남는 절 N(D3-S4)이 묶는다.
+        #   스탬프도 표지와 함께 사라져야 한다(읽히지 않는 찌꺼기 금지).
+        check("D3-F2 a new epoch strips the F-1 marker group, the stamp with it",
+              rf2["boot_epoch"] != rf1["boot_epoch"]
+              and rf2.get("fresh_scope_stripped", {}).get("worker-1", "").startswith("표지 세대")
+              and not any(k in jf2["roles"]["worker-1"] for k in m.FRESH_MARKER_KEYS)
+              and "fresh_epoch" not in jf2["roles"]["worker-1"]
+              and rf2["target_roles"] == [] and rf2["per_role_outcome"] == {})
     finally:
         shutil.rmtree(td)
     npass = sum(1 for c in _results if c)
