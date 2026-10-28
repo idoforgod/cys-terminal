@@ -41,10 +41,46 @@ if "queue" in a and "list" in a:
         sys.exit(1)
     print(json.dumps([{"id": i, "preview": p} for i, p in q["expired" if "--expired" in a else "pending"]]))
     sys.exit(0)
+if "status" in a and "--json" in a:
+    print(json.dumps({"surfaces": [{"role": "worker", "agent_alive": True, "idle_secs": 1}]}))
+    sys.exit(0)
 if "send" in a:
     f = a[a.index("--file") + 1]
     prev = open(f, encoding="utf-8").read().replace("\n", " ")[:80]
     qid = "qfake.%d" % (len(q["pending"]) + len(q["expired"]) + 1)
+    now = time.time()
+    # the queued text is the file text minus one trailing newline (measured on a real cysd: EMIT-FORK-R2 MEASURE-digest.md)
+    txt = open(f, encoding="utf-8").read()
+    txt = txt[:-1] if txt.endswith("\n") else txt
+    if mode == "digest_tail":
+        # the ticket is the NON-head item of a 2-item queue digest (governance.rs: head id on the row, the rest only in
+        # digest_parts with sha256 = digest_text(item text); the receipt carries merged_ids)
+        sys.path.insert(0, os.environ["FAKE_BIN"]); import javis_mission
+        head = "qhead.%d" % (len(q["pending"]) + 1)
+        with open(led, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"origin": "queue", "queue_entry_id": head, "ts_epoch": now, "delivered_at": None,
+                                 "preview": "[큐 다이제스트 2건 · 발신 cli:send] [1/2] another sender item",
+                                 "digest_items": 2, "digest_parts": [{"queue_entry_id": head, "sha256": "0" * 64},
+                                 {"queue_entry_id": qid, "sha256": javis_mission.delivery_digest(txt)}]}) + "\n")
+            fh.write(json.dumps({"origin": "queue_receipt", "kind": "receipt", "queue_entry_id": head, "ts_epoch": now,
+                                 "merged_ids": [head, qid], "body_sha256": "1" * 64, "delivered_at": now}) + "\n")
+    elif mode == "rotated_in_dot1":
+        with open(led + ".1", "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"origin": "queue", "queue_entry_id": qid, "preview": prev[:64], "ts_epoch": now, "delivered_at": None}) + "\n")
+            fh.write(json.dumps({"origin": "queue_receipt", "kind": "receipt", "queue_entry_id": qid, "ts_epoch": now, "delivered_at": now}) + "\n")
+        with open(led, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"origin": "boot", "ts_epoch": now + 1}) + "\n")
+    elif mode == "rotated_away":
+        # delivered, then the ledger rotated twice: neither generation still covers the send
+        with open(led + ".1", "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"origin": "boot", "ts_epoch": now + 100}) + "\n")
+        with open(led, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"origin": "boot", "ts_epoch": now + 200}) + "\n")
+    elif mode == "send_then_die":
+        q["pending"].append([qid, prev]); json.dump(q, open(qf, "w"))
+        sys.exit(137)   # the daemon accepted it, then the client died before the caller saw rc 0
+    if mode in ("digest_tail", "rotated_in_dot1", "rotated_away"):
+        json.dump(q, open(qf, "w")); print("QUEUED (depth 1)"); sys.exit(0)
     if mode == "deliver":
         with open(led, "a", encoding="utf-8") as fh:
             fh.write(json.dumps({"origin": "queue", "queue_entry_id": qid, "preview": prev[:64], "delivered_at": None}) + "\n")
@@ -92,7 +128,7 @@ class DispatchDelivers(unittest.TestCase):
         os.environ.update({"PATH": b + os.pathsep + self.saved.get("PATH", ""), "REAL_PY": sys.executable,
                            "FAKE_LOG": self.log, "FAKE_IMPL": os.path.join(self.root, "fake_impl.py"),
                            "FAKE_QUEUE": os.path.join(self.root, "queue.json"), "CYS_STATE_DIR": self.state,
-                           "CYS_DEPTS_JSON": self.depts, "JAVIS_ORG_DISPATCH_WAIT_S": "3"})
+                           "CYS_DEPTS_JSON": self.depts, "JAVIS_ORG_DISPATCH_WAIT_S": "3", "FAKE_BIN": BIN})
         sys.path.insert(0, BIN)
         import javis_lane
         os.environ["FAKE_LEDGER"] = javis_lane.lane_state_path("delivery", self.sock)
@@ -176,6 +212,129 @@ class DispatchDelivers(unittest.TestCase):
         self.assertNotEqual(rc, 0)
         self.assertIn("dept_unresolved", out)
         self.assertEqual(self._sends(), [])
+
+    # ── R2 (r1 review gemini1 M1-M3, m1; gemini5 m1, m2) ────────────────────────────────────────────────────────
+    def _keyed_copies(self):
+        import javis_lane
+        d = os.path.join(javis_lane.state_dir(), "org-dispatch")
+        return sorted(n for n in os.listdir(d)) if os.path.isdir(d) else []
+
+    def test_r2_m1_non_head_item_of_a_merged_digest_is_delivered(self):
+        os.environ["FAKE_MODE"] = "digest_tail"
+        self.org.dispatch_task(self.task)
+        self.assertEqual(self.org.first_ticket_state_of(self.task), "delivered")
+        rc, out = self.org.dispatch_task(self.task)
+        self.assertEqual(len(self._sends()), 1, "a ticket delivered inside a queue digest was sent again: " + out)
+        self.assertIn("delivered (existing item, not resent)", out)
+
+    def test_r2_m1_receipt_in_the_rotated_generation_counts(self):
+        os.environ["FAKE_MODE"] = "rotated_in_dot1"
+        self.org.dispatch_task(self.task)
+        self.assertEqual(self.org.first_ticket_state_of(self.task), "delivered")
+
+    def test_r2_m1_rotation_that_no_longer_covers_the_send_is_unknown_not_lost(self):
+        os.environ["FAKE_MODE"] = "rotated_away"
+        self.org.dispatch_task(self.task)
+        self.assertEqual(self.org.first_ticket_state_of(self.task), "unknown")
+        rc, out = self.org.dispatch_task(self.task)
+        self.assertEqual(len(self._sends()), 1, "rotation read as lost and re-sent: " + out)
+        self.assertNotEqual(rc, 0, out)
+
+    def test_r2_m1_really_lost_ticket_without_rotation_is_still_resent(self):
+        os.environ["FAKE_MODE"] = "pending"
+        self.org.dispatch_task(self.task)
+        os.remove(os.environ["FAKE_QUEUE"])          # the item vanished: in no list, no receipt, no rotation
+        os.makedirs(os.path.dirname(os.environ["FAKE_LEDGER"]), exist_ok=True)
+        with open(os.environ["FAKE_LEDGER"], "a", encoding="utf-8") as fh:   # the daemon restarted after the send
+            fh.write(json.dumps({"origin": "boot", "ts_epoch": time.time() + 50}) + "\n")
+        self.assertEqual(self.org.first_ticket_state_of(self.task), "lost")
+        rc, out = self.org.dispatch_task(self.task)
+        self.assertEqual(len(self._sends()), 2, out)
+        self.assertIn("RESEND of lost item", out)
+
+    def test_r2_m1_without_the_digest_absence_is_unknown_not_lost(self):
+        from unittest import mock
+        os.environ["FAKE_MODE"] = "pending"
+        self.org.dispatch_task(self.task)
+        os.remove(os.environ["FAKE_QUEUE"])
+        os.makedirs(os.path.dirname(os.environ["FAKE_LEDGER"]), exist_ok=True)
+        with open(os.environ["FAKE_LEDGER"], "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"origin": "boot", "ts_epoch": time.time() + 50}) + "\n")
+        with mock.patch.dict(sys.modules, {"javis_mission": None}):   # the digest mirror cannot be imported
+            self.assertEqual(self.org.first_ticket_state_of(self.task), "unknown")
+            rc, out = self.org.dispatch_task(self.task)
+        self.assertEqual(len(self._sends()), 1, "absence without a digest was read as lost: " + out)
+        self.assertNotEqual(rc, 0, out)
+
+    def test_r2_m2_same_second_resend_orders_by_sequence_not_by_nonce(self):
+        from unittest import mock
+        nonces = iter([b"\xff" * 5, b"\x00" * 5, b"\x11" * 5])
+        with mock.patch.object(self.org.os, "urandom", lambda n: next(nonces)), \
+                mock.patch.object(self.org.time, "strftime", lambda *a, **k: "20261029T000000"), \
+                mock.patch.object(self.org.time, "time_ns", lambda: 1793200000000000000):
+            os.environ["FAKE_MODE"] = "expire"
+            self.org.dispatch_task(self.task)
+            os.environ["FAKE_MODE"] = "pending"
+            rc, out = self.org.dispatch_task(self.task)
+            self.assertIn("RESEND of expired item", out)
+            self.assertEqual(self.org.first_ticket_state_of(self.task), "pending", self._keyed_copies())
+            rc, out = self.org.dispatch_task(self.task)
+        self.assertEqual(len(self._sends()), 2, "the newest copy lost to an older one by nonce order: " + out)
+
+    def test_r2_m2_send_accepted_then_client_died_is_not_sent_twice(self):
+        os.environ["FAKE_MODE"] = "send_then_die"
+        rc1, out1 = self.org.dispatch_task(self.task)
+        os.environ["FAKE_MODE"] = "pending"
+        rc2, out2 = self.org.dispatch_task(self.task)
+        self.assertEqual(len(self._sends()), 1, "an item the daemon accepted was queued twice: %s || %s" % (out1, out2))
+        self.assertIn("pending (existing item, not resent)", out2)
+
+    def test_r2_m3_apply_surfaces_the_dispatch_lines(self):
+        import contextlib, io
+        self.org.require_cso = lambda: None
+        self.org.apply_plan = lambda m: [("dispatch_task", self.task)]
+        self.org.validate_manifest = lambda m: []
+        man = os.path.join(self.root, "manifest.json")
+        with open(man, "w", encoding="utf-8") as f:
+            json.dump({"departments": [], "tasks": [self.task]}, f)
+        os.environ["FAKE_MODE"] = "expire"
+        err, outb = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(outb):
+            self.org.cmd_apply(man)
+            os.environ["FAKE_MODE"] = "pending"
+            self.org.cmd_apply(man)
+        self.assertIn("[dispatch] queued", err.getvalue())
+        self.assertIn("RESEND of expired item", err.getvalue())
+        last = json.loads(outb.getvalue().strip().splitlines()[-1])
+        self.assertTrue(any("RESEND of expired item" in x for x in last.get("dispatch", [])), last)
+
+    def test_r2_m1_to_none_means_worker(self):
+        os.environ["FAKE_MODE"] = "pending"
+        rc, out = self.org.dispatch_task(dict(self.task, to=None))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("--to worker", self._sends()[0])
+        self.assertEqual(self.org._first_ticket_key(dict(self.task, to=None)), self.org._first_ticket_key(self.task))
+        self.assertEqual(self.org._first_ticket_key(dict(self.task, to="")), self.org._first_ticket_key(self.task))
+
+    def test_r2_g5_cmd_status_pins_incomplete_then_ok(self):
+        import contextlib, io
+        def status_of(task):
+            man = os.path.join(self.root, "m-%s.json" % task["task"])
+            with open(man, "w", encoding="utf-8") as f:
+                json.dump({"departments": [{"key": "future-research"}], "tasks": [task]}, f)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = self.org.cmd_status(man)
+            return rc, json.loads(buf.getvalue().strip().splitlines()[-1])
+        os.environ["FAKE_MODE"] = "pending"
+        self.org.dispatch_task(self.task)
+        rc, d = status_of(self.task)
+        self.assertEqual((rc, d["status"]), (1, "incomplete"), d)
+        os.environ["FAKE_MODE"] = "deliver"
+        t2 = dict(self.task, task="T2")
+        self.org.dispatch_task(t2)
+        rc, d = status_of(t2)
+        self.assertEqual((rc, d["status"]), (0, "ok"), d)
 
 
 if __name__ == "__main__":
