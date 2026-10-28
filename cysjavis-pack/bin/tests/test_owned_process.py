@@ -201,7 +201,7 @@ class OwnershipRegression(unittest.TestCase):
         probe.write_text("import os,time\nfrom pathlib import Path\n_marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(os.getpid()));__import__('os').replace(_tmp,_marker)\ntime.sleep(30)\n" % str(marker))
         p = self.start("import sys\nsys.path.insert(0,%r)\nimport javis_checklist as c\nc.run_preflight([sys.executable,'-B',%r],timeout=20)\n" % (str(BIN), str(probe)))
         pid = self.marker('probe')
-        p.kill(); p.wait(timeout=3)
+        p.kill(); p.wait(timeout=3)  # wallclock: guard 3 s only ends a hang reaping the SIGKILLed driver; the verdict is assert_gone
         self.assert_gone(pid)
 
     @unittest.skipUnless(os.name == 'posix', 'POSIX identity fixture; native Job fixtures below')
@@ -211,7 +211,7 @@ class OwnershipRegression(unittest.TestCase):
         scan.write_text("import os,time,sys\nfrom pathlib import Path\nsys.path.insert(0,%r)\ndef main():\n _marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(os.getpid()));__import__('os').replace(_tmp,_marker)\n time.sleep(30)\ntry:\n from _owned_process import managed_main\nexcept ImportError:\n main()\nelse:\n managed_main(main)\n" % (str(BIN), str(marker)))
         p = self.start("import sys\nsys.path.insert(0,%r)\nfrom javis_preflight import Preflight\nPreflight._run_skillscan_all(%r,20)\n" % (str(BIN), str(scan)))
         pid = self.marker('scan')
-        p.kill(); p.wait(timeout=3)
+        p.kill(); p.wait(timeout=3)  # wallclock: guard 3 s only ends a hang reaping the SIGKILLed driver; the verdict is assert_gone
         self.assert_gone(pid)
 
     def test_scanner_then_preflight_death_reaches_spawn_worker(self):
@@ -242,7 +242,7 @@ if __name__=='__main__':
         scanner = self.marker('scanner'); worker = self.marker('worker')
         self.assertNotEqual(scanner,worker,'pool fixture silently fell back to serial')
         self.stop_recorded(scanner)
-        p.kill(); p.wait(timeout=3)
+        p.kill(); p.wait(timeout=3)  # wallclock: guard 3 s only ends a hang reaping the SIGKILLed driver; the verdict is assert_gone(worker)
         self.assert_gone(worker)
 
     @unittest.skipUnless(os.name == 'posix', 'POSIX late-spawn barrier')
@@ -275,7 +275,7 @@ from _owned_process import run_owned
 r=run_owned([sys.executable,'-B',%r],3,force=1)
 Path(%r).write_text(str(r))
 """ % (str(BIN),str(script),str(self.root/'result'))
-        p=self.start(driver); late=self.marker('late');p.wait(timeout=5)
+        p=self.start(driver); late=self.marker('late');p.wait(timeout=5)  # wallclock: guard 5 s only ends a hang of the driver; the verdict is assert_gone, the sibling alive and complete False
         self.assert_gone(late)
         self.assertIsNone(sentinel.poll(), 'outside sibling was terminated')
         self.assertIn("'complete': False", (self.root/'result').read_text())
@@ -297,8 +297,9 @@ Path(%r).write_text(str(r))
                            stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True)
         self.children.append(p)
         try:
+            # Stdin is withheld forever, so only the ingress phase budget can end the hook.
             try:
-                p.wait(timeout=23)
+                p.wait(timeout=60)  # wallclock: guard 60 s only ends a hang; the verdict is that the hook ended (rc 0, 'incomplete')
             except subprocess.TimeoutExpired:
                 self.fail('ingress exceeded its 20-second phase budget')
             self.assertEqual(p.returncode,0)
@@ -306,7 +307,7 @@ Path(%r).write_text(str(r))
         finally:
             if p.returncode is None:
                 os.killpg(p.pid,signal.SIGKILL)
-                p.wait(timeout=3)
+                p.wait(timeout=3)  # wallclock: guard 3 s only ends a hang reaping the SIGKILLed hook group; cleanup only, not the verdict
 
     @unittest.skipUnless(os.name == 'posix', 'POSIX group identity')
     def test_no_destructive_signal_after_reap(self):
@@ -366,7 +367,7 @@ Path(%r).write_text(str(r))
         child.write_text("import os,sys,time\nfrom pathlib import Path\nsys.path.insert(0,%r)\nfrom _owned_process import managed_main\ndef main():\n _marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(os.getpid()));__import__('os').replace(_tmp,_marker)\n time.sleep(30)\nmanaged_main(main)\n" % (str(BIN),str(self.root/'job-child')))
         sibling=self.start('import time;time.sleep(30)')
         owner=self.start("import sys\nsys.path.insert(0,%r)\nfrom _owned_process import run_owned\nrun_owned([sys.executable,'-B',%r],20)\n" % (str(BIN),str(child)))
-        pid=self.marker('job-child');owner.kill();owner.wait(timeout=3)
+        pid=self.marker('job-child');owner.kill();owner.wait(timeout=60)  # wallclock: guard 60 s only ends a hang reaping the killed owner; the verdict is assert_gone and the sibling alive
         self.assert_gone(pid)
         self.assertIsNone(sibling.poll())
 
@@ -377,7 +378,7 @@ Path(%r).write_text(str(r))
         preflight.write_text("import os,sys,time\nfrom pathlib import Path\nsys.path.insert(0,%r)\nfrom _owned_process import managed_main\ndef main():\n _marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(os.getpid()));__import__('os').replace(_tmp,_marker)\n _marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(os.getppid()));__import__('os').replace(_tmp,_marker)\n time.sleep(30)\nmanaged_main(main)\n" % (str(BIN),str(self.root/'preflight'),str(self.root/'checklist')))
         owner=self.start("import os,sys\nsys.path.insert(0,%r)\nos.environ['CYS_PACK_DIR']=%r\nfrom _owned_process import run_owned\nrun_owned([sys.executable,'-B',%r],20)\n" % (str(BIN),str(pack),str(BIN/'javis_checklist.py')))
         pf=self.marker('preflight');ck=self.marker('checklist')
-        owner.kill();owner.wait(timeout=3)
+        owner.kill();owner.wait(timeout=3)  # wallclock: guard 3 s only ends a hang reaping the SIGKILLed owner; the verdict is assert_gone and empty stderr
         self.assert_gone(pf);self.assert_gone(ck)
         self.assertEqual(owner.stderr.read(),b'')
 
@@ -385,9 +386,10 @@ Path(%r).write_text(str(r))
         sys.path.insert(0,str(BIN))
         import _owned_process as owned
         clock=getattr(owned,'monotonic',time.monotonic)
-        start=clock();time.sleep(.7)
+        # A phase that started 10 s ago in another process has spent its .6 s budget.
+        start=clock()-10.0
         marker=self.root/'should-not-start'
-        result=subprocess.run([PYTHON,'-B',str(BIN/'_owned_process.py'),
+        result=subprocess.run([PYTHON,'-B',str(BIN/'_owned_process.py'),  # wallclock: guard 3 s only ends a hang; the verdict is no marker and rc 124
             '--bounded','2','--start',str(start),'--budget','.6','--',
             PYTHON,'-B','-c',"from pathlib import Path;Path(%r).touch()" % str(marker)],
             capture_output=True,timeout=3)
@@ -398,7 +400,7 @@ Path(%r).write_text(str(r))
         # A phase may discover a canonical path before a later file read stalls.
         command=[PYTHON,'-B',str(BIN/'_owned_process.py'),'--bounded','.4','--records','--',
                  PYTHON,'-B','-c',"import sys,time;sys.stdout.write('STATE\\0/fixture/state\\0PARTIAL');sys.stdout.flush();time.sleep(30)"]
-        p=subprocess.run(command,capture_output=True,timeout=3)
+        p=subprocess.run(command,capture_output=True,timeout=3)  # wallclock: guard 3 s only ends a hang; the verdict is rc 124 and the retained record pairs
         self.assertEqual(p.returncode,124,p.stderr)
         self.assertIn(b'STATE\0/fixture/state\0',p.stdout)
         self.assertNotIn(b'PARTIAL',p.stdout)
@@ -420,8 +422,9 @@ Path(%r).write_text(str(r))
         sys.path.insert(0,str(BIN));import _owned_process as owned
         sys.path.insert(0,str(BIN));import javis_checklist as ck
         child=self.root/'held_custom.py'
-        code="import os,time;from pathlib import Path;_marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(os.getpid()));__import__('os').replace(_tmp,_marker);time.sleep(30)" % str(self.root/'held-grandchild')
-        child.write_text("import subprocess,sys,time\nsubprocess.Popen([sys.executable,'-B','-c',%r])\ntime.sleep(30)\n" % code)
+        code="import os,time;from pathlib import Path;_marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(os.getpid()));__import__('os').replace(_tmp,_marker);time.sleep(3600)" % str(self.root/'held-grandchild')
+        # Every timed actor outlives the 60 s guard, so no natural exit can end the run inside it.
+        child.write_text("import os,subprocess,sys,time\nfrom pathlib import Path\n_marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(os.getpid()));os.replace(_tmp,_marker)\nsubprocess.Popen([sys.executable,'-B','-c',%r])\ntime.sleep(3600)\n" % (str(self.root/'held-child'),code))
         results=queue.Queue()
         # Start the tested timeout only after the real grandchild exists. This
         # isolates reap behavior from interpreter-start scheduling; startup
@@ -431,13 +434,19 @@ Path(%r).write_text(str(r))
             now=clock()
             if not armed and (self.root/'held-grandchild').exists():armed.append(now)
             return origin+(now-armed[0] if armed else 0)
+        # The grandchild holds the output for an hour and the cooperative grace is
+        # 600 s, so returning at all is the event: a window waiting out either fails.
+        # The test owns the patches: a thread left hung by a failure must not keep
+        # them for the tests after it.
+        for pt in (patch.object(owned,'monotonic',ready_clock),patch.object(subprocess,'_time',ready_clock),
+                   patch.object(ck,'PREFLIGHT_GRACE',600)):
+            pt.start();self.addCleanup(pt.stop)
         def run():
-            with patch.object(owned,'monotonic',ready_clock),patch.object(subprocess,'_time',ready_clock):
-                results.put(ck.run_preflight([PYTHON,'-B',str(child)],timeout=.5))
+            results.put(ck.run_preflight([PYTHON,'-B',str(child)],timeout=.5))  # wallclock: guard .5 is the product timeout under test (an input), not a wait of this test
         threading.Thread(target=run,daemon=True).start()
-        pid=self.marker('held-grandchild')
+        self.marker('held-child');pid=self.marker('held-grandchild')
         try:
-            result=results.get(timeout=3)
+            result=results.get(timeout=60)  # wallclock: guard 60 s only ends a hang; the verdict is that run_preflight returned 'timeout'
         except queue.Empty:
             self.fail('checklist blocked draining a grandchild-held output pipe after timeout')
         self.assertEqual(result[0],'timeout')
@@ -457,13 +466,33 @@ Path(%r).write_text(str(r))
         self.assertEqual(result['stdout'],'original summary'+os.linesep)
 
     def test_timeout_drain_is_bounded_with_held_output(self):
+        import queue,threading
+        from unittest.mock import patch
         sys.path.insert(0,str(BIN))
-        from _owned_process import run_owned
+        import _owned_process as owned
         script=self.root/'held.py'
-        script.write_text("import sys,subprocess,time\nsys.path.insert(0,%r)\nfrom _owned_process import managed_main\ndef main():\n subprocess.Popen([sys.executable,'-B','-c','import time;time.sleep(30)'])\n time.sleep(30)\nmanaged_main(main)\n" % str(BIN))
-        start=time.monotonic()
-        result=run_owned([PYTHON,'-B',str(script)],.3,force=1)
-        self.assertLess(time.monotonic()-start,2.5,result)
+        code="import os,time;from pathlib import Path;_marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(os.getpid()));__import__('os').replace(_tmp,_marker);time.sleep(3600)" % str(self.root/'drain-grandchild')
+        script.write_text("import os,sys,subprocess,time\nfrom pathlib import Path\nsys.path.insert(0,%r)\nfrom _owned_process import managed_main\ndef main():\n _marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(os.getpid()));os.replace(_tmp,_marker)\n subprocess.Popen([sys.executable,'-B','-c',%r])\n time.sleep(3600)\nmanaged_main(main)\n" % (str(BIN),str(self.root/'drain-leader'),code))
+        results=queue.Queue()
+        # As in the checklist held-output test: the timeout starts once the
+        # output-holding grandchild exists. The leader and the grandchild both
+        # outlive the 60 s guard, so returning at all is the event: an unbounded
+        # drain or reap never returns.
+        clock=owned.monotonic;origin=clock();armed=[]
+        def ready_clock():
+            now=clock()
+            if not armed and (self.root/'drain-grandchild').exists():armed.append(now)
+            return origin+(now-armed[0] if armed else 0)
+        for pt in (patch.object(owned,'monotonic',ready_clock),patch.object(subprocess,'_time',ready_clock)):
+            pt.start();self.addCleanup(pt.stop)
+        def run():
+            results.put(owned.run_owned([PYTHON,'-B',str(script)],.3,force=1))
+        threading.Thread(target=run,daemon=True).start()
+        self.marker('drain-leader');self.marker('drain-grandchild')
+        try:
+            result=results.get(timeout=60)  # wallclock: guard 60 s only ends a hang; the verdict is that run_owned returned, timed out and incomplete
+        except queue.Empty:
+            self.fail('drain blocked on output held by a grandchild after timeout')
         self.assertTrue(result['timed_out'],result)
         self.assertFalse(result['complete'])
 
@@ -527,7 +556,7 @@ cys_timeout_run() {
   [ "$phase" = core ] || printf '_OWNED_RETURNED\\0001\\0'
 }
 ''')
-        result=subprocess.run(['/bin/bash',str(pack/'hooks'/'inject-context.sh')],
+        result=subprocess.run(['/bin/bash',str(pack/'hooks'/'inject-context.sh')],  # wallclock: guard 8 s only ends a hang of the hook; the verdict is the output content
             env=dict(os.environ,HOME=str(self.root),CYS_PACK_DIR=str(pack)),capture_output=True,text=True,timeout=8)
         self.assertEqual(result.returncode,0,result.stderr)
         self.assertIn('phase core incomplete',result.stdout)
@@ -616,7 +645,7 @@ print(json.dumps(owned.run_owned([sys.executable,'-B',%r],2,force=.3)),flush=Tru
         self.children.append(p)
         pid=self.marker('denied-child')
         try:
-            out,err=p.communicate(timeout=8)
+            out,err=p.communicate(timeout=8)  # wallclock: guard 8 s only ends a hang; the verdict is the JSON result (complete False, cleanup unknown)
             self.assertEqual(p.returncode,0,err)
             result=json.loads(out)
             self.assertFalse(result['complete'],result)
@@ -643,7 +672,7 @@ print(json.dumps(owned.run_owned([sys.executable,'-B',%r],2,force=.3)),flush=Tru
         os.mkfifo(state/'.state_log')
         env=dict(os.environ,HOME=str(self.root),CYS_PACK_DIR=str(pack),CYS_PY=PYTHON,CYS_ROLE='master',
                  PATH='/usr/bin:/bin',CYS_ROOT=str(self.root))
-        p=subprocess.run(['/bin/bash',str(pack/'hooks'/'inject-context.sh')],
+        p=subprocess.run(['/bin/bash',str(pack/'hooks'/'inject-context.sh')],  # wallclock: guard 8 s only ends a hang of the hook; the verdict is the output content
             input=json.dumps({'source':'clear','cwd':str(self.root)}),text=True,
             capture_output=True,env=env,timeout=8)
         self.assertEqual(p.returncode,0,p.stderr)
@@ -654,7 +683,7 @@ print(json.dumps(owned.run_owned([sys.executable,'-B',%r],2,force=.3)),flush=Tru
         p = subprocess.Popen([PYTHON, '-B', '-c', 'import sys;sys.stdin.buffer.read();print("EOF")'],
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE)
         self.children.append(p)
-        out, _ = p.communicate(timeout=3)
+        out, _ = p.communicate(timeout=3)  # wallclock: guard 3 s only ends a hang after stdin was closed; the verdict is the EOF output
         self.assertEqual(out.strip(), b'EOF')
         p = subprocess.Popen([PYTHON, '-B', '-c', 'import sys;sys.stdin.buffer.read();print("EOF")'],
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE)
@@ -693,7 +722,7 @@ print(json.dumps(owned.run_owned([sys.executable,'-B',%r],2,force=.3)),flush=Tru
         child=self.root/'startup_child.py'
         child.write_text("import sys\nfrom pathlib import Path\nsys.path.insert(0,%r)\nfrom _owned_process import managed_main\ndef main():\n Path(%r).touch()\n return 0\nmanaged_main(main)\n" % (str(BIN),str(self.root/'forbidden-work')))
         parent=self.start("import os,sys\nfrom pathlib import Path\nsys.path.insert(0,%r)\nimport _owned_process as owned\noriginal=owned.subprocess.Popen\ndef die(*a,**kw):\n p=original(*a,**kw)\n _marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(p.pid));__import__('os').replace(_tmp,_marker)\n os._exit(9)\nowned.subprocess.Popen=die\nowned.run_owned([sys.executable,'-B',%r],2)\n" % (str(BIN),str(self.root/'startup-child'),str(child)))
-        pid=self.marker('startup-child');parent.wait(timeout=3)
+        pid=self.marker('startup-child');parent.wait(timeout=3)  # wallclock: guard 3 s only ends a hang of the parent; the verdict is assert_gone and no forbidden work
         self.assert_gone(pid)
         self.assertFalse((self.root/'forbidden-work').exists())
 
@@ -758,7 +787,7 @@ print(json.dumps(owned.run_owned([sys.executable,'-B',%r],2,force=.3)),flush=Tru
         sibling_code="import time;time.sleep(30)"
         parent=self.start("import sys\nfrom pathlib import Path\nsys.path.insert(0,%r)\nimport _owned_process as owned\nreal=owned.subprocess.Popen\ndef spawn(*args,**kw):\n child=real(*args,**kw)\n sibling=real([sys.executable,'-B','-c',%r],close_fds=True,stdin=owned.subprocess.DEVNULL,stdout=owned.subprocess.DEVNULL,stderr=owned.subprocess.DEVNULL)\n _marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(child.pid));__import__('os').replace(_tmp,_marker)\n _marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(sibling.pid));__import__('os').replace(_tmp,_marker)\n return child\nowned.subprocess.Popen=spawn\nowned.run_owned([sys.executable,'-B',%r],20)\n" % (str(BIN),sibling_code,str(self.root/'owned-child'),str(self.root/'unrelated'),str(child)))
         child_pid=self.marker('owned-child');sibling_pid=self.marker('unrelated')
-        parent.kill();parent.wait(timeout=3)
+        parent.kill();parent.wait(timeout=60)  # wallclock: guard 60 s only ends a hang reaping the killed parent; the verdict is assert_gone and the sibling alive
         self.assert_gone(child_pid)
         self.assertTrue(self.recorded_alive(sibling_pid),'outside sibling was put in the owned Job')
 
@@ -790,7 +819,7 @@ if __name__=='__main__':
         scanner = self.marker('scanner'); worker = self.marker('worker')
         self.assertNotEqual(scanner,worker,'pool fixture silently fell back to serial')
         self.stop_recorded(scanner)
-        p.wait(timeout=5)
+        p.wait(timeout=5)  # wallclock: guard 5 s only ends a hang; the verdict is assert_gone(worker)
         self.assert_gone(worker)
 
     def test_job_close_failure_retains_handle_for_cleanup(self):
@@ -810,20 +839,22 @@ if __name__=='__main__':
         script.write_text("import os,sys,time,subprocess\nfrom pathlib import Path\nsys.path.insert(0,%r)\nimport _owned_process as owned\nimport javis_preflight as pf\nstop=owned._self_stop\ndef paused_stop(group):\n while not Path(%r).exists():time.sleep(.005)\n stop(group)\nowned._self_stop=paused_stop\ndef late_probe(*args,**kwargs):\n owned.CANCEL.set()\n child=subprocess.Popen([sys.executable,'-B','-c',%r])\n child.wait()\ndef main():\n pf.subprocess.run=late_probe\n checker=pf.Preflight(fix=False,skips=[])\n checker._run_check_isolated(checker.c60_gate_wiring)\n return 0\nowned.managed_main(main)\n" % (str(BIN),str(self.root/'late-c60'),child_code))
         sibling=self.start('import time;time.sleep(30)')
         parent=self.start("import sys\nsys.path.insert(0,%r)\nfrom _owned_process import run_owned\nrun_owned([sys.executable,'-B',%r],3,force=1)\n" % (str(BIN),str(script)))
-        child=self.marker('late-c60');parent.wait(timeout=5)
+        child=self.marker('late-c60');parent.wait(timeout=5)  # wallclock: guard 5 s only ends a hang of the parent; the verdict is assert_gone and the sibling alive
         self.assert_gone(child)
         self.assertIsNone(sibling.poll())
 
     def test_checklist_deadline_cleans_scanner_and_spawn_pool(self):
         skill=self.root/'skills'/'sample';skill.mkdir(parents=True);(skill/'SKILL.md').write_text('# fixture')
         scanner=self.root/'scan_deadline.py'
-        scanner.write_text("import os,sys,time,multiprocessing\nfrom pathlib import Path\nsys.path.insert(0,%r)\nimport javis_skillscan as scanner\nfrom _owned_process import managed_main\ndef slow_scan(path):\n _marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(os.getpid()));__import__('os').replace(_tmp,_marker)\n time.sleep(30)\n return {}\ndef main():\n multiprocessing.set_start_method('spawn',force=True)\n scanner.scan_skill=slow_scan\n _marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(os.getpid()));__import__('os').replace(_tmp,_marker)\n return scanner.cmd_all([%r],True)\nif __name__=='__main__':managed_main(main)\n" % (str(BIN),str(self.root/'pool-worker'),str(self.root/'deadline-scanner'),str(skill.parent)))
+        scanner.write_text("import os,sys,time,multiprocessing\nfrom pathlib import Path\nsys.path.insert(0,%r)\nimport javis_skillscan as scanner\nfrom _owned_process import managed_main\ndef slow_scan(path):\n _marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(os.getpid()));__import__('os').replace(_tmp,_marker)\n time.sleep(3600)\n return {}\ndef main():\n multiprocessing.set_start_method('spawn',force=True)\n scanner.scan_skill=slow_scan\n _marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(os.getpid()));__import__('os').replace(_tmp,_marker)\n return scanner.cmd_all([%r],True)\nif __name__=='__main__':managed_main(main)\n" % (str(BIN),str(self.root/'pool-worker'),str(self.root/'deadline-scanner'),str(skill.parent)))
         preflight=self.root/'preflight_deadline.py'
-        preflight.write_text("import sys\nsys.path.insert(0,%r)\nfrom javis_preflight import Preflight\nfrom _owned_process import managed_main\ndef main():\n Preflight._run_skillscan_all(%r,20)\n return 0\nmanaged_main(main)\n" % (str(BIN),str(scanner)))
+        preflight.write_text("import sys\nsys.path.insert(0,%r)\nfrom javis_preflight import Preflight\nfrom _owned_process import managed_main\ndef main():\n Preflight._run_skillscan_all(%r,3600)\n return 0\nmanaged_main(main)\n" % (str(BIN),str(scanner)))
+        # The scan and the inner skillscan deadline outlive the 60 s guard: only the
+        # checklist's own 2 s deadline can end this run inside it.
         parent=self.start("import sys\nfrom pathlib import Path\nsys.path.insert(0,%r)\nimport javis_checklist as ck\nck.DEFAULT_PREFLIGHT=[sys.executable,%r]\nresult=ck.run_preflight(ck.DEFAULT_PREFLIGHT,timeout=2)\nPath(%r).write_text(str(result))\n" % (str(BIN),str(preflight),str(self.root/'deadline-result')))
         scan_pid=self.marker('deadline-scanner');worker=self.marker('pool-worker')
         self.assertNotEqual(scan_pid,worker,'pool fixture silently fell back to serial')
-        parent.wait(timeout=6)
+        parent.wait(timeout=60)  # wallclock: guard 60 s only ends a hang of the parent; the verdict is 'timeout' in the result and assert_gone
         self.assertIn('timeout',(self.root/'deadline-result').read_text())
         self.assert_gone(scan_pid);self.assert_gone(worker)
 
@@ -843,11 +874,15 @@ if __name__=='__main__':
         pack=self.root/'pack';(pack/'hooks').mkdir(parents=True);(pack/'bin').mkdir()
         hooks=Path(__file__).resolve().parents[2]/'hooks'
         for name in ('_lib.sh','inject_gate.py'):shutil.copyfile(hooks/name,pack/'hooks'/name)
-        text=(hooks/'inject-context.sh').read_text().replace('ingress) _C03_CAP=20','ingress) _C03_CAP=1')
+        original=(hooks/'inject-context.sh').read_text()
+        # A silent no-op replace would leave the 20 s cap, which the 60 s guard below cannot tell apart.
+        self.assertIn('ingress) _C03_CAP=20',original)
+        text=original.replace('ingress) _C03_CAP=20','ingress) _C03_CAP=1')
         (pack/'hooks'/'inject-context.sh').write_text(text)
         shutil.copyfile(BIN/'_owned_process.py',pack/'bin'/'_owned_process.py')
         stubs=self.root/'stubs';stubs.mkdir()
-        locale=stubs/'locale';locale.write_text('#!/bin/sh\n: > "$C03_LOCALE_MARK"\nsleep 10\nprintf C.UTF-8\\n\n');locale.chmod(0o755)
+        # The locale lookup stalls for an hour, so only the 1 s ingress budget can end the hook.
+        locale=stubs/'locale';locale.write_text('#!/bin/sh\n: > "$C03_LOCALE_MARK"\nsleep 3600\nprintf C.UTF-8\\n\n');locale.chmod(0o755)
         env=dict(os.environ,HOME=str(self.root),CYS_PACK_DIR=str(pack),CYS_PY=PYTHON,CYS_ROLE='master',
                  PATH=str(stubs)+':/usr/bin:/bin',CYS_ROOT=str(self.root),LANG='C',LC_CTYPE='C',
                  PYTHONCOERCECLOCALE='0',PYTHONUTF8='0',C03_LOCALE_MARK=str(self.root/'locale-called'))
@@ -856,14 +891,14 @@ if __name__=='__main__':
                            stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env,start_new_session=True)
         self.children.append(p)
         try:
-            try:out,err=p.communicate(json.dumps({'source':'clear','cwd':str(self.root)}).encode(),timeout=3)
+            try:out,err=p.communicate(json.dumps({'source':'clear','cwd':str(self.root)}).encode(),timeout=60)  # wallclock: guard 60 s only ends a hang; the verdict is that the hook ended (rc 0, 'restoration input incomplete:')
             except subprocess.TimeoutExpired:self.fail('locale startup bypassed ingress budget')
             self.assertEqual(p.returncode,0,err)
             self.assertTrue((self.root/'locale-called').exists(),'fixture did not exercise locale lookup')
             self.assertIn(b'restoration input incomplete:',out)
         finally:
             if p.returncode is None:
-                os.killpg(p.pid,signal.SIGKILL);p.wait(timeout=3)
+                os.killpg(p.pid,signal.SIGKILL);p.wait(timeout=3)  # wallclock: guard 3 s only ends a hang reaping the SIGKILLed hook group; cleanup only, not the verdict
 
     @unittest.skipUnless(os.name == 'nt', 'Windows Git Bash hook: UNMEASURED locally')
     def test_windows_bundled_bash_hook_retains_core(self):
@@ -922,7 +957,7 @@ if __name__=='__main__':
         grep.write_text('#!/bin/sh\ncase "$*" in *RSI_LEDGER.md*) : > "$C03_RSI_MARK"; sleep 10;; esac\nexec /usr/bin/grep "$@"\n');grep.chmod(0o755)
         env=dict(os.environ,HOME=str(self.root),CYS_PACK_DIR=str(pack),CYS_PY=PYTHON,CYS_ROLE='master',
                  PATH=str(stubs)+':/usr/bin:/bin',CYS_ROOT=str(self.root),C03_RSI_MARK=str(self.root/'rsi-called'))
-        result=subprocess.run(['/bin/bash',str(pack/'hooks'/'inject-context.sh')],
+        result=subprocess.run(['/bin/bash',str(pack/'hooks'/'inject-context.sh')],  # wallclock: guard 8 s only ends a hang of the hook; the verdict is the output content and rsi-called
             input=json.dumps({'source':'resume','cwd':str(self.root)}),text=True,capture_output=True,env=env,timeout=8)
         self.assertTrue((self.root/'rsi-called').exists(),'RSI stall not reached')
         self.assertIn('C03-ISOLATED-STATE',result.stdout)
@@ -943,7 +978,7 @@ if __name__=='__main__':
             path=stubs/name;path.write_text(body);path.chmod(0o755)
         env=dict(os.environ,HOME=str(self.root),CYS_PACK_DIR=str(pack),CYS_PY=PYTHON,CYS_ROLE='master',
                  PATH=str(stubs)+':/usr/bin:/bin',CYS_ROOT=str(self.root),C03_PS_MARK=str(self.root/'ps-called'))
-        result=subprocess.run(['/bin/bash',str(pack/'hooks'/'inject-context.sh')],
+        result=subprocess.run(['/bin/bash',str(pack/'hooks'/'inject-context.sh')],  # wallclock: guard 8 s only ends a hang of the hook; the verdict is the output content and no ps-called
             input=json.dumps({'source':'clear','cwd':str(self.root)}),text=True,capture_output=True,env=env,timeout=8)
         self.assertIn('phase role incomplete',result.stdout)
         self.assertIn('C03-ISOLATED-STATE',result.stdout)
@@ -985,7 +1020,7 @@ if __name__=='__main__':
 
     def test_private_adapter_refuses_without_admission(self):
         marker=self.root/'uncontained'
-        result=subprocess.run([PYTHON,'-B',str(BIN/'_owned_process.py'),'--command',
+        result=subprocess.run([PYTHON,'-B',str(BIN/'_owned_process.py'),'--command',  # wallclock: guard 3 s only ends a hang; the verdict is rc 125 and no marker
             PYTHON,'-B','-c',"from pathlib import Path;Path(%r).touch()" % str(marker)],
             capture_output=True,timeout=3)
         self.assertEqual(result.returncode,125)
@@ -1045,7 +1080,7 @@ if __name__=='__main__':
             '--input-env','INPUT','--records','--',PYTHON,'-c','pass'],
             stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
         self.children.append(p)
-        p.wait(timeout=3)
+        p.wait(timeout=3)  # wallclock: guard 3 s only ends a hang; the verdict is rc 124 and 'input incomplete'
         out=p.stdout.read();err=p.stderr.read()
         self.assertEqual(p.returncode,124,err)
         self.assertIn(b'input incomplete',out)
