@@ -221,11 +221,21 @@ def _parse_fields(fields):
 
 
 def _spool_path():
-    """HUD spool 경로 — $HUD_STATE_DIR 우선, 없으면 <pack>/state/ (브리지 tailer와 동일 SOT)."""
-    base = os.environ.get("HUD_STATE_DIR")
-    if not base:
-        base = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "state")
-    return os.path.join(base, "evt_spool.jsonl")
+    """HUD spool path = javis_spool_path.spool_path_for_pack(<the pack of this file>) (0.14.56 X-8 A1).
+
+    No environment variable takes part (HUD_STATE_DIR no longer moves the spool). The leaf is loaded lazily and by
+    explicit path, never by a bare import (under `python -I` the script directory is not on sys.path); this runs after
+    the module's `sys.dont_write_bytecode = True`. Any failure becomes OSError, which cmd_emit maps to
+    EXIT_SPOOL_FAILED after the wire line was printed."""
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "javis_spool_path", os.path.join(_SELF_DIR, "javis_spool_path.py"))
+        leaf = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(leaf)
+        return leaf.spool_path_for_pack(os.path.dirname(_SELF_DIR))
+    except Exception as e:
+        raise OSError("spool leaf unavailable: %s" % type(e).__name__) from e
 
 
 def _spool_append(evt_type, payload, surface):
@@ -307,6 +317,21 @@ def cmd_types(a):
     return EXIT_OK
 
 
+def cmd_spool_path(a):
+    """0.14.56 X-8: print exactly the spool path of this file's pack, one line, and create nothing.
+
+    Written as UTF-8 bytes (surrogateescape) - the exact inverse of the reader's decode - so a Windows pipe's ANSI
+    code page cannot rewrite a non-ASCII pack path. Leaf unloadable -> stderr + EXIT_SPOOL_FAILED."""
+    try:
+        path = _spool_path()
+    except OSError as e:
+        print(str(e), file=sys.stderr)
+        return EXIT_SPOOL_FAILED
+    sys.stdout.buffer.write(path.encode("utf-8", "surrogateescape") + b"\n")
+    sys.stdout.buffer.flush()
+    return EXIT_OK
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description="이벤트 enum 계약 v1 (P0-4)")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -330,6 +355,9 @@ def main(argv=None):
 
     c = sub.add_parser("types")
     c.set_defaults(fn=cmd_types)
+
+    c = sub.add_parser("spool-path", help="print the HUD spool path of this pack (no environment input)")
+    c.set_defaults(fn=cmd_spool_path)
 
     a = p.parse_args(argv)
     return a.fn(a)

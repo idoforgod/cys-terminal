@@ -627,7 +627,6 @@ class T08CallerBoundary(unittest.TestCase):
     def _run_guard(self, h, guard, root, boot):
         env = h.env(STUB_PS_NEW_STALL="12")
         env.update({"GRILL_MARKER": os.path.join(root, ".grill-absent.json"), "JAVIS_ROOT": root,
-                    "HUD_STATE_DIR": os.path.join(root, "hud"),
                     "CYS_PROBE_RUNS": os.path.join(root, "probe_runs.jsonl"),
                     "CYS_GUARD_BOOT_MARKER": boot, "CYS_GUARD_LIVENESS": "alive",
                     "CYS_ROLE": "worker", "CYS_COMPLETION_GUARD": "1", "CYS_SURFACE_ID": "7",
@@ -643,10 +642,21 @@ class T08CallerBoundary(unittest.TestCase):
                            capture_output=True, text=True, env=env, timeout=120)
         return r.returncode, time.monotonic() - t0, r.stderr
 
+    def _spool_lines(self, spool):
+        if not os.path.isfile(spool):
+            return []
+        with open(spool, encoding="utf-8") as f:
+            return [json.loads(x) for x in f.read().splitlines() if x.strip()]
+
     def _guard_rows(self, gate):
         h = Harness()
         try:
-            guard = os.path.join(os.path.dirname(gate), "javis_completion_guard.py")
+            # 0.14.56 X-8 A1: the spool is <pack>/state/evt_spool.jsonl of the pack the guard runs from (no env moves
+            # it), so the guard runs from a RIG PACK - a copy of the gate's bin/ - and the rows read that rig's spool.
+            rig_bin = os.path.join(h.td, "rig", "bin")
+            shutil.copytree(os.path.dirname(gate), rig_bin, ignore=shutil.ignore_patterns("__pycache__"))
+            spool = os.path.join(h.td, "rig", "state", "evt_spool.jsonl")
+            guard = os.path.join(rig_bin, "javis_completion_guard.py")
             self.assertTrue(os.path.isfile(guard), guard)
             root, boot = self._guard_root(h, "r")
             out = []
@@ -655,15 +665,19 @@ class T08CallerBoundary(unittest.TestCase):
                 st_p = os.path.join(root, "_round", "tasks", "T1.guard.json")
                 with open(st_p, encoding="utf-8") as f:
                     st = json.load(f)
-                spool = os.path.join(root, "hud", "evt_spool.jsonl")
-                evts = []
-                if os.path.isfile(spool):
-                    with open(spool, encoding="utf-8") as f:
-                        evts = [json.loads(x) for x in f.read().splitlines() if x.strip()]
+                evts = self._spool_lines(spool)
                 out.append({"rc": rc, "dt": dt, "verdict": st.get("last_verdict"),
                             "infra_count": int(st.get("infra_count", 0)),
                             "run_failed": sum(1 for e in evts if e.get("type") == "run.failed"),
                             "err": err[-300:]})
+            # positive control: "run_failed == 0" is only evidence if the rows read the file the rig's producer
+            # writes - one marker emitted through the rig's own javis_event must show up in that same file
+            r = subprocess.run([sys.executable, os.path.join(rig_bin, "javis_event.py"), "emit", "task.unblocked",
+                                "--payload", '{"task":"rig-spool-probe"}', "--spool"],
+                               capture_output=True, text=True, env=h.env(), timeout=60)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("rig-spool-probe", [e.get("payload", {}).get("task") for e in self._spool_lines(spool)],
+                          "the rows read %s, which is not where the rig's producer writes" % spool)
             out.append({"new_reads": len(h.log("ps-new.log")),
                         "gate_reads": sum(1 for x in h.log("ps.log") if "pid,pcpu,command" in x)})
             return out

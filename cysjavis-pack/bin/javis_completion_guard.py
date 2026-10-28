@@ -1879,6 +1879,7 @@ def _self_test_platform():
 
 # ═════════════════════════ self-test(§2-4 필수 5케이스 + 완료 기준 배터리) ═════
 def self_test():
+    import shutil
     import tempfile
 
     # ── F10(G1 hard assert): 격리 env 필수 — JAVIS_ROOT·CYS_PROBE_RUNS 미설정 시 실행 거부.
@@ -1903,7 +1904,6 @@ def self_test():
               % (os.name, "OK" if not pf else "FAIL %d건: %s" % (len(pf), pf)), file=sys.stderr)
         return 1
 
-    self_path = os.path.abspath(__file__)
     fails = []
 
     def chk(cond, msg):
@@ -1911,6 +1911,21 @@ def self_test():
             fails.append(msg)
 
     with tempfile.TemporaryDirectory(prefix="guard-selftest-") as td:
+        # ★0.14.56 X-8 A1: the spool is <pack>/state/evt_spool.jsonl of the pack a producer runs from - no
+        #   environment variable moves it. So no run below starts THIS pack's script: every run goes through a RIG
+        #   PACK (a temp copy of this bin/). A case that reads its spool gets its own rig (new_root(.., own_rig=True));
+        #   every other case shares one rig, whose spool nobody reads.
+        def make_rig(dest):
+            rig_bin = os.path.join(dest, "bin")
+            shutil.copytree(_SELF_DIR, rig_bin, ignore=shutil.ignore_patterns("__pycache__"))
+            return rig_bin
+
+        shared_rig = make_rig(os.path.join(td, "rig-shared"))
+        rigs = {}
+
+        def script_for(root):
+            return os.path.join(rigs.get(root, shared_rig), "javis_completion_guard.py")
+
         # ── 공용 셔임·픽스처 준비 ──
         shim_dir = os.path.join(td, "shim")
         os.makedirs(shim_dir)
@@ -1948,11 +1963,13 @@ def self_test():
 
         roots = {}
 
-        def new_root(name):
+        def new_root(name, own_rig=False):
             root = os.path.join(td, name)
             tasks = os.path.join(root, "_round", "tasks")
             os.makedirs(tasks, exist_ok=True)
             roots[name] = root
+            if own_rig:
+                rigs[root] = make_rig(os.path.join(td, name + "-rig"))
             return root, tasks
 
         def mk_task(tasks, tid, spec, status="in_progress"):
@@ -1984,7 +2001,6 @@ def self_test():
                 # root 내 부재 경로로 핀. G6 케이스만 env_extra 로 실마커 주입.
                 "GRILL_MARKER": os.path.join(root, ".grill-absent.json"),
                 "JAVIS_ROOT": root,
-                "HUD_STATE_DIR": os.path.join(root, "hud"),
                 "CYS_PROBE_RUNS": os.path.join(root, "probe_runs.jsonl"),
                 "CYS_NO_AUTOSTART": "1",
                 "CYS_GUARD_BOOT_MARKER": boot_marker,
@@ -2003,7 +2019,7 @@ def self_test():
                 env.update(env_extra)
             stdin_text = json.dumps(stdin_obj or {"stop_hook_active": False,
                                                   "transcript_path": "/nonexistent.jsonl"})
-            r = subprocess.run([sys.executable, self_path], input=stdin_text,
+            r = subprocess.run([sys.executable, script_for(root)], input=stdin_text,
                                capture_output=True, text=True, env=env, timeout=120)
             return r.returncode, r.stdout, r.stderr
 
@@ -2015,13 +2031,12 @@ def self_test():
                       "JAVIS_VERIFY_BUDGET_SECS"):
                 env.pop(k, None)
             env.update({"JAVIS_ROOT": root,
-                        "HUD_STATE_DIR": os.path.join(root, "hud"),
                         "CYS_PROBE_RUNS": os.path.join(root, "probe_runs.jsonl"),
                         "CYS_NO_AUTOSTART": "1",
                         "PATH": shim_dir + os.pathsep + os.environ.get("PATH", "")})
             if env_extra:
                 env.update(env_extra)
-            r = subprocess.run([sys.executable, self_path] + list(args),
+            r = subprocess.run([sys.executable, script_for(root)] + list(args),
                                capture_output=True, text=True, env=env, timeout=120)
             return r.returncode, r.stdout, r.stderr
 
@@ -2031,7 +2046,8 @@ def self_test():
                 return json.load(f)
 
         def spool_lines(root):
-            p = os.path.join(root, "hud", "evt_spool.jsonl")
+            # the root's OWN rig (KeyError = a case reads a spool it was not given - loud, never the shared one)
+            p = os.path.join(os.path.dirname(rigs[root]), "state", "evt_spool.jsonl")
             if not os.path.isfile(p):
                 return []
             with open(p, encoding="utf-8") as f:
@@ -2060,7 +2076,7 @@ def self_test():
 
         # ── stale claim: pid 사망 ∧ **태스크 비활성** → exit 0 + 경보 1회 ──
         #    (E2-1: pid 사망 단독으로는 더 이상 stale 이 아니다 — 아래 R-02 배터리 참조)
-        root, tasks = new_root("r-stale")
+        root, tasks = new_root("r-stale", own_rig=True)
         mk_task(tasks, "T1", fail_spec, status="done")
         mk_claim(tasks, "7", "T1")
         rc, _o, _e = run_guard(root, env_extra={"CYS_GUARD_LIVENESS": "dead"})
@@ -2076,7 +2092,7 @@ def self_test():
         # ══ E2-1(BLOCKER R-02) 배터리 — guard-claim 침묵형 무발동 ═══════════════
         # (a) master 셸 pid 사망 + 태스크 활성 → claim 유효 유지 → **실제 발동**(exit 2).
         #     종전 코드에서는 여기서 영구 exit 0(무장했는데 아무것도 안 함)이었다.
-        root, tasks = new_root("r-r02-alive")
+        root, tasks = new_root("r-r02-alive", own_rig=True)
         mk_task(tasks, "T1", fail_spec)                 # status=in_progress
         mk_claim(tasks, "7", "T1")
         rc, _o, err = run_guard(root, env_extra={"CYS_GUARD_LIVENESS": "dead"})
@@ -2093,7 +2109,7 @@ def self_test():
         rc, _o, _e = run_guard(root, env_extra={"CYS_GUARD_LIVENESS": "dead"})
         chk(rc == 2, "R-02(a2): pid 미기록 claim + 활성 태스크가 발동 안 함: %s" % rc)
         # (c) 침묵 탐지기 — claim 부재로 연속 N회 무검증 종결 → 임계에서 경보 1회 + 상태파일
-        root, tasks = new_root("r-silence")
+        root, tasks = new_root("r-silence", own_rig=True)
         mk_task(tasks, "T1", fail_spec)                 # claim 은 만들지 않는다
         for i in range(4):
             rc, _o, _e = run_guard(root, env_extra={"CYS_GUARD_SILENCE_N": "3"})
@@ -2108,7 +2124,7 @@ def self_test():
               and "침묵 탐지" in x["payload"].get("summary", "")]
         chk(len(ev) == 1, "R-02(c): 침묵 경보 1회 아님(코얼레싱 포함): %d" % len(ev))
         # 임계 미달에서는 무경보(오탐 억제)
-        root, tasks = new_root("r-silence-quiet")
+        root, tasks = new_root("r-silence-quiet", own_rig=True)
         mk_task(tasks, "T1", fail_spec)
         run_guard(root, env_extra={"CYS_GUARD_SILENCE_N": "5"})
         ev = [x for x in spool_lines(root) if "침묵 탐지" in x["payload"].get("summary", "")]
@@ -2186,7 +2202,7 @@ def self_test():
             "신선 부트 마커(grace 내)가 SKIPPED_GRACE 아님")
 
         # ── 기준 ④a: ctx 60% 픽스처 → 블록 아닌 통과+context_yield+escalation(emit 1회) ──
-        root, tasks = new_root("r-ctx60")
+        root, tasks = new_root("r-ctx60", own_rig=True)
         mk_task(tasks, "T1", fail_spec)
         mk_claim(tasks, "7", "T1")
         write_status(60.0)
@@ -2236,7 +2252,7 @@ def self_test():
             "gate exit 64 가 INFRA_ERROR 아님: %s" % gstate(root, "T1"))
 
         # ── 사다리 5단: budget — 부재=무제한·소진=SKIPPED_BUDGET(deferred) ──
-        root, tasks = new_root("r-budget")
+        root, tasks = new_root("r-budget", own_rig=True)
         mk_task(tasks, "T1", ok_spec)
         mk_claim(tasks, "7", "T1")
         bdir = os.path.join(root, "_round", "verify-budget")
@@ -2285,7 +2301,7 @@ def self_test():
             "B2 반복 소진에 resource.hard 재발화(창당 1회 위반): %d" % len(hard_evs))
 
         # ── B2: 예산 env 노브 — JAVIS_VERIFY_BUDGET_RUNS 가 policy.json 보다 우선 ──
-        root, tasks = new_root("r-budget-env")
+        root, tasks = new_root("r-budget-env", own_rig=True)
         mk_task(tasks, "T1", ok_spec)
         mk_claim(tasks, "7", "T1")
         bdir2 = os.path.join(root, "_round", "verify-budget")
@@ -2364,7 +2380,7 @@ def self_test():
             "G5 다음 정상 Stop 의 강등 소비 실패: %s" % rec_g5.get("verify_spec"))
 
         # ── G6(수리): 무장 조합 위험 경보 — cap 미설정 ∧ grill 활성 ∧ self-cap 0 = 1회 ──
-        root, tasks = new_root("r-g6-combo")
+        root, tasks = new_root("r-g6-combo", own_rig=True)
         mk_task(tasks, "T1", ok_spec)
         mk_claim(tasks, "7", "T1")
         g6_marker = os.path.join(root, "grill_session.json")
@@ -2378,7 +2394,7 @@ def self_test():
         chk(len(g6_evs) == 1,
             "G6 무장 조합 위험 경보 1회(반복 무재발화) 아님: %d" % len(g6_evs))
         # self-cap 활성(≥1)·cap 상향은 각각 조합 해제 → 무경보
-        root, tasks = new_root("r-g6-off")
+        root, tasks = new_root("r-g6-off", own_rig=True)
         mk_task(tasks, "T1", ok_spec)
         mk_claim(tasks, "7", "T1")
         g6_marker2 = os.path.join(root, "grill_session.json")
@@ -2403,7 +2419,7 @@ def self_test():
             "spec 부재가 SKIPPED_NO_SPEC 아님")
 
         # ── ①(§2-4·기준 ①): 동일 실패 100회 → pending 정확 1건+escalation 1회+bundle 1개 ──
-        root, tasks = new_root("r-esc100")
+        root, tasks = new_root("r-esc100", own_rig=True)
         mk_task(tasks, "T1", fail_spec)
         mk_claim(tasks, "7", "T1")
         block_rcs = []
@@ -2471,7 +2487,7 @@ def self_test():
 
         # ── ⑤(F2 재설계·§2-4): 오버라이드 — 블록 3회→조건 조성(cap 4)→새 Stop 5회 →
         #    tamper 정확 1회·pending 무증식·신규 escalation 0 ──
-        root, tasks = new_root("r-override")
+        root, tasks = new_root("r-override", own_rig=True)
         mk_task(tasks, "T1", fail_spec)
         mk_claim(tasks, "7", "T1")
         cap_env = {"CLAUDE_CODE_STOP_HOOK_BLOCK_CAP": "4"}
@@ -2503,7 +2519,7 @@ def self_test():
             % len(ov_queued))
 
         # ── F2 후단: CYCLE 마커(인가 clear) 존재 시 감지 0 — 발화 위치가 양보 판정 이후 ──
-        root, tasks = new_root("r-override-cycle")
+        root, tasks = new_root("r-override-cycle", own_rig=True)
         mk_task(tasks, "T1", fail_spec)
         mk_claim(tasks, "7", "T1")
         with open(os.path.join(tasks, "T1.guard.json"), "w", encoding="utf-8") as f:
@@ -2519,7 +2535,7 @@ def self_test():
         chk(len(ov2) == 0, "CYCLE 마커(인가 clear) 존재인데 override 감지: %d" % len(ov2))
 
         # ── ②(§2-4·기준 ②): 인프라 오류 3종 주입 → 블록 0·경보 3·corrupt 격리 ──
-        root, tasks = new_root("r-infra3")
+        root, tasks = new_root("r-infra3", own_rig=True)
         infra_alerts = 0
         # (a) 명령부재 rc127
         mk_task(tasks, "Ta", {"mode": "command", "cmd": "definitely-not-a-command-xyz",
@@ -2553,7 +2569,7 @@ def self_test():
         chk(len(infra_alerts) == 3, "인프라 경보 3회 아님: %d" % len(infra_alerts))
 
         # ── 기준 ③: 연속 인프라 3회 → guard-disarmed 마커+경보·이후 무발동 ──
-        root, tasks = new_root("r-breaker")
+        root, tasks = new_root("r-breaker", own_rig=True)
         mk_task(tasks, "T1", {"mode": "command", "cmd": "definitely-not-a-command-xyz",
                               "pass_rule": {"kind": "exit_map", "pass_exits": [0]},
                               "timeout_s": 5})
@@ -2590,7 +2606,7 @@ def self_test():
             "전문 로그 부재/불완전: %s" % (os.path.getsize(vlog) if os.path.isfile(vlog) else None))
 
         # ── 기준 ⑨: 프로세스 그룹 잔존 — sleep 자식 스폰 → killpg 잔존 0 ──
-        root, tasks = new_root("r-pg")
+        root, tasks = new_root("r-pg", own_rig=True)
         childpid_f = os.path.join(root, "childpid")
         # 배경 자식은 stdout 파이프를 상속하면 communicate() EOF 를 붙잡는다 — 리다이렉트 필수
         pg = {"mode": "command",
@@ -2616,7 +2632,7 @@ def self_test():
         chk(len(tam2) == 1, "그룹 잔존 tamper-adjacent 이벤트 1회 아님: %d" % len(tam2))
 
         # ── F1a: 데드라인 예산 조기 INFRA — 장시간 spec+n_of_m 이 데드라인 초과 불가 ──
-        root, tasks = new_root("r-dl-budget")
+        root, tasks = new_root("r-dl-budget", own_rig=True)
         childpids = os.path.join(root, "childpids")
         slow = {"mode": "command",
                 "cmd": "sleep 60 >/dev/null 2>&1 & echo $! >> %s; sleep 1; exit 7" % childpids,
@@ -2649,7 +2665,7 @@ def self_test():
             % (dl_pids, dl_alive))
 
         # ── F1b: SIGALRM _Deadline 발화(E2E) — status 무기 지연 → INFRA 적재·violations++ ──
-        root, tasks = new_root("r-dl-alarm")
+        root, tasks = new_root("r-dl-alarm", own_rig=True)
         mk_task(tasks, "T1", fail_spec)
         mk_claim(tasks, "7", "T1")
         rc, _o, err = run_guard(root, env_extra={"CYS_GUARD_SELF_DEADLINE_SEC": "2",
@@ -2669,13 +2685,14 @@ def self_test():
         dtasks = os.path.join(droot, "_round", "tasks")
         os.makedirs(dtasks, exist_ok=True)
         g = globals()
-        dl_saved = {"ROOT": g["ROOT"], "TASKS_DIR": g["TASKS_DIR"],
-                    "hud": os.environ.get("HUD_STATE_DIR")}
+        # X-8 A1: the in-process path spawns its siblings (javis_event emit --spool, ...) from `_SELF_DIR`, so it
+        #   points at the shared rig for the duration - the spool lands in the rig pack, never in this pack.
+        dl_saved = {"ROOT": g["ROOT"], "TASKS_DIR": g["TASKS_DIR"], "_SELF_DIR": g["_SELF_DIR"]}
         p_track = subprocess.Popen(["sleep", "60"], start_new_session=True,
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             g["ROOT"], g["TASKS_DIR"] = droot, dtasks
-            os.environ["HUD_STATE_DIR"] = os.path.join(droot, "hud")
+            g["_SELF_DIR"] = shared_rig
             _ACTIVE_PGIDS.add(p_track.pid)
             st_u = _fresh_state("Tdl")
             st_u.update({"escalated_at": _now(), "last_sig": "sigX", "block_count": 3})
@@ -2700,10 +2717,7 @@ def self_test():
                 "escalated_at~_escalate 소실 창 esc-bundle 보강 부재/오기록: %s" % bd)
         finally:
             g["ROOT"], g["TASKS_DIR"] = dl_saved["ROOT"], dl_saved["TASKS_DIR"]
-            if dl_saved["hud"] is None:
-                os.environ.pop("HUD_STATE_DIR", None)
-            else:
-                os.environ["HUD_STATE_DIR"] = dl_saved["hud"]
+            g["_SELF_DIR"] = dl_saved["_SELF_DIR"]
             _DEADLINE_CTX.update({"state": None, "sid": None})
             with contextlib.suppress(Exception):
                 p_track.kill()
@@ -2803,13 +2817,12 @@ def self_test():
         env = dict(os.environ)
         env.update({"JAVIS_ROOT": root, "CYS_COMPLETION_GUARD": "1", "CYS_SURFACE_ID": "7",
                     "CYS_GUARD_BOOT_MARKER": boot_marker, "CYS_GUARD_LIVENESS": "alive",
-                    "HUD_STATE_DIR": os.path.join(root, "hud"),
                     "CYS_PROBE_RUNS": os.path.join(root, "probe_runs.jsonl"),
                     "CYS_NO_AUTOSTART": "1", "CYS_ROLE": "worker",
                     "CYS_GUARD_RESOURCE_ARGS":
                         "--servers-override 0 --nodes-override 0 --load-override 0.0",
                     "PATH": shim_dir + os.pathsep + os.environ.get("PATH", "")})
-        r2 = subprocess.run([sys.executable, self_path], input="not-json{{{",
+        r2 = subprocess.run([sys.executable, script_for(root)], input="not-json{{{",
                             capture_output=True, text=True, env=env, timeout=60).returncode
         adverse.append(("stdin 비JSON", r2))
         # 태스크 레코드 부재
