@@ -10,9 +10,16 @@
 
 하는 일 (기본은 dry-run — `--apply` 를 줘야 실제로 업로드한다)
   1. GitHub 릴리스에서 전 자산 다운로드 → `~/cys-release-backup/<tag>-assets/`
+     (H-05 D2: 로컬 사본 재사용은 크기 **와** 자산 digest 가 같을 때만 — digest 부재 = 재다운로드)
   2. `make-win-zip.py` 로 zip 변형 생성(기존 발행본 바이트 재현 확인됨)
+     2b. (H-05 D1-a) 릴리스에 `SHA256SUMS.txt` 가 있으면 그 바이트를 `SHA256SUMS.published.txt`
+         로 보존한다 — 불변(같으면 그대로 · 다르면 덮어쓰지 않고 오류로 멈춘다)
   3. `SHA256SUMS.txt` 생성 — **자기 자신을 뺀 전 자산**(과거 관례: 13자산)
   4. 자기 검증: zip 왕복 · SUMS 전 줄 재계산 대조 · 누락 0
+     4b. (H-05 D1-b) 발행본 대 재생성본 상태: bootstrap · equal · draft-mismatch(경고) ·
+         public-mismatch(오류 — 원격 쓰기 전에 멈춘다)
+     6a. (H-05 D1-c) `--apply` 는 첫 DELETE 전에 업로드 후보 두 파일이 4단계가 검증한
+         바이트 그대로인지 다시 확인한다
   5. ★Gatekeeper 게이트(F2 · 2026-08-20 신설): 백업 DMG 2종 = **발행될 실물 바이트**에
      `release-gate-gatekeeper.sh`(정적 실평가)를, 네이티브 아키텍처 DMG 에는 추가로
      `verify-gatekeeper-user-path.sh`(⑥ 봉인 자기파괴 재현 포함)를 돌린다.
@@ -42,6 +49,9 @@ import urllib.request
 REPO = "idoforgod/cys-terminal"
 BACKUP_ROOT = os.path.expanduser("~/cys-release-backup")
 SUMS_NAME = "SHA256SUMS.txt"          # ★과거 관례 — `SHA256SUMS`(확장자 없음) 아님
+# H-05 (0.14.56 · P9-DESIGN-R2 §5 D1-a): the release's own SUMS bytes, kept beside the regenerated one.
+# The uploader and release-postprocess.yml keep reading SUMS_NAME (= the regenerated candidate).
+PUBLISHED_NAME = "SHA256SUMS.published.txt"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -72,6 +82,37 @@ def sha256_file(p):
         for chunk in iter(lambda: fh.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def cache_hit(dest, asset):
+    """D2: a local copy is reused only if size AND digest match. A missing or empty digest is never a hit -
+    size alone cannot detect a replaced asset (R2 §10-C d-2: same-size stale latest.json and setup.exe)."""
+    if not (os.path.exists(dest) and os.path.getsize(dest) == asset["size"]):
+        return False
+    digest = asset.get("digest") or ""
+    return digest.startswith("sha256:") and digest[len("sha256:"):] == sha256_file(dest)
+
+
+def preserve_published(outdir, data):
+    """D1-a: keep the release's SUMS bytes as PUBLISHED_NAME. The copy is immutable: an equal copy is left as
+    it is, a different one is never overwritten (that would erase the earlier evidence) -> error text."""
+    path = os.path.join(outdir, PUBLISHED_NAME)
+    if os.path.exists(path):
+        with open(path, "rb") as fh:
+            if fh.read() == data:
+                return None
+        return ("%s 가 이미 있고 이번 릴리스의 %s 와 다르다 — 앞 증거를 덮어쓰지 않는다. "
+                "두 바이트를 사람이 대조한 뒤 처리하라: %s" % (PUBLISHED_NAME, SUMS_NAME, path))
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+    except BaseException:
+        os.unlink(path)
+        raise
+    return None
 
 
 def download(url, dest, tok):
@@ -204,7 +245,7 @@ def main(argv):
     by_name = {}
     for a in rel.get("assets", []):
         dest = os.path.join(outdir, a["name"])
-        if os.path.exists(dest) and os.path.getsize(dest) == a["size"]:
+        if cache_hit(dest, a):
             print("  (캐시) %-34s %12d" % (a["name"], a["size"]))
         else:
             print("  받는 중 %-34s %12d …" % (a["name"], a["size"]), flush=True)
@@ -231,12 +272,24 @@ def main(argv):
             return 1
         by_name[zipname] = zippath
 
+    # ── 2b. 발행본 SUMS 보존 (H-05 D1-a) — 3단계가 같은 경로를 덮어쓰기 **전에** ──
+    published = None
+    if SUMS_NAME in by_name:
+        with open(by_name[SUMS_NAME], "rb") as fh:
+            published = fh.read()
+        why = preserve_published(outdir, published)
+        if why:
+            print("::error::%s" % why, file=sys.stderr)
+            return 1
+
     # ── 3. SHA256SUMS.txt — 자기 자신 제외 전 자산 ──
     names = sorted(n for n in by_name if n != SUMS_NAME)
     lines = ["%s  %s\n" % (sha256_file(by_name[n]), n) for n in names]
     sums_path = os.path.join(outdir, SUMS_NAME)
     with open(sums_path, "w") as fh:
         fh.writelines(lines)
+    with open(sums_path, "rb") as fh:
+        sums_bytes = fh.read()             # the candidate the uploader will open (D1-c compares against it)
     print("  %s 생성 — %d자산" % (SUMS_NAME, len(names)))
 
     # ── 4. 자기 검증 ──
@@ -257,6 +310,28 @@ def main(argv):
         return 1
     print("  ✓ 자기 검증 통과 — 전 줄 재계산 일치 · 배포 4종 누락 0")
 
+    # ── 4b. 발행본 대 재생성본 — 상태를 이름으로 (H-05 D1-b) ──
+    #    draft 가 True 로 **명시**되지 않은 릴리스는 공개로 다룬다(키 부재 = fail-closed).
+    if published is None:
+        state = "bootstrap"                # 릴리스에 SUMS 가 없다 — 첫 후처리의 정상 경로
+    elif published == sums_bytes:
+        state = "equal"
+    elif rel.get("draft") is True:
+        state = "draft-mismatch"
+    else:
+        state = "public-mismatch"
+    print("  SUMS 상태: %s" % state)
+    if state in ("draft-mismatch", "public-mismatch"):
+        old = set(published.decode("utf-8", "replace").splitlines())
+        new = set(sums_bytes.decode("utf-8", "replace").splitlines())
+        detail = "발행본에만 %d줄 · 재생성본에만 %d줄 (둘 다 보존: %s · %s)" % (
+            len(old - new), len(new - old), PUBLISHED_NAME, SUMS_NAME)
+        if state == "public-mismatch":
+            print("::error::공개 릴리스의 %s 가 재생성본과 다르다 — %s. 원격 쓰기 전에 멈춘다"
+                  % (SUMS_NAME, detail), file=sys.stderr)
+            return 1
+        print("::warning::초안 재후처리 — %s 가 바뀐다(%s)" % (SUMS_NAME, detail))
+
     # ── 5. Gatekeeper 게이트 (F2) — 발행될 실물 바이트를 dry-run·--apply 공통으로 실평가 ──
     #    ★업로드(6단계)·dry-run 성공 판정보다 반드시 앞: rc≠0 이면 여기서 전체가 비영 종료라
     #      --apply 는 게이트를 우회할 수 없다(fail-closed · 측정 불능≠통과).
@@ -269,6 +344,16 @@ def main(argv):
         print("\n[dry-run] 업로드하지 않았다. 실제 업로드는 --apply")
         print("산출물: %s" % outdir)
         return 0
+
+    # ── 6a. 업로드 후보 재확인 (H-05 D1-c) — 첫 DELETE 보다 앞 ──
+    #    업로더가 여는 두 파일이 4단계가 검증한 바로 그 바이트인가. 그 사이 무엇이 바꿨다면 올리지 않는다.
+    with open(sums_path, "rb") as fh:
+        if fh.read() != sums_bytes:
+            print("::error::%s 가 자기 검증 뒤에 바뀌었다 — 업로드 거부" % SUMS_NAME, file=sys.stderr)
+            return 1
+    if "%s  %s\n" % (sha256_file(zippath), zipname) not in lines:
+        print("::error::%s 가 %s 의 해당 줄과 다르다 — 업로드 거부" % (zipname, SUMS_NAME), file=sys.stderr)
+        return 1
 
     up_base = rel["upload_url"].split("{")[0]
     existing = {a["name"]: a["id"] for a in rel.get("assets", [])}
