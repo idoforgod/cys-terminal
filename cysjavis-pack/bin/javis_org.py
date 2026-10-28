@@ -354,8 +354,10 @@ def dept_status(socket):
 def cmd_status(path=None):
     reg = load_json(DEPTS, {"depts":{}})
     keys = None
+    tasks = []
     if path:
         m = load_json(path); keys = {d["key"] for d in m["departments"]}
+        tasks = m.get("tasks") or []
     rows = []
     for name, e in reg.get("depts", {}).items():
         if keys is not None and e.get("mission_key") not in keys: continue
@@ -363,8 +365,10 @@ def cmd_status(path=None):
         surfaces = (st or {}).get("surfaces", [])
         rows.append({"dept": name, "display": e.get("display_name", name),
                      "alive": st is not None, "intake": intake_ok(surfaces)})
-    ok = all(r["intake"] for r in rows) if rows else False
-    print(json.dumps({"status": "ok" if ok else "incomplete", "depts": rows}, ensure_ascii=False))
+    # ★0.14.56 E3 P-1: the first ticket counts as started only on the daemon's delivery receipt
+    tickets = [{"dept": t.get("dept"), "task": t.get("task"), "first_ticket": first_ticket_state_of(t)} for t in tasks]
+    ok = (all(r["intake"] for r in rows) if rows else False) and all(x["first_ticket"] == "delivered" for x in tickets)
+    print(json.dumps({"status": "ok" if ok else "incomplete", "depts": rows, "first_tickets": tickets}, ensure_ascii=False))
     return 0 if ok else 1
 
 # ── ★T10(P3-3 최소안) org-audit — pack-only **read-only** 파생 집계 ─────────────────────────
@@ -843,9 +847,9 @@ def _ledger_size(ledger):
         return 0
 
 def _ticket_receipt(ledger, nonce, start=0):
-    """'delivered' | 'expired' | None from the department's delivery ledger, for the queue item whose preview
-    carries the nonce. Reads only the bytes appended since `start` (the ledger can be megabytes; a shrunk file
-    means it was replaced, so it is read from 0). Shapes: src/bin/cysd/delivery.rs (queue_receipt / queue_tombstone)."""
+    """'delivered' | 'unreadable' | None from the department's delivery ledger, for the item whose preview carries the
+    nonce. The preview row is written at DELIVERY (governance.rs, the pre-record before the writer hand-off), so a
+    pending item has no row here; pending/expired come from the department's queue (_queue_has)."""
     rows = []
     try:
         with open(ledger, "rb") as f:
@@ -856,47 +860,101 @@ def _ticket_receipt(ledger, nonce, start=0):
                 except ValueError:
                     continue   # a partial last line or a torn row is not a receipt
     except OSError:
-        return None
+        return "unreadable" if os.path.exists(ledger) else None
     ids = {r.get("queue_entry_id") for r in rows if nonce in (r.get("preview") or "") and r.get("queue_entry_id")}
     for r in rows:
         hit = r.get("queue_entry_id") in ids or bool(ids & set(r.get("merged_ids") or []))
         if hit and r.get("kind") == "receipt" and isinstance(r.get("delivered_at"), (int, float)):
             return "delivered"
-        if hit and r.get("kind") == "tombstone":
-            return "expired"
     return None
+
+def _queue_has(sock, nonce, expired=False):
+    """True/False: the department's queue (or its expired list) holds an item whose preview carries the nonce.
+    None when the read fails — that is UNKNOWN, never 'absent'."""
+    cmd = ["cys", "--socket", sock, "queue", "list", "--json"] + (["--expired"] if expired else [])
+    r = subprocess.run(cmd, capture_output=True, text=True, env={**os.environ, "CYS_NO_AUTOSTART": "1"})
+    if r.returncode != 0:
+        return None
+    try:
+        items = json.loads(r.stdout or "[]")
+    except ValueError:
+        return None
+    return any(isinstance(i, dict) and nonce in (i.get("preview") or "") for i in items)
+
+def _ticket_state(sock, nonce):
+    """'delivered' | 'pending' | 'expired' | 'lost' | 'unknown' for an earlier first-ticket send (P1P2-DIRECTIONS)."""
+    import javis_lane
+    ledger = javis_lane.lane_state_path("delivery", sock)
+    seen = _ticket_receipt(ledger, nonce)
+    if seen in ("delivered", "unreadable"):
+        return "delivered" if seen == "delivered" else "unknown"
+    for expired, name in ((False, "pending"), (True, "expired")):
+        q = _queue_has(sock, nonce, expired)
+        if q is None:
+            return "unknown"
+        if q:
+            return name
+    again = _ticket_receipt(ledger, nonce)   # a second read closes the delivered-between-reads race
+    return {"delivered": "delivered", "unreadable": "unknown"}.get(again, "lost")
+
+def _first_ticket_key(t):
+    raw = "\0".join(str(t.get(k, "")) for k in ("dept", "task", "scope")) + "\0" + str(t.get("to", "worker"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+def _latest_copy(t):
+    """The newest durable copy for this task's key, or None. Name: <dept>-<key>-<time>-<nonce>.txt."""
+    import javis_lane
+    d, pre = os.path.join(javis_lane.state_dir(), "org-dispatch"), "%s-%s-" % (t["dept"], _first_ticket_key(t))
+    try:
+        names = sorted(n for n in os.listdir(d) if n.startswith(pre) and n.endswith(".txt"))
+    except OSError:
+        return None
+    return os.path.join(d, names[-1]) if names else None
+
+def first_ticket_state_of(t):
+    """status-side check (P-1): 'absent' | 'unresolved' | the _ticket_state of the newest send for this task."""
+    sock, _n = _dept_socket_for(t["dept"])
+    if sock is None:
+        return "unresolved"
+    prev = _latest_copy(t)
+    if prev is None:
+        return "absent"
+    return _ticket_state(sock, os.path.basename(prev)[:-4].rsplit("-", 1)[1])
 
 def _deliver_first_ticket(t, ticket, out):
     sock, n = _dept_socket_for(t["dept"])
     if sock is None:
         return 4, out + "\n[dispatch] dept_unresolved: %d registry entries carry mission_key=%r" % (n, t["dept"])
     try:
-        import javis_lane   # the ledger path rule, mirrored from Rust (one owner — no copy here)
+        import javis_lane   # the state dir and ledger path rule, mirrored from Rust (one owner — no copy here)
     except Exception as e:
         return 2, out + "\n[dispatch] ledger_unavailable: %s" % e
+    key = _first_ticket_key(t)
+    resend = ""
+    prev = _latest_copy(t)
+    if prev is not None:   # P-2: one first ticket per (dept, task, scope, to)
+        pn = os.path.basename(prev)[:-4].rsplit("-", 1)[1]
+        st = _ticket_state(sock, pn)
+        if st in ("delivered", "pending"):
+            return 0, out + "\n[dispatch] %s (existing item, not resent) nonce=%s key=%s ticket=%s" % (st, pn, key, prev)
+        if st == "unknown":
+            return 1, out + "\n[dispatch] unknown state of the existing item, not resent nonce=%s key=%s ticket=%s" % (pn, key, prev)
+        resend = " RESEND of %s item nonce=%s" % (st, pn)
     nonce = os.urandom(5).hex()   # the marker "[org-dispatch <10 hex>]" is 26 chars: inside the 64-char ledger preview
     d = os.path.join(javis_lane.state_dir(), "org-dispatch")
     os.makedirs(d, exist_ok=True)
-    path = os.path.join(d, "%s-%s-%s.txt" % (t["dept"], time.strftime("%Y%m%dT%H%M%S"), nonce))
-    with open(path, "w", encoding="utf-8") as f:   # durable copy; its first line carries the nonce the ledger preview shows
+    path = os.path.join(d, "%s-%s-%s-%s.txt" % (t["dept"], key, time.strftime("%Y%m%dT%H%M%S"), nonce))
+    tmp = path + ".sending"   # the keyed name exists only after the daemon accepted the send
+    with open(tmp, "w", encoding="utf-8") as f:   # durable copy; its first line carries the nonce the previews show
         f.write("[org-dispatch %s] %s" % (nonce, ticket))
-    ledger = javis_lane.lane_state_path("delivery", sock)
-    start = _ledger_size(ledger)
-    s = subprocess.run(["cys", "--socket", sock, "send", "--queued", "--to", t.get("to", "worker"), "--file", path],
+    s = subprocess.run(["cys", "--socket", sock, "send", "--queued", "--to", t.get("to", "worker"), "--file", tmp],
                        capture_output=True, text=True, env={**os.environ, "CYS_NO_AUTOSTART": "1"})
     if s.returncode != 0:
+        os.remove(tmp)
         return s.returncode, out + "\n[dispatch] send_failed rc=%d: %s" % (s.returncode, (s.stderr or s.stdout or "")[-200:])
-    deadline = time.time() + float(os.environ.get("JAVIS_ORG_DISPATCH_WAIT_S", "120"))
-    while True:
-        seen = _ticket_receipt(ledger, nonce, start)
-        if seen == "delivered":
-            return 0, out + "\n[dispatch] delivered nonce=%s ticket=%s" % (nonce, path)
-        if seen == "expired":
-            return 1, out + "\n[dispatch] expired before delivery nonce=%s ticket=%s" % (nonce, path)
-        if time.time() >= deadline:
-            # not a loss claim: the item may still be delivered later; only the receipt counts as delivery
-            return 1, out + "\n[dispatch] queued_not_delivered nonce=%s ticket=%s ledger=%s" % (nonce, path, ledger)
-        time.sleep(1.0)
+    os.replace(tmp, path)
+    # P-1: no wait here — the caller's turn never sits on a delivery; `status` reports the receipt
+    return 0, out + "\n[dispatch] queued nonce=%s key=%s ticket=%s%s" % (nonce, key, path, resend)
 
 def apply_manifest(m):
     require_cso()  # 게이트를 효과 함수에 (R1 REVISE-1) — import 직접호출 우회 차단
