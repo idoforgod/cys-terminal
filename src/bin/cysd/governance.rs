@@ -8647,6 +8647,21 @@ pub(crate) fn d1_governs(s: &crate::state::Surface) -> bool {
         .is_some_and(|(agent, _)| D1_MEASURED_ADAPTERS.contains(&agent.as_str()))
 }
 
+/// ★(0.14.56 · P1 D9 · design r3 §8, CEO KEY PREDICATE rev 2 `3ab21282`) The ONE scope test for master/CEO composers:
+/// the target holds role `master` or `ceo` in THIS daemon, it is an agent seat (`seat_is_agent_backed` - a dead agent at a
+/// shell prompt keeps the pin paths, so node-recover still self-heals), and the caller is not owner class. Daemon-internal
+/// writers pass `owner_caller = false`. Every in-scope decision calls this function; a copy at a site is a defect.
+pub(crate) fn d9_scope(daemon: &Daemon, s: &Arc<crate::state::Surface>, owner_caller: bool) -> bool {
+    if owner_caller {
+        return false;
+    }
+    let role_hit = {
+        let roles = daemon.roles.lock().unwrap_or_else(|e| e.into_inner());
+        ["master", "ceo"].iter().any(|r| roles.get(*r) == Some(&s.id))
+    };
+    role_hit && crate::alert_route::seat_is_agent_backed(s)
+}
+
 /// ★(0.14.56 · P1 D1 · design r2 §2 rows 1-7, r3 §2) The composer verdict of ONE observation (pure; the first matching row wins).
 /// U+00A0 is never read as a signal here: `str::trim`/`split_whitespace` treat it as white space, i.e. as part of the CLI's
 /// marker glyph spacing (head constraint, CEO intake #57).

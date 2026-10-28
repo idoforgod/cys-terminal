@@ -1,0 +1,660 @@
+//! ★(0.14.56 · P1 D9 · design r3 §5, §8, §12; head ruling 646b2a36 + CEO amendment 52facf64) Master/CEO composers:
+//! RPC-level specimens for the send conversion, the pair key, the Return arm and the creator boot-gate carve-out.
+//!
+//! Write axis (as in `return_absorb_tests`): a handler that hands a PTY write to the writer always moves `input_gen`,
+//! so "generation unchanged" is the deterministic witness that a request wrote nothing.
+//!
+//! These specimens call only entry points that exist at 9da2418d (dispatch, create_surface, caller_cache, create_caller,
+//! agent_status, return_tickets, feed_items, pending_queue), so this file applied to the pin tree is the RED run.
+#![cfg(test)]
+
+use crate::handlers::{dispatch, Reply};
+use crate::state::{Daemon, Surface};
+use cys::Request;
+use serde_json::{json, Value};
+use std::io::BufRead;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, MutexGuard};
+
+struct Fx {
+    daemon: Arc<Daemon>,
+    dir: std::path::PathBuf,
+    _g: MutexGuard<'static, ()>,
+}
+
+impl Drop for Fx {
+    fn drop(&mut self) {
+        crate::state::test_stop_daemon(&self.daemon);
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        std::env::remove_var("CYS_RETURN_ABSORB_SECS");
+        std::env::remove_var("CYS_RETURN_ABSORB_REFLEX_MS");
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn fx(tag: &str) -> Fx {
+    let g = crate::governance::PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    crate::delivery::tests::isolate_state_dir_for_thread(tag);
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("cys-d9-{tag}-{}-{n}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("acl.json"), r#"{"default":"allow","rules":[]}"#).unwrap();
+    std::env::set_var(cys::pack::ENV_PACK_DIR, &dir);
+    std::env::remove_var("CYS_RETURN_ABSORB_SECS");
+    std::env::remove_var("CYS_RETURN_ABSORB_REFLEX_MS");
+    let daemon = Daemon::new(dir.join("cysd.sock"));
+    Fx { daemon, dir, _g: g }
+}
+
+/// Synthetic kernel-peer pids: above the macOS pid ceiling (99,999), so no live process can own one.
+const P: u32 = 997_300;
+
+fn seat(fx: &Fx, role: &str) -> Arc<Surface> {
+    let s = fx
+        .daemon
+        .create_surface(None, Some("sleep 30".into()), None, Some(role.into()), 24, 80)
+        .expect("create surface");
+    fx.daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+    s
+}
+
+/// A master seat in `d9_scope`: role `master` in this daemon and an agent seat (claude meta, seat state not Empty).
+fn master(fx: &Fx) -> Arc<Surface> {
+    let s = seat(fx, "master");
+    fx.daemon.roles.lock().unwrap().insert("master".into(), s.id);
+    *s.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+    s
+}
+
+fn bind(fx: &Fx, pid: u32, sid: u64) {
+    fx.daemon.caller_cache.lock().unwrap().insert(
+        pid,
+        crate::state::CallerCacheEntry::new(Some(sid), crate::state::now_epoch(), None, fx.daemon.caller_gen.load(Ordering::Relaxed)),
+    );
+}
+
+/// A caller pane (role `worker-N`) resolved from `pid`.
+fn pane(fx: &Fx, role: &str, pid: u32) -> Arc<Surface> {
+    let s = seat(fx, role);
+    bind(fx, pid, s.id);
+    s
+}
+
+fn rpc(fx: &Fx, pid: Option<u32>, method: &str, params: Value) -> Value {
+    let req = Request { id: json!(42), method: method.into(), params };
+    let Reply::Single(resp) = dispatch(&fx.daemon, req, pid) else {
+        panic!("expected single reply");
+    };
+    resp
+}
+
+fn send(fx: &Fx, pid: Option<u32>, t: &Arc<Surface>, text: &str, extra: Value) -> Value {
+    let mut p = json!({"surface_id": t.id, "text": text, "quiet": true});
+    if let (Some(m), Some(e)) = (p.as_object_mut(), extra.as_object()) {
+        m.extend(e.clone());
+    }
+    rpc(fx, pid, "surface.send_text", p)
+}
+
+fn ret(fx: &Fx, pid: Option<u32>, t: &Arc<Surface>, extra: Value) -> Value {
+    let mut p = json!({"surface_id": t.id, "key": "Return"});
+    if let (Some(m), Some(e)) = (p.as_object_mut(), extra.as_object()) {
+        m.extend(e.clone());
+    }
+    rpc(fx, pid, "surface.send_key", p)
+}
+
+fn gen(s: &Arc<Surface>) -> u64 {
+    s.input_gen.load(Ordering::Acquire)
+}
+
+fn queue_texts(s: &Arc<Surface>) -> Vec<String> {
+    s.pending_queue.lock().unwrap().iter().map(|e| e.text.clone()).collect()
+}
+
+fn held(s: &Arc<Surface>) -> usize {
+    s.submit_assoc.lock().unwrap_or_else(|e| e.into_inner()).len()
+}
+
+fn ledger_lines(fx: &Fx) -> usize {
+    std::fs::read_to_string(crate::delivery::ledger_path(&fx.daemon.socket_path))
+        .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
+        .unwrap_or(0)
+}
+
+fn assert_converted(resp: &Value) {
+    assert_eq!(resp["ok"], json!(true), "a non-owner send into master must succeed as ONE queue job: {resp}");
+    let r = &resp["result"];
+    assert_eq!(r["queued"], json!(true), "{resp}");
+    assert_eq!(r["converted"], json!("one_job"), "{resp}");
+    assert_eq!(r["sent"], json!(true), "{resp}");
+}
+
+fn assert_denied(resp: &Value) {
+    assert_eq!(resp["ok"], json!(false), "must be refused: {resp}");
+    assert_eq!(resp["error"]["code"], json!("composer_key_denied"), "{resp}");
+}
+
+fn assert_absorbed(resp: &Value) {
+    assert_eq!(resp["ok"], json!(true), "{resp}");
+    assert_eq!(resp["result"]["absorbed"], json!(true), "must be absorbed (0 bytes): {resp}");
+}
+
+/// A child process of this test process (its parent incarnation = this process). Killed on drop.
+struct Kid(std::process::Child);
+impl Drop for Kid {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+fn kid() -> Kid {
+    Kid(std::process::Command::new("/bin/sleep").arg("30").spawn().expect("spawn sleep"))
+}
+
+/// A grandchild: `sleep` under an intermediate shell, so its parent is NOT this process. Returns (shell, sleep pid).
+struct Grandkid(Kid, u32);
+impl Drop for Grandkid {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("/bin/kill").arg("-9").arg(self.1.to_string()).status();
+    }
+}
+fn grandkid() -> Grandkid {
+    let mut c = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg("/bin/sleep 30 & echo $!; wait")
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn sh");
+    let mut line = String::new();
+    std::io::BufReader::new(c.stdout.take().unwrap()).read_line(&mut line).unwrap();
+    let pid: u32 = line.trim().parse().expect("grandchild pid");
+    Grandkid(Kid(c), pid)
+}
+
+fn record_creator(fx: &Fx, sid: u64, pid: u32, start: Option<u64>, age_secs: f64) {
+    fx.daemon
+        .create_caller
+        .lock()
+        .unwrap()
+        .insert(sid, (pid, start, crate::state::now_epoch() - age_secs));
+}
+
+// ─────────────────────────── conversion (T-S1..S3, fence, control-only) ───────────────────────────
+
+/// T-S1: master inside its 3 s typing guard; a non-owner direct send -> converted, one queue item, 0 bytes.
+/// Pin: `ERR_TYPING_GUARD` (the RPC caller must fall back itself). Mutant: convert at the direct intents (after the guard).
+#[test]
+fn d9_s1_send_into_master_in_its_typing_guard_is_converted() {
+    let fx = fx("s1");
+    let m = master(&fx);
+    let _w = pane(&fx, "worker-1", P);
+    *m.last_human_input.lock().unwrap() = Some(std::time::Instant::now());
+    let g0 = gen(&m);
+    let r = send(&fx, Some(P), &m, "[보고] stage C", json!({}));
+    assert_converted(&r);
+    assert_eq!(queue_texts(&m), vec!["[보고] stage C".to_string()]);
+    assert_eq!(gen(&m), g0, "the conversion writes nothing at receipt");
+}
+
+/// T-S2: a converted send writes NO delivery-ledger record at receipt (its one record is written at delivery,
+/// `Origin::Queue`, by the unchanged queue path). Pin: an `Origin::Send` record at receipt (handlers.rs:6976), then a
+/// second one at delivery. Mutant: convert after the send audit.
+#[test]
+fn d9_s2_converted_send_is_not_audited_at_receipt() {
+    let fx = fx("s2");
+    let m = master(&fx);
+    let _w = pane(&fx, "worker-1", P + 1);
+    let before = ledger_lines(&fx);
+    let r = send(&fx, Some(P + 1), &m, "[보고] once", json!({}));
+    assert_converted(&r);
+    assert_eq!(ledger_lines(&fx), before, "no Origin::Send record at receipt");
+    assert_eq!(m.pending_queue.lock().unwrap().front().map(|e| e.origin.clone()), Some("send".into()));
+}
+
+/// T-S3: a body ending in `\n` -> ONE queue item without the trailing newline (the job's CR is the submit) and NO pair
+/// ticket (no follow-up Return is expected), so a later Return from the same caller is refused, 0 bytes.
+/// Pin: SelfSubmitting direct write. Mutant: keep the trailing newline / issue a ticket from the stripped text.
+#[test]
+fn d9_s3_self_submitting_body_becomes_one_item_without_a_ticket() {
+    let fx = fx("s3");
+    let m = master(&fx);
+    let _w = pane(&fx, "worker-1", P + 2);
+    let g0 = gen(&m);
+    let r = send(&fx, Some(P + 2), &m, "[보고] line\r\n", json!({}));
+    assert_converted(&r);
+    assert_eq!(r["result"]["return_absorb"], json!(false), "a self-submitting send gets no ticket: {r}");
+    assert_eq!(queue_texts(&m), vec!["[보고] line".to_string()]);
+    let k = ret(&fx, Some(P + 2), &m, json!({"pair_return": true}));
+    assert_denied(&k);
+    assert_eq!(gen(&m), g0, "0 bytes for both requests");
+}
+
+/// Head ruling condition 3: a body the CLI already fenced (`inject_text`) is queued fenced exactly ONCE - the queue job
+/// adds the one fence. Mutant: enqueue the received text as-is (double fence).
+#[test]
+fn d9_fenced_body_is_queued_without_its_outer_fence() {
+    let fx = fx("fence");
+    let m = master(&fx);
+    let _w = pane(&fx, "worker-1", P + 3);
+    let wrapped = cys::paste_fence::wrap("[CYCLE] save now\n");
+    let r = send(&fx, Some(P + 3), &m, &wrapped, json!({"authoritative": true}));
+    assert_converted(&r);
+    let q = queue_texts(&m);
+    assert_eq!(q, vec!["[CYCLE] save now".to_string()]);
+    assert!(!q[0].contains(cys::paste_fence::OPEN) && !q[0].contains(cys::paste_fence::CLOSE), "{q:?}");
+    assert_eq!(r["result"]["return_absorb"], json!(true), "the fence's inner newline is not a self-submit: {r}");
+}
+
+/// r2 §10-4: control-only text into master is refused at receipt, 0 bytes, nothing queued (an empty item would be a
+/// bare CR). Pin: written raw (the CR submits whatever the composer holds). Mutant: convert it.
+#[test]
+fn d9_control_only_text_into_master_is_refused() {
+    let fx = fx("ctl");
+    let m = master(&fx);
+    let _w = pane(&fx, "worker-1", P + 4);
+    let g0 = gen(&m);
+    for t in ["\r", "", "\x1b[A", "\u{3}", "\x1b]0;t\x07\r\n"] {
+        let r = send(&fx, Some(P + 4), &m, t, json!({}));
+        assert_denied(&r);
+    }
+    let r = send(&fx, Some(P + 4), &m, "\r", json!({"queued": true}));
+    assert_denied(&r);
+    assert_eq!(gen(&m), g0);
+    assert!(queue_texts(&m).is_empty());
+}
+
+// ─────────────────────────── the Return arm (T-A2..A6) ───────────────────────────
+
+/// T-A2: a converted send's own Return is absorbed (body still queued); a second Return, another caller's Return and a
+/// queued Return without a ticket are refused at receipt - 0 bytes, no empty `send-key` item is queued.
+/// Pin: the queued Return enqueues an empty item; untokened Returns are written. Mutant: drop the ticket at conversion.
+#[test]
+fn d9_a2_own_return_absorbed_every_other_return_refused() {
+    let fx = fx("a2");
+    let m = master(&fx);
+    let _a = pane(&fx, "worker-1", P + 10);
+    let _b = pane(&fx, "worker-2", P + 11);
+    let g0 = gen(&m);
+    assert_converted(&send(&fx, Some(P + 10), &m, "[보고] A", json!({})));
+    assert_absorbed(&ret(&fx, Some(P + 10), &m, json!({"pair_return": true})));
+    assert_denied(&ret(&fx, Some(P + 10), &m, json!({"pair_return": true})));
+    assert_denied(&ret(&fx, Some(P + 11), &m, json!({})));
+    assert_denied(&ret(&fx, Some(P + 11), &m, json!({"queued": true})));
+    assert_eq!(queue_texts(&m), vec!["[보고] A".to_string()], "no empty send-key item");
+    assert_eq!(gen(&m), g0);
+}
+
+/// T-A3: the `push_line` shape - send and Return from two different children of ONE process - is absorbed through
+/// `PairKey::Process` (the parent incarnation); a process with another parent gets refused. Mutant: key by `Claimed`.
+#[test]
+fn d9_a3_two_children_of_one_parent_share_the_process_key() {
+    let fx = fx("a3");
+    let m = master(&fx);
+    let (k1, k2) = (kid(), kid());
+    let other = grandkid();
+    let g0 = gen(&m);
+    let s = send(&fx, Some(k1.0.id()), &m, "[escalate] once", json!({"from": "surface:7"}));
+    assert_converted(&s);
+    assert_eq!(s["result"]["return_absorb"], json!(true), "a kernel-peer parent incarnation earns a ticket: {s}");
+    assert_denied(&ret(&fx, Some(other.1), &m, json!({"from": "surface:7"})));
+    assert_absorbed(&ret(&fx, Some(k2.0.id()), &m, json!({"from": "surface:7", "pair_return": true})));
+    assert_eq!(gen(&m), g0);
+}
+
+/// T-A4: a live ticket aged 3 s and a live approval on master -> still absorbed, 0 bytes (no approval narrowing in scope;
+/// a modal is answered only by a frame-bound key). Pin: `narrow_absorb_for_approval` writes it. Mutant: apply the narrowing.
+#[test]
+fn d9_a4_aged_ticket_with_live_approval_is_absorbed() {
+    let fx = fx("a4");
+    let m = master(&fx);
+    let a = pane(&fx, "worker-1", P + 20);
+    assert_converted(&send(&fx, Some(P + 20), &m, "[보고] A4", json!({})));
+    {
+        let mut t = m.return_tickets.lock().unwrap();
+        let tk = t.get_mut(&crate::state::PairKey::Verified(a.id)).expect("ticket");
+        tk.issued = std::time::Instant::now() - std::time::Duration::from_secs(3);
+    }
+    push_daemon_approval(&fx, m.id);
+    let g0 = gen(&m);
+    assert_absorbed(&ret(&fx, Some(P + 20), &m, json!({"pair_return": true})));
+    assert_eq!(gen(&m), g0);
+}
+
+/// T-A5: a partial machine body on master (pending > 0, human 0) and the caller's ticketed Return -> 0 bytes; a bare CR
+/// never submits a held partial body (R-3 governs its release). Pin: `PassThrough` writes the Return.
+/// Mutant: apply `PassThrough` in scope. (The ticket comes from the `--queued` + `absorb_return` form, which exists at the pin.)
+#[test]
+fn d9_a5_partial_machine_body_is_not_submitted_by_a_bare_return() {
+    let fx = fx("a5");
+    let m = master(&fx);
+    let _a = pane(&fx, "worker-1", P + 30);
+    let q = send(&fx, Some(P + 30), &m, "[보고] A5", json!({"queued": true, "absorb_return": true}));
+    assert_eq!(q["result"]["return_absorb"], json!(true), "{q}");
+    m.set_pending_input(12);
+    let g0 = gen(&m);
+    assert_absorbed(&ret(&fx, Some(P + 30), &m, json!({"pair_return": true})));
+    assert_eq!(gen(&m), g0);
+}
+
+/// T-A6: a caller known only by `from:"cli:send"` (no pane, no observable parent) gets no ticket; its body is still
+/// converted once and its Return is refused. Pin: `request_pair_key` reads `params.from`. Mutant: read `params.from` in scope.
+#[test]
+fn d9_a6_label_only_caller_gets_no_ticket() {
+    let fx = fx("a6");
+    let m = master(&fx);
+    let g0 = gen(&m);
+    let s = send(&fx, Some(P + 40), &m, "[보고] A6", json!({"from": "cli:send"}));
+    assert_converted(&s);
+    assert_eq!(s["result"]["return_absorb"], json!(false), "{s}");
+    assert_denied(&ret(&fx, Some(P + 40), &m, json!({"from": "cli:send", "pair_return": true})));
+    let s2 = send(&fx, Some(P + 41), &m, "[보고] A6b", json!({"from": "surface:9"}));
+    assert_eq!(s2["result"]["return_absorb"], json!(false), "a self-declared seat number earns no ticket: {s2}");
+    assert_denied(&ret(&fx, Some(P + 42), &m, json!({"from": "surface:9", "pair_return": true})));
+    assert_eq!(queue_texts(&m).len(), 2);
+    assert_eq!(gen(&m), g0);
+}
+
+fn push_daemon_approval(fx: &Fx, sid: u64) {
+    fx.daemon.feed_items.lock().unwrap().push(crate::state::FeedItem {
+        request_id: format!("{}d9-approval", crate::state::DAEMON_REQ_PREFIX),
+        kind: "approval".into(),
+        title: "Allow execution".into(),
+        body: "Allow execution of `cargo test`?".into(),
+        surface_id: Some(sid),
+        status: "pending".into(),
+        decision: None,
+        created_at: crate::state::now_epoch(),
+        resolved_at: None,
+        tier: None,
+        publisher_pid: None,
+        publisher_pgid: None,
+        publisher_surface: None,
+        risk_class: None,
+        auto_route: false,
+        resolver_surface: None,
+        resolver_pid: None,
+    });
+}
+
+// ─────────────────────────── the CEO locked test (T-CEO, design r3 §8) ───────────────────────────
+// Failure direction declared first (CEO 2230 §3): YES => REVISE if any cell types a body after a Return its supplier did
+// not send. PASS only if every such cell writes 0 bytes AND the control P-0 submits its body exactly once (one queue job).
+
+/// P-0 control: A's two-step into master -> one queue job carrying the body, the Return absorbed, nothing held.
+#[test]
+fn d9_ceo_p0_control_two_step_is_one_job() {
+    let fx = fx("ceo-p0");
+    let m = master(&fx);
+    let _a = pane(&fx, "worker-1", P + 50);
+    let g0 = gen(&m);
+    assert_converted(&send(&fx, Some(P + 50), &m, "[보고] P-0", json!({})));
+    assert_absorbed(&ret(&fx, Some(P + 50), &m, json!({"pair_return": true})));
+    assert_eq!(queue_texts(&m), vec!["[보고] P-0".to_string()], "the body exists once, in the job that types it");
+    assert_eq!(held(&m), 0);
+    assert_eq!(gen(&m), g0);
+}
+
+/// S-OP-1 token: A supplies a body; ANOTHER caller sends Return carrying A's request token. Pin: YES (bound:"token",
+/// measured r2 F18). r3: nothing is held, the other caller has no ticket -> refused, 0 bytes. Mutant: hold for master.
+#[test]
+fn d9_ceo_sop1_token_from_another_caller_types_nothing() {
+    let fx = fx("ceo-1");
+    let m = master(&fx);
+    let _a = pane(&fx, "worker-1", P + 60);
+    let _c = pane(&fx, "worker-2", P + 61);
+    let s = send(&fx, Some(P + 60), &m, "[보고] S-OP-1", json!({}));
+    let token = s["result"]["request_id"].as_str().unwrap_or("no-token-issued").to_string();
+    let g0 = gen(&m);
+    let k = ret(&fx, Some(P + 61), &m, json!({"request_id": token}));
+    assert_denied(&k);
+    assert_eq!(gen(&m), g0, "YES = a body typed by a Return its supplier did not send");
+    assert_eq!(held(&m), 0);
+}
+
+/// S-OP-2 claimed: C1 (no pane, claims seat 7) supplies a body; C3 (another process, also claims 7) sends Return.
+/// Pin: YES (bound:"legacy", measured). r3: nothing held, claimed callers get no ticket -> refused. Mutant: key by `Claimed`.
+#[test]
+fn d9_ceo_sop2_claimed_return_from_another_process_types_nothing() {
+    let fx = fx("ceo-2");
+    let m = master(&fx);
+    let _ = send(&fx, Some(P + 70), &m, "[보고] S-OP-2", json!({"from": "surface:7"}));
+    let g0 = gen(&m);
+    let k = ret(&fx, Some(P + 71), &m, json!({"from": "surface:7", "pair_return": true}));
+    assert_denied(&k);
+    assert_eq!(gen(&m), g0);
+    assert_eq!(held(&m), 0);
+}
+
+/// S-OP-3 modal: A supplies a body while a permission modal is up, then A's Return. Pin: association binds the held body
+/// first and types it into the modal (predicted YES). r3: nothing to bind; A's Return is absorbed by its own ticket, the
+/// modal is untouched (answering it is the frame-bound key, stage E). Mutant: associate before the scope arm.
+#[test]
+fn d9_ceo_sop3_return_on_a_modal_binds_nothing() {
+    let fx = fx("ceo-3");
+    let m = master(&fx);
+    let _a = pane(&fx, "worker-1", P + 80);
+    let modal = cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT.replace('\n', "\r\n");
+    {
+        let mut p = m.parser.lock().unwrap();
+        p.process(b"\x1b[2J\x1b[H");
+        p.process(modal.as_bytes());
+    }
+    let _ = send(&fx, Some(P + 80), &m, "[보고] S-OP-3", json!({}));
+    let g0 = gen(&m);
+    let k = ret(&fx, Some(P + 80), &m, json!({"pair_return": true}));
+    assert_eq!(gen(&m), g0, "no body typed into the modal: {k}");
+    assert_eq!(held(&m), 0);
+}
+
+/// S-OP-9 same seat: A's earlier body, then A's next send while master is in its typing guard, then A's Return.
+/// Pin: the first body is held, the second refused by the guard, and the Return binds the EARLIER body (predicted YES).
+/// r3: both sends are queue jobs; the Return is absorbed; nothing is typed by the Return. Mutant: re-enable holding.
+#[test]
+fn d9_ceo_sop9_same_seat_return_binds_no_earlier_body() {
+    let fx = fx("ceo-9");
+    let m = master(&fx);
+    let _a = pane(&fx, "worker-1", P + 90);
+    let _ = send(&fx, Some(P + 90), &m, "[보고] first", json!({}));
+    *m.last_human_input.lock().unwrap() = Some(std::time::Instant::now());
+    let _ = send(&fx, Some(P + 90), &m, "[보고] second", json!({}));
+    *m.last_human_input.lock().unwrap() = None;
+    let g0 = gen(&m);
+    let _ = ret(&fx, Some(P + 90), &m, json!({"pair_return": true}));
+    assert_eq!(gen(&m), g0, "the Return typed nothing");
+    assert_eq!(held(&m), 0);
+}
+
+// ─────────────────────────── creator boot-gate carve-out (head 646b2a36, CEO 52facf64) ───────────────────────────
+
+fn paint_trust(m: &Arc<Surface>) {
+    let screen = cys::first_run_gates::fixtures::FOLDER_TRUST.replace('\n', "\r\n");
+    let mut p = m.parser.lock().unwrap();
+    p.process(b"\x1b[2J\x1b[H");
+    p.process(screen.as_bytes());
+}
+
+fn set_status_from_the_seat(fx: &Fx, m: &Arc<Surface>, pid: u32) {
+    bind(fx, pid, m.id);
+    let r = rpc(fx, Some(pid), "status.set", json!({"surface_id": m.id, "state": "waiting"}));
+    assert_eq!(r["ok"], json!(true), "{r}");
+}
+
+/// (a) the CREATOR (same pid and start time, not a pane) answering the folder-trust gate of the master it just launched,
+/// no turn has reached the agent yet -> ACCEPTED through the pin path (written). A literal r3 arm refuses it: the boot
+/// chain of a new department master would stall at the prompt. Mutant: drop `d9_boot_creator` (refuse everyone).
+#[test]
+fn d9_creator_a_trust_confirm_of_a_new_master_is_accepted() {
+    let fx = fx("cr-a");
+    let m = master(&fx);
+    let me = kid();
+    let pid = me.0.id();
+    record_creator(&fx, m.id, pid, crate::state::peer_start_time(pid), 1.0);
+    paint_trust(&m);
+    let g0 = gen(&m);
+    let r = ret(&fx, Some(pid), &m, json!({"authoritative": true}));
+    assert_eq!(r["ok"], json!(true), "the launching operation answers its own boot gate: {r}");
+    assert_eq!(r["result"]["sent"], json!(true), "{r}");
+    assert!(gen(&m) > g0, "the confirm was written");
+}
+
+/// (a, directive half) + head condition 3: the creator's own directive is still converted (one job, fenced once) and
+/// its own Return is absorbed by its ticket - the carve-out never writes a bare CR after a converted body.
+#[test]
+fn d9_creator_a_directive_is_converted_and_its_return_absorbed() {
+    let fx = fx("cr-a2");
+    let m = master(&fx);
+    let me = kid();
+    let pid = me.0.id();
+    record_creator(&fx, m.id, pid, crate::state::peer_start_time(pid), 1.0);
+    let g0 = gen(&m);
+    let s = send(&fx, Some(pid), &m, &cys::paste_fence::wrap("[directive] read me"), json!({"authoritative": true}));
+    assert_converted(&s);
+    assert_eq!(queue_texts(&m), vec!["[directive] read me".to_string()]);
+    assert_absorbed(&ret(&fx, Some(pid), &m, json!({"authoritative": true})));
+    assert_eq!(gen(&m), g0);
+}
+
+/// (b) a different process of the same uid sending the same Return -> REFUSED, 0 bytes.
+#[test]
+fn d9_creator_b_another_process_is_refused() {
+    let fx = fx("cr-b");
+    let m = master(&fx);
+    let (me, other) = (kid(), kid());
+    record_creator(&fx, m.id, me.0.id(), crate::state::peer_start_time(me.0.id()), 1.0);
+    paint_trust(&m);
+    let g0 = gen(&m);
+    assert_denied(&ret(&fx, Some(other.0.id()), &m, json!({"authoritative": true})));
+    assert_eq!(gen(&m), g0);
+}
+
+/// (c, as amended by CEO 52facf64) the bound is the seat STATE, not an age: an old ledger entry with no turn yet is still
+/// the creator (accepted), and the creator once a turn has reached the agent is refused even 1 s after creation.
+/// Mutant: key the carve-out on the 30-minute age (the old entry refuses / the fresh one accepts).
+#[test]
+fn d9_creator_c_state_not_age_decides() {
+    let fx = fx("cr-c");
+    let m = master(&fx);
+    let me = kid();
+    let pid = me.0.id();
+    record_creator(&fx, m.id, pid, crate::state::peer_start_time(pid), 31.0 * 60.0);
+    paint_trust(&m);
+    assert_eq!(ret(&fx, Some(pid), &m, json!({"authoritative": true}))["ok"], json!(true), "no turn yet: still new");
+    let m2 = {
+        let s = seat(&fx, "ceo");
+        fx.daemon.roles.lock().unwrap().insert("ceo".into(), s.id);
+        *s.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+        s
+    };
+    record_creator(&fx, m2.id, pid, crate::state::peer_start_time(pid), 1.0);
+    set_status_from_the_seat(&fx, &m2, P + 100);
+    let g0 = gen(&m2);
+    assert_denied(&ret(&fx, Some(pid), &m2, json!({"authoritative": true})));
+    assert_eq!(gen(&m2), g0);
+}
+
+/// (d) a recycled pid: the recorded creator pid with a DIFFERENT start time -> REFUSED.
+#[test]
+fn d9_creator_d_recycled_pid_is_refused() {
+    let fx = fx("cr-d");
+    let m = master(&fx);
+    let me = kid();
+    let pid = me.0.id();
+    let start = crate::state::peer_start_time(pid).expect("observable start time");
+    record_creator(&fx, m.id, pid, Some(start + 1), 1.0);
+    paint_trust(&m);
+    let g0 = gen(&m);
+    assert_denied(&ret(&fx, Some(pid), &m, json!({"authoritative": true})));
+    assert_eq!(gen(&m), g0);
+}
+
+/// (e) the creator calling from inside a pane -> REFUSED (a pane caller is never the creator grade).
+#[test]
+fn d9_creator_e_creator_inside_a_pane_is_refused() {
+    let fx = fx("cr-e");
+    let m = master(&fx);
+    let me = kid();
+    let pid = me.0.id();
+    record_creator(&fx, m.id, pid, crate::state::peer_start_time(pid), 1.0);
+    let w = seat(&fx, "worker-1");
+    bind(&fx, pid, w.id);
+    paint_trust(&m);
+    let g0 = gen(&m);
+    assert_denied(&ret(&fx, Some(pid), &m, json!({"authoritative": true})));
+    assert_eq!(gen(&m), g0);
+}
+
+/// (f) the cross-socket department launch shape: the launching CLI is not a pane in the department daemon and carries
+/// only a display label -> it is the creator case and passes.
+#[test]
+fn d9_creator_f_cross_socket_launch_is_the_creator_case() {
+    let fx = fx("cr-f");
+    let m = master(&fx);
+    let me = kid();
+    let pid = me.0.id();
+    record_creator(&fx, m.id, pid, crate::state::peer_start_time(pid), 1.0);
+    paint_trust(&m);
+    let r = ret(&fx, Some(pid), &m, json!({"authoritative": true, "from": "cli:launch"}));
+    assert_eq!(r["ok"], json!(true), "{r}");
+}
+
+/// (g, CEO 52facf64 §3) the CREATOR's Return into a seat that has ALREADY reached ready (its agent reported) and HOLDS
+/// TEXT in its composer -> REFUSED, 0 bytes: the residual of the carve-out is closed by the state.
+#[test]
+fn d9_creator_g_ready_seat_with_text_refuses_the_creator() {
+    let fx = fx("cr-g");
+    let m = master(&fx);
+    let me = kid();
+    let pid = me.0.id();
+    record_creator(&fx, m.id, pid, crate::state::peer_start_time(pid), 1.0);
+    set_status_from_the_seat(&fx, &m, P + 110);
+    let h = rpc(&fx, None, "surface.send_text", json!({"surface_id": m.id, "text": "owner words", "human": true, "quiet": true}));
+    assert_eq!(h["ok"], json!(true), "{h}");
+    *m.last_human_input.lock().unwrap() = None;
+    let g0 = gen(&m);
+    assert_denied(&ret(&fx, Some(pid), &m, json!({"authoritative": true})));
+    assert_eq!(gen(&m), g0);
+}
+
+/// (g, the discriminating cell) the same ready seat showing a DIALOG (a permission prompt the owner's session opened):
+/// the pin path would press its default option (SubmitKey stays outside the modal axis), so only the state closes it.
+/// Mutant: drop the `agent_status` test from `d9_boot_creator` -> the creator's Return is written onto the dialog.
+#[test]
+fn d9_creator_g_ready_seat_with_a_dialog_refuses_the_creator() {
+    let fx = fx("cr-g3");
+    let m = master(&fx);
+    let me = kid();
+    let pid = me.0.id();
+    record_creator(&fx, m.id, pid, crate::state::peer_start_time(pid), 1.0);
+    set_status_from_the_seat(&fx, &m, P + 120);
+    let modal = cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT.replace('\n', "\r\n");
+    {
+        let mut p = m.parser.lock().unwrap();
+        p.process(b"\x1b[2J\x1b[H");
+        p.process(modal.as_bytes());
+    }
+    let g0 = gen(&m);
+    assert_denied(&ret(&fx, Some(pid), &m, json!({"authoritative": true})));
+    assert_eq!(gen(&m), g0, "the dialog stays unpressed");
+}
+
+/// (g') the window between a usable composer and the first turn: the creator's untokened Return onto human-typed text
+/// is not refused by D9 (no turn yet) - it reaches the pin path, whose draft gate refuses a submit over human bytes.
+/// Measured here so the residual statement rests on a run, not on reading.
+#[test]
+fn d9_creator_g_prime_pin_draft_gate_covers_text_before_the_first_turn() {
+    let fx = fx("cr-g2");
+    let m = master(&fx);
+    let me = kid();
+    let pid = me.0.id();
+    record_creator(&fx, m.id, pid, crate::state::peer_start_time(pid), 1.0);
+    let h = rpc(&fx, None, "surface.send_text", json!({"surface_id": m.id, "text": "owner words", "human": true, "quiet": true}));
+    assert_eq!(h["ok"], json!(true), "{h}");
+    *m.last_human_input.lock().unwrap() = None;
+    let g0 = gen(&m);
+    let r = ret(&fx, Some(pid), &m, json!({"authoritative": true}));
+    assert_eq!(r["ok"], json!(false), "the pin draft gate must refuse a submit over human text: {r}");
+    assert_ne!(r["error"]["code"], json!("composer_key_denied"), "this refusal is the pin's, not D9's: {r}");
+    assert_eq!(gen(&m), g0);
+}

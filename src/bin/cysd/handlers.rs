@@ -1786,14 +1786,25 @@ fn creator_matches(
     now: f64,
     start_time_lookup: impl Fn(u32) -> Option<u64>,
 ) -> bool {
-    let Some((pid, recorded_start, ts)) = entry else {
+    if entry.is_some_and(|(_, _, ts)| now - ts >= crate::state::CREATE_CALLER_TTL_SECS) {
+        return false; // 창 만료 — 창작자 등급은 영구 권한으로 자라지 않는다
+    }
+    creator_incarnation_matches(entry, caller_pid, start_time_lookup)
+}
+
+/// The identity half of [`creator_matches`] without its age (pure): the recorded creator is this pid AND this process
+/// incarnation (`Some(a) == Some(b)` start times). Absence, a pid mismatch, a missing or different start time = `false`.
+/// ★(0.14.56 · P1 D9) Used alone by [`d9_boot_creator`], whose bound is a seat STATE, not a clock (CEO 52facf64).
+fn creator_incarnation_matches(
+    entry: Option<crate::state::CreateCallerEntry>,
+    caller_pid: u32,
+    start_time_lookup: impl Fn(u32) -> Option<u64>,
+) -> bool {
+    let Some((pid, recorded_start, _)) = entry else {
         return false; // 원장 부재 = 창작 사실 없음
     };
     if pid != caller_pid {
         return false; // 남이 만든 좌석
-    }
-    if now - ts >= crate::state::CREATE_CALLER_TTL_SECS {
-        return false; // 창 만료 — 창작자 등급은 영구 권한으로 자라지 않는다
     }
     // A5(pid 재사용)·A6(관측실패) fail-closed: 기록값과 현재값이 Some==Some 로 일치할 때만.
     match recorded_start {
@@ -1818,15 +1829,47 @@ fn caller_is_creator(
     caller_pid: Option<u32>,
     target_sid: u64,
 ) -> bool {
+    caller_creator_entry(daemon, from_sid, caller_pid, target_sid)
+        .is_some_and(|(pid, e)| creator_matches(Some(e), pid, crate::state::now_epoch(), crate::state::peer_start_time))
+}
+
+/// The cheap refutations shared by [`caller_is_creator`] and [`d9_boot_creator`]: a pane caller, an unresolved pid, or
+/// a ledger entry of another pid ends here without a `peer_start_time` lookup. `Some((pid, entry))` = only the pid matched.
+fn caller_creator_entry(
+    daemon: &Daemon,
+    from_sid: Option<u64>,
+    caller_pid: Option<u32>,
+    target_sid: u64,
+) -> Option<(u32, crate::state::CreateCallerEntry)> {
     if from_sid.is_some() {
+        return None;
+    }
+    let pid = caller_pid?;
+    let entry = daemon.create_caller.lock().unwrap().get(&target_sid).copied();
+    entry.filter(|(p, _, _)| *p == pid).map(|e| (pid, e)) // 원장 부재·타인 창작 — sysinfo 조회 없이 종결
+}
+
+/// ★(0.14.56 · P1 D9 · head ruling 646b2a36 on Q-D9-boot-callers, amended by CEO 52facf64) May this caller's untokened
+/// Return reach the pin paths on a master/CEO seat in `d9_scope`? Only the LAUNCHING operation, only while the seat is new:
+///   · identity - the recorded creator of this seat, same pid AND same process start time, caller not a pane
+///     ([`creator_incarnation_matches`]; the pin's `caller_is_creator` at handlers.rs:1815 without its 30-minute age);
+///   · state - no turn has reached this incarnation's agent: `agent_status` is still `None`. Its one production writer is
+///     the `status.set` handler, reached by the hook ack when the injected directive carrying the boot nonce is submitted
+///     (cys.rs `hook_ack_boot_nonce`) or by the agent's own first `cys set-status`; it is never hydrated at create/restore.
+/// A just-created composer holds nothing the operation did not supply (CEO: newness, not identity, makes it safe), and
+/// the state ends that newness without a clock. The creator ledger's own retention (CREATE_CALLER_TTL_SECS) can only
+/// remove the entry - a refusal - never extend it.
+fn d9_boot_creator(
+    daemon: &Daemon,
+    surface: &crate::state::Surface,
+    verified_from: Option<u64>,
+    caller_pid: Option<u32>,
+) -> bool {
+    if surface.agent_status.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
         return false;
     }
-    let Some(pid) = caller_pid else { return false };
-    let entry = daemon.create_caller.lock().unwrap().get(&target_sid).copied();
-    if !entry.is_some_and(|(p, _, _)| p == pid) {
-        return false; // 원장 부재·타인 창작 — sysinfo 조회 없이 종결
-    }
-    creator_matches(entry, pid, crate::state::now_epoch(), crate::state::peer_start_time)
+    caller_creator_entry(daemon, verified_from, caller_pid, surface.id)
+        .is_some_and(|(pid, e)| creator_incarnation_matches(Some(e), pid, crate::state::peer_start_time))
 }
 
 /// ACL 규칙 배열의 순수 평가부 — 첫 매칭 승리, 매칭 없음 = `None`(호출부가 default 적용).
@@ -2905,7 +2948,7 @@ fn return_absorbed_response(
         Some(surface.id),
         json!({
             "surface_ref": cys::surface_ref(surface.id),
-            "from": cys::surface_ref(caller.sid()),
+            "from": caller.sid().map(cys::surface_ref),
             // ★(B) 키 등급 — false = 교차 소켓 등 검증 신원 없는 자기신고(Claimed). 추가형 키.
             "from_verified": caller.is_verified(),
             "absorb_kind": kind,
@@ -3157,10 +3200,85 @@ fn submit_caller_key(
             return Some(CallerKey::Claimed(n));
         }
     }
+    let (parent_pid, parent_birth_us) = caller_parent_incarnation(caller_pid)?;
+    Some(CallerKey::Process { parent_pid, parent_birth_us })
+}
+
+/// The kernel peer's parent process and its native birth in microseconds (a reused pid is another caller) - the
+/// `Process` grade shared by [`submit_caller_key`] and [`d9_pair_key`]. `None` = the peer or its parent is not observable.
+fn caller_parent_incarnation(caller_pid: Option<u32>) -> Option<(u32, u64)> {
     let me = cys::process_observation::observe(caller_pid?).ok()?;
     let parent = cys::process_observation::observe(me.identity.parent).ok()?;
     let birth_us = parent.identity.birth_seconds.saturating_mul(1_000_000) + parent.identity.birth_microseconds;
-    Some(CallerKey::Process { parent_pid: parent.identity.pid, parent_birth_us: birth_us })
+    Some((parent.identity.pid, birth_us))
+}
+
+/// ★(0.14.56 · P1 D9 · design r3 §5-3) The Return-absorb ticket key on a master/CEO target in `d9_scope`: the verified
+/// pane, else the kernel peer's parent incarnation (`PairKey::Process`), else none. It never reads `params["from"]`
+/// (CEO 2245 §4 floor): a caller known only by a self-declared number gets no ticket, so its follow-up Return is refused.
+fn d9_pair_key(verified_from: Option<u64>, caller_pid: Option<u32>) -> Option<crate::state::PairKey> {
+    match verified_from {
+        Some(v) => Some(crate::state::PairKey::Verified(v)),
+        None => caller_parent_incarnation(caller_pid)
+            .map(|(parent_pid, parent_birth_us)| crate::state::PairKey::Process { parent_pid, parent_birth_us }),
+    }
+}
+
+/// ★(P1 D9 · r2 §10-4) Refusal text for a key or control-only text into a master/CEO composer: it names the form that works.
+const D9_TEXT_DENIED: &str = "a master/CEO composer accepts no control-only text from a non-owner caller (nothing was typed); \
+     send the TEXT: cys send --queued \"<text>\"";
+
+/// ★(P1 D9 · r3 §5-4) Refusal text for an untokened Return into a master/CEO composer.
+const D9_RETURN_DENIED: &str = "a Return into a master/CEO composer submits only a body its own sender queued, and this caller \
+     holds no live pair ticket (nothing was typed); send the TEXT: cys send --queued \"<text>\" - the job submits it";
+
+/// One outer bracketed-paste fence (`cys::paste_fence::wrap`) removed, else the text unchanged (pure). The queue job fences
+/// the body itself, so a CLI-fenced body converted as-is would arrive fenced twice.
+fn d9_unfence(text: &str) -> &str {
+    text.strip_prefix(cys::paste_fence::OPEN)
+        .and_then(|t| t.strip_suffix(cys::paste_fence::CLOSE))
+        .unwrap_or(text)
+}
+
+/// Does the body consist only of control characters and escape sequences (CSI, OSC, two-byte ESC, 8-bit CSI)? An empty
+/// body counts. Pure; such a body converted into a queue item would be a bare CR into a master/CEO composer.
+fn d9_controls_only(body: &str) -> bool {
+    let mut it = body.chars();
+    while let Some(c) = it.next() {
+        match c {
+            '\x1b' => match it.next() {
+                Some('[') => {
+                    for n in it.by_ref() {
+                        if ('\x40'..='\x7e').contains(&n) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    while let Some(n) = it.next() {
+                        if n == '\x07' {
+                            break;
+                        }
+                        if n == '\x1b' {
+                            it.next();
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            '\u{9b}' => {
+                for n in it.by_ref() {
+                    if ('\x40'..='\x7e').contains(&n) {
+                        break;
+                    }
+                }
+            }
+            c if c.is_control() => {}
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// One ACL check and dispatch-time PID sample, compatibility grade; not bound to the accepted transport.
@@ -6733,12 +6851,32 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
             //   살균 본문**을 쓰도록 여기서 한 번 살균한다(writer 백스톱과 같은 값 · 표지 없는 `/clear` 는 바이트
             //   동일 · 무clear 무변경). 직접 비-clear 경로는 원문 그대로다(울타리 판정은 아래 D5′).
             let text = if clear_first { cys::paste_fence::sanitize_owned(text) } else { text };
+            // ★(0.14.56 · P1 D9 · design r3 §5-1) Master/CEO composers: a non-owner, non-human, non-clear send is ONE queue item
+            //   (body + the job's own CR), taken here - before the typing guard, the draft gate, the settle hold, the send audit
+            //   and the direct intents, none of which a converted send reaches. Control-only text is refused at receipt (r2 §10-4).
+            let queued_param = params.get("queued").and_then(|v| v.as_bool()).unwrap_or(false);
+            let d9 = !human
+                && !clear_first
+                && governance::d9_scope(daemon, &surface, caller_is_owner(daemon, &params, verified_from));
+            let (text, converted, had_trailing_crlf) = if d9 {
+                // A trailing CR/LF OUTSIDE any fence is the caller's own submit (no pair Return follows - minor m1, captured
+                // before stripping). The job's CR is the submit, so the run is stripped; a body the CLI already fenced
+                // (`inject_text`, cys.rs:4597) loses its one outer fence, because the queue job fences it itself.
+                let had_trailing_crlf = text.ends_with(['\r', '\n']);
+                let body = d9_unfence(text.trim_end_matches(['\r', '\n'])).trim_end_matches(['\r', '\n']);
+                if d9_controls_only(body) {
+                    return Reply::Single(err_response(&id, "composer_key_denied", D9_TEXT_DENIED));
+                }
+                if queued_param {
+                    (text, false, false)
+                } else {
+                    (body.to_string(), true, had_trailing_crlf)
+                }
+            } else {
+                (text, false, false)
+            };
             // followup 모드: 대상이 조용해질 때 배달자(watchdog 틱)가 순서대로 주입
-            if params
-                .get("queued")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-            {
+            if queued_param || converted {
                 // ★G1(W2-A): from = 검증된 발신 surface_ref 우선, 부재 시 클라이언트 from 문자열
                 // (관측·폐기 통지용 — 신원 판정은 여전히 커널 peer 기반 verified_from이 한다).
                 let entry_from = verified_from.map(cys::surface_ref).or_else(|| {
@@ -6793,10 +6931,21 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
                     .get("absorb_return")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                if absorb_return {
+                if converted {
+                    result["sent"] = json!(true);
+                    result["converted"] = json!("one_job");
+                }
+                // ★(P1 D9 · r3 §5-3, minor m1) a converted send gets the pair ticket too; in scope the key is `d9_pair_key`.
+                if absorb_return || converted {
                     let ttl = return_absorb_ttl_secs();
-                    let issued = match request_pair_key(daemon, verified_from, &params) {
-                        Some(x) if ttl > 0 && !text.ends_with(['\r', '\n']) => {
+                    let self_submits = if converted { had_trailing_crlf } else { text.ends_with(['\r', '\n']) };
+                    let key = if d9 {
+                        d9_pair_key(verified_from, caller_pid)
+                    } else {
+                        request_pair_key(daemon, verified_from, &params)
+                    };
+                    let issued = match key {
+                        Some(x) if ttl > 0 && !self_submits => {
                             surface.issue_return_ticket(
                                 x,
                                 crate::state::ReturnTicketKind::Pair { entry_id: entry.id.clone() },
@@ -7314,6 +7463,30 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
                 Ok(v) => v,
                 Err(e) => return Reply::Single(err_response(&id, "acl_denied", &e)),
             };
+            // ★(0.14.56 · P1 D9 · design r3 §5-4) Master/CEO composers: a Return/Enter (queued or not) from a non-owner caller
+            //   runs this arm BEFORE association and the generic absorb. The sender's live pair ticket (`d9_pair_key`) absorbs it
+            //   unconditionally (0 bytes; no `pair_return` flag, no PassThrough, no approval narrowing - a two-step caller can
+            //   press no default option, early or late). Without one it is refused, 0 bytes - except for the launching
+            //   operation while the seat is new (`d9_boot_creator`: head ruling 646b2a36, option A, amended by CEO 52facf64 -
+            //   creator pid+start time, not a pane, and no turn has reached the agent yet), which answers its own boot gates
+            //   (folder-trust confirm, cys.rs:16343) through the pin paths below.
+            //   Frame-bound modal keys (`expect_output_gen`) arrive with D8; until then no parameter bypasses this arm.
+            if bytes.as_slice() == b"\r"
+                && governance::d9_scope(daemon, &surface, caller_is_owner(daemon, &params, verified_from))
+            {
+                let ttl = std::time::Duration::from_secs(return_absorb_ttl_secs());
+                let live = d9_pair_key(verified_from, caller_pid).and_then(|x| {
+                    surface.peek_return_ticket(x).filter(|t| t.issued.elapsed() < ttl).map(|t| (x, t.issued))
+                });
+                if let Some((x, at)) = live {
+                    if let Some(t) = surface.take_return_ticket(x, at) {
+                        return Reply::Single(return_absorbed_response(daemon, &surface, &id, &key, x, &t));
+                    }
+                }
+                if !d9_boot_creator(daemon, &surface, verified_from, caller_pid) {
+                    return Reply::Single(err_response(&id, "composer_key_denied", D9_RETURN_DENIED));
+                }
+            }
             // ★(0.14.52 · S-a C5b) A Return to an agent seat first binds its caller's held body (S4-3; token, else the
             //   same caller and agent epoch inside 60,000 ms of receipt) - before the Return-absorb check, which would
             //   read the held (untyped) body's empty line as nothing to submit. No associable body = the paths below.
@@ -7431,7 +7604,7 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
                                 Some(sid),
                                 json!({
                                     "surface_ref": cys::surface_ref(sid),
-                                    "from": cys::surface_ref(x.sid()),
+                                    "from": x.sid().map(cys::surface_ref),
                                     "from_verified": x.is_verified(),
                                     "ticket_age_ms": t.issued.elapsed().as_millis() as u64,
                                     "ttl_secs": absorb_ttl,
@@ -7450,7 +7623,7 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
                             Some(sid),
                             json!({
                                 "surface_ref": cys::surface_ref(sid),
-                                "from": cys::surface_ref(x.sid()),
+                                "from": x.sid().map(cys::surface_ref),
                                 "from_verified": x.is_verified(),
                                 "reason": AbsorbMiss::ApprovalLive.as_str(),
                                 "ticket_age_ms": at.elapsed().as_millis() as u64,
@@ -18060,7 +18233,7 @@ mod tests {
         assert_eq!(pair_key(None, claim(None)), None, "결측은 값이 아니다");
         assert_eq!(calls.get(), 2);
         assert_ne!(Verified(3), Claimed(3), "같은 번호라도 다른 키");
-        assert_eq!(Claimed(7).sid(), 7);
+        assert_eq!(Claimed(7).sid(), Some(7));
         assert!(!Claimed(7).is_verified() && Verified(7).is_verified());
     }
 

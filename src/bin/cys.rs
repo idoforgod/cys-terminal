@@ -3845,6 +3845,19 @@ fn plain_absorb_aux_line(ttl_secs: u64, reflex_ms: Option<u64>) -> String {
     }
 }
 
+/// ★(0.14.56 · P1 D9 · design r3 §5-5) `cys send`'s result lines (pure): (stderr aux line, stdout line). It prints from
+/// the REPLY, not the local flag: a direct send into a master/CEO composer comes back `queued:true, converted:"one_job"`
+/// (one job carries body and CR). An old daemon has no such keys and keeps printing `OK`. No approval narrowing applies
+/// to that ticket, so the aux line names only the TTL.
+fn send_result_lines(queued: bool, r: &Value, tag: &str) -> (Option<String>, String) {
+    if !(queued || r["queued"].as_bool() == Some(true)) {
+        return (None, format!("OK{tag}"));
+    }
+    let aux = (r["converted"].as_str() == Some("one_job") && r["return_absorb"].as_bool() == Some(true))
+        .then(|| plain_absorb_aux_line(r["return_absorb_secs"].as_u64().unwrap_or(0), None));
+    (aux, format!("QUEUED (depth {}){}{tag}", r["depth"], queue_durable_suffix(r)))
+}
+
 /// ★B3 `cys send` 본문의 큐 1회 전환 판정(순수) — send-key 와 같은 근거·같은 보수성.
 ///
 /// `clear_first` 를 제외하는 이유: 원자 clear+paste+submit 은 **직접 전달 전용**이고 데몬이
@@ -6164,11 +6177,11 @@ fn run(command: Command) -> i32 {
                         }
                         Err(e) => return Err(e),
                     };
-                    if queued {
-                        println!("QUEUED (depth {}){}{tag}", r["depth"], queue_durable_suffix(&r));
-                    } else {
-                        println!("OK{tag}");
+                    let (aux, line) = send_result_lines(queued, &r, &tag);
+                    if let Some(aux) = aux {
+                        eprintln!("{aux}");
                     }
+                    println!("{line}");
                 }
                 Ok(())
             })
@@ -52397,5 +52410,32 @@ mod p3r1_caller_tests {
             assert_eq!(std::fs::read_to_string(r.pack.join(rel)).unwrap(), prev_bytes);
             let _ = std::fs::remove_dir_all(&r._root);
         }
+    }
+}
+
+// ★(0.14.56 · P1 D9 · design r3 §12 T-S4) `cys send` prints from the reply.
+#[cfg(test)]
+mod d9_send_print_tests {
+    use super::*;
+
+    /// A converted direct send (new daemon) prints QUEUED and the TTL-only aux line; mutant: print from the local flag.
+    #[test]
+    fn converted_reply_prints_queued_with_the_ttl_aux_line() {
+        let r = json!({"surface_id": 3, "sent": true, "queued": true, "converted": "one_job", "depth": 1,
+                       "queue_entry_id": "q-1", "durable": true, "return_absorb": true, "return_absorb_secs": 30,
+                       "return_absorb_reflex_ms": 2000});
+        let (aux, line) = send_result_lines(false, &r, "");
+        assert!(line.starts_with("QUEUED (depth 1)"), "{line}");
+        let aux = aux.expect("aux line for a ticketed conversion");
+        assert_eq!(aux, plain_absorb_aux_line(30, None), "no approval-window promise in scope: {aux}");
+    }
+
+    /// An old daemon's direct reply (no `queued`) still prints OK; an explicit `--queued` reply prints QUEUED, no aux.
+    #[test]
+    fn old_reply_shape_prints_ok_and_explicit_queued_has_no_aux() {
+        let (aux, line) = send_result_lines(false, &json!({"surface_id": 3, "sent": true}), " → surface:3");
+        assert_eq!((aux, line.as_str()), (None, "OK → surface:3"));
+        let (aux, line) = send_result_lines(true, &json!({"surface_id": 3, "queued": true, "depth": 2}), "");
+        assert!(aux.is_none() && line.starts_with("QUEUED (depth 2)"), "{line}");
     }
 }

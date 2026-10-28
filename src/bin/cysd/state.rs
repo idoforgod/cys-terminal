@@ -1276,13 +1276,17 @@ pub enum PairKey {
     Verified(u64),
     /// 검증 신원이 없는 호출자의 자기신고 좌석 id(다른 데몬의 번호일 수 있다).
     Claimed(u64),
+    /// ★(0.14.56 · P1 D9) Master/CEO targets only (`handlers::d9_pair_key`): no verified pane, so the kernel
+    /// peer's parent process with its native birth (a reused pid is another caller). Never built from `from`.
+    Process { parent_pid: u32, parent_birth_us: u64 },
 }
 
 impl PairKey {
-    /// 좌석 번호(이벤트 `from` 표기용 — 등급은 [`PairKey::is_verified`] 로 따로 싣는다).
-    pub fn sid(self) -> u64 {
+    /// 좌석 번호(이벤트 `from` 표기용 — 등급은 [`PairKey::is_verified`] 로 따로 싣는다). `Process` has none.
+    pub fn sid(self) -> Option<u64> {
         match self {
-            PairKey::Verified(x) | PairKey::Claimed(x) => x,
+            PairKey::Verified(x) | PairKey::Claimed(x) => Some(x),
+            PairKey::Process { .. } => None,
         }
     }
 

@@ -7876,3 +7876,8 @@ mod etx_ctrlc_tests;
 mod receipt_framing_tests {
     include!("receipt_framing_tests.rs");
 }
+
+// ★(0.14.56 · P1 D9) master/CEO composer specimens (send conversion, pair key, Return arm, creator boot-gate carve-out) -
+// test-only module; it calls only entry points that exist at 9da2418d, so applied to the pin it is the RED run.
+#[cfg(test)]
+mod d9_tests;
