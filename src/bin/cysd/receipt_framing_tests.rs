@@ -23,16 +23,18 @@ async fn c8_received_framer_preserves_blank_invalid_and_partial_eof_release() {
     write.write_all(b"  \n{").await.unwrap(); write.shutdown().await.unwrap();
     let mut reader = BufReader::new(read);
     {
-        let (line, frame) = next_received_line_capped(&mut reader, MAX_REQUEST_LINE, &daemon.receipt_registry).await.unwrap().unwrap();
+        let (line, frame, end) = next_received_line_capped(&mut reader, MAX_REQUEST_LINE, &daemon.receipt_registry).await.unwrap().unwrap();
         assert_eq!(frame.at(), at);
-        assert!(matches!(parse_received_line(&daemon, line, frame), ParsedReceivedLine::Blank));
+        assert!(matches!(end, ReceivedLineEnd::Newline(_)));
+        assert!(matches!(parse_received_line(&daemon, line, frame, end), ParsedReceivedLine::Blank));
     }
     let later = at + Duration::from_secs(61);
     assert_eq!(daemon.receipt_registry.with_expiry_clock(later, |t| t), later);
     {
-        let (line, frame) = next_received_line_capped(&mut reader, MAX_REQUEST_LINE, &daemon.receipt_registry).await.unwrap().unwrap();
+        let (line, frame, end) = next_received_line_capped(&mut reader, MAX_REQUEST_LINE, &daemon.receipt_registry).await.unwrap().unwrap();
         assert_eq!(line, "{");
-        let ParsedReceivedLine::Invalid(error) = parse_received_line(&daemon, line, frame) else { panic!("expected parse error") };
+        assert!(matches!(end, ReceivedLineEnd::Eof), "the `{{` tail ended at EOF, not at a newline");
+        let ParsedReceivedLine::Invalid(error) = parse_received_line(&daemon, line, frame, end) else { panic!("expected parse error") };
         assert_eq!(error["error"]["code"], "parse_error");
     }
     assert_eq!(daemon.receipt_registry.with_expiry_clock(later, |t| t), later);
@@ -392,4 +394,81 @@ mod unix_dispatch {
     async fn c8_actual_send_key_return_replaced_after_receipt_cannot_inherit_target() {
         check_return_target_does_not_inherit_another_object(true).await;
     }
+}
+
+// ── 0.14.56-SOCKET-P8 #19: a request line that ends at EOF instead of `\n` is not dispatched ──
+// Detector: a `feed.push` notification creates exactly one feed item per dispatch.
+const S19_BODY: &str = "{\"id\":3,\"method\":\"feed.push\",\"params\":{\"kind\":\"notification\",\"title\":\"s19\",\"body\":\"eof\"}}";
+
+fn s19_conn(daemon: &Arc<Daemon>) -> (tokio::io::DuplexStream, tokio::task::JoinHandle<()>) {
+    let (client, server) = tokio::io::duplex(8192);
+    let task = tokio::spawn(handle_connection_capped(
+        Arc::clone(daemon), Box::new(server) as Stream, None,
+        Some(Duration::from_secs(60)), Some(Duration::from_secs(30)),
+    ));
+    (client, task)
+}
+
+async fn s19_read_reply(rd: tokio::io::ReadHalf<tokio::io::DuplexStream>) -> (usize, serde_json::Value) {
+    let mut r = BufReader::new(rd);
+    let mut line = String::new();
+    let n = tokio::time::timeout(Duration::from_secs(5), r.read_line(&mut line)).await
+        .expect("no reply and no EOF within 5 s").unwrap();
+    (n, serde_json::from_str(line.trim()).unwrap_or(serde_json::Value::Null))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s19_1_eof_terminated_request_after_half_close_is_answered_and_not_executed() {
+    let root = TempRoot::new(); let daemon = Daemon::new(root.0.join("cysd.sock"));
+    let before = daemon.feed_items.lock().unwrap().len();
+    let (client, task) = s19_conn(&daemon);
+    let (rd, mut wr) = tokio::io::split(client);
+    wr.write_all(S19_BODY.as_bytes()).await.unwrap();
+    wr.shutdown().await.unwrap();
+    let (n, reply) = s19_read_reply(rd).await;
+    assert!(tokio::time::timeout(Duration::from_secs(5), task).await.is_ok(), "connection did not end after EOF");
+    assert_eq!(daemon.feed_items.lock().unwrap().len(), before, "an EOF-terminated request was executed");
+    assert!(n > 0, "no reply: the client cannot tell 'not executed' from a lost reply");
+    assert_eq!(reply["error"]["code"], "parse_error", "reply: {reply}");
+    assert!(reply["error"]["message"].as_str().unwrap_or("").contains("not executed"), "reply: {reply}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s19_2_eof_terminated_request_after_drop_is_not_executed() {
+    let root = TempRoot::new(); let daemon = Daemon::new(root.0.join("cysd.sock"));
+    let before = daemon.feed_items.lock().unwrap().len();
+    let (client, task) = s19_conn(&daemon);
+    let (rd, mut wr) = tokio::io::split(client);
+    wr.write_all(S19_BODY.as_bytes()).await.unwrap();
+    drop(rd); drop(wr);
+    assert!(tokio::time::timeout(Duration::from_secs(5), task).await.is_ok(), "connection did not end after the drop");
+    assert_eq!(daemon.feed_items.lock().unwrap().len(), before, "an EOF-terminated request was executed after the client left");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s19_3_newline_terminated_request_is_executed() {
+    let root = TempRoot::new(); let daemon = Daemon::new(root.0.join("cysd.sock"));
+    let before = daemon.feed_items.lock().unwrap().len();
+    let (client, task) = s19_conn(&daemon);
+    let (rd, mut wr) = tokio::io::split(client);
+    wr.write_all(format!("{S19_BODY}\n").as_bytes()).await.unwrap();
+    let (n, reply) = s19_read_reply(rd).await;
+    drop(wr);
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    assert!(n > 0 && reply["ok"] == true, "reply: {reply}");
+    assert_eq!(daemon.feed_items.lock().unwrap().len(), before + 1, "a framed request was not executed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s19_4_whitespace_before_eof_gets_no_reply() {
+    let root = TempRoot::new(); let daemon = Daemon::new(root.0.join("cysd.sock"));
+    let before = daemon.feed_items.lock().unwrap().len();
+    let (client, task) = s19_conn(&daemon);
+    let (rd, mut wr) = tokio::io::split(client);
+    wr.write_all(b"   ").await.unwrap();
+    wr.shutdown().await.unwrap();
+    let (n, reply) = s19_read_reply(rd).await;
+    assert!(tokio::time::timeout(Duration::from_secs(5), task).await.is_ok(), "connection did not end after EOF");
+    assert_eq!(n, 0, "whitespace before EOF got a reply: {reply}");
+    assert_eq!(daemon.feed_items.lock().unwrap().len(), before);
 }

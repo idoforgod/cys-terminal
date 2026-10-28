@@ -2959,27 +2959,33 @@ fn peer_pid(pipe: &tokio::net::windows::named_pipe::NamedPipeServer) -> Option<u
 /// 개행 없는 무한 스트림이 데몬 메모리를 잠식하지 못하게 줄 길이 상한을 둔 line reader.
 /// Compatibility helper for direct reader tests. Network connections use the shared daemon
 /// registry below; this helper cannot claim an earlier network receipt for an already parsed RPC.
+/// It still returns an EOF-terminated tail as a line; the dispatch path refuses such a tail
+/// (`parse_received_line`).
 #[cfg_attr(not(test), allow(dead_code))]
 async fn next_line_capped<R: tokio::io::AsyncBufRead + Unpin>(
     r: &mut R,
     cap: usize,
 ) -> std::io::Result<Option<String>> {
     let registry = Arc::new(crate::rpc_receipt::ReceiptRegistry::default());
-    Ok(next_received_line_capped(r, cap, &registry).await?.map(|(line, frame)| {
+    Ok(next_received_line_capped(r, cap, &registry).await?.map(|(line, frame, _end)| {
         drop(frame);
         line
     }))
 }
 
+#[derive(Clone, Copy)]
 enum ReceivedLineEnd { Newline(usize), Eof }
 
 /// Recognition and expiry have one order. Never hold the registry mutex across fill_buf/IO.
 /// Copy/UTF-8 conversion happen with PendingFrame alive, after its bounded recognition lock.
+/// Returns how the line ended: a request is dispatched only after its terminating `\n` has been
+/// received (0.14.56 #19). The GUI's single BeforeSend retry relies on that: a failed write never
+/// delivered its last byte, the `\n`, so it was not executed.
 async fn next_received_line_capped<R: tokio::io::AsyncBufRead + Unpin>(
     r: &mut R,
     cap: usize,
     registry: &Arc<crate::rpc_receipt::ReceiptRegistry>,
-) -> std::io::Result<Option<(String, crate::rpc_receipt::PendingFrame)>> {
+) -> std::io::Result<Option<(String, crate::rpc_receipt::PendingFrame, ReceivedLineEnd)>> {
     let mut buf: Vec<u8> = Vec::new();
     loop {
         let available = r.fill_buf().await?;
@@ -2998,7 +3004,7 @@ async fn next_received_line_capped<R: tokio::io::AsyncBufRead + Unpin>(
                 }
                 ReceivedLineEnd::Eof => (),
             }
-            return Ok(Some((String::from_utf8_lossy(&buf).into_owned(), frame)));
+            return Ok(Some((String::from_utf8_lossy(&buf).into_owned(), frame, end)));
         }
         if available.is_empty() { return Ok(None); }
         let n = available.len();
@@ -3016,12 +3022,20 @@ enum ParsedReceivedLine {
     Invalid(serde_json::Value),
     Request(Request, handlers::ReceivedRpc),
 }
+/// Reply text for a non-blank line that ended at EOF instead of `\n` (0.14.56 #19).
+const UNTERMINATED_AT_EOF: &str = "request line not terminated by a newline before EOF; not executed";
+
 /// No await: the non-Send global guard is always dropped/narrowed inside this function.
 fn parse_received_line(
-    daemon: &Arc<Daemon>, line: String, frame: crate::rpc_receipt::PendingFrame,
+    daemon: &Arc<Daemon>, line: String, frame: crate::rpc_receipt::PendingFrame, end: ReceivedLineEnd,
 ) -> ParsedReceivedLine {
     let line = line.trim().to_string();
     if line.is_empty() { drop(frame); return ParsedReceivedLine::Blank; }
+    // An EOF tail is never parsed, so a valid request in it never becomes a ReceivedRpc.
+    if matches!(end, ReceivedLineEnd::Eof) {
+        drop(frame);
+        return ParsedReceivedLine::Invalid(cys::err_response(&serde_json::Value::Null, "parse_error", UNTERMINATED_AT_EOF));
+    }
     match serde_json::from_str::<Request>(&line) {
         Ok(req) => {
             let received = handlers::ReceivedRpc::from_frame(daemon, &req, frame);
@@ -3316,8 +3330,8 @@ async fn handle_connection_capped(
                 }
                 _ => next_received_line_capped(&mut reader, MAX_REQUEST_LINE, &daemon.receipt_registry).await,
             };
-            let Ok(Some((line, frame))) = read else { return; };
-            parse_received_line(&daemon, line, frame)
+            let Ok(Some((line, frame, end))) = read else { return; };
+            parse_received_line(&daemon, line, frame, end)
         };
         let (req, received) = match parsed {
             ParsedReceivedLine::Blank => continue, // blank frames do not reset the original first-line deadline
