@@ -18,6 +18,7 @@ Use: python3 scripts/tests/test_homepage_switch.py
 """
 
 import ast
+import atexit
 import contextlib
 import errno
 import hashlib
@@ -25,6 +26,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -37,7 +39,15 @@ import unittest
 sys.dont_write_bytecode = True
 HERE = os.path.dirname(os.path.abspath(__file__))
 HS_PATH = os.path.normpath(os.path.join(HERE, "..", "homepage-switch.py"))
-_spec = importlib.util.spec_from_file_location("homepage_switch", HS_PATH)
+DPC_PATH = os.path.normpath(os.path.join(HERE, "..", "download_page_check.py"))
+# H-04-R: the switch loads download_page_check.py from beside itself (the release template uploads both). The tests run a
+# BYTE-IDENTICAL copy of the switch beside a copy of the module whose PROFILES block holds fixture profiles (the fixture
+# pages below are small stand-ins with the slot structure), written by write_page_module(). SourceTests reads HS_PATH.
+RUN_DIR = tempfile.mkdtemp(prefix="hs-run-")
+atexit.register(shutil.rmtree, RUN_DIR, True)
+RUN_PATH = os.path.join(RUN_DIR, "homepage-switch.py")
+shutil.copyfile(HS_PATH, RUN_PATH)
+_spec = importlib.util.spec_from_file_location("homepage_switch", RUN_PATH)
 hs = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(hs)
 
@@ -119,12 +129,55 @@ def asset_bytes(ver):
     return a
 
 
+PAGE_SUFFIXES = ("_aarch64.dmg", "_x64.dmg", "_x64-setup.exe", "_x64-setup.zip")
+BUNDLE = b"/* fixture bundle, pinned */\n"          # <docroot>/assets/main.js, the fixture index page's pinned JS
+
+
 def pages(ver):
-    root = ("<html><body>" + "".join('<a href="/downloads/cys_%s%s">x</a>' % (ver, s) for s in hs.VERSIONED_SUFFIXES[:3])
-            + "</body></html>\n").encode()
-    dl = ("<html><body>" + "".join('<a href="/downloads/cys_%s%s">x</a>' % (ver, s) for s in hs.VERSIONED_SUFFIXES)
-          + '<a href="/downloads/SHA256SUMS.txt">sums</a></body></html>\n').encode()
+    """Stand-in pages with the slot structure of the real ones: index = S-slot + 3 cards (href + meta) + the JS branch
+    literals (9 VER, 4 SIZE) + one pinned module script; downloads = 4 release links (4 VER) + the SUMS link."""
+    md = u" \u00b7 "
+    root = (u'<html><body><p class="dl-hero__sub">v%s%smacOS%sWindows</p>' % (ver, md, md)
+            + u"".join(u'<a class="dl-btn" href="/downloads/cys_%s%s"><span class="dl-btn__meta">cys_%s%s%s0MB</span></a>'
+                       % (ver, s, ver, s, md) for s in PAGE_SUFFIXES[:3])
+            + u"<script>var h='/downloads/cys_%s_x64-setup.zip';var m='cys_%s_x64-setup.zip%s0MB';</script>" % (ver, ver, md)
+            + u'<script type="module" src="./assets/main.js"></script></body></html>\n').encode("utf-8")
+    dl = (u"<html><body>" + u"".join(u'<a href="/downloads/cys_%s%s">x</a>' % (ver, s) for s in PAGE_SUFFIXES)
+          + u'<a href="/downloads/SHA256SUMS.txt">sums</a></body></html>\n').encode("utf-8")
     return {"index.html": root, "downloads/index.html": dl}
+
+
+_dspec = importlib.util.spec_from_file_location("download_page_check_repo", DPC_PATH)
+dpc = importlib.util.module_from_spec(_dspec)
+_dspec.loader.exec_module(dpc)
+_ZERO = dict((s, 0) for s in PAGE_SUFFIXES)
+FX_IX = dpc.PROFILES["index.html"]._replace(skeleton_sha256="", js_pins={"./assets/main.js": sha(BUNDLE)}, required=())
+FX_DL = dpc.PROFILES["downloads/index.html"]._replace(skeleton_sha256="", ver_slots=4, required=())
+TPL_IX = dpc._skeleton_from(pages(OLD)["index.html"], OLD, _ZERO, FX_IX)
+TPL_DL = dpc._skeleton_from(pages(OLD)["downloads/index.html"], OLD, {}, FX_DL)
+
+
+def page_module_source(ix_pin=None, drop_downloads=False):
+    """The repo module with ONLY its PROFILES block replaced by the fixture profiles."""
+    src = rd(DPC_PATH).decode("utf-8")
+    assert src.count("PROFILES = {") == 1
+    a = src.index("PROFILES = {")
+    b = src.index("\n}\n", a) + 3
+    block = ("PROFILES = {   # TEST FIXTURE PROFILES (test_homepage_switch.page_module_source replaced this block only)\n"
+             "    \"index.html\": Profile(\"index\", \"index.html\", \"index.skeleton\", %r, 9, SUFFIXES, %r,\n"
+             "                          \"index-parser\", ()),\n" % (ix_pin or sha(TPL_IX), dict(FX_IX.js_pins)))
+    if not drop_downloads:
+        block += ("    \"downloads/index.html\": Profile(\"downloads\", \"downloads/index.html\", "
+                  "\"downloads-index.skeleton\", %r, 4, (), {}, \"downloads-lint\", ()),\n" % sha(TPL_DL))
+    return src[:a] + block + "}\n" + src[b:]
+
+
+def write_page_module(text=None):
+    with open(os.path.join(RUN_DIR, "download_page_check.py"), "w", encoding="utf-8") as f:
+        f.write(page_module_source() if text is None else text)
+
+
+write_page_module()
 
 
 class Site(object):
@@ -155,6 +208,9 @@ class Site(object):
             put(os.path.join(self.stage, "downloads", n), b)
         put(os.path.join(self.stage, "pages", "index.html"), self.new_pages["index.html"])
         put(os.path.join(self.stage, "pages", "downloads-index.html"), self.new_pages["downloads/index.html"])
+        put(os.path.join(self.stage, "pages", "index.skeleton"), TPL_IX)          # H-04-R: uploaded with the stage
+        put(os.path.join(self.stage, "pages", "downloads-index.skeleton"), TPL_DL)
+        put(os.path.join(self.docroot, "assets", "main.js"), BUNDLE)            # pinned JS the switch never moves
         self.write_expect()
         put(os.path.join(self.stage, "pages.json"), json.dumps(dict(
             (rel, {"pre": sha(self.old_pages[rel]), "want": sha(self.new_pages[rel])}) for rel in self.old_pages)).encode())
@@ -175,12 +231,14 @@ class Site(object):
     def old_tree(self):
         t = dict(("downloads/" + n.replace(NEW, OLD), sha(b)) for n, b in self.old.items())
         t.update((rel, sha(b)) for rel, b in self.old_pages.items())
+        t["assets/main.js"] = sha(BUNDLE)
         return t
 
     def new_tree(self, old_moved=False):
         t = {} if old_moved else dict(("downloads/" + n, sha(self.old[n])) for n in hs.versioned_names(OLD))
         t.update(("downloads/" + n, sha(b)) for n, b in self.new.items())
         t.update((rel, sha(b)) for rel, b in self.new_pages.items())
+        t["assets/main.js"] = sha(BUNDLE)
         return t
 
     def args(self, cmd):
@@ -201,14 +259,14 @@ class Site(object):
 
 
 def run(args, extra=None):
-    p = subprocess.run([sys.executable, "-B", HS_PATH] + args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    p = subprocess.run([sys.executable, "-B", RUN_PATH] + args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     return p.returncode, p.stdout.decode("utf-8", "replace") + p.stderr.decode("utf-8", "replace")
 
 
 def run_wrapped(runner, mode, n, args, env=None):
     e = dict(os.environ)
     e.update(env or {})
-    p = subprocess.run([sys.executable, "-B", runner, HS_PATH, mode, str(n)] + args, stdout=subprocess.PIPE,
+    p = subprocess.run([sys.executable, "-B", runner, RUN_PATH, mode, str(n)] + args, stdout=subprocess.PIPE,
                        stderr=subprocess.PIPE, env=e)
     return p.returncode
 
@@ -221,6 +279,7 @@ def fail_safe_problems(site):
     old.update((rel, sha(b)) for rel, b in site.old_pages.items())
     new = dict(("downloads/" + n, sha(b)) for n, b in site.new.items())
     new.update((rel, sha(b)) for rel, b in site.new_pages.items())
+    old["assets/main.js"] = new["assets/main.js"] = sha(BUNDLE)     # unchanged by the switch; changed bytes = FOREIGN
     state = {}
     for rel, h in t.items():
         if h == new.get(rel):
@@ -1190,6 +1249,121 @@ class FolderOutsideDocrootTests(Base):
         self.assertEqual(s.tree(), s.new_tree(old_moved=True))
 
 
+class PageCheckTests(Base):
+    """H-04-R D3 (design r3 s5.2/s6): both pages against their profiles; pins read only from the uploaded module."""
+
+    def rehash_page(self, s, rel, flat, data):
+        put(os.path.join(s.stage, "pages", flat), data)
+        pj = json.loads(rd(os.path.join(s.stage, "pages.json")))
+        pj[rel]["want"] = fsha(os.path.join(s.stage, "pages", flat))
+        put(os.path.join(s.stage, "pages.json"), json.dumps(pj).encode())
+
+    def tearDown(self):
+        write_page_module()                         # every test that swaps the module copy gets the fixture one back
+        super(PageCheckTests, self).tearDown()
+
+    def test_first_call_refuses_a_changed_staged_page_of_either_profile(self):
+        for rel, flat in (("index.html", "index.html"), ("downloads/index.html", "downloads-index.html")):
+            s = Site(os.path.join(self.tmp, "bad-" + flat))
+            self.rehash_page(s, rel, flat, rd(os.path.join(s.stage, "pages", flat)).replace(b"</body>", b"<i>x</i></body>"))
+            before = s.tree()
+            rc, out = run(s.args("switch"))
+            self.assertEqual((rc, s.tree() == before, os.path.exists(os.path.join(s.stage, "plan.json"))), (3, True, False),
+                             out)
+            self.assertIn("%s PAGE-DIFF" % rel, out)
+
+    def test_first_call_refuses_a_changed_pinned_bundle(self):
+        s = Site(os.path.join(self.tmp, "js"))
+        put(os.path.join(s.docroot, "assets", "main.js"), b"/* changed */")
+        before = s.tree()
+        rc, out = run(s.args("switch"))
+        self.assertEqual((rc, s.tree() == before), (3, True), out)
+        self.assertIn("SCRIPT-SHA", out)
+
+    def test_verify_stage_checks_both_pages_bytes(self):
+        s = Site(os.path.join(self.tmp, "vs"))
+        self.assertEqual(run(["verify-stage", "--stage", s.stage])[0], 0)
+        for flat in ("index.html", "downloads-index.html"):
+            s = Site(os.path.join(self.tmp, "vs-" + flat))
+            put(os.path.join(s.stage, "pages", flat), b"<html>other</html>\n")
+            rc, out = run(["verify-stage", "--stage", s.stage])
+            self.assertEqual(rc, 3, out)
+
+    def test_resume_after_index_published_finishes(self):
+        s = Site(os.path.join(self.tmp, "done"))
+        runner = os.path.join(self.tmp, "runner.py")
+        put(runner, RUNNER.encode())
+        run_wrapped(runner, "kill", PRIMITIVE_CALLS, s.args("switch"))
+        rc, out = run(s.args("switch"))
+        self.assertEqual((rc, json.loads(out)["moved"]), (0, 0), out)
+
+    def test_resume_with_public_moves_and_changed_bundle_is_4(self):
+        s = Site(os.path.join(self.tmp, "pj"))
+        runner = os.path.join(self.tmp, "runner.py")
+        put(runner, RUNNER.encode())
+        run_wrapped(runner, "kill", 10, s.args("switch"))
+        put(os.path.join(s.docroot, "assets", "main.js"), b"/* changed */")
+        before = s.tree()
+        rc, out = run(s.args("switch"))
+        self.assertEqual((rc, s.tree() == before), (4, True), out)
+        self.assertIn("this call moved nothing", out)
+
+    def test_resume_with_public_moves_and_a_staged_page_changed_is_5(self):
+        for flat in ("index.html", "downloads-index.html"):
+            s = Site(os.path.join(self.tmp, "pt-" + flat))
+            runner = os.path.join(self.tmp, "runner.py")
+            put(runner, RUNNER.encode())
+            run_wrapped(runner, "kill", 10, s.args("switch"))
+            with open(os.path.join(s.stage, "pages", flat), "ab") as f:
+                f.write(b"<!-- x -->")
+            before = s.tree()
+            rc, out = run(s.args("switch"))
+            self.assertEqual((rc, s.tree() == before), (5, True), out)
+
+    def test_resume_plan_written_no_move_changed_bundle_is_3(self):
+        s = Site(os.path.join(self.tmp, "po"))
+        ex = hs.load_expect(os.path.join(s.stage, "expect.json"), s.ts)
+        items = hs.build_forward_plan(s.stage, s.docroot, s.backup, ex, json.loads(rd(os.path.join(s.stage, "pages.json"))))
+        hs._write_json_atomic(os.path.join(s.stage, "plan.json"), {"ts": s.ts, "items": items})
+        put(os.path.join(s.docroot, "assets", "main.js"), b"/* changed */")
+        before = s.tree()
+        rc, out = run(s.args("switch"))
+        self.assertEqual((rc, s.tree() == before), (3, True), out)
+
+    def test_an_unusable_module_stops_preflight_before_any_move_and_switch_before_the_plan(self):
+        s = Site(os.path.join(self.tmp, "pf"))
+        self.assertEqual(run(s.args("preflight"))[0], 0)
+        write_page_module(page_module_source() + "\ndef broken(:\n")      # stands in for a 3.6 parse failure
+        s = Site(os.path.join(self.tmp, "pf-bad"))
+        stale = os.path.join(s.home, "cys-site-staging-%s-20990101-000000" % NEW)
+        put(os.path.join(stale, "downloads", "x"), b"leftover")
+        home_before = sorted(os.listdir(s.home))
+        rc, out = run(s.args("preflight"))
+        self.assertEqual((rc, os.path.isdir(stale), sorted(os.listdir(s.home)) == home_before), (3, True, True), out)
+        self.assertIn("page-check module unusable", out)
+        s2 = Site(os.path.join(self.tmp, "sw-bad"))
+        before = s2.tree()
+        rc, out = run(s2.args("switch"))
+        self.assertEqual((rc, s2.tree() == before, os.path.exists(os.path.join(s2.stage, "plan.json"))), (3, True, False),
+                         out)
+
+    def test_the_switch_follows_the_module_pin(self):
+        write_page_module(page_module_source(ix_pin="0" * 64))
+        s = Site(os.path.join(self.tmp, "pin"))
+        before = s.tree()
+        rc, out = run(s.args("switch"))
+        self.assertEqual((rc, s.tree() == before), (3, True), out)
+        self.assertIn("SKELETON-PIN", out)
+
+    def test_profiles_must_cover_pages_order(self):
+        write_page_module(page_module_source(drop_downloads=True))
+        s = Site(os.path.join(self.tmp, "np"))
+        before = s.tree()
+        rc, out = run(s.args("switch"))
+        self.assertEqual((rc, s.tree() == before), (3, True), out)
+        self.assertIn("PAGES_ORDER", out)
+
+
 class AssetSetCouplingTests(unittest.TestCase):
     """R2: the asset set lives in three places - this file's tables, the homepage template's arrays (checked against this
     file at run time: load_expect refuses any other set) and verify-release-remote.py (the public verify, step 6). This pins
@@ -1278,25 +1452,70 @@ class SourceTests(unittest.TestCase):
                 bad.append("f-string token")
         return bad
 
+    FLOOR_FILES = (HS_PATH, DPC_PATH)          # every file the homepage server loads (H-04-R: the uploaded checker too)
+    TOP_IMPORTS = {"collections", "hashlib", "re", "sys"}
+
+    @staticmethod
+    def import_contract(src):
+        """download_page_check.py: module-level imports from a 3.6 stdlib whitelist only; nothing at module level names the
+        Mac-only advisory module (it is not uploaded; make_advisory/main load it inside the function)."""
+        tree, bad, todo = ast.parse(src), [], None
+        todo = list(tree.body)
+        while todo:
+            n = todo.pop()
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+                continue
+            todo.extend(ast.iter_child_nodes(n))
+            mods = [a.name for a in n.names] if isinstance(n, ast.Import) else (
+                [n.module or ""] if isinstance(n, ast.ImportFrom) else [])
+            bad += ["module-level import %s" % m for m in mods if m.split(".")[0] not in SourceTests.TOP_IMPORTS]
+            if isinstance(getattr(n, "value", None), str) and "download_page_advisory" in n.value:
+                bad.append("module-level reference to the advisory module")
+        return bad
+
     def test_publication_primitives_only(self):
-        self.assertEqual(self.publication_problems(self.SRC), [])
+        for p in self.FLOOR_FILES:
+            with self.subTest(p=os.path.basename(p)):
+                self.assertEqual(self.publication_problems(rd(p).decode("utf-8")), [])
 
     def test_publication_scan_positive_controls(self):
         for inject in ("import shutil\n", "import subprocess\n"):
-            self.assertTrue(self.publication_problems(inject + self.SRC), inject)
+            for p in self.FLOOR_FILES:
+                self.assertTrue(self.publication_problems(inject + rd(p).decode("utf-8")), (inject, p))
         mutated = self.SRC.replace("    os.rename(src, dst)\n\n\ndef _st_dev", "    os.rename(src, dst)\n\n\ndef _x(a, b):\n"
                                    "    os.rename(a, b)\n\n\ndef _st_dev", 1)
         self.assertNotEqual(mutated, self.SRC)
         self.assertTrue(self.publication_problems(mutated))
 
     def test_python36_floor(self):
-        self.assertEqual(self.floor_problems(self.SRC), [])
+        for p in self.FLOOR_FILES:
+            with self.subTest(p=os.path.basename(p)):
+                self.assertEqual(self.floor_problems(rd(p).decode("utf-8")), [])
+
+    def test_page_check_import_contract(self):
+        self.assertEqual(self.import_contract(rd(DPC_PATH).decode("utf-8")), [])
+        src = rd(DPC_PATH).decode("utf-8")
+        for inject in ("import html.parser\n", "import os\n", "import download_page_advisory\n",
+                       "ADV = 'download_page_advisory.py'\n", "try:\n    import importlib\nexcept ImportError:\n    pass\n"):
+            self.assertTrue(self.import_contract(inject + src), inject)
+
+    def test_the_switch_holds_no_page_pin(self):
+        """D-3: pins, slot counts and skeleton names live only in download_page_check.py."""
+        self.assertEqual(re.findall(r"\b[0-9a-f]{64}\b", self.SRC), [])
+        for name in ("SKELETON_SHA256", "JS_PINS", "index.skeleton", "downloads-index.skeleton", "ver_slots"):
+            self.assertNotIn(name, self.SRC)
+
+    def test_page_profiles_cover_pages_order(self):
+        self.assertEqual(sorted(dpc.PROFILES), sorted(rel for rel, _flat in hs.PAGES_ORDER))
+        self.assertEqual(rd(RUN_PATH), rd(HS_PATH))               # the tests run the switch's own bytes
 
     def test_python36_floor_positive_controls(self):
         for inject in ("if (zz := 1):\n    pass\n", "zz = f'{1}'\n", "import time\nzz = time.time_ns()\n",
                        "def zz(a, /):\n    pass\n", "from __future__ import annotations\n",
-                       "import argparse\nargparse.ArgumentParser().add_subparsers(dest='c', required=True)\n"):
-            self.assertTrue(self.floor_problems(inject + self.SRC), inject)
+                       "import argparse\nargparse.ArgumentParser().add_subparsers(dest='c', required=True)\n",
+                       "xx = 1\nzz = f'{xx=}'\n"):
+            for p in self.FLOOR_FILES:
+                self.assertTrue(self.floor_problems(inject + rd(p).decode("utf-8")), (inject, p))
 
 
 if __name__ == "__main__":

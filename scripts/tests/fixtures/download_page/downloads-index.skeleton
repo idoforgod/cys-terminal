@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="ko">
+<head><meta charset="utf-8"><title>cys {{cys:VER}} 다운로드</title></head>
+<body>
+  <main>
+    <h1>cys {{cys:VER}} 다운로드</h1>
+    <ul>
+      <li><a href="/downloads/cys_{{cys:VER}}_aarch64.dmg">cys_{{cys:VER}}_aarch64.dmg</a> — macOS (Apple Silicon · M1 이상)</li>
+      <li><a href="/downloads/cys_{{cys:VER}}_x64.dmg">cys_{{cys:VER}}_x64.dmg</a> — macOS (Intel)</li>
+      <li><a href="/downloads/cys_{{cys:VER}}_x64-setup.exe">cys_{{cys:VER}}_x64-setup.exe</a> — Windows 설치본</li>
+      <li><a href="/downloads/cys_{{cys:VER}}_x64-setup.zip">cys_{{cys:VER}}_x64-setup.zip</a> — Windows 설치본(zip)</li>
+    </ul>
+
+    <section data-cys-release-marker="macos-install-guidance-v1">
+      <h2>macOS 설치 안내</h2>
+      <p>
+        내려받은 <code>.dmg</code> 파일을 더블클릭해 엽니다. 창에 나타나는
+        <strong>“Install cys”</strong> 를 더블클릭하면 설치가 자동으로(원자적으로) 끝납니다.
+      </p>
+      <p>
+        예전처럼 앱을 응용 프로그램(Applications) 폴더로 <em>끌어다 놓는 복사 과정이 없어</em>,
+        “복사 도중 실행”으로 생기던 “손상되었습니다 / 열 수 없습니다” 같은 경합 오류가
+        원천적으로 발생하지 않습니다. 설치가 끝나면 Launchpad 또는 응용 프로그램 폴더에서 cys를 실행하세요.
+      </p>
+      <ul>
+        <li>Apple Silicon(M1 이상) Mac: <code>cys_{{cys:VER}}_aarch64.dmg</code></li>
+        <li>Intel Mac: <code>cys_{{cys:VER}}_x64.dmg</code></li>
+      </ul>
+    </section>
+
+    <section data-cys-release-marker="windows-defender-guidance-v2">
+      <h2>Windows Defender 안내</h2>
+      <p>
+        설치 전, <a href="/downloads/SHA256SUMS.txt">SHA256SUMS.txt</a> 와 내려받은 파일의 SHA-256 해시를
+        대조해 무결성을 확인하세요.
+      </p>
+      <p>
+        일부 환경에서 Windows Defender가 cys를 <code>Behavior:Win32/Execution.A!ml</code> 이라는 이름으로
+        <strong>잘못 탐지(오탐)</strong>해 자동으로 격리하는 경우가 있습니다. cys는 안전한 프로그램이며,
+        이 문제는 Microsoft에 오탐 신고가 접수되어 있습니다. 아래 순서대로 하면 복구됩니다.
+      </p>
+      <p>
+        <strong>⚠️ 순서가 중요합니다.</strong> 예외(제외)를 <strong>먼저</strong> 등록하지 않고 복구부터 하면,
+        Defender가 복구 즉시 다시 격리해 버립니다. 반드시 <strong>① 예외 등록 → ② 복구</strong> 순서로 진행하세요.
+      </p>
+      <p>관리자 권한 PowerShell(시작 메뉴 → <code>PowerShell</code> 우클릭 → “관리자 권한으로 실행”)에서:</p>
+      <pre><code>Add-MpPreference -ExclusionPath "$env:LOCALAPPDATA\cys"
+&amp; "C:\Program Files\Windows Defender\MpCmdRun.exe" -Restore -Name "Behavior:Win32/Execution.A!ml"</code></pre>
+      <p>
+        cys는 현재 사용자(per-user) 설치라 <code>%LOCALAPPDATA%\cys</code>
+        (예: <code>C:\Users\&lt;사용자이름&gt;\AppData\Local\cys</code>)에 설치됩니다.
+        격리 목록을 먼저 확인하려면 <code>MpCmdRun.exe -Restore -ListAll</code> 로 실제 격리된 항목명을 본 뒤 복구하면 됩니다.
+        Windows 보안 앱(바이러스 및 위협 방지 → 보호 기록)에서 복원할 수도 있으나, 이때도 <strong>예외 등록을 먼저</strong> 마쳐야 재격리되지 않습니다.
+      </p>
+    </section>
+  </main>
+</body>
+</html>

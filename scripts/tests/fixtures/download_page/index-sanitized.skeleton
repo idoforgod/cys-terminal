@@ -1,0 +1,543 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- ★RSI R4 security(eval v2.1): meta CSP 정상 적용 — v2.1 보정(frame-ancestors 정적 미요구·site-level)으로 가능해짐. script-src=self+unsafe-inline(★사유: hash 방식은 eval 하니스 axe 인라인 주입과 충돌 실측[defect#4 보고]·외부 script 출처 제한은 유지=실보안·배포 헤더 단계에서 nonce 강화 예정)·style-src unsafe-inline=인라인 style 속성(레이아웃)用·font-src=self+data(R1 Pretendard 1P 자체호스팅·3P CDN 폐기)·object none·base self·'*'/unsafe-eval 불사용. frame-ancestors/XCTO/HSTS=배포 응답헤더 단계. referrer=strict-origin-when-cross-origin(R2). -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data:; object-src 'none'; base-uri 'self'">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<link rel="icon" type="image/svg+xml" href="./assets/favicon-BzUyCdFw.svg">
+<link rel="alternate icon" type="image/png" href="./assets/favicon-32-a-CE3aoU.png">
+<script>(function(){try{var t=localStorage.getItem('theme');if(t==='light'||((!t||t==='system')&&window.matchMedia&&!matchMedia('(prefers-color-scheme:dark)').matches))document.documentElement.setAttribute('data-theme','light');var l=localStorage.getItem('lang');if(l==='en')document.documentElement.lang='en';}catch(e){}document.documentElement.classList.add('js');setTimeout(function(){if(!window.__navEnhanced)document.documentElement.classList.add('nav-fallback-show');if(!window.__revealReady){var r=document.querySelectorAll('.reveal');for(var i=0;i<r.length;i++)r[i].classList.add('in');}},1800);})();</script>
+<title>최윤식 — 미래학자 | 아시아미래인재연구소</title>
+<meta name="description" content="미래학자 최윤식. 아시아미래인재연구소 소장. 국가와 기업이 마주할 미래를 시나리오로 그리고, 강연·자문으로 전략을 돕습니다.">
+<meta name="author" content="최윤식">
+<!-- ★R14 배포(도메인 확정 https://www.cysinsight.com): canonical 절대URL + hreflang self-referential(ko/x-default). i18n=클라사이드 단일URL이라 별도 /en/ URL 부재 → 날조 alternate 금지·자기참조만. -->
+<link rel="canonical" href="https://www.cysinsight.com/">
+<link rel="alternate" hreflang="ko" href="https://www.cysinsight.com/">
+<link rel="alternate" hreflang="x-default" href="https://www.cysinsight.com/">
+<meta name="theme-color" content="#F5F5F2" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#121212" media="(prefers-color-scheme: dark)">
+<meta property="og:title" content="최윤식 — 미래학자">
+<meta property="og:url" content="https://www.cysinsight.com/">
+<meta property="og:description" content="국가와 기업이 마주할 미래를 시나리오로 그리는 미래학자 최윤식">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="최윤식 — 미래학자">
+<meta property="og:locale" content="ko_KR">
+<meta property="og:image" content="https://www.cysinsight.com/assets/img/generated/og-image.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="최윤식 — 미래학자, 아시아미래인재연구소 소장">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="최윤식 — 미래학자">
+<meta name="twitter:description" content="국가와 기업이 마주할 미래를 시나리오로 그리는 미래학자 최윤식">
+<meta name="twitter:image" content="https://www.cysinsight.com/assets/img/generated/og-image.png">
+<!-- R9 SEO(RSI cycle1·content SOT spec _round/R9_jsonld_schema.md): JSON-LD Person + 4 dated Book = PROOF-DISCIPLINE(날짜 기록) SEO 기계가독화. ★환각0: 전 필드 SOT verbatim·sameAs aladin 실프로필만·역임 affiliation/aggregateRating/award/적중/우위 schema 절대 미포함. -->
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "Person",
+      "@id": "#choi-yoonsik",
+      "name": "최윤식",
+      "jobTitle": "전문 미래학자",
+      "description": "휴스턴대학교에서 미래학을 전공한 전문 미래학자, 아시아미래인재연구소 소장.",
+      "alumniOf": [
+        { "@type": "CollegeOrUniversity", "name": "University of Houston Clear Lake" },
+        { "@type": "CollegeOrUniversity", "name": "University of Phoenix" }
+      ],
+      "worksFor": { "@type": "Organization", "name": "아시아미래인재연구소", "foundingDate": "2003", "founder": { "@type": "Person", "name": "최윤식" } },
+      "knowsAbout": ["미래예측", "미래학", "AX(AI Transformation)", "AI 자동화", "미·중 지정학", "미래 경제"],
+      "sameAs": [
+        "https://www.aladin.co.kr/author/wauthor_overview.aspx?AuthorSearch=@45367",
+        "https://www.youtube.com/channel/UCUJmeHNP4s4MYuGD_Rq8BTQ",
+        "https://product.kyobobook.co.kr/person/detail/1000344501"
+      ]
+    },
+    { "@type": "Book", "name": "2020 부의 전쟁 in Asia", "datePublished": "2010", "author": { "@id": "#choi-yoonsik" }, "url": "https://product.kyobobook.co.kr/detail/S000001523183" },
+    { "@type": "Book", "name": "2030 대담한 미래", "datePublished": "2013", "author": { "@id": "#choi-yoonsik" }, "url": "https://www.aladin.co.kr/shop/wproduct.aspx?ItemId=29267059" },
+    { "@type": "Book", "name": "2050 미중패권전쟁과 세계경제 시나리오", "datePublished": "2023", "author": { "@id": "#choi-yoonsik" }, "url": "https://www.aladin.co.kr/shop/wproduct.aspx?ItemId=309647341" },
+    { "@type": "Book", "name": "2026 세계 경제 시나리오", "datePublished": "2025", "author": { "@id": "#choi-yoonsik" }, "url": "https://www.aladin.co.kr/shop/wproduct.aspx?ItemId=376975301" }
+  ]
+}
+</script>
+<link rel="preload" as="image" type="image/webp" fetchpriority="high"
+      imagesrcset="./assets/futurist-cover-onrecord-360-706wUa9O.webp 360w, ./assets/futurist-cover-onrecord-480--QNJ-Hq7.webp 480w, ./assets/futurist-cover-onrecord-520-BJTqgdFI.webp 520w, ./assets/futurist-cover-onrecord-640-IA-FoLSZ.webp 640w, ./assets/futurist-cover-onrecord-720-siDM79Sd.webp 720w, ./assets/futurist-cover-onrecord-800-CpunUIMb.webp 800w, ./assets/futurist-cover-onrecord-840-bMmZVBT9.webp 840w, ./assets/futurist-cover-onrecord-900-Z0zGn6V8.webp 900w, ./assets/futurist-cover-onrecord-B4mp1G0E.webp 946w"
+      imagesizes="(max-width:1023px) calc(92vw - 2px), (max-width:1090px) calc(85vw - 50px), (max-width:1279px) calc(80.6vw - 2px), (max-width:1818px) calc(45.6vw - 50px), calc(50vw - 130px)">
+<!-- ★R9 폰트 비차단 로드: media=print→onload 승격(렌더 비차단=LH perf)·noscript=no-JS 폰트 보존. CSP script-src unsafe-inline 기허용·fontOnly 제외(URL 시트)는 유지 -->
+<link rel="stylesheet" href="css/fonts.css" media="print" onload="this.media='all'">
+<noscript><link rel="stylesheet" href="css/fonts.css"></noscript>
+<!-- ★R6 ESM 전환(vite.config 'ESM 전환(R후반)' 완성): 8 classic script→1 module 엔트리(순서=import로 보존·vite 공유청크). GSAP vendor=R4 lazy 주입 유지(js/vendor/ 정적 복사본). -->
+<!-- FOOTER-LEGAL 최소 CSS: 기존 footer 토큰(--surface-2/--ink-muted/--line) 재사용 · index.html 한정(공유 css 무접촉) -->
+<!-- MIG-FINAL 최소 CSS(G7 태그라인·G2 병존 연락처 — 기존 토큰만·index 한정) -->
+<style>.hero-band__tagline{font-family:var(--font-mono);font-size:var(--fs-mono);letter-spacing:var(--ls-mono);color:var(--ink-muted);margin:1rem 0 0}.contact-legacy{color:var(--ink-muted);font-size:.9rem;margin-top:.4rem}</style><!-- ★hotfix(주인님 2026-07-08): hero-band__tagline margin-top .4rem→1rem — 슬로건('미래를 준비한다.') 대형 글자 descender와 영문 태그라인 딱붙음(gap 6.4px) 해소 -->
+<style>.site-legal{background:var(--surface-2);color:var(--ink-muted);border-top:1px solid var(--line);font-size:.75rem;line-height:1.7;padding:1.2rem 0 1.6rem}.site-legal p{margin:0}</style>
+  <script type="module" crossorigin src="./assets/main-e5a35f84.js"></script>
+  <link rel="modulepreload" crossorigin href="./assets/site-data-yksQaPPU.js">
+  <link rel="modulepreload" crossorigin href="./assets/i18n-e5a35f84.js">
+  <link rel="stylesheet" crossorigin href="./assets/i18n-CppKjRdH.css">
+  <link rel="stylesheet" crossorigin href="./assets/main-CZrw6hS8.css">
+<style id="dv2">@media (min-width:1024px){:root{--maxw:min(1760px,85vw);--gutter:clamp(24px,2.2vw,40px);--maxw-text:min(760px,46vw)}.section .measure{margin-inline-start:clamp(0px,4vw,112px)}}.section{padding-block:clamp(3.5rem,8vw,12rem)}:root{--fs-hero:clamp(2.59rem,7.2vw,7.5rem);--fs-h1:clamp(2.07rem,4.6vw,3.5rem)}.hero-band__name{font-size:var(--fs-h1)}@media (min-width:1024px){:root{--ls-hero:-.05em;--lh-hero:1.0}}@media (prefers-reduced-motion:no-preference){:root{--motion-scale:1}html.js .reveal{opacity:0;transform:translateY(calc(var(--dv2-rise) * var(--mz,1)));transition:opacity var(--dv2-dur) var(--ease-out),transform var(--dv2-dur) var(--ease-out);will-change:opacity,transform}html.js .reveal.in{opacity:1;transform:none}:root{--dv2-rise:48px;--dv2-dur:.72s}@media (min-width:1024px){:root{--dv2-rise:160px;--dv2-dur:.95s}}html.js .btn,html.js .book-link,html.js .topic-card{transition-duration:var(--dur,.28s)}html.js .reveal:not(.in){animation:dv2-failsafe 1ms linear 2.4s forwards}@keyframes dv2-failsafe{to{opacity:1;transform:none}}}@media (prefers-reduced-motion:reduce){:root{--motion-scale:0}.reveal,html.js .reveal{opacity:1 !important;transform:none !important;transition:none !important;animation:none !important}}</style>  <link rel="stylesheet" crossorigin href="./assets/skin-fz8rsL2h.css">
+  <link rel="stylesheet" href="./assets/ds-tokens-8401cbe2.css">
+  </head>
+<body>
+<a class="skip-link" href="#main">본문 바로가기</a>
+
+<!-- HEADER -->
+<header class="site-header" data-site-header>
+  <!-- R9 no-JS resilience(codex item1#2): 정적 fallback nav. site-shell.js가 innerHTML 교체로 풍부한 header enhance(JS 성공시 자동 대체=중복0). no-JS/JS-fail=nav 항상 접근. -->
+  <div class="wrap nav-fallback">
+    <a class="brand" href="index.html">최윤식 <span lang="en">· Futurist</span></a>
+    <nav aria-label="주요 메뉴">
+      <a href="pages/about.html">연구소 소개</a>
+      <a href="pages/insights.html">미래통찰</a>
+      <a href="pages/speaking.html">강연·자문</a>
+      <a href="pages/books.html">출간 도서</a>
+      <a href="pages/media.html">미디어</a>
+      <a href="pages/academy.html">통찰아카데미</a>
+      <a href="pages/archive.html">자료실</a>
+      <a href="index.html#contact">문의</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main" tabindex="-1">
+
+  <!-- DL-HERO (S0-pre) — 박사님 3호: 자비스(cys) 다운로드 밴드. SOT=_round/dlhero/DLHERO_DESIGN_SPEC.md §2(구조)+DLHERO_COPY.md §1(확정 카피·denylist 13어 0건). 충돌 해소: 헤드라인=h2(h1 불변)·도구 밴드 레지스터=슬로건B focal 공존·텍스트 전용=LCP 재실측 계약. 3링크=정적 가시(no-JS)·JS=감지 강조 전용+★윈도우 한정 파일 전환(크롬=exe·엣지/IE=zip — 오너 직접명령 2026-07-11로 '라우팅 금지' 예외 스코프 한정 해제·자동다운로드는 여전히 금지)·CSP 무변(외부 fetch 0). 링크=자체 호스팅 /downloads/(맥 DMG=Apple 공증본 — GitHub 자산은 무공증이라 오너 지시로 자체 호스팅 전환 2026-07-11). 릴리스 범프=RELEASE_BUMP_CHECK.md(4곳+S 슬롯 버전 동시 갱신+zip). -->
+  <section class="dl-hero" id="download" aria-labelledby="dl-h">
+    <div class="wrap dl-hero__grid">
+      <div class="dl-hero__copy">
+        <p class="kicker reveal in" lang="en">DOWNLOAD</p>
+        <p class="dl-hero__claim reveal in">세계 최초의 AI 자비스 전용 터미널</p>
+        <h2 id="dl-h" class="dl-hero__headline reveal in">AI 에이전트 팀을 지휘하는 터미널, 자비스(cys)</h2>
+        <p class="dl-hero__sub reveal in">터미널 하나에서 AI 조직을 편성하고 운영합니다 — v{{cys:VER}} · macOS · Windows</p>
+        <ul class="dl-hero__bullets reveal in">
+          <li>master·CSO·워커·리뷰어를 역할별로 편성 — 역할 지침이 자동 주입되어 각 에이전트가 제 역할로 깨어납니다</li>
+          <li>부서 단위 격리 데몬과 phoenix 자동복구 — 세션이 끊겨도 조직이 되살아납니다</li>
+          <li>양방향 소켓 push로 에이전트가 먼저 보고하고, rate-limit은 자동 대기 후 이어서 재개합니다</li>
+        </ul>
+        <p class="dl-hero__winnote">참고 — 윈도우 설치파일: 크롬에서는 EXE를 바로 받고, 엣지·인터넷 익스플로러에서는 .exe 다운로드가 차단될 수 있어 ZIP을 받아 압축 해제 후 .exe를 실행합니다. .exe는 Authenticode 미서명(인증서 미보유)이라 실행 시 SmartScreen "알 수 없는 게시자" 경고가 뜰 수 있습니다("추가 정보 → 실행"으로 진행). 이는 알려진 상태이고 파일 무결성과는 무관합니다.</p>
+      </div>
+      <div class="dl-hero__actions reveal in" role="group" aria-label="다운로드">
+      <a class="dl-btn" data-dl="mac-arm"
+         href="/downloads/cys_{{cys:VER}}_aarch64.dmg">
+        <span class="dl-btn__label">macOS <span class="dl-btn__arch" lang="en">Apple Silicon</span></span>
+        <span class="dl-btn__meta" lang="en">cys_{{cys:VER}}_aarch64.dmg · {{cys:SIZE:_aarch64.dmg}}MB</span>
+      </a>
+      <a class="dl-btn" data-dl="mac-x64"
+         href="/downloads/cys_{{cys:VER}}_x64.dmg">
+        <span class="dl-btn__label">macOS <span class="dl-btn__arch" lang="en">Intel</span></span>
+        <span class="dl-btn__meta" lang="en">cys_{{cys:VER}}_x64.dmg · {{cys:SIZE:_x64.dmg}}MB</span>
+      </a>
+      <a class="dl-btn" data-dl="win-x64"
+         href="/downloads/cys_{{cys:VER}}_x64-setup.exe">
+        <span class="dl-btn__label">Windows</span>
+        <span class="dl-btn__meta" lang="en">cys_{{cys:VER}}_x64-setup.exe · {{cys:SIZE:_x64-setup.exe}}MB</span>
+      </a>
+      </div>
+    </div>
+  </section>
+  <!-- DL-HERO 감지 JS(DESIGN_SPEC §3 사다리 + 오너 직접명령 2026-07-11): 강조 + ★윈도우 한정 파일 전환(크롬 등=exe·엣지/IE=zip — 엣지/IE의 exe 다운로드 차단 우회). 로컬 API만(외부 fetch 0=CSP 무변)·무JS=정적 exe 버튼+winnote zip 수동 링크 폴백·자동다운로드 여전히 금지·오탐 무해. -->
+  <script>(function(){try{
+    var uad=navigator.userAgentData;var pf=(uad&&uad.platform)||navigator.platform||'';
+    function rec(k){var el=document.querySelector('.dl-btn[data-dl="'+k+'"]');if(el)el.classList.add('is-recommended');}
+    var ua=navigator.userAgent||'';
+    var isEdgeIE=/Edg\//.test(ua)||/Trident|MSIE/.test(ua)||!!(uad&&uad.brands&&uad.brands.some(function(b){return /Edge/i.test(b.brand);}));
+    if(isEdgeIE){var w=document.querySelector('.dl-btn[data-dl="win-x64"]');if(w){
+      w.setAttribute('href','/downloads/cys_{{cys:VER}}_x64-setup.zip');
+      var m=w.querySelector('.dl-btn__meta');if(m)m.textContent='cys_{{cys:VER}}_x64-setup.zip · {{cys:SIZE:_x64-setup.zip}}MB';
+    }}
+    if(/^Win/i.test(pf)){rec('win-x64');}
+    else if(/^Mac/i.test(pf)||/macOS/i.test(pf)){
+      if(uad&&uad.getHighEntropyValues){uad.getHighEntropyValues(['architecture']).then(function(d){
+        if(d.architecture==='arm')rec('mac-arm');else if(d.architecture==='x86')rec('mac-x64');
+      }).catch(function(){});}
+    }
+  }catch(e){}})();</script>
+
+  <!-- HERO (S0) — R1 강렬화: FUTURIST 표지(정적 LCP·webp preload 불변) + 라이브 above-fold 헤드라인 밴드(표지 상단).
+       밴드=design .hero-band 계약(css/hero-band.noir.css 타이포·시안) + content 카피(슬로건B·환각0). ★h1=식별('최윤식…소장' SEO/a11y)·슬로건B=h2 시각 dominant.
+       레이아웃(frontend): 밴드→표지 stacked·표지 ≤60vw fit(100svh내). 영문 'grows with you'·AX=표지 carry/Tier2 생략. CSS 비주얼=design·--dump-dom 1:1. ⑤ KT 진입=hero.noir. -->
+  <section class="hero hero--cover" aria-labelledby="hero-h">
+    <div class="wrap hero-stage">
+      <div class="hero-band is-entering">
+        <h1 id="hero-h" class="hero-band__name" data-i18n-html="hero-h1">최윤식 박사 · 미래학자<span class="sr-only"> · 아시아미래인재연구소 소장</span></h1>
+        <h2 class="hero-band__title" data-i18n-html="hero-slogan">미래를 맞히지 않는다. 미래를 <em class="em">준비한다</em>.</h2>
+        <!-- G7 이전(OB-544-01 구 태그라인 verbatim·ZWSP 포함 바이트 보존 — BLOCK_MAP 제안 목적지=히어로 · 박사님 사후 평가 대상(G7·CEO 집행지시 2026-07-07)) -->
+        <p class="hero-band__tagline" lang="en">Entrepreneur, Writer and Speaker.​</p>
+        <div class="hero-actions">
+          <a class="btn btn-cta hero-cta--primary" href="#contact"><span data-i18n="강연·자문 문의">강연·자문 문의</span> <span aria-hidden="true" class="arr">→</span></a>
+          <a class="btn btn-ghost" href="#books" data-i18n="저서 보기">저서 보기</a>
+        </div>
+      </div>
+      <!-- hero-ledger 블록 삭제(주인님 2026-07-08 '어울리지 않는다'): principle+dated 엔트리 제거. 표지/CTA/슬로건 무접촉. .hero-ledger* CSS(page-index.atlas.css)=사용처 소멸로 함께 정리. -->
+      <figure class="hero-cover zone-dissolve" data-zone="cover">
+        <picture>
+          <source type="image/webp"
+                  srcset="./assets/futurist-cover-onrecord-360-706wUa9O.webp 360w, ./assets/futurist-cover-onrecord-480--QNJ-Hq7.webp 480w, ./assets/futurist-cover-onrecord-520-BJTqgdFI.webp 520w, ./assets/futurist-cover-onrecord-640-IA-FoLSZ.webp 640w, ./assets/futurist-cover-onrecord-720-siDM79Sd.webp 720w, ./assets/futurist-cover-onrecord-800-CpunUIMb.webp 800w, ./assets/futurist-cover-onrecord-840-bMmZVBT9.webp 840w, ./assets/futurist-cover-onrecord-900-Z0zGn6V8.webp 900w, ./assets/futurist-cover-onrecord-B4mp1G0E.webp 946w"
+                  sizes="(max-width:1023px) calc(92vw - 2px), (max-width:1090px) calc(85vw - 50px), (max-width:1279px) calc(80.6vw - 2px), (max-width:1818px) calc(45.6vw - 50px), calc(50vw - 130px)">
+          <img src="./assets/futurist-cover-onrecord-D6ZGMs34.jpeg" alt="미래학자 최윤식" width="946" height="830" loading="eager" fetchpriority="high" decoding="async">
+        </picture>
+      </figure>
+      <!-- AX Tier2 — 차별성 라이브 라인(SEO crawl·표지 baked 아님). content profile.expertise.headline verbatim·환각0. 밴드 분리 얇은 절제(표지 하단). 시각=design 선-핑. -->
+      <p class="hero-ax" data-i18n-html="hm-hero-ax">미래예측 + <strong lang="en">AX(AI Transformation)</strong> + <strong>AI 자동화</strong></p>
+    </div>
+    <a class="hero-scroll-cue" href="#proof" aria-label="아래로 스크롤"><span aria-hidden="true">↓</span></a>
+  </section>
+
+  <!-- STATS (S1 PROOF) — 디졸브 착지·시안 첫 점화 지점 -->
+  <section class="stats" id="proof" aria-label="요약 지표">
+    <div class="wrap"><p class="stats__framing" data-i18n-html="hm-stat-framing">맞혀온 것이 아니라, <em class="em">기록해온</em> 것.</p></div>
+    <div class="wrap stats-row">
+      <div class="stat reveal"><span class="stat-num" data-count="80">80</span><span class="stat-suf" data-i18n-html="hm-stat1-suf">여 권</span><span class="stat-label" data-i18n-html="hm-stat1-label">전 분야 출간 저서</span></div>
+      <div class="stat reveal"><span class="stat-num" data-i18n-html="hm-stat2-num">베스트셀러</span><span class="stat-label" data-i18n-html="hm-stat2-label">주요 서점 상위 진입</span></div>
+      <div class="stat reveal"><span class="stat-num">2003</span><span class="stat-label" data-i18n-html="hm-stat3-label">민간 미래학 연구소 설립</span></div>
+    </div>
+  </section>
+
+  <!-- FORESIGHT (S2 무게중심) — 정적 베이스(progressive enhancement). design css/s2.noir.css BEM 계약 1:1 정합.
+       좌 narrative=4비트 KT(content 슬롯·정적) / 우 viz=SVG 스파인+전망 2×2 카드+방법론 HUD(JS 렌더, SOT).
+       ★W4 환각0: 축=연도/사건마커만(정확도 그래프·수치 차트 0=가치축 함의 차단). 카드=〔전망〕배지+summary verbatim+'적중 단정 아님' 노트(anti-claim·렌더)+근거+링크. -->
+  <section class="section foresight" id="insights" aria-labelledby="foresight-h">
+    <div class="wrap">
+      <header class="section-head reveal">
+        <h2 id="foresight-h" data-i18n-html="hm-fs-h">기록으로 남은 미래 전망</h2>
+        <p class="section-lede measure" data-i18n-html="hm-fs-lede">미래학자의 신뢰는 ‘적중 주장’이 아니라 <em>언제·어디서 무엇을 말했는가</em>의 기록에서 옵니다. 아래는 저서 원문에 근거한 전망으로, 출간 연도와 출처를 밝혀 직접 확인하실 수 있습니다.</p>
+      </header>
+      <div class="foresight__layout">
+        <!-- 좌: 키네틱타이포 내러티브(정적=4비트 전부 visible). ★카피=content 슬롯(제안·최종 wording=content SOT) -->
+        <div class="foresight-narrative reveal">
+          <p class="kicker" lang="en">FORESIGHT</p>
+          <ol class="foresight-narrative__beats">
+            <li class="foresight-beat" aria-current="step"><span class="foresight-beat__index">01</span><h3 class="foresight-beat__line" data-i18n-html="hm-beat-1"><span class="em">약한 신호</span>를 읽습니다.</h3></li>
+            <li class="foresight-beat"><span class="foresight-beat__index">02</span><h3 class="foresight-beat__line" data-i18n-html="hm-beat-2"><span class="em">여러 갈래</span>의 미래를 그립니다.</h3></li>
+            <li class="foresight-beat"><span class="foresight-beat__index">03</span><h3 class="foresight-beat__line" data-i18n-html="hm-beat-3"><span class="em">기록</span>으로 남깁니다.</h3></li>
+            <li class="foresight-beat"><span class="foresight-beat__index">04</span><h3 class="foresight-beat__line" data-i18n-html="hm-beat-4">그래서, <span class="em">준비</span>합니다.</h3></li>
+          </ol>
+          <!-- ★hotfix(주인님 2026-07-08): 진행 인디케이터(밑줄4개 foresight-progress) 삭제 — scrollytelling 제거로 스크롤 차례변경 사라짐→정적 밑줄은 죽은 UI. aria-hidden 장식이라 콘텐츠 손실0(beat aria-current가 SR 의미 운반). -->
+        </div>
+        <!-- 우: 데이터뷰(스파인→전망카드→HUD). JS 렌더(SOT, foresight.js) -->
+        <div class="foresight__viz reveal">
+          <div id="foresightSpine"></div>
+          <!-- ★정적 전망 4카드(stage6 SEO·no-JS info100%) — content forecasts SOT verbatim·환각0(〔전망〕배지·summary·'적중 단정 아님' 노트·근거). foresight.js는 카드 존재 시 미렌더(정적 권위). content forecasts 변경 시 동기 필요. -->
+          <div class="method-hud" id="methodHud"></div>
+          <!-- ★R6.4 P3 정식 feature: below-fold 예측 노드 그래프(장식·aria-hidden·앵커/i18n 속성 0). 의미 콘텐츠 아님(위 4비트·전망카드·스파인이 SOT).
+               static SVG=no-JS/reduce/save-data/IO미지원 정적 폴백(codex 빈박스 금지 교정·콘텐츠 무가림). JS+모션 가능 시 atlas-scene-core가 canvas로 강화(SVG는 CSS가 숨김). -->
+          <div class="atlas-scene" data-atlas-scene aria-hidden="true"><svg class="atlas-scene__static" viewBox="0 0 1600 700" preserveAspectRatio="xMidYMid meet" aria-hidden="true" focusable="false"><line class="atlas-svg__edge atlas-svg__edge--main" x1="88.0" y1="322.0" x2="352.0" y2="364.0"/><line class="atlas-svg__edge" x1="136.0" y1="518.0" x2="352.0" y2="364.0"/><line class="atlas-svg__edge" x1="136.0" y1="518.0" x2="432.0" y2="574.0"/><line class="atlas-svg__edge atlas-svg__edge--main" x1="192.0" y1="182.0" x2="408.0" y2="126.0"/><line class="atlas-svg__edge" x1="192.0" y1="182.0" x2="352.0" y2="364.0"/><line class="atlas-svg__edge atlas-svg__edge--main" x1="352.0" y1="364.0" x2="640.0" y2="238.0"/><line class="atlas-svg__edge atlas-svg__edge--main" x1="352.0" y1="364.0" x2="688.0" y2="462.0"/><line class="atlas-svg__edge" x1="408.0" y1="126.0" x2="640.0" y2="238.0"/><line class="atlas-svg__edge" x1="408.0" y1="126.0" x2="736.0" y2="70.0"/><line class="atlas-svg__edge atlas-svg__edge--main" x1="432.0" y1="574.0" x2="688.0" y2="462.0"/><line class="atlas-svg__edge" x1="432.0" y1="574.0" x2="608.0" y2="630.0"/><line class="atlas-svg__edge atlas-svg__edge--main" x1="640.0" y1="238.0" x2="936.0" y2="168.0"/><line class="atlas-svg__edge atlas-svg__edge--main" x1="640.0" y1="238.0" x2="960.0" y2="392.0"/><line class="atlas-svg__edge atlas-svg__edge--main" x1="688.0" y1="462.0" x2="960.0" y2="392.0"/><line class="atlas-svg__edge" x1="688.0" y1="462.0" x2="992.0" y2="588.0"/><line class="atlas-svg__edge" x1="736.0" y1="70.0" x2="936.0" y2="168.0"/><line class="atlas-svg__edge" x1="608.0" y1="630.0" x2="992.0" y2="588.0"/><line class="atlas-svg__edge atlas-svg__edge--main" x1="936.0" y1="168.0" x2="1248.0" y2="280.0"/><line class="atlas-svg__edge atlas-svg__edge--main" x1="960.0" y1="392.0" x2="1248.0" y2="280.0"/><line class="atlas-svg__edge" x1="960.0" y1="392.0" x2="1280.0" y2="490.0"/><line class="atlas-svg__edge atlas-svg__edge--main" x1="992.0" y1="588.0" x2="1280.0" y2="490.0"/><line class="atlas-svg__edge" x1="936.0" y1="168.0" x2="1528.0" y2="196.0"/><line class="atlas-svg__edge atlas-svg__edge--main" x1="1248.0" y1="280.0" x2="1488.0" y2="364.0"/><line class="atlas-svg__edge atlas-svg__edge--main" x1="1280.0" y1="490.0" x2="1488.0" y2="364.0"/><line class="atlas-svg__edge" x1="1248.0" y1="280.0" x2="1528.0" y2="196.0"/><line class="atlas-svg__edge" x1="1280.0" y1="490.0" x2="1472.0" y2="560.0"/><line class="atlas-svg__edge" x1="1488.0" y1="364.0" x2="1528.0" y2="196.0"/><line class="atlas-svg__edge" x1="1488.0" y1="364.0" x2="1472.0" y2="560.0"/><circle class="atlas-svg__node atlas-svg__node--t0" cx="88.0" cy="322.0" r="14.4"/><circle class="atlas-svg__node atlas-svg__node--t0" cx="136.0" cy="518.0" r="12.0"/><circle class="atlas-svg__node atlas-svg__node--t0" cx="192.0" cy="182.0" r="15.6"/><circle class="atlas-svg__node atlas-svg__node--t1" cx="352.0" cy="364.0" r="21.6"/><circle class="atlas-svg__node atlas-svg__node--t1" cx="408.0" cy="126.0" r="18.0"/><circle class="atlas-svg__node atlas-svg__node--t1" cx="432.0" cy="574.0" r="19.2"/><circle class="atlas-svg__node atlas-svg__node--t2" cx="640.0" cy="238.0" r="31.2"/><circle class="atlas-svg__node atlas-svg__node--t2" cx="688.0" cy="462.0" r="27.6"/><circle class="atlas-svg__node atlas-svg__node--t1" cx="608.0" cy="630.0" r="16.8"/><circle class="atlas-svg__node atlas-svg__node--t1" cx="736.0" cy="70.0" r="15.6"/><circle class="atlas-svg__node atlas-svg__node--t1" cx="936.0" cy="168.0" r="22.8"/><circle class="atlas-svg__node atlas-svg__node--t2" cx="960.0" cy="392.0" r="33.6"/><circle class="atlas-svg__node atlas-svg__node--t1" cx="992.0" cy="588.0" r="20.4"/><circle class="atlas-svg__node atlas-svg__node--t2" cx="1248.0" cy="280.0" r="26.4"/><circle class="atlas-svg__node atlas-svg__node--t1" cx="1280.0" cy="490.0" r="18.0"/><circle class="atlas-svg__node atlas-svg__node--t2" cx="1488.0" cy="364.0" r="38.4"/><circle class="atlas-svg__node atlas-svg__node--t0" cx="1528.0" cy="196.0" r="14.4"/><circle class="atlas-svg__node atlas-svg__node--t0" cx="1472.0" cy="560.0" r="13.2"/></svg></div>
+        </div>
+      </div>
+      <ol class="forecast-track" id="forecastTrack"><li class="forecast"><article class="forecast__card"><span class="ev-badge ev-forecast">전망</span><time class="forecast__year" datetime="2010">2010</time><h3 class="forecast__title">『2020 부의 전쟁 <span lang="en">in Asia</span>』 전망</h3><p class="forecast__summary">2010년 저서에서 2020년경 '한국판 잃어버린 10년' 가능성과 함께, 소유에서 접속으로의 경제·공급자에서 생태계로의 비즈니스 전환, 지식·소프트웨어가 하드웨어의 운명을 좌우하는 변화를 전망</p><p class="forecast__note">적중 단정 아님 — 저서·시점 기록</p><p class="forecast__source"><span class="forecast__source-label">저서 원문</span><a class="book-link" href="https://product.kyobobook.co.kr/detail/S000001523183" target="_blank" rel="noopener" aria-label="2020 부의 전쟁 in Asia — 저서에서 보기(새 창)">저서에서 보기 <span class="arr" aria-hidden="true">→</span></a></p></article></li><li class="forecast"><article class="forecast__card"><span class="ev-badge ev-forecast">전망</span><time class="forecast__year" datetime="2013">2013</time><h3 class="forecast__title">『2030 대담한 미래』 전망</h3><p class="forecast__summary">2013년 저서에서 제2의 외환위기 및 대기업 위기 가능성을 전망</p><p class="forecast__note">적중 단정 아님 — 저서·시점 기록</p><p class="forecast__source"><span class="forecast__source-label">저서 원문</span><a class="book-link" href="https://www.aladin.co.kr/shop/wproduct.aspx?ItemId=29267059" target="_blank" rel="noopener" aria-label="2030 대담한 미래 — 저서에서 보기(새 창)">저서에서 보기 <span class="arr" aria-hidden="true">→</span></a></p></article></li><li class="forecast"><article class="forecast__card"><span class="ev-badge ev-forecast">전망</span><time class="forecast__year" datetime="2023">2023</time><h3 class="forecast__title">『2050 미중패권전쟁』 전망</h3><p class="forecast__summary">2023년 저서에서 미·중 패권전쟁의 향방과 세계경제 시나리오를 전망</p><p class="forecast__note">적중 단정 아님 — 저서·시점 기록</p><p class="forecast__source"><span class="forecast__source-label">저서 원문</span><a class="book-link" href="https://www.aladin.co.kr/shop/wproduct.aspx?ItemId=309647341" target="_blank" rel="noopener" aria-label="2050 미중패권전쟁 — 저서에서 보기(새 창)">저서에서 보기 <span class="arr" aria-hidden="true">→</span></a></p></article></li><li class="forecast"><article class="forecast__card"><span class="ev-badge ev-forecast">전망</span><time class="forecast__year" datetime="2025">2025</time><h3 class="forecast__title">『2026 세계 경제 시나리오』 전망</h3><p class="forecast__summary">2025년 저서에서 AI 버블 붕괴 가능성과 2026년 '자산 재편'·경기침체 시나리오를 전망</p><p class="forecast__note">적중 단정 아님 — 저서·시점 기록</p><p class="forecast__source"><span class="forecast__source-label">저서 원문</span><a class="book-link" href="https://www.aladin.co.kr/shop/wproduct.aspx?ItemId=376975301" target="_blank" rel="noopener" aria-label="2026 세계 경제 시나리오 — 저서에서 보기(새 창)">저서에서 보기 <span class="arr" aria-hidden="true">→</span></a></p></article></li></ol>
+    </div>
+  </section>
+
+  <!-- ★R13 미래학 메인 진입(VALUE 라운드·2026-06-08): insights.html 미래학 4섹션(LIVE·환각0 검증)으로 앵커 티저.
+       ★새 주장/사실 0=검증된 내용만 surface·박사님 framing 톤·검증메모 준수. eval LOCKED 무접촉·기존 14축 무회귀
+       (앵커 링크=고유 서술 accessible-name[linkPurpose]·영문 lang 태깅[langParts]·JSON-LD 무변경[sdDepth]·신규 CSS 0).
+       forecastTrack 4카드 무접촉(nojs forecastCardsExactly:4 hard gate). -->
+  <section class="section" id="futures-intro" aria-labelledby="fi-h">
+    <div class="wrap">
+      <header class="section-head reveal">
+        <p class="kicker" lang="en">WHAT IS FUTURES STUDIES</p>
+        <h2 id="fi-h" data-i18n-html="hm-fi-h">미래는 어떻게 읽는가</h2>
+        <p class="section-lede measure" data-i18n-html="hm-fi-lede">위 전망들은 점을 친 결과가 아닙니다. 미래학은 미래를 ‘맞히는’ 학문이 아니라, 더 나은 미래를 위해 여러 갈래의 가능성을 근거 위에서 연구하는 학문입니다. 그 정의와 방법, 세계 지형을 미래통찰에서 더 깊이 만나보실 수 있습니다.</p>
+      </header>
+      <div class="topic-cards reveal">
+        <article class="topic-card">
+          <span class="en" lang="en">FUTURES STUDIES</span>
+          <h3 data-i18n-html="hm-tc1-h">미래학이란</h3>
+          <p data-i18n-html="hm-tc1-p">점술이 아니라 학문입니다. 예언과 예측의 차이, 그리고 ‘네 갈래의 미래’를 살펴봅니다.</p>
+          <a class="book-link" href="pages/insights.html#futures-studies" data-i18n-html="hm-tc1-link">미래학이란 보기 <span class="arr" aria-hidden="true">→</span></a>
+        </article>
+        <article class="topic-card">
+          <span class="en" lang="en">METHODS</span>
+          <h3 data-i18n-html="hm-tc2-h">미래예측 기법</h3>
+          <p data-i18n-html="hm-tc2-p">환경 스캐닝(<span lang="en">STEEPS</span>)부터 시나리오·델파이까지, 미래를 읽는 일곱 단계.</p>
+          <a class="book-link" href="pages/insights.html#methods-intro" data-i18n-html="hm-tc2-link">미래예측 기법 보기 <span class="arr" aria-hidden="true">→</span></a>
+        </article>
+        <article class="topic-card">
+          <span class="en" lang="en">APPROACH</span>
+          <h3 data-i18n-html="hm-tc3-h">근거 위의 미래예측</h3>
+          <p data-i18n-html="hm-tc3-p">적중 주장이 아니라 검증할 수 있는 방법과 기록. 휴스턴대 미래학 계보 위에 섭니다.</p>
+          <a class="book-link" href="pages/insights.html#approach" data-i18n-html="hm-tc3-link">미래예측 역량 보기 <span class="arr" aria-hidden="true">→</span></a>
+        </article>
+        <article class="topic-card">
+          <span class="en" lang="en">LANDSCAPE</span>
+          <h3 data-i18n-html="hm-tc4-h">세계 미래학의 지형</h3>
+          <p data-i18n-html="hm-tc4-p">휴스턴대·밀레니엄 프로젝트 등 세계의 미래학 학교·기관과 입문 학습자료를 안내합니다.</p>
+          <a class="book-link" href="pages/insights.html#world-map" data-i18n-html="hm-tc4-link">세계 지형 보기 <span class="arr" aria-hidden="true">→</span></a>
+        </article>
+      </div>
+      <div class="section-foot"><a class="btn btn-ghost" href="pages/insights.html" data-i18n-html="hm-fi-foot">미래통찰 전체 보기 →</a></div>
+    </div>
+  </section>
+
+  <!-- BOOKS (JS render) -->
+  <section class="section section-alt" id="books">
+    <div class="wrap">
+      <header class="section-head reveal">
+        <p class="kicker" lang="en">BOOKS</p>
+        <h2>저서</h2>
+        <p class="section-lede measure">그 전망들은 미래·경제·지정학·기술 분야 저서에 기록으로 남았습니다. 일부는 중국·일본에서 번역 출간되었습니다.</p>
+      </header>
+      <!-- R9 no-JS/data-fail fallback(codex item1#3): 대표 dated 저서 정적(SOT=forecast/JSON-LD 동일·환각0)·★main.js가 featured 그리드로 innerHTML 교체(JS 성공시 대체)·data/JS 실패시 신뢰근거(저서+원문 링크) 보존. 기존 skeleton 로딩 대체. -->
+      <div class="books-grid" id="booksGrid" aria-live="polite">
+        <article class="book"><h3 class="book-title">2030 대담한 미래</h3><p class="book-meta"><time class="en" lang="en">2013</time></p><a class="book-link" href="https://www.aladin.co.kr/shop/wproduct.aspx?ItemId=29267059" target="_blank" rel="noopener" aria-label="2030 대담한 미래 — 서점에서 보기(새 창)">서점에서 보기 <span class="arr" aria-hidden="true">→</span></a></article>
+        <article class="book"><h3 class="book-title">2050 미중패권전쟁</h3><p class="book-meta"><time class="en" lang="en">2023</time></p><a class="book-link" href="https://www.aladin.co.kr/shop/wproduct.aspx?ItemId=309647341" target="_blank" rel="noopener" aria-label="2050 미중패권전쟁 — 서점에서 보기(새 창)">서점에서 보기 <span class="arr" aria-hidden="true">→</span></a></article>
+        <article class="book"><h3 class="book-title">2026 세계 경제 시나리오</h3><p class="book-meta"><time class="en" lang="en">2025</time></p><a class="book-link" href="https://www.aladin.co.kr/shop/wproduct.aspx?ItemId=376975301" target="_blank" rel="noopener" aria-label="2026 세계 경제 시나리오 — 서점에서 보기(새 창)">서점에서 보기 <span class="arr" aria-hidden="true">→</span></a></article>
+        <article class="book"><h3 class="book-title">2020 부의 전쟁 <span lang="en">in Asia</span></h3><p class="book-meta"><time class="en" lang="en">2010</time></p><a class="book-link" href="https://product.kyobobook.co.kr/detail/S000001523183" target="_blank" rel="noopener" aria-label="2020 부의 전쟁 in Asia — 서점에서 보기(새 창)">서점에서 보기 <span class="arr" aria-hidden="true">→</span></a></article>
+      </div>
+      <div class="section-foot"><a class="btn btn-ghost" href="pages/books.html">전체 저서 보기 →</a></div>
+    </div>
+  </section>
+
+  <!-- MEDIA (JS render) — R4 U3-A: S5 proof를 S4 offer 앞으로 재배치(proof→offer 절정·master 승인). section-alt→section(alternation 유지). -->
+  <section class="section" id="media">
+    <div class="wrap">
+      <header class="section-head reveal">
+        <p class="kicker" lang="en">MEDIA &amp; RECORD</p>
+        <h2>언론 · 실적</h2>
+        <p class="section-lede measure">저서와 분석은 주요 언론에 다수 보도되었고, 여러 도서가 서점 베스트셀러 상위에 올랐습니다.</p>
+      </header>
+      <!-- C3 대표 보도 인용(md-09 SITE_DATA media SOT verbatim·환각0·design .press-quote) -->
+      <blockquote class="press-quote reveal">
+        <p class="press-quote__mark">“아시아가 새 금융위기 근원지 될 수도”</p>
+        <cite class="press-quote__cite">동아비즈니스리뷰(DBR), 2013</cite>
+      </blockquote>
+      <!-- S5 PRESS 마퀴 — SITE_DATA.media distinct source verbatim(실출처만·로고이미지0·환각0). JS 렌더(main.js renderPressMarquee).
+           정적/reduced/no-JS=track wrap 전체가시(info100%). 모션 시 일시정지 버튼(WCAG 2.2.2 키보드/터치) + reduced-motion 정지 + focus-within 정지. -->
+      <div class="press-marquee" role="group" aria-label="언론·서점 보도 출처">
+        <button type="button" class="press-marquee__toggle" id="pressToggle" aria-pressed="false">출처 흐름 일시정지</button>
+        <div class="press-marquee__viewport">
+          <!-- 정적 실출처(content 미디어 SOT verbatim·로고0·환각0) — no-JS/noscript도 info100%. JS는 복제+애니만. -->
+          <div class="press-marquee__track" id="pressTrack"><span class="press-source">교보문고</span><span class="press-source">YES24</span><span class="press-source">인터파크</span><span class="press-source">아마존 재팬</span><span class="press-source">매일경제</span><span class="press-source">조선닷컴</span><span class="press-source">동아비즈니스리뷰(DBR)</span><span class="press-source">중앙선데이</span><span class="press-source">조선일보</span><span class="press-source">중앙일보</span><span class="press-source">동아일보</span><span class="press-source">한국경제</span><span class="press-source">문화일보</span><span class="press-source">전자신문</span><span class="press-source">헤럴드경제</span><span class="press-source">한국일보</span></div>
+        </div>
+      </div>
+      <!-- R9 no-JS/data-fail fallback(codex item1#3): 위 press-quote·press-marquee(출처 16)가 정적 신뢰근거. 상세 보도/실적 카드는 main.js innerHTML 렌더(JS 성공시 교체·실패시 본 안내+위 정적 출처 유지). media item 라벨=content SOT(하드코딩 회피·환각0). -->
+      <div class="media-grid" id="mediaGrid" aria-live="polite">
+        <p class="loading">주요 언론 보도와 서점 베스트셀러 실적은 <a href="pages/media.html">언론·실적 페이지</a>에서 1차 증거(캡처·보도 스캔)로 확인하실 수 있습니다.</p>
+      </div>
+      <div class="section-foot"><a class="btn btn-ghost" href="pages/media.html">언론·실적 전체 보기 →</a></div>
+    </div>
+  </section>
+
+  <!-- BROADCAST·LECTURES·COLUMNS (★메인노출 보강 2026-06-07 박사님 지적: 유튜브·강연·칼럼 메인 0 노출 시정 — master 디스패치 + gemini 디자인리뷰 YES[위치·bg 전략 타당·Proof Block 강화]). 위치=#media(언론 proof) 직후·#speaking(alt=offer 전환 마킹) 직전=proof 연속존(class=section 동일 bg 인접 의도·S2 무게중심/thesis 척추 무접촉). 전 항목=_round/MEDIA_SPEAKING_CANDIDATES.md J/K/L/M절 4자 VERIFIED verbatim·중립표기(denylist 0)·조회수=YouTube 1차출처 curl 실측(2026-06 기준)·교회용0·codex trim 준수(GMC2019 리프킨 '화상'·구미 '차례로 강연 후 토론'). -->
+  <section class="section" id="appearances" aria-labelledby="appearances-h">
+    <div class="wrap">
+      <header class="section-head reveal">
+        <p class="kicker" lang="en">BROADCAST · LECTURES · COLUMNS</p>
+        <h2 id="appearances-h">방송 · 강연 · 칼럼</h2>
+        <p class="section-lede measure">방송·유튜브 출연과 공개 강연, 신문 연재까지 — 전망을 말한 시점과 출처를 모두 공개합니다.</p>
+      </header>
+      <div class="topic-cards">
+        <article class="topic-card reveal">
+          <span class="en" lang="en">01</span>
+          <h3>방송 · 유튜브 출연</h3>
+          <ul class="fact-list">
+            <li>MKTV 김미경TV 『드림머니』 — 금융시장 전망 · <time>2019</time> · 조회 약 272만 회</li>
+            <li>신사임당 — 부동산 시장 전망 · <time>2020</time> · 조회 약 63만 회</li>
+            <li>KBS 1TV 『빅체인지 2030』 3편 출연 · <time>2022-12-18</time> 방영</li>
+            <li>KBS 1TV 『아침마당』 신년특집 출연 · <time>2015-01-02</time></li>
+          </ul>
+          <a class="book-link" href="pages/media.html#broadcast">방송·유튜브 출연 약 110편 전체 보기 <span class="arr" aria-hidden="true">→</span></a>
+        </article>
+        <article class="topic-card reveal">
+          <span class="en" lang="en">02</span>
+          <h3>주요 공개 강연</h3>
+          <ul class="fact-list">
+            <li>구미시 ‘기술과 인간 국제포럼 2021’ — 세바스찬 스런(前 구글 부사장)과 차례로 강연 후 토론</li>
+            <li>그랜드마스터클래스 2019 — 제레미 리프킨(화상)·이어령 등과 연사 참여</li>
+            <li>한국정보산업연합회(FKII) 디지털 리더십 포럼 조찬강연 · <time>2024</time></li>
+          </ul>
+          <a class="book-link" href="pages/speaking.html#lectures">공개 강연 전체 보기 <span class="arr" aria-hidden="true">→</span></a>
+        </article>
+        <article class="topic-card reveal">
+          <span class="en" lang="en">03</span>
+          <h3>칼럼 · 기고</h3>
+          <ul class="fact-list">
+            <li>전자신문 연재 『최윤식의 부의 미래』 · <time>2010</time></li>
+            <li>전자신문 연재 『미래칼럼』 · <time>2010</time>~<time>2011</time></li>
+            <li>동아일보 특별기고 “2020년, 대변혁기를 대비하라” · <time>2014</time></li>
+          </ul>
+          <a class="book-link" href="pages/insights.html#columns">칼럼 · 기고 전체 보기 <span class="arr" aria-hidden="true">→</span></a>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <!-- SPEAKING — R4 U3-A: offer 절정(media proof 뒤·순서 S2→S3→S5→S4→S6→S7). section→section-alt(alternation 유지). C1 you-lede(D-B .em 재사용). -->
+  <section class="section section-alt" id="speaking">
+    <div class="wrap speaking-grid">
+      <div class="reveal">
+        <p class="kicker" lang="en">SPEAKING &amp; CONSULTING</p>
+        <h2 data-i18n="강연·자문">강연·자문</h2>
+        <p class="section-lede" data-i18n-html="hm-sp-lede">당신의 조직이 마주할 위기를 피하고 기회를 먼저 잡도록, 미래 시나리오와 전략을 함께 <em class="em">준비</em>합니다.</p>
+        <!-- D-A 자문 trust strip — ★R10 substance(박사님 자료 2026-06-07 verified: 강의용 docx·이력서 pdf·박사님 Q1 진술). flagship 2(삼성 DMC AI·로봇 2년 자문·SK 미래반도체)+역임 직책+marquee 대표명(이력서 검증·NDA 균형: 대표명만·나머지 일반화). 근거=_round/SUBSTANCE_SOT.md·환각0. credential chips=__item(styled). -->
+        <div class="advisory-trust">
+          <p class="advisory-trust__label" data-i18n-html="hm-sp-trust-label">대기업·정부기관의 미래전략을 자문해 왔습니다.</p>
+          <ul class="advisory-trust__list">
+            <li class="advisory-trust__item" data-i18n-html="hm-sp-tr1">삼성전자 DMC 연구소 — AI·로봇 2년 자문 (자문교수 역임)</li>
+            <li class="advisory-trust__item" data-i18n-html="hm-sp-tr2">SK — 미래 반도체 자문 (역임)</li>
+            <li class="advisory-trust__item" data-i18n-html="hm-sp-tr3">미래창조과학부 미래준비위원회 위원 (역임)</li>
+            <li class="advisory-trust__item" data-i18n-html="hm-sp-tr4">한국뉴욕주립대(SUNY Korea) 미래연구원장 (2013~2016 역임)</li>
+            <li class="advisory-trust__item" data-i18n-html="hm-sp-tr5">세계전문미래학자협회(APF) 운영이사 (2021~2022 역임)</li>
+            <li class="advisory-trust__item" data-i18n-html="hm-sp-tr6">IBM · Microsoft · 현대기아차 · LG · 포스코 · 네이버 · KT 외 국내외 대기업·정부기관 다수</li>
+          </ul>
+        </div>
+        <p class="topic-intro" data-i18n-html="hm-sp-topic-intro">당신의 조직이 다음을 미리 준비하도록 돕습니다 ―</p>
+        <ul class="topic-list">
+          <li data-i18n-html="hm-sp-tl1">세계 경제의 구조 전환과 복합위기 시나리오</li>
+          <li data-i18n-html="hm-sp-tl2">미·중 패권 경쟁과 한반도 지정학 리스크</li>
+          <li data-i18n-html="hm-sp-tl3">AI·반도체가 바꾸는 산업 지형과 한국의 기회</li>
+          <li data-i18n-html="hm-sp-tl4">국가·기업의 장기 미래전략과 위기관리</li>
+          <li data-i18n-html="hm-sp-tl5">전문 미래학의 예측 방법론 — 시나리오·환경 스캐닝</li>
+        </ul>
+        <a class="btn btn-cta" href="#contact"><span data-i18n="강연·자문 문의">강연·자문 문의</span> <span class="arr" aria-hidden="true">→</span></a>
+      </div>
+      <aside class="method-box reveal" aria-label="방법론">
+        <h3 data-i18n-html="method-prep-h">예측이 아니라 준비입니다</h3>
+        <p data-i18n-html="method-prep-p">하나의 정해진 미래를 맞히는 일이 아니라, ‘잘 알려진 미래’와 ‘가능성 있는 미래’를 함께 그리고 ‘선호하는 미래’를 향해 더 나은 선택을 준비하는 일입니다.</p>
+      </aside>
+    </div>
+  </section>
+
+  <!-- AI VIRTUAL LAB (신규 expertise 섹션·R9 4지시③·arc=S4 강연·자문 뒤·master GO). content SOT verbatim 3문장(톤 추진·과장0·운영/완성 단정0). design brutalist treatment(.ai-lab 2×2 카드·thematic home·BEM 선-핑 승인). ARP ready:false placeholder(NotebookLM 0건). -->
+  <section class="section ai-lab" id="ai-lab" aria-labelledby="ai-lab-h">
+    <div class="wrap">
+      <header class="section-head reveal">
+        <p class="kicker" lang="en">AI VIRTUAL LAB</p>
+        <h2 id="ai-lab-h" data-i18n-html="hm-ailab-h">AI 가상연구소 자동화</h2>
+        <p class="section-lede measure" data-i18n-html="hm-ailab-lede1">AI 가상미래연구소·AI 가상경영연구소·AI 가상경제연구소·AI 가상금융투자연구소의 자동화를 추진합니다. 미래학과 AI 자동화를 결합한 새로운 영역입니다. 미래예측·연구 과정을 AI로 자동화하는 시스템을 직접 개발하고 있습니다.</p>
+        <p class="section-lede measure" data-i18n-html="hm-ailab-lede2">지식과 예측 기법을 AI에 학습시켜, AI가 스스로 자료를 수집하고 시나리오를 도출하도록 설계합니다. 방대한 논문과 데이터를 리서치·분석해 미래 시나리오와 예측 원고를 만들어내는 것을 목표로 합니다. 사람의 연구를 돕는 도구를 넘어, 지식 생산 과정 자체를 다시 설계하려는 시도입니다.</p>
+      </header>
+      <ul class="ai-lab__list reveal">
+        <li class="ai-lab__item"><h3 data-i18n-html="hm-ailab-1">AI 가상미래연구소</h3></li>
+        <li class="ai-lab__item"><h3 data-i18n-html="hm-ailab-2">AI 가상경영연구소</h3></li>
+        <li class="ai-lab__item"><h3 data-i18n-html="hm-ailab-3">AI 가상경제연구소</h3></li>
+        <li class="ai-lab__item"><h3 data-i18n-html="hm-ailab-4">AI 가상금융투자연구소</h3></li>
+      </ul>
+      <p class="ai-lab__arp" data-ready="false" data-i18n-html="hm-ailab-arp">ARP — 개발 중</p>
+      <figure class="ai-lab__mockup reveal">
+        <img src="./assets/arp-dashboard-mockup-DTnC2mFj.webp" alt="개발 중 ARP 대시보드 목업" width="1000" height="1735" loading="lazy" decoding="async">
+        <figcaption class="ai-lab__mockup-label" data-i18n-html="hm-ailab-cap"><span lang="en">ARP</span> 관제탑 <span lang="en">DEMO</span> · 개발 중(<span lang="en">preview</span>)</figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <!-- C2 자문 사례(consulting-cases·ready:false 빈샘플·R9 4지시③ phase1·S4 인접 cluster). content §6: 서비스 범주=SOT-안전(R4)·기업명/결과=날조0(예시 골격만). design .sample-badge dashed=draft. 실배포 전 박사님 자료·동의 후 게재. -->
+
+
+  <!-- ABOUT -->
+  <section class="section" id="about">
+    <div class="wrap about-grid">
+      <figure class="about-portrait reveal">
+        <!-- ★RSI R2 resource: cwebp 변환(724KB jpg→61/130KB webp·실사진 변형0)·jpg fallback 보존 -->
+        <picture>
+          <source type="image/webp" srcset="./assets/profile-portrait-480-4CVZ4scR.webp 480w, ./assets/profile-portrait-800-kxKluVqH.webp 800w" sizes="(max-width:768px) 92vw, 480px">
+          <img src="./assets/profile-portrait-DzQKnUlB.jpg" alt="미래학자 최윤식" width="480" height="600" loading="lazy" decoding="async">
+        </picture>
+      </figure>
+      <div class="reveal">
+        <p class="kicker" lang="en">ABOUT</p>
+        <h2 data-i18n="최윤식">최윤식</h2>
+        <p class="about-lede measure" data-i18n-html="hm-ab-lede">휴스턴대학교(<span lang="en">University of Houston Clear Lake</span>)에서 미래학을 전공한 전문 미래학자이자 AI 전략 컨설턴트. <strong>아시아미래인재연구소</strong>(2003년 설립, 민간 미래학 연구소) 소장입니다. 세계전문미래학자협회(APF) 운영이사를 역임했습니다.</p>
+        <div class="about-cols">
+          <div>
+            <h3 class="about-h" data-i18n="학력">학력</h3>
+            <ul class="fact-list">
+              <li data-i18n-html="hm-ab-edu1"><span lang="en">University of Houston Clear Lake</span> 미래학 석사</li>
+              <li data-i18n-html="hm-ab-edu2"><span lang="en">University of Phoenix</span> 경영학 박사</li>
+              <li data-i18n-html="hm-ab-edu3">세계미래학회·APF를 이끈 미래학자들에게 <em class="em">직접 사사</em></li>
+            </ul>
+          </div>
+          <div>
+            <h3 class="about-h" data-i18n="주요 경력">주요 경력</h3>
+            <ul class="fact-list">
+              <li data-i18n-html="hm-ab-car1">삼성전자 DMC 연구소 자문교수 (역임)</li>
+              <li data-i18n-html="hm-ab-car2">한국뉴욕주립대(SUNY Korea) 미래연구원장 (2013~2016 역임)</li>
+              <li data-i18n-html="hm-ab-car3">미래창조과학부 미래준비위원회 위원 (역임)</li>
+              <li data-i18n-html="hm-ab-car4">주요 대기업 미래전략 자문</li>
+            </ul>
+          </div>
+        </div>
+        <p class="about-voice" data-i18n-html="hm-ab-voice">미래는 운명이 아니라 <em class="em">준비</em>입니다. 더 나은 미래를 준비하도록 돕는 일을 소명으로 삼아 왔습니다.</p>
+        <p><a class="book-link" href="pages/about.html#greeting" data-i18n-html="hm-ab-more">인사말 더 보기 <span class="arr" aria-hidden="true">→</span></a></p>
+      </div>
+    </div>
+  </section>
+
+  <!-- CONTACT -->
+  <section class="section section-cta" id="contact">
+    <div class="wrap contact-grid">
+      <div class="reveal">
+        <p class="kicker" lang="en">CONTACT</p>
+        <h2 data-i18n-html="hm-ct-h">강연·자문을 의뢰하시려면</h2>
+        <p class="section-lede measure" data-i18n-html="hm-ct-lede">행사·강연·기업 자문 문의를 남겨 주시면 빠르게 회신드리겠습니다.</p>
+        <p class="contact-youline" data-i18n-html="hm-ct-youline">당신의 다음 10년을, 함께 <em class="em">준비</em>하겠습니다.</p>
+        <ul class="contact-assurance">
+          <li class="contact-assurance__item" data-i18n-html="hm-ct-as1">강연 섭외</li>
+          <li class="contact-assurance__item" data-i18n-html="hm-ct-as2">기업 미래전략 자문</li>
+          <li class="contact-assurance__item" data-i18n-html="hm-ct-as3">미래예측 교육</li>
+        </ul>
+        <!-- R9 #4 no-JS/mailto-fail fallback(codex item1#4): 폼은 JS로 mailto 구성→JS/mail앱 미동작 시 직접 이메일=★항상 가시(no-JS 도달·email SOT nobody@example.com). -->
+        <p class="contact-direct" data-i18n-html="hm-ct-direct">메일 폼이 열리지 않으면 직접 이메일로 보내 주세요 — <a href="mailto:nobody@example.com" lang="en">nobody@example.com</a></p>
+        <!-- G2 이전(OB-544-03 구 공식 연락처 verbatim·원문 앵커 속성열 그대로·신 연락처 병존 · 박사님 사후 평가 대상(G2·CEO 집행지시 2026-07-07)) -->
+        <p class="contact-legacy" lang="en"><a href="mailto:cysinsight@gmail.com" target="_blank" rel="noopener" title="">cysinsight@gmail.com</a><br>010-3444-0910</p>
+      </div>
+      <form class="contact-form reveal" id="contactForm" novalidate>
+        <div class="field">
+          <label for="cf-name" data-i18n-html="hm-ct-lbl-name">이름 <span class="req" aria-hidden="true">*</span></label>
+          <input id="cf-name" name="name" type="text" required autocomplete="name" aria-describedby="err-name">
+          <span class="field-err" id="err-name" aria-live="polite" aria-atomic="true"></span>
+        </div>
+        <div class="field">
+          <label for="cf-org" data-i18n-html="hm-ct-lbl-org">소속</label>
+          <input id="cf-org" name="org" type="text" autocomplete="organization">
+        </div>
+        <div class="field">
+          <label for="cf-email" data-i18n-html="hm-ct-lbl-email">이메일 <span class="req" aria-hidden="true">*</span></label>
+          <input id="cf-email" name="email" type="email" required autocomplete="email" aria-describedby="err-email">
+          <span class="field-err" id="err-email" aria-live="polite" aria-atomic="true"></span>
+        </div>
+        <div class="field">
+          <label for="cf-type" data-i18n-html="hm-ct-lbl-type">문의 유형</label>
+          <select id="cf-type" name="type">
+            <option value="강연" data-i18n-html="hm-ct-opt1">강연 섭외</option>
+            <option value="자문" data-i18n-html="hm-ct-opt2">기업 자문</option>
+            <option value="기타" data-i18n-html="hm-ct-opt3">기타</option>
+          </select>
+        </div>
+        <div class="field field-full">
+          <label for="cf-msg" data-i18n-html="hm-ct-lbl-msg">내용 <span class="req" aria-hidden="true">*</span></label>
+          <textarea id="cf-msg" name="message" rows="4" required aria-describedby="err-msg"></textarea>
+          <span class="field-err" id="err-msg" aria-live="polite" aria-atomic="true"></span>
+        </div>
+        <button class="btn btn-cta btn-cta--invert" type="submit" data-i18n-html="hm-ct-submit">메일로 문의하기 <span class="arr" aria-hidden="true">→</span></button>
+        <p class="form-note" id="formNote" role="status"></p>
+      </form>
+    </div>
+  </section>
+
+</main>
+
+<footer class="site-footer" data-site-footer>
+  <!-- R9 no-JS resilience(codex item1#2): 정적 fallback footer. site-shell.js innerHTML 교체로 enhance(중복0). no-JS=email/링크 항상 접근. email SOT=nobody@example.com. -->
+  <div class="wrap footer-fallback">
+    <p class="footer-brand">최윤식 <span lang="en">· Futurist</span> · 아시아미래인재연구소</p>
+    <nav aria-label="사이트맵">
+      <a href="pages/about.html">연구소 소개</a> · <a href="pages/insights.html">미래통찰</a> · <a href="pages/speaking.html">강연·자문</a> · <a href="pages/books.html">출간 도서</a> · <a href="pages/media.html">미디어</a> · <a href="pages/academy.html">통찰아카데미</a> · <a href="pages/archive.html">자료실</a> · <a href="index.html#contact">문의</a>
+    </nav>
+    <p>문의: <a href="mailto:nobody@example.com" lang="en">nobody@example.com</a></p>
+    <p><small lang="en">© Choi Yoonsik. All rights reserved.</small></p>
+  </div>
+</footer>
+
+<!-- FOOTER-LEGAL: 사업자 법정 표기 (SOT=_round/migration/FOOTER_LEGAL_VERBATIM.txt · verbatim 불변·임의 교정 금지 · 법정 표기=번역 대상 아님→i18n 키 미부여 · [data-site-footer] 밖 형제 배치=site-shell.js innerHTML 교체(js/site-shell.js:245) 소실 방지) -->
+<aside class="site-legal" aria-label="사업자 정보">
+  <div class="wrap">
+    <p>2018 by 아시아미래연구소 | 아시아미래연구소 | 대표자: 최현식 | 사업자등록번호: 185-38-00094 / 주소: 경기도 용인시 기흥구 중부대로 579 508호 | 문의전화: 010-8233-2150 | 통신판매업 신고번호: 제 2020-서울강남-03560호</p>
+  </div>
+</aside>
+
+</body>
+</html>
