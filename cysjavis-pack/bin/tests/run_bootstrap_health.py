@@ -12805,7 +12805,7 @@ def h_w5_p3():
     def _dl_shadow(sd):
         rows = [e for e in _w5_ledger(sd) if "deadlock_shadow" in e]
         need(rows, "대장에 deadlock_shadow 기록이 없다(B-2: 판정과 멈춘 사유를 주기마다 남긴다)")
-        return [x for x in rows[-1]["deadlock_shadow"] if x.get("source") != "control"]
+        return [x for x in rows[-1]["deadlock_shadow"] if x.get("source") not in ("control", "lane")]   # 루트 레코드만
 
     def _no_page(r, what):
         need(not [e for e in r.enqueues if e[1] == "gate-deadlock"], "%s: 데드락 push 가 나갔다 %r" % (what, r.enqueues))

@@ -1429,6 +1429,174 @@ class DeadlockRootShadowTest(unittest.TestCase):
         self.assertEqual(got, sorted([(gone, "instrument_fail"), (os.path.abspath(self.tasks_dir), "would_fire")]))
         self.assert_never_paged(r, e)
 
+    # ── R2-m1: the cloud-folder check folds case where the filesystem does (macOS APFS default, Windows NTFS) ──
+    def test_m1_fold_flag_follows_the_platform(self):
+        self.assertEqual(G._CLOUD_PATH_FOLD, sys.platform == "darwin" or os.name == "nt")
+        # The Windows arm is checked here on every OS: the lanes that run this file are macOS and Ubuntu only.
+        cases = [("darwin", "posix"), ("win32", "nt"), ("linux", "posix"), ("cygwin", "posix")]
+        self.assertEqual([G._names_fold(*c) for c in cases], [True, True, False, False])
+
+    def test_m1_case_variant_cloud_path_is_excluded_where_names_fold(self):
+        from unittest import mock
+        home = os.path.expanduser("~")
+        variants = [os.path.join(home, "desktop", "CYSjavis", "_round", "tasks"),
+                    os.path.join(home, "DOCUMENTS", "w", "_round", "tasks"),
+                    os.path.join(home, "library", "mobile documents", "x"),
+                    os.path.join(home, "Library", "cloudstorage", "x"),
+                    os.path.join(home.upper(), "Desktop", "x")]
+        with mock.patch.object(G, "_CLOUD_PATH_FOLD", True):
+            for p in variants:
+                self.assertTrue(G.cloud_managed_path(p), p)
+            self.assertFalse(G.cloud_managed_path(os.path.join(home, "desktops", "x")), "a sibling is not the folder")
+        with mock.patch.object(G, "_CLOUD_PATH_FOLD", False):     # case-sensitive filesystem: ~/desktop is another folder
+            self.assertFalse(G.cloud_managed_path(variants[0]))
+            self.assertTrue(G.cloud_managed_path(os.path.join(home, "Desktop", "x")))
+
+    def test_m1_case_variant_root_is_not_read_through_the_gate(self):
+        from unittest import mock
+        desk = os.path.join(os.environ["HOME"], "desktop", "CYSjavis", "proj", "_round", "tasks")
+        self.write_ticket(desk, "T-D", scope=self.SCOPE)              # would fire if read
+        self.write_registry(desk)
+        with mock.patch.object(G, "_CLOUD_PATH_FOLD", True):
+            r, e = self.run_gate()
+        rec = self.shadow(e, "registry")[0]
+        self.assertEqual((rec["verdict"], rec["reason"]), ("unmeasured", "deadlock_unmeasured:root_icloud_not_read"))
+        self.assertEqual(rec["attributed"], 0)
+
+    # ── R2-m2: the lane is judged once across its roots - clause ② (no checkout anywhere for 30 min) is a lane fact ──
+    def lane(self, e):
+        recs = self.shadow(e, "lane")
+        self.assertEqual(len(recs), 1, "expected exactly one lane record: %r" % e.get("deadlock_shadow"))
+        return recs[0]
+
+    def two_roots(self, b_recent):
+        a = os.path.join(self.tmp, "wa", "_round", "tasks")
+        b = os.path.join(self.tmp, "wb", "_round", "tasks")
+        self.write_ticket(a, "T-A", scope=self.SCOPE)                 # unassigned and old: fires when read alone
+        if b_recent:                                                  # the classifying run is 300 s after this stamp
+            ts = time.strftime("%Y-%m-%dT%H:%M:%S+0000", time.gmtime(self.clock.epoch))
+            self.write_ticket(b, "T-B", scope=self.SCOPE, owner="worker", status="in_progress",
+                              created_at=ts, updated_at=ts)
+        else:
+            self.write_ticket(b, "T-B", scope=self.SCOPE, owner="worker", status="in_progress")
+        return a, b
+
+    def test_m2_recent_checkout_in_another_root_clears_the_lane(self):
+        a, b = self.two_roots(b_recent=True)
+        self.write_registry(a, b)
+        r, e = self.run_gate()
+        got = {x["root"]: (x["verdict"], x["reason"]) for x in self.shadow(e, "registry")}
+        self.assertEqual(got, {a: ("would_fire", "deadlock_yes"), b: ("no", "deadlock_no:no_unassigned_ticket")},
+                         "the per-root records (B-2) changed")
+        lane = self.lane(e)
+        self.assertEqual((lane["verdict"], lane["reason"]), ("no", "deadlock_no:recent_ticket_activity(300s)"))
+        self.assertEqual((lane["attributed"], lane["unattributed"], lane["foreign"]), (2, 0, 0))
+        self.assertIn("deadlock_shadow:would_fire=1,no=1,unmeasured=0,instrument_fail=0", e["reasons"],
+                      "the root counts must not include the lane record")
+        self.assertIn("deadlock_shadow_lane:no", e["reasons"])
+        self.assert_never_paged(r, e)
+
+    def test_m2_lane_without_activity_anywhere_would_fire(self):
+        a, b = self.two_roots(b_recent=False)
+        self.write_registry(a, b)
+        r, e = self.run_gate()
+        lane = self.lane(e)
+        self.assertEqual((lane["verdict"], lane["reason"]), ("would_fire", "deadlock_yes"))
+        self.assertIn("deadlock_shadow_lane:would_fire", e["reasons"])
+        self.assert_never_paged(r, e)
+
+    def test_m2_unread_root_refuses_a_lane_would_fire(self):
+        a, _ = self.two_roots(b_recent=False)
+        gone = os.path.join(self.tmp, "gone", "_round", "tasks")
+        self.write_registry(a, gone)
+        r, e = self.run_gate()
+        lane = self.lane(e)
+        self.assertEqual((lane["verdict"], lane["reason"]),
+                         ("unmeasured", "deadlock_unmeasured:lane_partial(1/2 roots unread)|deadlock_yes"))
+
+    def test_m2_unread_root_does_not_hide_activity_read_elsewhere(self):
+        a, b = self.two_roots(b_recent=True)
+        gone = os.path.join(self.tmp, "gone", "_round", "tasks")
+        self.write_registry(a, b, gone)
+        r, e = self.run_gate()
+        lane = self.lane(e)
+        self.assertEqual((lane["verdict"], lane["reason"]), ("no", "deadlock_no:recent_ticket_activity(300s)"))
+
+    def test_r2_partial_coverage_rule_is_an_allow_list(self):
+        held = ["deadlock_no:recent_ticket_activity(300s)", "deadlock_no:some_node_reported_recently",
+                "deadlock_unmeasured:set_status_age", "deadlock_instrument_fail:lane_raised:TypeError"]
+        refused = ["deadlock_yes", "deadlock_no:no_unassigned_ticket", "deadlock_no:a_reason_added_later"]
+        self.assertEqual([r for r in held if not G._lane_reason_holds_partially(r)], [])
+        self.assertEqual([r for r in refused if G._lane_reason_holds_partially(r)], [])
+
+    def test_m2_no_root_read_is_an_instrument_fail_or_unmeasured_lane(self):
+        r, e = self.run_gate()                                        # registry absent
+        lane = self.lane(e)
+        self.assertEqual((lane["verdict"], lane["reason"]), ("instrument_fail", "deadlock_instrument_fail:no_root_read"))
+        desk = os.path.join(os.environ["HOME"], "Desktop", "w", "_round", "tasks")
+        self.write_ticket(desk, "T-D", scope=self.SCOPE)
+        self.write_registry(desk)                                     # the only root is declined by policy
+        r, e = self.run_gate()
+        lane = self.lane(e)
+        self.assertEqual((lane["verdict"], lane["reason"]), ("unmeasured", "deadlock_unmeasured:no_root_read"))
+
+    def test_m2_lane_read_of_a_bad_stamp_is_an_instrument_fail_not_a_crash(self):
+        # Root B has no unassigned ticket, so its own judgement stops at clause ① and never parses its stamps. The
+        # lane judgement does: a non-string stamp raises TypeError in _parse_iso_epoch. That must not end the cycle.
+        a, _ = self.two_roots(b_recent=False)
+        b = os.path.join(self.tmp, "wb", "_round", "tasks")
+        self.write_ticket(b, "T-B", scope=self.SCOPE, owner="worker", status="in_progress",
+                          created_at=["bad"], updated_at={"bad": 1})
+        self.write_registry(a, b)
+        r, e = self.run_gate()
+        got = {x["root"]: x["verdict"] for x in self.shadow(e, "registry")}
+        self.assertEqual(got, {a: "would_fire", b: "no"})
+        lane = self.lane(e)
+        self.assertEqual((lane["verdict"], lane["reason"]),
+                         ("instrument_fail", "deadlock_instrument_fail:lane_raised:TypeError"))
+
+    def test_r1_bad_stamp_in_a_root_with_an_unassigned_ticket_fails_that_root_only(self):
+        a = os.path.join(self.tmp, "wa", "_round", "tasks")
+        c = os.path.join(self.tmp, "wc", "_round", "tasks")
+        self.write_ticket(a, "T-A", scope=self.SCOPE)
+        self.write_ticket(c, "T-C", scope=self.SCOPE, updated_at=["bad"])       # unassigned: its own judgement parses it
+        self.write_registry(a, c)
+        r, e = self.run_gate()
+        got = {x["root"]: (x["verdict"], x["reason"]) for x in self.shadow(e, "registry")}
+        self.assertEqual(got, {a: ("would_fire", "deadlock_yes"),
+                               c: ("instrument_fail", "deadlock_instrument_fail:root_raised:TypeError")})
+        self.assertNotEqual(e.get("verdict"), "FAILOPEN")
+
+    def test_r1_shadow_exception_does_not_fail_the_cycle_open(self):
+        # The shadow runs before the cycle's real routing. If it raised, the top-level fail-open caught it and that
+        # cycle routed no warning at all (deaths, ctx). It must be an instrument-fail record instead.
+        from unittest import mock
+        with mock.patch.object(G.Gate, "_deadlock_shadow", side_effect=RuntimeError("injected")):
+            r, e = self.run_gate()
+        self.assertNotEqual(e.get("verdict"), "FAILOPEN", e)
+        self.assertEqual([(x["source"], x["verdict"], x["reason"]) for x in e["deadlock_shadow"]],
+                         [("shadow", "instrument_fail", "deadlock_instrument_fail:shadow_raised:RuntimeError")])
+        self.assertIn("deadlock_instrument_fail:shadow_raised", e["reasons"])
+
+    def test_m2_failed_control_blinds_the_lane(self):
+        from unittest import mock
+        a, b = self.two_roots(b_recent=False)
+        self.write_registry(a, b)
+        with mock.patch.object(G, "deadlock_positive_control", create=True,
+                               return_value=(False, "deadlock_no:injected")):
+            r, e = self.run_gate()
+        lane = self.lane(e)
+        self.assertEqual(lane["verdict"], "instrument_fail")
+        self.assertEqual(lane["reason"], "deadlock_instrument_fail:control|deadlock_yes")
+
+    def test_m2_legacy_runner_lane_equals_its_single_source(self):
+        old = "2023-11-01T00:00:00+0000"
+        fr = FakeRunner(rep=self.stale, tasks=[{"id": "T-1", "status": "todo", "owner": None,
+                                                "created_at": old, "updated_at": old}])
+        r, e = self.run_gate(fr)
+        lane = self.lane(e)
+        self.assertEqual((lane["verdict"], lane["reason"]), ("would_fire", "deadlock_yes"))
+
     # ── D-c: an in-memory positive control every cycle; a control that does not fire blinds the verdict ──
     def test_dc_control_record_every_run(self):
         r, e = self.run_gate()

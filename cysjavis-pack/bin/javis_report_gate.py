@@ -135,14 +135,25 @@ TASK_ROOT_OVERRIDE_KEYS = ("JAVIS_TASK_ROOT", "CYS_TASK_ROOT", "JAVIS_ROOT")
 #   들어가는 심볼릭 링크와, 다른 경로로 옮겨진(OneDrive 리디렉션 등) Windows 바탕화면은 잡지 못한다.
 CLOUD_MANAGED_HOME_DIRS = ("Desktop", "Documents", os.path.join("Library", "Mobile Documents"),
                            os.path.join("Library", "CloudStorage"))
+# ★R2-m1: macOS 기본 APFS 와 Windows NTFS 는 이름을 대소문자 구분 없이 찾는다 — `~/desktop/…` 은 `~/Desktop` 과 같은
+#   폴더다(macOS 의 os.path.normcase 는 대소문자를 접지 않는다). 그 두 플랫폼에서는 접어서 비교한다(여전히 어휘만).
+#   실패 방향: 대소문자 구분 APFS 볼륨(선택 포맷)에서는 다른 폴더인 `~/desktop` 도 읽지 않는다 — 그 루트는 0 이 아니라
+#   unmeasured(`root_icloud_not_read`)로 남는다. 읽지 말아야 할 것을 읽는 쪽이 아니라 읽을 수 있는 것을 안 읽는 쪽이다.
+def _names_fold(platform, os_name):
+    """이 플랫폼의 기본 파일시스템이 이름의 대소문자를 접는가(순수 — Windows 갈래를 어느 OS 에서나 시험할 수 있게)."""
+    return platform == "darwin" or os_name == "nt"
+
+
+_CLOUD_PATH_FOLD = _names_fold(sys.platform, os.name)
 
 
 def cloud_managed_path(path):
     """경로가 클라우드 관리 홈 폴더(위 목록) 밑인가 — 순수 어휘 판정(파일시스템 호출 0)."""
+    fold = str.lower if _CLOUD_PATH_FOLD else str
     home = os.path.normpath(os.path.expanduser("~"))
-    p = os.path.normpath(os.path.abspath(path))
+    p = fold(os.path.normpath(os.path.abspath(path)))
     for d in CLOUD_MANAGED_HOME_DIRS:
-        top = os.path.join(home, d)
+        top = fold(os.path.join(home, d))
         if p == top or p.startswith(top + os.sep):
             return True
     return False
@@ -1515,6 +1526,15 @@ def deadlock_positive_control(now_epoch):
     return (warn is not None and reason == "deadlock_yes"), reason
 
 
+def _lane_reason_holds_partially(reason):
+    """R2-m2 — 읽지 못한 루트가 있어도 서는 레인 사유인가. **허용 목록**이다: 읽은 루트에서 찾은 활동(②의 반증),
+    노드 자기보고(③ — 레인 사실), 측정 불가·계기 고장(아무것도 주장하지 않는다). 그 밖의 사유(울림·미배정 없음,
+    그리고 술어가 앞으로 새로 낼 사유)는 전 범위를 요구한다고 보고 거절한다 — 새 사유가 조용히 통과하지 않게."""
+    r = str(reason)
+    return (r.startswith("deadlock_no:recent_ticket_activity") or r == "deadlock_no:some_node_reported_recently"
+            or r.startswith("deadlock_unmeasured:") or r.startswith("deadlock_instrument_fail:"))
+
+
 def shadow_verdict(reason):
     """술어 사유 → shadow 판정 enum(would_fire | no | unmeasured | instrument_fail)."""
     if reason == "deadlock_yes":
@@ -2137,10 +2157,16 @@ class Gate:
     def _deadlock_shadow(self, report, now_epoch):
         """0.14.56 SHADOW(CEO 4eeea43f Part B) — `(records, summary_reasons)`. ⛔ warn 을 만들지 않는다.
 
-        레코드 1건 = 출처×루트 1쌍 + 대조군 1건: `{source, root, verdict, reason, attributed, unattributed, foreign}`.
-        B-2: 판정만이 아니라 **멈춘 사유**를 쌍마다 싣는다(사유 없는 0 이 고치려는 결함 자체다).
+        레코드 1건 = 출처×루트 1쌍 + 대조군 1건 + 레인 1건: `{source, root, verdict, reason, attributed, unattributed,
+        foreign}`. B-2: 판정만이 아니라 **멈춘 사유**를 쌍마다 싣는다(사유 없는 0 이 고치려는 결함 자체다).
         D-d: 출처·루트를 읽지 못하면 instrument_fail 이지 no 가 아니다. D-c: 대조군이 울리지 않으면 그 주기의 모든
-        루트가 instrument_fail 이고, 루트 자신의 멈춘 사유는 `|` 뒤에 남는다."""
+        루트가 instrument_fail 이고, 루트 자신의 멈춘 사유는 `|` 뒤에 남는다.
+        ★R2-m2 레인 레코드(source=`lane`): ②항(30분간 어떤 노드도 checkout 하지 않았다)은 ③항처럼 **레인의** 사실이다 —
+        루트 B 에서 5분 전 checkout 이 있으면 루트 A 의 미배정 티켓이 늙어도 레인은 움직이고 있다. 그래서 레인은 읽은
+        모든 루트의 귀속 티켓을 합쳐 **한 번** 판정한다. 루트별 레코드는 루트 자기 자료만의 진단(B-2)으로 남고, paging 을
+        켤 때 쓸 판정은 레인 레코드다. 읽지 못한 루트가 하나라도 있으면 `_lane_reason_holds_partially` 의 허용 목록
+        (읽은 루트에서 찾은 활동 · 노드 자기보고 · 측정 불가/계기 고장)만 서고, 나머지(울림 = 어디에도 활동 없음 · 미배정
+        없음 = 어디에도 열린 티켓 없음 · 술어의 새 사유)는 unmeasured 로 거절한다 — 그 루트에 활동이나 티켓이 있을 수 있다."""
         ctl_ok, ctl_reason = deadlock_positive_control(now_epoch)
         records = [{"source": "control", "root": "<control>",
                     "verdict": "control_fired" if ctl_ok else "instrument_fail",
@@ -2168,6 +2194,7 @@ class Gate:
                 except Exception as e:          # noqa: BLE001
                     ok, rows, lerr = False, None, "task_list_raised:%s" % type(e).__name__
                 sources.append((src, root, ok, rows, lerr))
+        lane_att, unread = [], []
         for src, root, ok, rows, err in sources:
             rec = {"source": src, "root": root, "attributed": 0, "unattributed": 0, "foreign": 0}
             if not ok and str(err).startswith("unmeasured:"):
@@ -2179,17 +2206,46 @@ class Gate:
             else:
                 att, una, fgn = split_by_scope(rows, scope)
                 rec.update(attributed=len(att), unattributed=len(una), foreign=len(fgn))
-                _, reason = build_deadlock_warning(report, att, now_epoch)   # warn 객체는 버린다(라우팅 0)
+                lane_att.extend(att)
+                try:
+                    _, reason = build_deadlock_warning(report, att, now_epoch)   # warn 객체는 버린다(라우팅 0)
+                except Exception as e:          # noqa: BLE001 — 한 루트의 예외는 그 루트의 계기 고장이다(R1 반영)
+                    reason = "deadlock_instrument_fail:root_raised:%s" % type(e).__name__
                 rec.update(verdict=shadow_verdict(reason), reason=reason)
                 if not ctl_ok:
                     rec.update(verdict="instrument_fail",
                                reason="deadlock_instrument_fail:control|%s" % reason)
+            if not ok:
+                unread.append(rec["verdict"])
             records.append(rec)
         roots_only = records[1:]
         count = {v: sum(1 for x in roots_only if x["verdict"] == v)
                  for v in ("would_fire", "no", "unmeasured", "instrument_fail")}
+        lane = {"source": "lane", "root": "<lane>", "attributed": len(lane_att),
+                "unattributed": sum(x["unattributed"] for x in roots_only),
+                "foreign": sum(x["foreign"] for x in roots_only)}
+        if len(unread) == len(sources):
+            #   읽은 루트가 없다 — 전부 정책상 거절(iCloud)이면 선언된 한계, 하나라도 계기 고장이면 계기 고장.
+            if all(v == "unmeasured" for v in unread):
+                lane.update(verdict="unmeasured", reason="deadlock_unmeasured:no_root_read")
+            else:
+                lane.update(verdict="instrument_fail", reason="deadlock_instrument_fail:no_root_read")
+        else:
+            #   레인 판정은 루트별 판정이 ①에서 끊어 읽지 않은 루트의 시각까지 읽는다(문자열이 아닌 시각은 TypeError) —
+            #   그 예외가 게이트 주기 전체를 죽이지 않게 계기 고장으로 받는다(D-d · R1 반영).
+            try:
+                _, reason = build_deadlock_warning(report, lane_att, now_epoch)
+            except Exception as e:              # noqa: BLE001
+                reason = "deadlock_instrument_fail:lane_raised:%s" % type(e).__name__
+            if unread and not _lane_reason_holds_partially(reason):
+                reason = "deadlock_unmeasured:lane_partial(%d/%d roots unread)|%s" % (len(unread), len(sources), reason)
+            lane.update(verdict=shadow_verdict(reason), reason=reason)
+        if not ctl_ok:
+            lane.update(verdict="instrument_fail", reason="deadlock_instrument_fail:control|%s" % lane["reason"])
+        records.append(lane)
         summary = ["deadlock_shadow:would_fire=%(would_fire)d,no=%(no)d,unmeasured=%(unmeasured)d,"
-                   "instrument_fail=%(instrument_fail)d" % count]
+                   "instrument_fail=%(instrument_fail)d" % count,
+                   "deadlock_shadow_lane:%s" % lane["verdict"]]
         if not ctl_ok:
             summary.append("deadlock_instrument_fail:control")
         return records, summary
@@ -2397,7 +2453,15 @@ class Gate:
             reasons.append("deadman_poll_unavailable")
         #   P3 시스템 데드락(last_output 완전 배제) — ★0.14.56 SHADOW(CEO 4eeea43f Part B): 출처×루트마다 판정과
         #   멈춘 사유를 대장에만 남긴다. ⛔ warns 에 넣지 않는다 → push·EVT·badge·enqueue 0(paging enable 은 별도 결정).
-        deadlock_shadow, dl_summary = self._deadlock_shadow(report, now_epoch)
+        #   shadow 의 예외는 이 주기의 실제 라우팅(사망·ctx 등)을 멈추면 안 된다 — 잡지 않으면 주기 전체가 fail-open 으로
+        #   떨어져 그 주기의 warn 이 하나도 라우팅되지 않는다(R1 반영 · 시각이 문자열이 아닌 티켓 하나로 재현).
+        try:
+            deadlock_shadow, dl_summary = self._deadlock_shadow(report, now_epoch)
+        except Exception as e:                  # noqa: BLE001
+            deadlock_shadow = [{"source": "shadow", "root": None, "verdict": "instrument_fail",
+                                "reason": "deadlock_instrument_fail:shadow_raised:%s" % type(e).__name__,
+                                "attributed": 0, "unattributed": 0, "foreign": 0}]
+            dl_summary = ["deadlock_instrument_fail:shadow_raised"]
         reasons += dl_summary
 
         #   조건 해소 → push 엣지 재무장. 이번 주기에 나타나지 않은 push 키는 에피소드가 끝난
