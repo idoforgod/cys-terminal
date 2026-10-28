@@ -53,6 +53,7 @@ import subprocess
 import sys
 sys.dont_write_bytecode = True  # SEAL-1 층4: 호출자 env 와 무관하게 형제 import 의 __pycache__ 기록 차단(D-pyc 2026-09-21)
 import time
+from datetime import datetime
 
 # ★번들 파이썬(Windows embeddable · python312._pth) 경로 가드 — 형제 모듈 import 보장.
 #   ._pth 는 표준 경로 계산을 우회해 **스크립트 폴더를 sys.path 에 넣지 않는다**.
@@ -2553,16 +2554,31 @@ def _rc_and_id(res):
 
 
 def _parse_iso_epoch(s):
+    """ISO stamp -> epoch seconds, or None. Declared policy per form (0.14.56 #2, head decision 2026-10-28):
+
+    * With an offset (`+0900`, `+09:00`, `Z`): the offset is honoured. The old body was
+      `time.mktime(time.strptime(s, "...%z"))`, which reads the fields as host-local time and drops the
+      offset, so a stamp written before a host timezone change landed off by (stamp offset - host offset):
+      -16 h for a -0700 stamp read at +0900, and the deadlock age it feeds went wrong in both directions.
+      `datetime.strptime(..%z).timestamp()` is used, not `datetime.fromisoformat`: on Python 3.9 the latter
+      raises on `+0900`, the only form our writers (`_now_iso`, javis_task `_now`) emit. Same shape as
+      javis_task `_iso_to_epoch`.
+    * Zone-less: the host's local wall time at read time (unchanged). No shipped writer emits it. Rejecting
+      it would drop the stamp, and the deadlock detector would turn silent if every stamp dropped.
+    * Fractional seconds: not parsed (None, unchanged). No writer emits them.
+    * int/float: returned as float (unchanged)."""
     if not s:
         return None
     if isinstance(s, (int, float)):
         return float(s)
-    for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S"):
-        try:
-            return time.mktime(time.strptime(s, fmt))
-        except (ValueError, OverflowError):
-            continue
-    return None
+    try:
+        return datetime.strptime(s, "%Y-%m-%dT%H:%M:%S%z").timestamp()
+    except (ValueError, OverflowError):
+        pass
+    try:
+        return time.mktime(time.strptime(s, "%Y-%m-%dT%H:%M:%S"))
+    except (ValueError, OverflowError):
+        return None
 
 
 def _epoch_date(epoch):

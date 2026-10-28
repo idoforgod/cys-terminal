@@ -16,11 +16,13 @@ DESIGN §C1 필수 케이스 10종을 Gate 코어에 대역 Runner를 주입해 
 
 실행: python3 test_report_gate.py   (unittest·표준 러너 — CI가 파일 직접 실행하는 관례 준거)
 """
+import calendar
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 
 BIN = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))          # cysjavis-pack/bin
@@ -1084,6 +1086,102 @@ class P7InstrumentTests(unittest.TestCase):
         m=R._measurement_from_node(self.sample(),123)
         self.assertEqual((m['surface_id'],m['created_at']),(7,10))
         self.assertIsNone(R._measurement_from_node(self.sample(True),123)['idle_secs'])
+
+
+class ParseIsoEpochOffsetTest(unittest.TestCase):
+    """0.14.56 #2 — `_parse_iso_epoch` must honour the stamp's UTC offset.
+
+    The old body was `time.mktime(time.strptime(s, "...%z"))`: strptime parses the offset, mktime reads the
+    fields as HOST-LOCAL time and drops it, so a stamp written in another timezone lands off by
+    (stamp offset - host offset). Every cell runs in a child interpreter whose host offset is set through the
+    TZ environment variable (POSIX strings, no tz database needed: KST-9 = UTC+9, ICT-7 = UTC+7, MST7 =
+    UTC-7, UTC0), so this process's own clock is never touched. Each child first reports its own offset and
+    the cell asserts it — a child that ignored TZ would make every cell vacuous.
+    The instant is 2026-10-28T12:00:00Z written in each form."""
+
+    INSTANT = calendar.timegm((2026, 10, 28, 12, 0, 0))
+    HOSTS = {"KST-9": 32400, "ICT-7": 25200, "MST7": -25200, "UTC0": 0}
+    OFFSET_FORMS = {
+        "+0900": "2026-10-28T21:00:00+0900",
+        "+09:00": "2026-10-28T21:00:00+09:00",
+        "+0700": "2026-10-28T19:00:00+0700",
+        "+0000": "2026-10-28T12:00:00+0000",
+        "Z": "2026-10-28T12:00:00Z",
+        "-0700": "2026-10-28T05:00:00-0700",
+    }
+    CHILD = textwrap.dedent("""
+        import json, sys, time
+        sys.path.insert(0, sys.argv[1])
+        import javis_report_gate as G
+        job = json.loads(sys.argv[2])
+        out = {"gmtoff": time.localtime(job["at"]).tm_gmtoff,
+               "parsed": {k: G._parse_iso_epoch(v) for k, v in job.get("parse", {}).items()}}
+        if "deadlock" in job:
+            d = job["deadlock"]
+            tickets = [{"id": "T-1", "status": "todo", "owner": None,
+                        "created_at": d["stamp"], "updated_at": d["stamp"]}]
+            rep = {"live_nodes": [{"role": "master", "status_age_secs": 3600}]}
+            dl, reason = G.build_deadlock_warning(rep, tickets, d["now"])
+            out["deadlock"] = {"fired": dl is not None, "reason": reason}
+        print(json.dumps(out))
+    """)
+
+    def child(self, tz, job):
+        job = dict(job, at=self.INSTANT)
+        env = dict(os.environ, TZ=tz)
+        r = subprocess.run([sys.executable, "-B", "-c", self.CHILD, BIN, json.dumps(job)],
+                           capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr[-800:])
+        out = json.loads(r.stdout)
+        self.assertEqual(out["gmtoff"], self.HOSTS[tz],
+                         "child ignored TZ=%s (offset %r) - the cell would measure nothing" % (tz, out["gmtoff"]))
+        return out
+
+    def test_offset_bearing_forms_are_honoured_at_every_host_offset(self):
+        for tz in self.HOSTS:
+            got = self.child(tz, {"parse": self.OFFSET_FORMS})["parsed"]
+            for form, value in got.items():
+                self.assertIsNotNone(value, "host %s: %s did not parse" % (tz, form))
+                self.assertEqual(value - self.INSTANT, 0,
+                                 "host %s: %s read %+.2f h off (offset dropped)"
+                                 % (tz, form, (value - self.INSTANT) / 3600.0))
+
+    def test_deadlock_silent_direction_stamp_offset_above_host(self):
+        # Host back at +0700, newest ticket stamped at +0900 40 minutes ago. Read with the offset dropped it
+        # lands 2 h in the future, the age goes negative and the alarm stays silent past its 30-minute line.
+        d = {"stamp": "2026-10-28T20:20:00+0900", "now": self.INSTANT}
+        got = self.child("ICT-7", {"deadlock": d})["deadlock"]
+        self.assertTrue(got["fired"], "40 min of ticket inactivity did not fire: %r" % got)
+
+    def test_deadlock_noisy_direction_stamp_offset_below_host(self):
+        # Host at +0900, newest ticket stamped at -0700 10 minutes ago. Read with the offset dropped it lands
+        # 16 h in the past and the alarm fires on fresh activity.
+        d = {"stamp": "2026-10-28T04:50:00-0700", "now": self.INSTANT}
+        got = self.child("KST-9", {"deadlock": d})["deadlock"]
+        self.assertFalse(got["fired"], "10 min of inactivity fired the deadlock alarm: %r" % got)
+        self.assertEqual(got["reason"], "deadlock_no:recent_ticket_activity(600s)")
+
+    def test_zone_less_stamp_is_host_local_wall_time(self):
+        # Declared policy P-A (head decision 2026-10-28): a stamp without an offset is the host's local wall
+        # time at read time. No shipped writer emits one; this pins the rule instead of letting it drift.
+        wall = "2026-10-28T21:00:00"
+        for tz, off in self.HOSTS.items():
+            got = self.child(tz, {"parse": {"zl": wall}})["parsed"]["zl"]
+            self.assertEqual(got, calendar.timegm((2026, 10, 28, 21, 0, 0)) - off,
+                             "host %s: zone-less %s is not host-local" % (tz, wall))
+
+    def test_fractional_seconds_stay_unparsed(self):
+        # Declared: no writer emits fractional seconds; the parser returns None for them (unchanged).
+        forms = {"f_off": "2026-10-28T21:00:00.123+0900", "f_z": "2026-10-28T12:00:00.123Z",
+                 "f_zl": "2026-10-28T21:00:00.123"}
+        got = self.child("KST-9", {"parse": forms})["parsed"]
+        self.assertEqual(got, {k: None for k in forms})
+
+    def test_numbers_and_empty_pass_through(self):
+        self.assertEqual(G._parse_iso_epoch(1793018388), 1793018388.0)
+        self.assertEqual(G._parse_iso_epoch(1793018388.5), 1793018388.5)
+        self.assertIsNone(G._parse_iso_epoch(""))
+        self.assertIsNone(G._parse_iso_epoch(None))
 
 
 if __name__ == "__main__":
