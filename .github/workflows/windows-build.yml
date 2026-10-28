@@ -124,23 +124,23 @@ jobs:
           # -B protects the staged runtime and pack from bytecode writes.
           C03_TEST_BASH="$(cygpath -w "$PWD/src-tauri/runtime/git/bin/bash.exe")" src-tauri/runtime/python/python.exe -B -u cysjavis-pack/bin/tests/test_owned_process.py
 
-      - name: C-03 win32 DIAG (instrumented copies, reports only)
+      - name: C-03 win32 DIAG RUN 2 (launch matrix + watcher control, reports only)
         if: always()
-        timeout-minutes: 15
+        timeout-minutes: 12
         shell: bash
         run: |
           set -uo pipefail
-          for i in 1 2 3; do
-            echo "== C03 DIAG iteration $i (bundled Python) =="
-            C03_DIAG_WINDOW=45 src-tauri/runtime/python/python.exe -B -u diag/c03-win/diag_c03_win.py "bundled-$i" || echo "C03DIAG-RC bundled-$i rc=$?"
+          for i in 1 2; do
+            echo "== C03 DIAG RUN 2 iteration $i (bundled Python) =="
+            C03_DIAG_WINDOW=35 src-tauri/runtime/python/python.exe -B -u diag/c03-win/diag_c03_win_run2.py "bundled-$i" || echo "C03DIAG-RC bundled-$i rc=$?"
           done
 
-      - name: C-03 win32 DIAG under the runner system Python (separates the embeddable runtime)
+      - name: C-03 win32 DIAG RUN 2 under the runner system Python
         if: always()
         continue-on-error: true
-        timeout-minutes: 5
+        timeout-minutes: 6
         shell: bash
         run: |
           set -uo pipefail
           command -v python && python -V
-          C03_DIAG_WINDOW=45 python -B -u diag/c03-win/diag_c03_win.py "system-1" || echo "C03DIAG-RC system-1 rc=$?"
+          C03_DIAG_WINDOW=35 python -B -u diag/c03-win/diag_c03_win_run2.py "system-1" || echo "C03DIAG-RC system-1 rc=$?"
