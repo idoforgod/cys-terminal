@@ -20304,7 +20304,12 @@ mod tests {
         quiet_since(&s, 10);
         tick(&daemon);
         assert_eq!(blocked_reason(&s), BLOCKED_INPUT_PENDING, "first tick only stamps");
-        std::thread::sleep(std::time::Duration::from_millis(1200));
+        // The window is decided by the slot's own stamp: backdate it instead of sleeping (no wall-clock premise).
+        {
+            let mut slot = s.pending_input_stale.lock().unwrap();
+            let (bytes, gen, _) = slot.expect("the first tick arms the stale slot beside a suggestion");
+            *slot = Some((bytes, gen, std::time::Instant::now() - std::time::Duration::from_secs(10)));
+        }
         tick(&daemon);
         assert_eq!(s.pending_input_bytes.load(AtomicOrdering::Relaxed), 0, "the stale count beside a suggestion must reset");
         tick(&daemon);
@@ -20325,11 +20330,14 @@ mod tests {
         s.set_pending_input(1);
         paint_prompt(&s, "", "my own words");
         quiet_since(&s, 10);
-        tick(&daemon);
-        std::thread::sleep(std::time::Duration::from_millis(1200));
+        // Plant a slot whose window has long passed (no sleep): the reset must still never happen, because the draft makes
+        // the screen non-empty and the slot is cleared, never consumed.
+        *s.pending_input_stale.lock().unwrap() =
+            Some((1, s.input_gen.load(AtomicOrdering::Acquire), std::time::Instant::now() - std::time::Duration::from_secs(10)));
         tick(&daemon);
         tick(&daemon);
         assert_eq!(s.pending_input_bytes.load(AtomicOrdering::Relaxed), 1);
+        assert!(s.pending_input_stale.lock().unwrap().is_none(), "a draft never arms the reset");
         assert_eq!(s.pending_queue.lock().unwrap().len(), 1);
     }
 
