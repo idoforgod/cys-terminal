@@ -214,6 +214,8 @@ def run_tp(rows, to="worker", surface=None, no_gate=False):
     try:
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             rc = orch.cmd_task_prompt(args)
+    except Exception as e:                  # noqa: BLE001 — 한 칸의 예외가 뒤 칸을 지우지 않게 그 칸의 실패로 남긴다
+        rc = "EXC:%s:%s" % (type(e).__name__, str(e)[:80])
     finally:
         orch.cys_status = real
     return rc, out.getvalue(), err.getvalue(), calls[0]
