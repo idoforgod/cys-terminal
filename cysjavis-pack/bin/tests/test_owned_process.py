@@ -1065,7 +1065,7 @@ def note():
         f.write('%%d\n' %% os.getpid())
 def init(*args):
     note()
-    if BR in ('N', 'NI', 'SURV'):
+    if BR in ('N', 'NI', 'SURV', 'SURVX'):
         if BR == 'NI':
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
         time.sleep(3600)
@@ -1095,11 +1095,17 @@ if __name__ == '__main__':
     scanner.worker_observer = init
     scanner.scan_skill = task
     scanner.POOL_START_DEADLINE_S = float(os.environ['C03E2_D'])
-    if BR == 'SURV':
+    if BR in ('SURV', 'SURVX'):
         import multiprocessing.process as mpp
         mpp.BaseProcess.terminate = lambda self: None
         mpp.BaseProcess.kill = lambda self: None
         sys.argv = ['javis_skillscan.py', 'all', '--roots', os.environ['C03E2_ROOT'], '--json']
+        if BR == 'SURVX':
+            real_main = scanner.main
+            def raising_main():
+                real_main()
+                raise RuntimeError('fixture: main raised after the pool stop')
+            scanner.main = raising_main
         sys.exit(scanner.cli_main())
     rc = scanner.cmd_all([os.environ['C03E2_ROOT']], True)
     print('RESULT ' + json.dumps({'rc': rc, 'unbounded': scanner._POOL_UNBOUNDED}), flush=True)
@@ -1200,6 +1206,15 @@ class PoolBoundedStop(unittest.TestCase):
     def test_cli_with_a_surviving_worker_exits_instead_of_hanging(self):
         rc, res, err, pids = self.run_e2('SURV')
         self.assertEqual(rc, 0, err)
+        self.assertIn('unbounded', err)
+        self.assertTrue(any(alive(pid) for pid in pids), 'planted survivor not present: the control did not plant')
+
+    @unittest.skipUnless(os.name == 'posix', 'planted survivor via no-op signals: POSIX fixture (Windows UNMEASURED)')
+    def test_cli_raising_with_a_surviving_worker_exits_instead_of_hanging(self):
+        # cli_main's exception path: main() raises after the pool was left unbounded (mutant E4b survived without this).
+        rc, res, err, pids = self.run_e2('SURVX')
+        self.assertEqual(rc, 1, err)
+        self.assertIn('fixture: main raised after the pool stop', err)
         self.assertIn('unbounded', err)
         self.assertTrue(any(alive(pid) for pid in pids), 'planted survivor not present: the control did not plant')
 
@@ -1323,6 +1338,39 @@ class MarkerReaderContract(unittest.TestCase):
         with p, self.assertRaises(PermissionError):
             self._marker_pid(self.root/'m', retry_permission=False)
         self.assertEqual(len(calls), 1)
+
+    @unittest.skipUnless(os.name == 'posix', 'marker() retries PermissionError on win32 only')
+    def test_marker_on_posix_surfaces_permission_error_at_once(self):
+        # marker() itself, not _marker_pid: its retry_permission argument is os.name == 'nt' (mutant M5b survived
+        # without this). The read raises before any pid exists, so nothing reaches self.extra or the kill path.
+        # Called explicitly, not borrowed into the class: a specimen with a successful read must never reach marker().
+        calls, p = self.reads([PermissionError])
+        with p, self.assertRaises(PermissionError):
+            OwnershipRegression.marker(self, 'm')
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.extra, [])
+
+    def test_teardown_prints_the_retries_line(self):
+        # The real tearDown, run on an inner test, must print the retries line (mutant M8b survived without this).
+        import io
+        from unittest.mock import patch
+        outer = self
+        class Inner(unittest.TestCase):
+            setUp = OwnershipRegression.setUp
+            tearDown = OwnershipRegression.tearDown
+            _marker_pid = OwnershipRegression._marker_pid
+            stop_recorded = OwnershipRegression.stop_recorded
+            _report_marker_stats = OwnershipRegression._report_marker_stats
+            def runTest(self):
+                calls, p = outer.reads(['9'])
+                with p:
+                    self._marker_pid(self.root/'inner', retry_permission=True)
+        buf = io.StringIO()
+        result = unittest.TestResult()
+        with patch.object(sys, 'stderr', buf):
+            Inner().run(result)
+        self.assertEqual(result.errors + result.failures, [])
+        self.assertIn('inner=0/', buf.getvalue())
 
     def test_retries_line_is_printed_even_for_zero(self):
         import io
