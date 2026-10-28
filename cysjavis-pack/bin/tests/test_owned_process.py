@@ -970,6 +970,215 @@ if __name__=='__main__':
         self.assertIn(b'input incomplete',out)
         self.assertNotIn(b'Fatal Python error',err)
 
+
+# E(ii) (design r2 d4af60af): a pool that never becomes ready, or breaks while a worker outlives terminate(),
+# must not hang the scan. One fixture script drives cmd_all (or the CLI entry) with a stand-in initializer and
+# task per branch; workers record their pids so leftovers are counted, never guessed.
+_E2_FIXTURE = r'''
+import json, multiprocessing, os, signal, sys, time
+sys.path.insert(0, %(bin)r)
+import javis_skillscan as scanner
+BR = os.environ['C03E2_BRANCH']; TMP = os.environ['C03E2_TMP']
+def note():
+    with open(os.path.join(TMP, 'pids.txt'), 'a') as f:
+        f.write('%%d\n' %% os.getpid())
+def init(*args):
+    note()
+    if BR in ('N', 'NI', 'SURV'):
+        if BR == 'NI':
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        time.sleep(3600)
+    if BR == 'S':
+        os._exit(3)
+    if BR == 'X':
+        try:
+            fd = os.open(os.path.join(TMP, 'held'), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            return
+        os.close(fd)
+        time.sleep(3600)
+def task(path):
+    name = os.path.basename(path)
+    if multiprocessing.current_process().name != 'MainProcess' and BR == 'B':
+        if name == 'a-blocker':
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            time.sleep(3600)
+        if name == 'b-dier':
+            time.sleep(0.5)
+            os._exit(3)
+    return {'skill': name, 'verdict': 'ACCEPT', 'severity': 'LOW', 'findings': []}
+if __name__ == '__main__':
+    multiprocessing.set_start_method('spawn', force=True)
+    scanner.worker_observer = init
+    scanner.scan_skill = task
+    scanner.POOL_START_DEADLINE_S = float(os.environ['C03E2_D'])
+    if BR == 'SURV':
+        import multiprocessing.process as mpp
+        mpp.BaseProcess.terminate = lambda self: None
+        mpp.BaseProcess.kill = lambda self: None
+        sys.argv = ['javis_skillscan.py', 'all', '--roots', os.environ['C03E2_ROOT'], '--json']
+        sys.exit(scanner.cli_main())
+    rc = scanner.cmd_all([os.environ['C03E2_ROOT']], True)
+    print('RESULT ' + json.dumps({'rc': rc, 'unbounded': scanner._POOL_UNBOUNDED}), flush=True)
+'''
+
+
+class PoolBoundedStop(unittest.TestCase):
+    setUp = OwnershipRegression.setUp
+    tearDown = OwnershipRegression.tearDown
+    stop_recorded = OwnershipRegression.stop_recorded
+
+    def run_e2(self, branch, skills=('a-blocker', 'b-dier')):
+        root = self.root/'e2skills'
+        for name in skills:
+            (root/name).mkdir(parents=True)
+            (root/name/'SKILL.md').write_text('# fixture')
+        script = self.root/'e2fixture.py'
+        script.write_text(_E2_FIXTURE % {'bin': str(BIN)})
+        env = dict(os.environ, C03E2_BRANCH=branch, C03E2_TMP=str(self.root), C03E2_ROOT=str(root), C03E2_D='1.0')
+        out_f = open(self.root/'e2.out', 'w'); err_f = open(self.root/'e2.err', 'w')
+        p = subprocess.Popen([PYTHON, '-B', str(script)], stdout=out_f, stderr=err_f, env=env,
+                             start_new_session=(os.name == 'posix'))
+        self.children.append(p)
+        try:
+            p.wait(timeout=40)
+            finished = True
+        except subprocess.TimeoutExpired:
+            finished = False
+            if os.name == 'posix':
+                os.killpg(p.pid, signal.SIGKILL)
+        out_f.close(); err_f.close()
+        out = (self.root/'e2.out').read_text(); err = (self.root/'e2.err').read_text()
+        pids = [int(x) for x in (self.root/'pids.txt').read_text().split()] if (self.root/'pids.txt').exists() else []
+        self.addCleanup(self.reap_e2, pids)
+        self.assertTrue(finished, 'pool fixture %s did not finish: the stop hung (stderr %r)' % (branch, err[-400:]))  # wallclock: guard 40 s only ends a hang; the verdict is finished/unfinished, the designed worst case is D 1 s + 3 phases of 1 s
+        result = [json.loads(l[7:]) for l in out.splitlines() if l.startswith('RESULT ')]
+        return p.returncode, (result[0] if result else None), err, pids
+
+    def reap_e2(self, pids):
+        # Fixture workers sleep 3600 s, so a recorded pid that is still alive is still that worker.
+        for pid in pids:
+            if alive(pid):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+
+    def assert_no_leftover(self, pids):
+        end = time.monotonic() + 3
+        left = [x for x in pids if alive(x)]
+        while left and time.monotonic() < end:
+            time.sleep(.05)
+            left = [x for x in left if alive(x)]
+        self.assertEqual(left, [], 'pool workers outlived the scan')  # wallclock: guard 3 s only lets the init process reap orphans; a real survivor sleeps 3600 s
+
+    @unittest.skipUnless(os.name == 'posix', 'SIGTERM-ignoring worker: POSIX only (Windows UNMEASURED)')
+    def test_broken_pool_with_sigterm_ignoring_sibling_is_bounded(self):
+        rc, res, err, pids = self.run_e2('B')
+        self.assertEqual((res['rc'], res['unbounded']), (0, False), err)
+        self.assertIn('직렬로 폴백', err)
+        self.assertIn('BrokenProcessPool', err)
+        self.assert_no_leftover(pids)
+
+    def test_never_ready_pool_falls_back_at_the_start_deadline(self):
+        rc, res, err, pids = self.run_e2('N')
+        self.assertEqual((res['rc'], res['unbounded']), (0, False), err)
+        self.assertIn('직렬로 폴백', err)
+        self.assertIn('start deadline', err)
+        self.assert_no_leftover(pids)
+
+    @unittest.skipUnless(os.name == 'posix', 'SIGTERM-ignoring worker: POSIX only (Windows UNMEASURED)')
+    def test_never_ready_worker_ignoring_sigterm_is_killed(self):
+        rc, res, err, pids = self.run_e2('NI')
+        self.assertEqual((res['rc'], res['unbounded']), (0, False), err)
+        self.assertIn('start deadline', err)
+        self.assert_no_leftover(pids)
+
+    def test_one_never_ready_worker_does_not_hold_the_exit(self):
+        rc, res, err, pids = self.run_e2('X', skills=('a', 'b', 'c', 'd'))
+        self.assertEqual((res['rc'], res['unbounded']), (0, False), err)
+        self.assertNotIn('직렬로 폴백', err)
+        self.assert_no_leftover(pids)
+
+    def test_worker_dying_at_start_falls_back_without_leftover(self):
+        rc, res, err, pids = self.run_e2('S')
+        self.assertEqual((res['rc'], res['unbounded']), (0, False), err)
+        self.assertIn('BrokenProcessPool', err)
+        self.assert_no_leftover(pids)
+
+    def test_healthy_pool_is_silent_and_leaves_no_worker(self):
+        rc, res, err, pids = self.run_e2('H', skills=('a', 'b', 'c'))
+        self.assertEqual((res['rc'], res['unbounded']), (0, False), err)
+        self.assertEqual(err, '')
+        self.assert_no_leftover(pids)
+
+    @unittest.skipUnless(os.name == 'posix', 'planted survivor via no-op signals: POSIX fixture (Windows UNMEASURED)')
+    def test_cli_with_a_surviving_worker_exits_instead_of_hanging(self):
+        rc, res, err, pids = self.run_e2('SURV')
+        self.assertEqual(rc, 0, err)
+        self.assertIn('unbounded', err)
+        self.assertTrue(any(alive(pid) for pid in pids), 'planted survivor not present: the control did not plant')
+
+    def test_empty_skill_list_creates_no_pool(self):
+        sys.path.insert(0, str(BIN)); scanner = load('javis_skillscan')
+        import concurrent.futures
+        from unittest.mock import patch
+        created = []
+        def no_pool(*a, **kw):
+            created.append(a)
+            raise RuntimeError('fixture: a pool was created')
+        empty = self.root/'none'; empty.mkdir()
+        with patch.object(concurrent.futures, 'ProcessPoolExecutor', no_pool):
+            rc = scanner.cmd_all([str(empty)], True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(created, [], 'a pool was created for zero skills')
+
+    def test_cancel_during_the_start_wait_returns_125_without_serial(self):
+        import threading, concurrent.futures
+        from unittest.mock import patch
+        sys.path.insert(0, str(BIN)); scanner = load('javis_skillscan')
+        cancel = threading.Event(); scanner._CANCEL = cancel
+        skill = self.root/'skills'/'one'; skill.mkdir(parents=True); (skill/'SKILL.md').write_text('# fixture')
+        calls = []
+        class NeverReady:
+            _processes = {}
+            def __init__(self, *a, **kw):
+                pass
+            def submit(self, fn, *a):
+                cancel.set()
+                return concurrent.futures.Future()
+            def map(self, *a, **kw):
+                cancel.set()
+                return iter(())
+            def shutdown(self, *a, **kw):
+                pass
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+        with patch.object(concurrent.futures, 'ProcessPoolExecutor', NeverReady), \
+             patch.object(scanner, 'scan_skill', lambda path: calls.append(path)):
+            rc = scanner.cmd_all([str(skill.parent)], True)
+        self.assertEqual(rc, 125)
+        self.assertEqual(calls, [], 'cancelled scanner started a serial rescan')
+
+    def test_executor_worker_table_exists_on_this_python(self):
+        import concurrent.futures
+        ex = concurrent.futures.ProcessPoolExecutor(max_workers=1)
+        try:
+            self.assertEqual(ex.submit(os.getpid).result(timeout=60) > 0, True)  # wallclock: guard 60 s only ends a hung spawn
+            table = getattr(ex, '_processes', None)
+            self.assertIsInstance(table, dict, 'ProcessPoolExecutor._processes is gone: the bounded stop has no worker table')
+            self.assertTrue(table and all(hasattr(p, 'sentinel') for p in table.values()))
+        finally:
+            ex.shutdown(wait=True)
+
+    def test_start_deadline_and_stop_phases_fit_the_preflight_budget(self):
+        sys.path.insert(0, str(BIN)); scanner = load('javis_skillscan'); preflight = load('javis_preflight')
+        self.assertLess(scanner.POOL_START_DEADLINE_S + 3 * scanner.POOL_STOP_PHASE_S,
+                        preflight.Preflight.SKILLSCAN_SCAN_TIMEOUT_S)
+
+
 if __name__ == '__main__':
     # Tests never inherit a live seat's paths or account configuration.
     for key in list(os.environ):
