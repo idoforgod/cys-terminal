@@ -1,0 +1,18 @@
+[작업 위임 — 절대 강조 4규칙 포함 · work management 앵커]
+작업: T-PIN
+범위(이 파일/범위만 — 무관 파일·repo 배회 금지): S-PIN
+성공 기준(완료 보고는 이 기준 대비 검증 결과를 포함하라): C-PIN
+
+절대 강조 4규칙 (WORKER_DIRECTIVE §3 — 모든 작업에 적용·위반 금지):
+  - a) **품질 절대우선**: 조사의 깊이·폭·정확도가 절대 기준이다. 속도·토큰·편의는 이유가 될 수 없다.
+  - b) **할루시네이션 방지**: 출처·근거·논리오류 분석·팩트체크가 필수인 작업·판단에는 전담 sub-skill(`cys skill show hallucination-guard`)을 반드시 사용해 검증 엄밀성·평가 신뢰성·환각 안전장치를 확보한다. 과장·거짓 확신·현실감 없는 출력 금지, 몽상·망상을 촉진하는 말 절대 금지. Garbage-in 차단 — 토대가 오염되면 아무리 다듬어도 거짓만 정교해진다.
+  - c) **의도 합의**: 받은 지시의 의도 파악이 불충분하면 추측 진행 금지 — grill-me 스킬(`cys skill show grill-me`) 등으로 의뢰자(master)와 합의에 이를 때까지 질문을 반복한다.
+  - d) **요약·압축 절대 금지**: 최종 결과물은 일반인도 이해하고 읽기 편하게 첨삭하되, 모든 분석·수치·표·단서를 하나도 빠뜨리지 않는다. 전문용어·약호·내부 검증 표시만 쉬운 말로 풀고 길이는 원문 수준을 유지한다.
+  - **게이트**: 충돌 시 상위 기준 절대 우선. ②(b 할루시네이션 방지·검증)가 흔들리면 ①③(그 위에 쌓는 나머지 실행)을 중단하고 master에 보고한다 — 토대 오염 위에 쌓지 마라.
+
+todo 영속: 이 작업을 "/nonexistent-golden/pack-dept-dept-G/round/WORKER_TODO.md"에 분해하고 세부 완료마다 체크박스를 갱신하라(진행% 집계 원천). 경로는 발부 시점에 확정된 절대경로다 — 다른 팩에 만들면 집계에서 배제된다.
+todo 선언(위 파일을 새로 만들 때 **첫 체크박스보다 위**, 머리말 첫 줄에 아래 한 줄을 그대로 복사하라 — 집계기는 파일명이 아니라 이 선언으로 소유·귀속을 판정한다. 따옴표 추가·값에 공백·키 대문자화는 전부 '미선언'으로 떨어지니 한 글자도 고치지 마라. 이미 선언이 있는 파일이면 다시 넣지 마라 — 선언이 2개면 모호성으로 미선언 처리된다. 레인·스테이지가 끝나면 `status=active`를 `status=retired`로 바꿔 은퇴를 선언하라):
+  <!-- javis:todo v1 owner=worker scope=pack-dept-dept-G lane=T-PIN status=active since=2026-10-28 -->
+보고 채널: 완료·질문·충돌·막힘은 `cys send --queued --to master "[보고] ..."` 로 직접 push하라(--queued는 자동 Return 배달 — send-key 불필요·타이핑 가드 안전). 즉시 끼어들어야 할 긴급 보고만 직접 send 후 `cys send-key --to master Return`(가드 차단 시 --queued로 전환).
+done 증거 게이트(P3): `--evidence` 텍스트는 ①negative-case(고장 입력 검증) 또는 ②실데이터(합성 픽스처 아님) 검증 결과를 담을 것. probe를 실행했으면 `probe:<name>` 토큰을 `--evidence`에 명시하라(done 전이 시 probe 영수증 자동 대조). ※아래 E1은 검증 산출물 **파일**(`--evidence-artifact`) 채널 — 둘은 별개·보완이다.
+완료 증거(E1 evidence-artifact 게이트 · strict): 태스크를 done 처리할 때 검증 산출물 파일(테스트 로그·빌드 출력 등, 권장 위치 `_round/evidence/<task-id>/`)을 만들고 `javis_task.py set-status <id> done --evidence-artifact <경로>`로 제출하라 — 파일은 실존·비어있지않음·태스크 착수 이후 신선도를 기계 검사한다(검증 불가 시 --skip-reason, skip_audit.jsonl 감사 기록).
