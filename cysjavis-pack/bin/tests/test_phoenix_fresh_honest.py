@@ -34,6 +34,36 @@ def captured_path(entry):
     return result, paths
 
 
+def bind_rig_state_root(rig_dir, sock):
+    """픽스처가 **제품이 읽는 바로 그 자리**에 쓰도록 데몬 상태 루트를 리그 안에 묶는다(codex W1).
+
+    제품 규약은 `javis_phoenix.py:1113-1119` 다 — unix 는 소켓의 부모 디렉터리가 곧 상태 디렉터리이고,
+    Windows 는 named pipe 에 파일시스템 부모가 없어 슬러그 매핑
+    (`javis_state_snapshot._win_state_dir_for_socket` · `%LOCALAPPDATA%\\cys\\<슬러그>`)으로 파생한다.
+    그래서 소켓 부모에 topology 를 쓰면 Windows 에서는 제품이 **다른 자리**를 읽어 부활 대상이 0 이 된다
+    (실측 · IS_WINDOWS 대역: 「부활 대상 죽은 역할 0」 → D3-B1 FAIL → `:879` KeyError('evidence')).
+    여기서는 `LOCALAPPDATA` 를 리그 안 전용 디렉터리로 돌려 그 매핑이 리그 안에 떨어지게 하고,
+    ★**어떤 쓰기보다 먼저** 해소된 디렉터리가 리그 안인지 단언한다(디렉터리는 제품의 해소기로만 구한다 —
+    손으로 조립하지 않는다). 호출측이 `LOCALAPPDATA` 사본을 try 앞에서 떠 두고 finally 에서 되돌린다.
+    """
+    os.environ["LOCALAPPDATA"] = os.path.join(rig_dir, "winroot")
+    sd = m.state_dir_for(sock)                       # ★제품의 해소기 그대로
+    root, real = os.path.realpath(rig_dir), os.path.realpath(sd)
+    assert real == root or real.startswith(root + os.sep), (
+        "상태 디렉터리가 리그를 벗어났다: %r (리그 %r · IS_WINDOWS=%r)" % (sd, root, m.IS_WINDOWS))
+    os.makedirs(sd, exist_ok=True)
+    return sd
+
+
+def restore_env(saved):
+    """bind_rig_state_root 가 건드린 env 를 원래대로 — 없던 키는 지우고 있던 키는 값째 되돌린다."""
+    for k, v in saved.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+
+
 def main():
     _results.clear()
     td = tempfile.mkdtemp(prefix="phoenix-fresh-")
@@ -791,6 +821,7 @@ def main():
             """resume 역할 1개 · 좌석은 건강하게 올라온다. seed_stale 이면 **지난 부팅의** 독약 표지를 심는다."""
             td2 = tempfile.mkdtemp(prefix="phoenix-d3-run-")
             orig = (m.cys, m.time.sleep, m._emit_evt, m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN)
+            d3_state_env = {"LOCALAPPDATA": os.environ.get("LOCALAPPDATA")}
             try:
                 # ★통합(worker-18 · d3 impl r1 gemini minor · vj:6a2c8071): 이 헬퍼가 CYS_PACK_DIR 을 세우지 않으면
                 #   `~/.cys/pack/agents.json` 이 있는 호스트에서 **호스트 팩**을 읽어 resume 모드가 unknown→effective 로
@@ -804,6 +835,8 @@ def main():
                 os.environ["CYS_PACK_DIR"] = d3_pack
                 m._AGENTS_CACHE.clear()
                 sock = os.path.join(td2, "cys.sock")
+                # ★codex W1: 제품이 읽는 자리에 쓴다(unix=소켓 부모 · Windows=슬러그 매핑) — 단언이 쓰기보다 먼저.
+                state_dir = bind_rig_state_root(td2, sock)
                 tick = "d3-" + ("stale" if seed_stale else "clean")
                 now = m._now()
                 entry = {"role": "worker-1", "agent": "claude", "session_id": "sid-live",
@@ -815,7 +848,7 @@ def main():
                 os.makedirs(proj)
                 with open(os.path.join(proj, "sid-live.jsonl"), "w", encoding="utf-8") as f:
                     f.write("{}\n")       # 세션 파일이 있으므로 fresh 예상이 아니다 → else(핀) 분지로 간다
-                with open(os.path.join(td2, "topology.json"), "w", encoding="utf-8") as f:
+                with open(os.path.join(state_dir, "topology.json"), "w", encoding="utf-8") as f:
                     json.dump({"entries": [entry], "updated_at": now, "schema_version": 1,
                                "tombstones": [], "tombstones_rev": 0}, f)
                 jp = m.journal_path(sock, tick)
@@ -861,6 +894,7 @@ def main():
                         os.environ.pop(_k, None)
                     else:
                         os.environ[_k] = _v
+                restore_env(d3_state_env)
                 m._AGENTS_CACHE.clear()
                 (m.cys, m.time.sleep, m._emit_evt, m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN) = orig
                 shutil.rmtree(td2, ignore_errors=True)
@@ -901,6 +935,7 @@ def main():
             td3 = tempfile.mkdtemp(prefix="phoenix-d3-stamp-")
             orig = (m.cys, m.time.sleep, m._emit_evt, m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN,
                     m.SPAWN_RETRIES, m.SPAWN_SETTLE, m.SPAWN_BACKOFF, m.F1_REGISTERED_GRACE_TRIES)
+            d3_state_env = {"LOCALAPPDATA": os.environ.get("LOCALAPPDATA")}
             try:
                 # ★통합(worker-18 · d3 impl r1 gemini minor · vj:6a2c8071): 이 헬퍼가 CYS_PACK_DIR 을 세우지 않으면
                 #   `~/.cys/pack/agents.json` 이 있는 호스트에서 **호스트 팩**을 읽어 resume 모드가 unknown→effective 로
@@ -914,6 +949,8 @@ def main():
                 os.environ["CYS_PACK_DIR"] = d3_pack
                 m._AGENTS_CACHE.clear()
                 sock = os.path.join(td3, "cys.sock")
+                # ★codex W1: 제품이 읽는 자리에 쓴다 — 단언이 쓰기보다 먼저(M 절과 같은 규약).
+                state_dir = bind_rig_state_root(td3, sock)
                 tick = "d3-stamp"
                 entry = {"role": "worker-1", "agent": "claude", "session_id": "sid-poison",
                          "claude_config_dir": os.path.join(td3, "acct"), "cwd": os.path.join(td3, "proj"),
@@ -928,7 +965,7 @@ def main():
                 st = {"epoch": 1000.0, "phase": 1, "alive": False, "seat": "empty",
                       "gate": {"gate": "folder-trust"}}
                 def write_topology():
-                    with open(os.path.join(td3, "topology.json"), "w", encoding="utf-8") as f:
+                    with open(os.path.join(state_dir, "topology.json"), "w", encoding="utf-8") as f:
                         json.dump({"entries": [entry], "updated_at": m._now(), "schema_version": 1,
                                    "tombstones": [], "tombstones_rev": 0}, f)
                 write_topology()
@@ -986,6 +1023,7 @@ def main():
                         os.environ.pop(_k, None)
                     else:
                         os.environ[_k] = _v
+                restore_env(d3_state_env)
                 m._AGENTS_CACHE.clear()
                 (m.cys, m.time.sleep, m._emit_evt, m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN,
                  m.SPAWN_RETRIES, m.SPAWN_SETTLE, m.SPAWN_BACKOFF, m.F1_REGISTERED_GRACE_TRIES) = orig
@@ -1028,6 +1066,7 @@ def main():
             td4 = tempfile.mkdtemp(prefix="phoenix-d3-f1stamp-")
             orig = (m.cys, m.time.sleep, m._emit_evt, m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN,
                     m.SPAWN_SETTLE, m.SPAWN_BACKOFF, m.F1_REGISTERED_GRACE_TRIES)
+            d3_state_env = {"LOCALAPPDATA": os.environ.get("LOCALAPPDATA")}
             try:
                 # ★통합(worker-18 · d3 impl r1 gemini minor · vj:6a2c8071): 이 헬퍼가 CYS_PACK_DIR 을 세우지 않으면
                 #   `~/.cys/pack/agents.json` 이 있는 호스트에서 **호스트 팩**을 읽어 resume 모드가 unknown→effective 로
@@ -1041,6 +1080,8 @@ def main():
                 os.environ["CYS_PACK_DIR"] = d3_pack
                 m._AGENTS_CACHE.clear()
                 sock = os.path.join(td4, "cys.sock")
+                # ★codex W1: 제품이 읽는 자리에 쓴다 — 단언이 쓰기보다 먼저(M 절과 같은 규약).
+                state_dir = bind_rig_state_root(td4, sock)
                 tick = "d3-f1stamp"
                 entry = {"role": "worker-1", "agent": "claude", "session_id": "",
                          "claude_config_dir": os.path.join(td4, "acct"), "cwd": os.path.join(td4, "proj"),
@@ -1049,7 +1090,7 @@ def main():
                 proj = os.path.join(entry["claude_config_dir"], "projects",
                                     m._claude_project_component(entry["cwd"]))
                 os.makedirs(proj)      # ★세션 파일을 만들지 않는다 → F-1 fresh 예상
-                with open(os.path.join(td4, "topology.json"), "w", encoding="utf-8") as f:
+                with open(os.path.join(state_dir, "topology.json"), "w", encoding="utf-8") as f:
                     json.dump({"entries": [entry], "updated_at": m._now(), "schema_version": 1,
                                "tombstones": [], "tombstones_rev": 0}, f)
                 st = {"epoch": 3000.0, "alive": False}
@@ -1094,6 +1135,7 @@ def main():
                         os.environ.pop(_k, None)
                     else:
                         os.environ[_k] = _v
+                restore_env(d3_state_env)
                 m._AGENTS_CACHE.clear()
                 (m.cys, m.time.sleep, m._emit_evt, m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN,
                  m.SPAWN_SETTLE, m.SPAWN_BACKOFF, m.F1_REGISTERED_GRACE_TRIES) = orig
