@@ -6772,6 +6772,76 @@ pub(crate) fn machine_direct_hold_masked(
 /// 상태로 방치됐다. 소비자 셋(H0 · H1 큐 틱 · 채널 `deliverable_master`)이 모두 이 함수를 지난다(판정 한 곳).
 /// 실패 방향: pid 미상(peer pid 결측)·표지가 다른 세대(그 뒤 다시 세움)면 종전대로 상한만 — 살아 있는 사이클 창을 풀지 않는다.
 /// pid 재사용(수 분 안)은 푸는 쪽이 아니라 **늦게 푸는** 쪽으로만 틀린다(종전 상한과 같다).
+/// ★(0.14.56 · P1 D9 reinject order · impl/DESIGN-ADDENDUM-D9-reinject-order.md rev 1 §3, head ruling d8f5cad3c957c3ed arm 2) Is
+/// `caller_pid` the process that holds `s`'s CURRENT cycle window? Quiescing is on ([`effective_quiescing_since`]), the owner is bound to
+/// this window (`at == since`, the `owner_exited` generation test), the pid matches, and the caller's process start time is known and no
+/// later than `at` (whole seconds - a recycled pid starts after the owner died). No pid or no start time -> false (fail closed). Only
+/// cycle-agent binds an owner (`bind_owner:true`); its step-7 reinject is sent by that same process (the --detach child included).
+/// ★(0.14.56 · P1 D9 reinject order · DESIGN-ADDENDUM-D9-reinject-order.md rev 1 §2; head rulings 171d431a9879596a cond 2,
+/// d8f5cad3c957c3ed) Ids an authoritative job must never pass: the seat's in-memory partial-write hold and every persisted write hold
+/// (restart adoption takes a hold only at the FRONT, `adopt_persisted_write_hold`). Read BEFORE the queue lock (lock order).
+pub(crate) fn queue_pinned_ids(daemon: &Daemon, s: &crate::state::Surface) -> std::collections::HashSet<String> {
+    let mut ids: std::collections::HashSet<String> =
+        daemon.write_holds.lock().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect();
+    if let Some(h) = s.queue_hold.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        ids.extend(h.entry_ids.iter().cloned());
+    }
+    ids
+}
+
+/// Where an authoritative job goes (§2): past the leading pinned run (held, persisted-held, in flight) and past the leading
+/// authoritative run (FIFO among authoritative jobs, cond 3). Everything behind keeps its order.
+pub(crate) fn authoritative_insert_pos(
+    q: &std::collections::VecDeque<crate::state::QueueEntry>,
+    pinned: &std::collections::HashSet<String>,
+    in_flight: &[String],
+) -> usize {
+    let mut i = 0;
+    while i < q.len() && (pinned.contains(&q[i].id) || in_flight.contains(&q[i].id)) {
+        i += 1;
+    }
+    while i < q.len() && q[i].authoritative {
+        i += 1;
+    }
+    i
+}
+
+/// ★(0.14.56 · P1 D9 reinject order · addendum rev 1; head ruling d8f5cad3c957c3ed "MERGE") The origin key the merge planner compares:
+/// an authoritative entry's key is unique to it, so it never merges with the entries behind it nor with another authoritative entry
+/// (`plan_queue_merge` stops at a different origin). Ordinary entries keep their origin (pin merges unchanged).
+pub(crate) fn merge_origin_key(e: &crate::state::QueueEntry) -> String {
+    if e.authoritative {
+        format!("{}#authoritative:{}", e.origin, e.id)
+    } else {
+        e.origin.clone()
+    }
+}
+
+/// ★(0.14.56 · P1 D9 reinject order · addendum rev 1; head ruling 171d431a9879596a cond 4, d8f5cad3c957c3ed "AGES") The entry whose
+/// age the stuck-queue readers report: the oldest (`enqueued_at`) of the leading authoritative run and the first ordinary entry behind
+/// it. With no authoritative entry queued it is the front (the pin's reading); a fresh head-placed job never hides an older blocked item.
+pub(crate) fn queue_age_head(
+    q: &std::collections::VecDeque<crate::state::QueueEntry>,
+) -> Option<&crate::state::QueueEntry> {
+    let mut best: Option<&crate::state::QueueEntry> = None;
+    for e in q.iter() {
+        if best.is_none_or(|b| e.enqueued_at < b.enqueued_at) {
+            best = Some(e);
+        }
+        if !e.authoritative {
+            break;
+        }
+    }
+    best
+}
+
+pub(crate) fn caller_is_cycle_owner(daemon: &Arc<Daemon>, s: &crate::state::Surface, caller_pid: Option<u32>) -> bool {
+    let Some(pid) = caller_pid else { return false };
+    let Some(since) = effective_quiescing_since(daemon, s) else { return false };
+    let Some((owner, at, _)) = *s.quiesce_owner.lock().unwrap_or_else(|e| e.into_inner()) else { return false };
+    owner == pid && at == since && crate::state::peer_start_time(pid).is_some_and(|st| (st as f64) <= at)
+}
+
 pub(crate) fn effective_quiescing_since(daemon: &Arc<Daemon>, s: &crate::state::Surface) -> Option<f64> {
     let since = s
         .agent_status
@@ -8668,6 +8738,9 @@ pub(crate) fn d1_governs(s: &crate::state::Surface) -> bool {
 /// the target holds role `master` or `ceo` in THIS daemon, it is an agent seat (`seat_is_agent_backed` - a dead agent at a
 /// shell prompt keeps the pin paths, so node-recover still self-heals), and the caller is not owner class. Daemon-internal
 /// writers pass `owner_caller = false`. Every in-scope decision calls this function; a copy at a site is a defect.
+/// ★(CEO ruling 7c89eda5 sec 2 - label) Its reliance on `seat_is_agent_backed` is tick-phase dependent: both inputs
+/// (`agent_exit_notified`, `seat_cache`) are written only by the watchdog tick, so a relaunched agent enters scope BOUNDED BY ONE
+/// WATCHDOG TICK FROM AGENT START (RESIDUAL-C2 (h1); the frame-bound confirm backlog item is the real fix, must-not-lapse).
 pub(crate) fn d9_scope(daemon: &Daemon, s: &Arc<crate::state::Surface>, owner_caller: bool) -> bool {
     if owner_caller {
         return false;
@@ -9275,7 +9348,7 @@ fn queue_blocked_seats(daemon: &Arc<Daemon>) -> Vec<BlockedSeat> {
         }
         let (head, depth) = {
             let q = s.pending_queue.lock().unwrap_or_else(|e| e.into_inner());
-            match q.front().cloned() {
+            match queue_age_head(&q).cloned() {
                 Some(h) => (h, q.len()),
                 None => continue,
             }
@@ -10994,8 +11067,7 @@ pub(crate) fn deliver_head_locked(
         //   드러낸다. 프레임 **불변**을 요구하지 않는 이유는 종전과 같다(연속 출력 노드의 기아 #1).
         // ★(0.14.31 · 성찰 Q11) 간격은 상수가 아니라 **머리 나이의 함수**다(호출부 선판정과 같은
         //   산식 · 권위는 여기). 머리는 여기서 훔쳐보기만 한다(제거는 결판 뒤 · 유실 창 봉인).
-        let head_wait_for_interval = q
-            .front()
+        let head_wait_for_interval = queue_age_head(&q)
             .map(|e| queue_head_wait_secs(now, e.enqueued_at, daemon.started_at, s.created_at))
             .unwrap_or(0);
         let min_interval =
@@ -11046,7 +11118,7 @@ pub(crate) fn deliver_head_locked(
         let mut picked: Vec<usize> = if merge_on && q.len() > 1 {
             let prefix = queue_digest_prefix(q.iter().map(|e| e.text.as_str()));
             let froms: Vec<Option<String>> = q.iter().take(prefix).map(|e| e.from.clone()).collect();
-            let origins: Vec<String> = q.iter().take(prefix).map(|e| e.origin.clone()).collect();
+            let origins: Vec<String> = q.iter().take(prefix).map(merge_origin_key).collect();
             let chars: Vec<usize> = q.iter().take(prefix).map(|e| e.text.chars().count()).collect();
             plan_queue_merge(
                 &froms,
@@ -13157,7 +13229,7 @@ fn deliver_queued(
         // 배달 0건으로 안전)뿐이고, 배달 자체는 헬퍼 임계영역이 그 시점 머리로 원자 수행한다.
         let (head, depth) = {
             let q = s.pending_queue.lock().unwrap();
-            match q.front().cloned() {
+            match queue_age_head(&q).cloned() {
                 Some(h) => (h, q.len()),
                 None => {
                     starve_alerted.remove(&s.id);
@@ -16659,6 +16731,7 @@ mod tests {
             revived_at: None,
             expired_notified: false,
             expired_event_sent: false,
+            authoritative: false,
         }
     }
 

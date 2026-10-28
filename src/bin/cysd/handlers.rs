@@ -1859,8 +1859,10 @@ fn caller_creator_entry(
 ///     `governance::release_quiescing` - none of which ever sets it back to `None`, and it is never hydrated at
 ///     create/restore. So the state can close early (a refusal) but never re-open.
 /// A just-created composer holds nothing the operation did not supply (CEO: newness, not identity, makes it safe), and
-/// the state ends that newness without a clock. The creator ledger's own retention (CREATE_CALLER_TTL_SECS) can only
-/// remove the entry - a refusal - never extend it.
+/// the state ends that newness. ★(CEO ruling 7c89eda5 sec 2 - label) This is BOUNDED BY ONE WATCHDOG TICK FROM AGENT START, not
+/// "a state, not an age": D9 reaches the seat only through `d9_scope`, whose `seat_is_agent_backed` inputs only the watchdog tick
+/// writes (WATCHDOG_INTERVAL_SECS = 5), so the newness argument holds only inside that one tick (RESIDUAL-C2 (h1), report addendum 1).
+/// The creator ledger's own retention (CREATE_CALLER_TTL_SECS) can only remove the entry - a refusal - never extend it.
 fn d9_boot_creator(
     daemon: &Daemon,
     surface: &crate::state::Surface,
@@ -6884,6 +6886,15 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
                 let entry_from = verified_from.map(cys::surface_ref).or_else(|| {
                     params.get("from").and_then(|v| v.as_str()).map(str::to_string)
                 });
+                // ★(0.14.56 · P1 D9 reinject order · impl/DESIGN-ADDENDUM-D9-reinject-order.md rev 1 §3; head rulings 171d431a9879596a,
+                //   d8f5cad3c957c3ed) A converted AUTHORITATIVE send (the cycle's step-7 reinject, a boot directive) is marked when its
+                //   caller passes the gate: the daemon's `authoritative_caller_ok`, or the target's current cycle owner. Computed before the
+                //   queue lock (both read other locks).
+                let authoritative = converted
+                    && params.get("authoritative").and_then(|v| v.as_bool()).unwrap_or(false)
+                    && (authoritative_caller_ok(daemon, verified_from, caller_pid)
+                        || governance::caller_is_cycle_owner(daemon, &surface, caller_pid));
+                let pinned = if authoritative { governance::queue_pinned_ids(daemon, &surface) } else { Default::default() };
                 let (entry, depth) = {
                     let mut q = surface.pending_queue.lock().unwrap();
                     if q.len() >= 100 {
@@ -6893,8 +6904,15 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
                             "pending queue cap (100) reached",
                         ));
                     }
-                    let entry = daemon.next_queue_entry(text.clone(), entry_from, "send");
-                    q.push_back(entry.clone());
+                    let mut entry = daemon.next_queue_entry(text.clone(), entry_from, "send");
+                    entry.authoritative = authoritative;
+                    // Head placement (§2): behind the pinned prefix and earlier authoritative jobs; every other send keeps the tail.
+                    let at = if authoritative {
+                        governance::authoritative_insert_pos(&q, &pinned, &surface.inject_reservation_ids())
+                    } else {
+                        q.len()
+                    };
+                    q.insert(at, entry.clone());
                     (entry, q.len())
                 };
                 // ★G1(W2-B): payload는 enqueue 3경로 공용 빌더(기존 키 bytes/depth/from 불변
@@ -15414,6 +15432,7 @@ mod tests {
                 revived_at: None,
                 expired_notified: true,
                 expired_event_sent: true,
+                authoritative: false,
             };
             dest.expired_queue.lock().unwrap().push_back(e);
         };

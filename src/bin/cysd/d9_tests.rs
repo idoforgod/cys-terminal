@@ -803,3 +803,205 @@ fn d9_residual_h1_text_is_held_for_its_sender_within_the_window() {
         assert_eq!(gen(&h2), g1, "{label} (h2) converted: nothing written at receipt");
     }
 }
+
+// ===== ★(0.14.56 · P1 D9 reinject order · impl/DESIGN-ADDENDUM-D9-reinject-order.md rev 1 §8; head rulings 171d431a9879596a,
+//   d8f5cad3c957c3ed) A converted AUTHORITATIVE send whose caller passes the gate goes ahead of ordinary queued items, behind any
+//   pinned (held / in-flight) prefix and behind earlier authoritative jobs. RED on afcbe1d3 (+ the field and gate, placement unchanged). =====
+
+/// An ordinary report queued for the master by a worker pane (`--queued`: the tail).
+fn queued_report(fx: &Fx, m: &Arc<Surface>, pid: u32, text: &str) {
+    let r = send(fx, Some(pid), m, text, json!({"queued": true}));
+    assert_eq!(r["ok"], json!(true), "{r}");
+}
+
+/// An authoritative send (as `inject_text` makes it).
+fn auth(fx: &Fx, pid: Option<u32>, m: &Arc<Surface>, text: &str) -> Value {
+    send(fx, pid, m, text, json!({"authoritative": true}))
+}
+
+/// Quiesce `m` as cycle-agent does (`bind_owner`), from `pid`.
+fn quiesce_as_cycle(fx: &Fx, pid: u32, m: &Arc<Surface>) {
+    let r = rpc(fx, Some(pid), "surface.quiesce", json!({"surface_id": m.id, "on": true, "bind_owner": true}));
+    assert_eq!(r["ok"], json!(true), "{r}");
+}
+
+fn queue_auth_flags(s: &Arc<Surface>) -> Vec<bool> {
+    s.pending_queue.lock().unwrap().iter().map(|e| e.authoritative).collect()
+}
+
+/// A1 (arm 1): a cso pane's authoritative inject is placed ahead of reports already queued (the cycle reinject's order at the pin).
+/// Mutant: keep `push_back` for authoritative entries.
+#[test]
+fn d9_order_a1_cso_authoritative_inject_goes_ahead_of_queued_reports() {
+    let fx = fx("ord-a1");
+    let m = master(&fx);
+    let _w = pane(&fx, "worker-1", P + 40);
+    let _c = pane(&fx, "cso", P + 41);
+    queued_report(&fx, &m, P + 40, "[보고] r1");
+    queued_report(&fx, &m, P + 40, "[보고] r2");
+    assert_converted(&auth(&fx, Some(P + 41), &m, "[RESUME] a1"));
+    assert_eq!(queue_texts(&m), vec!["[RESUME] a1", "[보고] r1", "[보고] r2"]);
+    assert_eq!(queue_auth_flags(&m), vec![true, false, false]);
+}
+
+/// A1 (arm 2): the target's current cycle owner (a real process: this test runner, quiesce with `bind_owner`) - its authoritative
+/// inject goes first although it resolves to no pane (the CSO's cycle-agent case, measured caller null). Mutant: drop arm 2.
+#[test]
+fn d9_order_a1_cycle_owner_inject_goes_ahead_of_queued_reports() {
+    let fx = fx("ord-a1b");
+    let m = master(&fx);
+    let _w = pane(&fx, "worker-1", P + 42);
+    let me = std::process::id();
+    quiesce_as_cycle(&fx, me, &m);
+    queued_report(&fx, &m, P + 42, "[보고] r1");
+    assert_converted(&auth(&fx, Some(me), &m, "[RESUME] a1b"));
+    assert_eq!(queue_texts(&m), vec!["[RESUME] a1b", "[보고] r1"]);
+}
+
+/// A2 negatives: the flag with no arm stays at the tail - an unresolved off-pane pid, a worker pane, a non-owner process while the
+/// target is quiesced by another, and the would-be owner when nothing is quiesced.
+#[test]
+fn d9_order_a2_authoritative_flag_without_an_arm_stays_at_the_tail() {
+    let me = std::process::id();
+    for (i, case) in ["unresolved", "worker", "not_owner", "not_quiesced"].into_iter().enumerate() {
+        let fx = fx(&format!("ord-a2-{i}"));
+        let m = master(&fx);
+        let _w = pane(&fx, "worker-1", P + 50);
+        if case == "not_owner" {
+            quiesce_as_cycle(&fx, me, &m);
+        }
+        queued_report(&fx, &m, P + 50, "[보고] r1");
+        let caller = match case {
+            "unresolved" | "not_owner" => Some(P + 59), // no pane, no live process
+            "worker" => Some(P + 50),
+            _ => Some(me),
+        };
+        assert_converted(&auth(&fx, caller, &m, "[RESUME] a2"));
+        assert_eq!(queue_texts(&m), vec!["[보고] r1", "[RESUME] a2"], "{case}");
+        assert_eq!(queue_auth_flags(&m), vec![false, false], "{case}: not marked");
+    }
+}
+
+/// A3: never ahead of a pinned head - a persisted write hold on the front (the restart-adoption premise) and an in-memory partial
+/// QueueHold: the authoritative job goes right behind it, still ahead of the other reports. Mutant: ignore write_holds / queue_hold.
+#[test]
+fn d9_order_a3_never_ahead_of_a_held_head() {
+    for held in ["persisted", "in_memory"] {
+        let fx = fx(&format!("ord-a3-{held}"));
+        let m = master(&fx);
+        let _w = pane(&fx, "worker-1", P + 60);
+        let _c = pane(&fx, "cso", P + 61);
+        queued_report(&fx, &m, P + 60, "[보고] held");
+        queued_report(&fx, &m, P + 60, "[보고] r2");
+        let head = m.pending_queue.lock().unwrap()[0].id.clone();
+        if held == "persisted" {
+            fx.daemon.write_holds.lock().unwrap().insert(
+                head.clone(),
+                crate::state::PersistedWriteHold {
+                    kind: "partial_exact".into(),
+                    reason: "test".into(),
+                    request_id: "rq".into(),
+                    entry_ids: vec![head.clone()],
+                    body_offset: 3,
+                    held_at: crate::state::now_epoch(),
+                },
+            );
+        } else {
+            *m.queue_hold.lock().unwrap() = Some(crate::state::QueueHold {
+                kind: crate::state::QueueHoldKind::PartialExact,
+                reason: "test".into(),
+                request_id: "rq".into(),
+                entry_ids: vec![head.clone()],
+                since: std::time::Instant::now(),
+                attempts: 1,
+                next_retry: None,
+                envelope: None,
+                notified: false,
+                resume: None,
+                resuming: false,
+            });
+        }
+        assert_converted(&auth(&fx, Some(P + 61), &m, "[RESUME] a3"));
+        assert_eq!(queue_texts(&m), vec!["[보고] held", "[RESUME] a3", "[보고] r2"], "{held}");
+    }
+}
+
+/// A4: FIFO among authoritative jobs - two in a row keep their order, both ahead of the reports. Mutant: insert at index 0 always.
+#[test]
+fn d9_order_a4_authoritative_jobs_keep_fifo_among_themselves() {
+    let fx = fx("ord-a4");
+    let m = master(&fx);
+    let _w = pane(&fx, "worker-1", P + 70);
+    let _c = pane(&fx, "cso", P + 71);
+    queued_report(&fx, &m, P + 70, "[보고] r1");
+    assert_converted(&auth(&fx, Some(P + 71), &m, "directive one"));
+    assert_converted(&auth(&fx, Some(P + 71), &m, "directive two"));
+    assert_eq!(queue_texts(&m), vec!["directive one", "directive two", "[보고] r1"]);
+}
+
+/// A7 (queue pair, no-runaway half): one authoritative inject is exactly one queue job and its Return is absorbed, not re-sent - no
+/// second entry, nothing typed. The delivery half (the report behind it still goes out) is measured in the rig e2e.
+#[test]
+fn d9_order_a7_one_job_per_authoritative_inject_and_its_return_absorbed() {
+    let fx = fx("ord-a7");
+    let m = master(&fx);
+    let _w = pane(&fx, "worker-1", P + 80);
+    let _c = pane(&fx, "cso", P + 81);
+    queued_report(&fx, &m, P + 80, "[보고] r1");
+    let g0 = gen(&m);
+    assert_converted(&auth(&fx, Some(P + 81), &m, "[RESUME] a7"));
+    assert_absorbed(&ret(&fx, Some(P + 81), &m, json!({"authoritative": true})));
+    assert_eq!(queue_texts(&m).len(), 2, "one job for the inject");
+    assert_eq!(gen(&m), g0, "nothing typed");
+}
+
+fn qe(id: &str, from: &str, enqueued_at: f64, authoritative: bool) -> crate::state::QueueEntry {
+    crate::state::QueueEntry {
+        id: id.into(),
+        seq: 1,
+        text: format!("body {id}"),
+        enqueued_at,
+        from: Some(from.into()),
+        origin: "send".into(),
+        ttl_secs: None,
+        paused_total_secs: 0.0,
+        expired_at: None,
+        revived_at: None,
+        expired_notified: false,
+        expired_event_sent: false,
+        authoritative,
+    }
+}
+
+fn merge_plan(q: &[crate::state::QueueEntry]) -> Vec<usize> {
+    let froms: Vec<Option<String>> = q.iter().map(|e| e.from.clone()).collect();
+    let origins: Vec<String> = q.iter().map(crate::governance::merge_origin_key).collect();
+    let chars: Vec<usize> = q.iter().map(|e| e.text.chars().count()).collect();
+    crate::governance::plan_queue_merge(&froms, &origins, &chars, 5, 4000)
+}
+
+/// A5 (MERGE closure): an authoritative head goes alone - never merged with a later same-from report (two submissions, [RESUME]
+/// first), nor two authoritative jobs with each other; ordinary same-from entries still merge as at the pin (control).
+/// Mutant: `merge_origin_key` returns the plain origin.
+#[test]
+fn d9_order_a5_authoritative_entry_is_a_merge_barrier() {
+    let now = crate::state::now_epoch();
+    assert_eq!(merge_plan(&[qe("a", "cli:inject", now, true), qe("r", "cli:inject", now, false)]), vec![0], "[RESUME] alone");
+    assert_eq!(merge_plan(&[qe("a", "x", now, true), qe("b", "x", now, true)]), vec![0], "two authoritative never merge");
+    assert_eq!(merge_plan(&[qe("r1", "x", now, false), qe("r2", "x", now, false)]), vec![0, 1], "control: ordinary merge unchanged");
+}
+
+/// A6 (AGES closure): the stuck-queue age reads the oldest blocked item - an old report behind a fresh head-placed job; an old
+/// authoritative job ahead of a newer report; the front when nothing is authoritative; a held ordinary front ahead of an
+/// authoritative job. Mutant: `queue_age_head` returns the front.
+#[test]
+fn d9_order_a6_age_head_is_the_oldest_blocked_item() {
+    let now = crate::state::now_epoch();
+    let q = |v: Vec<crate::state::QueueEntry>| v.into_iter().collect::<std::collections::VecDeque<_>>();
+    let id = |q: &std::collections::VecDeque<crate::state::QueueEntry>| crate::governance::queue_age_head(q).map(|e| e.id.clone());
+    assert_eq!(id(&q(vec![qe("auth", "c", now, true), qe("old", "w", now - 700.0, false)])), Some("old".into()));
+    assert_eq!(id(&q(vec![qe("auth", "c", now - 900.0, true), qe("new", "w", now, false)])), Some("auth".into()));
+    assert_eq!(id(&q(vec![qe("r1", "w", now, false), qe("r0", "w", now - 50.0, false)])), Some("r1".into()), "pin: the front");
+    assert_eq!(id(&q(vec![qe("held", "w", now - 10.0, false), qe("auth", "c", now - 20.0, true)])), Some("held".into()));
+    assert_eq!(id(&q(vec![])), None);
+}

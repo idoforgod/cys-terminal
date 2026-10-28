@@ -146,6 +146,11 @@ pub struct QueueEntry {
     /// 1회면 족하고, 재시도 대상은 통지뿐이다.
     #[serde(default)]
     pub expired_event_sent: bool,
+    /// ★(0.14.56 · P1 D9 reinject order · impl/DESIGN-ADDENDUM-D9-reinject-order.md rev 1) A send D9 converted into this queue job whose
+    /// request was `authoritative` AND whose caller passed the head-placement gate (`authoritative_caller_ok`, or the target's current
+    /// cycle owner). The WAL row carries it only when true (ordinary rows stay byte-identical); an old daemon drops it (= ordinary).
+    #[serde(default)]
+    pub authoritative: bool,
 }
 
 /// ★(0.14.31 · WP-5 M) 큐 항목 TTL 기본(초) = 6h. env `CYS_QUEUE_TTL_SECS` 가 덮는다
@@ -168,7 +173,7 @@ pub fn queue_ttl_default_secs() -> u64 {
 /// TTL 회계 키는 전부 additive 라, 구 데몬이 이 파일을 다시 쓰면 사라졌다가 신 데몬 재기동 시
 /// serde default 로 되살아난다(활성 항목의 만료는 보존된 `enqueued_at` 기준 재계산 = 무손실).
 pub fn queue_entry_row(surface_id: u64, role: &Option<String>, e: &QueueEntry) -> Value {
-    json!({
+    let mut row = json!({
         "mid": queue_mid(surface_id, &e.text), "id": e.id, "seq": e.seq,
         "surface_id": surface_id, "role": role, "text": e.text,
         "enqueued_at": e.enqueued_at, "from": e.from, "origin": e.origin,
@@ -177,7 +182,12 @@ pub fn queue_entry_row(surface_id: u64, role: &Option<String>, e: &QueueEntry) -
         "expired_notified": e.expired_notified,
         // ★(0.14.31 · 리뷰 R1) 이벤트 래치 — 재기동이 만료 이벤트를 다시 쏘지 않게 관통한다.
         "expired_event_sent": e.expired_event_sent,
-    })
+    });
+    // ★(0.14.56 · P1 D9 reinject order) only when true - an ordinary row is byte-identical to the pin's.
+    if e.authoritative {
+        row["authoritative"] = json!(true);
+    }
+    row
 }
 
 /// ★(0.14.31 · WP-5 M) WAL 행(Value) → `QueueEntry` 되살림 — rehome 의 되살림 규칙과 같은 값
@@ -218,6 +228,7 @@ pub fn queue_entry_from_row(it: &Value) -> QueueEntry {
             .get("expired_event_sent")
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
+        authoritative: it.get("authoritative").and_then(|v| v.as_bool()).unwrap_or(false),
     }
 }
 
@@ -2427,6 +2438,12 @@ impl Surface {
     }
 
     /// 지금 인계 예약이 걸려 있는가(같은 좌석의 이중 인계 차단 · 배달 임계영역 전용).
+    /// ★(0.14.56 · P1 D9 reinject order) The in-flight hand-off's entry ids (empty if none) - an authoritative job is never placed
+    /// ahead of them. Lock order: callers hold `pending_queue` first, as `cancel_inject_reservation_locked` does.
+    pub fn inject_reservation_ids(&self) -> Vec<String> {
+        self.inject_reservation.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|r| r.ids.clone()).unwrap_or_default()
+    }
+
     pub fn inject_reserved(&self) -> bool {
         self.inject_reservation.lock().unwrap_or_else(|e| e.into_inner()).is_some()
     }
@@ -6521,6 +6538,7 @@ impl Daemon {
             revived_at: None,
             expired_notified: false,
             expired_event_sent: false,
+            authoritative: false,
         }
     }
 
@@ -12111,6 +12129,7 @@ mod tests {
             revived_at: None,
             expired_notified: false,
             expired_event_sent: false,
+            authoritative: false,
         }
     }
 
@@ -12315,6 +12334,7 @@ mod tests {
             revived_at: None,
             expired_notified: false,
             expired_event_sent: false,
+            authoritative: false,
         }
     }
 
