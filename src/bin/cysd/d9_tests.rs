@@ -658,3 +658,29 @@ fn d9_creator_g_prime_pin_draft_gate_covers_text_before_the_first_turn() {
     assert_ne!(r["error"]["code"], json!("composer_key_denied"), "this refusal is the pin's, not D9's: {r}");
     assert_eq!(gen(&m), g0);
 }
+
+/// (h, head ruling 28f2b064) an IN-SEAT boot by a non-creator: the master surface was made by someone else (another
+/// process, or no recorded creator at all - an empty shell from new-surface/GUI), a relauncher (restore in-seat,
+/// node-recover) answers the folder-trust gate with no turn yet -> REFUSED, 0 bytes (residual, named; the CLI makes the
+/// refusal loud: restore keeps the seat as gated, node-recover exits 79).
+#[test]
+fn d9_residual_h_in_seat_boot_by_a_non_creator_is_refused() {
+    let fx = fx("res-h");
+    let m = master(&fx);
+    let (maker, relauncher) = (kid(), kid());
+    record_creator(&fx, m.id, maker.0.id(), crate::state::peer_start_time(maker.0.id()), 5.0);
+    paint_trust(&m);
+    let g0 = gen(&m);
+    assert_denied(&ret(&fx, Some(relauncher.0.id()), &m, json!({"authoritative": true})));
+    assert_eq!(gen(&m), g0);
+    let m2 = {
+        let s = seat(&fx, "ceo");
+        fx.daemon.roles.lock().unwrap().insert("ceo".into(), s.id);
+        *s.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+        s
+    };
+    paint_trust(&m2);
+    let g1 = gen(&m2);
+    assert_denied(&ret(&fx, Some(relauncher.0.id()), &m2, json!({"authoritative": true})));
+    assert_eq!(gen(&m2), g1, "no creator recorded at all (an empty shell from new-surface) - refused, 0 bytes");
+}

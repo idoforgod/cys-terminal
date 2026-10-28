@@ -674,6 +674,12 @@ pub const ERR_JOURNAL_UNAVAILABLE: &str = "journal_unavailable";
 /// of `run()` and `run_reinject`), the launch-agent arm (pane kept), node-recover's fold (non-destructive rc 79) and
 /// `cycle_agent_exit`. Like the code above, it must never contain the typing-guard strings.
 pub const ERR_WRITE_OUTCOME_UNKNOWN: &str = "write_outcome_unknown";
+/// ★(0.14.56 · P1 D9) Error code of a key or control-only text refused at receipt on a master/CEO composer (zero bytes):
+/// an untokened Return from a caller that is not the seat's creator-before-first-turn, or text with no printable byte.
+/// Producer = cysd handlers (the D9 arms of `surface.send_text` / `surface.send_key`); consumers = `cys` node-recover's
+/// fold (non-destructive rc 79) and restore's in-seat arm (seat kept, no fresh fallback). Must never contain the
+/// typing-guard strings (that would turn it into a `--queued` fallback).
+pub const ERR_COMPOSER_KEY_DENIED: &str = "composer_key_denied";
 /// 직접 send 초안 거부의 사유 태그 — 기존 타이핑 가드 메시지 접두 뒤에 붙인다.
 pub const DRAFT_GATE_TAG: &str = "draft_gate";
 /// ★(0.14.43 · C5 · RQFIX I-8) 유령 계수 처방 — 데몬이 직접 send 거부 응답·강제 배달 거부 문구의 **맨 끝**에 덧붙이고(앞 문구·접두·태그의 위치·바이트는 불변),

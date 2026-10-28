@@ -1093,12 +1093,26 @@ fn recover_refusal_from_input_guard(e: String) -> String {
             "{RECOVER_REFUSED_TOKEN} writer journal refused the recovery write (zero bytes) — no reclaim, no kill; \
              make the daemon's writer journal writable, then boot again: {e}"
         )
+    } else if is_composer_key_denied(&e) && !is_recover_refusal(&e) {
+        // ★(0.14.56 · P1 D9 · head ruling 28f2b064) a master/CEO seat refused this relauncher's boot-gate Return (zero bytes):
+        //   node-recover is not the seat's creator, and the agent is ALIVE at that gate - rc 1 would reach run_boot's reclaim.
+        format!(
+            "{RECOVER_REFUSED_TOKEN} the master/CEO composer refused this relauncher's key (zero bytes) — no reclaim, no kill; \
+             the agent is waiting at a boot gate (e.g. folder trust): answer it on that seat (a person, or the head/CEO after a \
+             screen read), then boot again: {e}"
+        )
     } else {
         // ★(B-360 R2 revise · S60) an UNKNOWN is NOT folded into the 79 token any more: node-recover exits 91 for it
         //   (distinct from REFUSED / a human draft / agent-alive), and run_boot's inverted consumer (B-406) maps 91 to
         //   the non-destructive `recover_unknown` — no reclaim, no kill, no re-send.
         e
     }
+}
+
+/// ★(0.14.56 · P1 D9) Did a master/CEO composer refuse this key or text at receipt (zero bytes typed)? Pure; the code is
+/// `cys::ERR_COMPOSER_KEY_DENIED` as `rpc_roundtrip` renders it (`<code>: <message>`).
+fn is_composer_key_denied(e: &str) -> bool {
+    e.contains(&format!("{}: ", cys::ERR_COMPOSER_KEY_DENIED))
 }
 
 /// ★(B-360) Did the daemon refuse this direct write at the writer journal (zero bytes typed)? Pure; the code is
@@ -23375,6 +23389,18 @@ fn run_restore(cwd: Option<String>, include_master: bool, no_resume: bool) -> i3
                              `cys reinject --role {role} --check`): {e}"
                         );
                         record_kept_pane(sid, role, agent, &e, KeptWrite::of(&e, KeptWrite::Directive), KeptOutcome::of_err(&e));
+                        continue;
+                    }
+                    // ★(0.14.56 · P1 D9 · head ruling 28f2b064) the master/CEO composer refused a boot-gate key of this in-seat
+                    //   relaunch (zero bytes; this restore is not the seat's creator). The agent runs and waits at that gate,
+                    //   so a fresh fallback would put a second agent on the role. Keep the seat; it counts as gated (rc != 0).
+                    Err(e) if is_composer_key_denied(&e) => {
+                        gated += 1;
+                        println!(
+                            "· {role}: 좌석 내 재연결 — the master/CEO composer refused this relaunch's boot-gate key (zero bytes; \
+                             not the seat's creator) — seat surface:{sid} kept, no fresh launch. The agent waits at a boot gate \
+                             (e.g. folder trust): answer it on that seat, then `cys boot`: {e}"
+                        );
                         continue;
                     }
                     Err(e) => {
@@ -52437,5 +52463,51 @@ mod d9_send_print_tests {
         assert_eq!((aux, line.as_str()), (None, "OK → surface:3"));
         let (aux, line) = send_result_lines(true, &json!({"surface_id": 3, "queued": true, "depth": 2}), "");
         assert!(aux.is_none() && line.starts_with("QUEUED (depth 2)"), "{line}");
+    }
+}
+
+// ★(0.14.56 · P1 D9 · head ruling 28f2b064) a relauncher's refused boot-gate key is LOUD and non-destructive.
+#[cfg(test)]
+mod d9_relauncher_tests {
+    use super::*;
+
+    fn denied() -> String {
+        format!("{}: a Return into a master/CEO composer submits only a body its own sender queued", cys::ERR_COMPOSER_KEY_DENIED)
+    }
+
+    /// node-recover folds the refusal into the non-destructive code (79): run_boot does not reclaim (kill) a live agent
+    /// waiting at a boot gate. Mutant: drop the fold (catch-all rc 1 -> escalate_reclaim).
+    #[test]
+    fn node_recover_folds_composer_key_denied_into_the_non_destructive_code() {
+        let folded = recover_refusal_from_input_guard(denied());
+        assert!(is_recover_refusal(&folded), "{folded}");
+        assert!(folded.contains(cys::ERR_COMPOSER_KEY_DENIED), "the reason survives the fold: {folded}");
+        assert_eq!(recover_refusal_from_input_guard(folded.clone()), folded, "idempotent");
+    }
+
+    /// The predicate recognises only the daemon's code, and the code is not a typing-guard refusal (which would turn it
+    /// into a `--queued` fallback) nor a journal refusal.
+    #[test]
+    fn composer_key_denied_is_its_own_class() {
+        assert!(is_composer_key_denied(&denied()));
+        assert!(!is_typing_guard_err(&denied()), "must not divert to --queued");
+        assert!(!is_journal_refusal(&denied()));
+        assert!(!is_composer_key_denied(&format!("{}: {}", cys::ERR_TYPING_GUARD, cys::MSG_TYPING_GUARD)));
+        assert!(!is_composer_key_denied("composer_key_denied without the rpc rendering"));
+    }
+
+    /// restore in-seat keeps the seat on this refusal: its arm sits BEFORE the generic fresh-fallback arm, counts the seat
+    /// as gated (rc != 0) and continues without a fresh launch. Behaviour is measured in the isolated-daemon e2e cell (C);
+    /// this pins the arm order the fresh-fallback hazard depends on.
+    #[test]
+    fn restore_in_seat_arm_precedes_the_fresh_fallback() {
+        let src = include_str!("cys.rs");
+        let start = src.find("\nfn run_restore(").expect("run_restore");
+        let body = &src[start..start + 1 + src[start + 1..].find("\nfn ").expect("next fn")];
+        let arm = body.find("Err(e) if is_composer_key_denied(&e) => {").expect("in-seat composer_key_denied arm");
+        let fallback = body.find("좌석 내 재연결 실패({e}) — fresh 기동으로 폴백").expect("generic fallback arm");
+        assert!(arm < fallback, "the refusal would reach the fresh fallback first");
+        let seg = &body[arm..fallback];
+        assert!(seg.contains("gated += 1;") && seg.contains("continue;"), "{seg}");
     }
 }

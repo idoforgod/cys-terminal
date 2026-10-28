@@ -1853,9 +1853,11 @@ fn caller_creator_entry(
 /// Return reach the pin paths on a master/CEO seat in `d9_scope`? Only the LAUNCHING operation, only while the seat is new:
 ///   · identity - the recorded creator of this seat, same pid AND same process start time, caller not a pane
 ///     ([`creator_incarnation_matches`]; the pin's `caller_is_creator` at handlers.rs:1815 without its 30-minute age);
-///   · state - no turn has reached this incarnation's agent: `agent_status` is still `None`. Its one production writer is
-///     the `status.set` handler, reached by the hook ack when the injected directive carrying the boot nonce is submitted
-///     (cys.rs `hook_ack_boot_nonce`) or by the agent's own first `cys set-status`; it is never hydrated at create/restore.
+///   · state - no turn has reached this agent yet: `agent_status` is still `None`. It is set by three production writers -
+///     the `status.set` handler (the hook ack when the injected directive carrying the boot nonce is submitted, cys.rs
+///     `hook_ack_boot_nonce`, or the agent's own first `cys set-status`), `surface.quiesce` and
+///     `governance::release_quiescing` - none of which ever sets it back to `None`, and it is never hydrated at
+///     create/restore. So the state can close early (a refusal) but never re-open.
 /// A just-created composer holds nothing the operation did not supply (CEO: newness, not identity, makes it safe), and
 /// the state ends that newness without a clock. The creator ledger's own retention (CREATE_CALLER_TTL_SECS) can only
 /// remove the entry - a refusal - never extend it.
@@ -6861,11 +6863,11 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
             let (text, converted, had_trailing_crlf) = if d9 {
                 // A trailing CR/LF OUTSIDE any fence is the caller's own submit (no pair Return follows - minor m1, captured
                 // before stripping). The job's CR is the submit, so the run is stripped; a body the CLI already fenced
-                // (`inject_text`, cys.rs:4597) loses its one outer fence, because the queue job fences it itself.
+                // (`inject_text`, cys.rs:4596 at 9da2418d) loses its one outer fence, because the queue job fences it itself.
                 let had_trailing_crlf = text.ends_with(['\r', '\n']);
                 let body = d9_unfence(text.trim_end_matches(['\r', '\n'])).trim_end_matches(['\r', '\n']);
                 if d9_controls_only(body) {
-                    return Reply::Single(err_response(&id, "composer_key_denied", D9_TEXT_DENIED));
+                    return Reply::Single(err_response(&id, cys::ERR_COMPOSER_KEY_DENIED, D9_TEXT_DENIED));
                 }
                 if queued_param {
                     (text, false, false)
@@ -7484,7 +7486,7 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
                     }
                 }
                 if !d9_boot_creator(daemon, &surface, verified_from, caller_pid) {
-                    return Reply::Single(err_response(&id, "composer_key_denied", D9_RETURN_DENIED));
+                    return Reply::Single(err_response(&id, cys::ERR_COMPOSER_KEY_DENIED, D9_RETURN_DENIED));
                 }
             }
             // ★(0.14.52 · S-a C5b) A Return to an agent seat first binds its caller's held body (S4-3; token, else the
