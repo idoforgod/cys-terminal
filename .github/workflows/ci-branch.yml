@@ -1035,6 +1035,15 @@ jobs:
           #     핀(cys.rs 문자열 존재·순서)은 파싱 변이(`TP=${SS#*|}` → `TP=${SS%%|*}`)에 초록이었다 — 이 검체는 적색 43행.
           #     임시 팩(레포 hooks/ 사본)·격리 HOME·스텁 cys 만 쓰는 밀폐 검체(데몬 불요 · 라이브 무접촉) · test_hook_r34 옆 5곳.
           #     실측 2026-09-26 00:5x PDT · macOS arm64 · python 3.14.7 · sh·dash·bash 46행 rc=0 · 약 24s(10s 상한 행 1회 포함).
+          #   ★0.14.56 PHX-IMPL S2 5종 추가 등재 — phoenix 읽기 전용 `plan` 서브커맨드(DESIGN-r2 §4, §9):
+          #     test_phoenix_plan_cli(틀·exit·identity 계약·resolve 저널 없음) · test_phoenix_plan_certify(P1-P8 ·
+          #     P6 기준선 fold) · test_phoenix_plan_identity(plan 과 restore 의 대상 산정 동일성 · 한 경로 + 검체 내
+          #     변이 대조) · test_phoenix_plan_side_effect_free(GATE 1 — 쓰기 0·데몬 호출 0 · 검체 내 변이 M1-M8 ·
+          #     PHOENIX_HARNESS_CYSD 가 있으면 실 cysd 하네스 모드) · test_phoenix_result_file(PHOENIX_RESULT_FILE ·
+          #     deploy LEASE_HELD 회귀 핀). 공용 리그 tests/phoenix_plan_rig.py(검체 아님). 임시 HOME·가짜 cys 만 쓰는
+          #     밀폐 검체(라이브 무접촉) · POSIX 전용(fcntl·shebang 가짜 CLI) · test_phoenix_r32_restore_budget 옆 5곳.
+          #     실측 2026-10-29 00:4x KST(date) · macOS arm64 · python 3.9.6 · env -i 격리 HOME · 5종 rc=0(가짜 모드)
+          #     · 하네스 모드(실 cysd) GATE 1 45행 rc=0.
           for t in test_report_ghost test_hud_bridge_skew test_todo_shared_constants test_todo_stamp \
                    test_import_guard test_radio test_scrub test_bootstrap_chain test_snapshot \
                    test_dept_name_guard test_preflight_c03_states test_content_pins_parity \
@@ -1063,6 +1072,8 @@ jobs:
                    test_refl_wakeup_expiry_attribution \
                    test_phoenix_fresh_honest test_phoenix_f1_production_path test_phoenix_g2_ack_only test_phoenix_c6_due \
                    test_phoenix_r32_restore_budget test_phoenix_encoding_default \
+                   test_phoenix_plan_cli test_phoenix_plan_certify test_phoenix_plan_identity \
+                   test_phoenix_plan_side_effect_free test_phoenix_result_file \
                    test_report_ctx_axis test_formation_tick_visibility \
                    test_resource_gate_boot_anchor test_ctx_divergence \
                    test_state_rotate test_bootstrap_resource_recheck test_secret_scan_limit test_pack_guard_hooks_guidance test_silentpass_pack_c2 \
@@ -1900,6 +1911,8 @@ jobs:
                    test_refl_wakeup_expiry_attribution \
                    test_phoenix_fresh_honest test_phoenix_f1_production_path test_phoenix_g2_ack_only test_phoenix_c6_due test_reap_exited_matrix \
                    test_phoenix_r32_restore_budget test_phoenix_encoding_default \
+                   test_phoenix_plan_cli test_phoenix_plan_certify test_phoenix_plan_identity \
+                   test_phoenix_plan_side_effect_free test_phoenix_result_file \
                    test_report_ctx_axis test_formation_tick_visibility \
                    test_resource_gate_boot_anchor test_ctx_divergence \
                    test_state_rotate test_bootstrap_resource_recheck test_secret_scan_limit test_pack_guard_hooks_guidance test_silentpass_pack_c2 \

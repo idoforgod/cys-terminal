@@ -110,7 +110,10 @@ PHOENIX_EXIT_CORRUPT = 6   # 손상 감지 / cys identity 불일치 — 재시�
 def restore_exit_code(result):
     """run_restore 결과 dict → 프로세스 exit code(C1 계약). 최악 조건 우선(worst-wins):
     실 미부활(INCOMPLETE)이 세션 미검증(UNVERIFIED)보다, 손상/차단기가 그보다 상위다.
-    result 가 dict 가 아니면(비정상) 보수적으로 FAILED(1) — 성공 오판 방지."""
+    result 가 dict 가 아니면(비정상) 보수적으로 FAILED(1) — 성공 오판 방지.
+    ★LEASE_HELD(exit 0): 다른 복원이 `restore.run.lock` 또는 `restore.lease` 를 쥐고 있어 0.5 s 간격으로 4번 시도한 뒤(약 1.5 s · _acquire_lock_file)
+    **아무것도 계산하지 않고** 물러났다는 뜻이다 — 복원이 끝났다는 뜻이 아니다. exit 0 만으로는 VERIFIED·NOOP 와
+    구별되지 않으므로, 데몬은 `PHOENIX_RESULT_FILE` 에 남긴 판정(cmd_restore)으로 그것을 가려 한 번 재확인한다."""
     if not isinstance(result, dict):
         return PHOENIX_EXIT_FAILED
     verdict = result.get("phoenix_restore")
@@ -2188,6 +2191,8 @@ _LAST_LIVENESS_KNOWN = True
 #   known=True 가 된다. 둘 다 '관측된 부재'가 아니라 '부재한 관측'이므로 재개 판정의 증거가 될 수 없다.
 _LAST_LIVENESS_SOURCE = "status_json"      # "status_json" | "list_fallback"
 _LAST_LIVENESS_ENUMERATED = False          # status --json 응답에 "surfaces" 키가 실재했는가
+# 0.14.56 plan 의 observed.status_samples — 실 liveness 판독(_live_surfaces_raw) 횟수. plan 이 시작할 때 0 으로 둔다.
+_LIVENESS_SAMPLES = 0
 
 
 def _last_liveness_provenance():
@@ -2198,7 +2203,8 @@ def _last_liveness_provenance():
 
 def _live_surfaces_raw(socket):
     """실 liveness 파싱 — status --json(구조화) 우선·실패 시 list 폴백. _LAST_LIVENESS_KNOWN 을 갱신하고 dict 반환."""
-    global _LAST_LIVENESS_KNOWN, _LAST_LIVENESS_SOURCE, _LAST_LIVENESS_ENUMERATED
+    global _LAST_LIVENESS_KNOWN, _LAST_LIVENESS_SOURCE, _LAST_LIVENESS_ENUMERATED, _LIVENESS_SAMPLES
+    _LIVENESS_SAMPLES += 1
     st = _status_json(socket)
     if st is None:
         out, known = _live_role_surfaces_from_list(socket)
@@ -3055,7 +3061,10 @@ def _run_restore_locked(socket, ticket="default", stub=False, no_breaker=False, 
                               % (_kind, _rec.get("source")))
 
     j = load_journal(socket, ticket)
-    # C6 does not wait for grace or alter restoration eligibility.
+    # C6 does not wait for grace. It CAN change which roles are targets in one corner (0.14.56 CENSUS W2,
+    # measured): a role known only through an exited surface is a target when its reap is deferred and is not
+    # a target when the reap succeeds first. The read-only `plan` omits this reap, so its target set is a
+    # superset of this function's (the safe direction: a forced run, never a skipped one).
     c6 = c6_reap_stale_surfaces(socket)
     c6_stale = c6.get("detected", [])
     j.update(_c6_result_fields(c6))
@@ -3691,7 +3700,182 @@ def cmd_restore(args):
     )
     # ★W1/C1: CLI 진입점에서만 exit 를 방출한다(deploy 의 내부 run_restore 호출은 반환값을 쓰고
     #   자체 _finish 로 exit — 이 경로는 print_result=False 라 여기 오지 않는다). 판정→결정론 exit.
-    sys.exit(restore_exit_code(result))
+    code = restore_exit_code(result)
+    _write_result_file(result, code)
+    sys.exit(code)
+
+
+def _write_result_file(result, code):
+    """★0.14.56 D3: 데몬이 고른 `PHOENIX_RESULT_FILE` 이 설정됐을 때만 `{"phoenix_restore": <판정>, "exit": <코드>}`
+    를 원자적으로 남긴다 — exit 0 하나로는 VERIFIED·NOOP 와 LEASE_HELD(다른 복원이 진행 중이라 물러남)를 데몬이
+    가를 수 없기 때문이다. 변수가 없으면(CLI·deploy·사용자 스크립트) 아무것도 하지 않는다. 기록 실패는 exit 를
+    바꾸지 않는다 — 데몬은 결과 없음을 '판독 불가'로 읽고 한 번 재확인한다(안전한 쪽)."""
+    path = os.environ.get("PHOENIX_RESULT_FILE")
+    if not path:
+        return
+    verdict = result.get("phoenix_restore") if isinstance(result, dict) else None
+    try:
+        _atomic_write_json(path, {"phoenix_restore": verdict, "exit": code})
+    except Exception as _e:
+        log("결과 파일(PHOENIX_RESULT_FILE=%s) 기록 실패(%s: %s) — 데몬은 결과 없음으로 읽고 재확인한다."
+            % (path, type(_e).__name__, _e))
+
+
+# ------------------------------------------------------------------ plan (0.14.56 · 읽기 전용 계획)
+# 데몬이 부팅마다 "지금 복원하면 누구를 띄우는가"를 **아무것도 쓰지 않고** 묻는 진입점. 계산은 restore 와
+# 같은 함수(_desired_view · _compute_targets)를 부르고, restore 가 계산 앞에서 하는 효과(락·저널·intent
+# 재동기·C6 회수·손상 복구·영속·이벤트)는 하지 않는다. 그 효과가 대상 집합을 줄일 수 있는 상태(W3 intent ·
+# W4 손상)와, 입력이 읽히지 않았거나 phoenix 스스로 의심하는 상태(P6–P8)는 'uncertified' 로 올린다 —
+# 데몬은 certified 'empty' 에서만 복원을 건너뛴다. 출력은 stdout 의 **정확히 한 줄** `phoenix-plan/1 <JSON>`.
+
+PLAN_FRAME_PREFIX = "phoenix-plan/1 "
+PLAN_PROTOCOL = 1
+PLAN_OUTCOMES = ("empty", "targets", "uncertified")
+PLAN_BASELINE_MAX_BYTES = 64 * 1024      # 데몬의 계획 출력 판독 상한과 같다(r1 §5-2)
+
+
+def _plan_emit(obj):
+    """계획 한 줄 — ensure_ascii 라 줄바꿈·비ASCII 가 이스케이프돼 언제나 한 줄이다."""
+    sys.stdout.write(PLAN_FRAME_PREFIX + json.dumps(obj, ensure_ascii=True, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+
+def _plan_read_baseline(path):
+    """`--compare-plan F`(훅 앞의 계획 출력) 판독 → (B, reason). B = F.view_roles − F.view_tombstones.
+    F 는 정확히 한 개의 유효한 계획 줄(protocol 1 · outcome 세 값 · view_roles/view_tombstones 문자열 목록 ·
+    reasons 문자열 목록)을 담아야 한다. 아니면 (None, "compare_baseline_unreadable") — 비교하지 못한 것은 아무것도
+    증명하지 않는다. F 자신이 uncertified 사유를 가졌으면(입력이 손상돼 view 가 불완전할 수 있다) (None,
+    "compare_baseline_uncertified:<사유>") — 불완전한 기준선으로는 축소를 잡지 못한다(r2 리뷰 gemini1 · CEO 반영)."""
+    unreadable = (None, "compare_baseline_unreadable")
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(PLAN_BASELINE_MAX_BYTES + 1)
+    except (OSError, TypeError, ValueError):
+        return unreadable
+    if len(raw) > PLAN_BASELINE_MAX_BYTES:
+        return unreadable
+    lines = [ln[:-1] if ln.endswith("\r") else ln for ln in raw.decode("utf-8", "replace").split("\n")]
+    framed = [ln for ln in lines if ln.startswith(PLAN_FRAME_PREFIX)]
+    if len(framed) != 1:
+        return unreadable
+    try:
+        d = json.loads(framed[0][len(PLAN_FRAME_PREFIX):])
+    except ValueError:
+        return unreadable
+    if not isinstance(d, dict):
+        return unreadable
+    proto = d.get("phoenix_plan")
+    if type(proto) is not int or proto != PLAN_PROTOCOL or d.get("outcome") not in PLAN_OUTCOMES:
+        return unreadable
+    obs = d.get("observed")
+    if not isinstance(obs, dict):
+        return unreadable
+
+    def _strs(v):
+        return isinstance(v, list) and all(isinstance(x, str) for x in v)
+
+    roles, tombs, reasons = obs.get("view_roles"), obs.get("view_tombstones"), d.get("reasons")
+    if not (_strs(roles) and _strs(tombs) and _strs(reasons)):
+        return unreadable
+    if reasons:
+        return None, "compare_baseline_uncertified:" + ",".join(reasons)
+    return set(roles) - set(tombs), None
+
+
+def _plan_restore_budget(units):
+    """이 view 를 authority 의 `cys restore` 가 치를 예산(D4 · D4-prime 입력) → (outer_s, unit_s, source).
+    outer = restore_spawn_timeout_s 의 파생값과 같은 식(max(90, ceil(javis_budget.cys_restore_outer_s(U)))).
+    unit = 같은 함수로 잰 U+1 단위와 U 단위의 차 — 호출 시점의 javis_budget 에서 파생한다(리터럴 68.4 아님).
+    모듈 결손·스큐면 (90, None, "fallback") — 단위를 모르면 모른다고 적는다(결측은 값이 아니다)."""
+    floor = RESTORE_TIMEOUT_FLOOR_S
+    u = max(1, int(units or 0))
+    b = _budget_mod()
+    if b is not None:
+        try:
+            lo = float(b.cys_restore_outer_s(u))
+            hi = float(b.cys_restore_outer_s(u + 1))
+            if math.isfinite(lo) and math.isfinite(hi):
+                outer = max(floor, int(math.ceil(lo)))
+                return outer, max(floor, int(math.ceil(hi))) - outer, "javis_budget"
+        except Exception:
+            pass
+    return floor, None, "fallback"
+
+
+def _plan_compute(socket, compare_plan=None):
+    """계획 본체 — 쓰기 0. 반환 = 계획 JSON(dict). 판정 규칙은 DESIGN-r2 §4-3(P1–P8)."""
+    global _LIVENESS_SAMPLES
+    _LIVENESS_SAMPLES = 0
+    intents = _read_tombstone_intents(socket)
+    # restore 와 같은 한 경로. intent 재동기(효과)는 하지 않으므로 절단되지 않은 것으로 보고 멱등 재적용한다.
+    roster, tombstones, meta = _desired_view(socket, False, intents, False)
+    live, live_known = _live_role_surfaces_checked(socket)
+    _requested, _tomb_skipped, targets = _compute_targets(roster, tombstones, live, None)
+
+    reasons = []
+    if intents:                                                           # P2 (W3)
+        reasons.append("pending_tombstone_intents")
+    for _p, _kind in ((desired_roster_path(socket), "desired_roster"),   # P3 (W4)
+                      (dept_roster_path(socket), "dept_roster")):
+        _st = _roster_file_status(_p)
+        if _st == "corrupt":
+            reasons.append("retention_corrupt:" + _kind)
+        elif _st == "valid" and _recovered_provenance(_p):
+            reasons.append("retention_degraded:" + _kind)
+    if not live_known:                                                    # P4 (W9)
+        reasons.append("liveness_unknown")
+    if compare_plan is not None:                                          # P6
+        base, why = _plan_read_baseline(compare_plan)
+        if why:
+            reasons.append(why)
+        else:
+            shrunk = sorted(r for r in base if r not in roster)
+            if shrunk:
+                reasons.append("roster_shrunk_across_hook:" + ",".join(shrunk))
+            topo_tombs = set(meta["topo_tombs"])
+            unproven = sorted(r for r in base if r in tombstones
+                              and not (meta["replace"] == "replaced" and r in topo_tombs))
+            if unproven:
+                reasons.append("tombstoned_across_hook_unproven:" + ",".join(unproven))
+    if meta["topology_status"] == "error":                                # P7
+        reasons.append("topology_unreadable:state")
+    for _g in meta["snapshot_skipped"]:
+        reasons.append("topology_unreadable:generation:" + _g)
+    if _snapshot_roster_entries is not _SNAPSHOT_ROSTER_ENTRIES:
+        # 세대 판독기가 대역이면 파싱 실패 세대 목록을 받지 못한다 — 빈 목록을 '실패 없음'으로 믿지 않는다.
+        reasons.append("snapshot_reader_substituted")
+    if meta["replace"] == "regress_kept":                                 # P8
+        reasons.append("tombstone_rev_regress")
+    if meta["_persist"]["c3_refused"]:
+        # 한 번의 계획 안에서는 발화할 수 없다(r2 §4-3 C3 행) — 그래도 발화하면 반환 view 가 직전 영속본이라
+        # meta 의 replace·topo_tombs 와 어긋난다. 그 논증에 기대지 않고 닫는다.
+        reasons.append("c3_refused:" + ",".join(meta["_persist"]["c3_refused"]))
+
+    units = _restore_units_now(socket, live, True, roster, tombstones)
+    outer_s, unit_s, budget_src = _plan_restore_budget(units)
+    outcome = "targets" if targets else ("uncertified" if reasons else "empty")
+    return {"phoenix_plan": PLAN_PROTOCOL, "outcome": outcome, "targets": list(targets), "reasons": reasons,
+            "identity": "verified" if _CYS_IDENTITY == "verified" else "degraded-unverified",
+            "observed": {"entries": len(roster), "tombstones": len(tombstones), "live_known": bool(live_known),
+                         "c6_exited_surfaces": sum(1 for ss in live.values() for s in ss if s.get("exited")),
+                         "status_samples": _LIVENESS_SAMPLES,
+                         "view_roles": sorted(roster), "view_tombstones": sorted(tombstones),
+                         "replace": meta["replace"], "snapshot_skipped": list(meta["snapshot_skipped"]),
+                         "restore_units": units, "restore_outer_s": outer_s, "restore_unit_s": unit_s,
+                         "restore_budget_source": budget_src}}
+
+
+def cmd_plan(args):
+    """`plan [--compare-plan F]` — exit 0 = 계획을 계산했다(세 outcome 중 하나) · 내부 예외 = 오류 줄 + exit 1.
+    identity 계약 거부(exit 6)는 main 의 _resolve_cys(record=False) 에서 이미 났다. 데몬은 0 이 아닌 exit 를
+    줄 내용과 무관하게 '계획 없음'으로 읽는다."""
+    try:
+        plan = _plan_compute(args.socket, getattr(args, "compare_plan", None))
+    except Exception as _e:
+        _plan_emit({"phoenix_plan": PLAN_PROTOCOL, "outcome": "error", "error": repr(_e)[:300]})
+        sys.exit(1)
+    _plan_emit(plan)
+    sys.exit(0)
 
 
 # ------------------------------------------------------------------ B1 조정 패스
@@ -4733,6 +4917,10 @@ def main():
     # ★W2 콜드부트: cysd가 소켓 바인드 직후 detached 스폰. master 포함 강제(부활할 상위가 없으므로)
     #   — 단 master가 묘비면 부활 금지(1급 원칙이 include-master보다 상위, tombstone 병합으로 자동 배제).
     p.add_argument("--auto", action="store_true", help="콜드부트 자동 복원(master 포함·묘비는 배제)")
+    # ★0.14.56: 읽기 전용 계획 — restore 의 플래그가 아니라 서브커맨드다(플래그는 회귀로 무시되면 실제 복원이
+    #   돈다 · 모르는 서브커맨드는 argparse exit 2 라 데몬이 '계획 없음'으로 읽는다). deploy --plan 과 무관.
+    pl = sub.add_parser("plan")
+    pl.add_argument("--compare-plan", help="훅 앞에서 낸 계획 출력 파일(P6 기준선)")
     sub.add_parser("reconcile")
     sub.add_parser("status")
     rp = sub.add_parser("roster")  # Phase 4: desired 로스터 현황(침식 면역) + Phase7 부서
@@ -4768,8 +4956,10 @@ def main():
     #   (exit 124)됐다. 무실행 서브커맨드는 CYS 해석을 lazy 로 건너뛴다(실 subprocess 필요 경로는 모두 CYS 해석 후에
     #   실행되므로 무영향). die 경로(cys 부재)도 --plan 에선 부적절(계획 출력에 cys 불요)이라 함께 해소된다.
     _no_exec_plan = args.cmd == "deploy" and getattr(args, "plan", False)
-    CYS = None if _no_exec_plan else _resolve_cys(args.socket)
+    # plan 은 같은 identity 계약(같은 exit 6)을 거치되 resolve 저널(journal-resolve.json)을 쓰지 않는다.
+    CYS = None if _no_exec_plan else _resolve_cys(args.socket, record=(args.cmd != "plan"))
     {
+        "plan": cmd_plan,
         "restore": cmd_restore, "reconcile": cmd_reconcile, "status": cmd_status,
         "roster": cmd_roster, "inherit": cmd_inherit, "tombstone": cmd_tombstone,
         "gen-manual": cmd_gen_manual, "gen-protect": cmd_gen_protect, "deploy": cmd_deploy,
