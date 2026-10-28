@@ -18958,14 +18958,32 @@ mod tests {
     // 어떤 게이트 판정도 바뀌지 않는다(거부/통과 결과 불변) — 문구·필드만 잰다.
 
     /// 좌석 화면에 프롬프트 한 줄을 칠한다(PTY 쓰기 없음 — 에코가 픽스처를 덮지 않는다). `ghost` 는 커서 뒤에 남는 입력 추천 문구.
+    /// ★(0.14.56 · P1 D1 · head ruling on Q-suites-17-pins 5fffe0d9) `ghost` is drawn as Claude 2.1.312 draws a suggestion (first
+    /// glyph reverse = the CLI's drawn cursor, the rest SGR 2); a PLAIN run after the cursor is a Home-moved draft on a claude seat
+    /// ([`c5_paint_home_moved_draft`]).
     fn c5_paint_prompt(s: &Arc<crate::state::Surface>, typed: &str, ghost: &str) {
+        c5_paint_after_cursor(s, typed, ghost, true);
+    }
+
+    fn c5_paint_home_moved_draft(s: &Arc<crate::state::Surface>, text: &str) {
+        c5_paint_after_cursor(s, "", text, false);
+    }
+
+    fn c5_paint_after_cursor(s: &Arc<crate::state::Surface>, typed: &str, after: &str, dim: bool) {
         let mut p = s.parser.lock().unwrap();
         p.process(b"\x1b[2J\x1b[H");
         p.process(format!("❯ {typed}").as_bytes());
-        if !ghost.is_empty() {
+        if !after.is_empty() {
             // 열 계산을 손으로 하지 않는다 — 고스트를 쓰기 전 커서를 파서에게 물어 그 자리로 되돌린다(한글 = 2열).
             let (row, col) = p.screen().cursor_position();
-            p.process(ghost.as_bytes());
+            if dim {
+                let mut cs = after.chars();
+                let first = cs.next().unwrap();
+                let rest: String = cs.collect();
+                p.process(format!("\x1b[7m{first}\x1b[27m\x1b[2m{rest}\x1b[22m").as_bytes());
+            } else {
+                p.process(after.as_bytes());
+            }
             p.process(format!("\x1b[{};{}H", row + 1, col + 1).as_bytes());
         }
     }
@@ -19051,6 +19069,19 @@ mod tests {
             "문구는 커서 뒤 글자와 무관하게 같다(조건문 접미)"
         );
         assert_eq!((ev["draft_visible"].as_bool(), ev["remedy_code"].as_str()), (Some(false), Some("phantom_count")), "{ev}");
+
+        // ⓐ″ (0.14.56 · P1 D1 · head ruling 5fffe0d9) the plain-run case: the same text drawn PLAIN after the cursor (a Home-moved
+        //   draft) on a measured claude seat is a visible draft - refused with the pin wording, no Ctrl-U advice, remedy_code null (as ⓒ).
+        let plain = c5_agent_seat(&daemon, "worker-7", pid + 7, 3);
+        plain.d1_platform.store(true, Ordering::Relaxed);
+        let (resp, ev) = crate::state::test_until_no_pty_output(&plain, "c5 plain run denial", || {
+            c5_paint_home_moved_draft(&plain, "버그 수정 착수한다. 브랜치는");
+            (d12_rpc(&daemon, pid, "surface.send_text", text_params(&plain)), c5_last_denied_payload(&daemon))
+        });
+        d12_assert_denied(&resp, "pending_input");
+        assert_eq!(resp["error"]["message"].as_str().unwrap(), legacy_text("pending_input"), "a visible draft gets no Ctrl-U advice");
+        assert_eq!(ev["draft_visible"], json!(true), "{ev}");
+        assert!(ev["remedy_code"].is_null(), "{ev}");
 
         // ⓑ 같은 유령에 send-key Return(SubmitKey · human_draft) · C-u(CancelKey · 전용 문구) — 접두·태그 뒤 맨 끝에 같은 처방.
         //   `C-m` 은 별칭 키라 거부 문구에 실행 가능한 처방 hint 가 붙는다 — 유령 처방은 그 hint **뒤** 맨 끝이다.

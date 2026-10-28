@@ -18184,6 +18184,9 @@ mod tests {
         };
 
         // ⓐ V2 로 센 단독 Esc 의 잔여 1바이트 — 고스트가 떠 있어 stale 리셋이 불발한다.
+        // ★(0.14.56 · P1 D1 · head ruling on Q-suites-17-pins 5fffe0d9) The run in (a) is drawn PLAIN: on a measured claude seat that is a
+        //   Home-moved draft (D1 row 7), so the hold below is this family's plain-run case. A DIM suggestion beside the same stale count
+        //   now resets it (R-2, `p1_r2_stale_count_resets_beside_a_dim_suggestion`); (b) paints the suggestion dim.
         let v2 = pending_input_step_model(
             &PendingInputState::default(),
             b"\x1b",
@@ -18243,7 +18246,7 @@ mod tests {
         let bs = s.apply_pending_input(b"\x7f", InputOrigin::Human);
         assert_eq!((bs.count, bs.human), (0, 0), "ⓑ 기본 모델에서 빈 줄 Backspace 의 계수도 0: {bs:?}");
         assert_eq!(s.pending_input_bytes.load(AtomicOrdering::Relaxed), 0, "ⓑ 계수 미러도 0");
-        paint_prompt(&s, "", ghost);
+        paint_prompt_dim(&s, "", ghost);
         quiet_since(&s, 10);
         tick(&daemon);
         assert!(
@@ -28416,9 +28419,15 @@ after-tick liveness alone does not attribute a clock defect",
         let (daemon, s) = wp5_seat("c5-diag", "claude");
         let ghost = "버그 수정 착수한다. 브랜치는";
         // 빈 줄 + 커서 뒤 고스트(입력 추천).
-        paint_prompt(&s, "", ghost);
+        // ★(0.14.56 · P1 D1 · head ruling 5fffe0d9) The suggestion is drawn as Claude draws it (SGR 2); the same text drawn PLAIN is a
+        //   Home-moved draft on a measured claude seat - a visible draft (the plain-run case, right below).
+        paint_prompt_dim(&s, "", ghost);
         let d = queue_block_diag(&daemon, &s);
         assert_eq!((d.draft_visible, d.ghost_after_cursor), (Some(false), Some(true)), "{d:?}");
+        p1_measured(&s);
+        paint_prompt(&s, "", ghost);
+        let d = queue_block_diag(&daemon, &s);
+        assert_eq!((d.draft_visible, d.ghost_after_cursor), (Some(true), Some(true)), "plain run = visible draft: {d:?}");
         // 고스트 없는 빈 줄.
         paint_prompt(&s, "", "");
         let d = queue_block_diag(&daemon, &s);
@@ -28427,7 +28436,7 @@ after-tick liveness alone does not attribute a clock defect",
         paint_prompt(&s, "abc", "");
         let d = queue_block_diag(&daemon, &s);
         assert_eq!((d.draft_visible, d.ghost_after_cursor), (Some(true), Some(false)), "{d:?}");
-        paint_prompt(&s, "abc", ghost);
+        paint_prompt_dim(&s, "abc", ghost);
         let d = queue_block_diag(&daemon, &s);
         assert_eq!((d.draft_visible, d.ghost_after_cursor), (Some(true), Some(true)), "{d:?}");
         // 계수·모델·pause·패닉 — 사실 그대로.
@@ -28538,7 +28547,9 @@ after-tick liveness alone does not attribute a clock defect",
         let (head_id, head_at) = (e.id.clone(), e.enqueued_at);
         s.pending_queue.lock().unwrap().push_back(e);
         s.apply_pending_input(b"abc", InputOrigin::Human);
-        paint_prompt(&s, "", "버그 수정 착수한다. 브랜치는");
+        // ★(0.14.56 · P1 D1 · head ruling 5fffe0d9) a suggestion as Claude draws it (SGR 2); a plain run there is a Home-moved draft
+        //   (human_draft - `c5_queue_block_diag_observes_cursor_row_counts_pause_and_model`, `rqfix_f6_...` case 4).
+        paint_prompt_dim(&s, "", "버그 수정 착수한다. 브랜치는");
         quiet_since(&s, 10);
         tick(&daemon);
         assert_eq!(blocked_reason(&s), BLOCKED_INPUT_PENDING, "전제: 입력줄 계수로 막혔다");
@@ -28754,13 +28765,23 @@ after-tick liveness alone does not attribute a clock defect",
 
         // ⓐ 유령 — 사람 계수 3 + 빈 입력줄 → 거부는 그대로, 문구 끝에 처방.
         s.apply_pending_input(b"abc", InputOrigin::Human);
-        paint_prompt(&s, "", "버그 수정 착수한다. 브랜치는");
+        // ★(0.14.56 · P1 D1 · head ruling 5fffe0d9) the suggestion drawn as Claude draws it (SGR 2).
+        paint_prompt_dim(&s, "", "버그 수정 착수한다. 브랜치는");
         quiet_since(&s, 5);
         let denied = wp5_force(&daemon, &s, None, false).err().expect("유령 계수도 강제 배달은 거부된다(게이트 불변)");
         assert_eq!(denied, Wp5Denied::PromptGateGhost(BLOCKED_INPUT_PENDING));
         assert_eq!(denied.code(), "prompt_gate", "RPC 코드는 PromptGate 와 같다(CLI exit 판정 불변)");
         assert_eq!(denied.message(), format!("{}{GHOST_CTRL_U_SUFFIX}", legacy(BLOCKED_INPUT_PENDING)), "앞 문구는 종전 바이트 그대로 · 끝에만 처방");
         assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "거부 = 배달 0건(큐 그대로)");
+        // ⓐ′ (0.14.56 · P1 D1) the plain-run case: the same text drawn PLAIN after the cursor is a Home-moved draft on a measured
+        //   claude seat - a visible draft, refused with the pin wording and no Ctrl-U advice.
+        p1_measured(&s);
+        paint_prompt(&s, "", "버그 수정 착수한다. 브랜치는");
+        quiet_since(&s, 5);
+        let denied = wp5_force(&daemon, &s, None, false).err().expect("거부");
+        assert_eq!(denied, Wp5Denied::PromptGate(BLOCKED_INPUT_PENDING), "a Home-moved draft is no ghost");
+        assert_eq!(denied.message(), legacy(BLOCKED_INPUT_PENDING));
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1);
 
         // ⓑ 초안이 보인다 — 종전 문구 그대로.
         paint_prompt(&s, "미제출 초안", "");
@@ -29007,7 +29028,8 @@ after-tick liveness alone does not attribute a clock defect",
         assert_eq!((d.draft_visible, d.ghost_after_cursor), (Some(false), Some(false)), "{d:?}");
         assert_eq!(code(&d), "phantom_count");
         // 2) 빈 프롬프트 + 커서 뒤 글자 → 회색 제안인지 직접 쓴 글인지 사람이 가린다.
-        paint_prompt(&s, "", "버그 수정 착수한다. 브랜치는");
+        // ★(0.14.56 · P1 D1 · head ruling 5fffe0d9) the suggestion drawn as Claude draws it (SGR 2); a plain run is case 4.
+        paint_prompt_dim(&s, "", "버그 수정 착수한다. 브랜치는");
         let d = diag();
         assert_eq!((d.draft_visible, d.ghost_after_cursor), (Some(false), Some(true)), "{d:?}");
         assert_eq!(code(&d), "after_cursor_text");
@@ -29028,7 +29050,16 @@ after-tick liveness alone does not attribute a clock defect",
         assert_eq!((d.pending_input_human_bytes, d.draft_visible), (0, Some(false)), "{d:?}");
         assert_eq!(code(&d), "phantom_count", "사람 몫 0 이라고 '기계 본문이 보인다' 고 단정하지 않는다(F1)");
         // 4) 커서를 줄 머리에 둔 한 줄 초안(커서 앞 빈 · 커서 뒤 글) → 유령 단정이 아니다.
+        // ★(0.14.56 · P1 D1 · head ruling 5fffe0d9) the plain-run case: on a measured claude seat the plain run is a Home-moved draft,
+        //   a VISIBLE draft (the counts here are the machine's, from 3'). 4') the same text drawn dim keeps the after_cursor_text remedy.
+        p1_measured(&s);
         paint_screen(&s, &["❯ 직접 쓴 글"], 0, 2, false);
+        let d = diag();
+        assert_eq!((d.draft_visible, d.ghost_after_cursor), (Some(true), Some(true)), "{d:?}");
+        let c = code(&d);
+        assert_ne!(c, "phantom_count", "a visible draft is never a ghost count");
+        assert_eq!(c, "machine_residue", "machine count + visible text: {d:?}");
+        paint_screen(&s, &["❯ \x1b[7m직\x1b[27m\x1b[2m접 쓴 글\x1b[22m"], 0, 2, false);
         let d = diag();
         assert_eq!((d.draft_visible, d.ghost_after_cursor), (Some(false), Some(true)), "{d:?}");
         let (c, text) = queue_remedy(BLOCKED_INPUT_PENDING, &d);
@@ -31877,7 +31908,10 @@ mod h_machine_hold_tests {
             .collect::<Vec<_>>()
             .join("\n");
         // ⑤ 플레이스홀더 고스트 — 커서는 마커 바로 뒤, 고스트 제안은 커서 **뒤**에 그려진다.
-        let ghost = "────────────────────\n❯ Try \"refactor the parser\"\x1b[2;3H".to_string();
+        // ★(0.14.56 · P1 D1 · head ruling 5fffe0d9) drawn as Claude draws a suggestion (first glyph reverse, the rest SGR 2). Whether
+        //   ConPTY passes SGR 2 through is UNMEASURED - D1 is off on Windows seats (ruling W1 0048dfdf). The same text drawn PLAIN is
+        //   a Home-moved draft: the plain-run case after the loop.
+        let ghost = "────────────────────\n❯ \x1b[7mT\x1b[27m\x1b[2mry \"refactor the parser\"\x1b[22m\x1b[2;3H".to_string();
         let specimens: Vec<(&str, String, Option<MachineHold>)> = vec![
             ("CRLF 유휴", idle_crlf, None),
             ("우측 패딩 유휴", idle_padded, None),
@@ -31896,6 +31930,12 @@ mod h_machine_hold_tests {
                 );
             }
         }
+        // ★(0.14.56 · P1 D1) the plain-run case: the placeholder text drawn PLAIN after the cursor on a measured claude seat is a
+        //   Home-moved draft - Draft under the unix mask; the Windows default mask keeps the draft axis off.
+        s.d1_platform.store(true, std::sync::atomic::Ordering::Relaxed);
+        h_paint(&s, "────────────────────\n❯ Try \"refactor the parser\"\x1b[2;3H");
+        assert_eq!(machine_direct_hold_masked(&d, &s, want, unix), Some(MachineHold::Draft), "plain run (unix mask)");
+        assert_eq!(machine_direct_hold_masked(&d, &s, want, win), None, "plain run (Windows mask: draft axis off)");
         // 초안 — unix 마스크는 Draft, Windows 기본 마스크는 무발화(종전 직접 주입).
         h_paint(&s, H_DRAFT_SCREEN);
         assert_eq!(machine_direct_hold_masked(&d, &s, want, unix), Some(MachineHold::Draft));
