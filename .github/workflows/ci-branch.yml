@@ -1036,7 +1036,7 @@ jobs:
           #     임시 팩(레포 hooks/ 사본)·격리 HOME·스텁 cys 만 쓰는 밀폐 검체(데몬 불요 · 라이브 무접촉) · test_hook_r34 옆 5곳.
           #     실측 2026-09-26 00:5x PDT · macOS arm64 · python 3.14.7 · sh·dash·bash 46행 rc=0 · 약 24s(10s 상한 행 1회 포함).
           for t in test_report_ghost test_hud_bridge_skew test_todo_shared_constants test_todo_stamp \
-                   test_import_guard test_event_spool_rc test_radio test_scrub test_bootstrap_chain test_snapshot \
+                   test_import_guard test_event_spool_rc test_org_dispatch_delivers test_radio test_scrub test_bootstrap_chain test_snapshot \
                    test_dept_name_guard test_preflight_c03_states test_content_pins_parity \
                    test_role_bootstrap_hook test_seat_latch_negation \
                    test_hud_bridge_backoff test_preflight_c11b_seal test_wakeup_liveness \
@@ -1872,7 +1872,7 @@ jobs:
           set -euo pipefail
           echo "== [pack][ubuntu] release.yml pack-artifacts 와 동일 토큰 집합 · 동일 env 격리 =="
           for t in test_todo_decl test_todo_stamp test_report_ghost test_hud_bridge_skew \
-                   test_report_gate test_todo_shared_constants test_import_guard test_event_spool_rc test_radio test_scrub \
+                   test_report_gate test_todo_shared_constants test_import_guard test_event_spool_rc test_org_dispatch_delivers test_radio test_scrub \
                    test_bootstrap_chain test_snapshot \
                    test_role_bootstrap_hook test_seat_latch_negation \
                    test_hud_bridge_backoff test_preflight_c11b_seal test_wakeup_liveness \

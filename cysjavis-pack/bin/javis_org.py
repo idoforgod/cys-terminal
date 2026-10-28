@@ -823,7 +823,80 @@ def dispatch_task(t):
     if t.get("success"): cmd += ["--success", t["success"]]
     if t.get("dont"): cmd += ["--dont", t["dont"]]
     r = subprocess.run(cmd, capture_output=True, text=True)
-    return r.returncode, (r.stdout or "") + (r.stderr or "")
+    out = (r.stdout or "") + (r.stderr or "")
+    if r.returncode != 0:
+        return r.returncode, out
+    # ★0.14.56 E3: the ticket used to stop here (captured, then discarded) — deliver it and prove it arrived.
+    return _deliver_first_ticket(t, r.stdout or "", out)
+
+def _dept_socket_for(mission_key):
+    """The new department's socket from depts.json by mission_key. Exactly one match or None (never a guess)."""
+    reg = load_json(DEPTS, {"depts": {}})
+    hits = [e.get("socket") for e in (reg.get("depts") or {}).values()
+            if isinstance(e, dict) and e.get("mission_key") == mission_key and e.get("socket")]
+    return (hits[0] if len(hits) == 1 else None), len(hits)
+
+def _ledger_size(ledger):
+    try:
+        return os.path.getsize(ledger)
+    except OSError:
+        return 0
+
+def _ticket_receipt(ledger, nonce, start=0):
+    """'delivered' | 'expired' | None from the department's delivery ledger, for the queue item whose preview
+    carries the nonce. Reads only the bytes appended since `start` (the ledger can be megabytes; a shrunk file
+    means it was replaced, so it is read from 0). Shapes: src/bin/cysd/delivery.rs (queue_receipt / queue_tombstone)."""
+    rows = []
+    try:
+        with open(ledger, "rb") as f:
+            f.seek(start if start <= _ledger_size(ledger) else 0)
+            for l in f.read().decode("utf-8", "replace").splitlines():
+                try:
+                    rows.append(json.loads(l))
+                except ValueError:
+                    continue   # a partial last line or a torn row is not a receipt
+    except OSError:
+        return None
+    ids = {r.get("queue_entry_id") for r in rows if nonce in (r.get("preview") or "") and r.get("queue_entry_id")}
+    for r in rows:
+        hit = r.get("queue_entry_id") in ids or bool(ids & set(r.get("merged_ids") or []))
+        if hit and r.get("kind") == "receipt" and isinstance(r.get("delivered_at"), (int, float)):
+            return "delivered"
+        if hit and r.get("kind") == "tombstone":
+            return "expired"
+    return None
+
+def _deliver_first_ticket(t, ticket, out):
+    sock, n = _dept_socket_for(t["dept"])
+    if sock is None:
+        return 4, out + "\n[dispatch] dept_unresolved: %d registry entries carry mission_key=%r" % (n, t["dept"])
+    try:
+        import javis_lane   # the ledger path rule, mirrored from Rust (one owner — no copy here)
+    except Exception as e:
+        return 2, out + "\n[dispatch] ledger_unavailable: %s" % e
+    nonce = os.urandom(5).hex()   # the marker "[org-dispatch <10 hex>]" is 26 chars: inside the 64-char ledger preview
+    d = os.path.join(javis_lane.state_dir(), "org-dispatch")
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, "%s-%s-%s.txt" % (t["dept"], time.strftime("%Y%m%dT%H%M%S"), nonce))
+    with open(path, "w", encoding="utf-8") as f:   # durable copy; its first line carries the nonce the ledger preview shows
+        f.write("[org-dispatch %s] %s" % (nonce, ticket))
+    ledger = javis_lane.lane_state_path("delivery", sock)
+    start = _ledger_size(ledger)
+    s = subprocess.run(["cys", "--socket", sock, "send", "--queued", "--to", t.get("to", "worker"), "--file", path],
+                       capture_output=True, text=True, env={**os.environ, "CYS_NO_AUTOSTART": "1"})
+    if s.returncode != 0:
+        return s.returncode, out + "\n[dispatch] send_failed rc=%d: %s" % (s.returncode, (s.stderr or s.stdout or "")[-200:])
+    deadline = time.time() + float(os.environ.get("JAVIS_ORG_DISPATCH_WAIT_S", "120"))
+    while True:
+        seen = _ticket_receipt(ledger, nonce, start)
+        if seen == "delivered":
+            return 0, out + "\n[dispatch] delivered nonce=%s ticket=%s" % (nonce, path)
+        if seen == "expired":
+            return 1, out + "\n[dispatch] expired before delivery nonce=%s ticket=%s" % (nonce, path)
+        if time.time() >= deadline:
+            # not a loss claim: the item may still be delivered later; only the receipt counts as delivery
+            return 1, out + "\n[dispatch] queued_not_delivered nonce=%s ticket=%s ledger=%s" % (nonce, path, ledger)
+        time.sleep(1.0)
 
 def apply_manifest(m):
     require_cso()  # 게이트를 효과 함수에 (R1 REVISE-1) — import 직접호출 우회 차단
