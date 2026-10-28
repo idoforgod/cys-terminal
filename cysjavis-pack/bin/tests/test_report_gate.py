@@ -1338,6 +1338,18 @@ class DeadlockRootShadowTest(unittest.TestCase):
         self.assertEqual(recs[0]["verdict"], "instrument_fail")
         self.assertIn("registry_unreadable", recs[0]["reason"])
 
+    def test_dd_icloud_managed_root_is_not_read(self):
+        # Owner absolute rules (2026-09-30 · 2026-10-27): no repeated reads on an iCloud tree, never open a
+        # dataless file. A published root under ~/Desktop is listed every gate cycle unless the reader declines
+        # it - lexically, with no filesystem call. The limit is recorded per root, never as a zero (CEO B-4).
+        desk = os.path.join(os.environ["HOME"], "Desktop", "CYSjavis", "proj", "_round", "tasks")
+        self.write_ticket(desk, "T-D", scope=self.SCOPE)              # would fire if read
+        self.write_registry(desk)
+        r, e = self.run_gate()
+        rec = self.shadow(e, "registry")[0]
+        self.assertEqual((rec["verdict"], rec["reason"]), ("unmeasured", "deadlock_unmeasured:root_icloud_not_read"))
+        self.assertEqual(rec["attributed"], 0)
+
     # ── D-b: the writer stamps scope and publishes its root; the gate reads only the registry ──
     def test_db_create_stamps_scope_and_publishes_root(self):
         p = self.jt("create", "x", "--id", "T-1")

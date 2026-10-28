@@ -127,6 +127,25 @@ DEADLOCK_IDLE_SECS = 1800            # P3: 미배정 티켓 미checkout·set-sta
 #   과 명시 운영 오버라이드 이름(우선순위 순 — 종전 Runner 가 읽던 세 이름 그대로).
 TASK_ROOTS_FILE = "task-roots.json"
 TASK_ROOT_OVERRIDE_KEYS = ("JAVIS_TASK_ROOT", "CYS_TASK_ROOT", "JAVIS_ROOT")
+# ★오너 절대규칙(2026-09-30 iCloud 불관여 · 2026-10-27 iCloud 트리 반복 읽기 금지 · dataless 파일 열기 금지): 게이트는
+#   아래 폴더 밑의 루트를 **읽지 않는다**. 좌석 cwd 가 그 아래면 javis_task 가 거기에 루트를 정하고 공표한다(실측
+#   2026-10-28 23:04: 살아 있는 좌석 78개 중 2개). 그 루트를 5분마다 list 하면 iCloud 트리를 반복해 읽는다. 판정은
+#   **어휘(경로 문자열)만**으로 한다 — realpath·stat 도 그 트리의 성분을 건드린다. 거절은 루트마다 unmeasured
+#   (`root_icloud_not_read`)로 대장에 남는다 — 한계를 0 이 아니라 한계로 적는다(CEO B-4). 한계: 다른 곳에서 이 폴더로
+#   들어가는 심볼릭 링크와, 다른 경로로 옮겨진(OneDrive 리디렉션 등) Windows 바탕화면은 잡지 못한다.
+CLOUD_MANAGED_HOME_DIRS = ("Desktop", "Documents", os.path.join("Library", "Mobile Documents"),
+                           os.path.join("Library", "CloudStorage"))
+
+
+def cloud_managed_path(path):
+    """경로가 클라우드 관리 홈 폴더(위 목록) 밑인가 — 순수 어휘 판정(파일시스템 호출 0)."""
+    home = os.path.normpath(os.path.expanduser("~"))
+    p = os.path.normpath(os.path.abspath(path))
+    for d in CLOUD_MANAGED_HOME_DIRS:
+        top = os.path.join(home, d)
+        if p == top or p.startswith(top + os.sep):
+            return True
+    return False
 SETSTATUS_STALE_SECS = 900           # §2-C 2차 증거 ②: set-status age > 15분
 SEEN_TTL_SECS = 1800                 # A6′ seen-store TTL(=critical 재enqueue 상한 = TTL당 1)
 # ★성찰 R4 N8 — **재시도 억제 TTL** 과 **미완료 사건의 ID 보존**은 다른 축이다.
@@ -1822,7 +1841,10 @@ class Runner:
 
     def task_list(self, tasks_dir):
         """D-d — 공표된 루트 하나를 읽는다 `(ok, rows|None, err)`. 없는 루트·읽을 수 없는 루트는 err 다 — `javis_task
-        list` 는 없는 루트에 rc 0 `[]` 를 내므로(깨끗한 0 으로 위장) 그 전에 여기서 가른다."""
+        list` 는 없는 루트에 rc 0 `[]` 를 내므로(깨끗한 0 으로 위장) 그 전에 여기서 가른다.
+        클라우드 관리 폴더 밑의 루트는 **어떤 파일시스템 호출도 하기 전에** 거절한다(`cloud_managed_path` · 오너 절대규칙)."""
+        if cloud_managed_path(tasks_dir):
+            return False, None, "unmeasured:root_icloud_not_read"
         if not os.path.isdir(tasks_dir):
             return False, None, "root_absent"
         if not os.access(tasks_dir, os.R_OK | os.X_OK):
@@ -2148,7 +2170,10 @@ class Gate:
                 sources.append((src, root, ok, rows, lerr))
         for src, root, ok, rows, err in sources:
             rec = {"source": src, "root": root, "attributed": 0, "unattributed": 0, "foreign": 0}
-            if not ok:
+            if not ok and str(err).startswith("unmeasured:"):
+                #   정책상 읽지 않은 루트(iCloud) — 계기 고장이 아니라 선언된 한계다.
+                rec.update(verdict="unmeasured", reason="deadlock_unmeasured:%s" % str(err)[len("unmeasured:"):])
+            elif not ok:
                 rec.update(verdict="instrument_fail",
                            reason="deadlock_instrument_fail:%s" % (err or "task")[:160])
             else:
