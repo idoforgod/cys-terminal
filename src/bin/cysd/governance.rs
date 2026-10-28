@@ -20389,6 +20389,52 @@ mod tests {
         paint_prompt_dim(&s, "", "carry on please");
         assert_eq!(super::seat_input_line_visibility(&s), (Some(false), Some(true)));
     }
+    // ----- P1 D1 unit specimens (new functions; coverage, not RED proofs) -----
+
+    fn p1_verdict(s: &Arc<crate::state::Surface>) -> super::ComposerVerdict {
+        super::composer_verdict(&super::observe_prompt(s, &["❯".to_string()]), None)
+    }
+
+    /// T-V1: the verdict rows on rig-shaped frames, including the U+00A0 marker spacing (screen matching only) and the
+    /// fail-closed rows (a one-glyph suggestion whose only glyph is the drawn cursor has no dim reading -> Draft).
+    #[test]
+    fn p1_d1_verdict_rows() {
+        use super::ComposerVerdict as V;
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p1-v1");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (_daemon, s) = marker_seat("p1-v1");
+        paint_prompt(&s, "", "");
+        assert_eq!(p1_verdict(&s), V::Empty);
+        paint_prompt_dim(&s, "", "carry on please");
+        assert_eq!(p1_verdict(&s), V::Suggestion);
+        paint_prompt(&s, "", "my own words");
+        assert_eq!(p1_verdict(&s), V::Draft, "a non-dim after-cursor run is a Home-moved draft");
+        paint_prompt(&s, "typed", "");
+        assert_eq!(p1_verdict(&s), V::Draft);
+        paint_prompt_dim(&s, "", "x");
+        assert_eq!(p1_verdict(&s), V::Draft, "no dim reading is a draft (fail-closed)");
+        p1_paint_box(&s, "", false, false);
+        assert_eq!(p1_verdict(&s), V::Empty, "marker + U+00A0 is marker spacing, not content");
+        p1_paint_box(&s, "carry on please", true, false);
+        assert_eq!(p1_verdict(&s), V::Suggestion);
+        assert_eq!(V::Suggestion.reads_empty(), Some(true));
+        assert_eq!(V::Draft.reads_empty(), Some(false));
+        assert_eq!(V::Unknown.reads_empty(), None);
+    }
+
+    /// T-Q5: D1 governs claude seats only; every other adapter keeps its pin reading.
+    #[test]
+    fn p1_d1_scope_is_claude_only() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for (agent, want) in [("claude", true), ("gemini", false), ("codex", false), ("grok", false)] {
+            let (_daemon, s) = wp5_seat(&format!("p1-scope-{agent}"), agent);
+            assert_eq!(super::d1_governs(&s), want, "{agent}");
+            let obs = super::observe_prompt(&s, &["❯".to_string()]);
+            assert_eq!(super::composer_reads_empty(&s, &obs, None).is_some(), want, "{agent}");
+        }
+        assert_eq!(super::D1_MEASURED_ADAPTERS, &["claude"]);
+    }
     // ===== end of the P1 behavioural block =====
 
     /// 화면이 비어 보여도 데몬이 센 미제출 바이트가 있으면 배달하지 않는다(1차 축 우선).
