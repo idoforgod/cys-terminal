@@ -3139,9 +3139,12 @@ fn parse_first_line_cap(raw: Option<&str>) -> Option<std::time::Duration> {
 ///
 /// 【범위 = 단발 응답만】 `events.stream`·`surface.attach` 스트림은 면제다(클라이언트 `RPC_STREAMING_METHODS`
 /// 면제와 대칭). attach 를 끊으면 GUI 가 재attach 없이 `[surface exited]` 를 그린다(G-08) — 좌석이 살아
-/// 있는데 pane 이 죽어 보인다. ★알려진 잔여: **전혀 읽지 않는** 스트림 소비자는 `run_event_stream`·
-/// `run_attach` 의 쓰기에서 영구히 멈춘다 — 그동안 `rx.recv()` 가 다시 poll 되지 않으므로 Lagged·
-/// slow_consumer 분기에도 닿지 않고, 그 태스크·fd 는 소비자가 닫을 때까지 남는다. 버스·PTY 는 막히지
+/// 있는데 pane 이 죽어 보인다. ★알려진 잔여: **전혀 읽지 않는** 스트림 소비자는 `run_event_stream`
+/// 의 쓰기에서 영구히 멈춘다 — 그동안 `rx.recv()` 가 다시 poll 되지 않으므로 Lagged·
+/// slow_consumer 분기에도 닿지 않고, 그 태스크·fd 는 소비자가 닫을 때까지 남는다. `run_attach` 는
+/// (0.14.56 #12) 소비자가 닫을 때까지 남되, 좌석이 사라지면(reader EOF 또는 맵에서 빠짐 —
+/// `attach_surface_gone`) 읽는 소비자는 새 출력 없이 1초 뒤, 멈춘 쓰기는 그 쓰기 호출이 진행 없이
+/// `ATTACH_GONE_STALL`(5초) 지난 뒤 끝난다 — 살아 있는 좌석의 attach 는 여전히 끊지 않는다. 버스·PTY 는 막히지
 /// 않고(tokio broadcast 는 송신자를 막지 않는다) 메모리 영향은 실측상 작다(무수신 attach 16개: fd 만 증가 ·
 /// RSS 는 소비자 0 대조군과 같음). 스트림 쪽 회수는 GUI 재attach 가 생긴 뒤의 별도 과제다.
 ///
@@ -3863,6 +3866,51 @@ async fn run_event_stream<W: AsyncWrite + Unpin>(
     }
 }
 
+/// 0.14.56 #12: no-progress time after which a pending attach write is abandoned — only once the
+/// surface is gone ([`attach_surface_gone`]). Never applied to a live surface.
+const ATTACH_GONE_STALL: std::time::Duration = std::time::Duration::from_secs(5);
+/// How often a write that already passed [`ATTACH_GONE_STALL`] re-checks whether the surface is gone.
+const ATTACH_GONE_RECHECK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Gone = reader EOF (`exited`), or no longer this Arc in the daemon map (`close_surface_effect`
+/// is the only remover; on ConPTY a closed seat never reaches reader EOF while it is held).
+fn attach_surface_gone(daemon: &Arc<Daemon>, s: &Arc<crate::state::Surface>) -> bool {
+    s.exited.load(std::sync::atomic::Ordering::Relaxed)
+        || !daemon.get_surface(s.id).is_some_and(|cur| Arc::ptr_eq(&cur, s))
+}
+
+/// Writes attach bytes. Abandons (returns false) only when the surface is gone AND the pending write
+/// call has made no progress for [`ATTACH_GONE_STALL`] since that call started — a fresh clock per
+/// call, so a client that keeps reading, or any live surface, is never cut. A pending `write` call
+/// has accepted nothing, so dropping it loses no byte. `flush` stays outside the guard: the writer is
+/// a split of the raw connection stream (no user-space buffer), so it completes at once — if a
+/// buffered writer is ever put here, move the flush under the guard.
+async fn write_attach_bytes<W: AsyncWrite + Unpin>(w: &mut W, bytes: &[u8], gone: impl Fn() -> bool) -> bool {
+    let mut off = 0;
+    while off < bytes.len() {
+        let mut wake = tokio::time::Instant::now() + ATTACH_GONE_STALL;
+        let write = w.write(&bytes[off..]);
+        tokio::pin!(write);
+        let n = loop {
+            tokio::select! {
+                biased;
+                r = &mut write => match r {
+                    Ok(0) | Err(_) => return false,
+                    Ok(n) => break n,
+                },
+                _ = tokio::time::sleep_until(wake) => {
+                    if gone() {
+                        return false;
+                    }
+                    wake = tokio::time::Instant::now() + ATTACH_GONE_RECHECK;
+                }
+            }
+        };
+        off += n;
+    }
+    w.flush().await.is_ok()
+}
+
 /// Raw PTY output mirror: ack line (JSON), then raw bytes as they arrive.
 async fn run_attach<W: AsyncWrite + Unpin>(
     daemon: &Arc<Daemon>,
@@ -3887,17 +3935,19 @@ async fn run_attach<W: AsyncWrite + Unpin>(
     if write_line(w, &ack).await.is_err() {
         return;
     }
+    let gone = || attach_surface_gone(daemon, &surface);
     // Send a formatted (color/cursor-accurate) redraw of the current screen first.
-    if !snapshot.is_empty() && w.write_all(&snapshot).await.is_err() {
+    if !snapshot.is_empty() && !write_attach_bytes(w, &snapshot, gone).await {
         return;
     }
     loop {
         // out_tx Sender는 Surface 구조체가 소유라 자력 종료(셸 exit) 후에도 채널이 닫히지
-        // 않는다 — exited 플래그를 주기 점검해 스트림을 끝내야 클라이언트가 EOF를 받는다.
+        // 않는다 — 좌석이 사라졌는지(reader EOF 또는 맵에서 빠짐)를 주기 점검해 스트림을 끝내야
+        // 클라이언트가 EOF를 받는다. 출력이 1초 없을 때만 보므로 진행 중인 쓰기를 자르지 않는다.
         tokio::select! {
             r = rx.recv() => match r {
                 Ok(chunk) => {
-                    if w.write_all(&chunk).await.is_err() || w.flush().await.is_err() {
+                    if !write_attach_bytes(w, &chunk, gone).await {
                         return;
                     }
                 }
@@ -3905,7 +3955,7 @@ async fn run_attach<W: AsyncWrite + Unpin>(
                 Err(_) => return,
             },
             _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
-                if surface.exited.load(std::sync::atomic::Ordering::Relaxed) {
+                if gone() {
                     return;
                 }
             }
@@ -7889,4 +7939,9 @@ mod etx_ctrlc_tests;
 #[cfg(test)]
 mod receipt_framing_tests {
     include!("receipt_framing_tests.rs");
+}
+
+#[cfg(test)]
+mod attach_exit_tests {
+    include!("attach_exit_tests.rs");
 }

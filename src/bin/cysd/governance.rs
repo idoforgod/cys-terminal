@@ -31675,8 +31675,12 @@ mod h_machine_hold_tests {
     /// runs on Windows in the sibling specimens. Test renamed `_of_44` -> `_of_50` (the CI comment in windows-health.yml too).
     /// ★(0.14.52 · S-a C7d) 50 → **52**: class A (S21 withheld Return is Unix-only, `send_settle_applies`) +2 byte-exact
     /// withheld-Return accounting specimens (`send_settle_tests::c7d_*`). Renamed `_of_52`.
+    /// ★(0.14.56 · SOCKET-P8 #12) 55 → **61**: `attach_exit_tests` — class C +5 (POSIX seat commands:
+    /// S12-2, S12-A, S12-B, S12-C, S12-4) and class D +1 (S12-1 knows the exit by reader EOF). S12-3 is a
+    /// platform-neutral helper test, not ignored. The Windows close path is measured by the `cfg(windows)`
+    /// sibling S12-BW. Renamed `_of_61` (the CI comment in windows-health.yml too).
     #[test]
-    fn r2f_dm_windows_ignore_attributes_are_exactly_the_decided_set_of_55() {
+    fn r2f_dm_windows_ignore_attributes_are_exactly_the_decided_set_of_61() {
         const REASON_A: &str = "S21 제출 정착·창 위 CR 보류는 유닉스 한정(send_settle_applies)";
         const REASON_B: &str = "윈도우 기본 H 마스크는 draft 축을 끈다(hold_axes_default(true)) — 이 검체는 유닉스 기본(draft 축) 동작을 본다";
         const REASON_C: &str = "좌석 명령이 POSIX 셸 문법";
@@ -31744,8 +31748,14 @@ mod h_machine_hold_tests {
             ("etx_ctrlc_tests", "control_the_rig_does_carry_a_key_to_the_wire", 'C'),
             ("etx_ctrlc_tests", "ctrl_c_on_a_human_draft_is_refused_and_writes_nothing", 'C'),
             ("etx_ctrlc_tests", "ctrl_c_reaches_the_wire_as_a_single_etx_byte", 'C'),
+            ("attach_exit_tests", "s12_1_stalled_attach_is_released_after_a_natural_exit", 'D'),
+            ("attach_exit_tests", "s12_2_stalled_snapshot_write_is_released_after_close", 'C'),
+            ("attach_exit_tests", "s12_a_reading_client_gets_the_whole_final_burst", 'C'),
+            ("attach_exit_tests", "s12_b_surface_gone_from_the_map_without_eof_releases_a_stalled_attach", 'C'),
+            ("attach_exit_tests", "s12_c_reading_client_of_a_surface_gone_from_the_map_reaches_eof", 'C'),
+            ("attach_exit_tests", "s12_4_reading_client_ends_after_a_natural_exit", 'C'),
         ];
-        assert_eq!(want.len(), 55, "결정한 집합은 55건(24 + 17 + 11 + 3)");
+        assert_eq!(want.len(), 61, "결정한 집합은 61건(24 + 17 + 16 + 4)");
         let needle = concat!("#[cfg_attr(not(unix), ", "ignore = \"");
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/cysd");
         let mut got: Vec<(String, String, char)> = Vec::new();
@@ -31772,8 +31782,8 @@ mod h_machine_hold_tests {
         got.sort();
         let mut want_sorted: Vec<(String, String, char)> = want.iter().map(|(a, b, c)| (a.to_string(), b.to_string(), *c)).collect();
         want_sorted.sort();
-        assert_eq!(got.len(), 55, "윈도우 `ignore` 가 {}건이다(결정 55건) — 새로 더했거나 뺐다: {got:?}", got.len());
-        assert_eq!(got, want_sorted, "윈도우 `ignore` 집합이 결정한 55건과 다르다 — 목록과 `ignore` 사유를 함께 고쳐라");
+        assert_eq!(got.len(), 61, "윈도우 `ignore` 가 {}건이다(결정 61건) — 새로 더했거나 뺐다: {got:?}", got.len());
+        assert_eq!(got, want_sorted, "윈도우 `ignore` 집합이 결정한 61건과 다르다 — 목록과 `ignore` 사유를 함께 고쳐라");
     }
 }
 
