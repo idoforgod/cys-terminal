@@ -25541,7 +25541,27 @@ mod tests {
         let (daemon,sid)=deadman_daemon("p7-zero");let s=daemon.get_surface(sid).unwrap();
         let mut tracker=DeadmanTracker::default();
         tracker.last_idle_alert.insert("master".into(),Instant::now()+Duration::from_secs(100));
+        // ★(0.14.56) Park the PTY reader first (as p7_deadman_socket_rebuttal_vacant_and_shell_dead does): live
+        //   fixture output re-stamps `last_output` between `backdate_output` and the tick's read, so the verdict
+        //   reads Alive, not Idle (windows-health: 2 idle events instead of 3). The reader stamps before it takes
+        //   `parser`, so once it is parked on `parser` with its one chunk stamped, nothing can re-stamp until the
+        //   gate is released; the gate is taken between chunks (`output_gen` even) so that park is provable.
+        let end=Instant::now()+Duration::from_secs(30);
+        let gate=loop {
+            let g=s.parser.lock().unwrap_or_else(|e|e.into_inner());
+            if s.output_gen.load(AtomicOrdering::Acquire)%2==0 {break g;}
+            drop(g);
+            assert!(Instant::now()<end,"the reader never stood between chunks");
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        let gen=s.output_gen.load(AtomicOrdering::Acquire);
+        s.write_tx.send(crate::state::WriteReq::Data(b"x\n".to_vec())).unwrap();
+        while s.output_gen.load(AtomicOrdering::Acquire)==gen {
+            assert!(Instant::now()<end,"no PTY output after one written line: the reader is not parked");
+            std::thread::sleep(Duration::from_millis(5));
+        }
         for _ in 0..3 {backdate_output(&s,21);check_role_deadman(&daemon,&mut tracker);}
+        drop(gate);
         assert_eq!(events_named(&daemon,"master.idle").len(),3);
         assert!(events_named(&daemon,"master.deadman").is_empty());
     }
