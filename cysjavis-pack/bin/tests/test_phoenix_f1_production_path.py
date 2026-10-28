@@ -386,12 +386,24 @@ def d1_scenario(name):
 # verdict for the rest of time. Head ruling 1 (e578c42b) BC1. A single run cannot see this — hence two.
 # ──────────────────────────────────────────────────────────────────────────────
 def d1_composed(name):
-    """`name`: C1 resumed claude over two boots · C2 codex over two boots · C3 same-boot retry (one epoch)."""
+    """`name`: C1 resumed claude over two boots · C2 codex over two boots · C3 ★the real same-boot retry
+    (run 1 ends in a production-written unverified transient, run 2 recovers in the SAME epoch and must call
+    defect 1's verdict a SECOND time) · C3d the dedup-only shape, kept and labelled as dedup (codex impl r1 T1:
+    the old C3 ended run 1 verified, so run 2 dedup'd and the verdict ran exactly ONCE across both runs)."""
     td = tempfile.mkdtemp(prefix="phoenix-d1-composed-")
     original_cys, original_sleep, original_emit = m.cys, m.time.sleep, m._emit_evt
     original_epoch, original_known = m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN
     original_pack = os.environ.get("CYS_PACK_DIR")
+    original_verdict = m._d1_resume_verdict
     try:
+        # ★codex impl r1 T1: count the REAL verdict calls. A same-boot retry that never re-enters
+        #   `_d1_resume_verdict` is cached evidence, not a measured retry — the count is what tells them apart.
+        d1_calls = []
+        def counting_verdict(*a, **k):
+            out = original_verdict(*a, **k)
+            d1_calls.append(out[0])
+            return out
+        m._d1_resume_verdict = counting_verdict
         socket_path = os.path.join(td, "cys.sock")
         ticket = "d1x-" + name                      # ONE ticket ⇒ ONE journal across both runs
         agent = "codex" if name == "C2" else "claude"
@@ -414,18 +426,28 @@ def d1_composed(name):
             json.dump({"entries": [entry], "updated_at": 1.0, "schema_version": 1,
                        "tombstones": [], "tombstones_rev": 0}, f)
         journal_path = m.journal_path(socket_path, ticket)
-        state = {"alive": False, "epoch": 1000.0, "sref": "surface:9"}
+        # ★C3: run 1 must end in a PRODUCTION-written unverified transient, so the hook has not registered
+        #   yet on the first run; it registers before run 2, in the same boot generation.
+        state = {"alive": False, "epoch": 1000.0, "sref": "surface:9",
+                 "registered": None if (agent == "codex" or name == "C3") else D1_PIN,
+                 "alive_from_status": None}
 
         def fake_cys(*args, socket=None, timeout=25):
             assert socket == socket_path, "CLI escaped the isolated socket"
             verb = args[0]
             if verb == "status":
+                # ★C3 (codex impl r1 T1): a same-boot retry is a TRANSITION inside ONE generation, so this
+                #   fake scripts liveness by status-call index instead of holding it constant — the pane is
+                #   down when phoenix computes its targets and back up, registered, when the stages read it.
+                state["n_status"] = state.get("n_status", 0) + 1
+                alive = state["alive"] or (state.get("alive_from_status") is not None
+                                           and state["n_status"] >= state["alive_from_status"])
                 rows = []
-                if state["alive"]:
+                if alive:
                     rows = [{"surface_id": 9, "surface_ref": state["sref"], "role": "worker-1",
                              "exited": False, "agent_alive": True, "seat": "occupied", "agent": agent,
                              "gate_pending": None,
-                             "registered_session_id": None if agent == "codex" else D1_PIN}]
+                             "registered_session_id": state["registered"]}]
                 return SimpleNamespace(returncode=0, stdout=json.dumps(
                     {"daemon": {"started_at": state["epoch"]}, "surfaces": rows}), stderr="")
             if verb == "list":
@@ -444,28 +466,98 @@ def d1_composed(name):
         m._emit_evt = lambda *a, **k: None
 
         def one_run():
+            state["n_status"] = 0                   # the scripted liveness index counts per run
             res = m.run_restore(socket_path, ticket=ticket, stub=False, no_breaker=True, print_result=False)
             with open(journal_path, encoding="utf-8") as f:
                 return res, json.load(f)["roles"]["worker-1"]
 
         res1, rr1 = one_run()
+        calls_after_run1 = len(d1_calls)
         n = "d1xd3 " + name
-        want1 = "seat_only" if agent == "codex" else "verified"
+        want1 = "unverified" if name == "C3" else ("seat_only" if agent == "codex" else "verified")
+        want_leg1 = {"C3": "observe"}.get(name, "channel" if agent == "codex" else "all")
         check(n + " run 1 is judged by defect 1", rr1["outcome"] == want1
-              and (rr1.get("resume_evidence") or {}).get("leg") in ("all", "channel"))
+              and (rr1.get("resume_evidence") or {}).get("leg") == want_leg1,
+              extra="outcome=%r leg=%r want=%r/%r" % (
+                  rr1["outcome"], (rr1.get("resume_evidence") or {}).get("leg"), want1, want_leg1))
+        if name == "C3":
+            check(n + " run 1 is a PRODUCTION-written unverified transient, not a fixture",
+                  rr1["stages"]["verify"]["done"] is False
+                  and rr1["observed_sid"] is None
+                  and (rr1.get("resume_evidence") or {}).get("registered_now") is None
+                  and "재개 미확정" in (rr1.get("verify_reason") or "")
+                  and calls_after_run1 >= 1,
+                  extra="done=%r observed=%r calls=%d reason=%.80s" % (
+                      rr1["stages"]["verify"]["done"], rr1["observed_sid"], calls_after_run1,
+                      rr1.get("verify_reason")))
         check(n + " run 1 leaves NO key of defect 3's marker group on a non-F-1 role",
               not any(k in rr1 for k in m.FRESH_MARKER_KEYS),
               extra="present: %s" % sorted(k for k in m.FRESH_MARKER_KEYS if k in rr1))
 
         # ── the second run: the role died again (a later boot, or the daemon's same-boot retry) ──
         state["alive"] = False
-        if name != "C3":
+        if name in ("C1", "C2"):
             state["epoch"] = 2000.0                 # a NEW boot generation
             state["sref"] = "surface:11"            # a new pane, as a real restore would make
+        if name == "C3":
+            # ★the same-boot retry world — no new generation, no new pane. The pane phoenix created in run 1
+            #   is DOWN when run 2 computes its targets (so the role is a target again, and it is not dedup'd:
+            #   run 1 never finished verify), and it is back up WITH the hook's registration by the time the
+            #   stages read it — precisely the race run 1 lost. Attribution still rests on run 1's pre/post
+            #   snapshots in the journal, because the pane really was created by this restore, in this boot.
+            #   The index is MEASURED, not guessed: phoenix consumes its liveness snapshot inside the first
+            #   four status calls of a run, and 5..8 all produce this world, so 5 has slack. If a later change
+            #   moves it, the assertions below (a target again · a SECOND counted verdict · a new observation)
+            #   go red with their own diagnosis instead of silently testing nothing — which is how C3 died.
+            state["alive_from_status"] = 5
+            state["registered"] = D1_PIN            # the SessionStart hook has registered by now
         res2, rr2 = one_run()
-        check(n + " run 2 is still judged by defect 1, not pre-empted by the D3 guard",
-              rr2["outcome"] == want1 and "D3:" not in (rr2.get("verify_reason") or ""),
-              extra="run2 outcome=%r reason=%.90s" % (rr2["outcome"], rr2.get("verify_reason")))
+        calls_in_run2 = len(d1_calls) - calls_after_run1
+        if name == "C3":
+            # ★codex T1 (i): a SECOND verdict invocation actually happened in the same epoch.
+            check(n + " run 2 really re-ran the role — a target again in the SAME epoch, not a NOOP or a dedup",
+                  res2.get("target_roles") == ["worker-1"] and state["epoch"] == 1000.0
+                  and res2.get("phoenix_restore") != "NOOP",
+                  extra="targets=%r epoch=%r verdict=%r" % (
+                      res2.get("target_roles"), state["epoch"], res2.get("phoenix_restore")))
+            check(n + " run 2 calls defect 1's verdict a SECOND time in the same epoch",
+                  calls_in_run2 >= 1 and len(d1_calls) >= 2,
+                  extra="calls run1=%d run2=%d total=%d outcomes=%r" % (
+                      calls_after_run1, calls_in_run2, len(d1_calls), d1_calls))
+            # (ii) a NEW observation — not run 1's cached None.
+            check(n + " run 2 recovers on a NEW observation, not cached evidence",
+                  rr2["observed_sid"] == D1_PIN
+                  and (rr2.get("resume_evidence") or {}).get("registered_now") == D1_PIN
+                  and rr2["stages"]["verify"]["done"] is True
+                  and res2["phoenix_restore"] == "VERIFIED",
+                  extra="observed=%r registered_now=%r verdict=%r" % (
+                      rr2["observed_sid"], (rr2.get("resume_evidence") or {}).get("registered_now"),
+                      res2["phoenix_restore"]))
+            # (iv) and the run-2 verdict comes from defect 1's legs, not from defect 3's guard.
+            check(n + " run 2's verdict comes from defect 1's legs (leg=all), not the D3 guard",
+                  rr2["outcome"] == "verified"
+                  and (rr2.get("resume_evidence") or {}).get("leg") == "all"
+                  and (rr2.get("resume_evidence") or {}).get("pane_is_new") is True
+                  and "D3:" not in (rr2.get("verify_reason") or "")
+                  and "재개 확정" in (rr2.get("verify_reason") or ""),
+                  extra="outcome=%r leg=%r reason=%.90s" % (
+                      rr2["outcome"], (rr2.get("resume_evidence") or {}).get("leg"),
+                      rr2.get("verify_reason")))
+        elif name == "C3d":
+            # ★labelled DEDUP, kept on purpose: this is the shape codex found vacuous. Run 1 ends verified,
+            #   so production dedup skips the role and the verdict runs exactly ONCE across both runs. The row
+            #   is evidence of the dedup contract — never of a same-boot retry verdict.
+            check(n + " DEDUP: run 1 verified ⇒ run 2 reuses it and the verdict runs exactly ONCE",
+                  len(d1_calls) == 1 and calls_in_run2 == 0
+                  and rr2["outcome"] == "verified" and rr2["stages"]["verify"]["done"] is True,
+                  extra="calls=%d (run2=%d) outcome=%r" % (len(d1_calls), calls_in_run2, rr2["outcome"]))
+        else:
+            check(n + " run 2 is still judged by defect 1, not pre-empted by the D3 guard",
+                  rr2["outcome"] == want1 and "D3:" not in (rr2.get("verify_reason") or "")
+                  and calls_in_run2 >= 1,
+                  extra="run2 outcome=%r calls=%d reason=%.90s" % (
+                      rr2["outcome"], calls_in_run2, rr2.get("verify_reason")))
+        # (iii) no key of defect 3's marker group, and no strip, on any of the composed shapes.
         check(n + " run 2 has no fresh_scope_stripped on this role",
               "fresh_scope_stripped" not in rr2 and not (res2.get("fresh_scope_stripped") or {}),
               extra="stripped=%r" % (rr2.get("fresh_scope_stripped"),))
@@ -485,6 +577,7 @@ def d1_composed(name):
         else:
             os.environ["CYS_PACK_DIR"] = original_pack
         m._AGENTS_CACHE.clear()
+        m._d1_resume_verdict = original_verdict
         shutil.rmtree(td)
 
 
@@ -497,7 +590,7 @@ def main():
         scenario(name)
     for name in ("R1", "R2", "R3a", "R3b", "R3c", "R4", "R5", "R6"):
         d1_scenario(name)
-    for name in ("C1", "C2", "C3"):
+    for name in ("C1", "C2", "C3", "C3d"):
         d1_composed(name)
     npass = sum(1 for c in _results if c)
     print("\n=== %d/%d PASS ===" % (npass, len(_results)))
