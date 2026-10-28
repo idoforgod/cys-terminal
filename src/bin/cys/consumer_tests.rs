@@ -133,6 +133,57 @@ mod p2_consumer_tests {
 use std::{fs,io::{BufRead,BufReader,Write},sync::{Arc,Mutex,atomic::{AtomicBool,Ordering}},time::Duration};
 fn recorder_load() -> String { String::from_utf8_lossy(&std::process::Command::new("/usr/sbin/sysctl").arg("vm.loadavg").output().unwrap().stdout).trim().to_owned() }
 
+    /// The recorder peer's read step: accept one connection and read its one request line. `None` = nothing to
+    /// record this turn (no pending connection, or a connection that was not read - the latter is pushed to `errors`).
+    /// ★The accepted stream is made BLOCKING before the read: on macOS it inherits O_NONBLOCK from the listener (kept
+    /// nonblocking for the stop poll), and a read timeout is inert on a nonblocking socket. Linux does not inherit it.
+    #[cfg(unix)]
+    fn recorder_next_request(listener:&std::os::unix::net::UnixListener,read_timeout:Duration,lane:&str,errors:&Mutex<Vec<String>>)->Option<(std::os::unix::net::UnixStream,Value)> {
+     let (stream,_)=match listener.accept(){Ok(x)=>x,Err(e) if e.kind()==std::io::ErrorKind::WouldBlock=>{std::thread::sleep(Duration::from_millis(2));return None},Err(e)=>panic!("{e}")};
+     let read=|| -> Result<Value,String> {
+      stream.set_nonblocking(false).map_err(|e|format!("set_nonblocking(false): {e}"))?;
+      stream.set_read_timeout(Some(read_timeout)).map_err(|e|format!("set_read_timeout: {e}"))?;
+      let mut line=String::new();
+      if BufReader::new(&stream).read_line(&mut line).map_err(|e|format!("read_line: {e}"))?==0 {return Err("connection closed before a request line".into());}
+      serde_json::from_str(&line).map_err(|e|format!("request is not JSON ({e}): {line:?}"))
+     };
+     match read() {Ok(req)=>Some((stream,req)),Err(e)=>{errors.lock().unwrap().push(format!("{lane}: {e}"));None}}
+    }
+
+    /// ★#16 (0.14.56): a client whose request arrives AFTER the peer accepted must still be read. On macOS the accepted
+    /// socket inherits O_NONBLOCK from the nonblocking listener, so `set_read_timeout` alone is inert (read = WouldBlock at
+    /// 0 ms) and the request was dropped unread -> the CLI's write met EPIPE (release run 40664016381 attempt 2).
+    #[cfg(unix)]
+    #[test]
+    fn p2_recorder_reads_a_late_writer() {
+     let sock=std::env::temp_dir().join(format!("p2-late-{}.sock",std::process::id()));let _=fs::remove_file(&sock);
+     let listener=std::os::unix::net::UnixListener::bind(&sock).unwrap();listener.set_nonblocking(true).unwrap();
+     let path=sock.clone();
+     let client=std::thread::spawn(move||{let mut s=std::os::unix::net::UnixStream::connect(&path).unwrap();std::thread::sleep(Duration::from_millis(300));let _=s.write_all(b"{\"id\":1,\"method\":\"system.ping\",\"params\":{}}\n");std::thread::sleep(Duration::from_millis(500));});
+     let errors=Mutex::new(Vec::new());let until=std::time::Instant::now()+Duration::from_secs(2);
+     let got=loop{if let Some(x)=recorder_next_request(&listener,Duration::from_secs(3),"T",&errors){break Some(x.1)} if !errors.lock().unwrap().is_empty()||std::time::Instant::now()>until{break None}};
+     client.join().unwrap();let _=fs::remove_file(&sock);
+     assert_eq!(got.as_ref().map(|v|v["method"].clone()),Some(json!("system.ping")),"a request written 300 ms after connect was not read (errors {:?})",errors.lock().unwrap());
+    }
+
+    /// ★#16 (0.14.56, CEO ruling item 2): a connection the peer could not read is REPORTED, not skipped in silence -
+    /// otherwise the next fixture fault shows up only as an unrelated EPIPE in the CLI under test.
+    #[cfg(unix)]
+    #[test]
+    fn p2_recorder_reports_an_unread_connection() {
+     let sock=std::env::temp_dir().join(format!("p2-silent-{}.sock",std::process::id()));let _=fs::remove_file(&sock);
+     let listener=std::os::unix::net::UnixListener::bind(&sock).unwrap();listener.set_nonblocking(true).unwrap();
+     let path=sock.clone();
+     let client=std::thread::spawn(move||{let _s=std::os::unix::net::UnixStream::connect(&path).unwrap();std::thread::sleep(Duration::from_millis(800));});
+     let errors=Mutex::new(Vec::new());let until=std::time::Instant::now()+Duration::from_secs(2);
+     let got=loop{if let Some(x)=recorder_next_request(&listener,Duration::from_millis(200),"T",&errors){break Some(x.1)} if !errors.lock().unwrap().is_empty()||std::time::Instant::now()>until{break None}};
+     client.join().unwrap();let _=fs::remove_file(&sock);
+     let errors=errors.into_inner().unwrap();
+     assert!(got.is_none(),"a silent client produced a request: {got:?}");
+     assert_eq!(errors.len(),1,"the unread connection was not reported: {errors:?}");
+     assert!(errors[0].starts_with("T: "),"the report does not name the lane: {errors:?}");
+    }
+
     #[cfg(unix)]
     fn recorder_fixture(cli: std::path::PathBuf, out: std::path::PathBuf) {
  let root=std::env::temp_dir().join(format!("p2-r1-{}",std::process::id()));
@@ -145,18 +196,16 @@ fn recorder_load() -> String { String::from_utf8_lossy(&std::process::Command::n
   fs::write(pack.join("agents.json"),json!({"probe":{"cmd":"fixture-agent","ready_marker":"READY","inject_delay_secs":1}}).to_string()).unwrap();
  }
  fs::write(root.join(".cys/depts.json"),json!({"depts":{"fixture":{"socket":dept}}}).to_string()).unwrap();
- let stop=Arc::new(AtomicBool::new(false));let seen=Arc::new(Mutex::new(Vec::<Value>::new()));let mut servers=Vec::new();
+ let stop=Arc::new(AtomicBool::new(false));let seen=Arc::new(Mutex::new(Vec::<Value>::new()));let read_errors=Arc::new(Mutex::new(Vec::<String>::new()));let mut servers=Vec::new();
  for (lane,sock,sid,pid) in [("BASE",base.clone(),7,1),("DEPT",dept.clone(),9,std::process::id())] {
   fs::create_dir_all(sock.parent().unwrap()).unwrap();
   fs::write(cys::lane::epoch_path_in(&root.join(".cys/state"),&sock),json!({"socket":sock,"pid":pid,"daemon_epoch":100.1,"incarnation":format!("64-{pid:x}")}).to_string()).unwrap();
   let session=root.join(format!("{lane}-session.jsonl"));fs::write(&session,"").unwrap();
   let listener=std::os::unix::net::UnixListener::bind(&sock).unwrap();listener.set_nonblocking(true).unwrap();
-  let stop=stop.clone();let seen=seen.clone();
+  let stop=stop.clone();let seen=seen.clone();let read_errors=read_errors.clone();
   servers.push(std::thread::spawn(move|| {
    while !stop.load(Ordering::Relaxed) {
-    let (mut stream,_)=match listener.accept(){Ok(x)=>x,Err(e) if e.kind()==std::io::ErrorKind::WouldBlock=>{std::thread::sleep(Duration::from_millis(2));continue},Err(e)=>panic!("{e}")};
-    stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();let mut line=String::new();if BufReader::new(&stream).read_line(&mut line).is_err(){continue}
-    let req:Value=serde_json::from_str(&line).unwrap();let method=req["method"].as_str().unwrap();
+    let Some((mut stream,req))=recorder_next_request(&listener,Duration::from_secs(3),lane,&read_errors) else {continue};let method=req["method"].as_str().unwrap();
     seen.lock().unwrap().push(json!({"lane":lane,"request":req}));
     if method=="surface.send_text" {
      let text=req["params"]["text"].as_str().unwrap_or("");
@@ -196,9 +245,11 @@ fn recorder_load() -> String { String::from_utf8_lossy(&std::process::Command::n
   }
  }
  stop.store(true,Ordering::Relaxed);for s in servers{s.join().unwrap();}
+ let read_errors=read_errors.lock().unwrap().clone();
  let claim_dir=root.join(".cys/pack/state/reinject-check");
  let claims=fs::read_dir(&claim_dir).map(|x|x.flatten().map(|e|e.file_name().to_string_lossy().into_owned()).collect::<Vec<_>>()).unwrap_or_default();
- fs::create_dir_all(&out).unwrap();fs::write(out.join("RESULT.json"),serde_json::to_vec_pretty(&json!({"root":root,"results":results,"base_claim_files":claims,"scope":"real CLI and finite BASE/DEPT peers; no live daemon, no actual agent launch"})).unwrap()).unwrap();
+ fs::create_dir_all(&out).unwrap();fs::write(out.join("RESULT.json"),serde_json::to_vec_pretty(&json!({"root":root,"results":results,"base_claim_files":claims,"fixture_read_errors":read_errors,"scope":"real CLI and finite BASE/DEPT peers; no live daemon, no actual agent launch"})).unwrap()).unwrap();
+ assert!(read_errors.is_empty(),"the recorder peer could not read a request (fixture fault, not a CLI result): {read_errors:?}");
  let mut violations=Vec::new();
  if claims.is_empty() || claims.iter().any(|p|!p.starts_with("s7-")) { violations.push(format!("reinject-check claim used inferred instead of real identity: {claims:?}")); }
  let stamp_dir=root.join("tmp").join(format!("cys-outside-usage-{}",unsafe{libc::getuid()}));
