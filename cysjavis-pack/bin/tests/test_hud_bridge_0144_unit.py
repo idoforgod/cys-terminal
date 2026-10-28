@@ -858,6 +858,101 @@ class SpoolArchive(unittest.TestCase):
             self.assertFalse(HB.maybe_rotate_spool(self.path, len(self.data), now=self.NOW)[0])
         self.assertEqual(self.files(), {"evt_spool.jsonl": self.data})
 
+    # -- head ruling 2026-10-29 (rotation ACCEPT, conditions 1-5): G1 (4b) G2 (5) G3 (3b) - RED at 3cd23f35, GREEN after --
+
+    @unittest.skipIf(os.name == "nt", "the link + unlink pair is the POSIX branch")
+    def test_g1_an_unlink_that_removed_src_but_raised_never_costs_the_last_name(self):
+        """4b - a cleanup may not become a data loss (E5): an unlink(src) that removed src and still raised (a remove retried
+        by a network filesystem) must not make the take-back remove the ONLY remaining name. The rename is then complete."""
+        real = os.unlink
+
+        def unlink(p, *a, **k):
+            if p == self.path:
+                real(p)
+                raise FileNotFoundError(2, "removed on the server, error on the client")
+            return real(p, *a, **k)
+        with mock.patch.object(HB.os, "unlink", side_effect=unlink):
+            rotated = HB.maybe_rotate_spool(self.path, len(self.data), now=self.NOW)
+        self.assertEqual(self.files(), {self.name: self.data}, "the bytes survive under exactly one name, the archive")
+        self.assertEqual(rotated, (True, [], 0), "src is gone and dst holds the bytes: the rename is complete")
+
+    @unittest.skipIf(os.name == "nt", "the link + unlink pair is the POSIX branch")
+    def test_g1_a_producer_new_src_after_a_misreported_unlink_keeps_the_archive(self):
+        """4b: unlink(src) removed src and raised, and a producer had already created a NEW src (O_CREAT append). src and dst
+        are then different files - dst holds the old bytes and is their only name: keep it, the rename is complete."""
+        real = os.unlink
+        fresh = b'{"ts": 3.0, "type": "task.unblocked", "payload": {"task": "new"}}\n'
+
+        def unlink(p, *a, **k):
+            if p == self.path:
+                real(p)
+                with open(p, "wb") as f:
+                    f.write(fresh)
+                raise FileNotFoundError(2, "removed on the server, error on the client")
+            return real(p, *a, **k)
+        with mock.patch.object(HB.os, "unlink", side_effect=unlink):
+            self.assertEqual(HB.maybe_rotate_spool(self.path, len(self.data), now=self.NOW), (True, [], 0))
+        self.assertEqual(self.files(), {self.name: self.data, "evt_spool.jsonl": fresh})
+
+    @unittest.skipIf(os.name == "nt", "the link + unlink pair is the POSIX branch")
+    def test_g1_an_unknown_state_skips_and_never_resets_the_offset(self):
+        """4a + 4b (reflection R1 on G1): unlink(src) failed AND src cannot even be compared - the state is unknown. Treating
+        it as a finished rename would reset the offset to 0 on a src that still holds the old bytes (re-read as new events).
+        Skip instead: both names kept (one inode), offset unchanged, nothing removed."""
+        real = os.unlink
+
+        def unlink(p, *a, **k):
+            if p == self.path:
+                raise PermissionError("busy")
+            return real(p, *a, **k)
+        with mock.patch.object(HB.os, "unlink", side_effect=unlink), \
+                mock.patch.object(HB.os.path, "samefile", side_effect=PermissionError("stat refused")):
+            self.assertEqual(HB.maybe_rotate_spool(self.path, len(self.data), now=self.NOW), (False, [], len(self.data)))
+        self.assertEqual(self.files(), {"evt_spool.jsonl": self.data, self.name: self.data})
+
+    def test_g2_every_rotation_writes_one_readable_log_line(self):
+        """5 - the operator can read every rotation: archive name, bytes, the spool's directory, nothing deleted."""
+        lines = []
+        with mock.patch.object(HB, "_log", side_effect=lines.append):
+            self.assertTrue(HB.maybe_rotate_spool(self.path, len(self.data), now=self.NOW)[0])
+        self.assertEqual(len(lines), 1, lines)
+        for part in (self.name, "%d B" % len(self.data), os.path.dirname(self.path), "nothing deleted"):
+            self.assertIn(part, lines[0])
+
+    def test_g2_a_skipped_rotation_is_logged_once_per_reason(self):
+        """5 - a skipped rotation is readable too, once per (spool, reason) - a drain every second must not flood the log."""
+        lines = []
+        with mock.patch.object(HB, "_log", side_effect=lines.append), \
+                mock.patch.object(HB.os, "link", side_effect=PermissionError("no hard links here")):
+            for _ in range(3):
+                self.assertFalse(HB.maybe_rotate_spool(self.path, len(self.data), now=self.NOW)[0])
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("skipped", lines[0])
+        self.assertIn("PermissionError", lines[0])
+        self.assertEqual(self.files(), {"evt_spool.jsonl": self.data})
+
+    def test_g2_every_name_taken_is_a_readable_skip(self):
+        """5 - the other skip reason (all 99 names of this second taken) is logged too, once."""
+        d = os.path.dirname(self.path)
+        for n in range(1, 100):
+            with open(os.path.join(d, self.name if n == 1 else self.name[:-6] + "-%d.jsonl" % n), "wb") as f:
+                f.write(b"x\n")
+        lines = []
+        with mock.patch.object(HB, "_log", side_effect=lines.append):
+            for _ in range(2):
+                self.assertFalse(HB.maybe_rotate_spool(self.path, len(self.data), now=self.NOW)[0])
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("taken", lines[0])
+
+    @unittest.skipIf(os.name == "nt", "a second hard link is the POSIX crash shape")
+    def test_g3_two_names_of_one_inode_are_one_archive(self):
+        """3b - a crash between link and unlink leaves two names of ONE inode; the next drain renames again. /health must
+        count that as one archive of its real size, not two."""
+        d = os.path.dirname(self.path)
+        os.link(self.path, os.path.join(d, "evt_spool.20200101T000000Z.jsonl"))
+        self.assertTrue(HB.maybe_rotate_spool(self.path, len(self.data), now=self.NOW)[0])
+        self.assertEqual(HB.spool_archives(d), (1, len(self.data)))
+
     def test_windows_uses_a_plain_rename(self):
         calls = []
         with mock.patch.object(HB.os, "name", "nt"), mock.patch.object(HB.os, "rename", side_effect=lambda s, d: calls.append((s, d))), \

@@ -1276,6 +1276,17 @@ def _rename_no_overwrite(src, dst):
     try:
         os.unlink(src)
     except OSError:
+        # (0.14.56 head ruling 4b - a cleanup may never become a data loss) take back the second name ONLY while src still
+        # names the same file. An unlink that removed src and still raised (a remove retried by a network filesystem) left
+        # dst as the ONLY name: keep it - the rename is then complete.
+        try:
+            same = os.path.samefile(src, dst)
+        except FileNotFoundError:
+            return          # src is gone: dst is the only name - the rename is complete
+        except OSError:
+            raise           # state unknown: keep both names (one inode, no byte at risk) and skip - never reset the offset
+        if not same:
+            return          # a producer already made a NEW src: dst holds the old bytes - the rename is complete
         try:
             os.unlink(dst)
         except OSError:
@@ -1297,9 +1308,22 @@ def archive_spool(path, now=None):
             return dst
         except FileExistsError:
             continue
-        except OSError:
+        except OSError as e:
+            _rotation_skipped(path, type(e).__name__)
             return None
+    _rotation_skipped(path, "every archive name of this second is taken")
     return None
+
+
+_ROTATE_SKIP_LOGGED = set()   # (spool path, reason) already logged - a drain runs every second; cleared by a rotation
+
+
+def _rotation_skipped(path, reason):
+    """(0.14.56 head ruling 5) A skipped rotation is readable in the log, once per (spool, reason)."""
+    if (path, reason) in _ROTATE_SKIP_LOGGED:
+        return
+    _ROTATE_SKIP_LOGGED.add((path, reason))
+    _log("spool rotation skipped for %s (%s) - nothing changed, retried on the next drain" % (path, reason))
 
 
 def spool_archives(state_dir):
@@ -1309,13 +1333,20 @@ def spool_archives(state_dir):
         names = os.listdir(state_dir)
     except OSError:
         return 0, 0
+    seen = set()
     for fn in names:
         if _SPOOL_ARCHIVE_RE.match(fn):
             try:
-                total += os.path.getsize(os.path.join(state_dir, fn))
-                n += 1
+                st = os.stat(os.path.join(state_dir, fn))
             except OSError:
-                pass
+                continue
+            # (0.14.56 head ruling 3b) a crash between link and unlink leaves two names of ONE inode - one archive
+            key = (st.st_dev, st.st_ino)
+            if st.st_ino and key in seen:
+                continue
+            seen.add(key)
+            total += st.st_size
+            n += 1
     return n, total
 
 
@@ -1335,6 +1366,14 @@ def maybe_rotate_spool(path, offset, now=None):
     archive = archive_spool(path, now)
     if archive is None:
         return False, [], offset
+    try:
+        size = os.path.getsize(archive)
+    except OSError:
+        size = -1
+    # (0.14.56 head ruling 5) every rotation is a readable log line - which spool, which archive, how many bytes
+    _log("spool rotated: %s -> %s (%d B kept in the archive, nothing deleted)" % (path, os.path.basename(archive), size))
+    for k in [k for k in _ROTATE_SKIP_LOGGED if k[0] == path]:
+        _ROTATE_SKIP_LOGGED.discard(k)
     leftover, _ = tail_spool(archive, offset)   # rename 직전 착지분 회수
     return True, leftover, 0
 
