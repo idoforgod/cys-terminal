@@ -606,6 +606,13 @@ gh release create v0.2.0 --draft --title "cys 0.2.0" --notes-file docs/RELEASE_N
         유실 복구 등으로 재후처리할 때는 ⑤ SEAL-2 정적 검사가 구조적으로 FAIL 한다: 이미
         발행·검증된 과거 실물 바이트에 한해 `--unsafe-skip-gatekeeper` 로 우회한다
         (LOUD 경고 감수 · 신규 발행에는 절대 사용 금지).
+      · ★발행본 SUMS 보존(H-05 · 0.14.56): 후처리는 릴리스에 이미 있는 `SHA256SUMS.txt` 를
+        재생성 **전에** `~/cys-release-backup/<tag>-assets/SHA256SUMS.published.txt` 로 보존한다
+        (불변 — 같으면 그대로 · 다르면 덮어쓰지 않고 멈춘다). 로그의 `SUMS 상태:` 줄이
+        bootstrap · equal · draft-mismatch(경고) · public-mismatch(오류 — **원격 쓰기 전에** 중단)를
+        밝힌다. public-mismatch·보존본 불일치로 멈추면 두 파일을 사람이 대조한다. 로컬 사본 재사용은
+        크기 **와** 자산 digest 가 같을 때만이고(digest 없음 = 재다운로드), `--apply` 는 첫 DELETE 전에
+        업로드 후보 두 파일을 4단계가 검증한 바이트와 다시 대조한다.
 - [ ] **★메인 페이지(`/`) 원격 검증 — 6항목 전부 (S28 + 2026-07-29 오너 지시 ⓐⓑⓒ · 자동화 밖의 수동 게이트)**
 
       원 레인에서 이 격차의 형태는 "원격 검증기(`verify-release-remote.sh`)·조립기
