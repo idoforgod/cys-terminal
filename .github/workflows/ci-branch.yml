@@ -398,6 +398,14 @@ jobs:
                   "release and pack-release build and publish the GitHub assets and never run the homepage switch, so an entry "
                   "there would re-test the same tree with nothing new to measure.",
               ),
+              "test_download_page_check": (
+                  {"ci-branch"},
+                  "scripts/tests/ suite (not a pack suite; 0.14.56 H-04-R). Controls for scripts/download_page_check.py (uploaded "
+                  "beside homepage-switch.py and loaded by it on the homepage server; also used on the release Mac by "
+                  "deploy-homepage.py and verify-release-remote.py) and the Mac-only scripts/download_page_advisory.py. No "
+                  "workflow runs either at release time. Branch lane only, for the same reason as test_homepage_switch: the "
+                  "pre-tag procedure requires ci-branch green on the tag SHA, and release / pack-release never run these.",
+              ),
                             "test_verify_win_crt": (
                   {"ci-branch", "release"},
                   "scripts/tests/ 스위트(팩 스위트 아님 · R1-repair 2026-08-29 편입 — 그 전에는 "
@@ -1578,6 +1586,18 @@ jobs:
           set -euo pipefail
           f="scripts/tests/test_homepage_switch.py"
           [ -f "$f" ] || { echo "Missing homepage switch controls: $f" >&2; exit 1; }
+          PYTHONDONTWRITEBYTECODE=1 python3 "$f"
+
+      # ★(0.14.56 · H-04-R) Homepage download-page check controls, registered by name: the byte-level closed world per page
+      #   profile, the pinned JS closure, the refuse-only advisory contract, the pin workflow CLI (temp folders only, no
+      #   network). Branch lane only: ALLOWED("test_download_page_check") in the lane-parity gate above gives the reason.
+      #   ★No `if:`.
+      - name: Homepage download-page check controls (profiles, closed world, advisory contract, pin CLI)
+        shell: bash
+        run: |
+          set -euo pipefail
+          f="scripts/tests/test_download_page_check.py"
+          [ -f "$f" ] || { echo "Missing homepage download-page check controls: $f" >&2; exit 1; }
           PYTHONDONTWRITEBYTECODE=1 python3 "$f"
 
       # ★(0.14.43 성찰 R1F-PK · S3 minor 8) IOReport 강링크 **산출물** 게이트. E2 가 `hwmon.rs` 의 IOReport 강링크를 dlopen 지연

@@ -652,7 +652,7 @@ gh release create v0.2.0 --draft --title "cys 0.2.0" --notes-file docs/RELEASE_N
       - [ ] ④ **버튼 href 4종 HEAD 200** — 페이지에 박힌 다운로드 링크를 눈이 아니라 HTTP 로 확인.
             ★**정적 `href="…"` 만 grep 하면 3개만 잡힌다** — zip 링크는 JS 가
             `setAttribute('href', '/downloads/…zip')` 로 붙이기 때문이다(실측). 양쪽을 봐야 4개다.
-            아래 명령은 정적만 본다 → **`python3 scripts/verify-release-remote.py <V> <구버전>` 을 쓰라**
+            아래 명령은 정적만 본다 → **`python3 scripts/verify-release-remote.py <V> <구버전> --skeleton-dir <검토된 골격 폴더>` 을 쓰라**
             (6항목 전부를 기계로 돌리고 JS 주입 링크까지 센다):
 
             ```sh
@@ -693,7 +693,10 @@ gh release create v0.2.0 --draft --title "cys 0.2.0" --notes-file docs/RELEASE_N
 
             ```sh
             # 정본 = 기계 검사. 8축 전부를 측정한다(⑤ 포함).
-            python3 scripts/verify-release-remote.py <신버전>
+            python3 scripts/verify-release-remote.py <신버전> --skeleton-dir <검토된 골격 폴더>
+            # ★(0.14.56 H-04-R) ② 는 이제 "페이지 2종(index.html · downloads/index.html) = 검토된 골격 + 이번 값, 바이트 단위"다.
+            #   골격 2종은 저장소 밖에 두고(개인 데이터가 들어 있어 공개 저장소에 올리지 않는다) 핀은
+            #   scripts/download_page_check.py PROFILES 하나다. --skeleton-dir 가 없거나·못 읽거나·핀과 다르면 ② FAIL(측정 불능).
             # 공개 릴리스 전체 목록에서 목표보다 오래된 안정 바이너리 전임을 파생한다.
             # <구버전>을 추가할 수도 있지만 파생값과 다르면 실패다. 팩-only·draft·prerelease는 제외한다.
             # 이미 공개된 목표는 목표 발행시각보다 이른 판만 비교한다. 목록 불완전·스키마 오류도 실패다.
