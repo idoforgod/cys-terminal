@@ -216,6 +216,258 @@ fn one_line(s: &str) -> String {
     s.chars().map(|c| if c.is_control() { '?' } else { c }).take(64).collect()
 }
 
+// ── 사용자 스크립트 사전 복원(r1 §7-1·§7-2 · r2 §3 · 배치 = r1 R2-c: 데몬 타입 없는 순수 잎) ──────────────
+
+/// allow 파일 판독 상한(r1 §7-1). 호출자는 상한 + 1 바이트까지 읽어 넘긴다.
+pub const ALLOW_FILE_CAP: usize = 64 * 1024;
+/// allow 파일에서 읽는 항목 수 상한(r1 §7-1).
+pub const ALLOW_MAX_ENTRIES: usize = 64;
+/// 실행할 스크립트 크기 상한(r1 §7-2). 호출자는 상한 + 1 바이트까지 읽는다.
+pub const SCRIPT_CAP: usize = 4 * 1024 * 1024;
+
+/// 호출자가 `lstat` + 한 번의 판독으로 본 스크립트(호출자가 I/O 를 하고, 판정은 여기서 한다).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScriptRead {
+    /// 일반 파일의 원시 바이트(≤ `SCRIPT_CAP` + 1).
+    Regular(Vec<u8>),
+    Symlink,
+    NotRegular,
+    Error(String),
+}
+
+/// 부팅 한 번의 결정. `None` = 훅 없음 — 오늘과 같은 경로(C1). `Refused` 는 allow 파일이 **있는데** 스크립트를
+/// 실행할 수 없는 경우다(설계에 통지 문구가 없어 호출자는 복원 로그 한 줄만 쓰고 `None` 과 같은 경로로 간다).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Prerestore {
+    None,
+    Run { path: String, sha256: String, bytes: Vec<u8> },
+    Refused { path: String, reason: &'static str },
+}
+
+/// allow 파일 한 줄 = `[default ]<64 소문자 hex>  <절대경로>`. 해석할 수 없는 줄은 **버린다**(와일드카드가 되지 않는다).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllowEntry {
+    pub default: bool,
+    pub sha256: String,
+    pub path: String,
+}
+
+/// allow 파일 → 유효 항목(앞에서부터 최대 `ALLOW_MAX_ENTRIES`). 상한을 넘긴 입력은 상한까지만 읽고 그 끝의
+/// **잘린 줄은 버린다**(잘린 경로가 다른 경로로 읽히지 않게). 주석(`#`)·빈 줄은 무시한다.
+pub fn parse_allow(raw: &[u8]) -> Vec<AllowEntry> {
+    let mut body = raw;
+    if body.len() > ALLOW_FILE_CAP {
+        body = &body[..ALLOW_FILE_CAP];
+        body = match body.iter().rposition(|b| *b == b'\n') {
+            Some(i) => &body[..i],
+            None => &[],
+        };
+    }
+    let text = String::from_utf8_lossy(body);
+    let mut out = Vec::new();
+    for line in text.split('\n') {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            continue;
+        }
+        let (default, rest) = match line.strip_prefix("default ") {
+            Some(r) => (true, r),
+            None => (false, line),
+        };
+        let Some((hex, path)) = rest.split_once("  ") else { continue };
+        let hex_ok = hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        if !hex_ok || !path_acceptable(path) {
+            continue;
+        }
+        out.push(AllowEntry { default, sha256: hex.to_string(), path: path.to_string() });
+        if out.len() == ALLOW_MAX_ENTRIES {
+            break;
+        }
+    }
+    out
+}
+
+/// 절대경로이고 NUL·제어 문자가 없다(r1 §7-2 path rules).
+fn path_acceptable(p: &str) -> bool {
+    !p.is_empty() && !p.chars().any(char::is_control) && std::path::Path::new(p).is_absolute()
+}
+
+/// allow 파일 + 선택자(`CYS_PHOENIX_SCRIPT`) + 스크립트 판독 → 이번 부팅의 결정(r1 §7-1·§7-2).
+/// - allow 파일 없음 ⇒ `None`(호출자가 한 번 열어 본 결과다 — 그 밖에는 아무것도 하지 않는다).
+/// - 선택자는 **그것만으로는 아무것도 못 한다**: 같은 경로의 항목이 있고 원시 바이트의 SHA-256 이 맞아야 실행된다.
+/// - 선택자가 없으면 첫 `default` 항목. 그것도 없으면 `None`.
+pub fn decide_prerestore(
+    allow: Option<&[u8]>,
+    selector: Option<&str>,
+    read_script: &dyn Fn(&str) -> ScriptRead,
+) -> Prerestore {
+    let Some(raw) = allow else { return Prerestore::None };
+    let entries = parse_allow(raw);
+    let refuse = |path: &str, reason| Prerestore::Refused { path: one_line(path), reason };
+    let entry = match selector {
+        Some(sel) => {
+            if !path_acceptable(sel) {
+                return refuse(sel, "selector_not_an_absolute_clean_path");
+            }
+            match entries.iter().find(|e| e.path == sel) {
+                Some(e) => e,
+                None => return refuse(sel, "not_in_allow_file"),
+            }
+        }
+        None => match entries.iter().find(|e| e.default) {
+            Some(e) => e,
+            None => return Prerestore::None,
+        },
+    };
+    match read_script(&entry.path) {
+        ScriptRead::Regular(bytes) => {
+            if bytes.len() > SCRIPT_CAP {
+                return refuse(&entry.path, "too_large");
+            }
+            let got = sha256_hex(&bytes);
+            if got != entry.sha256 {
+                return refuse(&entry.path, "sha256_mismatch");
+            }
+            Prerestore::Run { path: entry.path.clone(), sha256: got, bytes }
+        }
+        ScriptRead::Symlink => refuse(&entry.path, "symlink"),
+        ScriptRead::NotRegular => refuse(&entry.path, "not_a_regular_file"),
+        ScriptRead::Error(_) => refuse(&entry.path, "read_error"),
+    }
+}
+
+fn sha256_hex(b: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(b).iter().map(|x| format!("{x:02x}")).collect()
+}
+
+#[cfg(test)]
+mod prerestore_decide_tests {
+    use super::*;
+
+    const BODY: &[u8] = b"print('hook')\n";
+
+    fn hex(b: &[u8]) -> String {
+        sha256_hex(b)
+    }
+
+    fn reader(map: Vec<(String, ScriptRead)>) -> impl Fn(&str) -> ScriptRead {
+        move |p| {
+            map.iter()
+                .find(|(k, _)| k == p)
+                .map(|(_, v)| v.clone())
+                .unwrap_or(ScriptRead::Error("absent".into()))
+        }
+    }
+
+    fn abs(p: &str) -> String {
+        if cfg!(windows) { format!("C:{}", p.replace('/', "\\")) } else { p.to_string() }
+    }
+
+    /// C1 — allow 파일이 없으면 판독기를 부르지 않고 `None`.
+    #[test]
+    fn no_allow_file_is_none_and_reads_nothing() {
+        let called = std::cell::Cell::new(0);
+        let r = |_: &str| {
+            called.set(called.get() + 1);
+            ScriptRead::Regular(BODY.to_vec())
+        };
+        assert_eq!(decide_prerestore(None, None, &r), Prerestore::None);
+        assert_eq!(decide_prerestore(None, Some(&abs("/x/h.py")), &r), Prerestore::None);
+        assert_eq!(called.get(), 0);
+    }
+
+    #[test]
+    fn default_entry_with_matching_bytes_runs_the_verified_bytes() {
+        let p = abs("/u/hook.py");
+        let allow = format!("# my hooks\n\ndefault {}  {p}\n", hex(BODY));
+        let got = decide_prerestore(Some(allow.as_bytes()), None, &reader(vec![(p.clone(), ScriptRead::Regular(BODY.to_vec()))]));
+        assert_eq!(got, Prerestore::Run { path: p, sha256: hex(BODY), bytes: BODY.to_vec() });
+    }
+
+    /// 선택자는 단독으로 무력하다 — 경로 항목이 없거나 해시가 다르면 실행하지 않는다.
+    #[test]
+    fn selector_is_inert_without_a_matching_entry_and_hash() {
+        let p = abs("/u/hook.py");
+        let other = abs("/u/other.py");
+        let allow = format!("{}  {p}\n", hex(BODY));
+        let ok = reader(vec![(p.clone(), ScriptRead::Regular(BODY.to_vec()))]);
+        assert_eq!(
+            decide_prerestore(Some(allow.as_bytes()), Some(&other), &ok),
+            Prerestore::Refused { path: other.clone(), reason: "not_in_allow_file" }
+        );
+        let changed = reader(vec![(p.clone(), ScriptRead::Regular(b"print('changed')\n".to_vec()))]);
+        assert_eq!(
+            decide_prerestore(Some(allow.as_bytes()), Some(&p), &changed),
+            Prerestore::Refused { path: p.clone(), reason: "sha256_mismatch" }
+        );
+        assert!(matches!(decide_prerestore(Some(allow.as_bytes()), Some(&p), &ok), Prerestore::Run { .. }));
+        // 선택자 없음 + default 없음 = 아무것도 실행하지 않는다(경로 항목만으로는 기본값이 아니다).
+        assert_eq!(decide_prerestore(Some(allow.as_bytes()), None, &ok), Prerestore::None);
+        // CRLF 로 고쳐 저장한 스크립트는 다른 바이트다(r1 docs: CRLF 경고).
+        let crlf = reader(vec![(p.clone(), ScriptRead::Regular(b"print('hook')\r\n".to_vec()))]);
+        assert!(matches!(decide_prerestore(Some(allow.as_bytes()), Some(&p), &crlf), Prerestore::Refused { reason: "sha256_mismatch", .. }));
+    }
+
+    #[test]
+    fn script_shape_refusals_are_named() {
+        let p = abs("/u/hook.py");
+        let allow = format!("default {}  {p}\n", hex(BODY));
+        for (read, why) in [
+            (ScriptRead::Symlink, "symlink"),
+            (ScriptRead::NotRegular, "not_a_regular_file"),
+            (ScriptRead::Error("EACCES".into()), "read_error"),
+            (ScriptRead::Regular(vec![b'#'; SCRIPT_CAP + 1]), "too_large"),
+        ] {
+            assert_eq!(
+                decide_prerestore(Some(allow.as_bytes()), None, &reader(vec![(p.clone(), read)])),
+                Prerestore::Refused { path: p.clone(), reason: why }
+            );
+        }
+        let rel = "hook.py";
+        assert_eq!(
+            decide_prerestore(Some(allow.as_bytes()), Some(rel), &reader(vec![])),
+            Prerestore::Refused { path: rel.into(), reason: "selector_not_an_absolute_clean_path" }
+        );
+    }
+
+    /// 해석할 수 없는 줄은 버려지고(와일드카드가 되지 않는다) 첫 `default` 만 센다.
+    #[test]
+    fn unparsable_lines_are_dropped_and_only_the_first_default_counts() {
+        let a = abs("/u/a.py");
+        let b = abs("/u/b.py");
+        let h = hex(BODY);
+        let lines = [
+            format!("default {}  {a}", h.to_uppercase()),     // 대문자 hex
+            format!("default {}  {a}", &h[..63]),             // 63자
+            format!("default {} {a}", h),                     // 공백 하나
+            format!("default {}  relative/a.py", h),          // 상대경로
+            format!("default {}  {a}\u{1}", h),               // 제어 문자
+            "default *  *".to_string(),
+            format!("default {}  {b}", h),                    // 첫 유효 default
+            format!("default {}  {a}", h),                    // 두 번째 default — 무시
+        ];
+        let allow = lines.join("\n");
+        let parsed = parse_allow(allow.as_bytes());
+        assert_eq!(parsed.len(), 2, "{parsed:?}");
+        let r = reader(vec![(b.clone(), ScriptRead::Regular(BODY.to_vec())), (a.clone(), ScriptRead::Regular(BODY.to_vec()))]);
+        assert!(matches!(decide_prerestore(Some(allow.as_bytes()), None, &r), Prerestore::Run { path, .. } if path == b));
+    }
+
+    /// 상한: 64 항목까지만, 64 KiB 까지만 — 상한에서 잘린 마지막 줄은 다른 경로로 읽히지 않고 버려진다.
+    #[test]
+    fn allow_caps_drop_entries_and_the_cut_line() {
+        let h = hex(BODY);
+        let many: String = (0..70).map(|i| format!("{h}  {}\n", abs(&format!("/u/{i}.py")))).collect();
+        assert_eq!(parse_allow(many.as_bytes()).len(), ALLOW_MAX_ENTRIES);
+        let long_path = abs(&format!("/u/{}", "d".repeat(ALLOW_FILE_CAP)));
+        let mut cut = format!("{h}  {}\n", abs("/u/first.py"));
+        cut.push_str(&format!("{h}  {long_path}\n"));
+        let parsed = parse_allow(cut.as_bytes());
+        assert_eq!(parsed.iter().map(|e| e.path.clone()).collect::<Vec<_>>(), vec![abs("/u/first.py")]);
+    }
+}
+
 #[cfg(test)]
 mod plan_outcome_tests {
     use super::*;
