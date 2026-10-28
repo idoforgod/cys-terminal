@@ -25698,8 +25698,9 @@ mod tests {
     /// `last_output` or writes `exited`. The gate is taken between chunks (`output_gen` even), so the
     /// chunk that turns it odd started after the gate and must wait for `parser` — an unrelated chunk
     /// already in flight cannot fake or hide the park. One written line makes that chunk.
+    /// The returned guard checks on drop, with no sleep, that the reader really stayed parked (see `ParkedReader`).
     #[track_caller]
-    fn park_reader(s: &crate::state::Surface) -> std::sync::MutexGuard<'_, vt100::Parser> {
+    fn park_reader(s: &crate::state::Surface) -> ParkedReader<'_> {
         let end=Instant::now()+Duration::from_secs(30);
         let gate=loop {
             let g=s.parser.lock().unwrap_or_else(|e|e.into_inner());
@@ -25714,7 +25715,25 @@ mod tests {
             assert!(Instant::now()<end,"no PTY output after one written line: the reader is not parked");
             std::thread::sleep(Duration::from_millis(5));
         }
-        gate
+        ParkedReader{s,parked_gen:gen+1,_gate:gate}
+    }
+
+    /// The park from `park_reader`. A parked reader holds `output_gen` at the odd `gen + 1` of its blocked
+    /// chunk; one that got past `parser` would bump it to even (`gen + 2`) and beyond. So `drop` asserts the
+    /// exact odd value BEFORE `_gate` (dropped after the `drop` body) releases the reader: no sleep, no margin.
+    /// Skipped while already panicking, so a failing test keeps its own message.
+    struct ParkedReader<'a> {
+        s: &'a crate::state::Surface,
+        parked_gen: u64,
+        _gate: std::sync::MutexGuard<'a, vt100::Parser>,
+    }
+    impl Drop for ParkedReader<'_> {
+        fn drop(&mut self) {
+            if !std::thread::panicking() {
+                assert_eq!(self.s.output_gen.load(AtomicOrdering::Acquire),self.parked_gen,
+                    "the PTY reader got past its parked chunk while the park was held: it did not wait for `parser`");
+            }
+        }
     }
 
     /// ★D-R2-3 상설 덤프 — ★실패 경로에서만 찍는다(통과 때 출력 0 ⇒ 로그 비용 0).

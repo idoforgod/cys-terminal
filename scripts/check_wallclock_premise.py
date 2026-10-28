@@ -31,10 +31,16 @@ Test identity = repo-relative path + qualified name, never a line number:
 Escape: a comment ON the deciding line printed for the test, with a non-empty reason, accepts that premise:
   Rust    assert!(done);  // wallclock: guard <reason>
   Python  self.assertTrue(done)  # wallclock: guard <reason>
-Every accepted annotation is printed and counted. An annotation without a reason is not accepted.
+`guard` = the timing only bounds an event that is guaranteed. `aging <reason>` (same syntax) = a deliberate premise that
+is not a guard (e.g. an aged sample that tells mutants apart); it is printed as AGING and counted on its own, never in
+the guard count. Every accepted annotation is printed and counted. An annotation without a reason is not accepted.
 
 Exit codes: 0 clean · 1 violations (new premise test, or stale baseline entry) · 2 cannot judge (missing or unreadable
 baseline, unparsable source, scanner self-check failure). 2 is never a pass.
+
+--write-baseline FILE rewrites the baseline from the live premise set, so it can only remove STALE ids: when a live
+premise is not in the current baseline it prints the NEW ids, writes nothing and exits 1; with no current baseline it
+cannot judge (exit 2).
 
     python3 scripts/check_wallclock_premise.py [--root DIR] [--baseline FILE] [--write-baseline FILE]
 """
@@ -979,22 +985,24 @@ def analyze(tree):
 
 
 # ======================= premise rows per test id, escape annotations =======================
-ANNOT_RS = re.compile(r"^//+\s*wallclock:\s*guard\b(.*)$")
-ANNOT_PY = re.compile(r"^#+\s*wallclock:\s*guard\b(.*)$")
+ANNOT_RS = re.compile(r"^//+\s*wallclock:\s*(guard|aging)\b(.*)$")
+ANNOT_PY = re.compile(r"^#+\s*wallclock:\s*(guard|aging)\b(.*)$")
 
 
 def annotation(files, path, line):
-    """(found, reason) for a `wallclock: guard <reason>` comment on path:line."""
+    """(keyword, reason) for a `wallclock: guard|aging <reason>` comment on path:line; keyword None when there is none.
+    `guard` = the timing bounds an event that is guaranteed; `aging` = a deliberate premise (e.g. an aged sample that
+    tells mutants apart), never a guard. Each keyword is counted on its own."""
     fd = files.get(path)
     if fd is None or line is None:
-        return False, ""
+        return None, ""
     text = fd.comments.get(line)
     if text is None:
-        return False, ""
+        return None, ""
     m = (ANNOT_PY if path.endswith(".py") else ANNOT_RS).match(text.strip())
     if not m:
-        return False, ""
-    return True, m.group(1).strip(" \t:-")
+        return None, ""
+    return m.group(1), m.group(2).strip(" \t:-")
 
 
 def quote(files, path, line):
@@ -1012,8 +1020,9 @@ def premise_tests(res):
     def add(file, qual, row):
         tid = "%s::%s" % (file, qual)
         ent = out.setdefault(tid, {"id": tid, "file": file, "rows": []})
-        found, reason = annotation(files, row["decide_file"], row["decide_line"])
-        row["annotated"], row["accepted"] = found, (reason if found and reason else None)
+        keyword, reason = annotation(files, row["decide_file"], row["decide_line"])
+        row["annotated"], row["accepted"] = keyword is not None, (reason if keyword and reason else None)
+        row["keyword"] = keyword
         row["quote"] = quote(files, row["decide_file"], row["decide_line"])
         ent["rows"].append(row)
 
@@ -1109,9 +1118,9 @@ def row_text(r):
     return '%s:%s  %s  "%s"  (%s)' % (r["decide_file"], r["decide_line"], cls, r["quote"], r["reason"])
 
 
-def summary(n_premise, n_base_ok, n_new, n_stale, n_acc, n_rej, verdict):
+def summary(n_premise, n_base_ok, n_new, n_stale, n_acc, n_rej, n_aging, verdict):
     return ("summary: premise tests %d (baselined %d, new %d); stale baseline entries %d; accepted annotations %d; "
-            "rejected annotations %d -> %s" % (n_premise, n_base_ok, n_new, n_stale, n_acc, n_rej, verdict))
+            "rejected annotations %d; aging annotations %d -> %s" % (n_premise, n_base_ok, n_new, n_stale, n_acc, n_rej, n_aging, verdict))
 
 
 def run(root, baseline_path, write_path):
@@ -1120,20 +1129,30 @@ def run(root, baseline_path, write_path):
     tests = premise_tests(res)
     for note in res["overrides_fired"]:
         print("census override: %s" % note)
-    accepted = [(tid, r) for tid, e in sorted(tests.items()) for r in e["rows"] if r["accepted"]]
+    accepted = [(tid, r) for tid, e in sorted(tests.items()) for r in e["rows"] if r["accepted"] and r["keyword"] == "guard"]
+    aging = [(tid, r) for tid, e in sorted(tests.items()) for r in e["rows"] if r["accepted"] and r["keyword"] == "aging"]
     rejected = [(tid, r) for tid, e in sorted(tests.items()) for r in e["rows"] if r["annotated"] and not r["accepted"]]
     for tid, r in accepted:
         print('ACCEPTED  %s:%s  %s  %s  reason: "%s"' % (r["decide_file"], r["decide_line"], tid, r["class"], r["accepted"]))
+    for tid, r in aging:
+        print('AGING     %s:%s  %s  %s  reason: "%s"' % (r["decide_file"], r["decide_line"], tid, r["class"], r["accepted"]))
     live = {tid: e for tid, e in tests.items() if e["live"]}
-    if write_path:
-        with open(write_path, "w", encoding="utf-8", newline="\n") as f:
-            f.write(BASELINE_HEADER + "".join(tid + "\n" for tid in sorted(live)))
-        print("wrote %d premise test ids to %s" % (len(live), write_path))
-        print(summary(len(live), 0, 0, 0, len(accepted), len(rejected), "baseline written (exit 0)"))
-        return EXIT_CLEAN
     entries = read_baseline(baseline_path)
     listed = {tid for _, tid in entries}
     new = sorted(tid for tid in live if tid not in listed)
+    if write_path:
+        # The baseline only shrinks: a rewrite may drop STALE ids, never add a premise the current baseline lacks.
+        if new:
+            for tid in new:
+                print("NEW       %s  %s" % (tid, row_text(live[tid]["live"])))
+            print(summary(len(live), len(live) - len(new), len(new), len(listed - set(live)), len(accepted), len(rejected), len(aging),
+                          "baseline write refused: fix or annotate the new premise tests first (exit 1)"))
+            return EXIT_VIOLATION
+        with open(write_path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(BASELINE_HEADER + "".join(tid + "\n" for tid in sorted(live)))
+        print("wrote %d premise test ids to %s (removed %d stale)" % (len(live), write_path, len(listed - set(live))))
+        print(summary(len(live), len(live), 0, len(listed - set(live)), len(accepted), len(rejected), len(aging), "baseline written (exit 0)"))
+        return EXIT_CLEAN
     stale = []
     for ln, tid in entries:
         if tid in live:
@@ -1158,9 +1177,9 @@ def run(root, baseline_path, write_path):
         print("STALE     %s:%d  %s  %s - remove from baseline" % (os.path.relpath(baseline_path, root) if os.path.isabs(baseline_path) else baseline_path, ln, tid, why))
     for tid, r in rejected:
         if tid not in new:
-            print('REJECTED  %s:%s  %s  annotation without a reason is not accepted' % (r["decide_file"], r["decide_line"], tid))
+            print('REJECTED  %s:%s  %s  `wallclock: %s` annotation without a reason is not accepted' % (r["decide_file"], r["decide_line"], tid, r["keyword"]))
     bad = bool(new or stale)
-    print(summary(len(live), len(live) - len(new), len(new), len(stale), len(accepted), len(rejected),
+    print(summary(len(live), len(live) - len(new), len(new), len(stale), len(accepted), len(rejected), len(aging),
                   "FAIL (exit 1)" if bad else "PASS (exit 0)"))
     return EXIT_VIOLATION if bad else EXIT_CLEAN
 
@@ -1169,7 +1188,9 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="Fail when a test outside the baseline rests its verdict on a wall-clock premise.")
     ap.add_argument("--root", default=DEFAULT_ROOT, help="tree to judge (default: the repo root, the parent of scripts/)")
     ap.add_argument("--baseline", help="baseline file (default: <root>/%s)" % BASELINE_REL)
-    ap.add_argument("--write-baseline", metavar="FILE", help="write the current premise test ids to FILE and exit")
+    ap.add_argument("--write-baseline", metavar="FILE",
+                    help="write the current premise test ids to FILE and exit; refused (exit 1, nothing written) if any "
+                         "is not in the current baseline - a rewrite may only remove stale ids")
     a = ap.parse_args(argv)
     for stream in (sys.stdout, sys.stderr):  # quoted source lines are not ASCII; a cp1252 console must not crash the gate
         try:
@@ -1184,7 +1205,7 @@ def main(argv=None):
         return run(root, baseline, a.write_baseline)
     except CannotJudge as e:
         print("cannot judge: %s" % e, file=sys.stderr)
-        print(summary(0, 0, 0, 0, 0, 0, "CANNOT JUDGE (exit 2): %s" % str(e)[:300]))
+        print(summary(0, 0, 0, 0, 0, 0, 0, "CANNOT JUDGE (exit 2): %s" % str(e)[:300]))
         return EXIT_CANNOT_JUDGE
 
 

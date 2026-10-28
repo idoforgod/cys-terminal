@@ -319,6 +319,39 @@ class WallclockPremiseGate(unittest.TestCase):
                 self.assertIn("no reason: not accepted", new[0])
                 self.assertIn("accepted annotations 0; rejected annotations 1", out)
 
+    def test_n2_aging_annotation_is_accepted_in_its_own_count(self):
+        # `wallclock: aging <reason>` accepts a premise that is deliberate (aging, not a guard): printed as AGING and
+        # counted on its own, never folded into the guard count. Both comment syntaxes, guard and aging side by side.
+        reason = "aged sample so a mutant that skips the age check is told apart"
+        for rs_kw, py_kw in (("aging", "guard"), ("guard", "aging")):
+            with self.subTest(rust=rs_kw, python=py_kw):
+                rs_src = P1_SRC.replace("ASSERT_LINE", P1_ASSERT + "  // wallclock: %s %s" % (rs_kw, reason))
+                py_src = P2_SRC.replace("self.assertEqual(box, [1])", "self.assertEqual(box, [1])  # wallclock: %s %s" % (py_kw, reason))
+                self.write(RS, rs_src)
+                self.write(PY, py_src)
+                self.set_baseline()
+                rc, out = self.run_gate()
+                self.assertEqual(rc, 0, out)
+                aging = [l for l in out.split("\n") if l.startswith("AGING ")]
+                acc = [l for l in out.split("\n") if l.startswith("ACCEPTED ")]
+                self.assertEqual((len(aging), len(acc)), (1, 1), out)
+                self.assertIn(P1_ID if rs_kw == "aging" else P2_ID, aging[0])
+                self.assertIn(P2_ID if rs_kw == "aging" else P1_ID, acc[0])
+                self.assertIn(reason, aging[0])
+                self.assertIn("accepted annotations 1; rejected annotations 0; aging annotations 1", out)
+
+    def test_n2_aging_annotation_without_a_reason_is_rejected(self):
+        for suffix in ("  // wallclock: aging", "  // wallclock: aging   "):
+            with self.subTest(suffix=suffix):
+                self.write(RS, P1_SRC.replace("ASSERT_LINE", P1_ASSERT + suffix))
+                self.set_baseline()
+                rc, out = self.run_gate()
+                self.assertEqual(rc, 1, out)
+                new = self.new_lines(out)
+                self.assertEqual(len(new), 1, out)
+                self.assertIn("no reason: not accepted", new[0])
+                self.assertIn("accepted annotations 0; rejected annotations 1; aging annotations 0", out)
+
     def test_n2_annotation_off_the_deciding_line_is_not_accepted(self):
         src = P1_SRC.replace("ASSERT_LINE", P1_ASSERT).replace(
             "std::thread::sleep(Duration::from_millis(50));", "std::thread::sleep(Duration::from_millis(50)); // wallclock: guard on the sleep line")
@@ -354,8 +387,11 @@ class WallclockPremiseGate(unittest.TestCase):
         self.assertIn("no such test any more", out)
 
     def test_write_baseline_round_trip(self):
+        # --write-baseline may only REMOVE stale lines: the listed STALE id goes, the two live premises stay.
         self.write(RS, P1_SRC.replace("ASSERT_LINE", P1_ASSERT))
         self.write(PY, P2_SRC)
+        stale_id = "src/bin/cysd/gone.rs::tests::no_such_test"
+        self.set_baseline(P1_ID, P2_ID, stale_id)
         out_file = os.path.join(self.tmp, "written.txt")
         rc, out = self.run_gate("--write-baseline", out_file)
         self.assertEqual(rc, 0, out)
@@ -367,6 +403,27 @@ class WallclockPremiseGate(unittest.TestCase):
         shutil.copy(out_file, self.baseline)
         rc, out = self.run_gate()
         self.assertEqual(rc, 0, out)
+
+    def test_write_baseline_refuses_a_new_premise(self):
+        # ADDENDUM-1 step 5 "never add a new premise to the baseline" is enforced by the tool, not by prose.
+        self.write(RS, P1_SRC.replace("ASSERT_LINE", P1_ASSERT))
+        self.write(PY, P2_SRC)
+        self.set_baseline(P1_ID)
+        out_file = os.path.join(self.tmp, "written.txt")
+        rc, out = self.run_gate("--write-baseline", out_file)
+        self.assertEqual(rc, 1, out)
+        self.assertEqual([l.split()[1] for l in self.new_lines(out)], [P2_ID], out)
+        self.assertIn("refused", out)
+        self.assertFalse(os.path.exists(out_file), "a refused write must not create the file")
+
+    def test_write_baseline_without_a_baseline_is_exit_2(self):
+        # With no baseline to compare against, every live id would be new: the tool cannot judge, and writes nothing.
+        self.write(RS, P1_SRC.replace("ASSERT_LINE", P1_ASSERT))
+        out_file = os.path.join(self.tmp, "written.txt")
+        rc, out = self.run_gate("--write-baseline", out_file)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("baseline missing or unreadable", out)
+        self.assertFalse(os.path.exists(out_file))
 
     # -- exit 2: cannot judge (never a pass) --
     def test_e_missing_baseline_is_exit_2(self):
