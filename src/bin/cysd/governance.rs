@@ -7008,14 +7008,21 @@ fn machine_hold_probe(
     }
     if axes.modal || axes.draft {
         let adapters = load_adapter_defs();
-        if let Some((markers, _)) = surface_prompt_marker(s, &adapters) {
+        if let Some((markers, placeholder)) = surface_prompt_marker(s, &adapters) {
             let obs = observe_prompt(s, &markers);
             input.modal = obs_modal_foreground(&obs);
+            // ★(0.14.56 · P1 R-6 · design r3 §4-6) Measured seat: a draft is the D1 verdict's draft reading (a Home-moved draft
+            //   now holds a CEO push, channel envelope, boot notice or schedule push instead of being typed onto). Unmeasured
+            //   seat: the pin's before-only test.
+            let draft_seen = match composer_reads_empty(s, &obs, placeholder.as_deref()) {
+                Some(reading) => !obs.selector_row && reading == Some(false),
+                None => obs_draft_observed(&obs),
+            };
             // ★(리뷰 F1·F2) 화면 초안이 기계 소유로 **입증**되면 초안 축의 보류 근거가 아니다([`draft_machine_owned`]).
             //   모달이 먼저 적중하면 초안 축은 판정에 쓰이지 않는다(순서 고정) — 귀속·가시화도 하지 않는다.
             input.draft = axes.draft
                 && !(axes.modal && input.modal)
-                && obs_draft_observed(&obs)
+                && draft_seen
                 && match draft_machine_owned(s, obs.line.as_ref().map(|(before, _)| before.as_str())) {
                     None => true,
                     Some(MachineDraft::OwnPaste) => false,
@@ -7254,11 +7261,31 @@ pub(crate) fn draft_gate_verdict(
     selector_row: bool,
     approval_pending: bool,
 ) -> Option<DraftGateDenied> {
+    draft_gate_verdict_occupied(
+        kind,
+        pending,
+        human_pending,
+        input_line_state(0, line) == InputLine::Occupied,
+        selector_row,
+        approval_pending,
+    )
+}
+
+/// ★(0.14.56 · P1 R-5) [`draft_gate_verdict`] with the screen-occupied fact given directly: the pin passes
+/// `input_line_state(0, line) == Occupied`; on a measured seat [`draft_gate`] passes the D1 verdict's "draft" reading instead.
+pub(crate) fn draft_gate_verdict_occupied(
+    kind: DirectSendKind,
+    pending: u64,
+    human_pending: u64,
+    screen_occupied: bool,
+    selector_row: bool,
+    approval_pending: bool,
+) -> Option<DraftGateDenied> {
     match kind {
         DirectSendKind::Text => {
             if pending > 0 {
                 Some(DraftGateDenied::PendingInput { bytes: pending })
-            } else if !selector_row && input_line_state(0, line) == InputLine::Occupied {
+            } else if !selector_row && screen_occupied {
                 Some(DraftGateDenied::ScreenOccupied)
             } else {
                 None
@@ -7270,7 +7297,7 @@ pub(crate) fn draft_gate_verdict(
             } else if pending == 0
                 && !selector_row
                 && !approval_pending
-                && input_line_state(0, line) == InputLine::Occupied
+                && screen_occupied
             {
                 Some(DraftGateDenied::ScreenOccupied)
             } else {
@@ -7323,7 +7350,8 @@ pub(crate) fn draft_gate(
         return None;
     }
     let adapters = load_adapter_defs();
-    let obs = surface_prompt_marker(s, &adapters).map(|(marker, _)| observe_prompt(s, &marker));
+    let marker_def = surface_prompt_marker(s, &adapters);
+    let obs = marker_def.as_ref().map(|(marker, _)| observe_prompt(s, marker));
     let line = obs.as_ref().and_then(|obs| {
         obs.line.as_ref().map(|(before, after)| PromptLine {
             before_cursor: before,
@@ -7349,7 +7377,24 @@ pub(crate) fn draft_gate(
         }
     }
     let approval_pending = approval_or_gate_pending(daemon, s.id);
-    draft_gate_verdict(kind, pending, human_pending, line, selector_row, approval_pending)
+    // ★(0.14.56 · P1 R-5 · design r3 §4-5) Measured seat: "screen occupied" is the D1 verdict's draft reading, so a Home-moved
+    //   draft (text after the cursor, not dim) refuses a direct Text/SubmitKey/ClearFirst; a suggestion passes as before.
+    //   `Unknown` does not refuse (the pin's rule for an unobserved line). Unmeasured seat: the pin's before-only test.
+    let d1 = match (&obs, &marker_def) {
+        (Some(obs), Some((_, placeholder))) => composer_reads_empty(s, obs, placeholder.as_deref()),
+        _ => None,
+    };
+    match d1 {
+        Some(reading) => draft_gate_verdict_occupied(
+            kind,
+            pending,
+            human_pending,
+            reading == Some(false),
+            selector_row,
+            approval_pending,
+        ),
+        None => draft_gate_verdict(kind, pending, human_pending, line, selector_row, approval_pending),
+    }
 }
 
 /// 미제출 입력 계수 v2 상태기계 — surface 별 상태(정의처 단일 · handlers send_text/send_key 둘 다 이것만 쓴다).
@@ -7849,6 +7894,10 @@ pub(crate) struct PromptObs {
     /// Filled only on request (submit/resubmit and slash admission); other observations carry None.
     /// A cursor outside a recognized input block also yields None.
     pub(crate) block: Option<ComposerBlock>,
+    /// ★(0.14.56 · P1 D1) Are ALL glyphs after the cursor on the cursor row dim (SGR 2)? Read with
+    /// [`after_cursor_dim_of`] inside the SAME parser lock as `line` (one frame). `None` = no glyph after the cursor or the
+    /// cursor is off-screen (a missing reading is not a value).
+    pub(crate) after_cursor_dim: Option<bool>,
 }
 
 impl PromptObs {
@@ -7879,6 +7928,7 @@ impl PromptObs {
             line: Some((String::new(), String::new())),
             selector_row: false,
             block: None,
+            after_cursor_dim: None,
             ..self.clone()
         })
     }
@@ -7926,9 +7976,12 @@ fn observe_prompt_ext(s: &Arc<crate::state::Surface>, markers: &[String], want_b
             quiet_secs,
             alt_screen,
             block: None,
+            after_cursor_dim: None,
         };
     }
     let before_all = screen.contents_between(cr, 0, cr, cc);
+    // ★(0.14.56 · P1 D1) Same lock, same frame as `line` below.
+    let after_cursor_dim = after_cursor_dim_of(screen, cr, cc);
     let row_all = screen.contents_between(cr, 0, cr, cols);
     // ★(0.14.39 · 수정 라운드 1 · 리뷰 PROBE-A) composer 마커는 커서행 **선두** 후보만이다. 종전 '커서 앞
     //   가장 뒤 후보(rfind)' 는 출력 행 끝의 `->` 와 초안 속 글리프(`» abc » `)를 빈 composer 로 읽었다.
@@ -7980,6 +8033,7 @@ fn observe_prompt_ext(s: &Arc<crate::state::Surface>, markers: &[String], want_b
         quiet_secs,
         alt_screen,
         block,
+        after_cursor_dim,
     }
 }
 
@@ -8249,15 +8303,34 @@ fn prompt_gate_input_with_approval(
     approval_pending: bool,
 ) -> PromptGateInput {
     let pending = s.pending_input_bytes.load(Ordering::Relaxed);
-    let input = input_line_state(
-        pending,
-        obs.line.as_ref().map(|(b, a)| PromptLine {
-            before_cursor: b,
-            at_or_after_cursor: a,
-        }),
-    );
+    // ★(0.14.56 · P1 R-1 · design r3 §3) On a measured seat `input` and `layout_ok` take the D1 verdict of THIS observation;
+    //   elsewhere both keep the pin expressions. The pending count still wins first.
+    let verdict = d1_governs(s).then(|| composer_verdict(obs, placeholder));
+    let input = match verdict {
+        Some(v) if pending == 0 => match v.reads_empty() {
+            Some(true) => InputLine::Empty,
+            Some(false) => InputLine::Occupied,
+            None => InputLine::Unknown,
+        },
+        _ => input_line_state(
+            pending,
+            obs.line.as_ref().map(|(b, a)| PromptLine {
+                before_cursor: b,
+                at_or_after_cursor: a,
+            }),
+        ),
+    };
     // ★(리뷰 R5) 화면과 **같은 관측**의 값이다(따로 읽지 않는다 — 합성 금지).
     let alt_screen = obs.alt_screen;
+    // ★(0.14.56 · P1 R-1) Which screen the unchanged readiness predicate sees: the marker-row-stripped copy only for a
+    //   `Suggestion` (so the scan still demands strong evidence, or weak evidence plus quiet, BELOW the marker); the screen as
+    //   observed for Empty/Placeholder (the placeholder text must stay - it is the scan's weak evidence) and on unmeasured seats;
+    //   no layout at all for Draft/Unknown. `src/readiness.rs` is not changed.
+    let layout_screen: Option<std::borrow::Cow<'_, str>> = match verdict {
+        None | Some(ComposerVerdict::Empty) | Some(ComposerVerdict::Placeholder) => Some(std::borrow::Cow::Borrowed(obs.screen.as_str())),
+        Some(ComposerVerdict::Suggestion) => marker_row_stripped(&obs.screen, &obs.marker).map(std::borrow::Cow::Owned),
+        Some(ComposerVerdict::Draft) | Some(ComposerVerdict::Unknown) => None,
+    };
     let quiet = queue_quiet_secs();
     PromptGateInput {
         marker_seen: obs.marker_seen,
@@ -8288,12 +8361,14 @@ fn prompt_gate_input_with_approval(
         //   더 조여지고(하류 `quiet_for < quiet`), 판정 의미는 소비처 전체에서 하나로 남는다.
         layout_ok: alt_screen
             && !marker.is_empty()
-            && cys::readiness::composer_layout_static_ok(
-                &obs.screen,
-                marker,
-                placeholder,
-                cys::readiness::idle_quiet_from(Some(obs.quiet_secs as f64)),
-            ),
+            && layout_screen.as_deref().is_some_and(|screen| {
+                cys::readiness::composer_layout_static_ok(
+                    screen,
+                    marker,
+                    placeholder,
+                    cys::readiness::idle_quiet_from(Some(obs.quiet_secs as f64)),
+                )
+            }),
         quiet_for: obs.quiet_secs,
         quiet,
         frame_published: obs.frame_published(),
@@ -8475,6 +8550,26 @@ pub(crate) fn seat_screen_probe_with(
 /// ★(RQFIX2 m-3) **지우는 행은 커서 행일 때만이다.** 지우려는 행(화면의 마지막 선두 마커 행)의 글자가 커서 행의 `(before, after)`(= `cursor_row`)와 다르면 그 행의 글자는
 /// 커서 앞·뒤 판독이 말해 주지 않는다 — 지우면 판정에서 **사라진다**(빈 첫 행에 커서 + 초안 안의 괘선 모양 줄 + `❯ 붙여넣은 전사 줄` 행이 유령으로 단정되던 모서리). 그때는
 /// 편집 영역이 비어 있지 않다고 접는다(`Some(false)` → 호출자 `draft_visible = Some(true)` · Ctrl-U 처방 없음).
+/// ★(0.14.56 · P1 R-1) The screen with the LAST leading-marker row cut to its marker glyph - the same copy
+/// [`composer_rest_empty`] builds for its own check. `None` when the screen has no leading-marker row.
+fn marker_row_stripped(screen: &str, marker: &str) -> Option<String> {
+    let lines: Vec<&str> = screen.lines().collect();
+    let li = lines
+        .iter()
+        .rposition(|l| cys::agent_markers::leading_marker_index(marker, l).is_some())?;
+    let line = lines[li];
+    let mi = cys::agent_markers::leading_marker_index(marker, line)?;
+    let bare = &line[..mi + marker.len()];
+    Some(
+        lines
+            .iter()
+            .enumerate()
+            .map(|(i, l)| if i == li { bare } else { *l })
+            .collect::<Vec<&str>>()
+            .join("\n"),
+    )
+}
+
 fn composer_rest_empty(
     screen: &str,
     marker: &str,
@@ -8510,6 +8605,95 @@ fn composer_rest_empty(
     Some(cys::readiness::composer_edit_region_empty(&copy, marker, placeholder))
 }
 
+/// ★(0.14.56 · P1 D1 · design r3 §2) The ONE composer verdict every reader on a measured seat takes (never re-implement it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ComposerVerdict {
+    /// Nothing before or after the cursor and the rest of the box is empty.
+    Empty,
+    /// The after-cursor run is the adapter's declared placeholder (token-wise).
+    Placeholder,
+    /// The after-cursor run is all dim (SGR 2): a rendered prompt suggestion nobody accepted.
+    Suggestion,
+    /// Content the operation did not supply: before the cursor, in the rest of the box, or a non-dim after-cursor run
+    /// (a Home-moved draft). A missing dim reading is a draft (fail-closed).
+    Draft,
+    /// No composer row at the cursor, a selector row, or a box the scan cannot read.
+    Unknown,
+}
+
+impl ComposerVerdict {
+    /// `Some(true)` = reads empty, `Some(false)` = a draft, `None` = unknown.
+    pub(crate) fn reads_empty(self) -> Option<bool> {
+        match self {
+            ComposerVerdict::Empty | ComposerVerdict::Placeholder | ComposerVerdict::Suggestion => Some(true),
+            ComposerVerdict::Draft => Some(false),
+            ComposerVerdict::Unknown => None,
+        }
+    }
+}
+
+/// ★(0.14.56 · P1 D1 · design r3 §2 item 2) Adapters where the D1 verdict was MEASURED: claude (2.1.312 rig - suggestion cells SGR 2 with
+/// a reverse drawn cursor, accepted/typed text non-dim; the boxed composer reads the same alt-screen and non-alt). On every other
+/// adapter each reader keeps its pin expression (residue R-14) - an unmeasured box scan would read `Draft` and hold every delivery.
+/// Adding an adapter requires the T-ADAPT measurement on that adapter.
+pub(crate) const D1_MEASURED_ADAPTERS: &[&str] = &["claude"];
+
+/// Does D1 govern this seat? `agent_meta` is a leaf lock (as in `draft_gate` and `machine_hold_probe`).
+pub(crate) fn d1_governs(s: &crate::state::Surface) -> bool {
+    s.agent_meta
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|(agent, _)| D1_MEASURED_ADAPTERS.contains(&agent.as_str()))
+}
+
+/// ★(0.14.56 · P1 D1 · design r2 §2 rows 1-7, r3 §2) The composer verdict of ONE observation (pure; the first matching row wins).
+/// U+00A0 is never read as a signal here: `str::trim`/`split_whitespace` treat it as white space, i.e. as part of the CLI's
+/// marker glyph spacing (head constraint, CEO intake #57).
+pub(crate) fn composer_verdict(obs: &PromptObs, placeholder: Option<&str>) -> ComposerVerdict {
+    // row 1
+    if obs.selector_row {
+        return ComposerVerdict::Unknown;
+    }
+    let Some((before, after)) = obs.line.as_ref() else {
+        return ComposerVerdict::Unknown;
+    };
+    // row 2
+    if !before.trim().is_empty() {
+        return ComposerVerdict::Draft;
+    }
+    // row 3 - the rest of the box (continuation rows, the m-3 bottom-row draft)
+    match composer_rest_empty(&obs.screen, &obs.marker, placeholder, (before.as_str(), after.as_str())) {
+        None => return ComposerVerdict::Unknown,
+        Some(false) => return ComposerVerdict::Draft,
+        Some(true) => {}
+    }
+    // row 4
+    if after.trim().is_empty() {
+        return ComposerVerdict::Empty;
+    }
+    // row 5 - token-wise, as `cys.rs` placeholder matching; fails toward Draft
+    if placeholder.is_some_and(|p| !p.trim().is_empty() && after.split_whitespace().eq(p.split_whitespace())) {
+        return ComposerVerdict::Placeholder;
+    }
+    // row 6
+    if obs.after_cursor_dim == Some(true) {
+        return ComposerVerdict::Suggestion;
+    }
+    // row 7 - a non-dim run or no dim reading
+    ComposerVerdict::Draft
+}
+
+/// ★(0.14.56 · P1 D1 · design r3 §4) The shared helper: `None` = D1 does not govern this seat (the caller keeps its pin
+/// expression), `Some(reading)` = [`ComposerVerdict::reads_empty`] of this observation.
+pub(crate) fn composer_reads_empty(
+    s: &crate::state::Surface,
+    obs: &PromptObs,
+    placeholder: Option<&str>,
+) -> Option<Option<bool>> {
+    d1_governs(s).then(|| composer_verdict(obs, placeholder).reads_empty())
+}
+
 /// 입력줄 가시성(순수) — `(draft_visible, ghost_after_cursor)`. 새 판정을 만들지 않는다: 커서 앞 판독은 게이트의 [`input_line_state`] 를,
 /// 편집 영역 아래 판독은 [`composer_rest_empty`](= stale 리셋의 술어)를, 커서 뒤 판독은 [`maybe_reset_stale_pending_input`] 의 `after.trim().is_empty()` 와 같은 술어다.
 /// 커서 행이 composer 가 아니거나(선택기 행) 프레임이 발행 중이거나 마커 뒤 커서가 없으면 `(None, None)`. `placeholder` = 그 어댑터의 빈 composer 플레이스홀더
@@ -8535,6 +8719,25 @@ pub(crate) fn input_line_visibility(
             (draft_visible, Some(!after.trim().is_empty()))
         }
         None => (None, None),
+    }
+}
+
+/// ★(0.14.56 · P1 R-7 + R-10 · design r3 §4-7) [`input_line_visibility`] for a seat: on a measured seat `draft_visible` is the
+/// D1 verdict's draft reading (`None` when unknown), so operator force-deliver stops treating a Home-moved draft as invisible and
+/// the remedy choice names it `human_draft` instead of offering the gray-ghost Ctrl-U advice. `ghost_after_cursor` is unchanged.
+/// Unmeasured seat: the pure function as at the pin.
+pub(crate) fn input_line_visibility_for(
+    s: &crate::state::Surface,
+    obs: &PromptObs,
+    placeholder: Option<&str>,
+) -> (Option<bool>, Option<bool>) {
+    let pin = input_line_visibility(obs, placeholder);
+    if !obs.frame_published() || obs.selector_row {
+        return pin;
+    }
+    match composer_reads_empty(s, obs, placeholder) {
+        Some(reading) => (reading.map(|empty| !empty), pin.1),
+        None => pin,
     }
 }
 
@@ -8600,7 +8803,7 @@ pub(crate) fn seat_input_line_visibility_with(
         let adapters = defs();
         match surface_prompt_marker(s, &adapters) {
             Some((markers, placeholder)) => {
-                input_line_visibility(&observe_prompt(s, &markers), placeholder.as_deref())
+                input_line_visibility_for(s, &observe_prompt(s, &markers), placeholder.as_deref())
             }
             None => (None, None),
         }
@@ -10542,12 +10745,17 @@ fn adopt_persisted_write_hold(daemon: &Arc<Daemon>, s: &Arc<crate::state::Surfac
 /// consistent frame, no modal or selector. Unreadable or no adapter -> false (keep holding).
 fn composer_measured_empty(s: &Arc<crate::state::Surface>) -> bool {
     let adapters = load_adapter_defs();
-    let Some((markers, _)) = surface_prompt_marker(s, &adapters) else { return false };
+    let Some((markers, placeholder)) = surface_prompt_marker(s, &adapters) else { return false };
     let obs = observe_prompt(s, &markers);
     obs.frame_consistent()
         && !obs.selector_row
         && !obs_modal_foreground(&obs)
-        && matches!(&obs.line, Some((before, _)) if before.trim().is_empty())
+        // ★(0.14.56 · P1 R-3 · design r3 §4-3) Measured seat: the D1 verdict - a Home-moved or continuation draft keeps the
+        //   hold (the pin released onto it); a suggestion releases. Unmeasured seat: the pin's before-only test.
+        && match composer_reads_empty(s, &obs, placeholder.as_deref()) {
+            Some(reading) => reading == Some(true),
+            None => matches!(&obs.line, Some((before, _)) if before.trim().is_empty()),
+        }
 }
 
 /// ★(0.14.52 · S-a C7a · head condition on Q2) Release a partial-write hold whose composer was measured empty: the held
@@ -10683,9 +10891,12 @@ fn slash_command_admission(
     if slash_known_occupied_region(&obs) { return Err(BLOCKED_INPUT_PENDING); }
     // A fresh full-region proof is stronger than a zero pending counter. Failure to recognise
     // the region is not proof of a draft: use the approved ordinary-message fallback instead.
-    if obs.frame_consistent()
-        && cys::readiness::composer_edit_region_empty(&obs.screen, &obs.marker, placeholder)
-    {
+    // ★(0.14.56 · P1 R-4) The label is audit text only; on a measured seat it follows the D1 verdict.
+    let measured_empty = match composer_reads_empty(s, &obs, placeholder) {
+        Some(reading) => reading == Some(true),
+        None => cys::readiness::composer_edit_region_empty(&obs.screen, &obs.marker, placeholder),
+    };
+    if obs.frame_consistent() && measured_empty {
         Ok("measured_empty")
     } else if obs.line.as_ref().is_some_and(|(_, after)| !after.trim().is_empty()) {
         Ok("fallback_unrecognized_hint")
@@ -12636,7 +12847,7 @@ pub(crate) fn force_deliver_entry(
             let input = prompt_gate_input(daemon, s, obs.marker.as_str(), placeholder.as_deref(), &obs);
             if let PromptGate::Blocked(why) = prompt_gate_verdict(&input) {
                 // ★(0.14.43 · C5) 유령 계수 처방 — 판정(거부)과 **같은 관측**(`obs`)에서 읽는다(재관측 없음 · 거부 결과 불변 · 문구만).
-                if blocked_is_input_pending(why) && input_line_visibility(&obs, placeholder.as_deref()).0 == Some(false) {
+                if blocked_is_input_pending(why) && input_line_visibility_for(&s, &obs, placeholder.as_deref()).0 == Some(false) {
                     return Err(ForceDeliverDenied::PromptGateGhost(why));
                 }
                 return Err(ForceDeliverDenied::PromptGate(why));
@@ -13206,11 +13417,19 @@ fn maybe_reset_stale_pending_input(
     //   첫 행(`❯ `)에 커서를 올려 두면 그 행은 앞뒤가 다 공백이고 둘째 행에 실초안이 있다.
     //   그래서 편집 **영역**(마커 줄 아래 첫 비공백 줄이 괘선/상태줄인가)까지 AND 한다
     //   (`readiness::composer_edit_region_empty` — 스캐너는 배달 자격 판정과 같은 것을 쓴다).
-    let screen_empty = obs
-        .line
-        .as_ref()
-        .is_some_and(|(before, after)| before.trim().is_empty() && after.trim().is_empty())
-        && cys::readiness::composer_edit_region_empty(&obs.screen, marker, placeholder);
+    // ★(0.14.56 · P1 R-2 · design r3 §4-2) On a measured seat the D1 verdict decides: a rendered suggestion (all dim) beside a
+    //   stale count now lets the count reset (it held delivery forever); a Home-moved or continuation draft still blocks the
+    //   reset. Unmeasured seats keep the pin expression below. Fail direction: only the all-dim row qualifies; no dim reading
+    //   is a draft.
+    let screen_empty = match composer_reads_empty(s, obs, placeholder) {
+        Some(reading) => reading == Some(true),
+        None => {
+            obs.line
+                .as_ref()
+                .is_some_and(|(before, after)| before.trim().is_empty() && after.trim().is_empty())
+                && cys::readiness::composer_edit_region_empty(&obs.screen, marker, placeholder)
+        }
+    };
     // ★(0.14.31 · 리뷰 R5 · codex major) 관측이 **한 프레임의 사실**일 때만 모순으로 센다 —
     //   발행 중이거나 관측 창에서 세대가 바뀐 화면은 "빈 입력줄" 의 근거가 되지 못한다.
     let contradiction = pending > 0
@@ -19917,7 +20136,10 @@ mod tests {
             ("CYS_QUEUE_STARVE_ALERT_SECS", "0"),
         ]);
         let (daemon, s) = marker_seat("b1-ghost");
-        paint_prompt(&s, "", "버그 수정 착수한다. 브랜치는");
+        // ★(0.14.56 · P1 · design r3 §10) The suggestion is painted DIM - how Claude 2.1.312 draws it (C29 rig,
+        //   RIG-FINDINGS.md:11). The pin painted it plain; a plain after-cursor run on a claude seat is now a Home-moved draft
+        //   and must HOLD (`p1_r1_non_alt_home_moved_draft_is_held_on_a_claude_seat`).
+        paint_prompt_dim(&s, "", "버그 수정 착수한다. 브랜치는");
         *s.last_output.lock().unwrap() = std::time::Instant::now();
         *s.last_human_input.lock().unwrap() = None;
         let (mut depth, mut starve) = (HashMap::new(), HashMap::new());
@@ -19927,6 +20149,247 @@ mod tests {
             "커서 뒤 제안문을 입력으로 오판하면 배달이 영구 보류된다(2026-09-03 13:27~15:37 실사고)"
         );
     }
+
+    // ===== ★(0.14.56 · P1 IMPL · design r3 §1/§3/§4) behavioural specimens. They call only entry points that exist at
+    //   9da2418d (deliver_queued/tick, draft_gate, machine_direct_hold, composer_measured_empty, seat_input_line_visibility),
+    //   so this block applied to the pin tree is the RED run. =====
+
+    /// A prompt suggestion drawn the way Claude 2.1.312 draws it (rig, RIG-FINDINGS.md:11): the first glyph reverse (the CLI's
+    /// drawn cursor), the rest dim (SGR 2).
+    fn paint_prompt_dim(s: &Arc<crate::state::Surface>, typed: &str, ghost: &str) {
+        let mut p = s.parser.lock().unwrap_or_else(|e| e.into_inner());
+        p.process(format!("\r\x1b[2K❯ {typed}").as_bytes());
+        if !ghost.is_empty() {
+            let (row, col) = p.screen().cursor_position();
+            let mut cs = ghost.chars();
+            let first = cs.next().unwrap();
+            let rest: String = cs.collect();
+            p.process(format!("\x1b[7m{first}\x1b[27m\x1b[2m{rest}\x1b[22m").as_bytes());
+            p.process(format!("\x1b[{};{}H", row + 1, col + 1).as_bytes());
+        }
+    }
+
+    /// The live-master composer layout (read-only screen read 2026-10-28 ~23:58: marker `❯` + U+00A0, box rules above and
+    /// below, two status rows), with `after` drawn either dim (a suggestion) or plain (a Home-moved draft).
+    fn p1_claude_box(after: &str, dim: bool, alt: bool) -> Vec<String> {
+        let row = if after.is_empty() {
+            "❯\u{a0}".to_string()
+        } else if dim {
+            let mut cs = after.chars();
+            let first = cs.next().unwrap();
+            let rest: String = cs.collect();
+            format!("❯\u{a0}\x1b[7m{first}\x1b[27m\x1b[2m{rest}\x1b[22m")
+        } else {
+            format!("❯\u{a0}{after}")
+        };
+        let _ = alt;
+        vec!["✻ Worked for 12s".to_string(), RULE.to_string(), row, RULE.to_string(), STATUS1.to_string(), STATUS2.to_string()]
+    }
+
+    fn p1_paint_box(s: &Arc<crate::state::Surface>, after: &str, dim: bool, alt: bool) {
+        let lines = p1_claude_box(after, dim, alt);
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        paint_screen(s, &refs, 2, 2, alt);
+    }
+
+    fn p1_seat(tag: &str) -> (Arc<Daemon>, Arc<crate::state::Surface>) {
+        let (daemon, s) = wp5_seat(tag, "claude");
+        let e = daemon.next_queue_entry("[보고] p1".into(), None, "test");
+        s.pending_queue.lock().unwrap().push_back(e);
+        (daemon, s)
+    }
+
+    /// T-Q1 (r2 F18 STALL, traced): alt-screen claude seat, boxed composer, a dim suggestion on the marker row ->
+    /// DELIVERED. Pin: `scan_composer` returns None on marker-row text, `layout_ok` false, BLOCKED_ALT_SCREEN forever.
+    #[test]
+    fn p1_r1_alt_dim_suggestion_with_box_is_delivered() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p1-q1");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap()), ("CYS_QUEUE_STARVE_ALERT_SECS", "0")]);
+        let (daemon, s) = p1_seat("p1-q1");
+        p1_paint_box(&s, "carry on please", true, true);
+        quiet_since(&s, 10);
+        tick(&daemon);
+        assert!(
+            s.pending_queue.lock().unwrap().is_empty(),
+            "a rendered suggestion nobody accepts must not hold a machine delivery (blocked: {})",
+            blocked_reason(&s)
+        );
+    }
+
+    /// T-Q1c: the same suggestion with NO box and no status row below -> still BLOCKED_ALT_SCREEN (the layout gate is
+    /// not bypassed; `layout_ok` is never set from the verdict alone).
+    #[test]
+    fn p1_r1_alt_dim_suggestion_without_box_stays_blocked() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p1-q1c");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap()), ("CYS_QUEUE_STARVE_ALERT_SECS", "0")]);
+        let (daemon, s) = p1_seat("p1-q1c");
+        paint_screen(&s, &["❯ \x1b[7mc\x1b[27m\x1b[2marry on please\x1b[22m"], 0, 2, true);
+        quiet_since(&s, 10);
+        tick(&daemon);
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1);
+        assert_eq!(blocked_reason(&s), BLOCKED_ALT_SCREEN);
+    }
+
+    /// T-Q1d: alt-screen, boxed composer, a PLAIN after-cursor run (a Home-moved draft) -> held, as at the pin.
+    #[test]
+    fn p1_r1_alt_home_moved_draft_stays_held() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p1-q1d");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap()), ("CYS_QUEUE_STARVE_ALERT_SECS", "0")]);
+        let (daemon, s) = p1_seat("p1-q1d");
+        p1_paint_box(&s, "my own words", false, true);
+        quiet_since(&s, 10);
+        tick(&daemon);
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "a Home-moved draft must never read as empty");
+    }
+
+    /// T-Q4: NON-alt claude seat (the live master's mode), boxed composer, pending 0, a plain after-cursor run -> HELD with
+    /// `input_pending`. Pin: `input_line_state` reads before-cursor only, Empty, delivered onto the draft.
+    #[test]
+    fn p1_r1_non_alt_home_moved_draft_is_held_on_a_claude_seat() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p1-q4");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap()), ("CYS_QUEUE_STARVE_ALERT_SECS", "0")]);
+        let (daemon, s) = p1_seat("p1-q4");
+        p1_paint_box(&s, "my own words", false, false);
+        quiet_since(&s, 10);
+        tick(&daemon);
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "a Home-moved draft must never read as empty");
+        assert_eq!(blocked_reason(&s), BLOCKED_INPUT_PENDING);
+    }
+
+    /// T-Q4b: the same non-alt live layout with a DIM suggestion -> delivered (the queue pair's normal-delivery half).
+    #[test]
+    fn p1_r1_non_alt_dim_suggestion_is_delivered_on_the_live_layout() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p1-q4b");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap()), ("CYS_QUEUE_STARVE_ALERT_SECS", "0")]);
+        let (daemon, s) = p1_seat("p1-q4b");
+        p1_paint_box(&s, "carry on please", true, false);
+        quiet_since(&s, 10);
+        tick(&daemon);
+        assert!(s.pending_queue.lock().unwrap().is_empty(), "blocked: {}", blocked_reason(&s));
+    }
+
+    /// T-Q4c: the non-alt live layout, EMPTY composer (marker + U+00A0 only) -> delivered. Guards the new dependency of a
+    /// non-alt claude seat on the box scan: if the live layout did not scan as empty, every master delivery would hold.
+    #[test]
+    fn p1_r1_non_alt_empty_live_layout_is_delivered() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p1-q4c");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap()), ("CYS_QUEUE_STARVE_ALERT_SECS", "0")]);
+        let (daemon, s) = p1_seat("p1-q4c");
+        p1_paint_box(&s, "", false, false);
+        quiet_since(&s, 10);
+        tick(&daemon);
+        assert!(s.pending_queue.lock().unwrap().is_empty(), "blocked: {}", blocked_reason(&s));
+    }
+
+    /// T-Q2 (gemini-2 G2-7, r2 run-2 STALL): a stale pending count beside a DIM suggestion resets after the quiet window,
+    /// then the item is delivered. Pin: the reset needs `after` empty, so the count is never erased: held forever.
+    #[test]
+    fn p1_r2_stale_count_resets_beside_a_dim_suggestion() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p1-q2");
+        let _env = QueueEnvGuard::set(&[
+            ("CYS_PACK_DIR", pack.to_str().unwrap()),
+            ("CYS_QUEUE_STARVE_ALERT_SECS", "0"),
+            ("CYS_QUEUE_QUIET_SECS", "1"),
+        ]);
+        let (daemon, s) = p1_seat("p1-q2");
+        s.set_pending_input(1);
+        paint_prompt_dim(&s, "", "carry on please");
+        quiet_since(&s, 10);
+        tick(&daemon);
+        assert_eq!(blocked_reason(&s), BLOCKED_INPUT_PENDING, "first tick only stamps");
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        tick(&daemon);
+        assert_eq!(s.pending_input_bytes.load(AtomicOrdering::Relaxed), 0, "the stale count beside a suggestion must reset");
+        tick(&daemon);
+        assert!(s.pending_queue.lock().unwrap().is_empty(), "delivered after the reset (blocked: {})", blocked_reason(&s));
+    }
+
+    /// T-Q2b: the same with a PLAIN after-cursor run (a Home-moved draft) -> the count is never reset (unchanged from pin).
+    #[test]
+    fn p1_r2_stale_count_beside_a_home_moved_draft_never_resets() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p1-q2b");
+        let _env = QueueEnvGuard::set(&[
+            ("CYS_PACK_DIR", pack.to_str().unwrap()),
+            ("CYS_QUEUE_STARVE_ALERT_SECS", "0"),
+            ("CYS_QUEUE_QUIET_SECS", "1"),
+        ]);
+        let (daemon, s) = p1_seat("p1-q2b");
+        s.set_pending_input(1);
+        paint_prompt(&s, "", "my own words");
+        quiet_since(&s, 10);
+        tick(&daemon);
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        tick(&daemon);
+        tick(&daemon);
+        assert_eq!(s.pending_input_bytes.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1);
+    }
+
+    /// T-Q3 (gemini-2 G2-7(2)): the partial-hold release reads a Home-moved draft as NOT empty (pin: before-only -> empty,
+    /// released onto the draft); a dim suggestion reads empty.
+    #[test]
+    fn p1_r3_hold_release_reads_a_home_moved_draft_as_occupied() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p1-q3");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (_daemon, s) = marker_seat("p1-q3");
+        paint_prompt(&s, "", "my own words");
+        assert!(!super::composer_measured_empty(&s), "a Home-moved draft must never read as empty");
+        paint_prompt_dim(&s, "", "carry on please");
+        assert!(super::composer_measured_empty(&s), "a suggestion reads empty");
+    }
+
+    /// T-G2 (R-5): a direct Text onto a Home-moved draft on a claude seat is refused (pin: passed); onto a dim suggestion it
+    /// passes (unchanged).
+    #[test]
+    fn p1_r5_direct_text_is_refused_onto_a_home_moved_draft() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p1-g2");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (daemon, s) = marker_seat("p1-g2");
+        paint_prompt(&s, "", "my own words");
+        assert_eq!(super::draft_gate(&daemon, &s, DirectSendKind::Text), Some(DraftGateDenied::ScreenOccupied));
+        paint_prompt_dim(&s, "", "carry on please");
+        assert_eq!(super::draft_gate(&daemon, &s, DirectSendKind::Text), None);
+    }
+
+    /// T-H0 (R-6): the machine-inject draft axis (CEO push, channel envelope, boot notice, schedule push) holds on a
+    /// Home-moved draft (pin: before-only -> no draft -> typed onto it); a dim suggestion is no draft.
+    #[test]
+    fn p1_r6_machine_inject_holds_on_a_home_moved_draft() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p1-h0");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (daemon, s) = marker_seat("p1-h0");
+        let axes = super::MachineHoldAxes { draft: true, ..super::MachineHoldAxes::NONE };
+        paint_prompt(&s, "", "my own words");
+        assert_eq!(super::machine_direct_hold(&daemon, &s, axes), Some(super::MachineHold::Draft));
+        paint_prompt_dim(&s, "", "carry on please");
+        assert_eq!(super::machine_direct_hold(&daemon, &s, axes), None);
+    }
+
+    /// T-F1 (R-7/R-10): the seat's visibility reading reports a Home-moved draft as VISIBLE (force-deliver refuses, the remedy
+    /// is `human_draft`); a dim suggestion is not a visible draft and still reports the after-cursor ghost.
+    #[test]
+    fn p1_r7_visibility_reports_a_home_moved_draft() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p1-f1");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (_daemon, s) = marker_seat("p1-f1");
+        paint_prompt(&s, "", "my own words");
+        assert_eq!(super::seat_input_line_visibility(&s), (Some(true), Some(true)));
+        paint_prompt_dim(&s, "", "carry on please");
+        assert_eq!(super::seat_input_line_visibility(&s), (Some(false), Some(true)));
+    }
+    // ===== end of the P1 behavioural block =====
 
     /// 화면이 비어 보여도 데몬이 센 미제출 바이트가 있으면 배달하지 않는다(1차 축 우선).
     #[test]
@@ -21264,6 +21727,7 @@ mod tests {
             quiet_secs,
             alt_screen: true,
             block: None,
+            after_cursor_dim: None,
         };
         for knob in ["1", "3", "30"] {
             let _knob = QueueEnvGuard::set(&[("CYS_QUEUE_QUIET_SECS", knob)]);
@@ -21629,6 +22093,7 @@ mod tests {
             quiet_secs: quiet,
             alt_screen: alt,
             block: None,
+            after_cursor_dim: None,
         };
         let b = |w: &'static str| PromptGate::Blocked(w);
         let cases: Vec<(&str, PromptGate, super::PromptObs, bool, crate::repaint::ScreenObs)> = vec![
@@ -28250,6 +28715,7 @@ after-tick liveness alone does not attribute a clock defect",
             quiet_secs: 9,
             alt_screen: false,
             block: None,
+            after_cursor_dim: None,
         };
         assert_eq!(input_line_visibility(&base(), None), (Some(false), Some(false)));
         let mut o = base();
@@ -28308,6 +28774,7 @@ after-tick liveness alone does not attribute a clock defect",
             quiet_secs: 9,
             alt_screen: false,
             block: None,
+            after_cursor_dim: None,
         }
     }
 
