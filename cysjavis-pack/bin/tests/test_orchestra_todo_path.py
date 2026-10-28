@@ -163,6 +163,11 @@ else:
                 bad[pos] ^= 0x01
                 check("N3 양성 대조 — 1바이트 뒤집기(@%d)를 비교기가 그 오프셋으로 거부(%s)" % (pos, role),
                       golden_mismatch(bytes(bad), exp) == pos)
+            #   길이 차 1바이트도 거부해야 한다 — 뒤집기 셋만으로는 끝 공백을 지우는 비교기(strip)가 살아남았다(M6c-8 실측).
+            check("N3 양성 대조 — 끝에 1바이트 덧붙임을 비교기가 거부(%s)" % role,
+                  golden_mismatch(exp + b"\n", exp) == len(exp))
+            check("N3 양성 대조 — 마지막 1바이트 제거를 비교기가 거부(%s)" % role,
+                  golden_mismatch(exp[:-1], exp) == len(exp) - 1)
 
 env = dict(os.environ)
 env["CYS_PACK_DIR"] = env.get("CYS_PACK_DIR") or "/tmp"
