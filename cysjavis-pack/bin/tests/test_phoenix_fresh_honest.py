@@ -604,6 +604,267 @@ def main():
                  "pending": {"fresh_reason": "no_session"}, "verified": {}}
         check("result partition exact target order", m.f1_result_partition(targets, outcomes, roles) ==
               (["f1", "poison"], {"f1": "no_session_file", "poison": "poison"}, ["poison"], ["f1"]))
+
+        # ──────────────────────────────────────────────────────────────────────
+        # L: ★D3(0.14.55) fresh 표지의 부팅 범위 한정 — D5H-20261028-PHOENIX-STALE-FRESH-MARKER.
+        #    설계 DESIGN.md(d1a4037e)+R2(7a90a1b5)+R3(14f45914) · 판정문 HEAD-RULING-R3-FINAL(14e0cdd2).
+        #    낡은 표지가 증거 0으로 'fresh' 를 만들던 자리와, 걷어낸 역할이 핀 동어반복으로 내려가
+        #    거짓 VERIFIED 가 되던 자리를 함께 묶는다.
+        E_OLD, E_NOW, E_NEXT = "sa:1793100000.1", "sa:1793200000.9", "sa:1793300000.5"
+        SRC = open(m.__file__ if hasattr(m, "__file__") and m.__file__ else PH, encoding="utf-8").read().splitlines()
+
+        def rec(**kw):
+            base = {"surface": "surface:7", "expected_sid": "sid-A", "observed_sid": "sid-A",
+                    "stages": {s2: {"done": True, "ts": 1, "epoch": E_OLD} for s2 in
+                               ("spawn", "ready", "resume", "reinject", "g2_ack", "verify")}}
+            base.update(kw)
+            return {"ticket_id": "default", "events": [], "created": 1, "roles": {"w": base}}
+
+        def find(pred, lo=0, hi=None):
+            hi = len(SRC) if hi is None else hi
+            return [i + 1 for i in range(lo, hi) if pred(SRC[i])]
+
+        # D3-1 낡은 표지(세대 스탬프 없음) → 걷어내고 표식을 이번 부팅 이름으로 남긴다 → 가드가 발화한다.
+        j = rec(fresh_fallback=True, fresh_reason="poison")
+        got = m.scope_fresh_markers(j, E_NOW)
+        rr = j["roles"]["w"]
+        check("D3-1 stale marker is stripped and flagged for this boot",
+              got == [("w", "표지에 세대 없음(이 수리 이전 저널)")]
+              and "fresh_fallback" not in rr and "fresh_reason" not in rr
+              and rr["fresh_scope_epoch"] == E_NOW
+              and m.fresh_scope_guard_fires(rr, E_NOW) is True)
+
+        # D3-2 ★위반 대조: 가드가 없으면 같은 역할이 핀 비교로 내려가 'verified' 가 된다(결함을 계속 보이게 둔다).
+        check("D3-2 without the guard the same pair is verified (the defect, kept visible)",
+              m.legacy_verify_outcome(rr.get("expected_sid", ""), rr.get("observed_sid"), "effective")
+              == ("verified", "세션 일치")
+              and m.restore_exit_code({"phoenix_restore": "VERIFIED", "completeness": "COMPLETE"}) == 0)
+
+        # D3-3 / D3-4 좌석 축: 같은 부팅의 표지라도 관문에 갇힌 좌석은 'fresh' 가 아니다.
+        trapped = {"exited": False, "agent_alive": True, "gate_pending": {"why": "folder-trust"}}
+        healthy = {"exited": False, "agent_alive": True, "gate_pending": None}
+        check("D3-3 same-boot marker + gate-trapped seat has no seat evidence",
+              m.p11_seat_evidence(trapped) == (False, "gate_pending 보류(관문 보류 · 주입 0)"))
+        check("D3-4 same-boot marker + healthy seat has seat evidence",
+              m.p11_seat_evidence(healthy) == (True, None))
+        check("D3-4b every missing axis is named, not collapsed",
+              m.p11_seat_evidence(None)[0] is False
+              and m.p11_seat_evidence({"exited": True, "agent_alive": True, "gate_pending": None})[1] == "exited≠false"
+              and m.p11_seat_evidence({"exited": False, "agent_alive": None, "gate_pending": None})[1] == "agent_alive≠true"
+              and m.p11_seat_evidence({"exited": False, "agent_alive": True})[1].startswith("gate_pending 키 부재"))
+
+        # D3-5 stub 팔: 분지가 stub 일 때 좌석 축을 요구하지 않는다(출하 P11 드릴이 --stub 으로 돈다).
+        p11_if = find(lambda l: l.strip() == "if fresh_fb:")
+        stub_arm = find(lambda l: "_p11_ok, _p11_why = (True, None) if stub else p11_seat_evidence(_p11_row)" in l)
+        check("D3-5 the stub arm exempts the seat axis exactly once",
+              len(p11_if) == 1 and len(stub_arm) == 1 and p11_if[0] < stub_arm[0] < p11_if[0] + 6)
+
+        # D3-6 EPOCH_GATE=0 은 stage_done 과 같은 방향(세대 무시) — 표지를 보존한다.
+        _gate = m.EPOCH_GATE
+        try:
+            m.EPOCH_GATE = False
+            jg = rec(fresh_fallback=True, fresh_reason="poison")
+            check("D3-6 EPOCH_GATE=0 keeps the marker, mirroring stage_done",
+                  m.marker_is_current({}, E_NOW) is True
+                  and m.scope_fresh_markers(jg, E_NOW) == []
+                  and jg["roles"]["w"]["fresh_fallback"] is True)
+        finally:
+            m.EPOCH_GATE = _gate
+        check("D3-6b the mirror restores", m.EPOCH_GATE is _gate and m.marker_is_current({}, E_NOW) is False)
+
+        # D3-7 두 순서: 범위 한정은 migrate **뒤**, dedup(pending)·spawn 재기록 **앞**.
+        mig = find(lambda l: "for _r in migrate_f1_journal(j):" in l)
+        scope_call = find(lambda l: "_fresh_scope_stripped = dict(scope_fresh_markers(j, _ACTIVE_EPOCH))" in l)
+        pend = find(lambda l: 'pending = [r for r in target_roles if not stage_done(j, r, "verify")]' in l)
+        remark = find(lambda l: 'j["roles"][role]["fresh_expected"] = True' in l)
+        check("D3-7 scope runs after migrate and before pending and the spawn re-mark",
+              len(mig) == 1 and len(scope_call) == 1 and len(pend) == 1 and len(remark) == 1
+              and mig[0] < scope_call[0] < pend[0] < remark[0])
+
+        # D3-8 가드는 핀 판정 함수보다 **먼저** — 검색 범위를 verify 블록으로 한정한다.
+        fb_read = find(lambda l: 'fresh_fb = j["roles"][role].get("fresh_fallback", False)' in l)
+        legacy_call = find(lambda l: "outcome, reason = legacy_verify_outcome(exp, obs," in l)
+        guard_line = find(lambda l: "elif fresh_scope_guard_fires(" in l, fb_read[0] - 1, legacy_call[0])
+        check("D3-8 the guard precedes the verdict call, inside the verify block",
+              len(fb_read) == 1 and len(legacy_call) == 1 and len(guard_line) == 1
+              and fb_read[0] < guard_line[0] < legacy_call[0])
+
+        # D3-9 F-1 잔여 키도 표지와 함께 걷어낸다.
+        j9 = rec(fresh_expected=True, fresh_reason="no_session", fresh_pre_sids=["old"], fresh_pre_dir=td,
+                 fresh_evidence={"provenance": "new"}, observed_sid_source="registered",
+                 reinject_sid="sid-A", reinject_sid_before="sid-A")
+        m.scope_fresh_markers(j9, E_NOW)
+        check("D3-9 the F-1 residue keys are stripped with the group",
+              not any(k in j9["roles"]["w"] for k in m.FRESH_MARKER_KEYS)
+              and set(m.FRESH_MARKER_KEYS) >= {"observed_sid_source", "reinject_sid", "reinject_sid_before"}
+              and "expected_sid" in j9["roles"]["w"] and "observed_sid" in j9["roles"]["w"])
+
+        # D3-10 세대 미상·판정 실패는 **걷어내는 쪽**으로 접는다(예외 경로이지 건너뛰기가 아니다).
+        j10 = rec(fresh_fallback=True, fresh_reason="poison", fresh_epoch=E_NOW)
+        check("D3-10 epoch unknown strips even a stamped marker",
+              m.scope_fresh_markers(j10, None) == [("w", "세대 미상(status --json 판독 실패)")]
+              and "fresh_fallback" not in j10["roles"]["w"])
+        class _Boom(dict):
+            def get(self, k, d=None):
+                if k == "fresh_epoch":
+                    raise RuntimeError("boom")
+                return dict.get(self, k, d)
+        j11 = {"ticket_id": "default", "events": [], "roles": {"w": _Boom(fresh_fallback=True)}}
+        out11 = m.scope_fresh_markers(j11, E_NOW)
+        check("D3-10b a raising record is stripped, never kept",
+              len(out11) == 1 and "범위 판정 실패" in out11[0][1] and "fresh_fallback" not in j11["roles"]["w"])
+
+        # D3-11 추가 결과 키(관측성) — 결과 dict 에 실린다.
+        rkey = find(lambda l: '"fresh_scope_stripped": _fresh_scope_stripped,' in l)
+        check("D3-11 the additive result key is in the result dict", len(rkey) == 1)
+
+        # D3-12 migrate_f1_journal 은 손대지 않았다 — poison 레코드 무접촉 계약 유지(출하 계약).
+        j12 = {"roles": {"p": {"fresh_fallback": True, "fresh_reason": "poison",
+                               "stages": {"verify": {"done": True}}}}}
+        before12 = copy.deepcopy(j12["roles"]["p"])
+        check("D3-12 migrate_f1_journal still leaves poison untouched",
+              m.migrate_f1_journal(j12) == [] and j12["roles"]["p"] == before12)
+
+        # D3-13 / D3-14 ★범위 한정 패스는 적재하중이다 — 조용히 빠질 수 없다.
+        check("D3-13 the scope pass has exactly one call site in the restore flow", len(scope_call) == 1)
+        j14 = rec(fresh_fallback=True, fresh_reason="poison")
+        # 패스를 돌리지 **않으면** 같은 세계에서 좌석이 건강하므로 분지가 'fresh' 를 낸다(fail-open).
+        check("D3-14 without the pass a healthy resumed seat still yields fresh (fail-open)",
+              j14["roles"]["w"].get("fresh_fallback") is True
+              and m.p11_seat_evidence(healthy) == (True, None)
+              and m.fresh_scope_guard_fires(j14["roles"]["w"], E_NOW) is False)
+        m.scope_fresh_markers(j14, E_NOW)
+        check("D3-14b with the pass the same world is unverified through the guard",
+              m.fresh_scope_guard_fires(j14["roles"]["w"], E_NOW) is True
+              and "fresh_fallback" not in j14["roles"]["w"])
+
+        # D3-15 ★소스 핀: Phase-11 의 좌석 조건 목록과 f1_fresh_verify 의 좌석 조건 목록이 내용·순서로 같다.
+        import re as _re
+        def conds(fn_name, stop):
+            lo = find(lambda l: l.startswith("def %s(" % fn_name))
+            assert len(lo) == 1, fn_name
+            hi = find(lambda l: stop in l, lo[0], len(SRC))
+            out = []
+            for l in SRC[lo[0]:hi[0]]:
+                mm = _re.match(r'^\s*(?:el)?if (.+?):\s*$', l)
+                if mm and ("row" in mm.group(1) or "isinstance" in mm.group(1)):
+                    out.append(mm.group(1).strip())
+            return out
+        ship = conds("f1_fresh_verify", "if kind not in F1_ACCEPTED_REINJECT_KINDS")
+        mine = conds("p11_seat_evidence", "return True, None")
+        check("D3-15 the two seat condition lists are identical in content and order",
+              ship == mine and ship == ['not isinstance(row, dict)', 'row.get("exited") is not False',
+                                        'row.get("agent_alive") is not True', '"gate_pending" not in row',
+                                        'row.get("gate_pending") is not None'])
+
+        # 판정문 항목 1 — 같은 부팅의 재시도는 표식을 **보존**하고, 새 세대는 지운다(영구 적색 0).
+        j16 = rec(fresh_fallback=True, fresh_reason="poison")
+        m.scope_fresh_markers(j16, E_NOW)                       # run 1 (this boot)
+        again = m.scope_fresh_markers(j16, E_NOW)               # run 2, SAME epoch (daemon's one retry)
+        check("ruling-1 the same-boot retry keeps the flag and the guard still fires",
+              again == [] and m.fresh_scope_guard_fires(j16["roles"]["w"], E_NOW) is True)
+        nxt = m.scope_fresh_markers(j16, E_NEXT)                # a later boot
+        check("ruling-1b a new epoch clears the flag — no permanent red",
+              nxt == [] and "fresh_scope_stripped" not in j16["roles"]["w"]
+              and m.fresh_scope_guard_fires(j16["roles"]["w"], E_NEXT) is False)
+
+        # 판정문 항목 2 — Phase-11 분지가 **자기** 행을 읽는다(elif 안의 row 를 빌리지 않는다).
+        own_row = find(lambda l: "_p11_row = None if stub else _surface_status_row(socket, surface)" in l)
+        elif_row = find(lambda l: "row = None if stub else _surface_status_row(socket, surface)" in l
+                        and "_p11_row" not in l)
+        check("ruling-2 the Phase-11 branch reads its own status row before its seat check",
+              len(own_row) == 1 and len(elif_row) == 1 and p11_if[0] < own_row[0] < stub_arm[0] < elif_row[0])
+
+        # ──────────────────────────────────────────────────────────────────────
+        # M: ★D3 **거동** 핀 — 실 `run_restore` 를 태워 조립된 결과를 본다. L 절은 구조와 순수 함수를
+        #    묶고, 이 절은 「그 구조가 실제로 그 판정을 낸다」를 묶는다(가드가 빠지면 여기서 붉어진다).
+        def d3_run(seed_stale):
+            """resume 역할 1개 · 좌석은 건강하게 올라온다. seed_stale 이면 **지난 부팅의** 독약 표지를 심는다."""
+            td2 = tempfile.mkdtemp(prefix="phoenix-d3-run-")
+            orig = (m.cys, m.time.sleep, m._emit_evt, m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN)
+            try:
+                sock = os.path.join(td2, "cys.sock")
+                tick = "d3-" + ("stale" if seed_stale else "clean")
+                now = m._now()
+                entry = {"role": "worker-1", "agent": "claude", "session_id": "sid-live",
+                         "claude_config_dir": os.path.join(td2, "acct"), "cwd": os.path.join(td2, "proj"),
+                         "surface_id": 7, "surface_ref": "surface:7"}
+                os.makedirs(entry["cwd"])
+                proj = os.path.join(entry["claude_config_dir"], "projects",
+                                    m._claude_project_component(entry["cwd"]))
+                os.makedirs(proj)
+                with open(os.path.join(proj, "sid-live.jsonl"), "w", encoding="utf-8") as f:
+                    f.write("{}\n")       # 세션 파일이 있으므로 fresh 예상이 아니다 → else(핀) 분지로 간다
+                with open(os.path.join(td2, "topology.json"), "w", encoding="utf-8") as f:
+                    json.dump({"entries": [entry], "updated_at": now, "schema_version": 1,
+                               "tombstones": [], "tombstones_rev": 0}, f)
+                jp = m.journal_path(sock, tick)
+                os.makedirs(os.path.dirname(jp), exist_ok=True)
+                if seed_stale:
+                    m._atomic_write_json(jp, {"ticket_id": tick, "events": [], "created": now, "roles": {
+                        "worker-1": {"surface": "surface:7", "expected_sid": "sid-live",
+                                     "observed_sid": "sid-live", "fresh_fallback": True,
+                                     "fresh_reason": "poison", "fresh_epoch": "sa:1.0", "outcome": "fresh",
+                                     "stages": {"verify": {"done": True, "ts": 1, "epoch": "sa:1.0"}}}}})
+                st = {"alive": False}
+                def fake_cys(*a, socket=None, timeout=25):
+                    assert socket == sock, "CLI escaped the isolated socket"
+                    v, out = a[0], ""
+                    if v == "status":
+                        rows = ([{"surface_id": 7, "surface_ref": "surface:7", "role": "worker-1",
+                                  "exited": False, "agent_alive": True, "seat": "occupied", "agent": "claude",
+                                  "gate_pending": None, "registered_session_id": "sid-live",
+                                  "awakened_at": now}] if st["alive"] else [])
+                        out = json.dumps({"daemon": {"started_at": now}, "surfaces": rows})
+                    elif v == "restore":
+                        st["alive"] = True; out = "restored worker-1 surface:7"
+                    elif v == "reinject":
+                        out = "디렉티브 생존 확인 (ACK 수신)"
+                    elif v in ("read-screen", "watch"):
+                        out = "bypass permissions on"
+                    elif v == "list":
+                        out = "surface:7 role=worker-1 pid=7 exited=false\n" if st["alive"] else ""
+                    else:
+                        raise AssertionError("unexpected cys call: %r" % (a,))
+                    return __import__("types").SimpleNamespace(returncode=0, stdout=out, stderr="")
+                m.cys = fake_cys
+                m.time.sleep = lambda _s: None
+                m._emit_evt = lambda *a, **k: None
+                res = m.run_restore(sock, ticket=tick, stub=False, no_breaker=True, print_result=False)
+                with open(jp, encoding="utf-8") as f:
+                    jr = json.load(f)
+                return res, jr
+            finally:
+                (m.cys, m.time.sleep, m._emit_evt, m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN) = orig
+                shutil.rmtree(td2, ignore_errors=True)
+
+        res_s, jr_s = d3_run(True)
+        rr_s = jr_s["roles"]["worker-1"]
+        check("D3-B1 a stale marker makes the assembled verdict UNVERIFIED, not VERIFIED_FRESH",
+              res_s["phoenix_restore"] == "UNVERIFIED"
+              and res_s["per_role_outcome"] == {"worker-1": "unverified"}
+              and m.restore_exit_code(res_s) == m.PHOENIX_EXIT_DEGRADED)
+        check("D3-B2 the result names the stripped role and the journal records why",
+              res_s.get("fresh_scope_stripped", {}).get("worker-1", "").startswith("표지 세대")
+              and "fresh_fallback" not in rr_s
+              and any(e["stage"] == "verify" and e["status"] == "fresh_scope_stripped"
+                      for e in jr_s["events"])
+              and "D3" in rr_s["stages"]["verify"]["evidence"]
+              and rr_s["stages"]["verify"]["done"] is False)
+        res_c, jr_c = d3_run(False)
+        ev_c = jr_c["roles"]["worker-1"]["stages"]["verify"]["evidence"]
+        # ★CONTROL: 같은 세계에서 낡은 표지만 없으면 이 수리는 **아무것도 하지 않는다** — 역할은 종전처럼
+        #   핀 분지로 가고, 그 분지의 종전 결론(이 하네스의 팩에는 agents.json 이 없어 resume 모드 '미상' ⇒
+        #   핀 일치를 verified 로 올리지 않는다 · 선재 가드)이 그대로 선다. 같은 'unverified' 이지만 **사유가
+        #   다르다**는 것이 요점이다: 내 가드 문면이 아니라 legacy_verify_outcome 의 문면이어야 한다.
+        check("D3-B3 CONTROL without a stale marker the verdict comes from the pin branch, not from my guard",
+              res_c.get("fresh_scope_stripped") == {}
+              and res_c["per_role_outcome"] == {"worker-1": "unverified"}
+              and "resume 모드 미상" in ev_c and "D3" not in ev_c
+              and m.legacy_verify_outcome("sid-live", "sid-live", "unknown")[0] == "unverified"
+              and m.legacy_verify_outcome("sid-live", "sid-live", "effective")[0] == "verified")
+        check("D3-B4 CONTROL the two paths are distinguishable in the journal evidence",
+              "D3" in jr_s["roles"]["worker-1"]["stages"]["verify"]["evidence"] and "D3" not in ev_c)
     finally:
         shutil.rmtree(td)
     npass = sum(1 for c in _results if c)

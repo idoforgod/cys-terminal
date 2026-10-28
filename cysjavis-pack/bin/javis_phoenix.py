@@ -568,6 +568,110 @@ def migrate_f1_journal(j):
     return moved
 
 
+# ---------------- ★D3(0.14.55): fresh 표지를 **그것을 쓴 부팅**으로 범위 한정 ----------------
+# 결함 D5H-20261028-PHOENIX-STALE-FRESH-MARKER · 설계 DESIGN.md(d1a4037e)+R2(7a90a1b5)+R3(14f45914).
+#
+# ★무엇이 결함이었나: 저널은 부팅을 넘어 산다(자동복원은 `restore --auto` 뿐이라 티켓이 늘 "default" —
+#   `journal-default.json`). 그런데 fresh 표지(`fresh_fallback` 등)는 **한 번의 실행 결과**인데 해제 자리가
+#   `migrate_f1_journal` 의 구판 형식 이관 한 곳뿐이고 그 조건이 F-1 사유를 요구해 `"poison"` 레코드는 거기
+#   **도달하지 못한다**. 그 결과 지난 부팅의 표지가 이번 부팅의 verify 첫 조건으로 읽혀 증거 0으로 'fresh' 를
+#   내고 VERIFIED_FRESH·exit 0 이 됐다(관문에 갇힌 좌석도 성공으로 셌다).
+# ★왜 '지우기' 가 아니라 '범위 한정' 인가: 표지는 그것을 쓴 실행에 대해서는 **참**이다. 그래서 stage 마킹이
+#   이미 쓰는 세대 규율(`stage_done`)을 그대로 빌려, **이 부팅이 쓴 표지만** 살린다.
+FRESH_MARKER_KEYS = ("fresh_fallback", "fresh_reason", "fresh_expected", "fresh_pre_sids",
+                     "fresh_pre_dir", "fresh_evidence",
+                     # ★F-1 잔여: `f1_fresh_verify` 의 provenance 축 입력들(이전 부팅 값이 새 세션을
+                     #   'pre_existing'·'evidence_unbound' 로 만든다) — 표지와 함께 범위 한정한다.
+                     "observed_sid_source", "reinject_sid", "reinject_sid_before")
+
+# ★`expected_sid`·`observed_sid` 는 **일부러 넣지 않는다**: spawn 단계가 live surface 를 가진 need 역할마다
+#   verify 앞에서 `expected_sid` 를 다시 쓰고(아래 spawn 블록) resume 단계가 `observed_sid` 를 다시 쓴다 ⇒
+#   지워도 되살아나므로, 엄격성은 `fresh_scope_guard_fires` 가 만든다(설계 R2 §2-2).
+FRESH_SCOPE_KEYS = ("fresh_scope_stripped", "fresh_scope_epoch")
+
+
+def marker_is_current(rr, epoch):
+    """이 역할 레코드의 fresh 표지가 **이번 부팅의 것**인가 — `stage_done` 의 세대 규율을 그대로 복제한다.
+
+    대조(같은 순서·같은 방향):
+      · `if not EPOCH_GATE: return True`  ← 레거시 모드는 세대를 **무시**한다(stale 취급이 아니다)
+      · `if cur is None: return False`    ← 세대 미상은 보수적으로 stale
+      · `return s.get("epoch") == cur`    ← 마킹 세대 부재·상이면 stale
+    ⛔한 파일에 '이 부팅' 정의를 둘로 두지 않기 위해 값도 같은 `_ACTIVE_EPOCH` 를 쓴다."""
+    if not EPOCH_GATE:
+        return True
+    if epoch is None:
+        return False
+    return rr.get("fresh_epoch") == epoch
+
+
+def scope_fresh_markers(j, epoch):
+    """낡은 fresh 표지를 걷어내고, 걷어냈다는 사실을 **이번 부팅 이름으로** 남긴다. 반환 [(role, 사유)].
+
+    ★표식(`FRESH_SCOPE_KEYS`)은 **파생 상태**다 — 입력이 아니다:
+      ⑴저장된 세대가 이번 부팅이 **아닐 때만** 지운다(같은 부팅의 재시도에서는 **보존** — 데몬은 0 이 아닌
+        종료코드에 1회 재시도하므로 같은 세대에서 이 함수가 다시 돈다).
+      ⑵「걷어낼 것이 있나」 판정은 `FRESH_MARKER_KEYS` **만** 본다. ⛔표식을 그 판정에 넣으면 패스가 자기
+        표식을 보고 매 부팅 다시 표식을 달아 **영구 적색**이 된다(설계 R3 §1 — 실측으로 잡은 함정이다).
+      ⑶실제로 걷어낸 그 패스만 표식을 쓴다.
+    ⛔예외는 삼키지 않고 **걷어내는 쪽**으로 접는다(엄격 방향) — 보존 쪽으로 접으면 거짓 성공이 살아난다."""
+    out = []
+    for role in list((j.get("roles") or {})):
+        rr = (j.get("roles") or {}).get(role)
+        if not isinstance(rr, dict):
+            continue
+        if rr.get("fresh_scope_epoch") != epoch:      # ⑴ 이번 부팅의 표식이 아니면 제거
+            for k in FRESH_SCOPE_KEYS:
+                rr.pop(k, None)
+        if not any(k in rr for k in FRESH_MARKER_KEYS):   # ⑵ 표지 자체로만 판정
+            continue
+        try:
+            if marker_is_current(rr, epoch):
+                continue
+            why = ("세대 미상(status --json 판독 실패)" if epoch is None
+                   else "표지에 세대 없음(이 수리 이전 저널)" if rr.get("fresh_epoch") is None
+                   else "표지 세대 %s ≠ 이번 부팅 %s" % (rr.get("fresh_epoch"), epoch))
+        except Exception as _e:
+            # ★예외 경로(건너뛰기가 아니다): 판정이 불가능하면 표지를 **신뢰하지 않는다**.
+            why = "범위 판정 실패(%s) — 표지를 걷어낸다(보존하지 않는다)" % type(_e).__name__
+        for k in FRESH_MARKER_KEYS:
+            rr.pop(k, None)
+        rr["fresh_scope_stripped"] = why
+        rr["fresh_scope_epoch"] = epoch               # ⑶ 걷어낸 패스만 표식을 쓴다
+        out.append((role, why))
+    return out
+
+
+def fresh_scope_guard_fires(rr, epoch):
+    """이번 부팅에서 낡은 표지를 걷어낸 역할인가 — verify 의 비-F1 분기 **첫 조건**이 이것을 본다.
+
+    ★왜 필요한가: 표지를 걷어낸 역할을 그대로 두면 `legacy_verify_outcome` 로 내려가는데, 그 비교의 두 변은
+      **같은 topology 필드**(기대=roster 병합한 `session_id` · 관측=`_topology_session_for`)라 값이 같아
+      'verified' 가 나온다 ⇒ 걷어내기만으로는 **거짓 VERIFIED** 다(설계 R2 §1·R3, 실측 반증).
+      그래서 이 부팅에 판정 재료가 없다는 사실을 **독립적으로** 보고한다. ⛔표식의 존재만으로 발화하지 않고
+      세대 일치를 요구한다 — 그렇지 않으면 다음 부팅이 영구 적색이 된다."""
+    return bool(rr.get("fresh_scope_stripped")) and rr.get("fresh_scope_epoch") == epoch
+
+
+def p11_seat_evidence(row):
+    """Phase 11(독약 강등) 표지가 **이번 부팅의 것**일 때도 좌석이 말해 주어야 'fresh' 다 → (ok, 미충족사유).
+
+    ★조건 목록은 `f1_fresh_verify` 의 좌석 축과 **내용·순서가 같다**(검체 `d3_seat_condition_lists_identical`
+      이 소스에서 두 목록을 뽑아 대조한다). ⛔`f1_fresh_verify` 는 **리팩터하지 않는다** — 그 함수는 `ev` 를
+      채우고 `missing` 문자열을 **순서대로** 쌓으며 출하 검체 7곳이 그 값을 읽는다(0.14.55 범위 밖)."""
+    if not isinstance(row, dict):
+        return False, "status 행 부재(surface 미발견 또는 status --json 실패)"
+    if row.get("exited") is not False:
+        return False, "exited≠false"
+    if row.get("agent_alive") is not True:
+        return False, "agent_alive≠true"
+    if "gate_pending" not in row:
+        return False, "gate_pending 키 부재(구 데몬 · 관문 통과 판정 불가)"
+    if row.get("gate_pending") is not None:
+        return False, "gate_pending 보류(관문 보류 · 주입 0)"
+    return True, None
+
+
 def _which(name):
     import shutil
     return shutil.which(name)
@@ -2805,6 +2909,12 @@ def _run_restore_locked(socket, ticket="default", stub=False, no_breaker=False, 
     for _r in migrate_f1_journal(j):
         jevent(j, _r, "verify", "revalidate",
                "★F-1 리뷰 R1: 구판 저널의 fresh 예상(fresh_fallback+no_session*)을 fresh_expected 로 이관 — 증거 없는 verify done 해제(재검증)")
+    # ★D3: 낡은 fresh 표지 범위 한정 — **migrate 뒤**(이관이 세대 없는 표지를 만들 수 있으므로) ·
+    #   dedup(pending) 과 spawn 단계가 이번 부팅 표지를 다시 쓰기 **전**. 이 순서가 이 수리의 핵심이다.
+    _fresh_scope_stripped = dict(scope_fresh_markers(j, _ACTIVE_EPOCH))
+    for _r, _why in _fresh_scope_stripped.items():
+        jevent(j, _r, "verify", "fresh_scope_stripped",
+               "★D3: 지난 부팅의 fresh 표지를 걷어냈다(%s) — 이번 부팅은 이 역할의 판정 재료가 없다(재검증)" % _why)
     # dedup(P4): 이 티켓 저널에서 이미 verify까지 done 인 역할은 skip
     pending = [r for r in target_roles if not stage_done(j, r, "verify")]
     log("티켓=%s · 대상역할=%s · 이번 진행=%s (완료 skip=%s)" % (
@@ -3035,9 +3145,19 @@ def _run_restore_locked(socket, ticket="default", stub=False, no_breaker=False, 
             # 세션 보존 실패는 정직히 밝히되(verified 아님) 실패(unverified/failed)로 오분류하지 않는다 —
             # 별도 outcome 'fresh' 로 라벨링(원 세션 독약 → 무 resume 부활·디렉티브/원장 재주입).
             if fresh_fb:
-                outcome = "fresh"
-                reason = ("★독약 세션 fresh 강등(원 세션 %r unresumable → 무 resume 새 세션 %r·디렉티브/원장 재주입). "
-                          "정직: 세션 보존 아님·의도적 전환(fork/오복원 아님·roster 부활 완료)" % (exp, obs))
+                # ★D3: 이번 부팅의 표지라도 **좌석 증거**가 있어야 'fresh' 다(관문에 갇힌 좌석을 성공으로
+                #   세지 않는다). 행은 이 분지가 **스스로** 읽는다(아래 elif 의 `row` 는 그 분지 안에서 계산된다).
+                #   stub 은 관측할 좌석이 없으므로 종전대로다(아래 elif 와 같은 꼴 · 출하 P11 드릴이 --stub 이다).
+                _p11_row = None if stub else _surface_status_row(socket, surface)
+                _p11_ok, _p11_why = (True, None) if stub else p11_seat_evidence(_p11_row)
+                if not _p11_ok:
+                    outcome = "unverified"
+                    reason = ("★D3: 이번 부팅의 독약 강등 표지이지만 좌석 증거 미충족(%s) — 'fresh' 로 세지 않는다"
+                              "(자기채점 금지). 확인: `cys status --json`(gate_pending·agent_alive·exited)." % _p11_why)
+                else:
+                    outcome = "fresh"
+                    reason = ("★독약 세션 fresh 강등(원 세션 %r unresumable → 무 resume 새 세션 %r·디렉티브/원장 재주입). "
+                              "정직: 세션 보존 아님·의도적 전환(fork/오복원 아님·roster 부활 완료)" % (exp, obs))
             elif fresh_exp:
                 # ★F-1(0.14.31 · 리뷰 R1 · codex BLOCK): 예상은 결과가 아니다 — 'fresh' 는 **이 기동의 각성 증거**
                 #   (관문 통과 gate_pending=null ∧ agent_alive ∧ reinject ack|injected)가 전부 있을 때만. 관문에 갇힌
@@ -3075,6 +3195,15 @@ def _run_restore_locked(socket, ticket="default", stub=False, no_breaker=False, 
                     #   있어야 한다 — 되돌린 단계를 같은 실행에서 1회(F1_REVERIFY_PASSES) 다시 돈다(무한 루프 0 · 게이트 완화 0).
                     if prov in F1_REOBSERVABLE and not stub:
                         f1_retry = prov
+            elif fresh_scope_guard_fires(j["roles"][role], _ACTIVE_EPOCH):
+                # ★D3 가드 — 이 분지의 **첫 조건**이어야 한다(아래 판정 함수보다 먼저). 낡은 표지를 걷어낸
+                #   역할은 이번 부팅의 판정 재료가 없으므로, 두 변이 같은 topology 필드를 읽는 핀 비교로
+                #   내려보내지 **않는다**(내려보내면 'verified' 가 나와 거짓 VERIFIED 가 된다).
+                #   ⛔결함1(핀 동어반복) 수리가 이 가지 위에 쌓인다 — 그 판정 함수는 이 가드 **뒤**에 온다.
+                outcome = "unverified"
+                reason = ("★D3: 지난 부팅의 fresh 표지를 걷어냈다(%s) — 이번 부팅은 이 역할의 판정 재료가 "
+                          "없다(핀 비교로 성공을 만들지 않는다). 재검증 대상."
+                          % j["roles"][role].get("fresh_scope_stripped"))
             else:
                 # ★리뷰 R3b(codex major): 판정은 순수 함수 하나(`legacy_verify_outcome`) — resume 모드가
                 #   **미상**이면 핀 일치도 verified 가 아니다(stale 신원으로 거짓 verified 가 나던 자리).
@@ -3201,6 +3330,8 @@ def _run_restore_locked(socket, ticket="default", stub=False, no_breaker=False, 
         "fresh_expected_roles": fresh_expected_roles,
         "fresh_unverified_roles": fresh_unverified_roles,
         "fresh_fork_suspect_roles": fresh_fork_suspect_roles,   # ★리뷰 R1b: 스폰 전 재고에 있던 세션(fork 의심)
+        # ★D3: 이번 부팅에 걷어낸 낡은 fresh 표지(역할→사유) — 저널 이벤트만으로는 드릴·지원 전사에서 안 보인다.
+        "fresh_scope_stripped": _fresh_scope_stripped,
         "ready_roles": ready_roles,
         "ticket": ticket,
         "boot_epoch": _ACTIVE_EPOCH,      # ★Phase6: 이 부활이 판정 기준으로 쓴 세대
