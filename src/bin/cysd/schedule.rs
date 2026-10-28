@@ -5435,12 +5435,19 @@ mod h2_schedule_hold_tests {
     use std::sync::atomic::Ordering;
 
     fn rig(tag: &str) -> (Arc<Daemon>, Arc<crate::state::Surface>) {
+        rig_role(tag, "master")
+    }
+
+    /// ★(0.14.56 · P1 · head ruling on Q-suites-17-pins 5fffe0d9) The residue cells sit on a NON-master claude seat: on a
+    /// master/CEO, D9 turns an off-seat non-owner send into one queue job, so the residue they study cannot arise there
+    /// (`h2_d9_master_off_seat_send_leaves_no_residue` shows that form).
+    fn rig_role(tag: &str, role: &str) -> (Arc<Daemon>, Arc<crate::state::Surface>) {
         crate::delivery::tests::isolate_state_dir_for_thread(tag);
         let daemon = super::tests::test_daemon();
         let s = daemon
-            .create_surface(None, Some("sleep 30".into()), None, Some("master".into()), 24, 80)
+            .create_surface(None, Some("sleep 30".into()), None, Some(role.into()), 24, 80)
             .expect("좌석");
-        daemon.roles.lock().unwrap().insert("master".into(), s.id);
+        daemon.roles.lock().unwrap().insert(role.into(), s.id);
         daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
         *s.agent_meta.lock().unwrap() = Some(("claude".into(), "/usr/local/bin/claude".into()));
         std::thread::sleep(std::time::Duration::from_millis(300));
@@ -5609,7 +5616,8 @@ mod h2_schedule_hold_tests {
     #[cfg_attr(not(unix), ignore = "윈도우 기본 H 마스크는 draft 축을 끈다(hold_axes_default(true)) — 이 검체는 유닉스 기본(draft 축) 동작을 본다")]
     fn h2_cross_socket_residue_stays_direct() {
         let pack = crate::governance::HOutsidePack::new(); // 좌석보다 먼저(락 대기 중 좌석 만료 방지)
-        let (d, s) = rig("h2-xsock");
+        // Intent kept: an off-seat sender's residue never diverts the push to the queue (fatal risk 3) - on a worker seat (head 5fffe0d9).
+        let (d, s) = rig_role("h2-xsock", "worker-1");
         let tok = d.operator_token.clone().expect("데몬 토큰");
         let j = periodic("heartbeat-5m", 5);
         let leave = |body: &str, extra: serde_json::Value| {
@@ -5648,6 +5656,37 @@ mod h2_schedule_hold_tests {
         d.bus.tail(5000).into_iter().filter(|e| e["name"] == name).collect()
     }
 
+    /// ★(0.14.56 · P1 D9 · head ruling on Q-suites-17-pins 5fffe0d9) The master form of the residue cells: an off-seat non-owner
+    /// send into a master is ONE queue job at receipt (nothing typed, so no residue exists for a push to merge or divert over),
+    /// and a bare Return from a caller holding no ticket is refused with 0 bytes.
+    #[test]
+    fn h2_d9_master_off_seat_send_leaves_no_residue() {
+        let _pack = crate::governance::HOutsidePack::new(); // as the other residue cells: before the seat
+        let (d, s) = rig("h2-d9-master");
+        h_paint(&s, H_IDLE_SCREEN);
+        let g0 = s.input_gen.load(Ordering::Acquire);
+        let params = json!({"surface_id": s.id, "text": "XSOCK-master residue", "queued": false, "quiet": true, "from": 900});
+        let r = match crate::handlers::dispatch(&d, cys::Request { id: json!(1), method: "surface.send_text".into(), params }, Some(std::process::id())) {
+            crate::handlers::Reply::Single(v) => v,
+            _ => panic!("single reply"),
+        };
+        assert_eq!(r["result"]["converted"], json!("one_job"), "the off-seat send is one queue job: {r}");
+        assert_eq!(queue(&s).len(), 1, "one item: body + its own submit");
+        assert_eq!(s.input_gen.load(Ordering::Acquire), g0, "nothing typed at receipt - no residue");
+        assert_eq!(s.pending_input_bytes.load(Ordering::Relaxed), 0);
+        let k = match crate::handlers::dispatch(
+            &d,
+            cys::Request { id: json!(2), method: "surface.send_key".into(), params: json!({"surface_id": s.id, "key": "Return"}) },
+            None,
+        ) {
+            crate::handlers::Reply::Single(v) => v,
+            _ => panic!("single reply"),
+        };
+        assert_eq!(k["error"]["code"], json!("composer_key_denied"), "a bare Return with no ticket is refused: {k}");
+        assert_eq!(s.input_gen.load(Ordering::Acquire), g0, "0 bytes");
+        done(&s);
+    }
+
     /// ★(R3SH-1 · S1 모양) 기계가 본문과 **CR 까지** 보냈는데 TUI 가 그 Return 을 먹어 입력줄에 잔여가 남았다 — CR 이
     /// 계수·세대를 되돌려 owner 각인이 결측이 된 상태다. 그래도 H2 는 큐로 우회하지 않고 종전(pre-H)처럼 직접 주입해 잔여를
     /// 병합 제출한다(마지막 기계 본문의 꼬리로 입력줄이 완전히 설명됨 ∧ 그 뒤 사람 입력 없음 ∧ 사람 바이트 0).
@@ -5657,7 +5696,8 @@ mod h2_schedule_hold_tests {
     #[cfg_attr(not(unix), ignore = "윈도우 기본 H 마스크는 draft 축을 끈다(hold_axes_default(true)) — 이 검체는 유닉스 기본(draft 축) 동작을 본다")]
     fn h2_swallowed_return_residue_stays_direct() {
         let pack = crate::governance::HOutsidePack::new();
-        let (d, s) = rig("h2-swallowed");
+        // Intent kept: a swallowed-Return machine residue is merged by the direct push, not queued forever - on a worker seat (head 5fffe0d9).
+        let (d, s) = rig_role("h2-swallowed", "worker-1");
         let body = "WORKER-REPORT swallowed-return body";
         h_paint(&s, H_IDLE_SCREEN);
         crate::governance::h_send_outside(&pack, &d, s.id, body, json!({}));
@@ -5860,7 +5900,9 @@ mod h2_schedule_hold_tests {
     #[test]
     fn h2_fallback_headroom_keeps_cli_room() {
         let _g = crate::governance::PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (d, s) = rig("h2-headroom");
+        // Intent kept: the 50-item divert cap leaves room for CLI --queued text and Return - on a worker seat, where a bare queued
+        // Return is not a D9 refusal (head 5fffe0d9).
+        let (d, s) = rig_role("h2-headroom", "worker-1");
         h_paint(&s, cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT);
         for i in 0..50 {
             let j = periodic(&format!("hb-{i}"), 5);

@@ -28519,6 +28519,10 @@ mod tests {
     #[test]
     #[cfg_attr(not(unix), ignore = "윈도우 기본 H 마스크는 draft 축을 끈다(hold_axes_default(true)) — 이 검체는 유닉스 기본(draft 축) 동작을 본다")]
     fn h4_cross_socket_residue_routes_to_ceo() {
+        // ★(0.14.56 · P1 · head ruling on Q-suites-17-pins 5fffe0d9) Intent kept: an off-seat machine sender never sends the CEO's
+        //   approval to a person. On the CEO, D9 makes that send one queue job (ruling's h4 form: converted, the composer stays
+        //   empty, the approval is not diverted to a person). The residue half - a machine residue is not a draft for the CEO
+        //   producer's hold axes - runs below on a NON-CEO claude seat; the owner-class GUI-insert control stays on the CEO.
         let pack = crate::governance::HOutsidePack::new(); // 좌석보다 먼저(락 대기 중 좌석 만료 방지)
         let (d, ceo) = h4_rig("h4-xsock", "sleep 30");
         let tok = d.operator_token.clone().expect("데몬 토큰");
@@ -28528,30 +28532,58 @@ mod tests {
                 .filter(|ev| ev["payload"]["request_id"] == json!(rid))
                 .collect()
         };
-        let leave = |body: &str, extra: Value| {
-            ceo.clear_pending_input();
-            *ceo.last_human_input.lock().unwrap() = None;
-            crate::governance::h_paint(&ceo, crate::governance::H_IDLE_SCREEN);
-            crate::governance::h_send_outside(&pack, &d, ceo.id, body, extra);
+        let leave_on = |seat: &Arc<crate::state::Surface>, body: &str, extra: Value| {
+            seat.clear_pending_input();
+            *seat.last_human_input.lock().unwrap() = None;
+            crate::governance::h_paint(seat, crate::governance::H_IDLE_SCREEN);
+            crate::governance::h_send_outside(&pack, &d, seat.id, body, extra);
             std::thread::sleep(std::time::Duration::from_millis(200));
-            *ceo.last_human_input.lock().unwrap() = None;
-            crate::governance::h_paint(&ceo, &crate::governance::h_residue_screen(body));
+            *seat.last_human_input.lock().unwrap() = None;
+            crate::governance::h_paint(seat, &crate::governance::h_residue_screen(body));
         };
         for (i, (label, extra)) in [("claimed", json!({"from": 900})), ("unattributed", json!({}))].into_iter().enumerate() {
-            leave(&format!("[부서A] REPORT {label} residue"), extra);
+            crate::governance::h_paint(&ceo, crate::governance::H_IDLE_SCREEN);
+            let g0 = ceo.input_gen.load(Ordering::Acquire);
+            let r = crate::governance::h_send_outside(&pack, &d, ceo.id, &format!("[부서A] REPORT {label} residue"), extra);
+            assert_eq!(r["result"]["converted"], json!("one_job"), "{label}: the off-seat send into the CEO is one queue job: {r}");
+            assert_eq!(ceo.input_gen.load(Ordering::Acquire), g0, "{label}: nothing typed - the composer stays empty");
             let item = h4_item(&format!("h4-xsock-{i}"), &format!("RSI 학습 추천 xsock {label}"), "x");
             route_auto_approval(&d, &item, false);
             assert!(
                 stalled_for(&d, &item.request_id).is_empty(),
-                "{label}: 좌석 밖 발신자의 잔여에 걸려 결재가 사람에게 갔다(ceo_seat_draft)"
+                "{label}: 좌석 밖 발신자의 송신 뒤 결재가 사람에게 갔다(ceo_seat_draft)"
             );
             assert_eq!(h4_events(&d, "feed.auto_routed").len(), i + 1, "{label}: CEO 로 가지 않았다");
             // 붙여넣기 창(본문 → 500ms → CR) + settle 이 지나도록 기다린다(다음 판정이 우리 붙여넣기로 면제되지 않게).
             std::thread::sleep(std::time::Duration::from_millis(500 + 500 + 700));
         }
+        // The residue half on a non-CEO claude seat, through the verdict `deliver_to_ceo` asks (its axes, handlers.rs:5167).
+        let w = d.create_surface(None, Some("sleep 30".into()), None, Some("worker-1".into()), 24, 80).expect("worker seat");
+        *w.agent_meta.lock().unwrap() = Some(("claude".into(), "/bin/claude".into()));
+        w.seat_cache.store(1, Ordering::Relaxed); // Occupied
+        d.surfaces.lock().unwrap().insert(w.id, w.clone());
+        d.roles.lock().unwrap().insert("worker-1".into(), w.id);
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let ceo_axes = crate::governance::MachineHoldAxes {
+            pause: true,
+            quiescing: true,
+            modal: true,
+            draft: true,
+            ..crate::governance::MachineHoldAxes::NONE
+        };
+        for (label, extra) in [("claimed", json!({"from": 900})), ("unattributed", json!({}))] {
+            leave_on(&w, &format!("[부서A] REPORT {label} residue"), extra);
+            assert_eq!(
+                crate::governance::machine_direct_hold(&d, &w, ceo_axes),
+                None,
+                "{label}: 좌석 밖 발신자의 잔여를 초안으로 봤다(ceo_seat_draft 경로)"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(500 + 500 + 700));
+        }
+        let _ = w.child.lock().unwrap().kill();
         assert_eq!(crate::governance::h_ledger_count(&d, "feed"), 2);
         // 음성 대조 — GUI 모양 삽입(오너 클릭)은 사람 의도 = 종전대로 escalation.
-        leave("GUI insert", json!({"human": true, "machine_origin": true, "owner_token": tok}));
+        leave_on(&ceo, "GUI insert", json!({"human": true, "machine_origin": true, "owner_token": tok}));
         let item = h4_item("h4-xsock-gui", "RSI 학습 추천 xsock gui", "x");
         route_auto_approval(&d, &item, false);
         let sc = stalled_for(&d, "h4-xsock-gui");

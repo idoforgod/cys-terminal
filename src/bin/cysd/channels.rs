@@ -4218,6 +4218,19 @@ mod tests {
         m
     }
 
+    /// A non-master claude seat with the same echo-free idle composer as `h3_master` (role `role`).
+    #[cfg(unix)]
+    fn h3_seat(d: &Arc<Daemon>, role: &str) -> Arc<crate::state::Surface> {
+        let w = d
+            .create_surface(None, Some("stty -echo; exec sleep 30".into()), None, Some(role.into()), 24, 80)
+            .expect("seat");
+        d.roles.lock().unwrap().insert(role.into(), w.id);
+        *w.agent_meta.lock().unwrap() = Some(("claude".into(), "/usr/local/bin/claude".into()));
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        crate::governance::h_paint(&w, crate::governance::H_IDLE_SCREEN);
+        w
+    }
+
     #[cfg(unix)]
     fn h3_state(d: &Arc<Daemon>, id: i64) -> String {
         let g = d.channels.lock().unwrap();
@@ -4690,34 +4703,58 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn h3_cross_socket_residue_does_not_hold_row() {
+        // ★(0.14.56 · P1 · head ruling on Q-suites-17-pins 5fffe0d9) Intent kept: an off-seat machine sender's residue is never a
+        //   draft for the channel's hold axes (else the owner's row is held forever, fatal risk 3). On a master/CEO D9 makes that
+        //   send one queue job, so the residue half runs on a NON-master claude seat through the verdict `master_hold` delegates to
+        //   (`machine_direct_hold` + `channel_hold_axes`); the master half is `h3_d9_master_off_seat_send_still_delivers_row`.
         let pack = crate::governance::HOutsidePack::new(); // 좌석보다 먼저(락 대기 중 좌석 만료 방지)
         let (d, m) = h3_rig("h3-xsock");
-        let sid = m.id;
+        let w = h3_seat(&d, "worker-1");
         let tok = d.operator_token.clone().expect("데몬 토큰");
         let leave = |body: &str, extra: Value| {
-            m.clear_pending_input();
-            *m.last_human_input.lock().unwrap() = None;
-            crate::governance::h_paint(&m, crate::governance::H_IDLE_SCREEN);
-            crate::governance::h_send_outside(&pack, &d, sid, body, extra);
+            w.clear_pending_input();
+            *w.last_human_input.lock().unwrap() = None;
+            crate::governance::h_paint(&w, crate::governance::H_IDLE_SCREEN);
+            crate::governance::h_send_outside(&pack, &d, w.id, body, extra);
             std::thread::sleep(std::time::Duration::from_millis(200));
-            *m.last_human_input.lock().unwrap() = None;
-            crate::governance::h_paint(&m, &crate::governance::h_residue_screen(body));
+            *w.last_human_input.lock().unwrap() = None;
+            crate::governance::h_paint(&w, &crate::governance::h_residue_screen(body));
         };
         for (label, extra) in [("claimed", json!({"from": 900})), ("unattributed", json!({}))] {
             leave(&format!("XSOCK-{label} residue"), extra);
-            assert!(master_hold(&d, sid).is_ok(), "{label}: 좌석 밖 발신자의 잔여를 초안으로 봤다 — 채널 행 무기한 보류(③)");
+            assert_eq!(
+                crate::governance::machine_direct_hold(&d, &w, channel_hold_axes()),
+                None,
+                "{label}: 좌석 밖 발신자의 잔여를 초안으로 봤다 — 채널 행 무기한 보류(③)"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(500 + 500 + 1100));
         }
-        let id = h3_seed(&d, "오너 원격 지시", now());
-        assert_eq!(h3_drain(&d, 1), vec![id], "잔여 위에서 채널 행이 나가지 않았다");
-        assert_eq!(h3_state(&d, id), "injected");
-        // 음성 대조 — GUI 모양 삽입(오너 클릭)은 사람 의도 = Draft. 앞 행의 붙여넣기 창·settle 이 지난 뒤 본다.
-        std::thread::sleep(std::time::Duration::from_millis(500 + 500 + 1100));
+        // 음성 대조 — GUI 모양 삽입(오너 클릭)은 사람 의도 = Draft.
         leave("GUI insert", json!({"human": true, "machine_origin": true, "owner_token": tok}));
         assert_eq!(
-            master_hold(&d, sid).err(),
-            Some(InboxHold::Gate(crate::governance::MachineHold::Draft)),
+            crate::governance::machine_direct_hold(&d, &w, channel_hold_axes()),
+            Some(crate::governance::MachineHold::Draft),
             "GUI 삽입을 기계 잔여로 봤다"
         );
+        h3_done(&w);
+        h3_done(&m);
+    }
+
+    /// ★(0.14.56 · P1 D9 · head ruling on Q-suites-17-pins 5fffe0d9) The master form: an off-seat non-owner send into the master
+    /// is ONE queue job at receipt (nothing typed, no residue), and the owner's channel row is still delivered.
+    #[cfg(unix)]
+    #[test]
+    fn h3_d9_master_off_seat_send_still_delivers_row() {
+        let pack = crate::governance::HOutsidePack::new();
+        let (d, m) = h3_rig("h3-d9-master");
+        let g0 = m.input_gen.load(std::sync::atomic::Ordering::Acquire);
+        let r = crate::governance::h_send_outside(&pack, &d, m.id, "XSOCK-master residue", json!({"from": 900}));
+        assert_eq!(r["result"]["converted"], json!("one_job"), "the off-seat send is one queue job: {r}");
+        assert_eq!(m.input_gen.load(std::sync::atomic::Ordering::Acquire), g0, "nothing typed at receipt - no residue");
+        assert!(master_hold(&d, m.id).is_ok(), "an idle master composer holds no row");
+        let id = h3_seed(&d, "오너 원격 지시", now());
+        assert_eq!(h3_drain(&d, 1), vec![id], "the owner's channel row is delivered");
+        assert_eq!(h3_state(&d, id), "injected");
         h3_done(&m);
     }
 
