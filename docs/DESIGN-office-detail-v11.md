@@ -51,7 +51,7 @@
 
 ## 3. EVT spool (신규 수송로)
 
-- 경로: `$HUD_STATE_DIR/evt_spool.jsonl` (기본 `<pack>/state/`). 한 줄 = `{"ts":…,"type":"<EVT enum>","payload":{…},"key":"surface:N"(선택)}`.
+- 경로: `<pack>/state/evt_spool.jsonl` — ★(0.14.56 X-8 CARRIER) 경로의 정본은 leaf `bin/javis_spool_path.py` 의 `spool_path_for_pack(pack_dir)` 하나다(방출자·브리지 공용 · 환경변수 무관 · `HUD_STATE_DIR` 은 브리지 사설 상태 폴더만 뜻한다). 브리지는 레인마다(본부 = 자기 팩, 부서 = `cys fleet --json` 의 `pack_dir`) 그 레인의 spool 을 읽고, 레인별 오프셋 `<HUD_STATE_DIR>/evt_spool-<레인키>.offset`, 로테이션은 같은 폴더의 `evt_spool.<UTC>.jsonl` 로 **이름만 바꾸고 지우지 않는다**(보관본 전량 유지). 상태는 `/health` 의 `spool` 항목(`spool_schema` 1)에 레인별로 나오고, 각 데몬의 spool watch 가 자기 레인 항목을 읽어 자기 master 에게 알린다. 한 줄 = `{"ts":…,"type":"<EVT enum>","payload":{…},"key":"surface:N"(선택)}`.
 - 방출: `javis_event.py emit … --spool` 이 wire 출력에 **더해** spool에 append(O_APPEND 원자 줄쓰기). `--surface <ref>` 로 key 귀속(선택).
 - 소비: 브리지가 1s 폴링 tail(오프셋 STATE_DIR 영속·truncate 감지 시 0부터). 노드 귀속: `key` 명시 > `payload.agent`==role 유일 일치 > 미귀속(부서 보드로만).
 - 이유: EVT wire는 surface stdin 텍스트로 흘러 데몬 이벤트 스트림에 안 잡힘 — 데몬 무변경 원칙상 파일 spool이 최소 결합.
