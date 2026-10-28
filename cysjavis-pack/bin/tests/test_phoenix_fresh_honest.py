@@ -792,6 +792,17 @@ def main():
             td2 = tempfile.mkdtemp(prefix="phoenix-d3-run-")
             orig = (m.cys, m.time.sleep, m._emit_evt, m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN)
             try:
+                # ★통합(worker-18 · d3 impl r1 gemini minor · vj:6a2c8071): 이 헬퍼가 CYS_PACK_DIR 을 세우지 않으면
+                #   `~/.cys/pack/agents.json` 이 있는 호스트에서 **호스트 팩**을 읽어 resume 모드가 unknown→effective 로
+                #   바뀌고 D3-B3 대조가 적색이 된다(실측: 오염된 HOME 에서 318/319 · FAIL D3-B3). 섹션 L 과 같은 규약으로
+                #   PACK_DIR_ENV_KEYS 를 비우고 **빈** 임시 팩을 가리킨다(선언 부재 = 이 행들이 통과하던 상태).
+                d3_pack = os.path.join(td2, "pack")
+                os.makedirs(d3_pack, exist_ok=True)
+                d3_pack_env = {k: os.environ.get(k) for k in m.PACK_DIR_ENV_KEYS}
+                for _k in m.PACK_DIR_ENV_KEYS:
+                    os.environ.pop(_k, None)
+                os.environ["CYS_PACK_DIR"] = d3_pack
+                m._AGENTS_CACHE.clear()
                 sock = os.path.join(td2, "cys.sock")
                 tick = "d3-" + ("stale" if seed_stale else "clean")
                 now = m._now()
@@ -844,6 +855,13 @@ def main():
                     jr = json.load(f)
                 return res, jr
             finally:
+                # ★팩 env 복원(섹션 L 과 같은 규약) — 다음 섹션이 호스트 팩을 물려받지 않게.
+                for _k, _v in d3_pack_env.items():
+                    if _v is None:
+                        os.environ.pop(_k, None)
+                    else:
+                        os.environ[_k] = _v
+                m._AGENTS_CACHE.clear()
                 (m.cys, m.time.sleep, m._emit_evt, m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN) = orig
                 shutil.rmtree(td2, ignore_errors=True)
 
@@ -884,6 +902,17 @@ def main():
             orig = (m.cys, m.time.sleep, m._emit_evt, m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN,
                     m.SPAWN_RETRIES, m.SPAWN_SETTLE, m.SPAWN_BACKOFF, m.F1_REGISTERED_GRACE_TRIES)
             try:
+                # ★통합(worker-18 · d3 impl r1 gemini minor · vj:6a2c8071): 이 헬퍼가 CYS_PACK_DIR 을 세우지 않으면
+                #   `~/.cys/pack/agents.json` 이 있는 호스트에서 **호스트 팩**을 읽어 resume 모드가 unknown→effective 로
+                #   바뀌고 D3-B3 대조가 적색이 된다(실측: 오염된 HOME 에서 318/319 · FAIL D3-B3). 섹션 L 과 같은 규약으로
+                #   PACK_DIR_ENV_KEYS 를 비우고 **빈** 임시 팩을 가리킨다(선언 부재 = 이 행들이 통과하던 상태).
+                d3_pack = os.path.join(td3, "pack")
+                os.makedirs(d3_pack, exist_ok=True)
+                d3_pack_env = {k: os.environ.get(k) for k in m.PACK_DIR_ENV_KEYS}
+                for _k in m.PACK_DIR_ENV_KEYS:
+                    os.environ.pop(_k, None)
+                os.environ["CYS_PACK_DIR"] = d3_pack
+                m._AGENTS_CACHE.clear()
                 sock = os.path.join(td3, "cys.sock")
                 tick = "d3-stamp"
                 entry = {"role": "worker-1", "agent": "claude", "session_id": "sid-poison",
@@ -951,6 +980,13 @@ def main():
                 outs.append((r3, json.load(open(jp, encoding="utf-8"))))
                 return outs
             finally:
+                # ★팩 env 복원(섹션 L 과 같은 규약) — 다음 섹션이 호스트 팩을 물려받지 않게.
+                for _k, _v in d3_pack_env.items():
+                    if _v is None:
+                        os.environ.pop(_k, None)
+                    else:
+                        os.environ[_k] = _v
+                m._AGENTS_CACHE.clear()
                 (m.cys, m.time.sleep, m._emit_evt, m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN,
                  m.SPAWN_RETRIES, m.SPAWN_SETTLE, m.SPAWN_BACKOFF, m.F1_REGISTERED_GRACE_TRIES) = orig
                 shutil.rmtree(td3, ignore_errors=True)
@@ -993,6 +1029,17 @@ def main():
             orig = (m.cys, m.time.sleep, m._emit_evt, m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN,
                     m.SPAWN_SETTLE, m.SPAWN_BACKOFF, m.F1_REGISTERED_GRACE_TRIES)
             try:
+                # ★통합(worker-18 · d3 impl r1 gemini minor · vj:6a2c8071): 이 헬퍼가 CYS_PACK_DIR 을 세우지 않으면
+                #   `~/.cys/pack/agents.json` 이 있는 호스트에서 **호스트 팩**을 읽어 resume 모드가 unknown→effective 로
+                #   바뀌고 D3-B3 대조가 적색이 된다(실측: 오염된 HOME 에서 318/319 · FAIL D3-B3). 섹션 L 과 같은 규약으로
+                #   PACK_DIR_ENV_KEYS 를 비우고 **빈** 임시 팩을 가리킨다(선언 부재 = 이 행들이 통과하던 상태).
+                d3_pack = os.path.join(td4, "pack")
+                os.makedirs(d3_pack, exist_ok=True)
+                d3_pack_env = {k: os.environ.get(k) for k in m.PACK_DIR_ENV_KEYS}
+                for _k in m.PACK_DIR_ENV_KEYS:
+                    os.environ.pop(_k, None)
+                os.environ["CYS_PACK_DIR"] = d3_pack
+                m._AGENTS_CACHE.clear()
                 sock = os.path.join(td4, "cys.sock")
                 tick = "d3-f1stamp"
                 entry = {"role": "worker-1", "agent": "claude", "session_id": "",
@@ -1041,6 +1088,13 @@ def main():
                 j2 = json.load(open(jp, encoding="utf-8"))
                 return (r1, j1), (r2, j2)
             finally:
+                # ★팩 env 복원(섹션 L 과 같은 규약) — 다음 섹션이 호스트 팩을 물려받지 않게.
+                for _k, _v in d3_pack_env.items():
+                    if _v is None:
+                        os.environ.pop(_k, None)
+                    else:
+                        os.environ[_k] = _v
+                m._AGENTS_CACHE.clear()
                 (m.cys, m.time.sleep, m._emit_evt, m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN,
                  m.SPAWN_SETTLE, m.SPAWN_BACKOFF, m.F1_REGISTERED_GRACE_TRIES) = orig
                 shutil.rmtree(td4, ignore_errors=True)
