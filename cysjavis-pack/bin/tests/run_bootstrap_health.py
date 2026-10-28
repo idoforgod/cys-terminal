@@ -6507,6 +6507,65 @@ def h_win_17():
     return " · ".join(notes)
 
 
+H_WIN_18_BASE_REF = "9da2418d"     # 0.14.56 #2 착지 직전 트리 — 스탬프 오프셋을 버리는 구 파서
+
+
+@specimen("H-WIN-18", "W6",
+          "0.14.56 #2 report_gate 스탬프 — strftime('%z') 실제 출력 · _now_iso 왕복 ±2s · 타 오프셋 스탬프 정답",
+          ["0.14.56-#2"])
+def h_win_18():
+    """0.14.56 #2: `_parse_iso_epoch` dropped a stamp's UTC offset (time.mktime over time.strptime %z). The
+    repair is pinned on POSIX by test_report_gate.ParseIsoEpochOffsetTest (TZ-controlled children), and no
+    Windows lane runs that file. This specimen measures what only a run on the platform itself can show:
+      (1) what `time.strftime("%z")` EMITS here. Both writers (`_now_iso`, javis_task `_now`) put it into
+          every stamp. A zone NAME instead of +HHMM would make every stamp fail both parser formats, so the
+          deadlock age reads 'unmeasured' - a second, writer-side defect that needs its own RED (head
+          decision 2026-10-28: report it before changing the writer). The value is recorded either way.
+      (2) `_parse_iso_epoch(_now_iso())` round-trips to time.time() within 2 s on this host.
+      (3) stamps written in other zones (-0700, +0900) parse to the true instant on this host - the #2
+          repair itself; it discriminates on any host whose offset is not the stamp's (CI runners are UTC).
+    Calibration: the parser at H_WIN_18_BASE_REF must get exactly the forms whose offset differs from this
+    host's wrong (the defect FIRES). Skipped without git."""
+    import calendar
+    G = _w5_mod()
+    notes = []
+    z = time.strftime("%z")
+    notes.append("strftime(%%z)=%r" % z)
+    need(re.fullmatch(r"[+-][0-9]{4}", z or "") is not None,
+         "time.strftime('%%z') emits %r here, not +HHMM - every gate/ticket stamp on this platform is "
+         "unparseable (writer-side defect: report before changing the writer)" % z)
+    t0 = time.time()
+    s = G._now_iso()
+    e = G._parse_iso_epoch(s)
+    t1 = time.time()
+    need(isinstance(e, float) and t0 - 2 <= e <= t1 + 2,
+         "round trip failed: _now_iso()=%r -> %r, clock %.3f..%.3f" % (s, e, t0, t1))
+    notes.append("왕복 %s Δ=%.3fs" % (s, e - (t0 + t1) / 2))
+    instant = calendar.timegm((2026, 10, 28, 12, 0, 0))
+    forms = (("2026-10-28T05:00:00-0700", -25200), ("2026-10-28T21:00:00+0900", 32400))
+    for f, _off in forms:
+        got = G._parse_iso_epoch(f)
+        need(got == instant, "%s read %r, true instant %r (%+.2f h off - offset dropped)"
+             % (f, got, instant, ((got or 0) - instant) / 3600.0))
+    host_off = time.localtime(instant).tm_gmtoff
+    notes.append("타 오프셋 2형 정답(host %+d s)" % host_off)
+    calib = "skip(no-git)"
+    old = _git_show("cysjavis-pack/bin/javis_report_gate.py", ref=H_WIN_18_BASE_REF)
+    if old is not None:
+        lines = old.split("\n")
+        i = next(k for k, ln in enumerate(lines) if ln.startswith("def _parse_iso_epoch("))
+        j = next(k for k in range(i + 1, len(lines)) if lines[k] and not lines[k][0].isspace())
+        ns = {"time": time}
+        exec("\n".join(lines[i:j]), ns)
+        wrong = [f for f, _off in forms if ns["_parse_iso_epoch"](f) != instant]
+        expect = [f for f, off in forms if off != host_off]
+        need(wrong == expect, "calibration failed: base parser (%s) got %r wrong, expected %r at host offset %+d"
+             % (H_WIN_18_BASE_REF, wrong, expect, host_off))
+        calib = "기준 %s 파서 %d/%d 오답 FIRE" % (H_WIN_18_BASE_REF, len(wrong), len(forms))
+    notes.append("계측검증=%s" % calib)
+    return " · ".join(notes)
+
+
 @specimen("H-PYSEAL-1", "W6",
           "훅 셸 층 SEAL-1 — 프리루드 source 만으로 PYTHONDONTWRITEBYTECODE=1 무조건 export",
           ["SEAL-1-HOOK"])
