@@ -16,8 +16,10 @@ spec = importlib.util.spec_from_file_location("javis_phoenix", PH)
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 
 _results = []
-def check(name, cond):
-    _results.append(cond); print(("PASS " if cond else "FAIL ") + name)
+def check(name, cond, extra=""):
+    """`extra` is printed only when the row fails — a red row in CI must carry its own diagnosis."""
+    _results.append(cond)
+    print(("PASS " if cond else "FAIL ") + name + ("" if cond or not extra else "  | " + str(extra)))
 
 
 def scenario(name):
@@ -320,7 +322,14 @@ def d1_scenario(name):
                   and rr["pre_spawn_snapshot_enumerated"] is True)
             check(n + " the compared values come from different writers",
                   rr["expected_sid"] == D1_PIN and rr["observed_sid"] == D1_PIN
-                  and rr["observed_sid_source"] == "registered")
+                  # ★D1xD3 BC1: the provenance lives under a defect-1 key, NOT under d3's marker key.
+                  # `.get()` so a regression that renames the key back fails as a NAMED row, not a KeyError
+                  and rr.get("resume_observed_source") == "registered"
+                  and "observed_sid_source" not in rr
+                  and ev.get("observed_sid_source") == "registered",
+                  extra="resume_observed_source=%r · marker key present=%s · evidence=%r" % (
+                      rr.get("resume_observed_source"), "observed_sid_source" in rr,
+                      ev.get("observed_sid_source")))
             check(n + " the project dir is journalled for the resume path",
                   rr["resume_project_dir"] == project_dir)
         if name == "R2":
@@ -369,6 +378,116 @@ def d1_scenario(name):
         shutil.rmtree(td)
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# D1xD3 — COMPOSED, TWO RUNS. defect 1 must not write a key that belongs to defect 3's marker group:
+# `FRESH_MARKER_KEYS` contains "observed_sid_source" and the scope pass tests KEY PRESENCE, so a value of
+# None counts. A key written outside the two marker writers carries no `fresh_epoch`, so on the NEXT run the
+# scope pass strips it, sets `fresh_scope_stripped`, and `fresh_scope_guard_fires` pre-empts the defect-1
+# verdict for the rest of time. Head ruling 1 (e578c42b) BC1. A single run cannot see this — hence two.
+# ──────────────────────────────────────────────────────────────────────────────
+def d1_composed(name):
+    """`name`: C1 resumed claude over two boots · C2 codex over two boots · C3 same-boot retry (one epoch)."""
+    td = tempfile.mkdtemp(prefix="phoenix-d1-composed-")
+    original_cys, original_sleep, original_emit = m.cys, m.time.sleep, m._emit_evt
+    original_epoch, original_known = m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN
+    original_pack = os.environ.get("CYS_PACK_DIR")
+    try:
+        socket_path = os.path.join(td, "cys.sock")
+        ticket = "d1x-" + name                      # ONE ticket ⇒ ONE journal across both runs
+        agent = "codex" if name == "C2" else "claude"
+        entry = {"role": "worker-1", "agent": agent, "session_id": D1_PIN,
+                 "claude_config_dir": os.path.join(td, "acct"), "cwd": os.path.join(td, "proj"),
+                 "surface_id": 9, "surface_ref": "surface:9"}
+        os.makedirs(entry["cwd"])
+        project_dir = os.path.join(entry["claude_config_dir"], "projects",
+                                   m._claude_project_component(entry["cwd"]))
+        os.makedirs(project_dir)
+        with open(os.path.join(project_dir, D1_PIN + ".jsonl"), "w", encoding="utf-8") as f:
+            f.write("{}\n")
+        pack = os.path.join(td, "pack")
+        os.makedirs(pack)
+        with open(os.path.join(pack, "agents.json"), "w", encoding="utf-8") as f:
+            json.dump({"claude": {"resume_arg": "--resume {session_id}"}}, f)
+        os.environ["CYS_PACK_DIR"] = pack
+        m._AGENTS_CACHE.clear()
+        with open(os.path.join(td, "topology.json"), "w", encoding="utf-8") as f:
+            json.dump({"entries": [entry], "updated_at": 1.0, "schema_version": 1,
+                       "tombstones": [], "tombstones_rev": 0}, f)
+        journal_path = m.journal_path(socket_path, ticket)
+        state = {"alive": False, "epoch": 1000.0, "sref": "surface:9"}
+
+        def fake_cys(*args, socket=None, timeout=25):
+            assert socket == socket_path, "CLI escaped the isolated socket"
+            verb = args[0]
+            if verb == "status":
+                rows = []
+                if state["alive"]:
+                    rows = [{"surface_id": 9, "surface_ref": state["sref"], "role": "worker-1",
+                             "exited": False, "agent_alive": True, "seat": "occupied", "agent": agent,
+                             "gate_pending": None,
+                             "registered_session_id": None if agent == "codex" else D1_PIN}]
+                return SimpleNamespace(returncode=0, stdout=json.dumps(
+                    {"daemon": {"started_at": state["epoch"]}, "surfaces": rows}), stderr="")
+            if verb == "list":
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            if verb == "restore":
+                state["alive"] = True
+                return SimpleNamespace(returncode=0, stdout="restored worker-1 " + state["sref"], stderr="")
+            if verb == "reinject":
+                return SimpleNamespace(returncode=0, stdout="디렉티브 생존 확인 (ACK 수신)", stderr="")
+            if verb in ("read-screen", "watch"):
+                return SimpleNamespace(returncode=0, stdout="bypass permissions on", stderr="")
+            raise AssertionError("unexpected cys call: %r" % (args,))
+
+        m.cys = fake_cys
+        m.time.sleep = lambda seconds: None
+        m._emit_evt = lambda *a, **k: None
+
+        def one_run():
+            res = m.run_restore(socket_path, ticket=ticket, stub=False, no_breaker=True, print_result=False)
+            with open(journal_path, encoding="utf-8") as f:
+                return res, json.load(f)["roles"]["worker-1"]
+
+        res1, rr1 = one_run()
+        n = "d1xd3 " + name
+        want1 = "seat_only" if agent == "codex" else "verified"
+        check(n + " run 1 is judged by defect 1", rr1["outcome"] == want1
+              and (rr1.get("resume_evidence") or {}).get("leg") in ("all", "channel"))
+        check(n + " run 1 leaves NO key of defect 3's marker group on a non-F-1 role",
+              not any(k in rr1 for k in m.FRESH_MARKER_KEYS),
+              extra="present: %s" % sorted(k for k in m.FRESH_MARKER_KEYS if k in rr1))
+
+        # ── the second run: the role died again (a later boot, or the daemon's same-boot retry) ──
+        state["alive"] = False
+        if name != "C3":
+            state["epoch"] = 2000.0                 # a NEW boot generation
+            state["sref"] = "surface:11"            # a new pane, as a real restore would make
+        res2, rr2 = one_run()
+        check(n + " run 2 is still judged by defect 1, not pre-empted by the D3 guard",
+              rr2["outcome"] == want1 and "D3:" not in (rr2.get("verify_reason") or ""),
+              extra="run2 outcome=%r reason=%.90s" % (rr2["outcome"], rr2.get("verify_reason")))
+        check(n + " run 2 has no fresh_scope_stripped on this role",
+              "fresh_scope_stripped" not in rr2 and not (res2.get("fresh_scope_stripped") or {}),
+              extra="stripped=%r" % (rr2.get("fresh_scope_stripped"),))
+        check(n + " the observation provenance is still reported, under a defect-1 key",
+              "resume_observed_source" in rr2 and "observed_sid_source" not in rr2
+              and (rr2.get("resume_evidence") or {}).get("observed_sid_source")
+              == ("registered" if agent == "claude" else None),
+              extra="resume_observed_source=%r evidence=%r" % (
+                  rr2.get("resume_observed_source"),
+                  (rr2.get("resume_evidence") or {}).get("observed_sid_source")))
+        return rr1, rr2
+    finally:
+        m.cys, m.time.sleep, m._emit_evt = original_cys, original_sleep, original_emit
+        m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN = original_epoch, original_known
+        if original_pack is None:
+            os.environ.pop("CYS_PACK_DIR", None)
+        else:
+            os.environ["CYS_PACK_DIR"] = original_pack
+        m._AGENTS_CACHE.clear()
+        shutil.rmtree(td)
+
+
 def main():
     _results.clear()
     if os.name == "nt":
@@ -378,6 +497,8 @@ def main():
         scenario(name)
     for name in ("R1", "R2", "R3a", "R3b", "R3c", "R4", "R5", "R6"):
         d1_scenario(name)
+    for name in ("C1", "C2", "C3"):
+        d1_composed(name)
     npass = sum(1 for c in _results if c)
     print("\n=== %d/%d PASS ===" % (npass, len(_results)))
     return 0 if npass == len(_results) else 1

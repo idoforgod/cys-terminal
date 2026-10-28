@@ -552,6 +552,7 @@ def resumed_verify_outcome(rr, row, agent, entry=None, session_file_exists=None)
           "registered_before_measured": rr.get("registered_before_measured"),
           "registered_before_surface": rr.get("registered_before_surface"),
           "surface_ref": rr.get("surface_ref"),
+          "observed_sid_source": rr.get("resume_observed_source"),
           "pre_source": rr.get("pre_spawn_snapshot_source"),
           "pre_known": rr.get("pre_spawn_snapshot_known"),
           "pre_enumerated": rr.get("pre_spawn_snapshot_enumerated"),
@@ -3334,12 +3335,16 @@ def _run_restore_locked(socket, ticket="default", stub=False, no_breaker=False, 
                     _pre = ([_sid_b] if (_m and isinstance(_sid_b, str) and _sid_b and _sid_b != _exp_now)
                             else None)
                     sid, ev = stage_observe_registered_session(socket, surface, pre_sids=_pre)
-                    j["roles"][role]["observed_sid_source"] = "registered" if sid else None
+                    # ★D1xD3(헤드 룰링1 BC1): `observed_sid_source` 는 **결함3 표지군**(FRESH_MARKER_KEYS)의
+                    #   키이고 그 범위 패스는 **키 존재**만 본다 — F-1 표지 작성기 밖에서 쓰면 fresh_epoch 스탬프가
+                    #   없어, 다음 실행의 범위 패스가 걷어내고 D3 가드가 이 판정을 선점한다(모든 재개 역할이
+                    #   영구 unverified). 그래서 재개 경로는 **결함1 소유 키**에 적는다(표지군 밖 · 스탬프 불요).
+                    j["roles"][role]["resume_observed_source"] = "registered" if sid else None
                 elif (not stub) and entries.get(role, {}).get("agent"):
                     # 좌석 결속 채널이 없는 어댑터(codex/gemini) — 있지도 않은 신원을 폴링하지 않는다.
                     sid, ev = None, ("좌석 결속 신원 채널 없음(agent=%s · 데몬 계약) — 관측 생략"
                                      % entries.get(role, {}).get("agent"))
-                    j["roles"][role]["observed_sid_source"] = None
+                    j["roles"][role]["resume_observed_source"] = None   # ★D1xD3 BC1: 표지군 밖의 결함1 키
                 else:
                     sid, ev = stage_observe_session(socket, surface, stub, role=role)
                 j["roles"][role]["observed_sid"] = sid
