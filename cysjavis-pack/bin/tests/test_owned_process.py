@@ -1354,12 +1354,22 @@ class MarkerReaderContract(unittest.TestCase):
         p.wait(timeout=30)  # wallclock: guard 30 s only ends a hang; the verdict is the SIGKILL return code
         self.assertEqual(p.returncode, -signal.SIGKILL)
 
+    def signals_sent(self):
+        # SIGKILL lands and is reaped asynchronously, so p.poll() right after a kill can still read None: record the
+        # signals stop_recorded sends instead (mutants K1c/K2c - kill AND record not-killed - survived a poll() check).
+        # Record only, never forward: a refused or gone pid must not be signalled even when the rule under test is wrong.
+        from unittest.mock import patch
+        sent = []
+        return sent, patch.object(os, 'kill', lambda target, sig: sent.append((target, sig)))
+
     @unittest.skipUnless(os.name == 'posix', 'pid identity check is POSIX (Windows kills through the handle)')
     def test_kill_refused_when_the_start_time_changed(self):
         p = subprocess.Popen([PYTHON, '-c', 'import time; time.sleep(3600)']); self.children.append(p)
         self.identities[p.pid] = ('ok', 'Mon Jan  1 00:00:00 2001')
-        self.stop_recorded(p.pid)
-        self.assertIsNone(p.poll(), 'a pid whose start time changed was killed')
+        sent, spy = self.signals_sent()
+        with spy:
+            self.stop_recorded(p.pid)
+        self.assertEqual(sent, [], 'a pid whose start time changed was signalled')
         self.assertIn('%d:start-time-changed' % p.pid, self.not_killed)
 
     @unittest.skipUnless(os.name == 'posix', 'pid identity check is POSIX (Windows kills through the handle)')
@@ -1367,9 +1377,10 @@ class MarkerReaderContract(unittest.TestCase):
         from unittest.mock import patch
         p = subprocess.Popen([PYTHON, '-c', 'import time; time.sleep(3600)']); self.children.append(p)
         self.identities[p.pid] = _start_time(p.pid)
-        with patch.object(subprocess, 'run', side_effect=PermissionError('fixture: ps blocked')):
+        sent, spy = self.signals_sent()
+        with spy, patch.object(subprocess, 'run', side_effect=PermissionError('fixture: ps blocked')):
             self.stop_recorded(p.pid)
-        self.assertIsNone(p.poll(), 'a pid with no readable identity was killed')
+        self.assertEqual(sent, [], 'a pid with no readable identity was signalled')
         self.assertIn('%d:identity-unavailable' % p.pid, self.not_killed)
 
     @unittest.skipUnless(os.name == 'posix', 'pid identity check is POSIX (Windows kills through the handle)')
@@ -1377,7 +1388,10 @@ class MarkerReaderContract(unittest.TestCase):
         p = subprocess.Popen([PYTHON, '-c', 'pass']); self.children.append(p)
         p.wait(timeout=30)  # wallclock: guard 30 s only ends a hang of a process that does nothing
         self.identities[p.pid] = ('ok', 'recorded')
-        self.stop_recorded(p.pid)
+        sent, spy = self.signals_sent()
+        with spy:
+            self.stop_recorded(p.pid)
+        self.assertEqual(sent, [], 'a gone pid was signalled')
         self.assertEqual(self.not_killed, [])
 
 
