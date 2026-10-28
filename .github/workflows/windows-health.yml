@@ -1237,6 +1237,21 @@ jobs:
           cargo_filter_count --bin cys aid_s5_cli_tests::
           CYS_PACK_DIR="$(mktemp -d)" RUST_MIN_STACK=8388608 cargo test --bin cys aid_s5_cli_tests:: -- --test-threads=1
           CYS_PACK_DIR="$(mktemp -d)" python cysjavis-pack/bin/tests/test_phoenix_c6_due.py
+          # ★D1+D3(0.14.55): 재개 판정(결함1 · 좌석 결속 신원)과 fresh 표지 범위(결함3)의 순수함수 진리표를
+          #   윈도우 실기에서 돈다 — 이 둘의 유일한 윈도우 커버리지다(실 run_restore 검체
+          #   `test_phoenix_f1_production_path.py` 는 `os.name == "nt"` 에서 자기 skip 한다). stdlib 전용.
+          #   ★양성 대조는 **파일이 스스로 센 수**다(손으로 쓴 N 금지 — 틀린 N 이 차단 셀을 헛되게 붉힌다):
+          #   마지막 줄 `=== N/N PASS ===` 의 두 수가 같고 0 이 아님을 확인한다. 파일은 한 줄이라도 실패하면
+          #   종료코드 1 이라 이 스텝(차단)이 그대로 붉어진다.
+          #   ★적색일 때 **먼저 출력하고 그 다음 실패한다**(헤드 노트1): `out="$(...)"` 는 set -e 아래에서
+          #   파일이 비0 이면 printf 에 닿기 전에 스텝을 끝내 실패한 행이 로그에 **하나도** 남지 않는다 —
+          #   윈도우 첫 실기가 바로 그 행들이 필요한 순간이다. rc 를 명시로 받고(POSIX sh 안전), stderr 도
+          #   같이 담아(트레이스백 보존) 인쇄 뒤에 그 rc 로 떨어진다.
+          d1d3_rc=0
+          d1d3_out="$(CYS_PACK_DIR="$(mktemp -d)" python cysjavis-pack/bin/tests/test_phoenix_fresh_honest.py 2>&1)" || d1d3_rc=$?
+          printf '%s\n' "$d1d3_out"
+          [ "$d1d3_rc" -eq 0 ] || { echo "::error title=d1+d3 진리표 적색::위 행 중 FAIL 을 보라(rc=$d1d3_rc)"; exit "$d1d3_rc"; }
+          printf '%s\n' "$d1d3_out" | python -c "import re,sys; t=sys.stdin.read(); m=re.search(r'=== (\d+)/(\d+) PASS ===', t); assert m, 'd1+d3 positive control line absent'; a,b=m.groups(); assert a==b and int(b)>0, 'd1+d3 rows not all green: %s/%s' % (a,b); print('d1+d3 positive control: %s/%s rows green' % (a,b))"
           CYS_PACK_DIR="$(mktemp -d)" python cysjavis-pack/bin/tests/test_reap_exited_matrix.py
           # P4 C-14 (B-490): how many skillscan workers outlive the 20 s preflight deadline.
           # This is the only lane that measures the Windows arm - the product does not re-measure
