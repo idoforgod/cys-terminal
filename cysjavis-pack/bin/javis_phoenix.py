@@ -1069,23 +1069,6 @@ def log(msg):
         pass  # 진단 스트림에 쓰지 못함(닫힘 · 없음 · write/flush 의 OSError) — 버린다 · 죽지 않는다
 
 
-def _emit_evt(evt_type, **fields):
-    """★C2/C3(W3): 구조화 이벤트를 HUD·음성 버스로 best-effort 방출(EVENT_CONTRACT v2·형제 javis_event.py).
-    손상 escalation·설명불가 축소 거부 등 운영자 가시성이 필요한 사건 전용. 절대 restore 판정을 죽이지 않는다
-    (버스 미도달·도구 부재는 조용히 무시하되, 사건 자체는 호출측이 log()/저널로도 남긴다=이중 기록)."""
-    mod = os.path.join(os.path.dirname(os.path.abspath(__file__)), "javis_event.py")
-    if not os.path.exists(mod):
-        return False
-    cmd = [sys.executable, mod, "emit", evt_type]
-    for k, v in fields.items():
-        cmd += ["--field", "%s=%s" % (k, v)]
-    try:
-        r = subprocess.run(cmd, capture_output=True, timeout=8)  # ★(0.14.48 · A) 종료코드만 쓴다 — 출력을 글자로 풀지 않는다
-        return r.returncode == 0
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        return False
-
-
 _SNAP_MOD = None
 
 
@@ -1498,7 +1481,7 @@ def _snapshot_tombstones(socket):
 # ---------------- C2(W3): 손상 격리 + 폴백 체인 ----------------
 # retention-critical(desired/dept) 파일이 파싱 실패(손상)면 침묵 빈-empty 통과 금지(W4 sentinel). W3 는 그 위에
 # 완전한 복원 체인을 얹는다: .corrupt-<ts> 로 격리(최근 3개만·inode DoS 차단) → .bak(직전 유효본) → 세대 스냅샷 →
-# 전부 불가면 unrecoverable(exit 6). 폴백으로 복원되면 degraded(묘비 불확실 → 부활 보류+escalation, fail-safe).
+# 전부 불가면 unrecoverable(exit 6). 폴백으로 복원되면 degraded(묘비 불확실 → 부활 보류 + log line + journal event + exit code, fail-safe).
 
 def _isolate_corrupt(path):
     """손상 파일을 `<path>.corrupt-<ts>` 로 격리(원본 자리 비움) 후 최근 3개만 유지·초과 prune(inode DoS 차단).
@@ -1935,7 +1918,7 @@ def _observe_and_persist_roster_locked(socket, rebase=False):
     #   ※ 기존 desired 파일에 이미 pop 된 역할은 세대 스냅샷·live 병합이 자연 치유한다(신규 의미론은 전향 적용).
     # ★C3 설명-가능-축소 불변식(W3): desired 는 관측으로만 늘고 묘비(OwnerClose)·ephemeral 로만 준다. 직전
     #   영속본 대비 '설명되지 않는 축소'(사라진 역할이 tombstone 도 ephemeral 도 아님)는 손상/조작/버그 신호다 —
-    #   영구 교착 대신 이 write 1회 거부(직전 상태 보존)+EVT/저널 escalation → 다음 관측 사이클이 재평가한다
+    #   영구 교착 대신 이 write 1회 거부(직전 상태 보존)+log/journal record (no event is delivered) → 다음 관측 사이클이 재평가한다
     #   (gemini R2 TOCTOU: 데몬의 엔트리 제거↔묘비 등록 지연이 만든 오판은 1사이클 유예로 자연 해소). 정당한 축소는
     #   운영자 `phoenix roster --rebase`(rebase=True)로 강제 수용.
     _prev_roster = prev.get("roster") or {}
@@ -1946,13 +1929,11 @@ def _observe_and_persist_roster_locked(socket, rebase=False):
     if _unexplained and not rebase and not _foreign:
         log("★C3 설명불가 축소 거부: 직전 대비 사라진 역할 %s 이 묘비·ephemeral 로 설명 안 됨 — 이 write 1회 "
             "거부(직전 상태 보존·다음 사이클 재평가). 정당하면 `phoenix roster --rebase`." % _unexplained)
-        _emit_evt("agent.error", agent="phoenix",
-                  summary="C3 설명불가 desired 축소 거부(%s) — write 보류, --rebase 로 수용" % _unexplained)
         # 직전 영속본을 그대로 반환(축소를 확정하지 않음) — 다운스트림(target 산정)이 좋은 이전 상태를 쓴다.
         return dict(_prev_roster), set(t for t in (prev.get("tombstones") or []) if isinstance(t, str))
     # ★A-S2: 이물(state_dir_tag 불일치) 파일이면 write 거부 — 교차오염 차단. 정상 경로는 태그를 기록해 영속.
     #   ★C2(W3): keep_bak=True 로 직전 유효본을 .bak 에 보존(손상 폴백 소스). 쓰기 실패는 침묵(except:pass) 금지 →
-    #   log+EVT(P2-8: 영속 실패 무보고 차단).
+    #   log line(P2-8: 영속 실패 무보고 차단).
     if not _foreign:
         _out = {"roster": roster, "tombstones": sorted(tombstones),
                 "tombstones_rev": new_rev, "daemon_epoch": cur_epoch,
@@ -1966,9 +1947,7 @@ def _observe_and_persist_roster_locked(socket, rebase=False):
         try:
             _atomic_write_json(desired_roster_path(socket), _out, keep_bak=True)
         except Exception as _e:
-            log("★C3/P2-8: desired_roster 원자쓰기 실패(%s: %s) — 침묵 삼킴 금지, escalation." % (type(_e).__name__, _e))
-            _emit_evt("agent.error", agent="phoenix",
-                      summary="desired_roster 영속 실패(%s) — 상태 갱신 미반영" % type(_e).__name__)
+            log("★C3/P2-8: desired_roster 원자쓰기 실패(%s: %s) — 침묵 삼킴 금지(log line)." % (type(_e).__name__, _e))
     return roster, tombstones
 
 
@@ -2064,9 +2043,7 @@ def _observe_and_persist_depts_locked(socket, rebase=False):
     try:
         _atomic_write_json(dept_roster_path(socket), _out, keep_bak=True)  # ★C2(W3): .bak 유지(손상 폴백 소스)
     except Exception as _e:
-        log("★P2-8: dept_roster 원자쓰기 실패(%s: %s) — 침묵 삼킴 금지, escalation." % (type(_e).__name__, _e))
-        _emit_evt("agent.error", agent="phoenix",
-                  summary="dept_roster 영속 실패(%s)" % type(_e).__name__)
+        log("★P2-8: dept_roster 원자쓰기 실패(%s: %s) — 침묵 삼킴 금지(log line)." % (type(_e).__name__, _e))
     return roster, tombstones
 
 
@@ -2193,12 +2170,10 @@ def load_journal(socket, ticket_id):
         except Exception as _e:
             # ★C2 2단계 보조상태(W3): 저널은 retention-critical 이 아니다(단계 진행 캐시 — 소실 시 재수행). 손상 시
             #   hard-fail 하지 않고 격리(.corrupt-<ts>·최근3)+경고 후 fresh 로 시작한다. 단 '침묵 삼킴'(try:pass)은
-            #   금지 — 재개가 불가능해졌음을 log/EVT 로 가시화(gemini W1-gate3: resolve 저널 침묵 제거).
+            #   금지 — 재개가 불가능해졌음을 log line 으로 가시화(gemini W1-gate3: resolve 저널 침묵 제거).
             isolated = _isolate_corrupt(p)
             log("★C2 보조상태: journal(%s) 손상 — 격리(%s) 후 fresh 시작(단계 재수행). 침묵 아님."
                 % (ticket_id, isolated))
-            _emit_evt("agent.error", agent="phoenix",
-                      summary="phoenix journal(%s) 손상 — fresh 재시작(단계 진행 소실)" % ticket_id)
     return {"ticket_id": ticket_id, "roles": {}, "events": [], "created": _now()}
 
 
@@ -2248,7 +2223,7 @@ def breaker_file(socket):
 def breaker_check_and_record(socket):
     """이번 restore 시도를 기록하고, T초 내 N회 이상이면 (open=True, 최근 시도 리스트) 반환.
     ★C2/P2-6(W3): 보조상태(breaker)는 retention-critical 이 아니므로 손상 시 hard-fail 하지 않고 격리+경고 후
-    빈 카운트로 재시작한다 — 단 '침묵 리셋'은 금지(크래시루프 감지 무력화 위험)이므로 log+EVT 로 가시화한다."""
+    빈 카운트로 재시작한다 — 단 '침묵 리셋'은 금지(크래시루프 감지 무력화 위험)이므로 log line 으로 가시화한다."""
     p = breaker_file(socket)
     now = _now()
     attempts = []
@@ -2259,8 +2234,6 @@ def breaker_check_and_record(socket):
             isolated = _isolate_corrupt(p)  # 손상 격리(.corrupt-<ts>·최근3 prune)
             log("★P2-6: breaker.json 손상 — 격리(%s) 후 빈 카운트 재시작(침묵 리셋 아님·경고). "
                 "크래시루프 감지가 이번 창에서 리셋될 수 있음." % isolated)
-            _emit_evt("agent.error", agent="phoenix",
-                      summary="breaker.json 손상 격리+리셋 — 크래시루프 감지 일시 약화")
             attempts = []
     attempts = [t for t in attempts if now - t <= BREAKER_T]  # 창 밖 제거
     attempts.append(now)
@@ -2937,8 +2910,8 @@ def _run_restore_locked(socket, ticket="default", stub=False, no_breaker=False, 
 
     # ★C2 손상 대응 — 2단계 계층화(W4 sentinel + W3 폴백 체인). missing(부재)=fresh install 정상 진행.
     #   corrupt(파싱 실패)=격리(.corrupt-<ts>·최근3 prune) 후 폴백 체인(.bak → 세대 스냅샷 → dept 재발견):
-    #     · 폴백 복원 성공 = degraded(묘비 불확실 → 부활 보류+escalation, fail-safe · exit 3)
-    #     · 전 폴백 실패 = unrecoverable(부활 중단+escalation · exit 6)
+    #     · 폴백 복원 성공 = degraded(묘비 불확실 → 부활 보류 + log, fail-safe · exit 3)
+    #     · 전 폴백 실패 = unrecoverable(부활 중단 + log · exit 6)
     #   빈 상태(fresh) 위장 통과는 어느 경우도 없다(silent-empty 차단).
     #     · 폴백 복원(신규 손상)=recovered_from provenance 를 파일에 영속 → degraded(부활 보류·전 auto-retry 지속).
     #   ★codex W3 BLOCKING: degraded 최종 판정은 observe **후** 파일의 recovered_from 으로 한다(휘발 방지 — 아래).
@@ -2948,8 +2921,6 @@ def _run_restore_locked(socket, ticket="default", stub=False, no_breaker=False, 
         if _rec["status"] == "unrecoverable":
             log("★C2 손상 감지: %s 파싱 실패·전 폴백(.bak/스냅샷) 불가 — 부활 중단(exit 6). 격리=%s"
                 % (_kind, _rec.get("isolated")))
-            _emit_evt("agent.error", agent="phoenix",
-                      summary="C2 손상 복원 불가(%s) — 부활 중단, 사람 개입 필요" % _kind)
             out = {"phoenix_restore": "CORRUPT", "corruption": True, "corrupt_file": _kind,
                    "corrupt_path": _p, "isolated": _rec.get("isolated"),
                    "note": ("손상된 %s — .bak·세대 스냅샷 전 폴백 불가. 빈 상태(fresh)로 진행하지 않는다"
@@ -2958,12 +2929,9 @@ def _run_restore_locked(socket, ticket="default", stub=False, no_breaker=False, 
                 print(json.dumps(out, ensure_ascii=False, indent=2))
             return out
         if _rec["status"] == "degraded" and not _rec.get("pending"):
-            # 이번 실행에서 새로 손상→복구(fresh) — escalation EVT 1회. pending(전 auto-retry 이월)은 재방출 안 함.
+            # 이번 실행에서 새로 손상→복구(fresh) — log line 1회. pending(전 auto-retry 이월)은 다시 쓰지 않음.
             log("★C2 폴백 복원: %s 손상 → %s 로 복원(degraded·provenance 영속). 묘비 불확실 → 부활 보류(fail-safe)."
                 % (_kind, _rec.get("source")))
-            _emit_evt("agent.error", agent="phoenix",
-                      summary="C2 손상→폴백 복원(%s src=%s) — degraded, 부활 보류(영속)"
-                              % (_kind, _rec.get("source")))
 
     j = load_journal(socket, ticket)
     # C6 does not wait for grace or alter restoration eligibility.
@@ -3034,8 +3002,6 @@ def _run_restore_locked(socket, ticket="default", stub=False, no_breaker=False, 
     #   보류+escalation 한다(P1-6 재도입 차단). 복귀 = liveness 소스 회복(status --json 정상 또는 list 형식 복구).
     if not _live_known:
         log("★C5 unknown-liveness: status --json 실패 + list 폴백 구조 무효 — 전원 사망 추정 금지, 부활 보류(fail-safe).")
-        _emit_evt("agent.error", agent="phoenix",
-                  summary="liveness 소스 불신(status --json 실패+list 드리프트) — 부활 보류, 대량 스폰 차단")
         jevent(j, "*", "c5_unknown_liveness", "hold", "liveness 불신 — 부활 보류(대량 오스폰 방지)")
         save_journal(socket, ticket, j)
         out = {"phoenix_restore": "DEGRADED", "degraded_reason": "unknown_liveness",
@@ -4180,8 +4146,6 @@ def load_deploy_journal(socket, ticket):
             # ★C2 2단계 보조상태(W3): deploy 저널도 재개 캐시(비 retention) — 손상 시 격리+경고 후 fresh.
             isolated = _isolate_corrupt(p)
             log("★C2 보조상태: deploy journal(%s) 손상 — 격리(%s) 후 fresh 시작." % (ticket, isolated))
-            _emit_evt("agent.error", agent="phoenix",
-                      summary="phoenix deploy journal(%s) 손상 — fresh 재시작" % ticket)
     return {"ticket": ticket, "stages": {}, "events": [], "created": _now()}
 
 

@@ -101,7 +101,6 @@ class C6DueTests(unittest.TestCase):
                            "spawn_surrogate":spawn, "stage_ready":lambda *a: (True,"fixture"),
                            "stage_observe_session":lambda *a, **k: ("s5-session","fixture"),
                            "stage_reinject":lambda *a: (True,"fixture"), "stage_g2_ack":lambda *a: (True,"fixture"),
-                           "_emit_evt":lambda *a, **k: None,
                            "_recovered_provenance":lambda p: {"source":"fixture","ts":1} if disposition == "corrupt" else None}
                 for name, value in patches.items():
                     stack.enter_context(mock.patch.object(P, name, value))

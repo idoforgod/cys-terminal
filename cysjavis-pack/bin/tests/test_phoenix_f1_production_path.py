@@ -24,7 +24,7 @@ def check(name, cond, extra=""):
 
 def scenario(name):
     td = tempfile.mkdtemp(prefix="phoenix-f1-production-")
-    original_cys, original_sleep, original_emit = m.cys, m.time.sleep, m._emit_evt
+    original_cys, original_sleep = m.cys, m.time.sleep
     original_epoch, original_known = m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN
     try:
         socket_path = os.path.join(td, "cys.sock")
@@ -111,7 +111,6 @@ def scenario(name):
 
         m.cys = fake_cys
         m.time.sleep = lambda seconds: sleeps.append(seconds)
-        m._emit_evt = lambda *args, **kwargs: None  # production emitter shells out
         result = m.run_restore(socket_path, ticket=ticket, stub=False,
                                no_breaker=True, print_result=False)
         with open(journal_path, encoding="utf-8") as f:
@@ -193,7 +192,7 @@ def scenario(name):
                   # grace 를 한 번은 끝까지 썼다(tries-1 회의 grace sleep) — SPAWN_SETTLE 등 다른 sleep 과 섞이므로 값으로 센다.
                   and sum(1 for s in sleeps if s == m.PHOENIX_SESSION_GRACE_SLEEP) >= m.F1_REGISTERED_GRACE_TRIES - 1)
     finally:
-        m.cys, m.time.sleep, m._emit_evt = original_cys, original_sleep, original_emit
+        m.cys, m.time.sleep = original_cys, original_sleep
         m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN = original_epoch, original_known
         shutil.rmtree(td)
 
@@ -210,7 +209,7 @@ D1_PIN = "PIN-1"
 def d1_scenario(name):
     """One resumed-role restore. `name` selects the shape; every shape is produced by the shipped parser."""
     td = tempfile.mkdtemp(prefix="phoenix-d1-production-")
-    original_cys, original_sleep, original_emit = m.cys, m.time.sleep, m._emit_evt
+    original_cys, original_sleep = m.cys, m.time.sleep
     original_epoch, original_known = m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN
     original_pack = os.environ.get("CYS_PACK_DIR")
     try:
@@ -299,7 +298,6 @@ def d1_scenario(name):
 
         m.cys = fake_cys
         m.time.sleep = lambda seconds: sleeps.append(seconds)
-        m._emit_evt = lambda *a, **k: None
         result = m.run_restore(socket_path, ticket=ticket, stub=False, no_breaker=True, print_result=False)
         with open(journal_path, encoding="utf-8") as f:
             journal = json.load(f)
@@ -368,7 +366,7 @@ def d1_scenario(name):
                   and sleeps.count(m.PHOENIX_SESSION_GRACE_SLEEP) >= m.F1_REGISTERED_GRACE_TRIES - 1)
         return journal
     finally:
-        m.cys, m.time.sleep, m._emit_evt = original_cys, original_sleep, original_emit
+        m.cys, m.time.sleep = original_cys, original_sleep
         m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN = original_epoch, original_known
         if original_pack is None:
             os.environ.pop("CYS_PACK_DIR", None)
@@ -391,7 +389,7 @@ def d1_composed(name):
     defect 1's verdict a SECOND time) · C3d the dedup-only shape, kept and labelled as dedup (codex impl r1 T1:
     the old C3 ended run 1 verified, so run 2 dedup'd and the verdict ran exactly ONCE across both runs)."""
     td = tempfile.mkdtemp(prefix="phoenix-d1-composed-")
-    original_cys, original_sleep, original_emit = m.cys, m.time.sleep, m._emit_evt
+    original_cys, original_sleep = m.cys, m.time.sleep
     original_epoch, original_known = m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN
     original_pack = os.environ.get("CYS_PACK_DIR")
     original_verdict = m._d1_resume_verdict
@@ -463,7 +461,6 @@ def d1_composed(name):
 
         m.cys = fake_cys
         m.time.sleep = lambda seconds: None
-        m._emit_evt = lambda *a, **k: None
 
         def one_run():
             state["n_status"] = 0                   # the scripted liveness index counts per run
@@ -570,7 +567,7 @@ def d1_composed(name):
                   (rr2.get("resume_evidence") or {}).get("observed_sid_source")))
         return rr1, rr2
     finally:
-        m.cys, m.time.sleep, m._emit_evt = original_cys, original_sleep, original_emit
+        m.cys, m.time.sleep = original_cys, original_sleep
         m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN = original_epoch, original_known
         if original_pack is None:
             os.environ.pop("CYS_PACK_DIR", None)
