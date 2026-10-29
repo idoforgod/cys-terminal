@@ -1263,6 +1263,7 @@ pub fn record_audited_with(
             }),
         );
     }
+    crate::agent_write::test_after_pre_record(surface_id);
     match report.outcome {
         Outcome::Recorded => true,
         Outcome::Blank => false,

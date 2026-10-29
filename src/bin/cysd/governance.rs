@@ -10151,9 +10151,6 @@ struct HandoffStamp {
     agent_epoch: u64,
     conversation_epoch: u64,
     human_at: Option<std::time::Instant>,
-    /// ★(0.14.56 · P1 D9 pre-CR · design r3 §6-2) The writer's write count AT THE HAND-OFF ([`crate::state::InjectTrack::wrote`]),
-    /// as [`QueueResume::wrote`] is at a hold: a request queued ahead of this one that writes before its claim moves it.
-    wrote: u64,
 }
 
 impl HandoffStamp {
@@ -10165,7 +10162,6 @@ impl HandoffStamp {
             agent_epoch: s.agent_epoch.load(Ordering::Acquire),
             conversation_epoch: s.conversation_epoch.load(Ordering::Acquire),
             human_at: *s.last_human_input.lock().unwrap_or_else(|e| e.into_inner()),
-            wrote: s.inject_track.wrote(),
         }
     }
     /// The seat is still on the hand-off's agent and conversation.
@@ -10224,6 +10220,43 @@ fn d9_claim_probe(s: &Arc<crate::state::Surface>, claim: Arc<D9Claim>, inner: cr
         *claim.moved.lock().unwrap_or_else(|e| e.into_inner()) = moved;
         true
     })
+}
+
+/// ★(0.14.56 · P1 D9 pre-CR · design r3 §5-7) The claim check of a daemon-internal one-job writer into a master/CEO seat:
+/// W-5 `handlers::deliver_to_ceo`, W-6 `channels::inject_master_confirmed`, W-7 `boot_supervisor::pane_notice_line`,
+/// W-8 `schedule::inject_on`. Those writers hand off with no seat probe and no judged frame, so the guard carries only the
+/// §6-2 three-counter test against a stamp taken at the hand-off (no output-generation expectation, no approval axis). A
+/// refusal writes 0 bytes and ends the job `guard_aborted`, which each producer already settles as zero bytes. Their CR
+/// behaviour stays the pin's (no §6-4 withhold here: residue R-16). Outside D9 scope there is no guard (the pin).
+pub(crate) struct D9WriterGuard {
+    guard: Arc<crate::state::InjectGuard>,
+}
+
+impl D9WriterGuard {
+    /// In D9 scope the guard, else `None`. Reads `daemon.roles` (through [`d9_scope`]): call it before taking `input_gate`.
+    /// ★(0.14.56 · D3-BOUND r2 §1.2, F1) The claim baseline S0 is taken HERE, so call it immediately BEFORE the producer's frame
+    /// judgment (and before its ledger pre-record): a write or input that starts and finishes between the judgment and the
+    /// hand-off then moves a counter and the claim refuses. None of W-5..W-8 marks `input_gen` between S0 and `try_send`.
+    pub(crate) fn for_target(daemon: &Daemon, s: &Arc<crate::state::Surface>) -> Option<Self> {
+        if !d9_scope(daemon, s, false) {
+            return None;
+        }
+        let claim = Arc::new(D9Claim::default());
+        let _ = claim.base.set(d9_snapshot(s));
+        let probe = d9_claim_probe(s, claim.clone(), Arc::new(|| false));
+        let guard = Arc::new(crate::state::InjectGuard::new(None, s.output_gen.clone(), false, Some(probe)));
+        Some(Self { guard })
+    }
+    /// The job's guard.
+    pub(crate) fn guard(&self) -> Arc<crate::state::InjectGuard> {
+        self.guard.clone()
+    }
+}
+
+/// ★(0.14.56 · D3-BOUND r2 §1.2) S0: the three claim counters now (`input_gen`, the writer's write count, the last human key).
+fn d9_snapshot(s: &crate::state::Surface) -> (u64, u64, Option<std::time::Instant>) {
+    let human_at = *s.last_human_input.lock().unwrap_or_else(|e| e.into_inner());
+    (s.input_gen.load(Ordering::Acquire), s.inject_track.wrote(), human_at)
 }
 
 /// ★(0.14.52 · S-a C7b) The resume material of a PartialExact queue hold (`QueueHold::resume`): what the SAME request
@@ -11144,6 +11177,9 @@ pub(crate) fn deliver_head_locked(
         let q = s.pending_queue.lock().unwrap();
         // 락 순서 계약: pending_queue → input_gate (state.rs Surface::input_gate doc).
         let _gate = s.input_gate.lock().unwrap();
+        // ★(0.14.56 · D3-BOUND r2 §1.2, F1) S0 - the claim baseline, read BEFORE the frame judgment (`handoff_gate_ok`) and the
+        //   ledger pre-record, so a write or input that starts and finishes in between moves a counter and the claim refuses.
+        let d9_s0 = d9_claim.as_ref().map(|_| d9_snapshot(s));
         // ★(0.14.31 · 리뷰 R2 · codex blocking) 결판 대기 중인 인계가 있으면 이번 호출은 아무것도
         //   하지 않는다. 항목이 결판까지 큐에 남아 있으므로(유실 창 봉인) 이 표식이 없으면 틱과
         //   RPC 강제 배달이 **같은 머리를 두 번** 인계할 수 있다. 검사·설정이 둘 다 이 임계영역
@@ -11436,9 +11472,10 @@ pub(crate) fn deliver_head_locked(
             None => s.agent_proof(),
         };
         let stamp = HandoffStamp::of(s, request.clone(), proof, guard.clone());
-        // ★(0.14.56 · P1 D9 pre-CR) the claim baseline, under `input_gate`, after the job's own count mark, before it can be claimed.
-        if let Some(c) = &d9_claim {
-            let _ = c.base.set((f.pending_gen, stamp.wrote, stamp.human_at));
+        // ★(0.14.56 · P1 D9 pre-CR · D3-BOUND r2 §1.2) the claim baseline = S0, adjusted by the queue's ONE own mark between S0
+        //   and `try_send`: `set_pending_input(0)` above adds exactly 1 to `input_gen`. Set before the job can be claimed.
+        if let (Some(c), Some((gen, wrote, human_at))) = (&d9_claim, d9_s0) {
+            let _ = c.base.set((gen + 1, wrote, human_at));
         }
         let job = crate::agent_write::AgentJob {
             attempt: None,
@@ -32685,13 +32722,12 @@ mod h_machine_hold_tests {
         for (f, src) in daemon_sources() {
             found.extend(guard_none_producers(f, src));
         }
+        // ★(0.14.56 · P1 D9 pre-CR · design r3 §5-7) `channels::inject_master_confirmed`, `schedule::inject_on`,
+        //   `handlers::deliver_to_ceo` and `boot_supervisor::pane_notice_line` left the list: each passes
+        //   `D9WriterGuard::for_target(..)`'s guard. ⛔This is a LEXICAL exit: outside D9 scope (a non-master/CEO target) that
+        //   expression is `None` at runtime, as at the pin - the in-scope guard is witnessed by the T-W4 specimens beside each
+        //   writer, and its wiring order by the four pairs added to `order` below.
         let allow: std::collections::BTreeSet<String> = [
-            "channels::inject_master_confirmed",
-            "schedule::inject_on",
-            "handlers::deliver_to_ceo",
-            // ★(R3SH-3) 통보 줄 쓰기가 즉시·미룬 재시도 공용 `pane_notice_line` 으로 모였다 — 두 호출자가 모두 그 앞에서
-            //   `pane_notice_hold`(H0) 를 판정한다(아래 순서 핀).
-            "boot_supervisor::pane_notice_line",
             // ★(0.14.52 · S-a C6d) `handlers::announce_seat_takeover` and `handlers::npm_prefix_pane_notice_req` left the list: both
             //   notices are events only (no pane write at all).
             "handlers::send_text_write_req",
@@ -32712,7 +32748,7 @@ mod h_machine_hold_tests {
         let order: Vec<(&str, &str, &str, &str, &str)> = vec![
             // H2 — 스케줄 직접 push: 하드축 판정이 직접 주입보다 앞.
             //   ★(0.14.52 · S-a C6a) the push path is `deliver_push_with` (the fire task then waits for the writer's verdict).
-            ("schedule", include_str!("schedule.rs"), "deliver_push_with", "machine_direct_hold(", "inject_on(daemon, &surface, text, Some(origin))"),
+            ("schedule", include_str!("schedule.rs"), "deliver_push_with", "machine_direct_hold(", "inject_on(daemon, &surface, text, Some(origin), d9)"),
             // H3 — 채널 inbox: 하드축 재확인(master_hold) → 기록 선행(UPDATE) → 주입.
             ("channels", include_str!("channels.rs"), "master_hold", "deliverable_master(daemon) != Some(sid)", "machine_direct_hold("),
             ("channels", include_str!("channels.rs"), "deliver_new_inbox_with", "master_hold(", "SET state='injected'"),
@@ -32731,7 +32767,46 @@ mod h_machine_hold_tests {
             ("boot_supervisor", include_str!("boot_supervisor.rs"), "retry_deferred_pane_notices", "pane_notice_hold(", "pane_notice_line("),
             ("boot_supervisor", include_str!("boot_supervisor.rs"), "pane_notice_hold", "machine_hold_enabled(", "machine_direct_hold("),
             ("boot_supervisor", include_str!("boot_supervisor.rs"), "pane_notice_line", "record_audited(", "write_tx.try_send("),
+            // ★(0.14.56 · P1 D9 §5-7 · D3-BOUND r2 §1.2, m2) W-5..W-8 and the queue: the claim baseline S0 (the guard is built, and
+            //   S0 read, by `D9WriterGuard::for_target(`; the queue reads `d9_snapshot(`) is taken in the function that JUDGES, before
+            //   the judgment and before the ledger pre-record (`record_audited` - for W-6 / W-7 / W-8 it runs inside the called writer
+            //   `inject_master_confirmed` / `pane_notice_line` / `inject_on`, so the pin's second token is that call). Each body_fn
+            //   names the function where the call lands now; `fn_body` + `find(..).unwrap_or_else(panic)` fail on a function that no
+            //   longer holds it (a stale pin cannot pass vacuously - mutant MP1 in the D3 evidence).
+            ("handlers", include_str!("handlers.rs"), "deliver_to_ceo", "D9WriterGuard::for_target(", "typing_guard_secs("),
+            ("handlers", include_str!("handlers.rs"), "deliver_to_ceo", "D9WriterGuard::for_target(", "machine_direct_hold("),
+            ("handlers", include_str!("handlers.rs"), "deliver_to_ceo", "D9WriterGuard::for_target(", "record_audited("),
+            ("channels", include_str!("channels.rs"), "deliver_new_inbox_with", "D9WriterGuard::for_target(", "master_hold("),
+            ("channels", include_str!("channels.rs"), "deliver_new_inbox_with", "D9WriterGuard::for_target(", "inject_master_confirmed("),
+            ("channels", include_str!("channels.rs"), "redeliver_unacked", "D9WriterGuard::for_target(", "master_hold("),
+            ("channels", include_str!("channels.rs"), "redeliver_unacked", "D9WriterGuard::for_target(", "inject_master_confirmed("),
+            ("boot_supervisor", include_str!("boot_supervisor.rs"), "notify_no_spawn", "D9WriterGuard::for_target(", "pane_notice_hold("),
+            ("boot_supervisor", include_str!("boot_supervisor.rs"), "retry_deferred_pane_notices", "D9WriterGuard::for_target(", "pane_notice_hold("),
+            ("schedule", include_str!("schedule.rs"), "deliver_push_with", "D9WriterGuard::for_target(", "machine_direct_hold("),
+            ("schedule", include_str!("schedule.rs"), "deliver_push_with", "D9WriterGuard::for_target(", "inject_on(daemon, &surface, text, Some(origin), d9)"),
+            ("governance", include_str!("governance.rs"), "deliver_head_locked", "d9_snapshot(", "handoff_gate_ok("),
+            ("governance", include_str!("governance.rs"), "deliver_head_locked", "d9_snapshot(", "record_audited_with("),
         ];
+        // ★(m2) Census: S0 is built ONLY where the pins above say - one guard per judging site, none in the writer helpers (a
+        //   second `for_target(` after the judgment would put the baseline back after the I/O).
+        for (f, src, want) in [
+            ("handlers", include_str!("handlers.rs"), 1usize),
+            ("channels", include_str!("channels.rs"), 2),
+            ("boot_supervisor", include_str!("boot_supervisor.rs"), 2),
+            ("schedule", include_str!("schedule.rs"), 1),
+        ] {
+            let code = strip_line_comments(&production(src));
+            assert_eq!(code.matches("D9WriterGuard::for_target(").count(), want, "{f}: D9WriterGuard::for_target( call-site count");
+        }
+        for (f, src, writer) in [
+            ("channels", include_str!("channels.rs"), "inject_master_confirmed"),
+            ("boot_supervisor", include_str!("boot_supervisor.rs"), "pane_notice_line"),
+            ("schedule", include_str!("schedule.rs"), "inject_on"),
+        ] {
+            let body = fn_body(&strip_line_comments(&production(src)), writer).to_string();
+            assert!(body.contains("record_audited("), "{f}::{writer}: the ledger pre-record moved - re-pin S0 against it");
+            assert!(!body.contains("for_target("), "{f}::{writer}: a guard (S0) built after the judgment");
+        }
         for (f, src, body_fn, gate, inject) in order {
             let code = strip_line_comments(&production(src));
             let body = fn_body(&code, body_fn);
@@ -32761,8 +32836,12 @@ mod h_machine_hold_tests {
     /// ★(0.14.56 · P1 D9 pre-CR stage D1) 55 → **58**: class C +3 recorder-seat claim-check specimens (`agent_queue_tests::d9_pre_cr_*`).
     /// Renamed `_of_58` (the CI comment in windows-health.yml too).
     /// ★(0.14.56 · P1 D9 pre-CR stage D2) 58 → **60**: class C +2 recorder-seat CR-withhold specimens (`d9_pre_cr_t_w3*`). Renamed `_of_60`.
+    /// ★(0.14.56 · P1 D9 pre-CR stage D3) 60 → **65**: class C +5 recorder-seat writer-guard specimens (`d9_pre_cr_t_w4_*`, one beside each
+    /// of W-5..W-8) and its scope control. Renamed `_of_65`.
+    /// ★(0.14.56 · D3-BOUND I1) 65 → **70**: class C +5 recorder-seat S0 specimens (`d9_bound_t_s0*` - queue T-S0, T-S0h, W-5, W-7,
+    /// W-8; the W-6 one lives with the `#[cfg(unix)]` H3 channel rig). Renamed `_of_70` (the CI comment in windows-health.yml too).
     #[test]
-    fn r2f_dm_windows_ignore_attributes_are_exactly_the_decided_set_of_60() {
+    fn r2f_dm_windows_ignore_attributes_are_exactly_the_decided_set_of_70() {
         const REASON_A: &str = "S21 제출 정착·창 위 CR 보류는 유닉스 한정(send_settle_applies)";
         const REASON_B: &str = "윈도우 기본 H 마스크는 draft 축을 끈다(hold_axes_default(true)) — 이 검체는 유닉스 기본(draft 축) 동작을 본다";
         const REASON_C: &str = "좌석 명령이 POSIX 셸 문법";
@@ -32840,8 +32919,22 @@ mod h_machine_hold_tests {
             //   bytes through the same recorder seat. The probe itself is armed only under cfg!(unix) (design r3 §6-4, R-5).
             ("agent_queue_tests", "d9_pre_cr_t_w3_a_dialog_during_the_settle_withholds_the_cr_with_one_owner", 'C'),
             ("agent_queue_tests", "d9_pre_cr_t_w3c_outside_d9_scope_the_queue_job_proof_is_unchanged", 'C'),
+            // ★(0.14.56 · P1 D9 pre-CR stage D3) class C +5: each daemon-internal writer's claim-check specimen (W-5..W-8) and the scope control record
+            //   the receiver's bytes through the same recorder seat. The guard itself has no cfg and runs on Windows (UNMEASURED there).
+            ("boot_supervisor", "d9_pre_cr_t_w4_boot_notice_refused_at_claim_writes_nothing", 'C'),
+            ("channels", "d9_pre_cr_t_w4_channel_envelope_refused_at_claim_writes_nothing", 'C'),
+            ("handlers", "d9_pre_cr_t_w4_ceo_push_refused_at_claim_writes_nothing", 'C'),
+            ("schedule", "d9_pre_cr_t_w4_schedule_push_refused_at_claim_writes_nothing", 'C'),
+            ("schedule", "d9_pre_cr_t_w4c_outside_d9_scope_the_push_has_no_guard", 'C'),
+            // ★(0.14.56 · D3-BOUND I1) class C +5: the S0 specimens record the receiver's bytes through the same recorder seat. The
+            //   S0 baseline itself has no cfg and runs on Windows (UNMEASURED there).
+            ("agent_queue_tests", "d9_bound_t_s0_a_write_finished_between_judgment_and_hand_off_refuses_the_claim", 'C'),
+            ("agent_queue_tests", "d9_bound_t_s0h_a_human_key_time_between_judgment_and_hand_off_refuses_the_claim", 'C'),
+            ("boot_supervisor", "d9_bound_t_s0_boot_notice_refused_after_a_write_finished_inside_the_window", 'C'),
+            ("handlers", "d9_bound_t_s0_ceo_push_refused_after_a_write_finished_inside_the_window", 'C'),
+            ("schedule", "d9_bound_t_s0_schedule_push_refused_after_a_write_finished_inside_the_window", 'C'),
         ];
-        assert_eq!(want.len(), 60, "결정한 집합은 60건(24 + 17 + 16 + 3)");
+        assert_eq!(want.len(), 70, "결정한 집합은 70건(24 + 17 + 26 + 3)");
         let needle = concat!("#[cfg_attr(not(unix), ", "ignore = \"");
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/cysd");
         let mut got: Vec<(String, String, char)> = Vec::new();
@@ -32868,8 +32961,8 @@ mod h_machine_hold_tests {
         got.sort();
         let mut want_sorted: Vec<(String, String, char)> = want.iter().map(|(a, b, c)| (a.to_string(), b.to_string(), *c)).collect();
         want_sorted.sort();
-        assert_eq!(got.len(), 60, "윈도우 `ignore` 가 {}건이다(결정 60건) — 새로 더했거나 뺐다: {got:?}", got.len());
-        assert_eq!(got, want_sorted, "윈도우 `ignore` 집합이 결정한 60건과 다르다 — 목록과 `ignore` 사유를 함께 고쳐라");
+        assert_eq!(got.len(), 70, "윈도우 `ignore` 가 {}건이다(결정 70건) — 새로 더했거나 뺐다: {got:?}", got.len());
+        assert_eq!(got, want_sorted, "윈도우 `ignore` 집합이 결정한 70건과 다르다 — 목록과 `ignore` 사유를 함께 고쳐라");
     }
 }
 

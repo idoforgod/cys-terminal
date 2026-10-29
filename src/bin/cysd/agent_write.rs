@@ -1230,6 +1230,31 @@ pub fn set_test_sync_settle(on: bool) {
     SYNC_SETTLE.with(|c| c.set(on));
 }
 
+/// Tests only (0.14.56 · D3-BOUND r2 §1.5, T-S0): run on the CALLING thread right after a delivery-ledger pre-record
+/// ([`crate::delivery::record_audited_with`]) - i.e. after the producer's judgment and before its hand-off. A specimen arms a
+/// one-shot hook there to land a foreign write or input inside that window. No-op in the product.
+pub fn test_after_pre_record(surface_id: u64) {
+    #[cfg(test)]
+    {
+        if let Some(hook) = AFTER_PRE_RECORD.with(|c| c.borrow_mut().take()) {
+            hook(surface_id);
+        }
+    }
+    #[cfg(not(test))]
+    let _ = surface_id;
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_PRE_RECORD: std::cell::RefCell<Option<Box<dyn FnOnce(u64)>>> = std::cell::RefCell::new(None);
+}
+
+/// Arms [`test_after_pre_record`] once on this thread (the next pre-record on this thread runs `hook`).
+#[cfg(test)]
+pub fn set_test_after_pre_record(hook: impl FnOnce(u64) + 'static) {
+    AFTER_PRE_RECORD.with(|c| *c.borrow_mut() = Some(Box::new(hook)));
+}
+
 /// Proof used while a seat has no receiver binding wired yet: every check passes (the caller's
 /// existing gates and hand-off guard remain the admission).
 pub struct PassThrough;

@@ -1654,6 +1654,7 @@ fn inject_master_confirmed(
     envelope: &str,
     inbox_id: i64,
     handoff: InboxHandoff,
+    d9: Option<crate::governance::D9WriterGuard>,
 ) -> Option<String> {
     // ★R1 배달 원장 — 주입보다 앞(delivery.rs 불변식 ①). 외부 채널 봉투도 기계 유래다.
     crate::delivery::record_audited(
@@ -1690,7 +1691,7 @@ fn inject_master_confirmed(
         journal: Some(journal),
         resume: None,
         settle: Some(Box::new(move |t: &crate::agent_write::Terminal| settle.run(t))),
-        guard: None, // 큐 배달 아님 — 인계 가드 없음(종전 동작 · 판정은 master_hold 가 앞에서 했다)
+        guard: d9.as_ref().map(|g| g.guard()), // ★(0.14.56 · P1 D9 §5-7) in D9 scope the claim check; outside it none (the pin)
         note_body: true, // the old Inject arm recorded every envelope (owner None)
         body_owner: None,
     };
@@ -1898,6 +1899,9 @@ fn deliver_new_inbox_with(daemon: &Arc<Daemon>, conn: &Connection) -> InboxDeliv
             out.hold = Some(if stuck { InboxHold::WriterBusy } else { InboxHold::Paced });
             break;
         }
+        // ★(0.14.56 · P1 D9 §5-7 · D3-BOUND r2 §1.2) the claim guard and its baseline S0, BEFORE the judgment (`master_hold`),
+        //   the record-first UPDATE and the ledger pre-record.
+        let d9 = daemon.get_surface(sid).and_then(|m| crate::governance::D9WriterGuard::for_target(daemon, &m));
         // ① 주입 직전 재확인(행마다 — 루프 중 quiescing·모달·초안 봉합).
         let surface = match master_hold(daemon, sid) {
             Ok(s) => s,
@@ -1924,7 +1928,7 @@ fn deliver_new_inbox_with(daemon: &Arc<Daemon>, conn: &Connection) -> InboxDeliv
         }
         let env = envelope_at(&channel, &sender_id, created_ts, inbox_id, false, &text, lag_on.then_some(now));
         // ③ 주입.
-        if let Some(request_id) = inject_master_confirmed(daemon, &surface, &env, inbox_id, InboxHandoff::New) {
+        if let Some(request_id) = inject_master_confirmed(daemon, &surface, &env, inbox_id, InboxHandoff::New, d9) {
             out.delivered.push(inbox_id);
             out.requests.push((inbox_id, request_id));
         } else {
@@ -1984,6 +1988,8 @@ fn redeliver_unacked(daemon: &Arc<Daemon>, conn: &Connection) -> usize {
         if lag_on && (n > 0 || daemon.get_surface(sid).is_some_and(|s| master_inject_settling(&s))) {
             break;
         }
+        // ★(0.14.56 · D3-BOUND r2 §1.2, §3.3) S0 before the judgment, as for a new row.
+        let d9 = daemon.get_surface(sid).and_then(|m| crate::governance::D9WriterGuard::for_target(daemon, &m));
         let Ok(surface) = master_hold(daemon, sid) else {
             break;
         };
@@ -2003,7 +2009,7 @@ fn redeliver_unacked(daemon: &Arc<Daemon>, conn: &Connection) -> usize {
         }
         let env = envelope_at(&channel, &sender_id, created_ts, inbox_id, true, &text, lag_on.then_some(now));
         let handoff = InboxHandoff::Redeliver { prev_injected_ts: injected_ts, prev_redelivered: redelivered };
-        if inject_master_confirmed(daemon, &surface, &env, inbox_id, handoff).is_some() {
+        if inject_master_confirmed(daemon, &surface, &env, inbox_id, handoff, d9).is_some() {
             n += 1;
         } else {
             let _ = conn.execute(
@@ -3569,7 +3575,7 @@ mod tests {
         // 비-quiescing(agent_status None) → 주입 가능.
         assert_eq!(deliverable_master(&d), Some(sid), "비-quiescing master는 배달 가능");
         let s1 = master_hold(&d, sid).expect("비-quiescing master 는 주입 직전 재확인 통과");
-        assert!(inject_master_confirmed(&d, &s1, "[test] hi", 0, InboxHandoff::New).is_some(), "비-quiescing master엔 주입 성공");
+        assert!(inject_master_confirmed(&d, &s1, "[test] hi", 0, InboxHandoff::New, crate::governance::D9WriterGuard::for_target(&d, &s1)).is_some(), "비-quiescing master엔 주입 성공");
         // 루프 중 quiescing set(cycle-agent가 /clear 진입 직전) → 주입 직전 재확인이 false 반환.
         *surface.agent_status.lock().unwrap() = Some(crate::state::AgentStatus {
             state: "quiescing".into(),
@@ -4500,6 +4506,74 @@ mod tests {
         h3_done(&m);
     }
 
+    /// ★(0.14.56 · P1 D9 pre-CR · head ruling (B) on D3-H3-RIPPLE, condition 2 - BOUND measurement) K consecutive passes, each
+    /// handing the row while a write is ahead of it in the in-scope master's writer: the W-6 claim check refuses the row on EVERY
+    /// pass (0 bytes, back to `new`). Nothing in the channel loop caps that: the row is delivered only by a pass without a write
+    /// ahead (the last one here), and `channel.message.write_refused` is published for the FIRST refusal of the row only, so
+    /// refusals 2..K are silent. This specimen measures that; it is not a bound.
+    #[cfg(unix)]
+    #[test]
+    fn d9_h3_row_refused_on_every_pass_with_a_write_ahead_until_one_without() {
+        const K: usize = 5;
+        let (d, m) = h3_rig("d9-h3-kpass");
+        let id = h3_seed(&d, "k0", now());
+        let pass = |d: &Arc<Daemon>| {
+            let mut g = d.channels.lock().unwrap();
+            deliver_new_inbox_with(d, g.as_mut().unwrap())
+        };
+        let wait_state = |want: &str| {
+            let t0 = std::time::Instant::now();
+            while h3_state(&d, id) != want && t0.elapsed() < std::time::Duration::from_secs(5) {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            h3_state(&d, id)
+        };
+        for k in 0..K {
+            // A write ahead: the writer is inside a 300 ms request when the row is handed.
+            m.write_tx.send(crate::state::WriteReq::DataAfter { bytes: Vec::new(), delay_ms: 300 }).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            let r = pass(&d);
+            assert_eq!(r.delivered, vec![id], "pass {k}: the row is handed (the loop does not see the write ahead): hold {:?}", r.hold);
+            assert_eq!(wait_state("new"), "new", "pass {k}: refused at claim and rolled back");
+        }
+        let refused: Vec<_> = d.bus.tail(400).into_iter().filter(|e| e["name"] == "channel.message.write_refused").collect();
+        assert_eq!(refused.len(), 1, "one event for K refusals of the same row: {refused:?}");
+        assert_eq!(crate::governance::h_ledger_count(&d, "channel"), K, "one ledger record per refused hand-off");
+        // A pass with no write ahead delivers it.
+        assert_eq!(h3_drain(&d, 1), vec![id], "delivered by the first pass without a write ahead");
+        assert_eq!(wait_state("injected"), "injected");
+        assert_eq!(crate::governance::h_ledger_count(&d, "channel"), K + 1);
+        h3_done(&m);
+    }
+
+    /// T-S0 / W-6 (D3-BOUND r2 §1.5, F1): a foreign `Data` write admitted after the row's judgment (`master_hold`) and ledger
+    /// pre-record and FINISHED before the hand-off. The guard's baseline S0 is read before the judgment, so the claim refuses:
+    /// the row goes back to `new` (0 bytes), `channel.message.write_refused` names `guard_aborted`; the next pass delivers it. On
+    /// the D3 bytes the stamp was taken after that window and the row was written over the foreign write (the RED).
+    #[cfg(unix)]
+    #[test]
+    fn d9_bound_t_s0_channel_row_refused_after_a_write_finished_inside_the_window() {
+        let (d, m) = h3_rig("d9-ts0-ch");
+        let id = h3_seed(&d, "s0", now());
+        let w0 = m.inject_track.wrote();
+        crate::agent_queue_tests::d9_s0_foreign_write_after_pre_record(&m, b"");
+        let r = {
+            let mut g = d.channels.lock().unwrap();
+            deliver_new_inbox_with(&d, g.as_mut().unwrap())
+        };
+        assert_eq!(r.delivered, vec![id], "premise: the row is handed: hold {:?}", r.hold);
+        assert_eq!(m.inject_track.wrote(), w0 + 1, "premise: the foreign write was counted inside the window");
+        let t0 = std::time::Instant::now();
+        while h3_state(&d, id) != "new" && t0.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(h3_state(&d, id), "new", "refused at claim and rolled back (0 bytes)");
+        let refused: Vec<_> = d.bus.tail(400).into_iter().filter(|e| e["name"] == "channel.message.write_refused").collect();
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(h3_drain(&d, 1), vec![id], "the next pass delivers it");
+        h3_done(&m);
+    }
+
     /// [H3 간격 경쟁 · R1-F4 짝] 넘긴 앞 행을 writer 가 [`CHANNEL_WRITER_STUCK_SECS`] 넘게 끝내지 못하면(선행 쓰기에서 막힘)
     /// 간격(Paced · 500ms 후속 재무장)이 아니라 `WriterBusy`(후속 없음 · 15s sweep)다 — 뒤 행은 new 로 남는다(더 넘기면 대기열에
     /// 쌓였다가 풀리는 순간 간격 없이 이어 쓰인다). 음성 대조: 방금 넘긴 인계는 `Paced`(인계 실패 되돌림은 state 검체).
@@ -4885,7 +4959,7 @@ mod tests {
                 .unwrap();
         }
         let handoff = InboxHandoff::Redeliver { prev_injected_ts: 1000.5, prev_redelivered: 1 };
-        assert!(inject_master_confirmed(&d, &m, "redelivered envelope", id, handoff).is_some(), "premise: handed off");
+        assert!(inject_master_confirmed(&d, &m, "redelivered envelope", id, handoff, crate::governance::D9WriterGuard::for_target(&d, &m)).is_some(), "premise: handed off");
         let read = || -> (String, f64, i64) {
             let g = d.channels.lock().unwrap();
             g.as_ref()
@@ -4897,5 +4971,44 @@ mod tests {
         };
         c6b_wait("redelivery rolled back", || read() == ("injected".to_string(), 1000.5, 1));
         h3_done(&m);
+    }
+}
+
+/// ★(0.14.56 · P1 D9 pre-CR · design r3 §5-7, §12 T-W4) W-6: a channel envelope into the master gets the claim check.
+#[cfg(test)]
+mod d9_writer_guard_tests {
+    use super::*;
+    use crate::agent_queue_tests::{d9_received, d9_role_recorder, d9_with_write_ahead, fx, wait_until};
+
+    fn refused(daemon: &Arc<Daemon>) -> Vec<serde_json::Value> {
+        daemon.bus.tail(400).into_iter().filter(|e| e["name"] == "channel.message.write_refused").collect()
+    }
+
+    /// T-W4 / W-6: a write lands between the envelope's hand-off and its claim -> the claim refuses, 0 bytes of the envelope,
+    /// and the row settles through its own zero-byte path (`channel.message.write_refused`, reason `guard_aborted`; the row
+    /// goes back for the next sweep). With no foreign write the envelope's bytes are the pin's exactly. Mutant: the envelope
+    /// keeps `guard: None`.
+    #[test]
+    #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+    fn d9_pre_cr_t_w4_channel_envelope_refused_at_claim_writes_nothing() {
+        let f = fx("d9-tw4-chan");
+        let (s, out) = d9_role_recorder(&f.daemon, &f.dir, "tw4-chan", "master");
+        let handed = d9_with_write_ahead(&s, || inject_master_confirmed(&f.daemon, &s, "[channel] tw4", 7, InboxHandoff::New, crate::governance::D9WriterGuard::for_target(&f.daemon, &s)));
+        assert!(handed.is_some(), "premise: handed off");
+        // The discriminating assertion first (a written envelope follows the write ahead at once), then its settlement.
+        assert_eq!(d9_received(&out, 1), b"T".to_vec(), "0 bytes of the envelope - only the write ahead");
+        wait_until("the envelope settled", || !refused(&f.daemon).is_empty());
+        let r = refused(&f.daemon);
+        assert_eq!(r.len(), 1, "{r:?}");
+        assert_eq!(r[0]["payload"]["reason"], serde_json::json!("guard_aborted"), "{r:?}");
+        assert_eq!(r[0]["payload"]["inbox_id"], serde_json::json!(7), "{r:?}");
+        // No foreign write: the pin's bytes.
+        assert!(inject_master_confirmed(&f.daemon, &s, "[channel] tw4b", 8, InboxHandoff::New, crate::governance::D9WriterGuard::for_target(&f.daemon, &s)).is_some());
+        let mut want = b"T".to_vec();
+        want.extend(crate::agent_write::Plan::paste("[channel] tw4b").with_submit(500, 0).planned_bytes());
+        let got = d9_received(&out, want.len());
+        let _ = s.child.lock().unwrap().kill();
+        assert_eq!(got, want, "the pin's bytes after the refused envelope");
+        assert_eq!(refused(&f.daemon).len(), 1, "the second envelope was refused");
     }
 }

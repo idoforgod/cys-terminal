@@ -2083,6 +2083,9 @@ fn deliver_push_with(
         //     스스로 비우지 않아, 우회하면 푸는 주체 없이 heartbeat·wakeup 이 무기한 침묵한다.
         //   · fresh 잡은 pause 재확인과 기존 모달만 본다(새 축 없음 · 회수 타이머 의미 무변경).
         //   노브(`CYS_MACHINE_INJECT_HOLD` 에서 schedule 제외)면 종전 U8 P1 과 byte-identical 이다(상한 100 · TTL 없음).
+        // ★(0.14.56 · P1 D9 §5-7 · D3-BOUND r2 §1.2) the claim guard and its baseline S0, BEFORE the judgment; handed to
+        //   `inject_on` (its one production caller is below).
+        let d9 = crate::governance::D9WriterGuard::for_target(daemon, &surface);
         if crate::governance::machine_hold_enabled(crate::governance::MachineInjector::Schedule) {
             use crate::governance::MachineHold as H;
             let hold = crate::governance::machine_direct_hold(daemon, &surface, schedule_hold_axes(job.fresh));
@@ -2135,7 +2138,7 @@ fn deliver_push_with(
                 crate::alert_route::RoleGuard::Prefix(p) => (p.to_string(), true),
             }),
         };
-        *handed = Some(inject_on(daemon, &surface, text, Some(origin))?);
+        *handed = Some(inject_on(daemon, &surface, text, Some(origin), d9)?);
         return Ok("pushed");
     }
     enqueue_schedule_push(daemon, job, sid, text, role_guard, SCHEDULE_QUEUE_CAP, None).map(|_| "queued")
@@ -2534,6 +2537,7 @@ fn inject_on(
     surface: &Arc<crate::state::Surface>,
     text: &str,
     origin: Option<PushOrigin>,
+    d9: Option<crate::governance::D9WriterGuard>,
 ) -> Result<PushHandle, String> {
     let sid = surface.id;
     // ★(0.14.42 · 설계 C D3) 잡 문안은 사용자 입력이다 — 원장 선기록 앞에서 살균해 원장과 주입 본문을 맞춘다
@@ -2583,7 +2587,7 @@ fn inject_on(
         journal: Some(journal),
         resume: None,
         settle: Some(Box::new(move |t: &crate::agent_write::Terminal| settle.run(t))),
-        guard: None,      // 스케줄 push 는 큐를 우회한다(§8) — 가드 대상 아님
+        guard: d9.as_ref().map(|g| g.guard()), // ★(0.14.56 · P1 D9 §5-7) in D9 scope the claim check; outside it none (the pin)
         note_body: true,  // the old Inject arm recorded every pushed body (owner None)
         body_owner: None,
     };
@@ -3176,7 +3180,7 @@ mod tests {
             .expect("surface");
         daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
         let raw = "[wakeup] 착수\x1b[201~\n탈출 명령";
-        inject_on(&daemon, &s, raw, None).expect("주입 인계");
+        inject_on(&daemon, &s, raw, None, None).expect("주입 인계");
         let _ = s.child.lock().unwrap().kill();
         let clean = cys::paste_fence::sanitize(raw).into_owned();
         assert_ne!(clean, raw, "전제: 원문에 표지가 있다");
@@ -6374,7 +6378,7 @@ mod c8_push_counts_submit_tests {
         let pusher = std::thread::spawn(move || {
             // 원장 선기록은 스레드 로컬 격리 상태 디렉터리를 쓴다 — 이 스레드도 새 격리를 쥔다.
             crate::delivery::tests::isolate_state_dir_for_thread("c8-gate-wait-pusher");
-            inject_on(&d2, &s2, "[heartbeat] 게이트 대기", None)
+            inject_on(&d2, &s2, "[heartbeat] 게이트 대기", None, None)
         });
         std::thread::sleep(std::time::Duration::from_millis(400));
         assert!(!pusher.is_finished(), "게이트를 쥔 동안 push 가 지나갔다 — 인계·계상이 임계영역 밖이다");
@@ -6450,7 +6454,7 @@ mod c8_push_counts_submit_tests {
         // 호출부: 판정(H0) 뒤에 인계 · 이벤트는 정산이 낸다.
         let dp = func("\nfn deliver_push_with(");
         assert!(
-            dp.find("machine_direct_hold(").expect("H0 판정") < dp.find("inject_on(daemon, &surface, text, Some(origin))?").expect("인계 호출"),
+            dp.find("machine_direct_hold(").expect("H0 판정") < dp.find("inject_on(daemon, &surface, text, Some(origin), d9)?").expect("인계 호출"),
             "판정이 인계 뒤로 갔다"
         );
         assert!(!dp.contains("note_push_cleared_pending("), "계상 이벤트가 인계 시점에 다시 났다");
@@ -7675,5 +7679,83 @@ mod s_a_push_tests {
         assert!(events(&d, "schedule.push_cleared_pending").is_empty());
         crate::agent_write::set_test_sync_settle(true);
         done(&s);
+    }
+}
+
+/// ★(0.14.56 · P1 D9 pre-CR · design r3 §5-7, §12 T-W4) W-8: the schedule push into a master/CEO seat gets the claim check.
+#[cfg(test)]
+mod d9_writer_guard_tests {
+    use super::tests::test_daemon;
+    use super::*;
+    use crate::agent_queue_tests::{d9_received, d9_role_recorder, d9_with_write_ahead, wait_until};
+
+    /// T-W4 / W-8: a write lands between the push's hand-off and its claim -> the claim refuses, 0 bytes of the push, and the
+    /// push settles through its own zero-byte path (`schedule.push_refused`, reason `guard_aborted`; no job -> not diverted).
+    /// With no foreign write the push's bytes are the pin's exactly. Mutant: the push keeps `guard: None`.
+    #[test]
+    #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+    fn d9_pre_cr_t_w4_schedule_push_refused_at_claim_writes_nothing() {
+        crate::delivery::tests::isolate_state_dir_for_thread("d9-tw4-sched");
+        let daemon = test_daemon();
+        let dir = daemon.socket_path.parent().expect("daemon dir").to_path_buf();
+        let (s, out) = d9_role_recorder(&daemon, &dir, "tw4-sched", "master");
+        let h = d9_with_write_ahead(&s, || inject_on(&daemon, &s, "[wakeup] tw4", None, crate::governance::D9WriterGuard::for_target(&daemon, &s)).expect("handed off"));
+        wait_until("the push settled", || h.outcome.lock().unwrap().is_some());
+        assert_eq!(d9_received(&out, 1), b"T".to_vec(), "0 bytes of the push - only the write ahead");
+        let got = h.outcome.lock().unwrap().clone();
+        assert!(matches!(&got, Some(PushOutcome::Refused(r)) if r.starts_with("guard_aborted")), "{got:?}");
+        let refused: Vec<_> = daemon.bus.tail(400).into_iter().filter(|e| e["name"] == "schedule.push_refused").collect();
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(refused[0]["payload"]["reason"], serde_json::json!("guard_aborted"), "{refused:?}");
+        // No foreign write: the pin's bytes, written and submitted.
+        let h2 = inject_on(&daemon, &s, "[wakeup] tw4b", None, crate::governance::D9WriterGuard::for_target(&daemon, &s)).expect("handed off");
+        wait_until("the second push settled", || h2.outcome.lock().unwrap().is_some());
+        let mut want = b"T".to_vec();
+        want.extend(crate::agent_write::Plan::paste("[wakeup] tw4b").with_submit(500, 0).planned_bytes());
+        let got_bytes = d9_received(&out, want.len());
+        let _ = s.child.lock().unwrap().kill();
+        assert_eq!(got_bytes, want, "the pin's bytes after the refused push");
+        assert_eq!(h2.outcome.lock().unwrap().clone(), Some(PushOutcome::Written));
+    }
+
+    /// T-S0 / W-8 (D3-BOUND r2 §1.5): S0 taken where `deliver_push_with` takes it (before its judgment - pinned in governance
+    /// h7), then a foreign write admitted after the push's ledger pre-record and FINISHED before its hand-off -> the claim
+    /// refuses: 0 bytes of the push, outcome `guard_aborted`.
+    #[test]
+    #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+    fn d9_bound_t_s0_schedule_push_refused_after_a_write_finished_inside_the_window() {
+        crate::delivery::tests::isolate_state_dir_for_thread("d9-ts0-sched");
+        let daemon = test_daemon();
+        let dir = daemon.socket_path.parent().expect("daemon dir").to_path_buf();
+        let (s, out) = d9_role_recorder(&daemon, &dir, "ts0-sched", "master");
+        let d9 = crate::governance::D9WriterGuard::for_target(&daemon, &s);
+        crate::agent_queue_tests::d9_s0_foreign_write_after_pre_record(&s, b"F");
+        let h = inject_on(&daemon, &s, "[wakeup] ts0", None, d9).expect("handed off");
+        wait_until("the push settled", || h.outcome.lock().unwrap().is_some());
+        let _ = s.child.lock().unwrap().kill();
+        assert_eq!(d9_received(&out, 1), b"F".to_vec(), "0 bytes of the push - only the foreign write");
+        let got = h.outcome.lock().unwrap().clone();
+        assert!(matches!(&got, Some(PushOutcome::Refused(r)) if r.starts_with("guard_aborted")), "{got:?}");
+    }
+
+    /// T-W4 scope control: the same write ahead on a schedule push into a role-less agent seat (outside D9 scope) - no guard,
+    /// as at the pin: the push is written after the foreign write. Mutant: guard every target.
+    #[test]
+    #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+    fn d9_pre_cr_t_w4c_outside_d9_scope_the_push_has_no_guard() {
+        crate::delivery::tests::isolate_state_dir_for_thread("d9-tw4c-sched");
+        let daemon = test_daemon();
+        let dir = daemon.socket_path.parent().expect("daemon dir").to_path_buf();
+        let (s, out) = d9_role_recorder(&daemon, &dir, "tw4c-sched", "master");
+        daemon.roles.lock().unwrap().remove("master");
+        assert!(!crate::governance::d9_scope(&daemon, &s, false), "premise: outside D9 scope");
+        let h = d9_with_write_ahead(&s, || inject_on(&daemon, &s, "[wakeup] tw4c", None, crate::governance::D9WriterGuard::for_target(&daemon, &s)).expect("handed off"));
+        let mut want = b"T".to_vec();
+        want.extend(crate::agent_write::Plan::paste("[wakeup] tw4c").with_submit(500, 0).planned_bytes());
+        let got = d9_received(&out, want.len());
+        wait_until("the push settled", || h.outcome.lock().unwrap().is_some());
+        let _ = s.child.lock().unwrap().kill();
+        assert_eq!(got, want, "the pin: written after the foreign write");
+        assert_eq!(h.outcome.lock().unwrap().clone(), Some(PushOutcome::Written));
     }
 }

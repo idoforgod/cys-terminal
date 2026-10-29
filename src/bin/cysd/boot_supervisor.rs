@@ -2049,7 +2049,14 @@ fn pane_hold_is_transient(h: crate::governance::MachineHold) -> bool {
 /// ([`NoticeSettle`]) reports what was written: a late notice announces `pane_notice_delivered_late` only after its Return;
 /// zero bytes or a part-way stop -> `pane_notice_skipped` (no retry and no notice about the refusal - design 4.3; the
 /// `bootstrap-fail` feed entry written before any pane write stays the floor; boot never waits for this write).
-fn pane_notice_line(daemon: &Arc<Daemon>, s: &Arc<crate::state::Surface>, text: String, ctx: NoticeCtx) {
+/// ★(0.14.56 · D3-BOUND r2 §1.2) `d9` is built by the caller BEFORE its `pane_notice_hold` judgment (S0 there).
+fn pane_notice_line(
+    daemon: &Arc<Daemon>,
+    s: &Arc<crate::state::Surface>,
+    text: String,
+    ctx: NoticeCtx,
+    d9: Option<crate::governance::D9WriterGuard>,
+) {
     crate::delivery::record_audited(daemon, s.id, &text, crate::delivery::Origin::Supervisor, None);
     let request = crate::agent_write::Request::new(
         crate::agent_write::new_request_id((daemon.started_at * 1000.0) as u64),
@@ -2067,7 +2074,7 @@ fn pane_notice_line(daemon: &Arc<Daemon>, s: &Arc<crate::state::Surface>, text: 
         journal: Some(daemon.agent_journal()),
         resume: None,
         settle: Some(Box::new(move |t: &crate::agent_write::Terminal| settle.run(t))),
-        guard: None, // 큐 배달 아님 — 인계 가드 없음(종전 동작)
+        guard: d9.as_ref().map(|g| g.guard()), // ★(0.14.56 · P1 D9 §5-7) in D9 scope the claim check; outside it none (the pin)
         note_body: true, // the old Inject arm recorded every notice body (owner None)
         body_owner: None,
     };
@@ -2140,12 +2147,14 @@ fn retry_deferred_pane_notices(daemon: &Arc<Daemon>, st: &mut SupState, pane_bud
             );
             continue;
         };
+        // ★(0.14.56 · D3-BOUND r2 §1.2) the claim guard (S0) before the judgment.
+        let d9 = crate::governance::D9WriterGuard::for_target(daemon, &s);
         match pane_notice_hold(daemon, &s) {
             None if *pane_budget > 0 => {
                 *pane_budget -= 1;
                 // ★(0.14.52 · S-a C6c) `pane_notice_delivered_late` now comes from the settlement, after the written Return.
                 let ctx = NoticeCtx { intent: d.intent.clone(), why: d.why.clone(), late: true };
-                pane_notice_line(daemon, &s, d.text, ctx);
+                pane_notice_line(daemon, &s, d.text, ctx, d9);
             }
             None => st.deferred_pane.push(d),
             Some(h) if pane_hold_is_transient(h) && now < d.until => st.deferred_pane.push(d),
@@ -2227,6 +2236,8 @@ fn notify_no_spawn(
                 //   ★(0.14.42 · R3SH-3) 순간 축(사람 입력 30s · quiescing · pause)은 **생략하지 않고 미룬다** — 인텐트 래치가
                 //   이미 서 있어 여기서 버리면 영구 소실이다(선언 프롬프트 직후의 즉시 실패는 사람 입력 창과 겹치기 쉽다).
                 //   다음 틱들이 [`retry_deferred_pane_notices`] 로 다시 본다(유계 · 수명 10분). 모달·초안은 종전대로 생략.
+                // ★(0.14.56 · D3-BOUND r2 §1.2) the claim guard (S0) before the judgment.
+                let d9 = crate::governance::D9WriterGuard::for_target(daemon, &s);
                 if let Some(h) = pane_notice_hold(daemon, &s) {
                     if pane_hold_is_transient(h) && st.deferred_pane.len() < MAX_DEFERRED_PANE_NOTICES {
                         st.deferred_pane.push(DeferredPaneNotice {
@@ -2257,7 +2268,7 @@ fn notify_no_spawn(
                     return;
                 }
                 let ctx = NoticeCtx { intent: it.id.clone(), why: why.to_string(), late: false };
-                pane_notice_line(daemon, &s, text, ctx);
+                pane_notice_line(daemon, &s, text, ctx, d9);
             }
         }
     }
@@ -6318,5 +6329,64 @@ mod tests {
         assert_eq!(s.inject_track.last_body().map(|b| b.norm.contains("cys-supervisor")), Some(true), "notice not written");
         assert!(h5_skipped(&d).iter().all(|e| e["payload"]["intent"] != "c6c-late-w"));
         let _ = s.child.lock().unwrap().kill();
+    }
+}
+
+/// ★(0.14.56 · P1 D9 pre-CR · design r3 §5-7, §12 T-W4) W-7: a supervisor pane notice into a master/CEO seat gets the claim check.
+#[cfg(test)]
+mod d9_writer_guard_tests {
+    use super::*;
+    use crate::agent_queue_tests::{d9_received, d9_role_recorder, d9_with_write_ahead, fx};
+
+    fn skipped(daemon: &Arc<Daemon>) -> Vec<serde_json::Value> {
+        daemon.bus.tail(400).into_iter().filter(|e| e["name"] == "boot_supervisor.pane_notice_skipped").collect()
+    }
+
+    /// T-W4 / W-7: a write lands between the notice's hand-off and its claim -> the claim refuses, 0 bytes of the notice, and
+    /// the notice settles through its own zero-byte path (`pane_notice_skipped`, reason `refused_no_write:guard_aborted`, no
+    /// retry). With no foreign write the notice's bytes are the pin's exactly. Mutant: the notice keeps `guard: None`.
+    #[test]
+    #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+    fn d9_pre_cr_t_w4_boot_notice_refused_at_claim_writes_nothing() {
+        let f = fx("d9-tw4-boot");
+        let (s, out) = d9_role_recorder(&f.daemon, &f.dir, "tw4-boot", "master");
+        let ctx = || NoticeCtx { intent: "tw4".into(), why: "test".into(), late: false };
+        d9_with_write_ahead(&s, || pane_notice_line(&f.daemon, &s, "[boot] tw4".into(), ctx(), crate::governance::D9WriterGuard::for_target(&f.daemon, &s)));
+        // The discriminating assertion first (a written notice follows the write ahead at once), then its settlement.
+        assert_eq!(d9_received(&out, 1), b"T".to_vec(), "0 bytes of the notice - only the write ahead");
+        crate::agent_queue_tests::wait_until("the notice settled", || !skipped(&f.daemon).is_empty());
+        let sk = skipped(&f.daemon);
+        assert_eq!(sk.len(), 1, "{sk:?}");
+        assert_eq!(sk[0]["payload"]["reason"], serde_json::json!("refused_no_write:guard_aborted"), "{sk:?}");
+        // No foreign write: the pin's bytes.
+        pane_notice_line(&f.daemon, &s, "[boot] tw4b".into(), ctx(), crate::governance::D9WriterGuard::for_target(&f.daemon, &s));
+        let mut want = b"T".to_vec();
+        want.extend(crate::agent_write::Plan::paste("[boot] tw4b").with_submit(120, 0).planned_bytes());
+        let got = d9_received(&out, want.len());
+        let _ = s.child.lock().unwrap().kill();
+        assert_eq!(got, want, "the pin's bytes after the refused notice");
+        assert_eq!(skipped(&f.daemon).len(), 1, "the second notice was skipped");
+    }
+
+    /// T-S0 / W-7 (D3-BOUND r2 §1.5): S0 taken where the callers take it (before `pane_notice_hold` - pinned in governance h7),
+    /// then a foreign write admitted after the notice's ledger pre-record and FINISHED before its hand-off -> the claim refuses:
+    /// 0 bytes of the notice, `pane_notice_skipped` reason `refused_no_write:guard_aborted`.
+    #[test]
+    #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+    fn d9_bound_t_s0_boot_notice_refused_after_a_write_finished_inside_the_window() {
+        let f = fx("d9-ts0-boot");
+        let (s, out) = d9_role_recorder(&f.daemon, &f.dir, "ts0-boot", "master");
+        let ctx = NoticeCtx { intent: "ts0".into(), why: "test".into(), late: false };
+        let d9 = crate::governance::D9WriterGuard::for_target(&f.daemon, &s);
+        crate::agent_queue_tests::d9_s0_foreign_write_after_pre_record(&s, b"F");
+        pane_notice_line(&f.daemon, &s, "[boot] ts0".into(), ctx, d9);
+        // The discriminating assertion first (once the writer is idle the notice is written or refused), then its settlement.
+        crate::agent_queue_tests::wait_until("the writer is idle", || s.write_tx.gate().pending() == 0);
+        let _ = s.child.lock().unwrap().kill();
+        assert_eq!(std::fs::read(&out).unwrap(), b"F".to_vec(), "0 bytes of the notice - only the foreign write");
+        crate::agent_queue_tests::wait_until("the notice settled", || !skipped(&f.daemon).is_empty());
+        let sk = skipped(&f.daemon);
+        assert_eq!(sk.len(), 1, "{sk:?}");
+        assert_eq!(sk[0]["payload"]["reason"], serde_json::json!("refused_no_write:guard_aborted"), "{sk:?}");
     }
 }

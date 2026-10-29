@@ -5144,6 +5144,9 @@ fn deliver_to_ceo(
     if !is_agent || seat == crate::governance::SeatState::Empty {
         return CeoDelivery::SeatEmpty;
     }
+    // ★(0.14.56 · P1 D9 §5-7 · D3-BOUND r2 §1.2) the claim guard and its baseline S0, BEFORE this push's judgments (typing guard,
+    //   machine_direct_hold) and its ledger pre-record.
+    let d9 = crate::governance::D9WriterGuard::for_target(daemon, &surface);
     // typing 가드: 사람이 방금 CEO 좌석에 입력 중이면 주입 보류 → escalation로 degrade.
     let guard = typing_guard_secs();
     if guard > 0
@@ -5213,7 +5216,7 @@ fn deliver_to_ceo(
         journal: Some(daemon.agent_journal()),
         resume: None,
         settle: Some(Box::new(move |t: &crate::agent_write::Terminal| settle.run(t))),
-        guard: None, // 큐 배달 아님 — 인계 가드 없음(종전 동작)
+        guard: d9.as_ref().map(|g| g.guard()), // ★(0.14.56 · P1 D9 §5-7) in D9 scope the claim check; outside it none (the pin)
         note_body: true, // the old Inject arm recorded every routed body (owner None)
         body_owner: None,
     };
@@ -33300,3 +33303,88 @@ mod tests {
 #[cfg(test)]
 #[path = "pty_allocator_busy_tests.rs"]
 mod pty_allocator_busy_tests;
+
+/// ★(0.14.56 · P1 D9 pre-CR · design r3 §5-7, §12 T-W4) W-5: the approval request pushed into the CEO seat gets the claim check.
+#[cfg(test)]
+mod d9_writer_guard_tests {
+    use super::*;
+    use crate::agent_queue_tests::{d9_received, d9_role_recorder, d9_with_write_ahead, fx, wait_until};
+
+    fn item(id: &str) -> crate::state::FeedItem {
+        crate::state::FeedItem {
+            request_id: id.into(),
+            kind: "approval".into(),
+            title: "t".into(),
+            body: "b".into(),
+            surface_id: Some(7),
+            status: "pending".into(),
+            decision: None,
+            created_at: crate::state::now_epoch(),
+            resolved_at: None,
+            tier: None,
+            publisher_pid: None,
+            publisher_pgid: None,
+            publisher_surface: Some(7),
+            risk_class: Some("auto".into()),
+            auto_route: true,
+            resolver_surface: None,
+            resolver_pid: None,
+        }
+    }
+
+    fn stalled(daemon: &Arc<Daemon>) -> Vec<Value> {
+        daemon.bus.tail(400).into_iter().filter(|e| e["name"] == "approval.stalled").collect()
+    }
+
+    /// T-W4 / W-5: a write lands between the CEO push's hand-off and its claim -> the claim refuses, 0 bytes of the push, and
+    /// the item settles through its own zero-byte path (the escalation `approval.stalled`, reason `ceo_write_refused`). With no
+    /// foreign write the push's bytes are the pin's exactly. Mutant: the push keeps `guard: None`.
+    #[test]
+    #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+    fn d9_pre_cr_t_w4_ceo_push_refused_at_claim_writes_nothing() {
+        let f = fx("d9-tw4-ceo");
+        let (s, out) = d9_role_recorder(&f.daemon, &f.dir, "tw4-ceo", "ceo");
+        s.seat_cache.store(1, Ordering::Relaxed); // not Empty (the CEO push's own seat check)
+        let first = item("d9tw4a");
+        let r = d9_with_write_ahead(&s, || deliver_to_ceo(&f.daemon, &first, false));
+        assert!(matches!(r, CeoDelivery::Handed), "premise: handed off");
+        // The discriminating assertion first (a written push follows the write ahead at once), then its settlement.
+        assert_eq!(d9_received(&out, 1), b"T".to_vec(), "0 bytes of the push - only the write ahead");
+        wait_until("the push settled", || !stalled(&f.daemon).is_empty());
+        let st = stalled(&f.daemon);
+        assert_eq!(st.len(), 1, "{st:?}");
+        assert_eq!(st[0]["payload"]["reason"], json!("ceo_write_refused"), "{st:?}");
+        assert_eq!(st[0]["payload"]["request_id"], json!("d9tw4a"), "{st:?}");
+        // No foreign write: the pin's bytes.
+        let second = item("d9tw4b");
+        assert!(matches!(deliver_to_ceo(&f.daemon, &second, false), CeoDelivery::Handed));
+        let text = cys::paste_fence::sanitize_owned(build_ceo_injection(&second, false));
+        let mut want = b"T".to_vec();
+        want.extend(crate::agent_write::Plan::paste(&text).with_submit(500, 0).planned_bytes());
+        let got = d9_received(&out, want.len());
+        let _ = s.child.lock().unwrap().kill();
+        assert_eq!(got, want, "the pin's bytes after the refused push");
+        assert_eq!(stalled(&f.daemon).len(), 1, "the second push escalated");
+    }
+
+    /// T-S0 / W-5 (D3-BOUND r2 §1.5): a foreign write admitted after the push's judgments and ledger pre-record and FINISHED
+    /// before its hand-off -> the claim refuses against S0 (read before the judgments): 0 bytes of the push, `approval.stalled`
+    /// reason `ceo_write_refused`. On the D3 bytes the stamp was taken after that window (the RED).
+    #[test]
+    #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+    fn d9_bound_t_s0_ceo_push_refused_after_a_write_finished_inside_the_window() {
+        let f = fx("d9-ts0-ceo");
+        let (s, out) = d9_role_recorder(&f.daemon, &f.dir, "ts0-ceo", "ceo");
+        s.seat_cache.store(1, Ordering::Relaxed); // not Empty (the CEO push's own seat check)
+        crate::agent_queue_tests::d9_s0_foreign_write_after_pre_record(&s, b"F");
+        assert!(matches!(deliver_to_ceo(&f.daemon, &item("d9ts0"), false), CeoDelivery::Handed), "premise: handed off");
+        // The discriminating assertion first (once the writer is idle the push is written or refused), then its settlement.
+        wait_until("the writer is idle", || s.write_tx.gate().pending() == 0);
+        let _ = s.child.lock().unwrap().kill();
+        assert_eq!(std::fs::read(&out).unwrap(), b"F".to_vec(), "0 bytes of the push - only the foreign write");
+        wait_until("the push settled", || !stalled(&f.daemon).is_empty());
+        let st = stalled(&f.daemon);
+        assert_eq!(st.len(), 1, "{st:?}");
+        assert_eq!(st[0]["payload"]["reason"], json!("ceo_write_refused"), "{st:?}");
+    }
+}

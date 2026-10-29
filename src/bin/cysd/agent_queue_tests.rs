@@ -17,9 +17,9 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-struct Fx {
-    daemon: Arc<Daemon>,
-    dir: std::path::PathBuf,
+pub(crate) struct Fx {
+    pub(crate) daemon: Arc<Daemon>,
+    pub(crate) dir: std::path::PathBuf,
     _g: MutexGuard<'static, ()>,
 }
 
@@ -31,7 +31,7 @@ impl Drop for Fx {
     }
 }
 
-fn fx(tag: &str) -> Fx {
+pub(crate) fn fx(tag: &str) -> Fx {
     // CYS_PACK_DIR is process-global: same lock as the governance queue and handlers ACL specimens.
     let g = crate::governance::PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     crate::delivery::tests::isolate_state_dir_for_thread(tag);
@@ -78,7 +78,7 @@ fn hold_kind(s: &Arc<Surface>) -> Option<QueueHoldKind> {
 }
 
 /// Bounded wait until `cond` holds (10 s).
-fn wait_until(what: &str, cond: impl Fn() -> bool) {
+pub(crate) fn wait_until(what: &str, cond: impl Fn() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !cond() {
         assert!(Instant::now() < deadline, "not within 10 s: {what}");
@@ -1417,6 +1417,74 @@ fn d9_pre_cr_t_w2_a_human_key_inside_the_r1_window_refuses_the_claim() {
     let _ = s.child.lock().unwrap().kill();
 }
 
+/// Arms the pre-record seam (`agent_write::set_test_after_pre_record`, D3-BOUND r2 §1.5) to admit one foreign `Data` write on `s`
+/// and wait until it has FINISHED (the gate is idle again) before the producer continues to its hand-off.
+pub(crate) fn d9_s0_foreign_write_after_pre_record(s: &Arc<Surface>, bytes: &'static [u8]) {
+    let s = s.clone();
+    crate::agent_write::set_test_after_pre_record(move |_| {
+        s.write_tx.send(crate::state::WriteReq::Data(bytes.to_vec())).unwrap();
+        wait_until("the foreign write finished inside the window", || s.write_tx.gate().pending() == 0);
+    });
+}
+
+/// T-S0 (D3-BOUND r2 §1.5, F1): a foreign `Data` write admitted AFTER the queue's judgment and ledger pre-record and FINISHED
+/// before the hand-off. The claim baseline is S0, read before the judgment, so the finished write is seen: the claim refuses
+/// (`foreign` = ["wrote"]), 0 bytes of the job, the item stays at the head; the next attempt delivers it once. On the D3 bytes
+/// the baseline was read after that window and the job was written over the foreign write (the RED). Mutant MS1: base from the
+/// late counters.
+#[test]
+#[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+fn d9_bound_t_s0_a_write_finished_between_judgment_and_hand_off_refuses_the_claim() {
+    let fx = fx("d9-ts0");
+    let (s, out) = d9_master_recorder(&fx, "ts0");
+    let id = enqueue(&fx, &s, "[보고] ts0");
+    let w0 = s.inject_track.wrote();
+    d9_s0_foreign_write_after_pre_record(&s, b"F");
+    let handed = hand_off(&fx, &s);
+    wait_until("the writer is idle", || s.write_tx.gate().pending() == 0);
+    // The discriminating assertions first (a written job also moves `wrote`), then the premise.
+    assert!(!handed, "the claim after a write finished between the judgment and the hand-off must be refused");
+    assert_eq!(std::fs::read(&out).unwrap(), b"F".to_vec(), "0 bytes of the job - only the foreign write");
+    assert_eq!(s.inject_track.wrote(), w0 + 1, "premise: the foreign write was counted inside the window");
+    assert_eq!(s.pending_queue.lock().unwrap().front().map(|e| e.id.clone()), Some(id.clone()), "the item stays at the head");
+    let ab = aborted(&fx, &s);
+    assert_eq!(ab.len(), 1, "{ab:?}");
+    assert_eq!(ab[0]["payload"]["foreign"], serde_json::json!(["wrote"]), "only the write count moved: {ab:?}");
+    // Next attempt (no seam): delivered once, after the foreign bytes.
+    assert!(hand_off(&fx, &s), "the next attempt hands off");
+    wait_until("delivered", || queue_len(&s) == 0);
+    let mut want = b"F".to_vec();
+    want.extend(queue_bytes("[보고] ts0"));
+    wait_until("receiver got the job", || std::fs::metadata(&out).map(|m| m.len() as usize).unwrap_or(0) >= want.len());
+    let _ = s.child.lock().unwrap().kill();
+    assert_eq!(std::fs::read(&out).unwrap(), want, "the job's bytes once, after the foreign write");
+}
+
+/// T-S0h (D3-BOUND r2 §1.5): as T-S0, but the window carries a human key time (`last_human_input` set, nothing written) -> the
+/// claim refuses naming `last_human_input` only, 0 bytes of the job.
+#[test]
+#[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+fn d9_bound_t_s0h_a_human_key_time_between_judgment_and_hand_off_refuses_the_claim() {
+    let fx = fx("d9-ts0h");
+    let (s, out) = d9_master_recorder(&fx, "ts0h");
+    let id = enqueue(&fx, &s, "[보고] ts0h");
+    {
+        let s = s.clone();
+        crate::agent_write::set_test_after_pre_record(move |_| {
+            *s.last_human_input.lock().unwrap() = Some(Instant::now());
+        });
+    }
+    let handed = hand_off(&fx, &s);
+    wait_until("the writer is idle", || s.write_tx.gate().pending() == 0);
+    assert!(!handed, "the claim after a human key time set between the judgment and the hand-off must be refused");
+    assert_eq!(std::fs::read(&out).unwrap(), Vec::<u8>::new(), "0 bytes of the job");
+    assert_eq!(s.pending_queue.lock().unwrap().front().map(|e| e.id.clone()), Some(id), "the item stays at the head");
+    let ab = aborted(&fx, &s);
+    assert_eq!(ab.len(), 1, "{ab:?}");
+    assert_eq!(ab[0]["payload"]["foreign"], serde_json::json!(["last_human_input"]), "{ab:?}");
+    let _ = s.child.lock().unwrap().kill();
+}
+
 /// T-L1 (design r3 §6-3, premise specimen): a human byte received DURING the body -> CR settle of a master queue job reaches the
 /// receiver AFTER the job's own CR, and the job's body is submitted exactly (one writer job owns body, settle and CR; no other
 /// request is dequeued in between). The specimen asserts the byte was sent while the CR was still unwritten. Mutant: split the CR
@@ -1583,4 +1651,51 @@ fn d9_pre_cr_t_w3c_outside_d9_scope_the_queue_job_proof_is_unchanged() {
     assert_eq!(std::fs::read(&out).unwrap(), want, "the pin's bytes");
     wait_until("delivered", || queue_len(&s) == 0);
     let _ = s.child.lock().unwrap().kill();
+}
+
+// ── ★(0.14.56 · P1 D9 pre-CR · design r3 §5-7) Shared helpers for T-W4, whose specimens live beside each daemon-internal
+//   writer into master/CEO (W-5 handlers, W-6 channels, W-7 boot_supervisor, W-8 schedule - the producers are private). ──
+
+/// A recorder seat on `daemon` that holds `role` there and is an agent seat (D9 scope); its receiver proof always admits.
+pub(crate) fn d9_role_recorder(daemon: &Arc<Daemon>, dir: &std::path::Path, tag: &str, role: &str) -> (Arc<Surface>, std::path::PathBuf) {
+    let out = dir.join(format!("rx-{tag}.bin"));
+    let cmd = format!("stty raw -echo; exec cat > '{}'", out.display());
+    let s = daemon.create_surface(None, Some(cmd), None, None, 24, 200).expect("recorder seat");
+    daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+    wait_until("recorder ready", || out.exists());
+    std::thread::sleep(Duration::from_millis(300)); // stty applied before the first byte
+    daemon.roles.lock().unwrap().insert(role.into(), s.id);
+    *s.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+    *s.receiver_proof.lock().unwrap() = Some(Scripted::new(0, ProofLoss::AgentDead, None));
+    assert!(crate::governance::d9_scope(daemon, &s, false), "premise: the seat is in D9 scope");
+    (s, out)
+}
+
+/// Runs `call` (one daemon-internal hand-off into `s`) while a one-byte write `T` sits AHEAD of its job in the seat's writer:
+/// the writer is held inside a refusing zero-byte job until both are queued, so `T` is written between the call's hand-off
+/// and its claim. Returns once the writer has taken both.
+pub(crate) fn d9_with_write_ahead<R>(s: &Arc<Surface>, call: impl FnOnce() -> R) -> R {
+    let release = hold_writer(s);
+    s.write_tx.send(crate::state::WriteReq::Data(b"T".to_vec())).unwrap();
+    // Released only when the call's own job has joined the writer's queue (one more than with `T` alone) - the count's
+    // absolute value (whether the held job is in it) is not assumed.
+    let with_t = s.write_tx.gate().pending();
+    let releaser = {
+        let s = s.clone();
+        std::thread::spawn(move || {
+            wait_until("the call's job queued behind the write ahead", || s.write_tx.gate().pending() > with_t);
+            release.send(()).unwrap();
+        })
+    };
+    let r = call();
+    releaser.join().unwrap();
+    wait_until("the writer took both", || s.write_tx.gate().pending() == 0);
+    r
+}
+
+/// The receiver's bytes once it holds at least `n` (300 ms grace for anything more).
+pub(crate) fn d9_received(out: &std::path::Path, n: usize) -> Vec<u8> {
+    wait_until("the receiver's bytes", || std::fs::metadata(out).map(|m| m.len() as usize).unwrap_or(0) >= n);
+    std::thread::sleep(Duration::from_millis(300));
+    std::fs::read(out).unwrap()
 }
