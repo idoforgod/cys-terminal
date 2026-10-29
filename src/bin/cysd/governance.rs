@@ -29700,6 +29700,148 @@ after-tick liveness alone does not attribute a clock defect",
         let differ: Vec<(bool, usize)> = got_all.iter().filter(|(_, _, d, p)| d != p).map(|(a, i, _, _)| (*a, *i)).collect();
         assert_eq!(differ, vec![(true, 0), (false, 0)], "dim changes the verdict only on the D1 row pair:\n{}", table.join("\n"));
     }
+
+    // ===== ★(0.14.56 · P1 D9 reinject order · IMPL r1 m1, gemini-6) A5/A6 at the READER SITES, not only the pure helpers
+    //   (`d9_tests::d9_order_a5_*` / `d9_order_a6_*` stay): the merge planner's origin key in `deliver_head_locked`, the min-interval
+    //   head age in `deliver_head_locked`, the starve head in `deliver_queued`, and the head row of `queue_blocked_seats`. =====
+
+    fn d9r_seat(tag: &str) -> (Arc<Daemon>, Arc<crate::state::Surface>) {
+        let daemon = drill_daemon(tag);
+        let s = daemon.create_surface(None, Some("sleep 30".into()), None, None, 24, 80).expect("create surface");
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        (daemon, s)
+    }
+
+    fn d9r_auth(daemon: &Arc<Daemon>, text: &str, from: &str) -> crate::state::QueueEntry {
+        let mut e = daemon.next_queue_entry(text.into(), Some(from.into()), "send");
+        e.authoritative = true;
+        e
+    }
+
+    /// A5r (merge site, `deliver_head_locked`): an authoritative head and two same-from reports behind it -> the head is delivered
+    /// alone, then the two reports as one digest (the pin's merge, unchanged for ordinary entries). Mutant: the reader site takes
+    /// `e.origin.clone()` instead of `merge_origin_key` (the helper specimen A5 does not see the call site).
+    #[test]
+    fn d9_order_a5r_deliver_head_locked_sends_an_authoritative_head_alone() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("d9-a5r");
+        let _env = QueueEnvGuard::set(&[
+            ("CYS_PACK_DIR", pack.to_str().unwrap()),
+            ("CYS_QUEUE_MIN_INTERVAL_SECS", "0"),
+            ("CYS_QUEUE_DIGEST_MAX_ITEMS", "5"),
+            ("CYS_QUEUE_DIGEST_MAX_CHARS", "4000"),
+        ]);
+        let (daemon, s) = d9r_seat("d9-a5r");
+        let a = d9r_auth(&daemon, "[RESUME] a5r", "surface:9");
+        let r1 = daemon.next_queue_entry("[보고] r1".into(), Some("surface:9".into()), "send");
+        let r2 = daemon.next_queue_entry("[보고] r2".into(), Some("surface:9".into()), "send");
+        let ids = (a.id.clone(), r1.id.clone(), r2.id.clone());
+        s.pending_queue.lock().unwrap().extend([a, r1, r2]);
+        let mut got: Vec<Vec<String>> = Vec::new();
+        for _ in 0..200 {
+            if let Some(d) = deliver_head_locked(&daemon, &s, false, false, None, None, None, None) {
+                got.push(d.merged_ids.clone());
+            }
+            if s.pending_queue.lock().unwrap().is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let _ = s.child.lock().unwrap().kill();
+        assert_eq!(
+            got,
+            vec![vec![ids.0.clone()], vec![ids.1.clone(), ids.2.clone()]],
+            "the authoritative head goes alone, then the two same-from reports merge"
+        );
+    }
+
+    /// A6r (min-interval site, `deliver_head_locked`): the per-seat delivery interval relaxes by the age of the oldest blocked item
+    /// (§4 AGES), so an old report behind a fresh head-placed job relaxes it as the pin's front would have. Base 8 s, max wait 1 s,
+    /// last delivery 2.5 s ago: the old report's measured wait (>= 2 s, uptime clamp) halves the interval twice, to 2 s -> delivery (the
+    /// authoritative front). Control first: the fresh job alone keeps the 8 s interval -> nothing (wide margins: a stall would have to
+    /// last 5.5 s to flip the control). Mutant: the site reads `q.front()`.
+    #[test]
+    fn d9_order_a6r_min_interval_relaxes_on_the_old_report_behind_a_fresh_front() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("d9-a6r-int");
+        let _env = QueueEnvGuard::set(&[
+            ("CYS_PACK_DIR", pack.to_str().unwrap()),
+            ("CYS_QUEUE_MIN_INTERVAL_SECS", "8"),
+            ("CYS_QUEUE_MAX_WAIT_SECS", "1"),
+        ]);
+        let (daemon, s) = d9r_seat("d9-a6r-int");
+        std::thread::sleep(std::time::Duration::from_millis(2300)); // uptime clamp: an old entry's measured wait reaches 2 s
+        let a = d9r_auth(&daemon, "[RESUME] a6r", "surface:8");
+        let a_id = a.id.clone();
+        s.pending_queue.lock().unwrap().push_back(a);
+        let last = std::time::Instant::now() - std::time::Duration::from_millis(2500);
+        *s.last_queue_delivery_at.lock().unwrap() = Some(last);
+        let control = deliver_head_locked(&daemon, &s, true, false, None, None, None, None);
+        assert!(control.is_none(), "control: a fresh front alone keeps the 8 s interval");
+        let mut old = daemon.next_queue_entry("[보고] old".into(), Some("surface:9".into()), "send");
+        old.enqueued_at -= 700.0;
+        s.pending_queue.lock().unwrap().push_back(old);
+        let d = deliver_head_locked(&daemon, &s, true, false, None, None, None, None);
+        let _ = s.child.lock().unwrap().kill();
+        let d = d.expect("the old report behind the fresh front relaxes the interval to 2 s; 2.5 s have passed");
+        assert_eq!(d.entry.id, a_id, "the authoritative front is what goes");
+    }
+
+    /// A6r (starve site, `deliver_queued` -> `queue.starved`): a report blocked past the alert threshold behind a fresh head-placed job
+    /// still raises `queue.starved`, naming the report. Control first: the fresh job alone raises nothing (threshold 2 s: a stall would
+    /// have to last 2 s to flip the control). Mutant: the site reads `q.front()`.
+    #[test]
+    fn d9_order_a6r_queue_starved_names_the_old_report_behind_a_fresh_front() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = QueueEnvGuard::set(&[("CYS_QUEUE_MAX_WAIT_SECS", "0"), ("CYS_QUEUE_STARVE_ALERT_SECS", "2")]);
+        let (daemon, s) = d9r_seat("d9-a6r-starve");
+        std::thread::sleep(std::time::Duration::from_millis(2300)); // uptime clamp: an old entry's measured wait reaches 2 s
+        let starved = |daemon: &Arc<Daemon>| -> Vec<Value> {
+            daemon.bus.tail(100).into_iter().filter(|ev| ev["name"] == "queue.starved").collect()
+        };
+        s.pending_queue.lock().unwrap().push_back(d9r_auth(&daemon, "[RESUME] a6r", "surface:8"));
+        let (mut depth, mut starve) = (HashMap::new(), HashMap::new());
+        *s.last_output.lock().unwrap() = std::time::Instant::now(); // busy: nothing is delivered
+        deliver_queued(&daemon, &mut depth, &mut starve, &mut HashMap::new());
+        assert!(starved(&daemon).is_empty(), "control: a fresh front alone is not starved");
+        let mut old = daemon.next_queue_entry("[보고] old".into(), Some("surface:9".into()), "send");
+        old.enqueued_at -= 700.0;
+        let old_id = old.id.clone();
+        s.pending_queue.lock().unwrap().push_back(old);
+        *s.last_output.lock().unwrap() = std::time::Instant::now();
+        deliver_queued(&daemon, &mut depth, &mut starve, &mut HashMap::new());
+        let left = s.pending_queue.lock().unwrap().len(); // before the kill: an exiting seat's queue is moved
+        let _ = s.child.lock().unwrap().kill();
+        let ev = starved(&daemon);
+        assert_eq!(ev.len(), 1, "the old report behind the fresh front is starved: {ev:?}");
+        assert_eq!(ev[0]["payload"]["head_entry_id"], json!(old_id), "{ev:?}");
+        assert_eq!(left, 2, "busy: nothing delivered");
+    }
+
+    /// A6r (blocked-row site, `queue_blocked_seats` -> queue-blocked.json): the row's head is the old blocked report behind a fresh
+    /// head-placed job (id and enqueued_at), depth counts both. Mutant: the site reads `q.front()`.
+    #[test]
+    fn d9_order_a6r_blocked_file_names_the_old_report_behind_a_fresh_front() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, s) = d9r_seat("d9-a6r-file");
+        let mut old = daemon.next_queue_entry("[보고] old".into(), Some("surface:9".into()), "send");
+        old.enqueued_at -= 700.0;
+        let (old_id, old_at) = (old.id.clone(), old.enqueued_at);
+        {
+            let mut q = s.pending_queue.lock().unwrap();
+            q.push_back(old);
+            q.insert(0, d9r_auth(&daemon, "[RESUME] a6r", "surface:8"));
+        }
+        super::mark_queue_blocked(&s, BLOCKED_BUSY);
+        super::persist_queue_blocked_at(&daemon, std::time::Instant::now());
+        let _ = s.child.lock().unwrap().kill();
+        let v = c5_read_blocked_file(&daemon);
+        let rows = v["surfaces"].as_array().expect("surfaces");
+        assert_eq!(rows.len(), 1, "{v}");
+        assert_eq!(rows[0]["head_entry_id"], json!(old_id), "{v}");
+        assert_eq!(rows[0]["head_enqueued_at"].as_f64(), Some(old_at), "{v}");
+        assert_eq!(rows[0]["depth"], json!(2), "{v}");
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

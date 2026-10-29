@@ -1044,3 +1044,85 @@ fn d9_order_a2c_cycle_owner_needs_a_start_time_before_the_window() {
         assert_eq!(first, want_first, "{case}: {:?}", queue_texts(&m));
     }
 }
+
+/// A8 (head ruling 171d431a9879596a cond 6; addendum rev 1 §6/§8; IMPL r1 M1, gemini-6): the in-seat restore relaunch - the surface
+/// and its queue persist, and the relauncher (a live descendant of a registered restore root: `authoritative_caller_ok` arm 1(b), no
+/// pane) injects the directive while a report is queued. The directive goes first. The restore root here is this runner (its pid and
+/// its real start time, as `RestoreRootGuard` registers one). Control: the same caller with the restore window closed (no roots) ->
+/// tail, unmarked. Mutant: the head-placement gate drops arm 1(b) (`authoritative_caller_ok(.., None)` at the enqueue site).
+#[test]
+fn d9_order_a8_in_seat_restore_directive_goes_first() {
+    let me = std::process::id();
+    let started = crate::state::peer_start_time(me).expect("this runner's start time");
+    for (case, window) in [("restore_window", true), ("no_window", false)] {
+        let fx = fx(&format!("ord-a8-{case}"));
+        let m = master(&fx);
+        let _w = pane(&fx, "worker-1", P + 110);
+        queued_report(&fx, &m, P + 110, "[보고] r1");
+        if window {
+            fx.daemon.restore_roots.lock().unwrap().push((me, started));
+        }
+        assert_converted(&auth(&fx, Some(me), &m, "directive a8"));
+        let (texts, flags) = if window {
+            (vec!["directive a8", "[보고] r1"], vec![true, false])
+        } else {
+            (vec!["[보고] r1", "directive a8"], vec![false, false])
+        };
+        assert_eq!(queue_texts(&m), texts, "{case}");
+        assert_eq!(queue_auth_flags(&m), flags, "{case}");
+        fx.daemon.restore_roots.lock().unwrap().clear();
+    }
+}
+
+/// A9 (head ruling d8f5cad3c957c3ed "queue.order_inverted ... fix or pin"; IMPL r1 M1, gemini-6): a privileged pane (cso) has an
+/// older ordinary job and a newer head-placed authoritative job queued for the master, then sends DIRECT (`clear_first`: D9 does not
+/// apply). `queue.order_inverted` names the OLDER entry and its wait - not the head-placed job in front of it. Control: the same
+/// sender with only its head-placed job pending (ahead of a worker's report) - that job IS its oldest pending entry, so the event
+/// names it (the inversion is real: the direct send overtakes it). Mutant: back to `mine.first()` (queue order).
+#[test]
+fn d9_order_a9_order_inverted_names_the_oldest_entry_not_the_head_placed_one() {
+    for case in ["older_ordinary_behind", "only_head_placed"] {
+        let fx = fx(&format!("ord-a9-{case}"));
+        let m = master(&fx);
+        let _w = pane(&fx, "worker-1", P + 100);
+        let c = pane(&fx, "cso", P + 101);
+        if case == "older_ordinary_behind" {
+            assert_converted(&send(&fx, Some(P + 101), &m, "[알림] e0", json!({})));
+        } else {
+            queued_report(&fx, &m, P + 100, "[보고] w0");
+        }
+        assert_converted(&auth(&fx, Some(P + 101), &m, "[RESUME] e1"));
+        // Unambiguous ages: the head-placed e1 is 5 s old, the entry behind it 600 s.
+        let now = crate::state::now_epoch();
+        let (e1, behind) = {
+            let mut q = m.pending_queue.lock().unwrap();
+            assert_eq!(q.len(), 2, "{case}");
+            assert_eq!((q[0].text.as_str(), q[0].authoritative), ("[RESUME] e1", true), "{case}: e1 is head-placed");
+            q[0].enqueued_at = now - 5.0;
+            q[1].enqueued_at = now - 600.0;
+            (q[0].id.clone(), q[1].id.clone())
+        };
+        let r = send(&fx, Some(P + 101), &m, "/clear", json!({"clear_first": true, "authoritative": true}));
+        assert_eq!(r["ok"], json!(true), "{case}: the direct clear_first send goes through: {r}");
+        let ev: Vec<Value> = fx
+            .daemon
+            .bus
+            .tail(200)
+            .into_iter()
+            .filter(|ev| ev["name"] == json!("queue.order_inverted"))
+            .collect();
+        assert_eq!(ev.len(), 1, "{case}: {ev:?}");
+        let p = &ev[0]["payload"];
+        assert_eq!(p["from"], json!(cys::surface_ref(c.id)), "{case}");
+        let waited = p["oldest_waited_secs"].as_u64().expect("oldest_waited_secs");
+        if case == "older_ordinary_behind" {
+            assert_eq!(p["pending_from_same_sender"], json!(2), "{case}");
+            assert_eq!(p["oldest_queue_entry_id"], json!(behind), "{case}: the head-placed e1 ({e1}) is not the oldest: {p}");
+            assert!(waited >= 599, "{case}: the oldest entry's wait: {p}");
+        } else {
+            assert_eq!(p["pending_from_same_sender"], json!(1), "{case}");
+            assert_eq!(p["oldest_queue_entry_id"], json!(e1), "{case}: {p}");
+            assert!((4..=7).contains(&waited), "{case}: {p}");
+        }
+    }
+}

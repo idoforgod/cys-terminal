@@ -7420,7 +7420,12 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
                         _ => false,
                     })
                     .collect();
-                if let Some(oldest) = mine.first() {
+                // ★(0.14.56 · P1 D9 reinject order · IMPL r1 M1; head ruling d8f5cad3c957c3ed "order_inverted ... fix or pin") The
+                //   oldest = the earliest `enqueued_at`, not the first in queue order: a head-placed authoritative job sits in front of
+                //   the same sender's older entries (a cso/master pane's direct clear_first send reaches here). Ties keep queue order.
+                //   The count and the firing condition are unchanged - an authoritative job overtaken by a direct send is still an
+                //   inversion, so it is not excluded; it is named only when it is the oldest.
+                if let Some(oldest) = mine.iter().min_by(|a, b| a.enqueued_at.total_cmp(&b.enqueued_at)) {
                     let waited = (crate::state::now_epoch() - oldest.enqueued_at).max(0.0) as u64;
                     let payload = json!({
                         "surface_ref": cys::surface_ref(sid),
