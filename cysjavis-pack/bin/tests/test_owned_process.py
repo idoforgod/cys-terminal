@@ -13,6 +13,12 @@ import unittest
 
 BIN = Path(os.environ.get('C03_TEST_BIN', Path(__file__).resolve().parents[1]))
 PYTHON = sys.executable
+# M5 (backlog D5W-20261029-M5-SKILLSCAN-POOL-NT-SERIAL): on Windows a spawn-pool worker under a managed scanner dies at
+# start (WinError 5 in spawn_main, diagnostic run 1; d2be23fe windows-build step 8 #1-#3), so these reap tests have no worker
+# to reap there. The product falls back to a serial scan; never_ready and worker_dying guard that path natively, and the skip
+# is void for a run in which either of them is not fully green (head ruling C3).
+_M5_SKIP = ('M5 D5W-20261029-M5-SKILLSCAN-POOL-NT-SERIAL: the spawn-pool worker dies at start under a managed scanner on '
+            'Windows; nothing to reap, the scan falls back to serial')
 
 
 def load(name):
@@ -286,6 +292,7 @@ class OwnershipRegression(unittest.TestCase):
         p.kill(); p.wait(timeout=3)  # wallclock: guard 3 s only ends a hang reaping the SIGKILLed driver; the verdict is assert_gone
         self.assert_gone(pid)
 
+    @unittest.skipIf(os.name == 'nt', _M5_SKIP)
     def test_scanner_then_preflight_death_reaches_spawn_worker(self):
         skill = self.root / 'skills' / 'sample'; skill.mkdir(parents=True)
         (skill / 'SKILL.md').write_text('# fixture')
@@ -986,6 +993,7 @@ print(json.dumps({k:v for k,v in owned.run_owned([sys.executable,'-B',%r],2,forc
         self.assert_gone(child_pid)
         self.assert_alive(sibling_pid,'outside sibling was put in the owned Job')
 
+    @unittest.skipIf(os.name == 'nt', _M5_SKIP)
     def test_scanner_death_alone_reaps_spawn_worker(self):
         skill = self.root / 'skills' / 'sample'; skill.mkdir(parents=True)
         (skill / 'SKILL.md').write_text('# fixture')
@@ -1038,6 +1046,7 @@ if __name__=='__main__':
         self.assert_gone(child)
         self.assertIsNone(sibling.poll())
 
+    @unittest.skipIf(os.name == 'nt', _M5_SKIP)
     def test_checklist_deadline_cleans_scanner_and_spawn_pool(self):
         skill=self.root/'skills'/'sample';skill.mkdir(parents=True);(skill/'SKILL.md').write_text('# fixture')
         scanner=self.root/'scan_deadline.py'
@@ -1669,6 +1678,21 @@ class PoolBoundedStop(unittest.TestCase):
         self.assertEqual((res['rc'], res['unbounded']), (0, False), err)
         self.assertIn('BrokenProcessPool', err)
         self.assert_no_leftover(pids)
+
+    def test_m5_skip_stands_only_while_its_guards_run(self):
+        # Head ruling C3: the M5 x3 skip on nt is void in a run where never_ready or worker_dying is not fully green. A red
+        # or an error voids it through the native step's acceptance (failures=0, errors=0); this pin covers "skipped".
+        # Source-level, so an nt-only skip is seen on every platform.
+        import ast, inspect, textwrap
+        for name in ('test_never_ready_pool_falls_back_at_the_start_deadline',
+                     'test_worker_dying_at_start_falls_back_without_leftover'):
+            guard = ast.parse(textwrap.dedent(inspect.getsource(getattr(PoolBoundedStop, name)))).body[0]
+            self.assertEqual([ast.unparse(d) for d in guard.decorator_list], [],
+                             '%s carries a decorator: a skip there leaves the M5 skip without its guard' % name)
+            self.assertNotIn('skipTest', ast.unparse(guard), name)
+        for helper in (PoolBoundedStop.run_e2, PoolBoundedStop.assert_no_leftover, OwnershipRegression.setUp):
+            self.assertNotIn('skipTest', inspect.getsource(helper), helper.__name__)
+        self.assertEqual(ast.parse(textwrap.dedent(inspect.getsource(PoolBoundedStop))).body[0].decorator_list, [])
 
     def test_healthy_pool_is_silent_and_leaves_no_worker(self):
         rc, res, err, pids = self.run_e2('H', skills=('a', 'b', 'c'))
