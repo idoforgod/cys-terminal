@@ -501,22 +501,43 @@ Path(%r).write_text(str(r))
         whole grace). The output holder publishes its pid as <name>; returns (returned, RESULT dict, output)."""
         script = self.root/'fa_driver.py'
         script.write_text(_FA_DRIVER % {'bin': str(BIN), 'arm': arm, 'launch': launch, 'timeout': timeout})
-        out_f = open(self.root/'fa.out', 'w')
-        p = subprocess.Popen([PYTHON, '-B', str(script)], stdout=out_f, stderr=subprocess.STDOUT,
-                             start_new_session=(os.name == 'posix'))
-        self.children.append(p)
-        self.marker(name)
-        try:
-            p.wait(timeout=60)  # wallclock: guard 60 s only ends a hang; the old bytes spend the 600 s grace, the verdict is that run_owned returned
-            returned = True
-        except subprocess.TimeoutExpired:
-            returned = False
-            if os.name == 'posix':
-                os.killpg(p.pid, signal.SIGKILL)
-        out_f.close()
+        # The with closes the test's own handle even when marker() fails; Windows cannot remove an open file.
+        with open(self.root/'fa.out', 'w') as out_f:
+            p = subprocess.Popen([PYTHON, '-B', str(script)], stdout=out_f, stderr=subprocess.STDOUT,
+                                 start_new_session=(os.name == 'posix'))
+            self.children.append(p)
+            self.marker(name)
+            try:
+                p.wait(timeout=60)  # wallclock: guard 60 s only ends a hang; the old bytes spend the 600 s grace, the verdict is that run_owned returned
+                returned = True
+            except subprocess.TimeoutExpired:
+                returned = False
+                if os.name == 'posix':
+                    os.killpg(p.pid, signal.SIGKILL)
         out = (self.root/'fa.out').read_text()
         result = [json.loads(l[7:]) for l in out.splitlines() if l.startswith('RESULT ')]
         return returned, (result[0] if result else None), out
+
+    def test_run_fa_closes_its_output_file_when_the_holder_never_starts(self):
+        # d2be23fe windows-build: the holder never started, marker() raised, and run_fa kept fa.out open, so tearDown's
+        # rmtree failed with WinError 32 (log :588-604; the ResourceWarning for fa.out came after the E, log :544).
+        from unittest.mock import patch
+        class Driver:
+            stdin = stdout = stderr = None
+            def poll(self): return 0
+            def kill(self): pass
+            def wait(self, timeout=None): return 0
+        handed = []
+        def popen(args, **kw):
+            handed.append(kw['stdout'])
+            return Driver()
+        def never_started(name):
+            self.fail('fixture never started: ' + name)
+        with patch.object(subprocess, 'Popen', popen), patch.object(self, 'marker', never_started), \
+                self.assertRaises(self.failureException):
+            self.run_fa([PYTHON, '-c', 'pass'], 1, '', 'fa-x')
+        self.assertEqual(len(handed), 1)
+        self.assertTrue(handed[0].closed, 'run_fa left its output file open after the holder failed to start')
 
     @unittest.skipUnless(os.name == 'posix', 'POSIX setsid twin of the nt held-output stall; on nt that is the held-output checklist test')
     def test_cooperative_window_ends_when_the_leader_is_gone(self):
