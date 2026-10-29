@@ -971,6 +971,91 @@ if __name__=='__main__':
             if p.returncode is None:
                 os.killpg(p.pid,signal.SIGKILL);p.wait(timeout=3)  # wallclock: guard 3 s only ends a hang reaping the SIGKILLed hook group; cleanup only, not the verdict
 
+    def test_hook_dir_derivation_splits_on_both_separators(self):
+        # F-B1 (string level): the directory the hook sources _lib.sh from, computed by the hook's own prelude text
+        # with BASH_SOURCE[0] replaced by each vector. The Windows shapes are plain strings here. One bash process
+        # reads that text from a file (on nt, command-line quoting of a -c script would decide the result) and
+        # prints one line per vector. On nt only the bundled Git bash counts (which('bash') may be WSL's).
+        import shutil
+        bash = os.environ.get('C03_TEST_BASH') or (shutil.which('bash') if os.name == 'posix' else None)
+        if not bash:
+            self.skipTest('no bash (on nt: C03_TEST_BASH, the bundled Git bash)')
+        lines = (Path(__file__).resolve().parents[2]/'hooks'/'inject-context.sh').read_text().splitlines()
+        src = [i for i, l in enumerate(lines) if l.startswith('. "') and l.endswith('/_lib.sh" 2>/dev/null \\')]
+        self.assertTrue(src, 'the first _lib.sh source line was not found')
+        i = src[0]
+        expr = lines[i][3:lines[i].index('/_lib.sh"')]
+        start = next((j for j in range(i) if lines[j].startswith('_C03_HOOK_DIR=')), i)
+        body = '\n'.join(['for _v in "$@"; do', 'set -- "$_v"'] + lines[start:i] + ['printf \'%s\\n\' "' + expr + '"', 'done', ''])
+        script = self.root/'derive.sh'
+        script.write_bytes(body.replace('${BASH_SOURCE[0]', '${1').encode('utf-8'))
+        vectors = [
+            ('D:\\a\\cys\\cys\\cysjavis-pack\\hooks\\inject-context.sh', 'D:\\a\\cys\\cys\\cysjavis-pack\\hooks'),
+            ('/srv/cys/pack/hooks/inject-context.sh', '/srv/cys/pack/hooks'),
+            ('D:\\a\\cys/cysjavis-pack\\hooks/inject-context.sh', 'D:\\a\\cys/cysjavis-pack\\hooks'),
+            ('inject-context.sh', '.'),
+            ('/inject-context.sh', '/'),
+            ('./inject-context.sh', '.'),
+            ('/Applications/cys.app/Contents/Resources/pack/hooks/inject-context.sh', '/Applications/cys.app/Contents/Resources/pack/hooks'),
+            ('C:\\Program Files\\cys\\cysjavis-pack\\hooks\\inject-context.sh', 'C:\\Program Files\\cys\\cysjavis-pack\\hooks'),
+            ('C:\\inject-context.sh', 'C:'),
+        ]
+        r = subprocess.run([bash, str(script)] + [given for given, _ in vectors], capture_output=True, text=True, timeout=10)
+        got = r.stdout.split('\n')[:-1]
+        self.assertEqual(len(got), len(vectors), 'one line per vector expected: %r %r' % (r.stdout, r.stderr))
+        wrong = [(given, out, want) for (given, want), out in zip(vectors, got) if out != want]
+        self.assertEqual(wrong, [], 'hook directory derived wrongly (given, got, want)')
+
+    @unittest.skipUnless(os.name == 'posix', 'bash hook started by its bare name')
+    def test_hook_started_by_bare_name_finds_its_lib(self):
+        # F-B2: 'bash inject-context.sh' from inside the hooks directory, with no CYS_PACK_DIR fallback.
+        import shutil
+        hooks = Path(__file__).resolve().parents[2]/'hooks'
+        pack = self.root/'pack'; (pack/'hooks').mkdir(parents=True); (pack/'bin').mkdir()
+        for name in ('_lib.sh', 'inject_gate.py', 'inject-context.sh'):
+            shutil.copyfile(hooks/name, pack/'hooks'/name)
+        shutil.copyfile(BIN/'_owned_process.py', pack/'bin'/'_owned_process.py')
+        home = self.root/'home'; home.mkdir()
+        env = {'PATH': '/usr/bin:/bin', 'HOME': str(home), 'TMPDIR': str(home), 'CYS_PY': PYTHON,
+               'CYS_ROLE': 'master', 'CYS_ROOT': str(self.root)}
+        p = subprocess.run(['/bin/bash', 'inject-context.sh'], cwd=str(pack/'hooks'), env=env, capture_output=True, text=True,  # wallclock: guard 60 s only ends a hang of the hook; the verdict is the absent degrade line
+                           input=json.dumps({'source': 'clear', 'cwd': str(self.root)}), timeout=60)
+        self.assertNotIn('_lib.sh 소실', p.stderr)
+
+    def run_backslash_hook(self):
+        """The Windows path shape on POSIX: a FILE named 'C:\\x\\hooks\\inject-context.sh' beside a DIRECTORY named
+        'C:\\x\\hooks' (backslashes are ordinary name characters here). bash gets the Windows-form $0, and only a split
+        on '\\' finds the hook's directory. The gate there is a stub that records it ran."""
+        import shutil
+        hooks = Path(__file__).resolve().parents[2]/'hooks'
+        d = self.root/'C:\\x\\hooks'; d.mkdir()
+        shutil.copyfile(hooks/'_lib.sh', d/'_lib.sh')
+        (d/'inject_gate.py').write_text("import os,sys,pathlib\npathlib.Path(os.environ['C03_GATE_MARK']).touch()\nsys.stdout.write(sys.stdin.read())\n")
+        shutil.copyfile(hooks/'inject-context.sh', self.root/'C:\\x\\hooks\\inject-context.sh')
+        (self.root/'bin').mkdir(); shutil.copyfile(BIN/'_owned_process.py', self.root/'bin'/'_owned_process.py')
+        home = self.root/'home'; home.mkdir()
+        mark = self.root/'gate-called'
+        env = {'PATH': '/usr/bin:/bin', 'HOME': str(home), 'TMPDIR': str(home), 'CYS_PY': PYTHON,
+               'CYS_ROLE': 'master', 'CYS_ROOT': str(self.root), 'C03_GATE_MARK': str(mark)}
+        p = subprocess.run(['/bin/bash', 'C:\\x\\hooks\\inject-context.sh'], cwd=str(self.root), env=env, capture_output=True, text=True,  # wallclock: guard 60 s only ends a hang of the hook; the verdict is the output and the gate record
+                           input=json.dumps({'source': 'clear', 'cwd': str(self.root)}), timeout=60)
+        return p, mark
+
+    @unittest.skipUnless(os.name == 'posix', 'backslashes are ordinary file name characters only on POSIX')
+    def test_hook_with_windows_path_finds_its_lib(self):
+        # F-B3: the H-WIN-2/3/5 shape end to end: the hook must find _lib.sh and inject the state.
+        p, mark = self.run_backslash_hook()
+        self.assertNotIn('_lib.sh 소실', p.stderr)
+        self.assertIn('C03-ISOLATED-STATE', p.stdout, p.stderr[-400:])
+
+    @unittest.skipUnless(os.name == 'posix', 'backslashes are ordinary file name characters only on POSIX')
+    def test_phase_with_windows_path_reaches_the_poison_gate(self):
+        # m1: a --phase re-entry gets the same Windows-form $0; the poison gate must be found next to the hook,
+        # not next to the working directory (dirname of a backslash path is '.').
+        p, mark = self.run_backslash_hook()
+        self.assertIn('C03-ISOLATED-STATE', p.stdout, p.stderr[-400:])
+        self.assertTrue(mark.exists(), 'the --phase body looked for inject_gate.py beside the cwd, not beside the hook')
+
     @unittest.skipUnless(os.name == 'nt', 'Windows Git Bash hook: UNMEASURED locally')
     def test_windows_bundled_bash_hook_retains_core(self):
         import shutil

@@ -8,7 +8,15 @@ set +e
 
 # ── 공용 프리루드(CS-4①) — loud-skip: 소실 시 조용히 꺼지지 않고 stderr 1줄 후 강등 ──
 if [ "${1:-}" != "--phase" ]; then _CYS_LIB_DEFINE_ONLY=1; CYS_LANE_REDIRECT=""; fi
-. "${BASH_SOURCE[0]%/*}/_lib.sh" 2>/dev/null \
+# The hook's own directory, split on '/' and on '\' (a Windows path reaches bash with backslashes;
+# '%/*' alone missed them and lost _lib.sh: H-WIN-2/3/5). Assignment only: no dirname, no command
+# substitution, no external process in this bounded prelude (46b24c6b).
+_C03_HOOK_DIR=${BASH_SOURCE[0]}
+case $_C03_HOOK_DIR in
+  */*|*\\*) _C03_HOOK_DIR=${_C03_HOOK_DIR%[/\\]*}; [ -n "$_C03_HOOK_DIR" ] || _C03_HOOK_DIR=/ ;;
+  *) _C03_HOOK_DIR=. ;;
+esac
+. "$_C03_HOOK_DIR/_lib.sh" 2>/dev/null \
   || . "${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh" 2>/dev/null \
   || { echo "[cys-hook] _lib.sh 소실 — 훅 강등(inject-context)" >&2; exit 0; }
 # Define-only loading skips _lib.sh's own run block, and cys_lane_guard lives in it.
@@ -59,7 +67,7 @@ _ic_resolve_role() {
 
 if [ "${1:-}" != "--phase" ]; then
   # The shell owns OUT throughout. A failed phase cannot replace cached core.
-  _C03_LEAF="${BASH_SOURCE[0]%/*}/../bin/_owned_process.py"
+  _C03_LEAF="$_C03_HOOK_DIR/../bin/_owned_process.py"
   [ -f "$_C03_LEAF" ] || _C03_LEAF="${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/_owned_process.py"
   _C03_START=""; _C03_CHECK_SPENT=0; _C03_ANC_SPENT=0
   OUT=""; SOURCE=""; CWD=""; _IC_GATE="unknown"
@@ -155,7 +163,9 @@ case "${2:-}" in ingress|role|core|ancillary|checklist|post|bookkeeping) ;; *) e
 # SESSION_STATE·RSI_LEDGER는 FS 쓰기 권한 노드가 지시를 심을 수 있는 재주입 면 — verbatim
 # 주입 전 skillscan 규칙(add 시점과 동일)으로 의심 라인만 격리(deny-by-default·라인 단위).
 # 게이트 부재·실패 시 원문 통과(복원 생명선 — 전면 차단 금지), 게이트 안에서 다운 배너 표기.
-GATE="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/inject_gate.py"
+# The prelude's $_C03_HOOK_DIR, not dirname "$0": a phase re-entry gets the same Windows-form $0, and
+# dirname of a backslash path is '.', which would look for the gate beside the working directory.
+GATE="$(cd "$_C03_HOOK_DIR" 2>/dev/null && pwd)/inject_gate.py"
 # Windows(PortableGit sh) 패리티: 네이티브 python3는 POSIX 경로(/c/...)를 못 연다 — cygpath 변환.
 command -v cygpath >/dev/null 2>&1 && GATE="$(cygpath -w "$GATE" 2>/dev/null || printf '%s' "$GATE")"
 _gate() {
