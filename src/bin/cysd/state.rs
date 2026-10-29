@@ -10020,31 +10020,74 @@ mod tests {
     /// 적체)에는 `busy_within` 이 거짓이어도(종전 빈틈) `handoff_pending` 이 참 ② arm 이 끝 CR 을 쓰면 풀리고 간격은
     /// 종전 `done_at` 이 잰다 ③ 인계 실패 되돌림 ④ 되돌림은 뒤에 덮은 표식을 건드리지 않는다 ⑤ 표식은 `active` 를
     /// 세우지 않는다(H0 자기 붙여넣기 귀속 무변경).
+    /// ★(0.14.56 · R2 D-4) 전제는 시계가 아니라 구성으로 선다 — 선행 쓰기 적체는 검체가 쥔 문(`GateWriter`)이고, writer 가
+    /// 그 arm 안에서 막힌 것을 확인한 뒤에만 Inject 를 넘긴다(FIFO 단일 소비자 ⇒ 문이 닫힌 동안 begin 불가). arm 의 끝은
+    /// `join()` 이 증명한다. 종전 판(DataAfter 300ms · 수면 50+50ms · 대기 3s)은 러너가 검체 스레드를 200ms 넘게 재우면
+    /// 전제 단언이 적색이었다(0.14.55 attempt 3 · R2-REPORT §4·§7).
     #[test]
     fn inject_track_handoff_pending_until_an_arm_ends() {
-        use std::sync::mpsc::sync_channel;
+        use std::sync::mpsc::{channel, sync_channel, Sender};
+        type Gate = Arc<(Mutex<bool>, std::sync::Condvar)>;
+        /// 첫 write(선행 쓰기)에서 `entered` 를 알리고 문이 열릴 때까지 막히는 싱크 — 그 뒤의 쓰기는 그대로 흘린다.
+        struct GateWriter {
+            entered: Option<Sender<()>>,
+            gate: Gate,
+        }
+        impl std::io::Write for GateWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if let Some(entered) = self.entered.take() {
+                    entered.send(()).unwrap();
+                    let (open, cv) = &*self.gate;
+                    let mut g = open.lock().unwrap();
+                    while !*g {
+                        g = cv.wait(g).unwrap();
+                    }
+                }
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        /// 문을 여는 유일한 자리 — 단언이 먼저 실패해 풀려도 writer 가 문에 갇힌 채 남지 않는다.
+        struct OpenOnDrop(Gate);
+        impl Drop for OpenOnDrop {
+            fn drop(&mut self) {
+                let (open, cv) = &*self.0;
+                *open.lock().unwrap_or_else(|e| e.into_inner()) = true;
+                cv.notify_all();
+            }
+        }
         let ms = std::time::Duration::from_millis;
         let track = Arc::new(InjectTrack::default());
         assert!(track.handoff_pending().is_none(), "빈 좌석");
         let (tx, rx) = sync_channel::<WriteReq>(8);
         let stop = Arc::new(AtomicBool::new(false));
         let t2 = Arc::clone(&track);
-        let handle = std::thread::spawn(move || run_writer_loop_tracked(std::io::sink(), rx, stop, Some(t2)));
-        tx.send(WriteReq::DataAfter { bytes: Vec::new(), delay_ms: 300 }).unwrap();
-        std::thread::sleep(ms(50));
+        let gate: Gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let (entered_tx, entered_rx) = channel();
+        let sink = GateWriter { entered: Some(entered_tx), gate: Arc::clone(&gate) };
+        let opener = OpenOnDrop(gate);
+        let handle = std::thread::spawn(move || run_writer_loop_tracked(sink, rx, stop, Some(t2)));
+        // ① 선행 쓰기를 넘기고 writer 가 그 arm 안에서 문에 막힌 것을 확인한다 — 이 뒤로 넘긴 Inject 는 문이 열리기 전에
+        //    begin 할 수 없으므로 아래 세 전제는 검체 스레드가 얼마나 늦든 참이다(수면 0).
+        tx.send(WriteReq::Data(b"x".to_vec())).unwrap();
+        entered_rx.recv().unwrap();
         let _mark = track.note_handoff();
-        tx.send(WriteReq::Inject { text: "행".into(), cr_delay_ms: 100, clear_first: false, guard: None })
-            .unwrap();
-        std::thread::sleep(ms(50));
-        assert!(!track.busy_within(ms(1000)), "전제: writer 가 아직 집지 않았다(begin 전 — 종전 판정의 빈틈)");
+        tx.send(WriteReq::Inject { text: "행".into(), cr_delay_ms: 0, clear_first: false, guard: None }).unwrap();
+        assert!(!track.busy_within(std::time::Duration::MAX), "전제: writer 가 아직 집지 않았다(begin 전 — 종전 판정의 빈틈)");
         assert!(track.handoff_pending().is_some(), "넘겼으나 writer 가 집기 전인 창을 비웠다");
         assert!(!track.stuck_over(ms(0)), "인계 표식이 active 를 세웠다(H0 자기 붙여넣기 귀속 오염)");
-        let t0 = std::time::Instant::now();
-        while track.handoff_pending().is_some() && t0.elapsed() < ms(3000) {
-            std::thread::sleep(ms(10));
-        }
+        // ② 문을 열고 채널을 닫은 뒤 join — writer 는 남은 요청을 FIFO 로 다 쓴 뒤에야 끝나므로 join 반환 = Inject arm 의 end() 뒤다.
+        drop(opener);
+        drop(tx);
+        handle.join().unwrap();
         assert!(track.handoff_pending().is_none(), "arm 이 끝났는데 인계 대기가 풀리지 않았다");
-        assert!(track.busy_within(ms(1000)), "끝난 직후 간격은 done_at 이 잰다(빈틈 0)");
+        let handed = track.handed_at.lock().unwrap().cur.expect("인계 표식").at;
+        let done = (*track.done_at.lock().unwrap()).expect("끝난 arm 의 done_at");
+        assert!(done >= handed, "인계를 푼 것은 인계 뒤에 끝난 arm 의 done_at 이어야 한다");
+        assert!(track.busy_within(std::time::Duration::MAX), "끝난 직후 간격은 done_at 이 잰다(빈틈 0)");
+        // ③④ 는 writer·채널을 쓰지 않는 InjectTrack 표식 상태 점검이라 writer 가 끝난(join) 뒤에 돌아도 같다.
         // ③ 인계 실패 되돌림 — 종전 표식(이미 끝난 인계)으로 돌아간다.
         let m = track.note_handoff();
         assert!(track.handoff_pending().is_some());
@@ -10055,8 +10098,6 @@ mod tests {
         let _newer = track.note_handoff();
         track.undo_handoff(stale);
         assert!(track.handoff_pending().is_some(), "뒤 인계의 표식을 앞 인계의 되돌림이 지웠다");
-        drop(tx);
-        handle.join().ok();
     }
 
     /// ★B2 계약 박제 ②(0.14.24): writer 는 **단일 소비자**라 DataAfter 가 자는 동안 뒤따라
