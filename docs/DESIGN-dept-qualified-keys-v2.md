@@ -60,6 +60,9 @@
   **despawn/spawn fallback(C4)**: `surface_ref` 재조립 분기(588)도 `main@` 정식 키로 생성.
 - route_spool 귀속 사다리: ①정식 키 명시=즉시(스냅샷 존재 검증) ②bare `surface:N`=기존 전역
   유일 게이트(하위호환) ③role 유일 ④미귀속.
+  ★(0.14.56 X-8 CARRIER) spool 은 레인별 파일이고 레코드의 레인 = 그 파일의 레인이다: ②③은 그 레인의 노드로 한정되고,
+  정식 키의 slug 가 그 레인 키와 다르면(다른 레인의 키) 사다리로 강등하지 않고 **버린다**(상태 변화·fx 없음 ·
+  `/health` 의 레인별 `foreign_key_dropped` 로 센다). `blocked[]` 항목은 `lane` 을 갖고 (lane, task) 단위로 바뀐다.
 - **presence_heat 지연 마이그레이션(M2)**: load_heat(부팅 직후, fleet 미수집)는 bare 키를
   `pending_heat`로 **보존만** 하고, 첫 merge_fleet 완료 시점에 1회 기회적 승격(유일 매칭 시
   정식 키로, 실패분만 폐기). 부팅 순서상 즉시 승격이 불가함(1333<1336)을 계약에 명시.

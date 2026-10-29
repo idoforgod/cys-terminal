@@ -7,10 +7,12 @@ despawn/spawn fallback 정식 키 · 귀속 사다리 4분기 · slug 정규화�
 dept 필드 부재 폴백 · 리플레이 관용 · fleet 키==이벤트 키 정합. 음성 케이스 포함.
 """
 import contextlib
+import importlib.util
 import io
 import json
 import os
 import secrets
+import shutil
 import tempfile
 import threading
 import time
@@ -238,11 +240,23 @@ class AttributionLadderV2(unittest.TestCase):
         self.assertEqual(B.attribute_spool(
             {"key": "dept-1@surface:5", "payload": {}}, w), "dept-1@surface:5")
 
-    def test_formal_key_absent_falls_back_to_role(self):
+    def test_formal_key_of_another_lane_is_dropped(self):
+        # (0.14.56 X-8 CARRIER · contract change, DESIGN-r3 §2) the pin demoted an unknown full key to the role ladder - this
+        # example (ghost@ read from main's file) landed on main@surface:8. A key whose lane prefix is not the file's lane
+        # is now DROPPED: no attribution, no state change, no fx (the reader counts it as foreign_key_dropped).
         w = merged_world(DUP)
-        # 스냅샷에 없는 정식 키 → 신뢰 안 함 → agent=cso 유일 role 폴백(본부 surface:8)
+        entry = {"ts": time.time(), "type": "task.blocked", "key": "ghost@surface:99",
+                 "payload": {"agent": "cso", "task": "T", "blocked_by": []}}
+        self.assertTrue(B.spool_foreign(entry, "main"))
+        self.assertIsNone(B.attribute_spool(entry, w, "main"))
+        self.assertEqual(B.route_spool(entry, w, B.Coalescer(), lane="main"), ([], False))
+        self.assertEqual(w.blocked, [])
+
+    def test_unknown_full_key_of_the_same_lane_keeps_the_lane_ladder(self):
+        w = merged_world(DUP)
+        # 같은 레인(main)의, 스냅샷에 없는 정식 키 → 신뢰 안 함 → 그 레인 안에서 agent=cso 유일 role 폴백(본부 surface:8)
         self.assertEqual(B.attribute_spool(
-            {"key": "ghost@surface:99", "payload": {"agent": "cso"}}, w), "main@surface:8")
+            {"key": "main@surface:99", "payload": {"agent": "cso"}}, w, "main"), "main@surface:8")
 
     def test_bare_unique_promotes_to_full_key(self):
         w = merged_world(DUP)
@@ -536,6 +550,7 @@ class EventSurfaceAuto(unittest.TestCase):
                        for k in ("CYS_SOCKET", "CYS_DEPTS_JSON", "HUD_STATE_DIR")}
         os.environ["CYS_DEPTS_JSON"] = depts
         os.environ.pop("CYS_SOCKET", None)
+        os.environ.pop("HUD_STATE_DIR", None)   # (0.14.56) a rig pack, not the env, places the spool
         self._orig_ref = E._resolve_surface_ref
         E._resolve_surface_ref = lambda: "surface:7"   # cys identify 스텁
 
@@ -562,30 +577,35 @@ class EventSurfaceAuto(unittest.TestCase):
         E._resolve_surface_ref = lambda: None
         self.assertIsNone(E.resolve_auto_surface())
 
-    def test_emit_auto_spools_resolved_key(self):
-        os.environ["CYS_SOCKET"] = "/tmp/d1.sock"
+    def rig_emit(self):
+        """(0.14.56 X-8 CARRIER · A1, DESIGN-r3 §3) `emit --surface auto --spool` from a rig pack: a COPY of bin/ in a temp
+        dir with its javis_event loaded by explicit path (cys identify stubbed on that copy) - the spool lands in the rig
+        pack's own state/evt_spool.jsonl. Returns (rc, first spool record)."""
         sd = tempfile.mkdtemp()
-        os.environ["HUD_STATE_DIR"] = sd
+        self.addCleanup(shutil.rmtree, sd, True)
+        pack = os.path.join(sd, "pack")
+        shutil.copytree(BIN, os.path.join(pack, "bin"), ignore=shutil.ignore_patterns("tests", "__pycache__"))
+        spec = importlib.util.spec_from_file_location("javis_event_rig", os.path.join(pack, "bin", "javis_event.py"))
+        rig = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(rig)
+        rig._resolve_surface_ref = lambda: "surface:7"   # cys identify 스텁
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            rc = E.main(["emit", "task.unblocked", "--payload", '{"task":"T"}',
-                         "--surface", "auto", "--spool"])
+            rc = rig.main(["emit", "task.unblocked", "--payload", '{"task":"T"}',
+                           "--surface", "auto", "--spool"])
+        with open(os.path.join(pack, "state", "evt_spool.jsonl")) as f:
+            return rc, json.loads(f.readline())
+
+    def test_emit_auto_spools_resolved_key(self):
+        os.environ["CYS_SOCKET"] = "/tmp/d1.sock"
+        rc, e = self.rig_emit()
         self.assertEqual(rc, 0)
-        with open(os.path.join(sd, "evt_spool.jsonl")) as f:
-            e = json.loads(f.readline())
         self.assertEqual(e["key"], "dept-1@surface:7")
 
     def test_emit_auto_unresolved_omits_key(self):
         os.environ["CYS_SOCKET"] = "/tmp/unknown.sock"   # 미매칭 → None
-        sd = tempfile.mkdtemp()
-        os.environ["HUD_STATE_DIR"] = sd
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            rc = E.main(["emit", "task.unblocked", "--payload", '{"task":"T"}',
-                         "--surface", "auto", "--spool"])
+        rc, e = self.rig_emit()
         self.assertEqual(rc, 0)
-        with open(os.path.join(sd, "evt_spool.jsonl")) as f:
-            e = json.loads(f.readline())
         self.assertNotIn("key", e)   # 미귀속 — bare/오귀속 키 미기록
 
 

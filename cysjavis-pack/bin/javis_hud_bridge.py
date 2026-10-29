@@ -13,6 +13,7 @@ WorldState(§4)로 정규화해 127.0.0.1 전용 HTTP(+SSE)로 내보낸다.
 기동:  cys run -- python3 bin/javis_hud_bridge.py
 접속:  http://127.0.0.1:8765
 """
+import base64
 import glob
 import json
 import os
@@ -27,6 +28,7 @@ import time
 from collections import defaultdict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from queue import Empty, Full, Queue
+sys.dont_write_bytecode = True  # (0.14.56) SEAL-1 layer 4: before the spool leaf loader below (check_seal4, DESIGN-r3 §1)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WEB_DIR = os.path.join(ROOT, "web")
@@ -85,6 +87,7 @@ def _has_escape(s):
 
 
 _SUPERVISOR = None   # (0.14.49) set once in main(); read by health_body()
+_SPOOL = None        # (0.14.56) the SpoolReader - set once in main() before its thread starts; read by health_body()
 
 
 def _log(msg):
@@ -110,11 +113,28 @@ JAVIS_ROOT = os.environ.get("JAVIS_ROOT") or os.path.expanduser("~/Desktop/CYSja
 TASKS_DIR = os.path.join(JAVIS_ROOT, "_round", "tasks")
 ROUND_DIR = os.path.join(JAVIS_ROOT, "_round")
 TRANSCRIPTS_DB = os.path.expanduser("~/.cys/transcripts.db")
-EVT_SPOOL_PATH = os.path.join(STATE_DIR, "evt_spool.jsonl")
-EVT_OFFSET_PATH = os.path.join(STATE_DIR, "evt_spool.offset")
+# (0.14.56 X-8 CARRIER) The spool is no longer under STATE_DIR: each lane's spool is spool_path_for_pack(<lane pack>)
+# from the leaf javis_spool_path.py, and STATE_DIR keeps one meaning - this bridge's private state (offsets
+# evt_spool-<lane>.offset live here). A pre-0.14.56 STATE_DIR/evt_spool.offset is left in place, never read or deleted.
 PRESENCE_HEAT_PATH = os.path.join(STATE_DIR, "presence_heat.json")
 SPOOL_POLL_SECS = 1.0
-SPOOL_ROTATE_BYTES = 4 * 1024 * 1024   # spool 무제한 성장 봉인 — 드레인 상태에서만 로테이션
+SPOOL_ROTATE_BYTES = 4 * 1024 * 1024   # spool 무제한 성장 봉인 — 드레인 상태에서만 로테이션 (0.14.56: 보관 이름으로 rename, 삭제 없음)
+SPOOL_SCHEMA = 1                       # (0.14.56) /health `spool_schema` (PLAN contract 3)
+SPOOL_FLEET_WAIT_SECS = 60.0           # (0.14.56) no non-null fleet this long after start -> `_fleet` fleet_unavailable (latched, K7)
+SPOOL_RECHECK_SECS = 60.0              # (0.14.56) re-run the self-check of a lane in FAULT or unverified this often (DESIGN-r2 1-5)
+SPOOL_CHECK_TIMEOUT_SECS = 5.0         # (0.14.56) bound on one lane's `javis_event.py spool-path` child (DESIGN 3(D))
+SPOOL_LEAF_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "javis_spool_path.py")
+SPOOL_READ_STATES = ("ok", "absent", "unverified")   # lane states that are read; every other lane state is a FAULT
+SPOOL_FAULT_STATES = frozenset(("unknown_pack", "pack_missing", "mismatch", "over_cap", "lane_key_collision",
+                                "leaf_missing", "fleet_unavailable"))
+_SPOOL_ARCHIVE_RE = re.compile(r"^evt_spool\.\d{8}T\d{6}Z(?:-\d{1,2})?\.jsonl$")
+# (0.14.56 slice H · CEO E5 "never re-read as new") A lane's offset record keeps the first bytes it has already read; a file at
+# the live name is judged by those bytes (a pack install's copy and a restore keep them; inode/dev/mtime do not survive a copy).
+SPOOL_HEAD_BYTES = 4096
+# (slice H · F1-C) no rotation while a pack install can be between its copy and its swap (pack.rs install_staged/atomic_swap):
+ROTATE_START_GRACE_SECS = 300.0        # G-a: the update path runs init-pack right after cysd (and so this bridge) starts
+STAGING_FRESH_SECS = 600.0             # G-b: a `.pack-staging-init-*` sibling younger than this is a live install; older = residue
+_STAGING_PREFIX = ".pack-staging-init-"
 KANBAN_POLL_SECS = 5.0
 VERDICT_POLL_SECS = 5.0
 BOARD_PERSIST_SECS = 60.0   # 히트 영속·비용 캐시 갱신 주기
@@ -323,6 +343,25 @@ def normalize_slug(raw):
     return s or "dept"
 
 
+def spool_lane_keys(rows):
+    """(0.14.56 X-8 CARRIER · DESIGN-r3 §2 "Lane key (one rule)") [(lane_key, is_base)] per `cys fleet --json` row.
+
+    The base row is the FIRST row whose `socket` is null (cys run_fleet emits the base first, socket null, dept "main");
+    its key is "main". Every other row: normalize_slug(row.dept if not None else row.department) - the old-CLI
+    fallback of _annotate_depts. No collision suffix here: a dept row keyed "main", or two rows with one key, is a
+    lane_key_collision for the reader (the key names the offset file and is compared with an explicit key's prefix).
+    """
+    out, base_seen = [], False
+    for r in rows:
+        if not base_seen and r.get("socket") is None:
+            base_seen = True
+            out.append(("main", True))
+            continue
+        raw = r.get("dept")
+        out.append((normalize_slug(raw if raw is not None else r.get("department")), False))
+    return out
+
+
 def full_key(slug, surface_ref):
     """정식 노드 키 <slug>@surface:N. surface_ref 부재 시 None (귀속 불능 노드)."""
     if not surface_ref:
@@ -495,6 +534,7 @@ class World:
         self.heat_hour = None          # 링 버킷 롤오버 기준 시각(hour)
         self.cost_cache = {"ts": 0.0, "value": {"usd": None, "tokens": None}}
         self.prev_top = {}             # patch_top 직전값 비교 (field → value)
+        self.fleet_gen = 0             # (0.14.56) count of merge_fleet calls that carried a non-null fleet (spool startup gate)
 
     # --- 수집 반영 ---
     def note_hook(self, key, ts):
@@ -544,14 +584,24 @@ class World:
             return any(node_key(s) == full_key for d in self.departments
                        for s in d.get("surfaces", []))
 
-    def unique_full_key_for_ref(self, ref):
-        """bare surface_ref 가 fleet 에서 정확히 1개 surface 에만 있으면 그 정식 키 (귀속 사다리 ②)."""
+    def unique_full_key_for_ref(self, ref, lane=None):
+        """bare surface_ref 가 fleet 에서 정확히 1개 surface 에만 있으면 그 정식 키 (귀속 사다리 ②).
+
+        (0.14.56) lane 이 주어지면 그 레인(`_lane`)의 노드만 본다 — 스풀 레코드는 자기 레인 안에서만 귀속된다(DESIGN-r3 §2).
+        """
         if not ref:
             return None
         with self.lock:
-            hits = [node_key(s) for d in self.departments for s in d.get("surfaces", [])
-                    if s.get("surface_ref") == ref]
+            hits = [node_key(s) for d in self.departments if lane is None or d.get("_lane") == lane
+                    for s in d.get("surfaces", []) if s.get("surface_ref") == ref]
         return hits[0] if len(hits) == 1 else None
+
+    def spool_rows(self):
+        """(0.14.56) Copies of the fleet rows the spool reader needs. `pack_dir` is read here only - the world snapshot
+        projects explicit department fields and never carries it to the office page."""
+        with self.lock:
+            return [{"dept": d.get("dept"), "department": d.get("department"), "socket": d.get("socket"),
+                     "pack_dir": d.get("pack_dir")} for d in self.departments]
 
     def dept_targets(self):
         """현재 fleet 의 구독 타깃 {slug: socket|None} (P2-1 슈퍼바이저 reconcile 입력).
@@ -638,6 +688,8 @@ class World:
                 s["_dept"] = slug
                 if fk is not None:
                     sockets[fk] = socket
+        for d, (lane, _base) in zip(new_deps, spool_lane_keys(new_deps)):
+            d["_lane"] = lane   # (0.14.56) the spool lane this row's nodes belong to (lane-scoped attribution)
         self.sockets = sockets
 
     def _migrate_pending_heat(self):
@@ -667,6 +719,7 @@ class World:
                 self.seq = self.daemon.get("latest_seq", self.seq)
             structural = False
             if fleet:
+                self.fleet_gen += 1   # (0.14.56) a non-null fleet was merged - opens the spool startup gate (DESIGN-r3 §2)
                 new_deps = fleet.get("departments") or []
                 self._annotate_depts(new_deps)   # 정식 키·socket 주석 (구조 비교 전 선행)
                 # 정식 키 기준 구조 비교 — 동번호 부서 surface_ref 충돌로 인한 오탐 제거
@@ -763,12 +816,15 @@ class World:
             return sum(1 for d in self.departments for s in d.get("surfaces", [])
                        if s.get("surface_ref") == key)
 
-    def role_key(self, role):
-        """role 문자열이 fleet에서 유일한 surface에 매칭되면 그 정식 키, 아니면 None (귀속 사다리 ③)."""
+    def role_key(self, role, lane=None):
+        """role 문자열이 fleet에서 유일한 surface에 매칭되면 그 정식 키, 아니면 None (귀속 사다리 ③).
+
+        (0.14.56) lane 이 주어지면 그 레인의 노드 안에서만 유일성을 본다 — dept-5 스풀의 `worker` 는 dept-5 의 worker 다.
+        """
         if not role:
             return None
         with self.lock:
-            hits = [node_key(s) for d in self.departments
+            hits = [node_key(s) for d in self.departments if lane is None or d.get("_lane") == lane
                     for s in d.get("surfaces", []) if s.get("role") == role]
         return hits[0] if len(hits) == 1 else None
 
@@ -1066,39 +1122,57 @@ def route_event(ev, world, coal, slug="main", now=None):
 
 
 # --------------------------------------------------- EVT spool → 프레임 (§2·§3)
-def attribute_spool(entry, world):
+def spool_foreign(entry, lane):
+    """(0.14.56 · DESIGN-r3 §2) True when the record names an explicit `<slug>@surface:N` key whose normalize_slug(prefix)
+    is not `lane` - the lane of the file the record came from. Such a record is DROPPED (no state change, no fx) and
+    counted per lane as foreign_key_dropped; it replaces the pin's demotion to the role ladder for the cross-lane case."""
+    key = entry.get("key") if isinstance(entry, dict) else None
+    return isinstance(key, str) and "@" in key and normalize_slug(key.split("@", 1)[0]) != lane
+
+
+def attribute_spool(entry, world, lane=None):
     """spool 항목 노드 귀속 — v2 귀속 사다리 (계약 §4b).
 
     ① 정식 키(<slug>@surface:N) 명시 → 스냅샷 존재 검증 후 즉시 귀속.
     ② bare surface:N → 전역 유일 게이트(하위호환) → 그 surface 의 정식 키로 승격.
     ③ payload.agent==role 유일 일치 → 그 정식 키.
     ④ 미귀속(None). 틀린 귀속(오정보)보다 미귀속(정직한 공백)이 낫다.
+
+    (0.14.56 X-8 CARRIER) lane = the lane whose spool file the record came from (the only lane attribution that exists,
+    DESIGN 1-4). With a lane, ②·③ look at that lane's nodes only and an explicit key of another lane is never
+    attributed (spool_foreign; the reader drops it before routing). lane None = the pre-0.14.56 whole-fleet ladder.
     """
     key = entry.get("key")
     if isinstance(key, str) and key:
         if "@" in key:                       # ① 정식 키 명시
+            if lane is not None and spool_foreign(entry, lane):
+                return None                  # 다른 레인의 정식 키 — 신뢰하지 않는다(강등도 없음)
             if world.has_full_key(key):
                 return key
-            # 스냅샷에 없는 정식 키 → 신뢰하지 않고 role 폴백으로 강등(③)
+            # 스냅샷에 없는 (같은 레인의) 정식 키 → 신뢰하지 않고 role 폴백으로 강등(③)
         else:                                # ② bare surface:N (하위호환)
-            fk = world.unique_full_key_for_ref(key)
+            fk = world.unique_full_key_for_ref(key, lane)
             if fk is not None:
                 return fk
-    return world.role_key((entry.get("payload") or {}).get("agent"))
+    return world.role_key((entry.get("payload") or {}).get("agent"), lane)
 
 
-def route_spool(entry, world, coal, now=None):
+def route_spool(entry, world, coal, now=None, lane=None):
     """EVT spool 항목 1건 → 방출 프레임 목록 (+월드 반영). 순수 로직 (테스트 대상).
 
     route_event와 동형 시그니처. 반환 (frames, poke). 상태 반영은 항상 수행하고
     fx 프레임만 Coalescer 예산·백로그 게이트(BACKLOG_FX_SECS)로 억제한다(계약 §2).
+    (0.14.56) lane = the record's lane (attribute_spool). A foreign-key record does nothing here; world.blocked
+    entries carry `lane`, and task.blocked / task.unblocked act on the same (lane, task) only (DESIGN-r3 §2).
     """
+    if lane is not None and spool_foreign(entry, lane):
+        return [], False
     now = time.time() if now is None else now
     typ = entry.get("type")
     p = entry.get("payload") or {}
     ts = entry.get("ts") or now
     backlog = (now - ts) > BACKLOG_FX_SECS
-    key = attribute_spool(entry, world)
+    key = attribute_spool(entry, world, lane)
     frames = []
 
     if typ == "task_progress":
@@ -1143,15 +1217,17 @@ def route_spool(entry, world, coal, now=None):
         task = p.get("task")
         bb = p.get("blocked_by") if isinstance(p.get("blocked_by"), list) else []
         with world.lock:
-            world.blocked = [b for b in world.blocked if b.get("task") != task]
-            world.blocked.append({"task": task, "blocked_by": bb, "key": key, "ts": ts})
+            world.blocked = [b for b in world.blocked
+                             if not (b.get("lane") == lane and b.get("task") == task)]
+            world.blocked.append({"task": task, "blocked_by": bb, "key": key, "ts": ts, "lane": lane})
         if coal.allow(typ, key):
             frames.append({"t": "fx", "kind": "blocked", "task": task,
                            "blocked_by": bb, "key": key})
     elif typ == "task.unblocked":
         task = p.get("task")
         with world.lock:
-            world.blocked = [b for b in world.blocked if b.get("task") != task]
+            world.blocked = [b for b in world.blocked
+                             if not (b.get("lane") == lane and b.get("task") == task)]
         if coal.allow(typ, key):
             frames.append({"t": "fx", "kind": "unblocked", "task": task, "key": key})
 
@@ -1165,6 +1241,8 @@ def tail_spool(path, offset):
 
     파일 축소/truncate 감지 시 0부터. 미완결 마지막 줄(쓰는 중)은 다음 폴에 넘긴다.
     깨진 JSON 줄은 skip (음성 케이스).
+    (0.14.56 slice H) Only the archive leftover read (maybe_rotate_spool) uses this. The live spool is read by
+    read_spool_lane: this function's "absent or shrunk -> 0" is exactly the replay that CEO E5 forbids on a live file.
     """
     try:
         size = os.path.getsize(path)
@@ -1195,27 +1273,118 @@ def tail_spool(path, offset):
     return entries, offset + len(chunk)
 
 
-def maybe_rotate_spool(path, offset):
+def _rename_no_overwrite(src, dst):
+    """(0.14.56 · DESIGN-r2 3-3) Rename src to dst, never over an existing dst. POSIX: os.link (FileExistsError when dst
+    exists) then os.unlink(src); in the link window both names hold one inode, so an append there lands in the archive
+    and the leftover tail picks it up. Windows: os.rename (never overwrites there). If the unlink step fails, the second
+    name this same call just made is taken back (the bytes stay under src - one inode, no byte removed) and the error
+    is raised, so the caller skips this rotation and retries on the next drain."""
+    if os.name == "nt":
+        os.rename(src, dst)
+        return
+    os.link(src, dst)
+    try:
+        os.unlink(src)
+    except OSError:
+        # (0.14.56 head ruling 4b - a cleanup may never become a data loss) take back the second name ONLY while src still
+        # names the same file. An unlink that removed src and still raised (a remove retried by a network filesystem) left
+        # dst as the ONLY name: keep it - the rename is then complete.
+        try:
+            same = os.path.samefile(src, dst)
+        except FileNotFoundError:
+            return          # src is gone: dst is the only name - the rename is complete
+        except OSError:
+            raise           # state unknown: keep both names (one inode, no byte at risk) and skip - never reset the offset
+        if not same:
+            return          # a producer already made a NEW src: dst holds the old bytes - the rename is complete
+        try:
+            os.unlink(dst)
+        except OSError:
+            pass
+        raise
+
+
+def archive_spool(path, now=None):
+    """(0.14.56 · ADDENDUM-1 Q5, DESIGN-r2 3-3) Rename a live spool to `evt_spool.<UTC YYYYmmddTHHMMSSZ>.jsonl` in its own
+    directory - the only move this bridge ever makes of a spool (CEO E5 invariants: no delete, no truncate, keep every
+    archive). Name taken -> `-2` .. `-99`, then skip; any other OSError (no hard links on that filesystem, a producer
+    holding the file on Windows) -> skip. Returns the archive path, or None when nothing was renamed (K5)."""
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(time.time() if now is None else now))
+    d = os.path.dirname(path)
+    for n in range(1, 100):
+        dst = os.path.join(d, "evt_spool.%s%s.jsonl" % (stamp, "" if n == 1 else "-%d" % n))
+        try:
+            _rename_no_overwrite(path, dst)
+            return dst
+        except FileExistsError:
+            continue
+        except OSError as e:
+            _rotation_skipped(path, type(e).__name__)
+            return None
+    _rotation_skipped(path, "every archive name of this second is taken")
+    return None
+
+
+_ROTATE_SKIP_LOGGED = set()   # (spool path, reason) already logged - a drain runs every second; cleared by a rotation
+
+
+def _rotation_skipped(path, reason):
+    """(0.14.56 head ruling 5) A skipped rotation is readable in the log, once per (spool, reason)."""
+    if (path, reason) in _ROTATE_SKIP_LOGGED:
+        return
+    _ROTATE_SKIP_LOGGED.add((path, reason))
+    _log("spool rotation skipped for %s (%s) - nothing changed, retried on the next drain" % (path, reason))
+
+
+def spool_archives(state_dir):
+    """(0.14.56 · Q5) (count, total bytes) of `evt_spool.<UTC>[-N].jsonl` archives in a lane's state dir (0, 0 if unreadable)."""
+    n = total = 0
+    try:
+        names = os.listdir(state_dir)
+    except OSError:
+        return 0, 0
+    seen = set()
+    for fn in names:
+        if _SPOOL_ARCHIVE_RE.match(fn):
+            try:
+                st = os.stat(os.path.join(state_dir, fn))
+            except OSError:
+                continue
+            # (0.14.56 head ruling 3b) a crash between link and unlink leaves two names of ONE inode - one archive
+            key = (st.st_dev, st.st_ino)
+            if st.st_ino and key in seen:
+                continue
+            seen.add(key)
+            total += st.st_size
+            n += 1
+    return n, total
+
+
+def maybe_rotate_spool(path, offset, now=None):
     """드레인 상태에서 offset이 상한 초과 시 spool 로테이션. 순수 로직 (tmpdir 테스트 대상).
 
     반환 (rotated:bool, leftover_entries:list, new_offset:int). 호출자는 이번 폴에서 신규 항목
     0(드레인)일 때만 호출한다. 방출자(javis_event._spool_append)는 open→write(1줄 원자)→close
-    **단발**이라 os.replace(rename) 이후의 append는 새 파일(O_CREAT)에 착지한다 — 이 가정 위에서
-    교체 직전 창(마지막 tail~rename 사이)에 착지한 완결 줄은 .old를 기존 offset부터 한 번 더
-    tail해 회수한다(무유실). 이후 .old 삭제·offset=0.
+    **단발**이라 rename 이후의 append는 새 파일(O_CREAT)에 착지한다 — 이 가정 위에서
+    교체 직전 창(마지막 tail~rename 사이)에 착지한 완결 줄은 보관본을 기존 offset부터 한 번 더
+    tail해 회수한다(무유실).
+    (0.14.56 X-8 CARRIER) 보관본은 지우지 않는다 — `evt_spool.<UTC>.jsonl` 로 남는다(archive_spool). 호출자는 회수분을
+    라우팅한 **뒤에** offset 0 을 영속한다(DESIGN-r2 3-3).
     """
     if offset <= SPOOL_ROTATE_BYTES:
         return False, [], offset
-    old = path + ".old"
-    try:
-        os.replace(path, old)
-    except OSError:
+    archive = archive_spool(path, now)
+    if archive is None:
         return False, [], offset
-    leftover, _ = tail_spool(old, offset)   # rename 직전 착지분 회수
     try:
-        os.remove(old)
+        size = os.path.getsize(archive)
     except OSError:
-        pass
+        size = -1
+    # (0.14.56 head ruling 5) every rotation is a readable log line - which spool, which archive, how many bytes
+    _log("spool rotated: %s -> %s (%d B kept in the archive, nothing deleted)" % (path, os.path.basename(archive), size))
+    for k in [k for k in _ROTATE_SKIP_LOGGED if k[0] == path]:
+        _ROTATE_SKIP_LOGGED.discard(k)
+    leftover, _ = tail_spool(archive, offset)   # rename 직전 착지분 회수
     return True, leftover, 0
 
 
@@ -1868,21 +2037,281 @@ class SubscriptionSupervisor:
 
 
 # --------------------------------------------- 오피스 디테일 v1.1 수집 루프
-def _load_offset(path):
+def _blank_ident():
+    """(slice H) The record of a lane with nothing consumed: the next file at the live name is read from 0."""
+    return {"offset": 0, "head": b"", "tail": b"", "prev_head": None, "last_ts": None}
+
+
+def _load_offset_record(path):
+    """(0.14.56 slice H · DESIGN-NOTE-H + ADDENDUM-1) The persisted v2 offset record, or None = first sight (missing, unreadable,
+    not v2 - a plain-integer file of the unreleased e59aae92 included - or inconsistent). First sight never replays."""
     try:
-        with open(path) as f:
-            return int(f.read().strip() or 0)
-    except (OSError, ValueError):
-        return 0
+        with open(path, "rb") as f:
+            d = json.loads(f.read().decode("utf-8"))
+        if not isinstance(d, dict) or d.get("v") != 2:
+            return None
+        off, lt, ph = d["offset"], d.get("last_ts"), d.get("prev_head")
+        head = base64.b64decode(d.get("head") or "", validate=True)
+        tail = base64.b64decode(d.get("tail") or "", validate=True)
+        prev = base64.b64decode(ph, validate=True) if ph else None
+    except (OSError, ValueError, KeyError, TypeError, UnicodeDecodeError):
+        return None
+    if type(off) is not int or off < 0 or (off > 0 and not head):
+        return None
+    if lt is not None and not (type(lt) in (int, float) and -1e18 < lt < 1e18):   # NaN and inf fail the comparison
+        return None
+    if max(len(head), len(tail), len(prev or b"")) > SPOOL_HEAD_BYTES:
+        return None
+    return {"offset": off, "head": head, "tail": tail, "prev_head": prev, "last_ts": lt}
 
 
-def _save_offset(path, offset):
+def _save_offset_record(path, ident):
+    """True when written. (0.14.56) A failed first-sight save makes the next poll first sight again (K4).
+    (slice H) tmp + os.replace, and the record keeps its file's mode: a save over an existing record restores that record's
+    mode; the first write gets what the former in-place open(path, "w") gave (0o666 minus the umask - never mkstemp's 0600)."""
+    body = json.dumps({"v": 2, "offset": ident["offset"], "last_ts": ident["last_ts"],
+                       "head": base64.b64encode(ident["head"]).decode("ascii"),
+                       "tail": base64.b64encode(ident["tail"]).decode("ascii"),
+                       "prev_head": base64.b64encode(ident["prev_head"]).decode("ascii") if ident["prev_head"] else None},
+                      sort_keys=True).encode("utf-8")
+    tmp = "%s.tmp-%d" % (path, os.getpid())
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w") as f:
-            f.write(str(offset))
+        try:
+            mode = os.stat(path).st_mode & 0o7777
+        except FileNotFoundError:
+            mode = None
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+        try:
+            fd = os.open(tmp, flags, 0o666)
+        except FileExistsError:
+            os.unlink(tmp)                 # this process's own leftover (the name carries its pid)
+            fd = os.open(tmp, flags, 0o666)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(body)
+            if mode is not None:
+                os.chmod(tmp, mode)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        return True
     except OSError:
-        pass
+        return False
+
+
+def _open_regular(path):
+    """(slice H · R1-1) Open a spool file for reading without blocking: the reader used to stat before it opened, and a plain
+    open() of a FIFO (or a device) at that name would block the spool thread forever. O_NONBLOCK makes that open return, and
+    anything but a regular file is refused with OSError - the lane is HELD, never read."""
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
+    try:
+        if os.fstat(fd).st_mode & 0o170000 != 0o100000:      # not S_IFREG
+            raise OSError("%s is not a regular file" % path)
+        return os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _first_line(buf):
+    """(slice H) The first record line of `buf` (with its newline), cut to SPOOL_HEAD_BYTES; None while it cannot be judged yet
+    (no newline in a buffer shorter than SPOOL_HEAD_BYTES). A copy or a restore keeps it; an append never changes it."""
+    nl = buf.find(b"\n", 0, SPOOL_HEAD_BYTES)
+    if nl != -1:
+        return buf[:nl + 1]
+    return buf[:SPOOL_HEAD_BYTES] if len(buf) >= SPOOL_HEAD_BYTES else None
+
+
+def _parse_lines(chunk):
+    entries = []
+    for raw in chunk.split(b"\n"):
+        if not raw.strip():
+            continue
+        try:
+            entries.append(json.loads(raw.decode("utf-8")))
+        except (ValueError, UnicodeDecodeError):
+            continue           # 깨진 줄 skip
+    return entries
+
+
+def _ts(entry):
+    v = entry.get("ts") if isinstance(entry, dict) else None
+    return v if type(v) in (int, float) and -1e18 < v < 1e18 else None
+
+
+def _max_ts(entries, floor):
+    for e in entries:
+        t = _ts(e)
+        if t is not None and (floor is None or t > floor):
+            floor = t
+    return floor
+
+
+def _tail_at(f, n):
+    """(slice H) The bytes from the last newline before byte n up to n (the last consumed line), cut to SPOOL_HEAD_BYTES."""
+    if n <= 0:
+        return b""
+    lo = max(0, n - SPOOL_HEAD_BYTES)
+    f.seek(lo)
+    win = f.read(n - lo)
+    return win[win.rfind(b"\n", 0, max(len(win) - 1, 0)) + 1:]
+
+
+def _ident_at(f, n, head, prev_head, last_ts):
+    return {"offset": n, "head": head if n > 0 else b"", "tail": _tail_at(f, n), "prev_head": prev_head,
+            "last_ts": last_ts}
+
+
+def _first_sight_ident(path):
+    """(slice H) First sight never replays: EOF when the spool exists (every present byte counts as consumed, and so does the
+    newest ts among the whole lines of its last SPOOL_HEAD_BYTES), 0 when it is absent or has no whole first line yet."""
+    try:
+        with _open_regular(path) as f:
+            size = os.fstat(f.fileno()).st_size
+            first = _first_line(f.read(SPOOL_HEAD_BYTES)) if size else None
+            if not first:
+                return _blank_ident()
+            lo = max(0, size - SPOOL_HEAD_BYTES)
+            f.seek(lo)
+            win = f.read(size - lo)
+            if lo:
+                win = win[win.find(b"\n") + 1:]   # drop the cut first line of the window
+            return _ident_at(f, size, first, None, _max_ts(_parse_lines(win[:win.rfind(b"\n") + 1]), None))
+    except OSError:
+        return _blank_ident()
+
+
+def _archive_firsts(spool_dir):
+    """(slice H · GO amendment 1, the CEO's directory predicate) (name, first line, newest ts of its last lines) of every
+    archive `evt_spool.<UTC>[-N].jsonl` in a lane's spool directory. An unreadable archive is skipped (stated residual)."""
+    out = []
+    try:
+        names = os.listdir(spool_dir)
+    except OSError:
+        return out
+    for fn in sorted(names):
+        if not _SPOOL_ARCHIVE_RE.match(fn):
+            continue
+        try:
+            with _open_regular(os.path.join(spool_dir, fn)) as f:
+                size = os.fstat(f.fileno()).st_size
+                first = _first_line(f.read(SPOOL_HEAD_BYTES))
+                lo = max(0, size - SPOOL_HEAD_BYTES)
+                f.seek(lo)
+                win = f.read(size - lo)
+        except OSError:
+            continue
+        if first:
+            if lo:
+                win = win[win.find(b"\n") + 1:]
+            out.append((fn, first, _max_ts(_parse_lines(win[:win.rfind(b"\n") + 1]), None)))
+    return out
+
+
+def _resync(f, ident, first, floor_ts, note):
+    """(slice H rows 5/6) The file at the live name holds bytes already consumed (an older copy or a rotated spool that came
+    back). Route ONLY the records newer than everything consumed (ts > the floor) - the records appended after the swap or
+    restore and before this poll - and continue at the end of its last whole line. Never a replay."""
+    floor = ident["last_ts"]
+    if floor_ts is not None and (floor is None or floor_ts > floor):
+        floor = floor_ts
+    f.seek(0)
+    data = f.read()
+    end = data.rfind(b"\n") + 1
+    parsed = _parse_lines(data[:end])
+    # Strict ">": a record whose ts EQUALS the floor is SKIPPED - the consumed record that set last_ts carries exactly that ts,
+    # so ">=" would replay it. A new record with the identical float ts (or an earlier one raced in after the swap, or written
+    # after a backward clock step) is the named residual: skipped from view, never replayed - and counted in the line below.
+    new = [e for e in parsed if floor is not None and _ts(e) is not None and _ts(e) > floor]
+    note = "%s; routed %d newer record(s), skipped %d (ts <= %r already read, or no numeric ts)" % (
+        note, len(new), len(parsed) - len(new), floor)
+    return new, _ident_at(f, end, first, ident["prev_head"], _max_ts(new, floor)), note
+
+
+def read_spool_lane(path, ident):
+    """(0.14.56 slice H · F2 · CEO E5 "never re-read as new") One poll of a lane's live spool against its offset record.
+    Returns (entries, new_record, note). new_record None = HOLD: nothing read, nothing to save (note = the OSError, if any).
+    One open file serves the identity check and the read (no TOCTOU between them). Rows of DESIGN-NOTE-H(+ADDENDUM-1):
+      absent / stat error / empty / first line not judgeable yet -> HOLD (the offset is never set to 0 by an absence);
+      same first line, byte N still ends the last consumed line -> continue at N;
+      same first line otherwise (an install's copy, a restore) -> _resync;
+      first line of the last rotated spool or of ANY archive in the spool dir -> _resync (a rotated spool came back);
+      anything else -> a different file, read from 0 (the only reset besides this bridge's own rotation)."""
+    try:
+        f = _open_regular(path)
+    except OSError as e:
+        return [], None, e
+    with f:
+        try:
+            size = os.fstat(f.fileno()).st_size
+            first = _first_line(f.read(SPOOL_HEAD_BYTES)) if size else None
+            if first is None:
+                return [], None, None
+            n, head = ident["offset"], ident["head"]
+            if head and first == head:
+                if size >= n and _tail_at(f, n) == ident["tail"]:
+                    start, note = n, None
+                else:
+                    return _resync(f, ident, first, None, "%s holds bytes already read but does not continue at the saved "
+                                   "offset %d (now %d B) - an older copy (a pack install or a restore): only records newer "
+                                   "than those already read are routed, nothing is replayed" % (path, n, size))
+            else:
+                if first == ident["prev_head"]:
+                    return _resync(f, ident, first, None, "%s starts like the last rotated spool - it came back under the "
+                                   "live name (an install's copy or a restore): nothing is replayed" % path)
+                for name, afirst, ats in _archive_firsts(os.path.dirname(path)):
+                    if first == afirst:
+                        return _resync(f, ident, first, ats, "%s starts like the archive %s - it came back under the live "
+                                       "name (a restore): nothing is replayed" % (path, name))
+                start = 0
+                note = ("%s is a different file (its first record is not the one already read, nor any archive's): "
+                        "reading it from 0" % path) if head else None
+            f.seek(start)
+            data = f.read()
+            end = start + data.rfind(b"\n") + 1 if b"\n" in data else start
+            entries = _parse_lines(data[:end - start])
+            return entries, _ident_at(f, end, first if end else b"", ident["prev_head"],
+                                      _max_ts(entries, ident["last_ts"])), note
+        except OSError as e:
+            return [], None, e
+
+
+def _install_in_progress(pack_dir, now=None):
+    """(0.14.56 slice H · F1-C G-b) The name of a live pack install next to pack_dir - a `.pack-staging-init-<pid>` sibling
+    (pack.rs init_staging_dir: it exists from install_staged's copy until atomic_swap renames it into place) younger than
+    STAGING_FRESH_SECS - "<parent> unreadable" when the parent cannot be listed, or None. The name carries no lane, so any
+    install defers every lane. An older sibling is a crashed install's residue: logged once and ignored."""
+    if not pack_dir:
+        return None
+    parent = os.path.dirname(os.path.normpath(pack_dir))
+    now = time.time() if now is None else now
+    try:
+        names = os.listdir(parent)
+    except OSError as e:
+        return "%s unreadable: %s" % (parent, type(e).__name__)
+    for fn in sorted(names):
+        if not fn.startswith(_STAGING_PREFIX):
+            continue
+        p = os.path.join(parent, fn)
+        try:
+            age = now - os.lstat(p).st_mtime
+        except OSError:
+            continue                       # gone between the listing and the stat: that install has swapped or failed
+        if age < STAGING_FRESH_SECS:
+            return fn
+        if p not in _STAGING_RESIDUE_LOGGED:
+            _STAGING_RESIDUE_LOGGED.add(p)
+            _log("pack staging residue ignored by spool rotation: %s (%d s old - a crashed install; `cys doctor --fix` "
+                 "removes it)" % (p, age))
+    return None
+
+
+_STAGING_RESIDUE_LOGGED = set()
 
 
 def load_heat(world):
@@ -1925,26 +2354,336 @@ def persist_heat(world):
         pass
 
 
-def spool_loop(world, hub, coal):
-    """EVT spool tail → route_spool → SSE (1s 폴링·오프셋 영속·truncate 감지·상한 로테이션)."""
-    offset = _load_offset(EVT_OFFSET_PATH)
-    while True:
-        entries, offset = tail_spool(EVT_SPOOL_PATH, offset)
-        if not entries:   # 드레인 상태에서만 로테이션 시도 (무제한 성장 봉인)
-            rotated, entries, offset = maybe_rotate_spool(EVT_SPOOL_PATH, offset)
-            if rotated:
-                _save_offset(EVT_OFFSET_PATH, offset)   # offset=0 즉시 영속
-        if entries:
-            for entry in entries:
-                frames, _ = route_spool(entry, world, coal)
-                for fr in frames:
-                    hub.publish(fr)
-                    if fr.get("t") == "fx":
-                        archive_fx(entry.get("ts"), fr)
-            _save_offset(EVT_OFFSET_PATH, offset)
-            fr = world.top_frame("blocked")  # blocked[] 변경 시 상단 갱신
+# ------------------------------------- 0.14.56 X-8 CARRIER — per-lane spool reader (DESIGN-r3 §1·§2 · PLAN contract 3)
+def _load_spool_leaf(path=None):
+    """Load javis_spool_path.py by EXPLICIT PATH (ADDENDUM-1 Q3) - never a bare import: under `python -I` the script
+    directory is not on sys.path. Returns (module, None) or (None, "<ExceptionType>"); no exception leaves (K9)."""
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("javis_spool_path", path or SPOOL_LEAF_PATH)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        if not callable(getattr(mod, "spool_path_for_pack", None)):
+            raise AttributeError("spool_path_for_pack")
+        return mod, None
+    except Exception as e:
+        return None, type(e).__name__
+
+
+def spool_self_check(pack_dir, want, python=None, timeout=None):
+    """One lane's self-check (DESIGN §3(B) table · DESIGN-r3 §1): run THAT lane's own producer code -
+    `<pack_dir>/bin/javis_event.py spool-path` - and compare what it prints with the reader's path `want`.
+
+    Returns (check, why): ("verified", None) = the same file (the lane is then ok/absent by the file itself);
+    ("mismatch", why) = another file (FAULT, the lane is not read - the 37-day class, caught at start);
+    ("unverified", why) = rc 2 (an older pack without the subcommand - read with the formula, not a fault), or a
+    timeout / a child that did not run / any other rc. Equal = the same string, or the same path after lexical
+    normalisation (the child prints `<abspath of its pack>/state/evt_spool.jsonl`; no symlink is resolved).
+    BYTES mode + an explicit decode (r2 gemini2-3): the AST census of text-mode children (test_hud_bridge_backoff
+    SourceCensus) counts only calls passing text= / universal_newlines=, so it stays 5 by construction.
+    """
+    script = os.path.join(pack_dir, "bin", "javis_event.py")
+    try:
+        r = subprocess.run([python or sys.executable, "-I", "-B", script, "spool-path"], capture_output=True,
+                           timeout=SPOOL_CHECK_TIMEOUT_SECS if timeout is None else timeout, **_nostdin(), **NOWIN)
+    except subprocess.TimeoutExpired:
+        return "unverified", "spool-path timed out"
+    except Exception as e:
+        return "unverified", "spool-path did not run (%s)" % type(e).__name__
+    if r.returncode == 2:
+        return "unverified", "spool-path rc 2 (older pack without the subcommand)"
+    if r.returncode != 0:
+        return "unverified", "spool-path rc %s" % r.returncode
+    out = r.stdout.decode("utf-8", "surrogateescape").strip()
+    if out == want or os.path.normpath(out) == os.path.normpath(os.path.abspath(want)):
+        return "verified", None
+    return "mismatch", "the lane's producers write %r" % out[:200]
+
+
+def _spool_entry(lane, socket, state, path=None, size=None, archives=0, archive_bytes=0, offset=None, dropped=0):
+    """One /health `spool` entry - every key always present (PLAN contract 3). `fault` is the daemon's one decider."""
+    return {"lane": lane, "socket": socket, "state": state, "fault": state in SPOOL_FAULT_STATES, "path": path,
+            "bytes": size, "archives": archives, "archive_bytes": archive_bytes, "offset": offset,
+            "foreign_key_dropped": dropped}
+
+
+class SpoolReader:
+    """Per-lane spool reader (0.14.56 X-8 CARRIER · DESIGN-r3 §1·§2). Lanes: `main` (P = this bridge's ROOT) and one per
+    `cys fleet --json` dept row (P = the row's additive `pack_dir`; null -> unknown_pack, never guessed). Each lane's
+    spool is spool_path_for_pack(P) from the leaf; a record's lane is the lane of its file.
+
+    tick() runs on spool_loop's one thread. health() runs on HTTP threads and only copies under self.lock; the
+    self-check child never runs under the lock. No lane is read before the first merge_fleet that carried a non-null
+    fleet (the startup gate); offsets do not move while waiting.
+    """
+
+    def __init__(self, world, hub, coal, root=None, state_dir=None, leaf_path=None, cap=None, clock=None,
+                 python=None):
+        self.world, self.hub, self.coal = world, hub, coal
+        self.root = ROOT if root is None else root
+        self.state_dir = STATE_DIR if state_dir is None else state_dir
+        self.leaf_path = leaf_path or SPOOL_LEAF_PATH
+        self.cap = SUB_CAP if cap is None else cap
+        self.clock = clock or time.monotonic
+        self.python = python
+        self.lock = threading.Lock()
+        self.t0 = self.clock()
+        self.leaf, err = _load_spool_leaf(self.leaf_path)
+        self.leaf_tried = self.t0
+        self.fleet_state = "waiting"       # -> ok on the first non-null fleet | fleet_unavailable at 60 s (latched) -> ok
+        self.fleet_gen = 0                 # world.fleet_gen last applied
+        self.sig = None                    # identity of the lane table last built
+        self.checked = self.leaf is None   # spool_checked; a missing leaf is a terminal startup fault -> latched now (K9)
+        self.lanes = [self._rec("main", None, self.root, None)]
+        self.held = set()                  # (slice H) (lane, error) already logged while a lane's spool cannot be read
+        if self.leaf is None:
+            _log("spool leaf unavailable: %s - no spool is read (lane _bridge leaf_missing)" % err)
+
+    def _rec(self, lane, socket, pack_dir, structural):
+        path = None
+        if self.leaf is not None and pack_dir is not None:
+            try:
+                path = self.leaf.spool_path_for_pack(pack_dir)   # known before the first check (state stays unverified until it)
+            except Exception:
+                path = None
+        return {"lane": lane, "socket": socket, "pack_dir": pack_dir, "structural": structural, "path": path,
+                "check": None, "why": None, "checked_at": None, "offset": None, "foreign_key_dropped": 0,
+                "ident": None}             # (slice H) the offset record in memory (read_spool_lane); None = load it
+
+    def _offset_path(self, lane):
+        return os.path.join(self.state_dir, "evt_spool-%s.offset" % lane)
+
+    def _check(self, rec):
+        """(check, why, path) of one lane. Precedence: leaf_missing > lane_key_collision / over_cap > unknown_pack >
+        pack_missing > the lane's own `spool-path`. Never raises."""
+        if self.leaf is None:
+            return "leaf_missing", None, None
+        pack, path = rec["pack_dir"], None
+        if pack is not None:
+            try:
+                path = self.leaf.spool_path_for_pack(pack)
+            except Exception as e:
+                return "leaf_missing", type(e).__name__, None
+        if rec["structural"]:
+            return rec["structural"], None, path
+        if path is None:
+            return "unknown_pack", None, None
+        if not os.path.isdir(pack):
+            return "pack_missing", None, path
+        check, why = spool_self_check(pack, path, self.python)
+        return check, why, path
+
+    def _run_check(self, rec, now):
+        check, why, path = self._check(rec)
+        with self.lock:
+            old = (rec["check"], rec["why"])
+            rec["check"], rec["why"], rec["path"], rec["checked_at"] = check, why, path, now
+            if check not in ("verified", "unverified"):
+                rec["offset"] = None       # not read while faulted; the persisted offset is reloaded when it clears
+                rec["ident"] = None
+        if (check, why) != old:            # one stderr line per change (DESIGN 3(B) "loud" (i))
+            _log("spool lane %s: %s%s" % (rec["lane"], "self-check agrees" if check == "verified" else check,
+                                          " - %s" % why if why else ""))
+
+    def _build(self):
+        """Lane table from the newest non-null fleet. None = no fleet merged since the last call; else
+        (records to self-check now, first) - first = the first fleet: every lane it lists is checked."""
+        gen = getattr(self.world, "fleet_gen", 0) or 0
+        if gen == self.fleet_gen:
+            return None
+        self.fleet_gen = gen
+        rows = self.world.spool_rows()
+        items = [("main", None, self.root)]
+        for r, (key, base) in zip(rows, spool_lane_keys(rows)):
+            if base:
+                continue
+            sock, pack = r.get("socket"), r.get("pack_dir")
+            items.append((key, sock if isinstance(sock, str) else None,
+                          pack if isinstance(pack, str) and pack else None))
+        counts = {}
+        for key, _s, _p in items:
+            counts[key] = counts.get(key, 0) + 1
+        # main first, then the dept lanes by key (stable) - the SUB_CAP cut (as reconcile_targets) and the /health order
+        order = items[:1] + sorted(items[1:], key=lambda it: it[0])
+        want = tuple((key, sock, pack, "lane_key_collision" if counts[key] > 1 else ("over_cap" if i >= self.cap else None))
+                     for i, (key, sock, pack) in enumerate(order))
+        first = self.fleet_state != "ok"
+        if want == self.sig and not first:
+            return [], False
+        pool = {}
+        for rec in self.lanes:
+            pool.setdefault((rec["lane"], rec["socket"], rec["pack_dir"], rec["structural"]), []).append(rec)
+        lanes, todo = [], []
+        for item in want:
+            got = pool.get(item)
+            if got:
+                rec = got.pop(0)
+                if first:
+                    todo.append(rec)
+            else:
+                rec = self._rec(*item)
+                todo.append(rec)
+            lanes.append(rec)
+        with self.lock:
+            self.lanes, self.sig = lanes, want
+        return todo, first
+
+    def tick(self):
+        """One reader pass: fleet gate and lane-set change, the 60 s re-check, then every readable lane is drained."""
+        now = self.clock()
+        built = self._build()
+        if built is not None:
+            todo, first = built
+            for rec in todo:
+                self._run_check(rec, now)
+            if first:
+                with self.lock:
+                    self.fleet_state = "ok"
+                    self.checked = True    # the first non-null fleet + one full self-check pass over every lane it lists
+                _log("spool: first fleet merged - %d lane(s) self-checked" % len(todo))
+        elif self.fleet_state == "waiting" and now - self.t0 >= SPOOL_FLEET_WAIT_SECS:
+            with self.lock:
+                self.fleet_state = "fleet_unavailable"
+                self.checked = True        # a terminal startup fault is latched (K7)
+            _log("spool: no fleet within %.0fs - lane _fleet fleet_unavailable; no lane is read" % SPOOL_FLEET_WAIT_SECS)
+        if self.leaf is None and now - self.leaf_tried >= SPOOL_RECHECK_SECS:
+            self.leaf_tried = now
+            leaf, _err = _load_spool_leaf(self.leaf_path)
+            if leaf is not None:
+                with self.lock:
+                    self.leaf = leaf
+                    for rec in self.lanes:
+                        rec["checked_at"] = None
+                _log("spool leaf loaded - every lane is self-checked again")
+        for rec in list(self.lanes):       # re-check every lane in FAULT or unverified (DESIGN-r2 1-5; clears only on a positive check, K8)
+            c = rec["check"]
+            if (c is None or c == "unverified" or c in SPOOL_FAULT_STATES) and \
+                    (rec["checked_at"] is None or now - rec["checked_at"] >= SPOOL_RECHECK_SECS):
+                self._run_check(rec, now)
+        if self.fleet_state != "ok" or self.leaf is None:
+            return                         # the startup gate: nothing is read, no offset moves
+        for rec in list(self.lanes):
+            if rec["check"] in ("verified", "unverified") and rec["path"]:
+                self._drain(rec)
+
+    def _drain(self, rec):
+        """Tail one lane's spool; route each record with ITS lane; rotate when drained (DESIGN-r2 3-3).
+        (0.14.56 slice H) The offset record carries the file's identity and read_spool_lane judges the file at the live name
+        against it before reading: an absence never resets the offset, and only a different file or this bridge's own
+        rotation starts at 0. A rotation waits while a pack install can be in its copy->swap window (_rotation_gate)."""
+        path, lane = rec["path"], rec["lane"]
+        opath = self._offset_path(lane)
+        ident = rec["ident"]
+        if ident is None:
+            ident = _load_offset_record(opath)
+            if ident is None:              # first sight: no replay - EOF if the spool exists, 0 if not (its first batch is read)
+                ident = _first_sight_ident(path)
+                if not _save_offset_record(opath, ident):
+                    return                 # K4: first sight again next poll (a view window may be skipped; no byte removed)
+            with self.lock:
+                rec["ident"], rec["offset"] = ident, ident["offset"]
+        entries, new, note = read_spool_lane(path, ident)
+        if new is None:                    # HOLD: nothing read, nothing saved, retried next poll
+            if isinstance(note, OSError) and not isinstance(note, FileNotFoundError) \
+                    and (lane, type(note).__name__) not in self.held:
+                self.held.add((lane, type(note).__name__))
+                _log("spool lane %s: %s cannot be read (%s) - its offset is kept and the read is retried every poll"
+                     % (lane, path, note))
+            return
+        self.held = {h for h in self.held if h[0] != lane}
+        if note:
+            _log("spool lane %s: %s" % (lane, note))
+        rotated = False
+        if not entries and new["offset"] > SPOOL_ROTATE_BYTES:   # 드레인 상태에서만 로테이션 (무제한 성장 봉인 · 보관본은 지우지 않는다)
+            why = self._rotation_gate(rec)
+            if why:
+                _rotation_skipped(path, why)
+            else:
+                rotated, entries, _ = maybe_rotate_spool(path, new["offset"])
+                if rotated:                # the rotated file's first line is remembered: a copy of it coming back is not new
+                    new = dict(_blank_ident(), prev_head=new["head"], last_ts=_max_ts(entries, new["last_ts"]))
+                    self._after_rotation(rec, path)
+        routed = 0
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            if spool_foreign(entry, lane):
+                with self.lock:
+                    rec["foreign_key_dropped"] += 1
+                continue
+            frames, _ = route_spool(entry, self.world, self.coal, lane=lane)
+            routed += 1
+            for fr in frames:
+                self.hub.publish(fr)
+                if fr.get("t") == "fx":
+                    archive_fx(entry.get("ts"), fr)
+        if rotated or new != ident:
+            _save_offset_record(opath, new)   # after routing: a rotation's leftover is routed BEFORE offset 0 is kept
+        with self.lock:
+            rec["ident"], rec["offset"] = new, new["offset"]
+        if routed:
+            fr = self.world.top_frame("blocked")  # blocked[] 변경 시 상단 갱신
             if fr:
-                hub.publish(fr)
+                self.hub.publish(fr)
+
+    def _rotation_gate(self, rec):
+        """(0.14.56 slice H · F1-C) Why a rotation must wait now, or None. G-a: the update path starts cysd (and this bridge)
+        and runs init-pack right after; G-b: a live `.pack-staging-init-*` next to the lane's pack. Residual (named, GO
+        amendment 3): a bridge restarted more often than every ROTATE_START_GRACE_SECS never rotates - nothing is lost, the
+        live spool keeps growing, and each restart logs one deferral line."""
+        if self.clock() - self.t0 < ROTATE_START_GRACE_SECS:
+            return "bridge start grace (%d s after the bridge starts)" % ROTATE_START_GRACE_SECS
+        who = _install_in_progress(rec["pack_dir"])
+        return "pack install in progress (%s)" % who if who else None
+
+    def _after_rotation(self, rec, path):
+        """(slice H · F1-C) The residual TOCTOU, made readable: an install that began between the gate and the rename."""
+        who = _install_in_progress(rec["pack_dir"])
+        if who and who.startswith(_STAGING_PREFIX):
+            _log("spool rotation of %s may have raced a pack install (%s appeared during the rename): the archive just logged "
+                 "may live only in <pack>.prev until the next init-pack; a copy of it that comes back under the live name is "
+                 "not replayed" % (path, who))
+
+    def health(self):
+        """(spool_checked, entries) for /health (PLAN contract 3). `main`, `_bridge` and `_fleet` are ALWAYS listed (T8).
+        File facts (ok/absent, bytes, archives, archive_bytes) are measured here, outside the lock."""
+        with self.lock:
+            lanes = [dict(r) for r in self.lanes]
+            checked, fleet_state, leaf_ok = self.checked, self.fleet_state, self.leaf is not None
+        out = []
+        for r in lanes:
+            path, size, n, total = r["path"], None, 0, 0
+            if not leaf_ok:                # leaf missing: every listed lane is leaf_missing (path null) in every phase
+                out.append(_spool_entry(r["lane"], r["socket"], "leaf_missing", dropped=r["foreign_key_dropped"]))
+                continue
+            if path:
+                try:
+                    size = os.path.getsize(path) if os.path.isfile(path) else None
+                except OSError:
+                    size = None
+                n, total = spool_archives(os.path.dirname(path))
+            c = r["check"]
+            state = ("ok" if size is not None else "absent") if c == "verified" else (c or "unverified")
+            out.append(_spool_entry(r["lane"], r["socket"], state, path, size, n, total,
+                                    r["offset"] if state in SPOOL_READ_STATES else None, r["foreign_key_dropped"]))
+        out.append(_spool_entry("_bridge", None, "ok" if leaf_ok else "leaf_missing"))
+        out.append(_spool_entry("_fleet", None, fleet_state))
+        return checked, out
+
+
+def spool_loop(reader):
+    """EVT spool per-lane tail → route_spool → SSE (1s 폴링 · 레인별 오프셋 영속 · truncate 감지 · 상한 로테이션 — SpoolReader)."""
+    last_err = None
+    while True:
+        try:
+            reader.tick()
+            last_err = None
+        except Exception as e:   # (0.14.56) one failed pass never ends the reader thread (the pin's loop had no guard)
+            sig = type(e).__name__
+            if sig != last_err:
+                last_err = sig
+                _log("spool reader pass failed (%s: %s) - retried next poll; repeats not logged"
+                     % (sig, " ".join(str(e).split())[:120]))
         time.sleep(SPOOL_POLL_SECS)
 
 
@@ -2191,7 +2930,15 @@ def health_body():
         subs = None   # /health must answer even if the snapshot fails
     if subs is not None:
         subs["damaged_snapshots"] = dsnap
+    rd = _SPOOL
+    try:
+        spool_checked, spool = rd.health() if rd is not None else (False, None)
+    except Exception:
+        spool_checked, spool = False, None   # /health must answer even if the spool snapshot fails (the daemon's W1 sees no `spool`)
     return json.dumps({
+        "spool_schema": SPOOL_SCHEMA,        # (0.14.56 X-8 CARRIER · PLAN contract 3) read by every cysd's spool_watch
+        "spool_checked": spool_checked,
+        "spool": spool,
         "subs": subs,
         "ok": True,
         "pid": os.getpid(),
@@ -2322,7 +3069,10 @@ def main():
     global _SUPERVISOR
     _SUPERVISOR = sup   # (0.14.49) before the supervisor thread starts, so /health never sees a half-built object
     threading.Thread(target=sup.run, daemon=True).start()
-    threading.Thread(target=spool_loop, args=(world, hub, coal), daemon=True).start()
+    rd = SpoolReader(world, hub, coal)     # (0.14.56) loads the leaf by explicit path; reads no lane before the first non-null fleet
+    global _SPOOL
+    _SPOOL = rd                            # before its thread starts, so /health never sees a half-built reader
+    threading.Thread(target=spool_loop, args=(rd,), daemon=True).start()
     threading.Thread(target=kanban_loop, args=(world, hub), daemon=True).start()
     threading.Thread(target=verdict_loop, args=(world, hub), daemon=True).start()
     threading.Thread(target=board_loop, args=(world, hub), daemon=True).start()

@@ -1,0 +1,67 @@
+{
+ "_doc": "0.14.56 X-8 CARRIER golden /health spool fields (PLAN contract 3). Written by cysjavis-pack/bin/tests/test_hud_bridge_0144_unit.py --write-golden from the bridge's own health_body() over a fixed temp-rig world; \"/RIG\" stands for that rig directory. Python test: equality of spool_schema, spool_checked and spool. cysd spool_watch's Rust test include_str!s this file.",
+ "spool_schema": 1,
+ "spool_checked": true,
+ "spool": [
+  {
+   "lane": "main",
+   "socket": null,
+   "state": "ok",
+   "fault": false,
+   "path": "/RIG/main/state/evt_spool.jsonl",
+   "bytes": 194,
+   "archives": 1,
+   "archive_bytes": 64,
+   "offset": 194,
+   "foreign_key_dropped": 1
+  },
+  {
+   "lane": "dept-5",
+   "socket": "/Users/x/.local/state/cys-dept-dept-5/cys.sock",
+   "state": "mismatch",
+   "fault": true,
+   "path": "/RIG/dept-5/state/evt_spool.jsonl",
+   "bytes": null,
+   "archives": 0,
+   "archive_bytes": 0,
+   "offset": null,
+   "foreign_key_dropped": 0
+  },
+  {
+   "lane": "dept-7",
+   "socket": "/Users/x/.local/state/cys-dept-dept-7/cys.sock",
+   "state": "unknown_pack",
+   "fault": true,
+   "path": null,
+   "bytes": null,
+   "archives": 0,
+   "archive_bytes": 0,
+   "offset": null,
+   "foreign_key_dropped": 0
+  },
+  {
+   "lane": "_bridge",
+   "socket": null,
+   "state": "ok",
+   "fault": false,
+   "path": null,
+   "bytes": null,
+   "archives": 0,
+   "archive_bytes": 0,
+   "offset": null,
+   "foreign_key_dropped": 0
+  },
+  {
+   "lane": "_fleet",
+   "socket": null,
+   "state": "ok",
+   "fault": false,
+   "path": null,
+   "bytes": null,
+   "archives": 0,
+   "archive_bytes": 0,
+   "offset": null,
+   "foreign_key_dropped": 0
+  }
+ ]
+}

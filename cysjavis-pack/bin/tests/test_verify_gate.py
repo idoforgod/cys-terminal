@@ -7,8 +7,12 @@
 본 파일은 standalone 실행 전용:
 
     JAVIS_ROOT=<scratch> CYS_PROBE_RUNS=<scratch>/probe_runs.jsonl \
-    HUD_STATE_DIR=<scratch>/hud CYS_NO_AUTOSTART=1 \
+    CYS_NO_AUTOSTART=1 \
     python3 cysjavis-pack/bin/tests/test_verify_gate.py
+
+(0.14.56 X-8 A1: HUD_STATE_DIR no longer moves the event spool - it is <pack>/state/evt_spool.jsonl of the pack a
+tool runs from (bin/javis_spool_path.py). The tools this file runs - javis_task, javis_actprobe, the brief-lint
+hook - write no spool.)
 
 ★격리 hard assert(안전 계약 G1 — T1 브리프): JAVIS_ROOT·CYS_PROBE_RUNS 미설정 시 **실행 거부**.
   javis_task/wakeup 의 `ROOT = env or os.getcwd()` cwd 폴백이 라이브 `_round/`·pack state 를

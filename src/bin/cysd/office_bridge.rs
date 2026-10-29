@@ -18,6 +18,11 @@ use std::path::{Path, PathBuf};
 
 /// 자기 자식이 살아 있는 동안 건강 확인을 하는 주기.
 pub const PROBE_INTERVAL_SECS: u64 = 60;
+/// The bridge's port: `HUD_PORT` when it parses, else 8642 - ONE source for the bridge spawner and every daemon's spool
+/// watch (0.14.56 X-8 CARRIER; it was a literal in `main.rs`).
+pub fn bridge_port() -> u16 {
+    std::env::var("HUD_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(8642)
+}
 /// 연속 실패가 이 횟수에 이르면(약 3분) 브리지를 끝내고 다시 띄운다. 한 번이라도 성공하면 0 으로 돌아간다.
 pub const FAIL_LIMIT: u32 = 3;
 /// 재기동 상한 — 이 시간 창 안에 스폰이 이 횟수를 넘으면 …

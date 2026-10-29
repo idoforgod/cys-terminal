@@ -109,6 +109,61 @@ class Specimen(unittest.TestCase):
         except OSError:
             return ""
 
+    def wait_spool(self, p, pred, limit=20.0):
+        """(0.14.56) Poll /health until pred(body) holds - the reader thread checks lanes asynchronously."""
+        end, j = time.monotonic() + limit, None
+        while time.monotonic() < end:
+            if p.poll() is not None:
+                self.fail("브리지가 일찍 끝남: " + self.diag(p))
+            try:
+                j = self.health(1)[1]
+                if pred(j):
+                    return j
+            except Exception:
+                pass
+            time.sleep(0.1)
+        self.fail("spool 조건 미충족(%.0fs): %r · %s" % (limit, j and j.get("spool"), self.errlog()))
+
+    def rig(self, leaf=True):
+        """(0.14.56) A rig pack: a COPY of bin/ (no tests/) at <tmp>/rig/pack - so the bridge's main lane is
+        <tmp>/rig/pack/state/evt_spool.jsonl - and a dept pack <tmp>/rig/d7 whose javis_event.py answers `spool-path` with
+        its formula. The fake cys answers `fleet --json` with the base row + dept-7 (pack_dir = that dept pack)."""
+        pack = os.path.join(self.tmp, "rig", "pack")
+        shutil.copytree(BIN, os.path.join(pack, "bin"), ignore=shutil.ignore_patterns("tests", "__pycache__"))
+        leaf_file = os.path.join(pack, "bin", "javis_spool_path.py")
+        if not leaf and os.path.exists(leaf_file):
+            os.remove(leaf_file)
+        d7 = os.path.join(self.tmp, "rig", "d7")
+        os.makedirs(os.path.join(d7, "bin"))
+        with open(os.path.join(d7, "bin", "javis_event.py"), "w") as f:
+            f.write("import sys\nif sys.argv[1:] != ['spool-path']:\n    sys.exit(2)\nprint(%r)\n"
+                    % os.path.join(d7, "state", "evt_spool.jsonl"))
+        fj = os.path.join(self.tmp, "fleet.json")
+        with open(fj, "w") as f:
+            json.dump({"departments": [
+                {"department": "본부 · CEO", "dept": "main", "socket": None, "pack_dir": None, "surfaces": []},
+                {"department": "d7", "dept": "dept-7", "socket": os.path.join(self.tmp, "d7.sock"), "pack_dir": d7,
+                 "surfaces": []}]}, f, ensure_ascii=False)
+        fake = os.path.join(self.tmp, "fakecys-rig")
+        with open(fake, "w") as f:
+            f.write('#!/bin/sh\n'
+                    'for a in "$@"; do if [ "$a" = events ]; then echo $$ >> "%s"; exec sleep 300; fi; done\n'
+                    'for a in "$@"; do if [ "$a" = fleet ]; then cat "%s"; exit 0; fi; done\n'
+                    'echo "{}"\n' % (self.childpid, fj))
+        os.chmod(fake, 0o755)
+        return pack, d7, fake
+
+    def start_rig(self, pack, fake):
+        """(0.14.56) The rig's own bridge copy under `python -I -B` (a bare leaf import would not resolve there)."""
+        p = subprocess.Popen([sys.executable, "-I", "-B", os.path.join(pack, "bin", "javis_hud_bridge.py")],
+                             env=self.env(HUD_CYS_BIN=fake, HUD_POLL="0.3"), stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=open(os.path.join(self.tmp, "err.log"), "ab"))
+        self.procs.append(p)
+        return p
+
+    def offsets(self):
+        return sorted(n for n in os.listdir(self.state) if n.endswith(".offset"))
+
     def child_pids(self):
         try:
             return [int(x) for x in open(self.childpid).read().split()]
@@ -134,13 +189,28 @@ class Specimen(unittest.TestCase):
         self.assertRegex(j["boot_id"], r"^[0-9a-f]{16}$")
         self.assertEqual(sorted(j["assets"]), ["office3d_html", "office_boot_js", "three_module_js"])
         self.assertEqual(j["timeouts"], 0)
+        # (0.14.56 X-8 CARRIER · T8 on the real process) /health lists main, _bridge and _fleet. The fake cys answers `{}`
+        # (no fleet), so the startup gate stays closed: `_fleet` waiting (no fault), spool_checked false, no lane read.
+        j = self.wait_spool(p, lambda j: bool(j.get("spool")))
+        self.assertEqual((j["spool_schema"], j["spool_checked"]), (1, False))
+        lanes = {e["lane"]: e for e in j["spool"]}
+        self.assertEqual(sorted(lanes), ["_bridge", "_fleet", "main"])
+        self.assertEqual([(lanes[k]["state"], lanes[k]["fault"]) for k in ("_bridge", "_fleet")], [("ok", False), ("waiting", False)])
+        self.assertIn(lanes["main"]["state"], ("ok", "absent", "unverified"))
+        self.assertEqual((lanes["main"]["socket"], lanes["main"]["fault"], lanes["main"]["offset"]), (None, False, None))
+        self.assertEqual(lanes["main"]["path"], os.path.join(os.path.dirname(BIN), "state", "evt_spool.jsonl"))
         # 기존 주소는 그대로: /world 200
         with urllib.request.urlopen("http://127.0.0.1:%d/world" % PORT, timeout=3) as r:
             self.assertEqual(r.status, 200)
-        # 로그 줄: 머리 + 시각 + 스레드 이름
+        # 로그 줄: 머리 + 시각 + 스레드 이름. (0.14.56) 스풀 리더 스레드가 http 줄보다 먼저 한 줄 찍을 수 있다 — http 줄을 찾고
+        # 모든 줄의 형식을 본다(종전 '첫 줄' 단언은 그 경쟁에 흔들린다).
         time.sleep(0.3)
-        first = self.errlog().splitlines()[0]
-        self.assertRegex(first, r"^\[hud-bridge\] \d{4}-\d\d-\d\dT\d\d:\d\d:\d\d \[MainThread\] http://127\.0\.0\.1:%d" % PORT)
+        lines = self.errlog().splitlines()
+        http = [ln for ln in lines if "http://127.0.0.1:%d" % PORT in ln]
+        self.assertEqual(len(http), 1, lines)
+        self.assertRegex(http[0], r"^\[hud-bridge\] \d{4}-\d\d-\d\dT\d\d:\d\d:\d\d \[MainThread\] http://127\.0\.0\.1:%d" % PORT)
+        for ln in lines:
+            self.assertRegex(ln, r"^\[hud-bridge\] \d{4}-\d\d-\d\dT\d\d:\d\d:\d\d \[[^\]]+\] ")
         # 다른 기동은 다른 기동 식별자
         p.send_signal(signal.SIGTERM)
         p.wait(3)
@@ -262,6 +332,69 @@ class Specimen(unittest.TestCase):
         c.close()
         p2.send_signal(signal.SIGTERM)
         p2.wait(3)
+
+    # ⑧ (0.14.56 X-8 CARRIER · ADDENDUM-1 Q3 specimens on the real script) --------------------------------------
+    def test_rig_bridge_under_isolated_python_reads_its_own_lanes(self):
+        # Q3(a): the leaf resolves by explicit path under `python -I`; the main lane is the rig pack's own spool; a dept lane
+        # is read from its fleet pack_dir with its lane on each record; nothing is written under the rig's bin/ (3-2 (f)).
+        pack, d7, fake = self.rig()
+        p = self.start_rig(pack, fake)
+        j = self.wait_spool(p, lambda j: j.get("spool_checked") is True)
+        lanes = {e["lane"]: e for e in j["spool"]}
+        self.assertEqual(sorted(lanes), ["_bridge", "_fleet", "dept-7", "main"])
+        self.assertEqual((lanes["_bridge"]["state"], lanes["_fleet"]["state"]), ("ok", "ok"), self.errlog())
+        self.assertEqual(lanes["main"]["path"], os.path.join(pack, "state", "evt_spool.jsonl"))
+        self.assertEqual((lanes["dept-7"]["state"], lanes["dept-7"]["socket"], lanes["dept-7"]["path"]),
+                         ("absent", os.path.join(self.tmp, "d7.sock"), os.path.join(d7, "state", "evt_spool.jsonl")))
+        spool = os.path.join(d7, "state", "evt_spool.jsonl")
+        os.makedirs(os.path.dirname(spool))
+        with open(spool, "w") as f:
+            f.write(json.dumps({"ts": time.time(), "type": "task.blocked", "payload": {"task": "RIG", "blocked_by": []}}) + "\n")
+        size = os.path.getsize(spool)
+        self.wait_spool(p, lambda j: any(e["lane"] == "dept-7" and e["state"] == "ok" and e["offset"] == size for e in j["spool"]))
+        with urllib.request.urlopen("http://127.0.0.1:%d/world" % PORT, timeout=3) as r:
+            self.assertEqual([(b["lane"], b["task"]) for b in json.loads(r.read())["blocked"]], [("dept-7", "RIG")])
+        self.assertEqual(self.offsets(), ["evt_spool-dept-7.offset", "evt_spool-main.offset"])
+        self.assertEqual([d for d, _, _ in os.walk(os.path.join(self.tmp, "rig")) if os.path.basename(d) == "__pycache__"], [])
+        self.assertNotIn("Traceback", self.errlog())
+        p.send_signal(signal.SIGTERM)
+        p.wait(3)
+
+    def test_rig_main_lane_agrees_with_its_own_producer_code(self):
+        # Q3(b): the rig pack's own javis_event.py `spool-path` under -I prints exactly the path the bridge computes for that
+        # pack, so the bridge's self-check verifies main (absent: no spool yet) - not unverified (rc 2) or mismatch.
+        pack, d7, fake = self.rig()
+        r = subprocess.run([sys.executable, "-I", "-B", os.path.join(pack, "bin", "javis_event.py"), "spool-path"],
+                           capture_output=True, text=True, timeout=30, env=self.env())
+        self.assertEqual((r.returncode, r.stdout), (0, os.path.join(pack, "state", "evt_spool.jsonl") + "\n"), r.stderr[-400:])
+        p = self.start_rig(pack, fake)
+        j = self.wait_spool(p, lambda j: j.get("spool_checked") is True)
+        main = [e for e in j["spool"] if e["lane"] == "main"][0]
+        self.assertEqual((main["state"], main["fault"], main["path"]),
+                         ("absent", False, os.path.join(pack, "state", "evt_spool.jsonl")), self.errlog())
+        p.send_signal(signal.SIGTERM)
+        p.wait(3)
+
+    def test_rig_bridge_without_the_leaf_keeps_serving_and_reports_leaf_missing(self):
+        # Q3(c): no leaf -> no spool is read, `_bridge` and every listed lane leaf_missing (fault, path null), spool_checked
+        # true; the HUD keeps serving and no exception escapes.
+        pack, d7, fake = self.rig(leaf=False)
+        p = self.start_rig(pack, fake)
+        j = self.wait_spool(p, lambda j: len(j.get("spool") or []) == 4)
+        self.assertIs(j["spool_checked"], True)
+        self.assertEqual(sorted((e["lane"], e["state"], e["fault"], e["path"]) for e in j["spool"]),
+                         [("_bridge", "leaf_missing", True, None), ("_fleet", "ok", False, None),
+                          ("dept-7", "leaf_missing", True, None), ("main", "leaf_missing", True, None)])
+        with urllib.request.urlopen("http://127.0.0.1:%d/world" % PORT, timeout=3) as r:
+            self.assertEqual(r.status, 200)
+        time.sleep(1.5)
+        self.assertIsNone(p.poll())
+        self.assertEqual(self.offsets(), [])
+        err = self.errlog()
+        self.assertIn("spool leaf unavailable: FileNotFoundError", err)
+        self.assertNotIn("Traceback", err)
+        p.send_signal(signal.SIGTERM)
+        p.wait(3)
 
 
 if __name__ == "__main__":

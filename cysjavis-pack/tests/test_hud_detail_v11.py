@@ -4,8 +4,10 @@
 대상: route_spool 4계열·귀속 규칙·날짜 롤오버·tail_spool 오프셋/truncate·칸반 스캔·
 verdict md 파싱·히트 버킷 산술. 음성 케이스 포함(깨진 JSON·미지 type·spool 부재).
 """
+import importlib.util
 import json
 import os
+import shutil
 import tempfile
 import time
 import unittest
@@ -15,7 +17,18 @@ if BIN not in __import__("sys").path:
     __import__("sys").path.insert(0, BIN)
 
 import javis_hud_bridge as B  # noqa: E402
-import javis_event as E       # noqa: E402
+
+
+def rig_event_module(tmp):
+    """(0.14.56 X-8 CARRIER · A1, DESIGN-r3 §3) A rig pack: a COPY of bin/ at <tmp>/pack with its javis_event loaded from
+    there by explicit path - so the producer's own pack is the rig and `--spool` lands in <tmp>/pack/state/evt_spool.jsonl.
+    HUD_STATE_DIR no longer moves the spool (it is the bridge's private state dir only)."""
+    pack = os.path.join(tmp, "pack")
+    shutil.copytree(BIN, os.path.join(pack, "bin"), ignore=shutil.ignore_patterns("tests", "__pycache__"))
+    spec = importlib.util.spec_from_file_location("javis_event_rig", os.path.join(pack, "bin", "javis_event.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod, os.path.join(pack, "state", "evt_spool.jsonl")
 
 
 def make_world(roles=None):
@@ -264,23 +277,22 @@ class TailSpool(unittest.TestCase):
 class EmitSpool(unittest.TestCase):
     def test_emit_spool_appends_entry(self):
         tmp = tempfile.mkdtemp()
-        old = os.environ.get("HUD_STATE_DIR")
-        os.environ["HUD_STATE_DIR"] = tmp
+        old = os.environ.pop("HUD_STATE_DIR", None)   # (0.14.56) a rig pack, not the env, places the spool
         try:
+            E, spool = rig_event_module(tmp)
             E._spool_append("task.blocked", {"task": "T", "blocked_by": ["d"]}, "surface:4")
-            with open(os.path.join(tmp, "evt_spool.jsonl")) as f:
+            with open(spool) as f:
                 e = json.loads(f.readline())
             self.assertEqual(e["type"], "task.blocked")
             self.assertEqual(e["key"], "surface:4")
             self.assertEqual(e["payload"]["task"], "T")
             # tail_spool 이 emit 산출을 그대로 소비 가능한지 왕복 확인
-            entries, _ = B.tail_spool(os.path.join(tmp, "evt_spool.jsonl"), 0)
+            entries, _ = B.tail_spool(spool, 0)
             self.assertEqual(entries[0]["type"], "task.blocked")
         finally:
-            if old is None:
-                os.environ.pop("HUD_STATE_DIR", None)
-            else:
+            if old is not None:
                 os.environ["HUD_STATE_DIR"] = old
+            shutil.rmtree(tmp, True)
 
 
 class KanbanScan(unittest.TestCase):
@@ -473,7 +485,9 @@ class SpoolRotate(unittest.TestCase):
         self.assertEqual(off, size)
         self.assertTrue(os.path.exists(self.path))   # 파일 유지
 
-    def test_drain_rotation_resets_offset(self):
+    def test_drain_rotation_resets_offset_and_keeps_the_archive(self):
+        # (0.14.56 X-8 CARRIER · contract change, DESIGN-r3 §3) the pin deleted the rotated spool (.old removed); now the
+        # spool is renamed to evt_spool.<UTC>.jsonl beside it and kept with every byte (CEO E5: never delete a spool).
         B.SPOOL_ROTATE_BYTES = 5
         with open(self.path, "w") as f:
             f.write('{"type":"a","payload":{}}\n')
@@ -483,7 +497,12 @@ class SpoolRotate(unittest.TestCase):
         self.assertEqual(off, 0)                    # offset 리셋
         self.assertEqual(leftover, [])              # 잔여 없음
         self.assertFalse(os.path.exists(self.path))            # 원본 rename됨(방출자가 새로 생성)
-        self.assertFalse(os.path.exists(self.path + ".old"))   # .old 삭제됨
+        self.assertFalse(os.path.exists(self.path + ".old"))   # .old 는 만들지 않는다
+        kept = [n for n in os.listdir(self.tmp) if n != "evt_spool.jsonl"]
+        self.assertEqual(len(kept), 1, kept)
+        self.assertRegex(kept[0], r"^evt_spool\.\d{8}T\d{6}Z\.jsonl$")   # 보관본이 남는다
+        with open(os.path.join(self.tmp, kept[0])) as f:
+            self.assertEqual(f.read(), '{"type":"a","payload":{}}\n')   # 바이트 그대로
 
     def test_landing_write_not_lost(self):
         # 마지막 tail~rename 창에 착지한 완결 줄을 offset 이후 내용으로 재현 → 무유실 회수

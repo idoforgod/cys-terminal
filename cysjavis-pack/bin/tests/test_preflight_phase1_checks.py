@@ -19,8 +19,11 @@
 그 안에서만 일어난다. `--fix` 는 어떤 경로에서도 켜지 않는다(Preflight(fix=False)).
 
     JAVIS_ROOT=<scratch> CYS_PROBE_RUNS=<scratch>/probe_runs.jsonl \
-    HUD_STATE_DIR=<scratch>/hud CYS_NO_AUTOSTART=1 \
+    CYS_NO_AUTOSTART=1 \
     python3 cysjavis-pack/bin/tests/test_preflight_phase1_checks.py
+
+(0.14.56 X-8 A1: HUD_STATE_DIR no longer moves the event spool - it is <pack>/state/evt_spool.jsonl of the pack a
+tool runs from (bin/javis_spool_path.py); the fixture pack's tools write into the fixture pack.)
 """
 import json
 import os

@@ -478,11 +478,8 @@ def _emit(evt_type, fields):
         argv += ["--field", "%s=%s" % (k, v)]
     env = dict(os.environ)
     env["CYS_NO_AUTOSTART"] = "1"
-    # ★L-f: `HUD_STATE_DIR` 미설정이면 javis_event 가 **팩 소스 트리**(`<pack>/state/`)에
-    #   spool 을 쌓아 격리 실행이 저장소를 오염시킨다(미추적 산출물 혼입). JAVIS_ROOT 가
-    #   있으면 격리 루트 안으로 강제한다 — 격리는 env 하나로 완결돼야 한다.
-    if not env.get("HUD_STATE_DIR") and _ROOT_FROM_ENV:
-        env["HUD_STATE_DIR"] = os.path.join(ROOT, "_round", "hud")
+    # ★0.14.56 X-8 A1: no spool redirect here. The spool is <pack>/state/evt_spool.jsonl of the pack this file runs
+    #   from (javis_spool_path.py), the one file the HUD bridge reads; isolation = run from a rig pack (self-test).
     try:
         r = subprocess.run(argv, capture_output=True, text=True, timeout=10, env=env)
         return r.returncode == 0
@@ -2528,6 +2525,7 @@ def cmd_deny(a):
 
 # ═════════════════════════ self-test(완료 기준 배터리) ═══════════════════════
 def self_test(a=None):
+    import shutil
     import tempfile
 
     # G1 hard assert — 격리 env 부재 시 실행 거부(cwd 폴백의 라이브 오염 차단).
@@ -2537,7 +2535,6 @@ def self_test(a=None):
               "(G1 라이브/사이드 경계 hard assert)" % ",".join(missing), file=sys.stderr)
         return 1
 
-    self_path = os.path.abspath(__file__)
     fails = []
 
     def chk(cond, msg):
@@ -2545,6 +2542,21 @@ def self_test(a=None):
             fails.append(msg)
 
     with tempfile.TemporaryDirectory(prefix="apq-selftest-") as td:
+        # ★0.14.56 X-8 A1: the spool is <pack>/state/evt_spool.jsonl of the pack a producer runs from - no
+        #   environment variable moves it. So no run below starts THIS pack's script: every run goes through a RIG
+        #   PACK (a temp copy of this bin/). A case that reads its spool gets its own rig (new_root(.., own_rig=True));
+        #   every other case shares one rig, whose spool nobody reads.
+        def make_rig(dest):
+            rig_bin = os.path.join(dest, "bin")
+            shutil.copytree(_SELF_DIR, rig_bin, ignore=shutil.ignore_patterns("__pycache__"))
+            return rig_bin
+
+        shared_rig = make_rig(os.path.join(td, "rig-shared"))
+        rigs = {}
+
+        def script_for(root):
+            return os.path.join(rigs.get(root, shared_rig), "javis_approval_queue.py")
+
         shim_dir = os.path.join(td, "shim")
         os.makedirs(shim_dir)
         shim_log = os.path.join(td, "cys-shim.log")
@@ -2569,9 +2581,11 @@ def self_test(a=None):
 
         write_status(1000.0)
 
-        def new_root(name):
+        def new_root(name, own_rig=False):
             root = os.path.join(td, name)
             os.makedirs(os.path.join(root, "_round", "tasks"), exist_ok=True)
+            if own_rig:
+                rigs[root] = make_rig(os.path.join(td, name + "-rig"))
             return root
 
         def env_for(root, env_extra=None, now=None):
@@ -2588,7 +2602,6 @@ def self_test(a=None):
                       "CYS_SHIM_SEND_DELAY", "CYS_SHIM_STATUS"):
                 env.pop(k, None)
             env.update({"JAVIS_ROOT": root,
-                        "HUD_STATE_DIR": os.path.join(root, "hud"),
                         "CYS_PROBE_RUNS": os.path.join(root, "probe_runs.jsonl"),
                         "CLAUDE_CONFIG_DIR": os.path.join(root, "claude-cfg"),
                         "CYS_NO_AUTOSTART": "1",
@@ -2602,12 +2615,12 @@ def self_test(a=None):
             return env
 
         def run_q(root, argv, env_extra=None, now=None, timeout=120):
-            r = subprocess.run([sys.executable, self_path] + argv, capture_output=True,
+            r = subprocess.run([sys.executable, script_for(root)] + argv, capture_output=True,
                                text=True, env=env_for(root, env_extra, now), timeout=timeout)
             return r.returncode, r.stdout, r.stderr
 
         def popen_q(root, argv, env_extra=None, now=None):
-            return subprocess.Popen([sys.executable, self_path] + argv,
+            return subprocess.Popen([sys.executable, script_for(root)] + argv,
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                     env=env_for(root, env_extra, now))
 
@@ -2632,7 +2645,8 @@ def self_test(a=None):
             return out
 
         def spool(root, evt_type):
-            p = os.path.join(root, "hud", "evt_spool.jsonl")
+            # the root's OWN rig (KeyError = a case reads a spool it was not given - loud, never the shared one)
+            p = os.path.join(os.path.dirname(rigs[root]), "state", "evt_spool.jsonl")
             out = []
             if os.path.isfile(p):
                 with open(p, encoding="utf-8") as f:
@@ -2652,7 +2666,7 @@ def self_test(a=None):
         t0 = 100000.0
 
         # ── ① 중복 알림 0 — 반복 submit·digest 경로 (pending 스냅샷 계수 · D17) ──
-        r1 = new_root("c1")
+        r1 = new_root("c1", own_rig=True)
         rc, out, err = run_q(r1, base + ["--no-deliver"])
         chk(rc == 0 and json.loads(out)["result"] == "delivered",
             "①1차 submit 실패: rc=%s out=%s err=%s" % (rc, out[:200], err[:200]))
@@ -2712,7 +2726,7 @@ def self_test(a=None):
         chk(rc == EXIT_NOTFOUND, "②미존재 승인 exit 3 아님: rc=%s" % rc)
 
         # ── ③ 자가치유 allowlist → 큐 미경유(사후 통지 기록만) ──
-        r3 = new_root("c3")
+        r3 = new_root("c3", own_rig=True)
         os.makedirs(os.path.join(r3, "_round", "approvals"), exist_ok=True)
         with open(os.path.join(r3, "_round", "approvals", "self-heal-allowlist.json"), "w",
                   encoding="utf-8") as f:      # 봉인된 정본 파일(경로·sha256 기록 대상)
@@ -2914,7 +2928,7 @@ def self_test(a=None):
             "E2-4: env 라벨 오버라이드 실패: %s" % out[:200])
 
         # ── ⑦ back-pressure: 단일 source 폭주 → resource.soft 정확 1회 + 이월 ──
-        r7 = new_root("c7")
+        r7 = new_root("c7", own_rig=True)
         for i in range(6):
             run_q(r7, ["submit", "--request-id", "P%d" % i, "--class", "approval",
                        "--source", "flood", "--summary", "폭주 %d" % i],
@@ -2935,7 +2949,7 @@ def self_test(a=None):
             % len(spool(r7, "approval.needed")))
 
         # ── ⑧ digest: 집계 파일 + 300자 헤드 + 2KB 캡 + 멱등 + feed 0 ──
-        r8 = new_root("c8")
+        r8 = new_root("c8", own_rig=True)
         for i in range(40):
             run_q(r8, ["submit", "--request-id", "D%02d" % i, "--class", "approval",
                        "--source", "s%d" % i, "--summary", "다이제스트 캡 검증 항목 %d %s"
@@ -2997,7 +3011,7 @@ def self_test(a=None):
         #   · `sk-` 키는 알파넘 **19자 이하**(게이트 하한 20자 미만). `javis_scrub` 의 탐지 하한은
         #     8자라 이 검체는 여전히 스캔 대상이다 — 즉 짧게 써도 검증력은 그대로다.
         # 이 두 제약을 어기면 테스트는 통과하지만 **태그 CI 가 pre-build 게이트에서 즉사**한다.
-        r9 = new_root("c9")
+        r9 = new_root("c9", own_rig=True)
         os.makedirs(os.path.join(r9, "_round", "approvals"), exist_ok=True)
         with open(os.path.join(r9, "_round", "approvals", ".slack-enabled"), "w") as f:
             f.write("on\n")
@@ -3023,7 +3037,7 @@ def self_test(a=None):
             chk(json.loads(out)["slack"] == "blocked", "⑨%s 미검출: %s" % (why, out[:200]))
 
         # ── 부가: 재기동 버스트 회귀(조건 03⑤) — 프로세스 재기동 후에도 계수 보존 ──
-        r10 = new_root("c10")
+        r10 = new_root("c10", own_rig=True)
         for i in range(3):
             run_q(r10, ["submit", "--request-id", "K%d" % i, "--class", "approval",
                         "--source", "boom", "--summary", "x"],
@@ -3159,7 +3173,7 @@ def self_test(a=None):
             "ⓓ원장 리플레이 pending 복원 실패: rc=%s %s" % (rc, out[:300]))
         chk(len(ledger_events(rD, "item_restored")) == 2,
             "ⓓitem_restored 원장 2건 아님: %d" % len(ledger_events(rD, "item_restored")))
-        rD2 = new_root("cD2")
+        rD2 = new_root("cD2", own_rig=True)
         for i in range(2):
             run_q(rD2, ["submit", "--request-id", "RL%d" % i, "--class", "approval",
                         "--source", "s1", "--summary", "소실 대상 %d" % i], now=t0)
@@ -3342,7 +3356,7 @@ def self_test(a=None):
         for cmd_, want in (("submit", EXIT_USAGE), ("tick", EXIT_USAGE), ("list", EXIT_OK)):
             argvK = ([cmd_, "--request-id", "Z1", "--class", "approval", "--source", "s1",
                       "--summary", "x"] if cmd_ == "submit" else [cmd_])
-            r = subprocess.run([sys.executable, self_path] + argvK, capture_output=True,
+            r = subprocess.run([sys.executable, script_for(rK)] + argvK, capture_output=True,
                                text=True, env=envK, cwd=cwdK, timeout=60)
             chk(r.returncode == want,
                 "ⓚJAVIS_ROOT 미설정 %s 처리 오류: rc=%s(기대 %s) %s"
