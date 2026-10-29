@@ -22,12 +22,78 @@ def load(name):
     return module
 
 
-def alive(pid):
+ALIVE, DEAD, UNKNOWN = 'alive', 'dead', 'unknown'
+_SYNCHRONIZE = 0x00100000
+_TERMINATE_AND_QUERY = 0x0001 | 0x1000  # PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION
+_WAIT_OBJECT_0, _WAIT_TIMEOUT = 0, 258
+_ERROR_ACCESS_DENIED, _ERROR_INVALID_PARAMETER = 5, 87
+
+
+def _alive_for(pid, is_windows, api):
+    # Tri-state, so a presence check and an absence check both fail when the probe cannot decide. On nt
+    # os.kill(pid, 0) is no probe: any signal but CTRL_C/CTRL_BREAK calls TerminateProcess, and a gone pid raises
+    # WinError 87 (d2be23fe windows-build log :607-687). The nt rule is cysd's pid_alive (src/bin/cysd/state.rs
+    # :5142-5162 @af092542), except that what it folds into "alive" stays UNKNOWN here.
+    if is_windows:
+        handle = api.OpenProcess(_SYNCHRONIZE, False, pid)
+        if not handle:
+            return {_ERROR_INVALID_PARAMETER: DEAD, _ERROR_ACCESS_DENIED: ALIVE}.get(api.GetLastError(), UNKNOWN)
+        try:
+            wait = api.WaitForSingleObject(handle, 0)
+        finally:
+            api.CloseHandle(handle)
+        return {_WAIT_OBJECT_0: DEAD, _WAIT_TIMEOUT: ALIVE}.get(wait, UNKNOWN)
     try:
         os.kill(pid, 0)
-        return True
+        return ALIVE
     except ProcessLookupError:
-        return False
+        return DEAD
+
+
+def _kernel32():
+    import ctypes
+    from ctypes import wintypes as w
+    k = ctypes.WinDLL('kernel32', use_last_error=True)
+    k.OpenProcess.argtypes = [w.DWORD, w.BOOL, w.DWORD]
+    k.OpenProcess.restype = w.HANDLE
+    k.WaitForSingleObject.argtypes = [w.HANDLE, w.DWORD]
+    k.WaitForSingleObject.restype = w.DWORD
+    k.CloseHandle.argtypes = [w.HANDLE]
+    k.TerminateProcess.argtypes = [w.HANDLE, w.UINT]
+    k.GetProcessTimes.argtypes = [w.HANDLE] + [ctypes.POINTER(w.FILETIME)] * 4
+
+    class Api:
+        OpenProcess = staticmethod(k.OpenProcess)
+        WaitForSingleObject = staticmethod(k.WaitForSingleObject)
+        CloseHandle = staticmethod(k.CloseHandle)
+        TerminateProcess = staticmethod(k.TerminateProcess)
+        GetLastError = staticmethod(ctypes.get_last_error)
+
+        @staticmethod
+        def creation(handle):
+            times = [w.FILETIME() for _ in range(4)]
+            if not k.GetProcessTimes(handle, *[ctypes.byref(t) for t in times]):
+                return None
+            return times[0].dwHighDateTime << 32 | times[0].dwLowDateTime
+    return Api
+
+
+def alive_state(pid):
+    return _alive_for(pid, os.name == 'nt', _kernel32() if os.name == 'nt' else None)
+
+
+def _reap_identified_for(entries, api):
+    # nt reap of recorded pool workers: Windows reuses pids quickly and has no SIGKILL. Terminate a worker only while
+    # its creation time still equals the one it wrote itself; an unopenable or changed pid is left alone.
+    for pid, created in entries:
+        handle = api.OpenProcess(_TERMINATE_AND_QUERY, False, pid)
+        if not handle:
+            continue
+        try:
+            if api.creation(handle) == created:
+                api.TerminateProcess(handle, 125)
+        finally:
+            api.CloseHandle(handle)
 
 
 # marker() reads a pid the fixture publishes with os.replace. On Windows that read can hit a sharing race and raise
@@ -164,10 +230,16 @@ class OwnershipRegression(unittest.TestCase):
             stream.flush()
 
     def recorded_alive(self,pid):
+        # Tri-state like alive_state. On nt the retained handle answers (no pid reuse); a failed wait is UNKNOWN, never
+        # DEAD, so assert_gone cannot pass on it.
         if os.name == 'nt':
             import ctypes
-            return ctypes.windll.kernel32.WaitForSingleObject(self.handles[pid],0)==258
-        return alive(pid)
+            wait = ctypes.windll.kernel32.WaitForSingleObject(self.handles[pid],0)
+            return {_WAIT_OBJECT_0: DEAD, _WAIT_TIMEOUT: ALIVE}.get(wait, UNKNOWN)
+        return alive_state(pid)
+
+    def assert_alive(self, pid, msg):
+        self.assertEqual(self.recorded_alive(pid), ALIVE, msg)
 
     def stop_recorded(self,pid):
         if os.name == 'nt':
@@ -190,9 +262,9 @@ class OwnershipRegression(unittest.TestCase):
 
     def assert_gone(self, pid):
         end = time.monotonic() + 3
-        while self.recorded_alive(pid) and time.monotonic() < end:
+        while self.recorded_alive(pid) != DEAD and time.monotonic() < end:
             time.sleep(.02)
-        self.assertFalse(self.recorded_alive(pid), 'owned descendant survived parent death: %s' % pid)
+        self.assertEqual(self.recorded_alive(pid), DEAD, 'owned descendant survived parent death: %s' % pid)
 
     @unittest.skipUnless(os.name == 'posix', 'POSIX identity fixture; native Job fixtures below')
     def test_checklist_abrupt_death_closes_descendant(self):
@@ -743,7 +815,7 @@ print(json.dumps({k:v for k,v in owned.run_owned([sys.executable,'-B',%r],2,forc
             self.assertFalse(result['complete'],result)
             self.assertEqual(result['cleanup'],'unknown',result)
             self.assertIn('Operation not permitted',result['reason'])
-            self.assertTrue(self.recorded_alive(pid),'permission denial did not leave a live child')
+            self.assert_alive(pid,'permission denial did not leave a live child')
         finally:
             # Outside the process-scoped sandbox: only this recorded fixture.
             try:self.stop_recorded(pid)
@@ -881,7 +953,7 @@ print(json.dumps({k:v for k,v in owned.run_owned([sys.executable,'-B',%r],2,forc
         child_pid=self.marker('owned-child');sibling_pid=self.marker('unrelated')
         parent.kill();parent.wait(timeout=60)  # wallclock: guard 60 s only ends a hang reaping the killed parent; the verdict is assert_gone and the sibling alive
         self.assert_gone(child_pid)
-        self.assertTrue(self.recorded_alive(sibling_pid),'outside sibling was put in the owned Job')
+        self.assert_alive(sibling_pid,'outside sibling was put in the owned Job')
 
     def test_scanner_death_alone_reaps_spawn_worker(self):
         skill = self.root / 'skills' / 'sample'; skill.mkdir(parents=True)
@@ -1414,6 +1486,17 @@ BR = os.environ['C03E2_BRANCH']; TMP = os.environ['C03E2_TMP']
 def note():
     with open(os.path.join(TMP, 'pids.txt'), 'a') as f:
         f.write('%%d\n' %% os.getpid())
+    if os.name == 'nt':
+        # The worker's own creation time: the reap terminates a pid only while it still has this identity.
+        import ctypes
+        from ctypes import wintypes as w
+        k = ctypes.WinDLL('kernel32', use_last_error=True)
+        k.GetCurrentProcess.restype = w.HANDLE
+        k.GetProcessTimes.argtypes = [w.HANDLE] + [ctypes.POINTER(w.FILETIME)] * 4
+        t = [w.FILETIME() for _ in range(4)]
+        if k.GetProcessTimes(k.GetCurrentProcess(), *[ctypes.byref(x) for x in t]):
+            with open(os.path.join(TMP, 'identities.txt'), 'a') as f:
+                f.write('%%d %%d\n' %% (os.getpid(), t[0].dwHighDateTime << 32 | t[0].dwLowDateTime))
 def init(*args):
     note()
     if BR in ('N', 'NI', 'SURV', 'SURVX'):
@@ -1491,15 +1574,21 @@ class PoolBoundedStop(unittest.TestCase):
         out_f.close(); err_f.close()
         out = (self.root/'e2.out').read_text(); err = (self.root/'e2.err').read_text()
         pids = [int(x) for x in (self.root/'pids.txt').read_text().split()] if (self.root/'pids.txt').exists() else []
-        self.addCleanup(self.reap_e2, pids)
+        # Read now: tearDown removes the temp root before the cleanups run.
+        ident = self.root/'identities.txt'
+        identities = [tuple(int(v) for v in l.split()) for l in ident.read_text().splitlines() if l.strip()] if ident.exists() else []
+        self.addCleanup(self.reap_e2, pids, identities)
         self.assertTrue(finished, 'pool fixture %s did not finish: the stop hung (stderr %r)' % (branch, err[-400:]))  # wallclock: guard 40 s only ends a hang; the verdict is finished/unfinished, the designed worst case is D 1 s + 3 phases of 1 s
         result = [json.loads(l[7:]) for l in out.splitlines() if l.startswith('RESULT ')]
         return p.returncode, (result[0] if result else None), err, pids
 
-    def reap_e2(self, pids):
+    def reap_e2(self, pids, identities=()):
+        if os.name == 'nt':
+            _reap_identified_for(identities, _kernel32())
+            return
         # Fixture workers sleep 3600 s, so a recorded pid that is still alive is still that worker.
         for pid in pids:
-            if alive(pid):
+            if alive_state(pid) != DEAD:
                 try:
                     os.kill(pid, signal.SIGKILL)
                 except (ProcessLookupError, PermissionError):
@@ -1507,10 +1596,10 @@ class PoolBoundedStop(unittest.TestCase):
 
     def assert_no_leftover(self, pids):
         end = time.monotonic() + 3
-        left = [x for x in pids if alive(x)]
+        left = [x for x in pids if alive_state(x) != DEAD]
         while left and time.monotonic() < end:
             time.sleep(.05)
-            left = [x for x in left if alive(x)]
+            left = [x for x in left if alive_state(x) != DEAD]
         self.assertEqual(left, [], 'pool workers outlived the scan')  # wallclock: guard 3 s only lets the init process reap orphans; a real survivor sleeps 3600 s
 
     @unittest.skipUnless(os.name == 'posix', 'SIGTERM-ignoring worker: POSIX only (Windows UNMEASURED)')
@@ -1558,7 +1647,7 @@ class PoolBoundedStop(unittest.TestCase):
         rc, res, err, pids = self.run_e2('SURV')
         self.assertEqual(rc, 0, err)
         self.assertIn('unbounded', err)
-        self.assertTrue(any(alive(pid) for pid in pids), 'planted survivor not present: the control did not plant')
+        self.assertTrue(any(alive_state(pid) == ALIVE for pid in pids), 'planted survivor not present: the control did not plant')
 
     @unittest.skipUnless(os.name == 'posix', 'planted survivor via no-op signals: POSIX fixture (Windows UNMEASURED)')
     def test_cli_raising_with_a_surviving_worker_exits_instead_of_hanging(self):
@@ -1567,7 +1656,7 @@ class PoolBoundedStop(unittest.TestCase):
         self.assertEqual(rc, 1, err)
         self.assertIn('fixture: main raised after the pool stop', err)
         self.assertIn('unbounded', err)
-        self.assertTrue(any(alive(pid) for pid in pids), 'planted survivor not present: the control did not plant')
+        self.assertTrue(any(alive_state(pid) == ALIVE for pid in pids), 'planted survivor not present: the control did not plant')
 
     def test_empty_skill_list_creates_no_pool(self):
         sys.path.insert(0, str(BIN)); scanner = load('javis_skillscan')
@@ -1792,6 +1881,91 @@ class MarkerReaderContract(unittest.TestCase):
             self.stop_recorded(p.pid)
         self.assertEqual(sent, [], 'a gone pid was signalled')
         self.assertEqual(self.not_killed, [])
+
+
+class LivenessProbe(unittest.TestCase):
+    """The liveness probe and the nt reap, driven through a stub kernel32 on every platform (d2be23fe windows-build
+    log :607-687: os.kill(pid, 0) raised WinError 87 in alive() seven times)."""
+
+    class Api:
+        def __init__(self, handle, error=0, wait=None, created=None):
+            self.handle, self.error, self.wait, self.created = handle, error, wait, created
+            self.calls = []
+        def OpenProcess(self, access, inherit, pid):
+            self.calls.append(('open', access, pid))
+            return self.handle
+        def GetLastError(self):
+            return self.error
+        def WaitForSingleObject(self, handle, ms):
+            self.calls.append(('wait', handle, ms))
+            return self.wait
+        def CloseHandle(self, handle):
+            self.calls.append(('close', handle))
+        def creation(self, handle):
+            return self.created
+        def TerminateProcess(self, handle, code):
+            self.calls.append(('terminate', handle, code))
+
+    def test_nt_probe_is_tri_state_and_never_signals(self):
+        from unittest.mock import patch
+        rows = [(None, _ERROR_INVALID_PARAMETER, None, DEAD), (None, _ERROR_ACCESS_DENIED, None, ALIVE),
+                (None, 6, None, UNKNOWN), (7, 0, _WAIT_OBJECT_0, DEAD), (7, 0, _WAIT_TIMEOUT, ALIVE),
+                (7, 0, 0xFFFFFFFF, UNKNOWN)]
+        def no_signal(*args):
+            raise AssertionError('os.kill on the nt path: %r' % (args,))
+        with patch.object(os, 'kill', no_signal):
+            for handle, error, wait, want in rows:
+                with self.subTest(handle=handle, error=error, wait=wait):
+                    api = self.Api(handle, error, wait)
+                    self.assertEqual(_alive_for(4242, True, api), want)
+                    self.assertEqual([c for c in api.calls if c[0] == 'open'], [('open', _SYNCHRONIZE, 4242)])
+                    self.assertEqual([c for c in api.calls if c[0] == 'close'], [('close', handle)] if handle else [])
+
+    def test_unknown_fails_a_negative_and_a_positive_call_site(self):
+        # Each site fails on UNKNOWN in its own direction; the passing state of each is the control.
+        from unittest.mock import patch
+        pool = PoolBoundedStop('test_empty_skill_list_creates_no_pool')
+        ticks = iter(range(10 ** 6))
+        clock = (patch.object(time, 'monotonic', lambda: float(next(ticks))), patch.object(time, 'sleep', lambda s: None))
+        for state, fails in ((UNKNOWN, True), (ALIVE, True), (DEAD, False)):
+            with self.subTest(site='assert_no_leftover', state=state), clock[0], clock[1], \
+                    patch.dict(globals(), {'alive_state': lambda pid, state=state: state}):
+                if fails:
+                    with self.assertRaises(pool.failureException):
+                        pool.assert_no_leftover([4242])
+                else:
+                    pool.assert_no_leftover([4242])
+        owner = OwnershipRegression('test_private_done_preserves_exit_and_output')
+        for state, fails in ((UNKNOWN, True), (DEAD, True), (ALIVE, False)):
+            with self.subTest(site='assert_alive', state=state):
+                owner.recorded_alive = lambda pid, state=state: state
+                if fails:
+                    with self.assertRaises(owner.failureException):
+                        owner.assert_alive(4242, 'probe answered %s' % state)
+                else:
+                    owner.assert_alive(4242, 'probe answered %s' % state)
+
+    def test_nt_reap_terminates_only_the_recorded_identity(self):
+        same = self.Api(9, created=111)
+        _reap_identified_for([(4242, 111)], same)
+        self.assertEqual([c[0] for c in same.calls], ['open', 'terminate', 'close'])
+        self.assertEqual(same.calls[0], ('open', _TERMINATE_AND_QUERY, 4242))
+        moved = self.Api(9, created=222)
+        _reap_identified_for([(4242, 111)], moved)
+        self.assertEqual([c[0] for c in moved.calls], ['open', 'close'], 'a pid with another identity was terminated')
+        gone = self.Api(None)
+        _reap_identified_for([(4242, 111)], gone)
+        self.assertEqual([c[0] for c in gone.calls], ['open'])
+
+    def test_probe_routes_by_the_host_and_the_nt_branch_has_no_os_kill(self):
+        import ast, inspect
+        wrapper = ast.parse(inspect.getsource(alive_state)).body[0]
+        self.assertEqual([ast.unparse(s) for s in wrapper.body],
+                         ["return _alive_for(pid, os.name == 'nt', _kernel32() if os.name == 'nt' else None)"])
+        probe = ast.parse(inspect.getsource(_alive_for)).body[0]
+        nt = [s for s in probe.body if isinstance(s, ast.If) and ast.unparse(s.test) == 'is_windows']
+        self.assertEqual(len(nt), 1)
+        self.assertNotIn('os.kill', ast.unparse(nt[0]))
 
 
 if __name__ == '__main__':
