@@ -29598,8 +29598,13 @@ after-tick liveness alone does not attribute a clock defect",
 
     /// 한 화면을 좌석에 그리고 큐 틱을 **실제로** 돌려 (남은 큐 길이, 기록된 막힘 사유)를 돌려준다.
     fn instr_tick_outcome(tag: &str, lines: &[String], row: u16, col: u16, alt: bool) -> (usize, String) {
-        let (daemon, s) = wp5_seat(tag, "claude");
-        p1_measured(&s); // the D1 contract on either host (head ruling W1)
+        instr_tick_outcome_on(tag, "claude", true, lines, row, col, alt) // the D1 contract on either host (head ruling W1)
+    }
+
+    /// The same tick on a seat of `agent` whose D1 platform half is `measured` (false = a Windows-configured seat, ruling W1).
+    fn instr_tick_outcome_on(tag: &str, agent: &str, measured: bool, lines: &[String], row: u16, col: u16, alt: bool) -> (usize, String) {
+        let (daemon, s) = wp5_seat(tag, agent);
+        s.d1_platform.store(measured, std::sync::atomic::Ordering::Relaxed);
         let e = daemon.next_queue_entry("[보고] 계측 판 게이트 무변경 검체".into(), None, "test");
         s.pending_queue.lock().unwrap().push_back(e);
         let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
@@ -29608,6 +29613,44 @@ after-tick liveness alone does not attribute a clock defect",
         tick(&daemon);
         let out = (s.pending_queue.lock().unwrap().len(), blocked_reason(&s));
         out
+    }
+
+    /// The six screen pairs the instr_gate tests measure: (name, lines, cursor row, cursor col).
+    fn instr_layouts() -> Vec<(&'static str, Vec<String>, u16, u16)> {
+        let m = "❯\u{a0}";
+        // (이름, 화면 줄, 커서 행, 커서 열)
+        vec![
+            ("안내문(흐림)", vec!["  출력".into(), RULE.into(), format!("{m}\x1b[7mT\x1b[27m\x1b[2mry \"fix lint errors\"\x1b[22m"), RULE.into(), STATUS1.into(), STATUS2.into()], 2, 2),
+            ("초안+Home 뒤에 흐린 꼬리", vec!["  출력".into(), RULE.into(), format!("{m}\x1b[7ma\x1b[27mbc \x1b[2mtail\x1b[22m"), RULE.into(), STATUS1.into(), STATUS2.into()], 2, 2),
+            ("커서 앞에 흐린 글", vec!["  출력".into(), RULE.into(), format!("{m}\x1b[2mabc\x1b[22m"), RULE.into(), STATUS1.into(), STATUS2.into()], 2, 5),
+            ("빈 줄 + 윗 행의 흐린 꼬리표", vec!["  출력".into(), format!("── \x1b[2mHistory 2/2\x1b[22m ──"), "❯ ".into(), RULE.into(), STATUS1.into(), STATUS2.into()], 2, 2),
+            ("빈 줄 + 흐린 출력 줄", vec![format!("  \x1b[2m흐린 출력 한 줄\x1b[22m"), "".into(), RULE.into(), "❯ ".into(), RULE.into(), STATUS1.into(), STATUS2.into()], 3, 2),
+            ("작업 중 표지(흐림)", vec![format!("\x1b[2m✻ Thinking… (esc to interrupt)\x1b[22m"), RULE.into(), "❯ ".into(), RULE.into(), STATUS1.into(), STATUS2.into()], 2, 2),
+        ]
+    }
+
+    /// ★(0.14.56 · P1 · late reflection R2-2, impl/REFLECTION-2-stageC.md) The RETIRED invariant still holds where D1 does not govern:
+    /// on a Windows-configured claude seat (ruling W1 0048dfdf) and on a gemini seat (an unmeasured adapter), the same six pairs x
+    /// alt/non-alt never differ - dim never changes the queue tick's result there. Mutant: D1 governs regardless of platform/adapter.
+    #[test]
+    fn instr_gate_dim_never_changes_the_verdict_where_d1_does_not_govern() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("instr-gate-nd1");
+        let mut table = Vec::new();
+        for (agent, measured) in [("claude", false), ("gemini", true)] {
+            for alt in [true, false] {
+                for (i, (name, lines, row, col)) in instr_layouts().iter().enumerate() {
+                    let twin: Vec<String> = lines.iter().map(|l| instr_strip_dim(l)).collect();
+                    let a = instr_tick_outcome_on(&format!("ignd-{agent}-d{}-{i}", u8::from(alt)), agent, measured, lines, *row, *col, alt);
+                    let b = instr_tick_outcome_on(&format!("ignd-{agent}-p{}-{i}", u8::from(alt)), agent, measured, &twin, *row, *col, alt);
+                    table.push(format!("{agent} alt={alt} · {name}: {a:?} · {b:?}"));
+                    assert_eq!(a, b, "{agent} alt={alt} · {name}: dim changed the verdict on a seat D1 does not govern");
+                }
+            }
+        }
+        println!("INSTR-GATE-NON-D1\n{}", table.join("\n"));
+        assert!(table.iter().any(|l| l.contains(": (0, ")), "no delivered cell:\n{}", table.join("\n"));
+        assert!(table.iter().any(|l| l.contains(": (1, ")), "no held cell:\n{}", table.join("\n"));
     }
 
     /// 시험 7 — (retired invariant, see below) 흐림이 섞인 화면과 흐림만 뺀 같은 화면에서 큐 틱의 결과(배달 여부 · 막힘 사유)를 잰다(alt · 비-alt 각각).
@@ -29621,16 +29664,7 @@ after-tick liveness alone does not attribute a clock defect",
     fn instr_gate_dim_changes_the_verdict_only_on_d1_rows() {
         let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (_pack, _env) = wp5_env("instr-gate");
-        let m = "❯\u{a0}";
-        // (이름, 화면 줄, 커서 행, 커서 열)
-        let layouts: Vec<(&str, Vec<String>, u16, u16)> = vec![
-            ("안내문(흐림)", vec!["  출력".into(), RULE.into(), format!("{m}\x1b[7mT\x1b[27m\x1b[2mry \"fix lint errors\"\x1b[22m"), RULE.into(), STATUS1.into(), STATUS2.into()], 2, 2),
-            ("초안+Home 뒤에 흐린 꼬리", vec!["  출력".into(), RULE.into(), format!("{m}\x1b[7ma\x1b[27mbc \x1b[2mtail\x1b[22m"), RULE.into(), STATUS1.into(), STATUS2.into()], 2, 2),
-            ("커서 앞에 흐린 글", vec!["  출력".into(), RULE.into(), format!("{m}\x1b[2mabc\x1b[22m"), RULE.into(), STATUS1.into(), STATUS2.into()], 2, 5),
-            ("빈 줄 + 윗 행의 흐린 꼬리표", vec!["  출력".into(), format!("── \x1b[2mHistory 2/2\x1b[22m ──"), "❯ ".into(), RULE.into(), STATUS1.into(), STATUS2.into()], 2, 2),
-            ("빈 줄 + 흐린 출력 줄", vec![format!("  \x1b[2m흐린 출력 한 줄\x1b[22m"), "".into(), RULE.into(), "❯ ".into(), RULE.into(), STATUS1.into(), STATUS2.into()], 3, 2),
-            ("작업 중 표지(흐림)", vec![format!("\x1b[2m✻ Thinking… (esc to interrupt)\x1b[22m"), RULE.into(), "❯ ".into(), RULE.into(), STATUS1.into(), STATUS2.into()], 2, 2),
-        ];
+        let layouts = instr_layouts();
         // The D1 contract, per layout: (with dim, dim stripped) - the same for alt and non-alt. Only layout 0 is a D1 row pair
         // (row 6 Suggestion -> delivered / row 7 Draft -> held input_pending); every other pair agrees.
         let delivered = (0usize, String::new());
