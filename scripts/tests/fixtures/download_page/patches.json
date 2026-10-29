@@ -1,0 +1,216 @@
+{
+ "_doc": "ops = [offset, delete_len, insert(latin-1)]; apply to the sanitized base; sha256 = of the sanitized result",
+ "duplicate_reordered_anchor": {
+  "base": "old27",
+  "ops": [
+   [
+    13460,
+    0,
+    "<a data-dl=\"win-x64\" class=\"dl-btn\" href=\"/downloads/wrong.exe\"><span class=\"dl-btn__meta\">wrong.exe \u00c2\u00b7 1MB</span></a>\n"
+   ]
+  ],
+  "real_sha256": "62416f29e8eb78121a95bdac29ef08a7f8eac69785c6e08baf09d3f3cada8df1",
+  "sha256": "b97c7d0ea07ff5d684389ef22d7e13fe94274aa0ffef73f8a68d76ff5bc9105c"
+ },
+ "h04_wrong_card": {
+  "base": "old27",
+  "ops": [
+   [
+    13134,
+    5,
+    "x"
+   ],
+   [
+    13151,
+    1,
+    "0"
+   ],
+   [
+    13419,
+    1,
+    "aarch"
+   ],
+   [
+    13432,
+    1,
+    "1"
+   ]
+  ],
+  "real_sha256": "7e2093125339ab9e4207dec42d06449093bc371aa524ec7969fa64d07cc5a43c",
+  "sha256": "3cf08952bf7c7aee96487ea4a6a8dc0be4b8e80923bb4ecc6330a8ce3764f514"
+ },
+ "js_wrong_selected_button": {
+  "base": "old27",
+  "ops": [
+   [
+    14536,
+    1,
+    "intended"
+   ],
+   [
+    14586,
+    0,
+    "\"]');var w=document.querySelector('a[data-dl=\"mac-arm"
+   ]
+  ],
+  "real_sha256": "db6b6a7ca53e249297b5c7868aa59c65cda3d2ca1dd6c4390bcfbfa212c6eccd",
+  "sha256": "6b0692a91aae605cd7b921afdc142cd186f05e4528d3f3164434f8e778c47e8f"
+ },
+ "old27": {
+  "base": "now",
+  "ops": [
+   [
+    6204,
+    57,
+    ""
+   ],
+   [
+    6281,
+    171,
+    ""
+   ],
+   [
+    6546,
+    114,
+    ""
+   ],
+   [
+    6709,
+    77,
+    ""
+   ],
+   [
+    6787,
+    13,
+    ""
+   ],
+   [
+    6801,
+    25,
+    ""
+   ],
+   [
+    6831,
+    9,
+    "92"
+   ],
+   [
+    6842,
+    0,
+    ","
+   ],
+   [
+    6843,
+    4,
+    "min(946"
+   ],
+   [
+    6849,
+    1,
+    ""
+   ],
+   [
+    6852,
+    6,
+    "6"
+   ],
+   [
+    6861,
+    8,
+    ""
+   ],
+   [
+    8364,
+    3,
+    "DIZ"
+   ],
+   [
+    8368,
+    4,
+    "GFio"
+   ],
+   [
+    8526,
+    6,
+    "M9iljwO"
+   ],
+   [
+    8533,
+    1,
+    ""
+   ],
+   [
+    9001,
+    40,
+    ""
+   ],
+   [
+    9937,
+    139,
+    ""
+   ],
+   [
+    17841,
+    57,
+    ""
+   ],
+   [
+    17918,
+    171,
+    ""
+   ],
+   [
+    18183,
+    114,
+    ""
+   ],
+   [
+    18353,
+    77,
+    ""
+   ],
+   [
+    18431,
+    13,
+    ""
+   ],
+   [
+    18445,
+    25,
+    ""
+   ],
+   [
+    18475,
+    9,
+    "92"
+   ],
+   [
+    18486,
+    0,
+    ","
+   ],
+   [
+    18487,
+    4,
+    "min(946"
+   ],
+   [
+    18493,
+    1,
+    ""
+   ],
+   [
+    18496,
+    6,
+    "6"
+   ],
+   [
+    18505,
+    8,
+    ""
+   ]
+  ],
+  "real_sha256": "bdbc94c0f1a4290cf207332476b958e708548f98a1bb908cd0d3739ce1477cf9",
+  "sha256": "e12c82658aa7879a0006fc7e220ed53c86219a3ce54cf6f6b90a11f47ec54e3b"
+ }
+}

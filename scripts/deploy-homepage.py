@@ -19,8 +19,10 @@
 기본은 dry-run. `--apply` 를 줘야 실제로 올린다.
 
 사용:
-  python3 scripts/deploy-homepage.py 0.14.5 <자산디렉터리>           # 계획만
-  python3 scripts/deploy-homepage.py 0.14.5 <자산디렉터리> --apply   # 집행
+  python3 scripts/deploy-homepage.py 0.14.5 <자산디렉터리> --skeleton-dir <검토된 골격 폴더>           # 계획만
+  python3 scripts/deploy-homepage.py 0.14.5 <자산디렉터리> --skeleton-dir <검토된 골격 폴더> --apply   # 집행
+  ★--skeleton-dir 는 필수다(H-04-R): 검토된 페이지 골격 2종(저장소 밖)이 없거나·못 읽거나·핀과 다르면 아무것도 받지도
+    올리지도 않고 exit 1. 페이지는 골격 render 로만 만들고, 올리기 전 바이트 단위 게이트를 통과해야 한다.
   python3 scripts/deploy-homepage.py --self-test                     # 삭제 로직 셀프테스트(무접촉)
 """
 import os
@@ -366,6 +368,90 @@ def self_test():
     return 0 if tally["fail"] == 0 else 1
 
 
+# ---- H-04-R page step (design round/_evidence/0.14.56-P9/h04r-r3/H04R-DESIGN-r3.md s5.1) --------------------------
+PAGE_ORDER = ("downloads/index.html", "index.html")        # homepage-switch.py PAGES_ORDER order
+
+
+def fetch_bytes(url):
+    """The page as served - the page gate compares bytes, so nothing is decoded here (fetch() decodes with 'replace')."""
+    r = curl(["-A", UA, url])
+    return r.stdout if r.returncode == 0 else None
+
+
+def fetch_js(name):
+    """A pinned JS name only (./assets/<file>.js) - never a name read from a page."""
+    if not re.match(r"^\./assets/[A-Za-z0-9._-]+\.js$", name):
+        return None
+    return fetch_bytes(SITE + name[1:])
+
+
+def load_page_check():
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "download_page_check.py")
+    spec = importlib.util.spec_from_file_location("download_page_check", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def skeleton_dir_arg(argv):
+    a = list(argv)
+    i = a.index("--skeleton-dir") if "--skeleton-dir" in a else -1
+    return a[i + 1] if 0 <= i < len(a) - 1 and not a[i + 1].startswith("--") else None
+
+
+def load_skeletons(skeleton_dir, dpc, profiles=None):
+    """-> ({rel: skeleton bytes}, refusals). The folder is REQUIRED; a missing folder or file, an unreadable file, or a file
+    whose sha256 differs from its PROFILES pin refuses (rc 1 before anything is contacted)."""
+    profiles = profiles or dpc.PROFILES
+    if not skeleton_dir:
+        return {}, ["--skeleton-dir <검토된 골격 폴더> 가 필요하다 — 골격 없이는 페이지를 만들지 않는다"]
+    out, bad = {}, []
+    for rel in PAGE_ORDER:
+        prof = profiles[rel]
+        p = os.path.join(skeleton_dir, prof.skeleton_name)
+        try:
+            with open(p, "rb") as f:
+                b = f.read()
+        except OSError as ex:
+            bad.append("골격 판독 불가 %s: %s" % (p, ex))
+            continue
+        if dpc.sha256(b) != prof.skeleton_sha256:
+            bad.append("골격 핀 불일치 %s: sha256 %s != PROFILES[%r] %s" % (p, dpc.sha256(b), rel, prof.skeleton_sha256))
+            continue
+        out[rel] = b
+    return out, bad
+
+
+def build_pages(live_pages, ver, sizes_bytes, skeletons, fetch_js, dpc, profiles=None):
+    """-> ({rel: new page bytes}, refusals, macnote report). Nothing may be uploaded unless refusals == []."""
+    profiles = profiles or dpc.PROFILES
+    out, refusals, macrep = {}, [], None
+    for rel in PAGE_ORDER:
+        prof, tpl, page = profiles[rel], skeletons[rel], live_pages[rel]
+        if rel == "index.html":
+            try:
+                text, macrep = strip_main_macnote(page.decode("utf-8"))   # strict decode: never U+FFFD
+                page = text.encode("utf-8")
+            except UnicodeDecodeError as ex:
+                refusals.append("%s: UTF-8 이 아니다: %s" % (rel, ex))
+                continue
+            except MacnoteEditError as ex:
+                refusals.append("%s: macOS 안내 삭제 중단(fail-closed): %s" % (rel, ex))
+                continue
+        vals, errs = dpc.check_input(page, tpl, prof)
+        if errs:
+            refusals += ["%s %s: %s" % (rel, c, d[:300]) for c, d in errs]
+            continue
+        sizes_mib = dict((s, dpc.mib(sizes_bytes["cys_%s%s" % (ver, s)])) for s in prof.size_suffixes)
+        new = dpc.render(tpl, ver, sizes_mib)
+        adv = dpc.make_advisory(prof, tpl, ver, sizes_bytes, fetch_js)
+        refusals += ["%s %s: %s" % (rel, c, d[:300]) for c, d in
+                     dpc.check_publish(new, tpl, prof, ver, sizes_bytes, fetch_js, adv)]
+        out[rel] = new
+    return out, refusals, macrep
+
+
 def main(argv):
     if "--self-test" in argv[1:]:
         return self_test()
@@ -375,6 +461,13 @@ def main(argv):
     ver = argv[1]
     assets = argv[2]
     apply_ = "--apply" in argv[3:]
+    # H-04-R: the reviewed skeletons (outside the repo) are read and pin-checked BEFORE any credential or network use.
+    dpc = load_page_check()
+    skeletons, bad = load_skeletons(skeleton_dir_arg(argv), dpc)
+    if bad:
+        for r in bad:
+            print("::error::%s" % r, file=sys.stderr)
+        return 1
     e = load_env()
 
     four = ["cys_%s_aarch64.dmg" % ver, "cys_%s_x64.dmg" % ver,
@@ -391,57 +484,24 @@ def main(argv):
                           - {ver})
     print("라이브 downloads/ 항목 %d · 구버전 %s" % (len(live), old_versions or "없음"))
 
-    # ── 페이지 범프 계획 ──
-    main_html = fetch(SITE + "/")
-    dl_html = fetch(SITE + "/downloads/")
-    if not main_html or not dl_html:
+    # ── 페이지 2종 (H-04-R): 라이브 = 검토된 골격인가 → render → 바이트 단위 게이트 ──
+    # 종전의 버전 토큰 최빈값 치환 + 용량 토큰 치환은 골격 render 로 대체됐다(설계 r3 §5.1). 페이지는 **바이트**로 받는다.
+    live_pages = {"index.html": fetch_bytes(SITE + "/"), "downloads/index.html": fetch_bytes(SITE + "/downloads/")}
+    if not all(live_pages.values()):
         print("::error::라이브 페이지를 받지 못했다", file=sys.stderr)
         return 1
-
-    # ── ★메인페이지 전용 삭제 단계 (오너 지시 2026-08-24) ──
-    # 버전 범프보다 **먼저** 돌린다 — 이후 계산(버전 토큰 집계·용량 토큰 치환)이 전부
-    # "실제로 올라갈 HTML" 위에서 이뤄지도록 하기 위해서다. dl_html 은 손대지 않는다
-    # (지시는 메인페이지 한정 · /downloads/ 안내 섹션 2종은 그대로 둔다).
-    try:
-        main_html, macrep = strip_main_macnote(main_html)
-    except MacnoteEditError as ex:
-        print("::error::메인페이지 macOS 안내 삭제 중단(fail-closed): %s" % ex, file=sys.stderr)
-        return 1
-    print_macnote_report(macrep)
-    # 이전 버전 = 페이지에 **가장 많이** 등장하는 토큰(밴드 9곳). 문자열 정렬은
-    # 잔존 토큰(예: 0.12.97 한 곳)을 집어 오답을 낸다 — dry-run 으로 실측 확인.
-    counts = {}
-    for v in re.findall(r"0\.\d+\.\d+", main_html):
-        if v != ver:
-            counts[v] = counts.get(v, 0) + 1
-    prev = max(counts, key=counts.get) if counts else None
-    print("메인 페이지: 현재 %s 토큰 %d개 → %s 로 범프" % (prev, main_html.count(prev or "\0"), ver))
-
     sizes = {f: os.path.getsize(os.path.join(assets, f)) for f in four}
     for f in four:
         print("  %-32s %12d B = %d MB(MiB 버림)" % (f, sizes[f], mib(sizes[f])))
-
-    new_main = main_html.replace(prev, ver) if prev else main_html
-    new_dl = dl_html.replace(prev, ver) if prev else dl_html
-    # 용량 토큰 — MiB 버림. 순서는 aarch64 → x64 → exe → zip 로 페이지에 등장한다고 가정하지 않고
-    # **구 자산의 실제 MiB → 신 자산 MiB** 로 1:1 치환한다(오탐 방지).
-    if prev:
-        for f in four:
-            oldf = f.replace(ver, prev)
-            h = curl(["-A", UA, "-I", "%s/downloads/%s" % (SITE, oldf)]).stdout.decode("utf-8", "replace")
-            m = re.search(r"(?i)content-length:\s*(\d+)", h)
-            if not m or int(m.group(1)) == 0:
-                print("  ⚠ 구자산 크기 조회 실패 — 용량 토큰 치환 생략: %s" % oldf)
-                continue
-            o, n = mib(int(m.group(1))), mib(sizes[f])
-            if o == n:
-                continue
-            tok = "%dMB" % o
-            if tok not in new_main:
-                print("  ⚠ 페이지에 %s 토큰이 없다 — 치환 생략(%s)" % (tok, f))
-                continue
-            new_main = new_main.replace(tok, "%dMB" % n)
-            print("  용량 토큰 %s → %dMB (%s)" % (tok, n, f))
+    new_pages, refusals, macrep = build_pages(live_pages, ver, sizes, skeletons, fetch_js, dpc)
+    if macrep is not None:
+        print_macnote_report(macrep)
+    if refusals:
+        for r in refusals:
+            print("::error::페이지 게이트 거부(업로드 전 · fail-closed): %s" % r, file=sys.stderr)
+        return 1
+    new_main, new_dl = new_pages["index.html"], new_pages["downloads/index.html"]
+    print("페이지 2종 = 검토된 골격 + %s (index %d B · downloads %d B)" % (ver, len(new_main), len(new_dl)))
 
     if not apply_:
         print("\n[dry-run] 아무것도 올리지 않았다. 집행은 --apply")
@@ -461,8 +521,10 @@ def main(argv):
     print("── 페이지 업로드 ──")
     with tempfile.TemporaryDirectory() as td:
         mp, dp = os.path.join(td, "index.html"), os.path.join(td, "dl.html")
-        open(mp, "w", encoding="utf-8").write(new_main)
-        open(dp, "w", encoding="utf-8").write(new_dl)
+        with open(mp, "wb") as f:
+            f.write(new_main)                    # the exact bytes the page gate passed
+        with open(dp, "wb") as f:
+            f.write(new_dl)
         for local, remote in ((mp, "index.html"), (dp, "downloads/index.html")):
             ok = ftp_put(e, local, remote)
             print("  %s %s" % ("✓" if ok else "✗", remote))

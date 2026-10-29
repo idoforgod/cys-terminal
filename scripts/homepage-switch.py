@@ -78,6 +78,69 @@ DONE, PENDING_UNLINK, TODO, ALREADY, UNKNOWN = "done", "pending-unlink", "todo",
 CHANGED = "changed"                         # the planned inode is where the plan expects it, but not the target bytes/filesystem
 
 
+# ---- H-04-R r3: the byte-level page checks. download_page_check.py is uploaded beside this file together with the two
+# skeletons; it is the ONLY place a pin, a slot count or a skeleton name is written (D-3). This file holds none.
+def _page_module():
+    """download_page_check.py from beside this file. Any load failure - a SyntaxError on an older interpreter included -
+    is a clean stop (exit 3), never a traceback."""
+    import importlib.util
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "download_page_check.py")
+    try:
+        spec = importlib.util.spec_from_file_location("download_page_check", p)
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+    except Exception as e:
+        raise Stop(STOP_CLEAN, "page-check module unusable here (%s): %s: %s" % (p, type(e).__name__, e))
+    return m
+
+
+def _page_fetch(docroot):
+    def fetch(name):
+        p = os.path.join(docroot, name)
+        if not _under(p, docroot) or not _is_reg(_lstat(p)):
+            return None
+        with open(p, "rb") as f:
+            return f.read()
+    return fetch
+
+
+def page_checks(stage, docroot, ex, with_js=True):
+    """-> refusal strings ([] = pass) for EVERY page in PAGES_ORDER: <stage>/pages/<flat> must equal
+    render(<stage>/pages/<profile.skeleton_name>, expect.json values), and (with_js) the profile's JS pins hold."""
+    dpc = _page_module()
+    bad = []
+    if set(dpc.PROFILES) != set(rel for rel, _flat in PAGES_ORDER):
+        bad.append("page profiles %s != PAGES_ORDER %s" % (sorted(dpc.PROFILES), sorted(r for r, _f in PAGES_ORDER)))
+    sizes = dict((a["name"], a["size"]) for a in ex["assets"])
+    for rel, flat in PAGES_ORDER:
+        prof = dpc.PROFILES.get(rel)
+        if prof is None:
+            continue
+        try:
+            with open(os.path.join(stage, "pages", prof.skeleton_name), "rb") as f:
+                tpl = f.read()
+            with open(os.path.join(stage, "pages", flat), "rb") as f:
+                page = f.read()
+        except OSError as e:
+            bad.append("%s: page-check input unreadable: %s" % (rel, e))
+            continue
+        if not with_js:
+            prof = prof._replace(js_pins={})
+        errs = dpc.check_publish(page, tpl, prof, ex["new_ver"], sizes, _page_fetch(docroot) if with_js else None)
+        bad += ["%s %s: %s" % (rel, c, d) for c, d in errs]
+    return bad
+
+
+def page_js_check(docroot):
+    dpc = _page_module()
+    bad = []
+    for rel, _flat in PAGES_ORDER:
+        prof = dpc.PROFILES.get(rel)
+        if prof is not None:
+            bad += ["%s %s: %s" % (rel, c, d) for c, d in dpc.check_js(prof.js_pins, _page_fetch(docroot))]
+    return bad
+
+
 class Stop(Exception):
     def __init__(self, code, msg):
         Exception.__init__(self, msg)
@@ -517,6 +580,11 @@ def build_forward_plan(stage, docroot, backup, ex, pages):
     bad = verify_stage(stage, ex)
     if bad:
         raise Stop(STOP_CLEAN, "staging verify: " + "; ".join(bad))
+    # H-04-R D3: every page against its profile, on the FIRST call only (cmd_switch reaches this only while plan.json is
+    # absent; moves happen only in execute(), after plan.json is written) - nothing of this run has moved: exit 3 is exact.
+    pc = page_checks(stage, docroot, ex)
+    if pc:
+        raise Stop(STOP_CLEAN, "page-check: " + "; ".join(pc))
     items = forward_items(stage, ex)
     want = dict((a["name"], a["sha256"]) for a in ex["assets"])
     for it in items:
@@ -561,6 +629,7 @@ def cmd_preflight(a):
     guard_ts(stage, a.ts)
     dev = guard_dev([os.path.join(stage, "downloads"), os.path.join(stage, "pages"), docroot,
                      os.path.join(docroot, "downloads")])
+    _page_module()           # H-04-R (gemini-4): the server's interpreter must load the uploaded checker - before any move
     home = os.path.dirname(_real(stage))
     moved = []
     trash = os.path.join(home, "cys-site-trash-%s" % a.ts, "stale-staging")
@@ -663,6 +732,7 @@ def cmd_verify_backup(a):
 def cmd_verify_stage(a):
     ex = load_expect(os.path.join(a.stage, "expect.json"))
     bad = verify_stage(a.stage, ex)
+    bad += page_checks(a.stage, None, ex, with_js=False)      # H-04-R: the byte part of both pages (no docroot here)
     if bad:
         raise Stop(STOP_CLEAN, "verify-stage: " + "; ".join(bad))
     return {"ok": True, "assets": len(ex["assets"]), "sums_lines": len(ex["assets"]) - 1}
@@ -681,6 +751,16 @@ def cmd_switch(a):
         if plan.get("ts") != a.ts:
             raise Stop(STOP_CLEAN, "G-ts: plan.json ts %s != run ts %s" % (plan.get("ts"), a.ts))
         items = plan["items"]
+        # H-04-R D3 resume: page BYTES are bound by check_plan's content rule (target_sha = the bytes that passed the first
+        # call), so they are not re-read. The live JS closure is outside the plan: re-check it while index.html is still
+        # unpublished. A published index.html means the pages are live - a resume must finish, not refuse.
+        idx = [it for it in items if it["dst"] == "index.html"]
+        if idx and classify(idx[0], docroot, dev=dev) in (TODO, PENDING_UNLINK):
+            js = page_js_check(docroot)
+            if js:
+                ours = [_published(it, docroot) for it in items]
+                raise Stop(STOP_PARTIAL if any(ours) else STOP_CLEAN,
+                           "page-check (resume): " + "; ".join(js) + " - this call moved nothing")
     else:
         pages = _load_json(os.path.join(stage, "pages.json"), "pages.json")
         items = build_forward_plan(stage, docroot, a.backup, ex, pages)

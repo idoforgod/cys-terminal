@@ -29,15 +29,18 @@
 """
 
 import contextlib
+import hashlib
 import importlib.util
 import io
 import os
 import re
+import shutil
 import struct
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 # ★하이픈 파일명(`release-postprocess.py`)은 `import` 문으로 못 부른다 — importlib 로 직접
 #   적재한다(test_release_verify.py 와 같은 이유·같은 관례).
@@ -185,7 +188,11 @@ class GatekeeperGateHookTests(unittest.TestCase):
             p = os.path.join(assets_dir, name)
             with open(p, "wb") as fh:
                 fh.write(b"stub-" + name.encode("ascii"))
-            fake_assets.append({"id": idx, "name": name, "size": os.path.getsize(p), "url": "https://example.invalid/" + name})
+            # digest: real release assets carry it (measured 14/14 v0.14.54, 6/6 v0.14.55 draft); H-05 D2 re-downloads without it
+            with open(p, "rb") as fh:
+                dg = "sha256:" + hashlib.sha256(fh.read()).hexdigest()
+            fake_assets.append({"id": idx, "name": name, "size": os.path.getsize(p), "digest": dg,
+                                "url": "https://example.invalid/" + name})
         uploads = []
         err_main = io.StringIO()
         orig_gate = rp.gatekeeper_gate
@@ -1312,6 +1319,238 @@ echo "00000000-0000-0000-0000-000000000000"
                         pass
             sentinel.kill()
             sentinel.wait()
+
+
+class PublishedSumsPreservationH05Tests(unittest.TestCase):
+    """H-05 (0.14.56): P9-DESIGN-R2 §5 D1-a/b/c and D2, plus the P9-DESIGN-R3 §6-2 coverage list.
+
+    Hermetic: a fake GitHub (release GET, asset download, DELETE, upload POST) and the real make-win-zip.py.
+    The Gatekeeper gate is replaced, because its own contract is pinned by the classes above; the hook on the
+    fake gate is the one point between self-verification and upload where a test can change a candidate."""
+
+    VER = "9.9.1"
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="rp-h05-")
+        self.tag = "v" + self.VER
+        self.outdir = os.path.join(self.root, self.tag + "-assets")
+        self.blobs, self.assets, self.calls = {}, [], []
+        self.gate_hook = None
+        self.delete_hook = None
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def add(self, name, data, digest="auto"):
+        url = "https://example.invalid/a/" + name
+        self.blobs[url] = data
+        a = {"id": len(self.assets) + 1, "name": name, "size": len(data), "url": url}
+        if digest == "auto":
+            a["digest"] = "sha256:" + hashlib.sha256(data).hexdigest()
+        elif digest is not None:
+            a["digest"] = digest
+        self.assets = [x for x in self.assets if x["name"] != name] + [a]
+        return a
+
+    def release(self, with_zip=True, sums=None):
+        v = self.VER
+        self.add("cys_%s_aarch64.dmg" % v, b"dmg-arm" * 10)
+        self.add("cys_%s_x64.dmg" % v, b"dmg-x64" * 10)
+        self.add("cys_%s_x64-setup.exe" % v, b"MZ-fake-setup-" + v.encode() * 50)
+        self.add("latest.json", b'{"version":"%s"}' % v.encode())
+        if with_zip:
+            self.add("cys_%s_x64-setup.zip" % v, b"PK-fake-zip-bytes")
+        if sums is not None:
+            self.add(rp.SUMS_NAME, sums)
+
+    def regenerated(self):
+        names = sorted(a["name"] for a in self.assets if a["name"] != rp.SUMS_NAME)
+        return "".join("%s  %s\n" % (hashlib.sha256(self.blobs["https://example.invalid/a/" + n]).hexdigest(), n)
+                       for n in names).encode()
+
+    def run_main(self, apply_=False, draft=True):
+        rel = {"tag_name": self.tag, "draft": draft, "assets": self.assets,
+               "upload_url": "https://example.invalid/up{?name}"}
+        if draft == "absent":
+            del rel["draft"]
+
+        def fake_api(path, tok, method="GET", data=None, ctype="application/json"):
+            self.calls.append((method, path))
+            if method == "DELETE" and self.delete_hook:
+                self.delete_hook()
+            return rel if method == "GET" else {}
+
+        def fake_download(url, dest, tok):
+            self.calls.append(("DL", os.path.basename(dest)))
+            with open(dest, "wb") as fh:
+                fh.write(self.blobs[url])
+
+        def fake_urlopen(req, *a, **k):
+            self.calls.append(("POST", req.full_url.split("name=")[-1], len(req.data or b"")))
+            return io.BytesIO(b"")
+
+        def fake_gate(outdir, version, unsafe_skip=False):
+            if self.gate_hook:
+                self.gate_hook()
+            return 0
+
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(rp, "BACKUP_ROOT", self.root), \
+             mock.patch.object(rp, "token", return_value="fake-tok"), \
+             mock.patch.object(rp, "api", side_effect=fake_api), \
+             mock.patch.object(rp, "download", side_effect=fake_download), \
+             mock.patch.object(rp.urllib.request, "urlopen", side_effect=fake_urlopen), \
+             mock.patch.object(rp, "gatekeeper_gate", side_effect=fake_gate), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = rp.main(["release-postprocess.py", self.tag] + (["--apply"] if apply_ else []))
+        return rc, out.getvalue(), err.getvalue()
+
+    def writes(self):
+        return [c for c in self.calls if c[0] in ("DELETE", "POST")]
+
+    def read(self, name):
+        with open(os.path.join(self.outdir, name), "rb") as fh:
+            return fh.read()
+
+    PUB = "SHA256SUMS.published.txt"
+
+    def test_h05_01_published_sums_preserved_before_regeneration(self):
+        """D1-a: the release's own SHA256SUMS.txt bytes survive step 3 under SHA256SUMS.published.txt."""
+        self.release(sums=b"0" * 64 + "  old-asset\n".encode())
+        rc, out, err = self.run_main(draft=True)
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(os.path.exists(os.path.join(self.outdir, self.PUB)), "published SUMS bytes were not preserved")
+        self.assertEqual(self.read(self.PUB), b"0" * 64 + b"  old-asset\n")
+        self.assertEqual(self.read(rp.SUMS_NAME), self.regenerated(), "the uploader path must hold the regenerated SUMS")
+
+    def test_h05_02_public_mismatch_blocks_before_any_delete_or_post(self):
+        """D1-b public-mismatch: draft=False and published != regenerated -> ::error::, both kept, no remote write."""
+        self.release(sums=b"0" * 64 + b"  old-asset\n")
+        rc, out, err = self.run_main(apply_=True, draft=False)
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(self.writes(), [], "a public release whose SUMS differs was modified")
+        self.assertIn("public-mismatch", out + err)
+        self.assertIn("::error::", err)
+        self.assertEqual(self.read(self.PUB), b"0" * 64 + b"  old-asset\n")
+        self.assertEqual(self.read(rp.SUMS_NAME), self.regenerated())
+
+    def test_h05_03_draft_mismatch_warns_preserves_and_continues(self):
+        """D1-b draft-mismatch: a warning, never an error; both kept; the upload still happens."""
+        self.release(sums=b"0" * 64 + b"  old-asset\n")
+        rc, out, err = self.run_main(apply_=True, draft=True)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("draft-mismatch", out + err)
+        self.assertIn("::warning::", out + err)
+        self.assertEqual(self.read(self.PUB), b"0" * 64 + b"  old-asset\n")
+        self.assertIn(("POST", rp.SUMS_NAME, len(self.regenerated())), self.calls)
+
+    def test_h05_04_equal_state_is_named(self):
+        self.release(with_zip=True)
+        self.add(rp.SUMS_NAME, self.regenerated())
+        rc, out, err = self.run_main(draft=False)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("equal", out)
+        self.assertEqual(self.read(self.PUB), self.read(rp.SUMS_NAME))
+
+    def test_h05_05_missing_zip_bootstrap_runs_make_win_zip(self):
+        """R3 §6-2 item 1: no zip and no SUMS in the release -> the zip is MADE (real make-win-zip.py), SUMS
+        lists it, the state is named bootstrap, nothing is preserved because nothing was published."""
+        self.release(with_zip=False, sums=None)
+        rc, out, err = self.run_main(draft=True)
+        self.assertEqual(rc, 0, err)
+        zipname = "cys_%s_x64-setup.zip" % self.VER
+        self.assertTrue(os.path.exists(os.path.join(self.outdir, zipname)), "bootstrap did not create the zip")
+        self.assertIn(zipname.encode(), self.read(rp.SUMS_NAME))
+        self.assertIn("bootstrap", out)
+        self.assertFalse(os.path.exists(os.path.join(self.outdir, self.PUB)))
+
+    def test_h05_06_rerun_keeps_an_identical_preserved_file_untouched(self):
+        """R3 §6-2 item 2a: second post-process of the same tag finds the preserved copy equal and leaves it."""
+        self.release(sums=b"0" * 64 + b"  old-asset\n")
+        self.assertEqual(self.run_main(draft=True)[0], 0)
+        st1 = os.stat(os.path.join(self.outdir, self.PUB))
+        rc, out, err = self.run_main(draft=True)
+        self.assertEqual(rc, 0, err)
+        st2 = os.stat(os.path.join(self.outdir, self.PUB))
+        self.assertEqual((st1.st_ino, st1.st_mtime_ns), (st2.st_ino, st2.st_mtime_ns), "preserved copy was rewritten")
+
+    def test_h05_07_rerun_refuses_to_overwrite_a_differing_preserved_file(self):
+        """R3 §6-2 items 2b/4: the release SUMS changed since the copy was taken -> ::error::, copy kept, no write."""
+        self.release(sums=b"0" * 64 + b"  old-asset\n")
+        self.assertEqual(self.run_main(draft=True)[0], 0)
+        self.add(rp.SUMS_NAME, b"1" * 64 + b"  other-asset\n")
+        rc, out, err = self.run_main(apply_=True, draft=True)
+        self.assertNotEqual(rc, 0)
+        self.assertIn("::error::", err)
+        self.assertEqual(self.read(self.PUB), b"0" * 64 + b"  old-asset\n", "the earlier evidence was overwritten")
+        self.assertEqual(self.writes(), [])
+
+    def test_h05_08_cache_hit_needs_digest_equality(self):
+        """D2: a same-size stale local copy with a present, different digest is downloaded again."""
+        self.release(with_zip=True)
+        os.makedirs(self.outdir, exist_ok=True)
+        stale = b'{"version":"9.9.0"}'
+        self.assertEqual(len(stale), len(self.blobs["https://example.invalid/a/latest.json"]))
+        with open(os.path.join(self.outdir, "latest.json"), "wb") as fh:
+            fh.write(stale)
+        rc, out, err = self.run_main(draft=True)
+        self.assertEqual(rc, 0, err)
+        self.assertIn(("DL", "latest.json"), self.calls)
+        self.assertEqual(self.read("latest.json"), self.blobs["https://example.invalid/a/latest.json"])
+
+    def test_h05_09_absent_digest_is_never_a_cache_hit(self):
+        self.release(with_zip=True)
+        self.add("latest.json", b'{"version":"9.9.1"}', digest=None)
+        os.makedirs(self.outdir, exist_ok=True)
+        with open(os.path.join(self.outdir, "latest.json"), "wb") as fh:
+            fh.write(b'{"version":"9.9.0"}')
+        rc, out, err = self.run_main(draft=True)
+        self.assertEqual(rc, 0, err)
+        self.assertIn(("DL", "latest.json"), self.calls)
+        self.assertEqual(self.read("latest.json"), b'{"version":"9.9.1"}')
+
+    def test_h05_10_equal_digest_is_still_a_cache_hit(self):
+        """Control for 08/09: identical bytes with an equal digest are not downloaded again."""
+        self.release(with_zip=True)
+        os.makedirs(self.outdir, exist_ok=True)
+        with open(os.path.join(self.outdir, "latest.json"), "wb") as fh:
+            fh.write(self.blobs["https://example.invalid/a/latest.json"])
+        rc, out, err = self.run_main(draft=True)
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn(("DL", "latest.json"), self.calls)
+
+    def test_h05_11_sums_candidate_changed_after_selfverify_blocks_upload(self):
+        """D1-c: the file the uploader opens must be the bytes step 4 verified."""
+        self.release(with_zip=True)
+        self.gate_hook = lambda: open(os.path.join(self.outdir, rp.SUMS_NAME), "ab").write(b"x")
+        rc, out, err = self.run_main(apply_=True, draft=True)
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(self.writes(), [], "an unverified SUMS candidate reached DELETE/POST")
+
+    def test_h05_12_zip_changed_after_sums_blocks_upload(self):
+        self.release(with_zip=False)
+        zipname = "cys_%s_x64-setup.zip" % self.VER
+        self.gate_hook = lambda: open(os.path.join(self.outdir, zipname), "ab").write(b"tail")
+        rc, out, err = self.run_main(apply_=True, draft=True)
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(self.writes(), [], "a zip that no longer matches its SUMS line reached DELETE/POST")
+
+    def test_h05_13_release_without_a_draft_key_is_treated_as_public(self):
+        """D1-b fail-closed: only an explicit draft=true earns the warning; a missing key blocks like public."""
+        self.release(sums=b"0" * 64 + b"  old-asset\n")
+        rc, out, err = self.run_main(apply_=True, draft="absent")
+        self.assertNotEqual(rc, 0)
+        self.assertIn("public-mismatch", out + err)
+        self.assertEqual(self.writes(), [])
+
+    def test_h05_14_posted_bytes_are_the_verified_bytes(self):
+        """D1-c: a candidate changed on disk after the check (here: during the first DELETE) must not reach POST."""
+        self.release(with_zip=True, sums=b"0" * 64 + b"  old-asset\n")
+        want = self.regenerated()
+        self.delete_hook = lambda: open(os.path.join(self.outdir, rp.SUMS_NAME), "ab").write(b"tampered\n")
+        rc, out, err = self.run_main(apply_=True, draft=True)
+        posted = [c for c in self.calls if c[0] == "POST" and c[1] == rp.SUMS_NAME]
+        self.assertEqual(posted, [("POST", rp.SUMS_NAME, len(want))], "POST sent bytes other than the verified SUMS")
 
 
 if __name__ == "__main__":

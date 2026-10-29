@@ -39,7 +39,8 @@
        안내까지 지운다. 그 회귀는 ⓐ·ⓒ만으로는 통과해 버리므로 ⓑ 로 0건을 즉시 잡는다.
      ★⑤(다운로드 페이지 Defender 섹션)와 **다른 페이지·다른 축**이다 — 어느 쪽도 약화시키지 않는다.
 
-사용: python3 scripts/verify-release-remote.py <신버전>               # 공개 목록에서 전임 파생 · 정본 8축
+사용: python3 scripts/verify-release-remote.py <신버전> --skeleton-dir <검토된 골격 폴더>   # ★② 는 골격 없이 측정 불능(FAIL)
+      python3 scripts/verify-release-remote.py <신버전>               # 공개 목록에서 전임 파생 · 정본 8축
       python3 scripts/verify-release-remote.py <신버전> <구버전>      # 인자는 파생값과 같아야 한다
       python3 scripts/verify-release-remote.py <신버전> --no-prev     # ① SKIP · 부분 측정
       python3 scripts/verify-release-remote.py --self-test           # 오프라인 판정·인자·main 시험
@@ -51,6 +52,7 @@
 from datetime import datetime
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -330,6 +332,22 @@ def p9_self_test():
     verifier = types.SimpleNamespace(**globals())
     VRR = verifier
     V, OLD = '9.9.55', '9.9.54'
+    # H-04-R: the exact-page axis reads the repo's sanitized fixture pages (scripts/tests/fixtures/download_page) under
+    # fixture profiles; the real skeletons live outside the repo (--skeleton-dir).
+    import shutil
+    import tempfile
+    fix = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tests', 'fixtures', 'download_page')
+    dpc = _page_check()
+    sk_ix = open(os.path.join(fix, 'index-sanitized.skeleton'), 'rb').read()
+    sk_dl = open(os.path.join(fix, 'downloads-index.skeleton'), 'rb').read()
+    js = dict(('./assets/' + n, open(os.path.join(fix, 'assets', n), 'rb').read()) for n in os.listdir(os.path.join(fix, 'assets')))
+    fx_profiles = {'index.html': dpc.PROFILES['index.html']._replace(
+                       skeleton_sha256=dpc.sha256(sk_ix), js_pins=dict((n, dpc.sha256(b)) for n, b in js.items())),
+                   'downloads/index.html': dpc.PROFILES['downloads/index.html']}
+    skel_dir = tempfile.mkdtemp(prefix='vrr-skel-')
+    for name, b in (('index.skeleton', sk_ix), ('downloads-index.skeleton', sk_dl)):
+        with open(os.path.join(skel_dir, name), 'wb') as f:
+            f.write(b)
 
 
     def release(v=OLD, **kw):
@@ -346,8 +364,9 @@ def p9_self_test():
             self.calls = []
             self.blobs = {n: n.encode() for n in mod.expected_sums_names(V)}
             self.four = ['cys_%s_%s' % (V, s) for s in ('aarch64.dmg', 'x64.dmg', 'x64-setup.exe', 'x64-setup.zip')]
-            self.html = ''.join('<a href="/downloads/%s">1MB</a>' % n for n in self.four)
-            self.html += (' ' + V) * 5 + '<p class="dl-hero__winnote">Defender</p>' + residual
+            one_mib = dict((s, 1) for s in dpc.SUFFIXES)                       # clen() answers 1 MiB below
+            self.html = dpc.render(sk_ix, V, one_mib).decode('utf-8') + residual
+            self.dl = dpc.render(sk_dl, V, {})
             if bad:
                 self.html += V  # exactly one failed axis (new-version count)
 
@@ -356,7 +375,7 @@ def p9_self_test():
             if url == self.mod.SITE + '/':
                 return self.html
             if url.endswith('/downloads/'):
-                return '<section %s>Defender</section>' % self.mod.DEFENDER_MARKER
+                return self.dl.decode('utf-8')
             if url.endswith('/SHA256SUMS.txt'):
                 return ''.join('%s  %s\n' % (hashlib.sha256(b).hexdigest(), n) for n, b in self.blobs.items())
             raise AssertionError('unexpected GET: ' + url)
@@ -379,10 +398,20 @@ def p9_self_test():
             assert url.startswith(self.mod.SITE + '/downloads/'), url
             return types.SimpleNamespace(stdout=self.blobs[url.rsplit('/', 1)[1]], returncode=0)
 
+        def get_bytes(self, url):
+            self.calls.append(url)
+            if url == self.mod.SITE + '/':
+                return self.html.encode('utf-8')
+            if url == self.mod.SITE + '/downloads/':
+                return self.dl
+            if url.startswith(self.mod.SITE + '/assets/'):
+                return js.get('.' + url[len(self.mod.SITE):])
+            raise AssertionError('unexpected GET (bytes): ' + url)
+
         @contextlib.contextmanager
         def installed(self):
-            with patch.dict(self.mod.main.__globals__, get=self.get, get_json=self.get_json,
-                                clen=lambda u: 1024 * 1024, code=lambda u: '200'), \
+            with patch.dict(self.mod.main.__globals__, get=self.get, get_json=self.get_json, get_bytes=self.get_bytes,
+                            PAGE_PROFILES=fx_profiles, clen=lambda u: 1024 * 1024, code=lambda u: '200'), \
                     patch.object(self.mod.subprocess, 'run', self.run):
                 yield self
 
@@ -396,7 +425,7 @@ def p9_self_test():
             remote = Remote(self.m, **kw)
             out = io.StringIO()
             with remote.installed(), contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
-                rc = self.m.main(['x', V] + args)
+                rc = self.m.main(['x', V] + args + ['--skeleton-dir', skel_dir])
             return rc, out.getvalue(), remote
 
         def derive(self, rows, want, state='derived', target=V):
@@ -507,8 +536,16 @@ def p9_self_test():
         def test_t14_repeated_main(self):
             with Remote(self.m).installed(), contextlib.redirect_stdout(io.StringIO()):
                 for _ in range(2):
-                    self.assertEqual(self.m.main(['x', V, OLD]), 0)
+                    self.assertEqual(self.m.main(['x', V, OLD, '--skeleton-dir', skel_dir]), 0)
                     self.assertEqual(len(self.m.results), 8)
+
+        def test_t14b_skeleton_dir_is_required(self):
+            """H-04-R: without the reviewed skeletons axis 2 is unmeasured = FAIL (exit 1); the other axes still run."""
+            out = io.StringIO()
+            with Remote(self.m).installed(), contextlib.redirect_stdout(out):
+                rc = self.m.main(['x', V, OLD])
+            self.assertEqual((rc, len(self.m.results)), (1, 8), out.getvalue())
+            self.assertIn('--skeleton-dir 미지정', out.getvalue())
 
         def test_t15_args_no_network(self):
             for argv in (['x'], ['x', V, OLD, '--no-prev'], ['x', V, '--bad'], ['x', V, OLD, '1.2.3'], ['x', 'bad']):
@@ -691,9 +728,80 @@ def self_test():
     return 0 if tally["fail"] == 0 else 1
 
 
+# ---- H-04-R: the exact-page axis (design round/_evidence/0.14.56-P9/h04r-r3/H04R-DESIGN-r3.md s5.3) ----------------
+PAGE_PROFILES = None          # None = download_page_check.PROFILES; only this file's own self-test replaces it
+PAGE_URLS = (("index.html", "/"), ("downloads/index.html", "/downloads/"))
+
+
+def get_bytes(url):
+    """The served bytes as they are - the page check is byte for byte, so no decoding (get() decodes with 'replace')."""
+    r = subprocess.run(["curl", "-s", "-A", UA, "--max-time", "120", url], capture_output=True)
+    return r.stdout if r.returncode == 0 else None
+
+
+def skeleton_dir_arg(argv):
+    args = list(argv[1:])
+    i = args.index("--skeleton-dir") if "--skeleton-dir" in args else -1
+    return args[i + 1] if 0 <= i < len(args) - 1 else None
+
+
+def _page_check():
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "download_page_check.py")
+    spec = importlib.util.spec_from_file_location("download_page_check", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def pages_verdict(ver, skeleton_dir):
+    """-> (ok, detail) for index.html and downloads/index.html. Unmeasured (no folder, unreadable skeleton, a skeleton whose
+    sha256 differs from its pin, an empty page, a missing Content-Length) is never a pass."""
+    if not skeleton_dir:
+        return False, "--skeleton-dir 미지정 — 검토된 골격 없이는 잴 수 없다(측정 불능)"
+    try:
+        dpc = _page_check()
+        profiles = PAGE_PROFILES or dpc.PROFILES
+        bad = []
+        for rel, path in PAGE_URLS:
+            prof = profiles[rel]
+            try:
+                with open(os.path.join(skeleton_dir, prof.skeleton_name), "rb") as f:
+                    tpl = f.read()
+            except OSError as e:
+                bad.append("%s: 골격 판독 불가(%s)" % (rel, e))
+                continue
+            if dpc.sha256(tpl) != prof.skeleton_sha256:
+                bad.append("%s SKELETON-PIN: %s sha256 %s != 핀 %s" % (rel, prof.skeleton_name, dpc.sha256(tpl),
+                                                                   prof.skeleton_sha256))
+                continue
+            page = get_bytes(SITE + path)
+            if not page:
+                bad.append("%s: 빈 응답" % rel)
+                continue
+            sizes = dict(("cys_%s%s" % (ver, s), clen("%s/downloads/cys_%s%s" % (SITE, ver, s)))
+                         for s in prof.size_suffixes)
+            if any(v is None for v in sizes.values()):
+                bad.append("%s: 자산 Content-Length 없음 %s(측정 불능)" % (rel, sorted(k for k, v in sizes.items() if v is None)))
+                continue
+
+            def fetch(name):
+                return get_bytes(SITE + name[1:]) if dpc.NAME_RE.match(name) else None
+            adv = dpc.make_advisory(prof, tpl, ver, sizes, fetch)
+            bad += ["%s %s: %s" % (rel, c, d[:300]) for c, d in dpc.check_publish(page, tpl, prof, ver, sizes, fetch, adv)]
+        return not bad, "; ".join(bad) if bad else "2종 일치(바이트 단위)"
+    except Exception as e:                                # the axis never passes on a crash
+        return False, "페이지 검사 중단: %s: %s" % (type(e).__name__, e)
+
+
 def parse_args(argv):
     """argv → (ver, prev, no_prev) 또는 문자열(인자 오류 사유). 순수함수 — 원격 무접촉."""
-    args = argv[1:]
+    args = list(argv[1:])
+    if "--skeleton-dir" in args:                       # H-04-R: the one flag that takes a value
+        i = args.index("--skeleton-dir")
+        if i + 1 >= len(args) or args[i + 1].startswith("--") or args.count("--skeleton-dir") > 1:
+            return "--skeleton-dir 는 폴더 경로 하나를 받는다"
+        del args[i:i + 2]
     flags = [a for a in args if a.startswith("--")]
     pos = [a for a in args if not a.startswith("--")]
     unknown = [f for f in flags if f != "--no-prev"]
@@ -745,9 +853,11 @@ def main(argv):
             n = main_html.count(derived)
             check("① 구버전 문자열 0 (%s)" % derived, n == 0, "발견 %d개 · %s" % (n, reason))
 
-    # ② 신버전 9
-    n = main_html.count(ver)
-    check("② 신버전 문자열 9 (%s)" % ver, n == 9, "발견 %d개" % n)
+    # ② (H-04-R) 페이지 2종 = 검토된 골격 + 이번 값. 종전 ②(신버전 문자열 9개)는 이 축의 한 결과다: 골격의 VER 칸이
+    #   index 9 · downloads 12 이고 그 밖의 바이트는 전부 고정이다. 골격은 저장소 밖(--skeleton-dir)에 있고 핀은
+    #   download_page_check.PROFILES 하나다(D-3). 골격이 없거나·못 읽거나·핀과 다르면 측정 불능 = FAIL.
+    ok2, detail2 = pages_verdict(ver, skeleton_dir_arg(argv))
+    check("② 페이지 2종 = 검토된 골격 + 이번 값 (index.html · downloads/index.html)", ok2, detail2)
 
     # ③ 용량 4토큰
     bad = []
