@@ -1754,16 +1754,19 @@ class MarkerReaderContract(unittest.TestCase):
 
     def test_persistent_permission_error_fails_loudly_after_the_attempt_bound(self):
         calls, p = self.reads([PermissionError])
+        # The default attempt bound (25), with the time bound and the readiness limit out of reach: no runner speed
+        # decides the verdict (d2be23fe macOS: 1.0 s ran out after 11 attempts, m=11/1020ms, log :5587).
         with p, self.assertRaises(self.failureException) as cm:
-            self._marker_pid(self.root/'m', retry_permission=True)
+            self._marker_pid(self.root/'m', retry_permission=True, budget_s=600, limit_s=600)
         self.assertIsInstance(cm.exception.__cause__, PermissionError)
-        self.assertIn('25 attempts', str(cm.exception))
+        # The bound that fired and the count; '(bounds: 25 attempts' is in every message, so it proves nothing.
+        self.assertIn('attempt bound reached after 25 attempts', str(cm.exception))
         self.assertEqual(self.marker_stats[-1][:2], ('m', 25))
 
     def test_attempt_bound_ends_the_retries(self):
         calls, p = self.reads([PermissionError])
         with p, self.assertRaises(self.failureException) as cm:
-            self._marker_pid(self.root/'m', retry_permission=True, attempts=25, budget_s=600)
+            self._marker_pid(self.root/'m', retry_permission=True, attempts=25, budget_s=600, limit_s=600)
         self.assertEqual(len(calls), 25)
         self.assertIn('attempt bound', str(cm.exception))
 
