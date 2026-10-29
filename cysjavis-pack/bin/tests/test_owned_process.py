@@ -1001,7 +1001,7 @@ if __name__=='__main__':
         bash = os.environ.get('C03_TEST_BASH') or (shutil.which('bash') if os.name == 'posix' else None)
         if not bash:
             self.skipTest('no bash (on nt: C03_TEST_BASH, the bundled Git bash)')
-        lines = (Path(__file__).resolve().parents[2]/'hooks'/'inject-context.sh').read_text().splitlines()
+        lines = (Path(__file__).resolve().parents[2]/'hooks'/'inject-context.sh').read_text(encoding='utf-8').splitlines()
         src = [i for i, l in enumerate(lines) if l.startswith('. "') and l.endswith('/_lib.sh" 2>/dev/null \\')]
         self.assertTrue(src, 'the first _lib.sh source line was not found')
         i = src[0]
