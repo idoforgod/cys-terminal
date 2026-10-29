@@ -357,6 +357,13 @@ REFERENCING_FILES = (  # 정렬 key=str(코드포인트 순 · LC_ALL=C sort 와
     #   `os.environ` 복사본 위에 봉인을 **상속 방향으로** 다시 건다(cysd 가 팩 python 을 띄워도 캐시를 쓰지 않게 ·
     #   test_lane_redirect·test_role_authority_shell 과 같은 계급). 벗기는 줄은 0이다.
     "scripts/tests/test_cysd_dispatch_storm_e2e.py",
+    # 2026-10-29 registration (0.14.56 H-04-R, worker-15; head ruling on INTEG-DRYRUN-1: register, do not drop the
+    #   line). Needle: ONE occurrence, the docstring run line `PYTHONDONTWRITEBYTECODE=1 python3 scripts/tests/...`,
+    #   which is how ci-branch runs it. **Seal inspection result**: NOT a python entry point and NOT a product
+    #   enforcement point; it starts NO child process (the checked scripts are loaded in-process with
+    #   importlib exec_module and their main() is called with redirected stdout/stderr), so it neither strips
+    #   nor sets the seal.
+    "scripts/tests/test_download_page_check.py",
     # 2026-10-23 registration (0.14.53 WP3 B-437 R1-R3 added the G1/G6 specimens for the gate step 6-B SEAL-1
     #   relaxation, which is how this file entered the set: f0ac3b0c holds 0 needles, cc93b458 holds 19
     #   (19 occurrences on 19 lines, all PYTHONDONTWRITEBYTECODE; ENV_PY_NO_BYTECODE 0).
