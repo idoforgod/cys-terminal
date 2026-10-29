@@ -47,6 +47,9 @@ import time
 
 PACK = Path(__file__).resolve().parents[2]
 REDIRECT = 'command -v cys_lane_redirect >/dev/null 2>&1 && cys_lane_redirect "$@"'
+DEFINE_ONLY_GUARD = ['if [ "${_CYS_LIB_DEFINE_ONLY:-}" = 1 ]; then',
+                     '  command -v cys_lane_guard >/dev/null 2>&1 && cys_lane_guard',
+                     'fi']
 MARKER = Path("state/lane-guard-tripped")
 fails = []
 sys.dont_write_bytecode = True
@@ -323,11 +326,32 @@ def r8():
         rel = path.relative_to(PACK / "hooks").as_posix()
         found.append(rel)
         following = next((line for line in lines[end + 1:] if line.strip()), "") if end is not None else ""
+        if path.name == "inject-context.sh" and end is not None:
+            # inject-context's controller loads _lib.sh define-only, which skips the run block that calls
+            # cys_lane_guard, so it calls the guard itself; the redirect line consumes what the guard reserves.
+            # Measured 2026-10-29 from a foreign lane (R-8b): guard-then-redirect delegates; redirect-first or
+            # no guard does not (the lane's hook never runs). So this hook may carry exactly that block, plus
+            # comments, between the prelude and the redirect line - nothing else.
+            rest = [line for line in lines[end + 1:] if line.strip() and not line.lstrip().startswith("#")]
+            if rest[:3] == DEFINE_ONLY_GUARD:
+                following = rest[3] if len(rest) > 3 else ""
         if following != REDIRECT:
             missing.append(rel)
     required = {"test_pre_dispatch.sh", "role-bootstrap.sh", "role-bootstrap-legacy.sh"}
     check("R-8 프리루드 직후 redirect census", bool(found) and required.issubset(found)
           and not missing, "scanned=%d missing=%s" % (len(found), ", ".join(missing)))
+
+
+def r8b(lab):
+    # The behaviour behind R-8's inject-context shape: from a foreign lane the define-only controller must
+    # still delegate to the lane's hook. inject-context.sh is a bash hook, so it runs under bash here.
+    write(lab.dept / "hooks/inject-context.sh", "#!/bin/bash\nprintf 'DEPT-INJECT-RAN\\n'\n")
+    payload = json.dumps({"source": "clear", "cwd": str(lab.root / "work")})
+    r = subprocess.run(["/bin/bash", str(lab.base / "hooks/inject-context.sh")], input=payload,
+                       env={**lab.env, "CYS_PACK_DIR": str(lab.dept)}, cwd=lab.root / "work",
+                       capture_output=True, text=True, timeout=60)
+    check("R-8b inject-context controller delegates from a foreign lane",
+          r.returncode == 0 and r.stdout == "DEPT-INJECT-RAN\n", result(r))
 
 
 def r9(lab):
@@ -642,7 +666,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="lane-redirect-") as tmp:
         root = Path(tmp)
         for name, action in (("R-1/R-5", r1_r5), ("R-2", r2), ("R-3", r3),
-                             ("R-4", r4), ("R-6", r6), ("R-7", r7),
+                             ("R-4", r4), ("R-6", r6), ("R-7", r7), ("R-8b", r8b),
                              ("R-9", r9), ("R-10", r10), ("R-11", r11),
                              ("P-1/P-2", preflight_cases)):
             attempt(name, lambda name=name, action=action:
