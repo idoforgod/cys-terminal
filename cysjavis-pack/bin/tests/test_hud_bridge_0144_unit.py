@@ -1373,6 +1373,118 @@ class SpoolRotationGateH(_SpoolH):
         self.assertIn("may have raced a pack install", self.log.getvalue())
 
 
+class SpoolSizeTriggerJ(_SpoolH):
+    """(0.14.56 slice J · CEO release blocker 97f1ea3b) A SECOND rotation trigger on size: inside the start grace (G-a) a drained
+    lane over SPOOL_FORCE_ROTATE_BYTES rotates, so a bridge restarted more often than every ROTATE_START_GRACE_SECS still
+    rotates. The install-staging gate (G-b) is never overridden (F1-C). The bound is patched with create=True, so at 75b31682
+    (no size bound) these specimens run and fail on behaviour, not on a missing name."""
+
+    LIFE_SECS = 100.0      # every bridge life here is shorter than the 300 s start grace
+
+    def bound(self, lines):
+        """A size bound half a record above `lines` records of this test's shape (task names L00..L99)."""
+        one = len(json.dumps(self.ev("L00", 0), ensure_ascii=False, sort_keys=True)) + 1
+        return lines * one + one // 2
+
+    def patched(self, bound):
+        st = contextlib.ExitStack()
+        st.enter_context(mock.patch.object(HB, "SPOOL_ROTATE_BYTES", 10))
+        st.enter_context(mock.patch.object(HB, "SPOOL_FORCE_ROTATE_BYTES", bound, create=True))
+        return st
+
+    def restart(self):
+        """cysd starts a new bridge process: a new world, a new reader on the same state dir, the first fleet merged."""
+        self.world = HB.World()
+        rd = self.reader()
+        self.merge(fleet())
+        self.tick(rd)
+        return rd
+
+    def test_j1_a_bridge_restarted_every_100_s_rotates_once_the_spool_is_over_the_size_bound(self):
+        bound = self.bound(4)
+        d = os.path.dirname(self.spool)
+        rotations, k = 0, 0
+        with self.patched(bound):
+            rd = self.first_sight("L00")
+            for life in range(4):
+                if life:
+                    self.clock.t += self.LIFE_SECS        # the previous life died inside its grace; cysd started a new one
+                    rd = self.restart()
+                    self.assertEqual(self.routed, [], "a restart replays nothing")
+                k += 2
+                self.consume(rd, ("L%02d" % (k - 1), k - 1), ("L%02d" % k, k))   # a poll that read records: no rotation
+                before, old = read_bytes(self.spool), self.archives()
+                self.tick(rd, 2)                          # drained polls, still inside this life's start grace
+                new = [a for a in self.archives() if a not in old]
+                if len(before) > bound:
+                    self.assertEqual(len(new), 1, "life %d: %d B over the bound %d B must rotate inside the grace"
+                                     % (life, len(before), bound))
+                    self.assertEqual(read_bytes(os.path.join(d, new[0])), before, "the archive is the pre-rotation spool")
+                    rotations += 1
+                else:
+                    self.assertEqual(new, [], "life %d: %d B at or under the bound - the grace holds" % (life, len(before)))
+        self.assertEqual(rotations, 1, "the loop crossed the bound exactly once")
+        self.assertLessEqual(os.path.getsize(self.spool), bound)
+        log = self.log.getvalue()
+        self.assertEqual(log.count("spool rotated:"), 1, "condition 5: the size-triggered rotation logs its line")
+        self.assertEqual(log.count("was size-triggered"), 1, "and one line naming the size trigger")
+        self.assertLess(log.index("spool rotated:"), log.index("was size-triggered"))
+
+    def test_j2_a_fresh_install_staging_holds_even_a_spool_over_the_size_bound(self):
+        with self.patched(self.bound(2)):
+            rd = self.first_sight("L00")
+            self.consume(rd, ("L01", 1), ("L02", 2))      # 3 records: over the bound, inside the grace
+            staging = os.path.join(self.tmp, ".pack-staging-init-4242")   # sibling of the main pack (<tmp>/main)
+            os.makedirs(staging)
+            mark = len(self.log.getvalue())               # (first sight, under the bound, deferred on the grace: correct)
+            self.tick(rd, 2)
+            self.assertEqual(self.archives(), [], "G-b is never overridden by the size trigger (F1-C)")
+            since = self.log.getvalue()[mark:]
+            self.assertIn("pack install in progress (.pack-staging-init-4242)", since)
+            self.assertNotIn("start grace", since, "over the bound the deferral is the install, not the grace")
+            os.rmdir(staging)                             # the swap renamed it into place
+            self.tick(rd)
+        self.assertEqual(len(self.archives()), 1, "the install is gone: it rotates, still inside the grace")
+        self.assertIn("was size-triggered", self.log.getvalue())
+
+    def test_j3_at_the_bound_the_grace_holds_and_one_record_more_rotates(self):
+        rd = self.first_sight("L00")
+        self.consume(rd, ("L01", 1))
+        exact = os.path.getsize(self.spool)
+        with self.patched(exact):
+            self.tick(rd, 2)
+            self.assertEqual(self.archives(), [], "offset == bound is not over it: the grace holds")
+            self.consume(rd, ("L02", 2))
+            self.tick(rd)
+        self.assertEqual(len(self.archives()), 1)
+
+    def test_j4_the_size_bound_is_above_the_rotation_threshold(self):
+        self.assertGreater(HB.SPOOL_FORCE_ROTATE_BYTES, HB.SPOOL_ROTATE_BYTES,
+                           "at or below the threshold every rotation candidate would override the start grace")
+
+    def test_j5_a_rotation_after_the_grace_is_not_size_triggered(self):
+        with self.patched(self.bound(1)):
+            rd = self.first_sight("L00")
+            self.consume(rd, ("L01", 1), ("L02", 2))
+            self.past_grace()
+            self.tick(rd)
+        self.assertEqual(len(self.archives()), 1)
+        self.assertIn("spool rotated:", self.log.getvalue())
+        self.assertNotIn("size-triggered", self.log.getvalue())
+
+    def test_j6_the_size_trigger_still_waits_for_a_drained_poll(self):
+        with self.patched(self.bound(1)):
+            rd = self.first_sight("L00")
+            for k in range(1, 4):
+                put(self.spool, self.ev("L%02d" % k, k))  # each poll reads a new record: never drained
+                self.tick(rd)
+                self.assertEqual(self.archives(), [], "a poll that read records does not rotate")   # asserted first (M7)
+                self.assertEqual(self.routed, ["L%02d" % k], "and every record that poll read is routed")
+                del self.routed[:]
+            self.tick(rd)
+        self.assertEqual(len(self.archives()), 1)
+
+
 if __name__ == "__main__":
     if sys.argv[1:] == ["--write-golden"]:
         _write_golden()
