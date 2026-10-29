@@ -373,7 +373,7 @@ class _Spool(unittest.TestCase):
 
     def read_offset(self, lane):
         with open(os.path.join(self.state, "evt_spool-%s.offset" % lane)) as f:
-            return int(f.read())
+            return json.load(f)["offset"]          # (slice H) the v2 offset record
 
 
 class SpoolStartupGate(_Spool):
@@ -718,14 +718,25 @@ class SpoolHistory(_Spool):
     (an absent lane's first batch is read); offsets per lane; the pre-0.14.56 evt_spool.offset is never touched."""
 
     def test_load_offset_is_none_when_missing_empty_unreadable_or_negative(self):
+        """(slice H) The v2 record round-trips; anything else - missing, empty, garbage, a plain integer (e59aae92's format),
+        negative, an offset without the identity, a non-finite last_ts, a directory - is None = first sight (no replay)."""
         p = os.path.join(self.tmp, "o")
-        self.assertIsNone(HB._load_offset(p))
-        for text, want in (("", None), ("garbage", None), ("-4", None), ("12\n", 12), ("0", 0)):
+        self.assertIsNone(HB._load_offset_record(p))
+        good = {"offset": 12, "head": b'{"ts": 1}\n', "tail": b'{"ts": 2}\n', "prev_head": None, "last_ts": 2.5}
+        self.assertTrue(HB._save_offset_record(p, good))
+        self.assertEqual(HB._load_offset_record(p), good)
+
+        def rec(**kw):
+            d = {"v": 2, "offset": 12, "head": "eyJ0cyI6IDF9Cg==", "tail": "", "prev_head": None, "last_ts": None}
+            d.update(kw)
+            return json.dumps(d)
+        for text in ("", "garbage", "12\n", "0", rec(offset=-4), rec(head=""), rec(v=1), rec(last_ts=float("nan")),
+                     rec(head="!!not base64!!"), rec(offset=True)):
             with open(p, "w") as f:
                 f.write(text)
-            self.assertEqual(HB._load_offset(p), want, repr(text))
+            self.assertIsNone(HB._load_offset_record(p), repr(text))
         os.makedirs(p + ".d")
-        self.assertIsNone(HB._load_offset(p + ".d"))
+        self.assertIsNone(HB._load_offset_record(p + ".d"))
 
     def test_an_absent_lane_starts_at_0_and_its_first_batch_is_read(self):
         d5 = stub_pack(os.path.join(self.tmp, "d5"))
@@ -769,20 +780,21 @@ class SpoolHistory(_Spool):
         put(spool_of(self.main), *({"ts": 1.0, "type": "task.unblocked", "payload": {"task": "o%d" % i}} for i in range(3)))
         original = read_bytes(spool_of(self.main))
         late = {"ts": T0, "type": "task.blocked", "payload": {"task": "LATE", "blocked_by": []}}
-        real_rotate, real_save, saves = HB.maybe_rotate_spool, HB._save_offset, []
+        real_rotate, real_save, saves = HB.maybe_rotate_spool, HB._save_offset_record, []
 
         def landing(path, off, now=None):     # a producer append lands between the last tail and the rename
             put(path, late)
             return real_rotate(path, off, now)
 
-        def save(p, v):
-            saves.append((os.path.basename(p), v, [b["task"] for b in self.world.blocked]))
-            return real_save(p, v)
+        def save(p, ident):
+            saves.append((os.path.basename(p), ident["offset"], [b["task"] for b in self.world.blocked]))
+            return real_save(p, ident)
         rd = self.reader()
         self.merge(fleet())
         self.tick(rd)                         # first sight: EOF (below the default threshold - nothing rotates yet)
+        self.clock.t += HB.ROTATE_START_GRACE_SECS + 1   # (slice H) past the start grace (F1-C G-a)
         with mock.patch.object(HB, "SPOOL_ROTATE_BYTES", 10), mock.patch.object(HB, "maybe_rotate_spool", landing), \
-                mock.patch.object(HB, "_save_offset", save):
+                mock.patch.object(HB, "_save_offset_record", save):
             self.tick(rd)                     # drained and above the (patched) threshold: rotate
         self.assertEqual(saves, [("evt_spool-main.offset", 0, ["LATE"])], "the leftover is routed BEFORE offset 0 is kept")
         names = os.listdir(os.path.join(self.main, "state"))
@@ -971,9 +983,12 @@ class SpoolArchive(unittest.TestCase):
                             "remove", "unlink", "replace", "rename", "renames", "rmdir", "rmtree", "move", "truncate", "ftruncate"):
                     found.setdefault(fn.name, []).append(n.func.attr)
         self.assertEqual({k: sorted(v) for k, v in found.items()},
-                         {"_rename_no_overwrite": ["rename", "unlink", "unlink"], "persist_heat": ["replace"]},
+                         {"_rename_no_overwrite": ["rename", "unlink", "unlink"], "persist_heat": ["replace"],
+                          "_save_offset_record": ["replace", "unlink", "unlink"]},
                          "pin: os.replace + os.remove(.old) in maybe_rotate_spool deleted a spool; now only the non-overwriting "
-                         "rename (link+unlink, its take-back, Windows rename) and presence_heat.json's own atomic replace")
+                         "rename (link+unlink, its take-back, Windows rename), presence_heat.json's own atomic replace and "
+                         "(slice H) the offset record's own tmp + replace - `<record>.tmp-<pid>` never matches evt_spool*.jsonl, "
+                         "even when HUD_STATE_DIR defaults to the spool's own directory")
 
 
 class SpoolAttribution(_Spool):
@@ -1045,6 +1060,301 @@ def _write_golden():
     with open(GOLDEN, "w", encoding="utf-8", newline="\n") as f:
         f.write(json.dumps(dict([("_doc", GOLDEN_DOC)] + list(body.items())), ensure_ascii=False, indent=1) + "\n")
     print("wrote %s" % GOLDEN)
+
+
+class _SpoolH(_Spool):
+    """(0.14.56 slice H · CEO E5 "never re-read as new", head ruling E5-F1-F2 78cd2297 + GO amendments) - every routed task is
+    recorded over the REAL route_spool, so a replay shows up as a task routed twice, and a skipped new record as a task missing."""
+
+    def setUp(self):
+        super().setUp()
+        self.spool = spool_of(self.main)
+        self.routed = []
+        real = HB.route_spool
+
+        def record(entry, *a, **kw):
+            self.routed.append((entry.get("payload") or {}).get("task"))
+            return real(entry, *a, **kw)
+        p = mock.patch.object(HB, "route_spool", record)
+        p.start()
+        self.addCleanup(p.stop)
+
+    @staticmethod
+    def ev(task, k):
+        return {"ts": T0 + k, "type": "task.unblocked", "payload": {"task": task}}
+
+    def first_sight(self, *tasks):
+        """Old records A.. are on disk; the reader starts (first sight = EOF, nothing replayed) and returns."""
+        put(self.spool, *(self.ev(t, i) for i, t in enumerate(tasks)))
+        rd = self.reader()
+        self.merge(fleet())
+        self.tick(rd)
+        self.assertEqual(self.routed, [], "first sight is EOF")
+        return rd
+
+    def consume(self, rd, *pairs):
+        put(self.spool, *(self.ev(t, k) for t, k in pairs))
+        self.tick(rd)
+        self.assertEqual(self.routed, [t for t, _ in pairs])
+        del self.routed[:]
+
+    def past_grace(self):
+        self.clock.t += getattr(HB, "ROTATE_START_GRACE_SECS", 0) + 1
+
+    def archives(self):
+        return sorted(n for n in os.listdir(os.path.dirname(self.spool)) if HB._SPOOL_ARCHIVE_RE.match(n))
+
+
+class SpoolIdentityH(_SpoolH):
+    """F2 routes (a)-(d), rows 2/6/7 of DESIGN-NOTE-H-F2-F1C 012b8d62 and the legacy record. At e59aae92 each of these re-reads
+    (or misreads) a file at the live name, because tail_spool turns an absent/short file into offset 0 and _drain saves it."""
+
+    def test_h_a_an_absent_moment_then_the_same_file_is_not_replayed(self):
+        rd = self.first_sight("A", "B")
+        self.consume(rd, ("C", 10))
+        os.rename(self.spool, self.spool + ".away")      # the swap's gap between its two renames: nothing at the live name
+        self.tick(rd)
+        os.rename(self.spool + ".away", self.spool)
+        put(self.spool, self.ev("D", 20))
+        self.tick(rd)
+        self.assertEqual(self.routed, ["D"], "the same file came back: only the new record is routed")
+
+    @unittest.skipUnless(os.name == "posix" and os.geteuid() != 0, "needs a directory a non-root user cannot search")
+    def test_h_b_a_transient_stat_error_holds_the_offset(self):
+        rd = self.first_sight("A", "B")
+        self.consume(rd, ("C", 10))
+        d = os.path.dirname(self.spool)
+        os.chmod(d, 0)
+        try:
+            self.tick(rd)
+        finally:
+            os.chmod(d, 0o755)
+        put(self.spool, self.ev("D", 20))
+        self.tick(rd)
+        self.assertEqual(self.routed, ["D"])
+
+    def test_h_c_an_install_copy_shorter_than_the_offset_is_not_replayed_and_a_new_record_counts_once(self):
+        rd = self.first_sight("A", "B")
+        copy = read_bytes(self.spool)                     # init-pack's copy_dir_all took the spool here
+        self.consume(rd, ("C", 10), ("E", 30))            # the bridge kept reading the OLD tree inside the window
+        with open(self.spool + ".new", "wb") as f:
+            f.write(copy)
+        os.replace(self.spool + ".new", self.spool)       # the swap: the copy (new inode) is the live file now
+        put(self.spool, self.ev("F", 40))                 # a producer appends before the bridge's next poll
+        self.tick(rd)
+        self.assertEqual(self.routed, ["F"], "A/B are not replayed and F, appended after the swap, is routed once")
+        self.assertIn("older copy", self.log.getvalue())
+
+    def test_h_d_a_restore_that_rewinds_the_file_in_place_is_not_replayed(self):
+        rd = self.first_sight("A", "B")
+        copy = read_bytes(self.spool)
+        self.consume(rd, ("C", 10), ("E", 30))
+        with open(self.spool, "r+b") as f:                # tar restore: same inode, older bytes
+            f.truncate(0)
+            f.write(copy)
+        put(self.spool, self.ev("F", 40))
+        self.tick(rd)
+        self.assertEqual(self.routed, ["F"])
+
+    def test_h_c2_a_copy_plus_appends_longer_than_the_offset_is_not_misread_at_the_old_offset(self):
+        """The copy grew past the old offset before the poll: byte N is no longer where the reader stopped (tail anchor)."""
+        rd = self.first_sight("A", "B")
+        copy = read_bytes(self.spool)
+        self.consume(rd, ("C", 10), ("E", 30))
+        with open(self.spool + ".new", "wb") as f:
+            f.write(copy)
+        os.replace(self.spool + ".new", self.spool)
+        put(self.spool, *(self.ev("F%d" % i, 40 + i) for i in range(5)))   # now longer than the old offset
+        self.assertGreater(os.path.getsize(self.spool), self.lane(rd, "main")["offset"])
+        self.tick(rd)
+        self.assertEqual(self.routed, ["F%d" % i for i in range(5)])
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "needs a FIFO")
+    def test_h_r1_1_a_fifo_at_the_live_name_never_blocks_the_reader(self):
+        """R1-1: a plain open() of a FIFO blocks until a writer appears - the spool thread must hold the lane instead."""
+        rd = self.first_sight("A")
+        self.consume(rd, ("B", 1))
+        off = self.lane(rd, "main")["offset"]
+        os.rename(self.spool, self.spool + ".away")
+        os.mkfifo(self.spool)
+        t = threading.Thread(target=self.tick, args=(rd,), daemon=True)
+        t.start()
+        t.join(5)
+        alive = t.is_alive()
+        if alive:                                         # unblock the stuck open so the daemon thread can end
+            fd = os.open(self.spool, os.O_WRONLY | os.O_NONBLOCK)
+            os.close(fd)
+        self.assertFalse(alive, "the reader blocked on a FIFO at the live name")
+        self.assertEqual(self.lane(rd, "main")["offset"], off, "held: the offset is kept")
+        os.remove(self.spool)
+        os.rename(self.spool + ".away", self.spool)
+        put(self.spool, self.ev("C", 2))
+        self.tick(rd)
+        self.assertEqual(self.routed, ["C"])
+
+    def test_h_first_sight_counts_the_skipped_records_as_consumed(self):
+        """First sight skips to EOF without routing: a rewind right after it must still treat A/B as consumed (last_ts)."""
+        rd = self.first_sight("A", "B")
+        a_only = read_bytes(self.spool).split(b"\n")[0] + b"\n"
+        with open(self.spool, "r+b") as f:
+            f.truncate(0)
+            f.write(a_only)
+        put(self.spool, self.ev("F", 40))
+        self.tick(rd)
+        self.assertEqual(self.routed, ["F"])
+
+    def test_h_row2_a_restore_seen_mid_write_holds_then_rewinds(self):
+        rd = self.first_sight("A", "B")
+        copy = read_bytes(self.spool)
+        self.consume(rd, ("C", 10), ("E", 30))
+        with open(self.spool, "r+b") as f:
+            f.truncate(0)
+            f.write(copy[:20])                            # less than one record, no newline: cannot be judged yet
+        self.tick(rd)
+        self.assertEqual(self.routed, [])
+        with open(self.spool, "ab") as f:
+            f.write(copy[20:])
+        put(self.spool, self.ev("F", 40))
+        self.tick(rd)
+        self.assertEqual(self.routed, ["F"], "the half-written restore was held, not read from 0")
+
+    def test_h_row7_a_different_file_at_the_live_name_is_read_from_0(self):
+        rd = self.first_sight("A")
+        self.consume(rd, ("B", 10))
+        os.remove(self.spool)
+        put(self.spool, *(self.ev("N%d" % i, 50 + i) for i in range(6)))   # longer than the old offset, other first bytes
+        self.tick(rd)
+        self.assertEqual(self.routed, ["N%d" % i for i in range(6)])
+        self.assertIn("different file", self.log.getvalue())
+
+    def test_h_row6_a_restored_archive_older_than_the_last_rotation_is_not_replayed(self):
+        """GO amendment (1): "came back" is judged against EVERY archive in the spool dir (the CEO's directory predicate)."""
+        rd = self.first_sight("A")                        # under the real threshold: nothing rotates at first sight
+        self.past_grace()                                 # the grace counts from the reader's start
+        with mock.patch.object(HB, "SPOOL_ROTATE_BYTES", 10):
+            self.consume(rd, ("X1", 1))
+            self.tick(rd)                                 # drained above 10 B: rotation 1
+            self.consume(rd, ("Y1", 2))
+            self.tick(rd)                                 # rotation 2
+        arch = self.archives()
+        self.assertEqual(len(arch), 2, arch)
+        d = os.path.dirname(self.spool)                   # by content: `...Z-2.jsonl` sorts BEFORE `...Z.jsonl`
+        (first,) = [os.path.join(d, n) for n in arch if b'"task": "A"' in read_bytes(os.path.join(d, n))]
+        with open(self.spool, "wb") as f:                 # the FIRST archive (older than the last rotation) restored
+            f.write(read_bytes(first))
+        put(self.spool, self.ev("W", 3))
+        self.tick(rd)
+        self.assertEqual(self.routed, ["W"], "A/X1 (archive 1) are not replayed; W is routed once")
+        self.assertEqual(self.archives(), arch, "both archives are still there")
+
+    def test_h_row6_prev_head_covers_an_archive_that_lives_only_in_prev(self):
+        """TOCTOU case C: the archive is in <pack>.prev only, its pre-rotation copy came back under the live name."""
+        rd = self.first_sight("A")
+        self.past_grace()
+        with mock.patch.object(HB, "SPOOL_ROTATE_BYTES", 10):
+            self.consume(rd, ("X1", 1))
+            self.tick(rd)                                 # rotation
+        (only,) = self.archives()
+        elsewhere = os.path.join(self.tmp, "prev-" + only)
+        os.rename(os.path.join(os.path.dirname(self.spool), only), elsewhere)   # test-only: the archive is not in the dir
+        with open(self.spool, "wb") as f:
+            f.write(read_bytes(elsewhere))
+        put(self.spool, self.ev("W", 3))
+        self.tick(rd)
+        self.assertEqual(self.routed, ["W"])
+
+    def test_h_a_legacy_integer_offset_is_first_sight_never_a_resume(self):
+        os.makedirs(self.state)
+        with open(os.path.join(self.state, "evt_spool-main.offset"), "w") as f:
+            f.write("5")
+        put(self.spool, self.ev("A", 0), self.ev("B", 1))
+        rd = self.reader()
+        self.merge(fleet())
+        self.tick(rd)
+        self.assertEqual(self.routed, [], "a record without the identity is first sight (EOF), never a resume at 5")
+        self.assertEqual(self.lane(rd, "main")["offset"], os.path.getsize(self.spool))
+
+    @unittest.skipUnless(os.name == "posix", "POSIX file modes")
+    def test_h_the_offset_record_keeps_its_file_mode(self):
+        """GO amendment (2): tmp + os.replace must not turn the record into 0600 (mkstemp) - first write = open(...,"w")."""
+        um = os.umask(0)
+        os.umask(um)
+        rd = self.first_sight("A")
+        opath = os.path.join(self.state, "evt_spool-main.offset")
+        self.assertEqual(os.stat(opath).st_mode & 0o777, 0o666 & ~um, "first write: the mode open(path, 'w') gives")
+        os.chmod(opath, 0o640)
+        self.consume(rd, ("B", 1))
+        self.assertEqual(os.stat(opath).st_mode & 0o777, 0o640, "a save keeps the existing file's mode")
+
+    @unittest.skipUnless(os.name == "posix", "POSIX file modes")
+    def test_h_an_archive_keeps_the_spool_mode(self):
+        rd = self.first_sight("A")
+        self.past_grace()
+        os.chmod(self.spool, 0o640)
+        with mock.patch.object(HB, "SPOOL_ROTATE_BYTES", 10):
+            self.consume(rd, ("B", 1))
+            self.tick(rd)
+        (only,) = self.archives()
+        self.assertEqual(os.stat(os.path.join(os.path.dirname(self.spool), only)).st_mode & 0o777, 0o640)
+
+
+class SpoolRotationGateH(_SpoolH):
+    """F1-C (head ruling E5-F1-F2): no rotation while a pack install can be in its copy->swap window - G-a start grace,
+    G-b a fresh `.pack-staging-init-*` sibling of the pack; the condition-5 line still appears once the rotation happens."""
+
+    def rotate_ready(self):
+        rd = self.first_sight("A")
+        self.consume(rd, ("B", 1))                        # offset now above the patched 10 B threshold
+        return rd
+
+    def test_h_ga_no_rotation_inside_the_start_grace_then_it_rotates_with_the_condition_5_line(self):
+        with mock.patch.object(HB, "SPOOL_ROTATE_BYTES", 10):
+            rd = self.rotate_ready()
+            self.tick(rd, 3)
+            self.assertEqual(self.archives(), [], "inside the grace nothing rotates")
+            self.assertEqual(self.log.getvalue().count("start grace"), 1, "one line per deferral episode")
+            self.past_grace()
+            self.tick(rd)
+        self.assertEqual(len(self.archives()), 1)
+        self.assertIn("spool rotated:", self.log.getvalue())
+
+    def test_h_gb_a_fresh_install_staging_defers_rotation_until_it_is_gone(self):
+        rd = self.first_sight("A")                        # under the real threshold
+        self.past_grace()
+        staging = os.path.join(self.tmp, ".pack-staging-init-4242")   # sibling of the main pack (<tmp>/main)
+        os.makedirs(staging)
+        with mock.patch.object(HB, "SPOOL_ROTATE_BYTES", 10):
+            self.tick(rd, 2)
+            self.assertEqual(self.archives(), [])
+            self.assertIn("pack install in progress (.pack-staging-init-4242)", self.log.getvalue())
+            os.rmdir(staging)                             # the swap renamed it into place
+            self.tick(rd)
+        self.assertEqual(len(self.archives()), 1)
+
+    def test_h_gb_stale_staging_residue_is_ignored_and_logged_once(self):
+        staging = os.path.join(self.tmp, ".pack-staging-init-77")
+        os.makedirs(staging)
+        old = time.time() - getattr(HB, "STAGING_FRESH_SECS", 600) - 100
+        os.utime(staging, (old, old))
+        rd = self.first_sight("A")                        # under the real threshold
+        self.past_grace()
+        with mock.patch.object(HB, "SPOOL_ROTATE_BYTES", 10):
+            self.tick(rd)                                 # drained above 10 B: one rotation attempt
+        self.assertEqual(len(self.archives()), 1, "a crashed install's leftover does not stop rotation forever")
+        self.assertEqual(self.log.getvalue().count("residue"), 1)
+
+    def test_h_post_check_logs_an_install_that_appeared_during_the_rename(self):
+        real = HB.archive_spool
+
+        def racing(path, now=None):
+            os.makedirs(os.path.join(self.tmp, ".pack-staging-init-9"), exist_ok=True)   # the copy started meanwhile
+            return real(path, now)
+        rd = self.first_sight("A")
+        self.past_grace()
+        with mock.patch.object(HB, "SPOOL_ROTATE_BYTES", 10), mock.patch.object(HB, "archive_spool", racing):
+            self.tick(rd)
+        self.assertEqual(len(self.archives()), 1)
+        self.assertIn("may have raced a pack install", self.log.getvalue())
 
 
 if __name__ == "__main__":
