@@ -6190,6 +6190,21 @@ pub(crate) fn submit_cr_withhold_probe(
     armed_by: &'static str,
     from: Option<u64>,
 ) -> crate::state::SafetyProbe {
+    submit_cr_withhold_probe_with(daemon, s, markers, armed_by, from, true)
+}
+
+/// ★(0.14.56 · P1 D9 pre-CR · design r3 §6-4 W-1) [`submit_cr_withhold_probe`] with the resubmit record optional. `record`
+/// = false for a master/CEO **queue** job: its withheld CR ends the job PartialExact and the queue hold's own resume
+/// (`try_resume_partial_write`) is the one owner of that CR, so [`resubmit_withheld_submits`] must never see it (two
+/// lifecycles would each write a CR). The event is published either way.
+pub(crate) fn submit_cr_withhold_probe_with(
+    daemon: &Arc<Daemon>,
+    s: &Arc<crate::state::Surface>,
+    markers: Vec<String>,
+    armed_by: &'static str,
+    from: Option<u64>,
+    record: bool,
+) -> crate::state::SafetyProbe {
     let wd = Arc::downgrade(daemon);
     let ws = Arc::downgrade(s);
     let handed = std::time::Instant::now();
@@ -6203,7 +6218,7 @@ pub(crate) fn submit_cr_withhold_probe(
             }
             // ★(재개 S91) 보류는 미룸이다 — 입력줄에 남는 기계 본문을 기록해 창이 닫힌 뒤 watchdog 틱이 이 CR 을 한 번 다시
             //   쓴다([`resubmit_withheld_submits`]). 기계 본문 기록이 없으면(빈 줄 위 Return) 다시 쓸 것이 없다.
-            if let Some(b) = s.inject_track.last_body() {
+            if let Some(b) = s.inject_track.last_body().filter(|_| record) {
                 s.inject_track.note_withheld(crate::state::WithheldSubmit::new(std::time::Instant::now(), b.at, from));
             }
             d.bus.publish(
@@ -6216,10 +6231,18 @@ pub(crate) fn submit_cr_withhold_probe(
                     "armed_by": armed_by,
                     "from": from.map(cys::surface_ref),
                     "handed_ms_ago": handed.elapsed().as_millis() as u64,
-                    "note": "제출 Return 을 넘긴 뒤 질문·선택 창이 전경이 됐다 — 그 CR 을 쓰지 않았다(쓰면 창의 기본 \
-                             선택지를 누른다). 본문은 입력줄에 미제출로 남는다. 창이 닫히고 입력줄이 그 본문 그대로면 \
-                             데몬이 그 CR 을 한 번 다시 쓴다(queue.submit_resubmitted). 보이는 창에 대한 Return 은 \
-                             종전처럼 쓴다.",
+                    "note": if record {
+                        "제출 Return 을 넘긴 뒤 질문·선택 창이 전경이 됐다 — 그 CR 을 쓰지 않았다(쓰면 창의 기본 \
+                         선택지를 누른다). 본문은 입력줄에 미제출로 남는다. 창이 닫히고 입력줄이 그 본문 그대로면 \
+                         데몬이 그 CR 을 한 번 다시 쓴다(queue.submit_resubmitted). 보이는 창에 대한 Return 은 \
+                         종전처럼 쓴다."
+                    } else {
+                        // ★(0.14.56 · P1 D9 pre-CR §6-4) a master/CEO queue job: no resubmit record - the queue hold's resume owns this CR.
+                        "A question or selection window came to the foreground after the queue job's body - its CR was not \
+                         written (it would press the window's default). The body stays unsubmitted on the line; the queue \
+                         hold's own resume writes that CR once the window has closed (within the resume window), never the \
+                         resubmit tick."
+                    },
                 }),
             );
             true
@@ -11105,6 +11128,17 @@ pub(crate) fn deliver_head_locked(
     adopt_persisted_write_hold(daemon, s);
     // ★(0.14.56 · P1 D9 pre-CR · design r3 §6-2) A master/CEO target gets the claim check (scope read before the queue lock).
     let d9_claim = d9_scope(daemon, s, false).then(|| Arc::new(D9Claim::default()));
+    // ★(0.14.56 · P1 D9 pre-CR · design r3 §6-4 W-1) ...and the pin's CR withhold probe, under the pin's own arming conditions
+    //   (`handlers::submit_owning_proof`); its material (adapter + parser) is read here, outside the queue lock and `input_gate`.
+    let d9_cr_ctx = if d9_claim.is_some()
+        && cfg!(unix)
+        && submit_guard_scope(s) != SubmitGuardScope::Off
+        && !crate::handlers::send_settle_disabled(daemon)
+    {
+        submit_cr_guard_context(s)
+    } else {
+        None
+    };
     let delivered = 'tx: {
         // 이 임계영역은 더 이상 큐를 **바꾸지 않는다**(인계 결판 전에는 빼지 않는다 · 리뷰 R2).
         let q = s.pending_queue.lock().unwrap();
@@ -11391,7 +11425,17 @@ pub(crate) fn deliver_head_locked(
         let request_id = request.id.clone();
         let handle = request.clone();
         // ★(0.14.52 · S-a C7b) The epochs and last human keystroke this request is written under (S4-1 resume premises).
-        let stamp = HandoffStamp::of(s, request.clone(), s.agent_proof(), guard.clone());
+        // ★(0.14.56 · P1 D9 pre-CR · §6-4 W-1) A master/CEO queue job's proof carries the CR withhold probe WITHOUT a resubmit
+        //   record: a withheld CR ends the job PartialExact, and the stamp's proof is also the resume's, so the hold's own resume
+        //   is the one owner of that CR and meets the same veto.
+        let proof: Arc<dyn crate::agent_write::Proof> = match d9_cr_ctx {
+            Some(ctx) => Arc::new(crate::handlers::SubmitWithhold {
+                inner: s.agent_proof(),
+                probe: submit_cr_withhold_probe_with(daemon, s, ctx.markers, "queue_job", None, false),
+            }),
+            None => s.agent_proof(),
+        };
+        let stamp = HandoffStamp::of(s, request.clone(), proof, guard.clone());
         // ★(0.14.56 · P1 D9 pre-CR) the claim baseline, under `input_gate`, after the job's own count mark, before it can be claimed.
         if let Some(c) = &d9_claim {
             let _ = c.base.set((f.pending_gen, stamp.wrote, stamp.human_at));
@@ -32716,8 +32760,9 @@ mod h_machine_hold_tests {
     /// withheld-Return accounting specimens (`send_settle_tests::c7d_*`). Renamed `_of_52`.
     /// ★(0.14.56 · P1 D9 pre-CR stage D1) 55 → **58**: class C +3 recorder-seat claim-check specimens (`agent_queue_tests::d9_pre_cr_*`).
     /// Renamed `_of_58` (the CI comment in windows-health.yml too).
+    /// ★(0.14.56 · P1 D9 pre-CR stage D2) 58 → **60**: class C +2 recorder-seat CR-withhold specimens (`d9_pre_cr_t_w3*`). Renamed `_of_60`.
     #[test]
-    fn r2f_dm_windows_ignore_attributes_are_exactly_the_decided_set_of_58() {
+    fn r2f_dm_windows_ignore_attributes_are_exactly_the_decided_set_of_60() {
         const REASON_A: &str = "S21 제출 정착·창 위 CR 보류는 유닉스 한정(send_settle_applies)";
         const REASON_B: &str = "윈도우 기본 H 마스크는 draft 축을 끈다(hold_axes_default(true)) — 이 검체는 유닉스 기본(draft 축) 동작을 본다";
         const REASON_C: &str = "좌석 명령이 POSIX 셸 문법";
@@ -32791,8 +32836,12 @@ mod h_machine_hold_tests {
             ("agent_queue_tests", "d9_pre_cr_t_l1_a_human_byte_during_the_settle_lands_after_the_cr", 'C'),
             ("agent_queue_tests", "d9_pre_cr_t_w1_a_write_ahead_inside_the_r1_window_refuses_the_claim", 'C'),
             ("agent_queue_tests", "d9_pre_cr_t_w2_a_human_key_inside_the_r1_window_refuses_the_claim", 'C'),
+            // ★(0.14.56 · P1 D9 pre-CR stage D2) class C +2: the CR-withhold specimen and its scope control compare the receiver's
+            //   bytes through the same recorder seat. The probe itself is armed only under cfg!(unix) (design r3 §6-4, R-5).
+            ("agent_queue_tests", "d9_pre_cr_t_w3_a_dialog_during_the_settle_withholds_the_cr_with_one_owner", 'C'),
+            ("agent_queue_tests", "d9_pre_cr_t_w3c_outside_d9_scope_the_queue_job_proof_is_unchanged", 'C'),
         ];
-        assert_eq!(want.len(), 58, "결정한 집합은 58건(24 + 17 + 14 + 3)");
+        assert_eq!(want.len(), 60, "결정한 집합은 60건(24 + 17 + 16 + 3)");
         let needle = concat!("#[cfg_attr(not(unix), ", "ignore = \"");
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/cysd");
         let mut got: Vec<(String, String, char)> = Vec::new();
@@ -32819,8 +32868,8 @@ mod h_machine_hold_tests {
         got.sort();
         let mut want_sorted: Vec<(String, String, char)> = want.iter().map(|(a, b, c)| (a.to_string(), b.to_string(), *c)).collect();
         want_sorted.sort();
-        assert_eq!(got.len(), 58, "윈도우 `ignore` 가 {}건이다(결정 58건) — 새로 더했거나 뺐다: {got:?}", got.len());
-        assert_eq!(got, want_sorted, "윈도우 `ignore` 집합이 결정한 58건과 다르다 — 목록과 `ignore` 사유를 함께 고쳐라");
+        assert_eq!(got.len(), 60, "윈도우 `ignore` 가 {}건이다(결정 60건) — 새로 더했거나 뺐다: {got:?}", got.len());
+        assert_eq!(got, want_sorted, "윈도우 `ignore` 집합이 결정한 60건과 다르다 — 목록과 `ignore` 사유를 함께 고쳐라");
     }
 }
 

@@ -1466,3 +1466,121 @@ fn d9_pre_cr_t_l1_a_human_byte_during_the_settle_lands_after_the_cr() {
     let _ = s.child.lock().unwrap().kill();
     assert_eq!(events(&fx, "queue.delivered").len(), 1);
 }
+
+// ── ★(0.14.56 · P1 D9 pre-CR · design r3 §6-4 W-1) At the CR: a master/CEO queue job carries the pin's CR withhold probe, and
+//   the probe writes NO resubmit record - the queue hold's own resume is the one owner of a withheld CR. ──
+
+/// Paints the permission dialog straight into the seat's parser, the cursor on its `❯ 1. Yes` row (the shape of
+/// `send_settle_tests::paint` / `DIALOG`); `lines` empty = a blank frame.
+fn d9_paint(s: &Arc<Surface>, lines: &[&str], row: u16, col: u16) {
+    let mut p = s.parser.lock().unwrap_or_else(|e| e.into_inner());
+    p.process(b"\x1b[2J\x1b[H");
+    for (i, l) in lines.iter().enumerate() {
+        p.process(format!("\x1b[{};1H{}", i + 1, l).as_bytes());
+    }
+    p.process(format!("\x1b[{};{}H", row + 1, col + 1).as_bytes());
+}
+
+const D9_DIALOG: [&str; 4] = ["Do you want to proceed?", "❯ 1. Yes", "  2. No", "  Esc to cancel"];
+
+/// The seat's receiver proof for T-W3: always admits; when the writer reaches the Return phase (after the body, before the
+/// CR withhold probe looks) it paints [`D9_DIALOG`] - ONCE, so the resume of the same request meets the dialog only if the
+/// specimen paints it again.
+struct DialogAtSubmitOnce {
+    seat: std::sync::Weak<Surface>,
+    painted: std::sync::atomic::AtomicBool,
+}
+
+impl Proof for DialogAtSubmitOnce {
+    fn admit(&self) -> Result<(), ProofLoss> {
+        Ok(())
+    }
+    fn recheck(&self, phase: Phase) -> Result<(), ProofLoss> {
+        if phase == Phase::Submit && !self.painted.swap(true, Ordering::AcqRel) {
+            if let Some(s) = self.seat.upgrade() {
+                d9_paint(&s, &D9_DIALOG, 1, 8);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One T-W3 seat: a recorder seat with a claude agent meta, its dialog premise measured, a blank frame, the dialog-at-Return
+/// proof installed. `master` = make it this daemon's master (D9 scope) or leave it role-less (outside D9 scope).
+fn d9_dialog_seat(fx: &Fx, tag: &str, master: bool) -> (Arc<Surface>, std::path::PathBuf) {
+    let (s, out) = if master {
+        d9_master_recorder(fx, tag)
+    } else {
+        let (s, out) = recorder_seat(fx, tag);
+        *s.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+        assert!(!crate::governance::d9_scope(&fx.daemon, &s, false), "premise: the seat is outside D9 scope");
+        (s, out)
+    };
+    // Premise: on this seat a CR now would press this dialog (the pin's own observation).
+    d9_paint(&s, &D9_DIALOG, 1, 8);
+    let ctx = crate::governance::submit_cr_guard_context(&s).expect("premise: the seat's prompt markers resolve");
+    assert!(ctx.dialog_at_handoff, "premise: the withhold probe sees this dialog");
+    d9_paint(&s, &[], 0, 0);
+    *s.receiver_proof.lock().unwrap() =
+        Some(Arc::new(DialogAtSubmitOnce { seat: Arc::downgrade(&s), painted: std::sync::atomic::AtomicBool::new(false) }));
+    (s, out)
+}
+
+/// T-W3 (design r3 §12; §6-4 W-1): a permission dialog rises during a master queue job's settle - after its body, before its
+/// CR. The CR is withheld (`queue.submit_withheld`, armed_by `queue_job`); the job holds PartialExact with the body written;
+/// NO resubmit record exists, so the resubmit tick writes nothing; once the dialog has closed the hold's own resume writes
+/// exactly the one CR. Mutants: do not arm the probe on queue jobs; arm it WITH a resubmit record.
+#[test]
+#[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+fn d9_pre_cr_t_w3_a_dialog_during_the_settle_withholds_the_cr_with_one_owner() {
+    let fx = fx("d9-tw3");
+    let (s, out) = d9_dialog_seat(&fx, "tw3", true);
+    let body = "[보고] tw3";
+    enqueue(&fx, &s, body);
+    assert!(hand_off(&fx, &s), "premise: handed off");
+    let want = queue_bytes(body);
+    assert_eq!(want.last(), Some(&b'\r'), "premise: the job's own Return is its last byte");
+    let body_bytes = want[..want.len() - 1].to_vec();
+    wait_until("the body", || file_len(&out) >= body_bytes.len());
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(std::fs::read(&out).unwrap(), body_bytes, "the body only - a CR here presses `1. Yes`");
+    let w = seat_events(&fx, &s, "queue.submit_withheld");
+    assert_eq!(w.len(), 1, "one withhold: {w:?}");
+    assert_eq!(w[0]["payload"]["armed_by"], serde_json::json!("queue_job"), "{w:?}");
+    assert_eq!(hold_kind(&s), Some(QueueHoldKind::PartialExact), "the item is held byte-exact");
+    assert_eq!(queue_len(&s), 1);
+    assert!(s.inject_track.withheld().is_none(), "a resubmit record would be a second owner of this CR");
+    crate::governance::resubmit_withheld_submits(&fx.daemon);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(file_len(&out), body_bytes.len(), "the resubmit tick wrote");
+    // The dialog closes; the hold's own resume writes the one CR.
+    crate::governance::h_paint(&s, crate::governance::H_IDLE_SCREEN);
+    let since = s.queue_hold.lock().unwrap().as_ref().map(|h| h.since).expect("held");
+    let _ = crate::governance::queue_write_hold_block_at(&fx.daemon, &s, since + Duration::from_secs(1));
+    wait_until("delivered", || queue_len(&s) == 0);
+    wait_until("the CR", || file_len(&out) >= want.len());
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(std::fs::read(&out).unwrap(), want, "the body, then exactly one CR");
+    let _ = s.child.lock().unwrap().kill();
+    assert_eq!(events(&fx, "queue.delivered").len(), 1);
+}
+
+/// T-W3 scope control: the same dialog on a queue job OUTSIDE D9 scope (role-less agent seat) - the job's proof is the
+/// pin's, unchanged in this release (design r3 §10-5): no withhold. Mutant: arm the probe on every queue job.
+#[test]
+#[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+fn d9_pre_cr_t_w3c_outside_d9_scope_the_queue_job_proof_is_unchanged() {
+    let fx = fx("d9-tw3c");
+    let (s, out) = d9_dialog_seat(&fx, "tw3c", false);
+    let body = "[보고] tw3c";
+    enqueue(&fx, &s, body);
+    assert!(hand_off(&fx, &s), "premise: handed off");
+    // The discriminating assertion first: the hand-off returned after the writer's settlement, so a withhold is already published.
+    assert!(seat_events(&fx, &s, "queue.submit_withheld").is_empty(), "a withhold outside D9 scope");
+    let want = queue_bytes(body);
+    wait_until("every byte", || file_len(&out) >= want.len());
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(std::fs::read(&out).unwrap(), want, "the pin's bytes");
+    wait_until("delivered", || queue_len(&s) == 0);
+    let _ = s.child.lock().unwrap().kill();
+}
