@@ -59,8 +59,6 @@ src/bin/cys.rs::tests::request_on_timeout_terminates_on_hung_socket
 src/bin/cys.rs::tests::rpc_watchdog_fires_defers_and_stops
 src/bin/cys.rs::update_repair_c_row7::c_row7_daemon_answers_within_against_responsive_dead_and_hung_rigs
 src/bin/cys.rs::update_repair_c_row7::c_row7_first_try_unanswered_then_a_later_one_answers
-src/bin/cys/consumer_tests.rs::p2_consumer_tests::p2_base_dept_marker_recorder
-src/bin/cys/consumer_tests.rs::p2_consumer_tests::p2_recorder_peer
 src/bin/cys/lane_fallback.rs::tests::p2_late_local_read_has_hard_return_bound
 src/bin/cys/lane_fallback.rs::tests::p2_late_rpc_has_hard_return_bound_and_slow_success_control
 src/bin/cys/lane_fallback.rs::tests::p2_post_operation_deadline_rejects_late_success
