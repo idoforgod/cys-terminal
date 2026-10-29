@@ -481,7 +481,7 @@ class SpoolSelfCheckDecode(_Spool):
         stub_pack(pack, sleep=30)
         t = time.monotonic()
         self.assertEqual(HB.spool_self_check(pack, spool_of(pack), timeout=0.5), ("unverified", "spool-path timed out"))
-        self.assertLess(time.monotonic() - t, 10.0)
+        self.assertLess(time.monotonic() - t, 10.0)  # wallclock: guard spool_self_check returns after its 0.5 s timeout; the stub child sleeps 30 s
         self.assertEqual(HB.spool_self_check(pack, spool_of(pack), python=os.path.join(self.tmp, "no-python")),
                          ("unverified", "spool-path did not run (FileNotFoundError)"))
 

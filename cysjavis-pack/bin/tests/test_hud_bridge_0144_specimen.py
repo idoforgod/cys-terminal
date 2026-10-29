@@ -388,7 +388,7 @@ class Specimen(unittest.TestCase):
         with urllib.request.urlopen("http://127.0.0.1:%d/world" % PORT, timeout=3) as r:
             self.assertEqual(r.status, 200)
         time.sleep(1.5)
-        self.assertIsNone(p.poll())
+        self.assertIsNone(p.poll())  # wallclock: aging the 1.5 s gives a crash time to show; the verdict on correct code does not depend on it; a crash later than 1.5 s is not seen
         self.assertEqual(self.offsets(), [])
         err = self.errlog()
         self.assertIn("spool leaf unavailable: FileNotFoundError", err)
