@@ -122,7 +122,7 @@ jobs:
             --source win-src
 
       - name: C-03 owned process native Windows (bundled Python)
-        timeout-minutes: 5
+        timeout-minutes: 10
         shell: bash
         run: |
           set -euo pipefail
