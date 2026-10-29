@@ -134,6 +134,9 @@ SPOOL_HEAD_BYTES = 4096
 # (slice H · F1-C) no rotation while a pack install can be between its copy and its swap (pack.rs install_staged/atomic_swap):
 ROTATE_START_GRACE_SECS = 300.0        # G-a: the update path runs init-pack right after cysd (and so this bridge) starts
 STAGING_FRESH_SECS = 600.0             # G-b: a `.pack-staging-init-*` sibling younger than this is a live install; older = residue
+# (slice J · CEO release blocker 97f1ea3b) the size trigger: over this, G-a does not hold a rotation (a bridge restarted more often
+# than the grace still rotates); G-b still does. 2 x SPOOL_ROTATE_BYTES - it must stay above it, or G-a never holds anything.
+SPOOL_FORCE_ROTATE_BYTES = 8 * 1024 * 1024
 _STAGING_PREFIX = ".pack-staging-init-"
 KANBAN_POLL_SECS = 5.0
 VERDICT_POLL_SECS = 5.0
@@ -2595,11 +2598,16 @@ class SpoolReader:
             _log("spool lane %s: %s" % (lane, note))
         rotated = False
         if not entries and new["offset"] > SPOOL_ROTATE_BYTES:   # 드레인 상태에서만 로테이션 (무제한 성장 봉인 · 보관본은 지우지 않는다)
-            why = self._rotation_gate(rec)
+            in_grace = self.clock() - self.t0 < ROTATE_START_GRACE_SECS
+            why = self._rotation_gate(rec, new["offset"], in_grace)
             if why:
                 _rotation_skipped(path, why)
             else:
                 rotated, entries, _ = maybe_rotate_spool(path, new["offset"])
+                if rotated and in_grace:   # (slice J) only the size trigger rotates inside the start grace
+                    _log("spool rotation of %s was size-triggered: %d B is over the size bound %d B, so it did not wait for "
+                         "the bridge start grace (%d s) - a bridge restarted more often than that still rotates"
+                         % (path, new["offset"], SPOOL_FORCE_ROTATE_BYTES, ROTATE_START_GRACE_SECS))
                 if rotated:                # the rotated file's first line is remembered: a copy of it coming back is not new
                     new = dict(_blank_ident(), prev_head=new["head"], last_ts=_max_ts(entries, new["last_ts"]))
                     self._after_rotation(rec, path)
@@ -2626,12 +2634,15 @@ class SpoolReader:
             if fr:
                 self.hub.publish(fr)
 
-    def _rotation_gate(self, rec):
+    def _rotation_gate(self, rec, offset, in_grace):
         """(0.14.56 slice H · F1-C) Why a rotation must wait now, or None. G-a: the update path starts cysd (and this bridge)
-        and runs init-pack right after; G-b: a live `.pack-staging-init-*` next to the lane's pack. Residual (named, GO
-        amendment 3): a bridge restarted more often than every ROTATE_START_GRACE_SECS never rotates - nothing is lost, the
-        live spool keeps growing, and each restart logs one deferral line."""
-        if self.clock() - self.t0 < ROTATE_START_GRACE_SECS:
+        and runs init-pack right after; G-b: a live `.pack-staging-init-*` next to the lane's pack.
+        (slice J · CEO release blocker 97f1ea3b) G-a yields to size: over SPOOL_FORCE_ROTATE_BYTES a lane rotates inside the
+        grace, so a bridge restarted more often than every ROTATE_START_GRACE_SECS still rotates (at most once per bound of
+        growth). G-b never yields - overriding it would rotate inside an install's copy->swap window (F1-C). Residuals (named):
+        over the bound, G-a no longer narrows the race between G-b's listing and the rename at an update's start; G-b still
+        holds while new installs keep starting less than STAGING_FRESH_SECS apart, or while the pack's parent cannot be listed."""
+        if in_grace and offset <= SPOOL_FORCE_ROTATE_BYTES:
             return "bridge start grace (%d s after the bridge starts)" % ROTATE_START_GRACE_SECS
         who = _install_in_progress(rec["pack_dir"])
         return "pack install in progress (%s)" % who if who else None
