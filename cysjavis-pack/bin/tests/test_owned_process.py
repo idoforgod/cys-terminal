@@ -496,7 +496,9 @@ Path(%r).write_text(str(r))
         child=self.root/'held_custom.py'
         code="import os,time;from pathlib import Path;_marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(os.getpid()));__import__('os').replace(_tmp,_marker);time.sleep(3600)" % str(self.root/'held-grandchild')
         # Every timed actor outlives the 60 s guard, so no natural exit can end the run inside it.
-        child.write_text("import os,subprocess,sys,time\nfrom pathlib import Path\n_marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(os.getpid()));os.replace(_tmp,_marker)\nsubprocess.Popen([sys.executable,'-B','-c',%r])\ntime.sleep(3600)\n" % (str(self.root/'held-child'),code))
+        # Holder spawned with stdin=DEVNULL: on nt that is what passes the std handles, so the holder really holds the
+        # output (an all-default Popen inherits none); the hook phases spawn this way too (_owned_process.py:494-496).
+        child.write_text("import os,subprocess,sys,time\nfrom pathlib import Path\n_marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(os.getpid()));os.replace(_tmp,_marker)\nsubprocess.Popen([sys.executable,'-B','-c',%r],stdin=subprocess.DEVNULL)\ntime.sleep(3600)\n" % (str(self.root/'held-child'),code))
         results=queue.Queue()
         # Start the tested timeout only after the real grandchild exists. This
         # isolates reap behavior from interpreter-start scheduling; startup
@@ -544,7 +546,9 @@ Path(%r).write_text(str(r))
         import _owned_process as owned
         script=self.root/'held.py'
         code="import os,time;from pathlib import Path;_marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(os.getpid()));__import__('os').replace(_tmp,_marker);time.sleep(3600)" % str(self.root/'drain-grandchild')
-        script.write_text("import os,sys,subprocess,time\nfrom pathlib import Path\nsys.path.insert(0,%r)\nfrom _owned_process import managed_main\ndef main():\n _marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(os.getpid()));os.replace(_tmp,_marker)\n subprocess.Popen([sys.executable,'-B','-c',%r])\n time.sleep(3600)\nmanaged_main(main)\n" % (str(BIN),str(self.root/'drain-leader'),code))
+        # Holder spawned with stdin=DEVNULL: on nt that is what passes the std handles, so the holder really holds the
+        # output (an all-default Popen inherits none); the hook phases spawn this way too (_owned_process.py:494-496).
+        script.write_text("import os,sys,subprocess,time\nfrom pathlib import Path\nsys.path.insert(0,%r)\nfrom _owned_process import managed_main\ndef main():\n _marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(os.getpid()));os.replace(_tmp,_marker)\n subprocess.Popen([sys.executable,'-B','-c',%r],stdin=subprocess.DEVNULL)\n time.sleep(3600)\nmanaged_main(main)\n" % (str(BIN),str(self.root/'drain-leader'),code))
         results=queue.Queue()
         # As in the checklist held-output test: the timeout starts once the
         # output-holding grandchild exists. The leader and the grandchild both
@@ -628,11 +632,38 @@ Path(%r).write_text(str(r))
         # F-A2: the leader crashes (control closed without DONE) while a grandchild keeps the output open.
         code = "import os,time;from pathlib import Path;_marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(os.getpid()));os.replace(_tmp,_marker);time.sleep(3600)" % str(self.root/'fa2-holder')
         script = self.root/'fa2_leader.py'
-        script.write_text("import os,subprocess,sys,time\nfrom pathlib import Path\nsys.path.insert(0,%r)\nfrom _owned_process import managed_main\ndef main():\n subprocess.Popen([sys.executable,'-B','-c',%r])\n while not Path(%r).exists(): time.sleep(.01)\n os._exit(3)\nmanaged_main(main)\n" % (str(BIN), code, str(self.root/'fa2-holder')))
+        # Holder spawned with stdin=DEVNULL: on nt that is what passes the std handles, so the holder really holds the
+        # output (an all-default Popen inherits none); the hook phases spawn this way too (_owned_process.py:494-496).
+        script.write_text("import os,subprocess,sys,time\nfrom pathlib import Path\nsys.path.insert(0,%r)\nfrom _owned_process import managed_main\ndef main():\n subprocess.Popen([sys.executable,'-B','-c',%r],stdin=subprocess.DEVNULL)\n while not Path(%r).exists(): time.sleep(.01)\n os._exit(3)\nmanaged_main(main)\n" % (str(BIN), code, str(self.root/'fa2-holder')))
         returned, result, out = self.run_fa([PYTHON, '-B', str(script)], 30, '', 'fa2-holder')
         self.assertTrue(returned, 'cooperative window outlived a crashed leader (grace 600 s): %r' % out[-400:])
         self.assertIn('control closed without DONE', (result or {}).get('reason', ''), out[-400:])
         self.assertFalse(result['complete'], result)
+
+    def test_managed_leader_runs_a_preflight_shaped_child(self):
+        # Product shape (head ruling C4): managed preflight runs its checks as javis_preflight.py:5333 @af092542 does -
+        # subprocess.run([sys.executable, "-c", ...], capture_output=True, timeout=60) with no stdin argument, as 39 of
+        # its 39 calls do - so the child inherits the managed leader's lifeline stdin. Hypothesis H1 (FIX-PLAN-d2be23fe
+        # 2.2): on nt that child may stall until its timeout. Verdict: no TimeoutExpired, rc 0, marker present. Elapsed
+        # is recorded, not asserted.
+        sys.path.insert(0,str(BIN));import _owned_process as owned
+        marker=self.root/'a1-child'
+        code="import os;from pathlib import Path;Path(%r).write_text(str(os.getpid()));raise SystemExit(0)" % str(marker)
+        leader=self.root/'a1_leader.py'
+        leader.write_text("import json,subprocess,sys,time\nsys.path.insert(0,%r)\nfrom _owned_process import managed_main\n"
+                          "def main():\n t=time.monotonic()\n try:\n"
+                          "  r=subprocess.run([sys.executable,'-c',%r],capture_output=True,timeout=60)\n"
+                          "  out={'rc':r.returncode,'timeout':False}\n except subprocess.TimeoutExpired:\n"
+                          "  out={'rc':None,'timeout':True}\n out['elapsed_ms']=int((time.monotonic()-t)*1000)\n"
+                          " print('A1 '+json.dumps(out),flush=True)\nmanaged_main(main)\n" % (str(BIN),code))
+        result=owned.run_owned([PYTHON,'-B',str(leader)],90)  # wallclock: guard 90 s only ends a hang; the child's own timeout=60 is the H1 signal and its verdict is no timeout, rc 0 and the marker
+        lines=[l for l in result['stdout'].splitlines() if l.startswith('A1 ')]
+        self.assertEqual(len(lines),1,result)
+        a1=json.loads(lines[0][3:])
+        sys.stderr.write('\nC03-A1 %s\n' % json.dumps(a1));sys.stderr.flush()
+        self.assertFalse(a1['timeout'],'H1: a child inheriting the managed lifeline stdin stalled to its timeout: %r' % a1)
+        self.assertEqual(a1['rc'],0,a1)
+        self.assertTrue(marker.exists(),'the child never ran its first statement: %r' % a1)
 
     @unittest.skipUnless(os.name == 'posix', 'hand-rolled POSIX lifeline leader')
     def test_cooperating_leader_finishes_inside_the_grace(self):
