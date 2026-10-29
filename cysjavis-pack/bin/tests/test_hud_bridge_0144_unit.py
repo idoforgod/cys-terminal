@@ -1156,6 +1156,22 @@ class SpoolIdentityH(_SpoolH):
         self.tick(rd)
         self.assertEqual(self.routed, ["F"])
 
+    def test_h_residual_an_earlier_ts_appended_after_a_swap_is_skipped_not_replayed_and_counted(self):
+        """Head add (b): the named residual of the ts filter - a record whose ts is not newer than the newest already read
+        (here earlier; == falls on the same side) lands after the swap. It is skipped from view, never replayed, and the
+        one resync line counts it (head add (a))."""
+        rd = self.first_sight("A", "B")
+        copy = read_bytes(self.spool)
+        self.consume(rd, ("C", 10), ("E", 30))
+        with open(self.spool + ".new", "wb") as f:
+            f.write(copy)
+        os.replace(self.spool + ".new", self.spool)
+        put(self.spool, self.ev("EARLY", 20), self.ev("SAME", 30), self.ev("F", 40))
+        self.tick(rd)
+        self.assertEqual(self.routed, ["F"], "A/B not replayed; EARLY (ts 20) and SAME (ts == 30) skipped; F routed once")
+        lines = [ln for ln in self.log.getvalue().splitlines() if "routed 1 newer record(s), skipped 4" in ln]
+        self.assertEqual(len(lines), 1, self.log.getvalue())
+
     def test_h_c2_a_copy_plus_appends_longer_than_the_offset_is_not_misread_at_the_old_offset(self):
         """The copy grew past the old offset before the poll: byte N is no longer where the reader stopped (tail anchor)."""
         rd = self.first_sight("A", "B")

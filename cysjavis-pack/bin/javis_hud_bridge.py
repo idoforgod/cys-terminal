@@ -2223,7 +2223,13 @@ def _resync(f, ident, first, floor_ts, note):
     f.seek(0)
     data = f.read()
     end = data.rfind(b"\n") + 1
-    new = [e for e in _parse_lines(data[:end]) if floor is not None and _ts(e) is not None and _ts(e) > floor]
+    parsed = _parse_lines(data[:end])
+    # Strict ">": a record whose ts EQUALS the floor is SKIPPED - the consumed record that set last_ts carries exactly that ts,
+    # so ">=" would replay it. A new record with the identical float ts (or an earlier one raced in after the swap, or written
+    # after a backward clock step) is the named residual: skipped from view, never replayed - and counted in the line below.
+    new = [e for e in parsed if floor is not None and _ts(e) is not None and _ts(e) > floor]
+    note = "%s; routed %d newer record(s), skipped %d (ts <= %r already read, or no numeric ts)" % (
+        note, len(new), len(parsed) - len(new), floor)
     return new, _ident_at(f, end, first, ident["prev_head"], _max_ts(new, floor)), note
 
 
