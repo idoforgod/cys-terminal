@@ -1206,7 +1206,7 @@ jobs:
       # ─────────────────────────────────────────────────────────────────────────
       - name: T5 피닉스 Windows 패리티 스모크 (무손실 복원 S1~S5 + KeepAlive)
         shell: pwsh
-        timeout-minutes: 20   # ★백스톱: 케이스⑦ RestartOnFailure 실전 재기동 지연 ~4분(예산 420s)+①~⑥ ~3분+오버헤드 → ~11-12분·여유 상향(hang은 스모크 롤링 워치독이 잡음)
+        timeout-minutes: 20   # ★백스톱: 케이스⑦ RestartOnFailure 실전 재기동 지연 ~4분(예산 420s)+①~⑥ ~3분+오버헤드 → ~11-12분·여유 상향(hang은 스모크 롤링 워치독이 잡음) · ★0.14.56 ⑩/⑩b(훅) 최악 2×90s 추가 → ~15분[추정 — 윈도우 실측 전]
         env:
           PYTHONUTF8: '1'     # 한글 stdout cp1252 크래시 방지(RC-16 관례)
         run: |
@@ -1238,7 +1238,7 @@ jobs:
           & $cys daemon uninstall 2>$null
           Get-Process cys,cysd -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           if ($code -ne 0) { throw "T5: 피닉스 Windows 패리티 스모크 실패 (exit=$code)" }
-          Write-Host "OK: T5 피닉스 Windows 패리티 스모크 통과 (경로매핑·schtasks·재시작·snapshot/ps1·stub restore·deploy plan·★KeepAlive respawn·★⑧실경로 auto-restore[주입 없이 cysd 자체 decide_auto_restore]·★⑨Job Object 자식트리 동반사망[D3 P2-9])"
+          Write-Host "OK: T5 피닉스 Windows 패리티 스모크 통과 (경로매핑·schtasks·재시작·snapshot/ps1·stub restore·deploy plan·★KeepAlive respawn·★⑧실경로 auto-restore[주입 없이 cysd 자체 decide_auto_restore]·★⑨Job Object 자식트리 동반사망[D3 P2-9]·★⑩/⑩b 사용자 사전 복원 훅[0.14.56 PHX])"
           # ★Actions pwsh 래퍼는 스크립트 말미에 exit $LASTEXITCODE 를 붙인다 — 위 방어적 uninstall(스모크 finally 가
           #   이미 제거해 rc=1)이 그 값을 오염시켜 '스모크 성공인데 스텝 exit 1'(run 28738140283 실증). 판정은 $code 로 끝 — 명시 exit 0.
           exit 0

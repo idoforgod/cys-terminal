@@ -20,6 +20,8 @@ javis_phoenix_win_smoke.py — 불사조(무손실 복원) Windows 전용 경량
   ⑥ deploy --plan + exit code 계약 — 무실행·exit0·부작용 0
   ⑦ ★진짜 KeepAlive respawn E2E — 실 cysd 스케줄러 태스크(RestartOnFailure): taskkill(crash)→유발 없이 스케줄러
      자동 재기동(간격 PT1M)만 관측→pong+epoch delta. 정직 evidence(경과 시간)·정리 finally.
+  ⑩ (0.14.56 PHX) 사용자 사전 복원 훅 — allow 파일 `default` 줄 → 훅 머리말·출력·exit=0·훅 뒤 계획 · ⑩b 문법
+     오류 스크립트 → exit=1 뒤에도 내장 복원.
 
 mac(비-Windows)에서 실행 시: "Windows 전용" 정직 안내 후 exit 0(skip).
 
@@ -141,9 +143,9 @@ def run_phoenix(pipe, *args, timeout=90):
     return _PH._run_capture(cmd, _phoenix_env({"PHOENIX_CYS": CYS_BIN}), timeout)
 
 
-def spawn_test_daemon(pipe):
-    """테스트 전용 파이프에 cysd 직접 기동(CYS_SOCKET 오버라이드). 반환 Popen(추적·정리용)."""
-    env = _phoenix_env({"CYS_SOCKET": pipe})
+def spawn_test_daemon(pipe, extra=None):
+    """테스트 전용 파이프에 cysd 직접 기동(CYS_SOCKET 오버라이드 · extra = 추가 env). 반환 Popen(추적·정리용)."""
+    env = _phoenix_env(dict({"CYS_SOCKET": pipe}, **(extra or {})))
     CREATE_NO_WINDOW = 0x08000000 if IS_WIN else 0
     return subprocess.Popen([CYSD_BIN], env=env, stdin=subprocess.DEVNULL,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -604,6 +606,74 @@ def case8_real_autorestore():
         teardown_daemon(pipe, state_dir=sd, tracked=tracked)
 
 
+def _after(body, first, then):
+    i = body.find(first)
+    return i >= 0 and body.find(then, i + len(first)) >= 0
+
+
+def _hook_boot(tag, pipe, script_body, done):
+    """⑩·⑩b 공용(0.14.56 PHX · 설계 r1 §11 AT1·AT3 의 윈도우판): 임시 CYS_LOCAL_DIR 의 allow 파일 `default` 줄로
+    사용자 스크립트를 걸고, 테스트 파이프에 설치된 cysd 를 콜드부트해(cysd 자체 decide_auto_restore → 훅 단계)
+    phoenix-restore.log 를 done(log) 까지 읽는다. 반환 (스크립트 경로, sha256 앞 16, 로그 본문)."""
+    import hashlib
+    import shutil
+    import tempfile
+    sd = _state_dir(pipe)
+    work = tempfile.mkdtemp(prefix="cys-phxsmoke-hook-")
+    local = os.path.join(work, "local")
+    os.makedirs(local)
+    script = os.path.join(work, "hook_%s.py" % tag)
+    raw = script_body.encode("utf-8")
+    with open(script, "wb") as f:
+        f.write(raw)
+    sha = hashlib.sha256(raw).hexdigest()
+    with open(os.path.join(local, "phoenix-allow.sha256"), "w", encoding="utf-8", newline="\n") as f:
+        f.write("default %s  %s\n" % (sha, script))
+    tracked = None
+    content = ""
+    try:
+        shutil.rmtree(sd, ignore_errors=True)
+        tracked = spawn_test_daemon(pipe, {"CYS_LOCAL_DIR": local})
+        log_path = os.path.join(sd, "phoenix-restore.log")
+        for _ in range(180):  # ~90s(콜드부트 + 훅 앞 계획 + 훅 + 훅 뒤 계획 · ⑧ 의 60s 보다 한 단계 더 걸린다)
+            _cp("⑩%s waiting hook log" % tag)
+            if os.path.exists(log_path):
+                content = open(log_path, encoding="utf-8", errors="replace").read()
+                if done(content):
+                    break
+            time.sleep(0.5)
+    finally:
+        _cp("⑩%s teardown" % tag)
+        teardown_daemon(pipe, state_dir=sd, tracked=tracked)
+        shutil.rmtree(work, ignore_errors=True)
+    return script, sha[:16], content
+
+
+def case10_prerestore_hook():
+    """★⑩(0.14.56 PHX) 사용자 사전 복원 훅 — 설치된 cysd.exe 가 allow 파일의 `default` 스크립트를 훅으로 돌리고
+    (머리말·출력·exit=0), 훅 뒤 계획까지 간다. ⑩b: 문법 오류 스크립트는 exit=1 로 끝나고 내장 복원(authority)이
+    그 뒤에 여전히 돈다. 맥 판(test_phoenix_e2e_hook.py at1·at3)과 같은 판정 — 윈도우는 훅 표준입력이 null 이라
+    hook.run.lock 은 만들지 않는다(at2 의 잠금 부재 판정은 POSIX 전용)."""
+    _cp("⑩ prerestore hook setup")
+    end0 = "===== phoenix hook end: exit=0 ====="
+    path, sha16, body = _hook_boot("a", r"\\.\pipe\cys-phxsmoke-hook", "print('WIN-HOOK-MARKER', flush=True)\n",
+                                   lambda b: _after(b, end0, "===== phoenix plan (post-hook"))
+    header = "===== phoenix hook %s sha256=%s =====" % (path, sha16)
+    tail = "tail=%r" % body[-600:]
+    check("⑩ 훅 머리말 + 사용자 스크립트 출력이 복원 로그에", _after(body, header, "WIN-HOOK-MARKER"), tail)
+    check("⑩ 훅 exit=0 뒤 훅 뒤 계획", _after(body, "WIN-HOOK-MARKER", end0)
+          and _after(body, end0, "===== phoenix plan (post-hook"), tail)
+    _cp("⑩b broken hook setup")
+    end1 = "===== phoenix hook end: exit=1 ====="
+    auth = "===== phoenix auto-restore @"
+    _p, _s, body = _hook_boot("b", r"\\.\pipe\cys-phxsmoke-hookb", "def (:\n",
+                              lambda b: _after(b, end1, auth) and _after(b[b.find(end1):], auth, '"phoenix_restore"'))
+    tail = "tail=%r" % body[-600:]
+    check("⑩b 문법 오류 스크립트가 훅으로 돌고 exit=1(SyntaxError)", end1 in body and "SyntaxError" in body, tail)
+    check("⑩b 그 뒤 내장 복원(authority)이 여전히 돈다", _after(body, end1, auth)
+          and _after(body[body.find(end1):], auth, '"phoenix_restore"'), tail)
+
+
 def resolve_bins():
     import shutil
     cys = os.environ.get("PHOENIX_CYS") or shutil.which("cys") or shutil.which("cys.exe")
@@ -637,7 +707,8 @@ def run():
 
     for fn in (case1_path_mapping, case2_schtasks, case3_restart_primitive,
                case4_snapshot_runbook, case5_stub_restore, case6_deploy_plan,
-               case7_keepalive_respawn, case8_real_autorestore, case9_job_kill_on_close):
+               case7_keepalive_respawn, case8_real_autorestore, case9_job_kill_on_close,
+               case10_prerestore_hook):
         try:
             fn()
         except Exception as e:

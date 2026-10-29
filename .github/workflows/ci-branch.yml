@@ -245,6 +245,14 @@ jobs:
                   "--bin cysd activity_tests::":
                       "0.14.52 F-01: the only BLOCKING native Windows run of the activity observer tests (Windows identity staging path included) — "
                       "without it the observer ships with Windows behaviour vouched for only by macOS.",
+                  "--bin cysd hook_job_win_tests::":
+                      "0.14.56 PHX: the only BLOCKING native Windows run of the per-hook Job specimens (timeout kills the hook's tree, "
+                      "assign failure is reported) — hook_tests:: is cfg(unix) and the cysd full step is non-blocking.",
+                  "--bin cysd phoenix_plan::":
+                      "0.14.56 PHX: the pure pre-restore judgements (allow file, plan outcome, hook bounds) run blocking on Windows here — "
+                      "without it Windows path rules in the allow-file parser are vouched for only by macOS.",
+                  "--bin cysd reclaim::tests::probe_":
+                      "0.14.56 PHX: the read-only restore-lock probe's Windows LockFileEx branch runs only here (named guard in the step).",
               },
           }
 

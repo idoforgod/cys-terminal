@@ -1236,6 +1236,22 @@ jobs:
           CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cysd governance::aid_s5_tests:: -- --test-threads=1
           cargo_filter_count --bin cys aid_s5_cli_tests::
           CYS_PACK_DIR="$(mktemp -d)" RUST_MIN_STACK=8388608 cargo test --bin cys aid_s5_cli_tests:: -- --test-threads=1
+          # ★0.14.56 PHX (S5 R1-7): the pre-restore hook's Windows specimens. hook_tests:: and phoenix_s4_tests:: are
+          #   cfg(unix) and would count 0 here; the Windows ones are hook_job_win_tests:: (per-hook Job, assign failure;
+          #   3 by source), the pure judgements in phoenix_plan:: (allow file, plan outcome, hook bounds; 27 by source)
+          #   and the read-only restore-lock probe reclaim::tests::probe_ (2 on Windows by source; the LockFileEx one is
+          #   named below). They reuse the cysd test binary the aid_s5 run above built. Windows wall time UNMEASURED.
+          cargo_filter_count --bin cysd hook_job_win_tests::
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cysd hook_job_win_tests:: -- --test-threads=1
+          cargo_filter_count --bin cysd phoenix_plan::
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cysd phoenix_plan:: -- --test-threads=1
+          probe_list="$(mktemp)"
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cysd reclaim::tests::probe_ -- --list > "$probe_list" 2>&1
+          grep -Fqx 'reclaim::tests::probe_readonly_lockfileex_matches_msvcrt_region: test' "$probe_list" || {
+            cat "$probe_list"; echo "::error title=PHX probe::the Windows LockFileEx probe specimen is not in the cysd test list"; exit 1; }
+          rm -f "$probe_list"
+          cargo_filter_count --bin cysd reclaim::tests::probe_
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cysd reclaim::tests::probe_ -- --test-threads=1
           CYS_PACK_DIR="$(mktemp -d)" python cysjavis-pack/bin/tests/test_phoenix_c6_due.py
           # ★D1+D3(0.14.55): 재개 판정(결함1 · 좌석 결속 신원)과 fresh 표지 범위(결함3)의 순수함수 진리표를
           #   윈도우 실기에서 돈다 — 이 둘의 유일한 윈도우 커버리지다(실 run_restore 검체
