@@ -541,6 +541,21 @@ Path(%r).write_text(str(r))
         self.assertIn('control closed without DONE', (result or {}).get('reason', ''), out[-400:])
         self.assertFalse(result['complete'], result)
 
+    @unittest.skipUnless(os.name == 'posix', 'hand-rolled POSIX lifeline leader')
+    def test_cooperating_leader_finishes_inside_the_grace(self):
+        # F-A3: fix A must never cut a COOPERATING leader short. This leader speaks the owner protocol by hand and,
+        # once released (stdin EOF), needs a moment before its last line and its exit. The grace (30 s) must give it
+        # that moment; tearing the tree down first loses the line. Its control end closes only when it exits.
+        sys.path.insert(0, str(BIN))
+        import _owned_process as owned
+        leader = self.root/'coop_leader.py'
+        leader.write_text("import os,sys,time\ncontrol=os.fdopen(int(sys.argv[-1]),'wb',buffering=0)\ncontrol.write(b'READY\\n')\n"
+                          "if os.read(0,1)!=b'G': os._exit(125)\nwhile os.read(0,1): pass\ntime.sleep(.2)\n"
+                          "sys.stdout.write('FINAL cooperative line\\n');sys.stdout.flush()\nos._exit(0)\n")
+        result = owned.run_owned([PYTHON, '-B', str(leader)], 1, grace=30, force=5)
+        self.assertTrue(result['timed_out'], result)
+        self.assertIn('FINAL cooperative line', result['stdout'], result)
+
     def test_checklist_timeout_renders_could_not_measure(self):
         # C (H-13 at the C-03 point): a real run_preflight timeout renders the could-not-measure line, never a
         # BLOCK count. Fix A may change only how long this path takes, never the line.
