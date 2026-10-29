@@ -25642,7 +25642,10 @@ mod tests {
         //   reads the verdict.
         let gate=park_reader(&s);
         s.child.lock().unwrap().kill().expect("owned fixture stop");
-        s.child.lock().unwrap().wait().expect("owned fixture reap");
+        // ★(0.14.56 SLEEP-BASH-HANG) Bounded: the plain `wait()` that stood here waited forever under SHELL=/bin/bash
+        //   (the killed child could not finish exiting while output sat unread behind the parked reader; see
+        //   `park_reader`). A child that is not reaped now fails here, by name, instead of hanging the suite.
+        reap_owned_child_within(&s,Duration::from_secs(30)).unwrap_or_else(|e|panic!("owned fixture reap: {e}"));
         assert!(!crate::state::pid_alive(s.pid),"fixture child not reaped");
         struct RestoreExit(Arc<crate::state::Surface>);
         impl Drop for RestoreExit {fn drop(&mut self){self.0.exited.store(true,AtomicOrdering::Relaxed);}}
@@ -25697,7 +25700,7 @@ mod tests {
     /// never takes `parser`. So while the guard lives with one chunk in flight, nothing re-stamps
     /// `last_output` or writes `exited`. The gate is taken between chunks (`output_gen` even), so the
     /// chunk that turns it odd started after the gate and must wait for `parser` — an unrelated chunk
-    /// already in flight cannot fake or hide the park. One written line makes that chunk.
+    /// already in flight cannot fake or hide the park. One written byte makes that chunk (a line on Windows): its echo.
     /// The returned guard checks on drop, with no sleep, that the reader really stayed parked (see `ParkedReader`).
     #[track_caller]
     fn park_reader(s: &crate::state::Surface) -> ParkedReader<'_> {
@@ -25710,9 +25713,16 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         };
         let gen=s.output_gen.load(AtomicOrdering::Acquire);
-        s.write_tx.send(crate::state::WriteReq::Data(b"x\n".to_vec())).unwrap();
+        // ★(0.14.56 SLEEP-BASH-HANG) Unix: ONE byte, no newline. The PTY echoes it at once as a one-byte chunk (the
+        //   fixture keeps the default line discipline: echo on, line mode), and `cat` never gets a whole line, so
+        //   it writes nothing back - no output is produced after the parked chunk and left unread. Unread output
+        //   holds a killed fixture in exit on macOS when the shell keeps `cat` as its child: bash does for the
+        //   two-command `-lc` string the fixture runs, zsh execs `cat` (s1 probe: not reaped in 5 s until the PTY
+        //   is read; reaped 24 ms after). Windows keeps the line `more` was measured with (windows-health).
+        let one: &[u8]=if cfg!(windows) {b"x\n"} else {b"x"};
+        s.write_tx.send(crate::state::WriteReq::Data(one.to_vec())).unwrap();
         while s.output_gen.load(AtomicOrdering::Acquire)==gen {
-            assert!(Instant::now()<end,"no PTY output after one written line: the reader is not parked");
+            assert!(Instant::now()<end,"no PTY output after the written byte (a line on Windows): the reader is not parked");
             std::thread::sleep(Duration::from_millis(5));
         }
         ParkedReader{s,parked_gen:gen+1,_gate:gate}
@@ -25734,6 +25744,36 @@ mod tests {
                     "the PTY reader got past its parked chunk while the park was held: it did not wait for `parser`");
             }
         }
+    }
+
+    /// ★(0.14.56 SLEEP-BASH-HANG) Reap an owned fixture child that was just stopped, within `bound`. `Err` says the
+    /// child was not reaped in time instead of waiting forever: an unbounded `wait()` hung the whole cysd suite when
+    /// a killed child could not finish exiting (macOS, SHELL=/bin/bash, output unread behind a parked reader).
+    fn reap_owned_child_within(s: &crate::state::Surface, bound: Duration) -> Result<(), String> {
+        let end=Instant::now()+bound;
+        loop { // wallclock: guard bounds the reap of a child the caller already stopped; the bound only turns a hang into a failure
+            let done=s.child.lock().unwrap_or_else(|e|e.into_inner()).try_wait().map_err(|e|format!("try_wait failed: {e}"))?;
+            if done.is_some() {return Ok(());}
+            if Instant::now()>=end {return Err(format!("the stopped fixture child (pid {}) was not reaped within {bound:?}",s.pid));}
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// The reap helper is bounded and reaps nothing it did not see exit: on a live child it returns `Err` after its
+    /// bound and leaves the child alone. It runs on another thread under a guard, so a helper that waits without
+    /// bound fails this test (the guard expires) instead of hanging the suite; the fixture teardown then stops the
+    /// child (process-group SIGKILL), which also frees such a helper.
+    #[test]
+    fn reap_owned_child_within_is_bounded_and_reaps_only_an_exited_child() {
+        let (daemon,sid)=deadman_daemon("reap-bound");let s=daemon.get_surface(sid).unwrap();
+        let (tx,rx)=std::sync::mpsc::channel();
+        let s2=s.clone();
+        std::thread::spawn(move||{let _=tx.send(reap_owned_child_within(&s2,Duration::from_millis(300)));});
+        let got=rx.recv_timeout(Duration::from_secs(30)) // wallclock: guard 100x the helper's 300 ms bound; expiry means the helper is unbounded
+            .expect("reap_owned_child_within did not return within 30 s on a live child: it waits without bound");
+        let err=got.expect_err("reap_owned_child_within reported a reap of a child that is still running");
+        assert!(err.contains("was not reaped within"),"{err}");
+        assert!(crate::state::pid_alive(s.pid),"the helper stopped or reaped a running child");
     }
 
     /// ★D-R2-3 상설 덤프 — ★실패 경로에서만 찍는다(통과 때 출력 0 ⇒ 로그 비용 0).
