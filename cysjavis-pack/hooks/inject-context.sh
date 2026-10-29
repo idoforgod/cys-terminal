@@ -7,13 +7,182 @@
 set +e
 
 # ── 공용 프리루드(CS-4①) — loud-skip: 소실 시 조용히 꺼지지 않고 stderr 1줄 후 강등 ──
-. "$(dirname "$0")/_lib.sh" 2>/dev/null \
+if [ "${1:-}" != "--phase" ]; then _CYS_LIB_DEFINE_ONLY=1; CYS_LANE_REDIRECT=""; fi
+# The hook's own directory, split on '/' and on '\' (a Windows path reaches bash with backslashes;
+# '%/*' alone missed them and lost _lib.sh: H-WIN-2/3/5). Assignment only: no dirname, no command
+# substitution, no external process in this bounded prelude (46b24c6b).
+_C03_HOOK_DIR=${BASH_SOURCE[0]}
+case $_C03_HOOK_DIR in
+  */*|*\\*) _C03_HOOK_DIR=${_C03_HOOK_DIR%[/\\]*}; [ -n "$_C03_HOOK_DIR" ] || _C03_HOOK_DIR=/ ;;
+  *) _C03_HOOK_DIR=. ;;
+esac
+. "$_C03_HOOK_DIR/_lib.sh" 2>/dev/null \
   || . "${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh" 2>/dev/null \
   || { echo "[cys-hook] _lib.sh 소실 — 훅 강등(inject-context)" >&2; exit 0; }
+# Define-only loading skips _lib.sh's own run block, and cys_lane_guard lives in it.
+# The controller must still take the lane decision here: it is routing, not
+# initialization, so it has to happen before any phase is spawned. Run inside a
+# phase instead and the delegated lane hook writes to the owned record channel,
+# where its output is read as records and never reaches the caller's stdout — the
+# controller then sees no SOURCE and exits 0 silently (measured at 491eb0e7; the
+# same case delegates at 9dbea792). The guard's helpers use shell builtins only,
+# so it is safe before cys_resolve_py.
+if [ "${_CYS_LIB_DEFINE_ONLY:-}" = 1 ]; then
+  command -v cys_lane_guard >/dev/null 2>&1 && cys_lane_guard
+fi
 command -v cys_lane_redirect >/dev/null 2>&1 && cys_lane_redirect "$@"
+unset _CYS_LIB_DEFINE_ONLY
+# Interpreter selection uses shell builtins and filesystem predicates only.
+[ "${1:-}" = "--phase" ] || cys_resolve_py >/dev/null 2>&1 || :
 
-INPUT=$(cat 2>/dev/null)
-[ -z "$INPUT" ] && exit 0
+
+# C-03 fixed phase protocol. NUL-delimited values are never eval/source input.
+_c03_emit() {
+  for _c03_key in SOURCE CWD SOUL ROOT OUT STATE STATE_DIR USED_FALLBACK DEPT_CTX DEPT_NO_STATE DEPT_ROUND DEPT_STATE_WITHHELD _IC_ROLE _IC_ROLE_DONE _IC_GATE; do
+    printf '%s\0%s\0' "$_c03_key" "${!_c03_key}"
+  done
+}
+_ic_resolve_role() {
+  [ -n "$_IC_ROLE_DONE" ] && return 0
+  _IC_ROLE_DONE=1
+  _IC_ROLE=""
+  if command -v cys_resolve_role >/dev/null 2>&1; then
+    cys_resolve_role >/dev/null 2>&1 || :
+    _IC_ROLE="${CYS_RESOLVED_ROLE:-}"
+  else
+    # 정본 부재(오래된 `_lib.sh`) — 훅은 강등하되 조용하지 않는다. env 는 폴백 전용이다.
+    echo "[cys-hook] cys_resolve_role 부재 — 역할 해소 강등(inject-context)" >&2
+    _IC_ROLE=$(printf '%s' "${CYS_ROLE:-}" | head -n1 | tr -d '\r')
+  fi
+  # ★소비 지점의 문법 검사(성찰 R4 N5 ⓓ): 표현 불가한 값은 **역할이 아니다**. 잘라 쓰면 없는
+  #   역할을 지어내는 것이고, 그대로 실으면 남이 심은 여러 낱말이 SessionStart 컨텍스트에
+  #   문장으로 들어간다(`_esc` 는 백슬래시만 이스케이프한다). 정본 `cys_role_token_ok` 와 같은 집합.
+  if [ -n "$_IC_ROLE" ] && command -v cys_role_token_ok >/dev/null 2>&1 \
+     && ! cys_role_token_ok "$_IC_ROLE"; then
+    _IC_ROLE=""
+  fi
+  return 0
+}
+
+
+if [ "${1:-}" != "--phase" ]; then
+  # The shell owns OUT throughout. A failed phase cannot replace cached core.
+  _C03_LEAF="$_C03_HOOK_DIR/../bin/_owned_process.py"
+  [ -f "$_C03_LEAF" ] || _C03_LEAF="${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/_owned_process.py"
+  _C03_START=""; _C03_CHECK_SPENT=0; _C03_ANC_SPENT=0
+  OUT=""; SOURCE=""; CWD=""; _IC_GATE="unknown"
+  for _C03_PHASE in ingress role core ancillary checklist post bookkeeping; do
+    case "$_C03_PHASE" in
+      ingress) _C03_CAP=20 ;;
+      role|ancillary) _C03_CAP=30 ;;
+      core) _C03_CAP=60 ;;
+      checklist) _C03_CAP=270 ;;
+      post) _C03_CAP=30 ;;
+      bookkeeping) _C03_CAP=10 ;;
+    esac
+    # Emit before optional logging: an unresponsive log cannot hide restoration.
+    [ "$_C03_PHASE" = bookkeeping ] && printf '%b' "$OUT"
+    export _C03_LEAF CYS_PY SOURCE CWD SOUL ROOT OUT STATE STATE_DIR USED_FALLBACK DEPT_CTX DEPT_NO_STATE DEPT_ROUND DEPT_STATE_WITHHELD _IC_ROLE _IC_ROLE_DONE _IC_GATE
+    _C03_ARGS=(--records --native-shell --budget 150 --total-budget 420 --exclude "$_C03_CHECK_SPENT")
+    [ -n "$_C03_START" ] && _C03_ARGS+=(--start "$_C03_START")
+    [ "$_C03_PHASE" = ingress ] && _C03_ARGS+=(--input-env INPUT)
+    case "$_C03_PHASE" in role|ancillary) _C03_ARGS+=(--spent "$_C03_ANC_SPENT");; esac
+    # Checklist has its own270 allowance; global420 still applies in the leaf.
+    [ "$_C03_PHASE" = checklist ] && _C03_ARGS+=(--budget 420)
+    _OWNED_FAILURE=""; _OWNED_ELAPSED=0; _OWNED_SPENT=0; _OWNED_RETURNED=""
+    # Records travel through a file, not `done < <(...)`: process substitution is a
+    # bash-only construct that `sh -n` refuses to parse (G-SYNTAX, CS-4① ⓐ POSIX sh).
+    # A pipe is not the alternative — it would put the loop in a subshell and every
+    # value assigned below (SOURCE, OUT, STATE, the budget counters) would be lost to
+    # the code after the loop. The file is created inside a directory made exclusively
+    # for it, on the same grounds as cys_role_cache_write: a predictable name in a
+    # shared tmp can be pre-seeded with a FIFO, and opening that FIFO would hang the
+    # SessionStart hook of every seat.
+    # The sink must not make a writable TMPDIR a precondition for restoration:
+    # process substitution needed no file at all, and B5 of test_wp18_skillscan_failopen
+    # pins that a machine whose TMPDIR cannot be written still runs the checklist
+    # (measured: a single-candidate sink turns that pin red). Walk candidates and take
+    # the first that actually yields a directory; the mkdir/mktemp is the real test,
+    # the -w probe only skips hopeless candidates.
+    _C03_RD=""
+    for _C03_TD in "${TMPDIR:-/tmp}" /tmp /var/tmp "${HOME:-}"; do
+      [ -n "$_C03_TD" ] || continue
+      [ -d "$_C03_TD" ] && [ -w "$_C03_TD" ] || continue
+      if command -v mktemp >/dev/null 2>&1; then
+        _C03_RD="$(mktemp -d "$_C03_TD/cys-ic-rec.XXXXXX" 2>/dev/null)" || _C03_RD=""
+      fi
+      if [ -z "$_C03_RD" ]; then
+        _C03_RD="$_C03_TD/cys-ic-rec.$$.$_C03_PHASE.d"
+        mkdir -m 700 "$_C03_RD" 2>/dev/null || _C03_RD=""
+      fi
+      [ -n "$_C03_RD" ] && break
+    done
+    # No writable record sink means no records, which the unmeasured branch below
+    # already handles; stderr stays on the hook's stderr exactly as it did before.
+    if [ -n "$_C03_RD" ]; then
+      cys_timeout_run --owned "$_C03_CAP" "$_C03_LEAF" "${_C03_ARGS[@]}" -- "${BASH:-/bin/bash}" "$0" --phase "$_C03_PHASE" > "$_C03_RD/rec"
+      while IFS= read -r -d '' _C03_KEY && IFS= read -r -d '' _C03_VALUE; do
+        case "$_C03_KEY" in
+          SOURCE|CWD|SOUL|ROOT|OUT|STATE|STATE_DIR|USED_FALLBACK|DEPT_CTX|DEPT_NO_STATE|DEPT_ROUND|DEPT_STATE_WITHHELD|_IC_ROLE|_IC_ROLE_DONE|_IC_GATE|_OWNED_FAILURE|_OWNED_STARTED|_OWNED_ELAPSED|_OWNED_SPENT|_OWNED_RETURNED)
+            printf -v "$_C03_KEY" '%s' "$_C03_VALUE" ;;
+        esac
+      done < "$_C03_RD/rec"
+      rm -f "$_C03_RD/rec" 2>/dev/null || :
+      rmdir "$_C03_RD" 2>/dev/null || :
+    fi
+    if [ "$_OWNED_RETURNED" != 1 ]; then
+      _OWNED_FAILURE="phase owner ended without completion; unmeasured"
+      # Missing elapsed evidence cannot refill the shared role/observation
+      # allowance. Conservatively spend that category's entire allocation.
+      case "$_C03_PHASE" in role|ancillary) _OWNED_SPENT="$_C03_CAP";; esac
+    fi
+    _C03_START="${_OWNED_STARTED:-$_C03_START}"
+    case "$_C03_PHASE" in role|ancillary) _C03_ANC_SPENT="$_OWNED_SPENT";; esac
+    [ "$_C03_PHASE" = checklist ] && _C03_CHECK_SPENT="$_OWNED_ELAPSED"
+    if [ -n "$_OWNED_FAILURE" ]; then
+      if [ "$_C03_PHASE" = ingress ]; then
+        printf '⚠ restoration input incomplete: %s; source/cwd unresolved.\n' "$_OWNED_FAILURE"
+        exit 0
+      fi
+      if [ "$_C03_PHASE" = bookkeeping ]; then
+        printf '⚠ restoration bookkeeping unmeasured: %s\n' "$_OWNED_FAILURE"
+      else
+        _C03_KNOWN="state=${STATE:-unresolved}; soul=${SOUL:-unresolved}"
+        _C03_KNOWN="${_C03_KNOWN//\\/\\\\}"
+        OUT="${OUT}⚠ restoration phase $_C03_PHASE incomplete/unmeasured: $_OWNED_FAILURE ($_C03_KNOWN)\n"
+      fi
+    fi
+    [ "$_C03_PHASE" = ingress ] && [ -z "$SOURCE" ] && exit 0
+  done
+  exit 0
+fi
+
+# Only code-owned phase identifiers reach the fixed bodies below.
+case "${2:-}" in ingress|role|core|ancillary|checklist|post|bookkeeping) ;; *) exit 125;; esac
+# ---------- ★G3(cokacdir 성찰 2026-07-04): 재주입 포이즌 게이트 ----------
+# SESSION_STATE·RSI_LEDGER는 FS 쓰기 권한 노드가 지시를 심을 수 있는 재주입 면 — verbatim
+# 주입 전 skillscan 규칙(add 시점과 동일)으로 의심 라인만 격리(deny-by-default·라인 단위).
+# 게이트 부재·실패 시 원문 통과(복원 생명선 — 전면 차단 금지), 게이트 안에서 다운 배너 표기.
+# The prelude's $_C03_HOOK_DIR, not dirname "$0": a phase re-entry gets the same Windows-form $0, and
+# dirname of a backslash path is '.', which would look for the gate beside the working directory.
+GATE="$(cd "$_C03_HOOK_DIR" 2>/dev/null && pwd)/inject_gate.py"
+# Windows(PortableGit sh) 패리티: 네이티브 python3는 POSIX 경로(/c/...)를 못 연다 — cygpath 변환.
+command -v cygpath >/dev/null 2>&1 && GATE="$(cygpath -w "$GATE" 2>/dev/null || printf '%s' "$GATE")"
+_gate() {
+  if [ -f "$GATE" ]; then
+    "$CYS_PY" "$GATE" || cat
+  else
+    cat
+  fi
+}
+# 외부 본문(경로변수 등)이 최종 printf '%b' 에 들어가기 전 백슬래시를 이중화 —
+# \c 등 이스케이프가 %b 로 해석돼 출력이 무음 절단되는 사고 봉인(H-HOOK-1).
+_esc() { printf '%s' "$1" | sed 's/\\/\\\\/g'; }
+
+
+case "$2" in
+ingress)
+[ -z "$INPUT" ] && { _c03_emit; exit 0; }
 # 인터프리터 해소는 프리루드(python3→python→py). 이 훅의 기존 계약(비어 있으면 안 됨)은
 # 자기 자리에서 명시 폴백한다 — 계약 무변경(미해소 시 graceful degrade).
 # ★U15(0.14.41): 개발자 도구(CLT) 없는 맥(프리루드 `cys_py_shim_risk`)에서는 폴백하지 않는다 — 그 기계의
@@ -33,10 +202,11 @@ try:
     d=json.load(sys.stdin)
     print(d.get('source','startup')); print(d.get('cwd',''))
 except Exception:
-    print('startup'); print('')
+    print('__INPUT_INCOMPLETE__'); print('')
 print('__CYS_END__')" 2>/dev/null | tr -d '\r')
 { IFS= read -r SOURCE; IFS= read -r CWD; } <<< "$_PARSED"
-[ -z "$SOURCE" ] && SOURCE="startup"
+[ "$SOURCE" = "__INPUT_INCOMPLETE__" ] && exit 125
+[ -z "$SOURCE" ] && exit 125
 # ── G19: 절대경로 게이트를 드라이브 경로까지 (Windows `C:\proj` cwd 공란화 해소) ──
 # 종전의 `/*` 전용 glob 게이트는 `C:\Users\x` 를 상대경로로 보고 CWD를 공란화해 SESSION_STATE
 # 상향탐색을 전면 불능화했다(Windows 전 설치). 드라이브/UNC 경로만 슬래시 정규화한 뒤
@@ -44,6 +214,46 @@ print('__CYS_END__')" 2>/dev/null | tr -d '\r')
 CWD="$(cys_norm_cwd "$CWD")"
 cys_is_abs "$CWD" || CWD=""   # 절대경로만 상향탐색 (상대·빈값은 fallback으로 — 무한루프 방지)
 
+
+;;
+role)
+_IC_ROLE=""; _IC_ROLE_DONE=""
+# ---------- ★U13 착수 게이트(0.14.41 · 오너 지시 2026-09-23 · 설계 §3 U13 · 반박 D1): 좌석 분류 ----------
+# 이 훅의 복원 신호('▶ 작업 계속 … 이어서 진행' · '▶ 복원 모드 … 미해결 게이트부터 재개')는 역할과 무관하게
+# **모든 좌석**에 나갔고, 부서 레인에서는 부서장 SESSION_STATE('다음 액션' 큐)까지 팀원 좌석에 실렸다 —
+# 팀원에게 스스로 착수를 권하는 가장 직접적인 제품 문안이었다(반박 M1·M2 · 세션 기록 실측). 지침 파일
+# (WORKER §0 · REVIEWER §1-2 = 정본)은 사용자 소유라 기존 설치에 닿지 않으므로 이 훅(팩 소유)이 배달한다.
+#   lead    = master · cso*        → 종전 출력 **바이트 동일**(문안·본문·체크리스트 전부)
+#   member  = 역할이 확정된 그 밖   → 중립 문안(`cys_start_gate_note` 단일 원본) + 부서 레인은 부서장 본문 대신 1줄
+#   unknown = 판별 실패             → 중립 문안 · 작업기억 본문은 **유지**(그 좌석이 부서장 자신일 수 있다 —
+#                                    작업기억은 복원 생명선이고, 본문은 '배경 컨텍스트' 머리글 아래 실린다)
+# 판별 순서: ① env `CYS_ROLE` 이 lead 면 그대로 lead — 조회 0(lead 좌석의 비용·출력 불변을 구조로 보장한다.
+#   env 가 낡았더라도 귀결은 종전 문안 = 현행 동작이다) ② 그 밖은 정본 해소(위 `_ic_resolve_role`).
+# 프리루드에 문안 함수가 없으면(부분 갱신) 종전 출력 그대로 — 모르는 상태를 새 거동으로 바꾸지 않는다.
+_IC_GATE="lead"
+if command -v cys_start_gate_is_lead >/dev/null 2>&1 && command -v cys_start_gate_note >/dev/null 2>&1; then
+  # env 는 첫 줄 + 양끝 공백 트림(정본 `cys_role_line` · 외부 명령 0 — CR 도 여기서 끊긴다).
+  _IC_ENV_ROLE=""
+  command -v cys_role_line >/dev/null 2>&1 && _IC_ENV_ROLE="$(cys_role_line "${CYS_ROLE:-}")"
+  if cys_start_gate_is_lead "$_IC_ENV_ROLE"; then
+    _IC_GATE="lead"
+  else
+    _ic_resolve_role
+    if cys_start_gate_is_lead "$_IC_ROLE"; then
+      _IC_GATE="lead"
+    elif [ -n "$_IC_ROLE" ]; then
+      _IC_GATE="member"
+    else
+      _IC_GATE="unknown"
+    fi
+  fi
+else
+  echo "[cys-hook] 착수 게이트 문안 부재(구 _lib.sh) — 종전 복원 신호 유지(inject-context)" >&2
+fi
+
+
+;;
+core)
 # ── #15: soul 해소는 **레인을 존중**한다 (2026-09-04 W-A) ──
 # 종전 순서(CYS_SOUL → ~/.claude/soul.md → ~/.cys/pack/soul.md)는 부서 레인 팩
 # (CYS_PACK_DIR=~/.cys/pack-<부서>)에서 돌아도 **본부 soul** 을 주입했다 — 레인의 정체가
@@ -55,25 +265,8 @@ SOUL=""
 [ -z "$SOUL" ] && [ -f "$HOME/.claude/soul.md" ] && SOUL="$HOME/.claude/soul.md"   # 레거시 경로
 [ -z "$SOUL" ] && SOUL="$HOME/.cys/pack/soul.md"   # 배포 기본 soul (일반 사용자 · 종전 최종 폴백 불변)
 ROOT="${CYS_ROOT:-$HOME}"
-OUT=""
-
-# ---------- ★G3(cokacdir 성찰 2026-07-04): 재주입 포이즌 게이트 ----------
-# SESSION_STATE·RSI_LEDGER는 FS 쓰기 권한 노드가 지시를 심을 수 있는 재주입 면 — verbatim
-# 주입 전 skillscan 규칙(add 시점과 동일)으로 의심 라인만 격리(deny-by-default·라인 단위).
-# 게이트 부재·실패 시 원문 통과(복원 생명선 — 전면 차단 금지), 게이트 안에서 다운 배너 표기.
-GATE="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/inject_gate.py"
-# Windows(PortableGit sh) 패리티: 네이티브 python3는 POSIX 경로(/c/...)를 못 연다 — cygpath 변환.
-command -v cygpath >/dev/null 2>&1 && GATE="$(cygpath -w "$GATE" 2>/dev/null || printf '%s' "$GATE")"
-_gate() {
-  if [ -f "$GATE" ]; then
-    "$CYS_PY" "$GATE" || cat
-  else
-    cat
-  fi
-}
-# 외부 본문(경로변수 등)이 최종 printf '%b' 에 들어가기 전 백슬래시를 이중화 —
-# \c 등 이스케이프가 %b 로 해석돼 출력이 무음 절단되는 사고 봉인(H-HOOK-1).
-_esc() { printf '%s' "$1" | sed 's/\\/\\\\/g'; }
+# Commit known canonical paths before a potentially slow file read.
+printf 'SOUL\0%s\0ROOT\0%s\0' "$SOUL" "$ROOT"
 
 # ---------- L0: soul 절 제목 전수 + 전문 포인터 (startup/resume) ----------
 # B-057 (0.14.50, base-lane H1 form): the old selector `awk '/^## \[/{p=1} p'` matched no heading of
@@ -114,78 +307,8 @@ if { [ "$SOURCE" = "startup" ] || [ "$SOURCE" = "resume" ]; } && [ -f "$SOUL" ];
   OUT="${OUT}\n"
 fi
 
-# ---------- 좌석 역할 해소(정본 1회 · 아래 복원 신호 분기와 동일 cwd 세션 줄이 공유) ----------
-# 신원은 **데몬이 권위**다(plan §8: `CYS_ROLE` env 는 승계 후 stale — 폴백 전용).
-# ★성찰 R4 N5 — 해소는 **정본 하나**(`_lib.sh:cys_resolve_role`)만 쓴다. 이 훅은 `_lib.sh` 를
-#   :11 에서 이미 source 하는데도 종전엔 같은 일을 **세 번째 경로**로 다시 구현했고, 그 사본에는
-#   정본의 네 장치가 전부 빠져 있었다:
-#     ⓐ 60s 디스크 캐시 없음 · ⓑ 30s 실패 백오프 없음 → 데몬이 떠 있으나 무응답인 상태에서
-#        좌석 12개가 동시에 SessionStart(부트·`/clear`·`/compact`)를 돌면 각 훅이 2s 씩 사용자
-#        프롬프트 앞을 붙잡는다(정본이었다면 첫 실패 뒤 30s 는 조회를 생략한다 · 봉인표 ④ 방향).
-#     ⓒ `${CYS_BIN:-cys}` 대신 `cys` 하드코딩 → `bin/cys-dept` 의 레인 지정과
-#        `javis_snapshot._st_env` 의 봉인을 둘 다 무시했다.
-#     ⓓ `cys_role_token_ok` 없음 → 문법 밖 문자열이 그대로 SessionStart 컨텍스트에 실렸다.
-#   정본의 신원 전제도 함께 온다: **숫자 surface id 가 없으면 데몬에게 '나'를 묻지 않는다**
-#   (주소가 없다는 사실이 '역할 없음' 판정으로 승격되면 정상 위임 경로가 죽는다). 자동기동 금지
-#   (`CYS_NO_AUTOSTART=1`)·CR 제거·한 줄 절단·rc0+빈 줄 = 확정 무역할도 전부 정본 쪽 규율이다.
-# ★0.14.41 U13: 해소는 **훅 1회당 최대 1회**다(`_IC_ROLE_DONE` 래치) — 복원 신호 분기와 동일 cwd 세션 줄이
-#   같은 답을 쓴다(두 번 묻지 않는다).
-_IC_ROLE=""; _IC_ROLE_DONE=""
-_ic_resolve_role() {
-  [ -n "$_IC_ROLE_DONE" ] && return 0
-  _IC_ROLE_DONE=1
-  _IC_ROLE=""
-  if command -v cys_resolve_role >/dev/null 2>&1; then
-    cys_resolve_role >/dev/null 2>&1 || :
-    _IC_ROLE="${CYS_RESOLVED_ROLE:-}"
-  else
-    # 정본 부재(오래된 `_lib.sh`) — 훅은 강등하되 조용하지 않는다. env 는 폴백 전용이다.
-    echo "[cys-hook] cys_resolve_role 부재 — 역할 해소 강등(inject-context)" >&2
-    _IC_ROLE=$(printf '%s' "${CYS_ROLE:-}" | head -n1 | tr -d '\r')
-  fi
-  # ★소비 지점의 문법 검사(성찰 R4 N5 ⓓ): 표현 불가한 값은 **역할이 아니다**. 잘라 쓰면 없는
-  #   역할을 지어내는 것이고, 그대로 실으면 남이 심은 여러 낱말이 SessionStart 컨텍스트에
-  #   문장으로 들어간다(`_esc` 는 백슬래시만 이스케이프한다). 정본 `cys_role_token_ok` 와 같은 집합.
-  if [ -n "$_IC_ROLE" ] && command -v cys_role_token_ok >/dev/null 2>&1 \
-     && ! cys_role_token_ok "$_IC_ROLE"; then
-    _IC_ROLE=""
-  fi
-  return 0
-}
-
-# ---------- ★U13 착수 게이트(0.14.41 · 오너 지시 2026-09-23 · 설계 §3 U13 · 반박 D1): 좌석 분류 ----------
-# 이 훅의 복원 신호('▶ 작업 계속 … 이어서 진행' · '▶ 복원 모드 … 미해결 게이트부터 재개')는 역할과 무관하게
-# **모든 좌석**에 나갔고, 부서 레인에서는 부서장 SESSION_STATE('다음 액션' 큐)까지 팀원 좌석에 실렸다 —
-# 팀원에게 스스로 착수를 권하는 가장 직접적인 제품 문안이었다(반박 M1·M2 · 세션 기록 실측). 지침 파일
-# (WORKER §0 · REVIEWER §1-2 = 정본)은 사용자 소유라 기존 설치에 닿지 않으므로 이 훅(팩 소유)이 배달한다.
-#   lead    = master · cso*        → 종전 출력 **바이트 동일**(문안·본문·체크리스트 전부)
-#   member  = 역할이 확정된 그 밖   → 중립 문안(`cys_start_gate_note` 단일 원본) + 부서 레인은 부서장 본문 대신 1줄
-#   unknown = 판별 실패             → 중립 문안 · 작업기억 본문은 **유지**(그 좌석이 부서장 자신일 수 있다 —
-#                                    작업기억은 복원 생명선이고, 본문은 '배경 컨텍스트' 머리글 아래 실린다)
-# 판별 순서: ① env `CYS_ROLE` 이 lead 면 그대로 lead — 조회 0(lead 좌석의 비용·출력 불변을 구조로 보장한다.
-#   env 가 낡았더라도 귀결은 종전 문안 = 현행 동작이다) ② 그 밖은 정본 해소(위 `_ic_resolve_role`).
-# 프리루드에 문안 함수가 없으면(부분 갱신) 종전 출력 그대로 — 모르는 상태를 새 거동으로 바꾸지 않는다.
-_IC_GATE="lead"
-if command -v cys_start_gate_is_lead >/dev/null 2>&1 && command -v cys_start_gate_note >/dev/null 2>&1; then
-  # env 는 첫 줄 + 양끝 공백 트림(정본 `cys_role_line` · 외부 명령 0 — CR 도 여기서 끊긴다).
-  _IC_ENV_ROLE=""
-  command -v cys_role_line >/dev/null 2>&1 && _IC_ENV_ROLE="$(cys_role_line "${CYS_ROLE:-}")"
-  if cys_start_gate_is_lead "$_IC_ENV_ROLE"; then
-    _IC_GATE="lead"
-  else
-    _ic_resolve_role
-    if cys_start_gate_is_lead "$_IC_ROLE"; then
-      _IC_GATE="lead"
-    elif [ -n "$_IC_ROLE" ]; then
-      _IC_GATE="member"
-    else
-      _IC_GATE="unknown"
-    fi
-  fi
-else
-  echo "[cys-hook] 착수 게이트 문안 부재(구 _lib.sh) — 종전 복원 신호 유지(inject-context)" >&2
-fi
-
+# Retain the completed soul text even if later state selection/read stalls.
+printf 'OUT\0%s\0' "$OUT"
 # ---------- ★부서 소켓 노드: pack-dept round 정본만 (dept-recovery §8③·R1/R2/R3) ----------
 DIR="$CWD"; STATE=""; STATE_DIR=""; PREV=""; DEPT_CTX=""; DEPT_NO_STATE=""; DEPT_ROUND=""; DEPT_STATE_WITHHELD=""
 # ── G4+G20: 부서 레인 감지 글롭 수리 (명명 부서 + Windows 파이프·백슬래시) ──
@@ -235,6 +358,7 @@ if [ -z "$STATE" ] && [ -z "$DEPT_CTX" ] && [ -f "$ROOT/_round/ACTIVE_PROJECT" ]
   if [ -n "$AP" ] && [ -f "$AP/_round/SESSION_STATE.md" ]; then STATE="$AP/_round/SESSION_STATE.md"; STATE_DIR="$AP"; USED_FALLBACK=1; fi
 fi
 
+printf 'STATE\0%s\0STATE_DIR\0%s\0' "$STATE" "$STATE_DIR"
 if [ -z "$STATE" ] && [ -n "$DEPT_NO_STATE" ]; then
   OUT="${OUT}⚠ 부서 pack round SESSION_STATE 부재/이상환경 — 작업기억 주입 생략(메인 레인 미참조·R2/R3). 부서 정본 생성: cys todo-path.
 "
@@ -265,6 +389,9 @@ else
   OUT="${OUT}■ 작업기억 미발견 — 임의 추정 금지. 활성 프로젝트를 지정하라.\n\n"
 fi
 
+
+;;
+ancillary)
 # ---------- ★도구 산출 스냅샷 주입 (BOOT_SNAPSHOT · 관측·비임무 — W-수리2 배선) ----------
 # 조건 3중: ①파일 존재 ②mtime 48h 이내(구식 스냅샷 오주입 차단) ③마스터 pane(javis_snapshot.py is-master exit 0).
 # 실패·부재·비마스터·구식은 조용히 생략(기존 주입 불변) · is-master는 cys_timeout_run 5초 캡(hang 차단).
@@ -339,6 +466,10 @@ if command -v lsof >/dev/null 2>&1 && command -v ps >/dev/null 2>&1 && [ -n "$CW
   fi
 fi
 
+
+;;
+checklist)
+
 # ---------- ★실측 체크리스트 (vimax-w0 A3 · SESSION_STATE '주장' 옆에 디스크 '실측' — G2 보조) ----------
 # 안전: 파일 부재 시 조용히 스킵(stale-hook 사고 방지) · 실패·공백 출력 시 미주입 · compact 제외.
 # 출력은 javis_checklist가 6줄·1KB 이내로 자체 절단, 머리에 P0.2 방어 문구 내장.
@@ -361,23 +492,14 @@ if [ "$SOURCE" != "compact" ] && [ -n "$STATE" ]; then
     #   체크리스트는 종전처럼 돈다 — rc 판정도 그대로다).
     _CHK_ERR="${TMPDIR:-/tmp}/cys-inject-chk-err.$$"
     : > "$_CHK_ERR" 2>/dev/null || _CHK_ERR=/dev/null
-    if command -v timeout >/dev/null 2>&1; then
-      # outer timeout 은 checklist 내부 PREFLIGHT_TIMEOUT(30s)보다 커야 한다 — 작으면 preflight가
-      # 25~30s 걸릴 때 checklist 출력이 통째로 조용히 유실(G2 degrade). 40 = inner 30 + 여유.
-      # ★C7 서열: 40(이 겹) > 30(checklist PREFLIGHT_TIMEOUT) > 20(preflight 안 skillscan)
-      #   = innermost-smallest. ★macOS 에는 timeout(1) 이 없다(이 호스트 실측: timeout·gtimeout
-      #   둘 다 부재) — 그런 기계는 아래 else 갈래로 가고 이 겹이 아예 없다. 그때의 상한은
-      #   체크리스트 자신의 30s 다.
-      CHK_OUT=$(timeout 40 "$CYS_PY" "$CHK" --state "$STATE" --round-dir "$(dirname "$STATE")" 2>"$_CHK_ERR")
-      CHK_RC=$?
-    else
-      CHK_OUT=$("$CYS_PY" "$CHK" --state "$STATE" --round-dir "$(dirname "$STATE")" 2>"$_CHK_ERR")
-      CHK_RC=$?
-    fi
+    # Execution and cleanup together fit the enclosing270s phase. The outer
+    # helper -> checklist watcher is part of the same owned lifeline chain.
+    CHK_OUT=$(cys_timeout_run --owned 265 "$_C03_LEAF" --budget 270 --managed-command -- "$CYS_PY" -B "$CHK" --state "$STATE" --round-dir "$(dirname "$STATE")" 2>"$_CHK_ERR")
+    CHK_RC=$?
     [ -n "$CHK_OUT" ] && OUT="${OUT}$(printf '%s' "$CHK_OUT" | sed 's/\\/\\\\/g')\n\n"
     if [ "$CHK_RC" != 0 ] || [ -z "$CHK_OUT" ]; then
       CHK_WHY="rc=$CHK_RC"
-      [ "$CHK_RC" = 124 ] && CHK_WHY="rc=124(상한 40s 초과)"
+      [ "$CHK_RC" = 124 ] && CHK_WHY="rc=124(상한270s/cleanup 포함)"
       [ -z "$CHK_OUT" ] && CHK_WHY="$CHK_WHY · 출력 없음"
       CHK_TAIL=""
       [ -s "$_CHK_ERR" ] && CHK_TAIL=$(tail -n 5 "$_CHK_ERR" | tr -d '\r' | tr '\n' ' ' | head -c 1024 | sed 's/\\/\\\\/g')
@@ -387,6 +509,9 @@ if [ "$SOURCE" != "compact" ] && [ -n "$STATE" ]; then
   fi
 fi
 
+
+;;
+post)
 # ---------- 복원 모드 신호 (순환의존 해소 — 모순 1) ----------
 # ★U13(0.14.41): lead(master·cso*)는 종전 문안 **바이트 동일** · member·역할 미상은 착수 게이트 1줄(단일 원본
 #   `_lib.sh:cys_start_gate_note`). compact(자동 압축 직후)는 진행 중 턴의 연속이지 새 착수가 아니므로
@@ -405,6 +530,9 @@ case "$SOURCE" in
 esac
 fi
 
+# Commit the source-specific restore note before optional RSI reads/filters.
+printf 'OUT\0%s\0' "$OUT"
+
 # ---------- RSI 자산 자동 주입 (오너 자동트리거 · startup/resume · master 결정 D1=4·D2=포인터) ----------
 if { [ "$SOURCE" = "startup" ] || [ "$SOURCE" = "resume" ]; } && [ -n "$STATE" ]; then
   RSI_DIR="$(dirname "$STATE")"   # ledger 는 SESSION_STATE 와 동일 _round (STATE_DIR 은 master 에서 프로젝트루트라 부적합)
@@ -420,6 +548,9 @@ if { [ "$SOURCE" = "startup" ] || [ "$SOURCE" = "resume" ]; } && [ -n "$STATE" ]
   fi
 fi
 
+
+;;
+bookkeeping)
 # ---------- ★계측(조건 12 · Phase1 B2): 주입 총 바이트 .state_log 1줄 — baseline 실측 확보 ----------
 # graceful: STATE(_round) 미확정이면 스킵 · 기록 실패도 주입 자체에 무영향.
 # G7f: 그룹화 { ...; } 2>/dev/null — `cmd >> f 2>/dev/null` 은 `>> f` 리다이렉션 자체가
@@ -430,5 +561,7 @@ if [ -n "$STATE" ]; then
   { echo "$(date -Iseconds 2>/dev/null || date)	SessionStart-inject	source=$SOURCE bytes=${INJ_BYTES:-0}" >> "$(dirname "$STATE")/.state_log"; } 2>/dev/null
 fi
 
-printf '%b' "$OUT"
+;;
+esac
+_c03_emit
 exit 0

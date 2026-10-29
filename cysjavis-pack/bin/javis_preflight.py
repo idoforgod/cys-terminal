@@ -41,6 +41,14 @@ _SELF_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SELF_DIR not in sys.path:
     sys.path.append(_SELF_DIR)
 
+from _owned_process import CANCEL as _CANCEL, run_owned, managed_main, is_managed as _managed_active
+
+
+def _cancel_fence():
+    if _CANCEL.is_set():
+        raise RuntimeError('diagnostic cancelled; unmeasured')
+
+
 # ★공용 크로스플랫폼 락·원자쓰기(W1a 신설 javis_lock → W3 소비 이관 · G16).
 #   import 실패(팩 스큐·부분 배포)는 preflight 를 죽이지 않는다 — None 이면 `_settings_rmw` 가
 #   mkstemp 인라인 폴백으로 강등한다(직렬화만 상실·등록은 계속).
@@ -5296,88 +5304,20 @@ class Preflight:
 
     @staticmethod
     def _run_skillscan_all(scan_tool, timeout_s):
-        """`javis_skillscan.py all --json` 을 **자기 프로세스 그룹**에서 돌리고 자손을 남기지 않는다.
-
-        반환: (returncode, stdout, stderr, timed_out, cleanup)
-        cleanup = {state: verified_empty | survivors | unknown, reason: 관측/오류}.
-
-        ★WP18 R2 MAJOR 2(codex r1 · 이 좌석이 실측 재현): `subprocess.run(timeout=20)` 은 **직속
-          자식만** 죽인다. 0.14.53 부터 스캐너가 ProcessPoolExecutor 를 쓰므로 그 워커들은 부모가
-          죽은 뒤에도 살아 계속 돈다 — 실측: 워커 2개가 시작 30초 뒤(preflight 가 타임아웃을 보고한
-          **10초 뒤**)에 자기 작업을 끝내고 완료 표식을 썼다. 그리고 그 워커들은 **이름으로 못 찾는다**
-          (spawn 워커의 명령줄은 `python -c …` 이고 javis_skillscan.py 가 아니다 — 내 첫 탐지기가
-          `pgrep -f javis_skillscan.py` 로 0 을 세고 "잔존 없음" 을 거짓 보고했다). 유일하게 믿을 수
-          있는 손잡이는 **우리가 이 자식에게 만들어 준 프로세스 그룹**이다.
-          집 안의 선례를 그대로 따른다 — `javis_completion_guard._popen_group`(POSIX setsid+killpg /
-          Windows CREATE_NEW_PROCESS_GROUP + `taskkill /T /F`). ★Windows 경로는 **UNMEASURED**다
-          (이 호스트에 윈도우가 없다) — 수단만 선례와 동일하게 배선한다.
-          R3: 파괴 신호는 자식을 reap 하기 전에만 보낸다. communicate 뒤의 숫자 pgid는
-          재사용될 수 있으므로 관측 권한만 있고 종료 권한은 없다. 관측 실패는 빈 그룹이 아니다.
-        """
-        kw = {}
-        if os.name == "posix":
-            kw["start_new_session"] = True            # setsid — 그룹 리더로 스폰
-        else:
-            kw["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        proc = subprocess.Popen([sys.executable, scan_tool, "all", "--json"],
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                stdin=subprocess.DEVNULL, text=True, **kw)
-        try:
-            out, err = proc.communicate(timeout=timeout_s)
-            return proc.returncode, out, err, False, {"state": "unknown", "reason": "not requested"}
-        except subprocess.TimeoutExpired:
-            pass
-        # The timed-out child is still unreaped: retain this identity through ALL kills.
-        outcomes = []
-        if os.name == "posix":
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-                outcomes.append("killpg SIGKILL sent")
-            except OSError as exc:
-                outcomes.append("killpg %s errno=%s" % (type(exc).__name__, exc.errno))
-        else:
-            try:
-                killed = subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
-                                        capture_output=True, text=True, timeout=5)
-                outcomes.append("taskkill rc=%s stderr=%s" %
-                                (killed.returncode, (killed.stderr or "")[-200:]))
-            except Exception as exc:
-                outcomes.append("taskkill %s: %s" % (type(exc).__name__, str(exc)[:200]))
-            try:
-                proc.kill()  # Windows Popen owns a process HANDLE; still before communicate/reap.
-                outcomes.append("parent kill requested")
-            except Exception as exc:
-                outcomes.append("parent kill %s: %s" % (type(exc).__name__, str(exc)[:200]))
-        # No destructive operation below this point: communicate may release the numeric identity.
-        try:
-            out, err = proc.communicate(timeout=5)
-        except Exception as exc:
-            out, err = "", ""
-            outcomes.append("communicate %s: %s" % (type(exc).__name__, str(exc)[:200]))
-        state = "unknown"
-        if os.name == "posix":
-            try:
-                os.killpg(proc.pid, 0)
-                if proc.returncode is None:
-                    state = "survivors"
-                    outcomes.append("owned group still present")
-                else:
-                    outcomes.append("numeric group present after identity release; ownership unknown")
-            except OSError as exc:
-                if exc.errno == errno.ESRCH:
-                    state = "verified_empty"
-                    outcomes.append("killpg probe ESRCH")
-                else:
-                    outcomes.append("killpg probe %s errno=%s" % (type(exc).__name__, exc.errno))
-        else:
-            outcomes.append("Windows owned-tree observation UNMEASURED")
-        cleanup = {"state": state, "reason": "; ".join(outcomes)}
-        return proc.returncode, out or "", err or "", True, cleanup
+        """Owned scanner session; completion and kernel termination are separate."""
+        _cancel_fence()
+        result = run_owned([sys.executable, '-B', scan_tool, 'all', '--json'],
+                           timeout_s, grace=5, force=5, cancel=_CANCEL)
+        code = result['returncode'] if result['complete'] else 125
+        cleanup = {'state': ('verified_empty' if result['cleanup'] == 'verified_empty'
+                             else 'unknown'), 'reason': result['cleanup'] + ': ' + result['reason']}
+        return (code, result['stdout'], result['stderr'], result['timed_out'], cleanup)
 
     def c60_gate_wiring(self):
         cid = "C60.gate-wiring"
         if self.skipped(cid):
             return
+        _cancel_fence()
         probs, warns = [], []
         # (a) G3 재주입 게이트 배선 — hook이 게이트를 실제로 경유하는가
         hook = os.path.join(pack_dir(), "hooks", "inject-context.sh")
@@ -5389,11 +5329,13 @@ class Preflight:
         if not (os.path.isfile(gate) and "inject_gate.py" in hook_txt):
             probs.append("재주입 포이즌 게이트 미배선(hooks/inject_gate.py + inject-context.sh _gate)")
         # (b) memory 포이즌 스캐너 로드 가능 — 다운이면 부트 FAIL(fail-closed 층)
+        _cancel_fence()
         r = subprocess.run(
             [sys.executable, "-c",
              "import sys; sys.path.insert(0, %r); import javis_memory as m; "
              "sys.exit(0 if m._skillscan is not None else 3)" % os.path.join(pack_dir(), "bin")],
             capture_output=True, timeout=60)
+        _cancel_fence()
         if r.returncode != 0:
             probs.append("memory 포이즌 스캐너 다운(_skillscan=None · fail-open 상태)")
         # (c) skillscan 집행 스캔(전 스킬 정적·~6s 실측) — BLOCK verdict는 정지경계 정책
@@ -5403,32 +5345,12 @@ class Preflight:
         acked_note = ""
         try:
             scan_tool = os.path.join(pack_dir(), "bin", "javis_skillscan.py")
-            # ★C7 상한 서열 — innermost-smallest(WP18 · 2026-10-24). 이 스캔은 겹겹의 상한
-            #   **안쪽**에서 돈다: ⓐ SessionStart 훅 inject-context.sh:352 의 `timeout 40`
-            #   (★macOS 에는 timeout(1) 이 없어 이 겹이 아예 없다 — 실측) → ⓑ
-            #   javis_checklist.py PREFLIGHT_TIMEOUT=30 → ⓒ 여기. 종전 120 은 바깥보다
-            #   커서 훅 경로에서 **발화 불가**였다(40>30>120): preflight 가 30 에 먼저
-            #   죽으니 스캔이 자기 실패를 말할 기회가 없었다.
-            #   ★R2 정정(codex r1 MINOR · 종전 문면은 과대주장이었다): 20<30 은 「어느 경로에서도
-            #   스캔이 자기 사유를 말한다」를 **보장하지 않는다**. 위 수들은 각기 **호출 1건에
-            #   설정된 상한**이고, ⓑ 의 30 은 preflight **전체**를 덮는 경과 예산이다 — 앞선 검사들
-            #   (memory 스캐너 probe 60s 포함)이 먼저 시간을 쓰면 스캔이 시작될 때 남은 창이 20s
-            #   보다 **작을 수 있다**. 그러면 체크리스트가 preflight 를 먼저 죽이고, 그 경우
-            #   **이 검사의 except 가 돌지 않으므로** 스캔 자신의 사유도, 아래 그룹 정리도 일어나지
-            #   않는다(→ 그때의 스캐너·풀 워커는 체크리스트의 몫이다 · javis_checklist.py 는
-            #   이 티켓 범위 밖이라 고치지 않고 **남은 구멍으로 보고**한다).
-            #   따라서 이 숫자가 보장하는 것은 하나다: **스캔이 자기 창 안에서 끝나지 못하면 그
-            #   사실을 자기가 적고 자손을 정리한다**(preflight 가 살아 있는 동안).
-            #   여유는 평균이 아니라 **실측 분포**로 잡는다 — 병렬 런의 바닥은
-            #   max(최장 스킬, 총합/워커수)이고 이 호스트 실측에서 최장 스킬(insane-search)
-            #   혼자 1.99s, 114 스킬 총합 11.5s ⇒ 바닥 ≈1.99s. 20s = 그 바닥의 약 10배.
-            #   ★바닥이 아니라 **부하 실측**과 대면 여유는 더 작다(정직하게 둘 다 적는다):
-            #     worker-2 가 부하 중(load 8.16/16 · fileproviderd 가 코어 하나 점유)에 잰
-            #     같은 병렬 스캔은 median 5,696 ms · max 6,077 ms 였다 ⇒ 20s 는 그 최악
-            #     관측의 3.3배다. 이 기계의 한가한 값(1.6~1.7s)만 보고 상한을 정하지 마라.
-            #   풀 기동 실패로 직렬 폴백이면 0.069s/스킬 ⇒ 20s 는 약 288 스킬까지 든다.
+            # Execution 20s + cleanup10 fits checklist's 240s service deadline.
+            # The outer owner can still cancel first; EOF then closes the entire chain.
+            _cancel_fence()
             _rc, _out, _err, _timed_out, _cleanup = self._run_skillscan_all(
                 scan_tool, self.SKILLSCAN_SCAN_TIMEOUT_S)
+            _cancel_fence()
             if _timed_out:
                 # ★C6/C7/R2: 상한 안에 **끝나지 못한 것**이다 — 느린 호스트·고부하의 상한 초과이고,
                 #   BLOCK 판정도 파싱 실패도 아니다. 처방으로 --fix 를 적지 않는다(수리할 결함이
@@ -5476,10 +5398,12 @@ class Preflight:
                 for s in blocked:
                     fp = None
                     if s in acks:
+                        _cancel_fence()
                         rc = subprocess.run(
                             [sys.executable, scan_tool, "card",
                              os.path.join(pack_dir(), "skills", s), "--json"],
                             capture_output=True, text=True, timeout=60)
+                        _cancel_fence()
                         try:
                             fp = json.loads(rc.stdout).get("fingerprint")
                         except (json.JSONDecodeError, ValueError):
@@ -5518,14 +5442,17 @@ class Preflight:
             changed = []
             for f in snaps[:10]:
                 skill = os.path.join(pack_dir(), "skills", f[:-5])
+                _cancel_fence()
                 r = subprocess.run(
                     [sys.executable, os.path.join(pack_dir(), "bin", "javis_mcpgate.py"),
                      "diff", skill, "--store", store, "--json"],
                     capture_output=True, text=True, timeout=60)
+                _cancel_fence()
                 if r.returncode != 0:
                     changed.append(f[:-5])
             if changed:
                 probs.append("mcpgate diff 변경 감지(rug-pull 의심): %s" % ", ".join(changed))
+        _cancel_fence()
         if probs:
             self.add(cid, FAIL, " | ".join(probs + warns))
         elif warns:
@@ -7095,10 +7022,17 @@ class Preflight:
 
     def _run_check_isolated(self, check):
         """병렬 워커: 이 체크의 add() 를 스레드-로컬 버퍼로 격리 수집해 반환한다."""
+        if _CANCEL.is_set():
+            return [{'id': 'cancelled', 'status': SKIP, 'detail': 'diagnostic cancelled', 'unmeasured': True}]
         buf = []
         self._local.sink = buf
         try:
-            check()
+            try:
+                check()
+            except RuntimeError:
+                if not _CANCEL.is_set():
+                    raise
+                buf.append({'id': 'cancelled', 'status': SKIP, 'detail': 'diagnostic cancelled', 'unmeasured': True})
         finally:
             self._local.sink = None
         return buf
@@ -7493,6 +7427,8 @@ def _trusted_exact(data, cwd_key):
 
 def _run_capture(cmd, timeout=15):
     """subprocess 러너 — (rc, stdout, stderr). 예외도 rc 127 로 정규화(판정 불가 → 호출자가 None 으로 접는다)."""
+    if _CANCEL.is_set():
+        return 127, '', 'diagnostic cancelled; unmeasured'
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         return p.returncode, p.stdout or "", p.stderr or ""
@@ -10632,6 +10568,9 @@ def _only_usage_exit(json_mode, mode, detail):
 
 
 def main():
+    if _managed_active() and any(x in sys.argv[1:] for x in ('--self-test', '--seed-trust')):
+        print('managed preflight requires report mode', file=sys.stderr)
+        return 125
     # --self-test 가로채기 — argparse 앞(팩 bin 도구 관례: 인자 스키마와 독립인 자기검증 채널).
 
     if "--self-test" in sys.argv[1:]:
@@ -10665,6 +10604,11 @@ def main():
     mode = ("safe" if args.safe else "dry" if args.dry_run
             else "fix" if args.fix else "report")
 
+    # Validate the parsed mode, including argparse abbreviations such as --fi.
+    if _managed_active() and (mode != "report" or args.allow_irreversible):
+        print('managed preflight requires report mode', file=sys.stderr)
+        return 125
+
     pf = Preflight(fix=args.fix, skips=args.skip, mode=mode,
                    allow_irreversible=args.allow_irreversible, only=args.only)
     # ★성찰 P5: `--only` 가 아무것도 재지 못한 실행은 **판정을 내지 않는다**(rc 2 사용법 오류).
@@ -10679,6 +10623,9 @@ def main():
             args.json, mode,
             "--only %s 로 실행했으나 기록된 검사 행이 0 이다 — 그 id 를 내는 검사가 없다(오타?). "
             "검사 0 인 실행은 READY 가 아니다" % ", ".join(args.only))
+    if _CANCEL.is_set():
+        print('preflight: INCOMPLETE — cancelled; not READY')
+        return 125
     fails = sum(1 for r in results if r["status"] == FAIL)
 
     warns = sum(1 for r in results if r["status"] == WARN)
@@ -10732,4 +10679,4 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(managed_main(main))

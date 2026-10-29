@@ -121,6 +121,16 @@ jobs:
             --app-version "$(grep -m1 '"version"' src-tauri/tauri.conf.json | sed -E 's/.*"([0-9][0-9.]*)".*/\1/')" \
             --source win-src
 
+      - name: C-03 owned process native Windows (bundled Python)
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Native Job/spawn/no-console tests; local macOS skips are not evidence.
+          # -B protects the staged runtime and pack from bytecode writes.
+          C03_TEST_BASH="$(cygpath -w "$PWD/src-tauri/runtime/git/bin/bash.exe")" src-tauri/runtime/python/python.exe -B -u cysjavis-pack/bin/tests/test_owned_process.py
+
+
       - name: Build Windows x64 (Tauri → NSIS setup.exe)
         shell: bash
         env:

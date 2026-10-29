@@ -857,7 +857,125 @@ def cmd_scan(path, as_json):
     return exit_for(r["verdict"])
 
 
+# This import arms no watcher in ordinary standalone invocations.
+sys.dont_write_bytecode = True
+_SELF_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SELF_DIR not in sys.path:
+    sys.path.append(_SELF_DIR)
+from _owned_process import CANCEL as _CANCEL, managed_main, worker_observer, pool_initializer_args, is_managed
+
+# [0.14.56 C-03 E(ii)] A pool that never becomes ready must not stall the scan, and stopping the pool must
+# never wait for a worker to leave on its own (design r2 d4af60af; measured on macOS 3.9.6 / 3.12.13 / 3.14.7,
+# Windows UNMEASURED).
+#   * ready probe + start deadline: no worker ready within POOL_START_DEADLINE_S -> the serial fallback below.
+#   * bounded stop, kill first: terminate, then kill, the executor's OWN workers, waiting on their sentinels with
+#     the remaining time; shutdown() runs last, only with zero survivors, on a helper thread joined for one phase.
+#     Why: after a worker dies, CPython 3.12/3.14 terminate_broken() holds the executor's _shutdown_lock across an
+#     unbounded p.join() on every worker, so a shutdown() before the kills deadlocks behind a worker that
+#     outlives terminate() (reproduced: HUNG 6/6); the manager thread is released by worker sentinels, not by
+#     shutdown().
+#   * a survivor (or a blocked shutdown) marks the pool unbounded; the unmanaged CLI then ends by os._exit after
+#     flushing (cli_main), because interpreter exit would join the survivor; a managed run is bounded by its owner.
+POOL_START_DEADLINE_S = 5.0   # provisional: set from the Windows healthy start time (M-D1(c), not yet measured)
+POOL_STOP_PHASE_S = 1.0
+_POOL_UNBOUNDED = False
+
+
+def _pool_ready_probe():
+    return os.getpid()
+
+
+def _pool_worker_ended(proc):
+    from multiprocessing.connection import wait
+    return bool(wait([proc.sentinel], 0))
+
+
+def _pool_wait_ended(procs, until):
+    # connection.wait returns when ANY sentinel is ready: re-wait on the remaining ones with the remaining time.
+    import time
+    from multiprocessing.connection import wait
+    left = [p for p in procs if not _pool_worker_ended(p)]
+    while left:
+        remaining = until - time.monotonic()
+        if remaining <= 0:
+            break
+        wait([p.sentinel for p in left], remaining)
+        left = [p for p in left if not _pool_worker_ended(p)]
+    return left
+
+
+def _bounded_pool_stop(ex):
+    """End this executor's own workers without waiting for them; returns True when the stop is bounded."""
+    import threading
+    import time
+    table = getattr(ex, '_processes', None)
+    if table is None:
+        print("[skillscan] 풀 정지 불가(이 Python 에 작업자 표가 없다) — unbounded, 소유자 상한이 끝낸다.", file=sys.stderr)
+        return False
+    procs = list(table.values())
+    left = [p for p in procs if not _pool_worker_ended(p)]
+    for p in left:
+        try:
+            p.terminate()
+        except OSError:
+            pass
+    left = _pool_wait_ended(left, time.monotonic() + POOL_STOP_PHASE_S)
+    for p in left:
+        try:
+            p.kill()
+        except OSError:
+            pass
+    left = _pool_wait_ended(left, time.monotonic() + POOL_STOP_PHASE_S)
+    for p in procs:
+        if p not in left:
+            try:
+                p.join(0)
+            except (OSError, ValueError):
+                pass
+    if left:
+        print("[skillscan] 풀 작업자 %d개가 terminate·kill 뒤에도 남았다 — unbounded, 소유자 상한이 끝낸다."
+              % len(left), file=sys.stderr)
+        return False
+    helper = threading.Thread(target=lambda: ex.shutdown(wait=False, cancel_futures=True), daemon=True)
+    helper.start()
+    helper.join(POOL_STOP_PHASE_S)
+    if helper.is_alive():
+        print("[skillscan] 풀 shutdown 이 막혔다 — unbounded, 소유자 상한이 끝낸다.", file=sys.stderr)
+        return False
+    return True
+
+
+def _scan_with_pool(skills):
+    import concurrent.futures as _cf
+    import time
+    global _POOL_UNBOUNDED
+    ex = _cf.ProcessPoolExecutor(max_workers=min(8, (os.cpu_count() or 4)),
+                                 initializer=worker_observer, initargs=pool_initializer_args())
+    try:
+        probe = ex.submit(_pool_ready_probe)
+        futures = [ex.submit(scan_skill, s) for s in skills]
+        deadline = time.monotonic() + POOL_START_DEADLINE_S
+        while True:
+            if _CANCEL.is_set():
+                raise RuntimeError('cancelled during the pool start')
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError('start deadline %.1f s: no pool worker became ready' % POOL_START_DEADLINE_S)
+            done, _ = _cf.wait([probe], timeout=min(0.25, remaining))
+            if done:
+                break
+        probe.result()
+        return [f.result() for f in futures]
+    finally:
+        if not _bounded_pool_stop(ex):
+            _POOL_UNBOUNDED = True
+
+
 def cmd_all(roots, as_json):
+    global _POOL_UNBOUNDED
+    _POOL_UNBOUNDED = False
+    if _CANCEL.is_set():
+        return 125
     skills = []
     for root in roots:
         if not os.path.isdir(root):
@@ -869,29 +987,36 @@ def cmd_all(roots, as_json):
     # [cys-parallel-skillscan] 2026-10-24 worker-2: scan_skill is independent CPU-bound work
     # (regex/AST/taint) and the GIL is enabled, so this must be processes, not threads.
     # ProcessPoolExecutor.map preserves INPUT order, so results[] ordering is unchanged.
-    # Falls back to the original serial comprehension if a pool cannot be created.
+    # Falls back to the original serial comprehension if a pool cannot be created, breaks, or has no worker
+    # ready within POOL_START_DEADLINE_S (E(ii)); the pool's workers are always ended by _bounded_pool_stop.
     # ★워커 수 상한의 근거 — 더 많은 워커가 더 빠르지 않다(실측 2건, 둘 다 반증):
     #   · worker-2 census(2026-10-24, 이 호스트): ProcessPool(16) 9,098 ms(8보다 나쁨) ·
     #     ThreadPool(16) 10,552 ms(직렬보다 느림 — GIL 켜짐 CPython 3.14.7, 이 일은 CPU 바운드).
     #   · worker-9 sweep(2026-10-24, 같은 호스트 · 114 스킬 · 스캐너 1c23c26c + 규칙 5432b790):
     #     4=2.284/2.289 s · 8=1.697/1.707 s · 12=1.703/1.677 s · 16=1.764/1.760 s ⇒ 무릎이 8.
     #   ⇒ 상한을 올리는 변경은 이 두 수치를 다시 재서 뒤집은 다음에만 한다.
-    try:
-        import concurrent.futures as _cf
-        with _cf.ProcessPoolExecutor(max_workers=min(8, (os.cpu_count() or 4))) as _ex:
-            results = list(_ex.map(scan_skill, skills))
-    except Exception as _pool_err:
-        # ★폴백은 worker-2 가 자기 티켓에서 벗어나 일부러 넣은 것이고(풀이 못 뜨는 환경에서
-        #   레인 전체의 부트를 깨뜨리지 않으려고) 그대로 유지한다. WP18 이 더한 것은 **한 줄의
-        #   고지**다: 종전엔 조용히 느린 경로로 내려가, 풀이 영영 못 뜨는 기계에서 아무도 그
-        #   사실을 모른 채 8초를 계속 쓰게 됐다(BAR S5 "serial fallback with a stderr note,
-        #   or a loud failure — say which" 의 앞쪽을 고른다). stdout 은 건드리지 않으므로
-        #   출력 동일성(S1)과 무관하다 — 고지는 stderr 로만 간다.
-        #   ★이 except 가 넓은 것은 안전하다: 폴백이 전수를 다시 계산하므로 scan_skill 자체의
-        #   진짜 버그는 삼켜지지 않고 직렬 재실행에서 그대로 올라온다.
-        print("[skillscan] 병렬 풀 기동 실패(%s: %s) — 직렬로 폴백한다(결과는 같고 느리다)."
-              % (type(_pool_err).__name__, _pool_err), file=sys.stderr)
-        results = [scan_skill(s) for s in skills]
+    # E(ii): the pool, its start deadline and its bounded stop live in _scan_with_pool (above).
+    if not skills:
+        results = []
+    else:
+        try:
+            results = _scan_with_pool(skills)
+        except Exception as _pool_err:
+            if _CANCEL.is_set():
+                return 125
+            # ★폴백은 worker-2 가 자기 티켓에서 벗어나 일부러 넣은 것이고(풀이 못 뜨는 환경에서
+            #   레인 전체의 부트를 깨뜨리지 않으려고) 그대로 유지한다. WP18 이 더한 것은 **한 줄의
+            #   고지**다: 종전엔 조용히 느린 경로로 내려가, 풀이 영영 못 뜨는 기계에서 아무도 그
+            #   사실을 모른 채 8초를 계속 쓰게 됐다(BAR S5 "serial fallback with a stderr note,
+            #   or a loud failure — say which" 의 앞쪽을 고른다). stdout 은 건드리지 않으므로
+            #   출력 동일성(S1)과 무관하다 — 고지는 stderr 로만 간다.
+            #   ★이 except 가 넓은 것은 안전하다: 폴백이 전수를 다시 계산하므로 scan_skill 자체의
+            #   진짜 버그는 삼켜지지 않고 직렬 재실행에서 그대로 올라온다.
+            print("[skillscan] 병렬 풀 기동 실패(%s: %s) — 직렬로 폴백한다(결과는 같고 느리다)."
+                  % (type(_pool_err).__name__, _pool_err), file=sys.stderr)
+            results = [scan_skill(s) for s in skills]
+    if _CANCEL.is_set():
+        return 125
     worst = max((SEV_ORDER.get(r["severity"], 3) * -1 for r in results), default=0)
     summary = {"scanned": len(results),
                "by_verdict": {v: sum(1 for r in results if r["verdict"] == v) for v in ("ACCEPT", "REVISE", "BLOCK")},
@@ -1014,5 +1139,28 @@ def main():
     return 2
 
 
+def cli_main():
+    """CLI entry. A pool left unbounded (a worker survived the stop, or shutdown blocked) would make interpreter exit
+    join that worker forever, so an unmanaged run then flushes and ends by os._exit. A managed run never returns from
+    managed_main (Managed.finish waits for the owner), and the owner's timeout bounds it."""
+    try:
+        rc = managed_main(main)
+    except BaseException as exc:
+        if _POOL_UNBOUNDED and not is_managed():
+            if isinstance(exc, SystemExit):
+                code = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
+            else:
+                import traceback
+                traceback.print_exc()
+                code = 1
+            sys.stdout.flush(); sys.stderr.flush()
+            os._exit(code)
+        raise
+    if _POOL_UNBOUNDED and not is_managed():
+        sys.stdout.flush(); sys.stderr.flush()
+        os._exit(rc if isinstance(rc, int) else 0)
+    return rc
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(cli_main())
