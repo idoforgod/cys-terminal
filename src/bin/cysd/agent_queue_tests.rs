@@ -1257,3 +1257,212 @@ fn wp17_r2_upper_draft_marker_row_zero_counter_blocks_before_ledger() {
         assert_eq!(queue_len(&s), 0);
     }
 }
+
+// ─── ★(0.14.56 · P1 D9 pre-CR · design r3 §6) master/CEO queue jobs: the R-1 window (hand-off -> first byte) is CHECKED at the
+//   writer's claim (§6-2); the body -> CR settle is ELIMINATED by construction (§6-3). Recorder seats: the receiver's bytes are exact. ──
+
+/// A recorder seat that is this daemon's `master` and an agent seat, so `d9_scope` holds; its receiver proof always admits.
+fn d9_master_recorder(fx: &Fx, tag: &str) -> (Arc<Surface>, std::path::PathBuf) {
+    let (s, out) = recorder_seat(fx, tag);
+    fx.daemon.roles.lock().unwrap().insert("master".into(), s.id);
+    *s.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+    *s.receiver_proof.lock().unwrap() = Some(Scripted::new(0, ProofLoss::AgentDead, None));
+    assert!(crate::governance::d9_scope(&fx.daemon, &s, false), "premise: the seat is in D9 scope");
+    (s, out)
+}
+
+/// Holds the seat's writer inside a job's own admission (after that job's claim, before any byte) until released, then
+/// refuses it: zero bytes, so the holder itself moves none of the three counters.
+struct HoldWriter {
+    entered: std::sync::mpsc::Sender<()>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl Proof for HoldWriter {
+    fn admit(&self) -> Result<(), ProofLoss> {
+        let _ = self.entered.send(());
+        let _ = self.release.lock().unwrap().recv_timeout(Duration::from_secs(10));
+        Err(ProofLoss::Unknown("test:hold_writer".into()))
+    }
+    fn recheck(&self, _: Phase) -> Result<(), ProofLoss> {
+        Ok(())
+    }
+}
+
+/// Puts a [`HoldWriter`] job at the front of the seat's writer FIFO and waits until the writer is inside it.
+fn hold_writer(s: &Arc<Surface>) -> std::sync::mpsc::Sender<()> {
+    let (entered, observed) = std::sync::mpsc::channel();
+    let (release, wait) = std::sync::mpsc::channel();
+    let job = crate::agent_write::AgentJob {
+        attempt: None,
+        request: crate::agent_write::Request::new(crate::agent_write::new_request_id(1), s.id, "test", crate::delivery::digest_text("hold")),
+        plan: crate::agent_write::Plan::paste("hold"),
+        proof: Arc::new(HoldWriter { entered, release: Mutex::new(wait) }),
+        journal: None,
+        resume: None,
+        settle: None,
+        guard: None,
+        note_body: false,
+        body_owner: None,
+    };
+    s.write_tx.send(crate::state::WriteReq::Agent(Box::new(job))).unwrap();
+    observed.recv_timeout(Duration::from_secs(5)).expect("premise: the writer is held inside the job ahead");
+    release
+}
+
+/// The `queue.inject_aborted` events of one seat.
+fn aborted(fx: &Fx, s: &Arc<Surface>) -> Vec<Value> {
+    seat_events(fx, s, "queue.inject_aborted")
+}
+
+/// T-W1 (design r3 §12; §6-2 `wrote`): a write queued AHEAD of a master queue job is written between the job's hand-off and its
+/// claim (here a terminal-reply-like `Data` request, the render-lag case: bytes on the PTY the screen may not show yet). The claim
+/// refuses: 0 bytes of the job reach the receiver, the item stays at the head, and the next attempt delivers it exactly once.
+/// Mutant: drop `wrote` from the claim check.
+#[test]
+#[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+fn d9_pre_cr_t_w1_a_write_ahead_inside_the_r1_window_refuses_the_claim() {
+    let fx = fx("d9-tw1");
+    let (s, out) = d9_master_recorder(&fx, "tw1");
+    let id = enqueue(&fx, &s, "[보고] tw1");
+    let release = hold_writer(&s);
+    s.write_tx.send(crate::state::WriteReq::Data(b"T".to_vec())).unwrap();
+    let w0 = s.inject_track.wrote();
+    let releaser = {
+        let s = s.clone();
+        std::thread::spawn(move || {
+            wait_until("the job is handed off", || s.inject_reserved());
+            release.send(()).unwrap();
+        })
+    };
+    let handed = hand_off(&fx, &s);
+    releaser.join().unwrap();
+    wait_until("the writer is idle", || s.write_tx.gate().pending() == 0);
+    assert!(!handed, "the claim after a write ahead inside the R-1 window must be refused");
+    assert_eq!(std::fs::read(&out).unwrap(), b"T".to_vec(), "only the write ahead reached the receiver (0 bytes of the job)");
+    assert_eq!(s.inject_track.wrote(), w0 + 1, "premise: exactly the write ahead was counted");
+    assert_eq!(s.pending_queue.lock().unwrap().front().map(|e| e.id.clone()), Some(id.clone()), "the item stays at the head");
+    let ab = aborted(&fx, &s);
+    assert_eq!(ab.len(), 1, "{ab:?}");
+    assert_eq!(ab[0]["payload"]["foreign"], serde_json::json!(["wrote"]), "only the write count moved: {ab:?}");
+    assert!(events(&fx, "queue.delivered").is_empty());
+    // The next attempt is a fresh judgement: delivered once.
+    assert!(hand_off(&fx, &s), "the next attempt hands off");
+    wait_until("delivered", || queue_len(&s) == 0);
+    let mut want = b"T".to_vec();
+    want.extend(queue_bytes("[보고] tw1"));
+    wait_until("receiver got the job", || std::fs::metadata(&out).map(|m| m.len() as usize).unwrap_or(0) >= want.len());
+    let _ = s.child.lock().unwrap().kill();
+    assert_eq!(std::fs::read(&out).unwrap(), want, "the job's bytes once, after the write ahead");
+    let delivered = events(&fx, "queue.delivered");
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(delivered[0]["payload"]["queue_entry_id"], Value::from(id));
+}
+
+/// T-W2 (design r3 §12; §6-2 `last_human_input`, `input_gen`): a human key received between the hand-off and the claim of a master
+/// queue job (the writer is busy with a job ahead that writes nothing) -> the claim refuses: 0 bytes of the job, the key is
+/// written after it as queued, the item stays at the head. The key is Ctrl-U: it leaves the pending count at 0 (V2 resets on it,
+/// V3 ignores BS/DEL), so the pin's claim probe - which reads that count - lets the claim through; a Backspace on this V2 recorder
+/// seat would be counted and refused by the pin already (measured: RED-stageD1-on-24fe6a7b.log). Mutant: compare neither handler
+/// counter.
+#[test]
+#[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+fn d9_pre_cr_t_w2_a_human_key_inside_the_r1_window_refuses_the_claim() {
+    let fx = fx("d9-tw2");
+    let (s, out) = d9_master_recorder(&fx, "tw2");
+    let id = enqueue(&fx, &s, "[보고] tw2");
+    let release = hold_writer(&s);
+    let w0 = s.inject_track.wrote();
+    // The keystroke's RPC waits for its own write, which queues behind the job: release the held writer as soon as the
+    // handler has RECEIVED the key (stamp + count moved), never after its reply (that would wait on the held writer).
+    let (gen0, human0) = (s.input_gen.load(Ordering::Acquire), *s.last_human_input.lock().unwrap());
+    let keyer = {
+        let fx_daemon = fx.daemon.clone();
+        let s = s.clone();
+        std::thread::spawn(move || {
+            wait_until("the job is handed off", || s.inject_reserved());
+            let gen_at_handoff = s.input_gen.load(Ordering::Acquire);
+            let sid = s.id;
+            let rpc = std::thread::spawn(move || {
+                let req = cys::Request {
+                    id: Value::from(1),
+                    method: "surface.send_text".into(),
+                    params: serde_json::json!({"surface_id": sid, "text": "\u{15}", "human": true, "quiet": true}),
+                };
+                match crate::handlers::dispatch(&fx_daemon, req, None) {
+                    crate::handlers::Reply::Single(v) => v,
+                    _ => panic!("single reply"),
+                }
+            });
+            wait_until("the key is received", || {
+                *s.last_human_input.lock().unwrap() != human0 && s.input_gen.load(Ordering::Acquire) != gen_at_handoff
+            });
+            release.send(()).unwrap();
+            rpc.join().unwrap()
+        })
+    };
+    let handed = hand_off(&fx, &s);
+    let reply = keyer.join().unwrap();
+    wait_until("the writer is idle", || s.write_tx.gate().pending() == 0);
+    assert_ne!(s.input_gen.load(Ordering::Acquire), gen0, "premise: input accounting moved");
+    assert_eq!(reply["ok"], Value::from(true), "premise: the keystroke was received: {reply}");
+    assert!(!handed, "the claim after a human key inside the R-1 window must be refused");
+    assert_eq!(s.inject_track.wrote(), w0 + 1, "premise: only the key was written (after the refusal)");
+    assert_eq!(s.pending_input_bytes.load(Ordering::Relaxed), 0, "premise: the key left the pending count at 0");
+    assert_eq!(std::fs::read(&out).unwrap(), b"\x15".to_vec(), "0 bytes of the job reached the receiver");
+    assert_eq!(s.pending_queue.lock().unwrap().front().map(|e| e.id.clone()), Some(id), "the item stays at the head");
+    let ab = aborted(&fx, &s);
+    assert_eq!(ab.len(), 1, "{ab:?}");
+    assert_eq!(ab[0]["payload"]["foreign"], serde_json::json!(["input_gen", "last_human_input"]), "{ab:?}");
+    let _ = s.child.lock().unwrap().kill();
+}
+
+/// T-L1 (design r3 §6-3, premise specimen): a human byte received DURING the body -> CR settle of a master queue job reaches the
+/// receiver AFTER the job's own CR, and the job's body is submitted exactly (one writer job owns body, settle and CR; no other
+/// request is dequeued in between). The specimen asserts the byte was sent while the CR was still unwritten. Mutant: split the CR
+/// into its own later request.
+#[test]
+#[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+fn d9_pre_cr_t_l1_a_human_byte_during_the_settle_lands_after_the_cr() {
+    let fx = fx("d9-tl1");
+    crate::agent_write::set_test_sync_settle(false);
+    let (s, out) = d9_master_recorder(&fx, "tl1");
+    let body = "[보고] tl1";
+    enqueue(&fx, &s, body);
+    let want = queue_bytes(body);
+    let before_cr = want[..want.len() - 1].to_vec();
+    let sender = {
+        let fx_daemon = fx.daemon.clone();
+        let s = s.clone();
+        let out = out.clone();
+        let before_cr = before_cr.clone();
+        std::thread::spawn(move || {
+            wait_until("the body is on the wire", || std::fs::read(&out).unwrap_or_default() == before_cr);
+            let req = cys::Request {
+                id: Value::from(1),
+                method: "surface.send_text".into(),
+                params: serde_json::json!({"surface_id": s.id, "text": "Z", "human": true, "quiet": true}),
+            };
+            let reply = match crate::handlers::dispatch(&fx_daemon, req, None) {
+                crate::handlers::Reply::Single(v) => v,
+                _ => panic!("single reply"),
+            };
+            let inside_settle = std::fs::read(&out).unwrap_or_default() == before_cr;
+            (reply, inside_settle)
+        })
+    };
+    assert!(hand_off(&fx, &s), "premise: handed off");
+    let (reply, inside_settle) = sender.join().unwrap();
+    let mut expect = want.clone();
+    expect.push(b'Z');
+    wait_until("receiver got the job and the byte", || std::fs::metadata(&out).map(|m| m.len() as usize).unwrap_or(0) >= expect.len());
+    std::thread::sleep(Duration::from_millis(100));
+    // The discriminating assertion first (the receiver's bytes), then the settlement.
+    let got = std::fs::read(&out).unwrap();
+    assert_eq!(reply["ok"], Value::from(true), "premise: the byte was received: {reply}");
+    assert!(inside_settle, "premise: the human byte was sent while the job's CR was still unwritten");
+    assert_eq!(got, expect, "the job's body and CR exactly, then the human byte");
+    wait_until("delivered", || queue_len(&s) == 0);
+    let _ = s.child.lock().unwrap().kill();
+    assert_eq!(events(&fx, "queue.delivered").len(), 1);
+}

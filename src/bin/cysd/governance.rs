@@ -9998,6 +9998,7 @@ fn rollback_aborted_inject(
     s: &Arc<crate::state::Surface>,
     f: &InflightInject,
     delivered: &Delivered,
+    foreign: Vec<&'static str>,
 ) {
     let Some((still_queued, disposed)) = restore_inflight_marks(s, f) else { return };
     // ★(triage codex 보완) 사유·계수를 **관측 사실**로 적는다 — 종전 `restored` 는 재삽입 건수를
@@ -10011,6 +10012,10 @@ fn rollback_aborted_inject(
          되살리지 않는다)"
     } else if gen_moved {
         "output_gen_moved(판정이 본 프레임이 아니다 — writer 가 쓰기 전에 화면이 바뀌었다)"
+    } else if !foreign.is_empty() {
+        // ★(0.14.56 · P1 D9 pre-CR · design r3 §6-2) the master/CEO claim check refused.
+        "foreign_since_handoff(a write or an input reached this seat after the hand-off, before the first byte - 0 bytes; the \
+         next tick re-judges on a fresh frame)"
     } else {
         "guard_aborted(승인·관문 대기 또는 결판 마감 — 판정 재료가 더는 유효하지 않다)"
     };
@@ -10018,17 +10023,24 @@ fn rollback_aborted_inject(
         "queue.inject_aborted",
         "queue",
         Some(s.id),
-        json!({
-            "surface_ref": cys::surface_ref(s.id),
-            "queue_entry_id": delivered.entry.id,
-            "merged_ids": delivered.merged_ids,
-            // 되살린 수가 아니라 **지금 큐에 남아 있는 수**다(재삽입 없음).
-            "still_queued": still_queued.len(),
-            "disposed_ids": disposed,
-            "why": why,
-            "hint": "주입 0 · 항목은 큐에 그대로 있다(다음 틱 재시도). 처분됐으면 그 항목은 \
-                     묘비와 함께 정당하게 폐기된 것이며 되살리지 않는다",
-        }),
+        {
+            let mut p = json!({
+                "surface_ref": cys::surface_ref(s.id),
+                "queue_entry_id": delivered.entry.id,
+                "merged_ids": delivered.merged_ids,
+                // 되살린 수가 아니라 **지금 큐에 남아 있는 수**다(재삽입 없음).
+                "still_queued": still_queued.len(),
+                "disposed_ids": disposed,
+                "why": why,
+                "hint": "주입 0 · 항목은 큐에 그대로 있다(다음 틱 재시도). 처분됐으면 그 항목은 \
+                         묘비와 함께 정당하게 폐기된 것이며 되살리지 않는다",
+            });
+            // ★(0.14.56 · P1 D9 pre-CR) which counters the master/CEO claim check saw move; absent otherwise (other payloads unchanged).
+            if !foreign.is_empty() {
+                p["foreign"] = json!(foreign);
+            }
+            p
+        },
     );
     daemon.persist_queue_state();
 }
@@ -10116,6 +10128,9 @@ struct HandoffStamp {
     agent_epoch: u64,
     conversation_epoch: u64,
     human_at: Option<std::time::Instant>,
+    /// ★(0.14.56 · P1 D9 pre-CR · design r3 §6-2) The writer's write count AT THE HAND-OFF ([`crate::state::InjectTrack::wrote`]),
+    /// as [`QueueResume::wrote`] is at a hold: a request queued ahead of this one that writes before its claim moves it.
+    wrote: u64,
 }
 
 impl HandoffStamp {
@@ -10127,6 +10142,7 @@ impl HandoffStamp {
             agent_epoch: s.agent_epoch.load(Ordering::Acquire),
             conversation_epoch: s.conversation_epoch.load(Ordering::Acquire),
             human_at: *s.last_human_input.lock().unwrap_or_else(|e| e.into_inner()),
+            wrote: s.inject_track.wrote(),
         }
     }
     /// The seat is still on the hand-off's agent and conversation.
@@ -10134,6 +10150,57 @@ impl HandoffStamp {
         s.agent_epoch.load(Ordering::Acquire) == self.agent_epoch
             && s.conversation_epoch.load(Ordering::Acquire) == self.conversation_epoch
     }
+}
+
+/// ★(0.14.56 · P1 D9 pre-CR · design r3 §6-2) The R-1 window (hand-off -> first byte) of a master/CEO queue job, CHECKED at the
+/// writer's claim with the pin's own three-counter foreign-input test (the partial-write resume's, `try_resume_partial_write`):
+/// the baseline is taken at the hand-off under `input_gate`, after the job's own count mark, and set before the job can be
+/// claimed; the claim compares it with the counters now. Unset at the claim = refuse (fail closed).
+#[derive(Default)]
+struct D9Claim {
+    /// (`input_gen` after the job's own count mark, the hand-off stamp's `wrote`, its `human_at`).
+    base: std::sync::OnceLock<(u64, u64, Option<std::time::Instant>)>,
+    /// What moved, when the claim refused - read by [`rollback_aborted_inject`] for its report.
+    moved: std::sync::Mutex<Vec<&'static str>>,
+}
+
+impl D9Claim {
+    fn moved(&self) -> Vec<&'static str> {
+        self.moved.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+/// The claim probe of a master/CEO queue job: the seat's own probe first, always (its observation stays as at the pin), then the
+/// three counters against the hand-off baseline. A write by a request queued ahead (`wrote`), any input received (`input_gen`)
+/// and any human key (`last_human_input`) since the hand-off refuse the claim: 0 bytes, the item stays at the head, the next
+/// tick re-judges on a fresh frame.
+fn d9_claim_probe(s: &Arc<crate::state::Surface>, claim: Arc<D9Claim>, inner: crate::state::SafetyProbe) -> crate::state::SafetyProbe {
+    let ws = Arc::downgrade(s);
+    Arc::new(move || {
+        let blocked = inner();
+        // Runs on the writer thread: a panic must not escape.
+        let moved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let Some(s) = ws.upgrade() else { return vec!["seat"] };
+            let Some(&(input_gen, wrote, human_at)) = claim.base.get() else { return vec!["unstamped"] };
+            let mut moved = Vec::new();
+            if s.inject_track.wrote() != wrote {
+                moved.push("wrote");
+            }
+            if s.input_gen.load(Ordering::Acquire) != input_gen {
+                moved.push("input_gen");
+            }
+            if *s.last_human_input.lock().unwrap_or_else(|e| e.into_inner()) != human_at {
+                moved.push("last_human_input");
+            }
+            moved
+        }))
+        .unwrap_or_else(|_| vec!["panic"]);
+        if moved.is_empty() {
+            return blocked;
+        }
+        *claim.moved.lock().unwrap_or_else(|e| e.into_inner()) = moved;
+        true
+    })
 }
 
 /// ★(0.14.52 · S-a C7b) The resume material of a PartialExact queue hold (`QueueHold::resume`): what the SAME request
@@ -11036,6 +11103,8 @@ pub(crate) fn deliver_head_locked(
     let mut handed: Option<Arc<crate::agent_write::Request>> = None;
     // ★(0.14.52 · S-a C7a) A restored partially written head is adopted as held before any hand-off (outside the queue lock).
     adopt_persisted_write_hold(daemon, s);
+    // ★(0.14.56 · P1 D9 pre-CR · design r3 §6-2) A master/CEO target gets the claim check (scope read before the queue lock).
+    let d9_claim = d9_scope(daemon, s, false).then(|| Arc::new(D9Claim::default()));
     let delivered = 'tx: {
         // 이 임계영역은 더 이상 큐를 **바꾸지 않는다**(인계 결판 전에는 빼지 않는다 · 리뷰 R2).
         let q = s.pending_queue.lock().unwrap();
@@ -11258,6 +11327,10 @@ pub(crate) fn deliver_head_locked(
             });
             probe
         } else { safety_probe };
+        let safety_probe = match &d9_claim {
+            Some(c) => d9_claim_probe(s, c.clone(), safety_probe),
+            None => safety_probe,
+        };
         let guard = Some(std::sync::Arc::new(crate::state::InjectGuard::new(
             expect_output_gen,
             s.output_gen.clone(),
@@ -11319,6 +11392,10 @@ pub(crate) fn deliver_head_locked(
         let handle = request.clone();
         // ★(0.14.52 · S-a C7b) The epochs and last human keystroke this request is written under (S4-1 resume premises).
         let stamp = HandoffStamp::of(s, request.clone(), s.agent_proof(), guard.clone());
+        // ★(0.14.56 · P1 D9 pre-CR) the claim baseline, under `input_gate`, after the job's own count mark, before it can be claimed.
+        if let Some(c) = &d9_claim {
+            let _ = c.base.set((f.pending_gen, stamp.wrote, stamp.human_at));
+        }
         let job = crate::agent_write::AgentJob {
             attempt: None,
             request,
@@ -11393,7 +11470,7 @@ pub(crate) fn deliver_head_locked(
             match guard_outcome {
                 crate::state::InjectHandoff::CallerAborted => {
                     // 예약 해제는 롤백 **안**에서 표식 되돌림과 같은 임계영역에 있다(triage codex 보완).
-                    rollback_aborted_inject(daemon, s, &f, &delivered);
+                    rollback_aborted_inject(daemon, s, &f, &delivered, d9_claim.as_ref().map(|c| c.moved()).unwrap_or_default());
                     return None;
                 }
                 crate::state::InjectHandoff::CallerClaimed => {},
@@ -19552,7 +19629,7 @@ mod tests {
         s.set_pending_input(0);
         assert_eq!(esc_marker(&s), (0, 0), "전제: 인계 계상이 표식을 내렸다");
         let f = make_flight(prev, s.input_gen.load(AtomicOrdering::Acquire));
-        super::rollback_aborted_inject(&daemon, &s, &f, &delivered);
+        super::rollback_aborted_inject(&daemon, &s, &f, &delivered, Vec::new());
         assert_eq!(esc_marker(&s), (4242, 4242), "(가) 쓰이지 않은 인계의 롤백은 표식을 되살린다(줄은 인계 전 그대로)");
         // (나) 그 사이 다른 입력(세대 변화) — 되살리지 않는다(그 사실이 최신이다).
         let prev = s.take_esc_exempt();
@@ -19560,11 +19637,11 @@ mod tests {
         let f = make_flight(prev, s.input_gen.load(AtomicOrdering::Acquire));
         s.apply_pending_input(b"x", InputOrigin::Human);
         s.clear_pending_input();
-        super::rollback_aborted_inject(&daemon, &s, &f, &delivered);
+        super::rollback_aborted_inject(&daemon, &s, &f, &delivered, Vec::new());
         assert_eq!(esc_marker(&s), (0, 0), "(나) 세대가 흘렀으면 표식을 되살리지 않는다");
         // (다) 직전 표식이 없었으면(0) 되살릴 것도 없다.
         let f = make_flight(0, s.input_gen.load(AtomicOrdering::Acquire));
-        super::rollback_aborted_inject(&daemon, &s, &f, &delivered);
+        super::rollback_aborted_inject(&daemon, &s, &f, &delivered, Vec::new());
         assert_eq!(esc_marker(&s), (0, 0), "(다) 직전 표식 0 → 되살리지 않는다");
         kill_pid(s.pid);
     }
@@ -23297,7 +23374,7 @@ mod tests {
             body: e.text.clone(),
         };
         *s.inject_reservation.lock().unwrap() = None;
-        super::rollback_aborted_inject(&daemon, &s, &f, &delivered);
+        super::rollback_aborted_inject(&daemon, &s, &f, &delivered, Vec::new());
         assert!(
             s.pending_queue.lock().unwrap().is_empty(),
             "폐기·묘비된 항목이 중단 롤백으로 활성 큐 머리에 되살아났다 — 다음 틱에 그 문장이 배달된다"
@@ -23350,7 +23427,7 @@ mod tests {
             body: e.text.clone(),
         };
         *s.inject_reservation.lock().unwrap() = None;
-        super::rollback_aborted_inject(&daemon, &s, &f, &delivered);
+        super::rollback_aborted_inject(&daemon, &s, &f, &delivered, Vec::new());
         assert!(
             s.pending_queue.lock().unwrap().is_empty(),
             "만료된 항목이 활성 큐 머리로 되살아났다(§8) — 활성·만료 양쪽에 같은 id 가 있다"
@@ -32637,8 +32714,10 @@ mod h_machine_hold_tests {
     /// runs on Windows in the sibling specimens. Test renamed `_of_44` -> `_of_50` (the CI comment in windows-health.yml too).
     /// ★(0.14.52 · S-a C7d) 50 → **52**: class A (S21 withheld Return is Unix-only, `send_settle_applies`) +2 byte-exact
     /// withheld-Return accounting specimens (`send_settle_tests::c7d_*`). Renamed `_of_52`.
+    /// ★(0.14.56 · P1 D9 pre-CR stage D1) 55 → **58**: class C +3 recorder-seat claim-check specimens (`agent_queue_tests::d9_pre_cr_*`).
+    /// Renamed `_of_58` (the CI comment in windows-health.yml too).
     #[test]
-    fn r2f_dm_windows_ignore_attributes_are_exactly_the_decided_set_of_55() {
+    fn r2f_dm_windows_ignore_attributes_are_exactly_the_decided_set_of_58() {
         const REASON_A: &str = "S21 제출 정착·창 위 CR 보류는 유닉스 한정(send_settle_applies)";
         const REASON_B: &str = "윈도우 기본 H 마스크는 draft 축을 끈다(hold_axes_default(true)) — 이 검체는 유닉스 기본(draft 축) 동작을 본다";
         const REASON_C: &str = "좌석 명령이 POSIX 셸 문법";
@@ -32706,8 +32785,14 @@ mod h_machine_hold_tests {
             ("etx_ctrlc_tests", "control_the_rig_does_carry_a_key_to_the_wire", 'C'),
             ("etx_ctrlc_tests", "ctrl_c_on_a_human_draft_is_refused_and_writes_nothing", 'C'),
             ("etx_ctrlc_tests", "ctrl_c_reaches_the_wire_as_a_single_etx_byte", 'C'),
+            // ★(0.14.56 · P1 D9 pre-CR stage D1) class C +3: the master/CEO claim-check specimens (T-W1, T-W2, T-L1) compare
+            //   the receiver's bytes through the same recorder seat (`stty raw -echo; exec cat > file`), so they are POSIX by
+            //   construction. The claim check itself has no cfg and runs on Windows; its Windows behaviour is UNMEASURED here.
+            ("agent_queue_tests", "d9_pre_cr_t_l1_a_human_byte_during_the_settle_lands_after_the_cr", 'C'),
+            ("agent_queue_tests", "d9_pre_cr_t_w1_a_write_ahead_inside_the_r1_window_refuses_the_claim", 'C'),
+            ("agent_queue_tests", "d9_pre_cr_t_w2_a_human_key_inside_the_r1_window_refuses_the_claim", 'C'),
         ];
-        assert_eq!(want.len(), 55, "결정한 집합은 55건(24 + 17 + 11 + 3)");
+        assert_eq!(want.len(), 58, "결정한 집합은 58건(24 + 17 + 14 + 3)");
         let needle = concat!("#[cfg_attr(not(unix), ", "ignore = \"");
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/cysd");
         let mut got: Vec<(String, String, char)> = Vec::new();
@@ -32734,8 +32819,8 @@ mod h_machine_hold_tests {
         got.sort();
         let mut want_sorted: Vec<(String, String, char)> = want.iter().map(|(a, b, c)| (a.to_string(), b.to_string(), *c)).collect();
         want_sorted.sort();
-        assert_eq!(got.len(), 55, "윈도우 `ignore` 가 {}건이다(결정 55건) — 새로 더했거나 뺐다: {got:?}", got.len());
-        assert_eq!(got, want_sorted, "윈도우 `ignore` 집합이 결정한 55건과 다르다 — 목록과 `ignore` 사유를 함께 고쳐라");
+        assert_eq!(got.len(), 58, "윈도우 `ignore` 가 {}건이다(결정 58건) — 새로 더했거나 뺐다: {got:?}", got.len());
+        assert_eq!(got, want_sorted, "윈도우 `ignore` 집합이 결정한 58건과 다르다 — 목록과 `ignore` 사유를 함께 고쳐라");
     }
 }
 
