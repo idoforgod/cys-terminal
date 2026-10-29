@@ -2029,6 +2029,184 @@ class LivenessProbe(unittest.TestCase):
         self.assertNotIn('os.kill', ast.unparse(nt[0]))
 
 
+def _published_pid(path, wait_s, clock=time.monotonic, sleep=time.sleep):
+    # A child that publishes its pid with os.open + os.write leaves an empty file for a moment. Wait for the digits within
+    # wait_s and never raise: the instrument reports what it saw.
+    end = clock() + wait_s
+    while True:
+        try:
+            return int(path.read_text())
+        except (OSError, ValueError):
+            if clock() >= end:  # wallclock: guard wait_s only bounds the wait for a publication that may never come; None is reported, not asserted
+                return None
+        sleep(.05)
+
+
+def _contained(arm, fn):
+    # Report-only: an arm that raises reports its error instead of failing the native step (errors=0 there).
+    try:
+        return fn()
+    except Exception as exc:
+        return {'arm': arm, 'error': ('instrument: %r' % (exc,))[:300]}
+
+
+_INSTRUMENT_LEADER = r'''
+import json, os, subprocess, sys, time
+sys.path.insert(0, %(bin)r)
+CFG = json.load(open(sys.argv[1]))
+def child(marker, sleep):
+    # The child's first statement publishes its pid, so nothing else runs before the marker.
+    code = ("import os,time\nfd=os.open(%%r,os.O_WRONLY|os.O_CREAT|os.O_TRUNC)\nos.write(fd,str(os.getpid()).encode())\n"
+            "os.close(fd)\ntime.sleep(%%r)\n" %% (marker, sleep))
+    return [sys.executable, '-B', '-c', code]
+def started(marker):
+    fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_TRUNC); os.write(fd, str(os.getpid()).encode()); os.close(fd)
+def main():
+    arm, rep, t0 = CFG['arm'], {'arm': CFG['arm']}, time.monotonic()
+    try:
+        if arm in ('A1', 'A2'):
+            kw = {'capture_output': True, 'timeout': 10}
+            if arm == 'A2':
+                kw['stdin'] = subprocess.DEVNULL
+            r = subprocess.run(child(CFG['marker'], 0), **kw)
+            rep.update(rc=r.returncode, stderr=r.stderr[-300:].decode('utf-8', 'replace'))
+        elif arm in ('A3', 'A4', 'A6'):
+            p = subprocess.Popen(child(CFG['marker'], 12))
+            rep.update(popen_ms=int((time.monotonic() - t0) * 1000), pid=p.pid)
+            if arm == 'A6':
+                print('INSTR ' + json.dumps(rep), flush=True)
+                os._exit(0)
+            time.sleep(5)
+            rep['poll_after_5s'] = p.poll()
+        elif arm == 'A5':
+            import multiprocessing
+            with multiprocessing.get_context('spawn').Pool(1, initializer=started, initargs=(CFG['marker'],)) as pool:
+                rep['worker_pid'] = pool.apply_async(os.getpid).get(timeout=10)
+    except subprocess.TimeoutExpired:
+        rep['timeout'] = True
+    except Exception as exc:
+        rep['error'] = repr(exc)[:300]
+    rep['elapsed_ms'] = int((time.monotonic() - t0) * 1000)
+    rep['marker'] = os.path.exists(CFG['marker'])
+    print('INSTR ' + json.dumps(rep), flush=True)
+if __name__ == '__main__':
+    if CFG.get('plain'):
+        main()
+    else:
+        from _owned_process import managed_main
+        managed_main(main)
+'''
+
+
+@unittest.skipUnless(os.name == 'nt' or os.environ.get('C03_INSTRUMENT_POSIX') == '1',
+                     'nt child-start instrument (report-only); C03_INSTRUMENT_POSIX=1 runs it as a local dry run')
+class ChildStartInstrument(unittest.TestCase):
+    """Report-only (FIX-PLAN-d2be23fe section 2.3, head ruling C3/C8): why children of a managed leader do or do not start on nt.
+    Every arm is bounded; each prints one C03-INSTRUMENT line to stderr. It asserts only that every arm reported."""
+    setUp = OwnershipRegression.setUp
+    tearDown = OwnershipRegression.tearDown
+    _report_marker_stats = OwnershipRegression._report_marker_stats
+    stop_recorded = OwnershipRegression.stop_recorded
+
+    def test_report_child_start_shapes(self):
+        sys.path.insert(0, str(BIN)); import _owned_process as owned
+        leader = self.root/'instr_leader.py'
+        leader.write_text(_INSTRUMENT_LEADER % {'bin': str(BIN)})
+        report = []
+        def emit(rep):
+            report.append(rep)
+            sys.stderr.write('\nC03-INSTRUMENT %s\n' % json.dumps(rep)); sys.stderr.flush()
+        def parse(arm, result):
+            got = [json.loads(l[6:]) for l in result['stdout'].splitlines() if l.startswith('INSTR ')]
+            rep = got[0] if got else {'arm': arm, 'error': 'no INSTR line'}
+            rep['owner'] = {k: result.get(k) for k in ('timed_out', 'complete', 'returncode', 'reason')}
+            rep['owner']['stderr_tail'] = result['stderr'][-300:]
+            return rep
+        for arm in ('A1', 'A2', 'A3', 'A4', 'A5'):
+            cfg = self.root/('%s.json' % arm)
+            cfg.write_text(json.dumps({'arm': arm, 'marker': str(self.root/('%s-started' % arm)), 'plain': arm == 'A4'}))
+            launch = [PYTHON, '-B', str(leader), str(cfg)]
+            if arm == 'A4':  # a plain child of a --command leader, as fix A's held-output test builds it
+                launch = [PYTHON, '-B', str(BIN/'_owned_process.py'), '--command'] + launch
+            emit(_contained(arm, lambda: parse(arm, owned.run_owned(launch, 20))))  # wallclock: guard 20 s only bounds a stuck arm; the report is the verdict, nothing is asserted on it
+        def a6():
+            # A6: does an all-default holder keep its parent's stdout pipe open? The leader exits right after the spawn.
+            cfg = self.root/'A6.json'
+            cfg.write_text(json.dumps({'arm': 'A6', 'marker': str(self.root/'A6-started')}))
+            t0 = time.monotonic()
+            p = subprocess.Popen([PYTHON, '-B', str(leader), str(cfg)], stdout=subprocess.PIPE, stdin=subprocess.DEVNULL)
+            self.children.append(p)
+            import threading
+            done = threading.Event(); out = []
+            threading.Thread(target=lambda: (out.append(p.stdout.read()), done.set()), daemon=True).start()
+            eof = done.wait(15)  # wallclock: guard 15 s only bounds the read; the holder sleeps 12 s, so EOF before then means it does not hold the pipe
+            rep = {'arm': 'A6', 'eof': eof, 'eof_ms': int((time.monotonic() - t0) * 1000) if eof else None,
+                   'leader_out': (out[0][-200:].decode('utf-8', 'replace') if out else None)}
+            marker = self.root/'A6-started'
+            # On nt EOF may come before the holder has written its pid (os.open, then os.write).
+            holder = _published_pid(marker, 5)
+            rep.update(holder_pid=holder, marker_exists=marker.exists(), holder_state=(alive_state(holder) if holder else None))
+            return rep
+        emit(_contained('A6', a6))
+        # A7: the real managed scan as preflight runs it (C60: run_owned(..., timeout_s, grace=5, force=5),
+        # javis_preflight.py:5309-5310/:5351-5352 @af092542), a) with preflight's own argv (the runner's corpus) and b) over
+        # the skills this repo ships (a user install's start).
+        scan = str(BIN/'javis_skillscan.py')
+        shipped = Path(__file__).resolve().parents[2]/'skills'
+        def a7(arm, argv):
+            bound = load('javis_preflight').Preflight.SKILLSCAN_SCAN_TIMEOUT_S
+            t0 = time.monotonic()
+            # 40 s is twice preflight's 20 s bound (af092542): enough to tell "slower" from "reaches the bound", and the
+            # native step keeps room inside its 10 min timeout when the guards this slice adds all fire (180 s did not).
+            result = owned.run_owned([PYTHON, '-B', scan] + argv, 40, grace=5, force=5)  # wallclock: guard 40 s only bounds the scan; wall time is reported against preflight's bound, not asserted
+            try:
+                scanned = json.loads(result['stdout']).get('scanned')
+            except (ValueError, AttributeError):
+                scanned = None
+            return {'arm': arm, 'wall_ms': int((time.monotonic() - t0) * 1000), 'preflight_timeout_s': bound, 'guard_s': 40,
+                    'skills_scanned': scanned, 'skill_dirs_on_disk': sum(1 for _ in shipped.glob('*/SKILL.md')) if arm == 'A7b' else None,
+                    'stdout_head': result['stdout'][:160], 'stderr_tail': result['stderr'][-300:],
+                    'owner': {k: result.get(k) for k in ('timed_out', 'complete', 'returncode', 'reason')}}
+        for arm, argv in (('A7a', ['all', '--json']), ('A7b', ['all', '--roots', str(shipped), '--json'])):
+            emit(_contained(arm, lambda: a7(arm, argv)))
+        (self.root/'instrument.json').write_text(json.dumps(report))
+        self.assertEqual([r['arm'] for r in report], ['A1', 'A2', 'A3', 'A4', 'A5', 'A6', 'A7a', 'A7b'])
+
+
+class InstrumentContainment(unittest.TestCase):
+    """The instrument rides in the native C-03 step, whose acceptance is errors=0: an arm must report its failure, never
+    raise it. Runs on every platform; the instrument itself runs on nt only."""
+
+    def test_a_published_pid_that_is_not_written_yet_reads_as_none(self):
+        with tempfile.TemporaryDirectory(prefix='c03-') as tmp:
+            marker = Path(tmp)/'m'
+            ticks = iter(range(1000))
+            clock, idle = (lambda: float(next(ticks))), (lambda s: None)
+            self.assertIsNone(_published_pid(marker, 3, clock, idle))
+            marker.write_text('')  # created by os.open, the os.write not done yet
+            self.assertIsNone(_published_pid(marker, 3, clock, idle))
+            self.assertEqual(_published_pid(marker, 3, clock, lambda s: marker.write_text('77')), 77)
+            marker.write_text('4242')
+            self.assertEqual(_published_pid(marker, 3, clock, idle), 4242)
+
+    def test_an_arm_that_raises_reports_instead_of_failing(self):
+        def broken():
+            raise OSError('fixture: spawn failed')
+        rep = _contained('A9', broken)
+        self.assertEqual(rep['arm'], 'A9')
+        self.assertIn('fixture: spawn failed', rep['error'])
+        self.assertEqual(_contained('A9', lambda: {'arm': 'A9', 'rc': 0}), {'arm': 'A9', 'rc': 0})
+
+    def test_every_instrument_arm_is_contained(self):
+        import ast, inspect, textwrap
+        body = ast.parse(textwrap.dedent(inspect.getsource(ChildStartInstrument.test_report_child_start_shapes)))
+        emits = [n for n in ast.walk(body) if isinstance(n, ast.Call) and getattr(n.func, 'id', None) == 'emit']
+        self.assertEqual(len(emits), 3, 'emit sites: A1-A5 loop, A6, A7 loop')
+        for n in emits:
+            self.assertEqual(getattr(n.args[0].func, 'id', None) if isinstance(n.args[0], ast.Call) else None,
+                             '_contained', ast.unparse(n))
+
+
 if __name__ == '__main__':
     # Tests never inherit a live seat's paths or account configuration.
     for key in list(os.environ):
