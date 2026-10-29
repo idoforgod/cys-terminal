@@ -3520,12 +3520,17 @@ fn push_n6b(daemon: &std::sync::Arc<Daemon>, roles: &[String]) {
     );
 }
 
+/// N7 의 원인·처방 한 문장(헤드 재정 2026-10-29 R1-1 조건 2) — 잠금은 훅의 표준입력으로 넘어가므로(U-7 핀이 다른 길을
+/// 막는다) 표준입력을 물려받은 도우미도 쥔다. 보유자 pid 는 적지 않는다: flock 보유자는 이식 가능한 값싼 조회가 없다
+/// (Linux `F_GETLK` 은 flock 을 보지 않는다) — 데몬은 lsof 를 띄우지 않는다.
+const N7_CAUSE_AND_REMEDY: &str = "원인은 대개 사전 복원 스크립트가 띄운 도우미 프로세스가 스크립트의 표준입력(stdin)을 물려받아 이 잠금을 쥐고 있는 것입니다 — 그 프로세스를 끝내고, 도우미는 표준입력을 돌려서(`</dev/null`, `stdin=DEVNULL`) 띄우십시오.";
+
 fn push_n7(daemon: &std::sync::Arc<Daemon>, d: std::time::Duration) {
     daemon.push_feed_notification(
         "error",
         "이전 부팅에서 시작된 자동복원 스크립트가 아직 실행 중입니다 — 이번 부팅의 자동복원은 일어나지 않았습니다",
         &format!(
-            "`hook.run.lock` 을 쥔 프로세스가 {}초 뒤에도 남아 있습니다. 두 복원이 같은 역할을 동시에 띄우지 않도록 이번에는 아무것도 실행하지 않았습니다. 실패로 보고하지 않고 그대로 알립니다. 할 일: 그 스크립트 프로세스를 종료하고 데몬을 다시 시작하십시오. 스크립트를 끄려면 allow 파일에서 해당 줄을 지우면 됩니다.",
+            "`hook.run.lock` 을 쥔 프로세스가 {}초 뒤에도 남아 있습니다. {N7_CAUSE_AND_REMEDY} 두 복원이 같은 역할을 동시에 띄우지 않도록 이번에는 아무것도 실행하지 않았습니다. 실패로 보고하지 않고 그대로 알립니다. 할 일: 그 스크립트 프로세스를 종료하고 데몬을 다시 시작하십시오. 스크립트를 끄려면 allow 파일에서 해당 줄을 지우면 됩니다.",
             d.as_secs()
         ),
         None,
@@ -9706,6 +9711,33 @@ sys.exit(0)
         let (kind, body) = notice(&rig, "아직 실행 중입니다").expect("N7");
         assert_eq!(kind, "error");
         assert!(body.starts_with("`hook.run.lock` 을 쥔 프로세스가 0초 뒤에도 남아 있습니다."), "{body}");
+        // 헤드 재정(R1-1 조건 2): 원인과 처방을 한 문장으로 — 표준입력을 물려받은 도우미 · 끝내고 stdin 을 돌려 띄운다.
+        assert!(body.contains(&format!("남아 있습니다. {N7_CAUSE_AND_REMEDY} 두 복원이")), "{body}");
+        assert!(N7_CAUSE_AND_REMEDY.contains("stdin") && N7_CAUSE_AND_REMEDY.contains("</dev/null") && N7_CAUSE_AND_REMEDY.contains("DEVNULL"));
+        assert!(N7_CAUSE_AND_REMEDY.ends_with('.') && N7_CAUSE_AND_REMEDY.matches('.').count() == 1, "one sentence");
+    }
+
+    /// ★헤드 재정 R1-1 조건 1 — allow 파일이 없는 기본 사용자는 N7 관측에도 표준입력 잠금 전달에도 닿지 않는다: 남이
+    /// `hook.run.lock` 을 쥐고 있어도 오늘의 경로 그대로 authority 가 돌고(N7 0), 데몬은 그 잠금 파일을 만들지도 않는다.
+    #[test]
+    fn default_boot_never_reaches_n7_or_the_stdin_carrier() {
+        let _g = hook_knobs();
+        let fresh = Rig::new("defnolock");
+        let local = fresh.dir.join("local");
+        std::fs::create_dir_all(&local).unwrap();
+        std::env::set_var("CYS_LOCAL_DIR", &local);
+        let pre = read_prerestore();
+        prerestore_then_authority(&fresh.run(), Some(fresh.rdir.as_path()), pre.clone());
+        let held = Rig::new("defheld");
+        let lock = reclaim::hold_named_lock_for_child(&held.dir, "hook.run.lock").expect("test holds the lock");
+        prerestore_then_authority(&held.run(), Some(held.rdir.as_path()), read_prerestore());
+        drop(lock);
+        std::env::remove_var("CYS_LOCAL_DIR");
+        assert_eq!(pre, Prerestore::None);
+        assert_eq!(fresh.calls(), vec!["restore --auto"]);
+        assert!(!fresh.dir.join("phoenix").join("hook.run.lock").exists(), "a default boot created hook.run.lock");
+        assert_eq!(held.calls(), vec!["restore --auto"], "a held hook.run.lock stopped a boot that has no allow file");
+        assert!(notice(&held, "아직 실행 중입니다").is_none() && feed(&held).is_empty(), "{:?}", feed(&held));
     }
 
     /// 잠금은 훅의 수명이다 — 훅이 사는 동안 Held, 끝난 뒤 Free(데몬은 사본을 쥐지 않는다).
