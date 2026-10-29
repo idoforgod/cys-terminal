@@ -169,6 +169,14 @@ def main():
     code, d, _ = plan(compare=p)
     check("P6-c control: a valid baseline (CRLF lines, log noise) is accepted -> empty",
           d.get("outcome") == "empty" and reasons_of(d) == [], "%r %r" % (d.get("outcome"), reasons_of(d)))
+    # S5 (CEO d34b1099 §4 ⒝): the daemon appends its W/X/U line to the pre-hook plan output before the post plan reads
+    # it — that line is not a plan frame, so the baseline stays exactly one framed line and is still accepted.
+    wall = 'cysd-hook-wall/1 {"wall_s":1800,"stall_s":90,"wall_from":"default","restore_outer_s":1300,' \
+           '"restore_units":19,"restore_unit_s":69,"check":"ok"}\n'
+    p = R.save("baseline-good-with-daemon-wall-line.out", "[phoenix] x\n" + framed(good) + wall)
+    code, d, _ = plan(compare=p)
+    check("P6-c control: a valid baseline followed by the daemon's cysd-hook-wall/1 line is accepted -> empty",
+          d.get("outcome") == "empty" and reasons_of(d) == [], "%r %r" % (d.get("outcome"), reasons_of(d)))
 
     # ── P6-d (gemini1 r2 fold): a baseline that was itself uncertified is not a baseline ───────────────────────
     #    pre-hook: desired_roster corrupt (worker-3 recoverable only from it); the hook writes a clean file without

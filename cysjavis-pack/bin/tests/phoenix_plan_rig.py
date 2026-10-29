@@ -61,6 +61,8 @@ if a[:1] == ["--socket"]:
     a = a[2:]
 with open(os.environ["FAKE_CYS_LOG"], "a") as f:
     f.write(json.dumps(a) + "\n")
+with open(os.environ["FAKE_CYS_LOG"] + ".env", "a") as f:   # what phoenix's child saw (S5 R1-3 specimen)
+    f.write(json.dumps(os.environ.get("PHOENIX_RESULT_FILE")) + "\n")
 w = json.load(open(os.environ["FAKE_CYS_WORLD"]))
 if a[:1] == ["phoenix-identity"]:
     if w.get("self") is None:

@@ -576,6 +576,34 @@ fn try_lock_region(file: &std::fs::File) -> LockTry {
     }
 }
 
+/// ★(0.14.56 PHX · r1 §7-2 · S5) 자식에게 넘길 잠금 — `<state>/phoenix/<name>` 을 만들고(없으면) 잡은 채
+/// **파일 그대로** 돌려준다. 호출자는 그 파일을 자식의 표준입력으로 넘기고 자기 사본을 즉시 닫는다 — 잠금은
+/// 열린 파일 설명(open file description)에 붙으므로 그 뒤로는 자식(과 표준입력을 물려받은 자손)이 살아 있는 동안만
+/// 잡혀 있다. `LeaseGuard` 를 쓰지 않는 이유: 그 drop 의 명시 해제(`LOCK_UN`)는 같은 설명을 공유하는 자식의
+/// 잠금까지 풀어 버린다(닫기만 하면 풀리지 않는다). unix 전용 — Windows 의 바이트 잠금은 핸들에 붙어 자식에게
+/// 넘어가지 않는다(설계도 unix 만 둔다).
+#[cfg(unix)]
+pub fn hold_named_lock_for_child(state_dir: &Path, name: &str) -> Result<std::fs::File, LeaseState> {
+    let path = canonical_state_dir(state_dir).join("phoenix").join(name);
+    if let Some(dir) = path.parent() {
+        if std::fs::create_dir_all(dir).is_err() {
+            return Err(LeaseState::Unavailable);
+        }
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|_| LeaseState::Unavailable)?;
+    match try_lock_region(&file) {
+        LockTry::Acquired => Ok(file),
+        LockTry::Busy => Err(LeaseState::Held),
+        LockTry::Failed => Err(LeaseState::Unavailable),
+    }
+}
+
 /// ★(0.14.56 PHX · r2 §5-1) 복원 잠금(`<state>/phoenix/<name>`)을 **아무것도 만들지 않고** 관측한다 —
 /// 디렉터리도 파일도 만들지 않고, 읽기 전용으로 열고, 잡히면 **즉시 놓는다**.
 ///

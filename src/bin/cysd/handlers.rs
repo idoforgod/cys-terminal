@@ -4052,7 +4052,7 @@ fn journal_barrier_verdict(id: &Value, handle: &crate::agent_write::Request, sid
 /// 부모 pid 가 낡아 재사용된 경우(죽은 부모의 pid 를 더 젊은 프로세스가 받았다) 그 젊은 프로세스는 자식의
 /// 조상이 아니다. 어느 쪽 start_time 이든 관측 실패면 false. 해상도는 lookup 의 단위(초)라 같은 초 안의
 /// 재사용은 가르지 못한다.
-fn caller_in_restore_root(
+pub(crate) fn caller_in_restore_root(
     daemon: &Daemon,
     caller_pid: u32,
     start_time_lookup: impl Fn(u32) -> Option<u64>,

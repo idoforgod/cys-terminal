@@ -38,7 +38,7 @@ pub(crate) mod winjob {
     use std::sync::OnceLock;
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
+        AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject, TerminateJobObject,
         JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
@@ -85,6 +85,66 @@ pub(crate) mod winjob {
             if !proc.is_null() {
                 AssignProcessToJobObject(j, proc);
                 CloseHandle(proc);
+            }
+        }
+    }
+
+    /// ★(0.14.56 PHX · r1 §7-2 · r2 §6-2) `assign_child` 와 같은 몸통이되 편입 성공 여부를 돌려준다 —
+    /// 실패는 호출자가 N9(`데몬 Job`)로 알린다(PTY 경로는 `assign_child` 그대로).
+    pub fn try_assign_child(pid: u32) -> bool {
+        if pid == 0 {
+            return false;
+        }
+        unsafe {
+            let j = job();
+            if j.is_null() {
+                return false;
+            }
+            let proc = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
+            if proc.is_null() {
+                return false;
+            }
+            let ok = AssignProcessToJobObject(j, proc) != 0;
+            CloseHandle(proc);
+            ok
+        }
+    }
+
+    /// ★(0.14.56 PHX · r2 §6-2 D2) 훅 하나의 Job — 제한 없이 만들어 훅을 넣는다. 훅이 이미 데몬 Job 안에 있으므로
+    /// Windows 8 이후에는 데몬 Job 의 **중첩 자식**이 된다(실기 동작은 specimen D2 만 잰다 · 이 맥에서는 미측정).
+    /// 상한이 끊을 때 `terminate` 가 훅과 그 뒤 생긴 자손을 함께 끝낸다. drop = 핸들 닫기(종료시키지 않는다 —
+    /// 정상 종료 뒤의 잔존은 훅의 일이다).
+    pub struct HookJob(usize);
+
+    impl HookJob {
+        /// 만들고 넣는다. 둘 중 하나라도 실패하면 None(호출자가 N9 `스크립트 Job` 으로 알리고 `Child::kill` 로 물러선다).
+        pub fn create_and_assign(pid: u32) -> Option<HookJob> {
+            unsafe {
+                let h = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+                if h.is_null() {
+                    return None;
+                }
+                let job = HookJob(h as usize);
+                let proc = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
+                if proc.is_null() {
+                    return None;
+                }
+                let ok = AssignProcessToJobObject(h, proc) != 0;
+                CloseHandle(proc);
+                if ok { Some(job) } else { None }
+            }
+        }
+
+        /// Job 안의 전부를 종료 코드 1 로 끝낸다(성공 여부를 돌려준다 — 실패면 호출자가 `Child::kill`).
+        pub fn terminate(&self) -> bool {
+            unsafe { TerminateJobObject(self.0 as HANDLE, 1) != 0 }
+        }
+    }
+
+    impl Drop for HookJob {
+        fn drop(&mut self) {
+            unsafe {
+                CloseHandle(self.0 as HANDLE);
             }
         }
     }

@@ -71,6 +71,21 @@ def main():
         fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
         holder.close()
 
+    # ── S4 R1-3 (closed in S5): the result channel belongs to THIS process — phoenix takes it out of its environment
+    #    at entry, so no child it starts (the cys CLI, the identity probe, a future nested restore) inherits the path ──
+    os.remove(res) if os.path.exists(res) else None
+    R.world(desired=rig.desired(rig.ROLES, rev=3), topo=rig.topo(rig.ROLES, rev=3), live=rig.LIVE_ALL)
+    envlog = os.path.join(R.root, "cys-calls.log.env")
+    os.remove(envlog) if os.path.exists(envlog) else None
+    rc, _f, _d, out, err, calls = R.run_cli(fake, ["--socket", sock, "restore", "--auto"], world,
+                                            {"PHOENIX_RESULT_FILE": res})
+    seen = [json.loads(ln) for ln in open(envlog, encoding="utf-8")] if os.path.exists(envlog) else []
+    check("phoenix's children ran (positive control: the fake cys logged >= 1 call)", len(seen) >= 1 and len(calls) >= 1,
+          "calls=%d env=%d" % (len(calls), len(seen)))
+    check("no child of phoenix saw PHOENIX_RESULT_FILE", seen != [] and all(v is None for v in seen), seen)
+    check("... and phoenix itself still wrote its verdict to the daemon's path",
+          isinstance(read_json(res), dict) and read_json(res).get("exit") == rc, "rc=%r got=%r" % (rc, read_json(res)))
+
     # ── the exit field mirrors the process exit: corrupt desired, no fallback -> CORRUPT, exit 6 ──────────────
     os.remove(res) if os.path.exists(res) else None
     R.world(desired=rig.CORRUPT, topo=rig.topo(rig.ROLES, rev=3), live=rig.LIVE_ALL)

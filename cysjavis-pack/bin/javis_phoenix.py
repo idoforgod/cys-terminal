@@ -3705,12 +3705,16 @@ def cmd_restore(args):
     sys.exit(code)
 
 
+# main() 이 환경에서 꺼내 둔 결과 채널(없으면 None — 프로세스 안에서 cmd_restore 를 직접 부르는 시험은 환경을 읽는다).
+_RESULT_FILE = None
+
+
 def _write_result_file(result, code):
     """★0.14.56 D3: 데몬이 고른 `PHOENIX_RESULT_FILE` 이 설정됐을 때만 `{"phoenix_restore": <판정>, "exit": <코드>}`
     를 원자적으로 남긴다 — exit 0 하나로는 VERIFIED·NOOP 와 LEASE_HELD(다른 복원이 진행 중이라 물러남)를 데몬이
     가를 수 없기 때문이다. 변수가 없으면(CLI·deploy·사용자 스크립트) 아무것도 하지 않는다. 기록 실패는 exit 를
     바꾸지 않는다 — 데몬은 결과 없음을 '판독 불가'로 읽고 한 번 재확인한다(안전한 쪽)."""
-    path = os.environ.get("PHOENIX_RESULT_FILE")
+    path = _RESULT_FILE if _RESULT_FILE is not None else os.environ.get("PHOENIX_RESULT_FILE")
     if not path:
         return
     verdict = result.get("phoenix_restore") if isinstance(result, dict) else None
@@ -4895,7 +4899,7 @@ def cmd_deploy(args):
 # ------------------------------------------------------------------ main
 
 def main():
-    global CYS
+    global CYS, _RESULT_FILE
     _force_utf8_stdio()  # ★(0.14.48 · A) selftest 판정보다 앞 — 이 프로세스의 모든 출력이 UTF-8 로 나간다
     # ★B1 self-test(임베드 추출 직후 cysd 가 호출): 추출된 phoenix 가 실행가능한지만 확인한다 — 데몬·cys 해석·
     #   상태파일 무접촉. argparse(서브커맨드 required)·_resolve_cys 이전에 조기 종료해 순수 실행성만 검증.
@@ -4904,6 +4908,9 @@ def main():
         sys.stdout.write("phoenix selftest ok (proto=%s)\n" % PHOENIX_PROTOCOL_VERSION)
         sys.stdout.flush()
         sys.exit(0)
+    # ★0.14.56 (S4 R1-3): 데몬이 준 결과 채널은 이 프로세스 것이다 — 맨 앞에서 환경에서 꺼내 둔다. 그래야 phoenix 가
+    #   띄우는 자손(cys CLI·신원 탐침·앞으로 생길 수 있는 중첩 restore)이 그 경로를 물려받아 데몬의 판정 자리에 쓰지 않는다.
+    _RESULT_FILE = os.environ.pop("PHOENIX_RESULT_FILE", None)
     # ★Windows 패리티(S1~S5): 재부팅 자동기동 토대는 mac=launchd·win=schtasks 로 플랫폼 디스패치하고, 경로/소켓은
     # named pipe→state_dir 매핑으로 해소한다. 과거 os.name=="nt" hard-gate 는 제거됐다 — 전 서브커맨드 Windows 동작.
     ap = argparse.ArgumentParser(description="불사조 부활 저널 상태머신 MVP (M1 게이트)")

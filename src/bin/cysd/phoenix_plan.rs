@@ -341,6 +341,195 @@ fn sha256_hex(b: &[u8]) -> String {
     Sha256::digest(b).iter().map(|x| format!("{x:02x}")).collect()
 }
 
+// ── 훅의 상한(r2 §6-3 D4 · CEO d34b1099 §4 D4′) ──────────────────────────────────────────────────────────
+
+/// 정지(stall) 기본값 — `javis_budget.cys_restore_stall_s()`(90 s)와 같다. 노브 `CYS_PHOENIX_HOOK_STALL_S`.
+pub const HOOK_STALL_DEFAULT_S: u64 = 90;
+pub const HOOK_STALL_RANGE_S: (u64, u64) = (30, 600);
+/// 벽(wall) 기본값의 바닥. D4′: 기본 = max(1800, X + 한 단위), 3600 에서 자른다.
+pub const HOOK_WALL_FLOOR_S: u64 = 1800;
+/// 노브 `CYS_PHOENIX_HOOK_TIMEOUT_S` 의 범위 — D4′ 는 기본값만 옮기고 천장은 그대로다(CEO 조건 ⒞).
+pub const HOOK_WALL_RANGE_S: (u64, u64) = (90, 3600);
+/// 데몬이 훅 앞 계획 출력(계획 산출물)에 덧붙이는 줄의 접두 — `phoenix-plan/1 ` 이 아니라서 phoenix 의
+/// `--compare-plan` 판독기는 이 줄을 세지 않는다(정확히 한 개의 계획 줄 규칙이 그대로다).
+pub const HOOK_WALL_PREFIX: &str = "cysd-hook-wall/1 ";
+
+/// 훅 앞 계획이 적은 authority 의 예산(r2 §4-1 `observed`) — D4′ 의 입력.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanBudget {
+    /// X — 이 view 를 authority 의 `cys restore` 가 치를 바깥 예산(초).
+    pub outer_s: u64,
+    /// 한 단위(초) — phoenix 가 호출 시점의 `javis_budget` 에서 잰 값. 단위를 모르면(`fallback`) None.
+    pub unit_s: Option<u64>,
+    /// U — 발사 단위 수.
+    pub units: u64,
+}
+
+/// 계획 출력에서 예산을 읽는다(계획 줄이 정확히 하나일 때만). 필드가 없거나 정수가 아니면 None —
+/// 읽지 못한 예산은 비교하지 않는다(그리고 로그가 그렇다고 말한다).
+pub fn plan_budget(out: &[u8]) -> Option<PlanBudget> {
+    if out.len() > PLAN_OUTPUT_CAP {
+        return None;
+    }
+    let mut framed = out
+        .split(|b| *b == b'\n')
+        .map(|l| l.strip_suffix(b"\r").unwrap_or(l))
+        .filter(|l| l.starts_with(PLAN_FRAME_PREFIX));
+    let line = match (framed.next(), framed.next()) {
+        (Some(l), None) => &l[PLAN_FRAME_PREFIX.len()..],
+        _ => return None,
+    };
+    let v: Value = serde_json::from_slice(line).ok()?;
+    let obs = v.get("observed")?.as_object()?;
+    let outer_s = obs.get("restore_outer_s")?.as_u64()?;
+    let units = obs.get("restore_units")?.as_u64()?;
+    let unit_s = match obs.get("restore_budget_source").and_then(Value::as_str) {
+        Some("javis_budget") => Some(obs.get("restore_unit_s")?.as_u64()?),
+        _ => None,
+    };
+    Some(PlanBudget { outer_s, unit_s, units })
+}
+
+/// 벽 값이 어디서 왔는가.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WallFrom {
+    /// D4′ 기본값 max(1800, X + 한 단위) — 3600 안쪽.
+    Default,
+    /// D4′ 기본값이 3600 에서 잘렸다(로스터가 약 51 단위를 넘는다).
+    DefaultCapped,
+    /// 사용자가 노브로 정했다(범위 [90, 3600]).
+    Knob,
+}
+
+/// r2 §6-3(6) 비교 — 훅 **앞에서** 벽과 예산을 견준다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WallCheck {
+    /// 비교할 예산이 없다(계획 없음 · 단위 모름) — 로그가 그렇다고 말한다.
+    NoComparison(&'static str),
+    /// W ≥ X + 한 단위.
+    Ok,
+    /// W < X — r2 §6-3(6) 원문의 경우.
+    BelowBudget,
+    /// X ≤ W < X + 한 단위 — CEO D4′ 「여유는 한 단위를 넘어야 한다」의 경우(상한 3600 이 묶을 때 여기 온다).
+    BelowOneUnit,
+}
+
+/// 이번 부팅 훅의 두 상한과 그 근거.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookBounds {
+    pub stall_s: u64,
+    pub wall_s: u64,
+    pub from: WallFrom,
+    pub check: WallCheck,
+    pub budget: Option<PlanBudget>,
+}
+
+impl HookBounds {
+    /// CEO 조건 ⒜ — 기본값이 3600 에서 잘려 한 단위의 여유를 못 줄 때는 훅 **앞에서** 크게(통지) 알린다.
+    /// 노브로 정한 벽은 사용자의 선택이라 로그만 남긴다(r2 §6-3(6)).
+    pub fn loud(&self) -> bool {
+        self.from == WallFrom::DefaultCapped && matches!(self.check, WallCheck::BelowBudget | WallCheck::BelowOneUnit)
+    }
+}
+
+/// 노브 문자열 → 정수(해석 불가·부재 = None, 기본값을 쓴다).
+fn knob_secs(raw: Option<&str>) -> Option<u64> {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+/// 상한 계산(순수). 정지: 기본 90, 노브는 [30, 600] 로 묶는다. 벽: 노브가 있으면 [90, 3600] 로 묶은 그 값,
+/// 없으면 D4′ max(1800, X + 한 단위)를 3600 에서 자른 값(단위를 모르면 1800). 단위는 계획이 잰 값이다
+/// (데몬은 68.4 같은 상수를 갖지 않는다).
+pub fn hook_bounds(stall_knob: Option<&str>, wall_knob: Option<&str>, budget: Option<PlanBudget>) -> HookBounds {
+    let stall_s = knob_secs(stall_knob)
+        .map(|s| s.clamp(HOOK_STALL_RANGE_S.0, HOOK_STALL_RANGE_S.1))
+        .unwrap_or(HOOK_STALL_DEFAULT_S);
+    let (wall_s, from) = match (knob_secs(wall_knob), &budget) {
+        (Some(w), _) => (w.clamp(HOOK_WALL_RANGE_S.0, HOOK_WALL_RANGE_S.1), WallFrom::Knob),
+        (None, Some(PlanBudget { outer_s, unit_s: Some(u), .. })) => {
+            let raw = HOOK_WALL_FLOOR_S.max(outer_s.saturating_add(*u));
+            if raw > HOOK_WALL_RANGE_S.1 {
+                (HOOK_WALL_RANGE_S.1, WallFrom::DefaultCapped)
+            } else {
+                (raw, WallFrom::Default)
+            }
+        }
+        (None, _) => (HOOK_WALL_FLOOR_S, WallFrom::Default),
+    };
+    let check = match &budget {
+        None => WallCheck::NoComparison("no restore budget from the pre-hook plan"),
+        Some(PlanBudget { unit_s: None, .. }) => WallCheck::NoComparison("restore unit unknown (budget fallback)"),
+        Some(PlanBudget { outer_s, unit_s: Some(u), .. }) => {
+            if wall_s < *outer_s {
+                WallCheck::BelowBudget
+            } else if wall_s < outer_s.saturating_add(*u) {
+                WallCheck::BelowOneUnit
+            } else {
+                WallCheck::Ok
+            }
+        }
+    };
+    HookBounds { stall_s, wall_s, from, check, budget }
+}
+
+/// 복원 로그 한 줄 — r2 §6-3(6) 의 비교 결과(BelowBudget 은 원문 문장 그대로).
+pub fn wall_check_sentence(b: &HookBounds) -> String {
+    let w = b.wall_s;
+    match (&b.check, &b.budget) {
+        (WallCheck::NoComparison(why), _) => format!("hook wall bound {w} s: no comparison with the restore budget ({why})"),
+        (check, Some(PlanBudget { outer_s: x, unit_s, units: u })) => {
+            let unit = unit_s.unwrap_or(0);
+            match check {
+                WallCheck::BelowBudget => format!("hook wall bound {w} s is below this roster's restore budget {x} s ({u} units)"),
+                WallCheck::BelowOneUnit => format!(
+                    "hook wall bound {w} s is less than one unit ({unit} s) above this roster's restore budget {x} s ({u} units)"
+                ),
+                _ => format!("hook wall bound {w} s covers this roster's restore budget {x} s ({u} units) plus one unit ({unit} s)"),
+            }
+        }
+        (_, None) => format!("hook wall bound {w} s"),
+    }
+}
+
+/// CEO 조건 ⒝ — W·X·U 를 계획 산출물에 싣는 데몬의 한 줄(`cysd-hook-wall/1 <JSON>`).
+pub fn hook_wall_line(b: &HookBounds) -> String {
+    let from = match b.from {
+        WallFrom::Default => "default",
+        WallFrom::DefaultCapped => "default_capped",
+        WallFrom::Knob => "knob",
+    };
+    let check = match &b.check {
+        WallCheck::NoComparison(why) => format!("no_comparison: {why}"),
+        WallCheck::Ok => "ok".into(),
+        WallCheck::BelowBudget => "below_budget".into(),
+        WallCheck::BelowOneUnit => "below_one_unit".into(),
+    };
+    let v = serde_json::json!({
+        "wall_s": b.wall_s,
+        "stall_s": b.stall_s,
+        "wall_from": from,
+        "restore_outer_s": b.budget.as_ref().map(|x| x.outer_s),
+        "restore_units": b.budget.as_ref().map(|x| x.units),
+        "restore_unit_s": b.budget.as_ref().and_then(|x| x.unit_s),
+        "check": check,
+    });
+    format!("{HOOK_WALL_PREFIX}{v}")
+}
+
+/// 훅 뒤 계획의 사유에서 훅 탓으로 돌릴 수 있는 것(r1 §7-4 N6 · r2 §6-4 N6b) → (N6 역할, N6b 역할).
+pub fn hook_attributable(reasons: &[String]) -> (Vec<String>, Vec<String>) {
+    let roles = |prefix: &str| -> Vec<String> {
+        reasons
+            .iter()
+            .filter_map(|r| r.strip_prefix(prefix))
+            .flat_map(|rest| rest.split(','))
+            .filter(|r| !r.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    (roles("roster_shrunk_across_hook:"), roles("tombstoned_across_hook_unproven:"))
+}
+
 #[cfg(test)]
 mod prerestore_decide_tests {
     use super::*;
@@ -689,5 +878,129 @@ mod plan_outcome_tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod hook_bounds_tests {
+    use super::*;
+
+    fn b(outer_s: u64, unit_s: Option<u64>, units: u64) -> Option<PlanBudget> {
+        Some(PlanBudget { outer_s, unit_s, units })
+    }
+
+    /// ★D4′ (CEO d34b1099 §4) — 기본 벽 = max(1800, X + 한 단위), 3600 에서 자른다. 여유는 정확히 한 단위 이상이고,
+    /// 경계(X + u = 1800 · 3600)는 잘리지 않는다.
+    #[test]
+    fn d4_prime_default_is_floor_or_budget_plus_one_unit() {
+        for (x, u, units, wall, from, check) in [
+            (1300, 69, 19, 1800, WallFrom::Default, WallCheck::Ok),
+            (1731, 69, 25, 1800, WallFrom::Default, WallCheck::Ok), // X + u = 1800 — 바닥과 같다
+            (1732, 69, 25, 1801, WallFrom::Default, WallCheck::Ok), // 바닥을 한 초 넘는다
+            (1778, 69, 26, 1847, WallFrom::Default, WallCheck::Ok),
+            (3532, 68, 51, 3600, WallFrom::Default, WallCheck::Ok), // X + u = 3600 — 상한과 같아 잘리지 않는다
+            (3557, 68, 52, 3600, WallFrom::DefaultCapped, WallCheck::BelowOneUnit),
+            (3625, 69, 53, 3600, WallFrom::DefaultCapped, WallCheck::BelowBudget),
+        ] {
+            let h = hook_bounds(None, None, b(x, Some(u), units));
+            assert_eq!((h.wall_s, h.from, h.check.clone()), (wall, from, check), "X={x} u={u}");
+            assert_eq!(h.loud(), from == WallFrom::DefaultCapped, "X={x}");
+            assert_eq!(h.stall_s, 90);
+        }
+    }
+
+    /// ★CEO 조건 ⒞ — 노브는 값만 정하고 범위 [90, 3600] 은 그대로다. 노브 벽이 예산보다 짧아도 로그만(loud 아님).
+    #[test]
+    fn wall_knob_keeps_its_range_and_is_never_loud() {
+        let budget = b(1300, Some(69), 19);
+        for (knob, wall) in [("90", 90), ("50", 90), ("0", 90), ("9999", 3600), (" 2000 ", 2000), ("3600", 3600)] {
+            let h = hook_bounds(None, Some(knob), budget.clone());
+            assert_eq!((h.wall_s, h.from), (wall, WallFrom::Knob), "{knob:?}");
+            assert!(!h.loud(), "{knob:?}");
+        }
+        assert_eq!(hook_bounds(None, Some("90"), budget.clone()).check, WallCheck::BelowBudget);
+        assert_eq!(hook_bounds(None, Some("1330"), budget.clone()).check, WallCheck::BelowOneUnit);
+        assert_eq!(hook_bounds(None, Some("1369"), budget.clone()).check, WallCheck::Ok);
+        // 해석할 수 없는 노브는 없는 것과 같다(기본값 경로).
+        assert_eq!(hook_bounds(None, Some("x"), budget).from, WallFrom::Default);
+    }
+
+    #[test]
+    fn stall_knob_is_clamped_to_its_range() {
+        for (knob, stall) in [(None, 90), (Some("1"), 30), (Some("45"), 45), (Some("1000"), 600), (Some("bad"), 90)] {
+            assert_eq!(hook_bounds(knob, None, None).stall_s, stall, "{knob:?}");
+        }
+    }
+
+    /// 예산을 모르면 비교하지 않고(그렇다고 말하고) 벽은 바닥 1800 이다.
+    #[test]
+    fn unknown_budget_is_no_comparison_at_the_floor() {
+        let h = hook_bounds(None, None, None);
+        assert_eq!((h.wall_s, h.from), (1800, WallFrom::Default));
+        assert!(matches!(h.check, WallCheck::NoComparison(_)) && !h.loud());
+        let f = hook_bounds(None, None, b(90, None, 3));
+        assert_eq!(f.wall_s, 1800);
+        assert_eq!(f.check, WallCheck::NoComparison("restore unit unknown (budget fallback)"));
+        assert!(wall_check_sentence(&f).contains("no comparison"), "{}", wall_check_sentence(&f));
+    }
+
+    /// r2 §6-3(6) 의 문장은 원문 그대로다.
+    #[test]
+    fn below_budget_sentence_is_the_design_text() {
+        let h = hook_bounds(None, Some("1800"), b(2000, Some(69), 29));
+        assert_eq!(wall_check_sentence(&h), "hook wall bound 1800 s is below this roster's restore budget 2000 s (29 units)");
+        let one = hook_bounds(None, None, b(3557, Some(68), 52));
+        assert_eq!(
+            wall_check_sentence(&one),
+            "hook wall bound 3600 s is less than one unit (68 s) above this roster's restore budget 3557 s (52 units)"
+        );
+    }
+
+    /// ★CEO 조건 ⒝ — W·X·U 는 계획 산출물에 실린다. 그 줄은 계획 줄이 아니다(판독기가 세지 않는다).
+    #[test]
+    fn hook_wall_line_carries_w_x_u_and_is_not_a_plan_frame() {
+        let line = hook_wall_line(&hook_bounds(None, None, b(3557, Some(68), 52)));
+        assert!(line.starts_with(HOOK_WALL_PREFIX) && !line.as_bytes().starts_with(PLAN_FRAME_PREFIX), "{line}");
+        let v: Value = serde_json::from_str(&line[HOOK_WALL_PREFIX.len()..]).unwrap();
+        assert_eq!(v["wall_s"], 3600);
+        assert_eq!(v["restore_outer_s"], 3557);
+        assert_eq!(v["restore_units"], 52);
+        assert_eq!(v["restore_unit_s"], 68);
+        assert_eq!(v["wall_from"], "default_capped");
+        assert_eq!(v["check"], "below_one_unit");
+        assert!(!line.contains('\n'));
+    }
+
+    #[test]
+    fn plan_budget_reads_the_one_framed_line() {
+        let obs = r#"{"phoenix_plan":1,"outcome":"empty","targets":[],"reasons":[],"identity":"verified","observed":{"restore_outer_s":1300,"restore_unit_s":69,"restore_units":19,"restore_budget_source":"javis_budget"}}"#;
+        let out = format!("log\nphoenix-plan/1 {obs}\n{}\n", hook_wall_line(&hook_bounds(None, None, None)));
+        assert_eq!(plan_budget(out.as_bytes()), b(1300, Some(69), 19));
+        let fallback = obs.replace("\"javis_budget\"", "\"fallback\"").replace(":69", ":null");
+        assert_eq!(plan_budget(format!("phoenix-plan/1 {fallback}\n").as_bytes()), b(1300, None, 19));
+        let float_unit = obs.replace(":69", ":68.4");
+        assert_eq!(plan_budget(format!("phoenix-plan/1 {float_unit}\n").as_bytes()), None);
+        let no_outer = obs.replace("\"restore_outer_s\":1300,", "");
+        assert_eq!(plan_budget(format!("phoenix-plan/1 {no_outer}\n").as_bytes()), None);
+        assert_eq!(plan_budget(format!("phoenix-plan/1 {obs}\nphoenix-plan/1 {obs}\n").as_bytes()), None);
+        assert_eq!(plan_budget(b"no plan here\n"), None);
+    }
+
+    #[test]
+    fn hook_attributable_splits_n6_and_n6b_roles() {
+        let reasons: Vec<String> = [
+            "liveness_unknown",
+            "roster_shrunk_across_hook:worker-2,worker-3",
+            "tombstoned_across_hook_unproven:cso",
+            "restore_lock_held",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            hook_attributable(&reasons),
+            (vec!["worker-2".to_string(), "worker-3".to_string()], vec!["cso".to_string()])
+        );
+        assert_eq!(hook_attributable(&["liveness_unknown".to_string()]), (vec![], vec![]));
     }
 }
