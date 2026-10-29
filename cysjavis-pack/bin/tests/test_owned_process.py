@@ -496,6 +496,62 @@ Path(%r).write_text(str(r))
         self.assertTrue(result['timed_out'],result)
         self.assertFalse(result['complete'])
 
+    def run_fa(self, launch, timeout, arm, name):
+        """Fix A specimens: run_owned with grace 600 / force 5 in a driver process (the old bytes block for the
+        whole grace). The output holder publishes its pid as <name>; returns (returned, RESULT dict, output)."""
+        script = self.root/'fa_driver.py'
+        script.write_text(_FA_DRIVER % {'bin': str(BIN), 'arm': arm, 'launch': launch, 'timeout': timeout})
+        out_f = open(self.root/'fa.out', 'w')
+        p = subprocess.Popen([PYTHON, '-B', str(script)], stdout=out_f, stderr=subprocess.STDOUT,
+                             start_new_session=(os.name == 'posix'))
+        self.children.append(p)
+        self.marker(name)
+        try:
+            p.wait(timeout=60)  # wallclock: guard 60 s only ends a hang; the old bytes spend the 600 s grace, the verdict is that run_owned returned
+            returned = True
+        except subprocess.TimeoutExpired:
+            returned = False
+            if os.name == 'posix':
+                os.killpg(p.pid, signal.SIGKILL)
+        out_f.close()
+        out = (self.root/'fa.out').read_text()
+        result = [json.loads(l[7:]) for l in out.splitlines() if l.startswith('RESULT ')]
+        return returned, (result[0] if result else None), out
+
+    @unittest.skipUnless(os.name == 'posix', 'POSIX setsid twin of the nt held-output stall; on nt that is the held-output checklist test')
+    def test_cooperative_window_ends_when_the_leader_is_gone(self):
+        # F-A1: run_owned as run_preflight builds it. At the timeout the leader self-stops; a setsid grandchild keeps
+        # the output open. Nobody is left to cooperate, so the 600 s grace must not be spent.
+        code = "import os,time;from pathlib import Path;_marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(os.getpid()));os.replace(_tmp,_marker);time.sleep(3600)" % str(self.root/'fa1-holder')
+        child = self.root/'fa1_child.py'
+        child.write_text("import subprocess,sys,time\nsubprocess.Popen([sys.executable,'-B','-c',%r],start_new_session=True)\ntime.sleep(3600)\n" % code)
+        launch = [PYTHON, '-B', str(BIN/'_owned_process.py'), '--command', PYTHON, '-B', str(child)]
+        returned, result, out = self.run_fa(launch, 1, str(self.root/'fa1-holder'), 'fa1-holder')
+        self.assertTrue(returned, 'cooperative window outlived the leader (grace 600 s): %r' % out[-400:])
+        self.assertTrue(result and result['timed_out'], out[-400:])
+        self.assertFalse(result['complete'], result)
+
+    def test_leader_crash_without_done_skips_the_cooperative_window(self):
+        # F-A2: the leader crashes (control closed without DONE) while a grandchild keeps the output open.
+        code = "import os,time;from pathlib import Path;_marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(os.getpid()));os.replace(_tmp,_marker);time.sleep(3600)" % str(self.root/'fa2-holder')
+        script = self.root/'fa2_leader.py'
+        script.write_text("import os,subprocess,sys,time\nfrom pathlib import Path\nsys.path.insert(0,%r)\nfrom _owned_process import managed_main\ndef main():\n subprocess.Popen([sys.executable,'-B','-c',%r])\n while not Path(%r).exists(): time.sleep(.01)\n os._exit(3)\nmanaged_main(main)\n" % (str(BIN), code, str(self.root/'fa2-holder')))
+        returned, result, out = self.run_fa([PYTHON, '-B', str(script)], 30, '', 'fa2-holder')
+        self.assertTrue(returned, 'cooperative window outlived a crashed leader (grace 600 s): %r' % out[-400:])
+        self.assertIn('control closed without DONE', (result or {}).get('reason', ''), out[-400:])
+        self.assertFalse(result['complete'], result)
+
+    def test_checklist_timeout_renders_could_not_measure(self):
+        # C (H-13 at the C-03 point): a real run_preflight timeout renders the could-not-measure line, never a
+        # BLOCK count. Fix A may change only how long this path takes, never the line.
+        sys.path.insert(0,str(BIN))
+        import javis_checklist as ck
+        child=self.root/'h13_child.py'
+        child.write_text("import subprocess,sys,time\nsubprocess.Popen([sys.executable,'-B','-c','import time;time.sleep(30)'])\ntime.sleep(30)\n")
+        line=ck._preflight_line([PYTHON,'-B',str(child)],timeout=1)
+        self.assertEqual(line,'preflight: 실행불가(timeout)')
+        self.assertNotIn('BLOCK',line)
+
     def test_normal_custom_command_retains_exit(self):
         sys.path.insert(0,str(BIN))
         import javis_checklist as ck
@@ -1085,6 +1141,28 @@ if __name__=='__main__':
         self.assertEqual(p.returncode,124,err)
         self.assertIn(b'input incomplete',out)
         self.assertNotIn(b'Fatal Python error',err)
+
+
+# Fix A (design r1 15acd497 s2.4): after a timeout or a crash the owner must stop spending grace once the leader is
+# gone (control-eof). The driver runs run_owned with grace 600 and force 5 and prints one RESULT line. With an arm
+# path, the timeout starts only once that file exists (the output holder is up), as in the held-output tests.
+_FA_DRIVER = r'''
+import json, os, subprocess, sys
+from pathlib import Path
+sys.path.insert(0, %(bin)r)
+import _owned_process as owned
+arm = %(arm)r
+if arm:
+    clock = owned.monotonic; origin = clock(); armed = []
+    def ready_clock():
+        now = clock()
+        if not armed and Path(arm).exists():
+            armed.append(now)
+        return origin + (now - armed[0] if armed else 0)
+    owned.monotonic = ready_clock; subprocess._time = ready_clock
+r = owned.run_owned(%(launch)r, %(timeout)r, grace=600, force=5)
+print('RESULT ' + json.dumps({k: r[k] for k in ('timed_out', 'complete', 'cleanup', 'reason')}), flush=True)
+'''
 
 
 # E(ii) (design r2 d4af60af): a pool that never becomes ready, or breaks while a worker outlives terminate(),

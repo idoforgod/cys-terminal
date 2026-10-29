@@ -269,6 +269,7 @@ def run_owned(cmd, timeout, grace=0.0, force=5.0, cancel=None, env=None, encodin
     """Bounded capture. Never poll/reap before teardown of the owned tree.
 
     timeout includes startup/execution; grace+force are shared cleanup allowances.
+    Grace ends early once the leader is gone (control-eof): nobody is left to cooperate.
     Every launch requires private admission/completion. Explicit custom commands
     use the managed command adapter; there is no uncontained launch mode.
     """
@@ -375,7 +376,10 @@ def run_owned(cmd, timeout, grace=0.0, force=5.0, cancel=None, env=None, encodin
                     _CONTEXT.downstream.discard(writer)
         expected_eof = {'out-eof', 'err-eof', 'control-eof'}
         cooperative_end = monotonic() + (grace if timed_out or fault else 0)
-        while readers_started and remaining(cooperative_end) > 0 and not expected_eof <= eof:
+        # The leader closes control only by exiting (self-stop or crash), so
+        # control-eof ends the window: the rest of the grace would be pure waiting.
+        while (readers_started and remaining(cooperative_end) > 0 and not expected_eof <= eof
+               and 'control-eof' not in eof):
             try:
                 label, data = events.get(timeout=min(.02, remaining(cooperative_end)))
             except queue.Empty:
