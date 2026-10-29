@@ -1695,7 +1695,8 @@ fn inject_master_confirmed(
         note_body: true, // the old Inject arm recorded every envelope (owner None)
         body_owner: None,
     };
-    let ok = surface.write_tx.try_send(crate::state::WriteReq::Agent(Box::new(job))).is_ok();
+    let busy = d9.is_some() && crate::governance::d9_writer_busy(surface, handoff.producer(), &inbox_id.to_string(), true);
+    let ok = !busy && surface.write_tx.try_send(crate::state::WriteReq::Agent(Box::new(job))).is_ok();
     if !ok {
         surface.inject_track.undo_handoff(mark);
     }
@@ -1709,6 +1710,22 @@ enum InboxHandoff {
     New,
     /// A redelivery of an `injected` row: its previous `injected_ts` and `redelivered` (redeliver_unacked).
     Redeliver { prev_injected_ts: f64, prev_redelivered: i64 },
+}
+
+impl InboxHandoff {
+    fn producer(self) -> crate::governance::ClaimProducer {
+        match self {
+            Self::New => crate::governance::ClaimProducer::ChannelNew,
+            Self::Redeliver { .. } => crate::governance::ClaimProducer::ChannelRedeliver,
+        }
+    }
+}
+
+fn counted_writer_hold(surface: &crate::state::Surface, producer: crate::governance::ClaimProducer, item: &str) -> InboxHold {
+    if crate::governance::d9_hold_age(surface, producer, item)
+        .is_some_and(|age| age > std::time::Duration::from_secs(CHANNEL_WRITER_STUCK_SECS)) {
+        InboxHold::WriterBusy
+    } else { InboxHold::Paced }
 }
 
 /// ★(0.14.52 · S-a C6b) Settlement of one inbox envelope after the writer's terminal (design 4.5; runs on the master seat's
@@ -1728,6 +1745,10 @@ impl ChannelSettle {
         use crate::agent_write::Terminal as T;
         let Some(daemon) = self.daemon.upgrade() else { return };
         let sid = self.surface.upgrade().map(|s| s.id);
+        if let Some(surface) = self.surface.upgrade() {
+            let wrote = matches!(t, T::WrittenSubmitted { .. } | T::WrittenBody { .. } | T::PartialExact { .. } | T::PartialUnknown { .. });
+            crate::governance::d9_terminal(&surface, self.handoff.producer(), &self.inbox_id.to_string(), wrote);
+        }
         match t {
             T::WrittenSubmitted { .. } => {
                 daemon.bus.publish(
@@ -1886,15 +1907,18 @@ fn deliver_new_inbox_with(daemon: &Arc<Daemon>, conn: &Connection) -> InboxDeliv
             Err(_) => return out,
         }
     };
+    let producer = crate::governance::ClaimProducer::ChannelNew;
+    if let Some(s) = daemon.get_surface(sid) {
+        crate::governance::d9_keep_item(&s, producer, rows.first().map(|r| r.0.to_string()).as_deref());
+    }
     let lag_on = crate::governance::machine_hold_enabled(crate::governance::MachineInjector::Channel);
     for (inbox_id, channel, sender_id, created_ts) in rows {
-        // ⓪ 간격(루프당 1행 · 앞 Inject 의 붙여넣기~CR + 간격 뒤에만 판정) — 노브 on 일 때만.
-        if lag_on
-            && (!out.delivered.is_empty()
-                || daemon.get_surface(sid).is_some_and(|s| master_inject_settling(&s)))
-        {
-            // ★(R1-F4) writer 가 막혔으면(한 arm 이 [`CHANNEL_WRITER_STUCK_SECS`] 초과 · 넘긴 앞 행을 그만큼 못 끝냄) 간격이
-            //   아니라 인계 정체다 — 후속 루프를 걸지 않는다(15s sweep 이 이어받는다 · 사유 writer_busy 로 보인다).
+        if lag_on && !out.delivered.is_empty() {
+            out.hold = Some(InboxHold::Paced);
+            break;
+        }
+        if lag_on && daemon.get_surface(sid).is_some_and(|s| (!crate::governance::d9_scope(daemon, &s, false) || s.write_tx.gate().pending() == 0) && master_inject_settling(&s)) {
+            if let Some(s) = daemon.get_surface(sid) { crate::governance::d9_nonwriter_hold(&s, producer); }
             let stuck = daemon.get_surface(sid).is_some_and(|s| master_writer_stuck(&s));
             out.hold = Some(if stuck { InboxHold::WriterBusy } else { InboxHold::Paced });
             break;
@@ -1906,10 +1930,15 @@ fn deliver_new_inbox_with(daemon: &Arc<Daemon>, conn: &Connection) -> InboxDeliv
         let surface = match master_hold(daemon, sid) {
             Ok(s) => s,
             Err(h) => {
+                if let Some(s) = daemon.get_surface(sid) { crate::governance::d9_nonwriter_hold(&s, producer); }
                 out.hold = Some(h);
                 break; // 행은 new — 다음 sweep 에서 재시도(순서 보존).
             }
         };
+        if d9.is_some() && crate::governance::d9_writer_busy(&surface, producer, &inbox_id.to_string(), false) {
+            out.hold = Some(counted_writer_hold(&surface, producer, &inbox_id.to_string()));
+            break;
+        }
         let text: String = conn
             .query_row("SELECT text FROM inbox WHERE id=?1", [inbox_id], |r| r.get(0))
             .unwrap_or_default();
@@ -1938,7 +1967,9 @@ fn deliver_new_inbox_with(daemon: &Arc<Daemon>, conn: &Connection) -> InboxDeliv
                 "UPDATE inbox SET state='new', injected_ts=NULL WHERE id=?1 AND state='injected'",
                 [inbox_id],
             );
-            out.hold = Some(InboxHold::WriterBusy);
+            out.hold = Some(if crate::governance::d9_hold_age(&surface, producer, &inbox_id.to_string()).is_some() {
+                counted_writer_hold(&surface, producer, &inbox_id.to_string())
+            } else { InboxHold::WriterBusy });
             break; // 주입 채널 정체 — 다음 sweep에서 재시도(순서 보존).
         }
     }
@@ -1980,19 +2011,30 @@ fn redeliver_unacked(daemon: &Arc<Daemon>, conn: &Connection) -> usize {
             .collect::<rusqlite::Result<Vec<_>>>()
         })
         .unwrap_or_default();
+    let producer = crate::governance::ClaimProducer::ChannelRedeliver;
+    if let Some(s) = daemon.get_surface(sid) {
+        // Eligibility (TTL/count/age) is not existence: an in-flight row has a fresh injected_ts.
+        let item = s.claim_streaks.lock().unwrap_or_else(|e| e.into_inner())[producer.index()].as_ref().map(|x| x.item.clone());
+        if let Some(item) = item {
+            let still_unacked: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM inbox WHERE id=?1 AND state='injected')", [&item], |r| r.get(0)).unwrap_or(true);
+            if !still_unacked { crate::governance::d9_clear_item(&s, producer, &item); }
+        }
+    }
     let lag_on = crate::governance::machine_hold_enabled(crate::governance::MachineInjector::Channel);
     let mut n = 0;
     for (inbox_id, channel, sender_id, created_ts, redelivered, injected_ts) in rows {
-        // ★(리뷰 F1-H3-batch-flush-stale-verdict) 신규 배달과 같은 간격(루프당 1행 · 앞 Inject + 간격 뒤) — 노브 on 일 때만.
-        //   재배달은 sweep(15s)마다 1행씩 나간다(기본 꺼짐 노브 · 후속 루프는 예약하지 않는다).
-        if lag_on && (n > 0 || daemon.get_surface(sid).is_some_and(|s| master_inject_settling(&s))) {
+        if lag_on && n > 0 { break; }
+        if lag_on && daemon.get_surface(sid).is_some_and(|s| (!crate::governance::d9_scope(daemon, &s, false) || s.write_tx.gate().pending() == 0) && master_inject_settling(&s)) {
+            if let Some(s) = daemon.get_surface(sid) { crate::governance::d9_nonwriter_hold(&s, producer); }
             break;
         }
         // ★(0.14.56 · D3-BOUND r2 §1.2, §3.3) S0 before the judgment, as for a new row.
         let d9 = daemon.get_surface(sid).and_then(|m| crate::governance::D9WriterGuard::for_target(daemon, &m));
         let Ok(surface) = master_hold(daemon, sid) else {
+            if let Some(s) = daemon.get_surface(sid) { crate::governance::d9_nonwriter_hold(&s, producer); }
             break;
         };
+        if d9.is_some() && crate::governance::d9_writer_busy(&surface, producer, &inbox_id.to_string(), false) { break; }
         let text: String = conn
             .query_row("SELECT text FROM inbox WHERE id=?1", [inbox_id], |r| r.get(0))
             .unwrap_or_default();
@@ -4465,84 +4507,152 @@ mod tests {
         h3_done(&m);
     }
 
-    /// ★(0.14.42 · H3 간격 경쟁 — 발행 준비 발견 · RUNBOOK §0-2b) 앞 행을 writer 에 **넘겼으나 writer 가 아직 집지 않은** 창에서
-    /// 돈 배달 루프는 다음 행을 판정·주입하지 않는다(`Paced`). 창을 결정론으로 연다 — writer 를 비-Inject 쓰기(선행 적체:
-    /// 직접 send 의 `SubmitAfterGap` 최소 간격 수면·큰 본문 쓰기와 같은 자리)로 붙잡아 앞 행 Inject 가 대기열에 서게 한다.
-    /// 다음 행은 앞 행의 끝 CR + [`CHANNEL_ROW_GAP_MS`] 뒤에 나간다(유실 0 · FIFO).
-    /// RED(HEAD c276cb73): 간격을 writer `begin()` 부터 재서 둘째 루프가 뒤 행을 곧바로 주입(두 행이 writer 에서 간격 없이 이어진다).
+    /// D3-BOUND h3 pin changed beyond the design's list: an already-busy writer holds; a write racing after the
+    /// final idle observation still causes a claim refusal. Row 1 is retried, and row 2 follows its CR plus gap.
+    /// Ledger count = 3 (one refused handoff and two written envelopes), as required by head ruling B.
     #[cfg(unix)]
     #[test]
     fn h3_row_handed_before_writer_pickup_paces_next_row() {
-        const HOLD_MS: u64 = 700;
         let (d, m) = h3_rig("h3-handoff");
         let ids = [h3_seed(&d, "q0", now()), h3_seed(&d, "q1", now())];
-        // ★(0.14.43 · 통합 2) 하한의 기준 시각 — 선행 쓰기를 넘기기 **직전**. writer 가 그 쓰기를 집어 자는 시각은 이보다 빠를 수
-        //   없고, 그 뒤 첫 행의 붙여넣기 + 500ms(cr_delay) + CR + [`CHANNEL_ROW_GAP_MS`] 전에는 다음 행이 나갈 수 없다.
-        //   종전엔 첫 행 인계 **뒤**(`t_hand`)를 재고 "선행 쓰기를 넘긴 뒤 정확히 50ms 뒤" 를 가정했다 — 스케줄 지연으로 그 50ms
-        //   수면이 길어지면 `t_hand` 가 늦어져 하한에 못 미쳤다(전량 실행 간헐 적색). 지금 하한은 수면 오차와 무관하다.
-        let t_send = std::time::Instant::now();
-        m.write_tx
-            .send(crate::state::WriteReq::DataAfter { bytes: Vec::new(), delay_ms: HOLD_MS })
-            .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(50)); // writer 가 선행 쓰기를 집고 자는 중
         let pass = |d: &Arc<Daemon>| {
-            let mut g = d.channels.lock().unwrap();
-            deliver_new_inbox_with(d, g.as_mut().unwrap())
+            let g = d.channels.lock().unwrap();
+            deliver_new_inbox_with(d, g.as_ref().unwrap())
         };
-        let r1 = pass(&d);
-        assert_eq!(r1.delivered, vec![ids[0]], "전제: 첫 행 인계");
-        assert!(
-            !m.inject_track.busy_within(std::time::Duration::from_millis(CHANNEL_ROW_GAP_MS)),
-            "전제: writer 가 앞 행을 아직 집지 않았다(begin 전)"
-        );
-        let r2 = pass(&d);
-        assert!(r2.delivered.is_empty(), "writer 가 앞 행을 집기 전 창에서 다음 행을 주입했다(간격 0 · 낡은 판정)");
-        assert_eq!(r2.hold, Some(InboxHold::Paced), "인계 대기는 간격(Paced)이다 — 막힌 writer 가 아니다");
-        assert_eq!(h3_state(&d, ids[1]), "new");
-        assert_eq!(h3_drain(&d, 1), vec![ids[1]], "간격 뒤 다음 행(유실 0 · FIFO)");
-        let floor = std::time::Duration::from_millis(HOLD_MS + 500 + CHANNEL_ROW_GAP_MS);
-        assert!(t_send.elapsed() >= floor, "다음 행이 앞 행 끝 CR + 간격 전에 나갔다: {:?} < {floor:?}", t_send.elapsed());
-        assert_eq!(crate::governance::h_ledger_count(&d, "channel"), 2, "각 1회");
+        // First population: already busy -> no handoff (RED on pre-I2).
+        let held = crate::agent_queue_tests::hold_writer(&m);
+        let busy = pass(&d);
+        assert!(busy.delivered.is_empty(), "h3: busy before judgment must hold");
+        held.send(()).unwrap();
+        crate::agent_queue_tests::wait_until("idle before race", || m.write_tx.gate().pending() == 0);
+        // Second population: a write enters AFTER the late idle observation; D9 must still refuse it.
+        let release = Arc::new(std::sync::Mutex::new(None));
+        {
+            let m = m.clone(); let release = release.clone();
+            crate::agent_write::set_test_after_writer_idle(move || {
+                *release.lock().unwrap() = Some(crate::agent_queue_tests::hold_writer(&m));
+                m.write_tx.send(crate::state::WriteReq::Data(Vec::new())).unwrap();
+            });
+        }
+        assert_eq!(pass(&d).delivered, vec![ids[0]], "h3: row 1 handed in the late race");
+        assert!(pass(&d).delivered.is_empty(), "h3: row 2 must wait for row 1");
+        release.lock().unwrap().take().unwrap().send(()).unwrap();
+        crate::agent_queue_tests::wait_until("race settlement", || m.write_tx.gate().pending() == 0);
+        assert_eq!(h3_state(&d, ids[0]), "new", "h3: claim must refuse the write ahead");
+        let refused: Vec<_> = d.bus.tail(400).into_iter().filter(|e| e["name"] == "channel.message.write_refused").collect();
+        assert_eq!(refused.len(), 1, "h3: claim refusal count");
+        assert_eq!(refused[0]["payload"]["reason"], json!("guard_aborted"));
+        let retry_started = std::time::Instant::now();
+        assert_eq!(pass(&d).delivered, vec![ids[0]], "h3: retry delivered row 1");
+        assert_eq!(h3_drain(&d, 1), vec![ids[1]], "h3: delivered row 2 after retry and gap");
+        assert!(retry_started.elapsed() >= std::time::Duration::from_millis(500 + CHANNEL_ROW_GAP_MS), "h3: second row before row 1 CR plus gap");
+        assert_eq!(crate::governance::h_ledger_count(&d, "channel"), 3, "h3: refusal + two written rows");
         h3_done(&m);
     }
 
-    /// ★(0.14.56 · P1 D9 pre-CR · head ruling (B) on D3-H3-RIPPLE, condition 2 - BOUND measurement) K consecutive passes, each
-    /// handing the row while a write is ahead of it in the in-scope master's writer: the W-6 claim check refuses the row on EVERY
-    /// pass (0 bytes, back to `new`). Nothing in the channel loop caps that: the row is delivered only by a pass without a write
-    /// ahead (the last one here), and `channel.message.write_refused` is published for the FIRST refusal of the row only, so
-    /// refusals 2..K are silent. This specimen measures that; it is not a bound.
+    /// S-C1: five busy observations hold without a ledger record; the first idle pass delivers.
     #[cfg(unix)]
     #[test]
     fn d9_h3_row_refused_on_every_pass_with_a_write_ahead_until_one_without() {
-        const K: usize = 5;
         let (d, m) = h3_rig("d9-h3-kpass");
         let id = h3_seed(&d, "k0", now());
-        let pass = |d: &Arc<Daemon>| {
-            let mut g = d.channels.lock().unwrap();
-            deliver_new_inbox_with(d, g.as_mut().unwrap())
-        };
-        let wait_state = |want: &str| {
-            let t0 = std::time::Instant::now();
-            while h3_state(&d, id) != want && t0.elapsed() < std::time::Duration::from_secs(5) {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            h3_state(&d, id)
-        };
-        for k in 0..K {
-            // A write ahead: the writer is inside a 300 ms request when the row is handed.
-            m.write_tx.send(crate::state::WriteReq::DataAfter { bytes: Vec::new(), delay_ms: 300 }).unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(30));
-            let r = pass(&d);
-            assert_eq!(r.delivered, vec![id], "pass {k}: the row is handed (the loop does not see the write ahead): hold {:?}", r.hold);
-            assert_eq!(wait_state("new"), "new", "pass {k}: refused at claim and rolled back");
+        let release = crate::agent_queue_tests::hold_writer(&m);
+        for k in 0..5 {
+            let r = {
+                let g = d.channels.lock().unwrap();
+                deliver_new_inbox_with(&d, g.as_ref().unwrap())
+            };
+            assert_eq!(crate::governance::h_ledger_count(&d, "channel"), 0, "S-C1: zero pre-records during busy pass {k}");
+            assert!(r.delivered.is_empty(), "S-C1: busy pass holds");
+            assert_eq!(r.hold, Some(InboxHold::Paced));
+            assert_eq!(h3_state(&d, id), "new");
         }
-        let refused: Vec<_> = d.bus.tail(400).into_iter().filter(|e| e["name"] == "channel.message.write_refused").collect();
-        assert_eq!(refused.len(), 1, "one event for K refusals of the same row: {refused:?}");
-        assert_eq!(crate::governance::h_ledger_count(&d, "channel"), K, "one ledger record per refused hand-off");
-        // A pass with no write ahead delivers it.
-        assert_eq!(h3_drain(&d, 1), vec![id], "delivered by the first pass without a write ahead");
-        assert_eq!(wait_state("injected"), "injected");
-        assert_eq!(crate::governance::h_ledger_count(&d, "channel"), K + 1);
+        assert_eq!(d.bus.tail(400).iter().filter(|e| e["name"] == "channel.message.write_refused").count(), 0, "S-C1: no refusals during holds");
+        release.send(()).unwrap();
+        crate::agent_queue_tests::wait_until("writer idle", || m.write_tx.gate().pending() == 0);
+        let r = {
+            let g = d.channels.lock().unwrap();
+            deliver_new_inbox_with(&d, g.as_ref().unwrap())
+        };
+        assert_eq!(r.delivered, vec![id], "S-C1: first idle pass delivers");
+        assert_eq!(crate::governance::h_ledger_count(&d, "channel"), 1);
+        h3_done(&m);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn d9_bound_i2_outside_scope_keeps_channel_pacing() {
+        let (d, m) = h3_rig("i2-ch-scope");
+        *m.agent_meta.lock().unwrap() = None;
+        m.seat_cache.store(crate::governance::SeatState::Empty.as_u8(), std::sync::atomic::Ordering::Relaxed);
+        assert!(!crate::governance::d9_scope(&d, &m, false));
+        h3_seed(&d, "scope", now());
+        let release = crate::agent_queue_tests::hold_writer(&m);
+        m.inject_track.note_handoff();
+        let r = { let g = d.channels.lock().unwrap(); deliver_new_inbox_with(&d, g.as_ref().unwrap()) };
+        release.send(()).unwrap();
+        assert_eq!(r.hold, Some(InboxHold::Paced), "S-SCOPE channel: old pacing precedes empty-seat gate");
+        assert_eq!(m.writer_holds.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(m.claim_streaks.lock().unwrap().iter().all(Option::is_none));
+        h3_done(&m);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn d9_bound_i2_channel_late_hold_rolls_back_row_and_mark() {
+        let (d, m) = h3_rig("i2-ch-late");
+        let id = h3_seed(&d, "late", now());
+        let release = Arc::new(std::sync::Mutex::new(None));
+        {
+            let m = m.clone(); let release = release.clone();
+            crate::agent_write::set_test_after_pre_record(move |_| *release.lock().unwrap() = Some(crate::agent_queue_tests::hold_writer(&m)));
+        }
+        let r = { let g = d.channels.lock().unwrap(); deliver_new_inbox_with(&d, g.as_ref().unwrap()) };
+        assert!(r.delivered.is_empty(), "channel late hold must not hand off");
+        assert_eq!(r.hold, Some(InboxHold::Paced));
+        assert_eq!(h3_state(&d, id), "new", "late hold rolls back UPDATE");
+        assert!(m.inject_track.handoff_pending().is_none(), "late hold undoes owned handoff mark");
+        release.lock().unwrap().take().unwrap().send(()).unwrap();
+        crate::agent_queue_tests::wait_until("idle", || m.write_tx.gate().pending() == 0);
+        assert_eq!(h3_drain(&d, 1), vec![id]);
+        h3_done(&m);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn d9_bound_i2_redelivery_holds_restore_exact_state_and_keep_inflight_slot() {
+        let (d, m) = h3_rig("i2-redeliver");
+        let _k = crate::governance::HKnobGuard::set(&[("CYS_CHANNEL_REDELIVER_MAX", "2")]);
+        let id = h3_seed(&d, "redelivery", now());
+        let old_ts = now() - INBOX_REDELIVER_TTL_SECS - 20.0;
+        {
+            let g = d.channels.lock().unwrap();
+            g.as_ref().unwrap().execute("UPDATE inbox SET state='injected',injected_ts=?2,redelivered=0 WHERE id=?1", params![id, old_ts]).unwrap();
+        }
+        let pass = || { let g = d.channels.lock().unwrap(); redeliver_unacked(&d, g.as_ref().unwrap()) };
+        let row = || { let g = d.channels.lock().unwrap(); g.as_ref().unwrap().query_row("SELECT injected_ts,redelivered FROM inbox WHERE id=?1", [id], |r| Ok((r.get::<_, f64>(0)?,r.get::<_, i64>(1)?))).unwrap() };
+        let held = crate::agent_queue_tests::hold_writer(&m);
+        assert_eq!(pass(), 0, "redelivery early hold");
+        assert_eq!(crate::governance::h_ledger_count(&d, "channel"), 0);
+        held.send(()).unwrap();
+        crate::agent_queue_tests::wait_until("idle", || m.write_tx.gate().pending() == 0);
+        let release = Arc::new(std::sync::Mutex::new(None));
+        {
+            let m = m.clone(); let release = release.clone();
+            crate::agent_write::set_test_after_pre_record(move |_| *release.lock().unwrap() = Some(crate::agent_queue_tests::hold_writer(&m)));
+        }
+        assert_eq!(pass(), 0, "redelivery late hold");
+        assert_eq!(row(), (old_ts, 0), "late hold restores timestamp and retry count exactly");
+        assert!(m.inject_track.handoff_pending().is_none());
+        release.lock().unwrap().take().unwrap().send(()).unwrap();
+        crate::agent_queue_tests::wait_until("idle", || m.write_tx.gate().pending() == 0);
+        let late_release = crate::agent_queue_tests::d9_late_hold(&m, None);
+        assert_eq!(pass(), 1, "idle redelivery hands off");
+        assert_eq!(pass(), 0, "inflight row not eligible yet");
+        assert!(m.claim_streaks.lock().unwrap()[2].is_some(), "ineligible but unacked row keeps its slot until terminal");
+        late_release.recv_timeout(std::time::Duration::from_secs(10)).expect("late idle seam did not run").send(()).unwrap();
+        crate::agent_queue_tests::wait_until("terminal", || m.write_tx.gate().pending() == 0);
+        assert!(m.claim_streaks.lock().unwrap()[2].is_none(), "byte-writing terminal clears redelivery slot");
         h3_done(&m);
     }
 
@@ -4606,10 +4716,7 @@ mod tests {
         let (d, m) = h3_rig("h3-handoff-draft");
         let sid = m.id;
         let id = h3_seed(&d, "대기열의 앞 행", now());
-        m.write_tx
-            .send(crate::state::WriteReq::DataAfter { bytes: Vec::new(), delay_ms: 600 })
-            .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        let release = crate::agent_queue_tests::d9_late_hold(&m, None);
         {
             let mut g = d.channels.lock().unwrap();
             assert_eq!(deliver_new_inbox_with(&d, g.as_mut().unwrap()).delivered, vec![id], "전제: 인계");
@@ -4624,6 +4731,7 @@ mod tests {
             Some(InboxHold::Gate(crate::governance::MachineHold::Draft)),
             "인계 창에서도 H0 초안 축은 종전대로 본다"
         );
+        release.recv_timeout(std::time::Duration::from_secs(10)).expect("late idle seam did not run").send(()).unwrap();
         h3_done(&m);
     }
 
@@ -4859,6 +4967,7 @@ mod tests {
         crate::governance::h_paint(&m, cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT);
         let r = call(&d, "inbound", inbound_params("slack", "U1", "slack:k1", "HEAD", "user"), own_pid());
         assert_eq!(r["result"]["action"], json!("delivered"), "노브로 끈 채널이 보류했다: {r}");
+        crate::agent_queue_tests::wait_until("first envelope terminal", || m.write_tx.gate().pending() == 0);
         let created = now() - 700.0;
         let late = h3_seed(&d, "늦은 HEAD", created);
         {
@@ -4978,7 +5087,7 @@ mod tests {
 #[cfg(test)]
 mod d9_writer_guard_tests {
     use super::*;
-    use crate::agent_queue_tests::{d9_received, d9_role_recorder, d9_with_write_ahead, fx, wait_until};
+    use crate::agent_queue_tests::{d9_received, d9_role_recorder, d9_with_late_write_ahead, fx, wait_until};
 
     fn refused(daemon: &Arc<Daemon>) -> Vec<serde_json::Value> {
         daemon.bus.tail(400).into_iter().filter(|e| e["name"] == "channel.message.write_refused").collect()
@@ -4993,7 +5102,7 @@ mod d9_writer_guard_tests {
     fn d9_pre_cr_t_w4_channel_envelope_refused_at_claim_writes_nothing() {
         let f = fx("d9-tw4-chan");
         let (s, out) = d9_role_recorder(&f.daemon, &f.dir, "tw4-chan", "master");
-        let handed = d9_with_write_ahead(&s, || inject_master_confirmed(&f.daemon, &s, "[channel] tw4", 7, InboxHandoff::New, crate::governance::D9WriterGuard::for_target(&f.daemon, &s)));
+        let handed = d9_with_late_write_ahead(&s, || inject_master_confirmed(&f.daemon, &s, "[channel] tw4", 7, InboxHandoff::New, crate::governance::D9WriterGuard::for_target(&f.daemon, &s)));
         assert!(handed.is_some(), "premise: handed off");
         // The discriminating assertion first (a written envelope follows the write ahead at once), then its settlement.
         assert_eq!(d9_received(&out, 1), b"T".to_vec(), "0 bytes of the envelope - only the write ahead");

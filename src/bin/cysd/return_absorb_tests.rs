@@ -284,7 +284,7 @@ fn a2_stuck_dead_sender_body_rescued_immediately() {
 fn deliver_now(fx: &Fx, t: &Arc<Surface>) -> bool {
     for _ in 0..40 {
         if crate::governance::deliver_head_locked(
-            &fx.daemon, t, false, false, None, Some(0), None, None,
+            &fx.daemon, t, false, false, None, Some(0), None, None, None,
         )
         .is_some()
         {

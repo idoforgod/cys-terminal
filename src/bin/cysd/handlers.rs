@@ -18338,7 +18338,7 @@ mod tests {
         // ② queue.enqueued 페이로드의 from 은 요청 값 그대로.
         assert_eq!(j3_last_event(&daemon, "queue.enqueued")["from"], json!("cli:send"));
         // ③ 병합 배달 — 같은 라벨 둘은 한 턴 · 머리말 `발신 cli:send`.
-        let d = crate::governance::deliver_head_locked(&daemon, &target, false, false, None, None, None, None)
+        let d = crate::governance::deliver_head_locked(&daemon, &target, false, false, None, None, None, None, None)
             .expect("병합 배달");
         assert_eq!(d.merged_ids.len(), 2, "같은 라벨 둘은 한 다이제스트로 묶인다");
         assert!(d.body.starts_with("[큐 다이제스트 2건 · 발신 cli:send]\n"), "{}", d.body);

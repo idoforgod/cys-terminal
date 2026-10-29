@@ -129,7 +129,7 @@ fn hand_off(fx: &Fx, s: &Arc<Surface>) -> bool {
 /// returns at once on a hand-off, keeps a refusal only from a quiet window and never re-runs on Unix, so an expected
 /// refusal is still a measured one and an unexpected hand-off is never retried away.
 fn hand_off_on(daemon: &Arc<Daemon>, s: &Arc<Surface>) -> bool {
-    crate::state::test_done_or_no_pty_output(s, || deliver_head_locked(daemon, s, true, false, None, None, None, None).is_some())
+    crate::state::test_done_or_no_pty_output(s, || deliver_head_locked(daemon, s, true, false, None, None, None, None, None).is_some())
 }
 
 /// S-T08 positive arm: the item is popped, receipted and announced exactly once — and only after
@@ -1016,7 +1016,7 @@ fn c8pp_resumed_success_releases_original_reservation_after_settlement() {
 fn wp17_normal_handoff(fx: &Fx, s: &Arc<Surface>) -> crate::governance::QueueHandoff {
     let mut result = None;
     crate::state::test_done_or_no_pty_output(s, || {
-        result = deliver_head_locked(&fx.daemon, s, false, false, None, Some(0), None, None);
+        result = deliver_head_locked(&fx.daemon, s, false, false, None, Some(0), None, None, None);
         result.is_some()
     });
     result.expect("eligible queue head must progress")
@@ -1033,7 +1033,7 @@ fn wp17_adjacent_commands_are_separate_submissions_and_keep_interval() {
     assert_eq!(one.merged_ids, vec![first]);
     assert!(one.written_submitted());
     assert_eq!(queue_len(&s), 1);
-    assert!(deliver_head_locked(&fx.daemon, &s, false, false, None, Some(0), None, None).is_none(),
+    assert!(deliver_head_locked(&fx.daemon, &s, false, false, None, Some(0), None, None, None).is_none(),
         "command isolation must not bypass delivery pacing");
     *s.last_queue_delivery_at.lock().unwrap() = Some(Instant::now() - Duration::from_secs(60));
     let two = wp17_normal_handoff(&fx, &s);
@@ -1109,7 +1109,7 @@ fn wp17_unknown_hint_command_delivers_and_records_fallback() {
         gen_at_verdict: s.output_gen.load(Ordering::Acquire), approval_pending: false,
     };
     enqueue(&fx, &s, "/model opus");
-    let d = deliver_head_locked(&fx.daemon, &s, false, false, None, Some(0), None, Some(&recheck))
+    let d = deliver_head_locked(&fx.daemon, &s, false, false, None, Some(0), None, Some(&recheck), None)
         .expect("head ruling: unknown hint keeps ordinary gate, not a new hold");
     assert_eq!(d.body, "/model opus");
     assert!(d.written_submitted());
@@ -1130,13 +1130,13 @@ fn wp17_known_empty_command_records_proof_and_draft_then_empty_progresses() {
     // ordinary handoff recheck considers its saved generation unchanged.
     s.parser.lock().unwrap().process("\x1b[2J\x1b[H❯ draft".as_bytes());
     let audit_before = crate::governance::h_ledger_count(&fx.daemon, "queue");
-    assert!(deliver_head_locked(&fx.daemon, &s, false, false, None, Some(0), None, Some(&recheck)).is_none());
+    assert!(deliver_head_locked(&fx.daemon, &s, false, false, None, Some(0), None, Some(&recheck), None).is_none());
     assert_eq!(crate::governance::h_ledger_count(&fx.daemon, "queue"), audit_before,
         "a later writer refusal cannot stand in for pre-publication admission");
     assert_eq!(queue_len(&s), 1);
     assert!(s.inject_track.last_body().is_none());
     s.parser.lock().unwrap().process("\x1b[2J\x1b[H❯ ".as_bytes());
-    let d = deliver_head_locked(&fx.daemon, &s, false, false, None, Some(0), None, Some(&recheck))
+    let d = deliver_head_locked(&fx.daemon, &s, false, false, None, Some(0), None, Some(&recheck), None)
         .expect("empty observed composer must progress");
     assert!(d.written_submitted());
     assert_eq!(queue_len(&s), 0);
@@ -1149,7 +1149,7 @@ fn wp17_markerless_pending_draft_keeps_ordinary_block_then_recovers() {
     let s = seat(&fx);
     enqueue(&fx, &s, "/model opus");
     s.pending_input_bytes.store(9, Ordering::Relaxed);
-    assert!(deliver_head_locked(&fx.daemon, &s, true, false, None, Some(9), None, None).is_none(),
+    assert!(deliver_head_locked(&fx.daemon, &s, true, false, None, Some(9), None, None, None).is_none(),
         "fallback must not bypass ordinary pending-input gate, even forced");
     assert_eq!(queue_len(&s), 1);
     assert!(s.inject_track.last_body().is_none());
@@ -1178,7 +1178,7 @@ fn wp17_r2_known_multiline_draft_zero_counter_blocks_then_empty_delivers() {
             gen_at_verdict: s.output_gen.load(Ordering::Acquire), approval_pending: false,
         };
         let before = crate::governance::h_ledger_count(&fx.daemon, "queue");
-        assert!(deliver_head_locked(&fx.daemon, &s, forced, false, None, Some(0), None, Some(&recheck)).is_none(),
+        assert!(deliver_head_locked(&fx.daemon, &s, forced, false, None, Some(0), None, Some(&recheck), None).is_none(),
             "recognized occupied multiline region must refuse before publication, forced={forced}");
         assert_eq!(crate::governance::h_ledger_count(&fx.daemon, "queue"), before);
         assert!(s.inject_track.last_body().is_none());
@@ -1188,7 +1188,7 @@ fn wp17_r2_known_multiline_draft_zero_counter_blocks_then_empty_delivers() {
         s.parser.lock().unwrap().process(format!(
             "\x1b[2J\x1b[H{rule}\r\n❯ \r\n{rule}\r\n  ? for shortcuts\x1b[2;3H"
         ).as_bytes());
-        let d = deliver_head_locked(&fx.daemon, &s, forced, false, None, Some(0), None, Some(&recheck))
+        let d = deliver_head_locked(&fx.daemon, &s, forced, false, None, Some(0), None, Some(&recheck), None)
             .expect("cleared recognized region must progress");
         assert!(d.written_submitted());
         assert_eq!(d.merged_ids, vec![id]);
@@ -1214,7 +1214,7 @@ fn wp17_r2_unknown_lower_layout_and_framed_hint_keep_fallback() {
             marker: Some(vec!["❯".into()]), placeholder: None,
             gen_at_verdict: s.output_gen.load(Ordering::Acquire), approval_pending: false,
         };
-        let d = deliver_head_locked(&fx.daemon, &s, false, false, None, Some(0), None, Some(&recheck))
+        let d = deliver_head_locked(&fx.daemon, &s, false, false, None, Some(0), None, Some(&recheck), None)
             .expect("unknown layout/hint retains ordinary progress");
         assert!(d.written_submitted());
         assert_eq!(queue_len(&s), 0);
@@ -1240,7 +1240,7 @@ fn wp17_r2_upper_draft_marker_row_zero_counter_blocks_before_ledger() {
             gen_at_verdict: s.output_gen.load(Ordering::Acquire), approval_pending: false,
         };
         let audit_before = crate::governance::h_ledger_count(&fx.daemon, "queue");
-        assert!(deliver_head_locked(&fx.daemon, &s, forced, false, None, Some(0), None, Some(&recheck)).is_none(),
+        assert!(deliver_head_locked(&fx.daemon, &s, forced, false, None, Some(0), None, Some(&recheck), None).is_none(),
             "upper-row draft inside recognized box must refuse before publication, forced={forced}");
         assert_eq!(crate::governance::h_ledger_count(&fx.daemon, "queue"), audit_before);
         assert!(s.inject_track.last_body().is_none());
@@ -1250,7 +1250,7 @@ fn wp17_r2_upper_draft_marker_row_zero_counter_blocks_before_ledger() {
         s.parser.lock().unwrap().process(format!(
             "\x1b[2J\x1b[H{rule}\r\n❯ \r\n{rule}\r\n  ? for shortcuts\x1b[2;3H"
         ).as_bytes());
-        let d = deliver_head_locked(&fx.daemon, &s, forced, false, None, Some(0), None, Some(&recheck))
+        let d = deliver_head_locked(&fx.daemon, &s, forced, false, None, Some(0), None, Some(&recheck), None)
             .expect("empty box must release ordinary delivery eligibility");
         assert!(d.written_submitted());
         assert_eq!(d.merged_ids, vec![id]);
@@ -1290,7 +1290,7 @@ impl Proof for HoldWriter {
 }
 
 /// Puts a [`HoldWriter`] job at the front of the seat's writer FIFO and waits until the writer is inside it.
-fn hold_writer(s: &Arc<Surface>) -> std::sync::mpsc::Sender<()> {
+pub(crate) fn hold_writer(s: &Arc<Surface>) -> std::sync::mpsc::Sender<()> {
     let (entered, observed) = std::sync::mpsc::channel();
     let (release, wait) = std::sync::mpsc::channel();
     let job = crate::agent_write::AgentJob {
@@ -1325,14 +1325,13 @@ fn d9_pre_cr_t_w1_a_write_ahead_inside_the_r1_window_refuses_the_claim() {
     let fx = fx("d9-tw1");
     let (s, out) = d9_master_recorder(&fx, "tw1");
     let id = enqueue(&fx, &s, "[보고] tw1");
-    let release = hold_writer(&s);
-    s.write_tx.send(crate::state::WriteReq::Data(b"T".to_vec())).unwrap();
+    let release = d9_late_hold(&s, Some(b"T"));
     let w0 = s.inject_track.wrote();
     let releaser = {
         let s = s.clone();
         std::thread::spawn(move || {
             wait_until("the job is handed off", || s.inject_reserved());
-            release.send(()).unwrap();
+            release.recv_timeout(Duration::from_secs(10)).expect("late idle seam did not run").send(()).unwrap();
         })
     };
     let handed = hand_off(&fx, &s);
@@ -1371,7 +1370,7 @@ fn d9_pre_cr_t_w2_a_human_key_inside_the_r1_window_refuses_the_claim() {
     let fx = fx("d9-tw2");
     let (s, out) = d9_master_recorder(&fx, "tw2");
     let id = enqueue(&fx, &s, "[보고] tw2");
-    let release = hold_writer(&s);
+    let release = d9_late_hold(&s, None);
     let w0 = s.inject_track.wrote();
     // The keystroke's RPC waits for its own write, which queues behind the job: release the held writer as soon as the
     // handler has RECEIVED the key (stamp + count moved), never after its reply (that would wait on the held writer).
@@ -1397,7 +1396,7 @@ fn d9_pre_cr_t_w2_a_human_key_inside_the_r1_window_refuses_the_claim() {
             wait_until("the key is received", || {
                 *s.last_human_input.lock().unwrap() != human0 && s.input_gen.load(Ordering::Acquire) != gen_at_handoff
             });
-            release.send(()).unwrap();
+            release.recv_timeout(Duration::from_secs(10)).expect("late idle seam did not run").send(()).unwrap();
             rpc.join().unwrap()
         })
     };
@@ -1698,4 +1697,193 @@ pub(crate) fn d9_received(out: &std::path::Path, n: usize) -> Vec<u8> {
     wait_until("the receiver's bytes", || std::fs::metadata(out).map(|m| m.len() as usize).unwrap_or(0) >= n);
     std::thread::sleep(Duration::from_millis(300));
     std::fs::read(out).unwrap()
+}
+
+/// S-Q1 / S-R16: admitted foreign work holds all five attempts without a ledger pre-record or claim refusal.
+#[test]
+#[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+fn d9_bound_i2_queue_busy_holds_then_first_idle_pass_delivers() {
+    let fx = fx("i2-q1");
+    let (s, out) = d9_master_recorder(&fx, "i2-q1");
+    enqueue(&fx, &s, "i2-q1");
+    let release = hold_writer(&s);
+    // The same bounded sender used for PTY terminal replies admits this behind the held arm.
+    assert!(crate::state::send_write_req_bounded(&s.write_tx, crate::state::WriteReq::Data(b"T".to_vec()), Duration::from_millis(250)));
+    for k in 0..5 {
+        let _ = hand_off(&fx, &s);
+        assert_eq!(crate::governance::h_ledger_count(&fx.daemon, "queue"), 0, "S-Q1: zero ledger pre-records during hold {k}");
+        let journal = std::fs::read_to_string(crate::state::state_dir(&fx.daemon.socket_path).join(crate::state::WRITER_JOURNAL_FILE)).expect("queue attempt opened its journal");
+        let writing = journal.lines().filter_map(|x| serde_json::from_str::<Value>(x).ok()).filter(|x| x["rec"] == "writing" && x["origin"] == "queue").count();
+        assert_eq!(writing, 0, "S-Q1: no queue journal writing during hold");
+        assert!(aborted(&fx, &s).is_empty(), "S-Q1: hold is not refusal");
+        assert!(s.queue_blocked.lock().unwrap().as_ref().is_some_and(|b| b.0.starts_with("writer_active")), "S-Q1: writer_active is visible");
+    }
+    release.send(()).unwrap();
+    wait_until("idle", || s.write_tx.gate().pending() == 0);
+    assert!(hand_off(&fx, &s), "S-Q1: first idle pass delivers");
+    wait_until("delivered", || queue_len(&s) == 0);
+    let mut expected = b"T".to_vec(); expected.extend(queue_bytes("i2-q1"));
+    assert_eq!(d9_received(&out, expected.len()), expected, "S-Q1: exact body and one Return");
+}
+
+/// S-Q1b: work admitted during the pre-record window reaches the late check, not the claim.
+#[test]
+#[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+fn d9_bound_i2_late_busy_undoes_owned_marks_without_refusal() {
+    let fx = fx("i2-late");
+    let (s, out) = d9_master_recorder(&fx, "i2-late");
+    enqueue(&fx, &s, "i2-late");
+    let release = Arc::new(Mutex::new(None));
+    {
+        let s = s.clone(); let release = release.clone();
+        crate::agent_write::set_test_after_pre_record(move |_| *release.lock().unwrap() = Some(hold_writer(&s)));
+    }
+    let _ = hand_off(&fx, &s);
+    assert!(aborted(&fx, &s).is_empty(), "S-Q1b: late busy is a hold, not a claim refusal");
+    assert!(s.queue_blocked.lock().unwrap().as_ref().is_some_and(|b| b.0.starts_with("writer_active")), "S-Q1b: late writer hold recorded");
+    assert!(!s.inject_reserved(), "S-Q1b: no reservation on hold");
+    assert!(s.last_queue_delivery_at.lock().unwrap().is_none(), "S-Q1b: owned timing mark undone");
+    release.lock().unwrap().take().unwrap().send(()).unwrap();
+    wait_until("idle", || s.write_tx.gate().pending() == 0);
+    assert!(hand_off(&fx, &s), "S-Q1b: first idle pass delivers");
+    let expected = queue_bytes("i2-late");
+    assert_eq!(d9_received(&out, expected.len()), expected);
+}
+
+/// S-SCOPE: a non-master keeps its prior admission even while its writer is busy.
+#[test]
+#[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+fn d9_bound_i2_non_master_is_not_idle_gated() {
+    let fx = fx("i2-scope");
+    let (s, out) = recorder_seat(&fx, "i2-scope");
+    enqueue(&fx, &s, "i2-scope");
+    let release = hold_writer(&s);
+    let sr = s.clone();
+    let worker = std::thread::spawn(move || {
+        wait_until("non-master handoff", || sr.inject_reserved());
+        release.send(()).unwrap();
+    });
+    assert!(hand_off(&fx, &s), "S-SCOPE: non-master is not held by idle gate");
+    worker.join().unwrap();
+    assert_eq!(s.writer_holds.load(Ordering::Relaxed), 0);
+    assert!(s.claim_streaks.lock().unwrap().iter().all(Option::is_none));
+    assert_eq!(d9_received(&out, queue_bytes("i2-scope").len()), queue_bytes("i2-scope"));
+}
+
+#[test]
+#[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+fn d9_bound_i2_writer_hold_keeps_queue_alarms_live() {
+    let fx = fx("i2-alarm");
+    let (s, _) = d9_master_recorder(&fx, "i2-alarm");
+    std::env::set_var("CYS_QUEUE_STARVE_ALERT_SECS", "1");
+    std::env::set_var("CYS_QUEUE_DEPTH_ALERT", "1");
+    std::env::set_var("CYS_QUEUE_QUIET_SECS", "0");
+    enqueue(&fx, &s, "i2-alarm");
+    std::thread::sleep(Duration::from_millis(1100));
+    crate::governance::h_paint(&s, crate::governance::H_IDLE_SCREEN);
+    let release = hold_writer(&s);
+    crate::governance::h_queue_tick(&fx.daemon);
+    let starved = events(&fx, "queue.starved");
+    let depth = events(&fx, "queue.depth_high");
+    release.send(()).unwrap();
+    for key in ["CYS_QUEUE_STARVE_ALERT_SECS", "CYS_QUEUE_DEPTH_ALERT", "CYS_QUEUE_QUIET_SECS"] { std::env::remove_var(key); }
+    assert_eq!(starved.len(), 1, "S-Q4: queue.starved count while writer held");
+    assert!(starved[0]["payload"]["blocked_by"].as_str().unwrap().starts_with("writer_active"));
+    assert_eq!(depth.len(), 1, "S-Q4: queue.depth_high count while writer held");
+}
+
+#[test]
+fn d9_bound_i2_writer_active_remedy_is_wait() {
+    assert_eq!(crate::governance::queue_remedy("writer_active(test)", &Default::default()).0, "wait", "F6: calm wait remedy");
+}
+
+/// Head F2 ruling: another producer's concurrent hold cannot overwrite this attempt's non-writer reason.
+#[test]
+fn d9_bound_i2_channel_hold_does_not_steal_queue_attribution() {
+    let fx = fx("i2-attribution");
+    let s = seat(&fx);
+    fx.daemon.roles.lock().unwrap().insert("master".into(), s.id);
+    *s.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+    enqueue(&fx, &s, "i2-attribution");
+    crate::governance::h_paint(&s, crate::governance::H_IDLE_SCREEN);
+    *s.queue_paused_until.lock().unwrap() = Some(Instant::now() + Duration::from_secs(30));
+    crate::governance::h_queue_tick(&fx.daemon);
+    let paused_reason = s.queue_blocked.lock().unwrap().as_ref().unwrap().0.clone();
+    assert!(paused_reason.starts_with("queue_paused"), "premise: real pause reason {paused_reason}");
+    *s.queue_paused_until.lock().unwrap() = None;
+    let release = Arc::new(Mutex::new(None));
+    {
+        let s = s.clone(); let release = release.clone();
+        crate::agent_write::set_test_after_pre_record(move |_| {
+            *release.lock().unwrap() = Some(hold_writer(&s));
+            let sc = s.clone();
+            std::thread::spawn(move || {
+                assert!(crate::governance::d9_writer_busy(&sc, crate::governance::ClaimProducer::ChannelNew, "channel-race", false));
+            }).join().unwrap();
+            // The helper's second frame gate refuses on this actual pause; its prior reason is still true.
+            *s.queue_paused_until.lock().unwrap() = Some(Instant::now() + Duration::from_secs(30));
+        });
+    }
+    crate::governance::h_queue_tick(&fx.daemon);
+    release.lock().unwrap().take().expect("pre-record race ran").send(()).unwrap();
+    assert_eq!(s.queue_blocked.lock().unwrap().as_ref().unwrap().0, paused_reason,
+        "F2: concurrent channel hold must not become queue writer_active");
+}
+
+/// Race fixture: introduce a holder only after the final idle observation, preserving claim coverage.
+pub(crate) fn d9_late_hold(s: &Arc<Surface>, bytes: Option<&'static [u8]>) -> std::sync::mpsc::Receiver<std::sync::mpsc::Sender<()>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let s = s.clone();
+    crate::agent_write::set_test_after_writer_idle(move || {
+        let release = hold_writer(&s);
+        if let Some(bytes) = bytes { s.write_tx.send(crate::state::WriteReq::Data(bytes.to_vec())).unwrap(); }
+        tx.send(release).unwrap();
+    });
+    rx
+}
+
+pub(crate) fn d9_with_late_write_ahead<R>(s: &Arc<Surface>, call: impl FnOnce() -> R) -> R {
+    let release = d9_late_hold(s, Some(b"T"));
+    let sr = s.clone();
+    let worker = std::thread::spawn(move || {
+        let release = release.recv_timeout(Duration::from_secs(10)).expect("late seam ran");
+        wait_until("subject queued behind holder and T", || sr.write_tx.gate().pending() >= 3);
+        release.send(()).unwrap();
+    });
+    let result = call();
+    worker.join().unwrap();
+    wait_until("late race settled", || s.write_tx.gate().pending() == 0);
+    result
+}
+
+#[test]
+fn d9_bound_i2_slot_lifecycle_and_head_replacement() {
+    use crate::governance::{ClaimProducer as P, d9_writer_busy, d9_nonwriter_hold, d9_hold_age, d9_terminal};
+    let fx = fx("i2-slots");
+    let s = seat(&fx);
+    let first = enqueue(&fx, &s, "first");
+    let release = hold_writer(&s);
+    for p in [P::Queue, P::ChannelNew, P::ChannelRedeliver] {
+        assert!(d9_writer_busy(&s, p, &first, false));
+    }
+    d9_nonwriter_hold(&s, P::Queue);
+    assert!(d9_hold_age(&s, P::Queue, &first).is_some(), "busy non-writer hold keeps held_since");
+    release.send(()).unwrap();
+    wait_until("idle", || s.write_tx.gate().pending() == 0);
+    assert!(!d9_writer_busy(&s, P::Queue, &first, false));
+    assert!(d9_hold_age(&s, P::Queue, &first).is_some(), "MI11: passing early idle clears nothing");
+    d9_nonwriter_hold(&s, P::ChannelNew);
+    assert!(d9_hold_age(&s, P::ChannelNew, &first).is_none(), "idle non-writer hold clears held_since");
+    assert!(d9_hold_age(&s, P::ChannelRedeliver, &first).is_some(), "producer slots independent");
+    d9_terminal(&s, P::ChannelRedeliver, &first, true);
+    assert!(s.claim_streaks.lock().unwrap()[2].is_none(), "writing terminal clears slot");
+    fx.daemon.paused.store(true, Ordering::Relaxed);
+    crate::governance::h_queue_tick(&fx.daemon);
+    assert!(d9_hold_age(&s, P::Queue, &first).is_none(), "idle daemon pause clears the observed writer hold");
+    fx.daemon.paused.store(false, Ordering::Relaxed);
+    s.pending_queue.lock().unwrap().pop_front();
+    enqueue(&fx, &s, "replacement");
+    *s.queue_paused_until.lock().unwrap() = Some(Instant::now() + Duration::from_secs(30));
+    crate::governance::h_queue_tick(&fx.daemon);
+    assert!(s.claim_streaks.lock().unwrap()[0].is_none(), "head changed behind non-writer gate clears old slot");
 }

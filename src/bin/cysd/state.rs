@@ -1912,6 +1912,13 @@ impl CycleClaim {
     }
 }
 
+/// D3-BOUND: one independent retry slot for each producer; its mutex is a leaf (no I/O).
+#[derive(Debug)]
+pub(crate) struct ClaimStreak {
+    pub item: String,
+    pub held_since: Option<Instant>,
+}
+
 pub struct Surface {
     pub id: u64,
     /// WP16: server-resolved creator, set once on successful surface.create.
@@ -2092,6 +2099,8 @@ pub struct Surface {
     /// 지운다. `queue.list` 가 이 값을 노출해 운영자가 "왜 안 가나" 를 화면 폴링 없이 안다
     /// (경보는 쿨다운·임계가 있어 매 틱 사유를 말해 주지 않는다 — 이 필드가 상시 사실이다).
     pub queue_blocked: Mutex<Option<(String, f64)>>,
+    pub(crate) writer_holds: AtomicU64,
+    pub(crate) claim_streaks: Mutex<[Option<ClaimStreak>; 3]>,
     /// T3-14 단조 라인 커서: scrollback FIFO와 무관하게 증가하는 누적 완성 라인 수
     pub line_count: AtomicU64,
     /// T4-17 헬스 조치: 이 시각까지 queued 배달 일시정지 (직접 send는 통과)
@@ -7281,6 +7290,8 @@ impl Daemon {
             // ★(0.14.42 · A2) 흡수 표는 휘발 — 재기동·재생성 좌석은 빈 채로 출발(= 종전 동작).
             return_tickets: Mutex::new(HashMap::new()),
             queue_blocked: Mutex::new(None),
+            writer_holds: AtomicU64::new(0),
+            claim_streaks: Mutex::new([None, None, None]),
             line_count: AtomicU64::new(0),
             queue_paused_until: Mutex::new(None),
             // ★(0.14.31 · WP-5) 만료 큐·배달 간격 시계·stale 입력 관측 — 전부 빈 채로 출발.

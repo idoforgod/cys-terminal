@@ -1255,6 +1255,22 @@ pub fn set_test_after_pre_record(hook: impl FnOnce(u64) + 'static) {
     AFTER_PRE_RECORD.with(|c| *c.borrow_mut() = Some(Box::new(hook)));
 }
 
+/// Test-only observation of the non-atomic idle-check/enqueue window. Empty in a product build.
+pub fn test_after_writer_idle() {
+    #[cfg(test)]
+    if let Some(hook) = AFTER_WRITER_IDLE.with(|c| c.borrow_mut().take()) { hook(); }
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_WRITER_IDLE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+pub fn set_test_after_writer_idle(hook: impl FnOnce() + 'static) {
+    AFTER_WRITER_IDLE.with(|c| *c.borrow_mut() = Some(Box::new(hook)));
+}
+
 /// Proof used while a seat has no receiver binding wired yet: every check passes (the caller's
 /// existing gates and hand-off guard remain the admission).
 pub struct PassThrough;

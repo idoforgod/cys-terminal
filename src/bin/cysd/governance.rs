@@ -8209,6 +8209,8 @@ pub(crate) const BLOCKED_SETTLE_BUDGET: &str =
 /// ★(0.14.52 · S-a) The writer refused this seat's last hand-off before any byte (receiver proof or
 /// journal) — retried on backoff 1, 2, 4, 8, then 30 s (design 4.6). Resolves by itself.
 pub(crate) const BLOCKED_RECEIVER_HELD: &str = "receiver_held(쓰기 전 수신자 증명·기록 실패 — 1·2·4·8·30초 간격 재시도)";
+// Private: legacy code-less UI payloads have no writer_active prefix; current payloads carry remedy_code=wait.
+const BLOCKED_WRITER_ACTIVE: &str = "writer_active(쓰기 중이거나 대기 중인 쓰기가 있음 — writer 유휴 시 재시도)";
 /// ★(0.14.52 · S-a) An agent write stopped mid-request: never retyped, the composer is not erased;
 /// automatic delivery to this seat waits for that request's reconciliation (design 4.6 / S4-1).
 pub(crate) const BLOCKED_PARTIAL_WRITE: &str = "partial_write(요청 도중 멈춘 에이전트 쓰기 — 다시 치지 않고 보류 · 정리 대기)";
@@ -8473,6 +8475,7 @@ fn prompt_gate_input_with_approval(
 /// 걸려 매 틱 말하지 않지만, 이 값은 상시 사실이라 `queue.list` 가 바로 읽는다).
 /// 같은 사유가 이어지면 **최초 시각을 보존**한다(얼마나 오래 막혔나가 사유보다 중요하다).
 fn mark_queue_blocked(s: &Arc<crate::state::Surface>, reason: &str) {
+    if !reason.starts_with("writer_active") { d9_nonwriter_hold(s, ClaimProducer::Queue); }
     let mut slot = s.queue_blocked.lock().unwrap();
     match slot.as_ref() {
         Some((prev, _)) if prev == reason => {}
@@ -9296,6 +9299,8 @@ pub(crate) fn queue_remedy(blocked_by: &str, d: &QueueBlockDiag) -> (&'static st
     } else if blocked_by.starts_with("receiver_held") {
         // ★(0.14.52 · S-a) calm: the daemon retries on its own backoff (no human action, no OS banner).
         ("wait", "쓰기 전 수신자 증명·기록이 실패했다 — 한 바이트도 쓰지 않았고 항목은 큐에 있다 · 1·2·4·8·30초 간격으로 스스로 다시 시도한다".into())
+    } else if blocked_by.starts_with("writer_active") {
+        ("wait", "좌석이 쓰는 중이거나 대기 중인 쓰기가 있다 — writer가 비면 다시 배달한다 · 오래 지속되면 writer.claim_escalated로 알린다".into())
     } else if blocked_by.starts_with("partial_write") {
         // ★(0.14.52 · S-a) calm for the owner: reconciliation belongs to the lane master (design 4.6), not to an owner key.
         ("wait", "에이전트 쓰기가 요청 도중 멈췄다 — 데몬은 입력줄을 지우지도 더 치지도 않는다 · 그 요청이 정리될 때까지 이 좌석의 자동 배달을 보류한다(항목·W-id 보존 · 정리는 그 레인의 master 몫)".into())
@@ -10024,6 +10029,7 @@ fn rollback_aborted_inject(
     foreign: Vec<&'static str>,
 ) {
     let Some((still_queued, disposed)) = restore_inflight_marks(s, f) else { return };
+    d9_terminal(s, ClaimProducer::Queue, &delivered.entry.id, false);
     // ★(triage codex 보완) 사유·계수를 **관측 사실**로 적는다 — 종전 `restored` 는 재삽입 건수를
     //   말했고(그 재삽입 자체가 결함이었다) `why` 는 출력 세대 하나로 단정했다. 지금은 세 갈래를
     //   가른다: 화면이 흘렀나 · 처분자가 가져갔나 · 그 밖(승인 대기·마감).
@@ -10259,6 +10265,65 @@ fn d9_snapshot(s: &crate::state::Surface) -> (u64, u64, Option<std::time::Instan
     (s.input_gen.load(Ordering::Acquire), s.inject_track.wrote(), human_at)
 }
 
+/// D3-BOUND r2: separate identity/hold history for producers that can run in the same sweep.
+#[derive(Clone, Copy)]
+pub(crate) enum ClaimProducer { Queue = 0, ChannelNew = 1, ChannelRedeliver = 2 }
+
+impl ClaimProducer {
+    pub(crate) fn index(self) -> usize {
+        match self { Self::Queue => 0, Self::ChannelNew => 1, Self::ChannelRedeliver => 2 }
+    }
+}
+
+pub(crate) fn d9_keep_item(s: &crate::state::Surface, producer: ClaimProducer, item: Option<&str>) {
+    let mut slots = s.claim_streaks.lock().unwrap_or_else(|e| e.into_inner());
+    let slot = &mut slots[producer.index()];
+    if slot.as_ref().is_some_and(|x| Some(x.item.as_str()) != item) { *slot = None; }
+}
+
+pub(crate) fn d9_clear_item(s: &crate::state::Surface, producer: ClaimProducer, item: &str) {
+    let mut slots = s.claim_streaks.lock().unwrap_or_else(|e| e.into_inner());
+    let slot = &mut slots[producer.index()];
+    if slot.as_ref().is_some_and(|x| x.item == item) { *slot = None; }
+}
+
+pub(crate) fn d9_nonwriter_hold(s: &crate::state::Surface, producer: ClaimProducer) {
+    if s.write_tx.gate().pending() == 0 {
+        let mut slots = s.claim_streaks.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(slot) = &mut slots[producer.index()] { slot.held_since = None; }
+    }
+}
+
+pub(crate) fn d9_terminal(s: &crate::state::Surface, producer: ClaimProducer, item: &str, wrote: bool) {
+    if wrote { d9_clear_item(s, producer, item); return; }
+    let mut slots = s.claim_streaks.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(slot) = &mut slots[producer.index()] {
+        if slot.item == item { slot.held_since = None; }
+    }
+}
+
+pub(crate) fn d9_hold_age(s: &crate::state::Surface, producer: ClaimProducer, item: &str) -> Option<std::time::Duration> {
+    let slots = s.claim_streaks.lock().unwrap_or_else(|e| e.into_inner());
+    slots[producer.index()].as_ref().filter(|x| x.item == item).and_then(|x| x.held_since.map(|t| t.elapsed()))
+}
+
+/// Called only with a D9 claim. A successful early observation clears nothing: only a terminal or idle non-writer hold does.
+pub(crate) fn d9_writer_busy(s: &crate::state::Surface, producer: ClaimProducer, item: &str, late: bool) -> bool {
+    if s.write_tx.gate().pending() == 0 {
+        if late { crate::agent_write::test_after_writer_idle(); }
+        return false;
+    }
+    s.writer_holds.fetch_add(1, Ordering::Relaxed);
+    let now = std::time::Instant::now();
+    let mut slots = s.claim_streaks.lock().unwrap_or_else(|e| e.into_inner());
+    let slot = &mut slots[producer.index()];
+    if slot.as_ref().is_none_or(|x| x.item != item) {
+        *slot = Some(crate::state::ClaimStreak { item: item.to_owned(), held_since: None });
+    }
+    slot.as_mut().expect("slot installed").held_since.get_or_insert(now);
+    true
+}
+
 /// ★(0.14.52 · S-a C7b) The resume material of a PartialExact queue hold (`QueueHold::resume`): what the SAME request
 /// needs to continue from its byte-exact offset through the same settlement, and the evidence its resume predicate
 /// compares (S4-1). The body is the stored hand-off digest (never recomputed from the queue); no second request id.
@@ -10320,6 +10385,10 @@ fn settle_queue_write(
     t: &crate::agent_write::Terminal,
 ) {
     use crate::agent_write::Terminal as T;
+    if let Some(surface) = &s {
+        let wrote = matches!(t, T::WrittenSubmitted { .. } | T::WrittenBody { .. } | T::PartialExact { .. } | T::PartialUnknown { .. });
+        d9_terminal(surface, ClaimProducer::Queue, &d.entry.id, wrote);
+    }
     match t {
         T::RefusedNoWrite { reason } if reason == crate::agent_write::GUARD_ABORTED
             && f.guard.as_ref().is_none_or(|g| g.cleanup_owner() != Ok(crate::state::InjectCleanupOwner::Controller)) => {}
@@ -11144,7 +11213,10 @@ pub(crate) fn deliver_head_locked(
     expect_pending: Option<u64>,
     expect_output_gen: Option<u64>,
     recheck: Option<&ScreenRecheck>,
+    mut hold_reason: Option<&mut Option<&'static str>>,
 ) -> Option<QueueHandoff> {
+    // Call-owned output: concurrent channel holds and force-deliver calls cannot attribute this tick.
+    if let Some(reason) = hold_reason.as_deref_mut() { *reason = None; }
     let now = now_epoch();
     let default_ttl = crate::state::queue_ttl_default_secs();
     let base_min_interval = queue_min_interval_secs();
@@ -11180,16 +11252,19 @@ pub(crate) fn deliver_head_locked(
         // ★(0.14.56 · D3-BOUND r2 §1.2, F1) S0 - the claim baseline, read BEFORE the frame judgment (`handoff_gate_ok`) and the
         //   ledger pre-record, so a write or input that starts and finishes in between moves a counter and the claim refuses.
         let d9_s0 = d9_claim.as_ref().map(|_| d9_snapshot(s));
+        d9_keep_item(s, ClaimProducer::Queue, q.front().map(|e| e.id.as_str()));
         // ★(0.14.31 · 리뷰 R2 · codex blocking) 결판 대기 중인 인계가 있으면 이번 호출은 아무것도
         //   하지 않는다. 항목이 결판까지 큐에 남아 있으므로(유실 창 봉인) 이 표식이 없으면 틱과
         //   RPC 강제 배달이 **같은 머리를 두 번** 인계할 수 있다. 검사·설정이 둘 다 이 임계영역
         //   안이라 창이 없다(배달 최소 간격 0 인 롤백 env 에서도 성립).
         if s.inject_reserved() || queue_write_admission_held(s, std::time::Instant::now()) {
+            d9_nonwriter_hold(s, ClaimProducer::Queue);
             break 'tx None;
         }
         if let Some(want) = expect_pending {
             if s.pending_input_bytes.load(Ordering::Relaxed) != want {
-                break 'tx None; // 판정 이후 입력줄이 바뀌었다 — 이번 틱은 보류(메시지 보존)
+                d9_nonwriter_hold(s, ClaimProducer::Queue);
+            break 'tx None; // 판정 이후 입력줄이 바뀌었다 — 이번 틱은 보류(메시지 보존)
             }
         }
         // ★(0.14.31 · 리뷰 R1(R6회차) · codex major) **발행 중(홀수) 거부는 무조건이다** — 판정이
@@ -11214,18 +11289,22 @@ pub(crate) fn deliver_head_locked(
         if min_interval > 0 {
             if let Some(t) = *s.last_queue_delivery_at.lock().unwrap() {
                 if t.elapsed().as_secs() < min_interval {
-                    break 'tx None; // 배달 최소 간격 미달 — 다음 틱(권위 판정 · 임계영역 안)
+                    d9_nonwriter_hold(s, ClaimProducer::Queue);
+            break 'tx None; // 배달 최소 간격 미달 — 다음 틱(권위 판정 · 임계영역 안)
                 }
             }
         }
         // ① 판정 — 보류할 배달을 원장에 선기록하지 않기 위해 **머리를 집기 전에** 한 번(codex 리뷰).
         if !handoff_gate_ok(daemon, s, expect_output_gen, recheck) {
+            d9_nonwriter_hold(s, ClaimProducer::Queue);
             break 'tx None;
         }
         let Some(entry) = q.front().cloned() else {
+            d9_nonwriter_hold(s, ClaimProducer::Queue);
             break 'tx None;
         };
         if expect_head_id.is_some_and(|want| want != entry.id) {
+            d9_nonwriter_hold(s, ClaimProducer::Queue);
             break 'tx None; // 조준 항목이 더는 머리가 아니다(경합) — 무부작용 반환
         }
         if crate::state::queue_entry_expired(&entry, now, default_ttl) {
@@ -11239,6 +11318,7 @@ pub(crate) fn deliver_head_locked(
             let mut e = entry.clone();
             e.expired_at = Some(now);
             expired_head = Some(e);
+            d9_nonwriter_hold(s, ClaimProducer::Queue);
             break 'tx None;
         }
         // ★B1(0.14.30) C3: 같은 발신자 대기분을 **한 턴으로** 병합한다(버스트 봉인).
@@ -11253,6 +11333,11 @@ pub(crate) fn deliver_head_locked(
                 Err(why) => { mark_queue_blocked(s, why); break 'tx None; }
             }
         } else { None };
+        if d9_claim.is_some() && d9_writer_busy(s, ClaimProducer::Queue, &entry.id, false) {
+            if let Some(reason) = hold_reason.as_deref_mut() { *reason = Some(BLOCKED_WRITER_ACTIVE); }
+            mark_queue_blocked(s, BLOCKED_WRITER_ACTIVE);
+            break 'tx None;
+        }
         let merge_on = !forced && expect_head_id.is_none();
         let mut picked: Vec<usize> = if merge_on && q.len() > 1 {
             let prefix = queue_digest_prefix(q.iter().map(|e| e.text.as_str()));
@@ -11489,7 +11574,12 @@ pub(crate) fn deliver_head_locked(
             note_body: true,
             body_owner: None,
         };
-        if s.write_tx.try_send(crate::state::WriteReq::Agent(Box::new(job))).is_err() {
+        let writer_busy = d9_claim.is_some() && d9_writer_busy(s, ClaimProducer::Queue, &d.entry.id, true);
+        if writer_busy || s.write_tx.try_send(crate::state::WriteReq::Agent(Box::new(job))).is_err() {
+            if writer_busy {
+                if let Some(reason) = hold_reason.as_deref_mut() { *reason = Some(BLOCKED_WRITER_ACTIVE); }
+                mark_queue_blocked(s, BLOCKED_WRITER_ACTIVE);
+            }
             // 인계 실패 — 메시지 보존, 다음 틱 재시도. Undo only the marks that are still mine.
             if s.input_gen.load(Ordering::Acquire) == f.pending_gen && s.pending_input_bytes.load(Ordering::Relaxed) == 0 {
                 s.set_pending_input(prev_pending);
@@ -11524,6 +11614,7 @@ pub(crate) fn deliver_head_locked(
             if q.front().is_some_and(|f| {
                 f.id == e.id && crate::state::queue_entry_expired(f, now, default_ttl)
             }) {
+                d9_clear_item(s, ClaimProducer::Queue, &e.id);
                 let mut moved = q.pop_front().expect("front checked");
                 moved.expired_at = Some(now);
                 if !x.iter().any(|o| o.id == moved.id) {
@@ -13216,6 +13307,7 @@ pub(crate) fn force_deliver_entry(
         expect_pending,
         expect_gen,
         recheck.as_ref(),
+        None,
     )
         .ok_or(ForceDeliverDenied::Raced)
 }
@@ -13318,6 +13410,13 @@ fn deliver_queued(
     }
     // T4-15 kill-switch: pause 중에는 큐 배달 동결 (메시지는 보존 — resume 시 재개)
     if daemon.paused.load(Ordering::Relaxed) {
+        // A paused tick is still an observation: do not carry a past busy interval across observed idle.
+        let seats: Vec<_> = daemon.surfaces.lock().unwrap().values().cloned().collect();
+        for s in seats {
+            let q = s.pending_queue.lock().unwrap();
+            d9_keep_item(&s, ClaimProducer::Queue, q.front().map(|e| e.id.as_str()));
+            d9_nonwriter_hold(&s, ClaimProducer::Queue);
+        }
         // ★(0.14.31 · 성찰 Q2) 전이 진입점(`Daemon::set_paused`)을 거치지 않은 pause(구 호출부의
         //   `paused.store(true)` · 재기동 복원)라도 결판 대기 중인 인계는 여기서 끊는다 — 두 번째
         //   방어선이다(첫째는 writer 의 안전 탐침 ⓐ축). pause 중에는 예약이 새로 생기지 않으므로
@@ -13387,9 +13486,11 @@ fn deliver_queued(
         // 배달 0건으로 안전)뿐이고, 배달 자체는 헬퍼 임계영역이 그 시점 머리로 원자 수행한다.
         let (head, depth) = {
             let q = s.pending_queue.lock().unwrap();
+            d9_keep_item(&s, ClaimProducer::Queue, q.front().map(|e| e.id.as_str()));
             match queue_age_head(&q).cloned() {
                 Some(h) => (h, q.len()),
                 None => {
+                    d9_keep_item(&s, ClaimProducer::Queue, None);
                     starve_alerted.remove(&s.id);
                     *s.queue_blocked.lock().unwrap() = None;
                     continue;
@@ -13617,6 +13718,7 @@ fn deliver_queued(
         // ★G1(W2-D): 배달 임계영역은 단일 헬퍼(deliver_head_locked — RPC 강제 배달과 공유).
         // pop은 writer 채널 인계 성공 후에만 — 실패 시 메시지를 보존해 다음 틱에 재시도.
         // 블로킹 write·sleep은 surface 전용 writer 스레드가 수행하므로 watchdog은 멈추지 않는다.
+        let mut hold_reason = None;
         if let Some(handoff) = deliver_head_locked(
             daemon,
             &s,
@@ -13626,12 +13728,15 @@ fn deliver_queued(
             Some(pending_at_verdict),
             expect_gen,
             recheck.as_ref(),
+            Some(&mut hold_reason),
         ) {
             if !handoff.written_submitted() { continue; }
             // 배달 성공 = 기아 해소 — 쿨다운 리셋(다음 기아는 새 사건으로 다시 경보).
             starve_alerted.remove(&s.id);
             // ★B1: 막힘 사유도 사실이 아니게 됐다 — 지운다(낡은 사유가 남으면 오독한다).
             *s.queue_blocked.lock().unwrap() = None;
+        } else if let Some(reason) = hold_reason {
+            block(reason);
         }
     }
     // ★(triage 2026-09-08 · #7) 다음 틱은 **예산 때문에 건너뛴 첫 좌석**부터 시작한다. 끝까지
@@ -22017,7 +22122,7 @@ mod tests {
         // ⓐ 대조 — 같은 프레임·같은 승인 상태면 alt 유휴 composer 는 배달된다(전제 성립).
         refill("alt 유휴");
         assert!(
-            deliver_head_locked(&daemon, &s, false, false, None, None, Some(gen), Some(&rc(false)))
+            deliver_head_locked(&daemon, &s, false, false, None, None, Some(gen), Some(&rc(false)), None)
                 .is_some(),
             "전제 붕괴: alt 유휴 프레임이 애초에 배달 자격이 아니면 승인 축을 재지 못한다"
         );
@@ -22035,7 +22140,7 @@ mod tests {
             approval_pending: true,
         };
         assert!(
-            deliver_head_locked(&daemon, &s, false, false, None, None, Some(gen2), Some(&rc2))
+            deliver_head_locked(&daemon, &s, false, false, None, None, Some(gen2), Some(&rc2), None)
                 .is_none(),
             "alt-screen 인계가 승인·관문 feed 를 다시 읽지 않는다(codex M3 가 사실이라면 여기서 배달된다)"
         );
@@ -22252,7 +22357,7 @@ mod tests {
         assert_eq!(now_gen % 2, 0, "전제 붕괴: 발행 중(홀수)이면 종전 축이 이미 잡는다");
         let mut bus_a = daemon.bus.subscribe();
         assert!(
-            deliver_head_locked(&daemon, &s, false, false, None, None, None, Some(&rc(gen0, false)))
+            deliver_head_locked(&daemon, &s, false, false, None, None, None, Some(&rc(gen0, false)), None)
                 .is_none(),
             "판정 이후 다 그려진 모달에 본문을 배달했다"
         );
@@ -22266,7 +22371,7 @@ mod tests {
         //    멈추는 것은 writer 안전 탐침이고, 그 사실이 `queue.inject_aborted` 로 드러난다.
         let mut bus_b = daemon.bus.subscribe();
         assert!(
-            deliver_head_locked(&daemon, &s, false, false, None, None, None, None).is_none(),
+            deliver_head_locked(&daemon, &s, false, false, None, None, None, None, None).is_none(),
             "재평가 없는 경로가 다 그려진 모달에 본문을 배달했다(Q1 탐침이 죽었다)"
         );
         assert_eq!(
@@ -22282,7 +22387,7 @@ mod tests {
         s.output_gen.fetch_add(2, AtomicOrdering::AcqRel);
         let gen2 = s.output_gen.load(AtomicOrdering::Acquire);
         assert!(
-            deliver_head_locked(&daemon, &s, false, false, None, None, None, Some(&rc(gen2 - 2, false)))
+            deliver_head_locked(&daemon, &s, false, false, None, None, None, Some(&rc(gen2 - 2, false)), None)
                 .is_some(),
             "세대가 바뀌었다는 이유만으로 정상 composer 배달이 막혔다(기아 #1 방향 회귀)"
         );
@@ -22292,7 +22397,7 @@ mod tests {
         quiet_since(&s, 10);
         let gen3 = s.output_gen.load(AtomicOrdering::Acquire);
         assert!(
-            deliver_head_locked(&daemon, &s, false, false, None, None, None, Some(&rc(gen3, true)))
+            deliver_head_locked(&daemon, &s, false, false, None, None, None, Some(&rc(gen3, true)), None)
                 .is_none(),
             "판정 이후 승인·관문 feed 가 바뀌었는데 그 승인으로 배달했다"
         );
@@ -22865,7 +22970,7 @@ mod tests {
         let gen = s.output_gen.load(AtomicOrdering::Acquire);
         s.output_gen.fetch_add(2, AtomicOrdering::AcqRel); // 청크 하나가 완전히 흘렀다
         assert!(
-            deliver_head_locked(&daemon, &s, false, false, None, None, Some(gen), None).is_none(),
+            deliver_head_locked(&daemon, &s, false, false, None, None, Some(gen), None, None).is_none(),
             "판정이 본 프레임이 아닌데 배달했다"
         );
         assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "전제: 머리가 있어야 검사가 유효하다");
@@ -22874,14 +22979,14 @@ mod tests {
         let odd = s.output_gen.load(AtomicOrdering::Acquire);
         assert_eq!(odd % 2, 1, "전제 붕괴: 홀수를 만들지 못했다");
         assert!(
-            deliver_head_locked(&daemon, &s, false, false, None, None, Some(odd), None).is_none(),
+            deliver_head_locked(&daemon, &s, false, false, None, None, Some(odd), None, None).is_none(),
             "홀수 세대가 동일 비교만으로 통과했다"
         );
         // ★(리뷰 R1(R6회차) · codex major) 판정이 세대를 **넘기지 않는 경로**(비-alt B1 · 마커 없는
         //   강제 배달)도 인계 시점에 발행 중이면 배달하지 않는다 — 종전에는 `None` 이면 홀수 검사
         //   자체가 없었다.
         assert!(
-            deliver_head_locked(&daemon, &s, false, false, None, None, None, None).is_none(),
+            deliver_head_locked(&daemon, &s, false, false, None, None, None, None, None).is_none(),
             "expect_output_gen=None 경로가 발행 중(홀수) 인계를 통과시켰다"
         );
         // 가용성 대조군 — 짝수로 닫고 같은 값을 넘기면 **곧바로** 배달된다(축이 상시 닫히지 않는다).
@@ -22906,7 +23011,7 @@ mod tests {
             approval_pending: false,
         };
         assert!(
-            deliver_head_locked(&daemon, &s, false, false, None, None, Some(even), Some(&rc_even))
+            deliver_head_locked(&daemon, &s, false, false, None, None, Some(even), Some(&rc_even), None)
                 .is_some(),
             "발행이 끝난 프레임인데 인계가 거부했다(기아 — 축이 상시 닫혔다)"
         );
@@ -24696,7 +24801,7 @@ mod tests {
         e.enqueued_at = now_epoch() - 7.0 * 3600.0;
         let id = e.id.clone();
         s.pending_queue.lock().unwrap().push_back(e);
-        assert!(deliver_head_locked(&daemon, &s, false, false, None, None, None, None).is_none());
+        assert!(deliver_head_locked(&daemon, &s, false, false, None, None, None, None, None).is_none());
         assert!(s.pending_queue.lock().unwrap().is_empty());
         assert!(s.expired_queue.lock().unwrap().iter().any(|x| x.id == id));
         assert!(
@@ -25005,7 +25110,7 @@ mod tests {
         // ⓐ 판정이 본 값(0) 과 배달 시점 값(직접 send 가 끼어들어 12)이 다르면 **배달하지 않는다**.
         s.pending_input_bytes.store(12, std::sync::atomic::Ordering::Relaxed);
         assert!(
-            deliver_head_locked(&daemon, &s, false, false, None, Some(0), None, None).is_none(),
+            deliver_head_locked(&daemon, &s, false, false, None, Some(0), None, None, None).is_none(),
             "판정 이후 직접 send 가 입력줄을 점유했는데 큐를 밀어 넣었다 — 두 본문이 한 제출로 합쳐진다"
         );
         assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "미배달분은 보존돼야 한다");
@@ -25013,7 +25118,7 @@ mod tests {
         // ⓑ 음성 대조: 값이 그대로면 정상 배달된다(무조건 거부 구현 차단).
         s.pending_input_bytes.store(0, std::sync::atomic::Ordering::Relaxed);
         assert!(
-            deliver_head_locked(&daemon, &s, false, false, None, Some(0), None, None).is_some(),
+            deliver_head_locked(&daemon, &s, false, false, None, Some(0), None, None, None).is_some(),
             "값이 변하지 않았는데 배달을 막으면 그 자체가 기아다"
         );
     }
@@ -25192,7 +25297,7 @@ mod tests {
         }
         let mut delivered = None;
         for _ in 0..40 {
-            delivered = deliver_head_locked(&daemon, &s, false, false, None, Some(0), None, None);
+            delivered = deliver_head_locked(&daemon, &s, false, false, None, Some(0), None, None, None);
             if delivered.is_some() {
                 break;
             }
@@ -25233,7 +25338,7 @@ mod tests {
         }
         let mut delivered = None;
         for _ in 0..40 {
-            delivered = deliver_head_locked(&daemon, &s, false, false, None, Some(0), None, None);
+            delivered = deliver_head_locked(&daemon, &s, false, false, None, Some(0), None, None, None);
             if delivered.is_some() {
                 break;
             }
@@ -25735,7 +25840,7 @@ mod tests {
             .expect("create surface");
         daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
         // 빈 큐 = None + 이벤트 0(부작용 없음).
-        assert!(deliver_head_locked(&daemon, &s, false, false, None, None, None, None).is_none());
+        assert!(deliver_head_locked(&daemon, &s, false, false, None, None, None, None, None).is_none());
         assert_eq!(
             daemon
                 .bus
@@ -25753,7 +25858,7 @@ mod tests {
             q.push_back(e1);
             q.push_back(e2);
         }
-        let d = deliver_head_locked(&daemon, &s, true, false, None, None, None, None).expect("머리 배달");
+        let d = deliver_head_locked(&daemon, &s, true, false, None, None, None, None, None).expect("머리 배달");
         assert_eq!(d.entry.id, id1, "배달 = 머리 항목(id 판정)");
         assert_eq!(d.remaining, 1);
         assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "pop 은 배달분 하나만");
@@ -25797,7 +25902,7 @@ mod tests {
         let e1 = daemon.next_queue_entry("현재 머리".into(), None, "test");
         s.pending_queue.lock().unwrap().push_back(e1.clone());
         // 조준(다른 id)과 머리 불일치 → 배달·pop·이벤트 전무.
-        assert!(deliver_head_locked(&daemon, &s, true, false, Some("q0.999"), None, None, None).is_none());
+        assert!(deliver_head_locked(&daemon, &s, true, false, Some("q0.999"), None, None, None, None).is_none());
         assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "불일치 시 pop 금지");
         assert_eq!(
             daemon.bus.tail(30).iter().filter(|ev| ev["name"] == "queue.delivered").count(),
@@ -25805,7 +25910,7 @@ mod tests {
             "불일치 시 배달 영수증도 없다(무부작용)"
         );
         // 대조군: 일치하면 정상 배달.
-        assert!(deliver_head_locked(&daemon, &s, true, false, Some(&e1.id), None, None, None).is_some());
+        assert!(deliver_head_locked(&daemon, &s, true, false, Some(&e1.id), None, None, None, None).is_some());
         assert!(s.pending_queue.lock().unwrap().is_empty());
     }
 
@@ -28584,7 +28689,7 @@ after-tick liveness alone does not attribute a clock defect",
         ks.paused = true;
         ks.kill_switch = true;
         // (상수 이름, 값, d0 에서의 code) — 소스의 `const BLOCKED_*` 선언과 **이름 집합이 같아야** 한다(아래 전수 가드).
-        let consts: [(&str, &str, &str); 14] = [
+        let consts: [(&str, &str, &str); 15] = [
             ("BLOCKED_APPROVAL", BLOCKED_APPROVAL, "approval"),
             ("BLOCKED_MODAL", BLOCKED_MODAL, "answer_modal"),
             ("BLOCKED_BUSY", BLOCKED_BUSY, "wait"),
@@ -28596,6 +28701,7 @@ after-tick liveness alone does not attribute a clock defect",
             ("BLOCKED_QUIESCING", super::BLOCKED_QUIESCING, "wait"),
             ("BLOCKED_SETTLE_BUDGET", super::BLOCKED_SETTLE_BUDGET, "wait"),
             ("BLOCKED_RECEIVER_HELD", super::BLOCKED_RECEIVER_HELD, "wait"),
+            ("BLOCKED_WRITER_ACTIVE", super::BLOCKED_WRITER_ACTIVE, "wait"),
             ("BLOCKED_PARTIAL_WRITE", super::BLOCKED_PARTIAL_WRITE, "wait"),
             ("BLOCKED_QUEUE_PAUSED", super::BLOCKED_QUEUE_PAUSED, "wait"), // 좌석 pause 가 진단 시점에 이미 만료(paused=false)
             ("BLOCKED_PAUSED_KILL_SWITCH", super::BLOCKED_PAUSED_KILL_SWITCH, "unknown"), // kill_switch=false 인 d0 에서는 미분류 — 실사용은 아래 ks(1행)
@@ -28653,7 +28759,8 @@ after-tick liveness alone does not attribute a clock defect",
             ["empty_seat(좌석에 에이전트 미연결)", "human_typing(사람 입력 직후)"].iter().map(|s| s.to_string()).collect();
         assert_eq!(lits, known_lits, "틱의 리터럴 막힘 사유가 표와 어긋났다 — queue_remedy 표·WORKLOG 매핑을 갱신하라");
         // 상수 인자는 전부 위 표에 있는 이름이어야 하고, 변수 인자는 게이트 판정이 돌려준 사유(`why`) 하나뿐이다(그 값은 `BLOCKED_*` 상수다).
-        let known_idents: std::collections::BTreeSet<String> = documented.iter().cloned().chain(["why".to_string()]).collect();
+        // F2 call-owned `reason` is another gate result; every producer of it returns BLOCKED_WRITER_ACTIVE.
+        let known_idents: std::collections::BTreeSet<String> = documented.iter().cloned().chain(["why".to_string(), "reason".to_string()]).collect();
         let stray: Vec<&String> = idents.difference(&known_idents).collect();
         assert!(stray.is_empty(), "틱이 표에 없는 식별자를 막힘 사유로 기록한다: {stray:?}");
         for must in ["BLOCKED_QUEUE_PAUSED", "BLOCKED_QUIESCING", "BLOCKED_SETTLE_BUDGET", "BLOCKED_INTERVAL", "BLOCKED_INPUT_PENDING", "BLOCKED_BUSY", "why"] {
@@ -29897,7 +30004,7 @@ after-tick liveness alone does not attribute a clock defect",
         s.pending_queue.lock().unwrap().extend([a, r1, r2]);
         let mut got: Vec<Vec<String>> = Vec::new();
         for _ in 0..200 {
-            if let Some(d) = deliver_head_locked(&daemon, &s, false, false, None, None, None, None) {
+            if let Some(d) = deliver_head_locked(&daemon, &s, false, false, None, None, None, None, None) {
                 got.push(d.merged_ids.clone());
             }
             if s.pending_queue.lock().unwrap().is_empty() {
@@ -29934,12 +30041,12 @@ after-tick liveness alone does not attribute a clock defect",
         s.pending_queue.lock().unwrap().push_back(a);
         let last = std::time::Instant::now() - std::time::Duration::from_millis(2500);
         *s.last_queue_delivery_at.lock().unwrap() = Some(last);
-        let control = deliver_head_locked(&daemon, &s, true, false, None, None, None, None);
+        let control = deliver_head_locked(&daemon, &s, true, false, None, None, None, None, None);
         assert!(control.is_none(), "control: a fresh front alone keeps the 8 s interval");
         let mut old = daemon.next_queue_entry("[보고] old".into(), Some("surface:9".into()), "send");
         old.enqueued_at -= 700.0;
         s.pending_queue.lock().unwrap().push_back(old);
-        let d = deliver_head_locked(&daemon, &s, true, false, None, None, None, None);
+        let d = deliver_head_locked(&daemon, &s, true, false, None, None, None, None, None);
         let _ = s.child.lock().unwrap().kill();
         let d = d.expect("the old report behind the fresh front relaxes the interval to 2 s; 2.5 s have passed");
         assert_eq!(d.entry.id, a_id, "the authoritative front is what goes");
@@ -32840,8 +32947,9 @@ mod h_machine_hold_tests {
     /// of W-5..W-8) and its scope control. Renamed `_of_65`.
     /// ★(0.14.56 · D3-BOUND I1) 65 → **70**: class C +5 recorder-seat S0 specimens (`d9_bound_t_s0*` - queue T-S0, T-S0h, W-5, W-7,
     /// W-8; the W-6 one lives with the `#[cfg(unix)]` H3 channel rig). Renamed `_of_70` (the CI comment in windows-health.yml too).
+    /// D3-BOUND I2: 70 -> 75, five additional POSIX recorder specimens; channel rig cases remain cfg(unix).
     #[test]
-    fn r2f_dm_windows_ignore_attributes_are_exactly_the_decided_set_of_70() {
+    fn r2f_dm_windows_ignore_attributes_are_exactly_the_decided_set_of_75() {
         const REASON_A: &str = "S21 제출 정착·창 위 CR 보류는 유닉스 한정(send_settle_applies)";
         const REASON_B: &str = "윈도우 기본 H 마스크는 draft 축을 끈다(hold_axes_default(true)) — 이 검체는 유닉스 기본(draft 축) 동작을 본다";
         const REASON_C: &str = "좌석 명령이 POSIX 셸 문법";
@@ -32930,11 +33038,16 @@ mod h_machine_hold_tests {
             //   S0 baseline itself has no cfg and runs on Windows (UNMEASURED there).
             ("agent_queue_tests", "d9_bound_t_s0_a_write_finished_between_judgment_and_hand_off_refuses_the_claim", 'C'),
             ("agent_queue_tests", "d9_bound_t_s0h_a_human_key_time_between_judgment_and_hand_off_refuses_the_claim", 'C'),
+            ("agent_queue_tests", "d9_bound_i2_queue_busy_holds_then_first_idle_pass_delivers", 'C'),
+            ("agent_queue_tests", "d9_bound_i2_late_busy_undoes_owned_marks_without_refusal", 'C'),
+            ("agent_queue_tests", "d9_bound_i2_non_master_is_not_idle_gated", 'C'),
+            ("agent_queue_tests", "d9_bound_i2_writer_hold_keeps_queue_alarms_live", 'C'),
             ("boot_supervisor", "d9_bound_t_s0_boot_notice_refused_after_a_write_finished_inside_the_window", 'C'),
             ("handlers", "d9_bound_t_s0_ceo_push_refused_after_a_write_finished_inside_the_window", 'C'),
             ("schedule", "d9_bound_t_s0_schedule_push_refused_after_a_write_finished_inside_the_window", 'C'),
+            ("schedule", "d9_bound_i2_schedule_diversion_delivers_at_first_idle_queue_pass", 'C'),
         ];
-        assert_eq!(want.len(), 70, "결정한 집합은 70건(24 + 17 + 26 + 3)");
+        assert_eq!(want.len(), 75, "결정한 집합은 75건(24 + 17 + 31 + 3)");
         let needle = concat!("#[cfg_attr(not(unix), ", "ignore = \"");
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/cysd");
         let mut got: Vec<(String, String, char)> = Vec::new();
@@ -32961,8 +33074,8 @@ mod h_machine_hold_tests {
         got.sort();
         let mut want_sorted: Vec<(String, String, char)> = want.iter().map(|(a, b, c)| (a.to_string(), b.to_string(), *c)).collect();
         want_sorted.sort();
-        assert_eq!(got.len(), 70, "윈도우 `ignore` 가 {}건이다(결정 70건) — 새로 더했거나 뺐다: {got:?}", got.len());
-        assert_eq!(got, want_sorted, "윈도우 `ignore` 집합이 결정한 70건과 다르다 — 목록과 `ignore` 사유를 함께 고쳐라");
+        assert_eq!(got.len(), 75, "윈도우 `ignore` 가 {}건이다(결정 75건) — 새로 더했거나 뺐다: {got:?}", got.len());
+        assert_eq!(got, want_sorted, "윈도우 `ignore` 집합이 결정한 75건과 다르다 — 목록과 `ignore` 사유를 함께 고쳐라");
     }
 }
 

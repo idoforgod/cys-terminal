@@ -7718,6 +7718,31 @@ mod d9_writer_guard_tests {
         assert_eq!(h2.outcome.lock().unwrap().clone(), Some(PushOutcome::Written));
     }
 
+    #[test]
+    #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+    fn d9_bound_i2_schedule_diversion_delivers_at_first_idle_queue_pass() {
+        let f = crate::agent_queue_tests::fx("i2-w8");
+        let daemon = &f.daemon;
+        let (s, out) = d9_role_recorder(daemon, &f.dir, "i2-w8", "master");
+        let job: Job = serde_json::from_value(json!({"id":"i2-w8", "action":"push", "to":"master", "every_minutes":60})).unwrap();
+        let h = d9_with_write_ahead(&s, || inject_on(daemon, &s, "i2-w8", Some(PushOrigin { job, role: Some(("master".into(), false)) }), crate::governance::D9WriterGuard::for_target(daemon, &s)).unwrap());
+        wait_until("push settled", || h.outcome.lock().unwrap().is_some());
+        assert_eq!(*h.outcome.lock().unwrap(), Some(PushOutcome::Diverted));
+        let held = crate::agent_queue_tests::hold_writer(&s);
+        let before = crate::governance::h_ledger_count(daemon, "queue");
+        crate::governance::deliver_head_locked(daemon, &s, true, false, None, None, None, None, None);
+        assert_eq!(crate::governance::h_ledger_count(daemon, "queue"), before, "S-W8: diverted queue item holds before pre-record");
+        held.send(()).unwrap();
+        wait_until("idle", || s.write_tx.gate().pending() == 0);
+        assert!(crate::governance::deliver_head_locked(daemon, &s, true, false, None, None, None, None, None).is_some(), "S-W8: first idle pass delivers");
+        wait_until("queue empty", || s.pending_queue.lock().unwrap().is_empty());
+        let bytes = d9_received(&out, 2);
+        assert_eq!(bytes.iter().filter(|&&b| b == b'\r').count(), 1, "S-W8: exactly one Return");
+        let refused: Vec<_> = daemon.bus.tail(400).into_iter().filter(|e| e["name"] == "schedule.push_refused").collect();
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0]["payload"]["diverted"], json!(true));
+    }
+
     /// T-S0 / W-8 (D3-BOUND r2 §1.5): S0 taken where `deliver_push_with` takes it (before its judgment - pinned in governance
     /// h7), then a foreign write admitted after the push's ledger pre-record and FINISHED before its hand-off -> the claim
     /// refuses: 0 bytes of the push, outcome `guard_aborted`.
