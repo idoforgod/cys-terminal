@@ -137,12 +137,15 @@ fn recorder_load() -> String { String::from_utf8_lossy(&std::process::Command::n
     /// record this turn (no pending connection, or a connection that was not read - the latter is pushed to `errors`).
     /// ★The accepted stream is made BLOCKING before the read: on macOS it inherits O_NONBLOCK from the listener (kept
     /// nonblocking for the stop poll), and a read timeout is inert on a nonblocking socket. Linux does not inherit it.
+    /// `before_read` runs once the stream is set up, right before the request line is read (the specimens use it to
+    /// order a late write after the accept; the fixture passes a no-op).
     #[cfg(unix)]
-    fn recorder_next_request(listener:&std::os::unix::net::UnixListener,read_timeout:Duration,lane:&str,errors:&Mutex<Vec<String>>)->Option<(std::os::unix::net::UnixStream,Value)> {
+    fn recorder_next_request(listener:&std::os::unix::net::UnixListener,read_timeout:Duration,lane:&str,errors:&Mutex<Vec<String>>,before_read:&dyn Fn(&std::os::unix::net::UnixStream))->Option<(std::os::unix::net::UnixStream,Value)> {
      let (stream,_)=match listener.accept(){Ok(x)=>x,Err(e) if e.kind()==std::io::ErrorKind::WouldBlock=>{std::thread::sleep(Duration::from_millis(2));return None},Err(e)=>panic!("{e}")};
      let read=|| -> Result<Value,String> {
       stream.set_nonblocking(false).map_err(|e|format!("set_nonblocking(false): {e}"))?;
       stream.set_read_timeout(Some(read_timeout)).map_err(|e|format!("set_read_timeout: {e}"))?;
+      before_read(&stream);
       let mut line=String::new();
       if BufReader::new(&stream).read_line(&mut line).map_err(|e|format!("read_line: {e}"))?==0 {return Err("connection closed before a request line".into());}
       serde_json::from_str(&line).map_err(|e|format!("request is not JSON ({e}): {line:?}"))
@@ -153,35 +156,51 @@ fn recorder_load() -> String { String::from_utf8_lossy(&std::process::Command::n
     /// ★#16 (0.14.56): a client whose request arrives AFTER the peer accepted must still be read. On macOS the accepted
     /// socket inherits O_NONBLOCK from the nonblocking listener, so `set_read_timeout` alone is inert (read = WouldBlock at
     /// 0 ms) and the request was dropped unread -> the CLI's write met EPIPE (release run 40664016381 attempt 2).
+    /// Ordered by events, not by time: the client connects (so the accept below returns at once), and writes only when
+    /// the peer's `before_read` says the stream is set up - the request is always written AFTER the accept.
     #[cfg(unix)]
     #[test]
     fn p2_recorder_reads_a_late_writer() {
+     use std::os::fd::AsRawFd;
      let sock=std::env::temp_dir().join(format!("p2-late-{}.sock",std::process::id()));let _=fs::remove_file(&sock);
      let listener=std::os::unix::net::UnixListener::bind(&sock).unwrap();listener.set_nonblocking(true).unwrap();
-     let path=sock.clone();
-     let client=std::thread::spawn(move||{let mut s=std::os::unix::net::UnixStream::connect(&path).unwrap();std::thread::sleep(Duration::from_millis(300));let _=s.write_all(b"{\"id\":1,\"method\":\"system.ping\",\"params\":{}}\n");std::thread::sleep(Duration::from_millis(500));});
-     let errors=Mutex::new(Vec::new());let until=std::time::Instant::now()+Duration::from_secs(2);
-     let got=loop{if let Some(x)=recorder_next_request(&listener,Duration::from_secs(3),"T",&errors){break Some(x.1)} if !errors.lock().unwrap().is_empty()||std::time::Instant::now()>until{break None}};
-     client.join().unwrap();let _=fs::remove_file(&sock);
-     assert_eq!(got.as_ref().map(|v|v["method"].clone()),Some(json!("system.ping")),"a request written 300 ms after connect was not read (errors {:?})",errors.lock().unwrap());
+     let path=sock.clone();let (connected_tx,connected_rx)=std::sync::mpsc::channel::<()>();let (go_tx,go_rx)=std::sync::mpsc::channel::<()>();
+     let client=std::thread::spawn(move||{let mut s=std::os::unix::net::UnixStream::connect(&path).unwrap();connected_tx.send(()).unwrap();if go_rx.recv().is_ok(){s.write_all(b"{\"id\":1,\"method\":\"system.ping\",\"params\":{}}\n").unwrap();}});
+     connected_rx.recv().unwrap();
+     let errors=Mutex::new(Vec::new());let blocking_at_read=std::cell::Cell::new(None);
+     let got=recorder_next_request(&listener,Duration::from_secs(60),"T",&errors,&|s|{blocking_at_read.set(Some(unsafe{libc::fcntl(s.as_raw_fd(),libc::F_GETFL)}&libc::O_NONBLOCK==0));go_tx.send(()).unwrap();}); // 60 s = hang guard only: the request is written right after the before-read signal
+     drop(go_tx);client.join().unwrap();let _=fs::remove_file(&sock);
+     assert_eq!(blocking_at_read.get(),Some(true),"the accepted stream was not blocking at the read - on macOS it inherits O_NONBLOCK from the listener (errors {:?})",errors.lock().unwrap());
+     assert_eq!(got.as_ref().map(|x|x.1["method"].clone()),Some(json!("system.ping")),"a request written after the peer accepted was not read (errors {:?})",errors.lock().unwrap());
     }
 
     /// ★#16 (0.14.56, CEO ruling item 2): a connection the peer could not read is REPORTED, not skipped in silence -
     /// otherwise the next fixture fault shows up only as an unrelated EPIPE in the CLI under test.
+    /// Two unread shapes, each reported as itself: a client that stays connected and silent until the peer has
+    /// returned (the read timeout ends the read), and a client that closes once the peer has set the stream up (EOF
+    /// at the read). A client that closed BEFORE the accept is reported too, but on macOS by `set_read_timeout`
+    /// (EINVAL, os error 22 - measured), never reaching the read, so it cannot stand for the EOF branch.
     #[cfg(unix)]
     #[test]
     fn p2_recorder_reports_an_unread_connection() {
      let sock=std::env::temp_dir().join(format!("p2-silent-{}.sock",std::process::id()));let _=fs::remove_file(&sock);
      let listener=std::os::unix::net::UnixListener::bind(&sock).unwrap();listener.set_nonblocking(true).unwrap();
-     let path=sock.clone();
-     let client=std::thread::spawn(move||{let _s=std::os::unix::net::UnixStream::connect(&path).unwrap();std::thread::sleep(Duration::from_millis(800));});
-     let errors=Mutex::new(Vec::new());let until=std::time::Instant::now()+Duration::from_secs(2);
-     let got=loop{if let Some(x)=recorder_next_request(&listener,Duration::from_millis(200),"T",&errors){break Some(x.1)} if !errors.lock().unwrap().is_empty()||std::time::Instant::now()>until{break None}};
-     client.join().unwrap();let _=fs::remove_file(&sock);
+     let errors=Mutex::new(Vec::new());
+     let path=sock.clone();let (connected_tx,connected_rx)=std::sync::mpsc::channel::<()>();let (done_tx,done_rx)=std::sync::mpsc::channel::<()>();
+     let silent=std::thread::spawn(move||{let _s=std::os::unix::net::UnixStream::connect(&path).unwrap();connected_tx.send(()).unwrap();let _=done_rx.recv();});
+     connected_rx.recv().unwrap();
+     let got_silent=recorder_next_request(&listener,Duration::from_millis(200),"T",&errors,&|_|{});
+     drop(done_tx);silent.join().unwrap();
+     let path=sock.clone();let (connected_tx,connected_rx)=std::sync::mpsc::channel::<()>();let (close_tx,close_rx)=std::sync::mpsc::channel::<()>();
+     let closing=std::thread::spawn(move||{let s=std::os::unix::net::UnixStream::connect(&path).unwrap();connected_tx.send(()).unwrap();let _=close_rx.recv();drop(s);});
+     connected_rx.recv().unwrap();
+     let got_closed=recorder_next_request(&listener,Duration::from_secs(60),"T",&errors,&|_|{close_tx.send(()).unwrap();}); // 60 s = hang guard only: the client closes right after the before-read signal
+     drop(close_tx);closing.join().unwrap();let _=fs::remove_file(&sock);
      let errors=errors.into_inner().unwrap();
-     assert!(got.is_none(),"a silent client produced a request: {got:?}");
-     assert_eq!(errors.len(),1,"the unread connection was not reported: {errors:?}");
-     assert!(errors[0].starts_with("T: "),"the report does not name the lane: {errors:?}");
+     assert!(got_silent.is_none()&&got_closed.is_none(),"an unread client produced a request: {got_silent:?} {got_closed:?}");
+     assert_eq!(errors.len(),2,"each unread connection must be reported once: {errors:?}");
+     assert!(errors[0].starts_with("T: read_line: "),"a silent client must be reported as a read that timed out, not as EOF: {errors:?}");
+     assert_eq!(errors[1],"T: connection closed before a request line","a closed client must be reported as EOF, not as a timeout: {errors:?}");
     }
 
     #[cfg(unix)]
@@ -205,7 +224,7 @@ fn recorder_load() -> String { String::from_utf8_lossy(&std::process::Command::n
   let stop=stop.clone();let seen=seen.clone();let read_errors=read_errors.clone();
   servers.push(std::thread::spawn(move|| {
    while !stop.load(Ordering::Relaxed) {
-    let Some((mut stream,req))=recorder_next_request(&listener,Duration::from_secs(3),lane,&read_errors) else {continue};let method=req["method"].as_str().unwrap();
+    let Some((mut stream,req))=recorder_next_request(&listener,Duration::from_secs(3),lane,&read_errors,&|_|{}) else {continue};let method=req["method"].as_str().unwrap();
     seen.lock().unwrap().push(json!({"lane":lane,"request":req}));
     if method=="surface.send_text" {
      let text=req["params"]["text"].as_str().unwrap_or("");
