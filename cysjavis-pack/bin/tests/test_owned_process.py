@@ -1559,7 +1559,10 @@ class PoolBoundedStop(unittest.TestCase):
             (root/name/'SKILL.md').write_text('# fixture')
         script = self.root/'e2fixture.py'
         script.write_text(_E2_FIXTURE % {'bin': str(BIN)})
-        env = dict(os.environ, C03E2_BRANCH=branch, C03E2_TMP=str(self.root), C03E2_ROOT=str(root), C03E2_D='1.0')
+        # UTF-8 on the wire, as on the product's managed path (_owned_process._utf8_stdio): with the runner's default
+        # the child's stderr file was cp1252 and its Korean came back as \\uXXXX escapes (d2be23fe log :762-768).
+        env = dict(os.environ, C03E2_BRANCH=branch, C03E2_TMP=str(self.root), C03E2_ROOT=str(root), C03E2_D='1.0',
+                   PYTHONIOENCODING='utf-8')
         out_f = open(self.root/'e2.out', 'w'); err_f = open(self.root/'e2.err', 'w')
         p = subprocess.Popen([PYTHON, '-B', str(script)], stdout=out_f, stderr=err_f, env=env,
                              start_new_session=(os.name == 'posix'))
@@ -1572,7 +1575,7 @@ class PoolBoundedStop(unittest.TestCase):
             if os.name == 'posix':
                 os.killpg(p.pid, signal.SIGKILL)
         out_f.close(); err_f.close()
-        out = (self.root/'e2.out').read_text(); err = (self.root/'e2.err').read_text()
+        out = (self.root/'e2.out').read_text(encoding='utf-8'); err = (self.root/'e2.err').read_text(encoding='utf-8')
         pids = [int(x) for x in (self.root/'pids.txt').read_text().split()] if (self.root/'pids.txt').exists() else []
         # Read now: tearDown removes the temp root before the cleanups run.
         ident = self.root/'identities.txt'
