@@ -272,6 +272,8 @@ def run_owned(cmd, timeout, grace=0.0, force=5.0, cancel=None, env=None, encodin
     Grace ends early once the leader is gone (control-eof): nobody is left to cooperate.
     Every launch requires private admission/completion. Explicit custom commands
     use the managed command adapter; there is no uncontained launch mode.
+    stdout/stderr are decoded text; stdout_bytes/stderr_bytes are the raw bytes the
+    leaf CLI relays (bytes, so the result dict is not JSON as a whole).
     """
     start = monotonic(); execution = start + timeout
     events = queue.Queue(); chunks = {'out': [], 'err': []}
@@ -474,11 +476,13 @@ def run_owned(cmd, timeout, grace=0.0, force=5.0, cancel=None, env=None, encodin
             if fd is not None:
                 os.close(fd)
     complete = done is not None and not fault and not timed_out and cleanup == 'verified_empty'
+    out, err = b''.join(chunks['out']), b''.join(chunks['err'])
     return {'returncode': done if complete else (proc.returncode if proc else None),
             'diagnostic_returncode': done,
             'kernel_returncode': proc.returncode if proc else None,
-            'stdout': b''.join(chunks['out']).decode(encoding, 'replace'),
-            'stderr': b''.join(chunks['err']).decode(encoding, 'replace'),
+            'stdout': out.decode(encoding, 'replace'),
+            'stderr': err.decode(encoding, 'replace'),
+            'stdout_bytes': out, 'stderr_bytes': err,
             'timed_out': timed_out, 'complete': complete, 'cleanup': cleanup,
             'reason': fault or '', 'elapsed': monotonic() - start}
 
@@ -578,23 +582,30 @@ def bounded_cli():
         result = {'complete': False, 'stdout': '', 'stderr': '',
                   'reason': 'phase budget exhausted; unmeasured', 'timed_out': True}
     elapsed = monotonic()-started
+    # Relay the child's bytes as written (H-WIN-17): a text-mode stdout on Windows writes LF as CR LF, and records
+    # pass this leaf once per phase, so every pass added a CR; decoding also turned invalid UTF-8 into U+FFFD.
+    # Only our own framing and diagnostics are encoded here.
+    out = result.get('stdout_bytes', result['stdout'].encode('utf-8'))
+    write = sys.stdout.buffer.write
     if args.records:
         if result['complete'] and result.get('returncode') == 0:
-            sys.stdout.write(result['stdout'])
+            write(out)
         else:
             # A complete key/value pair is a committed phase checkpoint. Keep
             # it even if a subsequent file read stalls; drop any partial pair.
-            fields = result['stdout'].split('\0')
+            fields = out.split(b'\0')
             for i in range(0, len(fields)-2, 2):
-                sys.stdout.write(fields[i]+'\0'+fields[i+1]+'\0')
-            sys.stdout.write('_OWNED_FAILURE\0%s\0' % (result['reason'] or 'timeout/incomplete'))
-        sys.stdout.write('_OWNED_STARTED\0%.9f\0_OWNED_ELAPSED\0%.9f\0' % (origin, elapsed))
-        sys.stdout.write(('_OWNED_SPENT\0%.9f\0_OWNED_RETURNED\0' + '1\0') % (args.spent+elapsed))
+                write(fields[i]+b'\0'+fields[i+1]+b'\0')
+            write(('_OWNED_FAILURE\0%s\0' % (result['reason'] or 'timeout/incomplete')).encode('utf-8', 'replace'))
+        write(('_OWNED_STARTED\0%.9f\0_OWNED_ELAPSED\0%.9f\0' % (origin, elapsed)).encode('ascii'))
+        write((('_OWNED_SPENT\0%.9f\0_OWNED_RETURNED\0' + '1\0') % (args.spent+elapsed)).encode('ascii'))
     else:
-        sys.stdout.write(result['stdout'])
-    sys.stderr.write(result['stderr'])
+        write(out)
+    sys.stdout.flush()
+    sys.stderr.buffer.write(result.get('stderr_bytes', result['stderr'].encode('utf-8')))
     if not result['complete']:
-        print('owned execution incomplete: ' + (result['reason'] or 'deadline'), file=sys.stderr)
+        sys.stderr.buffer.write(('owned execution incomplete: %s\n' % (result['reason'] or 'deadline')).encode('utf-8', 'replace'))
+    sys.stderr.flush()
     return (result.get('returncode') or 0) if result['complete'] else (124 if result['timed_out'] else 125)
 
 

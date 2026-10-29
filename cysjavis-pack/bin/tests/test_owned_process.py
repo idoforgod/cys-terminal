@@ -708,7 +708,7 @@ def record(*a,**kw):
  marker=Path(%r);tmp=marker.with_suffix('.tmp');tmp.write_text(str(p.pid));os.replace(tmp,marker)
  return p
 owned.subprocess.Popen=record
-print(json.dumps(owned.run_owned([sys.executable,'-B',%r],2,force=.3)),flush=True)
+print(json.dumps({k:v for k,v in owned.run_owned([sys.executable,'-B',%r],2,force=.3).items() if not isinstance(v,bytes)}),flush=True)
 """%(str(BIN),str(marker),str(self.root/'denied-target.py')))
         (self.root/'denied-target.py').write_text("import sys,threading\nsys.path.insert(0,%r)\nimport _owned_process as owned\nowned._self_stop=lambda group:threading.Event().wait()\nowned.managed_main(lambda:0)\n"%str(BIN))
         p=subprocess.Popen([str(sandbox),'-p','(version 1)(allow default)(deny signal)',PYTHON,'-B',str(script)],
@@ -1056,6 +1056,105 @@ if __name__=='__main__':
         self.assertIn('C03-ISOLATED-STATE', p.stdout, p.stderr[-400:])
         self.assertTrue(mark.exists(), 'the --phase body looked for inject_gate.py beside the cwd, not beside the hook')
 
+    def crlf_env(self):
+        """H-WIN-17 specimens: an env whose text-mode Python stdio writes LF as CR LF (Windows' premise). POSIX gets
+        the _CRLF_SITECUSTOMIZE emulation plus its argv log; on nt the premise is native and an embeddable runtime
+        ignores PYTHONPATH, so nothing is added there."""
+        if os.name == 'posix':
+            home = self.root/'home'; home.mkdir(exist_ok=True)
+            emu = self.root/'crlf-emu'; emu.mkdir(exist_ok=True)
+            (emu/'sitecustomize.py').write_text(_CRLF_SITECUSTOMIZE)
+            return {'PATH': '/usr/bin:/bin', 'HOME': str(home), 'TMPDIR': str(home), 'PYTHONUTF8': '0',
+                    'PYTHONPATH': str(emu), 'C03_EMU_LOG': str(self.root/'crlf-emu.log')}
+        return dict(os.environ, PYTHONUTF8='0')
+
+    def assert_crlf_premise(self, env, *leaf_args):
+        # Prerequisite, before any verdict: the premise is live, and on POSIX it reached the process under test (a
+        # process whose argv carries every leaf_args), not only a sibling - a green must not mean "emulation lost".
+        sib = subprocess.run([PYTHON, '-B', '-c', "print('a')"], capture_output=True, env=env, timeout=10)  # wallclock: guard 10 s only ends a hang; the verdict is the printed bytes
+        self.assertEqual(sib.stdout, b'a\r\n', 'premise not live: a text-mode print wrote %r' % sib.stdout)
+        if os.name == 'posix':
+            log = self.root/'crlf-emu.log'
+            seen = log.read_text(encoding='utf-8').splitlines() if log.exists() else []
+            self.assertTrue([l for l in seen if all(a in l for a in leaf_args)],
+                            'the CRLF emulation never reached a process with %r: %r' % (leaf_args, seen[-6:]))
+
+    def run_leaf(self, script, records):
+        """The leaf CLI relaying a bash child that writes LF and a 0xFF byte; returns (rc, stdout, stderr) as bytes."""
+        import shutil
+        bash = os.environ.get('C03_TEST_BASH') or shutil.which('bash')
+        if not bash:
+            self.skipTest('no bash (on nt: C03_TEST_BASH, the bundled Git bash)')
+        env = self.crlf_env()
+        cmd = [PYTHON, '-B', str(BIN/'_owned_process.py'), '--bounded', '10'] + (['--records'] if records else [])
+        p = subprocess.run(cmd + ['--', bash, '-c', script], capture_output=True, env=env, timeout=30)  # wallclock: guard 30 s only ends a hang (the leaf's own cap is 10 s); the verdict is the relayed bytes
+        self.assert_crlf_premise(env, '--bounded', '10')
+        return p.returncode, p.stdout, p.stderr
+
+    def test_leaf_records_complete_relay_is_byte_exact(self):
+        # H-WIN-17 S2 (:583): a complete phase's records leave the leaf as the child wrote them.
+        rc, out, err = self.run_leaf(r"printf 'OUT\0a\nb\377\0'", True)
+        self.assertEqual(rc, 0, err[-400:])
+        self.assertNotIn(b'\r', out, 'complete records relay (:583) added CR: %r' % out[:40])
+        self.assertTrue(out.startswith(b'OUT\x00a\nb\xff\x00'), 'complete records relay (:583) changed bytes: %r' % out[:40])
+
+    def test_leaf_records_partial_relay_is_byte_exact(self):
+        # H-WIN-17 S2 (:589): an incomplete phase keeps its committed pairs byte for byte.
+        rc, out, err = self.run_leaf(r"printf 'OUT\0a\nb\377\0'; exit 3", True)
+        self.assertIn(b'_OWNED_FAILURE\x00', out, 'not the partial-record path: %r' % out[:80])
+        self.assertNotIn(b'\r', out, 'partial records relay (:589) added CR: %r' % out[:40])
+        self.assertTrue(out.startswith(b'OUT\x00a\nb\xff\x00_OWNED_FAILURE\x00'), 'partial records relay (:589) changed bytes: %r' % out[:40])
+
+    def test_leaf_plain_relay_is_byte_exact(self):
+        # H-WIN-17 S2 (:594): the non-records relay (inject-context :497 CHK_OUT) passes stdout through unchanged.
+        rc, out, err = self.run_leaf(r"printf 'OUT\0a\nb\377\0'", False)
+        self.assertEqual(rc, 0, err[-400:])
+        self.assertNotIn(b'\r', out, 'plain relay (:594) added CR: %r' % out)
+        self.assertEqual(out, b'OUT\x00a\nb\xff\x00', 'plain relay (:594) changed bytes')
+
+    def test_leaf_stderr_relay_is_byte_exact(self):
+        # H-WIN-17 S2 (:595): the child's stderr leaves the leaf unchanged.
+        rc, out, err = self.run_leaf(r"printf 'e1\ne2\377' >&2", False)
+        self.assertEqual(rc, 0, err[-400:])
+        self.assertNotIn(b'\r', err, 'stderr relay (:595) added CR: %r' % err)
+        self.assertEqual(err, b'e1\ne2\xff', 'stderr relay (:595) changed bytes')
+
+    def test_soul_headings_reach_the_hook_output_without_cr(self):
+        # H-WIN-17 S1: the real hook, _lib.sh and leaf under the CRLF premise. The soul's real LF between headings
+        # and the checklist's own lines (:497) pass every phase with no CR added. The checklist's own CR LF (a text
+        # tool on the premise) is the in-path witness and must still arrive exactly once.
+        import shutil
+        bash = os.environ.get('C03_TEST_BASH') or shutil.which('bash')
+        if not bash:
+            self.skipTest('no bash (on nt: C03_TEST_BASH, the bundled Git bash)')
+        hooks = Path(__file__).resolve().parents[2]/'hooks'
+        pack = self.root/'pack'; (pack/'hooks').mkdir(parents=True); (pack/'bin').mkdir()
+        for name in ('_lib.sh', 'inject_gate.py', 'inject-context.sh'):
+            shutil.copyfile(hooks/name, pack/'hooks'/name)
+        for name in ('_owned_process.py', 'javis_checklist.py'):
+            shutil.copyfile(BIN/name, pack/'bin'/name)
+        (pack/'bin'/'javis_preflight.py').write_text("import os,sys\nsys.path.insert(0,os.path.dirname(__file__))\nfrom _owned_process import managed_main\ndef main():\n print('fixture summary')\n return 0\nmanaged_main(main)\n")
+        # No invalid UTF-8 byte here: the phase bash inherits LC_CTYPE=C.UTF-8 from the leaf's locale coercion and
+        # BSD tr at inject-context.sh:288 cuts a heading at such a byte (pin bytes too) - that is the heading
+        # pipeline, not the relay. The 0xFF byte rides through every relay site in the four leaf specimens above.
+        heads = '## 금지선 하나\n## 오너 규칙 둘\n'.encode('utf-8')
+        (pack/'soul.md').write_bytes(b'# s\n' + heads.replace(b'\n', b'\nx\n'))
+        env = dict(self.crlf_env(), CYS_PY=PYTHON, CYS_ROLE='master', CYS_ROOT=str(self.root), CYS_PACK_DIR=str(pack))
+        if os.name == 'nt':
+            env['PATH'] = str(Path(bash).parent.parent/'usr'/'bin') + os.pathsep + env.get('PATH', '')
+        p = subprocess.run([bash, str(pack/'hooks'/'inject-context.sh')], capture_output=True, env=env, cwd=str(self.root),  # wallclock: guard 60 s only ends a hang of the hook; the verdict is the output bytes
+                           input=json.dumps({'source': 'startup', 'cwd': str(self.root)}).encode(), timeout=60)
+        out = p.stdout
+        self.assertEqual(p.returncode, 0, p.stderr[-400:])
+        self.assert_crlf_premise(env, '--bounded', '--records')
+        if os.name == 'posix':
+            self.assert_crlf_premise(env, '--bounded', '--managed-command')
+        self.assertIn(b'fixture summary\r', out, 'witness: the checklist line never arrived with its own CR: %r' % out[-300:])
+        i = out.index(b'fixture summary\r') + len(b'fixture summary')
+        self.assertEqual(out[i:i + 2], b'\r\n', 'checklist relay (:497/:594) added CR: %r' % out[i:i + 8])
+        self.assertIn(heads, out, 'soul headings arrived changed (records relay :583): %r' % out[out.find(b'## '):][:120])
+        self.assertNotIn(b'\r\r', out, 'a CR run in the hook output')
+
     @unittest.skipUnless(os.name == 'nt', 'Windows Git Bash hook: UNMEASURED locally')
     def test_windows_bundled_bash_hook_retains_core(self):
         import shutil
@@ -1155,10 +1254,11 @@ if __name__=='__main__':
                   '--exclude',str(check_spent),'--budget',str(4.2 if name=='checklist' else 1.5),'--total-budget','4.2']
             if name in ('role','ancillary'):args+=['--spent',str(role_spent)]
             args+=['--','fixture-command']
-            out=io.StringIO()
-            with patch.object(sys,'argv',args),patch.object(sys,'stdout',out),patch.object(sys,'stderr',io.StringIO()),patch.object(owned,'monotonic',lambda:clock[0]),patch.object(owned,'run_owned',execute):
+            # bounded_cli relays through .buffer (H-WIN-17), so the patched streams carry one.
+            out=io.TextIOWrapper(io.BytesIO(),encoding='utf-8')
+            with patch.object(sys,'argv',args),patch.object(sys,'stdout',out),patch.object(sys,'stderr',io.TextIOWrapper(io.BytesIO(),encoding='utf-8')),patch.object(owned,'monotonic',lambda:clock[0]),patch.object(owned,'run_owned',execute):
                 rc=owned.bounded_cli()
-            fields=out.getvalue().split('\0');record=dict(zip(fields[::2],fields[1::2]))
+            fields=out.buffer.getvalue().decode('utf-8').split('\0');record=dict(zip(fields[::2],fields[1::2]))
             if name in ('role','ancillary'):role_spent=float(record['_OWNED_SPENT'])
             if name=='checklist':check_spent=float(record['_OWNED_ELAPSED'])
             self.assertEqual(rc,124 if name=='extra' else 0,(name,record))
@@ -1246,6 +1346,23 @@ if __name__=='__main__':
 # Fix A (design r1 15acd497 s2.4): after a timeout or a crash the owner must stop spending grace once the leader is
 # gone (control-eof). The driver runs run_owned with grace 600 and force 5 and prints one RESULT line. With an arm
 # path, the timeout starts only once that file exists (the output holder is up), as in the held-output tests.
+# H-WIN-17: on Windows a text-mode Python stdout writes LF as CR LF, and the leaf relayed every phase's records that
+# way, so each pass added one CR per LF inside OUT. On POSIX this sitecustomize (via PYTHONPATH) gives every Python
+# in the env that premise and logs its argv, so a specimen can show the premise reached the leaf itself.
+_CRLF_SITECUSTOMIZE = r'''
+import os, sys
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(newline='\r\n')
+    except Exception:
+        pass
+_log = os.environ.get('C03_EMU_LOG')
+if _log:
+    with open(_log, 'a', encoding='utf-8') as _f:
+        _f.write(repr(sys.argv) + '\n')
+'''
+
+
 _FA_DRIVER = r'''
 import json, os, subprocess, sys
 from pathlib import Path
