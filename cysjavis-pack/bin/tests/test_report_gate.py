@@ -16,14 +16,17 @@ DESIGN §C1 필수 케이스 10종을 Gate 코어에 대역 Runner를 주입해 
 
 실행: python3 test_report_gate.py   (unittest·표준 러너 — CI가 파일 직접 실행하는 관례 준거)
 """
+import calendar
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import textwrap
+import time
 import unittest
 
-BIN = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))          # cysjavis-pack/bin
+BIN =os.path.dirname(os.path.dirname(os.path.abspath(__file__)))          # cysjavis-pack/bin
 sys.path.insert(0, BIN)
 import javis_report_gate as G                                             # noqa: E402
 
@@ -1084,6 +1087,544 @@ class P7InstrumentTests(unittest.TestCase):
         m=R._measurement_from_node(self.sample(),123)
         self.assertEqual((m['surface_id'],m['created_at']),(7,10))
         self.assertIsNone(R._measurement_from_node(self.sample(True),123)['idle_secs'])
+
+
+class ParseIsoEpochOffsetTest(unittest.TestCase):
+    """0.14.56 #2 — `_parse_iso_epoch` must honour the stamp's UTC offset.
+
+    The old body was `time.mktime(time.strptime(s, "...%z"))`: strptime parses the offset, mktime reads the
+    fields as HOST-LOCAL time and drops it, so a stamp written in another timezone lands off by
+    (stamp offset - host offset). Every cell runs in a child interpreter whose host offset is set through the
+    TZ environment variable (POSIX strings, no tz database needed: KST-9 = UTC+9, ICT-7 = UTC+7, MST7 =
+    UTC-7, UTC0), so this process's own clock is never touched. Each child first reports its own offset and
+    the cell asserts it — a child that ignored TZ would make every cell vacuous.
+    The instant is 2026-10-28T12:00:00Z written in each form."""
+
+    INSTANT = calendar.timegm((2026, 10, 28, 12, 0, 0))
+    HOSTS = {"KST-9": 32400, "ICT-7": 25200, "MST7": -25200, "UTC0": 0}
+    OFFSET_FORMS = {
+        "+0900": "2026-10-28T21:00:00+0900",
+        "+09:00": "2026-10-28T21:00:00+09:00",
+        "+0700": "2026-10-28T19:00:00+0700",
+        "+0000": "2026-10-28T12:00:00+0000",
+        "Z": "2026-10-28T12:00:00Z",
+        "-0700": "2026-10-28T05:00:00-0700",
+    }
+    CHILD = textwrap.dedent("""
+        import json, sys, time
+        sys.path.insert(0, sys.argv[1])
+        import javis_report_gate as G
+        job = json.loads(sys.argv[2])
+        out = {"gmtoff": time.localtime(job["at"]).tm_gmtoff,
+               "parsed": {k: G._parse_iso_epoch(v) for k, v in job.get("parse", {}).items()}}
+        if "deadlock" in job:
+            d = job["deadlock"]
+            tickets = [{"id": "T-1", "status": "todo", "owner": None,
+                        "created_at": d["stamp"], "updated_at": d["stamp"]}]
+            rep = {"live_nodes": [{"role": "master", "status_age_secs": 3600}]}
+            dl, reason = G.build_deadlock_warning(rep, tickets, d["now"])
+            out["deadlock"] = {"fired": dl is not None, "reason": reason}
+        print(json.dumps(out))
+    """)
+
+    def child(self, tz, job):
+        job = dict(job, at=self.INSTANT)
+        env = dict(os.environ, TZ=tz)
+        r = subprocess.run([sys.executable, "-B", "-c", self.CHILD, BIN, json.dumps(job)],
+                           capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr[-800:])
+        out = json.loads(r.stdout)
+        self.assertEqual(out["gmtoff"], self.HOSTS[tz],
+                         "child ignored TZ=%s (offset %r) - the cell would measure nothing" % (tz, out["gmtoff"]))
+        return out
+
+    def test_offset_bearing_forms_are_honoured_at_every_host_offset(self):
+        for tz in self.HOSTS:
+            got = self.child(tz, {"parse": self.OFFSET_FORMS})["parsed"]
+            for form, value in got.items():
+                self.assertIsNotNone(value, "host %s: %s did not parse" % (tz, form))
+                self.assertEqual(value - self.INSTANT, 0,
+                                 "host %s: %s read %+.2f h off (offset dropped)"
+                                 % (tz, form, (value - self.INSTANT) / 3600.0))
+
+    def test_deadlock_silent_direction_stamp_offset_above_host(self):
+        # Host back at +0700, newest ticket stamped at +0900 40 minutes ago. Read with the offset dropped it
+        # lands 2 h in the future, the age goes negative and the alarm stays silent past its 30-minute line.
+        d = {"stamp": "2026-10-28T20:20:00+0900", "now": self.INSTANT}
+        got = self.child("ICT-7", {"deadlock": d})["deadlock"]
+        self.assertTrue(got["fired"], "40 min of ticket inactivity did not fire: %r" % got)
+
+    def test_deadlock_noisy_direction_stamp_offset_below_host(self):
+        # Host at +0900, newest ticket stamped at -0700 10 minutes ago. Read with the offset dropped it lands
+        # 16 h in the past and the alarm fires on fresh activity.
+        d = {"stamp": "2026-10-28T04:50:00-0700", "now": self.INSTANT}
+        got = self.child("KST-9", {"deadlock": d})["deadlock"]
+        self.assertFalse(got["fired"], "10 min of inactivity fired the deadlock alarm: %r" % got)
+        self.assertEqual(got["reason"], "deadlock_no:recent_ticket_activity(600s)")
+
+    def test_zone_less_stamp_is_host_local_wall_time(self):
+        # Declared policy P-A (head decision 2026-10-28): a stamp without an offset is the host's local wall
+        # time at read time. No shipped writer emits one; this pins the rule instead of letting it drift.
+        wall = "2026-10-28T21:00:00"
+        for tz, off in self.HOSTS.items():
+            got = self.child(tz, {"parse": {"zl": wall}})["parsed"]["zl"]
+            self.assertEqual(got, calendar.timegm((2026, 10, 28, 21, 0, 0)) - off,
+                             "host %s: zone-less %s is not host-local" % (tz, wall))
+
+    def test_fractional_seconds_stay_unparsed(self):
+        # Declared: no writer emits fractional seconds; the parser returns None for them (unchanged).
+        forms = {"f_off": "2026-10-28T21:00:00.123+0900", "f_z": "2026-10-28T12:00:00.123Z",
+                 "f_zl": "2026-10-28T21:00:00.123"}
+        got = self.child("KST-9", {"parse": forms})["parsed"]
+        self.assertEqual(got, {k: None for k in forms})
+
+    def test_numbers_and_empty_pass_through(self):
+        self.assertEqual(G._parse_iso_epoch(1793018388), 1793018388.0)
+        self.assertEqual(G._parse_iso_epoch(1793018388.5), 1793018388.5)
+        self.assertIsNone(G._parse_iso_epoch(""))
+        self.assertIsNone(G._parse_iso_epoch(None))
+
+
+# ── 0.14.56 PACKTOOLS Phase 4 — deadlock ticket root: D-d · D-b · SHADOW (CEO ruling 4eeea43f Part B) ──
+#   The ticket path below is the REAL one (G.Runner task methods + a javis_task.py subprocess); only the
+#   report, event, wakeup and daemon calls are faked. HOME, the three override names and the publish seam are
+#   pinned per test, so nothing reads or writes a live ~/.cys/state or a live pack.
+class _TaskPathRunner(G.Runner):
+    def __init__(self, pack_bin, state_dir, rep):
+        super().__init__(pack_bin, state_dir)
+        self.rep = rep
+        self.emits, self.enqueues, self.drains, self.sends = [], [], [], []
+        self._wid = 0
+
+    def collect_report(self):
+        self._sample = getattr(self, "_sample", 0) + 300
+        self.rep["sampled_at"] = self._sample
+        for i, row in enumerate(self.rep.get("live_nodes") or []):
+            row.setdefault("surface_id", i + 1)
+            row.setdefault("created_at", 1)
+        return True, self.rep, None
+
+    def emit(self, evt_type, fields, surface="auto"):
+        self.emits.append((evt_type, fields))
+        return 0, "", ""
+
+    def enqueue(self, to, task, reason, idem, payload=None, severity=None):
+        self.enqueues.append((to, task, reason, idem, severity))
+        self._wid += 1
+        return 0, "W-%010x" % self._wid
+
+    def drain(self, target):
+        self.drains.append(target)
+        return 0, 1
+
+    def poll_events(self, after_seq, names, timeout=0):
+        return True, [], after_seq
+
+    def send_queued(self, to, body):
+        self.sends.append((to, body))
+        return 0
+
+
+class DeadlockRootShadowTest(unittest.TestCase):
+    SCOPE = "pack-dept-dept-T"
+
+    def setUp(self):
+        from unittest import mock
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = self._tmp.name
+        self.pack = os.path.join(self.tmp, self.SCOPE)
+        os.makedirs(self.pack)
+        os.symlink(BIN, os.path.join(self.pack, "bin"))
+        self.pack_bin = os.path.join(self.pack, "bin")
+        self.registry = os.path.join(self.pack, "state", "task-roots.json")
+        self.ws = os.path.join(self.tmp, "ws")
+        self.tasks_dir = os.path.join(self.ws, "_round", "tasks")
+        #   A dept-shaped pack name needs a matching CYS_SOCKET or the gate skips the cycle as a foreign
+        #   daemon (foreign_daemon_verdict). Nothing connects to it: every daemon-facing method is faked.
+        env = {"HOME": os.path.join(self.tmp, "home"), "CYS_PACK_DIR": self.pack,
+               "CYS_SOCKET": os.path.join(self.tmp, "cys-dept-dept-T", "cys.sock")}
+        self._env = mock.patch.dict(os.environ, env)
+        self._env.start()
+        for k in ("JAVIS_ROOT", "JAVIS_TASK_ROOT", "CYS_TASK_ROOT", "JAVIS_TASK_PUBLISH_EPHEMERAL",
+                  "CYS_SURFACE_ID", "AITERM_SURFACE_ID", "CYS_ROLE"):
+            os.environ.pop(k, None)
+        self.stale = report(live_nodes=[
+            {"role": "master", "idle_secs": 60, "agent_alive": True, "status_age_secs": 3600},
+            {"role": "cso", "idle_secs": 60, "agent_alive": True, "status_age_secs": 3600}])
+        self.clock = Clock(time.time() + 7200)       # tickets written now are 2 h old to the gate
+
+    def tearDown(self):
+        for d, _, _ in os.walk(self.tmp):
+            try:
+                os.chmod(d, 0o755)
+            except OSError:
+                pass
+        self._env.stop()
+        self._tmp.cleanup()
+
+    # ── helpers ──
+    def jt(self, *argv, publish=True, root=None):
+        env = dict(os.environ, JAVIS_ROOT=root or self.ws, CYS_PACK_DIR=self.pack, CYS_NO_AUTOSTART="1",
+                   JAVIS_TASK_LIVENESS="alive", CYS_PROBE_RUNS=os.path.join(self.tmp, "probe_runs.jsonl"))
+        if publish:
+            env["JAVIS_TASK_PUBLISH_EPHEMERAL"] = "1"
+        return subprocess.run([sys.executable, "-B", os.path.join(BIN, "javis_task.py")] + list(argv),
+                              capture_output=True, text=True, env=env, timeout=60)
+
+    def write_ticket(self, tasks_dir, tid, **extra):
+        os.makedirs(tasks_dir, exist_ok=True)
+        t = {"id": tid, "title": tid, "status": "todo", "owner": None,
+             "created_at": "2026-10-28T00:00:00+0900", "updated_at": "2026-10-28T00:00:00+0900"}
+        t.update(extra)
+        with open(os.path.join(tasks_dir, tid + ".json"), "w", encoding="utf-8") as f:
+            json.dump(t, f)
+
+    def write_registry(self, *roots):
+        os.makedirs(os.path.dirname(self.registry), exist_ok=True)
+        with open(self.registry, "w", encoding="utf-8") as f:
+            json.dump({"v": 1, "roots": {r: {"first_seen": 1, "last_write": 1, "role": None}
+                                         for r in roots}}, f)
+
+    def run_gate(self, runner=None):
+        r = runner or _TaskPathRunner(self.pack_bin, os.path.join(self.tmp, "gate"), self.stale)
+        sd = os.path.join(self.tmp, "gate")
+        for _ in range(2):                              # run 1 is BASELINE (no classification)
+            gate(sd, r, clock=self.clock).run()
+            self.clock.epoch += 300
+        return r, ledger_entries(sd)[-1]
+
+    def shadow(self, entry, source=None):
+        recs = entry.get("deadlock_shadow")
+        self.assertIsInstance(recs, list, "ledger row has no deadlock_shadow list: %r" % sorted(entry))
+        return [x for x in recs if source is None or x.get("source") == source]
+
+    def assert_never_paged(self, r, entry):
+        self.assertEqual([e for e in r.enqueues if e[1] == "gate-deadlock"], [], "shadow enqueued a page")
+        self.assertEqual([e for e in r.emits if e[0] == "agent.silent"], [], "shadow emitted agent.silent")
+        self.assertFalse(any(str(x).startswith("deadlock:") for x in entry.get("reasons") or []),
+                         "the deadlock warn was routed (its reason reached the ledger)")
+
+    # ── D-d: an absent or unreadable source is an INSTRUMENT-FAIL, never a clean zero ──
+    def test_dd_registry_absent_is_instrument_fail(self):
+        r, e = self.run_gate()
+        recs = self.shadow(e, "registry")
+        self.assertEqual(len(recs), 1, recs)
+        self.assertEqual(recs[0]["verdict"], "instrument_fail")
+        self.assertIn("registry_absent", recs[0]["reason"])
+        self.assertNotIn("deadlock_no:no_unassigned_ticket", e.get("reasons") or [])
+
+    def test_dd_published_root_absent_is_instrument_fail(self):
+        self.write_registry(self.tasks_dir)                # published, then gone
+        r, e = self.run_gate()
+        recs = self.shadow(e, "registry")
+        self.assertEqual([(x["root"], x["verdict"]) for x in recs], [(self.tasks_dir, "instrument_fail")])
+        self.assertIn("root_absent", recs[0]["reason"])
+
+    def test_dd_unreadable_root_is_instrument_fail(self):
+        self.write_ticket(self.tasks_dir, "T-1", scope=self.SCOPE)
+        self.write_registry(self.tasks_dir)
+        os.chmod(self.tasks_dir, 0)
+        r, e = self.run_gate()
+        recs = self.shadow(e, "registry")
+        self.assertEqual(recs[0]["verdict"], "instrument_fail")
+        self.assertIn("root_unreadable", recs[0]["reason"])
+
+    def test_dd_unreadable_registry_is_instrument_fail(self):
+        os.makedirs(os.path.dirname(self.registry))
+        with open(self.registry, "w", encoding="utf-8") as f:
+            f.write("{not json")
+        r, e = self.run_gate()
+        recs = self.shadow(e, "registry")
+        self.assertEqual(recs[0]["verdict"], "instrument_fail")
+        self.assertIn("registry_unreadable", recs[0]["reason"])
+
+    def test_dd_icloud_managed_root_is_not_read(self):
+        # Owner absolute rules (2026-09-30 · 2026-10-27): no repeated reads on an iCloud tree, never open a
+        # dataless file. A published root under ~/Desktop is listed every gate cycle unless the reader declines
+        # it - lexically, with no filesystem call. The limit is recorded per root, never as a zero (CEO B-4).
+        desk = os.path.join(os.environ["HOME"], "Desktop", "CYSjavis", "proj", "_round", "tasks")
+        self.write_ticket(desk, "T-D", scope=self.SCOPE)              # would fire if read
+        self.write_registry(desk)
+        r, e = self.run_gate()
+        rec = self.shadow(e, "registry")[0]
+        self.assertEqual((rec["verdict"], rec["reason"]), ("unmeasured", "deadlock_unmeasured:root_icloud_not_read"))
+        self.assertEqual(rec["attributed"], 0)
+
+    # ── D-b: the writer stamps scope and publishes its root; the gate reads only the registry ──
+    def test_db_create_stamps_scope_and_publishes_root(self):
+        p = self.jt("create", "x", "--id", "T-1")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        with open(os.path.join(self.tasks_dir, "T-1.json"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f).get("scope"), self.SCOPE)
+        with open(self.registry, encoding="utf-8") as f:
+            reg = json.load(f)
+        self.assertEqual(reg.get("v"), 1)
+        self.assertEqual(sorted(reg.get("roots") or {}), [os.path.abspath(self.tasks_dir)])
+
+    def test_db_set_status_publishes_root(self):
+        self.assertEqual(self.jt("create", "x", "--id", "T-1").returncode, 0)
+        if os.path.exists(self.registry):                   # create's publish is pinned elsewhere
+            os.remove(self.registry)
+        p = self.jt("set-status", "T-1", "backlog")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertTrue(os.path.isfile(self.registry), "set-status did not publish its root")
+        with open(self.registry, encoding="utf-8") as f:
+            self.assertIn(os.path.abspath(self.tasks_dir), json.load(f)["roots"])
+
+    def test_db_ephemeral_root_not_published_without_seam(self):
+        # Guard (passes on the old bytes too): a test root under a temp prefix must not plant a root that is
+        # gone tomorrow, or every later gate cycle reads a permanent INSTRUMENT-FAIL.
+        p = self.jt("create", "x", "--id", "T-1", publish=False)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertFalse(os.path.exists(self.registry), "an ephemeral root was published")
+
+    def test_db_own_scope_unassigned_would_fire_without_paging(self):
+        self.assertEqual(self.jt("create", "x", "--id", "T-1").returncode, 0)
+        r, e = self.run_gate()
+        recs = self.shadow(e, "registry")
+        self.assertEqual(len(recs), 1, recs)
+        self.assertEqual(recs[0]["root"], os.path.abspath(self.tasks_dir))
+        self.assertEqual((recs[0]["verdict"], recs[0]["reason"]), ("would_fire", "deadlock_yes"))
+        self.assertEqual((recs[0]["attributed"], recs[0]["unattributed"], recs[0]["foreign"]), (1, 0, 0))
+        self.assert_never_paged(r, e)
+        self.assertIn("deadlock_shadow:would_fire=1,no=0,unmeasured=0,instrument_fail=0", e["reasons"])
+
+    def test_db_unscoped_legacy_row_is_unattributed_and_not_fired(self):
+        self.write_ticket(self.tasks_dir, "T-L")             # pre-0.14.56 row: no scope key
+        self.write_registry(os.path.abspath(self.tasks_dir))
+        r, e = self.run_gate()
+        rec = self.shadow(e, "registry")[0]
+        self.assertEqual((rec["verdict"], rec["reason"]), ("no", "deadlock_no:no_unassigned_ticket"))
+        self.assertEqual((rec["attributed"], rec["unattributed"], rec["foreign"]), (0, 1, 0))
+        self.assert_never_paged(r, e)
+
+    def test_db_foreign_scope_row_is_not_fired(self):
+        self.write_ticket(self.tasks_dir, "T-F", scope="pack-dept-dept-OTHER")
+        self.write_registry(os.path.abspath(self.tasks_dir))
+        r, e = self.run_gate()
+        rec = self.shadow(e, "registry")[0]
+        self.assertEqual(rec["verdict"], "no")
+        self.assertEqual((rec["attributed"], rec["unattributed"], rec["foreign"]), (0, 0, 1))
+
+    def test_db_override_env_is_named_in_the_record(self):
+        self.write_ticket(self.tasks_dir, "T-1", scope=self.SCOPE)
+        os.environ["JAVIS_TASK_ROOT"] = self.ws
+        r, e = self.run_gate()
+        recs = self.shadow(e, "override:JAVIS_TASK_ROOT")
+        self.assertEqual([(x["root"], x["verdict"]) for x in recs], [(self.tasks_dir, "would_fire")])
+        self.assertEqual(self.shadow(e, "registry"), [], "the registry was read beside an explicit override")
+
+    # ── B-2: one record per root, each with its own stop reason ──
+    def test_b2_two_roots_one_record_each(self):
+        gone = os.path.join(self.tmp, "gone", "_round", "tasks")
+        self.assertEqual(self.jt("create", "x", "--id", "T-1").returncode, 0)
+        self.assertTrue(os.path.isfile(self.registry), "create did not publish its root")
+        with open(self.registry, encoding="utf-8") as f:
+            reg = json.load(f)
+        reg["roots"][gone] = {"first_seen": 1, "last_write": 1, "role": None}
+        with open(self.registry, "w", encoding="utf-8") as f:
+            json.dump(reg, f)
+        r, e = self.run_gate()
+        got = sorted((x["root"], x["verdict"]) for x in self.shadow(e, "registry"))
+        self.assertEqual(got, sorted([(gone, "instrument_fail"), (os.path.abspath(self.tasks_dir), "would_fire")]))
+        self.assert_never_paged(r, e)
+
+    # ── R2-m1: the cloud-folder check folds case where the filesystem does (macOS APFS default, Windows NTFS) ──
+    def test_m1_fold_flag_follows_the_platform(self):
+        self.assertEqual(G._CLOUD_PATH_FOLD, sys.platform == "darwin" or os.name == "nt")
+        # The Windows arm is checked here on every OS: the lanes that run this file are macOS and Ubuntu only.
+        cases = [("darwin", "posix"), ("win32", "nt"), ("linux", "posix"), ("cygwin", "posix")]
+        self.assertEqual([G._names_fold(*c) for c in cases], [True, True, False, False])
+
+    def test_m1_case_variant_cloud_path_is_excluded_where_names_fold(self):
+        from unittest import mock
+        home = os.path.expanduser("~")
+        variants = [os.path.join(home, "desktop", "CYSjavis", "_round", "tasks"),
+                    os.path.join(home, "DOCUMENTS", "w", "_round", "tasks"),
+                    os.path.join(home, "library", "mobile documents", "x"),
+                    os.path.join(home, "Library", "cloudstorage", "x"),
+                    os.path.join(home.upper(), "Desktop", "x")]
+        with mock.patch.object(G, "_CLOUD_PATH_FOLD", True):
+            for p in variants:
+                self.assertTrue(G.cloud_managed_path(p), p)
+            self.assertFalse(G.cloud_managed_path(os.path.join(home, "desktops", "x")), "a sibling is not the folder")
+        with mock.patch.object(G, "_CLOUD_PATH_FOLD", False):     # case-sensitive filesystem: ~/desktop is another folder
+            self.assertFalse(G.cloud_managed_path(variants[0]))
+            self.assertTrue(G.cloud_managed_path(os.path.join(home, "Desktop", "x")))
+
+    def test_m1_case_variant_root_is_not_read_through_the_gate(self):
+        from unittest import mock
+        desk = os.path.join(os.environ["HOME"], "desktop", "CYSjavis", "proj", "_round", "tasks")
+        self.write_ticket(desk, "T-D", scope=self.SCOPE)              # would fire if read
+        self.write_registry(desk)
+        with mock.patch.object(G, "_CLOUD_PATH_FOLD", True):
+            r, e = self.run_gate()
+        rec = self.shadow(e, "registry")[0]
+        self.assertEqual((rec["verdict"], rec["reason"]), ("unmeasured", "deadlock_unmeasured:root_icloud_not_read"))
+        self.assertEqual(rec["attributed"], 0)
+
+    # ── R2-m2: the lane is judged once across its roots - clause ② (no checkout anywhere for 30 min) is a lane fact ──
+    def lane(self, e):
+        recs = self.shadow(e, "lane")
+        self.assertEqual(len(recs), 1, "expected exactly one lane record: %r" % e.get("deadlock_shadow"))
+        return recs[0]
+
+    def two_roots(self, b_recent):
+        a = os.path.join(self.tmp, "wa", "_round", "tasks")
+        b = os.path.join(self.tmp, "wb", "_round", "tasks")
+        self.write_ticket(a, "T-A", scope=self.SCOPE)                 # unassigned and old: fires when read alone
+        if b_recent:                                                  # the classifying run is 300 s after this stamp
+            ts = time.strftime("%Y-%m-%dT%H:%M:%S+0000", time.gmtime(self.clock.epoch))
+            self.write_ticket(b, "T-B", scope=self.SCOPE, owner="worker", status="in_progress",
+                              created_at=ts, updated_at=ts)
+        else:
+            self.write_ticket(b, "T-B", scope=self.SCOPE, owner="worker", status="in_progress")
+        return a, b
+
+    def test_m2_recent_checkout_in_another_root_clears_the_lane(self):
+        a, b = self.two_roots(b_recent=True)
+        self.write_registry(a, b)
+        r, e = self.run_gate()
+        got = {x["root"]: (x["verdict"], x["reason"]) for x in self.shadow(e, "registry")}
+        self.assertEqual(got, {a: ("would_fire", "deadlock_yes"), b: ("no", "deadlock_no:no_unassigned_ticket")},
+                         "the per-root records (B-2) changed")
+        lane = self.lane(e)
+        self.assertEqual((lane["verdict"], lane["reason"]), ("no", "deadlock_no:recent_ticket_activity(300s)"))
+        self.assertEqual((lane["attributed"], lane["unattributed"], lane["foreign"]), (2, 0, 0))
+        self.assertIn("deadlock_shadow:would_fire=1,no=1,unmeasured=0,instrument_fail=0", e["reasons"],
+                      "the root counts must not include the lane record")
+        self.assertIn("deadlock_shadow_lane:no", e["reasons"])
+        self.assert_never_paged(r, e)
+
+    def test_m2_lane_without_activity_anywhere_would_fire(self):
+        a, b = self.two_roots(b_recent=False)
+        self.write_registry(a, b)
+        r, e = self.run_gate()
+        lane = self.lane(e)
+        self.assertEqual((lane["verdict"], lane["reason"]), ("would_fire", "deadlock_yes"))
+        self.assertIn("deadlock_shadow_lane:would_fire", e["reasons"])
+        self.assert_never_paged(r, e)
+
+    def test_m2_unread_root_refuses_a_lane_would_fire(self):
+        a, _ = self.two_roots(b_recent=False)
+        gone = os.path.join(self.tmp, "gone", "_round", "tasks")
+        self.write_registry(a, gone)
+        r, e = self.run_gate()
+        lane = self.lane(e)
+        self.assertEqual((lane["verdict"], lane["reason"]),
+                         ("unmeasured", "deadlock_unmeasured:lane_partial(1/2 roots unread)|deadlock_yes"))
+
+    def test_m2_unread_root_does_not_hide_activity_read_elsewhere(self):
+        a, b = self.two_roots(b_recent=True)
+        gone = os.path.join(self.tmp, "gone", "_round", "tasks")
+        self.write_registry(a, b, gone)
+        r, e = self.run_gate()
+        lane = self.lane(e)
+        self.assertEqual((lane["verdict"], lane["reason"]), ("no", "deadlock_no:recent_ticket_activity(300s)"))
+
+    def test_r2_partial_coverage_rule_is_an_allow_list(self):
+        held = ["deadlock_no:recent_ticket_activity(300s)", "deadlock_no:some_node_reported_recently",
+                "deadlock_unmeasured:set_status_age", "deadlock_instrument_fail:lane_raised:TypeError"]
+        refused = ["deadlock_yes", "deadlock_no:no_unassigned_ticket", "deadlock_no:a_reason_added_later"]
+        self.assertEqual([r for r in held if not G._lane_reason_holds_partially(r)], [])
+        self.assertEqual([r for r in refused if G._lane_reason_holds_partially(r)], [])
+
+    def test_m2_no_root_read_is_an_instrument_fail_or_unmeasured_lane(self):
+        r, e = self.run_gate()                                        # registry absent
+        lane = self.lane(e)
+        self.assertEqual((lane["verdict"], lane["reason"]), ("instrument_fail", "deadlock_instrument_fail:no_root_read"))
+        desk = os.path.join(os.environ["HOME"], "Desktop", "w", "_round", "tasks")
+        self.write_ticket(desk, "T-D", scope=self.SCOPE)
+        self.write_registry(desk)                                     # the only root is declined by policy
+        r, e = self.run_gate()
+        lane = self.lane(e)
+        self.assertEqual((lane["verdict"], lane["reason"]), ("unmeasured", "deadlock_unmeasured:no_root_read"))
+
+    def test_m2_lane_read_of_a_bad_stamp_is_an_instrument_fail_not_a_crash(self):
+        # Root B has no unassigned ticket, so its own judgement stops at clause ① and never parses its stamps. The
+        # lane judgement does: a non-string stamp raises TypeError in _parse_iso_epoch. That must not end the cycle.
+        a, _ = self.two_roots(b_recent=False)
+        b = os.path.join(self.tmp, "wb", "_round", "tasks")
+        self.write_ticket(b, "T-B", scope=self.SCOPE, owner="worker", status="in_progress",
+                          created_at=["bad"], updated_at={"bad": 1})
+        self.write_registry(a, b)
+        r, e = self.run_gate()
+        got = {x["root"]: x["verdict"] for x in self.shadow(e, "registry")}
+        self.assertEqual(got, {a: "would_fire", b: "no"})
+        lane = self.lane(e)
+        self.assertEqual((lane["verdict"], lane["reason"]),
+                         ("instrument_fail", "deadlock_instrument_fail:lane_raised:TypeError"))
+
+    def test_r1_bad_stamp_in_a_root_with_an_unassigned_ticket_fails_that_root_only(self):
+        a = os.path.join(self.tmp, "wa", "_round", "tasks")
+        c = os.path.join(self.tmp, "wc", "_round", "tasks")
+        self.write_ticket(a, "T-A", scope=self.SCOPE)
+        self.write_ticket(c, "T-C", scope=self.SCOPE, updated_at=["bad"])       # unassigned: its own judgement parses it
+        self.write_registry(a, c)
+        r, e = self.run_gate()
+        got = {x["root"]: (x["verdict"], x["reason"]) for x in self.shadow(e, "registry")}
+        self.assertEqual(got, {a: ("would_fire", "deadlock_yes"),
+                               c: ("instrument_fail", "deadlock_instrument_fail:root_raised:TypeError")})
+        self.assertNotEqual(e.get("verdict"), "FAILOPEN")
+
+    def test_r1_shadow_exception_does_not_fail_the_cycle_open(self):
+        # The shadow runs before the cycle's real routing. If it raised, the top-level fail-open caught it and that
+        # cycle routed no warning at all (deaths, ctx). It must be an instrument-fail record instead.
+        from unittest import mock
+        with mock.patch.object(G.Gate, "_deadlock_shadow", side_effect=RuntimeError("injected")):
+            r, e = self.run_gate()
+        self.assertNotEqual(e.get("verdict"), "FAILOPEN", e)
+        self.assertEqual([(x["source"], x["verdict"], x["reason"]) for x in e["deadlock_shadow"]],
+                         [("shadow", "instrument_fail", "deadlock_instrument_fail:shadow_raised:RuntimeError")])
+        self.assertIn("deadlock_instrument_fail:shadow_raised", e["reasons"])
+
+    def test_m2_failed_control_blinds_the_lane(self):
+        from unittest import mock
+        a, b = self.two_roots(b_recent=False)
+        self.write_registry(a, b)
+        with mock.patch.object(G, "deadlock_positive_control", create=True,
+                               return_value=(False, "deadlock_no:injected")):
+            r, e = self.run_gate()
+        lane = self.lane(e)
+        self.assertEqual(lane["verdict"], "instrument_fail")
+        self.assertEqual(lane["reason"], "deadlock_instrument_fail:control|deadlock_yes")
+
+    def test_m2_legacy_runner_lane_equals_its_single_source(self):
+        old = "2023-11-01T00:00:00+0000"
+        fr = FakeRunner(rep=self.stale, tasks=[{"id": "T-1", "status": "todo", "owner": None,
+                                                "created_at": old, "updated_at": old}])
+        r, e = self.run_gate(fr)
+        lane = self.lane(e)
+        self.assertEqual((lane["verdict"], lane["reason"]), ("would_fire", "deadlock_yes"))
+
+    # ── D-c: an in-memory positive control every cycle; a control that does not fire blinds the verdict ──
+    def test_dc_control_record_every_run(self):
+        r, e = self.run_gate()
+        ctl = self.shadow(e, "control")
+        self.assertEqual([(x["verdict"], x["reason"]) for x in ctl], [("control_fired", "deadlock_yes")])
+        self.assertTrue(G.deadlock_positive_control(self.clock.epoch)[0])
+
+    def test_dc_failed_control_turns_every_root_into_instrument_fail(self):
+        from unittest import mock
+        self.write_ticket(self.tasks_dir, "T-O", scope=self.SCOPE, owner="worker")   # a clean "no"
+        self.write_registry(os.path.abspath(self.tasks_dir))
+        with mock.patch.object(G, "deadlock_positive_control", create=True,
+                               return_value=(False, "deadlock_no:injected")):
+            r, e = self.run_gate()
+        rec = self.shadow(e, "registry")[0]
+        self.assertEqual(rec["verdict"], "instrument_fail")
+        self.assertTrue(rec["reason"].startswith("deadlock_instrument_fail:control"), rec)
+        self.assertIn("deadlock_no:no_unassigned_ticket", rec["reason"], "the per-root stop reason was lost")
+
+    # ── legacy runner (no task_roots): the old single source still answers, shadow only ──
+    def test_legacy_task_snapshot_runner_is_shadow_only(self):
+        old = "2023-11-01T00:00:00+0000"
+        fr = FakeRunner(rep=self.stale, tasks=[{"id": "T-1", "status": "todo", "owner": None,
+                                                "created_at": old, "updated_at": old}])
+        r, e = self.run_gate(fr)
+        recs = self.shadow(e, "legacy:task_snapshot")
+        self.assertEqual([(x["verdict"], x["reason"]) for x in recs], [("would_fire", "deadlock_yes")])
+        self.assert_never_paged(r, e)
 
 
 if __name__ == "__main__":

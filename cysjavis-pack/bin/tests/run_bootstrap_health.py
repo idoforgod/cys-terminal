@@ -6507,6 +6507,65 @@ def h_win_17():
     return " · ".join(notes)
 
 
+H_WIN_18_BASE_REF = "9da2418d"     # 0.14.56 #2 착지 직전 트리 — 스탬프 오프셋을 버리는 구 파서
+
+
+@specimen("H-WIN-18", "W6",
+          "0.14.56 #2 report_gate 스탬프 — strftime('%z') 실제 출력 · _now_iso 왕복 ±2s · 타 오프셋 스탬프 정답",
+          ["0.14.56-#2"])
+def h_win_18():
+    """0.14.56 #2: `_parse_iso_epoch` dropped a stamp's UTC offset (time.mktime over time.strptime %z). The
+    repair is pinned on POSIX by test_report_gate.ParseIsoEpochOffsetTest (TZ-controlled children), and no
+    Windows lane runs that file. This specimen measures what only a run on the platform itself can show:
+      (1) what `time.strftime("%z")` EMITS here. Both writers (`_now_iso`, javis_task `_now`) put it into
+          every stamp. A zone NAME instead of +HHMM would make every stamp fail both parser formats, so the
+          deadlock age reads 'unmeasured' - a second, writer-side defect that needs its own RED (head
+          decision 2026-10-28: report it before changing the writer). The value is recorded either way.
+      (2) `_parse_iso_epoch(_now_iso())` round-trips to time.time() within 2 s on this host.
+      (3) stamps written in other zones (-0700, +0900) parse to the true instant on this host - the #2
+          repair itself; it discriminates on any host whose offset is not the stamp's (CI runners are UTC).
+    Calibration: the parser at H_WIN_18_BASE_REF must get exactly the forms whose offset differs from this
+    host's wrong (the defect FIRES). Skipped without git."""
+    import calendar
+    G = _w5_mod()
+    notes = []
+    z = time.strftime("%z")
+    notes.append("strftime(%%z)=%r" % z)
+    need(re.fullmatch(r"[+-][0-9]{4}", z or "") is not None,
+         "time.strftime('%%z') emits %r here, not +HHMM - every gate/ticket stamp on this platform is "
+         "unparseable (writer-side defect: report before changing the writer)" % z)
+    t0 = time.time()
+    s = G._now_iso()
+    e = G._parse_iso_epoch(s)
+    t1 = time.time()
+    need(isinstance(e, float) and t0 - 2 <= e <= t1 + 2,
+         "round trip failed: _now_iso()=%r -> %r, clock %.3f..%.3f" % (s, e, t0, t1))
+    notes.append("왕복 %s Δ=%.3fs" % (s, e - (t0 + t1) / 2))
+    instant = calendar.timegm((2026, 10, 28, 12, 0, 0))
+    forms = (("2026-10-28T05:00:00-0700", -25200), ("2026-10-28T21:00:00+0900", 32400))
+    for f, _off in forms:
+        got = G._parse_iso_epoch(f)
+        need(got == instant, "%s read %r, true instant %r (%+.2f h off - offset dropped)"
+             % (f, got, instant, ((got or 0) - instant) / 3600.0))
+    host_off = time.localtime(instant).tm_gmtoff
+    notes.append("타 오프셋 2형 정답(host %+d s)" % host_off)
+    calib = "skip(no-git)"
+    old = _git_show("cysjavis-pack/bin/javis_report_gate.py", ref=H_WIN_18_BASE_REF)
+    if old is not None:
+        lines = old.split("\n")
+        i = next(k for k, ln in enumerate(lines) if ln.startswith("def _parse_iso_epoch("))
+        j = next(k for k in range(i + 1, len(lines)) if lines[k] and not lines[k][0].isspace())
+        ns = {"time": time}
+        exec("\n".join(lines[i:j]), ns)
+        wrong = [f for f, _off in forms if ns["_parse_iso_epoch"](f) != instant]
+        expect = [f for f, off in forms if off != host_off]
+        need(wrong == expect, "calibration failed: base parser (%s) got %r wrong, expected %r at host offset %+d"
+             % (H_WIN_18_BASE_REF, wrong, expect, host_off))
+        calib = "기준 %s 파서 %d/%d 오답 FIRE" % (H_WIN_18_BASE_REF, len(wrong), len(forms))
+    notes.append("계측검증=%s" % calib)
+    return " · ".join(notes)
+
+
 @specimen("H-PYSEAL-1", "W6",
           "훅 셸 층 SEAL-1 — 프리루드 source 만으로 PYTHONDONTWRITEBYTECODE=1 무조건 export",
           ["SEAL-1-HOOK"])
@@ -12743,36 +12802,58 @@ def h_w5_p3():
                              {"role": "cso", "idle": 60, "status_age": 3600, "tokens": 2}])
     fresh = _w5_report(live=[{"role": "master", "idle": 60, "status_age": 60, "tokens": 1},
                              {"role": "cso", "idle": 60, "status_age": 60, "tokens": 2}])
+    def _dl_shadow(sd):
+        rows = [e for e in _w5_ledger(sd) if "deadlock_shadow" in e]
+        need(rows, "대장에 deadlock_shadow 기록이 없다(B-2: 판정과 멈춘 사유를 주기마다 남긴다)")
+        return [x for x in rows[-1]["deadlock_shadow"] if x.get("source") not in ("control", "lane")]   # 루트 레코드만
+
+    def _no_page(r, what):
+        need(not [e for e in r.enqueues if e[1] == "gate-deadlock"], "%s: 데드락 push 가 나갔다 %r" % (what, r.enqueues))
+        need(not [e for e in r.emits if e[0] == "agent.silent"], "%s: agent.silent EVT 가 나갔다" % what)
+
     with tempfile.TemporaryDirectory() as tmp, _W5Env(CYS_PACK_DIR=tmp):
-        #   ⓐ 성립 — CSO 1줄 push(수신 계층: 1차 수신자 CSO)
+        #   ⓐ 성립 — ★0.14.56 SHADOW(CEO 4eeea43f Part B): would_fire 와 사유를 대장에 남기고 push·EVT·배지는 0 이다.
+        #     (종전 이 칸은 CSO 1건 push 를 핀했다. paging enable 은 0.14.56 범위 밖이고 ③항 설계는 shadow 자료 뒤다.)
         sd = os.path.join(tmp, "yes")
         clk, r = _W5Clock(), _W5Fake(rep=stale, tasks=tickets)
         for _ in range(6):
             _w5_gate(G, sd, r, clk).run()
             clk.tick()
-        deadlocks = [e for e in r.enqueues if e[1] == "gate-deadlock"]
-        need(len(deadlocks) == 1, "데드락 push 가 %d건(기대 1 — 엣지+쿨다운 2h)" % len(deadlocks))
-        need(deadlocks[0][0] == "cso", "데드락 push 수신자가 CSO 가 아니다: %r" % (deadlocks[0],))
-        #   ⓑ 미성립 — 자기보고가 신선하면(노드가 살아 보고 중) 데드락이 아니다
+        recs = _dl_shadow(sd)
+        need([(x["verdict"], x["reason"]) for x in recs] == [("would_fire", "deadlock_yes")],
+             "성립 조건인데 shadow 판정이 would_fire 가 아니다: %r" % recs)
+        _no_page(r, "성립(shadow)")
+        need("gate-deadlock" not in _w5_badges(sd), "shadow 인데 데드락 배지가 섰다")
+        #   ⓑ 미성립 — 자기보고가 신선하면(노드가 살아 보고 중) 데드락이 아니다 — 멈춘 사유까지 남는다
         sd2 = os.path.join(tmp, "no")
         clk2, r2 = _W5Clock(), _W5Fake(rep=fresh, tasks=tickets)
         for _ in range(6):
             _w5_gate(G, sd2, r2, clk2).run()
             clk2.tick()
-        need(not [e for e in r2.enqueues if e[1] == "gate-deadlock"],
-             "자기보고 신선한데 데드락 오발화: %r" % (r2.enqueues,))
-        #   ⓒ 티켓 원장 미측정 → 판정 자체를 하지 않는다(추론으로 메우지 않는다)
+        recs2 = _dl_shadow(sd2)
+        need([(x["verdict"], x["reason"]) for x in recs2] == [("no", "deadlock_no:some_node_reported_recently")],
+             "자기보고 신선한데 shadow 판정·사유가 다르다: %r" % recs2)
+        _no_page(r2, "미성립")
+        #   ⓒ 티켓 원장 미측정 → INSTRUMENT-FAIL(깨끗한 0 이 아니다 · D-d). ★두 번 돌린다 — 첫 실행은 BASELINE 이라
+        #     분류를 하지 않는다(종전 이 칸은 1회만 돌려 판정 경로에 닿지 않은 채 통과했다).
         sd3 = os.path.join(tmp, "unmeasured")
-        r3 = _W5Fake(rep=stale, tasks=None)
-        _w5_gate(G, sd3, r3, _W5Clock()).run()
-        need(not [e for e in r3.enqueues if e[1] == "gate-deadlock"], "미측정에서 데드락 발화")
+        clk3, r3 = _W5Clock(), _W5Fake(rep=stale, tasks=None)
+        for _ in range(2):
+            _w5_gate(G, sd3, r3, clk3).run()
+            clk3.tick()
+        recs3 = _dl_shadow(sd3)
+        need([x["verdict"] for x in recs3] == ["instrument_fail"]
+             and recs3[0]["reason"].startswith("deadlock_instrument_fail:"),
+             "원장 미측정이 INSTRUMENT-FAIL 이 아니다: %r" % recs3)
+        _no_page(r3, "미측정")
     #   ★last_output 완전 배제(R2-C4)의 구조 확인 — 술어 본문이 idle 을 읽지 않는다
     src = _read(os.path.join(BIN_DIR, "javis_report_gate.py"))
     i = src.find("def build_deadlock_warning")
     body = src[i:src.find("\ndef ", i + 10)]
     need(i > 0 and "idle_secs" not in body,
          "데드락 술어가 idle(last_output 파생)을 다시 읽는다 — R2-C4 위반")
-    return "성립=CSO 1건 · 자기보고 신선=0 · 원장 미측정=0 · 술어에 idle 미사용"
+    return ("성립=shadow would_fire·push 0 · 자기보고 신선=no(사유 동반) · 원장 미측정=instrument_fail · "
+            "술어에 idle 미사용")
 
 
 # ── P4 master.idle 소비 — 정보층(격상 미달)·도메인 분리 (G2 W3-C · 결함 8 짝) ──
@@ -12928,6 +13009,28 @@ def _w5_deadlock_fixture():
     return rep, tickets
 
 
+class _W5CriticalVehicle:
+    """★0.14.56 — 시스템 데드락은 SHADOW 라 더 이상 라우팅되지 않는다(CEO 4eeea43f Part B). C2·C3 가 재는 것은
+    데드락 술어가 아니라 **지속하는 critical push 하나**가 seen-store·inflight 를 지나가는 방식이므로, 같은 deadlock
+    warn 객체(trigger·idem·severity·cooldown 동일)를 warn 출처 `build_label_join_warnings` 에 매 주기 실어 넣는다.
+    대상은 바뀌지 않고 차량만 바뀐다."""
+
+    def __init__(self, G, rep, tickets, now_epoch):
+        warn, reason = G.build_deadlock_warning(rep, tickets, now_epoch)
+        need(warn is not None and reason == "deadlock_yes", "차량 warn 이 만들어지지 않았다: %s" % reason)
+        self.G, self.warn, self.orig = G, warn, None
+
+    def __enter__(self):
+        import copy
+        self.orig = orig = self.G.build_label_join_warnings
+        warn = self.warn
+        self.G.build_label_join_warnings = lambda report: list(orig(report)) + [copy.deepcopy(warn)]
+        return self
+
+    def __exit__(self, *exc):
+        self.G.build_label_join_warnings = self.orig
+
+
 @specimen("H-W5-C2", "W5", "seen-store TTL 경계 — 만료 전 0 · 만료 후 1 · GC", ["C2"])
 def h_w5_c2():
     G = _w5_mod()
@@ -12951,7 +13054,8 @@ def h_w5_c2():
         need(not ok5, "시계 역행에서 재선점(TTL 무력화)")
     #   ⓑ e2e — 지속 조건에서 만료 전 0 / 만료 후 1
     rep, tickets = _w5_deadlock_fixture()
-    with tempfile.TemporaryDirectory() as tmp, _W5Env(CYS_PACK_DIR=tmp):
+    with tempfile.TemporaryDirectory() as tmp, _W5Env(CYS_PACK_DIR=tmp), \
+            _W5CriticalVehicle(G, rep, tickets, _W5Clock().now_epoch()):
         sd = os.path.join(tmp, "state")
         clk, r = _W5Clock(), _W5Fake(rep=rep, tasks=tickets)
         dl = lambda: [e for e in r.enqueues if e[1] == "gate-deadlock"]   # noqa: E731
@@ -12992,7 +13096,8 @@ def h_w5_c3():
     G = _w5_mod()
     rep, tickets = _w5_deadlock_fixture()                   # C2 와 같은 이유로 stall 미사용
     ttl = 900.0
-    with tempfile.TemporaryDirectory() as tmp, _W5Env(CYS_PACK_DIR=tmp):
+    with tempfile.TemporaryDirectory() as tmp, _W5Env(CYS_PACK_DIR=tmp), \
+            _W5CriticalVehicle(G, rep, tickets, _W5Clock().now_epoch()):
         sd = os.path.join(tmp, "state")
         clk = _W5Clock()
         r = _W5Fake(rep=rep, tasks=tickets, drain_delivered=0)   # 파킹: Inject 도달 0

@@ -145,7 +145,7 @@ UNREGISTERED_OK = {n: _BASELINE for n in (
     "test_dept_list_unregistered", "test_dept_ticket_deficit_zero", "test_dept_ticket_request",
     "test_distill_fx", "test_formation", "test_hud_bridge_master_idle", "test_installer_atomic",
     "test_lane_isolation_v1", "test_memory_desc_drift", "test_mission_boot_command_filter",
-    "test_mission_harness_filter", "test_orchestra_ticket_snapshot", "test_orchestra_todo_path",
+    "test_mission_harness_filter", "test_orchestra_ticket_snapshot",
     "test_org_audit", "test_pack_syntax_warnings", "test_preflight_nlm_pin", "test_preflight_phase1_checks",
     "test_seat_revival", "test_verify_gate", "test_vibecheck", "test_viberoute",
 )}

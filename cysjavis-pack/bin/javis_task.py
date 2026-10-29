@@ -169,6 +169,107 @@ if _SELF_DIR not in sys.path:
 ROOT = os.environ.get("JAVIS_ROOT") or os.getcwd()  # 개인경로 하드코딩 금지(pack scan gate) — env 또는 CWD(워크스페이스 루트에서 호출)
 TASKS_DIR = os.path.join(ROOT, "_round", "tasks")
 
+# ★0.14.56 PACKTOOLS Phase 4 (D-b · CEO ruling 4eeea43f Part B) — 티켓 루트를 정하는 코드(위 두 줄)가 그 루트를
+#   **스스로 공표**한다. 게이트(javis_report_gate)는 이 공표 대장만 읽는다 — 읽는 쪽이 루트 목록을 따로 들고 있으면
+#   쓰는 쪽과 갈린다(실측: 열거된 리더 루트 4개가 실 루트 9개 중 0개를 덮었다). 새 티켓에는 쓰는 쪽 레인의
+#   `scope` 를 박는다 — `~/_round/tasks` 처럼 여러 레인이 쓰는 루트에서 레인 표식이 없으면 울린 경보가 남의 레인
+#   CSO 를 깨운다(B-3: 정확성 결함이지 장부 정리가 아니다).
+#   팩 env 키 목록·순서는 javis_report.PACK_DIR_ENV_KEYS 와 같다(tests/test_todo_shared_constants.py 가 대조한다).
+PACK_DIR_ENV_KEYS = ("CYS_PACK_DIR", "JAVIS_PACK_DIR", "AITERM_PACK_DIR", "AITERM_JARVIS_DIR")
+TASK_ROOTS_FILE = "task-roots.json"
+#   임시 경로 아래의 루트는 공표하지 않는다 — 테스트·self-test 가 live CYS_PACK_DIR 을 상속한 채 tmp 루트에 쓰면
+#   내일이면 없는 루트가 대장에 영구히 남아 게이트가 매 주기 INSTRUMENT-FAIL 을 읽는다. 시험 seam 만 연다.
+_EPHEMERAL_PREFIXES = ("/tmp", "/private/tmp", "/var/folders", "/private/var/folders")
+
+
+def _pack_dir():
+    """쓰는 쪽 자기 팩(env) — 없으면 None. ★폴백하지 않는다: 팩 키가 없는 좌석(codex 셸은 CYS_* 를 잃는다)이
+    추측한 레인으로 scope 를 박거나 공표하면 B-3 오배달을 스스로 만든다. 모르면 비워 둔다(= unattributed)."""
+    for key in PACK_DIR_ENV_KEYS:
+        v = os.environ.get(key, "")
+        if v:
+            return v
+    return None
+
+
+def _pack_scope(pack):
+    """팩 정체성 = 팩 경로의 basename — javis_report.my_scope · Rust scope_id 와 같은 규칙."""
+    return os.path.basename(os.path.normpath(os.path.abspath(pack)))
+
+
+def _is_ephemeral(path):
+    import tempfile  # 지역 import — 공표 경로에서만 필요
+    real = os.path.realpath(path)
+    for p in {os.path.realpath(tempfile.gettempdir())} | {os.path.realpath(x) for x in _EPHEMERAL_PREFIXES}:
+        if real == p or real.startswith(p.rstrip(os.sep) + os.sep):
+            return True
+    return False
+
+
+def _publish_root():
+    """abs(TASKS_DIR) 를 `<자기 팩>/state/task-roots.json` 에 기록한다(read-modify-replace · mkdir 락).
+
+    ★best effort — 실패는 stderr 경고 1줄이고 티켓 쓰기를 절대 실패시키지 않는다. 대장이 깨져 있으면(JSON 아님)
+      덮어 고치지 않는다: 덮으면 거기 있던 다른 루트가 소리 없이 사라진다. 깨진 대장은 게이트가
+      INSTRUMENT-FAIL(registry_unreadable)로 매 주기 보여 준다."""
+    try:
+        pack = _pack_dir()
+        if not pack:
+            return
+        root = os.path.abspath(TASKS_DIR)
+        if _is_ephemeral(root) and os.environ.get("JAVIS_TASK_PUBLISH_EPHEMERAL") != "1":
+            return
+        state = os.path.join(pack, "state")
+        os.makedirs(state, exist_ok=True)
+        reg = os.path.join(state, TASK_ROOTS_FILE)
+        lock = reg + ".lock"
+        deadline = time.time() + 2.0
+        while True:
+            try:
+                os.mkdir(lock)
+                break
+            except FileExistsError:
+                try:  # 죽은 소유자의 만료 락은 _wlock 과 같은 방식(rename→rmdir)으로 회수
+                    if time.time() - os.stat(lock).st_mtime > 30:
+                        stale_name = "%s.stale.%d" % (lock, time.time_ns())
+                        os.rename(lock, stale_name)
+                        with contextlib.suppress(OSError):
+                            os.rmdir(stale_name)
+                        continue
+                except OSError:
+                    pass
+                if time.time() > deadline:
+                    print("warn: task-roots 공표 생략(락 경합) — 다음 쓰기가 다시 공표한다: %s" % root,
+                          file=sys.stderr)
+                    return
+                time.sleep(0.02)
+        try:
+            try:
+                with open(reg, encoding="utf-8") as f:
+                    data = json.load(f)
+            except FileNotFoundError:
+                data = {"v": 1, "roots": {}}
+            if not isinstance(data, dict) or not isinstance(data.get("roots"), dict):
+                print("warn: task-roots 대장이 형식 밖이라 공표하지 않는다(덮어 고치지 않음): %s" % reg,
+                      file=sys.stderr)
+                return
+            now = time.time()
+            rec = data["roots"].get(root)
+            rec = dict(rec) if isinstance(rec, dict) else {"first_seen": now}
+            rec["last_write"] = now
+            rec["role"] = os.environ.get("CYS_ROLE") or rec.get("role")
+            data["roots"][root] = rec
+            data["v"] = 1
+            tmp = "%s.tmp.%d.%s" % (reg, os.getpid(), uuid.uuid4().hex[:8])
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=1, sort_keys=True)
+            os.replace(tmp, reg)
+        finally:
+            with contextlib.suppress(OSError):
+                os.rmdir(lock)
+    except Exception as e:  # noqa: BLE001 — 공표 실패가 티켓 쓰기를 죽이지 않는다
+        print("warn: task-roots 공표 실패(티켓 쓰기는 완료): %s" % e, file=sys.stderr)
+
 STATUSES = ["backlog", "todo", "in_progress", "in_review", "done", "blocked", "cancelled"]
 OPEN_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"]
 TERMINAL_STATUSES = ["done", "cancelled"]
@@ -747,6 +848,8 @@ def _write_json_atomic(path, obj):
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)  # 원자적 교체
+    if os.path.dirname(os.path.abspath(path)) == os.path.abspath(TASKS_DIR):
+        _publish_root()  # D-b: 루트를 정한 쓰기가 그 루트를 공표한다(best effort — 실패해도 쓰기는 완료)
 
 
 def _read_task(task_id):
@@ -1010,6 +1113,9 @@ def cmd_create(a):
             "created_at": _now(),
             "updated_at": _now(),
         }
+        pack = _pack_dir()
+        if pack:  # D-b·B-3: 새 티켓에만 쓰는 쪽 레인을 박는다(기존 티켓은 다시 쓰지 않는다 — 게이트가 unattributed 로 센다)
+            task["scope"] = _pack_scope(pack)
         # T1(D13·조건 16②): 시스템 태스크 클래스는 표준 읽기전용 verify_spec 템플릿 자동 부여 —
         # 치유·복원 티켓이 checkout 게이트에 걸리는 경로 원천 제거(prereg 선서명은 [OT]).
         if a.origin_kind in SYSTEM_ORIGIN_KINDS:
@@ -1992,6 +2098,12 @@ def cmd_self_test(args):
     def run(root, argv, env_extra=None):
         env = dict(os.environ)
         env["JAVIS_ROOT"] = root
+        # D-b 밀폐(0.14.56): 루트 공표·scope 스탬프가 live 팩 대장에 닿지 않게 팩을 tmp 루트로 핀하고 시험 seam 은
+        #   지운다(tmp 루트는 원래 공표되지 않지만, 상속된 seam 이 그 보호를 끄지 못하게 한다).
+        for _k in PACK_DIR_ENV_KEYS:
+            env.pop(_k, None)
+        env["CYS_PACK_DIR"] = root
+        env.pop("JAVIS_TASK_PUBLISH_EPHEMERAL", None)
         # B1 밀폐: ambient surface id(cys pane 안에서 self-test 실행 시)가 guard-claim 을
         # 만들어 케이스 간 상태를 오염시키지 않게 기본 제거 — claim 케이스만 env_extra 로 주입.
         env.pop("CYS_SURFACE_ID", None)

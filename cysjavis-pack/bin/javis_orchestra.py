@@ -26,7 +26,7 @@ master가 (a) "4개 노드 다 떴나"를 눈대중 판단, (b) 리뷰 프롬프
                                 리뷰 의뢰 프롬프트를 출력(제약 누락 구조 차단). --success는
                                 구현 위임과 동일한 평가 기준을 리뷰어에게도 투입(N6 영상 양방향 —
                                 "구현할 때도 먹이고 리뷰할 때도 똑같이"). 생략 시 출력 바이트 동일.
-  task-prompt  --task T --scope S [--success C] [--to ROLE] [--dont D]
+  task-prompt  --task T --scope S [--success C] [--to ROLE] [--surface N] [--dont D]
                                 위임 티켓 생성(절대지침 5차 work management 앵커):
                                 ①위임 직전 대상 노드 생존을 결정론 확인(미기동=티켓 미출력 —
                                 "워커 정상 작동 확인 후 작업 지시") ②WORKER §3
@@ -416,16 +416,23 @@ def live_roles(status):
     out = {}
     for s in status.get("surfaces", []):
         role = s.get("role")
-        if not role or s.get("exited"):
-            continue
-        if s.get("agent_alive"):
-            out[role] = True
-            continue
-        st = s.get("status") or {}
-        age = st.get("age_secs")
-        if isinstance(age, (int, float)) and age <= STATUS_FRESH_SECS and st.get("state"):
+        if role and row_alive(s):
             out[role] = True
     return out
+
+
+def row_alive(s):
+    """한 surface 행의 생존 술어 — `live_roles` 와 task-prompt 의 수신 surface 게이트(0.14.56 #6-b)가 함께 쓴다.
+    살아 있다 = 종료되지 않았고(exited 아님) agent_alive 이거나 set-status 자기보고가 신선하다
+    (age<=STATUS_FRESH_SECS·state 존재). 술어를 한 곳에 두는 이유: 역할 단위와 행 단위가 다른 기준으로
+    '살아 있음'을 판정하면 같은 좌석이 두 게이트에서 반대로 읽힌다."""
+    if s.get("exited"):
+        return False
+    if s.get("agent_alive"):
+        return True
+    st = s.get("status") or {}
+    age = st.get("age_secs")
+    return bool(isinstance(age, (int, float)) and age <= STATUS_FRESH_SECS and st.get("state"))
 
 
 def _quiet_alive_roles(status, roles):
@@ -1809,35 +1816,28 @@ def todo_file_name(role):
     return "%s_TODO.md" % role.upper().replace("-", "_")
 
 
-def build_task_ticket(task, scope, success, to_role, rules, output_format=None, prereq_block="", dont=None, tier_hint=None, probes=None, task_id=None):
-    """위임 티켓 본문 생성. rules는 필수 — 호출자가 추출 성패를 알고 명시 주입한다
-    (기본값 경유의 무경고 폴백 경로 제거 · self-test는 rules 주입으로 밀폐 검증).
-    tier_hint(R2 1단계): 권장 실행 등급 정보 1줄(강제 아님·None이면 라인 부재 → byte-identical).
-    probes(P3 · 설계 §4 컴포넌트 C): 이 태스크의 필수 probe 이름 리스트. 지정 시 '필수 probe' 블록
-    삽입, 빈/None이면 블록 부재 → 기존 티켓과 byte-identical(하위호환). E1 evidence-artifact 게이트와
-    는 별개·보완 채널(E1=산출물 파일 `--evidence-artifact`, P3=`--evidence` 텍스트 증거범주·probe 영수증).
-    task_id(#10 · PREP #10): 장부(`javis_task.py`) 태스크 id. 지정 시 E1·P3 블록의 `<id>`·`<task-id>`
-    **플레이스홀더를 실 id 로 치환**하고 증거 경로도 그 id 로 확정한다. 미지정이면 종전 문안 그대로
-    (byte-identical 하위호환) — 대신 호출부(cmd_task_prompt)가 stderr 1줄로 그 사실을 고지한다."""
-    bullets = rules
-    lines = []
-    lines.append("[작업 위임 — 절대 강조 4규칙 포함 · work management 앵커]")
-    lines.append("작업: %s" % task)
-    lines.append("범위(이 파일/범위만 — 무관 파일·repo 배회 금지): %s" % scope)
-    # do/don't 쌍: scope=손댈 것(양) · dont=절대 손대지 말 것(음의 경계). 4대 행동지침③ 외과적
-    # 변경을 위임 티켓에 기계적으로 주입한다. dont=None이면 라인 부재 → 기존 티켓 byte-identical.
-    if dont:
-        lines.append("무접촉(절대 건드리지 마라 — 아래 대상은 수정·삭제·리팩터·포맷 금지): %s" % dont)
-    if success:
-        lines.append("성공 기준(완료 보고는 이 기준 대비 검증 결과를 포함하라): %s" % success)
-    if output_format:
-        lines.append("산출 형식(이 형식·구조로 산출하라 — W8 4-part output-format): %s" % output_format)
-    if tier_hint:
-        lines.append("권장 실행 등급(정보·강제 아님 — 작업 난이도 참고용): %s" % tier_hint)
-    lines.append("")
-    lines.append("절대 강조 4규칙 (WORKER_DIRECTIVE §3 — 모든 작업에 적용·위반 금지):")
-    lines.extend("  " + b for b in bullets)
-    lines.append("")
+# ── todo 블록의 두 형식 (0.14.56 #6 · CEO ruling 2026-10-28 22:40 `ebe8081218a26eb5` §1) ─────────────────────
+# ① `--surface` 없음 = **0.14.55(9da2418d) 바이트 그대로**(`_todo_lines_issuer`). 열 개 레인의 헌장이 이 형식으로
+#    부른다. 이 경로가 rc 1 로 답하거나 다른 바이트를 내면 헌장을 그대로 따른 좌석이 값을 치르고 위임이 멈춘다.
+#    남는 결함 — `--to`(기본 `worker`)와 실제 수신 좌석이 다르면(번호 붙은 워커 · Control Center 의
+#    `worker-fresh-<epoch>` · 다른 레인) 그 좌석은 남의 파일을 가리키는 지시를 받는다 — 은 기록된 잔여이고, 헌장 줄이
+#    바뀌기 전까지 그 좌석들에는 `--surface` 를 명시해 보낸다(CEO 임시 완화 · 헌장만 읽는 좌석에는 닿지 않는다).
+#    바이트 동일은 tests/test_orchestra_todo_path.py N1-N3(골든 픽스처 + sha256 핀 + 양성 대조)이 거부할 수 있게 핀한다.
+# ② `--surface N` = 수신 좌석이 산출한다(`_todo_lines_recipient`). 티켓은 파일을 이름 붙이지 않고 수신 좌석이
+#    `cys todo-path`(자기 surface 의 역할 · 자기 팩 · 같은 명명 규칙, src/bin/cys.rs)로 경로를,
+#    `cys todo-path --emit-decl` 로 선언을 받는다 — S14 불변식(경로와 선언 scope 는 같은 바인딩)은 수신 좌석의 한
+#    생산자가 둘 다 만드는 더 강한 형태로 남는다. 그 두 줄은 수신자와 무관하게 바이트 동일하다.
+#    ★우회 줄(CEO ⒝): codex 셸은 CYS_* 를 지워 `cys todo-path` 가 `CYS_SURFACE_ID 없음` 으로 거부된다. 티켓은 그
+#    거부를 **이름으로** 말하고, 역할을 발부 시점에 이 데몬의 **그 surface 행**에서 읽었을 때만 읽기 전용 우회
+#    (`CYS_PACK_DIR=<발부자 팩> cys todo-path --role <역할>` · `--emit-decl` — 둘 다 아무것도 만들지 않는다)를 싣는다.
+#    같은 데몬의 행이므로 발부자 팩 = 수신 좌석 팩이다. 역할을 읽지 못했으면(이 데몬에 없는 surface · 생존 게이트
+#    생략 · 형식 밖 역할) 우회를 싣지 않고 "master 에 보고" 를 이름으로 말한다 — 추측한 surface·역할은 없다.
+ROLE_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
+
+
+def _todo_lines_issuer(lines, to_role, task):
+    """① `--surface` 없음 — 0.14.55(9da2418d) 의 todo 세 줄. 본문은 그 판의 바이트를 그대로 옮긴 것이다(손대지 마라 —
+    N2 골든이 붉어진다. 의도한 변경은 골든 두 개를 새 코드로 재생성하고 커밋에 그렇게 적는다)."""
     # ★W14 S14 — 경로와 선언 `scope`를 **같은 시점·같은 조회**에서 확정한다.
     #
     # 종전에는 경로가 `${CYS_PACK_DIR:-$HOME/.cys/pack}/round/…` 문자열이라 **워커 셸에서 늦게**
@@ -1874,6 +1874,82 @@ def build_task_ticket(task, scope, success, to_role, rules, output_format=None, 
                      "틀린 `scope`는 이 파일을 '남의 레인'으로 **조용히** 배제시켜 진행률에서 "
                      "사라지게 만든다. 팩 이름을 G4 문자집합(`[A-Za-z0-9._:-]+`)으로 바로잡은 뒤 "
                      "`cys todo-path --emit-decl`로 다시 받아라." % why)
+
+
+def _todo_lines_recipient(lines, recipient):
+    """② `--surface N` — 수신 좌석 생산자 두 줄 + 우회 줄(거부의 이름과 읽기 전용 우회, 또는 "master 에 보고")."""
+    # ★0.14.56 #6-a — todo 경로와 선언은 **수신 좌석**의 `cys todo-path` 가 산출한다(파일 머리의 계약 주석).
+    #   발부자는 파일을 이름 붙이지 않는다: `to_role` 은 수신 좌석의 실제 역할과 다를 수 있고(기본 `worker`),
+    #   발부자의 팩은 수신 좌석의 팩과 다를 수 있다(레인을 건너는 발부). 그래서 이 블록은 수신자와 무관하게
+    #   바이트 동일하다 — 두 워커가 같은 지시를 받고 각자 자기 파일을 얻는다.
+    lines.append("todo 영속: 이 작업을 **`cys todo-path`** 가 출력하는 경로에 분해하고 세부 완료마다 "
+                 "체크박스를 갱신하라(진행% 집계 원천). 그 경로는 발부자가 아니라 **네 좌석**이 산출한다 — "
+                 "데몬에 등록된 네 역할의 파일이 네 팩에 있고, 없으면 선언 한 줄과 함께 만들어진다. "
+                 "티켓이나 다른 좌석이 가리키는 파일에 쓰지 마라(같은 레인의 다른 좌석 파일과 충돌한다). "
+                 "`cys todo-path` 가 실패하면 파일을 손으로 만들지 말고 master 에 보고하라.")
+    # 위치 계약(첫 체크박스 이전)은 협상 대상이 아니다: 체크박스 뒤의 선언을 인정하면 본문에 적힌 문구가
+    # 스스로를 무효화하는 자해 경로가 열린다(A2 회귀). 선언 한 줄은 생산자가 기계 생성한다(손기재 금지).
+    lines.append("todo 선언: 그 파일 머리말에 javis:todo 선언이 없으면 `cys todo-path --emit-decl` 이 출력하는 "
+                 "한 줄을 그대로 **첫 체크박스보다 위**, 머리말 첫 줄에 넣어라 — 집계기는 파일명이 아니라 이 "
+                 "선언으로 소유·귀속을 판정한다. 손으로 쓰거나 고치지 마라(따옴표 추가·값에 공백·키 대문자화는 "
+                 "전부 '미선언'으로 떨어진다). 이미 선언이 있는 파일이면 다시 넣지 마라 — 선언이 2개면 모호성으로 "
+                 "미선언 처리된다. 레인·스테이지가 끝나면 `status=active`를 `status=retired`로 바꿔 은퇴를 "
+                 "선언하라.")
+    import shlex                                # 지역 import — 이 형식에서만 쓴다
+    sid, role = recipient.get("surface"), recipient.get("role")
+    if isinstance(role, str) and ROLE_TOKEN_RE.fullmatch(role):
+        cmd = "CYS_PACK_DIR=%s cys todo-path --role %s" % (shlex.quote(_pack_identity()[0]), role)
+        lines.append("todo 우회(읽기 전용): `cys todo-path` 가 `CYS_SURFACE_ID 없음` 으로 거부되면(codex 셸은 CYS_* 를 "
+                     "지운다) 경로를 추측하지 말고 `%s` 로 경로를, `%s --emit-decl` 로 선언을 읽어라 — 둘 다 아무것도 "
+                     "만들지 않는다. 그 경로에 파일이 없으면 그 선언 한 줄을 첫 줄로 하여 만들어라. 역할 `%s` 는 발부 "
+                     "시점에 이 데몬의 surface:%s 행에서 읽은 값이다." % (cmd, cmd, role, sid))
+    else:
+        why = recipient.get("why") or "그 행의 역할이 형식 밖이다(kebab-case 아님)"
+        lines.append("todo 우회: 발부자는 surface:%s 의 역할을 읽지 못했다(%s). `cys todo-path` 가 거부되면 경로를 "
+                     "추측하지 말고 파일을 만들지 말고 master 에 보고하라 — 이 티켓은 경로 없이 진행하는 것을 "
+                     "허락하지 않는다." % (sid, why))
+
+def build_task_ticket(task, scope, success, to_role, rules, output_format=None, prereq_block="", dont=None, tier_hint=None, probes=None, task_id=None, liveness_note=None, recipient=None):
+    """위임 티켓 본문 생성. rules는 필수 — 호출자가 추출 성패를 알고 명시 주입한다
+    (기본값 경유의 무경고 폴백 경로 제거 · self-test는 rules 주입으로 밀폐 검증).
+    tier_hint(R2 1단계): 권장 실행 등급 정보 1줄(강제 아님·None이면 라인 부재 → byte-identical).
+    probes(P3 · 설계 §4 컴포넌트 C): 이 태스크의 필수 probe 이름 리스트. 지정 시 '필수 probe' 블록
+    삽입, 빈/None이면 블록 부재 → 기존 티켓과 byte-identical(하위호환). E1 evidence-artifact 게이트와
+    는 별개·보완 채널(E1=산출물 파일 `--evidence-artifact`, P3=`--evidence` 텍스트 증거범주·probe 영수증).
+    task_id(#10 · PREP #10): 장부(`javis_task.py`) 태스크 id. 지정 시 E1·P3 블록의 `<id>`·`<task-id>`
+    **플레이스홀더를 실 id 로 치환**하고 증거 경로도 그 id 로 확정한다. 미지정이면 종전 문안 그대로
+    (byte-identical 하위호환) — 대신 호출부(cmd_task_prompt)가 stderr 1줄로 그 사실을 고지한다.
+    liveness_note(0.14.56 #6-b): 발부 시점에 수신 좌석 생존을 확인하지 못한 사유 1줄(교차 데몬 발부).
+    지정 시 머리 둘째 줄에 싣는다 — 수신자도 그 사실을 본다. None 이면 라인 부재 → byte-identical.
+    recipient(0.14.56 #6 · CEO ruling ebe80812 §1): `--surface` 로 지정된 수신 좌석 `{surface, role|None, why}`.
+    None(=`--surface` 없음)이면 todo 세 줄이 0.14.55 바이트 그대로다(`_todo_lines_issuer`). 지정 시 수신 좌석 생산자
+    두 줄과 우회 줄이다(`_todo_lines_recipient`)."""
+    bullets = rules
+    lines = []
+    lines.append("[작업 위임 — 절대 강조 4규칙 포함 · work management 앵커]")
+    if liveness_note:
+        lines.append("⚠ %s" % liveness_note)
+    lines.append("작업: %s" % task)
+    lines.append("범위(이 파일/범위만 — 무관 파일·repo 배회 금지): %s" % scope)
+    # do/don't 쌍: scope=손댈 것(양) · dont=절대 손대지 말 것(음의 경계). 4대 행동지침③ 외과적
+    # 변경을 위임 티켓에 기계적으로 주입한다. dont=None이면 라인 부재 → 기존 티켓 byte-identical.
+    if dont:
+        lines.append("무접촉(절대 건드리지 마라 — 아래 대상은 수정·삭제·리팩터·포맷 금지): %s" % dont)
+    if success:
+        lines.append("성공 기준(완료 보고는 이 기준 대비 검증 결과를 포함하라): %s" % success)
+    if output_format:
+        lines.append("산출 형식(이 형식·구조로 산출하라 — W8 4-part output-format): %s" % output_format)
+    if tier_hint:
+        lines.append("권장 실행 등급(정보·강제 아님 — 작업 난이도 참고용): %s" % tier_hint)
+    lines.append("")
+    lines.append("절대 강조 4규칙 (WORKER_DIRECTIVE §3 — 모든 작업에 적용·위반 금지):")
+    lines.extend("  " + b for b in bullets)
+    lines.append("")
+    # ★0.14.56 #6 — todo 블록의 두 형식(위 `_todo_lines_issuer`·`_todo_lines_recipient` 머리 주석).
+    if recipient is None:
+        _todo_lines_issuer(lines, to_role, task)
+    else:
+        _todo_lines_recipient(lines, recipient)
     # ★D-14(2026-09-21 결정 · 코드 변경 0): `--queued` 회신 지시는 배포본 REVIEWER_DIRECTIVE:18-22 ·
     #   WORKER_DIRECTIVE:136-139 와 정합한다 — 회신 소실의 실제 의존성은 D-04 가 아니라 D-01(master
     #   좌석 큐 기아)이며, D-01 해소 후 무조치(설계 정본 §5 D-14). soul.md 5항(오너 로컬본)은 별도 규범 결정.
@@ -1926,7 +2002,7 @@ def build_task_ticket(task, scope, success, to_role, rules, output_format=None, 
 
 
 def cmd_task_prompt(args):
-    # 역할명은 kebab-case만 — 오류 메시지·todo 파일명에 그대로 보간되므로 위생 처리(주입 차단).
+    # 역할명은 kebab-case만 — 오류 메시지·launch 안내 명령에 그대로 보간되므로 위생 처리(주입 차단).
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", args.to):
         print("[task-prompt] --to 역할명은 kebab-case(a-z0-9-)만 허용: %r" % args.to,
               file=sys.stderr)
@@ -1936,31 +2012,84 @@ def cmd_task_prompt(args):
     # ★일회용(fresh) 경로 예외(D5/B2): --no-survival-gate면 생략한다 — 워커 surface는 실행 시점에
     #   schedule --fresh가 worker-fresh-*로 생성(+디렉티브 주입)하므로 지금 생존 확인은 의미가 없다.
     #   (raw pane 주입이 아니라 디렉티브 주입 워커이므로 무계약·치명 결함 위험 없음.)
+    # ★0.14.56 #6 — 생존 게이트의 두 형식(CEO ruling 2026-10-28 22:40 `ebe8081218a26eb5` §1). 실패 방향을 줄마다 선언한다:
+    #   ① `--surface` 없음 = **0.14.55 게이트 그대로**: `--to` 역할을 가진 산 좌석이 **아무나** 있으면 발부한다.
+    #      헌장이 부르는 경로라 그 역할의 산 좌석이 둘이어도 rc 1 로 답하지 않는다 — 실패 방향은 '발부'다. 잘못 고른
+    #      todo 파일은 보이고 고칠 수 있는 결함이지만, 막힌 위임은 헌장을 그대로 따른 좌석 전부를 멈춘다.
+    #      산 좌석이 하나도 없으면 종전대로 거부(rc 1)한다.
+    #   ② `--surface N` = 티켓이 실제로 갈 **그 행**을 `row_alive`(live_roles 와 같은 술어)로 잰다(#6-b · CEO 실측:
+    #      surface:133 으로 보내는 중에 종전 게이트는 `worker`(s126)를 보고했다). 실패 방향 — 그 행이 죽었으면 거부
+    #      (rc 1 · 같은 역할의 다른 산 좌석은 이 티켓의 수신자가 아니다) · 이 데몬에 그 행이 없으면 발부하되
+    #      'liveness UNVERIFIED' 를 stderr 와 티켓 머리에 함께 싣는다(레인을 건너는 발부) · 생존 게이트를 생략하면
+    #      발부하되 역할을 읽지 않았으므로 우회 줄이 "master 에 보고" 를 이름으로 말한다(추측 0).
+    #   ★status 수집 실패는 두 형식 모두 종전대로 거부(rc 2)다.
+    sid = None
+    surface = getattr(args, "surface", None)
+    if surface is not None:
+        m_sf = re.fullmatch(r"(?:surface:)?([0-9]+)", surface)
+        if not m_sf:
+            print("[task-prompt] --surface 는 N 또는 surface:N 만 허용: %r" % surface, file=sys.stderr)
+            return 2
+        sid = int(m_sf.group(1))
+    liveness_note = None
+    recipient = None
+    if sid is not None:
+        recipient = {"surface": sid, "role": None, "why": "생존 게이트를 생략해 status 를 읽지 않았다"}
     if not getattr(args, "no_survival_gate", False):
         status = cys_status()
         if status is None:
             print("[task-prompt] cys status 수집 실패(데몬 미가동?) — `cys ping` 확인 후 재실행. "
                   "대상 생존 미확인 상태로는 티켓을 내지 않는다.", file=sys.stderr)
             return 2
-        if not live_roles(status).get(args.to):
-            print("[task-prompt] 대상 '%s' 미기동 — 티켓 미출력. `cys boot`(4종 의무 기동) 또는 "
-                  "`cys launch-agent --role %s --agent claude`로 기동 후 재실행하라."
-                  % (args.to, args.to), file=sys.stderr)
-            return 1
-        # '정상 작동' 보조 신호: 장기 idle(기본 5분 — CYS_IDLE_SECONDS와 동기)은 hang일 수
-        # 있다 — 차단은 아니고 경고만(지시 대기 중인 워커도 idle이므로 alive가 결정 기준,
-        # idle은 §5 능동 점검 트리거). 같은 role의 죽은 stale surface는 건너뛴다.
-        try:
-            idle_thr = int(os.environ.get("CYS_IDLE_SECONDS", "300"))
-        except ValueError:
-            idle_thr = 300
-        for s in status.get("surfaces", []):
-            if s.get("role") == args.to and s.get("agent_alive"):
-                idle = s.get("idle_secs")
+        if sid is None:
+            # ① 0.14.55 게이트 — 아래 본문은 9da2418d 의 바이트를 한 단계 들여 옮긴 것이다.
+            if not live_roles(status).get(args.to):
+                print("[task-prompt] 대상 '%s' 미기동 — 티켓 미출력. `cys boot`(4종 의무 기동) 또는 "
+                      "`cys launch-agent --role %s --agent claude`로 기동 후 재실행하라."
+                      % (args.to, args.to), file=sys.stderr)
+                return 1
+            # '정상 작동' 보조 신호: 장기 idle(기본 5분 — CYS_IDLE_SECONDS와 동기)은 hang일 수
+            # 있다 — 차단은 아니고 경고만(지시 대기 중인 워커도 idle이므로 alive가 결정 기준,
+            # idle은 §5 능동 점검 트리거). 같은 role의 죽은 stale surface는 건너뛴다.
+            try:
+                idle_thr = int(os.environ.get("CYS_IDLE_SECONDS", "300"))
+            except ValueError:
+                idle_thr = 300
+            for s in status.get("surfaces", []):
+                if s.get("role") == args.to and s.get("agent_alive"):
+                    idle = s.get("idle_secs")
+                    if isinstance(idle, (int, float)) and idle >= idle_thr:
+                        print("[task-prompt] 주의: '%s' idle %d초 — hang 여부를 read-screen으로 "
+                              "확인 후 전송하라(§5 능동 점검)." % (args.to, int(idle)), file=sys.stderr)
+                    break
+        else:
+            # ② 수신 surface 게이트
+            target = None
+            matched = [s for s in status.get("surfaces", []) if s.get("surface_id") == sid]
+            if not matched:
+                liveness_note = "liveness UNVERIFIED (recipient not on this daemon)"
+                recipient["why"] = "이 데몬의 status 에 그 surface 가 없다 — %s" % liveness_note
+                print("[task-prompt] surface:%d — %s: 이 데몬의 status 에 그 surface 가 없다. 거부하지 "
+                      "않고 티켓 머리에 같은 줄을 싣는다." % (sid, liveness_note), file=sys.stderr)
+            elif not any(row_alive(s) for s in matched):
+                print("[task-prompt] 수신 surface:%d('%s') 미기동 — 티켓 미출력. 같은 역할의 다른 좌석이 살아 "
+                      "있어도 그 좌석은 이 티켓의 수신자가 아니다." % (sid, matched[0].get("role") or "?"),
+                      file=sys.stderr)
+                return 1
+            else:
+                target = next(s for s in matched if row_alive(s))
+                recipient.update(role=target.get("role"), why=None)
+            # '정상 작동' 보조 신호(경고만 · 차단 아님): 경고는 수신 좌석 **그 행**의 idle 을 읽는다.
+            try:
+                idle_thr = int(os.environ.get("CYS_IDLE_SECONDS", "300"))
+            except ValueError:
+                idle_thr = 300
+            if target is not None and target.get("agent_alive"):
+                idle = target.get("idle_secs")
                 if isinstance(idle, (int, float)) and idle >= idle_thr:
-                    print("[task-prompt] 주의: '%s' idle %d초 — hang 여부를 read-screen으로 "
-                          "확인 후 전송하라(§5 능동 점검)." % (args.to, int(idle)), file=sys.stderr)
-                break
+                    print("[task-prompt] 주의: surface:%s('%s') idle %d초 — hang 여부를 read-screen으로 "
+                          "확인 후 전송하라(§5 능동 점검)." % (target.get("surface_id"), target.get("role"),
+                                                         int(idle)), file=sys.stderr)
     rules = extract_worker_rules()
     if rules is None:
         print("[task-prompt] 경고: WORKER_DIRECTIVE '절대 강조 4규칙' 추출 실패 또는 "
@@ -1992,7 +2121,7 @@ def cmd_task_prompt(args):
                             prereq_block=prereq, dont=getattr(args, "dont", None),
                             tier_hint=getattr(args, "tier", None),
                             probes=_split_csv(getattr(args, "probes", None)),
-                            task_id=task_id))
+                            task_id=task_id, liveness_note=liveness_note, recipient=recipient))
     return 0
 
 
@@ -4839,12 +4968,9 @@ def cmd_self_test(args):
         # round-log 표 셀 새니타이즈: 파이프·개행이 제거된다
         assert _cell("a|b\nc") == "a/b c", "_cell 새니타이즈 오류"
         # task-prompt 티켓(밀폐 — rules 명시 주입, 설치본 디렉티브 상태와 무관):
-        # 절대 강조 4규칙·게이트·todo(pack 앵커)·보고 채널이 항상 포함된다
-        # ★W14 S14 — 종전 필수 토큰 `"${CYS_PACK_DIR"`는 **뺐다**. todo 경로를 워커 셸에서 늦게
-        #   전개되는 문자열로 두는 것이 바로 이번에 없앤 이원 바인딩이다(경로=워커 시점 /
-        #   선언 scope=master 시점 → foreign-scope 오배제 → false QUIET). pack 앵커 보장은
-        #   아래 S14 블록이 **발부 시점 절대경로**(`_pack_identity()` + WORKER_TODO.md)로
-        #   더 강하게 핀한다 — 토큰 존재 검사는 그 불변식과 정면으로 모순된다.
+        # 절대 강조 4규칙·게이트·todo·보고 채널이 항상 포함된다. todo 는 두 형식이다(0.14.56 #6 · CEO ruling
+        # ebe80812 §1): `--surface` 없음 = 0.14.55 발부자 절대경로(WORKER_TODO.md · 아래 S14 블록이 핀한다) ·
+        # `--surface` = 수신 좌석 `cys todo-path`(그 아래 #6 블록이 핀한다).
         ticket = build_task_ticket("T", "S", "C", "worker", rules=FALLBACK_RULES)
         for must in ("절대 강조 4규칙", "품질 절대우선", "할루시네이션 방지",
                      "hallucination-guard", "grill-me", "요약·압축 절대 금지", "게이트",
@@ -4926,6 +5052,41 @@ def cmd_self_test(args):
         # 티켓 동봉 확인은 날짜 리터럴을 비교하지 않는다(자정 경계에서 since가 갈리는 위조 flake 방지)
         assert "<!-- javis:todo v1 owner=worker scope=" in build_task_ticket(
             "T", "S", None, "worker", rules=FALLBACK_RULES), "티켓에 todo 선언 한 줄 누락"
+        # ★0.14.56 #6 `--surface` 형식(W14 S14 의 더 강한 형태) — 발부자는 todo 파일·선언을 티켓에 싣지 않는다.
+        #   경로와 선언 scope 는 수신 좌석의 한 생산자(`cys todo-path`·`--emit-decl`)가 함께 만든다.
+        _mains = []
+        for _role in ("worker", "worker-2", "reviewer-gemini", "worker-fresh-1"):
+            _tk = build_task_ticket("T", "S", None, _role, rules=FALLBACK_RULES,
+                                    recipient={"surface": 7, "role": _role})
+            _tl = _tk.splitlines()
+            _s = [k for k, ln in enumerate(_tl) if ln.startswith("todo 영속:")]
+            _e = [k for k, ln in enumerate(_tl) if ln.startswith("보고 채널:")]
+            assert len(_s) == 1 and len(_e) == 1 and _e[0] > _s[0], "todo 블록 경계 오류(%s)" % _role
+            _blk = "\n".join(_tl[_s[0]:_e[0]])
+            _main = "\n".join(ln for ln in _tl[_s[0]:_e[0]] if not ln.startswith("todo 우회"))
+            assert "`cys todo-path`" in _main and "cys todo-path --emit-decl" in _main, \
+                "todo 블록이 수신 좌석 생산자를 지시하지 않는다(%s)" % _role
+            assert "_TODO.md" not in _blk and "${CYS_PACK_DIR" not in _blk, \
+                "발부자가 todo 파일을 이름 붙였다(%s · 0.14.56 #6-a 회귀)" % _role
+            assert "<!-- javis:todo" not in _tk and "scope=" not in _tk, \
+                "발부자 선언이 티켓에 남았다(%s)" % _role
+            assert os.path.abspath(pack_dir()) not in _main, "발부자 팩 경로가 todo 두 줄에 새었다(%s)" % _role
+            assert "CYS_SURFACE_ID 없음" in _blk and ("cys todo-path --role %s --emit-decl" % _role) in _blk, \
+                "우회 줄이 거부의 이름·읽기 전용 우회를 싣지 않는다(%s)" % _role
+            assert "첫 체크박스보다 위" in _main and "status=retired" in _main, "위치·은퇴 계약 누락(%s)" % _role
+            _mains.append(_main)
+        assert len(set(_mains)) == 1, "todo 두 줄이 수신자 역할에 따라 달라졌다(발부자가 파일을 고른다)"
+        _unk = build_task_ticket("T", "S", None, "worker", rules=FALLBACK_RULES,
+                                 recipient={"surface": 7, "role": None, "why": "self-test"})
+        assert "역할을 읽지 못했다" in _unk and "master 에 보고" in _unk and "todo-path --role" not in _unk \
+            and os.path.abspath(pack_dir()) not in _unk, "역할 미상 우회 줄이 이름 붙은 거부가 아니다(추측 금지)"
+        # ★0.14.56 #6-b — liveness_note 는 머리 둘째 줄에만 실리고, 없으면 byte-동일
+        _ln = build_task_ticket("T", "S", None, "worker", rules=FALLBACK_RULES,
+                                liveness_note="liveness UNVERIFIED (recipient not on this daemon)")
+        assert _ln.splitlines()[1] == "⚠ liveness UNVERIFIED (recipient not on this daemon)", \
+            "UNVERIFIED 줄이 티켓 머리에 없다"
+        assert build_task_ticket("T", "S", None, "worker", rules=FALLBACK_RULES, liveness_note=None) == \
+            build_task_ticket("T", "S", None, "worker", rules=FALLBACK_RULES), "liveness_note=None 이 byte-동일이 아니다"
         # 추출기(순수 함수) 배터리 — 합성 디렉티브 텍스트로 밀폐 검증:
         synth = ("# W\n\n## 7. ★절대 강조 4규칙 — x\n머리말.\n"
                  + "\n".join(FALLBACK_RULES) + "\n\n## 8. 다음\n- 무관\n")
@@ -5867,6 +6028,8 @@ def main():
     tp.add_argument("--scope", required=True, help="작업 대상 파일/범위")
     tp.add_argument("--success", default=None, help="성공 기준 (완료 보고의 검증 기준)")
     tp.add_argument("--to", default="worker", help="위임 대상 역할 (기본 worker)")
+    tp.add_argument("--surface", default=None,
+                    help="수신 surface(N 또는 surface:N) — 지정하면 생존 게이트가 이 행을 재고 티켓의 todo 는 수신 좌석의 `cys todo-path` 가 산출한다(0.14.56 #6). 이 데몬에 없으면 거부하지 않고 liveness UNVERIFIED 를 stderr·티켓 머리에 싣는다. 미지정이면 0.14.55 그대로(--to 역할의 산 좌석 아무나 · 발부자 절대경로)")
     tp.add_argument("--output-format", default=None,
                     help="산출 형식·구조 (W8 4-part output-format 슬롯 — 예: 'JSON {필드}', '마크다운 표', '보고서 PDF')")
     tp.add_argument("--requires-skills", default=None,
