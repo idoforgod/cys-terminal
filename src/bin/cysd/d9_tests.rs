@@ -1005,3 +1005,42 @@ fn d9_order_a6_age_head_is_the_oldest_blocked_item() {
     assert_eq!(id(&q(vec![qe("held", "w", now - 10.0, false), qe("auth", "c", now - 20.0, true)])), Some("held".into()));
     assert_eq!(id(&q(vec![])), None);
 }
+
+/// A2b (mutant O3 survived without it): a caller WITH an arm but WITHOUT the authoritative flag - a cso pane's ordinary send into
+/// the master - is converted and stays at the tail, unmarked. Mutant: the gate ignores the flag.
+#[test]
+fn d9_order_a2b_an_arm_without_the_authoritative_flag_stays_at_the_tail() {
+    let fx = fx("ord-a2b");
+    let m = master(&fx);
+    let _w = pane(&fx, "worker-1", P + 90);
+    let _c = pane(&fx, "cso", P + 91);
+    queued_report(&fx, &m, P + 90, "[보고] r1");
+    assert_converted(&send(&fx, Some(P + 91), &m, "[알림] ordinary", json!({})));
+    assert_eq!(queue_texts(&m), vec!["[보고] r1", "[알림] ordinary"]);
+    assert_eq!(queue_auth_flags(&m), vec![false, false]);
+}
+
+/// A2c (mutant O8 survived without it): arm 2's start-time guard - the window's recorded owner pid now belongs to a process that
+/// started AFTER the window was set (a recycled pid: here this runner, with the window's time moved before its start) -> no head
+/// placement. Control: the same window with a time after this runner's start -> head placement. Mutant: drop the start-time test.
+#[test]
+fn d9_order_a2c_cycle_owner_needs_a_start_time_before_the_window() {
+    let me = std::process::id();
+    let started = crate::state::peer_start_time(me).expect("this runner's start time") as f64;
+    for (case, at, want_first) in [("recycled", started - 100.0, false), ("owner", started + 1.0, true)] {
+        let fx = fx(&format!("ord-a2c-{case}"));
+        let m = master(&fx);
+        let _w = pane(&fx, "worker-1", P + 92);
+        quiesce_as_cycle(&fx, me, &m);
+        // Move the window's time (owner record AND quiescing status, so `at == since` still holds).
+        if let Some(st) = m.agent_status.lock().unwrap().as_mut() {
+            st.updated_at = at;
+        }
+        let g = m.quiesce_owner.lock().unwrap().map(|(_, _, g)| g).expect("owner bound");
+        *m.quiesce_owner.lock().unwrap() = Some((me, at, g));
+        queued_report(&fx, &m, P + 92, "[보고] r1");
+        assert_converted(&auth(&fx, Some(me), &m, "[RESUME] a2c"));
+        let first = queue_texts(&m)[0] == "[RESUME] a2c";
+        assert_eq!(first, want_first, "{case}: {:?}", queue_texts(&m));
+    }
+}
