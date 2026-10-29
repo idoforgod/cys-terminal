@@ -69,7 +69,6 @@ if scenario == "entry_plan":
         done(1)
     done()
 spec = importlib.util.spec_from_file_location("javis_phoenix", ph); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
-m._emit_evt = lambda *a, **k: False            # 시험 자리 밖으로 이벤트를 내지 않는다
 m.CYS = os.path.join(work, "nonexistent-cys")
 sd = os.path.join(work, "state"); home = os.path.join(sd, "phoenix"); os.makedirs(home, exist_ok=True)
 sock = os.path.join(sd, "cys.sock")
@@ -213,14 +212,6 @@ try:
                 with builtins.open(mp2, "wb") as f: f.write(json.dumps(o2, indent=2, ensure_ascii=False).encode("cp949"))
                 with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                     res["verify_ambiguous_cp949"] = snap.do_verify(gen_root=gen2)
-    elif scenario == "emit_child":
-        # 진짜 _emit_evt — 형제 javis_event.py 자리에 「어느 인코딩으로도 풀리지 않는 바이트」를 내는 가짜를 둔다(버스에 닿지 않는다).
-        spec2 = importlib.util.spec_from_file_location("javis_phoenix_evt", ph); m2 = importlib.util.module_from_spec(spec2); spec2.loader.exec_module(m2)
-        fdir = os.path.join(work, "evt"); os.makedirs(fdir)
-        with builtins.open(os.path.join(fdir, "javis_event.py"), "wb") as f:
-            f.write(b"import sys\nsys.stdout.buffer.write(b'\\xff\\x81\\xff\\x81 \\xed\\x95\\x9c\\n'); sys.stdout.buffer.flush()\nsys.exit(0)\n")
-        m2.__file__ = os.path.join(fdir, "javis_phoenix.py")
-        res["emit_ok"] = m2._emit_evt("test.event", note=KO)
     elif scenario == "log_flush":
         class S:
             encoding = "utf-8"
@@ -425,9 +416,6 @@ def t_tombstone(td, child, cond):
 
 def t_extra(td, child, cond):
     L = label(cond)
-    rc, res, _ = run_child(td, child, cond, "emit_child")
-    check("%s 이벤트 자식: 어느 인코딩으로도 안 풀리는 출력을 내도 _emit_evt 가 예외 없이 종료코드만 본다" % L,
-          rc == 0 and bool(res) and res.get("emit_ok") is True, "rc=%s emit=%s exc=%s" % (rc, res and res.get("emit_ok"), res and res.get("exc")))
     rc, res, _ = run_child(td, child, cond, "log_flush")
     check("%s log(): flush 가 실패해도 죽지 않고 같은 줄을 두 번 쓰지 않는다" % L,
           rc == 0 and bool(res) and res.get("log_flush") == {"oserror": 1, "unicode": 1}, "rc=%s %s exc=%s" % (rc, res and res.get("log_flush"), res and res.get("exc")))

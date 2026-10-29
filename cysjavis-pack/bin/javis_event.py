@@ -33,6 +33,7 @@ import javis_scrub  # ★G2: 기록·전파 직전 비밀 마스킹(같은 폴�
 
 EXIT_OK, EXIT_USAGE, EXIT_INVALID = 0, 2, 6
 EXIT_DEGRADED = 4  # 해법④(2026-07-14 채택): 미지 타입=부패 아닌 '방출자가 더 새로움' — 무음 드롭 금지
+EXIT_SPOOL_FAILED = 5  # ★0.14.56 E4: --spool was asked for and the append failed — the wire line was printed, the spool was not written
 
 WIRE_PREFIX = "[EVT v2]"
 # ★v3 타입(round.closed) 추가에 따라 파서는 v3 라인도 수용한다. 방출 prefix 는 v2 유지 —
@@ -263,8 +264,10 @@ def cmd_emit(a):
     if getattr(a, "spool", False):
         try:  # spool 기록 실패는 wire 방출을 막지 않는다 (best-effort 수송로)
             _spool_append(a.type, payload, surface)   # auto 해석·검증 통과한 key(또는 None)
-        except OSError:
-            pass
+        except OSError as e:
+            # ★0.14.56 E4: but it is not success either — a caller that reads the exit code must see it
+            print(f"spool append failed: {e}", file=sys.stderr)
+            return EXIT_SPOOL_FAILED
     return EXIT_OK
 
 

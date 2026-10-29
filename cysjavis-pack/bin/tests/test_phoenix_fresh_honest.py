@@ -820,7 +820,7 @@ def main():
         def d3_run(seed_stale):
             """resume 역할 1개 · 좌석은 건강하게 올라온다. seed_stale 이면 **지난 부팅의** 독약 표지를 심는다."""
             td2 = tempfile.mkdtemp(prefix="phoenix-d3-run-")
-            orig = (m.cys, m.time.sleep, m._emit_evt, m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN)
+            orig = (m.cys, m.time.sleep, m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN)
             d3_state_env = {"LOCALAPPDATA": os.environ.get("LOCALAPPDATA")}
             try:
                 # ★통합(worker-18 · d3 impl r1 gemini minor · vj:6a2c8071): 이 헬퍼가 CYS_PACK_DIR 을 세우지 않으면
@@ -882,7 +882,6 @@ def main():
                     return __import__("types").SimpleNamespace(returncode=0, stdout=out, stderr="")
                 m.cys = fake_cys
                 m.time.sleep = lambda _s: None
-                m._emit_evt = lambda *a, **k: None
                 res = m.run_restore(sock, ticket=tick, stub=False, no_breaker=True, print_result=False)
                 with open(jp, encoding="utf-8") as f:
                     jr = json.load(f)
@@ -896,7 +895,7 @@ def main():
                         os.environ[_k] = _v
                 restore_env(d3_state_env)
                 m._AGENTS_CACHE.clear()
-                (m.cys, m.time.sleep, m._emit_evt, m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN) = orig
+                (m.cys, m.time.sleep, m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN) = orig
                 shutil.rmtree(td2, ignore_errors=True)
 
         res_s, jr_s = d3_run(True)
@@ -933,7 +932,7 @@ def main():
         #    실 scope 패스가 읽고, 실 가드가 판정한다. 세 시도(1·2=같은 세대 · 3=새 세대)를 한 저널로 잇는다.
         def d3_stamp_run():
             td3 = tempfile.mkdtemp(prefix="phoenix-d3-stamp-")
-            orig = (m.cys, m.time.sleep, m._emit_evt, m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN,
+            orig = (m.cys, m.time.sleep, m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN,
                     m.SPAWN_RETRIES, m.SPAWN_SETTLE, m.SPAWN_BACKOFF, m.F1_REGISTERED_GRACE_TRIES)
             d3_state_env = {"LOCALAPPDATA": os.environ.get("LOCALAPPDATA")}
             try:
@@ -996,7 +995,6 @@ def main():
                     return __import__("types").SimpleNamespace(returncode=0, stdout=out, stderr="")
                 m.cys = fake_cys
                 m.time.sleep = lambda _s: None
-                m._emit_evt = lambda *a, **k: None
                 m.SPAWN_RETRIES, m.SPAWN_SETTLE, m.SPAWN_BACKOFF = 1, 0.0, 0.0
                 m.F1_REGISTERED_GRACE_TRIES = 1
                 jp = m.journal_path(sock, tick)
@@ -1025,7 +1023,7 @@ def main():
                         os.environ[_k] = _v
                 restore_env(d3_state_env)
                 m._AGENTS_CACHE.clear()
-                (m.cys, m.time.sleep, m._emit_evt, m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN,
+                (m.cys, m.time.sleep, m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN,
                  m.SPAWN_RETRIES, m.SPAWN_SETTLE, m.SPAWN_BACKOFF, m.F1_REGISTERED_GRACE_TRIES) = orig
                 shutil.rmtree(td3, ignore_errors=True)
 
@@ -1064,7 +1062,7 @@ def main():
         #    세션 파일이 **없는** 역할이면 `fresh_expected(entry)` 가 참이라 F-1 블록이 표지를 쓴다.
         def d3_f1_stamp_run():
             td4 = tempfile.mkdtemp(prefix="phoenix-d3-f1stamp-")
-            orig = (m.cys, m.time.sleep, m._emit_evt, m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN,
+            orig = (m.cys, m.time.sleep, m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN,
                     m.SPAWN_SETTLE, m.SPAWN_BACKOFF, m.F1_REGISTERED_GRACE_TRIES)
             d3_state_env = {"LOCALAPPDATA": os.environ.get("LOCALAPPDATA")}
             try:
@@ -1118,7 +1116,6 @@ def main():
                     return __import__("types").SimpleNamespace(returncode=0, stdout=out, stderr="")
                 m.cys = fake_cys
                 m.time.sleep = lambda _s: None
-                m._emit_evt = lambda *a, **k: None
                 m.SPAWN_SETTLE, m.SPAWN_BACKOFF = 0.0, 0.0
                 m.F1_REGISTERED_GRACE_TRIES = 1
                 jp = m.journal_path(sock, tick)
@@ -1137,7 +1134,7 @@ def main():
                         os.environ[_k] = _v
                 restore_env(d3_state_env)
                 m._AGENTS_CACHE.clear()
-                (m.cys, m.time.sleep, m._emit_evt, m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN,
+                (m.cys, m.time.sleep, m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN,
                  m.SPAWN_SETTLE, m.SPAWN_BACKOFF, m.F1_REGISTERED_GRACE_TRIES) = orig
                 shutil.rmtree(td4, ignore_errors=True)
 

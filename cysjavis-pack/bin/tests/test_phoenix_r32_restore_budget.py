@@ -200,7 +200,7 @@ def run_scenario(name, restore_script, status_rows0=None, roles=None, topo_entri
     해제 지점)에서 멈춘다 — 이 검체의 관심은 스폰 상한뿐이다."""
     td = tempfile.mkdtemp(prefix="r32-run-%s-" % name)
     sock = os.path.join(td, "cys.sock")
-    saved = (m.cys, m.time.sleep, m._emit_evt, m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN,
+    saved = (m.cys, m.time.sleep, m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN,
              m._release_shared_restore_lease, m.log)
     state = {"rows": dict(status_rows0 or {}), "restore_calls": [], "launch_calls": 0}
     topo_path = os.path.join(td, "topology.json")
@@ -241,7 +241,6 @@ def run_scenario(name, restore_script, status_rows0=None, roles=None, topo_entri
     try:
         m.cys = fake_cys
         m.time.sleep = lambda s: None
-        m._emit_evt = lambda *a, **k: None
         m._release_shared_restore_lease = rel
         m.log = lambda s: None
         try:
@@ -251,7 +250,7 @@ def run_scenario(name, restore_script, status_rows0=None, roles=None, topo_entri
             pass
         return state
     finally:
-        (m.cys, m.time.sleep, m._emit_evt, m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN,
+        (m.cys, m.time.sleep, m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN,
          m._release_shared_restore_lease, m.log) = saved
         shutil.rmtree(td, ignore_errors=True)
 

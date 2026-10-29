@@ -73,7 +73,7 @@ def _probe(path):
 def run_scenario(name, disable_early_release=False):
     """실 `run_restore`(production 경로)를 스크립트 CLI 로 돌리고 국면별 락 상태를 기록한다."""
     td = tempfile.mkdtemp(prefix="phoenix-p10-")
-    orig = (m.cys, m.time.sleep, m._emit_evt, m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN,
+    orig = (m.cys, m.time.sleep, m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN,
             m._release_shared_restore_lease, m._RESTORE_LEASE_HANDLE)
     try:
         socket_path = os.path.join(td, "cys.sock")
@@ -150,7 +150,6 @@ def run_scenario(name, disable_early_release=False):
 
         m.cys = fake_cys
         m.time.sleep = lambda seconds: None
-        m._emit_evt = lambda *a, **k: None
         m._RESTORE_LEASE_HANDLE = None
         if disable_early_release:
             # 음성 대조: 조기 해제가 없던 종전 형상(= 결함)을 그대로 재현한다.
@@ -160,7 +159,7 @@ def run_scenario(name, disable_early_release=False):
         obs["lease_after"] = _probe(lease_path)
         return obs
     finally:
-        (m.cys, m.time.sleep, m._emit_evt, m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN,
+        (m.cys, m.time.sleep, m._ACTIVE_EPOCH, m._LAST_LIVENESS_KNOWN,
          m._release_shared_restore_lease, m._RESTORE_LEASE_HANDLE) = orig
         shutil.rmtree(td, ignore_errors=True)
 
@@ -221,14 +220,13 @@ def main():
     #    회귀 축: run.lock 을 atexit 로만 놓으면 두 번째 호출이 자기 락에 막혀 영구 LEASE_HELD 가 된다
     #    (deploy 의 LEASE_HELD backoff 재시도·auto-retry 2차 실행이 통째로 죽는 자리).
     td2 = tempfile.mkdtemp(prefix="phoenix-p10-seq-")
-    orig2 = (m.cys, m.CYS, m._emit_evt, m._RESTORE_LEASE_HANDLE)
+    orig2 = (m.cys, m.CYS, m._RESTORE_LEASE_HANDLE)
     try:
         sock2 = os.path.join(td2, "cys.sock")
         home2 = m.phoenix_home(sock2)
         with open(os.path.join(home2, "desired_roster.json"), "w", encoding="utf-8") as f:
             json.dump({"roster": {}, "tombstones": []}, f)
         m.CYS = os.path.join(td2, "nonexistent-cys")
-        m._emit_evt = lambda *a, **k: None
         m._RESTORE_LEASE_HANDLE = None
         r1 = m.run_restore(sock2, ticket="seq1", stub=True, print_result=False)
         r2 = m.run_restore(sock2, ticket="seq2", stub=True, print_result=False)
@@ -239,7 +237,7 @@ def main():
               _probe(os.path.join(home2, "restore.lease")) == "free"
               and _probe(os.path.join(home2, "restore.run.lock")) == "free")
     finally:
-        (m.cys, m.CYS, m._emit_evt, m._RESTORE_LEASE_HANDLE) = orig2
+        (m.cys, m.CYS, m._RESTORE_LEASE_HANDLE) = orig2
         shutil.rmtree(td2, ignore_errors=True)
 
     # ⑥ 구조 계약 — 껍데기(run.lock 전 구간)와 본체(lease · 스폰 구간)의 분업
