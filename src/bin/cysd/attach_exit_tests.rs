@@ -206,7 +206,7 @@ async fn s12_a_reading_client_gets_the_whole_final_burst() {
     let reader = att_read_paced(rd, 256, Duration::from_millis(1));
     tokio::time::sleep(Duration::from_secs(6)).await; // live longer than ATTACH_GONE_STALL: a stale clock would be due
     std::fs::write(&gate, b"1").unwrap();
-    let got = tokio::time::timeout(ATT_GUARD, reader).await.expect("reader did not reach EOF").unwrap(); // wallclock: guard NOT a hang guard: the 6 s sleep above is an aging premise so a stale-clock regression (r1 M1; mutants M12B/M12D) is due; the verdict on correct code does not depend on it
+    let got = tokio::time::timeout(ATT_GUARD, reader).await.expect("reader did not reach EOF").unwrap(); // wallclock: aging the 6 s sleep above is an aging premise so a stale-clock regression (r1 M1; mutants M12B/M12D) is due; the verdict on correct code does not depend on it
     let a = got.iter().filter(|&&b| b == b'a').count();
     let end = got.windows(12).any(|w| w == b"W30-S12A-END");
     assert!(a >= 32768 && end, "a reading client lost the final burst: {a} of 32768 bytes, end marker {end}");
