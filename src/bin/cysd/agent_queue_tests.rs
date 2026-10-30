@@ -2266,3 +2266,286 @@ fn p1_completion_reservation_registration_restores_outer_scope() {
     assert_eq!(P1_QUEUE_RESERVATION.with(|slot| slot.borrow().as_ref().unwrap().surface_id), 7);
     assert!(std::thread::spawn(|| P1_QUEUE_RESERVATION.with(|slot| slot.borrow().is_none())).join().unwrap());
 }
+
+const P1_GUARD: Duration = Duration::from_secs(60);
+const P1_BARRIER_MAGIC: &[u8] = b"\0P1WC:";
+
+/// One private receiver. ACKs carry complete prefixes; bytes travel only through the PTY writer.
+pub(crate) struct P1Recorder {
+    pub(crate) surface: Arc<Surface>,
+    pub(crate) output: std::path::PathBuf,
+    ack: std::net::TcpStream,
+    sequence: u64,
+    barrier_admitted: Option<std::sync::mpsc::Sender<()>>,
+}
+
+fn p1_read_frame(stream: &mut std::net::TcpStream) -> Result<(u8, u64, Vec<u8>), String> {
+    use std::io::Read;
+    let mut header = [0u8; 17];
+    stream.read_exact(&mut header).map_err(|e| format!("receiver ACK header: {e}"))?;
+    let sequence = u64::from_be_bytes(header[1..9].try_into().unwrap());
+    let n = u64::from_be_bytes(header[9..17].try_into().unwrap());
+    if n > 16 * 1024 * 1024 { return Err("receiver ACK exceeds fixture limit".into()); }
+    let mut prefix = vec![0; n as usize];
+    stream.read_exact(&mut prefix).map_err(|e| format!("receiver ACK payload: {e}"))?;
+    Ok((header[0], sequence, prefix))
+}
+
+impl P1Recorder {
+    /// Opt-in matching the old boot/queue recorder. Channels leave their real proof unchanged.
+    pub(crate) fn install_always_admit(&self) {
+        *self.surface.receiver_proof.lock().unwrap() = Some(Scripted::new(0, ProofLoss::AgentDead, None));
+    }
+
+    fn acknowledge(&mut self, barrier: Option<u64>, minimum: usize) -> Vec<u8> {
+        let mut reader = self.ack.try_clone().expect("private ACK stream");
+        let mut worker = None;
+        let event = if barrier.is_some() { "receiver FIFO barrier ACK" } else { "receiver body ACK at held producer" };
+        let admitted = p1_start_completion(event, |tx| {
+            worker = Some(std::thread::spawn(move || {
+                let result = (|| {
+                    loop {
+                        let (kind, seq, prefix) = p1_read_frame(&mut reader)?;
+                        match barrier {
+                            Some(want) if kind == b'B' => {
+                                if seq != want { return Err(format!("receiver barrier mismatch: {seq} != {want}")); }
+                                return Ok(prefix);
+                            }
+                            None if kind == b'D' && prefix.len() >= minimum => return Ok(prefix),
+                            _ => {}
+                        }
+                    }
+                })();
+                let _ = tx.send(result);
+            }));
+            if let Some(sequence) = barrier {
+                let mut marker = P1_BARRIER_MAGIC.to_vec();
+                marker.extend(sequence.to_be_bytes()); marker.push(0xff);
+                // This is the actual admission, before waiting for this exact marker's ACK.
+                self.surface.write_tx.send(crate::state::WriteReq::Data(marker)).map_err(|_| "barrier writer enqueue refused".to_string())?;
+                if let Some(notify) = self.barrier_admitted.take() { let _ = notify.send(()); }
+                Ok(())
+            } else {
+                Ok(()) // subscriber thread spawned on the receiver's already-established ACK stream
+            }
+        });
+        let result = p1_wait_completion(admitted, P1_GUARD);
+        if result.is_err() { let _ = self.ack.shutdown(std::net::Shutdown::Both); }
+        worker.unwrap().join().expect("receiver observer joined");
+        result.expect("named receiver completion guard").expect("receiver ACK valid")
+    }
+
+    pub(crate) fn barrier(&mut self) -> Vec<u8> {
+        self.sequence += 1;
+        let prefix = self.acknowledge(Some(self.sequence), 0);
+        p1_wait_completion(p1_writer_idle(&self.surface), P1_GUARD).expect("barrier operation lease released");
+        prefix
+    }
+
+    /// Only meaningful while the tested producer is held at an acknowledged pre-CR seam.
+    pub(crate) fn received_prefix(&mut self, minimum: usize) -> Vec<u8> {
+        self.acknowledge(None, minimum)
+    }
+}
+
+impl Drop for P1Recorder {
+    fn drop(&mut self) {
+        let _ = self.ack.shutdown(std::net::Shutdown::Both);
+        let _ = self.surface.child.lock().unwrap().kill();
+    }
+}
+
+pub(crate) fn p1_recorder(
+    daemon: &Arc<Daemon>, dir: &std::path::Path, tag: &str, role: Option<&str>,
+) -> P1Recorder {
+    use std::io::Write;
+    assert!(tag.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
+    let output = dir.join(format!("p1-rx-{tag}.bin"));
+    let script = dir.join(format!("p1-rx-{tag}.py"));
+    // An ephemeral loopback ACK endpoint avoids Unix path limits and fixed-port collisions.
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    std::fs::write(&script, r#"import os,socket,struct,sys,tty
+out=open(sys.argv[1],'wb',buffering=0)
+tty.setraw(0)
+ack=socket.create_connection(('127.0.0.1',int(sys.argv[2])))
+prefix=bytearray(); pending=bytearray(); magic=b'\x00P1WC:'
+def frame(kind,seq=0):
+    ack.sendall(kind+struct.pack('!QQ',seq,len(prefix))+prefix)
+def append(data):
+    if data:
+        out.write(data); prefix.extend(data); frame(b'D')
+frame(b'R')
+while True:
+    data=os.read(0,4096)
+    if not data: break
+    pending.extend(data)
+    while pending:
+        at=pending.find(magic)
+        if at>=0:
+            append(pending[:at]); del pending[:at]
+            if len(pending)<len(magic)+9: break
+            seq=struct.unpack('!Q',pending[len(magic):len(magic)+8])[0]
+            if pending[len(magic)+8]!=255: raise RuntimeError('invalid barrier frame')
+            del pending[:len(magic)+9]; frame(b'B',seq)
+        else:
+            keep=0
+            for n in range(1,min(len(pending),len(magic)-1)+1):
+                if pending[-n:]==magic[:n]: keep=n
+            take=len(pending)-keep
+            append(pending[:take]); del pending[:take]
+            break
+"#).unwrap();
+    let command = format!("exec python3 -B -u '{}' '{}' {}", script.display(), output.display(), address.port());
+    let mut surface = None;
+    let mut worker = None;
+    let active = Arc::new(Mutex::new(None::<std::net::TcpStream>));
+    let active_reader = active.clone();
+    let ready = p1_start_completion("recorder raw-mode READY ACK", |tx| {
+        let s = daemon.create_surface(None, Some(command), None, None, 24, 200).map_err(|e| format!("recorder spawn refused: {e}"))?;
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        surface = Some(s);
+        worker = Some(std::thread::spawn(move || {
+            let result: Result<std::net::TcpStream, String> = (|| {
+                let (mut stream, _) = listener.accept().map_err(|e| format!("ready accept: {e}"))?;
+                *active_reader.lock().unwrap() = Some(stream.try_clone().map_err(|e| e.to_string())?);
+                let (kind, seq, prefix) = p1_read_frame(&mut stream)?;
+                if kind != b'R' || seq != 0 || !prefix.is_empty() { return Err("invalid recorder READY".into()); }
+                Ok(stream)
+            })();
+            let _ = tx.send(result);
+        }));
+        Ok(()) // actual create_surface succeeded; READY confirms tty/output initialization
+    });
+    let result = p1_wait_completion(ready, P1_GUARD);
+    if result.is_err() {
+        if let Some(stream) = active.lock().unwrap().as_ref() { let _ = stream.shutdown(std::net::Shutdown::Both); }
+        if let Ok(mut unblock) = std::net::TcpStream::connect(address) { let _ = unblock.write_all(&[0; 17]); }
+    }
+    if let Some(worker) = worker { worker.join().expect("ready observer joined"); }
+    let ack = result.expect("recorder readiness guard").expect("recorder initialized");
+    let s = surface.expect("recorder admission");
+    if let Some(role) = role { daemon.roles.lock().unwrap().insert(role.into(), s.id); }
+    *s.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+    P1Recorder { surface: s, output, ack, sequence: 0, barrier_admitted: None }
+}
+
+struct P1HeldProof {
+    entered: std::sync::mpsc::Sender<()>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+impl Proof for P1HeldProof {
+    fn admit(&self) -> Result<(), ProofLoss> {
+        let _ = self.entered.send(());
+        let _ = self.release.lock().unwrap().recv(); // explicit release/disconnect, no expiry
+        Err(ProofLoss::Unknown("p1 explicit writer holder".into()))
+    }
+    fn recheck(&self, _: Phase) -> Result<(), ProofLoss> { Ok(()) }
+}
+
+pub(crate) struct P1WriterHold {
+    surface: Arc<Surface>,
+    release: Option<std::sync::mpsc::Sender<()>>,
+}
+impl P1WriterHold {
+    pub(crate) fn release_signal(mut self) -> Result<P1Admitted<()>, P1WaitError> {
+        self.release.take().unwrap().send(()).expect("held writer still owns release receiver");
+        p1_writer_idle(&self.surface)
+    }
+    pub(crate) fn release(self) {
+        p1_wait_completion(self.release_signal(), P1_GUARD).expect("explicit holder release completed");
+    }
+}
+impl Drop for P1WriterHold {
+    fn drop(&mut self) { if let Some(release) = self.release.take() { let _ = release.send(()); } }
+}
+
+pub(crate) fn p1_hold_writer(s: &Arc<Surface>) -> P1WriterHold {
+    let (release, held) = std::sync::mpsc::channel();
+    let entered = p1_start_completion("admitted holder proof entered", |tx| {
+        let job = crate::agent_write::AgentJob {
+            attempt: None,
+            request: crate::agent_write::Request::new(crate::agent_write::new_request_id(1), s.id, "test", "p1-holder".into()),
+            plan: crate::agent_write::Plan::control(Vec::new()),
+            proof: Arc::new(P1HeldProof { entered: tx, release: Mutex::new(held) }),
+            journal: None, resume: None, settle: None, guard: None, note_body: false, body_owner: None,
+        };
+        s.write_tx.send(crate::state::WriteReq::Agent(Box::new(job))).map_err(|_| "holder enqueue refused".into())
+    });
+    let holder = P1WriterHold { surface: s.clone(), release: Some(release) };
+    p1_wait_completion(entered, P1_GUARD).expect("holder admission and proof-entry guard");
+    holder
+}
+
+pub(crate) fn p1_write_finished(s: &Arc<Surface>, bytes: &[u8]) {
+    let admitted = p1_start_completion("foreign writer operation released", |tx| {
+        s.write_tx.send(crate::state::WriteReq::Data(bytes.to_vec())).map_err(|_| "foreign enqueue refused".to_string())?;
+        s.write_tx.gate().p1_subscribe_idle(tx)
+    });
+    p1_wait_completion(admitted, P1_GUARD).expect("admitted foreign write finished");
+}
+
+/// The held producer is installed in the exact old late-idle seam, without an automatic release.
+pub(crate) fn p1_late_hold(s: &Arc<Surface>, bytes: Option<&'static [u8]>) -> Arc<Mutex<Option<P1WriterHold>>> {
+    let slot = Arc::new(Mutex::new(None));
+    let ready = slot.clone(); let s = s.clone();
+    crate::agent_write::set_test_after_writer_idle(move || {
+        let holder = p1_hold_writer(&s);
+        if let Some(bytes) = bytes { s.write_tx.send(crate::state::WriteReq::Data(bytes.to_vec())).expect("foreign admission"); }
+        *ready.lock().unwrap() = Some(holder);
+    });
+    slot
+}
+
+
+#[test]
+#[cfg_attr(not(unix), ignore = "raw PTY recorder uses POSIX tty")]
+fn p1_completion_recorder_barrier_covers_delayed_extra_bytes() {
+    let fx = fx("p1-recorder-control");
+    let mut recorder = p1_recorder(&fx.daemon, &fx.dir, "control", Some("master"));
+    assert!(recorder.surface.receiver_proof.lock().unwrap().is_none(), "channel default proof unchanged");
+    recorder.install_always_admit();
+    p1_write_finished(&recorder.surface, b"first\r");
+    let holder = p1_hold_writer(&recorder.surface);
+    recorder.surface.write_tx.send(crate::state::WriteReq::Data(b"late-extra\r".to_vec())).expect("late bytes admitted");
+    let mut worker = None;
+    let marker_admitted = p1_start_completion("FIFO marker queued after delayed extra bytes", |tx| {
+        recorder.barrier_admitted = Some(tx);
+        worker = Some(std::thread::spawn(move || { let prefix = recorder.barrier(); (prefix, recorder) }));
+        Ok(())
+    });
+    p1_wait_completion(marker_admitted, P1_GUARD).expect("actual barrier enqueue receipt");
+    holder.release();
+    let (prefix, mut recorder) = worker.unwrap().join().unwrap();
+    assert_eq!(prefix, b"first\rlate-extra\r", "receiver ACK includes bytes delayed behind an explicit holder");
+    assert_eq!(std::fs::read(&recorder.output).unwrap(), prefix, "protocol marker is not product output");
+    assert_eq!(recorder.barrier(), prefix, "a second barrier introduces no extra product byte");
+}
+
+#[test]
+#[cfg_attr(not(unix), ignore = "raw PTY recorder uses POSIX tty")]
+fn p1_completion_explicit_holder_does_not_release_before_owner() {
+    let fx = fx("p1-holder-control");
+    let mut recorder = p1_recorder(&fx.daemon, &fx.dir, "hold", None);
+    let holder = p1_hold_writer(&recorder.surface);
+    let idle = p1_writer_idle(&recorder.surface);
+    assert_eq!(p1_wait_completion(idle, Duration::ZERO), Err(P1WaitError::CompletionTimeout {
+        event: "writer operation leases released",
+    }), "never-completes control is the named guard while owner retains holder");
+    holder.release();
+    assert_eq!(recorder.barrier(), b"", "holder itself writes no bytes");
+}
+
+pub(crate) fn p1_with_late_write_ahead<R>(s: &Arc<Surface>, call: impl FnOnce() -> R) -> R {
+    let _async_scope = crate::agent_write::p1_sync_settle(false);
+    let held = p1_late_hold(s, Some(b"T"));
+    let result = call();
+    let holder = held.lock().unwrap().take().expect("actual late-idle seam was reached");
+    holder.release();
+    result
+}
+
+pub(crate) fn p1_s0_foreign_write_after_pre_record(s: &Arc<Surface>, bytes: &'static [u8]) {
+    let s = s.clone();
+    crate::agent_write::set_test_after_pre_record(move |_| p1_write_finished(&s, bytes));
+}
