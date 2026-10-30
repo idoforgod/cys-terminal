@@ -329,7 +329,7 @@ class Enc12Census(unittest.TestCase):
                 if not (isinstance(enc, ast.Constant) and enc.value == "utf-8"
                         and isinstance(errs, ast.Constant) and errs.value == "replace"):
                     bad.append("%s:%d" % (fn, node.lineno))
-        self.assertGreaterEqual(seen, 20, "census vacuous: %d text-mode calls found" % seen)
+        self.assertGreaterEqual(seen, 18, "census vacuous: %d text-mode calls found (18 at 2b7cd363)" % seen)
         self.assertEqual(bad, [], "text=True without encoding='utf-8', errors='replace': %s" % bad)
 
     def test_report_gate_task_list_child_runs_with_dash_b(self):

@@ -261,9 +261,15 @@ def _publish_root():
             data["roots"][root] = rec
             data["v"] = 1
             tmp = "%s.tmp.%d.%s" % (reg, os.getpid(), uuid.uuid4().hex[:8])
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=1, sort_keys=True)
-            os.replace(tmp, reg)
+            try:   # PKG-3A #9: flush+fsync as _write_json_atomic does; the temp never outlives a failed write
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=1, sort_keys=True)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, reg)
+            finally:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp)
         finally:
             with contextlib.suppress(OSError):
                 os.rmdir(lock)

@@ -1389,20 +1389,26 @@ def _atomic_write_json(path, obj, keep_bak=False):
     Windows는 os.rename 이 대상 존재 시 FileExistsError 로 죽어(저널은 반복 갱신됨) 반드시 replace 여야 한다.
     ★C2(W3): keep_bak=True 면 새 내용으로 덮기 **직전**에 현재 유효본을 `<path>.bak` 으로 보존한다 —
     손상 폴백 체인의 '직전 유효본' 소스. 현재 파일이 손상(파싱 실패)이면 백업하지 않는다(손상 전파 차단)."""
-    d = os.path.dirname(path)
+    d = os.path.dirname(path) or "."   # PKG-3A #14: a bare relative path names the current directory
     os.makedirs(d, exist_ok=True)  # 읽기 경로 헬퍼는 디렉터리를 만들지 않는다(phoenix_home_path) — 쓰는 쪽이 만든다
     tmp = os.path.join(d, ".tmp-%d-%s" % (os.getpid(), os.path.basename(path)))
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=1)
-        f.flush()
-        os.fsync(f.fileno())
-    if keep_bak and os.path.exists(path):
+    try:   # PKG-3A #14: the temp never outlives a failed dump or replace
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=1)
+            f.flush()
+            os.fsync(f.fileno())
+        if keep_bak and os.path.exists(path):
+            try:
+                if _roster_file_status(path) == "valid":  # 유효본만 .bak 으로 승격(손상 백업 금지)
+                    shutil.copy2(path, path + ".bak")
+            except Exception:
+                pass
+        os.replace(tmp, path)
+    finally:
         try:
-            if _roster_file_status(path) == "valid":  # 유효본만 .bak 으로 승격(손상 백업 금지)
-                shutil.copy2(path, path + ".bak")
-        except Exception:
+            os.unlink(tmp)
+        except OSError:
             pass
-    os.replace(tmp, path)
     try:
         dfd = os.open(d, os.O_RDONLY)
         os.fsync(dfd)

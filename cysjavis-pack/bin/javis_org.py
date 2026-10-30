@@ -355,7 +355,7 @@ def intake_ok(surfaces, idle_max=600):
 def dept_status(socket):
     """부서 소켓의 cys status --json 회수."""
     try:
-        r = subprocess.run(["cys", "--socket", socket, "status", "--json"], capture_output=True, text=True,
+        r = subprocess.run(["cys", "--socket", socket, "status", "--json"], capture_output=True, text=True, encoding="utf-8", errors="replace",
                            env={**os.environ, "CYS_NO_AUTOSTART": "1"}, timeout=CYS_CALL_TIMEOUT_S)
     except subprocess.TimeoutExpired:
         return None   # PKG-3A M3: a stuck dept daemon reads as 'not answering', never a hang in the caller's turn
@@ -419,7 +419,7 @@ def _audit_daemon_status(socket=None):
     else:
         cmd = ["cys", "--socket", socket, "status", "--json"]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=10)
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", env=env, timeout=10)
     except FileNotFoundError:
         return None, "cys-not-found"
     except subprocess.TimeoutExpired:
@@ -764,7 +764,7 @@ def destroy_dept(name, mission_key, purge=False, purge_workdir=False, purge_stat
         try:
             vr = subprocess.run(["python3", verifier, "--dept", name,
                                  "--state-root", state_root, "--depts-json", DEPTS,
-                                 "--dept-roster", dept_roster], capture_output=True, text=True,
+                                 "--dept-roster", dept_roster], capture_output=True, text=True, encoding="utf-8", errors="replace",
                                 timeout=PURGE_VERIFY_TIMEOUT_S)
         except subprocess.TimeoutExpired:   # PKG-3A M3: a read-only verifier - killed at the bound, read as a failure
             vr = subprocess.CompletedProcess([], 124, stdout="", stderr="verifier timed out after %d s" % PURGE_VERIFY_TIMEOUT_S)
@@ -872,7 +872,7 @@ def dispatch_task(t):
     if t.get("success"): cmd += ["--success", t["success"]]
     if t.get("dont"): cmd += ["--dont", t["dont"]]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=TASK_PROMPT_TIMEOUT_S)
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=TASK_PROMPT_TIMEOUT_S)
     except subprocess.TimeoutExpired:   # PKG-3A M3: read-only (it prints a ticket) - killed at the bound
         return 124, "[dispatch] %s: task-prompt timed out after %d s - no ticket generated" % (t.get("dept"), TASK_PROMPT_TIMEOUT_S)
     out = (r.stdout or "") + (r.stderr or "")
@@ -900,9 +900,11 @@ def _ledger_rows(path, start=0):
         f.seek(start if start <= _ledger_size(path) else 0)
         for l in f.read().decode("utf-8", "replace").splitlines():
             try:
-                rows.append(json.loads(l))
+                row = json.loads(l)
             except ValueError:
                 continue   # a partial last line or a torn row is not a receipt
+            if isinstance(row, dict):   # PKG-3A #15: a valid non-object line is not a row (it crashed .get below)
+                rows.append(row)
     return rows
 
 def _ticket_receipt(ledger, nonce, start=0, digest=None, sent_at=None):
@@ -947,7 +949,7 @@ def _queue_has(sock, nonce, expired=False):
     None when the read fails — that is UNKNOWN, never 'absent'."""
     cmd = ["cys", "--socket", sock, "queue", "list", "--json"] + (["--expired"] if expired else [])
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, env={**os.environ, "CYS_NO_AUTOSTART": "1"},
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", env={**os.environ, "CYS_NO_AUTOSTART": "1"},
                            timeout=CYS_CALL_TIMEOUT_S)
     except subprocess.TimeoutExpired:
         return None   # PKG-3A M3: UNKNOWN, never 'absent'
@@ -1049,16 +1051,16 @@ def _deliver_first_ticket(t, ticket, out):
     while True:   # the keyed copy exists BEFORE the send: a client killed after the daemon accepted cannot hide it
         path = os.path.join(d, "%s-%s-%06d-%020d-%s.txt" % (t["dept"], key, seq, time.time_ns(), nonce))
         try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o644)   # PKG-3A #13
             break
         except FileExistsError:
             seq += 1
-    with os.fdopen(fd, "w", encoding="utf-8") as f:   # durable copy; its first line carries the nonce the previews show
+    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:   # durable copy (LF on every OS · PKG-3A #13); its first line carries the nonce the previews show
         f.write("[org-dispatch %s] %s" % (nonce, ticket))
     to = t.get("to") or "worker"
     try:
         s = subprocess.run(["cys", "--socket", sock, "send", "--queued", "--to", to, "--file", path],
-                           capture_output=True, text=True, env={**os.environ, "CYS_NO_AUTOSTART": "1"},
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", env={**os.environ, "CYS_NO_AUTOSTART": "1"},
                            timeout=CYS_CALL_TIMEOUT_S)
     except subprocess.TimeoutExpired:   # PKG-3A M3: the item-state check below settles a send that did not answer
         s = subprocess.CompletedProcess([], 124, stdout="", stderr="cys send timed out after %d s" % CYS_CALL_TIMEOUT_S)

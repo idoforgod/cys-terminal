@@ -114,7 +114,7 @@ def _resolve_caller(args):
         return env
     try:
         out = subprocess.run([CYS_BIN, "identify"], capture_output=True,
-                             text=True, timeout=5)
+                             text=True, encoding="utf-8", errors="replace", timeout=5)
         if out.returncode == 0:
             ref = ((json.loads(out.stdout) or {}).get("caller") or {}).get("surface_ref")
             if isinstance(ref, str) and ref:
@@ -209,10 +209,10 @@ def _read_screen_live(ref):
     {text, composer} from one daemon frame. A non-zero exit (an old binary that does not know --composer) re-reads with
     plain read-screen and returns composer=None (today's regex path). A null composer (an old daemon) is None too."""
     out = subprocess.run([CYS_BIN, "read-screen", "--surface", ref, "--composer"],
-                         capture_output=True, text=True, timeout=12)
+                         capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=12)
     if out.returncode != 0:
         out = subprocess.run([CYS_BIN, "read-screen", "--surface", ref],
-                             capture_output=True, text=True, timeout=12)
+                             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=12)
         if out.returncode != 0:
             raise _ReadError(f"cys read-screen exit {out.returncode}")
         return out.stdout, None
@@ -343,7 +343,7 @@ def _parse_ps(text):
 
 def _ps_live():
     out = subprocess.run(["ps", "-axo", "pid,ppid,command"],
-                         capture_output=True, text=True, timeout=12)
+                         capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=12)
     if out.returncode != 0:
         raise _ReadError(f"ps exit {out.returncode}")
     return out.stdout
@@ -454,7 +454,7 @@ def probe_verdict_match(args):
         cli = [sys.executable, os.path.join(pack, "bin", "javis_verdict.py")]
     try:
         vr = subprocess.run(cli + ["validate", args.file],
-                            capture_output=True, text=True, timeout=20)
+                            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20)
     except (OSError, subprocess.SubprocessError) as e:
         return EXIT_INDET, f"verdict validator unavailable: {e}"
     if vr.returncode != 0:
@@ -477,7 +477,7 @@ def _load_status(args):
     if args.status_file:
         return json.loads(open(args.status_file, encoding="utf-8").read())
     out = subprocess.run([CYS_BIN, "status", "--json"],
-                         capture_output=True, text=True, timeout=12)
+                         capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=12)
     if out.returncode != 0:
         raise _ReadError(f"cys status exit {out.returncode}")
     return json.loads(out.stdout)
