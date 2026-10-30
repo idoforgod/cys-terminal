@@ -2828,7 +2828,7 @@ mod queue_list_row_tests {
                 "println!(\"QUEUED (depth {depth}){}{tag}\"",
             ),
             (
-                arm_start("should_queue_fallback_send_key", "queued, key, &e"),
+                arm_start("expect_output_gen.is_none() && should_queue_fallback_send_key", "queued, key, &e"),
                 "[send-key] 사람 입력 감지",
                 "\"send-key\"",
                 "println!(\"QUEUED (depth {depth}){}\"",
