@@ -1434,3 +1434,41 @@ fn e_modal_rpc_queued_frame_is_refused_without_persisting_or_writing() {
     assert_eq!(gen(&m), before);
     assert_eq!(out.barrier(), b"");
 }
+
+/// Integration contract: D5's real guard abort must take D6's zero-byte restoration path.
+#[test]
+#[cfg(unix)]
+fn e_modal_d5_d6_cycle_abort_restores_held_body_and_later_return() {
+    let f = fx("e-cycle-held-restore");
+    let (s, mut recorder) = e_modal_recorder(&f, "cycle-held", "worker-2");
+    let caller_pid = std::process::id();
+    let _caller = e_modal_peer(&f, "worker-1", caller_pid);
+    paint_empty_box(&s);
+    let body = send(&f, Some(caller_pid), &s, "held through aborted cycle clear", json!({}));
+    let rid = body["result"]["request_id"].as_str().expect("body held").to_string();
+    let deadline = s.submit_assoc.lock().unwrap().records().find(|x| x.request_id == rid).map(|x| x.deadline).expect("receipt deadline");
+    *s.cycle_claim.lock().unwrap() = Some(crate::state::CycleClaim {
+        pid: Some(caller_pid), since: crate::state::now_epoch(), mono: crate::usage::ctx_guard_now(&f.daemon), fire_id: None,
+    });
+    let output = s.output_gen.load(Ordering::Acquire);
+    let input = s.input_gen.load(Ordering::Acquire);
+    let moved = s.clone();
+    crate::agent_write::set_test_after_pre_record(move |_| { moved.output_gen.fetch_add(2, Ordering::AcqRel); });
+    let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let got = seen.clone();
+    let _async = crate::agent_write::p1_sync_settle(false);
+    let _observer = crate::agent_write::p1_observe_admission(s.id, "send", move |_| { got.store(true, Ordering::Release); });
+    let clear = rpc(&f, Some(caller_pid), "surface.send_text", json!({
+        "surface_id":s.id,"text":"/clear","clear_first":true,"quiet":true,"cycle_clear":true,
+        "expect_output_gen":output,"expect_input_gen":input,"admitted":"idle"
+    }));
+    assert!(seen.load(Ordering::Acquire), "E-D5D6-ADMISSION: clear reached the actual writer handoff: {clear}");
+    assert_eq!(clear["error"]["code"], json!("guard_aborted"), "E-D5D6: D5 abort is a zero-byte refusal: {clear}");
+    crate::agent_queue_tests::p1_wait_completion(crate::agent_queue_tests::p1_writer_idle(&s), std::time::Duration::from_secs(60)).expect("clear terminal settled");
+    assert_eq!(s.submit_assoc.lock().unwrap().ids(), vec![rid.clone()], "E-D5D6: aborted clear restores the held body");
+    assert_eq!(s.submit_assoc.lock().unwrap().records().find(|x| x.request_id == rid).map(|x| x.deadline), Some(deadline), "E-D5D6: original receipt deadline preserved");
+    assert_eq!(recorder.barrier(), b"", "E-D5D6: aborted clear wrote no bytes");
+    let returned = rpc(&f, Some(caller_pid), "surface.send_key", json!({"surface_id":s.id,"key":"Return"}));
+    assert_eq!(returned["result"]["request_id"], json!(rid), "E-D5D6: later caller Return binds the restored body: {returned}");
+    assert_eq!(recorder.barrier(), b"held through aborted cycle clear\r", "E-D5D6: restored body submitted exactly once");
+}

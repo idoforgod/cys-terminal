@@ -224,7 +224,7 @@ enum Command {
     /// 대상 턴 종료·빈 composer 확인→입력버퍼 정리+clear→clear 실효 확인→디렉티브·재개 포인터 재주입.
     /// exit: 0=실효 확인 · 80=실효 미관측(재주입 0건) · 81=실효 측정 불능 · 82/83=검증자 충돌·미해소 ·
     /// 84=대상이 유휴가 되지 않음(clear 송신 0건) · 85=사람 초안 보호(clear 송신 0건).
-    /// 84·85 는 clear 송신 0건 비파괴 보류(원자 clear 거부는 composer 무변경 · launch-agent 미등록 좌석의 3분할 폴백에서만 C-u 1키가 선행하거나 Return 거부로 clear 본문이 composer에 남을 수 있다) — autopilot 이 쿨다운 뒤 자동 재시도한다(5단계 85 도 사이클 표지 끔에 'clear 안 됨'을 실어 그 통보가 미해결로 남는다 · 80 도 같은 결과를 실어 같은 --fire 재집행이 가능하다).
+    /// 84·85 는 clear 송신 0건 비파괴 보류(원자 clear 거부는 composer 무변경 · clear_first_unsupported 는 별도 키 송신 없이 보류) — autopilot 이 쿨다운 뒤 자동 재시도한다(5단계 85 도 사이클 표지 끔에 'clear 안 됨'을 실어 그 통보가 미해결로 남는다 · 80 도 같은 결과를 실어 같은 --fire 재집행이 가능하다).
     /// 86=실효 확인 뒤 재주입 보류: clear 는 이미 발효했다 — 손으로 다시 clear 하지 말고 재주입만 확인한다.
     /// 87=건너뜀(송신 0건): --fire 의 통보 뒤 그 좌석의 사이클이 이미 끝났다 — 재집행하지 않는다.
     /// 88=진행 중(송신 0건): 다른 집행자의 사이클이 진행 중이다(--fire 가 있으면 단일 전체 시한이 남기는 만큼 — 기본 --timeout 120 에서 최대 30초 — 끝나기를 기다린 뒤) — 이미 처리됨이 아니다. 턴 안에서 기다리거나 곧바로 재집행하지 말고 끝낸다: 그 사이클이 clear 전에 끝나면 데몬이 같은 통보를 한 번 재배달하고(redelivery) 그때 같은 --fire 로 다시 집행해도 된다(데몬이 판정 · 끝났으면 87).
@@ -1816,6 +1816,7 @@ enum CycleTargetState {
 
 /// 판정 입력 — 한 왕복의 관측을 그대로 담는다(합성 금지).
 struct CycleTargetObs<'a> {
+    composer: Option<&'a Value>,
     screen: Option<&'a str>,
     quiet: Option<bool>,
     /// 이 프레임에 첫기동 관문·모달이 서 있는가 — 참이면 어떤 축으로도 유휴를 선언하지 않는다.
@@ -1835,11 +1836,15 @@ struct CycleTargetObs<'a> {
 /// ANCHOR ④ pane 전멸). 실패 방향은 보류(rc 84)이고 그 귀결은 다음 사이클 재시도다.
 fn cycle_target_state(o: &CycleTargetObs<'_>) -> CycleTargetState {
     // 사람 초안은 어느 화면에서도 보류한다. 구 데몬의 사람 축 미보고도 종전처럼 보호한다.
-    if o.human_bytes.unwrap_or(0) > 0 {
+    if o.human_bytes.unwrap_or(0) > 0
+        || o.composer.and_then(|c| c["human_bytes"].as_u64()).unwrap_or(0) > 0
+    {
         return CycleTargetState::HumanDraft;
     }
-    let machine_residue = if o.pending_bytes.unwrap_or(0) > 0 {
-        if o.human_bytes.is_none() {
+    let pending = o.composer.and_then(|c| c["pending_bytes"].as_u64()).or(o.pending_bytes);
+    let human = o.composer.and_then(|c| c["human_bytes"].as_u64()).or(o.human_bytes);
+    let machine_residue = if pending.unwrap_or(0) > 0 {
+        if human.is_none() {
             return CycleTargetState::HumanDraft;
         }
         true
@@ -1851,6 +1856,29 @@ fn cycle_target_state(o: &CycleTargetObs<'_>) -> CycleTargetState {
     let Some(screen) = o.screen else {
         return CycleTargetState::Busy;
     };
+    if let Some(c) = o.composer {
+        // A present but torn export never supplies a usable observation/fence.
+        if c["output_gen"].as_u64().is_none() || c["input_gen"].as_u64().is_none() {
+            return CycleTargetState::Busy;
+        }
+        if c["owner"].as_str() == Some("own_paste") {
+            return CycleTargetState::Busy;
+        }
+        if c["modal"].as_bool() != Some(false) {
+            return CycleTargetState::Busy;
+        }
+        if c["governed"].as_bool() == Some(true) {
+            let residue = machine_residue || (human == Some(0) && c["owner"].as_str() == Some("machine"));
+            let ready = o.quiet == Some(true) && !o.gate_or_modal;
+            match c["verdict"].as_str() {
+                Some("draft") => return if !ready { CycleTargetState::Busy }
+                    else if residue { CycleTargetState::MachineResidue } else { CycleTargetState::HumanDraft },
+                Some("empty" | "placeholder" | "suggestion") => return if !ready { CycleTargetState::Busy }
+                    else if residue { CycleTargetState::MachineResidue } else { CycleTargetState::Idle },
+                _ => {} // Old/unknown adapters retain the text-only decision below.
+            }
+        }
+    }
     let Some(marker) = o.marker else {
         return if o.quiet == Some(true) && !o.gate_or_modal {
             if machine_residue {
@@ -1921,8 +1949,17 @@ fn marker_row_has_draft(screen: &str, marker: &str, placeholder: Option<&str>) -
         && !placeholder.is_some_and(|p| tail.split_whitespace().eq(p.split_whitespace()))
 }
 
-/// 순수 상태 판정과 RPC 관측 실패를 분리한다. quiet_secs 는 성공 응답의 키 유무만 잰다.
+/// An admitted observation carried unchanged from the wait to the atomic clear.
+struct CycleTargetFence {
+    admitted: CycleTargetState,
+    /// The complete E0 object retains same-pass counters, owner and verdict.
+    composer: Option<Value>,
+    observed_at: std::time::Instant,
+}
+
 struct CycleTargetObservation {
+    composer: Option<Value>,
+    observed_at: std::time::Instant,
     state: CycleTargetState,
     failure: Option<String>,
     quiet_secs_reported: Option<bool>,
@@ -1964,6 +2001,7 @@ fn cycle_target_observation(
     let resolved_marker =
         screen_text.and_then(|text| cys::agent_markers::pick_marker_leading_on_screen(marker, text));
     let state = cycle_target_state(&CycleTargetObs {
+        composer: screen.as_ref().and_then(|r| r.get("composer")).filter(|c| c.is_object()),
         screen: screen_text,
         gate_or_modal,
         quiet: cys::readiness::idle_quiet_from(
@@ -1978,6 +2016,8 @@ fn cycle_target_observation(
     });
     let failure = (!failures.is_empty()).then(|| failures.join("; "));
     CycleTargetObservation {
+        composer: screen.as_ref().and_then(|r| r.get("composer")).filter(|c| c.is_object()).cloned(),
+        observed_at: std::time::Instant::now(),
         // 입력 버퍼 관측이 실패했는데 화면만 유휴여도 통과시키지 않는다. 초안 보호는 유지한다.
         state: if failure.is_some() && state == CycleTargetState::Idle {
             CycleTargetState::Busy
@@ -1997,7 +2037,7 @@ fn observe_cycle_target(
     placeholder: Option<&str>,
     gates: &[cys::first_run_gates::Gate],
 ) -> CycleTargetObservation {
-    let screen = request("surface.read_text", json!({"surface_id": sid}));
+    let screen = request("surface.read_text", json!({"surface_id": sid, "composer": true}));
     let entry = surface_entry(sid);
     cycle_target_observation(screen, entry, marker, placeholder, gates)
 }
@@ -2047,7 +2087,7 @@ fn wait_cycle_target_idle(
     deadline: std::time::Instant,
     stage: &str,
     allow_machine_residue: bool,
-) -> Result<(), String> {
+) -> Result<CycleTargetFence, String> {
     let secs = deadline
         .saturating_duration_since(std::time::Instant::now())
         .as_secs_f64()
@@ -2071,10 +2111,14 @@ fn wait_cycle_target_idle(
         }
         // 초안 증거는 RPC 연속 실패보다 우선한다. 일반 오류로 접으면 clear 뒤 최선노력 주입이 열린다.
         match observed.state {
-            CycleTargetState::Idle => return Ok(()),
+            CycleTargetState::Idle => return Ok(CycleTargetFence {
+                admitted: observed.state, composer: observed.composer, observed_at: observed.observed_at,
+            }),
             CycleTargetState::MachineResidue if allow_machine_residue => {
                 eprintln!("  {stage}: surface:{sid} 기계 잔여를 감지했다 — 사람 초안 없음·턴 종료 확인됨, clear의 Ctrl-U로 정리한다");
-                return Ok(());
+                return Ok(CycleTargetFence {
+                    admitted: observed.state, composer: observed.composer, observed_at: observed.observed_at,
+                });
             }
             CycleTargetState::HumanDraft => {
                 return Err(format!(
@@ -3673,8 +3717,7 @@ fn is_modal_draft_gate_err(e: &str) -> bool {
     e.contains(&format!("[{}:modal]", cys::DRAFT_GATE_TAG))
 }
 
-/// 데몬이 `clear_first` 를 지원하지 않는 좌석이라고 답했는가(원자 경로 → 3분할 폴백 신호).
-/// launch-agent 등록 소실 좌석의 영구 무clear를 막되, 초안 거부·전송 실패는 재송신하지 않는다.
+/// Whether atomic clear is unavailable. The cycle holds without split key writes.
 fn is_clear_first_unsupported_err(e: &str) -> bool {
     e.contains("clear_first_unsupported")
 }
@@ -22502,7 +22545,7 @@ fn run_cycle_agent(
         // ★(0.14.42 · clear 가드 수정 4회차 RV3L-1) 1콜 단일 전체 시한 — 여기서부터 모든 대기가 이 시한 안이다(570초 · 점유 대기 포함).
         let budget = CycleBudget::new(timeout);
         // ★(0.14.42 · clear 가드 v3) 0단계 — 사이클 단일 비행 점유(저장 지시 전 · 송신 0건에서 건너뛴다). 끝날 때(모든 경로) 놓는다.
-        let _claim = CycleClaim::acquire(sid, fire.as_deref(), budget.claim_wait)?;
+        let claim = CycleClaim::acquire(sid, fire.as_deref(), budget.claim_wait)?;
         // clear 명령 선확정 — 저장만 시키고 clear 못하는 어정쩡한 상태 방지
         let agent = entry["agent"].as_str().map(String::from);
         let spec = cycle_spec_or_explicit_clear(
@@ -22825,7 +22868,7 @@ fn run_cycle_agent(
         // quiescing·C-u보다 앞에서 거부하고, 재주입 전에도 같은 관측·대기 경로를 쓴다.
         let idle_deadline = budget.stage(timeout);
         eprintln!("[cycle 4/7] 대상 턴 종료·빈 composer 확인 (최대 {}s · 단일 전체 시한 안)", CycleBudget::secs_until(idle_deadline));
-        wait_cycle_target_idle(
+        let mut clear_fence = wait_cycle_target_idle(
             sid,
             &marker,
             placeholder.as_deref(),
@@ -22852,11 +22895,11 @@ fn run_cycle_agent(
             .as_ref()
             .and_then(statusline_session_file);
         set_surface_quiescing(sid, true)?;
-        // ★(0.14.42 · RR1-ROLE-1) 표지 끔이 싣는 결과 — 여기부터 clear 가 나갈 수 있으므로 기본은 모름(송신 여부 불명 RPC 오류 ·
-        //   실효 측정 불능 81). 실효 확인(0·86) = cleared · 실효 미관측(80) = not_cleared(그 통보는 미해결 → 같은 --fire 재집행 ·
+        // No write has been attempted yet: start NotCleared, switch to Unknown immediately before the RPC.
+        // A successful RPC is not proof of a clear; the existing session-file check below determines its effect. 실효 확인(0·86) = cleared · 실효 미관측(80) = not_cleared(그 통보는 미해결 → 같은 --fire 재집행 ·
         //   autopilot 재시도 가능) · 사람 초안 거부(85 머리표 — 표지 켬 뒤 어느 단계든 clear 미제출) = not_cleared(클로저 뒤에서 접는다).
         //   데몬 가드는 not_cleared 를 사이클 끝으로 보지 않는다(발화를 풀지 않고 수준을 다시 재지 않는다).
-        let mut outcome = CycleOutcome::Unknown;
+        let mut outcome = CycleOutcome::NotCleared;
         let clear_result = (|| -> Result<(), String> {
             // ★(B-360 R2) set when the atomic clear's outcome is unknown (it may still be typed): the effect check decides
             let mut clear_unknown: Option<String> = None;
@@ -22867,66 +22910,63 @@ fn run_cycle_agent(
                 "[cycle] residual_window={:.1}s (검증자 allow→clear · 이 구간은 kill-switch 회수 불가)",
                 allow_at.elapsed().as_secs_f64()
             );
-            match request(
-                "surface.send_text",
-                json!({"surface_id": sid, "text": clear, "clear_first": true, "quiet": true}),
-            ) {
-                Ok(_) => {
-                    // autopilot KEYS_SENT_MARKERS는 성공 응답 뒤에만 찍는다(송신 0건 오기록 금지).
-                    eprintln!("[cycle 5/7] 입력 버퍼 정리 + '{clear}' (원자 송신)");
+            for attempt in 0..3 {
+                // wallclock: guard the existing clear-stage budget; never grant a fresh budget on retry.
+                if std::time::Instant::now() >= idle_deadline {
+                    return Err(format!("{CYCLE_TARGET_BUSY_TOKEN} cycle_clear_retry_exhausted: clear stage deadline reached (no new attempt)"));
                 }
-                Err(e) if is_clear_first_unsupported_err(&e) => {
-                    // 등록을 잃은 좌석은 원자 경로만 강제하면 영구 무clear가 된다(ANCHOR ②).
-                    // 이 팔에만 종전 3분할·오류 매핑을 보존한다. 본문 뒤 초안 혼합 위험도 잔여다.
-                    eprintln!("[cycle] 이 좌석은 launch-agent 등록이 없어 원자 clear 를 못 쓴다 — 3분할 폴백 ({e})");
-                    request("surface.send_key", json!({"surface_id": sid, "key": "C-u"}))
-                        .map_err(|e| {
-                            if is_typing_guard_err(&e) {
-                                format!("{CYCLE_HUMAN_DRAFT_TOKEN} 입력 버퍼 정리 거부(송신 0건): 데몬이 사람 초안을 감지했다({e}) — 소거 0 · 초안을 제출·삭제한 뒤 해당 단계만 재시도")
-                            } else {
-                                e
-                            }
-                        })?;
-                    eprintln!("[cycle 5/7] 입력 버퍼 정리 + '{clear}' (3분할 폴백)");
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-                    request(
-                        "surface.send_text",
-                        json!({"surface_id": sid, "text": clear, "quiet": true}),
-                    )
-                    .map_err(|e| {
-                        if is_typing_guard_err(&e) {
-                            format!("{CYCLE_HUMAN_DRAFT_TOKEN} clear 송신 거부(C-u 1건은 선행 송신됨): 데몬이 사람 입력을 감지했다({e}) — 추가 소거 금지")
-                        } else {
-                            e
-                        }
-                    })?;
-                    request(
-                        "surface.send_key",
-                        json!({"surface_id": sid, "key": "Return"}),
-                    )
-                    .map_err(|e| {
-                        if is_typing_guard_err(&e) {
-                            format!("{CYCLE_HUMAN_DRAFT_TOKEN} clear 제출 거부: 데몬이 사람 초안을 감지했다({e}) — clear 본문('{clear}')은 composer에 들어갔지만 제출되지 않았다 · 손으로 다시 clear 하지 마라 · 남은 clear 본문은 다음 재시도의 C-u가 지운다")
-                        } else {
-                            e
-                        }
-                    })?;
+                if attempt > 0 {
+                    clear_fence = wait_cycle_target_idle(
+                        sid, &marker, placeholder.as_deref(), gates, idle_deadline, "clear retry", true,
+                    )?;
                 }
-                Err(e) => {
-                    if is_write_outcome_unknown(&e) {
-                        // ★(B-360 R2) never re-sent; the session_file check below sees a late landing
+                // wallclock: guard the same deadline after a possibly blocking re-observation.
+                if std::time::Instant::now() >= idle_deadline {
+                    return Err(format!("{CYCLE_TARGET_BUSY_TOKEN} cycle_clear_retry_exhausted: observation used the clear stage budget (zero bytes)"));
+                }
+                let mut params = json!({"surface_id": sid, "text": clear, "clear_first": true, "quiet": true});
+                if claim.held {
+                    if let Some(c) = clear_fence.composer.as_ref() {
+                        params["cycle_clear"] = json!(true);
+                        params["expect_output_gen"] = c["output_gen"].clone();
+                        params["expect_input_gen"] = c["input_gen"].clone();
+                        params["admitted"] = json!(if clear_fence.admitted == CycleTargetState::MachineResidue {
+                            "machine_residue"
+                        } else { "idle" });
+                    }
+                }
+                eprintln!("[cycle] clear observation age={:.3}s attempt={}", clear_fence.observed_at.elapsed().as_secs_f64(), attempt + 1);
+                outcome = CycleOutcome::Unknown;
+                match request("surface.send_text", params) {
+                    Ok(_) => {
+                        eprintln!("[cycle 5/7] 입력 버퍼 정리 + '{clear}' (원자 송신)");
+                        break;
+                    }
+                    Err(e) if is_write_outcome_unknown(&e) => {
                         eprintln!("[cycle 5/7] '{clear}' outcome unknown (may still be typed — not re-sent) — the effect check decides");
                         clear_unknown = Some(e);
-                    } else {
-                        // ★(B-360 R2) zero bytes at the writer journal: the clear was never typed — the guard hears not_cleared
-                        if is_journal_refusal(&e) {
+                        break;
+                    }
+                    Err(e) if is_clear_first_unsupported_err(&e) => {
+                        outcome = CycleOutcome::NotCleared;
+                        return Err(format!("{CYCLE_TARGET_BUSY_TOKEN} clear_first_unsupported: atomic clear unavailable; no split fallback, zero bytes ({e})"));
+                    }
+                    Err(e) => {
+                        // Holds precede the retryable zero-byte refusals. Unknown already left the loop above.
+                        if is_typing_guard_err(&e) {
                             outcome = CycleOutcome::NotCleared;
+                            return Err(format!("{CYCLE_HUMAN_DRAFT_TOKEN} clear 원자 송신 거부(송신 0건 · composer 무변경): {e}"));
                         }
-                        return Err(if is_typing_guard_err(&e) {
-                            format!("{CYCLE_HUMAN_DRAFT_TOKEN} clear 원자 송신 거부(송신 0건 · composer 무변경): 데몬이 사람 초안을 감지했다 — 초안을 제출·삭제한 뒤 해당 단계만 재시도 ({e})")
-                        } else {
-                            e
-                        });
+                        if e.contains("own_paste_settling:") || e.contains("cycle_clear_unclaimed:") {
+                            outcome = CycleOutcome::NotCleared;
+                            return Err(format!("{CYCLE_TARGET_BUSY_TOKEN} transient cycle clear hold: {e}"));
+                        }
+                        if e.contains("guard_aborted:") || is_journal_refusal(&e) {
+                            outcome = CycleOutcome::NotCleared;
+                            if attempt + 1 == 3 { return Err(e); }
+                            continue;
+                        }
+                        return Err(e);
                     }
                 }
             }
@@ -22982,7 +23022,7 @@ fn run_cycle_agent(
                         "재주입 직전",
                         false,
                     ) {
-                        Ok(()) => {
+                        Ok(_) => {
                             eprintln!(
                                 "[cycle 7/7] 재주입 — 디렉티브 {} + 재개 포인터(한 제출)",
                                 if hooks_inject { "생략(훅이 주입)" } else { "주입" }
@@ -23030,7 +23070,7 @@ fn run_cycle_agent(
                         "재주입 직전(측정 불능)",
                         false,
                     ) {
-                        Ok(()) => {
+                        Ok(_) => {
                             eprintln!(
                                 "[cycle 7/7] 재주입(측정 불능 · 최선노력) — 디렉티브 {} + 재개 포인터",
                                 if hooks_inject { "생략(훅이 주입)" } else { "주입" }
@@ -23064,7 +23104,7 @@ fn run_cycle_agent(
         })();
         // 재개 성공/실패와 무관하게 quiescing 해제 — 실패로 master가 quiescing에 갇혀 채널이
         // 영구 보류되는 것을 막는다(master 자기보고 안전망과 별개의 결정론 해제). 결과를 싣는다(RR1-ROLE-1).
-        // 사람 초안 거부(rc 85 머리표)는 표지 켬 뒤 어느 단계든 clear 가 제출되지 않았다(원자 거부 송신 0건 · 3분할 C-u·본문·Return 거부).
+        // 사람 초안 거부(rc 85 머리표)는 표지 켬 뒤 어느 단계든 clear 가 제출되지 않았다(원자 거부 송신 0건).
         if clear_result.as_ref().is_err_and(|e| e.starts_with(CYCLE_HUMAN_DRAFT_TOKEN)) {
             outcome = CycleOutcome::NotCleared;
         }
@@ -41388,7 +41428,7 @@ mod tests {
         // 되돌림 뮤테이션(두 제출 복귀)을 잡는 축 — Verified 팔의 재주입 제출 호출은 정확히 1곳이다.
         let verified = compact.split("ClearEffect::Verified => {").nth(1).expect("Verified 팔")
             .split("ClearEffect::Unverified =>").next().expect("Verified 팔 끝");
-        let ok_arm = verified.split("Ok(()) => {").nth(1).expect("재주입 직전 유휴 Ok 팔")
+        let ok_arm = verified.split("Ok(_) => {").nth(1).expect("재주입 직전 유휴 Ok 팔")
             .split("Err(e) => Err(cycle_reinject_held(").next().expect("Ok 팔 끝");
         assert_eq!(ok_arm.matches("inject_text(sid,").count(), 1,
             "Verified 재주입이 한 제출이 아니다(디렉티브·RESUME 두 제출 = Claude 큐 선두 차단):\n{ok_arm}");
@@ -41813,33 +41853,15 @@ mod tests {
             .lines()
             .find(|line| line.trim_start().starts_with("/// 84·85"))
             .expect("CycleAgent doc 의 84·85 줄 없음");
-        if !held_line.contains("C-u 1키") {
-            failures.push("CycleAgent doc 에 C-u 1키 선행 가능성 없음".to_string());
+        if !held_line.contains("clear_first_unsupported") || held_line.contains("C-u 1키") {
+            failures.push("CycleAgent docs must describe the unsupported no-write hold".to_string());
         }
-
-        let (_, fallback, atomic_refusal) = d16_clear_atomic_and_fallback_source();
-        // 원자 거부는 송신 0건이고, C-u 선행 송신 문면은 미지원 폴백 본문 거부에만 남는다.
+        let (_, unsupported, atomic_refusal) = d16_clear_atomic_and_fallback_source();
         if !atomic_refusal.contains("송신 0건 · composer 무변경") {
-            failures.push("원자 clear 거부 문면에 송신 0건·composer 무변경 설명 없음".to_string());
+            failures.push("atomic refusal must describe zero bytes".to_string());
         }
-        if atomic_refusal.contains("C-u 1건은 선행 송신됨") {
-            failures.push("원자 clear 거부가 선행 송신을 거짓 보고".to_string());
-        }
-        let refusal = fallback
-            .split_once("\"text\": clear")
-            .expect("clear 본문 송신 없음")
-            .1
-            .split_once("if is_typing_guard_err(&e) {")
-            .expect("typing_guard 거부 분기 없음")
-            .1
-            .split_once("} else {")
-            .expect("typing_guard 거부 분기 끝 없음")
-            .0;
-        if !refusal.contains("C-u 1건은 선행 송신됨") {
-            failures.push("typing_guard 거부 문면에 C-u 1건 선행 송신 설명 없음".to_string());
-        }
-        if refusal.contains("초안 소거 금지") {
-            failures.push("typing_guard 거부 문면에 종전 초안 소거 금지 설명 잔존".to_string());
+        if unsupported.contains("request(") || !unsupported.contains("CycleOutcome::NotCleared") {
+            failures.push("unsupported must hold without a write".to_string());
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
@@ -42220,6 +42242,9 @@ mod tests {
         let src = include_str!("cys.rs");
         let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계")];
         for marker in markers {
+            // The autopilot still recognizes this historical marker from older CLIs.
+            // D7 removes its producer; it must not be restored to satisfy this census.
+            if marker == "C-u 1건은 선행 송신됨" { continue; }
             assert!(
                 !marker.contains("/clear"),
                 "키 송신 마커는 어댑터 clear_cmd에 종속되면 안 된다: {marker}"
@@ -42262,8 +42287,43 @@ mod tests {
     }
 
     #[test]
+    fn p1_e_d2_composer_export_controls_cycle_classification() {
+        let screen = "❯ carry on please\n";
+        let classify = |composer: Option<Value>, pending: u64, human: u64| {
+            let mut reply = json!({"text": screen, "quiet_secs": 10.0});
+            if let Some(c) = composer { reply["composer"] = c; }
+            cycle_target_observation(Ok(reply), Ok(json!({
+                "pending_input_bytes": pending, "pending_input_human_bytes": human
+            })), &["❯".to_string()], None, &[]).state
+        };
+        let c = |verdict: &str, owner: &str, pending: u64, human: u64| json!({
+            "verdict": verdict, "governed": true, "owner": owner, "owner_kind": "verified",
+            "modal": false, "output_gen": 8, "input_gen": 3,
+            "pending_bytes": pending, "human_bytes": human
+        });
+        for verdict in ["suggestion", "empty", "placeholder"] {
+            assert_eq!(classify(Some(c(verdict,"none",0,0)),0,0), CycleTargetState::Idle, "T-C1 {verdict}");
+            assert_eq!(classify(Some(c(verdict,"machine",6,0)),6,0), CycleTargetState::MachineResidue, "T-C4 {verdict}");
+        }
+        assert_eq!(classify(None,0,0), CycleTargetState::HumanDraft, "T-C2 absent");
+        assert_eq!(classify(Some(c("unknown","none",0,0)),0,0), CycleTargetState::HumanDraft, "unknown fallback");
+        assert_eq!(classify(Some(c("suggestion","none",0,0)),0,1), CycleTargetState::HumanDraft, "T-C3 entry human");
+        assert_eq!(classify(Some(c("suggestion","none",0,1)),0,0), CycleTargetState::HumanDraft, "T-C3 frame human");
+        assert_eq!(classify(Some(c("empty","own_paste",0,0)),0,0), CycleTargetState::Busy, "own paste precedes empty");
+        assert_eq!(classify(Some(c("draft","machine",0,0)),0,0), CycleTargetState::MachineResidue, "owner proof with zero mirror");
+        assert_eq!(classify(Some(c("draft","none",0,0)),0,0), CycleTargetState::HumanDraft, "unowned draft");
+        let mut moved = c("suggestion","none",0,0); moved["output_gen"] = Value::Null;
+        assert_eq!(classify(Some(moved),0,0), CycleTargetState::Busy, "inconsistent frame");
+        let mut modal = c("suggestion","none",0,0); modal["modal"] = json!(true);
+        assert_eq!(classify(Some(modal),0,0), CycleTargetState::Busy, "same frame modal");
+        let mut ung = c("suggestion","none",0,0); ung["governed"] = json!(false);
+        assert_eq!(classify(Some(ung),0,0), CycleTargetState::HumanDraft, "ungoverned fallback");
+    }
+
+    #[test]
     fn d16_target_state_busy_when_output_streaming() {
         let mut obs = CycleTargetObs {
+        composer: None,
             gate_or_modal: false,
             screen: Some(cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT),
             quiet: Some(false),
@@ -42281,6 +42341,7 @@ mod tests {
     #[test]
     fn d16_target_state_idle_on_quiet_empty_composer() {
         let mut obs = CycleTargetObs {
+        composer: None,
             gate_or_modal: false,
             screen: Some(cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT),
             quiet: Some(true),
@@ -42300,6 +42361,7 @@ mod tests {
     #[test]
     fn d16_target_state_human_draft() {
         let mut obs = CycleTargetObs {
+        composer: None,
             gate_or_modal: false,
             screen: None,
             quiet: Some(false),
@@ -42350,6 +42412,7 @@ mod tests {
         ] {
             assert_eq!(
                 cycle_target_state(&CycleTargetObs {
+        composer: None,
                     gate_or_modal: false,
                     screen,
                     quiet,
@@ -42370,6 +42433,7 @@ mod tests {
         ] {
             assert_eq!(
                 cycle_target_state(&CycleTargetObs {
+        composer: None,
                     gate_or_modal: false,
                     screen: Some("마커 없는 화면"),
                     quiet,
@@ -42396,17 +42460,18 @@ mod tests {
             }).expect("유휴 대기 호출 닫힘");
             tail[..end].chars().filter(|c| !c.is_whitespace()).collect()
         }).collect();
-        assert_eq!(calls.len(), 3, "clear 직전 1곳·재주입 직전 2곳의 정책을 모두 잰다");
+        assert_eq!(calls.len(), 4, "initial clear, retry, and two reinject paths");
         assert!(calls[0].ends_with("\"clear직전\",true,"), "clear 직전만 기계 잔여를 허용한다: {}", calls[0]);
-        assert!(calls[1].ends_with("\"재주입직전\",false,"), "검증 뒤 재주입은 기계 잔여를 허용하지 않는다: {}", calls[1]);
-        assert!(calls[2].ends_with("\"재주입직전(측정불능)\",false,"), "측정 불능 재주입도 기계 잔여를 허용하지 않는다: {}", calls[2]);
+        assert!(calls[1].ends_with("\"clearretry\",true,"));
+        assert!(calls[2].ends_with("\"재주입직전\",false,"), "검증 뒤 재주입은 기계 잔여를 허용하지 않는다: {}", calls[1]);
+        assert!(calls[3].ends_with("\"재주입직전(측정불능)\",false,"), "측정 불능 재주입도 기계 잔여를 허용하지 않는다: {}", calls[2]);
 
         let gate = strip_line_comments(refl_fn_body(include_str!("cys.rs"), "wait_cycle_target_idle"));
         let compact: String = gate.chars().filter(|c| !c.is_whitespace()).collect();
         assert!(compact.contains("CycleTargetState::MachineResidueifallow_machine_residue=>{"), "허용 인자가 기계 잔여 분기를 통제해야 한다");
         let allowed = compact.split_once("CycleTargetState::MachineResidueifallow_machine_residue=>{")
             .expect("기계 잔여 허용 분기").1.split_once("CycleTargetState::HumanDraft=>").expect("사람 초안 분기").0;
-        assert!(allowed.contains("eprintln!(") && allowed.contains("returnOk(())"), "clear 직전 통과는 진단을 남기고 성공한다");
+        assert!(allowed.contains("eprintln!(") && allowed.contains("returnOk(CycleTargetFence{"), "clear 직전 통과는 진단을 남기고 성공한다");
         assert!(compact.contains("CycleTargetState::Busy|CycleTargetState::MachineResidue=>{}"), "재주입의 잔여는 Busy와 함께 계속 관측한다");
     }
 
@@ -42452,6 +42517,7 @@ mod tests {
             );
             assert_eq!(
                 cycle_target_state(&CycleTargetObs {
+        composer: None,
                     gate_or_modal: false,
                     screen: Some(screen),
                     quiet: Some(true),
@@ -42498,6 +42564,7 @@ mod tests {
             ] {
                 assert_eq!(
                     cycle_target_state(&CycleTargetObs {
+        composer: None,
                         gate_or_modal: false,
                         screen: Some(screen),
                         quiet,
@@ -42534,99 +42601,47 @@ mod tests {
         (atomic.to_string(), fallback.to_string(), refusal.to_string())
     }
 
-    /// 해당 키의 request부터 첫 오류 전파까지 한정해 폴백 send_text의 매핑을 잘못 세지 않는다.
-    fn d16_clear_key_request_source(key: &str) -> String {
-        let (_, body, _) = d16_clear_atomic_and_fallback_source();
-        let key_at = body.find(&format!("\"key\": \"{key}\"")).expect("키 송신 없음");
-        let start = body[..key_at].rfind("request(").expect("키 요청 없음");
-        let end = key_at + body[key_at..].find("?;").expect("키 오류 전파 없음") + 2;
-        body[start..end].chars().filter(|c| !c.is_whitespace()).collect()
-    }
-
     #[test]
     fn d16_clear_cu_refusal_folds_to_human_draft() {
-        // 원자 clear 거부는 송신 0건·rc85, 미지원 폴백의 C-u도 같은 초안 토큰을 쓴다.
-        let (_, _, refusal) = d16_clear_atomic_and_fallback_source();
-        let compact: String = refusal.chars().filter(|c| !c.is_whitespace()).collect();
-        assert!(compact.contains("returnErr(ifis_typing_guard_err(&e){format!(\"{CYCLE_HUMAN_DRAFT_TOKEN}"));
-        assert!(compact.contains("}else{e});"), "원자 경로의 가드 밖 오류는 원형 전파");
-        assert!(refusal.contains("clear 원자 송신 거부(송신 0건 · composer 무변경)"));
-        assert!(!refusal.contains("C-u 1건은 선행 송신됨"), "원자 거부는 선행 송신이 없다");
-        let call = d16_clear_key_request_source("C-u");
-        assert!(call.starts_with("request(\"surface.send_key\","), "C-u 요청 배선 없음");
-        assert!(
-            call.contains(".map_err(|e|{ifis_typing_guard_err(&e){format!(\"{CYCLE_HUMAN_DRAFT_TOKEN}"),
-            "C-u 타이핑 가드 거부가 사람 초안 토큰으로 접히지 않는다"
-        );
-        assert!(call.ends_with("}else{e}})?;"), "타이핑 가드 밖 오류는 원형대로 전파해야 한다");
+        let (_, unsupported, refusal) = d16_clear_atomic_and_fallback_source();
+        assert!(refusal.contains("is_typing_guard_err(&e)"));
+        assert!(refusal.contains("{CYCLE_HUMAN_DRAFT_TOKEN}"));
+        assert!(refusal.contains("송신 0건 · composer 무변경"));
+        assert!(unsupported.contains("CycleOutcome::NotCleared"));
+        assert!(!unsupported.contains("request("), "unsupported must not write C-u");
     }
 
     #[test]
     fn d16_clear_submit_refusal_folds_to_human_draft() {
-        // 원자 팔은 제출까지 한 번에 판정하고, 폴백 Return 거부도 rc85·원형 오류를 보존한다.
-        let (atomic, fallback, refusal) = d16_clear_atomic_and_fallback_source();
-        assert!(!atomic.contains("surface.send_key"), "원자 팔 뒤에 별도 제출 키가 있으면 안 된다");
+        let (_, unsupported, refusal) = d16_clear_atomic_and_fallback_source();
+        assert!(!d16_clear_stage_source().contains("surface.send_key"), "no detached submit");
         assert!(refusal.contains("CYCLE_HUMAN_DRAFT_TOKEN"));
-        assert!(refusal.contains("송신 0건 · composer 무변경"));
-        assert!(!refusal.contains("들어갔지만 제출되지 않았다"));
-        let text = fallback.split_once("\"text\": clear").expect("폴백 본문 송신").1
-            .split_once("?;").expect("폴백 본문 오류 전파").0;
-        let text: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-        assert!(text.contains(".map_err(|e|{ifis_typing_guard_err(&e){format!(\"{CYCLE_HUMAN_DRAFT_TOKEN}"));
-        assert!(text.ends_with("}else{e}})"), "폴백 본문도 가드 밖 오류는 원형 전파");
-        let call = d16_clear_key_request_source("Return");
-        assert!(call.starts_with("request(\"surface.send_key\","), "Return 요청 배선 없음");
-        assert!(
-            call.contains(".map_err(|e|{ifis_typing_guard_err(&e){format!(\"{CYCLE_HUMAN_DRAFT_TOKEN}"),
-            "Return 타이핑 가드 거부가 사람 초안 토큰으로 접히지 않는다"
-        );
-        assert!(call.ends_with("}else{e}})?;"), "타이핑 가드 밖 오류는 원형대로 전파해야 한다");
+        assert!(unsupported.contains("clear_first_unsupported"));
+        assert!(unsupported.contains("return Err("));
     }
 
     #[test]
     fn d16_keys_sent_marker_only_after_cu_success() {
-        // 원자 성공 팔·폴백 C-u 성공 뒤에만 마커를 찍어 송신 0건의 오기록을 막는다.
-        let (atomic, body, refusal) = d16_clear_atomic_and_fallback_source();
-        let (before_success, success) = atomic.split_once("Ok(_) => {").expect("원자 성공 팔");
-        let marker_literal = "[cycle 5/7] 입력 버퍼 정리 + '";
-        assert!(!before_success.contains(marker_literal));
-        assert!(success.contains(marker_literal), "원자 성공 뒤 송신 마커 누락");
-        assert!(success.contains("원자"), "5단계가 원자 경로임을 명시해야 한다");
-        for literal in ["C-u 1건은 선행 송신됨", marker_literal] {
-            assert!(!refusal.contains(literal), "원자 거부에 송신 마커가 있다: {literal}");
-        }
-        let cu = body.find("\"key\": \"C-u\"").expect("C-u 송신 없음");
-        let done = cu + body[cu..].find("?;").expect("C-u 오류 전파 없음") + 2;
-        let marker = body.find("eprintln!(\"[cycle 5/7] 입력 버퍼 정리 + '")
-            .expect("키 송신 마커 출력 없음");
-        assert!(done < marker, "키 송신 마커가 C-u 성공 전에 출력된다");
-        for literal in ["C-u 1건은 선행 송신됨", "[cycle 5/7] 입력 버퍼 정리 + '"] {
-            assert!(!body[..done].contains(literal), "C-u 거부 경로에 키 송신 마커가 있다: {literal}");
-        }
+        let (atomic, unsupported, refusal) = d16_clear_atomic_and_fallback_source();
+        let (before, success) = atomic.split_once("Ok(_) => {").expect("atomic success arm");
+        let marker = "[cycle 5/7] 입력 버퍼 정리 + '";
+        assert!(!before.contains(marker));
+        assert!(success.contains(marker));
+        assert!(!unsupported.contains(marker) && !refusal.contains(marker));
     }
 
     /// ★적대 major ①: 원자 송신 1회 뒤 별도 키를 보내면 다시 사람 입력이 끼어드는 경로가 열린다.
     #[test]
-    fn r1_cycle_clear_is_atomic_with_legacy_fallback_only_when_unsupported() {
-        let (atomic, fallback, refusal) = d16_clear_atomic_and_fallback_source();
-        assert_eq!(atomic.matches("request(").count(), 1, "원자 요청은 1회");
-        assert!(atomic.contains("match request("));
-        assert!(atomic.contains("\"surface.send_text\""));
+    fn r1_cycle_clear_is_atomic_and_unsupported_holds_without_fallback() {
+        let (atomic, unsupported, _) = d16_clear_atomic_and_fallback_source();
+        assert_eq!(atomic.matches("request(").count(), 1);
+        assert!(atomic.contains(r#"match request("surface.send_text", params)"#));
         assert!(atomic.contains("\"clear_first\": true"));
         assert!(atomic.contains("\"text\": clear"));
-        assert!(atomic.contains("\"quiet\": true"));
-        assert!(!atomic.contains("surface.send_key") && !atomic.contains("sleep("));
-        assert!(!refusal.contains("request(") && !refusal.contains("sleep("));
-        assert_eq!(fallback.matches("request(").count(), 3, "미지원 팔에만 종전 3분할");
-        assert_eq!(fallback.matches("surface.send_key").count(), 2);
-        assert_eq!(fallback.matches("surface.send_text").count(), 1);
-        assert!(!fallback.contains("\"clear_first\": true"));
-        assert!(fallback.contains("이 좌석은 launch-agent 등록이 없어 원자 clear 를 못 쓴다 — 3분할 폴백"));
-        let cu = fallback.find("\"key\": \"C-u\"").unwrap();
-        let settle = fallback.find("Duration::from_millis(200)").expect("종전 settle 보존");
-        let text = fallback.find("\"text\": clear").unwrap();
-        let submit = fallback.find("\"key\": \"Return\"").unwrap();
-        assert!(cu < settle && settle < text && text < submit);
+        assert!(!unsupported.contains("request(") && !unsupported.contains("sleep("));
+        assert!(unsupported.contains("CycleOutcome::NotCleared"));
+        assert!(unsupported.contains("clear_first_unsupported"));
+        assert!(!d16_clear_stage_source().contains("surface.send_key"));
     }
 
     #[test]
@@ -42662,12 +42677,11 @@ mod tests {
         assert!(target < quiesce, "사전 턴 확인은 quiescing 앞이어야 한다");
         let atomic = body.find("match request(").expect("원자 clear 송신 없음");
         let fallback = body.find("Err(e) if is_clear_first_unsupported_err(&e) => {").expect("미지원 폴백 없음");
-        let cu = body.find("\"key\": \"C-u\"").expect("입력버퍼 정리 없음");
-        assert!(quiesce < atomic && atomic < fallback && fallback < cu,
-            "유휴·quiescing 뒤 원자 송신, 미지원 팔 안에서만 C-u 순서여야 한다");
-        let verdict = body.find("clear_effect_verdict(").expect("clear 실효 판정 없음");
-        let submit = body.find("\"key\": \"Return\"").expect("폴백 제출 없음");
-        assert!(cu < submit && submit < verdict, "폴백 송신도 실효 확인보다 앞이어야 한다");
+        assert!(quiesce < atomic && atomic < fallback);
+        assert!(!body.contains("\"key\": \"C-u\""));
+        assert!(!body.contains("\"key\": \"Return\""));
+        let verdict = body.find("clear_effect_verdict(").expect("clear effect check");
+        assert!(fallback < verdict);
         let directive = body.find("compose_directive(").expect("디렉티브 재주입 없음");
         assert!(verdict < directive, "clear 실효 판정 전에 디렉티브가 재주입된다");
         let sent = body.find("\"text\": clear").expect("clear 송신 없음");
@@ -42706,8 +42720,7 @@ mod tests {
         let measured = body.find("allow_at.elapsed()").expect("잔여 창이 실측이 아니다");
         assert!(report < measured, "잔여 창 보고가 실측식보다 뒤에 있다");
         let atomic = body.find("match request(").expect("원자 clear 송신 없음");
-        let cu = body.find("\"key\": \"C-u\"").expect("폴백 입력버퍼 정리 없음");
-        assert!(measured < atomic && atomic < cu, "잔여 창 보고는 원자·폴백 첫 송신 앞이어야 한다");
+        assert!(measured < atomic, "residual window precedes atomic attempt");
         // 파이썬 쪽 문면도 실제 상한(사전 턴 확인 포함)을 적어야 한다 — 문면↔코드 드리프트 핀.
         // 한국어 본문을 바이트로 자르지 않도록 줄 단위로 읽는다.
         let py = include_str!("../../cysjavis-pack/bin/javis_cycle_autopilot.py");
@@ -47311,6 +47324,119 @@ mod b360_tests {
         let (rc, _out, err) = r2c_child("cycle", &daemon, &pack.envs());
         let error = err.lines().filter(|l| l.starts_with("error: ")).last().unwrap_or_default().to_string();
         (rc, error, daemon.calls())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn p1_e_d7_cycle_rpc_loop_preserves_fences_holds_and_outcomes() {
+        for (code, retries, expected_outcome) in [
+            ("guard_aborted", 2, "cleared"),
+            (cys::ERR_JOURNAL_UNAVAILABLE, 2, "cleared"),
+            ("own_paste_settling", 1, "not_cleared"),
+            ("cycle_clear_unclaimed", 1, "not_cleared"),
+            ("clear_first_unsupported", 1, "not_cleared"),
+            (cys::ERR_TYPING_GUARD, 1, "not_cleared"),
+            (cys::ERR_WRITE_OUTCOME_UNKNOWN, 1, "unknown"),
+        ] {
+            let pack = R2cPack::new();
+            let cwd = pack.dir.clone();
+            let code = code.to_string(); let named = code.clone();
+            let mut attempts = 0; let mut reads = 0; let mut cleared = false;
+            let daemon = R2cDaemon::start(move |method, p| match method {
+                "surface.cycle_claim" => r2c_ok(json!({"claim":"claimed"})),
+                "surface.list" => r2c_ok(json!({"surfaces":[{
+                    "surface_id":7, "surface_ref":"surface:7", "role":"worker", "agent":"claude",
+                    "exited":false, "awakened_at":1.0, "cwd":cwd, "live_cwd":cwd,
+                    "pending_input_bytes":0,"pending_input_human_bytes":0,
+                    "usage":{"source":"statusline","session_file":if cleared {"S2"} else {"S1"}}
+                }]})),
+                "surface.read_text" => {
+                    reads += 1;
+                    r2c_ok(json!({"text": cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT,
+                        "quiet_secs":5.0, "composer":{"verdict":"empty","governed":true,"modal":false,
+                        "owner":"none","owner_kind":"unattributed","output_gen":2*reads,"input_gen":reads,
+                        "pending_bytes":0,"human_bytes":0}}))
+                },
+                "surface.send_text" if p["clear_first"] == true => {
+                    attempts += 1;
+                    if attempts == 1 { json!({"ok":false,"error":{"code":code,"message":code}}) }
+                    else { cleared = true; r2c_ok(json!({})) }
+                },
+                _ => r2c_ok(json!({})),
+            });
+            let (rc, _out, err) = r2c_child("cycle", &daemon, &pack.envs());
+            let calls = daemon.calls();
+            let clears: Vec<_> = calls.iter().filter(|(m,p)|m=="surface.send_text" && p["clear_first"]==true).collect();
+            assert_eq!(clears.len(), retries, "D7 retry precedence {named}: {err}");
+            let mut generation = 0; let mut last_sent_generation = 0;
+            for (m,p) in &calls {
+                if m=="surface.read_text" { generation += 1; assert_eq!(p["composer"],json!(true),"D2 opt-in"); }
+                if m=="surface.send_text" && p["clear_first"]==true {
+                    assert!(generation > last_sent_generation, "D7 must reobserve before each attempt {named}");
+                    last_sent_generation = generation;
+                    assert_eq!(p["cycle_clear"],json!(true),"D7 discriminator {named}");
+                    assert_eq!(p["expect_output_gen"],json!(2*generation),"D7 fresh output fence {named}");
+                    assert_eq!(p["expect_input_gen"],json!(generation),"D7 same frame input fence {named}");
+                    assert_eq!(p["admitted"],json!("idle"));
+                }
+            }
+            assert_eq!(r2c_quiesce_outcome(&calls).as_deref(),Some(expected_outcome),"D7 cleanup {named}: {err}");
+            let first = calls.iter().position(|(m,p)|m=="surface.send_text" && p["clear_first"]==true).unwrap();
+            let end = calls[first+1..].iter().position(|(m,p)|m=="surface.send_text" && p["authoritative"]==true)
+                .map(|n|first+1+n).unwrap_or(calls.len());
+            assert!(!calls[first..end].iter().any(|(m,_)|m=="surface.send_key"),"D7 no split fallback {named}");
+            if retries==2 { assert_eq!(rc,0,"{named}: {err}"); }
+            else { assert_ne!(rc,0,"{named}"); assert!(err.contains(&named),"D7 visible refusal {named}: {err}"); }
+            assert!(!err.contains("[diag=quiet_secs_unreported]"),"D7 transient refusal {named}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn p1_e_d7_retry_cap_reobservation_and_legacy_discriminator() {
+        for mode in ["cap", "human_after_abort", "no_claim", "old_daemon"] {
+            let pack = R2cPack::new(); let cwd = pack.dir.clone();
+            let mut attempts = 0; let mut cleared = false;
+            let daemon = R2cDaemon::start(move |method,p| match method {
+                "surface.cycle_claim" => r2c_ok(if mode=="no_claim" {json!({})} else {json!({"claim":"claimed"})}),
+                "surface.list" => r2c_ok(json!({"surfaces":[{
+                    "surface_id":7,"surface_ref":"surface:7","role":"worker","agent":"claude",
+                    "exited":false,"awakened_at":1.0,"cwd":cwd,"live_cwd":cwd,
+                    "pending_input_bytes":0,"pending_input_human_bytes":0,
+                    "usage":{"source":"statusline","session_file":if cleared {"S2"} else {"S1"}}
+                }]})),
+                "surface.read_text" => {
+                    let mut r = json!({"text":cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT,"quiet_secs":5.0});
+                    if mode!="old_daemon" {r["composer"]=json!({
+                        "verdict":"empty","governed":true,"modal":false,"owner":"none",
+                        "input_gen":2,"output_gen":4,"pending_bytes":0,
+                        "human_bytes":if mode=="human_after_abort" && attempts>0 {1} else {0}
+                    });}
+                    r2c_ok(r)
+                },
+                "surface.send_text" if p["clear_first"]==true => {
+                    attempts+=1;
+                    if mode=="cap" || mode=="human_after_abort" {
+                        json!({"ok":false,"error":{"code":"guard_aborted","message":"guard_aborted"}})
+                    } else {cleared=true;r2c_ok(json!({}))}
+                },
+                _ => r2c_ok(json!({})),
+            });
+            let (rc,_out,err)=r2c_child("cycle",&daemon,&pack.envs());
+            let calls=daemon.calls();
+            let clears:Vec<_>=calls.iter().filter(|(m,p)|m=="surface.send_text" && p["clear_first"]==true).collect();
+            match mode {
+                "cap" => {assert_eq!(clears.len(),3,"D7 attempt cap: {err}");assert_eq!(rc,1,"D7 cap must return the refusal: {err}");assert!(err.contains("guard_aborted"));},
+                "human_after_abort" => {assert_eq!(clears.len(),1,"D7 reobserve human: {err}");assert_eq!(rc,EXIT_CYCLE_HUMAN_DRAFT);},
+                _ => {
+                    assert_eq!(rc,0,"{mode}: {err}");assert_eq!(clears.len(),1);
+                    assert!(clears[0].1.get("cycle_clear").is_none(),"D7 legacy discriminator {mode}");
+                    assert!(clears[0].1.get("expect_output_gen").is_none(),"D7 legacy fence {mode}");
+                }
+            }
+            let want=if mode=="cap" || mode=="human_after_abort" {"not_cleared"} else {"cleared"};
+            assert_eq!(r2c_quiesce_outcome(&calls).as_deref(),Some(want),"D7 every exit cleanup {mode}");
+        }
     }
 
     /// How many authoritative pastes followed the atomic /clear (the reinject writes: directive + RESUME, RESUME alone).

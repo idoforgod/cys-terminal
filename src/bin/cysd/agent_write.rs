@@ -1184,6 +1184,11 @@ pub enum JournalBarrier {
     Passed,
     /// The journal barrier refused the request: zero bytes. The writer's reason (`journal:<os error>`).
     Refused(String),
+    /// ★(0.14.56 · P1 D5 · design r2 §6) The request ended before `Writing` with zero bytes: its hand-off guard was not claimed
+    /// ([`GUARD_ABORTED`]) or it was cancelled ([`Terminal::CancelledBeforeWrite`]). Both are decided before the first byte, so
+    /// this report is not timing-dependent. Other non-journal refusals (e.g. a lost receiver proof, decided after `Writing`)
+    /// stay [`JournalBarrier::Passed`].
+    GuardAborted,
     /// The budget ended before the seat's writer reached the request (it is queued behind earlier writes).
     Pending,
 }
@@ -1203,6 +1208,10 @@ pub fn await_journal_barrier(req: &Request, budget: Duration) -> JournalBarrier 
             Status::Terminal(Terminal::RefusedNoWrite { reason }) if reason.starts_with("journal:") => {
                 return JournalBarrier::Refused(reason)
             }
+            Status::Terminal(Terminal::RefusedNoWrite { reason }) if reason == GUARD_ABORTED => {
+                return JournalBarrier::GuardAborted
+            }
+            Status::Terminal(Terminal::CancelledBeforeWrite) => return JournalBarrier::GuardAborted,
             Status::Terminal(_) => return JournalBarrier::Passed,
             Status::AcceptedPending => {}
         }
@@ -3031,6 +3040,47 @@ mod tests {
         drop(job.attempt);
         assert!(job.request.reserve_attempt(&next,None).is_err(),"data helper changed the actual admitted native Plan");
         assert!(job.request.reserve_attempt(&plan,None).is_ok());
+    }
+
+    /// ★(0.14.56 · P1 E L-CYCLE D5 · design r2 §6, §15 T-D5) The barrier reports the two ends decided before `Writing` - a
+    /// hand-off guard that was not claimed and a cancellation - as `GuardAborted` (zero bytes); a non-journal refusal decided after
+    /// `Writing` (a lost receiver proof) stays `Passed`. Mutants: keep `Passed` for GUARD_ABORTED; keep it for a cancellation;
+    /// map every non-journal refusal to `GuardAborted`.
+    #[test]
+    fn p1_e_t_d5_barrier_reports_pre_writing_zero_byte_ends_as_guard_aborted() {
+        let budget = Duration::from_millis(JOURNAL_BARRIER_BUDGET_MS);
+        // a guard whose generation moved: never claimed
+        let mut j = job(Plan::paste("x").with_clear(0).with_submit(0, 0), FakeProof::healthy());
+        j.guard = Some(Arc::new(crate::state::InjectGuard::new(
+            Some(0),
+            Arc::new(std::sync::atomic::AtomicU64::new(2)),
+            false,
+            None,
+        )));
+        let req = j.request.clone();
+        let mut w = Rec::new();
+        let ex = run_job(&mut w, &j);
+        finish(j, &ex);
+        assert!(matches!(req.status(), Status::Terminal(Terminal::RefusedNoWrite { ref reason }) if reason == GUARD_ABORTED));
+        assert_eq!(w.attempts, 0, "zero bytes");
+        assert_eq!(await_journal_barrier(&req, budget), JournalBarrier::GuardAborted, "guard abort");
+        // cancelled before the first byte
+        let j = job(Plan::paste("x").with_submit(0, 0), FakeProof::healthy());
+        j.request.cancel();
+        let req = j.request.clone();
+        let mut w = Rec::new();
+        let ex = run_job(&mut w, &j);
+        finish(j, &ex);
+        assert_eq!(w.attempts, 0, "zero bytes");
+        assert_eq!(await_journal_barrier(&req, budget), JournalBarrier::GuardAborted, "cancellation");
+        // a receiver-proof refusal (after `Writing`): not remapped
+        let j = job(Plan::paste("x").with_submit(0, 0), FakeProof::refusing(ProofLoss::AgentDead));
+        let req = j.request.clone();
+        let mut w = Rec::new();
+        let ex = run_job(&mut w, &j);
+        finish(j, &ex);
+        assert!(matches!(req.status(), Status::Terminal(Terminal::RefusedNoWrite { .. })));
+        assert_eq!(await_journal_barrier(&req, budget), JournalBarrier::Passed, "receiver-proof refusal stays Passed");
     }
 
 }
