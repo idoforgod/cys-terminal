@@ -1920,6 +1920,15 @@ pub struct BootAck {
     pub generation: u32,
 }
 
+/// ★(0.14.56 · PKG1-M1 · design sec 3.2-3.3) [`Surface::auth_born`]: entry id -> `ctx_guard_now` at insertion (the daemon's monotonic
+/// clock; an entry restored from the WAL has no row and is aged by its wall-clock `enqueued_at`), and the one entry whose lapse
+/// event was already published (`queue.authoritative_hold_lapsed` fires once per entry). Pruned to the ids still queued.
+#[derive(Debug, Default)]
+pub struct AuthBook {
+    pub born: std::collections::HashMap<String, f64>,
+    pub lapsed_reported: Option<String>,
+}
+
 /// ★(0.14.42 · clear 가드 v3) 사이클 단일 비행 점유 — `surface.cycle_claim` 이 기록한다(`Surface::cycle_claim`).
 #[derive(Debug, Clone)]
 pub struct CycleClaim {
@@ -2288,6 +2297,10 @@ pub struct Surface {
     /// 말단 락(가드 락보다 먼저 잡는다 · 가드 락을 쥔 채 잡지 않는다). ★(RR2-ROLE-2) 좌석 상태 JSON `ctx_guard.claim` 으로 보이고,
     /// 점유가 끝났는데(해제 · 죽음) 그 통보가 미해결이면 데몬이 같은 통보를 한 번 재배달한다(`usage::ctx_guard_claim_ended`).
     pub cycle_claim: Mutex<Option<CycleClaim>>,
+    /// ★(0.14.56 · PKG1-M1 · design sec 3.2) Monotonic insertion times of this seat's queued authoritative entries (the cycle's
+    /// converted [RESUME] / directive) - the age book of the `authoritative` hold axis ([`crate::governance::authoritative_hold_age`]).
+    /// Leaf lock: taken after `pending_queue` is released, never while holding another lock.
+    pub auth_born: Mutex<AuthBook>,
     /// (B2) OSC 9/99/777 알림 스캐너 carry — reader 스레드 전용(단일 스레드 접근이라 Mutex면 충분).
     /// strip 전 raw chunk를 누적해 완성 OSC 시퀀스만 추출한다(화면 렌더/strip 경로와 독립).
     pub osc_carry: Mutex<Vec<u8>>,
@@ -4104,6 +4117,10 @@ pub struct Daemon {
     /// ★(0.14.52 · S-a C7a) Partial-write holds by queue entry id, mirrored to `queue-write-holds.json` (see
     /// [`PersistedWriteHold`]); loaded at start so a restored held entry is adopted as held, never handed off again.
     pub write_holds: Mutex<HashMap<String, PersistedWriteHold>>,
+    /// ★(0.14.56 · PKG1-M1 m1) Boot-supervisor pane notices refused at their master/CEO claim (a foreign write or input after the
+    /// hand-off): the writer-thread settlement puts them here and the supervisor moves them into its deferred list at its next
+    /// retry, within the existing bounds (16 notices, 600 s). Leaf lock.
+    pub pane_notice_requeue: Mutex<Vec<crate::boot_supervisor::DeferredPaneNotice>>,
     /// ★(0.14.52 · S-a C7e) Held bodies an earlier daemon run left in `submit-held.json`, disposed once by the first
     /// `handlers::sync_held_bodies` of this run.
     pub held_bodies_restart: Mutex<Vec<PersistedHeldBody>>,
@@ -6433,6 +6450,7 @@ impl Daemon {
             feed_persist_lock: Mutex::new(()),
             restored_queue: Mutex::new(restored_qentries),
             write_holds: Mutex::new(load_write_holds(&dir)),
+            pane_notice_requeue: Mutex::new(Vec::new()),
             held_bodies_restart: Mutex::new(load_held_bodies(&dir)),
             held_bodies_written: Mutex::new(None),
             restored_expired: Mutex::new(restored_expired),
@@ -7523,6 +7541,7 @@ impl Daemon {
             pack_reinject: Mutex::new(None),
             ctx_loop_guard: Mutex::new(crate::usage::clear_guard::ClearGuard::default()),
             cycle_claim: Mutex::new(None),
+            auth_born: Mutex::new(AuthBook::default()),
             // 능력 가드: 생성 시 역할에서 도출(reviewer-*=read/search, full=worker/master/cso,
             // 그 외 deny-by-default none). claim_role이 역할 전이 시 동기 재도출한다.
             caps: Mutex::new(crate::caps::Caps::for_role(role.as_deref())),

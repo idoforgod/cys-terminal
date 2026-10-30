@@ -1685,21 +1685,53 @@ pub(crate) fn pkg1_raw_authoritative(daemon: &Arc<Daemon>, s: &Arc<Surface>, tex
     id
 }
 
-/// Hands the queue's head off (the tick's write step) until the queue is empty, at most `max` times.
+/// Hands the queue's head off (the tick's write step) until the queue is empty: at most `max` hand-offs (no runaway), within
+/// 10 s (no block - a held hand-off is retried every 20 ms, as the tick would; the last hold reason is printed on failure).
+/// The queue's minimum delivery interval (`CYS_QUEUE_MIN_INTERVAL_SECS`, default 10 s) paces a forced hand-off too, so after
+/// each hand-off this thread's queue clock ([`crate::governance::P1QueueClockSnapshot`]) is moved 61 s further: the interval
+/// passing, never a human key.
 pub(crate) fn pkg1_drain(daemon: &Arc<Daemon>, s: &Arc<Surface>, max: usize) {
-    for _ in 0..max {
-        if s.pending_queue.lock().unwrap().is_empty() {
-            return;
-        }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let (mut handoffs, mut last): (usize, Option<&'static str>) = (0, None);
+    let mut clock: Option<crate::governance::P1QueueClockSnapshot> = None;
+    while !s.pending_queue.lock().unwrap().is_empty() {
+        assert!(Instant::now() < deadline, "not drained in 10 s (last hold {last:?}): {}", pkg1_queue_story(daemon, s));
         wait_until("writer idle before the next hand-off", || s.write_tx.gate().pending() == 0);
-        let _ = deliver_head_locked(daemon, s, true, false, None, None, None, None, None);
-        wait_until("writer idle after the hand-off", || s.write_tx.gate().pending() == 0);
+        let mut reason = None;
+        if deliver_head_locked(daemon, s, true, false, None, None, None, None, Some(&mut reason)).is_some() {
+            handoffs += 1;
+            assert!(handoffs <= max, "more hand-offs than expected ({max}): {}", pkg1_queue_story(daemon, s));
+            wait_until("writer idle after the hand-off", || s.write_tx.gate().pending() == 0);
+            let skew = 61.0 * handoffs as f64;
+            drop(clock.take()); // restore before re-setting: a snapshot restores the slot it replaced
+            clock = Some(crate::governance::P1QueueClockSnapshot::set(
+                crate::state::now_epoch() + skew,
+                Instant::now() + Duration::from_secs_f64(skew),
+            ));
+        } else {
+            last = reason;
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 }
 
 /// Where `needle` first occurs in `hay` (the receiver's bytes).
 pub(crate) fn pkg1_at(hay: &[u8], needle: &str) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle.as_bytes())
+}
+
+/// What a failing queue assertion prints: the queue (id, authoritative, text) and the queue.* events for the seat.
+pub(crate) fn pkg1_queue_story(daemon: &Arc<Daemon>, s: &Arc<Surface>) -> String {
+    let q: Vec<(String, bool, String)> =
+        s.pending_queue.lock().unwrap().iter().map(|e| (e.id.clone(), e.authoritative, e.text.clone())).collect();
+    let ev: Vec<String> = daemon
+        .bus
+        .tail(1000)
+        .into_iter()
+        .filter(|e| e["name"].as_str().is_some_and(|n| n.starts_with("queue.")) && e["surface_id"] == serde_json::json!(s.id))
+        .map(|e| format!("{} {}", e["name"], e["payload"]["why"].as_str().or(e["payload"]["reason"].as_str()).unwrap_or("")))
+        .collect();
+    format!("queue={q:?} events={ev:?}")
 }
 
 /// The `queue.authoritative_hold_lapsed` events published for `sid`.

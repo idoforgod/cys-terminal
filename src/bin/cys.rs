@@ -4657,6 +4657,28 @@ fn gate_hold_message(sid: u64, hit: &cys::inject_guard::GateHit, stage: &str) ->
     )
 }
 
+/// ★(0.14.56 · PKG1-M1 · PKG-2 m1-m2) The standard injection, as every caller has always called it (cycle step 7, boot and
+/// launch-agent directives, reinject). The single choke point is [`inject_text_sent`]; this stays a pure delegation (pinned).
+fn inject_text(sid: u64, text: &str) -> Result<(), String> {
+    inject_text_sent(sid, text).map(|_| ())
+}
+
+/// ★(0.14.56 · PKG1-M1 · PKG-2 m1-m3) What an injection did: typed directly (paste + its Return), or queued as ONE job that the
+/// daemon types with its own Return when the seat is ready (a master/CEO composer converts a direct send - D9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Sent {
+    Typed,
+    Queued { entry_id: String },
+}
+
+/// ★(0.14.56 · PKG-2 m1) The stderr line for an injection the daemon converted into one queue job (pure, pinned by a specimen).
+fn queued_inject_line(entry_id: &str, sid: u64) -> String {
+    format!(
+        "[inject] queued as one job {entry_id} -> {} (not typed now; the daemon types it with its own Return when the seat is ready)",
+        surface_ref(sid)
+    )
+}
+
 /// 지침·과업 텍스트의 표준 주입: bracketed paste → 0.8s → Return
 ///
 /// ★T-0147-6(사람 입력 경합 · W4): `authoritative:true` 는 타이핑 가드를 면제하지만 **무조건이
@@ -4672,7 +4694,10 @@ fn gate_hold_message(sid: u64, hit: &cys::inject_guard::GateHit, stage: &str) ->
 /// ★W2 ack 검증과의 결합: 큐 전환은 '배달 예약'이므로 ack(awakened_at 래치)가 늦어질 수 있다.
 ///   호출부(launch-agent)는 미확인을 **치명으로 올리지 않고** `directive_verified=false` 로
 ///   상태화하므로(B14), 이 전환이 새 실패를 만들지 않는다. 중복 주입 0 은 위 '1회' 규칙이 보장.
-fn inject_text(sid: u64, text: &str) -> Result<(), String> {
+/// ★(0.14.56 · PKG1-M1 · PKG-2 m1-m2) A reply `converted:"one_job"` means the daemon queued the body as ONE job that owns its
+/// CR: no pre-Return gate check and no Return follow it (a Return there is refused, and a caller retrying on that refusal would
+/// queue a second authoritative job); the line [`queued_inject_line`] says so on stderr.
+fn inject_text_sent(sid: u64, text: &str) -> Result<Sent, String> {
     // ★U-14 관문 가드 ①(붙여넣기 직전). 이 한 줄이 `inject_text` 를 부르는 모든 경로를 덮는다.
     gate_guard_check(sid, "디렉티브 주입")?;
     // ★(0.14.42 · 설계 C D4) 봉투는 lib 단일 정의처 — 본문 안 표지·끝 미완성 이스케이프를 살균한다(표지 없는
@@ -4693,6 +4718,11 @@ fn inject_text(sid: u64, text: &str) -> Result<(), String> {
             "inject",
         ),
     ) {
+        Ok(r) if r["converted"] == "one_job" => {
+            let entry_id = r["queue_entry_id"].as_str().unwrap_or("?").to_string();
+            eprintln!("{}", queued_inject_line(&entry_id, sid));
+            return Ok(Sent::Queued { entry_id });
+        }
         Ok(_) => {}
         Err(e) if is_typing_guard_err(&e) => {
             eprintln!(
@@ -4705,12 +4735,13 @@ fn inject_text(sid: u64, text: &str) -> Result<(), String> {
             //   씌운다(state.rs writer arm). 여기서 `wrapped` 를 넣으면 이중 래핑이 되어 제어열이
             //   본문에 섞인다 — 직접 경로(`Data`, 클라이언트가 래핑)와 규약이 다르므로 **원문**을
             //   보낸다(`cys send --queued` 가 원문을 보내는 것과 동일).
-            request(
+            let r = request(
                 "surface.send_text",
                 json!({"surface_id": sid, "text": text, "queued": true,
                        "from": "inject(typing_guard fallback)"}),
             )?;
-            return Ok(()); // 큐 배달이 CR 을 포함한다 — 별도 Return 금지(이중 제출 방지)
+            // 큐 배달이 CR 을 포함한다 — 별도 Return 금지(이중 제출 방지)
+            return Ok(Sent::Queued { entry_id: r["queue_entry_id"].as_str().unwrap_or("?").to_string() });
         }
         Err(e) => return Err(e),
     }
@@ -4726,7 +4757,7 @@ fn inject_text(sid: u64, text: &str) -> Result<(), String> {
         "surface.send_key",
         json!({"surface_id": sid, "key": "Return", "authoritative": true}),
     ) {
-        Ok(_) => Ok(()),
+        Ok(_) => Ok(Sent::Typed),
         Err(e) if is_typing_guard_err(&e) => {
             // 본문은 이미 직접 들어갔고 **제출만** 막혔다 — Return 만 큐로 1회 전환한다
             // (send_key --queued 는 Return/Enter 전용이라 계약상 안전).
@@ -4738,7 +4769,7 @@ fn inject_text(sid: u64, text: &str) -> Result<(), String> {
                 "surface.send_key",
                 json!({"surface_id": sid, "key": "Return", "queued": true}),
             )?;
-            Ok(())
+            Ok(Sent::Typed) // the body was typed directly; only its Return waits in the queue
         }
         Err(e) => Err(e),
     }
@@ -20737,13 +20768,18 @@ fn inject_text_on(
     let wrapped = cys::paste_fence::wrap(text);
     // ★(0.14.42 · 통합 minor 정리) 좌석 밖 호출자(본부 CLI → 부서 데몬)는 권위 면제가 아니다 — 정착 증명 거부는 `cys send`
     //   와 같은 예산 안에서 다시 보낸다(종전: 재시도 없이 Err → `drain --verify` 가 '소켓 hung' 으로 오분류).
-    authoritative_paste_settled(
+    let r = authoritative_paste_settled(
         |p| request_on_timeout(socket, "surface.send_text", p, timeout),
         inject_params_with_sender(
             json!({"surface_id": sid, "text": wrapped, "quiet": true, "authoritative": true}),
             kind,
         ),
     )?;
+    // ★(0.14.56 · PKG1-M1 · head check Q3) a dept master converts it too: the queue job owns its CR - no gate check, no Return.
+    if r["converted"] == "one_job" {
+        eprintln!("{}", queued_inject_line(r["queue_entry_id"].as_str().unwrap_or("?"), sid));
+        return Ok(());
+    }
     std::thread::sleep(std::time::Duration::from_millis(800));
     gate_guard_check_on(socket, sid, timeout, "제출 Return(부서)")?;
     request_on_timeout(
@@ -23851,6 +23887,18 @@ enum Presence {
     Undetermined(String),
 }
 
+/// ★(0.14.56 · PKG-2 m3) A presence ping the daemon queued as one job (a master/CEO composer converts it) that the transcript has
+/// not seen yet is BUSY - queued, not delivered - not "undetermined". Pure. `Some(label)` only for (queued, NotSeen); every other
+/// fate keeps its meaning. Callers still type nothing.
+fn queued_ping_label(fate: &Result<PingFate, String>, queued: Option<&str>) -> Option<String> {
+    match (fate, queued) {
+        (Ok(PingFate::NotSeen), Some(id)) => Some(format!(
+            "ping queued as one job {id} (not delivered yet - the daemon types it at the seat's next idle prompt)"
+        )),
+        _ => None,
+    }
+}
+
 /// Bound of one presence ping (s) — phoenix's `reinject --check` window, so a pass over several unknown seats stays short.
 const PRESENCE_PING_TIMEOUT_SECS: u64 = 6;
 
@@ -23872,9 +23920,11 @@ fn directive_presence(sid: u64, timeout: u64) -> Presence {
         Ok(r) => r["latest_cursor"].as_u64().unwrap_or(0),
         Err(e) => return Presence::Undetermined(format!("screen cursor unreadable: {e}")),
     };
-    if let Err(e) = inject_text(sid, &reinject_ping_text(&nonce)) {
-        return Presence::Undetermined(format!("presence ping not delivered: {e}"));
-    }
+    let queued = match inject_text_sent(sid, &reinject_ping_text(&nonce)) {
+        Ok(Sent::Queued { entry_id }) => Some(entry_id),
+        Ok(Sent::Typed) => None,
+        Err(e) => return Presence::Undetermined(format!("presence ping not delivered: {e}")),
+    };
     match request(
         "surface.wait_for",
         json!({"surface_id": sid, "pattern": format!("DIRECTIVE-ACK-{nonce}"),
@@ -23885,6 +23935,9 @@ fn directive_presence(sid: u64, timeout: u64) -> Presence {
         Err(e) => eprintln!("[presence] surface:{sid} ACK wait failed ({e}) — reading the transcript"),
     }
     let fate = surface_entry(sid).and_then(|e| ping_fate_from_entry(&e, &nonce)).map(|(f, _)| f);
+    if let Some(busy) = queued_ping_label(&fate, queued.as_deref()) {
+        return Presence::Undetermined(busy); // ★(PKG-2 m3) busy, named - the caller still types nothing
+    }
     match reinject_check_action(&fate, false) {
         ReinjectCheckAction::AckInTranscript => Presence::Present,
         ReinjectCheckAction::Reinject => Presence::Absent,
@@ -23961,6 +24014,17 @@ fn reinject_claim_prune(dir: &std::path::Path, now: std::time::SystemTime) {
     }
 }
 
+/// ★(0.14.56 · PKG-2 m1) What `cys reinject` prints after the directive went out (pure, pinned by a specimen): a converted send is
+/// "queued as one job", not "reinjected".
+fn reinject_done_line(sent: &Sent, bytes: usize, sid: u64, role_name: &str) -> String {
+    match sent {
+        Sent::Typed => format!("reinjected {bytes} bytes → surface:{sid} ({role_name})"),
+        Sent::Queued { entry_id } => format!(
+            "queued as one job {entry_id} ({bytes} bytes) → surface:{sid} ({role_name}) - the daemon types it with its own Return"
+        ),
+    }
+}
+
 fn run_reinject(
     role: Option<String>,
     surface: Option<String>,
@@ -24001,8 +24065,14 @@ fn run_reinject(
                 .unwrap_or(0);
             // ★(B-360 R2 revise · S63) an UNKNOWN ping may still land: the ACK wait and the transcript read still run —
             //   ACK → alive (0); anything else → the existing 91, never a re-inject (the ping itself is unresolved)
-            let ping_unknown = match inject_text(sid, &reinject_ping_text(&nonce)) {
-                Ok(()) => None,
+            let mut ping_queued: Option<String> = None;
+            let ping_unknown = match inject_text_sent(sid, &reinject_ping_text(&nonce)) {
+                Ok(sent) => {
+                    if let Sent::Queued { entry_id } = sent {
+                        ping_queued = Some(entry_id);
+                    }
+                    None
+                }
                 Err(e) if is_write_outcome_unknown(&e) => {
                     eprintln!("[reinject] presence ping outcome unknown (it may still land — not re-sent) — waiting for the ACK: {e}");
                     Some(e)
@@ -24041,6 +24111,11 @@ fn run_reinject(
                 Err(e) => e.clone(),
             };
             eprintln!("[reinject] ACK 없음 ({timeout}s) — 핑 배달 판정(세션 기록): {fate_label}");
+            // ★(0.14.56 · PKG-2 m3) a queued ping that has not been delivered yet: busy, named (rc 0, nothing re-injected).
+            if let Some(busy) = queued_ping_label(&fate, ping_queued.as_deref()) {
+                println!("재주입 보류({busy}) — surface:{sid} ({role_name}) · 배달 전의 핑을 '미배달'로 읽지 않는다(폭주 차단)");
+                return Ok(());
+            }
             if let Some(e) = ping_unknown {
                 // ★(B-360 R2 revise · S63) no ACK after an UNKNOWN ping: not re-injected (no claim consumed) — 91
                 eprintln!("[reinject] the ping's outcome is unknown and no ACK came — nothing re-injected (surface:{sid})");
@@ -24101,12 +24176,9 @@ fn run_reinject(
         }
         let directive = compose_directive(&role_name)
             .map_err(|e| reinject_claim_exhausted_hint(e, reinject_claim_consumed))?;
-        inject_text(sid, &directive)
+        let sent = inject_text_sent(sid, &directive)
             .map_err(|e| reinject_claim_exhausted_hint(e, reinject_claim_consumed))?;
-        println!(
-            "reinjected {} bytes → surface:{sid} ({role_name})",
-            directive.len()
-        );
+        println!("{}", reinject_done_line(&sent, directive.len(), sid, &role_name));
         Ok(())
     })();
     match result {
@@ -33374,7 +33446,10 @@ mod tests {
             !prod.contains("format!(\"\\x1b[200~{text}"),
             "손수 만든 울타리 봉투가 남았다 — cys::paste_fence::wrap 을 써라"
         );
-        for f in ["fn inject_text(", "fn inject_text_on("] {
+        // ★(0.14.56 · PKG1-M1) the body moved to `inject_text_sent`; `inject_text` stays its pure delegation (one choke point).
+        let del = prod.split("fn inject_text(sid: u64, text: &str) -> Result<(), String> {").nth(1).expect("inject_text 소실");
+        assert_eq!(del[..del.find("\n}\n").expect("함수 끝")].trim(), "inject_text_sent(sid, text).map(|_| ())", "inject_text 는 순수 위임");
+        for f in ["fn inject_text_sent(", "fn inject_text_on("] {
             let body = prod.split(f).nth(1).unwrap_or_else(|| panic!("{f} 소실"));
             let body = &body[..body.find("\n}\n").expect("함수 끝")];
             assert!(body.contains("cys::paste_fence::wrap(text)"), "{f} 가 lib wrap 을 거치지 않는다");
@@ -33936,7 +34011,7 @@ mod tests {
     fn injection_hold_is_never_discarded_silently_source_pin() {
         let src = include_str!("cys.rs");
         let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계")];
-        let discarded = prod.matches("let _ = inject_text(").count();
+        let discarded = prod.matches("let _ = inject_text(").count() + prod.matches("let _ = inject_text_sent(").count();
         assert_eq!(
             discarded, 0,
             "주입 결과를 통째로 버리는 지점이 {discarded}곳 남았다 — 관문 Hold 처방이 \
@@ -33951,8 +34026,11 @@ mod tests {
         //   브로드캐스트 · 부트 주입 직후 · 팩 업데이트 재주입.
         // ★(B-360 R2 revise · area P) 동결값 3 → 4: `directive_presence` 의 존재 확인 핑이 네 번째 지점이다 — 그 Err 는
         //   버려지지 않고 `Presence::Undetermined("presence ping not delivered: {e}")` 로 호출부 문안에 실린다(침묵 0).
+        // ★(0.14.56 · PKG1-M1 · PKG-2 m3) the fourth site (`directive_presence`) now matches `inject_text_sent` (it needs to know
+        //   whether the ping was queued); its Err still becomes `Presence::Undetermined("presence ping not delivered: {e}")`.
         assert_eq!(
-            prod.matches("if let Err(e) = inject_text(").count(),
+            prod.matches("if let Err(e) = inject_text(").count()
+                + prod.matches("Err(e) => return Presence::Undetermined(format!(\"presence ping not delivered: {e}\")),").count(),
             4,
             "주입 사유를 남기는 지점 수가 동결값(4)을 벗어났다 — 줄었다면 침묵이 되살아난 것이다"
         );
@@ -34962,7 +35040,7 @@ mod tests {
     fn inject_gate_guard_is_wired_inside_the_single_choke_point_source_pin() {
         let src = include_str!("cys.rs");
         // ⓐ 두 전송 지점(붙여넣기·제출 Return) 앞에 각각 가드가 있다.
-        let ii = src.find("fn inject_text(sid: u64").expect("inject_text 가 사라졌다");
+        let ii = src.find("fn inject_text_sent(sid: u64").expect("inject_text_sent 가 사라졌다");
         let iend = src[ii..].find("\n/// \"90s\"").map(|e| ii + e).unwrap_or(src.len());
         let body = &src[ii..iend];
         assert_eq!(
@@ -39064,6 +39142,24 @@ mod tests {
         assert!(!calls.iter().any(|(m, _)| m == "surface.send_key"), "a converted directive owns its CR - no Return: {calls:?}");
     }
 
+    /// ★(0.14.56 · PKG-2 m1/m3 · pure halves; added with the fix, no pre-fix RED - the functions did not exist) The labels say what
+    /// happened: a converted directive is "queued as one job", not "reinjected"; a queued ping not seen yet is busy and named, and
+    /// every other ping fate keeps its meaning.
+    #[test]
+    fn pkg1_queued_labels_say_what_happened() {
+        assert_eq!(reinject_done_line(&Sent::Typed, 9, 7, "master"), "reinjected 9 bytes → surface:7 (master)");
+        let q = reinject_done_line(&Sent::Queued { entry_id: "q-1".into() }, 9, 7, "master");
+        assert!(q.starts_with("queued as one job q-1 (9 bytes) → surface:7 (master)"), "{q}");
+        assert!(queued_inject_line("q-1", 7).starts_with("[inject] queued as one job q-1 -> surface:7"), "{}", queued_inject_line("q-1", 7));
+        assert_eq!(queued_ping_label(&Ok(PingFate::NotSeen), None), None, "a typed ping keeps NotSeen's meaning");
+        let busy = queued_ping_label(&Ok(PingFate::NotSeen), Some("q-1"));
+        assert!(busy.as_deref().is_some_and(|l| l.contains("queued as one job q-1")), "{busy:?}");
+        for f in [PingFate::Acked, PingFate::QueuedInAgent, PingFate::ReceivedNoAck, PingFate::ReceivedPending] {
+            assert_eq!(queued_ping_label(&Ok(f), Some("q-1")), None, "a seen ping keeps its meaning");
+        }
+        assert_eq!(queued_ping_label(&Err("unreadable".into()), Some("q-1")), None);
+    }
+
     // ───────── ★(0.14.43 · J3) pane 밖에서 보낸 메시지의 발신자 표기(`from=null` · "발신 unknown") ─────────
     //
     // 데몬은 검증 신원이 있으면 그것을 늘 우선하고(커널 peer → pane 조상 사슬) 없을 때만 요청의 `from` 을 본다. pane 밖 CLI 는 검증할 좌석이 없어 `from` 이
@@ -39326,7 +39422,7 @@ mod tests {
         let arm = arm.split("Command::SendKey").next().unwrap();
         assert!(arm.contains("let from = send_from_param("), "Send 의 from 이 라벨 판정을 거치지 않는다");
         assert_eq!(arm.matches("\"from\": from,").count(), 2, "직접 요청과 큐 전환 폴백이 같은 from 값을 쓰지 않는다");
-        let it = item_body(src, "\nfn inject_text(sid: u64");
+        let it = item_body(src, "\nfn inject_text_sent(sid: u64");
         assert_eq!(it.matches("inject_params_with_sender(").count(), 1, "inject_text 의 라벨 래퍼는 직접 붙여넣기 요청 한 곳");
         assert!(it.contains("\"inject\","), "inject_text 의 kind 는 inject");
         assert!(it.contains("\"from\": \"inject(typing_guard fallback)\""), "타이핑 가드 폴백 라벨은 무변경");
@@ -41831,8 +41927,9 @@ mod tests {
         let body = refl_fn_body(include_str!("cys.rs"), "run_reinject");
         let compose_at = body.find("compose_directive(&role_name)\n")
             .expect("compose_directive 호출 소실");
-        let inject_at = body.find("inject_text(sid, &directive)\n")
-            .expect("inject_text 호출 소실");
+        // ★(0.14.56 · PKG-2 m1) the forced path calls `inject_text_sent` (it prints "queued as one job" for a converted send).
+        let inject_at = body.find("inject_text_sent(sid, &directive)\n")
+            .expect("inject_text_sent 호출 소실");
         assert!(compose_at < inject_at, "compose 가 inject 보다 앞이어야 한다");
         let hint_count = body.matches(".map_err(|e| reinject_claim_exhausted_hint(e, reinject_claim_consumed))?;").count();
         assert_eq!(hint_count, 2, "compose·inject 양쪽 모두 소진 힌트로 감싸야 한다: {hint_count}건");

@@ -2006,8 +2006,8 @@ fn no_spawn_reason(why: &str) -> &'static str {
     }
 }
 
-/// ★(0.14.42 · R3SH-3) 미룬 pane 통보 줄 1건.
-struct DeferredPaneNotice {
+/// ★(0.14.42 · R3SH-3) 미룬 pane 통보 줄 1건. ★(0.14.56 · PKG1-M1 m1) `pub(crate)` for `Daemon::pane_notice_requeue`.
+pub(crate) struct DeferredPaneNotice {
     intent: String,
     sid: u64,
     why: String,
@@ -2028,6 +2028,7 @@ fn pane_notice_hold(daemon: &Arc<Daemon>, s: &Arc<crate::state::Surface>) -> Opt
     let axes = crate::governance::MachineHoldAxes {
         pause: true,
         quiescing: true,
+        authoritative: true, // ★(0.14.56 · PKG1-M1 · design sec 3.5 W-7) deferred behind the cycle's queued [RESUME]
         human: true,
         modal: true,
         draft: true,
@@ -2039,9 +2040,15 @@ fn pane_notice_hold(daemon: &Arc<Daemon>, s: &Arc<crate::state::Surface>) -> Opt
 
 /// ★(R3SH-3) 순간 축인가 — 기다리면 스스로 풀린다(사람 입력 창 · 사이클 창 · kill-switch 해제). 모달·초안은 주입하지 않는
 /// 것이 설계 H5 의 목적이라 미루지 않고 생략한다.
+/// ★(0.14.56 · PKG1-M1) `Authoritative` is transient too (the queued [RESUME] is delivered by the next idle tick, bounded by the
+/// quiesce hold). Written as an exhaustive match (head check condition 3 - it was `matches!` until 77f66491), so a new variant
+/// must be classified here on purpose.
 fn pane_hold_is_transient(h: crate::governance::MachineHold) -> bool {
     use crate::governance::MachineHold as H;
-    matches!(h, H::HumanActive | H::Quiescing | H::Paused)
+    match h {
+        H::HumanActive | H::Quiescing | H::Paused | H::Authoritative => true,
+        H::ShellOnly | H::Modal | H::Draft | H::ProbeFailed => false,
+    }
 }
 
 /// pane 통보 줄 1건 쓰기 — ★원장 선기록이 주입보다 앞(delivery.rs 불변식 ① — dispatch_one 과 같은 순서).
@@ -2065,7 +2072,8 @@ fn pane_notice_line(
         crate::delivery::digest_text(&text),
     );
     let handle = request.clone();
-    let settle = NoticeSettle { daemon: Arc::downgrade(daemon), sid: s.id, ctx };
+    // ★(0.14.56 · PKG1-M1 m1) the settlement keeps the text and the claim guard, so a notice refused at its claim can be deferred.
+    let settle = NoticeSettle { daemon: Arc::downgrade(daemon), sid: s.id, ctx, text: text.clone(), d9: d9.clone() };
     let job = crate::agent_write::AgentJob {
         attempt: None,
         request,
@@ -2091,6 +2099,9 @@ struct NoticeCtx {
     why: String,
     /// A deferred notice written late (`retry_deferred_pane_notices`).
     late: bool,
+    /// ★(0.14.56 · PKG1-M1 m1) A deferred notice's deadline (kept if it is deferred again); `None` = a first notice
+    /// (now + [`PANE_NOTICE_DEFER_SECS`] when deferred).
+    until: Option<std::time::Instant>,
 }
 
 /// ★(0.14.52 · S-a C6c) Settlement of one supervisor pane notice (writer thread). Never retries, never writes again.
@@ -2098,13 +2109,15 @@ struct NoticeSettle {
     daemon: std::sync::Weak<Daemon>,
     sid: u64,
     ctx: NoticeCtx,
+    text: String,
+    d9: Option<crate::governance::D9WriterGuard>,
 }
 
 impl NoticeSettle {
     fn run(self, t: &crate::agent_write::Terminal) {
         use crate::agent_write::Terminal as T;
         let Some(daemon) = self.daemon.upgrade() else { return };
-        let NoticeCtx { intent, why, late } = self.ctx;
+        let NoticeCtx { intent, why, late, until } = self.ctx;
         let reason = match t {
             T::WrittenSubmitted { .. } => {
                 if late {
@@ -2115,6 +2128,37 @@ impl NoticeSettle {
                     );
                 }
                 return;
+            }
+            // ★(0.14.56 · PKG1-M1 m1 · HEAD-RULING-PKG1-R1.md sec 3) Refused at its master/CEO claim (a foreign write or input after
+            //   the hand-off, 0 bytes): the notice is not dropped - it goes back to the supervisor's deferred list within the
+            //   existing bounds (at most [`MAX_DEFERRED_PANE_NOTICES`], a late notice keeps its first deadline). Other refusals and
+            //   partial writes are skipped as before (never retyped).
+            T::RefusedNoWrite { reason }
+                if reason == crate::agent_write::GUARD_ABORTED && self.d9.as_ref().is_some_and(|g| !g.moved().is_empty()) =>
+            {
+                let until = until.unwrap_or_else(|| {
+                    std::time::Instant::now() + std::time::Duration::from_secs(PANE_NOTICE_DEFER_SECS)
+                });
+                let requeued = {
+                    let mut q = daemon.pane_notice_requeue.lock().unwrap_or_else(|e| e.into_inner());
+                    (q.len() < MAX_DEFERRED_PANE_NOTICES).then(|| {
+                        q.push(DeferredPaneNotice {
+                            intent: intent.clone(), sid: self.sid, why: why.clone(), text: self.text, until,
+                        })
+                    })
+                };
+                if requeued.is_some() {
+                    publish(
+                        &daemon,
+                        "boot_supervisor.pane_notice_deferred",
+                        json!({"intent": intent, "reason": "claim_refused", "surface_id": self.sid, "why": why,
+                               "defer_secs": until.saturating_duration_since(std::time::Instant::now()).as_secs(),
+                               "note": "the pane notice was refused at its claim (a write or input reached the seat after the \
+                                        hand-off, 0 bytes); it is deferred and retried - feed(bootstrap-fail) already holds the fact"}),
+                    );
+                    return;
+                }
+                "defer_full".to_string()
             }
             T::RefusedNoWrite { reason } => format!("refused_no_write:{reason}"),
             T::CancelledBeforeWrite => "refused_no_write:cancelled".to_string(),
@@ -2132,6 +2176,21 @@ impl NoticeSettle {
 /// ★(0.14.42 · R3SH-3) 미룬 pane 통보를 이번 틱에 다시 본다 — 순간 축이 풀렸으면 쓰고, 여전히 순간 축이면 수명 안에서
 /// 계속 미루고, 모달·초안이 되었거나 수명이 지났거나 좌석이 사라졌으면 생략 사실을 남긴다. 틱 pane 예산을 같이 쓴다.
 fn retry_deferred_pane_notices(daemon: &Arc<Daemon>, st: &mut SupState, pane_budget: &mut usize) {
+    // ★(0.14.56 · PKG1-M1 m1) notices refused at their claim (settlement, writer thread) join the deferred list here, within its
+    //   bound; overflow is skipped as `defer_full`.
+    let requeued = std::mem::take(&mut *daemon.pane_notice_requeue.lock().unwrap_or_else(|e| e.into_inner()));
+    for d in requeued {
+        if st.deferred_pane.len() < MAX_DEFERRED_PANE_NOTICES {
+            st.deferred_pane.push(d);
+        } else {
+            publish(
+                daemon,
+                "boot_supervisor.pane_notice_skipped",
+                json!({"intent": d.intent, "reason": "defer_full", "surface_id": d.sid, "why": d.why,
+                       "note": "a claim-refused pane notice found the deferred list full - feed(bootstrap-fail) already holds the fact"}),
+            );
+        }
+    }
     if st.deferred_pane.is_empty() {
         return;
     }
@@ -2153,7 +2212,7 @@ fn retry_deferred_pane_notices(daemon: &Arc<Daemon>, st: &mut SupState, pane_bud
             None if *pane_budget > 0 => {
                 *pane_budget -= 1;
                 // ★(0.14.52 · S-a C6c) `pane_notice_delivered_late` now comes from the settlement, after the written Return.
-                let ctx = NoticeCtx { intent: d.intent.clone(), why: d.why.clone(), late: true };
+                let ctx = NoticeCtx { intent: d.intent.clone(), why: d.why.clone(), late: true, until: Some(d.until) };
                 pane_notice_line(daemon, &s, d.text, ctx, d9);
             }
             None => st.deferred_pane.push(d),
@@ -2267,7 +2326,7 @@ fn notify_no_spawn(
                     );
                     return;
                 }
-                let ctx = NoticeCtx { intent: it.id.clone(), why: why.to_string(), late: false };
+                let ctx = NoticeCtx { intent: it.id.clone(), why: why.to_string(), late: false, until: None };
                 pane_notice_line(daemon, &s, text, ctx, d9);
             }
         }
@@ -6342,9 +6401,15 @@ mod d9_writer_guard_tests {
         daemon.bus.tail(400).into_iter().filter(|e| e["name"] == "boot_supervisor.pane_notice_skipped").collect()
     }
 
+    fn deferred(daemon: &Arc<Daemon>) -> Vec<serde_json::Value> {
+        daemon.bus.tail(400).into_iter().filter(|e| e["name"] == "boot_supervisor.pane_notice_deferred").collect()
+    }
+
     /// T-W4 / W-7: a write lands between the notice's hand-off and its claim -> the claim refuses, 0 bytes of the notice, and
-    /// the notice settles through its own zero-byte path (`pane_notice_skipped`, reason `refused_no_write:guard_aborted`, no
-    /// retry). With no foreign write the notice's bytes are the pin's exactly. Mutant: the notice keeps `guard: None`.
+    /// the notice settles through its own zero-byte path - ★(0.14.56 · PKG1-M1 m1) deferred (`pane_notice_deferred`, reason
+    /// `claim_refused`, into `Daemon::pane_notice_requeue`), no longer skipped (until 77f66491: `pane_notice_skipped`,
+    /// `refused_no_write:guard_aborted`). With no foreign write the notice's bytes are the pin's exactly. Mutant: the notice keeps
+    /// `guard: None`.
     #[test]
     #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
     fn d9_pre_cr_t_w4_boot_notice_refused_at_claim_writes_nothing() {
@@ -6352,7 +6417,7 @@ mod d9_writer_guard_tests {
         let mut recorder = crate::agent_queue_tests::p1_recorder(&f.daemon, &f.dir, "tw4-boot", Some("master"));
         recorder.install_always_admit();
         let s = recorder.surface.clone();
-        let ctx = || NoticeCtx { intent: "tw4".into(), why: "test".into(), late: false };
+        let ctx = || NoticeCtx { intent: "tw4".into(), why: "test".into(), late: false, until: None };
         let holder = crate::agent_queue_tests::p1_hold_writer(&s);
         s.write_tx.send(crate::state::WriteReq::Data(b"T".to_vec())).expect("foreign T admitted ahead of notice");
         let (_, terminal) = crate::agent_queue_tests::p1_supervisor_call(&s, || {
@@ -6364,9 +6429,10 @@ mod d9_writer_guard_tests {
         // The discriminating assertion first (a written notice follows the write ahead at once), then its settlement.
         assert_eq!(recorder.barrier(), b"T".to_vec(), "0 bytes of the notice - only the write ahead");
         crate::agent_queue_tests::p1_wait_completion(terminal, std::time::Duration::from_secs(60)).expect("tw4 supervisor settlement");
-        let sk = skipped(&f.daemon);
-        assert_eq!(sk.len(), 1, "{sk:?}");
-        assert_eq!(sk[0]["payload"]["reason"], serde_json::json!("refused_no_write:guard_aborted"), "{sk:?}");
+        let df = deferred(&f.daemon);
+        assert_eq!(df.len(), 1, "{df:?}");
+        assert_eq!(df[0]["payload"]["reason"], serde_json::json!("claim_refused"), "{df:?}");
+        assert!(skipped(&f.daemon).is_empty(), "m1: a claim-refused notice is deferred, not skipped");
         // No foreign write: the pin's bytes.
         let (_, terminal) = crate::agent_queue_tests::p1_supervisor_call(&s, || {
             pane_notice_line(&f.daemon, &s, "[boot] tw4b".into(), ctx(), crate::governance::D9WriterGuard::for_target(&f.daemon, &s))
@@ -6376,12 +6442,14 @@ mod d9_writer_guard_tests {
         want.extend(crate::agent_write::Plan::paste("[boot] tw4b").with_submit(120, 0).planned_bytes());
         let got = recorder.barrier();
         assert_eq!(got, want, "the pin's bytes after the refused notice");
-        assert_eq!(skipped(&f.daemon).len(), 1, "the second notice was skipped");
+        assert!(skipped(&f.daemon).is_empty(), "the second notice was written, nothing skipped");
+        assert_eq!(f.daemon.pane_notice_requeue.lock().unwrap().len(), 1, "the refused notice waits for the supervisor's retry");
     }
 
     /// T-S0 / W-7 (D3-BOUND r2 §1.5): S0 taken where the callers take it (before `pane_notice_hold` - pinned in governance h7),
     /// then a foreign write admitted after the notice's ledger pre-record and FINISHED before its hand-off -> the claim refuses:
-    /// 0 bytes of the notice, `pane_notice_skipped` reason `refused_no_write:guard_aborted`.
+    /// 0 bytes of the notice; ★(0.14.56 · PKG1-M1 m1) `pane_notice_deferred` reason `claim_refused` (until 77f66491:
+    /// `pane_notice_skipped` reason `refused_no_write:guard_aborted`).
     #[test]
     #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
     fn d9_bound_t_s0_boot_notice_refused_after_a_write_finished_inside_the_window() {
@@ -6389,7 +6457,7 @@ mod d9_writer_guard_tests {
         let mut recorder = crate::agent_queue_tests::p1_recorder(&f.daemon, &f.dir, "ts0-boot", Some("master"));
         recorder.install_always_admit();
         let s = recorder.surface.clone();
-        let ctx = NoticeCtx { intent: "ts0".into(), why: "test".into(), late: false };
+        let ctx = NoticeCtx { intent: "ts0".into(), why: "test".into(), late: false, until: None };
         let d9 = crate::governance::D9WriterGuard::for_target(&f.daemon, &s);
         {
             let s = s.clone();
@@ -6406,9 +6474,10 @@ mod d9_writer_guard_tests {
         // The discriminating assertion first (once the writer is idle the notice is written or refused), then its settlement.
         crate::agent_queue_tests::p1_wait_completion(terminal, std::time::Duration::from_secs(60)).expect("ts0 supervisor settlement");
         assert_eq!(recorder.barrier(), b"F".to_vec(), "0 bytes of the notice - only the foreign write");
-        let sk = skipped(&f.daemon);
-        assert_eq!(sk.len(), 1, "{sk:?}");
-        assert_eq!(sk[0]["payload"]["reason"], serde_json::json!("refused_no_write:guard_aborted"), "{sk:?}");
+        let df = deferred(&f.daemon);
+        assert_eq!(df.len(), 1, "{df:?}");
+        assert_eq!(df[0]["payload"]["reason"], serde_json::json!("claim_refused"), "{df:?}");
+        assert!(skipped(&f.daemon).is_empty(), "m1: a claim-refused notice is deferred, not skipped");
     }
 }
 
@@ -6477,7 +6546,7 @@ mod pkg1_auth_hold_tests {
         let mut recorder = crate::agent_queue_tests::p1_recorder(&f.daemon, &f.dir, "pkg1-s9", Some("master"));
         recorder.install_always_admit();
         let s = recorder.surface.clone();
-        let ctx = NoticeCtx { intent: "pkg1-s9".into(), why: "test".into(), late: false };
+        let ctx = NoticeCtx { intent: "pkg1-s9".into(), why: "test".into(), late: false, until: None };
         let d9 = crate::governance::D9WriterGuard::for_target(&f.daemon, &s);
         {
             let s = s.clone();

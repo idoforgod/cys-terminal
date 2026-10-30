@@ -6508,6 +6508,10 @@ pub(crate) enum MachineHold {
     Paused,
     /// 좌석이 사이클(`/clear`~RESUME) 창이다 — `agent_status.state=="quiescing"` ∧ 나이 < 상한.
     Quiescing,
+    /// ★(0.14.56 · PKG1-M1 · DESIGN-ADDENDUM-PKG1-M1.md sec 3.1) The seat's queue holds the cycle's converted authoritative job
+    /// ([RESUME] / directive), which must be the first machine input of the new session; bounded by the quiesce hold on the
+    /// OLDEST authoritative entry's age ([`authoritative_hold_age`]).
+    Authoritative,
     /// **양성 부재 증거**만(에이전트 종료 관측 ∨ SEAT Empty). Unknown(Windows 미도달 포함)은 아니다.
     ShellOnly,
     /// 사람 입력 흔적이 생산자가 준 창 안이다.
@@ -6527,6 +6531,7 @@ impl MachineHold {
         match self {
             Self::Paused => "pause",
             Self::Quiescing => "quiescing",
+            Self::Authoritative => "authoritative",
             Self::ShellOnly => "shell",
             Self::HumanActive => "human",
             Self::Modal => "modal",
@@ -6541,6 +6546,9 @@ impl MachineHold {
 pub(crate) struct MachineHoldAxes {
     pub(crate) pause: bool,
     pub(crate) quiescing: bool,
+    /// ★(0.14.56 · PKG1-M1) hold while the seat's queue holds an authoritative entry (no screen read). The queue tick and the
+    /// partial-write resume never request it - they deliver that very entry (head check condition 1).
+    pub(crate) authoritative: bool,
     pub(crate) shell: bool,
     pub(crate) human: bool,
     pub(crate) modal: bool,
@@ -6554,6 +6562,7 @@ impl MachineHoldAxes {
     pub(crate) const NONE: Self = Self {
         pause: false,
         quiescing: false,
+        authoritative: false,
         shell: false,
         human: false,
         modal: false,
@@ -6566,6 +6575,7 @@ impl MachineHoldAxes {
         Self {
             pause: self.pause && mask.pause,
             quiescing: self.quiescing && mask.quiescing,
+            authoritative: self.authoritative && mask.authoritative,
             shell: self.shell && mask.shell,
             human: self.human && mask.human,
             modal: self.modal && mask.modal,
@@ -6583,6 +6593,9 @@ pub(crate) struct MachineHoldInput {
     pub(crate) quiescing_age_secs: Option<f64>,
     /// quiescing 보류 상한(초) — [`queue_quiesce_hold_secs`]. 0 = 축 끔.
     pub(crate) quiesce_hold_secs: u64,
+    /// ★(0.14.56 · PKG1-M1) the age (s) of the OLDEST authoritative entry queued for the seat ([`authoritative_hold_age`]); `None`
+    /// = none queued. Bounded by the same `quiesce_hold_secs`.
+    pub(crate) auth_age_secs: Option<f64>,
     /// 양성 부재 증거(에이전트 종료 관측 ∨ SEAT Empty).
     pub(crate) shell_evidence: bool,
     /// 마지막 사람 입력 뒤 경과(초). 흔적 없음 = `None`.
@@ -6592,7 +6605,7 @@ pub(crate) struct MachineHoldInput {
 }
 
 /// ★H0 **순수 판정** — 첫 적중을 돌려준다. 순서(고정):
-/// `Paused → Quiescing → ShellOnly → HumanActive → Modal → Draft`.
+/// `Paused → Quiescing → Authoritative → ShellOnly → HumanActive → Modal → Draft`.
 /// 앞의 싼 축(메모리 원자값)이 먼저이고 화면 관측이 필요한 두 축이 끝이다 — IO 래퍼는 싼 축이 적중하면
 /// 화면을 보지 않는다(같은 판정을 두 번 부르는 것은 이 순서 덕분에 결과가 같다).
 pub(crate) fn machine_hold_verdict(i: &MachineHoldInput, ax: &MachineHoldAxes) -> Option<MachineHold> {
@@ -6601,6 +6614,9 @@ pub(crate) fn machine_hold_verdict(i: &MachineHoldInput, ax: &MachineHoldAxes) -
     }
     if ax.quiescing && quiesce_hold_active(i.quiescing_age_secs, i.quiesce_hold_secs) {
         return Some(MachineHold::Quiescing);
+    }
+    if ax.authoritative && quiesce_hold_active(i.auth_age_secs, i.quiesce_hold_secs) {
+        return Some(MachineHold::Authoritative);
     }
     if ax.shell && i.shell_evidence {
         return Some(MachineHold::ShellOnly);
@@ -6688,6 +6704,7 @@ pub(crate) fn hold_axes_default(windows: bool) -> MachineHoldAxes {
     MachineHoldAxes {
         pause: true,
         quiescing: true,
+        authoritative: true, // ★(0.14.56 · PKG1-M1) no screen observation, so on for both OSes
         shell: true,
         human: true,
         modal: true,
@@ -6714,6 +6731,7 @@ pub(crate) fn hold_axes_mask_from(raw: Option<&str>, windows: bool) -> MachineHo
         match t.as_str() {
             "pause" => m.pause = true,
             "quiescing" => m.quiescing = true,
+            "authoritative" => m.authoritative = true,
             "shell" => m.shell = true,
             "human" => m.human = true,
             "modal" => m.modal = true,
@@ -6797,6 +6815,86 @@ pub(crate) fn machine_direct_hold_masked(
             Some(MachineHold::ProbeFailed)
         }
     }
+}
+
+/// ★(0.14.56 · PKG1-M1 · DESIGN-ADDENDUM-PKG1-M1.md sec 3.1-3.4; head check Q1) The OLDEST authoritative entry queued for `s`
+/// and its age (s), or `None` when none is queued. The age is the daemon's MONOTONIC insertion age from the seat's book
+/// ([`crate::state::AuthBook`], written by [`note_authoritative_born`]) - a laptop sleep cannot age a live job past the bound,
+/// the same reason H1 measures quiescing monotonically. An entry with no book row (restored from the WAL after a restart) falls
+/// back to its wall-clock `enqueued_at`. Because the OLDEST entry governs, repeated cycles cannot extend the hold forever. When
+/// that age has reached the quiesce hold ([`queue_quiesce_hold_secs`], 0 = axis off) `queue.authoritative_hold_lapsed` is
+/// published ONCE per entry, lazily (the first probe that sees it). Locks: `pending_queue` then `auth_born`, each a leaf, never
+/// both at once; the event is published after both are released. The book is pruned to the ids still queued on every read.
+pub(crate) fn authoritative_hold_age(daemon: &Arc<Daemon>, s: &crate::state::Surface) -> Option<(String, f64)> {
+    let queued: Vec<(String, f64)> = s
+        .pending_queue
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|e| e.authoritative)
+        .map(|e| (e.id.clone(), e.enqueued_at))
+        .collect();
+    let (mono, wall, bound) = (crate::usage::ctx_guard_now(daemon), now_epoch(), queue_quiesce_hold_secs());
+    let (oldest, lapse) = {
+        let mut book = s.auth_born.lock().unwrap_or_else(|e| e.into_inner());
+        book.born.retain(|id, _| queued.iter().any(|(q, _)| q == id));
+        let (id, age, clock) = queued
+            .iter()
+            .map(|(id, at)| match book.born.get(id) {
+                Some(born) => (id.clone(), (mono - born).max(0.0), "mono"),
+                None => (id.clone(), wall - at, "wall"),
+            })
+            .max_by(|a, b| a.1.total_cmp(&b.1))?;
+        let lapsed = bound > 0 && !quiesce_hold_active(Some(age), bound);
+        let lapse = (lapsed && book.lapsed_reported.as_deref() != Some(id.as_str())).then(|| {
+            book.lapsed_reported = Some(id.clone());
+            clock
+        });
+        ((id, age), lapse)
+    };
+    if let Some(clock) = lapse {
+        daemon.bus.publish(
+            "queue.authoritative_hold_lapsed",
+            "queue",
+            Some(s.id),
+            json!({"surface_ref": cys::surface_ref(s.id), "queue_entry_id": oldest.0, "age_secs": oldest.1,
+                   "bound_secs": bound, "clock": clock,
+                   "note": "the cycle's authoritative job waited past the bound; machine producers take their old paths again \
+                            (the job stays queued)"}),
+        );
+    }
+    Some(oldest)
+}
+
+/// ★(0.14.56 · PKG1-M1 · design sec 3.2) Book the monotonic insertion time of the authoritative entry `id` just queued for `s`
+/// (the single production site that marks an entry authoritative - send_text, after the queue lock is released). Pruned to the
+/// ids still queued, so the book never outgrows the queue cap. Locks: `pending_queue` then `auth_born`, each a leaf.
+pub(crate) fn note_authoritative_born(daemon: &Daemon, s: &crate::state::Surface, id: &str) {
+    let queued: Vec<String> = s
+        .pending_queue
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|e| e.authoritative)
+        .map(|e| e.id.clone())
+        .collect();
+    let mono = crate::usage::ctx_guard_now(daemon);
+    let mut book = s.auth_born.lock().unwrap_or_else(|e| e.into_inner());
+    book.born.retain(|q, _| queued.contains(q));
+    if queued.iter().any(|q| q == id) {
+        book.born.insert(id.to_string(), mono);
+    }
+}
+
+/// ★(0.14.56 · PKG1-M1 · design sec 3.6; head check Q2) The authoritative entry a NON-cycle `clear_first` must wait for: the
+/// oldest one queued while the axis holds (the global mask keeps the off switch `CYS_MACHINE_INJECT_HOLD_AXES`, the bound
+/// `CYS_QUEUE_QUIESCE_HOLD_SECS`). `None` = nothing to wait for (none queued, lapsed, or the axis is off).
+pub(crate) fn authoritative_pending(daemon: &Arc<Daemon>, s: &crate::state::Surface) -> Option<String> {
+    if !hold_axes_mask_from(h_knob("CYS_MACHINE_INJECT_HOLD_AXES").as_deref(), cfg!(windows)).authoritative {
+        return None;
+    }
+    let (id, age) = authoritative_hold_age(daemon, s)?;
+    quiesce_hold_active(Some(age), queue_quiesce_hold_secs()).then_some(id)
 }
 
 /// ★(0.14.42 · R2NC-F3 · R3SH-4) quiescing 의 **실효** 판독 — 지금 quiescing 이면 그 시작 epoch, 아니면 None.
@@ -7098,6 +7196,8 @@ fn machine_hold_probe(
         paused: daemon.paused.load(Ordering::Relaxed),
         quiescing_age_secs,
         quiesce_hold_secs: queue_quiesce_hold_secs(),
+        // ★(0.14.56 · PKG1-M1) read only for a producer that asks for the axis (leaf lock order in `authoritative_hold_age`).
+        auth_age_secs: if axes.authoritative { authoritative_hold_age(daemon, s).map(|(_, age)| age) } else { None },
         shell_evidence: s.agent_exit_notified.load(Ordering::Relaxed)
             || SeatState::from_u8(s.seat_cache.load(Ordering::Relaxed)) == SeatState::Empty,
         human_idle_secs: s
@@ -10428,7 +10528,12 @@ impl D9Claim {
 /// The claim probe of a master/CEO queue job: the seat's own probe first, always (its observation stays as at the pin), then the
 /// three counters against the hand-off baseline. A write by a request queued ahead (`wrote`), any input received (`input_gen`)
 /// and any human key (`last_human_input`) since the hand-off refuse the claim: 0 bytes, the item stays at the head, the next
-/// tick re-judges on a fresh frame.
+/// tick re-judges on a fresh frame. That holds when the caller still owns the hand-off's cleanup (it rolls the hand-off back,
+/// `rollback_aborted_inject`, label `foreign_since_handoff`, no backoff). ★(0.14.56 · PKG1-M1 m5, head ruling 2026-10-31) When the
+/// guard's cleanup owner is the Controller (`InjectGuard::defer_to_controller`), `settle_queue_write` takes the zero-byte arm
+/// instead: a `Refused` hold with backoff (1, 2, 4, 8, 30 s) and `why: receiver_refused(guard_aborted)`. That case has NO production
+/// caller at this pin - the controller-owned bit is set only by `defer_to_controller`, called only from cfg(test) code - so it is
+/// left as it is (backlog B-493: align it with the caller-owned rollback when a production caller appears).
 fn d9_claim_probe(s: &Arc<crate::state::Surface>, claim: Arc<D9Claim>, inner: crate::state::SafetyProbe) -> crate::state::SafetyProbe {
     let ws = Arc::downgrade(s);
     Arc::new(move || {
@@ -33000,42 +33105,51 @@ mod h_machine_hold_tests {
     /// [H0 순수] 전 조합 진리표 — 첫 적중 순서 고정 · 마스크에서 끈 축은 무발화.
     #[test]
     fn h0_hold_verdict_truth_table() {
+        // ★(0.14.56 · PKG1-M1) seven axes: `Authoritative` sits right after `Quiescing` (index 2).
         let order = [
             MachineHold::Paused,
             MachineHold::Quiescing,
+            MachineHold::Authoritative,
             MachineHold::ShellOnly,
             MachineHold::HumanActive,
             MachineHold::Modal,
             MachineHold::Draft,
         ];
-        for bits in 0u32..64 {
+        for bits in 0u32..128 {
             let on = |i: u32| bits & (1 << i) != 0;
             let input = MachineHoldInput {
                 paused: on(0),
                 quiescing_age_secs: on(1).then_some(10.0),
                 quiesce_hold_secs: 600,
-                shell_evidence: on(2),
-                human_idle_secs: on(3).then_some(5),
-                modal: on(4),
-                draft: on(5),
+                auth_age_secs: on(2).then_some(10.0),
+                shell_evidence: on(3),
+                human_idle_secs: on(4).then_some(5),
+                modal: on(5),
+                draft: on(6),
             };
-            let expect = (0..6).find(|&i| on(i)).map(|i| order[i as usize]);
-            assert_eq!(machine_hold_verdict(&input, &all_axes(30)), expect, "bits={bits:06b}");
+            let expect = (0..7).find(|&i| on(i)).map(|i| order[i as usize]);
+            assert_eq!(machine_hold_verdict(&input, &all_axes(30)), expect, "bits={bits:07b}");
             // 한 축씩 끈 마스크 — 그 축은 절대 적중하지 않고, 나머지 순서는 그대로다.
-            for off in 0..6u32 {
+            for off in 0..7u32 {
                 let mut ax = all_axes(30);
                 match off {
                     0 => ax.pause = false,
                     1 => ax.quiescing = false,
-                    2 => ax.shell = false,
-                    3 => ax.human = false,
-                    4 => ax.modal = false,
+                    2 => ax.authoritative = false,
+                    3 => ax.shell = false,
+                    4 => ax.human = false,
+                    5 => ax.modal = false,
                     _ => ax.draft = false,
                 }
-                let expect = (0..6).filter(|&i| i != off).find(|&i| on(i)).map(|i| order[i as usize]);
-                assert_eq!(machine_hold_verdict(&input, &ax), expect, "bits={bits:06b} off={off}");
+                let expect = (0..7).filter(|&i| i != off).find(|&i| on(i)).map(|i| order[i as usize]);
+                assert_eq!(machine_hold_verdict(&input, &ax), expect, "bits={bits:07b} off={off}");
             }
         }
+        // ★(0.14.56 · PKG1-M1) the authoritative axis lapses at the same bound as quiescing (age >= hold = no hold; hold 0 = off).
+        let aged = |a: f64, hold: u64| MachineHoldInput { auth_age_secs: Some(a), quiesce_hold_secs: hold, ..Default::default() };
+        assert_eq!(machine_hold_verdict(&aged(599.9, 600), &all_axes(30)), Some(MachineHold::Authoritative));
+        assert_eq!(machine_hold_verdict(&aged(600.0, 600), &all_axes(30)), None, "the bound itself is past the hold");
+        assert_eq!(machine_hold_verdict(&aged(1.0, 0), &all_axes(30)), None, "hold 0 = axis off");
         // 사람 입력 창 — 창 밖(30s 이상)이면 무발화 · 창 0 이면 축 무발화.
         let mut i = MachineHoldInput { human_idle_secs: Some(30), ..Default::default() };
         assert_eq!(machine_hold_verdict(&i, &all_axes(30)), None, "창 경계(30s)는 창 밖이다");
@@ -33047,6 +33161,7 @@ mod h_machine_hold_tests {
             paused: true,
             quiescing_age_secs: Some(1.0),
             quiesce_hold_secs: 600,
+            auth_age_secs: Some(1.0),
             shell_evidence: true,
             human_idle_secs: Some(0),
             modal: true,
@@ -33055,7 +33170,7 @@ mod h_machine_hold_tests {
         assert_eq!(machine_hold_verdict(&loud, &MachineHoldAxes::NONE), None);
         // 축 이름(이벤트·결과 문자열의 어휘) 고정.
         let names: Vec<&str> = order.iter().map(|h| h.axis()).collect();
-        assert_eq!(names, ["pause", "quiescing", "shell", "human", "modal", "draft"]);
+        assert_eq!(names, ["pause", "quiescing", "authoritative", "shell", "human", "modal", "draft"]);
         assert_eq!(MachineHold::ProbeFailed.axis(), "probe_failed");
     }
 
@@ -33177,6 +33292,10 @@ mod h_machine_hold_tests {
             (true, true, false, false, true, false),
             "목록 = 그 축만 · 미지 토큰 무시"
         );
+        // ★(0.14.56 · PKG1-M1) the `authoritative` token, and the axis is on by default on both OSes (no screen read).
+        assert!(!m.authoritative, "not listed = off");
+        assert!(hold_axes_mask_from(Some("authoritative"), true).authoritative);
+        assert!(hold_axes_default(false).authoritative && hold_axes_default(true).authoritative);
         use MachineInjector::*;
         const ALL: [MachineInjector; 5] = [Schedule, Channel, Ceo, Supervisor, Takeover];
         for p in ALL {

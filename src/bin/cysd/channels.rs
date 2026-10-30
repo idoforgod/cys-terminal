@@ -1545,6 +1545,9 @@ impl InboxHold {
 /// (`governance::draft_machine_owned` — writer Inject 진행 표식)이 초안에서 뺀다 — 생산자 공통 규칙이다.
 fn channel_hold_axes() -> crate::governance::MachineHoldAxes {
     crate::governance::MachineHoldAxes {
+        // ★(0.14.56 · PKG1-M1 · design sec 3.5 W-6) the master's queue holds the cycle's converted [RESUME]: the row stays `new`
+        //   (InboxHold::Gate(Authoritative)) and a later sweep delivers it after the job.
+        authoritative: true,
         shell: true,
         human: true,
         modal: true,

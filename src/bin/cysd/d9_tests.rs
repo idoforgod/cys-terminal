@@ -1081,6 +1081,10 @@ fn d9_order_a8_in_seat_restore_directive_goes_first() {
 /// names it (the inversion is real: the direct send overtakes it). Mutant: back to `mine.first()` (queue order).
 #[test]
 fn d9_order_a9_order_inverted_names_the_oldest_entry_not_the_head_placed_one() {
+    // ★(0.14.56 · PKG1-M1 · head check Q2) With the `authoritative` hold axis on, this direct non-cycle clear_first ahead of a
+    //   queued [RESUME] is refused (`authoritative_pending`, specimen S8). The event's naming rule still applies when the axis is
+    //   off or lapsed, so this specimen switches ONLY that axis off (the mask lists every other axis).
+    let _axes = crate::governance::HKnobGuard::set(&[("CYS_MACHINE_INJECT_HOLD_AXES", "pause,quiescing,shell,human,modal,draft")]);
     for case in ["older_ordinary_behind", "only_head_placed"] {
         let fx = fx(&format!("ord-a9-{case}"));
         let m = master(&fx);

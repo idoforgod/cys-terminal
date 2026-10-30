@@ -2101,12 +2101,16 @@ fn deliver_push_with(
                 Some(H::Paused) => return Err(SCHEDULE_FROZEN_ERR.to_string()),
                 // ★(R3SH-1) 입증 못 한 기계 모양 초안 위에서 연속 우회 상한을 넘겼다 — 종전(pre-H) 직접 주입(유계 폴백).
                 Some(H::Draft) if draft_step == Some(DraftStep::Fallback) => {}
-                Some(h @ (H::Modal | H::Quiescing | H::HumanActive | H::Draft)) => {
+                Some(h @ (H::Modal | H::Quiescing | H::Authoritative | H::HumanActive | H::Draft)) => {
+                    // ★(0.14.56 · PKG1-M1 · head check condition 3) no wildcard arm: a new MachineHold variant must be routed here
+                    //   on purpose (the arm that existed until 77f66491 was `_ => "queued(gate:draft)"`).
                     let label = match h {
                         H::Modal => "queued(modal)",
                         H::Quiescing => "queued(gate:quiescing)",
+                        H::Authoritative => "queued(gate:authoritative)",
                         H::HumanActive => "queued(gate:human)",
-                        _ => "queued(gate:draft)",
+                        H::Draft => "queued(gate:draft)",
+                        H::Paused | H::ShellOnly | H::ProbeFailed => unreachable!("bound by the arm pattern above"),
                     };
                     let enqueued = enqueue_schedule_divert(
                         daemon,
@@ -2148,12 +2152,15 @@ fn deliver_push_with(
 /// (`CYS_QUEUE_HUMAN_QUIET_SECS` · 기본 30s). fresh 잡은 pause·모달만(갓 띄운 좌석 · 새 축 없음).
 fn schedule_hold_axes(fresh: bool) -> crate::governance::MachineHoldAxes {
     use crate::governance::MachineHoldAxes;
+    // ★(0.14.56 · PKG1-M1 · design sec 3.5 W-8) `authoritative` for fresh and non-fresh jobs alike: a push into a seat whose
+    //   queue holds the cycle's converted [RESUME] is diverted into that queue, FIFO behind the job.
     if fresh {
-        return MachineHoldAxes { pause: true, modal: true, ..MachineHoldAxes::NONE };
+        return MachineHoldAxes { pause: true, authoritative: true, modal: true, ..MachineHoldAxes::NONE };
     }
     MachineHoldAxes {
         pause: true,
         quiescing: true,
+        authoritative: true,
         human: true,
         modal: true,
         draft: true,
@@ -7830,7 +7837,8 @@ mod pkg1_auth_hold_tests {
         assert_eq!(ids.len(), 2, "no runaway: exactly one queue item for the held push: {ids:?}");
         assert_eq!(ids[0], resume, "the [RESUME] stays the head");
         pkg1_drain(daemon, &s, 4);
-        assert!(s.pending_queue.lock().unwrap().is_empty(), "no block: the held push was delivered without a human");
+        let story = crate::agent_queue_tests::pkg1_queue_story(daemon, &s);
+        assert!(s.pending_queue.lock().unwrap().is_empty(), "no block: the held push was delivered without a human: {story}");
         let bytes = d9_received(&out, 2);
         let _ = s.child.lock().unwrap().kill();
         let (r, p) = (pkg1_at(&bytes, "[RESUME] pkg1-s1"), pkg1_at(&bytes, "[wakeup] pkg1-s1"));
@@ -7852,13 +7860,15 @@ mod pkg1_auth_hold_tests {
         assert_eq!(deliver_push(daemon, &push_job("pkg1-s5a"), s.id, "[wakeup] pkg1-s5a", None), Ok("pushed"));
         assert_eq!(deliver_push(daemon, &push_job("pkg1-s5b"), s.id, "[wakeup] pkg1-s5b", None), Ok("pushed"));
         let bytes = d9_received(&out, 2);
+        let queued = s.pending_queue.lock().unwrap().len(); // read before the kill: a seat exit disposes its queue
+        let story = crate::agent_queue_tests::pkg1_queue_story(daemon, &s);
         let _ = s.child.lock().unwrap().kill();
         assert!(pkg1_at(&bytes, "[wakeup] pkg1-s5b").is_some(), "the producers resumed by their old path");
         let ev = pkg1_lapse_events(daemon, s.id);
         assert_eq!(ev.len(), 1, "exactly one lapse event per entry: {ev:?}");
         assert_eq!(ev[0]["payload"]["queue_entry_id"], json!(jammed), "{ev:?}");
         assert_eq!(ev[0]["payload"]["clock"], json!("wall"), "a restored entry has no monotonic record: {ev:?}");
-        assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "the jammed job is not dropped by the lapse");
+        assert_eq!(queued, 1, "the jammed job is not dropped by the lapse: {story}");
     }
 
     /// S5b: the OLDEST authoritative entry governs - a jammed old job (wall age 700 s) with a fresh step-7 job behind it still

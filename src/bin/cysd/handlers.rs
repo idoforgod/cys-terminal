@@ -3235,8 +3235,11 @@ const D9_TEXT_DENIED: &str = "a master/CEO composer accepts no control-only text
      send the TEXT: cys send --queued \"<text>\"";
 
 /// ★(P1 D9 · r3 §5-4) Refusal text for an untokened Return into a master/CEO composer.
+/// ★(0.14.56 · PKG1-M1 m2) It also says that a text this caller already sent with `cys send` is already one queued job that
+/// submits itself (every non-owner, non-human, non-clear send into this scope is converted), so the sender does not resend it.
 const D9_RETURN_DENIED: &str = "a Return into a master/CEO composer submits only a body its own sender queued, and this caller \
-     holds no live pair ticket (nothing was typed); send the TEXT: cys send --queued \"<text>\" - the job submits it";
+     holds no live pair ticket (nothing was typed). A text you already sent here with cys send is already one queued job that \
+     submits itself - do not resend it; for new text: cys send --queued \"<text>\" - the job submits it";
 
 // Frame-bound modal controls never associate a held body or consume a pair ticket.
 fn modal_frame_matches(frame: &Value, expected: u64) -> bool {
@@ -5350,11 +5353,15 @@ fn deliver_to_ceo(
     //   보지 않는다(H0 `draft_machine_owned`) — 0.5s 안 연속 결재 둘째 건이 첫 건 붙여넣기에 걸려 사람에게 가던 결함.
     if crate::governance::machine_hold_enabled(crate::governance::MachineInjector::Ceo) {
         use crate::governance::{MachineHold as H, MachineHoldAxes};
-        let axes = MachineHoldAxes { pause: true, quiescing: true, modal: true, draft: true, ..MachineHoldAxes::NONE };
+        // ★(0.14.56 · PKG1-M1 · head check Q4) `authoritative`: the CEO seat's queue holds the cycle's converted [RESUME] /
+        //   directive - the same escalation as a cycling seat (the item stays pending), reason `ceo_seat_resuming`.
+        let axes =
+            MachineHoldAxes { pause: true, quiescing: true, authoritative: true, modal: true, draft: true, ..MachineHoldAxes::NONE };
         if let Some(h) = crate::governance::machine_direct_hold(daemon, &surface, axes) {
             return CeoDelivery::Held(match h {
                 H::Paused => "delivery_frozen",
                 H::Quiescing => "ceo_seat_cycling",
+                H::Authoritative => "ceo_seat_resuming",
                 H::Modal => "ceo_seat_modal",
                 H::Draft => "ceo_seat_draft",
                 H::ProbeFailed => "ceo_probe_failed",
@@ -7087,6 +7094,27 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
             } else {
                 None
             };
+            // ★(0.14.56 · PKG1-M1 · design sec 3.6, head check Q2) While the seat's queue holds the cycle's converted authoritative
+            //   job, a NON-cycle clear_first from a non-owner, non-human caller would type ahead of it (it is never converted): refused
+            //   here, zero bytes. Exempt: the D4-valid cycle clear (a second cycle must not wedge), owner and human. Bounded by the
+            //   same lapse as the hold axis (`governance::authoritative_pending`).
+            if clear_first
+                && !cycle_clear
+                && !human
+                && governance::d9_scope(daemon, &surface, caller_is_owner(daemon, &params, verified_from))
+            {
+                if let Some(entry) = governance::authoritative_pending(daemon, &surface) {
+                    return Reply::Single(err_response(
+                        &id,
+                        "authoritative_pending",
+                        &format!(
+                            "zero bytes written: this master/CEO seat's queue holds the cycle's authoritative job {entry} (its \
+                             [RESUME]/directive must be the session's first input) and a clear_first would type ahead of it; send \
+                             with cys send --queued (it goes behind the job) or retry after it is delivered"
+                        ),
+                    ));
+                }
+            }
             // ★(0.14.42 · 설계 C D3) clear_first 는 원자 Inject(울타리)로 나간다 — 원장 선기록과 주입이 **같은
             //   살균 본문**을 쓰도록 여기서 한 번 살균한다(writer 백스톱과 같은 값 · 표지 없는 `/clear` 는 바이트
             //   동일 · 무clear 무변경). 직접 비-clear 경로는 원문 그대로다(울타리 판정은 아래 D5′).
@@ -7134,11 +7162,14 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
                 let (entry, depth) = {
                     let mut q = surface.pending_queue.lock().unwrap();
                     if q.len() >= 100 {
-                        return Reply::Single(err_response(
-                            &id,
-                            "queue_full",
-                            "pending queue cap (100) reached",
-                        ));
+                        // ★(0.14.56 · PKG1-M1 m4) the CLI matches the prefix; a converted send also says what happened to it.
+                        let msg = if converted {
+                            "pending queue cap (100) reached - this direct send to a master/CEO composer was converted to one \
+                             queue job; nothing was typed or queued"
+                        } else {
+                            "pending queue cap (100) reached"
+                        };
+                        return Reply::Single(err_response(&id, "queue_full", msg));
                     }
                     let mut entry = daemon.next_queue_entry(text.clone(), entry_from, "send");
                     entry.authoritative = authoritative;
@@ -7151,6 +7182,10 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
                     q.insert(at, entry.clone());
                     (entry, q.len())
                 };
+                // ★(0.14.56 · PKG1-M1 · design sec 3.2) the monotonic age book of the `authoritative` hold axis (leaf lock, queue released).
+                if authoritative {
+                    governance::note_authoritative_born(daemon, &surface, &entry.id);
+                }
                 // ★G1(W2-B): payload는 enqueue 3경로 공용 빌더(기존 키 bytes/depth/from 불변
                 // + queue_entry_id/seq/enqueued_at additive).
                 daemon.bus.publish(
@@ -33615,11 +33650,13 @@ mod pkg1_auth_hold_tests {
         assert!(held, "the CEO push must wait behind the queued [RESUME] (got {} bytes)", bytes.len());
         assert!(bytes.is_empty(), "zero bytes: {}", String::from_utf8_lossy(&bytes));
         route_auto_approval(&f.daemon, &item("pkg1s3b"), false);
+        let queued = s.pending_queue.lock().unwrap().len(); // read before the kill: a seat exit disposes its queue
+        let story = crate::agent_queue_tests::pkg1_queue_story(&f.daemon, &s);
         let _ = s.child.lock().unwrap().kill();
         let st: Vec<Value> = f.daemon.bus.tail(400).into_iter().filter(|e| e["name"] == "approval.stalled").collect();
         assert_eq!(st.len(), 1, "{st:?}");
         assert_eq!(st[0]["payload"]["reason"], json!("ceo_seat_resuming"), "{st:?}");
-        assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "the [RESUME] is still the only queued job");
+        assert_eq!(queued, 1, "the [RESUME] is still the only queued job: {story}");
     }
 }
 
