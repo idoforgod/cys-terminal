@@ -13,6 +13,12 @@ import unittest
 
 BIN = Path(os.environ.get('C03_TEST_BIN', Path(__file__).resolve().parents[1]))
 PYTHON = sys.executable
+# M5 (backlog D5W-20261029-M5-SKILLSCAN-POOL-NT-SERIAL): on Windows a spawn-pool worker under a managed scanner dies at
+# start (WinError 5 in spawn_main, diagnostic run 1; d2be23fe windows-build step 8 #1-#3), so these reap tests have no worker
+# to reap there. The product falls back to a serial scan; never_ready and worker_dying guard that path natively, and the skip
+# is void for a run in which either of them is not fully green (head ruling C3).
+_M5_SKIP = ('M5 D5W-20261029-M5-SKILLSCAN-POOL-NT-SERIAL: the spawn-pool worker dies at start under a managed scanner on '
+            'Windows; nothing to reap, the scan falls back to serial')
 
 
 def load(name):
@@ -22,12 +28,78 @@ def load(name):
     return module
 
 
-def alive(pid):
+ALIVE, DEAD, UNKNOWN = 'alive', 'dead', 'unknown'
+_SYNCHRONIZE = 0x00100000
+_TERMINATE_AND_QUERY = 0x0001 | 0x1000  # PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION
+_WAIT_OBJECT_0, _WAIT_TIMEOUT = 0, 258
+_ERROR_ACCESS_DENIED, _ERROR_INVALID_PARAMETER = 5, 87
+
+
+def _alive_for(pid, is_windows, api):
+    # Tri-state, so a presence check and an absence check both fail when the probe cannot decide. On nt
+    # os.kill(pid, 0) is no probe: any signal but CTRL_C/CTRL_BREAK calls TerminateProcess, and a gone pid raises
+    # WinError 87 (d2be23fe windows-build log :607-687). The nt rule is cysd's pid_alive (src/bin/cysd/state.rs
+    # :5142-5162 @af092542), except that what it folds into "alive" stays UNKNOWN here.
+    if is_windows:
+        handle = api.OpenProcess(_SYNCHRONIZE, False, pid)
+        if not handle:
+            return {_ERROR_INVALID_PARAMETER: DEAD, _ERROR_ACCESS_DENIED: ALIVE}.get(api.GetLastError(), UNKNOWN)
+        try:
+            wait = api.WaitForSingleObject(handle, 0)
+        finally:
+            api.CloseHandle(handle)
+        return {_WAIT_OBJECT_0: DEAD, _WAIT_TIMEOUT: ALIVE}.get(wait, UNKNOWN)
     try:
         os.kill(pid, 0)
-        return True
+        return ALIVE
     except ProcessLookupError:
-        return False
+        return DEAD
+
+
+def _kernel32():
+    import ctypes
+    from ctypes import wintypes as w
+    k = ctypes.WinDLL('kernel32', use_last_error=True)
+    k.OpenProcess.argtypes = [w.DWORD, w.BOOL, w.DWORD]
+    k.OpenProcess.restype = w.HANDLE
+    k.WaitForSingleObject.argtypes = [w.HANDLE, w.DWORD]
+    k.WaitForSingleObject.restype = w.DWORD
+    k.CloseHandle.argtypes = [w.HANDLE]
+    k.TerminateProcess.argtypes = [w.HANDLE, w.UINT]
+    k.GetProcessTimes.argtypes = [w.HANDLE] + [ctypes.POINTER(w.FILETIME)] * 4
+
+    class Api:
+        OpenProcess = staticmethod(k.OpenProcess)
+        WaitForSingleObject = staticmethod(k.WaitForSingleObject)
+        CloseHandle = staticmethod(k.CloseHandle)
+        TerminateProcess = staticmethod(k.TerminateProcess)
+        GetLastError = staticmethod(ctypes.get_last_error)
+
+        @staticmethod
+        def creation(handle):
+            times = [w.FILETIME() for _ in range(4)]
+            if not k.GetProcessTimes(handle, *[ctypes.byref(t) for t in times]):
+                return None
+            return times[0].dwHighDateTime << 32 | times[0].dwLowDateTime
+    return Api
+
+
+def alive_state(pid):
+    return _alive_for(pid, os.name == 'nt', _kernel32() if os.name == 'nt' else None)
+
+
+def _reap_identified_for(entries, api):
+    # nt reap of recorded pool workers: Windows reuses pids quickly and has no SIGKILL. Terminate a worker only while
+    # its creation time still equals the one it wrote itself; an unopenable or changed pid is left alone.
+    for pid, created in entries:
+        handle = api.OpenProcess(_TERMINATE_AND_QUERY, False, pid)
+        if not handle:
+            continue
+        try:
+            if api.creation(handle) == created:
+                api.TerminateProcess(handle, 125)
+        finally:
+            api.CloseHandle(handle)
 
 
 # marker() reads a pid the fixture publishes with os.replace. On Windows that read can hit a sharing race and raise
@@ -164,10 +236,16 @@ class OwnershipRegression(unittest.TestCase):
             stream.flush()
 
     def recorded_alive(self,pid):
+        # Tri-state like alive_state. On nt the retained handle answers (no pid reuse); a failed wait is UNKNOWN, never
+        # DEAD, so assert_gone cannot pass on it.
         if os.name == 'nt':
             import ctypes
-            return ctypes.windll.kernel32.WaitForSingleObject(self.handles[pid],0)==258
-        return alive(pid)
+            wait = ctypes.windll.kernel32.WaitForSingleObject(self.handles[pid],0)
+            return {_WAIT_OBJECT_0: DEAD, _WAIT_TIMEOUT: ALIVE}.get(wait, UNKNOWN)
+        return alive_state(pid)
+
+    def assert_alive(self, pid, msg):
+        self.assertEqual(self.recorded_alive(pid), ALIVE, msg)
 
     def stop_recorded(self,pid):
         if os.name == 'nt':
@@ -190,9 +268,9 @@ class OwnershipRegression(unittest.TestCase):
 
     def assert_gone(self, pid):
         end = time.monotonic() + 3
-        while self.recorded_alive(pid) and time.monotonic() < end:
+        while self.recorded_alive(pid) != DEAD and time.monotonic() < end:
             time.sleep(.02)
-        self.assertFalse(self.recorded_alive(pid), 'owned descendant survived parent death: %s' % pid)
+        self.assertEqual(self.recorded_alive(pid), DEAD, 'owned descendant survived parent death: %s' % pid)
 
     @unittest.skipUnless(os.name == 'posix', 'POSIX identity fixture; native Job fixtures below')
     def test_checklist_abrupt_death_closes_descendant(self):
@@ -214,6 +292,7 @@ class OwnershipRegression(unittest.TestCase):
         p.kill(); p.wait(timeout=3)  # wallclock: guard 3 s only ends a hang reaping the SIGKILLed driver; the verdict is assert_gone
         self.assert_gone(pid)
 
+    @unittest.skipIf(os.name == 'nt', _M5_SKIP)
     def test_scanner_then_preflight_death_reaches_spawn_worker(self):
         skill = self.root / 'skills' / 'sample'; skill.mkdir(parents=True)
         (skill / 'SKILL.md').write_text('# fixture')
@@ -424,7 +503,9 @@ Path(%r).write_text(str(r))
         child=self.root/'held_custom.py'
         code="import os,time;from pathlib import Path;_marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(os.getpid()));__import__('os').replace(_tmp,_marker);time.sleep(3600)" % str(self.root/'held-grandchild')
         # Every timed actor outlives the 60 s guard, so no natural exit can end the run inside it.
-        child.write_text("import os,subprocess,sys,time\nfrom pathlib import Path\n_marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(os.getpid()));os.replace(_tmp,_marker)\nsubprocess.Popen([sys.executable,'-B','-c',%r])\ntime.sleep(3600)\n" % (str(self.root/'held-child'),code))
+        # Holder spawned with stdin=DEVNULL: on nt that is what passes the std handles, so the holder really holds the
+        # output (an all-default Popen inherits none); the hook phases spawn this way too (_owned_process.py:494-496).
+        child.write_text("import os,subprocess,sys,time\nfrom pathlib import Path\n_marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(os.getpid()));os.replace(_tmp,_marker)\nsubprocess.Popen([sys.executable,'-B','-c',%r],stdin=subprocess.DEVNULL)\ntime.sleep(3600)\n" % (str(self.root/'held-child'),code))
         results=queue.Queue()
         # Start the tested timeout only after the real grandchild exists. This
         # isolates reap behavior from interpreter-start scheduling; startup
@@ -472,7 +553,9 @@ Path(%r).write_text(str(r))
         import _owned_process as owned
         script=self.root/'held.py'
         code="import os,time;from pathlib import Path;_marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(os.getpid()));__import__('os').replace(_tmp,_marker);time.sleep(3600)" % str(self.root/'drain-grandchild')
-        script.write_text("import os,sys,subprocess,time\nfrom pathlib import Path\nsys.path.insert(0,%r)\nfrom _owned_process import managed_main\ndef main():\n _marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(os.getpid()));os.replace(_tmp,_marker)\n subprocess.Popen([sys.executable,'-B','-c',%r])\n time.sleep(3600)\nmanaged_main(main)\n" % (str(BIN),str(self.root/'drain-leader'),code))
+        # Holder spawned with stdin=DEVNULL: on nt that is what passes the std handles, so the holder really holds the
+        # output (an all-default Popen inherits none); the hook phases spawn this way too (_owned_process.py:494-496).
+        script.write_text("import os,sys,subprocess,time\nfrom pathlib import Path\nsys.path.insert(0,%r)\nfrom _owned_process import managed_main\ndef main():\n _marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(os.getpid()));os.replace(_tmp,_marker)\n subprocess.Popen([sys.executable,'-B','-c',%r],stdin=subprocess.DEVNULL)\n time.sleep(3600)\nmanaged_main(main)\n" % (str(BIN),str(self.root/'drain-leader'),code))
         results=queue.Queue()
         # As in the checklist held-output test: the timeout starts once the
         # output-holding grandchild exists. The leader and the grandchild both
@@ -501,22 +584,43 @@ Path(%r).write_text(str(r))
         whole grace). The output holder publishes its pid as <name>; returns (returned, RESULT dict, output)."""
         script = self.root/'fa_driver.py'
         script.write_text(_FA_DRIVER % {'bin': str(BIN), 'arm': arm, 'launch': launch, 'timeout': timeout})
-        out_f = open(self.root/'fa.out', 'w')
-        p = subprocess.Popen([PYTHON, '-B', str(script)], stdout=out_f, stderr=subprocess.STDOUT,
-                             start_new_session=(os.name == 'posix'))
-        self.children.append(p)
-        self.marker(name)
-        try:
-            p.wait(timeout=60)  # wallclock: guard 60 s only ends a hang; the old bytes spend the 600 s grace, the verdict is that run_owned returned
-            returned = True
-        except subprocess.TimeoutExpired:
-            returned = False
-            if os.name == 'posix':
-                os.killpg(p.pid, signal.SIGKILL)
-        out_f.close()
+        # The with closes the test's own handle even when marker() fails; Windows cannot remove an open file.
+        with open(self.root/'fa.out', 'w') as out_f:
+            p = subprocess.Popen([PYTHON, '-B', str(script)], stdout=out_f, stderr=subprocess.STDOUT,
+                                 start_new_session=(os.name == 'posix'))
+            self.children.append(p)
+            self.marker(name)
+            try:
+                p.wait(timeout=60)  # wallclock: guard 60 s only ends a hang; the old bytes spend the 600 s grace, the verdict is that run_owned returned
+                returned = True
+            except subprocess.TimeoutExpired:
+                returned = False
+                if os.name == 'posix':
+                    os.killpg(p.pid, signal.SIGKILL)
         out = (self.root/'fa.out').read_text()
         result = [json.loads(l[7:]) for l in out.splitlines() if l.startswith('RESULT ')]
         return returned, (result[0] if result else None), out
+
+    def test_run_fa_closes_its_output_file_when_the_holder_never_starts(self):
+        # d2be23fe windows-build: the holder never started, marker() raised, and run_fa kept fa.out open, so tearDown's
+        # rmtree failed with WinError 32 (log :588-604; the ResourceWarning for fa.out came after the E, log :544).
+        from unittest.mock import patch
+        class Driver:
+            stdin = stdout = stderr = None
+            def poll(self): return 0
+            def kill(self): pass
+            def wait(self, timeout=None): return 0
+        handed = []
+        def popen(args, **kw):
+            handed.append(kw['stdout'])
+            return Driver()
+        def never_started(name):
+            self.fail('fixture never started: ' + name)
+        with patch.object(subprocess, 'Popen', popen), patch.object(self, 'marker', never_started), \
+                self.assertRaises(self.failureException):
+            self.run_fa([PYTHON, '-c', 'pass'], 1, '', 'fa-x')
+        self.assertEqual(len(handed), 1)
+        self.assertTrue(handed[0].closed, 'run_fa left its output file open after the holder failed to start')
 
     @unittest.skipUnless(os.name == 'posix', 'POSIX setsid twin of the nt held-output stall; on nt that is the held-output checklist test')
     def test_cooperative_window_ends_when_the_leader_is_gone(self):
@@ -535,11 +639,73 @@ Path(%r).write_text(str(r))
         # F-A2: the leader crashes (control closed without DONE) while a grandchild keeps the output open.
         code = "import os,time;from pathlib import Path;_marker=Path(%r);_tmp=_marker.with_name(_marker.name+'.tmp');_tmp.write_text(str(os.getpid()));os.replace(_tmp,_marker);time.sleep(3600)" % str(self.root/'fa2-holder')
         script = self.root/'fa2_leader.py'
-        script.write_text("import os,subprocess,sys,time\nfrom pathlib import Path\nsys.path.insert(0,%r)\nfrom _owned_process import managed_main\ndef main():\n subprocess.Popen([sys.executable,'-B','-c',%r])\n while not Path(%r).exists(): time.sleep(.01)\n os._exit(3)\nmanaged_main(main)\n" % (str(BIN), code, str(self.root/'fa2-holder')))
+        # Holder spawned with stdin=DEVNULL: on nt that is what passes the std handles, so the holder really holds the
+        # output (an all-default Popen inherits none); the hook phases spawn this way too (_owned_process.py:494-496).
+        script.write_text("import os,subprocess,sys,time\nfrom pathlib import Path\nsys.path.insert(0,%r)\nfrom _owned_process import managed_main\ndef main():\n subprocess.Popen([sys.executable,'-B','-c',%r],stdin=subprocess.DEVNULL)\n while not Path(%r).exists(): time.sleep(.01)\n os._exit(3)\nmanaged_main(main)\n" % (str(BIN), code, str(self.root/'fa2-holder')))
         returned, result, out = self.run_fa([PYTHON, '-B', str(script)], 30, '', 'fa2-holder')
         self.assertTrue(returned, 'cooperative window outlived a crashed leader (grace 600 s): %r' % out[-400:])
         self.assertIn('control closed without DONE', (result or {}).get('reason', ''), out[-400:])
         self.assertFalse(result['complete'], result)
+
+    def test_managed_leader_runs_a_preflight_shaped_child(self):
+        # Product shape (head ruling C4): managed preflight runs its checks as javis_preflight.py:5333 @af092542 does -
+        # subprocess.run([sys.executable, "-c", ...], capture_output=True, timeout=60) with no stdin argument, as 39 of
+        # its 39 calls do - so the child inherits the managed leader's lifeline stdin. Hypothesis H1 (FIX-PLAN-d2be23fe
+        # 2.2): on nt that child may stall until its timeout. Verdict: no TimeoutExpired, rc 0, marker present. Elapsed
+        # is recorded, not asserted.
+        sys.path.insert(0,str(BIN));import _owned_process as owned
+        marker=self.root/'a1-child'
+        code="import os;from pathlib import Path;Path(%r).write_text(str(os.getpid()));raise SystemExit(0)" % str(marker)
+        leader=self.root/'a1_leader.py'
+        leader.write_text("import json,subprocess,sys,time\nsys.path.insert(0,%r)\nfrom _owned_process import managed_main\n"
+                          "def main():\n pre={}\n if sys.platform=='win32':\n"
+                          "  import os,msvcrt,ctypes,_owned_process as owned\n"
+                          "  k=ctypes.WinDLL('kernel32',use_last_error=True);k.GetStdHandle.argtypes=[ctypes.c_ulong];k.GetStdHandle.restype=ctypes.c_void_p\n"
+                          "  pre={'stdin_null':os.read(0,1)==b'','std_handle_matches':k.GetStdHandle(4294967286)==msvcrt.get_osfhandle(0),'private_noninheritable':not os.get_inheritable(owned._CONTEXT._lifeline_fd)}\n"
+                          " t=time.monotonic()\n try:\n"
+                          "  r=subprocess.run([sys.executable,'-c',%r],capture_output=True,timeout=60)\n"
+                          "  out={'rc':r.returncode,'timeout':False}\n except subprocess.TimeoutExpired:\n"
+                          "  out={'rc':None,'timeout':True}\n out['elapsed_ms']=int((time.monotonic()-t)*1000)\n"
+                          " out.update(pre)\n print('A1 '+json.dumps(out),flush=True)\nmanaged_main(main)\n" % (str(BIN),code))
+        result=owned.run_owned([PYTHON,'-B',str(leader)],90)  # wallclock: guard 90 s only ends a hang; the child's own timeout=60 is the H1 signal and its verdict is no timeout, rc 0 and the marker
+        lines=[l for l in result['stdout'].splitlines() if l.startswith('A1 ')]
+        self.assertEqual(len(lines),1,result)
+        a1=json.loads(lines[0][3:])
+        sys.stderr.write('\nC03-A1 %s\n' % json.dumps(a1));sys.stderr.flush()
+        self.assertFalse(a1['timeout'],'H1: a child inheriting the managed lifeline stdin stalled to its timeout: %r' % a1)
+        self.assertEqual(a1['rc'],0,a1)
+        self.assertTrue(marker.exists(),'the child never ran its first statement: %r' % a1)
+        if os.name == 'nt':
+            for key in ('stdin_null', 'std_handle_matches', 'private_noninheritable'):
+                self.assertIs(a1[key], True, (key, a1))
+
+
+    @unittest.skipUnless(os.name == 'nt', 'H1 native Windows handle/EOF witness')
+    def test_windows_managed_stdin_and_worker_transport_keep_owner_eof(self):
+        # Only this direct child is launched. Its self-stop is replaced with observations; no fleet process or Job.
+        # Real Managed/worker_observer read real private pipes. Existing parent-death tests retain the kill proof.
+        pre, post = self.root/'h1-pre.json', self.root/'h1-post.json'
+        script = self.root/'h1_native.py'
+        script.write_text(_H1_NATIVE % {'bin':str(BIN), 'pre':str(pre), 'post':str(post)})
+        p = subprocess.Popen([PYTHON, '-B', str(script)], stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.children.append(p)
+        p.stdin.write(b'G'); p.stdin.flush()
+        end = time.monotonic()+10
+        while not pre.exists() and p.poll() is None and time.monotonic()<end:  # wallclock: guard 10 s ends a native setup hang
+            time.sleep(.01)
+        # Release the known fixture input before any assertion, even on a failed publication.
+        p.stdin.close(); p.stdin=None
+        out, err = p.communicate(timeout=10)  # wallclock: guard 10 s ends a native EOF-observation hang
+        self.assertEqual(p.returncode, 0, err)
+        self.assertTrue(pre.exists() and post.exists(), (out,err))
+        before, after = json.loads(pre.read_text()), json.loads(post.read_text())
+        expected={'stdin_null':True,'std_handle_matches':True,'private_noninheritable':True,
+                  'watcher_before_close':False,'worker_before_close':False}
+        self.assertEqual(before, expected)
+        self.assertEqual(after, {'owner_eof_observed':True,'worker_eof_observed':True})
+        witness=dict(before,**after)
+        sys.stderr.write('\nC03-H1-NATIVE '+json.dumps(witness)+'\n');sys.stderr.flush()
 
     @unittest.skipUnless(os.name == 'posix', 'hand-rolled POSIX lifeline leader')
     def test_cooperating_leader_finishes_inside_the_grace(self):
@@ -708,7 +874,7 @@ def record(*a,**kw):
  marker=Path(%r);tmp=marker.with_suffix('.tmp');tmp.write_text(str(p.pid));os.replace(tmp,marker)
  return p
 owned.subprocess.Popen=record
-print(json.dumps(owned.run_owned([sys.executable,'-B',%r],2,force=.3)),flush=True)
+print(json.dumps({k:v for k,v in owned.run_owned([sys.executable,'-B',%r],2,force=.3).items() if not isinstance(v,bytes)}),flush=True)
 """%(str(BIN),str(marker),str(self.root/'denied-target.py')))
         (self.root/'denied-target.py').write_text("import sys,threading\nsys.path.insert(0,%r)\nimport _owned_process as owned\nowned._self_stop=lambda group:threading.Event().wait()\nowned.managed_main(lambda:0)\n"%str(BIN))
         p=subprocess.Popen([str(sandbox),'-p','(version 1)(allow default)(deny signal)',PYTHON,'-B',str(script)],
@@ -722,7 +888,7 @@ print(json.dumps(owned.run_owned([sys.executable,'-B',%r],2,force=.3)),flush=Tru
             self.assertFalse(result['complete'],result)
             self.assertEqual(result['cleanup'],'unknown',result)
             self.assertIn('Operation not permitted',result['reason'])
-            self.assertTrue(self.recorded_alive(pid),'permission denial did not leave a live child')
+            self.assert_alive(pid,'permission denial did not leave a live child')
         finally:
             # Outside the process-scoped sandbox: only this recorded fixture.
             try:self.stop_recorded(pid)
@@ -860,8 +1026,9 @@ print(json.dumps(owned.run_owned([sys.executable,'-B',%r],2,force=.3)),flush=Tru
         child_pid=self.marker('owned-child');sibling_pid=self.marker('unrelated')
         parent.kill();parent.wait(timeout=60)  # wallclock: guard 60 s only ends a hang reaping the killed parent; the verdict is assert_gone and the sibling alive
         self.assert_gone(child_pid)
-        self.assertTrue(self.recorded_alive(sibling_pid),'outside sibling was put in the owned Job')
+        self.assert_alive(sibling_pid,'outside sibling was put in the owned Job')
 
+    @unittest.skipIf(os.name == 'nt', _M5_SKIP)
     def test_scanner_death_alone_reaps_spawn_worker(self):
         skill = self.root / 'skills' / 'sample'; skill.mkdir(parents=True)
         (skill / 'SKILL.md').write_text('# fixture')
@@ -914,6 +1081,7 @@ if __name__=='__main__':
         self.assert_gone(child)
         self.assertIsNone(sibling.poll())
 
+    @unittest.skipIf(os.name == 'nt', _M5_SKIP)
     def test_checklist_deadline_cleans_scanner_and_spawn_pool(self):
         skill=self.root/'skills'/'sample';skill.mkdir(parents=True);(skill/'SKILL.md').write_text('# fixture')
         scanner=self.root/'scan_deadline.py'
@@ -980,7 +1148,7 @@ if __name__=='__main__':
         bash = os.environ.get('C03_TEST_BASH') or (shutil.which('bash') if os.name == 'posix' else None)
         if not bash:
             self.skipTest('no bash (on nt: C03_TEST_BASH, the bundled Git bash)')
-        lines = (Path(__file__).resolve().parents[2]/'hooks'/'inject-context.sh').read_text().splitlines()
+        lines = (Path(__file__).resolve().parents[2]/'hooks'/'inject-context.sh').read_text(encoding='utf-8').splitlines()
         src = [i for i, l in enumerate(lines) if l.startswith('. "') and l.endswith('/_lib.sh" 2>/dev/null \\')]
         self.assertTrue(src, 'the first _lib.sh source line was not found')
         i = src[0]
@@ -1055,6 +1223,165 @@ if __name__=='__main__':
         p, mark = self.run_backslash_hook()
         self.assertIn('C03-ISOLATED-STATE', p.stdout, p.stderr[-400:])
         self.assertTrue(mark.exists(), 'the --phase body looked for inject_gate.py beside the cwd, not beside the hook')
+
+    def crlf_env(self):
+        """H-WIN-17 specimens: an env whose text-mode Python stdio writes LF as CR LF (Windows' premise). POSIX gets
+        the _CRLF_SITECUSTOMIZE emulation plus its argv log; on nt the premise is native and an embeddable runtime
+        ignores PYTHONPATH, so nothing is added there."""
+        if os.name == 'posix':
+            home = self.root/'home'; home.mkdir(exist_ok=True)
+            emu = self.root/'crlf-emu'; emu.mkdir(exist_ok=True)
+            (emu/'sitecustomize.py').write_text(_CRLF_SITECUSTOMIZE)
+            return {'PATH': '/usr/bin:/bin', 'HOME': str(home), 'TMPDIR': str(home), 'PYTHONUTF8': '0',
+                    'PYTHONPATH': str(emu), 'C03_EMU_LOG': str(self.root/'crlf-emu.log')}
+        return dict(os.environ, PYTHONUTF8='0')
+
+    def assert_crlf_premise(self, env, *leaf_args):
+        # Prerequisite, before any verdict: the premise is live, and on POSIX it reached the process under test (a
+        # process whose argv carries every leaf_args), not only a sibling - a green must not mean "emulation lost".
+        sib = subprocess.run([PYTHON, '-B', '-c', "print('a')"], capture_output=True, env=env, timeout=10)  # wallclock: guard 10 s only ends a hang; the verdict is the printed bytes
+        self.assertEqual(sib.stdout, b'a\r\n', 'premise not live: a text-mode print wrote %r' % sib.stdout)
+        if os.name == 'posix':
+            log = self.root/'crlf-emu.log'
+            seen = log.read_text(encoding='utf-8').splitlines() if log.exists() else []
+            self.assertTrue([l for l in seen if all(a in l for a in leaf_args)],
+                            'the CRLF emulation never reached a process with %r: %r' % (leaf_args, seen[-6:]))
+
+    def run_leaf(self, script, records):
+        """The leaf CLI relaying a bash child that writes LF and a 0xFF byte; returns (rc, stdout, stderr) as bytes."""
+        import shutil
+        bash = os.environ.get('C03_TEST_BASH') or shutil.which('bash')
+        if not bash:
+            self.skipTest('no bash (on nt: C03_TEST_BASH, the bundled Git bash)')
+        env = self.crlf_env()
+        cmd = [PYTHON, '-B', str(BIN/'_owned_process.py'), '--bounded', '10'] + (['--records'] if records else [])
+        p = subprocess.run(cmd + ['--', bash, '-c', script], capture_output=True, env=env, timeout=30)  # wallclock: guard 30 s only ends a hang (the leaf's own cap is 10 s); the verdict is the relayed bytes
+        self.assert_crlf_premise(env, '--bounded', '10')
+        return p.returncode, p.stdout, p.stderr
+
+    def test_leaf_records_complete_relay_is_byte_exact(self):
+        # H-WIN-17 S2 (:583): a complete phase's records leave the leaf as the child wrote them.
+        rc, out, err = self.run_leaf(r"printf 'OUT\0a\nb\377\0'", True)
+        self.assertEqual(rc, 0, err[-400:])
+        self.assertNotIn(b'\r', out, 'complete records relay (:583) added CR: %r' % out[:40])
+        self.assertTrue(out.startswith(b'OUT\x00a\nb\xff\x00'), 'complete records relay (:583) changed bytes: %r' % out[:40])
+
+    def test_leaf_records_partial_relay_is_byte_exact(self):
+        # H-WIN-17 S2 (:589): an incomplete phase keeps its committed pairs byte for byte.
+        rc, out, err = self.run_leaf(r"printf 'OUT\0a\nb\377\0'; exit 3", True)
+        self.assertIn(b'_OWNED_FAILURE\x00', out, 'not the partial-record path: %r' % out[:80])
+        self.assertNotIn(b'\r', out, 'partial records relay (:589) added CR: %r' % out[:40])
+        self.assertTrue(out.startswith(b'OUT\x00a\nb\xff\x00_OWNED_FAILURE\x00'), 'partial records relay (:589) changed bytes: %r' % out[:40])
+
+    def test_leaf_plain_relay_is_byte_exact(self):
+        # H-WIN-17 S2 (:594): the non-records relay (inject-context :497 CHK_OUT) passes stdout through unchanged.
+        rc, out, err = self.run_leaf(r"printf 'OUT\0a\nb\377\0'", False)
+        self.assertEqual(rc, 0, err[-400:])
+        self.assertNotIn(b'\r', out, 'plain relay (:594) added CR: %r' % out)
+        self.assertEqual(out, b'OUT\x00a\nb\xff\x00', 'plain relay (:594) changed bytes')
+
+    def test_leaf_stderr_relay_is_byte_exact(self):
+        # H-WIN-17 S2 (:595): the child's stderr leaves the leaf unchanged.
+        rc, out, err = self.run_leaf(r"printf 'e1\ne2\377' >&2", False)
+        self.assertEqual(rc, 0, err[-400:])
+        self.assertNotIn(b'\r', err, 'stderr relay (:595) added CR: %r' % err)
+        self.assertEqual(err, b'e1\ne2\xff', 'stderr relay (:595) changed bytes')
+
+
+    def trace_crlf_boundaries(self, pack, bash, env):
+        """M2 diagnostics on fixture COPIES only. The uninstrumented result still decides the witness.
+
+        G2a is a tee before shell command substitution; G2b is CHK_OUT before sed; G2 is sed's output.
+        Adding a tee changes the pipe topology, so divergence from the control is INCONCLUSIVE, not a fix.
+        """
+        trace = self.root/'crlf-trace'; trace.mkdir()
+        hook = pack/'hooks'/'inject-context.sh'; leaf = pack/'bin'/'_owned_process.py'
+        source = hook.read_text(encoding='utf-8')
+        lines=source.splitlines(keepends=True)
+        a=[i for i,line in enumerate(lines) if 'CHK_OUT=$(cys_timeout_run' in line]
+        self.assertEqual(len(a),1)
+        i=a[0]; self.assertIn('2>"$_CHK_ERR")',lines[i])
+        lines[i]=lines[i].replace('2>"$_CHK_ERR")','2>"$_CHK_ERR" | tee "$C03_TRACE_DIR/G2a")')
+        b=[i for i,line in enumerate(lines) if line.strip()=='CHK_RC=$?'];self.assertEqual(len(b),1)
+        lines[b[0]]+='    printf \'%s\' "$CHK_OUT" > "$C03_TRACE_DIR/G2b"\n'
+        c=[i for i,line in enumerate(lines) if '[ -n "$CHK_OUT" ] && OUT=' in line];self.assertEqual(len(c),1)
+        ending=')\\n\\n"'
+        self.assertEqual(lines[c[0]].count(ending),1)
+        lines[c[0]]=lines[c[0]].replace(ending,' | tee "$C03_TRACE_DIR/G2")\\n\\n"')
+        source=''.join(lines)
+        anchor="      while IFS= read -r -d '' _C03_KEY"
+        self.assertEqual(source.count(anchor),1)
+        source=source.replace(anchor,'      [ "$_C03_PHASE" != checklist ] || cp "$_C03_RD/rec" "$C03_TRACE_DIR/G3"\n'+anchor)
+        anchor='      done < "$_C03_RD/rec"'
+        self.assertEqual(source.count(anchor),1)
+        source=source.replace(anchor,anchor+'\n      [ "$_C03_PHASE" != checklist ] || printf \'%b\' "$OUT" > "$C03_TRACE_DIR/G4"')
+        hook.write_bytes(source.encode('utf-8'))  # retain LF shell source on native Windows
+        source=leaf.read_text(encoding='utf-8');anchor='    write = sys.stdout.buffer.write'
+        self.assertEqual(source.count(anchor),1)
+        source=source.replace(anchor,"    if args.managed_command and os.environ.get('C03_TRACE_DIR'):\n"
+                             "        with open(os.path.join(os.environ['C03_TRACE_DIR'], 'G1'), 'wb') as trace_out:\n"
+                             "            trace_out.write(out)\n"+anchor)
+        leaf.write_bytes(source.encode('utf-8'))
+        env=dict(env,C03_TRACE_DIR=str(trace))
+        # Prove tee itself preserves CRLF, so it cannot be mistaken for the leaf/command-substitution boundary.
+        tee=subprocess.run([bash,'-c',"printf 'a\\r\\nb\\r\\n' | tee \"$1\"",'trace',str(trace/'tee-control')],
+                           capture_output=True,env=env,timeout=10)  # wallclock: guard 10 s bounds the diagnostic tee control
+        self.assertEqual((tee.returncode,tee.stdout),(0,b'a\r\nb\r\n'),tee.stderr)
+        self.assertEqual((trace/'tee-control').read_bytes(),tee.stdout)
+        sibling=subprocess.run([PYTHON,'-B','-c',"print('a')"],capture_output=True,env=env,timeout=10)  # wallclock: guard 10 s bounds the trace's native sibling
+        r=subprocess.run([bash,str(hook)],input=json.dumps({'source':'startup','cwd':str(self.root)}).encode(),
+                         capture_output=True,env=env,cwd=str(self.root),timeout=60)  # wallclock: guard 60 s bounds the optional fixture-only trace
+        payload={'G0':sibling.stdout.hex(),'G0_rc':sibling.returncode,'tee_control':tee.stdout.hex(),
+                 'G5':r.stdout.hex(),'rc':r.returncode,'stderr':r.stderr[-400:].hex()}
+        for key in ('G1','G2a','G2b','G2','G3','G4'):
+            f=trace/key;payload[key]=f.read_bytes().hex() if f.is_file() else None
+        return payload
+
+    def test_soul_headings_reach_the_hook_output_without_cr(self):
+        # H-WIN-17 S1: the real hook, _lib.sh and leaf under the CRLF premise. The soul's real LF between headings
+        # and the checklist's own lines (:497) pass every phase with no CR added. The checklist's own CR LF (a text
+        # tool on the premise) is the in-path witness and must still arrive exactly once.
+        import shutil
+        bash = os.environ.get('C03_TEST_BASH') or shutil.which('bash')
+        if not bash:
+            self.skipTest('no bash (on nt: C03_TEST_BASH, the bundled Git bash)')
+        hooks = Path(__file__).resolve().parents[2]/'hooks'
+        pack = self.root/'pack'; (pack/'hooks').mkdir(parents=True); (pack/'bin').mkdir()
+        for name in ('_lib.sh', 'inject_gate.py', 'inject-context.sh'):
+            shutil.copyfile(hooks/name, pack/'hooks'/name)
+        for name in ('_owned_process.py', 'javis_checklist.py'):
+            shutil.copyfile(BIN/name, pack/'bin'/name)
+        (pack/'bin'/'javis_preflight.py').write_text("import os,sys\nsys.path.insert(0,os.path.dirname(__file__))\nfrom _owned_process import managed_main\ndef main():\n print('fixture summary')\n return 0\nmanaged_main(main)\n")
+        # No invalid UTF-8 byte here: the phase bash inherits LC_CTYPE=C.UTF-8 from the leaf's locale coercion and
+        # BSD tr at inject-context.sh:288 cuts a heading at such a byte (pin bytes too) - that is the heading
+        # pipeline, not the relay. The 0xFF byte rides through every relay site in the four leaf specimens above.
+        heads = '## 금지선 하나\n## 오너 규칙 둘\n'.encode('utf-8')
+        (pack/'soul.md').write_bytes(b'# s\n' + heads.replace(b'\n', b'\nx\n'))
+        env = dict(self.crlf_env(), CYS_PY=PYTHON, CYS_ROLE='master', CYS_ROOT=str(self.root), CYS_PACK_DIR=str(pack))
+        if os.name == 'nt':
+            env['PATH'] = str(Path(bash).parent.parent/'usr'/'bin') + os.pathsep + env.get('PATH', '')
+        p = subprocess.run([bash, str(pack/'hooks'/'inject-context.sh')], capture_output=True, env=env, cwd=str(self.root),  # wallclock: guard 60 s only ends a hang of the hook; the verdict is the output bytes
+                           input=json.dumps({'source': 'startup', 'cwd': str(self.root)}).encode(), timeout=60)
+        out = p.stdout
+        self.assertEqual(p.returncode, 0, p.stderr[-400:])
+        self.assert_crlf_premise(env, '--bounded', '--records')
+        if os.name == 'posix':
+            self.assert_crlf_premise(env, '--bounded', '--managed-command')
+        if os.name == 'nt' or os.environ.get('C03_TRACE_POSIX') == '1':
+            # Diagnostic failure cannot replace the ORIGINAL witness verdict (the fixture copy is changed only
+            # after the control's bytes were captured). The head, not this test, rules on a witness change.
+            try:
+                trace=self.trace_crlf_boundaries(pack,bash,env)
+                trace['control_matches_G5']=(trace['G5']==out.hex())
+                trace['classification']='UNMEASURED: compare first changed boundary; shell loss is provisional TEST per M2'
+            except Exception as exc:
+                trace={'error':repr(exc),'classification':'UNMEASURED'}
+            sys.stderr.write('\nC03-CRLF-TRACE '+json.dumps(trace)+'\n');sys.stderr.flush()
+        self.assertIn(b'fixture summary\r', out, 'witness: the checklist line never arrived with its own CR: %r' % out[-300:])
+        i = out.index(b'fixture summary\r') + len(b'fixture summary')
+        self.assertEqual(out[i:i + 2], b'\r\n', 'checklist relay (:497/:594) added CR: %r' % out[i:i + 8])
+        self.assertIn(heads, out, 'soul headings arrived changed (records relay :583): %r' % out[out.find(b'## '):][:120])
+        self.assertNotIn(b'\r\r', out, 'a CR run in the hook output')
 
     @unittest.skipUnless(os.name == 'nt', 'Windows Git Bash hook: UNMEASURED locally')
     def test_windows_bundled_bash_hook_retains_core(self):
@@ -1155,10 +1482,11 @@ if __name__=='__main__':
                   '--exclude',str(check_spent),'--budget',str(4.2 if name=='checklist' else 1.5),'--total-budget','4.2']
             if name in ('role','ancillary'):args+=['--spent',str(role_spent)]
             args+=['--','fixture-command']
-            out=io.StringIO()
-            with patch.object(sys,'argv',args),patch.object(sys,'stdout',out),patch.object(sys,'stderr',io.StringIO()),patch.object(owned,'monotonic',lambda:clock[0]),patch.object(owned,'run_owned',execute):
+            # bounded_cli relays through .buffer (H-WIN-17), so the patched streams carry one.
+            out=io.TextIOWrapper(io.BytesIO(),encoding='utf-8')
+            with patch.object(sys,'argv',args),patch.object(sys,'stdout',out),patch.object(sys,'stderr',io.TextIOWrapper(io.BytesIO(),encoding='utf-8')),patch.object(owned,'monotonic',lambda:clock[0]),patch.object(owned,'run_owned',execute):
                 rc=owned.bounded_cli()
-            fields=out.getvalue().split('\0');record=dict(zip(fields[::2],fields[1::2]))
+            fields=out.buffer.getvalue().decode('utf-8').split('\0');record=dict(zip(fields[::2],fields[1::2]))
             if name in ('role','ancillary'):role_spent=float(record['_OWNED_SPENT'])
             if name=='checklist':check_spent=float(record['_OWNED_ELAPSED'])
             self.assertEqual(rc,124 if name=='extra' else 0,(name,record))
@@ -1246,6 +1574,23 @@ if __name__=='__main__':
 # Fix A (design r1 15acd497 s2.4): after a timeout or a crash the owner must stop spending grace once the leader is
 # gone (control-eof). The driver runs run_owned with grace 600 and force 5 and prints one RESULT line. With an arm
 # path, the timeout starts only once that file exists (the output holder is up), as in the held-output tests.
+# H-WIN-17: on Windows a text-mode Python stdout writes LF as CR LF, and the leaf relayed every phase's records that
+# way, so each pass added one CR per LF inside OUT. On POSIX this sitecustomize (via PYTHONPATH) gives every Python
+# in the env that premise and logs its argv, so a specimen can show the premise reached the leaf itself.
+_CRLF_SITECUSTOMIZE = r'''
+import os, sys
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(newline='\r\n')
+    except Exception:
+        pass
+_log = os.environ.get('C03_EMU_LOG')
+if _log:
+    with open(_log, 'a', encoding='utf-8') as _f:
+        _f.write(repr(sys.argv) + '\n')
+'''
+
+
 _FA_DRIVER = r'''
 import json, os, subprocess, sys
 from pathlib import Path
@@ -1276,6 +1621,17 @@ BR = os.environ['C03E2_BRANCH']; TMP = os.environ['C03E2_TMP']
 def note():
     with open(os.path.join(TMP, 'pids.txt'), 'a') as f:
         f.write('%%d\n' %% os.getpid())
+    if os.name == 'nt':
+        # The worker's own creation time: the reap terminates a pid only while it still has this identity.
+        import ctypes
+        from ctypes import wintypes as w
+        k = ctypes.WinDLL('kernel32', use_last_error=True)
+        k.GetCurrentProcess.restype = w.HANDLE
+        k.GetProcessTimes.argtypes = [w.HANDLE] + [ctypes.POINTER(w.FILETIME)] * 4
+        t = [w.FILETIME() for _ in range(4)]
+        if k.GetProcessTimes(k.GetCurrentProcess(), *[ctypes.byref(x) for x in t]):
+            with open(os.path.join(TMP, 'identities.txt'), 'a') as f:
+                f.write('%%d %%d\n' %% (os.getpid(), t[0].dwHighDateTime << 32 | t[0].dwLowDateTime))
 def init(*args):
     note()
     if BR in ('N', 'NI', 'SURV', 'SURVX'):
@@ -1338,7 +1694,10 @@ class PoolBoundedStop(unittest.TestCase):
             (root/name/'SKILL.md').write_text('# fixture')
         script = self.root/'e2fixture.py'
         script.write_text(_E2_FIXTURE % {'bin': str(BIN)})
-        env = dict(os.environ, C03E2_BRANCH=branch, C03E2_TMP=str(self.root), C03E2_ROOT=str(root), C03E2_D='1.0')
+        # UTF-8 on the wire, as on the product's managed path (_owned_process._utf8_stdio): with the runner's default
+        # the child's stderr file was cp1252 and its Korean came back as \\uXXXX escapes (d2be23fe log :762-768).
+        env = dict(os.environ, C03E2_BRANCH=branch, C03E2_TMP=str(self.root), C03E2_ROOT=str(root), C03E2_D='1.0',
+                   PYTHONIOENCODING='utf-8')
         out_f = open(self.root/'e2.out', 'w'); err_f = open(self.root/'e2.err', 'w')
         p = subprocess.Popen([PYTHON, '-B', str(script)], stdout=out_f, stderr=err_f, env=env,
                              start_new_session=(os.name == 'posix'))
@@ -1351,17 +1710,23 @@ class PoolBoundedStop(unittest.TestCase):
             if os.name == 'posix':
                 os.killpg(p.pid, signal.SIGKILL)
         out_f.close(); err_f.close()
-        out = (self.root/'e2.out').read_text(); err = (self.root/'e2.err').read_text()
+        out = (self.root/'e2.out').read_text(encoding='utf-8'); err = (self.root/'e2.err').read_text(encoding='utf-8')
         pids = [int(x) for x in (self.root/'pids.txt').read_text().split()] if (self.root/'pids.txt').exists() else []
-        self.addCleanup(self.reap_e2, pids)
+        # Read now: tearDown removes the temp root before the cleanups run.
+        ident = self.root/'identities.txt'
+        identities = [tuple(int(v) for v in l.split()) for l in ident.read_text().splitlines() if l.strip()] if ident.exists() else []
+        self.addCleanup(self.reap_e2, pids, identities)
         self.assertTrue(finished, 'pool fixture %s did not finish: the stop hung (stderr %r)' % (branch, err[-400:]))  # wallclock: guard 40 s only ends a hang; the verdict is finished/unfinished, the designed worst case is D 1 s + 3 phases of 1 s
         result = [json.loads(l[7:]) for l in out.splitlines() if l.startswith('RESULT ')]
         return p.returncode, (result[0] if result else None), err, pids
 
-    def reap_e2(self, pids):
+    def reap_e2(self, pids, identities=()):
+        if os.name == 'nt':
+            _reap_identified_for(identities, _kernel32())
+            return
         # Fixture workers sleep 3600 s, so a recorded pid that is still alive is still that worker.
         for pid in pids:
-            if alive(pid):
+            if alive_state(pid) != DEAD:
                 try:
                     os.kill(pid, signal.SIGKILL)
                 except (ProcessLookupError, PermissionError):
@@ -1369,10 +1734,10 @@ class PoolBoundedStop(unittest.TestCase):
 
     def assert_no_leftover(self, pids):
         end = time.monotonic() + 3
-        left = [x for x in pids if alive(x)]
+        left = [x for x in pids if alive_state(x) != DEAD]
         while left and time.monotonic() < end:
             time.sleep(.05)
-            left = [x for x in left if alive(x)]
+            left = [x for x in left if alive_state(x) != DEAD]
         self.assertEqual(left, [], 'pool workers outlived the scan')  # wallclock: guard 3 s only lets the init process reap orphans; a real survivor sleeps 3600 s
 
     @unittest.skipUnless(os.name == 'posix', 'SIGTERM-ignoring worker: POSIX only (Windows UNMEASURED)')
@@ -1409,6 +1774,21 @@ class PoolBoundedStop(unittest.TestCase):
         self.assertIn('BrokenProcessPool', err)
         self.assert_no_leftover(pids)
 
+    def test_m5_skip_stands_only_while_its_guards_run(self):
+        # Head ruling C3: the M5 x3 skip on nt is void in a run where never_ready or worker_dying is not fully green. A red
+        # or an error voids it through the native step's acceptance (failures=0, errors=0); this pin covers "skipped".
+        # Source-level, so an nt-only skip is seen on every platform.
+        import ast, inspect, textwrap
+        for name in ('test_never_ready_pool_falls_back_at_the_start_deadline',
+                     'test_worker_dying_at_start_falls_back_without_leftover'):
+            guard = ast.parse(textwrap.dedent(inspect.getsource(getattr(PoolBoundedStop, name)))).body[0]
+            self.assertEqual([ast.unparse(d) for d in guard.decorator_list], [],
+                             '%s carries a decorator: a skip there leaves the M5 skip without its guard' % name)
+            self.assertNotIn('skipTest', ast.unparse(guard), name)
+        for helper in (PoolBoundedStop.run_e2, PoolBoundedStop.assert_no_leftover, OwnershipRegression.setUp):
+            self.assertNotIn('skipTest', inspect.getsource(helper), helper.__name__)
+        self.assertEqual(ast.parse(textwrap.dedent(inspect.getsource(PoolBoundedStop))).body[0].decorator_list, [])
+
     def test_healthy_pool_is_silent_and_leaves_no_worker(self):
         rc, res, err, pids = self.run_e2('H', skills=('a', 'b', 'c'))
         self.assertEqual((res['rc'], res['unbounded']), (0, False), err)
@@ -1420,7 +1800,7 @@ class PoolBoundedStop(unittest.TestCase):
         rc, res, err, pids = self.run_e2('SURV')
         self.assertEqual(rc, 0, err)
         self.assertIn('unbounded', err)
-        self.assertTrue(any(alive(pid) for pid in pids), 'planted survivor not present: the control did not plant')
+        self.assertTrue(any(alive_state(pid) == ALIVE for pid in pids), 'planted survivor not present: the control did not plant')
 
     @unittest.skipUnless(os.name == 'posix', 'planted survivor via no-op signals: POSIX fixture (Windows UNMEASURED)')
     def test_cli_raising_with_a_surviving_worker_exits_instead_of_hanging(self):
@@ -1429,7 +1809,7 @@ class PoolBoundedStop(unittest.TestCase):
         self.assertEqual(rc, 1, err)
         self.assertIn('fixture: main raised after the pool stop', err)
         self.assertIn('unbounded', err)
-        self.assertTrue(any(alive(pid) for pid in pids), 'planted survivor not present: the control did not plant')
+        self.assertTrue(any(alive_state(pid) == ALIVE for pid in pids), 'planted survivor not present: the control did not plant')
 
     def test_empty_skill_list_creates_no_pool(self):
         sys.path.insert(0, str(BIN)); scanner = load('javis_skillscan')
@@ -1524,16 +1904,19 @@ class MarkerReaderContract(unittest.TestCase):
 
     def test_persistent_permission_error_fails_loudly_after_the_attempt_bound(self):
         calls, p = self.reads([PermissionError])
+        # The default attempt bound (25), with the time bound and the readiness limit out of reach: no runner speed
+        # decides the verdict (d2be23fe macOS: 1.0 s ran out after 11 attempts, m=11/1020ms, log :5587).
         with p, self.assertRaises(self.failureException) as cm:
-            self._marker_pid(self.root/'m', retry_permission=True)
+            self._marker_pid(self.root/'m', retry_permission=True, budget_s=600, limit_s=600)
         self.assertIsInstance(cm.exception.__cause__, PermissionError)
-        self.assertIn('25 attempts', str(cm.exception))
+        # The bound that fired and the count; '(bounds: 25 attempts' is in every message, so it proves nothing.
+        self.assertIn('attempt bound reached after 25 attempts', str(cm.exception))
         self.assertEqual(self.marker_stats[-1][:2], ('m', 25))
 
     def test_attempt_bound_ends_the_retries(self):
         calls, p = self.reads([PermissionError])
         with p, self.assertRaises(self.failureException) as cm:
-            self._marker_pid(self.root/'m', retry_permission=True, attempts=25, budget_s=600)
+            self._marker_pid(self.root/'m', retry_permission=True, attempts=25, budget_s=600, limit_s=600)
         self.assertEqual(len(calls), 25)
         self.assertIn('attempt bound', str(cm.exception))
 
@@ -1656,6 +2039,514 @@ class MarkerReaderContract(unittest.TestCase):
         self.assertEqual(self.not_killed, [])
 
 
+_H1_NATIVE = r"""
+import os,sys,ctypes,threading,time,json
+from pathlib import Path
+sys.path.insert(0, %(bin)r)
+import _owned_process as owned
+import msvcrt
+from multiprocessing.reduction import duplicate
+r,w=os.pipe()
+raw=duplicate(msvcrt.get_osfhandle(w));os.close(w)
+api=owned._managed_io(True)
+control,fd=owned._acquire_managed(raw,True,api)
+class Context: pass
+ctx=Context();ctx._lifeline_fd=fd;ctx.group=None
+owned._CONTEXT=ctx
+conn=owned.worker_lifeline()
+owned._CONTEXT=None
+entered={n:threading.Event() for n in ('owned-eof','pool-lifeline')}
+stopped={n:threading.Event() for n in ('owned-lifeline','pool-lifeline')}
+read=os.read
+class OS:
+    def __getattr__(self,n):return getattr(os,n)
+    def read(self,fd,n):
+        name=threading.current_thread().name
+        if name in entered:entered[name].set()
+        return read(fd,n)
+owned.os=OS()
+owned._self_stop=lambda group:stopped[threading.current_thread().name].set()
+context=owned.Managed(control,fd);owned._CONTEXT=context
+owned.worker_observer(conn,None)
+assert all(event.wait(3) for event in entered.values())
+# These are observations of the two exact readers, not a process-poll proxy.
+time.sleep(.05)
+before={'stdin_null':os.read(0,1)==b'', 'std_handle_matches':api.get_stdin()==api.get_osfhandle(0),
+        'private_noninheritable':not os.get_inheritable(fd),
+        'watcher_before_close':stopped['owned-lifeline'].is_set(), 'worker_before_close':stopped['pool-lifeline'].is_set()}
+def publish(path,data):
+    q=Path(path+'.tmp');q.write_text(json.dumps(data));os.replace(q,path)
+publish(%(pre)r,before)
+after={'owner_eof_observed':stopped['owned-lifeline'].wait(5),'worker_eof_observed':stopped['pool-lifeline'].wait(5)}
+publish(%(post)r,after)
+conn.close();control.close();os.close(fd);os.close(r)
+"""
+
+
+class ManagedInputContract(unittest.TestCase):
+    """M1: real managed_main, fake OS handles only; never redirects this runner's stdin."""
+    class Api:
+        def __init__(self, fault=None):
+            self.fault = fault
+            self.calls, self.acquired, self.closed = [], [], []
+            self.source = {0: 'pipe'}
+            self.inherit = {}
+            self.std = 100
+        def step(self, name):
+            self.calls.append(name)
+            if self.fault == name:
+                raise OSError('injected ' + name)
+        def control_fd(self, handle):
+            self.step('control_fd'); self.acquired.append(10); return 10
+        def fdopen(self, fd, *args, **kwargs):
+            self.step('fdopen')
+            api = self
+            class Stream:
+                def fileno(self): return fd
+                def close(self): api.close(fd)
+            return Stream()
+        def set_inheritable(self, fd, value):
+            self.step('control_noninherit' if fd == 10 else 'private_noninherit')
+            self.inherit[fd] = value
+        def dup(self, fd):
+            self.step('dup'); self.acquired.append(11); self.source[11] = self.source[fd]; return 11
+        def open_null(self):
+            self.step('open_null'); self.acquired.append(12); self.source[12] = 'null'; return 12
+        def dup2(self, fd, dst):
+            self.step('dup2'); self.source[dst] = self.source[fd]
+        def set_stdin(self, fd):
+            self.step('set_stdin'); self.std = self.get_osfhandle(fd)
+        def get_stdin(self):
+            self.step('get_stdin'); return -1 if self.fault == 'readback' else self.std
+        def get_osfhandle(self, fd):
+            return (200 if self.source[0] == 'null' else 100) if fd == 0 else 100 + fd
+        def close(self, fd): self.closed.append(fd)
+        def close_raw_control(self, handle): self.closed.append(('raw', handle))
+
+    def invoke(self, api, windows=True, admitted=True):
+        import types
+        from unittest.mock import patch
+        owned = load('_owned_process')
+        entered, contexts = [], []
+        class Managed:
+            def __init__(self, control, lifeline_fd=0):
+                self.control, self._lifeline_fd = control, lifeline_fd
+                contexts.append(self)
+            def finish(self, code): pass
+        # Also intercept the old entry's direct APIs: reverting the helper must yield a behavioural RED,
+        # not a missing-function or unavailable-msvcrt error on a Mac.
+        fake_os = types.SimpleNamespace(name='nt' if windows else 'posix', O_WRONLY=1, O_BINARY=0,
+                                        fdopen=api.fdopen, set_inheritable=api.set_inheritable)
+        fake_msvcrt = types.SimpleNamespace(open_osfhandle=lambda h, flags: api.control_fd(h))
+        args = ['--owned-lifeline', '1000'] if admitted else ['payload']
+        with patch.object(owned, 'os', fake_os), patch.dict(sys.modules, {'msvcrt': fake_msvcrt}), \
+             patch.object(owned, '_managed_io', lambda win: api, create=True), \
+             patch.object(owned, '_utf8_stdio', lambda: None), patch.object(owned, 'Managed', Managed):
+            rc = owned.managed_main(lambda: entered.append(api.source[0]) or 0, args)
+        return rc, entered, contexts
+
+    def test_native_api_checks_setstdhandle_and_pointer_width(self):
+        import ctypes, types
+        from ctypes import wintypes as w
+        from unittest.mock import patch
+        owned=load('_owned_process')
+        class Call:
+            def __init__(self,result): self.result=result;self.calls=[]
+            def __call__(self,*args): self.calls.append(args);return self.result
+        kernel=types.SimpleNamespace(SetStdHandle=Call(0),GetStdHandle=Call(2**40+17),CloseHandle=Call(1))
+        with patch.object(ctypes,'WinDLL',lambda *a,**kw:kernel,create=True), \
+             patch.object(ctypes,'WinError',lambda n:OSError('native error '+str(n)),create=True), \
+             patch.object(ctypes,'get_last_error',lambda:6,create=True), \
+             patch.dict(sys.modules,{'msvcrt':types.SimpleNamespace(get_osfhandle=lambda fd:2**40+17)}):
+            api=owned._managed_io(True)
+            with self.assertRaises(OSError): api.set_stdin(0)
+            self.assertEqual(kernel.SetStdHandle.calls,[(4294967286,2**40+17)])
+            self.assertEqual(kernel.SetStdHandle.argtypes,[w.DWORD,w.HANDLE])
+            self.assertEqual(kernel.SetStdHandle.restype,w.BOOL)
+            self.assertEqual(kernel.GetStdHandle.argtypes,[w.DWORD])
+            self.assertEqual(kernel.GetStdHandle.restype,w.HANDLE)
+            kernel.SetStdHandle.result=1
+            api.set_stdin(0)
+            self.assertEqual(api.get_stdin(),2**40+17)
+
+    def test_unwind_attempts_other_owners_after_a_close_error(self):
+        api=self.Api('get_stdin');close=api.close
+        def failing_close(fd):
+            close(fd)
+            if fd==11: raise OSError('private close failed')
+        api.close=failing_close
+        rc,entered,contexts=self.invoke(api)
+        self.assertEqual((rc,entered,contexts),(125,[],[]))
+        self.assertCountEqual(api.closed,api.acquired)
+        self.assertEqual(len(api.closed),len(set(api.closed)))
+
+    def test_nt_setup_selects_private_reader_and_null_stdin(self):
+        api = self.Api()
+        rc, entered, contexts = self.invoke(api)
+        self.assertEqual(entered, ['null'], 'managed child inherited the ownership pipe as stdin')
+        self.assertEqual(contexts[0]._lifeline_fd, 11)
+        self.assertEqual(api.source[11], 'pipe')
+        self.assertIs(api.inherit[11], False)
+        self.assertEqual(api.std, api.get_osfhandle(0))
+        self.assertEqual(api.closed, [12], 'successful setup closed a transferred owner')
+        contexts[0].control.close(); api.close(11)
+        self.assertCountEqual(api.closed, api.acquired)
+
+    def test_nt_lifeline_initialization_faults_never_enter_main(self):
+        # control acquisition has three failure sites, followed by the six nt steps and a mismatched readback.
+        for fault in ('control_fd', 'fdopen', 'control_noninherit', 'dup', 'private_noninherit',
+                      'open_null', 'dup2', 'set_stdin', 'get_stdin', 'readback'):
+            with self.subTest(fault=fault):
+                api = self.Api(fault)
+                rc, entered, contexts = self.invoke(api)
+                self.assertEqual(rc, 125, fault)
+                self.assertEqual(entered, [], 'main ran after ' + fault)
+                self.assertEqual(contexts, [], 'READY-capable constructor ran after ' + fault)
+                expected = [('raw', 1000)] if fault == 'control_fd' else api.acquired
+                self.assertCountEqual(api.closed, expected, 'not exactly-once unwind: ' + fault)
+                self.assertNotIn(0, api.closed)
+                self.assertEqual(len(api.closed), len(set(api.closed)), 'double close: ' + fault)
+
+    def test_posix_acquisition_keeps_borrowed_fd_zero(self):
+        api = self.Api()
+        rc, entered, contexts = self.invoke(api, windows=False)
+        self.assertEqual(entered, ['pipe'])
+        self.assertEqual(contexts[0]._lifeline_fd, 0)
+        self.assertNotIn('dup', api.calls)
+        self.assertNotIn('set_stdin', api.calls)
+        self.assertNotIn(0, api.closed)
+        contexts[0].control.close()
+
+    def test_unmanaged_entry_preserves_stdin(self):
+        for windows in (True, False):
+            api = self.Api()
+            rc, entered, contexts = self.invoke(api, windows=windows, admitted=False)
+            self.assertEqual((rc, entered, contexts, api.calls), (0, ['pipe'], [], []))
+
+    def test_worker_transport_duplicates_private_reader(self):
+        import types, multiprocessing.connection, multiprocessing.reduction
+        from unittest.mock import patch
+        owned = load('_owned_process'); seen = []
+        owned._CONTEXT = types.SimpleNamespace(_lifeline_fd=17, group=None)
+        with patch.object(owned, 'os', types.SimpleNamespace(name='nt')), \
+             patch.dict(sys.modules, {'msvcrt': types.SimpleNamespace(get_osfhandle=lambda fd: seen.append(fd) or fd+100)}), \
+             patch.object(multiprocessing.reduction, 'duplicate', lambda handle: handle+1000, create=True), \
+             patch.object(multiprocessing.connection, 'PipeConnection', lambda handle, **kw: (handle,kw), create=True):
+            result = owned.worker_lifeline()
+        self.assertEqual(seen, [17], 'worker transport still duplicates fd 0')
+        self.assertEqual(result, (1117, {'readable': True, 'writable': False}))
+
+    def test_go_and_eof_read_the_instance_descriptor(self):
+        import types
+        from unittest.mock import patch
+        owned = load('_owned_process'); seen = []
+        class Stream:
+            def write(self, b): pass
+        class Thread:
+            def __init__(self, target, **kw): self.target = target
+            def start(self): pass
+        with patch.object(owned, 'os', types.SimpleNamespace(name='nt', read=lambda fd,n: seen.append(fd) or b'G')), \
+             patch.object(owned.signal, 'signal', lambda *a: None), patch.object(owned.threading, 'Thread', Thread):
+            # Old ctor has only control; accommodate its signature so the assertion measures its fd choice.
+            import inspect
+            obj = owned.Managed(Stream(), **({'lifeline_fd':17} if 'lifeline_fd' in inspect.signature(owned.Managed).parameters else {}))
+        self.assertEqual(seen, [17], 'GO still reads fd 0')
+        seen.clear()
+        class RunThread(Thread):
+            def start(self): self.target()
+        with patch.object(owned, 'os', types.SimpleNamespace(name='nt', read=lambda fd,n: seen.append(fd) or b'')), \
+             patch.object(owned.threading, 'Thread', RunThread), patch.object(owned, '_self_stop', lambda group: None):
+            obj.watch()
+        self.assertEqual(seen, [17], 'EOF still reads fd 0')
+
+
+class LivenessProbe(unittest.TestCase):
+    """The liveness probe and the nt reap, driven through a stub kernel32 on every platform (d2be23fe windows-build
+    log :607-687: os.kill(pid, 0) raised WinError 87 in alive() seven times)."""
+
+    class Api:
+        def __init__(self, handle, error=0, wait=None, created=None):
+            self.handle, self.error, self.wait, self.created = handle, error, wait, created
+            self.calls = []
+        def OpenProcess(self, access, inherit, pid):
+            self.calls.append(('open', access, pid))
+            return self.handle
+        def GetLastError(self):
+            return self.error
+        def WaitForSingleObject(self, handle, ms):
+            self.calls.append(('wait', handle, ms))
+            return self.wait
+        def CloseHandle(self, handle):
+            self.calls.append(('close', handle))
+        def creation(self, handle):
+            return self.created
+        def TerminateProcess(self, handle, code):
+            self.calls.append(('terminate', handle, code))
+
+    def test_nt_probe_is_tri_state_and_never_signals(self):
+        from unittest.mock import patch
+        rows = [(None, _ERROR_INVALID_PARAMETER, None, DEAD), (None, _ERROR_ACCESS_DENIED, None, ALIVE),
+                (None, 6, None, UNKNOWN), (7, 0, _WAIT_OBJECT_0, DEAD), (7, 0, _WAIT_TIMEOUT, ALIVE),
+                (7, 0, 0xFFFFFFFF, UNKNOWN)]
+        def no_signal(*args):
+            raise AssertionError('os.kill on the nt path: %r' % (args,))
+        with patch.object(os, 'kill', no_signal):
+            for handle, error, wait, want in rows:
+                with self.subTest(handle=handle, error=error, wait=wait):
+                    api = self.Api(handle, error, wait)
+                    self.assertEqual(_alive_for(4242, True, api), want)
+                    self.assertEqual([c for c in api.calls if c[0] == 'open'], [('open', _SYNCHRONIZE, 4242)])
+                    self.assertEqual([c for c in api.calls if c[0] == 'close'], [('close', handle)] if handle else [])
+
+    def test_unknown_fails_a_negative_and_a_positive_call_site(self):
+        # Each site fails on UNKNOWN in its own direction; the passing state of each is the control.
+        from unittest.mock import patch
+        pool = PoolBoundedStop('test_empty_skill_list_creates_no_pool')
+        ticks = iter(range(10 ** 6))
+        clock = (patch.object(time, 'monotonic', lambda: float(next(ticks))), patch.object(time, 'sleep', lambda s: None))
+        for state, fails in ((UNKNOWN, True), (ALIVE, True), (DEAD, False)):
+            with self.subTest(site='assert_no_leftover', state=state), clock[0], clock[1], \
+                    patch.dict(globals(), {'alive_state': lambda pid, state=state: state}):
+                if fails:
+                    with self.assertRaises(pool.failureException):
+                        pool.assert_no_leftover([4242])
+                else:
+                    pool.assert_no_leftover([4242])
+        owner = OwnershipRegression('test_private_done_preserves_exit_and_output')
+        for state, fails in ((UNKNOWN, True), (DEAD, True), (ALIVE, False)):
+            with self.subTest(site='assert_alive', state=state):
+                owner.recorded_alive = lambda pid, state=state: state
+                if fails:
+                    with self.assertRaises(owner.failureException):
+                        owner.assert_alive(4242, 'probe answered %s' % state)
+                else:
+                    owner.assert_alive(4242, 'probe answered %s' % state)
+
+    def test_nt_reap_terminates_only_the_recorded_identity(self):
+        same = self.Api(9, created=111)
+        _reap_identified_for([(4242, 111)], same)
+        self.assertEqual([c[0] for c in same.calls], ['open', 'terminate', 'close'])
+        self.assertEqual(same.calls[0], ('open', _TERMINATE_AND_QUERY, 4242))
+        moved = self.Api(9, created=222)
+        _reap_identified_for([(4242, 111)], moved)
+        self.assertEqual([c[0] for c in moved.calls], ['open', 'close'], 'a pid with another identity was terminated')
+        gone = self.Api(None)
+        _reap_identified_for([(4242, 111)], gone)
+        self.assertEqual([c[0] for c in gone.calls], ['open'])
+
+    def test_probe_routes_by_the_host_and_the_nt_branch_has_no_os_kill(self):
+        import ast, inspect
+        wrapper = ast.parse(inspect.getsource(alive_state)).body[0]
+        self.assertEqual([ast.unparse(s) for s in wrapper.body],
+                         ["return _alive_for(pid, os.name == 'nt', _kernel32() if os.name == 'nt' else None)"])
+        probe = ast.parse(inspect.getsource(_alive_for)).body[0]
+        nt = [s for s in probe.body if isinstance(s, ast.If) and ast.unparse(s.test) == 'is_windows']
+        self.assertEqual(len(nt), 1)
+        self.assertNotIn('os.kill', ast.unparse(nt[0]))
+
+
+def _published_pid(path, wait_s, clock=time.monotonic, sleep=time.sleep):
+    # A child that publishes its pid with os.open + os.write leaves an empty file for a moment. Wait for the digits within
+    # wait_s and never raise: the instrument reports what it saw.
+    end = clock() + wait_s
+    while True:
+        try:
+            return int(path.read_text())
+        except (OSError, ValueError):
+            if clock() >= end:  # wallclock: guard wait_s only bounds the wait for a publication that may never come; None is reported, not asserted
+                return None
+        sleep(.05)
+
+
+def _contained(arm, fn):
+    # Report-only: an arm that raises reports its error instead of failing the native step (errors=0 there).
+    try:
+        return fn()
+    except Exception as exc:
+        return {'arm': arm, 'error': ('instrument: %r' % (exc,))[:300]}
+
+
+_INSTRUMENT_LEADER = r'''
+import json, os, subprocess, sys, time
+sys.path.insert(0, %(bin)r)
+CFG = json.load(open(sys.argv[1]))
+def child(marker, sleep):
+    # The child's first statement publishes its pid, so nothing else runs before the marker.
+    code = ("import os,time\nfd=os.open(%%r,os.O_WRONLY|os.O_CREAT|os.O_TRUNC)\nos.write(fd,str(os.getpid()).encode())\n"
+            "os.close(fd)\ntime.sleep(%%r)\n" %% (marker, sleep))
+    return [sys.executable, '-B', '-c', code]
+def started(marker):
+    fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_TRUNC); os.write(fd, str(os.getpid()).encode()); os.close(fd)
+def main():
+    arm, rep, t0 = CFG['arm'], {'arm': CFG['arm']}, time.monotonic()
+    try:
+        if arm in ('A1', 'A2'):
+            kw = {'capture_output': True, 'timeout': 10}
+            if arm == 'A2':
+                kw['stdin'] = subprocess.DEVNULL
+            r = subprocess.run(child(CFG['marker'], 0), **kw)
+            rep.update(rc=r.returncode, stderr=r.stderr[-300:].decode('utf-8', 'replace'))
+        elif arm in ('A3', 'A4', 'A6'):
+            p = subprocess.Popen(child(CFG['marker'], 12))
+            rep.update(popen_ms=int((time.monotonic() - t0) * 1000), pid=p.pid)
+            if arm == 'A6':
+                print('INSTR ' + json.dumps(rep), flush=True)
+                os._exit(0)
+            time.sleep(5)
+            rep['poll_after_5s'] = p.poll()
+        elif arm == 'A5':
+            import multiprocessing
+            with multiprocessing.get_context('spawn').Pool(1, initializer=started, initargs=(CFG['marker'],)) as pool:
+                rep['worker_pid'] = pool.apply_async(os.getpid).get(timeout=10)
+    except subprocess.TimeoutExpired:
+        rep['timeout'] = True
+    except Exception as exc:
+        rep['error'] = repr(exc)[:300]
+    rep['elapsed_ms'] = int((time.monotonic() - t0) * 1000)
+    rep['marker'] = os.path.exists(CFG['marker'])
+    print('INSTR ' + json.dumps(rep), flush=True)
+if __name__ == '__main__':
+    if CFG.get('plain'):
+        main()
+    else:
+        from _owned_process import managed_main
+        managed_main(main)
+'''
+
+
+@unittest.skipUnless(os.name == 'nt' or os.environ.get('C03_INSTRUMENT_POSIX') == '1',
+                     'nt child-start instrument (report-only); C03_INSTRUMENT_POSIX=1 runs it as a local dry run')
+class ChildStartInstrument(unittest.TestCase):
+    """Report-only (FIX-PLAN-d2be23fe section 2.3, head ruling C3/C8): why children of a managed leader do or do not start on nt.
+    Every arm is bounded; each prints one C03-INSTRUMENT line to stderr. It asserts only that every arm reported."""
+    setUp = OwnershipRegression.setUp
+    tearDown = OwnershipRegression.tearDown
+    _report_marker_stats = OwnershipRegression._report_marker_stats
+    stop_recorded = OwnershipRegression.stop_recorded
+
+    def test_report_child_start_shapes(self):
+        sys.path.insert(0, str(BIN)); import _owned_process as owned
+        leader = self.root/'instr_leader.py'
+        leader.write_text(_INSTRUMENT_LEADER % {'bin': str(BIN)})
+        report = []
+        def emit(rep):
+            report.append(rep)
+            sys.stderr.write('\nC03-INSTRUMENT %s\n' % json.dumps(rep)); sys.stderr.flush()
+        def parse(arm, result):
+            got = [json.loads(l[6:]) for l in result['stdout'].splitlines() if l.startswith('INSTR ')]
+            rep = got[0] if got else {'arm': arm, 'error': 'no INSTR line'}
+            rep['owner'] = {k: result.get(k) for k in ('timed_out', 'complete', 'returncode', 'reason')}
+            rep['owner']['stderr_tail'] = result['stderr'][-300:]
+            return rep
+        for arm in ('A1', 'A2', 'A3', 'A4', 'A5'):
+            cfg = self.root/('%s.json' % arm)
+            cfg.write_text(json.dumps({'arm': arm, 'marker': str(self.root/('%s-started' % arm)), 'plain': arm == 'A4'}))
+            launch = [PYTHON, '-B', str(leader), str(cfg)]
+            if arm == 'A4':  # a plain child of a --command leader, as fix A's held-output test builds it
+                launch = [PYTHON, '-B', str(BIN/'_owned_process.py'), '--command'] + launch
+            emit(_contained(arm, lambda: parse(arm, owned.run_owned(launch, 20))))  # wallclock: guard 20 s only bounds a stuck arm; the report is the verdict, nothing is asserted on it
+        def a6():
+            # A6: does an all-default holder keep its parent's stdout pipe open? The leader exits right after the spawn.
+            cfg = self.root/'A6.json'
+            cfg.write_text(json.dumps({'arm': 'A6', 'marker': str(self.root/'A6-started')}))
+            t0 = time.monotonic()
+            p = subprocess.Popen([PYTHON, '-B', str(leader), str(cfg)], stdout=subprocess.PIPE, stdin=subprocess.DEVNULL)
+            self.children.append(p)
+            import threading
+            done = threading.Event(); out = []
+            threading.Thread(target=lambda: (out.append(p.stdout.read()), done.set()), daemon=True).start()
+            eof = done.wait(15)  # wallclock: guard 15 s only bounds the read; the holder sleeps 12 s, so EOF before then means it does not hold the pipe
+            rep = {'arm': 'A6', 'eof': eof, 'eof_ms': int((time.monotonic() - t0) * 1000) if eof else None,
+                   'leader_out': (out[0][-200:].decode('utf-8', 'replace') if out else None)}
+            marker = self.root/'A6-started'
+            # On nt EOF may come before the holder has written its pid (os.open, then os.write).
+            holder = _published_pid(marker, 5)
+            rep.update(holder_pid=holder, marker_exists=marker.exists(), holder_state=(alive_state(holder) if holder else None))
+            return rep
+        emit(_contained('A6', a6))
+        # A7: the real managed scan as preflight runs it (C60: run_owned(..., timeout_s, grace=5, force=5),
+        # javis_preflight.py:5309-5310/:5351-5352 @af092542), a) with preflight's own argv (the runner's corpus) and b) over
+        # the skills this repo ships (a user install's start).
+        scan = str(BIN/'javis_skillscan.py')
+        shipped = Path(__file__).resolve().parents[2]/'skills'
+        def a7(arm, argv):
+            bound = load('javis_preflight').Preflight.SKILLSCAN_SCAN_TIMEOUT_S
+            t0 = time.monotonic()
+            # 40 s is twice preflight's 20 s bound (af092542): enough to tell "slower" from "reaches the bound", and the
+            # native step keeps room inside its 10 min timeout when the guards this slice adds all fire (180 s did not).
+            result = owned.run_owned([PYTHON, '-B', scan] + argv, 40, grace=5, force=5)  # wallclock: guard 40 s only bounds the scan; wall time is reported against preflight's bound, not asserted
+            try:
+                scanned = json.loads(result['stdout']).get('scanned')
+            except (ValueError, AttributeError):
+                scanned = None
+            return {'arm': arm, 'wall_ms': int((time.monotonic() - t0) * 1000), 'preflight_timeout_s': bound, 'guard_s': 40,
+                    'skills_scanned': scanned, 'skill_dirs_on_disk': sum(1 for _ in shipped.glob('*/SKILL.md')) if arm == 'A7b' else None,
+                    'stdout_head': result['stdout'][:160], 'stderr_tail': result['stderr'][-300:],
+                    'owner': {k: result.get(k) for k in ('timed_out', 'complete', 'returncode', 'reason')}}
+        for arm, argv in (('A7a', ['all', '--json']), ('A7b', ['all', '--roots', str(shipped), '--json'])):
+            emit(_contained(arm, lambda: a7(arm, argv)))
+        (self.root/'instrument.json').write_text(json.dumps(report))
+        self.assertEqual([r['arm'] for r in report], ['A1', 'A2', 'A3', 'A4', 'A5', 'A6', 'A7a', 'A7b'])
+
+
+class InstrumentContainment(unittest.TestCase):
+    """The instrument rides in the native C-03 step, whose acceptance is errors=0: an arm must report its failure, never
+    raise it. Runs on every platform; the instrument itself runs on nt only."""
+
+    def test_a_published_pid_that_is_not_written_yet_reads_as_none(self):
+        with tempfile.TemporaryDirectory(prefix='c03-') as tmp:
+            marker = Path(tmp)/'m'
+            ticks = iter(range(1000))
+            clock, idle = (lambda: float(next(ticks))), (lambda s: None)
+            self.assertIsNone(_published_pid(marker, 3, clock, idle))
+            marker.write_text('')  # created by os.open, the os.write not done yet
+            self.assertIsNone(_published_pid(marker, 3, clock, idle))
+            self.assertEqual(_published_pid(marker, 3, clock, lambda s: marker.write_text('77')), 77)
+            marker.write_text('4242')
+            self.assertEqual(_published_pid(marker, 3, clock, idle), 4242)
+
+    def test_an_arm_that_raises_reports_instead_of_failing(self):
+        def broken():
+            raise OSError('fixture: spawn failed')
+        rep = _contained('A9', broken)
+        self.assertEqual(rep['arm'], 'A9')
+        self.assertIn('fixture: spawn failed', rep['error'])
+        self.assertEqual(_contained('A9', lambda: {'arm': 'A9', 'rc': 0}), {'arm': 'A9', 'rc': 0})
+
+    def test_every_instrument_arm_is_contained(self):
+        import ast, inspect, textwrap
+        body = ast.parse(textwrap.dedent(inspect.getsource(ChildStartInstrument.test_report_child_start_shapes)))
+        emits = [n for n in ast.walk(body) if isinstance(n, ast.Call) and getattr(n.func, 'id', None) == 'emit']
+        self.assertEqual(len(emits), 3, 'emit sites: A1-A5 loop, A6, A7 loop')
+        for n in emits:
+            self.assertEqual(getattr(n.args[0].func, 'id', None) if isinstance(n.args[0], ast.Call) else None,
+                             '_contained', ast.unparse(n))
+
+
+class CaseStartResult(unittest.TextTestResult):
+    """Keep the active case visible even if the CI step is killed at its hard timeout."""
+    def startTest(self, test):
+        super().startTest(test)
+        self.stream.write('\nC03-CASE-START %s %.6f\n' % (test.id(), time.monotonic()))
+        self.stream.flush()
+
+
+class CaseStartContract(unittest.TestCase):
+    def test_case_start_names_the_case_and_flushes(self):
+        import io
+        class Stream(io.StringIO):
+            flushed = 0
+            def flush(self): self.flushed += 1
+        stream = Stream(); result = CaseStartResult(stream, True, 1)
+        case = unittest.FunctionTestCase(lambda: None)
+        result.startTest(case)
+        line = stream.getvalue().strip()
+        self.assertTrue(line.startswith('C03-CASE-START ' + case.id() + ' '), line)
+        self.assertGreaterEqual(float(line.rsplit(' ',1)[1]), 0)
+        self.assertGreater(stream.flushed, 0)
+        result.stopTest(case)
+
+
 if __name__ == '__main__':
     # Tests never inherit a live seat's paths or account configuration.
     for key in list(os.environ):
@@ -1666,7 +2557,7 @@ if __name__ == '__main__':
         if os.name == 'nt':
             os.environ['LOCALAPPDATA']=str(Path(home)/'localappdata')
         print(json.dumps({'executable': sys.executable, 'version': sys.version, 'platform': sys.platform}), flush=True)
-        run=unittest.main(exit=False)
+        run=unittest.main(exit=False, testRunner=unittest.TextTestRunner(resultclass=CaseStartResult))
         if os.name == 'nt' and run.result.wasSuccessful():
             print('C03-WINDOWS-NATIVE-OK',flush=True)
         sys.exit(0 if run.result.wasSuccessful() else 1)

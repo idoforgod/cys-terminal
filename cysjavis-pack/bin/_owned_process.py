@@ -113,7 +113,9 @@ def _self_stop(group):
 
 
 class Managed:
-    def __init__(self, control):
+    def __init__(self, control, lifeline_fd=0):
+        # POSIX borrows fd 0; nt owns a private reader, separate from ordinary stdin.
+        self._lifeline_fd = lifeline_fd
         self.group = os.getpgrp() if os.name == 'posix' else None
         if os.name == 'posix' and (self.group != os.getpid() or os.getsid(0) != os.getpid()):
             raise RuntimeError('managed child is not its own session/group leader')
@@ -121,7 +123,7 @@ class Managed:
         self.downstream = set()
         self.lock = threading.Lock()
         self.control.write(b'READY\n')
-        if os.read(0, 1) != b'G':
+        if os.read(self._lifeline_fd, 1) != b'G':
             os._exit(125)
         signal.signal(signal.SIGTERM, lambda *_: CANCEL.set())
         threading.Thread(target=self.watch, daemon=True, name='owned-lifeline').start()
@@ -129,7 +131,7 @@ class Managed:
     def watch(self):
         def read_eof():
             try:
-                while os.read(0, 1):
+                while os.read(self._lifeline_fd, 1):
                     pass
             except OSError:
                 pass
@@ -167,6 +169,111 @@ def is_managed():
     return _CONTEXT is not None
 
 
+def _managed_io(is_windows):
+    """OS seam for admission acquisition; fake implementations never touch runner fd 0."""
+    if is_windows:
+        import msvcrt
+        from ctypes import wintypes as w
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.SetStdHandle.argtypes = [w.DWORD, w.HANDLE]
+        kernel.SetStdHandle.restype = w.BOOL
+        kernel.GetStdHandle.argtypes = [w.DWORD]
+        kernel.GetStdHandle.restype = w.HANDLE
+        kernel.CloseHandle.argtypes = [w.HANDLE]
+        kernel.CloseHandle.restype = w.BOOL
+
+    class IO:
+        fdopen = staticmethod(os.fdopen)
+        set_inheritable = staticmethod(os.set_inheritable)
+        dup = staticmethod(os.dup)
+        close = staticmethod(os.close)
+
+        @staticmethod
+        def control_fd(handle):
+            return msvcrt.open_osfhandle(handle, os.O_WRONLY | os.O_BINARY)
+
+        @staticmethod
+        def open_null():
+            return os.open(os.devnull, os.O_RDONLY | os.O_BINARY)
+
+        @staticmethod
+        def dup2(fd, dst):
+            os.dup2(fd, dst, inheritable=True)  # only NUL is made an ordinary inheritable stream
+
+        @staticmethod
+        def get_osfhandle(fd):
+            return msvcrt.get_osfhandle(fd)
+
+        @staticmethod
+        def set_stdin(fd):
+            if not kernel.SetStdHandle(4294967286, msvcrt.get_osfhandle(fd)):
+                raise ctypes.WinError(ctypes.get_last_error())
+
+        @staticmethod
+        def get_stdin():
+            return kernel.GetStdHandle(4294967286)
+
+        @staticmethod
+        def close_raw_control(handle):
+            if not kernel.CloseHandle(handle):
+                raise ctypes.WinError(ctypes.get_last_error())
+    return IO
+
+
+def _unwind_managed(api, nul_fd=None, private_fd=None, control=None, raw_fd=None, raw_handle=None):
+    """Attempt every untransferred close exactly once, even if an earlier close fails."""
+    errors = []
+    closers = [(api.close, fd) for fd in (nul_fd, private_fd) if fd is not None]
+    if control is not None:
+        closers.append((lambda stream: stream.close(), control))
+    elif raw_fd is not None:
+        closers.append((api.close, raw_fd))
+    elif raw_handle is not None:
+        closers.append((api.close_raw_control, raw_handle))
+    for close, value in closers:
+        try:
+            close(value)
+        except OSError as exc:
+            errors.append(str(exc))
+    if errors:
+        raise OSError('managed setup unwind failed: ' + '; '.join(errors))
+
+
+def _acquire_managed(handle, is_windows, api):
+    """M1: one ownership seam for control acquisition AND nt stdin separation, before READY.
+
+    A converted raw handle belongs to its CRT fd; an fdopen'd fd belongs to the stream.
+    Failure closes each currently owned resource explicitly, never by GC. fd 0 is never
+    an unwind resource: after replacement a failed admitted child exits, without rollback.
+    """
+    raw_handle = handle if is_windows else None
+    raw_fd = None if is_windows else handle
+    control = None; private_fd = None; nul_fd = None
+    try:
+        if is_windows:
+            raw_fd = api.control_fd(raw_handle)
+            raw_handle = None
+        control = api.fdopen(raw_fd, 'wb', buffering=0)
+        raw_fd = None
+        api.set_inheritable(control.fileno(), False)
+        if is_windows:
+            private_fd = api.dup(0)
+            # Duplicating a Windows standard stream is an inheritable-dup exception.
+            api.set_inheritable(private_fd, False)
+            nul_fd = api.open_null()
+            api.dup2(nul_fd, 0)
+            closing = nul_fd; nul_fd = None
+            api.close(closing)
+            # subprocess's captured-output path consults GetStdHandle, not CRT fd 0.
+            api.set_stdin(0)
+            if api.get_stdin() != api.get_osfhandle(0):
+                raise OSError('managed stdin handle readback mismatch')
+        return control, private_fd if is_windows else 0
+    except BaseException:
+        _unwind_managed(api, nul_fd, private_fd, control, raw_fd, raw_handle)
+        raise
+
+
 def managed_main(main, argv=None):
     """CLI entry; consumes private flags only in explicitly managed mode."""
     global _CONTEXT
@@ -177,17 +284,17 @@ def managed_main(main, argv=None):
         return main()
     _utf8_stdio()
     i = len(args)-2
+    control = None; lifeline_fd = None; transferred = False
+    is_windows = os.name == 'nt'
+    api = _managed_io(is_windows)
     try:
         handle = int(args[i + 1])
         del args[i:i + 2]
         if argv is None:
             sys.argv[1:] = args
-        if os.name == 'nt':
-            import msvcrt
-            handle = msvcrt.open_osfhandle(handle, os.O_WRONLY | os.O_BINARY)
-        control = os.fdopen(handle, 'wb', buffering=0)
-        os.set_inheritable(control.fileno(), False)
-        _CONTEXT = Managed(control)
+        control, lifeline_fd = _acquire_managed(handle, is_windows, api)
+        _CONTEXT = Managed(control, lifeline_fd)
+        transferred = True
         try:
             code = main()
         except SystemExit as exc:
@@ -196,6 +303,9 @@ def managed_main(main, argv=None):
     except (OSError, ValueError, IndexError) as exc:
         print('owned lifecycle unavailable: %s' % exc, file=sys.stderr)
         return 125
+    finally:
+        if control is not None and not transferred:
+            _unwind_managed(api, private_fd=lifeline_fd if is_windows else None, control=control)
 
 
 def worker_lifeline():
@@ -205,7 +315,7 @@ def worker_lifeline():
     if os.name == 'nt':
         import msvcrt
         from multiprocessing import reduction
-        handle = reduction.duplicate(msvcrt.get_osfhandle(0))
+        handle = reduction.duplicate(msvcrt.get_osfhandle(_CONTEXT._lifeline_fd))
         from multiprocessing.connection import PipeConnection
         return PipeConnection(handle, readable=True, writable=False)
     return Connection(os.dup(0), readable=True, writable=False)
@@ -272,6 +382,8 @@ def run_owned(cmd, timeout, grace=0.0, force=5.0, cancel=None, env=None, encodin
     Grace ends early once the leader is gone (control-eof): nobody is left to cooperate.
     Every launch requires private admission/completion. Explicit custom commands
     use the managed command adapter; there is no uncontained launch mode.
+    stdout/stderr are decoded text; stdout_bytes/stderr_bytes are the raw bytes the
+    leaf CLI relays (bytes, so the result dict is not JSON as a whole).
     """
     start = monotonic(); execution = start + timeout
     events = queue.Queue(); chunks = {'out': [], 'err': []}
@@ -474,11 +586,13 @@ def run_owned(cmd, timeout, grace=0.0, force=5.0, cancel=None, env=None, encodin
             if fd is not None:
                 os.close(fd)
     complete = done is not None and not fault and not timed_out and cleanup == 'verified_empty'
+    out, err = b''.join(chunks['out']), b''.join(chunks['err'])
     return {'returncode': done if complete else (proc.returncode if proc else None),
             'diagnostic_returncode': done,
             'kernel_returncode': proc.returncode if proc else None,
-            'stdout': b''.join(chunks['out']).decode(encoding, 'replace'),
-            'stderr': b''.join(chunks['err']).decode(encoding, 'replace'),
+            'stdout': out.decode(encoding, 'replace'),
+            'stderr': err.decode(encoding, 'replace'),
+            'stdout_bytes': out, 'stderr_bytes': err,
             'timed_out': timed_out, 'complete': complete, 'cleanup': cleanup,
             'reason': fault or '', 'elapsed': monotonic() - start}
 
@@ -578,23 +692,30 @@ def bounded_cli():
         result = {'complete': False, 'stdout': '', 'stderr': '',
                   'reason': 'phase budget exhausted; unmeasured', 'timed_out': True}
     elapsed = monotonic()-started
+    # Relay the child's bytes as written (H-WIN-17): a text-mode stdout on Windows writes LF as CR LF, and records
+    # pass this leaf once per phase, so every pass added a CR; decoding also turned invalid UTF-8 into U+FFFD.
+    # Only our own framing and diagnostics are encoded here.
+    out = result.get('stdout_bytes', result['stdout'].encode('utf-8'))
+    write = sys.stdout.buffer.write
     if args.records:
         if result['complete'] and result.get('returncode') == 0:
-            sys.stdout.write(result['stdout'])
+            write(out)
         else:
             # A complete key/value pair is a committed phase checkpoint. Keep
             # it even if a subsequent file read stalls; drop any partial pair.
-            fields = result['stdout'].split('\0')
+            fields = out.split(b'\0')
             for i in range(0, len(fields)-2, 2):
-                sys.stdout.write(fields[i]+'\0'+fields[i+1]+'\0')
-            sys.stdout.write('_OWNED_FAILURE\0%s\0' % (result['reason'] or 'timeout/incomplete'))
-        sys.stdout.write('_OWNED_STARTED\0%.9f\0_OWNED_ELAPSED\0%.9f\0' % (origin, elapsed))
-        sys.stdout.write(('_OWNED_SPENT\0%.9f\0_OWNED_RETURNED\0' + '1\0') % (args.spent+elapsed))
+                write(fields[i]+b'\0'+fields[i+1]+b'\0')
+            write(('_OWNED_FAILURE\0%s\0' % (result['reason'] or 'timeout/incomplete')).encode('utf-8', 'replace'))
+        write(('_OWNED_STARTED\0%.9f\0_OWNED_ELAPSED\0%.9f\0' % (origin, elapsed)).encode('ascii'))
+        write((('_OWNED_SPENT\0%.9f\0_OWNED_RETURNED\0' + '1\0') % (args.spent+elapsed)).encode('ascii'))
     else:
-        sys.stdout.write(result['stdout'])
-    sys.stderr.write(result['stderr'])
+        write(out)
+    sys.stdout.flush()
+    sys.stderr.buffer.write(result.get('stderr_bytes', result['stderr'].encode('utf-8')))
     if not result['complete']:
-        print('owned execution incomplete: ' + (result['reason'] or 'deadline'), file=sys.stderr)
+        sys.stderr.buffer.write(('owned execution incomplete: %s\n' % (result['reason'] or 'deadline')).encode('utf-8', 'replace'))
+    sys.stderr.flush()
     return (result.get('returncode') or 0) if result['complete'] else (124 if result['timed_out'] else 125)
 
 
