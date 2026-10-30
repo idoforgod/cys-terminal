@@ -509,18 +509,38 @@ pub fn try_hold_restore_lease(state_dir: &Path) -> (LeaseState, Option<LeaseGuar
         Ok(f) => f,
         Err(_) => return (LeaseState::Unavailable, None),
     };
+    match try_lock_region(&file) {
+        LockTry::Acquired => (LeaseState::Free, Some(LeaseGuard { file, path })),
+        LockTry::Busy => (LeaseState::Held, None),
+        LockTry::Failed => (LeaseState::Unavailable, None),
+    }
+}
+
+/// 비차단 배타 락 한 번의 결과.
+enum LockTry {
+    Acquired,
+    /// 다른 보유자가 있다(unix `EWOULDBLOCK`/`EAGAIN` · Windows `ERROR_LOCK_VIOLATION`=33).
+    Busy,
+    /// 그 밖의 실패 — 판정 불가.
+    Failed,
+}
+
+/// ★(0.14.56 PHX · r2 §5-1 · RB-4) 락 영역의 **단일 정의처** — `try_hold_restore_lease` 와
+/// `probe_restore_lock` 이 같은 함수를 부른다. 영역은 phoenix 와 정확히 같아야 한다: unix `flock`(파일 전체) ·
+/// Windows 는 `msvcrt.locking(LK_NBLCK, 1)` 이 seek(0) 뒤 **byte 0 한 바이트**를 잠그므로 같은 범위를 쓴다.
+/// 획득한 락의 해제는 호출자 몫이다(`LeaseGuard` 의 drop).
+fn try_lock_region(file: &std::fs::File) -> LockTry {
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc == 0 {
-            return (LeaseState::Free, Some(LeaseGuard { file, path }));
+            return LockTry::Acquired;
         }
-        let err = std::io::Error::last_os_error();
         // EWOULDBLOCK(=EAGAIN) 만 '다른 보유자'다. 그 밖의 오류는 판정 불가 → 보류.
-        return match err.raw_os_error() {
-            Some(e) if e == libc::EWOULDBLOCK || e == libc::EAGAIN => (LeaseState::Held, None),
-            _ => (LeaseState::Unavailable, None),
+        return match std::io::Error::last_os_error().raw_os_error() {
+            Some(e) if e == libc::EWOULDBLOCK || e == libc::EAGAIN => LockTry::Busy,
+            _ => LockTry::Failed,
         };
     }
     #[cfg(windows)]
@@ -541,18 +561,74 @@ pub fn try_hold_restore_lease(state_dir: &Path) -> (LeaseState, Option<LeaseGuar
             )
         };
         if ok != 0 {
-            return (LeaseState::Free, Some(LeaseGuard { file, path }));
+            return LockTry::Acquired;
         }
-        // 잠긴 것(ERROR_LOCK_VIOLATION=33)만 Held · 그 밖은 판정 불가 → 보류.
+        // 잠긴 것(ERROR_LOCK_VIOLATION=33)만 Busy · 그 밖은 판정 불가 → 보류.
         return match std::io::Error::last_os_error().raw_os_error() {
-            Some(33) => (LeaseState::Held, None),
-            _ => (LeaseState::Unavailable, None),
+            Some(33) => LockTry::Busy,
+            _ => LockTry::Failed,
         };
     }
     #[cfg(not(any(unix, windows)))]
     {
-        drop(file);
-        (LeaseState::Unavailable, None)
+        let _ = file;
+        LockTry::Failed
+    }
+}
+
+/// ★(0.14.56 PHX · r1 §7-2 · S5) 자식에게 넘길 잠금 — `<state>/phoenix/<name>` 을 만들고(없으면) 잡은 채
+/// **파일 그대로** 돌려준다. 호출자는 그 파일을 자식의 표준입력으로 넘기고 자기 사본을 즉시 닫는다 — 잠금은
+/// 열린 파일 설명(open file description)에 붙으므로 그 뒤로는 자식(과 표준입력을 물려받은 자손)이 살아 있는 동안만
+/// 잡혀 있다. `LeaseGuard` 를 쓰지 않는 이유: 그 drop 의 명시 해제(`LOCK_UN`)는 같은 설명을 공유하는 자식의
+/// 잠금까지 풀어 버린다(닫기만 하면 풀리지 않는다). unix 전용 — Windows 의 바이트 잠금은 핸들에 붙어 자식에게
+/// 넘어가지 않는다(설계도 unix 만 둔다).
+#[cfg(unix)]
+pub fn hold_named_lock_for_child(state_dir: &Path, name: &str) -> Result<std::fs::File, LeaseState> {
+    let path = canonical_state_dir(state_dir).join("phoenix").join(name);
+    if let Some(dir) = path.parent() {
+        if std::fs::create_dir_all(dir).is_err() {
+            return Err(LeaseState::Unavailable);
+        }
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|_| LeaseState::Unavailable)?;
+    match try_lock_region(&file) {
+        LockTry::Acquired => Ok(file),
+        LockTry::Busy => Err(LeaseState::Held),
+        LockTry::Failed => Err(LeaseState::Unavailable),
+    }
+}
+
+/// ★(0.14.56 PHX · r2 §5-1) 복원 잠금(`<state>/phoenix/<name>`)을 **아무것도 만들지 않고** 관측한다 —
+/// 디렉터리도 파일도 만들지 않고, 읽기 전용으로 열고, 잡히면 **즉시 놓는다**.
+///
+/// - 경로는 `restore_lease_path` 와 같은 심링크 해소(`canonical_state_dir`)를 거친다.
+/// - 파일(또는 그 위 디렉터리)이 없으면 `Free` — 보유자는 그 경로를 열었어야 하고 phoenix 는 `a+` 로 열어
+///   만든다. 그 밖의 열기 실패·일반 파일이 아님은 `Unavailable`(판정 불가 — 건너뛰기를 허락하지 않는다).
+/// - 즉시 놓는 이유(reclaim 의 가드와 반대): 관측 뒤 데몬은 **자기** authority 를 건너뛰거나 돌릴 뿐이다.
+///   관측 직후 시작한 복원은 제 일을 하고 건너뛰기와 충돌하지 않으며, authority 는 잠금을 스스로 잡는다.
+pub fn probe_restore_lock(state_dir: &Path, name: &str) -> LeaseState {
+    let path = canonical_state_dir(state_dir).join("phoenix").join(name);
+    let file = match std::fs::OpenOptions::new().read(true).open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return LeaseState::Free,
+        Err(_) => return LeaseState::Unavailable,
+    };
+    if !file.metadata().is_ok_and(|m| m.is_file()) {
+        return LeaseState::Unavailable;
+    }
+    match try_lock_region(&file) {
+        LockTry::Acquired => {
+            drop(LeaseGuard { file, path }); // 즉시 해제(unlock + close)
+            LeaseState::Free
+        }
+        LockTry::Busy => LeaseState::Held,
+        LockTry::Failed => LeaseState::Unavailable,
     }
 }
 
@@ -1195,6 +1271,186 @@ pub(crate) mod tests {
             Decision::Defer("restore_lease_unavailable"),
             "판정 불능인데 결합했다"
         );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    // ── ★(0.14.56 PHX · r2 §5-1 · §9 M1) probe_restore_lock — 만들지 않고, 같은 영역을 보고, 즉시 놓는다 ──
+
+    fn probe_dir(label: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "cys-probe-{label}-{}-{}",
+            std::process::id(),
+            crate::state::now_epoch() as u64
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// ★M1 — 첫 부팅(phoenix/ 없음)·잠금 파일 없음은 `Free` 이고, 관측은 **아무것도 만들지 않는다**.
+    #[test]
+    fn probe_on_fresh_state_dir_is_free_and_creates_nothing() {
+        let base = probe_dir("fresh");
+        for name in ["restore.lease", "restore.run.lock", "hook.run.lock"] {
+            assert_eq!(probe_restore_lock(&base, name), LeaseState::Free, "{name}");
+        }
+        assert!(!base.join("phoenix").exists(), "관측이 phoenix/ 를 만들었다");
+        std::fs::create_dir_all(base.join("phoenix")).unwrap();
+        for name in ["restore.lease", "restore.run.lock", "hook.run.lock"] {
+            assert_eq!(probe_restore_lock(&base, name), LeaseState::Free, "{name}");
+            assert!(!base.join("phoenix").join(name).exists(), "관측이 {name} 을 만들었다");
+        }
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// 같은 영역 · 즉시 해제 — 데몬이 쥔 lease 는 `Held` 로 보이고, 놓으면 `Free`, 그리고 관측 뒤에는
+    /// 아무도 잠금을 쥐고 있지 않다(관측이 놓지 않으면 마지막 획득이 `Held` 가 된다).
+    #[cfg(unix)]
+    #[test]
+    fn probe_sees_a_held_lease_and_releases_at_once() {
+        let base = probe_dir("held");
+        let (st, guard) = try_hold_restore_lease(&base);
+        assert_eq!(st, LeaseState::Free);
+        assert_eq!(probe_restore_lock(&base, "restore.lease"), LeaseState::Held, "보유 중인 lease 를 못 봤다");
+        drop(guard);
+        assert_eq!(probe_restore_lock(&base, "restore.lease"), LeaseState::Free);
+        let (st2, _g2) = try_hold_restore_lease(&base);
+        assert_eq!(st2, LeaseState::Free, "관측이 잠금을 놓지 않았다");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// ★M1-held — phoenix 와 같은 꼴의 보유자(**다른 프로세스**가 `open(p,"a+")` + `flock(LOCK_EX)`)를 `Held` 로
+    /// 본다. 보유자가 잡았다는 사실은 자식의 출력 줄로 기다린다(시계가 아니라 사건). 보유자가 끝나면 `Free`.
+    #[cfg(unix)]
+    #[test]
+    fn probe_sees_phoenix_style_holder() {
+        use crate::state::HideConsole;
+        use std::io::BufRead;
+        let base = probe_dir("child");
+        std::fs::create_dir_all(base.join("phoenix")).unwrap();
+        let lock = base.join("phoenix").join("restore.run.lock");
+        let mut child = cys::python_command("python3")
+            .hide_console()
+            .args([
+                "-c",
+                "import fcntl,sys\nf=open(sys.argv[1],'a+')\nfcntl.flock(f,fcntl.LOCK_EX)\n\
+                 sys.stdout.write('locked\\n');sys.stdout.flush()\nsys.stdin.read()",
+            ])
+            .arg(&lock)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("python3 is required for the phoenix-style holder specimen");
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(line, "locked\n", "보유자가 잠그지 못했다");
+        let held = probe_restore_lock(&base, "restore.run.lock");
+        drop(child.stdin.take()); // 보유자 종료 신호(stdin EOF)
+        let status = child.wait().unwrap();
+        assert_eq!(held, LeaseState::Held, "다른 프로세스의 a+ flock 을 못 봤다");
+        assert!(status.success(), "보유자 비정상 종료: {status:?}");
+        assert_eq!(probe_restore_lock(&base, "restore.run.lock"), LeaseState::Free, "보유자 종료 뒤에도 Held");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// ★M1-win (r2 §9) — Windows: phoenix 와 같은 꼴의 보유자(`open(p,"a+")` · `seek(0)` ·
+    /// `msvcrt.locking(LK_NBLCK, 1)` = byte 0 한 바이트, `javis_phoenix.py` `_try_lock_nb`)를 **읽기 전용** 핸들의
+    /// `LockFileEx`(byte 0 · 길이 1) 관측이 `Held` 로 본다. 보유자가 끝나면 `Free`.
+    /// ⚠ 이 검체는 맥에서 컴파일되지 않는다 — Windows 실행 결과는 UNMEASURED(windows-health 배선은 S6).
+    #[cfg(windows)]
+    #[test]
+    fn probe_readonly_lockfileex_matches_msvcrt_region() {
+        use crate::state::HideConsole;
+        use std::io::BufRead;
+        let base = probe_dir("win");
+        std::fs::create_dir_all(base.join("phoenix")).unwrap();
+        let lock = base.join("phoenix").join("restore.run.lock");
+        let mut child = cys::python_command("python")
+            .hide_console()
+            .args([
+                "-c",
+                "import msvcrt,sys\nf=open(sys.argv[1],'a+')\nf.seek(0)\n\
+                 msvcrt.locking(f.fileno(),msvcrt.LK_NBLCK,1)\n\
+                 sys.stdout.write('locked\\n');sys.stdout.flush()\nsys.stdin.read()",
+            ])
+            .arg(&lock)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("python is required for the phoenix-style holder specimen");
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(line.trim_end(), "locked", "보유자가 잠그지 못했다");
+        let held = probe_restore_lock(&base, "restore.run.lock");
+        drop(child.stdin.take());
+        let status = child.wait().unwrap();
+        assert_eq!(held, LeaseState::Held, "msvcrt byte-0 보유자를 못 봤다(영역 불일치)");
+        assert!(status.success(), "보유자 비정상 종료: {status:?}");
+        assert_eq!(probe_restore_lock(&base, "restore.run.lock"), LeaseState::Free, "보유자 종료 뒤에도 Held");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// ★M1-dir — 잠금 자리에 디렉터리가 있으면 판정 불가(`Unavailable`)다. 디렉터리는 읽기 전용으로 열리고
+    /// flock 도 받으므로 `is_file` 검사가 없으면 `Free` 로 접힌다.
+    #[cfg(unix)]
+    #[test]
+    fn probe_directory_is_unavailable() {
+        let base = probe_dir("dir");
+        std::fs::create_dir_all(base.join("phoenix").join("restore.run.lock")).unwrap();
+        assert_eq!(probe_restore_lock(&base, "restore.run.lock"), LeaseState::Unavailable);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// 위 디렉터리 자리에 일반 파일이 있으면(ENOTDIR) 없음이 아니라 판정 불가다(unix).
+    #[cfg(unix)]
+    #[test]
+    fn probe_parent_not_a_directory_is_unavailable() {
+        let base = probe_dir("notdir");
+        std::fs::write(base.join("phoenix"), b"not-a-dir").unwrap();
+        assert_eq!(probe_restore_lock(&base, "restore.lease"), LeaseState::Unavailable);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// 읽기 전용으로 연다 — 쓰기 권한 없는 잠금 파일도 관측된다(대조: 쓰기로 여는 `try_hold_restore_lease` 는
+    /// 같은 파일에서 `Unavailable` 이다). 관측은 그 파일의 내용·모드를 바꾸지 않는다.
+    #[cfg(unix)]
+    #[test]
+    fn probe_opens_read_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = probe_dir("ro");
+        std::fs::create_dir_all(base.join("phoenix")).unwrap();
+        let f = base.join("phoenix").join("restore.lease");
+        std::fs::write(&f, b"x").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let probed = probe_restore_lock(&base, "restore.lease");
+        let (held, _g) = try_hold_restore_lease(&base);
+        let after = std::fs::metadata(&f).unwrap();
+        let body = std::fs::read(&f).unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(probed, LeaseState::Free, "읽기 전용 파일을 관측하지 못했다");
+        assert_eq!(held, LeaseState::Unavailable, "대조: 쓰기 열기가 0444 파일에서 성공했다(전제 붕괴)");
+        assert_eq!(after.permissions().mode() & 0o777, 0o444);
+        assert_eq!(body, b"x");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// 심링크 대칭 — 심링크 경유로 잡은 lease 를 실경로 관측이 `Held` 로 본다(`restore_lease_path` 와 같은 해소).
+    #[cfg(unix)]
+    #[test]
+    fn probe_resolves_a_symlinked_state_dir() {
+        let base = probe_dir("sym");
+        let real = base.join("real");
+        let link = base.join("link");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let (st, guard) = try_hold_restore_lease(&link);
+        assert_eq!(st, LeaseState::Free);
+        assert_eq!(probe_restore_lock(&real, "restore.lease"), LeaseState::Held);
+        assert_eq!(probe_restore_lock(&link, "restore.lease"), LeaseState::Held);
+        drop(guard);
         std::fs::remove_dir_all(&base).ok();
     }
 

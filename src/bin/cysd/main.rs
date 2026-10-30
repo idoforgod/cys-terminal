@@ -53,6 +53,7 @@ mod knobs;
 mod office_bridge;
 mod native_publication;
 mod pending_requests;
+mod phoenix_plan;
 mod policy_loader;
 mod recall;
 mod reclaim;
@@ -2243,6 +2244,7 @@ fn spawn_auto_restore(
             let log_path = state_dir.join("phoenix-restore.log");
             let state_dir = state_dir.to_path_buf();
             let daemon = daemon.clone();
+            let socket_owned = socket.to_string();
             std::thread::spawn(move || {
                 let log_for_panic = log_path.clone();
                 // ★P0-5 침묵사 차단(D3/W5·CI 28780215417 실증: auto-restore 스레드가 std/time.rs panic 으로 즉사
@@ -2250,12 +2252,33 @@ fn spawn_auto_restore(
                 //   감싸 panic 을 삼키지 않고 stderr + phoenix-restore.log 에 **1회 기록**한다 — 무한 재스폰 금지
                 //   (재기동은 다음 데몬 부트/schtasks 소관). 이 웨이브가 죽이려는 '스레드 침묵사' 클래스의 구조 수리.
                 guard_restore_panic(&log_for_panic, || {
+                    // ★(0.14.56 PHX · r2 §3) 사용자 스크립트 결정이 먼저다 — allow 파일이 없으면 열기 한 번의 실패로
+                    //   끝나고(C1) 아래는 오늘과 같은 길이다.
+                    let pre = read_prerestore();
                     // ★B1: 임베드 추출 실행 우선(바이너리=스크립트 동일 커밋 하드보장) → 실패 시 manifest-검증 디스크 폴백.
                     match resolve_phoenix_source(&state_dir, &disk_phoenix, &program, &daemon) {
                         PhoenixResolve::Ready { script, cleanup } => {
                             let mut run_args = vec![script.to_string_lossy().into_owned()];
                             run_args.extend(tail);
-                            loop_auto_restore(&daemon, &program, &run_args, &env, &log_path);
+                            // ★(0.14.56 PHX · r2 §7) 결과 파일 채널의 자리 — 추출 트리 E, 디스크 폴백이면 부트별 디렉터리.
+                            let own_rdir = if cleanup.is_none() { authority_results_dir(&state_dir) } else { None };
+                            let rdir = cleanup.clone().or_else(|| own_rdir.clone());
+                            let run = AuthorityRun {
+                                daemon: &daemon,
+                                program: &program,
+                                script: &script,
+                                socket: &socket_owned,
+                                args: &run_args,
+                                env: &env,
+                                log_path: &log_path,
+                                state_dir: &state_dir,
+                                rdir: rdir.as_deref(),
+                                roots_at_plan: None,
+                            };
+                            prerestore_then_authority(&run, cleanup.as_deref(), pre);
+                            if let Some(dir) = own_rdir {
+                                let _ = std::fs::remove_dir_all(&dir);
+                            }
                             // temp 누수 0: 추출본은 실행 후 정리(디스크 폴백은 cleanup=None).
                             if let Some(dir) = cleanup {
                                 let _ = std::fs::remove_dir_all(&dir);
@@ -2469,24 +2492,85 @@ fn autorestore_retry_delay() -> std::time::Duration {
     std::time::Duration::from_millis(ms)
 }
 
+/// ★(0.14.56 PHX) authority 한 부팅분의 입력 — 루프·재확인·계획 호출이 같은 값을 쓴다.
+struct AuthorityRun<'a> {
+    daemon: &'a std::sync::Arc<Daemon>,
+    program: &'a str,
+    /// 실행할 phoenix(임베드 추출본 또는 검증된 디스크본) — 계획도 **같은** 스크립트로 묻는다(r1 §5-1).
+    script: &'a std::path::Path,
+    socket: &'a str,
+    args: &'a [String],
+    env: &'a [(String, String)],
+    log_path: &'a std::path::Path,
+    state_dir: &'a std::path::Path,
+    /// 결과 파일·계획 출력의 자리(데몬 소유). None 이면 결과 채널이 없다.
+    rdir: Option<&'a std::path::Path>,
+    /// 관찰 이음매(r2 §9 D1-a): 계획을 띄우는 순간의 `restore_roots` 길이를 적는다. 프로덕션은 None.
+    roots_at_plan: Option<&'a std::sync::Mutex<Vec<usize>>>,
+}
+
+/// 마지막 시도의 사실(r2 §7-1): exit · 결과 파일 바이트 · 결과 채널을 넘겼는가.
+struct LastAttempt {
+    exit: Option<i32>,
+    result: Option<Vec<u8>>,
+    channel: bool,
+}
+
 /// auto-restore 자식을 실행하고 exit 계약에 따라 처리한다. 비0(단 5·6 제외)은 delay 후 정확히 1회 재시도한다
 /// — 재시도의 멱등성은 phoenix 의 lease·liveness 재산정에 맡긴다(수동 복원이 이미 끝났으면 재시도는 NOOP·중복 스폰 0).
-fn loop_auto_restore(
-    daemon: &std::sync::Arc<Daemon>,
-    program: &str,
-    args: &[String],
-    env: &[(String, String)],
-    log_path: &std::path::Path,
-) {
-    let daemon = daemon.clone();
-    let program = program.to_string();
-    let args = args.to_vec();
-    let env = env.to_vec();
-    let log_path = log_path.to_path_buf();
+/// ★(0.14.56 PHX · r2 §7-1) 시도마다 결과 파일 채널을 넘기고 **마지막 시도**의 사실을 돌려준다(판정은 호출자).
+fn loop_auto_restore(run: &AuthorityRun) -> LastAttempt {
+    let mut last = LastAttempt { exit: None, result: None, channel: false };
     loop_auto_restore_with(
-        |_attempt| run_auto_restore_once(&daemon, &program, &args, &env, &log_path),
+        |attempt| {
+            last = run_attempt_with_result(run, attempt);
+            last.exit
+        },
         autorestore_retry_delay(),
     );
+    last
+}
+
+/// ★(0.14.56 PHX · r1 §8-2 · r2 §7-1) authority 1회 + 결과 파일. 시도 **전에** 그 자리의 파일을 지운다(낡은 판정을
+/// 읽지 않게) — 지우지 못하면 변수를 넘기지 않는다(exit 0 이면 `no_result_channel` 로 판독 불가). 판독 ≤ 64 KiB 후 지운다.
+fn run_attempt_with_result(run: &AuthorityRun, attempt: u32) -> LastAttempt {
+    let path = run.rdir.map(|d| d.join(format!("result-{attempt}.json"))).filter(|p| match std::fs::remove_file(p) {
+        Ok(()) => true,
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+    });
+    let mut env = run.env.to_vec();
+    if let Some(p) = &path {
+        env.push(("PHOENIX_RESULT_FILE".to_string(), p.to_string_lossy().into_owned()));
+    }
+    let exit = run_auto_restore_once(run.daemon, run.program, run.args, &env, run.log_path);
+    let result = path.as_ref().and_then(|p| {
+        let b = read_capped(p, phoenix_plan::PLAN_OUTPUT_CAP);
+        let _ = std::fs::remove_file(p);
+        b
+    });
+    LastAttempt { exit, result, channel: path.is_some() }
+}
+
+/// 파일 앞 `cap` + 1 바이트(넘치면 판독기가 판정한다). 없거나 못 읽으면 None.
+fn read_capped(p: &std::path::Path, cap: usize) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let f = std::fs::File::open(p).ok()?;
+    let mut b = Vec::new();
+    f.take(cap as u64 + 1).read_to_end(&mut b).ok()?;
+    Some(b)
+}
+
+/// 디스크 폴백(추출 트리 없음)용 부트별 결과 디렉터리 — `phoenix-embed/` 아래라 다음 부팅의 prune 이 치운다.
+/// 만들지 못하면 None(결과 채널 없음 → exit 0 은 판독 불가로 한 번 재확인한다: 복원 쪽).
+fn authority_results_dir(state_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let d = state_dir
+        .join("phoenix-embed")
+        .join(format!("results-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&d).ok().map(|_| d)
 }
 
 /// ★재시도 결정 루프(test seam · 순수 로직 — 러너·지연 주입). 반환 = 실행 횟수(테스트 단언용).
@@ -2613,6 +2697,9 @@ fn run_auto_restore_once(
     // PYTHONDONTWRITEBYTECODE 를 얹어 콜드부트 복원이 번들 봉인을 깨지 않게 한다.
     let mut cmd = cys::python_command(program);
     cmd.args(args).env("CYS_NO_AUTOSTART", "1");
+    // ★(0.14.56 PHX · S4 R1-3) 결과 채널은 데몬이 **이번 시도에** 넘긴 값뿐이다 — 데몬 자신의 환경에 같은 이름이
+    //   있어도 물려주지 않는다(채널이 없는 시도는 변수가 없어야 한다).
+    cmd.env_remove("PHOENIX_RESULT_FILE");
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -2671,6 +2758,812 @@ fn run_auto_restore_once(
             None
         }
     }
+}
+
+/// ★(0.14.56 PHX · r1 §5-3) 계획 호출 상한 60 s. 시험 이음매 `CYS_PHOENIX_PLAN_TIMEOUT_MS` 는 시험 빌드에서만 읽는다.
+const PLAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn plan_timeout() -> std::time::Duration {
+    if cfg!(test) {
+        if let Some(ms) = std::env::var("CYS_PHOENIX_PLAN_TIMEOUT_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+            return std::time::Duration::from_millis(ms);
+        }
+    }
+    PLAN_TIMEOUT
+}
+
+/// ★(0.14.56 PHX · r1 §8-2 · r2 §7-2) 재확인은 기본 켜짐 — `CYS_AUTORESTORE_LEASE_RECHECK=0` 만 끈다.
+fn lease_recheck_enabled() -> bool {
+    std::env::var("CYS_AUTORESTORE_LEASE_RECHECK").map(|v| v != "0").unwrap_or(true)
+}
+
+/// 재확인 지연 D: 기본 30 s, `CYS_AUTORESTORE_LEASE_RECHECK_DELAY_MS` 는 [5 000, 300 000] 로 묶는다(0 은 시험 빌드만).
+fn lease_recheck_delay() -> std::time::Duration {
+    let raw = std::env::var("CYS_AUTORESTORE_LEASE_RECHECK_DELAY_MS").ok();
+    std::time::Duration::from_millis(recheck_delay_ms(raw.as_deref(), cfg!(test)))
+}
+
+/// 순수 — 해석 불가·부재 = 30 000. 하한 5 000 은 시험 빌드(`allow_zero`)에서만 풀린다.
+fn recheck_delay_ms(raw: Option<&str>, allow_zero: bool) -> u64 {
+    let ms = raw.and_then(|v| v.parse::<u64>().ok()).unwrap_or(30_000);
+    if allow_zero { ms.min(300_000) } else { ms.clamp(5_000, 300_000) }
+}
+
+/// 복원 로그에 줄을 덧붙인다(머리말 없이 — `open_restore_log` 는 부팅 머리말을 쓰므로 여기 쓰지 않는다).
+fn append_restore_log(log_path: &std::path::Path, line: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log_path) {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+/// ★(0.14.56 PHX · r2 §7-1·§7-2) 루프가 끝난 뒤 마지막 시도를 판정한다. Done·Exited 는 오늘과 같은 길이다
+/// (복원 로그에 아무것도 더하지 않는다 — C1). Retreat·Ambiguous 만 재확인으로 간다: 판독 불가는 done 이 아니다.
+fn finish_authority(run: &AuthorityRun, last: LastAttempt) {
+    use phoenix_plan::AuthorityOutcome as A;
+    let outcome = if last.channel {
+        phoenix_plan::classify_authority(last.exit, last.result.as_deref())
+    } else if last.exit == Some(0) {
+        A::Ambiguous(phoenix_plan::CAUSE_NO_RESULT_CHANNEL.to_string())
+    } else {
+        A::Exited(last.exit)
+    };
+    match outcome {
+        A::Done => {}
+        A::Exited(code) => {
+            if let Some(b) = &last.result {
+                eprintln!("[cysd] auto-restore exit={code:?} result-file={}", String::from_utf8_lossy(b).trim());
+            }
+        }
+        trigger => lease_recheck(run, &trigger),
+    }
+}
+
+/// N8 의 원인 문구(r2 §6-4).
+fn recheck_cause(trigger: &phoenix_plan::AuthorityOutcome) -> String {
+    match trigger {
+        phoenix_plan::AuthorityOutcome::Ambiguous(c) => format!("결과 파일을 읽지 못함({c})"),
+        _ => "LEASE_HELD".to_string(),
+    }
+}
+
+/// N8(escalation · r1 §8-2 문안 + r2 §6-4 원인). 이번 부팅의 자동복원이 일어나지 않았을 수 있다 — 성공으로 보고하지 않는다.
+fn push_n8(daemon: &std::sync::Arc<Daemon>, delay: std::time::Duration, cause: &str) {
+    daemon.push_feed_notification(
+        "error",
+        &format!(
+            "다른 복원이 {}초 뒤에도 끝나지 않았습니다 — 이번 부팅의 자동복원은 일어나지 않았을 수 있습니다",
+            delay.as_secs()
+        ),
+        &format!(
+            "`restore.run.lock`/`restore.lease` 를 쥔 프로세스가 아직 있습니다. 같은 역할을 두 번 띄우지 않으려고 \
+             물러났습니다. 좌석이 비어 있으면 그 프로세스를 확인한 뒤 데몬을 다시 시작하십시오. 원인: {cause}."
+        ),
+        None,
+    );
+}
+
+/// ★(0.14.56 PHX · r2 §7-2) 한 번의 재확인 — 꼬리말 → D 대기 → 두 잠금 관측(Held ⇒ N8, 멈춤) → 계획 →
+/// 게이트된 Empty ⇒ 「남은 대상이 없습니다」 멈춤 · 그 밖 ⇒ authority **한 번**(Done 끝 · Retreat/Ambiguous ⇒ N8 · 비0 ⇒ 로그).
+/// 두 번째 재확인은 없다(유계). 모호한 상태는 done 도 skip 도 아니다(r2 §7-3).
+fn lease_recheck(run: &AuthorityRun, trigger: &phoenix_plan::AuthorityOutcome) {
+    use phoenix_plan::{AuthorityOutcome as A, PlanOutcome};
+    use reclaim::{probe_restore_lock, LeaseState};
+    let cause = match trigger {
+        A::Ambiguous(c) => Some(c.as_str()),
+        _ => None,
+    };
+    if !lease_recheck_enabled() {
+        append_restore_log(
+            run.log_path,
+            &match cause {
+                Some(c) => format!("[cysd] ambiguous result, recheck disabled ({c}; CYS_AUTORESTORE_LEASE_RECHECK=0)"),
+                None => "[cysd] LEASE_HELD, recheck disabled (CYS_AUTORESTORE_LEASE_RECHECK=0)".to_string(),
+            },
+        );
+        return;
+    }
+    let d = lease_recheck_delay();
+    append_restore_log(
+        run.log_path,
+        &match cause {
+            Some(c) => format!(
+                "===== phoenix auto-restore exit=0 (결과 파일 판독 불가: {c} — {}초 뒤 한 번 재확인) =====",
+                d.as_secs()
+            ),
+            None => format!(
+                "===== phoenix auto-restore exit=0 (LEASE_HELD: 다른 복원이 진행 중이라 이번 실행은 물러났습니다 — {}초 뒤 한 번 재확인) =====",
+                d.as_secs()
+            ),
+        },
+    );
+    std::thread::sleep(d);
+    let probe = || {
+        (
+            probe_restore_lock(run.state_dir, "restore.lease"),
+            probe_restore_lock(run.state_dir, "restore.run.lock"),
+        )
+    };
+    let (lease, runlock) = probe();
+    if lease == LeaseState::Held || runlock == LeaseState::Held {
+        append_restore_log(run.log_path, &format!("[cysd] recheck: restore lock held (lease={lease:?} run.lock={runlock:?}) — 이번 부팅은 멈춘다"));
+        push_n8(run.daemon, d, &recheck_cause(trigger));
+        return;
+    }
+    if lease == LeaseState::Unavailable || runlock == LeaseState::Unavailable {
+        append_restore_log(run.log_path, &format!("[cysd] recheck: restore lock probe unavailable (lease={lease:?} run.lock={runlock:?}) — 계획으로 진행"));
+    }
+    let mut plan = call_plan(run, "recheck", 0);
+    if plan == PlanOutcome::Empty {
+        let (lease, runlock) = probe();
+        plan = phoenix_plan::gate_empty(plan, lease, runlock);
+    }
+    if plan.permits_skip() {
+        append_restore_log(run.log_path, "[cysd] recheck: 다른 복원이 끝났고 남은 대상이 없습니다");
+        return;
+    }
+    let again = run_attempt_with_result(run, 2);
+    let outcome = if again.channel {
+        phoenix_plan::classify_authority(again.exit, again.result.as_deref())
+    } else if again.exit == Some(0) {
+        A::Ambiguous(phoenix_plan::CAUSE_NO_RESULT_CHANNEL.to_string())
+    } else {
+        A::Exited(again.exit)
+    };
+    match &outcome {
+        A::Done => {}
+        A::Exited(code) => append_restore_log(run.log_path, &format!("[cysd] recheck attempt exit={code:?} — 더 반복하지 않는다")),
+        retreat_or_ambiguous => push_n8(run.daemon, d, &recheck_cause(retreat_or_ambiguous)),
+    }
+}
+
+/// ★(0.14.56 PHX · r1 §5) 계획 호출 — authority 와 **같은** 스크립트·인터프리터·env 로 `plan` 을 묻는다. 출력은
+/// 데몬 소유 파일(`<rdir>/plan-<n>.out`)로 받고(파이프 없음), 100 ms 폴링·60 s 상한(넘기면 kill → reap → Timeout),
+/// 끝난 뒤 앞 64 KiB 를 판정하고 파일 전체를 복원 로그에 머리말과 함께 붙인다. 순수 판정은 `classify_plan`.
+fn call_plan(run: &AuthorityRun, why: &str, n: u32) -> phoenix_plan::PlanOutcome {
+    use phoenix_plan::{PlanFailure, PlanOutcome};
+    let Some(dir) = run.rdir else {
+        let o = PlanOutcome::Unobtainable(PlanFailure::SpawnFailed("plan output file: no daemon-owned directory".into()));
+        append_restore_log(run.log_path, &format!("===== phoenix plan ({why}) outcome={o:?} ====="));
+        return o;
+    };
+    let out_path = dir.join(format!("plan-{n}.out"));
+    let outcome = run_plan(run, &out_path, None);
+    log_plan(run, why, &outcome, &out_path);
+    outcome
+}
+
+/// 계획 한 번을 띄워 판정한다(복원 로그에는 쓰지 않는다 — `log_plan` 몫). `compare` 가 있으면
+/// `--compare-plan <파일>`(r2 §3 훅 뒤 계획). 출력 파일은 호출자가 고른다 — 훅 앞·훅 뒤·재확인이 서로 다른
+/// 파일이다(S4 R1-9: 훅 뒤 계획이 비교할 훅 앞 출력을 덮지 않는다).
+fn run_plan(
+    run: &AuthorityRun,
+    out_path: &std::path::Path,
+    compare: Option<&std::path::Path>,
+) -> phoenix_plan::PlanOutcome {
+    use phoenix_plan::{classify_plan, PlanFailure, PlanOutcome};
+    if let Some(rec) = run.roots_at_plan {
+        let n = run.daemon.restore_roots.lock().unwrap_or_else(|e| e.into_inner()).len();
+        rec.lock().unwrap_or_else(|e| e.into_inner()).push(n);
+    }
+    match spawn_and_bound_plan(run, out_path, compare) {
+        Err(e) => classify_plan(Err(e), None, false, b""),
+        Ok(PlanWait::WaitFailed(e)) => PlanOutcome::Unobtainable(PlanFailure::WaitFailed(e)),
+        Ok(PlanWait::Ended { code, timed_out }) => {
+            let out = read_capped(out_path, phoenix_plan::PLAN_OUTPUT_CAP).unwrap_or_default();
+            classify_plan(Ok(()), code, timed_out, &out)
+        }
+    }
+}
+
+/// 계획 블록을 복원 로그에 남긴다 — 머리말 한 줄 + 출력 파일 전체.
+fn log_plan(run: &AuthorityRun, header: &str, outcome: &phoenix_plan::PlanOutcome, out_path: &std::path::Path) {
+    append_restore_log(run.log_path, &format!("===== phoenix plan ({header}) outcome={outcome:?} ====="));
+    if let Ok(all) = std::fs::read(out_path) {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(run.log_path) {
+            let _ = f.write_all(&all);
+        }
+    }
+}
+
+/// 계획 자식이 어떻게 끝났는가(판정 전 프로세스 사실).
+enum PlanWait {
+    Ended { code: Option<i32>, timed_out: bool },
+    WaitFailed(String),
+}
+
+/// 계획 자식을 띄우고 상한 안에서 기다린다. 출력 파일을 못 만들면 띄우지 않는다(Err).
+fn spawn_and_bound_plan(
+    run: &AuthorityRun,
+    out_path: &std::path::Path,
+    compare: Option<&std::path::Path>,
+) -> Result<PlanWait, String> {
+    use crate::state::HideConsole;
+    let out = std::fs::File::create(out_path).map_err(|e| format!("plan output file: {e}"))?;
+    let err = out.try_clone().map_err(|e| format!("plan output file: {e}"))?;
+    let mut cmd = cys::python_command(run.program);
+    cmd.arg(run.script)
+        .args(["--socket", run.socket, "plan"])
+        .env("CYS_NO_AUTOSTART", "1");
+    if let Some(f) = compare {
+        cmd.arg("--compare-plan").arg(f);
+    }
+    for (k, v) in run.env {
+        cmd.env(k, v);
+    }
+    cmd.env_remove("PHOENIX_RESULT_FILE"); // S4 R1-3 — 계획은 결과 채널을 받지 않는다
+
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(out))
+        .stderr(std::process::Stdio::from(err));
+    cmd.hide_console();
+    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+    let deadline = std::time::Instant::now() + plan_timeout();
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => return Ok(PlanWait::Ended { code: st.code(), timed_out: false }),
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(PlanWait::Ended { code: None, timed_out: true });
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(PlanWait::WaitFailed(e.to_string()));
+            }
+        }
+    }
+}
+
+// ── 사용자 스크립트 사전 복원 훅(0.14.56 PHX · r2 §3 · §6 · r1 §7) ─────────────────────────────────────────
+
+/// 이전 부팅의 훅이 아직 살아 있는지 알려 주는 잠금(unix) — 훅이 표준입력으로 물려받아 자기 수명 동안 쥔다.
+const HOOK_RUN_LOCK: &str = "hook.run.lock";
+/// 상한에서 끊은 훅을 거두는 데 쓰는 상한(r2 §6-2 "bounded reap").
+const HOOK_REAP_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 훅 단계가 끝난 뒤 이 부팅이 할 일.
+#[derive(Debug, PartialEq, Eq)]
+enum HookNext {
+    /// 내장 phoenix(authority)를 돌린다 — r1 §3-1 경로 그대로(루프 ≤ 2 · r2 §7 재확인).
+    Authority,
+    /// 훅 뒤 계획이 certified Empty 이고 두 복원 잠금이 비었다 — authority 를 건너뛴다.
+    Skip,
+    /// 이번 부팅은 멈춘다(N3 · N7).
+    Stop,
+}
+
+/// ★(0.14.56 PHX · r1 §7-1·§7-2) 이번 부팅의 사용자 스크립트 결정 — I/O 는 여기, 판정은 `decide_prerestore`.
+/// allow 파일을 못 열면(없음 포함) 그 한 번으로 끝난다(C1 — 다른 판독·로그·통지 0).
+fn read_prerestore() -> phoenix_plan::Prerestore {
+    let allow = read_capped(&cys::pack::local_dir().join("phoenix-allow.sha256"), phoenix_plan::ALLOW_FILE_CAP);
+    let selector = cys::env_compat("CYS_PHOENIX_SCRIPT");
+    phoenix_plan::decide_prerestore(allow.as_deref(), selector.as_deref(), &read_hook_script)
+}
+
+/// 스크립트 판독(r1 §7-2) — `lstat` 으로 심링크·일반 파일 아님을 먼저 가리고, 일반 파일이면 한 번 읽는다
+/// (상한 + 1 바이트까지). 해시는 이 바이트로 하고, 실행하는 것도 이 바이트의 사본이다.
+fn read_hook_script(p: &str) -> phoenix_plan::ScriptRead {
+    use phoenix_plan::ScriptRead as R;
+    match std::fs::symlink_metadata(p) {
+        Err(e) => R::Error(e.to_string()),
+        Ok(m) if m.file_type().is_symlink() => R::Symlink,
+        Ok(m) if !m.is_file() => R::NotRegular,
+        Ok(_) => match read_capped(std::path::Path::new(p), phoenix_plan::SCRIPT_CAP) {
+            Some(b) => R::Regular(b),
+            None => R::Error("read failed".into()),
+        },
+    }
+}
+
+/// 결정 → (훅) → authority. `None` 은 오늘의 경로 그대로다(C1). `Refused` 는 복원 로그 한 줄 뒤 같은 경로다
+/// (설계에 통지 문구가 없다 — S4 R1-6 읽기). `e` = 이번 부팅의 추출 트리(디스크 폴백이면 None).
+fn prerestore_then_authority(run: &AuthorityRun, e: Option<&std::path::Path>, pre: phoenix_plan::Prerestore) {
+    use phoenix_plan::Prerestore as P;
+    let next = match pre {
+        P::None => HookNext::Authority,
+        P::Refused { path, reason } => {
+            append_restore_log(run.log_path, &format!("===== phoenix hook refused: {path} ({reason}) — 내장 복원만 실행 ====="));
+            HookNext::Authority
+        }
+        P::Run { path, sha256, bytes } => run_prerestore_hook(run, e, &path, &sha256, &bytes),
+    };
+    if next == HookNext::Authority {
+        let last = loop_auto_restore(run);
+        finish_authority(run, last);
+    }
+}
+
+/// 훅 단계 전체(r2 §3): 이전 훅 확인(unix) → 훅 앞 계획(기준선 · D4′ 입력) → 검증된 바이트의 사본 → 훅(상한 둘)
+/// → 훅 뒤 계획 → 건너뛰기 · authority · 멈춤. 모르는 것은 건너뛰지 않는다 — 건너뛰기는 certified Empty 와
+/// 두 복원 잠금 Free 가 함께일 때뿐이다.
+fn run_prerestore_hook(
+    run: &AuthorityRun,
+    e: Option<&std::path::Path>,
+    path: &str,
+    sha: &str,
+    bytes: &[u8],
+) -> HookNext {
+    use phoenix_plan::PlanOutcome;
+    use reclaim::{probe_restore_lock, LeaseState};
+    let Some(e) = e else {
+        // 사본은 같은 빌드의 임베드 형제 옆에서만 돈다 — 디스크 폴백의 팩 bin/ 은 살아 있는 팩이라 쓰지 않는다.
+        append_restore_log(run.log_path, &format!("===== phoenix hook {path}: not run — no extraction tree (disk fallback) ====="));
+        push_n1(run.daemon, path, &HookEnd::NotRun("no extraction tree (disk fallback)".into()));
+        return HookNext::Authority;
+    };
+    let d = lease_recheck_delay();
+    // ① (unix) 이전 부팅의 훅이 아직 사는가 — 관측만(만들지 않는다). Held ⇒ D 뒤 한 번 더 · 그래도 Held ⇒ N7 · 멈춤.
+    if cfg!(unix) {
+        match probe_restore_lock(run.state_dir, HOOK_RUN_LOCK) {
+            LeaseState::Held => {
+                append_restore_log(run.log_path, &format!("[cysd] hook: {HOOK_RUN_LOCK} held at boot — {}초 뒤 다시 본다", d.as_secs()));
+                std::thread::sleep(d);
+                if probe_restore_lock(run.state_dir, HOOK_RUN_LOCK) == LeaseState::Held {
+                    append_restore_log(run.log_path, &format!("[cysd] hook: {HOOK_RUN_LOCK} still held — 이번 부팅은 아무것도 실행하지 않는다"));
+                    push_n7(run.daemon, d);
+                    return HookNext::Stop;
+                }
+            }
+            LeaseState::Unavailable => {
+                append_restore_log(run.log_path, &format!("[cysd] hook: {HOOK_RUN_LOCK} probe unavailable — 계속(획득에서 다시 가린다)"));
+            }
+            LeaseState::Free => {}
+        }
+    }
+    // ② 훅 앞 계획 — 기준선이자 D4′ 의 예산(X·U·단위). 계획을 얻지 못해도 훅은 돈다(요청 1) — 다만 이번 부팅에는
+    //    건너뛰기가 없다(기준선이 없다).
+    let pre_out = e.join("plan-pre.out");
+    let pre = run_plan(run, &pre_out, None);
+    let baseline = !matches!(pre, PlanOutcome::Unobtainable(_));
+    let budget = if baseline {
+        read_capped(&pre_out, phoenix_plan::PLAN_OUTPUT_CAP).and_then(|b| phoenix_plan::plan_budget(&b))
+    } else {
+        None
+    };
+    let bounds = phoenix_plan::hook_bounds(
+        std::env::var("CYS_PHOENIX_HOOK_STALL_S").ok().as_deref(),
+        std::env::var("CYS_PHOENIX_HOOK_TIMEOUT_S").ok().as_deref(),
+        budget,
+    );
+    // CEO 조건 ⒝ — W·X·U 를 계획 산출물(훅 앞 계획 출력 파일)에 싣는다. 계획 줄이 아니라 판독기는 세지 않는다.
+    append_line(&pre_out, &phoenix_plan::hook_wall_line(&bounds));
+    let header = match &bounds.budget {
+        Some(b) => format!("pre-hook · wall={}s budget={}s units={}", bounds.wall_s, b.outer_s, b.units),
+        None => format!("pre-hook · wall={}s budget=unknown", bounds.wall_s),
+    };
+    log_plan(run, &header, &pre, &pre_out);
+    // r2 §6-3(6) — 훅 **앞에서** 비교한다. 상한이 묶여 한 단위의 여유를 못 주면 크게 알린다(CEO 조건 ⒜).
+    append_restore_log(run.log_path, &format!("[cysd] {}", phoenix_plan::wall_check_sentence(&bounds)));
+    if bounds.loud() {
+        push_wall_loud(run.daemon, &bounds);
+    }
+    // ③ 검증된 바이트의 사본 — 임베드 형제 옆(형제 import 가 같은 빌드로 풀린다). 실행하는 것은 이 사본이다.
+    let copy = run.script.with_file_name("javis_phoenix.py.user");
+    if let Err(err) = std::fs::write(&copy, bytes) {
+        let end = HookEnd::NotRun(format!("hook copy: {err}"));
+        append_restore_log(run.log_path, &format!("===== phoenix hook end: {end} ====="));
+        push_n1(run.daemon, path, &end);
+        return HookNext::Authority;
+    }
+    // ④ 훅 — 두 상한(정지 · 벽). 시험 빌드만 밀리초 이음매를 읽는다.
+    let secs_or_ms = |ms_knob: &str, s: u64| {
+        let ms = if cfg!(test) { std::env::var(ms_knob).ok().and_then(|v| v.parse::<u64>().ok()) } else { None };
+        ms.map(std::time::Duration::from_millis).unwrap_or(std::time::Duration::from_secs(s))
+    };
+    let stall = secs_or_ms("CYS_PHOENIX_HOOK_STALL_MS", bounds.stall_s);
+    let wall = secs_or_ms("CYS_PHOENIX_HOOK_TIMEOUT_MS", bounds.wall_s);
+    let end = run_hook(run, &copy, path, sha, &e.join("hook-0.out"), stall, wall);
+    append_restore_log(run.log_path, &format!("===== phoenix hook end: {end} ====="));
+    match &end {
+        HookEnd::Exited(Some(0)) => {}
+        HookEnd::Exited(Some(c @ (5 | 6))) => {
+            push_n3(run.daemon, path, *c);
+            return HookNext::Stop;
+        }
+        HookEnd::RunLockHeld => {
+            push_n7(run.daemon, d);
+            return HookNext::Stop;
+        }
+        HookEnd::Bound { kind, after } => {
+            push_n2(run.daemon, path, kind, *after, d, &bounds);
+            std::thread::sleep(d);
+        }
+        _ => {
+            push_n1(run.daemon, path, &end);
+            return HookNext::Authority;
+        }
+    }
+    // ⑤ 훅 뒤 계획 — 기준선이 있어야 비교한다. 없으면 N5(baseline) ⇒ authority.
+    if let PlanOutcome::Unobtainable(f) = &pre {
+        push_n5(run.daemon, &format!("사전 계획(baseline): {}", plan_failure_cause(f)));
+        return HookNext::Authority;
+    }
+    let post_out = e.join("plan-post.out");
+    let post = run_plan(run, &post_out, Some(&pre_out));
+    log_plan(run, "post-hook", &post, &post_out);
+    match post {
+        PlanOutcome::Empty => {
+            let gated = phoenix_plan::gate_empty(
+                PlanOutcome::Empty,
+                probe_restore_lock(run.state_dir, "restore.lease"),
+                probe_restore_lock(run.state_dir, "restore.run.lock"),
+            );
+            if gated.permits_skip() {
+                append_restore_log(run.log_path, "[cysd] hook: 계획이 비었고 복원 잠금도 비어 있다 — 내장 복원을 건너뛴다");
+                return HookNext::Skip;
+            }
+            append_restore_log(run.log_path, &format!("[cysd] hook: 계획은 비었지만 {gated:?} — 내장 복원을 실행한다"));
+        }
+        PlanOutcome::Targets(roles) => push_n4(run.daemon, &roles),
+        PlanOutcome::Uncertified(reasons) => {
+            append_restore_log(run.log_path, &format!("[cysd] hook: 계획이 비었다고 증명되지 않았다({}) — 내장 복원을 실행한다", reasons.join(", ")));
+            let (shrunk, unproven) = phoenix_plan::hook_attributable(&reasons);
+            if !shrunk.is_empty() {
+                push_n6(run.daemon, &shrunk);
+            }
+            if !unproven.is_empty() {
+                push_n6b(run.daemon, &unproven);
+            }
+        }
+        PlanOutcome::Unobtainable(f) => push_n5(run.daemon, &plan_failure_cause(&f)),
+    }
+    HookNext::Authority
+}
+
+/// 훅이 어떻게 끝났는가(프로세스 사실 — 판정은 호출자).
+#[derive(Debug, PartialEq, Eq)]
+enum HookEnd {
+    /// 끝났다 — 종료코드(None = 신호).
+    Exited(Option<i32>),
+    /// 상한이 끊었다(`stall` | `wall`) — 끊고 거둔 뒤다.
+    Bound { kind: &'static str, after: std::time::Duration },
+    /// (unix) `hook.run.lock` 을 잡지 못했다 — 다른 보유자가 있다(관측 뒤 획득 사이에 생겼다).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    RunLockHeld,
+    /// 띄우지 않았거나 띄우지 못했다(원인 문구).
+    NotRun(String),
+    /// 기다림(`try_wait`)이 실패했다 — 끊고 거둔 뒤다.
+    WaitFailed(String),
+}
+
+impl std::fmt::Display for HookEnd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HookEnd::Exited(Some(c)) => write!(f, "exit={c}"),
+            HookEnd::Exited(None) => write!(f, "signal"),
+            HookEnd::Bound { kind, after } => write!(f, "{kind} bound ({} s) — killed and reaped", after.as_secs()),
+            HookEnd::RunLockHeld => write!(f, "not run — {HOOK_RUN_LOCK} held"),
+            HookEnd::NotRun(c) => write!(f, "not run — {c}"),
+            HookEnd::WaitFailed(c) => write!(f, "wait failed: {c} — killed"),
+        }
+    }
+}
+
+/// 훅을 띄우고 두 상한 안에서 기다린다. 출력은 데몬 소유 파일(`out_path`)로만 받는다 — 그 파일을 만들 수 없으면
+/// 훅을 **띄우지 않는다**(정지 탐지기 없이는 돌지 않는다 · r2 §6-3(1)). 100 ms 마다 그 파일의 크기를 보고 새 바이트를
+/// 복원 로그에 덧붙인다. 정지 = 마지막으로 자란 뒤 `stall` · 벽 = 띄운 뒤 `wall`. 상한이면 끊고(Windows 는 훅의
+/// Job 째) 거둔다. restore root 등록은 이 함수의 지역이라 돌아가는 순간 풀린다(훅 뒤 계획 전 · r2 §6-1).
+fn run_hook(
+    run: &AuthorityRun,
+    copy: &std::path::Path,
+    path: &str,
+    sha: &str,
+    out_path: &std::path::Path,
+    stall: std::time::Duration,
+    wall: std::time::Duration,
+) -> HookEnd {
+    use crate::state::HideConsole;
+    use std::process::Stdio;
+    let out = match std::fs::File::create(out_path) {
+        Ok(f) => f,
+        Err(err) => return HookEnd::NotRun(format!("hook output file: {err}")),
+    };
+    let err_out = match out.try_clone() {
+        Ok(f) => f,
+        Err(err) => return HookEnd::NotRun(format!("hook output file: {err}")),
+    };
+    // (unix) 이전 훅 탐지 잠금은 훅의 표준입력으로 넘긴다 — 데몬 사본은 띄운 직후 닫으므로 잠금은 훅(과 표준입력을
+    // 물려받은 자손)의 수명이다. 자식 분리 규약(U-7)상 자식 쪽 fd 조작을 쓰지 않는다.
+    #[cfg(unix)]
+    let stdin = match reclaim::hold_named_lock_for_child(run.state_dir, HOOK_RUN_LOCK) {
+        Ok(f) => Stdio::from(f),
+        Err(reclaim::LeaseState::Held) => return HookEnd::RunLockHeld,
+        Err(_) => return HookEnd::NotRun(format!("{HOOK_RUN_LOCK}: unavailable")),
+    };
+    #[cfg(not(unix))]
+    let stdin = Stdio::null();
+    let mut cmd = cys::python_command(run.program);
+    cmd.arg(copy)
+        .args(["--socket", run.socket, "restore", "--auto"])
+        .env("CYS_NO_AUTOSTART", "1");
+    for (k, v) in run.env {
+        cmd.env(k, v);
+    }
+    cmd.env_remove("PHOENIX_RESULT_FILE") // S4 R1-3 — 훅은 authority 의 결과 채널에 쓰지 않는다
+        .env("CYS_PHOENIX_HOOK", "1")
+        .env("PYTHONUNBUFFERED", "1")
+        .stdin(stdin)
+        .stdout(Stdio::from(out))
+        .stderr(Stdio::from(err_out));
+    cmd.hide_console();
+    append_restore_log(run.log_path, &format!("===== phoenix hook {path} sha256={} =====", sha.get(..16).unwrap_or(sha)));
+    let spawned = cmd.spawn();
+    drop(cmd); // 데몬이 쥔 표준입력 사본(잠금 파일)을 여기서 닫는다
+    let mut child = match spawned {
+        Ok(c) => c,
+        Err(err) => return HookEnd::NotRun(format!("spawn: {err}")),
+    };
+    let pid = child.id();
+    #[cfg(windows)]
+    let hook_job = {
+        if !crate::state::winjob::try_assign_child(pid) {
+            push_n9(run.daemon, "데몬 Job");
+        }
+        let j = crate::state::winjob::HookJob::create_and_assign(pid);
+        if j.is_none() {
+            push_n9(run.daemon, "스크립트 Job");
+        }
+        j
+    };
+    let start_time = {
+        let mut st = None;
+        for _ in 0..3 {
+            if let Some(s) = crate::state::peer_start_time(pid) {
+                st = Some(s);
+                break;
+            }
+        }
+        st
+    };
+    let _guard = start_time.map(|s| crate::state::RestoreRootGuard::new(run.daemon.clone(), pid, s));
+    let kill = |child: &mut std::process::Child| {
+        #[cfg(windows)]
+        {
+            if hook_job.as_ref().is_some_and(|j| j.terminate()) {
+                return;
+            }
+        }
+        let _ = child.kill();
+    };
+    let started = std::time::Instant::now();
+    let mut last_growth = std::time::Instant::now();
+    let mut copied: u64 = 0;
+    let end = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break HookEnd::Exited(st.code()),
+            Ok(None) => {}
+            Err(err) => {
+                kill(&mut child);
+                reap_bounded(&mut child);
+                break HookEnd::WaitFailed(err.to_string());
+            }
+        }
+        let len = std::fs::metadata(out_path).map(|m| m.len()).unwrap_or(copied);
+        if len > copied {
+            copy_to_restore_log(out_path, copied, len, run.log_path);
+            copied = len;
+            last_growth = std::time::Instant::now();
+        }
+        let bound = if last_growth.elapsed() >= stall {
+            Some(("stall", stall))
+        } else if started.elapsed() >= wall {
+            Some(("wall", wall))
+        } else {
+            None
+        };
+        if let Some((kind, after)) = bound {
+            kill(&mut child);
+            if !reap_bounded(&mut child) {
+                append_restore_log(run.log_path, &format!("[cysd] hook pid {pid} not reaped within {} s", HOOK_REAP_BOUND.as_secs()));
+            }
+            break HookEnd::Bound { kind, after };
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let len = std::fs::metadata(out_path).map(|m| m.len()).unwrap_or(copied);
+    if len > copied {
+        copy_to_restore_log(out_path, copied, len, run.log_path);
+    }
+    end
+}
+
+/// 끊은 자식을 상한 안에서 거둔다. 거두었으면 참.
+fn reap_bounded(child: &mut std::process::Child) -> bool {
+    let deadline = std::time::Instant::now() + HOOK_REAP_BOUND;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(50)),
+            _ => return false,
+        }
+    }
+}
+
+/// `from..to` 바이트를 복원 로그에 덧붙인다(로그를 못 열면 조용히 건너뛴다 — 정지 탐지는 출력 파일로 한다).
+fn copy_to_restore_log(src: &std::path::Path, from: u64, to: u64, log_path: &std::path::Path) {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let Ok(mut f) = std::fs::File::open(src) else { return };
+    if f.seek(SeekFrom::Start(from)).is_err() {
+        return;
+    }
+    let mut buf = Vec::new();
+    if f.take(to - from).read_to_end(&mut buf).is_err() {
+        return;
+    }
+    if let Ok(mut log) = std::fs::OpenOptions::new().create(true).append(true).open(log_path) {
+        let _ = log.write_all(&buf);
+    }
+}
+
+/// 파일 끝에 한 줄을 덧붙인다(계획 산출물에 W·X·U 를 싣는다 — 실패해도 복원 로그 머리말이 같은 값을 갖는다).
+fn append_line(p: &std::path::Path, line: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(p) {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+/// N5 의 원인 문구.
+fn plan_failure_cause(f: &phoenix_plan::PlanFailure) -> String {
+    use phoenix_plan::PlanFailure as F;
+    match f {
+        F::SpawnFailed(e) => format!("spawn failed: {e}"),
+        F::Timeout => format!("timeout ({} s)", plan_timeout().as_secs()),
+        F::Signal => "signal".into(),
+        F::Exit(n) => format!("exit {n}"),
+        F::NoOutput => "no plan line".into(),
+        F::Garbled(w) => format!("garbled: {w}"),
+        F::ProtocolMismatch(p) => format!("protocol {p}"),
+        F::WaitFailed(e) => format!("wait failed: {e}"),
+    }
+}
+
+// 통지 문안 — r1 DESIGN §7-4(N1–N9) + r2 §6-4(N2·N5·N6b·N9 개정). 수(초·단위)는 백틱 없이(S4 N8 과 같다).
+
+fn push_n1(daemon: &std::sync::Arc<Daemon>, path: &str, end: &HookEnd) {
+    let body = match end {
+        HookEnd::Exited(Some(n)) => format!(
+            "스크립트 `{path}` 가 종료코드 `{n}` 로 끝났습니다. 내장 phoenix 로 자동복원을 이어서 실행했습니다. 스크립트 출력은 `phoenix-restore.log` 에 있습니다."
+        ),
+        other => format!(
+            "스크립트 `{path}` 를 정상적으로 실행하지 못했습니다(원인: `{other}`). 내장 phoenix 로 자동복원을 이어서 실행했습니다. 스크립트 출력이 있으면 `phoenix-restore.log` 에 있습니다."
+        ),
+    };
+    daemon.push_feed_notification("warn", "지정한 자동복원 스크립트가 실패했습니다 — 내장 복원으로 진행했습니다", &body, None);
+}
+
+fn push_n2(
+    daemon: &std::sync::Arc<Daemon>,
+    path: &str,
+    kind: &str,
+    after: std::time::Duration,
+    d: std::time::Duration,
+    bounds: &phoenix_plan::HookBounds,
+) {
+    use phoenix_plan::WallCheck;
+    let mut body = format!(
+        "스크립트 `{path}` 가 `{kind}` 상한({}초) 안에 끝나지 않아 종료시켰습니다. {}초 뒤 복원 계획을 다시 확인해 필요한 역할만 내장 phoenix 로 복원합니다. 스크립트가 띄운 다른 프로세스가 남아 있으면 그것이 끝날 때까지 복원 잠금이 잡혀 있을 수 있습니다.",
+        after.as_secs(),
+        d.as_secs()
+    );
+    if kind == "wall" {
+        if let Some(b) = &bounds.budget {
+            match bounds.check {
+                WallCheck::BelowBudget => body.push_str(&format!(" 이 로스터의 복원 예산({}초, {}단위)이 상한보다 깁니다.", b.outer_s, b.units)),
+                WallCheck::BelowOneUnit => body.push_str(&format!(
+                    " 이 로스터의 복원 예산({}초, {}단위)에 한 단위({}초)를 더한 값이 상한보다 깁니다.",
+                    b.outer_s,
+                    b.units,
+                    b.unit_s.unwrap_or(0)
+                )),
+                _ => {}
+            }
+        }
+    }
+    daemon.push_feed_notification("warn", &format!("지정한 자동복원 스크립트가 멈춰서 중단했습니다 ({kind})"), &body, None);
+}
+
+fn push_n3(daemon: &std::sync::Arc<Daemon>, path: &str, code: i32) {
+    let name = if code == 5 { "BREAKER_OPEN" } else { "CORRUPT/identity" };
+    daemon.push_feed_notification(
+        "error",
+        "지정한 자동복원 스크립트가 사람 확인이 필요한 상태로 끝났습니다 — 이번 부팅의 자동복원을 멈췄습니다",
+        &format!(
+            "스크립트 `{path}` 가 종료코드 `{code}` (`{name}`) 로 끝났습니다. 이 두 코드는 '사람이 확인해야 한다'는 뜻이라 내장 phoenix 도 실행하지 않았습니다. 할 일: `phoenix-restore.log` 를 확인하고 원인을 해결한 뒤 데몬을 다시 시작하십시오."
+        ),
+        None,
+    );
+}
+
+fn push_n4(daemon: &std::sync::Arc<Daemon>, roles: &[String]) {
+    daemon.push_feed_notification(
+        "warn",
+        "지정한 스크립트가 끝난 뒤에도 복원되지 않은 역할이 있어 내장 복원을 실행했습니다",
+        &format!("남아 있던 역할: `{}`.", roles.join(", ")),
+        None,
+    );
+}
+
+fn push_n5(daemon: &std::sync::Arc<Daemon>, cause: &str) {
+    daemon.push_feed_notification(
+        "warn",
+        "복원 계획을 확인하지 못해 내장 복원을 실행했습니다(안전한 쪽)",
+        &format!("원인: `{cause}`. 계획을 얻지 못한 것을 '복원할 것이 없다'로 읽지 않습니다."),
+        None,
+    );
+}
+
+fn push_n6(daemon: &std::sync::Arc<Daemon>, roles: &[String]) {
+    daemon.push_feed_notification(
+        "warn",
+        "지정한 스크립트가 복원 대상 목록에서 역할을 지웠습니다",
+        &format!(
+            "스크립트 실행 전에는 있었고 실행 뒤에는 묘비 없이 사라진 역할: `{}`. 의도한 폐역이면 `cys tombstone <role>` 로 등록하십시오. 내장 복원을 실행했습니다.",
+            roles.join(", ")
+        ),
+        None,
+    );
+}
+
+fn push_n6b(daemon: &std::sync::Arc<Daemon>, roles: &[String]) {
+    daemon.push_feed_notification(
+        "warn",
+        "지정한 스크립트 실행 뒤, 데몬 기록에 없는 폐역이 생겼습니다",
+        &format!(
+            "스크립트 실행 전에는 복원 대상이었고 실행 뒤 묘비로 바뀌었지만 데몬의 묘비 기록(topology.json)에는 없는 역할: `{}`. 의도한 폐역이면 `cys tombstone <role>` 로 등록하십시오. 내장 복원을 실행했지만 이 역할은 지금 묘비로 보이므로 복원되지 않았을 수 있습니다.",
+            roles.join(", ")
+        ),
+        None,
+    );
+}
+
+/// N7 의 원인·처방 한 문장(헤드 재정 2026-10-29 R1-1 조건 2) — 잠금은 훅의 표준입력으로 넘어가므로(U-7 핀이 다른 길을
+/// 막는다) 표준입력을 물려받은 도우미도 쥔다. 보유자 pid 는 적지 않는다: flock 보유자는 이식 가능한 값싼 조회가 없다
+/// (Linux `F_GETLK` 은 flock 을 보지 않는다) — 데몬은 lsof 를 띄우지 않는다.
+const N7_CAUSE_AND_REMEDY: &str = "원인은 대개 사전 복원 스크립트가 띄운 도우미 프로세스가 스크립트의 표준입력(stdin)을 물려받아 이 잠금을 쥐고 있는 것입니다 — 그 프로세스를 끝내고, 도우미는 표준입력을 돌려서(`</dev/null`, `stdin=DEVNULL`) 띄우십시오.";
+
+fn push_n7(daemon: &std::sync::Arc<Daemon>, d: std::time::Duration) {
+    daemon.push_feed_notification(
+        "error",
+        "이전 부팅에서 시작된 자동복원 스크립트가 아직 실행 중입니다 — 이번 부팅의 자동복원은 일어나지 않았습니다",
+        &format!(
+            "`hook.run.lock` 을 쥔 프로세스가 {}초 뒤에도 남아 있습니다. {N7_CAUSE_AND_REMEDY} 두 복원이 같은 역할을 동시에 띄우지 않도록 이번에는 아무것도 실행하지 않았습니다. 실패로 보고하지 않고 그대로 알립니다. 할 일: 그 스크립트 프로세스를 종료하고 데몬을 다시 시작하십시오. 스크립트를 끄려면 allow 파일에서 해당 줄을 지우면 됩니다.",
+            d.as_secs()
+        ),
+        None,
+    );
+}
+
+#[cfg(windows)]
+fn push_n9(daemon: &std::sync::Arc<Daemon>, step: &str) {
+    let body = if step == "데몬 Job" {
+        format!("실패한 단계: `{step}`. 데몬이 스크립트 실행 중에 종료되면 스크립트가 남아 있을 수 있습니다. 다음 부팅에서 복원 잠금이 잡혀 있으면 따로 알립니다.")
+    } else {
+        format!("실패한 단계: `{step}`. 시간 초과 시 스크립트가 띄운 하위 프로세스를 함께 종료하지 못할 수 있습니다.")
+    };
+    daemon.push_feed_notification("warn", "지정한 자동복원 스크립트를 데몬 수명에 묶지 못했습니다(Windows Job 편입 실패)", &body, None);
+}
+
+/// CEO 조건 ⒜(d34b1099 §4) — 기본 벽이 3600 에서 잘려 한 단위의 여유를 못 줄 때, 훅 **앞에서** 알린다
+/// (조용히 잘리는 상한이 바로 없애려는 결함이다). 설계 문안이 없는 새 문구다(S5 보고에 밝힌다).
+fn push_wall_loud(daemon: &std::sync::Arc<Daemon>, bounds: &phoenix_plan::HookBounds) {
+    let Some(b) = &bounds.budget else { return };
+    daemon.push_feed_notification(
+        "warn",
+        "자동복원 스크립트의 시간 상한이 이 로스터의 복원 예산을 덮지 못합니다",
+        &format!(
+            "상한 {}초(최댓값)가 복원 예산 {}초({}단위)에 한 단위({}초)를 더한 값보다 짧습니다. 스크립트가 끝까지 일하면 상한에서 중단되고, 남은 역할은 그 뒤 내장 phoenix 가 복원합니다.",
+            bounds.wall_s,
+            b.outer_s,
+            b.units,
+            b.unit_s.unwrap_or(0)
+        ),
+        None,
+    );
 }
 
 /// T1-3: UDS peer pid 조회 — macOS LOCAL_PEERPID, Linux SO_PEERCRED.
@@ -7945,4 +8838,1170 @@ mod receipt_framing_tests {
 #[cfg(test)]
 mod attach_exit_tests {
     include!("attach_exit_tests.rs");
+}
+
+// ★(0.14.56 PHX-IMPL S4) 결과 파일 채널 · authority 판정 · 재확인 · 계획 호출 — 가짜 phoenix(python)로 실제 스폰한다.
+#[cfg(all(test, unix))]
+mod phoenix_s4_tests {
+    use super::*;
+    use crate::phoenix_plan::{PlanFailure, PlanOutcome};
+    use crate::state::Daemon;
+
+    /// 이 모듈의 노브(재확인 지연·계획 상한·재확인 끄기)는 프로세스 env 라 검체끼리 직렬화한다(S5 hook_tests 도 같은 자물쇠).
+    pub(super) static KNOBS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    pub(super) const FAKE: &str = r#"import json, os, sys, threading
+d = os.environ["FAKE_DIR"]
+argv = sys.argv[1:]
+with open(os.path.join(d, "calls.txt"), "a") as f:
+    f.write(" ".join(argv[2:]) + "\n")
+def cfg(name, default):
+    p = os.path.join(d, name)
+    return open(p).read().strip() if os.path.exists(p) else default
+EMPTY = {"phoenix_plan": 1, "outcome": "empty", "targets": [], "reasons": [], "identity": "verified",
+         "observed": json.loads(cfg("plan.observed", "{}"))}
+if "plan" in argv:
+    with open(os.path.join(d, "plan-env.txt"), "a") as f:
+        f.write((os.environ.get("PHOENIX_RESULT_FILE") or "-") + "\n")
+    mode = cfg("plan.post.mode", cfg("plan.mode", "targets")) if "--compare-plan" in argv else cfg("plan.mode", "targets")
+    print("plan log line before")
+    if mode == "empty":
+        print("phoenix-plan/1 " + json.dumps(EMPTY))
+    elif mode == "targets":
+        print("phoenix-plan/1 " + json.dumps(dict(EMPTY, outcome="targets", targets=["worker-2"])))
+    elif mode == "uncertified":
+        print("phoenix-plan/1 " + json.dumps(dict(EMPTY, outcome="uncertified", reasons=cfg("plan.reasons", "liveness_unknown").split(";"))))
+    elif mode == "skew":
+        print("phoenix-plan/1 " + json.dumps(dict(EMPTY, phoenix_plan=2)))
+    elif mode == "two":
+        print("phoenix-plan/1 " + json.dumps(EMPTY)); print("phoenix-plan/1 " + json.dumps(EMPTY))
+    elif mode == "crash":
+        raise RuntimeError("plan crashed")
+    elif mode.startswith("exit"):
+        sys.exit(int(mode[4:]))
+    elif mode == "signal":
+        os.kill(os.getpid(), 9)
+    elif mode == "empty_hold":
+        import fcntl
+        os.makedirs(os.path.join(d, "phoenix"), exist_ok=True)
+        f = open(os.path.join(d, "phoenix", "restore.run.lock"), "a+")
+        fcntl.flock(f, fcntl.LOCK_EX)
+        pid = os.fork()
+        if pid == 0:
+            threading.Event().wait()
+        with open(os.path.join(d, "hold.pid"), "w") as h:
+            h.write(str(pid))
+        print("phoenix-plan/1 " + json.dumps(EMPTY))
+        sys.stdout.flush()
+        os._exit(0)
+    elif mode == "block":
+        with open(os.path.join(d, "plan.pid"), "w") as f:
+            f.write(str(os.getpid()))
+        threading.Event().wait()
+    sys.exit(0)
+n = sum(1 for l in open(os.path.join(d, "calls.txt")) if l.split()[:1] == ["restore"])
+seq = cfg("restore.verdicts", "VERIFIED").split()
+v = seq[min(n, len(seq)) - 1]
+print("fake phoenix restore " + v)
+p = os.environ.get("PHOENIX_RESULT_FILE")
+with open(os.path.join(d, "result-env.txt"), "a") as f:
+    f.write((p or "-") + "\n")
+if v == "EXIT1":
+    sys.exit(1)
+if p and v != "NOFILE":
+    with open(p, "w") as f:
+        f.write("{garbled" if v == "GARBLED" else json.dumps({"phoenix_restore": v, "exit": 0}))
+sys.exit(0)
+"#;
+
+    pub(super) struct Rig {
+        pub(super) dir: std::path::PathBuf,
+        pub(super) daemon: std::sync::Arc<Daemon>,
+        pub(super) script: std::path::PathBuf,
+        sock: String,
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+        pub(super) log: std::path::PathBuf,
+        pub(super) rdir: std::path::PathBuf,
+        /// 계획을 띄우는 순간의 `restore_roots` 길이(D1-a 관찰 이음매).
+        pub(super) roots: std::sync::Mutex<Vec<usize>>,
+    }
+
+    impl Rig {
+        pub(super) fn new(label: &str) -> Rig {
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!("cys-s4-{label}-{}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let rdir = dir.join("E");
+            std::fs::create_dir_all(&rdir).unwrap();
+            let script = rdir.join("javis_phoenix.py");
+            std::fs::write(&script, FAKE).unwrap();
+            let sock = dir.join("cysd.sock").to_string_lossy().into_owned();
+            let args = vec![
+                script.to_string_lossy().into_owned(),
+                "--socket".into(),
+                sock.clone(),
+                "restore".into(),
+                "--auto".into(),
+            ];
+            let env = vec![("FAKE_DIR".to_string(), dir.to_string_lossy().into_owned())];
+            Rig {
+                daemon: Daemon::new(dir.join("cysd.sock")),
+                log: dir.join("phoenix-restore.log"),
+                dir,
+                script,
+                sock,
+                args,
+                env,
+                rdir,
+                roots: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+        pub(super) fn run(&self) -> AuthorityRun<'_> {
+            AuthorityRun {
+                daemon: &self.daemon,
+                program: "python3",
+                script: &self.script,
+                socket: &self.sock,
+                args: &self.args,
+                env: &self.env,
+                log_path: &self.log,
+                state_dir: &self.dir,
+                rdir: Some(&self.rdir),
+                roots_at_plan: Some(&self.roots),
+            }
+        }
+        pub(super) fn set(&self, name: &str, v: &str) {
+            std::fs::write(self.dir.join(name), v).unwrap();
+        }
+        pub(super) fn calls(&self) -> Vec<String> {
+            std::fs::read_to_string(self.dir.join("calls.txt")).unwrap_or_default().lines().map(str::to_string).collect()
+        }
+        pub(super) fn log(&self) -> String {
+            std::fs::read_to_string(&self.log).unwrap_or_default()
+        }
+        pub(super) fn n8(&self) -> usize {
+            self.daemon.feed_items.lock().unwrap().iter().filter(|i| i.title.contains("뒤에도 끝나지 않았습니다")).count()
+        }
+        fn results_left(&self) -> usize {
+            std::fs::read_dir(&self.rdir)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with("result-"))
+                .count()
+        }
+    }
+
+    impl Drop for Rig {
+        fn drop(&mut self) {
+            for f in ["hold.pid", "plan.pid"] {
+                if let Some(pid) = std::fs::read_to_string(self.dir.join(f)).ok().and_then(|s| s.trim().parse::<i32>().ok()) {
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                }
+            }
+            for f in ["hook.pid", "grandchild.pid"] {
+                self.kill_ours(f);
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    impl Rig {
+        /// S5: pid 파일의 프로세스를 그 명령줄에 이 리그 경로가 있을 때만 끝낸다(끝난 pid 가 재사용됐으면 남의 프로세스다).
+        pub(super) fn kill_ours(&self, pidfile: &str) {
+            let Some(pid) = std::fs::read_to_string(self.dir.join(pidfile)).ok().and_then(|s| s.trim().parse::<u32>().ok()) else {
+                return;
+            };
+            use crate::state::HideConsole;
+            let cmdline = std::process::Command::new("ps")
+                .args(["-o", "command=", "-p", &pid.to_string()])
+                .hide_console()
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .unwrap_or_default();
+            if cmdline.contains(&*self.dir.to_string_lossy()) {
+                unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            }
+        }
+    }
+
+    pub(super) fn knobs(delay_ms: &str) -> std::sync::MutexGuard<'static, ()> {
+        let g = KNOBS.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("CYS_AUTORESTORE_LEASE_RECHECK_DELAY_MS", delay_ms);
+        std::env::remove_var("CYS_AUTORESTORE_LEASE_RECHECK");
+        std::env::remove_var("CYS_PHOENIX_PLAN_TIMEOUT_MS");
+        g
+    }
+
+    fn last(exit: Option<i32>, result: Option<&str>) -> LastAttempt {
+        LastAttempt { exit, result: result.map(|r| r.as_bytes().to_vec()), channel: true }
+    }
+
+    // ── C1 · AT2 ──
+
+    /// ★C1 (r1 §7-1 · r2 §7-4) — 보통 부팅(VERIFIED)은 결과 채널을 거쳐도 복원 로그가 오늘과 같다: 부팅 머리말 +
+    /// 자식 출력 한 줄뿐이고, 꼬리말·계획·재확인이 없으며, 루프 뒤 결과 파일이 남지 않는다. 채널은 실제로 넘어갔다.
+    #[test]
+    fn c1_unset_is_byte_identical() {
+        let _g = knobs("0");
+        let rig = Rig::new("c1");
+        let run = rig.run();
+        let l = loop_auto_restore(&run);
+        assert_eq!(l.exit, Some(0));
+        finish_authority(&run, l);
+        let log = rig.log();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 3, "{log:?}");
+        assert_eq!(lines[0], "");
+        assert!(lines[1].starts_with("===== phoenix auto-restore @ epoch=") && lines[1].ends_with(" =====") && !lines[1].contains("exit="), "{log:?}");
+        assert_eq!(lines[2], "fake phoenix restore VERIFIED");
+        assert_eq!(rig.calls(), vec!["restore --auto"]);
+        assert_eq!(rig.results_left(), 0, "결과 파일이 루프 뒤에 남았다");
+        let env = std::fs::read_to_string(rig.dir.join("result-env.txt")).unwrap();
+        assert!(env.trim().ends_with("result-0.json"), "결과 채널이 넘어가지 않았다: {env:?}");
+    }
+
+    /// 낡은 결과 파일은 시도 전에 지워진다 — 이전 부팅의 VERIFIED 가 이번 무응답을 Done 으로 만들지 못한다.
+    #[test]
+    fn stale_result_file_is_removed_before_the_attempt() {
+        let _g = knobs("0");
+        let rig = Rig::new("stale");
+        rig.set("restore.verdicts", "NOFILE");
+        std::fs::write(rig.rdir.join("result-0.json"), r#"{"phoenix_restore":"VERIFIED","exit":0}"#).unwrap();
+        let l = run_attempt_with_result(&rig.run(), 0);
+        assert_eq!(l.exit, Some(0));
+        assert!(l.channel);
+        assert_eq!(l.result, None, "낡은 VERIFIED 를 읽었다");
+        assert_eq!(phoenix_plan::classify_authority(l.exit, l.result.as_deref()),
+                   phoenix_plan::AuthorityOutcome::Ambiguous("result_missing".into()));
+    }
+
+    // ── 재확인 (r2 §7-2 · D3-a/b/c · AT4 · AT5) ──
+
+    /// ★D3-b 대조 — Done 은 재확인하지 않는다(계획 호출 0 · 로그 무변화 · N8 0).
+    #[test]
+    fn exit0_verified_or_noop_is_done() {
+        let _g = knobs("0");
+        for v in ["VERIFIED", "NOOP", "VERIFIED_FRESH", "VERIFIED_SEAT_ONLY"] {
+            let rig = Rig::new("done");
+            finish_authority(&rig.run(), last(Some(0), Some(&format!(r#"{{"phoenix_restore":"{v}","exit":0}}"#))));
+            assert!(rig.calls().is_empty(), "{v}: {:?}", rig.calls());
+            assert_eq!(rig.log(), "", "{v}");
+            assert_eq!(rig.n8(), 0);
+        }
+    }
+
+    /// ★D3-a — exit 0 인데 결과를 읽을 수 없으면(없음·빈·깨짐·모르는 판정·exit 필드 1·FAILED·채널 없음) 꼬리말을 쓰고
+    /// 계획을 묻고, 계획이 Targets 면 authority 를 **한 번** 더 돌린다(그 시도가 VERIFIED 면 끝).
+    #[test]
+    fn exit0_ambiguous_result_rechecks() {
+        let _g = knobs("0");
+        let cases: Vec<(LastAttempt, &str)> = vec![
+            (last(Some(0), None), "result_missing"),
+            (last(Some(0), Some("")), "result_empty"),
+            (last(Some(0), Some("{x")), "result_not_json"),
+            (last(Some(0), Some(r#"{"phoenix_restore":"NEW","exit":0}"#)), "verdict:NEW"),
+            (last(Some(0), Some(r#"{"phoenix_restore":"VERIFIED","exit":1}"#)), "exit_field:1"),
+            (last(Some(0), Some(r#"{"phoenix_restore":"FAILED","exit":0}"#)), "verdict:FAILED"),
+            (LastAttempt { exit: Some(0), result: None, channel: false }, "no_result_channel"),
+        ];
+        for (l, cause) in cases {
+            let rig = Rig::new("amb");
+            finish_authority(&rig.run(), l);
+            let log = rig.log();
+            assert!(log.contains(&format!("===== phoenix auto-restore exit=0 (결과 파일 판독 불가: {cause} — 0초 뒤 한 번 재확인) =====")), "{cause}: {log}");
+            assert!(log.contains("===== phoenix plan (recheck) outcome=Targets([\"worker-2\"]) ====="), "{cause}: {log}");
+            assert_eq!(rig.calls(), vec!["plan", "restore --auto"], "{cause}");
+            assert_eq!(rig.n8(), 0, "{cause}");
+        }
+    }
+
+    /// ★AT4 — LEASE_HELD 는 LEASE_HELD 와 exit=0 을 한 줄에 남긴다.
+    #[test]
+    fn lease_held_footer_written() {
+        let _g = knobs("0");
+        let rig = Rig::new("at4");
+        rig.set("plan.mode", "empty");
+        finish_authority(&rig.run(), last(Some(0), Some(r#"{"phoenix_restore":"LEASE_HELD","exit":0}"#)));
+        let log = rig.log();
+        assert!(log.contains("===== phoenix auto-restore exit=0 (LEASE_HELD: 다른 복원이 진행 중이라 이번 실행은 물러났습니다 — 0초 뒤 한 번 재확인) ====="), "{log}");
+        assert!(log.contains("[cysd] recheck: 다른 복원이 끝났고 남은 대상이 없습니다"), "{log}");
+        assert_eq!(rig.calls(), vec!["plan"], "gated Empty 뒤에 authority 를 돌렸다");
+    }
+
+    /// ★AT5 — 보유자가 D 안에 죽으면(잠금 Free) 계획 Targets ⇒ authority **정확히 한 번**.
+    #[test]
+    fn lease_recheck_restores_after_holder_dies() {
+        let _g = knobs("0");
+        let rig = Rig::new("at5");
+        let (st, holder) = reclaim::try_hold_restore_lease(&rig.dir);
+        assert_eq!(st, reclaim::LeaseState::Free);
+        drop(holder); // 보유자 사망
+        finish_authority(&rig.run(), last(Some(0), Some(r#"{"phoenix_restore":"LEASE_HELD","exit":0}"#)));
+        assert_eq!(rig.calls(), vec!["plan", "restore --auto"]);
+        assert_eq!(rig.n8(), 0);
+    }
+
+    /// ★lock_held_after_empty_is_not_a_skip (r1 §10-2 · r2 §5-2) — 재확인 앞 관측은 Free 였고 계획은 Empty 인데, 계획이
+    /// 끝날 때 다른 프로세스(계획이 포크한 손자 — 잠금을 쥔 fd 를 물려받았다)가 `restore.run.lock` 을 쥐고 있다.
+    /// Empty 뒤의 관측이 그것을 보고 Uncertified ⇒ authority 한 번. Empty 를 그대로 믿으면 아무도 복원하지 않는다.
+    #[test]
+    fn lock_held_after_empty_is_not_a_skip() {
+        let _g = knobs("0");
+        let rig = Rig::new("heldafter");
+        rig.set("plan.mode", "empty_hold");
+        finish_authority(&rig.run(), last(Some(0), Some(r#"{"phoenix_restore":"LEASE_HELD","exit":0}"#)));
+        assert!(rig.log().contains("outcome=Empty"), "{}", rig.log());
+        assert_eq!(rig.calls(), vec!["plan", "restore --auto"], "Empty 뒤 잠금 보유를 보지 못하고 건너뛰었다");
+        assert!(!rig.log().contains("남은 대상이 없습니다"));
+    }
+
+    #[test]
+    fn recheck_delay_is_clamped_in_production_only() {
+        assert_eq!(recheck_delay_ms(None, false), 30_000);
+        assert_eq!(recheck_delay_ms(Some("x"), false), 30_000);
+        assert_eq!(recheck_delay_ms(Some("0"), false), 5_000);
+        assert_eq!(recheck_delay_ms(Some("4999"), false), 5_000);
+        assert_eq!(recheck_delay_ms(Some("400000"), false), 300_000);
+        assert_eq!(recheck_delay_ms(Some("12345"), false), 12_345);
+        assert_eq!(recheck_delay_ms(Some("0"), true), 0);
+        assert_eq!(recheck_delay_ms(Some("400000"), true), 300_000);
+    }
+
+    /// ★D3-c — 재확인 관측에서 Held 면 N8 로 멈추고(계획 0), Unavailable 이면 기록하고 계획으로 간다.
+    #[test]
+    fn recheck_unavailable_proceeds_held_stops() {
+        let _g = knobs("0");
+        let held = Rig::new("held");
+        let (_st, guard) = reclaim::try_hold_restore_lease(&held.dir);
+        finish_authority(&held.run(), last(Some(0), Some(r#"{"phoenix_restore":"LEASE_HELD","exit":0}"#)));
+        drop(guard);
+        assert!(held.calls().is_empty(), "Held 인데 계획/복원을 돌렸다: {:?}", held.calls());
+        assert_eq!(held.n8(), 1);
+        let it = held.daemon.feed_items.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(it.kind, "error");
+        assert!(it.body.ends_with("원인: LEASE_HELD."), "{}", it.body);
+
+        let unav = Rig::new("unav");
+        std::fs::create_dir_all(unav.dir.join("phoenix").join("restore.run.lock")).unwrap();
+        finish_authority(&unav.run(), last(Some(0), Some("{x")));
+        assert!(unav.log().contains("restore lock probe unavailable"), "{}", unav.log());
+        assert_eq!(unav.calls(), vec!["plan", "restore --auto"], "Unavailable 에서 멈췄다");
+        assert_eq!(unav.n8(), 0);
+    }
+
+    /// 재확인의 시도가 다시 물러나거나 판독 불가면 N8(원인 포함)로 멈춘다 — 두 번째 재확인은 없다.
+    #[test]
+    fn recheck_attempt_that_retreats_again_raises_n8() {
+        let _g = knobs("0");
+        for (v, cause) in [("LEASE_HELD", "원인: LEASE_HELD."), ("GARBLED", "원인: 결과 파일을 읽지 못함(result_not_json).")] {
+            let rig = Rig::new("again");
+            rig.set("restore.verdicts", v);
+            finish_authority(&rig.run(), last(Some(0), Some(r#"{"phoenix_restore":"LEASE_HELD","exit":0}"#)));
+            assert_eq!(rig.calls(), vec!["plan", "restore --auto"], "{v}");
+            assert_eq!(rig.n8(), 1, "{v}");
+            let it = rig.daemon.feed_items.lock().unwrap().last().cloned().unwrap();
+            assert!(it.body.ends_with(cause), "{v}: {}", it.body);
+        }
+        let rig = Rig::new("again1");
+        rig.set("restore.verdicts", "EXIT1");
+        finish_authority(&rig.run(), last(Some(0), Some(r#"{"phoenix_restore":"LEASE_HELD","exit":0}"#)));
+        assert_eq!(rig.calls(), vec!["plan", "restore --auto"]);
+        assert!(rig.log().contains("[cysd] recheck attempt exit=Some(1)"), "{}", rig.log());
+        assert_eq!(rig.n8(), 0);
+    }
+
+    /// 노브 0 이면 재확인하지 않고 한 줄만 남긴다(꼬리말은 '재확인한다'고 말하므로 쓰지 않는다).
+    #[test]
+    fn recheck_disabled_logs_and_stops() {
+        let _g = knobs("0");
+        std::env::set_var("CYS_AUTORESTORE_LEASE_RECHECK", "0");
+        let a = Rig::new("off1");
+        finish_authority(&a.run(), last(Some(0), Some("{x")));
+        let b = Rig::new("off2");
+        finish_authority(&b.run(), last(Some(0), Some(r#"{"phoenix_restore":"LEASE_HELD","exit":0}"#)));
+        std::env::remove_var("CYS_AUTORESTORE_LEASE_RECHECK");
+        assert_eq!(a.log(), "[cysd] ambiguous result, recheck disabled (result_not_json; CYS_AUTORESTORE_LEASE_RECHECK=0)\n");
+        assert_eq!(b.log(), "[cysd] LEASE_HELD, recheck disabled (CYS_AUTORESTORE_LEASE_RECHECK=0)\n");
+        assert!(a.calls().is_empty() && b.calls().is_empty());
+    }
+
+    /// exit ≠ 0 은 결과 파일이 무엇이든 오늘의 길이다(재확인 0 · 복원 로그 무변화).
+    #[test]
+    fn nonzero_exit_keeps_todays_path() {
+        let _g = knobs("0");
+        let rig = Rig::new("nz");
+        finish_authority(&rig.run(), last(Some(1), Some(r#"{"phoenix_restore":"LEASE_HELD","exit":0}"#)));
+        finish_authority(&rig.run(), LastAttempt { exit: None, result: None, channel: false });
+        assert!(rig.calls().is_empty());
+        assert_eq!(rig.log(), "");
+    }
+
+    // ── 계획 호출 (r1 §5 · §10-2 gate 2 실스폰) ──
+
+    fn plan(rig: &Rig, mode: &str) -> PlanOutcome {
+        rig.set("plan.mode", mode);
+        call_plan(&rig.run(), "test", 0)
+    }
+
+    #[test]
+    fn plan_consistent_empty_permits_skip() {
+        let _g = knobs("0");
+        let rig = Rig::new("pe");
+        let o = plan(&rig, "empty");
+        assert_eq!(o, PlanOutcome::Empty);
+        let log = rig.log();
+        assert!(log.contains("===== phoenix plan (test) outcome=Empty =====\nplan log line before\nphoenix-plan/1 "), "{log}");
+    }
+
+    #[test]
+    fn plan_failures_are_not_empty() {
+        let _g = knobs("0");
+        let rig = Rig::new("pf");
+        assert_eq!(plan(&rig, "crash"), PlanOutcome::Unobtainable(PlanFailure::Exit(1)));
+        assert_eq!(plan(&rig, "exit2"), PlanOutcome::Unobtainable(PlanFailure::Exit(2)));
+        assert_eq!(plan(&rig, "exit6"), PlanOutcome::Unobtainable(PlanFailure::Exit(6)));
+        assert_eq!(plan(&rig, "silent"), PlanOutcome::Unobtainable(PlanFailure::NoOutput));
+        assert_eq!(plan(&rig, "two"), PlanOutcome::Unobtainable(PlanFailure::Garbled("multiple-framed-lines")));
+        assert_eq!(plan(&rig, "skew"), PlanOutcome::Unobtainable(PlanFailure::ProtocolMismatch("2".into())));
+        assert_eq!(plan(&rig, "signal"), PlanOutcome::Unobtainable(PlanFailure::Signal));
+        assert_eq!(plan(&rig, "targets"), PlanOutcome::Targets(vec!["worker-2".into()]));
+    }
+
+    #[test]
+    fn plan_missing_interpreter_or_script_is_not_empty() {
+        let _g = knobs("0");
+        let rig = Rig::new("pm");
+        let mut run = rig.run();
+        run.program = "/nonexistent/cys-test/python3";
+        assert!(matches!(call_plan(&run, "test", 0), PlanOutcome::Unobtainable(PlanFailure::SpawnFailed(_))));
+        let missing = rig.dir.join("no-such-phoenix.py");
+        let mut run = rig.run();
+        run.script = missing.as_path();
+        assert_eq!(call_plan(&run, "test", 1), PlanOutcome::Unobtainable(PlanFailure::Exit(2)));
+    }
+
+    /// 출력 파일을 만들 수 없으면 계획을 **띄우지 않는다**(Unobtainable · 스크립트 호출 0).
+    #[test]
+    fn plan_output_file_failure_spawns_nothing() {
+        let _g = knobs("0");
+        let rig = Rig::new("pof");
+        let notdir = rig.dir.join("a-file");
+        std::fs::write(&notdir, b"x").unwrap();
+        let mut run = rig.run();
+        run.rdir = Some(notdir.as_path());
+        let o = call_plan(&run, "test", 0);
+        assert!(matches!(&o, PlanOutcome::Unobtainable(PlanFailure::SpawnFailed(m)) if m.starts_with("plan output file:")), "{o:?}");
+        assert!(rig.calls().is_empty());
+    }
+
+    /// ★plan_timeout_is_not_empty — 상한(시험 이음매 2 s)에서 Timeout 이고 자식은 거두어졌다(pid 가 사라졌다).
+    /// 상한이 사라지면 호출이 영원히 막히므로 다른 스레드에서 부르고 기다림에 백스톱을 둔다(막힘 = 실패).
+    #[test]
+    fn plan_timeout_is_not_empty() {
+        let _g = knobs("0");
+        std::env::set_var("CYS_PHOENIX_PLAN_TIMEOUT_MS", "2000");
+        let rig = std::sync::Arc::new(Rig::new("pt"));
+        rig.set("plan.mode", "block");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let r2 = rig.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(call_plan(&r2.run(), "test", 0));
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_secs(60)); // wallclock: guard hang if the plan bound is gone
+        std::env::remove_var("CYS_PHOENIX_PLAN_TIMEOUT_MS");
+        if got.is_err() {
+            // 막힌 계획 자식을 남기지 않는다(그 뒤 call_plan 은 자식 종료를 보고 돌아온다).
+            if let Some(pid) = std::fs::read_to_string(rig.dir.join("plan.pid")).ok().and_then(|s| s.trim().parse::<i32>().ok()) {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        }
+        let o = got.expect("call_plan did not return: the plan bound did not fire");
+        assert_eq!(o, PlanOutcome::Unobtainable(PlanFailure::Timeout));
+        let pid: i32 = std::fs::read_to_string(rig.dir.join("plan.pid")) // wallclock: guard python start inside the 2 s plan bound
+            .expect("the blocked plan wrote its pid")
+            .trim()
+            .parse()
+            .unwrap();
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(!alive, "timed-out plan pid {pid} still exists (not reaped)");
+    }
+}
+
+// ★(0.14.56 PHX-IMPL S5) 사용자 스크립트 훅 — 가짜 phoenix(계획·authority) + 가짜 사용자 스크립트(python)로 실제 스폰한다.
+#[cfg(all(test, unix))]
+mod hook_tests {
+    use super::phoenix_s4_tests::{knobs, Rig};
+    use super::*;
+    use crate::phoenix_plan::Prerestore;
+
+    /// 사용자 스크립트 — allow 파일이 검증한 바이트로 보고 사본으로 돈다. 동작은 `FAKE_DIR/hook.mode`.
+    const HOOK: &str = r#"import json, os, subprocess, sys, threading, time
+d = os.environ["FAKE_DIR"]
+def cfg(name, default):
+    p = os.path.join(d, name)
+    return open(p).read().strip() if os.path.exists(p) else default
+mode = cfg("hook.mode", "ok")
+with open(os.path.join(d, "calls.txt"), "a") as f:
+    f.write("hook " + mode + "\n")
+with open(os.path.join(d, "hook-env.json"), "w") as f:
+    json.dump({k: os.environ.get(k) for k in ("PHOENIX_RESULT_FILE", "CYS_PHOENIX_HOOK", "PYTHONUNBUFFERED", "CYS_NO_AUTOSTART")}, f)
+with open(os.path.join(d, "hook-argv.json"), "w") as f:
+    json.dump(sys.argv, f)
+def released():
+    return os.path.exists(os.path.join(d, "release"))
+if mode == "ok":
+    print("HOOK-MARKER-OUTPUT")
+    sys.exit(0)
+if mode.startswith("exit"):
+    print("hook exiting")
+    sys.exit(int(mode[4:]))
+with open(os.path.join(d, "hook.pid"), "w") as f:
+    f.write(str(os.getpid()))
+if mode == "silent":
+    threading.Event().wait()
+elif mode == "chatty":
+    while True:
+        print("tick", flush=True)
+        time.sleep(0.2)
+elif mode == "release":
+    print("HOOK-EARLY-MARKER", flush=True)
+    while not released():
+        time.sleep(0.05)
+    print("HOOK-LATE-MARKER")
+elif mode == "grandchild":
+    p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)", d], stdin=subprocess.DEVNULL)
+    with open(os.path.join(d, "grandchild.pid"), "w") as f:
+        f.write(str(p.pid))
+    while not released():
+        time.sleep(0.05)
+sys.exit(0)
+"#;
+
+    const OBS_1300: &str = r#"{"restore_outer_s":1300,"restore_unit_s":69,"restore_units":19,"restore_budget_source":"javis_budget"}"#;
+
+    fn hook_knobs() -> std::sync::MutexGuard<'static, ()> {
+        let g = knobs("0");
+        for k in [
+            "CYS_PHOENIX_HOOK_STALL_MS",
+            "CYS_PHOENIX_HOOK_TIMEOUT_MS",
+            "CYS_PHOENIX_HOOK_STALL_S",
+            "CYS_PHOENIX_HOOK_TIMEOUT_S",
+            "PHOENIX_RESULT_FILE",
+            "CYS_LOCAL_DIR",
+            "CYS_PHOENIX_SCRIPT",
+        ] {
+            std::env::remove_var(k);
+        }
+        g
+    }
+
+    fn user_script(rig: &Rig, body: &str) -> Prerestore {
+        use sha2::{Digest, Sha256};
+        let p = rig.dir.join("user-hook.py");
+        std::fs::write(&p, body).unwrap();
+        let sha: String = Sha256::digest(body.as_bytes()).iter().map(|x| format!("{x:02x}")).collect();
+        Prerestore::Run { path: p.to_string_lossy().into_owned(), sha256: sha, bytes: body.as_bytes().to_vec() }
+    }
+
+    fn boot(rig: &Rig) {
+        let pre = user_script(rig, HOOK);
+        prerestore_then_authority(&rig.run(), Some(rig.rdir.as_path()), pre);
+    }
+
+    /// 훅 단계를 다른 스레드에서 돌린다(상한이 사라지면 영원히 막히므로 — 기다림은 호출자가 백스톱으로 묶는다).
+    fn hook_on_thread(rig: &std::sync::Arc<Rig>) -> std::sync::mpsc::Receiver<HookNext> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let r = rig.clone();
+        std::thread::spawn(move || {
+            let Prerestore::Run { path, sha256, bytes } = user_script(&r, HOOK) else { unreachable!() };
+            let _ = tx.send(run_prerestore_hook(&r.run(), Some(r.rdir.as_path()), &path, &sha256, &bytes));
+        });
+        rx
+    }
+
+    fn post_call(rig: &Rig) -> String {
+        format!("plan --compare-plan {}", rig.rdir.join("plan-pre.out").display())
+    }
+
+    fn feed(rig: &Rig) -> Vec<(String, String, String)> {
+        rig.daemon.feed_items.lock().unwrap().iter().map(|i| (i.kind.clone(), i.title.clone(), i.body.clone())).collect()
+    }
+
+    fn notice(rig: &Rig, title_part: &str) -> Option<(String, String)> {
+        feed(rig).into_iter().find(|(_, t, _)| t.contains(title_part)).map(|(k, _, b)| (k, b))
+    }
+
+    /// 파일이 생길 때까지 기다린다(사건) — 백스톱은 막힘 방지일 뿐 판정이 아니다.
+    fn wait_for_file(p: &std::path::Path) -> bool {
+        for _ in 0..600 {
+            // wallclock: guard hang — the hook writes this file at its own start
+            if p.exists() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        false
+    }
+
+    // ── AT1 · 경로 ──
+
+    /// ★AT1 hook_output_reaches_restore_log — 훅 출력이 머리말 아래 복원 로그에 있고, 훅 뒤 계획이 certified Empty 이고
+    /// 잠금이 비었으니 authority 를 건너뛴다. 실행된 것은 원본 경로가 아니라 검증된 바이트의 사본이다.
+    #[test]
+    fn hook_output_reaches_restore_log() {
+        let _g = hook_knobs();
+        let rig = Rig::new("at1");
+        rig.set("plan.mode", "targets");
+        rig.set("plan.post.mode", "empty");
+        let pre = user_script(&rig, HOOK);
+        let Prerestore::Run { path, sha256, .. } = pre.clone() else { unreachable!() };
+        prerestore_then_authority(&rig.run(), Some(rig.rdir.as_path()), pre);
+        assert_eq!(rig.calls(), vec!["plan".to_string(), "hook ok".into(), post_call(&rig)]);
+        let log = rig.log();
+        let header = format!("===== phoenix hook {path} sha256={} =====", &sha256[..16]);
+        let at = log.find(&header).unwrap_or_else(|| panic!("no hook header: {log}"));
+        assert!(log[at..].contains("HOOK-MARKER-OUTPUT"), "{log}");
+        assert!(log.contains("===== phoenix hook end: exit=0 ====="), "{log}");
+        assert!(log.contains("내장 복원을 건너뛴다"), "{log}");
+        assert!(feed(&rig).is_empty(), "{:?}", feed(&rig));
+        let copy = rig.script.with_file_name("javis_phoenix.py.user");
+        assert_eq!(std::fs::read(&copy).unwrap(), HOOK.as_bytes());
+        // K8 (r1 §7-2): argv 벡터 — 사본 · --socket S · restore --auto. 셸도 문자열 조립도 없다.
+        let argv: Vec<String> = serde_json::from_str(&std::fs::read_to_string(rig.dir.join("hook-argv.json")).unwrap()).unwrap();
+        let sock = rig.run().socket.to_string();
+        assert_eq!(argv, vec![copy.to_string_lossy().into_owned(), "--socket".into(), sock, "restore".into(), "--auto".into()]);
+    }
+
+    /// ★r1 §7-2 (S5 R1-2) — 해시한 뒤 원본이 바뀌어도 바뀐 파일은 **돌지 않는다**: 데몬은 해시한 그 바이트의 사본을 돌린다.
+    #[test]
+    fn swapped_source_after_hashing_is_never_executed() {
+        let _g = hook_knobs();
+        let rig = Rig::new("toctou");
+        rig.set("plan.post.mode", "empty");
+        let pre = user_script(&rig, HOOK);
+        let Prerestore::Run { path, .. } = pre.clone() else { unreachable!() };
+        std::fs::write(
+            &path,
+            "import os\nopen(os.path.join(os.environ['FAKE_DIR'], 'calls.txt'), 'a').write('hook swapped\\n')\nprint('SWAPPED-SOURCE-RAN')\n",
+        )
+        .unwrap();
+        prerestore_then_authority(&rig.run(), Some(rig.rdir.as_path()), pre);
+        assert_eq!(rig.calls(), vec!["plan".to_string(), "hook ok".into(), post_call(&rig)], "the swapped source ran");
+        assert!(!rig.log().contains("SWAPPED-SOURCE-RAN") && rig.log().contains("HOOK-MARKER-OUTPUT"), "{}", rig.log());
+    }
+
+    /// ★C1 — 결정이 None 이면 오늘의 경로 그대로(복원 로그 3줄 · authority 한 번 · 통지 0). Refused 는 한 줄을 더하고 같은 경로.
+    #[test]
+    fn no_hook_and_refused_hook_take_todays_path() {
+        let _g = hook_knobs();
+        let rig = Rig::new("c1hook");
+        prerestore_then_authority(&rig.run(), Some(rig.rdir.as_path()), Prerestore::None);
+        assert_eq!(rig.calls(), vec!["restore --auto"]);
+        let log = rig.log();
+        assert_eq!(log.lines().count(), 3, "{log:?}");
+        assert!(feed(&rig).is_empty());
+        let r = Rig::new("refused");
+        prerestore_then_authority(&r.run(), Some(r.rdir.as_path()), Prerestore::Refused { path: "/u/h.py".into(), reason: "sha256_mismatch" });
+        assert_eq!(r.calls(), vec!["restore --auto"]);
+        assert!(r.log().starts_with("===== phoenix hook refused: /u/h.py (sha256_mismatch) — 내장 복원만 실행 =====\n"), "{}", r.log());
+        assert!(feed(&r).is_empty());
+    }
+
+    /// 실제 판독 경로 — allow 파일은 `CYS_LOCAL_DIR/phoenix-allow.sha256`. 없으면 None, default 줄과 바이트가 맞으면 Run,
+    /// 목록에 없는 선택자는 Refused.
+    #[test]
+    fn read_prerestore_reads_the_local_allow_file() {
+        let _g = hook_knobs();
+        let rig = Rig::new("allow");
+        let local = rig.dir.join("local");
+        std::fs::create_dir_all(&local).unwrap();
+        std::env::set_var("CYS_LOCAL_DIR", &local);
+        let none = read_prerestore();
+        let Prerestore::Run { path, sha256, .. } = user_script(&rig, HOOK) else { unreachable!() };
+        std::fs::write(local.join("phoenix-allow.sha256"), format!("default {sha256}  {path}\n")).unwrap();
+        let run = read_prerestore();
+        std::env::set_var("CYS_PHOENIX_SCRIPT", rig.dir.join("other.py"));
+        let refused = read_prerestore();
+        std::env::remove_var("CYS_PHOENIX_SCRIPT");
+        std::env::remove_var("CYS_LOCAL_DIR");
+        assert_eq!(none, Prerestore::None);
+        assert!(matches!(&run, Prerestore::Run { path: p, .. } if *p == path), "{run:?}");
+        assert!(matches!(refused, Prerestore::Refused { reason: "not_in_allow_file", .. }));
+    }
+
+    /// 디스크 폴백(추출 트리 없음)이면 훅을 돌리지 않는다 — N1(원인) 뒤 authority.
+    #[test]
+    fn disk_fallback_runs_no_hook() {
+        let _g = hook_knobs();
+        let rig = Rig::new("nofe");
+        prerestore_then_authority(&rig.run(), None, user_script(&rig, HOOK));
+        assert_eq!(rig.calls(), vec!["restore --auto"]);
+        let (kind, body) = notice(&rig, "스크립트가 실패했습니다").expect("N1");
+        assert_eq!(kind, "warn");
+        assert!(body.contains("no extraction tree (disk fallback)"), "{body}");
+    }
+
+    // ── D4 (r2 §6-3 · §9) ──
+
+    /// ★D4-a — 조용히 멈춘 훅은 **정지 상한**이 끝낸다(복원 로그를 열 수 없어도 — 측정 대상은 훅 출력 파일이다).
+    /// 벽이 끝낸다면 정지 탐지기가 없는 것이고 이 검체는 실패한다(r2 §6-3(3)).
+    #[test]
+    fn silent_hang_ends_by_stall_without_restore_log() {
+        let _g = hook_knobs();
+        std::env::set_var("CYS_PHOENIX_HOOK_STALL_MS", "1000");
+        std::env::set_var("CYS_PHOENIX_HOOK_TIMEOUT_MS", "30000");
+        let rig = std::sync::Arc::new(Rig::new("d4a"));
+        std::fs::create_dir_all(&rig.log).unwrap(); // 복원 로그 자리가 디렉터리 — 열 수 없다
+        rig.set("hook.mode", "silent");
+        rig.set("plan.post.mode", "empty");
+        let rx = hook_on_thread(&rig);
+        let got = rx.recv_timeout(std::time::Duration::from_secs(120)); // wallclock: guard hang if no bound ends the hook
+        std::env::remove_var("CYS_PHOENIX_HOOK_STALL_MS");
+        std::env::remove_var("CYS_PHOENIX_HOOK_TIMEOUT_MS");
+        if got.is_err() {
+            rig.kill_ours("hook.pid");
+        }
+        assert_eq!(got.expect("the hook phase did not return"), HookNext::Skip);
+        let (kind, body) = notice(&rig, "멈춰서 중단했습니다").expect("N2");
+        assert_eq!(kind, "warn");
+        assert!(notice(&rig, "멈춰서 중단했습니다 (stall)").is_some(), "the wall, not the stall, ended the hang: {body}");
+        assert!(body.contains("`stall` 상한"), "{body}");
+    }
+
+    /// ★D4-b — 훅 출력은 훅이 **살아 있는 동안** 복원 로그에 덧붙는다(끝난 뒤 한 번 복사가 아니다).
+    #[test]
+    fn hook_output_reaches_restore_log_incrementally() {
+        let _g = hook_knobs();
+        let rig = std::sync::Arc::new(Rig::new("d4b"));
+        rig.set("hook.mode", "release");
+        rig.set("plan.post.mode", "empty");
+        let rx = hook_on_thread(&rig);
+        let mut seen_while_alive = false;
+        for _ in 0..400 {
+            // wallclock: guard hang — the hook waits for the release file, so it is alive for this whole loop
+            if rig.log().contains("HOOK-EARLY-MARKER") {
+                seen_while_alive = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        rig.set("release", "1");
+        let got = rx.recv_timeout(std::time::Duration::from_secs(60)); // wallclock: guard hang
+        if got.is_err() {
+            rig.kill_ours("hook.pid");
+        }
+        assert_eq!(got.expect("hook phase did not return"), HookNext::Skip);
+        assert!(seen_while_alive, "the hook's output reached the restore log only after it ended: {}", rig.log());
+        assert!(rig.log().contains("HOOK-LATE-MARKER"));
+    }
+
+    /// ★D4-c — 출력 파일을 만들 수 없으면 훅을 **띄우지 않는다**(정지 탐지기 없이 돌지 않는다): N1 · authority.
+    #[test]
+    fn hook_not_run_when_output_file_fails() {
+        let _g = hook_knobs();
+        let rig = Rig::new("d4c");
+        std::fs::create_dir_all(rig.rdir.join("hook-0.out")).unwrap();
+        boot(&rig);
+        assert_eq!(rig.calls(), vec!["plan", "restore --auto"], "the hook ran without its output file");
+        let (_, body) = notice(&rig, "스크립트가 실패했습니다").expect("N1");
+        assert!(body.contains("hook output file"), "{body}");
+    }
+
+    /// ★D4-d — 벽이 이 로스터의 예산보다 짧으면 훅 **앞에서** 로그에 남는다(노브 1800 · 예산 2000). 예산이 덮이면 남지 않는다.
+    #[test]
+    fn wall_below_restore_budget_is_logged() {
+        let _g = hook_knobs();
+        std::env::set_var("CYS_PHOENIX_HOOK_TIMEOUT_S", "1800");
+        let below = Rig::new("d4d1");
+        below.set("plan.observed", r#"{"restore_outer_s":2000,"restore_unit_s":69,"restore_units":29,"restore_budget_source":"javis_budget"}"#);
+        below.set("plan.post.mode", "empty");
+        boot(&below);
+        let covered = Rig::new("d4d2");
+        covered.set("plan.observed", OBS_1300);
+        covered.set("plan.post.mode", "empty");
+        boot(&covered);
+        std::env::remove_var("CYS_PHOENIX_HOOK_TIMEOUT_S");
+        let log = below.log();
+        let line = "[cysd] hook wall bound 1800 s is below this roster's restore budget 2000 s (29 units)";
+        let (at_line, at_hook) = (log.find(line), log.find("===== phoenix hook /"));
+        assert!(at_line.is_some() && at_line < at_hook, "{log}");
+        assert!(notice(&below, "시간 상한").is_none(), "a knob wall is logged, not loud");
+        assert!(!covered.log().contains("is below"), "{}", covered.log());
+        assert!(covered.log().contains("covers this roster's restore budget 1300 s (19 units) plus one unit (69 s)"), "{}", covered.log());
+    }
+
+    /// ★D4′ (CEO d34b1099 §4 ⒜⒝) — 기본 벽이 3600 에서 잘리면(52 단위) 훅 앞에서 **크게**(통지) 알리고, W·X·U 는
+    /// 계획 산출물(훅 앞 계획 출력)과 그 머리말에 실린다. 대조: 1300 s 로스터는 1800 · 조용.
+    #[test]
+    fn d4_prime_cap_binds_is_loud_before_the_hook_and_in_the_plan_artifact() {
+        let _g = hook_knobs();
+        let capped = Rig::new("cap");
+        capped.set("plan.observed", r#"{"restore_outer_s":3557,"restore_unit_s":68,"restore_units":52,"restore_budget_source":"javis_budget"}"#);
+        capped.set("plan.post.mode", "empty");
+        boot(&capped);
+        let (kind, body) = notice(&capped, "시간 상한이 이 로스터의 복원 예산을 덮지 못합니다").expect("loud notice");
+        assert_eq!(kind, "warn");
+        assert!(body.contains("상한 3600초") && body.contains("3557초(52단위)") && body.contains("한 단위(68초)"), "{body}");
+        let log = capped.log();
+        let at_sentence = log.find("hook wall bound 3600 s is less than one unit (68 s) above this roster's restore budget 3557 s (52 units)");
+        assert!(at_sentence.is_some() && at_sentence < log.find("===== phoenix hook /"), "{log}");
+        assert!(log.contains("===== phoenix plan (pre-hook · wall=3600s budget=3557s units=52) outcome="), "{log}");
+        let artifact = std::fs::read_to_string(capped.rdir.join("plan-pre.out")).unwrap();
+        let wl = artifact.lines().find(|l| l.starts_with(phoenix_plan::HOOK_WALL_PREFIX)).expect("W/X/U line in the plan artifact");
+        let v: serde_json::Value = serde_json::from_str(&wl[phoenix_plan::HOOK_WALL_PREFIX.len()..]).unwrap();
+        assert_eq!((v["wall_s"].as_u64(), v["restore_outer_s"].as_u64(), v["restore_units"].as_u64()), (Some(3600), Some(3557), Some(52)));
+        assert_eq!(v["wall_from"], "default_capped");
+
+        let small = Rig::new("nocap");
+        small.set("plan.observed", OBS_1300);
+        small.set("plan.post.mode", "empty");
+        boot(&small);
+        assert!(notice(&small, "시간 상한").is_none());
+        let a = std::fs::read_to_string(small.rdir.join("plan-pre.out")).unwrap();
+        assert!(a.contains(r#""wall_s":1800"#) && a.contains(r#""check":"ok""#), "{a}");
+    }
+
+    /// 벽은 계속 출력하는 훅을 끝낸다(정지는 넉넉하다) — N2(wall) 와 예산 문장(r2 §6-4).
+    #[test]
+    fn wall_ends_a_chatty_hook_with_the_budget_sentence() {
+        let _g = hook_knobs();
+        std::env::set_var("CYS_PHOENIX_HOOK_TIMEOUT_S", "90");
+        std::env::set_var("CYS_PHOENIX_HOOK_TIMEOUT_MS", "1500");
+        std::env::set_var("CYS_PHOENIX_HOOK_STALL_MS", "30000");
+        let rig = std::sync::Arc::new(Rig::new("wall"));
+        rig.set("hook.mode", "chatty");
+        rig.set("plan.observed", OBS_1300);
+        rig.set("plan.post.mode", "empty");
+        let rx = hook_on_thread(&rig);
+        let got = rx.recv_timeout(std::time::Duration::from_secs(60)); // wallclock: guard hang if the wall bound is gone
+        for k in ["CYS_PHOENIX_HOOK_TIMEOUT_S", "CYS_PHOENIX_HOOK_TIMEOUT_MS", "CYS_PHOENIX_HOOK_STALL_MS"] {
+            std::env::remove_var(k);
+        }
+        if got.is_err() {
+            rig.kill_ours("hook.pid");
+        }
+        assert_eq!(got.expect("hook phase did not return"), HookNext::Skip);
+        let (_, body) = notice(&rig, "멈춰서 중단했습니다 (wall)").expect("N2 (wall)");
+        assert!(body.ends_with("이 로스터의 복원 예산(1300초, 19단위)이 상한보다 깁니다."), "{body}");
+    }
+
+    // ── 결과 → 통지 (r1 §7-4 · r2 §6-4) ──
+
+    /// ★AT3 — 문법 오류인 스크립트(exit 1)는 N1(종료코드) 뒤 authority.
+    #[test]
+    fn hook_syntax_error_falls_back_with_notice() {
+        let _g = hook_knobs();
+        let rig = Rig::new("at3");
+        let bad = "def (:\n";
+        let pre = user_script(&rig, bad);
+        prerestore_then_authority(&rig.run(), Some(rig.rdir.as_path()), pre);
+        assert_eq!(rig.calls(), vec!["plan", "restore --auto"]);
+        let (_, body) = notice(&rig, "스크립트가 실패했습니다").expect("N1");
+        assert!(body.contains("종료코드 `1` 로 끝났습니다"), "{body}");
+    }
+
+    /// exit 5 · 6 은 사람 확인 — N3(error) · 이번 부팅은 authority 도 돌리지 않는다.
+    #[test]
+    fn hook_exit_5_or_6_stops_the_boot() {
+        let _g = hook_knobs();
+        for (code, name) in [(5, "BREAKER_OPEN"), (6, "CORRUPT/identity")] {
+            let rig = Rig::new("n3");
+            rig.set("hook.mode", &format!("exit{code}"));
+            boot(&rig);
+            assert_eq!(rig.calls(), vec!["plan".to_string(), format!("hook exit{code}")], "{code}");
+            let (kind, body) = notice(&rig, "사람 확인이 필요한 상태").expect("N3");
+            assert_eq!(kind, "error");
+            assert!(body.contains(&format!("종료코드 `{code}` (`{name}`)")), "{body}");
+        }
+    }
+
+    /// 훅 뒤 계획: Targets ⇒ N4 · Uncertified(축소 · 증명 없는 묘비) ⇒ N6 · N6b · 판독 불가 ⇒ N5 — 모두 authority.
+    #[test]
+    fn post_plan_outcomes_route_to_notices_and_the_authority() {
+        let _g = hook_knobs();
+        let t = Rig::new("n4");
+        t.set("plan.post.mode", "targets");
+        boot(&t);
+        assert_eq!(t.calls(), vec!["plan".to_string(), "hook ok".into(), post_call(&t), "restore --auto".into()]);
+        assert_eq!(notice(&t, "복원되지 않은 역할이 있어").expect("N4").1, "남아 있던 역할: `worker-2`.");
+
+        let u = Rig::new("n6");
+        u.set("plan.post.mode", "uncertified");
+        u.set("plan.reasons", "liveness_unknown;roster_shrunk_across_hook:worker-2,worker-3;tombstoned_across_hook_unproven:cso");
+        boot(&u);
+        assert_eq!(u.calls().last().map(String::as_str), Some("restore --auto"));
+        assert!(notice(&u, "복원 대상 목록에서 역할을 지웠습니다").expect("N6").1.contains("`worker-2, worker-3`"));
+        assert!(notice(&u, "데몬 기록에 없는 폐역").expect("N6b").1.contains("`cso`"));
+
+        let x = Rig::new("n5");
+        x.set("plan.post.mode", "crash");
+        boot(&x);
+        assert_eq!(x.calls().last().map(String::as_str), Some("restore --auto"));
+        assert!(notice(&x, "복원 계획을 확인하지 못해").expect("N5").1.starts_with("원인: `exit 1`."));
+    }
+
+    /// 훅 앞 계획을 얻지 못해도 훅은 돈다 — 기준선이 없으니 훅 뒤 계획 없이 N5(baseline) · authority, 비교도 없다고 적는다.
+    #[test]
+    fn pre_plan_unobtainable_runs_the_hook_then_baseline_n5() {
+        let _g = hook_knobs();
+        let rig = Rig::new("n5b");
+        rig.set("plan.mode", "crash");
+        boot(&rig);
+        assert_eq!(rig.calls(), vec!["plan", "hook ok", "restore --auto"]);
+        assert!(notice(&rig, "복원 계획을 확인하지 못해").expect("N5").1.starts_with("원인: `사전 계획(baseline): exit 1`."));
+        assert!(rig.log().contains("no comparison with the restore budget"), "{}", rig.log());
+    }
+
+    /// 훅 뒤 계획이 Empty 여도 복원 잠금이 잡혀 있으면 건너뛰지 않는다(r2 §5-2).
+    #[test]
+    fn post_empty_with_a_held_lock_runs_the_authority() {
+        let _g = hook_knobs();
+        let rig = Rig::new("held");
+        rig.set("plan.post.mode", "empty");
+        let (_st, guard) = reclaim::try_hold_restore_lease(&rig.dir);
+        boot(&rig);
+        drop(guard);
+        assert_eq!(rig.calls().last().map(String::as_str), Some("restore --auto"));
+        assert!(rig.log().contains("계획은 비었지만 Uncertified([\"restore_lock_held\"])"), "{}", rig.log());
+    }
+
+    // ── hook.run.lock (r1 §7-2 · r2 §5-2 · N7) ──
+
+    /// 이전 부팅의 훅이 `hook.run.lock` 을 쥐고 있으면 D 뒤에도 쥐고 있을 때 N7 · 이번 부팅은 아무것도 띄우지 않는다.
+    #[test]
+    fn previous_hook_alive_stops_the_boot() {
+        let _g = hook_knobs();
+        let rig = Rig::new("n7");
+        let held = reclaim::hold_named_lock_for_child(&rig.dir, "hook.run.lock").expect("test holds the lock");
+        boot(&rig);
+        drop(held);
+        assert!(rig.calls().is_empty(), "{:?}", rig.calls());
+        let (kind, body) = notice(&rig, "아직 실행 중입니다").expect("N7");
+        assert_eq!(kind, "error");
+        assert!(body.starts_with("`hook.run.lock` 을 쥔 프로세스가 0초 뒤에도 남아 있습니다."), "{body}");
+        // 헤드 재정(R1-1 조건 2): 원인과 처방을 한 문장으로 — 표준입력을 물려받은 도우미 · 끝내고 stdin 을 돌려 띄운다.
+        assert!(body.contains(&format!("남아 있습니다. {N7_CAUSE_AND_REMEDY} 두 복원이")), "{body}");
+        assert!(N7_CAUSE_AND_REMEDY.contains("stdin") && N7_CAUSE_AND_REMEDY.contains("</dev/null") && N7_CAUSE_AND_REMEDY.contains("DEVNULL"));
+        assert!(N7_CAUSE_AND_REMEDY.ends_with('.') && N7_CAUSE_AND_REMEDY.matches('.').count() == 1, "one sentence");
+    }
+
+    /// ★헤드 재정 R1-1 조건 1 — allow 파일이 없는 기본 사용자는 N7 관측에도 표준입력 잠금 전달에도 닿지 않는다: 남이
+    /// `hook.run.lock` 을 쥐고 있어도 오늘의 경로 그대로 authority 가 돌고(N7 0), 데몬은 그 잠금 파일을 만들지도 않는다.
+    #[test]
+    fn default_boot_never_reaches_n7_or_the_stdin_carrier() {
+        let _g = hook_knobs();
+        let fresh = Rig::new("defnolock");
+        let local = fresh.dir.join("local");
+        std::fs::create_dir_all(&local).unwrap();
+        std::env::set_var("CYS_LOCAL_DIR", &local);
+        let pre = read_prerestore();
+        prerestore_then_authority(&fresh.run(), Some(fresh.rdir.as_path()), pre.clone());
+        let held = Rig::new("defheld");
+        let lock = reclaim::hold_named_lock_for_child(&held.dir, "hook.run.lock").expect("test holds the lock");
+        prerestore_then_authority(&held.run(), Some(held.rdir.as_path()), read_prerestore());
+        drop(lock);
+        std::env::remove_var("CYS_LOCAL_DIR");
+        assert_eq!(pre, Prerestore::None);
+        assert_eq!(fresh.calls(), vec!["restore --auto"]);
+        assert!(!fresh.dir.join("phoenix").join("hook.run.lock").exists(), "a default boot created hook.run.lock");
+        assert_eq!(held.calls(), vec!["restore --auto"], "a held hook.run.lock stopped a boot that has no allow file");
+        assert!(notice(&held, "아직 실행 중입니다").is_none() && feed(&held).is_empty(), "{:?}", feed(&held));
+    }
+
+    /// 잠금은 훅의 수명이다 — 훅이 사는 동안 Held, 끝난 뒤 Free(데몬은 사본을 쥐지 않는다).
+    #[test]
+    fn hook_holds_hook_run_lock_for_its_life() {
+        let _g = hook_knobs();
+        let rig = std::sync::Arc::new(Rig::new("lock"));
+        rig.set("hook.mode", "release");
+        rig.set("plan.post.mode", "empty");
+        let rx = hook_on_thread(&rig);
+        let started = wait_for_file(&rig.dir.join("hook.pid"));
+        let during = reclaim::probe_restore_lock(&rig.dir, "hook.run.lock");
+        rig.set("release", "1");
+        let got = rx.recv_timeout(std::time::Duration::from_secs(60)); // wallclock: guard hang
+        if got.is_err() {
+            rig.kill_ours("hook.pid");
+        }
+        got.expect("hook phase did not return");
+        assert!(started);
+        assert_eq!(during, reclaim::LeaseState::Held, "the hook did not hold hook.run.lock");
+        assert_eq!(reclaim::probe_restore_lock(&rig.dir, "hook.run.lock"), reclaim::LeaseState::Free);
+    }
+
+    // ── R1-3 · R1-9 (S4 carries) ──
+
+    /// ★R1-3 — 데몬의 환경에 `PHOENIX_RESULT_FILE` 이 있어도 훅·두 계획·채널 없는 authority 시도는 그것을 받지 않는다.
+    /// 훅은 `CYS_PHOENIX_HOOK=1` · `PYTHONUNBUFFERED=1` 을 받는다.
+    #[test]
+    fn result_file_channel_never_leaks_to_hook_plans_or_channelless_attempts() {
+        let _g = hook_knobs();
+        let rig = Rig::new("r13");
+        let leak = rig.dir.join("leak.json");
+        std::env::set_var("PHOENIX_RESULT_FILE", &leak);
+        rig.set("plan.post.mode", "targets");
+        boot(&rig);
+        let mut run = rig.run();
+        run.rdir = None;
+        let channelless = run_attempt_with_result(&run, 0);
+        std::env::remove_var("PHOENIX_RESULT_FILE");
+        let env: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(rig.dir.join("hook-env.json")).unwrap()).unwrap();
+        assert_eq!(env["PHOENIX_RESULT_FILE"], serde_json::Value::Null, "{env}");
+        assert_eq!((env["CYS_PHOENIX_HOOK"].as_str(), env["PYTHONUNBUFFERED"].as_str(), env["CYS_NO_AUTOSTART"].as_str()), (Some("1"), Some("1"), Some("1")));
+        let plans = std::fs::read_to_string(rig.dir.join("plan-env.txt")).unwrap();
+        assert_eq!(plans, "-\n-\n", "a plan saw the daemon's PHOENIX_RESULT_FILE");
+        let attempts = std::fs::read_to_string(rig.dir.join("result-env.txt")).unwrap();
+        let lines: Vec<&str> = attempts.lines().collect();
+        assert!(lines[0].ends_with("result-0.json") && !lines[0].contains("leak"), "{attempts}");
+        assert_eq!(lines.last(), Some(&"-"), "a channel-less attempt inherited the daemon's variable");
+        assert!(!channelless.channel);
+        assert!(!leak.exists());
+    }
+
+    /// ★R1-9 — 훅 앞·훅 뒤·재확인 계획은 서로 다른 파일이다: 재확인이 훅 앞 기준선(과 그 W·X·U 줄)을 덮지 않는다.
+    #[test]
+    fn pre_post_and_recheck_plans_use_distinct_files() {
+        let _g = hook_knobs();
+        let rig = Rig::new("r19");
+        rig.set("plan.post.mode", "targets");
+        rig.set("restore.verdicts", "NOFILE");
+        boot(&rig);
+        assert_eq!(
+            rig.calls(),
+            vec!["plan".to_string(), "hook ok".into(), post_call(&rig), "restore --auto".into(), "plan".into(), "restore --auto".into()]
+        );
+        let pre = std::fs::read_to_string(rig.rdir.join("plan-pre.out")).unwrap();
+        assert!(pre.contains(phoenix_plan::HOOK_WALL_PREFIX), "the recheck overwrote the pre-hook plan: {pre}");
+        assert!(rig.rdir.join("plan-post.out").exists() && rig.rdir.join("plan-0.out").exists());
+        assert_eq!(rig.n8(), 1);
+    }
+
+    // ── D1 (r2 §6-1) ──
+
+    /// ★D1-a — 훅이 사는 동안만 restore root 로 등록되고, 두 계획(훅 앞 · 훅 뒤)을 띄우는 순간에는 등록이 없다.
+    #[test]
+    fn restore_root_dropped_before_post_plan() {
+        let _g = hook_knobs();
+        let rig = std::sync::Arc::new(Rig::new("d1a"));
+        rig.set("hook.mode", "release");
+        rig.set("plan.post.mode", "empty");
+        let rx = hook_on_thread(&rig);
+        let started = wait_for_file(&rig.dir.join("hook.pid"));
+        let during = rig.daemon.restore_roots.lock().unwrap().len();
+        rig.set("release", "1");
+        let got = rx.recv_timeout(std::time::Duration::from_secs(60)); // wallclock: guard hang
+        if got.is_err() {
+            rig.kill_ours("hook.pid");
+        }
+        assert_eq!(got.expect("hook phase did not return"), HookNext::Skip);
+        assert!(started);
+        assert_eq!(during, 1, "the live hook was not a restore root");
+        assert_eq!(*rig.roots.lock().unwrap(), vec![0, 0], "a plan was spawned while the hook's registration was still held");
+        assert_eq!(rig.daemon.restore_roots.lock().unwrap().len(), 0);
+    }
+
+    /// ★D1-b — 훅의 손자는 훅이 사는 동안에만 restore root 의 자손으로 면제된다.
+    #[test]
+    fn hook_grandchild_exempt_only_while_hook_lives() {
+        let _g = hook_knobs();
+        let rig = std::sync::Arc::new(Rig::new("d1b"));
+        rig.set("hook.mode", "grandchild");
+        rig.set("plan.post.mode", "empty");
+        let rx = hook_on_thread(&rig);
+        let ready = wait_for_file(&rig.dir.join("grandchild.pid"));
+        let gpid: u32 = std::fs::read_to_string(rig.dir.join("grandchild.pid")).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+        let during = crate::handlers::caller_in_restore_root(&rig.daemon, gpid, crate::state::peer_start_time);
+        rig.set("release", "1");
+        let got = rx.recv_timeout(std::time::Duration::from_secs(60)); // wallclock: guard hang
+        if got.is_err() {
+            rig.kill_ours("hook.pid");
+        }
+        got.expect("hook phase did not return");
+        let after = crate::handlers::caller_in_restore_root(&rig.daemon, gpid, crate::state::peer_start_time);
+        let alive = unsafe { libc::kill(gpid as i32, 0) } == 0;
+        rig.kill_ours("grandchild.pid");
+        assert!(ready && gpid > 1);
+        assert!(during, "the hook's grandchild was not exempt while the hook lived");
+        assert!(alive, "control: the grandchild outlived the hook (so 'after' tests the exemption, not its death)");
+        assert!(!after, "the grandchild stayed exempt after the hook ended");
+    }
+}
+
+// ★(0.14.56 PHX-IMPL S5 · r2 §6-2 D2) Windows 훅 하나의 Job — 이 맥에서는 타입 검사만 한다(실기 동작은 windows-health 런이 잰다 ·
+// UNMEASURED). 손자는 Job 편입 **뒤에** 생겨야 Job 안에 든다(편입 전 창은 r2 §6-2.4 의 잔여) — 그래서 자식은 표준입력 한
+// 줄을 받은 뒤에야 손자를 띄운다.
+#[cfg(all(test, windows))]
+mod hook_job_win_tests {
+    use crate::state::HideConsole;
+    use std::io::{BufRead, Write};
+
+    const TREE: &str = "import subprocess, sys, time\nsys.stdin.readline()\np = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\nprint(p.pid, flush=True)\ntime.sleep(60)\n";
+
+    /// (자식, 손자 pid). 손자는 `go` 뒤에 생긴다.
+    fn spawn_tree(before_go: impl FnOnce(u32)) -> (std::process::Child, u32) {
+        let mut child = cys::python_command("python")
+            .args(["-c", TREE])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .hide_console()
+            .spawn()
+            .expect("python on the runner");
+        before_go(child.id());
+        child.stdin.as_mut().unwrap().write_all(b"go\n").unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        (child, line.trim().parse().expect("grandchild pid"))
+    }
+
+    fn alive(pid: u32) -> bool {
+        let mut sys = sysinfo::System::new();
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(pid)]), true);
+        sys.process(sysinfo::Pid::from_u32(pid)).is_some()
+    }
+
+    fn gone_within(pid: u32) -> bool {
+        for _ in 0..100 {
+            // wallclock: guard hang — TerminateJobObject is synchronous for the job's processes; this only absorbs teardown
+            if !alive(pid) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        false
+    }
+
+    /// ★D2 — 훅의 Job 을 끝내면 편입 뒤 생긴 손자도 함께 끝난다.
+    #[test]
+    fn hook_timeout_terminates_per_hook_job_tree() {
+        let mut job = None;
+        let (mut child, g) = spawn_tree(|pid| job = crate::state::winjob::HookJob::create_and_assign(pid));
+        let job = job.expect("per-hook job created and assigned (N9 otherwise)");
+        assert!(job.terminate(), "TerminateJobObject failed");
+        let _ = child.wait();
+        assert!(gone_within(g), "the grandchild survived the per-hook job's termination");
+    }
+
+    /// ★D2-ctl — 대조: Job 없이 `Child::kill` 만 하면 손자는 남는다(그래서 D2 가 무엇을 재는지 드러난다).
+    #[test]
+    fn child_kill_alone_leaves_the_grandchild() {
+        let (mut child, g) = spawn_tree(|_| {});
+        let _ = child.kill();
+        let _ = child.wait();
+        let survived = alive(g);
+        let mut sys = sysinfo::System::new();
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(g)]), true);
+        if let Some(p) = sys.process(sysinfo::Pid::from_u32(g)) {
+            p.kill();
+        }
+        assert!(survived, "control: Child::kill already ended the grandchild, so D2 measures nothing");
+    }
+
+    /// `try_assign_child` 는 실패를 돌려준다(N9 `데몬 Job` 의 탐지기) — 없는 pid 는 거짓.
+    #[test]
+    fn try_assign_child_reports_failure() {
+        assert!(!crate::state::winjob::try_assign_child(0));
+        assert!(!crate::state::winjob::try_assign_child(u32::MAX - 1));
+    }
 }

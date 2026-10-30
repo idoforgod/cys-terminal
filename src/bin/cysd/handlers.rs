@@ -4048,7 +4048,11 @@ fn journal_barrier_verdict(id: &Value, handle: &crate::agent_write::Request, sid
 /// caller_cache 와 완전 독립이다(별도 sysinfo 새로고침·캐시 미사용 — 공유 자료구조 오염 0). start_time
 /// 재조회를 lookup 으로 주입해 관측실패(None) 경로를 결정론 테스트한다. fail-closed: 복원 미진행(빈
 /// 목록)·미등록 조상·start_time 불일치/관측실패 = false. Some(current)==Some(registered) 만 허용한다.
-fn caller_in_restore_root(
+/// ★(0.14.56 PHX · r2 §6-1 D1) 한 칸 올라갈 때마다 부모가 자식보다 늦게 시작하지 않았음을 확인한다 —
+/// 부모 pid 가 낡아 재사용된 경우(죽은 부모의 pid 를 더 젊은 프로세스가 받았다) 그 젊은 프로세스는 자식의
+/// 조상이 아니다. 어느 쪽 start_time 이든 관측 실패면 false. 해상도는 lookup 의 단위(초)라 같은 초 안의
+/// 재사용은 가르지 못한다.
+pub(crate) fn caller_in_restore_root(
     daemon: &Daemon,
     caller_pid: u32,
     start_time_lookup: impl Fn(u32) -> Option<u64>,
@@ -4064,6 +4068,7 @@ fn caller_in_restore_root(
     let mut sys = sysinfo::System::new();
     sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
     let mut cur = caller_pid;
+    let mut cur_start: Option<u64> = None; // 직전 칸에서 이미 읽은 cur 의 start_time
     for _ in 0..32 {
         if let Some(&(_, registered_start)) = roots.iter().find(|(p, _)| *p == cur) {
             // A5(pid 재사용)·A6(관측실패) fail-closed: 현재 start_time 재조회가 등록값과
@@ -4075,7 +4080,15 @@ fn caller_in_restore_root(
             .and_then(|p| p.parent())
         {
             Some(parent) if parent.as_u32() != cur && parent.as_u32() > 1 => {
-                cur = parent.as_u32();
+                let parent = parent.as_u32();
+                let child_start = cur_start.or_else(|| start_time_lookup(cur));
+                match (start_time_lookup(parent), child_start) {
+                    (Some(ps), Some(cs)) if ps <= cs => {
+                        cur = parent;
+                        cur_start = Some(ps);
+                    }
+                    _ => return false, // 부모가 자식보다 젊다(낡은 ppid) · 관측 실패
+                }
             }
             _ => break,
         }
@@ -29194,6 +29207,64 @@ mod tests {
             allowed,
             "restore-root(self) 의 실 자식이 조상 walk 로 면제되지 않았다 (P1 다중홉)"
         );
+    }
+
+    /// ★(0.14.56 PHX · r2 §9 D1-c) 조상 walk 의 시작 순서 검사 — 실 자식(sleep)의 부모는 등록된 root(self)
+    /// 이다. lookup 이 자식을 **부모보다 먼저 시작한 것**처럼 보고하면(낡은 ppid 를 젊은 프로세스가 재사용한
+    /// 모양) 그 부모는 조상이 아니므로 거부한다. 대조 절반: 같은 계보에서 자식이 부모보다 늦게(또는 같은 초에)
+    /// 시작했다고 보고하면 허용한다. 자식 관측 실패도 거부다. 핀 9da2418d 의 walk 는 등록 root 의 start_time
+    /// 만 보므로 첫 단언이 그 판에서 적색이다.
+    #[test]
+    fn restore_root_walk_rejects_parent_younger_than_child() {
+        use crate::state::HideConsole;
+        let daemon = claim_daemon();
+        let self_pid = std::process::id();
+        let real_start = crate::state::peer_start_time(self_pid).expect("self process must be visible");
+        daemon.restore_roots.lock().unwrap().push((self_pid, real_start));
+        let mut child = std::process::Command::new("sleep")
+            .hide_console()
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep child");
+        let child_pid = child.id();
+        // 관측 게이트: 자식과 그 부모 연결이 프로세스표에 보일 때까지(시계가 아니라 관측).
+        let mut visible = false;
+        for _ in 0..200 {
+            let mut sys = sysinfo::System::new();
+            sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+            if sys
+                .process(sysinfo::Pid::from_u32(child_pid))
+                .and_then(|p| p.parent())
+                .is_some_and(|pp| pp.as_u32() == self_pid)
+            {
+                visible = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10)); // wallclock: guard process-table visibility
+        }
+        let with = |child_start: Option<u64>| {
+            move |p: u32| {
+                if p == self_pid {
+                    Some(real_start)
+                } else if p == child_pid {
+                    child_start
+                } else {
+                    None
+                }
+            }
+        };
+        let older_child = caller_in_restore_root(&daemon, child_pid, with(Some(real_start.saturating_sub(10))));
+        let same_second = caller_in_restore_root(&daemon, child_pid, with(Some(real_start)));
+        let younger_child = caller_in_restore_root(&daemon, child_pid, with(Some(real_start + 10)));
+        let unobserved = caller_in_restore_root(&daemon, child_pid, with(None));
+        let _ = child.kill();
+        let _ = child.wait();
+        daemon.restore_roots.lock().unwrap().clear();
+        assert!(visible, "sleep 자식과 부모 연결이 프로세스표에 보이지 않았다(관측 실패)");
+        assert!(!older_child, "자식보다 늦게 시작한 '부모'를 조상으로 받아들였다 (D1-c)");
+        assert!(same_second, "대조: 같은 초에 시작한 실 부모를 거부했다");
+        assert!(younger_child, "대조: 자식보다 먼저 시작한 실 부모를 거부했다");
+        assert!(!unobserved, "자식 start_time 관측 실패를 통과시켰다");
     }
 
     /// P1 dispatch: restore-root 자손의 authoritative send_text·send_key **둘 다** typing_guard 를

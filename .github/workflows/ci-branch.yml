@@ -249,6 +249,14 @@ jobs:
                   "--bin cysd activity_tests::":
                       "0.14.52 F-01: the only BLOCKING native Windows run of the activity observer tests (Windows identity staging path included) — "
                       "without it the observer ships with Windows behaviour vouched for only by macOS.",
+                  "--bin cysd hook_job_win_tests::":
+                      "0.14.56 PHX: the only BLOCKING native Windows run of the per-hook Job specimens (timeout kills the hook's tree, "
+                      "assign failure is reported) — hook_tests:: is cfg(unix) and the cysd full step is non-blocking.",
+                  "--bin cysd phoenix_plan::":
+                      "0.14.56 PHX: the pure pre-restore judgements (allow file, plan outcome, hook bounds) run blocking on Windows here — "
+                      "without it Windows path rules in the allow-file parser are vouched for only by macOS.",
+                  "--bin cysd reclaim::tests::probe_":
+                      "0.14.56 PHX: the read-only restore-lock probe's Windows LockFileEx branch runs only here (named guard in the step).",
               },
           }
 
@@ -289,7 +297,8 @@ jobs:
                   "`cargo build --bin cys --bin cysd` 로 실 데몬을 만들고 PHOENIX_HARNESS_CYSD 로 "
                   "kill→재기동 host-level e2e 를 돌린다. 팩-only 레인은 manifest emit 용 `cys` 만 "
                   "빌드해 cysd 가 없고, ci-branch 는 그 예산(수 분)을 안 쓴다. 13종 중 cysd 를 실제로 "
-                  "요구하는 것은 3종(c6_reap·e2e_replacement·w2_untomb_fullcycle)뿐이라 나머지는 "
+                  "요구하는 것은 3종(c6_reap·e2e_replacement·w2_untomb_fullcycle)뿐이라 "
+                  "(0.14.56 PHX S6b: e2e_hook 이 4번째다 — 실 cysd 의 훅 단계를 재므로 이 글롭에만 실린다) 나머지는 "
                   "원리상 이식 가능하다 — 즉 이것은 **잔여 격차**이지 정당한 무관함이 아니다. 팩 레인 "
                   "예산이 허용되면 밀폐 부분집합부터 편입하라. "
                   "⚠이 접두 글롭은 **새 phoenix 파일을 자동으로 면제한다**(추출 정규식이 `*` 앞에서 "
@@ -1058,6 +1067,15 @@ jobs:
           #     실측 2026-09-26 00:5x PDT · macOS arm64 · python 3.14.7 · sh·dash·bash 46행 rc=0 · 약 24s(10s 상한 행 1회 포함).
           #   ★0.14.56 #6(gemini-6 r1 minor) — test_orchestra_todo_path 를 mac 루프에도 싣는다. ubuntu·pack-release·release
           #     루프에는 c214777a 가 실었고 mac 루프만 빠져 있었다(lane-parity 는 워크플로 단위 합집합이라 못 본다).
+          #   ★0.14.56 PHX-IMPL S2 5종 추가 등재 — phoenix 읽기 전용 `plan` 서브커맨드(DESIGN-r2 §4, §9):
+          #     test_phoenix_plan_cli(틀·exit·identity 계약·resolve 저널 없음) · test_phoenix_plan_certify(P1-P8 ·
+          #     P6 기준선 fold) · test_phoenix_plan_identity(plan 과 restore 의 대상 산정 동일성 · 한 경로 + 검체 내
+          #     변이 대조) · test_phoenix_plan_side_effect_free(GATE 1 — 쓰기 0·데몬 호출 0 · 검체 내 변이 M1-M8 ·
+          #     PHOENIX_HARNESS_CYSD 가 있으면 실 cysd 하네스 모드) · test_phoenix_result_file(PHOENIX_RESULT_FILE ·
+          #     deploy LEASE_HELD 회귀 핀). 공용 리그 tests/phoenix_plan_rig.py(검체 아님). 임시 HOME·가짜 cys 만 쓰는
+          #     밀폐 검체(라이브 무접촉) · POSIX 전용(fcntl·shebang 가짜 CLI) · test_phoenix_r32_restore_budget 옆 5곳.
+          #     실측 2026-10-29 00:4x KST(date) · macOS arm64 · python 3.9.6 · env -i 격리 HOME · 5종 rc=0(가짜 모드)
+          #     · 하네스 모드(실 cysd) GATE 1 45행 rc=0.
           for t in test_report_ghost test_hud_bridge_skew test_todo_shared_constants test_orchestra_todo_path test_todo_stamp \
                    test_import_guard test_event_spool_rc test_org_dispatch_delivers test_radio test_scrub test_bootstrap_chain test_snapshot \
                    test_dept_name_guard test_preflight_c03_states test_content_pins_parity \
@@ -1086,6 +1104,8 @@ jobs:
                    test_refl_wakeup_expiry_attribution \
                    test_phoenix_fresh_honest test_phoenix_f1_production_path test_phoenix_g2_ack_only test_phoenix_c6_due \
                    test_phoenix_r32_restore_budget test_phoenix_encoding_default \
+                   test_phoenix_plan_cli test_phoenix_plan_certify test_phoenix_plan_identity \
+                   test_phoenix_plan_side_effect_free test_phoenix_result_file \
                    test_report_ctx_axis test_formation_tick_visibility \
                    test_resource_gate_boot_anchor test_ctx_divergence \
                    test_state_rotate test_bootstrap_resource_recheck test_secret_scan_limit test_pack_guard_hooks_guidance test_silentpass_pack_c2 \
@@ -1955,6 +1975,8 @@ jobs:
                    test_refl_wakeup_expiry_attribution \
                    test_phoenix_fresh_honest test_phoenix_f1_production_path test_phoenix_g2_ack_only test_phoenix_c6_due test_reap_exited_matrix \
                    test_phoenix_r32_restore_budget test_phoenix_encoding_default \
+                   test_phoenix_plan_cli test_phoenix_plan_certify test_phoenix_plan_identity \
+                   test_phoenix_plan_side_effect_free test_phoenix_result_file \
                    test_report_ctx_axis test_formation_tick_visibility \
                    test_resource_gate_boot_anchor test_ctx_divergence \
                    test_state_rotate test_bootstrap_resource_recheck test_secret_scan_limit test_pack_guard_hooks_guidance test_silentpass_pack_c2 \
