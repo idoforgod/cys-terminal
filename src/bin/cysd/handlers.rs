@@ -3236,6 +3236,97 @@ const D9_TEXT_DENIED: &str = "a master/CEO composer accepts no control-only text
 const D9_RETURN_DENIED: &str = "a Return into a master/CEO composer submits only a body its own sender queued, and this caller \
      holds no live pair ticket (nothing was typed); send the TEXT: cys send --queued \"<text>\" - the job submits it";
 
+// Frame-bound modal controls never associate a held body or consume a pair ticket.
+fn modal_frame_matches(frame: &Value, expected: u64) -> bool {
+    expected % 2 == 0
+        && frame["composer"]["modal"].as_bool() == Some(true)
+        && frame["composer"]["output_gen"].as_u64() == Some(expected)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_frame_bound_modal_key(
+    daemon: &Arc<Daemon>,
+    surface: &Arc<crate::state::Surface>,
+    id: &Value,
+    key: &str,
+    bytes: Vec<u8>,
+    expected: u64,
+    queued: bool,
+) -> Value {
+    if queued || !modal_frame_matches(&governance::observe_composer_export(surface), expected) {
+        return err_response(id, cys::ERR_COMPOSER_KEY_DENIED,
+            "no matching published modal frame; nothing was typed. Read with cys read-screen --composer, then send one key with --expect-output-gen. A frame-bound key cannot be persisted with --queued");
+    }
+    let weak = Arc::downgrade(surface);
+    let safety: crate::state::SafetyProbe = Arc::new(move || {
+        weak.upgrade().is_none_or(|s| !modal_frame_matches(&governance::observe_composer_export(&s), expected))
+    });
+    let guard = Arc::new(crate::state::InjectGuard::new(Some(expected), surface.output_gen.clone(), false, Some(safety)));
+    let rid = crate::agent_write::new_request_id((daemon.started_at * 1000.0) as u64);
+    let request = crate::agent_write::Request::new(rid.clone(), surface.id, "modal-key", crate::delivery::digest_text(&String::from_utf8_lossy(&bytes)));
+    let proof = surface.agent_proof();
+    let journal = daemon.agent_journal();
+    let (done, terminal) = std::sync::mpsc::sync_channel(1);
+    let weak_s = Arc::downgrade(surface);
+    let weak_d = Arc::downgrade(daemon);
+    let planned = bytes.clone();
+    let settle_id = rid.clone();
+    {
+        let _input = surface.input_gate.lock().unwrap();
+        let input_gen = surface.input_gen.load(Ordering::Acquire);
+        let job = crate::agent_write::AgentJob {
+            attempt: None, request: request.clone(), plan: crate::agent_write::Plan::control(bytes),
+            proof, journal: Some(journal), resume: None, guard: Some(guard.clone()), note_body: false, body_owner: None,
+            settle: Some(Box::new(move |t: &crate::agent_write::Terminal| {
+                use crate::agent_write::Terminal as T;
+                if let (Some(s), Some(d)) = (weak_s.upgrade(), weak_d.upgrade()) {
+                    let accepted = match t {
+                        T::WrittenBody { accepted } | T::WrittenSubmitted { accepted }
+                        | T::PartialExact { accepted, .. } | T::PartialUnknown { accepted, .. } => accepted.total(),
+                        _ => 0,
+                    };
+                    if accepted > 0 {
+                        let _input = s.input_gate.lock().unwrap();
+                        if s.input_gen.load(Ordering::Acquire) == input_gen {
+                            let n = usize::try_from(accepted).unwrap_or(usize::MAX).min(planned.len());
+                            s.apply_pending_input(&planned[..n], governance::InputOrigin::Machine);
+                        }
+                    }
+                    if t.wrote_nothing() {
+                        let reason = match t { T::RefusedNoWrite { reason } => reason.as_str(), _ => "cancelled" };
+                        d.bus.publish("surface.write_refused", "surface", Some(s.id),
+                            json!({"surface_ref":cys::surface_ref(s.id),"request_id":settle_id,"reason":reason,"note":"Zero modal-key bytes written; no held body or pair ticket was consumed."}));
+                    } else if let T::PartialExact { reason, .. } | T::PartialUnknown { reason, .. } = t {
+                        d.bus.publish("surface.write_partial", "surface", Some(s.id),
+                            json!({"surface_ref":cys::surface_ref(s.id),"request_id":settle_id,"reason":reason,"kind":t.kind(),"note":"Modal key outcome is partial; never replay automatically."}));
+                    }
+                }
+                let _ = done.send(t.clone());
+            })),
+        };
+        if let Some(error) = try_write(surface, crate::state::WriteReq::Agent(Box::new(job)), id) { return error; }
+    }
+    match guard.settle_handoff(crate::state::INJECT_GUARD_WAIT_MS) {
+        crate::state::InjectHandoff::CallerAborted => return err_response(id, crate::agent_write::GUARD_ABORTED,
+            "zero modal-key bytes written: the observed frame changed or admission was cancelled; read a new frame before retrying"),
+        crate::state::InjectHandoff::CallerClaimed => {},
+        _ => return err_response(id, cys::ERR_WRITE_OUTCOME_UNKNOWN,
+            &format!("modal-key outcome unknown for request {rid}; do not replay the key")),
+    }
+    // wallclock: guard wait for this key's terminal settlement; timeout never proves a write or permits replay.
+    match terminal.recv_timeout(std::time::Duration::from_millis(crate::state::INJECT_GUARD_WAIT_MS)) {
+        Ok(crate::agent_write::Terminal::WrittenBody { .. }) => ok_response(id,
+            json!({"surface_id":surface.id,"key":key,"sent":true,"request_id":rid,"frame_bound":true})),
+        Ok(crate::agent_write::Terminal::RefusedNoWrite { reason }) => err_response(id,
+            if reason == crate::agent_write::GUARD_ABORTED { crate::agent_write::GUARD_ABORTED } else { "write_refused" },
+            &format!("zero modal-key bytes written ({reason}); observe again before retrying")),
+        Ok(crate::agent_write::Terminal::CancelledBeforeWrite) => err_response(id, crate::agent_write::GUARD_ABORTED,
+            "zero modal-key bytes written: request cancelled"),
+        _ => err_response(id, cys::ERR_WRITE_OUTCOME_UNKNOWN,
+            &format!("modal-key outcome unknown or partial for request {rid}; do not replay the key")),
+    }
+}
+
 /// One outer bracketed-paste fence (`cys::paste_fence::wrap`) removed, else the text unchanged (pure). The queue job fences
 /// the body itself, so a CLI-fenced body converted as-is would arrive fenced twice.
 fn d9_unfence(text: &str) -> &str {
@@ -7573,6 +7664,22 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
                 Ok(v) => v,
                 Err(e) => return Reply::Single(err_response(&id, "acl_denied", &e)),
             };
+            // Explicit frame binding owns this key operation on every seat. It precedes
+            // both pair-ticket absorption and held-body association (N3).
+            if params.get("expect_output_gen").is_some() {
+                let Some(expected) = params.get("expect_output_gen").and_then(Value::as_u64) else {
+                    return Reply::Single(err_response(&id, cys::ERR_COMPOSER_KEY_DENIED,
+                        "invalid modal frame generation; nothing was typed. Read with --composer and send one key with --expect-output-gen"));
+                };
+                return Reply::Single(send_frame_bound_modal_key(daemon, &surface, &id, &key, bytes, expected,
+                    params.get("queued").and_then(Value::as_bool).unwrap_or(false)));
+            }
+            if bytes.as_slice() != b"\r"
+                && governance::d9_scope(daemon, &surface, caller_is_owner(daemon, &params, verified_from))
+            {
+                return Reply::Single(err_response(&id, cys::ERR_COMPOSER_KEY_DENIED,
+                    "a master/CEO composer accepts no unbound key; nothing was typed. Send the TEXT with cys send --queued, or read-screen --composer then send one modal key with --expect-output-gen"));
+            }
             // ★(0.14.56 · P1 D9 · design r3 §5-4) Master/CEO composers: a Return/Enter (queued or not) from a non-owner caller
             //   runs this arm BEFORE association and the generic absorb. The sender's live pair ticket (`d9_pair_key`) absorbs it
             //   unconditionally (0 bytes; no `pair_return` flag, no PassThrough, no approval narrowing - a two-step caller can
@@ -7580,7 +7687,7 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
             //   operation while the seat is new (`d9_boot_creator`: head ruling 646b2a36, option A, amended by CEO 52facf64 -
             //   creator pid+start time, not a pane, and no turn has reached the agent yet), which answers its own boot gates
             //   (folder-trust confirm, cys.rs:16343) through the pin paths below.
-            //   Frame-bound modal keys (`expect_output_gen`) arrive with D8; until then no parameter bypasses this arm.
+            //   Explicit frame-bound modal keys took their guarded control-only path above; no other parameter bypasses this arm.
             if bytes.as_slice() == b"\r"
                 && governance::d9_scope(daemon, &surface, caller_is_owner(daemon, &params, verified_from))
             {

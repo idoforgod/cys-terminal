@@ -11415,6 +11415,7 @@ pub(crate) fn deliver_head_locked(
     let mut inflight: Option<InflightInject> = None;
     // ★(0.14.52 · S-a) The handed-off request (status reads; specimens' settlement wait).
     let mut handed: Option<Arc<crate::agent_write::Request>> = None;
+    let mut obsolete_key_head: Option<crate::state::QueueEntry> = None;
     // ★(0.14.52 · S-a C7a) A restored partially written head is adopted as held before any hand-off (outside the queue lock).
     adopt_persisted_write_hold(daemon, s);
     // ★(0.14.56 · P1 D9 pre-CR · design r3 §6-2) A master/CEO target gets the claim check (scope read before the queue lock).
@@ -11506,6 +11507,14 @@ pub(crate) fn deliver_head_locked(
             expired_head = Some(e);
             d9_nonwriter_hold(s, ClaimProducer::Queue);
             break 'tx None;
+        }
+        // Old daemons persisted bare Return entries. In D9 scope they can never
+        // acquire a body or reach the writer, including through force-deliver.
+        if d9_claim.is_some() {
+            if let Some(entry) = q.front().filter(|e| e.origin == "send-key" && e.text.is_empty()) {
+                obsolete_key_head = Some(entry.clone());
+                break 'tx None;
+            }
         }
         // ★B1(0.14.30) C3: 같은 발신자 대기분을 **한 턴으로** 병합한다(버스트 봉인).
         //   강제 배달(queue.deliver RPC)과 조준 배달은 **병합하지 않는다** — 운영자가 지목한
@@ -11789,6 +11798,29 @@ pub(crate) fn deliver_head_locked(
         });
         Some(d)
     };
+    if let Some(entry) = obsolete_key_head {
+        // Evidence before removal; I/O is outside queue/input locks. If it fails,
+        // retain the item but still never type its unbound Return.
+        let entries = std::slice::from_ref(&entry);
+        if !crate::delivery::record_queue_tombstones(daemon, s.id, entries, "composer_key_denied", now_epoch()) {
+            return None;
+        }
+        let removed = {
+            let mut q = s.pending_queue.lock().unwrap();
+            if !s.inject_reserved() && q.front().is_some_and(|e| e.id == entry.id && e.origin == "send-key" && e.text.is_empty()) {
+                q.pop_front()
+            } else { None }
+        };
+        if let Some(removed) = removed {
+            d9_clear_item(s, ClaimProducer::Queue, &removed.id);
+            daemon.bus.publish("queue.dropped", "queue", Some(s.id),
+                crate::state::queue_dropped_payload("composer_key_denied", &[removed], None));
+            daemon.persist_queue_state();
+        } else {
+            publish_tombstone_superseded(daemon, Some(s.id), std::slice::from_ref(&entry.id), "composer_key_denied");
+        }
+        return None;
+    }
     if let Some(e) = expired_head {
         // ★(0.14.31 · 리뷰 R1 · codex major) 이동은 **두 락을 동시에 쥔 한 임계영역**에서 끝낸다.
         //   종전(R5)에는 만료 큐에 먼저 넣고 락을 놓았다가 다시 활성 큐를 잡아 뺐다 — 그 창에

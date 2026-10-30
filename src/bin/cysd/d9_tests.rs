@@ -1126,3 +1126,301 @@ fn d9_order_a9_order_inverted_names_the_oldest_entry_not_the_head_placed_one() {
         }
     }
 }
+
+// Stage E L-MODAL: these RPC-level specimens use only APIs present at ece8f1e8.
+#[cfg(unix)]
+fn e_modal_recorder(f: &Fx, tag: &str, role: &str) -> (Arc<Surface>, std::path::PathBuf) {
+    let pair = crate::agent_queue_tests::d9_role_recorder(&f.daemon, &f.dir, tag, "master");
+    if role != "master" {
+        let mut roles = f.daemon.roles.lock().unwrap();
+        roles.remove("master");
+        roles.insert(role.into(), pair.0.id);
+    }
+    pair
+}
+
+#[cfg(unix)]
+fn e_modal_frame(s: &Arc<Surface>) -> u64 {
+    paint_trust(s);
+    s.output_gen.store(2, Ordering::Release);
+    2
+}
+
+#[test]
+#[cfg(unix)]
+fn e_modal_receipt_denies_nonmodal_keys_and_aliases() {
+    let f = fx("e-modal-deny");
+    let m = master(&f);
+    let _a = pane(&f, "worker-1", P + 500);
+    paint_empty_box(&m);
+    for key in ["Tab", "Right", "End", "Up", "Escape", "C-u", "C-c", "C-j", "0"] {
+        let before = gen(&m);
+        let r = rpc(&f, Some(P + 500), "surface.send_key", json!({"surface_id":m.id,"key":key}));
+        assert_eq!(r["error"]["code"], json!("composer_key_denied"), "E-K1: nonmodal key refused at receipt: {key}: {r}");
+        assert_eq!(gen(&m), before, "E-K1: no input transition for {key}");
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn e_modal_matching_frame_return_writes_only_the_key() {
+    let f = fx("e-modal-return");
+    let (m, out) = e_modal_recorder(&f, "return", "master");
+    let _a = pane(&f, "worker-1", P + 501);
+    let generation = e_modal_frame(&m);
+    let r = rpc(&f, Some(P + 501), "surface.send_key", json!({"surface_id":m.id,"key":"Return","expect_output_gen":generation}));
+    assert_eq!(r["ok"], json!(true), "E-K3: frame-bound modal Return accepted: {r}");
+    assert_eq!(crate::agent_queue_tests::d9_received(&out, 1), b"\r", "E-K3: exactly the key, no paste/body");
+    assert_eq!(held(&m), 0);
+}
+
+#[test]
+#[cfg(unix)]
+fn e_modal_nonmodal_stale_and_unpublished_frames_refuse() {
+    let f = fx("e-modal-frame-deny");
+    let m = master(&f);
+    let _a = pane(&f, "worker-1", P + 502);
+    for (label, modal, actual, expected) in [("not-modal",false,2,2),("stale",true,4,2),("unpublished",true,3,3)] {
+        if modal { paint_trust(&m); } else { paint_empty_box(&m); }
+        m.output_gen.store(actual, Ordering::Release);
+        let before = gen(&m);
+        let r = rpc(&f, Some(P + 502), "surface.send_key", json!({"surface_id":m.id,"key":"0","expect_output_gen":expected}));
+        assert_eq!(r["error"]["code"], json!("composer_key_denied"), "E-K3: {label} refuses before writing: {r}");
+        assert_eq!(gen(&m), before, "E-K3: {label} no input transition");
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn e_modal_worker_frame_key_never_consumes_a_held_body() {
+    let f = fx("e-modal-worker-held");
+    let (m, out) = e_modal_recorder(&f, "held", "worker-2");
+    let _a = pane(&f, "worker-1", P + 503);
+    paint_empty_box(&m);
+    let body = send(&f, Some(P + 503), &m, "unsubmitted worker body", json!({}));
+    assert_eq!(held(&m), 1, "premise: worker body held: {body}");
+    let generation = e_modal_frame(&m);
+    let r = rpc(&f, Some(P + 503), "surface.send_key", json!({"surface_id":m.id,"key":"Return","expect_output_gen":generation,"request_id":body["result"]["request_id"]}));
+    assert_eq!(held(&m), 1, "E-N3: modal key must not associate or consume held body: {r}");
+    assert_eq!(r["ok"], json!(true), "E-N3: modal key remains answerable: {r}");
+    assert_eq!(crate::agent_queue_tests::d9_received(&out, 1), b"\r", "E-N3: only key bytes, never held body");
+}
+
+#[test]
+#[cfg(unix)]
+fn e_modal_persisted_send_key_drops_with_tombstone_and_next_body_delivers() {
+    let f = fx("e-modal-persisted");
+    crate::agent_write::set_test_sync_settle(true);
+    let (m, out) = e_modal_recorder(&f, "persisted", "master");
+    let stale = f.daemon.next_queue_entry(String::new(), None, "send-key");
+    m.pending_queue.lock().unwrap().push_back(stale.clone());
+    let r = crate::governance::deliver_head_locked(&f.daemon, &m, true, false, None, None, None, None, None);
+    assert!(r.is_none(), "E-K6: persisted bare key is never handed to writer");
+    assert!(m.pending_queue.lock().unwrap().is_empty(), "E-K6: invalid persisted item removed");
+    let events = f.daemon.bus.tail(1000);
+    assert!(events.iter().any(|e|e["name"]=="queue.dropped" && e["payload"].to_string().contains(&stale.id)), "E-K6: observable tombstone/drop for item");
+    let ledger = std::fs::read_to_string(crate::delivery::ledger_path(&f.daemon.socket_path)).expect("drop ledger");
+    let rows: Vec<Value> = ledger.lines().map(|l|serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(rows.iter().filter(|r|r["origin"]=="queue_tombstone" && r["queue_entry_id"]==stale.id).count(), 1, "E-K6: one durable tombstone before removal");
+    let next = f.daemon.next_queue_entry("normal report".into(), None, "send");
+    m.pending_queue.lock().unwrap().push_back(next);
+    assert!(crate::governance::deliver_head_locked(&f.daemon, &m, true, false, None, None, None, None, None).is_some(), "E-K6: normal report behind dropped key delivers");
+    let want = crate::agent_write::Plan::paste("normal report").with_submit(500, 0).planned_bytes();
+    assert_eq!(crate::agent_queue_tests::d9_received(&out, want.len()), want, "E-K6: no extra bare CR before normal report");
+}
+
+/// Provisional: geometry reconstructed. Lexical bytes come from the real dept5 surface34
+/// transcript row4329229 (2026-10-13; sha2569ca095854d8af7f7cbaf95ec9d255f3f8d88b3e970023c185f201560aeed4164).
+/// Row breaks/cursor/SGR were not stored. This is NOT final rating-overlay evidence.
+#[test]
+#[cfg(unix)]
+fn e_modal_provisional_rating_geometry_is_unanswerable_residue() {
+    let rule = "─".repeat(98);
+    let screen = format!("● How is Claude doing this session? (optional)\n  1:Bad2:Fine3:Good0:Dismiss\n{rule}\n❯\u{a0}\n{rule}");
+    assert!(cys::readiness::modal_foreground(&screen, Some("❯")).is_none(),
+        "E-RATING-RESIDUE: no unmeasured survey signature may authorize keys");
+    let f = fx("e-rating-residue");
+    let m = master(&f);
+    let _a = pane(&f, "worker-1", P + 505);
+    m.parser.lock().unwrap().process(format!("\x1b[2J\x1b[H{}", screen.replace('\n', "\r\n")).as_bytes());
+    m.output_gen.store(2, Ordering::Release);
+    let before = gen(&m);
+    let r = rpc(&f, Some(P + 505), "surface.send_key", json!({"surface_id":m.id,"key":"0","expect_output_gen":2}));
+    assert_eq!(r["error"]["code"], json!("composer_key_denied"), "E-RATING-RESIDUE: optional survey key0 is refused: {r}");
+    assert_eq!(gen(&m), before, "E-RATING-RESIDUE: zero key bytes");
+}
+
+#[test]
+#[cfg(unix)]
+fn e_modal_frame_moved_while_writer_parked_writes_nothing() {
+    let f = fx("e-modal-claim-race");
+    let (m, out) = e_modal_recorder(&f, "race", "worker-2");
+    let _a = pane(&f, "worker-1", P + 504);
+    let generation = e_modal_frame(&m);
+    let release = crate::agent_queue_tests::hold_writer(&m);
+    let d = f.daemon.clone(); let target = m.id;
+    let call = std::thread::spawn(move || {
+        let req = Request { id:json!(52), method:"surface.send_key".into(), params:json!({"surface_id":target,"key":"0","expect_output_gen":generation}) };
+        let Reply::Single(r) = dispatch(&d, req, Some(P + 504)) else { panic!("single reply") }; r
+    });
+    crate::agent_queue_tests::wait_until("modal key admitted behind holder", ||m.write_tx.gate().pending()>=2);
+    m.output_gen.store(4, Ordering::Release);
+    release.send(()).unwrap();
+    let r = call.join().unwrap();
+    crate::agent_queue_tests::wait_until("modal request settled", ||m.write_tx.gate().pending()==0);
+    assert_eq!(std::fs::read(&out).unwrap(), b"", "E-K3-CLAIM: moved frame writes zero key bytes");
+    assert_eq!(r["ok"], json!(false), "E-K3-CLAIM: refusal cannot report sent:true: {r}");
+}
+
+#[test]
+#[cfg(unix)]
+fn e_modal_persisted_drop_retains_item_when_tombstone_cannot_be_written() {
+    let f = fx("e-modal-tombstone-fault");
+    let (m, out) = e_modal_recorder(&f, "fault", "master");
+    let entry = f.daemon.next_queue_entry(String::new(), None, "send-key");
+    m.pending_queue.lock().unwrap().push_back(entry.clone());
+    let path = crate::delivery::ledger_path(&f.daemon.socket_path);
+    std::fs::create_dir_all(&path).unwrap(); // deterministic EISDIR, not chmod under a privileged process
+    assert!(crate::governance::deliver_head_locked(&f.daemon, &m, true, false, None, None, None, None, None).is_none());
+    assert_eq!(m.pending_queue.lock().unwrap().front().map(|e|e.id.clone()), Some(entry.id), "E-K6-FAULT: no removal without durable tombstone");
+    assert_eq!(std::fs::read(&out).unwrap(), b"", "E-K6-FAULT: no writer fallback on record failure");
+    assert!(!f.daemon.bus.tail(1000).iter().any(|e|e["name"]=="queue.dropped"));
+    std::fs::remove_dir(path).unwrap(); // remove only the empty fixture blocker
+    assert!(crate::governance::deliver_head_locked(&f.daemon, &m, true, false, None, None, None, None, None).is_none());
+    assert!(m.pending_queue.lock().unwrap().is_empty(), "E-K6-FAULT: retry records and removes the obsolete item");
+}
+
+#[test]
+#[cfg(unix)]
+fn e_modal_persisted_key_outside_d9_keeps_legacy_delivery() {
+    let f = fx("e-modal-persisted-scope");
+    crate::agent_write::set_test_sync_settle(true);
+    let (s, out) = e_modal_recorder(&f, "scope", "worker-2");
+    s.pending_queue.lock().unwrap().push_back(f.daemon.next_queue_entry(String::new(), None, "send-key"));
+    assert!(crate::governance::deliver_head_locked(&f.daemon, &s, true, false, None, None, None, None, None).is_some(), "E-K6-SCOPE: worker's legacy empty queue job is unchanged");
+    let want = crate::agent_write::Plan::paste("").with_submit(500, 0).planned_bytes();
+    assert_eq!(crate::agent_queue_tests::d9_received(&out, want.len()), want);
+    assert!(!f.daemon.bus.tail(1000).iter().any(|e|e["name"]=="queue.dropped"));
+}
+
+#[test]
+#[cfg(unix)]
+fn e_modal_persisted_drop_respects_force_deliver_target_mismatch() {
+    let f = fx("e-modal-target-mismatch");
+    let (m, _) = e_modal_recorder(&f, "target", "master");
+    let wanted = f.daemon.next_queue_entry("requested report".into(), None, "send");
+    let intervening = f.daemon.next_queue_entry(String::new(), None, "send-key");
+    m.pending_queue.lock().unwrap().extend([intervening.clone(), wanted.clone()]);
+    assert!(crate::governance::deliver_head_locked(&f.daemon, &m, true, false, Some(&wanted.id), None, None, None, None).is_none());
+    let ids = m.pending_queue.lock().unwrap().iter().map(|e|e.id.clone()).collect::<Vec<_>>();
+    assert_eq!(ids, vec![intervening.id, wanted.id], "E-K6-TARGET: a raced targeted operation must not remove another head");
+    assert!(!f.daemon.bus.tail(1000).iter().any(|e|e["name"]=="queue.dropped"), "E-K6-TARGET: no drop event for another head");
+}
+
+#[test]
+#[cfg(unix)]
+fn e_modal_key_does_not_consume_a_live_pair_ticket() {
+    let f = fx("e-modal-pair");
+    let (m, out) = e_modal_recorder(&f, "pair", "master");
+    let a = pane(&f, "worker-1", P + 506);
+    let key = crate::state::PairKey::Verified(a.id);
+    m.issue_return_ticket(key, crate::state::ReturnTicketKind::Compensation, std::time::Duration::from_secs(60));
+    let generation = e_modal_frame(&m);
+    let r = rpc(&f, Some(P + 506), "surface.send_key", json!({"surface_id":m.id,"key":"Return","pair_return":true,"expect_output_gen":generation}));
+    assert!(m.peek_return_ticket(key).is_some(), "E-PAIR: modal answer never consumes the body's independent ticket: {r}");
+    assert_eq!(r["ok"], json!(true));
+    assert_ne!(r["result"]["absorbed"], json!(true), "E-PAIR: modal answer is not swallowed");
+    assert_eq!(crate::agent_queue_tests::d9_received(&out, 1), b"\r");
+}
+
+#[test]
+#[cfg(unix)]
+fn e_modal_explicit_malformed_frame_never_falls_back_to_plain_key() {
+    let f = fx("e-modal-malformed");
+    let m = master(&f);
+    let _a = pane(&f, "worker-1", P + 507);
+    e_modal_frame(&m);
+    for value in [Value::Null, json!("2"), json!(true), json!(-1)] {
+        let before = gen(&m);
+        let r = rpc(&f, Some(P + 507), "surface.send_key", json!({"surface_id":m.id,"key":"0","expect_output_gen":value}));
+        assert_eq!(r["error"]["code"], json!("composer_key_denied"), "E-FRAME-TYPE: invalid explicit frame refuses: {r}");
+        assert_eq!(gen(&m), before);
+    }
+    // A worker plain key is allowed, so invalid -> plain fallback cannot pass by the master's separate denial.
+    let (worker, out) = e_modal_recorder(&f, "malformed-worker", "worker-2");
+    let plain = rpc(&f, Some(P + 507), "surface.send_key", json!({"surface_id":worker.id,"key":"0"}));
+    assert_eq!(plain["ok"], json!(true), "premise: worker's plain key is admitted");
+    assert_eq!(crate::agent_queue_tests::d9_received(&out, 1), b"0");
+    e_modal_frame(&worker);
+    for value in [Value::Null, json!("2"), json!(true), json!(-1)] {
+        let r = rpc(&f, Some(P + 507), "surface.send_key", json!({"surface_id":worker.id,"key":"0","expect_output_gen":value}));
+        assert_eq!(r["error"]["code"], json!("composer_key_denied"), "E-FRAME-TYPE-WORKER: malformed explicit frame never falls back to admitted plain key: {r}");
+    }
+
+}
+
+#[test]
+#[cfg(unix)]
+fn e_modal_poisoned_parser_never_authorizes_a_key() {
+    let f = fx("e-modal-poison");
+    let (m, out) = e_modal_recorder(&f, "poison", "master");
+    let _a = pane(&f, "worker-1", P + 508);
+    e_modal_frame(&m);
+    let sc = m.clone();
+    assert!(std::thread::spawn(move || { let _parser = sc.parser.lock().unwrap(); panic!("fixture poison"); }).join().is_err());
+    let poisoned = m.parser.is_poisoned();
+    let r = rpc(&f, Some(P + 508), "surface.send_key", json!({"surface_id":m.id,"key":"0","expect_output_gen":2}));
+    m.parser.clear_poison(); // fixture cleanup before assertions, so daemon teardown cannot double-panic
+    assert!(poisoned, "premise: parser was poisoned at the RPC");
+    assert_eq!(std::fs::read(&out).unwrap(), b"", "E-POISON: recovered parser contents do not authorize key bytes");
+    assert_eq!(r["error"]["code"], json!("composer_key_denied"));
+}
+
+#[test]
+#[cfg(unix)]
+fn e_modal_claim_rechecks_modal_even_in_same_generation_fault_fixture() {
+    let f = fx("e-modal-probe");
+    let (m, out) = e_modal_recorder(&f, "probe", "worker-2");
+    let _a = pane(&f, "worker-1", P + 509);
+    e_modal_frame(&m);
+    let release = crate::agent_queue_tests::hold_writer(&m);
+    let d=f.daemon.clone(); let target=m.id;
+    let call=std::thread::spawn(move || {
+        let req=Request{id:json!(53),method:"surface.send_key".into(),params:json!({"surface_id":target,"key":"0","expect_output_gen":2})};
+        let Reply::Single(r)=dispatch(&d,req,Some(P+509)) else {panic!("single")};r
+    });
+    crate::agent_queue_tests::wait_until("frame key queued", ||m.write_tx.gate().pending()>=2);
+    // Deliberate fault injection: production PTY changes advance output_gen. Keeping it fixed
+    // here isolates the independent modal-probe wiring; this is not a claim of a native race.
+    paint_empty_box(&m);
+    assert_eq!(m.output_gen.load(Ordering::Acquire),2,"fault fixture keeps generation fixed");
+    release.send(()).unwrap();let r=call.join().unwrap();
+    crate::agent_queue_tests::wait_until("probe job settled", ||m.write_tx.gate().pending()==0);
+    assert_eq!(std::fs::read(&out).unwrap(),b"","E-MODAL-PROBE: claim consults the shared modal observation");
+    assert_eq!(r["ok"],json!(false));
+}
+
+#[test]
+#[cfg(unix)]
+fn e_modal_plain_worker_key_keeps_legacy_behavior() {
+    let f=fx("e-modal-worker-plain");let (s,out)=e_modal_recorder(&f,"plain","worker-2");
+    let _a=pane(&f,"worker-1",P+510);paint_empty_box(&s);
+    let r=rpc(&f,Some(P+510),"surface.send_key",json!({"surface_id":s.id,"key":"0"}));
+    assert_eq!(r["ok"],json!(true),"E-SCOPE: ordinary worker key unchanged: {r}");
+    assert_eq!(crate::agent_queue_tests::d9_received(&out,1),b"0");
+}
+
+#[test]
+#[cfg(unix)]
+fn e_modal_rpc_queued_frame_is_refused_without_persisting_or_writing() {
+    let f = fx("e-modal-rpc-queued");
+    let (m, out) = e_modal_recorder(&f, "queued", "master");
+    let _a = pane(&f, "worker-1", P + 511);
+    let frame = e_modal_frame(&m);
+    let before = gen(&m);
+    let r = rpc(&f, Some(P + 511), "surface.send_key", json!({"surface_id":m.id,"key":"0","queued":true,"expect_output_gen":frame}));
+    assert_eq!(r["error"]["code"], json!("composer_key_denied"), "E-RPC-QUEUED: valid modal frame cannot be queued: {r}");
+    assert!(m.pending_queue.lock().unwrap().is_empty(), "E-RPC-QUEUED: no persisted key");
+    assert_eq!(gen(&m), before);
+    assert_eq!(std::fs::read(out).unwrap(), b"");
+}

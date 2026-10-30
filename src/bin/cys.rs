@@ -126,6 +126,9 @@ enum Command {
         /// Queue the key for quiet-time delivery (Return/Enter only) — typing-guard safe
         #[arg(long)]
         queued: bool,
+        /// Bind one modal key to output_gen from read-screen --composer; never queue a stale frame
+        #[arg(long, conflicts_with = "queued")]
+        expect_output_gen: Option<u64>,
         #[arg(required = true)]
         keys: Vec<String>,
     },
@@ -3718,6 +3721,14 @@ fn send_key_request_params(
     p
 }
 
+/// A frame binding is opt-in; legacy key request bytes remain unchanged.
+fn send_key_with_frame(mut params: Value, expected: Option<u64>) -> Value {
+    if let Some(generation) = expected {
+        params["expect_output_gen"] = json!(generation);
+    }
+    params
+}
+
 /// ★(0.14.43 · J3) 검증되지 않은 발신자(pane 밖 — 사람 터미널·스크립트·GUI 가 띄운 `cys`)가 요청 `from` 에 싣는 **표시용 라벨**을 덧붙이는
 /// 선택 env 키. 값은 [`unverified_sender_label`] 이 살균한다(없으면 명령 종류만 쓴다). 라벨은 표시·원장용이다 — 좌석·역할 판정에 쓰이지 않는다.
 const ENV_SENDER_LABEL: &str = "CYS_SENDER_LABEL";
@@ -6217,8 +6228,11 @@ fn run(command: Command) -> i32 {
             })
         }
 
-        Command::SendKey { surface, to, queued, keys } => {
+        Command::SendKey { surface, to, queued, keys, expect_output_gen } => {
             resolve_targets(&surface, &to).and_then(|sids| {
+                if expect_output_gen.is_some() && (keys.len() != 1 || sids.len() != 1) {
+                    return Err("a frame-bound modal key requires exactly one key and one target; read a new frame before the next key".into());
+                }
                 for key in &keys {
                     if key_to_bytes(key).is_none() {
                         return Err(format!("unknown key: {key}"));
@@ -6250,14 +6264,14 @@ fn run(command: Command) -> i32 {
                     for key in &keys {
                         let r = match request(
                             "surface.send_key",
-                            send_key_request_params(sid, key, queued, pair, from),
+                            send_key_with_frame(send_key_request_params(sid, key, queued, pair, from), expect_output_gen),
                         ) {
                             Ok(r) => r,
                             // ★B3: 제출 Return 이 타이핑 가드에 막히면 소실시키지 않고 큐로
                             //   1회 전환한다(inject_text T-0147-6 동형 · 데몬 계약상
                             //   send_key --queued 는 Return/Enter 전용이라 안전).
                             //   이것이 없어서 노드 보고의 Enter 가 조용히 사라졌다.
-                            Err(e) if should_queue_fallback_send_key(queued, key, &e) => {
+                            Err(e) if expect_output_gen.is_none() && should_queue_fallback_send_key(queued, key, &e) => {
                                 // ★(0.14.56 · P1 r2 §10-5) The retry keeps the first request's self-declared `from`: the
                                 //   daemon keyed a cross-socket caller's held body by it (`Claimed`), so a retry without it
                                 //   cannot bind that body and orphans it. An explicit `--queued` stays from-less
@@ -33176,7 +33190,7 @@ mod tests {
         assert!(!send_key_pair_return(&k(&[])));
         // 배선 핀: 첫 요청과 폴백 r2 모두 pair_return 을 싣는다(★B5: 첫 요청은 `send_key_request_params` 헬퍼).
         let src = include_str!("cys.rs");
-        let arm = src.split("Command::SendKey { surface, to, queued, keys } => {").nth(1).expect("SendKey");
+        let arm = src.split("Command::SendKey { surface, to, queued, keys").nth(1).expect("SendKey");
         let arm = arm.split("Command::SetStatus").next().unwrap();
         assert_eq!(arm.matches("\"pair_return\": pair").count(), 1, "폴백 r2(인라인)");
         assert!(arm.contains("send_key_request_params(sid, key, queued, pair, from)"), "첫 요청(헬퍼)");
@@ -33411,7 +33425,7 @@ mod tests {
         std::env::set_var(cys::ENV_SOCKET, &daemon.sock);
         std::env::set_var("CYS_NO_AUTOSTART", "1");
         std::env::set_var(ENV_SURFACE_ID, "900");
-        let rc = run(Command::SendKey { surface: Some("5".into()), to: None, queued: false, keys: vec!["Return".into()] });
+        let rc = run(Command::SendKey { surface: Some("5".into()), to: None, queued: false, expect_output_gen: None, keys: vec!["Return".into()] });
         let calls = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
         assert_eq!(rc, 0, "{calls:?}");
         assert_eq!(calls.len(), 2, "the first Return and exactly one typing-guard retry: {calls:?}");
@@ -39122,7 +39136,7 @@ mod tests {
         let inject = &rv[..rv.find("fn read_screen(").expect("read_screen")];
         assert!(inject.contains("inject_text_on(socket, sid, text, timeout, \"drain\")"), "drain --verify 경로의 kind 가 drain 이 아니다");
         // send-key: 라벨 코드 없음.
-        let karm = src.split("Command::SendKey { surface, to, queued, keys } => {").nth(1).expect("SendKey arm");
+        let karm = src.split("Command::SendKey { surface, to, queued, keys").nth(1).expect("SendKey arm");
         let karm = karm.split("Command::SetStatus").next().unwrap();
         let helper = item_body(src, "\nfn send_key_request_params(");
         let helper = &helper[..helper.find("\n}\n").expect("함수 끝")]; // 뒤따르는 라벨 함수의 문서 주석은 제외
@@ -46740,7 +46754,7 @@ mod b360_tests {
         let saved = std::env::var_os(cys::ENV_SOCKET);
         let (sock, calls, stop) = send_key_daemon(reply);
         std::env::set_var(cys::ENV_SOCKET, &sock);
-        let rc = run(Command::SendKey { surface: Some("surface:7".into()), to: None, queued: false, keys: vec!["Return".into()] });
+        let rc = run(Command::SendKey { surface: Some("surface:7".into()), to: None, queued: false, expect_output_gen: None, keys: vec!["Return".into()] });
         stop();
         match &saved {
             Some(v) => std::env::set_var(cys::ENV_SOCKET, v),
@@ -52649,4 +52663,77 @@ mod d8_read_screen_composer_tests {
         let failing = |_: &str, _: Value| -> Result<Value, String> { Err("socket closed".into()) };
         assert_eq!(read_screen_composer(3, &failing), Err("socket closed".to_string()));
     }
+}
+
+#[cfg(test)]
+mod e_modal_cli_tests {
+    use super::*;
+    #[test]
+    fn e_modal_cli_accepts_expected_generation_for_one_key() {
+        let parsed = Cli::try_parse_from(["cys", "send-key", "--surface", "1", "--expect-output-gen", "42", "0"]);
+        assert!(parsed.is_ok(), "E-CLI: shipped modal flow accepts observed generation: {:?}", parsed.err());
+        let Cli { command: Command::SendKey { expect_output_gen, .. }, .. } = parsed.unwrap() else { panic!("send-key") };
+        let base = send_key_request_params(1, "0", false, false, Some(9));
+        let bound = send_key_with_frame(base.clone(), expect_output_gen);
+        assert_eq!(bound["expect_output_gen"], json!(42), "E-CLI: exact observed generation forwarded");
+        assert_eq!(send_key_with_frame(base.clone(), None), base, "E-CLI: old request bytes unchanged");
+        assert!(Cli::try_parse_from(["cys", "send-key", "--surface", "1", "--expect-output-gen", "42", "--queued", "Return"]).is_err(), "E-CLI: a frame-bound key is not persisted for later delivery");
+        let src = include_str!("cys.rs");
+        let arm = src.split("Command::SendKey { surface, to, queued, keys").nth(1).unwrap().split("Command::SetStatus").next().unwrap();
+        assert!(arm.contains("send_key_with_frame(send_key_request_params(sid, key, queued, pair, from), expect_output_gen)"), "E-CLI: RPC uses frame-aware request");
+        assert!(arm.contains("expect_output_gen.is_none() && should_queue_fallback_send_key"), "E-CLI: never retry a frame key as an unbound queued Return");
+    }
+    #[test]
+    #[cfg(unix)]
+    fn e_modal_cli_rpc_carries_frame_and_never_queues_a_guard_error() {
+        let _env = super::tests::ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+        let socket = std::env::temp_dir().join(format!("w35-modal-cli-{}.sock", std::process::id()));
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let saved_calls = calls.clone();
+        let server = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut line = String::new();
+                std::io::BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+                let req: Value = serde_json::from_str(&line).unwrap();
+                if req["method"] == "__stop" { break; }
+                let mut reply = if req["method"] == "surface.send_key" {
+                    saved_calls.lock().unwrap().push(req.clone());
+                    json!({"ok":false,"error":{"code":cys::ERR_TYPING_GUARD,"message":cys::MSG_TYPING_GUARD}})
+                } else if req["method"] == "surface.list" {
+                    json!({"ok":true,"result":{"surfaces":[{"surface_id":7,"surface_ref":"surface:7","role":"worker-7","exited":false},{"surface_id":8,"surface_ref":"surface:8","role":"worker-8","exited":false}]}})
+                } else { json!({"ok":true,"result":{}}) };
+                reply["id"] = req["id"].clone();
+                writeln!(stream, "{reply}").unwrap();
+            }
+        });
+        let saved = std::env::var_os(cys::ENV_SOCKET);
+        std::env::set_var(cys::ENV_SOCKET, &socket);
+        let args = Cli::try_parse_from(["cys", "send-key", "--surface", "7", "--expect-output-gen", "42", "Return"]).unwrap();
+        let rc = run(args.command);
+        let before_arity = calls.lock().unwrap().len();
+        let many_keys = run(Command::SendKey { surface: Some("7".into()), to: None, queued: false,
+            keys: vec!["0".into(), "Return".into()], expect_output_gen: Some(42) });
+        let after_keys = calls.lock().unwrap().len();
+        let resolved = resolve_targets(&None, &Some("worker-*".into()));
+        let many_targets = run(Command::SendKey { surface: None, to: Some("worker-*".into()), queued: false,
+            keys: vec!["0".into()], expect_output_gen: Some(42) });
+        let after_targets = calls.lock().unwrap().len();
+        let mut stop = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        writeln!(stop, "{}", json!({"id":1,"method":"__stop","params":{}})).unwrap();
+        server.join().unwrap();
+        match saved { Some(v)=>std::env::set_var(cys::ENV_SOCKET,v), None=>std::env::remove_var(cys::ENV_SOCKET) }
+        std::fs::remove_file(socket).unwrap();
+        let calls = calls.lock().unwrap();
+        assert_eq!(rc, 1, "E-CLI-RPC: refusal reaches caller");
+        assert_eq!(resolved, Ok(vec![7, 8]), "premise: wildcard actually resolves two live targets");
+        assert_eq!((many_keys, many_targets), (1, 1));
+        assert_eq!(after_keys, before_arity, "E-CLI-ARITY: multiple keys make no key RPC");
+        assert_eq!(after_targets, before_arity, "E-CLI-ARITY: multiple targets make no key RPC");
+        assert_eq!(calls.len(), 1, "E-CLI-RPC: no unbound queue fallback for a frame key");
+        assert_eq!(calls[0]["params"]["expect_output_gen"], json!(42), "E-CLI-RPC: actual request carries observed generation");
+        assert_eq!(calls[0]["params"]["queued"], json!(false));
+    }
+
 }
