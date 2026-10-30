@@ -114,7 +114,6 @@ src/bin/cysd/caller_matrix_tests.rs::c8_caller_matrix::actual_cli_caller_compati
 src/bin/cysd/channels.rs::tests::c6b_refused_envelope_rolls_the_row_back_and_leaves_no_handoff_mark
 src/bin/cysd/channels.rs::tests::h3_cross_socket_residue_does_not_hold_row
 src/bin/cysd/channels.rs::tests::h3_flush_rejudges_each_row_after_own_paste_settles
-src/bin/cysd/channels.rs::tests::h3_handoff_window_draft_is_not_own_paste
 src/bin/cysd/channels.rs::tests::h3_own_paste_in_flight_is_not_a_draft
 src/bin/cysd/channels.rs::tests::h3_row_handed_before_writer_pickup_paces_next_row
 src/bin/cysd/channels.rs::tests::inbox_redelivery_off_by_default_capped_when_enabled
