@@ -129,6 +129,7 @@ class OwnershipRegression(unittest.TestCase):
         self.children = []
         self.extra = []
         self.handles = {}
+        self.handle_err = {}
         self.marker_stats = []
         self.identities = {}
         self.not_killed = []
@@ -154,7 +155,8 @@ class OwnershipRegression(unittest.TestCase):
         if os.name == 'nt':
             import ctypes
             for handle in self.handles.values():
-                ctypes.windll.kernel32.CloseHandle(handle)
+                if handle:  # a may_be_gone pid whose OpenProcess answered 87 has no handle to close
+                    ctypes.windll.kernel32.CloseHandle(handle)
         self.tmp.cleanup()
 
     def start(self, text):
@@ -165,7 +167,10 @@ class OwnershipRegression(unittest.TestCase):
         self.children.append(p)
         return p
 
-    def marker(self, name):
+    def marker(self, name, may_be_gone=False):
+        # may_be_gone: the caller's product is DESIGNED to end this process right after the marker appears (F-A2: the
+        # crashed leader's Job is terminated). OpenProcess answering ERROR_INVALID_PARAMETER (87) is then the expected
+        # outcome of a lost race, not a missing fixture; every other NULL, and every NULL for any other caller, still fails.
         pid = self._marker_pid(self.root / name, retry_permission=(os.name == 'nt'))
         self.extra.append(pid)
         if os.name == 'posix':
@@ -179,8 +184,11 @@ class OwnershipRegression(unittest.TestCase):
             api.WaitForSingleObject.argtypes=[wintypes.HANDLE,wintypes.DWORD]
             api.TerminateProcess.argtypes=[wintypes.HANDLE,wintypes.UINT]
             api.CloseHandle.argtypes=[wintypes.HANDLE]
-            self.handles[pid]=api.OpenProcess(0x100001,False,pid)
-            self.assertTrue(self.handles[pid], 'fixture process handle unavailable')
+            k32 = _kernel32()  # use_last_error=True: the error code of a NULL handle is part of the verdict
+            self.handles[pid] = k32.OpenProcess(0x100001, False, pid)
+            self.handle_err[pid] = 0 if self.handles[pid] else k32.GetLastError()
+            self.assertTrue(self.handles[pid] or (may_be_gone and self.handle_err[pid] == _ERROR_INVALID_PARAMETER),
+                            'fixture process handle unavailable (OpenProcess error %d)' % self.handle_err[pid])
         return pid
 
     def _marker_pid(self, path, *, retry_permission, attempts=MARKER_PERM_ATTEMPTS, budget_s=MARKER_PERM_BUDGET_S,
@@ -239,6 +247,8 @@ class OwnershipRegression(unittest.TestCase):
         # Tri-state like alive_state. On nt the retained handle answers (no pid reuse); a failed wait is UNKNOWN, never
         # DEAD, so assert_gone cannot pass on it.
         if os.name == 'nt':
+            if not self.handles.get(pid):
+                return alive_state(pid)  # may_be_gone pid (OpenProcess said 87): no retained handle, the tri-state probe answers
             import ctypes
             wait = ctypes.windll.kernel32.WaitForSingleObject(self.handles[pid],0)
             return {_WAIT_OBJECT_0: DEAD, _WAIT_TIMEOUT: ALIVE}.get(wait, UNKNOWN)
@@ -250,7 +260,8 @@ class OwnershipRegression(unittest.TestCase):
     def stop_recorded(self,pid):
         if os.name == 'nt':
             import ctypes
-            ctypes.windll.kernel32.TerminateProcess(self.handles[pid],125)
+            if self.handles.get(pid):  # no handle: the process was already gone when marker() looked (may_be_gone, error 87)
+                ctypes.windll.kernel32.TerminateProcess(self.handles[pid],125)
             return
         # POSIX: a pid is a number the OS reuses once the process ends. SIGKILL only the process whose start time
         # still equals the one read when marker() recorded it; an unreadable identity refuses (never kills blind).
@@ -579,9 +590,10 @@ Path(%r).write_text(str(r))
         self.assertTrue(result['timed_out'],result)
         self.assertFalse(result['complete'])
 
-    def run_fa(self, launch, timeout, arm, name):
+    def run_fa(self, launch, timeout, arm, name, may_be_gone=False):
         """Fix A specimens: run_owned with grace 600 / force 5 in a driver process (the old bytes block for the
-        whole grace). The output holder publishes its pid as <name>; returns (returned, RESULT dict, output)."""
+        whole grace). The output holder publishes its pid as <name>; returns (returned, RESULT dict, output).
+        may_be_gone is passed on to marker() (see there)."""
         script = self.root/'fa_driver.py'
         script.write_text(_FA_DRIVER % {'bin': str(BIN), 'arm': arm, 'launch': launch, 'timeout': timeout})
         # The with closes the test's own handle even when marker() fails; Windows cannot remove an open file.
@@ -589,7 +601,10 @@ Path(%r).write_text(str(r))
             p = subprocess.Popen([PYTHON, '-B', str(script)], stdout=out_f, stderr=subprocess.STDOUT,
                                  start_new_session=(os.name == 'posix'))
             self.children.append(p)
-            self.marker(name)
+            if may_be_gone:
+                self.marker(name, may_be_gone=True)
+            else:
+                self.marker(name)  # one-argument call: the never-started specimen replaces marker() by a one-argument function
             try:
                 p.wait(timeout=60)  # wallclock: guard 60 s only ends a hang; the old bytes spend the 600 s grace, the verdict is that run_owned returned
                 returned = True
@@ -642,10 +657,19 @@ Path(%r).write_text(str(r))
         # Holder spawned with stdin=DEVNULL: on nt that is what passes the std handles, so the holder really holds the
         # output (an all-default Popen inherits none); the hook phases spawn this way too (_owned_process.py:494-496).
         script.write_text("import os,subprocess,sys,time\nfrom pathlib import Path\nsys.path.insert(0,%r)\nfrom _owned_process import managed_main\ndef main():\n subprocess.Popen([sys.executable,'-B','-c',%r],stdin=subprocess.DEVNULL)\n while not Path(%r).exists(): time.sleep(.01)\n os._exit(3)\nmanaged_main(main)\n" % (str(BIN), code, str(self.root/'fa2-holder')))
-        returned, result, out = self.run_fa([PYTHON, '-B', str(script)], 30, '', 'fa2-holder')
+        # may_be_gone: the leader exits as soon as the marker exists and run_owned then ends the Job, so the holder can be
+        # gone before the test's own OpenProcess runs (native Windows, f64f990b step 8: error 87).
+        returned, result, out = self.run_fa([PYTHON, '-B', str(script)], 30, '', 'fa2-holder', may_be_gone=True)
+        holder = int((self.root/'fa2-holder').read_text())
+        if os.name == 'nt':
+            # Which branch ran: the handle was live (the test won the race) or OpenProcess answered 87 (the Job was first).
+            sys.stderr.write('\nC03-FA2-HOLDER ' + json.dumps({'handle': 'live' if self.handles.get(holder) else 'gone87',
+                                                                'err': self.handle_err.get(holder, 0)}) + '\n')
+            sys.stderr.flush()
         self.assertTrue(returned, 'cooperative window outlived a crashed leader (grace 600 s): %r' % out[-400:])
         self.assertIn('control closed without DONE', (result or {}).get('reason', ''), out[-400:])
         self.assertFalse(result['complete'], result)
+        self.assert_gone(holder)  # the product obligation this case never checked: the crashed leader's Job ends the holder
 
     def test_managed_leader_runs_a_preflight_shaped_child(self):
         # Product shape (head ruling C4): managed preflight runs its checks as javis_preflight.py:5333 @af092542 does -
@@ -1377,6 +1401,19 @@ if __name__=='__main__':
             except Exception as exc:
                 trace={'error':repr(exc),'classification':'UNMEASURED'}
             sys.stderr.write('\nC03-CRLF-TRACE '+json.dumps(trace)+'\n');sys.stderr.flush()
+        if os.name == 'nt':
+            # R2-a (head ruling on REPORT-C03-NATIVE-RED-f64f990b, f64f990b step 8): the bundled Git bash normalises CRLF in
+            # `printf '%s' "$CHK_OUT" | sed` (hook :499; trace G2b has the CRs, G2 has none), so the final hook output carries no CR
+            # on Windows. The in-path witness therefore moves to the relay boundary G1 (the managed checklist's bytes), and on nt
+            # the trace is LOAD-BEARING: a missing or errored G1 fails here, it is never UNMEASURED. POSIX keeps the lines below.
+            self.assertNotIn('error', trace, 'nt: the CRLF trace failed, so the relay witness is unmeasured: %r' % (trace,))
+            self.assertIn('G1', trace, 'nt: the CRLF trace has no G1 boundary: %r' % (sorted(trace),))
+            self.assertIn(b'fixture summary\r\n', bytes.fromhex(trace['G1']),
+                          'witness: the checklist line never reached the relay boundary with its own CR LF: %r' % bytes.fromhex(trace['G1'])[-300:])
+            self.assertIn(heads, out, 'soul headings arrived changed (records relay :583): %r' % out[out.find(b'## '):][:120])
+            self.assertNotIn(b'\r\r', out, 'a CR run in the hook output')
+            self.assertNotIn(b'\r', out, 'nt: a CR in the hook output: %r' % out[out.find(b'\r') - 40:][:120])
+            return
         self.assertIn(b'fixture summary\r', out, 'witness: the checklist line never arrived with its own CR: %r' % out[-300:])
         i = out.index(b'fixture summary\r') + len(b'fixture summary')
         self.assertEqual(out[i:i + 2], b'\r\n', 'checklist relay (:497/:594) added CR: %r' % out[i:i + 8])
