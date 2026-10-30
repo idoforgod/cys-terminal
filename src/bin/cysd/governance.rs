@@ -33951,8 +33951,10 @@ mod h_machine_hold_tests {
     /// P1 WC (0.14.56 shared completion fixtures): 83 -> 86, class C +3 - two shared POSIX recorder (`p1_recorder`) controls and the
     /// WC-1 per-case delayed/missing receipt control, whose cases are themselves recorder specimens. Renamed `_of_86` (the CI comment too).
     /// Integration UNION: 55 shared + 6 SOCKET-only + 31 P1-only = 92; the historical parent counts above are superseded.
+    /// ★(0.14.56 · PKG1-M1) 92 -> **103**: class C +11 recorder-seat specimens of the `authoritative` hold axis (`pkg1_*`:
+    /// agent_queue_tests 2 · boot_supervisor 2 · channels 1 · handlers 2 · schedule 4). Renamed `_of_103` (the CI comment too).
     #[test]
-    fn r2f_dm_windows_ignore_attributes_are_exactly_the_decided_set_of_92() {
+    fn r2f_dm_windows_ignore_attributes_are_exactly_the_decided_set_of_103() {
         const REASON_A: &str = "S21 제출 정착·창 위 CR 보류는 유닉스 한정(send_settle_applies)";
         const REASON_B: &str = "윈도우 기본 H 마스크는 draft 축을 끈다(hold_axes_default(true)) — 이 검체는 유닉스 기본(draft 축) 동작을 본다";
         const REASON_C: &str = "좌석 명령이 POSIX 셸 문법";
@@ -34069,6 +34071,18 @@ mod h_machine_hold_tests {
             ("agent_queue_tests", "p1_completion_recorder_barrier_covers_delayed_extra_bytes", 'C'),
             ("agent_queue_tests", "p1_completion_explicit_holder_does_not_release_before_owner", 'C'),
             ("agent_queue_tests", "p1_completion_wc1_each_case_delayed_and_missing_actual_receipt", 'C'),
+            // PKG1-M1 (0.14.56): the `authoritative` hold specimens read the POSIX recorder (`stty raw -echo; exec cat > file`).
+            ("agent_queue_tests", "pkg1_guard_a_the_queue_tick_delivers_the_authoritative_job_while_the_axis_holds", 'C'),
+            ("agent_queue_tests", "pkg1_guard_b_a_partial_authoritative_write_resumes_while_the_axis_holds", 'C'),
+            ("boot_supervisor", "pkg1_s4_boot_notice_waits_behind_a_queued_resume_then_is_written", 'C'),
+            ("boot_supervisor", "pkg1_s9_boot_notice_refused_at_claim_is_deferred_then_written", 'C'),
+            ("channels", "pkg1_s2_inbox_row_before_the_tick_waits_behind_the_resume", 'C'),
+            ("handlers", "pkg1_s3_ceo_push_is_held_behind_a_queued_resume", 'C'),
+            ("handlers", "pkg1_s8_plain_clear_first_is_refused_while_a_resume_waits_and_s8b_the_cycle_clear_passes", 'C'),
+            ("schedule", "pkg1_s1_schedule_push_after_quiesce_off_waits_behind_the_resume", 'C'),
+            ("schedule", "pkg1_s5_jammed_job_lapses_after_the_bound_with_one_event", 'C'),
+            ("schedule", "pkg1_s5b_the_oldest_authoritative_entry_governs_the_bound", 'C'),
+            ("schedule", "pkg1_s7_the_monotonic_insertion_age_governs_not_the_wall_clock", 'C'),
         ];
         let needle = concat!("#[cfg_attr(not(unix), ", "ignore = \"");
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/cysd");
@@ -34098,9 +34112,9 @@ mod h_machine_hold_tests {
         want_sorted.sort();
         let missing: Vec<_> = got.iter().filter(|entry| !want_sorted.contains(entry)).collect();
         let extra: Vec<_> = want_sorted.iter().filter(|entry| !got.contains(entry)).collect();
-        assert_eq!(want.len(), 92, "union registry must contain 92 entries; missing={missing:?}; extra={extra:?}");
-        assert_eq!(got.len(), 92, "윈도우 `ignore` 가 {}건이다(결정 92건) — 새로 더했거나 뺐다: {got:?}", got.len());
-        assert_eq!(got, want_sorted, "윈도우 `ignore` 집합이 결정한 92건과 다르다 — 목록과 `ignore` 사유를 함께 고쳐라");
+        assert_eq!(want.len(), 103, "union registry must contain 103 entries; missing={missing:?}; extra={extra:?}");
+        assert_eq!(got.len(), 103, "윈도우 `ignore` 가 {}건이다(결정 103건) — 새로 더했거나 뺐다: {got:?}", got.len());
+        assert_eq!(got, want_sorted, "윈도우 `ignore` 집합이 결정한 103건과 다르다 — 목록과 `ignore` 사유를 함께 고쳐라");
     }
 }
 
