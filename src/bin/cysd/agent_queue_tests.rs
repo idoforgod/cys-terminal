@@ -2016,3 +2016,112 @@ fn d9_bound_i3_late_refusal_does_not_restore_a_replaced_head_slot() {
     assert!(row["writer_claim"]["slots"]["queue"].is_null(),"late refusal must not recreate a slot for the former head");
     assert_eq!(row["writer_claim"]["refusals_total"]["queue"],1,"historical refusal still counted");
 }
+
+// WC-1: P1-only admission/completion channel. Historical wait_until callers are unchanged.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum P1WaitError {
+    Admission { event: &'static str, reason: String },
+    CompletionTimeout { event: &'static str },
+    CompletionDisconnected { event: &'static str },
+}
+
+/// Non-forgeable outside this module: created only after the producer's synchronous admission.
+pub(crate) struct P1Admitted<T> {
+    event: &'static str,
+    receiver: std::sync::mpsc::Receiver<T>,
+}
+
+/// `start` must return the actual producer admission, installing `tx` at its named completion.
+/// No predicate or background state poll is accepted; the channel exists before admission runs.
+pub(crate) fn p1_start_completion<T>(
+    event: &'static str,
+    start: impl FnOnce(std::sync::mpsc::Sender<T>) -> Result<(), String>,
+) -> Result<P1Admitted<T>, P1WaitError> {
+    let (tx, receiver) = std::sync::mpsc::channel();
+    start(tx).map_err(|reason| P1WaitError::Admission { event, reason })?;
+    Ok(P1Admitted { event, receiver })
+}
+
+/// Only an admitted operation can reach this named completion guard.
+pub(crate) fn p1_wait_completion<T>(
+    admitted: Result<P1Admitted<T>, P1WaitError>,
+    guard: Duration,
+) -> Result<T, P1WaitError> {
+    let P1Admitted { event, receiver } = admitted?;
+    match receiver.recv_timeout(guard) { // wallclock: guard receipt of the admitted producer's named completion event
+        Ok(value) => Ok(value),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(P1WaitError::CompletionTimeout { event }),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(P1WaitError::CompletionDisconnected { event }),
+    }
+}
+
+#[test]
+fn p1_completion_refusal_is_not_a_timeout_or_success() {
+    let admitted = p1_start_completion("refused producer", |tx| {
+        tx.send(7).unwrap(); // even a premature completion cannot replace admission
+        Err("enqueue refused".into())
+    });
+    assert_eq!(p1_wait_completion(admitted, Duration::ZERO), Err(P1WaitError::Admission {
+        event: "refused producer", reason: "enqueue refused".into(),
+    }));
+}
+
+#[test]
+fn p1_completion_synchronous_receipt_cannot_be_lost() {
+    let admitted = p1_start_completion("synchronous terminal", |tx| {
+        tx.send(9).unwrap();
+        Ok(())
+    });
+    assert_eq!(p1_wait_completion(admitted, Duration::ZERO), Ok(9));
+}
+
+#[test]
+fn p1_completion_delayed_success_uses_explicit_release() {
+    let (release, held) = std::sync::mpsc::channel();
+    let (entered, observed) = std::sync::mpsc::channel();
+    let mut producer = None;
+    let admitted = p1_start_completion("released terminal", |tx| {
+        producer = Some(std::thread::spawn(move || {
+            entered.send(()).unwrap();
+            held.recv().expect("explicit holder release");
+            tx.send(11).unwrap();
+        }));
+        Ok(()) // spawn returned a live owned thread; receiver above is its completion
+    });
+    observed.recv().unwrap();
+    let waiter = std::thread::spawn(move || p1_wait_completion(admitted, Duration::from_secs(60)));
+    release.send(()).unwrap();
+    assert_eq!(waiter.join().unwrap(), Ok(11));
+    producer.unwrap().join().unwrap();
+}
+
+#[test]
+fn p1_completion_never_arrives_is_a_named_guard_failure() {
+    let mut held = None;
+    let admitted = p1_start_completion("missing terminal", |tx: std::sync::mpsc::Sender<()>| {
+        held = Some(tx);
+        Ok(())
+    });
+    assert_eq!(p1_wait_completion(admitted, Duration::ZERO), Err(P1WaitError::CompletionTimeout {
+        event: "missing terminal",
+    }));
+    drop(held); // no timer can release the holder before the guard
+}
+
+#[test]
+fn p1_completion_disconnect_is_not_a_timeout() {
+    let admitted = p1_start_completion("lost producer", |_tx: std::sync::mpsc::Sender<()>| Ok(()));
+    assert_eq!(p1_wait_completion(admitted, Duration::ZERO), Err(P1WaitError::CompletionDisconnected {
+        event: "lost producer",
+    }));
+}
+
+#[test]
+fn p1_completion_one_producers_receipt_cannot_complete_another() {
+    let first = p1_start_completion("first", |tx| { tx.send(1).unwrap(); Ok(()) });
+    let mut held = None;
+    let second = p1_start_completion("second", |tx: std::sync::mpsc::Sender<i32>| { held = Some(tx); Ok(()) });
+    assert_eq!(p1_wait_completion(second, Duration::ZERO), Err(P1WaitError::CompletionTimeout { event: "second" }));
+    assert_eq!(p1_wait_completion(first, Duration::ZERO), Ok(1));
+    drop(held);
+}
