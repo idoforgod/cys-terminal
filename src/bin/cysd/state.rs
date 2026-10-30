@@ -2373,6 +2373,9 @@ pub struct Surface {
     /// (동형성 핀) → GUI 폴더별 고정 토스트. **스폰 동작은 이 값과 무관하다**(cwd 대체 없음).
     /// 판정·상한·롤백 규약은 `cwd_probe.rs` 머리말이 정본이다.
     pub cwd_blocked: Option<crate::cwd_probe::CwdBlocked>,
+    /// E0 fixture notification only; absent from non-test layouts.
+    #[cfg(test)]
+    p1_e0_reader_completion: Mutex<(bool, Vec<std::sync::mpsc::Sender<()>>)>,
 }
 
 /// ★(U-10) 관문 보류 좌석의 근거. `surface.list`·`org.status`·`topology.json` 에 **object**
@@ -2413,6 +2416,18 @@ pub enum EscRecount {
 }
 
 impl Surface {
+    /// Admission is registration with this already-spawned reader, not a sampled predicate.
+    #[cfg(test)]
+    pub(crate) fn p1_e0_subscribe_reader_completion(&self, sender: std::sync::mpsc::Sender<()>) -> Result<(), String> {
+        let mut completion = self.p1_e0_reader_completion.lock().unwrap_or_else(|e| e.into_inner());
+        if completion.0 {
+            sender.send(()).map_err(|_| "E0 completion receiver disconnected".to_string())?;
+        } else {
+            completion.1.push(sender);
+        }
+        Ok(())
+    }
+
     /// Creation observation only; strict callers must still prove current lifetime.
     #[allow(dead_code)] // Consumed by the later S3/S4 integration.
     pub(crate) fn registration_start(&self) -> Option<u64> {
@@ -5668,6 +5683,143 @@ pub(crate) fn test_stop_daemon(daemon: &Arc<Daemon>) {
     }
 }
 
+/// E0-only teardown: actual reader completion through the sole P1 event waiter.
+#[cfg(test)]
+pub(crate) fn p1_e0_stop_daemon(daemon: &Arc<Daemon>) {
+    let sdir = state_dir(&daemon.socket_path);
+    let intact_at_entry = sdir.exists() && sdir.join("operator.token").exists();
+    let fault_injected = should_quiet_expected_persist_fail()
+        || sdir.join("queue-expired.json").is_dir()
+        || sdir.join("queue-state.json").is_dir()
+        || crate::delivery::ledger_path(&daemon.socket_path).is_dir();
+    let expected_strong = 1 + usize::from(daemon.activity.running.load(Ordering::Acquire));
+
+    let surfaces: Vec<Arc<Surface>> = daemon
+        .surfaces
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .cloned()
+        .collect();
+    let created: Vec<(u64, u32)> = daemon
+        .bus
+        .replay_after(0)
+        .into_iter()
+        .filter(|e| e.get("name").and_then(|v| v.as_str()) == Some("surface.created"))
+        .filter_map(|e| {
+            let sid = e.get("surface_id").and_then(|v| v.as_u64())?;
+            let pid = e
+                .get("payload")
+                .and_then(|p| p.get("pid"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
+            Some((sid, pid))
+        })
+        .collect();
+
+    // create_surface returned only after its reader was spawned; registration and completed ACK share one mutex.
+    let readers: Vec<_> = daemon.test_created.lock().unwrap_or_else(|e| e.into_inner())
+        .iter().filter_map(std::sync::Weak::upgrade).collect();
+    let completions: Vec<_> = readers.iter().map(|surface| {
+        crate::agent_queue_tests::p1_start_completion("E0 reader released daemon", |sender| {
+            surface.p1_e0_subscribe_reader_completion(sender)
+        })
+    }).collect();
+
+    for s in &surfaces {
+        #[cfg(unix)]
+        if s.pid > 1 && s.pid != std::process::id() {
+            unsafe {
+                let pgid = libc::getpgid(s.pid as libc::pid_t);
+                if pgid == s.pid as libc::pid_t {
+                    let _ = libc::kill(-pgid, libc::SIGKILL);
+                }
+            }
+        }
+        let mut child = s.child.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    #[cfg(unix)]
+    for &(sid, pid) in &created {
+        if !surfaces.iter().any(|s| s.id == sid) && pid > 1 && pid != std::process::id() {
+            unsafe {
+                let pgid = libc::getpgid(pid as libc::pid_t);
+                if pgid == pid as libc::pid_t {
+                    let _ = libc::kill(-pgid, libc::SIGKILL);
+                } else {
+                    let _ = libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    // ★(0.14.53 · U229 · 계약 C-4 의 O-2) `created` 수집(위) **뒤**, 대기 **앞**, `panicking` 가드 **앞**이 이 자리다.
+    //   ⓐ 수집이 먼저이므로 "단언 대상인데 해제되지 않은 좌석"이 생길 수 없고(등재 ⊇ 버스),
+    //   ⓑ 가드보다 앞이므로 패닉 중 `Drop` 에서도 해제만 하고 단언은 그대로 건너뛴다,
+    //   ⓒ unix 에서는 `cfg!(windows)` 가 거짓이라 **무동작**이다(이 함수의 유닉스 결정론은 종전 그대로 자식 종료가 만든다).
+    let _ = test_drain_created_and_release(daemon, cfg!(windows));
+
+    for completion in completions {
+        crate::agent_queue_tests::p1_wait_completion(completion, std::time::Duration::from_secs(120))
+            .expect("E0 reader released daemon completion");
+    }
+    // No best-effort transcript-file sleep: closing recall_tx retains the original stop signal.
+    *daemon.recall_tx.lock().unwrap_or_else(|e| e.into_inner()) = std::sync::mpsc::channel().0;
+
+    if std::thread::panicking() {
+        return;
+    }
+
+    let exited_ids: std::collections::HashSet<u64> = daemon
+        .bus
+        .replay_after(0)
+        .into_iter()
+        .filter(|e| e.get("name").and_then(|v| v.as_str()) == Some("surface.exited"))
+        .filter_map(|e| e.get("surface_id").and_then(|v| v.as_u64()))
+        .collect();
+    for (sid, _) in &created {
+        assert!(
+            exited_ids.contains(sid),
+            "test_stop_daemon: surface {sid} reader 스레드가 surface.exited 를 발행하기 전에 시한을 넘겼다"
+        );
+    }
+    for s in &surfaces {
+        assert!(
+            s.exited.load(Ordering::Acquire)
+                && s.exited_at.lock().unwrap_or_else(|e| e.into_inner()).is_some(),
+            "test_stop_daemon: surface {} exited/exited_at 표식이 서지 않았다",
+            s.id
+        );
+    }
+    assert_eq!(
+        Arc::strong_count(daemon),
+        expected_strong,
+        "test_stop_daemon: 데몬 Arc 강한 참조가 {expected_strong} 이 아니다 — 배경 스레드가 아직 살아 있다"
+    );
+    let persist_failures: Vec<Value> = daemon
+        .bus
+        .replay_after(0)
+        .into_iter()
+        .filter(|e| e.get("name").and_then(|v| v.as_str()) == Some("queue.persist_failed"))
+        .collect();
+    let intact_at_exit = sdir.exists() && sdir.join("operator.token").exists();
+    assert!(
+        intact_at_entry && intact_at_exit,
+        "test_stop_daemon: 배경 스레드를 멈추기 전에 상태 디렉터리({})를 먼저 지웠다(intact_entry={}, intact_exit={}, persist_failed={})",
+        sdir.display(),
+        intact_at_entry,
+        intact_at_exit,
+        persist_failures.len()
+    );
+    if !fault_injected {
+        assert!(
+            persist_failures.is_empty() && daemon.queue_wal_durable(),
+            "test_stop_daemon: 배경 스레드 정리 중 큐 영속 실패가 발생했다: {persist_failures:?}"
+        );
+    }
+}
+
 /// 영속 상태 디렉터리 — 소켓과 같은 곳 (unix). Windows는 LOCALAPPDATA 하위.
 /// RC-13: Windows에서 부서 데몬마다 pipe명 슬러그로 **고유 디렉토리**를 파생해 transcripts.db·feed.jsonl
 /// 격리를 보장한다(구: 모든 부서가 단일 %LOCALAPPDATA%\cys 공유 → SQLite 락 경합·부서간 오염).
@@ -7363,6 +7515,8 @@ impl Daemon {
             gate_pending: Mutex::new(None),
             // ★(0.14.41 · U18) 생성 시 관측 1회의 결과(불변) — 위 관측 블록 참조.
             cwd_blocked,
+            #[cfg(test)]
+            p1_e0_reader_completion: Mutex::new((false, Vec::new())),
         });
 
         // ★W2a: 이 create가 실제 등록한(dedup 후) 역할 — 아래에서 묘비 해제에 쓴다.
@@ -7697,6 +7851,16 @@ impl Daemon {
                 Some(surf.id),
                 surface_exited_payload(surf.id, exited_role, exited_agent),
             );
+            #[cfg(test)]
+            {
+                // Notify only after this reader has relinquished its daemon ownership.
+                drop(daemon);
+                let mut completion = surf.p1_e0_reader_completion.lock().unwrap_or_else(|e| e.into_inner());
+                completion.0 = true;
+                for sender in completion.1.drain(..) {
+                    let _ = sender.send(());
+                }
+            }
         });
 
         Ok(surface)
