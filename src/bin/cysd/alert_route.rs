@@ -10394,20 +10394,46 @@ mod office_spool_drills {
     }
 
     /// m5 (base digest): a changed digest set held by the coalescing window is NOT presented every minute; it is
-    /// presented when the window has passed.
+    /// presented when the window has passed. Each check isolates one arm: `waiting` has the window passed and a digest
+    /// undelivered; `held` has nothing waiting and the window open (mutant run 1: a `held` taken while the first digest
+    /// still waited passed for the waiting arm's reason, so it did not pin the window).
     #[test]
     fn osd_m5_held_digest_change_waits_for_the_window() {
         let (b, _d5) = pair("m5window");
         let dg = |f: &[&str]| json!({"lanes": [lane("main", "ok", false)], "digest": {"faults": f, "unreachable": false}});
         send(&b, vec![lane("main", "ok", false)], json!({"faults": ["dept-5 mismatch"], "unreachable": false}), 0.0);
-        let held = office_spool_wants(&b, &dg(&[]));
         state_lock(&b).office_spool.digest_sent_mono = Some(-(OFFICE_SPOOL_DIGEST_WINDOW_SECS + 60.0));
         let waiting = office_spool_wants(&b, &dg(&[])); // the first digest is still undelivered in the Secretariat queue
         drain(&b, "worker"); // delivered
         let due = office_spool_wants(&b, &dg(&[]));
+        state_lock(&b).office_spool.digest_sent_mono = Some(Now::live(&b).mono); // window open, nothing waiting
+        let held = office_spool_wants(&b, &dg(&[]));
         println!("OSD-M5-WINDOW held={held} waiting={waiting} due={due}");
         assert!(!held, "inside the window the held change is not republished");
         assert!(!waiting, "while a digest waits undelivered the leg does nothing, so nothing is published");
         assert!(due, "after the window, with nothing waiting, it is presented");
+    }
+
+    /// m5 (record gate, kept per w51-B-DESIGN-NOTES "unchanged, loud"): a notified-record file that is not a JSON object,
+    /// or that cannot be read, makes `wants` publish even an all-ok observation. Measured beside it: the leg does nothing
+    /// with that observation - no master entry, the file left as it was (reported to the head as a residual case).
+    #[test]
+    fn osd_m5_unreadable_record_still_publishes() {
+        let (_b, d5) = pair("m5unread");
+        let dir = crate::state::state_dir(&d5.socket_path);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ok = json!({"lanes": [lane("dept-5", "ok", false)], "digest": null});
+        std::fs::write(dir.join(REC), b"{not json").unwrap();
+        let not_object = office_spool_wants(&d5, &ok);
+        send(&d5, vec![lane("dept-5", "ok", false)], Value::Null, 400.0);
+        let leg_entries = texts(&d5, "master").len();
+        let left_as_it_was = std::fs::read(dir.join(REC)).unwrap() == b"{not json";
+        std::fs::remove_file(dir.join(REC)).unwrap();
+        std::fs::create_dir(dir.join(REC)).unwrap(); // a read error that is not NotFound
+        let read_error = office_spool_wants(&d5, &ok);
+        println!("OSD-M5-UNREAD not_object={not_object} read_error={read_error} leg_entries={leg_entries} left_as_it_was={left_as_it_was}");
+        assert!(not_object, "a record that is not a JSON object publishes");
+        assert!(read_error, "a record that cannot be read publishes");
+        assert_eq!((leg_entries, left_as_it_was), (0, true), "measured: the leg does nothing with that all-ok observation");
     }
 }
