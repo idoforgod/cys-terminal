@@ -2492,7 +2492,7 @@ pub(crate) fn p1_late_hold(s: &Arc<Surface>, bytes: Option<&'static [u8]>) -> Ar
 
 
 #[test]
-#[cfg_attr(not(unix), ignore = "raw PTY recorder uses POSIX tty")]
+#[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
 fn p1_completion_recorder_barrier_covers_delayed_extra_bytes() {
     let fx = fx("p1-recorder-control");
     let mut recorder = p1_recorder(&fx.daemon, &fx.dir, "control", Some("master"));
@@ -2516,7 +2516,7 @@ fn p1_completion_recorder_barrier_covers_delayed_extra_bytes() {
 }
 
 #[test]
-#[cfg_attr(not(unix), ignore = "raw PTY recorder uses POSIX tty")]
+#[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
 fn p1_completion_explicit_holder_does_not_release_before_owner() {
     let fx = fx("p1-holder-control");
     let mut recorder = p1_recorder(&fx.daemon, &fx.dir, "hold", None);
@@ -2643,7 +2643,7 @@ thread_local! {
 }
 
 #[test]
-#[cfg_attr(not(unix), ignore = "WC1 real PTY caller controls use POSIX recorder")]
+#[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
 fn p1_completion_wc1_each_case_delayed_and_missing_actual_receipt() {
     let cases: &[(&str, fn(), &str)] = &[
         ("row14", d9_pre_cr_t_l1_a_human_byte_during_the_settle_lands_after_the_cr, "admitted queue body acknowledged before held CR"),
