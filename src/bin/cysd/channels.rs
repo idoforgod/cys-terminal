@@ -1655,7 +1655,7 @@ fn inject_master_confirmed(
     inbox_id: i64,
     handoff: InboxHandoff,
     d9: Option<crate::governance::D9WriterGuard>,
-) -> Option<String> {
+) -> Result<String, InboxHold> {
     // ★R1 배달 원장 — 주입보다 앞(delivery.rs 불변식 ①). 외부 채널 봉투도 기계 유래다.
     crate::delivery::record_audited(
         daemon,
@@ -1697,11 +1697,29 @@ fn inject_master_confirmed(
         body_owner: None,
     };
     let busy = d9.is_some() && crate::governance::d9_writer_busy(daemon, surface, handoff.producer(), &inbox_id.to_string(), true);
-    let ok = !busy && surface.write_tx.try_send(crate::state::WriteReq::Agent(Box::new(job))).is_ok();
-    if !ok {
+    let paced = crate::governance::machine_hold_enabled(crate::governance::MachineInjector::Channel);
+    let result = if busy {
+        Err(counted_writer_hold(surface, handoff.producer(), &inbox_id.to_string()))
+    } else {
+        let send = || surface.write_tx.try_send(crate::state::WriteReq::Agent(Box::new(job)));
+        // Fresh completion check AFTER ledger/proof/idle waits, in the same critical section as handoff.
+        // Do not use master_inject_settling here: our own handoff mark has already been installed.
+        let admitted = if paced {
+            surface.inject_track.handoff_after_gap(std::time::Duration::from_millis(CHANNEL_ROW_GAP_MS), send)
+        } else { Some(send()) };
+        match admitted {
+            None => {
+                crate::governance::d9_nonwriter_hold(surface, handoff.producer());
+                Err(InboxHold::Paced)
+            }
+            Some(Ok(())) => Ok(request_id),
+            Some(Err(_)) => Err(InboxHold::WriterBusy),
+        }
+    };
+    if result.is_err() {
         surface.inject_track.undo_handoff(mark);
     }
-    ok.then_some(request_id)
+    result
 }
 
 /// ★(0.14.52 · S-a C6b) The row state a channel hand-off changed, so a zero-byte terminal can put it back exactly.
@@ -1950,6 +1968,7 @@ fn deliver_new_inbox_with(daemon: &Arc<Daemon>, conn: &Connection) -> InboxDeliv
             out.hold = Some(if stuck { InboxHold::WriterBusy } else { InboxHold::Paced });
             break;
         }
+        h3_after_cooldown();
         // ★(0.14.56 · P1 D9 §5-7 · D3-BOUND r2 §1.2) the claim guard and its baseline S0, BEFORE the judgment (`master_hold`),
         //   the record-first UPDATE and the ledger pre-record.
         let d9 = daemon.get_surface(sid).and_then(|m| crate::governance::D9WriterGuard::for_target(daemon, &m));
@@ -1984,20 +2003,21 @@ fn deliver_new_inbox_with(daemon: &Arc<Daemon>, conn: &Connection) -> InboxDeliv
         }
         let env = envelope_at(&channel, &sender_id, created_ts, inbox_id, false, &text, lag_on.then_some(now));
         // ③ 주입.
-        if let Some(request_id) = inject_master_confirmed(daemon, &surface, &env, inbox_id, InboxHandoff::New, d9) {
-            out.delivered.push(inbox_id);
-            out.requests.push((inbox_id, request_id));
-        } else {
+        match inject_master_confirmed(daemon, &surface, &env, inbox_id, InboxHandoff::New, d9) {
+            Ok(request_id) => {
+                out.delivered.push(inbox_id);
+                out.requests.push((inbox_id, request_id));
+            }
+            Err(hold) => {
             // 인계 실패(채널 정체) — 기록을 되돌린다(최선노력). 되돌림까지 실패하는 이중 결함이면 그 행은
             // injected 로 남는다(재배달 기본 0 이라 재주입되지 않는다 · 잔여 · 원장에 선기록은 남는다).
             let _ = conn.execute(
                 "UPDATE inbox SET state='new', injected_ts=NULL WHERE id=?1 AND state='injected'",
                 [inbox_id],
             );
-            out.hold = Some(if crate::governance::d9_hold_age(&surface, producer, &inbox_id.to_string()).is_some() {
-                counted_writer_hold(&surface, producer, &inbox_id.to_string())
-            } else { InboxHold::WriterBusy });
+            out.hold = Some(hold);
             break; // 주입 채널 정체 — 다음 sweep에서 재시도(순서 보존).
+            }
         }
     }
     if out.hold == Some(InboxHold::Paced) {
@@ -2055,6 +2075,7 @@ fn redeliver_unacked(daemon: &Arc<Daemon>, conn: &Connection) -> usize {
             if let Some(s) = daemon.get_surface(sid) { crate::governance::d9_nonwriter_hold(&s, producer); }
             break;
         }
+        h3_after_cooldown();
         // ★(0.14.56 · D3-BOUND r2 §1.2, §3.3) S0 before the judgment, as for a new row.
         let d9 = daemon.get_surface(sid).and_then(|m| crate::governance::D9WriterGuard::for_target(daemon, &m));
         let Ok(surface) = master_hold(daemon, sid) else {
@@ -2078,7 +2099,7 @@ fn redeliver_unacked(daemon: &Arc<Daemon>, conn: &Connection) -> usize {
         }
         let env = envelope_at(&channel, &sender_id, created_ts, inbox_id, true, &text, lag_on.then_some(now));
         let handoff = InboxHandoff::Redeliver { prev_injected_ts: injected_ts, prev_redelivered: redelivered };
-        if inject_master_confirmed(daemon, &surface, &env, inbox_id, handoff, d9).is_some() {
+        if inject_master_confirmed(daemon, &surface, &env, inbox_id, handoff, d9).is_ok() {
             n += 1;
         } else {
             let _ = conn.execute(
@@ -3644,7 +3665,7 @@ mod tests {
         // 비-quiescing(agent_status None) → 주입 가능.
         assert_eq!(deliverable_master(&d), Some(sid), "비-quiescing master는 배달 가능");
         let s1 = master_hold(&d, sid).expect("비-quiescing master 는 주입 직전 재확인 통과");
-        assert!(inject_master_confirmed(&d, &s1, "[test] hi", 0, InboxHandoff::New, crate::governance::D9WriterGuard::for_target(&d, &s1)).is_some(), "비-quiescing master엔 주입 성공");
+        assert!(inject_master_confirmed(&d, &s1, "[test] hi", 0, InboxHandoff::New, crate::governance::D9WriterGuard::for_target(&d, &s1)).is_ok(), "비-quiescing master엔 주입 성공");
         // 루프 중 quiescing set(cycle-agent가 /clear 진입 직전) → 주입 직전 재확인이 false 반환.
         *surface.agent_status.lock().unwrap() = Some(crate::state::AgentStatus {
             state: "quiescing".into(),
@@ -4577,6 +4598,90 @@ mod tests {
         h3_done(&m);
     }
 
+    /// A real predecessor writes its CR during a controlled producer descheduling AFTER the early cooldown check.
+    /// The per-seat consumer clock is frozen at that actual done_at: elapsed=0 deterministically, even on a slow host.
+    /// No sleep duration decides this verdict. The original h3 timing specimen remains unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn h3_post_wait_completion_rechecks_actual_done_at() {
+        h3_post_wait_case(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn h3_post_wait_redelivery_rechecks_actual_done_at() {
+        h3_post_wait_case(true);
+    }
+
+    #[cfg(unix)]
+    fn h3_completion(what: &str, complete: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !complete() { // wallclock: guard admitted H3 predecessor terminal or PTY ready receipt
+            assert!(std::time::Instant::now() < deadline, "H3_COMPLETION: {what}");
+            std::thread::yield_now();
+        }
+    }
+
+    #[cfg(unix)]
+    fn h3_post_wait_case(redelivery: bool) {
+        let _knob = crate::governance::HKnobGuard::set(&[("CYS_CHANNEL_REDELIVER_MAX", "2")]);
+        let d = tmp_daemon("h3-postwait");
+        seed_registered(&d, "slack", "t");
+        call(&d, "allow", json!({"channel": "slack", "sender_id": "U1"}), None);
+        let m = d.create_surface(None, Some("stty -echo; printf H3_READY; exec cat >/dev/null".into()), None,
+            Some("master".into()), 24, 80).expect("admitted PTY creation");
+        struct Cleanup(Arc<crate::state::Surface>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) { let _ = self.0.child.lock().unwrap().kill(); }
+        }
+        let _cleanup = Cleanup(m.clone());
+        d.roles.lock().unwrap().insert("master".into(), m.id);
+        *m.agent_meta.lock().unwrap() = Some(("claude".into(), "/usr/local/bin/claude".into()));
+        h3_completion("ready after stty", || m.parser.lock().unwrap().screen().contents().contains("H3_READY"));
+        crate::governance::h_paint(&m, crate::governance::H_IDLE_SCREEN);
+        let id = h3_seed(&d, "must remain queued", now());
+        let previous_stamp = now() - INBOX_REDELIVER_TTL_SECS - 1.0;
+        if redelivery {
+            let conn = d.channels.lock().unwrap();
+            conn.as_ref().unwrap().execute("UPDATE inbox SET state='injected', injected_ts=?2, redelivered=0 WHERE id=?1", params![id, previous_stamp]).unwrap();
+        }
+        let release = crate::agent_queue_tests::hold_writer(&m);
+        m.write_tx.send(crate::state::WriteReq::Inject {
+            text: "previous row".into(), cr_delay_ms: 0, clear_first: false, guard: None,
+        }).unwrap();
+        let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let clock_seat = m.clone();
+        let hook_seen = seen.clone();
+        H3_AFTER_COOLDOWN.with(|slot| *slot.borrow_mut() = Some(Box::new(move || {
+            assert!(clock_seat.write_tx.gate().pending() > 0, "predecessor is pending at skipped cooldown");
+            release.send(()).unwrap();
+            h3_completion("predecessor CR and terminal", || clock_seat.write_tx.gate().pending() == 0);
+            clock_seat.inject_track.test_freeze_gap_at_done();
+            hook_seen.store(true, std::sync::atomic::Ordering::Release);
+        })));
+        let (delivered, hold) = {
+            let conn = d.channels.lock().unwrap();
+            if redelivery { (redeliver_unacked(&d, conn.as_ref().unwrap()), None) }
+            else {
+                let result = deliver_new_inbox_with(&d, conn.as_ref().unwrap());
+                (result.delivered.len(), result.hold)
+            }
+        };
+        assert!(seen.load(std::sync::atomic::Ordering::Acquire), "controlled scheduling seam executed");
+        // This assertion, not a timeout or compile error, must kill the omitted post-wait check.
+        assert_eq!(delivered, 0, "H3_POSTWAIT: a fresh actual done_at must prevent row handoff");
+        if redelivery {
+            let conn = d.channels.lock().unwrap();
+            let restored: (f64, i64) = conn.as_ref().unwrap().query_row("SELECT injected_ts, redelivered FROM inbox WHERE id=?1", [id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+            assert_eq!(restored, (previous_stamp, 0), "redelivery preserves its exact previous stamp/count");
+        } else {
+            assert_eq!(hold, Some(InboxHold::Paced), "fresh gap is a pacing hold");
+            assert_eq!(h3_state(&d, id), "new", "record-first update restored");
+        }
+        m.inject_track.test_release_gap_clock();
+        h3_done(&m);
+    }
+
     /// S-C1: five busy observations hold without a ledger record; the first idle pass delivers.
     #[cfg(unix)]
     #[test]
@@ -5207,7 +5312,7 @@ mod tests {
                 .unwrap();
         }
         let handoff = InboxHandoff::Redeliver { prev_injected_ts: 1000.5, prev_redelivered: 1 };
-        assert!(inject_master_confirmed(&d, &m, "redelivered envelope", id, handoff, crate::governance::D9WriterGuard::for_target(&d, &m)).is_some(), "premise: handed off");
+        assert!(inject_master_confirmed(&d, &m, "redelivered envelope", id, handoff, crate::governance::D9WriterGuard::for_target(&d, &m)).is_ok(), "premise: handed off");
         let read = || -> (String, f64, i64) {
             let g = d.channels.lock().unwrap();
             g.as_ref()
@@ -5250,7 +5355,7 @@ mod d9_writer_guard_tests {
             ).unwrap();
         }
         let handed = d9_with_late_write_ahead(&s, || inject_master_confirmed(&f.daemon, &s, "[channel] tw4", 7, InboxHandoff::New, crate::governance::D9WriterGuard::for_target(&f.daemon, &s)));
-        assert!(handed.is_some(), "premise: handed off");
+        assert!(handed.is_ok(), "premise: handed off");
         // The discriminating assertion first (a written envelope follows the write ahead at once), then its settlement.
         assert_eq!(d9_received(&out, 1), b"T".to_vec(), "0 bytes of the envelope - only the write ahead");
         wait_until("the envelope settled", || !refused(&f.daemon).is_empty());
@@ -5259,12 +5364,26 @@ mod d9_writer_guard_tests {
         assert_eq!(r[0]["payload"]["reason"], serde_json::json!("guard_aborted"), "{r:?}");
         assert_eq!(r[0]["payload"]["inbox_id"], serde_json::json!(7), "{r:?}");
         // No foreign write: the pin's bytes.
-        assert!(inject_master_confirmed(&f.daemon, &s, "[channel] tw4b", 8, InboxHandoff::New, crate::governance::D9WriterGuard::for_target(&f.daemon, &s)).is_some());
+        assert!(inject_master_confirmed(&f.daemon, &s, "[channel] tw4b", 8, InboxHandoff::New, crate::governance::D9WriterGuard::for_target(&f.daemon, &s)).is_ok());
         let mut want = b"T".to_vec();
         want.extend(crate::agent_write::Plan::paste("[channel] tw4b").with_submit(500, 0).planned_bytes());
         let got = d9_received(&out, want.len());
         let _ = s.child.lock().unwrap().kill();
         assert_eq!(got, want, "the pin's bytes after the refused envelope");
         assert_eq!(refused(&f.daemon).len(), 1, "the second envelope was refused");
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static H3_AFTER_COOLDOWN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+}
+
+// No-op in production; keep test cfg inside the hook so source pins retain the real test-module boundary.
+fn h3_after_cooldown() {
+    #[cfg(test)]
+    {
+        let hook = H3_AFTER_COOLDOWN.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook { hook(); }
     }
 }

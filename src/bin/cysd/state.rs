@@ -1330,13 +1330,16 @@ pub struct ReturnTicket {
 ///
 /// 쓰기 = writer 스레드 단독([`run_writer_loop_tracked`] 의 Inject arm 이 begin/end) — 예외 `handed_at`(채널 생산자 ·
 /// [`InjectTrack::note_handoff`]). 읽기 = H0 판정·채널 배달 간격.
-/// 휘발(재기동·재생성 좌석은 빈 채로 출발 = 종전 동작). 락: `done_at`·`handed_at` 은 leaf.
+/// 휘발(재기동·재생성 좌석은 빈 채로 출발 = 종전 동작). `handed_at` is leaf; `done_at` also spans nonblocking writer admission in `handoff_after_gap`.
 #[derive(Debug, Default)]
 pub struct InjectTrack {
     /// Inject arm 이 (선정리)·붙여넣기·cr_delay·CR 을 쓰는 중이다.
     active: AtomicBool,
     /// 마지막 Inject arm 이 끝난 단조 시각(성공·실패 무관 — 끝난 뒤에는 화면만 남는다).
     done_at: Mutex<Option<Instant>>,
+    /// Per-track deterministic pacing clock, frozen only by a regression specimen after a real terminal.
+    #[cfg(test)]
+    gap_test_now: Mutex<Option<Instant>>,
     /// ★(0.14.42 · H3 간격 경쟁) 채널 생산자가 Inject 를 writer 에 **넘긴**(try_send 직전) 단조 시각 —
     /// [`InjectTrack::handoff_pending`]. 채널 행 간격 전용이다(H0 자기 붙여넣기 귀속은 읽지 않는다 — 인계만 된 본문은 화면에 없다).
     /// ★(R2F-DM 2차 · B2) 표식은 시각과 함께 **순번**을 든다([`HandoffSlot`]) — '같은 표식인가' 는 순번으로, 경과·선후는 시각으로 가린다.
@@ -1647,6 +1650,36 @@ impl InjectTrack {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .is_some_and(|t| t.elapsed() < within)
+    }
+
+    /// Recheck the actual completion gap and hand off without letting `end` replace that completion in between.
+    /// The closure must ONLY perform nonblocking writer admission: no IO, parser, journal or settlement waits.
+    /// Lock order is done_at -> WriterGate admission; writer releases done_at before settlement/operation release.
+    /// This does not reserve the writer or reject human/DSR admissions. A later writer start is still covered by D9.
+    pub(crate) fn handoff_after_gap<R>(&self, within: std::time::Duration, handoff: impl FnOnce() -> R) -> Option<R> {
+        let done = self.done_at.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        #[cfg(test)]
+        let now = self.gap_test_now.lock().unwrap().unwrap_or(now);
+        if self.active.load(Ordering::Acquire) || done.is_some_and(|t| now.saturating_duration_since(t) < within) {
+            return None;
+        }
+        let result = handoff();
+        drop(done);
+        Some(result)
+    }
+
+    /// Test control: pin the consumer clock to the actual completed writer timestamp, never manufacture a completion.
+    #[cfg(test)]
+    pub(crate) fn test_freeze_gap_at_done(&self) {
+        assert_ne!(self.submit_written_ms.load(Ordering::Acquire), 0, "H3 premise: predecessor actually wrote its CR");
+        let done = self.done_at.lock().unwrap().expect("real writer completion required");
+        *self.gap_test_now.lock().unwrap() = Some(done);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_release_gap_clock(&self) {
+        *self.gap_test_now.lock().unwrap() = None;
     }
 
     /// ★(0.14.42 · H3 간격 경쟁 — 발행 준비 발견) 생산자 전용 — Inject 를 writer 에 넘기기(`try_send`) **직전**에 부른다.
@@ -15283,5 +15316,30 @@ mod c8_proof_pending_v2_api_tests {
         assert_eq!(g.expect_gen, Some(4));
         assert!(!g.claim_for_write());
         assert_eq!(g.cleanup_owner(), Ok(InjectCleanupOwner::Controller));
+    }
+}
+
+#[cfg(test)]
+mod h3_gap_atomic_tests {
+    use super::*;
+
+    #[test]
+    fn h3_gap_boundary_and_completion_lock_span_handoff() {
+        let track = InjectTrack::default();
+        let done = Instant::now();
+        *track.done_at.lock().unwrap() = Some(done);
+        let gap = std::time::Duration::from_millis(1000);
+        for elapsed in [std::time::Duration::ZERO, gap - std::time::Duration::from_nanos(1), gap] {
+            *track.gap_test_now.lock().unwrap() = Some(done + elapsed);
+            let result = track.handoff_after_gap(gap, || {
+                assert!(track.done_at.try_lock().is_err(), "H3_ATOMIC: completion lock must span actual admission");
+                // No exclusive writer transition: normal raw admissions remain available inside the gap decision.
+                let (sender, receiver) = crate::writer_gate::WriterSender::channel(1);
+                assert!(sender.try_send(WriteReq::Data(vec![b'x'])).is_ok());
+                assert!(receiver.try_recv().is_ok());
+                1
+            });
+            assert_eq!(result, (elapsed >= gap).then_some(1), "exact product1000ms boundary");
+        }
     }
 }
