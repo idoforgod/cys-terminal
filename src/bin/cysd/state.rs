@@ -1842,6 +1842,8 @@ pub enum WriteReq {
     /// runs. Refused / cancelled / partial outcomes do not end the writer loop — only a broken
     /// transport does (an exit would drop the writer, and Unix writer Drop types newline + VEOF).
     Agent(Box<crate::agent_write::AgentJob>),
+    #[cfg(test)]
+    P1ReceiverBarrier(Vec<u8>),
 }
 
 /// 청크 경계 상태: 미완성 ESC/UTF-8 꼬리·\r 덮어쓰기·진행 중 라인
@@ -8349,6 +8351,13 @@ pub(crate) fn run_writer_loop_tracked<W: Write, R: Into<crate::writer_gate::Queu
         // The lease spans every arm, flush and Agent terminal settlement, including early exits.
         let (req, _operation) = req.into().into_parts();
         let res = match req {
+            #[cfg(test)]
+            WriteReq::P1ReceiverBarrier(marker) => {
+                if writer.write_all(&marker).and_then(|_| writer.flush()).is_err() {
+                    break;
+                }
+                continue;
+            }
             WriteReq::Data(bytes) => writer.write_all(&bytes).and_then(|_| writer.flush()),
             // ★B2: 최소 간격 확보용 지연 쓰기. 단일 소비자라 이 sleep 동안 뒤 요청은 채널에
             // 머물고, 따라서 '지연된 CR 뒤에 온 바이트'가 CR 을 추월하는 일이 없다(순서 보존).

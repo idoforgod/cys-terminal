@@ -20888,6 +20888,7 @@ mod tests {
             crate::state::WriteReq::SubmitAfterGap { .. } => "SubmitAfterGap",
             crate::state::WriteReq::Inject { .. } => "Inject",
             crate::state::WriteReq::Agent(_) => "Agent",
+            crate::state::WriteReq::P1ReceiverBarrier(_) => "P1ReceiverBarrier",
         }
     }
 
