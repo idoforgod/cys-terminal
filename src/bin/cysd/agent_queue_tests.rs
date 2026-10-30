@@ -1464,46 +1464,33 @@ fn d9_bound_t_s0h_a_human_key_time_between_judgment_and_hand_off_refuses_the_cla
 #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
 fn d9_pre_cr_t_l1_a_human_byte_during_the_settle_lands_after_the_cr() {
     let fx = fx("d9-tl1");
-    crate::agent_write::set_test_sync_settle(false);
-    let (s, out) = d9_master_recorder(&fx, "tl1");
-    let body = "[보고] tl1";
-    enqueue(&fx, &s, body);
-    let want = queue_bytes(body);
-    let before_cr = want[..want.len() - 1].to_vec();
-    let sender = {
-        let fx_daemon = fx.daemon.clone();
-        let s = s.clone();
-        let out = out.clone();
-        let before_cr = before_cr.clone();
-        std::thread::spawn(move || {
-            wait_until("the body is on the wire", || std::fs::read(&out).unwrap_or_default() == before_cr);
-            let req = cys::Request {
-                id: Value::from(1),
-                method: "surface.send_text".into(),
-                params: serde_json::json!({"surface_id": s.id, "text": "Z", "human": true, "quiet": true}),
-            };
-            let reply = match crate::handlers::dispatch(&fx_daemon, req, None) {
-                crate::handlers::Reply::Single(v) => v,
-                _ => panic!("single reply"),
-            };
-            let inside_settle = std::fs::read(&out).unwrap_or_default() == before_cr;
-            (reply, inside_settle)
-        })
-    };
-    assert!(hand_off(&fx, &s), "premise: handed off");
-    let (reply, inside_settle) = sender.join().unwrap();
-    let mut expect = want.clone();
-    expect.push(b'Z');
-    wait_until("receiver got the job and the byte", || std::fs::metadata(&out).map(|m| m.len() as usize).unwrap_or(0) >= expect.len());
-    std::thread::sleep(Duration::from_millis(100));
-    // The discriminating assertion first (the receiver's bytes), then the settlement.
-    let got = std::fs::read(&out).unwrap();
-    assert_eq!(reply["ok"], Value::from(true), "premise: the byte was received: {reply}");
-    assert!(inside_settle, "premise: the human byte was sent while the job's CR was still unwritten");
-    assert_eq!(got, expect, "the job's body and CR exactly, then the human byte");
-    wait_until("delivered", || queue_len(&s) == 0);
-    let _ = s.child.lock().unwrap().kill();
-    assert_eq!(events(&fx, "queue.delivered").len(), 1);
+    let _async = crate::agent_write::p1_sync_settle(false);
+    let mut recorder=p1_master_recorder(&fx,"tl1");let s=recorder.surface.clone();
+    let body="[보고] tl1";enqueue(&fx,&s,body);
+    let want=queue_bytes(body);let before_cr=want[..want.len()-1].to_vec();
+    let (release,held)=std::sync::mpsc::channel();
+    let paused=Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let pause_state=paused.clone();
+    let entered=p1_start_completion("admitted queue body acknowledged before held CR",|tx| {
+        *s.receiver_proof.lock().unwrap()=Some(Arc::new(P1PauseAtSubmit {
+            entered:Mutex::new(Some(tx)),release:Mutex::new(held),paused:pause_state,
+        }));
+        if hand_off(&fx,&s) { Ok(()) } else { Err("queue handoff refused".into()) }
+    });
+    p1_wait_completion(entered,P1_GUARD).expect("actual admitted job reached preCR rendezvous");
+    assert_eq!(recorder.received_prefix(before_cr.len()),before_cr,"receiver acknowledged complete body before CR");
+    let req=cys::Request{id:Value::from(1),method:"surface.send_text".into(),params:serde_json::json!({"surface_id":s.id,"text":"Z","human":true,"quiet":true})};
+    let reply=match crate::handlers::dispatch(&fx.daemon,req,None){crate::handlers::Reply::Single(v)=>v,_=>panic!("single reply")};
+    let inside_settle=paused.load(Ordering::Acquire);
+    assert_eq!(p1_wait_completion(p1_writer_idle(&s),Duration::ZERO),Err(P1WaitError::CompletionTimeout {event:"writer operation leases released"}),"actual preCR producer remains held until explicit release");
+    assert_eq!(reply["ok"],Value::from(true),"premise: the byte was received: {reply}");
+    assert!(inside_settle,"premise: the human byte was sent while the job's CR was still unwritten");
+    release.send(()).expect("explicit preCR release");
+    p1_wait_completion(p1_writer_idle(&s),P1_GUARD).expect("queue and admitted human byte settled");
+    let mut expect=want.clone();expect.push(b'Z');
+    assert_eq!(recorder.barrier(),expect,"the job's body and CR exactly, then the human byte");
+    assert_eq!(queue_len(&s),0);
+    assert_eq!(events(&fx,"queue.delivered").len(),1);
 }
 
 // ── ★(0.14.56 · P1 D9 pre-CR · design r3 §6-4 W-1) At the CR: a master/CEO queue job carries the pin's CR withhold probe, and
@@ -1609,19 +1596,13 @@ fn d9_pre_cr_t_w3_a_dialog_during_the_settle_withholds_the_cr_with_one_owner() {
 #[test]
 #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
 fn d9_pre_cr_t_w3c_outside_d9_scope_the_queue_job_proof_is_unchanged() {
-    let fx = fx("d9-tw3c");
-    let (s, out) = d9_dialog_seat(&fx, "tw3c", false);
-    let body = "[보고] tw3c";
-    enqueue(&fx, &s, body);
-    assert!(hand_off(&fx, &s), "premise: handed off");
-    // The discriminating assertion first: the hand-off returned after the writer's settlement, so a withhold is already published.
-    assert!(seat_events(&fx, &s, "queue.submit_withheld").is_empty(), "a withhold outside D9 scope");
-    let want = queue_bytes(body);
-    wait_until("every byte", || file_len(&out) >= want.len());
-    std::thread::sleep(Duration::from_millis(300));
-    assert_eq!(std::fs::read(&out).unwrap(), want, "the pin's bytes");
-    wait_until("delivered", || queue_len(&s) == 0);
-    let _ = s.child.lock().unwrap().kill();
+    let fx=fx("d9-tw3c");let mut recorder=p1_dialog_recorder(&fx,"tw3",false);let s=recorder.surface.clone();
+    let body="[보고] tw3c";enqueue(&fx,&s,body);
+    assert!(hand_off(&fx,&s),"premise: handed off");
+    p1_wait_completion(p1_writer_idle(&s),P1_GUARD).expect("outside scope terminal settled");
+    assert!(seat_events(&fx,&s,"queue.submit_withheld").is_empty(),"a withhold outside D9 scope");
+    let want=queue_bytes(body);assert_eq!(recorder.barrier(),want,"the pin's bytes");
+    assert_eq!(queue_len(&s),0);
 }
 
 // ── ★(0.14.56 · P1 D9 pre-CR · design r3 §5-7) Shared helpers for T-W4, whose specimens live beside each daemon-internal
@@ -2022,11 +2003,41 @@ pub(crate) fn p1_start_completion<T>(
 }
 
 /// Only an admitted operation can reach this named completion guard.
-pub(crate) fn p1_wait_completion<T>(
+pub(crate) fn p1_wait_completion<T: Send + 'static>(
     admitted: Result<P1Admitted<T>, P1WaitError>,
     guard: Duration,
 ) -> Result<T, P1WaitError> {
-    let P1Admitted { event, receiver } = admitted?;
+    let P1Admitted { event, mut receiver } = admitted?;
+    let mut guard = guard;
+    let fault = P1_COMPLETION_CONTROL.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        slot.as_mut().filter(|c| !c.consumed && c.event == event && !guard.is_zero()).map(|c| {
+            c.consumed = true; c.fault
+        })
+    });
+    // Fault controls are installed only by the caller-control test. Admission above is real.
+    let mut retained_sender = None;
+    match fault {
+        Some(P1CompletionFault::Delayed) => {
+            let (tx, delayed) = std::sync::mpsc::channel();
+            let relay = std::thread::spawn(move || {
+                let actual = receiver.recv();
+                // Inject delayed delivery of the ACTUAL event, not a successful replacement value.
+                std::thread::sleep(Duration::from_millis(100));
+                if let Ok(value) = actual { let _ = tx.send(value); }
+            });
+            P1_COMPLETION_CONTROL.with(|slot| slot.borrow_mut().as_mut().unwrap().relays.push(relay));
+            receiver = delayed;
+        }
+        Some(P1CompletionFault::Missing) => {
+            let (tx, missing) = std::sync::mpsc::channel();
+            retained_sender = Some(tx); // no disconnect masquerading as the named guard
+            receiver = missing; // deliberately withhold the real producer's completion
+            guard = Duration::ZERO;
+        }
+        None => {}
+    }
+    let _retain_through_wait = retained_sender;
     match receiver.recv_timeout(guard) { // wallclock: guard receipt of the admitted producer's named completion event
         Ok(value) => Ok(value),
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(P1WaitError::CompletionTimeout { event }),
@@ -2428,6 +2439,9 @@ pub(crate) struct P1WriterHold {
 }
 impl P1WriterHold {
     pub(crate) fn release_signal(mut self) -> Result<P1Admitted<()>, P1WaitError> {
+        assert_eq!(p1_wait_completion(p1_writer_idle(&self.surface), Duration::ZERO),
+            Err(P1WaitError::CompletionTimeout { event: "writer operation leases released" }),
+            "retained actual holder must fail at its named completion guard");
         self.release.take().unwrap().send(()).expect("held writer still owns release receiver");
         p1_writer_idle(&self.surface)
     }
@@ -2535,7 +2549,7 @@ struct P1QueueAction<T> {
     completion: std::rc::Rc<std::cell::RefCell<Option<Result<P1Admitted<T>, P1WaitError>>>>,
     worker: std::rc::Rc<std::cell::RefCell<Option<std::thread::JoinHandle<()>>>>,
 }
-impl<T> P1QueueAction<T> {
+impl<T: Send + 'static> P1QueueAction<T> {
     fn finish(self) -> T {
         let admitted = self.completion.borrow_mut().take().unwrap_or_else(|| Err(P1WaitError::Admission {
             event: "queue reservation action completed", reason: "no successful enqueue/reservation callback".into(),
@@ -2592,4 +2606,85 @@ fn p1_dialog_recorder(fx: &Fx, tag: &str, master: bool) -> P1Recorder {
         seat: Arc::downgrade(s), painted: std::sync::atomic::AtomicBool::new(false),
     }));
     recorder
+}
+
+
+struct P1PauseAtSubmit {
+    entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+    paused: Arc<std::sync::atomic::AtomicBool>,
+}
+impl Proof for P1PauseAtSubmit {
+    fn admit(&self) -> Result<(), ProofLoss> { Ok(()) }
+    fn recheck(&self, phase: Phase) -> Result<(), ProofLoss> {
+        if phase == Phase::Submit {
+            if let Some(entered) = self.entered.lock().unwrap().take() {
+                self.paused.store(true, Ordering::Release);
+                let _ = entered.send(());
+                let _ = self.release.lock().unwrap().recv();
+                self.paused.store(false, Ordering::Release);
+            }
+        }
+        Ok(())
+    }
+}
+
+
+#[derive(Clone, Copy, Debug)]
+enum P1CompletionFault { Delayed, Missing }
+struct P1CompletionControl {
+    event: &'static str,
+    fault: P1CompletionFault,
+    consumed: bool,
+    relays: Vec<std::thread::JoinHandle<()>>,
+}
+thread_local! {
+    static P1_COMPLETION_CONTROL: std::cell::RefCell<Option<P1CompletionControl>> = const { std::cell::RefCell::new(None) };
+}
+
+#[test]
+#[cfg_attr(not(unix), ignore = "WC1 real PTY caller controls use POSIX recorder")]
+fn p1_completion_wc1_each_case_delayed_and_missing_actual_receipt() {
+    let cases: &[(&str, fn(), &str)] = &[
+        ("row14", d9_pre_cr_t_l1_a_human_byte_during_the_settle_lands_after_the_cr, "admitted queue body acknowledged before held CR"),
+        ("row18", d9_pre_cr_t_w3c_outside_d9_scope_the_queue_job_proof_is_unchanged, "writer operation leases released"),
+        ("row1", d9_bound_i2_late_busy_undoes_owned_marks_without_refusal, "writer operation leases released"),
+        ("row2", d9_bound_i2_non_master_is_not_idle_gated, "queue reservation action completed"),
+        ("row3", d9_bound_i2_queue_busy_holds_then_first_idle_pass_delivers, "writer operation leases released"),
+        ("row4", d9_bound_i2_slot_lifecycle_and_head_replacement, "writer operation leases released"),
+        ("row5", d9_bound_i2_writer_hold_keeps_queue_alarms_live, "writer operation leases released"),
+        ("row6", d9_bound_i3_busy_holds_do_not_reset_refusals, "writer operation leases released"),
+        ("row7", d9_bound_i3_busy_queue_escalates_once_then_delivers, "writer operation leases released"),
+        ("row8", d9_bound_i3_controller_owned_claim_is_counted_once, "queue reservation action completed"),
+        ("row9", d9_bound_i3_idle_nonwriter_hold_breaks_busy_continuity, "writer operation leases released"),
+        ("row10", d9_bound_i3_late_refusal_does_not_restore_a_replaced_head_slot, "queue reservation action completed"),
+        ("row11", d9_bound_i3_queue_refusals_are_counted_bounded_and_cleared, "writer operation leases released"),
+        ("row12", d9_bound_t_s0_a_write_finished_between_judgment_and_hand_off_refuses_the_claim, "foreign writer operation released"),
+        ("row13", d9_bound_t_s0h_a_human_key_time_between_judgment_and_hand_off_refuses_the_claim, "writer operation leases released"),
+        ("row15", d9_pre_cr_t_w1_a_write_ahead_inside_the_r1_window_refuses_the_claim, "queue reservation action completed"),
+        ("row16", d9_pre_cr_t_w2_a_human_key_inside_the_r1_window_refuses_the_claim, "queue reservation action completed"),
+    ];
+    for &(name, case, event) in cases {
+        for fault in [P1CompletionFault::Delayed, P1CompletionFault::Missing] {
+            P1_COMPLETION_CONTROL.with(|slot| {
+                assert!(slot.borrow().is_none());
+                *slot.borrow_mut() = Some(P1CompletionControl { event, fault, consumed: false, relays: Vec::new() });
+            });
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(case));
+            let control = P1_COMPLETION_CONTROL.with(|slot| slot.borrow_mut().take().unwrap());
+            for relay in control.relays { relay.join().expect("completion relay exits after fixture cleanup"); }
+            assert!(control.consumed, "{name}: actual named receipt was never reached: {event}");
+            match fault {
+                P1CompletionFault::Delayed => assert!(outcome.is_ok(), "{name}: delayed actual completion changed verdict"),
+                P1CompletionFault::Missing => {
+                    let panic = outcome.expect_err("missing actual completion must fail");
+                    let message = panic.downcast_ref::<String>().cloned()
+                        .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
+                    assert!(message.contains("CompletionTimeout") && message.contains(event),
+                        "{name}: missing completion must fail at named guard, got {message}");
+                }
+            }
+            println!("P1-CONTROL {name} {fault:?}: {event}");
+        }
+    }
 }
