@@ -253,6 +253,7 @@ pub fn routable(name: &str) -> bool {
             name,
             "health.alert"
                 | "surface.exited"
+                | "writer.claim_escalated"
                 | "context.threshold"
                 | "queue.starved"
                 | "queue.depth_high"
@@ -548,7 +549,7 @@ pub fn is_discardable(name: &str) -> bool {
 /// 이 이름의 경보는 **에지 1회 발행**이라(재발행 없음) 잃으면 영영 오지 않는다.
 /// 접기 우선순위와 영속 강제(즉시 fsync)의 공통 기준이다.
 pub fn is_one_shot(name: &str) -> bool {
-    matches!(name, "context.threshold" | "surface.exited") || name == GAP_NAME
+    matches!(name, "context.threshold" | "surface.exited" | "writer.claim_escalated") || name == GAP_NAME
 }
 
 impl RouteState {
@@ -842,7 +843,7 @@ impl RouteState {
             // 재생 갭 통지 — 다시 만들어질 수 없는 사실(그 구간은 이미 지나갔다).
             GAP_NAME => 2,
             // 좌석 생애 사실 — 재발행 없음.
-            "surface.exited" => 1,
+            "surface.exited" | "writer.claim_escalated" => 1,
             _ => 0,
         }
     }
@@ -1355,7 +1356,7 @@ fn summary_value_is_machine(k: &str, v: &str) -> bool {
     if k == "in_use" && v == "na" {
         return true;
     }
-    matches!(k, "role" | "agent" | "kind" | "severity" | "where" | "blocked_by") && safe_identity(v)
+    matches!(k, "role" | "agent" | "kind" | "severity" | "where" | "blocked_by" | "producer" | "cause" | "item") && safe_identity(v)
 }
 
 /// ★(0.14.43 · B3) 창 라벨 허용 목록 — `5h`·`7d` 와 일반형 `^[0-9]{1,3}[mhd]$`(숫자 1~3자리 + 단위 m·h·d). 신원 파일이 아니라 데몬 상수 어휘(`5h`·`7d`·`300m`)에서만 오는 값이라
@@ -1450,6 +1451,15 @@ pub fn summarize_payload(name: &str, payload: &Value) -> String {
             let role = identity_field(payload, "role").unwrap_or_else(|| "-".into());
             let agent = identity_field(payload, "agent").unwrap_or_else(|| "-".into());
             Some(format!("role={role} agent={agent}"))
+        }
+        "writer.claim_escalated" => {
+            let producer = identity_field(payload, "producer").unwrap_or_else(|| "-".into());
+            let cause = identity_field(payload, "cause").unwrap_or_else(|| "-".into());
+            let item = identity_field(payload, "item").unwrap_or_else(|| "-".into());
+            let refusals = field(payload, "refusals").unwrap_or_else(|| "?".into());
+            let held = field(payload, "held_secs").unwrap_or_else(|| "?".into());
+            let pending = field(payload, "writer_pending").unwrap_or_else(|| "?".into());
+            Some(format!("producer={producer} cause={cause} item={item} refusals={refusals} held={held}s pending={pending}"))
         }
         "context.threshold" => {
             let role = identity_field(payload, "role").unwrap_or_else(|| "-".into());
@@ -1630,6 +1640,7 @@ fn rate_alert_detail(detail: &Value, legacy: bool) -> String {
 pub fn key_detail(name: &str, payload: &Value) -> Option<String> {
     let raw = match name {
         "health.alert" => field(payload, "rule"),
+        "writer.claim_escalated" => field(payload, "producer"),
         // ★(성찰 A9) `alert.{kind}` 하나가 역할·계정·도구별 여러 사실을 다중화한다(발행부의
         //   리마인드 키가 `key` 다) — 키에 없으면 `rate_limit:master` 뒤에 온 `rate_limit:worker`
         //   가 같은 키로 병합돼 요약을 덮는다. 카디널리티는 역할×계정 수로 유계다.
@@ -6137,10 +6148,27 @@ mod pure_tests {
         }
     }
 
+    #[test]
+    fn d9_bound_i3_writer_escalation_route_preserves_three_producer_keys() {
+        let name="writer.claim_escalated";
+        assert!(routable(name),"writer escalation is routable");assert!(!is_discardable(name));assert!(is_one_shot(name));
+        let mut state=RouteState::default();
+        for producer in ["queue","channel_new","channel_redeliver"] {
+            let payload=json!({"producer":producer,"cause":"claim_refused","item":"qabc.12","refusals":3,"held_secs":0,"writer_pending":1});
+            let key=AlertKey { name:name.into(),surface:Some(7),detail:key_detail(name,&payload) };
+            assert_eq!(RouteState::fold_rank(&key),1);
+            let summary=summarize_payload(name,&payload);
+            assert_eq!(summary,format!("producer={producer} cause=claim_refused item=qabc.12 refusals=3 held=0s pending=1"));
+            assert!(summary_value_is_machine("producer",producer));assert!(summary_value_is_machine("cause","claim_refused"));assert!(summary_value_is_machine("item","qabc.12"));
+            assert!(state.ingest(&key,&summary,HoldReason::NoCso,Now::at(100.0)));
+        }
+        assert_eq!(state.pending.len(),3,"MI14: each producer retains a distinct alert key");
+    }
+
     // 허용 목록 자체가 닫히거나 watchdog 접두 판정이 넓어지는 회귀를 막는다.
     #[test]
     fn routable_names_follow_the_allowlist() {
-        for name in ["health.alert", "surface.exited", "context.threshold", "queue.starved",
+        for name in ["health.alert", "surface.exited", "writer.claim_escalated", "context.threshold", "queue.starved",
             "queue.depth_high", "watchdog.load_high", "watchdog.custom", OVERFLOW_NAME,
             // ★(성찰 A9) 데몬 경보 엔진 5종 — crit 경보의 독자가 CSO 큐다.
             "alert.rate_limit", "alert.account_rate", "alert.weekly_budget",
@@ -7584,7 +7612,7 @@ mod pure_tests {
                 now,
             );
         }
-        for (index, name) in ["context.threshold", "surface.exited", GAP_NAME]
+        for (index, name) in ["context.threshold", "surface.exited", "writer.claim_escalated", GAP_NAME]
             .iter()
             .enumerate()
         {

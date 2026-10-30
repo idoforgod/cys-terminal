@@ -1682,6 +1682,7 @@ fn inject_master_confirmed(
         handoff,
         mark,
         request_id: request_id.clone(),
+        d9: d9.clone(),
     };
     let job = crate::agent_write::AgentJob {
         attempt: None,
@@ -1695,7 +1696,7 @@ fn inject_master_confirmed(
         note_body: true, // the old Inject arm recorded every envelope (owner None)
         body_owner: None,
     };
-    let busy = d9.is_some() && crate::governance::d9_writer_busy(surface, handoff.producer(), &inbox_id.to_string(), true);
+    let busy = d9.is_some() && crate::governance::d9_writer_busy(daemon, surface, handoff.producer(), &inbox_id.to_string(), true);
     let ok = !busy && surface.write_tx.try_send(crate::state::WriteReq::Agent(Box::new(job))).is_ok();
     if !ok {
         surface.inject_track.undo_handoff(mark);
@@ -1738,6 +1739,7 @@ struct ChannelSettle {
     handoff: InboxHandoff,
     mark: crate::state::HandoffMark,
     request_id: String,
+    d9: Option<crate::governance::D9WriterGuard>,
 }
 
 impl ChannelSettle {
@@ -1763,7 +1765,25 @@ impl ChannelSettle {
                     s.inject_track.undo_handoff(self.mark);
                 }
                 let rolled_back = rollback_inbox_handoff(&daemon, self.inbox_id, self.handoff);
-                if first_write_refusal(&daemon, self.inbox_id) {
+                let foreign = self.d9.as_ref().map(|g| g.moved()).unwrap_or_default();
+                // Exhaustive/disjoint partition of zero-byte terminals: moved counters or none.
+                let claim_refusal = !foreign.is_empty();
+                let refusal_n = if claim_refusal {
+                    // Keep ACK/head membership stable through the slot update. A late terminal
+                    // still counts historically, but cannot resurrect an acknowledged row.
+                    let channels = daemon.channels.lock().unwrap_or_else(|e| e.into_inner());
+                    let current = channels.as_ref().map_or(true, |conn| {
+                        let query = match self.handoff {
+                            InboxHandoff::New => "SELECT EXISTS(SELECT 1 FROM inbox WHERE id=?1 AND id=(SELECT id FROM inbox WHERE state='new' ORDER BY id LIMIT 1))",
+                            InboxHandoff::Redeliver { .. } => "SELECT EXISTS(SELECT 1 FROM inbox WHERE id=?1 AND state='injected')",
+                        };
+                        conn.query_row(query, [self.inbox_id], |r| r.get::<_, bool>(0)).unwrap_or(true)
+                    });
+                    self.surface.upgrade().map(|s| crate::governance::d9_note_refusal(&daemon, &s, self.handoff.producer(), &self.inbox_id.to_string(), &foreign, current))
+                } else { None };
+                let publish = if claim_refusal { refusal_n.is_some_and(crate::governance::d9_refusal_event_due) }
+                    else { first_nonclaim_write_refusal(&daemon, self.inbox_id) };
+                if publish {
                     let reason = match t {
                         T::RefusedNoWrite { reason } => reason.clone(),
                         _ => "cancelled".to_string(),
@@ -1772,10 +1792,17 @@ impl ChannelSettle {
                         "channel.message.write_refused",
                         "channel",
                         sid,
-                        json!({"inbox_id": self.inbox_id, "request_id": self.request_id, "reason": reason,
-                               "rolled_back": rolled_back,
-                               "note": "Zero bytes were written to the master for this inbox row; the row is back to its state before \
-                                        the hand-off and the next sweep retries it (this event is published once per row)."}),
+                        {
+                            let mut payload = json!({"inbox_id": self.inbox_id, "request_id": self.request_id, "reason": reason,
+                                "rolled_back": rolled_back,
+                                "note": if claim_refusal {
+                                    "Zero bytes were written; every claim refusal is counted in status and events follow the bounded refusal sequence."
+                                } else {
+                                    "Zero bytes were written to the master for this inbox row; the row is back to its state before the hand-off and the next sweep retries it (this event is published once per row)."
+                                }});
+                            if claim_refusal { payload["foreign"] = json!(foreign); payload["refusal_n"] = json!(refusal_n); }
+                            payload
+                        },
                     );
                 }
             }
@@ -1818,11 +1845,11 @@ fn rollback_inbox_handoff(daemon: &Arc<Daemon>, inbox_id: i64, handoff: InboxHan
     matches!(r, Ok(1))
 }
 
-/// `true` the first time a row's write is refused (per daemon socket; bounded at 256 remembered rows).
-fn first_write_refusal(daemon: &Arc<Daemon>, inbox_id: i64) -> bool {
-    static SEEN: OnceLock<std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, std::collections::HashSet<i64>>>> =
+/// First non-claim zero-byte report only (per socket); retain the original 256-row bound and eviction.
+fn first_nonclaim_write_refusal(daemon: &Arc<Daemon>, inbox_id: i64) -> bool {
+    static NONCLAIM_SEEN: OnceLock<std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, std::collections::HashSet<i64>>>> =
         OnceLock::new();
-    let mut g = SEEN.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = NONCLAIM_SEEN.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
     let set = g.entry(daemon.socket_path.clone()).or_default();
     if set.len() >= 256 {
         set.clear();
@@ -1935,7 +1962,7 @@ fn deliver_new_inbox_with(daemon: &Arc<Daemon>, conn: &Connection) -> InboxDeliv
                 break; // 행은 new — 다음 sweep 에서 재시도(순서 보존).
             }
         };
-        if d9.is_some() && crate::governance::d9_writer_busy(&surface, producer, &inbox_id.to_string(), false) {
+        if d9.is_some() && crate::governance::d9_writer_busy(daemon, &surface, producer, &inbox_id.to_string(), false) {
             out.hold = Some(counted_writer_hold(&surface, producer, &inbox_id.to_string()));
             break;
         }
@@ -2034,7 +2061,7 @@ fn redeliver_unacked(daemon: &Arc<Daemon>, conn: &Connection) -> usize {
             if let Some(s) = daemon.get_surface(sid) { crate::governance::d9_nonwriter_hold(&s, producer); }
             break;
         };
-        if d9.is_some() && crate::governance::d9_writer_busy(&surface, producer, &inbox_id.to_string(), false) { break; }
+        if d9.is_some() && crate::governance::d9_writer_busy(daemon, &surface, producer, &inbox_id.to_string(), false) { break; }
         let text: String = conn
             .query_row("SELECT text FROM inbox WHERE id=?1", [inbox_id], |r| r.get(0))
             .unwrap_or_default();
@@ -4656,6 +4683,118 @@ mod tests {
         h3_done(&m);
     }
 
+    #[cfg(unix)]
+    struct D9H3Stop(Arc<crate::state::Surface>);
+    #[cfg(unix)]
+    impl Drop for D9H3Stop {
+        fn drop(&mut self) { if let Ok(mut child) = self.0.child.lock() { let _ = child.kill(); } }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn d9_bound_i3_claim_and_nonclaim_refusals_have_disjoint_reporting() {
+        let(d,m)=h3_rig("i3-c2");let _cleanup=D9H3Stop(m.clone());let id=h3_seed(&d,"i3-c2",now());
+        let pass=||{let g=d.channels.lock().unwrap();deliver_new_inbox_with(&d,g.as_ref().unwrap())};
+        let refused=||d.bus.tail(1000).into_iter().filter(|e|e["name"]=="channel.message.write_refused").collect::<Vec<_>>();
+        *m.receiver_proof.lock().unwrap()=Some(Arc::new(C6bRefuse));
+        for _ in 0..5 {
+            assert_eq!(pass().delivered,vec![id]);crate::agent_queue_tests::wait_until("nonclaim terminal",||m.write_tx.gate().pending()==0);
+            assert_eq!(refused().len(),1,"nonclaim repeated K sweeps is reported once");
+        }
+        *m.receiver_proof.lock().unwrap()=None;
+        for n in 1..=5 {
+            crate::agent_queue_tests::d9_s0_foreign_write_after_pre_record(&m,b"");
+            assert_eq!(pass().delivered,vec![id]);crate::agent_queue_tests::wait_until("claim terminal",||m.write_tx.gate().pending()==0);
+            let ns:Vec<_>=refused().iter().filter_map(|e|e["payload"]["refusal_n"].as_u64()).collect();
+            let want:Vec<_>=(1..=n.min(3)).collect();
+            assert_eq!(ns,want,"S-C2: retained nonclaim map must not suppress claim events");
+        }
+        let ev:Vec<_>=d.bus.tail(1000).into_iter().filter(|e|e["name"]=="writer.claim_escalated").collect();
+        assert_eq!(ev.len(),1,"S-C2: one escalation");assert_eq!(ev[0]["payload"]["producer"],"channel_new");
+        assert_eq!(crate::agent_queue_tests::d9_status(&d,m.id)["writer_claim"]["refusals_total"]["channel_new"],5);
+        assert_eq!(h3_drain(&d,1),vec![id]);crate::agent_queue_tests::wait_until("written terminal",||m.write_tx.gate().pending()==0);
+        assert!(crate::agent_queue_tests::d9_status(&d,m.id)["writer_claim"]["slots"]["channel_new"].is_null());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn d9_bound_i3_settling_busy_channel_escalates_once() {
+        for redelivery in [false, true] {
+            let(d,m)=h3_rig(if redelivery { "i3-f4-red" } else { "i3-f4-new" });
+            let _cleanup=D9H3Stop(m.clone());let id=h3_seed(&d,"i3-f4",now());
+            let _k=crate::governance::HKnobGuard::set(&[("CYS_WRITER_HOLD_ESCALATE_SECS","1"),("CYS_CHANNEL_REDELIVER_MAX","2")]);
+            if redelivery { let g=d.channels.lock().unwrap();g.as_ref().unwrap().execute("UPDATE inbox SET state='injected',injected_ts=?2 WHERE id=?1",params![id,now()-INBOX_REDELIVER_TTL_SECS-20.0]).unwrap(); }
+            let release=crate::agent_queue_tests::hold_writer(&m);let mark=m.inject_track.note_handoff();
+            assert!(m.write_tx.gate().pending()>0 && master_inject_settling(&m),"F4 fixture is both pending and settling");
+            let escalated=||d.bus.tail(1000).into_iter().filter(|e|e["name"]=="writer.claim_escalated").collect::<Vec<_>>();
+            let t=std::time::Instant::now();
+            while escalated().is_empty() && t.elapsed()<std::time::Duration::from_secs(3) {
+                let g=d.channels.lock().unwrap();
+                if redelivery { assert_eq!(redeliver_unacked(&d,g.as_ref().unwrap()),0); }
+                else { assert!(deliver_new_inbox_with(&d,g.as_ref().unwrap()).delivered.is_empty()); }
+                drop(g);std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let ev=escalated();assert_eq!(ev.len(),1,"S-F4: pending writer must not hide under uncounted cooldown, redelivery={redelivery}");
+            assert_eq!(ev[0]["payload"]["cause"],"not_idle");assert_eq!(ev[0]["payload"]["refusals"],0);
+            assert_eq!(ev[0]["payload"]["producer"],if redelivery { "channel_redeliver" } else { "channel_new" });
+            release.send(()).unwrap();crate::agent_queue_tests::wait_until("idle",||m.write_tx.gate().pending()==0);m.inject_track.undo_handoff(mark);
+            if redelivery { let g=d.channels.lock().unwrap();assert_eq!(redeliver_unacked(&d,g.as_ref().unwrap()),1); }
+            else { assert_eq!(h3_drain(&d,1),vec![id]); }
+            crate::agent_queue_tests::wait_until("written terminal",||m.write_tx.gate().pending()==0);
+            assert_eq!(d.bus.tail(1000).iter().filter(|e|e["name"]=="channel.message.written").count(),1,"S-C3: one completed submission after idle");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn d9_bound_i3_new_and_redelivery_streaks_are_independent() {
+        let(d,m)=h3_rig("i3-f3d");let _cleanup=D9H3Stop(m.clone());let new_id=h3_seed(&d,"new",now());let old_id=h3_seed(&d,"retry",now());
+        let _k=crate::governance::HKnobGuard::set(&[("CYS_CHANNEL_REDELIVER_MAX","2")]);
+        {let g=d.channels.lock().unwrap();g.as_ref().unwrap().execute("UPDATE inbox SET state='injected',injected_ts=?2 WHERE id=?1",params![old_id,now()-INBOX_REDELIVER_TTL_SECS-20.0]).unwrap();}
+        for _ in 0..3 {
+            crate::agent_queue_tests::d9_s0_foreign_write_after_pre_record(&m,b"");
+            {let g=d.channels.lock().unwrap();assert_eq!(deliver_new_inbox_with(&d,g.as_ref().unwrap()).delivered,vec![new_id]);}
+            crate::agent_queue_tests::wait_until("new refused",||m.write_tx.gate().pending()==0);
+            crate::agent_queue_tests::d9_s0_foreign_write_after_pre_record(&m,b"");
+            {let g=d.channels.lock().unwrap();assert_eq!(redeliver_unacked(&d,g.as_ref().unwrap()),1);}
+            crate::agent_queue_tests::wait_until("redelivery refused",||m.write_tx.gate().pending()==0);
+        }
+        let ev:Vec<_>=d.bus.tail(1000).into_iter().filter(|e|e["name"]=="writer.claim_escalated").collect();
+        assert_eq!(ev.len(),2,"S-F3d: two independent producers each escalate at third refusal");
+        let row=crate::agent_queue_tests::d9_status(&d,m.id);
+        assert_eq!(row["writer_claim"]["refusals_total"]["channel_new"],3);assert_eq!(row["writer_claim"]["refusals_total"]["channel_redeliver"],3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn d9_bound_i3_acked_row_does_not_escalate_at_late_terminal() {
+        let(d,m)=h3_rig("i3-ack-race");let _cleanup=D9H3Stop(m.clone());let id=h3_seed(&d,"ack race",now());
+        let pass=||{let g=d.channels.lock().unwrap();deliver_new_inbox_with(&d,g.as_ref().unwrap())};
+        for _ in 0..2 {
+            crate::agent_queue_tests::d9_s0_foreign_write_after_pre_record(&m,b"");
+            assert_eq!(pass().delivered,vec![id]);crate::agent_queue_tests::wait_until("refused",||m.write_tx.gate().pending()==0);
+        }
+        let release=crate::agent_queue_tests::d9_late_hold(&m,Some(b""));assert_eq!(pass().delivered,vec![id]);
+        let acked=call(&d,"ack",json!({"inbox_id":id}),None);assert_eq!(acked["result"]["acked"],json!(true));
+        release.recv_timeout(std::time::Duration::from_secs(10)).expect("late seam").send(()).unwrap();
+        crate::agent_queue_tests::wait_until("late terminal",||m.write_tx.gate().pending()==0);
+        assert_eq!(d.bus.tail(1000).iter().filter(|e|e["name"]=="writer.claim_escalated").count(),0,"acked row must not escalate from a late refusal");
+        let row=crate::agent_queue_tests::d9_status(&d,m.id);
+        assert!(row["writer_claim"]["slots"]["channel_new"].is_null(),"acked row must not regain a slot");
+        assert_eq!(row["writer_claim"]["refusals_total"]["channel_new"],3,"historical terminal still counted");
+        assert_eq!(h3_state(&d,id),"acked");
+    }
+
+    #[test]
+    fn d9_bound_i3_nonclaim_history_keeps_256_eviction() {
+        let d=tmp_daemon("i3-map-bound");
+        for id in 0..255 { assert!(first_nonclaim_write_refusal(&d,id)); }
+        assert!(!first_nonclaim_write_refusal(&d,0),"255 entries retain first key");
+        assert!(first_nonclaim_write_refusal(&d,255));assert!(first_nonclaim_write_refusal(&d,256));
+        assert!(!first_nonclaim_write_refusal(&d,256),"new key retained after 257th distinct key");
+        assert!(first_nonclaim_write_refusal(&d,0),"old keys evicted at exactly the existing 256 bound");
+    }
+
     /// T-S0 / W-6 (D3-BOUND r2 §1.5, F1): a foreign `Data` write admitted after the row's judgment (`master_hold`) and ledger
     /// pre-record and FINISHED before the hand-off. The guard's baseline S0 is read before the judgment, so the claim refuses:
     /// the row goes back to `new` (0 bytes), `channel.message.write_refused` names `guard_aborted`; the next pass delivers it. On
@@ -5102,6 +5241,14 @@ mod d9_writer_guard_tests {
     fn d9_pre_cr_t_w4_channel_envelope_refused_at_claim_writes_nothing() {
         let f = fx("d9-tw4-chan");
         let (s, out) = d9_role_recorder(&f.daemon, &f.dir, "tw4-chan", "master");
+        // The settlement now checks row membership; model the handoff's real injected row.
+        {
+            let channels = f.daemon.channels.lock().unwrap();
+            channels.as_ref().unwrap().execute(
+                "INSERT INTO inbox(id,channel,sender_id,text,state,created_ts) VALUES(7,'slack','U1','tw4','injected',?1)",
+                [now()],
+            ).unwrap();
+        }
         let handed = d9_with_late_write_ahead(&s, || inject_master_confirmed(&f.daemon, &s, "[channel] tw4", 7, InboxHandoff::New, crate::governance::D9WriterGuard::for_target(&f.daemon, &s)));
         assert!(handed.is_some(), "premise: handed off");
         // The discriminating assertion first (a written envelope follows the write ahead at once), then its settlement.

@@ -1917,6 +1917,22 @@ impl CycleClaim {
 pub(crate) struct ClaimStreak {
     pub item: String,
     pub held_since: Option<Instant>,
+    pub held_epoch: Option<f64>,
+    pub refusals: u32,
+    pub first_refusal_at: Option<Instant>,
+    pub first_refusal_epoch: Option<f64>,
+    pub last_foreign: Vec<&'static str>,
+    pub foreign_counts: [u32; 3],
+    pub escalated: bool,
+    pub updated_at: Instant,
+}
+
+impl ClaimStreak {
+    pub(crate) fn new(item: &str, now: Instant) -> Self {
+        Self { item: item.to_owned(), held_since: None, held_epoch: None, refusals: 0,
+            first_refusal_at: None, first_refusal_epoch: None, last_foreign: Vec::new(),
+            foreign_counts: [0; 3], escalated: false, updated_at: now }
+    }
 }
 
 pub struct Surface {
@@ -2100,6 +2116,7 @@ pub struct Surface {
     /// (경보는 쿨다운·임계가 있어 매 틱 사유를 말해 주지 않는다 — 이 필드가 상시 사실이다).
     pub queue_blocked: Mutex<Option<(String, f64)>>,
     pub(crate) writer_holds: AtomicU64,
+    pub(crate) claim_refusals_total: [AtomicU64; 3],
     pub(crate) claim_streaks: Mutex<[Option<ClaimStreak>; 3]>,
     /// T3-14 단조 라인 커서: scrollback FIFO와 무관하게 증가하는 누적 완성 라인 수
     pub line_count: AtomicU64,
@@ -7291,6 +7308,7 @@ impl Daemon {
             return_tickets: Mutex::new(HashMap::new()),
             queue_blocked: Mutex::new(None),
             writer_holds: AtomicU64::new(0),
+            claim_refusals_total: std::array::from_fn(|_| AtomicU64::new(0)),
             claim_streaks: Mutex::new([None, None, None]),
             line_count: AtomicU64::new(0),
             queue_paused_until: Mutex::new(None),

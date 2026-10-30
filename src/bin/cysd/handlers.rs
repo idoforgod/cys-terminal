@@ -10781,10 +10781,12 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
             let surfaces = daemon.surfaces.lock().unwrap();
             // ★(0.14.43 · C5) 막힌 좌석(이 순회에서 사유를 읽은 좌석)의 조치 코드는 `surfaces` 가드를 **놓은 뒤** 계산한다 — 진단이 파서·어댑터를
             //   읽기 때문이다(좌석 맵 락을 쥔 채 파서 락을 잡지 않는다).
+            let mut writer_todo = Vec::new();
             let mut remedy_todo: Vec<(Arc<crate::state::Surface>, String)> = Vec::new();
             let mut list: Vec<Value> = surfaces
                 .values()
                 .map(|s| {
+                    writer_todo.push(s.clone());
                     let live_cwd = live.get(&s.pid).cloned();
                     // ★(0.14.43 · C5) 큐 막힘 사유·시작 시각 — 큐가 비면 막힘이 아니다(낡은 사유 기록은 싣지 않는다 · null).
                     //   (두 락을 겹쳐 쥐지 않는다 — `queue_blocked` 는 복제 뒤 놓고 `pending_queue` 는 그다음 순간만.)
@@ -10892,6 +10894,7 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
                         "queue_depth": s.pending_queue.lock().unwrap().len(),
                         "queue_paused": queue_paused,
                         // ★(0.14.43 · C5) 가산 키 3개(막힘 없으면 null) — 조치 코드는 아래 `remedy_todo` 가 가드 해제 뒤 채운다.
+                        "writer_claim": Value::Null,
                         "queue_blocked_by": queue_blocked.as_ref().map(|(why, _)| why.clone()),
                         "queue_blocked_since": queue_blocked.as_ref().map(|(_, at)| *at),
                         "queue_remedy_code": paused_code.map_or(Value::Null, |c| json!(c)),
@@ -10980,6 +10983,13 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
                 })
                 .collect();
             drop(surfaces);
+            // d9_scope reads roles: never nest that lookup under the surfaces map lock.
+            for s in writer_todo {
+                let snapshot = crate::governance::d9_writer_status(daemon, &s);
+                if let Some(row) = list.iter_mut().find(|v| v["surface_id"].as_u64() == Some(s.id)) {
+                    row["writer_claim"] = snapshot;
+                }
+            }
             list.sort_by_key(|v| v["surface_id"].as_u64().unwrap_or(0));
             // ★(0.14.43 · C5) 막힌 좌석의 조치 코드 — 좌석 맵 락을 놓은 뒤 좌석당 진단 1회(파서 읽기 포함 · 큐 락 없음).
             for (s, why) in &remedy_todo {

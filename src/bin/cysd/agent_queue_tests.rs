@@ -1814,11 +1814,13 @@ fn d9_bound_i2_channel_hold_does_not_steal_queue_attribution() {
     let release = Arc::new(Mutex::new(None));
     {
         let s = s.clone(); let release = release.clone();
+        let daemon_for_race = fx.daemon.clone();
         crate::agent_write::set_test_after_pre_record(move |_| {
             *release.lock().unwrap() = Some(hold_writer(&s));
             let sc = s.clone();
+            let dc = daemon_for_race.clone();
             std::thread::spawn(move || {
-                assert!(crate::governance::d9_writer_busy(&sc, crate::governance::ClaimProducer::ChannelNew, "channel-race", false));
+                assert!(crate::governance::d9_writer_busy(&dc, &sc, crate::governance::ClaimProducer::ChannelNew, "channel-race", false));
             }).join().unwrap();
             // The helper's second frame gate refuses on this actual pause; its prior reason is still true.
             *s.queue_paused_until.lock().unwrap() = Some(Instant::now() + Duration::from_secs(30));
@@ -1864,13 +1866,13 @@ fn d9_bound_i2_slot_lifecycle_and_head_replacement() {
     let first = enqueue(&fx, &s, "first");
     let release = hold_writer(&s);
     for p in [P::Queue, P::ChannelNew, P::ChannelRedeliver] {
-        assert!(d9_writer_busy(&s, p, &first, false));
+        assert!(d9_writer_busy(&fx.daemon, &s, p, &first, false));
     }
     d9_nonwriter_hold(&s, P::Queue);
     assert!(d9_hold_age(&s, P::Queue, &first).is_some(), "busy non-writer hold keeps held_since");
     release.send(()).unwrap();
     wait_until("idle", || s.write_tx.gate().pending() == 0);
-    assert!(!d9_writer_busy(&s, P::Queue, &first, false));
+    assert!(!d9_writer_busy(&fx.daemon, &s, P::Queue, &first, false));
     assert!(d9_hold_age(&s, P::Queue, &first).is_some(), "MI11: passing early idle clears nothing");
     d9_nonwriter_hold(&s, P::ChannelNew);
     assert!(d9_hold_age(&s, P::ChannelNew, &first).is_none(), "idle non-writer hold clears held_since");
@@ -1886,4 +1888,131 @@ fn d9_bound_i2_slot_lifecycle_and_head_replacement() {
     *s.queue_paused_until.lock().unwrap() = Some(Instant::now() + Duration::from_secs(30));
     crate::governance::h_queue_tick(&fx.daemon);
     assert!(s.claim_streaks.lock().unwrap()[0].is_none(), "head changed behind non-writer gate clears old slot");
+}
+
+pub(crate) fn d9_status(daemon: &Arc<Daemon>, sid: u64) -> Value {
+    let req = cys::Request { id: Value::from(1), method: "org.status".into(), params: serde_json::json!({}) };
+    let crate::handlers::Reply::Single(v) = crate::handlers::dispatch(daemon, req, None) else { panic!("single status reply") };
+    v["result"]["surfaces"].as_array().expect("status surfaces").iter().find(|x| x["surface_id"] == sid).expect("status seat").clone()
+}
+
+fn d9_refuse_queue_once(fx: &Fx, s: &Arc<Surface>) {
+    let sc = s.clone();
+    crate::agent_write::set_test_after_pre_record(move |_| { sc.input_gen.fetch_add(1, Ordering::AcqRel); });
+    assert!(!hand_off(fx, s), "claim refuses injected foreign input");
+    wait_until("refusal terminal", || s.write_tx.gate().pending() == 0);
+}
+
+#[test]
+#[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+fn d9_bound_i3_queue_refusals_are_counted_bounded_and_cleared() {
+    let fx = fx("i3-q2"); let (s, out) = d9_master_recorder(&fx, "i3-q2");
+    enqueue(&fx, &s, "i3-q2");
+    for n in 1..=13 {
+        d9_refuse_queue_once(&fx, &s);
+        assert_eq!(events(&fx, "writer.claim_escalated").len(), usize::from(n >= 3), "S-Q2: escalation edge at N=3, attempt {n}");
+    }
+    let ns: Vec<_> = aborted(&fx, &s).iter().map(|e| e["payload"]["refusal_n"].as_u64().unwrap_or(0)).collect();
+    assert_eq!(ns, vec![1,2,3,6,12], "S-Q2: bounded refusal event sequence");
+    let row = d9_status(&fx.daemon, s.id);
+    assert_eq!(row["writer_claim"]["refusals_total"]["queue"], 13, "S-Q2: every refusal counted");
+    assert_eq!(row["writer_claim"]["slots"]["queue"]["refusals"], 13);
+    assert_eq!(row["writer_claim"]["slots"]["queue"]["last_foreign"], serde_json::json!(["input_gen"]));
+    assert!(std::fs::read(&out).unwrap().is_empty());
+    let observed = Instant::now();
+    while observed.elapsed() < Duration::from_millis(1100) { let _ = d9_status(&fx.daemon, s.id); std::thread::sleep(Duration::from_millis(20)); }
+    assert!(d9_status(&fx.daemon,s.id)["writer_claim"]["slots"]["queue"]["age_secs"].as_u64().unwrap_or(0)>=1,"status reads do not refresh the streak age");
+    assert!(hand_off(&fx, &s), "S-Q2: delivered after fault removed");
+    wait_until("delivered", || queue_len(&s)==0);
+    let row = d9_status(&fx.daemon, s.id);
+    assert!(row["writer_claim"]["slots"]["queue"].is_null(), "S-Q2: delivery clears slot");
+    assert_eq!(row["writer_claim"]["refusals_total"]["queue"],13);
+}
+
+#[test]
+#[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+fn d9_bound_i3_busy_holds_do_not_reset_refusals() {
+    let fx=fx("i3-q2b");let(s,_)=d9_master_recorder(&fx,"i3-q2b");enqueue(&fx,&s,"i3-q2b");
+    for _ in 0..3 {
+        d9_refuse_queue_once(&fx,&s);
+        let release=hold_writer(&s);assert!(!hand_off(&fx,&s));release.send(()).unwrap();
+        wait_until("idle",||s.write_tx.gate().pending()==0);
+    }
+    assert_eq!(events(&fx,"writer.claim_escalated").len(),1,"S-Q2b: hold preserves the refusal streak");
+    assert_eq!(d9_status(&fx.daemon,s.id)["writer_claim"]["slots"]["queue"]["refusals"],3);
+}
+
+#[test]
+#[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+fn d9_bound_i3_busy_queue_escalates_once_then_delivers() {
+    let fx=fx("i3-q3");let(s,_)=d9_master_recorder(&fx,"i3-q3");enqueue(&fx,&s,"i3-q3");
+    let _knob=crate::governance::HKnobGuard::set(&[("CYS_WRITER_HOLD_ESCALATE_SECS","1")]);
+    let release=hold_writer(&s);let started=Instant::now();
+    while events(&fx,"writer.claim_escalated").is_empty() && started.elapsed()<Duration::from_secs(3) {
+        assert!(!hand_off(&fx,&s));std::thread::sleep(Duration::from_millis(20));
+    }
+    let ev=events(&fx,"writer.claim_escalated");
+    assert_eq!(ev.len(),1,"S-Q3: continuous busy escalates without resetting its clock");
+    assert_eq!(ev[0]["payload"]["cause"],"not_idle");assert_eq!(ev[0]["payload"]["refusals"],0);
+    for _ in 0..3 { assert!(!hand_off(&fx,&s)); }
+    assert_eq!(events(&fx,"writer.claim_escalated").len(),1,"S-Q3: one event per streak");
+    release.send(()).unwrap();wait_until("idle",||s.write_tx.gate().pending()==0);
+    assert!(hand_off(&fx,&s),"S-Q3: first idle attempt delivers");
+}
+
+#[test]
+#[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+fn d9_bound_i3_idle_nonwriter_hold_breaks_busy_continuity() {
+    let fx=fx("i3-f3a");let(s,_)=d9_master_recorder(&fx,"i3-f3a");enqueue(&fx,&s,"i3-f3a");
+    let _knob=crate::governance::HKnobGuard::set(&[("CYS_WRITER_HOLD_ESCALATE_SECS","1")]);
+    let release=hold_writer(&s);assert!(!hand_off(&fx,&s));release.send(()).unwrap();wait_until("idle",||s.write_tx.gate().pending()==0);
+    *s.queue_paused_until.lock().unwrap()=Some(Instant::now()+Duration::from_secs(20));
+    crate::governance::h_queue_tick(&fx.daemon);
+    std::thread::sleep(Duration::from_millis(1100));
+    *s.queue_paused_until.lock().unwrap()=None;
+    let release=hold_writer(&s);assert!(!hand_off(&fx,&s));
+    assert!(events(&fx,"writer.claim_escalated").is_empty(),"S-F3a: idle non-writer interval must not count as continuously busy");
+    release.send(()).unwrap();
+}
+
+#[test]
+#[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+fn d9_bound_i3_controller_owned_claim_is_counted_once() {
+    let fx=fx("i3-controller");let(s,_)=d9_master_recorder(&fx,"i3-controller");enqueue(&fx,&s,"i3-controller");
+    // Synthetic API ownership control: the current tree has no production defer_to_controller caller.
+    let release=d9_late_hold(&s,None);let sc=s.clone();
+    let owner=std::thread::spawn(move || {
+        wait_until("reservation",||sc.inject_reserved());
+        let guard=sc.inject_reservation.lock().unwrap().as_ref().unwrap().guard.clone();
+        let(wake,_rx)=crate::state::controller_wake_channel();guard.defer_to_controller(wake).unwrap();
+        sc.input_gen.fetch_add(1,Ordering::AcqRel);
+        release.recv_timeout(Duration::from_secs(10)).expect("late seam").send(()).unwrap();
+    });
+    let _=hand_off(&fx,&s);owner.join().unwrap();wait_until("controller terminal",||s.write_tx.gate().pending()==0);
+    assert_eq!(d9_status(&fx.daemon,s.id)["writer_claim"]["refusals_total"]["queue"],1,"controller claim refusal counted exactly once");
+    assert_eq!(hold_kind(&s),Some(QueueHoldKind::Refused),"controller disposition/backoff unchanged");
+}
+
+#[test]
+fn d9_bound_i3_status_key_present_and_null_outside_scope() {
+    let fx=fx("i3-status-scope");let s=seat(&fx);let row=d9_status(&fx.daemon,s.id);
+    assert!(row.as_object().unwrap().contains_key("writer_claim"),"writer_claim is an explicit additive status key");
+    assert!(row["writer_claim"].is_null(),"outside D9 scope stays null");
+}
+
+#[test]
+#[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+fn d9_bound_i3_late_refusal_does_not_restore_a_replaced_head_slot() {
+    let fx=fx("i3-head-race");let(s,_)=d9_master_recorder(&fx,"i3-head-race");enqueue(&fx,&s,"old head");
+    let next=fx.daemon.next_queue_entry("[RESUME] new head".into(),None,"test");
+    let release=d9_late_hold(&s,Some(b"T"));let sc=s.clone();
+    let inserter=std::thread::spawn(move || {
+        wait_until("reservation",||sc.inject_reserved());
+        sc.pending_queue.lock().unwrap().push_front(next);
+        release.recv_timeout(Duration::from_secs(10)).expect("late seam").send(()).unwrap();
+    });
+    let _=hand_off(&fx,&s);inserter.join().unwrap();wait_until("terminal",||s.write_tx.gate().pending()==0);
+    let row=d9_status(&fx.daemon,s.id);
+    assert!(row["writer_claim"]["slots"]["queue"].is_null(),"late refusal must not recreate a slot for the former head");
+    assert_eq!(row["writer_claim"]["refusals_total"]["queue"],1,"historical refusal still counted");
 }

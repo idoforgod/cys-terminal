@@ -10048,7 +10048,8 @@ fn rollback_aborted_inject(
     } else {
         "guard_aborted(승인·관문 대기 또는 결판 마감 — 판정 재료가 더는 유효하지 않다)"
     };
-    daemon.bus.publish(
+    let refusal_n = (!foreign.is_empty()).then(|| d9_note_refusal(daemon, s, ClaimProducer::Queue, &delivered.entry.id, &foreign, true));
+    if refusal_n.is_none_or(d9_refusal_event_due) { daemon.bus.publish(
         "queue.inject_aborted",
         "queue",
         Some(s.id),
@@ -10067,10 +10068,12 @@ fn rollback_aborted_inject(
             // ★(0.14.56 · P1 D9 pre-CR) which counters the master/CEO claim check saw move; absent otherwise (other payloads unchanged).
             if !foreign.is_empty() {
                 p["foreign"] = json!(foreign);
+                p["refusal_n"] = json!(refusal_n);
             }
             p
         },
     );
+    }
     daemon.persist_queue_state();
 }
 
@@ -10149,6 +10152,7 @@ fn queue_write_settle(
 /// run carries the stamp of the original hand-off, never a new one.
 #[derive(Clone)]
 struct HandoffStamp {
+    claim: Option<Arc<D9Claim>>,
     request: Arc<crate::agent_write::Request>,
     /// The original immutable receiver proof; partial bytes never borrow a successor's authority.
     proof: Arc<dyn crate::agent_write::Proof>,
@@ -10162,6 +10166,7 @@ struct HandoffStamp {
 impl HandoffStamp {
     fn of(s: &crate::state::Surface, request: Arc<crate::agent_write::Request>, proof: Arc<dyn crate::agent_write::Proof>, reservation_guard: Option<Arc<crate::state::InjectGuard>>) -> HandoffStamp {
         HandoffStamp {
+            claim: None,
             request,
             proof,
             reservation_guard,
@@ -10231,11 +10236,13 @@ fn d9_claim_probe(s: &Arc<crate::state::Surface>, claim: Arc<D9Claim>, inner: cr
 /// ★(0.14.56 · P1 D9 pre-CR · design r3 §5-7) The claim check of a daemon-internal one-job writer into a master/CEO seat:
 /// W-5 `handlers::deliver_to_ceo`, W-6 `channels::inject_master_confirmed`, W-7 `boot_supervisor::pane_notice_line`,
 /// W-8 `schedule::inject_on`. Those writers hand off with no seat probe and no judged frame, so the guard carries only the
-/// §6-2 three-counter test against a stamp taken at the hand-off (no output-generation expectation, no approval axis). A
+/// §6-2 three-counter test against S0 taken before the judgment (no output-generation expectation, no approval axis). A
 /// refusal writes 0 bytes and ends the job `guard_aborted`, which each producer already settles as zero bytes. Their CR
 /// behaviour stays the pin's (no §6-4 withhold here: residue R-16). Outside D9 scope there is no guard (the pin).
+#[derive(Clone)]
 pub(crate) struct D9WriterGuard {
     guard: Arc<crate::state::InjectGuard>,
+    claim: Arc<D9Claim>,
 }
 
 impl D9WriterGuard {
@@ -10251,8 +10258,9 @@ impl D9WriterGuard {
         let _ = claim.base.set(d9_snapshot(s));
         let probe = d9_claim_probe(s, claim.clone(), Arc::new(|| false));
         let guard = Arc::new(crate::state::InjectGuard::new(None, s.output_gen.clone(), false, Some(probe)));
-        Some(Self { guard })
+        Some(Self { guard, claim })
     }
+    pub(crate) fn moved(&self) -> Vec<&'static str> { self.claim.moved() }
     /// The job's guard.
     pub(crate) fn guard(&self) -> Arc<crate::state::InjectGuard> {
         self.guard.clone()
@@ -10273,6 +10281,10 @@ impl ClaimProducer {
     pub(crate) fn index(self) -> usize {
         match self { Self::Queue => 0, Self::ChannelNew => 1, Self::ChannelRedeliver => 2 }
     }
+    pub(crate) fn name(self) -> &'static str {
+        match self { Self::Queue => "queue", Self::ChannelNew => "channel_new", Self::ChannelRedeliver => "channel_redeliver" }
+    }
+
 }
 
 pub(crate) fn d9_keep_item(s: &crate::state::Surface, producer: ClaimProducer, item: Option<&str>) {
@@ -10288,9 +10300,11 @@ pub(crate) fn d9_clear_item(s: &crate::state::Surface, producer: ClaimProducer, 
 }
 
 pub(crate) fn d9_nonwriter_hold(s: &crate::state::Surface, producer: ClaimProducer) {
-    if s.write_tx.gate().pending() == 0 {
-        let mut slots = s.claim_streaks.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(slot) = &mut slots[producer.index()] { slot.held_since = None; }
+    let idle = s.write_tx.gate().pending() == 0;
+    let mut slots = s.claim_streaks.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(slot) = &mut slots[producer.index()] {
+        if idle { slot.held_since = None; slot.held_epoch = None; }
+        slot.updated_at = std::time::Instant::now();
     }
 }
 
@@ -10298,7 +10312,7 @@ pub(crate) fn d9_terminal(s: &crate::state::Surface, producer: ClaimProducer, it
     if wrote { d9_clear_item(s, producer, item); return; }
     let mut slots = s.claim_streaks.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(slot) = &mut slots[producer.index()] {
-        if slot.item == item { slot.held_since = None; }
+        if slot.item == item { slot.held_since = None; slot.held_epoch = None; slot.updated_at = std::time::Instant::now(); }
     }
 }
 
@@ -10308,20 +10322,114 @@ pub(crate) fn d9_hold_age(s: &crate::state::Surface, producer: ClaimProducer, it
 }
 
 /// Called only with a D9 claim. A successful early observation clears nothing: only a terminal or idle non-writer hold does.
-pub(crate) fn d9_writer_busy(s: &crate::state::Surface, producer: ClaimProducer, item: &str, late: bool) -> bool {
-    if s.write_tx.gate().pending() == 0 {
+pub(crate) fn d9_writer_busy(daemon: &Daemon, s: &crate::state::Surface, producer: ClaimProducer, item: &str, late: bool) -> bool {
+    let pending = s.write_tx.gate().pending();
+    if pending == 0 {
         if late { crate::agent_write::test_after_writer_idle(); }
         return false;
     }
     s.writer_holds.fetch_add(1, Ordering::Relaxed);
     let now = std::time::Instant::now();
-    let mut slots = s.claim_streaks.lock().unwrap_or_else(|e| e.into_inner());
-    let slot = &mut slots[producer.index()];
-    if slot.as_ref().is_none_or(|x| x.item != item) {
-        *slot = Some(crate::state::ClaimStreak { item: item.to_owned(), held_since: None });
-    }
-    slot.as_mut().expect("slot installed").held_since.get_or_insert(now);
+    let epoch = now_epoch();
+    let event = {
+        let mut slots = s.claim_streaks.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = &mut slots[producer.index()];
+        if slot.as_ref().is_none_or(|x| x.item != item) {
+            *slot = Some(crate::state::ClaimStreak::new(item, now));
+        }
+        let slot = slot.as_mut().expect("slot installed");
+        slot.held_since.get_or_insert(now);
+        slot.held_epoch.get_or_insert(epoch);
+        slot.updated_at = now;
+        d9_escalation(s.id, producer, slot, pending, now)
+    };
+    if let Some(event) = event { daemon.bus.publish("writer.claim_escalated", "writer", Some(s.id), event); }
     true
+}
+
+fn d9_refusal_threshold() -> u32 {
+    h_knob("CYS_CLAIM_REFUSE_ESCALATE_N").and_then(|x| x.parse::<u32>().ok()).unwrap_or(3).max(1)
+}
+
+fn d9_hold_threshold() -> std::time::Duration {
+    std::time::Duration::from_secs(h_knob("CYS_WRITER_HOLD_ESCALATE_SECS").and_then(|x| x.parse::<u64>().ok()).unwrap_or(60).max(1))
+}
+
+pub(crate) fn d9_refusal_event_due(n: u32) -> bool {
+    let threshold = d9_refusal_threshold();
+    n > 0 && (n <= threshold || (n % threshold == 0 && (n / threshold).is_power_of_two()))
+}
+
+/// Updates only the leaf record. Its caller publishes the owned payload AFTER releasing the mutex.
+fn d9_escalation(sid: u64, producer: ClaimProducer, slot: &mut crate::state::ClaimStreak, pending: usize, now: std::time::Instant) -> Option<Value> {
+    if slot.escalated { return None; }
+    let held = slot.held_since.map(|t| now.saturating_duration_since(t));
+    let cause = if slot.refusals >= d9_refusal_threshold() { "claim_refused" }
+        else if held.is_some_and(|t| t >= d9_hold_threshold()) { "not_idle" }
+        else { return None; };
+    slot.escalated = true;
+    Some(json!({"surface_ref":cys::surface_ref(sid), "producer":producer.name(), "item":slot.item,
+        "cause":cause, "refusals":slot.refusals, "held_secs":held.map_or(0, |t| t.as_secs()),
+        "since":slot.first_refusal_epoch.or(slot.held_epoch), "last_foreign":slot.last_foreign,
+        "foreign_counts":{"wrote":slot.foreign_counts[0],"input_gen":slot.foreign_counts[1],"last_human_input":slot.foreign_counts[2]},
+        "writer_pending":pending,
+        "hint":"0 bytes were written in the refused or held attempt; retry remains subject to the existing gates. Nothing writes anyway. Read the screen and moved counters."}))
+}
+
+/// Return the active streak count; zero means no current-head streak or saturation. Lifetime totals still count.
+pub(crate) fn d9_note_refusal(daemon: &Daemon, s: &crate::state::Surface, producer: ClaimProducer, item: &str, foreign: &[&'static str], producer_current: bool) -> u32 {
+    if foreign.is_empty() { return 0; }
+    let pending = s.write_tx.gate().pending();
+    let now = std::time::Instant::now();
+    let epoch = now_epoch();
+    // Ownership cleanup has completed. Keep the current head stable while updating its slot;
+    // a late terminal may count historically but must not resurrect the former head's streak.
+    let queue = matches!(producer, ClaimProducer::Queue).then(|| s.pending_queue.lock().unwrap_or_else(|e| e.into_inner()));
+    let current_head = queue.as_ref().and_then(|q| q.front()).map(|e| e.id.as_str());
+    let head_matches = producer_current && (queue.is_none() || current_head == Some(item));
+    let (n, event) = {
+        let mut slots = s.claim_streaks.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = &mut slots[producer.index()];
+        let _ = s.claim_refusals_total[producer.index()].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_add(1)));
+        if !head_matches {
+            if slot.as_ref().is_some_and(|x| if queue.is_some() { Some(x.item.as_str()) != current_head } else { x.item == item }) { *slot = None; }
+            (0, None) // no active streak; lifetime telemetry still counted this refusal
+        } else {
+        if slot.as_ref().is_none_or(|x| x.item != item) { *slot = Some(crate::state::ClaimStreak::new(item, now)); }
+        let slot = slot.as_mut().expect("slot installed");
+        slot.held_since = None; slot.held_epoch = None;
+        let previous = slot.refusals;
+        slot.refusals = slot.refusals.saturating_add(1);
+        if slot.first_refusal_at.is_none() { slot.first_refusal_at = Some(now); slot.first_refusal_epoch = Some(epoch); }
+        slot.last_foreign = foreign.to_vec();
+        for name in foreign {
+            let index = match *name { "wrote" => Some(0), "input_gen" => Some(1), "last_human_input" => Some(2), _ => None };
+            if let Some(i) = index { slot.foreign_counts[i] = slot.foreign_counts[i].saturating_add(1); }
+        }
+        slot.updated_at = now;
+        let n = if slot.refusals == previous { 0 } else { slot.refusals };
+        (n, d9_escalation(s.id, producer, slot, pending, now))
+        }
+    };
+    drop(queue);
+    if let Some(event) = event { daemon.bus.publish("writer.claim_escalated", "writer", Some(s.id), event); }
+    n
+}
+
+pub(crate) fn d9_writer_status(daemon: &Daemon, s: &Arc<crate::state::Surface>) -> Value {
+    if !d9_scope(daemon, s, false) { return Value::Null; }
+    let pending = s.write_tx.gate().pending();
+    let now = std::time::Instant::now();
+    let slots = s.claim_streaks.lock().unwrap_or_else(|e| e.into_inner());
+    let mut histories = serde_json::Map::new();
+    let mut totals = serde_json::Map::new();
+    for producer in [ClaimProducer::Queue, ClaimProducer::ChannelNew, ClaimProducer::ChannelRedeliver] {
+        totals.insert(producer.name().into(), json!(s.claim_refusals_total[producer.index()].load(Ordering::Relaxed)));
+        histories.insert(producer.name().into(), slots[producer.index()].as_ref().map_or(Value::Null, |x| json!({
+            "item":x.item,"refusals":x.refusals,"held_secs":x.held_since.map_or(0,|t|now.saturating_duration_since(t).as_secs()),
+            "age_secs":now.saturating_duration_since(x.updated_at).as_secs(),"last_foreign":x.last_foreign,"escalated":x.escalated})));
+    }
+    json!({"pending":pending,"holds_total":s.writer_holds.load(Ordering::Relaxed),"refusals_total":totals,"slots":histories})
 }
 
 /// ★(0.14.52 · S-a C7b) The resume material of a PartialExact queue hold (`QueueHold::resume`): what the SAME request
@@ -10482,12 +10590,14 @@ fn settle_queue_write(
                 });
                 (live.to_vec(), disposed.to_vec(), attempts == 1)
             }) else { return };
-            if first {
+            let foreign = stamp.claim.as_ref().map(|c| c.moved()).unwrap_or_default();
+            let refusal_n = (!foreign.is_empty()).then(|| d9_note_refusal(daemon, s, ClaimProducer::Queue, &d.entry.id, &foreign, true));
+            if refusal_n.map_or(first, d9_refusal_event_due) {
                 daemon.bus.publish(
                     "queue.inject_aborted",
                     "queue",
                     Some(sid),
-                    json!({
+                    { let mut payload = json!({
                         "surface_ref": cys::surface_ref(sid),
                         "queue_entry_id": d.entry.id,
                         "merged_ids": d.merged_ids,
@@ -10495,8 +10605,11 @@ fn settle_queue_write(
                         "disposed_ids": disposed,
                         "why": format!("receiver_refused({reason})"),
                         "request_id": request_id,
-                        "hint": "주입 0 · 항목은 큐에 그대로 있다 — 1·2·4·8·30초 간격으로 다시 시도한다(같은 사유의 재시도는 이 알림을 다시 내지 않는다)",
-                    }),
+                        "hint": if refusal_n.is_some() { "주입 0 · 거부는 누적하며 알림은 정해진 횟수에만 낸다 · 기존 재시도 간격은 유지한다" }
+                            else { "주입 0 · 항목은 큐에 그대로 있다 — 1·2·4·8·30초 간격으로 다시 시도한다(같은 사유의 재시도는 이 알림을 다시 내지 않는다)" },
+                    });
+                    if let Some(n) = refusal_n { payload["foreign"] = json!(foreign); payload["refusal_n"] = json!(n); }
+                    payload },
                 );
             }
             daemon.persist_queue_state();
@@ -11333,7 +11446,7 @@ pub(crate) fn deliver_head_locked(
                 Err(why) => { mark_queue_blocked(s, why); break 'tx None; }
             }
         } else { None };
-        if d9_claim.is_some() && d9_writer_busy(s, ClaimProducer::Queue, &entry.id, false) {
+        if d9_claim.is_some() && d9_writer_busy(daemon, s, ClaimProducer::Queue, &entry.id, false) {
             if let Some(reason) = hold_reason.as_deref_mut() { *reason = Some(BLOCKED_WRITER_ACTIVE); }
             mark_queue_blocked(s, BLOCKED_WRITER_ACTIVE);
             break 'tx None;
@@ -11556,7 +11669,8 @@ pub(crate) fn deliver_head_locked(
             }),
             None => s.agent_proof(),
         };
-        let stamp = HandoffStamp::of(s, request.clone(), proof, guard.clone());
+        let mut stamp = HandoffStamp::of(s, request.clone(), proof, guard.clone());
+        stamp.claim = d9_claim.clone();
         // ★(0.14.56 · P1 D9 pre-CR · D3-BOUND r2 §1.2) the claim baseline = S0, adjusted by the queue's ONE own mark between S0
         //   and `try_send`: `set_pending_input(0)` above adds exactly 1 to `input_gen`. Set before the job can be claimed.
         if let (Some(c), Some((gen, wrote, human_at))) = (&d9_claim, d9_s0) {
@@ -11574,7 +11688,7 @@ pub(crate) fn deliver_head_locked(
             note_body: true,
             body_owner: None,
         };
-        let writer_busy = d9_claim.is_some() && d9_writer_busy(s, ClaimProducer::Queue, &d.entry.id, true);
+        let writer_busy = d9_claim.is_some() && d9_writer_busy(daemon, s, ClaimProducer::Queue, &d.entry.id, true);
         if writer_busy || s.write_tx.try_send(crate::state::WriteReq::Agent(Box::new(job))).is_err() {
             if writer_busy {
                 if let Some(reason) = hold_reason.as_deref_mut() { *reason = Some(BLOCKED_WRITER_ACTIVE); }
@@ -32948,8 +33062,9 @@ mod h_machine_hold_tests {
     /// ★(0.14.56 · D3-BOUND I1) 65 → **70**: class C +5 recorder-seat S0 specimens (`d9_bound_t_s0*` - queue T-S0, T-S0h, W-5, W-7,
     /// W-8; the W-6 one lives with the `#[cfg(unix)]` H3 channel rig). Renamed `_of_70` (the CI comment in windows-health.yml too).
     /// D3-BOUND I2: 70 -> 75, five additional POSIX recorder specimens; channel rig cases remain cfg(unix).
+    /// D3-BOUND I3: 75 -> 81, six recorder-seat escalation/status/ownership specimens.
     #[test]
-    fn r2f_dm_windows_ignore_attributes_are_exactly_the_decided_set_of_75() {
+    fn r2f_dm_windows_ignore_attributes_are_exactly_the_decided_set_of_81() {
         const REASON_A: &str = "S21 제출 정착·창 위 CR 보류는 유닉스 한정(send_settle_applies)";
         const REASON_B: &str = "윈도우 기본 H 마스크는 draft 축을 끈다(hold_axes_default(true)) — 이 검체는 유닉스 기본(draft 축) 동작을 본다";
         const REASON_C: &str = "좌석 명령이 POSIX 셸 문법";
@@ -33046,8 +33161,14 @@ mod h_machine_hold_tests {
             ("handlers", "d9_bound_t_s0_ceo_push_refused_after_a_write_finished_inside_the_window", 'C'),
             ("schedule", "d9_bound_t_s0_schedule_push_refused_after_a_write_finished_inside_the_window", 'C'),
             ("schedule", "d9_bound_i2_schedule_diversion_delivers_at_first_idle_queue_pass", 'C'),
+            ("agent_queue_tests", "d9_bound_i3_queue_refusals_are_counted_bounded_and_cleared", 'C'),
+            ("agent_queue_tests", "d9_bound_i3_busy_holds_do_not_reset_refusals", 'C'),
+            ("agent_queue_tests", "d9_bound_i3_busy_queue_escalates_once_then_delivers", 'C'),
+            ("agent_queue_tests", "d9_bound_i3_idle_nonwriter_hold_breaks_busy_continuity", 'C'),
+            ("agent_queue_tests", "d9_bound_i3_controller_owned_claim_is_counted_once", 'C'),
+            ("agent_queue_tests", "d9_bound_i3_late_refusal_does_not_restore_a_replaced_head_slot", 'C'),
         ];
-        assert_eq!(want.len(), 75, "결정한 집합은 75건(24 + 17 + 31 + 3)");
+        assert_eq!(want.len(), 81, "결정한 집합은 81건(24 + 17 + 37 + 3)");
         let needle = concat!("#[cfg_attr(not(unix), ", "ignore = \"");
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/cysd");
         let mut got: Vec<(String, String, char)> = Vec::new();
@@ -33074,8 +33195,8 @@ mod h_machine_hold_tests {
         got.sort();
         let mut want_sorted: Vec<(String, String, char)> = want.iter().map(|(a, b, c)| (a.to_string(), b.to_string(), *c)).collect();
         want_sorted.sort();
-        assert_eq!(got.len(), 75, "윈도우 `ignore` 가 {}건이다(결정 75건) — 새로 더했거나 뺐다: {got:?}", got.len());
-        assert_eq!(got, want_sorted, "윈도우 `ignore` 집합이 결정한 75건과 다르다 — 목록과 `ignore` 사유를 함께 고쳐라");
+        assert_eq!(got.len(), 81, "윈도우 `ignore` 가 {}건이다(결정 81건) — 새로 더했거나 뺐다: {got:?}", got.len());
+        assert_eq!(got, want_sorted, "윈도우 `ignore` 집합이 결정한 81건과 다르다 — 목록과 `ignore` 사유를 함께 고쳐라");
     }
 }
 
