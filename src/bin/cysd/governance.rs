@@ -7541,6 +7541,100 @@ pub(crate) fn cycle_clear_claimed(
     c.pid == Some(caller) && !c.expired(mono_now)
 }
 
+/// ★(0.14.56 · P1 D5 · design r2 §6, r1 §6) The class a D4-valid cycle clear was admitted as by the cycle CLI (`admitted`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CycleAdmitted {
+    /// The composer read empty (or placeholder / suggestion): the turn ended with nothing on the line.
+    Idle,
+    /// The line holds the daemon's own unsubmitted machine body (D3), which the clear's Ctrl-U erases.
+    MachineResidue,
+}
+
+impl CycleAdmitted {
+    pub(crate) fn parse(s: &str) -> Option<Self> {
+        match s {
+            "idle" => Some(Self::Idle),
+            "machine_residue" => Some(Self::MachineResidue),
+            _ => None,
+        }
+    }
+}
+
+/// ★(0.14.56 · P1 D5 · design r2 §6) The writer-side guard of a D4-valid cycle clear: `expect_gen` = the output generation of the
+/// CLI's composer observation (a moved generation aborts before the probe runs, `InjectGuard::claim_for_write`), the approval /
+/// first-run-gate fact at this decision, and [`cycle_clear_probe`]. Adapter markers are resolved here, so the writer thread does
+/// no disk read. The guard is the authority; the handler's generation pre-check is only an early refusal.
+pub(crate) fn cycle_clear_guard(
+    daemon: &Arc<Daemon>,
+    s: &Arc<crate::state::Surface>,
+    expect_output_gen: u64,
+    expect_input_gen: u64,
+    admitted: CycleAdmitted,
+) -> Arc<crate::state::InjectGuard> {
+    let adapters = load_adapter_defs();
+    let (markers, placeholder) = match surface_prompt_marker(s, &adapters) {
+        Some((m, p)) => (Some(m), p),
+        None => (None, None),
+    };
+    Arc::new(crate::state::InjectGuard::new(
+        Some(expect_output_gen),
+        s.output_gen.clone(),
+        approval_or_gate_pending(daemon, s.id),
+        Some(cycle_clear_probe(s, markers, placeholder, expect_input_gen, admitted)),
+    ))
+}
+
+/// ★(0.14.56 · P1 D5 · design r1 §6 probe, r2 §6) Runs on the WRITER thread at the claim (no `input_gate`; leaf locks taken one
+/// at a time, as [`inject_safety_probe`]). `true` = do not write. Blocks when the input generation moved since the CLI's
+/// observation, a raw human byte is counted, the daemon's own paste is active or settling, a modal is in the foreground, or the
+/// admitted class no longer holds: `Idle` -> the D1 verdict reads draft (unknown or an unmeasured seat: the pin's before-cursor
+/// test, as the CLI's own fallback); `MachineResidue` -> [`draft_machine_owned`] no longer proves residue. A seat without markers
+/// has no class axis (the counters still apply). A vanished seat or a panic blocks (`catch_unwind` - a panic must not kill the
+/// writer thread).
+fn cycle_clear_probe(
+    s: &Arc<crate::state::Surface>,
+    markers: Option<Vec<String>>,
+    placeholder: Option<String>,
+    expect_input_gen: u64,
+    admitted: CycleAdmitted,
+) -> crate::state::SafetyProbe {
+    let ws = Arc::downgrade(s);
+    Arc::new(move || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let Some(s) = ws.upgrade() else {
+                return true;
+            };
+            if s.input_gen.load(Ordering::Acquire) != expect_input_gen
+                || s.pending_input.lock().unwrap_or_else(|e| e.into_inner()).human != 0
+                || s.inject_track.busy_within(std::time::Duration::from_millis(OWN_PASTE_SETTLE_MS))
+            {
+                return true;
+            }
+            let obs = markers.as_deref().map(|m| observe_prompt(&s, m));
+            if obs.as_ref().is_some_and(obs_modal_foreground) {
+                return true;
+            }
+            let line = obs.as_ref().and_then(|o| {
+                o.line.as_ref().map(|(before, after)| PromptLine { before_cursor: before, at_or_after_cursor: after })
+            });
+            match admitted {
+                CycleAdmitted::MachineResidue => !matches!(
+                    draft_machine_owned(&s, line.map(|l| l.before_cursor)),
+                    Some(MachineDraft::MachineResidue { .. } | MachineDraft::SubmittedResidue { .. })
+                ),
+                CycleAdmitted::Idle => match &obs {
+                    None => false,
+                    Some(o) => match composer_reads_empty(&s, o, placeholder.as_deref()).flatten() {
+                        Some(empty) => !empty,
+                        None => input_line_state(0, line) == InputLine::Occupied,
+                    },
+                },
+            }
+        }))
+        .unwrap_or(true)
+    })
+}
+
 /// 미제출 입력 계수 v2 상태기계 — surface 별 상태(정의처 단일 · handlers send_text/send_key 둘 다 이것만 쓴다).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PendingInputState {
@@ -33343,10 +33437,11 @@ mod h_machine_hold_tests {
             // ★(0.14.52 · S-a C6d) `handlers::announce_seat_takeover` and `handlers::npm_prefix_pane_notice_req` left the list: both
             //   notices are events only (no pane write at all).
             "handlers::send_text_write_req",
-            // ★(0.14.52 · S-a C5b) The direct send family's checked agent writes (send_text's owned-submit /
-            //   self-submitting / clear-first jobs and a Return bound to its held body): the same admission as
-            //   `send_text_write_req` (ACL, typing guard, D-12 draft gate, S21 settle hold) runs before the hand-off.
-            "handlers::hand_off_direct_job",
+            // ★(0.14.56 · P1 D5) `handlers::hand_off_direct_job` left the list: its job takes the guard its caller passes (a
+            //   D4-valid cycle clear's `cycle_clear_guard`). ⛔A LEXICAL exit, as the D9 writers above: every other direct job
+            //   (owned submit, self-submitting, plain clear-first, the bound Return) passes `None` at runtime, as at the pin -
+            //   witnessed by `handlers::p1_cycle_tests::p1_e_t_d5_*` cell (d) (a plain clear is not stopped by a moved
+            //   generation). Their admission (ACL, typing guard, D-12 draft gate, S21 settle hold) is unchanged.
         ]
         .iter()
         .map(|s| s.to_string())

@@ -3922,6 +3922,7 @@ fn hand_off_direct_job(
     journal: Arc<dyn crate::agent_write::Journal>,
     body_owner: Option<crate::governance::InputOwner>,
     mut settle: DirectSettle,
+    guard: Option<Arc<crate::state::InjectGuard>>,
 ) -> Option<Value> {
     settle.gen_at_handoff = surface.input_gen.load(Ordering::Acquire);
     settle.planned = plan.planned_bytes();
@@ -3938,7 +3939,8 @@ fn hand_off_direct_job(
         journal: Some(journal),
         resume: None,
         settle: Some(Box::new(move |t: &crate::agent_write::Terminal| settle.run(t))),
-        guard: None,
+        // ★(0.14.56 · P1 D5) `Some` only for a D4-valid cycle clear (send_text); every other direct job passes `None`.
+        guard,
         note_body: body_owner.is_some(),
         body_owner,
     };
@@ -4102,7 +4104,7 @@ fn bind_held_and_write(
                 return draft_gate_denied_response(daemon, surface, id, kind, why, verified_from, None, settle);
             }
         }
-        if let Some(err) = hand_off_direct_job(surface, id, request, plan, proof, journal, owner, settle) {
+        if let Some(err) = hand_off_direct_job(surface, id, request, plan, proof, journal, owner, settle, None) {
             drop(_gate);
             restore(body);
             return err;
@@ -4136,10 +4138,23 @@ enum BarrierReply {
     Unknown(Value),
 }
 
+/// ★(0.14.56 · P1 D5 · design r2 §6) The one reply for "zero bytes, aborted before the first byte": the cycle clear's generation
+/// pre-check and the writer's guard abort / cancellation (via [`journal_barrier_verdict`]). The cycle CLI re-observes on it.
+fn guard_aborted_response(id: &Value) -> Value {
+    err_response(
+        id,
+        crate::agent_write::GUARD_ABORTED,
+        "zero bytes written: the write was aborted before its first byte (the seat changed after it was observed, or the \
+         write was cancelled); nothing was typed - observe the seat again before retrying",
+    )
+}
+
 fn journal_barrier_verdict(id: &Value, handle: &crate::agent_write::Request, sid: u64) -> Result<(), BarrierReply> {
     let budget_ms = crate::agent_write::JOURNAL_BARRIER_BUDGET_MS;
     match crate::agent_write::await_journal_barrier(handle, std::time::Duration::from_millis(budget_ms)) {
         crate::agent_write::JournalBarrier::Passed => Ok(()),
+        // ★(0.14.56 · P1 D5 · design r2 §6) a guard abort or a cancellation before the first byte: a real zero-byte refusal.
+        crate::agent_write::JournalBarrier::GuardAborted => Err(BarrierReply::Refused(guard_aborted_response(id))),
         crate::agent_write::JournalBarrier::Refused(reason) => Err(BarrierReply::Refused(err_response(
             id,
             cys::ERR_JOURNAL_UNAVAILABLE,
@@ -6879,6 +6894,35 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
                     ));
                 }
             }
+            // ★(0.14.56 · P1 D5 · design r2 §6) A D4-valid clear carries the output and input generations of ONE composer observation
+            //   and the class the CLI admitted. A moved generation is refused here, zero bytes (`guard_aborted`); the writer-side guard
+            //   built from the same values below is the authority.
+            let cycle_fence = if cycle_clear {
+                let out_gen = param_u64(&params, "expect_output_gen");
+                let in_gen = param_u64(&params, "expect_input_gen");
+                let admitted = param_str(&params, "admitted").as_deref().and_then(governance::CycleAdmitted::parse);
+                let (Some(out_gen), Some(in_gen), Some(admitted)) = (out_gen, in_gen, admitted) else {
+                    return Reply::Single(err_response(
+                        &id,
+                        "invalid_params",
+                        "cycle_clear requires expect_output_gen, expect_input_gen and admitted (idle|machine_residue) from one \
+                         composer observation",
+                    ));
+                };
+                if out_gen % 2 == 1 {
+                    return Reply::Single(err_response(
+                        &id,
+                        "invalid_params",
+                        "expect_output_gen is odd: an unpublished frame's generation is not an observation",
+                    ));
+                }
+                if surface.output_gen.load(Ordering::Acquire) != out_gen || surface.input_gen.load(Ordering::Acquire) != in_gen {
+                    return Reply::Single(guard_aborted_response(&id));
+                }
+                Some((out_gen, in_gen, admitted))
+            } else {
+                None
+            };
             // ★(0.14.42 · 설계 C D3) clear_first 는 원자 Inject(울타리)로 나간다 — 원장 선기록과 주입이 **같은
             //   살균 본문**을 쓰도록 여기서 한 번 살균한다(writer 백스톱과 같은 값 · 표지 없는 `/clear` 는 바이트
             //   동일 · 무clear 무변경). 직접 비-clear 경로는 원문 그대로다(울타리 판정은 아래 D5′).
@@ -7237,6 +7281,9 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
                 ));
             }
             let quiet = params.get("quiet").and_then(|v| v.as_bool()).unwrap_or(false);
+            // ★(0.14.56 · P1 D5) The cycle clear's writer-side guard (`None` for every other direct job).
+            let cycle_guard =
+                cycle_fence.map(|(out_gen, in_gen, admitted)| governance::cycle_clear_guard(daemon, &surface, out_gen, in_gen, admitted));
             let mut direct_job = match agent_intent {
                 Some(intent) => {
                     let Ok(written) = String::from_utf8(written) else {
@@ -7359,7 +7406,7 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
             }
             if let Some((request, plan, proof, journal, settle)) = direct_job.take() {
                 if let Some(err) =
-                    hand_off_direct_job(&surface, &id, request, plan, proof, journal, owner_if_residue, settle)
+                    hand_off_direct_job(&surface, &id, request, plan, proof, journal, owner_if_residue, settle, cycle_guard.clone())
                 {
                     return Reply::Single(err);
                 }
@@ -33493,6 +33540,13 @@ mod p1_cycle_tests {
             .planned_bytes()
     }
 
+    /// The D5 fence a cycle clear carries: `cycle_clear` plus ONE observation's generations and the admitted class (here read
+    /// straight from the seat, as an E0 composer export taken now would report them).
+    fn fence(s: &crate::state::Surface, admitted: &str) -> Value {
+        json!({"cycle_clear": true, "expect_output_gen": s.output_gen.load(Ordering::Acquire),
+               "expect_input_gen": s.input_gen.load(Ordering::Acquire), "admitted": admitted})
+    }
+
     /// T-D4 (r2 §5): `cycle_clear:true` is valid iff the caller's pid and the claim's pid are both present, equal, and the claim
     /// is not expired; every other combination is refused with `cycle_clear_unclaimed` and 0 bytes. The seat's bytes after all
     /// refusals are exactly one valid cycle clear plus one plain `--clear-first` (absent -> today's path, no claim needed).
@@ -33532,7 +33586,7 @@ mod p1_cycle_tests {
             resp
         };
         assert_eq!(r["result"]["claim"], json!("claimed"), "{r}");
-        let ok = clear(&f, Some(me), &s, cycle.clone());
+        let ok = clear(&f, Some(me), &s, fence(&s, "idle"));
         assert_eq!(ok["result"]["sent"], json!(true), "the caller's own live claim: valid ({ok})");
         let plain = clear(&f, Some(me), &s, json!({}));
         assert_eq!(plain["result"]["sent"], json!(true), "plain --clear-first: today's path ({plain})");
@@ -33576,7 +33630,6 @@ mod p1_cycle_tests {
     fn p1_e_t_g1_cycle_clear_draft_gate_admits_proven_residue_and_holds_own_paste() {
         let f = fx("p1e-tg1");
         let me = Some(std::process::id());
-        let cycle = json!({"cycle_clear": true});
         // Seat A: screen axis.
         let a = painted(&f);
         own_claim(&f, &a);
@@ -33586,21 +33639,21 @@ mod p1_cycle_tests {
         let why = gate_reason(&plain).unwrap_or_else(|| panic!("plain --clear-first over a drawn line: today's refusal ({plain})"));
         assert!(why.contains("[draft_gate:screen_occupied]"), "plain --clear-first keeps ScreenOccupied: {why}");
         a.inject_track.note_body("another machine body", None);
-        let unproven = clear(&f, me, &a, cycle.clone());
+        let unproven = clear(&f, me, &a, fence(&a, "machine_residue"));
         let why = gate_reason(&unproven).unwrap_or_else(|| panic!("unproven text refuses a cycle clear ({unproven})"));
         assert!(why.contains("[draft_gate:screen_occupied]"), "a cycle clear over unproven text: ScreenOccupied ({why})");
         a.inject_track.note_body("residue body", None);
-        let proven = clear(&f, me, &a, cycle.clone());
+        let proven = clear(&f, me, &a, fence(&a, "machine_residue"));
         assert_eq!(proven["result"]["sent"], json!(true), "proven machine residue + valid cycle clear passes draft_gate ({proven})");
         // Seat B: our own paste is active.
         let b = painted(&f);
         own_claim(&f, &b);
         paint(&b, "our paste in flight");
         b.inject_track.begin();
-        let drawn = clear(&f, me, &b, cycle.clone());
+        let drawn = clear(&f, me, &b, fence(&b, "idle"));
         assert_eq!(drawn["error"]["code"], json!("own_paste_settling"), "own paste drawn on the line: own_paste_settling ({drawn})");
         paint(&b, "");
-        let empty = clear(&f, me, &b, cycle.clone());
+        let empty = clear(&f, me, &b, fence(&b, "idle"));
         assert_eq!(empty["error"]["code"], json!("own_paste_settling"), "own paste, empty line: own_paste_settling ({empty})");
         assert!(!empty.to_string().contains("quiet_secs_unreported"), "a transient code, never the structural token");
         let plain_b = clear(&f, me, &b, json!({}));
@@ -33608,5 +33661,110 @@ mod p1_cycle_tests {
         b.inject_track.end();
         let _ = a.child.lock().unwrap().kill();
         let _ = b.child.lock().unwrap().kill();
+    }
+
+    fn ledger_lines(f: &Fx) -> usize {
+        std::fs::read_to_string(crate::delivery::ledger_path(&f.daemon.socket_path))
+            .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
+            .unwrap_or(0)
+    }
+
+    /// T-D5 (r2 §6, T23 corrected): a D4-valid cycle clear carries ONE observation's generations into the writer's guard.
+    /// (a) generations already moved at receipt -> `guard_aborted`, nothing pre-recorded, nothing handed; (b) the output or the
+    /// input generation moves after the handler's checks (the ledger pre-record seam) -> the writer's guard aborts and the RPC
+    /// replies `guard_aborted` (not `sent:true`); (c) unmoved -> written; (d) a plain `--clear-first` has no guard (a moved
+    /// generation does not stop it); (e) a malformed fence is `invalid_params`. Byte witness: exactly (c) and (d) reach the seat.
+    /// Mutants: keep `Passed` for GUARD_ABORTED at the barrier; hand off with no guard; a guard with no expected generation; drop
+    /// the probe's input-generation test; drop the handler's pre-check.
+    #[test]
+    #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+    fn p1_e_t_d5_the_observed_generations_reach_the_guard_and_an_abort_is_a_refusal() {
+        let f = fx("p1e-td5");
+        let (s, out) = recorder(&f, "td5");
+        let me = Some(std::process::id());
+        own_claim(&f, &s);
+        // (e) malformed fences
+        let missing = clear(&f, me, &s, json!({"cycle_clear": true, "admitted": "idle"}));
+        assert_eq!(missing["error"]["code"], json!("invalid_params"), "{missing}");
+        let mut odd = fence(&s, "idle");
+        odd["expect_output_gen"] = json!(s.output_gen.load(Ordering::Acquire) + 1);
+        let odd = clear(&f, me, &s, odd);
+        assert_eq!(odd["error"]["code"], json!("invalid_params"), "{odd}");
+        // (a) moved at receipt: refused before the ledger pre-record and before any hand-off
+        for (label, key, delta) in [("output moved at receipt", "expect_output_gen", 2u64), ("input moved at receipt", "expect_input_gen", 1)] {
+            let l0 = ledger_lines(&f);
+            let mut stale = fence(&s, "idle");
+            stale[key] = json!(stale[key].as_u64().unwrap() + delta);
+            let resp = clear(&f, me, &s, stale);
+            assert_eq!(resp["error"]["code"], json!("guard_aborted"), "{label}: {resp}");
+            assert_eq!(ledger_lines(&f), l0, "{label}: refused before the ledger pre-record");
+            assert_eq!(s.write_tx.gate().pending(), 0, "{label}: nothing handed to the writer");
+        }
+        // (b) moved after the handler's checks, before the writer's claim
+        for label in ["output moved before the claim", "input moved before the claim"] {
+            let sc = s.clone();
+            let output = label.starts_with("output");
+            crate::agent_write::set_test_after_pre_record(move |_| {
+                if output {
+                    sc.output_gen.fetch_add(2, Ordering::AcqRel);
+                } else {
+                    sc.input_gen.fetch_add(1, Ordering::AcqRel);
+                }
+            });
+            let resp = clear(&f, me, &s, fence(&s, "idle"));
+            assert_eq!(resp["error"]["code"], json!("guard_aborted"), "{label}: the writer's abort is an RPC refusal ({resp})");
+        }
+        // (b2) the probe's other axes, each perturbed after the handler's checks and before the claim (a painted claude seat)
+        let z = painted(&f);
+        own_claim(&f, &z);
+        paint(&z, "");
+        // a dialog over a machine residue proven by the owner generation (a proof that reads no screen): only the modal axis blocks
+        z.apply_pending_input(b"residue m", crate::governance::InputOrigin::Machine);
+        z.mark_pending_input_owner(crate::governance::InputOwner::Unattributed);
+        let zc = z.clone();
+        crate::agent_write::set_test_after_pre_record(move |_| {
+            crate::governance::h_paint(&zc, cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT)
+        });
+        let resp = clear(&f, me, &z, fence(&z, "machine_residue"));
+        assert_eq!(resp["error"]["code"], json!("guard_aborted"), "a dialog drawn over a proven residue before the claim: ({resp})");
+        z.clear_pending_input();
+        crate::governance::h_paint(&z, "❯ ");
+        type Perturb = Box<dyn FnOnce(&Arc<crate::state::Surface>)>;
+        let cells: Vec<(&str, &str, Perturb)> = vec![
+            ("draft typed before the claim", "idle", Box::new(|z| paint(z, "typed draft"))),
+            ("modal before the claim", "idle", Box::new(|z| paint(z, "1. Yes"))),
+            ("raw human byte before the claim", "idle", Box::new(|z| z.pending_input.lock().unwrap().human = 1)),
+            ("residue proof broken before the claim", "machine_residue", Box::new(|z| z.inject_track.note_body("another body", None))),
+            ("own paste begun before the claim", "idle", Box::new(|z| z.inject_track.begin())),
+        ];
+        for (label, admitted, perturb) in cells {
+            if admitted == "machine_residue" {
+                paint(&z, "residue z");
+                z.inject_track.note_body("residue z", None);
+            }
+            let zc = z.clone();
+            crate::agent_write::set_test_after_pre_record(move |_| perturb(&zc));
+            let resp = clear(&f, me, &z, fence(&z, admitted));
+            assert_eq!(resp["error"]["code"], json!("guard_aborted"), "{label}: ({resp})");
+            paint(&z, "");
+            z.pending_input.lock().unwrap().human = 0;
+        }
+        z.inject_track.end();
+        let _ = z.child.lock().unwrap().kill();
+        // (c) unmoved: written
+        let ok = clear(&f, me, &s, fence(&s, "idle"));
+        assert_eq!(ok["result"]["sent"], json!(true), "unmoved generations: written ({ok})");
+        // (d) plain --clear-first: no guard, a moved generation does not stop it
+        let sc = s.clone();
+        crate::agent_write::set_test_after_pre_record(move |_| {
+            sc.output_gen.fetch_add(2, Ordering::AcqRel);
+        });
+        let plain = clear(&f, me, &s, json!({}));
+        assert_eq!(plain["result"]["sent"], json!(true), "plain --clear-first: no guard ({plain})");
+        let mut want = clear_bytes();
+        want.extend(clear_bytes());
+        let got = d9_received(&out, want.len());
+        let _ = s.child.lock().unwrap().kill();
+        assert_eq!(got, want, "exactly the unmoved cycle clear and the plain clear reached the seat");
     }
 }
