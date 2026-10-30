@@ -379,6 +379,84 @@ for name, (rows, surface, no_gate) in {
           and "Worker 7;rm" not in so,
           "rc=%s tail=%r" % (rc, so[-700:]))
 
+# ── X. 수신 surface 는 데몬에 결박된다 (0.14.56 PKG-3A M2 · HEAD-RULING-PKG3A-R1 §1) ─────────────────────────
+# surface 번호는 데몬마다 따로 매겨져 서로 겹친다(리뷰어 실측 2026-10-31: 126 이 base 와 dept-5 에 함께 있다). 발부자 데몬의
+# 행으로 판정해도 되는 것은 수신자가 **발부자 데몬에 있다고 이름으로 밝힌** `<lane>/surface:N` 일 때뿐이다. 그 밖(맨 번호 ·
+# 다른 레인 · 발부자 레인 미상)은 거부하지 않고 UNVERIFIED 를 stderr 와 티켓 머리에 싣고, 역할 기반 todo 우회를 싣지 않는다.
+LANE_UNV = "liveness UNVERIFIED"
+X_PACK = "/nonexistent-x/pack-dept-dept-T"
+X_SOCK = "/nonexistent-x/state/cys-dept-dept-T/cys.sock"
+
+
+@contextlib.contextmanager
+def issuer_env(pack, sock):
+    old = {k: os.environ.get(k) for k in ("CYS_PACK_DIR", "CYS_SOCKET")}
+    os.environ["CYS_PACK_DIR"] = pack
+    if sock is None:
+        os.environ.pop("CYS_SOCKET", None)
+    else:
+        os.environ["CYS_SOCKET"] = sock
+    try:
+        yield
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def run_x(rows, surface, pack=X_PACK, sock=X_SOCK):
+    with issuer_env(pack, sock):
+        return run_tp(rows, to="worker", surface=surface)
+
+
+def no_role_fallback(so):
+    return "todo-path --role" not in so and UNKNOWN in so and "master 에 보고" in so
+
+
+# X1 — 리뷰어 실측 형상: 발부자 데몬의 126 은 산 `worker` 다. 맨 번호 126 은 다른 데몬의 좌석일 수 있다 → 판정 금지.
+rc, so, se, _ = run_x([row(126, "worker")], "126")
+head = "\n".join(so.splitlines()[:3])
+check("X1 맨 번호(발부자 데몬에 같은 id 의 산 행) → 발부·UNVERIFIED(stderr+머리)·역할 우회 없음",
+      rc == 0 and LANE_UNV in se and LANE_UNV in head and no_role_fallback(so),
+      "rc=%s head=%r tail=%r" % (rc, head, so[-500:]))
+# X2 — 같은 id 의 행이 발부자 데몬에서 죽었다: 그 행은 수신자가 아닐 수 있으므로 거부하지 않는다
+rc, so, se, _ = run_x([row(126, "worker", alive=False, exited=True)], "surface:126")
+check("X2 맨 surface:N(발부자 데몬의 같은 id 가 죽음) → 거부 없음(rc 0)·UNVERIFIED·역할 우회 없음",
+      rc == 0 and LANE_UNV in se and no_role_fallback(so), "rc=%s se=%r" % (rc, se[-300:]))
+# X3 — 다른 레인을 이름으로 밝힘(발부자 = dept-T): 발부자 데몬의 같은 번호 행을 읽지 않는다
+rc, so, se, _ = run_x([row(126, "worker")], "dept-5/surface:126")
+check("X3 다른 레인 dept-5/surface:126 → 발부·UNVERIFIED·역할 우회 없음·레인 이름이 메시지에",
+      rc == 0 and LANE_UNV in se and "dept-5" in se and no_role_fallback(so),
+      "rc=%s se=%r" % (rc, se[-300:]))
+# X4 — 발부자 레인을 이름으로 밝힘: 그 행을 잰다(죽었으면 거부 · 살았으면 역할 우회)
+rc, so, se, _ = run_x([row(126, "worker"), row(133, "worker-7", alive=False, status_age=9999)],
+                      "dept-T/surface:133")
+check("X4a 발부자 레인 dept-T/surface:133 이 죽음 → 거부(rc 1·티켓 미출력)",
+      rc == 1 and so == "" and "surface:133" in se, "rc=%s se=%r" % (rc, se[-300:]))
+rc, so, se, _ = run_x([row(126, "worker"), row(133, "worker-7")], "dept-T/133")
+x_path = "CYS_PACK_DIR=%s cys todo-path --role worker-7" % shlex.quote(X_PACK)
+check("X4b 발부자 레인 dept-T/133 이 삶 → 발부·UNVERIFIED 없음·역할 우회(worker-7)",
+      rc == 0 and LANE_UNV not in se and LANE_UNV not in so and x_path in so, "rc=%s tail=%r" % (rc, so[-600:]))
+# X5 — 발부자 레인 미상: 팩은 dept-T 인데 소켓이 다른 부서(접두 충돌 dept-T0 포함) / 소켓 없음 / 팩이 레인 팩이 아님
+for name, (pack, sock) in {
+        "X5a 소켓이 다른 부서": (X_PACK, "/nonexistent-x/state/cys-dept-dept-Q/cys.sock"),
+        "X5b 소켓 접두 충돌(dept-T0)": (X_PACK, "/nonexistent-x/state/cys-dept-dept-T0/cys.sock"),
+        "X5c 부서 팩인데 CYS_SOCKET 없음": (X_PACK, None),
+        "X5d 레인 팩이 아닌 팩(mktemp 형)": ("/nonexistent-x/tmp.AbC123", X_SOCK)}.items():
+    rc, so, se, _ = run_x([row(133, "worker-7")], "dept-T/surface:133", pack=pack, sock=sock)
+    check("%s → 발부자 레인 미상 → 판정 없음·UNVERIFIED·역할 우회 없음" % name,
+          rc == 0 and LANE_UNV in se and no_role_fallback(so), "rc=%s se=%r" % (rc, se[-300:]))
+# X6 — 레인 토큰 위생: 형식 밖 레인은 exit 2
+rc, so, se, _ = run_x([row(133, "worker-7")], "dept T;rm/surface:133")
+check("X6 레인 토큰 위생 위반 → exit 2", rc == 2 and so == "", "rc=%s" % rc)
+# X7 — CLI --help 가 새 형식을 말한다
+r_h = subprocess.run([PY, ORCH, "task-prompt", "--help"], capture_output=True, text=True, encoding="utf-8",
+                     env=env, timeout=60)
+check("X7 task-prompt --help 에 <lane>/surface:N 형식", r_h.returncode == 0 and "<lane>/surface:N" in r_h.stdout,
+      "rc=%s" % r_h.returncode)
+
 print("\n=== %d/%d PASS ===" % (checked[0] - len(fails), checked[0]))
 if fails:
     print("FAIL: %s" % fails, file=sys.stderr)

@@ -1485,6 +1485,133 @@ class SpoolSizeTriggerJ(_SpoolH):
         self.assertEqual(len(self.archives()), 1)
 
 
+class Pkg3aSpoolRobustness(_Spool):
+    """0.14.56 pre-tag review PKG-3A r1 minors (HEAD-RULING-PKG3A-R1 section 2, tools lane):
+    #16 one record that fails to route is counted and skipped - the batch's routed records are not replayed at 1 Hz;
+    #18 a failed first offset save logs once and the lane keeps routing from the in-memory record (retrying the save);
+    #19 an rc 2 self-check (older pack without the subcommand) is settled until that pack's .pack-version changes, and the
+        periodic re-check runs at most one self-check child per tick."""
+
+    def ev(self, task):
+        return {"ts": T0, "type": "task.blocked", "payload": {"task": task, "blocked_by": ["x"]}}
+
+    def opened(self):
+        """A reader past the startup gate with the main lane at first sight (EOF)."""
+        put(spool_of(self.main), self.ev("OLD"))
+        rd = self.reader()
+        self.tick(rd)
+        self.merge(fleet())
+        self.tick(rd)
+        return rd
+
+    def test_16_a_failing_record_is_skipped_and_routed_records_are_not_replayed(self):
+        rd = self.opened()
+        real, seen = HB.route_spool, []
+
+        def route(entry, *a, **k):
+            task = (entry.get("payload") or {}).get("task")
+            seen.append(task)
+            if task == "BAD":
+                raise ValueError("specimen route failure")
+            return real(entry, *a, **k)
+        put(spool_of(self.main), self.ev("A"), self.ev("BAD"), self.ev("C"))
+        with mock.patch.object(HB, "route_spool", route):
+            for _ in range(3):
+                try:
+                    self.tick(rd)
+                except Exception:      # noqa: BLE001 - spool_loop catches a failed pass; the next poll runs again
+                    pass
+        self.assertEqual(seen, ["A", "BAD", "C"], "records were replayed (1 Hz replay of routed records)")
+        self.assertEqual(sorted(b["task"] for b in self.world.blocked), ["A", "C"])
+        self.assertEqual(self.read_offset("main"), os.path.getsize(spool_of(self.main)))
+        self.assertEqual(self.log.getvalue().count("specimen route failure"), 1, self.log.getvalue())
+
+    def test_16_one_lane_that_raises_does_not_stop_the_other_lanes(self):
+        d5 = stub_pack(os.path.join(self.tmp, "d5"))
+        put(spool_of(self.main), self.ev("OLD"))
+        put(spool_of(d5), self.ev("OLD5"))
+        rd = self.reader()
+        self.tick(rd)
+        self.merge(fleet(("dept-5", "/s/d5.sock", d5, [])))
+        self.tick(rd, 2)
+        real = HB.read_spool_lane
+
+        def read(path, ident):
+            if path == spool_of(self.main):
+                raise RuntimeError("specimen lane failure")
+            return real(path, ident)
+        put(spool_of(d5), self.ev("D5NEW"))
+        with mock.patch.object(HB, "read_spool_lane", read):
+            try:
+                self.tick(rd)
+            except Exception:          # noqa: BLE001
+                pass
+        self.assertEqual([b["task"] for b in self.world.blocked], ["D5NEW"], "a raising lane skipped the other lanes")
+
+    def test_18_failed_first_offset_save_keeps_routing_from_memory(self):
+        put(spool_of(self.main), self.ev("OLD"))
+        rd = self.reader()
+        self.tick(rd)
+        self.merge(fleet())
+        with mock.patch.object(HB, "_save_offset_record", lambda path, ident: False):
+            self.tick(rd)                                  # first sight: the save fails
+            put(spool_of(self.main), self.ev("NEW"))
+            self.tick(rd, 3)
+        self.assertEqual([b["task"] for b in self.world.blocked], ["NEW"], "the lane was never read after a failed save")
+        self.assertEqual(self.log.getvalue().count("offset cannot be saved"), 1, self.log.getvalue())
+        self.tick(rd)                                      # the save works again: retried without new records
+        self.assertEqual(self.read_offset("main"), os.path.getsize(spool_of(self.main)))
+
+    def _count_checks(self):
+        calls = []
+        real = HB.spool_self_check
+
+        def spy(pack, *a, **k):
+            calls.append(os.path.basename(pack))
+            return real(pack, *a, **k)
+        p = mock.patch.object(HB, "spool_self_check", spy)
+        p.start()
+        self.addCleanup(p.stop)
+        return calls
+
+    def test_19_rc2_is_settled_until_the_pack_version_changes(self):
+        d5 = stub_pack(os.path.join(self.tmp, "d5"), rc=2)
+        with open(os.path.join(d5, ".pack-version"), "w", encoding="utf-8") as f:
+            f.write("0.14.54\n")
+        calls = self._count_checks()
+        rd = self.reader()
+        self.tick(rd)
+        self.merge(fleet(("dept-5", "/s/d5.sock", d5, [])))
+        self.tick(rd)
+        first = calls.count("d5")
+        self.assertEqual(first, 1)
+        for _ in range(3):
+            self.clock.t += HB.SPOOL_RECHECK_SECS + 1
+            self.tick(rd)
+        self.assertEqual(calls.count("d5"), first, "an rc 2 lane was re-checked although its pack did not change")
+        with open(os.path.join(d5, ".pack-version"), "w", encoding="utf-8") as f:
+            f.write("0.14.56\n")
+        self.clock.t += HB.SPOOL_RECHECK_SECS + 1
+        self.tick(rd)
+        self.assertEqual(calls.count("d5"), first + 1, "a changed .pack-version must be re-checked")
+
+    def test_19_at_most_one_periodic_self_check_per_tick(self):
+        packs = [stub_pack(os.path.join(self.tmp, n), rc=1) for n in ("d1", "d2", "d3")]
+        calls = self._count_checks()
+        rd = self.reader()
+        self.tick(rd)
+        self.merge(fleet(*[("dept-%d" % (i + 1), "/s/d%d.sock" % (i + 1), p, []) for i, p in enumerate(packs)]))
+        self.tick(rd)
+        base = len(calls)
+        self.clock.t += HB.SPOOL_RECHECK_SECS + 1
+        per_tick = []
+        for _ in range(3):
+            n = len(calls)
+            self.tick(rd)
+            per_tick.append(len(calls) - n)
+        self.assertEqual(per_tick, [1, 1, 1], "periodic self-checks per tick: %r (base %d)" % (per_tick, base))
+
+
 if __name__ == "__main__":
     if sys.argv[1:] == ["--write-golden"]:
         _write_golden()
