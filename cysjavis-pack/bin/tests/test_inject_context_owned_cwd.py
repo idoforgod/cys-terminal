@@ -19,7 +19,7 @@ What it pins (issue numbers = verdict 0.14.56_PRETAG_cross-vendor_PKG-3A_pack_bi
   #7  a SIGTERM to the controller does not leave cys-ic-rec.* directories behind.
 Faults are injected without touching product code: BASH_ENV is read by every non-interactive bash, so a
 file that matches its own process arguments can end exactly one phase (`--phase role`).
-Hermetic: stub ps/lsof/cys on PATH, temporary pack/home/TMPDIR, CYS_* and CLAUDE_CONFIG_DIR removed.
+Hermetic: stub ps/lsof/cys on PATH, temporary pack, HOME and TMPDIR, CYS_* and CLAUDE_CONFIG_DIR removed.
 POSIX only (bash hook). Output: PASS/FAIL lines, exit 1 on any failure, final token
 INJECT-CONTEXT-OWNED-CWD-OK. Run as CI does: CYS_PACK_DIR="$(mktemp -d)" python3 bin/tests/<this file>.
 """
