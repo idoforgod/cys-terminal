@@ -4,7 +4,7 @@
 The daemon calls `plan` on every configured boot and before deciding to skip the embedded restore, so the plan
 must write nothing and ask the daemon to do nothing. Measured, not trusted:
   · every file (sha256 + mode) and every directory under the rig HOME (the LIVE state dir incl. phoenix/,
-    topology.json, the generation snapshots, ~/.cys/local) and under the bound roots (TMPDIR/TEMP/TMP,
+    topology.json, the generation snapshots, ~/.cys/local), the private byte-identical subject pack, and bound roots (TMPDIR/TEMP/TMP,
     CYS_PACK_DIR, CYS_LOCAL_DIR, HUD_STATE_DIR, PHOENIX_DEPT_STATE_ROOT, PHOENIX_DEPTS_JSON) is hashed before and
     after EACH plan call — any difference fails;
   · the fake daemon CLI records every call; anything other than `phoenix-identity`, `status --json`, `list`
@@ -13,8 +13,10 @@ must write nothing and ask the daemon to do nothing. Measured, not trusted:
 Worlds: healthy, dead role, C6 exited-only role, pending intent, corrupt desired + .bak, desired absent + .bak,
 corrupt topology, rev regression, corrupt generation, topology missing, fresh install (no phoenix/), held
 restore.run.lock, an ambiguous `fresh` role, a C3 world, and a post-hook `--compare-plan` call.
-MUTATION CONTROL (inside the specimen): eight module copies, each reintroducing one effect at an exact anchor
-(anchor missing = FAIL); each must be caught, the unmutated module must pass.
+MUTATION CONTROL (inside the specimen): nine module copies, each reintroducing one effect at an exact anchor
+(anchor missing = FAIL); each must be caught, the unmutated module must pass. Four separately gated negative
+controls prove the recorder, real spool, containment and invalid-mutant distinction; they do not replace the
+original 41 fake / 45 native checks.
 HARNESS MODE: when PHOENIX_HARNESS_CYSD is set (release phoenix gate) the plan also runs against a real isolated
 cysd — a missing binary there is a FAILURE, not a skip.
 
@@ -38,6 +40,37 @@ check = rig.Checks()
 BIN = os.path.dirname(rig.PH)
 HASHED = os.path.join(R.root, "hashed")
 CTL = os.path.join(R.root, "ctl")
+# The subject bytes are unchanged, but their script-owned spool must never be in the checkout.
+SUBJECT_PACK = os.path.join(R.root, "subject-pack")
+SUBJECT_BIN = os.path.join(SUBJECT_PACK, "bin")
+SUBJECT_PH = os.path.join(SUBJECT_BIN, "javis_phoenix.py")
+EVENT = os.path.join(SUBJECT_BIN, "javis_event.py")
+SPOOL = os.path.join(SUBJECT_PACK, "state", "evt_spool.jsonl")
+CLOSURE = ("javis_phoenix.py", "javis_budget.py", "javis_state_snapshot.py",
+           "javis_event.py", "javis_scrub.py", "javis_spool_path.py")
+os.makedirs(SUBJECT_BIN)
+for _name in CLOSURE:
+    _src, _dst = os.path.join(BIN, _name), os.path.join(SUBJECT_BIN, _name)
+    shutil.copy2(_src, _dst)  # missing dependency is a loud error, never a skipped copy
+    with open(_src, "rb") as _a, open(_dst, "rb") as _b:
+        assert _a.read() == _b.read(), "subject closure is not byte-identical: " + _name
+
+
+def event_argv(producer=EVENT):
+    """Refuse an outside producer BEFORE launching it; ask the real producer for its actual destination."""
+    root, producer = os.path.realpath(SUBJECT_PACK), os.path.realpath(producer)
+    if os.path.commonpath((root, producer)) != root:
+        raise ValueError("event producer outside observed private pack")
+    probe = subprocess.run([sys.executable, "-B", producer, "spool-path"], capture_output=True, timeout=30)
+    if probe.returncode != 0:
+        raise ValueError("cannot measure event spool path: %r" % probe.stderr)
+    path = os.path.realpath(os.fsdecode(probe.stdout).strip())
+    if os.path.commonpath((root, path)) != root or path != os.path.realpath(SPOOL):
+        raise ValueError("event spool outside observed private pack: " + path)
+    return [sys.executable, "-B", producer, "emit", "agent.error",
+            "--field", "agent=phoenix", "--field", "summary=m6b", "--spool"]
+
+
 ALLOWED = {("phoenix-identity",), ("status", "--json"), ("list",)}
 BOUND = {"TMPDIR": "tmp", "TEMP": "tmp", "TMP": "tmp", "CYS_PACK_DIR": "pack", "CYS_LOCAL_DIR": "local",
          "HUD_STATE_DIR": "hud", "PHOENIX_DEPT_STATE_ROOT": "depts-root", "PHOENIX_DEPTS_JSON": "depts.json"}
@@ -53,9 +86,9 @@ def bound_env(fake):
     return env
 
 
-def snapshot():
+def snapshot(roots=None):
     out = {}
-    for top in (R.home, HASHED):
+    for top in ((R.home, HASHED, SUBJECT_PACK) if roots is None else roots):
         for dp, dns, fns in os.walk(top):
             for d in dns:
                 out[os.path.join(dp, d)] = "dir"
@@ -171,12 +204,13 @@ MUTANTS = [
     ("M5 creating read path", "def desired_roster_path(socket):\n    return os.path.join(phoenix_home_path(socket),",
      "def desired_roster_path(socket):\n    return os.path.join(phoenix_home(socket),"),
     ("M6 event emit", "    units = _restore_units_now(socket, live, True, roster, tombstones)\n",
-     "    _emit_evt(\"agent.error\", agent=\"phoenix\", summary=\"plan mutant\")\n"
+     "    subprocess.run([sys.executable, \"-B\", os.path.join(os.path.dirname(__file__), \"javis_event.py\"), "
+     "\"emit\", \"agent.error\", \"--field\", \"agent=phoenix\", \"--field\", \"summary=plan mutant\"], "
+     "capture_output=True, check=True)\n"
      "    units = _restore_units_now(socket, live, True, roster, tombstones)\n"),
     ("M6b event emit --spool", "    units = _restore_units_now(socket, live, True, roster, tombstones)\n",
-     "    subprocess.run([sys.executable, os.path.join(%r, \"javis_event.py\"), \"emit\", \"agent.error\", "
-     "\"--field\", \"agent=phoenix\", \"--field\", \"summary=m6b\", \"--spool\"], capture_output=True)\n"
-     "    units = _restore_units_now(socket, live, True, roster, tombstones)\n" % BIN),
+     "    subprocess.run(%r, capture_output=True, check=True)\n"
+     "    units = _restore_units_now(socket, live, True, roster, tombstones)\n" % event_argv()),
     ("M7 resolve journal", "_resolve_cys(args.socket, record=(args.cmd != \"plan\"))",
      "_resolve_cys(args.socket, record=True)"),
     ("M8 temp file", "    units = _restore_units_now(socket, live, True, roster, tombstones)\n",
@@ -193,7 +227,7 @@ with open(os.environ["PLAN_GATE_EVT_LOG"], "a") as f:
 
 def module_copy(label, text):
     """A copy of the module beside copies of the siblings it imports, with javis_event.py replaced by a recorder:
-    `_emit_evt` only prints a wire line that phoenix discards (no durable trace to hash), so ANY call is flagged."""
+    M6 invokes that recorder directly; its outside-the-hash log is a wire-call witness, not a file-effect witness."""
     d = os.path.join(CTL, re.sub(r"\W+", "_", label))
     os.makedirs(d, exist_ok=True)
     for sib in ("javis_budget.py", "javis_state_snapshot.py"):
@@ -208,10 +242,97 @@ def module_copy(label, text):
 
 
 def mutant_script(label, anchor, repl):
-    src = open(rig.PH, encoding="utf-8").read()
+    src = open(SUBJECT_PH, encoding="utf-8").read()
     if src.count(anchor) != 1:
         return None, src.count(anchor)
     return module_copy(label, src.replace(anchor, repl, 1)), 1
+
+
+def event_hits(rows, label):
+    """An event mutation must actually execute successfully, and be caught on its intended channel."""
+    valid = [(w, c, o) for w, c, o, rc, outcome in rows if rc == 0 and outcome in rig_outcomes()]
+    if label == "M6 event emit":
+        return [(w, c, o) for w, c, o in valid if any(call[:1] == ["javis_event"] for call in o)]
+    payload_seen = False
+    if os.path.isfile(SPOOL):
+        with open(SPOOL, encoding="utf-8") as f:
+            payload_seen = any(json.loads(line).get("payload", {}).get("summary") == "m6b"
+                               for line in f if line.strip())
+    return [(w, c, o) for w, c, o in valid if SPOOL in c and payload_seen]
+
+
+def negative_controls(fake):
+    results = []
+
+    def record(name, ok, detail):
+        results.append(bool(ok))
+        print("NEGATIVE-CONTROL %s %s | %s" % ("PASS" if ok else "FAIL", name, detail))
+
+    m6, m6b = MUTANTS[5], MUTANTS[6]
+    script, n = mutant_script("negative recorder", m6[1], m6[2])
+    assert n == 1
+    with open(os.path.join(os.path.dirname(script), "javis_event.py"), "w", encoding="utf-8") as f:
+        f.write("import sys\nsys.exit(0)\n")
+    rows = gate(fake, script)
+    record("recorder append off is not caught", all(r[3] == 0 for r in rows)
+           and not event_hits(rows, m6[0]) and not any(r[1] or r[2] for r in rows),
+           "worlds=%d rc=%r" % (len(rows), sorted(set(r[3] for r in rows))))
+
+    with open(EVENT, "rb") as f:
+        original = f.read()
+    anchor = b"            _spool_append(a.type, payload, surface)"
+    assert original.count(anchor) == 1, "spool suppression anchor moved"
+    try:
+        with open(EVENT, "wb") as f:
+            f.write(original.replace(anchor, b"            pass  # negative control: no append", 1))
+        script, n = mutant_script("negative spool", m6b[1], m6b[2])
+        assert n == 1
+        rows = gate(fake, script)
+        record("spool write off is not caught", all(r[3] == 0 for r in rows)
+               and not event_hits(rows, m6b[0]) and not any(r[1] or r[2] for r in rows),
+               "worlds=%d rc=%r" % (len(rows), sorted(set(r[3] for r in rows))))
+    finally:
+        with open(EVENT, "wb") as f:
+            f.write(original)
+
+    outside = os.path.join(R.root, "outside-observer", "javis_event.py")
+    launched = []
+    real_run = subprocess.run
+    def forbidden_run(*args, **kwargs):
+        launched.append(args)
+        raise AssertionError("outside producer was launched")
+    refused = False
+    try:
+        subprocess.run = forbidden_run
+        try:
+            event_argv(outside)
+        except ValueError as e:
+            refused = "outside observed private pack" in str(e)
+    finally:
+        subprocess.run = real_run
+    record("outside producer refused before launch", refused and not launched and not os.path.exists(outside),
+           "refused=%r launches=%d" % (refused, len(launched)))
+
+    bad = "    _emit_evt(\"agent.error\", agent=\"phoenix\", summary=\"invalid mutant\")\n" + m6[1]
+    script, n = mutant_script("negative invalid helper", m6[1], bad)
+    assert n == 1
+    # Preserve the framed error for this control, without changing the run_cli return value.
+    errors = []
+    real_cli = R.run_cli
+    def observed_cli(*args, **kwargs):
+        value = real_cli(*args, **kwargs)
+        errors.append("NameError" in value[3] and "_emit_evt" in value[3])
+        return value
+    try:
+        R.run_cli = observed_cli
+        rows = gate(fake, script)
+    finally:
+        R.run_cli = real_cli
+    record("invalid NameError mutant is not credited", len(rows) == 15 and all(errors)
+           and all(r[3] == 1 and r[4] == "error" for r in rows) and not event_hits(rows, m6[0]),
+           "worlds=%d framed_NameErrors=%d" % (len(rows), sum(errors)))
+    print("NEGATIVE-CONTROLS %d/%d PASS" % (sum(results), len(results)))
+    return len(results) == 4 and all(results)
 
 
 def harness_mode():
@@ -249,7 +370,8 @@ def harness_mode():
                           for s in st.get("surfaces", []))
 
         def files():
-            out = {}
+            out = {"subject:" + os.path.relpath(p, SUBJECT_PACK): value
+                   for p, value in snapshot((SUBJECT_PACK,)).items()}
             for rel in ("phoenix", "phoenix-embed", "topology.json", "phoenix-restore.log"):
                 p = os.path.join(h.HARN_DIR, rel)
                 if os.path.isfile(p):
@@ -264,7 +386,7 @@ def harness_mode():
 
         s0, f0 = norm_status(), files()
         env = dict(os.environ, PHOENIX_CYS=cys)
-        p = subprocess.run([sys.executable, "-B", rig.PH, "--socket", h.HARN_SOCK, "plan"], env=env,
+        p = subprocess.run([sys.executable, "-B", SUBJECT_PH, "--socket", h.HARN_SOCK, "plan"], env=env,
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
         s1, f1 = norm_status(), files()
         out = p.stdout.decode("utf-8", "replace")
@@ -300,8 +422,8 @@ def main():
     check("probe: the child's temp root is under the hashed root (M8 check is not void)",
           tmpdir.startswith(os.path.realpath(HASHED) + os.sep), tmpdir)
 
-    src = open(rig.PH, encoding="utf-8").read()
-    for layout, script in (("shipped layout", rig.PH), ("recorder copy", module_copy("unmutated", src))):
+    src = open(SUBJECT_PH, encoding="utf-8").read()
+    for layout, script in (("shipped layout", SUBJECT_PH), ("recorder copy", module_copy("unmutated", src))):
         for name, changed, odd, rc, outcome in gate(fake, script):
             check("%s / %s: plan exit 0, nothing written, only identity/status/list calls, no event" % (layout, name),
                   rc == 0 and not changed and not odd and outcome in rig_outcomes(),
@@ -312,15 +434,21 @@ def main():
         if script is None:
             check("mutation control %s: anchor found exactly once" % label, False, "count=%d" % n)
             continue
-        hits = [(w, c[:2], o[:2]) for w, c, o, rc, _ in gate(fake, script, stop_at_first=True) if c or o]
+        rows = gate(fake, script, stop_at_first=True)
+        if label in ("M6 event emit", "M6b event emit --spool"):
+            hits = event_hits(rows, label)
+        else:
+            hits = [(w, c[:2], o[:2]) for w, c, o, rc, _ in rows if c or o]
         check("mutation control %s: caught" % label, bool(hits), hits[:1])
         if label == "M6 event emit":
             check("mutation control M6 is caught by the recorded wire call (not by a file artefact)",
                   any(o for _w, _c, o in hits), hits[:1])
 
+    controls_ok = negative_controls(fake)
     harness_mode()
     R.close()
-    return check.finish()
+    result = check.finish()
+    return result if result else (0 if controls_ok else 1)
 
 
 def rig_outcomes():
