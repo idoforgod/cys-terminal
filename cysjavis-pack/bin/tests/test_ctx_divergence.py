@@ -383,6 +383,106 @@ class ActprobeDivergence(unittest.TestCase):
         self.probe(78, 79, 2, env_threshold=0)
 
 
+class ActprobeSubmitComposer(unittest.TestCase):
+    """D8 (P1-DESIGN-056-r2 §9, test T-P1): the live submit probe reads `cys read-screen --composer` - one JSON object
+    {text, composer} - takes the activity markers from `text` and "pending text" from `composer.verdict`
+    (empty/placeholder/suggestion -> empty, draft -> FAIL, unknown -> INDET). A non-zero exit (an old binary) re-reads with
+    plain `read-screen` and keeps today's regex path; so does a reply without a composer (an old daemon) or a seat D1 does
+    not govern (`governed: false`). The cys CLI is a fake in-process `subprocess.run` - no live cys, no shell shim (any OS)."""
+
+    SURFACE = "surface:9"
+    # A rendered suggestion on the caret row while a turn runs: the regex reads it as pending text.
+    SUGGESTION = "✻ Working… (esc to interrupt)\n│ > try fixing the lint errors │\n"
+    # A draft on a continuation row under an empty caret row: the regex reads the caret row as empty.
+    CONTINUATION_DRAFT = "✻ Working… (esc to interrupt)\n❯ \n  the second line of my own draft\n"
+
+    def envelope(self, text, verdict, governed=True):
+        return json.dumps({"text": text, "quiet_secs": 0.0,
+                           "composer": {"verdict": verdict, "governed": governed}})
+
+    def probe(self, replies):
+        """Runs the live probe (one budget, two reads) against scripted CLI replies [(rc, stdout)], in call order."""
+        import javis_actprobe as AP  # BIN is on sys.path (module top)
+        calls, queue = [], list(replies)
+
+        def fake_run(argv, **kw):
+            calls.append(list(argv[1:]))
+            if not queue:
+                raise AssertionError("unexpected extra CLI call %r (calls so far %r)" % (argv[1:], calls))
+            rc, out = queue.pop(0)
+            return subprocess.CompletedProcess(argv, rc, stdout=out, stderr="")
+
+        args = AP.build_parser().parse_args(["submit", "--surface", self.SURFACE, "--reread", "1", "--interval", "0"])
+        with patch.object(AP.subprocess, "run", fake_run), patch.object(AP.time, "sleep", lambda s: None):
+            code, reason = AP.probe_submit(args)
+        self.assertEqual(queue, [], "unused scripted replies")
+        return code, reason, calls
+
+    def composer_call(self):
+        return ["read-screen", "--surface", self.SURFACE, "--composer"]
+
+    def test_suggestion_verdict_reads_empty(self):
+        """A rendered suggestion + activity -> PASS (the regex alone says pending text -> FAIL)."""
+        env = self.envelope(self.SUGGESTION, "suggestion")
+        code, reason, calls = self.probe([(0, env), (0, env)])
+        self.assertEqual(code, 0, reason)
+        self.assertEqual(calls, [self.composer_call()] * 2)
+
+    def test_empty_and_placeholder_verdicts_read_empty(self):
+        for verdict in ("empty", "placeholder"):
+            with self.subTest(verdict=verdict):
+                env = self.envelope(self.SUGGESTION, verdict)
+                self.assertEqual(self.probe([(0, env), (0, env)])[0], 0)
+
+    def test_draft_verdict_fails(self):
+        """A continuation-row draft -> FAIL (the regex alone reads the empty caret row -> PASS)."""
+        env = self.envelope(self.CONTINUATION_DRAFT, "draft")
+        code, reason, _ = self.probe([(0, env), (0, env)])
+        self.assertEqual(code, 2, reason)
+
+    def test_unknown_verdict_is_indeterminate(self):
+        """unknown (a governed seat whose box cannot be read) -> INDET, whatever the regex would say."""
+        env = self.envelope(self.CONTINUATION_DRAFT, "unknown")
+        code, reason, _ = self.probe([(0, env), (0, env)])
+        self.assertEqual(code, 3, reason)
+
+    def test_activity_markers_come_from_text(self):
+        """The verdict says empty; with no activity marker in `text` the probe cannot confirm a submission -> INDET."""
+        env = self.envelope("❯ \n", "empty")
+        code, reason, _ = self.probe([(0, env), (0, env)])
+        self.assertEqual(code, 3, reason)
+
+    def test_ungoverned_seat_keeps_the_regex_path(self):
+        """governed false (a seat D1 does not govern): today's regex on `text` - pending text -> FAIL, not INDET."""
+        env = self.envelope(self.SUGGESTION, "unknown", governed=False)
+        code, reason, _ = self.probe([(0, env), (0, env)])
+        self.assertEqual(code, 2, reason)
+
+    def test_reply_without_composer_keeps_the_regex_path(self):
+        """An old daemon (composer null): today's regex on `text` - the empty caret row + activity -> PASS."""
+        env = json.dumps({"text": self.CONTINUATION_DRAFT, "composer": None})
+        code, reason, _ = self.probe([(0, env), (0, env)])
+        self.assertEqual(code, 0, reason)
+
+    def test_old_binary_falls_back_to_plain_read_screen(self):
+        """Non-zero exit for --composer -> one plain read-screen per read, today's regex path (suggestion -> FAIL)."""
+        code, reason, calls = self.probe([(2, ""), (0, self.SUGGESTION), (2, ""), (0, self.SUGGESTION)])
+        self.assertEqual(code, 2, reason)
+        plain = ["read-screen", "--surface", self.SURFACE]
+        self.assertEqual(calls, [self.composer_call(), plain] * 2)
+
+    def test_fallback_read_failure_is_indeterminate(self):
+        """Both reads fail -> INDET (a read failure is never a verdict)."""
+        code, reason, _ = self.probe([(2, ""), (1, "")])
+        self.assertEqual(code, 3, reason)
+
+    def test_unparseable_composer_reply_is_indeterminate(self):
+        """Exit 0 but not one JSON object (or a non-object composer) -> INDET, never the regex on raw stdout."""
+        for out in ("not json " + self.SUGGESTION, json.dumps({"text": self.SUGGESTION, "composer": "suggestion"})):
+            with self.subTest(out=out[:20]):
+                self.assertEqual(self.probe([(0, out)])[0], 3)
+
+
 class HudContextFreshness(unittest.TestCase):
     def test_stale_report_is_none(self):
         """HUD 낡은 자기보고(age 301) → None."""

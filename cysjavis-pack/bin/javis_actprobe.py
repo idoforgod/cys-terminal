@@ -205,11 +205,49 @@ class _ReadError(Exception):
 
 
 def _read_screen_live(ref):
-    out = subprocess.run([CYS_BIN, "read-screen", "--surface", ref],
+    """One read -> (text, composer). D8 (design P1-DESIGN-056-r2 §9): `read-screen --composer` prints ONE JSON object
+    {text, composer} from one daemon frame. A non-zero exit (an old binary that does not know --composer) re-reads with
+    plain read-screen and returns composer=None (today's regex path). A null composer (an old daemon) is None too."""
+    out = subprocess.run([CYS_BIN, "read-screen", "--surface", ref, "--composer"],
                          capture_output=True, text=True, timeout=12)
     if out.returncode != 0:
-        raise _ReadError(f"cys read-screen exit {out.returncode}")
-    return out.stdout
+        out = subprocess.run([CYS_BIN, "read-screen", "--surface", ref],
+                             capture_output=True, text=True, timeout=12)
+        if out.returncode != 0:
+            raise _ReadError(f"cys read-screen exit {out.returncode}")
+        return out.stdout, None
+    try:
+        env = json.loads(out.stdout)
+    except ValueError as e:
+        raise _ReadError(f"cys read-screen --composer: not one JSON object ({e})")
+    if not isinstance(env, dict) or not isinstance(env.get("text"), str):
+        raise _ReadError("cys read-screen --composer: no text")
+    composer = env.get("composer")
+    if composer is not None and not isinstance(composer, dict):
+        raise _ReadError("cys read-screen --composer: composer is not an object")
+    return env["text"], composer
+
+
+# D8: the composer verdicts that read as an empty input box (the daemon's D1 vocabulary - the screen is not re-judged here).
+_COMPOSER_EMPTY = ("empty", "placeholder", "suggestion")
+
+
+def _analyze_read(read):
+    """One (text, composer) read -> (located, input_empty, active), as _analyze_screen returns.
+
+    The activity markers always come from text. Pending text comes from composer.verdict: empty/placeholder/suggestion ->
+    empty, draft -> pending text (FAIL), unknown or any other value -> box not read (INDET). No composer (an old daemon or
+    binary) or a seat D1 does not govern (governed false) -> today's regex judgement unchanged."""
+    text, composer = read
+    if composer is None or composer.get("governed") is False:
+        return _analyze_screen(text)
+    active = _analyze_screen(text)[2]
+    verdict = composer.get("verdict")
+    if verdict in _COMPOSER_EMPTY:
+        return True, True, active
+    if verdict == "draft":
+        return True, False, active
+    return False, None, active
 
 
 def _load_files(paths):
@@ -218,9 +256,9 @@ def _load_files(paths):
 
 
 def _judge_submit(pair):
-    """두 판독(screen text 2개)으로 제출 판정 → (exit, reason)."""
-    a1 = _analyze_screen(pair[0])
-    a2 = _analyze_screen(pair[1])
+    """두 판독((text, composer) 2개)으로 제출 판정 → (exit, reason)."""
+    a1 = _analyze_read(pair[0])
+    a2 = _analyze_read(pair[1])
     # 하나라도 입력창 미발견 → 판독 불가
     if not a1[0] or not a2[0]:
         return EXIT_INDET, "input box not located in one or both reads"
@@ -244,7 +282,7 @@ def probe_submit(args):
         texts = _load_files(files)  # 디렉터리/부재 → 예외 → 상위 guard → exit3
         if len(texts) == 1:
             texts = [texts[0], texts[0]]
-        return _judge_submit(texts)
+        return _judge_submit([(t, None) for t in texts])
     # live
     budget = max(1, args.reread)
     last = (EXIT_INDET, "no read performed")
