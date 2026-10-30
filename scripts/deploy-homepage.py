@@ -16,11 +16,11 @@
     바로 아래 형제인 윈도우 안내(`dl-hero__winnote`)는 릴리스 체크리스트 ⓐ 필수 잔존 항목이라
     **반드시 살려둔다**. 세목은 아래 strip_main_macnote() 위 주석 참조.
 
-기본은 dry-run. `--apply` 를 줘야 실제로 올린다.
+dry-run 만 한다. `--apply` 는 거부된다(exit 2 · PKG-3B M1): 그 경로는 다른 버전의 자산을 FTP 로 전부 지웠고,
+릴리스 절차(docs/HOMEPAGE_0.14.56.md)는 SSH 릴리스 경로로 올린다.
 
 사용:
   python3 scripts/deploy-homepage.py 0.14.5 <자산디렉터리> --skeleton-dir <검토된 골격 폴더>           # 계획만
-  python3 scripts/deploy-homepage.py 0.14.5 <자산디렉터리> --skeleton-dir <검토된 골격 폴더> --apply   # 집행
   ★--skeleton-dir 는 필수다(H-04-R): 검토된 페이지 골격 2종(저장소 밖)이 없거나·못 읽거나·핀과 다르면 아무것도 받지도
     올리지도 않고 exit 1. 페이지는 골격 render 로만 만들고, 올리기 전 바이트 단위 게이트를 통과해야 한다.
   python3 scripts/deploy-homepage.py --self-test                     # 삭제 로직 셀프테스트(무접촉)
@@ -452,9 +452,16 @@ def build_pages(live_pages, ver, sizes_bytes, skeletons, fetch_js, dpc, profiles
     return out, refusals, macrep
 
 
+APPLY_REFUSAL = ("::error::--apply is refused: this route FTP-deletes every other version's assets; publish the homepage "
+                 "with the SSH release route in docs/HOMEPAGE_0.14.56.md (a run without --apply still plans)")
+
+
 def main(argv):
     if "--self-test" in argv[1:]:
         return self_test()
+    if "--apply" in argv[1:]:   # PKG-3B M1: refused before any credential load or network call
+        print(APPLY_REFUSAL, file=sys.stderr)
+        return 2
     if len(argv) < 3:
         print(__doc__.strip(), file=sys.stderr)
         return 2
@@ -531,12 +538,6 @@ def main(argv):
             if not ok:
                 return 1
 
-    print("── 구버전 자산 정리 (최신 1개 정책) ──")
-    for l in live:
-        name = l.split()[-1] if l.split() else ""
-        m = re.search(r"cys_(\d+\.\d+\.\d+)_", name)
-        if m and m.group(1) != ver:
-            print("  %s rm %s" % ("✓" if ftp_delete(e, "downloads/" + name) else "✗", name))
     print("\n✅ 홈페이지 배포 완료")
     return 0
 

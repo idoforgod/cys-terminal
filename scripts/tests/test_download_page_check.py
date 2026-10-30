@@ -669,6 +669,54 @@ class DeployPageStep(unittest.TestCase):
             self.dep.load_env, self.dep.curl = saved
         return rc, err.getvalue()
 
+    def test_apply_is_refused_before_credentials_and_network(self):
+        """PKG-3B M1 (HEAD-RULING-PKG3B-R1 1): --apply FTP-deleted every other version's assets and
+        docs/HOMEPAGE_0.14.56.md forbids that route. It is refused with exit 2 before any credential load or network
+        call. Every stub below records; with the refusal removed the run reaches load_env, ftp_list, fetch_bytes and
+        ftp_put, so the zero-calls assertion (first) is the one that turns red."""
+        calls = []
+        names = ("load_env", "curl", "ftp_list", "ftp_put", "ftp_delete", "sftp_put", "fetch", "fetch_bytes")
+        saved = {n: getattr(self.dep, n) for n in names + ("load_page_check", "load_skeletons", "build_pages")}
+
+        def rec(name, ret):
+            def f(*a, **k):
+                calls.append(name)
+                return ret
+            return f
+        stubs = {"load_env": {"FTP_HOST": "h", "FTP_USER": "u", "FTP_PASS": "p"}, "curl": None,
+                 "ftp_list": [], "ftp_put": True, "ftp_delete": True, "sftp_put": True, "fetch": "", "fetch_bytes": b"p"}
+        for n in names:
+            setattr(self.dep, n, rec(n, stubs[n]))
+        self.dep.load_page_check = lambda: dpc
+        self.dep.load_skeletons = lambda *a, **k: ({}, [])
+        self.dep.build_pages = lambda *a, **k: ({"index.html": b"i", "downloads/index.html": b"d"}, [], None)
+        assets = fresh("assets-apply")
+        os.makedirs(assets)
+        for f in ("cys_%s_aarch64.dmg", "cys_%s_x64.dmg", "cys_%s_x64-setup.exe", "cys_%s_x64-setup.zip"):
+            with open(os.path.join(assets, f % V2), "wb") as fh:
+                fh.write(b"x")
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                rc = self.dep.main(["deploy-homepage.py", V2, assets, "--skeleton-dir", fresh("skel-unused"), "--apply"])
+        finally:
+            for n, v in saved.items():
+                setattr(self.dep, n, v)
+        self.assertEqual(calls, [], "--apply reached credentials or the network")
+        self.assertEqual(rc, 2, err.getvalue())
+        self.assertIn("docs/HOMEPAGE_0.14.56.md", err.getvalue())
+        self.assertIn("SSH", err.getvalue())
+        self.assertEqual(len(err.getvalue().strip().splitlines()), 1, err.getvalue())
+
+    def test_usage_no_longer_advertises_apply_and_nothing_deletes(self):
+        doc = self.dep.__doc__
+        usage = doc[doc.index("사용:"):]
+        self.assertNotIn("--apply  ", usage)
+        self.assertFalse([l for l in usage.splitlines() if "--apply" in l and "#" in l and "집행" in l], usage)
+        with open(os.path.join(SCRIPTS, "deploy-homepage.py"), encoding="utf-8") as f:
+            src = f.read()
+        self.assertEqual(src.count("ftp_delete("), 1, "ftp_delete must have no caller (only its def remains)")
+
     def test_missing_flag_refuses(self):
         rc, err = self.refuse_before_anything([])
         self.assertEqual(rc, 1, err)
