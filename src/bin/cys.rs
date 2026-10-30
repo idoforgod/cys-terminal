@@ -1810,6 +1810,7 @@ enum CycleTargetState {
 
 /// 판정 입력 — 한 왕복의 관측을 그대로 담는다(합성 금지).
 struct CycleTargetObs<'a> {
+    composer: Option<&'a Value>,
     screen: Option<&'a str>,
     quiet: Option<bool>,
     /// 이 프레임에 첫기동 관문·모달이 서 있는가 — 참이면 어떤 축으로도 유휴를 선언하지 않는다.
@@ -1829,11 +1830,15 @@ struct CycleTargetObs<'a> {
 /// ANCHOR ④ pane 전멸). 실패 방향은 보류(rc 84)이고 그 귀결은 다음 사이클 재시도다.
 fn cycle_target_state(o: &CycleTargetObs<'_>) -> CycleTargetState {
     // 사람 초안은 어느 화면에서도 보류한다. 구 데몬의 사람 축 미보고도 종전처럼 보호한다.
-    if o.human_bytes.unwrap_or(0) > 0 {
+    if o.human_bytes.unwrap_or(0) > 0
+        || o.composer.and_then(|c| c["human_bytes"].as_u64()).unwrap_or(0) > 0
+    {
         return CycleTargetState::HumanDraft;
     }
-    let machine_residue = if o.pending_bytes.unwrap_or(0) > 0 {
-        if o.human_bytes.is_none() {
+    let pending = o.composer.and_then(|c| c["pending_bytes"].as_u64()).or(o.pending_bytes);
+    let human = o.composer.and_then(|c| c["human_bytes"].as_u64()).or(o.human_bytes);
+    let machine_residue = if pending.unwrap_or(0) > 0 {
+        if human.is_none() {
             return CycleTargetState::HumanDraft;
         }
         true
@@ -1845,6 +1850,29 @@ fn cycle_target_state(o: &CycleTargetObs<'_>) -> CycleTargetState {
     let Some(screen) = o.screen else {
         return CycleTargetState::Busy;
     };
+    if let Some(c) = o.composer {
+        // A present but torn export never supplies a usable observation/fence.
+        if c["output_gen"].as_u64().is_none() || c["input_gen"].as_u64().is_none() {
+            return CycleTargetState::Busy;
+        }
+        if c["owner"].as_str() == Some("own_paste") {
+            return CycleTargetState::Busy;
+        }
+        if c["modal"].as_bool() != Some(false) {
+            return CycleTargetState::Busy;
+        }
+        if c["governed"].as_bool() == Some(true) {
+            let residue = machine_residue || (human == Some(0) && c["owner"].as_str() == Some("machine"));
+            let ready = o.quiet == Some(true) && !o.gate_or_modal;
+            match c["verdict"].as_str() {
+                Some("draft") => return if !ready { CycleTargetState::Busy }
+                    else if residue { CycleTargetState::MachineResidue } else { CycleTargetState::HumanDraft },
+                Some("empty" | "placeholder" | "suggestion") => return if !ready { CycleTargetState::Busy }
+                    else if residue { CycleTargetState::MachineResidue } else { CycleTargetState::Idle },
+                _ => {} // Old/unknown adapters retain the text-only decision below.
+            }
+        }
+    }
     let Some(marker) = o.marker else {
         return if o.quiet == Some(true) && !o.gate_or_modal {
             if machine_residue {
@@ -1958,6 +1986,7 @@ fn cycle_target_observation(
     let resolved_marker =
         screen_text.and_then(|text| cys::agent_markers::pick_marker_leading_on_screen(marker, text));
     let state = cycle_target_state(&CycleTargetObs {
+        composer: screen.as_ref().and_then(|r| r.get("composer")).filter(|c| c.is_object()),
         screen: screen_text,
         gate_or_modal,
         quiet: cys::readiness::idle_quiet_from(
@@ -1991,7 +2020,7 @@ fn observe_cycle_target(
     placeholder: Option<&str>,
     gates: &[cys::first_run_gates::Gate],
 ) -> CycleTargetObservation {
-    let screen = request("surface.read_text", json!({"surface_id": sid}));
+    let screen = request("surface.read_text", json!({"surface_id": sid, "composer": true}));
     let entry = surface_entry(sid);
     cycle_target_observation(screen, entry, marker, placeholder, gates)
 }
@@ -42167,8 +42196,43 @@ mod tests {
     }
 
     #[test]
+    fn p1_e_d2_composer_export_controls_cycle_classification() {
+        let screen = "❯ carry on please\n";
+        let classify = |composer: Option<Value>, pending: u64, human: u64| {
+            let mut reply = json!({"text": screen, "quiet_secs": 10.0});
+            if let Some(c) = composer { reply["composer"] = c; }
+            cycle_target_observation(Ok(reply), Ok(json!({
+                "pending_input_bytes": pending, "pending_input_human_bytes": human
+            })), &["❯".to_string()], None, &[]).state
+        };
+        let c = |verdict: &str, owner: &str, pending: u64, human: u64| json!({
+            "verdict": verdict, "governed": true, "owner": owner, "owner_kind": "verified",
+            "modal": false, "output_gen": 8, "input_gen": 3,
+            "pending_bytes": pending, "human_bytes": human
+        });
+        for verdict in ["suggestion", "empty", "placeholder"] {
+            assert_eq!(classify(Some(c(verdict,"none",0,0)),0,0), CycleTargetState::Idle, "T-C1 {verdict}");
+            assert_eq!(classify(Some(c(verdict,"machine",6,0)),6,0), CycleTargetState::MachineResidue, "T-C4 {verdict}");
+        }
+        assert_eq!(classify(None,0,0), CycleTargetState::HumanDraft, "T-C2 absent");
+        assert_eq!(classify(Some(c("unknown","none",0,0)),0,0), CycleTargetState::HumanDraft, "unknown fallback");
+        assert_eq!(classify(Some(c("suggestion","none",0,0)),0,1), CycleTargetState::HumanDraft, "T-C3 entry human");
+        assert_eq!(classify(Some(c("suggestion","none",0,1)),0,0), CycleTargetState::HumanDraft, "T-C3 frame human");
+        assert_eq!(classify(Some(c("empty","own_paste",0,0)),0,0), CycleTargetState::Busy, "own paste precedes empty");
+        assert_eq!(classify(Some(c("draft","machine",0,0)),0,0), CycleTargetState::MachineResidue, "owner proof with zero mirror");
+        assert_eq!(classify(Some(c("draft","none",0,0)),0,0), CycleTargetState::HumanDraft, "unowned draft");
+        let mut moved = c("suggestion","none",0,0); moved["output_gen"] = Value::Null;
+        assert_eq!(classify(Some(moved),0,0), CycleTargetState::Busy, "inconsistent frame");
+        let mut modal = c("suggestion","none",0,0); modal["modal"] = json!(true);
+        assert_eq!(classify(Some(modal),0,0), CycleTargetState::Busy, "same frame modal");
+        let mut ung = c("suggestion","none",0,0); ung["governed"] = json!(false);
+        assert_eq!(classify(Some(ung),0,0), CycleTargetState::HumanDraft, "ungoverned fallback");
+    }
+
+    #[test]
     fn d16_target_state_busy_when_output_streaming() {
         let mut obs = CycleTargetObs {
+        composer: None,
             gate_or_modal: false,
             screen: Some(cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT),
             quiet: Some(false),
@@ -42186,6 +42250,7 @@ mod tests {
     #[test]
     fn d16_target_state_idle_on_quiet_empty_composer() {
         let mut obs = CycleTargetObs {
+        composer: None,
             gate_or_modal: false,
             screen: Some(cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT),
             quiet: Some(true),
@@ -42205,6 +42270,7 @@ mod tests {
     #[test]
     fn d16_target_state_human_draft() {
         let mut obs = CycleTargetObs {
+        composer: None,
             gate_or_modal: false,
             screen: None,
             quiet: Some(false),
@@ -42255,6 +42321,7 @@ mod tests {
         ] {
             assert_eq!(
                 cycle_target_state(&CycleTargetObs {
+        composer: None,
                     gate_or_modal: false,
                     screen,
                     quiet,
@@ -42275,6 +42342,7 @@ mod tests {
         ] {
             assert_eq!(
                 cycle_target_state(&CycleTargetObs {
+        composer: None,
                     gate_or_modal: false,
                     screen: Some("마커 없는 화면"),
                     quiet,
@@ -42357,6 +42425,7 @@ mod tests {
             );
             assert_eq!(
                 cycle_target_state(&CycleTargetObs {
+        composer: None,
                     gate_or_modal: false,
                     screen: Some(screen),
                     quiet: Some(true),
@@ -42403,6 +42472,7 @@ mod tests {
             ] {
                 assert_eq!(
                     cycle_target_state(&CycleTargetObs {
+        composer: None,
                         gate_or_modal: false,
                         screen: Some(screen),
                         quiet,
