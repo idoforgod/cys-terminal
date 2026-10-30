@@ -851,7 +851,14 @@ def _run_mutating(argv, bound, env=None):
     (None, message naming the pid and the log); the caller returns non-zero and never retries."""
     fd, log = tempfile.mkstemp(prefix="javis-org-%s-" % os.path.basename(argv[0]), suffix=".log")
     with os.fdopen(fd, "w+b") as f:
-        p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT, env=env)
+        try:
+            p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT, env=env)
+        except BaseException:      # nothing started: the log has no reader, remove it and fail as subprocess.run did
+            try:
+                os.unlink(log)
+            except OSError:
+                pass
+            raise
         try:
             rc = p.wait(timeout=bound)
         except subprocess.TimeoutExpired:
