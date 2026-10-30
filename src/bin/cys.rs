@@ -33417,7 +33417,7 @@ mod tests {
             arm.contains("let from = cys::env_compat(ENV_SURFACE_ID).and_then(|s| parse_surface_ref(&s));"),
             "from 해석은 cys send 와 같은 규칙"
         );
-        let r2 = arm.split("Err(e) if should_queue_fallback_send_key(queued, key, &e) => {").nth(1).expect("r2");
+        let r2 = arm.split("Err(e) if expect_output_gen.is_none() && should_queue_fallback_send_key(queued, key, &e) => {").nth(1).expect("r2");
         let r2 = &r2[..r2.find(")?;").expect("r2 끝")];
         assert!(r2.contains("\"queued\": true, \"pair_return\": pair}"), "폴백 r2 종전 바이트: {r2}");
         assert!(r2.contains("if let Some(f) = from {") && r2.contains("retry[\"from\"] = json!(f);"),
