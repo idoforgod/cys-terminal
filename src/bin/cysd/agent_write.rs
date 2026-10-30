@@ -224,6 +224,8 @@ pub struct Request {
     status: Mutex<Status>,
     /// In-process completion ended, including a caught callback panic. Not durable source settlement.
     settled: AtomicBool,
+    #[cfg(test)]
+    p1_supervisor_completion: Mutex<P1SupervisorCompletion>,
     /// When the receiver proof was last lost (admission or recheck): the S4-1 resume window counts from here.
     lost_at: Mutex<Option<Instant>>,
     native: Mutex<NativeState>,
@@ -250,6 +252,8 @@ impl Request {
             cancelled: AtomicBool::new(false),
             status: Mutex::new(Status::AcceptedPending),
             settled: AtomicBool::new(false),
+            #[cfg(test)]
+            p1_supervisor_completion: Mutex::new(P1SupervisorCompletion::default()),
             lost_at: Mutex::new(None),
             native: Mutex::new(NativeState { plan: admitted_plan.cloned(), ..NativeState::default() }),
             managed: admitted_plan.is_some(),
@@ -1163,6 +1167,12 @@ pub fn finish(job: AgentJob, ex: &Executed) -> Terminal {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || settle(&t)));
     }
     job.request.settled.store(true, Ordering::Release);
+    #[cfg(test)]
+    if !job.request.managed && job.request.origin == "supervisor" {
+        let mut receipt = job.request.p1_supervisor_completion.lock().unwrap();
+        receipt.completed = Some(terminal.clone());
+        for tx in receipt.subscribers.drain(..) { let _ = tx.send(terminal.clone()); }
+    }
     terminal
 }
 
@@ -1214,6 +1224,13 @@ thread_local! {
 pub fn test_wait_settled(req: &Request) {
     #[cfg(test)]
     {
+        P1_ADMISSION_OBSERVER.with(|slot| {
+            let matching = slot.borrow().as_ref().is_some_and(|o| o.surface_id == req.surface_id && o.origin == req.origin);
+            if matching {
+                let observer = slot.borrow_mut().take().unwrap();
+                (observer.notify)(req);
+            }
+        });
         if SYNC_SETTLE.with(|c| c.get()) {
             let deadline = Instant::now() + Duration::from_secs(10);
             while !req.is_settled() && Instant::now() < deadline {
@@ -3016,4 +3033,56 @@ mod tests {
         assert!(job.request.reserve_attempt(&plan,None).is_ok());
     }
 
+}
+
+
+// P1 WC-1 observer data only: no field, allocation, callback or lock in non-test builds.
+#[cfg(test)]
+#[derive(Default)]
+struct P1SupervisorCompletion {
+    completed: Option<Terminal>,
+    subscribers: Vec<std::sync::mpsc::Sender<Terminal>>,
+}
+
+#[cfg(test)]
+impl Request {
+    pub(crate) fn p1_subscribe_supervisor_completion(&self, tx: std::sync::mpsc::Sender<Terminal>) -> Result<(), String> {
+        if self.managed || self.origin != "supervisor" {
+            return Err("P1 observer supports ordinary supervisor requests only".into());
+        }
+        let mut receipt = self.p1_supervisor_completion.lock().unwrap();
+        if let Some(terminal) = &receipt.completed {
+            tx.send(terminal.clone()).map_err(|_| "completion receiver dropped".to_string())?;
+        } else {
+            receipt.subscribers.push(tx);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+struct P1AdmissionNotification {
+    surface_id: u64,
+    origin: &'static str,
+    notify: Box<dyn FnOnce(&Request)>,
+}
+#[cfg(test)]
+thread_local! {
+    static P1_ADMISSION_OBSERVER: std::cell::RefCell<Option<P1AdmissionNotification>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+pub(crate) struct P1AdmissionObserver(Option<P1AdmissionNotification>);
+#[cfg(test)]
+impl Drop for P1AdmissionObserver {
+    fn drop(&mut self) {
+        P1_ADMISSION_OBSERVER.with(|slot| *slot.borrow_mut() = self.0.take());
+    }
+}
+#[cfg(test)]
+pub(crate) fn p1_observe_admission(
+    surface_id: u64, origin: &'static str, notify: impl FnOnce(&Request) + 'static,
+) -> P1AdmissionObserver {
+    P1AdmissionObserver(P1_ADMISSION_OBSERVER.with(|slot| slot.replace(Some(P1AdmissionNotification {
+        surface_id, origin, notify: Box::new(notify),
+    }))))
 }
