@@ -226,6 +226,14 @@ def main():
     check("#5b interpreter cannot start: degraded restore (one line, state head, lead note)",
           sum(1 for ln in out.splitlines() if "degraded" in ln and "unbounded" in ln) == 1
           and "HUB-SS-MARKER" in out and LEAD_CLEAR in out, "out=%r" % out[-500:])
+    fx = fixture("i5d", shadows=(), leaf=False)
+    dept = os.path.join(fx["root"], "pack-dept-t1")
+    os.makedirs(os.path.join(dept, "round"))
+    _write(os.path.join(dept, "round", "SESSION_STATE.md"), "# S\nDEPT-SS-MARKER\n다음 액션: r09 착수\n")
+    r = run_hook(fx, "clear", role="worker-1", extra={"CYS_PACK_DIR": dept})
+    check("#5d degraded restore keeps U13: a dept member seat gets the pointer, not the head's SESSION_STATE",
+          "DEPT-SS-MARKER" not in r.stdout and "master 소관" in r.stdout and "착수 게이트" in r.stdout
+          and "degraded" in r.stdout, "out=%r" % r.stdout[-500:])
     fx = fixture("i5c", shadows=())
     r = run_hook(fx, payload='{"source": "clear", ', role="master")
     check("#5c malformed hook JSON: restored as startup with one warning line",
