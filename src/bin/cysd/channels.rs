@@ -4682,13 +4682,26 @@ mod tests {
         h3_done(&m);
     }
 
+    // WC-2 fixture data only; READY/ACK/writer synchronization lives in the sole shared recorder.
+    #[cfg(unix)]
+    fn p1_wc2_channel_rig(tag: &str) -> (Arc<Daemon>, crate::agent_queue_tests::P1Recorder) {
+        let d = tmp_daemon(tag);
+        seed_registered(&d, "slack", "t");
+        call(&d, "allow", json!({"channel": "slack", "sender_id": "U1"}), None);
+        let recorder = crate::agent_queue_tests::p1_recorder(&d, d.socket_path.parent().unwrap(), tag, Some("master"));
+        *recorder.surface.agent_meta.lock().unwrap() = Some(("claude".into(), "/usr/local/bin/claude".into()));
+        crate::governance::h_paint(&recorder.surface, crate::governance::H_IDLE_SCREEN);
+        (d, recorder)
+    }
+
     /// S-C1: five busy observations hold without a ledger record; the first idle pass delivers.
     #[cfg(unix)]
     #[test]
     fn d9_h3_row_refused_on_every_pass_with_a_write_ahead_until_one_without() {
-        let (d, m) = h3_rig("d9-h3-kpass");
+        let _async_scope = crate::agent_write::p1_sync_settle(false);
+        let (d, mut recorder) = p1_wc2_channel_rig("d9-h3-kpass"); let m = recorder.surface.clone();
         let id = h3_seed(&d, "k0", now());
-        let release = crate::agent_queue_tests::hold_writer(&m);
+        let release = crate::agent_queue_tests::p1_hold_writer(&m);
         for k in 0..5 {
             let r = {
                 let g = d.channels.lock().unwrap();
@@ -4700,15 +4713,16 @@ mod tests {
             assert_eq!(h3_state(&d, id), "new");
         }
         assert_eq!(d.bus.tail(400).iter().filter(|e| e["name"] == "channel.message.write_refused").count(), 0, "S-C1: no refusals during holds");
-        release.send(()).unwrap();
-        crate::agent_queue_tests::wait_until("writer idle", || m.write_tx.gate().pending() == 0);
+        assert_eq!(crate::agent_queue_tests::p1_wait_completion(crate::agent_queue_tests::p1_writer_idle(&m), std::time::Duration::ZERO), Err(crate::agent_queue_tests::P1WaitError::CompletionTimeout { event: "writer operation leases released" }), "retained non-expiring holder: exact named guard failure");
+        release.release();
+        crate::agent_queue_tests::p1_wait_completion(crate::agent_queue_tests::p1_writer_idle(&m), std::time::Duration::from_secs(60)).expect("writer idle");
         let r = {
             let g = d.channels.lock().unwrap();
             deliver_new_inbox_with(&d, g.as_ref().unwrap())
         };
         assert_eq!(r.delivered, vec![id], "S-C1: first idle pass delivers");
         assert_eq!(crate::governance::h_ledger_count(&d, "channel"), 1);
-        h3_done(&m);
+        let _complete_prefix = recorder.barrier();
     }
 
     #[cfg(unix)]
@@ -4732,28 +4746,31 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn d9_bound_i2_channel_late_hold_rolls_back_row_and_mark() {
-        let (d, m) = h3_rig("i2-ch-late");
+        let _async_scope = crate::agent_write::p1_sync_settle(false);
+        let (d, mut recorder) = p1_wc2_channel_rig("i2-ch-late"); let m = recorder.surface.clone();
         let id = h3_seed(&d, "late", now());
         let release = Arc::new(std::sync::Mutex::new(None));
         {
             let m = m.clone(); let release = release.clone();
-            crate::agent_write::set_test_after_pre_record(move |_| *release.lock().unwrap() = Some(crate::agent_queue_tests::hold_writer(&m)));
+            crate::agent_write::set_test_after_pre_record(move |_| *release.lock().unwrap() = Some(crate::agent_queue_tests::p1_hold_writer(&m)));
         }
         let r = { let g = d.channels.lock().unwrap(); deliver_new_inbox_with(&d, g.as_ref().unwrap()) };
         assert!(r.delivered.is_empty(), "channel late hold must not hand off");
         assert_eq!(r.hold, Some(InboxHold::Paced));
         assert_eq!(h3_state(&d, id), "new", "late hold rolls back UPDATE");
         assert!(m.inject_track.handoff_pending().is_none(), "late hold undoes owned handoff mark");
-        release.lock().unwrap().take().unwrap().send(()).unwrap();
-        crate::agent_queue_tests::wait_until("idle", || m.write_tx.gate().pending() == 0);
-        assert_eq!(h3_drain(&d, 1), vec![id]);
-        h3_done(&m);
+        assert_eq!(crate::agent_queue_tests::p1_wait_completion(crate::agent_queue_tests::p1_writer_idle(&m), std::time::Duration::ZERO), Err(crate::agent_queue_tests::P1WaitError::CompletionTimeout { event: "writer operation leases released" }), "retained non-expiring holder: exact named guard failure");
+        release.lock().unwrap().take().unwrap().release();
+        crate::agent_queue_tests::p1_wait_completion(crate::agent_queue_tests::p1_writer_idle(&m), std::time::Duration::from_secs(60)).expect("idle");
+        assert_eq!({ let g = d.channels.lock().unwrap(); deliver_new_inbox_with(&d, g.as_ref().unwrap()).delivered }, vec![id]);
+        let _complete_prefix = recorder.barrier();
     }
 
     #[cfg(unix)]
     #[test]
     fn d9_bound_i2_redelivery_holds_restore_exact_state_and_keep_inflight_slot() {
-        let (d, m) = h3_rig("i2-redeliver");
+        let _async_scope = crate::agent_write::p1_sync_settle(false);
+        let (d, mut recorder) = p1_wc2_channel_rig("i2-redeliver"); let m = recorder.surface.clone();
         let _k = crate::governance::HKnobGuard::set(&[("CYS_CHANNEL_REDELIVER_MAX", "2")]);
         let id = h3_seed(&d, "redelivery", now());
         let old_ts = now() - INBOX_REDELIVER_TTL_SECS - 20.0;
@@ -4763,29 +4780,30 @@ mod tests {
         }
         let pass = || { let g = d.channels.lock().unwrap(); redeliver_unacked(&d, g.as_ref().unwrap()) };
         let row = || { let g = d.channels.lock().unwrap(); g.as_ref().unwrap().query_row("SELECT injected_ts,redelivered FROM inbox WHERE id=?1", [id], |r| Ok((r.get::<_, f64>(0)?,r.get::<_, i64>(1)?))).unwrap() };
-        let held = crate::agent_queue_tests::hold_writer(&m);
+        let held = crate::agent_queue_tests::p1_hold_writer(&m);
         assert_eq!(pass(), 0, "redelivery early hold");
         assert_eq!(crate::governance::h_ledger_count(&d, "channel"), 0);
-        held.send(()).unwrap();
-        crate::agent_queue_tests::wait_until("idle", || m.write_tx.gate().pending() == 0);
+        assert_eq!(crate::agent_queue_tests::p1_wait_completion(crate::agent_queue_tests::p1_writer_idle(&m), std::time::Duration::ZERO), Err(crate::agent_queue_tests::P1WaitError::CompletionTimeout { event: "writer operation leases released" }), "retained non-expiring holder: exact named guard failure");
+        held.release();
+        crate::agent_queue_tests::p1_wait_completion(crate::agent_queue_tests::p1_writer_idle(&m), std::time::Duration::from_secs(60)).expect("idle");
         let release = Arc::new(std::sync::Mutex::new(None));
         {
             let m = m.clone(); let release = release.clone();
-            crate::agent_write::set_test_after_pre_record(move |_| *release.lock().unwrap() = Some(crate::agent_queue_tests::hold_writer(&m)));
+            crate::agent_write::set_test_after_pre_record(move |_| *release.lock().unwrap() = Some(crate::agent_queue_tests::p1_hold_writer(&m)));
         }
         assert_eq!(pass(), 0, "redelivery late hold");
         assert_eq!(row(), (old_ts, 0), "late hold restores timestamp and retry count exactly");
         assert!(m.inject_track.handoff_pending().is_none());
-        release.lock().unwrap().take().unwrap().send(()).unwrap();
-        crate::agent_queue_tests::wait_until("idle", || m.write_tx.gate().pending() == 0);
-        let late_release = crate::agent_queue_tests::d9_late_hold(&m, None);
+        release.lock().unwrap().take().unwrap().release();
+        crate::agent_queue_tests::p1_wait_completion(crate::agent_queue_tests::p1_writer_idle(&m), std::time::Duration::from_secs(60)).expect("idle");
+        let late_release = crate::agent_queue_tests::p1_late_hold(&m, None);
         assert_eq!(pass(), 1, "idle redelivery hands off");
         assert_eq!(pass(), 0, "inflight row not eligible yet");
         assert!(m.claim_streaks.lock().unwrap()[2].is_some(), "ineligible but unacked row keeps its slot until terminal");
-        late_release.recv_timeout(std::time::Duration::from_secs(10)).expect("late idle seam did not run").send(()).unwrap();
-        crate::agent_queue_tests::wait_until("terminal", || m.write_tx.gate().pending() == 0);
+        late_release.lock().unwrap().take().expect("late idle seam did not run").release();
+        crate::agent_queue_tests::p1_wait_completion(crate::agent_queue_tests::p1_writer_idle(&m), std::time::Duration::from_secs(60)).expect("terminal");
         assert!(m.claim_streaks.lock().unwrap()[2].is_none(), "byte-writing terminal clears redelivery slot");
-        h3_done(&m);
+        let _complete_prefix = recorder.barrier();
     }
 
     #[cfg(unix)]
@@ -4798,18 +4816,22 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn d9_bound_i3_claim_and_nonclaim_refusals_have_disjoint_reporting() {
-        let(d,m)=h3_rig("i3-c2");let _cleanup=D9H3Stop(m.clone());let id=h3_seed(&d,"i3-c2",now());
+        let _async_scope = crate::agent_write::p1_sync_settle(false);
+        let(d,mut recorder)=p1_wc2_channel_rig("i3-c2"); let m = recorder.surface.clone();let _cleanup=D9H3Stop(m.clone());let id=h3_seed(&d,"i3-c2",now());
         let pass=||{let g=d.channels.lock().unwrap();deliver_new_inbox_with(&d,g.as_ref().unwrap())};
         let refused=||d.bus.tail(1000).into_iter().filter(|e|e["name"]=="channel.message.write_refused").collect::<Vec<_>>();
         *m.receiver_proof.lock().unwrap()=Some(Arc::new(C6bRefuse));
         for _ in 0..5 {
-            assert_eq!(pass().delivered,vec![id]);crate::agent_queue_tests::wait_until("nonclaim terminal",||m.write_tx.gate().pending()==0);
+            let delayed = crate::agent_queue_tests::p1_late_hold(&m, None);
+            assert_eq!(pass().delivered,vec![id]);assert_eq!(crate::agent_queue_tests::p1_wait_completion(crate::agent_queue_tests::p1_writer_idle(&m), std::time::Duration::ZERO), Err(crate::agent_queue_tests::P1WaitError::CompletionTimeout { event: "writer operation leases released" }), "retained non-expiring holder: exact named guard failure");
+            delayed.lock().unwrap().take().expect("actual late-idle producer seam").release();
+            crate::agent_queue_tests::p1_wait_completion(crate::agent_queue_tests::p1_writer_idle(&m), std::time::Duration::from_secs(60)).expect("nonclaim terminal");
             assert_eq!(refused().len(),1,"nonclaim repeated K sweeps is reported once");
         }
         *m.receiver_proof.lock().unwrap()=None;
         for n in 1..=5 {
-            crate::agent_queue_tests::d9_s0_foreign_write_after_pre_record(&m,b"");
-            assert_eq!(pass().delivered,vec![id]);crate::agent_queue_tests::wait_until("claim terminal",||m.write_tx.gate().pending()==0);
+            crate::agent_queue_tests::p1_s0_foreign_write_after_pre_record(&m,b"");
+            assert_eq!(pass().delivered,vec![id]);crate::agent_queue_tests::p1_wait_completion(crate::agent_queue_tests::p1_writer_idle(&m), std::time::Duration::from_secs(60)).expect("claim terminal");
             let ns:Vec<_>=refused().iter().filter_map(|e|e["payload"]["refusal_n"].as_u64()).collect();
             let want:Vec<_>=(1..=n.min(3)).collect();
             assert_eq!(ns,want,"S-C2: retained nonclaim map must not suppress claim events");
@@ -4817,77 +4839,95 @@ mod tests {
         let ev:Vec<_>=d.bus.tail(1000).into_iter().filter(|e|e["name"]=="writer.claim_escalated").collect();
         assert_eq!(ev.len(),1,"S-C2: one escalation");assert_eq!(ev[0]["payload"]["producer"],"channel_new");
         assert_eq!(crate::agent_queue_tests::d9_status(&d,m.id)["writer_claim"]["refusals_total"]["channel_new"],5);
-        assert_eq!(h3_drain(&d,1),vec![id]);crate::agent_queue_tests::wait_until("written terminal",||m.write_tx.gate().pending()==0);
+        assert_eq!({ let g = d.channels.lock().unwrap(); deliver_new_inbox_with(&d, g.as_ref().unwrap()).delivered },vec![id]);crate::agent_queue_tests::p1_wait_completion(crate::agent_queue_tests::p1_writer_idle(&m), std::time::Duration::from_secs(60)).expect("written terminal");
         assert!(crate::agent_queue_tests::d9_status(&d,m.id)["writer_claim"]["slots"]["channel_new"].is_null());
+        let _complete_prefix = recorder.barrier();
     }
 
     #[cfg(unix)]
     #[test]
     fn d9_bound_i3_settling_busy_channel_escalates_once() {
+        let _async_scope = crate::agent_write::p1_sync_settle(false);
         for redelivery in [false, true] {
-            let(d,m)=h3_rig(if redelivery { "i3-f4-red" } else { "i3-f4-new" });
+            let(d,mut recorder)=p1_wc2_channel_rig(if redelivery { "i3-f4-red" } else { "i3-f4-new" }); let m = recorder.surface.clone();
             let _cleanup=D9H3Stop(m.clone());let id=h3_seed(&d,"i3-f4",now());
             let _k=crate::governance::HKnobGuard::set(&[("CYS_WRITER_HOLD_ESCALATE_SECS","1"),("CYS_CHANNEL_REDELIVER_MAX","2")]);
             if redelivery { let g=d.channels.lock().unwrap();g.as_ref().unwrap().execute("UPDATE inbox SET state='injected',injected_ts=?2 WHERE id=?1",params![id,now()-INBOX_REDELIVER_TTL_SECS-20.0]).unwrap(); }
-            let release=crate::agent_queue_tests::hold_writer(&m);let mark=m.inject_track.note_handoff();
+            let release=crate::agent_queue_tests::p1_hold_writer(&m);let mark=m.inject_track.note_handoff();
             assert!(m.write_tx.gate().pending()>0 && master_inject_settling(&m),"F4 fixture is both pending and settling");
             let escalated=||d.bus.tail(1000).into_iter().filter(|e|e["name"]=="writer.claim_escalated").collect::<Vec<_>>();
-            let t=std::time::Instant::now();
-            while escalated().is_empty() && t.elapsed()<std::time::Duration::from_secs(3) {
+            // Fixture DATA: the held interval is already older than the one-second input threshold.
+            // The tested pass must publish the event; do not wait for the event before invoking it.
+            let held_at = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(2))
+                .expect("fixture monotonic clock supports a two-second held age");
+            let mut slot = crate::state::ClaimStreak::new(&id.to_string(), held_at);
+            slot.held_since = Some(held_at);
+            slot.held_epoch = Some(now() - 2.0);
+            m.claim_streaks.lock().unwrap()[if redelivery { 2 } else { 1 }] = Some(slot);
+            {
                 let g=d.channels.lock().unwrap();
                 if redelivery { assert_eq!(redeliver_unacked(&d,g.as_ref().unwrap()),0); }
                 else { assert!(deliver_new_inbox_with(&d,g.as_ref().unwrap()).delivered.is_empty()); }
-                drop(g);std::thread::sleep(std::time::Duration::from_millis(20));
             }
             let ev=escalated();assert_eq!(ev.len(),1,"S-F4: pending writer must not hide under uncounted cooldown, redelivery={redelivery}");
             assert_eq!(ev[0]["payload"]["cause"],"not_idle");assert_eq!(ev[0]["payload"]["refusals"],0);
             assert_eq!(ev[0]["payload"]["producer"],if redelivery { "channel_redeliver" } else { "channel_new" });
-            release.send(()).unwrap();crate::agent_queue_tests::wait_until("idle",||m.write_tx.gate().pending()==0);m.inject_track.undo_handoff(mark);
+            assert_eq!(crate::agent_queue_tests::p1_wait_completion(crate::agent_queue_tests::p1_writer_idle(&m), std::time::Duration::ZERO), Err(crate::agent_queue_tests::P1WaitError::CompletionTimeout { event: "writer operation leases released" }), "retained non-expiring holder: exact named guard failure");
+            release.release();crate::agent_queue_tests::p1_wait_completion(crate::agent_queue_tests::p1_writer_idle(&m), std::time::Duration::from_secs(60)).expect("idle");m.inject_track.undo_handoff(mark);
             if redelivery { let g=d.channels.lock().unwrap();assert_eq!(redeliver_unacked(&d,g.as_ref().unwrap()),1); }
-            else { assert_eq!(h3_drain(&d,1),vec![id]); }
-            crate::agent_queue_tests::wait_until("written terminal",||m.write_tx.gate().pending()==0);
+            else { assert_eq!({ let g = d.channels.lock().unwrap(); deliver_new_inbox_with(&d, g.as_ref().unwrap()).delivered },vec![id]); }
+            crate::agent_queue_tests::p1_wait_completion(crate::agent_queue_tests::p1_writer_idle(&m), std::time::Duration::from_secs(60)).expect("written terminal");
             assert_eq!(d.bus.tail(1000).iter().filter(|e|e["name"]=="channel.message.written").count(),1,"S-C3: one completed submission after idle");
+            let _complete_prefix = recorder.barrier();
         }
     }
 
     #[cfg(unix)]
     #[test]
     fn d9_bound_i3_new_and_redelivery_streaks_are_independent() {
-        let(d,m)=h3_rig("i3-f3d");let _cleanup=D9H3Stop(m.clone());let new_id=h3_seed(&d,"new",now());let old_id=h3_seed(&d,"retry",now());
+        let _async_scope = crate::agent_write::p1_sync_settle(false);
+        let(d,mut recorder)=p1_wc2_channel_rig("i3-f3d"); let m = recorder.surface.clone();let _cleanup=D9H3Stop(m.clone());let new_id=h3_seed(&d,"new",now());let old_id=h3_seed(&d,"retry",now());
         let _k=crate::governance::HKnobGuard::set(&[("CYS_CHANNEL_REDELIVER_MAX","2")]);
         {let g=d.channels.lock().unwrap();g.as_ref().unwrap().execute("UPDATE inbox SET state='injected',injected_ts=?2 WHERE id=?1",params![old_id,now()-INBOX_REDELIVER_TTL_SECS-20.0]).unwrap();}
         for _ in 0..3 {
-            crate::agent_queue_tests::d9_s0_foreign_write_after_pre_record(&m,b"");
+            crate::agent_queue_tests::p1_s0_foreign_write_after_pre_record(&m,b"");
+            let delayed = crate::agent_queue_tests::p1_late_hold(&m, None);
             {let g=d.channels.lock().unwrap();assert_eq!(deliver_new_inbox_with(&d,g.as_ref().unwrap()).delivered,vec![new_id]);}
-            crate::agent_queue_tests::wait_until("new refused",||m.write_tx.gate().pending()==0);
-            crate::agent_queue_tests::d9_s0_foreign_write_after_pre_record(&m,b"");
+            assert_eq!(crate::agent_queue_tests::p1_wait_completion(crate::agent_queue_tests::p1_writer_idle(&m), std::time::Duration::ZERO), Err(crate::agent_queue_tests::P1WaitError::CompletionTimeout { event: "writer operation leases released" }), "retained non-expiring holder: exact named guard failure");
+            delayed.lock().unwrap().take().expect("actual new-row admission behind holder").release();
+            crate::agent_queue_tests::p1_wait_completion(crate::agent_queue_tests::p1_writer_idle(&m), std::time::Duration::from_secs(60)).expect("new refused");
+            crate::agent_queue_tests::p1_s0_foreign_write_after_pre_record(&m,b"");
             {let g=d.channels.lock().unwrap();assert_eq!(redeliver_unacked(&d,g.as_ref().unwrap()),1);}
-            crate::agent_queue_tests::wait_until("redelivery refused",||m.write_tx.gate().pending()==0);
+            crate::agent_queue_tests::p1_wait_completion(crate::agent_queue_tests::p1_writer_idle(&m), std::time::Duration::from_secs(60)).expect("redelivery refused");
         }
         let ev:Vec<_>=d.bus.tail(1000).into_iter().filter(|e|e["name"]=="writer.claim_escalated").collect();
         assert_eq!(ev.len(),2,"S-F3d: two independent producers each escalate at third refusal");
         let row=crate::agent_queue_tests::d9_status(&d,m.id);
         assert_eq!(row["writer_claim"]["refusals_total"]["channel_new"],3);assert_eq!(row["writer_claim"]["refusals_total"]["channel_redeliver"],3);
+        let _complete_prefix = recorder.barrier();
     }
 
     #[cfg(unix)]
     #[test]
     fn d9_bound_i3_acked_row_does_not_escalate_at_late_terminal() {
-        let(d,m)=h3_rig("i3-ack-race");let _cleanup=D9H3Stop(m.clone());let id=h3_seed(&d,"ack race",now());
+        let _async_scope = crate::agent_write::p1_sync_settle(false);
+        let(d,mut recorder)=p1_wc2_channel_rig("i3-ack-race"); let m = recorder.surface.clone();let _cleanup=D9H3Stop(m.clone());let id=h3_seed(&d,"ack race",now());
         let pass=||{let g=d.channels.lock().unwrap();deliver_new_inbox_with(&d,g.as_ref().unwrap())};
         for _ in 0..2 {
-            crate::agent_queue_tests::d9_s0_foreign_write_after_pre_record(&m,b"");
-            assert_eq!(pass().delivered,vec![id]);crate::agent_queue_tests::wait_until("refused",||m.write_tx.gate().pending()==0);
+            crate::agent_queue_tests::p1_s0_foreign_write_after_pre_record(&m,b"");
+            assert_eq!(pass().delivered,vec![id]);crate::agent_queue_tests::p1_wait_completion(crate::agent_queue_tests::p1_writer_idle(&m), std::time::Duration::from_secs(60)).expect("refused");
         }
-        let release=crate::agent_queue_tests::d9_late_hold(&m,Some(b""));assert_eq!(pass().delivered,vec![id]);
+        let release=crate::agent_queue_tests::p1_late_hold(&m,Some(b""));assert_eq!(pass().delivered,vec![id]);
         let acked=call(&d,"ack",json!({"inbox_id":id}),None);assert_eq!(acked["result"]["acked"],json!(true));
-        release.recv_timeout(std::time::Duration::from_secs(10)).expect("late seam").send(()).unwrap();
-        crate::agent_queue_tests::wait_until("late terminal",||m.write_tx.gate().pending()==0);
+        assert_eq!(crate::agent_queue_tests::p1_wait_completion(crate::agent_queue_tests::p1_writer_idle(&m), std::time::Duration::ZERO), Err(crate::agent_queue_tests::P1WaitError::CompletionTimeout { event: "writer operation leases released" }), "retained non-expiring holder: exact named guard failure");
+        release.lock().unwrap().take().expect("late seam").release();
+        crate::agent_queue_tests::p1_wait_completion(crate::agent_queue_tests::p1_writer_idle(&m), std::time::Duration::from_secs(60)).expect("late terminal");
         assert_eq!(d.bus.tail(1000).iter().filter(|e|e["name"]=="writer.claim_escalated").count(),0,"acked row must not escalate from a late refusal");
         let row=crate::agent_queue_tests::d9_status(&d,m.id);
         assert!(row["writer_claim"]["slots"]["channel_new"].is_null(),"acked row must not regain a slot");
         assert_eq!(row["writer_claim"]["refusals_total"]["channel_new"],3,"historical terminal still counted");
         assert_eq!(h3_state(&d,id),"acked");
+        let _complete_prefix = recorder.barrier();
     }
 
     #[test]
@@ -5206,12 +5246,16 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn h3_knob_off_is_head_identical() {
-        let (d, m) = h3_rig("h3-knob");
+        let _async_scope = crate::agent_write::p1_sync_settle(false);
+        let (d, mut recorder) = p1_wc2_channel_rig("h3-knob"); let m = recorder.surface.clone();
         let _k = crate::governance::HKnobGuard::set(&[("CYS_MACHINE_INJECT_HOLD", "schedule,ceo,supervisor,takeover")]);
         crate::governance::h_paint(&m, cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT);
+        let delayed = crate::agent_queue_tests::p1_late_hold(&m, None);
         let r = call(&d, "inbound", inbound_params("slack", "U1", "slack:k1", "HEAD", "user"), own_pid());
         assert_eq!(r["result"]["action"], json!("delivered"), "노브로 끈 채널이 보류했다: {r}");
-        crate::agent_queue_tests::wait_until("first envelope terminal", || m.write_tx.gate().pending() == 0);
+        assert_eq!(crate::agent_queue_tests::p1_wait_completion(crate::agent_queue_tests::p1_writer_idle(&m), std::time::Duration::ZERO), Err(crate::agent_queue_tests::P1WaitError::CompletionTimeout { event: "writer operation leases released" }), "retained non-expiring holder: exact named guard failure");
+        delayed.lock().unwrap().take().expect("knob-off real admission behind holder").release();
+        crate::agent_queue_tests::p1_wait_completion(crate::agent_queue_tests::p1_writer_idle(&m), std::time::Duration::from_secs(60)).expect("first envelope terminal");
         let created = now() - 700.0;
         let late = h3_seed(&d, "늦은 HEAD", created);
         {
@@ -5221,7 +5265,7 @@ mod tests {
         let want = envelope("slack", "U1", created, late, false, "늦은 HEAD");
         let led = std::fs::read_to_string(crate::delivery::ledger_path(&d.socket_path)).unwrap();
         assert!(led.contains(&crate::delivery::digest_text(&want)), "노브 0 봉투가 HEAD 와 다르다");
-        h3_done(&m);
+        let _complete_prefix = recorder.barrier();
     }
 
     // ── ★(0.14.52 · S-a C6b) inbox envelopes settle on the writer's terminal (DESIGN-S-FROZEN-R3 §3.3 channel row, §4.5) ──

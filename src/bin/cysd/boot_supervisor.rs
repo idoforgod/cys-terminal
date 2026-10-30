@@ -6349,21 +6349,32 @@ mod d9_writer_guard_tests {
     #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
     fn d9_pre_cr_t_w4_boot_notice_refused_at_claim_writes_nothing() {
         let f = fx("d9-tw4-boot");
-        let (s, out) = d9_role_recorder(&f.daemon, &f.dir, "tw4-boot", "master");
+        let mut recorder = crate::agent_queue_tests::p1_recorder(&f.daemon, &f.dir, "tw4-boot", Some("master"));
+        recorder.install_always_admit();
+        let s = recorder.surface.clone();
         let ctx = || NoticeCtx { intent: "tw4".into(), why: "test".into(), late: false };
-        d9_with_write_ahead(&s, || pane_notice_line(&f.daemon, &s, "[boot] tw4".into(), ctx(), crate::governance::D9WriterGuard::for_target(&f.daemon, &s)));
+        let holder = crate::agent_queue_tests::p1_hold_writer(&s);
+        s.write_tx.send(crate::state::WriteReq::Data(b"T".to_vec())).expect("foreign T admitted ahead of notice");
+        let (_, terminal) = crate::agent_queue_tests::p1_supervisor_call(&s, || {
+            pane_notice_line(&f.daemon, &s, "[boot] tw4".into(), ctx(), crate::governance::D9WriterGuard::for_target(&f.daemon, &s))
+        });
+        assert!(terminal.is_ok(), "the real notice enqueue precedes holder release");
+        assert_eq!(crate::agent_queue_tests::p1_wait_completion(crate::agent_queue_tests::p1_writer_idle(&s), std::time::Duration::ZERO), Err(crate::agent_queue_tests::P1WaitError::CompletionTimeout { event: "writer operation leases released" }), "retained non-expiring holder: exact named guard failure");
+        holder.release();
         // The discriminating assertion first (a written notice follows the write ahead at once), then its settlement.
-        assert_eq!(d9_received(&out, 1), b"T".to_vec(), "0 bytes of the notice - only the write ahead");
-        crate::agent_queue_tests::wait_until("the notice settled", || !skipped(&f.daemon).is_empty());
+        assert_eq!(recorder.barrier(), b"T".to_vec(), "0 bytes of the notice - only the write ahead");
+        crate::agent_queue_tests::p1_wait_completion(terminal, std::time::Duration::from_secs(60)).expect("tw4 supervisor settlement");
         let sk = skipped(&f.daemon);
         assert_eq!(sk.len(), 1, "{sk:?}");
         assert_eq!(sk[0]["payload"]["reason"], serde_json::json!("refused_no_write:guard_aborted"), "{sk:?}");
         // No foreign write: the pin's bytes.
-        pane_notice_line(&f.daemon, &s, "[boot] tw4b".into(), ctx(), crate::governance::D9WriterGuard::for_target(&f.daemon, &s));
+        let (_, terminal) = crate::agent_queue_tests::p1_supervisor_call(&s, || {
+            pane_notice_line(&f.daemon, &s, "[boot] tw4b".into(), ctx(), crate::governance::D9WriterGuard::for_target(&f.daemon, &s))
+        });
+        crate::agent_queue_tests::p1_wait_completion(terminal, std::time::Duration::from_secs(60)).expect("tw4b supervisor settlement");
         let mut want = b"T".to_vec();
         want.extend(crate::agent_write::Plan::paste("[boot] tw4b").with_submit(120, 0).planned_bytes());
-        let got = d9_received(&out, want.len());
-        let _ = s.child.lock().unwrap().kill();
+        let got = recorder.barrier();
         assert_eq!(got, want, "the pin's bytes after the refused notice");
         assert_eq!(skipped(&f.daemon).len(), 1, "the second notice was skipped");
     }
@@ -6375,16 +6386,26 @@ mod d9_writer_guard_tests {
     #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
     fn d9_bound_t_s0_boot_notice_refused_after_a_write_finished_inside_the_window() {
         let f = fx("d9-ts0-boot");
-        let (s, out) = d9_role_recorder(&f.daemon, &f.dir, "ts0-boot", "master");
+        let mut recorder = crate::agent_queue_tests::p1_recorder(&f.daemon, &f.dir, "ts0-boot", Some("master"));
+        recorder.install_always_admit();
+        let s = recorder.surface.clone();
         let ctx = NoticeCtx { intent: "ts0".into(), why: "test".into(), late: false };
         let d9 = crate::governance::D9WriterGuard::for_target(&f.daemon, &s);
-        crate::agent_queue_tests::d9_s0_foreign_write_after_pre_record(&s, b"F");
-        pane_notice_line(&f.daemon, &s, "[boot] ts0".into(), ctx, d9);
+        {
+            let s = s.clone();
+            crate::agent_write::set_test_after_pre_record(move |_| {
+                let holder = crate::agent_queue_tests::p1_hold_writer(&s);
+                s.write_tx.send(crate::state::WriteReq::Data(b"F".to_vec())).expect("S0 foreign write admitted");
+                assert_eq!(crate::agent_queue_tests::p1_wait_completion(crate::agent_queue_tests::p1_writer_idle(&s), std::time::Duration::ZERO), Err(crate::agent_queue_tests::P1WaitError::CompletionTimeout { event: "writer operation leases released" }), "retained non-expiring holder: exact named guard failure");
+                holder.release(); // ACK covers F finishing before the subject handoff.
+            });
+        }
+        let (_, terminal) = crate::agent_queue_tests::p1_supervisor_call(&s, || {
+            pane_notice_line(&f.daemon, &s, "[boot] ts0".into(), ctx, d9)
+        });
         // The discriminating assertion first (once the writer is idle the notice is written or refused), then its settlement.
-        crate::agent_queue_tests::wait_until("the writer is idle", || s.write_tx.gate().pending() == 0);
-        let _ = s.child.lock().unwrap().kill();
-        assert_eq!(std::fs::read(&out).unwrap(), b"F".to_vec(), "0 bytes of the notice - only the foreign write");
-        crate::agent_queue_tests::wait_until("the notice settled", || !skipped(&f.daemon).is_empty());
+        crate::agent_queue_tests::p1_wait_completion(terminal, std::time::Duration::from_secs(60)).expect("ts0 supervisor settlement");
+        assert_eq!(recorder.barrier(), b"F".to_vec(), "0 bytes of the notice - only the foreign write");
         let sk = skipped(&f.daemon);
         assert_eq!(sk.len(), 1, "{sk:?}");
         assert_eq!(sk[0]["payload"]["reason"], serde_json::json!("refused_no_write:guard_aborted"), "{sk:?}");
