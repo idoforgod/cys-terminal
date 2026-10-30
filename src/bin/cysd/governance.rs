@@ -8841,8 +8841,8 @@ pub(crate) fn composer_reads_empty(
 /// generation read before it and after it, the quiet sample between) plus the input counters, bracketed by `input_gen`. Consumers
 /// (`surface.read_text` `composer:true`, the frame-bound modal key, the cycle CLI through the RPC) take this object; none
 /// re-derives a field or reads a generation of its own.
-/// - Not one frame (`!frame_consistent()`, or `input_gen` moved during the collection) → `output_gen: null`, `verdict: unknown`,
-///   `quiet_secs: 0.0`.
+/// - Not one frame (`!frame_consistent()`, `input_gen` moved during the collection, or the parser lock is poisoned) →
+///   `output_gen: null`, `verdict: unknown`, `quiet_secs: 0.0`.
 /// - `governed` = [`d1_governs`]. Off D1 the verdict is `unknown` (no invented verdict) and readers keep their pin expression.
 /// - `quiet_secs` is the observation's own whole-second sample (floored; the threshold it feeds is whole, 3.0).
 /// - `owner`/`owner_kind` are informational, from the existing [`MachineDraft`] evidence on this observation's before-cursor text.
@@ -8856,7 +8856,10 @@ pub(crate) fn observe_composer_export(s: &Arc<crate::state::Surface>) -> serde_j
     let obs = observe_prompt_ext(s, &markers, false);
     composer_export_observed(s);
     let owner = draft_machine_owned(s, obs.line.as_ref().map(|(before, _)| before.as_str()));
-    let consistent = obs.frame_consistent() && s.input_gen.load(Ordering::Acquire) == input_gen;
+    // A poisoned parser lock is not one frame: the observation recovers the guard (`into_inner`), so the export refuses here.
+    // Read AFTER the observation: poison is permanent, so a panic before or during it is seen.
+    let consistent =
+        obs.frame_consistent() && s.input_gen.load(Ordering::Acquire) == input_gen && !s.parser.is_poisoned();
     let verdict = if consistent && governed {
         composer_verdict(&obs, placeholder.as_deref())
     } else {
@@ -20991,6 +20994,48 @@ mod tests {
         assert_eq!(keys, ["latest_cursor", "quiet_secs", "surface_id", "surface_ref", "text"], "{r}");
         let _ = s.child.lock().unwrap().kill();
         crate::state::test_stop_daemon(&daemon);
+    }
+
+    /// A poisoned parser lock (a holder panicked inside it) is not one frame. `observe_prompt_ext` recovers the guard with
+    /// `into_inner` (the queue observers keep doing so), so the export itself refuses: `output_gen` null, `verdict` unknown,
+    /// `quiet_secs` 0.0, whatever the recovered screen shows - here a selector row, so `modal` reads true and only the null
+    /// generation keeps it from authorizing a key. Seat A is poisoned before the read; seat B between the one observation and
+    /// the assembly (the export hook). Mutants: no poison condition; the poison read before the observation only.
+    #[test]
+    fn p1_e0_poisoned_parser_exports_no_frame() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p1-e0-poison");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let poison = |s: &Arc<crate::state::Surface>| {
+            let s2 = Arc::clone(s);
+            let _ = std::thread::spawn(move || {
+                let _held = s2.parser.lock().unwrap_or_else(|e| e.into_inner());
+                panic!("specimen: a holder panics inside the parser lock");
+            })
+            .join();
+            assert!(s.parser.is_poisoned(), "premise: the parser lock is poisoned");
+        };
+        for before_read in [true, false] {
+            let (daemon, s) = wp5_seat(if before_read { "p1-e0-poison-a" } else { "p1-e0-poison-b" }, "claude");
+            p1_measured(&s);
+            paint_screen(&s, &["❯ 1. Yes", "  2. No"], 0, 2, true);
+            let r = crate::state::test_until_no_pty_output(&s, "e0 control", || e0_read(&daemon, &s, true));
+            assert!(r["composer"]["output_gen"].is_u64() && r["composer"]["modal"] == json!(true), "control: {r}");
+            let _h = if before_read {
+                poison(&s);
+                None
+            } else {
+                let sp = Arc::clone(&s);
+                Some(e0_hook(move |_| poison(&sp)))
+            };
+            let r = e0_read(&daemon, &s, true);
+            assert!(s.parser.is_poisoned());
+            let label = if before_read { "poisoned before the read" } else { "poisoned after the observation" };
+            assert_eq!(r["composer"]["output_gen"], json!(null), "{label}: a poisoned frame kept its generation: {r}");
+            assert_eq!((r["composer"]["verdict"].clone(), r["quiet_secs"].clone()), (json!("unknown"), json!(0.0)), "{label}: {r}");
+            let _ = s.child.lock().unwrap_or_else(|e| e.into_inner()).kill();
+            crate::state::test_stop_daemon(&daemon);
+        }
     }
 
     /// Invariant 4 + RAW human bytes: owner/owner_kind from the existing MachineDraft evidence, and the input counters as
