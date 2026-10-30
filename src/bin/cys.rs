@@ -224,7 +224,7 @@ enum Command {
     /// 대상 턴 종료·빈 composer 확인→입력버퍼 정리+clear→clear 실효 확인→디렉티브·재개 포인터 재주입.
     /// exit: 0=실효 확인 · 80=실효 미관측(재주입 0건) · 81=실효 측정 불능 · 82/83=검증자 충돌·미해소 ·
     /// 84=대상이 유휴가 되지 않음(clear 송신 0건) · 85=사람 초안 보호(clear 송신 0건).
-    /// 84·85 는 clear 송신 0건 비파괴 보류(원자 clear 거부는 composer 무변경 · clear_first_unsupported 는 별도 키 송신 없이 보류) — autopilot 이 쿨다운 뒤 자동 재시도한다(5단계 85 도 사이클 표지 끔에 'clear 안 됨'을 실어 그 통보가 미해결로 남는다 · 80 도 같은 결과를 실어 같은 --fire 재집행이 가능하다).
+    /// 84·85 는 clear 송신 0건 비파괴 보류(원자 clear 거부는 composer 무변경 · clear_first_unsupported = 등록 에이전트 없는 좌석은 보류가 아니라 rc 1 실패다: 송신 0건 · 재시도로 풀리지 않는다 · launch-agent 로 재등록) — autopilot 이 쿨다운 뒤 자동 재시도한다(5단계 85 도 사이클 표지 끔에 'clear 안 됨'을 실어 그 통보가 미해결로 남는다 · 80 도 같은 결과를 실어 같은 --fire 재집행이 가능하다).
     /// 86=실효 확인 뒤 재주입 보류: clear 는 이미 발효했다 — 손으로 다시 clear 하지 말고 재주입만 확인한다.
     /// 87=건너뜀(송신 0건): --fire 의 통보 뒤 그 좌석의 사이클이 이미 끝났다 — 재집행하지 않는다.
     /// 88=진행 중(송신 0건): 다른 집행자의 사이클이 진행 중이다(--fire 가 있으면 단일 전체 시한이 남기는 만큼 — 기본 --timeout 120 에서 최대 30초 — 끝나기를 기다린 뒤) — 이미 처리됨이 아니다. 턴 안에서 기다리거나 곧바로 재집행하지 말고 끝낸다: 그 사이클이 clear 전에 끝나면 데몬이 같은 통보를 한 번 재배달하고(redelivery) 그때 같은 --fire 로 다시 집행해도 된다(데몬이 판정 · 끝났으면 87).
@@ -1795,6 +1795,22 @@ const CYCLE_TARGET_BUSY_TOKEN: &str = "cycle-target-busy:";
 /// held_cooldown_secs(지수 · 300→600→1200s 상한) 뒤 자동 재시도한다 · 구조적(구 데몬
 /// quiet_secs 미보고 `[diag=…]`) 보류만 HELD_RETRY_MAX 연속 도달 시 escalation 후 정지(사람 reset).
 const CYCLE_HUMAN_DRAFT_TOKEN: &str = "cycle-human-draft:";
+/// ★(0.14.56 · PKG-2 M1) The target has no registered agent (`agent_meta` None): the daemon refuses the atomic clear as
+/// `clear_first_unsupported`, and the split fallback that used to work around it was removed on purpose (51f029a1 ·
+/// P1 E D7). No retry changes that state, so this is NOT the 84 hold - it has no exit arm and exits 1 (failure), the
+/// same code as the step-0 stop for the same condition. Automated callers never reach it (none passes `--clear-cmd`,
+/// the only way an unregistered seat gets past step 0); every one of them already reads 1 as a failure.
+const CYCLE_TARGET_UNREGISTERED_TOKEN: &str = "cycle-target-unregistered:";
+
+/// The one remedy text for a seat the daemon has no registered agent for - the step-0 stop and the refused atomic clear.
+fn unregistered_seat_remedy(role: Option<&str>) -> String {
+    format!(
+        "re-register the seat: relaunch its agent with `cys launch-agent --role {} --agent <agent>` (launch-agent registers \
+         the agent when it starts it) - --clear-cmd does not help an unregistered seat (the atomic clear is refused as \
+         clear_first_unsupported and the split fallback was removed on purpose)",
+        role.unwrap_or("<role>")
+    )
+}
 /// ★팩 `javis_cycle_autopilot.py` 의 `QUIET_UNREPORTED_DIAG` 와 같은 값이어야 한다
 /// (autopilot 이 rc84 를 '구조적(구 데몬) 보류' 로 분류하는 기계 토큰 · cargo 검체
 /// d16_held_rcs_and_diag_token_match_autopilot 가 파싱 대조).
@@ -22591,8 +22607,13 @@ fn run_cycle_agent(
         let clear = match clear_cmd {
             Some(c) => c,
             None => {
-                let a = agent.as_deref()
-                    .ok_or("agent 메타 없음 — --clear-cmd 명시 필요")?;
+                // ★(0.14.56 · PKG-2 M1) same rc 1 and place; the old "--clear-cmd 명시 필요" advice became false with 51f029a1.
+                let a = agent.as_deref().ok_or_else(|| {
+                    format!(
+                        "agent 메타 없음 — surface:{sid} has no registered agent (zero bytes sent) · {}",
+                        unregistered_seat_remedy(entry["role"].as_str())
+                    )
+                })?;
                 spec.as_ref().and_then(|s| s["clear_cmd"].as_str())
                     .ok_or_else(|| {
                         format!("agents.json '{a}'에 clear_cmd 없음 — --clear-cmd 명시 필요")
@@ -22985,7 +23006,11 @@ fn run_cycle_agent(
                     }
                     Err(e) if is_clear_first_unsupported_err(&e) => {
                         outcome = CycleOutcome::NotCleared;
-                        return Err(format!("{CYCLE_TARGET_BUSY_TOKEN} clear_first_unsupported: atomic clear unavailable; no split fallback, zero bytes ({e})"));
+                        // ★(0.14.56 · PKG-2 M1) not BUSY: no retry registers the seat (rc 1 · CYCLE_TARGET_UNREGISTERED_TOKEN doc).
+                        return Err(format!(
+                            "{CYCLE_TARGET_UNREGISTERED_TOKEN} surface:{sid} has no registered agent: atomic clear refused (clear_first_unsupported), no split fallback, zero bytes - not retryable · {} ({e})",
+                            unregistered_seat_remedy(entry["role"].as_str())
+                        ));
                     }
                     Err(e) => {
                         // Holds precede the retryable zero-byte refusals. Unknown already left the loop above.
@@ -42002,6 +42027,23 @@ mod tests {
         );
     }
 
+    /// PKG-2 M1 (0.14.56): the unregistered token has no exit arm (rc 1, like the step-0 stop for the same condition), no
+    /// mapped token is a prefix of it or it of one, and the remedy names the seat's role or a placeholder.
+    #[test]
+    fn pkg2_m1_unregistered_token_exits_1_and_remedy_names_the_role() {
+        let token = CYCLE_TARGET_UNREGISTERED_TOKEN;
+        assert_eq!(cycle_agent_exit(&Err(format!("{token} x"))), 1);
+        for other in [
+            CLEAR_UNVERIFIED_TOKEN, CLEAR_UNMEASURABLE_TOKEN, CYCLE_TARGET_BUSY_TOKEN, CYCLE_HUMAN_DRAFT_TOKEN,
+            CYCLE_REINJECT_HELD_TOKEN, CYCLE_SKIPPED_TOKEN, CYCLE_BUSY_TOKEN, VERIFIER_COLLISION_TOKEN, VERIFIER_UNRESOLVED_TOKEN,
+        ] {
+            assert!(!token.starts_with(other) && !other.starts_with(token), "{token} vs {other}");
+        }
+        assert!(unregistered_seat_remedy(Some("worker-3")).contains("`cys launch-agent --role worker-3 --agent <agent>`"));
+        assert!(unregistered_seat_remedy(None).contains("--role <role>"));
+        assert!(!unregistered_seat_remedy(None).contains("명시 필요"));
+    }
+
     #[test]
     fn d16_exit_code_reinject_held_is_distinct_and_prefix_order_independent() {
         let code = EXIT_CYCLE_REINJECT_HELD;
@@ -42118,8 +42160,9 @@ mod tests {
             .lines()
             .find(|line| line.trim_start().starts_with("/// 84·85"))
             .expect("CycleAgent doc 의 84·85 줄 없음");
-        if !held_line.contains("clear_first_unsupported") || held_line.contains("C-u 1키") {
-            failures.push("CycleAgent docs must describe the unsupported no-write hold".to_string());
+        // ★(0.14.56 · PKG-2 M1) clear_first_unsupported is no longer an 84 hold: the line must say rc 1 (no-write failure).
+        if !held_line.contains("clear_first_unsupported") || !held_line.contains("rc 1") || held_line.contains("C-u 1키") {
+            failures.push("CycleAgent docs must describe clear_first_unsupported as the rc 1 no-write failure".to_string());
         }
         let (_, unsupported, atomic_refusal) = d16_clear_atomic_and_fallback_source();
         if !atomic_refusal.contains("송신 0건 · composer 무변경") {
@@ -47654,6 +47697,76 @@ mod b360_tests {
             else { assert_ne!(rc,0,"{named}"); assert!(err.contains(&named),"D7 visible refusal {named}: {err}"); }
             assert!(!err.contains("[diag=quiet_secs_unreported]"),"D7 transient refusal {named}");
         }
+    }
+
+    /// The fake seat for the PKG-2 M1 specimens: worker role, idle composer, `agent` as given (None = no registration).
+    #[cfg(unix)]
+    fn pkg2_m1_daemon(cwd: std::path::PathBuf, agent: Option<&'static str>) -> R2cDaemon {
+        let mut reads = 0;
+        R2cDaemon::start(move |method, p| match method {
+            "surface.cycle_claim" => r2c_ok(json!({"claim":"claimed"})),
+            "surface.list" => r2c_ok(json!({"surfaces":[{
+                "surface_id":7, "surface_ref":"surface:7", "role":"worker", "agent":agent,
+                "exited":false, "awakened_at":1.0, "cwd":cwd, "live_cwd":cwd,
+                "pending_input_bytes":0,"pending_input_human_bytes":0,
+                "usage":{"source":"statusline","session_file":"S1"}
+            }]})),
+            "surface.read_text" => {
+                reads += 1;
+                r2c_ok(json!({"text": cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT,
+                    "quiet_secs":5.0, "composer":{"verdict":"empty","governed":true,"modal":false,
+                    "owner":"none","owner_kind":"unattributed","output_gen":2*reads,"input_gen":reads,
+                    "pending_bytes":0,"human_bytes":0}}))
+            }
+            "surface.send_text" if p["clear_first"] == true => json!({"ok":false,"error":{
+                "code":"clear_first_unsupported",
+                "message":"clear_first requires a launch-agent-registered pane (Ctrl-U semantics vary by TUI)"}}),
+            _ => r2c_ok(json!({})),
+        })
+    }
+
+    /// PKG-2 M1 (0.14.56): the atomic clear refused as `clear_first_unsupported` (the seat has no registered agent) is
+    /// a FAILURE with its own token and the working remedy - not the BUSY-labelled rc 84, which every caller reads as
+    /// "retry later" for a state no retry changes (51f029a1 removed the split fallback on purpose). Zero extra writes.
+    #[cfg(unix)]
+    #[test]
+    fn pkg2_m1_clear_first_unsupported_is_a_named_failure_not_busy() {
+        let pack = R2cPack::new();
+        let daemon = pkg2_m1_daemon(pack.dir.clone(), Some("claude"));
+        let (rc, _out, err) = r2c_child("cycle", &daemon, &pack.envs());
+        let calls = daemon.calls();
+        let line = err.lines().filter(|l| l.starts_with("error: ")).last().unwrap_or_default().to_string();
+        assert_eq!(rc, 1, "an unregistered seat is a failure, not the 84 hold: {err}");
+        assert!(line.starts_with("error: cycle-target-unregistered:"), "distinct token: {line}");
+        assert!(!err.contains("cycle-target-busy:"), "must not read as BUSY: {err}");
+        assert!(line.contains("cys launch-agent --role worker"), "names the working remedy: {line}");
+        assert!(line.contains("clear_first_unsupported"), "the daemon's code stays visible: {line}");
+        let clears = calls.iter().filter(|(m, p)| m == "surface.send_text" && p["clear_first"] == true).count();
+        assert_eq!(clears, 1, "one atomic attempt, no retry: {err}");
+        // The save instruction before the clear submits with its own Return; the fallback would be a key AFTER the refusal.
+        let first = calls.iter().position(|(m, p)| m == "surface.send_text" && p["clear_first"] == true).expect("the clear");
+        assert!(!calls[first..].iter().any(|(m, _)| m == "surface.send_key"), "no split fallback after the refusal: {calls:?}");
+        assert_eq!(r2c_quiesce_outcome(&calls).as_deref(), Some("not_cleared"), "{err}");
+    }
+
+    /// PKG-2 M1 (0.14.56): the step-0 stop for a seat with no registered agent keeps rc 1 and its place, but no longer
+    /// advises `--clear-cmd` - since 51f029a1 that only leads to the refused atomic clear. Nothing is written.
+    #[cfg(unix)]
+    #[test]
+    fn pkg2_m1_step0_unregistered_names_launch_agent_not_clear_cmd() {
+        let pack = R2cPack::new();
+        let daemon = pkg2_m1_daemon(pack.dir.clone(), None);
+        let (rc, _out, err) = r2c_child("cycle", &daemon, &pack.envs());
+        let calls = daemon.calls();
+        let line = err.lines().filter(|l| l.starts_with("error: ")).last().unwrap_or_default().to_string();
+        assert_eq!(rc, 1, "{err}");
+        assert!(line.starts_with("error: agent 메타 없음"), "same place: {line}");
+        assert!(line.contains("cys launch-agent --role worker"), "names the working remedy: {line}");
+        assert!(!line.contains("--clear-cmd 명시 필요"), "the --clear-cmd advice is false since 51f029a1: {line}");
+        assert!(
+            !calls.iter().any(|(m, _)| m == "surface.send_text" || m == "surface.send_key" || m == "surface.quiesce"),
+            "step 0 sends nothing: {calls:?}"
+        );
     }
 
     #[cfg(unix)]
