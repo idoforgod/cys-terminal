@@ -1559,36 +1559,27 @@ fn d9_dialog_seat(fx: &Fx, tag: &str, master: bool) -> (Arc<Surface>, std::path:
 #[test]
 #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
 fn d9_pre_cr_t_w3_a_dialog_during_the_settle_withholds_the_cr_with_one_owner() {
-    let fx = fx("d9-tw3");
-    let (s, out) = d9_dialog_seat(&fx, "tw3", true);
-    let body = "[보고] tw3";
-    enqueue(&fx, &s, body);
-    assert!(hand_off(&fx, &s), "premise: handed off");
-    let want = queue_bytes(body);
-    assert_eq!(want.last(), Some(&b'\r'), "premise: the job's own Return is its last byte");
-    let body_bytes = want[..want.len() - 1].to_vec();
-    wait_until("the body", || file_len(&out) >= body_bytes.len());
-    std::thread::sleep(Duration::from_millis(300));
-    assert_eq!(std::fs::read(&out).unwrap(), body_bytes, "the body only - a CR here presses `1. Yes`");
-    let w = seat_events(&fx, &s, "queue.submit_withheld");
-    assert_eq!(w.len(), 1, "one withhold: {w:?}");
-    assert_eq!(w[0]["payload"]["armed_by"], serde_json::json!("queue_job"), "{w:?}");
-    assert_eq!(hold_kind(&s), Some(QueueHoldKind::PartialExact), "the item is held byte-exact");
-    assert_eq!(queue_len(&s), 1);
-    assert!(s.inject_track.withheld().is_none(), "a resubmit record would be a second owner of this CR");
+    let fx=fx("d9-tw3");let mut recorder=p1_dialog_recorder(&fx,"tw3",true);let s=recorder.surface.clone();
+    let body="[보고] tw3";enqueue(&fx,&s,body);
+    assert!(hand_off(&fx,&s),"premise: handed off");
+    p1_wait_completion(p1_writer_idle(&s),P1_GUARD).expect("withheld terminal settled");
+    let want=queue_bytes(body);assert_eq!(want.last(),Some(&b'\r'),"premise: the job's own Return is its last byte");
+    let body_bytes=want[..want.len()-1].to_vec();
+    assert_eq!(recorder.barrier(),body_bytes,"the body only - a CR here presses `1. Yes`");
+    let w=seat_events(&fx,&s,"queue.submit_withheld");assert_eq!(w.len(),1,"one withhold: {w:?}");
+    assert_eq!(w[0]["payload"]["armed_by"],serde_json::json!("queue_job"),"{w:?}");
+    assert_eq!(hold_kind(&s),Some(QueueHoldKind::PartialExact),"the item is held byte-exact");assert_eq!(queue_len(&s),1);
+    assert!(s.inject_track.withheld().is_none(),"a resubmit record would be a second owner of this CR");
     crate::governance::resubmit_withheld_submits(&fx.daemon);
-    std::thread::sleep(Duration::from_millis(300));
-    assert_eq!(file_len(&out), body_bytes.len(), "the resubmit tick wrote");
-    // The dialog closes; the hold's own resume writes the one CR.
-    crate::governance::h_paint(&s, crate::governance::H_IDLE_SCREEN);
-    let since = s.queue_hold.lock().unwrap().as_ref().map(|h| h.since).expect("held");
-    let _ = crate::governance::queue_write_hold_block_at(&fx.daemon, &s, since + Duration::from_secs(1));
-    wait_until("delivered", || queue_len(&s) == 0);
-    wait_until("the CR", || file_len(&out) >= want.len());
-    std::thread::sleep(Duration::from_millis(300));
-    assert_eq!(std::fs::read(&out).unwrap(), want, "the body, then exactly one CR");
-    let _ = s.child.lock().unwrap().kill();
-    assert_eq!(events(&fx, "queue.delivered").len(), 1);
+    assert_eq!(recorder.barrier(),body_bytes,"the resubmit tick wrote");
+    crate::governance::h_paint(&s,crate::governance::H_IDLE_SCREEN);
+    let since=s.queue_hold.lock().unwrap().as_ref().map(|h|h.since).expect("held");
+    let _=crate::governance::queue_write_hold_block_at(&fx.daemon,&s,since+Duration::from_secs(1));
+    assert_eq!(events(&fx,"queue.write_resumed").len(),1,"synchronous successful resume admission receipt");
+    p1_wait_completion(p1_writer_idle(&s),P1_GUARD).expect("admitted resume settled");
+    assert_eq!(queue_len(&s),0);
+    assert_eq!(recorder.barrier(),want,"the body, then exactly one CR");
+    assert_eq!(events(&fx,"queue.delivered").len(),1);
 }
 
 /// T-W3 scope control: the same dialog on a queue job OUTSIDE D9 scope (role-less agent seat) - the job's proof is the
@@ -2312,7 +2303,7 @@ impl P1Recorder {
                 let mut marker = P1_BARRIER_MAGIC.to_vec();
                 marker.extend(sequence.to_be_bytes()); marker.push(0xff);
                 // This is the actual admission, before waiting for this exact marker's ACK.
-                self.surface.write_tx.send(crate::state::WriteReq::Data(marker)).map_err(|_| "barrier writer enqueue refused".to_string())?;
+                self.surface.write_tx.send(crate::state::WriteReq::P1ReceiverBarrier(marker)).map_err(|_| "barrier writer enqueue refused".to_string())?;
                 if let Some(notify) = self.barrier_admitted.take() { let _ = notify.send(()); }
                 Ok(())
             } else {
@@ -2513,6 +2504,11 @@ fn p1_completion_recorder_barrier_covers_delayed_extra_bytes() {
     assert_eq!(prefix, b"first\rlate-extra\r", "receiver ACK includes bytes delayed behind an explicit holder");
     assert_eq!(std::fs::read(&recorder.output).unwrap(), prefix, "protocol marker is not product output");
     assert_eq!(recorder.barrier(), prefix, "a second barrier introduces no extra product byte");
+    p1_write_finished(&recorder.surface, b"\r");
+    let duplicate = recorder.barrier();
+    let mut expected = prefix.clone(); expected.push(b'\r');
+    assert_eq!(duplicate, expected, "an extra duplicate CR remains visible before the receiver barrier");
+    assert_ne!(duplicate, prefix, "the observer cannot erase a duplicate CR");
 }
 
 #[test]
@@ -2646,6 +2642,7 @@ thread_local! {
 #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
 fn p1_completion_wc1_each_case_delayed_and_missing_actual_receipt() {
     let cases: &[(&str, fn(), &str)] = &[
+        ("row17", d9_pre_cr_t_w3_a_dialog_during_the_settle_withholds_the_cr_with_one_owner, "writer operation leases released"),
         ("row14", d9_pre_cr_t_l1_a_human_byte_during_the_settle_lands_after_the_cr, "admitted queue body acknowledged before held CR"),
         ("row18", d9_pre_cr_t_w3c_outside_d9_scope_the_queue_job_proof_is_unchanged, "writer operation leases released"),
         ("row1", d9_bound_i2_late_busy_undoes_owned_marks_without_refusal, "writer operation leases released"),
@@ -2687,4 +2684,50 @@ fn p1_completion_wc1_each_case_delayed_and_missing_actual_receipt() {
             println!("P1-CONTROL {name} {fault:?}: {event}");
         }
     }
+}
+
+#[test]
+fn p1_completion_neutral_marker_preserves_track_and_fifo_order() {
+    let track = Arc::new(crate::state::InjectTrack::default());
+    track.begin(); track.note_handoff(); track.note_wrote(); track.submit_handed();
+    track.submit_written(); track.note_body("seed", None); track.end();
+    let before = format!("{track:?}"); // derived Debug enumerates every current field, including all counters
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(crate::state::WriteReq::P1ReceiverBarrier(b"marker".to_vec())).unwrap();
+    drop(tx);
+    let mut bytes = Vec::new();
+    crate::state::run_writer_loop_tracked(&mut bytes, rx, Arc::new(std::sync::atomic::AtomicBool::new(false)), Some(track.clone()));
+    assert_eq!(bytes, b"marker", "receiver barrier writes its marker at its FIFO position");
+    assert_eq!(format!("{track:?}"), before, "receiver marker leaves every InjectTrack field unchanged");
+    let wrote = track.wrote();
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(crate::state::WriteReq::P1ReceiverBarrier(b"first".to_vec())).unwrap();
+    tx.send(crate::state::WriteReq::Data(b"ordinary".to_vec())).unwrap();
+    drop(tx);
+    let mut bytes = Vec::new();
+    crate::state::run_writer_loop_tracked(&mut bytes, rx, Arc::new(std::sync::atomic::AtomicBool::new(false)), Some(track.clone()));
+    assert_eq!(bytes, b"firstordinary", "receiver barrier precedes the next ordinary writer operation");
+    assert_eq!(track.wrote(), wrote + 1, "ordinary Data remains a counted write");
+}
+
+#[test]
+fn p1_completion_neutral_marker_write_error_stops_before_later_data() {
+    struct FailFirst { calls: Vec<Vec<u8>> }
+    impl std::io::Write for FailFirst {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.calls.push(bytes.to_vec());
+            if self.calls.len() == 1 { Err(std::io::ErrorKind::BrokenPipe.into()) } else { Ok(bytes.len()) }
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    let track = Arc::new(crate::state::InjectTrack::default());
+    let before = format!("{track:?}");
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(crate::state::WriteReq::P1ReceiverBarrier(b"failed marker".to_vec())).unwrap();
+    tx.send(crate::state::WriteReq::Data(b"must not run".to_vec())).unwrap();
+    drop(tx);
+    let mut writer = FailFirst { calls: Vec::new() };
+    crate::state::run_writer_loop_tracked(&mut writer, rx, Arc::new(std::sync::atomic::AtomicBool::new(false)), Some(track.clone()));
+    assert_eq!(writer.calls, vec![b"failed marker".to_vec()], "barrier write error stops the writer before subsequent Data");
+    assert_eq!(format!("{track:?}"), before, "failed marker also leaves InjectTrack untouched");
 }
