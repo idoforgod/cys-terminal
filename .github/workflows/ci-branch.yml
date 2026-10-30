@@ -1077,7 +1077,7 @@ jobs:
           #     실측 2026-10-29 00:4x KST(date) · macOS arm64 · python 3.9.6 · env -i 격리 HOME · 5종 rc=0(가짜 모드)
           #     · 하네스 모드(실 cysd) GATE 1 45행 rc=0.
           for t in test_report_ghost test_hud_bridge_skew test_todo_shared_constants test_orchestra_todo_path test_todo_stamp \
-                   test_import_guard test_event_spool_rc test_org_dispatch_delivers test_radio test_scrub test_bootstrap_chain test_snapshot \
+                   test_import_guard test_event_spool_rc test_org_dispatch_delivers test_pkg3a_tools_lane test_radio test_scrub test_bootstrap_chain test_snapshot \
                    test_dept_name_guard test_preflight_c03_states test_content_pins_parity \
                    test_role_bootstrap_hook test_seat_latch_negation \
                    test_hud_bridge_backoff test_preflight_c11b_seal test_wakeup_liveness \
@@ -1947,7 +1947,7 @@ jobs:
           set -euo pipefail
           echo "== [pack][ubuntu] release.yml pack-artifacts 와 동일 토큰 집합 · 동일 env 격리 =="
           for t in test_todo_decl test_todo_stamp test_report_ghost test_hud_bridge_skew \
-                   test_report_gate test_orchestra_todo_path test_todo_shared_constants test_import_guard test_event_spool_rc test_org_dispatch_delivers test_radio test_scrub \
+                   test_report_gate test_orchestra_todo_path test_todo_shared_constants test_import_guard test_event_spool_rc test_org_dispatch_delivers test_pkg3a_tools_lane test_radio test_scrub \
                    test_bootstrap_chain test_snapshot \
                    test_role_bootstrap_hook test_seat_latch_negation \
                    test_hud_bridge_backoff test_preflight_c11b_seal test_wakeup_liveness \

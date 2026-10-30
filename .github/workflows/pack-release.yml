@@ -281,7 +281,7 @@ jobs:
           #     (WP6-3 괴리 임계). 실측 2026-09-15 · macOS arm64 · python 3.14.7 · 루프와 같은 env
           #     (CYS_PACK_DIR 임시 + 격리 HOME/CYS_STATE_DIR) · 4종 전건 rc=0 · 합계 약 4s.
           for t in test_todo_decl test_todo_stamp test_report_ghost test_hud_bridge_skew \
-                   test_report_gate test_orchestra_todo_path test_todo_shared_constants test_import_guard test_event_spool_rc test_org_dispatch_delivers test_radio test_scrub \
+                   test_report_gate test_orchestra_todo_path test_todo_shared_constants test_import_guard test_event_spool_rc test_org_dispatch_delivers test_pkg3a_tools_lane test_radio test_scrub \
                    test_bootstrap_chain test_snapshot \
                    test_dept_name_guard test_preflight_c03_states test_content_pins_parity \
                    test_role_bootstrap_hook test_seat_latch_negation \
