@@ -1758,6 +1758,63 @@ pub(crate) fn pkg1_pane_caller(daemon: &Arc<Daemon>, role: &str) -> u32 {
     pid
 }
 
+/// ★(0.14.56 · PKG1-M1 · head check condition 1) Guard A: the `authoritative` axis must never hold the job it protects. The real
+/// queue tick (`deliver_queued`, as the watchdog runs it) delivers the converted [RESUME] while the axis is active for that seat.
+/// Mutant: the tick requests the axis -> the job is never delivered (deadlock).
+#[test]
+#[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+fn pkg1_guard_a_the_queue_tick_delivers_the_authoritative_job_while_the_axis_holds() {
+    let f = fx("pkg1-guard-a");
+    // The tick's own gates need a drawn idle prompt and no quiet wait (as the I2 tick specimens set them, unwind-safe).
+    let _queue_env = crate::governance::ReapEnvGuard::set(&[("CYS_QUEUE_QUIET_SECS", "0")]);
+    let mut recorder = p1_master_recorder(&f, "pkg1-guard-a");
+    let s = recorder.surface.clone();
+    crate::governance::h_paint(&s, crate::governance::H_IDLE_SCREEN);
+    let id = pkg1_authoritative_job(&f.daemon, &s, "[RESUME] pkg1-guard-a");
+    assert_eq!(crate::governance::authoritative_pending(&f.daemon, &s), Some(id.clone()), "premise: the axis is active for this seat");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !s.pending_queue.lock().unwrap().is_empty() {
+        let why = s.queue_blocked.lock().unwrap().clone();
+        assert!(Instant::now() < deadline, "the real tick did not deliver (blocked by {why:?}): {}", pkg1_queue_story(&f.daemon, &s));
+        crate::governance::h_queue_tick(&f.daemon);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let bytes = recorder.barrier();
+    assert!(pkg1_at(&bytes, "[RESUME] pkg1-guard-a").is_some(), "{}", String::from_utf8_lossy(&bytes));
+    let delivered = events(&f, "queue.delivered");
+    assert_eq!(delivered.len(), 1, "{delivered:?}");
+    assert_eq!(delivered[0]["payload"]["queue_entry_id"], Value::from(id));
+}
+
+/// ★(0.14.56 · PKG1-M1 · head check condition 1) Guard B: a byte-exact partial write of the authoritative job (one transient
+/// receiver loss mid-body, as S4-1) resumes and submits once while the axis is active - `try_resume_partial_write` does not
+/// request the axis. Mutant: its axes include `authoritative` -> the resume is held by its own job and never completes.
+#[test]
+#[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+fn pkg1_guard_b_a_partial_authoritative_write_resumes_while_the_axis_holds() {
+    let fx = fx("pkg1-guard-b");
+    let (s, out) = recorder_seat(&fx, "pkg1-guard-b");
+    let body = s4_1_body();
+    *s.receiver_proof.lock().unwrap() = Some(Scripted::new(0, ProofLoss::AgentDead, Some((12, ProofLoss::Unknown("agent:denied".into())))));
+    let id = enqueue(&fx, &s, &body);
+    s.pending_queue.lock().unwrap().iter_mut().for_each(|e| e.authoritative = true);
+    crate::governance::note_authoritative_born(&fx.daemon, &s, &id);
+    assert!(hand_off(&fx, &s), "premise: handed off");
+    assert_eq!(hold_kind(&s), Some(QueueHoldKind::PartialExact), "premise: a byte-exact stop mid-body");
+    assert_eq!(crate::governance::authoritative_pending(&fx.daemon, &s), Some(id.clone()), "premise: the axis is active");
+    assert_eq!(crate::governance::queue_write_hold_block(&fx.daemon, &s), Some(crate::governance::BLOCKED_PARTIAL_WRITE));
+    wait_until("the resumed authoritative write settled", || queue_len(&s) == 0);
+    let want = queue_bytes(&body);
+    wait_until("receiver got every byte", || std::fs::metadata(&out).map(|m| m.len() as usize).unwrap_or(0) >= want.len());
+    std::thread::sleep(Duration::from_millis(200));
+    let got = std::fs::read(&out).unwrap();
+    let delivered = events(&fx, "queue.delivered");
+    assert_eq!(delivered.len(), 1, "delivered once");
+    assert_eq!(delivered[0]["payload"]["queue_entry_id"], Value::from(id));
+    assert_eq!(events(&fx, "queue.write_resumed").len(), 1, "one resumed run");
+    assert!(got == want, "receiver bytes differ: got {} bytes, want {}", got.len(), want.len());
+}
+
 /// S-Q1 / S-R16: admitted foreign work holds all five attempts without a ledger pre-record or claim refusal.
 #[test]
 #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
