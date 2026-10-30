@@ -5401,6 +5401,53 @@ mod d9_writer_guard_tests {
     }
 }
 
+/// ★(0.14.56 · PKG1-M1 · DESIGN-ADDENDUM-PKG1-M1.md sec 5) W-6: a channel envelope that arrives between quiesce-off and the queue
+/// tick waits (row stays `new`) behind the cycle's converted [RESUME], and the next sweep delivers it without a human (S2).
+#[cfg(test)]
+mod pkg1_auth_hold_tests {
+    use super::*;
+    use crate::agent_queue_tests::{d9_received, d9_role_recorder, fx, pkg1_at, pkg1_authoritative_job, pkg1_drain, wait_until};
+
+    /// S2: RESUME queued (converted step 7) -> inbox row -> sweep before the tick: held, row stays `new`; after the tick delivers
+    /// the [RESUME], a later sweep delivers the envelope. The [RESUME] bytes precede the envelope bytes.
+    /// RED (77f66491): the first sweep types the envelope ahead of the [RESUME].
+    #[test]
+    #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+    fn pkg1_s2_inbox_row_before_the_tick_waits_behind_the_resume() {
+        let f = fx("pkg1-s2");
+        let (s, out) = d9_role_recorder(&f.daemon, &f.dir, "pkg1-s2", "master");
+        let _resume = pkg1_authoritative_job(&f.daemon, &s, "[RESUME] pkg1-s2");
+        {
+            let channels = f.daemon.channels.lock().unwrap();
+            channels
+                .as_ref()
+                .unwrap()
+                .execute(
+                    "INSERT INTO inbox(id,channel,sender_id,text,state,created_ts) VALUES(11,'slack','U1','pkg1-s2 envelope','new',?1)",
+                    [now()],
+                )
+                .unwrap();
+        }
+        let first = {
+            let mut g = f.daemon.channels.lock().unwrap();
+            deliver_new_inbox_with(&f.daemon, g.as_mut().unwrap())
+        };
+        assert!(first.delivered.is_empty(), "the envelope must wait behind the queued [RESUME] (hold {:?})", first.hold);
+        assert!(format!("{:?}", first.hold).contains("Authoritative"), "held by the authoritative axis: {:?}", first.hold);
+        pkg1_drain(&f.daemon, &s, 3);
+        assert!(s.pending_queue.lock().unwrap().is_empty(), "premise: the tick delivered the [RESUME]");
+        wait_until("a later sweep delivers the held envelope", || {
+            let mut g = f.daemon.channels.lock().unwrap();
+            !deliver_new_inbox_with(&f.daemon, g.as_mut().unwrap()).delivered.is_empty()
+        });
+        let bytes = d9_received(&out, 2);
+        let _ = s.child.lock().unwrap().kill();
+        let (r, e) = (pkg1_at(&bytes, "[RESUME] pkg1-s2"), pkg1_at(&bytes, "pkg1-s2 envelope"));
+        assert!(r.is_some() && e.is_some(), "both reached the receiver: {}", String::from_utf8_lossy(&bytes));
+        assert!(r < e, "the [RESUME] must be the first machine input: {}", String::from_utf8_lossy(&bytes));
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     static H3_AFTER_COOLDOWN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);

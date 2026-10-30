@@ -1643,6 +1643,75 @@ pub(crate) fn d9_received(out: &std::path::Path, n: usize) -> Vec<u8> {
     std::fs::read(out).unwrap()
 }
 
+// ── ★(0.14.56 · PKG1-M1 · DESIGN-ADDENDUM-PKG1-M1.md sec 5) Shared helpers: the cycle's step-7 [RESUME] as the daemon receives it
+//   (one converted authoritative queue job), and the order of bodies on the receiver's wire. ──
+
+/// Sends `text` into `s` the way the cycle's step 7 does (`inject_text`: `authoritative:true`, quiet) from a CSO pane, so the
+/// daemon's `authoritative_caller_ok` passes, and returns the id of the ONE authoritative queue job D9 converted it into.
+pub(crate) fn pkg1_authoritative_job(daemon: &Arc<Daemon>, s: &Arc<Surface>, text: &str) -> String {
+    static PID: AtomicU32 = AtomicU32::new(997_500);
+    let pid = PID.fetch_add(1, Ordering::Relaxed);
+    let cso = daemon.create_surface(None, Some("sleep 30".into()), None, Some("cso".into()), 24, 80).expect("cso pane");
+    daemon.surfaces.lock().unwrap().insert(cso.id, cso.clone());
+    daemon.caller_cache.lock().unwrap().insert(
+        pid,
+        crate::state::CallerCacheEntry::new(Some(cso.id), crate::state::now_epoch(), None, daemon.caller_gen.load(Ordering::Relaxed)),
+    );
+    let req = cys::Request {
+        id: serde_json::json!(1),
+        method: "surface.send_text".into(),
+        params: serde_json::json!({"surface_id": s.id, "text": text, "quiet": true, "authoritative": true}),
+    };
+    let crate::handlers::Reply::Single(resp) = crate::handlers::dispatch(daemon, req, Some(pid)) else {
+        panic!("expected a single reply");
+    };
+    assert_eq!(resp["result"]["converted"], serde_json::json!("one_job"), "premise: the step-7 send was converted: {resp}");
+    let id = resp["result"]["queue_entry_id"].as_str().expect("queue entry id").to_string();
+    assert!(
+        s.pending_queue.lock().unwrap().iter().any(|e| e.id == id && e.authoritative),
+        "premise: the converted job is authoritative"
+    );
+    id
+}
+
+/// An authoritative entry put straight into the queue (as a WAL restore leaves it - no in-memory record of its insertion)
+/// whose wall-clock age is `age_secs`. Placed at the front, as `authoritative_insert_pos` places one on an empty queue.
+pub(crate) fn pkg1_raw_authoritative(daemon: &Arc<Daemon>, s: &Arc<Surface>, text: &str, age_secs: f64) -> String {
+    let mut e = daemon.next_queue_entry(text.into(), None, "send");
+    e.authoritative = true;
+    e.enqueued_at = crate::state::now_epoch() - age_secs;
+    let id = e.id.clone();
+    s.pending_queue.lock().unwrap().push_front(e);
+    id
+}
+
+/// Hands the queue's head off (the tick's write step) until the queue is empty, at most `max` times.
+pub(crate) fn pkg1_drain(daemon: &Arc<Daemon>, s: &Arc<Surface>, max: usize) {
+    for _ in 0..max {
+        if s.pending_queue.lock().unwrap().is_empty() {
+            return;
+        }
+        wait_until("writer idle before the next hand-off", || s.write_tx.gate().pending() == 0);
+        let _ = deliver_head_locked(daemon, s, true, false, None, None, None, None, None);
+        wait_until("writer idle after the hand-off", || s.write_tx.gate().pending() == 0);
+    }
+}
+
+/// Where `needle` first occurs in `hay` (the receiver's bytes).
+pub(crate) fn pkg1_at(hay: &[u8], needle: &str) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle.as_bytes())
+}
+
+/// The `queue.authoritative_hold_lapsed` events published for `sid`.
+pub(crate) fn pkg1_lapse_events(daemon: &Arc<Daemon>, sid: u64) -> Vec<Value> {
+    daemon
+        .bus
+        .tail(1000)
+        .into_iter()
+        .filter(|e| e["name"] == "queue.authoritative_hold_lapsed" && e["payload"]["surface_ref"] == cys::surface_ref(sid))
+        .collect()
+}
+
 /// S-Q1 / S-R16: admitted foreign work holds all five attempts without a ledger pre-record or claim refusal.
 #[test]
 #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]

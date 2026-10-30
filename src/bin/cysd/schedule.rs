@@ -7784,3 +7784,115 @@ mod d9_writer_guard_tests {
         assert_eq!(h.outcome.lock().unwrap().clone(), Some(PushOutcome::Written));
     }
 }
+
+/// ★(0.14.56 · PKG1-M1 · DESIGN-ADDENDUM-PKG1-M1.md sec 5; head ruling HEAD-RULING-PKG1-R1.md sec 2) After a master/CEO cycle the
+/// converted authoritative job ([RESUME]) is the FIRST machine input: a schedule push issued between quiesce-off and the queue tick
+/// waits behind it and is still delivered without a human (S1, S6). The hold is bounded: once the oldest authoritative entry has
+/// waited the quiesce hold (600 s), pushes take their old path and ONE `queue.authoritative_hold_lapsed` names it (S5 - the jam case,
+/// S5b). The age is the daemon's monotonic insertion age, not the wall clock (S7).
+#[cfg(test)]
+mod pkg1_auth_hold_tests {
+    use super::*;
+    use crate::agent_queue_tests::{
+        d9_received, d9_role_recorder, fx, pkg1_at, pkg1_authoritative_job, pkg1_drain, pkg1_lapse_events, pkg1_raw_authoritative,
+    };
+
+    fn push_job(id: &str) -> Job {
+        serde_json::from_value(json!({"id": id, "action": "push", "to": "master", "every_minutes": 60})).unwrap()
+    }
+
+    fn quiescing(s: &crate::state::Surface) {
+        *s.agent_status.lock().unwrap() = Some(crate::state::AgentStatus {
+            state: "quiescing".into(),
+            context_pct: None,
+            task: None,
+            updated_at: now_epoch(),
+        });
+    }
+
+    /// S1 (the reviewer's specimen) + S6 (queue pair): quiesce on -> the step-7 reinject is converted into one authoritative job ->
+    /// quiesce off -> a schedule push BEFORE the tick -> the tick. The [RESUME] bytes precede the push bytes; no runaway (one job for
+    /// the inject, one queue item for the held push, one Return each); no block (the held push is delivered by the next tick, no
+    /// human key, the queue ends empty). RED (77f66491): the push is typed directly, ahead of the [RESUME].
+    #[test]
+    #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+    fn pkg1_s1_schedule_push_after_quiesce_off_waits_behind_the_resume() {
+        let f = fx("pkg1-s1");
+        let daemon = &f.daemon;
+        let (s, out) = d9_role_recorder(daemon, &f.dir, "pkg1-s1", "master");
+        quiescing(&s);
+        let resume = pkg1_authoritative_job(daemon, &s, "[RESUME] pkg1-s1");
+        assert!(crate::governance::release_quiescing(daemon, &s, "pkg1-test"), "premise: quiescing was on");
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "no runaway: one queue job for one inject");
+        let how = deliver_push(daemon, &push_job("pkg1-s1"), s.id, "[wakeup] pkg1-s1", None);
+        assert_eq!(how, Ok("queued(gate:authoritative)"), "the push must wait behind the queued [RESUME]");
+        let ids: Vec<String> = s.pending_queue.lock().unwrap().iter().map(|e| e.id.clone()).collect();
+        assert_eq!(ids.len(), 2, "no runaway: exactly one queue item for the held push: {ids:?}");
+        assert_eq!(ids[0], resume, "the [RESUME] stays the head");
+        pkg1_drain(daemon, &s, 4);
+        assert!(s.pending_queue.lock().unwrap().is_empty(), "no block: the held push was delivered without a human");
+        let bytes = d9_received(&out, 2);
+        let _ = s.child.lock().unwrap().kill();
+        let (r, p) = (pkg1_at(&bytes, "[RESUME] pkg1-s1"), pkg1_at(&bytes, "[wakeup] pkg1-s1"));
+        assert!(r.is_some() && p.is_some(), "both bodies reached the receiver: {}", String::from_utf8_lossy(&bytes));
+        assert!(r < p, "the [RESUME] must be the first machine input: {}", String::from_utf8_lossy(&bytes));
+        assert_eq!(bytes.iter().filter(|&&b| b == b'\r').count(), 2, "one Return per body, no retry");
+    }
+
+    /// S5 + the jam case (head check condition 2): the authoritative entry cannot be delivered (no tick ever writes it) and its age
+    /// is past the bound (a WAL-restored entry: wall-clock age 700 s >= 600 s). Pushes take their old path (written directly) and
+    /// exactly ONE lapse event names the entry, with `clock: wall`. RED (77f66491): no lapse event.
+    #[test]
+    #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+    fn pkg1_s5_jammed_job_lapses_after_the_bound_with_one_event() {
+        let f = fx("pkg1-s5");
+        let daemon = &f.daemon;
+        let (s, out) = d9_role_recorder(daemon, &f.dir, "pkg1-s5", "master");
+        let jammed = pkg1_raw_authoritative(daemon, &s, "[RESUME] pkg1-s5", 700.0);
+        assert_eq!(deliver_push(daemon, &push_job("pkg1-s5a"), s.id, "[wakeup] pkg1-s5a", None), Ok("pushed"));
+        assert_eq!(deliver_push(daemon, &push_job("pkg1-s5b"), s.id, "[wakeup] pkg1-s5b", None), Ok("pushed"));
+        let bytes = d9_received(&out, 2);
+        let _ = s.child.lock().unwrap().kill();
+        assert!(pkg1_at(&bytes, "[wakeup] pkg1-s5b").is_some(), "the producers resumed by their old path");
+        let ev = pkg1_lapse_events(daemon, s.id);
+        assert_eq!(ev.len(), 1, "exactly one lapse event per entry: {ev:?}");
+        assert_eq!(ev[0]["payload"]["queue_entry_id"], json!(jammed), "{ev:?}");
+        assert_eq!(ev[0]["payload"]["clock"], json!("wall"), "a restored entry has no monotonic record: {ev:?}");
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "the jammed job is not dropped by the lapse");
+    }
+
+    /// S5b: the OLDEST authoritative entry governs - a jammed old job (wall age 700 s) with a fresh step-7 job behind it still
+    /// lapses, so repeated cycles cannot extend the hold forever. RED (77f66491): no lapse event.
+    #[test]
+    #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+    fn pkg1_s5b_the_oldest_authoritative_entry_governs_the_bound() {
+        let f = fx("pkg1-s5b");
+        let daemon = &f.daemon;
+        let (s, _out) = d9_role_recorder(daemon, &f.dir, "pkg1-s5b", "master");
+        let old = pkg1_raw_authoritative(daemon, &s, "[RESUME] pkg1-s5b old", 700.0);
+        let _fresh = pkg1_authoritative_job(daemon, &s, "[RESUME] pkg1-s5b fresh");
+        assert_eq!(deliver_push(daemon, &push_job("pkg1-s5b"), s.id, "[wakeup] pkg1-s5b", None), Ok("pushed"));
+        let _ = s.child.lock().unwrap().kill();
+        let ev = pkg1_lapse_events(daemon, s.id);
+        assert_eq!(ev.len(), 1, "{ev:?}");
+        assert_eq!(ev[0]["payload"]["queue_entry_id"], json!(old), "the oldest entry is the one that lapsed: {ev:?}");
+    }
+
+    /// S7: the hold's age is the daemon's MONOTONIC insertion age. A step-7 job whose wall-clock `enqueued_at` reads 5,000 s old
+    /// (a sleep or a clock jump) but which was inserted a moment ago still holds the push, and no lapse event fires.
+    /// RED (77f66491): the push is typed directly.
+    #[test]
+    #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+    fn pkg1_s7_the_monotonic_insertion_age_governs_not_the_wall_clock() {
+        let f = fx("pkg1-s7");
+        let daemon = &f.daemon;
+        let (s, _out) = d9_role_recorder(daemon, &f.dir, "pkg1-s7", "master");
+        let id = pkg1_authoritative_job(daemon, &s, "[RESUME] pkg1-s7");
+        for e in s.pending_queue.lock().unwrap().iter_mut().filter(|e| e.id == id) {
+            e.enqueued_at -= 5000.0;
+        }
+        assert_eq!(deliver_push(daemon, &push_job("pkg1-s7"), s.id, "[wakeup] pkg1-s7", None), Ok("queued(gate:authoritative)"));
+        let _ = s.child.lock().unwrap().kill();
+        assert!(pkg1_lapse_events(daemon, s.id).is_empty(), "a wall-clock jump must not lapse the hold");
+    }
+}
