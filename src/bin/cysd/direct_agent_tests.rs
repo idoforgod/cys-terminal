@@ -276,6 +276,272 @@ fn a_clear_first_write_disposes_the_held_bodies_as_cleared() {
     assert!(!written_ids(&fx).contains(&a));
 }
 
+// ── ★(0.14.56 · P1 D6 · design r2 §7 with r1 §7) held bodies are reserved at hand-off and settled by the terminal ─────
+// A clear-first write (OwnedClear) moves every held body into its settlement at hand-off; a bound write moves its own
+// body. Zero bytes -> each body goes back with its receipt deadline; a written clear -> `cleared`; a clear whose outcome
+// is unknown -> `clear_outcome_unknown`; a bound write whose outcome is unknown -> `bound_outcome_unknown`. The writer's
+// settlement is awaited through the seat writer's lease (`WriterGate::pending` drops only after the terminal settlement,
+// `state::run_writer_loop_tracked`), a happens-before edge rather than a sleep.
+
+/// Admission blocks until released, then refuses: zero bytes, decided after the handler has answered.
+struct BlockThenRefuse(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+impl crate::agent_write::Proof for BlockThenRefuse {
+    fn admit(&self) -> Result<(), crate::receiver::ProofLoss> {
+        crate::agent_write::Proof::admit(&BlockAdmit(self.0.clone()))?;
+        Err(crate::receiver::ProofLoss::Unknown("test:refuse_after_block".into()))
+    }
+    fn recheck(&self, _: crate::agent_write::Phase) -> Result<(), crate::receiver::ProofLoss> {
+        Ok(())
+    }
+}
+
+/// Admits (the first call is written), then loses proof before every later call: `Unknown` stops byte-exact
+/// (PartialExact), a death stops with an unknown outcome (PartialUnknown).
+struct LoseAfterFirstCall(fn() -> crate::receiver::ProofLoss);
+impl crate::agent_write::Proof for LoseAfterFirstCall {
+    fn admit(&self) -> Result<(), crate::receiver::ProofLoss> {
+        Ok(())
+    }
+    fn recheck(&self, _: crate::agent_write::Phase) -> Result<(), crate::receiver::ProofLoss> {
+        Err((self.0)())
+    }
+}
+
+/// The seat's writer has finished every handed-off job, its terminal settlement included.
+fn wait_writer_settled(s: &Arc<Surface>) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    // wallclock: guard writer lease released (hang guard only; every verdict is read after the lease is gone)
+    while s.write_tx.gate().pending() != 0 {
+        assert!(Instant::now() < deadline, "the seat writer never settled its job");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+fn undelivered(fx: &Fx, rid: &str) -> Vec<Value> {
+    events(fx, "surface.submit_undelivered").into_iter().filter(|e| e["payload"]["request_id"] == json!(rid)).collect()
+}
+
+fn held_ids(s: &Arc<Surface>) -> Vec<String> {
+    let mut ids = s.submit_assoc.lock().unwrap().ids();
+    ids.sort();
+    ids
+}
+
+fn clear(fx: &Fx, s: &Arc<Surface>) -> Value {
+    rpc(fx, "surface.send_text", json!({"surface_id": s.id, "text": "/clear", "clear_first": true, "authoritative": true}))
+}
+
+/// T-H1 (r1 §14): a clear that writes zero bytes restores every held body with its receipt deadline, and the later
+/// Return of the body's caller still types it once. Mutant: dispose at hand-off.
+#[test]
+fn d6_a_zero_byte_clear_restores_every_held_body_and_its_return_still_types_it() {
+    let fx = fx("d6-h1");
+    let s = seat(&fx, true);
+    let a = id_of(&send(&fx, &s, 900, "held through a refused clear"));
+    let b = id_of(&send(&fx, &s, 901, "another caller's held body"));
+    let deadline_of = |rid: &str| s.submit_assoc.lock().unwrap().records().find(|x| x.request_id == rid).map(|x| x.deadline);
+    let before = deadline_of(&a).expect("premise: held");
+    *s.receiver_proof.lock().unwrap() = Some(Arc::new(Refuse));
+    let c = clear(&fx, &s);
+    let cid = id_of(&c);
+    wait_writer_settled(&s);
+    *s.receiver_proof.lock().unwrap() = None;
+    assert!(events(&fx, "surface.write_refused").iter().any(|e| e["payload"]["request_id"] == json!(cid)), "premise: the clear wrote zero bytes");
+    assert!(undelivered(&fx, &a).is_empty() && undelivered(&fx, &b).is_empty(), "{:?}", events(&fx, "surface.submit_undelivered"));
+    let mut both = vec![a.clone(), b.clone()];
+    both.sort();
+    assert_eq!(held_ids(&s), both, "a zero-byte clear must give every held body back");
+    assert_eq!(deadline_of(&a), Some(before), "the receipt deadline is never widened");
+    let k = ret(&fx, &s, 900);
+    assert_eq!(k["result"]["bound"], "legacy", "{k}");
+    assert_eq!(k["result"]["request_id"], json!(a), "{k}");
+    assert_written_exactly_once(&fx, "held through a refused clear");
+}
+
+/// T-H1 through the journal (B-360 path 2): a clear refused by the writer journal is an error AND gives the held body
+/// back; once the journal heals, the body's Return types it once.
+#[test]
+fn d6_a_clear_refused_by_the_journal_restores_the_held_body() {
+    let fx = fx("d6-h1-journal");
+    let s = seat(&fx, true);
+    break_journal(&fx);
+    let a = id_of(&send(&fx, &s, 900, "held through a journal refusal"));
+    let c = clear(&fx, &s);
+    assert_eq!(c["error"]["code"], "journal_unavailable", "premise: {c}");
+    assert_eq!(held_ids(&s), [a.clone()], "the journal refusal lost the held body");
+    assert!(undelivered(&fx, &a).is_empty(), "{:?}", undelivered(&fx, &a));
+    std::fs::remove_dir_all(fx.dir.join(crate::state::WRITER_JOURNAL_FILE)).unwrap();
+    let k = ret(&fx, &s, 900);
+    assert_eq!(k["result"]["request_id"], json!(a), "{k}");
+    assert_written_exactly_once(&fx, "held through a journal refusal");
+}
+
+/// T-H2 (r1 §14): a restore refused because the same caller now holds a newer body disposes the older one as
+/// `superseded` naming the newer id. Mutants: `restore().unwrap()`; name no newer id.
+#[test]
+fn d6_a_restore_refused_by_a_newer_body_is_superseded_naming_it() {
+    let fx = fx("d6-h2");
+    let s = seat(&fx, true);
+    crate::agent_write::set_test_sync_settle(false); // the clear's handler answers at the barrier; its writer is held
+    let a = id_of(&send(&fx, &s, 900, "older body"));
+    let latch = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    *s.receiver_proof.lock().unwrap() = Some(Arc::new(BlockThenRefuse(latch.clone())));
+    let c = clear(&fx, &s);
+    assert!(c["result"]["request_id"].is_string(), "premise: {c}");
+    let b = id_of(&send(&fx, &s, 900, "newer body")); // the same caller holds a newer body while the clear is in flight
+    release(&latch);
+    wait_writer_settled(&s);
+    *s.receiver_proof.lock().unwrap() = None;
+    let gone = undelivered(&fx, &a);
+    assert_eq!(gone.len(), 1, "{gone:?}");
+    assert_eq!(gone[0]["payload"]["reason"], "superseded", "{gone:?}");
+    assert_eq!(gone[0]["payload"]["superseded_by"], json!(b), "{gone:?}");
+    assert_eq!(held_ids(&s), [b], "only the newer body is held");
+    crate::agent_write::set_test_sync_settle(true);
+}
+
+/// T-H3 (r1 §14), first half: the held bodies stay reserved - out of the table, undisposed - while the clear has not
+/// written, and are disposed as `cleared` only after its terminal. Mutant: dispose at hand-off.
+#[test]
+fn d6_held_bodies_stay_reserved_until_the_clears_terminal_then_go_as_cleared() {
+    let fx = fx("d6-h3");
+    let s = seat(&fx, true);
+    crate::agent_write::set_test_sync_settle(false);
+    let a = id_of(&send(&fx, &s, 900, "reserved body"));
+    let latch = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    *s.receiver_proof.lock().unwrap() = Some(Arc::new(BlockAdmit(latch.clone())));
+    let c = clear(&fx, &s);
+    assert!(c["result"]["request_id"].is_string(), "premise: {c}");
+    assert!(undelivered(&fx, &a).is_empty(), "disposed before the clear wrote a byte: {:?}", undelivered(&fx, &a));
+    assert!(held_ids(&s).is_empty(), "a reserved body is out of the table while the clear is in flight (R-6)");
+    release(&latch);
+    wait_writer_settled(&s);
+    *s.receiver_proof.lock().unwrap() = None;
+    let gone = undelivered(&fx, &a);
+    assert_eq!(gone.len(), 1, "{gone:?}");
+    assert_eq!(gone[0]["payload"]["reason"], "cleared", "{gone:?}");
+    assert!(held_ids(&s).is_empty());
+    assert!(!written_ids(&fx).contains(&a), "a held body is never typed by a clear");
+    crate::agent_write::set_test_sync_settle(true);
+}
+
+/// T-H3 (r1 §14), second half: a clear that wrote its Ctrl-U and then stopped byte-exact (PartialExact) has erased the
+/// line, so the held body is disposed as `cleared`, not restored. Mutant: restore on partial.
+#[test]
+fn d6_a_clear_that_wrote_its_ctrl_u_and_stopped_exactly_disposes_as_cleared() {
+    let fx = fx("d6-h3-partial");
+    let s = seat(&fx, true);
+    let a = id_of(&send(&fx, &s, 900, "erased by the ctrl-u"));
+    *s.receiver_proof.lock().unwrap() = Some(Arc::new(LoseAfterFirstCall(|| crate::receiver::ProofLoss::Unknown("test:after_ctrl_u".into()))));
+    let cid = id_of(&clear(&fx, &s));
+    wait_writer_settled(&s);
+    *s.receiver_proof.lock().unwrap() = None;
+    let partial = events(&fx, "surface.write_partial");
+    assert!(partial.iter().any(|e| e["payload"]["request_id"] == json!(cid) && e["payload"]["kind"] == "partial_exact"), "premise: {partial:?}");
+    let gone = undelivered(&fx, &a);
+    assert_eq!(gone.len(), 1, "{gone:?}");
+    assert_eq!(gone[0]["payload"]["reason"], "cleared", "{gone:?}");
+    assert!(held_ids(&s).is_empty(), "a body whose line the Ctrl-U erased must not come back");
+}
+
+/// T-H4 (r1 §14): a clear whose outcome is unknown (death after the Ctrl-U: PartialUnknown) disposes the held bodies as
+/// `clear_outcome_unknown` - the sender is told, the body is never typed twice. Mutant: treat as zero-byte.
+#[test]
+fn d6_a_clear_with_an_unknown_outcome_disposes_held_bodies_as_clear_outcome_unknown() {
+    let fx = fx("d6-h4");
+    let s = seat(&fx, true);
+    let a = id_of(&send(&fx, &s, 900, "behind an unknown clear"));
+    *s.receiver_proof.lock().unwrap() = Some(Arc::new(LoseAfterFirstCall(|| crate::receiver::ProofLoss::AgentDead)));
+    let cid = id_of(&clear(&fx, &s));
+    wait_writer_settled(&s);
+    *s.receiver_proof.lock().unwrap() = None;
+    let partial = events(&fx, "surface.write_partial");
+    assert!(partial.iter().any(|e| e["payload"]["request_id"] == json!(cid) && e["payload"]["kind"] == "partial_unknown"), "premise: {partial:?}");
+    let gone = undelivered(&fx, &a);
+    assert_eq!(gone.len(), 1, "{gone:?}");
+    assert_eq!(gone[0]["payload"]["reason"], "clear_outcome_unknown", "{gone:?}");
+    assert!(held_ids(&s).is_empty(), "an unknown clear outcome must not restore the body");
+}
+
+/// T-H5 (r2 §15): a bound write refused with zero bytes (by the journal - today's loss at the barrier refusal - or by
+/// the seat proof) gives its body back; a later bound Return of the same caller types it once. Mutant: drop the
+/// bound-body reservation.
+#[test]
+fn d6_a_bound_write_refused_with_zero_bytes_restores_its_body_and_a_later_return_types_it() {
+    let fx = fx("d6-h5");
+    let s = seat(&fx, true);
+    break_journal(&fx);
+    let a = id_of(&send(&fx, &s, 900, "bound then refused by the journal"));
+    let k = ret(&fx, &s, 900);
+    assert_eq!(k["error"]["code"], "journal_unavailable", "premise: {k}");
+    assert_eq!(held_ids(&s), [a.clone()], "the journal refusal lost the bound body");
+    assert!(undelivered(&fx, &a).is_empty(), "{:?}", undelivered(&fx, &a));
+    std::fs::remove_dir_all(fx.dir.join(crate::state::WRITER_JOURNAL_FILE)).unwrap();
+    let k = ret(&fx, &s, 900);
+    assert_eq!(k["result"]["request_id"], json!(a), "{k}");
+    assert_written_exactly_once(&fx, "bound then refused by the journal");
+    // The seat proof refuses admission: zero bytes again, the body again goes back. A fresh seat: the written Return
+    // above opens that seat's S21 split hold, a different gate from the one under test.
+    let s = seat(&fx, true);
+    let b = id_of(&send(&fx, &s, 901, "bound then refused by the proof"));
+    *s.receiver_proof.lock().unwrap() = Some(Arc::new(Refuse));
+    let _ = ret(&fx, &s, 901);
+    wait_writer_settled(&s);
+    *s.receiver_proof.lock().unwrap() = None;
+    assert_eq!(held_ids(&s), [b.clone()], "a proof refusal lost the bound body");
+    let k = ret(&fx, &s, 901);
+    assert_eq!(k["result"]["request_id"], json!(b), "{k}");
+    // A proof refusal comes after the journal barrier, so that attempt left a `writing` record and a zero-byte terminal.
+    let digest = crate::delivery::digest_text("bound then refused by the proof");
+    let recs: Vec<Value> = journal(&fx).lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).collect();
+    let ids: Vec<Value> = recs.iter().filter(|v| v["rec"] == "writing" && v["digest"] == json!(digest)).map(|v| v["id"].clone()).collect();
+    let kinds: Vec<Value> = recs.iter().filter(|v| v["rec"] == "terminal" && ids.contains(&v["id"])).map(|v| v["kind"].clone()).collect();
+    assert_eq!(kinds, [json!("refused_no_write"), json!("written_submitted")], "typed once, after one zero-byte attempt");
+}
+
+/// D6 extension (r2 §7): a bound write whose outcome is unknown (the body went out, the agent died before its Return:
+/// PartialUnknown) disposes the body with an explicit reason, never restores it. Mutant: no disposal on PartialUnknown.
+#[test]
+fn d6_a_bound_write_with_an_unknown_outcome_disposes_its_body_with_an_explicit_reason() {
+    let fx = fx("d6-h6");
+    let s = seat(&fx, true);
+    let a = id_of(&send(&fx, &s, 900, "bound body, unknown outcome"));
+    *s.receiver_proof.lock().unwrap() = Some(Arc::new(LoseAfterFirstCall(|| crate::receiver::ProofLoss::AgentDead)));
+    let _ = ret(&fx, &s, 900);
+    wait_writer_settled(&s);
+    *s.receiver_proof.lock().unwrap() = None;
+    let partial = events(&fx, "surface.write_partial");
+    assert!(partial.iter().any(|e| e["payload"]["request_id"] == json!(a) && e["payload"]["kind"] == "partial_unknown"), "premise: {partial:?}");
+    let gone = undelivered(&fx, &a);
+    assert_eq!(gone.len(), 1, "{gone:?}");
+    assert_eq!(gone[0]["payload"]["reason"], "bound_outcome_unknown", "{gone:?}");
+    let note = gone[0]["payload"]["note"].as_str().unwrap_or_default();
+    assert!(note.contains("may have been typed"), "the note must not claim nothing was typed: {note}");
+    assert!(held_ids(&s).is_empty(), "an unknown bound outcome must not restore the body");
+}
+
+/// Guard for the reservation itself (passes at ece8f1e8, where nothing was reserved before a failed hand-off): when the
+/// seat's writer refuses the hand-off, the reserved bodies go back - for a clear and for a bound write. Mutant: keep
+/// the reserved bodies when the hand-off fails.
+#[test]
+fn d6_a_failed_hand_off_gives_the_reserved_bodies_back() {
+    let fx = fx("d6-handoff");
+    let s = seat(&fx, true);
+    let a = id_of(&send(&fx, &s, 900, "held through failed hand-offs"));
+    let closed = s.write_tx.gate().try_transition().expect("premise: an idle writer");
+    let c = clear(&fx, &s);
+    assert_eq!(c["error"]["code"], "write_stalled", "premise: {c}");
+    assert_eq!(held_ids(&s), [a.clone()], "a failed clear hand-off lost the held body");
+    let k = ret(&fx, &s, 900);
+    assert_eq!(k["error"]["code"], "write_stalled", "premise: {k}");
+    assert_eq!(held_ids(&s), [a.clone()], "a failed bound hand-off lost the body");
+    drop(closed);
+    assert!(undelivered(&fx, &a).is_empty(), "{:?}", undelivered(&fx, &a));
+    let k = ret(&fx, &s, 900);
+    assert_eq!(k["result"]["request_id"], json!(a), "{k}");
+    assert_written_exactly_once(&fx, "held through failed hand-offs");
+}
+
 /// A body held for one agent never binds to the next one (agent epoch).
 #[test]
 fn a_body_held_for_one_agent_never_binds_to_the_next() {
