@@ -1272,6 +1272,26 @@ class PageCheckTests(Base):
                              out)
             self.assertIn("%s PAGE-DIFF" % rel, out)
 
+    def test_each_unfilled_release_size_refuses_before_any_public_move(self):
+        # Release-day preparation intentionally keeps SIZE slots until assets are measured.
+        for suffix in PAGE_SUFFIXES:
+            s = Site(os.path.join(self.tmp, "unfilled-" + suffix))
+            page = s.new_pages["index.html"]
+            literal = ("cys_%s%s" % (NEW, suffix)).encode() + dpc.MIDDOT + b"0MB"
+            self.assertEqual(page.count(literal), 1)
+            pending = literal[:-3] + dpc.MARK_SIZE[suffix] + b"MB"
+            self.rehash_page(s, "index.html", "index.html", page.replace(literal, pending))
+            before = s.tree()
+            rc, out = run(s.args("switch"))
+            self.assertEqual(rc, 3, out)
+            self.assertIn("index.html PAGE-DIFF", out)
+            self.assertEqual(s.tree(), before)
+            self.assertFalse(os.path.exists(os.path.join(s.stage, "plan.json")))
+            # Same assets and skeleton, only the pending slot filled: the switch succeeds.
+            self.rehash_page(s, "index.html", "index.html", page)
+            self.assertEqual(run(s.args("switch"))[0], 0)
+            self.assertEqual(s.tree(), s.new_tree())
+
     def test_first_call_refuses_a_changed_pinned_bundle(self):
         s = Site(os.path.join(self.tmp, "js"))
         put(os.path.join(s.docroot, "assets", "main.js"), b"/* changed */")
