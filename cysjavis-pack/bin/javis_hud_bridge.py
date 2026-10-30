@@ -2373,6 +2373,20 @@ def _load_spool_leaf(path=None):
         return None, type(e).__name__
 
 
+SPOOL_RC2_WHY = "spool-path rc 2 (older pack without the subcommand)"
+
+
+def _pack_version(pack_dir):
+    """(PKG-3A #19) The pack's install marker `<pack>/.pack-version` (the commit marker every pack install writes last), or
+    None when it cannot be read - then nothing is settled and the lane keeps its periodic re-check."""
+    try:
+        with open(os.path.join(pack_dir, ".pack-version"), "rb") as f:
+            v = f.read(256).decode("utf-8", "replace").strip()
+        return v or None
+    except (OSError, TypeError):
+        return None
+
+
 def spool_self_check(pack_dir, want, python=None, timeout=None):
     """One lane's self-check (DESIGN §3(B) table · DESIGN-r3 §1): run THAT lane's own producer code -
     `<pack_dir>/bin/javis_event.py spool-path` - and compare what it prints with the reader's path `want`.
@@ -2394,7 +2408,7 @@ def spool_self_check(pack_dir, want, python=None, timeout=None):
     except Exception as e:
         return "unverified", "spool-path did not run (%s)" % type(e).__name__
     if r.returncode == 2:
-        return "unverified", "spool-path rc 2 (older pack without the subcommand)"
+        return "unverified", SPOOL_RC2_WHY
     if r.returncode != 0:
         return "unverified", "spool-path rc %s" % r.returncode
     out = r.stdout.decode("utf-8", "surrogateescape").strip()
@@ -2439,6 +2453,7 @@ class SpoolReader:
         self.checked = self.leaf is None   # spool_checked; a missing leaf is a terminal startup fault -> latched now (K9)
         self.lanes = [self._rec("main", None, self.root, None)]
         self.held = set()                  # (slice H) (lane, error) already logged while a lane's spool cannot be read
+        self.failed = set()                # (PKG-3A #16 #18) (lane, kind[, error]) already logged - one line per episode
         if self.leaf is None:
             _log("spool leaf unavailable: %s - no spool is read (lane _bridge leaf_missing)" % err)
 
@@ -2451,7 +2466,10 @@ class SpoolReader:
                 path = None
         return {"lane": lane, "socket": socket, "pack_dir": pack_dir, "structural": structural, "path": path,
                 "check": None, "why": None, "checked_at": None, "offset": None, "foreign_key_dropped": 0,
-                "ident": None}             # (slice H) the offset record in memory (read_spool_lane); None = load it
+                "ident": None,             # (slice H) the offset record in memory (read_spool_lane); None = load it
+                "unsaved": False,          # (PKG-3A #18) the offset record in memory is not on disk yet: the save is retried
+                "route_failed": 0,         # (PKG-3A #16) records that failed to route, counted and skipped
+                "settled": None}           # (PKG-3A #19) .pack-version an rc 2 self-check is settled for (None = not settled)
 
     def _offset_path(self, lane):
         return os.path.join(self.state_dir, "evt_spool-%s.offset" % lane)
@@ -2481,6 +2499,9 @@ class SpoolReader:
         with self.lock:
             old = (rec["check"], rec["why"])
             rec["check"], rec["why"], rec["path"], rec["checked_at"] = check, why, path, now
+            # (PKG-3A #19) an older pack without the subcommand answers rc 2 until it is replaced: settled until its
+            # .pack-version changes (unreadable version -> not settled, the 60 s re-check stays)
+            rec["settled"] = _pack_version(rec["pack_dir"]) if (check, why) == ("unverified", SPOOL_RC2_WHY) else None
             if check not in ("verified", "unverified"):
                 rec["offset"] = None       # not read while faulted; the persisted offset is reloaded when it clears
                 rec["ident"] = None
@@ -2559,15 +2580,27 @@ class SpoolReader:
                         rec["checked_at"] = None
                 _log("spool leaf loaded - every lane is self-checked again")
         for rec in list(self.lanes):       # re-check every lane in FAULT or unverified (DESIGN-r2 1-5; clears only on a positive check, K8)
-            c = rec["check"]
+            c = rec["check"]               # (PKG-3A #19) at most ONE self-check per tick: each child can take up to 5 s
             if (c is None or c == "unverified" or c in SPOOL_FAULT_STATES) and \
                     (rec["checked_at"] is None or now - rec["checked_at"] >= SPOOL_RECHECK_SECS):
+                if rec["settled"] is not None and rec["settled"] == _pack_version(rec["pack_dir"]):
+                    with self.lock:
+                        rec["checked_at"] = now   # still the same older pack: no child; the version is read again next interval
+                    continue
                 self._run_check(rec, now)
+                break                      # the next due lane gets the next tick
         if self.fleet_state != "ok" or self.leaf is None:
             return                         # the startup gate: nothing is read, no offset moves
         for rec in list(self.lanes):
             if rec["check"] in ("verified", "unverified") and rec["path"]:
-                self._drain(rec)
+                try:                       # (PKG-3A #16) one lane that raises does not skip the other lanes this tick
+                    self._drain(rec)
+                except Exception as e:     # noqa: BLE001
+                    key = (rec["lane"], "drain", type(e).__name__)
+                    if key not in self.failed:
+                        self.failed.add(key)
+                        _log("spool lane %s: drain failed (%s: %s) - the other lanes are read; retried next poll, repeats not "
+                             "logged" % (rec["lane"], type(e).__name__, " ".join(str(e).split())[:120]))
 
     def _drain(self, rec):
         """Tail one lane's spool; route each record with ITS lane; rotate when drained (DESIGN-r2 3-3).
@@ -2582,7 +2615,9 @@ class SpoolReader:
             if ident is None:              # first sight: no replay - EOF if the spool exists, 0 if not (its first batch is read)
                 ident = _first_sight_ident(path)
                 if not _save_offset_record(opath, ident):
-                    return                 # K4: first sight again next poll (a view window may be skipped; no byte removed)
+                    # (PKG-3A #18 - replaces K4's 'first sight again next poll', which never read the lane while the save
+                    # kept failing) route from the record in memory and retry the save every poll (below)
+                    self._unsaved(rec, lane, opath)
             with self.lock:
                 rec["ident"], rec["offset"] = ident, ident["offset"]
         entries, new, note = read_spool_lane(path, ident)
@@ -2615,24 +2650,50 @@ class SpoolReader:
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
-            if spool_foreign(entry, lane):
+            try:                           # (PKG-3A #16) a record that fails is counted and skipped: the offset still moves
+                if spool_foreign(entry, lane):     # past the batch, so the records already routed are never replayed
+                    with self.lock:
+                        rec["foreign_key_dropped"] += 1
+                    continue
+                frames, _ = route_spool(entry, self.world, self.coal, lane=lane)
+                routed += 1
+                for fr in frames:
+                    self.hub.publish(fr)
+                    if fr.get("t") == "fx":
+                        archive_fx(entry.get("ts"), fr)
+            except Exception as e:         # noqa: BLE001
                 with self.lock:
-                    rec["foreign_key_dropped"] += 1
-                continue
-            frames, _ = route_spool(entry, self.world, self.coal, lane=lane)
-            routed += 1
-            for fr in frames:
-                self.hub.publish(fr)
-                if fr.get("t") == "fx":
-                    archive_fx(entry.get("ts"), fr)
-        if rotated or new != ident:
-            _save_offset_record(opath, new)   # after routing: a rotation's leftover is routed BEFORE offset 0 is kept
+                    rec["route_failed"] += 1
+                key = (lane, "route", type(e).__name__)
+                if key not in self.failed:
+                    self.failed.add(key)
+                    _log("spool lane %s: a record failed to route (%s: %s) - counted and skipped; repeats not logged"
+                         % (lane, type(e).__name__, " ".join(str(e).split())[:120]))
+        if rotated or new != ident or rec["unsaved"]:
+            # after routing: a rotation's leftover is routed BEFORE offset 0 is kept; (PKG-3A #18) an unsaved record is retried
+            if _save_offset_record(opath, new):
+                if rec["unsaved"]:
+                    with self.lock:
+                        rec["unsaved"] = False
+                    self.failed.discard((lane, "offset"))
+                    _log("spool lane %s: offset saved again to %s" % (lane, opath))
+            else:
+                self._unsaved(rec, lane, opath)
         with self.lock:
             rec["ident"], rec["offset"] = new, new["offset"]
         if routed:
             fr = self.world.top_frame("blocked")  # blocked[] 변경 시 상단 갱신
             if fr:
                 self.hub.publish(fr)
+
+    def _unsaved(self, rec, lane, opath):
+        """(PKG-3A #18) The offset record could not be saved: keep routing from memory, retry every poll, log once."""
+        with self.lock:
+            rec["unsaved"] = True
+        if (lane, "offset") not in self.failed:
+            self.failed.add((lane, "offset"))
+            _log("spool lane %s: offset cannot be saved to %s - routing continues from memory and the save is retried every "
+                 "poll" % (lane, opath))
 
     def _rotation_gate(self, rec, offset, in_grace):
         """(0.14.56 slice H · F1-C) Why a rotation must wait now, or None. G-a: the update path starts cysd (and this bridge)
