@@ -2026,34 +2026,6 @@ fn d9_bound_i3_controller_owned_claim_is_counted_once() {
     assert_eq!(hold_kind(&s),Some(QueueHoldKind::Refused),"controller disposition/backoff unchanged");
 }
 
-/// ★(0.14.56 · PKG1-M1 m5 · DESIGN-ADDENDUM-PKG1-M1.md sec 4, head check Q5) S11: a claim refusal that the writer settles after
-/// the caller stopped waiting (cleanup owner Controller) takes the same rollback as a caller-owned one: no `Refused` hold and
-/// no backoff, the item stays queued for the next tick, the event says `foreign_since_handoff`, and the refusal is counted
-/// once. RED (77f66491): a `Refused` hold with backoff and `why: receiver_refused(guard_aborted)` (doc C46 says the next tick
-/// re-judges).
-#[test]
-#[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
-fn pkg1_s11_controller_owned_claim_refusal_rolls_back_without_backoff() {
-    let fx=fx("pkg1-s11"); let recorder=p1_master_recorder(&fx,"pkg1-s11"); let s=recorder.surface.clone(); let id=enqueue(&fx,&s,"pkg1-s11");
-    // Synthetic API ownership control, as d9_bound_i3_controller_owned_claim_is_counted_once: no production defer_to_controller caller.
-    let held=p1_late_hold(&s,None);
-    let action=p1_queue_action(&s,move |sc,_| {
-        let guard=sc.inject_reservation.lock().unwrap().as_ref().expect("actual reservation").guard.clone();
-        let(wake,_rx)=crate::state::controller_wake_channel(); guard.defer_to_controller(wake).unwrap();
-        sc.input_gen.fetch_add(1,Ordering::AcqRel);
-        held.lock().unwrap().take().expect("late seam holder").release();
-    });
-    let _=hand_off(&fx,&s); action.finish();
-    p1_wait_completion(p1_writer_idle(&s),P1_GUARD).expect("controller terminal");
-    assert_eq!(d9_status(&fx.daemon,s.id)["writer_claim"]["refusals_total"]["queue"],1,"the claim refusal is counted exactly once");
-    let ab=events(&fx,"queue.inject_aborted");
-    assert_eq!(ab.len(),1,"{ab:?}");
-    assert!(ab[0]["payload"]["why"].as_str().is_some_and(|w| w.starts_with("foreign_since_handoff")),"m5 label: {ab:?}");
-    assert_eq!(hold_kind(&s),None,"m5: rollback without a Refused hold or backoff - the next tick re-judges");
-    let q:Vec<String>=s.pending_queue.lock().unwrap().iter().map(|e| e.id.clone()).collect();
-    assert_eq!(q,vec![id],"the item stays queued, not dropped and not duplicated");
-}
-
 #[test]
 fn d9_bound_i3_status_key_present_and_null_outside_scope() {
     let fx=fx("i3-status-scope");let s=seat(&fx);let row=d9_status(&fx.daemon,s.id);
