@@ -444,7 +444,7 @@ def main():
         repo = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
         for relative, literals in (
             (os.path.join("src", "bin", "cys.rs"), (
-                "디렉티브 생존 확인 (ACK 수신)", "reinjected {} bytes → surface:{sid}",
+                "디렉티브 생존 확인 (ACK 수신)", "reinjected {bytes} bytes → surface:{sid}",
                 "check reinject skip", "[reinject] ACK 없음",
                 # ★리뷰 R3: 실제 기동 모드가 phoenix 에 닿는 유일한 문면(`cli_fresh_roles` 가 파싱한다).
                 "[launch-agent] fresh 각성(role={role} · agent={agent})")),
