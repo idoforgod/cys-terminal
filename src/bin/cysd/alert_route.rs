@@ -4402,21 +4402,14 @@ fn office_spool_recorded_digest(daemon: &Arc<Daemon>) -> Option<(Vec<String>, f6
 /// change or close, a re-arm due), a refused-ledger key an explicit ok report forgets, or - base - a digest that is due
 /// (changed, outside the coalescing window, none already waiting). Measured before the change: one identical event every
 /// 60 s while a bridge gave no usable report (w51-m5-measure). An undeliverable notice stays pending, so it is still
-/// retried on every observation until delivered (never silence). An unreadable record says yes (loud).
+/// retried on every observation until delivered (never silence). An unreadable or non-object record is read as empty,
+/// exactly as the leg reads it (head decision on REPORT-PKG2-M1 2.5(2)): an all-ok observation publishes nothing - the
+/// leg had nothing to do with it - and a fault still publishes as a new pair, whose delivered entry overwrites the file.
 pub fn office_spool_wants(daemon: &Arc<Daemon>, payload: &Value) -> bool {
     office_spool_wants_at(daemon, payload, Now::live(daemon))
 }
 
 fn office_spool_wants_at(daemon: &Arc<Daemon>, payload: &Value, now: Now) -> bool {
-    match std::fs::read(state_dir(daemon).join(OFFICE_SPOOL_NOTIFIED_FILE)) {
-        Ok(b) => {
-            if !matches!(serde_json::from_slice::<Value>(&b), Ok(Value::Object(_))) {
-                return true;
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => return true,
-    }
     let lanes = parse_spool_lanes(payload);
     let before = load_spool_record(daemon);
     let expired = office_spool_expired_ids(daemon, OFFICE_SPOOL_MASTER_ROLE);
@@ -10414,26 +10407,36 @@ mod office_spool_drills {
         assert!(due, "after the window, with nothing waiting, it is presented");
     }
 
-    /// m5 (record gate, kept per w51-B-DESIGN-NOTES "unchanged, loud"): a notified-record file that is not a JSON object,
-    /// or that cannot be read, makes `wants` publish even an all-ok observation. Measured beside it: the leg does nothing
-    /// with that observation - no master entry, the file left as it was (reported to the head as a residual case).
+    /// m5 (head decision on REPORT-PKG2-M1 2.5(2)): an unreadable or non-object notified-record file is read as empty, as
+    /// the leg reads it. An all-ok observation then publishes nothing (17142f11 measured that the leg did nothing with it:
+    /// no master entry, the file left as it was - 1,440 events a day of noise). A fault still publishes as a new pair, is
+    /// delivered as one master entry, and that entry's save overwrites the corrupt file.
     #[test]
-    fn osd_m5_unreadable_record_still_publishes() {
+    fn osd_m5_unreadable_record_is_read_as_empty() {
         let (_b, d5) = pair("m5unread");
         let dir = crate::state::state_dir(&d5.socket_path);
         std::fs::create_dir_all(&dir).unwrap();
         let ok = json!({"lanes": [lane("dept-5", "ok", false)], "digest": null});
+        let bad = json!({"lanes": [lane("dept-5", "mismatch", true)], "digest": null});
         std::fs::write(dir.join(REC), b"{not json").unwrap();
-        let not_object = office_spool_wants(&d5, &ok);
-        send(&d5, vec![lane("dept-5", "ok", false)], Value::Null, 400.0);
-        let leg_entries = texts(&d5, "master").len();
-        let left_as_it_was = std::fs::read(dir.join(REC)).unwrap() == b"{not json";
+        let corrupt_ok = office_spool_wants(&d5, &ok);
+        std::fs::write(dir.join(REC), b"[]").unwrap();
+        let non_object_ok = office_spool_wants(&d5, &ok);
         std::fs::remove_file(dir.join(REC)).unwrap();
         std::fs::create_dir(dir.join(REC)).unwrap(); // a read error that is not NotFound
-        let read_error = office_spool_wants(&d5, &ok);
-        println!("OSD-M5-UNREAD not_object={not_object} read_error={read_error} leg_entries={leg_entries} left_as_it_was={left_as_it_was}");
-        assert!(not_object, "a record that is not a JSON object publishes");
-        assert!(read_error, "a record that cannot be read publishes");
-        assert_eq!((leg_entries, left_as_it_was), (0, true), "measured: the leg does nothing with that all-ok observation");
+        let read_error_ok = office_spool_wants(&d5, &ok);
+        std::fs::remove_dir(dir.join(REC)).unwrap();
+        std::fs::write(dir.join(REC), b"{not json").unwrap();
+        let corrupt_fault = office_spool_wants(&d5, &bad);
+        send(&d5, vec![lane("dept-5", "mismatch", true)], Value::Null, 400.0);
+        let entries = texts(&d5, "master").len();
+        let overwritten = matches!(serde_json::from_slice::<Value>(&std::fs::read(dir.join(REC)).unwrap()), Ok(Value::Object(_)));
+        println!("OSD-M5-UNREAD corrupt_ok={corrupt_ok} non_object_ok={non_object_ok} read_error_ok={read_error_ok} \
+                  corrupt_fault={corrupt_fault} entries={entries} overwritten={overwritten}");
+        assert!(!corrupt_ok, "a corrupt record + an all-ok observation publishes nothing");
+        assert!(!non_object_ok, "a non-object record + an all-ok observation publishes nothing");
+        assert!(!read_error_ok, "an unreadable record + an all-ok observation publishes nothing");
+        assert!(corrupt_fault, "a corrupt record + a fault still publishes");
+        assert_eq!((entries, overwritten), (1, true), "the fault is one master entry and its save overwrites the corrupt file");
     }
 }
