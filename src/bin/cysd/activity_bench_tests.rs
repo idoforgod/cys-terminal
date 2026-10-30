@@ -259,7 +259,7 @@ fn u43_lock_cost_arm() {
     let dir = std::env::temp_dir().join(format!("cys-u43-{}-{}", arm.as_str(), std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     std::fs::write(dir.join("acl.json"), r#"{"default":"allow","rules":[]}"#).unwrap();
-    std::env::set_var(cys::pack::ENV_PACK_DIR, &dir);
+    let _pack_env = crate::governance::ReapEnvGuard::set(&[(cys::pack::ENV_PACK_DIR, &dir.to_string_lossy())]);
 
     // ── corpus verification (sha256 vs INDEX.json) ────────────────────────────────────────────
     let index_raw = std::fs::read(corpus.join("INDEX.json")).expect("read INDEX.json");

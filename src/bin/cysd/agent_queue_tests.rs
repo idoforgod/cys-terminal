@@ -1716,9 +1716,9 @@ fn d9_bound_i2_non_master_is_not_idle_gated() {
 fn d9_bound_i2_writer_hold_keeps_queue_alarms_live() {
     let fx = fx("i2-alarm");
     let recorder = p1_master_recorder(&fx, "i2-alarm"); let s = recorder.surface.clone();
-    std::env::set_var("CYS_QUEUE_STARVE_ALERT_SECS", "1");
-    std::env::set_var("CYS_QUEUE_DEPTH_ALERT", "1");
-    std::env::set_var("CYS_QUEUE_QUIET_SECS", "0");
+    // Unwind-safe: the meta test p1_completion_wc1_each_case_* forces a panic inside holder.release() below; a manual remove_var after it
+    // never ran and left CYS_QUEUE_QUIET_SECS=0 in the process for every later test (F-4 (C)).
+    let _queue_env = crate::governance::ReapEnvGuard::set(&[("CYS_QUEUE_STARVE_ALERT_SECS", "1"), ("CYS_QUEUE_DEPTH_ALERT", "1"), ("CYS_QUEUE_QUIET_SECS", "0")]);
     let id = enqueue(&fx, &s, "i2-alarm");
     let entry_at = s.pending_queue.lock().unwrap().front().unwrap().enqueued_at;
     let now = entry_at.max(fx.daemon.started_at).max(s.created_at) + 2.0;
@@ -1728,7 +1728,6 @@ fn d9_bound_i2_writer_hold_keeps_queue_alarms_live() {
     crate::governance::h_queue_tick(&fx.daemon);
     let starved = events(&fx, "queue.starved"); let depth = events(&fx, "queue.depth_high");
     holder.release();
-    for key in ["CYS_QUEUE_STARVE_ALERT_SECS", "CYS_QUEUE_DEPTH_ALERT", "CYS_QUEUE_QUIET_SECS"] { std::env::remove_var(key); }
     assert_eq!(starved.len(), 1, "S-Q4: queue.starved count while writer held");
     assert!(starved[0]["payload"]["blocked_by"].as_str().unwrap().starts_with("writer_active"));
     assert_eq!(starved[0]["payload"]["head_entry_id"], id, "the aged item is the observed item");

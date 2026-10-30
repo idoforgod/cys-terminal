@@ -3238,13 +3238,10 @@ mod tests {
     /// 기본 임계는 15분이다(설정 가능) — 기본값이 곧 계약이므로 상수를 핀한다.
     #[test]
     fn b6_default_max_session_age_is_fifteen_minutes() {
-        let prev = std::env::var("CYS_USAGE_MAX_SESSION_AGE_SECS").ok();
+        let age_env = crate::governance::ReapEnvGuard::set(&[("CYS_USAGE_MAX_SESSION_AGE_SECS", "")]);
         std::env::remove_var("CYS_USAGE_MAX_SESSION_AGE_SECS");
         let got = usage_max_session_age_secs();
-        match prev {
-            Some(v) => std::env::set_var("CYS_USAGE_MAX_SESSION_AGE_SECS", v),
-            None => std::env::remove_var("CYS_USAGE_MAX_SESSION_AGE_SECS"),
-        }
+        drop(age_env);
         assert_eq!(got, 900.0);
     }
 
@@ -3632,19 +3629,13 @@ mod tests {
             "JAVIS_CLAUDE_CTX_WINDOW",
             "AITERM_CLAUDE_CTX_WINDOW",
         ];
-        let saved: Vec<(&str, Option<String>)> =
-            keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        let window_env = crate::governance::ReapEnvGuard::set(&keys.map(|k| (k, "")));
         for k in keys {
             std::env::remove_var(k);
         }
         assert_eq!(claude_ctx_window("claude-fable-5"), 200_000);
         assert_eq!(claude_ctx_window("claude-sonnet-4-6[1m]"), 1_000_000);
-        for (k, v) in saved {
-            match v {
-                Some(val) => std::env::set_var(k, val),
-                None => std::env::remove_var(k),
-            }
-        }
+        drop(window_env);
     }
 
     // ── codex 파서: 실측 스키마(2026-06-13, codex-cli 0.139.0) 핀 ──

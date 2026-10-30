@@ -920,9 +920,9 @@ mod tests {
         let mut last_prune: Option<std::time::Instant> = None; // ★prune 발동(즉시 due·Instant 뺄셈 제거)
         {
             let _g = RETAIN_ENV_LOCK.lock().unwrap();
-            std::env::set_var("CYS_RECALL_RETAIN_DAYS", "30");
+            let retain_env = crate::governance::ReapEnvGuard::set(&[("CYS_RECALL_RETAIN_DAYS", "30")]);
             maybe_prune(&conn, &mut chains, &mut last_prune);
-            std::env::remove_var("CYS_RECALL_RETAIN_DAYS");
+            drop(retain_env);
         }
 
         // 1) 오래된 3줄은 lines에서 삭제, 최근 2줄만 남는다
@@ -1154,9 +1154,9 @@ mod tests {
         let mut last_prune: Option<std::time::Instant> = Some(std::time::Instant::now()); // ★최근 prune=미발동
         {
             let _g = RETAIN_ENV_LOCK.lock().unwrap();
-            std::env::set_var("CYS_RECALL_RETAIN_DAYS", "30");
+            let retain_env = crate::governance::ReapEnvGuard::set(&[("CYS_RECALL_RETAIN_DAYS", "30")]);
             maybe_prune(&conn, &mut chains, &mut last_prune);
-            std::env::remove_var("CYS_RECALL_RETAIN_DAYS");
+            drop(retain_env);
         }
         let cnt: i64 = conn
             .query_row("SELECT COUNT(*) FROM lines WHERE surface_id=?1", [sid], |r| {
@@ -1212,9 +1212,9 @@ mod tests {
                 std::collections::HashMap::new();
             let mut last_prune: Option<std::time::Instant> = None; // ★prune 발동(즉시 due·Instant 뺄셈 제거)
             let _g = RETAIN_ENV_LOCK.lock().unwrap();
-            std::env::set_var("CYS_RECALL_RETAIN_DAYS", "30");
+            let retain_env = crate::governance::ReapEnvGuard::set(&[("CYS_RECALL_RETAIN_DAYS", "30")]);
             maybe_prune(writer, &mut chains, &mut last_prune);
-            std::env::remove_var("CYS_RECALL_RETAIN_DAYS");
+            drop(retain_env);
         };
 
         // --- (A) split-reads(현재 버그 시퀀스): read1 → prune → read2 ---
@@ -1345,9 +1345,9 @@ mod tests {
         let mut last_prune: Option<std::time::Instant> = None; // ★prune 발동(즉시 due·Instant 뺄셈 제거)
         {
             let _g = RETAIN_ENV_LOCK.lock().unwrap();
-            std::env::set_var("CYS_RECALL_RETAIN_DAYS", "0");
+            let retain_env = crate::governance::ReapEnvGuard::set(&[("CYS_RECALL_RETAIN_DAYS", "0")]);
             maybe_prune(&conn, &mut chains, &mut last_prune);
-            std::env::remove_var("CYS_RECALL_RETAIN_DAYS");
+            drop(retain_env);
         }
         let cnt: i64 = conn
             .query_row("SELECT COUNT(*) FROM lines WHERE surface_id=?1", [sid], |r| {

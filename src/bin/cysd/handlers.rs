@@ -13358,7 +13358,7 @@ mod tests {
     #[test]
     fn p2_identify_and_epoch_share_one_incarnation_and_resolve_null_caller() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("p2-identify", r#"{"default":"allow"}"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("p2-identify", r#"{"default":"allow"}"#);
         let pid = std::process::id();
         daemon.caller_cache.lock().unwrap().insert(pid,
             crate::state::CallerCacheEntry::new(Some(7), crate::state::now_epoch(), None, 0));
@@ -13377,7 +13377,6 @@ mod tests {
             method: "system.identify".into(), params: json!({"caller": null}) }, None) else { panic!("single"); };
         assert!(no_peer["result"]["caller"].is_null());
         crate::state::test_stop_daemon(&daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -14282,7 +14281,7 @@ mod tests {
 
     /// 격리된 임시 디렉터리에 acl.json을 깔고 그 안에 소켓 경로를 둔 Daemon을 만든다.
     /// 반환된 _guard가 살아있는 동안 CYS_PACK_DIR가 이 디렉터리를 가리킨다.
-    fn daemon_with_acl(tag: &str, acl_json: &str) -> (Arc<Daemon>, std::path::PathBuf) {
+    fn daemon_with_acl(tag: &str, acl_json: &str) -> (Arc<Daemon>, std::path::PathBuf, crate::governance::ReapEnvGuard) {
         // ★R5-B: dispatch(surface.send_text / feed 자동 라우팅)가 배달 원장에 append 하므로,
         // 격리가 없으면 `pack_state_dir()` 이 실 HOME 으로 해소돼 라이브 원장이 더러워진다.
         // 하네스에서 일괄로 접는다(개별 테스트가 잊어도 새지 않게 — delivery.rs tests 머리말 참조).
@@ -14298,9 +14297,10 @@ mod tests {
         ));
         let _ = std::fs::create_dir_all(&dir);
         std::fs::write(dir.join("acl.json"), acl_json).unwrap();
-        std::env::set_var(cys::pack::ENV_PACK_DIR, &dir);
+        // Unwind-safe (F-4 (C)): the caller keeps the guard; CYS_PACK_DIR goes back to its previous value (set or unset) when the test ends or panics.
+        let pack_env = crate::governance::ReapEnvGuard::set(&[(cys::pack::ENV_PACK_DIR, &dir.to_string_lossy())]);
         let daemon = Daemon::new(dir.join("cysd.sock"));
-        (daemon, dir)
+        (daemon, dir, pack_env)
     }
 
     /// T1-3 회귀: send_text의 `human:true`는 ACL을 우회하지 못한다.
@@ -14316,7 +14316,7 @@ mod tests {
                 { "from": "reviewer-*", "to": "worker*", "allow": false }
             ]
         }"#;
-        let (daemon, dir) = daemon_with_acl("human-bypass", acl);
+        let (daemon, dir, _pack_env) = daemon_with_acl("human-bypass", acl);
 
         // 대상: worker 역할 surface (reviewer가 주입하려는 stdin)
         let worker = daemon
@@ -14388,7 +14388,6 @@ mod tests {
         assert_eq!(resp2["error"]["code"], json!("acl_denied"));
 
         crate::state::test_stop_daemon(&daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -14406,7 +14405,7 @@ mod tests {
     #[test]
     fn owner_grade_needs_matching_token_and_no_pane_binding() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("owner-grade", r#"{"default":"allow","rules":[]}"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("owner-grade", r#"{"default":"allow","rules":[]}"#);
         let tok = daemon
             .operator_token
             .clone()
@@ -14449,7 +14448,6 @@ mod tests {
             "owner_token 으로 이 데몬의 pane 이 승격됐다 — 판정 2조건이 키마다 갈라졌다"
         );
 
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -14472,7 +14470,7 @@ mod tests {
                 { "from": "external", "to": "master", "allow": true }
             ]
         }"#;
-        let (daemon, dir) = daemon_with_acl("owner-dept", dept_acl);
+        let (daemon, dir, _pack_env) = daemon_with_acl("owner-dept", dept_acl);
         let tok = daemon.operator_token.clone().expect("operator.token 발급 전제");
 
         let worker = daemon
@@ -14546,7 +14544,6 @@ mod tests {
         );
 
         crate::state::test_stop_daemon(&daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -14575,7 +14572,7 @@ mod tests {
                 { "from": "reviewer-*", "to": "worker*", "allow": false }
             ]
         }"#;
-        let (daemon, dir) = daemon_with_acl("owner-absent", no_owner_acl);
+        let (daemon, dir, _pack_env) = daemon_with_acl("owner-absent", no_owner_acl);
         let tok = daemon.operator_token.clone().expect("operator.token 발급 전제");
 
         let worker = daemon
@@ -14620,7 +14617,6 @@ mod tests {
         );
 
         crate::state::test_stop_daemon(&daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -14642,7 +14638,7 @@ mod tests {
                 { "from": "reviewer-*", "to": "worker*", "allow": false }
             ]
         }"#;
-        let (daemon, dir) = daemon_with_acl("non-owner-identical", acl);
+        let (daemon, dir, _pack_env) = daemon_with_acl("non-owner-identical", acl);
         let tok = daemon.operator_token.clone().expect("operator.token 발급 전제");
 
         let worker = daemon
@@ -14761,7 +14757,6 @@ mod tests {
         }
 
         crate::state::test_stop_daemon(&daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -14773,7 +14768,7 @@ mod tests {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let run = |tag: &'static str, acl: &str, gui_pid: u32| -> Value {
-            let (daemon, dir) = daemon_with_acl(tag, acl);
+            let (daemon, dir, _pack_env) = daemon_with_acl(tag, acl);
             let tok = daemon.operator_token.clone().expect("operator.token 발급 전제");
             let worker = daemon
                 .create_surface(None, Some("sleep 30".into()), None, Some("worker-1".into()), 24, 80)
@@ -14809,7 +14804,6 @@ mod tests {
                 panic!("expected single reply");
             };
             crate::state::test_stop_daemon(&daemon);
-            std::env::remove_var(cys::pack::ENV_PACK_DIR);
             let _ = std::fs::remove_dir_all(&dir);
             resp
         };
@@ -14843,7 +14837,7 @@ mod tests {
         // ②' 대조군: **같은 와일드카드 규칙**이 비-오너에게는 종전대로 글롭 매칭돼 거부다
         //     (from exact 는 오너 순회에만 적용된다 — 일반 규칙 의미론 무회귀).
         {
-            let (daemon, dir) = daemon_with_acl("wildcard-nonowner-control", WILDCARD_ACL);
+            let (daemon, dir, _pack_env) = daemon_with_acl("wildcard-nonowner-control", WILDCARD_ACL);
             let worker = daemon
                 .create_surface(None, Some("sleep 30".into()), None, Some("worker-1".into()), 24, 80)
                 .expect("create worker surface");
@@ -14883,7 +14877,6 @@ mod tests {
                 "`from:\"*\"` 가 비-오너에게 더는 글롭 매칭되지 않는다 — 일반 규칙 의미론 회귀 ({r})"
             );
             crate::state::test_stop_daemon(&daemon);
-            std::env::remove_var(cys::pack::ENV_PACK_DIR);
             let _ = std::fs::remove_dir_all(&dir);
         }
 
@@ -14896,7 +14889,7 @@ mod tests {
         );
 
         // ④ 대조군: 같은 default:"deny" 에서 **비-오너**는 종전대로 거부(기본 허용 누출 없음).
-        let (daemon, dir) = daemon_with_acl("owner-default-deny-control", r#"{"default":"deny","rules":[]}"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("owner-default-deny-control", r#"{"default":"deny","rules":[]}"#);
         let worker = daemon
             .create_surface(None, Some("sleep 30".into()), None, Some("worker-1".into()), 24, 80)
             .expect("create worker surface");
@@ -14936,7 +14929,6 @@ mod tests {
             "오너 기본 허용이 비-오너에게 새어 나갔다 ({r4})"
         );
         crate::state::test_stop_daemon(&daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -14952,7 +14944,7 @@ mod tests {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // owner 규칙이 **없는** ACL — 기본 허용으로 승격되며, 승격이 없었다면 external→worker deny.
         let acl = r#"{"default":"allow","rules":[{"from":"external","to":"worker*","allow":false}]}"#;
-        let (daemon, dir) = daemon_with_acl("owner-audit", acl);
+        let (daemon, dir, _pack_env) = daemon_with_acl("owner-audit", acl);
         let tok = daemon.operator_token.clone().expect("operator.token 발급 전제");
 
         let worker = daemon
@@ -15108,7 +15100,6 @@ mod tests {
         }
 
         crate::state::test_stop_daemon(&daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -15123,7 +15114,7 @@ mod tests {
     fn unresolved_caller_pid_owner_grants_are_never_suppressed() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let acl = r#"{"default":"allow","rules":[{"from":"external","to":"worker*","allow":false}]}"#;
-        let (daemon, dir) = daemon_with_acl("owner-audit-nopid", acl);
+        let (daemon, dir, _pack_env) = daemon_with_acl("owner-audit-nopid", acl);
         let tok = daemon.operator_token.clone().expect("operator.token 발급 전제");
         let worker = daemon
             .create_surface(None, Some("sleep 30".into()), None, Some("worker-1".into()), 24, 80)
@@ -15232,7 +15223,6 @@ mod tests {
         );
 
         crate::state::test_stop_daemon(&daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -15248,7 +15238,7 @@ mod tests {
     #[test]
     fn owner_grant_audit_ledger_rotates_one_generation_over_cap() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("owner-audit-rotate", r#"{"default":"allow"}"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("owner-audit-rotate", r#"{"default":"allow"}"#);
         let p = owner_grant_audit_path(&daemon);
         let rotated = p.with_extension("jsonl.1");
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -15282,7 +15272,6 @@ mod tests {
             "세대가 늘었다 — 계약은 1세대 회전이다(디스크 무한 점유 차단)"
         );
 
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -15366,7 +15355,7 @@ mod tests {
                 { "from": "external", "to": "worker*", "allow": false }
             ]
         }"#;
-        let (daemon, dir) = daemon_with_acl("owner-machine-origin", dept_acl);
+        let (daemon, dir, _pack_env) = daemon_with_acl("owner-machine-origin", dept_acl);
         let tok = daemon.operator_token.clone().expect("operator.token 발급 전제");
         let worker = daemon
             .create_surface(None, Some("sleep 30".into()), None, Some("worker-1".into()), 24, 80)
@@ -15438,7 +15427,6 @@ mod tests {
         );
 
         crate::state::test_stop_daemon(&daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -15868,7 +15856,7 @@ mod tests {
     #[test]
     fn unset_boot_v2_reads_off_inside_and_answers_off_outside() {
         let _g = BOOT_V2_ENV_LOCK.lock().unwrap();
-        let saved = std::env::var(crate::boot_supervisor::ENV_BOOT_V2).ok();
+        let boot_env = crate::governance::ReapEnvGuard::set(&[(crate::boot_supervisor::ENV_BOOT_V2, "")]);
         std::env::remove_var(crate::boot_supervisor::ENV_BOOT_V2);
 
         // ⓐ 안쪽 — 순수 판독.
@@ -15889,9 +15877,7 @@ mod tests {
         };
         std::fs::remove_dir_all(&dir).ok();
         // ★단언보다 먼저 되돌린다 — 실패해도 프로세스 전역 env 를 더럽힌 채 나가지 않는다.
-        if let Some(v) = saved {
-            std::env::set_var(crate::boot_supervisor::ENV_BOOT_V2, v);
-        }
+        drop(boot_env);
 
         assert!(!inside, "미설정인데 내부 판독이 켜짐이다 — opt-in 이 아니다");
         assert_eq!(
@@ -16184,7 +16170,7 @@ mod tests {
     #[test]
     fn role_owner_is_reserved_on_claim_and_create() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("owner-reserved", r#"{"default":"allow","rules":[]}"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("owner-reserved", r#"{"default":"allow","rules":[]}"#);
 
         let pane = daemon
             .create_surface(None, Some("sleep 30".into()), None, Some("worker-1".into()), 24, 80)
@@ -16259,7 +16245,6 @@ mod tests {
         assert_eq!(ok["ok"], json!(true), "정상 역할 등록까지 막혔다 ({ok})");
 
         crate::state::test_stop_daemon(&daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -16293,7 +16278,7 @@ mod tests {
                 { "from": "external", "to": "master", "allow": true }
             ]
         }"#;
-        let (daemon, dir) = daemon_with_acl("creator-boot", dept_acl);
+        let (daemon, dir, _pack_env) = daemon_with_acl("creator-boot", dept_acl);
 
         // 창작자 = **이 테스트 프로세스 자신**. 합성 pid 로는 start_time 이 None 이라
         // fail-closed 로 거부된다(설계상 의도) — 실제 pid 여야 판정이 성립한다.
@@ -16363,7 +16348,6 @@ mod tests {
         );
 
         crate::state::test_stop_daemon(&daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -16379,7 +16363,7 @@ mod tests {
                 { "from": "external", "to": "worker*", "allow": false }
             ]
         }"#;
-        let (daemon, dir) = daemon_with_acl("creator-scope", dept_acl);
+        let (daemon, dir, _pack_env) = daemon_with_acl("creator-scope", dept_acl);
         let boot_pid = std::process::id();
         daemon
             .caller_cache
@@ -16452,7 +16436,6 @@ mod tests {
         );
 
         crate::state::test_stop_daemon(&daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -16559,7 +16542,7 @@ mod tests {
                 { "from": "creator", "to": "worker*", "allow": false }
             ]
         }"#;
-        let (daemon, dir) = daemon_with_acl("creator-deny", acl);
+        let (daemon, dir, _pack_env) = daemon_with_acl("creator-deny", acl);
         let boot_pid = std::process::id();
         daemon
             .caller_cache
@@ -16604,7 +16587,6 @@ mod tests {
         );
 
         crate::state::test_stop_daemon(&daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -16626,7 +16608,7 @@ mod tests {
                 { "from": "external", "to": "worker*", "allow": false }
             ]
         }"#;
-        let (daemon, dir) = daemon_with_acl("creator-audit", acl);
+        let (daemon, dir, _pack_env) = daemon_with_acl("creator-audit", acl);
         daemon
             .next_id
             .store(4_200, std::sync::atomic::Ordering::SeqCst);
@@ -16752,7 +16734,6 @@ mod tests {
         );
 
         crate::state::test_stop_daemon(&daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -16762,7 +16743,7 @@ mod tests {
     #[test]
     fn role_creator_is_reserved_on_claim_and_create() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("creator-reserved", r#"{"default":"allow","rules":[]}"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("creator-reserved", r#"{"default":"allow","rules":[]}"#);
 
         let pane = daemon
             .create_surface(None, Some("sleep 30".into()), None, Some("worker-1".into()), 24, 80)
@@ -16837,7 +16818,6 @@ mod tests {
         assert_eq!(ok["ok"], json!(true), "정상 역할 등록까지 막혔다 ({ok})");
 
         crate::state::test_stop_daemon(&daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -16846,7 +16826,7 @@ mod tests {
     #[test]
     fn closing_a_seat_drops_its_creator_ledger_entry() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("creator-close", r#"{"default":"allow","rules":[]}"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("creator-close", r#"{"default":"allow","rules":[]}"#);
         let boot_pid = std::process::id();
         daemon
             .caller_cache
@@ -16888,7 +16868,6 @@ mod tests {
         );
 
         crate::state::test_stop_daemon(&daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -16898,7 +16877,7 @@ mod tests {
     #[test]
     fn b1_order_inverted_is_observed_when_same_sender_has_pending_queue() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, _dir) = daemon_with_acl("b1-order", r#"{"default":"allow","rules":[]}"#);
+        let (daemon, _dir, _pack_env) = daemon_with_acl("b1-order", r#"{"default":"allow","rules":[]}"#);
         let target = daemon
             .create_surface(None, Some("sleep 30".into()), None, Some("master".into()), 24, 80)
             .expect("create target");
@@ -16962,7 +16941,7 @@ mod tests {
         // ★R5-B: 상태 디렉터리 격리는 `daemon_with_acl` 이 스레드 로컬로 건다(종전의 손수
         // 짠 `CYS_STATE_DIR` 저장/복원 + 전역 뮤텍스는 제거 — 프로세스 전역 env 라 병렬 러너에서
         // 서로를 덮었고, `ACL_ENV_LOCK` 과 획득 순서가 갈려 교착 위험도 있었다).
-        let (daemon, dir) = daemon_with_acl("delivery-ledger", r#"{"default":"allow","rules":[]}"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("delivery-ledger", r#"{"default":"allow","rules":[]}"#);
         let token = daemon
             .operator_token
             .clone()
@@ -17072,7 +17051,6 @@ mod tests {
         );
 
         crate::state::test_stop_daemon(&daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -17128,7 +17106,7 @@ mod tests {
                 { "from": "reviewer-*", "to": "worker*", "allow": false }
             ]
         }"#;
-        let (daemon, dir) = daemon_with_acl("denied-guard", acl);
+        let (daemon, dir, _pack_env) = daemon_with_acl("denied-guard", acl);
 
         // 대상: worker pane (타이핑 가드가 오염될 피해자)
         let worker = daemon
@@ -17190,7 +17168,6 @@ mod tests {
         );
 
         crate::state::test_stop_daemon(&daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -17202,7 +17179,7 @@ mod tests {
     #[test]
     fn send_text_pure_mouse_report_does_not_touch_typing_guard() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) =
+        let (daemon, dir, _pack_env) =
             daemon_with_acl("mouse-human-exempt", r#"{ "default": "allow", "rules": [] }"#);
 
         let worker = daemon
@@ -17267,7 +17244,6 @@ mod tests {
         );
 
         crate::state::test_stop_daemon(&daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -17284,7 +17260,7 @@ mod tests {
     #[test]
     fn terminal_autoreply_does_not_block_node_submit_return() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) =
+        let (daemon, dir, _pack_env) =
             daemon_with_acl("autoreply-guard", r#"{ "default": "allow", "rules": [] }"#);
 
         // 피해자: master pane (다른 노드의 보고를 받는 쪽)
@@ -17369,7 +17345,6 @@ mod tests {
         );
 
         crate::state::test_stop_daemon(&daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -17423,7 +17398,7 @@ mod tests {
     #[test]
     fn v7_probe_handler_observed_counts() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("v7-probe", r#"{ "default": "allow", "rules": [] }"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("v7-probe", r#"{ "default": "allow", "rules": [] }"#);
         let pid = 999_470_u32;
 
         // D-01: pane 을 10번 클릭·이탈 — 타이핑 가드 시계와 계수를 **같은 호출에서** 나란히 본다.
@@ -17482,7 +17457,6 @@ mod tests {
         eprintln!("V7OBS handler.split three_calls={steps_a:?} one_call={one} boundary_in_body={steps_c:?}");
 
         crate::state::test_stop_daemon(&daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -17492,7 +17466,7 @@ mod tests {
     #[test]
     fn v7_d01_handler_exempts_typing_guard_but_still_counts_autoreply() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("v7-d01", r#"{ "default": "allow", "rules": [] }"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("v7-d01", r#"{ "default": "allow", "rules": [] }"#);
         let pid = 999_480_u32;
         let m = v7_pane(&daemon, "master", pid);
         let mut pending = 0;
@@ -17502,7 +17476,6 @@ mod tests {
         }
         let guard_untouched = m.last_human_input.lock().unwrap().is_none();
         crate::state::test_stop_daemon(&daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
         eprintln!("V7OBS v7_d01_handler guard_untouched={guard_untouched} pending_input_bytes={pending}");
         assert!(guard_untouched, "전제: 자동응답은 타이핑 가드를 찍지 않는다(handlers.rs:4224 면제)");
@@ -17516,7 +17489,7 @@ mod tests {
     #[test]
     fn v7_split_paste_handler_call_boundary_must_not_change_count() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("v7-split", r#"{ "default": "allow", "rules": [] }"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("v7-split", r#"{ "default": "allow", "rules": [] }"#);
         let pid = 999_490_u32;
         let a = v7_pane(&daemon, "worker-1", pid);
         let steps: Vec<u64> = ["\u{1b}[200~", "\u{1b}[24;80R", "\u{1b}[201~"]
@@ -17526,7 +17499,6 @@ mod tests {
         let b = v7_pane(&daemon, "worker-2", pid + 1);
         let one = v7_send_human(&daemon, b.id, pid + 1, "\u{1b}[200~\u{1b}[24;80R\u{1b}[201~");
         crate::state::test_stop_daemon(&daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
         eprintln!("V7OBS v7_split_paste_handler three_calls={steps:?} one_call={one}");
         assert_eq!(
@@ -17571,7 +17543,6 @@ mod tests {
     /// 의도된 RED 단언 전에 정리해 실패가 다음 검체의 pack 환경·자식 프로세스에 새지 않게 한다.
     fn d12_cleanup(daemon: &Arc<Daemon>, dir: &std::path::Path) {
         crate::state::test_stop_daemon(daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -17580,7 +17551,7 @@ mod tests {
     #[test]
     fn c_clear_first_text_sanitized_before_ledger() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("c-clear-first", r#"{"default":"allow","rules":[]}"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("c-clear-first", r#"{"default":"allow","rules":[]}"#);
         let pid = 999_700;
         let target = v7_pane(&daemon, "worker-1", pid);
         let _sender = v7_pane(&daemon, "master", pid + 1);
@@ -17775,7 +17746,7 @@ mod tests {
     #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
     fn c_direct_fence_dispatch_behavior() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("c-direct-fence", r#"{"default":"allow","rules":[]}"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("c-direct-fence", r#"{"default":"allow","rules":[]}"#);
         let pid = 999_720;
         let _sender = v7_pane(&daemon, "master", pid);
         let out = dir.join("rx.bin");
@@ -17904,7 +17875,7 @@ mod tests {
     #[test]
     fn d12_direct_send_text_denied_when_human_draft_pending() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("d12-text-draft", r#"{"default":"allow","rules":[]}"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("d12-text-draft", r#"{"default":"allow","rules":[]}"#);
         let pid = 999_510;
         let target = v7_pane(&daemon, "worker-1", pid);
         let _sender = v7_pane(&daemon, "worker-2", pid + 1);
@@ -17934,7 +17905,7 @@ mod tests {
     #[test]
     fn d12_direct_send_text_passes_on_empty_line() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("d12-text-empty", r#"{"default":"allow","rules":[]}"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("d12-text-empty", r#"{"default":"allow","rules":[]}"#);
         let pid = 999_512;
         let target = v7_pane(&daemon, "worker-1", pid);
         let _sender = v7_pane(&daemon, "worker-2", pid + 1);
@@ -17953,7 +17924,7 @@ mod tests {
     #[test]
     fn d12_autoreply_only_line_counts_as_empty() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("d12-autoreply", r#"{"default":"allow","rules":[]}"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("d12-autoreply", r#"{"default":"allow","rules":[]}"#);
         let pid = 999_514;
         let target = v7_pane(&daemon, "worker-1", pid);
         let _sender = v7_pane(&daemon, "worker-2", pid + 1);
@@ -17979,7 +17950,7 @@ mod tests {
     #[test]
     fn d12_send_key_return_denied_when_human_draft_pending() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("d12-return-draft", r#"{"default":"allow","rules":[]}"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("d12-return-draft", r#"{"default":"allow","rules":[]}"#);
         let pid = 999_516;
         let target = v7_pane(&daemon, "worker-1", pid);
         let _sender = v7_pane(&daemon, "worker-2", pid + 1);
@@ -18003,7 +17974,7 @@ mod tests {
     #[test]
     fn d12_submit_key_alias_denied_when_human_draft_pending() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("d12-submit-alias", r#"{"default":"allow","rules":[]}"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("d12-submit-alias", r#"{"default":"allow","rules":[]}"#);
         let pid = 999_550;
         let target = v7_pane(&daemon, "worker-1", pid);
         let _sender = v7_pane(&daemon, "worker-2", pid + 1);
@@ -18042,7 +18013,7 @@ mod tests {
     #[test]
     fn d12_cancel_key_alias_denies_human_draft_but_passes_machine_residue() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("d12-cancel-alias", r#"{"default":"allow","rules":[]}"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("d12-cancel-alias", r#"{"default":"allow","rules":[]}"#);
         let pid = 999_554;
         let machine_target = v7_pane(&daemon, "worker-1", pid);
         let _sender = v7_pane(&daemon, "worker-2", pid + 1);
@@ -18098,7 +18069,7 @@ mod tests {
     #[test]
     fn d12_gui_assembled_submit_payload_denied_when_human_draft_pending() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("d12-gui-submit", r#"{"default":"allow","rules":[]}"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("d12-gui-submit", r#"{"default":"allow","rules":[]}"#);
         let pid = 999_560;
         let target = v7_pane(&daemon, "worker-1", pid);
         let _sender = v7_pane(&daemon, "worker-2", pid + 1);
@@ -18137,7 +18108,7 @@ mod tests {
     #[test]
     fn d12_gui_assembled_clear_first_denied_when_human_draft_pending() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("d12-gui-clear-first", r#"{"default":"allow","rules":[]}"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("d12-gui-clear-first", r#"{"default":"allow","rules":[]}"#);
         let pid = 999_562;
         let target = v7_pane(&daemon, "worker-1", pid);
         let _sender = v7_pane(&daemon, "worker-2", pid + 1);
@@ -18163,7 +18134,7 @@ mod tests {
     #[test]
     fn d12_gui_assembled_cancel_byte_denied_when_human_draft_pending() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("d12-gui-cancel-byte", r#"{"default":"allow","rules":[]}"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("d12-gui-cancel-byte", r#"{"default":"allow","rules":[]}"#);
         let pid = 999_574;
         let machine_target = v7_pane(&daemon, "worker-1", pid);
         let _sender = v7_pane(&daemon, "worker-2", pid + 1);
@@ -18219,7 +18190,7 @@ mod tests {
     #[test]
     fn d12_gui_pure_insertion_without_newline_passes_into_own_draft() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("d12-gui-insertion", r#"{"default":"allow","rules":[]}"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("d12-gui-insertion", r#"{"default":"allow","rules":[]}"#);
         let pid = 999_564;
         let target = v7_pane(&daemon, "worker-1", pid);
         let _sender = v7_pane(&daemon, "worker-2", pid + 1);
@@ -18242,7 +18213,7 @@ mod tests {
     #[test]
     fn d12_real_human_return_without_machine_origin_passes() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("d12-real-human-return", r#"{"default":"allow","rules":[]}"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("d12-real-human-return", r#"{"default":"allow","rules":[]}"#);
         let pid = 999_566;
         let target = v7_pane(&daemon, "worker-1", pid);
         let _sender = v7_pane(&daemon, "worker-2", pid + 1);
@@ -18264,7 +18235,7 @@ mod tests {
     #[test]
     fn d12_authoritative_caller_cancel_key_exempt() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("d12-authoritative-cancel", r#"{"default":"allow","rules":[]}"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("d12-authoritative-cancel", r#"{"default":"allow","rules":[]}"#);
         let pid = 999_568;
         let target = v7_pane(&daemon, "worker-1", pid);
         let sender = v7_pane(&daemon, "worker-2", pid + 1);
@@ -18300,7 +18271,7 @@ mod tests {
     #[test]
     fn d12_detached_caller_authoritative_cancel_key_is_still_denied() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("d12-detached-authoritative-cancel", r#"{"default":"allow","rules":[]}"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("d12-detached-authoritative-cancel", r#"{"default":"allow","rules":[]}"#);
         let pid = 999_576;
         let target = v7_pane(&daemon, "worker-1", pid);
         let sender = v7_pane(&daemon, "worker-2", pid + 1);
@@ -18366,7 +18337,7 @@ mod tests {
     #[test]
     fn d12_submit_key_alias_denial_prescribes_return_queued() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("d12-submit-alias-message", r#"{"default":"allow","rules":[]}"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("d12-submit-alias-message", r#"{"default":"allow","rules":[]}"#);
         let pid = 999_570;
         let target = v7_pane(&daemon, "worker-1", pid);
         let _sender = v7_pane(&daemon, "worker-2", pid + 1);
@@ -18406,7 +18377,7 @@ mod tests {
     #[test]
     fn d12_cancel_key_denial_does_not_prescribe_queued() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("d12-cancel-message", r#"{"default":"allow","rules":[]}"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("d12-cancel-message", r#"{"default":"allow","rules":[]}"#);
         let pid = 999_572;
         let target = v7_pane(&daemon, "worker-1", pid);
         let _sender = v7_pane(&daemon, "worker-2", pid + 1);
@@ -18433,7 +18404,7 @@ mod tests {
     #[test]
     fn d12_navigation_keys_stay_ungated_with_human_draft() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("d12-navigation", r#"{"default":"allow","rules":[]}"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("d12-navigation", r#"{"default":"allow","rules":[]}"#);
         let pid = 999_558;
         let target = v7_pane(&daemon, "worker-1", pid);
         let _sender = v7_pane(&daemon, "worker-2", pid + 1);
@@ -18609,7 +18580,7 @@ mod tests {
     #[test]
     fn j3_queued_send_from_cli_label_reaches_entry_digest_header_and_ledger() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("j3-queue", r#"{"default":"allow","rules":[]}"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("j3-queue", r#"{"default":"allow","rules":[]}"#);
         let target = daemon
             .create_surface(None, Some("sleep 30".into()), None, Some("worker-1".into()), 24, 80)
             .expect("create target");
@@ -18657,7 +18628,7 @@ mod tests {
     #[test]
     fn j3_direct_send_ledger_from_label_only_without_verified_identity() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("j3-direct", r#"{"default":"allow","rules":[]}"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("j3-direct", r#"{"default":"allow","rules":[]}"#);
         let send = |pid: Option<u32>, target: u64, text: &str, extra: Value| -> Value {
             let mut params = json!({"surface_id": target, "text": text});
             if let Some(o) = extra.as_object() {
@@ -18743,7 +18714,7 @@ mod tests {
     #[test]
     fn j3_label_is_never_a_seat_claim_and_consumers_match_the_null_case() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("j3-audit", r#"{"default":"allow","rules":[]}"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("j3-audit", r#"{"default":"allow","rules":[]}"#);
         let labels = ["cli", "cli:send", "cli:inject", "cli:drain", "cli:7", "cli:surface7", "cli:master", "cli:backupjob"];
         // ⓐ 좌석 자기신고 해석(짝 Return 키·원장 from·잔여 소유의 재료) — 라벨은 결측과 같다(None).
         for lb in labels {
@@ -19054,7 +19025,7 @@ mod tests {
     #[test]
     fn d12_send_key_return_passes_after_own_direct_send() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("d12-return-own", r#"{"default":"allow","rules":[]}"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("d12-return-own", r#"{"default":"allow","rules":[]}"#);
         let pid = 999_518;
         let target = v7_pane(&daemon, "worker-1", pid);
         let _sender = v7_pane(&daemon, "worker-2", pid + 1);
@@ -19077,7 +19048,7 @@ mod tests {
     #[test]
     fn d12_authoritative_caller_exempt() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("d12-authoritative", r#"{"default":"allow","rules":[]}"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("d12-authoritative", r#"{"default":"allow","rules":[]}"#);
         let pid = 999_520;
         let target = v7_pane(&daemon, "worker-1", pid);
         let sender = v7_pane(&daemon, "worker-2", pid + 1);
@@ -19098,7 +19069,7 @@ mod tests {
     #[test]
     fn d12_screen_axis_denies_text_when_count_zero_but_cursor_row_has_draft() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("d12-screen", r#"{"default":"allow","rules":[]}"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("d12-screen", r#"{"default":"allow","rules":[]}"#);
         let pid = 999_522;
         let _sender = v7_pane(&daemon, "worker-2", pid);
         let mut observations = Vec::new();
@@ -19145,7 +19116,7 @@ mod tests {
     #[test]
     fn u8_p1_text_denied_on_foreground_modal_but_submit_key_unchanged() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("u8-p1-modal", r#"{"default":"allow","rules":[]}"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("u8-p1-modal", r#"{"default":"allow","rules":[]}"#);
         let pid = 999_640;
         let _sender = v7_pane(&daemon, "worker-2", pid);
         let modal = cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT.replace('\n', "\r\n");
@@ -19187,7 +19158,7 @@ mod tests {
     #[test]
     fn u8_p1_fix1_dead_seat_relaunch_passes_modal_axis_but_live_seat_still_denied() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("u8-p1-fix1-dead-seat", r#"{"default":"allow","rules":[]}"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("u8-p1-fix1-dead-seat", r#"{"default":"allow","rules":[]}"#);
         let pid = 999_650;
         let _sender = v7_pane(&daemon, "worker-2", pid);
         let modal = cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT.replace('\n', "\r\n");
@@ -19236,7 +19207,7 @@ mod tests {
     #[test]
     fn d12_denials_publish_once_per_request_including_clear_first_and_enter() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("d12-events", r#"{"default":"allow","rules":[]}"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("d12-events", r#"{"default":"allow","rules":[]}"#);
         let pid = 999_530;
         let target = v7_pane(&daemon, "worker-1", pid);
         let sender = v7_pane(&daemon, "worker-2", pid + 1);
@@ -19351,7 +19322,7 @@ mod tests {
     #[test]
     fn c5_direct_send_denial_appends_ctrl_u_only_for_ghost_count() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("c5-ghost-deny", r#"{"default":"allow","rules":[]}"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("c5-ghost-deny", r#"{"default":"allow","rules":[]}"#);
         let pid = 999_810;
         let _sender = v7_pane(&daemon, "worker-9", pid);
         let suffix = crate::governance::GHOST_CTRL_U_SUFFIX;
@@ -19507,7 +19478,7 @@ mod tests {
     fn c5_ghost_suffix_keeps_cli_fallback_and_settle_parsers_working() {
         // ★(RQFIX I-11) 종전 검체는 자기가 조립한 문자열(`format!("{base}{suffix}")`)에 `contains` 를 걸어 항상 참이었다(동어반복). 이제 **데몬이 실제로 낸** 거부 문구로 잰다.
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("c5-ghost-parsers", r#"{"default":"allow","rules":[]}"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("c5-ghost-parsers", r#"{"default":"allow","rules":[]}"#);
         let suffix = crate::governance::GHOST_CTRL_U_SUFFIX;
         let seat = c5_agent_seat(&daemon, "worker-1", 999_860, 3);
         let denial = |settle: Option<u64>| -> String {
@@ -19546,7 +19517,7 @@ mod tests {
     #[test]
     fn c5_queue_list_adds_remedy_and_diag_keys_per_seat() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("c5-qlist", r#"{"default":"allow","rules":[]}"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("c5-qlist", r#"{"default":"allow","rules":[]}"#);
         let pid = 999_830;
         let blocked = c5_agent_seat(&daemon, "worker-1", pid, 3);
         let free = c5_agent_seat(&daemon, "worker-2", pid + 1, 0);
@@ -19620,7 +19591,7 @@ mod tests {
     #[test]
     fn rqfix_i6_settle_proof_seen_before_the_pause_filter_blocks_the_ghost_prescription() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("rqfix-i6", r#"{"default":"allow","rules":[]}"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("rqfix-i6", r#"{"default":"allow","rules":[]}"#);
         let suffix = crate::governance::GHOST_CTRL_U_SUFFIX;
         let seat = c5_agent_seat(&daemon, "worker-1", 999_870, 3);
         c5_paint_prompt(&seat, "", ""); // 계수 3 + 빈 입력줄 = 유령 모양(편집 영역 전체가 비어 보인다)
@@ -19668,7 +19639,7 @@ mod tests {
     #[test]
     fn rqfix_f3_paused_seat_without_recorded_reason_reports_paused_in_queue_list_and_org_status() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("rqfix-f3", r#"{"default":"allow","rules":[]}"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("rqfix-f3", r#"{"default":"allow","rules":[]}"#);
         let pid = 999_880;
         let busy = c5_agent_seat(&daemon, "worker-1", pid, 0);
         let empty = c5_agent_seat(&daemon, "worker-2", pid + 1, 0);
@@ -19759,7 +19730,7 @@ mod tests {
     #[test]
     fn c5_org_status_adds_queue_blocked_keys_and_pending_input_model() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("c5-orgstatus", r#"{"default":"allow","rules":[]}"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("c5-orgstatus", r#"{"default":"allow","rules":[]}"#);
         let pid = 999_850;
         let blocked = c5_agent_seat(&daemon, "worker-1", pid, 3);
         let free = c5_agent_seat(&daemon, "worker-2", pid + 1, 0);
@@ -19812,7 +19783,7 @@ mod tests {
     #[test]
     fn s2_org_status_window_is_additive_and_the_read_changes_nothing() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("s2-orgstatus", r#"{"default":"allow","rules":[]}"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("s2-orgstatus", r#"{"default":"allow","rules":[]}"#);
         let pid = 999_870;
         let quiescing = c5_agent_seat(&daemon, "worker-1", pid, 0);
         let plain = c5_agent_seat(&daemon, "worker-2", pid + 1, 0);
@@ -19955,7 +19926,7 @@ mod tests {
     #[test]
     fn s2_min2_org_status_never_shows_a_window_on_a_non_quiescing_row() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("s2-min2-race", r#"{"default":"allow","rules":[]}"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("s2-min2-race", r#"{"default":"allow","rules":[]}"#);
         let pid = 999_874;
         let seat = c5_agent_seat(&daemon, "worker-1", pid, 0);
         let flip_seat = seat.clone();
@@ -20045,7 +20016,7 @@ mod tests {
     #[test]
     fn d12_clear_first_passes_machine_residue_but_denies_human_draft() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("d12-clear-first", r#"{"default":"allow","rules":[]}"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("d12-clear-first", r#"{"default":"allow","rules":[]}"#);
         let pid = 999_540;
         let machine_target = v7_pane(&daemon, "worker-1", pid);
         let _sender = v7_pane(&daemon, "worker-2", pid + 1);
@@ -20133,17 +20104,14 @@ mod tests {
         // ⑧ 비활성 스위치는 핸들러층에서도 즉시 통한다(요청 자체가 안 만들어진다).
         assert_eq!(submit_gap_for_key("Return", 0), None);
         // ⑦ 기본값 계약 — env 미설정이면 150ms.
-        let prev = std::env::var("CYS_CR_MIN_GAP_MS").ok();
+        let gap_env = crate::governance::ReapEnvGuard::set(&[("CYS_CR_MIN_GAP_MS", "")]);
         std::env::remove_var("CYS_CR_MIN_GAP_MS");
         assert_eq!(cr_min_gap_ms(), 150, "기본 최소 간격이 바뀌면 실기 체감이 달라진다");
         std::env::set_var("CYS_CR_MIN_GAP_MS", "0");
         assert_eq!(cr_min_gap_ms(), 0, "비활성 스위치가 죽었다");
         std::env::set_var("CYS_CR_MIN_GAP_MS", "쓰레기");
         assert_eq!(cr_min_gap_ms(), 150, "오염 값은 기본으로 접혀야 한다(fail-safe)");
-        match prev {
-            Some(v) => std::env::set_var("CYS_CR_MIN_GAP_MS", v),
-            None => std::env::remove_var("CYS_CR_MIN_GAP_MS"),
-        }
+        drop(gap_env);
     }
 
     /// ★B2′ 사람 경로 불변 박제(codex 감사 R1 수리의 부작용 방지).
@@ -20208,7 +20176,7 @@ mod tests {
     #[test]
     fn send_key_return_delegates_the_gap_to_the_writer_not_the_handler() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) =
+        let (daemon, dir, _pack_env) =
             daemon_with_acl("cr-gap-nonblocking", r#"{ "default": "allow", "rules": [] }"#);
 
         let target = daemon
@@ -20231,8 +20199,7 @@ mod tests {
             (resp, t0.elapsed())
         };
 
-        let prev = std::env::var("CYS_CR_MIN_GAP_MS").ok();
-        std::env::set_var("CYS_CR_MIN_GAP_MS", "3000"); // 과장된 간격 — 블로킹이면 즉시 드러난다
+        let gap_env = crate::governance::ReapEnvGuard::set(&[("CYS_CR_MIN_GAP_MS", "3000")]); // 과장된 간격 — 블로킹이면 즉시 드러난다
 
         // ① 간격 무장(SubmitAfterGap 경로). 잠자는 것은 writer 이므로 응답은 즉시 와야 한다.
         let (resp, took) = send_return();
@@ -20248,12 +20215,8 @@ mod tests {
         assert_eq!(resp["ok"], json!(true), "무지연 경로가 깨졌다 (응답: {resp})");
         assert!(took < std::time::Duration::from_millis(500), "무지연 경로가 느리다 ({took:?})");
 
-        match prev {
-            Some(v) => std::env::set_var("CYS_CR_MIN_GAP_MS", v),
-            None => std::env::remove_var("CYS_CR_MIN_GAP_MS"),
-        }
+        drop(gap_env);
         crate::state::test_stop_daemon(&daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -20265,7 +20228,7 @@ mod tests {
     fn authoritative_send_bypasses_typing_guard() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let acl = r#"{ "default": "allow", "rules": [] }"#;
-        let (daemon, dir) = daemon_with_acl("auth-guard", acl);
+        let (daemon, dir, _pack_env) = daemon_with_acl("auth-guard", acl);
 
         let worker = daemon
             .create_surface(None, Some("sleep 30".into()), None, Some("worker-1".into()), 24, 80)
@@ -20388,7 +20351,6 @@ mod tests {
         );
 
         crate::state::test_stop_daemon(&daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -20404,7 +20366,7 @@ mod tests {
                 { "from": "reviewer-*", "to": "master", "allow": true }
             ]
         }"#;
-        let (daemon, dir) = daemon_with_acl("allow-path", acl);
+        let (daemon, dir, _pack_env) = daemon_with_acl("allow-path", acl);
 
         let master = daemon
             .create_surface(None, Some("sleep 30".into()), None, Some("master".into()), 24, 80)
@@ -20451,7 +20413,6 @@ mod tests {
         );
 
         crate::state::test_stop_daemon(&daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -21115,7 +21076,7 @@ mod tests {
     #[test]
     fn send_text_clear_first_requires_agent_pane() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) =
+        let (daemon, dir, _pack_env) =
             daemon_with_acl("clearfirst-gate", r#"{"default":"allow","rules":[]}"#);
         let s = daemon
             .create_surface(None, Some("sleep 30".into()), None, None, 24, 80)
@@ -21157,7 +21118,6 @@ mod tests {
         );
 
         crate::state::test_stop_daemon(&daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -21166,7 +21126,7 @@ mod tests {
     #[test]
     fn send_text_clear_first_rejects_queued_combo() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) =
+        let (daemon, dir, _pack_env) =
             daemon_with_acl("clearfirst-combo", r#"{"default":"allow","rules":[]}"#);
         let s = daemon
             .create_surface(None, Some("sleep 30".into()), None, None, 24, 80)
@@ -21193,7 +21153,6 @@ mod tests {
         );
 
         crate::state::test_stop_daemon(&daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -26836,7 +26795,7 @@ mod tests {
                 { "from": "reviewer-*", "to": "worker*", "allow": false }
             ]
         }"#;
-        let (daemon, dir) = daemon_with_acl("w2e-deliver-acl", acl);
+        let (daemon, dir, _pack_env) = daemon_with_acl("w2e-deliver-acl", acl);
         let worker = daemon
             .create_surface(None, Some("sleep 30".into()), None, Some("worker-1".into()), 24, 80)
             .expect("create worker surface");
@@ -26860,7 +26819,6 @@ mod tests {
         assert_eq!(worker.pending_queue.lock().unwrap().len(), 1, "거부 시 배달 0건");
 
         crate::state::test_stop_daemon(&daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -26871,7 +26829,7 @@ mod tests {
     #[test]
     fn queue_deliver_rpc_delivers_single_and_plumbs_params() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) =
+        let (daemon, dir, _pack_env) =
             daemon_with_acl("w2e-deliver-ok", r#"{"default":"allow","rules":[]}"#);
         let s = daemon
             .create_surface(None, Some("sleep 30".into()), None, None, 24, 80)
@@ -26930,7 +26888,6 @@ mod tests {
         }
 
         crate::state::test_stop_daemon(&daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -27057,7 +27014,7 @@ mod tests {
     #[test]
     fn queue_list_exposes_pending_input_bytes_additive() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("pending-input-list", r#"{ "default": "allow", "rules": [] }"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("pending-input-list", r#"{ "default": "allow", "rules": [] }"#);
         let pid = 999_480_u32;
         let s = v7_pane(&daemon, "worker", pid);
         assert_eq!(v7_send_human(&daemon, s.id, pid, "abc"), 3);
@@ -27102,14 +27059,13 @@ mod tests {
             let _ = child.wait();
         }
         crate::state::test_stop_daemon(&daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn org_status_and_surface_list_expose_pending_input_bytes() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("pending-input-status", r#"{ "default": "allow", "rules": [] }"#);
+        let (daemon, dir, _pack_env) = daemon_with_acl("pending-input-status", r#"{ "default": "allow", "rules": [] }"#);
         let pid = 999_481_u32;
         let s = v7_pane(&daemon, "worker", pid);
         assert_eq!(v7_send_human(&daemon, s.id, pid, "abc"), 3);
@@ -27143,7 +27099,6 @@ mod tests {
             let _ = child.wait();
         }
         crate::state::test_stop_daemon(&daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -28056,7 +28011,7 @@ mod tests {
     #[test]
     fn approval_sign_denied_when_master_just_claimed() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) =
+        let (daemon, dir, _pack_env) =
             daemon_with_acl("vec9-just-claimed", r#"{"default":"allow","rules":[]}"#);
         let caller = 992_001_u32;
         let _sid = setup_master(&daemon, caller);
@@ -28073,7 +28028,6 @@ mod tests {
         );
 
         crate::state::test_stop_daemon(&daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -28083,11 +28037,10 @@ mod tests {
     #[test]
     fn approval_sign_allowed_when_master_stable() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) =
+        let (daemon, dir, _pack_env) =
             daemon_with_acl("vec9-stable", r#"{"default":"allow","rules":[]}"#);
         // 서명 부작용(secret·approvals.json)을 임시 HOME으로 격리 — 실제 ~/.cys 오염 방지.
-        let prev_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &dir);
+        let _home_env = crate::governance::ReapEnvGuard::set(&[("HOME", &dir.to_string_lossy())]);
         // ★(수렴 R2 · codex 재검증 major) 승인 저장소 루트도 **함께** 옮긴다 —
         //   `HOME` 하나로는 Windows 에서 격리되지 않는다(§`approval::store_root`).
         let _store = crate::approval::tests::with_store_root(&dir);
@@ -28108,12 +28061,7 @@ mod tests {
         assert_eq!(resp["result"]["signed"], json!(true), "서명 미완료 (응답: {resp})");
 
         // HOME 복원
-        match prev_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
         crate::state::test_stop_daemon(&daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -28122,7 +28070,7 @@ mod tests {
     #[test]
     fn approval_sign_denied_when_no_master() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) =
+        let (daemon, dir, _pack_env) =
             daemon_with_acl("vec9-no-master", r#"{"default":"allow","rules":[]}"#);
         let caller = 992_003_u32;
         // caller=master 검증은 통과시키되(roles["master"]=sid) master_claimed_at만 None으로 둔다 —
@@ -28140,7 +28088,6 @@ mod tests {
         );
 
         crate::state::test_stop_daemon(&daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -28149,7 +28096,7 @@ mod tests {
     #[test]
     fn approval_sign_denied_when_caller_not_master() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) =
+        let (daemon, dir, _pack_env) =
             daemon_with_acl("vec9-not-master", r#"{"default":"allow","rules":[]}"#);
         // worker 역할 surface가 발신 — master가 아니므로 forbidden(쿨다운 검사 이전 단계).
         let s = daemon
@@ -28172,7 +28119,6 @@ mod tests {
         );
 
         crate::state::test_stop_daemon(&daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -28370,15 +28316,15 @@ mod tests {
 
     /// CYS_APPROVE_AUTO_ROUTE를 세팅한 뒤 격리 데몬 생성(config 캡처 후 env 정리).
     /// ACL_ENV_LOCK 하에서만 호출한다(프로세스 전역 env 경합 차단).
-    fn daemon_auto(tag: &str, on: bool) -> (Arc<Daemon>, std::path::PathBuf) {
-        if on {
-            std::env::set_var("CYS_APPROVE_AUTO_ROUTE", "1");
-        } else {
+    fn daemon_auto(tag: &str, on: bool) -> (Arc<Daemon>, std::path::PathBuf, crate::governance::ReapEnvGuard) {
+        // Unwind-safe (F-4 (C)): the flag guard restores the previous value even if daemon_with_acl panics.
+        let auto_env = crate::governance::ReapEnvGuard::set(&[("CYS_APPROVE_AUTO_ROUTE", "1")]);
+        if !on {
             std::env::remove_var("CYS_APPROVE_AUTO_ROUTE");
         }
-        let (d, dir) = daemon_with_acl(tag, r#"{"default":"allow","rules":[]}"#);
-        std::env::remove_var("CYS_APPROVE_AUTO_ROUTE"); // config 캡처 후 즉시 정리
-        (d, dir)
+        let (d, dir, pack_env) = daemon_with_acl(tag, r#"{"default":"allow","rules":[]}"#);
+        drop(auto_env); // config 캡처 후 즉시 정리
+        (d, dir, pack_env)
     }
 
     fn w3_push(id: i64, rid: &str, title: &str, body: &str, tier: Option<&str>) -> Request {
@@ -28434,8 +28380,8 @@ mod tests {
     fn w3_off_no_auto_route() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 임계 1로 좁혀, 게이트가 없으면 단 1건에도 backpressure가 터지게 만든다(C-4 진짜 증명).
-        std::env::set_var("CYS_APPROVE_BACKPRESSURE_N", "1");
-        let (daemon, dir) = daemon_auto("w3-off", false);
+        let bp_env_off = crate::governance::ReapEnvGuard::set(&[("CYS_APPROVE_BACKPRESSURE_N", "1")]);
+        let (daemon, dir, _pack_env) = daemon_auto("w3-off", false);
         let mut rx = daemon.bus.subscribe();
         let Reply::Single(resp) =
             dispatch(&daemon, w3_push(1, "off1", "[RSI 학습 추천]", "확인", None), None)
@@ -28469,8 +28415,7 @@ mod tests {
         let _ = dispatch(&daemon, rr, None);
         let audit = crate::state::state_dir(&daemon.socket_path).join("approval_audit.jsonl");
         assert!(!audit.exists(), "OFF인데 approval_audit.jsonl 생성됨(C-4 위반)");
-        std::env::remove_var("CYS_APPROVE_BACKPRESSURE_N");
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        drop(bp_env_off);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -28478,7 +28423,7 @@ mod tests {
     #[test]
     fn w3_human_only_escalates() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_auto("w3-human", true);
+        let (daemon, dir, _pack_env) = daemon_auto("w3-human", true);
         let mut rx = daemon.bus.subscribe();
         let _ = dispatch(
             &daemon,
@@ -28496,7 +28441,6 @@ mod tests {
                 && e["payload"]["request_id"].as_str() == Some("hum1"))
             .expect("human_only escalation 미발동");
         assert_eq!(stalled["payload"]["reason"], json!("human_only"));
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -28505,7 +28449,7 @@ mod tests {
     #[test]
     fn w3_human_only_idempotent() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_auto("w3-human-idem", true);
+        let (daemon, dir, _pack_env) = daemon_auto("w3-human-idem", true);
         let mut rx = daemon.bus.subscribe();
         let _ = dispatch(&daemon, w3_push(1, "h1", "★사람 단계 필수: TCC 재부여", "동일", None), None);
         let _ = dispatch(&daemon, w3_push(2, "h2", "★사람 단계 필수: TCC 재부여", "동일", None), None);
@@ -28516,7 +28460,6 @@ mod tests {
             1,
             "동일 HumanOnly 재발행이 escalation을 이중 유발함(F5 멱등 실패)"
         );
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -28525,7 +28468,7 @@ mod tests {
     #[test]
     fn w3_ceo_seat_empty_escalates() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_auto("w3-empty", true);
+        let (daemon, dir, _pack_env) = daemon_auto("w3-empty", true);
         seed_caller(&daemon, 900_001, 55);
         let mut rx = daemon.bus.subscribe();
         let _ = dispatch(&daemon, w3_push(1, "e1", "[RSI 학습 추천]", "확인", None), Some(900_001));
@@ -28539,7 +28482,6 @@ mod tests {
                 && e["payload"]["request_id"].as_str() == Some("e1"))
             .expect("seat-empty escalation 미발동");
         assert_eq!(stalled["payload"]["reason"], json!("ceo_seat_empty"));
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -28547,7 +28489,7 @@ mod tests {
     #[test]
     fn w3_tier_spoof_denylist_stays_human() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_auto("w3-spoof", true);
+        let (daemon, dir, _pack_env) = daemon_auto("w3-spoof", true);
         let mut rx = daemon.bus.subscribe();
         let _ = dispatch(&daemon, w3_push(1, "s1", "백업본 삭제", "정리", Some("a")), None);
         let evs = drain(&mut rx);
@@ -28556,7 +28498,6 @@ mod tests {
         assert_eq!(p["payload"]["auto_route"], json!(false), "denylist가 auto로 샘");
         assert_eq!(count_named(&evs, "feed.auto_routed"), 0);
         assert_eq!(count_named(&evs, "approval.stalled"), 0, "HighRisk는 현행 CC 경로(무 escalation)");
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -28564,7 +28505,7 @@ mod tests {
     #[test]
     fn w3_kind_forgery_ignored() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_auto("w3-kind", true);
+        let (daemon, dir, _pack_env) = daemon_auto("w3-kind", true);
         let mut rx = daemon.bus.subscribe();
         let req = Request {
             id: json!(1),
@@ -28577,7 +28518,6 @@ mod tests {
         let p = created_payload(&evs, "k1").expect("created");
         assert_eq!(p["payload"]["risk_class"], json!("high"));
         assert_eq!(p["payload"]["auto_route"], json!(false));
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -28587,7 +28527,7 @@ mod tests {
     #[test]
     fn w3_idempotent_semantic_key() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_auto("w3-idem", true);
+        let (daemon, dir, _pack_env) = daemon_auto("w3-idem", true);
         seed_caller(&daemon, 900_002, 56);
         let mut rx = daemon.bus.subscribe();
         let _ = dispatch(&daemon, w3_push(1, "r1", "[RSI 학습 추천]", "동일본문", None), Some(900_002));
@@ -28600,7 +28540,6 @@ mod tests {
             1,
             "같은 의미 키 재발행이 CEO 재주입/escalation을 이중 유발함(멱등 실패)"
         );
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -29033,7 +28972,7 @@ mod tests {
     #[test]
     fn w3_ceo_delivered_when_seat_occupied() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_auto("w3-deliver", true);
+        let (daemon, dir, _pack_env) = daemon_auto("w3-deliver", true);
         // CEO 좌석: 살아있는 에이전트 pane + 점유 좌석.
         let ceo = daemon
             .create_surface(None, Some("sleep 30".into()), None, Some("ceo".into()), 24, 80)
@@ -29057,7 +28996,6 @@ mod tests {
         let p = created_payload(&evs, "d1").expect("created");
         assert_eq!(p["payload"]["auto_route"], json!(true));
         crate::state::test_stop_daemon(&daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -29066,7 +29004,7 @@ mod tests {
     fn w3_audit_record_written() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 감사는 flag ON일 때만 기록된다(C-4 게이트). 따라서 ON으로 데몬 생성.
-        let (daemon, dir) = daemon_auto("w3-audit", true);
+        let (daemon, dir, _pack_env) = daemon_auto("w3-audit", true);
         let _ = dispatch(&daemon, w3_push(1, "a1", "[RSI 학습 추천]", "확인", None), None);
         let rr = Request {
             id: json!(2),
@@ -29082,7 +29020,6 @@ mod tests {
         assert_eq!(v["decision"], json!("allow"));
         assert_eq!(v["reason"], json!("근거 대조 완료"));
         assert_eq!(v["risk"], json!("auto"), "감사에 risk 파생 기록");
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -29145,16 +29082,15 @@ mod tests {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // back-pressure는 flag ON일 때만 작동(C-4 게이트) — ON으로 생성.
         // 임계는 record_approval_request가 매 호출 env를 재조회하므로 push 시점까지 유지한다.
-        std::env::set_var("CYS_APPROVE_BACKPRESSURE_N", "2");
-        let (daemon, dir) = daemon_auto("w3-bp", true);
+        let bp_env = crate::governance::ReapEnvGuard::set(&[("CYS_APPROVE_BACKPRESSURE_N", "2")]);
+        let (daemon, dir, _pack_env) = daemon_auto("w3-bp", true);
         let mut rx = daemon.bus.subscribe();
         // 같은 발행자(None=0) 2건 → 2번째에서 임계 교차 이벤트. HighRisk 서술로 라우팅 부작용 회피.
         let _ = dispatch(&daemon, w3_push(1, "b1", "무언가 요청", "", None), None);
         let _ = dispatch(&daemon, w3_push(2, "b2", "무언가 요청2", "", None), None);
         let evs = drain(&mut rx);
         assert_eq!(count_named(&evs, "approval.backpressure"), 1, "임계 교차 이벤트 1회");
-        std::env::remove_var("CYS_APPROVE_BACKPRESSURE_N");
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        drop(bp_env);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -29166,7 +29102,7 @@ mod tests {
     #[test]
     fn w3_auto_route_requires_publisher_attribution() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_auto("w4-anon", true);
+        let (daemon, dir, _pack_env) = daemon_auto("w4-anon", true);
         let mut rx = daemon.bus.subscribe();
         // caller_pid는 있으나 어떤 surface에도 귀속 불가(실재하지 않는 pid → 조상 추적 실패).
         let _ = dispatch(&daemon, w3_push(1, "an1", "[RSI 학습 추천]", "확인", None), Some(900_004));
@@ -29190,7 +29126,6 @@ mod tests {
             assert_eq!(it.status, "pending", "무명 발행 항목은 사람 결재 대기로 남아야");
             assert!(!it.auto_route, "영속 스냅샷에도 auto_route=false 각인");
         }
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -29205,7 +29140,7 @@ mod tests {
     #[test]
     fn w3_cycle_verify_not_auto_routed() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_auto("w4-cycle", true);
+        let (daemon, dir, _pack_env) = daemon_auto("w4-cycle", true);
         // CEO 좌석 점유 — auto 로 새면 실제 배달(feed.auto_routed)이 일어나는 환경을 구성한다.
         let ceo = daemon
             .create_surface(None, Some("sleep 30".into()), None, Some("ceo".into()), 24, 80)
@@ -29252,7 +29187,6 @@ mod tests {
             assert!(!it.auto_route, "영속 스냅샷에 auto_route=true 각인됨");
         }
         crate::state::test_stop_daemon(&daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -29265,7 +29199,7 @@ mod tests {
     fn feed_reply_imprints_resolver_three_sides() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 감사 append는 flag ON에서만(C-4) — 감사면까지 검증하려고 ON 데몬.
-        let (daemon, dir) = daemon_auto("w4-resolver", true);
+        let (daemon, dir, _pack_env) = daemon_auto("w4-resolver", true);
         // 발행자(surface 61)·승인자(surface 62)를 서로 다른 pane에 귀속.
         seed_caller(&daemon, 900_005, 61);
         seed_caller(&daemon, 900_006, 62);
@@ -29342,7 +29276,6 @@ mod tests {
         let snap = daemon.resolve_feed_item("res2", "stale-cleared").expect("resolve");
         assert_eq!(snap.resolver_surface, None, "래퍼 경로가 resolver를 각인함(무주체가 사실)");
         assert_eq!(snap.resolver_pid, None);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -29769,7 +29702,7 @@ mod tests {
     #[test]
     fn authoritative_restore_root_descendant_bypasses_both_send_paths() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) =
+        let (daemon, dir, _pack_env) =
             daemon_with_acl("restore-root-p1", r#"{"default":"allow","rules":[]}"#);
 
         let target = make_surface(&daemon, Some("worker-1"));
@@ -29818,7 +29751,6 @@ mod tests {
         );
 
         crate::state::test_stop_daemon(&daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -29835,7 +29767,7 @@ mod tests {
     #[test]
     fn authoritative_non_restore_root_denied_during_active_restore() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) =
+        let (daemon, dir, _pack_env) =
             daemon_with_acl("restore-root-a3", r#"{"default":"allow","rules":[]}"#);
 
         let target = make_surface(&daemon, Some("worker-1"));
@@ -29873,7 +29805,6 @@ mod tests {
         );
 
         crate::state::test_stop_daemon(&daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -30308,13 +30239,9 @@ mod tests {
         );
 
         // ② 축 노브를 누르면 통과한다.
-        let prev = std::env::var(cys::profile_gate::ENV_OBSERVE_ONLY).ok();
-        std::env::set_var(cys::profile_gate::ENV_OBSERVE_ONLY, "1");
+        let observe_env = crate::governance::ReapEnvGuard::set(&[(cys::profile_gate::ENV_OBSERVE_ONLY, "1")]);
         let allowed = create_rpc(&daemon, params);
-        match prev {
-            Some(v) => std::env::set_var(cys::profile_gate::ENV_OBSERVE_ONLY, v),
-            None => std::env::remove_var(cys::profile_gate::ENV_OBSERVE_ONLY),
-        }
+        drop(observe_env);
         assert_eq!(
             allowed["ok"], json!(true),
             "★롤백 스위치를 눌렀는데 이 게이트만 엄격하게 남았다 (응답: {allowed})"
@@ -32351,9 +32278,8 @@ mod tests {
     #[test]
     fn approval_ttl_roundtrip_through_rpc() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("ttl-rt", r#"{"default":"allow","rules":[]}"#);
-        let prev_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &dir); // 서명 시크릿·approvals.json 격리(실 ~/.cys 오염 방지)
+        let (daemon, dir, _pack_env) = daemon_with_acl("ttl-rt", r#"{"default":"allow","rules":[]}"#);
+        let _home_env = crate::governance::ReapEnvGuard::set(&[("HOME", &dir.to_string_lossy())]); // 서명 시크릿·approvals.json 격리(실 ~/.cys 오염 방지)
         // ★(수렴 R2 · codex 재검증 major) 승인 저장소 루트도 **함께** 옮긴다 —
         //   `HOME` 하나로는 Windows 에서 격리되지 않는다(§`approval::store_root`).
         let _store = crate::approval::tests::with_store_root(&dir);
@@ -32431,13 +32357,7 @@ mod tests {
                 "만료된 승인이 require_ttl={require} 에서 통과했다: {r7}"
             );
         }
-
-        match prev_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
         crate::state::test_stop_daemon(&daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -32449,9 +32369,8 @@ mod tests {
     fn r2f_dm_windows_like_100ns_clock_approvals_survive_reload_through_the_rpc_handlers() {
         use crate::approval::tests::{r2f_lossy_readings_near_now, raw_clock_remaining, with_raw_clock_script};
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("r2f-clk", r#"{"default":"allow","rules":[]}"#);
-        let prev_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &dir); // 서명 시크릿·approvals.json 격리(실 ~/.cys 오염 방지)
+        let (daemon, dir, _pack_env) = daemon_with_acl("r2f-clk", r#"{"default":"allow","rules":[]}"#);
+        let _home_env = crate::governance::ReapEnvGuard::set(&[("HOME", &dir.to_string_lossy())]); // 서명 시크릿·approvals.json 격리(실 ~/.cys 오염 방지)
         let _store = crate::approval::tests::with_store_root(&dir); // `HOME` 하나로는 Windows 에서 격리되지 않는다(§`approval::store_root`)
         let caller = 993_171_u32;
         let _sid = setup_master(&daemon, caller);
@@ -32504,12 +32423,7 @@ mod tests {
         all_valid("무기한 승인 사용 직후");
 
         assert_eq!(raw_clock_remaining(), 0, "시계 이음매의 판독이 다 쓰이지 않았다 — 승인 시각 생산자가 `approval::record_now` 를 거치지 않는다");
-        match prev_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
         crate::state::test_stop_daemon(&daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -32522,9 +32436,8 @@ mod tests {
     #[test]
     fn approval_check_never_rewrites_a_store_it_could_not_read() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("ttl-wipe", r#"{"default":"allow","rules":[]}"#);
-        let prev_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &dir);
+        let (daemon, dir, _pack_env) = daemon_with_acl("ttl-wipe", r#"{"default":"allow","rules":[]}"#);
+        let _home_env = crate::governance::ReapEnvGuard::set(&[("HOME", &dir.to_string_lossy())]);
         // ★(수렴 R2 · codex 재검증 major) 승인 저장소 루트도 **함께** 옮긴다 —
         //   `HOME` 하나로는 Windows 에서 격리되지 않는다(§`approval::store_root`).
         let _store = crate::approval::tests::with_store_root(&dir);
@@ -32604,13 +32517,7 @@ mod tests {
                 "읽지 못한 승인 저장소를 빈 목록으로 덮어썼다 — 유효 승인이 영구 삭제된다"
             );
         }
-
-        match prev_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
         crate::state::test_stop_daemon(&daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -32626,9 +32533,8 @@ mod tests {
     fn approval_check_that_matches_nothing_leaves_the_store_alone() {
         use std::os::unix::fs::MetadataExt;
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("ttl-notouch", r#"{"default":"allow","rules":[]}"#);
-        let prev_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &dir);
+        let (daemon, dir, _pack_env) = daemon_with_acl("ttl-notouch", r#"{"default":"allow","rules":[]}"#);
+        let _home_env = crate::governance::ReapEnvGuard::set(&[("HOME", &dir.to_string_lossy())]);
         // ★(수렴 R2 · codex 재검증 major) 승인 저장소 루트도 **함께** 옮긴다 —
         //   `HOME` 하나로는 Windows 에서 격리되지 않는다(§`approval::store_root`).
         let _store = crate::approval::tests::with_store_root(&dir);
@@ -32657,13 +32563,7 @@ mod tests {
             before,
             "무매칭 검사가 TTL 저장소를 되썼다 — 다른 데몬이 그 사이 서명한 승인을 덮는다"
         );
-
-        match prev_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
         crate::state::test_stop_daemon(&daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -32675,9 +32575,8 @@ mod tests {
     #[test]
     fn approval_check_rechecks_expiry_after_it_gets_the_store_lock() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("ttl-lockwait", r#"{"default":"allow","rules":[]}"#);
-        let prev_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &dir);
+        let (daemon, dir, _pack_env) = daemon_with_acl("ttl-lockwait", r#"{"default":"allow","rules":[]}"#);
+        let _home_env = crate::governance::ReapEnvGuard::set(&[("HOME", &dir.to_string_lossy())]);
         // ★(수렴 R2 · codex 재검증 major) 승인 저장소 루트도 **함께** 옮긴다 —
         //   `HOME` 하나로는 Windows 에서 격리되지 않는다(§`approval::store_root`).
         let _store = crate::approval::tests::with_store_root(&dir);
@@ -32715,13 +32614,7 @@ mod tests {
             json!(false),
             "잠금 대기 이전 시각으로 검사해 만료된 승인이 통과했다({waited}s 대기): {rc}"
         );
-
-        match prev_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
         crate::state::test_stop_daemon(&daemon);
-        std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -32733,9 +32626,8 @@ mod tests {
     #[test]
     fn duplicate_id_forgery_is_not_resigned_through_rpc() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("ttl-wash", r#"{"default":"allow","rules":[]}"#);
-        let prev_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &dir);
+        let (daemon, dir, _pack_env) = daemon_with_acl("ttl-wash", r#"{"default":"allow","rules":[]}"#);
+        let _home_env = crate::governance::ReapEnvGuard::set(&[("HOME", &dir.to_string_lossy())]);
         // ★(수렴 R2 · codex 재검증 major) 승인 저장소 루트도 **함께** 옮긴다 —
         //   `HOME` 하나로는 Windows 에서 격리되지 않는다(§`approval::store_root`).
         let _store = crate::approval::tests::with_store_root(&dir);
@@ -32791,11 +32683,6 @@ mod tests {
             dispatch(&daemon, approval_check_req("git push --force x", "/tmp", false), Some(caller))
         else { panic!() };
         assert_eq!(rc2["result"]["matched_prefix"], json!(["git", "push"]));
-
-        match prev_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     /// ★TTL 연장 불가를 **RPC 로** 관통시킨다(codex 적대검증 R1 major): 종전 검체는 테스트가
@@ -32805,9 +32692,8 @@ mod tests {
     #[test]
     fn repeated_checks_never_extend_expiry_through_rpc() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("ttl-ext", r#"{"default":"allow","rules":[]}"#);
-        let prev_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &dir);
+        let (daemon, dir, _pack_env) = daemon_with_acl("ttl-ext", r#"{"default":"allow","rules":[]}"#);
+        let _home_env = crate::governance::ReapEnvGuard::set(&[("HOME", &dir.to_string_lossy())]);
         // ★(수렴 R2 · codex 재검증 major) 승인 저장소 루트도 **함께** 옮긴다 —
         //   `HOME` 하나로는 Windows 에서 격리되지 않는다(§`approval::store_root`).
         let _store = crate::approval::tests::with_store_root(&dir);
@@ -32850,11 +32736,6 @@ mod tests {
             Some(exp0),
             "반복 사용 후 절대 만료가 바뀌었다"
         );
-
-        match prev_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
     /// ★`approval.capabilities` — TTL 능력 **비변경** 프로브(구 데몬은 method_not_found).
@@ -32863,9 +32744,8 @@ mod tests {
     #[test]
     fn approval_capabilities_is_readonly_and_declares_ttl() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (daemon, dir) = daemon_with_acl("ttl-cap", r#"{"default":"allow","rules":[]}"#);
-        let prev_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &dir);
+        let (daemon, dir, _pack_env) = daemon_with_acl("ttl-cap", r#"{"default":"allow","rules":[]}"#);
+        let _home_env = crate::governance::ReapEnvGuard::set(&[("HOME", &dir.to_string_lossy())]);
         // ★(수렴 R2 · codex 재검증 major) 승인 저장소 루트도 **함께** 옮긴다 —
         //   `HOME` 하나로는 Windows 에서 격리되지 않는다(§`approval::store_root`).
         let _store = crate::approval::tests::with_store_root(&dir);
@@ -32886,10 +32766,6 @@ mod tests {
             0,
             "능력 프로브가 감사 이벤트를 냈다(check 로 위장하면 원장이 오염된다)"
         );
-        match prev_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
     }
 
 
