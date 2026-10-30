@@ -124,7 +124,7 @@ sys.exit(3)
 
 FAKE_PY = r'''#!/bin/sh
 case "$1" in
-  *javis_orchestra.py) if [ "$FAKE_MODE" = sleep_tp ]; then sleep "$HANG_S"; fi; echo "[ticket] first project"; exit 0 ;;
+  *javis_orchestra.py) if [ "$FAKE_MODE" = sleep_tp ]; then exec sleep "$HANG_S"; fi; echo "[ticket] first project"; exit 0 ;;
 esac
 exec "$REAL_PY" "$@"
 '''
@@ -133,7 +133,9 @@ FAKE_CYS_DEPT = r'''#!/bin/sh
 echo $$ > "$FAKE_PIDFILE"
 echo "$$ $*" >> "$FAKE_PIDFILE.calls"
 echo "fake cys-dept $*"
-sleep "$HANG_S"
+trap 'kill $! 2>/dev/null; exit 143' TERM
+sleep "$HANG_S" &
+wait $!
 echo "fake cys-dept done"
 exit 0
 '''
@@ -290,7 +292,8 @@ class M3Census(unittest.TestCase):
     """Every subprocess call in javis_org.py is bounded (a timeout= keyword, or a Popen whose wait has a timeout)."""
 
     def test_every_run_call_has_a_timeout(self):
-        src = open(os.path.join(BIN, "javis_org.py"), encoding="utf-8").read()
+        with open(os.path.join(BIN, "javis_org.py"), encoding="utf-8") as f:
+            src = f.read()
         missing, runs = [], 0
         for node in ast.walk(ast.parse(src)):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
@@ -312,7 +315,8 @@ class Enc12Census(unittest.TestCase):
     def test_every_text_child_decodes_utf8_with_replace(self):
         bad, seen = [], 0
         for fn in ENC_FILES:
-            src = open(os.path.join(BIN, fn), encoding="utf-8").read()
+            with open(os.path.join(BIN, fn), encoding="utf-8") as f:
+                src = f.read()
             for node in ast.walk(ast.parse(src)):
                 if not isinstance(node, ast.Call):
                     continue

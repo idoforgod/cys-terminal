@@ -43,6 +43,15 @@ DEPTS = os.environ.get("CYS_DEPTS_JSON", f"{HOME}/.cys/depts.json")
 MISSIONS = os.environ.get("CYS_DEPT_MISSIONS", f"{HOME}/.cys/dept-missions")
 ALLOWED_ROLES = ("worker", "reviewer", "cso")  # tasks[].to enum
 MIN_QUOTE = 20  # source_quote 최소 길이(F3)
+# ★0.14.56 PKG-3A M3 (HEAD-RULING-PKG3A-R1 §1 · head answer to the w53 plan, point 2) — every wait on a child is bounded
+#   (C11; commit 54373fe5: "the CSO turn must never sit on a delivery wait"; cys request() has no read cap,
+#   javis_phoenix.py `request()` note). Read-only / idempotent children are killed at the bound and read as UNKNOWN or
+#   as a failure. The two MUTATING children (cys-dept create, cys-dept down) are NEVER killed: see _run_mutating.
+CYS_CALL_TIMEOUT_S = 15        # cys status · cys queue list · cys send (a send timeout goes through the item-state check)
+TASK_PROMPT_TIMEOUT_S = 60     # the task-prompt child (its own cys status call is bounded at 12 s)
+PURGE_VERIFY_TIMEOUT_S = 60    # javis_purge_verify.py (read-only)
+DEPT_CREATE_TIMEOUT_S = 240    # cys-dept create - the bound javis_bootstrap gives cys-dept allocate (CYS_DEPT_FB_ALLOC_S)
+DEPT_DOWN_TIMEOUT_S = 120      # cys-dept down
 
 def expand(p): return os.path.expandvars(os.path.expanduser(p)) if p else p
 
@@ -345,8 +354,11 @@ def intake_ok(surfaces, idle_max=600):
 
 def dept_status(socket):
     """부서 소켓의 cys status --json 회수."""
-    r = subprocess.run(["cys", "--socket", socket, "status", "--json"],
-                       capture_output=True, text=True, env={**os.environ, "CYS_NO_AUTOSTART": "1"})
+    try:
+        r = subprocess.run(["cys", "--socket", socket, "status", "--json"], capture_output=True, text=True,
+                           env={**os.environ, "CYS_NO_AUTOSTART": "1"}, timeout=CYS_CALL_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return None   # PKG-3A M3: a stuck dept daemon reads as 'not answering', never a hang in the caller's turn
     if r.returncode != 0: return None
     try: return json.loads(r.stdout)
     except Exception: return None
@@ -682,8 +694,13 @@ def destroy_dept(name, mission_key, purge=False, purge_workdir=False, purge_stat
         sys.stderr.write("[destroy] %s: cys-dept 미발견(%s) — down 불가\n" % (name, cys_dept))
         return actions  # down 실패로 cmd_destroy가 비0 판정
     down_cmd = [cys_dept, "down", name] + (["--purge-state"] if purge_state else [])
-    r = subprocess.run(down_cmd, capture_output=True, text=True,
-                       env={**os.environ, "CYS_TRASH_STAMP": ts})
+    down_rc, down_out = _run_mutating(down_cmd, DEPT_DOWN_TIMEOUT_S, env={**os.environ, "CYS_TRASH_STAMP": ts})
+    if down_rc is None:   # PKG-3A M3: still running - termination not confirmed -> stop before any isolation, no retry
+        actions.append(("down", "unknown"))
+        sys.stderr.write("[destroy] %s: cys-dept down %s. pack/workdir 격리를 하지 않고 중단한다(반파괴 방지).\n"
+                         % (name, down_out))
+        return actions
+    r = subprocess.CompletedProcess(down_cmd, down_rc, stdout="", stderr=down_out)
     actions.append(("down", r.returncode))
     # ★0.14.31 P6 R1 (두 리뷰어 blocking): 거부 또는 종료 완료 미확인 시 격리를 중단한다.
     #   `cys-dept down` 의 아래 rc는 종료 완료의 근거가 될 수 없다 —
@@ -744,9 +761,13 @@ def destroy_dept(name, mission_key, purge=False, purge_workdir=False, purge_stat
         verifier = os.path.join(os.path.dirname(os.path.abspath(__file__)), "javis_purge_verify.py")
         state_root = expand("~/.local/state")
         dept_roster = expand("~/.local/state/cys/phoenix/dept_roster.json")
-        vr = subprocess.run(["python3", verifier, "--dept", name,
-                             "--state-root", state_root, "--depts-json", DEPTS,
-                             "--dept-roster", dept_roster], capture_output=True, text=True)
+        try:
+            vr = subprocess.run(["python3", verifier, "--dept", name,
+                                 "--state-root", state_root, "--depts-json", DEPTS,
+                                 "--dept-roster", dept_roster], capture_output=True, text=True,
+                                timeout=PURGE_VERIFY_TIMEOUT_S)
+        except subprocess.TimeoutExpired:   # PKG-3A M3: a read-only verifier - killed at the bound, read as a failure
+            vr = subprocess.CompletedProcess([], 124, stdout="", stderr="verifier timed out after %d s" % PURGE_VERIFY_TIMEOUT_S)
         actions.append(("verify", vr.returncode))
         if vr.returncode != 0:
             sys.stderr.write("[destroy] %s: 사후 검증 실패(rc=%d) — %s\n"
@@ -816,9 +837,33 @@ def apply_plan(m):
 def create_dept(key):
     """cys-dept create 위임. 부서장 각성·미션주입·격리·멱등 전부 cys-dept 책임."""
     require_cso()  # 게이트를 효과 함수에 (R1 REVISE-1) — import 직접호출 우회 차단
-    r = subprocess.run(["cys-dept", "create", key], capture_output=True, text=True,
-                       env={**os.environ})  # 부모 role 상속(require_cso로 cso 보장·하류 가드 유지)
-    return r.returncode, (r.stdout or "") + (r.stderr or "")
+    rc, out = _run_mutating(["cys-dept", "create", key], DEPT_CREATE_TIMEOUT_S,
+                            env={**os.environ})  # 부모 role 상속(require_cso로 cso 보장·하류 가드 유지)
+    if rc is None:   # PKG-3A M3: still running - outcome unknown, never retried here
+        return 124, "[create] %s: cys-dept create %s" % (key, out)
+    return rc, out
+
+def _run_mutating(argv, bound, env=None):
+    """A MUTATING child (cys-dept create / down) under a bound that never kills it (PKG-3A M3 · head answer to the w53
+    plan, point 2): killing a create or a down midway can leave a half-built or half-stopped department, which is worse
+    than waiting. Output goes to a log file, not a pipe - a child left running must neither block on a full pipe nor die
+    on a broken pipe once this process has gone. Returns (rc, output) when the child ended inside the bound, else
+    (None, message naming the pid and the log); the caller returns non-zero and never retries."""
+    fd, log = tempfile.mkstemp(prefix="javis-org-%s-" % os.path.basename(argv[0]), suffix=".log")
+    with os.fdopen(fd, "w+b") as f:
+        p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT, env=env)
+        try:
+            rc = p.wait(timeout=bound)
+        except subprocess.TimeoutExpired:
+            return None, ("outcome unknown - still running as pid %d after %d s (output: %s); check `cys-dept list` "
+                          "and the department daemon before any retry - not retried" % (p.pid, bound, log))
+        f.seek(0)
+        out = f.read().decode("utf-8", "replace")
+    try:
+        os.unlink(log)
+    except OSError:
+        pass
+    return rc, out
 
 def dispatch_task(t):
     """첫 프로젝트 = 유일 실행 티켓(task-prompt). 미션 md의 첫프로젝트와 중복 금지(DUP-4)."""
@@ -826,7 +871,10 @@ def dispatch_task(t):
            "--task", t["task"], "--scope", t["scope"], "--to", t.get("to") or "worker"]
     if t.get("success"): cmd += ["--success", t["success"]]
     if t.get("dont"): cmd += ["--dont", t["dont"]]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=TASK_PROMPT_TIMEOUT_S)
+    except subprocess.TimeoutExpired:   # PKG-3A M3: read-only (it prints a ticket) - killed at the bound
+        return 124, "[dispatch] %s: task-prompt timed out after %d s - no ticket generated" % (t.get("dept"), TASK_PROMPT_TIMEOUT_S)
     out = (r.stdout or "") + (r.stderr or "")
     if r.returncode != 0:
         return r.returncode, out
@@ -898,7 +946,11 @@ def _queue_has(sock, nonce, expired=False):
     """True/False: the department's queue (or its expired list) holds an item whose preview carries the nonce.
     None when the read fails — that is UNKNOWN, never 'absent'."""
     cmd = ["cys", "--socket", sock, "queue", "list", "--json"] + (["--expired"] if expired else [])
-    r = subprocess.run(cmd, capture_output=True, text=True, env={**os.environ, "CYS_NO_AUTOSTART": "1"})
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, env={**os.environ, "CYS_NO_AUTOSTART": "1"},
+                           timeout=CYS_CALL_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return None   # PKG-3A M3: UNKNOWN, never 'absent'
     if r.returncode != 0:
         return None
     try:
@@ -1004,8 +1056,12 @@ def _deliver_first_ticket(t, ticket, out):
     with os.fdopen(fd, "w", encoding="utf-8") as f:   # durable copy; its first line carries the nonce the previews show
         f.write("[org-dispatch %s] %s" % (nonce, ticket))
     to = t.get("to") or "worker"
-    s = subprocess.run(["cys", "--socket", sock, "send", "--queued", "--to", to, "--file", path],
-                       capture_output=True, text=True, env={**os.environ, "CYS_NO_AUTOSTART": "1"})
+    try:
+        s = subprocess.run(["cys", "--socket", sock, "send", "--queued", "--to", to, "--file", path],
+                           capture_output=True, text=True, env={**os.environ, "CYS_NO_AUTOSTART": "1"},
+                           timeout=CYS_CALL_TIMEOUT_S)
+    except subprocess.TimeoutExpired:   # PKG-3A M3: the item-state check below settles a send that did not answer
+        s = subprocess.CompletedProcess([], 124, stdout="", stderr="cys send timed out after %d s" % CYS_CALL_TIMEOUT_S)
     if s.returncode != 0:
         why = (s.stderr or s.stdout or "")[-200:]
         st = _ticket_state(sock, *_copy_ticket(path))
