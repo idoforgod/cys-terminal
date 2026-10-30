@@ -224,6 +224,8 @@ pub struct Request {
     status: Mutex<Status>,
     /// In-process completion ended, including a caught callback panic. Not durable source settlement.
     settled: AtomicBool,
+    #[cfg(test)]
+    p1_supervisor_completion: Mutex<P1SupervisorCompletion>,
     /// When the receiver proof was last lost (admission or recheck): the S4-1 resume window counts from here.
     lost_at: Mutex<Option<Instant>>,
     native: Mutex<NativeState>,
@@ -250,6 +252,8 @@ impl Request {
             cancelled: AtomicBool::new(false),
             status: Mutex::new(Status::AcceptedPending),
             settled: AtomicBool::new(false),
+            #[cfg(test)]
+            p1_supervisor_completion: Mutex::new(P1SupervisorCompletion::default()),
             lost_at: Mutex::new(None),
             native: Mutex::new(NativeState { plan: admitted_plan.cloned(), ..NativeState::default() }),
             managed: admitted_plan.is_some(),
@@ -1163,6 +1167,12 @@ pub fn finish(job: AgentJob, ex: &Executed) -> Terminal {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || settle(&t)));
     }
     job.request.settled.store(true, Ordering::Release);
+    #[cfg(test)]
+    if !job.request.managed && job.request.origin == "supervisor" {
+        let mut receipt = job.request.p1_supervisor_completion.lock().unwrap();
+        receipt.completed = Some(terminal.clone());
+        for tx in receipt.subscribers.drain(..) { let _ = tx.send(terminal.clone()); }
+    }
     terminal
 }
 
@@ -1174,6 +1184,11 @@ pub enum JournalBarrier {
     Passed,
     /// The journal barrier refused the request: zero bytes. The writer's reason (`journal:<os error>`).
     Refused(String),
+    /// ★(0.14.56 · P1 D5 · design r2 §6) The request ended before `Writing` with zero bytes: its hand-off guard was not claimed
+    /// ([`GUARD_ABORTED`]) or it was cancelled ([`Terminal::CancelledBeforeWrite`]). Both are decided before the first byte, so
+    /// this report is not timing-dependent. Other non-journal refusals (e.g. a lost receiver proof, decided after `Writing`)
+    /// stay [`JournalBarrier::Passed`].
+    GuardAborted,
     /// The budget ended before the seat's writer reached the request (it is queued behind earlier writes).
     Pending,
 }
@@ -1193,6 +1208,10 @@ pub fn await_journal_barrier(req: &Request, budget: Duration) -> JournalBarrier 
             Status::Terminal(Terminal::RefusedNoWrite { reason }) if reason.starts_with("journal:") => {
                 return JournalBarrier::Refused(reason)
             }
+            Status::Terminal(Terminal::RefusedNoWrite { reason }) if reason == GUARD_ABORTED => {
+                return JournalBarrier::GuardAborted
+            }
+            Status::Terminal(Terminal::CancelledBeforeWrite) => return JournalBarrier::GuardAborted,
             Status::Terminal(_) => return JournalBarrier::Passed,
             Status::AcceptedPending => {}
         }
@@ -1214,6 +1233,13 @@ thread_local! {
 pub fn test_wait_settled(req: &Request) {
     #[cfg(test)]
     {
+        P1_ADMISSION_OBSERVER.with(|slot| {
+            let matching = slot.borrow().as_ref().is_some_and(|o| o.surface_id == req.surface_id && o.origin == req.origin);
+            if matching {
+                let observer = slot.borrow_mut().take().unwrap();
+                (observer.notify)(req);
+            }
+        });
         if SYNC_SETTLE.with(|c| c.get()) {
             let deadline = Instant::now() + Duration::from_secs(10);
             while !req.is_settled() && Instant::now() < deadline {
@@ -1228,6 +1254,47 @@ pub fn test_wait_settled(req: &Request) {
 #[cfg(test)]
 pub fn set_test_sync_settle(on: bool) {
     SYNC_SETTLE.with(|c| c.set(on));
+}
+
+/// Tests only (0.14.56 · D3-BOUND r2 §1.5, T-S0): run on the CALLING thread right after a delivery-ledger pre-record
+/// ([`crate::delivery::record_audited_with`]) - i.e. after the producer's judgment and before its hand-off. A specimen arms a
+/// one-shot hook there to land a foreign write or input inside that window. No-op in the product.
+pub fn test_after_pre_record(surface_id: u64) {
+    #[cfg(test)]
+    {
+        if let Some(hook) = AFTER_PRE_RECORD.with(|c| c.borrow_mut().take()) {
+            hook(surface_id);
+        }
+    }
+    #[cfg(not(test))]
+    let _ = surface_id;
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_PRE_RECORD: std::cell::RefCell<Option<Box<dyn FnOnce(u64)>>> = std::cell::RefCell::new(None);
+}
+
+/// Arms [`test_after_pre_record`] once on this thread (the next pre-record on this thread runs `hook`).
+#[cfg(test)]
+pub fn set_test_after_pre_record(hook: impl FnOnce(u64) + 'static) {
+    AFTER_PRE_RECORD.with(|c| *c.borrow_mut() = Some(Box::new(hook)));
+}
+
+/// Test-only observation of the non-atomic idle-check/enqueue window. Empty in a product build.
+pub fn test_after_writer_idle() {
+    #[cfg(test)]
+    if let Some(hook) = AFTER_WRITER_IDLE.with(|c| c.borrow_mut().take()) { hook(); }
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_WRITER_IDLE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+pub fn set_test_after_writer_idle(hook: impl FnOnce() + 'static) {
+    AFTER_WRITER_IDLE.with(|c| *c.borrow_mut() = Some(Box::new(hook)));
 }
 
 /// Proof used while a seat has no receiver binding wired yet: every check passes (the caller's
@@ -2975,4 +3042,109 @@ mod tests {
         assert!(job.request.reserve_attempt(&plan,None).is_ok());
     }
 
+    /// ★(0.14.56 · P1 E L-CYCLE D5 · design r2 §6, §15 T-D5) The barrier reports the two ends decided before `Writing` - a
+    /// hand-off guard that was not claimed and a cancellation - as `GuardAborted` (zero bytes); a non-journal refusal decided after
+    /// `Writing` (a lost receiver proof) stays `Passed`. Mutants: keep `Passed` for GUARD_ABORTED; keep it for a cancellation;
+    /// map every non-journal refusal to `GuardAborted`.
+    #[test]
+    fn p1_e_t_d5_barrier_reports_pre_writing_zero_byte_ends_as_guard_aborted() {
+        let budget = Duration::from_millis(JOURNAL_BARRIER_BUDGET_MS);
+        // a guard whose generation moved: never claimed
+        let mut j = job(Plan::paste("x").with_clear(0).with_submit(0, 0), FakeProof::healthy());
+        j.guard = Some(Arc::new(crate::state::InjectGuard::new(
+            Some(0),
+            Arc::new(std::sync::atomic::AtomicU64::new(2)),
+            false,
+            None,
+        )));
+        let req = j.request.clone();
+        let mut w = Rec::new();
+        let ex = run_job(&mut w, &j);
+        finish(j, &ex);
+        assert!(matches!(req.status(), Status::Terminal(Terminal::RefusedNoWrite { ref reason }) if reason == GUARD_ABORTED));
+        assert_eq!(w.attempts, 0, "zero bytes");
+        assert_eq!(await_journal_barrier(&req, budget), JournalBarrier::GuardAborted, "guard abort");
+        // cancelled before the first byte
+        let j = job(Plan::paste("x").with_submit(0, 0), FakeProof::healthy());
+        j.request.cancel();
+        let req = j.request.clone();
+        let mut w = Rec::new();
+        let ex = run_job(&mut w, &j);
+        finish(j, &ex);
+        assert_eq!(w.attempts, 0, "zero bytes");
+        assert_eq!(await_journal_barrier(&req, budget), JournalBarrier::GuardAborted, "cancellation");
+        // a receiver-proof refusal (after `Writing`): not remapped
+        let j = job(Plan::paste("x").with_submit(0, 0), FakeProof::refusing(ProofLoss::AgentDead));
+        let req = j.request.clone();
+        let mut w = Rec::new();
+        let ex = run_job(&mut w, &j);
+        finish(j, &ex);
+        assert!(matches!(req.status(), Status::Terminal(Terminal::RefusedNoWrite { .. })));
+        assert_eq!(await_journal_barrier(&req, budget), JournalBarrier::Passed, "receiver-proof refusal stays Passed");
+    }
+
+}
+
+
+// P1 WC-1 observer data only: no field, allocation, callback or lock in non-test builds.
+#[cfg(test)]
+#[derive(Default)]
+struct P1SupervisorCompletion {
+    completed: Option<Terminal>,
+    subscribers: Vec<std::sync::mpsc::Sender<Terminal>>,
+}
+
+#[cfg(test)]
+impl Request {
+    pub(crate) fn p1_subscribe_supervisor_completion(&self, tx: std::sync::mpsc::Sender<Terminal>) -> Result<(), String> {
+        if self.managed || self.origin != "supervisor" {
+            return Err("P1 observer supports ordinary supervisor requests only".into());
+        }
+        let mut receipt = self.p1_supervisor_completion.lock().unwrap();
+        if let Some(terminal) = &receipt.completed {
+            tx.send(terminal.clone()).map_err(|_| "completion receiver dropped".to_string())?;
+        } else {
+            receipt.subscribers.push(tx);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+struct P1AdmissionNotification {
+    surface_id: u64,
+    origin: &'static str,
+    notify: Box<dyn FnOnce(&Request)>,
+}
+#[cfg(test)]
+thread_local! {
+    static P1_ADMISSION_OBSERVER: std::cell::RefCell<Option<P1AdmissionNotification>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+pub(crate) struct P1AdmissionObserver(Option<P1AdmissionNotification>);
+#[cfg(test)]
+impl Drop for P1AdmissionObserver {
+    fn drop(&mut self) {
+        P1_ADMISSION_OBSERVER.with(|slot| *slot.borrow_mut() = self.0.take());
+    }
+}
+#[cfg(test)]
+pub(crate) fn p1_observe_admission(
+    surface_id: u64, origin: &'static str, notify: impl FnOnce(&Request) + 'static,
+) -> P1AdmissionObserver {
+    P1AdmissionObserver(P1_ADMISSION_OBSERVER.with(|slot| slot.replace(Some(P1AdmissionNotification {
+        surface_id, origin, notify: Box::new(notify),
+    }))))
+}
+
+
+#[cfg(test)]
+pub(crate) struct P1SyncSettleGuard(bool);
+#[cfg(test)]
+impl Drop for P1SyncSettleGuard {
+    fn drop(&mut self) { SYNC_SETTLE.with(|slot| slot.set(self.0)); }
+}
+#[cfg(test)]
+pub(crate) fn p1_sync_settle(on: bool) -> P1SyncSettleGuard {
+    P1SyncSettleGuard(SYNC_SETTLE.with(|slot| slot.replace(on)))
 }

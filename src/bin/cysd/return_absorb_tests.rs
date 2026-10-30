@@ -284,7 +284,7 @@ fn a2_stuck_dead_sender_body_rescued_immediately() {
 fn deliver_now(fx: &Fx, t: &Arc<Surface>) -> bool {
     for _ in 0..40 {
         if crate::governance::deliver_head_locked(
-            &fx.daemon, t, false, false, None, Some(0), None, None,
+            &fx.daemon, t, false, false, None, Some(0), None, None, None,
         )
         .is_some()
         {
@@ -1182,11 +1182,14 @@ fn pair_return_from(fx: &Fx, pid: Option<u32>, t: &Arc<Surface>, extra: Value) -
 
 /// ★B 핵심 재현(적색): 교차 소켓 CEO(검증 불가 pid + from=900) → 부서장(권한 창 전경) `send` 가 모달로 큐 전환
 /// → 같은 셸 체인의 짝 Return → **흡수(쓰기 0)**. 종전(A2): 표 미발급(unverified) → Return 이 써져 창을 눌렀다.
+/// ★(0.14.56 · P1 · head ruling on Q-suites-17-pins 5fffe0d9) Intent kept: a cross-socket sender's pair Return never presses a
+///   seat's dialog. The Claimed-key path is shown on a NON-master seat (worker-1): on a master/CEO, D9 turns that send into one
+///   queue job at receipt, so no modal refusal and no Claimed ticket arise there - D9's form is the next cell.
 #[test]
 fn b_claimed_cross_socket_modal_pair_return_absorbed() {
     let fx = fx("b-claimed");
     std::env::set_var("CYS_RETURN_ABSORB_REFLEX_MS", "25000"); // 부하 러너에서도 '반사 창 안' 전제 고정
-    let t = pane(&fx, "master", P + 700);
+    let t = pane(&fx, "worker-1", P + 700);
     paint_modal(&t);
     let first = direct_from(&fx, None, &t, "[CEO 지시] 착수", json!({"from": CEO_FROM}));
     assert!(
@@ -1214,6 +1217,32 @@ fn b_claimed_cross_socket_modal_pair_return_absorbed() {
     assert_sent(&pair_return_from(&fx, None, &t, json!({})));
     assert_sent(&pair_return_from(&fx, None, &t, json!({"from": CEO_FROM + 1})));
     assert_absorbed(&pair_return_from(&fx, None, &t, json!({"from": CEO_FROM})), "pair", "queued");
+}
+
+/// ★(0.14.56 · P1 · head ruling on Q-suites-17-pins 5fffe0d9) D9's form of the cell above, on the master: the same cross-socket
+///   send (unverified pid + from=900) over the same dialog is one queue job at receipt - nothing typed, no Claimed ticket
+///   (design r2 sec 10-1: a self-reported `from` never keys D9) - and the pair Return is refused at receipt, 0 bytes, so the
+///   dialog's default option is not pressed and the body waits in the queue.
+#[test]
+fn b_claimed_d9_master_cross_socket_send_is_one_job_and_its_return_is_refused() {
+    let fx = fx("b-claimed-d9");
+    std::env::set_var("CYS_RETURN_ABSORB_REFLEX_MS", "25000");
+    let t = pane(&fx, "master", P + 701);
+    paint_modal(&t);
+    let before = counts(&t);
+    let r = direct_from(&fx, None, &t, "[CEO 지시] 착수", json!({"from": CEO_FROM}));
+    assert_eq!(r["ok"], json!(true), "the send is accepted, not refused by the dialog: {r}");
+    assert_eq!(r["result"]["converted"], json!("one_job"), "one queue job at receipt: {r}");
+    assert_eq!(r["result"]["return_absorb"], json!(false), "a self-reported from opens no ticket under D9: {r}");
+    assert_eq!(counts(&t), before, "nothing typed into the master's composer");
+    assert_eq!(qlen(&t), 1, "the body waits in the queue");
+    for extra in [json!({"from": CEO_FROM}), json!({})] {
+        let k = pair_return_from(&fx, None, &t, extra.clone());
+        assert_eq!(k["error"]["code"], json!(cys::ERR_COMPOSER_KEY_DENIED), "({extra}) refused at receipt: {k}");
+        assert_eq!(counts(&t), before, "({extra}) 0 bytes - the dialog's default option is not pressed");
+        assert_eq!(qlen(&t), 1, "({extra}) the body stays queued");
+    }
+    assert_eq!(bus_count(&fx, "queue.return_absorbed"), 0, "no absorption - the Return was refused, not swallowed");
 }
 
 /// Verified(n) 과 Claimed(n) 은 서로 다른 키다(B 지적 2·11): 교차 소켓이 로컬 좌석 P 의 번호를 자기신고해도

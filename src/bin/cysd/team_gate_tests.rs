@@ -49,9 +49,9 @@ pub(crate) fn tmp_daemon(tag: &str, dept_lane: bool) -> Arc<Daemon> {
 /// 감싸 병행 테스트와의 경합을 막는다.
 fn tmp_daemon_auto_route_on(tag: &str, dept_lane: bool) -> Arc<Daemon> {
     let _g = crate::governance::PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("CYS_APPROVE_AUTO_ROUTE", "1");
+    let auto_env = crate::governance::ReapEnvGuard::set(&[("CYS_APPROVE_AUTO_ROUTE", "1")]);
     let d = tmp_daemon(tag, dept_lane);
-    std::env::remove_var("CYS_APPROVE_AUTO_ROUTE"); // config 캡처 후 즉시 정리
+    drop(auto_env); // config 캡처 후 즉시 정리
     d
 }
 

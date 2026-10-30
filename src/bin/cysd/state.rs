@@ -206,6 +206,11 @@ pub struct QueueEntry {
     /// 1회면 족하고, 재시도 대상은 통지뿐이다.
     #[serde(default)]
     pub expired_event_sent: bool,
+    /// ★(0.14.56 · P1 D9 reinject order · impl/DESIGN-ADDENDUM-D9-reinject-order.md rev 1) A send D9 converted into this queue job whose
+    /// request was `authoritative` AND whose caller passed the head-placement gate (`authoritative_caller_ok`, or the target's current
+    /// cycle owner). The WAL row carries it only when true (ordinary rows stay byte-identical); an old daemon drops it (= ordinary).
+    #[serde(default)]
+    pub authoritative: bool,
 }
 
 /// ★(0.14.31 · WP-5 M) 큐 항목 TTL 기본(초) = 6h. env `CYS_QUEUE_TTL_SECS` 가 덮는다
@@ -228,7 +233,7 @@ pub fn queue_ttl_default_secs() -> u64 {
 /// TTL 회계 키는 전부 additive 라, 구 데몬이 이 파일을 다시 쓰면 사라졌다가 신 데몬 재기동 시
 /// serde default 로 되살아난다(활성 항목의 만료는 보존된 `enqueued_at` 기준 재계산 = 무손실).
 pub fn queue_entry_row(surface_id: u64, role: &Option<String>, e: &QueueEntry) -> Value {
-    json!({
+    let mut row = json!({
         "mid": queue_mid(surface_id, &e.text), "id": e.id, "seq": e.seq,
         "surface_id": surface_id, "role": role, "text": e.text,
         "enqueued_at": e.enqueued_at, "from": e.from, "origin": e.origin,
@@ -237,7 +242,12 @@ pub fn queue_entry_row(surface_id: u64, role: &Option<String>, e: &QueueEntry) -
         "expired_notified": e.expired_notified,
         // ★(0.14.31 · 리뷰 R1) 이벤트 래치 — 재기동이 만료 이벤트를 다시 쏘지 않게 관통한다.
         "expired_event_sent": e.expired_event_sent,
-    })
+    });
+    // ★(0.14.56 · P1 D9 reinject order) only when true - an ordinary row is byte-identical to the pin's.
+    if e.authoritative {
+        row["authoritative"] = json!(true);
+    }
+    row
 }
 
 /// ★(0.14.31 · WP-5 M) WAL 행(Value) → `QueueEntry` 되살림 — rehome 의 되살림 규칙과 같은 값
@@ -278,6 +288,7 @@ pub fn queue_entry_from_row(it: &Value) -> QueueEntry {
             .get("expired_event_sent")
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
+        authoritative: it.get("authoritative").and_then(|v| v.as_bool()).unwrap_or(false),
     }
 }
 
@@ -1336,13 +1347,17 @@ pub enum PairKey {
     Verified(u64),
     /// 검증 신원이 없는 호출자의 자기신고 좌석 id(다른 데몬의 번호일 수 있다).
     Claimed(u64),
+    /// ★(0.14.56 · P1 D9) Master/CEO targets only (`handlers::d9_pair_key`): no verified pane, so the kernel
+    /// peer's parent process with its native birth (a reused pid is another caller). Never built from `from`.
+    Process { parent_pid: u32, parent_birth_us: u64 },
 }
 
 impl PairKey {
-    /// 좌석 번호(이벤트 `from` 표기용 — 등급은 [`PairKey::is_verified`] 로 따로 싣는다).
-    pub fn sid(self) -> u64 {
+    /// 좌석 번호(이벤트 `from` 표기용 — 등급은 [`PairKey::is_verified`] 로 따로 싣는다). `Process` has none.
+    pub fn sid(self) -> Option<u64> {
         match self {
-            PairKey::Verified(x) | PairKey::Claimed(x) => x,
+            PairKey::Verified(x) | PairKey::Claimed(x) => Some(x),
+            PairKey::Process { .. } => None,
         }
     }
 
@@ -1375,13 +1390,16 @@ pub struct ReturnTicket {
 ///
 /// 쓰기 = writer 스레드 단독([`run_writer_loop_tracked`] 의 Inject arm 이 begin/end) — 예외 `handed_at`(채널 생산자 ·
 /// [`InjectTrack::note_handoff`]). 읽기 = H0 판정·채널 배달 간격.
-/// 휘발(재기동·재생성 좌석은 빈 채로 출발 = 종전 동작). 락: `done_at`·`handed_at` 은 leaf.
+/// 휘발(재기동·재생성 좌석은 빈 채로 출발 = 종전 동작). `handed_at` is leaf; `done_at` also spans nonblocking writer admission in `handoff_after_gap`.
 #[derive(Debug, Default)]
 pub struct InjectTrack {
     /// Inject arm 이 (선정리)·붙여넣기·cr_delay·CR 을 쓰는 중이다.
     active: AtomicBool,
     /// 마지막 Inject arm 이 끝난 단조 시각(성공·실패 무관 — 끝난 뒤에는 화면만 남는다).
     done_at: Mutex<Option<Instant>>,
+    /// Per-track deterministic pacing clock, frozen only by a regression specimen after a real terminal.
+    #[cfg(test)]
+    gap_test_now: Mutex<Option<Instant>>,
     /// ★(0.14.42 · H3 간격 경쟁) 채널 생산자가 Inject 를 writer 에 **넘긴**(try_send 직전) 단조 시각 —
     /// [`InjectTrack::handoff_pending`]. 채널 행 간격 전용이다(H0 자기 붙여넣기 귀속은 읽지 않는다 — 인계만 된 본문은 화면에 없다).
     /// ★(R2F-DM 2차 · B2) 표식은 시각과 함께 **순번**을 든다([`HandoffSlot`]) — '같은 표식인가' 는 순번으로, 경과·선후는 시각으로 가린다.
@@ -1694,6 +1712,36 @@ impl InjectTrack {
                 .is_some_and(|t| t.elapsed() < within)
     }
 
+    /// Recheck the actual completion gap and hand off without letting `end` replace that completion in between.
+    /// The closure must ONLY perform nonblocking writer admission: no IO, parser, journal or settlement waits.
+    /// Lock order is done_at -> WriterGate admission; writer releases done_at before settlement/operation release.
+    /// This does not reserve the writer or reject human/DSR admissions. A later writer start is still covered by D9.
+    pub(crate) fn handoff_after_gap<R>(&self, within: std::time::Duration, handoff: impl FnOnce() -> R) -> Option<R> {
+        let done = self.done_at.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        #[cfg(test)]
+        let now = self.gap_test_now.lock().unwrap().unwrap_or(now);
+        if self.active.load(Ordering::Acquire) || done.is_some_and(|t| now.saturating_duration_since(t) < within) {
+            return None;
+        }
+        let result = handoff();
+        drop(done);
+        Some(result)
+    }
+
+    /// Test control: pin the consumer clock to the actual completed writer timestamp, never manufacture a completion.
+    #[cfg(test)]
+    pub(crate) fn test_freeze_gap_at_done(&self) {
+        assert_ne!(self.submit_written_ms.load(Ordering::Acquire), 0, "H3 premise: predecessor actually wrote its CR");
+        let done = self.done_at.lock().unwrap().expect("real writer completion required");
+        *self.gap_test_now.lock().unwrap() = Some(done);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_release_gap_clock(&self) {
+        *self.gap_test_now.lock().unwrap() = None;
+    }
+
     /// ★(0.14.42 · H3 간격 경쟁 — 발행 준비 발견) 생산자 전용 — Inject 를 writer 에 넘기기(`try_send`) **직전**에 부른다.
     ///
     /// 【왜】 [`Self::busy_within`] 은 writer 가 arm 을 **시작한**(`begin`) 뒤부터만 참이다. 생산자가 넘긴 뒤 writer 가 집기 전
@@ -1854,6 +1902,8 @@ pub enum WriteReq {
     /// runs. Refused / cancelled / partial outcomes do not end the writer loop — only a broken
     /// transport does (an exit would drop the writer, and Unix writer Drop types newline + VEOF).
     Agent(Box<crate::agent_write::AgentJob>),
+    #[cfg(test)]
+    P1ReceiverBarrier(Vec<u8>),
 }
 
 /// 청크 경계 상태: 미완성 ESC/UTF-8 꼬리·\r 덮어쓰기·진행 중 라인
@@ -1930,6 +1980,15 @@ pub struct BootAck {
     pub generation: u32,
 }
 
+/// ★(0.14.56 · PKG1-M1 · design sec 3.2-3.3) [`Surface::auth_born`]: entry id -> `ctx_guard_now` at insertion (the daemon's monotonic
+/// clock; an entry restored from the WAL has no row and is aged by its wall-clock `enqueued_at`), and the one entry whose lapse
+/// event was already published (`queue.authoritative_hold_lapsed` fires once per entry). Pruned to the ids still queued.
+#[derive(Debug, Default)]
+pub struct AuthBook {
+    pub born: std::collections::HashMap<String, f64>,
+    pub lapsed_reported: Option<String>,
+}
+
 /// ★(0.14.42 · clear 가드 v3) 사이클 단일 비행 점유 — `surface.cycle_claim` 이 기록한다(`Surface::cycle_claim`).
 #[derive(Debug, Clone)]
 pub struct CycleClaim {
@@ -1954,6 +2013,29 @@ impl CycleClaim {
     /// — 벽시계는 입력이 아니다(절전 뒤에도 산 집행자의 점유를 나이로 버리지 않는다). 게으르게 버린다.
     pub fn expired(&self, mono_now: f64) -> bool {
         self.pid.is_some_and(|p| !pid_alive(p)) || mono_now - self.mono > CYCLE_CLAIM_MAX_SECS
+    }
+}
+
+/// D3-BOUND: one independent retry slot for each producer; its mutex is a leaf (no I/O).
+#[derive(Debug)]
+pub(crate) struct ClaimStreak {
+    pub item: String,
+    pub held_since: Option<Instant>,
+    pub held_epoch: Option<f64>,
+    pub refusals: u32,
+    pub first_refusal_at: Option<Instant>,
+    pub first_refusal_epoch: Option<f64>,
+    pub last_foreign: Vec<&'static str>,
+    pub foreign_counts: [u32; 3],
+    pub escalated: bool,
+    pub updated_at: Instant,
+}
+
+impl ClaimStreak {
+    pub(crate) fn new(item: &str, now: Instant) -> Self {
+        Self { item: item.to_owned(), held_since: None, held_epoch: None, refusals: 0,
+            first_refusal_at: None, first_refusal_epoch: None, last_foreign: Vec::new(),
+            foreign_counts: [0; 3], escalated: false, updated_at: now }
     }
 }
 
@@ -2137,6 +2219,9 @@ pub struct Surface {
     /// 지운다. `queue.list` 가 이 값을 노출해 운영자가 "왜 안 가나" 를 화면 폴링 없이 안다
     /// (경보는 쿨다운·임계가 있어 매 틱 사유를 말해 주지 않는다 — 이 필드가 상시 사실이다).
     pub queue_blocked: Mutex<Option<(String, f64)>>,
+    pub(crate) writer_holds: AtomicU64,
+    pub(crate) claim_refusals_total: [AtomicU64; 3],
+    pub(crate) claim_streaks: Mutex<[Option<ClaimStreak>; 3]>,
     /// T3-14 단조 라인 커서: scrollback FIFO와 무관하게 증가하는 누적 완성 라인 수
     pub line_count: AtomicU64,
     /// T4-17 헬스 조치: 이 시각까지 queued 배달 일시정지 (직접 send는 통과)
@@ -2197,6 +2282,10 @@ pub struct Surface {
     /// writer), 읽기 = surface.list·status·deliver_queued. 승계 게이트만은 캐시를 믿지 않고 그 시점
     /// 프로브를 새로 뜬다(드문 경로·판정이 role 재바인딩을 좌우하므로 stale 금지).
     pub seat_cache: AtomicU8,
+    /// ★(0.14.56 · P1 · head ruling W1 0048dfdf) D1's platform half for this seat - set once at creation from
+    /// `governance::d1_platform_measured()` (false on Windows) and read by `governance::d1_governs`. Instance-owned so a specimen
+    /// configures one seat's platform without a process-global switch.
+    pub d1_platform: AtomicBool,
     /// ★G2(W3-A BLOCK 교정) 좌석 에이전트 엄격 관측 캐시: 이 틱의 신선한 자손 관측에서
     /// **기지(旣知) 에이전트 엄격 매칭**(governance::cmdline_matches_agent_exec — R2 확정
     /// strict 매처)이 잡혔는가. 쓰기 = `governance::refresh_seat_cache` 단독(seat_cache 와
@@ -2268,6 +2357,10 @@ pub struct Surface {
     /// 말단 락(가드 락보다 먼저 잡는다 · 가드 락을 쥔 채 잡지 않는다). ★(RR2-ROLE-2) 좌석 상태 JSON `ctx_guard.claim` 으로 보이고,
     /// 점유가 끝났는데(해제 · 죽음) 그 통보가 미해결이면 데몬이 같은 통보를 한 번 재배달한다(`usage::ctx_guard_claim_ended`).
     pub cycle_claim: Mutex<Option<CycleClaim>>,
+    /// ★(0.14.56 · PKG1-M1 · design sec 3.2) Monotonic insertion times of this seat's queued authoritative entries (the cycle's
+    /// converted [RESUME] / directive) - the age book of the `authoritative` hold axis ([`crate::governance::authoritative_hold_age`]).
+    /// Leaf lock: taken after `pending_queue` is released, never while holding another lock.
+    pub auth_born: Mutex<AuthBook>,
     /// (B2) OSC 9/99/777 알림 스캐너 carry — reader 스레드 전용(단일 스레드 접근이라 Mutex면 충분).
     /// strip 전 raw chunk를 누적해 완성 OSC 시퀀스만 추출한다(화면 렌더/strip 경로와 독립).
     pub osc_carry: Mutex<Vec<u8>>,
@@ -2388,6 +2481,9 @@ pub struct Surface {
     /// (동형성 핀) → GUI 폴더별 고정 토스트. **스폰 동작은 이 값과 무관하다**(cwd 대체 없음).
     /// 판정·상한·롤백 규약은 `cwd_probe.rs` 머리말이 정본이다.
     pub cwd_blocked: Option<crate::cwd_probe::CwdBlocked>,
+    /// E0 fixture notification only; absent from non-test layouts.
+    #[cfg(test)]
+    p1_e0_reader_completion: Mutex<(bool, Vec<std::sync::mpsc::Sender<()>>)>,
 }
 
 /// ★(U-10) 관문 보류 좌석의 근거. `surface.list`·`org.status`·`topology.json` 에 **object**
@@ -2428,6 +2524,18 @@ pub enum EscRecount {
 }
 
 impl Surface {
+    /// Admission is registration with this already-spawned reader, not a sampled predicate.
+    #[cfg(test)]
+    pub(crate) fn p1_e0_subscribe_reader_completion(&self, sender: std::sync::mpsc::Sender<()>) -> Result<(), String> {
+        let mut completion = self.p1_e0_reader_completion.lock().unwrap_or_else(|e| e.into_inner());
+        if completion.0 {
+            sender.send(()).map_err(|_| "E0 completion receiver disconnected".to_string())?;
+        } else {
+            completion.1.push(sender);
+        }
+        Ok(())
+    }
+
     /// Creation observation only; strict callers must still prove current lifetime.
     #[allow(dead_code)] // Consumed by the later S3/S4 integration.
     pub(crate) fn registration_start(&self) -> Option<u64> {
@@ -2479,6 +2587,12 @@ impl Surface {
     }
 
     /// 지금 인계 예약이 걸려 있는가(같은 좌석의 이중 인계 차단 · 배달 임계영역 전용).
+    /// ★(0.14.56 · P1 D9 reinject order) The in-flight hand-off's entry ids (empty if none) - an authoritative job is never placed
+    /// ahead of them. Lock order: callers hold `pending_queue` first, as `cancel_inject_reservation_locked` does.
+    pub fn inject_reservation_ids(&self) -> Vec<String> {
+        self.inject_reservation.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|r| r.ids.clone()).unwrap_or_default()
+    }
+
     pub fn inject_reserved(&self) -> bool {
         self.inject_reservation.lock().unwrap_or_else(|e| e.into_inner()).is_some()
     }
@@ -4063,6 +4177,10 @@ pub struct Daemon {
     /// ★(0.14.52 · S-a C7a) Partial-write holds by queue entry id, mirrored to `queue-write-holds.json` (see
     /// [`PersistedWriteHold`]); loaded at start so a restored held entry is adopted as held, never handed off again.
     pub write_holds: Mutex<HashMap<String, PersistedWriteHold>>,
+    /// ★(0.14.56 · PKG1-M1 m1) Boot-supervisor pane notices refused at their master/CEO claim (a foreign write or input after the
+    /// hand-off): the writer-thread settlement puts them here and the supervisor moves them into its deferred list at its next
+    /// retry, within the existing bounds (16 notices, 600 s). Leaf lock.
+    pub pane_notice_requeue: Mutex<Vec<crate::boot_supervisor::DeferredPaneNotice>>,
     /// ★(0.14.52 · S-a C7e) Held bodies an earlier daemon run left in `submit-held.json`, disposed once by the first
     /// `handlers::sync_held_bodies` of this run.
     pub held_bodies_restart: Mutex<Vec<PersistedHeldBody>>,
@@ -5677,6 +5795,143 @@ pub(crate) fn test_stop_daemon(daemon: &Arc<Daemon>) {
     }
 }
 
+/// E0-only teardown: actual reader completion through the sole P1 event waiter.
+#[cfg(test)]
+pub(crate) fn p1_e0_stop_daemon(daemon: &Arc<Daemon>) {
+    let sdir = state_dir(&daemon.socket_path);
+    let intact_at_entry = sdir.exists() && sdir.join("operator.token").exists();
+    let fault_injected = should_quiet_expected_persist_fail()
+        || sdir.join("queue-expired.json").is_dir()
+        || sdir.join("queue-state.json").is_dir()
+        || crate::delivery::ledger_path(&daemon.socket_path).is_dir();
+    let expected_strong = 1 + usize::from(daemon.activity.running.load(Ordering::Acquire));
+
+    let surfaces: Vec<Arc<Surface>> = daemon
+        .surfaces
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .cloned()
+        .collect();
+    let created: Vec<(u64, u32)> = daemon
+        .bus
+        .replay_after(0)
+        .into_iter()
+        .filter(|e| e.get("name").and_then(|v| v.as_str()) == Some("surface.created"))
+        .filter_map(|e| {
+            let sid = e.get("surface_id").and_then(|v| v.as_u64())?;
+            let pid = e
+                .get("payload")
+                .and_then(|p| p.get("pid"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
+            Some((sid, pid))
+        })
+        .collect();
+
+    // create_surface returned only after its reader was spawned; registration and completed ACK share one mutex.
+    let readers: Vec<_> = daemon.test_created.lock().unwrap_or_else(|e| e.into_inner())
+        .iter().filter_map(std::sync::Weak::upgrade).collect();
+    let completions: Vec<_> = readers.iter().map(|surface| {
+        crate::agent_queue_tests::p1_start_completion("E0 reader released daemon", |sender| {
+            surface.p1_e0_subscribe_reader_completion(sender)
+        })
+    }).collect();
+
+    for s in &surfaces {
+        #[cfg(unix)]
+        if s.pid > 1 && s.pid != std::process::id() {
+            unsafe {
+                let pgid = libc::getpgid(s.pid as libc::pid_t);
+                if pgid == s.pid as libc::pid_t {
+                    let _ = libc::kill(-pgid, libc::SIGKILL);
+                }
+            }
+        }
+        let mut child = s.child.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    #[cfg(unix)]
+    for &(sid, pid) in &created {
+        if !surfaces.iter().any(|s| s.id == sid) && pid > 1 && pid != std::process::id() {
+            unsafe {
+                let pgid = libc::getpgid(pid as libc::pid_t);
+                if pgid == pid as libc::pid_t {
+                    let _ = libc::kill(-pgid, libc::SIGKILL);
+                } else {
+                    let _ = libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    // ★(0.14.53 · U229 · 계약 C-4 의 O-2) `created` 수집(위) **뒤**, 대기 **앞**, `panicking` 가드 **앞**이 이 자리다.
+    //   ⓐ 수집이 먼저이므로 "단언 대상인데 해제되지 않은 좌석"이 생길 수 없고(등재 ⊇ 버스),
+    //   ⓑ 가드보다 앞이므로 패닉 중 `Drop` 에서도 해제만 하고 단언은 그대로 건너뛴다,
+    //   ⓒ unix 에서는 `cfg!(windows)` 가 거짓이라 **무동작**이다(이 함수의 유닉스 결정론은 종전 그대로 자식 종료가 만든다).
+    let _ = test_drain_created_and_release(daemon, cfg!(windows));
+
+    for completion in completions {
+        crate::agent_queue_tests::p1_wait_completion(completion, std::time::Duration::from_secs(120))
+            .expect("E0 reader released daemon completion");
+    }
+    // No best-effort transcript-file sleep: closing recall_tx retains the original stop signal.
+    *daemon.recall_tx.lock().unwrap_or_else(|e| e.into_inner()) = std::sync::mpsc::channel().0;
+
+    if std::thread::panicking() {
+        return;
+    }
+
+    let exited_ids: std::collections::HashSet<u64> = daemon
+        .bus
+        .replay_after(0)
+        .into_iter()
+        .filter(|e| e.get("name").and_then(|v| v.as_str()) == Some("surface.exited"))
+        .filter_map(|e| e.get("surface_id").and_then(|v| v.as_u64()))
+        .collect();
+    for (sid, _) in &created {
+        assert!(
+            exited_ids.contains(sid),
+            "test_stop_daemon: surface {sid} reader 스레드가 surface.exited 를 발행하기 전에 시한을 넘겼다"
+        );
+    }
+    for s in &surfaces {
+        assert!(
+            s.exited.load(Ordering::Acquire)
+                && s.exited_at.lock().unwrap_or_else(|e| e.into_inner()).is_some(),
+            "test_stop_daemon: surface {} exited/exited_at 표식이 서지 않았다",
+            s.id
+        );
+    }
+    assert_eq!(
+        Arc::strong_count(daemon),
+        expected_strong,
+        "test_stop_daemon: 데몬 Arc 강한 참조가 {expected_strong} 이 아니다 — 배경 스레드가 아직 살아 있다"
+    );
+    let persist_failures: Vec<Value> = daemon
+        .bus
+        .replay_after(0)
+        .into_iter()
+        .filter(|e| e.get("name").and_then(|v| v.as_str()) == Some("queue.persist_failed"))
+        .collect();
+    let intact_at_exit = sdir.exists() && sdir.join("operator.token").exists();
+    assert!(
+        intact_at_entry && intact_at_exit,
+        "test_stop_daemon: 배경 스레드를 멈추기 전에 상태 디렉터리({})를 먼저 지웠다(intact_entry={}, intact_exit={}, persist_failed={})",
+        sdir.display(),
+        intact_at_entry,
+        intact_at_exit,
+        persist_failures.len()
+    );
+    if !fault_injected {
+        assert!(
+            persist_failures.is_empty() && daemon.queue_wal_durable(),
+            "test_stop_daemon: 배경 스레드 정리 중 큐 영속 실패가 발생했다: {persist_failures:?}"
+        );
+    }
+}
+
 /// 영속 상태 디렉터리 — 소켓과 같은 곳 (unix). Windows는 LOCALAPPDATA 하위.
 /// RC-13: Windows에서 부서 데몬마다 pipe명 슬러그로 **고유 디렉토리**를 파생해 transcripts.db·feed.jsonl
 /// 격리를 보장한다(구: 모든 부서가 단일 %LOCALAPPDATA%\cys 공유 → SQLite 락 경합·부서간 오염).
@@ -6255,6 +6510,7 @@ impl Daemon {
             feed_persist_lock: Mutex::new(()),
             restored_queue: Mutex::new(restored_qentries),
             write_holds: Mutex::new(load_write_holds(&dir)),
+            pane_notice_requeue: Mutex::new(Vec::new()),
             held_bodies_restart: Mutex::new(load_held_bodies(&dir)),
             held_bodies_written: Mutex::new(None),
             restored_expired: Mutex::new(restored_expired),
@@ -6573,6 +6829,7 @@ impl Daemon {
             revived_at: None,
             expired_notified: false,
             expired_event_sent: false,
+            authoritative: false,
         }
     }
 
@@ -7288,6 +7545,7 @@ impl Daemon {
             // Unknown의 소비 규약은 "현행 동작 유지"다(§소비처: 큐=배달·승계=거부) — 판정 미도달이
             // 새로운 실패를 만들지 않는다.
             seat_cache: AtomicU8::new(0),
+            d1_platform: AtomicBool::new(crate::governance::d1_platform_measured()),
             // 신생 좌석은 미관측(false) — 첫 watchdog 틱의 엄격 관측이 확정한다(fail-closed).
             seat_agent_cache: AtomicBool::new(false),
             // ★G5-③: 확정 대기 관측은 항상 빈 채로 출발 — claim_role(windows)만이 기록한다.
@@ -7314,6 +7572,9 @@ impl Daemon {
             // ★(0.14.42 · A2) 흡수 표는 휘발 — 재기동·재생성 좌석은 빈 채로 출발(= 종전 동작).
             return_tickets: Mutex::new(HashMap::new()),
             queue_blocked: Mutex::new(None),
+            writer_holds: AtomicU64::new(0),
+            claim_refusals_total: std::array::from_fn(|_| AtomicU64::new(0)),
+            claim_streaks: Mutex::new([None, None, None]),
             line_count: AtomicU64::new(0),
             queue_paused_until: Mutex::new(None),
             // ★(0.14.31 · WP-5) 만료 큐·배달 간격 시계·stale 입력 관측 — 전부 빈 채로 출발.
@@ -7340,6 +7601,7 @@ impl Daemon {
             pack_reinject: Mutex::new(None),
             ctx_loop_guard: Mutex::new(crate::usage::clear_guard::ClearGuard::default()),
             cycle_claim: Mutex::new(None),
+            auth_born: Mutex::new(AuthBook::default()),
             // 능력 가드: 생성 시 역할에서 도출(reviewer-*=read/search, full=worker/master/cso,
             // 그 외 deny-by-default none). claim_role이 역할 전이 시 동기 재도출한다.
             caps: Mutex::new(crate::caps::Caps::for_role(role.as_deref())),
@@ -7367,6 +7629,8 @@ impl Daemon {
             gate_pending: Mutex::new(None),
             // ★(0.14.41 · U18) 생성 시 관측 1회의 결과(불변) — 위 관측 블록 참조.
             cwd_blocked,
+            #[cfg(test)]
+            p1_e0_reader_completion: Mutex::new((false, Vec::new())),
         });
 
         // ★W2a: 이 create가 실제 등록한(dedup 후) 역할 — 아래에서 묘비 해제에 쓴다.
@@ -7701,6 +7965,16 @@ impl Daemon {
                 Some(surf.id),
                 surface_exited_payload(surf.id, exited_role, exited_agent),
             );
+            #[cfg(test)]
+            {
+                // Notify only after this reader has relinquished its daemon ownership.
+                drop(daemon);
+                let mut completion = surf.p1_e0_reader_completion.lock().unwrap_or_else(|e| e.into_inner());
+                completion.0 = true;
+                for sender in completion.1.drain(..) {
+                    let _ = sender.send(());
+                }
+            }
         });
 
         Ok(surface)
@@ -8156,6 +8430,13 @@ pub(crate) fn run_writer_loop_tracked<W: Write, R: Into<crate::writer_gate::Queu
         // The lease spans every arm, flush and Agent terminal settlement, including early exits.
         let (req, _operation) = req.into().into_parts();
         let res = match req {
+            #[cfg(test)]
+            WriteReq::P1ReceiverBarrier(marker) => {
+                if writer.write_all(&marker).and_then(|_| writer.flush()).is_err() {
+                    break;
+                }
+                continue;
+            }
             WriteReq::Data(bytes) => writer.write_all(&bytes).and_then(|_| writer.flush()),
             // ★B2: 최소 간격 확보용 지연 쓰기. 단일 소비자라 이 sleep 동안 뒤 요청은 채널에
             // 머물고, 따라서 '지연된 CR 뒤에 온 바이트'가 CR 을 추월하는 일이 없다(순서 보존).
@@ -12203,6 +12484,7 @@ mod tests {
             revived_at: None,
             expired_notified: false,
             expired_event_sent: false,
+            authoritative: false,
         }
     }
 
@@ -12407,6 +12689,7 @@ mod tests {
             revived_at: None,
             expired_notified: false,
             expired_event_sent: false,
+            authoritative: false,
         }
     }
 
@@ -15326,5 +15609,30 @@ mod c8_proof_pending_v2_api_tests {
         assert_eq!(g.expect_gen, Some(4));
         assert!(!g.claim_for_write());
         assert_eq!(g.cleanup_owner(), Ok(InjectCleanupOwner::Controller));
+    }
+}
+
+#[cfg(test)]
+mod h3_gap_atomic_tests {
+    use super::*;
+
+    #[test]
+    fn h3_gap_boundary_and_completion_lock_span_handoff() {
+        let track = InjectTrack::default();
+        let done = Instant::now();
+        *track.done_at.lock().unwrap() = Some(done);
+        let gap = std::time::Duration::from_millis(1000);
+        for elapsed in [std::time::Duration::ZERO, gap - std::time::Duration::from_nanos(1), gap] {
+            *track.gap_test_now.lock().unwrap() = Some(done + elapsed);
+            let result = track.handoff_after_gap(gap, || {
+                assert!(track.done_at.try_lock().is_err(), "H3_ATOMIC: completion lock must span actual admission");
+                // No exclusive writer transition: normal raw admissions remain available inside the gap decision.
+                let (sender, receiver) = crate::writer_gate::WriterSender::channel(1);
+                assert!(sender.try_send(WriteReq::Data(vec![b'x'])).is_ok());
+                assert!(receiver.try_recv().is_ok());
+                1
+            });
+            assert_eq!(result, (elapsed >= gap).then_some(1), "exact product1000ms boundary");
+        }
     }
 }

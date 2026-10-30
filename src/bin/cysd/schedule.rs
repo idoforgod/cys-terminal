@@ -2083,6 +2083,9 @@ fn deliver_push_with(
         //     스스로 비우지 않아, 우회하면 푸는 주체 없이 heartbeat·wakeup 이 무기한 침묵한다.
         //   · fresh 잡은 pause 재확인과 기존 모달만 본다(새 축 없음 · 회수 타이머 의미 무변경).
         //   노브(`CYS_MACHINE_INJECT_HOLD` 에서 schedule 제외)면 종전 U8 P1 과 byte-identical 이다(상한 100 · TTL 없음).
+        // ★(0.14.56 · P1 D9 §5-7 · D3-BOUND r2 §1.2) the claim guard and its baseline S0, BEFORE the judgment; handed to
+        //   `inject_on` (its one production caller is below).
+        let d9 = crate::governance::D9WriterGuard::for_target(daemon, &surface);
         if crate::governance::machine_hold_enabled(crate::governance::MachineInjector::Schedule) {
             use crate::governance::MachineHold as H;
             let hold = crate::governance::machine_direct_hold(daemon, &surface, schedule_hold_axes(job.fresh));
@@ -2098,12 +2101,16 @@ fn deliver_push_with(
                 Some(H::Paused) => return Err(SCHEDULE_FROZEN_ERR.to_string()),
                 // ★(R3SH-1) 입증 못 한 기계 모양 초안 위에서 연속 우회 상한을 넘겼다 — 종전(pre-H) 직접 주입(유계 폴백).
                 Some(H::Draft) if draft_step == Some(DraftStep::Fallback) => {}
-                Some(h @ (H::Modal | H::Quiescing | H::HumanActive | H::Draft)) => {
+                Some(h @ (H::Modal | H::Quiescing | H::Authoritative | H::HumanActive | H::Draft)) => {
+                    // ★(0.14.56 · PKG1-M1 · head check condition 3) no wildcard arm: a new MachineHold variant must be routed here
+                    //   on purpose (the arm that existed until 77f66491 was `_ => "queued(gate:draft)"`).
                     let label = match h {
                         H::Modal => "queued(modal)",
                         H::Quiescing => "queued(gate:quiescing)",
+                        H::Authoritative => "queued(gate:authoritative)",
                         H::HumanActive => "queued(gate:human)",
-                        _ => "queued(gate:draft)",
+                        H::Draft => "queued(gate:draft)",
+                        H::Paused | H::ShellOnly | H::ProbeFailed => unreachable!("bound by the arm pattern above"),
                     };
                     let enqueued = enqueue_schedule_divert(
                         daemon,
@@ -2135,7 +2142,7 @@ fn deliver_push_with(
                 crate::alert_route::RoleGuard::Prefix(p) => (p.to_string(), true),
             }),
         };
-        *handed = Some(inject_on(daemon, &surface, text, Some(origin))?);
+        *handed = Some(inject_on(daemon, &surface, text, Some(origin), d9)?);
         return Ok("pushed");
     }
     enqueue_schedule_push(daemon, job, sid, text, role_guard, SCHEDULE_QUEUE_CAP, None).map(|_| "queued")
@@ -2145,12 +2152,15 @@ fn deliver_push_with(
 /// (`CYS_QUEUE_HUMAN_QUIET_SECS` · 기본 30s). fresh 잡은 pause·모달만(갓 띄운 좌석 · 새 축 없음).
 fn schedule_hold_axes(fresh: bool) -> crate::governance::MachineHoldAxes {
     use crate::governance::MachineHoldAxes;
+    // ★(0.14.56 · PKG1-M1 · design sec 3.5 W-8) `authoritative` for fresh and non-fresh jobs alike: a push into a seat whose
+    //   queue holds the cycle's converted [RESUME] is diverted into that queue, FIFO behind the job.
     if fresh {
-        return MachineHoldAxes { pause: true, modal: true, ..MachineHoldAxes::NONE };
+        return MachineHoldAxes { pause: true, authoritative: true, modal: true, ..MachineHoldAxes::NONE };
     }
     MachineHoldAxes {
         pause: true,
         quiescing: true,
+        authoritative: true,
         human: true,
         modal: true,
         draft: true,
@@ -2534,6 +2544,7 @@ fn inject_on(
     surface: &Arc<crate::state::Surface>,
     text: &str,
     origin: Option<PushOrigin>,
+    d9: Option<crate::governance::D9WriterGuard>,
 ) -> Result<PushHandle, String> {
     let sid = surface.id;
     // ★(0.14.42 · 설계 C D3) 잡 문안은 사용자 입력이다 — 원장 선기록 앞에서 살균해 원장과 주입 본문을 맞춘다
@@ -2583,7 +2594,7 @@ fn inject_on(
         journal: Some(journal),
         resume: None,
         settle: Some(Box::new(move |t: &crate::agent_write::Terminal| settle.run(t))),
-        guard: None,      // 스케줄 push 는 큐를 우회한다(§8) — 가드 대상 아님
+        guard: d9.as_ref().map(|g| g.guard()), // ★(0.14.56 · P1 D9 §5-7) in D9 scope the claim check; outside it none (the pin)
         note_body: true,  // the old Inject arm recorded every pushed body (owner None)
         body_owner: None,
     };
@@ -3176,7 +3187,7 @@ mod tests {
             .expect("surface");
         daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
         let raw = "[wakeup] 착수\x1b[201~\n탈출 명령";
-        inject_on(&daemon, &s, raw, None).expect("주입 인계");
+        inject_on(&daemon, &s, raw, None, None).expect("주입 인계");
         let _ = s.child.lock().unwrap().kill();
         let clean = cys::paste_fence::sanitize(raw).into_owned();
         assert_ne!(clean, raw, "전제: 원문에 표지가 있다");
@@ -5435,12 +5446,19 @@ mod h2_schedule_hold_tests {
     use std::sync::atomic::Ordering;
 
     fn rig(tag: &str) -> (Arc<Daemon>, Arc<crate::state::Surface>) {
+        rig_role(tag, "master")
+    }
+
+    /// ★(0.14.56 · P1 · head ruling on Q-suites-17-pins 5fffe0d9) The residue cells sit on a NON-master claude seat: on a
+    /// master/CEO, D9 turns an off-seat non-owner send into one queue job, so the residue they study cannot arise there
+    /// (`h2_d9_master_off_seat_send_leaves_no_residue` shows that form).
+    fn rig_role(tag: &str, role: &str) -> (Arc<Daemon>, Arc<crate::state::Surface>) {
         crate::delivery::tests::isolate_state_dir_for_thread(tag);
         let daemon = super::tests::test_daemon();
         let s = daemon
-            .create_surface(None, Some("sleep 30".into()), None, Some("master".into()), 24, 80)
+            .create_surface(None, Some("sleep 30".into()), None, Some(role.into()), 24, 80)
             .expect("좌석");
-        daemon.roles.lock().unwrap().insert("master".into(), s.id);
+        daemon.roles.lock().unwrap().insert(role.into(), s.id);
         daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
         *s.agent_meta.lock().unwrap() = Some(("claude".into(), "/usr/local/bin/claude".into()));
         std::thread::sleep(std::time::Duration::from_millis(300));
@@ -5609,7 +5627,8 @@ mod h2_schedule_hold_tests {
     #[cfg_attr(not(unix), ignore = "윈도우 기본 H 마스크는 draft 축을 끈다(hold_axes_default(true)) — 이 검체는 유닉스 기본(draft 축) 동작을 본다")]
     fn h2_cross_socket_residue_stays_direct() {
         let pack = crate::governance::HOutsidePack::new(); // 좌석보다 먼저(락 대기 중 좌석 만료 방지)
-        let (d, s) = rig("h2-xsock");
+        // Intent kept: an off-seat sender's residue never diverts the push to the queue (fatal risk 3) - on a worker seat (head 5fffe0d9).
+        let (d, s) = rig_role("h2-xsock", "worker-1");
         let tok = d.operator_token.clone().expect("데몬 토큰");
         let j = periodic("heartbeat-5m", 5);
         let leave = |body: &str, extra: serde_json::Value| {
@@ -5648,6 +5667,37 @@ mod h2_schedule_hold_tests {
         d.bus.tail(5000).into_iter().filter(|e| e["name"] == name).collect()
     }
 
+    /// ★(0.14.56 · P1 D9 · head ruling on Q-suites-17-pins 5fffe0d9) The master form of the residue cells: an off-seat non-owner
+    /// send into a master is ONE queue job at receipt (nothing typed, so no residue exists for a push to merge or divert over),
+    /// and a bare Return from a caller holding no ticket is refused with 0 bytes.
+    #[test]
+    fn h2_d9_master_off_seat_send_leaves_no_residue() {
+        let _pack = crate::governance::HOutsidePack::new(); // as the other residue cells: before the seat
+        let (d, s) = rig("h2-d9-master");
+        h_paint(&s, H_IDLE_SCREEN);
+        let g0 = s.input_gen.load(Ordering::Acquire);
+        let params = json!({"surface_id": s.id, "text": "XSOCK-master residue", "queued": false, "quiet": true, "from": 900});
+        let r = match crate::handlers::dispatch(&d, cys::Request { id: json!(1), method: "surface.send_text".into(), params }, Some(std::process::id())) {
+            crate::handlers::Reply::Single(v) => v,
+            _ => panic!("single reply"),
+        };
+        assert_eq!(r["result"]["converted"], json!("one_job"), "the off-seat send is one queue job: {r}");
+        assert_eq!(queue(&s).len(), 1, "one item: body + its own submit");
+        assert_eq!(s.input_gen.load(Ordering::Acquire), g0, "nothing typed at receipt - no residue");
+        assert_eq!(s.pending_input_bytes.load(Ordering::Relaxed), 0);
+        let k = match crate::handlers::dispatch(
+            &d,
+            cys::Request { id: json!(2), method: "surface.send_key".into(), params: json!({"surface_id": s.id, "key": "Return"}) },
+            None,
+        ) {
+            crate::handlers::Reply::Single(v) => v,
+            _ => panic!("single reply"),
+        };
+        assert_eq!(k["error"]["code"], json!("composer_key_denied"), "a bare Return with no ticket is refused: {k}");
+        assert_eq!(s.input_gen.load(Ordering::Acquire), g0, "0 bytes");
+        done(&s);
+    }
+
     /// ★(R3SH-1 · S1 모양) 기계가 본문과 **CR 까지** 보냈는데 TUI 가 그 Return 을 먹어 입력줄에 잔여가 남았다 — CR 이
     /// 계수·세대를 되돌려 owner 각인이 결측이 된 상태다. 그래도 H2 는 큐로 우회하지 않고 종전(pre-H)처럼 직접 주입해 잔여를
     /// 병합 제출한다(마지막 기계 본문의 꼬리로 입력줄이 완전히 설명됨 ∧ 그 뒤 사람 입력 없음 ∧ 사람 바이트 0).
@@ -5657,7 +5707,8 @@ mod h2_schedule_hold_tests {
     #[cfg_attr(not(unix), ignore = "윈도우 기본 H 마스크는 draft 축을 끈다(hold_axes_default(true)) — 이 검체는 유닉스 기본(draft 축) 동작을 본다")]
     fn h2_swallowed_return_residue_stays_direct() {
         let pack = crate::governance::HOutsidePack::new();
-        let (d, s) = rig("h2-swallowed");
+        // Intent kept: a swallowed-Return machine residue is merged by the direct push, not queued forever - on a worker seat (head 5fffe0d9).
+        let (d, s) = rig_role("h2-swallowed", "worker-1");
         let body = "WORKER-REPORT swallowed-return body";
         h_paint(&s, H_IDLE_SCREEN);
         crate::governance::h_send_outside(&pack, &d, s.id, body, json!({}));
@@ -5860,7 +5911,9 @@ mod h2_schedule_hold_tests {
     #[test]
     fn h2_fallback_headroom_keeps_cli_room() {
         let _g = crate::governance::PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (d, s) = rig("h2-headroom");
+        // Intent kept: the 50-item divert cap leaves room for CLI --queued text and Return - on a worker seat, where a bare queued
+        // Return is not a D9 refusal (head 5fffe0d9).
+        let (d, s) = rig_role("h2-headroom", "worker-1");
         h_paint(&s, cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT);
         for i in 0..50 {
             let j = periodic(&format!("hb-{i}"), 5);
@@ -6332,7 +6385,7 @@ mod c8_push_counts_submit_tests {
         let pusher = std::thread::spawn(move || {
             // 원장 선기록은 스레드 로컬 격리 상태 디렉터리를 쓴다 — 이 스레드도 새 격리를 쥔다.
             crate::delivery::tests::isolate_state_dir_for_thread("c8-gate-wait-pusher");
-            inject_on(&d2, &s2, "[heartbeat] 게이트 대기", None)
+            inject_on(&d2, &s2, "[heartbeat] 게이트 대기", None, None)
         });
         std::thread::sleep(std::time::Duration::from_millis(400));
         assert!(!pusher.is_finished(), "게이트를 쥔 동안 push 가 지나갔다 — 인계·계상이 임계영역 밖이다");
@@ -6408,7 +6461,7 @@ mod c8_push_counts_submit_tests {
         // 호출부: 판정(H0) 뒤에 인계 · 이벤트는 정산이 낸다.
         let dp = func("\nfn deliver_push_with(");
         assert!(
-            dp.find("machine_direct_hold(").expect("H0 판정") < dp.find("inject_on(daemon, &surface, text, Some(origin))?").expect("인계 호출"),
+            dp.find("machine_direct_hold(").expect("H0 판정") < dp.find("inject_on(daemon, &surface, text, Some(origin), d9)?").expect("인계 호출"),
             "판정이 인계 뒤로 갔다"
         );
         assert!(!dp.contains("note_push_cleared_pending("), "계상 이벤트가 인계 시점에 다시 났다");
@@ -7633,5 +7686,223 @@ mod s_a_push_tests {
         assert!(events(&d, "schedule.push_cleared_pending").is_empty());
         crate::agent_write::set_test_sync_settle(true);
         done(&s);
+    }
+}
+
+/// ★(0.14.56 · P1 D9 pre-CR · design r3 §5-7, §12 T-W4) W-8: the schedule push into a master/CEO seat gets the claim check.
+#[cfg(test)]
+mod d9_writer_guard_tests {
+    use super::tests::test_daemon;
+    use super::*;
+    use crate::agent_queue_tests::{d9_received, d9_role_recorder, d9_with_write_ahead, wait_until};
+
+    /// T-W4 / W-8: a write lands between the push's hand-off and its claim -> the claim refuses, 0 bytes of the push, and the
+    /// push settles through its own zero-byte path (`schedule.push_refused`, reason `guard_aborted`; no job -> not diverted).
+    /// With no foreign write the push's bytes are the pin's exactly. Mutant: the push keeps `guard: None`.
+    #[test]
+    #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+    fn d9_pre_cr_t_w4_schedule_push_refused_at_claim_writes_nothing() {
+        crate::delivery::tests::isolate_state_dir_for_thread("d9-tw4-sched");
+        let daemon = test_daemon();
+        let dir = daemon.socket_path.parent().expect("daemon dir").to_path_buf();
+        let (s, out) = d9_role_recorder(&daemon, &dir, "tw4-sched", "master");
+        let h = d9_with_write_ahead(&s, || inject_on(&daemon, &s, "[wakeup] tw4", None, crate::governance::D9WriterGuard::for_target(&daemon, &s)).expect("handed off"));
+        wait_until("the push settled", || h.outcome.lock().unwrap().is_some());
+        assert_eq!(d9_received(&out, 1), b"T".to_vec(), "0 bytes of the push - only the write ahead");
+        let got = h.outcome.lock().unwrap().clone();
+        assert!(matches!(&got, Some(PushOutcome::Refused(r)) if r.starts_with("guard_aborted")), "{got:?}");
+        let refused: Vec<_> = daemon.bus.tail(400).into_iter().filter(|e| e["name"] == "schedule.push_refused").collect();
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(refused[0]["payload"]["reason"], serde_json::json!("guard_aborted"), "{refused:?}");
+        // No foreign write: the pin's bytes, written and submitted.
+        let h2 = inject_on(&daemon, &s, "[wakeup] tw4b", None, crate::governance::D9WriterGuard::for_target(&daemon, &s)).expect("handed off");
+        wait_until("the second push settled", || h2.outcome.lock().unwrap().is_some());
+        let mut want = b"T".to_vec();
+        want.extend(crate::agent_write::Plan::paste("[wakeup] tw4b").with_submit(500, 0).planned_bytes());
+        let got_bytes = d9_received(&out, want.len());
+        let _ = s.child.lock().unwrap().kill();
+        assert_eq!(got_bytes, want, "the pin's bytes after the refused push");
+        assert_eq!(h2.outcome.lock().unwrap().clone(), Some(PushOutcome::Written));
+    }
+
+    #[test]
+    #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+    fn d9_bound_i2_schedule_diversion_delivers_at_first_idle_queue_pass() {
+        let f = crate::agent_queue_tests::fx("i2-w8");
+        let daemon = &f.daemon;
+        let (s, out) = d9_role_recorder(daemon, &f.dir, "i2-w8", "master");
+        let job: Job = serde_json::from_value(json!({"id":"i2-w8", "action":"push", "to":"master", "every_minutes":60})).unwrap();
+        let h = d9_with_write_ahead(&s, || inject_on(daemon, &s, "i2-w8", Some(PushOrigin { job, role: Some(("master".into(), false)) }), crate::governance::D9WriterGuard::for_target(daemon, &s)).unwrap());
+        wait_until("push settled", || h.outcome.lock().unwrap().is_some());
+        assert_eq!(*h.outcome.lock().unwrap(), Some(PushOutcome::Diverted));
+        let held = crate::agent_queue_tests::hold_writer(&s);
+        let before = crate::governance::h_ledger_count(daemon, "queue");
+        crate::governance::deliver_head_locked(daemon, &s, true, false, None, None, None, None, None);
+        assert_eq!(crate::governance::h_ledger_count(daemon, "queue"), before, "S-W8: diverted queue item holds before pre-record");
+        held.send(()).unwrap();
+        wait_until("idle", || s.write_tx.gate().pending() == 0);
+        assert!(crate::governance::deliver_head_locked(daemon, &s, true, false, None, None, None, None, None).is_some(), "S-W8: first idle pass delivers");
+        wait_until("queue empty", || s.pending_queue.lock().unwrap().is_empty());
+        let bytes = d9_received(&out, 2);
+        assert_eq!(bytes.iter().filter(|&&b| b == b'\r').count(), 1, "S-W8: exactly one Return");
+        let refused: Vec<_> = daemon.bus.tail(400).into_iter().filter(|e| e["name"] == "schedule.push_refused").collect();
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0]["payload"]["diverted"], json!(true));
+    }
+
+    /// T-S0 / W-8 (D3-BOUND r2 §1.5): S0 taken where `deliver_push_with` takes it (before its judgment - pinned in governance
+    /// h7), then a foreign write admitted after the push's ledger pre-record and FINISHED before its hand-off -> the claim
+    /// refuses: 0 bytes of the push, outcome `guard_aborted`.
+    #[test]
+    #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+    fn d9_bound_t_s0_schedule_push_refused_after_a_write_finished_inside_the_window() {
+        crate::delivery::tests::isolate_state_dir_for_thread("d9-ts0-sched");
+        let daemon = test_daemon();
+        let dir = daemon.socket_path.parent().expect("daemon dir").to_path_buf();
+        let (s, out) = d9_role_recorder(&daemon, &dir, "ts0-sched", "master");
+        let d9 = crate::governance::D9WriterGuard::for_target(&daemon, &s);
+        crate::agent_queue_tests::d9_s0_foreign_write_after_pre_record(&s, b"F");
+        let h = inject_on(&daemon, &s, "[wakeup] ts0", None, d9).expect("handed off");
+        wait_until("the push settled", || h.outcome.lock().unwrap().is_some());
+        let _ = s.child.lock().unwrap().kill();
+        assert_eq!(d9_received(&out, 1), b"F".to_vec(), "0 bytes of the push - only the foreign write");
+        let got = h.outcome.lock().unwrap().clone();
+        assert!(matches!(&got, Some(PushOutcome::Refused(r)) if r.starts_with("guard_aborted")), "{got:?}");
+    }
+
+    /// T-W4 scope control: the same write ahead on a schedule push into a role-less agent seat (outside D9 scope) - no guard,
+    /// as at the pin: the push is written after the foreign write. Mutant: guard every target.
+    #[test]
+    #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+    fn d9_pre_cr_t_w4c_outside_d9_scope_the_push_has_no_guard() {
+        crate::delivery::tests::isolate_state_dir_for_thread("d9-tw4c-sched");
+        let daemon = test_daemon();
+        let dir = daemon.socket_path.parent().expect("daemon dir").to_path_buf();
+        let (s, out) = d9_role_recorder(&daemon, &dir, "tw4c-sched", "master");
+        daemon.roles.lock().unwrap().remove("master");
+        assert!(!crate::governance::d9_scope(&daemon, &s, false), "premise: outside D9 scope");
+        let h = d9_with_write_ahead(&s, || inject_on(&daemon, &s, "[wakeup] tw4c", None, crate::governance::D9WriterGuard::for_target(&daemon, &s)).expect("handed off"));
+        let mut want = b"T".to_vec();
+        want.extend(crate::agent_write::Plan::paste("[wakeup] tw4c").with_submit(500, 0).planned_bytes());
+        let got = d9_received(&out, want.len());
+        wait_until("the push settled", || h.outcome.lock().unwrap().is_some());
+        let _ = s.child.lock().unwrap().kill();
+        assert_eq!(got, want, "the pin: written after the foreign write");
+        assert_eq!(h.outcome.lock().unwrap().clone(), Some(PushOutcome::Written));
+    }
+}
+
+/// ★(0.14.56 · PKG1-M1 · DESIGN-ADDENDUM-PKG1-M1.md sec 5; head ruling HEAD-RULING-PKG1-R1.md sec 2) After a master/CEO cycle the
+/// converted authoritative job ([RESUME]) is the FIRST machine input: a schedule push issued between quiesce-off and the queue tick
+/// waits behind it and is still delivered without a human (S1, S6). The hold is bounded: once the oldest authoritative entry has
+/// waited the quiesce hold (600 s), pushes take their old path and ONE `queue.authoritative_hold_lapsed` names it (S5 - the jam case,
+/// S5b). The age is the daemon's monotonic insertion age, not the wall clock (S7).
+#[cfg(test)]
+mod pkg1_auth_hold_tests {
+    use super::*;
+    use crate::agent_queue_tests::{
+        d9_received, d9_role_recorder, fx, pkg1_at, pkg1_authoritative_job, pkg1_drain, pkg1_lapse_events, pkg1_raw_authoritative,
+    };
+
+    fn push_job(id: &str) -> Job {
+        serde_json::from_value(json!({"id": id, "action": "push", "to": "master", "every_minutes": 60})).unwrap()
+    }
+
+    fn quiescing(s: &crate::state::Surface) {
+        *s.agent_status.lock().unwrap() = Some(crate::state::AgentStatus {
+            state: "quiescing".into(),
+            context_pct: None,
+            task: None,
+            updated_at: now_epoch(),
+        });
+    }
+
+    /// S1 (the reviewer's specimen) + S6 (queue pair): quiesce on -> the step-7 reinject is converted into one authoritative job ->
+    /// quiesce off -> a schedule push BEFORE the tick -> the tick. The [RESUME] bytes precede the push bytes; no runaway (one job for
+    /// the inject, one queue item for the held push, one Return each); no block (the held push is delivered by the next tick, no
+    /// human key, the queue ends empty). RED (77f66491): the push is typed directly, ahead of the [RESUME].
+    #[test]
+    #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+    fn pkg1_s1_schedule_push_after_quiesce_off_waits_behind_the_resume() {
+        let f = fx("pkg1-s1");
+        let daemon = &f.daemon;
+        let (s, out) = d9_role_recorder(daemon, &f.dir, "pkg1-s1", "master");
+        quiescing(&s);
+        let resume = pkg1_authoritative_job(daemon, &s, "[RESUME] pkg1-s1");
+        assert!(crate::governance::release_quiescing(daemon, &s, "pkg1-test"), "premise: quiescing was on");
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "no runaway: one queue job for one inject");
+        let how = deliver_push(daemon, &push_job("pkg1-s1"), s.id, "[wakeup] pkg1-s1", None);
+        assert_eq!(how, Ok("queued(gate:authoritative)"), "the push must wait behind the queued [RESUME]");
+        let ids: Vec<String> = s.pending_queue.lock().unwrap().iter().map(|e| e.id.clone()).collect();
+        assert_eq!(ids.len(), 2, "no runaway: exactly one queue item for the held push: {ids:?}");
+        assert_eq!(ids[0], resume, "the [RESUME] stays the head");
+        pkg1_drain(daemon, &s, 4);
+        let story = crate::agent_queue_tests::pkg1_queue_story(daemon, &s);
+        assert!(s.pending_queue.lock().unwrap().is_empty(), "no block: the held push was delivered without a human: {story}");
+        let bytes = d9_received(&out, 2);
+        let _ = s.child.lock().unwrap().kill();
+        let (r, p) = (pkg1_at(&bytes, "[RESUME] pkg1-s1"), pkg1_at(&bytes, "[wakeup] pkg1-s1"));
+        assert!(r.is_some() && p.is_some(), "both bodies reached the receiver: {}", String::from_utf8_lossy(&bytes));
+        assert!(r < p, "the [RESUME] must be the first machine input: {}", String::from_utf8_lossy(&bytes));
+        assert_eq!(bytes.iter().filter(|&&b| b == b'\r').count(), 2, "one Return per body, no retry");
+    }
+
+    /// S5 + the jam case (head check condition 2): the authoritative entry cannot be delivered (no tick ever writes it) and its age
+    /// is past the bound (a WAL-restored entry: wall-clock age 700 s >= 600 s). Pushes take their old path (written directly) and
+    /// exactly ONE lapse event names the entry, with `clock: wall`. RED (77f66491): no lapse event.
+    #[test]
+    #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+    fn pkg1_s5_jammed_job_lapses_after_the_bound_with_one_event() {
+        let f = fx("pkg1-s5");
+        let daemon = &f.daemon;
+        let (s, out) = d9_role_recorder(daemon, &f.dir, "pkg1-s5", "master");
+        let jammed = pkg1_raw_authoritative(daemon, &s, "[RESUME] pkg1-s5", 700.0);
+        assert_eq!(deliver_push(daemon, &push_job("pkg1-s5a"), s.id, "[wakeup] pkg1-s5a", None), Ok("pushed"));
+        assert_eq!(deliver_push(daemon, &push_job("pkg1-s5b"), s.id, "[wakeup] pkg1-s5b", None), Ok("pushed"));
+        let bytes = d9_received(&out, 2);
+        let queued = s.pending_queue.lock().unwrap().len(); // read before the kill: a seat exit disposes its queue
+        let story = crate::agent_queue_tests::pkg1_queue_story(daemon, &s);
+        let _ = s.child.lock().unwrap().kill();
+        assert!(pkg1_at(&bytes, "[wakeup] pkg1-s5b").is_some(), "the producers resumed by their old path");
+        let ev = pkg1_lapse_events(daemon, s.id);
+        assert_eq!(ev.len(), 1, "exactly one lapse event per entry: {ev:?}");
+        assert_eq!(ev[0]["payload"]["queue_entry_id"], json!(jammed), "{ev:?}");
+        assert_eq!(ev[0]["payload"]["clock"], json!("wall"), "a restored entry has no monotonic record: {ev:?}");
+        assert_eq!(queued, 1, "the jammed job is not dropped by the lapse: {story}");
+    }
+
+    /// S5b: the OLDEST authoritative entry governs - a jammed old job (wall age 700 s) with a fresh step-7 job behind it still
+    /// lapses, so repeated cycles cannot extend the hold forever. RED (77f66491): no lapse event.
+    #[test]
+    #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+    fn pkg1_s5b_the_oldest_authoritative_entry_governs_the_bound() {
+        let f = fx("pkg1-s5b");
+        let daemon = &f.daemon;
+        let (s, _out) = d9_role_recorder(daemon, &f.dir, "pkg1-s5b", "master");
+        let old = pkg1_raw_authoritative(daemon, &s, "[RESUME] pkg1-s5b old", 700.0);
+        let _fresh = pkg1_authoritative_job(daemon, &s, "[RESUME] pkg1-s5b fresh");
+        assert_eq!(deliver_push(daemon, &push_job("pkg1-s5b"), s.id, "[wakeup] pkg1-s5b", None), Ok("pushed"));
+        let _ = s.child.lock().unwrap().kill();
+        let ev = pkg1_lapse_events(daemon, s.id);
+        assert_eq!(ev.len(), 1, "{ev:?}");
+        assert_eq!(ev[0]["payload"]["queue_entry_id"], json!(old), "the oldest entry is the one that lapsed: {ev:?}");
+    }
+
+    /// S7: the hold's age is the daemon's MONOTONIC insertion age. A step-7 job whose wall-clock `enqueued_at` reads 5,000 s old
+    /// (a sleep or a clock jump) but which was inserted a moment ago still holds the push, and no lapse event fires.
+    /// RED (77f66491): the push is typed directly.
+    #[test]
+    #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+    fn pkg1_s7_the_monotonic_insertion_age_governs_not_the_wall_clock() {
+        let f = fx("pkg1-s7");
+        let daemon = &f.daemon;
+        let (s, _out) = d9_role_recorder(daemon, &f.dir, "pkg1-s7", "master");
+        let id = pkg1_authoritative_job(daemon, &s, "[RESUME] pkg1-s7");
+        for e in s.pending_queue.lock().unwrap().iter_mut().filter(|e| e.id == id) {
+            e.enqueued_at -= 5000.0;
+        }
+        assert_eq!(deliver_push(daemon, &push_job("pkg1-s7"), s.id, "[wakeup] pkg1-s7", None), Ok("queued(gate:authoritative)"));
+        let _ = s.child.lock().unwrap().kill();
+        assert!(pkg1_lapse_events(daemon, s.id).is_empty(), "a wall-clock jump must not lapse the hold");
     }
 }

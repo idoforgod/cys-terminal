@@ -126,6 +126,9 @@ enum Command {
         /// Queue the key for quiet-time delivery (Return/Enter only) — typing-guard safe
         #[arg(long)]
         queued: bool,
+        /// Bind one modal key to output_gen from read-screen --composer; never queue a stale frame
+        #[arg(long, conflicts_with = "queued")]
+        expect_output_gen: Option<u64>,
         #[arg(required = true)]
         keys: Vec<String>,
     },
@@ -221,7 +224,7 @@ enum Command {
     /// 대상 턴 종료·빈 composer 확인→입력버퍼 정리+clear→clear 실효 확인→디렉티브·재개 포인터 재주입.
     /// exit: 0=실효 확인 · 80=실효 미관측(재주입 0건) · 81=실효 측정 불능 · 82/83=검증자 충돌·미해소 ·
     /// 84=대상이 유휴가 되지 않음(clear 송신 0건) · 85=사람 초안 보호(clear 송신 0건).
-    /// 84·85 는 clear 송신 0건 비파괴 보류(원자 clear 거부는 composer 무변경 · launch-agent 미등록 좌석의 3분할 폴백에서만 C-u 1키가 선행하거나 Return 거부로 clear 본문이 composer에 남을 수 있다) — autopilot 이 쿨다운 뒤 자동 재시도한다(5단계 85 도 사이클 표지 끔에 'clear 안 됨'을 실어 그 통보가 미해결로 남는다 · 80 도 같은 결과를 실어 같은 --fire 재집행이 가능하다).
+    /// 84·85 는 clear 송신 0건 비파괴 보류(원자 clear 거부는 composer 무변경 · clear_first_unsupported = 등록 에이전트 없는 좌석은 보류가 아니라 rc 1 실패다: 송신 0건 · 재시도로 풀리지 않는다 · launch-agent 로 재등록) — autopilot 이 쿨다운 뒤 자동 재시도한다(5단계 85 도 사이클 표지 끔에 'clear 안 됨'을 실어 그 통보가 미해결로 남는다 · 80 도 같은 결과를 실어 같은 --fire 재집행이 가능하다).
     /// 86=실효 확인 뒤 재주입 보류: clear 는 이미 발효했다 — 손으로 다시 clear 하지 말고 재주입만 확인한다.
     /// 87=건너뜀(송신 0건): --fire 의 통보 뒤 그 좌석의 사이클이 이미 끝났다 — 재집행하지 않는다.
     /// 88=진행 중(송신 0건): 다른 집행자의 사이클이 진행 중이다(--fire 가 있으면 단일 전체 시한이 남기는 만큼 — 기본 --timeout 120 에서 최대 30초 — 끝나기를 기다린 뒤) — 이미 처리됨이 아니다. 턴 안에서 기다리거나 곧바로 재집행하지 말고 끝낸다: 그 사이클이 clear 전에 끝나면 데몬이 같은 통보를 한 번 재배달하고(redelivery) 그때 같은 --fire 로 다시 집행해도 된다(데몬이 판정 · 끝났으면 87).
@@ -339,6 +342,9 @@ enum Command {
         since: Option<u64>,
         #[arg(long, default_value_t = 2000)]
         max_lines: u64,
+        /// Print ONE JSON object {text, composer} (+ quiet_secs) from one daemon frame (the composer verdict is the daemon's)
+        #[arg(long, conflicts_with_all = ["lines", "since"])]
+        composer: bool,
     },
     /// Resize a surface
     Resize {
@@ -1093,12 +1099,26 @@ fn recover_refusal_from_input_guard(e: String) -> String {
             "{RECOVER_REFUSED_TOKEN} writer journal refused the recovery write (zero bytes) — no reclaim, no kill; \
              make the daemon's writer journal writable, then boot again: {e}"
         )
+    } else if is_composer_key_denied(&e) && !is_recover_refusal(&e) {
+        // ★(0.14.56 · P1 D9 · head ruling 28f2b064) a master/CEO seat refused this relauncher's boot-gate Return (zero bytes):
+        //   node-recover is not the seat's creator, and the agent is ALIVE at that gate - rc 1 would reach run_boot's reclaim.
+        format!(
+            "{RECOVER_REFUSED_TOKEN} the master/CEO composer refused this relauncher's key (zero bytes) — no reclaim, no kill; \
+             the agent is waiting at a boot gate (e.g. folder trust): answer it on that seat (a person, or the head/CEO after a \
+             screen read), then boot again: {e}"
+        )
     } else {
         // ★(B-360 R2 revise · S60) an UNKNOWN is NOT folded into the 79 token any more: node-recover exits 91 for it
         //   (distinct from REFUSED / a human draft / agent-alive), and run_boot's inverted consumer (B-406) maps 91 to
         //   the non-destructive `recover_unknown` — no reclaim, no kill, no re-send.
         e
     }
+}
+
+/// ★(0.14.56 · P1 D9) Did a master/CEO composer refuse this key or text at receipt (zero bytes typed)? Pure; the code is
+/// `cys::ERR_COMPOSER_KEY_DENIED` as `rpc_roundtrip` renders it (`<code>: <message>`).
+fn is_composer_key_denied(e: &str) -> bool {
+    e.contains(&format!("{}: ", cys::ERR_COMPOSER_KEY_DENIED))
 }
 
 /// ★(B-360) Did the daemon refuse this direct write at the writer journal (zero bytes typed)? Pure; the code is
@@ -1775,6 +1795,22 @@ const CYCLE_TARGET_BUSY_TOKEN: &str = "cycle-target-busy:";
 /// held_cooldown_secs(지수 · 300→600→1200s 상한) 뒤 자동 재시도한다 · 구조적(구 데몬
 /// quiet_secs 미보고 `[diag=…]`) 보류만 HELD_RETRY_MAX 연속 도달 시 escalation 후 정지(사람 reset).
 const CYCLE_HUMAN_DRAFT_TOKEN: &str = "cycle-human-draft:";
+/// ★(0.14.56 · PKG-2 M1) The target has no registered agent (`agent_meta` None): the daemon refuses the atomic clear as
+/// `clear_first_unsupported`, and the split fallback that used to work around it was removed on purpose (51f029a1 ·
+/// P1 E D7). No retry changes that state, so this is NOT the 84 hold - it has no exit arm and exits 1 (failure), the
+/// same code as the step-0 stop for the same condition. Automated callers never reach it (none passes `--clear-cmd`,
+/// the only way an unregistered seat gets past step 0); every one of them already reads 1 as a failure.
+const CYCLE_TARGET_UNREGISTERED_TOKEN: &str = "cycle-target-unregistered:";
+
+/// The one remedy text for a seat the daemon has no registered agent for - the step-0 stop and the refused atomic clear.
+fn unregistered_seat_remedy(role: Option<&str>) -> String {
+    format!(
+        "re-register the seat: relaunch its agent with `cys launch-agent --role {} --agent <agent>` (launch-agent registers \
+         the agent when it starts it) - --clear-cmd does not help an unregistered seat (the atomic clear is refused as \
+         clear_first_unsupported and the split fallback was removed on purpose)",
+        role.unwrap_or("<role>")
+    )
+}
 /// ★팩 `javis_cycle_autopilot.py` 의 `QUIET_UNREPORTED_DIAG` 와 같은 값이어야 한다
 /// (autopilot 이 rc84 를 '구조적(구 데몬) 보류' 로 분류하는 기계 토큰 · cargo 검체
 /// d16_held_rcs_and_diag_token_match_autopilot 가 파싱 대조).
@@ -1796,6 +1832,7 @@ enum CycleTargetState {
 
 /// 판정 입력 — 한 왕복의 관측을 그대로 담는다(합성 금지).
 struct CycleTargetObs<'a> {
+    composer: Option<&'a Value>,
     screen: Option<&'a str>,
     quiet: Option<bool>,
     /// 이 프레임에 첫기동 관문·모달이 서 있는가 — 참이면 어떤 축으로도 유휴를 선언하지 않는다.
@@ -1815,11 +1852,15 @@ struct CycleTargetObs<'a> {
 /// ANCHOR ④ pane 전멸). 실패 방향은 보류(rc 84)이고 그 귀결은 다음 사이클 재시도다.
 fn cycle_target_state(o: &CycleTargetObs<'_>) -> CycleTargetState {
     // 사람 초안은 어느 화면에서도 보류한다. 구 데몬의 사람 축 미보고도 종전처럼 보호한다.
-    if o.human_bytes.unwrap_or(0) > 0 {
+    if o.human_bytes.unwrap_or(0) > 0
+        || o.composer.and_then(|c| c["human_bytes"].as_u64()).unwrap_or(0) > 0
+    {
         return CycleTargetState::HumanDraft;
     }
-    let machine_residue = if o.pending_bytes.unwrap_or(0) > 0 {
-        if o.human_bytes.is_none() {
+    let pending = o.composer.and_then(|c| c["pending_bytes"].as_u64()).or(o.pending_bytes);
+    let human = o.composer.and_then(|c| c["human_bytes"].as_u64()).or(o.human_bytes);
+    let machine_residue = if pending.unwrap_or(0) > 0 {
+        if human.is_none() {
             return CycleTargetState::HumanDraft;
         }
         true
@@ -1831,6 +1872,29 @@ fn cycle_target_state(o: &CycleTargetObs<'_>) -> CycleTargetState {
     let Some(screen) = o.screen else {
         return CycleTargetState::Busy;
     };
+    if let Some(c) = o.composer {
+        // A present but torn export never supplies a usable observation/fence.
+        if c["output_gen"].as_u64().is_none() || c["input_gen"].as_u64().is_none() {
+            return CycleTargetState::Busy;
+        }
+        if c["owner"].as_str() == Some("own_paste") {
+            return CycleTargetState::Busy;
+        }
+        if c["modal"].as_bool() != Some(false) {
+            return CycleTargetState::Busy;
+        }
+        if c["governed"].as_bool() == Some(true) {
+            let residue = machine_residue || (human == Some(0) && c["owner"].as_str() == Some("machine"));
+            let ready = o.quiet == Some(true) && !o.gate_or_modal;
+            match c["verdict"].as_str() {
+                Some("draft") => return if !ready { CycleTargetState::Busy }
+                    else if residue { CycleTargetState::MachineResidue } else { CycleTargetState::HumanDraft },
+                Some("empty" | "placeholder" | "suggestion") => return if !ready { CycleTargetState::Busy }
+                    else if residue { CycleTargetState::MachineResidue } else { CycleTargetState::Idle },
+                _ => {} // Old/unknown adapters retain the text-only decision below.
+            }
+        }
+    }
     let Some(marker) = o.marker else {
         return if o.quiet == Some(true) && !o.gate_or_modal {
             if machine_residue {
@@ -1901,8 +1965,17 @@ fn marker_row_has_draft(screen: &str, marker: &str, placeholder: Option<&str>) -
         && !placeholder.is_some_and(|p| tail.split_whitespace().eq(p.split_whitespace()))
 }
 
-/// 순수 상태 판정과 RPC 관측 실패를 분리한다. quiet_secs 는 성공 응답의 키 유무만 잰다.
+/// An admitted observation carried unchanged from the wait to the atomic clear.
+struct CycleTargetFence {
+    admitted: CycleTargetState,
+    /// The complete E0 object retains same-pass counters, owner and verdict.
+    composer: Option<Value>,
+    observed_at: std::time::Instant,
+}
+
 struct CycleTargetObservation {
+    composer: Option<Value>,
+    observed_at: std::time::Instant,
     state: CycleTargetState,
     failure: Option<String>,
     quiet_secs_reported: Option<bool>,
@@ -1944,6 +2017,7 @@ fn cycle_target_observation(
     let resolved_marker =
         screen_text.and_then(|text| cys::agent_markers::pick_marker_leading_on_screen(marker, text));
     let state = cycle_target_state(&CycleTargetObs {
+        composer: screen.as_ref().and_then(|r| r.get("composer")).filter(|c| c.is_object()),
         screen: screen_text,
         gate_or_modal,
         quiet: cys::readiness::idle_quiet_from(
@@ -1958,6 +2032,8 @@ fn cycle_target_observation(
     });
     let failure = (!failures.is_empty()).then(|| failures.join("; "));
     CycleTargetObservation {
+        composer: screen.as_ref().and_then(|r| r.get("composer")).filter(|c| c.is_object()).cloned(),
+        observed_at: std::time::Instant::now(),
         // 입력 버퍼 관측이 실패했는데 화면만 유휴여도 통과시키지 않는다. 초안 보호는 유지한다.
         state: if failure.is_some() && state == CycleTargetState::Idle {
             CycleTargetState::Busy
@@ -1977,7 +2053,7 @@ fn observe_cycle_target(
     placeholder: Option<&str>,
     gates: &[cys::first_run_gates::Gate],
 ) -> CycleTargetObservation {
-    let screen = request("surface.read_text", json!({"surface_id": sid}));
+    let screen = request("surface.read_text", json!({"surface_id": sid, "composer": true}));
     let entry = surface_entry(sid);
     cycle_target_observation(screen, entry, marker, placeholder, gates)
 }
@@ -2027,7 +2103,7 @@ fn wait_cycle_target_idle(
     deadline: std::time::Instant,
     stage: &str,
     allow_machine_residue: bool,
-) -> Result<(), String> {
+) -> Result<CycleTargetFence, String> {
     let secs = deadline
         .saturating_duration_since(std::time::Instant::now())
         .as_secs_f64()
@@ -2051,10 +2127,14 @@ fn wait_cycle_target_idle(
         }
         // 초안 증거는 RPC 연속 실패보다 우선한다. 일반 오류로 접으면 clear 뒤 최선노력 주입이 열린다.
         match observed.state {
-            CycleTargetState::Idle => return Ok(()),
+            CycleTargetState::Idle => return Ok(CycleTargetFence {
+                admitted: observed.state, composer: observed.composer, observed_at: observed.observed_at,
+            }),
             CycleTargetState::MachineResidue if allow_machine_residue => {
                 eprintln!("  {stage}: surface:{sid} 기계 잔여를 감지했다 — 사람 초안 없음·턴 종료 확인됨, clear의 Ctrl-U로 정리한다");
-                return Ok(());
+                return Ok(CycleTargetFence {
+                    admitted: observed.state, composer: observed.composer, observed_at: observed.observed_at,
+                });
             }
             CycleTargetState::HumanDraft => {
                 return Err(format!(
@@ -2764,7 +2844,7 @@ mod queue_list_row_tests {
                 "println!(\"QUEUED (depth {depth}){}{tag}\"",
             ),
             (
-                arm_start("should_queue_fallback_send_key", "queued, key, &e"),
+                arm_start("expect_output_gen.is_none() && should_queue_fallback_send_key", "queued, key, &e"),
                 "[send-key] 사람 입력 감지",
                 "\"send-key\"",
                 "println!(\"QUEUED (depth {depth}){}\"",
@@ -3653,8 +3733,7 @@ fn is_modal_draft_gate_err(e: &str) -> bool {
     e.contains(&format!("[{}:modal]", cys::DRAFT_GATE_TAG))
 }
 
-/// 데몬이 `clear_first` 를 지원하지 않는 좌석이라고 답했는가(원자 경로 → 3분할 폴백 신호).
-/// launch-agent 등록 소실 좌석의 영구 무clear를 막되, 초안 거부·전송 실패는 재송신하지 않는다.
+/// Whether atomic clear is unavailable. The cycle holds without split key writes.
 fn is_clear_first_unsupported_err(e: &str) -> bool {
     e.contains("clear_first_unsupported")
 }
@@ -3699,6 +3778,14 @@ fn send_key_request_params(
         p["from"] = json!(f);
     }
     p
+}
+
+/// A frame binding is opt-in; legacy key request bytes remain unchanged.
+fn send_key_with_frame(mut params: Value, expected: Option<u64>) -> Value {
+    if let Some(generation) = expected {
+        params["expect_output_gen"] = json!(generation);
+    }
+    params
 }
 
 /// ★(0.14.43 · J3) 검증되지 않은 발신자(pane 밖 — 사람 터미널·스크립트·GUI 가 띄운 `cys`)가 요청 `from` 에 싣는 **표시용 라벨**을 덧붙이는
@@ -3843,6 +3930,19 @@ fn plain_absorb_aux_line(ttl_secs: u64, reflex_ms: Option<u64>) -> String {
         ),
         None => format!("[send] 뒤따르는 send-key Return 은 불필요 — {ttl_secs}초 안 첫 1회는 흡수된다"),
     }
+}
+
+/// ★(0.14.56 · P1 D9 · design r3 §5-5) `cys send`'s result lines (pure): (stderr aux line, stdout line). It prints from
+/// the REPLY, not the local flag: a direct send into a master/CEO composer comes back `queued:true, converted:"one_job"`
+/// (one job carries body and CR). An old daemon has no such keys and keeps printing `OK`. No approval narrowing applies
+/// to that ticket, so the aux line names only the TTL.
+fn send_result_lines(queued: bool, r: &Value, tag: &str) -> (Option<String>, String) {
+    if !(queued || r["queued"].as_bool() == Some(true)) {
+        return (None, format!("OK{tag}"));
+    }
+    let aux = (r["converted"].as_str() == Some("one_job") && r["return_absorb"].as_bool() == Some(true))
+        .then(|| plain_absorb_aux_line(r["return_absorb_secs"].as_u64().unwrap_or(0), None));
+    (aux, format!("QUEUED (depth {}){}{tag}", r["depth"], queue_durable_suffix(r)))
 }
 
 /// ★B3 `cys send` 본문의 큐 1회 전환 판정(순수) — send-key 와 같은 근거·같은 보수성.
@@ -4573,6 +4673,28 @@ fn gate_hold_message(sid: u64, hit: &cys::inject_guard::GateHit, stage: &str) ->
     )
 }
 
+/// ★(0.14.56 · PKG1-M1 · PKG-2 m1-m2) The standard injection, as every caller has always called it (cycle step 7, boot and
+/// launch-agent directives, reinject). The single choke point is [`inject_text_sent`]; this stays a pure delegation (pinned).
+fn inject_text(sid: u64, text: &str) -> Result<(), String> {
+    inject_text_sent(sid, text).map(|_| ())
+}
+
+/// ★(0.14.56 · PKG1-M1 · PKG-2 m1-m3) What an injection did: typed directly (paste + its Return), or queued as ONE job that the
+/// daemon types with its own Return when the seat is ready (a master/CEO composer converts a direct send - D9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Sent {
+    Typed,
+    Queued { entry_id: String },
+}
+
+/// ★(0.14.56 · PKG-2 m1) The stderr line for an injection the daemon converted into one queue job (pure, pinned by a specimen).
+fn queued_inject_line(entry_id: &str, sid: u64) -> String {
+    format!(
+        "[inject] queued as one job {entry_id} -> {} (not typed now; the daemon types it with its own Return when the seat is ready)",
+        surface_ref(sid)
+    )
+}
+
 /// 지침·과업 텍스트의 표준 주입: bracketed paste → 0.8s → Return
 ///
 /// ★T-0147-6(사람 입력 경합 · W4): `authoritative:true` 는 타이핑 가드를 면제하지만 **무조건이
@@ -4588,7 +4710,10 @@ fn gate_hold_message(sid: u64, hit: &cys::inject_guard::GateHit, stage: &str) ->
 /// ★W2 ack 검증과의 결합: 큐 전환은 '배달 예약'이므로 ack(awakened_at 래치)가 늦어질 수 있다.
 ///   호출부(launch-agent)는 미확인을 **치명으로 올리지 않고** `directive_verified=false` 로
 ///   상태화하므로(B14), 이 전환이 새 실패를 만들지 않는다. 중복 주입 0 은 위 '1회' 규칙이 보장.
-fn inject_text(sid: u64, text: &str) -> Result<(), String> {
+/// ★(0.14.56 · PKG1-M1 · PKG-2 m1-m2) A reply `converted:"one_job"` means the daemon queued the body as ONE job that owns its
+/// CR: no pre-Return gate check and no Return follow it (a Return there is refused, and a caller retrying on that refusal would
+/// queue a second authoritative job); the line [`queued_inject_line`] says so on stderr.
+fn inject_text_sent(sid: u64, text: &str) -> Result<Sent, String> {
     // ★U-14 관문 가드 ①(붙여넣기 직전). 이 한 줄이 `inject_text` 를 부르는 모든 경로를 덮는다.
     gate_guard_check(sid, "디렉티브 주입")?;
     // ★(0.14.42 · 설계 C D4) 봉투는 lib 단일 정의처 — 본문 안 표지·끝 미완성 이스케이프를 살균한다(표지 없는
@@ -4609,6 +4734,11 @@ fn inject_text(sid: u64, text: &str) -> Result<(), String> {
             "inject",
         ),
     ) {
+        Ok(r) if r["converted"] == "one_job" => {
+            let entry_id = r["queue_entry_id"].as_str().unwrap_or("?").to_string();
+            eprintln!("{}", queued_inject_line(&entry_id, sid));
+            return Ok(Sent::Queued { entry_id });
+        }
         Ok(_) => {}
         Err(e) if is_typing_guard_err(&e) => {
             eprintln!(
@@ -4621,12 +4751,13 @@ fn inject_text(sid: u64, text: &str) -> Result<(), String> {
             //   씌운다(state.rs writer arm). 여기서 `wrapped` 를 넣으면 이중 래핑이 되어 제어열이
             //   본문에 섞인다 — 직접 경로(`Data`, 클라이언트가 래핑)와 규약이 다르므로 **원문**을
             //   보낸다(`cys send --queued` 가 원문을 보내는 것과 동일).
-            request(
+            let r = request(
                 "surface.send_text",
                 json!({"surface_id": sid, "text": text, "queued": true,
                        "from": "inject(typing_guard fallback)"}),
             )?;
-            return Ok(()); // 큐 배달이 CR 을 포함한다 — 별도 Return 금지(이중 제출 방지)
+            // 큐 배달이 CR 을 포함한다 — 별도 Return 금지(이중 제출 방지)
+            return Ok(Sent::Queued { entry_id: r["queue_entry_id"].as_str().unwrap_or("?").to_string() });
         }
         Err(e) => return Err(e),
     }
@@ -4642,7 +4773,7 @@ fn inject_text(sid: u64, text: &str) -> Result<(), String> {
         "surface.send_key",
         json!({"surface_id": sid, "key": "Return", "authoritative": true}),
     ) {
-        Ok(_) => Ok(()),
+        Ok(_) => Ok(Sent::Typed),
         Err(e) if is_typing_guard_err(&e) => {
             // 본문은 이미 직접 들어갔고 **제출만** 막혔다 — Return 만 큐로 1회 전환한다
             // (send_key --queued 는 Return/Enter 전용이라 계약상 안전).
@@ -4654,7 +4785,7 @@ fn inject_text(sid: u64, text: &str) -> Result<(), String> {
                 "surface.send_key",
                 json!({"surface_id": sid, "key": "Return", "queued": true}),
             )?;
-            Ok(())
+            Ok(Sent::Typed) // the body was typed directly; only its Return waits in the queue
         }
         Err(e) => Err(e),
     }
@@ -5707,6 +5838,19 @@ fn request(method: &str, params: Value) -> Result<Value, String> {
     request_with_idle_cap(method, params, None)
 }
 
+/// ★(0.14.56 · P1 D8 · design r2 §9) `cys read-screen --composer`: ONE `surface.read_text` request with `composer: true`,
+/// and ONE JSON object built from its reply - `text` and `composer` as the daemon sent them (the verdict is never re-derived
+/// here), `quiet_secs` when present. An old daemon ignores the param; its reply has no `composer` and the object carries
+/// `composer: null` (consumers keep their pre-D8 path). `rpc` is `request` in production.
+fn read_screen_composer(sid: u64, rpc: &dyn Fn(&str, Value) -> Result<Value, String>) -> Result<Value, String> {
+    let r = rpc("surface.read_text", json!({"surface_id": sid, "composer": true}))?;
+    let mut out = json!({"text": r["text"].as_str().unwrap_or(""), "composer": r.get("composer").cloned().unwrap_or(Value::Null)});
+    if let Some(q) = r.get("quiet_secs") {
+        out["quiet_secs"] = q.clone();
+    }
+    Ok(out)
+}
+
 /// ★(0.14.31 · 성찰 C8) `--ttl` 미지원 데몬 앞에서 멈출 때의 문안 — **변이 0** 을 명시한다.
 const APPROVAL_TTL_UNSUPPORTED: &str = "--ttl 미지원 데몬 — **아무 승인도 만들지 않았다**. \
 이 데몬은 ttl_secs 를 버리고 무기한 승인을 만들었을 것이므로 서명 전에 멈춘다. 데몬을 0.14.31 이상으로 \
@@ -6164,18 +6308,21 @@ fn run(command: Command) -> i32 {
                         }
                         Err(e) => return Err(e),
                     };
-                    if queued {
-                        println!("QUEUED (depth {}){}{tag}", r["depth"], queue_durable_suffix(&r));
-                    } else {
-                        println!("OK{tag}");
+                    let (aux, line) = send_result_lines(queued, &r, &tag);
+                    if let Some(aux) = aux {
+                        eprintln!("{aux}");
                     }
+                    println!("{line}");
                 }
                 Ok(())
             })
         }
 
-        Command::SendKey { surface, to, queued, keys } => {
+        Command::SendKey { surface, to, queued, keys, expect_output_gen } => {
             resolve_targets(&surface, &to).and_then(|sids| {
+                if expect_output_gen.is_some() && (keys.len() != 1 || sids.len() != 1) {
+                    return Err("a frame-bound modal key requires exactly one key and one target; read a new frame before the next key".into());
+                }
                 for key in &keys {
                     if key_to_bytes(key).is_none() {
                         return Err(format!("unknown key: {key}"));
@@ -6188,7 +6335,8 @@ fn run(command: Command) -> i32 {
                     }
                 }
                 let multi = sids.len() > 1;
-                // ★(0.14.42 · B5) 자기신고 from — `cys send` 와 같은 해석(교차 소켓 Claimed 키의 재료 · 비큐 요청만).
+                // ★(0.14.42 · B5) 자기신고 from — `cys send` 와 같은 해석(교차 소켓 Claimed 키의 재료 · 비큐 요청과
+                //   그 타이핑 가드 재시도에만 — 0.14.56 P1 r2 §10-5 · 명시 `--queued` 는 from 없음).
                 let from = cys::env_compat(ENV_SURFACE_ID).and_then(|s| parse_surface_ref(&s));
                 // ★(0.14.42 · A2 C2) 짝 Return 표식 — 단일 `Return|Enter` 만(다중 키·별칭은 원시 요청).
                 //   데몬은 이 발신자의 `cys send` 가 방금 큐로 자동 전환됐을 때만 이 Return 1회를
@@ -6206,18 +6354,23 @@ fn run(command: Command) -> i32 {
                     for key in &keys {
                         let r = match request(
                             "surface.send_key",
-                            send_key_request_params(sid, key, queued, pair, from),
+                            send_key_with_frame(send_key_request_params(sid, key, queued, pair, from), expect_output_gen),
                         ) {
                             Ok(r) => r,
                             // ★B3: 제출 Return 이 타이핑 가드에 막히면 소실시키지 않고 큐로
                             //   1회 전환한다(inject_text T-0147-6 동형 · 데몬 계약상
                             //   send_key --queued 는 Return/Enter 전용이라 안전).
                             //   이것이 없어서 노드 보고의 Enter 가 조용히 사라졌다.
-                            Err(e) if should_queue_fallback_send_key(queued, key, &e) => {
-                                let r2 = request(
-                                    "surface.send_key",
-                                    json!({"surface_id": sid, "key": key, "queued": true, "pair_return": pair}),
-                                )?;
+                            Err(e) if expect_output_gen.is_none() && should_queue_fallback_send_key(queued, key, &e) => {
+                                // ★(0.14.56 · P1 r2 §10-5) The retry keeps the first request's self-declared `from`: the
+                                //   daemon keyed a cross-socket caller's held body by it (`Claimed`), so a retry without it
+                                //   cannot bind that body and orphans it. An explicit `--queued` stays from-less
+                                //   (`send_key_request_params`).
+                                let mut retry = json!({"surface_id": sid, "key": key, "queued": true, "pair_return": pair});
+                                if let Some(f) = from {
+                                    retry["from"] = json!(f);
+                                }
+                                let r2 = request("surface.send_key", retry)?;
                                 if r2["absorbed"].as_bool() == Some(true) {
                                     report_return_absorbed(&r2, &tag);
                                     sid_absorbed = true;
@@ -6781,8 +6934,11 @@ fn run(command: Command) -> i32 {
             };
         }
 
-        Command::ReadScreen { surface, to, lines, since, max_lines } => {
+        Command::ReadScreen { surface, to, lines, since, max_lines, composer } => {
             target_surface(&surface, &to).and_then(|sid| {
+                if composer {
+                    return read_screen_composer(sid, &request).map(|v| println!("{v}"));
+                }
                 if let Some(s) = since {
                     return request(
                         "surface.read_text",
@@ -20628,13 +20784,18 @@ fn inject_text_on(
     let wrapped = cys::paste_fence::wrap(text);
     // ★(0.14.42 · 통합 minor 정리) 좌석 밖 호출자(본부 CLI → 부서 데몬)는 권위 면제가 아니다 — 정착 증명 거부는 `cys send`
     //   와 같은 예산 안에서 다시 보낸다(종전: 재시도 없이 Err → `drain --verify` 가 '소켓 hung' 으로 오분류).
-    authoritative_paste_settled(
+    let r = authoritative_paste_settled(
         |p| request_on_timeout(socket, "surface.send_text", p, timeout),
         inject_params_with_sender(
             json!({"surface_id": sid, "text": wrapped, "quiet": true, "authoritative": true}),
             kind,
         ),
     )?;
+    // ★(0.14.56 · PKG1-M1 · head check Q3) a dept master converts it too: the queue job owns its CR - no gate check, no Return.
+    if r["converted"] == "one_job" {
+        eprintln!("{}", queued_inject_line(r["queue_entry_id"].as_str().unwrap_or("?"), sid));
+        return Ok(());
+    }
     std::thread::sleep(std::time::Duration::from_millis(800));
     gate_guard_check_on(socket, sid, timeout, "제출 Return(부서)")?;
     request_on_timeout(
@@ -22456,7 +22617,7 @@ fn run_cycle_agent(
         // ★(0.14.42 · clear 가드 수정 4회차 RV3L-1) 1콜 단일 전체 시한 — 여기서부터 모든 대기가 이 시한 안이다(570초 · 점유 대기 포함).
         let budget = CycleBudget::new(timeout);
         // ★(0.14.42 · clear 가드 v3) 0단계 — 사이클 단일 비행 점유(저장 지시 전 · 송신 0건에서 건너뛴다). 끝날 때(모든 경로) 놓는다.
-        let _claim = CycleClaim::acquire(sid, fire.as_deref(), budget.claim_wait)?;
+        let claim = CycleClaim::acquire(sid, fire.as_deref(), budget.claim_wait)?;
         // clear 명령 선확정 — 저장만 시키고 clear 못하는 어정쩡한 상태 방지
         let agent = entry["agent"].as_str().map(String::from);
         let spec = cycle_spec_or_explicit_clear(
@@ -22466,8 +22627,13 @@ fn run_cycle_agent(
         let clear = match clear_cmd {
             Some(c) => c,
             None => {
-                let a = agent.as_deref()
-                    .ok_or("agent 메타 없음 — --clear-cmd 명시 필요")?;
+                // ★(0.14.56 · PKG-2 M1) same rc 1 and place; the old "--clear-cmd 명시 필요" advice became false with 51f029a1.
+                let a = agent.as_deref().ok_or_else(|| {
+                    format!(
+                        "agent 메타 없음 — surface:{sid} has no registered agent (zero bytes sent) · {}",
+                        unregistered_seat_remedy(entry["role"].as_str())
+                    )
+                })?;
                 spec.as_ref().and_then(|s| s["clear_cmd"].as_str())
                     .ok_or_else(|| {
                         format!("agents.json '{a}'에 clear_cmd 없음 — --clear-cmd 명시 필요")
@@ -22779,7 +22945,7 @@ fn run_cycle_agent(
         // quiescing·C-u보다 앞에서 거부하고, 재주입 전에도 같은 관측·대기 경로를 쓴다.
         let idle_deadline = budget.stage(timeout);
         eprintln!("[cycle 4/7] 대상 턴 종료·빈 composer 확인 (최대 {}s · 단일 전체 시한 안)", CycleBudget::secs_until(idle_deadline));
-        wait_cycle_target_idle(
+        let mut clear_fence = wait_cycle_target_idle(
             sid,
             &marker,
             placeholder.as_deref(),
@@ -22806,11 +22972,11 @@ fn run_cycle_agent(
             .as_ref()
             .and_then(statusline_session_file);
         set_surface_quiescing(sid, true)?;
-        // ★(0.14.42 · RR1-ROLE-1) 표지 끔이 싣는 결과 — 여기부터 clear 가 나갈 수 있으므로 기본은 모름(송신 여부 불명 RPC 오류 ·
-        //   실효 측정 불능 81). 실효 확인(0·86) = cleared · 실효 미관측(80) = not_cleared(그 통보는 미해결 → 같은 --fire 재집행 ·
+        // No write has been attempted yet: start NotCleared, switch to Unknown immediately before the RPC.
+        // A successful RPC is not proof of a clear; the existing session-file check below determines its effect. 실효 확인(0·86) = cleared · 실효 미관측(80) = not_cleared(그 통보는 미해결 → 같은 --fire 재집행 ·
         //   autopilot 재시도 가능) · 사람 초안 거부(85 머리표 — 표지 켬 뒤 어느 단계든 clear 미제출) = not_cleared(클로저 뒤에서 접는다).
         //   데몬 가드는 not_cleared 를 사이클 끝으로 보지 않는다(발화를 풀지 않고 수준을 다시 재지 않는다).
-        let mut outcome = CycleOutcome::Unknown;
+        let mut outcome = CycleOutcome::NotCleared;
         let clear_result = (|| -> Result<(), String> {
             // ★(B-360 R2) set when the atomic clear's outcome is unknown (it may still be typed): the effect check decides
             let mut clear_unknown: Option<String> = None;
@@ -22821,66 +22987,67 @@ fn run_cycle_agent(
                 "[cycle] residual_window={:.1}s (검증자 allow→clear · 이 구간은 kill-switch 회수 불가)",
                 allow_at.elapsed().as_secs_f64()
             );
-            match request(
-                "surface.send_text",
-                json!({"surface_id": sid, "text": clear, "clear_first": true, "quiet": true}),
-            ) {
-                Ok(_) => {
-                    // autopilot KEYS_SENT_MARKERS는 성공 응답 뒤에만 찍는다(송신 0건 오기록 금지).
-                    eprintln!("[cycle 5/7] 입력 버퍼 정리 + '{clear}' (원자 송신)");
+            for attempt in 0..3 {
+                // wallclock: guard the existing clear-stage budget; never grant a fresh budget on retry.
+                if std::time::Instant::now() >= idle_deadline {
+                    return Err(format!("{CYCLE_TARGET_BUSY_TOKEN} cycle_clear_retry_exhausted: clear stage deadline reached (no new attempt)"));
                 }
-                Err(e) if is_clear_first_unsupported_err(&e) => {
-                    // 등록을 잃은 좌석은 원자 경로만 강제하면 영구 무clear가 된다(ANCHOR ②).
-                    // 이 팔에만 종전 3분할·오류 매핑을 보존한다. 본문 뒤 초안 혼합 위험도 잔여다.
-                    eprintln!("[cycle] 이 좌석은 launch-agent 등록이 없어 원자 clear 를 못 쓴다 — 3분할 폴백 ({e})");
-                    request("surface.send_key", json!({"surface_id": sid, "key": "C-u"}))
-                        .map_err(|e| {
-                            if is_typing_guard_err(&e) {
-                                format!("{CYCLE_HUMAN_DRAFT_TOKEN} 입력 버퍼 정리 거부(송신 0건): 데몬이 사람 초안을 감지했다({e}) — 소거 0 · 초안을 제출·삭제한 뒤 해당 단계만 재시도")
-                            } else {
-                                e
-                            }
-                        })?;
-                    eprintln!("[cycle 5/7] 입력 버퍼 정리 + '{clear}' (3분할 폴백)");
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-                    request(
-                        "surface.send_text",
-                        json!({"surface_id": sid, "text": clear, "quiet": true}),
-                    )
-                    .map_err(|e| {
-                        if is_typing_guard_err(&e) {
-                            format!("{CYCLE_HUMAN_DRAFT_TOKEN} clear 송신 거부(C-u 1건은 선행 송신됨): 데몬이 사람 입력을 감지했다({e}) — 추가 소거 금지")
-                        } else {
-                            e
-                        }
-                    })?;
-                    request(
-                        "surface.send_key",
-                        json!({"surface_id": sid, "key": "Return"}),
-                    )
-                    .map_err(|e| {
-                        if is_typing_guard_err(&e) {
-                            format!("{CYCLE_HUMAN_DRAFT_TOKEN} clear 제출 거부: 데몬이 사람 초안을 감지했다({e}) — clear 본문('{clear}')은 composer에 들어갔지만 제출되지 않았다 · 손으로 다시 clear 하지 마라 · 남은 clear 본문은 다음 재시도의 C-u가 지운다")
-                        } else {
-                            e
-                        }
-                    })?;
+                if attempt > 0 {
+                    clear_fence = wait_cycle_target_idle(
+                        sid, &marker, placeholder.as_deref(), gates, idle_deadline, "clear retry", true,
+                    )?;
                 }
-                Err(e) => {
-                    if is_write_outcome_unknown(&e) {
-                        // ★(B-360 R2) never re-sent; the session_file check below sees a late landing
+                // wallclock: guard the same deadline after a possibly blocking re-observation.
+                if std::time::Instant::now() >= idle_deadline {
+                    return Err(format!("{CYCLE_TARGET_BUSY_TOKEN} cycle_clear_retry_exhausted: observation used the clear stage budget (zero bytes)"));
+                }
+                let mut params = json!({"surface_id": sid, "text": clear, "clear_first": true, "quiet": true});
+                if claim.held {
+                    if let Some(c) = clear_fence.composer.as_ref() {
+                        params["cycle_clear"] = json!(true);
+                        params["expect_output_gen"] = c["output_gen"].clone();
+                        params["expect_input_gen"] = c["input_gen"].clone();
+                        params["admitted"] = json!(if clear_fence.admitted == CycleTargetState::MachineResidue {
+                            "machine_residue"
+                        } else { "idle" });
+                    }
+                }
+                eprintln!("[cycle] clear observation age={:.3}s attempt={}", clear_fence.observed_at.elapsed().as_secs_f64(), attempt + 1);
+                outcome = CycleOutcome::Unknown;
+                match request("surface.send_text", params) {
+                    Ok(_) => {
+                        eprintln!("[cycle 5/7] 입력 버퍼 정리 + '{clear}' (원자 송신)");
+                        break;
+                    }
+                    Err(e) if is_write_outcome_unknown(&e) => {
                         eprintln!("[cycle 5/7] '{clear}' outcome unknown (may still be typed — not re-sent) — the effect check decides");
                         clear_unknown = Some(e);
-                    } else {
-                        // ★(B-360 R2) zero bytes at the writer journal: the clear was never typed — the guard hears not_cleared
-                        if is_journal_refusal(&e) {
+                        break;
+                    }
+                    Err(e) if is_clear_first_unsupported_err(&e) => {
+                        outcome = CycleOutcome::NotCleared;
+                        // ★(0.14.56 · PKG-2 M1) not BUSY: no retry registers the seat (rc 1 · CYCLE_TARGET_UNREGISTERED_TOKEN doc).
+                        return Err(format!(
+                            "{CYCLE_TARGET_UNREGISTERED_TOKEN} surface:{sid} has no registered agent: atomic clear refused (clear_first_unsupported), no split fallback, zero bytes - not retryable · {} ({e})",
+                            unregistered_seat_remedy(entry["role"].as_str())
+                        ));
+                    }
+                    Err(e) => {
+                        // Holds precede the retryable zero-byte refusals. Unknown already left the loop above.
+                        if is_typing_guard_err(&e) {
                             outcome = CycleOutcome::NotCleared;
+                            return Err(format!("{CYCLE_HUMAN_DRAFT_TOKEN} clear 원자 송신 거부(송신 0건 · composer 무변경): {e}"));
                         }
-                        return Err(if is_typing_guard_err(&e) {
-                            format!("{CYCLE_HUMAN_DRAFT_TOKEN} clear 원자 송신 거부(송신 0건 · composer 무변경): 데몬이 사람 초안을 감지했다 — 초안을 제출·삭제한 뒤 해당 단계만 재시도 ({e})")
-                        } else {
-                            e
-                        });
+                        if e.contains("own_paste_settling:") || e.contains("cycle_clear_unclaimed:") {
+                            outcome = CycleOutcome::NotCleared;
+                            return Err(format!("{CYCLE_TARGET_BUSY_TOKEN} transient cycle clear hold: {e}"));
+                        }
+                        if e.contains("guard_aborted:") || is_journal_refusal(&e) {
+                            outcome = CycleOutcome::NotCleared;
+                            if attempt + 1 == 3 { return Err(e); }
+                            continue;
+                        }
+                        return Err(e);
                     }
                 }
             }
@@ -22936,7 +23103,7 @@ fn run_cycle_agent(
                         "재주입 직전",
                         false,
                     ) {
-                        Ok(()) => {
+                        Ok(_) => {
                             eprintln!(
                                 "[cycle 7/7] 재주입 — 디렉티브 {} + 재개 포인터(한 제출)",
                                 if hooks_inject { "생략(훅이 주입)" } else { "주입" }
@@ -22984,7 +23151,7 @@ fn run_cycle_agent(
                         "재주입 직전(측정 불능)",
                         false,
                     ) {
-                        Ok(()) => {
+                        Ok(_) => {
                             eprintln!(
                                 "[cycle 7/7] 재주입(측정 불능 · 최선노력) — 디렉티브 {} + 재개 포인터",
                                 if hooks_inject { "생략(훅이 주입)" } else { "주입" }
@@ -23018,7 +23185,7 @@ fn run_cycle_agent(
         })();
         // 재개 성공/실패와 무관하게 quiescing 해제 — 실패로 master가 quiescing에 갇혀 채널이
         // 영구 보류되는 것을 막는다(master 자기보고 안전망과 별개의 결정론 해제). 결과를 싣는다(RR1-ROLE-1).
-        // 사람 초안 거부(rc 85 머리표)는 표지 켬 뒤 어느 단계든 clear 가 제출되지 않았다(원자 거부 송신 0건 · 3분할 C-u·본문·Return 거부).
+        // 사람 초안 거부(rc 85 머리표)는 표지 켬 뒤 어느 단계든 clear 가 제출되지 않았다(원자 거부 송신 0건).
         if clear_result.as_ref().is_err_and(|e| e.starts_with(CYCLE_HUMAN_DRAFT_TOKEN)) {
             outcome = CycleOutcome::NotCleared;
         }
@@ -23382,6 +23549,18 @@ fn run_restore(cwd: Option<String>, include_master: bool, no_resume: bool) -> i3
                              `cys reinject --role {role} --check`): {e}"
                         );
                         record_kept_pane(sid, role, agent, &e, KeptWrite::of(&e, KeptWrite::Directive), KeptOutcome::of_err(&e));
+                        continue;
+                    }
+                    // ★(0.14.56 · P1 D9 · head ruling 28f2b064) the master/CEO composer refused a boot-gate key of this in-seat
+                    //   relaunch (zero bytes; this restore is not the seat's creator). The agent runs and waits at that gate,
+                    //   so a fresh fallback would put a second agent on the role. Keep the seat; it counts as gated (rc != 0).
+                    Err(e) if is_composer_key_denied(&e) => {
+                        gated += 1;
+                        println!(
+                            "· {role}: 좌석 내 재연결 — the master/CEO composer refused this relaunch's boot-gate key (zero bytes; \
+                             not the seat's creator) — seat surface:{sid} kept, no fresh launch. The agent waits at a boot gate \
+                             (e.g. folder trust): answer it on that seat, then `cys boot`: {e}"
+                        );
                         continue;
                     }
                     Err(e) => {
@@ -23753,6 +23932,18 @@ enum Presence {
     Undetermined(String),
 }
 
+/// ★(0.14.56 · PKG-2 m3) A presence ping the daemon queued as one job (a master/CEO composer converts it) that the transcript has
+/// not seen yet is BUSY - queued, not delivered - not "undetermined". Pure. `Some(label)` only for (queued, NotSeen); every other
+/// fate keeps its meaning. Callers still type nothing.
+fn queued_ping_label(fate: &Result<PingFate, String>, queued: Option<&str>) -> Option<String> {
+    match (fate, queued) {
+        (Ok(PingFate::NotSeen), Some(id)) => Some(format!(
+            "ping queued as one job {id} (not delivered yet - the daemon types it at the seat's next idle prompt)"
+        )),
+        _ => None,
+    }
+}
+
 /// Bound of one presence ping (s) — phoenix's `reinject --check` window, so a pass over several unknown seats stays short.
 const PRESENCE_PING_TIMEOUT_SECS: u64 = 6;
 
@@ -23774,9 +23965,11 @@ fn directive_presence(sid: u64, timeout: u64) -> Presence {
         Ok(r) => r["latest_cursor"].as_u64().unwrap_or(0),
         Err(e) => return Presence::Undetermined(format!("screen cursor unreadable: {e}")),
     };
-    if let Err(e) = inject_text(sid, &reinject_ping_text(&nonce)) {
-        return Presence::Undetermined(format!("presence ping not delivered: {e}"));
-    }
+    let queued = match inject_text_sent(sid, &reinject_ping_text(&nonce)) {
+        Ok(Sent::Queued { entry_id }) => Some(entry_id),
+        Ok(Sent::Typed) => None,
+        Err(e) => return Presence::Undetermined(format!("presence ping not delivered: {e}")),
+    };
     match request(
         "surface.wait_for",
         json!({"surface_id": sid, "pattern": format!("DIRECTIVE-ACK-{nonce}"),
@@ -23787,6 +23980,9 @@ fn directive_presence(sid: u64, timeout: u64) -> Presence {
         Err(e) => eprintln!("[presence] surface:{sid} ACK wait failed ({e}) — reading the transcript"),
     }
     let fate = surface_entry(sid).and_then(|e| ping_fate_from_entry(&e, &nonce)).map(|(f, _)| f);
+    if let Some(busy) = queued_ping_label(&fate, queued.as_deref()) {
+        return Presence::Undetermined(busy); // ★(PKG-2 m3) busy, named - the caller still types nothing
+    }
     match reinject_check_action(&fate, false) {
         ReinjectCheckAction::AckInTranscript => Presence::Present,
         ReinjectCheckAction::Reinject => Presence::Absent,
@@ -23863,6 +24059,17 @@ fn reinject_claim_prune(dir: &std::path::Path, now: std::time::SystemTime) {
     }
 }
 
+/// ★(0.14.56 · PKG-2 m1) What `cys reinject` prints after the directive went out (pure, pinned by a specimen): a converted send is
+/// "queued as one job", not "reinjected".
+fn reinject_done_line(sent: &Sent, bytes: usize, sid: u64, role_name: &str) -> String {
+    match sent {
+        Sent::Typed => format!("reinjected {bytes} bytes → surface:{sid} ({role_name})"),
+        Sent::Queued { entry_id } => format!(
+            "queued as one job {entry_id} ({bytes} bytes) → surface:{sid} ({role_name}) - the daemon types it with its own Return"
+        ),
+    }
+}
+
 fn run_reinject(
     role: Option<String>,
     surface: Option<String>,
@@ -23903,8 +24110,14 @@ fn run_reinject(
                 .unwrap_or(0);
             // ★(B-360 R2 revise · S63) an UNKNOWN ping may still land: the ACK wait and the transcript read still run —
             //   ACK → alive (0); anything else → the existing 91, never a re-inject (the ping itself is unresolved)
-            let ping_unknown = match inject_text(sid, &reinject_ping_text(&nonce)) {
-                Ok(()) => None,
+            let mut ping_queued: Option<String> = None;
+            let ping_unknown = match inject_text_sent(sid, &reinject_ping_text(&nonce)) {
+                Ok(sent) => {
+                    if let Sent::Queued { entry_id } = sent {
+                        ping_queued = Some(entry_id);
+                    }
+                    None
+                }
                 Err(e) if is_write_outcome_unknown(&e) => {
                     eprintln!("[reinject] presence ping outcome unknown (it may still land — not re-sent) — waiting for the ACK: {e}");
                     Some(e)
@@ -23943,6 +24156,11 @@ fn run_reinject(
                 Err(e) => e.clone(),
             };
             eprintln!("[reinject] ACK 없음 ({timeout}s) — 핑 배달 판정(세션 기록): {fate_label}");
+            // ★(0.14.56 · PKG-2 m3) a queued ping that has not been delivered yet: busy, named (rc 0, nothing re-injected).
+            if let Some(busy) = queued_ping_label(&fate, ping_queued.as_deref()) {
+                println!("재주입 보류({busy}) — surface:{sid} ({role_name}) · 배달 전의 핑을 '미배달'로 읽지 않는다(폭주 차단)");
+                return Ok(());
+            }
             if let Some(e) = ping_unknown {
                 // ★(B-360 R2 revise · S63) no ACK after an UNKNOWN ping: not re-injected (no claim consumed) — 91
                 eprintln!("[reinject] the ping's outcome is unknown and no ACK came — nothing re-injected (surface:{sid})");
@@ -24003,12 +24221,9 @@ fn run_reinject(
         }
         let directive = compose_directive(&role_name)
             .map_err(|e| reinject_claim_exhausted_hint(e, reinject_claim_consumed))?;
-        inject_text(sid, &directive)
+        let sent = inject_text_sent(sid, &directive)
             .map_err(|e| reinject_claim_exhausted_hint(e, reinject_claim_consumed))?;
-        println!(
-            "reinjected {} bytes → surface:{sid} ({role_name})",
-            directive.len()
-        );
+        println!("{}", reinject_done_line(&sent, directive.len(), sid, &role_name));
         Ok(())
     })();
     match result {
@@ -33132,7 +33347,7 @@ mod tests {
         assert!(!send_key_pair_return(&k(&[])));
         // 배선 핀: 첫 요청과 폴백 r2 모두 pair_return 을 싣는다(★B5: 첫 요청은 `send_key_request_params` 헬퍼).
         let src = include_str!("cys.rs");
-        let arm = src.split("Command::SendKey { surface, to, queued, keys } => {").nth(1).expect("SendKey");
+        let arm = src.split("Command::SendKey { surface, to, queued, keys").nth(1).expect("SendKey");
         let arm = arm.split("Command::SetStatus").next().unwrap();
         assert_eq!(arm.matches("\"pair_return\": pair").count(), 1, "폴백 r2(인라인)");
         assert!(arm.contains("send_key_request_params(sid, key, queued, pair, from)"), "첫 요청(헬퍼)");
@@ -33276,7 +33491,10 @@ mod tests {
             !prod.contains("format!(\"\\x1b[200~{text}"),
             "손수 만든 울타리 봉투가 남았다 — cys::paste_fence::wrap 을 써라"
         );
-        for f in ["fn inject_text(", "fn inject_text_on("] {
+        // ★(0.14.56 · PKG1-M1) the body moved to `inject_text_sent`; `inject_text` stays its pure delegation (one choke point).
+        let del = prod.split("fn inject_text(sid: u64, text: &str) -> Result<(), String> {").nth(1).expect("inject_text 소실");
+        assert_eq!(del[..del.find("\n}\n").expect("함수 끝")].trim(), "inject_text_sent(sid, text).map(|_| ())", "inject_text 는 순수 위임");
+        for f in ["fn inject_text_sent(", "fn inject_text_on("] {
             let body = prod.split(f).nth(1).unwrap_or_else(|| panic!("{f} 소실"));
             let body = &body[..body.find("\n}\n").expect("함수 끝")];
             assert!(body.contains("cys::paste_fence::wrap(text)"), "{f} 가 lib wrap 을 거치지 않는다");
@@ -33288,7 +33506,8 @@ mod tests {
 
     /// ★(0.14.42 · B5) `send-key` 요청 파라미터(순수) — **비큐 요청에만** 자기신고 from(CYS_SURFACE_ID)을 싣는다.
     /// 데몬은 검증 신원이 없을 때만 그 from 을 짝 Return 표의 Claimed 키로 쓴다(교차 소켓 CEO → 부서장).
-    /// 명시 `--queued`·폴백 r2 는 종전 바이트 그대로다(queue.enqueued 페이로드 from=null 유지).
+    /// 명시 `--queued` 는 종전 바이트 그대로다(queue.enqueued 페이로드 from=null 유지). 타이핑 가드 폴백 r2 는 첫 요청의
+    /// from 을 싣는다(0.14.56 P1 r2 §10-5 — 교차 소켓 발신자의 Claimed 보유 본문이 재시도 Return 에 묶이게 한다).
     #[test]
     fn b_send_key_request_params_from_only_when_not_queued() {
         let ser = |v: &serde_json::Value| serde_json::to_string(v).unwrap();
@@ -33305,19 +33524,74 @@ mod tests {
         // 비큐 + from 결측 → 종전 바이트(결측은 값이 아니다 — null 도 싣지 않는다).
         let legacy = json!({"surface_id": 5, "key": "Down", "queued": false, "pair_return": false});
         assert_eq!(ser(&send_key_request_params(5, "Down", false, false, None)), ser(&legacy));
-        // 배선 핀: 첫 요청은 헬퍼(from 포함) · 폴백 r2 는 종전 인라인(from 없음) · from 은 Send 와 같은 해석.
+        // 배선 핀: 첫 요청은 헬퍼(from 포함) · 폴백 r2 는 종전 인라인 + 첫 요청의 from(P1 r2 §10-5) · from 은 Send 와 같은 해석.
+        // 행동 검체는 `n1_cli_send_key_typing_guard_retry_carries_the_first_requests_from`.
+        // 갈래 앵커는 닫는 괄호 없는 접두다(P1 L-MODAL 이 이 갈래에 필드를 더한다 · 합의 2026-10-30). 맨 `Command::SendKey {` 는
+        //   :3422 의 `{ .. } => IdentityConsumer::SendKey` 를 먼저 잡는다.
         let src = include_str!("cys.rs");
-        let arm = src.split("Command::SendKey { surface, to, queued, keys } => {").nth(1).expect("SendKey");
+        let arm = src.split("Command::SendKey { surface, to, queued, keys").nth(1).expect("SendKey");
         let arm = arm.split("Command::SetStatus").next().unwrap();
+        assert!(arm.contains("resolve_targets(&surface, &to)"), "앵커가 제품 갈래가 아니다");
         assert!(arm.contains("send_key_request_params(sid, key, queued, pair, from)"), "첫 요청은 헬퍼 경유");
         assert!(
             arm.contains("let from = cys::env_compat(ENV_SURFACE_ID).and_then(|s| parse_surface_ref(&s));"),
             "from 해석은 cys send 와 같은 규칙"
         );
-        let r2 = arm.split("Err(e) if should_queue_fallback_send_key(queued, key, &e) => {").nth(1).expect("r2");
+        let r2 = arm.split("Err(e) if expect_output_gen.is_none() && should_queue_fallback_send_key(queued, key, &e) => {").nth(1).expect("r2");
         let r2 = &r2[..r2.find(")?;").expect("r2 끝")];
         assert!(r2.contains("\"queued\": true, \"pair_return\": pair}"), "폴백 r2 종전 바이트: {r2}");
-        assert!(!r2.contains("from"), "폴백 r2 에 from 금지(종전 페이로드 유지): {r2}");
+        assert!(r2.contains("if let Some(f) = from {") && r2.contains("retry[\"from\"] = json!(f);"),
+            "폴백 r2 는 첫 요청의 from 을 싣는다(P1 r2 §10-5): {r2}");
+    }
+
+    /// ★(0.14.56 · P1 r2 §10-5 · G5-4 (2)) The `cys send-key Return` typing-guard retry carries the same self-declared
+    /// `from` as the first request. The daemon keys a cross-socket caller's held body by that `from` (`Claimed`), so a
+    /// retry without it cannot bind the body and orphans it. Runs the real `run(Command::SendKey)` in-process against a
+    /// scripted fake daemon that refuses the first (non-queued) Return with the typing guard and records both requests.
+    /// At `ece8f1e8` the retry has no `from`. Mutant M-CLI1: build the retry without `from`.
+    #[cfg(unix)]
+    #[test]
+    fn n1_cli_send_key_typing_guard_retry_carries_the_first_requests_from() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<Value>>> = Default::default();
+        let rec = std::sync::Arc::clone(&seen);
+        let daemon = super::b360_tests::R2cDaemon::start(move |method, params| {
+            if method != "surface.send_key" {
+                return json!({"ok": true, "result": {}});
+            }
+            rec.lock().unwrap_or_else(|e| e.into_inner()).push(params.clone());
+            if params["queued"] == json!(true) {
+                json!({"ok": true, "result": {"surface_id": 5, "key": "Return", "queued": true, "depth": 1, "queue_entry_id": "q-1"}})
+            } else {
+                json!({"ok": false, "error": {"code": cys::ERR_TYPING_GUARD, "message": cys::MSG_TYPING_GUARD}})
+            }
+        });
+        struct Restore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (k, v) in &self.0 {
+                    match v {
+                        Some(v) => std::env::set_var(k, v),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+        let keys = [cys::ENV_SOCKET, "JAVIS_SOCKET", "AITERM_SOCKET", "CYS_NO_AUTOSTART", ENV_SURFACE_ID, "JAVIS_SURFACE_ID", "AITERM_SURFACE_ID"];
+        let _restore = Restore(keys.iter().map(|k| (*k, std::env::var_os(k))).collect());
+        for k in keys {
+            std::env::remove_var(k);
+        }
+        std::env::set_var(cys::ENV_SOCKET, &daemon.sock);
+        std::env::set_var("CYS_NO_AUTOSTART", "1");
+        std::env::set_var(ENV_SURFACE_ID, "900");
+        let rc = run(Command::SendKey { surface: Some("5".into()), to: None, queued: false, expect_output_gen: None, keys: vec!["Return".into()] });
+        let calls = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(rc, 0, "{calls:?}");
+        assert_eq!(calls.len(), 2, "the first Return and exactly one typing-guard retry: {calls:?}");
+        assert_eq!((calls[0]["queued"].clone(), calls[0]["from"].clone()), (json!(false), json!(900)), "{calls:?}");
+        assert_eq!((calls[1]["queued"].clone(), calls[1]["pair_return"].clone()), (json!(true), json!(true)), "{calls:?}");
+        assert_eq!(calls[1]["from"], json!(900), "the typing-guard retry dropped `from`: {:?}", calls[1]);
     }
 
     /// ★(0.14.42 · A2 C2) ABSORBED 포맷터 — OK·QUEUED 로 시작하지 않고, 본문 상태 3문구 · 다중 대상 접미.
@@ -33782,7 +34056,7 @@ mod tests {
     fn injection_hold_is_never_discarded_silently_source_pin() {
         let src = include_str!("cys.rs");
         let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계")];
-        let discarded = prod.matches("let _ = inject_text(").count();
+        let discarded = prod.matches("let _ = inject_text(").count() + prod.matches("let _ = inject_text_sent(").count();
         assert_eq!(
             discarded, 0,
             "주입 결과를 통째로 버리는 지점이 {discarded}곳 남았다 — 관문 Hold 처방이 \
@@ -33797,8 +34071,11 @@ mod tests {
         //   브로드캐스트 · 부트 주입 직후 · 팩 업데이트 재주입.
         // ★(B-360 R2 revise · area P) 동결값 3 → 4: `directive_presence` 의 존재 확인 핑이 네 번째 지점이다 — 그 Err 는
         //   버려지지 않고 `Presence::Undetermined("presence ping not delivered: {e}")` 로 호출부 문안에 실린다(침묵 0).
+        // ★(0.14.56 · PKG1-M1 · PKG-2 m3) the fourth site (`directive_presence`) now matches `inject_text_sent` (it needs to know
+        //   whether the ping was queued); its Err still becomes `Presence::Undetermined("presence ping not delivered: {e}")`.
         assert_eq!(
-            prod.matches("if let Err(e) = inject_text(").count(),
+            prod.matches("if let Err(e) = inject_text(").count()
+                + prod.matches("Err(e) => return Presence::Undetermined(format!(\"presence ping not delivered: {e}\")),").count(),
             4,
             "주입 사유를 남기는 지점 수가 동결값(4)을 벗어났다 — 줄었다면 침묵이 되살아난 것이다"
         );
@@ -34808,7 +35085,7 @@ mod tests {
     fn inject_gate_guard_is_wired_inside_the_single_choke_point_source_pin() {
         let src = include_str!("cys.rs");
         // ⓐ 두 전송 지점(붙여넣기·제출 Return) 앞에 각각 가드가 있다.
-        let ii = src.find("fn inject_text(sid: u64").expect("inject_text 가 사라졌다");
+        let ii = src.find("fn inject_text_sent(sid: u64").expect("inject_text_sent 가 사라졌다");
         let iend = src[ii..].find("\n/// \"90s\"").map(|e| ii + e).unwrap_or(src.len());
         let body = &src[ii..iend];
         assert_eq!(
@@ -38742,6 +39019,192 @@ mod tests {
         assert!(calls.iter().any(|(m, p)| m == "surface.send_key" && p["key"] == "Return"), "직접 제출 Return: {calls:?}");
     }
 
+    // ───────── ★(0.14.56 · PKG1-M1 · PKG-2 r1 minors m1-m3 · HEAD-RULING-PKG2-R1.md sec 3; DESIGN-ADDENDUM-PKG1-M1.md sec 4) ─────────
+    // A direct send into a master/CEO composer that the daemon CONVERTS (D9) comes back as ONE queue job that owns its own CR.
+
+    /// A scripted daemon whose seat converts every direct send the way the real daemon answers a d9-scope master
+    /// (`converted:"one_job"`, `queue_entry_id`): `surface.wait_for` never matches, and `surface.list` names one live claude
+    /// seat (surface 7, role master) whose transcript is `session_file`. Returns (socket, recorded (method, params), stop).
+    #[cfg(unix)]
+    fn pkg1_converting_daemon(
+        session_file: &std::path::Path,
+    ) -> (std::path::PathBuf, std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>>, impl FnOnce()) {
+        use std::io::{BufRead, BufReader, Write};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::{Arc, Mutex};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let sock = std::path::Path::new("/tmp").join(format!(
+            ".pkg1conv-{}-{}.sock",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&sock);
+        let listener = std::os::unix::net::UnixListener::bind(&sock).expect("fake socket bind");
+        let calls: Arc<Mutex<Vec<(String, Value)>>> = Arc::new(Mutex::new(Vec::new()));
+        let rec = Arc::clone(&calls);
+        let session_file = session_file.display().to_string();
+        let server = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                let mut reader = BufReader::new(match stream.try_clone() { Ok(s) => s, Err(_) => break });
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
+                    continue;
+                }
+                let req: Value = serde_json::from_str(line.trim()).unwrap_or(Value::Null);
+                let method = req["method"].as_str().unwrap_or("").to_string();
+                if method == "__stop" {
+                    break;
+                }
+                rec.lock().unwrap_or_else(|e| e.into_inner()).push((method.clone(), req["params"].clone()));
+                let result = match method.as_str() {
+                    "surface.list" => json!({"surfaces": [{
+                        "surface_id": 7, "surface_ref": "surface:7", "role": "master", "awakened_at": 1.0,
+                        "agent": "claude", "agent_alive": true, "exited": false, "gate_pending": null,
+                        "usage": {"source": "transcript", "session_file": session_file}}]}),
+                    "surface.read_text" => json!({"text": cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT,
+                                                  "quiet_secs": 5.0, "line_count": 40, "latest_cursor": 0}),
+                    "surface.send_text" if req["params"]["queued"] != true => json!({"surface_id": 7, "queued": true,
+                        "depth": 1, "queue_entry_id": "q-pkg1", "durable": true, "sent": true, "converted": "one_job"}),
+                    "surface.send_text" => json!({"queued": true, "depth": 1}),
+                    "surface.wait_for" => json!({"matched": false}),
+                    _ => json!({"ok": true}),
+                };
+                let mut w = stream;
+                let _ = writeln!(w, "{}", json!({"id": req["id"], "ok": true, "result": result}));
+            }
+        });
+        let stop_sock = sock.clone();
+        let stop = move || {
+            if let Ok(mut s) = std::os::unix::net::UnixStream::connect(&stop_sock) {
+                let _ = writeln!(s, "{}", json!({"id": 1, "method": "__stop", "params": {}}));
+            }
+            let _ = server.join();
+            let _ = std::fs::remove_file(&stop_sock);
+        };
+        (sock, calls, stop)
+    }
+
+    /// Runs `body` with `CYS_SOCKET` (and, when given, `CYS_PACK_DIR`) pointing at the test's own values, restoring both after.
+    #[cfg(unix)]
+    fn pkg1_with_env<R>(sock: &std::path::Path, pack: Option<&std::path::Path>, body: impl FnOnce() -> R) -> R {
+        let saved_sock = std::env::var_os(cys::ENV_SOCKET);
+        let saved_pack = std::env::var_os(cys::pack::ENV_PACK_DIR);
+        std::env::set_var(cys::ENV_SOCKET, sock);
+        if let Some(p) = pack {
+            std::env::set_var(cys::pack::ENV_PACK_DIR, p);
+        }
+        let r = body();
+        for (k, v) in [(cys::ENV_SOCKET, saved_sock), (cys::pack::ENV_PACK_DIR, saved_pack)] {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        r
+    }
+
+    /// A fresh scratch directory holding one transcript line that never mentions any ping (fate NotSeen).
+    #[cfg(unix)]
+    fn pkg1_scratch(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("cys-pkg1-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let session = dir.join("session.jsonl");
+        std::fs::write(&session, "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n").unwrap();
+        (dir, session)
+    }
+
+    /// S12 (PKG-2 m2): a direct send the daemon converted into ONE queue job owns its CR, so the CLI sends no pre-Return gate
+    /// check and no Return after it - neither `inject_text` (default socket: the cycle's step 7, boot directives) nor
+    /// `inject_text_on` (dept socket, `drain --verify`; head check Q3). A Return there is refused by the daemon (a converted body
+    /// submits itself), and a caller that retries on that refusal queues a second authoritative job.
+    /// RED (77f66491): both send `surface.send_key Return` 800 ms after the converted send.
+    #[cfg(unix)]
+    #[test]
+    fn pkg1_s12_a_converted_inject_sends_no_return() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("CYS_SEND_SETTLE");
+        std::env::remove_var("CYS_SEND_SETTLE_BUDGET_MS");
+        let (dir, session) = pkg1_scratch("s12");
+        let (sock, calls, stop) = pkg1_converting_daemon(&session);
+        let r = pkg1_with_env(&sock, None, || inject_text(7, "[RESUME] pkg1-s12"));
+        let r_on = inject_text_on(&sock, 7, "SAVE NOW", std::time::Duration::from_secs(3), "inject");
+        stop();
+        let _ = std::fs::remove_dir_all(&dir);
+        let calls = calls.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert!(r.is_ok() && r_on.is_ok(), "{r:?} {r_on:?} {calls:?}");
+        let sends = calls.iter().filter(|(m, p)| m == "surface.send_text" && p["queued"] != true).count();
+        assert_eq!(sends, 2, "one send each, no retry: {calls:?}");
+        assert!(!calls.iter().any(|(m, _)| m == "surface.send_key"), "a converted send owns its CR - no Return: {calls:?}");
+    }
+
+    /// S13 (PKG-2 m3): the presence ping into a master is converted too. When the transcript has not seen it yet (NotSeen), the
+    /// truthful answer is "the ping is queued as one job <id>" (busy), not "undetermined"; the caller still types nothing.
+    /// RED (77f66491): `Undetermined(<NotSeen label>)` - the queue job is not named.
+    #[cfg(unix)]
+    #[test]
+    fn pkg1_s13_a_converted_presence_ping_reports_queued() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("CYS_SEND_SETTLE");
+        std::env::remove_var("CYS_SEND_SETTLE_BUDGET_MS");
+        let (dir, session) = pkg1_scratch("s13");
+        let (sock, calls, stop) = pkg1_converting_daemon(&session);
+        let p = pkg1_with_env(&sock, None, || directive_presence(7, 1));
+        stop();
+        let _ = std::fs::remove_dir_all(&dir);
+        let calls = calls.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        match &p {
+            Presence::Undetermined(why) => assert!(why.contains("queued as one job q-pkg1"), "m3: {why} {calls:?}"),
+            other => panic!("a queued ping is neither present nor absent: {other:?}"),
+        }
+        assert_eq!(calls.iter().filter(|(m, _)| m == "surface.send_text").count(), 1, "one ping, nothing else typed: {calls:?}");
+        assert!(!calls.iter().any(|(m, _)| m == "surface.send_key"), "no Return after the converted ping: {calls:?}");
+    }
+
+    /// S14 (PKG-2 m1/m2): a forced `cys reinject` into a master whose daemon converts the directive: rc 0 and no Return (the job
+    /// submits itself). RED (77f66491): a Return follows the converted directive.
+    #[cfg(unix)]
+    #[test]
+    fn pkg1_s14_a_converted_reinject_sends_no_return() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("CYS_SEND_SETTLE");
+        std::env::remove_var("CYS_SEND_SETTLE_BUDGET_MS");
+        let (dir, session) = pkg1_scratch("s14");
+        let pack = dir.join("pack");
+        std::fs::create_dir_all(pack.join("directives")).unwrap();
+        std::fs::write(pack.join("directives/MASTER_DIRECTIVE.md"), "# MASTER pkg1-s14\n").unwrap();
+        std::fs::write(pack.join("directives/RSI_LEARNING_DIRECTIVE.md"), "# RSI pkg1-s14\n").unwrap();
+        let (sock, calls, stop) = pkg1_converting_daemon(&session);
+        let rc = pkg1_with_env(&sock, Some(&pack), || run_reinject(None, Some("7".into()), false, 1, false));
+        stop();
+        let _ = std::fs::remove_dir_all(&dir);
+        let calls = calls.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(rc, 0, "{calls:?}");
+        let sends: Vec<&Value> = calls.iter().filter(|(m, _)| m == "surface.send_text").map(|(_, p)| p).collect();
+        assert_eq!(sends.len(), 1, "one directive send: {calls:?}");
+        assert!(sends[0]["text"].as_str().is_some_and(|t| t.contains("MASTER pkg1-s14")), "premise: the directive was sent: {sends:?}");
+        assert!(!calls.iter().any(|(m, _)| m == "surface.send_key"), "a converted directive owns its CR - no Return: {calls:?}");
+    }
+
+    /// ★(0.14.56 · PKG-2 m1/m3 · pure halves; added with the fix, no pre-fix RED - the functions did not exist) The labels say what
+    /// happened: a converted directive is "queued as one job", not "reinjected"; a queued ping not seen yet is busy and named, and
+    /// every other ping fate keeps its meaning.
+    #[test]
+    fn pkg1_queued_labels_say_what_happened() {
+        assert_eq!(reinject_done_line(&Sent::Typed, 9, 7, "master"), "reinjected 9 bytes → surface:7 (master)");
+        let q = reinject_done_line(&Sent::Queued { entry_id: "q-1".into() }, 9, 7, "master");
+        assert!(q.starts_with("queued as one job q-1 (9 bytes) → surface:7 (master)"), "{q}");
+        assert!(queued_inject_line("q-1", 7).starts_with("[inject] queued as one job q-1 -> surface:7"), "{}", queued_inject_line("q-1", 7));
+        assert_eq!(queued_ping_label(&Ok(PingFate::NotSeen), None), None, "a typed ping keeps NotSeen's meaning");
+        let busy = queued_ping_label(&Ok(PingFate::NotSeen), Some("q-1"));
+        assert!(busy.as_deref().is_some_and(|l| l.contains("queued as one job q-1")), "{busy:?}");
+        for f in [PingFate::Acked, PingFate::QueuedInAgent, PingFate::ReceivedNoAck, PingFate::ReceivedPending] {
+            assert_eq!(queued_ping_label(&Ok(f), Some("q-1")), None, "a seen ping keeps its meaning");
+        }
+        assert_eq!(queued_ping_label(&Err("unreadable".into()), Some("q-1")), None);
+    }
+
     // ───────── ★(0.14.43 · J3) pane 밖에서 보낸 메시지의 발신자 표기(`from=null` · "발신 unknown") ─────────
     //
     // 데몬은 검증 신원이 있으면 그것을 늘 우선하고(커널 peer → pane 조상 사슬) 없을 때만 요청의 `from` 을 본다. pane 밖 CLI 는 검증할 좌석이 없어 `from` 이
@@ -39004,7 +39467,7 @@ mod tests {
         let arm = arm.split("Command::SendKey").next().unwrap();
         assert!(arm.contains("let from = send_from_param("), "Send 의 from 이 라벨 판정을 거치지 않는다");
         assert_eq!(arm.matches("\"from\": from,").count(), 2, "직접 요청과 큐 전환 폴백이 같은 from 값을 쓰지 않는다");
-        let it = item_body(src, "\nfn inject_text(sid: u64");
+        let it = item_body(src, "\nfn inject_text_sent(sid: u64");
         assert_eq!(it.matches("inject_params_with_sender(").count(), 1, "inject_text 의 라벨 래퍼는 직접 붙여넣기 요청 한 곳");
         assert!(it.contains("\"inject\","), "inject_text 의 kind 는 inject");
         assert!(it.contains("\"from\": \"inject(typing_guard fallback)\""), "타이핑 가드 폴백 라벨은 무변경");
@@ -39022,7 +39485,7 @@ mod tests {
         let inject = &rv[..rv.find("fn read_screen(").expect("read_screen")];
         assert!(inject.contains("inject_text_on(socket, sid, text, timeout, \"drain\")"), "drain --verify 경로의 kind 가 drain 이 아니다");
         // send-key: 라벨 코드 없음.
-        let karm = src.split("Command::SendKey { surface, to, queued, keys } => {").nth(1).expect("SendKey arm");
+        let karm = src.split("Command::SendKey { surface, to, queued, keys").nth(1).expect("SendKey arm");
         let karm = karm.split("Command::SetStatus").next().unwrap();
         let helper = item_body(src, "\nfn send_key_request_params(");
         let helper = &helper[..helper.find("\n}\n").expect("함수 끝")]; // 뒤따르는 라벨 함수의 문서 주석은 제외
@@ -41274,7 +41737,7 @@ mod tests {
         // 되돌림 뮤테이션(두 제출 복귀)을 잡는 축 — Verified 팔의 재주입 제출 호출은 정확히 1곳이다.
         let verified = compact.split("ClearEffect::Verified => {").nth(1).expect("Verified 팔")
             .split("ClearEffect::Unverified =>").next().expect("Verified 팔 끝");
-        let ok_arm = verified.split("Ok(()) => {").nth(1).expect("재주입 직전 유휴 Ok 팔")
+        let ok_arm = verified.split("Ok(_) => {").nth(1).expect("재주입 직전 유휴 Ok 팔")
             .split("Err(e) => Err(cycle_reinject_held(").next().expect("Ok 팔 끝");
         assert_eq!(ok_arm.matches("inject_text(sid,").count(), 1,
             "Verified 재주입이 한 제출이 아니다(디렉티브·RESUME 두 제출 = Claude 큐 선두 차단):\n{ok_arm}");
@@ -41509,8 +41972,9 @@ mod tests {
         let body = refl_fn_body(include_str!("cys.rs"), "run_reinject");
         let compose_at = body.find("compose_directive(&role_name)\n")
             .expect("compose_directive 호출 소실");
-        let inject_at = body.find("inject_text(sid, &directive)\n")
-            .expect("inject_text 호출 소실");
+        // ★(0.14.56 · PKG-2 m1) the forced path calls `inject_text_sent` (it prints "queued as one job" for a converted send).
+        let inject_at = body.find("inject_text_sent(sid, &directive)\n")
+            .expect("inject_text_sent 호출 소실");
         assert!(compose_at < inject_at, "compose 가 inject 보다 앞이어야 한다");
         let hint_count = body.matches(".map_err(|e| reinject_claim_exhausted_hint(e, reinject_claim_consumed))?;").count();
         assert_eq!(hint_count, 2, "compose·inject 양쪽 모두 소진 힌트로 감싸야 한다: {hint_count}건");
@@ -41581,6 +42045,23 @@ mod tests {
             cycle_agent_exit(&Err(format!("{CYCLE_HUMAN_DRAFT_TOKEN} x"))),
             85,
         );
+    }
+
+    /// PKG-2 M1 (0.14.56): the unregistered token has no exit arm (rc 1, like the step-0 stop for the same condition), no
+    /// mapped token is a prefix of it or it of one, and the remedy names the seat's role or a placeholder.
+    #[test]
+    fn pkg2_m1_unregistered_token_exits_1_and_remedy_names_the_role() {
+        let token = CYCLE_TARGET_UNREGISTERED_TOKEN;
+        assert_eq!(cycle_agent_exit(&Err(format!("{token} x"))), 1);
+        for other in [
+            CLEAR_UNVERIFIED_TOKEN, CLEAR_UNMEASURABLE_TOKEN, CYCLE_TARGET_BUSY_TOKEN, CYCLE_HUMAN_DRAFT_TOKEN,
+            CYCLE_REINJECT_HELD_TOKEN, CYCLE_SKIPPED_TOKEN, CYCLE_BUSY_TOKEN, VERIFIER_COLLISION_TOKEN, VERIFIER_UNRESOLVED_TOKEN,
+        ] {
+            assert!(!token.starts_with(other) && !other.starts_with(token), "{token} vs {other}");
+        }
+        assert!(unregistered_seat_remedy(Some("worker-3")).contains("`cys launch-agent --role worker-3 --agent <agent>`"));
+        assert!(unregistered_seat_remedy(None).contains("--role <role>"));
+        assert!(!unregistered_seat_remedy(None).contains("명시 필요"));
     }
 
     #[test]
@@ -41699,33 +42180,16 @@ mod tests {
             .lines()
             .find(|line| line.trim_start().starts_with("/// 84·85"))
             .expect("CycleAgent doc 의 84·85 줄 없음");
-        if !held_line.contains("C-u 1키") {
-            failures.push("CycleAgent doc 에 C-u 1키 선행 가능성 없음".to_string());
+        // ★(0.14.56 · PKG-2 M1) clear_first_unsupported is no longer an 84 hold: the line must say rc 1 (no-write failure).
+        if !held_line.contains("clear_first_unsupported") || !held_line.contains("rc 1") || held_line.contains("C-u 1키") {
+            failures.push("CycleAgent docs must describe clear_first_unsupported as the rc 1 no-write failure".to_string());
         }
-
-        let (_, fallback, atomic_refusal) = d16_clear_atomic_and_fallback_source();
-        // 원자 거부는 송신 0건이고, C-u 선행 송신 문면은 미지원 폴백 본문 거부에만 남는다.
+        let (_, unsupported, atomic_refusal) = d16_clear_atomic_and_fallback_source();
         if !atomic_refusal.contains("송신 0건 · composer 무변경") {
-            failures.push("원자 clear 거부 문면에 송신 0건·composer 무변경 설명 없음".to_string());
+            failures.push("atomic refusal must describe zero bytes".to_string());
         }
-        if atomic_refusal.contains("C-u 1건은 선행 송신됨") {
-            failures.push("원자 clear 거부가 선행 송신을 거짓 보고".to_string());
-        }
-        let refusal = fallback
-            .split_once("\"text\": clear")
-            .expect("clear 본문 송신 없음")
-            .1
-            .split_once("if is_typing_guard_err(&e) {")
-            .expect("typing_guard 거부 분기 없음")
-            .1
-            .split_once("} else {")
-            .expect("typing_guard 거부 분기 끝 없음")
-            .0;
-        if !refusal.contains("C-u 1건은 선행 송신됨") {
-            failures.push("typing_guard 거부 문면에 C-u 1건 선행 송신 설명 없음".to_string());
-        }
-        if refusal.contains("초안 소거 금지") {
-            failures.push("typing_guard 거부 문면에 종전 초안 소거 금지 설명 잔존".to_string());
+        if unsupported.contains("request(") || !unsupported.contains("CycleOutcome::NotCleared") {
+            failures.push("unsupported must hold without a write".to_string());
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
@@ -42106,6 +42570,9 @@ mod tests {
         let src = include_str!("cys.rs");
         let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계")];
         for marker in markers {
+            // The autopilot still recognizes this historical marker from older CLIs.
+            // D7 removes its producer; it must not be restored to satisfy this census.
+            if marker == "C-u 1건은 선행 송신됨" { continue; }
             assert!(
                 !marker.contains("/clear"),
                 "키 송신 마커는 어댑터 clear_cmd에 종속되면 안 된다: {marker}"
@@ -42148,8 +42615,43 @@ mod tests {
     }
 
     #[test]
+    fn p1_e_d2_composer_export_controls_cycle_classification() {
+        let screen = "❯ carry on please\n";
+        let classify = |composer: Option<Value>, pending: u64, human: u64| {
+            let mut reply = json!({"text": screen, "quiet_secs": 10.0});
+            if let Some(c) = composer { reply["composer"] = c; }
+            cycle_target_observation(Ok(reply), Ok(json!({
+                "pending_input_bytes": pending, "pending_input_human_bytes": human
+            })), &["❯".to_string()], None, &[]).state
+        };
+        let c = |verdict: &str, owner: &str, pending: u64, human: u64| json!({
+            "verdict": verdict, "governed": true, "owner": owner, "owner_kind": "verified",
+            "modal": false, "output_gen": 8, "input_gen": 3,
+            "pending_bytes": pending, "human_bytes": human
+        });
+        for verdict in ["suggestion", "empty", "placeholder"] {
+            assert_eq!(classify(Some(c(verdict,"none",0,0)),0,0), CycleTargetState::Idle, "T-C1 {verdict}");
+            assert_eq!(classify(Some(c(verdict,"machine",6,0)),6,0), CycleTargetState::MachineResidue, "T-C4 {verdict}");
+        }
+        assert_eq!(classify(None,0,0), CycleTargetState::HumanDraft, "T-C2 absent");
+        assert_eq!(classify(Some(c("unknown","none",0,0)),0,0), CycleTargetState::HumanDraft, "unknown fallback");
+        assert_eq!(classify(Some(c("suggestion","none",0,0)),0,1), CycleTargetState::HumanDraft, "T-C3 entry human");
+        assert_eq!(classify(Some(c("suggestion","none",0,1)),0,0), CycleTargetState::HumanDraft, "T-C3 frame human");
+        assert_eq!(classify(Some(c("empty","own_paste",0,0)),0,0), CycleTargetState::Busy, "own paste precedes empty");
+        assert_eq!(classify(Some(c("draft","machine",0,0)),0,0), CycleTargetState::MachineResidue, "owner proof with zero mirror");
+        assert_eq!(classify(Some(c("draft","none",0,0)),0,0), CycleTargetState::HumanDraft, "unowned draft");
+        let mut moved = c("suggestion","none",0,0); moved["output_gen"] = Value::Null;
+        assert_eq!(classify(Some(moved),0,0), CycleTargetState::Busy, "inconsistent frame");
+        let mut modal = c("suggestion","none",0,0); modal["modal"] = json!(true);
+        assert_eq!(classify(Some(modal),0,0), CycleTargetState::Busy, "same frame modal");
+        let mut ung = c("suggestion","none",0,0); ung["governed"] = json!(false);
+        assert_eq!(classify(Some(ung),0,0), CycleTargetState::HumanDraft, "ungoverned fallback");
+    }
+
+    #[test]
     fn d16_target_state_busy_when_output_streaming() {
         let mut obs = CycleTargetObs {
+        composer: None,
             gate_or_modal: false,
             screen: Some(cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT),
             quiet: Some(false),
@@ -42167,6 +42669,7 @@ mod tests {
     #[test]
     fn d16_target_state_idle_on_quiet_empty_composer() {
         let mut obs = CycleTargetObs {
+        composer: None,
             gate_or_modal: false,
             screen: Some(cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT),
             quiet: Some(true),
@@ -42186,6 +42689,7 @@ mod tests {
     #[test]
     fn d16_target_state_human_draft() {
         let mut obs = CycleTargetObs {
+        composer: None,
             gate_or_modal: false,
             screen: None,
             quiet: Some(false),
@@ -42236,6 +42740,7 @@ mod tests {
         ] {
             assert_eq!(
                 cycle_target_state(&CycleTargetObs {
+        composer: None,
                     gate_or_modal: false,
                     screen,
                     quiet,
@@ -42256,6 +42761,7 @@ mod tests {
         ] {
             assert_eq!(
                 cycle_target_state(&CycleTargetObs {
+        composer: None,
                     gate_or_modal: false,
                     screen: Some("마커 없는 화면"),
                     quiet,
@@ -42282,17 +42788,18 @@ mod tests {
             }).expect("유휴 대기 호출 닫힘");
             tail[..end].chars().filter(|c| !c.is_whitespace()).collect()
         }).collect();
-        assert_eq!(calls.len(), 3, "clear 직전 1곳·재주입 직전 2곳의 정책을 모두 잰다");
+        assert_eq!(calls.len(), 4, "initial clear, retry, and two reinject paths");
         assert!(calls[0].ends_with("\"clear직전\",true,"), "clear 직전만 기계 잔여를 허용한다: {}", calls[0]);
-        assert!(calls[1].ends_with("\"재주입직전\",false,"), "검증 뒤 재주입은 기계 잔여를 허용하지 않는다: {}", calls[1]);
-        assert!(calls[2].ends_with("\"재주입직전(측정불능)\",false,"), "측정 불능 재주입도 기계 잔여를 허용하지 않는다: {}", calls[2]);
+        assert!(calls[1].ends_with("\"clearretry\",true,"));
+        assert!(calls[2].ends_with("\"재주입직전\",false,"), "검증 뒤 재주입은 기계 잔여를 허용하지 않는다: {}", calls[1]);
+        assert!(calls[3].ends_with("\"재주입직전(측정불능)\",false,"), "측정 불능 재주입도 기계 잔여를 허용하지 않는다: {}", calls[2]);
 
         let gate = strip_line_comments(refl_fn_body(include_str!("cys.rs"), "wait_cycle_target_idle"));
         let compact: String = gate.chars().filter(|c| !c.is_whitespace()).collect();
         assert!(compact.contains("CycleTargetState::MachineResidueifallow_machine_residue=>{"), "허용 인자가 기계 잔여 분기를 통제해야 한다");
         let allowed = compact.split_once("CycleTargetState::MachineResidueifallow_machine_residue=>{")
             .expect("기계 잔여 허용 분기").1.split_once("CycleTargetState::HumanDraft=>").expect("사람 초안 분기").0;
-        assert!(allowed.contains("eprintln!(") && allowed.contains("returnOk(())"), "clear 직전 통과는 진단을 남기고 성공한다");
+        assert!(allowed.contains("eprintln!(") && allowed.contains("returnOk(CycleTargetFence{"), "clear 직전 통과는 진단을 남기고 성공한다");
         assert!(compact.contains("CycleTargetState::Busy|CycleTargetState::MachineResidue=>{}"), "재주입의 잔여는 Busy와 함께 계속 관측한다");
     }
 
@@ -42338,6 +42845,7 @@ mod tests {
             );
             assert_eq!(
                 cycle_target_state(&CycleTargetObs {
+        composer: None,
                     gate_or_modal: false,
                     screen: Some(screen),
                     quiet: Some(true),
@@ -42384,6 +42892,7 @@ mod tests {
             ] {
                 assert_eq!(
                     cycle_target_state(&CycleTargetObs {
+        composer: None,
                         gate_or_modal: false,
                         screen: Some(screen),
                         quiet,
@@ -42420,99 +42929,47 @@ mod tests {
         (atomic.to_string(), fallback.to_string(), refusal.to_string())
     }
 
-    /// 해당 키의 request부터 첫 오류 전파까지 한정해 폴백 send_text의 매핑을 잘못 세지 않는다.
-    fn d16_clear_key_request_source(key: &str) -> String {
-        let (_, body, _) = d16_clear_atomic_and_fallback_source();
-        let key_at = body.find(&format!("\"key\": \"{key}\"")).expect("키 송신 없음");
-        let start = body[..key_at].rfind("request(").expect("키 요청 없음");
-        let end = key_at + body[key_at..].find("?;").expect("키 오류 전파 없음") + 2;
-        body[start..end].chars().filter(|c| !c.is_whitespace()).collect()
-    }
-
     #[test]
     fn d16_clear_cu_refusal_folds_to_human_draft() {
-        // 원자 clear 거부는 송신 0건·rc85, 미지원 폴백의 C-u도 같은 초안 토큰을 쓴다.
-        let (_, _, refusal) = d16_clear_atomic_and_fallback_source();
-        let compact: String = refusal.chars().filter(|c| !c.is_whitespace()).collect();
-        assert!(compact.contains("returnErr(ifis_typing_guard_err(&e){format!(\"{CYCLE_HUMAN_DRAFT_TOKEN}"));
-        assert!(compact.contains("}else{e});"), "원자 경로의 가드 밖 오류는 원형 전파");
-        assert!(refusal.contains("clear 원자 송신 거부(송신 0건 · composer 무변경)"));
-        assert!(!refusal.contains("C-u 1건은 선행 송신됨"), "원자 거부는 선행 송신이 없다");
-        let call = d16_clear_key_request_source("C-u");
-        assert!(call.starts_with("request(\"surface.send_key\","), "C-u 요청 배선 없음");
-        assert!(
-            call.contains(".map_err(|e|{ifis_typing_guard_err(&e){format!(\"{CYCLE_HUMAN_DRAFT_TOKEN}"),
-            "C-u 타이핑 가드 거부가 사람 초안 토큰으로 접히지 않는다"
-        );
-        assert!(call.ends_with("}else{e}})?;"), "타이핑 가드 밖 오류는 원형대로 전파해야 한다");
+        let (_, unsupported, refusal) = d16_clear_atomic_and_fallback_source();
+        assert!(refusal.contains("is_typing_guard_err(&e)"));
+        assert!(refusal.contains("{CYCLE_HUMAN_DRAFT_TOKEN}"));
+        assert!(refusal.contains("송신 0건 · composer 무변경"));
+        assert!(unsupported.contains("CycleOutcome::NotCleared"));
+        assert!(!unsupported.contains("request("), "unsupported must not write C-u");
     }
 
     #[test]
     fn d16_clear_submit_refusal_folds_to_human_draft() {
-        // 원자 팔은 제출까지 한 번에 판정하고, 폴백 Return 거부도 rc85·원형 오류를 보존한다.
-        let (atomic, fallback, refusal) = d16_clear_atomic_and_fallback_source();
-        assert!(!atomic.contains("surface.send_key"), "원자 팔 뒤에 별도 제출 키가 있으면 안 된다");
+        let (_, unsupported, refusal) = d16_clear_atomic_and_fallback_source();
+        assert!(!d16_clear_stage_source().contains("surface.send_key"), "no detached submit");
         assert!(refusal.contains("CYCLE_HUMAN_DRAFT_TOKEN"));
-        assert!(refusal.contains("송신 0건 · composer 무변경"));
-        assert!(!refusal.contains("들어갔지만 제출되지 않았다"));
-        let text = fallback.split_once("\"text\": clear").expect("폴백 본문 송신").1
-            .split_once("?;").expect("폴백 본문 오류 전파").0;
-        let text: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-        assert!(text.contains(".map_err(|e|{ifis_typing_guard_err(&e){format!(\"{CYCLE_HUMAN_DRAFT_TOKEN}"));
-        assert!(text.ends_with("}else{e}})"), "폴백 본문도 가드 밖 오류는 원형 전파");
-        let call = d16_clear_key_request_source("Return");
-        assert!(call.starts_with("request(\"surface.send_key\","), "Return 요청 배선 없음");
-        assert!(
-            call.contains(".map_err(|e|{ifis_typing_guard_err(&e){format!(\"{CYCLE_HUMAN_DRAFT_TOKEN}"),
-            "Return 타이핑 가드 거부가 사람 초안 토큰으로 접히지 않는다"
-        );
-        assert!(call.ends_with("}else{e}})?;"), "타이핑 가드 밖 오류는 원형대로 전파해야 한다");
+        assert!(unsupported.contains("clear_first_unsupported"));
+        assert!(unsupported.contains("return Err("));
     }
 
     #[test]
     fn d16_keys_sent_marker_only_after_cu_success() {
-        // 원자 성공 팔·폴백 C-u 성공 뒤에만 마커를 찍어 송신 0건의 오기록을 막는다.
-        let (atomic, body, refusal) = d16_clear_atomic_and_fallback_source();
-        let (before_success, success) = atomic.split_once("Ok(_) => {").expect("원자 성공 팔");
-        let marker_literal = "[cycle 5/7] 입력 버퍼 정리 + '";
-        assert!(!before_success.contains(marker_literal));
-        assert!(success.contains(marker_literal), "원자 성공 뒤 송신 마커 누락");
-        assert!(success.contains("원자"), "5단계가 원자 경로임을 명시해야 한다");
-        for literal in ["C-u 1건은 선행 송신됨", marker_literal] {
-            assert!(!refusal.contains(literal), "원자 거부에 송신 마커가 있다: {literal}");
-        }
-        let cu = body.find("\"key\": \"C-u\"").expect("C-u 송신 없음");
-        let done = cu + body[cu..].find("?;").expect("C-u 오류 전파 없음") + 2;
-        let marker = body.find("eprintln!(\"[cycle 5/7] 입력 버퍼 정리 + '")
-            .expect("키 송신 마커 출력 없음");
-        assert!(done < marker, "키 송신 마커가 C-u 성공 전에 출력된다");
-        for literal in ["C-u 1건은 선행 송신됨", "[cycle 5/7] 입력 버퍼 정리 + '"] {
-            assert!(!body[..done].contains(literal), "C-u 거부 경로에 키 송신 마커가 있다: {literal}");
-        }
+        let (atomic, unsupported, refusal) = d16_clear_atomic_and_fallback_source();
+        let (before, success) = atomic.split_once("Ok(_) => {").expect("atomic success arm");
+        let marker = "[cycle 5/7] 입력 버퍼 정리 + '";
+        assert!(!before.contains(marker));
+        assert!(success.contains(marker));
+        assert!(!unsupported.contains(marker) && !refusal.contains(marker));
     }
 
     /// ★적대 major ①: 원자 송신 1회 뒤 별도 키를 보내면 다시 사람 입력이 끼어드는 경로가 열린다.
     #[test]
-    fn r1_cycle_clear_is_atomic_with_legacy_fallback_only_when_unsupported() {
-        let (atomic, fallback, refusal) = d16_clear_atomic_and_fallback_source();
-        assert_eq!(atomic.matches("request(").count(), 1, "원자 요청은 1회");
-        assert!(atomic.contains("match request("));
-        assert!(atomic.contains("\"surface.send_text\""));
+    fn r1_cycle_clear_is_atomic_and_unsupported_holds_without_fallback() {
+        let (atomic, unsupported, _) = d16_clear_atomic_and_fallback_source();
+        assert_eq!(atomic.matches("request(").count(), 1);
+        assert!(atomic.contains(r#"match request("surface.send_text", params)"#));
         assert!(atomic.contains("\"clear_first\": true"));
         assert!(atomic.contains("\"text\": clear"));
-        assert!(atomic.contains("\"quiet\": true"));
-        assert!(!atomic.contains("surface.send_key") && !atomic.contains("sleep("));
-        assert!(!refusal.contains("request(") && !refusal.contains("sleep("));
-        assert_eq!(fallback.matches("request(").count(), 3, "미지원 팔에만 종전 3분할");
-        assert_eq!(fallback.matches("surface.send_key").count(), 2);
-        assert_eq!(fallback.matches("surface.send_text").count(), 1);
-        assert!(!fallback.contains("\"clear_first\": true"));
-        assert!(fallback.contains("이 좌석은 launch-agent 등록이 없어 원자 clear 를 못 쓴다 — 3분할 폴백"));
-        let cu = fallback.find("\"key\": \"C-u\"").unwrap();
-        let settle = fallback.find("Duration::from_millis(200)").expect("종전 settle 보존");
-        let text = fallback.find("\"text\": clear").unwrap();
-        let submit = fallback.find("\"key\": \"Return\"").unwrap();
-        assert!(cu < settle && settle < text && text < submit);
+        assert!(!unsupported.contains("request(") && !unsupported.contains("sleep("));
+        assert!(unsupported.contains("CycleOutcome::NotCleared"));
+        assert!(unsupported.contains("clear_first_unsupported"));
+        assert!(!d16_clear_stage_source().contains("surface.send_key"));
     }
 
     #[test]
@@ -42548,12 +43005,11 @@ mod tests {
         assert!(target < quiesce, "사전 턴 확인은 quiescing 앞이어야 한다");
         let atomic = body.find("match request(").expect("원자 clear 송신 없음");
         let fallback = body.find("Err(e) if is_clear_first_unsupported_err(&e) => {").expect("미지원 폴백 없음");
-        let cu = body.find("\"key\": \"C-u\"").expect("입력버퍼 정리 없음");
-        assert!(quiesce < atomic && atomic < fallback && fallback < cu,
-            "유휴·quiescing 뒤 원자 송신, 미지원 팔 안에서만 C-u 순서여야 한다");
-        let verdict = body.find("clear_effect_verdict(").expect("clear 실효 판정 없음");
-        let submit = body.find("\"key\": \"Return\"").expect("폴백 제출 없음");
-        assert!(cu < submit && submit < verdict, "폴백 송신도 실효 확인보다 앞이어야 한다");
+        assert!(quiesce < atomic && atomic < fallback);
+        assert!(!body.contains("\"key\": \"C-u\""));
+        assert!(!body.contains("\"key\": \"Return\""));
+        let verdict = body.find("clear_effect_verdict(").expect("clear effect check");
+        assert!(fallback < verdict);
         let directive = body.find("compose_directive(").expect("디렉티브 재주입 없음");
         assert!(verdict < directive, "clear 실효 판정 전에 디렉티브가 재주입된다");
         let sent = body.find("\"text\": clear").expect("clear 송신 없음");
@@ -42592,8 +43048,7 @@ mod tests {
         let measured = body.find("allow_at.elapsed()").expect("잔여 창이 실측이 아니다");
         assert!(report < measured, "잔여 창 보고가 실측식보다 뒤에 있다");
         let atomic = body.find("match request(").expect("원자 clear 송신 없음");
-        let cu = body.find("\"key\": \"C-u\"").expect("폴백 입력버퍼 정리 없음");
-        assert!(measured < atomic && atomic < cu, "잔여 창 보고는 원자·폴백 첫 송신 앞이어야 한다");
+        assert!(measured < atomic, "residual window precedes atomic attempt");
         // 파이썬 쪽 문면도 실제 상한(사전 턴 확인 포함)을 적어야 한다 — 문면↔코드 드리프트 핀.
         // 한국어 본문을 바이트로 자르지 않도록 줄 단위로 읽는다.
         let py = include_str!("../../cysjavis-pack/bin/javis_cycle_autopilot.py");
@@ -46684,7 +47139,7 @@ mod b360_tests {
         let saved = std::env::var_os(cys::ENV_SOCKET);
         let (sock, calls, stop) = send_key_daemon(reply);
         std::env::set_var(cys::ENV_SOCKET, &sock);
-        let rc = run(Command::SendKey { surface: Some("surface:7".into()), to: None, queued: false, keys: vec!["Return".into()] });
+        let rc = run(Command::SendKey { surface: Some("surface:7".into()), to: None, queued: false, expect_output_gen: None, keys: vec!["Return".into()] });
         stop();
         match &saved {
             Some(v) => std::env::set_var(cys::ENV_SOCKET, v),
@@ -47241,6 +47696,189 @@ mod b360_tests {
         let (rc, _out, err) = r2c_child("cycle", &daemon, &pack.envs());
         let error = err.lines().filter(|l| l.starts_with("error: ")).last().unwrap_or_default().to_string();
         (rc, error, daemon.calls())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn p1_e_d7_cycle_rpc_loop_preserves_fences_holds_and_outcomes() {
+        for (code, retries, expected_outcome) in [
+            ("guard_aborted", 2, "cleared"),
+            (cys::ERR_JOURNAL_UNAVAILABLE, 2, "cleared"),
+            ("own_paste_settling", 1, "not_cleared"),
+            ("cycle_clear_unclaimed", 1, "not_cleared"),
+            ("clear_first_unsupported", 1, "not_cleared"),
+            (cys::ERR_TYPING_GUARD, 1, "not_cleared"),
+            (cys::ERR_WRITE_OUTCOME_UNKNOWN, 1, "unknown"),
+        ] {
+            let pack = R2cPack::new();
+            let cwd = pack.dir.clone();
+            let code = code.to_string(); let named = code.clone();
+            let mut attempts = 0; let mut reads = 0; let mut cleared = false;
+            let daemon = R2cDaemon::start(move |method, p| match method {
+                "surface.cycle_claim" => r2c_ok(json!({"claim":"claimed"})),
+                "surface.list" => r2c_ok(json!({"surfaces":[{
+                    "surface_id":7, "surface_ref":"surface:7", "role":"worker", "agent":"claude",
+                    "exited":false, "awakened_at":1.0, "cwd":cwd, "live_cwd":cwd,
+                    "pending_input_bytes":0,"pending_input_human_bytes":0,
+                    "usage":{"source":"statusline","session_file":if cleared {"S2"} else {"S1"}}
+                }]})),
+                "surface.read_text" => {
+                    reads += 1;
+                    r2c_ok(json!({"text": cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT,
+                        "quiet_secs":5.0, "composer":{"verdict":"empty","governed":true,"modal":false,
+                        "owner":"none","owner_kind":"unattributed","output_gen":2*reads,"input_gen":reads,
+                        "pending_bytes":0,"human_bytes":0}}))
+                },
+                "surface.send_text" if p["clear_first"] == true => {
+                    attempts += 1;
+                    if attempts == 1 { json!({"ok":false,"error":{"code":code,"message":code}}) }
+                    else { cleared = true; r2c_ok(json!({})) }
+                },
+                _ => r2c_ok(json!({})),
+            });
+            let (rc, _out, err) = r2c_child("cycle", &daemon, &pack.envs());
+            let calls = daemon.calls();
+            let clears: Vec<_> = calls.iter().filter(|(m,p)|m=="surface.send_text" && p["clear_first"]==true).collect();
+            assert_eq!(clears.len(), retries, "D7 retry precedence {named}: {err}");
+            let mut generation = 0; let mut last_sent_generation = 0;
+            for (m,p) in &calls {
+                if m=="surface.read_text" { generation += 1; assert_eq!(p["composer"],json!(true),"D2 opt-in"); }
+                if m=="surface.send_text" && p["clear_first"]==true {
+                    assert!(generation > last_sent_generation, "D7 must reobserve before each attempt {named}");
+                    last_sent_generation = generation;
+                    assert_eq!(p["cycle_clear"],json!(true),"D7 discriminator {named}");
+                    assert_eq!(p["expect_output_gen"],json!(2*generation),"D7 fresh output fence {named}");
+                    assert_eq!(p["expect_input_gen"],json!(generation),"D7 same frame input fence {named}");
+                    assert_eq!(p["admitted"],json!("idle"));
+                }
+            }
+            assert_eq!(r2c_quiesce_outcome(&calls).as_deref(),Some(expected_outcome),"D7 cleanup {named}: {err}");
+            let first = calls.iter().position(|(m,p)|m=="surface.send_text" && p["clear_first"]==true).unwrap();
+            let end = calls[first+1..].iter().position(|(m,p)|m=="surface.send_text" && p["authoritative"]==true)
+                .map(|n|first+1+n).unwrap_or(calls.len());
+            assert!(!calls[first..end].iter().any(|(m,_)|m=="surface.send_key"),"D7 no split fallback {named}");
+            if retries==2 { assert_eq!(rc,0,"{named}: {err}"); }
+            else { assert_ne!(rc,0,"{named}"); assert!(err.contains(&named),"D7 visible refusal {named}: {err}"); }
+            assert!(!err.contains("[diag=quiet_secs_unreported]"),"D7 transient refusal {named}");
+        }
+    }
+
+    /// The fake seat for the PKG-2 M1 specimens: worker role, idle composer, `agent` as given (None = no registration).
+    #[cfg(unix)]
+    fn pkg2_m1_daemon(cwd: std::path::PathBuf, agent: Option<&'static str>) -> R2cDaemon {
+        let mut reads = 0;
+        R2cDaemon::start(move |method, p| match method {
+            "surface.cycle_claim" => r2c_ok(json!({"claim":"claimed"})),
+            "surface.list" => r2c_ok(json!({"surfaces":[{
+                "surface_id":7, "surface_ref":"surface:7", "role":"worker", "agent":agent,
+                "exited":false, "awakened_at":1.0, "cwd":cwd, "live_cwd":cwd,
+                "pending_input_bytes":0,"pending_input_human_bytes":0,
+                "usage":{"source":"statusline","session_file":"S1"}
+            }]})),
+            "surface.read_text" => {
+                reads += 1;
+                r2c_ok(json!({"text": cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT,
+                    "quiet_secs":5.0, "composer":{"verdict":"empty","governed":true,"modal":false,
+                    "owner":"none","owner_kind":"unattributed","output_gen":2*reads,"input_gen":reads,
+                    "pending_bytes":0,"human_bytes":0}}))
+            }
+            "surface.send_text" if p["clear_first"] == true => json!({"ok":false,"error":{
+                "code":"clear_first_unsupported",
+                "message":"clear_first requires a launch-agent-registered pane (Ctrl-U semantics vary by TUI)"}}),
+            _ => r2c_ok(json!({})),
+        })
+    }
+
+    /// PKG-2 M1 (0.14.56): the atomic clear refused as `clear_first_unsupported` (the seat has no registered agent) is
+    /// a FAILURE with its own token and the working remedy - not the BUSY-labelled rc 84, which every caller reads as
+    /// "retry later" for a state no retry changes (51f029a1 removed the split fallback on purpose). Zero extra writes.
+    #[cfg(unix)]
+    #[test]
+    fn pkg2_m1_clear_first_unsupported_is_a_named_failure_not_busy() {
+        let pack = R2cPack::new();
+        let daemon = pkg2_m1_daemon(pack.dir.clone(), Some("claude"));
+        let (rc, _out, err) = r2c_child("cycle", &daemon, &pack.envs());
+        let calls = daemon.calls();
+        let line = err.lines().filter(|l| l.starts_with("error: ")).last().unwrap_or_default().to_string();
+        assert_eq!(rc, 1, "an unregistered seat is a failure, not the 84 hold: {err}");
+        assert!(line.starts_with("error: cycle-target-unregistered:"), "distinct token: {line}");
+        assert!(!err.contains("cycle-target-busy:"), "must not read as BUSY: {err}");
+        assert!(line.contains("cys launch-agent --role worker"), "names the working remedy: {line}");
+        assert!(line.contains("clear_first_unsupported"), "the daemon's code stays visible: {line}");
+        let clears = calls.iter().filter(|(m, p)| m == "surface.send_text" && p["clear_first"] == true).count();
+        assert_eq!(clears, 1, "one atomic attempt, no retry: {err}");
+        // The save instruction before the clear submits with its own Return; the fallback would be a key AFTER the refusal.
+        let first = calls.iter().position(|(m, p)| m == "surface.send_text" && p["clear_first"] == true).expect("the clear");
+        assert!(!calls[first..].iter().any(|(m, _)| m == "surface.send_key"), "no split fallback after the refusal: {calls:?}");
+        assert_eq!(r2c_quiesce_outcome(&calls).as_deref(), Some("not_cleared"), "{err}");
+    }
+
+    /// PKG-2 M1 (0.14.56): the step-0 stop for a seat with no registered agent keeps rc 1 and its place, but no longer
+    /// advises `--clear-cmd` - since 51f029a1 that only leads to the refused atomic clear. Nothing is written.
+    #[cfg(unix)]
+    #[test]
+    fn pkg2_m1_step0_unregistered_names_launch_agent_not_clear_cmd() {
+        let pack = R2cPack::new();
+        let daemon = pkg2_m1_daemon(pack.dir.clone(), None);
+        let (rc, _out, err) = r2c_child("cycle", &daemon, &pack.envs());
+        let calls = daemon.calls();
+        let line = err.lines().filter(|l| l.starts_with("error: ")).last().unwrap_or_default().to_string();
+        assert_eq!(rc, 1, "{err}");
+        assert!(line.starts_with("error: agent 메타 없음"), "same place: {line}");
+        assert!(line.contains("cys launch-agent --role worker"), "names the working remedy: {line}");
+        assert!(!line.contains("--clear-cmd 명시 필요"), "the --clear-cmd advice is false since 51f029a1: {line}");
+        assert!(
+            !calls.iter().any(|(m, _)| m == "surface.send_text" || m == "surface.send_key" || m == "surface.quiesce"),
+            "step 0 sends nothing: {calls:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn p1_e_d7_retry_cap_reobservation_and_legacy_discriminator() {
+        for mode in ["cap", "human_after_abort", "no_claim", "old_daemon"] {
+            let pack = R2cPack::new(); let cwd = pack.dir.clone();
+            let mut attempts = 0; let mut cleared = false;
+            let daemon = R2cDaemon::start(move |method,p| match method {
+                "surface.cycle_claim" => r2c_ok(if mode=="no_claim" {json!({})} else {json!({"claim":"claimed"})}),
+                "surface.list" => r2c_ok(json!({"surfaces":[{
+                    "surface_id":7,"surface_ref":"surface:7","role":"worker","agent":"claude",
+                    "exited":false,"awakened_at":1.0,"cwd":cwd,"live_cwd":cwd,
+                    "pending_input_bytes":0,"pending_input_human_bytes":0,
+                    "usage":{"source":"statusline","session_file":if cleared {"S2"} else {"S1"}}
+                }]})),
+                "surface.read_text" => {
+                    let mut r = json!({"text":cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT,"quiet_secs":5.0});
+                    if mode!="old_daemon" {r["composer"]=json!({
+                        "verdict":"empty","governed":true,"modal":false,"owner":"none",
+                        "input_gen":2,"output_gen":4,"pending_bytes":0,
+                        "human_bytes":if mode=="human_after_abort" && attempts>0 {1} else {0}
+                    });}
+                    r2c_ok(r)
+                },
+                "surface.send_text" if p["clear_first"]==true => {
+                    attempts+=1;
+                    if mode=="cap" || mode=="human_after_abort" {
+                        json!({"ok":false,"error":{"code":"guard_aborted","message":"guard_aborted"}})
+                    } else {cleared=true;r2c_ok(json!({}))}
+                },
+                _ => r2c_ok(json!({})),
+            });
+            let (rc,_out,err)=r2c_child("cycle",&daemon,&pack.envs());
+            let calls=daemon.calls();
+            let clears:Vec<_>=calls.iter().filter(|(m,p)|m=="surface.send_text" && p["clear_first"]==true).collect();
+            match mode {
+                "cap" => {assert_eq!(clears.len(),3,"D7 attempt cap: {err}");assert_eq!(rc,1,"D7 cap must return the refusal: {err}");assert!(err.contains("guard_aborted"));},
+                "human_after_abort" => {assert_eq!(clears.len(),1,"D7 reobserve human: {err}");assert_eq!(rc,EXIT_CYCLE_HUMAN_DRAFT);},
+                _ => {
+                    assert_eq!(rc,0,"{mode}: {err}");assert_eq!(clears.len(),1);
+                    assert!(clears[0].1.get("cycle_clear").is_none(),"D7 legacy discriminator {mode}");
+                    assert!(clears[0].1.get("expect_output_gen").is_none(),"D7 legacy fence {mode}");
+                }
+            }
+            let want=if mode=="cap" || mode=="human_after_abort" {"not_cleared"} else {"cleared"};
+            assert_eq!(r2c_quiesce_outcome(&calls).as_deref(),Some(want),"D7 every exit cleanup {mode}");
+        }
     }
 
     /// How many authoritative pastes followed the atomic /clear (the reinject writes: directive + RESUME, RESUME alone).
@@ -52462,4 +53100,208 @@ mod p3r1_caller_tests {
             let _ = std::fs::remove_dir_all(&r._root);
         }
     }
+}
+
+// ★(0.14.56 · P1 D9 · design r3 §12 T-S4) `cys send` prints from the reply.
+#[cfg(test)]
+mod d9_send_print_tests {
+    use super::*;
+
+    /// A converted direct send (new daemon) prints QUEUED and the TTL-only aux line; mutant: print from the local flag.
+    #[test]
+    fn converted_reply_prints_queued_with_the_ttl_aux_line() {
+        let r = json!({"surface_id": 3, "sent": true, "queued": true, "converted": "one_job", "depth": 1,
+                       "queue_entry_id": "q-1", "durable": true, "return_absorb": true, "return_absorb_secs": 30,
+                       "return_absorb_reflex_ms": 2000});
+        let (aux, line) = send_result_lines(false, &r, "");
+        assert!(line.starts_with("QUEUED (depth 1)"), "{line}");
+        let aux = aux.expect("aux line for a ticketed conversion");
+        assert_eq!(aux, plain_absorb_aux_line(30, None), "no approval-window promise in scope: {aux}");
+    }
+
+    /// An old daemon's direct reply (no `queued`) still prints OK; an explicit `--queued` reply prints QUEUED, no aux.
+    #[test]
+    fn old_reply_shape_prints_ok_and_explicit_queued_has_no_aux() {
+        let (aux, line) = send_result_lines(false, &json!({"surface_id": 3, "sent": true}), " → surface:3");
+        assert_eq!((aux, line.as_str()), (None, "OK → surface:3"));
+        let (aux, line) = send_result_lines(true, &json!({"surface_id": 3, "queued": true, "depth": 2}), "");
+        assert!(aux.is_none() && line.starts_with("QUEUED (depth 2)"), "{line}");
+    }
+}
+
+// ★(0.14.56 · P1 D9 · head ruling 28f2b064) a relauncher's refused boot-gate key is LOUD and non-destructive.
+#[cfg(test)]
+mod d9_relauncher_tests {
+    use super::*;
+
+    fn denied() -> String {
+        format!("{}: a Return into a master/CEO composer submits only a body its own sender queued", cys::ERR_COMPOSER_KEY_DENIED)
+    }
+
+    /// node-recover folds the refusal into the non-destructive code (79): run_boot does not reclaim (kill) a live agent
+    /// waiting at a boot gate. Mutant: drop the fold (catch-all rc 1 -> escalate_reclaim).
+    #[test]
+    fn node_recover_folds_composer_key_denied_into_the_non_destructive_code() {
+        let folded = recover_refusal_from_input_guard(denied());
+        assert!(is_recover_refusal(&folded), "{folded}");
+        assert!(folded.contains(cys::ERR_COMPOSER_KEY_DENIED), "the reason survives the fold: {folded}");
+        assert_eq!(recover_refusal_from_input_guard(folded.clone()), folded, "idempotent");
+    }
+
+    /// The predicate recognises only the daemon's code, and the code is not a typing-guard refusal (which would turn it
+    /// into a `--queued` fallback) nor a journal refusal.
+    #[test]
+    fn composer_key_denied_is_its_own_class() {
+        assert!(is_composer_key_denied(&denied()));
+        assert!(!is_typing_guard_err(&denied()), "must not divert to --queued");
+        assert!(!is_journal_refusal(&denied()));
+        assert!(!is_composer_key_denied(&format!("{}: {}", cys::ERR_TYPING_GUARD, cys::MSG_TYPING_GUARD)));
+        assert!(!is_composer_key_denied("composer_key_denied without the rpc rendering"));
+    }
+
+    /// restore in-seat keeps the seat on this refusal: its arm sits BEFORE the generic fresh-fallback arm, counts the seat
+    /// as gated (rc != 0) and continues without a fresh launch. Behaviour is measured in the isolated-daemon e2e cell (C);
+    /// this pins the arm order the fresh-fallback hazard depends on.
+    #[test]
+    fn restore_in_seat_arm_precedes_the_fresh_fallback() {
+        let src = include_str!("cys.rs");
+        let start = src.find("\nfn run_restore(").expect("run_restore");
+        let body = &src[start..start + 1 + src[start + 1..].find("\nfn ").expect("next fn")];
+        let arm = body.find("Err(e) if is_composer_key_denied(&e) => {").expect("in-seat composer_key_denied arm");
+        let fallback = body.find("좌석 내 재연결 실패({e}) — fresh 기동으로 폴백").expect("generic fallback arm");
+        assert!(arm < fallback, "the refusal would reach the fresh fallback first");
+        let seg = &body[arm..fallback];
+        assert!(seg.contains("gated += 1;") && seg.contains("continue;"), "{seg}");
+    }
+}
+
+/// ★(0.14.56 · P1 D8 · design r2 §9 · T-P1 CLI half) `cys read-screen --composer`: the flag parses (and refuses `--lines` /
+/// `--since` beside it), and the command is ONE `surface.read_text` request with `composer: true` whose reply becomes ONE object.
+#[cfg(test)]
+mod d8_read_screen_composer_tests {
+    use super::*;
+
+    /// Parses on its own 8 MiB thread: building the clap root sits at the libtest 2 MiB stack cliff (head ruling 2026-10-24 D).
+    fn parse(argv: &[&str]) -> Result<Cli, String> {
+        let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+        std::thread::Builder::new()
+            .stack_size(8 << 20)
+            .spawn(move || Cli::try_parse_from(argv).map_err(|e| e.to_string()))
+            .expect("spawn parse thread")
+            .join()
+            .unwrap_or_else(|p| std::panic::resume_unwind(p))
+    }
+
+    fn composer_flag(argv: &[&str]) -> Result<bool, String> {
+        match parse(argv)?.command {
+            Command::ReadScreen { composer, .. } => Ok(composer),
+            _ => Err("not read-screen".into()),
+        }
+    }
+
+    #[test]
+    fn d8_read_screen_parses_composer_and_refuses_it_beside_lines_or_since() {
+        let base = ["cys", "read-screen", "--surface", "surface:3"];
+        assert_eq!(composer_flag(&[&base[..], &["--composer"][..]].concat()), Ok(true));
+        assert_eq!(composer_flag(&base), Ok(false), "without the flag: today's read");
+        for extra in [["--lines", "5"], ["--since", "0"]] {
+            let r = composer_flag(&[&base[..], &["--composer"][..], &extra[..]].concat());
+            assert!(r.is_err(), "--composer beside {extra:?} must be refused (one full frame, never tail text): {r:?}");
+        }
+    }
+
+    #[test]
+    fn d8_read_screen_composer_is_one_request_and_one_object() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let reply = std::cell::RefCell::new(Value::Null);
+        let rpc = |m: &str, p: Value| -> Result<Value, String> {
+            calls.borrow_mut().push((m.to_string(), p));
+            Ok(reply.borrow().clone())
+        };
+        let composer = json!({"verdict": "suggestion", "governed": true, "modal": false, "output_gen": 42});
+        *reply.borrow_mut() = json!({"surface_id": 3, "surface_ref": "surface:3", "text": "❯ hi", "quiet_secs": 4.0,
+                                     "composer": composer.clone()});
+        let out = read_screen_composer(3, &rpc).expect("ok");
+        assert_eq!(out, json!({"text": "❯ hi", "composer": composer, "quiet_secs": 4.0}), "the daemon's object, unchanged");
+        assert_eq!(*calls.borrow(), vec![("surface.read_text".to_string(), json!({"surface_id": 3, "composer": true}))]);
+        // An old daemon ignores the param: no `composer` in its reply -> `composer: null`; no `quiet_secs` -> no key.
+        *reply.borrow_mut() = json!({"surface_id": 3, "text": "plain", "latest_cursor": 9});
+        assert_eq!(read_screen_composer(3, &rpc).expect("ok"), json!({"text": "plain", "composer": null}));
+        // A failed request is an error (a non-zero exit, so the probe falls back), not an empty object.
+        let failing = |_: &str, _: Value| -> Result<Value, String> { Err("socket closed".into()) };
+        assert_eq!(read_screen_composer(3, &failing), Err("socket closed".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod e_modal_cli_tests {
+    use super::*;
+    #[test]
+    fn e_modal_cli_accepts_expected_generation_for_one_key() {
+        let parsed = Cli::try_parse_from(["cys", "send-key", "--surface", "1", "--expect-output-gen", "42", "0"]);
+        assert!(parsed.is_ok(), "E-CLI: shipped modal flow accepts observed generation: {:?}", parsed.err());
+        let Cli { command: Command::SendKey { expect_output_gen, .. }, .. } = parsed.unwrap() else { panic!("send-key") };
+        let base = send_key_request_params(1, "0", false, false, Some(9));
+        let bound = send_key_with_frame(base.clone(), expect_output_gen);
+        assert_eq!(bound["expect_output_gen"], json!(42), "E-CLI: exact observed generation forwarded");
+        assert_eq!(send_key_with_frame(base.clone(), None), base, "E-CLI: old request bytes unchanged");
+        assert!(Cli::try_parse_from(["cys", "send-key", "--surface", "1", "--expect-output-gen", "42", "--queued", "Return"]).is_err(), "E-CLI: a frame-bound key is not persisted for later delivery");
+        let src = include_str!("cys.rs");
+        let arm = src.split("Command::SendKey { surface, to, queued, keys").nth(1).unwrap().split("Command::SetStatus").next().unwrap();
+        assert!(arm.contains("send_key_with_frame(send_key_request_params(sid, key, queued, pair, from), expect_output_gen)"), "E-CLI: RPC uses frame-aware request");
+        assert!(arm.contains("expect_output_gen.is_none() && should_queue_fallback_send_key"), "E-CLI: never retry a frame key as an unbound queued Return");
+    }
+    #[test]
+    #[cfg(unix)]
+    fn e_modal_cli_rpc_carries_frame_and_never_queues_a_guard_error() {
+        let _env = super::tests::ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+        let socket = std::env::temp_dir().join(format!("w35-modal-cli-{}.sock", std::process::id()));
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let saved_calls = calls.clone();
+        let server = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut line = String::new();
+                std::io::BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+                let req: Value = serde_json::from_str(&line).unwrap();
+                if req["method"] == "__stop" { break; }
+                let mut reply = if req["method"] == "surface.send_key" {
+                    saved_calls.lock().unwrap().push(req.clone());
+                    json!({"ok":false,"error":{"code":cys::ERR_TYPING_GUARD,"message":cys::MSG_TYPING_GUARD}})
+                } else if req["method"] == "surface.list" {
+                    json!({"ok":true,"result":{"surfaces":[{"surface_id":7,"surface_ref":"surface:7","role":"worker-7","exited":false},{"surface_id":8,"surface_ref":"surface:8","role":"worker-8","exited":false}]}})
+                } else { json!({"ok":true,"result":{}}) };
+                reply["id"] = req["id"].clone();
+                writeln!(stream, "{reply}").unwrap();
+            }
+        });
+        let saved = std::env::var_os(cys::ENV_SOCKET);
+        std::env::set_var(cys::ENV_SOCKET, &socket);
+        let args = Cli::try_parse_from(["cys", "send-key", "--surface", "7", "--expect-output-gen", "42", "Return"]).unwrap();
+        let rc = run(args.command);
+        let before_arity = calls.lock().unwrap().len();
+        let many_keys = run(Command::SendKey { surface: Some("7".into()), to: None, queued: false,
+            keys: vec!["0".into(), "Return".into()], expect_output_gen: Some(42) });
+        let after_keys = calls.lock().unwrap().len();
+        let resolved = resolve_targets(&None, &Some("worker-*".into()));
+        let many_targets = run(Command::SendKey { surface: None, to: Some("worker-*".into()), queued: false,
+            keys: vec!["0".into()], expect_output_gen: Some(42) });
+        let after_targets = calls.lock().unwrap().len();
+        let mut stop = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        writeln!(stop, "{}", json!({"id":1,"method":"__stop","params":{}})).unwrap();
+        server.join().unwrap();
+        match saved { Some(v)=>std::env::set_var(cys::ENV_SOCKET,v), None=>std::env::remove_var(cys::ENV_SOCKET) }
+        std::fs::remove_file(socket).unwrap();
+        let calls = calls.lock().unwrap();
+        assert_eq!(rc, 1, "E-CLI-RPC: refusal reaches caller");
+        assert_eq!(resolved, Ok(vec![7, 8]), "premise: wildcard actually resolves two live targets");
+        assert_eq!((many_keys, many_targets), (1, 1));
+        assert_eq!(after_keys, before_arity, "E-CLI-ARITY: multiple keys make no key RPC");
+        assert_eq!(after_targets, before_arity, "E-CLI-ARITY: multiple targets make no key RPC");
+        assert_eq!(calls.len(), 1, "E-CLI-RPC: no unbound queue fallback for a frame key");
+        assert_eq!(calls[0]["params"]["expect_output_gen"], json!(42), "E-CLI-RPC: actual request carries observed generation");
+        assert_eq!(calls[0]["params"]["queued"], json!(false));
+    }
+
 }

@@ -1821,6 +1821,9 @@ pub(crate) mod tests {
     #[test]
     fn r2f_dm_no_daemon_test_turns_only_the_home_env_without_a_seam() {
         let needle = concat!("set_var(\"HO", "ME\"");
+        // F-4 (C): HOME is now turned through the unwind-safe guard (`ReapEnvGuard::set(&[("HOME", ..)])`); a guard-turned HOME needs the same seam,
+        // so the scan recognises both forms (concat! keeps this pin from matching itself).
+        let guard_needle = concat!("ReapEnvGuard::set(&[(\"HO", "ME\"");
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/cysd");
         let (mut scanned, mut hits) = (0usize, 0usize);
         for e in std::fs::read_dir(&dir).expect("cysd 소스 디렉터리") {
@@ -1841,7 +1844,7 @@ pub(crate) mod tests {
             }
             chunks.push(&text[start..]);
             for c in chunks {
-                if !c.contains(needle) {
+                if !c.contains(needle) && !c.contains(guard_needle) {
                     continue;
                 }
                 hits += 1;
@@ -2107,7 +2110,8 @@ pub(crate) mod tests {
                 continue;
             }
             let text = std::fs::read_to_string(&path).expect("소스 읽기");
-            let body = strip(text.split("\n#[cfg(test)]").next().unwrap_or(""));
+            let end = text.find("\n#[cfg(test)]\nmod tests {").or_else(|| text.find("\n#[cfg(test)]\npub(crate) mod tests {")).or_else(|| text.find("\n#[cfg(test)]")).unwrap_or(text.len());
+            let body = strip(&text[..end]);
             scanned += 1;
             literals += body
                 .lines()

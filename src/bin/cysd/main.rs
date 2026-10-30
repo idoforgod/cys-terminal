@@ -4962,10 +4962,12 @@ mod env_scrub_tests {
     /// scrub은 누설 변수만 제거하고 무관 변수는 보존해야 한다.
     #[test]
     fn scrub_removes_leaky_session_vars_only() {
-        std::env::set_var("CLAUDE_CODE_SESSION_ID", "parent-session");
-        std::env::set_var("CLAUDE_CODE_CHILD_SESSION", "1");
-        std::env::set_var("CLAUDECODE", "1");
-        std::env::set_var("CYS_SCRUB_TEST_KEEP", "yes"); // 무관 변수 — 보존 확인용
+        let _scrub_env = crate::governance::ReapEnvGuard::set(&[
+            ("CLAUDE_CODE_SESSION_ID", "parent-session"),
+            ("CLAUDE_CODE_CHILD_SESSION", "1"),
+            ("CLAUDECODE", "1"),
+            ("CYS_SCRUB_TEST_KEEP", "yes"), // 무관 변수 — 보존 확인용
+        ]);
         super::scrub_claude_session_env();
         assert!(std::env::var_os("CLAUDE_CODE_SESSION_ID").is_none());
         assert!(std::env::var_os("CLAUDE_CODE_CHILD_SESSION").is_none());
@@ -4975,7 +4977,6 @@ mod env_scrub_tests {
             Ok("yes"),
             "무관 env까지 지우면 안 된다"
         );
-        std::env::remove_var("CYS_SCRUB_TEST_KEEP");
     }
 }
 
@@ -6606,12 +6607,12 @@ mod auto_restore_tests {
     #[test]
     fn retry_delay_env_override() {
         // 기본값
+        let _retry_env = crate::governance::ReapEnvGuard::set(&[("CYS_AUTORESTORE_RETRY_DELAY_MS", "")]);
         std::env::remove_var("CYS_AUTORESTORE_RETRY_DELAY_MS");
         assert_eq!(autorestore_retry_delay(), Duration::from_millis(60_000));
         // override — 이 테스트만 단일 스레드 실행 계약(--test-threads=1)이라 env 격리 안전.
         std::env::set_var("CYS_AUTORESTORE_RETRY_DELAY_MS", "0");
         assert_eq!(autorestore_retry_delay(), Duration::from_millis(0));
-        std::env::remove_var("CYS_AUTORESTORE_RETRY_DELAY_MS");
     }
 
     /// ★T6-L1: RestoreRootGuard 수명 계약 — 정상 스코프·panic unwind·loop 다중 attempt 모든 경로에서
@@ -10005,3 +10006,8 @@ mod hook_job_win_tests {
         assert!(!crate::state::winjob::try_assign_child(u32::MAX - 1));
     }
 }
+
+// ★(0.14.56 · P1 D9) master/CEO composer specimens (send conversion, pair key, Return arm, creator boot-gate carve-out) -
+// test-only module; it calls only entry points that exist at 9da2418d, so applied to the pin it is the RED run.
+#[cfg(test)]
+mod d9_tests;

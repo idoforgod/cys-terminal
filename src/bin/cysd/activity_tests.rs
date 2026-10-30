@@ -355,6 +355,8 @@ fn window_is_bottom_eight_plus_cursor_span_deduplicated_and_clipped() {
 struct Fx {
     daemon: Arc<Daemon>,
     _dir: std::path::PathBuf,
+    // Declared before `_g`: fields drop in order, so CYS_PACK_DIR is restored while the env lock is still held.
+    _env: crate::governance::ReapEnvGuard,
     _g: std::sync::MutexGuard<'static, ()>,
 }
 
@@ -366,11 +368,11 @@ fn fx(tag: &str) -> Fx {
     let dir = std::env::temp_dir().join(format!("cys-activity-{tag}-{}-{n}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     std::fs::write(dir.join("acl.json"), r#"{"default":"allow","rules":[]}"#).unwrap();
-    std::env::set_var(cys::pack::ENV_PACK_DIR, &dir);
+    let env = crate::governance::ReapEnvGuard::set(&[(cys::pack::ENV_PACK_DIR, &dir.to_string_lossy())]);
     let daemon = Daemon::new(dir.join("cysd.sock"));
     // Seat ids restart at 1 per daemon: a new fixture starts the own-bump ledger empty (see `OWN_GEN`).
     OWN_GEN.with(|m| m.borrow_mut().clear());
-    Fx { daemon, _dir: dir, _g: g }
+    Fx { daemon, _dir: dir, _env: env, _g: g }
 }
 
 fn seat(fx: &Fx, role: &str, agent: Option<&str>) -> Arc<Surface> {

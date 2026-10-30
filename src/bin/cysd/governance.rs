@@ -10,6 +10,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
+// WC3: the non-test expansion invokes only the original clock callback, at its original read site.
+#[cfg(not(test))]
+#[inline]
+fn p1_queue_clock<T>(real: impl FnOnce() -> T, _snapshot: impl FnOnce((f64, Instant)) -> T) -> T {
+    real()
+}
+
 pub(crate) const WATCHDOG_INTERVAL_SECS: u64 = 5;
 const LOAD_DEBOUNCE_SECS: f64 = 60.0;
 
@@ -5783,6 +5790,10 @@ pub(crate) enum DraftGateDenied {
     /// `--queued` 로 넘어가 pause 동안 동결됐다). 줄이 비어 있어도 쓰지 않고 증명 없이 거부한다 → CLI 는 종전처럼
     /// `--queued` 1회(동결). 첫 직접 요청은 종전 그대로 pause 판정 대상이 아니다(pause 중 보고 경로).
     Paused,
+    /// ★(0.14.56 · P1 D3 · design r2 §4) A D4-valid cycle clear met the daemon's own paste still being written or inside
+    /// [`OWN_PASTE_SETTLE_MS`] - only [`draft_gate_cycle_clear`] makes it. Transient: the handler replies with its own code
+    /// `own_paste_settling`, never the typing guard (which the cycle CLI holds as a human draft, rc 85).
+    OwnPasteSettling,
 }
 
 impl DraftGateDenied {
@@ -5794,6 +5805,7 @@ impl DraftGateDenied {
             Self::Modal => "modal",
             Self::SubmitSettling => "submit_settling",
             Self::Paused => "paused",
+            Self::OwnPasteSettling => "own_paste_settling",
         }
     }
 }
@@ -6190,6 +6202,21 @@ pub(crate) fn submit_cr_withhold_probe(
     armed_by: &'static str,
     from: Option<u64>,
 ) -> crate::state::SafetyProbe {
+    submit_cr_withhold_probe_with(daemon, s, markers, armed_by, from, true)
+}
+
+/// ★(0.14.56 · P1 D9 pre-CR · design r3 §6-4 W-1) [`submit_cr_withhold_probe`] with the resubmit record optional. `record`
+/// = false for a master/CEO **queue** job: its withheld CR ends the job PartialExact and the queue hold's own resume
+/// (`try_resume_partial_write`) is the one owner of that CR, so [`resubmit_withheld_submits`] must never see it (two
+/// lifecycles would each write a CR). The event is published either way.
+pub(crate) fn submit_cr_withhold_probe_with(
+    daemon: &Arc<Daemon>,
+    s: &Arc<crate::state::Surface>,
+    markers: Vec<String>,
+    armed_by: &'static str,
+    from: Option<u64>,
+    record: bool,
+) -> crate::state::SafetyProbe {
     let wd = Arc::downgrade(daemon);
     let ws = Arc::downgrade(s);
     let handed = std::time::Instant::now();
@@ -6203,7 +6230,7 @@ pub(crate) fn submit_cr_withhold_probe(
             }
             // ★(재개 S91) 보류는 미룸이다 — 입력줄에 남는 기계 본문을 기록해 창이 닫힌 뒤 watchdog 틱이 이 CR 을 한 번 다시
             //   쓴다([`resubmit_withheld_submits`]). 기계 본문 기록이 없으면(빈 줄 위 Return) 다시 쓸 것이 없다.
-            if let Some(b) = s.inject_track.last_body() {
+            if let Some(b) = s.inject_track.last_body().filter(|_| record) {
                 s.inject_track.note_withheld(crate::state::WithheldSubmit::new(std::time::Instant::now(), b.at, from));
             }
             d.bus.publish(
@@ -6216,10 +6243,18 @@ pub(crate) fn submit_cr_withhold_probe(
                     "armed_by": armed_by,
                     "from": from.map(cys::surface_ref),
                     "handed_ms_ago": handed.elapsed().as_millis() as u64,
-                    "note": "제출 Return 을 넘긴 뒤 질문·선택 창이 전경이 됐다 — 그 CR 을 쓰지 않았다(쓰면 창의 기본 \
-                             선택지를 누른다). 본문은 입력줄에 미제출로 남는다. 창이 닫히고 입력줄이 그 본문 그대로면 \
-                             데몬이 그 CR 을 한 번 다시 쓴다(queue.submit_resubmitted). 보이는 창에 대한 Return 은 \
-                             종전처럼 쓴다.",
+                    "note": if record {
+                        "제출 Return 을 넘긴 뒤 질문·선택 창이 전경이 됐다 — 그 CR 을 쓰지 않았다(쓰면 창의 기본 \
+                         선택지를 누른다). 본문은 입력줄에 미제출로 남는다. 창이 닫히고 입력줄이 그 본문 그대로면 \
+                         데몬이 그 CR 을 한 번 다시 쓴다(queue.submit_resubmitted). 보이는 창에 대한 Return 은 \
+                         종전처럼 쓴다."
+                    } else {
+                        // ★(0.14.56 · P1 D9 pre-CR §6-4) a master/CEO queue job: no resubmit record - the queue hold's resume owns this CR.
+                        "A question or selection window came to the foreground after the queue job's body - its CR was not \
+                         written (it would press the window's default). The body stays unsubmitted on the line; the queue \
+                         hold's own resume writes that CR once the window has closed (within the resume window), never the \
+                         resubmit tick."
+                    },
                 }),
             );
             true
@@ -6473,6 +6508,10 @@ pub(crate) enum MachineHold {
     Paused,
     /// 좌석이 사이클(`/clear`~RESUME) 창이다 — `agent_status.state=="quiescing"` ∧ 나이 < 상한.
     Quiescing,
+    /// ★(0.14.56 · PKG1-M1 · DESIGN-ADDENDUM-PKG1-M1.md sec 3.1) The seat's queue holds the cycle's converted authoritative job
+    /// ([RESUME] / directive), which must be the first machine input of the new session; bounded by the quiesce hold on the
+    /// OLDEST authoritative entry's age ([`authoritative_hold_age`]).
+    Authoritative,
     /// **양성 부재 증거**만(에이전트 종료 관측 ∨ SEAT Empty). Unknown(Windows 미도달 포함)은 아니다.
     ShellOnly,
     /// 사람 입력 흔적이 생산자가 준 창 안이다.
@@ -6492,6 +6531,7 @@ impl MachineHold {
         match self {
             Self::Paused => "pause",
             Self::Quiescing => "quiescing",
+            Self::Authoritative => "authoritative",
             Self::ShellOnly => "shell",
             Self::HumanActive => "human",
             Self::Modal => "modal",
@@ -6506,6 +6546,9 @@ impl MachineHold {
 pub(crate) struct MachineHoldAxes {
     pub(crate) pause: bool,
     pub(crate) quiescing: bool,
+    /// ★(0.14.56 · PKG1-M1) hold while the seat's queue holds an authoritative entry (no screen read). The queue tick and the
+    /// partial-write resume never request it - they deliver that very entry (head check condition 1).
+    pub(crate) authoritative: bool,
     pub(crate) shell: bool,
     pub(crate) human: bool,
     pub(crate) modal: bool,
@@ -6519,6 +6562,7 @@ impl MachineHoldAxes {
     pub(crate) const NONE: Self = Self {
         pause: false,
         quiescing: false,
+        authoritative: false,
         shell: false,
         human: false,
         modal: false,
@@ -6531,6 +6575,7 @@ impl MachineHoldAxes {
         Self {
             pause: self.pause && mask.pause,
             quiescing: self.quiescing && mask.quiescing,
+            authoritative: self.authoritative && mask.authoritative,
             shell: self.shell && mask.shell,
             human: self.human && mask.human,
             modal: self.modal && mask.modal,
@@ -6548,6 +6593,9 @@ pub(crate) struct MachineHoldInput {
     pub(crate) quiescing_age_secs: Option<f64>,
     /// quiescing 보류 상한(초) — [`queue_quiesce_hold_secs`]. 0 = 축 끔.
     pub(crate) quiesce_hold_secs: u64,
+    /// ★(0.14.56 · PKG1-M1) the age (s) of the OLDEST authoritative entry queued for the seat ([`authoritative_hold_age`]); `None`
+    /// = none queued. Bounded by the same `quiesce_hold_secs`.
+    pub(crate) auth_age_secs: Option<f64>,
     /// 양성 부재 증거(에이전트 종료 관측 ∨ SEAT Empty).
     pub(crate) shell_evidence: bool,
     /// 마지막 사람 입력 뒤 경과(초). 흔적 없음 = `None`.
@@ -6557,7 +6605,7 @@ pub(crate) struct MachineHoldInput {
 }
 
 /// ★H0 **순수 판정** — 첫 적중을 돌려준다. 순서(고정):
-/// `Paused → Quiescing → ShellOnly → HumanActive → Modal → Draft`.
+/// `Paused → Quiescing → Authoritative → ShellOnly → HumanActive → Modal → Draft`.
 /// 앞의 싼 축(메모리 원자값)이 먼저이고 화면 관측이 필요한 두 축이 끝이다 — IO 래퍼는 싼 축이 적중하면
 /// 화면을 보지 않는다(같은 판정을 두 번 부르는 것은 이 순서 덕분에 결과가 같다).
 pub(crate) fn machine_hold_verdict(i: &MachineHoldInput, ax: &MachineHoldAxes) -> Option<MachineHold> {
@@ -6566,6 +6614,9 @@ pub(crate) fn machine_hold_verdict(i: &MachineHoldInput, ax: &MachineHoldAxes) -
     }
     if ax.quiescing && quiesce_hold_active(i.quiescing_age_secs, i.quiesce_hold_secs) {
         return Some(MachineHold::Quiescing);
+    }
+    if ax.authoritative && quiesce_hold_active(i.auth_age_secs, i.quiesce_hold_secs) {
+        return Some(MachineHold::Authoritative);
     }
     if ax.shell && i.shell_evidence {
         return Some(MachineHold::ShellOnly);
@@ -6653,6 +6704,7 @@ pub(crate) fn hold_axes_default(windows: bool) -> MachineHoldAxes {
     MachineHoldAxes {
         pause: true,
         quiescing: true,
+        authoritative: true, // ★(0.14.56 · PKG1-M1) no screen observation, so on for both OSes
         shell: true,
         human: true,
         modal: true,
@@ -6679,6 +6731,7 @@ pub(crate) fn hold_axes_mask_from(raw: Option<&str>, windows: bool) -> MachineHo
         match t.as_str() {
             "pause" => m.pause = true,
             "quiescing" => m.quiescing = true,
+            "authoritative" => m.authoritative = true,
             "shell" => m.shell = true,
             "human" => m.human = true,
             "modal" => m.modal = true,
@@ -6764,6 +6817,86 @@ pub(crate) fn machine_direct_hold_masked(
     }
 }
 
+/// ★(0.14.56 · PKG1-M1 · DESIGN-ADDENDUM-PKG1-M1.md sec 3.1-3.4; head check Q1) The OLDEST authoritative entry queued for `s`
+/// and its age (s), or `None` when none is queued. The age is the daemon's MONOTONIC insertion age from the seat's book
+/// ([`crate::state::AuthBook`], written by [`note_authoritative_born`]) - a laptop sleep cannot age a live job past the bound,
+/// the same reason H1 measures quiescing monotonically. An entry with no book row (restored from the WAL after a restart) falls
+/// back to its wall-clock `enqueued_at`. Because the OLDEST entry governs, repeated cycles cannot extend the hold forever. When
+/// that age has reached the quiesce hold ([`queue_quiesce_hold_secs`], 0 = axis off) `queue.authoritative_hold_lapsed` is
+/// published ONCE per entry, lazily (the first probe that sees it). Locks: `pending_queue` then `auth_born`, each a leaf, never
+/// both at once; the event is published after both are released. The book is pruned to the ids still queued on every read.
+pub(crate) fn authoritative_hold_age(daemon: &Arc<Daemon>, s: &crate::state::Surface) -> Option<(String, f64)> {
+    let queued: Vec<(String, f64)> = s
+        .pending_queue
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|e| e.authoritative)
+        .map(|e| (e.id.clone(), e.enqueued_at))
+        .collect();
+    let (mono, wall, bound) = (crate::usage::ctx_guard_now(daemon), now_epoch(), queue_quiesce_hold_secs());
+    let (oldest, lapse) = {
+        let mut book = s.auth_born.lock().unwrap_or_else(|e| e.into_inner());
+        book.born.retain(|id, _| queued.iter().any(|(q, _)| q == id));
+        let (id, age, clock) = queued
+            .iter()
+            .map(|(id, at)| match book.born.get(id) {
+                Some(born) => (id.clone(), (mono - born).max(0.0), "mono"),
+                None => (id.clone(), wall - at, "wall"),
+            })
+            .max_by(|a, b| a.1.total_cmp(&b.1))?;
+        let lapsed = bound > 0 && !quiesce_hold_active(Some(age), bound);
+        let lapse = (lapsed && book.lapsed_reported.as_deref() != Some(id.as_str())).then(|| {
+            book.lapsed_reported = Some(id.clone());
+            clock
+        });
+        ((id, age), lapse)
+    };
+    if let Some(clock) = lapse {
+        daemon.bus.publish(
+            "queue.authoritative_hold_lapsed",
+            "queue",
+            Some(s.id),
+            json!({"surface_ref": cys::surface_ref(s.id), "queue_entry_id": oldest.0, "age_secs": oldest.1,
+                   "bound_secs": bound, "clock": clock,
+                   "note": "the cycle's authoritative job waited past the bound; machine producers take their old paths again \
+                            (the job stays queued)"}),
+        );
+    }
+    Some(oldest)
+}
+
+/// ★(0.14.56 · PKG1-M1 · design sec 3.2) Book the monotonic insertion time of the authoritative entry `id` just queued for `s`
+/// (the single production site that marks an entry authoritative - send_text, after the queue lock is released). Pruned to the
+/// ids still queued, so the book never outgrows the queue cap. Locks: `pending_queue` then `auth_born`, each a leaf.
+pub(crate) fn note_authoritative_born(daemon: &Daemon, s: &crate::state::Surface, id: &str) {
+    let queued: Vec<String> = s
+        .pending_queue
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|e| e.authoritative)
+        .map(|e| e.id.clone())
+        .collect();
+    let mono = crate::usage::ctx_guard_now(daemon);
+    let mut book = s.auth_born.lock().unwrap_or_else(|e| e.into_inner());
+    book.born.retain(|q, _| queued.contains(q));
+    if queued.iter().any(|q| q == id) {
+        book.born.insert(id.to_string(), mono);
+    }
+}
+
+/// ★(0.14.56 · PKG1-M1 · design sec 3.6; head check Q2) The authoritative entry a NON-cycle `clear_first` must wait for: the
+/// oldest one queued while the axis holds (the global mask keeps the off switch `CYS_MACHINE_INJECT_HOLD_AXES`, the bound
+/// `CYS_QUEUE_QUIESCE_HOLD_SECS`). `None` = nothing to wait for (none queued, lapsed, or the axis is off).
+pub(crate) fn authoritative_pending(daemon: &Arc<Daemon>, s: &crate::state::Surface) -> Option<String> {
+    if !hold_axes_mask_from(h_knob("CYS_MACHINE_INJECT_HOLD_AXES").as_deref(), cfg!(windows)).authoritative {
+        return None;
+    }
+    let (id, age) = authoritative_hold_age(daemon, s)?;
+    quiesce_hold_active(Some(age), queue_quiesce_hold_secs()).then_some(id)
+}
+
 /// ★(0.14.42 · R2NC-F3 · R3SH-4) quiescing 의 **실효** 판독 — 지금 quiescing 이면 그 시작 epoch, 아니면 None.
 ///
 /// 세운 호출자(`Surface::quiesce_owner` — cycle-agent 의 peer pid)가 해제 없이 죽었으면(SIGTERM·Bash 도구 시한 kill·
@@ -6772,6 +6905,76 @@ pub(crate) fn machine_direct_hold_masked(
 /// 상태로 방치됐다. 소비자 셋(H0 · H1 큐 틱 · 채널 `deliverable_master`)이 모두 이 함수를 지난다(판정 한 곳).
 /// 실패 방향: pid 미상(peer pid 결측)·표지가 다른 세대(그 뒤 다시 세움)면 종전대로 상한만 — 살아 있는 사이클 창을 풀지 않는다.
 /// pid 재사용(수 분 안)은 푸는 쪽이 아니라 **늦게 푸는** 쪽으로만 틀린다(종전 상한과 같다).
+/// ★(0.14.56 · P1 D9 reinject order · impl/DESIGN-ADDENDUM-D9-reinject-order.md rev 1 §3, head ruling d8f5cad3c957c3ed arm 2) Is
+/// `caller_pid` the process that holds `s`'s CURRENT cycle window? Quiescing is on ([`effective_quiescing_since`]), the owner is bound to
+/// this window (`at == since`, the `owner_exited` generation test), the pid matches, and the caller's process start time is known and no
+/// later than `at` (whole seconds - a recycled pid starts after the owner died). No pid or no start time -> false (fail closed). Only
+/// cycle-agent binds an owner (`bind_owner:true`); its step-7 reinject is sent by that same process (the --detach child included).
+/// ★(0.14.56 · P1 D9 reinject order · DESIGN-ADDENDUM-D9-reinject-order.md rev 1 §2; head rulings 171d431a9879596a cond 2,
+/// d8f5cad3c957c3ed) Ids an authoritative job must never pass: the seat's in-memory partial-write hold and every persisted write hold
+/// (restart adoption takes a hold only at the FRONT, `adopt_persisted_write_hold`). Read BEFORE the queue lock (lock order).
+pub(crate) fn queue_pinned_ids(daemon: &Daemon, s: &crate::state::Surface) -> std::collections::HashSet<String> {
+    let mut ids: std::collections::HashSet<String> =
+        daemon.write_holds.lock().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect();
+    if let Some(h) = s.queue_hold.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        ids.extend(h.entry_ids.iter().cloned());
+    }
+    ids
+}
+
+/// Where an authoritative job goes (§2): past the leading pinned run (held, persisted-held, in flight) and past the leading
+/// authoritative run (FIFO among authoritative jobs, cond 3). Everything behind keeps its order.
+pub(crate) fn authoritative_insert_pos(
+    q: &std::collections::VecDeque<crate::state::QueueEntry>,
+    pinned: &std::collections::HashSet<String>,
+    in_flight: &[String],
+) -> usize {
+    let mut i = 0;
+    while i < q.len() && (pinned.contains(&q[i].id) || in_flight.contains(&q[i].id)) {
+        i += 1;
+    }
+    while i < q.len() && q[i].authoritative {
+        i += 1;
+    }
+    i
+}
+
+/// ★(0.14.56 · P1 D9 reinject order · addendum rev 1; head ruling d8f5cad3c957c3ed "MERGE") The origin key the merge planner compares:
+/// an authoritative entry's key is unique to it, so it never merges with the entries behind it nor with another authoritative entry
+/// (`plan_queue_merge` stops at a different origin). Ordinary entries keep their origin (pin merges unchanged).
+pub(crate) fn merge_origin_key(e: &crate::state::QueueEntry) -> String {
+    if e.authoritative {
+        format!("{}#authoritative:{}", e.origin, e.id)
+    } else {
+        e.origin.clone()
+    }
+}
+
+/// ★(0.14.56 · P1 D9 reinject order · addendum rev 1; head ruling 171d431a9879596a cond 4, d8f5cad3c957c3ed "AGES") The entry whose
+/// age the stuck-queue readers report: the oldest (`enqueued_at`) of the leading authoritative run and the first ordinary entry behind
+/// it. With no authoritative entry queued it is the front (the pin's reading); a fresh head-placed job never hides an older blocked item.
+pub(crate) fn queue_age_head(
+    q: &std::collections::VecDeque<crate::state::QueueEntry>,
+) -> Option<&crate::state::QueueEntry> {
+    let mut best: Option<&crate::state::QueueEntry> = None;
+    for e in q.iter() {
+        if best.is_none_or(|b| e.enqueued_at < b.enqueued_at) {
+            best = Some(e);
+        }
+        if !e.authoritative {
+            break;
+        }
+    }
+    best
+}
+
+pub(crate) fn caller_is_cycle_owner(daemon: &Arc<Daemon>, s: &crate::state::Surface, caller_pid: Option<u32>) -> bool {
+    let Some(pid) = caller_pid else { return false };
+    let Some(since) = effective_quiescing_since(daemon, s) else { return false };
+    let Some((owner, at, _)) = *s.quiesce_owner.lock().unwrap_or_else(|e| e.into_inner()) else { return false };
+    owner == pid && at == since && crate::state::peer_start_time(pid).is_some_and(|st| (st as f64) <= at)
+}
+
 pub(crate) fn effective_quiescing_since(daemon: &Arc<Daemon>, s: &crate::state::Surface) -> Option<f64> {
     let since = s
         .agent_status
@@ -6993,6 +7196,8 @@ fn machine_hold_probe(
         paused: daemon.paused.load(Ordering::Relaxed),
         quiescing_age_secs,
         quiesce_hold_secs: queue_quiesce_hold_secs(),
+        // ★(0.14.56 · PKG1-M1) read only for a producer that asks for the axis (leaf lock order in `authoritative_hold_age`).
+        auth_age_secs: if axes.authoritative { authoritative_hold_age(daemon, s).map(|(_, age)| age) } else { None },
         shell_evidence: s.agent_exit_notified.load(Ordering::Relaxed)
             || SeatState::from_u8(s.seat_cache.load(Ordering::Relaxed)) == SeatState::Empty,
         human_idle_secs: s
@@ -7008,14 +7213,21 @@ fn machine_hold_probe(
     }
     if axes.modal || axes.draft {
         let adapters = load_adapter_defs();
-        if let Some((markers, _)) = surface_prompt_marker(s, &adapters) {
+        if let Some((markers, placeholder)) = surface_prompt_marker(s, &adapters) {
             let obs = observe_prompt(s, &markers);
             input.modal = obs_modal_foreground(&obs);
+            // ★(0.14.56 · P1 R-6 · design r3 §4-6) Measured seat: a draft is the D1 verdict's draft reading (a Home-moved draft
+            //   now holds a CEO push, channel envelope, boot notice or schedule push instead of being typed onto). Unmeasured
+            //   seat: the pin's before-only test.
+            let draft_seen = match composer_reads_empty(s, &obs, placeholder.as_deref()) {
+                Some(reading) => !obs.selector_row && reading == Some(false),
+                None => obs_draft_observed(&obs),
+            };
             // ★(리뷰 F1·F2) 화면 초안이 기계 소유로 **입증**되면 초안 축의 보류 근거가 아니다([`draft_machine_owned`]).
             //   모달이 먼저 적중하면 초안 축은 판정에 쓰이지 않는다(순서 고정) — 귀속·가시화도 하지 않는다.
             input.draft = axes.draft
                 && !(axes.modal && input.modal)
-                && obs_draft_observed(&obs)
+                && draft_seen
                 && match draft_machine_owned(s, obs.line.as_ref().map(|(before, _)| before.as_str())) {
                     None => true,
                     Some(MachineDraft::OwnPaste) => false,
@@ -7254,11 +7466,31 @@ pub(crate) fn draft_gate_verdict(
     selector_row: bool,
     approval_pending: bool,
 ) -> Option<DraftGateDenied> {
+    draft_gate_verdict_occupied(
+        kind,
+        pending,
+        human_pending,
+        input_line_state(0, line) == InputLine::Occupied,
+        selector_row,
+        approval_pending,
+    )
+}
+
+/// ★(0.14.56 · P1 R-5) [`draft_gate_verdict`] with the screen-occupied fact given directly: the pin passes
+/// `input_line_state(0, line) == Occupied`; on a measured seat [`draft_gate`] passes the D1 verdict's "draft" reading instead.
+pub(crate) fn draft_gate_verdict_occupied(
+    kind: DirectSendKind,
+    pending: u64,
+    human_pending: u64,
+    screen_occupied: bool,
+    selector_row: bool,
+    approval_pending: bool,
+) -> Option<DraftGateDenied> {
     match kind {
         DirectSendKind::Text => {
             if pending > 0 {
                 Some(DraftGateDenied::PendingInput { bytes: pending })
-            } else if !selector_row && input_line_state(0, line) == InputLine::Occupied {
+            } else if !selector_row && screen_occupied {
                 Some(DraftGateDenied::ScreenOccupied)
             } else {
                 None
@@ -7270,7 +7502,7 @@ pub(crate) fn draft_gate_verdict(
             } else if pending == 0
                 && !selector_row
                 && !approval_pending
-                && input_line_state(0, line) == InputLine::Occupied
+                && screen_occupied
             {
                 Some(DraftGateDenied::ScreenOccupied)
             } else {
@@ -7311,6 +7543,24 @@ pub(crate) fn draft_gate(
     s: &Arc<crate::state::Surface>,
     kind: DirectSendKind,
 ) -> Option<DraftGateDenied> {
+    draft_gate_with(daemon, s, kind, false)
+}
+
+/// ★(0.14.56 · P1 D3 · design r2 §4) The draft gate of a D4-valid cycle clear (the handler decides validity once and calls this
+/// only then). Two changes from [`draft_gate`], same observation: the daemon's own paste active or settling refuses with
+/// [`DraftGateDenied::OwnPasteSettling`] whatever the line renders (after the human count, before the screen); a line proven to be
+/// the daemon's own machine body ([`draft_machine_owned`] residue, raw human 0) is not "occupied". Every other verdict is
+/// [`draft_gate`]'s.
+pub(crate) fn draft_gate_cycle_clear(daemon: &Arc<Daemon>, s: &Arc<crate::state::Surface>) -> Option<DraftGateDenied> {
+    draft_gate_with(daemon, s, DirectSendKind::ClearFirst, true)
+}
+
+fn draft_gate_with(
+    daemon: &Arc<Daemon>,
+    s: &Arc<crate::state::Surface>,
+    kind: DirectSendKind,
+    cycle_clear: bool,
+) -> Option<DraftGateDenied> {
     let pending = s.pending_input_bytes.load(Ordering::Relaxed);
     let human_pending = s.pending_input.lock().unwrap_or_else(|e| e.into_inner()).human.min(pending);
     if let Some(why) = draft_gate_verdict(kind, pending, human_pending, None, false, false) {
@@ -7323,7 +7573,8 @@ pub(crate) fn draft_gate(
         return None;
     }
     let adapters = load_adapter_defs();
-    let obs = surface_prompt_marker(s, &adapters).map(|(marker, _)| observe_prompt(s, &marker));
+    let marker_def = surface_prompt_marker(s, &adapters);
+    let obs = marker_def.as_ref().map(|(marker, _)| observe_prompt(s, marker));
     let line = obs.as_ref().and_then(|obs| {
         obs.line.as_ref().map(|(before, after)| PromptLine {
             before_cursor: before,
@@ -7348,8 +7599,147 @@ pub(crate) fn draft_gate(
             return Some(why);
         }
     }
+    // ★(0.14.56 · P1 D3 · design r2 §4) Cycle clear only, from THIS observation's before-cursor text: our own paste is a transient
+    //   refusal before the screen axis; a proven machine residue is not an occupied line.
+    let machine = cycle_clear.then(|| draft_machine_owned(s, line.as_ref().map(|l| l.before_cursor)));
+    if machine == Some(Some(MachineDraft::OwnPaste)) {
+        return Some(DraftGateDenied::OwnPasteSettling);
+    }
+    let proven_residue = matches!(
+        machine,
+        Some(Some(MachineDraft::MachineResidue { .. } | MachineDraft::SubmittedResidue { .. }))
+    );
     let approval_pending = approval_or_gate_pending(daemon, s.id);
-    draft_gate_verdict(kind, pending, human_pending, line, selector_row, approval_pending)
+    // ★(0.14.56 · P1 R-5 · design r3 §4-5) Measured seat: "screen occupied" is the D1 verdict's draft reading, so a Home-moved
+    //   draft (text after the cursor, not dim) refuses a direct Text/SubmitKey/ClearFirst; a suggestion passes as before.
+    //   `Unknown` does not refuse (the pin's rule for an unobserved line). Unmeasured seat: the pin's before-only test.
+    let d1 = match (&obs, &marker_def) {
+        (Some(obs), Some((_, placeholder))) => composer_reads_empty(s, obs, placeholder.as_deref()),
+        _ => None,
+    };
+    match d1 {
+        Some(reading) => draft_gate_verdict_occupied(
+            kind,
+            pending,
+            human_pending,
+            reading == Some(false) && !proven_residue,
+            selector_row,
+            approval_pending,
+        ),
+        None if proven_residue => {
+            draft_gate_verdict_occupied(kind, pending, human_pending, false, selector_row, approval_pending)
+        }
+        None => draft_gate_verdict(kind, pending, human_pending, line, selector_row, approval_pending),
+    }
+}
+
+/// ★(0.14.56 · P1 D4 · design r2 §5) Is a `cycle_clear:true` request backed by its caller's own cycle claim? Valid iff the
+/// kernel caller pid and the claim's pid are both present, equal, and the claim is not expired (`CycleClaim::expired`: the pid is
+/// dead or the claim is older than its maximum age, on the daemon's monotonic clock `mono_now`). A pid-less claim is never a
+/// match: `surface.cycle_claim` release accepts one, and busy rejects one, so it names no process. Pure.
+pub(crate) fn cycle_clear_claimed(
+    caller_pid: Option<u32>,
+    claim: Option<&crate::state::CycleClaim>,
+    mono_now: f64,
+) -> bool {
+    let (Some(caller), Some(c)) = (caller_pid, claim) else {
+        return false;
+    };
+    c.pid == Some(caller) && !c.expired(mono_now)
+}
+
+/// ★(0.14.56 · P1 D5 · design r2 §6, r1 §6) The class a D4-valid cycle clear was admitted as by the cycle CLI (`admitted`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CycleAdmitted {
+    /// The composer read empty (or placeholder / suggestion): the turn ended with nothing on the line.
+    Idle,
+    /// The line holds the daemon's own unsubmitted machine body (D3), which the clear's Ctrl-U erases.
+    MachineResidue,
+}
+
+impl CycleAdmitted {
+    pub(crate) fn parse(s: &str) -> Option<Self> {
+        match s {
+            "idle" => Some(Self::Idle),
+            "machine_residue" => Some(Self::MachineResidue),
+            _ => None,
+        }
+    }
+}
+
+/// ★(0.14.56 · P1 D5 · design r2 §6) The writer-side guard of a D4-valid cycle clear: `expect_gen` = the output generation of the
+/// CLI's composer observation (a moved generation aborts before the probe runs, `InjectGuard::claim_for_write`), the approval /
+/// first-run-gate fact at this decision, and [`cycle_clear_probe`]. Adapter markers are resolved here, so the writer thread does
+/// no disk read. The guard is the authority; the handler's generation pre-check is only an early refusal.
+pub(crate) fn cycle_clear_guard(
+    daemon: &Arc<Daemon>,
+    s: &Arc<crate::state::Surface>,
+    expect_output_gen: u64,
+    expect_input_gen: u64,
+    admitted: CycleAdmitted,
+) -> Arc<crate::state::InjectGuard> {
+    let adapters = load_adapter_defs();
+    let (markers, placeholder) = match surface_prompt_marker(s, &adapters) {
+        Some((m, p)) => (Some(m), p),
+        None => (None, None),
+    };
+    Arc::new(crate::state::InjectGuard::new(
+        Some(expect_output_gen),
+        s.output_gen.clone(),
+        approval_or_gate_pending(daemon, s.id),
+        Some(cycle_clear_probe(s, markers, placeholder, expect_input_gen, admitted)),
+    ))
+}
+
+/// ★(0.14.56 · P1 D5 · design r1 §6 probe, r2 §6) Runs on the WRITER thread at the claim (no `input_gate`; leaf locks taken one
+/// at a time, as [`inject_safety_probe`]). `true` = do not write. Blocks when the input generation moved since the CLI's
+/// observation, a raw human byte is counted, the daemon's own paste is active or settling, a modal is in the foreground, or the
+/// admitted class no longer holds: `Idle` -> the D1 verdict reads draft (unknown or an unmeasured seat: the pin's before-cursor
+/// test, as the CLI's own fallback); `MachineResidue` -> [`draft_machine_owned`] no longer proves residue. A seat without markers
+/// has no class axis (the counters still apply). A vanished seat or a panic blocks (`catch_unwind` - a panic must not kill the
+/// writer thread).
+fn cycle_clear_probe(
+    s: &Arc<crate::state::Surface>,
+    markers: Option<Vec<String>>,
+    placeholder: Option<String>,
+    expect_input_gen: u64,
+    admitted: CycleAdmitted,
+) -> crate::state::SafetyProbe {
+    let ws = Arc::downgrade(s);
+    Arc::new(move || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let Some(s) = ws.upgrade() else {
+                return true;
+            };
+            if s.input_gen.load(Ordering::Acquire) != expect_input_gen
+                || s.pending_input.lock().unwrap_or_else(|e| e.into_inner()).human != 0
+                || s.inject_track.busy_within(std::time::Duration::from_millis(OWN_PASTE_SETTLE_MS))
+            {
+                return true;
+            }
+            let obs = markers.as_deref().map(|m| observe_prompt(&s, m));
+            if obs.as_ref().is_some_and(obs_modal_foreground) {
+                return true;
+            }
+            let line = obs.as_ref().and_then(|o| {
+                o.line.as_ref().map(|(before, after)| PromptLine { before_cursor: before, at_or_after_cursor: after })
+            });
+            match admitted {
+                CycleAdmitted::MachineResidue => !matches!(
+                    draft_machine_owned(&s, line.map(|l| l.before_cursor)),
+                    Some(MachineDraft::MachineResidue { .. } | MachineDraft::SubmittedResidue { .. })
+                ),
+                CycleAdmitted::Idle => match &obs {
+                    None => false,
+                    Some(o) => match composer_reads_empty(&s, o, placeholder.as_deref()).flatten() {
+                        Some(empty) => !empty,
+                        None => input_line_state(0, line) == InputLine::Occupied,
+                    },
+                },
+            }
+        }))
+        .unwrap_or(true)
+    })
 }
 
 /// 미제출 입력 계수 v2 상태기계 — surface 별 상태(정의처 단일 · handlers send_text/send_key 둘 다 이것만 쓴다).
@@ -7849,6 +8239,10 @@ pub(crate) struct PromptObs {
     /// Filled only on request (submit/resubmit and slash admission); other observations carry None.
     /// A cursor outside a recognized input block also yields None.
     pub(crate) block: Option<ComposerBlock>,
+    /// ★(0.14.56 · P1 D1) Are ALL glyphs after the cursor on the cursor row dim (SGR 2)? Read with
+    /// [`after_cursor_dim_of`] inside the SAME parser lock as `line` (one frame). `None` = no glyph after the cursor or the
+    /// cursor is off-screen (a missing reading is not a value).
+    pub(crate) after_cursor_dim: Option<bool>,
 }
 
 impl PromptObs {
@@ -7879,6 +8273,7 @@ impl PromptObs {
             line: Some((String::new(), String::new())),
             selector_row: false,
             block: None,
+            after_cursor_dim: None,
             ..self.clone()
         })
     }
@@ -7926,9 +8321,12 @@ fn observe_prompt_ext(s: &Arc<crate::state::Surface>, markers: &[String], want_b
             quiet_secs,
             alt_screen,
             block: None,
+            after_cursor_dim: None,
         };
     }
     let before_all = screen.contents_between(cr, 0, cr, cc);
+    // ★(0.14.56 · P1 D1) Same lock, same frame as `line` below.
+    let after_cursor_dim = after_cursor_dim_of(screen, cr, cc);
     let row_all = screen.contents_between(cr, 0, cr, cols);
     // ★(0.14.39 · 수정 라운드 1 · 리뷰 PROBE-A) composer 마커는 커서행 **선두** 후보만이다. 종전 '커서 앞
     //   가장 뒤 후보(rfind)' 는 출력 행 끝의 `->` 와 초안 속 글리프(`» abc » `)를 빈 composer 로 읽었다.
@@ -7980,6 +8378,7 @@ fn observe_prompt_ext(s: &Arc<crate::state::Surface>, markers: &[String], want_b
         quiet_secs,
         alt_screen,
         block,
+        after_cursor_dim,
     }
 }
 
@@ -8062,6 +8461,8 @@ pub(crate) const BLOCKED_SETTLE_BUDGET: &str =
 /// ★(0.14.52 · S-a) The writer refused this seat's last hand-off before any byte (receiver proof or
 /// journal) — retried on backoff 1, 2, 4, 8, then 30 s (design 4.6). Resolves by itself.
 pub(crate) const BLOCKED_RECEIVER_HELD: &str = "receiver_held(쓰기 전 수신자 증명·기록 실패 — 1·2·4·8·30초 간격 재시도)";
+// Private: legacy code-less UI payloads have no writer_active prefix; current payloads carry remedy_code=wait.
+const BLOCKED_WRITER_ACTIVE: &str = "writer_active(쓰기 중이거나 대기 중인 쓰기가 있음 — writer 유휴 시 재시도)";
 /// ★(0.14.52 · S-a) An agent write stopped mid-request: never retyped, the composer is not erased;
 /// automatic delivery to this seat waits for that request's reconciliation (design 4.6 / S4-1).
 pub(crate) const BLOCKED_PARTIAL_WRITE: &str = "partial_write(요청 도중 멈춘 에이전트 쓰기 — 다시 치지 않고 보류 · 정리 대기)";
@@ -8249,15 +8650,34 @@ fn prompt_gate_input_with_approval(
     approval_pending: bool,
 ) -> PromptGateInput {
     let pending = s.pending_input_bytes.load(Ordering::Relaxed);
-    let input = input_line_state(
-        pending,
-        obs.line.as_ref().map(|(b, a)| PromptLine {
-            before_cursor: b,
-            at_or_after_cursor: a,
-        }),
-    );
+    // ★(0.14.56 · P1 R-1 · design r3 §3) On a measured seat `input` and `layout_ok` take the D1 verdict of THIS observation;
+    //   elsewhere both keep the pin expressions. The pending count still wins first.
+    let verdict = d1_governs(s).then(|| composer_verdict(obs, placeholder));
+    let input = match verdict {
+        Some(v) if pending == 0 => match v.reads_empty() {
+            Some(true) => InputLine::Empty,
+            Some(false) => InputLine::Occupied,
+            None => InputLine::Unknown,
+        },
+        _ => input_line_state(
+            pending,
+            obs.line.as_ref().map(|(b, a)| PromptLine {
+                before_cursor: b,
+                at_or_after_cursor: a,
+            }),
+        ),
+    };
     // ★(리뷰 R5) 화면과 **같은 관측**의 값이다(따로 읽지 않는다 — 합성 금지).
     let alt_screen = obs.alt_screen;
+    // ★(0.14.56 · P1 R-1) Which screen the unchanged readiness predicate sees: the marker-row-stripped copy only for a
+    //   `Suggestion` (so the scan still demands strong evidence, or weak evidence plus quiet, BELOW the marker); the screen as
+    //   observed for Empty/Placeholder (the placeholder text must stay - it is the scan's weak evidence) and on unmeasured seats;
+    //   no layout at all for Draft/Unknown. `src/readiness.rs` is not changed.
+    let layout_screen: Option<std::borrow::Cow<'_, str>> = match verdict {
+        None | Some(ComposerVerdict::Empty) | Some(ComposerVerdict::Placeholder) => Some(std::borrow::Cow::Borrowed(obs.screen.as_str())),
+        Some(ComposerVerdict::Suggestion) => marker_row_stripped(&obs.screen, &obs.marker).map(std::borrow::Cow::Owned),
+        Some(ComposerVerdict::Draft) | Some(ComposerVerdict::Unknown) => None,
+    };
     let quiet = queue_quiet_secs();
     PromptGateInput {
         marker_seen: obs.marker_seen,
@@ -8288,12 +8708,14 @@ fn prompt_gate_input_with_approval(
         //   더 조여지고(하류 `quiet_for < quiet`), 판정 의미는 소비처 전체에서 하나로 남는다.
         layout_ok: alt_screen
             && !marker.is_empty()
-            && cys::readiness::composer_layout_static_ok(
-                &obs.screen,
-                marker,
-                placeholder,
-                cys::readiness::idle_quiet_from(Some(obs.quiet_secs as f64)),
-            ),
+            && layout_screen.as_deref().is_some_and(|screen| {
+                cys::readiness::composer_layout_static_ok(
+                    screen,
+                    marker,
+                    placeholder,
+                    cys::readiness::idle_quiet_from(Some(obs.quiet_secs as f64)),
+                )
+            }),
         quiet_for: obs.quiet_secs,
         quiet,
         frame_published: obs.frame_published(),
@@ -8305,6 +8727,7 @@ fn prompt_gate_input_with_approval(
 /// 걸려 매 틱 말하지 않지만, 이 값은 상시 사실이라 `queue.list` 가 바로 읽는다).
 /// 같은 사유가 이어지면 **최초 시각을 보존**한다(얼마나 오래 막혔나가 사유보다 중요하다).
 fn mark_queue_blocked(s: &Arc<crate::state::Surface>, reason: &str) {
+    if !reason.starts_with("writer_active") { d9_nonwriter_hold(s, ClaimProducer::Queue); }
     let mut slot = s.queue_blocked.lock().unwrap();
     match slot.as_ref() {
         Some((prev, _)) if prev == reason => {}
@@ -8475,6 +8898,26 @@ pub(crate) fn seat_screen_probe_with(
 /// ★(RQFIX2 m-3) **지우는 행은 커서 행일 때만이다.** 지우려는 행(화면의 마지막 선두 마커 행)의 글자가 커서 행의 `(before, after)`(= `cursor_row`)와 다르면 그 행의 글자는
 /// 커서 앞·뒤 판독이 말해 주지 않는다 — 지우면 판정에서 **사라진다**(빈 첫 행에 커서 + 초안 안의 괘선 모양 줄 + `❯ 붙여넣은 전사 줄` 행이 유령으로 단정되던 모서리). 그때는
 /// 편집 영역이 비어 있지 않다고 접는다(`Some(false)` → 호출자 `draft_visible = Some(true)` · Ctrl-U 처방 없음).
+/// ★(0.14.56 · P1 R-1) The screen with the LAST leading-marker row cut to its marker glyph - the same copy
+/// [`composer_rest_empty`] builds for its own check. `None` when the screen has no leading-marker row.
+fn marker_row_stripped(screen: &str, marker: &str) -> Option<String> {
+    let lines: Vec<&str> = screen.lines().collect();
+    let li = lines
+        .iter()
+        .rposition(|l| cys::agent_markers::leading_marker_index(marker, l).is_some())?;
+    let line = lines[li];
+    let mi = cys::agent_markers::leading_marker_index(marker, line)?;
+    let bare = &line[..mi + marker.len()];
+    Some(
+        lines
+            .iter()
+            .enumerate()
+            .map(|(i, l)| if i == li { bare } else { *l })
+            .collect::<Vec<&str>>()
+            .join("\n"),
+    )
+}
+
 fn composer_rest_empty(
     screen: &str,
     marker: &str,
@@ -8510,6 +8953,203 @@ fn composer_rest_empty(
     Some(cys::readiness::composer_edit_region_empty(&copy, marker, placeholder))
 }
 
+/// ★(0.14.56 · P1 D1 · design r3 §2) The ONE composer verdict every reader on a measured seat takes (never re-implement it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ComposerVerdict {
+    /// Nothing before or after the cursor and the rest of the box is empty.
+    Empty,
+    /// The after-cursor run is the adapter's declared placeholder (token-wise).
+    Placeholder,
+    /// The after-cursor run is all dim (SGR 2): a rendered prompt suggestion nobody accepted.
+    Suggestion,
+    /// Content the operation did not supply: before the cursor, in the rest of the box, or a non-dim after-cursor run
+    /// (a Home-moved draft). A missing dim reading is a draft (fail-closed).
+    Draft,
+    /// No composer row at the cursor, a selector row, or a box the scan cannot read.
+    Unknown,
+}
+
+impl ComposerVerdict {
+    /// `Some(true)` = reads empty, `Some(false)` = a draft, `None` = unknown.
+    pub(crate) fn reads_empty(self) -> Option<bool> {
+        match self {
+            ComposerVerdict::Empty | ComposerVerdict::Placeholder | ComposerVerdict::Suggestion => Some(true),
+            ComposerVerdict::Draft => Some(false),
+            ComposerVerdict::Unknown => None,
+        }
+    }
+
+    /// The export vocabulary (`surface.read_text` `composer.verdict`, design r2 §2).
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            ComposerVerdict::Empty => "empty",
+            ComposerVerdict::Placeholder => "placeholder",
+            ComposerVerdict::Suggestion => "suggestion",
+            ComposerVerdict::Draft => "draft",
+            ComposerVerdict::Unknown => "unknown",
+        }
+    }
+}
+
+/// ★(0.14.56 · P1 D1 · design r3 §2 item 2) Adapters where the D1 verdict was MEASURED: claude (2.1.312 rig - suggestion cells SGR 2 with
+/// a reverse drawn cursor, accepted/typed text non-dim; the boxed composer reads the same alt-screen and non-alt). On every other
+/// adapter each reader keeps its pin expression (residue R-14) - an unmeasured box scan would read `Draft` and hold every delivery.
+/// Adding an adapter requires the T-ADAPT measurement on that adapter.
+pub(crate) const D1_MEASURED_ADAPTERS: &[&str] = &["claude"];
+
+/// ★(0.14.56 · P1 · head ruling W1 0048dfdf) The platform half of D1's scope - the ONE named predicate. Windows (`true`) is not
+/// measured: whether ConPTY passes SGR 2 (the suggestion's dim attribute) through to a Windows claude seat has not been measured,
+/// so there D1 is off and every reader keeps its pin expression (named residue: a Home-moved draft reads empty on Windows, as at
+/// the pin; backlog "ConPTY SGR 2 pass-through: measure on Windows; until then D1 is off on Windows"). A pure table, so a host of
+/// either OS measures both branches (the `PendingInputModel::default_for` precedent).
+pub(crate) fn d1_platform_measured_for(is_windows: bool) -> bool {
+    !is_windows
+}
+
+/// This build's platform half - [`d1_platform_measured_for`] of this OS, one expression. Read once per seat, at creation
+/// (`Surface::d1_platform`).
+pub(crate) fn d1_platform_measured() -> bool {
+    d1_platform_measured_for(cfg!(windows))
+}
+
+/// Does D1 govern this seat? The seat's platform half (`Surface::d1_platform`, from [`d1_platform_measured`]) and a measured
+/// adapter. `agent_meta` is a leaf lock (as in `draft_gate` and `machine_hold_probe`).
+pub(crate) fn d1_governs(s: &crate::state::Surface) -> bool {
+    s.d1_platform.load(Ordering::Relaxed)
+        && s.agent_meta
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|(agent, _)| D1_MEASURED_ADAPTERS.contains(&agent.as_str()))
+}
+
+/// ★(0.14.56 · P1 D9 · design r3 §8, CEO KEY PREDICATE rev 2 `3ab21282`) The ONE scope test for master/CEO composers:
+/// the target holds role `master` or `ceo` in THIS daemon, it is an agent seat (`seat_is_agent_backed` - a dead agent at a
+/// shell prompt keeps the pin paths, so node-recover still self-heals), and the caller is not owner class. Daemon-internal
+/// writers pass `owner_caller = false`. Every in-scope decision calls this function; a copy at a site is a defect.
+/// ★(CEO ruling 7c89eda5 sec 2 - label) Its reliance on `seat_is_agent_backed` is tick-phase dependent: both inputs
+/// (`agent_exit_notified`, `seat_cache`) are written only by the watchdog tick, so a relaunched agent enters scope BOUNDED BY ONE
+/// WATCHDOG TICK FROM AGENT START (RESIDUAL-C2 (h1); the frame-bound confirm backlog item is the real fix, must-not-lapse).
+pub(crate) fn d9_scope(daemon: &Daemon, s: &Arc<crate::state::Surface>, owner_caller: bool) -> bool {
+    if owner_caller {
+        return false;
+    }
+    let role_hit = {
+        let roles = daemon.roles.lock().unwrap_or_else(|e| e.into_inner());
+        ["master", "ceo"].iter().any(|r| roles.get(*r) == Some(&s.id))
+    };
+    role_hit && crate::alert_route::seat_is_agent_backed(s)
+}
+
+/// ★(0.14.56 · P1 D1 · design r2 §2 rows 1-7, r3 §2) The composer verdict of ONE observation (pure; the first matching row wins).
+/// U+00A0 is never read as a signal here: `str::trim`/`split_whitespace` treat it as white space, i.e. as part of the CLI's
+/// marker glyph spacing (head constraint, CEO intake #57).
+pub(crate) fn composer_verdict(obs: &PromptObs, placeholder: Option<&str>) -> ComposerVerdict {
+    // row 1
+    if obs.selector_row {
+        return ComposerVerdict::Unknown;
+    }
+    let Some((before, after)) = obs.line.as_ref() else {
+        return ComposerVerdict::Unknown;
+    };
+    // row 2
+    if !before.trim().is_empty() {
+        return ComposerVerdict::Draft;
+    }
+    // row 3 - the rest of the box (continuation rows, the m-3 bottom-row draft)
+    match composer_rest_empty(&obs.screen, &obs.marker, placeholder, (before.as_str(), after.as_str())) {
+        None => return ComposerVerdict::Unknown,
+        Some(false) => return ComposerVerdict::Draft,
+        Some(true) => {}
+    }
+    // row 4
+    if after.trim().is_empty() {
+        return ComposerVerdict::Empty;
+    }
+    // row 5 - token-wise, as `cys.rs` placeholder matching; fails toward Draft
+    if placeholder.is_some_and(|p| !p.trim().is_empty() && after.split_whitespace().eq(p.split_whitespace())) {
+        return ComposerVerdict::Placeholder;
+    }
+    // row 6
+    if obs.after_cursor_dim == Some(true) {
+        return ComposerVerdict::Suggestion;
+    }
+    // row 7 - a non-dim run or no dim reading
+    ComposerVerdict::Draft
+}
+
+/// ★(0.14.56 · P1 D1 · design r3 §4) The shared helper: `None` = D1 does not govern this seat (the caller keeps its pin
+/// expression), `Some(reading)` = [`ComposerVerdict::reads_empty`] of this observation.
+pub(crate) fn composer_reads_empty(
+    s: &crate::state::Surface,
+    obs: &PromptObs,
+    placeholder: Option<&str>,
+) -> Option<Option<bool>> {
+    d1_governs(s).then(|| composer_verdict(obs, placeholder).reads_empty())
+}
+
+/// ★(0.14.56 · P1 E0 · design r2 §2 "Export", r3 §2 · head ruling E0 a7cbc003 · API note API-E0-worker35.md 64cc32fd) The ONE
+/// caller-facing composer export. Every field comes from ONE collection: one [`observe_prompt_ext`] (one parser lock, the output
+/// generation read before it and after it, the quiet sample between) plus the input counters, bracketed by `input_gen`. Consumers
+/// (`surface.read_text` `composer:true`, the frame-bound modal key, the cycle CLI through the RPC) take this object; none
+/// re-derives a field or reads a generation of its own.
+/// - Not one frame (`!frame_consistent()`, `input_gen` moved during the collection, or the parser lock is poisoned) →
+///   `output_gen: null`, `verdict: unknown`, `quiet_secs: 0.0`.
+/// - `governed` = [`d1_governs`]. Off D1 the verdict is `unknown` (no invented verdict) and readers keep their pin expression.
+/// - `quiet_secs` is the observation's own whole-second sample (floored; the threshold it feeds is whole, 3.0).
+/// - `owner`/`owner_kind` are informational, from the existing [`MachineDraft`] evidence on this observation's before-cursor text.
+pub(crate) fn observe_composer_export(s: &Arc<crate::state::Surface>) -> serde_json::Value {
+    let adapters = load_adapter_defs();
+    let (markers, placeholder) = surface_prompt_marker(s, &adapters).unwrap_or_default();
+    let governed = d1_governs(s);
+    let input_gen = s.input_gen.load(Ordering::Acquire);
+    let pending_bytes = s.pending_input_bytes.load(Ordering::Relaxed);
+    let human_bytes = s.pending_input.lock().unwrap_or_else(|e| e.into_inner()).human;
+    let obs = observe_prompt_ext(s, &markers, false);
+    composer_export_observed(s);
+    let owner = draft_machine_owned(s, obs.line.as_ref().map(|(before, _)| before.as_str()));
+    // A poisoned parser lock is not one frame: the observation recovers the guard (`into_inner`), so the export refuses here.
+    // Read AFTER the observation: poison is permanent, so a panic before or during it is seen.
+    let consistent =
+        obs.frame_consistent() && s.input_gen.load(Ordering::Acquire) == input_gen && !s.parser.is_poisoned();
+    let verdict = if consistent && governed {
+        composer_verdict(&obs, placeholder.as_deref())
+    } else {
+        ComposerVerdict::Unknown
+    };
+    let (owner_name, owner_kind) = match owner {
+        Some(MachineDraft::OwnPaste) => ("own_paste", "daemon"),
+        Some(MachineDraft::MachineResidue { owner }) => ("machine", owner.kind()),
+        Some(MachineDraft::SubmittedResidue { owner: Some(owner) }) => ("machine", owner.kind()),
+        Some(MachineDraft::SubmittedResidue { owner: None }) => ("machine", "daemon"),
+        None => ("none", "unattributed"),
+    };
+    serde_json::json!({
+        "text": obs.screen,
+        "quiet_secs": if consistent { obs.quiet_secs as f64 } else { 0.0 },
+        "composer": {
+            "verdict": verdict.as_str(),
+            "governed": governed,
+            "modal": obs_modal_foreground(&obs),
+            "owner": owner_name,
+            "owner_kind": owner_kind,
+            "before_cursor_empty": obs.line.as_ref().map(|(before, _)| before.trim().is_empty()),
+            "after_cursor_present": obs.line.as_ref().map(|(_, after)| !after.trim().is_empty()),
+            "after_cursor_dim": obs.after_cursor_dim,
+            "input_gen": input_gen,
+            "output_gen": consistent.then_some(obs.output_gen),
+            "pending_bytes": pending_bytes,
+            "human_bytes": human_bytes,
+        },
+    })
+}
+
+/// [`observe_composer_export`]'s seam between the observation and the assembly. Production: nothing. The test twin (below the
+/// first test item) runs a specimen's hook there, so a specimen can move output or input after the one observation.
+#[cfg(not(test))]
+#[inline]
+fn composer_export_observed(_s: &crate::state::Surface) {}
+
 /// 입력줄 가시성(순수) — `(draft_visible, ghost_after_cursor)`. 새 판정을 만들지 않는다: 커서 앞 판독은 게이트의 [`input_line_state`] 를,
 /// 편집 영역 아래 판독은 [`composer_rest_empty`](= stale 리셋의 술어)를, 커서 뒤 판독은 [`maybe_reset_stale_pending_input`] 의 `after.trim().is_empty()` 와 같은 술어다.
 /// 커서 행이 composer 가 아니거나(선택기 행) 프레임이 발행 중이거나 마커 뒤 커서가 없으면 `(None, None)`. `placeholder` = 그 어댑터의 빈 composer 플레이스홀더
@@ -8535,6 +9175,25 @@ pub(crate) fn input_line_visibility(
             (draft_visible, Some(!after.trim().is_empty()))
         }
         None => (None, None),
+    }
+}
+
+/// ★(0.14.56 · P1 R-7 + R-10 · design r3 §4-7) [`input_line_visibility`] for a seat: on a measured seat `draft_visible` is the
+/// D1 verdict's draft reading (`None` when unknown), so operator force-deliver stops treating a Home-moved draft as invisible and
+/// the remedy choice names it `human_draft` instead of offering the gray-ghost Ctrl-U advice. `ghost_after_cursor` is unchanged.
+/// Unmeasured seat: the pure function as at the pin.
+pub(crate) fn input_line_visibility_for(
+    s: &crate::state::Surface,
+    obs: &PromptObs,
+    placeholder: Option<&str>,
+) -> (Option<bool>, Option<bool>) {
+    let pin = input_line_visibility(obs, placeholder);
+    if !obs.frame_published() || obs.selector_row {
+        return pin;
+    }
+    match composer_reads_empty(s, obs, placeholder) {
+        Some(reading) => (reading.map(|empty| !empty), pin.1),
+        None => pin,
     }
 }
 
@@ -8600,7 +9259,7 @@ pub(crate) fn seat_input_line_visibility_with(
         let adapters = defs();
         match surface_prompt_marker(s, &adapters) {
             Some((markers, placeholder)) => {
-                input_line_visibility(&observe_prompt(s, &markers), placeholder.as_deref())
+                input_line_visibility_for(s, &observe_prompt(s, &markers), placeholder.as_deref())
             }
             None => (None, None),
         }
@@ -8816,8 +9475,10 @@ const REMEDY_BODY_KILL_SWITCH: &str = "kill-switch 동결 중 — 정체가 아�
 const REMEDY_BODY_SEAT_PAUSE: &str =
     "이 좌석의 큐가 헬스 조치(pause-queue)로 일시정지됐다 — 정해진 시간이 지나면 스스로 풀린다(반복되면 그 창의 출력을 사람이 확인)";
 /// 사람이 쓰던 글이 입력줄에 있다(표 3·6행).
+/// ★(0.14.56 · P1 D1c · head approval of NOTE-wp5-remedy-text.md c4a104a3) "read the screen first": under D1 a claude seat's rows
+/// under the marker can read as a draft while the frame is a selector, so the person reads the screen before submitting or clearing.
 const REMEDY_BODY_HUMAN_DRAFT: &str =
-    "입력줄에 제출되지 않은 글이 있다 — 기계는 지우지 않는다. 사람이 그 창에서 제출하거나 지운다(오너에게 알린다)";
+    "입력줄에 제출되지 않은 글이 있다 — 기계는 지우지 않는다. 먼저 그 창의 화면을 읽는다(글이 아니라 선택 창일 수 있다). 사람이 그 창에서 제출하거나 지운다(오너에게 알린다)";
 
 /// 일시정지 처방 문장(표 1·2행) — `(kill-switch, 일시정지 여부)` → 문장. 둘 다 아니면 `None`. 화면을 읽지 않는 순수 표라 `queue.list`·`org.status` 가
 /// 사유가 기록되지 않은 일시정지 좌석에서도 진단(파서 읽기) 없이 같은 문장을 쓴다.
@@ -8963,6 +9624,8 @@ pub(crate) fn queue_remedy(blocked_by: &str, d: &QueueBlockDiag) -> (&'static st
     } else if blocked_by.starts_with("receiver_held") {
         // ★(0.14.52 · S-a) calm: the daemon retries on its own backoff (no human action, no OS banner).
         ("wait", "쓰기 전 수신자 증명·기록이 실패했다 — 한 바이트도 쓰지 않았고 항목은 큐에 있다 · 1·2·4·8·30초 간격으로 스스로 다시 시도한다".into())
+    } else if blocked_by.starts_with("writer_active") {
+        ("wait", "좌석이 쓰는 중이거나 대기 중인 쓰기가 있다 — writer가 비면 다시 배달한다 · 오래 지속되면 writer.claim_escalated로 알린다".into())
     } else if blocked_by.starts_with("partial_write") {
         // ★(0.14.52 · S-a) calm for the owner: reconciliation belongs to the lane master (design 4.6), not to an owner key.
         ("wait", "에이전트 쓰기가 요청 도중 멈췄다 — 데몬은 입력줄을 지우지도 더 치지도 않는다 · 그 요청이 정리될 때까지 이 좌석의 자동 배달을 보류한다(항목·W-id 보존 · 정리는 그 레인의 master 몫)".into())
@@ -9038,7 +9701,7 @@ fn queue_blocked_seats(daemon: &Arc<Daemon>) -> Vec<BlockedSeat> {
         }
         let (head, depth) = {
             let q = s.pending_queue.lock().unwrap_or_else(|e| e.into_inner());
-            match q.front().cloned() {
+            match queue_age_head(&q).cloned() {
                 Some(h) => (h, q.len()),
                 None => continue,
             }
@@ -9688,8 +10351,10 @@ fn rollback_aborted_inject(
     s: &Arc<crate::state::Surface>,
     f: &InflightInject,
     delivered: &Delivered,
+    foreign: Vec<&'static str>,
 ) {
     let Some((still_queued, disposed)) = restore_inflight_marks(s, f) else { return };
+    d9_terminal(s, ClaimProducer::Queue, &delivered.entry.id, false);
     // ★(triage codex 보완) 사유·계수를 **관측 사실**로 적는다 — 종전 `restored` 는 재삽입 건수를
     //   말했고(그 재삽입 자체가 결함이었다) `why` 는 출력 세대 하나로 단정했다. 지금은 세 갈래를
     //   가른다: 화면이 흘렀나 · 처분자가 가져갔나 · 그 밖(승인 대기·마감).
@@ -9701,25 +10366,39 @@ fn rollback_aborted_inject(
          되살리지 않는다)"
     } else if gen_moved {
         "output_gen_moved(판정이 본 프레임이 아니다 — writer 가 쓰기 전에 화면이 바뀌었다)"
+    } else if !foreign.is_empty() {
+        // ★(0.14.56 · P1 D9 pre-CR · design r3 §6-2) the master/CEO claim check refused.
+        "foreign_since_handoff(a write or an input reached this seat after the hand-off, before the first byte - 0 bytes; the \
+         next tick re-judges on a fresh frame)"
     } else {
         "guard_aborted(승인·관문 대기 또는 결판 마감 — 판정 재료가 더는 유효하지 않다)"
     };
-    daemon.bus.publish(
+    let refusal_n = (!foreign.is_empty()).then(|| d9_note_refusal(daemon, s, ClaimProducer::Queue, &delivered.entry.id, &foreign, true));
+    if refusal_n.is_none_or(d9_refusal_event_due) { daemon.bus.publish(
         "queue.inject_aborted",
         "queue",
         Some(s.id),
-        json!({
-            "surface_ref": cys::surface_ref(s.id),
-            "queue_entry_id": delivered.entry.id,
-            "merged_ids": delivered.merged_ids,
-            // 되살린 수가 아니라 **지금 큐에 남아 있는 수**다(재삽입 없음).
-            "still_queued": still_queued.len(),
-            "disposed_ids": disposed,
-            "why": why,
-            "hint": "주입 0 · 항목은 큐에 그대로 있다(다음 틱 재시도). 처분됐으면 그 항목은 \
-                     묘비와 함께 정당하게 폐기된 것이며 되살리지 않는다",
-        }),
+        {
+            let mut p = json!({
+                "surface_ref": cys::surface_ref(s.id),
+                "queue_entry_id": delivered.entry.id,
+                "merged_ids": delivered.merged_ids,
+                // 되살린 수가 아니라 **지금 큐에 남아 있는 수**다(재삽입 없음).
+                "still_queued": still_queued.len(),
+                "disposed_ids": disposed,
+                "why": why,
+                "hint": "주입 0 · 항목은 큐에 그대로 있다(다음 틱 재시도). 처분됐으면 그 항목은 \
+                         묘비와 함께 정당하게 폐기된 것이며 되살리지 않는다",
+            });
+            // ★(0.14.56 · P1 D9 pre-CR) which counters the master/CEO claim check saw move; absent otherwise (other payloads unchanged).
+            if !foreign.is_empty() {
+                p["foreign"] = json!(foreign);
+                p["refusal_n"] = json!(refusal_n);
+            }
+            p
+        },
     );
+    }
     daemon.persist_queue_state();
 }
 
@@ -9798,6 +10477,7 @@ fn queue_write_settle(
 /// run carries the stamp of the original hand-off, never a new one.
 #[derive(Clone)]
 struct HandoffStamp {
+    claim: Option<Arc<D9Claim>>,
     request: Arc<crate::agent_write::Request>,
     /// The original immutable receiver proof; partial bytes never borrow a successor's authority.
     proof: Arc<dyn crate::agent_write::Proof>,
@@ -9811,6 +10491,7 @@ struct HandoffStamp {
 impl HandoffStamp {
     fn of(s: &crate::state::Surface, request: Arc<crate::agent_write::Request>, proof: Arc<dyn crate::agent_write::Proof>, reservation_guard: Option<Arc<crate::state::InjectGuard>>) -> HandoffStamp {
         HandoffStamp {
+            claim: None,
             request,
             proof,
             reservation_guard,
@@ -9824,6 +10505,261 @@ impl HandoffStamp {
         s.agent_epoch.load(Ordering::Acquire) == self.agent_epoch
             && s.conversation_epoch.load(Ordering::Acquire) == self.conversation_epoch
     }
+}
+
+/// ★(0.14.56 · P1 D9 pre-CR · design r3 §6-2) The R-1 window (hand-off -> first byte) of a master/CEO queue job, CHECKED at the
+/// writer's claim with the pin's own three-counter foreign-input test (the partial-write resume's, `try_resume_partial_write`):
+/// the baseline is taken at the hand-off under `input_gate`, after the job's own count mark, and set before the job can be
+/// claimed; the claim compares it with the counters now. Unset at the claim = refuse (fail closed).
+#[derive(Default)]
+struct D9Claim {
+    /// (`input_gen` after the job's own count mark, the hand-off stamp's `wrote`, its `human_at`).
+    base: std::sync::OnceLock<(u64, u64, Option<std::time::Instant>)>,
+    /// What moved, when the claim refused - read by [`rollback_aborted_inject`] for its report.
+    moved: std::sync::Mutex<Vec<&'static str>>,
+}
+
+impl D9Claim {
+    fn moved(&self) -> Vec<&'static str> {
+        self.moved.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+/// The claim probe of a master/CEO queue job: the seat's own probe first, always (its observation stays as at the pin), then the
+/// three counters against the hand-off baseline. A write by a request queued ahead (`wrote`), any input received (`input_gen`)
+/// and any human key (`last_human_input`) since the hand-off refuse the claim: 0 bytes, the item stays at the head, the next
+/// tick re-judges on a fresh frame. That holds when the caller still owns the hand-off's cleanup (it rolls the hand-off back,
+/// `rollback_aborted_inject`, label `foreign_since_handoff`, no backoff). ★(0.14.56 · PKG1-M1 m5, head ruling 2026-10-31) When the
+/// guard's cleanup owner is the Controller (`InjectGuard::defer_to_controller`), `settle_queue_write` takes the zero-byte arm
+/// instead: a `Refused` hold with backoff (1, 2, 4, 8, 30 s) and `why: receiver_refused(guard_aborted)`. That case has NO production
+/// caller at this pin - the controller-owned bit is set only by `defer_to_controller`, called only from cfg(test) code - so it is
+/// left as it is (backlog B-493: align it with the caller-owned rollback when a production caller appears).
+fn d9_claim_probe(s: &Arc<crate::state::Surface>, claim: Arc<D9Claim>, inner: crate::state::SafetyProbe) -> crate::state::SafetyProbe {
+    let ws = Arc::downgrade(s);
+    Arc::new(move || {
+        let blocked = inner();
+        // Runs on the writer thread: a panic must not escape.
+        let moved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let Some(s) = ws.upgrade() else { return vec!["seat"] };
+            let Some(&(input_gen, wrote, human_at)) = claim.base.get() else { return vec!["unstamped"] };
+            let mut moved = Vec::new();
+            if s.inject_track.wrote() != wrote {
+                moved.push("wrote");
+            }
+            if s.input_gen.load(Ordering::Acquire) != input_gen {
+                moved.push("input_gen");
+            }
+            if *s.last_human_input.lock().unwrap_or_else(|e| e.into_inner()) != human_at {
+                moved.push("last_human_input");
+            }
+            moved
+        }))
+        .unwrap_or_else(|_| vec!["panic"]);
+        if moved.is_empty() {
+            return blocked;
+        }
+        *claim.moved.lock().unwrap_or_else(|e| e.into_inner()) = moved;
+        true
+    })
+}
+
+/// ★(0.14.56 · P1 D9 pre-CR · design r3 §5-7) The claim check of a daemon-internal one-job writer into a master/CEO seat:
+/// W-5 `handlers::deliver_to_ceo`, W-6 `channels::inject_master_confirmed`, W-7 `boot_supervisor::pane_notice_line`,
+/// W-8 `schedule::inject_on`. Those writers hand off with no seat probe and no judged frame, so the guard carries only the
+/// §6-2 three-counter test against S0 taken before the judgment (no output-generation expectation, no approval axis). A
+/// refusal writes 0 bytes and ends the job `guard_aborted`, which each producer already settles as zero bytes. Their CR
+/// behaviour stays the pin's (no §6-4 withhold here: residue R-16). Outside D9 scope there is no guard (the pin).
+#[derive(Clone)]
+pub(crate) struct D9WriterGuard {
+    guard: Arc<crate::state::InjectGuard>,
+    claim: Arc<D9Claim>,
+}
+
+impl D9WriterGuard {
+    /// In D9 scope the guard, else `None`. Reads `daemon.roles` (through [`d9_scope`]): call it before taking `input_gate`.
+    /// ★(0.14.56 · D3-BOUND r2 §1.2, F1) The claim baseline S0 is taken HERE, so call it immediately BEFORE the producer's frame
+    /// judgment (and before its ledger pre-record): a write or input that starts and finishes between the judgment and the
+    /// hand-off then moves a counter and the claim refuses. None of W-5..W-8 marks `input_gen` between S0 and `try_send`.
+    pub(crate) fn for_target(daemon: &Daemon, s: &Arc<crate::state::Surface>) -> Option<Self> {
+        if !d9_scope(daemon, s, false) {
+            return None;
+        }
+        let claim = Arc::new(D9Claim::default());
+        let _ = claim.base.set(d9_snapshot(s));
+        let probe = d9_claim_probe(s, claim.clone(), Arc::new(|| false));
+        let guard = Arc::new(crate::state::InjectGuard::new(None, s.output_gen.clone(), false, Some(probe)));
+        Some(Self { guard, claim })
+    }
+    pub(crate) fn moved(&self) -> Vec<&'static str> { self.claim.moved() }
+    /// The job's guard.
+    pub(crate) fn guard(&self) -> Arc<crate::state::InjectGuard> {
+        self.guard.clone()
+    }
+}
+
+/// ★(0.14.56 · D3-BOUND r2 §1.2) S0: the three claim counters now (`input_gen`, the writer's write count, the last human key).
+fn d9_snapshot(s: &crate::state::Surface) -> (u64, u64, Option<std::time::Instant>) {
+    let human_at = *s.last_human_input.lock().unwrap_or_else(|e| e.into_inner());
+    (s.input_gen.load(Ordering::Acquire), s.inject_track.wrote(), human_at)
+}
+
+/// D3-BOUND r2: separate identity/hold history for producers that can run in the same sweep.
+#[derive(Clone, Copy)]
+pub(crate) enum ClaimProducer { Queue = 0, ChannelNew = 1, ChannelRedeliver = 2 }
+
+impl ClaimProducer {
+    pub(crate) fn index(self) -> usize {
+        match self { Self::Queue => 0, Self::ChannelNew => 1, Self::ChannelRedeliver => 2 }
+    }
+    pub(crate) fn name(self) -> &'static str {
+        match self { Self::Queue => "queue", Self::ChannelNew => "channel_new", Self::ChannelRedeliver => "channel_redeliver" }
+    }
+
+}
+
+pub(crate) fn d9_keep_item(s: &crate::state::Surface, producer: ClaimProducer, item: Option<&str>) {
+    let mut slots = s.claim_streaks.lock().unwrap_or_else(|e| e.into_inner());
+    let slot = &mut slots[producer.index()];
+    if slot.as_ref().is_some_and(|x| Some(x.item.as_str()) != item) { *slot = None; }
+}
+
+pub(crate) fn d9_clear_item(s: &crate::state::Surface, producer: ClaimProducer, item: &str) {
+    let mut slots = s.claim_streaks.lock().unwrap_or_else(|e| e.into_inner());
+    let slot = &mut slots[producer.index()];
+    if slot.as_ref().is_some_and(|x| x.item == item) { *slot = None; }
+}
+
+pub(crate) fn d9_nonwriter_hold(s: &crate::state::Surface, producer: ClaimProducer) {
+    let idle = s.write_tx.gate().pending() == 0;
+    let mut slots = s.claim_streaks.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(slot) = &mut slots[producer.index()] {
+        if idle { slot.held_since = None; slot.held_epoch = None; }
+        slot.updated_at = std::time::Instant::now();
+    }
+}
+
+pub(crate) fn d9_terminal(s: &crate::state::Surface, producer: ClaimProducer, item: &str, wrote: bool) {
+    if wrote { d9_clear_item(s, producer, item); return; }
+    let mut slots = s.claim_streaks.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(slot) = &mut slots[producer.index()] {
+        if slot.item == item { slot.held_since = None; slot.held_epoch = None; slot.updated_at = std::time::Instant::now(); }
+    }
+}
+
+pub(crate) fn d9_hold_age(s: &crate::state::Surface, producer: ClaimProducer, item: &str) -> Option<std::time::Duration> {
+    let slots = s.claim_streaks.lock().unwrap_or_else(|e| e.into_inner());
+    slots[producer.index()].as_ref().filter(|x| x.item == item).and_then(|x| x.held_since.map(|t| t.elapsed()))
+}
+
+/// Called only with a D9 claim. A successful early observation clears nothing: only a terminal or idle non-writer hold does.
+pub(crate) fn d9_writer_busy(daemon: &Daemon, s: &crate::state::Surface, producer: ClaimProducer, item: &str, late: bool) -> bool {
+    let pending = s.write_tx.gate().pending();
+    if pending == 0 {
+        if late { crate::agent_write::test_after_writer_idle(); }
+        return false;
+    }
+    s.writer_holds.fetch_add(1, Ordering::Relaxed);
+    let now = std::time::Instant::now();
+    let epoch = now_epoch();
+    let event = {
+        let mut slots = s.claim_streaks.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = &mut slots[producer.index()];
+        if slot.as_ref().is_none_or(|x| x.item != item) {
+            *slot = Some(crate::state::ClaimStreak::new(item, now));
+        }
+        let slot = slot.as_mut().expect("slot installed");
+        slot.held_since.get_or_insert(now);
+        slot.held_epoch.get_or_insert(epoch);
+        slot.updated_at = now;
+        d9_escalation(s.id, producer, slot, pending, now)
+    };
+    if let Some(event) = event { daemon.bus.publish("writer.claim_escalated", "writer", Some(s.id), event); }
+    true
+}
+
+fn d9_refusal_threshold() -> u32 {
+    h_knob("CYS_CLAIM_REFUSE_ESCALATE_N").and_then(|x| x.parse::<u32>().ok()).unwrap_or(3).max(1)
+}
+
+fn d9_hold_threshold() -> std::time::Duration {
+    std::time::Duration::from_secs(h_knob("CYS_WRITER_HOLD_ESCALATE_SECS").and_then(|x| x.parse::<u64>().ok()).unwrap_or(60).max(1))
+}
+
+pub(crate) fn d9_refusal_event_due(n: u32) -> bool {
+    let threshold = d9_refusal_threshold();
+    n > 0 && (n <= threshold || (n % threshold == 0 && (n / threshold).is_power_of_two()))
+}
+
+/// Updates only the leaf record. Its caller publishes the owned payload AFTER releasing the mutex.
+fn d9_escalation(sid: u64, producer: ClaimProducer, slot: &mut crate::state::ClaimStreak, pending: usize, now: std::time::Instant) -> Option<Value> {
+    if slot.escalated { return None; }
+    let held = slot.held_since.map(|t| now.saturating_duration_since(t));
+    let cause = if slot.refusals >= d9_refusal_threshold() { "claim_refused" }
+        else if held.is_some_and(|t| t >= d9_hold_threshold()) { "not_idle" }
+        else { return None; };
+    slot.escalated = true;
+    Some(json!({"surface_ref":cys::surface_ref(sid), "producer":producer.name(), "item":slot.item,
+        "cause":cause, "refusals":slot.refusals, "held_secs":held.map_or(0, |t| t.as_secs()),
+        "since":slot.first_refusal_epoch.or(slot.held_epoch), "last_foreign":slot.last_foreign,
+        "foreign_counts":{"wrote":slot.foreign_counts[0],"input_gen":slot.foreign_counts[1],"last_human_input":slot.foreign_counts[2]},
+        "writer_pending":pending,
+        "hint":"0 bytes were written in the refused or held attempt; retry remains subject to the existing gates. Nothing writes anyway. Read the screen and moved counters."}))
+}
+
+/// Return the active streak count; zero means no current-head streak or saturation. Lifetime totals still count.
+pub(crate) fn d9_note_refusal(daemon: &Daemon, s: &crate::state::Surface, producer: ClaimProducer, item: &str, foreign: &[&'static str], producer_current: bool) -> u32 {
+    if foreign.is_empty() { return 0; }
+    let pending = s.write_tx.gate().pending();
+    let now = std::time::Instant::now();
+    let epoch = now_epoch();
+    // Ownership cleanup has completed. Keep the current head stable while updating its slot;
+    // a late terminal may count historically but must not resurrect the former head's streak.
+    let queue = matches!(producer, ClaimProducer::Queue).then(|| s.pending_queue.lock().unwrap_or_else(|e| e.into_inner()));
+    let current_head = queue.as_ref().and_then(|q| q.front()).map(|e| e.id.as_str());
+    let head_matches = producer_current && (queue.is_none() || current_head == Some(item));
+    let (n, event) = {
+        let mut slots = s.claim_streaks.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = &mut slots[producer.index()];
+        let _ = s.claim_refusals_total[producer.index()].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_add(1)));
+        if !head_matches {
+            if slot.as_ref().is_some_and(|x| if queue.is_some() { Some(x.item.as_str()) != current_head } else { x.item == item }) { *slot = None; }
+            (0, None) // no active streak; lifetime telemetry still counted this refusal
+        } else {
+        if slot.as_ref().is_none_or(|x| x.item != item) { *slot = Some(crate::state::ClaimStreak::new(item, now)); }
+        let slot = slot.as_mut().expect("slot installed");
+        slot.held_since = None; slot.held_epoch = None;
+        let previous = slot.refusals;
+        slot.refusals = slot.refusals.saturating_add(1);
+        if slot.first_refusal_at.is_none() { slot.first_refusal_at = Some(now); slot.first_refusal_epoch = Some(epoch); }
+        slot.last_foreign = foreign.to_vec();
+        for name in foreign {
+            let index = match *name { "wrote" => Some(0), "input_gen" => Some(1), "last_human_input" => Some(2), _ => None };
+            if let Some(i) = index { slot.foreign_counts[i] = slot.foreign_counts[i].saturating_add(1); }
+        }
+        slot.updated_at = now;
+        let n = if slot.refusals == previous { 0 } else { slot.refusals };
+        (n, d9_escalation(s.id, producer, slot, pending, now))
+        }
+    };
+    drop(queue);
+    if let Some(event) = event { daemon.bus.publish("writer.claim_escalated", "writer", Some(s.id), event); }
+    n
+}
+
+pub(crate) fn d9_writer_status(daemon: &Daemon, s: &Arc<crate::state::Surface>) -> Value {
+    if !d9_scope(daemon, s, false) { return Value::Null; }
+    let pending = s.write_tx.gate().pending();
+    let now = std::time::Instant::now();
+    let slots = s.claim_streaks.lock().unwrap_or_else(|e| e.into_inner());
+    let mut histories = serde_json::Map::new();
+    let mut totals = serde_json::Map::new();
+    for producer in [ClaimProducer::Queue, ClaimProducer::ChannelNew, ClaimProducer::ChannelRedeliver] {
+        totals.insert(producer.name().into(), json!(s.claim_refusals_total[producer.index()].load(Ordering::Relaxed)));
+        histories.insert(producer.name().into(), slots[producer.index()].as_ref().map_or(Value::Null, |x| json!({
+            "item":x.item,"refusals":x.refusals,"held_secs":x.held_since.map_or(0,|t|now.saturating_duration_since(t).as_secs()),
+            "age_secs":now.saturating_duration_since(x.updated_at).as_secs(),"last_foreign":x.last_foreign,"escalated":x.escalated})));
+    }
+    json!({"pending":pending,"holds_total":s.writer_holds.load(Ordering::Relaxed),"refusals_total":totals,"slots":histories})
 }
 
 /// ★(0.14.52 · S-a C7b) The resume material of a PartialExact queue hold (`QueueHold::resume`): what the SAME request
@@ -9887,6 +10823,10 @@ fn settle_queue_write(
     t: &crate::agent_write::Terminal,
 ) {
     use crate::agent_write::Terminal as T;
+    if let Some(surface) = &s {
+        let wrote = matches!(t, T::WrittenSubmitted { .. } | T::WrittenBody { .. } | T::PartialExact { .. } | T::PartialUnknown { .. });
+        d9_terminal(surface, ClaimProducer::Queue, &d.entry.id, wrote);
+    }
     match t {
         T::RefusedNoWrite { reason } if reason == crate::agent_write::GUARD_ABORTED
             && f.guard.as_ref().is_none_or(|g| g.cleanup_owner() != Ok(crate::state::InjectCleanupOwner::Controller)) => {}
@@ -9980,12 +10920,14 @@ fn settle_queue_write(
                 });
                 (live.to_vec(), disposed.to_vec(), attempts == 1)
             }) else { return };
-            if first {
+            let foreign = stamp.claim.as_ref().map(|c| c.moved()).unwrap_or_default();
+            let refusal_n = (!foreign.is_empty()).then(|| d9_note_refusal(daemon, s, ClaimProducer::Queue, &d.entry.id, &foreign, true));
+            if refusal_n.map_or(first, d9_refusal_event_due) {
                 daemon.bus.publish(
                     "queue.inject_aborted",
                     "queue",
                     Some(sid),
-                    json!({
+                    { let mut payload = json!({
                         "surface_ref": cys::surface_ref(sid),
                         "queue_entry_id": d.entry.id,
                         "merged_ids": d.merged_ids,
@@ -9993,8 +10935,11 @@ fn settle_queue_write(
                         "disposed_ids": disposed,
                         "why": format!("receiver_refused({reason})"),
                         "request_id": request_id,
-                        "hint": "주입 0 · 항목은 큐에 그대로 있다 — 1·2·4·8·30초 간격으로 다시 시도한다(같은 사유의 재시도는 이 알림을 다시 내지 않는다)",
-                    }),
+                        "hint": if refusal_n.is_some() { "주입 0 · 거부는 누적하며 알림은 정해진 횟수에만 낸다 · 기존 재시도 간격은 유지한다" }
+                            else { "주입 0 · 항목은 큐에 그대로 있다 — 1·2·4·8·30초 간격으로 다시 시도한다(같은 사유의 재시도는 이 알림을 다시 내지 않는다)" },
+                    });
+                    if let Some(n) = refusal_n { payload["foreign"] = json!(foreign); payload["refusal_n"] = json!(n); }
+                    payload },
                 );
             }
             daemon.persist_queue_state();
@@ -10542,12 +11487,17 @@ fn adopt_persisted_write_hold(daemon: &Arc<Daemon>, s: &Arc<crate::state::Surfac
 /// consistent frame, no modal or selector. Unreadable or no adapter -> false (keep holding).
 fn composer_measured_empty(s: &Arc<crate::state::Surface>) -> bool {
     let adapters = load_adapter_defs();
-    let Some((markers, _)) = surface_prompt_marker(s, &adapters) else { return false };
+    let Some((markers, placeholder)) = surface_prompt_marker(s, &adapters) else { return false };
     let obs = observe_prompt(s, &markers);
     obs.frame_consistent()
         && !obs.selector_row
         && !obs_modal_foreground(&obs)
-        && matches!(&obs.line, Some((before, _)) if before.trim().is_empty())
+        // ★(0.14.56 · P1 R-3 · design r3 §4-3) Measured seat: the D1 verdict - a Home-moved or continuation draft keeps the
+        //   hold (the pin released onto it); a suggestion releases. Unmeasured seat: the pin's before-only test.
+        && match composer_reads_empty(s, &obs, placeholder.as_deref()) {
+            Some(reading) => reading == Some(true),
+            None => matches!(&obs.line, Some((before, _)) if before.trim().is_empty()),
+        }
 }
 
 /// ★(0.14.52 · S-a C7a · head condition on Q2) Release a partial-write hold whose composer was measured empty: the held
@@ -10683,9 +11633,12 @@ fn slash_command_admission(
     if slash_known_occupied_region(&obs) { return Err(BLOCKED_INPUT_PENDING); }
     // A fresh full-region proof is stronger than a zero pending counter. Failure to recognise
     // the region is not proof of a draft: use the approved ordinary-message fallback instead.
-    if obs.frame_consistent()
-        && cys::readiness::composer_edit_region_empty(&obs.screen, &obs.marker, placeholder)
-    {
+    // ★(0.14.56 · P1 R-4) The label is audit text only; on a measured seat it follows the D1 verdict.
+    let measured_empty = match composer_reads_empty(s, &obs, placeholder) {
+        Some(reading) => reading == Some(true),
+        None => cys::readiness::composer_edit_region_empty(&obs.screen, &obs.marker, placeholder),
+    };
+    if obs.frame_consistent() && measured_empty {
         Ok("measured_empty")
     } else if obs.line.as_ref().is_some_and(|(_, after)| !after.trim().is_empty()) {
         Ok("fallback_unrecognized_hint")
@@ -10703,8 +11656,11 @@ pub(crate) fn deliver_head_locked(
     expect_pending: Option<u64>,
     expect_output_gen: Option<u64>,
     recheck: Option<&ScreenRecheck>,
+    mut hold_reason: Option<&mut Option<&'static str>>,
 ) -> Option<QueueHandoff> {
-    let now = now_epoch();
+    // Call-owned output: concurrent channel holds and force-deliver calls cannot attribute this tick.
+    if let Some(reason) = hold_reason.as_deref_mut() { *reason = None; }
+    let now = p1_queue_clock(now_epoch, |(epoch, _)| epoch);
     let default_ttl = crate::state::queue_ttl_default_secs();
     let base_min_interval = queue_min_interval_secs();
     let interval_max_wait = queue_max_wait_secs();
@@ -10716,23 +11672,43 @@ pub(crate) fn deliver_head_locked(
     let mut inflight: Option<InflightInject> = None;
     // ★(0.14.52 · S-a) The handed-off request (status reads; specimens' settlement wait).
     let mut handed: Option<Arc<crate::agent_write::Request>> = None;
+    let mut obsolete_key_head: Option<crate::state::QueueEntry> = None;
     // ★(0.14.52 · S-a C7a) A restored partially written head is adopted as held before any hand-off (outside the queue lock).
     adopt_persisted_write_hold(daemon, s);
+    // ★(0.14.56 · P1 D9 pre-CR · design r3 §6-2) A master/CEO target gets the claim check (scope read before the queue lock).
+    let d9_claim = d9_scope(daemon, s, false).then(|| Arc::new(D9Claim::default()));
+    // ★(0.14.56 · P1 D9 pre-CR · design r3 §6-4 W-1) ...and the pin's CR withhold probe, under the pin's own arming conditions
+    //   (`handlers::submit_owning_proof`); its material (adapter + parser) is read here, outside the queue lock and `input_gate`.
+    let d9_cr_ctx = if d9_claim.is_some()
+        && cfg!(unix)
+        && submit_guard_scope(s) != SubmitGuardScope::Off
+        && !crate::handlers::send_settle_disabled(daemon)
+    {
+        submit_cr_guard_context(s)
+    } else {
+        None
+    };
     let delivered = 'tx: {
         // 이 임계영역은 더 이상 큐를 **바꾸지 않는다**(인계 결판 전에는 빼지 않는다 · 리뷰 R2).
         let q = s.pending_queue.lock().unwrap();
         // 락 순서 계약: pending_queue → input_gate (state.rs Surface::input_gate doc).
         let _gate = s.input_gate.lock().unwrap();
+        // ★(0.14.56 · D3-BOUND r2 §1.2, F1) S0 - the claim baseline, read BEFORE the frame judgment (`handoff_gate_ok`) and the
+        //   ledger pre-record, so a write or input that starts and finishes in between moves a counter and the claim refuses.
+        let d9_s0 = d9_claim.as_ref().map(|_| d9_snapshot(s));
+        d9_keep_item(s, ClaimProducer::Queue, q.front().map(|e| e.id.as_str()));
         // ★(0.14.31 · 리뷰 R2 · codex blocking) 결판 대기 중인 인계가 있으면 이번 호출은 아무것도
         //   하지 않는다. 항목이 결판까지 큐에 남아 있으므로(유실 창 봉인) 이 표식이 없으면 틱과
         //   RPC 강제 배달이 **같은 머리를 두 번** 인계할 수 있다. 검사·설정이 둘 다 이 임계영역
         //   안이라 창이 없다(배달 최소 간격 0 인 롤백 env 에서도 성립).
         if s.inject_reserved() || queue_write_admission_held(s, std::time::Instant::now()) {
+            d9_nonwriter_hold(s, ClaimProducer::Queue);
             break 'tx None;
         }
         if let Some(want) = expect_pending {
             if s.pending_input_bytes.load(Ordering::Relaxed) != want {
-                break 'tx None; // 판정 이후 입력줄이 바뀌었다 — 이번 틱은 보류(메시지 보존)
+                d9_nonwriter_hold(s, ClaimProducer::Queue);
+            break 'tx None; // 판정 이후 입력줄이 바뀌었다 — 이번 틱은 보류(메시지 보존)
             }
         }
         // ★(0.14.31 · 리뷰 R1(R6회차) · codex major) **발행 중(홀수) 거부는 무조건이다** — 판정이
@@ -10749,27 +11725,30 @@ pub(crate) fn deliver_head_locked(
         //   드러낸다. 프레임 **불변**을 요구하지 않는 이유는 종전과 같다(연속 출력 노드의 기아 #1).
         // ★(0.14.31 · 성찰 Q11) 간격은 상수가 아니라 **머리 나이의 함수**다(호출부 선판정과 같은
         //   산식 · 권위는 여기). 머리는 여기서 훔쳐보기만 한다(제거는 결판 뒤 · 유실 창 봉인).
-        let head_wait_for_interval = q
-            .front()
+        let head_wait_for_interval = queue_age_head(&q)
             .map(|e| queue_head_wait_secs(now, e.enqueued_at, daemon.started_at, s.created_at))
             .unwrap_or(0);
         let min_interval =
             effective_min_interval_secs(base_min_interval, head_wait_for_interval, interval_max_wait);
         if min_interval > 0 {
             if let Some(t) = *s.last_queue_delivery_at.lock().unwrap() {
-                if t.elapsed().as_secs() < min_interval {
-                    break 'tx None; // 배달 최소 간격 미달 — 다음 틱(권위 판정 · 임계영역 안)
+                if p1_queue_clock(Instant::now, |(_, mono)| mono).saturating_duration_since(t).as_secs() < min_interval {
+                    d9_nonwriter_hold(s, ClaimProducer::Queue);
+            break 'tx None; // 배달 최소 간격 미달 — 다음 틱(권위 판정 · 임계영역 안)
                 }
             }
         }
         // ① 판정 — 보류할 배달을 원장에 선기록하지 않기 위해 **머리를 집기 전에** 한 번(codex 리뷰).
         if !handoff_gate_ok(daemon, s, expect_output_gen, recheck) {
+            d9_nonwriter_hold(s, ClaimProducer::Queue);
             break 'tx None;
         }
         let Some(entry) = q.front().cloned() else {
+            d9_nonwriter_hold(s, ClaimProducer::Queue);
             break 'tx None;
         };
         if expect_head_id.is_some_and(|want| want != entry.id) {
+            d9_nonwriter_hold(s, ClaimProducer::Queue);
             break 'tx None; // 조준 항목이 더는 머리가 아니다(경합) — 무부작용 반환
         }
         if crate::state::queue_entry_expired(&entry, now, default_ttl) {
@@ -10783,7 +11762,16 @@ pub(crate) fn deliver_head_locked(
             let mut e = entry.clone();
             e.expired_at = Some(now);
             expired_head = Some(e);
+            d9_nonwriter_hold(s, ClaimProducer::Queue);
             break 'tx None;
+        }
+        // Old daemons persisted bare Return entries. In D9 scope they can never
+        // acquire a body or reach the writer, including through force-deliver.
+        if d9_claim.is_some() {
+            if let Some(entry) = q.front().filter(|e| e.origin == "send-key" && e.text.is_empty()) {
+                obsolete_key_head = Some(entry.clone());
+                break 'tx None;
+            }
         }
         // ★B1(0.14.30) C3: 같은 발신자 대기분을 **한 턴으로** 병합한다(버스트 봉인).
         //   강제 배달(queue.deliver RPC)과 조준 배달은 **병합하지 않는다** — 운영자가 지목한
@@ -10797,11 +11785,16 @@ pub(crate) fn deliver_head_locked(
                 Err(why) => { mark_queue_blocked(s, why); break 'tx None; }
             }
         } else { None };
+        if d9_claim.is_some() && d9_writer_busy(daemon, s, ClaimProducer::Queue, &entry.id, false) {
+            if let Some(reason) = hold_reason.as_deref_mut() { *reason = Some(BLOCKED_WRITER_ACTIVE); }
+            mark_queue_blocked(s, BLOCKED_WRITER_ACTIVE);
+            break 'tx None;
+        }
         let merge_on = !forced && expect_head_id.is_none();
         let mut picked: Vec<usize> = if merge_on && q.len() > 1 {
             let prefix = queue_digest_prefix(q.iter().map(|e| e.text.as_str()));
             let froms: Vec<Option<String>> = q.iter().take(prefix).map(|e| e.from.clone()).collect();
-            let origins: Vec<String> = q.iter().take(prefix).map(|e| e.origin.clone()).collect();
+            let origins: Vec<String> = q.iter().take(prefix).map(merge_origin_key).collect();
             let chars: Vec<usize> = q.iter().take(prefix).map(|e| e.text.chars().count()).collect();
             plan_queue_merge(
                 &froms,
@@ -10941,6 +11934,10 @@ pub(crate) fn deliver_head_locked(
             });
             probe
         } else { safety_probe };
+        let safety_probe = match &d9_claim {
+            Some(c) => d9_claim_probe(s, c.clone(), safety_probe),
+            None => safety_probe,
+        };
         let guard = Some(std::sync::Arc::new(crate::state::InjectGuard::new(
             expect_output_gen,
             s.output_gen.clone(),
@@ -11001,7 +11998,23 @@ pub(crate) fn deliver_head_locked(
         let request_id = request.id.clone();
         let handle = request.clone();
         // ★(0.14.52 · S-a C7b) The epochs and last human keystroke this request is written under (S4-1 resume premises).
-        let stamp = HandoffStamp::of(s, request.clone(), s.agent_proof(), guard.clone());
+        // ★(0.14.56 · P1 D9 pre-CR · §6-4 W-1) A master/CEO queue job's proof carries the CR withhold probe WITHOUT a resubmit
+        //   record: a withheld CR ends the job PartialExact, and the stamp's proof is also the resume's, so the hold's own resume
+        //   is the one owner of that CR and meets the same veto.
+        let proof: Arc<dyn crate::agent_write::Proof> = match d9_cr_ctx {
+            Some(ctx) => Arc::new(crate::handlers::SubmitWithhold {
+                inner: s.agent_proof(),
+                probe: submit_cr_withhold_probe_with(daemon, s, ctx.markers, "queue_job", None, false),
+            }),
+            None => s.agent_proof(),
+        };
+        let mut stamp = HandoffStamp::of(s, request.clone(), proof, guard.clone());
+        stamp.claim = d9_claim.clone();
+        // ★(0.14.56 · P1 D9 pre-CR · D3-BOUND r2 §1.2) the claim baseline = S0, adjusted by the queue's ONE own mark between S0
+        //   and `try_send`: `set_pending_input(0)` above adds exactly 1 to `input_gen`. Set before the job can be claimed.
+        if let (Some(c), Some((gen, wrote, human_at))) = (&d9_claim, d9_s0) {
+            let _ = c.base.set((gen + 1, wrote, human_at));
+        }
         let job = crate::agent_write::AgentJob {
             attempt: None,
             request,
@@ -11014,7 +12027,12 @@ pub(crate) fn deliver_head_locked(
             note_body: true,
             body_owner: None,
         };
-        if s.write_tx.try_send(crate::state::WriteReq::Agent(Box::new(job))).is_err() {
+        let writer_busy = d9_claim.is_some() && d9_writer_busy(daemon, s, ClaimProducer::Queue, &d.entry.id, true);
+        if writer_busy || s.write_tx.try_send(crate::state::WriteReq::Agent(Box::new(job))).is_err() {
+            if writer_busy {
+                if let Some(reason) = hold_reason.as_deref_mut() { *reason = Some(BLOCKED_WRITER_ACTIVE); }
+                mark_queue_blocked(s, BLOCKED_WRITER_ACTIVE);
+            }
             // 인계 실패 — 메시지 보존, 다음 틱 재시도. Undo only the marks that are still mine.
             if s.input_gen.load(Ordering::Acquire) == f.pending_gen && s.pending_input_bytes.load(Ordering::Relaxed) == 0 {
                 s.set_pending_input(prev_pending);
@@ -11035,8 +12053,35 @@ pub(crate) fn deliver_head_locked(
         *s.inject_reservation.lock().unwrap() = guard.as_ref().map(|g| {
             crate::state::InjectReservation { ids: d.merged_ids.clone(), guard: g.clone() }
         });
+        #[cfg(test)]
+        crate::agent_queue_tests::p1_queue_reservation_admitted(
+            s, handed.as_ref().expect("successful enqueue owns request").as_ref(),
+        );
         Some(d)
     };
+    if let Some(entry) = obsolete_key_head {
+        // Evidence before removal; I/O is outside queue/input locks. If it fails,
+        // retain the item but still never type its unbound Return.
+        let entries = std::slice::from_ref(&entry);
+        if !crate::delivery::record_queue_tombstones(daemon, s.id, entries, "composer_key_denied", now_epoch()) {
+            return None;
+        }
+        let removed = {
+            let mut q = s.pending_queue.lock().unwrap();
+            if !s.inject_reserved() && q.front().is_some_and(|e| e.id == entry.id && e.origin == "send-key" && e.text.is_empty()) {
+                q.pop_front()
+            } else { None }
+        };
+        if let Some(removed) = removed {
+            d9_clear_item(s, ClaimProducer::Queue, &removed.id);
+            daemon.bus.publish("queue.dropped", "queue", Some(s.id),
+                crate::state::queue_dropped_payload("composer_key_denied", &[removed], None));
+            daemon.persist_queue_state();
+        } else {
+            publish_tombstone_superseded(daemon, Some(s.id), std::slice::from_ref(&entry.id), "composer_key_denied");
+        }
+        return None;
+    }
     if let Some(e) = expired_head {
         // ★(0.14.31 · 리뷰 R1 · codex major) 이동은 **두 락을 동시에 쥔 한 임계영역**에서 끝낸다.
         //   종전(R5)에는 만료 큐에 먼저 넣고 락을 놓았다가 다시 활성 큐를 잡아 뺐다 — 그 창에
@@ -11049,6 +12094,7 @@ pub(crate) fn deliver_head_locked(
             if q.front().is_some_and(|f| {
                 f.id == e.id && crate::state::queue_entry_expired(f, now, default_ttl)
             }) {
+                d9_clear_item(s, ClaimProducer::Queue, &e.id);
                 let mut moved = q.pop_front().expect("front checked");
                 moved.expired_at = Some(now);
                 if !x.iter().any(|o| o.id == moved.id) {
@@ -11076,7 +12122,7 @@ pub(crate) fn deliver_head_locked(
             match guard_outcome {
                 crate::state::InjectHandoff::CallerAborted => {
                     // 예약 해제는 롤백 **안**에서 표식 되돌림과 같은 임계영역에 있다(triage codex 보완).
-                    rollback_aborted_inject(daemon, s, &f, &delivered);
+                    rollback_aborted_inject(daemon, s, &f, &delivered, d9_claim.as_ref().map(|c| c.moved()).unwrap_or_default());
                     return None;
                 }
                 crate::state::InjectHandoff::CallerClaimed => {},
@@ -12636,7 +13682,7 @@ pub(crate) fn force_deliver_entry(
             let input = prompt_gate_input(daemon, s, obs.marker.as_str(), placeholder.as_deref(), &obs);
             if let PromptGate::Blocked(why) = prompt_gate_verdict(&input) {
                 // ★(0.14.43 · C5) 유령 계수 처방 — 판정(거부)과 **같은 관측**(`obs`)에서 읽는다(재관측 없음 · 거부 결과 불변 · 문구만).
-                if blocked_is_input_pending(why) && input_line_visibility(&obs, placeholder.as_deref()).0 == Some(false) {
+                if blocked_is_input_pending(why) && input_line_visibility_for(&s, &obs, placeholder.as_deref()).0 == Some(false) {
                     return Err(ForceDeliverDenied::PromptGateGhost(why));
                 }
                 return Err(ForceDeliverDenied::PromptGate(why));
@@ -12741,6 +13787,7 @@ pub(crate) fn force_deliver_entry(
         expect_pending,
         expect_gen,
         recheck.as_ref(),
+        None,
     )
         .ok_or(ForceDeliverDenied::Raced)
 }
@@ -12843,6 +13890,13 @@ fn deliver_queued(
     }
     // T4-15 kill-switch: pause 중에는 큐 배달 동결 (메시지는 보존 — resume 시 재개)
     if daemon.paused.load(Ordering::Relaxed) {
+        // A paused tick is still an observation: do not carry a past busy interval across observed idle.
+        let seats: Vec<_> = daemon.surfaces.lock().unwrap().values().cloned().collect();
+        for s in seats {
+            let q = s.pending_queue.lock().unwrap();
+            d9_keep_item(&s, ClaimProducer::Queue, q.front().map(|e| e.id.as_str()));
+            d9_nonwriter_hold(&s, ClaimProducer::Queue);
+        }
         // ★(0.14.31 · 성찰 Q2) 전이 진입점(`Daemon::set_paused`)을 거치지 않은 pause(구 호출부의
         //   `paused.store(true)` · 재기동 복원)라도 결판 대기 중인 인계는 여기서 끊는다 — 두 번째
         //   방어선이다(첫째는 writer 의 안전 탐침 ⓐ축). pause 중에는 예약이 새로 생기지 않으므로
@@ -12912,9 +13966,11 @@ fn deliver_queued(
         // 배달 0건으로 안전)뿐이고, 배달 자체는 헬퍼 임계영역이 그 시점 머리로 원자 수행한다.
         let (head, depth) = {
             let q = s.pending_queue.lock().unwrap();
-            match q.front().cloned() {
+            d9_keep_item(&s, ClaimProducer::Queue, q.front().map(|e| e.id.as_str()));
+            match queue_age_head(&q).cloned() {
                 Some(h) => (h, q.len()),
                 None => {
+                    d9_keep_item(&s, ClaimProducer::Queue, None);
                     starve_alerted.remove(&s.id);
                     *s.queue_blocked.lock().unwrap() = None;
                     continue;
@@ -12943,7 +13999,7 @@ fn deliver_queued(
         // ★G1(W2-D BLOCKER): overdue·기아 자격의 대기 = uptime 클램프 측정(부트 직후
         // typing 가드 공백 창 봉인 — queue_head_wait_secs doc 참조).
         let head_wait =
-            queue_head_wait_secs(now_epoch(), head.enqueued_at, daemon.started_at, s.created_at);
+            queue_head_wait_secs(p1_queue_clock(now_epoch, |(epoch, _)| epoch), head.enqueued_at, daemon.started_at, s.created_at);
         // 막힘 공통 처리 — 사유 기록 + 적체·기아 경보(한 분기라도 빠지면 그 사유가 침묵한다).
         let mut block = |why: &str| {
             mark_queue_blocked(&s, why);
@@ -13017,7 +14073,7 @@ fn deliver_queued(
                 .last_queue_delivery_at
                 .lock()
                 .unwrap()
-                .map(|t| t.elapsed().as_secs() < min_interval)
+                .map(|t| p1_queue_clock(Instant::now, |(_, mono)| mono).saturating_duration_since(t).as_secs() < min_interval)
                 .unwrap_or(false);
             if recent {
                 // ★(0.14.31 · 리뷰 R1 · minor) 이 보류는 **몇 초 뒤 스스로 풀린다** — 기아 경보
@@ -13142,6 +14198,7 @@ fn deliver_queued(
         // ★G1(W2-D): 배달 임계영역은 단일 헬퍼(deliver_head_locked — RPC 강제 배달과 공유).
         // pop은 writer 채널 인계 성공 후에만 — 실패 시 메시지를 보존해 다음 틱에 재시도.
         // 블로킹 write·sleep은 surface 전용 writer 스레드가 수행하므로 watchdog은 멈추지 않는다.
+        let mut hold_reason = None;
         if let Some(handoff) = deliver_head_locked(
             daemon,
             &s,
@@ -13151,12 +14208,15 @@ fn deliver_queued(
             Some(pending_at_verdict),
             expect_gen,
             recheck.as_ref(),
+            Some(&mut hold_reason),
         ) {
             if !handoff.written_submitted() { continue; }
             // 배달 성공 = 기아 해소 — 쿨다운 리셋(다음 기아는 새 사건으로 다시 경보).
             starve_alerted.remove(&s.id);
             // ★B1: 막힘 사유도 사실이 아니게 됐다 — 지운다(낡은 사유가 남으면 오독한다).
             *s.queue_blocked.lock().unwrap() = None;
+        } else if let Some(reason) = hold_reason {
+            block(reason);
         }
     }
     // ★(triage 2026-09-08 · #7) 다음 틱은 **예산 때문에 건너뛴 첫 좌석**부터 시작한다. 끝까지
@@ -13206,11 +14266,19 @@ fn maybe_reset_stale_pending_input(
     //   첫 행(`❯ `)에 커서를 올려 두면 그 행은 앞뒤가 다 공백이고 둘째 행에 실초안이 있다.
     //   그래서 편집 **영역**(마커 줄 아래 첫 비공백 줄이 괘선/상태줄인가)까지 AND 한다
     //   (`readiness::composer_edit_region_empty` — 스캐너는 배달 자격 판정과 같은 것을 쓴다).
-    let screen_empty = obs
-        .line
-        .as_ref()
-        .is_some_and(|(before, after)| before.trim().is_empty() && after.trim().is_empty())
-        && cys::readiness::composer_edit_region_empty(&obs.screen, marker, placeholder);
+    // ★(0.14.56 · P1 R-2 · design r3 §4-2) On a measured seat the D1 verdict decides: a rendered suggestion (all dim) beside a
+    //   stale count now lets the count reset (it held delivery forever); a Home-moved or continuation draft still blocks the
+    //   reset. Unmeasured seats keep the pin expression below. Fail direction: only the all-dim row qualifies; no dim reading
+    //   is a draft.
+    let screen_empty = match composer_reads_empty(s, obs, placeholder) {
+        Some(reading) => reading == Some(true),
+        None => {
+            obs.line
+                .as_ref()
+                .is_some_and(|(before, after)| before.trim().is_empty() && after.trim().is_empty())
+                && cys::readiness::composer_edit_region_empty(&obs.screen, marker, placeholder)
+        }
+    };
     // ★(0.14.31 · 리뷰 R5 · codex major) 관측이 **한 프레임의 사실**일 때만 모순으로 센다 —
     //   발행 중이거나 관측 창에서 세대가 바뀐 화면은 "빈 입력줄" 의 근거가 되지 못한다.
     let contradiction = pending > 0
@@ -13293,6 +14361,59 @@ pub(crate) static REAP_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 /// 37건 연쇄 실패 중 36건은 그 패닉의 poison 전파). 두 모듈이 이 한 락을 별칭으로 쓴다.
 #[cfg(test)]
 pub(crate) static PACK_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+thread_local! {
+    static P1_QUEUE_CLOCK: std::cell::Cell<Option<(f64, Instant)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Explicit queue-age/min-interval inputs, owned by this test thread and restored on unwind.
+#[cfg(test)]
+pub(crate) struct P1QueueClockSnapshot(Option<(f64, Instant)>);
+#[cfg(test)]
+impl P1QueueClockSnapshot {
+    pub(crate) fn set(epoch: f64, monotonic: Instant) -> Self {
+        assert!(epoch.is_finite(), "P1 queue clock epoch must be finite");
+        Self(P1_QUEUE_CLOCK.with(|slot| slot.replace(Some((epoch, monotonic)))))
+    }
+}
+#[cfg(test)]
+impl Drop for P1QueueClockSnapshot {
+    fn drop(&mut self) {
+        P1_QUEUE_CLOCK.with(|slot| slot.set(self.0));
+    }
+}
+#[cfg(test)]
+fn p1_queue_clock<T>(real: impl FnOnce() -> T, snapshot: impl FnOnce((f64, Instant)) -> T) -> T {
+    match P1_QUEUE_CLOCK.with(|slot| slot.get()) {
+        Some(pair) => snapshot(pair),
+        None => real(),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// ★(0.14.56 · P1 E0) The specimen hook [`observe_composer_export`] runs after its one observation. Thread-local: the export
+    /// runs on the calling thread, so parallel specimens never see each other's hook.
+    static COMPOSER_EXPORT_HOOK: std::cell::RefCell<Option<Box<dyn Fn(&crate::state::Surface)>>> =
+        std::cell::RefCell::new(None);
+}
+
+/// Sets (or clears) this thread's [`COMPOSER_EXPORT_HOOK`].
+#[cfg(test)]
+pub(crate) fn set_composer_export_hook(hook: Option<Box<dyn Fn(&crate::state::Surface)>>) {
+    COMPOSER_EXPORT_HOOK.with(|h| *h.borrow_mut() = hook);
+}
+
+/// The test twin of the production no-op seam: runs this thread's hook, if any.
+#[cfg(test)]
+fn composer_export_observed(s: &crate::state::Surface) {
+    COMPOSER_EXPORT_HOOK.with(|h| {
+        if let Some(f) = h.borrow().as_ref() {
+            f(s)
+        }
+    });
+}
 
 /// env를 테스트 종료 시(패닉 포함) 이전 값으로 원복하는 가드 —
 /// 없던 값은 remove, 있던 값은 원복. 프로세스 전역 env 누수 차단.
@@ -13601,7 +14722,7 @@ mod tests {
     #[test]
     fn wh_guarded_collectors_called_only_from_two_sites() {
         let src = include_str!("governance.rs");
-        let prod = src.split("#[cfg(test)]").next().expect("프로덕션 구간");
+        let prod = src.split("\n#[cfg(test)]\nmod tests {").next().expect("프로덕션 구간");
         let mut hits: Vec<&str> = Vec::new();
         for line in prod.lines() {
             let t = line.trim_start();
@@ -14712,7 +15833,7 @@ mod tests {
     fn wrapper_delegates_to_the_promoted_collector_source_pin() {
         let src = include_str!("governance.rs");
         let prod = src
-            .split("#[cfg(test)]")
+            .split("\n#[cfg(test)]\nmod tests {")
             .next()
             .expect("프로덕션 구간 분리 실패");
         let at = prod
@@ -15899,7 +17020,7 @@ mod tests {
         // ⑤ 배선 핀: refresh_seat_cache 가 이 판정을 실제로 소비한다(생산자 경계 우회 금지).
         //    순수 함수만 있고 호출부가 상수면 ①~④가 전부 무의미해지므로 호출 자체를 못박는다.
         let src = include_str!("governance.rs");
-        let prod = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커 소실")];
+        let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 앵커 소실")];
         let at = prod
             .find("pub fn refresh_seat_cache")
             .expect("refresh_seat_cache 소실");
@@ -16406,6 +17527,7 @@ mod tests {
             revived_at: None,
             expired_notified: false,
             expired_event_sent: false,
+            authoritative: false,
         }
     }
 
@@ -16612,10 +17734,13 @@ mod tests {
     #[test]
     fn u8_p1_text_arm_holds_on_a_foreground_modal_source_pin() {
         let src = include_str!("governance.rs");
+        // ★(0.14.56 · P1 D3) `draft_gate` and `draft_gate_cycle_clear` share ONE body, `draft_gate_with`; the axes live there.
+        let wrapper = src.split("\npub(crate) fn draft_gate(").nth(1).expect("draft_gate 소실").split("\n}\n").next().unwrap();
+        assert!(wrapper.contains("draft_gate_with(daemon, s, kind, false)"), "draft_gate 가 공유 본문을 부르지 않는다");
         let body = src
-            .split("\npub(crate) fn draft_gate(")
+            .split("\nfn draft_gate_with(")
             .nth(1)
-            .expect("draft_gate 소실")
+            .expect("draft_gate_with 소실")
             .split("\n}\n")
             .next()
             .unwrap();
@@ -17933,6 +19058,9 @@ mod tests {
         };
 
         // ⓐ V2 로 센 단독 Esc 의 잔여 1바이트 — 고스트가 떠 있어 stale 리셋이 불발한다.
+        // ★(0.14.56 · P1 D1 · head ruling on Q-suites-17-pins 5fffe0d9) The run in (a) is drawn PLAIN: on a measured claude seat that is a
+        //   Home-moved draft (D1 row 7), so the hold below is this family's plain-run case. A DIM suggestion beside the same stale count
+        //   now resets it (R-2, `p1_r2_stale_count_resets_beside_a_dim_suggestion`); (b) paints the suggestion dim.
         let v2 = pending_input_step_model(
             &PendingInputState::default(),
             b"\x1b",
@@ -17992,7 +19120,7 @@ mod tests {
         let bs = s.apply_pending_input(b"\x7f", InputOrigin::Human);
         assert_eq!((bs.count, bs.human), (0, 0), "ⓑ 기본 모델에서 빈 줄 Backspace 의 계수도 0: {bs:?}");
         assert_eq!(s.pending_input_bytes.load(AtomicOrdering::Relaxed), 0, "ⓑ 계수 미러도 0");
-        paint_prompt(&s, "", ghost);
+        paint_prompt_dim(&s, "", ghost);
         quiet_since(&s, 10);
         tick(&daemon);
         assert!(
@@ -19223,7 +20351,7 @@ mod tests {
         s.set_pending_input(0);
         assert_eq!(esc_marker(&s), (0, 0), "전제: 인계 계상이 표식을 내렸다");
         let f = make_flight(prev, s.input_gen.load(AtomicOrdering::Acquire));
-        super::rollback_aborted_inject(&daemon, &s, &f, &delivered);
+        super::rollback_aborted_inject(&daemon, &s, &f, &delivered, Vec::new());
         assert_eq!(esc_marker(&s), (4242, 4242), "(가) 쓰이지 않은 인계의 롤백은 표식을 되살린다(줄은 인계 전 그대로)");
         // (나) 그 사이 다른 입력(세대 변화) — 되살리지 않는다(그 사실이 최신이다).
         let prev = s.take_esc_exempt();
@@ -19231,11 +20359,11 @@ mod tests {
         let f = make_flight(prev, s.input_gen.load(AtomicOrdering::Acquire));
         s.apply_pending_input(b"x", InputOrigin::Human);
         s.clear_pending_input();
-        super::rollback_aborted_inject(&daemon, &s, &f, &delivered);
+        super::rollback_aborted_inject(&daemon, &s, &f, &delivered, Vec::new());
         assert_eq!(esc_marker(&s), (0, 0), "(나) 세대가 흘렀으면 표식을 되살리지 않는다");
         // (다) 직전 표식이 없었으면(0) 되살릴 것도 없다.
         let f = make_flight(0, s.input_gen.load(AtomicOrdering::Acquire));
-        super::rollback_aborted_inject(&daemon, &s, &f, &delivered);
+        super::rollback_aborted_inject(&daemon, &s, &f, &delivered, Vec::new());
         assert_eq!(esc_marker(&s), (0, 0), "(다) 직전 표식 0 → 되살리지 않는다");
         kill_pid(s.pid);
     }
@@ -19300,7 +20428,12 @@ mod tests {
             ("governance", 6, 2, 1),
             // ★(0.14.52 · S-a C5b) +1 clear, +1 apply: the direct agent write's settlement (`DirectSettle::run`) applies the
             //   SAME clear-first reset / accepted-bytes step the handler applied at hand-off - moved to after the terminal.
-            ("handlers", 0, 2, 3),
+            // ★(0.14.56 · L-MODAL b65b993f) +1 apply: `send_frame_bound_modal_key` counts the accepted modal-key bytes as Machine
+            //   input under `input_gate`, only while `input_gen` is unchanged (the settle closure, handlers.rs:3294 @c764cdff). It is the same
+            //   accounting the legacy `send_key` path applies to key bytes (B1 0.14.30: CR submits, Ctrl-U/Ctrl-C cancel, other keys
+            //   accumulate); it sets no count and clears nothing, so no exempt marker is lowered and the question this pin exists for does
+            //   not arise. Accepted as intended by head ruling F-4 STEP 1 (B), HEAD-RULING-F4-STEP1.txt, 2026-10-30T22:37.
+            ("handlers", 0, 2, 4),
             // ★(0.14.52 · S-a C6a) the set (count reset) moved into the push settlement after the written Return; +1 apply: a push
             //   stopped before its Return counts its accepted prefix as machine input (`ScheduleSettle::count_prefix`) - the line was
             //   NOT submitted, so the exempt marker is not lowered (same rule as the queue's partial-write prefix).
@@ -19374,7 +20507,7 @@ mod tests {
     #[test]
     fn r1f_in_tick_wiring_source_pin() {
         let gov = include_str!("governance.rs");
-        let prod = &gov[..gov.find("#[cfg(test)]").expect("테스트 모듈 앵커")];
+        let prod = &gov[..gov.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 앵커")];
         let body = &prod[prod.find("fn check_agent_death_with_model(").expect("사망 감지 본체")..];
         let body = &body[..body.find("\nfn learn_stuck_candidates(").expect("본체 끝 앵커")];
         let tick = body.find("recount_exempted_esc_at_tick(daemon, &s);").expect("틱 되돌리기 호출");
@@ -19537,7 +20670,7 @@ mod tests {
         assert!(path.is_file(), "창이 지나면 그 틱에 쓴다");
         // 소스 핀 — `Err` 분기는 순수 갱신을 부르고, 그 분기에서 로그를 무조건 찍지 않는다.
         let src = include_str!("governance.rs");
-        let prod = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커")];
+        let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 앵커")];
         let f = &prod[prod.find("pub(crate) fn persist_queue_blocked_at(").expect("본체")..];
         let f = &f[..f.find("\n}\n").expect("끝")];
         let tail = &f[f.find("if r.is_err() {").expect("패닉 분기")..];
@@ -19550,7 +20683,7 @@ mod tests {
     #[test]
     fn rqfix2_deliver_queued_refcell_is_borrowed_only_inside_tick_defs() {
         let src = include_str!("governance.rs");
-        let prod = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커")];
+        let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 앵커")];
         let f = &prod[prod.find("\nfn deliver_queued(").expect("deliver_queued")..];
         let f = &f[..f.find("\n}\n").expect("끝")];
         assert_eq!(f.matches(".borrow_mut()").count(), 1, "차용 지점은 한 곳뿐이다");
@@ -19573,7 +20706,7 @@ mod tests {
     #[test]
     fn rqfix2_hint_claim_matches_force_deliver_gates_source_pin() {
         let src = include_str!("governance.rs");
-        let prod = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커")];
+        let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 앵커")];
         let force = &prod[prod.find("pub(crate) fn force_deliver_entry(").expect("force_deliver_entry")..];
         let force = &force[..force.find("\n}\n").expect("끝")];
         // 주석 줄은 제외한다(설명 주석이 '여기엔 quiescing 이 없다' 고 적는 것은 자유) — 코드 줄에만 사이클 창 판정이 없으면 된다.
@@ -19606,7 +20739,7 @@ mod tests {
     #[test]
     fn rqfix_lone_key_exempt_single_writer_and_wiring_source_pin() {
         let gov = include_str!("governance.rs");
-        let prod = &gov[..gov.find("#[cfg(test)]").expect("테스트 모듈 앵커")];
+        let prod = &gov[..gov.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 앵커")];
         assert_eq!(prod.matches("lone_key_exempt.store(").count(), 1, "① 표식 쓰기는 governance 생산 코드에 정확히 한 곳(sync_lone_key_exempt)");
         for (name, text) in [
             ("state", include_str!("state.rs")),
@@ -19917,7 +21050,10 @@ mod tests {
             ("CYS_QUEUE_STARVE_ALERT_SECS", "0"),
         ]);
         let (daemon, s) = marker_seat("b1-ghost");
-        paint_prompt(&s, "", "버그 수정 착수한다. 브랜치는");
+        // ★(0.14.56 · P1 · design r3 §10) The suggestion is painted DIM - how Claude 2.1.312 draws it (C29 rig,
+        //   RIG-FINDINGS.md:11). The pin painted it plain; a plain after-cursor run on a claude seat is now a Home-moved draft
+        //   and must HOLD (`p1_r1_non_alt_home_moved_draft_is_held_on_a_claude_seat`).
+        paint_prompt_dim(&s, "", "버그 수정 착수한다. 브랜치는");
         *s.last_output.lock().unwrap() = std::time::Instant::now();
         *s.last_human_input.lock().unwrap() = None;
         let (mut depth, mut starve) = (HashMap::new(), HashMap::new());
@@ -19927,6 +21063,668 @@ mod tests {
             "커서 뒤 제안문을 입력으로 오판하면 배달이 영구 보류된다(2026-09-03 13:27~15:37 실사고)"
         );
     }
+
+    // ===== ★(0.14.56 · P1 IMPL · design r3 §1/§3/§4) behavioural specimens. They call only entry points that exist at
+    //   9da2418d (deliver_queued/tick, draft_gate, machine_direct_hold, composer_measured_empty, seat_input_line_visibility),
+    //   so this block applied to the pin tree is the RED run. =====
+
+    /// A prompt suggestion drawn the way Claude 2.1.312 draws it (rig, RIG-FINDINGS.md:11): the first glyph reverse (the CLI's
+    /// drawn cursor), the rest dim (SGR 2).
+    fn paint_prompt_dim(s: &Arc<crate::state::Surface>, typed: &str, ghost: &str) {
+        let mut p = s.parser.lock().unwrap_or_else(|e| e.into_inner());
+        p.process(format!("\r\x1b[2K❯ {typed}").as_bytes());
+        if !ghost.is_empty() {
+            let (row, col) = p.screen().cursor_position();
+            let mut cs = ghost.chars();
+            let first = cs.next().unwrap();
+            let rest: String = cs.collect();
+            p.process(format!("\x1b[7m{first}\x1b[27m\x1b[2m{rest}\x1b[22m").as_bytes());
+            p.process(format!("\x1b[{};{}H", row + 1, col + 1).as_bytes());
+        }
+    }
+
+    /// The live-master composer layout (read-only screen read 2026-10-28 ~23:58: marker `❯` + U+00A0, box rules above and
+    /// below, two status rows), with `after` drawn either dim (a suggestion) or plain (a Home-moved draft).
+    fn p1_claude_box(after: &str, dim: bool, alt: bool) -> Vec<String> {
+        let row = if after.is_empty() {
+            "❯\u{a0}".to_string()
+        } else if dim {
+            let mut cs = after.chars();
+            let first = cs.next().unwrap();
+            let rest: String = cs.collect();
+            format!("❯\u{a0}\x1b[7m{first}\x1b[27m\x1b[2m{rest}\x1b[22m")
+        } else {
+            format!("❯\u{a0}{after}")
+        };
+        let _ = alt;
+        vec!["✻ Worked for 12s".to_string(), RULE.to_string(), row, RULE.to_string(), STATUS1.to_string(), STATUS2.to_string()]
+    }
+
+    fn p1_paint_box(s: &Arc<crate::state::Surface>, after: &str, dim: bool, alt: bool) {
+        let lines = p1_claude_box(after, dim, alt);
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        paint_screen(s, &refs, 2, 2, alt);
+    }
+
+    /// (b) The measured-platform contract: a D1 specimen configures its seat as measured, so it asserts D1 on a host of either OS
+    /// (a Windows build creates seats with `d1_platform` false - head ruling W1 0048dfdf).
+    fn p1_measured(s: &crate::state::Surface) {
+        s.d1_platform.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn p1_seat(tag: &str) -> (Arc<Daemon>, Arc<crate::state::Surface>) {
+        let (daemon, s) = wp5_seat(tag, "claude");
+        p1_measured(&s);
+        let e = daemon.next_queue_entry("[보고] p1".into(), None, "test");
+        s.pending_queue.lock().unwrap().push_back(e);
+        (daemon, s)
+    }
+
+    // ===== ★(0.14.56 · P1 E0 · design r2 §2 + T-V3 · head ruling a7cbc003 · API note 64cc32fd) the one-frame composer export.
+    //   Each specimen asks `surface.read_text` for `composer: true` through dispatch. At ece8f1e8 that reply carries no
+    //   `composer` (RED); the hook setter is the only new test symbol. =====
+
+    fn e0_read(daemon: &Arc<Daemon>, s: &crate::state::Surface, composer: bool) -> serde_json::Value {
+        let params = if composer { json!({"surface_id": s.id, "composer": true}) } else { json!({"surface_id": s.id}) };
+        let req = cys::Request { id: json!(1), method: "surface.read_text".into(), params };
+        let crate::handlers::Reply::Single(resp) = crate::handlers::dispatch(daemon, req, None) else { panic!("single reply") };
+        assert_eq!(resp["ok"], json!(true), "read_text failed: {resp}");
+        resp["result"].clone()
+    }
+
+    /// Clears this thread's export hook on drop (a failing specimen never leaves its hook to the next one on the thread).
+    struct E0Hook;
+    impl Drop for E0Hook {
+        fn drop(&mut self) {
+            super::set_composer_export_hook(None);
+        }
+    }
+    fn e0_hook(f: impl Fn(&crate::state::Surface) + 'static) -> E0Hook {
+        super::set_composer_export_hook(Some(Box::new(f)));
+        E0Hook
+    }
+
+    fn e0_contents(s: &crate::state::Surface) -> String {
+        s.parser.lock().unwrap_or_else(|e| e.into_inner()).screen().contents()
+    }
+
+    /// T-V3 (one frame): output moves (a whole publish: a selector-row screen, generation +2) between the one observation and
+    /// the assembly. The exported set stays the observed one: the pre-move text, the pre-move generation and the pre-move
+    /// modal (none). An attempt counts only when the specimen's own +2 is the only movement (no seat output inside it).
+    /// Mutants: the generation, the text or the modal taken from a second read after the observation.
+    #[test]
+    fn p1_e0_export_pairs_text_and_generation_from_the_one_observation() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p1-e0-frame");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (daemon, s) = wp5_seat("p1-e0-frame", "claude");
+        p1_measured(&s);
+        let at_hook = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+        let seen = Arc::clone(&at_hook);
+        let _h = e0_hook(move |s| {
+            seen.store(s.output_gen.load(AtomicOrdering::Acquire), AtomicOrdering::Release);
+            s.parser.lock().unwrap_or_else(|e| e.into_inner()).process("\x1b[2J\x1b[H❯ 1. Yes\r\n  2. No\x1b[1;3H".as_bytes());
+            s.output_gen.fetch_add(2, AtomicOrdering::AcqRel);
+        });
+        let mut checked = false;
+        for _ in 0..40 {
+            p1_paint_box(&s, "carry on please", true, true);
+            let painted = e0_contents(&s);
+            let pre = s.output_gen.load(AtomicOrdering::Acquire);
+            let r = e0_read(&daemon, &s, true);
+            let post = s.output_gen.load(AtomicOrdering::Acquire);
+            if pre % 2 != 0 || at_hook.load(AtomicOrdering::Acquire) != pre || post != pre + 2 {
+                std::thread::sleep(std::time::Duration::from_millis(50)); // not a verdict: the attempt is discarded
+                continue;
+            }
+            assert_eq!(r["composer"]["output_gen"], json!(pre), "the exported generation is not the observed one: {r}");
+            assert_eq!(r["text"], json!(painted), "the exported text is not the observed frame: {r}");
+            assert_eq!(r["composer"]["verdict"], json!("suggestion"), "{r}");
+            assert_eq!(r["composer"]["modal"], json!(false), "the modal is not the observed frame's: {r}");
+            assert_eq!((r["surface_id"].clone(), r["surface_ref"].clone()), (json!(s.id), json!(cys::surface_ref(s.id))));
+            checked = true;
+            break;
+        }
+        assert!(checked, "premise failed: no attempt without seat output");
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    /// Invariant 3: the input generation moves during the collection -> not one frame: `output_gen` null, `verdict`
+    /// unknown, `quiet_secs` 0.0; `input_gen` is the value sampled at the start. Mutant: drop the input bracket.
+    #[test]
+    fn p1_e0_input_move_during_the_collection_exports_no_frame() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p1-e0-input");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (daemon, s) = wp5_seat("p1-e0-input", "claude");
+        p1_measured(&s);
+        let _h = e0_hook(|s| {
+            s.input_gen.fetch_add(1, AtomicOrdering::AcqRel);
+        });
+        p1_paint_box(&s, "carry on please", true, true);
+        let (r, gen0) = crate::state::test_until_no_pty_output(&s, "e0 input move", || {
+            quiet_since(&s, 10);
+            let gen0 = s.input_gen.load(AtomicOrdering::Acquire);
+            (e0_read(&daemon, &s, true), gen0)
+        });
+        assert_eq!(r["composer"]["output_gen"], json!(null), "{r}");
+        assert_eq!(r["composer"]["verdict"], json!("unknown"), "{r}");
+        assert_eq!(r["quiet_secs"], json!(0.0), "{r}");
+        assert_eq!(r["composer"]["input_gen"], json!(gen0), "{r}");
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    /// Invariant 2: a publish in progress (odd generation) is not a frame: `output_gen` null, `verdict` unknown,
+    /// `quiet_secs` 0.0 although the stamp is 10 s old; the same seat once the publish ends exports all three. Mutants:
+    /// export the generation, or the quiet sample, without `frame_consistent()`.
+    #[test]
+    fn p1_e0_publish_in_progress_exports_no_frame() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p1-e0-odd");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (daemon, s) = wp5_seat("p1-e0-odd", "claude");
+        p1_measured(&s);
+        p1_paint_box(&s, "carry on please", true, true);
+        let mut odd = None;
+        for _ in 0..40 {
+            quiet_since(&s, 10);
+            let pre = s.output_gen.load(AtomicOrdering::Acquire);
+            if pre % 2 != 0 {
+                std::thread::sleep(std::time::Duration::from_millis(50)); // not a verdict: wait for an even start
+                continue;
+            }
+            s.output_gen.fetch_add(1, AtomicOrdering::AcqRel);
+            let r = e0_read(&daemon, &s, true);
+            let during = s.output_gen.load(AtomicOrdering::Acquire);
+            s.output_gen.fetch_add(1, AtomicOrdering::AcqRel);
+            if during == pre + 1 {
+                odd = Some(r);
+                break;
+            }
+        }
+        let r = odd.expect("premise failed: no attempt without seat output");
+        assert_eq!(r["composer"]["output_gen"], json!(null), "{r}");
+        assert_eq!(r["composer"]["verdict"], json!("unknown"), "{r}");
+        assert_eq!(r["quiet_secs"], json!(0.0), "{r}");
+        let (r, gen) = crate::state::test_until_no_pty_output(&s, "e0 even gen", || {
+            quiet_since(&s, 10);
+            (e0_read(&daemon, &s, true), s.output_gen.load(AtomicOrdering::Acquire))
+        });
+        assert_eq!(r["composer"]["output_gen"], json!(gen), "{r}");
+        assert_eq!(r["composer"]["verdict"], json!("suggestion"), "{r}");
+        let q = r["quiet_secs"].as_f64().expect("quiet_secs f64");
+        assert!((10.0..600.0).contains(&q), "the observation's quiet sample is not exported: {r}");
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    /// The verdict and the cursor fields on a measured claude seat (suggestion / Home-moved draft / empty / selector row),
+    /// the scope bit off D1 (the same painted suggestion on a seat whose platform half is off reads `unknown`), and the reply
+    /// without `composer` unchanged. Mutants: drop the `governed` condition; a selector row exporting `modal: false`.
+    #[test]
+    fn p1_e0_export_fields_follow_the_d1_verdict_and_its_scope() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p1-e0-fields");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (daemon, s) = wp5_seat("p1-e0-fields", "claude");
+        p1_measured(&s);
+        let read = |label: &str| crate::state::test_until_no_pty_output(&s, label, || e0_read(&daemon, &s, true));
+        let c = |r: &serde_json::Value, k: &str| r["composer"][k].clone();
+        p1_paint_box(&s, "carry on please", true, true);
+        let r = read("suggestion");
+        assert_eq!(
+            (c(&r, "verdict"), c(&r, "governed"), c(&r, "before_cursor_empty"), c(&r, "after_cursor_present"), c(&r, "after_cursor_dim"), c(&r, "modal")),
+            (json!("suggestion"), json!(true), json!(true), json!(true), json!(true), json!(false)),
+            "{r}"
+        );
+        p1_paint_box(&s, "my own words", false, true);
+        let r = read("home-moved draft");
+        assert_eq!((c(&r, "verdict"), c(&r, "after_cursor_dim")), (json!("draft"), json!(false)), "{r}");
+        p1_paint_box(&s, "", false, true);
+        let r = read("empty");
+        assert_eq!(
+            (c(&r, "verdict"), c(&r, "after_cursor_present"), c(&r, "after_cursor_dim")),
+            (json!("empty"), json!(false), json!(null)),
+            "{r}"
+        );
+        paint_screen(&s, &["❯ 1. Yes", "  2. No"], 0, 2, true);
+        let r = read("selector row");
+        assert_eq!((c(&r, "verdict"), c(&r, "modal")), (json!("unknown"), json!(true)), "{r}");
+        // Off D1: the platform half off (as on Windows) - the same suggestion is not given a verdict.
+        s.d1_platform.store(false, AtomicOrdering::Relaxed);
+        p1_paint_box(&s, "carry on please", true, true);
+        let r = read("off D1");
+        assert_eq!((c(&r, "verdict"), c(&r, "governed")), (json!("unknown"), json!(false)), "{r}");
+        assert!(r["composer"]["output_gen"].is_u64(), "off D1 is still one frame: {r}");
+        // Off D1 a modal frame stays answerable (L-MODAL reads modal + output_gen, never the verdict): frame consistency and the
+        // modal are not tied to the D1 text-verdict scope.
+        paint_screen(&s, &["❯ 1. Yes", "  2. No"], 0, 2, true);
+        let r = read("off D1 selector row");
+        assert_eq!((c(&r, "verdict"), c(&r, "modal")), (json!("unknown"), json!(true)), "{r}");
+        assert!(r["composer"]["output_gen"].is_u64(), "an off-D1 modal frame must keep its generation: {r}");
+        // `composer` comes before the delta and tail branches: with `since_line` or `lines` beside it the reply is still the
+        // full-frame export (never tail text beside a full-frame object).
+        for extra in [json!({"since_line": 0}), json!({"lines": 3})] {
+            let mut params = json!({"surface_id": s.id, "composer": true});
+            params.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            let (r, screen) = crate::state::test_until_no_pty_output(&s, "composer beside delta/tail", || {
+                let req = cys::Request { id: json!(1), method: "surface.read_text".into(), params: params.clone() };
+                let crate::handlers::Reply::Single(resp) = crate::handlers::dispatch(&daemon, req, None) else { panic!("reply") };
+                (resp["result"].clone(), e0_contents(&s))
+            });
+            assert!(r["composer"].is_object() && r.get("next_cursor").is_none(), "{extra}: {r}");
+            assert_eq!(r["text"], json!(screen), "{extra}: {r}");
+        }
+        // No `composer` key: today's reply, key for key.
+        let r = crate::state::test_until_no_pty_output(&s, "plain", || e0_read(&daemon, &s, false));
+        let mut keys: Vec<&str> = r.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["latest_cursor", "quiet_secs", "surface_id", "surface_ref", "text"], "{r}");
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    /// A poisoned parser lock (a holder panicked inside it) is not one frame. `observe_prompt_ext` recovers the guard with
+    /// `into_inner` (the queue observers keep doing so), so the export itself refuses: `output_gen` null, `verdict` unknown,
+    /// `quiet_secs` 0.0, whatever the recovered screen shows - here a selector row, so `modal` reads true and only the null
+    /// generation keeps it from authorizing a key. Seat A is poisoned before the read; seat B between the one observation and
+    /// the assembly (the export hook). Mutants: no poison condition; the poison read before the observation only.
+    #[test]
+    fn p1_e0_poisoned_parser_exports_no_frame() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p1-e0-poison");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let poison = |s: &Arc<crate::state::Surface>| {
+            let s2 = Arc::clone(s);
+            let _ = std::thread::spawn(move || {
+                let _held = s2.parser.lock().unwrap_or_else(|e| e.into_inner());
+                panic!("specimen: a holder panics inside the parser lock");
+            })
+            .join();
+            assert!(s.parser.is_poisoned(), "premise: the parser lock is poisoned");
+        };
+        for before_read in [true, false] {
+            let (daemon, s) = wp5_seat(if before_read { "p1-e0-poison-a" } else { "p1-e0-poison-b" }, "claude");
+            p1_measured(&s);
+            paint_screen(&s, &["❯ 1. Yes", "  2. No"], 0, 2, true);
+            let r = crate::state::test_until_no_pty_output(&s, "e0 control", || e0_read(&daemon, &s, true));
+            assert!(r["composer"]["output_gen"].is_u64() && r["composer"]["modal"] == json!(true), "control: {r}");
+            let _h = if before_read {
+                poison(&s);
+                None
+            } else {
+                let sp = Arc::clone(&s);
+                Some(e0_hook(move |_| poison(&sp)))
+            };
+            let r = e0_read(&daemon, &s, true);
+            assert!(s.parser.is_poisoned());
+            let label = if before_read { "poisoned before the read" } else { "poisoned after the observation" };
+            assert_eq!(r["composer"]["output_gen"], json!(null), "{label}: a poisoned frame kept its generation: {r}");
+            assert_eq!((r["composer"]["verdict"].clone(), r["quiet_secs"].clone()), (json!("unknown"), json!(0.0)), "{label}: {r}");
+            let _ = s.child.lock().unwrap_or_else(|e| e.into_inner()).kill();
+            crate::state::p1_e0_stop_daemon(&daemon);
+        }
+    }
+
+    /// Invariant 4 + RAW human bytes: owner/owner_kind from the existing MachineDraft evidence, and the input counters as
+    /// sampled (human RAW, not clamped by pending). Mutants: clamp human by pending; map OwnPaste as `machine`.
+    /// (SubmittedResidue is not built here: it needs a recorded machine body explaining the screen - its arm is read, not run.)
+    #[test]
+    fn p1_e0_owner_fields_and_raw_input_counters() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p1-e0-owner");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (daemon, s) = wp5_seat("p1-e0-owner", "claude");
+        p1_measured(&s);
+        p1_paint_box(&s, "", false, true);
+        let read = |label: &str| crate::state::test_until_no_pty_output(&s, label, || e0_read(&daemon, &s, true));
+        let owner = |r: &serde_json::Value| (r["composer"]["owner"].clone(), r["composer"]["owner_kind"].clone());
+        let r = read("no evidence");
+        assert_eq!(owner(&r), (json!("none"), json!("unattributed")), "{r}");
+        s.set_pending_input(5);
+        s.mark_pending_input_owner(super::InputOwner::Claimed(7));
+        let r = read("claimed residue");
+        assert_eq!(owner(&r), (json!("machine"), json!("claimed")), "{r}");
+        assert_eq!(
+            (r["composer"]["pending_bytes"].clone(), r["composer"]["human_bytes"].clone(), r["composer"]["input_gen"].clone()),
+            (json!(5), json!(0), json!(s.input_gen.load(AtomicOrdering::Acquire))),
+            "{r}"
+        );
+        s.set_pending_input(0);
+        s.pending_input.lock().unwrap().human = 3;
+        let r = read("raw human");
+        assert_eq!(owner(&r), (json!("none"), json!("unattributed")), "a human byte is never machine-owned: {r}");
+        assert_eq!((r["composer"]["pending_bytes"].clone(), r["composer"]["human_bytes"].clone()), (json!(0), json!(3)), "{r}");
+        s.pending_input.lock().unwrap().human = 0;
+        s.inject_track.begin();
+        let r = read("own paste");
+        assert_eq!(owner(&r), (json!("own_paste"), json!("daemon")), "{r}");
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    /// T-Q1 (r2 F18 STALL, traced): alt-screen claude seat, boxed composer, a dim suggestion on the marker row ->
+    /// DELIVERED. Pin: `scan_composer` returns None on marker-row text, `layout_ok` false, BLOCKED_ALT_SCREEN forever.
+    #[test]
+    fn p1_r1_alt_dim_suggestion_with_box_is_delivered() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p1-q1");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap()), ("CYS_QUEUE_STARVE_ALERT_SECS", "0")]);
+        let (daemon, s) = p1_seat("p1-q1");
+        p1_paint_box(&s, "carry on please", true, true);
+        quiet_since(&s, 10);
+        tick(&daemon);
+        assert!(
+            s.pending_queue.lock().unwrap().is_empty(),
+            "a rendered suggestion nobody accepts must not hold a machine delivery (blocked: {})",
+            blocked_reason(&s)
+        );
+    }
+
+    /// T-Q1c: the same suggestion with NO box and no status row below -> still BLOCKED_ALT_SCREEN (the layout gate is
+    /// not bypassed; `layout_ok` is never set from the verdict alone).
+    #[test]
+    fn p1_r1_alt_dim_suggestion_without_box_stays_blocked() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p1-q1c");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap()), ("CYS_QUEUE_STARVE_ALERT_SECS", "0")]);
+        let (daemon, s) = p1_seat("p1-q1c");
+        paint_screen(&s, &["❯ \x1b[7mc\x1b[27m\x1b[2marry on please\x1b[22m"], 0, 2, true);
+        quiet_since(&s, 10);
+        tick(&daemon);
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1);
+        assert_eq!(blocked_reason(&s), BLOCKED_ALT_SCREEN);
+    }
+
+    /// T-Q1d: alt-screen, boxed composer, a PLAIN after-cursor run (a Home-moved draft) -> held, as at the pin.
+    #[test]
+    fn p1_r1_alt_home_moved_draft_stays_held() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p1-q1d");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap()), ("CYS_QUEUE_STARVE_ALERT_SECS", "0")]);
+        let (daemon, s) = p1_seat("p1-q1d");
+        p1_paint_box(&s, "my own words", false, true);
+        quiet_since(&s, 10);
+        tick(&daemon);
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "a Home-moved draft must never read as empty");
+    }
+
+    /// T-Q4: NON-alt claude seat (the live master's mode), boxed composer, pending 0, a plain after-cursor run -> HELD with
+    /// `input_pending`. Pin: `input_line_state` reads before-cursor only, Empty, delivered onto the draft.
+    #[test]
+    fn p1_r1_non_alt_home_moved_draft_is_held_on_a_claude_seat() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p1-q4");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap()), ("CYS_QUEUE_STARVE_ALERT_SECS", "0")]);
+        let (daemon, s) = p1_seat("p1-q4");
+        p1_paint_box(&s, "my own words", false, false);
+        quiet_since(&s, 10);
+        tick(&daemon);
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "a Home-moved draft must never read as empty");
+        assert_eq!(blocked_reason(&s), BLOCKED_INPUT_PENDING);
+    }
+
+    /// T-Q4b: the same non-alt live layout with a DIM suggestion -> delivered (the queue pair's normal-delivery half).
+    #[test]
+    fn p1_r1_non_alt_dim_suggestion_is_delivered_on_the_live_layout() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p1-q4b");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap()), ("CYS_QUEUE_STARVE_ALERT_SECS", "0")]);
+        let (daemon, s) = p1_seat("p1-q4b");
+        p1_paint_box(&s, "carry on please", true, false);
+        quiet_since(&s, 10);
+        tick(&daemon);
+        assert!(s.pending_queue.lock().unwrap().is_empty(), "blocked: {}", blocked_reason(&s));
+    }
+
+    /// T-Q4c: the non-alt live layout, EMPTY composer (marker + U+00A0 only) -> delivered. Guards the new dependency of a
+    /// non-alt claude seat on the box scan: if the live layout did not scan as empty, every master delivery would hold.
+    #[test]
+    fn p1_r1_non_alt_empty_live_layout_is_delivered() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p1-q4c");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap()), ("CYS_QUEUE_STARVE_ALERT_SECS", "0")]);
+        let (daemon, s) = p1_seat("p1-q4c");
+        p1_paint_box(&s, "", false, false);
+        quiet_since(&s, 10);
+        tick(&daemon);
+        assert!(s.pending_queue.lock().unwrap().is_empty(), "blocked: {}", blocked_reason(&s));
+    }
+
+    /// T-Q2 (gemini-2 G2-7, r2 run-2 STALL): a stale pending count beside a DIM suggestion resets after the quiet window,
+    /// then the item is delivered. Pin: the reset needs `after` empty, so the count is never erased: held forever.
+    #[test]
+    fn p1_r2_stale_count_resets_beside_a_dim_suggestion() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p1-q2");
+        let _env = QueueEnvGuard::set(&[
+            ("CYS_PACK_DIR", pack.to_str().unwrap()),
+            ("CYS_QUEUE_STARVE_ALERT_SECS", "0"),
+            ("CYS_QUEUE_QUIET_SECS", "1"),
+        ]);
+        let (daemon, s) = p1_seat("p1-q2");
+        s.set_pending_input(1);
+        paint_prompt_dim(&s, "", "carry on please");
+        quiet_since(&s, 10);
+        tick(&daemon);
+        assert_eq!(blocked_reason(&s), BLOCKED_INPUT_PENDING, "first tick only stamps");
+        // The window is decided by the slot's own stamp: backdate it instead of sleeping (no wall-clock premise).
+        {
+            let mut slot = s.pending_input_stale.lock().unwrap();
+            let (bytes, gen, _) = slot.expect("the first tick arms the stale slot beside a suggestion");
+            *slot = Some((bytes, gen, std::time::Instant::now() - std::time::Duration::from_secs(10)));
+        }
+        tick(&daemon);
+        assert_eq!(s.pending_input_bytes.load(AtomicOrdering::Relaxed), 0, "the stale count beside a suggestion must reset");
+        tick(&daemon);
+        assert!(s.pending_queue.lock().unwrap().is_empty(), "delivered after the reset (blocked: {})", blocked_reason(&s));
+    }
+
+    /// T-Q2b: the same with a PLAIN after-cursor run (a Home-moved draft) -> the count is never reset (unchanged from pin).
+    #[test]
+    fn p1_r2_stale_count_beside_a_home_moved_draft_never_resets() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p1-q2b");
+        let _env = QueueEnvGuard::set(&[
+            ("CYS_PACK_DIR", pack.to_str().unwrap()),
+            ("CYS_QUEUE_STARVE_ALERT_SECS", "0"),
+            ("CYS_QUEUE_QUIET_SECS", "1"),
+        ]);
+        let (daemon, s) = p1_seat("p1-q2b");
+        s.set_pending_input(1);
+        paint_prompt(&s, "", "my own words");
+        quiet_since(&s, 10);
+        // Plant a slot whose window has long passed (no sleep): the reset must still never happen, because the draft makes
+        // the screen non-empty and the slot is cleared, never consumed.
+        *s.pending_input_stale.lock().unwrap() =
+            Some((1, s.input_gen.load(AtomicOrdering::Acquire), std::time::Instant::now() - std::time::Duration::from_secs(10)));
+        tick(&daemon);
+        tick(&daemon);
+        assert_eq!(s.pending_input_bytes.load(AtomicOrdering::Relaxed), 1);
+        assert!(s.pending_input_stale.lock().unwrap().is_none(), "a draft never arms the reset");
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1);
+    }
+
+    /// T-Q3 (gemini-2 G2-7(2)): the partial-hold release reads a Home-moved draft as NOT empty (pin: before-only -> empty,
+    /// released onto the draft); a dim suggestion reads empty.
+    #[test]
+    fn p1_r3_hold_release_reads_a_home_moved_draft_as_occupied() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p1-q3");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (_daemon, s) = marker_seat("p1-q3");
+        p1_measured(&s);
+        paint_prompt(&s, "", "my own words");
+        assert!(!super::composer_measured_empty(&s), "a Home-moved draft must never read as empty");
+        paint_prompt_dim(&s, "", "carry on please");
+        assert!(super::composer_measured_empty(&s), "a suggestion reads empty");
+    }
+
+    /// T-G2 (R-5): a direct Text onto a Home-moved draft on a claude seat is refused (pin: passed); onto a dim suggestion it
+    /// passes (unchanged).
+    #[test]
+    fn p1_r5_direct_text_is_refused_onto_a_home_moved_draft() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p1-g2");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (daemon, s) = marker_seat("p1-g2");
+        p1_measured(&s);
+        paint_prompt(&s, "", "my own words");
+        assert_eq!(super::draft_gate(&daemon, &s, DirectSendKind::Text), Some(DraftGateDenied::ScreenOccupied));
+        paint_prompt_dim(&s, "", "carry on please");
+        assert_eq!(super::draft_gate(&daemon, &s, DirectSendKind::Text), None);
+    }
+
+    /// T-H0 (R-6): the machine-inject draft axis (CEO push, channel envelope, boot notice, schedule push) holds on a
+    /// Home-moved draft (pin: before-only -> no draft -> typed onto it); a dim suggestion is no draft.
+    #[test]
+    fn p1_r6_machine_inject_holds_on_a_home_moved_draft() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p1-h0");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (daemon, s) = marker_seat("p1-h0");
+        p1_measured(&s);
+        let axes = super::MachineHoldAxes { draft: true, ..super::MachineHoldAxes::NONE };
+        paint_prompt(&s, "", "my own words");
+        assert_eq!(super::machine_direct_hold(&daemon, &s, axes), Some(super::MachineHold::Draft));
+        paint_prompt_dim(&s, "", "carry on please");
+        assert_eq!(super::machine_direct_hold(&daemon, &s, axes), None);
+    }
+
+    /// T-F1 (R-7/R-10): the seat's visibility reading reports a Home-moved draft as VISIBLE (force-deliver refuses, the remedy
+    /// is `human_draft`); a dim suggestion is not a visible draft and still reports the after-cursor ghost.
+    #[test]
+    fn p1_r7_visibility_reports_a_home_moved_draft() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p1-f1");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (_daemon, s) = marker_seat("p1-f1");
+        p1_measured(&s);
+        paint_prompt(&s, "", "my own words");
+        assert_eq!(super::seat_input_line_visibility(&s), (Some(true), Some(true)));
+        paint_prompt_dim(&s, "", "carry on please");
+        assert_eq!(super::seat_input_line_visibility(&s), (Some(false), Some(true)));
+    }
+    // ----- P1 D1 unit specimens (new functions; coverage, not RED proofs) -----
+
+    fn p1_verdict(s: &Arc<crate::state::Surface>) -> super::ComposerVerdict {
+        super::composer_verdict(&super::observe_prompt(s, &["❯".to_string()]), None)
+    }
+
+    /// T-V1: the verdict rows on rig-shaped frames, including the U+00A0 marker spacing (screen matching only) and the
+    /// fail-closed rows (a one-glyph suggestion whose only glyph is the drawn cursor has no dim reading -> Draft).
+    #[test]
+    fn p1_d1_verdict_rows() {
+        use super::ComposerVerdict as V;
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p1-v1");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (_daemon, s) = marker_seat("p1-v1");
+        paint_prompt(&s, "", "");
+        assert_eq!(p1_verdict(&s), V::Empty);
+        paint_prompt_dim(&s, "", "carry on please");
+        assert_eq!(p1_verdict(&s), V::Suggestion);
+        paint_prompt(&s, "", "my own words");
+        assert_eq!(p1_verdict(&s), V::Draft, "a non-dim after-cursor run is a Home-moved draft");
+        paint_prompt(&s, "typed", "");
+        assert_eq!(p1_verdict(&s), V::Draft);
+        paint_prompt_dim(&s, "", "x");
+        assert_eq!(p1_verdict(&s), V::Draft, "no dim reading is a draft (fail-closed)");
+        p1_paint_box(&s, "", false, false);
+        assert_eq!(p1_verdict(&s), V::Empty, "marker + U+00A0 is marker spacing, not content");
+        p1_paint_box(&s, "carry on please", true, false);
+        assert_eq!(p1_verdict(&s), V::Suggestion);
+        assert_eq!(V::Suggestion.reads_empty(), Some(true));
+        assert_eq!(V::Draft.reads_empty(), Some(false));
+        assert_eq!(V::Unknown.reads_empty(), None);
+    }
+
+    /// T-Q5: D1 governs claude seats only; every other adapter keeps its pin reading.
+    #[test]
+    fn p1_d1_scope_is_claude_only() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for (agent, want) in [("claude", true), ("gemini", false), ("codex", false), ("grok", false)] {
+            let (_daemon, s) = wp5_seat(&format!("p1-scope-{agent}"), agent);
+            p1_measured(&s);
+            assert_eq!(super::d1_governs(&s), want, "{agent}");
+            let obs = super::observe_prompt(&s, &["❯".to_string()]);
+            assert_eq!(super::composer_reads_empty(&s, &obs, None).is_some(), want, "{agent}");
+        }
+        assert_eq!(super::D1_MEASURED_ADAPTERS, &["claude"]);
+    }
+    /// W1 (a) (head ruling W1 0048dfdf): a seat configured as a Windows seat (`d1_platform` false) keeps every reader's PIN verdict
+    /// - D1 is inert there. The pin values are the ones measured on 9da2418d (impl/RED-stageAB-on-pin.log, STOP-D1-windows-conpty.md):
+    /// the alt suggestion stall stays (named Windows residue until ConPTY SGR 2 is measured) and a non-alt plain after-cursor run is
+    /// DELIVERED, as at the pin (named Windows residue: a Home-moved draft).
+    #[test]
+    fn p1_w1_windows_seat_keeps_the_pin_readers() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p1-w1a");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap()), ("CYS_QUEUE_STARVE_ALERT_SECS", "0")]);
+        // (layout, after, dim, alt, delivered at the pin, blocked reason at the pin when held)
+        for (label, after, dim, alt, delivered, reason) in [
+            ("alt dim suggestion, box", "carry on please", true, true, false, Some(BLOCKED_ALT_SCREEN)),
+            ("alt plain run, box", "my own words", false, true, false, None),
+            ("non-alt plain run, live layout", "my own words", false, false, true, None),
+            ("non-alt dim suggestion, live layout", "carry on please", true, false, true, None),
+            ("non-alt empty, live layout", "", false, false, true, None),
+        ] {
+            let (daemon, s) = p1_seat(&format!("p1-w1a-{}-{}", alt, after.len()));
+            s.d1_platform.store(false, std::sync::atomic::Ordering::Relaxed);
+            assert!(!super::d1_governs(&s), "{label}: D1 is off on a Windows seat");
+            p1_paint_box(&s, after, dim, alt);
+            let obs = super::observe_prompt(&s, &["❯".to_string()]);
+            assert_eq!(super::composer_reads_empty(&s, &obs, None), None, "{label}: the reader keeps its pin expression");
+            quiet_since(&s, 10);
+            tick(&daemon);
+            let depth = s.pending_queue.lock().unwrap().len();
+            assert_eq!(depth == 0, delivered, "{label}: pin verdict (blocked: {})", blocked_reason(&s));
+            if let Some(r) = reason {
+                assert_eq!(blocked_reason(&s), r, "{label}");
+            }
+        }
+        // The non-queue readers on a Windows seat read a Home-moved draft as at the pin (R-3, R-5, R-6, R-7).
+        let (daemon, s) = marker_seat("p1-w1a-readers");
+        s.d1_platform.store(false, std::sync::atomic::Ordering::Relaxed);
+        paint_prompt(&s, "", "my own words");
+        assert!(super::composer_measured_empty(&s), "R-3 pin: reads empty");
+        assert_eq!(super::draft_gate(&daemon, &s, DirectSendKind::Text), None, "R-5 pin: passes");
+        let axes = super::MachineHoldAxes { draft: true, ..super::MachineHoldAxes::NONE };
+        assert_eq!(super::machine_direct_hold(&daemon, &s, axes), None, "R-6 pin: no draft");
+        assert_eq!(super::seat_input_line_visibility(&s).0, Some(false), "R-7 pin: not visible");
+    }
+
+    /// W1 (c): the platform gate is ONE named predicate. Both branches of the pure table are measured on any host; the wrapper is
+    /// that table of this OS in one expression; a seat takes it at creation; `d1_governs` reads the seat's half first.
+    #[test]
+    fn p1_w1_d1_platform_gate_is_one_named_predicate() {
+        assert!(!super::d1_platform_measured_for(true), "Windows: not measured");
+        assert!(super::d1_platform_measured_for(false), "elsewhere: measured");
+        let body = |src: &str, head: &str| -> String {
+            let i = src.find(head).unwrap_or_else(|| panic!("{head} missing"));
+            let rest = &src[i..];
+            let open = rest.find('{').expect("body start");
+            let close = rest.find("\n}\n").expect("body end (top-level fn)");
+            rest[open + 1..close].split_whitespace().collect::<Vec<_>>().join(" ")
+        };
+        let gov = include_str!("governance.rs");
+        assert_eq!(body(gov, concat!("pub(crate) fn d1_platform_measured_for", "(is_windows: bool) -> bool {")), "!is_windows");
+        assert_eq!(body(gov, concat!("pub(crate) fn d1_platform_measured", "() -> bool {")), "d1_platform_measured_for(cfg!(windows))");
+        assert!(
+            body(gov, concat!("pub(crate) fn d1_governs", "(s: &crate::state::Surface) -> bool {"))
+                .starts_with("s.d1_platform.load(Ordering::Relaxed) && "),
+            "d1_governs reads the seat's platform half first"
+        );
+        let st = include_str!("state.rs");
+        assert_eq!(st.matches(concat!("d1_platform: AtomicBool::new(", "crate::governance::d1_platform_measured()),")).count(), 1);
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_daemon, s) = wp5_seat("p1-w1c", "claude");
+        assert_eq!(s.d1_platform.load(std::sync::atomic::Ordering::Relaxed), super::d1_platform_measured(), "a new seat takes this build's half");
+        assert_eq!(super::d1_governs(&s), super::d1_platform_measured(), "claude seat: governed exactly where measured");
+    }
+    // ===== end of the P1 behavioural block =====
 
     /// 화면이 비어 보여도 데몬이 센 미제출 바이트가 있으면 배달하지 않는다(1차 축 우선).
     #[test]
@@ -20821,6 +22619,7 @@ mod tests {
         let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (_pack, _env) = wp5_env("layout");
         let (daemon, s) = wp5_seat("wp5-layout", "claude");
+        p1_measured(&s); // the D1 contract on either host (head ruling W1)
         let e = daemon.next_queue_entry("[보고] 레이아웃 없음".into(), None, "test");
         s.pending_queue.lock().unwrap().push_back(e);
         paint_screen(&s, &["❯ ", "  Continue with the new plan", "  Esc to cancel"], 0, 2, true);
@@ -20829,11 +22628,27 @@ mod tests {
         assert_eq!(s.pending_queue.lock().unwrap().len(), 1);
         assert_eq!(blocked_reason(&s), BLOCKED_BUSY, "Esc to cancel 조각은 작업 중 어휘로 먼저 거부된다");
         *s.queue_blocked.lock().unwrap() = None;
+        // ★(0.14.56 · P1 D1 · head ruling on Q-suites-17-pins 5fffe0d9, item 3 (i)) On a measured claude seat D1 row 3 reads the rows
+        //   under the marker through the shared composer-region scan: text there is a draft, so the refusal is `input_pending` (it comes
+        //   before the layout refusal) and the queue still holds. The frame may be a selector rather than text, so the remedy tells a
+        //   person to READ THE SCREEN before acting (approved wording, NOTE-wp5-remedy-text.md c4a104a3). A seat D1 does not govern
+        //   (here: configured as a Windows seat, ruling W1) keeps the pin label `alt_screen` - the original intent of this frame.
         paint_screen(&s, &["❯ ", "  Continue with the new plan", "  Some other label"], 0, 2, true);
         quiet_since(&s, 5);
         tick(&daemon);
         assert_eq!(s.pending_queue.lock().unwrap().len(), 1);
-        assert_eq!(blocked_reason(&s), BLOCKED_ALT_SCREEN);
+        assert_eq!(blocked_reason(&s), BLOCKED_INPUT_PENDING);
+        let (code, text) = queue_remedy(BLOCKED_INPUT_PENDING, &queue_block_diag(&daemon, &s));
+        assert_eq!(code, "human_draft", "{text}");
+        let read = text.find("먼저 그 창의 화면을 읽는다(글이 아니라 선택 창일 수 있다).").expect("the remedy says read the screen");
+        let act = text.find("사람이 그 창에서 제출하거나 지운다").expect("the remedy names the action");
+        assert!(read < act, "the remedy says read the screen BEFORE acting: {text}");
+        s.d1_platform.store(false, std::sync::atomic::Ordering::Relaxed);
+        *s.queue_blocked.lock().unwrap() = None;
+        quiet_since(&s, 5);
+        tick(&daemon);
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1);
+        assert_eq!(blocked_reason(&s), BLOCKED_ALT_SCREEN, "a seat D1 does not govern keeps the pin label");
     }
 
     /// CONTRACTS B-1 반례 5종 + codex 설계 검토 반례 — 전부 NotReady(alt-screen 재정의가 열지 않는다).
@@ -21133,7 +22948,7 @@ mod tests {
         // ⓐ 대조 — 같은 프레임·같은 승인 상태면 alt 유휴 composer 는 배달된다(전제 성립).
         refill("alt 유휴");
         assert!(
-            deliver_head_locked(&daemon, &s, false, false, None, None, Some(gen), Some(&rc(false)))
+            deliver_head_locked(&daemon, &s, false, false, None, None, Some(gen), Some(&rc(false)), None)
                 .is_some(),
             "전제 붕괴: alt 유휴 프레임이 애초에 배달 자격이 아니면 승인 축을 재지 못한다"
         );
@@ -21151,7 +22966,7 @@ mod tests {
             approval_pending: true,
         };
         assert!(
-            deliver_head_locked(&daemon, &s, false, false, None, None, Some(gen2), Some(&rc2))
+            deliver_head_locked(&daemon, &s, false, false, None, None, Some(gen2), Some(&rc2), None)
                 .is_none(),
             "alt-screen 인계가 승인·관문 feed 를 다시 읽지 않는다(codex M3 가 사실이라면 여기서 배달된다)"
         );
@@ -21264,6 +23079,7 @@ mod tests {
             quiet_secs,
             alt_screen: true,
             block: None,
+            after_cursor_dim: None,
         };
         for knob in ["1", "3", "30"] {
             let _knob = QueueEnvGuard::set(&[("CYS_QUEUE_QUIET_SECS", knob)]);
@@ -21367,7 +23183,7 @@ mod tests {
         assert_eq!(now_gen % 2, 0, "전제 붕괴: 발행 중(홀수)이면 종전 축이 이미 잡는다");
         let mut bus_a = daemon.bus.subscribe();
         assert!(
-            deliver_head_locked(&daemon, &s, false, false, None, None, None, Some(&rc(gen0, false)))
+            deliver_head_locked(&daemon, &s, false, false, None, None, None, Some(&rc(gen0, false)), None)
                 .is_none(),
             "판정 이후 다 그려진 모달에 본문을 배달했다"
         );
@@ -21381,7 +23197,7 @@ mod tests {
         //    멈추는 것은 writer 안전 탐침이고, 그 사실이 `queue.inject_aborted` 로 드러난다.
         let mut bus_b = daemon.bus.subscribe();
         assert!(
-            deliver_head_locked(&daemon, &s, false, false, None, None, None, None).is_none(),
+            deliver_head_locked(&daemon, &s, false, false, None, None, None, None, None).is_none(),
             "재평가 없는 경로가 다 그려진 모달에 본문을 배달했다(Q1 탐침이 죽었다)"
         );
         assert_eq!(
@@ -21397,7 +23213,7 @@ mod tests {
         s.output_gen.fetch_add(2, AtomicOrdering::AcqRel);
         let gen2 = s.output_gen.load(AtomicOrdering::Acquire);
         assert!(
-            deliver_head_locked(&daemon, &s, false, false, None, None, None, Some(&rc(gen2 - 2, false)))
+            deliver_head_locked(&daemon, &s, false, false, None, None, None, Some(&rc(gen2 - 2, false)), None)
                 .is_some(),
             "세대가 바뀌었다는 이유만으로 정상 composer 배달이 막혔다(기아 #1 방향 회귀)"
         );
@@ -21407,7 +23223,7 @@ mod tests {
         quiet_since(&s, 10);
         let gen3 = s.output_gen.load(AtomicOrdering::Acquire);
         assert!(
-            deliver_head_locked(&daemon, &s, false, false, None, None, None, Some(&rc(gen3, true)))
+            deliver_head_locked(&daemon, &s, false, false, None, None, None, Some(&rc(gen3, true)), None)
                 .is_none(),
             "판정 이후 승인·관문 feed 가 바뀌었는데 그 승인으로 배달했다"
         );
@@ -21629,6 +23445,7 @@ mod tests {
             quiet_secs: quiet,
             alt_screen: alt,
             block: None,
+            after_cursor_dim: None,
         };
         let b = |w: &'static str| PromptGate::Blocked(w);
         let cases: Vec<(&str, PromptGate, super::PromptObs, bool, crate::repaint::ScreenObs)> = vec![
@@ -21979,7 +23796,7 @@ mod tests {
         let gen = s.output_gen.load(AtomicOrdering::Acquire);
         s.output_gen.fetch_add(2, AtomicOrdering::AcqRel); // 청크 하나가 완전히 흘렀다
         assert!(
-            deliver_head_locked(&daemon, &s, false, false, None, None, Some(gen), None).is_none(),
+            deliver_head_locked(&daemon, &s, false, false, None, None, Some(gen), None, None).is_none(),
             "판정이 본 프레임이 아닌데 배달했다"
         );
         assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "전제: 머리가 있어야 검사가 유효하다");
@@ -21988,14 +23805,14 @@ mod tests {
         let odd = s.output_gen.load(AtomicOrdering::Acquire);
         assert_eq!(odd % 2, 1, "전제 붕괴: 홀수를 만들지 못했다");
         assert!(
-            deliver_head_locked(&daemon, &s, false, false, None, None, Some(odd), None).is_none(),
+            deliver_head_locked(&daemon, &s, false, false, None, None, Some(odd), None, None).is_none(),
             "홀수 세대가 동일 비교만으로 통과했다"
         );
         // ★(리뷰 R1(R6회차) · codex major) 판정이 세대를 **넘기지 않는 경로**(비-alt B1 · 마커 없는
         //   강제 배달)도 인계 시점에 발행 중이면 배달하지 않는다 — 종전에는 `None` 이면 홀수 검사
         //   자체가 없었다.
         assert!(
-            deliver_head_locked(&daemon, &s, false, false, None, None, None, None).is_none(),
+            deliver_head_locked(&daemon, &s, false, false, None, None, None, None, None).is_none(),
             "expect_output_gen=None 경로가 발행 중(홀수) 인계를 통과시켰다"
         );
         // 가용성 대조군 — 짝수로 닫고 같은 값을 넘기면 **곧바로** 배달된다(축이 상시 닫히지 않는다).
@@ -22020,7 +23837,7 @@ mod tests {
             approval_pending: false,
         };
         assert!(
-            deliver_head_locked(&daemon, &s, false, false, None, None, Some(even), Some(&rc_even))
+            deliver_head_locked(&daemon, &s, false, false, None, None, Some(even), Some(&rc_even), None)
                 .is_some(),
             "발행이 끝난 프레임인데 인계가 거부했다(기아 — 축이 상시 닫혔다)"
         );
@@ -22569,7 +24386,7 @@ mod tests {
             body: e.text.clone(),
         };
         *s.inject_reservation.lock().unwrap() = None;
-        super::rollback_aborted_inject(&daemon, &s, &f, &delivered);
+        super::rollback_aborted_inject(&daemon, &s, &f, &delivered, Vec::new());
         assert!(
             s.pending_queue.lock().unwrap().is_empty(),
             "폐기·묘비된 항목이 중단 롤백으로 활성 큐 머리에 되살아났다 — 다음 틱에 그 문장이 배달된다"
@@ -22622,7 +24439,7 @@ mod tests {
             body: e.text.clone(),
         };
         *s.inject_reservation.lock().unwrap() = None;
-        super::rollback_aborted_inject(&daemon, &s, &f, &delivered);
+        super::rollback_aborted_inject(&daemon, &s, &f, &delivered, Vec::new());
         assert!(
             s.pending_queue.lock().unwrap().is_empty(),
             "만료된 항목이 활성 큐 머리로 되살아났다(§8) — 활성·만료 양쪽에 같은 id 가 있다"
@@ -23810,7 +25627,7 @@ mod tests {
         e.enqueued_at = now_epoch() - 7.0 * 3600.0;
         let id = e.id.clone();
         s.pending_queue.lock().unwrap().push_back(e);
-        assert!(deliver_head_locked(&daemon, &s, false, false, None, None, None, None).is_none());
+        assert!(deliver_head_locked(&daemon, &s, false, false, None, None, None, None, None).is_none());
         assert!(s.pending_queue.lock().unwrap().is_empty());
         assert!(s.expired_queue.lock().unwrap().iter().any(|x| x.id == id));
         assert!(
@@ -24119,7 +25936,7 @@ mod tests {
         // ⓐ 판정이 본 값(0) 과 배달 시점 값(직접 send 가 끼어들어 12)이 다르면 **배달하지 않는다**.
         s.pending_input_bytes.store(12, std::sync::atomic::Ordering::Relaxed);
         assert!(
-            deliver_head_locked(&daemon, &s, false, false, None, Some(0), None, None).is_none(),
+            deliver_head_locked(&daemon, &s, false, false, None, Some(0), None, None, None).is_none(),
             "판정 이후 직접 send 가 입력줄을 점유했는데 큐를 밀어 넣었다 — 두 본문이 한 제출로 합쳐진다"
         );
         assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "미배달분은 보존돼야 한다");
@@ -24127,7 +25944,7 @@ mod tests {
         // ⓑ 음성 대조: 값이 그대로면 정상 배달된다(무조건 거부 구현 차단).
         s.pending_input_bytes.store(0, std::sync::atomic::Ordering::Relaxed);
         assert!(
-            deliver_head_locked(&daemon, &s, false, false, None, Some(0), None, None).is_some(),
+            deliver_head_locked(&daemon, &s, false, false, None, Some(0), None, None, None).is_some(),
             "값이 변하지 않았는데 배달을 막으면 그 자체가 기아다"
         );
     }
@@ -24306,7 +26123,7 @@ mod tests {
         }
         let mut delivered = None;
         for _ in 0..40 {
-            delivered = deliver_head_locked(&daemon, &s, false, false, None, Some(0), None, None);
+            delivered = deliver_head_locked(&daemon, &s, false, false, None, Some(0), None, None, None);
             if delivered.is_some() {
                 break;
             }
@@ -24347,7 +26164,7 @@ mod tests {
         }
         let mut delivered = None;
         for _ in 0..40 {
-            delivered = deliver_head_locked(&daemon, &s, false, false, None, Some(0), None, None);
+            delivered = deliver_head_locked(&daemon, &s, false, false, None, Some(0), None, None, None);
             if delivered.is_some() {
                 break;
             }
@@ -24849,7 +26666,7 @@ mod tests {
             .expect("create surface");
         daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
         // 빈 큐 = None + 이벤트 0(부작용 없음).
-        assert!(deliver_head_locked(&daemon, &s, false, false, None, None, None, None).is_none());
+        assert!(deliver_head_locked(&daemon, &s, false, false, None, None, None, None, None).is_none());
         assert_eq!(
             daemon
                 .bus
@@ -24867,7 +26684,7 @@ mod tests {
             q.push_back(e1);
             q.push_back(e2);
         }
-        let d = deliver_head_locked(&daemon, &s, true, false, None, None, None, None).expect("머리 배달");
+        let d = deliver_head_locked(&daemon, &s, true, false, None, None, None, None, None).expect("머리 배달");
         assert_eq!(d.entry.id, id1, "배달 = 머리 항목(id 판정)");
         assert_eq!(d.remaining, 1);
         assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "pop 은 배달분 하나만");
@@ -24911,7 +26728,7 @@ mod tests {
         let e1 = daemon.next_queue_entry("현재 머리".into(), None, "test");
         s.pending_queue.lock().unwrap().push_back(e1.clone());
         // 조준(다른 id)과 머리 불일치 → 배달·pop·이벤트 전무.
-        assert!(deliver_head_locked(&daemon, &s, true, false, Some("q0.999"), None, None, None).is_none());
+        assert!(deliver_head_locked(&daemon, &s, true, false, Some("q0.999"), None, None, None, None).is_none());
         assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "불일치 시 pop 금지");
         assert_eq!(
             daemon.bus.tail(30).iter().filter(|ev| ev["name"] == "queue.delivered").count(),
@@ -24919,7 +26736,7 @@ mod tests {
             "불일치 시 배달 영수증도 없다(무부작용)"
         );
         // 대조군: 일치하면 정상 배달.
-        assert!(deliver_head_locked(&daemon, &s, true, false, Some(&e1.id), None, None, None).is_some());
+        assert!(deliver_head_locked(&daemon, &s, true, false, Some(&e1.id), None, None, None, None).is_some());
         assert!(s.pending_queue.lock().unwrap().is_empty());
     }
 
@@ -25129,7 +26946,7 @@ mod tests {
     #[test]
     fn queue_delivery_single_helper_shared_by_tick_and_rpc() {
         let src = include_str!("governance.rs");
-        let prod = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커 소실")];
+        let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 앵커 소실")];
         assert_eq!(
             prod.matches("crate::delivery::record_audited").count(),
             1,
@@ -25250,7 +27067,7 @@ mod tests {
         }
         const NARROWING: [&str; 3] = ["as u32", "as u16", "as usize"];
         let src = include_str!("governance.rs");
-        let raw = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커 소실")];
+        let raw = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 앵커 소실")];
         let code = strip_line_comments(raw);
         let hits: Vec<&str> = NARROWING
             .iter()
@@ -27173,7 +28990,7 @@ after-tick liveness alone does not attribute a clock defect",
 
         // ⓑ ★배선 핀 — 데몬이 그 사유를 버리지 않는다.
         let src = include_str!("governance.rs");
-        let prod = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커 소실")];
+        let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 앵커 소실")];
         let at = prod.find("    fn corpus(").expect("코퍼스 캐시 진입점 소실");
         let body = &prod[at..];
         let end = body.find("\n    }\n").expect("코퍼스 캐시 본문 끝을 못 찾았다");
@@ -27433,7 +29250,7 @@ after-tick liveness alone does not attribute a clock defect",
     #[test]
     fn badge_lifecycle_is_wired_to_observation_not_to_the_ceiling() {
         let src = include_str!("governance.rs");
-        let prod = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커 소실")];
+        let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 앵커 소실")];
         let at = prod.find("fn check_approvals").expect("check_approvals 소실");
         let body = &prod[at..];
         let close_at = body
@@ -27808,7 +29625,7 @@ after-tick liveness alone does not attribute a clock defect",
         ks.paused = true;
         ks.kill_switch = true;
         // (상수 이름, 값, d0 에서의 code) — 소스의 `const BLOCKED_*` 선언과 **이름 집합이 같아야** 한다(아래 전수 가드).
-        let consts: [(&str, &str, &str); 14] = [
+        let consts: [(&str, &str, &str); 15] = [
             ("BLOCKED_APPROVAL", BLOCKED_APPROVAL, "approval"),
             ("BLOCKED_MODAL", BLOCKED_MODAL, "answer_modal"),
             ("BLOCKED_BUSY", BLOCKED_BUSY, "wait"),
@@ -27820,6 +29637,7 @@ after-tick liveness alone does not attribute a clock defect",
             ("BLOCKED_QUIESCING", super::BLOCKED_QUIESCING, "wait"),
             ("BLOCKED_SETTLE_BUDGET", super::BLOCKED_SETTLE_BUDGET, "wait"),
             ("BLOCKED_RECEIVER_HELD", super::BLOCKED_RECEIVER_HELD, "wait"),
+            ("BLOCKED_WRITER_ACTIVE", super::BLOCKED_WRITER_ACTIVE, "wait"),
             ("BLOCKED_PARTIAL_WRITE", super::BLOCKED_PARTIAL_WRITE, "wait"),
             ("BLOCKED_QUEUE_PAUSED", super::BLOCKED_QUEUE_PAUSED, "wait"), // 좌석 pause 가 진단 시점에 이미 만료(paused=false)
             ("BLOCKED_PAUSED_KILL_SWITCH", super::BLOCKED_PAUSED_KILL_SWITCH, "unknown"), // kill_switch=false 인 d0 에서는 미분류 — 실사용은 아래 ks(1행)
@@ -27844,7 +29662,7 @@ after-tick liveness alone does not attribute a clock defect",
 
         // ── 전수 가드 ① 소스의 `const BLOCKED_*` 선언 이름 집합 = 위 표의 이름 집합 — 새 상수는 표의 어느 행에 드는지 정하게 만든다.
         let src = include_str!("governance.rs");
-        let prod = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커")];
+        let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 앵커")];
         let mut declared: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for (i, _) in prod.match_indices("const BLOCKED_") {
             let rest = &prod[i + "const ".len()..];
@@ -27877,7 +29695,8 @@ after-tick liveness alone does not attribute a clock defect",
             ["empty_seat(좌석에 에이전트 미연결)", "human_typing(사람 입력 직후)"].iter().map(|s| s.to_string()).collect();
         assert_eq!(lits, known_lits, "틱의 리터럴 막힘 사유가 표와 어긋났다 — queue_remedy 표·WORKLOG 매핑을 갱신하라");
         // 상수 인자는 전부 위 표에 있는 이름이어야 하고, 변수 인자는 게이트 판정이 돌려준 사유(`why`) 하나뿐이다(그 값은 `BLOCKED_*` 상수다).
-        let known_idents: std::collections::BTreeSet<String> = documented.iter().cloned().chain(["why".to_string()]).collect();
+        // F2 call-owned `reason` is another gate result; every producer of it returns BLOCKED_WRITER_ACTIVE.
+        let known_idents: std::collections::BTreeSet<String> = documented.iter().cloned().chain(["why".to_string(), "reason".to_string()]).collect();
         let stray: Vec<&String> = idents.difference(&known_idents).collect();
         assert!(stray.is_empty(), "틱이 표에 없는 식별자를 막힘 사유로 기록한다: {stray:?}");
         for must in ["BLOCKED_QUEUE_PAUSED", "BLOCKED_QUIESCING", "BLOCKED_SETTLE_BUDGET", "BLOCKED_INTERVAL", "BLOCKED_INPUT_PENDING", "BLOCKED_BUSY", "why"] {
@@ -27893,9 +29712,15 @@ after-tick liveness alone does not attribute a clock defect",
         let (daemon, s) = wp5_seat("c5-diag", "claude");
         let ghost = "버그 수정 착수한다. 브랜치는";
         // 빈 줄 + 커서 뒤 고스트(입력 추천).
-        paint_prompt(&s, "", ghost);
+        // ★(0.14.56 · P1 D1 · head ruling 5fffe0d9) The suggestion is drawn as Claude draws it (SGR 2); the same text drawn PLAIN is a
+        //   Home-moved draft on a measured claude seat - a visible draft (the plain-run case, right below).
+        paint_prompt_dim(&s, "", ghost);
         let d = queue_block_diag(&daemon, &s);
         assert_eq!((d.draft_visible, d.ghost_after_cursor), (Some(false), Some(true)), "{d:?}");
+        p1_measured(&s);
+        paint_prompt(&s, "", ghost);
+        let d = queue_block_diag(&daemon, &s);
+        assert_eq!((d.draft_visible, d.ghost_after_cursor), (Some(true), Some(true)), "plain run = visible draft: {d:?}");
         // 고스트 없는 빈 줄.
         paint_prompt(&s, "", "");
         let d = queue_block_diag(&daemon, &s);
@@ -27904,7 +29729,7 @@ after-tick liveness alone does not attribute a clock defect",
         paint_prompt(&s, "abc", "");
         let d = queue_block_diag(&daemon, &s);
         assert_eq!((d.draft_visible, d.ghost_after_cursor), (Some(true), Some(false)), "{d:?}");
-        paint_prompt(&s, "abc", ghost);
+        paint_prompt_dim(&s, "abc", ghost);
         let d = queue_block_diag(&daemon, &s);
         assert_eq!((d.draft_visible, d.ghost_after_cursor), (Some(true), Some(true)), "{d:?}");
         // 계수·모델·pause·패닉 — 사실 그대로.
@@ -28015,7 +29840,9 @@ after-tick liveness alone does not attribute a clock defect",
         let (head_id, head_at) = (e.id.clone(), e.enqueued_at);
         s.pending_queue.lock().unwrap().push_back(e);
         s.apply_pending_input(b"abc", InputOrigin::Human);
-        paint_prompt(&s, "", "버그 수정 착수한다. 브랜치는");
+        // ★(0.14.56 · P1 D1 · head ruling 5fffe0d9) a suggestion as Claude draws it (SGR 2); a plain run there is a Home-moved draft
+        //   (human_draft - `c5_queue_block_diag_observes_cursor_row_counts_pause_and_model`, `rqfix_f6_...` case 4).
+        paint_prompt_dim(&s, "", "버그 수정 착수한다. 브랜치는");
         quiet_since(&s, 10);
         tick(&daemon);
         assert_eq!(blocked_reason(&s), BLOCKED_INPUT_PENDING, "전제: 입력줄 계수로 막혔다");
@@ -28231,13 +30058,23 @@ after-tick liveness alone does not attribute a clock defect",
 
         // ⓐ 유령 — 사람 계수 3 + 빈 입력줄 → 거부는 그대로, 문구 끝에 처방.
         s.apply_pending_input(b"abc", InputOrigin::Human);
-        paint_prompt(&s, "", "버그 수정 착수한다. 브랜치는");
+        // ★(0.14.56 · P1 D1 · head ruling 5fffe0d9) the suggestion drawn as Claude draws it (SGR 2).
+        paint_prompt_dim(&s, "", "버그 수정 착수한다. 브랜치는");
         quiet_since(&s, 5);
         let denied = wp5_force(&daemon, &s, None, false).err().expect("유령 계수도 강제 배달은 거부된다(게이트 불변)");
         assert_eq!(denied, Wp5Denied::PromptGateGhost(BLOCKED_INPUT_PENDING));
         assert_eq!(denied.code(), "prompt_gate", "RPC 코드는 PromptGate 와 같다(CLI exit 판정 불변)");
         assert_eq!(denied.message(), format!("{}{GHOST_CTRL_U_SUFFIX}", legacy(BLOCKED_INPUT_PENDING)), "앞 문구는 종전 바이트 그대로 · 끝에만 처방");
         assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "거부 = 배달 0건(큐 그대로)");
+        // ⓐ′ (0.14.56 · P1 D1) the plain-run case: the same text drawn PLAIN after the cursor is a Home-moved draft on a measured
+        //   claude seat - a visible draft, refused with the pin wording and no Ctrl-U advice.
+        p1_measured(&s);
+        paint_prompt(&s, "", "버그 수정 착수한다. 브랜치는");
+        quiet_since(&s, 5);
+        let denied = wp5_force(&daemon, &s, None, false).err().expect("거부");
+        assert_eq!(denied, Wp5Denied::PromptGate(BLOCKED_INPUT_PENDING), "a Home-moved draft is no ghost");
+        assert_eq!(denied.message(), legacy(BLOCKED_INPUT_PENDING));
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1);
 
         // ⓑ 초안이 보인다 — 종전 문구 그대로.
         paint_prompt(&s, "미제출 초안", "");
@@ -28360,6 +30197,7 @@ after-tick liveness alone does not attribute a clock defect",
             quiet_secs: 9,
             alt_screen: false,
             block: None,
+            after_cursor_dim: None,
         };
         assert_eq!(input_line_visibility(&base(), None), (Some(false), Some(false)));
         let mut o = base();
@@ -28418,6 +30256,7 @@ after-tick liveness alone does not attribute a clock defect",
             quiet_secs: 9,
             alt_screen: false,
             block: None,
+            after_cursor_dim: None,
         }
     }
 
@@ -28482,7 +30321,8 @@ after-tick liveness alone does not attribute a clock defect",
         assert_eq!((d.draft_visible, d.ghost_after_cursor), (Some(false), Some(false)), "{d:?}");
         assert_eq!(code(&d), "phantom_count");
         // 2) 빈 프롬프트 + 커서 뒤 글자 → 회색 제안인지 직접 쓴 글인지 사람이 가린다.
-        paint_prompt(&s, "", "버그 수정 착수한다. 브랜치는");
+        // ★(0.14.56 · P1 D1 · head ruling 5fffe0d9) the suggestion drawn as Claude draws it (SGR 2); a plain run is case 4.
+        paint_prompt_dim(&s, "", "버그 수정 착수한다. 브랜치는");
         let d = diag();
         assert_eq!((d.draft_visible, d.ghost_after_cursor), (Some(false), Some(true)), "{d:?}");
         assert_eq!(code(&d), "after_cursor_text");
@@ -28503,7 +30343,16 @@ after-tick liveness alone does not attribute a clock defect",
         assert_eq!((d.pending_input_human_bytes, d.draft_visible), (0, Some(false)), "{d:?}");
         assert_eq!(code(&d), "phantom_count", "사람 몫 0 이라고 '기계 본문이 보인다' 고 단정하지 않는다(F1)");
         // 4) 커서를 줄 머리에 둔 한 줄 초안(커서 앞 빈 · 커서 뒤 글) → 유령 단정이 아니다.
+        // ★(0.14.56 · P1 D1 · head ruling 5fffe0d9) the plain-run case: on a measured claude seat the plain run is a Home-moved draft,
+        //   a VISIBLE draft (the counts here are the machine's, from 3'). 4') the same text drawn dim keeps the after_cursor_text remedy.
+        p1_measured(&s);
         paint_screen(&s, &["❯ 직접 쓴 글"], 0, 2, false);
+        let d = diag();
+        assert_eq!((d.draft_visible, d.ghost_after_cursor), (Some(true), Some(true)), "{d:?}");
+        let c = code(&d);
+        assert_ne!(c, "phantom_count", "a visible draft is never a ghost count");
+        assert_eq!(c, "machine_residue", "machine count + visible text: {d:?}");
+        paint_screen(&s, &["❯ \x1b[7m직\x1b[27m\x1b[2m접 쓴 글\x1b[22m"], 0, 2, false);
         let d = diag();
         assert_eq!((d.draft_visible, d.ghost_after_cursor), (Some(false), Some(true)), "{d:?}");
         let (c, text) = queue_remedy(BLOCKED_INPUT_PENDING, &d);
@@ -28586,7 +30435,7 @@ after-tick liveness alone does not attribute a clock defect",
                 .collect()
         };
         let gov = include_str!("governance.rs");
-        let prod = &gov[..gov.find("#[cfg(test)]").expect("테스트 모듈 앵커")];
+        let prod = &gov[..gov.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 앵커")];
         let lines = code_lines(prod);
         let want = [
             "pub(crate) fn diag_adapter_defs() -> Arc<(serde_json::Value, serde_json::Value)> {",
@@ -28825,7 +30674,7 @@ after-tick liveness alone does not attribute a clock defect",
             ("alert_route", include_str!("alert_route.rs")),
             ("schedule", include_str!("schedule.rs")),
         ] {
-            let prod = &text[..text.find("#[cfg(test)]").unwrap_or(text.len())];
+            let prod = &text[..text.find("\n#[cfg(test)]\nmod tests {").or_else(|| text.find("#[cfg(test)]")).unwrap_or(text.len())];
             let hits: Vec<&str> = prod.lines().filter(|l| l.contains("phantom_count_ctrl_u")).collect();
             assert!(hits.is_empty(), "{name} 제품 구간에 옛 코드 이름이 남았다(주석 포함 0건): {hits:?}");
         }
@@ -28950,7 +30799,13 @@ after-tick liveness alone does not attribute a clock defect",
 
     /// 한 화면을 좌석에 그리고 큐 틱을 **실제로** 돌려 (남은 큐 길이, 기록된 막힘 사유)를 돌려준다.
     fn instr_tick_outcome(tag: &str, lines: &[String], row: u16, col: u16, alt: bool) -> (usize, String) {
-        let (daemon, s) = wp5_seat(tag, "claude");
+        instr_tick_outcome_on(tag, "claude", true, lines, row, col, alt) // the D1 contract on either host (head ruling W1)
+    }
+
+    /// The same tick on a seat of `agent` whose D1 platform half is `measured` (false = a Windows-configured seat, ruling W1).
+    fn instr_tick_outcome_on(tag: &str, agent: &str, measured: bool, lines: &[String], row: u16, col: u16, alt: bool) -> (usize, String) {
+        let (daemon, s) = wp5_seat(tag, agent);
+        s.d1_platform.store(measured, std::sync::atomic::Ordering::Relaxed);
         let e = daemon.next_queue_entry("[보고] 계측 판 게이트 무변경 검체".into(), None, "test");
         s.pending_queue.lock().unwrap().push_back(e);
         let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
@@ -28961,23 +30816,72 @@ after-tick liveness alone does not attribute a clock defect",
         out
     }
 
-    /// 시험 7 — **게이트 판정 무변경**: 흐림이 섞인 화면과 흐림만 뺀 같은 화면에서 큐 틱의 결과(배달 여부 · 막힘 사유)가 같다(alt · 비-alt 각각).
-    /// 흐림은 칸에만 기억되고 게이트가 읽는 화면 글자·커서·반전에는 닿지 않는다. 한 쌍이라도 다르면 이 판은 내보낼 수 없다.
-    #[test]
-    fn instr_gate_verdict_unchanged_by_dim_cells() {
-        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (_pack, _env) = wp5_env("instr-gate");
+    /// The six screen pairs the instr_gate tests measure: (name, lines, cursor row, cursor col).
+    fn instr_layouts() -> Vec<(&'static str, Vec<String>, u16, u16)> {
         let m = "❯\u{a0}";
         // (이름, 화면 줄, 커서 행, 커서 열)
-        let layouts: Vec<(&str, Vec<String>, u16, u16)> = vec![
+        vec![
             ("안내문(흐림)", vec!["  출력".into(), RULE.into(), format!("{m}\x1b[7mT\x1b[27m\x1b[2mry \"fix lint errors\"\x1b[22m"), RULE.into(), STATUS1.into(), STATUS2.into()], 2, 2),
             ("초안+Home 뒤에 흐린 꼬리", vec!["  출력".into(), RULE.into(), format!("{m}\x1b[7ma\x1b[27mbc \x1b[2mtail\x1b[22m"), RULE.into(), STATUS1.into(), STATUS2.into()], 2, 2),
             ("커서 앞에 흐린 글", vec!["  출력".into(), RULE.into(), format!("{m}\x1b[2mabc\x1b[22m"), RULE.into(), STATUS1.into(), STATUS2.into()], 2, 5),
             ("빈 줄 + 윗 행의 흐린 꼬리표", vec!["  출력".into(), format!("── \x1b[2mHistory 2/2\x1b[22m ──"), "❯ ".into(), RULE.into(), STATUS1.into(), STATUS2.into()], 2, 2),
             ("빈 줄 + 흐린 출력 줄", vec![format!("  \x1b[2m흐린 출력 한 줄\x1b[22m"), "".into(), RULE.into(), "❯ ".into(), RULE.into(), STATUS1.into(), STATUS2.into()], 3, 2),
             ("작업 중 표지(흐림)", vec![format!("\x1b[2m✻ Thinking… (esc to interrupt)\x1b[22m"), RULE.into(), "❯ ".into(), RULE.into(), STATUS1.into(), STATUS2.into()], 2, 2),
-        ];
+        ]
+    }
+
+    /// ★(0.14.56 · P1 · late reflection R2-2, impl/REFLECTION-2-stageC.md) The RETIRED invariant still holds where D1 does not govern:
+    /// on a Windows-configured claude seat (ruling W1 0048dfdf) and on a gemini seat (an unmeasured adapter), the same six pairs x
+    /// alt/non-alt never differ - dim never changes the queue tick's result there. Mutant: D1 governs regardless of platform/adapter.
+    #[test]
+    fn instr_gate_dim_never_changes_the_verdict_where_d1_does_not_govern() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("instr-gate-nd1");
         let mut table = Vec::new();
+        for (agent, measured) in [("claude", false), ("gemini", true)] {
+            for alt in [true, false] {
+                for (i, (name, lines, row, col)) in instr_layouts().iter().enumerate() {
+                    let twin: Vec<String> = lines.iter().map(|l| instr_strip_dim(l)).collect();
+                    let a = instr_tick_outcome_on(&format!("ignd-{agent}-d{}-{i}", u8::from(alt)), agent, measured, lines, *row, *col, alt);
+                    let b = instr_tick_outcome_on(&format!("ignd-{agent}-p{}-{i}", u8::from(alt)), agent, measured, &twin, *row, *col, alt);
+                    table.push(format!("{agent} alt={alt} · {name}: {a:?} · {b:?}"));
+                    assert_eq!(a, b, "{agent} alt={alt} · {name}: dim changed the verdict on a seat D1 does not govern");
+                }
+            }
+        }
+        println!("INSTR-GATE-NON-D1\n{}", table.join("\n"));
+        assert!(table.iter().any(|l| l.contains(": (0, ")), "no delivered cell:\n{}", table.join("\n"));
+        assert!(table.iter().any(|l| l.contains(": (1, ")), "no held cell:\n{}", table.join("\n"));
+    }
+
+    /// 시험 7 — (retired invariant, see below) 흐림이 섞인 화면과 흐림만 뺀 같은 화면에서 큐 틱의 결과(배달 여부 · 막힘 사유)를 잰다(alt · 비-alt 각각).
+    /// ★(0.14.56 · P1 D1 · head ruling on Q-suites-17-pins 5fffe0d9, item 2) RETIRES the ship-gate invariant this test held as
+    /// `instr_gate_verdict_unchanged_by_dim_cells` - "dim cells never change the queue tick's result; if one pair differs this release
+    /// cannot ship", plus "the alt seat's placeholder screen still blocks". D1 makes dim a signal on purpose: a rendered suggestion
+    /// no longer holds a delivery (T-Q1). The same six screen pairs now assert the D1 contract EXACTLY: a pair differs only where a
+    /// D1 row reads the dim run (row 6 Suggestion reads empty; its plain twin is row 7, a Home-moved draft) and agrees everywhere
+    /// else. The retirement is recorded in the stage C report.
+    #[test]
+    fn instr_gate_dim_changes_the_verdict_only_on_d1_rows() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("instr-gate");
+        let layouts = instr_layouts();
+        // The D1 contract, per layout: (with dim, dim stripped) - the same for alt and non-alt. Only layout 0 is a D1 row pair
+        // (row 6 Suggestion -> delivered / row 7 Draft -> held input_pending); every other pair agrees.
+        let delivered = (0usize, String::new());
+        let held = |r: &str| (1usize, r.to_string());
+        let want: Vec<((usize, String), (usize, String))> = vec![
+            (delivered.clone(), held(BLOCKED_INPUT_PENDING)), // 안내문: Suggestion vs Home-moved draft
+            (held(BLOCKED_INPUT_PENDING), held(BLOCKED_INPUT_PENDING)), // a plain run after the cursor in both
+            (held(BLOCKED_INPUT_PENDING), held(BLOCKED_INPUT_PENDING)), // text before the cursor in both
+            (delivered.clone(), delivered.clone()), // dim outside the composer row
+            (delivered.clone(), delivered.clone()), // dim output line
+            (held(BLOCKED_BUSY), held(BLOCKED_BUSY)), // the working indicator, dim or not
+        ];
+        assert_eq!(want.len(), layouts.len());
+        let mut table = Vec::new();
+        let mut got_all = Vec::new();
+        let mut want_all = Vec::new();
         for alt in [true, false] {
             for (i, (name, lines, row, col)) in layouts.iter().enumerate() {
                 let twin: Vec<String> = lines.iter().map(|l| instr_strip_dim(l)).collect();
@@ -28985,19 +30889,203 @@ after-tick liveness alone does not attribute a clock defect",
                 let with_dim = instr_tick_outcome(&format!("ig-d{}-{i}", u8::from(alt)), lines, *row, *col, alt);
                 let without = instr_tick_outcome(&format!("ig-p{}-{i}", u8::from(alt)), &twin, *row, *col, alt);
                 table.push(format!("alt={alt} · {name}: 흐림 있음 {with_dim:?} · 흐림 뺌 {without:?}"));
-                assert_eq!(with_dim, without, "alt={alt} · {name}: 흐림 유무로 큐 틱의 결과가 갈렸다 — 게이트 판정이 바뀌었다");
+                got_all.push((alt, i, with_dim, without));
+                want_all.push((alt, i, want[i].0.clone(), want[i].1.clone()));
             }
         }
         println!("INSTR-GATE-TABLE\n{}", table.join("\n"));
-        // 공허 방지 — 이 표 안에 배달된 화면과 막힌 화면이 둘 다 있어야 한다(전부 같은 사유로 막혔다면 게이트의 갈래를 지나지 않은 것이다).
+        assert_eq!(got_all, want_all, "the D1 contract table:\n{}", table.join("\n"));
+        // 공허 방지 — 배달된 화면과 막힌 화면이 둘 다 있고, 흐림 유무로 갈린 쌍이 정확히 D1 행 쌍(안내문 · alt/비-alt)뿐이다.
         assert!(table.iter().any(|l| l.contains("흐림 있음 (0, ")), "배달된 검체가 하나도 없다:\n{}", table.join("\n"));
         assert!(table.iter().any(|l| l.contains("흐림 있음 (1, ")), "막힌 검체가 하나도 없다:\n{}", table.join("\n"));
-        // 오늘 판의 사실 그대로: alt 좌석의 안내문 화면은 여전히 막힌다(이 판은 그것을 풀지 않는다).
-        assert!(
-            table.iter().any(|l| l.starts_with("alt=true · 안내문(흐림): 흐림 있음 (1, ")),
-            "alt 좌석의 안내문 화면이 배달됐다 — 이 판은 큐 막힘의 판정을 바꾸지 않는다:\n{}",
-            table.join("\n")
+        let differ: Vec<(bool, usize)> = got_all.iter().filter(|(_, _, d, p)| d != p).map(|(a, i, _, _)| (*a, *i)).collect();
+        assert_eq!(differ, vec![(true, 0), (false, 0)], "dim changes the verdict only on the D1 row pair:\n{}", table.join("\n"));
+    }
+
+    // ===== ★(0.14.56 · P1 D9 reinject order · IMPL r1 m1, gemini-6) A5/A6 at the READER SITES, not only the pure helpers
+    //   (`d9_tests::d9_order_a5_*` / `d9_order_a6_*` stay): the merge planner's origin key in `deliver_head_locked`, the min-interval
+    //   head age in `deliver_head_locked`, the starve head in `deliver_queued`, and the head row of `queue_blocked_seats`. =====
+
+    #[test]
+    fn p1_queue_clock_without_snapshot_uses_original_real_callbacks() {
+        assert!(super::P1_QUEUE_CLOCK.with(|slot| slot.get()).is_none());
+        let before = now_epoch();
+        let got = super::p1_queue_clock(now_epoch, |(epoch, _)| epoch);
+        let after = now_epoch();
+        assert!(before <= got && got <= after, "no snapshot: real epoch");
+        let before = Instant::now();
+        let got = super::p1_queue_clock(Instant::now, |(_, mono)| mono);
+        let after = Instant::now();
+        assert!(before <= got && got <= after, "no snapshot: real Instant");
+        let calls = std::cell::Cell::new(0);
+        assert_eq!(super::p1_queue_clock(|| { calls.set(calls.get()+1); 42 }, |_| panic!("snapshot absent")), 42);
+        assert_eq!(calls.get(), 1, "one original callback, not two clock reads");
+    }
+
+    #[test]
+    fn p1_queue_clock_snapshot_is_exact_nested_restored_and_thread_local() {
+        let first = (1234.5, Instant::now());
+        let second = (9876.5, first.1 + Duration::from_secs(100));
+        {
+            let _outer = super::P1QueueClockSnapshot::set(first.0, first.1);
+            assert_eq!(super::p1_queue_clock(|| panic!("snapshot must skip real clock"), |pair| pair), first);
+            {
+                let _inner = super::P1QueueClockSnapshot::set(second.0, second.1);
+                assert_eq!(super::p1_queue_clock(|| panic!("snapshot must skip real clock"), |pair| pair), second);
+            }
+            assert_eq!(super::p1_queue_clock(|| panic!("outer restored"), |pair| pair), first);
+            std::thread::spawn(|| {
+                assert!(super::P1_QUEUE_CLOCK.with(|slot| slot.get()).is_none());
+                assert_eq!(super::p1_queue_clock(|| 73, |_| panic!("foreign thread snapshot")), 73);
+            }).join().unwrap();
+        }
+        assert!(super::P1_QUEUE_CLOCK.with(|slot| slot.get()).is_none());
+        assert_eq!(super::p1_queue_clock(|| 91, |_| panic!("drop restores absence")), 91);
+    }
+
+    fn d9r_seat(tag: &str) -> (Arc<Daemon>, Arc<crate::state::Surface>) {
+        let daemon = drill_daemon(tag);
+        let s = daemon.create_surface(None, Some("sleep 30".into()), None, None, 24, 80).expect("create surface");
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        (daemon, s)
+    }
+
+    fn d9r_auth(daemon: &Arc<Daemon>, text: &str, from: &str) -> crate::state::QueueEntry {
+        let mut e = daemon.next_queue_entry(text.into(), Some(from.into()), "send");
+        e.authoritative = true;
+        e
+    }
+
+    /// A5r (merge site, `deliver_head_locked`): an authoritative head and two same-from reports behind it -> the head is delivered
+    /// alone, then the two reports as one digest (the pin's merge, unchanged for ordinary entries). Mutant: the reader site takes
+    /// `e.origin.clone()` instead of `merge_origin_key` (the helper specimen A5 does not see the call site).
+    #[test]
+    fn d9_order_a5r_deliver_head_locked_sends_an_authoritative_head_alone() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("d9-a5r");
+        let _env = QueueEnvGuard::set(&[
+            ("CYS_PACK_DIR", pack.to_str().unwrap()),
+            ("CYS_QUEUE_MIN_INTERVAL_SECS", "0"),
+            ("CYS_QUEUE_DIGEST_MAX_ITEMS", "5"),
+            ("CYS_QUEUE_DIGEST_MAX_CHARS", "4000"),
+        ]);
+        let (daemon, s) = d9r_seat("d9-a5r");
+        let a = d9r_auth(&daemon, "[RESUME] a5r", "surface:9");
+        let r1 = daemon.next_queue_entry("[보고] r1".into(), Some("surface:9".into()), "send");
+        let r2 = daemon.next_queue_entry("[보고] r2".into(), Some("surface:9".into()), "send");
+        let ids = (a.id.clone(), r1.id.clone(), r2.id.clone());
+        s.pending_queue.lock().unwrap().extend([a, r1, r2]);
+        let mut got: Vec<Vec<String>> = Vec::new();
+        for _ in 0..200 {
+            if let Some(d) = deliver_head_locked(&daemon, &s, false, false, None, None, None, None, None) {
+                got.push(d.merged_ids.clone());
+            }
+            if s.pending_queue.lock().unwrap().is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let _ = s.child.lock().unwrap().kill();
+        assert_eq!(
+            got,
+            vec![vec![ids.0.clone()], vec![ids.1.clone(), ids.2.clone()]],
+            "the authoritative head goes alone, then the two same-from reports merge"
         );
+    }
+
+    /// A6r (min-interval site, `deliver_head_locked`): the per-seat delivery interval relaxes by the age of the oldest blocked item
+    /// (§4 AGES), so an old report behind a fresh head-placed job relaxes it as the pin's front would have. Base 8 s, max wait 1 s,
+    /// last delivery 2.5 s ago under one explicit epoch/Instant snapshot: old age 2 s halves the interval twice, to 2 s -> delivery.
+    /// The fresh-only control has age 0 at that same snapshot; a scheduler delay cannot age it. Mutant: the site reads `q.front()`.
+    #[test]
+    fn d9_order_a6r_min_interval_relaxes_on_the_old_report_behind_a_fresh_front() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("d9-a6r-int");
+        let _env = QueueEnvGuard::set(&[
+            ("CYS_PACK_DIR", pack.to_str().unwrap()),
+            ("CYS_QUEUE_MIN_INTERVAL_SECS", "8"),
+            ("CYS_QUEUE_MAX_WAIT_SECS", "1"),
+        ]);
+        let (daemon, s) = d9r_seat("d9-a6r-int");
+        let epoch = now_epoch() + 10_000.0;
+        let monotonic = Instant::now();
+        let _clock = super::P1QueueClockSnapshot::set(epoch, monotonic);
+        let mut a = d9r_auth(&daemon, "[RESUME] a6r", "surface:8");
+        a.enqueued_at = epoch;
+        let a_id = a.id.clone();
+        s.pending_queue.lock().unwrap().push_back(a);
+        let last = monotonic - std::time::Duration::from_millis(2500);
+        *s.last_queue_delivery_at.lock().unwrap() = Some(last);
+        let control = deliver_head_locked(&daemon, &s, true, false, None, None, None, None, None);
+        assert!(control.is_none(), "control: a fresh front alone keeps the 8 s interval");
+        let mut old = daemon.next_queue_entry("[보고] old".into(), Some("surface:9".into()), "send");
+        old.enqueued_at = epoch - 2.0;
+        s.pending_queue.lock().unwrap().push_back(old);
+        let d = deliver_head_locked(&daemon, &s, true, false, None, None, None, None, None);
+        let _ = s.child.lock().unwrap().kill();
+        let d = d.expect("the old report behind the fresh front relaxes the interval to 2 s; 2.5 s have passed");
+        assert_eq!(d.entry.id, a_id, "the authoritative front is what goes");
+    }
+
+    /// A6r (starve site, `deliver_queued` -> `queue.starved`): a report blocked past the alert threshold behind a fresh head-placed job
+    /// still raises `queue.starved`, naming the report. One explicit epoch makes fresh age 0 and old age 3; an empty-seat gate holds
+    /// delivery by state rather than a last-output grace period. Mutant: the site reads `q.front()`.
+    #[test]
+    fn d9_order_a6r_queue_starved_names_the_old_report_behind_a_fresh_front() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = QueueEnvGuard::set(&[("CYS_QUEUE_MAX_WAIT_SECS", "0"), ("CYS_QUEUE_STARVE_ALERT_SECS", "2")]);
+        let (daemon, s) = d9r_seat("d9-a6r-starve");
+        let epoch = now_epoch() + 10_000.0;
+        let monotonic = Instant::now();
+        let _clock = super::P1QueueClockSnapshot::set(epoch, monotonic);
+        let starved = |daemon: &Arc<Daemon>| -> Vec<Value> {
+            daemon.bus.tail(100).into_iter().filter(|ev| ev["name"] == "queue.starved").collect()
+        };
+        let mut fresh = d9r_auth(&daemon, "[RESUME] a6r", "surface:8");
+        fresh.enqueued_at = epoch;
+        s.pending_queue.lock().unwrap().push_back(fresh);
+        // Keep delivery blocked by state, not a quiet-time window that a scheduler stall can outlive.
+        *s.role.lock().unwrap() = Some("worker".into());
+        s.seat_cache.store(SeatState::Empty.as_u8(), AtomicOrdering::Relaxed);
+        let (mut depth, mut starve) = (HashMap::new(), HashMap::new());
+        deliver_queued(&daemon, &mut depth, &mut starve, &mut HashMap::new());
+        assert!(starved(&daemon).is_empty(), "control: a fresh front alone is not starved");
+        let mut old = daemon.next_queue_entry("[보고] old".into(), Some("surface:9".into()), "send");
+        old.enqueued_at = epoch - 3.0;
+        let old_id = old.id.clone();
+        s.pending_queue.lock().unwrap().push_back(old);
+        deliver_queued(&daemon, &mut depth, &mut starve, &mut HashMap::new());
+        let left = s.pending_queue.lock().unwrap().len(); // before the kill: an exiting seat's queue is moved
+        let _ = s.child.lock().unwrap().kill();
+        let ev = starved(&daemon);
+        assert_eq!(ev.len(), 1, "the old report behind the fresh front is starved: {ev:?}");
+        assert_eq!(ev[0]["payload"]["head_entry_id"], json!(old_id), "{ev:?}");
+        assert_eq!(left, 2, "busy: nothing delivered");
+    }
+
+    /// A6r (blocked-row site, `queue_blocked_seats` -> queue-blocked.json): the row's head is the old blocked report behind a fresh
+    /// head-placed job (id and enqueued_at), depth counts both. Mutant: the site reads `q.front()`.
+    #[test]
+    fn d9_order_a6r_blocked_file_names_the_old_report_behind_a_fresh_front() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, s) = d9r_seat("d9-a6r-file");
+        let mut old = daemon.next_queue_entry("[보고] old".into(), Some("surface:9".into()), "send");
+        old.enqueued_at -= 700.0;
+        let (old_id, old_at) = (old.id.clone(), old.enqueued_at);
+        {
+            let mut q = s.pending_queue.lock().unwrap();
+            q.push_back(old);
+            q.insert(0, d9r_auth(&daemon, "[RESUME] a6r", "surface:8"));
+        }
+        super::mark_queue_blocked(&s, BLOCKED_BUSY);
+        super::persist_queue_blocked_at(&daemon, std::time::Instant::now());
+        let _ = s.child.lock().unwrap().kill();
+        let v = c5_read_blocked_file(&daemon);
+        let rows = v["surfaces"].as_array().expect("surfaces");
+        assert_eq!(rows.len(), 1, "{v}");
+        assert_eq!(rows[0]["head_entry_id"], json!(old_id), "{v}");
+        assert_eq!(rows[0]["head_enqueued_at"].as_f64(), Some(old_at), "{v}");
+        assert_eq!(rows[0]["depth"], json!(2), "{v}");
     }
 }
 
@@ -29944,7 +32032,7 @@ mod reflect_queue_tests {
     #[test]
     fn f1_resubmit_wired_into_watchdog_tick_before_queue_delivery() {
         let src = include_str!("governance.rs");
-        let prod = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커")];
+        let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 앵커")];
         let tick = &prod[prod.find("refresh_seat_cache(&daemon, &sys);").expect("틱 앵커(좌석 캐시 갱신)")..];
         let re = tick.find("resubmit_withheld_submits(&daemon);").expect("보류 CR 재제출 배선 소실");
         let dq = tick.find("deliver_queued(").expect("큐 배달");
@@ -29977,7 +32065,7 @@ mod reflect_queue_tests {
             full_scope_sees_residue,
             "형상 대조 실패: 생존 좌석의 전역 서명 판정이 잔상 형상을 창으로 보지 않는다 — 아래 ③ 대조가 무의미해진다"
         );
-        s.seat_cache.store(SeatState::Empty.as_u8(), Ordering::Relaxed);
+        s.seat_cache.store(SeatState::Empty.as_u8(), AtomicOrdering::Relaxed);
         s.agent_seen.store(false, Ordering::Relaxed);
         paint(&s, &dialog, 1, 9, false);
         assert!(probe(), "기동 전 틱의 낡은 Empty 좌석에서 창 위 CR 을 썼다 — '1. Yes' 오승인");
@@ -31127,42 +33215,51 @@ mod h_machine_hold_tests {
     /// [H0 순수] 전 조합 진리표 — 첫 적중 순서 고정 · 마스크에서 끈 축은 무발화.
     #[test]
     fn h0_hold_verdict_truth_table() {
+        // ★(0.14.56 · PKG1-M1) seven axes: `Authoritative` sits right after `Quiescing` (index 2).
         let order = [
             MachineHold::Paused,
             MachineHold::Quiescing,
+            MachineHold::Authoritative,
             MachineHold::ShellOnly,
             MachineHold::HumanActive,
             MachineHold::Modal,
             MachineHold::Draft,
         ];
-        for bits in 0u32..64 {
+        for bits in 0u32..128 {
             let on = |i: u32| bits & (1 << i) != 0;
             let input = MachineHoldInput {
                 paused: on(0),
                 quiescing_age_secs: on(1).then_some(10.0),
                 quiesce_hold_secs: 600,
-                shell_evidence: on(2),
-                human_idle_secs: on(3).then_some(5),
-                modal: on(4),
-                draft: on(5),
+                auth_age_secs: on(2).then_some(10.0),
+                shell_evidence: on(3),
+                human_idle_secs: on(4).then_some(5),
+                modal: on(5),
+                draft: on(6),
             };
-            let expect = (0..6).find(|&i| on(i)).map(|i| order[i as usize]);
-            assert_eq!(machine_hold_verdict(&input, &all_axes(30)), expect, "bits={bits:06b}");
+            let expect = (0..7).find(|&i| on(i)).map(|i| order[i as usize]);
+            assert_eq!(machine_hold_verdict(&input, &all_axes(30)), expect, "bits={bits:07b}");
             // 한 축씩 끈 마스크 — 그 축은 절대 적중하지 않고, 나머지 순서는 그대로다.
-            for off in 0..6u32 {
+            for off in 0..7u32 {
                 let mut ax = all_axes(30);
                 match off {
                     0 => ax.pause = false,
                     1 => ax.quiescing = false,
-                    2 => ax.shell = false,
-                    3 => ax.human = false,
-                    4 => ax.modal = false,
+                    2 => ax.authoritative = false,
+                    3 => ax.shell = false,
+                    4 => ax.human = false,
+                    5 => ax.modal = false,
                     _ => ax.draft = false,
                 }
-                let expect = (0..6).filter(|&i| i != off).find(|&i| on(i)).map(|i| order[i as usize]);
-                assert_eq!(machine_hold_verdict(&input, &ax), expect, "bits={bits:06b} off={off}");
+                let expect = (0..7).filter(|&i| i != off).find(|&i| on(i)).map(|i| order[i as usize]);
+                assert_eq!(machine_hold_verdict(&input, &ax), expect, "bits={bits:07b} off={off}");
             }
         }
+        // ★(0.14.56 · PKG1-M1) the authoritative axis lapses at the same bound as quiescing (age >= hold = no hold; hold 0 = off).
+        let aged = |a: f64, hold: u64| MachineHoldInput { auth_age_secs: Some(a), quiesce_hold_secs: hold, ..Default::default() };
+        assert_eq!(machine_hold_verdict(&aged(599.9, 600), &all_axes(30)), Some(MachineHold::Authoritative));
+        assert_eq!(machine_hold_verdict(&aged(600.0, 600), &all_axes(30)), None, "the bound itself is past the hold");
+        assert_eq!(machine_hold_verdict(&aged(1.0, 0), &all_axes(30)), None, "hold 0 = axis off");
         // 사람 입력 창 — 창 밖(30s 이상)이면 무발화 · 창 0 이면 축 무발화.
         let mut i = MachineHoldInput { human_idle_secs: Some(30), ..Default::default() };
         assert_eq!(machine_hold_verdict(&i, &all_axes(30)), None, "창 경계(30s)는 창 밖이다");
@@ -31174,6 +33271,7 @@ mod h_machine_hold_tests {
             paused: true,
             quiescing_age_secs: Some(1.0),
             quiesce_hold_secs: 600,
+            auth_age_secs: Some(1.0),
             shell_evidence: true,
             human_idle_secs: Some(0),
             modal: true,
@@ -31182,7 +33280,7 @@ mod h_machine_hold_tests {
         assert_eq!(machine_hold_verdict(&loud, &MachineHoldAxes::NONE), None);
         // 축 이름(이벤트·결과 문자열의 어휘) 고정.
         let names: Vec<&str> = order.iter().map(|h| h.axis()).collect();
-        assert_eq!(names, ["pause", "quiescing", "shell", "human", "modal", "draft"]);
+        assert_eq!(names, ["pause", "quiescing", "authoritative", "shell", "human", "modal", "draft"]);
         assert_eq!(MachineHold::ProbeFailed.axis(), "probe_failed");
     }
 
@@ -31304,6 +33402,10 @@ mod h_machine_hold_tests {
             (true, true, false, false, true, false),
             "목록 = 그 축만 · 미지 토큰 무시"
         );
+        // ★(0.14.56 · PKG1-M1) the `authoritative` token, and the axis is on by default on both OSes (no screen read).
+        assert!(!m.authoritative, "not listed = off");
+        assert!(hold_axes_mask_from(Some("authoritative"), true).authoritative);
+        assert!(hold_axes_default(false).authoritative && hold_axes_default(true).authoritative);
         use MachineInjector::*;
         const ALL: [MachineInjector; 5] = [Schedule, Channel, Ceo, Supervisor, Takeover];
         for p in ALL {
@@ -31352,7 +33454,10 @@ mod h_machine_hold_tests {
             .collect::<Vec<_>>()
             .join("\n");
         // ⑤ 플레이스홀더 고스트 — 커서는 마커 바로 뒤, 고스트 제안은 커서 **뒤**에 그려진다.
-        let ghost = "────────────────────\n❯ Try \"refactor the parser\"\x1b[2;3H".to_string();
+        // ★(0.14.56 · P1 D1 · head ruling 5fffe0d9) drawn as Claude draws a suggestion (first glyph reverse, the rest SGR 2). Whether
+        //   ConPTY passes SGR 2 through is UNMEASURED - D1 is off on Windows seats (ruling W1 0048dfdf). The same text drawn PLAIN is
+        //   a Home-moved draft: the plain-run case after the loop.
+        let ghost = "────────────────────\n❯ \x1b[7mT\x1b[27m\x1b[2mry \"refactor the parser\"\x1b[22m\x1b[2;3H".to_string();
         let specimens: Vec<(&str, String, Option<MachineHold>)> = vec![
             ("CRLF 유휴", idle_crlf, None),
             ("우측 패딩 유휴", idle_padded, None),
@@ -31371,6 +33476,12 @@ mod h_machine_hold_tests {
                 );
             }
         }
+        // ★(0.14.56 · P1 D1) the plain-run case: the placeholder text drawn PLAIN after the cursor on a measured claude seat is a
+        //   Home-moved draft - Draft under the unix mask; the Windows default mask keeps the draft axis off.
+        s.d1_platform.store(true, std::sync::atomic::Ordering::Relaxed);
+        h_paint(&s, "────────────────────\n❯ Try \"refactor the parser\"\x1b[2;3H");
+        assert_eq!(machine_direct_hold_masked(&d, &s, want, unix), Some(MachineHold::Draft), "plain run (unix mask)");
+        assert_eq!(machine_direct_hold_masked(&d, &s, want, win), None, "plain run (Windows mask: draft axis off)");
         // 초안 — unix 마스크는 Draft, Windows 기본 마스크는 무발화(종전 직접 주입).
         h_paint(&s, H_DRAFT_SCREEN);
         assert_eq!(machine_direct_hold_masked(&d, &s, want, unix), Some(MachineHold::Draft));
@@ -31712,20 +33823,20 @@ mod h_machine_hold_tests {
         for (f, src) in daemon_sources() {
             found.extend(guard_none_producers(f, src));
         }
+        // ★(0.14.56 · P1 D9 pre-CR · design r3 §5-7) `channels::inject_master_confirmed`, `schedule::inject_on`,
+        //   `handlers::deliver_to_ceo` and `boot_supervisor::pane_notice_line` left the list: each passes
+        //   `D9WriterGuard::for_target(..)`'s guard. ⛔This is a LEXICAL exit: outside D9 scope (a non-master/CEO target) that
+        //   expression is `None` at runtime, as at the pin - the in-scope guard is witnessed by the T-W4 specimens beside each
+        //   writer, and its wiring order by the four pairs added to `order` below.
         let allow: std::collections::BTreeSet<String> = [
-            "channels::inject_master_confirmed",
-            "schedule::inject_on",
-            "handlers::deliver_to_ceo",
-            // ★(R3SH-3) 통보 줄 쓰기가 즉시·미룬 재시도 공용 `pane_notice_line` 으로 모였다 — 두 호출자가 모두 그 앞에서
-            //   `pane_notice_hold`(H0) 를 판정한다(아래 순서 핀).
-            "boot_supervisor::pane_notice_line",
             // ★(0.14.52 · S-a C6d) `handlers::announce_seat_takeover` and `handlers::npm_prefix_pane_notice_req` left the list: both
             //   notices are events only (no pane write at all).
             "handlers::send_text_write_req",
-            // ★(0.14.52 · S-a C5b) The direct send family's checked agent writes (send_text's owned-submit /
-            //   self-submitting / clear-first jobs and a Return bound to its held body): the same admission as
-            //   `send_text_write_req` (ACL, typing guard, D-12 draft gate, S21 settle hold) runs before the hand-off.
-            "handlers::hand_off_direct_job",
+            // ★(0.14.56 · P1 D5) `handlers::hand_off_direct_job` left the list: its job takes the guard its caller passes (a
+            //   D4-valid cycle clear's `cycle_clear_guard`). ⛔A LEXICAL exit, as the D9 writers above: every other direct job
+            //   (owned submit, self-submitting, plain clear-first, the bound Return) passes `None` at runtime, as at the pin -
+            //   witnessed by `handlers::p1_cycle_tests::p1_e_t_d5_*` cell (d) (a plain clear is not stopped by a moved
+            //   generation). Their admission (ACL, typing guard, D-12 draft gate, S21 settle hold) is unchanged.
         ]
         .iter()
         .map(|s| s.to_string())
@@ -31739,7 +33850,7 @@ mod h_machine_hold_tests {
         let order: Vec<(&str, &str, &str, &str, &str)> = vec![
             // H2 — 스케줄 직접 push: 하드축 판정이 직접 주입보다 앞.
             //   ★(0.14.52 · S-a C6a) the push path is `deliver_push_with` (the fire task then waits for the writer's verdict).
-            ("schedule", include_str!("schedule.rs"), "deliver_push_with", "machine_direct_hold(", "inject_on(daemon, &surface, text, Some(origin))"),
+            ("schedule", include_str!("schedule.rs"), "deliver_push_with", "machine_direct_hold(", "inject_on(daemon, &surface, text, Some(origin), d9)"),
             // H3 — 채널 inbox: 하드축 재확인(master_hold) → 기록 선행(UPDATE) → 주입.
             ("channels", include_str!("channels.rs"), "master_hold", "deliverable_master(daemon) != Some(sid)", "machine_direct_hold("),
             ("channels", include_str!("channels.rs"), "deliver_new_inbox_with", "master_hold(", "SET state='injected'"),
@@ -31758,7 +33869,46 @@ mod h_machine_hold_tests {
             ("boot_supervisor", include_str!("boot_supervisor.rs"), "retry_deferred_pane_notices", "pane_notice_hold(", "pane_notice_line("),
             ("boot_supervisor", include_str!("boot_supervisor.rs"), "pane_notice_hold", "machine_hold_enabled(", "machine_direct_hold("),
             ("boot_supervisor", include_str!("boot_supervisor.rs"), "pane_notice_line", "record_audited(", "write_tx.try_send("),
+            // ★(0.14.56 · P1 D9 §5-7 · D3-BOUND r2 §1.2, m2) W-5..W-8 and the queue: the claim baseline S0 (the guard is built, and
+            //   S0 read, by `D9WriterGuard::for_target(`; the queue reads `d9_snapshot(`) is taken in the function that JUDGES, before
+            //   the judgment and before the ledger pre-record (`record_audited` - for W-6 / W-7 / W-8 it runs inside the called writer
+            //   `inject_master_confirmed` / `pane_notice_line` / `inject_on`, so the pin's second token is that call). Each body_fn
+            //   names the function where the call lands now; `fn_body` + `find(..).unwrap_or_else(panic)` fail on a function that no
+            //   longer holds it (a stale pin cannot pass vacuously - mutant MP1 in the D3 evidence).
+            ("handlers", include_str!("handlers.rs"), "deliver_to_ceo", "D9WriterGuard::for_target(", "typing_guard_secs("),
+            ("handlers", include_str!("handlers.rs"), "deliver_to_ceo", "D9WriterGuard::for_target(", "machine_direct_hold("),
+            ("handlers", include_str!("handlers.rs"), "deliver_to_ceo", "D9WriterGuard::for_target(", "record_audited("),
+            ("channels", include_str!("channels.rs"), "deliver_new_inbox_with", "D9WriterGuard::for_target(", "master_hold("),
+            ("channels", include_str!("channels.rs"), "deliver_new_inbox_with", "D9WriterGuard::for_target(", "inject_master_confirmed("),
+            ("channels", include_str!("channels.rs"), "redeliver_unacked", "D9WriterGuard::for_target(", "master_hold("),
+            ("channels", include_str!("channels.rs"), "redeliver_unacked", "D9WriterGuard::for_target(", "inject_master_confirmed("),
+            ("boot_supervisor", include_str!("boot_supervisor.rs"), "notify_no_spawn", "D9WriterGuard::for_target(", "pane_notice_hold("),
+            ("boot_supervisor", include_str!("boot_supervisor.rs"), "retry_deferred_pane_notices", "D9WriterGuard::for_target(", "pane_notice_hold("),
+            ("schedule", include_str!("schedule.rs"), "deliver_push_with", "D9WriterGuard::for_target(", "machine_direct_hold("),
+            ("schedule", include_str!("schedule.rs"), "deliver_push_with", "D9WriterGuard::for_target(", "inject_on(daemon, &surface, text, Some(origin), d9)"),
+            ("governance", include_str!("governance.rs"), "deliver_head_locked", "d9_snapshot(", "handoff_gate_ok("),
+            ("governance", include_str!("governance.rs"), "deliver_head_locked", "d9_snapshot(", "record_audited_with("),
         ];
+        // ★(m2) Census: S0 is built ONLY where the pins above say - one guard per judging site, none in the writer helpers (a
+        //   second `for_target(` after the judgment would put the baseline back after the I/O).
+        for (f, src, want) in [
+            ("handlers", include_str!("handlers.rs"), 1usize),
+            ("channels", include_str!("channels.rs"), 2),
+            ("boot_supervisor", include_str!("boot_supervisor.rs"), 2),
+            ("schedule", include_str!("schedule.rs"), 1),
+        ] {
+            let code = strip_line_comments(&production(src));
+            assert_eq!(code.matches("D9WriterGuard::for_target(").count(), want, "{f}: D9WriterGuard::for_target( call-site count");
+        }
+        for (f, src, writer) in [
+            ("channels", include_str!("channels.rs"), "inject_master_confirmed"),
+            ("boot_supervisor", include_str!("boot_supervisor.rs"), "pane_notice_line"),
+            ("schedule", include_str!("schedule.rs"), "inject_on"),
+        ] {
+            let body = fn_body(&strip_line_comments(&production(src)), writer).to_string();
+            assert!(body.contains("record_audited("), "{f}::{writer}: the ledger pre-record moved - re-pin S0 against it");
+            assert!(!body.contains("for_target("), "{f}::{writer}: a guard (S0) built after the judgment");
+        }
         for (f, src, body_fn, gate, inject) in order {
             let code = strip_line_comments(&production(src));
             let body = fn_body(&code, body_fn);
@@ -31789,8 +33939,20 @@ mod h_machine_hold_tests {
     /// S12-2, S12-A, S12-B, S12-C, S12-4) and class D +1 (S12-1 knows the exit by reader EOF). S12-3 is a
     /// platform-neutral helper test, not ignored. The Windows close path is measured by the `cfg(windows)`
     /// sibling S12-BW. Renamed `_of_61` (the CI comment in windows-health.yml too).
+    /// ★(0.14.56 · P1 D9 pre-CR stage D1) 55 → **58**: class C +3 recorder-seat claim-check specimens (`agent_queue_tests::d9_pre_cr_*`).
+    /// Renamed `_of_58` (the CI comment in windows-health.yml too).
+    /// ★(0.14.56 · P1 D9 pre-CR stage D2) 58 → **60**: class C +2 recorder-seat CR-withhold specimens (`d9_pre_cr_t_w3*`). Renamed `_of_60`.
+    /// ★(0.14.56 · P1 D9 pre-CR stage D3) 60 → **65**: class C +5 recorder-seat writer-guard specimens (`d9_pre_cr_t_w4_*`, one beside each
+    /// of W-5..W-8) and its scope control. Renamed `_of_65`.
+    /// ★(0.14.56 · D3-BOUND I1) 65 → **70**: class C +5 recorder-seat S0 specimens (`d9_bound_t_s0*` - queue T-S0, T-S0h, W-5, W-7,
+    /// W-8; the W-6 one lives with the `#[cfg(unix)]` H3 channel rig). Renamed `_of_70` (the CI comment in windows-health.yml too).
+    /// D3-BOUND I2: 70 -> 75, five additional POSIX recorder specimens; channel rig cases remain cfg(unix).
+    /// D3-BOUND I3: 75 -> 81, six recorder-seat escalation/status/ownership specimens.
+    /// P1 WC (0.14.56 shared completion fixtures): 83 -> 86, class C +3 - two shared POSIX recorder (`p1_recorder`) controls and the
+    /// WC-1 per-case delayed/missing receipt control, whose cases are themselves recorder specimens. Renamed `_of_86` (the CI comment too).
+    /// Integration UNION: 55 shared + 6 SOCKET-only + 31 P1-only = 92; the historical parent counts above are superseded.
     #[test]
-    fn r2f_dm_windows_ignore_attributes_are_exactly_the_decided_set_of_61() {
+    fn r2f_dm_windows_ignore_attributes_are_exactly_the_decided_set_of_92() {
         const REASON_A: &str = "S21 제출 정착·창 위 CR 보류는 유닉스 한정(send_settle_applies)";
         const REASON_B: &str = "윈도우 기본 H 마스크는 draft 축을 끈다(hold_axes_default(true)) — 이 검체는 유닉스 기본(draft 축) 동작을 본다";
         const REASON_C: &str = "좌석 명령이 POSIX 셸 문법";
@@ -31864,8 +34026,50 @@ mod h_machine_hold_tests {
             ("attach_exit_tests", "s12_b_surface_gone_from_the_map_without_eof_releases_a_stalled_attach", 'C'),
             ("attach_exit_tests", "s12_c_reading_client_of_a_surface_gone_from_the_map_reaches_eof", 'C'),
             ("attach_exit_tests", "s12_4_reading_client_ends_after_a_natural_exit", 'C'),
+            // ★(0.14.56 · P1 D9 pre-CR stage D1) class C +3: the master/CEO claim-check specimens (T-W1, T-W2, T-L1) compare
+            //   the receiver's bytes through the same recorder seat (`stty raw -echo; exec cat > file`), so they are POSIX by
+            //   construction. The claim check itself has no cfg and runs on Windows; its Windows behaviour is UNMEASURED here.
+            ("agent_queue_tests", "d9_pre_cr_t_l1_a_human_byte_during_the_settle_lands_after_the_cr", 'C'),
+            ("agent_queue_tests", "d9_pre_cr_t_w1_a_write_ahead_inside_the_r1_window_refuses_the_claim", 'C'),
+            ("agent_queue_tests", "d9_pre_cr_t_w2_a_human_key_inside_the_r1_window_refuses_the_claim", 'C'),
+            // ★(0.14.56 · P1 D9 pre-CR stage D2) class C +2: the CR-withhold specimen and its scope control compare the receiver's
+            //   bytes through the same recorder seat. The probe itself is armed only under cfg!(unix) (design r3 §6-4, R-5).
+            ("agent_queue_tests", "d9_pre_cr_t_w3_a_dialog_during_the_settle_withholds_the_cr_with_one_owner", 'C'),
+            ("agent_queue_tests", "d9_pre_cr_t_w3c_outside_d9_scope_the_queue_job_proof_is_unchanged", 'C'),
+            // ★(0.14.56 · P1 D9 pre-CR stage D3) class C +5: each daemon-internal writer's claim-check specimen (W-5..W-8) and the scope control record
+            //   the receiver's bytes through the same recorder seat. The guard itself has no cfg and runs on Windows (UNMEASURED there).
+            ("boot_supervisor", "d9_pre_cr_t_w4_boot_notice_refused_at_claim_writes_nothing", 'C'),
+            ("channels", "d9_pre_cr_t_w4_channel_envelope_refused_at_claim_writes_nothing", 'C'),
+            ("handlers", "d9_pre_cr_t_w4_ceo_push_refused_at_claim_writes_nothing", 'C'),
+            ("schedule", "d9_pre_cr_t_w4_schedule_push_refused_at_claim_writes_nothing", 'C'),
+            ("schedule", "d9_pre_cr_t_w4c_outside_d9_scope_the_push_has_no_guard", 'C'),
+            // ★(0.14.56 · D3-BOUND I1) class C +5: the S0 specimens record the receiver's bytes through the same recorder seat. The
+            //   S0 baseline itself has no cfg and runs on Windows (UNMEASURED there).
+            ("agent_queue_tests", "d9_bound_t_s0_a_write_finished_between_judgment_and_hand_off_refuses_the_claim", 'C'),
+            ("agent_queue_tests", "d9_bound_t_s0h_a_human_key_time_between_judgment_and_hand_off_refuses_the_claim", 'C'),
+            ("agent_queue_tests", "d9_bound_i2_queue_busy_holds_then_first_idle_pass_delivers", 'C'),
+            ("agent_queue_tests", "d9_bound_i2_late_busy_undoes_owned_marks_without_refusal", 'C'),
+            ("agent_queue_tests", "d9_bound_i2_non_master_is_not_idle_gated", 'C'),
+            ("agent_queue_tests", "d9_bound_i2_writer_hold_keeps_queue_alarms_live", 'C'),
+            ("boot_supervisor", "d9_bound_t_s0_boot_notice_refused_after_a_write_finished_inside_the_window", 'C'),
+            ("handlers", "d9_bound_t_s0_ceo_push_refused_after_a_write_finished_inside_the_window", 'C'),
+            ("schedule", "d9_bound_t_s0_schedule_push_refused_after_a_write_finished_inside_the_window", 'C'),
+            ("schedule", "d9_bound_i2_schedule_diversion_delivers_at_first_idle_queue_pass", 'C'),
+            ("agent_queue_tests", "d9_bound_i3_queue_refusals_are_counted_bounded_and_cleared", 'C'),
+            ("agent_queue_tests", "d9_bound_i3_busy_holds_do_not_reset_refusals", 'C'),
+            ("agent_queue_tests", "d9_bound_i3_busy_queue_escalates_once_then_delivers", 'C'),
+            ("agent_queue_tests", "d9_bound_i3_idle_nonwriter_hold_breaks_busy_continuity", 'C'),
+            ("agent_queue_tests", "d9_bound_i3_controller_owned_claim_is_counted_once", 'C'),
+            ("agent_queue_tests", "d9_bound_i3_late_refusal_does_not_restore_a_replaced_head_slot", 'C'),
+            // L-CYCLE wire witnesses use the same POSIX recorder (REASON_C); portable claim/barrier tests remain enabled.
+            ("handlers", "p1_e_t_d4_cycle_clear_needs_the_callers_own_live_claim", 'C'),
+            ("handlers", "p1_e_t_d5_the_observed_generations_reach_the_guard_and_an_abort_is_a_refusal", 'C'),
+            // P1 WC shared completion fixtures: the seat is the POSIX recorder (`stty raw -echo; exec cat > file`) directly, or (wc1 control)
+            //   through the row specimens it runs, 17 of whose 18 cases are class C themselves.
+            ("agent_queue_tests", "p1_completion_recorder_barrier_covers_delayed_extra_bytes", 'C'),
+            ("agent_queue_tests", "p1_completion_explicit_holder_does_not_release_before_owner", 'C'),
+            ("agent_queue_tests", "p1_completion_wc1_each_case_delayed_and_missing_actual_receipt", 'C'),
         ];
-        assert_eq!(want.len(), 61, "결정한 집합은 61건(24 + 17 + 16 + 4)");
         let needle = concat!("#[cfg_attr(not(unix), ", "ignore = \"");
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/cysd");
         let mut got: Vec<(String, String, char)> = Vec::new();
@@ -31892,8 +34096,11 @@ mod h_machine_hold_tests {
         got.sort();
         let mut want_sorted: Vec<(String, String, char)> = want.iter().map(|(a, b, c)| (a.to_string(), b.to_string(), *c)).collect();
         want_sorted.sort();
-        assert_eq!(got.len(), 61, "윈도우 `ignore` 가 {}건이다(결정 61건) — 새로 더했거나 뺐다: {got:?}", got.len());
-        assert_eq!(got, want_sorted, "윈도우 `ignore` 집합이 결정한 61건과 다르다 — 목록과 `ignore` 사유를 함께 고쳐라");
+        let missing: Vec<_> = got.iter().filter(|entry| !want_sorted.contains(entry)).collect();
+        let extra: Vec<_> = want_sorted.iter().filter(|entry| !got.contains(entry)).collect();
+        assert_eq!(want.len(), 92, "union registry must contain 92 entries; missing={missing:?}; extra={extra:?}");
+        assert_eq!(got.len(), 92, "윈도우 `ignore` 가 {}건이다(결정 92건) — 새로 더했거나 뺐다: {got:?}", got.len());
+        assert_eq!(got, want_sorted, "윈도우 `ignore` 집합이 결정한 92건과 다르다 — 목록과 `ignore` 사유를 함께 고쳐라");
     }
 }
 
