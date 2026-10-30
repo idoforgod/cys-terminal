@@ -328,7 +328,12 @@ cys_timeout_run() {
     fi
     # Bootstrap needs no external path converter. Drive-mounted MSYS paths
     # have a lexical native spelling; other paths retain ordinary semantics.
-    "$CYS_PY" -B -c 'import os,runpy,sys
+    # -c puts '' (the session cwd = a project directory) first on sys.path, and runpy plus the leaf
+    # then import stdlib modules a project file can shadow (queue.py, json.py ...). Drop it before any
+    # import. Not -I: that implies -E and drops PYTHONHOME/PYTHONUTF8/PYTHONIOENCODING (PKG-3A M1).
+    "$CYS_PY" -B -c 'import sys
+sys.path[:]=[x for x in sys.path if x]
+import os,runpy
 p=sys.argv[1]
 if os.name == "nt" and len(p)>3 and p[0]=="/" and p[2]=="/" and p[1].isalpha():
     p=p[1]+":"+p[2:]
@@ -352,7 +357,10 @@ runpy.run_path(p,run_name="__main__")' "$_cys_owned_leaf" --bounded "$_cys_owned
     # ★프로세스 **그룹** 종료: 대상만 죽이면 손자(대상이 띄운 자식)가 stdout 파이프를 계속 붙잡아
     #   호출측 `$(...)` 가 EOF 를 못 받고 그대로 행 걸린다(데드라인이 사실상 무효 — 실측 확인).
     #   그래서 새 세션으로 스폰하고 타임아웃 시 그룹 전체에 SIGKILL 을 보낸다.
-    "$CYS_PY" -c 'import os,signal,subprocess,sys
+    #   '' (the cwd) leaves sys.path first, for the same reason as the --owned bootstrap above.
+    "$CYS_PY" -B -c 'import sys
+sys.path[:]=[x for x in sys.path if x]
+import os,signal,subprocess
 try:
     p = subprocess.Popen(sys.argv[2:], start_new_session=True)
 except FileNotFoundError:

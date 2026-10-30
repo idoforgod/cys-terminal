@@ -1091,7 +1091,7 @@ jobs:
                    test_cso_directive_rev test_role_authority test_role_authority_shell \
                    test_role_authority_triage \
                    test_round_stop_reason test_resource_gate test_resource_gate_fleet_cpu test_resource_gate_product_cpu \
-                   test_inject_context_role_seat test_inject_context_soul_l0 test_carry_unproven_scope \
+                   test_inject_context_role_seat test_inject_context_soul_l0 test_inject_context_owned_cwd test_carry_unproven_scope \
                    test_wp18_skillscan_failopen test_owned_process \
                    test_skillscan_orphan_horizon \
                    test_wakeup_durable_receipt test_wakeup_park_failure \
@@ -1962,7 +1962,7 @@ jobs:
                    test_cso_directive_rev test_role_authority test_role_authority_shell \
                    test_role_authority_triage \
                    test_round_stop_reason test_resource_gate test_resource_gate_fleet_cpu test_resource_gate_product_cpu \
-                   test_inject_context_role_seat test_inject_context_soul_l0 test_carry_unproven_scope \
+                   test_inject_context_role_seat test_inject_context_soul_l0 test_inject_context_owned_cwd test_carry_unproven_scope \
                    test_wp18_skillscan_failopen test_owned_process \
                    test_skillscan_orphan_horizon \
                    test_wakeup_durable_receipt test_wakeup_park_failure \
