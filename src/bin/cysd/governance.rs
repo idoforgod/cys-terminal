@@ -10,6 +10,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
+// WC3: the non-test expansion invokes only the original clock callback, at its original read site.
+#[cfg(not(test))]
+#[inline]
+fn p1_queue_clock<T>(real: impl FnOnce() -> T, _snapshot: impl FnOnce((f64, Instant)) -> T) -> T {
+    real()
+}
+
 pub(crate) const WATCHDOG_INTERVAL_SECS: u64 = 5;
 const LOAD_DEBOUNCE_SECS: f64 = 60.0;
 
@@ -11548,7 +11555,7 @@ pub(crate) fn deliver_head_locked(
 ) -> Option<QueueHandoff> {
     // Call-owned output: concurrent channel holds and force-deliver calls cannot attribute this tick.
     if let Some(reason) = hold_reason.as_deref_mut() { *reason = None; }
-    let now = now_epoch();
+    let now = p1_queue_clock(now_epoch, |(epoch, _)| epoch);
     let default_ttl = crate::state::queue_ttl_default_secs();
     let base_min_interval = queue_min_interval_secs();
     let interval_max_wait = queue_max_wait_secs();
@@ -11620,7 +11627,7 @@ pub(crate) fn deliver_head_locked(
             effective_min_interval_secs(base_min_interval, head_wait_for_interval, interval_max_wait);
         if min_interval > 0 {
             if let Some(t) = *s.last_queue_delivery_at.lock().unwrap() {
-                if t.elapsed().as_secs() < min_interval {
+                if p1_queue_clock(Instant::now, |(_, mono)| mono).saturating_duration_since(t).as_secs() < min_interval {
                     d9_nonwriter_hold(s, ClaimProducer::Queue);
             break 'tx None; // 배달 최소 간격 미달 — 다음 틱(권위 판정 · 임계영역 안)
                 }
@@ -11941,6 +11948,10 @@ pub(crate) fn deliver_head_locked(
         *s.inject_reservation.lock().unwrap() = guard.as_ref().map(|g| {
             crate::state::InjectReservation { ids: d.merged_ids.clone(), guard: g.clone() }
         });
+        #[cfg(test)]
+        crate::agent_queue_tests::p1_queue_reservation_admitted(
+            s, handed.as_ref().expect("successful enqueue owns request").as_ref(),
+        );
         Some(d)
     };
     if let Some(entry) = obsolete_key_head {
@@ -13883,7 +13894,7 @@ fn deliver_queued(
         // ★G1(W2-D BLOCKER): overdue·기아 자격의 대기 = uptime 클램프 측정(부트 직후
         // typing 가드 공백 창 봉인 — queue_head_wait_secs doc 참조).
         let head_wait =
-            queue_head_wait_secs(now_epoch(), head.enqueued_at, daemon.started_at, s.created_at);
+            queue_head_wait_secs(p1_queue_clock(now_epoch, |(epoch, _)| epoch), head.enqueued_at, daemon.started_at, s.created_at);
         // 막힘 공통 처리 — 사유 기록 + 적체·기아 경보(한 분기라도 빠지면 그 사유가 침묵한다).
         let mut block = |why: &str| {
             mark_queue_blocked(&s, why);
@@ -13957,7 +13968,7 @@ fn deliver_queued(
                 .last_queue_delivery_at
                 .lock()
                 .unwrap()
-                .map(|t| t.elapsed().as_secs() < min_interval)
+                .map(|t| p1_queue_clock(Instant::now, |(_, mono)| mono).saturating_duration_since(t).as_secs() < min_interval)
                 .unwrap_or(false);
             if recent {
                 // ★(0.14.31 · 리뷰 R1 · minor) 이 보류는 **몇 초 뒤 스스로 풀린다** — 기아 경보
@@ -14245,6 +14256,35 @@ pub(crate) static REAP_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 /// 37건 연쇄 실패 중 36건은 그 패닉의 poison 전파). 두 모듈이 이 한 락을 별칭으로 쓴다.
 #[cfg(test)]
 pub(crate) static PACK_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+thread_local! {
+    static P1_QUEUE_CLOCK: std::cell::Cell<Option<(f64, Instant)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Explicit queue-age/min-interval inputs, owned by this test thread and restored on unwind.
+#[cfg(test)]
+pub(crate) struct P1QueueClockSnapshot(Option<(f64, Instant)>);
+#[cfg(test)]
+impl P1QueueClockSnapshot {
+    pub(crate) fn set(epoch: f64, monotonic: Instant) -> Self {
+        assert!(epoch.is_finite(), "P1 queue clock epoch must be finite");
+        Self(P1_QUEUE_CLOCK.with(|slot| slot.replace(Some((epoch, monotonic)))))
+    }
+}
+#[cfg(test)]
+impl Drop for P1QueueClockSnapshot {
+    fn drop(&mut self) {
+        P1_QUEUE_CLOCK.with(|slot| slot.set(self.0));
+    }
+}
+#[cfg(test)]
+fn p1_queue_clock<T>(real: impl FnOnce() -> T, snapshot: impl FnOnce((f64, Instant)) -> T) -> T {
+    match P1_QUEUE_CLOCK.with(|slot| slot.get()) {
+        Some(pair) => snapshot(pair),
+        None => real(),
+    }
+}
 
 #[cfg(test)]
 thread_local! {
@@ -30645,6 +30685,43 @@ after-tick liveness alone does not attribute a clock defect",
     // ===== ★(0.14.56 · P1 D9 reinject order · IMPL r1 m1, gemini-6) A5/A6 at the READER SITES, not only the pure helpers
     //   (`d9_tests::d9_order_a5_*` / `d9_order_a6_*` stay): the merge planner's origin key in `deliver_head_locked`, the min-interval
     //   head age in `deliver_head_locked`, the starve head in `deliver_queued`, and the head row of `queue_blocked_seats`. =====
+
+    #[test]
+    fn p1_queue_clock_without_snapshot_uses_original_real_callbacks() {
+        assert!(super::P1_QUEUE_CLOCK.with(|slot| slot.get()).is_none());
+        let before = now_epoch();
+        let got = super::p1_queue_clock(now_epoch, |(epoch, _)| epoch);
+        let after = now_epoch();
+        assert!(before <= got && got <= after, "no snapshot: real epoch");
+        let before = Instant::now();
+        let got = super::p1_queue_clock(Instant::now, |(_, mono)| mono);
+        let after = Instant::now();
+        assert!(before <= got && got <= after, "no snapshot: real Instant");
+        let calls = std::cell::Cell::new(0);
+        assert_eq!(super::p1_queue_clock(|| { calls.set(calls.get()+1); 42 }, |_| panic!("snapshot absent")), 42);
+        assert_eq!(calls.get(), 1, "one original callback, not two clock reads");
+    }
+
+    #[test]
+    fn p1_queue_clock_snapshot_is_exact_nested_restored_and_thread_local() {
+        let first = (1234.5, Instant::now());
+        let second = (9876.5, first.1 + Duration::from_secs(100));
+        {
+            let _outer = super::P1QueueClockSnapshot::set(first.0, first.1);
+            assert_eq!(super::p1_queue_clock(|| panic!("snapshot must skip real clock"), |pair| pair), first);
+            {
+                let _inner = super::P1QueueClockSnapshot::set(second.0, second.1);
+                assert_eq!(super::p1_queue_clock(|| panic!("snapshot must skip real clock"), |pair| pair), second);
+            }
+            assert_eq!(super::p1_queue_clock(|| panic!("outer restored"), |pair| pair), first);
+            std::thread::spawn(|| {
+                assert!(super::P1_QUEUE_CLOCK.with(|slot| slot.get()).is_none());
+                assert_eq!(super::p1_queue_clock(|| 73, |_| panic!("foreign thread snapshot")), 73);
+            }).join().unwrap();
+        }
+        assert!(super::P1_QUEUE_CLOCK.with(|slot| slot.get()).is_none());
+        assert_eq!(super::p1_queue_clock(|| 91, |_| panic!("drop restores absence")), 91);
+    }
 
     fn d9r_seat(tag: &str) -> (Arc<Daemon>, Arc<crate::state::Surface>) {
         let daemon = drill_daemon(tag);

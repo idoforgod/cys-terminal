@@ -1323,23 +1323,17 @@ fn aborted(fx: &Fx, s: &Arc<Surface>) -> Vec<Value> {
 #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
 fn d9_pre_cr_t_w1_a_write_ahead_inside_the_r1_window_refuses_the_claim() {
     let fx = fx("d9-tw1");
-    let (s, out) = d9_master_recorder(&fx, "tw1");
+    let mut recorder = p1_master_recorder(&fx, "tw1"); let s = recorder.surface.clone(); let out = recorder.output.clone();
     let id = enqueue(&fx, &s, "[보고] tw1");
-    let release = d9_late_hold(&s, Some(b"T"));
+    let held = p1_late_hold(&s, Some(b"T"));
     let w0 = s.inject_track.wrote();
-    let releaser = {
-        let s = s.clone();
-        std::thread::spawn(move || {
-            wait_until("the job is handed off", || s.inject_reserved());
-            release.recv_timeout(Duration::from_secs(10)).expect("late idle seam did not run").send(()).unwrap();
-        })
-    };
-    let handed = hand_off(&fx, &s);
-    releaser.join().unwrap();
-    wait_until("the writer is idle", || s.write_tx.gate().pending() == 0);
-    assert!(!handed, "the claim after a write ahead inside the R-1 window must be refused");
-    assert_eq!(std::fs::read(&out).unwrap(), b"T".to_vec(), "only the write ahead reached the receiver (0 bytes of the job)");
+    let action = p1_queue_action(&s, move |_,_| { held.lock().unwrap().take().expect("late seam holder").release(); });
+    let _handed = hand_off(&fx, &s);
+    action.finish();
+    p1_wait_completion(p1_writer_idle(&s), P1_GUARD).expect("writer operation completed");
+    assert_eq!(aborted(&fx, &s).len(), 1, "the claim after a write ahead inside the R-1 window must be refused");
     assert_eq!(s.inject_track.wrote(), w0 + 1, "premise: exactly the write ahead was counted");
+    assert_eq!(recorder.barrier(), b"T".to_vec(), "only the write ahead reached the receiver (0 bytes of the job)");
     assert_eq!(s.pending_queue.lock().unwrap().front().map(|e| e.id.clone()), Some(id.clone()), "the item stays at the head");
     let ab = aborted(&fx, &s);
     assert_eq!(ab.len(), 1, "{ab:?}");
@@ -1347,12 +1341,11 @@ fn d9_pre_cr_t_w1_a_write_ahead_inside_the_r1_window_refuses_the_claim() {
     assert!(events(&fx, "queue.delivered").is_empty());
     // The next attempt is a fresh judgement: delivered once.
     assert!(hand_off(&fx, &s), "the next attempt hands off");
-    wait_until("delivered", || queue_len(&s) == 0);
+    p1_wait_completion(p1_writer_idle(&s), P1_GUARD).expect("delivery operation completed"); assert_eq!(queue_len(&s), 0);
     let mut want = b"T".to_vec();
     want.extend(queue_bytes("[보고] tw1"));
-    wait_until("receiver got the job", || std::fs::metadata(&out).map(|m| m.len() as usize).unwrap_or(0) >= want.len());
-    let _ = s.child.lock().unwrap().kill();
-    assert_eq!(std::fs::read(&out).unwrap(), want, "the job's bytes once, after the write ahead");
+    // P1Recorder Drop stops this test-owned child after the final ACK/assertions.
+    assert_eq!(recorder.barrier(), want, "the job's bytes once, after the write ahead");
     let delivered = events(&fx, "queue.delivered");
     assert_eq!(delivered.len(), 1);
     assert_eq!(delivered[0]["payload"]["queue_entry_id"], Value::from(id));
@@ -1368,52 +1361,32 @@ fn d9_pre_cr_t_w1_a_write_ahead_inside_the_r1_window_refuses_the_claim() {
 #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
 fn d9_pre_cr_t_w2_a_human_key_inside_the_r1_window_refuses_the_claim() {
     let fx = fx("d9-tw2");
-    let (s, out) = d9_master_recorder(&fx, "tw2");
+    let mut recorder = p1_master_recorder(&fx, "tw2"); let s = recorder.surface.clone(); let out = recorder.output.clone();
     let id = enqueue(&fx, &s, "[보고] tw2");
-    let release = d9_late_hold(&s, None);
-    let w0 = s.inject_track.wrote();
-    // The keystroke's RPC waits for its own write, which queues behind the job: release the held writer as soon as the
-    // handler has RECEIVED the key (stamp + count moved), never after its reply (that would wait on the held writer).
-    let (gen0, human0) = (s.input_gen.load(Ordering::Acquire), *s.last_human_input.lock().unwrap());
-    let keyer = {
-        let fx_daemon = fx.daemon.clone();
-        let s = s.clone();
-        std::thread::spawn(move || {
-            wait_until("the job is handed off", || s.inject_reserved());
-            let gen_at_handoff = s.input_gen.load(Ordering::Acquire);
-            let sid = s.id;
-            let rpc = std::thread::spawn(move || {
-                let req = cys::Request {
-                    id: Value::from(1),
-                    method: "surface.send_text".into(),
-                    params: serde_json::json!({"surface_id": sid, "text": "\u{15}", "human": true, "quiet": true}),
-                };
-                match crate::handlers::dispatch(&fx_daemon, req, None) {
-                    crate::handlers::Reply::Single(v) => v,
-                    _ => panic!("single reply"),
-                }
-            });
-            wait_until("the key is received", || {
-                *s.last_human_input.lock().unwrap() != human0 && s.input_gen.load(Ordering::Acquire) != gen_at_handoff
-            });
-            release.recv_timeout(Duration::from_secs(10)).expect("late idle seam did not run").send(()).unwrap();
-            rpc.join().unwrap()
-        })
-    };
-    let handed = hand_off(&fx, &s);
-    let reply = keyer.join().unwrap();
-    wait_until("the writer is idle", || s.write_tx.gate().pending() == 0);
+    let held=p1_late_hold(&s,None);let w0=s.inject_track.wrote();
+    let gen0=s.input_gen.load(Ordering::Acquire);let daemon=fx.daemon.clone();
+    let action=p1_queue_action(&s,move |sc,_| {
+        let _async=crate::agent_write::p1_sync_settle(false);
+        let req=cys::Request{id:Value::from(1),method:"surface.send_text".into(),params:serde_json::json!({"surface_id":sc.id,"text":"\u{15}","human":true,"quiet":true})};
+        let reply=match crate::handlers::dispatch(&daemon,req,None){crate::handlers::Reply::Single(v)=>v,_=>panic!("single reply")};
+        assert_eq!(reply["ok"],true,"human request admission");
+        held.lock().unwrap().take().expect("late holder").release();
+        reply
+    });
+    let _handed = hand_off(&fx, &s);
+    let reply = action.finish();
+    p1_wait_completion(p1_writer_idle(&s), P1_GUARD).expect("writer operation completed");
     assert_ne!(s.input_gen.load(Ordering::Acquire), gen0, "premise: input accounting moved");
     assert_eq!(reply["ok"], Value::from(true), "premise: the keystroke was received: {reply}");
-    assert!(!handed, "the claim after a human key inside the R-1 window must be refused");
+    assert_eq!(aborted(&fx, &s).len(), 1, "the claim after a human key inside the R-1 window must be refused");
     assert_eq!(s.inject_track.wrote(), w0 + 1, "premise: only the key was written (after the refusal)");
     assert_eq!(s.pending_input_bytes.load(Ordering::Relaxed), 0, "premise: the key left the pending count at 0");
-    assert_eq!(std::fs::read(&out).unwrap(), b"\x15".to_vec(), "0 bytes of the job reached the receiver");
+    assert_eq!(recorder.barrier(), b"\x15".to_vec(), "0 bytes of the job reached the receiver");
     assert_eq!(s.pending_queue.lock().unwrap().front().map(|e| e.id.clone()), Some(id), "the item stays at the head");
     let ab = aborted(&fx, &s);
     assert_eq!(ab.len(), 1, "{ab:?}");
     assert_eq!(ab[0]["payload"]["foreign"], serde_json::json!(["input_gen", "last_human_input"]), "{ab:?}");
-    let _ = s.child.lock().unwrap().kill();
+    // P1Recorder Drop stops this test-owned child after the final ACK/assertions.
 }
 
 /// Arms the pre-record seam (`agent_write::set_test_after_pre_record`, D3-BOUND r2 §1.5) to admit one foreign `Data` write on `s`
@@ -1435,28 +1408,27 @@ pub(crate) fn d9_s0_foreign_write_after_pre_record(s: &Arc<Surface>, bytes: &'st
 #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
 fn d9_bound_t_s0_a_write_finished_between_judgment_and_hand_off_refuses_the_claim() {
     let fx = fx("d9-ts0");
-    let (s, out) = d9_master_recorder(&fx, "ts0");
+    let mut recorder = p1_master_recorder(&fx, "ts0"); let s = recorder.surface.clone(); let out = recorder.output.clone();
     let id = enqueue(&fx, &s, "[보고] ts0");
     let w0 = s.inject_track.wrote();
-    d9_s0_foreign_write_after_pre_record(&s, b"F");
-    let handed = hand_off(&fx, &s);
-    wait_until("the writer is idle", || s.write_tx.gate().pending() == 0);
+    p1_s0_foreign_write_after_pre_record(&s, b"F");
+    let _handed = hand_off(&fx, &s);
+    p1_wait_completion(p1_writer_idle(&s), P1_GUARD).expect("writer operation completed");
     // The discriminating assertions first (a written job also moves `wrote`), then the premise.
-    assert!(!handed, "the claim after a write finished between the judgment and the hand-off must be refused");
-    assert_eq!(std::fs::read(&out).unwrap(), b"F".to_vec(), "0 bytes of the job - only the foreign write");
+    assert_eq!(aborted(&fx, &s).len(), 1, "the claim after a write finished between the judgment and the hand-off must be refused");
     assert_eq!(s.inject_track.wrote(), w0 + 1, "premise: the foreign write was counted inside the window");
+    assert_eq!(recorder.barrier(), b"F".to_vec(), "0 bytes of the job - only the foreign write");
     assert_eq!(s.pending_queue.lock().unwrap().front().map(|e| e.id.clone()), Some(id.clone()), "the item stays at the head");
     let ab = aborted(&fx, &s);
     assert_eq!(ab.len(), 1, "{ab:?}");
     assert_eq!(ab[0]["payload"]["foreign"], serde_json::json!(["wrote"]), "only the write count moved: {ab:?}");
     // Next attempt (no seam): delivered once, after the foreign bytes.
     assert!(hand_off(&fx, &s), "the next attempt hands off");
-    wait_until("delivered", || queue_len(&s) == 0);
+    p1_wait_completion(p1_writer_idle(&s), P1_GUARD).expect("delivery operation completed"); assert_eq!(queue_len(&s), 0);
     let mut want = b"F".to_vec();
     want.extend(queue_bytes("[보고] ts0"));
-    wait_until("receiver got the job", || std::fs::metadata(&out).map(|m| m.len() as usize).unwrap_or(0) >= want.len());
-    let _ = s.child.lock().unwrap().kill();
-    assert_eq!(std::fs::read(&out).unwrap(), want, "the job's bytes once, after the foreign write");
+    // P1Recorder Drop stops this test-owned child after the final ACK/assertions.
+    assert_eq!(recorder.barrier(), want, "the job's bytes once, after the foreign write");
 }
 
 /// T-S0h (D3-BOUND r2 §1.5): as T-S0, but the window carries a human key time (`last_human_input` set, nothing written) -> the
@@ -1465,7 +1437,7 @@ fn d9_bound_t_s0_a_write_finished_between_judgment_and_hand_off_refuses_the_clai
 #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
 fn d9_bound_t_s0h_a_human_key_time_between_judgment_and_hand_off_refuses_the_claim() {
     let fx = fx("d9-ts0h");
-    let (s, out) = d9_master_recorder(&fx, "ts0h");
+    let mut recorder = p1_master_recorder(&fx, "ts0h"); let s = recorder.surface.clone(); let out = recorder.output.clone();
     let id = enqueue(&fx, &s, "[보고] ts0h");
     {
         let s = s.clone();
@@ -1473,15 +1445,15 @@ fn d9_bound_t_s0h_a_human_key_time_between_judgment_and_hand_off_refuses_the_cla
             *s.last_human_input.lock().unwrap() = Some(Instant::now());
         });
     }
-    let handed = hand_off(&fx, &s);
-    wait_until("the writer is idle", || s.write_tx.gate().pending() == 0);
-    assert!(!handed, "the claim after a human key time set between the judgment and the hand-off must be refused");
-    assert_eq!(std::fs::read(&out).unwrap(), Vec::<u8>::new(), "0 bytes of the job");
+    let _handed = hand_off(&fx, &s);
+    p1_wait_completion(p1_writer_idle(&s), P1_GUARD).expect("writer operation completed");
+    assert_eq!(aborted(&fx, &s).len(), 1, "the claim after a human key time set between the judgment and the hand-off must be refused");
+    assert_eq!(recorder.barrier(), Vec::<u8>::new(), "0 bytes of the job");
     assert_eq!(s.pending_queue.lock().unwrap().front().map(|e| e.id.clone()), Some(id), "the item stays at the head");
     let ab = aborted(&fx, &s);
     assert_eq!(ab.len(), 1, "{ab:?}");
     assert_eq!(ab[0]["payload"]["foreign"], serde_json::json!(["last_human_input"]), "{ab:?}");
-    let _ = s.child.lock().unwrap().kill();
+    // P1Recorder Drop stops this test-owned child after the final ACK/assertions.
 }
 
 /// T-L1 (design r3 §6-3, premise specimen): a human byte received DURING the body -> CR settle of a master queue job reaches the
@@ -1492,46 +1464,33 @@ fn d9_bound_t_s0h_a_human_key_time_between_judgment_and_hand_off_refuses_the_cla
 #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
 fn d9_pre_cr_t_l1_a_human_byte_during_the_settle_lands_after_the_cr() {
     let fx = fx("d9-tl1");
-    crate::agent_write::set_test_sync_settle(false);
-    let (s, out) = d9_master_recorder(&fx, "tl1");
-    let body = "[보고] tl1";
-    enqueue(&fx, &s, body);
-    let want = queue_bytes(body);
-    let before_cr = want[..want.len() - 1].to_vec();
-    let sender = {
-        let fx_daemon = fx.daemon.clone();
-        let s = s.clone();
-        let out = out.clone();
-        let before_cr = before_cr.clone();
-        std::thread::spawn(move || {
-            wait_until("the body is on the wire", || std::fs::read(&out).unwrap_or_default() == before_cr);
-            let req = cys::Request {
-                id: Value::from(1),
-                method: "surface.send_text".into(),
-                params: serde_json::json!({"surface_id": s.id, "text": "Z", "human": true, "quiet": true}),
-            };
-            let reply = match crate::handlers::dispatch(&fx_daemon, req, None) {
-                crate::handlers::Reply::Single(v) => v,
-                _ => panic!("single reply"),
-            };
-            let inside_settle = std::fs::read(&out).unwrap_or_default() == before_cr;
-            (reply, inside_settle)
-        })
-    };
-    assert!(hand_off(&fx, &s), "premise: handed off");
-    let (reply, inside_settle) = sender.join().unwrap();
-    let mut expect = want.clone();
-    expect.push(b'Z');
-    wait_until("receiver got the job and the byte", || std::fs::metadata(&out).map(|m| m.len() as usize).unwrap_or(0) >= expect.len());
-    std::thread::sleep(Duration::from_millis(100));
-    // The discriminating assertion first (the receiver's bytes), then the settlement.
-    let got = std::fs::read(&out).unwrap();
-    assert_eq!(reply["ok"], Value::from(true), "premise: the byte was received: {reply}");
-    assert!(inside_settle, "premise: the human byte was sent while the job's CR was still unwritten");
-    assert_eq!(got, expect, "the job's body and CR exactly, then the human byte");
-    wait_until("delivered", || queue_len(&s) == 0);
-    let _ = s.child.lock().unwrap().kill();
-    assert_eq!(events(&fx, "queue.delivered").len(), 1);
+    let _async = crate::agent_write::p1_sync_settle(false);
+    let mut recorder=p1_master_recorder(&fx,"tl1");let s=recorder.surface.clone();
+    let body="[보고] tl1";enqueue(&fx,&s,body);
+    let want=queue_bytes(body);let before_cr=want[..want.len()-1].to_vec();
+    let (release,held)=std::sync::mpsc::channel();
+    let paused=Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let pause_state=paused.clone();
+    let entered=p1_start_completion("admitted queue body acknowledged before held CR",|tx| {
+        *s.receiver_proof.lock().unwrap()=Some(Arc::new(P1PauseAtSubmit {
+            entered:Mutex::new(Some(tx)),release:Mutex::new(held),paused:pause_state,
+        }));
+        if hand_off(&fx,&s) { Ok(()) } else { Err("queue handoff refused".into()) }
+    });
+    p1_wait_completion(entered,P1_GUARD).expect("actual admitted job reached preCR rendezvous");
+    assert_eq!(recorder.received_prefix(before_cr.len()),before_cr,"receiver acknowledged complete body before CR");
+    let req=cys::Request{id:Value::from(1),method:"surface.send_text".into(),params:serde_json::json!({"surface_id":s.id,"text":"Z","human":true,"quiet":true})};
+    let reply=match crate::handlers::dispatch(&fx.daemon,req,None){crate::handlers::Reply::Single(v)=>v,_=>panic!("single reply")};
+    let inside_settle=paused.load(Ordering::Acquire);
+    assert_eq!(p1_wait_completion(p1_writer_idle(&s),Duration::ZERO),Err(P1WaitError::CompletionTimeout {event:"writer operation leases released"}),"actual preCR producer remains held until explicit release");
+    assert_eq!(reply["ok"],Value::from(true),"premise: the byte was received: {reply}");
+    assert!(inside_settle,"premise: the human byte was sent while the job's CR was still unwritten");
+    release.send(()).expect("explicit preCR release");
+    p1_wait_completion(p1_writer_idle(&s),P1_GUARD).expect("queue and admitted human byte settled");
+    let mut expect=want.clone();expect.push(b'Z');
+    assert_eq!(recorder.barrier(),expect,"the job's body and CR exactly, then the human byte");
+    assert_eq!(queue_len(&s),0);
+    assert_eq!(events(&fx,"queue.delivered").len(),1);
 }
 
 // ── ★(0.14.56 · P1 D9 pre-CR · design r3 §6-4 W-1) At the CR: a master/CEO queue job carries the pin's CR withhold probe, and
@@ -1637,19 +1596,13 @@ fn d9_pre_cr_t_w3_a_dialog_during_the_settle_withholds_the_cr_with_one_owner() {
 #[test]
 #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
 fn d9_pre_cr_t_w3c_outside_d9_scope_the_queue_job_proof_is_unchanged() {
-    let fx = fx("d9-tw3c");
-    let (s, out) = d9_dialog_seat(&fx, "tw3c", false);
-    let body = "[보고] tw3c";
-    enqueue(&fx, &s, body);
-    assert!(hand_off(&fx, &s), "premise: handed off");
-    // The discriminating assertion first: the hand-off returned after the writer's settlement, so a withhold is already published.
-    assert!(seat_events(&fx, &s, "queue.submit_withheld").is_empty(), "a withhold outside D9 scope");
-    let want = queue_bytes(body);
-    wait_until("every byte", || file_len(&out) >= want.len());
-    std::thread::sleep(Duration::from_millis(300));
-    assert_eq!(std::fs::read(&out).unwrap(), want, "the pin's bytes");
-    wait_until("delivered", || queue_len(&s) == 0);
-    let _ = s.child.lock().unwrap().kill();
+    let fx=fx("d9-tw3c");let mut recorder=p1_dialog_recorder(&fx,"tw3",false);let s=recorder.surface.clone();
+    let body="[보고] tw3c";enqueue(&fx,&s,body);
+    assert!(hand_off(&fx,&s),"premise: handed off");
+    p1_wait_completion(p1_writer_idle(&s),P1_GUARD).expect("outside scope terminal settled");
+    assert!(seat_events(&fx,&s,"queue.submit_withheld").is_empty(),"a withhold outside D9 scope");
+    let want=queue_bytes(body);assert_eq!(recorder.barrier(),want,"the pin's bytes");
+    assert_eq!(queue_len(&s),0);
 }
 
 // ── ★(0.14.56 · P1 D9 pre-CR · design r3 §5-7) Shared helpers for T-W4, whose specimens live beside each daemon-internal
@@ -1704,9 +1657,9 @@ pub(crate) fn d9_received(out: &std::path::Path, n: usize) -> Vec<u8> {
 #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
 fn d9_bound_i2_queue_busy_holds_then_first_idle_pass_delivers() {
     let fx = fx("i2-q1");
-    let (s, out) = d9_master_recorder(&fx, "i2-q1");
+    let mut recorder = p1_master_recorder(&fx, "i2-q1"); let s = recorder.surface.clone(); let out = recorder.output.clone();
     enqueue(&fx, &s, "i2-q1");
-    let release = hold_writer(&s);
+    let release = p1_hold_writer(&s);
     // The same bounded sender used for PTY terminal replies admits this behind the held arm.
     assert!(crate::state::send_write_req_bounded(&s.write_tx, crate::state::WriteReq::Data(b"T".to_vec()), Duration::from_millis(250)));
     for k in 0..5 {
@@ -1718,12 +1671,12 @@ fn d9_bound_i2_queue_busy_holds_then_first_idle_pass_delivers() {
         assert!(aborted(&fx, &s).is_empty(), "S-Q1: hold is not refusal");
         assert!(s.queue_blocked.lock().unwrap().as_ref().is_some_and(|b| b.0.starts_with("writer_active")), "S-Q1: writer_active is visible");
     }
-    release.send(()).unwrap();
-    wait_until("idle", || s.write_tx.gate().pending() == 0);
+    release.release();
+    p1_wait_completion(p1_writer_idle(&s), P1_GUARD).expect("writer operation completed");
     assert!(hand_off(&fx, &s), "S-Q1: first idle pass delivers");
-    wait_until("delivered", || queue_len(&s) == 0);
+    p1_wait_completion(p1_writer_idle(&s), P1_GUARD).expect("delivery operation completed"); assert_eq!(queue_len(&s), 0);
     let mut expected = b"T".to_vec(); expected.extend(queue_bytes("i2-q1"));
-    assert_eq!(d9_received(&out, expected.len()), expected, "S-Q1: exact body and one Return");
+    assert_eq!(recorder.barrier(), expected, "S-Q1: exact body and one Return");
 }
 
 /// S-Q1b: work admitted during the pre-record window reaches the late check, not the claim.
@@ -1731,23 +1684,23 @@ fn d9_bound_i2_queue_busy_holds_then_first_idle_pass_delivers() {
 #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
 fn d9_bound_i2_late_busy_undoes_owned_marks_without_refusal() {
     let fx = fx("i2-late");
-    let (s, out) = d9_master_recorder(&fx, "i2-late");
+    let mut recorder = p1_master_recorder(&fx, "i2-late"); let s = recorder.surface.clone(); let out = recorder.output.clone();
     enqueue(&fx, &s, "i2-late");
     let release = Arc::new(Mutex::new(None));
     {
         let s = s.clone(); let release = release.clone();
-        crate::agent_write::set_test_after_pre_record(move |_| *release.lock().unwrap() = Some(hold_writer(&s)));
+        crate::agent_write::set_test_after_pre_record(move |_| *release.lock().unwrap() = Some(p1_hold_writer(&s)));
     }
     let _ = hand_off(&fx, &s);
     assert!(aborted(&fx, &s).is_empty(), "S-Q1b: late busy is a hold, not a claim refusal");
     assert!(s.queue_blocked.lock().unwrap().as_ref().is_some_and(|b| b.0.starts_with("writer_active")), "S-Q1b: late writer hold recorded");
     assert!(!s.inject_reserved(), "S-Q1b: no reservation on hold");
     assert!(s.last_queue_delivery_at.lock().unwrap().is_none(), "S-Q1b: owned timing mark undone");
-    release.lock().unwrap().take().unwrap().send(()).unwrap();
-    wait_until("idle", || s.write_tx.gate().pending() == 0);
+    release.lock().unwrap().take().unwrap().release();
+    p1_wait_completion(p1_writer_idle(&s), P1_GUARD).expect("writer operation completed");
     assert!(hand_off(&fx, &s), "S-Q1b: first idle pass delivers");
     let expected = queue_bytes("i2-late");
-    assert_eq!(d9_received(&out, expected.len()), expected);
+    assert_eq!(recorder.barrier(), expected);
 }
 
 /// S-SCOPE: a non-master keeps its prior admission even while its writer is busy.
@@ -1755,40 +1708,39 @@ fn d9_bound_i2_late_busy_undoes_owned_marks_without_refusal() {
 #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
 fn d9_bound_i2_non_master_is_not_idle_gated() {
     let fx = fx("i2-scope");
-    let (s, out) = recorder_seat(&fx, "i2-scope");
+    let mut recorder = p1_recorder(&fx.daemon, &fx.dir, "i2-scope", None);
+    let s = recorder.surface.clone(); *s.agent_meta.lock().unwrap() = None;
     enqueue(&fx, &s, "i2-scope");
-    let release = hold_writer(&s);
-    let sr = s.clone();
-    let worker = std::thread::spawn(move || {
-        wait_until("non-master handoff", || sr.inject_reserved());
-        release.send(()).unwrap();
-    });
+    let holder = p1_hold_writer(&s);
+    let worker = p1_queue_action(&s, move |_, _| { holder.release(); });
     assert!(hand_off(&fx, &s), "S-SCOPE: non-master is not held by idle gate");
-    worker.join().unwrap();
+    worker.finish();
     assert_eq!(s.writer_holds.load(Ordering::Relaxed), 0);
     assert!(s.claim_streaks.lock().unwrap().iter().all(Option::is_none));
-    assert_eq!(d9_received(&out, queue_bytes("i2-scope").len()), queue_bytes("i2-scope"));
+    assert_eq!(recorder.barrier(), queue_bytes("i2-scope"));
 }
 
 #[test]
 #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
 fn d9_bound_i2_writer_hold_keeps_queue_alarms_live() {
     let fx = fx("i2-alarm");
-    let (s, _) = d9_master_recorder(&fx, "i2-alarm");
+    let recorder = p1_master_recorder(&fx, "i2-alarm"); let s = recorder.surface.clone();
     std::env::set_var("CYS_QUEUE_STARVE_ALERT_SECS", "1");
     std::env::set_var("CYS_QUEUE_DEPTH_ALERT", "1");
     std::env::set_var("CYS_QUEUE_QUIET_SECS", "0");
-    enqueue(&fx, &s, "i2-alarm");
-    std::thread::sleep(Duration::from_millis(1100));
+    let id = enqueue(&fx, &s, "i2-alarm");
+    let entry_at = s.pending_queue.lock().unwrap().front().unwrap().enqueued_at;
+    let now = entry_at.max(fx.daemon.started_at).max(s.created_at) + 2.0;
+    let _clock = crate::governance::P1QueueClockSnapshot::set(now, Instant::now());
     crate::governance::h_paint(&s, crate::governance::H_IDLE_SCREEN);
-    let release = hold_writer(&s);
+    let holder = p1_hold_writer(&s);
     crate::governance::h_queue_tick(&fx.daemon);
-    let starved = events(&fx, "queue.starved");
-    let depth = events(&fx, "queue.depth_high");
-    release.send(()).unwrap();
+    let starved = events(&fx, "queue.starved"); let depth = events(&fx, "queue.depth_high");
+    holder.release();
     for key in ["CYS_QUEUE_STARVE_ALERT_SECS", "CYS_QUEUE_DEPTH_ALERT", "CYS_QUEUE_QUIET_SECS"] { std::env::remove_var(key); }
     assert_eq!(starved.len(), 1, "S-Q4: queue.starved count while writer held");
     assert!(starved[0]["payload"]["blocked_by"].as_str().unwrap().starts_with("writer_active"));
+    assert_eq!(starved[0]["payload"]["head_entry_id"], id, "the aged item is the observed item");
     assert_eq!(depth.len(), 1, "S-Q4: queue.depth_high count while writer held");
 }
 
@@ -1862,16 +1814,16 @@ pub(crate) fn d9_with_late_write_ahead<R>(s: &Arc<Surface>, call: impl FnOnce() 
 fn d9_bound_i2_slot_lifecycle_and_head_replacement() {
     use crate::governance::{ClaimProducer as P, d9_writer_busy, d9_nonwriter_hold, d9_hold_age, d9_terminal};
     let fx = fx("i2-slots");
-    let s = seat(&fx);
+    let recorder = p1_recorder(&fx.daemon, &fx.dir, "i2-slots", None); let s = recorder.surface.clone(); *s.agent_meta.lock().unwrap() = None;
     let first = enqueue(&fx, &s, "first");
-    let release = hold_writer(&s);
+    let release = p1_hold_writer(&s);
     for p in [P::Queue, P::ChannelNew, P::ChannelRedeliver] {
         assert!(d9_writer_busy(&fx.daemon, &s, p, &first, false));
     }
     d9_nonwriter_hold(&s, P::Queue);
     assert!(d9_hold_age(&s, P::Queue, &first).is_some(), "busy non-writer hold keeps held_since");
-    release.send(()).unwrap();
-    wait_until("idle", || s.write_tx.gate().pending() == 0);
+    release.release();
+    p1_wait_completion(p1_writer_idle(&s), P1_GUARD).expect("writer operation completed");
     assert!(!d9_writer_busy(&fx.daemon, &s, P::Queue, &first, false));
     assert!(d9_hold_age(&s, P::Queue, &first).is_some(), "MI11: passing early idle clears nothing");
     d9_nonwriter_hold(&s, P::ChannelNew);
@@ -1906,10 +1858,10 @@ fn d9_refuse_queue_once(fx: &Fx, s: &Arc<Surface>) {
 #[test]
 #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
 fn d9_bound_i3_queue_refusals_are_counted_bounded_and_cleared() {
-    let fx = fx("i3-q2"); let (s, out) = d9_master_recorder(&fx, "i3-q2");
+    let fx = fx("i3-q2"); let mut recorder = p1_master_recorder(&fx, "i3-q2"); let s = recorder.surface.clone(); let out = recorder.output.clone();
     enqueue(&fx, &s, "i3-q2");
     for n in 1..=13 {
-        d9_refuse_queue_once(&fx, &s);
+        p1_refuse_queue_once(&fx, &s);
         assert_eq!(events(&fx, "writer.claim_escalated").len(), usize::from(n >= 3), "S-Q2: escalation edge at N=3, attempt {n}");
     }
     let ns: Vec<_> = aborted(&fx, &s).iter().map(|e| e["payload"]["refusal_n"].as_u64().unwrap_or(0)).collect();
@@ -1918,12 +1870,16 @@ fn d9_bound_i3_queue_refusals_are_counted_bounded_and_cleared() {
     assert_eq!(row["writer_claim"]["refusals_total"]["queue"], 13, "S-Q2: every refusal counted");
     assert_eq!(row["writer_claim"]["slots"]["queue"]["refusals"], 13);
     assert_eq!(row["writer_claim"]["slots"]["queue"]["last_foreign"], serde_json::json!(["input_gen"]));
-    assert!(std::fs::read(&out).unwrap().is_empty());
-    let observed = Instant::now();
-    while observed.elapsed() < Duration::from_millis(1100) { let _ = d9_status(&fx.daemon, s.id); std::thread::sleep(Duration::from_millis(20)); }
+    assert!(recorder.barrier().is_empty());
+    let observed = Instant::now()-Duration::from_secs(2);
+    s.claim_streaks.lock().unwrap()[0].as_mut().unwrap().updated_at=observed;
+    for _ in 0..8 {
+        let _=d9_status(&fx.daemon,s.id);
+        assert_eq!(s.claim_streaks.lock().unwrap()[0].as_ref().unwrap().updated_at,observed,"status reads preserve the actual age anchor");
+    }
     assert!(d9_status(&fx.daemon,s.id)["writer_claim"]["slots"]["queue"]["age_secs"].as_u64().unwrap_or(0)>=1,"status reads do not refresh the streak age");
     assert!(hand_off(&fx, &s), "S-Q2: delivered after fault removed");
-    wait_until("delivered", || queue_len(&s)==0);
+    p1_wait_completion(p1_writer_idle(&s), P1_GUARD).expect("delivery operation completed"); assert_eq!(queue_len(&s), 0);
     let row = d9_status(&fx.daemon, s.id);
     assert!(row["writer_claim"]["slots"]["queue"].is_null(), "S-Q2: delivery clears slot");
     assert_eq!(row["writer_claim"]["refusals_total"]["queue"],13);
@@ -1932,11 +1888,11 @@ fn d9_bound_i3_queue_refusals_are_counted_bounded_and_cleared() {
 #[test]
 #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
 fn d9_bound_i3_busy_holds_do_not_reset_refusals() {
-    let fx=fx("i3-q2b");let(s,_)=d9_master_recorder(&fx,"i3-q2b");enqueue(&fx,&s,"i3-q2b");
+    let fx=fx("i3-q2b");let mut recorder = p1_master_recorder(&fx, "i3-q2b"); let s = recorder.surface.clone(); let out = recorder.output.clone();enqueue(&fx,&s,"i3-q2b");
     for _ in 0..3 {
-        d9_refuse_queue_once(&fx,&s);
-        let release=hold_writer(&s);assert!(!hand_off(&fx,&s));release.send(()).unwrap();
-        wait_until("idle",||s.write_tx.gate().pending()==0);
+        p1_refuse_queue_once(&fx,&s);
+        let release=p1_hold_writer(&s);assert!(!hand_off(&fx,&s));release.release();
+        p1_wait_completion(p1_writer_idle(&s), P1_GUARD).expect("writer operation completed");
     }
     assert_eq!(events(&fx,"writer.claim_escalated").len(),1,"S-Q2b: hold preserves the refusal streak");
     assert_eq!(d9_status(&fx.daemon,s.id)["writer_claim"]["slots"]["queue"]["refusals"],3);
@@ -1945,50 +1901,54 @@ fn d9_bound_i3_busy_holds_do_not_reset_refusals() {
 #[test]
 #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
 fn d9_bound_i3_busy_queue_escalates_once_then_delivers() {
-    let fx=fx("i3-q3");let(s,_)=d9_master_recorder(&fx,"i3-q3");enqueue(&fx,&s,"i3-q3");
+    let fx=fx("i3-q3");let mut recorder = p1_master_recorder(&fx, "i3-q3"); let s = recorder.surface.clone(); let out = recorder.output.clone();enqueue(&fx,&s,"i3-q3");
     let _knob=crate::governance::HKnobGuard::set(&[("CYS_WRITER_HOLD_ESCALATE_SECS","1")]);
-    let release=hold_writer(&s);let started=Instant::now();
-    while events(&fx,"writer.claim_escalated").is_empty() && started.elapsed()<Duration::from_secs(3) {
-        assert!(!hand_off(&fx,&s));std::thread::sleep(Duration::from_millis(20));
-    }
+    let release=p1_hold_writer(&s);
+    assert!(!hand_off(&fx,&s));
+    s.claim_streaks.lock().unwrap()[0].as_mut().expect("held queue slot").held_since = Some(Instant::now()-Duration::from_secs(2));
+    assert!(!hand_off(&fx,&s));
     let ev=events(&fx,"writer.claim_escalated");
     assert_eq!(ev.len(),1,"S-Q3: continuous busy escalates without resetting its clock");
     assert_eq!(ev[0]["payload"]["cause"],"not_idle");assert_eq!(ev[0]["payload"]["refusals"],0);
     for _ in 0..3 { assert!(!hand_off(&fx,&s)); }
     assert_eq!(events(&fx,"writer.claim_escalated").len(),1,"S-Q3: one event per streak");
-    release.send(()).unwrap();wait_until("idle",||s.write_tx.gate().pending()==0);
+    release.release();p1_wait_completion(p1_writer_idle(&s), P1_GUARD).expect("writer operation completed");
     assert!(hand_off(&fx,&s),"S-Q3: first idle attempt delivers");
 }
 
 #[test]
 #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
 fn d9_bound_i3_idle_nonwriter_hold_breaks_busy_continuity() {
-    let fx=fx("i3-f3a");let(s,_)=d9_master_recorder(&fx,"i3-f3a");enqueue(&fx,&s,"i3-f3a");
+    let fx=fx("i3-f3a");let recorder=p1_master_recorder(&fx,"i3-f3a");let s=recorder.surface.clone();enqueue(&fx,&s,"i3-f3a");
     let _knob=crate::governance::HKnobGuard::set(&[("CYS_WRITER_HOLD_ESCALATE_SECS","1")]);
-    let release=hold_writer(&s);assert!(!hand_off(&fx,&s));release.send(()).unwrap();wait_until("idle",||s.write_tx.gate().pending()==0);
+    let holder=p1_hold_writer(&s);assert!(!hand_off(&fx,&s));holder.release();
+    let old=Instant::now()-Duration::from_secs(2);
+    s.claim_streaks.lock().unwrap()[0].as_mut().unwrap().held_since=Some(old);
     *s.queue_paused_until.lock().unwrap()=Some(Instant::now()+Duration::from_secs(20));
     crate::governance::h_queue_tick(&fx.daemon);
-    std::thread::sleep(Duration::from_millis(1100));
+    { let slots=s.claim_streaks.lock().unwrap();let slot=slots[0].as_ref().unwrap();
+      assert!(slot.held_since.is_none() && slot.held_epoch.is_none(),"idle nonwriter hold synchronously clears both hold anchors"); }
     *s.queue_paused_until.lock().unwrap()=None;
-    let release=hold_writer(&s);assert!(!hand_off(&fx,&s));
+    let holder=p1_hold_writer(&s);assert!(!hand_off(&fx,&s));
+    assert!(s.claim_streaks.lock().unwrap()[0].as_ref().unwrap().held_since.unwrap()>old,"new hold owns a fresh anchor");
     assert!(events(&fx,"writer.claim_escalated").is_empty(),"S-F3a: idle non-writer interval must not count as continuously busy");
-    release.send(()).unwrap();
+    holder.release();
 }
 
 #[test]
 #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
 fn d9_bound_i3_controller_owned_claim_is_counted_once() {
-    let fx=fx("i3-controller");let(s,_)=d9_master_recorder(&fx,"i3-controller");enqueue(&fx,&s,"i3-controller");
-    // Synthetic API ownership control: the current tree has no production defer_to_controller caller.
-    let release=d9_late_hold(&s,None);let sc=s.clone();
-    let owner=std::thread::spawn(move || {
-        wait_until("reservation",||sc.inject_reserved());
-        let guard=sc.inject_reservation.lock().unwrap().as_ref().unwrap().guard.clone();
-        let(wake,_rx)=crate::state::controller_wake_channel();guard.defer_to_controller(wake).unwrap();
+    let fx=fx("i3-controller"); let recorder=p1_master_recorder(&fx,"i3-controller"); let s=recorder.surface.clone(); enqueue(&fx,&s,"i3-controller");
+    // Synthetic API ownership control: no production defer_to_controller caller.
+    let held=p1_late_hold(&s,None);
+    let action=p1_queue_action(&s,move |sc,_| {
+        let guard=sc.inject_reservation.lock().unwrap().as_ref().expect("actual reservation").guard.clone();
+        let(wake,_rx)=crate::state::controller_wake_channel(); guard.defer_to_controller(wake).unwrap();
         sc.input_gen.fetch_add(1,Ordering::AcqRel);
-        release.recv_timeout(Duration::from_secs(10)).expect("late seam").send(()).unwrap();
+        held.lock().unwrap().take().expect("late seam holder").release();
     });
-    let _=hand_off(&fx,&s);owner.join().unwrap();wait_until("controller terminal",||s.write_tx.gate().pending()==0);
+    let _=hand_off(&fx,&s); action.finish();
+    p1_wait_completion(p1_writer_idle(&s),P1_GUARD).expect("controller terminal");
     assert_eq!(d9_status(&fx.daemon,s.id)["writer_claim"]["refusals_total"]["queue"],1,"controller claim refusal counted exactly once");
     assert_eq!(hold_kind(&s),Some(QueueHoldKind::Refused),"controller disposition/backoff unchanged");
 }
@@ -2003,15 +1963,15 @@ fn d9_bound_i3_status_key_present_and_null_outside_scope() {
 #[test]
 #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
 fn d9_bound_i3_late_refusal_does_not_restore_a_replaced_head_slot() {
-    let fx=fx("i3-head-race");let(s,_)=d9_master_recorder(&fx,"i3-head-race");enqueue(&fx,&s,"old head");
+    let fx=fx("i3-head-race");let recorder=p1_master_recorder(&fx,"i3-head-race");let s=recorder.surface.clone();enqueue(&fx,&s,"old head");
     let next=fx.daemon.next_queue_entry("[RESUME] new head".into(),None,"test");
-    let release=d9_late_hold(&s,Some(b"T"));let sc=s.clone();
-    let inserter=std::thread::spawn(move || {
-        wait_until("reservation",||sc.inject_reserved());
+    let held=p1_late_hold(&s,Some(b"T"));
+    let action=p1_queue_action(&s,move |sc,_| {
         sc.pending_queue.lock().unwrap().push_front(next);
-        release.recv_timeout(Duration::from_secs(10)).expect("late seam").send(()).unwrap();
+        held.lock().unwrap().take().expect("late holder").release();
     });
-    let _=hand_off(&fx,&s);inserter.join().unwrap();wait_until("terminal",||s.write_tx.gate().pending()==0);
+    let _=hand_off(&fx,&s);action.finish();
+    p1_wait_completion(p1_writer_idle(&s),P1_GUARD).expect("terminal");
     let row=d9_status(&fx.daemon,s.id);
     assert!(row["writer_claim"]["slots"]["queue"].is_null(),"late refusal must not recreate a slot for the former head");
     assert_eq!(row["writer_claim"]["refusals_total"]["queue"],1,"historical refusal still counted");
@@ -2043,11 +2003,41 @@ pub(crate) fn p1_start_completion<T>(
 }
 
 /// Only an admitted operation can reach this named completion guard.
-pub(crate) fn p1_wait_completion<T>(
+pub(crate) fn p1_wait_completion<T: Send + 'static>(
     admitted: Result<P1Admitted<T>, P1WaitError>,
     guard: Duration,
 ) -> Result<T, P1WaitError> {
-    let P1Admitted { event, receiver } = admitted?;
+    let P1Admitted { event, mut receiver } = admitted?;
+    let mut guard = guard;
+    let fault = P1_COMPLETION_CONTROL.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        slot.as_mut().filter(|c| !c.consumed && c.event == event && !guard.is_zero()).map(|c| {
+            c.consumed = true; c.fault
+        })
+    });
+    // Fault controls are installed only by the caller-control test. Admission above is real.
+    let mut retained_sender = None;
+    match fault {
+        Some(P1CompletionFault::Delayed) => {
+            let (tx, delayed) = std::sync::mpsc::channel();
+            let relay = std::thread::spawn(move || {
+                let actual = receiver.recv();
+                // Inject delayed delivery of the ACTUAL event, not a successful replacement value.
+                std::thread::sleep(Duration::from_millis(100));
+                if let Ok(value) = actual { let _ = tx.send(value); }
+            });
+            P1_COMPLETION_CONTROL.with(|slot| slot.borrow_mut().as_mut().unwrap().relays.push(relay));
+            receiver = delayed;
+        }
+        Some(P1CompletionFault::Missing) => {
+            let (tx, missing) = std::sync::mpsc::channel();
+            retained_sender = Some(tx); // no disconnect masquerading as the named guard
+            receiver = missing; // deliberately withhold the real producer's completion
+            guard = Duration::ZERO;
+        }
+        None => {}
+    }
+    let _retain_through_wait = retained_sender;
     match receiver.recv_timeout(guard) { // wallclock: guard receipt of the admitted producer's named completion event
         Ok(value) => Ok(value),
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(P1WaitError::CompletionTimeout { event }),
@@ -2449,6 +2439,9 @@ pub(crate) struct P1WriterHold {
 }
 impl P1WriterHold {
     pub(crate) fn release_signal(mut self) -> Result<P1Admitted<()>, P1WaitError> {
+        assert_eq!(p1_wait_completion(p1_writer_idle(&self.surface), Duration::ZERO),
+            Err(P1WaitError::CompletionTimeout { event: "writer operation leases released" }),
+            "retained actual holder must fail at its named completion guard");
         self.release.take().unwrap().send(()).expect("held writer still owns release receiver");
         p1_writer_idle(&self.surface)
     }
@@ -2499,7 +2492,7 @@ pub(crate) fn p1_late_hold(s: &Arc<Surface>, bytes: Option<&'static [u8]>) -> Ar
 
 
 #[test]
-#[cfg_attr(not(unix), ignore = "raw PTY recorder uses POSIX tty")]
+#[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
 fn p1_completion_recorder_barrier_covers_delayed_extra_bytes() {
     let fx = fx("p1-recorder-control");
     let mut recorder = p1_recorder(&fx.daemon, &fx.dir, "control", Some("master"));
@@ -2523,7 +2516,7 @@ fn p1_completion_recorder_barrier_covers_delayed_extra_bytes() {
 }
 
 #[test]
-#[cfg_attr(not(unix), ignore = "raw PTY recorder uses POSIX tty")]
+#[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
 fn p1_completion_explicit_holder_does_not_release_before_owner() {
     let fx = fx("p1-holder-control");
     let mut recorder = p1_recorder(&fx.daemon, &fx.dir, "hold", None);
@@ -2548,4 +2541,150 @@ pub(crate) fn p1_with_late_write_ahead<R>(s: &Arc<Surface>, call: impl FnOnce() 
 pub(crate) fn p1_s0_foreign_write_after_pre_record(s: &Arc<Surface>, bytes: &'static [u8]) {
     let s = s.clone();
     crate::agent_write::set_test_after_pre_record(move |_| p1_write_finished(&s, bytes));
+}
+
+/// Worker starts ONLY in the real post-enqueue reservation callback; no reservation poll.
+struct P1QueueAction<T> {
+    _observer: P1QueueReservationObserver,
+    completion: std::rc::Rc<std::cell::RefCell<Option<Result<P1Admitted<T>, P1WaitError>>>>,
+    worker: std::rc::Rc<std::cell::RefCell<Option<std::thread::JoinHandle<()>>>>,
+}
+impl<T: Send + 'static> P1QueueAction<T> {
+    fn finish(self) -> T {
+        let admitted = self.completion.borrow_mut().take().unwrap_or_else(|| Err(P1WaitError::Admission {
+            event: "queue reservation action completed", reason: "no successful enqueue/reservation callback".into(),
+        }));
+        let result = p1_wait_completion(admitted, P1_GUARD);
+        if let Some(worker) = self.worker.borrow_mut().take() { worker.join().expect("queue action worker joined"); }
+        result.expect("admitted queue action completion")
+    }
+}
+fn p1_queue_action<T: Send + 'static>(
+    s: &Arc<Surface>, action: impl FnOnce(Arc<Surface>, String) -> T + Send + 'static,
+) -> P1QueueAction<T> {
+    let completion = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let worker = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let record = completion.clone(); let record_worker = worker.clone();
+    let observer = p1_on_queue_reserved(s.id, move |surface, request| {
+        let surface = surface.clone(); let request_id = request.id.clone();
+        let admitted = p1_start_completion("queue reservation action completed", |tx| {
+            let worker = std::thread::Builder::new().spawn(move || {
+                let result = action(surface, request_id);
+                let _ = tx.send(result);
+            }).map_err(|e| format!("queue action worker admission: {e}"))?;
+            *record_worker.borrow_mut() = Some(worker);
+            Ok(())
+        });
+        *record.borrow_mut() = Some(admitted);
+    });
+    P1QueueAction { _observer: observer, completion, worker }
+}
+
+fn p1_master_recorder(fx: &Fx, tag: &str) -> P1Recorder {
+    let recorder = p1_recorder(&fx.daemon, &fx.dir, tag, Some("master"));
+    recorder.install_always_admit();
+    assert!(crate::governance::d9_scope(&fx.daemon, &recorder.surface, false));
+    recorder
+}
+
+fn p1_refuse_queue_once(fx: &Fx, s: &Arc<Surface>) {
+    let sc = s.clone();
+    crate::agent_write::set_test_after_pre_record(move |_| { sc.input_gen.fetch_add(1, Ordering::AcqRel); });
+    assert!(!hand_off(fx, s), "claim refuses injected foreign input");
+    p1_wait_completion(p1_writer_idle(s), P1_GUARD).expect("refused queue operation settled");
+}
+
+fn p1_dialog_recorder(fx: &Fx, tag: &str, master: bool) -> P1Recorder {
+    let recorder = p1_recorder(&fx.daemon, &fx.dir, tag, master.then_some("master"));
+    let s = &recorder.surface;
+    assert_eq!(crate::governance::d9_scope(&fx.daemon, s, false), master);
+    d9_paint(s, &D9_DIALOG, 1, 8);
+    let ctx = crate::governance::submit_cr_guard_context(s).expect("prompt markers resolve");
+    assert!(ctx.dialog_at_handoff);
+    d9_paint(s, &[], 0, 0);
+    *s.receiver_proof.lock().unwrap() = Some(Arc::new(DialogAtSubmitOnce {
+        seat: Arc::downgrade(s), painted: std::sync::atomic::AtomicBool::new(false),
+    }));
+    recorder
+}
+
+
+struct P1PauseAtSubmit {
+    entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+    paused: Arc<std::sync::atomic::AtomicBool>,
+}
+impl Proof for P1PauseAtSubmit {
+    fn admit(&self) -> Result<(), ProofLoss> { Ok(()) }
+    fn recheck(&self, phase: Phase) -> Result<(), ProofLoss> {
+        if phase == Phase::Submit {
+            if let Some(entered) = self.entered.lock().unwrap().take() {
+                self.paused.store(true, Ordering::Release);
+                let _ = entered.send(());
+                let _ = self.release.lock().unwrap().recv();
+                self.paused.store(false, Ordering::Release);
+            }
+        }
+        Ok(())
+    }
+}
+
+
+#[derive(Clone, Copy, Debug)]
+enum P1CompletionFault { Delayed, Missing }
+struct P1CompletionControl {
+    event: &'static str,
+    fault: P1CompletionFault,
+    consumed: bool,
+    relays: Vec<std::thread::JoinHandle<()>>,
+}
+thread_local! {
+    static P1_COMPLETION_CONTROL: std::cell::RefCell<Option<P1CompletionControl>> = const { std::cell::RefCell::new(None) };
+}
+
+#[test]
+#[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+fn p1_completion_wc1_each_case_delayed_and_missing_actual_receipt() {
+    let cases: &[(&str, fn(), &str)] = &[
+        ("row14", d9_pre_cr_t_l1_a_human_byte_during_the_settle_lands_after_the_cr, "admitted queue body acknowledged before held CR"),
+        ("row18", d9_pre_cr_t_w3c_outside_d9_scope_the_queue_job_proof_is_unchanged, "writer operation leases released"),
+        ("row1", d9_bound_i2_late_busy_undoes_owned_marks_without_refusal, "writer operation leases released"),
+        ("row2", d9_bound_i2_non_master_is_not_idle_gated, "queue reservation action completed"),
+        ("row3", d9_bound_i2_queue_busy_holds_then_first_idle_pass_delivers, "writer operation leases released"),
+        ("row4", d9_bound_i2_slot_lifecycle_and_head_replacement, "writer operation leases released"),
+        ("row5", d9_bound_i2_writer_hold_keeps_queue_alarms_live, "writer operation leases released"),
+        ("row6", d9_bound_i3_busy_holds_do_not_reset_refusals, "writer operation leases released"),
+        ("row7", d9_bound_i3_busy_queue_escalates_once_then_delivers, "writer operation leases released"),
+        ("row8", d9_bound_i3_controller_owned_claim_is_counted_once, "queue reservation action completed"),
+        ("row9", d9_bound_i3_idle_nonwriter_hold_breaks_busy_continuity, "writer operation leases released"),
+        ("row10", d9_bound_i3_late_refusal_does_not_restore_a_replaced_head_slot, "queue reservation action completed"),
+        ("row11", d9_bound_i3_queue_refusals_are_counted_bounded_and_cleared, "writer operation leases released"),
+        ("row12", d9_bound_t_s0_a_write_finished_between_judgment_and_hand_off_refuses_the_claim, "foreign writer operation released"),
+        ("row13", d9_bound_t_s0h_a_human_key_time_between_judgment_and_hand_off_refuses_the_claim, "writer operation leases released"),
+        ("row15", d9_pre_cr_t_w1_a_write_ahead_inside_the_r1_window_refuses_the_claim, "queue reservation action completed"),
+        ("row16", d9_pre_cr_t_w2_a_human_key_inside_the_r1_window_refuses_the_claim, "queue reservation action completed"),
+    ];
+    for &(name, case, event) in cases {
+        for fault in [P1CompletionFault::Delayed, P1CompletionFault::Missing] {
+            P1_COMPLETION_CONTROL.with(|slot| {
+                assert!(slot.borrow().is_none());
+                *slot.borrow_mut() = Some(P1CompletionControl { event, fault, consumed: false, relays: Vec::new() });
+            });
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(case));
+            let control = P1_COMPLETION_CONTROL.with(|slot| slot.borrow_mut().take().unwrap());
+            for relay in control.relays { relay.join().expect("completion relay exits after fixture cleanup"); }
+            assert!(control.consumed, "{name}: actual named receipt was never reached: {event}");
+            match fault {
+                P1CompletionFault::Delayed => assert!(outcome.is_ok(), "{name}: delayed actual completion changed verdict"),
+                P1CompletionFault::Missing => {
+                    let panic = outcome.expect_err("missing actual completion must fail");
+                    let message = panic.downcast_ref::<String>().cloned()
+                        .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
+                    assert!(message.contains("CompletionTimeout") && message.contains(event),
+                        "{name}: missing completion must fail at named guard, got {message}");
+                }
+            }
+            println!("P1-CONTROL {name} {fault:?}: {event}");
+        }
+    }
 }
