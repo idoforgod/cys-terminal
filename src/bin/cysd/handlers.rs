@@ -6854,6 +6854,29 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
                     ));
                 }
             }
+            // ★(0.14.56 · P1 D4 · design r2 §5) `cycle_clear:true` marks the cycle's own clear. Valid only with the caller's own live
+            //   `surface.cycle_claim` (governance::cycle_clear_claimed); otherwise refused here, before any write, with a transient
+            //   code the CLI holds on. Absent -> today's path exactly.
+            let cycle_clear = params.get("cycle_clear").and_then(|v| v.as_bool()).unwrap_or(false);
+            if cycle_clear {
+                if !clear_first {
+                    return Reply::Single(err_response(&id, "invalid_params", "cycle_clear requires clear_first"));
+                }
+                let mono = crate::usage::ctx_guard_now(daemon);
+                let claimed = governance::cycle_clear_claimed(
+                    caller_pid,
+                    surface.cycle_claim.lock().unwrap_or_else(|e| e.into_inner()).as_ref(),
+                    mono,
+                );
+                if !claimed {
+                    return Reply::Single(err_response(
+                        &id,
+                        "cycle_clear_unclaimed",
+                        "zero bytes written: cycle_clear needs this caller's own live surface.cycle_claim on the seat \
+                         (no claim, another or no pid, or expired); nothing was typed",
+                    ));
+                }
+            }
             // ★(0.14.42 · 설계 C D3) clear_first 는 원자 Inject(울타리)로 나간다 — 원장 선기록과 주입이 **같은
             //   살균 본문**을 쓰도록 여기서 한 번 살균한다(writer 백스톱과 같은 값 · 표지 없는 `/clear` 는 바이트
             //   동일 · 무clear 무변경). 직접 비-clear 경로는 원문 그대로다(울타리 판정은 아래 D5′).
@@ -33406,5 +33429,102 @@ mod d9_writer_guard_tests {
         let st = stalled(&f.daemon);
         assert_eq!(st.len(), 1, "{st:?}");
         assert_eq!(st[0]["payload"]["reason"], json!("ceo_write_refused"), "{st:?}");
+    }
+}
+
+/// ★(0.14.56 · P1 E L-CYCLE · design r2 §3-§6, §8, §15) The cycle-clear chain: specimens that drive `surface.send_text` through
+/// `dispatch` on a recorder seat (`stty raw -echo; exec cat > file`), so the receiver's bytes are the write witness.
+#[cfg(test)]
+mod p1_cycle_tests {
+    use super::*;
+    use crate::agent_queue_tests::{d9_received, fx, wait_until, Fx};
+
+    /// An agent seat (claude meta, no role) whose receiver records every byte; its receiver proof is the default PassThrough.
+    fn recorder(f: &Fx, tag: &str) -> (Arc<crate::state::Surface>, std::path::PathBuf) {
+        let out = f.dir.join(format!("rx-{tag}.bin"));
+        let cmd = format!("stty raw -echo; exec cat > '{}'", out.display());
+        let s = f.daemon.create_surface(None, Some(cmd), None, None, 24, 200).expect("recorder seat");
+        f.daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        wait_until("recorder ready", || out.exists());
+        std::thread::sleep(std::time::Duration::from_millis(300)); // stty applied before the first byte
+        *s.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+        (s, out)
+    }
+
+    fn clear(f: &Fx, pid: Option<u32>, s: &Arc<crate::state::Surface>, extra: Value) -> Value {
+        let mut p = json!({"surface_id": s.id, "text": "/clear", "clear_first": true, "quiet": true});
+        if let (Some(m), Some(e)) = (p.as_object_mut(), extra.as_object()) {
+            m.extend(e.clone());
+        }
+        let req = Request { id: json!(7), method: "surface.send_text".into(), params: p };
+        let Reply::Single(resp) = dispatch(&f.daemon, req, pid) else {
+            panic!("expected single reply");
+        };
+        resp
+    }
+
+    fn claim(s: &crate::state::Surface, pid: Option<u32>, mono: f64) {
+        *s.cycle_claim.lock().unwrap() =
+            Some(crate::state::CycleClaim { pid, since: crate::state::now_epoch(), mono, fire_id: None });
+    }
+
+    /// The bytes ONE atomic clear of `/clear` puts on the wire (the OwnedClear plan).
+    fn clear_bytes() -> Vec<u8> {
+        crate::agent_write::Plan::paste("/clear")
+            .with_clear(crate::state::clear_settle_ms())
+            .with_submit(400, 0)
+            .planned_bytes()
+    }
+
+    /// T-D4 (r2 §5): `cycle_clear:true` is valid iff the caller's pid and the claim's pid are both present, equal, and the claim
+    /// is not expired; every other combination is refused with `cycle_clear_unclaimed` and 0 bytes. The seat's bytes after all
+    /// refusals are exactly one valid cycle clear plus one plain `--clear-first` (absent -> today's path, no claim needed).
+    /// Mutants: allow a pid-less claim; compare the two `Option`s directly (None == None).
+    #[test]
+    #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+    fn p1_e_t_d4_cycle_clear_needs_the_callers_own_live_claim() {
+        let f = fx("p1e-td4");
+        let (s, out) = recorder(&f, "td4");
+        let me = std::process::id();
+        let mut other = std::process::Command::new("sleep").arg("30").spawn().expect("a second live process");
+        let other_pid = other.id();
+        let now = crate::usage::ctx_guard_now(&f.daemon);
+        let cycle = json!({"cycle_clear": true});
+        let cells: Vec<(&str, Option<(Option<u32>, f64)>, Option<u32>)> = vec![
+            ("no claim", None, Some(me)),
+            ("pid-less claim, caller known", Some((None, now)), Some(me)),
+            ("pid-less claim, caller unresolved", Some((None, now)), None),
+            ("claim of another live pid", Some((Some(other_pid), now)), Some(me)),
+            ("own claim, expired by age", Some((Some(me), now - crate::state::CYCLE_CLAIM_MAX_SECS - 1.0)), Some(me)),
+            ("own claim, caller unresolved", Some((Some(me), now)), None),
+        ];
+        for (label, c, caller) in cells {
+            *s.cycle_claim.lock().unwrap() = None;
+            if let Some((pid, mono)) = c {
+                claim(&s, pid, mono);
+            }
+            let resp = clear(&f, caller, &s, cycle.clone());
+            assert_eq!(resp["error"]["code"], json!("cycle_clear_unclaimed"), "{label}: {resp}");
+            assert!(!resp.to_string().contains("quiet_secs_unreported"), "{label}: a transient code, never the structural token");
+            assert_eq!(s.write_tx.gate().pending(), 0, "{label}: nothing handed to the writer");
+        }
+        *s.cycle_claim.lock().unwrap() = None;
+        let r = {
+            let req = Request { id: json!(8), method: "surface.cycle_claim".into(), params: json!({"surface_id": s.id}) };
+            let Reply::Single(resp) = dispatch(&f.daemon, req, Some(me)) else { panic!("expected single reply") };
+            resp
+        };
+        assert_eq!(r["result"]["claim"], json!("claimed"), "{r}");
+        let ok = clear(&f, Some(me), &s, cycle.clone());
+        assert_eq!(ok["result"]["sent"], json!(true), "the caller's own live claim: valid ({ok})");
+        let plain = clear(&f, Some(me), &s, json!({}));
+        assert_eq!(plain["result"]["sent"], json!(true), "plain --clear-first: today's path ({plain})");
+        let mut want = clear_bytes();
+        want.extend(clear_bytes());
+        let got = d9_received(&out, want.len());
+        let _ = other.kill();
+        let _ = other.wait();
+        let _ = s.child.lock().unwrap().kill();
+        assert_eq!(got, want, "exactly one valid cycle clear and one plain clear reached the seat - every refusal wrote 0 bytes");
     }
 }

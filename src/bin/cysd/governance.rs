@@ -7490,6 +7490,21 @@ pub(crate) fn draft_gate(
     }
 }
 
+/// ★(0.14.56 · P1 D4 · design r2 §5) Is a `cycle_clear:true` request backed by its caller's own cycle claim? Valid iff the
+/// kernel caller pid and the claim's pid are both present, equal, and the claim is not expired (`CycleClaim::expired`: the pid is
+/// dead or the claim is older than its maximum age, on the daemon's monotonic clock `mono_now`). A pid-less claim is never a
+/// match: `surface.cycle_claim` release accepts one, and busy rejects one, so it names no process. Pure.
+pub(crate) fn cycle_clear_claimed(
+    caller_pid: Option<u32>,
+    claim: Option<&crate::state::CycleClaim>,
+    mono_now: f64,
+) -> bool {
+    let (Some(caller), Some(c)) = (caller_pid, claim) else {
+        return false;
+    };
+    c.pid == Some(caller) && !c.expired(mono_now)
+}
+
 /// 미제출 입력 계수 v2 상태기계 — surface 별 상태(정의처 단일 · handlers send_text/send_key 둘 다 이것만 쓴다).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PendingInputState {
