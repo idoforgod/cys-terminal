@@ -2560,6 +2560,8 @@ fn submit_settle_proof(
         }),
         // ★(수정 2회차 FV1-1) pause 중 정착 재시도 거부는 증명하지 않는다(재시도가 pause 를 뚫는다).
         DraftGateDenied::HumanDraft { .. } | DraftGateDenied::Modal | DraftGateDenied::Paused => None,
+        // ★(0.14.56 · P1 D3) cycle clear only (ClearFirst) - never a Text settle refusal; no proof.
+        DraftGateDenied::OwnPasteSettling => None,
     }
 }
 
@@ -7086,7 +7088,22 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
                 ));
             }
             if let Some(kind) = gate_kind {
-                if let Some(why) = governance::draft_gate(daemon, &surface, kind) {
+                // ★(0.14.56 · P1 D3 · design r2 §4) A D4-valid cycle clear (`cycle_clear` is true only past the claim check
+                //   above) takes the cycle gate; every other send keeps `draft_gate` exactly.
+                let gate = if cycle_clear && kind == DirectSendKind::ClearFirst {
+                    governance::draft_gate_cycle_clear(daemon, &surface)
+                } else {
+                    governance::draft_gate(daemon, &surface, kind)
+                };
+                if gate == Some(DraftGateDenied::OwnPasteSettling) {
+                    return Reply::Single(err_response(
+                        &id,
+                        "own_paste_settling",
+                        "zero bytes written: the daemon's own paste into this seat is still being written or settling; nothing \
+                         was typed - observe the seat again and retry",
+                    ));
+                }
+                if let Some(why) = gate {
                     let settle = settle_on.then(|| submit_settle_proof_now(&surface, why)).flatten();
                     return Reply::Single(draft_gate_denied_response(
                         daemon, &surface, &id, kind, why, verified_from, None, settle,
@@ -33526,5 +33543,70 @@ mod p1_cycle_tests {
         let _ = other.wait();
         let _ = s.child.lock().unwrap().kill();
         assert_eq!(got, want, "exactly one valid cycle clear and one plain clear reached the seat - every refusal wrote 0 bytes");
+    }
+
+    /// A claude agent seat (a `sleep 30` child) on which the test paints the composer row; D1 governs it (measured platform).
+    fn painted(f: &Fx) -> Arc<crate::state::Surface> {
+        let s = f.daemon.create_surface(None, Some("sleep 30".into()), None, None, 24, 80).expect("create surface");
+        f.daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        *s.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+        s.d1_platform.store(true, Ordering::Relaxed);
+        s
+    }
+
+    /// Paint `❯ {typed}` with the cursor after it (a plain, non-dim run before the cursor).
+    fn paint(s: &crate::state::Surface, typed: &str) {
+        s.parser.lock().unwrap_or_else(|e| e.into_inner()).process(format!("\r\x1b[2K❯ {typed}").as_bytes());
+    }
+
+    fn own_claim(f: &Fx, s: &crate::state::Surface) {
+        claim(s, Some(std::process::id()), crate::usage::ctx_guard_now(&f.daemon));
+    }
+
+    fn gate_reason(resp: &Value) -> Option<String> {
+        (resp["error"]["code"] == json!(cys::ERR_TYPING_GUARD)).then(|| resp["error"]["message"].as_str().unwrap_or("").to_string())
+    }
+
+    /// T-G1 (r2 §4): only a D4-valid cycle clear gets the two changes in `draft_gate`. Our own paste active or settling ->
+    /// `own_paste_settling` (NOT the typing guard, which the CLI holds as a human draft), checked before the screen even when
+    /// the frame shows text; a frame proven to be the daemon's own unsubmitted body skips `ScreenOccupied`. Unproven text still
+    /// refuses a cycle clear, and every plain `--clear-first` keeps today's verdicts. Mutants: apply to every ClearFirst; skip
+    /// `ScreenOccupied` without the proof; map OwnPaste to the typing guard; test the screen before OwnPaste.
+    #[test]
+    fn p1_e_t_g1_cycle_clear_draft_gate_admits_proven_residue_and_holds_own_paste() {
+        let f = fx("p1e-tg1");
+        let me = Some(std::process::id());
+        let cycle = json!({"cycle_clear": true});
+        // Seat A: screen axis.
+        let a = painted(&f);
+        own_claim(&f, &a);
+        paint(&a, "residue body");
+        a.inject_track.note_body("residue body", None);
+        let plain = clear(&f, me, &a, json!({}));
+        let why = gate_reason(&plain).unwrap_or_else(|| panic!("plain --clear-first over a drawn line: today's refusal ({plain})"));
+        assert!(why.contains("[draft_gate:screen_occupied]"), "plain --clear-first keeps ScreenOccupied: {why}");
+        a.inject_track.note_body("another machine body", None);
+        let unproven = clear(&f, me, &a, cycle.clone());
+        let why = gate_reason(&unproven).unwrap_or_else(|| panic!("unproven text refuses a cycle clear ({unproven})"));
+        assert!(why.contains("[draft_gate:screen_occupied]"), "a cycle clear over unproven text: ScreenOccupied ({why})");
+        a.inject_track.note_body("residue body", None);
+        let proven = clear(&f, me, &a, cycle.clone());
+        assert_eq!(proven["result"]["sent"], json!(true), "proven machine residue + valid cycle clear passes draft_gate ({proven})");
+        // Seat B: our own paste is active.
+        let b = painted(&f);
+        own_claim(&f, &b);
+        paint(&b, "our paste in flight");
+        b.inject_track.begin();
+        let drawn = clear(&f, me, &b, cycle.clone());
+        assert_eq!(drawn["error"]["code"], json!("own_paste_settling"), "own paste drawn on the line: own_paste_settling ({drawn})");
+        paint(&b, "");
+        let empty = clear(&f, me, &b, cycle.clone());
+        assert_eq!(empty["error"]["code"], json!("own_paste_settling"), "own paste, empty line: own_paste_settling ({empty})");
+        assert!(!empty.to_string().contains("quiet_secs_unreported"), "a transient code, never the structural token");
+        let plain_b = clear(&f, me, &b, json!({}));
+        assert_eq!(plain_b["result"]["sent"], json!(true), "plain --clear-first during our own paste: today's path ({plain_b})");
+        b.inject_track.end();
+        let _ = a.child.lock().unwrap().kill();
+        let _ = b.child.lock().unwrap().kill();
     }
 }

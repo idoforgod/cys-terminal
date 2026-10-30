@@ -5783,6 +5783,10 @@ pub(crate) enum DraftGateDenied {
     /// `--queued` 로 넘어가 pause 동안 동결됐다). 줄이 비어 있어도 쓰지 않고 증명 없이 거부한다 → CLI 는 종전처럼
     /// `--queued` 1회(동결). 첫 직접 요청은 종전 그대로 pause 판정 대상이 아니다(pause 중 보고 경로).
     Paused,
+    /// ★(0.14.56 · P1 D3 · design r2 §4) A D4-valid cycle clear met the daemon's own paste still being written or inside
+    /// [`OWN_PASTE_SETTLE_MS`] - only [`draft_gate_cycle_clear`] makes it. Transient: the handler replies with its own code
+    /// `own_paste_settling`, never the typing guard (which the cycle CLI holds as a human draft, rc 85).
+    OwnPasteSettling,
 }
 
 impl DraftGateDenied {
@@ -5794,6 +5798,7 @@ impl DraftGateDenied {
             Self::Modal => "modal",
             Self::SubmitSettling => "submit_settling",
             Self::Paused => "paused",
+            Self::OwnPasteSettling => "own_paste_settling",
         }
     }
 }
@@ -7431,6 +7436,24 @@ pub(crate) fn draft_gate(
     s: &Arc<crate::state::Surface>,
     kind: DirectSendKind,
 ) -> Option<DraftGateDenied> {
+    draft_gate_with(daemon, s, kind, false)
+}
+
+/// ★(0.14.56 · P1 D3 · design r2 §4) The draft gate of a D4-valid cycle clear (the handler decides validity once and calls this
+/// only then). Two changes from [`draft_gate`], same observation: the daemon's own paste active or settling refuses with
+/// [`DraftGateDenied::OwnPasteSettling`] whatever the line renders (after the human count, before the screen); a line proven to be
+/// the daemon's own machine body ([`draft_machine_owned`] residue, raw human 0) is not "occupied". Every other verdict is
+/// [`draft_gate`]'s.
+pub(crate) fn draft_gate_cycle_clear(daemon: &Arc<Daemon>, s: &Arc<crate::state::Surface>) -> Option<DraftGateDenied> {
+    draft_gate_with(daemon, s, DirectSendKind::ClearFirst, true)
+}
+
+fn draft_gate_with(
+    daemon: &Arc<Daemon>,
+    s: &Arc<crate::state::Surface>,
+    kind: DirectSendKind,
+    cycle_clear: bool,
+) -> Option<DraftGateDenied> {
     let pending = s.pending_input_bytes.load(Ordering::Relaxed);
     let human_pending = s.pending_input.lock().unwrap_or_else(|e| e.into_inner()).human.min(pending);
     if let Some(why) = draft_gate_verdict(kind, pending, human_pending, None, false, false) {
@@ -7469,6 +7492,16 @@ pub(crate) fn draft_gate(
             return Some(why);
         }
     }
+    // ★(0.14.56 · P1 D3 · design r2 §4) Cycle clear only, from THIS observation's before-cursor text: our own paste is a transient
+    //   refusal before the screen axis; a proven machine residue is not an occupied line.
+    let machine = cycle_clear.then(|| draft_machine_owned(s, line.as_ref().map(|l| l.before_cursor)));
+    if machine == Some(Some(MachineDraft::OwnPaste)) {
+        return Some(DraftGateDenied::OwnPasteSettling);
+    }
+    let proven_residue = matches!(
+        machine,
+        Some(Some(MachineDraft::MachineResidue { .. } | MachineDraft::SubmittedResidue { .. }))
+    );
     let approval_pending = approval_or_gate_pending(daemon, s.id);
     // ★(0.14.56 · P1 R-5 · design r3 §4-5) Measured seat: "screen occupied" is the D1 verdict's draft reading, so a Home-moved
     //   draft (text after the cursor, not dim) refuses a direct Text/SubmitKey/ClearFirst; a suggestion passes as before.
@@ -7482,10 +7515,13 @@ pub(crate) fn draft_gate(
             kind,
             pending,
             human_pending,
-            reading == Some(false),
+            reading == Some(false) && !proven_residue,
             selector_row,
             approval_pending,
         ),
+        None if proven_residue => {
+            draft_gate_verdict_occupied(kind, pending, human_pending, false, selector_row, approval_pending)
+        }
         None => draft_gate_verdict(kind, pending, human_pending, line, selector_row, approval_pending),
     }
 }
@@ -17424,10 +17460,13 @@ mod tests {
     #[test]
     fn u8_p1_text_arm_holds_on_a_foreground_modal_source_pin() {
         let src = include_str!("governance.rs");
+        // ★(0.14.56 · P1 D3) `draft_gate` and `draft_gate_cycle_clear` share ONE body, `draft_gate_with`; the axes live there.
+        let wrapper = src.split("\npub(crate) fn draft_gate(").nth(1).expect("draft_gate 소실").split("\n}\n").next().unwrap();
+        assert!(wrapper.contains("draft_gate_with(daemon, s, kind, false)"), "draft_gate 가 공유 본문을 부르지 않는다");
         let body = src
-            .split("\npub(crate) fn draft_gate(")
+            .split("\nfn draft_gate_with(")
             .nth(1)
-            .expect("draft_gate 소실")
+            .expect("draft_gate_with 소실")
             .split("\n}\n")
             .next()
             .unwrap();
