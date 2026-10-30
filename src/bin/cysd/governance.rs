@@ -11794,6 +11794,10 @@ pub(crate) fn deliver_head_locked(
         *s.inject_reservation.lock().unwrap() = guard.as_ref().map(|g| {
             crate::state::InjectReservation { ids: d.merged_ids.clone(), guard: g.clone() }
         });
+        #[cfg(test)]
+        crate::agent_queue_tests::p1_queue_reservation_admitted(
+            s, handed.as_ref().expect("successful enqueue owns request").as_ref(),
+        );
         Some(d)
     };
     if let Some(e) = expired_head {
