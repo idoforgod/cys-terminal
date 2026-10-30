@@ -2125,3 +2125,99 @@ fn p1_completion_one_producers_receipt_cannot_complete_another() {
     assert_eq!(p1_wait_completion(first, Duration::ZERO), Ok(1));
     drop(held);
 }
+
+
+/// Register at a real per-instance idle event; callers must first check their producer admission.
+pub(crate) fn p1_writer_idle(s: &Arc<Surface>) -> Result<P1Admitted<()>, P1WaitError> {
+    p1_start_completion("writer operation leases released", |tx| s.write_tx.gate().p1_subscribe_idle(tx))
+}
+
+/// Ordinary supervisor only. Returning `()` from the producer cannot fabricate admission.
+/// The caller disables test_sync_settle before invoking this asynchronous adapter.
+pub(crate) fn p1_supervisor_call<R>(
+    s: &Arc<Surface>, call: impl FnOnce() -> R,
+) -> (R, Result<P1Admitted<crate::agent_write::Terminal>, P1WaitError>) {
+    let seen = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let failure = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let mut result = None;
+    let admitted = p1_start_completion("ordinary supervisor settlement", |tx| {
+        let seen_at_admit = seen.clone();
+        let failure_at_admit = failure.clone();
+        let _observer = crate::agent_write::p1_observe_admission(s.id, "supervisor", move |request| {
+            seen_at_admit.set(seen_at_admit.get() + 1);
+            *failure_at_admit.borrow_mut() = request.p1_subscribe_supervisor_completion(tx).err();
+        });
+        result = Some(call());
+        if seen.get() != 1 { return Err(format!("expected one real supervisor enqueue receipt, observed {}", seen.get())); }
+        if let Some(reason) = failure.borrow_mut().take() { return Err(reason); }
+        Ok(())
+    });
+    (result.expect("producer returned"), admitted)
+}
+
+#[test]
+fn p1_completion_supervisor_early_and_late_observers_see_post_settlement() {
+    use crate::agent_write::{Request, AgentJob, Plan, WriterIo};
+    let request = Request::new("p1-supervisor".into(), 7, "supervisor", "d".into());
+    let early = p1_start_completion("early supervisor terminal", |tx| request.p1_subscribe_supervisor_completion(tx));
+    let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let completed_at_settle = completed.clone();
+    let job = AgentJob { request: request.clone(), plan: Plan::raw("x"),
+        proof: Scripted::new(0, ProofLoss::AgentDead, None), journal: None, attempt: None, resume: None,
+        settle: Some(Box::new(move |_| { completed_at_settle.store(true, Ordering::Release); })),
+        guard: None, note_body: false, body_owner: None };
+    let mut anchor = None; let mut first = || {}; let mut body = |_: &str| {};
+    let mut io = WriterIo { sleep: &|_| {}, last_program_write: &mut anchor, on_first_byte: &mut first, on_body_written: &mut body };
+    let mut writer = Vec::new();
+    let executed = crate::agent_write::execute(&mut writer, &job, &mut io);
+    assert!(matches!(early.as_ref().unwrap().receiver.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)), "execute is not settlement");
+    let terminal = crate::agent_write::finish(job, &executed);
+    assert!(completed.load(Ordering::Acquire));
+    assert_eq!(p1_wait_completion(early, Duration::ZERO), Ok(terminal.clone()));
+    let late = p1_start_completion("late supervisor terminal", |tx| request.p1_subscribe_supervisor_completion(tx));
+    assert_eq!(p1_wait_completion(late, Duration::ZERO), Ok(terminal));
+    let other = Request::new("not-supervisor".into(), 7, "queue", "d".into());
+    assert!(matches!(p1_start_completion("reject queue", |tx| other.p1_subscribe_supervisor_completion(tx)), Err(P1WaitError::Admission { .. })));
+    let managed = Request::new_managed("managed".into(), 7, "supervisor", "d".into(), &Plan::raw("x"));
+    assert!(matches!(p1_start_completion("reject managed", |tx| managed.p1_subscribe_supervisor_completion(tx)), Err(P1WaitError::Admission { .. })));
+}
+
+#[test]
+fn p1_completion_admission_observer_is_scoped_and_one_shot() {
+    crate::agent_write::set_test_sync_settle(false);
+    let seen = std::rc::Rc::new(std::cell::Cell::new(0));
+    let seen_inner = seen.clone();
+    let observer = crate::agent_write::p1_observe_admission(7, "supervisor", move |_| seen_inner.set(seen_inner.get()+1));
+    let wrong = crate::agent_write::Request::new("wrong".into(), 8, "supervisor", "d".into());
+    crate::agent_write::test_wait_settled(&wrong);
+    assert_eq!(seen.get(), 0);
+    let right = crate::agent_write::Request::new("right".into(), 7, "supervisor", "d".into());
+    crate::agent_write::test_wait_settled(&right);
+    crate::agent_write::test_wait_settled(&right);
+    assert_eq!(seen.get(), 1);
+    drop(observer);
+    crate::agent_write::test_wait_settled(&right);
+    assert_eq!(seen.get(), 1);
+    crate::agent_write::set_test_sync_settle(true);
+}
+
+#[test]
+fn p1_completion_idle_ack_is_after_release_and_late_subscription_is_safe() {
+    let (sender, receiver) = crate::writer_gate::WriterSender::channel(4);
+    sender.send(crate::state::WriteReq::Data(vec![1])).unwrap(); // actual admission
+    let queued = receiver.recv().unwrap();
+    let admitted = p1_start_completion("owned operation release", |tx| sender.gate().p1_subscribe_idle(tx));
+    assert!(matches!(admitted.as_ref().unwrap().receiver.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+    let (release, held) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || { held.recv().unwrap(); drop(queued); });
+    release.send(()).unwrap();
+    assert_eq!(p1_wait_completion(admitted, Duration::from_secs(60)), Ok(()));
+    holder.join().unwrap();
+    let late = p1_start_completion("already idle", |tx| sender.gate().p1_subscribe_idle(tx));
+    assert_eq!(p1_wait_completion(late, Duration::ZERO), Ok(()));
+    sender.send(crate::state::WriteReq::Data(vec![2])).unwrap();
+    let held = receiver.recv().unwrap();
+    let never = p1_start_completion("unreleased operation", |tx| sender.gate().p1_subscribe_idle(tx));
+    assert_eq!(p1_wait_completion(never, Duration::ZERO), Err(P1WaitError::CompletionTimeout { event: "unreleased operation" }));
+    drop(held);
+}

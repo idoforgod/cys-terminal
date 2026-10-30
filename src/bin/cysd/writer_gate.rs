@@ -12,6 +12,8 @@ use std::sync::{mpsc, Arc, Condvar, Mutex};
 struct State {
     pending: usize,
     transition: bool,
+    #[cfg(test)]
+    p1_idle_subscribers: Vec<mpsc::Sender<()>>,
 }
 
 #[derive(Default)]
@@ -92,11 +94,12 @@ pub(crate) struct Operation(Arc<Shared>);
 impl Drop for Operation {
     fn drop(&mut self) {
         // Each lease has one owner and no Clone; poison must not turn unwinding into an abort.
-        self.0
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .pending -= 1;
+        let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.pending -= 1;
+        #[cfg(test)]
+        if state.pending == 0 {
+            for tx in state.p1_idle_subscribers.drain(..) { let _ = tx.send(()); }
+        }
     }
 }
 
@@ -891,5 +894,20 @@ mod tests {
         assert!(matches!(request, WriteReq::Data(bytes) if bytes == b"dsr"));
         drop(lease);
         assert_eq!(gate.pending(), 0);
+    }
+}
+
+
+#[cfg(test)]
+impl WriterGate {
+    /// Receipt of the instance becoming idle; never a promise that future producers stay idle.
+    pub(crate) fn p1_subscribe_idle(&self, tx: mpsc::Sender<()>) -> Result<(), String> {
+        let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.pending == 0 {
+            tx.send(()).map_err(|_| "idle receiver dropped".to_string())?;
+        } else {
+            state.p1_idle_subscribers.push(tx);
+        }
+        Ok(())
     }
 }
