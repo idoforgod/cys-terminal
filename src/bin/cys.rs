@@ -339,6 +339,9 @@ enum Command {
         since: Option<u64>,
         #[arg(long, default_value_t = 2000)]
         max_lines: u64,
+        /// Print ONE JSON object {text, composer} (+ quiet_secs) from one daemon frame (the composer verdict is the daemon's)
+        #[arg(long, conflicts_with_all = ["lines", "since"])]
+        composer: bool,
     },
     /// Resize a surface
     Resize {
@@ -5734,6 +5737,19 @@ fn request(method: &str, params: Value) -> Result<Value, String> {
     request_with_idle_cap(method, params, None)
 }
 
+/// ★(0.14.56 · P1 D8 · design r2 §9) `cys read-screen --composer`: ONE `surface.read_text` request with `composer: true`,
+/// and ONE JSON object built from its reply - `text` and `composer` as the daemon sent them (the verdict is never re-derived
+/// here), `quiet_secs` when present. An old daemon ignores the param; its reply has no `composer` and the object carries
+/// `composer: null` (consumers keep their pre-D8 path). `rpc` is `request` in production.
+fn read_screen_composer(sid: u64, rpc: &dyn Fn(&str, Value) -> Result<Value, String>) -> Result<Value, String> {
+    let r = rpc("surface.read_text", json!({"surface_id": sid, "composer": true}))?;
+    let mut out = json!({"text": r["text"].as_str().unwrap_or(""), "composer": r.get("composer").cloned().unwrap_or(Value::Null)});
+    if let Some(q) = r.get("quiet_secs") {
+        out["quiet_secs"] = q.clone();
+    }
+    Ok(out)
+}
+
 /// ★(0.14.31 · 성찰 C8) `--ttl` 미지원 데몬 앞에서 멈출 때의 문안 — **변이 0** 을 명시한다.
 const APPROVAL_TTL_UNSUPPORTED: &str = "--ttl 미지원 데몬 — **아무 승인도 만들지 않았다**. \
 이 데몬은 ttl_secs 를 버리고 무기한 승인을 만들었을 것이므로 서명 전에 멈춘다. 데몬을 0.14.31 이상으로 \
@@ -6814,8 +6830,11 @@ fn run(command: Command) -> i32 {
             };
         }
 
-        Command::ReadScreen { surface, to, lines, since, max_lines } => {
+        Command::ReadScreen { surface, to, lines, since, max_lines, composer } => {
             target_surface(&surface, &to).and_then(|sid| {
+                if composer {
+                    return read_screen_composer(sid, &request).map(|v| println!("{v}"));
+                }
                 if let Some(s) = since {
                     return request(
                         "surface.read_text",
@@ -52571,5 +52590,63 @@ mod d9_relauncher_tests {
         assert!(arm < fallback, "the refusal would reach the fresh fallback first");
         let seg = &body[arm..fallback];
         assert!(seg.contains("gated += 1;") && seg.contains("continue;"), "{seg}");
+    }
+}
+
+/// ★(0.14.56 · P1 D8 · design r2 §9 · T-P1 CLI half) `cys read-screen --composer`: the flag parses (and refuses `--lines` /
+/// `--since` beside it), and the command is ONE `surface.read_text` request with `composer: true` whose reply becomes ONE object.
+#[cfg(test)]
+mod d8_read_screen_composer_tests {
+    use super::*;
+
+    /// Parses on its own 8 MiB thread: building the clap root sits at the libtest 2 MiB stack cliff (head ruling 2026-10-24 D).
+    fn parse(argv: &[&str]) -> Result<Cli, String> {
+        let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+        std::thread::Builder::new()
+            .stack_size(8 << 20)
+            .spawn(move || Cli::try_parse_from(argv).map_err(|e| e.to_string()))
+            .expect("spawn parse thread")
+            .join()
+            .unwrap_or_else(|p| std::panic::resume_unwind(p))
+    }
+
+    fn composer_flag(argv: &[&str]) -> Result<bool, String> {
+        match parse(argv)?.command {
+            Command::ReadScreen { composer, .. } => Ok(composer),
+            _ => Err("not read-screen".into()),
+        }
+    }
+
+    #[test]
+    fn d8_read_screen_parses_composer_and_refuses_it_beside_lines_or_since() {
+        let base = ["cys", "read-screen", "--surface", "surface:3"];
+        assert_eq!(composer_flag(&[&base[..], &["--composer"][..]].concat()), Ok(true));
+        assert_eq!(composer_flag(&base), Ok(false), "without the flag: today's read");
+        for extra in [["--lines", "5"], ["--since", "0"]] {
+            let r = composer_flag(&[&base[..], &["--composer"][..], &extra[..]].concat());
+            assert!(r.is_err(), "--composer beside {extra:?} must be refused (one full frame, never tail text): {r:?}");
+        }
+    }
+
+    #[test]
+    fn d8_read_screen_composer_is_one_request_and_one_object() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let reply = std::cell::RefCell::new(Value::Null);
+        let rpc = |m: &str, p: Value| -> Result<Value, String> {
+            calls.borrow_mut().push((m.to_string(), p));
+            Ok(reply.borrow().clone())
+        };
+        let composer = json!({"verdict": "suggestion", "governed": true, "modal": false, "output_gen": 42});
+        *reply.borrow_mut() = json!({"surface_id": 3, "surface_ref": "surface:3", "text": "❯ hi", "quiet_secs": 4.0,
+                                     "composer": composer.clone()});
+        let out = read_screen_composer(3, &rpc).expect("ok");
+        assert_eq!(out, json!({"text": "❯ hi", "composer": composer, "quiet_secs": 4.0}), "the daemon's object, unchanged");
+        assert_eq!(*calls.borrow(), vec![("surface.read_text".to_string(), json!({"surface_id": 3, "composer": true}))]);
+        // An old daemon ignores the param: no `composer` in its reply -> `composer: null`; no `quiet_secs` -> no key.
+        *reply.borrow_mut() = json!({"surface_id": 3, "text": "plain", "latest_cursor": 9});
+        assert_eq!(read_screen_composer(3, &rpc).expect("ok"), json!({"text": "plain", "composer": null}));
+        // A failed request is an error (a non-zero exit, so the probe falls back), not an empty object.
+        let failing = |_: &str, _: Value| -> Result<Value, String> { Err("socket closed".into()) };
+        assert_eq!(read_screen_composer(3, &failing), Err("socket closed".to_string()));
     }
 }
