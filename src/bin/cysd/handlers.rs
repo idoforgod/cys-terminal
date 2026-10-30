@@ -3558,7 +3558,12 @@ fn checked_submit_sender(
     })
 }
 
-/// Explicit undelivered disposition of held bodies (never typed): one event each. Internal signal
+/// ★(0.14.56 · P1 D6 · design r2 §7) Disposition of a bound body whose body+Return write stopped with an unknown outcome:
+///   it may have been typed, so it is neither restored nor described as untyped.
+const BOUND_OUTCOME_UNKNOWN: &str = "bound_outcome_unknown";
+
+/// Explicit undelivered disposition of held bodies (never typed by it; a `bound_outcome_unknown` body may already have
+/// been typed by its own write, and its note says so): one event each. Internal signal
 /// only (owner rule 2026-10-12: queue-block signals stay, owner-visible display does not).
 fn dispose_held_bodies(
     daemon: &Daemon,
@@ -3568,6 +3573,14 @@ fn dispose_held_bodies(
     superseded_by: Option<&str>,
     now: std::time::Instant,
 ) {
+    let note = if reason == BOUND_OUTCOME_UNKNOWN {
+        "This body was bound to its Return and written with it as one request, which stopped with an unknown outcome: part \
+         or all of the body may have been typed and its Return may not have been. It is no longer held and will not be \
+         typed again; read the seat before sending it again."
+    } else {
+        "A body sent without its own Return was held untyped and was not delivered; nothing was typed. \
+         Send it again with its Return (cys send then cys send-key Return within the window, or --queued)."
+    };
     for b in bodies {
         daemon.bus.publish(
             "surface.submit_undelivered",
@@ -3582,8 +3595,7 @@ fn dispose_held_bodies(
                 "window_ms": crate::submit_assoc::LEGACY_ASSOCIATION_WINDOW_MS,
                 "chars": b.text.chars().count(),
                 "text_sha256": crate::delivery::digest_text(&b.text),
-                "note": "A body sent without its own Return was held untyped and was not delivered; nothing was typed. \
-                         Send it again with its Return (cys send then cys send-key Return within the window, or --queued).",
+                "note": note,
             }),
         );
     }
@@ -3829,6 +3841,19 @@ struct DirectSettle {
     handed_at: std::time::Instant,
     /// `surface.input_injected` payload (None = quiet caller).
     input_event: Option<Value>,
+    /// ★(0.14.56 · P1 D6 · design r2 §7) Held bodies this job took out of the association table at hand-off - every held
+    ///   body for a clear-first write, its own body for a bound write - settled by the terminal (`settle_reserved`).
+    reserved_held: ReservedHeld,
+}
+
+/// ★(0.14.56 · P1 D6) Shared by a job's settlement and the handler that hands the job off: a refused hand-off drops the
+///   job, and this settlement with it, inside `try_write`, so the handler takes the bodies back through its own handle and
+///   restores them after `input_gate` is released. A settlement that never runs (its seat or daemon is gone, or the writer
+///   dropped the job unexecuted) drops them unannounced.
+type ReservedHeld = Arc<std::sync::Mutex<Vec<crate::submit_assoc::HeldBody>>>;
+
+fn take_reserved(r: &ReservedHeld) -> Vec<crate::submit_assoc::HeldBody> {
+    std::mem::take(&mut *r.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
 impl DirectSettle {
@@ -3843,6 +3868,7 @@ impl DirectSettle {
             T::PartialExact { accepted, .. } | T::PartialUnknown { accepted, .. } => accepted.total(),
             T::RefusedNoWrite { .. } | T::CancelledBeforeWrite => 0,
         } as usize;
+        self.settle_reserved(&daemon, &s, t);
         if t.wrote_nothing() {
             let reason = match t {
                 T::RefusedNoWrite { reason } => reason.clone(),
@@ -3906,6 +3932,36 @@ impl DirectSettle {
             }
         }
     }
+
+    /// ★(0.14.56 · P1 D6 · design r2 §7, r1 §7 step 2) The reserved held bodies, by terminal. Zero bytes (the first arm is
+    ///   exactly `Terminal::wrote_nothing`): each goes back with its receipt deadline (`restore_held_body`). Bytes went out: a
+    ///   clear-first write began with its Ctrl-U and erased the line they would have been typed into -> `cleared`; a bound
+    ///   write typed its own body, which needs no disposition. Unknown outcome: an explicit reason, never restored (a
+    ///   restored bound body could be typed twice). Runs after the terminal and outside `input_gate`.
+    fn settle_reserved(&self, daemon: &Daemon, s: &crate::state::Surface, t: &crate::agent_write::Terminal) {
+        use crate::agent_write::Terminal as T;
+        let bodies = take_reserved(&self.reserved_held);
+        if bodies.is_empty() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        match t {
+            T::RefusedNoWrite { .. } | T::CancelledBeforeWrite => {
+                for b in bodies {
+                    restore_held_body(daemon, s, b);
+                }
+            }
+            T::WrittenBody { .. } | T::WrittenSubmitted { .. } | T::PartialExact { .. } => {
+                if self.clear_first {
+                    dispose_held_bodies(daemon, self.sid, bodies, "cleared", None, now);
+                }
+            }
+            T::PartialUnknown { .. } => {
+                let reason = if self.clear_first { "clear_outcome_unknown" } else { BOUND_OUTCOME_UNKNOWN };
+                dispose_held_bodies(daemon, self.sid, bodies, reason, None, now);
+            }
+        }
+    }
 }
 
 /// Hand one direct agent job to the seat's writer (inside `input_gate`; the caller holds it). The
@@ -3948,11 +4004,18 @@ fn hand_off_direct_job(
 }
 
 /// Put a body back after a refused bind (its receipt deadline, never widened). If its caller has held a
-/// newer body meanwhile (or the table filled), the older one is disposed as superseded instead.
+/// newer body meanwhile (or the table filled), the older one is disposed as superseded instead, naming the
+/// newer body (★(0.14.56 · P1 D6 · r1 T-H2); none when the table filled).
 fn restore_held_body(daemon: &Daemon, surface: &crate::state::Surface, body: crate::submit_assoc::HeldBody) {
-    let back = surface.submit_assoc.lock().unwrap_or_else(|e| e.into_inner()).restore(body);
-    if let Err(b) = back {
-        dispose_held_bodies(daemon, surface.id, vec![b], "superseded", None, std::time::Instant::now());
+    let refused = {
+        let mut t = surface.submit_assoc.lock().unwrap_or_else(|e| e.into_inner());
+        t.restore(body).err().map(|b| {
+            let newer = t.records().find(|x| x.caller == b.caller && x.generation == b.generation).map(|x| x.request_id.clone());
+            (b, newer)
+        })
+    };
+    if let Some((b, newer)) = refused {
+        dispose_held_bodies(daemon, surface.id, vec![b], "superseded", newer.as_deref(), std::time::Instant::now());
     }
 }
 
@@ -4086,7 +4149,10 @@ fn bind_held_and_write(
             };
             json!({"bytes": body.text.len(), "from": from, "from_verified": from_verified, "request_id": body.request_id})
         }),
+        reserved_held: ReservedHeld::default(),
     };
+    let reserved = settle.reserved_held.clone();
+    let request_id = body.request_id.clone();
     let plan = crate::agent_write::Plan::raw(&written).with_submit(cr_min_gap_ms(), 0);
     {
         let _gate = surface.input_gate.lock().unwrap();
@@ -4100,9 +4166,14 @@ fn bind_held_and_write(
                 return draft_gate_denied_response(daemon, surface, id, kind, why, verified_from, None, settle);
             }
         }
+        // ★(0.14.56 · P1 D6 · design r2 §7) The bound body moves into the settlement before hand-off: zero bytes give it back
+        //   there (a journal refusal no longer loses it); an unknown outcome disposes it with its reason.
+        reserved.lock().unwrap_or_else(|e| e.into_inner()).push(body);
         if let Some(err) = hand_off_direct_job(surface, id, request, plan, proof, journal, owner, settle) {
             drop(_gate);
-            restore(body);
+            for b in take_reserved(&reserved) {
+                restore(b);
+            }
             return err;
         }
     }
@@ -4119,14 +4190,14 @@ fn bind_held_and_write(
     *surface.last_cmd_ack.lock().unwrap() = Some(crate::state::now_epoch());
     ok_response(
         id,
-        json!({"surface_id": sid, "key": key, "sent": true, "request_id": body.request_id, "bound": how}),
+        json!({"surface_id": sid, "key": key, "sent": true, "request_id": request_id, "bound": how}),
     )
 }
 
 /// ★(B-360) What the caller of a handed-off direct agent job is told, after a bounded wait for the writer's journal
 /// barrier (taken after `input_gate` is released). Three outcomes, never merged:
 /// `Ok(())` = PASSED, the journal wrote the record - the only outcome that may be reported as `sent:true`;
-/// `Err(Refused)` = zero bytes were written and nothing is retained - safe to send again;
+/// `Err(Refused)` = zero bytes were written and the writer retains nothing (a bound body is held again, D6) - safe to send again;
 /// `Err(Unknown)` = the seat's writer did not reach the job within the budget - it is still queued and may still be typed,
 /// so it must NOT be sent again (a retry can type it twice). The write itself proceeds unchanged in every case.
 enum BarrierReply {
@@ -7251,6 +7322,7 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
                             json!({"bytes": text.len(), "from": from, "from_verified": from_verified,
                                    "request_id": request.id})
                         }),
+                        reserved_held: ReservedHeld::default(),
                     };
                     Some((request, plan, proof, daemon.agent_journal(), settle))
                 }
@@ -7262,6 +7334,7 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
             //   Inject 를 넣으면 두 본문이 한 제출로 합쳐졌다(delivery_concatenated 이상징후).
             //   락 순서 계약: pending_queue → input_gate. 여기서는 input_gate 하나만 잡고
             //   그 안에서는 pending_input leaf 외의 락을 잡지 않는다(사이클 없음).
+            //   ★(0.14.56 · P1 D6) Exception: a clear-first write's reservation also takes the `submit_assoc` leaf here (below).
             let _gate = surface.input_gate.lock().unwrap();
             // ★(수정 라운드 1 · 리뷰 minor TOCTOU) 1차 판정은 파서 락 때문에 input_gate 밖이다.
             // 사람 키 경로(send_text human=true)도 이 gate 를 지나므로 계수 축은 여기서 정확히
@@ -7318,9 +7391,23 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
                 }
             }
             if let Some((request, plan, proof, journal, settle)) = direct_job.take() {
+                // ★(0.14.56 · P1 D6 · design r2 §7, r1 §7 step 1) A clear-first write erases the line every held body would
+                //   have been typed into under the old two-step, so it reserves them all at hand-off: out of the table now (a
+                //   Return meanwhile finds none, R-6), settled by the terminal - restored on zero bytes, `cleared` once the
+                //   Ctrl-U went out, `clear_outcome_unknown` on an unknown outcome. `submit_assoc` is a leaf lock
+                //   (`Surface::submit_assoc`), so taking it inside `input_gate` adds no lock order.
+                let reserved = settle.reserved_held.clone();
+                if agent_intent == Some(DirectAgentIntent::OwnedClear) {
+                    let drained = surface.submit_assoc.lock().unwrap_or_else(|e| e.into_inner()).drain_all();
+                    *reserved.lock().unwrap_or_else(|e| e.into_inner()) = drained;
+                }
                 if let Some(err) =
                     hand_off_direct_job(&surface, &id, request, plan, proof, journal, owner_if_residue, settle)
                 {
+                    drop(_gate);
+                    for b in take_reserved(&reserved) {
+                        restore_held_body(daemon, &surface, b);
+                    }
                     return Reply::Single(err);
                 }
             } else if let Some(err) = try_write(&surface, write_req, &id) {
@@ -7365,12 +7452,7 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
             //   Return 은 이 새 본문을 제출해야 한다(clear_first 포함). 표 락은 단독 leaf(게이트 밖).
             //   ★(B) 키는 발급과 같은 규칙(`request_pair_key`) — Claimed 발신자의 직접 성공도 자기 표만 지운다
             //   (Verified(n) 과 Claimed(n) 은 서로를 지우지 않는다).
-            // ★(0.14.52 · S-a C5b) A clear-first write erases the line every held body would have been typed into
-            //   under the old two-step: those bodies are disposed (undelivered, never typed).
-            if agent_intent == Some(DirectAgentIntent::OwnedClear) {
-                let gone = surface.submit_assoc.lock().unwrap_or_else(|e| e.into_inner()).drain_all();
-                dispose_held_bodies(daemon, sid, gone, "cleared", None, std::time::Instant::now());
-            }
+            // ★(0.14.56 · P1 D6) A clear-first write's held bodies were reserved at hand-off; its settlement disposes them.
             if let Some(h) = &agent_handle {
                 // Ticket, echo window and `surface.input_injected` are the settlement's (after the terminal).
                 crate::agent_write::test_wait_settled(h);
