@@ -4253,9 +4253,21 @@ fn office_spool_expired_ids(daemon: &Arc<Daemon>, role: &str) -> std::collection
         .unwrap_or_default()
 }
 
-/// The own-master leg. Returns the number of master entries created (0, 1 or 2) - for tests and the bus event.
-pub fn office_spool_master_leg(daemon: &Arc<Daemon>, lanes: &[SpoolLane], now: Now) -> usize {
-    let before = load_spool_record(daemon);
+/// What the own-master leg would do with `lanes` before any delivery: the record after streak counting and closes, the
+/// faulted pairs not yet in it (`new`) and the notified ones whose entry expired unread (`rearm`). ★(0.14.56 PKG-2 m5)
+/// Pure, and shared by the leg and [`office_spool_wants`], so "would this observation change anything" cannot drift from
+/// what the leg does.
+struct SpoolPlan<'a> {
+    rec: BTreeMap<String, SpoolEpisode>,
+    new: Vec<&'a SpoolLane>,
+    rearm: Vec<&'a SpoolLane>,
+}
+
+fn office_spool_plan<'a>(
+    before: &BTreeMap<String, SpoolEpisode>,
+    lanes: &'a [SpoolLane],
+    expired: &std::collections::BTreeSet<String>,
+) -> SpoolPlan<'a> {
     let mut rec = before.clone();
     let fault_lanes: std::collections::BTreeSet<&str> = lanes.iter().filter(|l| l.fault).map(|l| l.lane.as_str()).collect();
     let ok_lanes: std::collections::BTreeSet<&str> = lanes.iter().filter(|l| !l.fault).map(|l| l.lane.as_str()).collect();
@@ -4276,19 +4288,6 @@ pub fn office_spool_master_leg(daemon: &Arc<Daemon>, lanes: &[SpoolLane], now: N
         rec.remove(id);
     }
     let faults: Vec<&SpoolLane> = lanes.iter().filter(|l| l.fault).collect();
-    // An explicitly non-faulted (lane, state) forgets its ledger-dedupe keys: a LATER undeliverable episode of the same
-    // pair and reason gets its own row again (R2 D2-10). Lanes absent from this observation keep theirs.
-    {
-        let gone: Vec<String> = lanes.iter().filter(|l| !l.fault).map(|l| l.lane.clone()).collect();
-        if !gone.is_empty() {
-            let still: std::collections::BTreeSet<String> = faults.iter().map(|l| l.id()).collect();
-            state_lock(daemon).office_spool.refused_logged.retain(|k| {
-                let lane = k.split('|').next().unwrap_or("");
-                !gone.iter().any(|g| g == lane) || still.iter().any(|id| k.starts_with(&format!("{id}|")))
-            });
-        }
-    }
-    let mut created = 0;
     // Q-r2-2: ONE entry per observation listing every (lane, state) not yet in the record.
     let mut new: Vec<&SpoolLane> = Vec::new();
     for l in &faults {
@@ -4296,6 +4295,31 @@ pub fn office_spool_master_leg(daemon: &Arc<Daemon>, lanes: &[SpoolLane], now: N
             new.push(l);
         }
     }
+    // Re-arm ONCE: the episode's entry expired unread while the fault persists -> one new entry, never again this episode.
+    //   Taken on the record before `new` is inserted - a pair in `new` is never in it, and a fresh entry is never expired.
+    let rearm: Vec<&SpoolLane> = faults
+        .iter()
+        .copied()
+        .filter(|l| rec.get(&l.id()).is_some_and(|e| !e.rearmed && expired.contains(&e.entry_id)))
+        .collect();
+    SpoolPlan { rec, new, rearm }
+}
+
+/// An explicitly non-faulted (lane, state) forgets its ledger-dedupe keys: a LATER undeliverable episode of the same pair
+/// and reason gets its own row again (R2 D2-10). Lanes absent from the observation keep theirs. True = `k` goes.
+fn office_spool_key_forgotten(k: &str, lanes: &[SpoolLane]) -> bool {
+    let lane = k.split('|').next().unwrap_or("");
+    lanes.iter().any(|l| !l.fault && l.lane == lane)
+        && !lanes.iter().any(|l| l.fault && k.starts_with(&format!("{}|", l.id())))
+}
+
+/// The own-master leg. Returns the number of master entries created (0, 1 or 2) - for tests and the bus event.
+pub fn office_spool_master_leg(daemon: &Arc<Daemon>, lanes: &[SpoolLane], now: Now) -> usize {
+    let before = load_spool_record(daemon);
+    let expired = office_spool_expired_ids(daemon, OFFICE_SPOOL_MASTER_ROLE);
+    let SpoolPlan { mut rec, new, rearm } = office_spool_plan(&before, lanes, &expired);
+    state_lock(daemon).office_spool.refused_logged.retain(|k| !office_spool_key_forgotten(k, lanes));
+    let mut created = 0;
     if !new.is_empty() {
         let ids: Vec<String> = new.iter().map(|l| l.id()).collect();
         match office_spool_enqueue(daemon, OFFICE_SPOOL_MASTER_ROLE, office_spool_text(&new, false)) {
@@ -4314,13 +4338,6 @@ pub fn office_spool_master_leg(daemon: &Arc<Daemon>, lanes: &[SpoolLane], now: N
             Err(reason) => office_spool_refused(daemon, &ids, "office_spool_undelivered", reason, now),
         }
     }
-    // Re-arm ONCE: the episode's entry expired unread while the fault persists -> one new entry, never again this episode.
-    let expired = office_spool_expired_ids(daemon, OFFICE_SPOOL_MASTER_ROLE);
-    let rearm: Vec<&SpoolLane> = faults
-        .iter()
-        .copied()
-        .filter(|l| rec.get(&l.id()).is_some_and(|e| !e.rearmed && expired.contains(&e.entry_id)))
-        .collect();
     if !rearm.is_empty() {
         let ids: Vec<String> = rearm.iter().map(|l| l.id()).collect();
         match office_spool_enqueue(daemon, OFFICE_SPOOL_MASTER_ROLE, office_spool_text(&rearm, true)) {
@@ -4379,72 +4396,99 @@ fn office_spool_recorded_digest(daemon: &Arc<Daemon>) -> Option<(Vec<String>, f6
         })
 }
 
-/// Does this observation give the router anything to do? (DESIGN-r2 1-4: one event a minute "only while something is
-/// faulted".) Yes when a lane is faulted, when an episode is still open in this daemon's record (its lane's explicit ok
-/// reports are what close it), or - base - when the digest set differs from the last delivered one (a change held by the
-/// window or by an undelivered digest must be presented again later, never dropped). A steady all-ok daemon publishes
-/// NOTHING, so a master's unfiltered `cys events` stream carries no per-minute line. An unreadable record says yes (loud).
+/// Does this observation give the router anything to do? A steady all-ok daemon publishes NOTHING, so a master's
+/// unfiltered `cys events` stream carries no per-minute line. ★(0.14.56 PKG-2 m5) Nor does a PERSISTING fault: yes only
+/// when the router would change something - the master leg's plan ([`office_spool_plan`]: a new faulted pair, a streak
+/// change or close, a re-arm due), a refused-ledger key an explicit ok report forgets, or - base - a digest that is due
+/// (changed, outside the coalescing window, none already waiting). Measured before the change: one identical event every
+/// 60 s while a bridge gave no usable report (w51-m5-measure). An undeliverable notice stays pending, so it is still
+/// retried on every observation until delivered (never silence). An unreadable record says yes (loud).
 pub fn office_spool_wants(daemon: &Arc<Daemon>, payload: &Value) -> bool {
-    let faulted = payload
-        .get("lanes")
-        .and_then(Value::as_array)
-        .is_some_and(|a| a.iter().any(|l| l.get("fault").and_then(Value::as_bool).unwrap_or(false)));
-    if faulted {
-        return true;
-    }
+    office_spool_wants_at(daemon, payload, Now::live(daemon))
+}
+
+fn office_spool_wants_at(daemon: &Arc<Daemon>, payload: &Value, now: Now) -> bool {
     match std::fs::read(state_dir(daemon).join(OFFICE_SPOOL_NOTIFIED_FILE)) {
-        Ok(b) => match serde_json::from_slice::<Value>(&b) {
-            Ok(Value::Object(o)) if o.is_empty() => {}
-            _ => return true,
-        },
+        Ok(b) => {
+            if !matches!(serde_json::from_slice::<Value>(&b), Ok(Value::Object(_))) {
+                return true;
+            }
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(_) => return true,
     }
-    match payload.get("digest").filter(|d| d.is_object()) {
-        Some(d) => {
-            let recorded = office_spool_recorded_digest(daemon).map(|(s, _)| s).unwrap_or_default();
-            office_spool_digest_set(d) != recorded
-        }
-        None => false,
+    let lanes = parse_spool_lanes(payload);
+    let before = load_spool_record(daemon);
+    let expired = office_spool_expired_ids(daemon, OFFICE_SPOOL_MASTER_ROLE);
+    let plan = office_spool_plan(&before, &lanes, &expired);
+    if plan.rec != before || !plan.new.is_empty() || !plan.rearm.is_empty() {
+        return true;
     }
+    if state_lock(daemon).office_spool.refused_logged.iter().any(|k| office_spool_key_forgotten(k, &lanes)) {
+        return true;
+    }
+    let Some(d) = payload.get("digest").filter(|d| d.is_object()) else { return false };
+    let set = office_spool_digest_set(d);
+    let last = office_spool_recorded_digest(daemon);
+    let mono = state_lock(daemon).office_spool.digest_sent_mono;
+    office_spool_digest_step(&set, &last, mono, now) == DigestStep::Due
+        && !office_spool_digest_target(daemon).is_some_and(|r| office_spool_digest_waiting(daemon, r))
 }
 
-/// The base daemon's Secretariat digest leg. Returns true when a digest entry was queued.
-pub fn office_spool_digest_leg(daemon: &Arc<Daemon>, digest: &Value, now: Now) -> bool {
-    let set = office_spool_digest_set(digest);
-    let last = office_spool_recorded_digest(daemon);
-    match &last {
-        Some((s, _)) if *s == set => return false, // no change
-        None if set.is_empty() => return false,    // nothing at start while the set is empty
+/// The digest leg's decision before delivery - shared by the leg and [`office_spool_wants`] (m5).
+#[derive(Debug, PartialEq)]
+enum DigestStep {
+    NoChange,
+    Held,
+    Due,
+}
+
+fn office_spool_digest_step(set: &[String], last: &Option<(Vec<String>, f64)>, mono: Option<f64>, now: Now) -> DigestStep {
+    match last {
+        Some((s, _)) if s.as_slice() == set => return DigestStep::NoChange, // no change
+        None if set.is_empty() => return DigestStep::NoChange,              // nothing at start while the set is empty
         _ => {}
     }
     // Coalescing window: monotonic this boot; across a restart, the record's epoch.
-    let mono = state_lock(daemon).office_spool.digest_sent_mono;
-    let in_window = match (mono, &last) {
+    let in_window = match (mono, last) {
         (Some(m), _) => now.mono - m < OFFICE_SPOOL_DIGEST_WINDOW_SECS,
         (None, Some((_, e))) => *e > 0.0 && now.epoch >= *e && now.epoch - *e < OFFICE_SPOOL_DIGEST_WINDOW_SECS,
         (None, None) => false,
     };
-    if in_window {
-        return false;
-    }
-    let target = {
-        let roles = daemon.roles.lock().unwrap();
-        OFFICE_SPOOL_DIGEST_ROLES.iter().find(|r| roles.contains_key(**r)).copied()
-    };
-    let Some(role) = target else {
-        office_spool_refused(daemon, &["digest".to_string()], "office_spool_digest_undelivered", "no_secretariat", now);
-        return false;
-    };
-    // At most ONE undelivered digest in the Secretariat queue.
-    let waiting = daemon
+    if in_window { DigestStep::Held } else { DigestStep::Due }
+}
+
+fn office_spool_digest_target(daemon: &Arc<Daemon>) -> Option<&'static str> {
+    let roles = daemon.roles.lock().unwrap();
+    OFFICE_SPOOL_DIGEST_ROLES.iter().find(|r| roles.contains_key(**r)).copied()
+}
+
+/// At most ONE undelivered digest in the Secretariat queue.
+fn office_spool_digest_waiting(daemon: &Arc<Daemon>, role: &str) -> bool {
+    daemon
         .roles
         .lock()
         .unwrap()
         .get(role)
         .copied()
         .and_then(|sid| daemon.get_surface(sid))
-        .is_some_and(|s| s.pending_queue.lock().unwrap().iter().any(|e| e.text.starts_with(OFFICE_SPOOL_DIGEST_PREFIX)));
+        .is_some_and(|s| s.pending_queue.lock().unwrap().iter().any(|e| e.text.starts_with(OFFICE_SPOOL_DIGEST_PREFIX)))
+}
+
+/// The base daemon's Secretariat digest leg. Returns true when a digest entry was queued.
+pub fn office_spool_digest_leg(daemon: &Arc<Daemon>, digest: &Value, now: Now) -> bool {
+    let set = office_spool_digest_set(digest);
+    let last = office_spool_recorded_digest(daemon);
+    let mono = state_lock(daemon).office_spool.digest_sent_mono;
+    if office_spool_digest_step(&set, &last, mono, now) != DigestStep::Due {
+        return false;
+    }
+    let target = office_spool_digest_target(daemon);
+    let Some(role) = target else {
+        office_spool_refused(daemon, &["digest".to_string()], "office_spool_digest_undelivered", "no_secretariat", now);
+        return false;
+    };
+    let waiting = office_spool_digest_waiting(daemon, role);
     if waiting {
         return false;
     }
@@ -9986,6 +10030,11 @@ mod office_spool_drills {
             e.push_back(x);
         }
     }
+    /// The seat read its queue (m5 specimens: an undelivered digest no longer waits).
+    fn drain(d: &Arc<Daemon>, role: &str) {
+        let sid = d.roles.lock().unwrap().get(role).copied().unwrap();
+        d.get_surface(sid).unwrap().pending_queue.lock().unwrap().clear();
+    }
     fn pair(tag: &str) -> (Arc<Daemon>, Arc<Daemon>) {
         let b = daemon_at(tag, "cys");
         let d5 = daemon_at(tag, "cys-dept-dept-5");
@@ -10246,10 +10295,14 @@ mod office_spool_drills {
         let base_change = office_spool_wants(&b, &dg(&["dept-5 mismatch"]));
         send(&b, vec![lane("main", "ok", false)], json!({"faults": ["dept-5 mismatch"], "unreachable": false}), 400.0);
         let base_after_delivery = !office_spool_wants(&b, &dg(&["dept-5 mismatch"]));
+        // ★(0.14.56 PKG-2 m5) a held change is presented when the coalescing window has passed, not every minute in it.
+        let cleared_held = !office_spool_wants(&b, &dg(&[]));
+        state_lock(&b).office_spool.digest_sent_mono = Some(-(OFFICE_SPOOL_DIGEST_WINDOW_SECS + 60.0));
+        drain(&b, "worker"); // the first digest was delivered
         let cleared_pending = office_spool_wants(&b, &dg(&[]));
-        println!("OSD-R1-1 {quiet_at_start} {open_episode_keeps_reporting} {quiet_after_close} {base_quiet} {base_change} {base_after_delivery} {cleared_pending}");
+        println!("OSD-R1-1 {quiet_at_start} {open_episode_keeps_reporting} {quiet_after_close} {base_quiet} {base_change} {base_after_delivery} {cleared_held} {cleared_pending}");
         assert!(quiet_at_start && open_episode_keeps_reporting && quiet_after_close);
-        assert!(base_quiet && base_change && base_after_delivery && cleared_pending);
+        assert!(base_quiet && base_change && base_after_delivery && cleared_held && cleared_pending);
     }
 
     /// The observation never enters the CSO pending set and never reaches a CSO seat (non-regression guard).
@@ -10260,5 +10313,101 @@ mod office_spool_drills {
         send(&b, vec![lane("main", "pack_missing", true)], json!({"faults": ["main pack_missing"], "unreachable": false}), 400.0);
         assert!(texts(&b, "cso").is_empty());
         assert!(state_lock(&b).pending.is_empty());
+    }
+
+    /// The spawn loop's glue (spool_watch.rs spawn): observe -> publish only if `office_spool_wants` -> the router.
+    fn watch_minute(d: &Arc<Daemon>, own: &crate::spool_watch::Own, probe: &Result<Value, ()>,
+                    st: &mut crate::spool_watch::WatchState, mono: f64) -> bool {
+        let payload = crate::spool_watch::observe(own, probe, st);
+        let published = office_spool_wants(d, &payload);
+        if published {
+            send_at(d, payload["lanes"].as_array().cloned().unwrap_or_default(), payload["digest"].clone(), Now::at(mono));
+        }
+        published
+    }
+
+    /// m5 (0.14.56 PKG-2 r1, head 03:0x): an OLDER bridge on the port - it answers /health with 200 but without a usable
+    /// spool report (this Mac's 0.14.54 bridge on 8642) - is W1 bridge_unreachable for as long as it stays. Exactly ONE
+    /// publish and ONE master notice per episode, no per-minute republish; a CHANGE (the new bridge reports the lane)
+    /// still publishes. Base and dept daemon alike.
+    #[test]
+    fn osd_m5_older_bridge_is_one_notice_per_episode_and_a_change_still_publishes() {
+        let (b, d5) = pair("m5old");
+        let spool = std::env::temp_dir().join(format!("cys-osd-m5old-{}", std::process::id())).join("evt_spool.jsonl");
+        for (d, is_base, lane_id) in [(&b, true, "main"), (&d5, false, "dept-5")] {
+            let own = crate::spool_watch::Own {
+                socket: d.socket_path.to_string_lossy().into_owned(), is_base, lane: lane_id.into(), spool_path: spool.clone(),
+            };
+            for body in [&br#"{"ok":true,"lanes":[]}"#[..], &br#"{"spool_schema":0,"spool":[]}"#[..]] {
+                assert!(crate::spool_watch::parse_health(body).is_err(), "an older /health body is not a usable spool report");
+            }
+            let old = crate::spool_watch::parse_health(br#"{"ok":true,"lanes":[]}"#);
+            let mut st = crate::spool_watch::WatchState::default();
+            let mut publishes = 0;
+            for m in 1..=13 {
+                if watch_minute(d, &own, &old, &mut st, 60.0 * m as f64) { publishes += 1; }
+            }
+            let notices = texts(d, "master").len();
+            // The new bridge arrives and reports this daemon's own lane healthy: the open episode's streak moves.
+            let entry = if is_base { json!({"lane": "main", "state": "ok", "fault": false, "socket": null}) }
+                        else { json!({"lane": "dept-5", "state": "ok", "fault": false, "socket": own.socket}) };
+            let fresh = Ok(json!({"spool_schema": 1, "spool_checked": true, "spool": [entry]}));
+            let change_publishes = watch_minute(d, &own, &fresh, &mut st, 60.0 * 14.0);
+            println!("OSD-M5-OLD {lane_id} publishes={publishes} notices={notices} change={change_publishes}");
+            assert_eq!((publishes, notices), (1, 1), "{lane_id}: one publish and one notice per episode");
+            assert!(change_publishes, "{lane_id}: a change in that state still publishes");
+        }
+    }
+
+    /// m5: a persisting fault is quiet after its notice; a changed fault set publishes; a re-arm that is due publishes
+    /// once and is quiet again after it.
+    #[test]
+    fn osd_m5_persisting_fault_is_quiet_and_changes_publish() {
+        let (_b, d5) = pair("m5persist");
+        let a = json!({"lanes": [lane("dept-5", "mismatch", true)], "digest": null});
+        let ab = json!({"lanes": [lane("dept-5", "mismatch", true), lane("dept-5", "not_ready", true)], "digest": null});
+        send(&d5, vec![lane("dept-5", "mismatch", true)], Value::Null, 400.0);
+        let quiet: Vec<bool> = (0..10).map(|_| office_spool_wants(&d5, &a)).collect();
+        let changed = office_spool_wants(&d5, &ab);
+        expire_all(&d5, "master");
+        let rearm_due = office_spool_wants(&d5, &a);
+        send(&d5, vec![lane("dept-5", "mismatch", true)], Value::Null, 460.0);
+        let after_rearm = office_spool_wants(&d5, &a);
+        println!("OSD-M5-PERSIST quiet={quiet:?} changed={changed} rearm_due={rearm_due} after_rearm={after_rearm}");
+        assert!(quiet.iter().all(|w| !w), "a persisting fault is not republished every minute");
+        assert!(changed && rearm_due && !after_rearm);
+    }
+
+    /// m5: an undelivered episode's refused-ledger key is forgotten only when the lane's explicit ok report reaches the
+    /// router - so that ok report must be published, or a later episode of the same pair would never log again.
+    #[test]
+    fn osd_m5_ok_report_that_forgets_a_refused_key_is_published() {
+        let d5 = daemon_at("m5forget", "cys-dept-dept-5"); // no master seat: the episode is undeliverable
+        let ok = json!({"lanes": [lane("dept-5", "ok", false)], "digest": null});
+        send(&d5, vec![lane("dept-5", "mismatch", true)], Value::Null, 400.0);
+        let logged = !state_lock(&d5).office_spool.refused_logged.is_empty();
+        let forget_published = office_spool_wants(&d5, &ok);
+        send(&d5, vec![lane("dept-5", "ok", false)], Value::Null, 460.0);
+        let quiet_after = !office_spool_wants(&d5, &ok);
+        println!("OSD-M5-FORGET logged={logged} forget_published={forget_published} quiet_after={quiet_after}");
+        assert!(logged && forget_published && quiet_after);
+    }
+
+    /// m5 (base digest): a changed digest set held by the coalescing window is NOT presented every minute; it is
+    /// presented when the window has passed.
+    #[test]
+    fn osd_m5_held_digest_change_waits_for_the_window() {
+        let (b, _d5) = pair("m5window");
+        let dg = |f: &[&str]| json!({"lanes": [lane("main", "ok", false)], "digest": {"faults": f, "unreachable": false}});
+        send(&b, vec![lane("main", "ok", false)], json!({"faults": ["dept-5 mismatch"], "unreachable": false}), 0.0);
+        let held = office_spool_wants(&b, &dg(&[]));
+        state_lock(&b).office_spool.digest_sent_mono = Some(-(OFFICE_SPOOL_DIGEST_WINDOW_SECS + 60.0));
+        let waiting = office_spool_wants(&b, &dg(&[])); // the first digest is still undelivered in the Secretariat queue
+        drain(&b, "worker"); // delivered
+        let due = office_spool_wants(&b, &dg(&[]));
+        println!("OSD-M5-WINDOW held={held} waiting={waiting} due={due}");
+        assert!(!held, "inside the window the held change is not republished");
+        assert!(!waiting, "while a digest waits undelivered the leg does nothing, so nothing is published");
+        assert!(due, "after the window, with nothing waiting, it is presented");
     }
 }
