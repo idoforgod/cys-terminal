@@ -33679,7 +33679,7 @@ mod d9_writer_guard_tests {
 #[cfg(test)]
 mod pkg1_auth_hold_tests {
     use super::*;
-    use crate::agent_queue_tests::{d9_role_recorder, fx, pkg1_authoritative_job, wait_until};
+    use crate::agent_queue_tests::{d9_role_recorder, fx, pkg1_authoritative_job};
 
     fn item(id: &str) -> crate::state::FeedItem {
         crate::state::FeedItem {
@@ -33715,10 +33715,11 @@ mod pkg1_auth_hold_tests {
         let _resume = pkg1_authoritative_job(&f.daemon, &s, "[RESUME] pkg1-s3");
         let r = deliver_to_ceo(&f.daemon, &item("pkg1s3a"), false);
         let held = matches!(r, CeoDelivery::Held("ceo_seat_resuming"));
-        wait_until("the writer is idle", || s.write_tx.gate().pending() == 0);
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(held, "the CEO push must wait behind the queued [RESUME]");
+        // ★(HEAD-RULING-WALLCLOCK-3) No fixed sleep: Held is decided synchronously and hands nothing to the writer, so an empty
+        //   writer queue right after the return is the point that proves the push had its chance and wrote nothing.
+        assert_eq!(s.write_tx.gate().pending(), 0, "nothing handed to the writer");
         let bytes = std::fs::read(&out).unwrap();
-        assert!(held, "the CEO push must wait behind the queued [RESUME] (got {} bytes)", bytes.len());
         assert!(bytes.is_empty(), "zero bytes: {}", String::from_utf8_lossy(&bytes));
         route_auto_approval(&f.daemon, &item("pkg1s3b"), false);
         let queued = s.pending_queue.lock().unwrap().len(); // read before the kill: a seat exit disposes its queue

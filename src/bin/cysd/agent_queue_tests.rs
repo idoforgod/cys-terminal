@@ -1628,13 +1628,29 @@ fn d9_pre_cr_t_w3c_outside_d9_scope_the_queue_job_proof_is_unchanged() {
 //   writer into master/CEO (W-5 handlers, W-6 channels, W-7 boot_supervisor, W-8 schedule - the producers are private). ──
 
 /// A recorder seat on `daemon` that holds `role` there and is an agent seat (D9 scope); its receiver proof always admits.
+/// ★(0.14.56 · PKG1-M1 · HEAD-RULING-WALLCLOCK-3) Waits until a `stty raw -echo; exec cat > out` seat has created `out` - no fixed
+/// sleep: the seat's shell runs `stty` to completion before `exec cat > out` opens (creates) `out`, so the file's existence is
+/// the point at which raw mode is already applied.
+pub(crate) fn recorder_file_ready(out: &std::path::Path) {
+    let end = Instant::now() + Duration::from_secs(30);
+    let ready = loop { // wallclock: guard the deadline only ends a hang; the file appears once the seat's shell execs cat
+        if out.exists() {
+            break true;
+        }
+        if Instant::now() >= end {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert!(ready, "not within 30 s: recorder ready ({})", out.display());
+}
+
 pub(crate) fn d9_role_recorder(daemon: &Arc<Daemon>, dir: &std::path::Path, tag: &str, role: &str) -> (Arc<Surface>, std::path::PathBuf) {
     let out = dir.join(format!("rx-{tag}.bin"));
     let cmd = format!("stty raw -echo; exec cat > '{}'", out.display());
     let s = daemon.create_surface(None, Some(cmd), None, None, 24, 200).expect("recorder seat");
     daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
-    wait_until("recorder ready", || out.exists());
-    std::thread::sleep(Duration::from_millis(300)); // stty applied before the first byte
+    recorder_file_ready(&out);
     daemon.roles.lock().unwrap().insert(role.into(), s.id);
     *s.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
     *s.receiver_proof.lock().unwrap() = Some(Scripted::new(0, ProofLoss::AgentDead, None));
@@ -1821,7 +1837,12 @@ fn pkg1_guard_a_the_queue_tick_delivers_the_authoritative_job_while_the_axis_hol
 #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
 fn pkg1_guard_b_a_partial_authoritative_write_resumes_while_the_axis_holds() {
     let fx = fx("pkg1-guard-b");
-    let (s, out) = recorder_seat(&fx, "pkg1-guard-b");
+    // The seat of `recorder_seat` without its bounded wait and its fixed sleep (HEAD-RULING-WALLCLOCK-3): `recorder_file_ready`.
+    let out = fx.dir.join("rx-pkg1-guard-b.bin");
+    let cmd = format!("stty raw -echo; exec cat > '{}'", out.display());
+    let s = fx.daemon.create_surface(None, Some(cmd), None, None, 24, 200).expect("recorder seat");
+    fx.daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+    recorder_file_ready(&out);
     let body = s4_1_body();
     *s.receiver_proof.lock().unwrap() = Some(Scripted::new(0, ProofLoss::AgentDead, Some((12, ProofLoss::Unknown("agent:denied".into())))));
     let id = enqueue(&fx, &s, &body);
@@ -1831,10 +1852,26 @@ fn pkg1_guard_b_a_partial_authoritative_write_resumes_while_the_axis_holds() {
     assert_eq!(hold_kind(&s), Some(QueueHoldKind::PartialExact), "premise: a byte-exact stop mid-body");
     assert_eq!(crate::governance::authoritative_pending(&fx.daemon, &s), Some(id.clone()), "premise: the axis is active");
     assert_eq!(crate::governance::queue_write_hold_block(&fx.daemon, &s), Some(crate::governance::BLOCKED_PARTIAL_WRITE));
-    wait_until("the resumed authoritative write settled", || queue_len(&s) == 0);
     let want = queue_bytes(&body);
-    wait_until("receiver got every byte", || std::fs::metadata(&out).map(|m| m.len() as usize).unwrap_or(0) >= want.len());
-    std::thread::sleep(Duration::from_millis(200));
+    // ★(HEAD-RULING-WALLCLOCK-3) No fixed sleep before the 'once' counts: wait for the point where the resumed run has fully
+    //   settled - the entry left the queue, the writer has nothing pending, its delivered and write_resumed events are out and
+    //   the receiver holds every byte. After it no queued entry or writer job is left that could write the entry again.
+    let end = Instant::now() + Duration::from_secs(30);
+    let settled = loop { // wallclock: guard the deadline only ends a hang; the resume settles because the axis is never requested
+        let done = queue_len(&s) == 0
+            && s.write_tx.gate().pending() == 0
+            && !events(&fx, "queue.delivered").is_empty()
+            && !events(&fx, "queue.write_resumed").is_empty()
+            && std::fs::metadata(&out).map(|m| m.len() as usize).unwrap_or(0) >= want.len();
+        if done {
+            break true;
+        }
+        if Instant::now() >= end {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert!(settled, "not within 30 s: the resumed authoritative write settled (queue {})", queue_len(&s));
     let got = std::fs::read(&out).unwrap();
     let delivered = events(&fx, "queue.delivered");
     assert_eq!(delivered.len(), 1, "delivered once");
