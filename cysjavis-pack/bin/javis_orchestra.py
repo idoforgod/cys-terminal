@@ -1744,6 +1744,39 @@ def _pack_identity():
     return root, os.path.basename(root)
 
 
+# ★0.14.56 PKG-3A M2(HEAD-RULING-PKG3A-R1 §1) — surface 번호는 데몬마다 따로 매겨져 서로 겹친다(리뷰어 실측
+#   2026-10-31: 126 이 base 와 dept-5 에 함께 있다). 그래서 `--surface` 의 행을 발부자 데몬에서 판정해도 되는 것은
+#   수신자가 **발부자 데몬에 있다고 레인 이름으로 밝혔을 때**(`<lane>/surface:N`)뿐이다 — 그 이름을 여기서 산출한
+#   발부자 레인과 맞춰 본다.
+BASE_LANE = "base"
+_LANE_TOKEN = r"[A-Za-z0-9._-]+"
+DEFAULT_SOCKET = os.path.join("~", ".local", "state", "cys", "cys.sock")
+
+
+def _issuer_lane():
+    """발부자 데몬의 레인 → `(lane, None)` 또는 판정 불가 `(None, 사유)`.
+
+    팩 basename 이 레인을 말한다(`pack` → base · `pack-dept-<X>` → `<X>`). 그 레인은 CYS_SOCKET 이 같은 레인을
+    가리킬 때만 유효하다 — `cys status` 는 팩이 아니라 소켓의 데몬을 읽는다. 규칙은
+    javis_report_gate.foreign_daemon_verdict 와 같다(부서 팩 = 소켓 경로에 `cys-dept-<X>` · 본사 팩 = 소켓 미설정 또는
+    기본 소켓). 단 부서 토큰은 부분 문자열이 아니라 **경로 성분 일치**로 잰다 — 부분 문자열이면 dept-5 팩이 dept-50
+    소켓과 맞는다. 판정 불가는 실패 방향이 안전하다: 호출자는 행을 판정하지 않고 UNVERIFIED 를 싣는다."""
+    root, base = _pack_identity()
+    sock = os.environ.get("CYS_SOCKET") or ""
+    m = re.fullmatch(r"pack-dept-(%s)" % _LANE_TOKEN, base)
+    if m:
+        token = "cys-dept-%s" % m.group(1)
+        if token in re.split(r"[\\/]", sock):
+            return m.group(1), None
+        return None, "dept pack %s needs CYS_SOCKET with a path component %s (got %s)" % (base, token, sock or "unset")
+    hq = os.path.realpath(os.path.expanduser(os.path.join("~", ".cys", "pack")))
+    if os.path.realpath(root) == hq:
+        if sock and os.path.realpath(os.path.expanduser(sock)) != os.path.realpath(os.path.expanduser(DEFAULT_SOCKET)):
+            return None, "base pack with a non-default CYS_SOCKET (%s)" % sock
+        return BASE_LANE, None
+    return None, "pack %s is neither the base pack nor a dept pack" % base
+
+
 def decl_value_strict(raw):
     """**정체성 값**(owner·scope) 검증 — 접지 않고, 폴백도 없다. 위반이면 `None`.
 
@@ -1897,17 +1930,18 @@ def _todo_lines_recipient(lines, recipient):
                  "선언하라.")
     import shlex                                # 지역 import — 이 형식에서만 쓴다
     sid, role = recipient.get("surface"), recipient.get("role")
+    ref = sid if isinstance(sid, str) else "surface:%s" % sid   # PKG-3A M2: `<lane>/surface:N` 또는 `surface:N`
     if isinstance(role, str) and ROLE_TOKEN_RE.fullmatch(role):
         cmd = "CYS_PACK_DIR=%s cys todo-path --role %s" % (shlex.quote(_pack_identity()[0]), role)
         lines.append("todo 우회(읽기 전용): `cys todo-path` 가 `CYS_SURFACE_ID 없음` 으로 거부되면(codex 셸은 CYS_* 를 "
                      "지운다) 경로를 추측하지 말고 `%s` 로 경로를, `%s --emit-decl` 로 선언을 읽어라 — 둘 다 아무것도 "
                      "만들지 않는다. 그 경로에 파일이 없으면 그 선언 한 줄을 첫 줄로 하여 만들어라. 역할 `%s` 는 발부 "
-                     "시점에 이 데몬의 surface:%s 행에서 읽은 값이다." % (cmd, cmd, role, sid))
+                     "시점에 이 데몬의 %s 행에서 읽은 값이다." % (cmd, cmd, role, ref))
     else:
         why = recipient.get("why") or "그 행의 역할이 형식 밖이다(kebab-case 아님)"
-        lines.append("todo 우회: 발부자는 surface:%s 의 역할을 읽지 못했다(%s). `cys todo-path` 가 거부되면 경로를 "
+        lines.append("todo 우회: 발부자는 %s 의 역할을 읽지 못했다(%s). `cys todo-path` 가 거부되면 경로를 "
                      "추측하지 말고 파일을 만들지 말고 master 에 보고하라 — 이 티켓은 경로 없이 진행하는 것을 "
-                     "허락하지 않는다." % (sid, why))
+                     "허락하지 않는다." % (ref, why))
 
 def build_task_ticket(task, scope, success, to_role, rules, output_format=None, prereq_block="", dont=None, tier_hint=None, probes=None, task_id=None, liveness_note=None, recipient=None):
     """위임 티켓 본문 생성. rules는 필수 — 호출자가 추출 성패를 알고 명시 주입한다
@@ -2019,22 +2053,29 @@ def cmd_task_prompt(args):
     #      산 좌석이 하나도 없으면 종전대로 거부(rc 1)한다.
     #   ② `--surface N` = 티켓이 실제로 갈 **그 행**을 `row_alive`(live_roles 와 같은 술어)로 잰다(#6-b · CEO 실측:
     #      surface:133 으로 보내는 중에 종전 게이트는 `worker`(s126)를 보고했다). 실패 방향 — 그 행이 죽었으면 거부
-    #      (rc 1 · 같은 역할의 다른 산 좌석은 이 티켓의 수신자가 아니다) · 이 데몬에 그 행이 없으면 발부하되
-    #      'liveness UNVERIFIED' 를 stderr 와 티켓 머리에 함께 싣는다(레인을 건너는 발부) · 생존 게이트를 생략하면
+    #      (rc 1 · 같은 역할의 다른 산 좌석은 이 티켓의 수신자가 아니다) · 수신자가 이 데몬에 있다고 레인으로 밝히지 않았으면
+    #      판정하지 않고 발부하되 'liveness UNVERIFIED' 를 stderr 와 티켓 머리에 함께 싣는다(아래 ★PKG-3A M2) · 생존 게이트를 생략하면
     #      발부하되 역할을 읽지 않았으므로 우회 줄이 "master 에 보고" 를 이름으로 말한다(추측 0).
     #   ★status 수집 실패는 두 형식 모두 종전대로 거부(rc 2)다.
-    sid = None
+    #   ★PKG-3A M2(HEAD-RULING-PKG3A-R1 §1 · head answer to the w53 plan) — ②는 수신자가 **발부자 데몬에 있다고 레인
+    #      이름으로 밝힌** `<lane>/surface:N` 일 때만 그 행을 잰다(`_issuer_lane` 과 일치). 맨 번호(`N`·`surface:N`)·다른
+    #      레인·발부자 레인 미상은 판정하지 않는다 — 번호는 데몬마다 겹쳐서 이 데몬의 같은 번호 행은 남의 좌석일 수 있다.
+    #      그때는 거부하지 않고 UNVERIFIED 를 stderr 와 티켓 머리에 싣고, 역할을 읽지 않았으므로 역할 기반 todo 우회도
+    #      싣지 않는다("master 에 보고"). 발부자 레인을 밝혔는데 그 행이 이 데몬에 없으면 그런 좌석이 없는 것이다 → 거부.
+    sid = lane = ref = None
     surface = getattr(args, "surface", None)
     if surface is not None:
-        m_sf = re.fullmatch(r"(?:surface:)?([0-9]+)", surface)
+        m_sf = re.fullmatch(r"(?:(%s)/)?(?:surface:)?([0-9]+)" % _LANE_TOKEN, surface)
         if not m_sf:
-            print("[task-prompt] --surface 는 N 또는 surface:N 만 허용: %r" % surface, file=sys.stderr)
+            print("[task-prompt] --surface 는 N · surface:N · <lane>/surface:N · <lane>/N 만 허용: %r" % surface,
+                  file=sys.stderr)
             return 2
-        sid = int(m_sf.group(1))
+        lane, sid = m_sf.group(1), int(m_sf.group(2))
+        ref = ("%s/surface:%d" % (lane, sid)) if lane else ("surface:%d" % sid)
     liveness_note = None
     recipient = None
     if sid is not None:
-        recipient = {"surface": sid, "role": None, "why": "생존 게이트를 생략해 status 를 읽지 않았다"}
+        recipient = {"surface": ref, "role": None, "why": "생존 게이트를 생략해 status 를 읽지 않았다"}
     if not getattr(args, "no_survival_gate", False):
         status = cys_status()
         if status is None:
@@ -2063,17 +2104,30 @@ def cmd_task_prompt(args):
                               "확인 후 전송하라(§5 능동 점검)." % (args.to, int(idle)), file=sys.stderr)
                     break
         else:
-            # ② 수신 surface 게이트
+            # ② 수신 surface 게이트 — 발부자 레인을 이름으로 밝힌 행만 잰다(위 ★PKG-3A M2)
             target = None
-            matched = [s for s in status.get("surfaces", []) if s.get("surface_id") == sid]
-            if not matched:
-                liveness_note = "liveness UNVERIFIED (recipient not on this daemon)"
-                recipient["why"] = "이 데몬의 status 에 그 surface 가 없다 — %s" % liveness_note
-                print("[task-prompt] surface:%d — %s: 이 데몬의 status 에 그 surface 가 없다. 거부하지 "
-                      "않고 티켓 머리에 같은 줄을 싣는다." % (sid, liveness_note), file=sys.stderr)
+            own, own_why = _issuer_lane()
+            if lane is None:
+                unv = "recipient daemon not named - use <lane>/surface:N"
+            elif own is None:
+                unv = "this daemon's lane is unknown: %s" % own_why
+            elif lane != own:
+                unv = "recipient on lane %s, this daemon is %s" % (lane, own)
+            else:
+                unv = None
+            matched = [s for s in status.get("surfaces", []) if s.get("surface_id") == sid] if unv is None else []
+            if unv is not None:
+                liveness_note = "liveness UNVERIFIED (%s)" % unv
+                recipient["why"] = "%s 의 행을 이 데몬에서 판정하지 않았다 — %s" % (ref, liveness_note)
+                print("[task-prompt] %s — %s: 번호는 데몬마다 겹치므로 이 데몬의 같은 번호 행으로 판정하지 않는다. "
+                      "거부하지 않고 티켓 머리에 같은 줄을 싣는다." % (ref, liveness_note), file=sys.stderr)
+            elif not matched:
+                print("[task-prompt] 수신 %s 가 이 데몬(레인 %s)의 status 에 없다 — 티켓 미출력." % (ref, own),
+                      file=sys.stderr)
+                return 1
             elif not any(row_alive(s) for s in matched):
-                print("[task-prompt] 수신 surface:%d('%s') 미기동 — 티켓 미출력. 같은 역할의 다른 좌석이 살아 "
-                      "있어도 그 좌석은 이 티켓의 수신자가 아니다." % (sid, matched[0].get("role") or "?"),
+                print("[task-prompt] 수신 %s('%s') 미기동 — 티켓 미출력. 같은 역할의 다른 좌석이 살아 "
+                      "있어도 그 좌석은 이 티켓의 수신자가 아니다." % (ref, matched[0].get("role") or "?"),
                       file=sys.stderr)
                 return 1
             else:
@@ -2087,9 +2141,8 @@ def cmd_task_prompt(args):
             if target is not None and target.get("agent_alive"):
                 idle = target.get("idle_secs")
                 if isinstance(idle, (int, float)) and idle >= idle_thr:
-                    print("[task-prompt] 주의: surface:%s('%s') idle %d초 — hang 여부를 read-screen으로 "
-                          "확인 후 전송하라(§5 능동 점검)." % (target.get("surface_id"), target.get("role"),
-                                                         int(idle)), file=sys.stderr)
+                    print("[task-prompt] 주의: %s('%s') idle %d초 — hang 여부를 read-screen으로 "
+                          "확인 후 전송하라(§5 능동 점검)." % (ref, target.get("role"), int(idle)), file=sys.stderr)
     rules = extract_worker_rules()
     if rules is None:
         print("[task-prompt] 경고: WORKER_DIRECTIVE '절대 강조 4규칙' 추출 실패 또는 "
@@ -6029,7 +6082,7 @@ def main():
     tp.add_argument("--success", default=None, help="성공 기준 (완료 보고의 검증 기준)")
     tp.add_argument("--to", default="worker", help="위임 대상 역할 (기본 worker)")
     tp.add_argument("--surface", default=None,
-                    help="수신 surface(N 또는 surface:N) — 지정하면 생존 게이트가 이 행을 재고 티켓의 todo 는 수신 좌석의 `cys todo-path` 가 산출한다(0.14.56 #6). 이 데몬에 없으면 거부하지 않고 liveness UNVERIFIED 를 stderr·티켓 머리에 싣는다. 미지정이면 0.14.55 그대로(--to 역할의 산 좌석 아무나 · 발부자 절대경로)")
+                    help="수신 surface — <lane>/surface:N (또는 <lane>/N · lane = base | dept 이름) 이면 그 레인이 이 데몬일 때만 생존 게이트가 그 행을 잰다(죽었거나 없으면 거부). 맨 N·surface:N·다른 레인은 surface 번호가 데몬마다 겹치므로 판정하지 않고 liveness UNVERIFIED 를 stderr·티켓 머리에 싣는다(거부 없음·역할 기반 todo 우회 없음 · 0.14.56 PKG-3A M2). 티켓의 todo 는 수신 좌석의 `cys todo-path` 가 산출한다(0.14.56 #6). 미지정이면 0.14.55 그대로(--to 역할의 산 좌석 아무나 · 발부자 절대경로)")
     tp.add_argument("--output-format", default=None,
                     help="산출 형식·구조 (W8 4-part output-format 슬롯 — 예: 'JSON {필드}', '마크다운 표', '보고서 PDF')")
     tp.add_argument("--requires-skills", default=None,

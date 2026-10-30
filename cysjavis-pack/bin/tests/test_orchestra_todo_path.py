@@ -19,7 +19,8 @@
 (B) **플레이스홀더 방치**: E1·P3 블록의 `<id>`·`<task-id>` 를 워커가 치환하지 않으면 done 게이트가
     대상 불일치로 거부한다. 발부자가 아는 값은 발부 시점에 박고(--task-id), 모르면 stderr 로 고지한다.
 (C) **수신 surface 를 잰 생존 게이트**(0.14.56 #6-b · `--surface` 형식에서만): 그 행을 `live_roles` 와 같은
-    술어로 잰다. 이 데몬에 없는 surface 는 거부하지 않고 'liveness UNVERIFIED' 를 stderr 와 티켓 머리에 적는다.
+    술어로 잰다 — 단 수신자가 발부자 데몬에 있다고 레인으로 밝힌 `<lane>/surface:N` 일 때만이다(PKG-3A M2 · X 절).
+    맨 번호·다른 레인·발부자 레인 미상은 거부하지 않고 'liveness UNVERIFIED' 를 stderr 와 티켓 머리에 적는다.
 
 ## 이 파일이 못박는 것
   N1 골든 픽스처 두 개(fixtures/task-prompt-noflag-{worker,worker-2}.txt · 9da2418d 코드가 만든 바이트)의 sha256 이
@@ -48,8 +49,10 @@
   C3 ★`--surface` 없이 역할 `worker` 의 산 좌석이 둘이어도 **발부한다**(exit 0 · 0.14.55 게이트 · CEO ⒞ 의
      실패 방향: 헌장 경로는 rc 1 로 답하지 않는다).
   C4 역할의 산 좌석이 하나면 발부(exit 0).
-  C5 이 데몬에 없는 surface 는 거부하지 않고 'liveness UNVERIFIED (recipient not on this daemon)' 를 stderr 와
-     티켓 머리에 함께 싣는다.
+  C5 맨 번호 surface 는 거부하지 않고 'liveness UNVERIFIED (…)' 를 stderr 와 티켓 머리에 함께 싣는다 ·
+     C5c 발부자 레인을 밝힌 surface 가 이 데몬에 없으면 거부(PKG-3A M2).
+  X1-X7 (PKG-3A M2) 한 번호가 두 데몬에 있어도 맨 번호는 판정하지 않는다 · 다른 레인·발부자 레인 미상도 같다 ·
+     발부자 레인을 밝힌 행만 판정(죽음 → 거부 · 삶 → 역할 우회) · 레인 토큰 위생 · --help 의 새 형식.
   C6 idle 경고는 --surface 의 그 행을 읽는다(같은 역할의 다른 행이 아니다).
   C7 --no-survival-gate 는 status 를 부르지 않는다(종전 그대로).
   C8 --surface 값 위생(N 또는 surface:N 만) — 위반 exit 2.
@@ -265,8 +268,6 @@ check("B3 부적격 id 거부(exit 2 · 명령문 보간 위생)",
       r_bad.returncode == 2 and "--task-id" in r_bad.stderr, "rc=%s" % r_bad.returncode)
 
 # ── C. 생존 게이트는 수신 surface 를 잰다 ───────────────────────────────────────
-UNVERIFIED = "liveness UNVERIFIED (recipient not on this daemon)"
-
 
 def row(sid, role, alive=True, idle=0, exited=False, status_age=None):
     st = {"state": "working", "age_secs": status_age} if status_age is not None else {}
@@ -299,90 +300,7 @@ def run_tp(rows, to="worker", surface=None, no_gate=False):
     return rc, out.getvalue(), err.getvalue(), calls[0]
 
 
-# C1 — CEO 실측 형상: 실제 수신자(surface:133, worker-7)가 죽었는데 같은 역할의 다른 좌석과 `worker` 는 살아 있다
-rc, so, se, _ = run_tp([row(126, "worker"), row(133, "worker-7", alive=False, status_age=9999),
-                        row(140, "worker-7")], to="worker", surface="133")
-check("C1 죽은 수신 surface 는 같은 역할의 산 좌석이 있어도 거부(exit 1 · 티켓 미출력)",
-      rc == 1 and so == "" and "surface:133" in se, "rc=%s se=%r" % (rc, se[-200:]))
-
-# C2 — 수신 surface 가 살아 있고 역할이 worker 가 아니다(역할 worker 는 아예 없다)
-rc, so, se, _ = run_tp([row(133, "worker-7")], to="worker", surface="surface:133")
-check("C2 산 수신 surface(역할 worker-7)는 역할 worker 부재여도 발부",
-      rc == 0 and "[작업 위임" in so and UNVERIFIED not in so, "rc=%s se=%r" % (rc, se[-200:]))
-
-# C3 — ★`--surface` 없이 역할 worker 의 산 좌석 둘: 0.14.55 게이트 그대로 발부(CEO ruling ebe80812 §1 · 실패 방향:
-#   헌장이 부르는 경로는 rc 1 로 답하지 않는다 — 막히면 헌장을 그대로 따른 좌석이 값을 치른다)
-rc, so, se, _ = run_tp([row(126, "worker"), row(150, "worker")], to="worker")
-check("C3 --surface 없음 · 역할 worker 의 산 좌석 둘 → 발부(exit 0 · 0.14.55 형식 · 거부 문구 없음)",
-      rc == 0 and "[작업 위임" in so and "WORKER_TODO.md" in so and "산 좌석이" not in se,
-      "rc=%s se=%r" % (rc, se[-240:]))
-
-# C4 — 역할의 산 좌석이 하나면 종전대로
-rc, so, se, _ = run_tp([row(126, "worker"), row(150, "worker", alive=False, exited=True)], to="worker")
-check("C4 역할의 산 좌석 하나 → 발부(exit 0)", rc == 0 and "[작업 위임" in so, "rc=%s se=%r" % (rc, se[-200:]))
-
-# C5 — 이 데몬에 없는 surface: 거부하지 않고 UNVERIFIED 를 stderr 와 티켓 머리에
-rc, so, se, _ = run_tp([row(126, "worker")], to="worker", surface="999")
-head = "\n".join(so.splitlines()[:3])
-check("C5 교차 데몬 surface → 발부(exit 0)·stderr 와 티켓 머리에 UNVERIFIED",
-      rc == 0 and UNVERIFIED in se and UNVERIFIED in head, "rc=%s head=%r se=%r" % (rc, head, se[-200:]))
-check("C5b 같은 데몬의 수신자에는 UNVERIFIED 없음(byte-동일 머리)",
-      UNVERIFIED not in run_tp([row(126, "worker")], to="worker")[1])
-
-# C6 — idle 경고는 그 행을 읽는다(같은 역할의 먼저 나오는 행이 아니다)
-idle_thr = int(os.environ.get("CYS_IDLE_SECONDS", "300"))
-rc, so, se, _ = run_tp([row(120, "worker-7", idle=0), row(133, "worker-7", idle=idle_thr + 699)],
-                       to="worker", surface="133")
-check("C6 idle 경고가 수신 surface:133 의 idle 을 읽는다",
-      rc == 0 and ("idle %d초" % (idle_thr + 699)) in se and "surface:133" in se, "se=%r" % se[-240:])
-
-# C7 — --no-survival-gate 는 status 를 읽지 않는다(Control Center 일회용 경로 · 종전 그대로)
-rc, so, se, calls = run_tp(None, to="worker", surface=None, no_gate=True)
-check("C7 --no-survival-gate → status 미호출·발부", rc == 0 and calls == 0 and "[작업 위임" in so,
-      "rc=%s calls=%s" % (rc, calls))
-
-# C8 — --surface 값 위생
-rc, so, se, _ = run_tp([row(126, "worker")], to="worker", surface="133;rm")
-check("C8 --surface 위생 위반 → exit 2", rc == 2 and so == "", "rc=%s" % rc)
-
-# C9 — CLI 가 --surface 를 받는다(생존 게이트는 --no-survival-gate 로 생략 — 파서 계약만)
-r_sf = subprocess.run([PY, ORCH, "task-prompt", "--task", "T", "--scope", "S", "--surface", "surface:12",
-                       "--no-survival-gate"],
-                      capture_output=True, text=True, encoding="utf-8", env=env, timeout=60)
-check("C9 CLI --surface 인자 수용", r_sf.returncode == 0 and "[작업 위임" in r_sf.stdout,
-      "rc=%s se=%r" % (r_sf.returncode, r_sf.stderr[-200:]))
-
-# C10 — live_roles 술어(cmd_check·self-test 의 소비)는 종전 그대로
-check("C10 live_roles 종전 술어",
-      orch.live_roles({"surfaces": [row(1, "cso"), row(2, "worker", alive=False),
-                                    row(3, "worker-7", alive=False, status_age=10),
-                                    row(4, "worker-9", exited=True)]})
-      == {"cso": True, "worker-7": True})
-
-# ── W. `--surface` 형식의 우회 줄 — 이름 붙은 거부 + 읽기 전용 우회(CEO ⒝ · 추측 0) ─────────────────────────
-REFUSAL = "CYS_SURFACE_ID 없음"
-rc, so, se, _ = run_tp([row(126, "worker"), row(133, "worker-7")], to="worker", surface="133")
-want_path = "CYS_PACK_DIR=%s cys todo-path --role worker-7" % shlex.quote(issuer_pack)
-check("W1 산 surface:133(worker-7) → 거부 이름(`%s`)과 우회 `%s`·`--emit-decl` 을 싣는다" % (REFUSAL, want_path),
-      rc == 0 and REFUSAL in so and want_path in so and (want_path + " --emit-decl") in so
-      and "--role worker " not in so and "--role worker`" not in so,
-      "rc=%s tail=%r" % (rc, so[-900:]))
-
-UNKNOWN = "역할을 읽지 못했다"
-for name, (rows, surface, no_gate) in {
-        "W2 이 데몬에 없는 surface": ([row(126, "worker")], "999", False),
-        "W3 --surface + --no-survival-gate": (None, "133", True),
-        "W4 형식 밖 역할(kebab 아님)": ([row(133, "Worker 7;rm -rf")], "133", False)}.items():
-    rc, so, se, _ = run_tp(rows, to="worker", surface=surface, no_gate=no_gate)
-    check("%s → 우회 명령 없음 · '%s … master 에 보고' 를 이름으로" % (name, UNKNOWN),
-          rc == 0 and UNKNOWN in so and "master 에 보고" in so and "todo-path --role" not in so
-          and "Worker 7;rm" not in so,
-          "rc=%s tail=%r" % (rc, so[-700:]))
-
-# ── X. 수신 surface 는 데몬에 결박된다 (0.14.56 PKG-3A M2 · HEAD-RULING-PKG3A-R1 §1) ─────────────────────────
-# surface 번호는 데몬마다 따로 매겨져 서로 겹친다(리뷰어 실측 2026-10-31: 126 이 base 와 dept-5 에 함께 있다). 발부자 데몬의
-# 행으로 판정해도 되는 것은 수신자가 **발부자 데몬에 있다고 이름으로 밝힌** `<lane>/surface:N` 일 때뿐이다. 그 밖(맨 번호 ·
-# 다른 레인 · 발부자 레인 미상)은 거부하지 않고 UNVERIFIED 를 stderr 와 티켓 머리에 싣고, 역할 기반 todo 우회를 싣지 않는다.
+# (PKG-3A M2) 발부자 레인 env — 수신 행은 `<lane>/surface:N` 이 발부자 레인일 때만 판정된다(X 절 머리 주석).
 LANE_UNV = "liveness UNVERIFIED"
 X_PACK = "/nonexistent-x/pack-dept-dept-T"
 X_SOCK = "/nonexistent-x/state/cys-dept-dept-T/cys.sock"
@@ -411,6 +329,95 @@ def run_x(rows, surface, pack=X_PACK, sock=X_SOCK):
         return run_tp(rows, to="worker", surface=surface)
 
 
+# C1 — CEO 실측 형상: 실제 수신자(surface:133, worker-7)가 죽었는데 같은 역할의 다른 좌석과 `worker` 는 살아 있다
+rc, so, se, _ = run_x([row(126, "worker"), row(133, "worker-7", alive=False, status_age=9999),
+                       row(140, "worker-7")], "dept-T/surface:133")
+check("C1 죽은 수신 surface 는 같은 역할의 산 좌석이 있어도 거부(exit 1 · 티켓 미출력)",
+      rc == 1 and so == "" and "surface:133" in se, "rc=%s se=%r" % (rc, se[-200:]))
+
+# C2 — 수신 surface 가 살아 있고 역할이 worker 가 아니다(역할 worker 는 아예 없다)
+rc, so, se, _ = run_x([row(133, "worker-7")], "dept-T/surface:133")
+check("C2 산 수신 surface(역할 worker-7)는 역할 worker 부재여도 발부",
+      rc == 0 and "[작업 위임" in so and LANE_UNV not in so, "rc=%s se=%r" % (rc, se[-200:]))
+
+# C3 — ★`--surface` 없이 역할 worker 의 산 좌석 둘: 0.14.55 게이트 그대로 발부(CEO ruling ebe80812 §1 · 실패 방향:
+#   헌장이 부르는 경로는 rc 1 로 답하지 않는다 — 막히면 헌장을 그대로 따른 좌석이 값을 치른다)
+rc, so, se, _ = run_tp([row(126, "worker"), row(150, "worker")], to="worker")
+check("C3 --surface 없음 · 역할 worker 의 산 좌석 둘 → 발부(exit 0 · 0.14.55 형식 · 거부 문구 없음)",
+      rc == 0 and "[작업 위임" in so and "WORKER_TODO.md" in so and "산 좌석이" not in se,
+      "rc=%s se=%r" % (rc, se[-240:]))
+
+# C4 — 역할의 산 좌석이 하나면 종전대로
+rc, so, se, _ = run_tp([row(126, "worker"), row(150, "worker", alive=False, exited=True)], to="worker")
+check("C4 역할의 산 좌석 하나 → 발부(exit 0)", rc == 0 and "[작업 위임" in so, "rc=%s se=%r" % (rc, se[-200:]))
+
+# C5 — 이 데몬에 없는 surface: 거부하지 않고 UNVERIFIED 를 stderr 와 티켓 머리에
+rc, so, se, _ = run_tp([row(126, "worker")], to="worker", surface="999")
+head = "\n".join(so.splitlines()[:3])
+check("C5 교차 데몬 surface → 발부(exit 0)·stderr 와 티켓 머리에 UNVERIFIED",
+      rc == 0 and LANE_UNV in se and LANE_UNV in head, "rc=%s head=%r se=%r" % (rc, head, se[-200:]))
+check("C5b 같은 데몬의 수신자에는 UNVERIFIED 없음(byte-동일 머리)",
+      LANE_UNV not in run_tp([row(126, "worker")], to="worker")[1])
+# C5c — 발부자 레인을 밝혔는데 그 행이 이 데몬에 없다 = 그런 좌석이 없다 → 거부(PKG-3A M2)
+rc, so, se, _ = run_x([row(126, "worker")], "dept-T/surface:999")
+check("C5c 발부자 레인 dept-T/surface:999 가 이 데몬에 없음 → 거부(rc 1·티켓 미출력)",
+      rc == 1 and so == "" and "dept-T/surface:999" in se, "rc=%s se=%r" % (rc, se[-200:]))
+
+# C6 — idle 경고는 그 행을 읽는다(같은 역할의 먼저 나오는 행이 아니다)
+idle_thr = int(os.environ.get("CYS_IDLE_SECONDS", "300"))
+rc, so, se, _ = run_x([row(120, "worker-7", idle=0), row(133, "worker-7", idle=idle_thr + 699)],
+                      "dept-T/133")
+check("C6 idle 경고가 수신 surface:133 의 idle 을 읽는다",
+      rc == 0 and ("idle %d초" % (idle_thr + 699)) in se and "surface:133" in se, "se=%r" % se[-240:])
+
+# C7 — --no-survival-gate 는 status 를 읽지 않는다(Control Center 일회용 경로 · 종전 그대로)
+rc, so, se, calls = run_tp(None, to="worker", surface=None, no_gate=True)
+check("C7 --no-survival-gate → status 미호출·발부", rc == 0 and calls == 0 and "[작업 위임" in so,
+      "rc=%s calls=%s" % (rc, calls))
+
+# C8 — --surface 값 위생
+rc, so, se, _ = run_tp([row(126, "worker")], to="worker", surface="133;rm")
+check("C8 --surface 위생 위반 → exit 2", rc == 2 and so == "", "rc=%s" % rc)
+
+# C9 — CLI 가 --surface 를 받는다(생존 게이트는 --no-survival-gate 로 생략 — 파서 계약만)
+r_sf = subprocess.run([PY, ORCH, "task-prompt", "--task", "T", "--scope", "S", "--surface", "surface:12",
+                       "--no-survival-gate"],
+                      capture_output=True, text=True, encoding="utf-8", env=env, timeout=60)
+check("C9 CLI --surface 인자 수용", r_sf.returncode == 0 and "[작업 위임" in r_sf.stdout,
+      "rc=%s se=%r" % (r_sf.returncode, r_sf.stderr[-200:]))
+
+# C10 — live_roles 술어(cmd_check·self-test 의 소비)는 종전 그대로
+check("C10 live_roles 종전 술어",
+      orch.live_roles({"surfaces": [row(1, "cso"), row(2, "worker", alive=False),
+                                    row(3, "worker-7", alive=False, status_age=10),
+                                    row(4, "worker-9", exited=True)]})
+      == {"cso": True, "worker-7": True})
+
+# ── W. `--surface` 형식의 우회 줄 — 이름 붙은 거부 + 읽기 전용 우회(CEO ⒝ · 추측 0) ─────────────────────────
+REFUSAL = "CYS_SURFACE_ID 없음"
+rc, so, se, _ = run_x([row(126, "worker"), row(133, "worker-7")], "dept-T/surface:133")
+want_path = "CYS_PACK_DIR=%s cys todo-path --role worker-7" % shlex.quote(X_PACK)
+check("W1 산 surface:133(worker-7) → 거부 이름(`%s`)과 우회 `%s`·`--emit-decl` 을 싣는다" % (REFUSAL, want_path),
+      rc == 0 and REFUSAL in so and want_path in so and (want_path + " --emit-decl") in so
+      and "--role worker " not in so and "--role worker`" not in so,
+      "rc=%s tail=%r" % (rc, so[-900:]))
+
+UNKNOWN = "역할을 읽지 못했다"
+for name, (rows, surface, no_gate) in {
+        "W2 이 데몬에 없는 surface": ([row(126, "worker")], "999", False),
+        "W3 --surface + --no-survival-gate": (None, "133", True),
+        "W4 형식 밖 역할(kebab 아님)": ([row(133, "Worker 7;rm -rf")], "dept-T/133", False)}.items():
+    with issuer_env(X_PACK, X_SOCK):
+        rc, so, se, _ = run_tp(rows, to="worker", surface=surface, no_gate=no_gate)
+    check("%s → 우회 명령 없음 · '%s … master 에 보고' 를 이름으로" % (name, UNKNOWN),
+          rc == 0 and UNKNOWN in so and "master 에 보고" in so and "todo-path --role" not in so
+          and "Worker 7;rm" not in so,
+          "rc=%s tail=%r" % (rc, so[-700:]))
+
+# ── X. 수신 surface 는 데몬에 결박된다 (0.14.56 PKG-3A M2 · HEAD-RULING-PKG3A-R1 §1) ─────────────────────────
+# surface 번호는 데몬마다 따로 매겨져 서로 겹친다(리뷰어 실측 2026-10-31: 126 이 base 와 dept-5 에 함께 있다). 발부자 데몬의
+# 행으로 판정해도 되는 것은 수신자가 **발부자 데몬에 있다고 이름으로 밝힌** `<lane>/surface:N` 일 때뿐이다. 그 밖(맨 번호 ·
+# 다른 레인 · 발부자 레인 미상)은 거부하지 않고 UNVERIFIED 를 stderr 와 티켓 머리에 싣고, 역할 기반 todo 우회를 싣지 않는다.
 def no_role_fallback(so):
     return "todo-path --role" not in so and UNKNOWN in so and "master 에 보고" in so
 
