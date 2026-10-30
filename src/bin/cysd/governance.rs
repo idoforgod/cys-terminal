@@ -14617,7 +14617,7 @@ mod tests {
     #[test]
     fn wh_guarded_collectors_called_only_from_two_sites() {
         let src = include_str!("governance.rs");
-        let prod = src.split("#[cfg(test)]").next().expect("프로덕션 구간");
+        let prod = src.split("\n#[cfg(test)]\nmod tests {").next().expect("프로덕션 구간");
         let mut hits: Vec<&str> = Vec::new();
         for line in prod.lines() {
             let t = line.trim_start();
@@ -15728,7 +15728,7 @@ mod tests {
     fn wrapper_delegates_to_the_promoted_collector_source_pin() {
         let src = include_str!("governance.rs");
         let prod = src
-            .split("#[cfg(test)]")
+            .split("\n#[cfg(test)]\nmod tests {")
             .next()
             .expect("프로덕션 구간 분리 실패");
         let at = prod
@@ -16915,7 +16915,7 @@ mod tests {
         // ⑤ 배선 핀: refresh_seat_cache 가 이 판정을 실제로 소비한다(생산자 경계 우회 금지).
         //    순수 함수만 있고 호출부가 상수면 ①~④가 전부 무의미해지므로 호출 자체를 못박는다.
         let src = include_str!("governance.rs");
-        let prod = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커 소실")];
+        let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 앵커 소실")];
         let at = prod
             .find("pub fn refresh_seat_cache")
             .expect("refresh_seat_cache 소실");
@@ -20323,7 +20323,12 @@ mod tests {
             ("governance", 6, 2, 1),
             // ★(0.14.52 · S-a C5b) +1 clear, +1 apply: the direct agent write's settlement (`DirectSettle::run`) applies the
             //   SAME clear-first reset / accepted-bytes step the handler applied at hand-off - moved to after the terminal.
-            ("handlers", 0, 2, 3),
+            // ★(0.14.56 · L-MODAL b65b993f) +1 apply: `send_frame_bound_modal_key` counts the accepted modal-key bytes as Machine
+            //   input under `input_gate`, only while `input_gen` is unchanged (the settle closure, handlers.rs:3294 @c764cdff). It is the same
+            //   accounting the legacy `send_key` path applies to key bytes (B1 0.14.30: CR submits, Ctrl-U/Ctrl-C cancel, other keys
+            //   accumulate); it sets no count and clears nothing, so no exempt marker is lowered and the question this pin exists for does
+            //   not arise. Accepted as intended by head ruling F-4 STEP 1 (B), HEAD-RULING-F4-STEP1.txt, 2026-10-30T22:37.
+            ("handlers", 0, 2, 4),
             // ★(0.14.52 · S-a C6a) the set (count reset) moved into the push settlement after the written Return; +1 apply: a push
             //   stopped before its Return counts its accepted prefix as machine input (`ScheduleSettle::count_prefix`) - the line was
             //   NOT submitted, so the exempt marker is not lowered (same rule as the queue's partial-write prefix).
@@ -20397,7 +20402,7 @@ mod tests {
     #[test]
     fn r1f_in_tick_wiring_source_pin() {
         let gov = include_str!("governance.rs");
-        let prod = &gov[..gov.find("#[cfg(test)]").expect("테스트 모듈 앵커")];
+        let prod = &gov[..gov.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 앵커")];
         let body = &prod[prod.find("fn check_agent_death_with_model(").expect("사망 감지 본체")..];
         let body = &body[..body.find("\nfn learn_stuck_candidates(").expect("본체 끝 앵커")];
         let tick = body.find("recount_exempted_esc_at_tick(daemon, &s);").expect("틱 되돌리기 호출");
@@ -20560,7 +20565,7 @@ mod tests {
         assert!(path.is_file(), "창이 지나면 그 틱에 쓴다");
         // 소스 핀 — `Err` 분기는 순수 갱신을 부르고, 그 분기에서 로그를 무조건 찍지 않는다.
         let src = include_str!("governance.rs");
-        let prod = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커")];
+        let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 앵커")];
         let f = &prod[prod.find("pub(crate) fn persist_queue_blocked_at(").expect("본체")..];
         let f = &f[..f.find("\n}\n").expect("끝")];
         let tail = &f[f.find("if r.is_err() {").expect("패닉 분기")..];
@@ -20573,7 +20578,7 @@ mod tests {
     #[test]
     fn rqfix2_deliver_queued_refcell_is_borrowed_only_inside_tick_defs() {
         let src = include_str!("governance.rs");
-        let prod = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커")];
+        let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 앵커")];
         let f = &prod[prod.find("\nfn deliver_queued(").expect("deliver_queued")..];
         let f = &f[..f.find("\n}\n").expect("끝")];
         assert_eq!(f.matches(".borrow_mut()").count(), 1, "차용 지점은 한 곳뿐이다");
@@ -20596,7 +20601,7 @@ mod tests {
     #[test]
     fn rqfix2_hint_claim_matches_force_deliver_gates_source_pin() {
         let src = include_str!("governance.rs");
-        let prod = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커")];
+        let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 앵커")];
         let force = &prod[prod.find("pub(crate) fn force_deliver_entry(").expect("force_deliver_entry")..];
         let force = &force[..force.find("\n}\n").expect("끝")];
         // 주석 줄은 제외한다(설명 주석이 '여기엔 quiescing 이 없다' 고 적는 것은 자유) — 코드 줄에만 사이클 창 판정이 없으면 된다.
@@ -20629,7 +20634,7 @@ mod tests {
     #[test]
     fn rqfix_lone_key_exempt_single_writer_and_wiring_source_pin() {
         let gov = include_str!("governance.rs");
-        let prod = &gov[..gov.find("#[cfg(test)]").expect("테스트 모듈 앵커")];
+        let prod = &gov[..gov.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 앵커")];
         assert_eq!(prod.matches("lone_key_exempt.store(").count(), 1, "① 표식 쓰기는 governance 생산 코드에 정확히 한 곳(sync_lone_key_exempt)");
         for (name, text) in [
             ("state", include_str!("state.rs")),
@@ -26836,7 +26841,7 @@ mod tests {
     #[test]
     fn queue_delivery_single_helper_shared_by_tick_and_rpc() {
         let src = include_str!("governance.rs");
-        let prod = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커 소실")];
+        let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 앵커 소실")];
         assert_eq!(
             prod.matches("crate::delivery::record_audited").count(),
             1,
@@ -26957,7 +26962,7 @@ mod tests {
         }
         const NARROWING: [&str; 3] = ["as u32", "as u16", "as usize"];
         let src = include_str!("governance.rs");
-        let raw = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커 소실")];
+        let raw = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 앵커 소실")];
         let code = strip_line_comments(raw);
         let hits: Vec<&str> = NARROWING
             .iter()
@@ -28770,7 +28775,7 @@ after-tick liveness alone does not attribute a clock defect",
 
         // ⓑ ★배선 핀 — 데몬이 그 사유를 버리지 않는다.
         let src = include_str!("governance.rs");
-        let prod = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커 소실")];
+        let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 앵커 소실")];
         let at = prod.find("    fn corpus(").expect("코퍼스 캐시 진입점 소실");
         let body = &prod[at..];
         let end = body.find("\n    }\n").expect("코퍼스 캐시 본문 끝을 못 찾았다");
@@ -29030,7 +29035,7 @@ after-tick liveness alone does not attribute a clock defect",
     #[test]
     fn badge_lifecycle_is_wired_to_observation_not_to_the_ceiling() {
         let src = include_str!("governance.rs");
-        let prod = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커 소실")];
+        let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 앵커 소실")];
         let at = prod.find("fn check_approvals").expect("check_approvals 소실");
         let body = &prod[at..];
         let close_at = body
@@ -29442,7 +29447,7 @@ after-tick liveness alone does not attribute a clock defect",
 
         // ── 전수 가드 ① 소스의 `const BLOCKED_*` 선언 이름 집합 = 위 표의 이름 집합 — 새 상수는 표의 어느 행에 드는지 정하게 만든다.
         let src = include_str!("governance.rs");
-        let prod = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커")];
+        let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 앵커")];
         let mut declared: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for (i, _) in prod.match_indices("const BLOCKED_") {
             let rest = &prod[i + "const ".len()..];
@@ -30215,7 +30220,7 @@ after-tick liveness alone does not attribute a clock defect",
                 .collect()
         };
         let gov = include_str!("governance.rs");
-        let prod = &gov[..gov.find("#[cfg(test)]").expect("테스트 모듈 앵커")];
+        let prod = &gov[..gov.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 앵커")];
         let lines = code_lines(prod);
         let want = [
             "pub(crate) fn diag_adapter_defs() -> Arc<(serde_json::Value, serde_json::Value)> {",
@@ -30454,7 +30459,7 @@ after-tick liveness alone does not attribute a clock defect",
             ("alert_route", include_str!("alert_route.rs")),
             ("schedule", include_str!("schedule.rs")),
         ] {
-            let prod = &text[..text.find("#[cfg(test)]").unwrap_or(text.len())];
+            let prod = &text[..text.find("\n#[cfg(test)]\nmod tests {").or_else(|| text.find("#[cfg(test)]")).unwrap_or(text.len())];
             let hits: Vec<&str> = prod.lines().filter(|l| l.contains("phantom_count_ctrl_u")).collect();
             assert!(hits.is_empty(), "{name} 제품 구간에 옛 코드 이름이 남았다(주석 포함 0건): {hits:?}");
         }
@@ -31812,7 +31817,7 @@ mod reflect_queue_tests {
     #[test]
     fn f1_resubmit_wired_into_watchdog_tick_before_queue_delivery() {
         let src = include_str!("governance.rs");
-        let prod = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커")];
+        let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 앵커")];
         let tick = &prod[prod.find("refresh_seat_cache(&daemon, &sys);").expect("틱 앵커(좌석 캐시 갱신)")..];
         let re = tick.find("resubmit_withheld_submits(&daemon);").expect("보류 CR 재제출 배선 소실");
         let dq = tick.find("deliver_queued(").expect("큐 배달");

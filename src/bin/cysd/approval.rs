@@ -2107,7 +2107,8 @@ pub(crate) mod tests {
                 continue;
             }
             let text = std::fs::read_to_string(&path).expect("소스 읽기");
-            let body = strip(text.split("\n#[cfg(test)]").next().unwrap_or(""));
+            let end = text.find("\n#[cfg(test)]\nmod tests {").or_else(|| text.find("\n#[cfg(test)]\npub(crate) mod tests {")).or_else(|| text.find("\n#[cfg(test)]")).unwrap_or(text.len());
+            let body = strip(&text[..end]);
             scanned += 1;
             literals += body
                 .lines()
