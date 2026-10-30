@@ -174,9 +174,13 @@ impl AssociationTable {
         }
     }
 
+    /// ★(0.14.56 · P1 r2 §10-5 N1) A token Return binds the body with that token only for the caller that holds it:
+    /// the token is announced on the event bus (`surface.submit_held`) and in `submit-held.json`, so the token alone
+    /// says nothing about who sent the Return. `caller` is the Return's resolved key; `None` (unresolved) never binds.
     pub(crate) fn take_received_token(&mut self, received: &HeldSubmitRetention, token: &str,
-        generation: u64, at: Instant) -> Option<HeldBody> {
+        caller: Option<&CallerKey>, generation: u64, at: Instant) -> Option<HeldBody> {
         let i = self.held.iter().position(|b| received.contains(b) && b.request_id == token
+            && caller.is_some_and(|c| b.caller == *c)
             && b.generation == generation && b.received_at <= at && at <= b.deadline)?;
         Some(self.held.remove(i))
     }
@@ -416,7 +420,7 @@ mod tests {
         let received=table.retain_for_receipt(now+MS,1,None);
         table.hold(body("late-admission",caller.clone(),1,now)).unwrap();
         assert!(matches!(table.take_received_return(&received,&caller,1,now+MS),Associate::NoBody));
-        assert!(table.take_received_token(&received,"late-admission",1,now+MS).is_none());
+        assert!(table.take_received_token(&received,"late-admission",Some(&caller),1,now+MS).is_none());
         assert_eq!(table.len(),1);
     }
 
@@ -446,14 +450,29 @@ mod tests {
         table.hold(body("once-token", CallerKey::Surface(72), 10, now)).unwrap();
         let first = table.retain_for_receipt(now + MS, 10, Some("once-token"));
         let second = table.retain_for_receipt(now + MS + MS, 10, Some("once-token"));
-        let bound = table.take_received_token(&first, "once-token", 10, now + MS)
+        let bound = table.take_received_token(&first, "once-token", Some(&CallerKey::Surface(72)), 10, now + MS)
             .expect("first retained token Return must bind its admitted body");
         assert_eq!(bound.request_id, "once-token");
         assert_eq!(bound.text, "body once-token");
         assert_eq!(bound.deadline, now + W);
-        assert!(table.take_received_token(&second, "once-token", 10, now + MS + MS).is_none(),
+        assert!(table.take_received_token(&second, "once-token", Some(&CallerKey::Surface(72)), 10, now + MS + MS).is_none(),
             "second retained token Return rebound an already taken body");
         assert_eq!(table.len(), 0);
         drop((first, second, bound));
+    }
+
+    /// ★(0.14.56 · P1 r2 §10-5 N1) A token binds only for the body's own caller: another caller or an unresolved one
+    /// (`None`) binds nothing and leaves the body held. Mutants M-N1a (drop the caller match) and M-N1b (an unresolved
+    /// caller binds by the token alone) each turn this red.
+    #[test]
+    fn a_token_binds_only_for_its_own_caller_and_never_for_an_unresolved_one() {
+        let now = Instant::now(); let mut table = AssociationTable::default();
+        table.hold(body("n1", CallerKey::Claimed(900), 4, now)).unwrap();
+        let received = table.retain_for_receipt(now + MS, 4, Some("n1"));
+        assert!(table.take_received_token(&received, "n1", Some(&CallerKey::Claimed(901)), 4, now + MS).is_none(), "another caller bound");
+        assert!(table.take_received_token(&received, "n1", None, 4, now + MS).is_none(), "an unresolved caller bound");
+        assert_eq!(table.ids(), ["n1"], "a refused token Return leaves the body held");
+        let bound = table.take_received_token(&received, "n1", Some(&CallerKey::Claimed(900)), 4, now + MS);
+        assert_eq!(bound.map(|b| b.request_id), Some("n1".to_string()));
     }
 }

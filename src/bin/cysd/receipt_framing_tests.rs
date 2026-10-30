@@ -260,7 +260,7 @@ mod unix_dispatch {
         rig.daemon.receipt_registry.test_clock(Some(deadline + Duration::from_millis(1)));
         let (mut late_conn, _) = rig.connection();
         send(&mut late_conn, json!({"id":"late","method":"surface.send_key","params":{
-            "surface_id":surface.id,"key":"Return","request_id":"late-token","queued":true}})).await;
+            "surface_id":surface.id,"from":"surface:9001","key":"Return","request_id":"late-token","queued":true}})).await;
         let late = reply(&mut late_conn).await;
         assert_eq!(late["error"]["code"], "submit_unbound");
         assert_eq!(surface.pending_queue.lock().unwrap().len(), 1);

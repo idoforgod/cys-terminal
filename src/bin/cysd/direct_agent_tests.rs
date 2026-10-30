@@ -185,17 +185,40 @@ fn a_different_callers_body_never_supersedes_and_each_return_binds_its_own() {
     assert_eq!(written_ids(&fx), [b, a]);
 }
 
-/// A migrated caller's Return carries the token; an unknown token is a typed zero-byte refusal.
+/// A migrated caller's Return carries the token; an unknown token is a typed zero-byte refusal. Both Returns come
+/// from the body's own caller (`from` 900), so the unknown-token refusal is the token match alone (N1, r2 §10-5).
 #[test]
 fn a_token_binds_its_body_and_an_unknown_token_writes_nothing() {
     let fx = fx("token");
     let s = seat(&fx, true);
     let a = id_of(&send(&fx, &s, 900, "tokened"));
-    let bad = rpc(&fx, "surface.send_key", json!({"surface_id": s.id, "key": "Return", "request_id": "w0-0"}));
+    let bad = rpc(&fx, "surface.send_key", json!({"surface_id": s.id, "key": "Return", "request_id": "w0-0", "from": "surface:900"}));
     assert_eq!(bad["error"]["code"], "submit_unbound", "{bad}");
     assert!(written_ids(&fx).is_empty());
-    let k = rpc(&fx, "surface.send_key", json!({"surface_id": s.id, "key": "Return", "request_id": a}));
+    let k = rpc(&fx, "surface.send_key", json!({"surface_id": s.id, "key": "Return", "request_id": a, "from": "surface:900"}));
     assert_eq!(k["result"]["bound"], "token", "{k}");
+    assert_eq!(written_ids(&fx), [a]);
+}
+
+/// ★(0.14.56 · P1 r2 §10-5 N1 · T-N1) A token binds only its own caller's body. A token Return from ANOTHER caller,
+/// or from a caller the daemon cannot resolve at all (no pane, no `from`, no peer pid), is refused with
+/// `submit_unbound` and writes nothing; the body stays held, and its own caller's token Return still binds it.
+/// At `ece8f1e8` both foreign Returns bind (`bound:"token"`). Mutants: drop `b.caller == caller` (M-N1a, dies at
+/// `other`); let an unresolved caller bind by the token alone (M-N1b, dies at `unresolved`).
+#[test]
+fn n1_a_token_return_from_another_or_an_unresolved_caller_is_refused_and_writes_nothing() {
+    let fx = fx("n1");
+    let s = seat(&fx, true);
+    let a = id_of(&send(&fx, &s, 900, "only 900 submits this"));
+    let other = rpc(&fx, "surface.send_key", json!({"surface_id": s.id, "key": "Return", "request_id": a, "from": "surface:901"}));
+    assert_eq!(other["error"]["code"], "submit_unbound", "another caller's token Return bound the body: {other}");
+    let req = Request { id: json!(2), method: "surface.send_key".into(), params: json!({"surface_id": s.id, "key": "Return", "request_id": a}) };
+    let crate::handlers::Reply::Single(unresolved) = dispatch(&fx.daemon, req, None) else { panic!("single reply") };
+    assert_eq!(unresolved["error"]["code"], "submit_unbound", "an unresolved caller's token Return bound the body: {unresolved}");
+    assert!(written_ids(&fx).is_empty(), "a refused token Return typed something");
+    assert_eq!(s.submit_assoc.lock().unwrap().ids(), [a.clone()], "the body stays held, untouched");
+    let own = rpc(&fx, "surface.send_key", json!({"surface_id": s.id, "key": "Return", "request_id": a, "from": "surface:900"}));
+    assert_eq!(own["result"]["bound"], "token", "{own}");
     assert_eq!(written_ids(&fx), [a]);
 }
 

@@ -7527,8 +7527,11 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
                 let any_held = surface.submit_assoc.lock().unwrap_or_else(|e| e.into_inner()).len() > 0;
                 let bound = match token {
                     Some(t) => {
+                        // ★(0.14.56 · P1 r2 §10-5 N1) The token binds only its own caller's body; an unresolved caller
+                        //   (`None`) binds nothing and gets the `submit_unbound` below, zero bytes.
+                        let caller = submit_caller_key(daemon, verified_from, caller_pid, &params);
                         let b = candidates.and_then(|captured| surface.submit_assoc.lock()
-                            .unwrap_or_else(|e| e.into_inner()).take_received_token(captured, t, epoch, now));
+                            .unwrap_or_else(|e| e.into_inner()).take_received_token(captured, t, caller.as_ref(), epoch, now));
                         let Some(b) = b else {
                             return Reply::Single(err_response(
                                 &id,
