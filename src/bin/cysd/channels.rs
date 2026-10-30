@@ -4614,38 +4614,17 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn h3_completion(what: &str, complete: impl Fn() -> bool) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !complete() { // wallclock: guard admitted H3 predecessor terminal or PTY ready receipt
-            assert!(std::time::Instant::now() < deadline, "H3_COMPLETION: {what}");
-            std::thread::yield_now();
-        }
-    }
-
-    #[cfg(unix)]
     fn h3_post_wait_case(redelivery: bool) {
         let _knob = crate::governance::HKnobGuard::set(&[("CYS_CHANNEL_REDELIVER_MAX", "2")]);
-        let d = tmp_daemon("h3-postwait");
-        seed_registered(&d, "slack", "t");
-        call(&d, "allow", json!({"channel": "slack", "sender_id": "U1"}), None);
-        let m = d.create_surface(None, Some("stty -echo; printf H3_READY; exec cat >/dev/null".into()), None,
-            Some("master".into()), 24, 80).expect("admitted PTY creation");
-        struct Cleanup(Arc<crate::state::Surface>);
-        impl Drop for Cleanup {
-            fn drop(&mut self) { let _ = self.0.child.lock().unwrap().kill(); }
-        }
-        let _cleanup = Cleanup(m.clone());
-        d.roles.lock().unwrap().insert("master".into(), m.id);
-        *m.agent_meta.lock().unwrap() = Some(("claude".into(), "/usr/local/bin/claude".into()));
-        h3_completion("ready after stty", || m.parser.lock().unwrap().screen().contents().contains("H3_READY"));
-        crate::governance::h_paint(&m, crate::governance::H_IDLE_SCREEN);
+        let (d, recorder) = p1_wc2_channel_rig("h3-postwait");
+        let m = recorder.surface.clone();
         let id = h3_seed(&d, "must remain queued", now());
         let previous_stamp = now() - INBOX_REDELIVER_TTL_SECS - 1.0;
         if redelivery {
             let conn = d.channels.lock().unwrap();
             conn.as_ref().unwrap().execute("UPDATE inbox SET state='injected', injected_ts=?2, redelivered=0 WHERE id=?1", params![id, previous_stamp]).unwrap();
         }
-        let release = crate::agent_queue_tests::hold_writer(&m);
+        let release = crate::agent_queue_tests::p1_hold_writer(&m);
         m.write_tx.send(crate::state::WriteReq::Inject {
             text: "previous row".into(), cr_delay_ms: 0, clear_first: false, guard: None,
         }).unwrap();
@@ -4654,8 +4633,12 @@ mod tests {
         let hook_seen = seen.clone();
         H3_AFTER_COOLDOWN.with(|slot| *slot.borrow_mut() = Some(Box::new(move || {
             assert!(clock_seat.write_tx.gate().pending() > 0, "predecessor is pending at skipped cooldown");
-            release.send(()).unwrap();
-            h3_completion("predecessor CR and terminal", || clock_seat.write_tx.gate().pending() == 0);
+            assert!(matches!(crate::agent_queue_tests::p1_wait_completion(
+                crate::agent_queue_tests::p1_writer_idle(&clock_seat), std::time::Duration::ZERO),
+                Err(crate::agent_queue_tests::P1WaitError::CompletionTimeout { event: "writer operation leases released" })),
+                "H3_NEVER: retained predecessor cannot acknowledge idle");
+            release.release(); // actual holder release; shared typed idle ACK follows predecessor CR
+
             clock_seat.inject_track.test_freeze_gap_at_done();
             hook_seen.store(true, std::sync::atomic::Ordering::Release);
         })));

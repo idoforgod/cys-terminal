@@ -3306,6 +3306,8 @@ fn send_frame_bound_modal_key(
         };
         if let Some(error) = try_write(surface, crate::state::WriteReq::Agent(Box::new(job)), id) { return error; }
     }
+    // Test observer is after successful admission and OUTSIDE input_gate (settlement takes that gate).
+    crate::agent_write::test_wait_settled(&request);
     match guard.settle_handoff(crate::state::INJECT_GUARD_WAIT_MS) {
         crate::state::InjectHandoff::CallerAborted => return err_response(id, crate::agent_write::GUARD_ABORTED,
             "zero modal-key bytes written: the observed frame changed or admission was cancelled; read a new frame before retrying"),
