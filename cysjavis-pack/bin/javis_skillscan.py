@@ -862,7 +862,26 @@ sys.dont_write_bytecode = True
 _SELF_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SELF_DIR not in sys.path:
     sys.path.append(_SELF_DIR)
-from _owned_process import CANCEL as _CANCEL, managed_main, worker_observer, pool_initializer_args, is_managed
+# PKG-3A #26: a pack missing the new leaf (skew, partial deploy, checkout run) still starts, loudly.
+try:
+    from _owned_process import CANCEL as _CANCEL, managed_main, worker_observer, pool_initializer_args, is_managed
+except Exception as _owned_err:
+    _OWNED_IMPORT_ERROR = '%s: %s' % (type(_owned_err).__name__, _owned_err)
+    print('[skillscan] owned-process leaf unavailable (%s) - running unmanaged; owned child runs report incomplete' % _OWNED_IMPORT_ERROR, file=sys.stderr)
+    import threading as _threading
+    _CANCEL = _threading.Event()
+    worker_observer = None
+    def managed_main(main, argv=None):
+        args = sys.argv[1:] if argv is None else argv
+        if len(args) >= 2 and args[-2] == '--owned-lifeline':
+            print('owned lifecycle unavailable: ' + _OWNED_IMPORT_ERROR, file=sys.stderr)
+            return 125
+        return main()
+    def pool_initializer_args():
+        return ()
+
+    def is_managed():
+        return False
 
 # [0.14.56 C-03 E(ii)] A pool that never becomes ready must not stall the scan, and stopping the pool must
 # never wait for a worker to leave on its own (design r2 d4af60af; measured on macOS 3.9.6 / 3.12.13 / 3.14.7,
@@ -878,6 +897,10 @@ from _owned_process import CANCEL as _CANCEL, managed_main, worker_observer, poo
 #     flushing (cli_main), because interpreter exit would join the survivor; a managed run is bounded by its owner.
 POOL_START_DEADLINE_S = 5.0   # provisional: set from the Windows healthy start time (M-D1(c), not yet measured)
 POOL_STOP_PHASE_S = 1.0
+# PKG-3A #23: the whole pool run, from submit, is bounded too (a worker that never returns no longer holds
+# f.result() forever). Measured 114 skills: pool 1.7 s, serial ~8 s (worker-9 sweep above); 60 s is the cap,
+# not an expectation. Expiry -> TimeoutError -> the bounded stop below and cmd_all's serial fallback.
+POOL_SCAN_DEADLINE_S = 60.0
 _POOL_UNBOUNDED = False
 
 
@@ -952,6 +975,7 @@ def _scan_with_pool(skills):
     ex = _cf.ProcessPoolExecutor(max_workers=min(8, (os.cpu_count() or 4)),
                                  initializer=worker_observer, initargs=pool_initializer_args())
     try:
+        scan_deadline = time.monotonic() + POOL_SCAN_DEADLINE_S
         probe = ex.submit(_pool_ready_probe)
         futures = [ex.submit(scan_skill, s) for s in skills]
         deadline = time.monotonic() + POOL_START_DEADLINE_S
@@ -965,6 +989,16 @@ def _scan_with_pool(skills):
             if done:
                 break
         probe.result()
+        while True:
+            if _CANCEL.is_set():
+                raise RuntimeError('cancelled during the pool scan')
+            remaining = scan_deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError('scan deadline %.1f s: %d of %d pool results missing'
+                                   % (POOL_SCAN_DEADLINE_S, sum(1 for f in futures if not f.done()), len(futures)))
+            _, pending = _cf.wait(futures, timeout=min(0.25, remaining))
+            if not pending:
+                break
         return [f.result() for f in futures]
     finally:
         if not _bounded_pool_stop(ex):

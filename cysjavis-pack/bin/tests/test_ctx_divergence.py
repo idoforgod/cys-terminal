@@ -395,13 +395,15 @@ class ActprobeSubmitComposer(unittest.TestCase):
     SUGGESTION = "✻ Working… (esc to interrupt)\n│ > try fixing the lint errors │\n"
     # A draft on a continuation row under an empty caret row: the regex reads the caret row as empty.
     CONTINUATION_DRAFT = "✻ Working… (esc to interrupt)\n❯ \n  the second line of my own draft\n"
+    # The only old-binary signature the probe accepts (PKG-3A #25): cys 0.14.54's clap rejection, measured 2026-10-31.
+    OLD_CLI_REJECT = "error: unexpected argument '--composer' found\n\nUsage: cys read-screen --surface <SURFACE>\n"
 
     def envelope(self, text, verdict, governed=True):
         return json.dumps({"text": text, "quiet_secs": 0.0,
                            "composer": {"verdict": verdict, "governed": governed}})
 
     def probe(self, replies):
-        """Runs the live probe (one budget, two reads) against scripted CLI replies [(rc, stdout)], in call order."""
+        """Runs the live probe (one budget, two reads) against scripted CLI replies [(rc, stdout[, stderr])], in call order."""
         import javis_actprobe as AP  # BIN is on sys.path (module top)
         calls, queue = [], list(replies)
 
@@ -409,8 +411,8 @@ class ActprobeSubmitComposer(unittest.TestCase):
             calls.append(list(argv[1:]))
             if not queue:
                 raise AssertionError("unexpected extra CLI call %r (calls so far %r)" % (argv[1:], calls))
-            rc, out = queue.pop(0)
-            return subprocess.CompletedProcess(argv, rc, stdout=out, stderr="")
+            rc, out, *err = queue.pop(0)
+            return subprocess.CompletedProcess(argv, rc, stdout=out, stderr=err[0] if err else "")
 
         args = AP.build_parser().parse_args(["submit", "--surface", self.SURFACE, "--reread", "1", "--interval", "0"])
         with patch.object(AP.subprocess, "run", fake_run), patch.object(AP.time, "sleep", lambda s: None):
@@ -465,16 +467,25 @@ class ActprobeSubmitComposer(unittest.TestCase):
         self.assertEqual(code, 0, reason)
 
     def test_old_binary_falls_back_to_plain_read_screen(self):
-        """Non-zero exit for --composer -> one plain read-screen per read, today's regex path (suggestion -> FAIL)."""
-        code, reason, calls = self.probe([(2, ""), (0, self.SUGGESTION), (2, ""), (0, self.SUGGESTION)])
+        """The CLI rejects --composer (an old binary) -> one plain read-screen per read, today's regex path (suggestion -> FAIL)."""
+        old = (2, "", self.OLD_CLI_REJECT)
+        code, reason, calls = self.probe([old, (0, self.SUGGESTION), old, (0, self.SUGGESTION)])
         self.assertEqual(code, 2, reason)
         plain = ["read-screen", "--surface", self.SURFACE]
         self.assertEqual(calls, [self.composer_call(), plain] * 2)
 
     def test_fallback_read_failure_is_indeterminate(self):
         """Both reads fail -> INDET (a read failure is never a verdict)."""
-        code, reason, _ = self.probe([(2, ""), (1, "")])
+        code, reason, _ = self.probe([(2, "", self.OLD_CLI_REJECT), (1, "")])
         self.assertEqual(code, 3, reason)
+
+    def test_other_composer_failure_is_indeterminate_without_a_plain_read(self):
+        """PKG-3A #25: a --composer failure that is not the CLI's own flag rejection -> INDET, no silent plain read."""
+        for reply in ((1, "", "daemon unreachable"), (2, ""), (2, "", "error: unexpected argument '--surface' found")):
+            with self.subTest(reply=reply):
+                code, reason, calls = self.probe([reply])
+                self.assertEqual(code, 3, reason)
+                self.assertEqual(calls, [self.composer_call()])
 
     def test_unparseable_composer_reply_is_indeterminate(self):
         """Exit 0 but not one JSON object (or a non-object composer) -> INDET, never the regex on raw stdout."""

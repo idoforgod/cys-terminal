@@ -295,17 +295,27 @@ def managed_main(main, argv=None):
         control, lifeline_fd = _acquire_managed(handle, is_windows, api)
         _CONTEXT = Managed(control, lifeline_fd)
         transferred = True
-        try:
-            code = main()
-        except SystemExit as exc:
-            code = exc.code if isinstance(exc.code, int) else 1
-        _CONTEXT.finish(0 if code is None else code)
     except (OSError, ValueError, IndexError) as exc:
         print('owned lifecycle unavailable: %s' % exc, file=sys.stderr)
         return 125
     finally:
         if control is not None and not transferred:
             _unwind_managed(api, private_fd=lifeline_fd if is_windows else None, control=control)
+    # Errors raised by main() are the tool's own (PKG-3A #27): reported as an unmanaged run would report
+    # them (traceback, rc 1) and completed with DONE - never relabelled as a lifecycle failure.
+    try:
+        code = main()
+    except SystemExit as exc:
+        code = exc.code if isinstance(exc.code, int) else 1
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        code = 1
+    try:
+        _CONTEXT.finish(0 if code is None else code)
+    except (OSError, ValueError) as exc:
+        print('owned lifecycle unavailable: %s' % exc, file=sys.stderr)
+        return 125
 
 
 def worker_lifeline():

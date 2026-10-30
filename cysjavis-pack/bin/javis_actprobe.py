@@ -206,13 +206,19 @@ class _ReadError(Exception):
 
 def _read_screen_live(ref):
     """One read -> (text, composer). D8 (design P1-DESIGN-056-r2 §9): `read-screen --composer` prints ONE JSON object
-    {text, composer} from one daemon frame. A non-zero exit (an old binary that does not know --composer) re-reads with
-    plain read-screen and returns composer=None (today's regex path). A null composer (an old daemon) is None too."""
+    {text, composer} from one daemon frame. Only the CLI's own rejection of the flag (an old binary that does not know
+    --composer) re-reads with plain read-screen and returns composer=None (today's regex path); any other non-zero
+    exit is _ReadError (INDET), never a silent downgrade (PKG-3A #25). A null composer (an old daemon) is None too."""
     out = subprocess.run([CYS_BIN, "read-screen", "--surface", ref, "--composer"],
-                         capture_output=True, text=True, timeout=12)
+                         capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=12)
     if out.returncode != 0:
+        # The only "old binary" signature: cys 0.14.54 (measured 2026-10-31) exits 2 with the clap text
+        #   error: unexpected argument '--composer' found
+        if out.returncode != 2 or "unexpected argument '--composer'" not in (out.stderr or ""):
+            raise _ReadError("cys read-screen --composer exit %s: %s"
+                             % (out.returncode, (out.stderr or "").strip()[:160]))
         out = subprocess.run([CYS_BIN, "read-screen", "--surface", ref],
-                             capture_output=True, text=True, timeout=12)
+                             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=12)
         if out.returncode != 0:
             raise _ReadError(f"cys read-screen exit {out.returncode}")
         return out.stdout, None

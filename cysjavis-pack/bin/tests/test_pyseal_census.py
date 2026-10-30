@@ -297,6 +297,10 @@ REFERENCING_FILES = (  # 정렬 key=str(코드포인트 순 · LC_ALL=C sort 와
     #   검체가 `sys.executable` 로 띄우는 python 자식은 전부 `_bare_env()` 를 거치므로 봉인이 그 실행에 적용된다
     #   (test_lane_redirect.py·test_role_authority_shell.py 와 같은 계급). 프로덕션 경로의 새 python 진입점이 아니다.
     "cysjavis-pack/bin/tests/test_phoenix_encoding_default.py",
+    # PKG-3A (0.14.56): a specimen, not an entry point - like test_wp18 it imports product modules
+    #   (javis_preflight, javis_skillscan, javis_checklist, javis_actprobe) in rig children, so their env
+    #   carries PYTHONDONTWRITEBYTECODE to keep .pyc out of the tree it measures.
+    "cysjavis-pack/bin/tests/test_pkg3a_owned_tools.py",
     # ★2026-09-08 통합 단계 등재(오너 참고1 · CONTRACTS §B-11 "음성 검체 1개 추가").
     #   **봉인 점검 결과(등재 = 이 선언)**: 새 python 진입점도 강제점도 **아니다** — 이 파일은
     #   봉인을 *강제*하는 게 아니라 봉인이 실제로 듣는지를 **관측**한다(데몬이 주입하는 env 를

@@ -41,7 +41,27 @@ _SELF_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SELF_DIR not in sys.path:
     sys.path.append(_SELF_DIR)
 
-from _owned_process import CANCEL as _CANCEL, run_owned, managed_main, is_managed as _managed_active
+# PKG-3A #26: a pack missing the new leaf (skew, partial deploy, checkout run) still starts, loudly.
+try:
+    from _owned_process import CANCEL as _CANCEL, run_owned, managed_main, is_managed as _managed_active
+except Exception as _owned_err:
+    _OWNED_IMPORT_ERROR = '%s: %s' % (type(_owned_err).__name__, _owned_err)
+    print('[preflight] owned-process leaf unavailable (%s) - running unmanaged; owned child runs report incomplete' % _OWNED_IMPORT_ERROR, file=sys.stderr)
+    import threading as _threading
+    _CANCEL = _threading.Event()
+    def run_owned(cmd, timeout, grace=0.0, force=5.0, cancel=None, env=None, encoding="utf-8"):
+        return {'returncode': None, 'diagnostic_returncode': None, 'kernel_returncode': None,
+                'stdout': '', 'stderr': '', 'stdout_bytes': b'', 'stderr_bytes': b'', 'timed_out': False,
+                'complete': False, 'cleanup': 'unknown', 'elapsed': 0.0,
+                'reason': 'owned-process leaf unavailable: ' + _OWNED_IMPORT_ERROR}
+    def managed_main(main, argv=None):
+        args = sys.argv[1:] if argv is None else argv
+        if len(args) >= 2 and args[-2] == '--owned-lifeline':
+            print('owned lifecycle unavailable: ' + _OWNED_IMPORT_ERROR, file=sys.stderr)
+            return 125
+        return main()
+    def _managed_active():
+        return False
 
 
 def _cancel_fence():
@@ -5310,7 +5330,8 @@ class Preflight:
                            timeout_s, grace=5, force=5, cancel=_CANCEL)
         code = result['returncode'] if result['complete'] else 125
         cleanup = {'state': ('verified_empty' if result['cleanup'] == 'verified_empty'
-                             else 'unknown'), 'reason': result['cleanup'] + ': ' + result['reason']}
+                             else 'unknown'), 'reason': result['cleanup'] + ': ' + result['reason'],
+                   'complete': result['complete']}
         return (code, result['stdout'], result['stderr'], result['timed_out'], cleanup)
 
     def c60_gate_wiring(self):
@@ -5378,8 +5399,17 @@ class Preflight:
             #    통과해 조용한 「차단 0건」이 됐다).
             #   exit 1 은 실패가 아니다(BLOCK 존재 = 정상 판정) · exit 2 는 도구 오류다.
             if _rc not in (0, 1):
-                raise ValueError("스캐너 exit %s · stderr: %s"
-                                 % (_rc, (_err or "").strip()[:200] or "(없음)"))
+                # PKG-3A #24: an incomplete owned run carries its reason; #26b (option A): C60 scans the TARGET
+                # pack's scanner by design, so when that is not preflight's own sibling, say so - a skewed pack
+                # (old scanner without the owned lifeline) ends exactly this way.
+                _why = ""
+                if _cleanup.get("complete") is False:
+                    _why = " · owned run incomplete: %s" % (_cleanup.get("reason") or "?")[:200]
+                    _own = os.path.join(_SELF_DIR, "javis_skillscan.py")
+                    if os.path.realpath(scan_tool) != os.path.realpath(_own):
+                        _why += (" · scanner %s is not preflight's own (%s) - pack skew?" % (scan_tool, _own))
+                raise ValueError("스캐너 exit %s · stderr: %s%s"
+                                 % (_rc, (_err or "").strip()[:200] or "(없음)", _why))
             if not (_out or "").strip():
                 raise ValueError("스캐너가 출력을 내지 않았다(빈 stdout)")
             data = json.loads(_out)

@@ -20,7 +20,23 @@ sys.dont_write_bytecode = True
 _SELF_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SELF_DIR not in sys.path:
     sys.path.append(_SELF_DIR)
-from _owned_process import run_owned, managed_main
+# PKG-3A #26: a pack missing the new leaf (skew, partial deploy, checkout run) still starts, loudly.
+try:
+    from _owned_process import run_owned, managed_main
+except Exception as _owned_err:
+    _OWNED_IMPORT_ERROR = '%s: %s' % (type(_owned_err).__name__, _owned_err)
+    print('[checklist] owned-process leaf unavailable (%s) - running unmanaged; owned child runs report incomplete' % _OWNED_IMPORT_ERROR, file=sys.stderr)
+    def run_owned(cmd, timeout, grace=0.0, force=5.0, cancel=None, env=None, encoding="utf-8"):
+        return {'returncode': None, 'diagnostic_returncode': None, 'kernel_returncode': None,
+                'stdout': '', 'stderr': '', 'stdout_bytes': b'', 'stderr_bytes': b'', 'timed_out': False,
+                'complete': False, 'cleanup': 'unknown', 'elapsed': 0.0,
+                'reason': 'owned-process leaf unavailable: ' + _OWNED_IMPORT_ERROR}
+    def managed_main(main, argv=None):
+        args = sys.argv[1:] if argv is None else argv
+        if len(args) >= 2 and args[-2] == '--owned-lifeline':
+            print('owned lifecycle unavailable: ' + _OWNED_IMPORT_ERROR, file=sys.stderr)
+            return 125
+        return main()
 
 PREFLIGHT_TIMEOUT = 240  # 초 — preflight subprocess 타임아웃(필수)
 PREFLIGHT_GRACE = 15
@@ -72,7 +88,8 @@ def _preflight_line(cmd, timeout):
     if code == 'timeout':
         return 'preflight: 실행불가(timeout)'
     if code is None:
-        return 'preflight: 실행불가'
+        # PKG-3A #24: the owned-run reason (e.g. cleanup not verified) is what the reader needs.
+        return 'preflight: 실행불가' + (' (%s)' % last[:120] if last else '')
     tail = (last or '')[:120]
     return f'preflight: exit {code} | {tail}' if tail else f'preflight: exit {code}'
 

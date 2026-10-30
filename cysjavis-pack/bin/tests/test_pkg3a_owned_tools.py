@@ -157,7 +157,7 @@ def t26a():
     empty = os.path.join(tmp, "skills")
     os.makedirs(empty)
     env = _env(tmp, CYS_PACK_DIR=os.path.join(tmp, "pack"))
-    for name, args in (("javis_preflight.py", ["--help"]), ("javis_skillscan.py", ["all", empty, "--json"]),
+    for name, args in (("javis_preflight.py", ["--help"]), ("javis_skillscan.py", ["all", "--roots", empty, "--json"]),
                        ("javis_checklist.py", ["--state", os.path.join(tmp, "none.md")])):
         rc, out, err = _run([PY, "-B", os.path.join(rig, name)] + args, env, 120)
         check("#26a %s starts without _owned_process.py and says so" % name,
