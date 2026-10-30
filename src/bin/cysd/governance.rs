@@ -33710,8 +33710,10 @@ mod h_machine_hold_tests {
     /// W-8; the W-6 one lives with the `#[cfg(unix)]` H3 channel rig). Renamed `_of_70` (the CI comment in windows-health.yml too).
     /// D3-BOUND I2: 70 -> 75, five additional POSIX recorder specimens; channel rig cases remain cfg(unix).
     /// D3-BOUND I3: 75 -> 81, six recorder-seat escalation/status/ownership specimens.
+    /// P1 WC (0.14.56 shared completion fixtures): 83 -> 86, class C +3 - two shared POSIX recorder (`p1_recorder`) controls and the
+    /// WC-1 per-case delayed/missing receipt control, whose cases are themselves recorder specimens. Renamed `_of_86` (the CI comment too).
     #[test]
-    fn r2f_dm_windows_ignore_attributes_are_exactly_the_decided_set_of_83() {
+    fn r2f_dm_windows_ignore_attributes_are_exactly_the_decided_set_of_86() {
         const REASON_A: &str = "S21 제출 정착·창 위 CR 보류는 유닉스 한정(send_settle_applies)";
         const REASON_B: &str = "윈도우 기본 H 마스크는 draft 축을 끈다(hold_axes_default(true)) — 이 검체는 유닉스 기본(draft 축) 동작을 본다";
         const REASON_C: &str = "좌석 명령이 POSIX 셸 문법";
@@ -33817,8 +33819,13 @@ mod h_machine_hold_tests {
             // L-CYCLE wire witnesses use the same POSIX recorder (REASON_C); portable claim/barrier tests remain enabled.
             ("handlers", "p1_e_t_d4_cycle_clear_needs_the_callers_own_live_claim", 'C'),
             ("handlers", "p1_e_t_d5_the_observed_generations_reach_the_guard_and_an_abort_is_a_refusal", 'C'),
+            // P1 WC shared completion fixtures: the seat is the POSIX recorder (`stty raw -echo; exec cat > file`) directly, or (wc1 control)
+            //   through the row specimens it runs, 17 of whose 18 cases are class C themselves.
+            ("agent_queue_tests", "p1_completion_recorder_barrier_covers_delayed_extra_bytes", 'C'),
+            ("agent_queue_tests", "p1_completion_explicit_holder_does_not_release_before_owner", 'C'),
+            ("agent_queue_tests", "p1_completion_wc1_each_case_delayed_and_missing_actual_receipt", 'C'),
         ];
-        assert_eq!(want.len(), 83, "결정한 집합은 83건(24 + 17 + 39 + 3)");
+        assert_eq!(want.len(), 86, "결정한 집합은 86건(24 + 17 + 42 + 3)");
         let needle = concat!("#[cfg_attr(not(unix), ", "ignore = \"");
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/cysd");
         let mut got: Vec<(String, String, char)> = Vec::new();
@@ -33845,8 +33852,8 @@ mod h_machine_hold_tests {
         got.sort();
         let mut want_sorted: Vec<(String, String, char)> = want.iter().map(|(a, b, c)| (a.to_string(), b.to_string(), *c)).collect();
         want_sorted.sort();
-        assert_eq!(got.len(), 83, "윈도우 `ignore` 가 {}건이다(결정 83건) — 새로 더했거나 뺐다: {got:?}", got.len());
-        assert_eq!(got, want_sorted, "윈도우 `ignore` 집합이 결정한 83건과 다르다 — 목록과 `ignore` 사유를 함께 고쳐라");
+        assert_eq!(got.len(), 86, "윈도우 `ignore` 가 {}건이다(결정 86건) — 새로 더했거나 뺐다: {got:?}", got.len());
+        assert_eq!(got, want_sorted, "윈도우 `ignore` 집합이 결정한 86건과 다르다 — 목록과 `ignore` 사유를 함께 고쳐라");
     }
 }
 
