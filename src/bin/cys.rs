@@ -6215,7 +6215,8 @@ fn run(command: Command) -> i32 {
                     }
                 }
                 let multi = sids.len() > 1;
-                // ★(0.14.42 · B5) 자기신고 from — `cys send` 와 같은 해석(교차 소켓 Claimed 키의 재료 · 비큐 요청만).
+                // ★(0.14.42 · B5) 자기신고 from — `cys send` 와 같은 해석(교차 소켓 Claimed 키의 재료 · 비큐 요청과
+                //   그 타이핑 가드 재시도에만 — 0.14.56 P1 r2 §10-5 · 명시 `--queued` 는 from 없음).
                 let from = cys::env_compat(ENV_SURFACE_ID).and_then(|s| parse_surface_ref(&s));
                 // ★(0.14.42 · A2 C2) 짝 Return 표식 — 단일 `Return|Enter` 만(다중 키·별칭은 원시 요청).
                 //   데몬은 이 발신자의 `cys send` 가 방금 큐로 자동 전환됐을 때만 이 Return 1회를
@@ -6241,10 +6242,15 @@ fn run(command: Command) -> i32 {
                             //   send_key --queued 는 Return/Enter 전용이라 안전).
                             //   이것이 없어서 노드 보고의 Enter 가 조용히 사라졌다.
                             Err(e) if should_queue_fallback_send_key(queued, key, &e) => {
-                                let r2 = request(
-                                    "surface.send_key",
-                                    json!({"surface_id": sid, "key": key, "queued": true, "pair_return": pair}),
-                                )?;
+                                // ★(0.14.56 · P1 r2 §10-5) The retry keeps the first request's self-declared `from`: the
+                                //   daemon keyed a cross-socket caller's held body by it (`Claimed`), so a retry without it
+                                //   cannot bind that body and orphans it. An explicit `--queued` stays from-less
+                                //   (`send_key_request_params`).
+                                let mut retry = json!({"surface_id": sid, "key": key, "queued": true, "pair_return": pair});
+                                if let Some(f) = from {
+                                    retry["from"] = json!(f);
+                                }
+                                let r2 = request("surface.send_key", retry)?;
                                 if r2["absorbed"].as_bool() == Some(true) {
                                     report_return_absorbed(&r2, &tag);
                                     sid_absorbed = true;
@@ -33307,7 +33313,8 @@ mod tests {
 
     /// ★(0.14.42 · B5) `send-key` 요청 파라미터(순수) — **비큐 요청에만** 자기신고 from(CYS_SURFACE_ID)을 싣는다.
     /// 데몬은 검증 신원이 없을 때만 그 from 을 짝 Return 표의 Claimed 키로 쓴다(교차 소켓 CEO → 부서장).
-    /// 명시 `--queued`·폴백 r2 는 종전 바이트 그대로다(queue.enqueued 페이로드 from=null 유지).
+    /// 명시 `--queued` 는 종전 바이트 그대로다(queue.enqueued 페이로드 from=null 유지). 타이핑 가드 폴백 r2 는 첫 요청의
+    /// from 을 싣는다(0.14.56 P1 r2 §10-5 — 교차 소켓 발신자의 Claimed 보유 본문이 재시도 Return 에 묶이게 한다).
     #[test]
     fn b_send_key_request_params_from_only_when_not_queued() {
         let ser = |v: &serde_json::Value| serde_json::to_string(v).unwrap();
@@ -33324,10 +33331,14 @@ mod tests {
         // 비큐 + from 결측 → 종전 바이트(결측은 값이 아니다 — null 도 싣지 않는다).
         let legacy = json!({"surface_id": 5, "key": "Down", "queued": false, "pair_return": false});
         assert_eq!(ser(&send_key_request_params(5, "Down", false, false, None)), ser(&legacy));
-        // 배선 핀: 첫 요청은 헬퍼(from 포함) · 폴백 r2 는 종전 인라인(from 없음) · from 은 Send 와 같은 해석.
+        // 배선 핀: 첫 요청은 헬퍼(from 포함) · 폴백 r2 는 종전 인라인 + 첫 요청의 from(P1 r2 §10-5) · from 은 Send 와 같은 해석.
+        // 행동 검체는 `n1_cli_send_key_typing_guard_retry_carries_the_first_requests_from`.
+        // 갈래 앵커는 닫는 괄호 없는 접두다(P1 L-MODAL 이 이 갈래에 필드를 더한다 · 합의 2026-10-30). 맨 `Command::SendKey {` 는
+        //   :3422 의 `{ .. } => IdentityConsumer::SendKey` 를 먼저 잡는다.
         let src = include_str!("cys.rs");
-        let arm = src.split("Command::SendKey { surface, to, queued, keys } => {").nth(1).expect("SendKey");
+        let arm = src.split("Command::SendKey { surface, to, queued, keys").nth(1).expect("SendKey");
         let arm = arm.split("Command::SetStatus").next().unwrap();
+        assert!(arm.contains("resolve_targets(&surface, &to)"), "앵커가 제품 갈래가 아니다");
         assert!(arm.contains("send_key_request_params(sid, key, queued, pair, from)"), "첫 요청은 헬퍼 경유");
         assert!(
             arm.contains("let from = cys::env_compat(ENV_SURFACE_ID).and_then(|s| parse_surface_ref(&s));"),
@@ -33336,7 +33347,58 @@ mod tests {
         let r2 = arm.split("Err(e) if should_queue_fallback_send_key(queued, key, &e) => {").nth(1).expect("r2");
         let r2 = &r2[..r2.find(")?;").expect("r2 끝")];
         assert!(r2.contains("\"queued\": true, \"pair_return\": pair}"), "폴백 r2 종전 바이트: {r2}");
-        assert!(!r2.contains("from"), "폴백 r2 에 from 금지(종전 페이로드 유지): {r2}");
+        assert!(r2.contains("if let Some(f) = from {") && r2.contains("retry[\"from\"] = json!(f);"),
+            "폴백 r2 는 첫 요청의 from 을 싣는다(P1 r2 §10-5): {r2}");
+    }
+
+    /// ★(0.14.56 · P1 r2 §10-5 · G5-4 (2)) The `cys send-key Return` typing-guard retry carries the same self-declared
+    /// `from` as the first request. The daemon keys a cross-socket caller's held body by that `from` (`Claimed`), so a
+    /// retry without it cannot bind the body and orphans it. Runs the real `run(Command::SendKey)` in-process against a
+    /// scripted fake daemon that refuses the first (non-queued) Return with the typing guard and records both requests.
+    /// At `ece8f1e8` the retry has no `from`. Mutant M-CLI1: build the retry without `from`.
+    #[cfg(unix)]
+    #[test]
+    fn n1_cli_send_key_typing_guard_retry_carries_the_first_requests_from() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<Value>>> = Default::default();
+        let rec = std::sync::Arc::clone(&seen);
+        let daemon = super::b360_tests::R2cDaemon::start(move |method, params| {
+            if method != "surface.send_key" {
+                return json!({"ok": true, "result": {}});
+            }
+            rec.lock().unwrap_or_else(|e| e.into_inner()).push(params.clone());
+            if params["queued"] == json!(true) {
+                json!({"ok": true, "result": {"surface_id": 5, "key": "Return", "queued": true, "depth": 1, "queue_entry_id": "q-1"}})
+            } else {
+                json!({"ok": false, "error": {"code": cys::ERR_TYPING_GUARD, "message": cys::MSG_TYPING_GUARD}})
+            }
+        });
+        struct Restore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (k, v) in &self.0 {
+                    match v {
+                        Some(v) => std::env::set_var(k, v),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+        let keys = [cys::ENV_SOCKET, "JAVIS_SOCKET", "AITERM_SOCKET", "CYS_NO_AUTOSTART", ENV_SURFACE_ID, "JAVIS_SURFACE_ID", "AITERM_SURFACE_ID"];
+        let _restore = Restore(keys.iter().map(|k| (*k, std::env::var_os(k))).collect());
+        for k in keys {
+            std::env::remove_var(k);
+        }
+        std::env::set_var(cys::ENV_SOCKET, &daemon.sock);
+        std::env::set_var("CYS_NO_AUTOSTART", "1");
+        std::env::set_var(ENV_SURFACE_ID, "900");
+        let rc = run(Command::SendKey { surface: Some("5".into()), to: None, queued: false, keys: vec!["Return".into()] });
+        let calls = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(rc, 0, "{calls:?}");
+        assert_eq!(calls.len(), 2, "the first Return and exactly one typing-guard retry: {calls:?}");
+        assert_eq!((calls[0]["queued"].clone(), calls[0]["from"].clone()), (json!(false), json!(900)), "{calls:?}");
+        assert_eq!((calls[1]["queued"].clone(), calls[1]["pair_return"].clone()), (json!(true), json!(true)), "{calls:?}");
+        assert_eq!(calls[1]["from"], json!(900), "the typing-guard retry dropped `from`: {:?}", calls[1]);
     }
 
     /// ★(0.14.42 · A2 C2) ABSORBED 포맷터 — OK·QUEUED 로 시작하지 않고, 본문 상태 3문구 · 다중 대상 접미.
