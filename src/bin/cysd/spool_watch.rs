@@ -1,7 +1,7 @@
 //! X-8 CARRIER (0.14.56) - the per-daemon spool watch (DESIGN-r3 e04f3f11, 4-2 .. 4-9).
 //!
 //! EVERY daemon (base and each dept - no dept skip, unlike the bridge spawner) reads the HUD bridge's tokenless `/health`
-//! once a minute, keeps the entries that are ITS OWN (dept: `socket` equals this daemon's socket path; base: `socket: null`
+//! once a minute, keeps the entries that are ITS OWN (dept: `socket` names this daemon's socket path - `same_socket`; base: `socket: null`
 //! lanes plus the global `_bridge` / `_fleet`), adds checks that do not trust the bridge's verdict (W1-W5) and publishes ONE
 //! observation named [`OFFICE_SPOOL_EVENT`] on its OWN bus. The same daemon's alert router delivers it to its own master
 //! (and, on the base, a bounded digest to the Secretariat). This module only READS: one local HTTP GET a minute and one
@@ -34,7 +34,7 @@ pub const SPOOL_BASENAME: &str = "evt_spool.jsonl";
 /// Who this daemon is, for the watch.
 #[derive(Clone, Debug)]
 pub struct Own {
-    /// This daemon's socket path, as the fleet registry spells it (compared verbatim with the `/health` entry's `socket`).
+    /// This daemon's socket path (compared with the `/health` entry's `socket` by [`same_socket`], not verbatim - m6).
     pub socket: String,
     /// The base daemon (not a `cys-dept-*` socket).
     pub is_base: bool,
@@ -88,14 +88,39 @@ pub fn parse_health(body: &[u8]) -> Result<Value, ()> {
     Ok(v)
 }
 
+/// The spelling rule W4 and the dept socket check share: separators and a trailing separator do not count; `windows`
+/// compares without case. Pure, so the Windows rule is testable on every host.
+fn norm_path(s: &str, windows: bool) -> String {
+    let t = s.replace('\\', "/");
+    let t = t.trim_end_matches('/').to_string();
+    if windows { t.to_lowercase() } else { t }
+}
+
 /// Path equality for W4: separators and a trailing separator do not count; Windows compares without case.
 fn same_path(reported: &str, own: &Path) -> bool {
-    fn norm(s: &str) -> String {
-        let t = s.replace('\\', "/");
-        let t = t.trim_end_matches('/').to_string();
-        if cfg!(windows) { t.to_lowercase() } else { t }
+    norm_path(reported, cfg!(windows)) == norm_path(&own.to_string_lossy(), cfg!(windows))
+}
+
+/// m6 (0.14.56 PKG-2): does the registry's `socket` name THIS daemon's socket? Equal under [`norm_path`] is mine. Under
+/// the unix rule only, a mismatch is checked once more with both parent directories resolved (`std::fs::canonicalize`,
+/// a read) and the file names compared - so `/tmp/...` and `/private/tmp/...` are one socket. A path that cannot be
+/// resolved (a pipe name, a missing directory) keeps the spelling answer. Never the dept slug: an entry with the same
+/// slug from another home is not this daemon.
+fn same_socket(reported: &str, own: &str, windows: bool) -> bool {
+    if norm_path(reported, windows) == norm_path(own, windows) {
+        return true;
     }
-    norm(reported) == norm(&own.to_string_lossy())
+    !windows && same_resolved(reported, own)
+}
+
+fn same_resolved(a: &str, b: &str) -> bool {
+    fn resolved(p: &str) -> Option<PathBuf> {
+        let p = Path::new(p);
+        let name = p.file_name()?;
+        let parent = p.parent().filter(|d| !d.as_os_str().is_empty())?;
+        std::fs::canonicalize(parent).ok().map(|d| d.join(name))
+    }
+    matches!((resolved(a), resolved(b)), (Some(x), Some(y)) if x == y)
 }
 
 fn lane_entry(lane: &str, state: &str, fault: bool, hint: Option<String>) -> Value {
@@ -144,7 +169,7 @@ pub fn observe(own: &Own, probe: &Result<Value, ()>, st: &mut WatchState) -> Val
                 }
                 let socket = e.get("socket").and_then(Value::as_str);
                 let global = lane.starts_with('_');
-                let is_mine = if own.is_base { socket.is_none() && !global } else { socket == Some(own.socket.as_str()) };
+                let is_mine = if own.is_base { socket.is_none() && !global } else { socket.is_some_and(|s| same_socket(s, &own.socket, cfg!(windows))) };
                 if is_mine {
                     mine += 1;
                     // W4: the reader's path for this lane is not this daemon's own pack spool.
@@ -298,6 +323,49 @@ mod tests {
         assert!(parse_health(b"{\"spool_schema\":1}").is_err());
         assert!(parse_health(b"{\"ok\":true}").is_err(), "a pre-0.14.56 bridge body has no spool field");
         assert!(parse_health(b"not json").is_err());
+    }
+
+    /// m6 (0.14.56 PKG-2): the registry may spell this daemon's socket through a symlinked parent (`/tmp` vs
+    /// `/private/tmp`) - still mine, so no W3 lane_unobserved after three probes. A neighbour socket in the same real
+    /// directory, and a socket with the same dept slug under another home, are not mine. The Windows rule never resolves.
+    #[cfg(unix)]
+    #[test]
+    fn spw_m6_symlinked_parent_spelling_is_mine_and_neighbours_are_not() {
+        let root = tmp("m6");
+        let real = root.join("real").join("cys-dept-dept-5");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+        std::fs::write(real.join("cys.sock"), b"").unwrap(); // a regular file stands in for the socket
+        let sp = spool_path_for_pack(&root);
+        let own_sock = real.join("cys.sock").to_string_lossy().into_owned();
+        let own = Own { socket: own_sock.clone(), is_base: false, lane: "dept-5".into(), spool_path: sp };
+        let via_link = root.join("link").join("cys-dept-dept-5").join("cys.sock").to_string_lossy().into_owned();
+        let neighbour = real.join("other.sock").to_string_lossy().into_owned();
+        let elsewhere = "/nonexistent-home-w51/.local/state/cys-dept-dept-5/cys.sock";
+        let (mut st, mut st2) = (WatchState::default(), WatchState::default());
+        let mut seen = Vec::new();
+        let mut other = Vec::new();
+        for _ in 0..3 {
+            seen.push(lanes(&observe(&own, &health(vec![entry("dept-5", Some(&via_link), "ok", false, None, None)], true), &mut st)));
+            let both = vec![entry("dept-5", Some(&neighbour), "ok", false, None, None), entry("dept-5", Some(elsewhere), "ok", false, None, None)];
+            other.push(lanes(&observe(&own, &health(both, true), &mut st2)));
+        }
+        println!("SPW-M6 via_link={seen:?} neighbours={other:?}");
+        let ok = vec![("dept-5".to_string(), "ok".to_string(), false)];
+        assert_eq!(seen, vec![ok.clone(), ok.clone(), ok], "the symlinked spelling is this daemon's own entry");
+        assert_eq!(other[2], vec![("dept-5".to_string(), "lane_unobserved".to_string(), true)], "neighbours are not mine");
+        assert!(!same_socket(&via_link, &own_sock, true), "the Windows rule compares names, it never resolves a path");
+    }
+
+    /// m6: the Windows rule (pure - runs on every host): a pipe name that differs only in case or separator spelling is
+    /// the same socket; under the unix rule case counts; another dept's pipe is not.
+    #[test]
+    fn spw_m6_windows_pipe_name_case_and_separators() {
+        let own = r"\\.\pipe\cys-dept-dept-5";
+        assert!(same_socket(r"\\.\pipe\CYS-Dept-Dept-5", own, true), "Windows pipe names compare without case");
+        assert!(same_socket("//./pipe/cys-dept-dept-5", own, true), "separator spelling does not count");
+        assert!(!same_socket(r"\\.\pipe\CYS-Dept-Dept-5", own, false), "the unix rule compares case");
+        assert!(!same_socket(r"\\.\pipe\cys-dept-dept-3", own, true), "another dept's pipe is not mine");
     }
 
     /// Q2 / Q8 (single-HQ negative): a dept daemon keeps ONLY its own socket's entry - never another dept's fault.
