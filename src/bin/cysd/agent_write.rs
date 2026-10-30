@@ -3086,3 +3086,15 @@ pub(crate) fn p1_observe_admission(
         surface_id, origin, notify: Box::new(notify),
     }))))
 }
+
+
+#[cfg(test)]
+pub(crate) struct P1SyncSettleGuard(bool);
+#[cfg(test)]
+impl Drop for P1SyncSettleGuard {
+    fn drop(&mut self) { SYNC_SETTLE.with(|slot| slot.set(self.0)); }
+}
+#[cfg(test)]
+pub(crate) fn p1_sync_settle(on: bool) -> P1SyncSettleGuard {
+    P1SyncSettleGuard(SYNC_SETTLE.with(|slot| slot.replace(on)))
+}

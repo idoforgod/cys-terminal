@@ -2133,10 +2133,11 @@ pub(crate) fn p1_writer_idle(s: &Arc<Surface>) -> Result<P1Admitted<()>, P1WaitE
 }
 
 /// Ordinary supervisor only. Returning `()` from the producer cannot fabricate admission.
-/// The caller disables test_sync_settle before invoking this asynchronous adapter.
+/// The adapter restores the calling thread's previous test_sync_settle mode on every exit.
 pub(crate) fn p1_supervisor_call<R>(
     s: &Arc<Surface>, call: impl FnOnce() -> R,
 ) -> (R, Result<P1Admitted<crate::agent_write::Terminal>, P1WaitError>) {
+    let _async_scope = crate::agent_write::p1_sync_settle(false);
     let seen = std::rc::Rc::new(std::cell::Cell::new(0usize));
     let failure = std::rc::Rc::new(std::cell::RefCell::new(None));
     let mut result = None;
@@ -2220,4 +2221,48 @@ fn p1_completion_idle_ack_is_after_release_and_late_subscription_is_safe() {
     let never = p1_start_completion("unreleased operation", |tx| sender.gate().p1_subscribe_idle(tx));
     assert_eq!(p1_wait_completion(never, Duration::ZERO), Err(P1WaitError::CompletionTimeout { event: "unreleased operation" }));
     drop(held);
+}
+
+
+struct P1QueueReservationNotification {
+    surface_id: u64,
+    notify: Box<dyn FnOnce(&Arc<Surface>, &crate::agent_write::Request)>,
+}
+thread_local! {
+    static P1_QUEUE_RESERVATION: std::cell::RefCell<Option<P1QueueReservationNotification>> = const { std::cell::RefCell::new(None) };
+}
+pub(crate) struct P1QueueReservationObserver(Option<P1QueueReservationNotification>);
+impl Drop for P1QueueReservationObserver {
+    fn drop(&mut self) { P1_QUEUE_RESERVATION.with(|slot| *slot.borrow_mut() = self.0.take()); }
+}
+/// Install before the tested producer call; the producer invokes this only after real admission.
+pub(crate) fn p1_on_queue_reserved(
+    surface_id: u64, notify: impl FnOnce(&Arc<Surface>, &crate::agent_write::Request) + 'static,
+) -> P1QueueReservationObserver {
+    P1QueueReservationObserver(P1_QUEUE_RESERVATION.with(|slot| slot.replace(Some(P1QueueReservationNotification {
+        surface_id, notify: Box::new(notify),
+    }))))
+}
+/// Notification only: called once after successful enqueue and installation of its reservation.
+pub(crate) fn p1_queue_reservation_admitted(s: &Arc<Surface>, request: &crate::agent_write::Request) {
+    P1_QUEUE_RESERVATION.with(|slot| {
+        let matching = slot.borrow().as_ref().is_some_and(|observer| observer.surface_id == s.id);
+        if matching {
+            let observer = slot.borrow_mut().take().unwrap();
+            assert_eq!(request.surface_id, s.id, "P1 reservation receipt belongs to this surface");
+            (observer.notify)(s, request);
+        }
+    });
+}
+
+#[test]
+fn p1_completion_reservation_registration_restores_outer_scope() {
+    let _outer = p1_on_queue_reserved(7, |_, _| {});
+    assert_eq!(P1_QUEUE_RESERVATION.with(|slot| slot.borrow().as_ref().unwrap().surface_id), 7);
+    {
+        let _inner = p1_on_queue_reserved(8, |_, _| {});
+        assert_eq!(P1_QUEUE_RESERVATION.with(|slot| slot.borrow().as_ref().unwrap().surface_id), 8);
+    }
+    assert_eq!(P1_QUEUE_RESERVATION.with(|slot| slot.borrow().as_ref().unwrap().surface_id), 7);
+    assert!(std::thread::spawn(|| P1_QUEUE_RESERVATION.with(|slot| slot.borrow().is_none())).join().unwrap());
 }
