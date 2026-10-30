@@ -7978,6 +7978,16 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
                     &format!("surface {sid} not found"),
                 ));
             };
+            // ★(0.14.56 · P1 E0 · design r2 §2 · head ruling a7cbc003) `composer: true` = the one-frame export: `text`,
+            //   `quiet_secs` and `composer` from ONE observation (`governance::observe_composer_export`). It comes before the
+            //   tail and delta reads, so a composer reply is never tail text beside a full-frame object. Without the key the
+            //   reply below is unchanged (an old daemon ignores the key; its consumers fall back).
+            if params.get("composer").and_then(|v| v.as_bool()).unwrap_or(false) {
+                let mut reply = crate::governance::observe_composer_export(&surface);
+                reply["surface_id"] = json!(sid);
+                reply["surface_ref"] = json!(surface_ref(sid));
+                return Reply::Single(ok_response(&id, reply));
+            }
             // ★(0.14.31 · WP-1 H-1 · CONTRACTS B-4) `quiet_secs` = 마지막 **PTY 출력** 이후 경과 초(f64).
             //   부트 폴링(`cys.rs boot_agent_on_surface` · 관문 보류 재관측)의 Boot Valve 가
             //   `idle_quiet = quiet_secs >= readiness::BOOT_VALVE_QUIET_SECS` 를 **생산**하는 유일한

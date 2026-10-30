@@ -8726,6 +8726,17 @@ impl ComposerVerdict {
             ComposerVerdict::Unknown => None,
         }
     }
+
+    /// The export vocabulary (`surface.read_text` `composer.verdict`, design r2 §2).
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            ComposerVerdict::Empty => "empty",
+            ComposerVerdict::Placeholder => "placeholder",
+            ComposerVerdict::Suggestion => "suggestion",
+            ComposerVerdict::Draft => "draft",
+            ComposerVerdict::Unknown => "unknown",
+        }
+    }
 }
 
 /// ★(0.14.56 · P1 D1 · design r3 §2 item 2) Adapters where the D1 verdict was MEASURED: claude (2.1.312 rig - suggestion cells SGR 2 with
@@ -8824,6 +8835,65 @@ pub(crate) fn composer_reads_empty(
 ) -> Option<Option<bool>> {
     d1_governs(s).then(|| composer_verdict(obs, placeholder).reads_empty())
 }
+
+/// ★(0.14.56 · P1 E0 · design r2 §2 "Export", r3 §2 · head ruling E0 a7cbc003 · API note API-E0-worker35.md 64cc32fd) The ONE
+/// caller-facing composer export. Every field comes from ONE collection: one [`observe_prompt_ext`] (one parser lock, the output
+/// generation read before it and after it, the quiet sample between) plus the input counters, bracketed by `input_gen`. Consumers
+/// (`surface.read_text` `composer:true`, the frame-bound modal key, the cycle CLI through the RPC) take this object; none
+/// re-derives a field or reads a generation of its own.
+/// - Not one frame (`!frame_consistent()`, or `input_gen` moved during the collection) → `output_gen: null`, `verdict: unknown`,
+///   `quiet_secs: 0.0`.
+/// - `governed` = [`d1_governs`]. Off D1 the verdict is `unknown` (no invented verdict) and readers keep their pin expression.
+/// - `quiet_secs` is the observation's own whole-second sample (floored; the threshold it feeds is whole, 3.0).
+/// - `owner`/`owner_kind` are informational, from the existing [`MachineDraft`] evidence on this observation's before-cursor text.
+pub(crate) fn observe_composer_export(s: &Arc<crate::state::Surface>) -> serde_json::Value {
+    let adapters = load_adapter_defs();
+    let (markers, placeholder) = surface_prompt_marker(s, &adapters).unwrap_or_default();
+    let governed = d1_governs(s);
+    let input_gen = s.input_gen.load(Ordering::Acquire);
+    let pending_bytes = s.pending_input_bytes.load(Ordering::Relaxed);
+    let human_bytes = s.pending_input.lock().unwrap_or_else(|e| e.into_inner()).human;
+    let obs = observe_prompt_ext(s, &markers, false);
+    composer_export_observed(s);
+    let owner = draft_machine_owned(s, obs.line.as_ref().map(|(before, _)| before.as_str()));
+    let consistent = obs.frame_consistent() && s.input_gen.load(Ordering::Acquire) == input_gen;
+    let verdict = if consistent && governed {
+        composer_verdict(&obs, placeholder.as_deref())
+    } else {
+        ComposerVerdict::Unknown
+    };
+    let (owner_name, owner_kind) = match owner {
+        Some(MachineDraft::OwnPaste) => ("own_paste", "daemon"),
+        Some(MachineDraft::MachineResidue { owner }) => ("machine", owner.kind()),
+        Some(MachineDraft::SubmittedResidue { owner: Some(owner) }) => ("machine", owner.kind()),
+        Some(MachineDraft::SubmittedResidue { owner: None }) => ("machine", "daemon"),
+        None => ("none", "unattributed"),
+    };
+    serde_json::json!({
+        "text": obs.screen,
+        "quiet_secs": if consistent { obs.quiet_secs as f64 } else { 0.0 },
+        "composer": {
+            "verdict": verdict.as_str(),
+            "governed": governed,
+            "modal": obs_modal_foreground(&obs),
+            "owner": owner_name,
+            "owner_kind": owner_kind,
+            "before_cursor_empty": obs.line.as_ref().map(|(before, _)| before.trim().is_empty()),
+            "after_cursor_present": obs.line.as_ref().map(|(_, after)| !after.trim().is_empty()),
+            "after_cursor_dim": obs.after_cursor_dim,
+            "input_gen": input_gen,
+            "output_gen": consistent.then_some(obs.output_gen),
+            "pending_bytes": pending_bytes,
+            "human_bytes": human_bytes,
+        },
+    })
+}
+
+/// [`observe_composer_export`]'s seam between the observation and the assembly. Production: nothing. The test twin (below the
+/// first test item) runs a specimen's hook there, so a specimen can move output or input after the one observation.
+#[cfg(not(test))]
+#[inline]
+fn composer_export_observed(_s: &crate::state::Surface) {}
 
 /// 입력줄 가시성(순수) — `(draft_visible, ghost_after_cursor)`. 새 판정을 만들지 않는다: 커서 앞 판독은 게이트의 [`input_line_state`] 를,
 /// 편집 영역 아래 판독은 [`composer_rest_empty`](= stale 리셋의 술어)를, 커서 뒤 판독은 [`maybe_reset_stale_pending_input`] 의 `after.trim().is_empty()` 와 같은 술어다.
@@ -13995,6 +14065,30 @@ pub(crate) static REAP_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 /// 37건 연쇄 실패 중 36건은 그 패닉의 poison 전파). 두 모듈이 이 한 락을 별칭으로 쓴다.
 #[cfg(test)]
 pub(crate) static PACK_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+thread_local! {
+    /// ★(0.14.56 · P1 E0) The specimen hook [`observe_composer_export`] runs after its one observation. Thread-local: the export
+    /// runs on the calling thread, so parallel specimens never see each other's hook.
+    static COMPOSER_EXPORT_HOOK: std::cell::RefCell<Option<Box<dyn Fn(&crate::state::Surface)>>> =
+        std::cell::RefCell::new(None);
+}
+
+/// Sets (or clears) this thread's [`COMPOSER_EXPORT_HOOK`].
+#[cfg(test)]
+pub(crate) fn set_composer_export_hook(hook: Option<Box<dyn Fn(&crate::state::Surface)>>) {
+    COMPOSER_EXPORT_HOOK.with(|h| *h.borrow_mut() = hook);
+}
+
+/// The test twin of the production no-op seam: runs this thread's hook, if any.
+#[cfg(test)]
+fn composer_export_observed(s: &crate::state::Surface) {
+    COMPOSER_EXPORT_HOOK.with(|h| {
+        if let Some(f) = h.borrow().as_ref() {
+            f(s)
+        }
+    });
+}
 
 /// env를 테스트 종료 시(패닉 포함) 이전 값으로 원복하는 가드 —
 /// 없던 값은 remove, 있던 값은 원복. 프로세스 전역 env 누수 차단.
@@ -20691,6 +20785,249 @@ mod tests {
         let e = daemon.next_queue_entry("[보고] p1".into(), None, "test");
         s.pending_queue.lock().unwrap().push_back(e);
         (daemon, s)
+    }
+
+    // ===== ★(0.14.56 · P1 E0 · design r2 §2 + T-V3 · head ruling a7cbc003 · API note 64cc32fd) the one-frame composer export.
+    //   Each specimen asks `surface.read_text` for `composer: true` through dispatch. At ece8f1e8 that reply carries no
+    //   `composer` (RED); the hook setter is the only new test symbol. =====
+
+    fn e0_read(daemon: &Arc<Daemon>, s: &crate::state::Surface, composer: bool) -> serde_json::Value {
+        let params = if composer { json!({"surface_id": s.id, "composer": true}) } else { json!({"surface_id": s.id}) };
+        let req = cys::Request { id: json!(1), method: "surface.read_text".into(), params };
+        let crate::handlers::Reply::Single(resp) = crate::handlers::dispatch(daemon, req, None) else { panic!("single reply") };
+        assert_eq!(resp["ok"], json!(true), "read_text failed: {resp}");
+        resp["result"].clone()
+    }
+
+    /// Clears this thread's export hook on drop (a failing specimen never leaves its hook to the next one on the thread).
+    struct E0Hook;
+    impl Drop for E0Hook {
+        fn drop(&mut self) {
+            super::set_composer_export_hook(None);
+        }
+    }
+    fn e0_hook(f: impl Fn(&crate::state::Surface) + 'static) -> E0Hook {
+        super::set_composer_export_hook(Some(Box::new(f)));
+        E0Hook
+    }
+
+    fn e0_contents(s: &crate::state::Surface) -> String {
+        s.parser.lock().unwrap_or_else(|e| e.into_inner()).screen().contents()
+    }
+
+    /// T-V3 (one frame): output moves (a whole publish: a selector-row screen, generation +2) between the one observation and
+    /// the assembly. The exported set stays the observed one: the pre-move text, the pre-move generation and the pre-move
+    /// modal (none). An attempt counts only when the specimen's own +2 is the only movement (no seat output inside it).
+    /// Mutants: the generation, the text or the modal taken from a second read after the observation.
+    #[test]
+    fn p1_e0_export_pairs_text_and_generation_from_the_one_observation() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p1-e0-frame");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (daemon, s) = wp5_seat("p1-e0-frame", "claude");
+        p1_measured(&s);
+        let at_hook = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+        let seen = Arc::clone(&at_hook);
+        let _h = e0_hook(move |s| {
+            seen.store(s.output_gen.load(AtomicOrdering::Acquire), AtomicOrdering::Release);
+            s.parser.lock().unwrap_or_else(|e| e.into_inner()).process("\x1b[2J\x1b[H❯ 1. Yes\r\n  2. No\x1b[1;3H".as_bytes());
+            s.output_gen.fetch_add(2, AtomicOrdering::AcqRel);
+        });
+        let mut checked = false;
+        for _ in 0..40 {
+            p1_paint_box(&s, "carry on please", true, true);
+            let painted = e0_contents(&s);
+            let pre = s.output_gen.load(AtomicOrdering::Acquire);
+            let r = e0_read(&daemon, &s, true);
+            let post = s.output_gen.load(AtomicOrdering::Acquire);
+            if pre % 2 != 0 || at_hook.load(AtomicOrdering::Acquire) != pre || post != pre + 2 {
+                std::thread::sleep(std::time::Duration::from_millis(50)); // not a verdict: the attempt is discarded
+                continue;
+            }
+            assert_eq!(r["composer"]["output_gen"], json!(pre), "the exported generation is not the observed one: {r}");
+            assert_eq!(r["text"], json!(painted), "the exported text is not the observed frame: {r}");
+            assert_eq!(r["composer"]["verdict"], json!("suggestion"), "{r}");
+            assert_eq!(r["composer"]["modal"], json!(false), "the modal is not the observed frame's: {r}");
+            assert_eq!((r["surface_id"].clone(), r["surface_ref"].clone()), (json!(s.id), json!(cys::surface_ref(s.id))));
+            checked = true;
+            break;
+        }
+        assert!(checked, "premise failed: no attempt without seat output");
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::test_stop_daemon(&daemon);
+    }
+
+    /// Invariant 3: the input generation moves during the collection -> not one frame: `output_gen` null, `verdict`
+    /// unknown, `quiet_secs` 0.0; `input_gen` is the value sampled at the start. Mutant: drop the input bracket.
+    #[test]
+    fn p1_e0_input_move_during_the_collection_exports_no_frame() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p1-e0-input");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (daemon, s) = wp5_seat("p1-e0-input", "claude");
+        p1_measured(&s);
+        let _h = e0_hook(|s| {
+            s.input_gen.fetch_add(1, AtomicOrdering::AcqRel);
+        });
+        p1_paint_box(&s, "carry on please", true, true);
+        let (r, gen0) = crate::state::test_until_no_pty_output(&s, "e0 input move", || {
+            quiet_since(&s, 10);
+            let gen0 = s.input_gen.load(AtomicOrdering::Acquire);
+            (e0_read(&daemon, &s, true), gen0)
+        });
+        assert_eq!(r["composer"]["output_gen"], json!(null), "{r}");
+        assert_eq!(r["composer"]["verdict"], json!("unknown"), "{r}");
+        assert_eq!(r["quiet_secs"], json!(0.0), "{r}");
+        assert_eq!(r["composer"]["input_gen"], json!(gen0), "{r}");
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::test_stop_daemon(&daemon);
+    }
+
+    /// Invariant 2: a publish in progress (odd generation) is not a frame: `output_gen` null, `verdict` unknown,
+    /// `quiet_secs` 0.0 although the stamp is 10 s old; the same seat once the publish ends exports all three. Mutants:
+    /// export the generation, or the quiet sample, without `frame_consistent()`.
+    #[test]
+    fn p1_e0_publish_in_progress_exports_no_frame() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p1-e0-odd");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (daemon, s) = wp5_seat("p1-e0-odd", "claude");
+        p1_measured(&s);
+        p1_paint_box(&s, "carry on please", true, true);
+        let mut odd = None;
+        for _ in 0..40 {
+            quiet_since(&s, 10);
+            let pre = s.output_gen.load(AtomicOrdering::Acquire);
+            if pre % 2 != 0 {
+                std::thread::sleep(std::time::Duration::from_millis(50)); // not a verdict: wait for an even start
+                continue;
+            }
+            s.output_gen.fetch_add(1, AtomicOrdering::AcqRel);
+            let r = e0_read(&daemon, &s, true);
+            let during = s.output_gen.load(AtomicOrdering::Acquire);
+            s.output_gen.fetch_add(1, AtomicOrdering::AcqRel);
+            if during == pre + 1 {
+                odd = Some(r);
+                break;
+            }
+        }
+        let r = odd.expect("premise failed: no attempt without seat output");
+        assert_eq!(r["composer"]["output_gen"], json!(null), "{r}");
+        assert_eq!(r["composer"]["verdict"], json!("unknown"), "{r}");
+        assert_eq!(r["quiet_secs"], json!(0.0), "{r}");
+        let (r, gen) = crate::state::test_until_no_pty_output(&s, "e0 even gen", || {
+            quiet_since(&s, 10);
+            (e0_read(&daemon, &s, true), s.output_gen.load(AtomicOrdering::Acquire))
+        });
+        assert_eq!(r["composer"]["output_gen"], json!(gen), "{r}");
+        assert_eq!(r["composer"]["verdict"], json!("suggestion"), "{r}");
+        let q = r["quiet_secs"].as_f64().expect("quiet_secs f64");
+        assert!((10.0..600.0).contains(&q), "the observation's quiet sample is not exported: {r}");
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::test_stop_daemon(&daemon);
+    }
+
+    /// The verdict and the cursor fields on a measured claude seat (suggestion / Home-moved draft / empty / selector row),
+    /// the scope bit off D1 (the same painted suggestion on a seat whose platform half is off reads `unknown`), and the reply
+    /// without `composer` unchanged. Mutants: drop the `governed` condition; a selector row exporting `modal: false`.
+    #[test]
+    fn p1_e0_export_fields_follow_the_d1_verdict_and_its_scope() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p1-e0-fields");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (daemon, s) = wp5_seat("p1-e0-fields", "claude");
+        p1_measured(&s);
+        let read = |label: &str| crate::state::test_until_no_pty_output(&s, label, || e0_read(&daemon, &s, true));
+        let c = |r: &serde_json::Value, k: &str| r["composer"][k].clone();
+        p1_paint_box(&s, "carry on please", true, true);
+        let r = read("suggestion");
+        assert_eq!(
+            (c(&r, "verdict"), c(&r, "governed"), c(&r, "before_cursor_empty"), c(&r, "after_cursor_present"), c(&r, "after_cursor_dim"), c(&r, "modal")),
+            (json!("suggestion"), json!(true), json!(true), json!(true), json!(true), json!(false)),
+            "{r}"
+        );
+        p1_paint_box(&s, "my own words", false, true);
+        let r = read("home-moved draft");
+        assert_eq!((c(&r, "verdict"), c(&r, "after_cursor_dim")), (json!("draft"), json!(false)), "{r}");
+        p1_paint_box(&s, "", false, true);
+        let r = read("empty");
+        assert_eq!(
+            (c(&r, "verdict"), c(&r, "after_cursor_present"), c(&r, "after_cursor_dim")),
+            (json!("empty"), json!(false), json!(null)),
+            "{r}"
+        );
+        paint_screen(&s, &["❯ 1. Yes", "  2. No"], 0, 2, true);
+        let r = read("selector row");
+        assert_eq!((c(&r, "verdict"), c(&r, "modal")), (json!("unknown"), json!(true)), "{r}");
+        // Off D1: the platform half off (as on Windows) - the same suggestion is not given a verdict.
+        s.d1_platform.store(false, AtomicOrdering::Relaxed);
+        p1_paint_box(&s, "carry on please", true, true);
+        let r = read("off D1");
+        assert_eq!((c(&r, "verdict"), c(&r, "governed")), (json!("unknown"), json!(false)), "{r}");
+        assert!(r["composer"]["output_gen"].is_u64(), "off D1 is still one frame: {r}");
+        // Off D1 a modal frame stays answerable (L-MODAL reads modal + output_gen, never the verdict): frame consistency and the
+        // modal are not tied to the D1 text-verdict scope.
+        paint_screen(&s, &["❯ 1. Yes", "  2. No"], 0, 2, true);
+        let r = read("off D1 selector row");
+        assert_eq!((c(&r, "verdict"), c(&r, "modal")), (json!("unknown"), json!(true)), "{r}");
+        assert!(r["composer"]["output_gen"].is_u64(), "an off-D1 modal frame must keep its generation: {r}");
+        // `composer` comes before the delta and tail branches: with `since_line` or `lines` beside it the reply is still the
+        // full-frame export (never tail text beside a full-frame object).
+        for extra in [json!({"since_line": 0}), json!({"lines": 3})] {
+            let mut params = json!({"surface_id": s.id, "composer": true});
+            params.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            let (r, screen) = crate::state::test_until_no_pty_output(&s, "composer beside delta/tail", || {
+                let req = cys::Request { id: json!(1), method: "surface.read_text".into(), params: params.clone() };
+                let crate::handlers::Reply::Single(resp) = crate::handlers::dispatch(&daemon, req, None) else { panic!("reply") };
+                (resp["result"].clone(), e0_contents(&s))
+            });
+            assert!(r["composer"].is_object() && r.get("next_cursor").is_none(), "{extra}: {r}");
+            assert_eq!(r["text"], json!(screen), "{extra}: {r}");
+        }
+        // No `composer` key: today's reply, key for key.
+        let r = crate::state::test_until_no_pty_output(&s, "plain", || e0_read(&daemon, &s, false));
+        let mut keys: Vec<&str> = r.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["latest_cursor", "quiet_secs", "surface_id", "surface_ref", "text"], "{r}");
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::test_stop_daemon(&daemon);
+    }
+
+    /// Invariant 4 + RAW human bytes: owner/owner_kind from the existing MachineDraft evidence, and the input counters as
+    /// sampled (human RAW, not clamped by pending). Mutants: clamp human by pending; map OwnPaste as `machine`.
+    /// (SubmittedResidue is not built here: it needs a recorded machine body explaining the screen - its arm is read, not run.)
+    #[test]
+    fn p1_e0_owner_fields_and_raw_input_counters() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p1-e0-owner");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (daemon, s) = wp5_seat("p1-e0-owner", "claude");
+        p1_measured(&s);
+        p1_paint_box(&s, "", false, true);
+        let read = |label: &str| crate::state::test_until_no_pty_output(&s, label, || e0_read(&daemon, &s, true));
+        let owner = |r: &serde_json::Value| (r["composer"]["owner"].clone(), r["composer"]["owner_kind"].clone());
+        let r = read("no evidence");
+        assert_eq!(owner(&r), (json!("none"), json!("unattributed")), "{r}");
+        s.set_pending_input(5);
+        s.mark_pending_input_owner(super::InputOwner::Claimed(7));
+        let r = read("claimed residue");
+        assert_eq!(owner(&r), (json!("machine"), json!("claimed")), "{r}");
+        assert_eq!(
+            (r["composer"]["pending_bytes"].clone(), r["composer"]["human_bytes"].clone(), r["composer"]["input_gen"].clone()),
+            (json!(5), json!(0), json!(s.input_gen.load(AtomicOrdering::Acquire))),
+            "{r}"
+        );
+        s.set_pending_input(0);
+        s.pending_input.lock().unwrap().human = 3;
+        let r = read("raw human");
+        assert_eq!(owner(&r), (json!("none"), json!("unattributed")), "a human byte is never machine-owned: {r}");
+        assert_eq!((r["composer"]["pending_bytes"].clone(), r["composer"]["human_bytes"].clone()), (json!(0), json!(3)), "{r}");
+        s.pending_input.lock().unwrap().human = 0;
+        s.inject_track.begin();
+        let r = read("own paste");
+        assert_eq!(owner(&r), (json!("own_paste"), json!("daemon")), "{r}");
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::test_stop_daemon(&daemon);
     }
 
     /// T-Q1 (r2 F18 STALL, traced): alt-screen claude seat, boxed composer, a dim suggestion on the marker row ->
