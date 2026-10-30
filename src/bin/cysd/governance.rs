@@ -33550,7 +33550,7 @@ mod h_machine_hold_tests {
     /// D3-BOUND I2: 70 -> 75, five additional POSIX recorder specimens; channel rig cases remain cfg(unix).
     /// D3-BOUND I3: 75 -> 81, six recorder-seat escalation/status/ownership specimens.
     #[test]
-    fn r2f_dm_windows_ignore_attributes_are_exactly_the_decided_set_of_81() {
+    fn r2f_dm_windows_ignore_attributes_are_exactly_the_decided_set_of_83() {
         const REASON_A: &str = "S21 제출 정착·창 위 CR 보류는 유닉스 한정(send_settle_applies)";
         const REASON_B: &str = "윈도우 기본 H 마스크는 draft 축을 끈다(hold_axes_default(true)) — 이 검체는 유닉스 기본(draft 축) 동작을 본다";
         const REASON_C: &str = "좌석 명령이 POSIX 셸 문법";
@@ -33653,8 +33653,11 @@ mod h_machine_hold_tests {
             ("agent_queue_tests", "d9_bound_i3_idle_nonwriter_hold_breaks_busy_continuity", 'C'),
             ("agent_queue_tests", "d9_bound_i3_controller_owned_claim_is_counted_once", 'C'),
             ("agent_queue_tests", "d9_bound_i3_late_refusal_does_not_restore_a_replaced_head_slot", 'C'),
+            // L-CYCLE wire witnesses use the same POSIX recorder (REASON_C); portable claim/barrier tests remain enabled.
+            ("handlers", "p1_e_t_d4_cycle_clear_needs_the_callers_own_live_claim", 'C'),
+            ("handlers", "p1_e_t_d5_the_observed_generations_reach_the_guard_and_an_abort_is_a_refusal", 'C'),
         ];
-        assert_eq!(want.len(), 81, "결정한 집합은 81건(24 + 17 + 37 + 3)");
+        assert_eq!(want.len(), 83, "결정한 집합은 83건(24 + 17 + 39 + 3)");
         let needle = concat!("#[cfg_attr(not(unix), ", "ignore = \"");
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/cysd");
         let mut got: Vec<(String, String, char)> = Vec::new();
@@ -33681,8 +33684,8 @@ mod h_machine_hold_tests {
         got.sort();
         let mut want_sorted: Vec<(String, String, char)> = want.iter().map(|(a, b, c)| (a.to_string(), b.to_string(), *c)).collect();
         want_sorted.sort();
-        assert_eq!(got.len(), 81, "윈도우 `ignore` 가 {}건이다(결정 81건) — 새로 더했거나 뺐다: {got:?}", got.len());
-        assert_eq!(got, want_sorted, "윈도우 `ignore` 집합이 결정한 81건과 다르다 — 목록과 `ignore` 사유를 함께 고쳐라");
+        assert_eq!(got.len(), 83, "윈도우 `ignore` 가 {}건이다(결정 83건) — 새로 더했거나 뺐다: {got:?}", got.len());
+        assert_eq!(got, want_sorted, "윈도우 `ignore` 집합이 결정한 83건과 다르다 — 목록과 `ignore` 사유를 함께 고쳐라");
     }
 }
 

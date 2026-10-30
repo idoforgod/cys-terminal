@@ -33547,6 +33547,27 @@ mod p1_cycle_tests {
                "expect_input_gen": s.input_gen.load(Ordering::Acquire), "admitted": admitted})
     }
 
+    /// The D4 claim predicate has no PTY dependency. This table runs on Windows too;
+    /// the separate recorder test retains its explicit POSIX byte-witness exception.
+    #[test]
+    fn p1_e_t_d4_claim_table_is_platform_independent() {
+        let me = std::process::id();
+        let now = crate::state::CYCLE_CLAIM_MAX_SECS + 100.0;
+        let claim = |pid, mono| crate::state::CycleClaim { pid, since: 0.0, mono, fire_id: None };
+        for (label, caller, held, expected) in [
+            ("no claim", Some(me), None, false),
+            ("both absent", None, None, false),
+            ("pid-less claim known caller", Some(me), Some(claim(None, now)), false),
+            ("pid-less claim unknown caller", None, Some(claim(None, now)), false),
+            ("own live claim", Some(me), Some(claim(Some(me), now)), true),
+            ("caller unknown", None, Some(claim(Some(me), now)), false),
+            ("another caller", Some(me.wrapping_add(1)), Some(claim(Some(me), now)), false),
+            ("expired own claim", Some(me), Some(claim(Some(me), 0.0)), false),
+        ] {
+            assert_eq!(crate::governance::cycle_clear_claimed(caller, held.as_ref(), now), expected, "{label}");
+        }
+    }
+
     /// T-D4 (r2 §5): `cycle_clear:true` is valid iff the caller's pid and the claim's pid are both present, equal, and the claim
     /// is not expired; every other combination is refused with `cycle_clear_unclaimed` and 0 bytes. The seat's bytes after all
     /// refusals are exactly one valid cycle clear plus one plain `--clear-first` (absent -> today's path, no claim needed).
