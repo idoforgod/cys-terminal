@@ -21077,7 +21077,7 @@ mod tests {
         }
         assert!(checked, "premise failed: no attempt without seat output");
         let _ = s.child.lock().unwrap().kill();
-        crate::state::test_stop_daemon(&daemon);
+        crate::state::p1_e0_stop_daemon(&daemon);
     }
 
     /// Invariant 3: the input generation moves during the collection -> not one frame: `output_gen` null, `verdict`
@@ -21103,7 +21103,7 @@ mod tests {
         assert_eq!(r["quiet_secs"], json!(0.0), "{r}");
         assert_eq!(r["composer"]["input_gen"], json!(gen0), "{r}");
         let _ = s.child.lock().unwrap().kill();
-        crate::state::test_stop_daemon(&daemon);
+        crate::state::p1_e0_stop_daemon(&daemon);
     }
 
     /// Invariant 2: a publish in progress (odd generation) is not a frame: `output_gen` null, `verdict` unknown,
@@ -21147,7 +21147,7 @@ mod tests {
         let q = r["quiet_secs"].as_f64().expect("quiet_secs f64");
         assert!((10.0..600.0).contains(&q), "the observation's quiet sample is not exported: {r}");
         let _ = s.child.lock().unwrap().kill();
-        crate::state::test_stop_daemon(&daemon);
+        crate::state::p1_e0_stop_daemon(&daemon);
     }
 
     /// The verdict and the cursor fields on a measured claude seat (suggestion / Home-moved draft / empty / selector row),
@@ -21213,7 +21213,7 @@ mod tests {
         keys.sort_unstable();
         assert_eq!(keys, ["latest_cursor", "quiet_secs", "surface_id", "surface_ref", "text"], "{r}");
         let _ = s.child.lock().unwrap().kill();
-        crate::state::test_stop_daemon(&daemon);
+        crate::state::p1_e0_stop_daemon(&daemon);
     }
 
     /// A poisoned parser lock (a holder panicked inside it) is not one frame. `observe_prompt_ext` recovers the guard with
@@ -21254,7 +21254,7 @@ mod tests {
             assert_eq!(r["composer"]["output_gen"], json!(null), "{label}: a poisoned frame kept its generation: {r}");
             assert_eq!((r["composer"]["verdict"].clone(), r["quiet_secs"].clone()), (json!("unknown"), json!(0.0)), "{label}: {r}");
             let _ = s.child.lock().unwrap_or_else(|e| e.into_inner()).kill();
-            crate::state::test_stop_daemon(&daemon);
+            crate::state::p1_e0_stop_daemon(&daemon);
         }
     }
 
@@ -21292,7 +21292,7 @@ mod tests {
         let r = read("own paste");
         assert_eq!(owner(&r), (json!("own_paste"), json!("daemon")), "{r}");
         let _ = s.child.lock().unwrap().kill();
-        crate::state::test_stop_daemon(&daemon);
+        crate::state::p1_e0_stop_daemon(&daemon);
     }
 
     /// T-Q1 (r2 F18 STALL, traced): alt-screen claude seat, boxed composer, a dim suggestion on the marker row ->
@@ -30775,9 +30775,8 @@ after-tick liveness alone does not attribute a clock defect",
 
     /// A6r (min-interval site, `deliver_head_locked`): the per-seat delivery interval relaxes by the age of the oldest blocked item
     /// (§4 AGES), so an old report behind a fresh head-placed job relaxes it as the pin's front would have. Base 8 s, max wait 1 s,
-    /// last delivery 2.5 s ago: the old report's measured wait (>= 2 s, uptime clamp) halves the interval twice, to 2 s -> delivery (the
-    /// authoritative front). Control first: the fresh job alone keeps the 8 s interval -> nothing (wide margins: a stall would have to
-    /// last 5.5 s to flip the control). Mutant: the site reads `q.front()`.
+    /// last delivery 2.5 s ago under one explicit epoch/Instant snapshot: old age 2 s halves the interval twice, to 2 s -> delivery.
+    /// The fresh-only control has age 0 at that same snapshot; a scheduler delay cannot age it. Mutant: the site reads `q.front()`.
     #[test]
     fn d9_order_a6r_min_interval_relaxes_on_the_old_report_behind_a_fresh_front() {
         let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -30788,16 +30787,19 @@ after-tick liveness alone does not attribute a clock defect",
             ("CYS_QUEUE_MAX_WAIT_SECS", "1"),
         ]);
         let (daemon, s) = d9r_seat("d9-a6r-int");
-        std::thread::sleep(std::time::Duration::from_millis(2300)); // uptime clamp: an old entry's measured wait reaches 2 s
-        let a = d9r_auth(&daemon, "[RESUME] a6r", "surface:8");
+        let epoch = now_epoch() + 10_000.0;
+        let monotonic = Instant::now();
+        let _clock = super::P1QueueClockSnapshot::set(epoch, monotonic);
+        let mut a = d9r_auth(&daemon, "[RESUME] a6r", "surface:8");
+        a.enqueued_at = epoch;
         let a_id = a.id.clone();
         s.pending_queue.lock().unwrap().push_back(a);
-        let last = std::time::Instant::now() - std::time::Duration::from_millis(2500);
+        let last = monotonic - std::time::Duration::from_millis(2500);
         *s.last_queue_delivery_at.lock().unwrap() = Some(last);
         let control = deliver_head_locked(&daemon, &s, true, false, None, None, None, None, None);
         assert!(control.is_none(), "control: a fresh front alone keeps the 8 s interval");
         let mut old = daemon.next_queue_entry("[보고] old".into(), Some("surface:9".into()), "send");
-        old.enqueued_at -= 700.0;
+        old.enqueued_at = epoch - 2.0;
         s.pending_queue.lock().unwrap().push_back(old);
         let d = deliver_head_locked(&daemon, &s, true, false, None, None, None, None, None);
         let _ = s.child.lock().unwrap().kill();
@@ -30806,27 +30808,32 @@ after-tick liveness alone does not attribute a clock defect",
     }
 
     /// A6r (starve site, `deliver_queued` -> `queue.starved`): a report blocked past the alert threshold behind a fresh head-placed job
-    /// still raises `queue.starved`, naming the report. Control first: the fresh job alone raises nothing (threshold 2 s: a stall would
-    /// have to last 2 s to flip the control). Mutant: the site reads `q.front()`.
+    /// still raises `queue.starved`, naming the report. One explicit epoch makes fresh age 0 and old age 3; an empty-seat gate holds
+    /// delivery by state rather than a last-output grace period. Mutant: the site reads `q.front()`.
     #[test]
     fn d9_order_a6r_queue_starved_names_the_old_report_behind_a_fresh_front() {
         let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env = QueueEnvGuard::set(&[("CYS_QUEUE_MAX_WAIT_SECS", "0"), ("CYS_QUEUE_STARVE_ALERT_SECS", "2")]);
         let (daemon, s) = d9r_seat("d9-a6r-starve");
-        std::thread::sleep(std::time::Duration::from_millis(2300)); // uptime clamp: an old entry's measured wait reaches 2 s
+        let epoch = now_epoch() + 10_000.0;
+        let monotonic = Instant::now();
+        let _clock = super::P1QueueClockSnapshot::set(epoch, monotonic);
         let starved = |daemon: &Arc<Daemon>| -> Vec<Value> {
             daemon.bus.tail(100).into_iter().filter(|ev| ev["name"] == "queue.starved").collect()
         };
-        s.pending_queue.lock().unwrap().push_back(d9r_auth(&daemon, "[RESUME] a6r", "surface:8"));
+        let mut fresh = d9r_auth(&daemon, "[RESUME] a6r", "surface:8");
+        fresh.enqueued_at = epoch;
+        s.pending_queue.lock().unwrap().push_back(fresh);
+        // Keep delivery blocked by state, not a quiet-time window that a scheduler stall can outlive.
+        *s.role.lock().unwrap() = Some("worker".into());
+        s.seat_cache.store(SeatState::Empty.as_u8(), AtomicOrdering::Relaxed);
         let (mut depth, mut starve) = (HashMap::new(), HashMap::new());
-        *s.last_output.lock().unwrap() = std::time::Instant::now(); // busy: nothing is delivered
         deliver_queued(&daemon, &mut depth, &mut starve, &mut HashMap::new());
         assert!(starved(&daemon).is_empty(), "control: a fresh front alone is not starved");
         let mut old = daemon.next_queue_entry("[보고] old".into(), Some("surface:9".into()), "send");
-        old.enqueued_at -= 700.0;
+        old.enqueued_at = epoch - 3.0;
         let old_id = old.id.clone();
         s.pending_queue.lock().unwrap().push_back(old);
-        *s.last_output.lock().unwrap() = std::time::Instant::now();
         deliver_queued(&daemon, &mut depth, &mut starve, &mut HashMap::new());
         let left = s.pending_queue.lock().unwrap().len(); // before the kill: an exiting seat's queue is moved
         let _ = s.child.lock().unwrap().kill();
@@ -31838,7 +31845,7 @@ mod reflect_queue_tests {
             full_scope_sees_residue,
             "형상 대조 실패: 생존 좌석의 전역 서명 판정이 잔상 형상을 창으로 보지 않는다 — 아래 ③ 대조가 무의미해진다"
         );
-        s.seat_cache.store(SeatState::Empty.as_u8(), Ordering::Relaxed);
+        s.seat_cache.store(SeatState::Empty.as_u8(), AtomicOrdering::Relaxed);
         s.agent_seen.store(false, Ordering::Relaxed);
         paint(&s, &dialog, 1, 9, false);
         assert!(probe(), "기동 전 틱의 낡은 Empty 좌석에서 창 위 CR 을 썼다 — '1. Yes' 오승인");
