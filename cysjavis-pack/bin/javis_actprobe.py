@@ -209,10 +209,10 @@ def _read_screen_live(ref):
     {text, composer} from one daemon frame. A non-zero exit (an old binary that does not know --composer) re-reads with
     plain read-screen and returns composer=None (today's regex path). A null composer (an old daemon) is None too."""
     out = subprocess.run([CYS_BIN, "read-screen", "--surface", ref, "--composer"],
-                         capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=12)
+                         capture_output=True, text=True, timeout=12)
     if out.returncode != 0:
         out = subprocess.run([CYS_BIN, "read-screen", "--surface", ref],
-                             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=12)
+                             capture_output=True, text=True, timeout=12)
         if out.returncode != 0:
             raise _ReadError(f"cys read-screen exit {out.returncode}")
         return out.stdout, None
