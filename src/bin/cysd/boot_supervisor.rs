@@ -6411,3 +6411,99 @@ mod d9_writer_guard_tests {
         assert_eq!(sk[0]["payload"]["reason"], serde_json::json!("refused_no_write:guard_aborted"), "{sk:?}");
     }
 }
+
+/// ★(0.14.56 · PKG1-M1 · DESIGN-ADDENDUM-PKG1-M1.md sec 3.5 W-7 and sec 4 m1; head ruling HEAD-RULING-PKG1-R1.md sec 2-3) A
+/// supervisor pane notice into a master/CEO seat waits (deferred) while the seat's queue holds the cycle's converted
+/// authoritative job and is written by a later retry once the job is delivered (S4); a notice refused at its claim goes back
+/// to the deferred list within the existing bounds instead of being dropped (S9).
+#[cfg(test)]
+mod pkg1_auth_hold_tests {
+    use super::*;
+    use crate::agent_queue_tests::{d9_received, d9_role_recorder, fx, pkg1_at, pkg1_authoritative_job, pkg1_drain};
+
+    fn intent(id: &str, sid: u64) -> BootIntent {
+        BootIntent {
+            id: id.into(), v: INTENT_SCHEMA_V, action_token: "ensure-team".into(),
+            lane: String::new(), surface_id: Some(sid), created_at: 1000.0, attempts: 0,
+            next_attempt_at: 0.0, reason: String::new(), decl_origin: String::new(),
+            claim_rc: None, claim_at: None,
+            decl_id: id.into(), executor: EXECUTOR_RUNNER.into(), generation: 0,
+            state: IntentState::Pending, terminal: None,
+        }
+    }
+
+    fn named(daemon: &Arc<Daemon>, name: &str, intent: &str) -> Vec<serde_json::Value> {
+        daemon.bus.tail(400).into_iter().filter(|e| e["name"] == name && e["payload"]["intent"] == intent).collect()
+    }
+
+    /// S4: RESUME queued (converted step 7) -> a no-spawn notice for the same master seat is DEFERRED (reason `authoritative`),
+    /// not typed; after the tick delivers the [RESUME], the supervisor's retry writes it once, after the [RESUME].
+    /// RED (77f66491): the notice is typed at once, ahead of the [RESUME].
+    #[test]
+    #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+    fn pkg1_s4_boot_notice_waits_behind_a_queued_resume_then_is_written() {
+        let f = fx("pkg1-s4");
+        let (s, out) = d9_role_recorder(&f.daemon, &f.dir, "pkg1-s4", "master");
+        let _resume = pkg1_authoritative_job(&f.daemon, &s, "[RESUME] pkg1-s4");
+        let it = intent("pkg1-s4", s.id);
+        let mut st = SupState::default();
+        let mut budget = MAX_RETIRE_NOTIFY_PER_TICK;
+        notify_no_spawn(&f.daemon, &mut st, &it, "claim_stale", &mut budget);
+        assert_eq!(st.deferred_pane.len(), 1, "the notice must wait behind the queued [RESUME], not be typed");
+        let d = named(&f.daemon, "boot_supervisor.pane_notice_deferred", "pkg1-s4");
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0]["payload"]["reason"], serde_json::json!("authoritative"), "{d:?}");
+        pkg1_drain(&f.daemon, &s, 3);
+        assert!(s.pending_queue.lock().unwrap().is_empty(), "premise: the tick delivered the [RESUME]");
+        let mut budget = MAX_RETIRE_NOTIFY_PER_TICK;
+        retry_deferred_pane_notices(&f.daemon, &mut st, &mut budget);
+        assert!(st.deferred_pane.is_empty(), "the retry wrote the held notice");
+        let bytes = d9_received(&out, 1);
+        let _ = s.child.lock().unwrap().kill();
+        let (r, n) = (pkg1_at(&bytes, "[RESUME] pkg1-s4"), pkg1_at(&bytes, "[cys-supervisor]"));
+        assert!(r.is_some() && n.is_some(), "both reached the receiver: {}", String::from_utf8_lossy(&bytes));
+        assert!(r < n, "the [RESUME] must be the first machine input: {}", String::from_utf8_lossy(&bytes));
+        assert_eq!(named(&f.daemon, "boot_supervisor.pane_notice_delivered_late", "pkg1-s4").len(), 1, "written once, late");
+    }
+
+    /// S9 / m1: a foreign write admitted after the notice's ledger pre-record and FINISHED before its hand-off makes the claim
+    /// refuse (0 bytes, as T-S0). The notice is not dropped: it is deferred once (`pane_notice_deferred`, reason
+    /// `claim_refused`, no `pane_notice_skipped`), and the supervisor's next retry writes it once (`pane_notice_delivered_late`).
+    /// RED (77f66491): `pane_notice_skipped{refused_no_write:guard_aborted}` and the notice is never written.
+    #[test]
+    #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+    fn pkg1_s9_boot_notice_refused_at_claim_is_deferred_then_written() {
+        let f = fx("pkg1-s9");
+        let mut recorder = crate::agent_queue_tests::p1_recorder(&f.daemon, &f.dir, "pkg1-s9", Some("master"));
+        recorder.install_always_admit();
+        let s = recorder.surface.clone();
+        let ctx = NoticeCtx { intent: "pkg1-s9".into(), why: "test".into(), late: false };
+        let d9 = crate::governance::D9WriterGuard::for_target(&f.daemon, &s);
+        {
+            let s = s.clone();
+            crate::agent_write::set_test_after_pre_record(move |_| {
+                let holder = crate::agent_queue_tests::p1_hold_writer(&s);
+                s.write_tx.send(crate::state::WriteReq::Data(b"F".to_vec())).expect("S0 foreign write admitted");
+                assert_eq!(crate::agent_queue_tests::p1_wait_completion(crate::agent_queue_tests::p1_writer_idle(&s), std::time::Duration::ZERO), Err(crate::agent_queue_tests::P1WaitError::CompletionTimeout { event: "writer operation leases released" }), "retained non-expiring holder: exact named guard failure");
+                holder.release(); // ACK covers F finishing before the subject handoff.
+            });
+        }
+        let (_, terminal) = crate::agent_queue_tests::p1_supervisor_call(&s, || {
+            pane_notice_line(&f.daemon, &s, "[boot] pkg1-s9".into(), ctx, d9)
+        });
+        crate::agent_queue_tests::p1_wait_completion(terminal, std::time::Duration::from_secs(60)).expect("pkg1-s9 supervisor settlement");
+        assert_eq!(recorder.barrier(), b"F".to_vec(), "premise: 0 bytes of the notice at the refusal - only the foreign write");
+        assert!(named(&f.daemon, "boot_supervisor.pane_notice_skipped", "pkg1-s9").is_empty(), "m1: a claim-refused notice was dropped");
+        let d = named(&f.daemon, "boot_supervisor.pane_notice_deferred", "pkg1-s9");
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0]["payload"]["reason"], serde_json::json!("claim_refused"), "{d:?}");
+        let mut st = SupState::default();
+        let mut budget = MAX_RETIRE_NOTIFY_PER_TICK;
+        retry_deferred_pane_notices(&f.daemon, &mut st, &mut budget);
+        assert!(st.deferred_pane.is_empty(), "the retry wrote the requeued notice");
+        let mut want = b"F".to_vec();
+        want.extend(crate::agent_write::Plan::paste("[boot] pkg1-s9").with_submit(120, 0).planned_bytes());
+        assert_eq!(recorder.barrier(), want, "the requeued notice written once, after the foreign write");
+        assert_eq!(named(&f.daemon, "boot_supervisor.pane_notice_delivered_late", "pkg1-s9").len(), 1, "announced once, late");
+    }
+}

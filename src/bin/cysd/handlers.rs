@@ -33567,6 +33567,62 @@ mod d9_writer_guard_tests {
     }
 }
 
+/// ★(0.14.56 · PKG1-M1 · DESIGN-ADDENDUM-PKG1-M1.md sec 3.5 W-5, head check Q4) The CEO auto-route while the CEO seat's queue holds
+/// the cycle's converted authoritative job: held with reason `ceo_seat_resuming` (the same escalation as `ceo_seat_cycling`), zero
+/// bytes, the feed item stays pending.
+#[cfg(test)]
+mod pkg1_auth_hold_tests {
+    use super::*;
+    use crate::agent_queue_tests::{d9_role_recorder, fx, pkg1_authoritative_job, wait_until};
+
+    fn item(id: &str) -> crate::state::FeedItem {
+        crate::state::FeedItem {
+            request_id: id.into(),
+            kind: "approval".into(),
+            title: "t".into(),
+            body: "b".into(),
+            surface_id: Some(7),
+            status: "pending".into(),
+            decision: None,
+            created_at: crate::state::now_epoch(),
+            resolved_at: None,
+            tier: None,
+            publisher_pid: None,
+            publisher_pgid: None,
+            publisher_surface: Some(7),
+            risk_class: Some("auto".into()),
+            auto_route: true,
+            resolver_surface: None,
+            resolver_pid: None,
+        }
+    }
+
+    /// S3: RESUME queued (converted step 7) in the CEO seat -> the CEO push is `Held("ceo_seat_resuming")` and writes nothing;
+    /// through `route_auto_approval` it escalates once as `approval.stalled{reason: ceo_seat_resuming}`.
+    /// RED (77f66491): `Handed` - the approval request is typed ahead of the [RESUME].
+    #[test]
+    #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+    fn pkg1_s3_ceo_push_is_held_behind_a_queued_resume() {
+        let f = fx("pkg1-s3");
+        let (s, out) = d9_role_recorder(&f.daemon, &f.dir, "pkg1-s3", "ceo");
+        s.seat_cache.store(1, Ordering::Relaxed); // not Empty (the CEO push's own seat check)
+        let _resume = pkg1_authoritative_job(&f.daemon, &s, "[RESUME] pkg1-s3");
+        let r = deliver_to_ceo(&f.daemon, &item("pkg1s3a"), false);
+        let held = matches!(r, CeoDelivery::Held("ceo_seat_resuming"));
+        wait_until("the writer is idle", || s.write_tx.gate().pending() == 0);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let bytes = std::fs::read(&out).unwrap();
+        assert!(held, "the CEO push must wait behind the queued [RESUME] (got {} bytes)", bytes.len());
+        assert!(bytes.is_empty(), "zero bytes: {}", String::from_utf8_lossy(&bytes));
+        route_auto_approval(&f.daemon, &item("pkg1s3b"), false);
+        let _ = s.child.lock().unwrap().kill();
+        let st: Vec<Value> = f.daemon.bus.tail(400).into_iter().filter(|e| e["name"] == "approval.stalled").collect();
+        assert_eq!(st.len(), 1, "{st:?}");
+        assert_eq!(st[0]["payload"]["reason"], json!("ceo_seat_resuming"), "{st:?}");
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "the [RESUME] is still the only queued job");
+    }
+}
+
 /// ★(0.14.56 · P1 E L-CYCLE · design r2 §3-§6, §8, §15) The cycle-clear chain: specimens that drive `surface.send_text` through
 /// `dispatch` on a recorder seat (`stty raw -echo; exec cat > file`), so the receiver's bytes are the write witness.
 #[cfg(test)]
@@ -33858,5 +33914,35 @@ mod p1_cycle_tests {
         let got = d9_received(&out, want.len());
         let _ = s.child.lock().unwrap().kill();
         assert_eq!(got, want, "exactly the unmoved cycle clear and the plain clear reached the seat");
+    }
+
+    /// ★(0.14.56 · PKG1-M1 · DESIGN-ADDENDUM-PKG1-M1.md sec 3.6, head check Q2) S8: while a converted authoritative job ([RESUME])
+    /// waits in a d9-scope master's queue, a NON-cycle `clear_first` from a non-owner pane (`cys send --clear-first --to master`
+    /// from a worker seat) is refused with zero bytes and code `authoritative_pending`. S8b: the cycle's own D4-valid clear still
+    /// passes - a second cycle on a seat whose job is undelivered must not wedge (fatal risk 2). RED (77f66491): the plain clear is
+    /// typed ahead of the [RESUME].
+    #[test]
+    #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+    fn pkg1_s8_plain_clear_first_is_refused_while_a_resume_waits_and_s8b_the_cycle_clear_passes() {
+        let f = fx("pkg1-s8");
+        let (s, out) = crate::agent_queue_tests::d9_role_recorder(&f.daemon, &f.dir, "pkg1-s8", "master");
+        let resume = crate::agent_queue_tests::pkg1_authoritative_job(&f.daemon, &s, "[RESUME] pkg1-s8");
+        let worker = crate::agent_queue_tests::pkg1_pane_caller(&f.daemon, "worker");
+        let g0 = s.input_gen.load(Ordering::Acquire);
+        let plain = clear(&f, Some(worker), &s, json!({}));
+        assert_eq!(plain["error"]["code"], json!("authoritative_pending"), "a plain clear_first must wait for the [RESUME]: {plain}");
+        assert_eq!(s.write_tx.gate().pending(), 0, "nothing handed to the writer");
+        assert_eq!(s.input_gen.load(Ordering::Acquire), g0, "zero bytes: the input generation did not move");
+        // S8b: the cycle's own clear (the caller's live claim + one observation's fence) passes.
+        let me = std::process::id();
+        claim(&s, Some(me), crate::usage::ctx_guard_now(&f.daemon));
+        let ok = clear(&f, Some(me), &s, fence(&s, "idle"));
+        assert_eq!(ok["result"]["sent"], json!(true), "the D4-valid cycle clear is exempt: {ok}");
+        let want = clear_bytes();
+        let got = d9_received(&out, want.len());
+        let _ = s.child.lock().unwrap().kill();
+        assert_eq!(got, want, "exactly the cycle clear's bytes reached the seat - the refused plain clear wrote zero bytes");
+        let q: Vec<String> = s.pending_queue.lock().unwrap().iter().map(|e| e.id.clone()).collect();
+        assert_eq!(q, vec![resume], "the [RESUME] is still queued for the tick");
     }
 }

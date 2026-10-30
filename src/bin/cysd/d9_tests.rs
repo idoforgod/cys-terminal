@@ -1472,3 +1472,42 @@ fn e_modal_d5_d6_cycle_abort_restores_held_body_and_later_return() {
     assert_eq!(returned["result"]["request_id"], json!(rid), "E-D5D6: later caller Return binds the restored body: {returned}");
     assert_eq!(recorder.barrier(), b"held through aborted cycle clear\r", "E-D5D6: restored body submitted exactly once");
 }
+
+/// ★(0.14.56 · PKG1-M1 m2 · DESIGN-ADDENDUM-PKG1-M1.md sec 4; head ruling HEAD-RULING-PKG1-R1.md sec 3) S10a: the refusal text of
+/// an untokened Return into a master/CEO composer says that a `cys send` text from a non-owner is already ONE queued job that
+/// submits itself - do not resend (the sender must not report or send twice). RED (77f66491): the text does not say so.
+#[test]
+fn pkg1_s10a_return_refusal_text_says_the_text_is_already_queued() {
+    let fx = fx("pkg1-s10a");
+    let m = master(&fx);
+    let _w = pane(&fx, "worker-1", P + 60);
+    let g0 = gen(&m);
+    let r = ret(&fx, Some(P + 60), &m, json!({}));
+    assert_denied(&r);
+    let msg = r["error"]["message"].as_str().unwrap_or("");
+    assert!(msg.contains("already") && msg.contains("one queued job") && msg.contains("do not resend"), "m2: {msg}");
+    assert_eq!(gen(&m), g0, "nothing was typed");
+}
+
+/// ★(0.14.56 · PKG1-M1 m4 · same design sec) S10b: a converted send at the 100 cap keeps the prefix the CLI matches and says the
+/// direct send was converted to one queue job and nothing was typed or queued. RED (77f66491): the bare prefix only.
+#[test]
+fn pkg1_s10b_queue_full_on_a_converted_send_names_the_conversion() {
+    let fx = fx("pkg1-s10b");
+    let m = master(&fx);
+    let _w = pane(&fx, "worker-1", P + 61);
+    let g0 = gen(&m);
+    {
+        let mut q = m.pending_queue.lock().unwrap();
+        for i in 0..100 {
+            q.push_back(fx.daemon.next_queue_entry(format!("fill {i}"), None, "test"));
+        }
+    }
+    let full = send(&fx, Some(P + 61), &m, "[보고] over the cap", json!({}));
+    assert_eq!(full["error"]["code"], json!("queue_full"), "{full}");
+    let msg = full["error"]["message"].as_str().unwrap_or("");
+    assert!(msg.starts_with("pending queue cap (100) reached"), "the prefix the CLI matches is kept: {msg}");
+    assert!(msg.contains("converted to one queue job") && msg.contains("nothing was typed or queued"), "m4: {msg}");
+    assert_eq!(m.pending_queue.lock().unwrap().len(), 100, "nothing was queued");
+    assert_eq!(gen(&m), g0, "nothing was typed");
+}

@@ -38896,6 +38896,174 @@ mod tests {
         assert!(calls.iter().any(|(m, p)| m == "surface.send_key" && p["key"] == "Return"), "직접 제출 Return: {calls:?}");
     }
 
+    // ───────── ★(0.14.56 · PKG1-M1 · PKG-2 r1 minors m1-m3 · HEAD-RULING-PKG2-R1.md sec 3; DESIGN-ADDENDUM-PKG1-M1.md sec 4) ─────────
+    // A direct send into a master/CEO composer that the daemon CONVERTS (D9) comes back as ONE queue job that owns its own CR.
+
+    /// A scripted daemon whose seat converts every direct send the way the real daemon answers a d9-scope master
+    /// (`converted:"one_job"`, `queue_entry_id`): `surface.wait_for` never matches, and `surface.list` names one live claude
+    /// seat (surface 7, role master) whose transcript is `session_file`. Returns (socket, recorded (method, params), stop).
+    #[cfg(unix)]
+    fn pkg1_converting_daemon(
+        session_file: &std::path::Path,
+    ) -> (std::path::PathBuf, std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>>, impl FnOnce()) {
+        use std::io::{BufRead, BufReader, Write};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::{Arc, Mutex};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let sock = std::path::Path::new("/tmp").join(format!(
+            ".pkg1conv-{}-{}.sock",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&sock);
+        let listener = std::os::unix::net::UnixListener::bind(&sock).expect("fake socket bind");
+        let calls: Arc<Mutex<Vec<(String, Value)>>> = Arc::new(Mutex::new(Vec::new()));
+        let rec = Arc::clone(&calls);
+        let session_file = session_file.display().to_string();
+        let server = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                let mut reader = BufReader::new(match stream.try_clone() { Ok(s) => s, Err(_) => break });
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
+                    continue;
+                }
+                let req: Value = serde_json::from_str(line.trim()).unwrap_or(Value::Null);
+                let method = req["method"].as_str().unwrap_or("").to_string();
+                if method == "__stop" {
+                    break;
+                }
+                rec.lock().unwrap_or_else(|e| e.into_inner()).push((method.clone(), req["params"].clone()));
+                let result = match method.as_str() {
+                    "surface.list" => json!({"surfaces": [{
+                        "surface_id": 7, "surface_ref": "surface:7", "role": "master", "awakened_at": 1.0,
+                        "agent": "claude", "agent_alive": true, "exited": false, "gate_pending": null,
+                        "usage": {"source": "transcript", "session_file": session_file}}]}),
+                    "surface.read_text" => json!({"text": cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT,
+                                                  "quiet_secs": 5.0, "line_count": 40, "latest_cursor": 0}),
+                    "surface.send_text" if req["params"]["queued"] != true => json!({"surface_id": 7, "queued": true,
+                        "depth": 1, "queue_entry_id": "q-pkg1", "durable": true, "sent": true, "converted": "one_job"}),
+                    "surface.send_text" => json!({"queued": true, "depth": 1}),
+                    "surface.wait_for" => json!({"matched": false}),
+                    _ => json!({"ok": true}),
+                };
+                let mut w = stream;
+                let _ = writeln!(w, "{}", json!({"id": req["id"], "ok": true, "result": result}));
+            }
+        });
+        let stop_sock = sock.clone();
+        let stop = move || {
+            if let Ok(mut s) = std::os::unix::net::UnixStream::connect(&stop_sock) {
+                let _ = writeln!(s, "{}", json!({"id": 1, "method": "__stop", "params": {}}));
+            }
+            let _ = server.join();
+            let _ = std::fs::remove_file(&stop_sock);
+        };
+        (sock, calls, stop)
+    }
+
+    /// Runs `body` with `CYS_SOCKET` (and, when given, `CYS_PACK_DIR`) pointing at the test's own values, restoring both after.
+    #[cfg(unix)]
+    fn pkg1_with_env<R>(sock: &std::path::Path, pack: Option<&std::path::Path>, body: impl FnOnce() -> R) -> R {
+        let saved_sock = std::env::var_os(cys::ENV_SOCKET);
+        let saved_pack = std::env::var_os(cys::pack::ENV_PACK_DIR);
+        std::env::set_var(cys::ENV_SOCKET, sock);
+        if let Some(p) = pack {
+            std::env::set_var(cys::pack::ENV_PACK_DIR, p);
+        }
+        let r = body();
+        for (k, v) in [(cys::ENV_SOCKET, saved_sock), (cys::pack::ENV_PACK_DIR, saved_pack)] {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        r
+    }
+
+    /// A fresh scratch directory holding one transcript line that never mentions any ping (fate NotSeen).
+    #[cfg(unix)]
+    fn pkg1_scratch(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("cys-pkg1-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let session = dir.join("session.jsonl");
+        std::fs::write(&session, "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n").unwrap();
+        (dir, session)
+    }
+
+    /// S12 (PKG-2 m2): a direct send the daemon converted into ONE queue job owns its CR, so the CLI sends no pre-Return gate
+    /// check and no Return after it - neither `inject_text` (default socket: the cycle's step 7, boot directives) nor
+    /// `inject_text_on` (dept socket, `drain --verify`; head check Q3). A Return there is refused by the daemon (a converted body
+    /// submits itself), and a caller that retries on that refusal queues a second authoritative job.
+    /// RED (77f66491): both send `surface.send_key Return` 800 ms after the converted send.
+    #[cfg(unix)]
+    #[test]
+    fn pkg1_s12_a_converted_inject_sends_no_return() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("CYS_SEND_SETTLE");
+        std::env::remove_var("CYS_SEND_SETTLE_BUDGET_MS");
+        let (dir, session) = pkg1_scratch("s12");
+        let (sock, calls, stop) = pkg1_converting_daemon(&session);
+        let r = pkg1_with_env(&sock, None, || inject_text(7, "[RESUME] pkg1-s12"));
+        let r_on = inject_text_on(&sock, 7, "SAVE NOW", std::time::Duration::from_secs(3), "inject");
+        stop();
+        let _ = std::fs::remove_dir_all(&dir);
+        let calls = calls.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert!(r.is_ok() && r_on.is_ok(), "{r:?} {r_on:?} {calls:?}");
+        let sends = calls.iter().filter(|(m, p)| m == "surface.send_text" && p["queued"] != true).count();
+        assert_eq!(sends, 2, "one send each, no retry: {calls:?}");
+        assert!(!calls.iter().any(|(m, _)| m == "surface.send_key"), "a converted send owns its CR - no Return: {calls:?}");
+    }
+
+    /// S13 (PKG-2 m3): the presence ping into a master is converted too. When the transcript has not seen it yet (NotSeen), the
+    /// truthful answer is "the ping is queued as one job <id>" (busy), not "undetermined"; the caller still types nothing.
+    /// RED (77f66491): `Undetermined(<NotSeen label>)` - the queue job is not named.
+    #[cfg(unix)]
+    #[test]
+    fn pkg1_s13_a_converted_presence_ping_reports_queued() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("CYS_SEND_SETTLE");
+        std::env::remove_var("CYS_SEND_SETTLE_BUDGET_MS");
+        let (dir, session) = pkg1_scratch("s13");
+        let (sock, calls, stop) = pkg1_converting_daemon(&session);
+        let p = pkg1_with_env(&sock, None, || directive_presence(7, 1));
+        stop();
+        let _ = std::fs::remove_dir_all(&dir);
+        let calls = calls.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        match &p {
+            Presence::Undetermined(why) => assert!(why.contains("queued as one job q-pkg1"), "m3: {why} {calls:?}"),
+            other => panic!("a queued ping is neither present nor absent: {other:?}"),
+        }
+        assert_eq!(calls.iter().filter(|(m, _)| m == "surface.send_text").count(), 1, "one ping, nothing else typed: {calls:?}");
+        assert!(!calls.iter().any(|(m, _)| m == "surface.send_key"), "no Return after the converted ping: {calls:?}");
+    }
+
+    /// S14 (PKG-2 m1/m2): a forced `cys reinject` into a master whose daemon converts the directive: rc 0 and no Return (the job
+    /// submits itself). RED (77f66491): a Return follows the converted directive.
+    #[cfg(unix)]
+    #[test]
+    fn pkg1_s14_a_converted_reinject_sends_no_return() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("CYS_SEND_SETTLE");
+        std::env::remove_var("CYS_SEND_SETTLE_BUDGET_MS");
+        let (dir, session) = pkg1_scratch("s14");
+        let pack = dir.join("pack");
+        std::fs::create_dir_all(pack.join("directives")).unwrap();
+        std::fs::write(pack.join("directives/MASTER_DIRECTIVE.md"), "# MASTER pkg1-s14\n").unwrap();
+        std::fs::write(pack.join("directives/RSI_LEARNING_DIRECTIVE.md"), "# RSI pkg1-s14\n").unwrap();
+        let (sock, calls, stop) = pkg1_converting_daemon(&session);
+        let rc = pkg1_with_env(&sock, Some(&pack), || run_reinject(None, Some("7".into()), false, 1, false));
+        stop();
+        let _ = std::fs::remove_dir_all(&dir);
+        let calls = calls.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(rc, 0, "{calls:?}");
+        let sends: Vec<&Value> = calls.iter().filter(|(m, _)| m == "surface.send_text").map(|(_, p)| p).collect();
+        assert_eq!(sends.len(), 1, "one directive send: {calls:?}");
+        assert!(sends[0]["text"].as_str().is_some_and(|t| t.contains("MASTER pkg1-s14")), "premise: the directive was sent: {sends:?}");
+        assert!(!calls.iter().any(|(m, _)| m == "surface.send_key"), "a converted directive owns its CR - no Return: {calls:?}");
+    }
+
     // ───────── ★(0.14.43 · J3) pane 밖에서 보낸 메시지의 발신자 표기(`from=null` · "발신 unknown") ─────────
     //
     // 데몬은 검증 신원이 있으면 그것을 늘 우선하고(커널 peer → pane 조상 사슬) 없을 때만 요청의 `from` 을 본다. pane 밖 CLI 는 검증할 좌석이 없어 `from` 이
