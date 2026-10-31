@@ -598,28 +598,30 @@ impl ScheduleFileLock {
 
     /// 대기·부패 상한을 주입받는 본체(검체가 부패 잠금 깨기를 초 단위로 기다리지 않게).
     pub fn acquire_with(path: &std::path::Path, wait: Duration, stale: Duration) -> Option<Self> {
+        Self::acquire_with_ops(path, wait, stale, cfg!(windows), &mut NativeScheduleLockOps)
+    }
+
+    // One acquisition owns its operations; no global observer, platform override or environment knob.
+    fn acquire_with_ops<O: ScheduleLockOps>(path: &std::path::Path, wait: Duration, stale: Duration, windows: bool, ops: &mut O) -> Option<Self> {
+        let _ = windows; // RED scaffold: the original loop has no Windows-denial retry yet.
         let dir = Self::lock_dir_for(path);
         if let Some(parent) = dir.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            ops.parent(parent);
         }
-        let deadline = std::time::Instant::now() + wait;
+        let deadline = ops.now() + wait;
         loop {
-            match std::fs::create_dir(&dir) {
+            match ops.create(&dir) {
                 Ok(()) => return Some(Self { dir }),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     // 죽은 보유자의 잠금인가 — mtime 이 부패 상한을 넘겼으면 깨고 다시 잡는다.
-                    let stale_now = std::fs::metadata(&dir)
-                        .and_then(|m| m.modified())
-                        .ok()
-                        .and_then(|t| t.elapsed().ok())
-                        .is_some_and(|age| age > stale);
+                    let stale_now = ops.is_stale(&dir, stale);
                     if stale_now {
                         // ★(0.14.31 · 성찰 확인 · blocking) **회수는 CLI 와 같은 철자여야 한다.**
                         //   CLI(`cys.rs::acquire_schedule_lock`)는 잠금 디렉터리 **안**에 owner 파일을
                         //   쓴다. 그 창에서 writer 가 SIGKILL 되면 잔존 잠금은 **비어 있지 않다** —
                         //   종전의 `remove_dir` 는 ENOTEMPTY(실측 errno 66)로 실패하고 mtime 은 그대로라
                         //   `stale_now` 가 계속 참이다. 두 writer 의 비대칭이 그 자체로 부트체인 사고였다.
-                        let _ = std::fs::remove_dir_all(&dir);
+                        ops.reclaim(&dir);
                     }
                     // ★회수 실패도 **유계**여야 한다 — 종전엔 여기서 `continue` 로 돌아 아래의
                     //   deadline 검사와 10ms sleep 을 **둘 다 건너뛰었다**. remove 가 지속 실패하면
@@ -631,12 +633,34 @@ impl ScheduleFileLock {
                 }
                 Err(_) => return None, // 잠금 디렉터리를 만들 수 없는 파일시스템 — 쓰기 포기(막는 방향)
             }
-            if std::time::Instant::now() >= deadline {
+            if ops.now() >= deadline {
                 return None;
             }
-            std::thread::sleep(Duration::from_millis(10));
+            ops.sleep(Duration::from_millis(10));
         }
     }
+}
+
+trait ScheduleLockOps {
+    type Clock: Copy + PartialOrd + std::ops::Add<Duration, Output = Self::Clock>;
+    fn parent(&mut self, path: &std::path::Path);
+    fn create(&mut self, path: &std::path::Path) -> std::io::Result<()>;
+    fn is_stale(&mut self, path: &std::path::Path, stale: Duration) -> bool;
+    fn reclaim(&mut self, path: &std::path::Path);
+    fn now(&mut self) -> Self::Clock;
+    fn sleep(&mut self, delay: Duration);
+}
+struct NativeScheduleLockOps;
+impl ScheduleLockOps for NativeScheduleLockOps {
+    type Clock = std::time::Instant;
+    fn parent(&mut self, path: &std::path::Path) { let _ = std::fs::create_dir_all(path); }
+    fn create(&mut self, path: &std::path::Path) -> std::io::Result<()> { std::fs::create_dir(path) }
+    fn is_stale(&mut self, path: &std::path::Path, stale: Duration) -> bool {
+        std::fs::metadata(path).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > stale)
+    }
+    fn reclaim(&mut self, path: &std::path::Path) { let _ = std::fs::remove_dir_all(path); }
+    fn now(&mut self) -> Self::Clock { std::time::Instant::now() }
+    fn sleep(&mut self, delay: Duration) { std::thread::sleep(delay); }
 }
 
 impl Drop for ScheduleFileLock {
@@ -647,6 +671,7 @@ impl Drop for ScheduleFileLock {
 
 // Call-owned I/O seam: production always supplies std::fs::read. No global fault switch.
 type ScheduleReader<'a> = dyn Fn(&std::path::Path) -> std::io::Result<Vec<u8>> + 'a;
+type ScheduleAcquirer<'a> = dyn Fn(&std::path::Path) -> Option<ScheduleFileLock> + 'a;
 #[derive(Clone, Debug)]
 struct ScheduleRefusal {
     reason: &'static str,
@@ -836,7 +861,10 @@ pub fn ensure_builtin_jobs_at(path: &std::path::Path) {
     ensure_builtin_jobs_at_read(path, &|p| std::fs::read(p));
 }
 fn ensure_builtin_jobs_at_read(path: &std::path::Path, read: &ScheduleReader<'_>) {
-    let Some(_lock) = ScheduleFileLock::acquire(path) else {
+    ensure_builtin_jobs_at_access(path, read, &ScheduleFileLock::acquire)
+}
+fn ensure_builtin_jobs_at_access(path: &std::path::Path, read: &ScheduleReader<'_>, acquire: &ScheduleAcquirer<'_>) {
+    let Some(_lock) = acquire(path) else {
         eprintln!("[cysd] ensure_builtin_jobs: schedule.json writer 잠금을 {SCHEDULE_LOCK_WAIT_MS}ms 안에 잡지 못했다 — 무접촉(다음 기회에 다시)");
         return;
     };
@@ -934,16 +962,19 @@ pub fn load_jobs_at(path: &std::path::Path, mode: LoadMode) -> Vec<Job> {
     load_jobs_at_read(path, mode, &|p| std::fs::read(p))
 }
 fn load_jobs_at_read(path: &std::path::Path, mode: LoadMode, read: &ScheduleReader<'_>) -> Vec<Job> {
+    load_jobs_at_access(path, mode, read, &ScheduleFileLock::acquire)
+}
+fn load_jobs_at_access(path: &std::path::Path, mode: LoadMode, read: &ScheduleReader<'_>, acquire: &ScheduleAcquirer<'_>) -> Vec<Job> {
     // 쓰기 모드는 읽기 **전에** 잠근다 — 읽기와 치환 사이에 CLI 추가가 끼어들면 그 추가가
     // 우리의 옛 문서로 덮여 사라진다(CLI 는 이미 성공을 출력한 뒤 = 거짓 성공).
     let lock = match mode {
         LoadMode::ReadOnly => None,
-        LoadMode::HotReload => match ScheduleFileLock::acquire(path) {
+        LoadMode::HotReload => match acquire(path) {
             Some(l) => Some(l),
             None => {
                 // 잠금을 못 잡았다 — 이번 틱은 **읽기만** 한다(쓰기 없는 경로로 강등 · 발화는 계속).
                 eprintln!("[cysd] schedule: writer 잠금을 {SCHEDULE_LOCK_WAIT_MS}ms 안에 잡지 못했다 — 이번 틱은 읽기만 한다");
-                return load_jobs_at_read(path, LoadMode::ReadOnly, read);
+                return load_jobs_at_access(path, LoadMode::ReadOnly, read, acquire);
             }
         },
     };
@@ -1502,8 +1533,11 @@ fn remove_job_from_file_at(path: &std::path::Path, job_id: &str) {
     remove_job_from_file_at_read(path, job_id, &|p| std::fs::read(p));
 }
 fn remove_job_from_file_at_read(path: &std::path::Path, job_id: &str, read: &ScheduleReader<'_>) {
+    remove_job_from_file_at_access(path, job_id, read, &ScheduleFileLock::acquire)
+}
+fn remove_job_from_file_at_access(path: &std::path::Path, job_id: &str, read: &ScheduleReader<'_>, acquire: &ScheduleAcquirer<'_>) {
     let result = (|| -> Result<(), ScheduleRefusal> {
-        let _lock = ScheduleFileLock::acquire(path).ok_or_else(|| ScheduleRefusal::named("lock_unavailable"))?;
+        let _lock = acquire(path).ok_or_else(|| ScheduleRefusal::named("lock_unavailable"))?;
         let Some(mut root) = read_schedule_root(path, read)? else { return Ok(()) };
         drop_job_and_canonicalize(&mut root, job_id);
         if !write_schedule_atomic(path, &root) { return Err(ScheduleRefusal::named("write_failed")); }
@@ -1522,6 +1556,9 @@ fn requeue_oneshot_after_frozen_at(daemon: &Arc<Daemon>, path: &std::path::Path,
     requeue_oneshot_after_frozen_at_read(daemon, path, job, &|p| std::fs::read(p));
 }
 fn requeue_oneshot_after_frozen_at_read(daemon: &Arc<Daemon>, path: &std::path::Path, job: &Job, read: &ScheduleReader<'_>) {
+    requeue_oneshot_after_frozen_at_access(daemon, path, job, read, &ScheduleFileLock::acquire)
+}
+fn requeue_oneshot_after_frozen_at_access(daemon: &Arc<Daemon>, path: &std::path::Path, job: &Job, read: &ScheduleReader<'_>, acquire: &ScheduleAcquirer<'_>) {
     let Some(at) = job.at else { return };
     if job.every_minutes.is_some_and(|m| m > 0) {
         return;
@@ -1529,7 +1566,7 @@ fn requeue_oneshot_after_frozen_at_read(daemon: &Arc<Daemon>, path: &std::path::
     let mut back = job.clone();
     back.at = Some(at.saturating_add(1));
     let result = (|| -> Result<(), ScheduleRefusal> {
-        let _lock = ScheduleFileLock::acquire(path).ok_or_else(|| ScheduleRefusal::named("lock_unavailable"))?;
+        let _lock = acquire(path).ok_or_else(|| ScheduleRefusal::named("lock_unavailable"))?;
         let mut root = read_schedule_root(path, read)?.unwrap_or_else(|| json!({"jobs": []}));
         if root.get("jobs").is_none() {
             root.as_object_mut().expect("validated root").insert("jobs".to_string(), json!([]));
@@ -7915,3 +7952,7 @@ mod pkg1_auth_hold_tests {
 #[cfg(test)]
 #[path = "schedule_integrity_tests.rs"]
 mod integrity_tests;
+
+#[cfg(test)]
+#[path = "schedule_lock_policy_tests.rs"]
+mod lock_policy_tests;
