@@ -489,27 +489,26 @@ fn canonicalize_stored_queue_actions(jobs: &mut [serde_json::Value]) -> bool {
 /// 같은 문안 · action 표현만 하나로) — §B-5 의 "무언 소실" 이 아니지만, 조용한 무접촉도 관측
 /// 소실이므로 바꾼 잡 id 를 한 줄로 남긴다.
 /// 반환: 파일을 바꿨는가.
-fn canonicalize_schedule_file(path: &std::path::Path, root: &mut serde_json::Value) -> bool {
+fn canonicalize_schedule_file(path: &std::path::Path, root: &mut serde_json::Value) -> Result<bool, ScheduleRefusal> {
     let ids: Vec<String> = match root.get_mut("jobs").and_then(|j| j.as_array_mut()) {
         Some(arr) => {
             if !canonicalize_stored_queue_actions(arr) {
-                return false;
+                return Ok(false);
             }
             arr.iter()
                 .filter(|j| j.get("action").and_then(|v| v.as_str()) == Some(ACTION_PUSH_QUEUED))
                 .filter_map(|j| j.get("id").and_then(|v| v.as_str()).map(str::to_string))
                 .collect()
         }
-        None => return false,
+        None => return Ok(false),
     };
     if !write_schedule_atomic(path, root) {
-        eprintln!("[cysd] schedule.json 정규화 기록 실패 — 파일은 구 표현 그대로다(강등 시 직접 주입 위험)");
-        return false;
+        return Err(ScheduleRefusal::named("write_failed"));
     }
     eprintln!(
         "[cysd] schedule.json: 'action:\"push\" + via_queue:true' 를 '{ACTION_PUSH_QUEUED}' 로 접었다(뜻 보존 · 대상 {ids:?})"
     );
-    true
+    Ok(true)
 }
 
 /// schedule.json 원자 치환(tmp+rename) — 핫리로드 torn read 회피. 반환: 성공했는가.
@@ -599,28 +598,29 @@ impl ScheduleFileLock {
 
     /// 대기·부패 상한을 주입받는 본체(검체가 부패 잠금 깨기를 초 단위로 기다리지 않게).
     pub fn acquire_with(path: &std::path::Path, wait: Duration, stale: Duration) -> Option<Self> {
+        Self::acquire_with_ops(path, wait, stale, cfg!(windows), &mut NativeScheduleLockOps)
+    }
+
+    // One acquisition owns its operations; no global observer, platform override or environment knob.
+    fn acquire_with_ops<O: ScheduleLockOps>(path: &std::path::Path, wait: Duration, stale: Duration, windows: bool, ops: &mut O) -> Option<Self> {
         let dir = Self::lock_dir_for(path);
         if let Some(parent) = dir.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            ops.parent(parent);
         }
-        let deadline = std::time::Instant::now() + wait;
+        let deadline = ops.now() + wait;
         loop {
-            match std::fs::create_dir(&dir) {
+            let denied_retry = match ops.create(&dir) {
                 Ok(()) => return Some(Self { dir }),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     // 죽은 보유자의 잠금인가 — mtime 이 부패 상한을 넘겼으면 깨고 다시 잡는다.
-                    let stale_now = std::fs::metadata(&dir)
-                        .and_then(|m| m.modified())
-                        .ok()
-                        .and_then(|t| t.elapsed().ok())
-                        .is_some_and(|age| age > stale);
+                    let stale_now = ops.is_stale(&dir, stale);
                     if stale_now {
                         // ★(0.14.31 · 성찰 확인 · blocking) **회수는 CLI 와 같은 철자여야 한다.**
                         //   CLI(`cys.rs::acquire_schedule_lock`)는 잠금 디렉터리 **안**에 owner 파일을
                         //   쓴다. 그 창에서 writer 가 SIGKILL 되면 잔존 잠금은 **비어 있지 않다** —
                         //   종전의 `remove_dir` 는 ENOTEMPTY(실측 errno 66)로 실패하고 mtime 은 그대로라
                         //   `stale_now` 가 계속 참이다. 두 writer 의 비대칭이 그 자체로 부트체인 사고였다.
-                        let _ = std::fs::remove_dir_all(&dir);
+                        ops.reclaim(&dir);
                     }
                     // ★회수 실패도 **유계**여야 한다 — 종전엔 여기서 `continue` 로 돌아 아래의
                     //   deadline 검사와 10ms sleep 을 **둘 다 건너뛰었다**. remove 가 지속 실패하면
@@ -629,21 +629,89 @@ impl ScheduleFileLock {
                     //   `ensure_builtin_jobs()`(main.rs)가 accept 루프 **이전**에 동기로 부르므로
                     //   데몬이 소켓을 한 번도 받지 못한다(부트체인 전손 · 자가 회복 경로 없음).
                     //   유계 대기 뒤 `None` = 쓰기 포기(막는 방향).
+                    false
                 }
+                Err(e) if windows && e.kind() == std::io::ErrorKind::PermissionDenied => true,
                 Err(_) => return None, // 잠금 디렉터리를 만들 수 없는 파일시스템 — 쓰기 포기(막는 방향)
-            }
-            if std::time::Instant::now() >= deadline {
+            };
+            if ops.now() >= deadline {
                 return None;
             }
-            std::thread::sleep(Duration::from_millis(10));
+            ops.sleep(Duration::from_millis(10));
+            // Only a just-observed Windows denial gets the new wake fence. AlreadyExists retains its legacy path.
+            if denied_retry && ops.now() >= deadline { return None; }
         }
     }
+}
+
+trait ScheduleLockOps {
+    type Clock: Copy + PartialOrd + std::ops::Add<Duration, Output = Self::Clock>;
+    fn parent(&mut self, path: &std::path::Path);
+    fn create(&mut self, path: &std::path::Path) -> std::io::Result<()>;
+    fn is_stale(&mut self, path: &std::path::Path, stale: Duration) -> bool;
+    fn reclaim(&mut self, path: &std::path::Path);
+    fn now(&mut self) -> Self::Clock;
+    fn sleep(&mut self, delay: Duration);
+}
+struct NativeScheduleLockOps;
+impl ScheduleLockOps for NativeScheduleLockOps {
+    type Clock = std::time::Instant;
+    fn parent(&mut self, path: &std::path::Path) { let _ = std::fs::create_dir_all(path); }
+    fn create(&mut self, path: &std::path::Path) -> std::io::Result<()> { std::fs::create_dir(path) }
+    fn is_stale(&mut self, path: &std::path::Path, stale: Duration) -> bool {
+        std::fs::metadata(path).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > stale)
+    }
+    fn reclaim(&mut self, path: &std::path::Path) { let _ = std::fs::remove_dir_all(path); }
+    fn now(&mut self) -> Self::Clock { std::time::Instant::now() }
+    fn sleep(&mut self, delay: Duration) { std::thread::sleep(delay); }
 }
 
 impl Drop for ScheduleFileLock {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir(&self.dir);
     }
+}
+
+// Call-owned I/O seam: production always supplies std::fs::read. No global fault switch.
+type ScheduleReader<'a> = dyn Fn(&std::path::Path) -> std::io::Result<Vec<u8>> + 'a;
+type ScheduleAcquirer<'a> = dyn Fn(&std::path::Path) -> Option<ScheduleFileLock> + 'a;
+#[derive(Clone, Debug)]
+struct ScheduleRefusal {
+    reason: &'static str,
+    io_kind: Option<std::io::ErrorKind>,
+    raw_os_error: Option<i32>,
+}
+impl ScheduleRefusal {
+    fn named(reason: &'static str) -> Self { Self { reason, io_kind: None, raw_os_error: None } }
+    fn read(error: std::io::Error) -> Self {
+        Self { reason: "read_failed", io_kind: Some(error.kind()), raw_os_error: error.raw_os_error() }
+    }
+}
+fn report_schedule_refusal(operation: &str, error: &ScheduleRefusal) {
+    // Metadata only: never print the schedule's contents or serde's rejected value.
+    eprintln!("[cysd] schedule normal RMW refused operation={operation} reason={} io_kind={:?} raw_os_error={:?} — no normal write",
+        error.reason, error.io_kind, error.raw_os_error);
+}
+fn validate_schedule_root(root: &serde_json::Value) -> Result<(), ScheduleRefusal> {
+    if !root.is_object() { return Err(ScheduleRefusal::named("invalid_schema")); }
+    // Missing jobs is a valid known-empty object. Validate with the existing Job deserializer,
+    // but retain the RAW root/jobs so unknown fields survive every mutation.
+    if let Some(jobs) = root.get("jobs") {
+        serde_json::from_value::<Vec<Job>>(jobs.clone())
+            .map_err(|_| ScheduleRefusal::named("invalid_schema"))?;
+    }
+    Ok(())
+}
+fn read_schedule_root(path: &std::path::Path, read: &ScheduleReader<'_>) -> Result<Option<serde_json::Value>, ScheduleRefusal> {
+    let bytes = match read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(ScheduleRefusal::read(e)),
+    };
+    let text = std::str::from_utf8(&bytes).map_err(|_| ScheduleRefusal::named("invalid_utf8"))?;
+    let root = serde_json::from_str(text).map_err(|_| ScheduleRefusal::named("invalid_json"))?;
+    validate_schedule_root(&root)?;
+    Ok(Some(root))
 }
 
 /// built-in 잡을 jobs 배열에 idempotent upsert(순수 — 회귀 핀). id 로 대조:
@@ -793,39 +861,27 @@ pub fn ensure_builtin_jobs() {
 
 /// 경로 주입판(검체 가능) — 위 함수의 본체. ★(성찰 A11) **writer 잠금** 아래에서 읽고·접고·쓴다.
 pub fn ensure_builtin_jobs_at(path: &std::path::Path) {
-    let Some(_lock) = ScheduleFileLock::acquire(path) else {
+    ensure_builtin_jobs_at_read(path, &|p| std::fs::read(p));
+}
+fn ensure_builtin_jobs_at_read(path: &std::path::Path, read: &ScheduleReader<'_>) {
+    ensure_builtin_jobs_at_access(path, read, &ScheduleFileLock::acquire)
+}
+fn ensure_builtin_jobs_at_access(path: &std::path::Path, read: &ScheduleReader<'_>, acquire: &ScheduleAcquirer<'_>) {
+    let Some(_lock) = acquire(path) else {
         eprintln!("[cysd] ensure_builtin_jobs: schedule.json writer 잠금을 {SCHEDULE_LOCK_WAIT_MS}ms 안에 잡지 못했다 — 무접촉(다음 기회에 다시)");
         return;
     };
-    ensure_builtin_jobs_locked(path);
+    if let Err(error) = ensure_builtin_jobs_locked_read(path, read) { report_schedule_refusal("seed", &error); }
 }
 
 /// 잠금을 **이미 쥔** 호출자용 본체(손상 격리 직후 같은 틱의 복구가 여기로 온다).
 fn ensure_builtin_jobs_locked(path: &std::path::Path) {
-    let mut root: serde_json::Value = match std::fs::read_to_string(path) {
-        Ok(c) => match serde_json::from_str(&c) {
-            Ok(v) => v,
-            Err(e) => {
-                // 손상 — 무접촉(사용자 잡 보존 우선). load_jobs 가 격리+loud 신호를 낸다.
-                eprintln!("[cysd] ensure_builtin_jobs: schedule.json 파싱 실패({e}) — 무접촉(손상은 load_jobs 격리 소관)");
-                return;
-            }
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({"jobs": []}),
-        Err(e) => {
-            eprintln!("[cysd] ensure_builtin_jobs: schedule.json 읽기 실패({e}) — 무접촉");
-            return;
-        }
-    };
-    if !root.is_object() {
-        eprintln!("[cysd] ensure_builtin_jobs: schedule.json 최상위가 object 아님 — 무접촉");
-        return;
-    }
-    // jobs 배열 확보(부재/비배열이면 빈 배열로 정규화 — 다른 키는 보존).
-    if !root.get("jobs").map(|j| j.is_array()).unwrap_or(false) {
-        root.as_object_mut()
-            .unwrap()
-            .insert("jobs".to_string(), json!([]));
+    if let Err(error) = ensure_builtin_jobs_locked_read(path, &|p| std::fs::read(p)) { report_schedule_refusal("seed", &error); }
+}
+fn ensure_builtin_jobs_locked_read(path: &std::path::Path, read: &ScheduleReader<'_>) -> Result<bool, ScheduleRefusal> {
+    let mut root = read_schedule_root(path, read)?.unwrap_or_else(|| json!({"jobs": []}));
+    if root.get("jobs").is_none() {
+        root.as_object_mut().expect("validated root").insert("jobs".to_string(), json!([]));
     }
     let arr = root.get_mut("jobs").and_then(|j| j.as_array_mut()).unwrap();
     // ★(triage X8) 저장된 표현도 같은 정규형으로 접는다 — 메모리에서만 접으면 **파일**은 여전히
@@ -857,12 +913,10 @@ fn ensure_builtin_jobs_locked(path: &std::path::Path) {
         eprintln!("{}", text_command_note_detail(&id, kind));
     }
     if changed {
-        if write_schedule_atomic(path, &root) {
-            eprintln!("[cysd] ensure_builtin_jobs: built-in phoenix 잡 보장(생성/갱신) 완료");
-        } else {
-            eprintln!("[cysd] ensure_builtin_jobs: schedule.json 원자쓰기 실패");
-        }
+        if !write_schedule_atomic(path, &root) { return Err(ScheduleRefusal::named("write_failed")); }
+        eprintln!("[cysd] ensure_builtin_jobs: built-in phoenix 잡 보장(생성/갱신) 완료");
     }
+    Ok(changed)
 }
 
 fn state_path(daemon: &Daemon) -> PathBuf {
@@ -908,65 +962,50 @@ pub enum LoadMode {
 
 /// 경로 주입판(검체 가능) — 두 로더의 본체.
 pub fn load_jobs_at(path: &std::path::Path, mode: LoadMode) -> Vec<Job> {
+    load_jobs_at_read(path, mode, &|p| std::fs::read(p))
+}
+fn load_jobs_at_read(path: &std::path::Path, mode: LoadMode, read: &ScheduleReader<'_>) -> Vec<Job> {
+    load_jobs_at_access(path, mode, read, &ScheduleFileLock::acquire)
+}
+fn load_jobs_at_access(path: &std::path::Path, mode: LoadMode, read: &ScheduleReader<'_>, acquire: &ScheduleAcquirer<'_>) -> Vec<Job> {
     // 쓰기 모드는 읽기 **전에** 잠근다 — 읽기와 치환 사이에 CLI 추가가 끼어들면 그 추가가
     // 우리의 옛 문서로 덮여 사라진다(CLI 는 이미 성공을 출력한 뒤 = 거짓 성공).
     let lock = match mode {
         LoadMode::ReadOnly => None,
-        LoadMode::HotReload => match ScheduleFileLock::acquire(path) {
+        LoadMode::HotReload => match acquire(path) {
             Some(l) => Some(l),
             None => {
                 // 잠금을 못 잡았다 — 이번 틱은 **읽기만** 한다(쓰기 없는 경로로 강등 · 발화는 계속).
                 eprintln!("[cysd] schedule: writer 잠금을 {SCHEDULE_LOCK_WAIT_MS}ms 안에 잡지 못했다 — 이번 틱은 읽기만 한다");
-                return load_jobs_at(path, LoadMode::ReadOnly);
+                return load_jobs_at_access(path, LoadMode::ReadOnly, read, acquire);
             }
         },
     };
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        // 부재 = 정상(스케줄 미설정). 빈 스케줄로 조용히 진행한다.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
-        Err(e) => {
-            eprintln!(
-                "[cysd] schedule.json 읽기 실패({}): {e} — 빈 스케줄로 진행",
-                path.display()
-            );
-            return Vec::new();
-        }
-    };
-    // 존재하나 파싱 불가 = 데이터 손상. 조용히 빈 스케줄로 대체하면 24/365 데몬의 전 하트비트가
-    // 신호 0으로 소실된다(헌장 복원 불변식 모순). 손상본을 격리하고 loud 신호를 남긴다.
-    let mut root: serde_json::Value = match serde_json::from_str(&content) {
-        Ok(v) => v,
-        Err(e) => {
-            if lock.is_none() {
-                // 읽기 전용 경로는 격리하지 않는다(rename 은 쓰기다) — 틱이 30초 안에 처리한다.
-                eprintln!("[cysd] schedule.json 파싱 실패: {e} — 읽기 전용 경로라 격리하지 않는다(다음 틱이 격리·복구) · 빈 스케줄로 진행");
-                return Vec::new();
-            }
+    let mut root = match read_schedule_root(path, read) {
+        Ok(None) => return Vec::new(), // Direct NotFound still does not seed on hotreload.
+        Ok(Some(root)) => root,
+        Err(error) if error.reason == "invalid_json" && lock.is_some() => {
             let note = match quarantine_corrupt(path) {
                 Some(b) => format!("손상본을 {}로 격리(데이터 보존)", b.display()),
                 None => "손상본 격리 실패".to_string(),
             };
-            // ★(성찰 A11 ⓒ) 격리 뒤 **같은 틱에서** builtin 을 복구한다. 종전에는 `ensure_builtin_jobs`
-            //   가 부트에만 돌아 phoenix 스냅샷·learn 감사·cycle 틱·편성 심박·CSO 60분 점검이
-            //   **데몬 재시작까지 전부 정지**했다(코드 자신이 경고한 무발화 침묵).
-            eprintln!("[cysd] schedule.json 파싱 실패: {e} — {note}; 같은 틱에서 built-in 잡을 복구한다");
+            // Explicit, existing syntax recovery, not normal-RMW permission to overwrite unreadable data.
+            eprintln!("[cysd] schedule recovery reason=invalid_json — {note}; 같은 틱에서 built-in 잡을 복구한다");
             ensure_builtin_jobs_locked(path);
-            return match std::fs::read_to_string(path)
-                .ok()
-                .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
-            {
-                Some(v) => jobs_of(&v),
-                None => Vec::new(),
+            return match read_schedule_root(path, read) {
+                Ok(Some(v)) => jobs_of(&v),
+                Ok(None) => Vec::new(),
+                Err(error) => { report_schedule_refusal("recovery_readback", &error); Vec::new() }
             };
         }
+        Err(error) => { report_schedule_refusal(if mode == LoadMode::HotReload { "hotreload" } else { "readonly" }, &error); return Vec::new(); }
     };
     // ★(수렴 R2 · triage X8 잔여) **핫리로드도 파일을 접는다.** 종전에는 아래 serde 계층이
     //   메모리의 `Job` 만 정규화했고(`canonicalize_queue_action`), 디스크는 운영자가 손으로 넣은
     //   구 표현 그대로였다 — 그 표현이 강등된 구 데몬의 직접 주입 통로다. 멱등이라 바뀔 것이
     //   없으면 파일을 건드리지 않는다(매 틱 쓰기 없음). ★(성찰 A11) 쓰기 모드에서만 · 잠금 아래에서.
     if lock.is_some() {
-        canonicalize_schedule_file(path, &mut root);
+        if let Err(error) = canonicalize_schedule_file(path, &mut root) { report_schedule_refusal("canonicalize", &error); }
     }
     jobs_of(&root)
 }
@@ -1494,21 +1533,20 @@ fn remove_job_from_file(job_id: &str) {
 
 /// 경로 주입판 — ★(성찰 A11) writer 잠금 아래에서 읽고·빼고·쓴다(읽기와 치환 사이의 CLI 추가 보존).
 fn remove_job_from_file_at(path: &std::path::Path, job_id: &str) {
-    let Some(_lock) = ScheduleFileLock::acquire(path) else {
-        eprintln!("[cysd] schedule: 원샷 잡 '{job_id}' 제거 — writer 잠금을 잡지 못했다 · 다음 틱이 다시 시도한다");
-        return;
-    };
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return;
-    };
-    let Ok(mut root) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return;
-    };
-    drop_job_and_canonicalize(&mut root, job_id);
-    // 원자 치환 — 부분 쓰기가 핫리로드에 잡히면 스케줄 전체가 빈 스케줄로 읽힌다.
-    if !write_schedule_atomic(path, &root) {
-        eprintln!("[cysd] schedule: 원샷 잡 '{job_id}' 제거 기록 실패 — 다음 틱이 다시 시도한다");
-    }
+    remove_job_from_file_at_read(path, job_id, &|p| std::fs::read(p));
+}
+fn remove_job_from_file_at_read(path: &std::path::Path, job_id: &str, read: &ScheduleReader<'_>) {
+    remove_job_from_file_at_access(path, job_id, read, &ScheduleFileLock::acquire)
+}
+fn remove_job_from_file_at_access(path: &std::path::Path, job_id: &str, read: &ScheduleReader<'_>, acquire: &ScheduleAcquirer<'_>) {
+    let result = (|| -> Result<(), ScheduleRefusal> {
+        let _lock = acquire(path).ok_or_else(|| ScheduleRefusal::named("lock_unavailable"))?;
+        let Some(mut root) = read_schedule_root(path, read)? else { return Ok(()) };
+        drop_job_and_canonicalize(&mut root, job_id);
+        if !write_schedule_atomic(path, &root) { return Err(ScheduleRefusal::named("write_failed")); }
+        Ok(())
+    })();
+    if let Err(error) = result { report_schedule_refusal("remove", &error); }
 }
 
 /// ★(0.14.42 · R3SH-5 ②) 동결로 끝난 원샷 잡을 파일에 되돌린다(`at + 1`). 같은 id 가 이미 있으면(사람이 다시 넣음) 손대지
@@ -1518,35 +1556,42 @@ fn requeue_oneshot_after_frozen(daemon: &Arc<Daemon>, job: &Job) {
 }
 
 fn requeue_oneshot_after_frozen_at(daemon: &Arc<Daemon>, path: &std::path::Path, job: &Job) {
+    requeue_oneshot_after_frozen_at_read(daemon, path, job, &|p| std::fs::read(p));
+}
+fn requeue_oneshot_after_frozen_at_read(daemon: &Arc<Daemon>, path: &std::path::Path, job: &Job, read: &ScheduleReader<'_>) {
+    requeue_oneshot_after_frozen_at_access(daemon, path, job, read, &ScheduleFileLock::acquire)
+}
+fn requeue_oneshot_after_frozen_at_access(daemon: &Arc<Daemon>, path: &std::path::Path, job: &Job, read: &ScheduleReader<'_>, acquire: &ScheduleAcquirer<'_>) {
     let Some(at) = job.at else { return };
     if job.every_minutes.is_some_and(|m| m > 0) {
         return;
     }
     let mut back = job.clone();
     back.at = Some(at.saturating_add(1));
-    let ok = (|| {
-        let _lock = ScheduleFileLock::acquire(path)?;
-        let mut root: serde_json::Value = std::fs::read_to_string(path)
-            .ok()
-            .and_then(|c| serde_json::from_str(&c).ok())
-            .unwrap_or_else(|| json!({"jobs": []}));
-        if !root["jobs"].is_array() {
-            root["jobs"] = json!([]);
+    let result = (|| -> Result<(), ScheduleRefusal> {
+        let _lock = acquire(path).ok_or_else(|| ScheduleRefusal::named("lock_unavailable"))?;
+        let mut root = read_schedule_root(path, read)?.unwrap_or_else(|| json!({"jobs": []}));
+        if root.get("jobs").is_none() {
+            root.as_object_mut().expect("validated root").insert("jobs".to_string(), json!([]));
         }
-        let arr = root["jobs"].as_array_mut()?;
-        if arr.iter().any(|j| j["id"].as_str() == Some(back.id.as_str())) {
-            return Some(true);
-        }
-        arr.push(serde_json::to_value(&back).ok()?);
+        let arr = root["jobs"].as_array_mut().expect("validated jobs");
+        if arr.iter().any(|j| j["id"].as_str() == Some(back.id.as_str())) { return Ok(()) }
+        arr.push(serde_json::to_value(&back).map_err(|_| ScheduleRefusal::named("serialize_failed"))?);
         canonicalize_stored_queue_actions(arr);
-        write_schedule_atomic(path, &root).then_some(true)
-    })()
-    .unwrap_or(false);
+        if !write_schedule_atomic(path, &root) { return Err(ScheduleRefusal::named("write_failed")); }
+        Ok(())
+    })();
+    let ok = result.is_ok();
+    let refusal = result.as_ref().err();
+    if let Some(error) = refusal { report_schedule_refusal("requeue", error); }
+
     daemon.bus.publish(
         "schedule.oneshot_requeued",
         "schedule",
         None,
         json!({"job_id": job.id, "at": back.at, "ok": ok,
+               "reason": refusal.map(|e| e.reason), "io_kind": refusal.and_then(|e| e.io_kind).map(|k| format!("{k:?}")),
+               "raw_os_error": refusal.and_then(|e| e.raw_os_error),
                "note": if ok { "kill-switch 경합으로 동결된 원샷을 파일에 되돌렸다 — 해제 뒤 다음 틱이 다시 발화한다" }
                        else { "동결된 원샷을 파일에 되돌리지 못했다(잠금·쓰기 실패) — 이 wake 는 다시 오지 않는다 · 수동 재등록 필요" }}),
     );
@@ -4886,7 +4931,7 @@ mod converge_schedule {
         std::fs::write(&path, raw.to_string()).unwrap();
         let mut root: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(canonicalize_schedule_file(&path, &mut root), "구 표현을 접지 않았다");
+        assert!(canonicalize_schedule_file(&path, &mut root).expect("normalization write"), "구 표현을 접지 않았다");
         let on_disk: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(
@@ -4899,7 +4944,7 @@ mod converge_schedule {
         // 멱등 — 바꿀 것이 없으면 파일을 건드리지 않는다(매 틱 쓰기 금지).
         let mut again: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(!canonicalize_schedule_file(&path, &mut again), "재실행이 또 쓴다(비멱등)");
+        assert!(!canonicalize_schedule_file(&path, &mut again).expect("idempotent normalization"), "재실행이 또 쓴다(비멱등)");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -7906,3 +7951,11 @@ mod pkg1_auth_hold_tests {
         assert!(pkg1_lapse_events(daemon, s.id).is_empty(), "a wall-clock jump must not lapse the hold");
     }
 }
+
+#[cfg(test)]
+#[path = "schedule_integrity_tests.rs"]
+mod integrity_tests;
+
+#[cfg(test)]
+#[path = "schedule_lock_policy_tests.rs"]
+mod lock_policy_tests;
