@@ -1452,8 +1452,10 @@ pub struct InjectTrack {
     /// watchdog 틱의 재제출(`governance::resubmit_withheld_submits`). leaf 락(다른 락을 쥔 채 잡지 않는다).
     withheld: Mutex<Option<WithheldSubmit>>,
     /// ★(0.14.52 · S-a C7b) Writer requests that wrote at least one byte to this seat (any arm). A held partial write
-    /// resumes only while this is unchanged since its hold (S4-1 "no foreign input since the loss").
+    /// D9 retains this conservative total, including successful CPR and possibly partial failed attempts.
     wrote: AtomicU64,
+    /// Ordinary writes and failed terminal replies; successful own replies do not taint resume.
+    resume_write_epoch: AtomicU64,
 }
 
 /// ★(0.14.42 · 수정 2회차 F1 · 재개) 쓰지 않은(보류한) 제출 CR 의 기록 — 보류는 **버림이 아니라 미룸**이다. 창이 닫히고
@@ -1678,14 +1680,27 @@ impl InjectTrack {
             Some(MachineBody { norm, owner, at: Instant::now() });
     }
 
-    /// ★(0.14.52 · S-a C7b) writer only - this request put at least one byte on the PTY.
+    /// Writer only: conservative ordinary write attempt, including possibly partial failures.
     pub(crate) fn note_wrote(&self) {
         self.wrote.fetch_add(1, Ordering::AcqRel);
+        self.resume_write_epoch.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// ★(0.14.52 · S-a C7b) Writer requests that wrote at least one byte so far ([`InjectTrack::note_wrote`]).
+    /// Total counted transport attempts, including successful protocol replies; D9 uses this.
     pub(crate) fn wrote(&self) -> u64 {
         self.wrote.load(Ordering::Acquire)
+    }
+
+    /// Resume's own monotonic write instrument, never total-minus-reply-count.
+    pub(crate) fn resume_write_epoch(&self) -> u64 {
+        self.resume_write_epoch.load(Ordering::Acquire)
+    }
+
+    fn note_terminal_reply(&self, succeeded: bool) {
+        self.wrote.fetch_add(1, Ordering::AcqRel);
+        if !succeeded {
+            self.resume_write_epoch.fetch_add(1, Ordering::AcqRel);
+        }
     }
 
     /// ★(R3SH-1) 마지막 기계 본문 기록(없으면 None).
@@ -1849,10 +1864,16 @@ pub(crate) struct HandoffMark {
     mine: HandoffStamp,
 }
 
+/// Only the state-module CPR generator can construct this protocol response.
+/// No public byte constructor: identical bytes sent as Data remain ordinary input.
+pub struct TerminalReply(Vec<u8>);
+
 /// PTY 쓰기 요청 — surface별 전용 writer 스레드가 순서대로 소비한다.
 pub enum WriteReq {
-    /// 그대로 쓰기 (키 입력·텍스트·DSR 응답)
+    /// 그대로 쓰기 (키 입력·텍스트; bytes never confer reply provenance)
     Data(Vec<u8>),
+    /// Internally generated CPR, retaining normal writer admission and operation lease.
+    TerminalReply(TerminalReply),
     /// 원자적 주입: (clear_first면 Ctrl-U 선정리 → settle) → bracketed paste → cr_delay_ms 대기 → CR.
     /// 전부 한 writer arm에서 처리 = 다른 WriteReq의 끼어듦 차단(동시 주입 병합·부분 전달 차단).
     /// clear_first=권위 전달: 잔존 미제출 텍스트를 지운 깨끗한 라인에 명령을 원자적으로 꽂고 제출한다.
@@ -3604,6 +3625,17 @@ fn process_chunk_isolated(
             (None, true)
         }
     }
+}
+
+/// The same generator used by the reader, exposed only to controlled resume specimens.
+#[cfg(test)]
+pub(crate) fn dsr_resume_generated_request() -> WriteReq {
+    let mut parser = vt100::Parser::new(24, 80, 0);
+    let query = b"\x1b[6n";
+    let (count, _) = count_dsr_queries(&[], query);
+    let (response, panicked) = process_chunk_isolated(&mut parser, query, count);
+    assert!(!panicked);
+    WriteReq::TerminalReply(TerminalReply(response.expect("generated CPR").into_bytes()))
 }
 
 #[cfg(test)]
@@ -7861,7 +7893,7 @@ impl Daemon {
                             // 응답을 조용히 버려 '고부하에서만 ConPTY 스톨'을 만들었다.
                             if send_write_req_bounded(
                                 &surf.write_tx,
-                                WriteReq::Data(resp.into_bytes()),
+                                WriteReq::TerminalReply(TerminalReply(resp.into_bytes())),
                                 DSR_SEND_DEADLINE,
                             ) {
                                 if debug {
@@ -8467,6 +8499,7 @@ pub(crate) fn run_writer_loop_tracked<W: Write, R: Into<crate::writer_gate::Queu
         #[cfg(test)]
         let win_diag_origin = track.as_ref().filter(|t| t.win_diag.enabled()).map(|_| match &req {
             WriteReq::Data(bytes) => format!("Data bytes={bytes:?}"),
+            WriteReq::TerminalReply(reply) => format!("TerminalReply bytes={:?}", reply.0),
             WriteReq::DataAfter { bytes, .. } => format!("DataAfter bytes={bytes:?}"),
             WriteReq::Program(_) => "Program".into(),
             WriteReq::SubmitAfterGap { .. } => "SubmitAfterGap".into(),
@@ -8474,6 +8507,7 @@ pub(crate) fn run_writer_loop_tracked<W: Write, R: Into<crate::writer_gate::Queu
             WriteReq::Agent(job) => format!("Agent origin={} request={}", job.request.origin, job.request.id),
             WriteReq::P1ReceiverBarrier(_) => "P1ReceiverBarrier".into(),
         });
+        let terminal_reply = matches!(&req, WriteReq::TerminalReply(_));
         let res = match req {
             #[cfg(test)]
             WriteReq::P1ReceiverBarrier(marker) => {
@@ -8483,6 +8517,7 @@ pub(crate) fn run_writer_loop_tracked<W: Write, R: Into<crate::writer_gate::Queu
                 continue;
             }
             WriteReq::Data(bytes) => writer.write_all(&bytes).and_then(|_| writer.flush()),
+            WriteReq::TerminalReply(reply) => writer.write_all(&reply.0).and_then(|_| writer.flush()),
             // ★B2: 최소 간격 확보용 지연 쓰기. 단일 소비자라 이 sleep 동안 뒤 요청은 채널에
             // 머물고, 따라서 '지연된 CR 뒤에 온 바이트'가 CR 을 추월하는 일이 없다(순서 보존).
             // delay_ms=0 이면 sleep 은 즉시 반환하므로 Data 와 동일 동작이다.
@@ -8624,9 +8659,13 @@ pub(crate) fn run_writer_loop_tracked<W: Write, R: Into<crate::writer_gate::Queu
         // ★(0.14.52 · S-a C7b) Every arm that reaches here attempted a write (a withheld Return and an unclaimed Inject
         //   `continue` above without a byte): counted even when it failed, since a failed write may have put bytes.
         if let Some(t) = &track {
-            t.note_wrote();
+            if terminal_reply {
+                t.note_terminal_reply(res.is_ok());
+            } else {
+                t.note_wrote();
+            }
             #[cfg(test)]
-            t.win_diag.record(|| format!("write_count={} origin={win_diag_origin:?} result={res:?}", t.wrote()));
+            t.win_diag.record(|| format!("write_count={} resume_write_epoch={} origin={win_diag_origin:?} result={res:?}", t.wrote(), t.resume_write_epoch()));
         }
         if res.is_err() {
             break; // PTY 닫힘 — 이후 send는 disconnected로 호출자에 드러난다

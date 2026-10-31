@@ -20902,6 +20902,7 @@ mod tests {
     fn write_req_name(r: &crate::state::WriteReq) -> &'static str {
         match r {
             crate::state::WriteReq::Data(_) => "Data",
+            crate::state::WriteReq::TerminalReply(_) => "TerminalReply",
             crate::state::WriteReq::Program(_) => "Program",
             crate::state::WriteReq::DataAfter { .. } => "DataAfter",
             crate::state::WriteReq::SubmitAfterGap { .. } => "SubmitAfterGap",

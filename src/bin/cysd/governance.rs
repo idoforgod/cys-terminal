@@ -10794,8 +10794,8 @@ pub(crate) struct QueueResume {
     entries: Vec<crate::state::QueueEntry>,
     /// `input_gen` right after the hold's own count update: any later move is foreign input.
     input_gen: u64,
-    /// The writer's write count at the hold ([`crate::state::InjectTrack::wrote`]): any later write is foreign.
-    wrote: u64,
+    /// Resume epoch at hold: ordinary writes and failed replies are foreign.
+    resume_write_epoch: u64,
     /// A resumed run's claim-time probe found a premise broken (a foreign write or a moved epoch): the re-hold never resumes.
     void: std::sync::atomic::AtomicBool,
 }
@@ -10815,7 +10815,7 @@ impl std::fmt::Debug for QueueResume {
             .field("request_id", &self.stamp.request.id)
             .field("entry_ids", &self.d.merged_ids)
             .field("input_gen", &self.input_gen)
-            .field("wrote", &self.wrote)
+            .field("resume_write_epoch", &self.resume_write_epoch)
             .finish()
     }
 }
@@ -11034,7 +11034,7 @@ fn hold_partial_write(
                 overdue,
                 entries: f.entries.clone(),
                 input_gen,
-                wrote: s.inject_track.wrote(),
+                resume_write_epoch: s.inject_track.resume_write_epoch(),
                 void: std::sync::atomic::AtomicBool::new(false),
             })
         });
@@ -11210,17 +11210,16 @@ fn try_resume_partial_write(daemon: &Arc<Daemon>, s: &Arc<crate::state::Surface>
         (r, env)
     };
     let foreign = || {
-        s.input_gen.load(Ordering::Acquire) != r.input_gen
-            || s.inject_track.wrote() != r.wrote
-            || *s.last_human_input.lock().unwrap_or_else(|e| e.into_inner()) != r.stamp.human_at
-    };
-    #[cfg(test)]
-    let foreign = || {
+        // Evaluate each production operand once, retaining short-circuit lock/read ordering.
         let input = s.input_gen.load(Ordering::Acquire);
-        let wrote = s.inject_track.wrote();
-        let human = *s.last_human_input.lock().unwrap_or_else(|e| e.into_inner());
-        let result = input != r.input_gen || wrote != r.wrote || human != r.stamp.human_at;
-        crate::agent_queue_tests::win_diag(s, "resume.foreign", (result, r.input_gen, input, r.wrote, wrote, r.stamp.human_at, human));
+        let epoch = (input == r.input_gen).then(|| s.inject_track.resume_write_epoch());
+        let human = epoch.filter(|v| *v == r.resume_write_epoch)
+            .map(|_| *s.last_human_input.lock().unwrap_or_else(|e| e.into_inner()));
+        let result = input != r.input_gen
+            || epoch.is_some_and(|v| v != r.resume_write_epoch)
+            || human.is_some_and(|v| v != r.stamp.human_at);
+        #[cfg(test)]
+        crate::agent_queue_tests::win_diag(s, "resume.foreign", (result, r.input_gen, input, r.resume_write_epoch, epoch, r.stamp.human_at, human));
         result
     };
     if !r.stamp.epochs_hold(s) || foreign() {
@@ -11344,7 +11343,7 @@ fn resume_safety_probe(
             let (Some(d), Some(s)) = (wd.upgrade(), ws.upgrade()) else {
                 return true;
             };
-            if s.inject_track.wrote() != r.wrote || !r.stamp.epochs_hold(&s) {
+            if s.inject_track.resume_write_epoch() != r.resume_write_epoch || !r.stamp.epochs_hold(&s) {
                 r.void.store(true, Ordering::Release);
                 return true;
             }
