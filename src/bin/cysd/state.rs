@@ -7661,6 +7661,9 @@ impl Daemon {
             p1_e0_reader_completion: Mutex::new((false, Vec::new())),
         });
 
+        #[cfg(test)]
+        crate::agent_queue_tests::win_diag_surface_created(&surface);
+
         // ★W2a: 이 create가 실제 등록한(dedup 후) 역할 — 아래에서 묘비 해제에 쓴다.
         let mut registered_role: Option<String> = None;
         {
@@ -7738,6 +7741,8 @@ impl Daemon {
             let mut reader = reader;
             let mut buf = [0u8; 16 * 1024];
             // DSR 질의가 청크 경계에 걸려도 감지되도록 직전 꼬리 3바이트를 이어붙인다
+            #[cfg(test)]
+            let _reader_liveness = crate::agent_queue_tests::WinDiagReader::new(&surf.inject_track.win_diag);
             let mut dsr_tail: Vec<u8> = Vec::new();
             if debug {
                 eprintln!(

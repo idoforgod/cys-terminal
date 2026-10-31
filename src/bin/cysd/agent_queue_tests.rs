@@ -3042,8 +3042,9 @@ fn p1_completion_neutral_marker_write_error_stops_before_later_data() {
 
 // Per-instance diagnostic storage: never shared between seats or concurrent specimens.
 #[derive(Debug, Default)]
-pub(crate) struct WinDiag(std::sync::Mutex<Option<Vec<String>>>);
+pub(crate) struct WinDiag(std::sync::Mutex<Option<Vec<String>>>, std::sync::atomic::AtomicBool);
 impl WinDiag {
+    pub(crate) fn reader_alive(&self) -> bool { self.1.load(Ordering::Acquire) }
     pub(crate) fn enabled(&self) -> bool { self.0.lock().unwrap().is_some() }
     pub(crate) fn enable(&self) { *self.0.lock().unwrap() = Some(Vec::new()); }
     pub(crate) fn record(&self, value: impl FnOnce() -> String) {
@@ -3092,4 +3093,170 @@ impl<'a> WinDiagSurface<'a> {
 impl std::ops::Deref for WinDiagSurface<'_> {
     type Target = Arc<Surface>;
     fn deref(&self) -> &Arc<Surface> { self.surface }
+}
+
+// Creation-scoped opt-in precedes reader startup, so startup diagnostics are not discarded.
+thread_local! { static WIN_DIAG_CREATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+pub(crate) fn with_win_diag_creation<T>(create: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore { fn drop(&mut self) { WIN_DIAG_CREATE.with(|s| s.set(self.0)); } }
+    let _restore = Restore(WIN_DIAG_CREATE.with(|s| s.replace(true)));
+    create()
+}
+pub(crate) fn win_diag_surface_created(s: &Surface) {
+    if WIN_DIAG_CREATE.with(|v| v.get()) { s.inject_track.win_diag.enable(); }
+}
+pub(crate) struct WinDiagReader<'a>(&'a WinDiag);
+impl<'a> WinDiagReader<'a> {
+    pub(crate) fn new(diag: &'a WinDiag) -> Self {
+        diag.1.store(true, Ordering::Release);
+        Self(diag)
+    }
+}
+impl Drop for WinDiagReader<'_> {
+    fn drop(&mut self) { self.0.1.store(false, Ordering::Release); }
+}
+
+#[derive(Clone, Debug)]
+struct StartupFacts {
+    before: u64, after: u64, quiet: Duration, pending: usize,
+    dropped: u64, parser_panics: u64, reader_alive: bool, child_alive: bool,
+}
+fn startup_ready(f: &StartupFacts) -> bool {
+    f.before > 0 && f.before % 2 == 0 && f.before == f.after
+        && f.quiet >= Duration::from_secs(1) && f.pending == 0
+        && f.dropped == 0 && f.parser_panics == 0 && f.reader_alive && f.child_alive
+}
+fn startup_barrier(sid: u64) -> (Arc<crate::agent_write::Request>, crate::state::WriteReq) {
+    use crate::agent_write::{AgentJob, PassThrough, Plan, Request};
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let request = Request::new(format!("startup-barrier-{sid}-{}", NEXT.fetch_add(1, Ordering::Relaxed)), sid, "fixture-startup", String::new());
+    let plan = Plan::control(Vec::new());
+    assert!(plan.planned_bytes().is_empty(), "startup marker must not write to the PTY");
+    let job = AgentJob { request:request.clone(), attempt:None, plan, proof:Arc::new(PassThrough), journal:None,
+        resume:None, settle:None, guard:None, note_body:false, body_owner:None };
+    (request, crate::state::WriteReq::Agent(Box::new(job)))
+}
+
+/// One shared 12 s setup/operation deadline. A completed zero-byte FIFO marker
+/// proves earlier raw DSR writes did not break the writer; it does not promise future quiet.
+pub(crate) fn fixture_startup_deadline(s: &Arc<Surface>, what: &str) -> Instant {
+    let deadline = Instant::now() + Duration::from_secs(12);
+    if cfg!(windows) {
+        wait_fixture_startup(s, deadline).unwrap_or_else(|e| panic!("{what}: {e}; {}", s.inject_track.win_diag.dump()));
+    }
+    deadline
+}
+fn wait_fixture_startup(s: &Arc<Surface>, deadline: Instant) -> Result<(), String> {
+    use crate::agent_write::{Accepted, Status, Terminal};
+    let mut retained = None;
+    let mut barrier: Option<(u64, Arc<crate::agent_write::Request>)> = None;
+    loop { // wallclock: guard the whole startup setup, marker admission and settlement share one deadline
+        let before = s.output_gen.load(Ordering::Acquire);
+        let quiet = s.last_output.lock().unwrap_or_else(|e| e.into_inner()).elapsed();
+        if before > 0 && before % 2 == 0 && quiet >= Duration::from_secs(1) && retained.is_none() {
+            // Delay executable identity capture until startup settles (a Unix shell may exec sleep).
+            retained = Some(cys::process_observation::Retained::open(s.pid).map_err(|e| format!("retaining fixture child: {e:?}"))?);
+        }
+        let child_alive = match &retained {
+            Some(child) => { child.recheck().map_err(|e| format!("fixture child changed/exited: {e:?}"))?; true },
+            None => false,
+        };
+        let facts = StartupFacts { before, quiet, pending:s.write_tx.gate().pending(),
+            dropped:s.dsr_dropped.load(Ordering::Acquire), parser_panics:s.parser_panics.load(Ordering::Acquire),
+            reader_alive:s.inject_track.win_diag.reader_alive(), child_alive,
+            after:s.output_gen.load(Ordering::Acquire) };
+        if facts.dropped != 0 || facts.parser_panics != 0 || s.exited.load(Ordering::Acquire) {
+            return Err(format!("startup lost a reply/frame or reader exited: {facts:?}"));
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("startup 12 s budget exhausted: {facts:?}; marker={:?}", barrier.as_ref().map(|(_,r)| r.status())));
+        }
+        if let Some((generation, request)) = &barrier {
+            if request.is_settled() {
+                let terminal = request.status();
+                if terminal != Status::Terminal(Terminal::WrittenBody { accepted:Accepted::default() }) {
+                    return Err(format!("zero-byte startup marker failed: {terminal:?}; {facts:?}"));
+                }
+                if startup_ready(&facts) && facts.before == *generation {
+                    win_diag(s, "startup.ready", (&facts, request.id.clone(), retained.as_ref().unwrap().observation().identity.clone()));
+                    return Ok(());
+                }
+                barrier = None; // publication moved; next candidate needs another ordered marker
+            }
+        } else if startup_ready(&facts) {
+            let (request, job) = startup_barrier(s.id);
+            s.write_tx.try_send(job).map_err(|_| format!("startup marker admission failed: {facts:?}"))?;
+            barrier = Some((facts.before, request));
+        }
+        std::thread::sleep(deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(25)));
+    }
+}
+
+#[test]
+fn win_startup_facts_require_all_measured_axes() {
+    let baseline = StartupFacts { before:2, after:2, quiet:Duration::from_secs(1), pending:0,
+        dropped:0, parser_panics:0, reader_alive:true, child_alive:true };
+    assert!(startup_ready(&baseline));
+    for axis in 0..9 {
+        let mut f = baseline.clone();
+        match axis { 0=>{f.before=0; f.after=0}, 1=>{f.before=3;f.after=3}, 2=>f.after=4,
+            3=>f.quiet=Duration::from_millis(999), 4=>f.pending=1, 5=>f.dropped=1,
+            6=>f.parser_panics=1, 7=>f.reader_alive=false, _=>f.child_alive=false }
+        assert!(!startup_ready(&f), "missing axis {axis}: {f:?}");
+    }
+}
+#[test]
+fn win_startup_barrier_has_no_bytes_or_track_side_effects() {
+    let track = Arc::new(crate::state::InjectTrack::default());
+    track.note_body("seed", None); track.note_wrote();
+    let before = format!("{track:?}");
+    let (request, job) = startup_barrier(1);
+    let (tx, rx) = std::sync::mpsc::channel(); tx.send(job).unwrap(); drop(tx);
+    let mut bytes = Vec::new();
+    crate::state::run_writer_loop_tracked(&mut bytes, rx, Arc::new(std::sync::atomic::AtomicBool::new(false)), Some(track.clone()));
+    assert!(request.is_settled());
+    assert_eq!(request.status(), crate::agent_write::Status::Terminal(crate::agent_write::Terminal::WrittenBody { accepted:crate::agent_write::Accepted::default() }));
+    assert!(bytes.is_empty());
+    assert_eq!(format!("{track:?}"), before);
+}
+#[test]
+fn win_startup_barrier_cannot_outlive_a_prior_raw_write_failure() {
+    struct Broken;
+    impl std::io::Write for Broken {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> { Err(std::io::Error::other("fixture raw failure")) }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    let (request, job) = startup_barrier(1);
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(crate::state::WriteReq::Data(b"reply".to_vec())).unwrap(); tx.send(job).unwrap(); drop(tx);
+    crate::state::run_writer_loop_tracked(Broken, rx, Arc::new(std::sync::atomic::AtomicBool::new(false)), None);
+    assert!(!request.is_settled(), "a failed prior reply must never acknowledge the later marker");
+}
+#[test]
+fn win_startup_setup_observes_real_output_and_zero_byte_barrier() {
+    let fx = fx("win-startup");
+    let command = if cfg!(windows) { "Write-Output 'WIN_READY'; Start-Sleep -Seconds 30" } else { "printf WIN_READY; sleep 30" };
+    let s = with_win_diag_creation(|| fx.daemon.create_surface(None, Some(command.into()), None, None, 24, 80).unwrap());
+    let deadline = Instant::now() + Duration::from_secs(12);
+    wait_fixture_startup(&s, deadline).unwrap_or_else(|e| panic!("{e}; {}", s.inject_track.win_diag.dump()));
+    assert!(s.output_gen.load(Ordering::Acquire)>0);
+    assert!(s.inject_track.win_diag.dump().contains("route=startup.ready"));
+}
+
+pub(crate) fn fixture_zero_write_retry(windows: bool, code: Option<&str>, before: u64, after: u64,
+    input_before: u64, input_after: u64, human_before: u64, human_after: u64) -> bool {
+    windows && code == Some("guard_aborted") && before % 2 == 0 && before != after
+        && input_before == input_after && human_before == 0 && human_after == 0
+}
+#[test]
+fn win_startup_retry_requires_known_zero_and_only_output_interference() {
+    assert!(fixture_zero_write_retry(true, Some("guard_aborted"), 2, 4, 0, 0, 0, 0));
+    for code in [None, Some("own_paste_settling"), Some("write_outcome_unknown"), Some("partial_exact"), Some("invalid_params")] {
+        assert!(!fixture_zero_write_retry(true, code, 2, 4, 0, 0, 0, 0));
+    }
+    for (win, before, after, ib, ia, hb, ha) in [
+        (false,2,4,0,0,0,0), (true,2,2,0,0,0,0), (true,1,2,0,0,0,0),
+        (true,2,4,0,1,0,0), (true,2,4,0,0,1,0), (true,2,4,0,0,0,1),
+    ] { assert!(!fixture_zero_write_retry(win, Some("guard_aborted"), before, after, ib, ia, hb, ha)); }
 }

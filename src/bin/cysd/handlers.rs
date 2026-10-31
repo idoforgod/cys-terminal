@@ -33898,8 +33898,8 @@ mod p1_cycle_tests {
         let f = fx("p1e-tg1");
         let me = Some(std::process::id());
         // Seat A: screen axis.
-        let a = painted(&f);
-        a.inject_track.win_diag.enable();
+        let a = crate::agent_queue_tests::with_win_diag_creation(|| painted(&f));
+        let _a_deadline = crate::agent_queue_tests::fixture_startup_deadline(&a, "p1_e_t_g1 seat a");
         own_claim(&f, &a);
         paint(&a, "residue body");
         a.inject_track.note_body("residue body", None);
@@ -33914,15 +33914,15 @@ mod p1_cycle_tests {
         let proven = clear(&f, me, &a, fence(&a, "machine_residue"));
         assert_eq!(proven["result"]["sent"], json!(true), "proven machine residue + valid cycle clear passes draft_gate ({proven}) diagnostic {}", a.inject_track.win_diag.dump());
         // Seat B: our own paste is active.
-        let b = painted(&f);
-        b.inject_track.win_diag.enable();
+        let b = crate::agent_queue_tests::with_win_diag_creation(|| painted(&f));
+        let b_deadline = crate::agent_queue_tests::fixture_startup_deadline(&b, "p1_e_t_g1 seat b");
         own_claim(&f, &b);
         paint(&b, "our paste in flight");
         b.inject_track.begin();
-        let drawn = clear(&f, me, &b, fence(&b, "idle"));
+        let drawn = own_paste_clear_without_interference(&f, me, &b, "our paste in flight", b_deadline);
         assert_eq!(drawn["error"]["code"], json!("own_paste_settling"), "own paste drawn on the line: own_paste_settling ({drawn}) diagnostic {}", b.inject_track.win_diag.dump());
         paint(&b, "");
-        let empty = clear(&f, me, &b, fence(&b, "idle"));
+        let empty = own_paste_clear_without_interference(&f, me, &b, "", b_deadline);
         assert_eq!(empty["error"]["code"], json!("own_paste_settling"), "own paste, empty line: own_paste_settling ({empty}) diagnostic {}", b.inject_track.win_diag.dump());
         assert!(!empty.to_string().contains("quiet_secs_unreported"), "a transient code, never the structural token");
         let plain_b = clear(&f, me, &b, json!({}));
@@ -33930,9 +33930,9 @@ mod p1_cycle_tests {
         b.inject_track.end();
         // Separate stale-receipt and writer-claim negatives; neither can satisfy the own-paste assertion above.
         for stage in ["receipt_refused", "writer_result"] {
-            let c = painted(&f);
-            c.inject_track.win_diag.enable();
-            own_claim(&f, &c);
+            let c = crate::agent_queue_tests::with_win_diag_creation(|| painted(&f));
+            let _c_deadline = crate::agent_queue_tests::fixture_startup_deadline(&c, "p1_e_t_g1 seat c");
+                own_claim(&f, &c);
             paint(&c, "");
             let mut observed = fence(&c, "idle");
             if stage == "receipt_refused" {
@@ -33953,6 +33953,31 @@ mod p1_cycle_tests {
         }
         let _ = a.child.lock().unwrap().kill();
         let _ = b.child.lock().unwrap().kill();
+    }
+
+    fn own_paste_clear_without_interference(f: &Fx, me: Option<u32>, s: &Arc<crate::state::Surface>, typed: &str, deadline: std::time::Instant) -> Value {
+        loop { // wallclock: guard shares the Windows startup deadline; no fresh budget on retry
+            assert!(std::time::Instant::now() < deadline, "own-paste fixture budget exhausted: {}", s.inject_track.win_diag.dump());
+            let before = s.output_gen.load(Ordering::Acquire);
+            let input = s.input_gen.load(Ordering::Acquire);
+            let human = s.pending_input.lock().unwrap().human;
+            paint(s, typed);
+            let observed = fence(s, "idle");
+            assert_eq!(observed["expect_input_gen"], json!(input), "input changed during fixture paint; no retry: {}", s.inject_track.win_diag.dump());
+            assert_eq!(s.pending_input.lock().unwrap().human, human, "human input changed during fixture paint; no retry");
+            let coherent = before % 2 == 0 && observed["expect_output_gen"] == json!(before);
+            if !coherent && cfg!(windows) {
+                std::thread::sleep(deadline.saturating_duration_since(std::time::Instant::now()).min(std::time::Duration::from_millis(25)));
+                continue; // no request was made on an unpublished/torn fixture paint
+            }
+            let response = clear(f, me, s, observed);
+            let after = s.output_gen.load(Ordering::Acquire);
+            let retry = crate::agent_queue_tests::fixture_zero_write_retry(cfg!(windows),
+                response["error"]["code"].as_str(), before, after, input,
+                s.input_gen.load(Ordering::Acquire), human, s.pending_input.lock().unwrap().human);
+            crate::agent_queue_tests::win_diag(s, "fixture.own_paste_attempt", (typed, before, after, input, retry, response.clone()));
+            if !retry { return response; } // stable wrong verdict, writes, unknown outcomes are never retried
+        }
     }
 
     fn ledger_lines(f: &Fx) -> usize {
