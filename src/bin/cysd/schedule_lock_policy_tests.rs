@@ -23,6 +23,7 @@ struct Ops {
     trace: Vec<String>,
     creates: usize,
     grants: usize,
+    native_raw5: bool,
 }
 impl Ops {
     fn new(steps: &[Option<ErrorKind>]) -> Self {
@@ -35,6 +36,7 @@ impl Ops {
             trace: vec![],
             creates: 0,
             grants: 0,
+            native_raw5: false,
         }
     }
 }
@@ -53,7 +55,20 @@ impl ScheduleLockOps for Ops {
         let x = self.steps.pop_front().unwrap_or(Some(self.fallback));
         self.trace.push(format!("create:{x:?}"));
         match x {
-            Some(k) => Err(std::io::Error::new(k, "call-owned injected mkdir result")),
+            Some(k) => {
+                let error = if self.native_raw5 && k == ErrorKind::PermissionDenied {
+                    let error = std::io::Error::from_raw_os_error(5);
+                    assert_eq!(
+                        error.raw_os_error(),
+                        Some(5),
+                        "actual raw Windows error supplied to the loop"
+                    );
+                    error
+                } else {
+                    std::io::Error::new(k, "call-owned injected mkdir result")
+                };
+                Err(error)
+            }
             None => {
                 std::fs::create_dir(p)?;
                 self.grants += 1;
@@ -91,6 +106,37 @@ fn acquire(
         windows,
         ops,
     )
+}
+
+struct Record {
+    native: NativeScheduleLockOps,
+    errors: Vec<(String, Option<i32>)>,
+}
+impl ScheduleLockOps for Record {
+    type Clock = std::time::Instant;
+    fn parent(&mut self, p: &std::path::Path) {
+        self.native.parent(p)
+    }
+    fn create(&mut self, p: &std::path::Path) -> std::io::Result<()> {
+        let r = self.native.create(p);
+        if let Err(e) = &r {
+            self.errors
+                .push((format!("{:?}", e.kind()), e.raw_os_error()));
+        }
+        r
+    }
+    fn is_stale(&mut self, p: &std::path::Path, d: Duration) -> bool {
+        self.native.is_stale(p, d)
+    }
+    fn reclaim(&mut self, p: &std::path::Path) {
+        self.native.reclaim(p)
+    }
+    fn now(&mut self) -> Self::Clock {
+        self.native.now()
+    }
+    fn sleep(&mut self, d: Duration) {
+        self.native.sleep(d)
+    }
 }
 
 #[test]
@@ -231,9 +277,14 @@ fn windows_raw_five_mapping_and_real_directory_admission() {
         "native Windows premise"
     );
     let p = fixture("native-map");
-    let mut o = Ops::new(&[Some(std::io::Error::from_raw_os_error(5).kind()), None]);
+    let mut o = Ops::new(&[
+        Some(std::io::Error::from_raw_os_error(5).kind()),
+        Some(std::io::Error::from_raw_os_error(5).kind()),
+        None,
+    ]);
+    o.native_raw5 = true;
     let _guard = acquire(&p, &mut o, true, 100).expect("native mapping retries");
-    assert_eq!(o.grants, 1);
+    assert_eq!((o.creates, o.grants), (3, 1));
 }
 
 const BEFORE:&[u8]=br#"{ "owner":17, "jobs":[{"id":"keep","action":"push","via_queue":true},{"id":"remove","action":"command"}] }"#;
@@ -264,7 +315,11 @@ fn caller(
                     .unwrap();
             requeue_oneshot_after_frozen_at_access(&d, p, &j, read, get);
             let e = serde_json::to_value(rx.try_recv().expect("requeue result")).unwrap();
-            crate::state::test_stop_daemon(&d);
+            // This fixture only publishes a result; it never creates a seat or starts a daemon service.
+            assert!(d.surfaces.lock().unwrap().is_empty());
+            assert!(!d.bus.replay_after(0).iter().any(|e| e.get("name").and_then(|v| v.as_str()) == Some("surface.created")));
+            assert_eq!(Arc::strong_count(&d), 1, "no background seat owner to await");
+            drop(d); // closes the fixture's recall sender; no OS-teardown timing premise
             e
         }
         _ => panic!("site"),
@@ -434,36 +489,6 @@ fn contention_child() {
             self.0.fetch_sub(1, Ordering::SeqCst);
         }
     }
-    struct Record {
-        native: NativeScheduleLockOps,
-        errors: Vec<(String, Option<i32>)>,
-    }
-    impl ScheduleLockOps for Record {
-        type Clock = std::time::Instant;
-        fn parent(&mut self, p: &std::path::Path) {
-            self.native.parent(p)
-        }
-        fn create(&mut self, p: &std::path::Path) -> std::io::Result<()> {
-            let r = self.native.create(p);
-            if let Err(e) = &r {
-                self.errors
-                    .push((format!("{:?}", e.kind()), e.raw_os_error()));
-            }
-            r
-        }
-        fn is_stale(&mut self, p: &std::path::Path, d: Duration) -> bool {
-            self.native.is_stale(p, d)
-        }
-        fn reclaim(&mut self, p: &std::path::Path) {
-            self.native.reclaim(p)
-        }
-        fn now(&mut self) -> Self::Clock {
-            self.native.now()
-        }
-        fn sleep(&mut self, d: Duration) {
-            self.native.sleep(d)
-        }
-    }
     let writers: Vec<_> = (0..3)
         .map(|writer| {
             let path = path.clone();
@@ -545,8 +570,7 @@ fn real_contention_preserves_all_ids() {
         .spawn()
         .unwrap();
     let end = std::time::Instant::now() + Duration::from_secs(60);
-    loop {
-        // wallclock: guard bounds the owned contention child and potentially stuck joins
+    loop { // wallclock: guard bounds the owned contention child and potentially stuck joins
         if c.try_wait().unwrap().is_some() {
             break;
         }

@@ -45,7 +45,11 @@ fn fixture_child() {
             if let Ok(e) = rx.try_recv() {
                 event = serde_json::to_value(e).unwrap();
             }
-            crate::state::test_stop_daemon(&d);
+            // This fixture only publishes a result; it never creates a seat or starts a daemon service.
+            assert!(d.surfaces.lock().unwrap().is_empty());
+            assert!(!d.bus.replay_after(0).iter().any(|e| e.get("name").and_then(|v| v.as_str()) == Some("surface.created")));
+            assert_eq!(Arc::strong_count(&d), 1, "no background seat owner to await");
+            drop(d); // closes the fixture's recall sender; no OS-teardown timing premise
         }
         _ => panic!("unknown fixture site"),
     }
@@ -235,8 +239,202 @@ fn cell(site: &str, kind: &str) {
     );
     std::fs::remove_dir_all(&dir).expect("remove own unique fixture");
 }
-macro_rules! site_cells {($site:literal,$($name:ident=>$kind:literal),+)=>{$(#[test] fn $name(){cell($site,$kind);})+};}
-site_cells!("seed", seed_denied=>"denied",seed_json=>"json",seed_utf8=>"utf8",seed_root=>"root",seed_null=>"null_jobs",seed_nonarray=>"nonarray",seed_entry=>"entry",seed_absent=>"absent",seed_valid=>"valid",seed_missing_jobs=>"missing_jobs");
-site_cells!("hotreload", hotreload_denied=>"denied",hotreload_json_recovery=>"json",hotreload_utf8=>"utf8",hotreload_root=>"root",hotreload_null=>"null_jobs",hotreload_nonarray=>"nonarray",hotreload_entry=>"entry",hotreload_absent=>"absent",hotreload_valid=>"valid",hotreload_missing_jobs=>"missing_jobs");
-site_cells!("remove", remove_denied=>"denied",remove_json=>"json",remove_utf8=>"utf8",remove_root=>"root",remove_null=>"null_jobs",remove_nonarray=>"nonarray",remove_entry=>"entry",remove_absent=>"absent",remove_valid=>"valid",remove_missing_jobs=>"missing_jobs");
-site_cells!("requeue", requeue_denied=>"denied",requeue_json=>"json",requeue_utf8=>"utf8",requeue_root=>"root",requeue_null=>"null_jobs",requeue_nonarray=>"nonarray",requeue_entry=>"entry",requeue_absent=>"absent",requeue_valid=>"valid",requeue_missing_jobs=>"missing_jobs");
+#[test]
+fn seed_denied() {
+    cell("seed", "denied");
+}
+
+#[test]
+fn seed_json() {
+    cell("seed", "json");
+}
+
+#[test]
+fn seed_utf8() {
+    cell("seed", "utf8");
+}
+
+#[test]
+fn seed_root() {
+    cell("seed", "root");
+}
+
+#[test]
+fn seed_null() {
+    cell("seed", "null_jobs");
+}
+
+#[test]
+fn seed_nonarray() {
+    cell("seed", "nonarray");
+}
+
+#[test]
+fn seed_entry() {
+    cell("seed", "entry");
+}
+
+#[test]
+fn seed_absent() {
+    cell("seed", "absent");
+}
+
+#[test]
+fn seed_valid() {
+    cell("seed", "valid");
+}
+
+#[test]
+fn seed_missing_jobs() {
+    cell("seed", "missing_jobs");
+}
+
+#[test]
+fn hotreload_denied() {
+    cell("hotreload", "denied");
+}
+
+#[test]
+fn hotreload_json_recovery() {
+    cell("hotreload", "json");
+}
+
+#[test]
+fn hotreload_utf8() {
+    cell("hotreload", "utf8");
+}
+
+#[test]
+fn hotreload_root() {
+    cell("hotreload", "root");
+}
+
+#[test]
+fn hotreload_null() {
+    cell("hotreload", "null_jobs");
+}
+
+#[test]
+fn hotreload_nonarray() {
+    cell("hotreload", "nonarray");
+}
+
+#[test]
+fn hotreload_entry() {
+    cell("hotreload", "entry");
+}
+
+#[test]
+fn hotreload_absent() {
+    cell("hotreload", "absent");
+}
+
+#[test]
+fn hotreload_valid() {
+    cell("hotreload", "valid");
+}
+
+#[test]
+fn hotreload_missing_jobs() {
+    cell("hotreload", "missing_jobs");
+}
+
+#[test]
+fn remove_denied() {
+    cell("remove", "denied");
+}
+
+#[test]
+fn remove_json() {
+    cell("remove", "json");
+}
+
+#[test]
+fn remove_utf8() {
+    cell("remove", "utf8");
+}
+
+#[test]
+fn remove_root() {
+    cell("remove", "root");
+}
+
+#[test]
+fn remove_null() {
+    cell("remove", "null_jobs");
+}
+
+#[test]
+fn remove_nonarray() {
+    cell("remove", "nonarray");
+}
+
+#[test]
+fn remove_entry() {
+    cell("remove", "entry");
+}
+
+#[test]
+fn remove_absent() {
+    cell("remove", "absent");
+}
+
+#[test]
+fn remove_valid() {
+    cell("remove", "valid");
+}
+
+#[test]
+fn remove_missing_jobs() {
+    cell("remove", "missing_jobs");
+}
+
+#[test]
+fn requeue_denied() {
+    cell("requeue", "denied");
+}
+
+#[test]
+fn requeue_json() {
+    cell("requeue", "json");
+}
+
+#[test]
+fn requeue_utf8() {
+    cell("requeue", "utf8");
+}
+
+#[test]
+fn requeue_root() {
+    cell("requeue", "root");
+}
+
+#[test]
+fn requeue_null() {
+    cell("requeue", "null_jobs");
+}
+
+#[test]
+fn requeue_nonarray() {
+    cell("requeue", "nonarray");
+}
+
+#[test]
+fn requeue_entry() {
+    cell("requeue", "entry");
+}
+
+#[test]
+fn requeue_absent() {
+    cell("requeue", "absent");
+}
+
+#[test]
+fn requeue_valid() {
+    cell("requeue", "valid");
+}
+
+#[test]
+fn requeue_missing_jobs() {
+    cell("requeue", "missing_jobs");
+}
