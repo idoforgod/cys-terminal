@@ -3300,6 +3300,13 @@ fn dsr_resume_wait(what: &str, done: impl Fn() -> bool) {
     }
 }
 
+// The later zero-byte refusal enters only after earlier FIFO requests finished their
+// postambles and settlement. Ambient CPR cannot counterfeit this request-owned receipt.
+fn dsr_resume_fifo_completed(s: &Arc<Surface>) {
+    let release = hold_writer(s);
+    release.send(()).expect("release owned zero-byte FIFO receipt");
+}
+
 // DSR resume contract: actual writer and both resume phases, not a counter-only model.
 fn dsr_resume_case(ahead_of_claim: bool, mode: u8) {
     let fx = fx("dsr-resume");
@@ -3311,6 +3318,7 @@ fn dsr_resume_case(ahead_of_claim: bool, mode: u8) {
     assert!(hand_off(&fx, &s));
     let since = s.queue_hold.lock().unwrap().as_ref().unwrap().since;
     let total = s.inject_track.wrote();
+    let epoch = s.inject_track.resume_write_epoch();
     let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
     let entered = Arc::new(AtomicUsize::new(0));
     if ahead_of_claim {
@@ -3336,22 +3344,26 @@ fn dsr_resume_case(ahead_of_claim: bool, mode: u8) {
         2 => vec![generated(), raw()],
         3 => vec![raw(), generated()],
         4 => vec![crate::state::WriteReq::Program(b"ordinary body".to_vec())],
+        5 => vec![crate::state::WriteReq::Data(Vec::new())],
         _ => panic!("unknown fixture mode"),
     };
     let written = requests.len() as u64;
     for request in requests { s.write_tx.send(request).unwrap(); }
-    if !ahead_of_claim { dsr_resume_wait("CPR operations counted", || s.inject_track.wrote() == total + written); }
+    if !ahead_of_claim { dsr_resume_fifo_completed(&s); }
     let _ = crate::governance::queue_write_hold_block_at(&fx.daemon, &s, since + Duration::from_secs(4));
     if ahead_of_claim {
-        assert_eq!(events(&fx, "queue.write_resumed").len(), 1, "premise: claim arm was handed off before release");
+        let handed_before_release = events(&fx, "queue.write_resumed").len();
         *release.0.lock().unwrap() = true;
         release.1.notify_one();
-        dsr_resume_wait("resumed writer settled", || s.inject_track.wrote() > total && s.queue_hold.lock().unwrap().as_ref().is_some_and(|h| !h.resuming));
+        assert_eq!(handed_before_release, 1, "premise: claim arm was handed off before release");
+    } else {
+        assert_eq!(events(&fx, "queue.write_resumed").len(), if ordinary_bytes {0} else {1},
+            "pre-check foreign refusal must not be borrowed from writer claim");
     }
-    if s.queue_hold.lock().unwrap().as_ref().is_some_and(|h| h.resuming) {
-        dsr_resume_wait("admitted resume settled", || s.queue_hold.lock().unwrap().as_ref().is_some_and(|h| !h.resuming));
-    }
-    assert_eq!(s.inject_track.wrote(), total + written, "D9 must retain the CPR transport count");
+    dsr_resume_fifo_completed(&s);
+    assert!(s.inject_track.wrote() >= total + written, "D9 retains all transport attempts, including ambient CPR");
+    assert_eq!(s.inject_track.resume_write_epoch(), epoch + u64::from(ordinary_bytes),
+        "only the owned ordinary request taints resume; successful ambient CPR does not");
     assert_eq!(proof.admits.load(Ordering::Acquire), if ordinary_bytes {1} else {2},
         "DSR_RESUME_PROVENANCE phase_claim={ahead_of_claim} ordinary={ordinary_bytes}: {}", s.inject_track.win_diag.dump());
     if ahead_of_claim && ordinary_bytes {
@@ -3373,7 +3385,7 @@ fn dsr_resume_raw_cpr_ahead_of_claim_stays_foreign() { dsr_resume_case(true, 1);
 
 #[test]
 fn dsr_resume_mixed_and_program_writes_remain_foreign() {
-    for ahead in [false, true] { for mode in [2, 3, 4] { dsr_resume_case(ahead, mode); } }
+    for ahead in [false, true] { for mode in [2, 3, 4, 5] { dsr_resume_case(ahead, mode); } }
 }
 
 #[test]
@@ -3412,7 +3424,8 @@ fn dsr_resume_reply_still_refuses_fresh_d9_claim() {
     let d9 = crate::governance::D9WriterGuard::for_target(&fx.daemon, &s).expect("D9 scope");
     let before = s.inject_track.wrote();
     s.write_tx.send(crate::state::dsr_resume_generated_request()).unwrap();
-    dsr_resume_wait("D9 response completed", || s.inject_track.wrote() > before);
+    dsr_resume_fifo_completed(&s);
+    assert!(s.inject_track.wrote() > before);
     assert!(!d9.guard().claim_for_write());
     assert_eq!(d9.moved(), vec!["wrote"]);
 }
@@ -3433,11 +3446,12 @@ fn dsr_resume_complete_stream(ahead: bool) {
     let total = s.inject_track.wrote();
     let release = if ahead { crate::agent_write::set_test_sync_settle(false); Some(hold_writer(&s)) } else { None };
     s.write_tx.send(crate::state::dsr_resume_generated_request()).unwrap();
-    if !ahead { dsr_resume_wait("reply finished", || s.inject_track.wrote() > total); }
+    if !ahead { dsr_resume_fifo_completed(&s); }
     let _ = crate::governance::queue_write_hold_block_at(&fx.daemon, &s, since + Duration::from_secs(4));
     if let Some(release) = release { release.send(()).unwrap(); }
     assert_eq!(seat_events(&fx, &s, "queue.write_resumed").len(), 1, "DSR_COMPLETE_HANDOFF");
-    dsr_resume_wait("writer operation settled", || s.write_tx.gate().pending() == 0);
+    dsr_resume_fifo_completed(&s);
+    assert!(s.inject_track.wrote() > total);
     assert_eq!(queue_len(&s), 0, "DSR_COMPLETE_SETTLED_WITHOUT_DELIVERY");
     assert!(!s.inject_reserved());
     let resumed = seat_events(&fx, &s, "queue.write_resumed");
@@ -3486,10 +3500,11 @@ fn dsr_resume_successor_proof_cannot_write_after_original_prefix() {
     let successor = Arc::new(Successor(AtomicUsize::new(0)));
     *s.receiver_proof.lock().unwrap() = Some(successor.clone());
     s.write_tx.send(crate::state::dsr_resume_generated_request()).unwrap();
-    dsr_resume_wait("successor reply finished", || s.inject_track.wrote() > total);
+    dsr_resume_fifo_completed(&s);
+    assert!(s.inject_track.wrote() > total);
     let _ = crate::governance::queue_write_hold_block_at(&fx.daemon, &s, since + Duration::from_secs(4));
     assert_eq!(events(&fx, "queue.write_resumed").len(), 1, "DSR_ORIGINAL_PROOF_HANDOFF");
-    dsr_resume_wait("original proof refusal settled", || s.write_tx.gate().pending() == 0);
+    dsr_resume_fifo_completed(&s);
     assert_eq!(original.admits.load(Ordering::Acquire), 2); assert_eq!(successor.0.load(Ordering::Acquire), 0);
     assert_eq!(s.inject_track.resume_write_epoch(), epoch);
     dsr_resume_wait("only prefix and reply received", || file_len(&out) >= expected.len());
