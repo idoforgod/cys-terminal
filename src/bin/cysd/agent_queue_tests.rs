@@ -2041,7 +2041,11 @@ pub(crate) fn d9_with_late_write_ahead<R>(s: &Arc<Surface>, call: impl FnOnce() 
 fn d9_bound_i2_slot_lifecycle_and_head_replacement() {
     use crate::governance::{ClaimProducer as P, d9_writer_busy, d9_nonwriter_hold, d9_hold_age, d9_terminal};
     let fx = fx("i2-slots");
-    let recorder = p1_recorder(&fx.daemon, &fx.dir, "i2-slots", None); let s = recorder.surface.clone(); *s.agent_meta.lock().unwrap() = None;
+    // This case holds an empty writer job at its proof barrier; it never inspects receiver bytes.
+    // A native idle seat suffices on both OSes, without Python tty/raw-mode or POSIX shell syntax.
+    let command = if cfg!(windows) { "cmd.exe /D /Q /C more" } else { "/bin/cat" };
+    let s = fx.daemon.create_surface(None, Some(command.into()), None, None, 24, 200).expect("native idle seat");
+    fx.daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
     let first = enqueue(&fx, &s, "first");
     let release = p1_hold_writer(&s);
     for p in [P::Queue, P::ChannelNew, P::ChannelRedeliver] {

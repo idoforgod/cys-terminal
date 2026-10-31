@@ -21588,9 +21588,28 @@ mod tests {
         p1_measured(&s);
         let axes = super::MachineHoldAxes { draft: true, ..super::MachineHoldAxes::NONE };
         paint_prompt(&s, "", "my own words");
-        assert_eq!(super::machine_direct_hold(&daemon, &s, axes), Some(super::MachineHold::Draft));
+        // Explicit draft opt-in is independent of the host's default mask.
+        let enabled = super::MachineHoldAxes { draft: true, ..super::MachineHoldAxes::NONE };
+        assert_eq!(super::machine_direct_hold_masked(&daemon, &s, axes, enabled), Some(super::MachineHold::Draft));
         paint_prompt_dim(&s, "", "carry on please");
-        assert_eq!(super::machine_direct_hold(&daemon, &s, axes), None);
+        assert_eq!(super::machine_direct_hold_masked(&daemon, &s, axes, enabled), None);
+    }
+
+    #[test]
+    fn p1_r6_windows_default_mask_does_not_hold_a_draft() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p1-h0-default");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap()), ("CYS_MACHINE_INJECT_HOLD_AXES", "")]);
+        let (daemon, s) = marker_seat("p1-h0-default");
+        p1_measured(&s);
+        let axes = super::MachineHoldAxes { draft: true, ..super::MachineHoldAxes::NONE };
+        paint_prompt(&s, "", "my own words");
+        assert_eq!(super::machine_direct_hold_masked(&daemon, &s, axes, super::hold_axes_default(true)), None,
+            "Windows default disables draft even on a D1-measured fixture");
+        let native_default = if cfg!(windows) { None } else { Some(super::MachineHold::Draft) };
+        assert_eq!(super::machine_direct_hold(&daemon, &s, axes), native_default, "native default mask");
+        paint_prompt_dim(&s, "", "carry on please");
+        assert_eq!(super::machine_direct_hold_masked(&daemon, &s, axes, super::hold_axes_default(true)), None);
     }
 
     /// T-F1 (R-7/R-10): the seat's visibility reading reports a Home-moved draft as VISIBLE (force-deliver refuses, the remedy
