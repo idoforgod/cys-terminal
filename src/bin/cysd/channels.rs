@@ -4595,10 +4595,24 @@ mod tests {
         assert_eq!(refused[0]["payload"]["reason"], json!("guard_aborted"));
         let retry_started = std::time::Instant::now();
         assert_eq!(pass(&d).delivered, vec![ids[0]], "h3: retry delivered row 1");
+        // The exact audit count below excludes a pre-recorded late pacing hold.
+        // Await the actual retry completion outside the channels mutex before judging row 2.
+        h3_await_writer(&d, &m, "q0 retry");
         assert_eq!(h3_drain(&d, 1), vec![ids[1]], "h3: delivered row 2 after retry and gap");
         assert!(retry_started.elapsed() >= std::time::Duration::from_millis(500 + CHANNEL_ROW_GAP_MS), "h3: second row before row 1 CR plus gap");
         assert_eq!(crate::governance::h_ledger_count(&d, "channel"), 3, "h3: refusal + two written rows");
         h3_done(&m);
+    }
+
+    #[cfg(unix)]
+    fn h3_await_writer(d: &Arc<Daemon>, m: &Arc<crate::state::Surface>, phase: &str) {
+        if let Err(error) = crate::agent_queue_tests::p1_wait_completion(
+            crate::agent_queue_tests::p1_writer_idle(m), std::time::Duration::from_secs(60),
+        ) {
+            let audit = std::fs::read_to_string(crate::delivery::ledger_path(&d.socket_path));
+            let journal = std::fs::read_to_string(crate::state::state_dir(&d.socket_path).join(crate::state::WRITER_JOURNAL_FILE));
+            panic!("h3 {phase}: writer completion failed: {error:?}; audit={audit:?}; journal={journal:?}");
+        }
     }
 
     /// A real predecessor writes its CR during a controlled producer descheduling AFTER the early cooldown check.
@@ -4645,6 +4659,9 @@ mod tests {
             clock_seat.inject_track.test_freeze_gap_at_done();
             hook_seen.store(true, std::sync::atomic::Ordering::Release);
         })));
+        let _journal = d.agent_journal();
+        let journal_path = crate::state::state_dir(&d.socket_path).join(crate::state::WRITER_JOURNAL_FILE);
+        assert_eq!(crate::governance::h_ledger_count(&d, "channel"), 0, "H3_AUDIT baseline audit");
         let (delivered, hold) = {
             let conn = d.channels.lock().unwrap();
             if redelivery { (redeliver_unacked(&d, conn.as_ref().unwrap()), None) }
@@ -4664,7 +4681,30 @@ mod tests {
             assert_eq!(hold, Some(InboxHold::Paced), "fresh gap is a pacing hold");
             assert_eq!(h3_state(&d, id), "new", "record-first update restored");
         }
+        assert_eq!(crate::governance::h_ledger_count(&d, "channel"), 1, "H3_AUDIT late pacing pre-record");
+        let before = std::fs::read_to_string(&journal_path).expect("opened journal");
+        let before_rows: Vec<Value> = before.lines().map(|s| serde_json::from_str(s).unwrap()).collect();
+        assert!(!before_rows.iter().any(|v| v["origin"] == "channel"), "H3_AUDIT no channel writing before retry");
+        eprintln!("H3-AUDIT held: redelivery={redelivery} audit=1 delivered=0 state={} channel_writing=0 journal={}", h3_state(&d, id), journal_path.display());
         m.inject_track.test_release_gap_clock();
+        if redelivery {
+            crate::agent_queue_tests::wait_until("h3 post-wait redelivery handoff", || {
+                let conn = d.channels.lock().unwrap();
+                let delivered = redeliver_unacked(&d, conn.as_ref().unwrap());
+                assert!(delivered <= 1, "H3_POSTWAIT: only the retained row may retry");
+                delivered == 1
+            });
+        } else {
+            assert_eq!(h3_drain(&d, 1), vec![id], "H3_POSTWAIT: retry eventually hands off");
+        }
+        h3_await_writer(&d, &m, "post-wait retry");
+        assert_eq!(crate::governance::h_ledger_count(&d, "channel"), 2, "H3_AUDIT two audits for one row");
+        let after = std::fs::read_to_string(&journal_path).expect("journal after retry");
+        let after_rows: Vec<Value> = after.lines().map(|s| serde_json::from_str(s).unwrap()).collect();
+        let writes: Vec<_> = after_rows.iter().filter(|v| v["rec"] == "writing" && v["origin"] == "channel").collect();
+        assert_eq!(writes.len(), 1, "H3_AUDIT exactly one actual channel writer request");
+        assert_eq!(after_rows.iter().filter(|v| v["rec"] == "terminal" && v["id"] == writes[0]["id"] && v["kind"] == "written_submitted").count(), 1, "H3_AUDIT actual submitted terminal");
+        eprintln!("H3-AUDIT final: audit=2 delivered=1 channel_writing=1 submitted=1");
         h3_done(&m);
     }
 
