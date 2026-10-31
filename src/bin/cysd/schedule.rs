@@ -630,9 +630,29 @@ impl ScheduleFileLock {
                     //   데몬이 소켓을 한 번도 받지 못한다(부트체인 전손 · 자가 회복 경로 없음).
                     //   유계 대기 뒤 `None` = 쓰기 포기(막는 방향).
                 }
-                Err(_) => return None, // 잠금 디렉터리를 만들 수 없는 파일시스템 — 쓰기 포기(막는 방향)
+                Err(_error) => {
+                    // DIAG ONLY: observe the real refusal; never retry or change its disposition.
+                    #[cfg(test)]
+                    eprintln!("SCHEDULE_LOCK_RATE {}", json!({
+                        "schema": 1, "reason": "io", "pid": std::process::id(),
+                        "lock_dir": dir.display().to_string(),
+                        "kind": format!("{:?}", _error.kind()),
+                        "raw_os_error": _error.raw_os_error(),
+                        "error_message": _error.to_string(),
+                        "wait_ms": wait.as_millis(),
+                        "remaining_ms": deadline.saturating_duration_since(std::time::Instant::now()).as_millis()
+                    }));
+                    return None;
+                }
             }
             if std::time::Instant::now() >= deadline {
+                #[cfg(test)]
+                eprintln!("SCHEDULE_LOCK_RATE {}", json!({
+                    "schema": 1, "reason": "deadline", "pid": std::process::id(),
+                    "lock_dir": dir.display().to_string(), "kind": null,
+                    "raw_os_error": null, "error_message": null,
+                    "wait_ms": wait.as_millis(), "remaining_ms": 0
+                }));
                 return None;
             }
             std::thread::sleep(Duration::from_millis(10));
