@@ -558,6 +558,7 @@ fn contention_child() {
 #[test]
 fn real_contention_preserves_all_ids() {
     let mut c = std::process::Command::new(std::env::current_exe().unwrap())
+        .hide_console()
         .args([
             "--exact",
             "schedule::lock_policy_tests::contention_child",

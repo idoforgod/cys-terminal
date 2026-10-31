@@ -83,6 +83,7 @@ fn cell(site: &str, kind: &str) {
         std::fs::write(&path, &bytes).unwrap();
     }
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .hide_console()
         .args([
             "--exact",
             "schedule::integrity_tests::fixture_child",
