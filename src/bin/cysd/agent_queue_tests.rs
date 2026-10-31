@@ -1222,33 +1222,63 @@ fn wp17_r2_known_multiline_draft_zero_counter_blocks_then_empty_delivers() {
     let fx = fx("wp17-r2-region");
     let rule = "────────────────────────────────────────";
     for forced in [false, true] {
-        let s = seat(&fx);
+        let started = Instant::now();
+        let s = with_win_diag_creation(|| seat(&fx));
+        win_diag(&s, "known.created", serde_json::json!({"forced":forced,"elapsed_us":started.elapsed().as_micros(),
+            "build":option_env!("CYS_BUILD_ID"),"witness":"known-phase-v1; instrumented test timing is not baseline timing"}));
+        let _deadline = fixture_startup_deadline(&s, "wp17 known startup");
         let id = enqueue(&fx, &s, "/model opus");
+        let occupied_before = s.output_gen.load(Ordering::Acquire);
         s.parser.lock().unwrap().process(format!(
             "\x1b[2J\x1b[H{rule}\r\n❯ \r\n  real lower-row draft\r\n{rule}\r\n  ? for shortcuts\x1b[2;3H"
         ).as_bytes());
-        assert_eq!(s.pending_input_bytes.load(Ordering::Relaxed), 0, "zero-counter premise");
+        assert_eq!(s.pending_input_bytes.load(Ordering::Relaxed), 0, "zero-counter premise; {}", s.inject_track.win_diag.dump());
         let recheck = crate::governance::ScreenRecheck {
             marker: Some(vec!["❯".into()]), placeholder: None,
             gen_at_verdict: s.output_gen.load(Ordering::Acquire), approval_pending: false,
         };
+        win_diag(&s, "known.occupied_before_call", serde_json::json!({"forced":forced,"head":id,
+            "elapsed_us":started.elapsed().as_micros(),"before_paint_gen":occupied_before,"recheck_gen":recheck.gen_at_verdict,
+            "writer_pending":s.write_tx.gate().pending()}));
         let before = crate::governance::h_ledger_count(&fx.daemon, "queue");
-        assert!(deliver_head_locked(&fx.daemon, &s, forced, false, None, Some(0), None, Some(&recheck), None).is_none(),
-            "recognized occupied multiline region must refuse before publication, forced={forced}");
+        let mut hold_reason = None;
+        let blocked = deliver_head_locked(&fx.daemon, &s, forced, false, None, Some(0), None, Some(&recheck), Some(&mut hold_reason));
+        win_diag(&s, "known.occupied_after_call", serde_json::json!({"forced":forced,"elapsed_us":started.elapsed().as_micros(),
+            "call_hold_reason":hold_reason,"return_state":blocked.as_ref().map(|d| d.written_state())}));
+        assert!(blocked.is_none(), "recognized occupied multiline region must refuse before publication, forced={forced}; {}", s.inject_track.win_diag.dump());
         assert_eq!(crate::governance::h_ledger_count(&fx.daemon, "queue"), before);
         assert!(s.inject_track.last_body().is_none());
         assert_eq!(s.pending_queue.lock().unwrap().front().unwrap().id, id);
         assert_eq!(s.queue_blocked.lock().unwrap().as_ref().unwrap().0, crate::governance::BLOCKED_INPUT_PENDING);
         assert!(hold_kind(&s).is_none(), "no new writer hold/retry state");
+        let cleared_before = s.output_gen.load(Ordering::Acquire);
         s.parser.lock().unwrap().process(format!(
             "\x1b[2J\x1b[H{rule}\r\n❯ \r\n{rule}\r\n  ? for shortcuts\x1b[2;3H"
         ).as_bytes());
-        let d = deliver_head_locked(&fx.daemon, &s, forced, false, None, Some(0), None, Some(&recheck), None)
-            .expect("cleared recognized region must progress");
-        assert!(d.written_submitted());
+        // A new paint is a new observation. Never carry the occupied-phase recheck into it.
+        let recheck = crate::governance::ScreenRecheck {
+            marker: Some(vec!["❯".into()]), placeholder: None,
+            gen_at_verdict: s.output_gen.load(Ordering::Acquire), approval_pending: false,
+        };
+        win_diag(&s, "known.cleared_before_call", serde_json::json!({"forced":forced,"head":id,
+            "elapsed_us":started.elapsed().as_micros(),"before_paint_gen":cleared_before,"recheck_gen":recheck.gen_at_verdict,
+            "writer_pending":s.write_tx.gate().pending()}));
+        let mut hold_reason = None;
+        // One side-effecting attempt only: neither a successful write nor an unattributed None is replayed.
+        let delivered = deliver_head_locked(&fx.daemon, &s, forced, false, None, Some(0), None, Some(&recheck), Some(&mut hold_reason));
+        win_diag(&s, "known.cleared_after_call", serde_json::json!({"forced":forced,"elapsed_us":started.elapsed().as_micros(),
+            "call_hold_reason":hold_reason,"return_state":delivered.as_ref().map(|d| d.written_state())}));
+        let d = delivered.unwrap_or_else(|| {
+            let gen_before_sample = s.output_gen.load(Ordering::Acquire);
+            let post_refusal_screen = s.parser.lock().unwrap().screen().contents();
+            let gen_after_sample = s.output_gen.load(Ordering::Acquire);
+            panic!("cleared recognized region must progress; forced={forced}; phase=cleared; post-refusal screen sample (NOT deciding frame) gens={gen_before_sample}->{gen_after_sample}: {post_refusal_screen:?}; stored block may be the prior occupied label; named route and deciding operands follow: {}", s.inject_track.win_diag.dump());
+        });
+        assert!(d.written_submitted(), "forced={forced}; phase=cleared; return={}; {}", d.written_state(), s.inject_track.win_diag.dump());
         assert_eq!(d.merged_ids, vec![id]);
         assert_eq!(d.body, "/model opus");
         assert_eq!(queue_len(&s), 0);
+        eprintln!("WIN-KNOWN forced={forced}: {}", s.inject_track.win_diag.dump());
     }
 }
 
