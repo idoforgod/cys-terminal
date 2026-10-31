@@ -1356,13 +1356,17 @@ def h_detect_10():
     #   감지기까지 죽이면 훅이 A22 cannot-judge 분기로 빠져 A6 표면을 아예 통과하지 않는다.
     #   ★같은 이유로 **임무 게이트도 정상 위임**한다(2026-08-01 D4-a): 게이트를 죽이면 훅이
     #     fail-closed 로 접혀 no-spawn 경로를 타므로, 역시 A6 표면에 도달하지 않는다.
+    #   ★PKG-3A (0.14.56): the hook-side `-c` sites now run `"$CYS_PY" -B -c` (bytecode seal; M1), and every
+    #   real CYS_PY (bundled and system python) accepts that - so the mock also delegates an optional leading
+    #   -B before -c. Narrower than a real interpreter, it answered the role lookup with 127 (HD10-MEASURE.md).
     mock = ("#!/bin/sh\n"
             'case "$1" in\n'
             '  -c) exec "%s" "$@" ;;\n'
+            '  -B) [ "${2-}" = -c ] && exec "%s" "$@" ;;\n'
             "  *javis_detect.py) exec \"%s\" \"$@\" ;;\n"
             "  *javis_mission.py) exec \"%s\" \"$@\" ;;\n"
             "esac\n"
-            "exit 127\n" % (real, real, real))
+            "exit 127\n" % (real, real, real, real))
     with tempfile.TemporaryDirectory() as tmp:
         env, _home, _pack, _bind, state = _rb_sandbox(tmp, mock_py=mock)
         r = _run_rb(env)
