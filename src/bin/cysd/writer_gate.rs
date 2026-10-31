@@ -485,6 +485,7 @@ mod tests {
         for wait_at_flush in [false, true] {
             let cases = [
                 (WriteReq::Data(b"data".to_vec()), b"data".to_vec()),
+                (crate::state::dsr_resume_generated_request(), b"\x1b[1;1R".to_vec()),
                 (
                     WriteReq::DataAfter {
                         bytes: b"after".to_vec(),

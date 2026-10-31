@@ -956,20 +956,21 @@ fn reconciliation_pages_100_rows_with_a_cursor() {
 /// A partial request must retain its original proof even if the surface publishes a successor.
 #[test]
 fn c8i_partial_resume_never_borrows_a_successor_proof() {
-    let fx=fx("c8i-proof-stamp");let s=seat(&fx);
+    let fx=fx("c8i-proof-stamp");let s=seat(&fx);s.inject_track.win_diag.enable();
     let original=Arc::new(LostForGood{admits:AtomicUsize::new(0),rechecks:AtomicUsize::new(0),fail_at:1});
     *s.receiver_proof.lock().unwrap()=Some(original.clone());
     enqueue(&fx,&s,&"original bound directive ".repeat(400));
     assert!(hand_off(&fx,&s));
     assert_eq!(hold_kind(&s),Some(QueueHoldKind::PartialExact));
     let since=s.queue_hold.lock().unwrap().as_ref().unwrap().since;
-    let wrote=s.inject_track.wrote();
+    let epoch=s.inject_track.resume_write_epoch();
     *s.receiver_proof.lock().unwrap()=Some(Arc::new(crate::agent_write::PassThrough));
     let _=crate::governance::queue_write_hold_block_at(&fx.daemon,&s,since+Duration::from_secs(1));
     wait_until("resume attempt settled",|| queue_len(&s)==0 || (original.admits.load(Ordering::Acquire)==2 && s.queue_hold.lock().unwrap().as_ref().is_some_and(|h| !h.resuming)));
+    eprintln!("C8I resume epoch={} total={} witness={}",s.inject_track.resume_write_epoch(),s.inject_track.wrote(),s.inject_track.win_diag.dump());
     assert_eq!(original.admits.load(Ordering::Acquire),2,"partial resume must recheck its captured original proof");
     assert_eq!(queue_len(&s),1,"successor proof cannot complete an old partial obligation");
-    assert_eq!(s.inject_track.wrote(),wrote,"no byte follows a successor proof");
+    assert_eq!(s.inject_track.resume_write_epoch(),epoch,"no unauthorized non-reply write follows a successor proof: {}",s.inject_track.win_diag.dump());
     assert!(events(&fx,"queue.delivered").is_empty());
     assert_eq!(s.queue_hold.lock().unwrap().as_ref().unwrap().since,since,"first partial hold age remains fixed");
 }
@@ -1054,12 +1055,12 @@ fn c8pp_force_rpc_reports_pending_while_receiver_proof_is_blocked() {
 
 #[test]
 fn c8pp_resumed_success_releases_original_reservation_after_settlement() {
-    let fx=fx("c8pp-reservation-resume");let s=seat(&fx);
+    let fx=fx("c8pp-reservation-resume");let s=seat(&fx);s.inject_track.win_diag.enable();
     let since=hold_exact(&fx,&s,&"resume reservation body ".repeat(500),1);
     let original=s.inject_reservation.lock().unwrap().as_ref().unwrap().guard.clone();
     assert!(!original.abort_if_pending(),"premise: original prefix keeps disposal protection");
     let _=crate::governance::queue_write_hold_block_at(&fx.daemon,&s,since+Duration::from_secs(1));
-    assert_eq!(events(&fx,"queue.write_resumed").len(),1,"premise: resumed run entered the writer");
+    assert_eq!(events(&fx,"queue.write_resumed").len(),1,"premise: resumed run entered the writer; epoch={} total={} witness={}",s.inject_track.resume_write_epoch(),s.inject_track.wrote(),s.inject_track.win_diag.dump());
     wait_until("resumed writer and settlement finished",||s.write_tx.gate().pending()==0);
     assert_eq!(queue_len(&s),0,"resumed success releases the original reservation owner");
     assert!(!s.inject_reserved());assert!(hold_kind(&s).is_none());
@@ -3289,4 +3290,226 @@ fn win_startup_retry_requires_known_zero_and_only_output_interference() {
         (false,2,4,0,0,0,0), (true,2,2,0,0,0,0), (true,1,2,0,0,0,0),
         (true,2,4,0,1,0,0), (true,2,4,0,0,1,0), (true,2,4,0,0,0,1),
     ] { assert!(!fixture_zero_write_retry(win, Some("guard_aborted"), before, after, ib, ia, hb, ha)); }
+}
+
+fn dsr_resume_wait(what: &str, done: impl Fn() -> bool) {
+    let limit = Instant::now() + Duration::from_secs(120);
+    while !done() { // wallclock: guard bounds completion of an owned FIFO operation, timeout fails and never supplies a premise
+        assert!(Instant::now() < limit, "DSR owned operation hung: {what}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+// The later zero-byte refusal enters only after earlier FIFO requests finished their
+// postambles and settlement. Ambient CPR cannot counterfeit this request-owned receipt.
+fn dsr_resume_fifo_completed(s: &Arc<Surface>) {
+    let release = hold_writer(s);
+    release.send(()).expect("release owned zero-byte FIFO receipt");
+}
+
+// DSR resume contract: actual writer and both resume phases, not a counter-only model.
+fn dsr_resume_case(ahead_of_claim: bool, mode: u8) {
+    let fx = fx("dsr-resume");
+    let s = seat(&fx);
+    s.inject_track.win_diag.enable();
+    let proof = Arc::new(LostForGood { admits: AtomicUsize::new(0), rechecks: AtomicUsize::new(0), fail_at: 1 });
+    *s.receiver_proof.lock().unwrap() = Some(proof.clone());
+    enqueue(&fx, &s, &"DSR held body ".repeat(400));
+    assert!(hand_off(&fx, &s));
+    let since = s.queue_hold.lock().unwrap().as_ref().unwrap().since;
+    let total = s.inject_track.wrote();
+    let epoch = s.inject_track.resume_write_epoch();
+    let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let entered = Arc::new(AtomicUsize::new(0));
+    if ahead_of_claim {
+        crate::agent_write::set_test_sync_settle(false);
+        let signal = release.clone();
+        let seen = entered.clone();
+        let busy: crate::state::SafetyProbe = Arc::new(move || {
+            seen.store(1, Ordering::Release);
+            let (lock, cv) = &*signal;
+            let (released, timed) = cv.wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(30), |v| !*v).unwrap();
+            assert!(*released && !timed.timed_out(), "owned writer barrier not released");
+            true // withheld: no bytes or counter increment
+        });
+        s.write_tx.send(crate::state::WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: 0, withhold: Some(busy) }).unwrap();
+        dsr_resume_wait("writer parked", || entered.load(Ordering::Acquire) == 1);
+    }
+    let ordinary_bytes = mode != 0;
+    let generated = crate::state::dsr_resume_generated_request;
+    let raw = || crate::state::WriteReq::Data(b"\x1b[1;1R".to_vec());
+    let requests = match mode {
+        0 => vec![generated()],
+        1 => vec![raw()],
+        2 => vec![generated(), raw()],
+        3 => vec![raw(), generated()],
+        4 => vec![crate::state::WriteReq::Program(b"ordinary body".to_vec())],
+        5 => vec![crate::state::WriteReq::Data(Vec::new())],
+        _ => panic!("unknown fixture mode"),
+    };
+    let written = requests.len() as u64;
+    for request in requests { s.write_tx.send(request).unwrap(); }
+    if !ahead_of_claim { dsr_resume_fifo_completed(&s); }
+    let _ = crate::governance::queue_write_hold_block_at(&fx.daemon, &s, since + Duration::from_secs(4));
+    if ahead_of_claim {
+        let handed_before_release = events(&fx, "queue.write_resumed").len();
+        *release.0.lock().unwrap() = true;
+        release.1.notify_one();
+        assert_eq!(handed_before_release, 1, "premise: claim arm was handed off before release");
+    } else {
+        assert_eq!(events(&fx, "queue.write_resumed").len(), if ordinary_bytes {0} else {1},
+            "pre-check foreign refusal must not be borrowed from writer claim");
+    }
+    dsr_resume_fifo_completed(&s);
+    assert!(s.inject_track.wrote() >= total + written, "D9 retains all transport attempts, including ambient CPR");
+    assert_eq!(s.inject_track.resume_write_epoch(), epoch + u64::from(ordinary_bytes),
+        "only the owned ordinary request taints resume; successful ambient CPR does not");
+    assert_eq!(proof.admits.load(Ordering::Acquire), if ordinary_bytes {1} else {2},
+        "DSR_RESUME_PROVENANCE phase_claim={ahead_of_claim} ordinary={ordinary_bytes}: {}", s.inject_track.win_diag.dump());
+    if ahead_of_claim && ordinary_bytes {
+        assert!(s.queue_hold.lock().unwrap().as_ref().unwrap().resume.is_none(), "foreign claim permanently voids held material");
+    }
+    assert_eq!(queue_len(&s), 1, "original rejecting proof cannot be replaced");
+    assert_eq!(s.queue_hold.lock().unwrap().as_ref().unwrap().since, since);
+    assert!(events(&fx, "queue.delivered").is_empty());
+}
+
+#[test]
+fn dsr_resume_generated_reply_before_outer_check_keeps_original_proof() { dsr_resume_case(false, 0); }
+#[test]
+fn dsr_resume_generated_reply_ahead_of_claim_keeps_original_proof() { dsr_resume_case(true, 0); }
+#[test]
+fn dsr_resume_raw_cpr_before_outer_check_stays_foreign() { dsr_resume_case(false, 1); }
+#[test]
+fn dsr_resume_raw_cpr_ahead_of_claim_stays_foreign() { dsr_resume_case(true, 1); }
+
+#[test]
+fn dsr_resume_mixed_and_program_writes_remain_foreign() {
+    for ahead in [false, true] { for mode in [2, 3, 4, 5] { dsr_resume_case(ahead, mode); } }
+}
+
+#[test]
+fn dsr_resume_writer_reply_success_and_error_accounting() {
+    struct Sink { bytes: Vec<u8>, fail_write: bool, fail_flush: bool }
+    impl std::io::Write for Sink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.fail_write {
+                if self.bytes.is_empty() { self.bytes.push(bytes[0]); return Ok(1); }
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
+            self.bytes.extend_from_slice(bytes); Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.fail_flush { Err(std::io::ErrorKind::BrokenPipe.into()) } else { Ok(()) }
+        }
+    }
+    for mode in [0, 1, 2] {
+        let track = Arc::new(crate::state::InjectTrack::default());
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(crate::state::dsr_resume_generated_request()).unwrap();
+        tx.send(crate::state::WriteReq::Data(b"later".to_vec())).unwrap(); drop(tx);
+        let mut sink = Sink { bytes: vec![], fail_write: mode == 1, fail_flush: mode == 2 };
+        crate::state::run_writer_loop_tracked(&mut sink, rx, Arc::new(std::sync::atomic::AtomicBool::new(false)), Some(track.clone()));
+        assert_eq!(track.wrote(), if mode == 0 {2} else {1});
+        assert_eq!(track.resume_write_epoch(), 1, "DSR_SUCCESS_EXCLUDED_ERRORS_FOREIGN mode={mode}");
+        assert_eq!(sink.bytes, match mode {0 => b"\x1b[1;1Rlater".to_vec(), 1 => vec![27], _ => b"\x1b[1;1R".to_vec()});
+    }
+}
+
+#[test]
+fn dsr_resume_reply_still_refuses_fresh_d9_claim() {
+    let fx = fx("dsr-d9"); let s = seat(&fx);
+    fx.daemon.roles.lock().unwrap().insert("master".into(), s.id);
+    *s.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+    let d9 = crate::governance::D9WriterGuard::for_target(&fx.daemon, &s).expect("D9 scope");
+    let before = s.inject_track.wrote();
+    s.write_tx.send(crate::state::dsr_resume_generated_request()).unwrap();
+    dsr_resume_fifo_completed(&s);
+    assert!(s.inject_track.wrote() > before);
+    assert!(!d9.guard().claim_for_write());
+    assert_eq!(d9.moved(), vec!["wrote"]);
+}
+
+#[cfg(unix)]
+fn dsr_resume_complete_stream(ahead: bool) {
+    let fx = fx("dsr-complete");
+    let out = fx.dir.join("received.bin"); let ready = fx.dir.join("ready");
+    let command = format!("stty raw -echo; touch '{}'; exec cat > '{}'", ready.display(), out.display());
+    let s = fx.daemon.create_surface(None, Some(command), None, None, 24, 200).unwrap();
+    fx.daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+    dsr_resume_wait("raw receiver configured", || ready.exists());
+    let body = "exact preserved body ".repeat(400);
+    let since = hold_exact(&fx, &s, &body, 1);
+    let (offset, request) = { let hold = s.queue_hold.lock().unwrap(); let h = hold.as_ref().unwrap(); (h.envelope.unwrap().body_offset, h.request_id.clone()) };
+    let prefix = cys::paste_fence::OPEN.len() + offset;
+    dsr_resume_wait("exact prefix received", || file_len(&out) == prefix);
+    let total = s.inject_track.wrote();
+    let release = if ahead { crate::agent_write::set_test_sync_settle(false); Some(hold_writer(&s)) } else { None };
+    s.write_tx.send(crate::state::dsr_resume_generated_request()).unwrap();
+    if !ahead { dsr_resume_fifo_completed(&s); }
+    let _ = crate::governance::queue_write_hold_block_at(&fx.daemon, &s, since + Duration::from_secs(4));
+    if let Some(release) = release { release.send(()).unwrap(); }
+    assert_eq!(seat_events(&fx, &s, "queue.write_resumed").len(), 1, "DSR_COMPLETE_HANDOFF");
+    dsr_resume_fifo_completed(&s);
+    assert!(s.inject_track.wrote() > total);
+    assert_eq!(queue_len(&s), 0, "DSR_COMPLETE_SETTLED_WITHOUT_DELIVERY");
+    assert!(!s.inject_reserved());
+    let resumed = seat_events(&fx, &s, "queue.write_resumed");
+    assert_eq!(resumed[0]["payload"]["request_id"], request);
+    assert_eq!(resumed[0]["payload"]["body_offset"], offset);
+    let mut expected = queue_bytes(&body); expected.splice(prefix..prefix, b"\x1b[1;1R".iter().copied());
+    dsr_resume_wait("complete raw stream", || file_len(&out) >= expected.len());
+    assert_eq!(std::fs::read(&out).unwrap(), expected, "suffix/fence/CR must be exact, without prefix replay");
+    assert_eq!(events(&fx, "queue.delivered").len(), 1);
+    assert!(s.queue_hold.lock().unwrap().is_none());
+    let journal = std::fs::read_to_string(fx.dir.join(crate::state::WRITER_JOURNAL_FILE)).unwrap();
+    let terminal: Vec<Value> = journal.lines().map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|row| row["rec"] == "terminal" && row["kind"] == "written_submitted").collect();
+    assert_eq!(terminal.len(), 1);
+    assert_eq!(terminal[0]["id"], request, "same request completed");
+}
+#[test]
+#[cfg(unix)]
+fn dsr_resume_complete_stream_before_outer_check() { dsr_resume_complete_stream(false); }
+#[test]
+#[cfg(unix)]
+fn dsr_resume_complete_stream_ahead_of_claim() { dsr_resume_complete_stream(true); }
+
+#[test]
+#[cfg(unix)]
+fn dsr_resume_successor_proof_cannot_write_after_original_prefix() {
+    struct Successor(AtomicUsize);
+    impl Proof for Successor {
+        fn admit(&self) -> Result<(), ProofLoss> { self.0.fetch_add(1, Ordering::AcqRel); Ok(()) }
+        fn recheck(&self, _: Phase) -> Result<(), ProofLoss> { Ok(()) }
+    }
+    let fx = fx("dsr-successor");
+    let out = fx.dir.join("received.bin"); let ready = fx.dir.join("ready");
+    let command = format!("stty raw -echo; touch '{}'; exec cat > '{}'", ready.display(), out.display());
+    let s = fx.daemon.create_surface(None, Some(command), None, None, 24, 200).unwrap();
+    fx.daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+    dsr_resume_wait("successor receiver configured", || ready.exists());
+    let original = Arc::new(LostForGood { admits: AtomicUsize::new(0), rechecks: AtomicUsize::new(0), fail_at: 1 });
+    *s.receiver_proof.lock().unwrap() = Some(original.clone());
+    let body = "original proof body ".repeat(400); enqueue(&fx, &s, &body); assert!(hand_off(&fx, &s));
+    let (since, offset, request) = { let h = s.queue_hold.lock().unwrap(); let h = h.as_ref().unwrap(); (h.since, h.envelope.unwrap().body_offset, h.request_id.clone()) };
+    let prefix = cys::paste_fence::OPEN.len() + offset;
+    dsr_resume_wait("original prefix received", || file_len(&out) == prefix);
+    let mut expected = std::fs::read(&out).unwrap(); expected.extend_from_slice(b"\x1b[1;1R");
+    let epoch = s.inject_track.resume_write_epoch(); let total = s.inject_track.wrote();
+    let successor = Arc::new(Successor(AtomicUsize::new(0)));
+    *s.receiver_proof.lock().unwrap() = Some(successor.clone());
+    s.write_tx.send(crate::state::dsr_resume_generated_request()).unwrap();
+    dsr_resume_fifo_completed(&s);
+    assert!(s.inject_track.wrote() > total);
+    let _ = crate::governance::queue_write_hold_block_at(&fx.daemon, &s, since + Duration::from_secs(4));
+    assert_eq!(events(&fx, "queue.write_resumed").len(), 1, "DSR_ORIGINAL_PROOF_HANDOFF");
+    dsr_resume_fifo_completed(&s);
+    assert_eq!(original.admits.load(Ordering::Acquire), 2); assert_eq!(successor.0.load(Ordering::Acquire), 0);
+    assert_eq!(s.inject_track.resume_write_epoch(), epoch);
+    dsr_resume_wait("only prefix and reply received", || file_len(&out) >= expected.len());
+    assert_eq!(std::fs::read(&out).unwrap(), expected, "successor must not add body/fence/CR");
+    let hold = s.queue_hold.lock().unwrap(); let h = hold.as_ref().unwrap();
+    assert_eq!(h.request_id, request); assert_eq!(h.envelope.unwrap().body_offset, offset); assert_eq!(h.since, since);
+    assert!(s.inject_reserved()); assert_eq!(queue_len(&s), 1); assert!(events(&fx, "queue.delivered").is_empty());
 }
