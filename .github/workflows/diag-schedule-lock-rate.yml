@@ -1,14 +1,15 @@
-name: diag-schedule-lock-rate
+name: schedule-lock-rate-regimes
 on:
   push:
-    branches: ['diag/0.14.56-schedule-lock-rate']
+    branches: ['work/0.14.56-schedule-lock-rate']
 permissions:
   contents: read
 concurrency:
   group: diag-schedule-lock-rate-${{ github.ref }}
   cancel-in-progress: false
 jobs:
-  measure:
+  isolated_control:
+    name: isolated-regime CONTROL (${{ matrix.arm }})
     runs-on: windows-latest
     timeout-minutes: 75
     strategy:
@@ -21,13 +22,13 @@ jobs:
       - uses: actions/checkout@v4
         timeout-minutes: 5
         with:
-          fetch-depth: 4
+          fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-python@v5
         timeout-minutes: 5
         with:
           python-version: '3.12'
-      - name: Build once and collect 300 exact single-test processes
+      - name: ISOLATED CONTROL — 300 exact processes; 0/300 does not exonerate suite red
         id: measure
         timeout-minutes: 60
         continue-on-error: true
@@ -40,7 +41,7 @@ jobs:
         uses: actions/upload-artifact@v4
         timeout-minutes: 5
         with:
-          name: schedule-lock-rate-${{ github.sha }}-${{ matrix.arm }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: schedule-lock-isolated-CONTROL-${{ github.sha }}-${{ matrix.arm }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/schedule-rate-${{ matrix.arm }}/manifest.json
             ${{ runner.temp }}/schedule-rate-${{ matrix.arm }}/summary.json

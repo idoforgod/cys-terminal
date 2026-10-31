@@ -4,6 +4,9 @@ import argparse, hashlib, json, math, os, platform, re, shutil, subprocess, sys,
 from pathlib import Path
 
 BASE = '0b25c51158270804911bca82f23dc7f7ed066590'
+INSTRUMENTED = 'b26ef7334012b997b2cd03e86651ef991768526f'
+REGIME = 'isolated-regime CONTROL'
+LIMIT = 'Bounds only the isolated single-test regime; 0/300 is NOT exoneration of a suite red.'
 TEST = 'schedule::tests::schedule_writers_serialize_under_the_lock_and_no_add_is_lost'
 MARKER = 'SCHEDULE_LOCK_RATE '
 N = 300
@@ -109,7 +112,7 @@ def main():
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=False)
     repo = Path(__file__).resolve().parents[2]
-    manifest = {'arm': args.arm, 'planned_n': N, 'test': TEST, 'base': BASE, 'started': time.time(), 'platform': platform.platform(), 'python': sys.version, 'python_executable': sys.executable, 'python_resolved': str(Path(sys.executable).resolve()), 'runner_image': {k: os.environ.get(k) for k in ['ImageOS', 'ImageVersion', 'RUNNER_OS', 'RUNNER_ARCH', 'GITHUB_SHA', 'GITHUB_REF', 'GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT']}}
+    manifest = {'regime': REGIME, 'interpretation_limit': LIMIT, 'arm': args.arm, 'planned_n': N, 'test': TEST, 'base': BASE, 'started': time.time(), 'platform': platform.platform(), 'python': sys.version, 'python_executable': sys.executable, 'python_resolved': str(Path(sys.executable).resolve()), 'runner_image': {k: os.environ.get(k) for k in ['ImageOS', 'ImageVersion', 'RUNNER_OS', 'RUNNER_ARCH', 'GITHUB_SHA', 'GITHUB_REF', 'GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT']}}
     rows = []
     started_count = 0
     error = None
@@ -119,16 +122,20 @@ def main():
         def git(*command):
             return subprocess.check_output(['git', *command], cwd=repo, text=True).strip()
         tip = git('rev-parse', 'HEAD')
-        if os.environ.get('GITHUB_SHA') != tip or os.environ.get('GITHUB_REF') != 'refs/heads/diag/0.14.56-schedule-lock-rate':
+        if os.environ.get('GITHUB_SHA') != tip or os.environ.get('GITHUB_REF') != 'refs/heads/work/0.14.56-schedule-lock-rate':
             raise RuntimeError('Workflow association is not the approved diagnostic tip/ref')
-        first = git('rev-parse', 'HEAD^')
-        if git('rev-parse', 'HEAD^^^') != BASE:
-            raise RuntimeError('Expected exactly three diagnostic commits above the frozen base')
+        first = git('rev-parse', INSTRUMENTED + '^')
+        if git('rev-parse', INSTRUMENTED + '^^^') != BASE:
+            raise RuntimeError('Original diagnostic source lineage changed')
+        subprocess.run(['git', 'merge-base', '--is-ancestor', INSTRUMENTED, tip], cwd=repo, check=True)
+        allowed = {'.github/workflows/diag-schedule-lock-rate.yml', 'scripts/diag/schedule_lock_rate.py', 'scripts/diag/schedule_suite_rate.py'}
+        if not set(git('diff', '--name-only', INSTRUMENTED, tip).splitlines()) <= allowed:
+            raise RuntimeError('Revision changed inputs outside the authorized observation protocol')
         if set(git('diff', '--name-only', BASE, first).splitlines()) != {'.github/workflows/diag-schedule-lock-rate.yml', 'scripts/diag/schedule_lock_rate.py'}:
             raise RuntimeError('Baseline commit changed unexpected inputs')
-        if git('diff', '--name-only', first, tip) != 'src/bin/cysd/schedule.rs':
+        if git('diff', '--name-only', first, INSTRUMENTED) != 'src/bin/cysd/schedule.rs':
             raise RuntimeError('Instrumentation commit changed unexpected inputs')
-        ref = BASE if args.arm == 'baseline' else tip
+        ref = BASE if args.arm == 'baseline' else INSTRUMENTED
         source = out / 'source'
         subprocess.run(['git', 'worktree', 'add', '--detach', str(source), ref], cwd=repo, check=True)
         schedule = source / 'src/bin/cysd/schedule.rs'
@@ -198,7 +205,7 @@ def main():
             error = str(error) + '; journal reconciliation: ' + repr(exc)
         complete = sample_complete(rows, error, reconciled)
         diagnostics_complete = None if args.arm == 'baseline' else all(valid_diagnostics(row) for row in rows) and len(rows) == N
-        summary = {'planned_n': N, 'attempted': started_count, 'completed_records': len(rows), 'counts': counts, 'complete_classified_sample': complete, 'journal_reconciled': reconciled, 'diagnostic_attribution_complete': diagnostics_complete, 'error': error, 'rate': counts['fail']/N if complete else None, 'wilson_95': wilson(counts['fail'], N) if complete else None, 'unknown_including_unattempted': N-counts['pass']-counts['fail'], 'failure_fraction_bounds_if_incomplete': [counts['fail']/N, (N-counts['pass'])/N], 'blocks_50': [{'first': a+1, 'attempted': len(rows[a:a+50]), 'fail': sum(x['outcome']=='fail' for x in rows[a:a+50])} for a in range(0, N, 50)], 'zero_inner_failures_observed': (counts['fail'] == 0) if complete else None, 'release_verdict': 'NONE; CEO gate remains separate'}
+        summary = {'regime': REGIME, 'interpretation_limit': LIMIT, 'planned_n': N, 'attempted': started_count, 'completed_records': len(rows), 'counts': counts, 'complete_classified_sample': complete, 'journal_reconciled': reconciled, 'diagnostic_attribution_complete': diagnostics_complete, 'error': error, 'rate': counts['fail']/N if complete else None, 'wilson_95': wilson(counts['fail'], N) if complete else None, 'unknown_including_unattempted': N-counts['pass']-counts['fail'], 'failure_fraction_bounds_if_incomplete': [counts['fail']/N, (N-counts['pass'])/N], 'blocks_50': [{'first': a+1, 'attempted': len(rows[a:a+50]), 'fail': sum(x['outcome']=='fail' for x in rows[a:a+50])} for a in range(0, N, 50)], 'zero_inner_failures_observed': (counts['fail'] == 0) if complete else None, 'release_verdict': 'NONE; CEO gate remains separate'}
         manifest['ended'] = time.time()
         (out / 'manifest.json').write_text(json.dumps(manifest, indent=2))
         (out / 'summary.json').write_text(json.dumps(summary, indent=2))
