@@ -144,8 +144,13 @@ fn assert_absorbed(resp: &Value) {
 /// Re-executed libtest output is private: it must never add a second `test result:` to the parent log.
 struct Kid(std::process::Child, Option<std::net::TcpStream>);
 impl Kid {
+    fn checked_exit(status: std::process::ExitStatus) {
+        if !status.success() && !std::thread::panicking() {
+            panic!("D9 fixture child exited unsuccessfully: {status}");
+        }
+    }
     fn finish(&mut self) {
-        if matches!(self.0.try_wait(), Ok(Some(_))) { return; }
+        if let Ok(Some(status)) = self.0.try_wait() { Self::checked_exit(status); return; }
         if let Some(control) = self.1.take() {
             let _ = control.shutdown(std::net::Shutdown::Both);
         } else {
@@ -154,14 +159,17 @@ impl Kid {
         }
         let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop { // wallclock: guard bounds cooperative fixture teardown; elapsed time is never a success criterion
-            if matches!(self.0.try_wait(), Ok(Some(_))) { return; }
+            if let Ok(Some(status)) = self.0.try_wait() { Self::checked_exit(status); return; }
             if std::time::Instant::now() >= end { break; }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         let _ = self.0.kill(); // retained handle, never a process-name or recycled-pid kill
         let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop { // wallclock: guard bounds the reap after stopping this owned fixture child
-            if matches!(self.0.try_wait(), Ok(Some(_))) { return; }
+            if let Ok(Some(status)) = self.0.try_wait() {
+                if !std::thread::panicking() { panic!("D9 fixture cooperative teardown guard expired; forced stop: {status}"); }
+                return;
+            }
             if std::time::Instant::now() >= end { break; }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
@@ -238,7 +246,7 @@ fn d9_fixture_process() {
     use std::io::{Read, Write};
     let Ok(address) = std::env::var("D9_FIXTURE_ADDRESS") else { return; };
     let mode = std::env::var("D9_FIXTURE_MODE").expect("fixture mode");
-    assert!(mode == "leaf" || mode == "parent");
+    assert!(mode == "leaf" || mode == "parent" || mode == "fail-on-close");
     let mut control = std::net::TcpStream::connect(address).expect("fixture control");
     // A lost parent closes the socket. The timeout is a hard orphan guard, not the fixture lifetime.
     control.set_read_timeout(Some(std::time::Duration::from_secs(120))).unwrap();
@@ -250,6 +258,14 @@ fn d9_fixture_process() {
     let result = control.read(&mut byte);
     drop(descendant); // retained Child is reaped before the parent test process exits
     assert!(matches!(result, Ok(0)), "fixture control must end by EOF: {result:?}");
+    assert_ne!(mode, "fail-on-close", "injected private child failure");
+}
+
+#[test]
+#[should_panic(expected = "D9 fixture child exited unsuccessfully")]
+fn d9_fixture_child_failure_is_reported() {
+    let mut child = spawn_kid("fail-on-close").0;
+    child.finish();
 }
 
 fn record_creator(fx: &Fx, sid: u64, pid: u32, start: Option<u64>, age_secs: f64) {
