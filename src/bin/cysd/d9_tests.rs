@@ -12,7 +12,6 @@ use crate::handlers::{dispatch, Reply};
 use crate::state::{Daemon, Surface};
 use cys::Request;
 use serde_json::{json, Value};
-use std::io::BufRead;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, MutexGuard};
 
@@ -141,36 +140,116 @@ fn assert_absorbed(resp: &Value) {
     assert_eq!(resp["result"]["absorbed"], json!(true), "must be absorbed (0 bytes): {resp}");
 }
 
-/// A child process of this test process (its parent incarnation = this process). Killed on drop.
-struct Kid(std::process::Child);
-impl Drop for Kid {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+/// A real child of this test process, with an owned control socket and retained process handle.
+/// Re-executed libtest output is private: it must never add a second `test result:` to the parent log.
+struct Kid(std::process::Child, Option<std::net::TcpStream>);
+impl Kid {
+    fn finish(&mut self) {
+        if matches!(self.0.try_wait(), Ok(Some(_))) { return; }
+        if let Some(control) = self.1.take() {
+            let _ = control.shutdown(std::net::Shutdown::Both);
+        } else {
+            // Startup failed before the READY socket was acquired; only this owned child is stopped.
+            let _ = self.0.kill();
+        }
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop { // wallclock: guard bounds cooperative fixture teardown; elapsed time is never a success criterion
+            if matches!(self.0.try_wait(), Ok(Some(_))) { return; }
+            if std::time::Instant::now() >= end { break; }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let _ = self.0.kill(); // retained handle, never a process-name or recycled-pid kill
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop { // wallclock: guard bounds the reap after stopping this owned fixture child
+            if matches!(self.0.try_wait(), Ok(Some(_))) { return; }
+            if std::time::Instant::now() >= end { break; }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if !std::thread::panicking() { panic!("owned D9 fixture child did not reap"); }
+        eprintln!("D9 fixture cleanup failed during unwind");
     }
 }
-fn kid() -> Kid {
-    Kid(std::process::Command::new("/bin/sleep").arg("30").spawn().expect("spawn sleep"))
+impl Drop for Kid {
+    fn drop(&mut self) { self.finish(); }
 }
 
-/// A grandchild: `sleep` under an intermediate shell, so its parent is NOT this process. Returns (shell, sleep pid).
+fn spawn_kid(mode: &str) -> (Kid, u32) {
+    use crate::state::HideConsole;
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("fixture listener");
+    listener.set_nonblocking(true).unwrap();
+    let child = Command::new(std::env::current_exe().expect("test executable"))
+        .args(["--exact", "d9_tests::d9_fixture_process", "--nocapture", "--test-threads=1"])
+        .env("D9_FIXTURE_ADDRESS", listener.local_addr().unwrap().to_string())
+        .env("D9_FIXTURE_MODE", mode)
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+        .hide_console().spawn().expect("spawn owned fixture");
+    let mut child = Kid(child, None);
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut control = loop { // wallclock: guard bounds startup; the socket's READY message is the readiness evidence
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => panic!("fixture accept: {e}"),
+        }
+        assert!(child.0.try_wait().expect("fixture status").is_none(), "fixture exited before READY");
+        assert!(std::time::Instant::now() < end, "fixture READY guard expired");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    // Accepted sockets can inherit the listener's nonblocking mode (Darwin); READY must wait for its bounded read.
+    control.set_nonblocking(false).unwrap();
+    control.set_read_timeout(Some(std::time::Duration::from_secs(30))).unwrap();
+    let mut ids = [0u8; 8];
+    control.read_exact(&mut ids).expect("fixture READY identities");
+    assert_eq!(u32::from_be_bytes(ids[..4].try_into().unwrap()), child.0.id(), "READY is from the owned child");
+    let grandchild = u32::from_be_bytes(ids[4..].try_into().unwrap());
+    child.1 = Some(control);
+    (child, grandchild)
+}
+
+fn kid() -> Kid { spawn_kid("leaf").0 }
+
+/// A real grandchild whose parent owns its handle. Closing the root control socket tears down
+/// the grandchild before the intermediate process exits, on both Windows and POSIX.
 struct Grandkid(Kid, u32);
 impl Drop for Grandkid {
     fn drop(&mut self) {
-        let _ = std::process::Command::new("/bin/kill").arg("-9").arg(self.1.to_string()).status();
+        self.0.finish();
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while crate::state::pid_alive(self.1) { // wallclock: guard requires observed descendant exit, never a sleep-only cleanup
+            if std::time::Instant::now() >= end {
+                if !std::thread::panicking() { panic!("owned D9 grandchild still alive after parent teardown"); }
+                eprintln!("D9 grandchild cleanup failed during unwind");
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 }
 fn grandkid() -> Grandkid {
-    let mut c = std::process::Command::new("/bin/sh")
-        .arg("-c")
-        .arg("/bin/sleep 30 & echo $!; wait")
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn sh");
-    let mut line = String::new();
-    std::io::BufReader::new(c.stdout.take().unwrap()).read_line(&mut line).unwrap();
-    let pid: u32 = line.trim().parse().expect("grandchild pid");
-    Grandkid(Kid(c), pid)
+    let (parent, pid) = spawn_kid("parent");
+    assert_ne!(pid, 0, "parent READY names its actual child");
+    Grandkid(parent, pid)
+}
+
+#[test]
+fn d9_fixture_process() {
+    use std::io::{Read, Write};
+    let Ok(address) = std::env::var("D9_FIXTURE_ADDRESS") else { return; };
+    let mode = std::env::var("D9_FIXTURE_MODE").expect("fixture mode");
+    assert!(mode == "leaf" || mode == "parent");
+    let mut control = std::net::TcpStream::connect(address).expect("fixture control");
+    // A lost parent closes the socket. The timeout is a hard orphan guard, not the fixture lifetime.
+    control.set_read_timeout(Some(std::time::Duration::from_secs(120))).unwrap();
+    let descendant = (mode == "parent").then(kid);
+    let pid = descendant.as_ref().map_or(0, |c| c.0.id());
+    control.write_all(&std::process::id().to_be_bytes()).unwrap();
+    control.write_all(&pid.to_be_bytes()).unwrap();
+    let mut byte = [0u8; 1];
+    let result = control.read(&mut byte);
+    drop(descendant); // retained Child is reaped before the parent test process exits
+    assert!(matches!(result, Ok(0)), "fixture control must end by EOF: {result:?}");
 }
 
 fn record_creator(fx: &Fx, sid: u64, pid: u32, start: Option<u64>, age_secs: f64) {
