@@ -223,7 +223,7 @@ enum Command {
     /// T2-4 컨텍스트 60% 사이클 집행기 (7단계 · D-16): 저장 지시→파일 검증→검증자 handshake→
     /// 대상 턴 종료·빈 composer 확인→입력버퍼 정리+clear→clear 실효 확인→디렉티브·재개 포인터 재주입.
     /// exit: 0=실효 확인 · 80=실효 미관측(재주입 0건) · 81=실효 측정 불능 · 82/83=검증자 충돌·미해소 ·
-    /// 84=대상이 유휴가 되지 않음(clear 송신 0건) · 85=사람 초안 보호(clear 송신 0건).
+    /// 84=유휴 대기 보류 또는 유휴 관측 뒤 쓰기 전 가드 3회 거부(clear 송신 0건) · 85=사람 초안 보호(clear 송신 0건).
     /// 84·85 는 clear 송신 0건 비파괴 보류(원자 clear 거부는 composer 무변경 · clear_first_unsupported = 등록 에이전트 없는 좌석은 보류가 아니라 rc 1 실패다: 송신 0건 · 재시도로 풀리지 않는다 · launch-agent 로 재등록) — autopilot 이 쿨다운 뒤 자동 재시도한다(5단계 85 도 사이클 표지 끔에 'clear 안 됨'을 실어 그 통보가 미해결로 남는다 · 80 도 같은 결과를 실어 같은 --fire 재집행이 가능하다).
     /// 86=실효 확인 뒤 재주입 보류: clear 는 이미 발효했다 — 손으로 다시 clear 하지 말고 재주입만 확인한다.
     /// 87=건너뜀(송신 0건): --fire 의 통보 뒤 그 좌석의 사이클이 이미 끝났다 — 재집행하지 않는다.
@@ -1756,7 +1756,7 @@ const CLEAR_UNMEASURABLE_TOKEN: &str = "clear-unmeasurable:";
 /// `t2_clear_verify_window_matches_autopilot_settle` 가 잡는다(파이썬 원문을 include_str 로 대조).
 const CLEAR_VERIFY_SECS: u64 = 75;
 
-/// 대상 턴·composer가 유휴가 되지 않아 clear 보류(84). 턴 종료 뒤 재시도 또는 --timeout 연장.
+/// 유휴 대기 또는 유휴 관측 뒤 쓰기 전 가드 3회 거부로 clear 보류(84). 새 관측으로 재시도.
 /// 자동 경로(javis_cycle_autopilot)는 84/85 를 `held_noop` 으로 종결하고
 /// held_cooldown_secs(지수 · 300→600→1200s 상한) 뒤 자동 재시도한다 · 구조적(구 데몬
 /// quiet_secs 미보고 `[diag=…]`) 보류만 HELD_RETRY_MAX 연속 도달 시 escalation 후 정지(사람 reset).
@@ -1785,7 +1785,7 @@ const CYCLE_SKIPPED_TOKEN: &str = "cycle-skipped:";
 /// 데몬이 그 통보를 한 번 재배달한다(`context.threshold` · 같은 fire_id · redelivery) — 그 재배달이 다시 집행할 계기다.
 const EXIT_CYCLE_BUSY: i32 = 88;
 const CYCLE_BUSY_TOKEN: &str = "cycle-busy:";
-/// 유휴 대기 만료 머리표. 대상 턴 종료 뒤 재시도 또는 --timeout 연장.
+/// 유휴 대기 또는 알려진 0바이트 가드 거부 상한의 보류 머리표. 새 관측으로 재시도.
 /// 자동 경로(javis_cycle_autopilot)는 84/85 를 `held_noop` 으로 종결하고
 /// held_cooldown_secs(지수 · 300→600→1200s 상한) 뒤 자동 재시도한다 · 구조적(구 데몬
 /// quiet_secs 미보고 `[diag=…]`) 보류만 HELD_RETRY_MAX 연속 도달 시 escalation 후 정지(사람 reset).
@@ -6025,6 +6025,8 @@ fn request_with_idle_cap(
     params: Value,
     cap: Option<std::time::Duration>,
 ) -> Result<Value, String> {
+    #[cfg(test)]
+    if let Some(result) = b360_tests::native_cap_rpc(method, &params) { return result; }
     // ★선언 순서 = drop 순서의 역순. `deadline` 을 `stream` 뒤에 선언해야 감시자가 스트림보다
     //   먼저 정지·join 된다(닫힌 핸들에 CancelIoEx 금지). 아래 명시 drop 은 그 계약의 이중 보증.
     // ★두 축을 하나로 합치지 않는 이유는 실패 원인이 다르기 때문이다
@@ -22987,6 +22989,7 @@ fn run_cycle_agent(
                 "[cycle] residual_window={:.1}s (검증자 allow→clear · 이 구간은 kill-switch 회수 불가)",
                 allow_at.elapsed().as_secs_f64()
             );
+            let mut only_guard_aborts = true;
             for attempt in 0..3 {
                 // wallclock: guard the existing clear-stage budget; never grant a fresh budget on retry.
                 if std::time::Instant::now() >= idle_deadline {
@@ -23044,7 +23047,13 @@ fn run_cycle_agent(
                         }
                         if e.contains("guard_aborted:") || is_journal_refusal(&e) {
                             outcome = CycleOutcome::NotCleared;
-                            if attempt + 1 == 3 { return Err(e); }
+                            only_guard_aborts &= e.contains("guard_aborted:");
+                            if attempt + 1 == 3 {
+                                if only_guard_aborts {
+                                    return Err(format!("{CYCLE_TARGET_BUSY_TOKEN} cycle_clear_guard_retry_exhausted [diag=guard_retry_exhausted]: idle was observed before each of three known-zero pre-write guard refusals; no clear sent; {e}"));
+                                }
+                                return Err(e);
+                            }
                             continue;
                         }
                         return Err(e);
@@ -47190,6 +47199,102 @@ mod b360_tests {
         json!({"ok": true, "result": result})
     }
 
+    type NativeCapRpc = Box<dyn FnMut(&str, &Value) -> Result<Value, String>>;
+    thread_local! {
+        static NATIVE_CAP_RPC: std::cell::RefCell<Option<NativeCapRpc>> = const { std::cell::RefCell::new(None) };
+    }
+    pub(super) fn native_cap_rpc(method: &str, params: &Value) -> Option<Result<Value, String>> {
+        NATIVE_CAP_RPC.with(|slot| slot.borrow_mut().as_mut().map(|rpc| rpc(method, params)))
+    }
+    struct NativeCapRpcScope;
+    impl Drop for NativeCapRpcScope {
+        fn drop(&mut self) { NATIVE_CAP_RPC.with(|slot| { slot.borrow_mut().take(); }); }
+    }
+
+    /// Platform-independent controlled composer output: execute the REAL cycle loop,
+    /// substituting only its RPC transport. No socket, child CLI, or live daemon is touched.
+    #[test]
+    fn native_cycle_guard_cap_controlled_output_and_mixed_history() {
+        use std::sync::{Arc, Mutex};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let _lock = super::tests::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        struct Root(std::path::PathBuf);
+        impl Drop for Root { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+        for (errors, expected) in [
+            (vec!["guard_aborted", "guard_aborted", "guard_aborted"], 84),
+            (vec![cys::ERR_JOURNAL_UNAVAILABLE; 3], 1),
+            (vec![cys::ERR_JOURNAL_UNAVAILABLE, cys::ERR_JOURNAL_UNAVAILABLE, "guard_aborted"], 1),
+            (vec!["guard_aborted", "guard_aborted", cys::ERR_JOURNAL_UNAVAILABLE], 1),
+            (vec!["guard_aborted", "guard_aborted", "fixture_generic_error"], 1),
+            (vec!["own_paste_settling"], 84),
+            (vec!["cycle_clear_unclaimed"], 84),
+            (vec![cys::ERR_TYPING_GUARD], EXIT_CYCLE_HUMAN_DRAFT),
+        ] {
+            let root = Root(std::env::temp_dir().join(format!("native-cap-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed))));
+            std::fs::create_dir(&root.0).expect("fresh owned fixture root");
+            for dir in ["pack/directives", "pack/round", "config", "local", "_round"] {
+                std::fs::create_dir_all(root.0.join(dir)).unwrap();
+            }
+            let embedded = cys::pack::PACK_ALL.iter().find(|(p,_)| *p=="agents.json").unwrap().1;
+            std::fs::write(root.0.join("pack/agents.json"), embedded).unwrap();
+            std::fs::write(root.0.join("pack/directives/WORKER_DIRECTIVE.md"), "W").unwrap();
+            let _env = R2cEnv::set(vec![
+                ("CYS_PACK_DIR", root.0.join("pack").into_os_string()),
+                ("CYS_CONFIG_DIR", root.0.join("config").into_os_string()),
+                ("CYS_LOCAL_DIR", root.0.join("local").into_os_string()),
+                ("CYS_NO_AUTOSTART", "1".into()),
+                (cys::ENV_SOCKET, root.0.join("never-connect.sock").into_os_string()),
+            ]);
+            let calls = Arc::new(Mutex::new(Vec::<(String,Value)>::new()));
+            let mismatches = Arc::new(Mutex::new(Vec::<(u64,u64)>::new()));
+            let (record, changes) = (calls.clone(), mismatches.clone());
+            let cwd = root.0.clone(); let scripted = errors.clone();
+            let mut generation = 0u64; let mut attempts = 0usize;
+            NATIVE_CAP_RPC.with(|slot| {
+                assert!(slot.borrow().is_none());
+                *slot.borrow_mut() = Some(Box::new(move |method, params| {
+                    record.lock().unwrap().push((method.into(), params.clone()));
+                    match method {
+                        "surface.cycle_claim" => Ok(json!({"claim":"claimed"})),
+                        "surface.list" => Ok(json!({"surfaces":[{"surface_id":7,"surface_ref":"surface:7","role":"worker","agent":"claude","exited":false,"awakened_at":1.0,"cwd":cwd,"live_cwd":cwd,"pending_input_bytes":0,"pending_input_human_bytes":0,"usage":{"source":"statusline","session_file":"S1"}}]})),
+                        "surface.read_text" => {
+                            generation += 2;
+                            Ok(json!({"text":cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT,"quiet_secs":5.0,"composer":{"verdict":"empty","governed":true,"modal":false,"owner":"none","output_gen":generation,"input_gen":0,"pending_bytes":0,"human_bytes":0}}))
+                        }
+                        "surface.send_text" if params["clear_first"] == true => {
+                            let observed = params["expect_output_gen"].as_u64().unwrap();
+                            assert_eq!(observed, generation, "fresh observation before controlled output");
+                            generation += 2; // controlled output between observation and receipt
+                            assert_ne!(observed, generation);
+                            changes.lock().unwrap().push((observed, generation));
+                            let error = scripted.get(attempts).expect("unexpected extra clear attempt");
+                            attempts += 1;
+                            Err(format!("{error}: zero bytes; controlled output {observed}->{generation}"))
+                        }
+                        "surface.send_text" | "surface.send_key" | "surface.quiesce" => Ok(json!({})),
+                        other => panic!("unexpected RPC {other}; live transport is forbidden"),
+                    }
+                }));
+            });
+            let hook = NativeCapRpcScope;
+            let rc = run_cycle_agent(None, Some("7".into()), None, vec![], None, None, 3, true, None);
+            drop(hook);
+            let calls = calls.lock().unwrap();
+            let changes = mismatches.lock().unwrap();
+            assert_eq!(rc, expected, "refusal history {errors:?}: {calls:?}");
+            assert_eq!(changes.len(), errors.len(), "exact bounded attempt count");
+            assert!(changes.iter().all(|(old,new)| old!=new));
+            assert!(changes.windows(2).all(|pair| pair[1].0 > pair[0].0), "each retry reobserves output");
+            let first = calls.iter().position(|(m,p)| m=="surface.send_text" && p["clear_first"]==true).unwrap();
+            assert!(!calls[first..].iter().any(|(m,p)| m=="surface.send_key" || (m=="surface.send_text" && p["clear_first"]!=true)), "zero clear writes in scripted refusals; no subsequent directive/RESUME or split keys");
+            // A generic error is NOT a known-zero protocol result, even if the fixture text says zero.
+            let outcome = if errors.last() == Some(&"fixture_generic_error") { "unknown" } else { "not_cleared" };
+            assert_eq!(r2c_quiesce_outcome(&calls).as_deref(), Some(outcome));
+            eprintln!("NATIVE-CAP history={errors:?} output_mismatches={changes:?} rc={rc}; clear_writes=0; reinjection=0");
+        }
+    }
+
     /// What the CLI itself says: the part of a line before the daemon's echoed error text (`<code>: <message>`).
     fn r2c_own(line: &str) -> &str {
         let cut = [cys::ERR_JOURNAL_UNAVAILABLE, cys::ERR_WRITE_OUTCOME_UNKNOWN]
@@ -47323,10 +47428,8 @@ mod b360_tests {
     }
 
     /// Sets env vars for an in-process specimen (hold `ENV_LOCK`); restores them on drop, also after a RED panic.
-    #[cfg(unix)]
     struct R2cEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
 
-    #[cfg(unix)]
     impl R2cEnv {
         fn set(pairs: Vec<(&'static str, std::ffi::OsString)>) -> Self {
             let saved = pairs.iter().map(|(k, _)| (*k, std::env::var_os(k))).collect();
@@ -47337,7 +47440,6 @@ mod b360_tests {
         }
     }
 
-    #[cfg(unix)]
     impl Drop for R2cEnv {
         fn drop(&mut self) {
             for (k, v) in &self.0 {
@@ -47838,7 +47940,7 @@ mod b360_tests {
     fn p1_e_d7_retry_cap_reobservation_and_legacy_discriminator() {
         for mode in ["cap", "human_after_abort", "no_claim", "old_daemon"] {
             let pack = R2cPack::new(); let cwd = pack.dir.clone();
-            let mut attempts = 0; let mut cleared = false;
+            let mut attempts = 0; let mut reads = 0; let mut cleared = false;
             let daemon = R2cDaemon::start(move |method,p| match method {
                 "surface.cycle_claim" => r2c_ok(if mode=="no_claim" {json!({})} else {json!({"claim":"claimed"})}),
                 "surface.list" => r2c_ok(json!({"surfaces":[{
@@ -47848,10 +47950,11 @@ mod b360_tests {
                     "usage":{"source":"statusline","session_file":if cleared {"S2"} else {"S1"}}
                 }]})),
                 "surface.read_text" => {
+                    reads += 1;
                     let mut r = json!({"text":cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT,"quiet_secs":5.0});
                     if mode!="old_daemon" {r["composer"]=json!({
                         "verdict":"empty","governed":true,"modal":false,"owner":"none",
-                        "input_gen":2,"output_gen":4,"pending_bytes":0,
+                        "input_gen":reads,"output_gen":2*reads,"pending_bytes":0,
                         "human_bytes":if mode=="human_after_abort" && attempts>0 {1} else {0}
                     });}
                     r2c_ok(r)
@@ -47868,13 +47971,28 @@ mod b360_tests {
             let calls=daemon.calls();
             let clears:Vec<_>=calls.iter().filter(|(m,p)|m=="surface.send_text" && p["clear_first"]==true).collect();
             match mode {
-                "cap" => {assert_eq!(clears.len(),3,"D7 attempt cap: {err}");assert_eq!(rc,1,"D7 cap must return the refusal: {err}");assert!(err.contains("guard_aborted"));},
+                "cap" => {assert_eq!(clears.len(),3,"D7 attempt cap: {err}");assert_eq!(rc,EXIT_CYCLE_TARGET_BUSY,"D7 guard-only cap must retain automatic retry eligibility: {err}");assert!(err.contains("guard_aborted"));},
                 "human_after_abort" => {assert_eq!(clears.len(),1,"D7 reobserve human: {err}");assert_eq!(rc,EXIT_CYCLE_HUMAN_DRAFT);},
                 _ => {
                     assert_eq!(rc,0,"{mode}: {err}");assert_eq!(clears.len(),1);
                     assert!(clears[0].1.get("cycle_clear").is_none(),"D7 legacy discriminator {mode}");
                     assert!(clears[0].1.get("expect_output_gen").is_none(),"D7 legacy fence {mode}");
                 }
+            }
+            if mode == "cap" {
+                assert!(err.contains("[diag=guard_retry_exhausted]"), "new cause must be explicit: {err}");
+                let mut observed = 0; let mut sent = 0;
+                for (method, params) in &calls {
+                    if method == "surface.read_text" { observed += 1; }
+                    if method == "surface.send_text" && params["clear_first"] == true {
+                        assert!(observed > sent, "each cap attempt needs a new observation: {calls:?}");
+                        sent = observed;
+                        assert_eq!(params["expect_output_gen"], json!(2*observed));
+                        assert_eq!(params["expect_input_gen"], json!(observed));
+                    }
+                }
+                let first = calls.iter().position(|(m,p)| m=="surface.send_text" && p["clear_first"]==true).unwrap();
+                assert!(!calls[first..].iter().any(|(m,p)| m=="surface.send_key" || (m=="surface.send_text" && p["clear_first"]!=true)), "no keys/directive/RESUME after known-zero refusals: {calls:?}");
             }
             let want=if mode=="cap" || mode=="human_after_abort" {"not_cleared"} else {"cleared"};
             assert_eq!(r2c_quiesce_outcome(&calls).as_deref(),Some(want),"D7 every exit cleanup {mode}");
@@ -47891,7 +48009,6 @@ mod b360_tests {
     }
 
     /// The outcome the cycle handed the daemon's clear guard when it turned quiescing off.
-    #[cfg(unix)]
     fn r2c_quiesce_outcome(calls: &[(String, Value)]) -> Option<String> {
         calls
             .iter()
