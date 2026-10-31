@@ -564,6 +564,7 @@ impl Proof for LostForGood {
 fn s4_1_window_does_not_widen_under_repeated_no_progress_resumes() {
     let fx = fx("s4-1-widen");
     let s = seat(&fx);
+    s.inject_track.win_diag.enable();
     let proof = Arc::new(LostForGood { admits: AtomicUsize::new(0), rechecks: AtomicUsize::new(0), fail_at: 1 });
     *s.receiver_proof.lock().unwrap() = Some(proof.clone());
     enqueue(&fx, &s, &"a widening directive ".repeat(400));
@@ -595,9 +596,10 @@ fn s4_1_window_does_not_widen_under_repeated_no_progress_resumes() {
         };
         assert!(
             handed,
-            "attempt {k}: the resume was refused before hand-off (candidate cause: backlog D5W-20261028-DSR-REPLY-COUNTED-AS-FOREIGN-WRITE; operands follow) - hold-time {resume}, now input_gen {} inject_track.wrote {} ({what})",
+            "attempt {k}: the resume was refused before hand-off (candidate cause: backlog D5W-20261028-DSR-REPLY-COUNTED-AS-FOREIGN-WRITE; operands follow) - hold-time {resume}, now input_gen {} inject_track.wrote {} ({what}); diagnostic {}",
             s.input_gen.load(Ordering::Acquire),
-            s.inject_track.wrote()
+            s.inject_track.wrote(),
+            s.inject_track.win_diag.dump(),
         );
         let end = Instant::now() + Duration::from_secs(120);
         while !(proof.admits.load(Ordering::Acquire) == before + 1 && s.queue_hold.lock().unwrap().as_ref().is_some_and(|h| !h.resuming)) {
@@ -632,6 +634,31 @@ fn s4_1_window_does_not_widen_under_repeated_no_progress_resumes() {
     assert_eq!(proof.admits.load(Ordering::Acquire), before, "attempted after the window");
     assert_eq!(events(&fx, "queue.write_held").len(), 1, "one notice at expiry");
     assert!(events(&fx, "queue.delivered").is_empty());
+    // Negative: an actual extra raw write must be attributed and must still block resume.
+    let extra = seat(&fx);
+    extra.inject_track.win_diag.enable();
+    *extra.receiver_proof.lock().unwrap() = Some(Arc::new(LostForGood {
+        admits: AtomicUsize::new(0), rechecks: AtomicUsize::new(0), fail_at: 1,
+    }));
+    enqueue(&fx, &extra, &"a widening directive ".repeat(400));
+    assert!(hand_off(&fx, &extra));
+    let (at, baseline) = {
+        let h = extra.queue_hold.lock().unwrap();
+        (h.as_ref().unwrap().since + Duration::from_secs(4), extra.inject_track.wrote())
+    };
+    extra.write_tx.try_send(crate::state::WriteReq::Data(b"w56-extra".to_vec())).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while extra.inject_track.wrote() <= baseline { // wallclock: guard bounds an owned raw write; timeout is failure, never evidence
+        assert!(Instant::now() < deadline, "extra raw write did not finish: {}", extra.inject_track.win_diag.dump());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let _ = crate::governance::queue_write_hold_block_at(&fx.daemon, &extra, at);
+    let diag = extra.inject_track.win_diag.dump();
+    assert!(extra.queue_hold.lock().unwrap().as_ref().is_some_and(|h| h.attempts == 0 && !h.resuming), "foreign write was admitted: {diag}");
+    assert!(diag.contains("route=resume.foreign detail=(true,"), "foreign refusal missing: {diag}");
+    assert!(diag.contains("Data bytes=[119, 53, 54, 45, 101, 120, 116, 114, 97]"), "extra writer attribution missing: {diag}");
+    eprintln!("WIN-DIAG negative resume: {diag}");
+
 }
 
 /// ★S4-1 premises: an agent epoch move, a conversation epoch move (e.g. `/clear`), a foreign writer write, foreign input
@@ -1236,6 +1263,7 @@ fn wp17_r2_unknown_lower_layout_and_framed_hint_keep_fallback() {
             "fallback_unrecognized_hint"),
     ] {
         let s = seat(&fx);
+        s.inject_track.win_diag.enable();
         enqueue(&fx, &s, "/model opus");
         s.parser.lock().unwrap().process(paint.as_bytes());
         let recheck = crate::governance::ScreenRecheck {
@@ -1243,11 +1271,51 @@ fn wp17_r2_unknown_lower_layout_and_framed_hint_keep_fallback() {
             gen_at_verdict: s.output_gen.load(Ordering::Acquire), approval_pending: false,
         };
         let d = deliver_head_locked(&fx.daemon, &s, false, false, None, Some(0), None, Some(&recheck), None)
-            .expect("unknown layout/hint retains ordinary progress");
-        assert!(d.written_submitted());
+            .unwrap_or_else(|| panic!("unknown layout/hint retains ordinary progress: {}", s.inject_track.win_diag.dump()));
+        assert!(d.written_submitted(), "terminal diagnostic: {}", s.inject_track.win_diag.dump());
         assert_eq!(queue_len(&s), 0);
         assert!(wp17_has_admission_record(&fx, reason));
     }
+    // Negative controls exercise the route recorder through the real delivery function.
+    for route in ["pending_changed", "queue_empty", "head_changed", "handoff_gate_preledger", "handoff_gate_postledger"] {
+        let s = seat(&fx);
+        s.inject_track.win_diag.enable();
+        if route != "queue_empty" { enqueue(&fx, &s, "/model opus"); }
+        s.parser.lock().unwrap().process(b"\x1b[2J\x1b[H");
+        s.parser.lock().unwrap().process("❯ ".as_bytes());
+        let recheck = crate::governance::ScreenRecheck {
+            marker: Some(vec!["❯".into()]), placeholder: None,
+            gen_at_verdict: s.output_gen.load(Ordering::Acquire), approval_pending: false,
+        };
+        if route == "handoff_gate_postledger" {
+            let sc = s.clone();
+            crate::agent_write::set_test_after_pre_record(move |_| { sc.output_gen.fetch_or(1, Ordering::AcqRel); });
+        }
+        let got = deliver_head_locked(&fx.daemon, &s, false, false,
+            (route == "head_changed").then_some("not-the-head"),
+            Some(if route == "pending_changed" { u64::MAX } else { 0 }),
+            (route == "handoff_gate_preledger").then_some(u64::MAX), Some(&recheck), None);
+        let diag = s.inject_track.win_diag.dump();
+        assert!(got.is_none(), "negative {route} must refuse: {diag}");
+        assert!(diag.contains(&format!("route=queue.{route} ")), "wrong refusal for {route}: {diag}");
+        eprintln!("WIN-DIAG negative {route}: {diag}");
+    }
+
+    for route in ["output", "probe", "cancelled"] {
+        let output = Arc::new(std::sync::atomic::AtomicU64::new(2));
+        let guard = crate::state::InjectGuard::new(
+            Some(if route == "output" { 0 } else { 2 }), output, false,
+            Some(Arc::new(move || route == "probe")),
+        );
+        guard.win_diag.enable();
+        if route == "cancelled" { assert!(guard.abort_if_pending()); }
+        assert!(!guard.claim_for_write(), "negative writer {route} must refuse: {}", guard.win_diag.dump());
+        let diag = guard.win_diag.dump();
+        let expected = match route { "output" => "output_operand expected=0 observed=2", "probe" => "safety_probe result=true", _ => "writer_claim state_operand=2" };
+        assert!(diag.contains(expected), "wrong writer attribution {route}: {diag}");
+        eprintln!("WIN-DIAG negative writer {route}: {diag}");
+    }
+
 }
 
 /// Gemini R1 shape (b): the cursor is on a pasted marker row inside the editor, below
@@ -2970,4 +3038,58 @@ fn p1_completion_neutral_marker_write_error_stops_before_later_data() {
     crate::state::run_writer_loop_tracked(&mut writer, rx, Arc::new(std::sync::atomic::AtomicBool::new(false)), Some(track.clone()));
     assert_eq!(writer.calls, vec![b"failed marker".to_vec()], "barrier write error stops the writer before subsequent Data");
     assert_eq!(format!("{track:?}"), before, "failed marker also leaves InjectTrack untouched");
+}
+
+// Per-instance diagnostic storage: never shared between seats or concurrent specimens.
+#[derive(Debug, Default)]
+pub(crate) struct WinDiag(std::sync::Mutex<Option<Vec<String>>>);
+impl WinDiag {
+    pub(crate) fn enabled(&self) -> bool { self.0.lock().unwrap().is_some() }
+    pub(crate) fn enable(&self) { *self.0.lock().unwrap() = Some(Vec::new()); }
+    pub(crate) fn record(&self, value: impl FnOnce() -> String) {
+        let mut rows = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(rows) = rows.as_mut() {
+            if rows.len() < 128 { rows.push(value()); }
+            else if rows.len() == 128 { rows.push("TRUNCATED: diagnostic capacity reached".into()); }
+        }
+    }
+    pub(crate) fn dump(&self) -> String { format!("{:?}", *self.0.lock().unwrap_or_else(|e| e.into_inner())) }
+}
+pub(crate) fn win_diag(s: &Surface, route: &str, detail: impl std::fmt::Debug) {
+    s.inject_track.win_diag.record(|| format!(
+        "route={route} detail={detail:?} branch_sample(output={}, input={}, pending={}, wrote={}, block={:?})",
+        s.output_gen.load(Ordering::Acquire), s.input_gen.load(Ordering::Acquire),
+        s.pending_input_bytes.load(Ordering::Acquire), s.inject_track.wrote(),
+        *s.queue_blocked.lock().unwrap_or_else(|e| e.into_inner())));
+}
+
+// A test-only view of the SAME atomic loads in the receipt predicate. Deref keeps
+// all other Surface operations unchanged; this captures operands, not later reads.
+pub(crate) struct WinDiagAtomic<'a> {
+    atom: &'a std::sync::atomic::AtomicU64,
+    name: &'static str,
+    log: &'a WinDiag,
+}
+impl WinDiagAtomic<'_> {
+    pub(crate) fn load(&self, order: Ordering) -> u64 {
+        let value = self.atom.load(order);
+        self.log.record(|| format!("generation_operand {}={value}", self.name));
+        value
+    }
+}
+pub(crate) struct WinDiagSurface<'a> {
+    surface: &'a Arc<Surface>,
+    pub(crate) output_gen: WinDiagAtomic<'a>,
+    pub(crate) input_gen: WinDiagAtomic<'a>,
+}
+impl<'a> WinDiagSurface<'a> {
+    pub(crate) fn new(s: &'a Arc<Surface>) -> Self {
+        Self { surface: s,
+            output_gen: WinDiagAtomic { atom: &s.output_gen, name: "output_gen", log: &s.inject_track.win_diag },
+            input_gen: WinDiagAtomic { atom: &s.input_gen, name: "input_gen", log: &s.inject_track.win_diag } }
+    }
+}
+impl std::ops::Deref for WinDiagSurface<'_> {
+    type Target = Arc<Surface>;
+    fn deref(&self) -> &Arc<Surface> { self.surface }
 }

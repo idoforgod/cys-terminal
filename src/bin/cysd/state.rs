@@ -846,6 +846,10 @@ pub type SafetyProbe = Arc<dyn Fn() -> bool + Send + Sync>;
 /// 아니다. 본문·flush·400ms·CR 중 실패하면 writer 는 루프를 끊는다(PTY 닫힘 = 좌석 사망). 이는
 /// 종전(`try_send` 성공 = 배달)과 같은 계약이며 이 변경으로 나빠지지 않는다.
 pub struct InjectGuard {
+    #[cfg(test)]
+    pub(crate) win_diag: crate::agent_queue_tests::WinDiag,
+    #[cfg(test)]
+    win_diag_created: Instant,
     /// 판정이 본 출력 세대(짝수 = 발행 완료). `None` = 이 경로는 출력 세대 불변을 요구하지 않는다.
     pub expect_gen: Option<u64>,
     /// 그 surface 의 `output_gen`(공유 카운터).
@@ -969,6 +973,10 @@ impl InjectGuard {
             safety,
             state: AtomicU8::new(INJECT_PENDING),
             cancel_wake: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            win_diag: crate::agent_queue_tests::WinDiag::default(),
+            #[cfg(test)]
+            win_diag_created: Instant::now(),
         }
     }
 
@@ -1102,6 +1110,14 @@ impl InjectGuard {
     }
     /// 출력 세대가 판정 시점과 달라졌는가(락 없는 원자 읽기 — 호출부 대기 루프가 쓴다).
     fn output_moved(&self) -> bool {
+        #[cfg(test)]
+        if self.win_diag.enabled() {
+            return self.expect_gen.is_some_and(|expected| {
+                let observed = self.output_gen.load(Ordering::Acquire);
+                self.win_diag.record(|| format!("output_operand expected={expected} observed={observed}"));
+                observed != expected
+            });
+        }
         self.expect_gen.is_some_and(|g| self.output_gen.load(Ordering::Acquire) != g)
     }
     /// ★(0.14.31 · 성찰 Q1·Q2) **무거운 축** — 안전 탐침을 실제로 돌린다(pause · 승인·관문 ·
@@ -1114,6 +1130,8 @@ impl InjectGuard {
             // 탐침을 **항상** 부른다(단락 평가로 관측을 건너뛰면 계측이 사라진다).
             Some(p) => {
                 let now = p();
+                #[cfg(test)]
+                self.win_diag.record(|| format!("safety_probe result={now} expected_approval={}", self.expect_approval));
                 now || self.expect_approval
             }
             None => false,
@@ -1137,8 +1155,12 @@ impl InjectGuard {
     }
     /// writer 쪽 결판 — 반환 true = **내가 쓴다**.
     pub fn claim_for_write(&self) -> bool {
+        #[cfg(test)]
+        self.win_diag.record(|| format!("writer_claim enter age={:?} snapshot={:?}", self.win_diag_created.elapsed(), self.revalidation_snapshot()));
         loop {
             let raw = self.state.load(Ordering::Acquire);
+            #[cfg(test)]
+            self.win_diag.record(|| format!("writer_claim state_operand={raw}"));
             let Some((owner, phase)) = Self::decode_state(raw) else { return false };
             match phase {
                 INJECT_CLAIMED | INJECT_ACKED => return true,
@@ -1146,6 +1168,8 @@ impl InjectGuard {
                 _ => return false,
             }
             if self.output_moved() {
+                #[cfg(test)]
+                self.win_diag.record(|| format!("writer_claim output_moved raw={raw} snapshot={:?}", self.revalidation_snapshot()));
                 let aborted = owner | INJECT_ABORTED;
                 if self.state.compare_exchange(raw, aborted, Ordering::AcqRel, Ordering::Acquire).is_ok() {
                     self.wake_controller_after_abort(aborted);
@@ -1159,6 +1183,8 @@ impl InjectGuard {
             }
             // Cancellation may win while this predicate runs. A caller cannot acknowledge Claiming.
             if self.axes_moved() {
+                #[cfg(test)]
+                self.win_diag.record(|| format!("writer_claim axes_moved claiming={claiming} snapshot={:?}", self.revalidation_snapshot()));
                 let aborted = owner | INJECT_ABORTED;
                 if self.state.compare_exchange(claiming, aborted, Ordering::AcqRel, Ordering::Acquire).is_ok() {
                     self.wake_controller_after_abort(aborted);
@@ -1393,6 +1419,8 @@ pub struct ReturnTicket {
 /// 휘발(재기동·재생성 좌석은 빈 채로 출발 = 종전 동작). `handed_at` is leaf; `done_at` also spans nonblocking writer admission in `handoff_after_gap`.
 #[derive(Debug, Default)]
 pub struct InjectTrack {
+    #[cfg(test)]
+    pub(crate) win_diag: crate::agent_queue_tests::WinDiag,
     /// Inject arm 이 (선정리)·붙여넣기·cr_delay·CR 을 쓰는 중이다.
     active: AtomicBool,
     /// 마지막 Inject arm 이 끝난 단조 시각(성공·실패 무관 — 끝난 뒤에는 화면만 남는다).
@@ -7819,6 +7847,8 @@ impl Daemon {
                             bench_c.0.zip(bench_c.1).map(|(c0, c1)| c1.saturating_sub(c0)),
                         );
                         if let Some(resp) = dsr_resp {
+                            #[cfg(test)]
+                            surf.inject_track.win_diag.record(|| format!("DSR producer bytes={:?} input={} output={} wrote={}", resp.as_bytes(), surf.input_gen.load(Ordering::Acquire), surf.output_gen.load(Ordering::Acquire), surf.inject_track.wrote()));
                             // ★G5-④ 락 범위 검증 완료(W5-A 확정 결정의 선행 조건): 이 송신은
                             // 위 parser 락 블록이 닫힌 '뒤'다 — 유계 대기(250ms)가 블록하는 것은
                             // reader 스레드 자신뿐이며 read-screen/status/attach(parser 락
@@ -8429,6 +8459,16 @@ pub(crate) fn run_writer_loop_tracked<W: Write, R: Into<crate::writer_gate::Queu
         };
         // The lease spans every arm, flush and Agent terminal settlement, including early exits.
         let (req, _operation) = req.into().into_parts();
+        #[cfg(test)]
+        let win_diag_origin = track.as_ref().filter(|t| t.win_diag.enabled()).map(|_| match &req {
+            WriteReq::Data(bytes) => format!("Data bytes={bytes:?}"),
+            WriteReq::DataAfter { bytes, .. } => format!("DataAfter bytes={bytes:?}"),
+            WriteReq::Program(_) => "Program".into(),
+            WriteReq::SubmitAfterGap { .. } => "SubmitAfterGap".into(),
+            WriteReq::Inject { .. } => "Inject".into(),
+            WriteReq::Agent(job) => format!("Agent origin={} request={}", job.request.origin, job.request.id),
+            WriteReq::P1ReceiverBarrier(_) => "P1ReceiverBarrier".into(),
+        });
         let res = match req {
             #[cfg(test)]
             WriteReq::P1ReceiverBarrier(marker) => {
@@ -8556,6 +8596,8 @@ pub(crate) fn run_writer_loop_tracked<W: Write, R: Into<crate::writer_gate::Queu
                 };
                 if let (Some(t), true) = (&track, began) {
                     t.note_wrote();
+                    #[cfg(test)]
+                    t.win_diag.record(|| format!("write_count={} origin={win_diag_origin:?}", t.wrote()));
                     if !body_noted && job.note_body {
                         if let Some(body) = ex.accepted_body(&job.plan) {
                             t.note_body(&body, job.body_owner);
@@ -8578,6 +8620,8 @@ pub(crate) fn run_writer_loop_tracked<W: Write, R: Into<crate::writer_gate::Queu
         //   `continue` above without a byte): counted even when it failed, since a failed write may have put bytes.
         if let Some(t) = &track {
             t.note_wrote();
+            #[cfg(test)]
+            t.win_diag.record(|| format!("write_count={} origin={win_diag_origin:?} result={res:?}", t.wrote()));
         }
         if res.is_err() {
             break; // PTY 닫힘 — 이후 send는 disconnected로 호출자에 드러난다

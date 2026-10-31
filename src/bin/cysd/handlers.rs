@@ -7100,7 +7100,13 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
                         "expect_output_gen is odd: an unpublished frame's generation is not an observation",
                     ));
                 }
+                #[cfg(test)]
+                let surface = crate::agent_queue_tests::WinDiagSurface::new(&surface);
+                #[cfg(test)]
+                crate::agent_queue_tests::win_diag(&surface, "cycle.receipt_precheck", (out_gen, in_gen));
                 if surface.output_gen.load(Ordering::Acquire) != out_gen || surface.input_gen.load(Ordering::Acquire) != in_gen {
+                    #[cfg(test)]
+                    crate::agent_queue_tests::win_diag(&surface, "cycle.receipt_refused", (out_gen, in_gen));
                     return Reply::Single(guard_aborted_response(&id));
                 }
                 Some((out_gen, in_gen, admitted))
@@ -7496,6 +7502,8 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
             // ★(0.14.56 · P1 D5) The cycle clear's writer-side guard (`None` for every other direct job).
             let cycle_guard =
                 cycle_fence.map(|(out_gen, in_gen, admitted)| governance::cycle_clear_guard(daemon, &surface, out_gen, in_gen, admitted));
+            #[cfg(test)]
+            { if surface.inject_track.win_diag.enabled() { if let Some(g) = &cycle_guard { g.win_diag.enable(); } } }
             let mut direct_job = match agent_intent {
                 Some(intent) => {
                     let Ok(written) = String::from_utf8(written) else {
@@ -7685,6 +7693,8 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
                 // Ticket, echo window and `surface.input_injected` are the settlement's (after the terminal).
                 crate::agent_write::test_wait_settled(h);
                 // ★(B-360) `sent:true` only when the journal wrote the record (all agent intents of send_text).
+                #[cfg(test)]
+                crate::agent_queue_tests::win_diag(&surface, "cycle.writer_result", (h.status(), cycle_guard.as_ref().map(|g| (g.revalidation_snapshot(), g.win_diag.dump()))));
                 match journal_barrier_verdict(&id, h, sid) {
                     Ok(()) => {}
                     Err(BarrierReply::Refused(reply)) => return Reply::Single(reply),
@@ -33889,6 +33899,7 @@ mod p1_cycle_tests {
         let me = Some(std::process::id());
         // Seat A: screen axis.
         let a = painted(&f);
+        a.inject_track.win_diag.enable();
         own_claim(&f, &a);
         paint(&a, "residue body");
         a.inject_track.note_body("residue body", None);
@@ -33901,21 +33912,45 @@ mod p1_cycle_tests {
         assert!(why.contains("[draft_gate:screen_occupied]"), "a cycle clear over unproven text: ScreenOccupied ({why})");
         a.inject_track.note_body("residue body", None);
         let proven = clear(&f, me, &a, fence(&a, "machine_residue"));
-        assert_eq!(proven["result"]["sent"], json!(true), "proven machine residue + valid cycle clear passes draft_gate ({proven})");
+        assert_eq!(proven["result"]["sent"], json!(true), "proven machine residue + valid cycle clear passes draft_gate ({proven}) diagnostic {}", a.inject_track.win_diag.dump());
         // Seat B: our own paste is active.
         let b = painted(&f);
+        b.inject_track.win_diag.enable();
         own_claim(&f, &b);
         paint(&b, "our paste in flight");
         b.inject_track.begin();
         let drawn = clear(&f, me, &b, fence(&b, "idle"));
-        assert_eq!(drawn["error"]["code"], json!("own_paste_settling"), "own paste drawn on the line: own_paste_settling ({drawn})");
+        assert_eq!(drawn["error"]["code"], json!("own_paste_settling"), "own paste drawn on the line: own_paste_settling ({drawn}) diagnostic {}", b.inject_track.win_diag.dump());
         paint(&b, "");
         let empty = clear(&f, me, &b, fence(&b, "idle"));
-        assert_eq!(empty["error"]["code"], json!("own_paste_settling"), "own paste, empty line: own_paste_settling ({empty})");
+        assert_eq!(empty["error"]["code"], json!("own_paste_settling"), "own paste, empty line: own_paste_settling ({empty}) diagnostic {}", b.inject_track.win_diag.dump());
         assert!(!empty.to_string().contains("quiet_secs_unreported"), "a transient code, never the structural token");
         let plain_b = clear(&f, me, &b, json!({}));
         assert_eq!(plain_b["result"]["sent"], json!(true), "plain --clear-first during our own paste: today's path ({plain_b})");
         b.inject_track.end();
+        // Separate stale-receipt and writer-claim negatives; neither can satisfy the own-paste assertion above.
+        for stage in ["receipt_refused", "writer_result"] {
+            let c = painted(&f);
+            c.inject_track.win_diag.enable();
+            own_claim(&f, &c);
+            paint(&c, "");
+            let mut observed = fence(&c, "idle");
+            if stage == "receipt_refused" {
+                observed["expect_input_gen"] = json!(u64::MAX);
+            } else {
+                let cc = c.clone();
+                crate::agent_write::set_test_after_pre_record(move |_| { cc.input_gen.fetch_add(1, Ordering::AcqRel); });
+            }
+            let refusal = clear(&f, me, &c, observed);
+            let diag = c.inject_track.win_diag.dump();
+            assert_eq!(refusal["error"]["code"], json!("guard_aborted"), "{stage}: {refusal}; {diag}");
+            assert!(diag.contains(&format!("route=cycle.{stage} ")), "wrong refusal site {stage}: {diag}");
+            if stage == "writer_result" {
+                assert!(diag.contains("safety_probe result=true"), "writer refusal must be attributed to the probe: {diag}");
+            }
+            eprintln!("WIN-DIAG negative cycle {stage}: {diag}");
+            let _ = c.child.lock().unwrap().kill();
+        }
         let _ = a.child.lock().unwrap().kill();
         let _ = b.child.lock().unwrap().kill();
     }

@@ -7711,6 +7711,10 @@ fn cycle_clear_probe(
             let Some(s) = ws.upgrade() else {
                 return true;
             };
+            #[cfg(test)]
+            crate::agent_queue_tests::win_diag(&s, "cycle.writer_probe", expect_input_gen);
+            #[cfg(test)]
+            let s = crate::agent_queue_tests::WinDiagSurface::new(&s);
             if s.input_gen.load(Ordering::Acquire) != expect_input_gen
                 || s.pending_input.lock().unwrap_or_else(|e| e.into_inner()).human != 0
                 || s.inject_track.busy_within(std::time::Duration::from_millis(OWN_PASTE_SETTLE_MS))
@@ -10250,16 +10254,24 @@ fn handoff_gate_ok(
     //   운영자의 `cys pause` 가 완료되는 창이 그 두 지점에서 닫힌다. 축은 OR(데몬 ∨ 좌석)이고
     //   범위는 큐 주입이다(직접 send 는 종전대로 통과한다).
     if queue_injection_paused(daemon, s) {
+        #[cfg(test)]
+        { crate::agent_queue_tests::win_diag(s, "handoff.pause", (expect_output_gen, recheck.map(|r| r.gen_at_verdict))); }
         return false;
     }
     let now_gen = s.output_gen.load(Ordering::Acquire);
+    #[cfg(test)]
+    crate::agent_queue_tests::win_diag(s, "handoff.output_operand", (now_gen, expect_output_gen, recheck.map(|r| r.gen_at_verdict)));
     if now_gen % 2 == 1 {
+        #[cfg(test)]
+        { crate::agent_queue_tests::win_diag(s, "handoff.unpublished", (expect_output_gen, recheck.map(|r| r.gen_at_verdict))); }
         return false; // reader 가 청크를 반영하는 중 — 화면에 없는 바이트가 이미 도착해 있다
     }
     if let Some(gen) = expect_output_gen {
         // ★(0.14.31 · 리뷰 R5 · codex major) 정적(quiet) 기반 판정은 **그 프레임**이어야 한다.
         if now_gen != gen {
-            return false; // 판정이 본 프레임이 아니다(그 사이 출력이 흘렀다) — 정적 판정 무효
+            #[cfg(test)]
+        { crate::agent_queue_tests::win_diag(s, "handoff.output_mismatch", (expect_output_gen, recheck.map(|r| r.gen_at_verdict))); }
+        return false; // 판정이 본 프레임이 아니다(그 사이 출력이 흘렀다) — 정적 판정 무효
         }
     }
     // ★(0.14.31 · 리뷰 R2(R7회차) · codex major M4) 세대 불변을 **요구하지 않는** 경로(비-alt B1)의
@@ -10279,13 +10291,17 @@ fn handoff_gate_ok(
         //   판정 이후 승인이 떠도 `output_gen` 만 같으면 그대로 나갔다(승인 feed 는 화면 세대
         //   없이 바뀐다 — §8 "승인 대기 게이트는 어떤 경로에서도 면제되지 않는다").
         if approval_or_gate_pending(daemon, s.id) != rc.approval_pending {
-            return false; // 판정 이후 승인·관문 feed 가 바뀌었다 — 그 승인은 이 프레임의 것이 아니다
+            #[cfg(test)]
+        { crate::agent_queue_tests::win_diag(s, "handoff.approval_changed", (expect_output_gen, recheck.map(|r| r.gen_at_verdict))); }
+        return false; // 판정 이후 승인·관문 feed 가 바뀌었다 — 그 승인은 이 프레임의 것이 아니다
         }
         match rc.marker.as_deref() {
             Some(markers) if now_gen != rc.gen_at_verdict => {
                 let obs = observe_prompt(s, markers);
                 if !obs.frame_consistent() {
-                    return false; // 재평가 관측이 한 프레임의 사실이 아니다
+                    #[cfg(test)]
+        { crate::agent_queue_tests::win_diag(s, "handoff.inconsistent_frame", (expect_output_gen, recheck.map(|r| r.gen_at_verdict))); }
+        return false; // 재평가 관측이 한 프레임의 사실이 아니다
                 }
                 let again = prompt_gate_input_with_approval(
                     s,
@@ -10295,13 +10311,17 @@ fn handoff_gate_ok(
                     rc.approval_pending,
                 );
                 if matches!(prompt_gate_verdict(&again), PromptGate::Blocked(_)) {
-                    return false; // 지금 화면은 배달 자격이 없다 — 메시지 보존(다음 틱 재시도)
+                    #[cfg(test)]
+        { crate::agent_queue_tests::win_diag(s, "handoff.prompt_blocked", (expect_output_gen, recheck.map(|r| r.gen_at_verdict))); }
+        return false; // 지금 화면은 배달 자격이 없다 — 메시지 보존(다음 틱 재시도)
                 }
             }
             // 마커 없는 좌석: 순수 판정자가 없으므로 같은 안전 게이트를 인계 직전에 다시 돌린다.
             None => {
                 if no_marker_gate(daemon, s).is_some() {
-                    return false;
+                    #[cfg(test)]
+        { crate::agent_queue_tests::win_diag(s, "handoff.markerless", (expect_output_gen, recheck.map(|r| r.gen_at_verdict))); }
+        return false;
                 }
             }
             _ => {}
@@ -11194,6 +11214,15 @@ fn try_resume_partial_write(daemon: &Arc<Daemon>, s: &Arc<crate::state::Surface>
             || s.inject_track.wrote() != r.wrote
             || *s.last_human_input.lock().unwrap_or_else(|e| e.into_inner()) != r.stamp.human_at
     };
+    #[cfg(test)]
+    let foreign = || {
+        let input = s.input_gen.load(Ordering::Acquire);
+        let wrote = s.inject_track.wrote();
+        let human = *s.last_human_input.lock().unwrap_or_else(|e| e.into_inner());
+        let result = input != r.input_gen || wrote != r.wrote || human != r.stamp.human_at;
+        crate::agent_queue_tests::win_diag(s, "resume.foreign", (result, r.input_gen, input, r.wrote, wrote, r.stamp.human_at, human));
+        result
+    };
     if !r.stamp.epochs_hold(s) || foreign() {
         return false;
     }
@@ -11660,6 +11689,8 @@ pub(crate) fn deliver_head_locked(
 ) -> Option<QueueHandoff> {
     // Call-owned output: concurrent channel holds and force-deliver calls cannot attribute this tick.
     if let Some(reason) = hold_reason.as_deref_mut() { *reason = None; }
+    #[cfg(test)]
+    crate::agent_queue_tests::win_diag(s, "queue.entry", (expect_output_gen, recheck.map(|r| r.gen_at_verdict), expect_pending));
     let now = p1_queue_clock(now_epoch, |(epoch, _)| epoch);
     let default_ttl = crate::state::queue_ttl_default_secs();
     let base_min_interval = queue_min_interval_secs();
@@ -11703,11 +11734,15 @@ pub(crate) fn deliver_head_locked(
         //   안이라 창이 없다(배달 최소 간격 0 인 롤백 env 에서도 성립).
         if s.inject_reserved() || queue_write_admission_held(s, std::time::Instant::now()) {
             d9_nonwriter_hold(s, ClaimProducer::Queue);
+            #[cfg(test)]
+            { crate::agent_queue_tests::win_diag(s, "queue.reservation_or_write_hold", (expect_output_gen, recheck.map(|r| r.gen_at_verdict))); }
             break 'tx None;
         }
         if let Some(want) = expect_pending {
             if s.pending_input_bytes.load(Ordering::Relaxed) != want {
                 d9_nonwriter_hold(s, ClaimProducer::Queue);
+            #[cfg(test)]
+            { crate::agent_queue_tests::win_diag(s, "queue.pending_changed", (expect_output_gen, recheck.map(|r| r.gen_at_verdict))); }
             break 'tx None; // 판정 이후 입력줄이 바뀌었다 — 이번 틱은 보류(메시지 보존)
             }
         }
@@ -11734,6 +11769,8 @@ pub(crate) fn deliver_head_locked(
             if let Some(t) = *s.last_queue_delivery_at.lock().unwrap() {
                 if p1_queue_clock(Instant::now, |(_, mono)| mono).saturating_duration_since(t).as_secs() < min_interval {
                     d9_nonwriter_hold(s, ClaimProducer::Queue);
+            #[cfg(test)]
+            { crate::agent_queue_tests::win_diag(s, "queue.delivery_interval", (expect_output_gen, recheck.map(|r| r.gen_at_verdict))); }
             break 'tx None; // 배달 최소 간격 미달 — 다음 틱(권위 판정 · 임계영역 안)
                 }
             }
@@ -11741,14 +11778,20 @@ pub(crate) fn deliver_head_locked(
         // ① 판정 — 보류할 배달을 원장에 선기록하지 않기 위해 **머리를 집기 전에** 한 번(codex 리뷰).
         if !handoff_gate_ok(daemon, s, expect_output_gen, recheck) {
             d9_nonwriter_hold(s, ClaimProducer::Queue);
+            #[cfg(test)]
+            { crate::agent_queue_tests::win_diag(s, "queue.handoff_gate_preledger", (expect_output_gen, recheck.map(|r| r.gen_at_verdict))); }
             break 'tx None;
         }
         let Some(entry) = q.front().cloned() else {
             d9_nonwriter_hold(s, ClaimProducer::Queue);
+            #[cfg(test)]
+            { crate::agent_queue_tests::win_diag(s, "queue.queue_empty", (expect_output_gen, recheck.map(|r| r.gen_at_verdict))); }
             break 'tx None;
         };
         if expect_head_id.is_some_and(|want| want != entry.id) {
             d9_nonwriter_hold(s, ClaimProducer::Queue);
+            #[cfg(test)]
+            { crate::agent_queue_tests::win_diag(s, "queue.head_changed", (expect_output_gen, recheck.map(|r| r.gen_at_verdict))); }
             break 'tx None; // 조준 항목이 더는 머리가 아니다(경합) — 무부작용 반환
         }
         if crate::state::queue_entry_expired(&entry, now, default_ttl) {
@@ -11763,6 +11806,8 @@ pub(crate) fn deliver_head_locked(
             e.expired_at = Some(now);
             expired_head = Some(e);
             d9_nonwriter_hold(s, ClaimProducer::Queue);
+            #[cfg(test)]
+            { crate::agent_queue_tests::win_diag(s, "queue.expired", (expect_output_gen, recheck.map(|r| r.gen_at_verdict))); }
             break 'tx None;
         }
         // Old daemons persisted bare Return entries. In D9 scope they can never
@@ -11770,7 +11815,9 @@ pub(crate) fn deliver_head_locked(
         if d9_claim.is_some() {
             if let Some(entry) = q.front().filter(|e| e.origin == "send-key" && e.text.is_empty()) {
                 obsolete_key_head = Some(entry.clone());
-                break 'tx None;
+                #[cfg(test)]
+            { crate::agent_queue_tests::win_diag(s, "queue.obsolete_return", (expect_output_gen, recheck.map(|r| r.gen_at_verdict))); }
+            break 'tx None;
             }
         }
         // ★B1(0.14.30) C3: 같은 발신자 대기분을 **한 턴으로** 병합한다(버스트 봉인).
@@ -11782,12 +11829,16 @@ pub(crate) fn deliver_head_locked(
                 recheck.and_then(|r| r.marker.as_deref()),
                 recheck.and_then(|r| r.placeholder.as_deref())) {
                 Ok(reason) => Some(reason),
-                Err(why) => { mark_queue_blocked(s, why); break 'tx None; }
+                Err(why) => { mark_queue_blocked(s, why); #[cfg(test)]
+            { crate::agent_queue_tests::win_diag(s, "queue.slash_preledger", (expect_output_gen, recheck.map(|r| r.gen_at_verdict))); }
+            break 'tx None; }
             }
         } else { None };
         if d9_claim.is_some() && d9_writer_busy(daemon, s, ClaimProducer::Queue, &entry.id, false) {
             if let Some(reason) = hold_reason.as_deref_mut() { *reason = Some(BLOCKED_WRITER_ACTIVE); }
             mark_queue_blocked(s, BLOCKED_WRITER_ACTIVE);
+            #[cfg(test)]
+            { crate::agent_queue_tests::win_diag(s, "queue.d9_busy_preledger", (expect_output_gen, recheck.map(|r| r.gen_at_verdict))); }
             break 'tx None;
         }
         let merge_on = !forced && expect_head_id.is_none();
@@ -11873,6 +11924,8 @@ pub(crate) fn deliver_head_locked(
         //   없다(리뷰 R2 · codex: 종전 주석의 "두 호출 사이 I/O 0" 은 사실오류였다 — ①과 ② 사이에는
         //   `record_audited_with` 의 원장 append·회전이 있고, 그것이 바로 ②를 넣은 이유다).
         if !handoff_gate_ok(daemon, s, expect_output_gen, recheck) {
+            #[cfg(test)]
+            { crate::agent_queue_tests::win_diag(s, "queue.handoff_gate_postledger", (expect_output_gen, recheck.map(|r| r.gen_at_verdict))); }
             break 'tx None;
         }
         if slash_command {
@@ -11880,7 +11933,9 @@ pub(crate) fn deliver_head_locked(
                 recheck.and_then(|r| r.marker.as_deref()),
                 recheck.and_then(|r| r.placeholder.as_deref())) {
                 mark_queue_blocked(s, why);
-                break 'tx None;
+                #[cfg(test)]
+            { crate::agent_queue_tests::win_diag(s, "queue.slash_postledger", (expect_output_gen, recheck.map(|r| r.gen_at_verdict))); }
+            break 'tx None;
             }
         }
         // ★(0.14.31 · triage 2026-09-08 · codex blocking) 마지막 게이트 **뒤에** 승인이 생겼으면
@@ -11888,6 +11943,8 @@ pub(crate) fn deliver_head_locked(
         //   `expect_approval` 이 되어 승인이 계속 대기 중이어도 축이 면제됐다(§8 위반). 지금은
         //   **배달 자체를 하지 않는다**: 항목은 큐에 그대로 남고 다음 틱이 다시 판정한다(§3-3 보류).
         if approval_or_gate_pending(daemon, s.id) {
+            #[cfg(test)]
+            { crate::agent_queue_tests::win_diag(s, "queue.approval_pending", (expect_output_gen, recheck.map(|r| r.gen_at_verdict))); }
             break 'tx None;
         }
         // 가드의 기대값은 **언제나 false**(= "승인 대기는 무조건 거부")다. 이 상수는 축을 끄는
@@ -12015,6 +12072,8 @@ pub(crate) fn deliver_head_locked(
         if let (Some(c), Some((gen, wrote, human_at))) = (&d9_claim, d9_s0) {
             let _ = c.base.set((gen + 1, wrote, human_at));
         }
+        #[cfg(test)]
+        { if s.inject_track.win_diag.enabled() { if let Some(g) = &guard { g.win_diag.enable(); } } }
         let job = crate::agent_write::AgentJob {
             attempt: None,
             request,
@@ -12042,6 +12101,8 @@ pub(crate) fn deliver_head_locked(
             if *t == set_delivery_at {
                 *t = prev_delivery_at;
             }
+            #[cfg(test)]
+            { crate::agent_queue_tests::win_diag(s, "queue.writer_busy_or_channel_send", (expect_output_gen, recheck.map(|r| r.gen_at_verdict))); }
             break 'tx None;
         }
         inflight = Some(f);
@@ -12119,6 +12180,8 @@ pub(crate) fn deliver_head_locked(
             let t0 = std::time::Instant::now();
             guard_outcome = g.settle_handoff(wait);
             spend_tick_settle_budget(t0.elapsed());
+            #[cfg(test)]
+            crate::agent_queue_tests::win_diag(s, "queue.settle_handoff", (guard_outcome, t0.elapsed(), g.revalidation_snapshot(), g.win_diag.dump()));
             match guard_outcome {
                 crate::state::InjectHandoff::CallerAborted => {
                     // 예약 해제는 롤백 **안**에서 표식 되돌림과 같은 임계영역에 있다(triage codex 보완).
@@ -27477,25 +27540,58 @@ mod tests {
         //   in flight keeps the reader from writing `exited` while the test reaps the child itself and
         //   reads the verdict.
         let gate=park_reader(&s);
-        s.child.lock().unwrap().kill().expect("owned fixture stop");
+        // Retain BEFORE stopping: on Windows Retained owns the process handle and reads its
+        // creation time through that same handle. Its recheck polls that object with
+        // WaitForSingleObject, not a fresh PID lookup. Unix retains the birth observation.
+        let retained=cys::process_observation::Retained::open(s.pid)
+            .unwrap_or_else(|e|panic!("p7 retain owned fixture pid {} before stop: {e:?}",s.pid));
+        let identity=retained.observation().identity.clone();
+        let witness=format!("pid={} birth={}.{:06} retained_windows_handle={} identity={identity:?}",
+            s.pid,identity.birth_seconds,identity.birth_microseconds,cfg!(windows));
+        assert_eq!(retained.recheck(),Ok(()),"p7 retained fixture must be live before stop: {witness}");
+        let stop_at=Instant::now();
+        let stop_bound=Duration::from_secs(30);
+        s.child.lock().unwrap().kill().unwrap_or_else(|e|panic!("owned fixture stop: {e}; {witness}"));
         // ★(0.14.56 SLEEP-BASH-HANG) Bounded: the plain `wait()` that stood here waited forever under SHELL=/bin/bash
         //   (the killed child could not finish exiting while output sat unread behind the parked reader; see
         //   `park_reader`). A child that is not reaped now fails here, by name, instead of hanging the suite.
-        reap_owned_child_within(&s,Duration::from_secs(30)).unwrap_or_else(|e|panic!("owned fixture reap: {e}"));
-        assert!(!crate::state::pid_alive(s.pid),"fixture child not reaped");
+        reap_owned_child_within(&s,stop_bound.saturating_sub(stop_at.elapsed()))
+            .unwrap_or_else(|e|panic!("owned fixture reap: {e}; {witness}; retained={:?}",retained.recheck()));
+        // The reap adapter's Some(exit) is not the retained native object's signal. Wait for
+        // that signal inside the SAME 30 s stop budget; unknown/changed is never called death.
+        let retained_exit=loop { // wallclock: guard bounds retained fixture exit within the existing 30 s stop budget
+            let reading=retained.recheck();
+            match &reading {
+                Err(cys::process_observation::Failure::Dead)=>break reading,
+                Ok(())=>{},
+                _=>panic!("p7 retained exit is not proven: {reading:?}; elapsed={:?}; {witness}",stop_at.elapsed()),
+            }
+            assert!(stop_at.elapsed()<stop_bound, // wallclock: guard bounds retained fixture exit; never a death premise
+                "p7 retained fixture handle not signaled within 30 s: {reading:?}; {witness}");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let pid_alive=crate::state::pid_alive(s.pid);
+        assert!(!pid_alive,"fixture child not reaped: pid_alive={pid_alive} retained_exit={retained_exit:?} elapsed={:?}; {witness}",stop_at.elapsed());
         struct RestoreExit(Arc<crate::state::Surface>);
         impl Drop for RestoreExit {fn drop(&mut self){self.0.exited.store(true,AtomicOrdering::Relaxed);}}
         let restore=RestoreExit(s.clone());
         s.exited.store(false,AtomicOrdering::Relaxed);
         *s.agent_status.lock().unwrap()=Some(crate::state::AgentStatus{updated_at:now_epoch(),..fresh});
-        for _ in 0..3 {check_role_deadman(&daemon,&mut tracker);}
+        let mut decisions=Vec::new();
+        for _ in 0..3 {
+            super::check_role_deadman_at(&daemon,&mut tracker,now_epoch(),Instant::now(),
+                |role,verdict,epoch,elapsed,debounce_secs,due,alive,exited|
+                    decisions.push(format!("role={role} verdict={verdict} epoch={epoch:?} elapsed={elapsed:?} debounce_secs={debounce_secs} due={due:?} alive={alive:?} exited={exited:?}")));
+        }
         // Exact witness: the reader (true only) is parked, the test's own store was false, RestoreExit
         // runs later — so `false` here proves every tick above read `exited == false`.
-        assert!(!s.exited.load(AtomicOrdering::Relaxed),"the reader wrote `exited` inside the verdict window");
+        assert!(!s.exited.load(AtomicOrdering::Relaxed),"the reader wrote `exited` inside the verdict window; {witness}; decisions={decisions:?}");
         drop(gate);
         drop(restore);
-        let events=events_named(&daemon,"master.deadman");assert_eq!(events.len(),1);
-        assert_eq!(events[0]["payload"]["axis"],"shell_proc_dead");
+        let events=events_named(&daemon,"master.deadman");
+        assert_eq!(events.len(),1,"{witness}; retained_exit={retained_exit:?}; decisions={decisions:?}; events={events:?}");
+        assert_eq!(events[0]["payload"]["axis"],"shell_proc_dead","{witness}; decisions={decisions:?}");
+        eprintln!("WIN-DIAG p7: {witness}; retained_exit={retained_exit:?}; decisions={decisions:?}");
     }
 
     #[test]
