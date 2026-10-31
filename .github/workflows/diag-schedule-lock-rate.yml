@@ -15,50 +15,1044 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arm: [baseline, instrumented]
+        arm:
+        - baseline
+        - instrumented
     env:
       PYTHONUTF8: '1'
     steps:
-      - uses: actions/checkout@v4
-        timeout-minutes: 5
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - uses: actions/setup-python@v5
-        timeout-minutes: 5
-        with:
-          python-version: '3.12'
-      - name: ISOLATED CONTROL — 300 exact processes; 0/300 does not exonerate suite red
-        id: measure
-        timeout-minutes: 60
-        continue-on-error: true
-        shell: pwsh
-        run: |
-          python scripts/diag/schedule_lock_rate.py --arm '${{ matrix.arm }}' --out "$env:RUNNER_TEMP/schedule-rate-${{ matrix.arm }}"
-          exit $LASTEXITCODE
-      - name: Return raw evidence even when collection is incomplete
-        if: always()
-        uses: actions/upload-artifact@v4
-        timeout-minutes: 5
-        with:
-          name: schedule-lock-isolated-CONTROL-${{ github.sha }}-${{ matrix.arm }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/schedule-rate-${{ matrix.arm }}/manifest.json
-            ${{ runner.temp }}/schedule-rate-${{ matrix.arm }}/summary.json
-            ${{ runner.temp }}/schedule-rate-${{ matrix.arm }}/build.json
-            ${{ runner.temp }}/schedule-rate-${{ matrix.arm }}/build.log
-            ${{ runner.temp }}/schedule-rate-${{ matrix.arm }}/test-list.log
-            ${{ runner.temp }}/schedule-rate-${{ matrix.arm }}/iterations-started.jsonl
-            ${{ runner.temp }}/schedule-rate-${{ matrix.arm }}/iterations.jsonl
-            ${{ runner.temp }}/schedule-rate-${{ matrix.arm }}/iteration-*.log
-            ${{ runner.temp }}/schedule-rate-${{ matrix.arm }}/*.kill.json
-          if-no-files-found: error
-          retention-days: 30
-      - name: Keep collection status and inner failures separate
-        if: always()
-        shell: pwsh
-        run: |
-          if ('${{ steps.measure.outcome }}' -ne 'success') { throw 'Rate/diagnostic collection incomplete; read both axes in uploaded evidence.' }
-          $summary = Get-Content "$env:RUNNER_TEMP/schedule-rate-${{ matrix.arm }}/summary.json" -Raw | ConvertFrom-Json
-          if (-not $summary.complete_classified_sample) { throw 'Incomplete sample; no rate verdict.' }
-          if ($summary.counts.fail -gt 0) { throw 'Measured inner failures remain. This is not a release pass.' }
+    - name: Collection-window admission (no queue cancellation)
+      id: window
+      timeout-minutes: 1
+      shell: pwsh
+      run: |
+        $now = [DateTimeOffset]::UtcNow
+        $cutoff = [DateTimeOffset]::Parse('2026-10-31T19:00:00Z')
+        $allowed = $now -lt $cutoff
+        "open=$($allowed.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+        $path = Join-Path $env:RUNNER_TEMP 'isolated-window-${{ matrix.arm }}.json'
+        New-Item -ItemType Directory -Force (Split-Path $path) | Out-Null
+        @{ allowed=$allowed; observed_utc=$now.ToString('o'); start_before_utc=$cutoff.ToString('o'); workflow_sha=$env:GITHUB_SHA; run_id=$env:GITHUB_RUN_ID; attempt=$env:GITHUB_RUN_ATTEMPT; note='Late queued jobs are not cancelled or rerun; no measurements begin after this cutoff.' } | ConvertTo-Json | Set-Content -Encoding utf8 $path
+        if (-not $allowed) { Write-Host 'WINDOW CLOSED: collection is incomplete, not a zero-failure result.' }
+    - uses: actions/checkout@v4
+      timeout-minutes: 5
+      with:
+        fetch-depth: 0
+        persist-credentials: false
+      if: steps.window.outputs.open == 'true'
+    - uses: actions/setup-python@v5
+      timeout-minutes: 5
+      with:
+        python-version: '3.12'
+      if: steps.window.outputs.open == 'true'
+    - name: ISOLATED CONTROL — 300 exact processes; 0/300 does not exonerate suite red
+      id: measure
+      timeout-minutes: 60
+      continue-on-error: true
+      shell: pwsh
+      run: |
+        python scripts/diag/schedule_lock_rate.py --arm '${{ matrix.arm }}' --out "$env:RUNNER_TEMP/schedule-rate-${{ matrix.arm }}"
+        exit $LASTEXITCODE
+      if: steps.window.outputs.open == 'true'
+    - name: Return raw evidence even when collection is incomplete
+      if: always()
+      uses: actions/upload-artifact@v4
+      timeout-minutes: 5
+      with:
+        name: schedule-lock-isolated-CONTROL-${{ github.sha }}-${{ matrix.arm }}-${{ github.run_id }}-${{ github.run_attempt
+          }}
+        path: |
+          ${{ runner.temp }}/schedule-rate-${{ matrix.arm }}/manifest.json
+          ${{ runner.temp }}/schedule-rate-${{ matrix.arm }}/summary.json
+          ${{ runner.temp }}/schedule-rate-${{ matrix.arm }}/build.json
+          ${{ runner.temp }}/schedule-rate-${{ matrix.arm }}/build.log
+          ${{ runner.temp }}/schedule-rate-${{ matrix.arm }}/test-list.log
+          ${{ runner.temp }}/schedule-rate-${{ matrix.arm }}/iterations-started.jsonl
+          ${{ runner.temp }}/schedule-rate-${{ matrix.arm }}/iterations.jsonl
+          ${{ runner.temp }}/schedule-rate-${{ matrix.arm }}/iteration-*.log
+          ${{ runner.temp }}/schedule-rate-${{ matrix.arm }}/*.kill.json
+
+          ${{ runner.temp }}/isolated-window-${{ matrix.arm }}.json
+        if-no-files-found: error
+        retention-days: 30
+    - name: Keep collection status and inner failures separate
+      if: always()
+      shell: pwsh
+      run: |
+        if ('${{ steps.window.outputs.open }}' -ne 'true') { throw 'Window closed; no isolated measurements.' }
+        if ('${{ steps.measure.outcome }}' -ne 'success') { throw 'Rate/diagnostic collection incomplete; read both axes in uploaded evidence.' }
+        $summary = Get-Content "$env:RUNNER_TEMP/schedule-rate-${{ matrix.arm }}/summary.json" -Raw | ConvertFrom-Json
+        if (-not $summary.complete_classified_sample) { throw 'Incomplete sample; no rate verdict.' }
+        if ($summary.counts.fail -gt 0) { throw 'Measured inner failures remain. This is not a release pass.' }
+  suite_regime:
+    name: suite-regime (shard ${{ matrix.shard }}, two full suites)
+    runs-on: windows-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix:
+        shard:
+        - 1
+        - 2
+        - 3
+        - 4
+        - 5
+        - 6
+        - 7
+        - 8
+        - 9
+        - 10
+    env:
+      PYTHONUTF8: '1'
+    steps:
+    - name: Collection-window admission (no queue cancellation)
+      id: window
+      timeout-minutes: 1
+      shell: pwsh
+      run: |
+        $now = [DateTimeOffset]::UtcNow
+        $cutoff = [DateTimeOffset]::Parse('2026-10-31T19:00:00Z')
+        $allowed = $now -lt $cutoff
+        "open=$($allowed.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+        $path = Join-Path $env:RUNNER_TEMP 'schedule-suite-${{ matrix.shard }}/window.json'
+        New-Item -ItemType Directory -Force (Split-Path $path) | Out-Null
+        @{ allowed=$allowed; observed_utc=$now.ToString('o'); start_before_utc=$cutoff.ToString('o'); workflow_sha=$env:GITHUB_SHA; run_id=$env:GITHUB_RUN_ID; attempt=$env:GITHUB_RUN_ATTEMPT; note='Late queued jobs are not cancelled or rerun; no measurements begin after this cutoff.' } | ConvertTo-Json | Set-Content -Encoding utf8 $path
+        if (-not $allowed) { Write-Host 'WINDOW CLOSED: collection is incomplete, not a zero-failure result.' }
+    - name: Fetch the pinned observer protocol
+      uses: actions/checkout@v4
+      timeout-minutes: 2
+      if: steps.window.outputs.open == 'true'
+      with:
+        ref: ${{ github.sha }}
+        fetch-depth: 1
+        persist-credentials: false
+    - name: Keep observer outside the measured checkout
+      id: observer_copy
+      timeout-minutes: 1
+      if: steps.window.outputs.open == 'true'
+      shell: pwsh
+      run: |
+        $observer = Join-Path $env:RUNNER_TEMP 'schedule-suite-observer'
+        New-Item -ItemType Directory -Force $observer | Out-Null
+        Copy-Item scripts/diag/schedule_suite_rate.py,scripts/diag/schedule_lock_rate.py -Destination $observer
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        ref: 0b25c51158270804911bca82f23dc7f7ed066590
+      timeout-minutes: 2
+      if: steps.window.outputs.open == 'true'
+    - name: Setup Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+      timeout-minutes: 3
+      if: steps.window.outputs.open == 'true'
+    - name: 실기 환경 확인 (python · bash · 경로 규약)
+      shell: bash
+      run: |
+        set -euo pipefail
+        python -c "import sys,os;print('python',sys.version.split()[0],'os.name',os.name)"
+        bash --version | head -1
+        echo "OSTYPE=${OSTYPE:-?} · which bash=$(command -v bash)"
+      timeout-minutes: 1
+      if: steps.window.outputs.open == 'true'
+    - name: 부트스트랩 건강성 — H-WIN 검체 실기 (windows-latest)
+      id: bootstrap_health
+      continue-on-error: true
+      timeout-minutes: 20
+      shell: bash
+      run: |
+        set -euo pipefail
+        BH_DIR="${RUNNER_TEMP:-/tmp}/bootstrap-health"
+        rm -rf "$BH_DIR"; mkdir -p "$BH_DIR"
+        R="cysjavis-pack/bin/tests/run_bootstrap_health.py"
+        [ -f "$R" ] || { echo "건강성 러너 누락: $R (git add 누락 의심)" >&2; exit 1; }
+        # 플랫폼 검체 목록의 단일 출처(이 한 줄). H-WIN-11 은 잡 계약 자기검증 + 실기 재실행.
+        # H-MISSION-1(기계유래 스폰 게이트 §4-10)은 Windows 실기 편입(2026-08-10 P3C) — git
+        # 계측 대조(D4A_REF·pre-t1)는 shallow checkout 에서 graceful skip(no-git) 검증됨.
+        # H-WIN-12(SYS32-TIMEOUT · 2026-08-13): System32 timeout.exe 함정에서 save-state.sh
+        # BOOT_SNAPSHOT 생성 경로가 실행됨을 Windows 실기로 증명 — cys_timeout_run GNU 판별 수리의 검체.
+        # ★H-IDENT-1 동승(2026-08-16): claim 신원 실패 ⇄ 정당거부 분리 3겹. 이 결함은 조상 체인
+        #   단절이 원인이라 **Windows 에서 더 자주** 발현한다(git-bash 한 겹 + 고아 프로세스의
+        #   부모 pid 소멸). 검체 자체는 소스 구조 판정이라 플랫폼 무관이지만, Windows 러너가
+        #   빌드하는 그 트리에 3겹이 실제로 실려 있는지를 이 레인에서도 확증한다.
+        # ★H-CYCLE-1 동승(2026-08-20 R3): cycle-autopilot Windows single-flight 개통 —
+        #   count_cycle_agent os_name 분기표(nt=PowerShell CIM fail-closed) · pid_alive
+        #   비파괴(OpenProcess 계열 · os.kill 0회) · self-test os.fork 케이스 한정 SKIP.
+        #   판정은 주입식(전 플랫폼 결정론)이지만 Windows 실기 트리에 실려 있음을 이 레인이 확증한다.
+        # ★H-PACK-CRLF 편입(2026-08-23 U-1): CRLF 결함은 **Windows 체크아웃에서만 발현**한다
+        #   (Git for Windows 설치 기본값 core.autocrlf=true). 다른 OS 에서 아무리 초록이어도
+        #   그것은 결함이 존재할 수 없는 환경에서의 초록이라 증거가치가 0이다 — 정확히
+        #   이 파일 머리말이 말하는 "돌지 않는 초록". `.gitattributes` 봉인이 Windows 러너의
+        #   실제 체크아웃 바이트를 LF 로 만드는지는 이 레인만이 실측할 수 있다.
+        # ★H-WIN-13·H-WIN-14 편입(2026-09-23 · 0.14.41 U7·U13 · WP-C1): 폴더 신뢰 키는 Claude 가 **슬래시 표기**만
+        #   읽는데 cys 의 Windows 분기(nt)는 역슬래시였다 — trust 검체가 이 레인에 0건이라 그 분기가 실기에서
+        #   한 번도 돈 적이 없던 것이 잠복 원인이다(반박 M7). H-WIN-14 는 SessionStart 복원 신호의 역할 분기
+        #   (팀원 중립·부서장 작업기억 비주입)를 Git Bash 실기로 잰다(POSIX 전용 스위트가 닿지 않는 자리).
+        # ★H-WIN-15 편입(2026-09-23 · 0.14.41 U11 · WP-C2, 통합 시 H-WIN-13→H-WIN-15 재번호 —
+        #   WP-C1 이 먼저 병합돼 H-WIN-13 을 선점했다): ④′ 부하 재확인 루프(30초 간격·최대 3분)가
+        #   Windows 에서 **구조적으로 켜지지 않음**을 실기에서 확인한다 — 호스트 판정 가드가 실제로
+        #   물리는지와, 실제 게이트 형상(measure_errors·fleet_cpu_reason)을 detail 에 박제한다.
+        # ★H-CLT-2 편입(2026-09-23 · 0.14.41 WP-C3 · U15): 개발자 도구(CLT) 없는 맥의 셔임 회피 논리가 공유
+        #   훅 `_lib.sh` 에 들어갔다. 새 논리는 전부 `case $OSTYPE in darwin*` 안이라는 것 — Git Bash 실기에서
+        #   CYS_PY 해소값이 종전 규칙(PATH 첫 python3→python→py)과 같고 셔임 분류·폴백 제거 조건이 거짓임 —
+        #   을 이 레인만 실측할 수 있다(맥 러너의 msys 모의는 OSTYPE 주입일 뿐 플랫폼 증명이 아니다).
+        # ★H-WIN-16 편입(2026-09-23 · 0.14.41 U5 "1분마다 검은 창" · WP-B3, 통합 시 H-WIN-13→H-WIN-16
+        #   재번호 — H-WIN-13/14/15 가 이미 선점됨): 1분 builtin 잡 사슬(cycle-autopilot tick)의 캡처
+        #   호출에 CREATE_NO_WINDOW 를 걸었다. 그 대가로 **윈도우 실기에서** 실스폰 tick 이 gate-check
+        #   rc=0 으로 kill-switch 를 통과하고 status 파싱까지 가는지(② 무clear 방지) · stdin 왕복 · verifier
+        #   (pane 거주) 무 NOWIN 을 잰다. NOWIN 이 실제로 걸리는 플랫폼은 여기뿐이다(맥은 비-NOWIN 대조).
+        # ★H-WIN-17 편입(0.14.50 B-057): soul L0 블록(제목 전수+포인터 · 0제목 경보 · CRLF soul 의 CR 제거)을 Git Bash
+        #   실기로 잰다 — POSIX 전용 test_inject_context_soul_l0 이 닿지 않는 자리. 포인터의 Windows 경로 형상은 기록만 한다.
+        # ★H-WIN-18 편입(0.14.56 #2): report_gate 스탬프 — Windows 에서 time.strftime('%z') 가 실제로 무엇을 내는지 기록·판정하고,
+        #   _parse_iso_epoch(_now_iso()) 왕복(±2s)과 타 오프셋 스탬프(-0700·+0900)의 정답을 잰다. 오프셋 회귀 검체
+        #   (test_report_gate) 는 Windows 레인이 돌리지 않는다. %z 가 시간대 **이름**을 내면 이 검체가 붉고, 그것은 쓰는 쪽의
+        #   별개 결함이다(부서장 결정: 쓰는 쪽을 고치기 전에 보고).
+        WIN_SPECIMENS="H-WIN-1,H-WIN-2,H-WIN-3,H-WIN-4,H-WIN-5,H-WIN-6,H-WIN-7,H-WIN-8,H-WIN-9,H-WIN-10,H-WIN-11,H-WIN-12,H-WIN-13,H-WIN-14,H-WIN-15,H-WIN-16,H-WIN-17,H-WIN-18,H-CONC-1,H-CONC-3,H-DETECT-10,H-MISSION-1,H-IDENT-1,H-CYCLE-1,H-PACK-CRLF,H-CLT-2"
+        echo "== H-WIN 실기: $WIN_SPECIMENS =="
+        # ★단일 실행 + rc 포획으로 교체(2026-09-04 실사고). 종전엔 bare 실행이 먼저 돌아
+        #   `set -euo pipefail` 아래에서 스텝을 **즉사**시켰고, 검체별 사유를 찍는 아래 블록은
+        #   정작 실패했을 때만 실행되지 않았다 — 진단이 필요 없을 때만 진단이 도는 구조다.
+        #   실측: 8d03bf4 런(33874334807)의 annotation 은 "exit code 1" 한 줄이 전부였다.
+        #   더구나 전 검체를 두 번 돌려 간헐 검체(H-CONC-3 등)는 두 판정이 갈릴 수 있었다.
+        #   ci-branch 가 이미 쓰는 검증된 형식(`--json > 파일 || rc=$?` → 판독 블록)으로 맞춘다.
+        rc=0
+        python "$R" --only "$WIN_SPECIMENS" --json > win-health.json || rc=$?
+        vrc=0
+        python - "$rc" "$BH_DIR" <<'PY' || vrc=$?
+        # B-344 step-5 reader (DESIGN-v4 s5): a positive green rule with counts derived from the rows, the H-WIN-11 child's
+        #   capture in a log group (stop-commands, 16 KiB per stream incl. notices), one annotation per category, and the
+        #   category marker written atomically. Exits 0 only when every green condition is shown.
+        import json
+        import os
+        import re
+        import secrets
+        import sys
+
+        TAG = {"PRODUCT": "[PRODUCT 제품 결함]", "HARNESS": "[HARNESS 계측 결함 · 무측정]"}
+        KINDS = {"fail": "PRODUCT", "crash": "HARNESS", "unimplemented": "HARNESS"}
+        STATUSES = ("pass", "fail", "skip", "disabled", "pending")     # the producer's summary counts (main()'s counted lists)
+        LOG_STREAM_MAX = 16 * 1024            # accepted (head decision 1): ALL bytes printed for one stream, notices included
+        ALT_VIEWS_MAX = 2                     # code-page views printed per stream (the model makes at most 2)
+        LINE_MAX = 1024                       # header / view-header lines are clipped to this many UTF-8 bytes
+        ANN_MAX = 600
+        ROW_ANN_CAP = 9                       # error annotations from rows (GitHub keeps 10 per step)
+        CHILD_ANN_CAP = 5
+        RC_RE = re.compile(r"0|[1-9][0-9]{0,2}")      # [0-9] is ASCII only in re (unlike \d)
+        ANN_SUFFIX = "…(+%d자 · 전문은 로그 그룹·아티팩트)"
+        LOG_NOTICE = ("[… %d bytes of the log copy dropped here: display bytes %d..%d of %s (%d B); the artifact "
+                      "win-health.json keeps the bounded copy …]")
+
+        rc_arg = sys.argv[1] if len(sys.argv) > 1 else ""
+        marker_dir = sys.argv[2] if len(sys.argv) > 2 else ""
+        rc = int(rc_arg) if RC_RE.fullmatch(rc_arg) and int(rc_arg) <= 255 else None
+        token = secrets.token_hex(16)
+        cats = set()
+        own = []                              # the reader's own fail-closed reasons (HARNESS) -> ONE ::error at the end
+        emitted = [0]
+        not_emitted = [0]
+
+
+        def nb(s):
+            """UTF-8 bytes print() writes for this line, its newline included."""
+            return len(s.encode("utf-8")) + 1
+
+
+        def clip(s, n):
+            b = s.encode("utf-8")
+            return s if len(b) <= n else b[:n - 3].decode("utf-8", "ignore") + "…"
+
+
+        def write_category():
+            """Atomic (temp file renamed over the marker): the verdict step sees the whole value or no file. Returns an
+            error text, or None when written."""
+            if not marker_dir:
+                return "marker directory argument missing"
+            val = ",".join(sorted(cats)) if cats else "NONE"
+            p = os.path.join(marker_dir, "category")
+            try:
+                with open(p + ".tmp", "w", encoding="ascii") as f:
+                    f.write(val)
+                os.replace(p + ".tmp", p)
+            except OSError as e:
+                return "%s: %s" % (type(e).__name__, e)
+            return None
+
+
+        def finish(code):
+            """Write the category (a failed write turns any result red), print the reader's own reasons once, exit."""
+            if own:
+                cats.add("HARNESS")
+            err = write_category()
+            if err is not None:
+                own.append("결함 분류 표지를 쓰지 못했다(%s) — 판정 단계가 통과로 읽을 근거가 없다" % err)
+                code = 1
+            if own:
+                print("::error::%s %s (fail-closed)" % (TAG["HARNESS"], cut_ann(esc_data(" · ".join(own)))), file=sys.stderr)
+                code = 1
+            sys.exit(code)
+
+
+        def esc_data(s):
+            return s.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+        def esc_prop(s):
+            return esc_data(s).replace(":", "%3A").replace(",", "%2C")
+
+
+        def cut_ann(s):
+            """Cut an ESCAPED message to <= ANN_MAX chars, never inside a %XX escape (gemini-2), saying what was cut.
+            v3 (R2-3): the suffix is reserved with len(s) as N - the real N is never larger, so never wider."""
+            if len(s) <= ANN_MAX:
+                return s
+            room = ANN_MAX - len(ANN_SUFFIX % len(s))
+            c = s[:room]
+            i = c.rfind("%", max(0, len(c) - 2))                  # a '%' in the last two chars starts a split escape
+            if i != -1:
+                c = c[:i]
+            return c + ANN_SUFFIX % (len(s) - len(c))
+
+
+        def annotate(title, msg):
+            if emitted[0] >= ROW_ANN_CAP:
+                not_emitted[0] += 1
+                return
+            emitted[0] += 1
+            print("::error title=%s::%s" % (esc_prop(title), cut_ann(esc_data(msg))))
+
+
+        def _part(text, where, cap):
+            """<= cap UTF-8 bytes INCLUDING the drop notice and its two newlines (v3, R2-3). The notice is sized with the
+            widest numbers it can carry (every number in it is <= len(b)) and reserved before the text is cut; then the first
+            quarter and the last three quarters of what is left are kept, and the notice carries the real offsets."""
+            b = text.encode("utf-8")
+            if len(b) <= cap:
+                return text
+            w = 10 ** len(str(len(b))) - 1
+            room = cap - len(("\n" + LOG_NOTICE % (w, w, w, where, w) + "\n").encode("utf-8"))
+            if room < 4:                                          # unreachable with these constants (T4 asserts the sizes)
+                return (LOG_NOTICE % (len(b), 0, len(b), where, len(b))).encode("utf-8")[:max(cap, 0)].decode("utf-8", "ignore")
+            hb = room // 4
+            h = b[:hb].decode("utf-8", "ignore")
+            t = b[len(b) - (room - hb):].decode("utf-8", "ignore")   # explicit start offset: never b[-0:] (= the whole text)
+            a, z = len(h.encode("utf-8")), len(b) - len(t.encode("utf-8"))
+            out = h + "\n" + LOG_NOTICE % (z - a, a, z, where, len(b)) + "\n" + t
+            assert len(out.encode("utf-8")) <= cap, (len(out.encode("utf-8")), cap)   # fail-closed: a crash is a HARNESS red
+            return out
+
+
+        def stream_block(name, rec):
+            """Every line printed for one stream; their UTF-8 bytes, each line's newline included, are <= LOG_STREAM_MAX."""
+            if not rec:
+                return ["--- %s: not captured ---" % name]
+            head_line = clip("--- %s: %s B · sha256 %s · hash_complete=%s · stable=%s%s ---"
+                             % (name, rec.get("bytes"), str(rec.get("sha256") or "-")[:16], rec.get("hash_complete"),
+                                rec.get("stable"), (" · truncated: %s" % rec.get("marker")) if rec.get("truncated") else ""),
+                             LINE_MAX)
+            head = rec.get("head") or {}
+            text = str(head.get("text", ""))
+            if rec.get("truncated"):
+                text += "\n" + str(rec.get("marker", "")) + "\n" + str((rec.get("tail") or {}).get("text", ""))
+            alts = {}
+            for part in ("head", "tail"):
+                for codec, t in ((rec.get(part) or {}).get("alt") or {}).items():
+                    alts.setdefault(str(codec), []).append(str(t))
+            if alts:                                              # not valid UTF-8: the budget is shared with the code-page views
+                shown = list(alts)[:ALT_VIEWS_MAX]
+                vh = [clip("--- %s as %s (legibility view; undecodable bytes as U+FFFD) ---" % (name, c), LINE_MAX // 4)
+                      for c in shown]
+                extra = ["--- %s: %d more code-page views are in win-health.json only ---" % (name, len(alts) - len(shown))] \
+                    if len(alts) > len(shown) else []
+                room = LOG_STREAM_MAX - nb(head_line) - sum(nb(x) for x in vh + extra) - (1 + len(shown))
+                lines = [head_line, _part(text, name + " (utf-8 view, invalid bytes as \\xNN)", room // 2)]
+                share = (room - room // 2) // len(shown)
+                for c, h in zip(shown, vh):
+                    lines += [h, _part("\n".join(alts[c]), "%s as %s" % (name, c), share)]
+                lines += extra
+            else:
+                lines = [head_line, _part(text, name, LOG_STREAM_MAX - nb(head_line) - 1)]
+            assert sum(nb(x) for x in lines) <= LOG_STREAM_MAX, sum(nb(x) for x in lines)
+            return lines
+
+
+        def one_line(s, n=160):
+            s = str(s).replace("\r", " ").replace("\n", " ⏎ ")
+            return s if len(s) <= n else s[:n] + "…(+%d자)" % (len(s) - n)
+
+
+        def is_count(v):
+            return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+
+        def no_dup(pairs):
+            """object_pairs_hook: a repeated key is refused, not resolved to its last value (v4, R3-c)."""
+            seen = set()
+            for k, _ in pairs:
+                if k in seen:
+                    raise ValueError("duplicate key %r" % k[:40])
+                seen.add(k)
+            return dict(pairs)
+
+
+        if rc is None:
+            own.append("러너 rc 인자 %s 가 0..255 의 정수가 아니다 — 판정 불가" % one_line(repr(rc_arg), 40))
+        try:
+            d = json.load(open("win-health.json", encoding="utf-8"), object_pairs_hook=no_dup)
+            s = d["summary"]
+            rows = d["specimens"]
+            if not isinstance(s, dict) or not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
+                raise ValueError("summary is not an object or specimens is not a list of objects")
+        except Exception as e:                                   # noqa: BLE001 - a parse failure is an observation failure
+            own.append("건강성 결과 JSON 을 읽지 못했다(%s) — 러너가 중도 사망했을 수 있다. 이 상태의 '문제 없음' 은 근거가 "
+                       "아니다" % str(e)[:200])
+            finish(1)
+
+        print("[win-health] verdict=%s pass=%s fail=%s skip=%s disabled=%s pending=%s"
+              % tuple(one_line(s.get(k), 40) for k in ("verdict", "pass", "fail", "skip", "disabled", "pending")))
+        print("::stop-commands::%s" % token)
+        for r in rows:
+            print("  %-6s %-12s %s" % (one_line(r.get("status"), 12).upper(), one_line(r.get("id"), 40),
+                                       one_line(r.get("reason", r.get("detail", "")))))
+        print("::%s::" % token)
+
+        for r in rows:
+            ch = (r.get("evidence") or {}).get("child")
+            if not ch:
+                continue
+            print("::group::%s child (rc=%s · categories=%s · timed_out=%s · stdout %s B · stderr %s B)"
+                  % (one_line(r.get("id"), 40), one_line(ch.get("rc"), 40), one_line(",".join(ch.get("categories") or []), 40)
+                     or "none", ch.get("timed_out"), (ch.get("stdout") or {}).get("bytes"), (ch.get("stderr") or {}).get("bytes")))
+            print("::stop-commands::%s" % token)
+            for c in ch.get("causes") or []:
+                print("[cause] %s %s %s" % (c.get("category"), c.get("code"), c.get("message")))
+            if (ch.get("causes_total") or 0) > len(ch.get("causes") or []):
+                print("[cause] … %d more causes in the artifact" % (ch["causes_total"] - len(ch["causes"])))
+            for f in ch.get("failing") or []:
+                print("[failing] %s (%s): %s" % (f.get("id"), f.get("fail_kind"), f.get("reason")))
+            if ch.get("failing_omitted"):
+                print("[failing] … %d more failing rows not recorded (failing_total=%s)" % (ch["failing_omitted"],
+                                                                                           ch.get("failing_total")))
+            for t in ch.get("truncations") or []:
+                print("[cut] %s: %s %s dropped (%s..%s of %s)" % (t.get("field"), t.get("dropped_bytes"), t.get("unit"),
+                                                                 (t.get("dropped_range") or ["?", "?"])[0],
+                                                                 (t.get("dropped_range") or ["?", "?"])[1],
+                                                                 t.get("total_bytes")))
+            for sname in ("stdout", "stderr"):
+                for ln in stream_block(sname, ch.get(sname)):
+                    print(ln)
+            print("::%s::" % token)
+            print("::endgroup::")
+
+        # v3 (R2-1, R2-2): counts derived from the rows; every green condition stated positively
+        derived = dict((k, 0) for k in STATUSES)
+        bad_shape = kind_on_nonfail = cat_on_nonfail = bad_counted = 0
+        for r in rows:
+            st, c = r.get("status"), r.get("counted", True)
+            if not isinstance(r.get("id"), str) or st not in STATUSES:
+                bad_shape += 1
+                continue
+            if not isinstance(c, bool):
+                bad_counted += 1
+            elif c:
+                derived[st] += 1
+            if st != "fail" and "fail_kind" in r:
+                kind_on_nonfail += 1
+            if st != "fail" and ((r.get("evidence") or {}).get("child") or {}).get("categories"):
+                cat_on_nonfail += 1
+        if bad_shape:
+            own.append("행 %d 건에 문자열 id 또는 알려진 status 가 없다" % bad_shape)
+        if bad_counted:
+            own.append("행 %d 건의 counted 가 bool 이 아니다" % bad_counted)
+        if kind_on_nonfail:
+            own.append("실패가 아닌 행 %d 건이 fail_kind 를 가진다 — 보고가 자기모순이다" % kind_on_nonfail)
+        if cat_on_nonfail:
+            own.append("실패가 아닌 행 %d 건의 evidence.child 가 결함 분류를 가진다 — 보고가 자기모순이다" % cat_on_nonfail)
+        for k in STATUSES:
+            if not is_count(s.get(k)):
+                own.append("summary.%s 가 없거나 음이 아닌 정수가 아니다(%s)" % (k, type(s.get(k)).__name__))
+            elif s[k] != derived[k]:
+                own.append("summary.%s=%d 인데 행에서 센 값은 %d — 이월·낡은 수는 측정이 아니다" % (k, s[k], derived[k]))
+
+        fail_rows = [r for r in rows if r.get("status") == "fail"]
+        for r in fail_rows:
+            ch = (r.get("evidence") or {}).get("child")
+            if ch is not None:
+                for cat in ("PRODUCT", "HARNESS"):
+                    if cat in (ch.get("categories") or []):
+                        cats.add(cat)
+                        annotate("%s %s" % (r.get("id"), cat), "%s %s" % (TAG[cat], " · ".join(
+                            str(c.get("message", "")) for c in ch.get("causes") or [] if c.get("category") == cat)))
+                for f in (ch.get("failing") or [])[:CHILD_ANN_CAP]:
+                    annotate("%s child %s" % (r.get("id"), f.get("id")), "[%s] %s" % (f.get("fail_kind"), f.get("reason")))
+                if not ch.get("categories"):
+                    cats.add("HARNESS")
+                    annotate(str(r.get("id")), "%s %s" % (TAG["HARNESS"], r.get("reason") or r.get("detail") or ""))
+            else:
+                cat = KINDS.get(r.get("fail_kind")) if isinstance(r.get("fail_kind"), str) else None
+                cat = cat or "HARNESS"
+                cats.add(cat)
+                annotate(str(r.get("id")), "%s %s" % (TAG[cat], r.get("reason") or r.get("detail") or ""))
+        if not_emitted[0]:
+            print("[win-health] annotation cap: %d more failing items were not annotated (GitHub keeps 10 error annotations "
+                  "per step) - they are in the log above and in win-health.json" % not_emitted[0])
+        if derived["pass"] == 0:
+            own.append("Windows 실기에서 PASS 0건(행에서 센 값 · 실제로 돈 행 %d 건) — 검체가 전부 skip/pending 이면 이 잡은 "
+                       "무검증 베이스라인을 재생산한다" % (derived["pass"] + derived["fail"]))
+        if derived["disabled"]:
+            own.append("사람이 끈 미측정 행 %d 건 — 통과가 아니다" % derived["disabled"])
+        if not fail_rows and s.get("verdict") != "GREEN":
+            own.append("실패 행 없이 verdict=%s — 통과가 아니다" % one_line(s.get("verdict"), 40))
+        if rc is not None and rc != 0 and not fail_rows:
+            own.append("건강성 러너가 rc=%d 로 끝났는데 실패 검체는 0건이다 — 판정 불가" % rc)
+        if rc == 0 and fail_rows:
+            own.append("실패 행 %d 건인데 러너 rc=0 — 보고가 자기모순이다" % len(fail_rows))
+        green = (rc == 0 and s.get("verdict") == "GREEN" and not fail_rows and not own and not cats
+                 and derived["pass"] > 0 and derived["pass"] + derived["fail"] > 0 and derived["disabled"] == 0)
+        if not green and not own and not cats:                   # a red that no rule above named is still a red
+            own.append("통과 조건 전부를 증명하지 못했다 — 원인 미분류는 통과가 아니다")
+        finish(0 if green else 1)
+        PY
+        echo "$vrc" > "$BH_DIR/rc"
+        exit "$vrc"
+      if: steps.window.outputs.open == 'true'
+    - name: Rust 툴체인 (factory-reset Windows 계약 검증용)
+      uses: dtolnay/rust-toolchain@stable
+      timeout-minutes: 3
+      if: steps.window.outputs.open == 'true'
+    - name: cargo test --lib factory_reset + readiness + inject_guard + first_run_gates + update_launch + agy_statusline +
+        claude_tui (Windows 실기)
+      shell: bash
+      run: |
+        set -euo pipefail
+        # ★D10(반성 라운드 2026-09-10): '측정 ≥1' 폐쇄. cargo 필터는 **0매치도 초록**이라 모듈 경로가
+        #   바뀌면(리팩터링 · 모듈 이동) 이 잡은 아무것도 안 돌리고 초록으로 되돌아간다 — 이 파일의
+        #   다른 게이트와 ci-branch 의 `names()` 0건 fail-closed 가 쓰는 규율의 반대였다. 실행 전에
+        #   `-- --list` 로 세어 0 이면 붉힌다. 함수 이름 `cargo_filter_count` 는 ci-branch 레인 대조
+        #   게이트의 FILTERED_CARGO_GUARD 핀과의 **계약**이다(실행 줄마다 같은 인자의 선행 호출 요구).
+        #   판정은 리다이렉트 뒤 `$?` 하나로 잰다(파이프 꼬리 rc 금지).
+        cargo_filter_count() {
+          local list="${RUNNER_TEMP:-/tmp}/cargo-filter-list.txt" n rc
+          if CYS_PACK_DIR="$(mktemp -d)" cargo test "$@" -- --list > "$list" 2>&1; then rc=0; else rc=$?; fi
+          if [ "$rc" -ne 0 ]; then
+            cat "$list"
+            echo "::error::cargo test $* -- --list 실패(rc=$rc) — 필터를 셀 수 없으면 실행도 근거가 없다(fail-closed)"
+            exit 1
+          fi
+          n=$(grep -c ': test$' "$list" || true)
+          if [ "${n:-0}" -lt 1 ]; then
+            tail -20 "$list"
+            echo "::error::cargo test $* 필터에 걸리는 테스트가 0건 — 모듈 경로가 바뀌었다(돌지 않는 초록 금지)"
+            exit 1
+          fi
+          echo "[filter-count] cargo test $* → ${n}건"
+        }
+        # CYS_PACK_DIR 임시 격리 — W0-a 봉인(테스트가 라이브 ~/.cys/pack 접촉 금지) 충족.
+        cargo_filter_count --lib factory_reset::
+        CYS_PACK_DIR="$(mktemp -d)" cargo test --lib factory_reset:: -- --test-threads=1
+        # ★(0.14.31 · WP-1 H-1 · CONTRACTS B-8) 관문·모달 판정부(`readiness::`)와 주입 가드
+        #   (`inject_guard::`)의 검체를 Windows 실기에서 **차단 게이트**로 돈다. 종전엔 lib 필터가
+        #   `factory_reset::` 하나라 ConPTY 문면 검체(H-WIN 5종 · readiness::tests)가 Windows 에서
+        #   한 번도 실행되지 않았다 — 녹색은 증거가 아니다(정본 §8). 순수 진리표라 PTY 불요.
+        #   ⚠이 두 줄에 `if:`/continue-on-error 를 달지 마라(잡 머리말의 '돌지 않는 초록 금지').
+        # ★(0.14.31 · 리뷰 R1b · W1) `readiness::` 필터에는 **실행 계측** 1건이 들어 있다 —
+        #   `pty_idle_shell_emits_no_bytes_within_valve_quiet_window`: 이 러너의 ConPTY 에 cmd.exe 를
+        #   띄워 정착 뒤 4.0s 유휴 바이트가 0 임(+ 창 뒤 명령 응답으로 펌프 생존 재증명)을 잰다. Boot
+        #   Valve 창(`quiet_secs ≥ 3`)이 Windows 전송층에서 도달 가능한지의 유일한 실기 근거다. 실패하면
+        #   밸브 단독 경로 좌석이 영구 보류(GatePending)라는 뜻이니 초록 여부가 아니라 스텝 로그의
+        #   `[pty-idle-probe] … idle_bytes=` 줄을 릴리스 노트에 병기하라(녹색은 증거가 아니다 · 정본 §8).
+        #   범위: PTY/ConPTY 전송층만이다 — ink(claude 렌더러)의 Windows 유휴 거동은 릴리스 게이트의
+        #   격리 config dir 라이브 부트 계측이 따로 본다.
+        cargo_filter_count --lib readiness::
+        CYS_PACK_DIR="$(mktemp -d)" cargo test --lib readiness:: -- --test-threads=1 --nocapture
+        cargo_filter_count --lib inject_guard::
+        CYS_PACK_DIR="$(mktemp -d)" cargo test --lib inject_guard:: -- --test-threads=1
+        # ★(0.14.31 성찰 R3·R4 · 통합 2026-09-10) 넷째 모듈 `first_run_gates::` 편입.
+        #   이 잡의 lib 필터는 종전 셋(factory_reset·readiness·inject_guard)뿐이라, 이번 판이
+        #   세운 두 검체군이 Windows 실기에서 **한 번도 돌지 않았다**:
+        #     R3 = 공백만 남은 needle(접힌 렌더에서 관문 문면이 공백으로 뭉개지는 축),
+        #     R4 = 접힌 배너의 버전 판독(줄바꿈이 배너를 가르는 축).
+        #   둘 다 ConPTY 접힘·렌더 축이고 Windows 가 정확히 그 축의 기계다 — mac 에서만
+        #   초록인 검체는 그 축의 증거가 아니다(정본 §8). 순수 판정자라 PTY 불요.
+        #   D10 '측정 ≥1 폐쇄' 와 한 스텝으로 묶어 0매치 초록도 차단한다.
+        cargo_filter_count --lib first_run_gates::
+        CYS_PACK_DIR="$(mktemp -d)" cargo test --lib first_run_gates:: -- --test-threads=1
+        # ★(0.14.43 · WU) 다섯째 모듈 `update_launch::` 편입 — 윈도우 인앱 업데이트가 설치 파일을 띄우는 호출(`ShellExecuteW` 반환값 판정)과
+        #   그 인자·임시 경로 계약이다. 순수 검체(인자 이스케이프·분류표·실패 판정·임시 파일 쓰기)는 mac 에서도 돌지만, 이 모듈의 **윈도우 전용 검체는
+        #   하나**다(실제 `ShellExecuteW` 로 `cmd.exe /c exit 0` 실행 성공) — Windows 실기에서만 돌고, mac 초록은 그 축의 증거가 아니다(정본 §8).
+        #   실패 판정(반환 5·오류 4551 등)은 순수 검체가 전 OS 에서 잰다: `ShellExecuteW` 는 대상 파일이 없으면 모달 오류 창을 띄워(`SEE_MASK_FLAG_NO_UI` 없음)
+        #   대화형 세션인 CI 러너에서 멈추므로 실패 경로는 실제 API 로 돌리지 않는다. 필터가 0 매치(모듈 경로 변경)면 `cargo_filter_count` 가 붉힌다.
+        #   이 두 줄에도 `if:` 를 달지 마라.
+        cargo_filter_count --lib update_launch::
+        CYS_PACK_DIR="$(mktemp -d)" cargo test --lib update_launch:: -- --test-threads=1
+        # ★(0.14.45) 여섯째 모듈 `agy_statusline::` 편입 — Windows Antigravity 상태줄 자동 연결. 이 모듈의 **윈도우 전용 검체**
+        #   `windows_cmd_wrapper_runs_under_cmd_c_like_agy` 는 팩의 LF `.cmd` 래퍼를 agy 와 같은 방식(`cmd /c` + Go `EscapeArg`
+        #   인용 · 창 없음 · 5초 상한)으로 실제 실행해, 가짜 `cys.cmd` 가 PATH 에 있으면 통과 · 없으면 실패(구별)임을 잰다.
+        #   mac 초록은 그 축(cmd 의 따옴표 처리·LF 배치 파일 실행)의 증거가 아니다(정본 §8). 이 두 줄에도 `if:` 를 달지 마라.
+        cargo_filter_count --lib agy_statusline::
+        CYS_PACK_DIR="$(mktemp -d)" cargo test --lib agy_statusline:: -- --test-threads=1
+        # ★(0.14.45) 일곱째 모듈 `claude_tui::` 편입 — Windows 에서 Claude Code 기본 화면 모드(classic) 설정 파일 기록·롤백 계약.
+        #   이 모듈의 **윈도우 전용 검체 둘**(`claude_tui_windows_personal_comparison_ignores_case_and_verbatim_prefix` ·
+        #   `claude_tui_ensure_refuses_short_name_spelling_of_personal_profile`)은 개인 프로필 판정이 대소문자·`\\?\` 접두·8.3 짧은 이름
+        #   철자를 같은 폴더로 보는지 Windows 실기에서만 잰다 — mac 초록은 그 축의 증거가 아니다(정본 §8). 검체는 전부 temp_dir 샌드박스에서
+        #   돌고 reconcile 은 테스트 빌드에서 무동작이라 실 HOME·~/.claude 를 만지지 않는다(킬스위치 파일 존재 stat 1회뿐 · 읽기 전용).
+        #   이 두 줄에도 `if:` 를 달지 마라.
+        cargo_filter_count --lib claude_tui::
+        CYS_PACK_DIR="$(mktemp -d)" cargo test --lib claude_tui:: -- --test-threads=1
+      timeout-minutes: 12
+      if: steps.window.outputs.open == 'true'
+    - name: cargo test --bin cys D5 파이프라인 핀 (Windows 실기 · cfg(windows) 블록 최초 컴파일)
+      shell: bash
+      run: |
+        set -euo pipefail
+        # ★D10: 같은 계급의 필터형 실행 — 0매치 초록 차단(위 스텝의 cargo_filter_count 와 같은 규율 ·
+        #   스텝이 달라 함수를 다시 정의한다 · 게이트 핀은 스텝 단위로 선행 호출을 요구한다).
+        cargo_filter_count() {
+          local list="${RUNNER_TEMP:-/tmp}/cargo-filter-list.txt" n rc
+          if CYS_PACK_DIR="$(mktemp -d)" cargo test "$@" -- --list > "$list" 2>&1; then rc=0; else rc=$?; fi
+          if [ "$rc" -ne 0 ]; then
+            cat "$list"
+            echo "::error::cargo test $* -- --list 실패(rc=$rc) — 필터를 셀 수 없으면 실행도 근거가 없다(fail-closed)"
+            exit 1
+          fi
+          n=$(grep -c ': test$' "$list" || true)
+          if [ "${n:-0}" -lt 1 ]; then
+            tail -20 "$list"
+            echo "::error::cargo test $* 필터에 걸리는 테스트가 0건 — 필터 이름이 바뀌었다(돌지 않는 초록 금지)"
+            exit 1
+          fi
+          echo "[filter-count] cargo test $* → ${n}건"
+        }
+        cargo_filter_count --bin cys d5_env_injection
+        CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cys d5_env_injection -- --test-threads=1
+      timeout-minutes: 5
+      if: steps.window.outputs.open == 'true'
+    - name: Record suite-source and declared-environment identity
+      id: suite_prepare
+      timeout-minutes: 1
+      if: steps.window.outputs.open == 'true'
+      shell: pwsh
+      run: |
+        python "$env:RUNNER_TEMP/schedule-suite-observer/schedule_suite_rate.py" prepare --out "$env:RUNNER_TEMP/schedule-suite-${{ matrix.shard }}" --shard ${{ matrix.shard }}
+        exit $LASTEXITCODE
+    - name: Suite-regime full cysd invocation 1
+      id: cysd_win_1
+      continue-on-error: true
+      timeout-minutes: 30
+      shell: bash
+      run: |
+        # ★-e 를 명시적으로 끈다(U4 C4-①). GitHub `shell: bash` 는 `bash -eo pipefail` 로 돌고
+        #   `set -uo pipefail` 은 -e 를 끄지 않는다 — 종전엔 cargo 가 비0 이면 파이프 직후 그 자리에서
+        #   스텝이 끝나 아래 `::error` 판독 코드가 **도달 불가**였다(위 '-e 를 빼고 rc 를 잡은 뒤' 의도와
+        #   코드의 불일치 · 로컬 하네스 실측: rc 101 인데 주석 0줄). 판정(스텝 rc)은 그대로다.
+        set +e
+        set -uo pipefail
+        # 스텝 사이 전달용 **고정 경로**(다음 '판독' 스텝이 읽는다 — mktemp 값은 스텝을 넘지 못한다).
+        #   rc 파일은 cargo 가 **끝났을 때만** 생긴다 — 그 부재가 곧 '절단(강제 종료)' 의 표지다.
+        CYSD_DIR="${RUNNER_TEMP:-/tmp}/cysd-win"
+        rm -rf "$CYSD_DIR"
+        mkdir -p "$CYSD_DIR"
+        date +%s > "$CYSD_DIR/start"
+        LOG="$CYSD_DIR/cargo.log"
+        # ★(0.14.52 · CI-RED-FIX-PREP · CEO) The FULL failure list goes into the uploaded artifact (win-health-json →
+        #   win-cysd-failures.json): every failed test name and every panic's location and message, not only the 20-line tail
+        #   below. The parser is written to the step folder first, so the reader step can run it when a timeout cuts this
+        #   step (the trap below did not fire on a real cut). It never changes this step's exit code.
+        FAILS_JSON="${GITHUB_WORKSPACE:-$PWD}/win-cysd-failures.json"
+        rm -f "$FAILS_JSON"
+        cat > "$CYSD_DIR/failures.py" <<'PY'
+        import json, re, sys
+        log, status, out = sys.argv[1], sys.argv[2], sys.argv[3]
+        try:
+            with open(log, encoding="utf-8", errors="replace") as f:
+                text = f.read()
+            readable = True
+        except OSError:
+            text, readable = "", False
+        TEST = re.compile(r"^test (\S+) \.\.\. ?(.*)$")
+        # --nocapture: a panic header often follows `test X ... ` on the same line, so it is searched, not anchored.
+        # Current toolchains put the numeric thread id after the name (real windows-health log, 2026-10-19:
+        # `thread 'activity_tests::exited_seat_serializes_unknown' (12296) panicked at src\bin\cysd\activity_tests.rs:658:5:`);
+        # older ones do not, and the oldest put the message on the header line. All three are read.
+        PANIC = re.compile(r"thread '([^']*)'(?: \((\d+)\))? panicked at (.+:\d+:\d+):$")
+        PANIC_OLD = re.compile(r"thread '([^']*)'(?: \((\d+)\))? panicked at '(.*)', (.+:\d+:\d+)$")
+        # Coverage is measured against a looser header test, so a header form none of the above reads shows up as unparsed.
+        SEEN = re.compile(r"thread '[^']*'.*? panicked at ")
+        NAME = re.compile(r"^    ([A-Za-z_][A-Za-z0-9_:]*)$")
+        summary, verdict, section, panics, seen, unparsed = None, [], [], [], 0, []
+        current, in_section, panic = None, False, None
+        for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            if panic is not None:
+                # a message may hold blank lines (screen dumps), so a blank line does not end it
+                ends = (line.startswith(("note: ", "stack backtrace:", "test result:")) or line in ("failures:", "FAILED", "ok")
+                        or (line.startswith("---- ") and line.endswith(" ----"))   # next captured-output block
+                        or TEST.match(line) or SEEN.search(line))
+                if not ends:
+                    panic["message"].append(line)
+                    continue
+                panic["message"] = "\n".join(panic["message"]).rstrip("\n")
+                panics.append(panic)
+                panic = None
+            t = TEST.match(line)
+            if t:
+                current, rest = t.group(1), t.group(2).rstrip()
+            if SEEN.search(line):
+                seen += 1
+                m = PANIC.search(line)
+                if m:
+                    panic = {"thread": m.group(1), "thread_id": m.group(2), "location": m.group(3), "message": []}
+                    continue
+                m = PANIC_OLD.search(line)
+                if m:
+                    panics.append({"thread": m.group(1), "thread_id": m.group(2), "location": m.group(4), "message": m.group(3)})
+                    continue
+                unparsed.append(line)
+            if line.startswith("test result:"):
+                summary, in_section = line.strip(), False
+                continue
+            if line == "failures:":
+                in_section, section = True, []   # libtest's last failures: block holds the names
+                continue
+            if in_section:
+                m = NAME.match(line)
+                if m:
+                    section.append(m.group(1))
+                continue
+            if t:
+                if rest.endswith("FAILED"):
+                    verdict.append(current)
+                    current = None
+                elif rest.endswith(("ok", "ignored")):
+                    current = None
+                continue
+            if current is not None and line.rstrip().endswith("FAILED"):   # --nocapture: verdict after the test's output
+                verdict.append(current)
+                current = None
+        if panic is not None:
+            panic["message"] = "\n".join(panic["message"]).rstrip("\n")
+            panics.append(panic)
+        m = re.search(r"(\d+) failed", summary or "")
+        failed_in_summary = int(m.group(1)) if m else None
+        # a finished run: libtest's own failures: list; a cut run: the FAILED verdicts seen before the cut
+        failed = sorted(set(section) if summary is not None else set(verdict))
+        threads = {p["thread"] for p in panics}
+        # Two separate questions: are the NAMES complete (libtest's list matches its own count), and is the panic DETAIL
+        # complete (every header line was read; which failed tests have no panic record - a test can also fail without one).
+        doc = {"schema": "cysd-win-failures/2", "log": log, "log_readable": readable, "status": status,
+               "cut": status == "cut", "summary": summary, "failed_in_summary": failed_in_summary,
+               "names_complete": failed_in_summary is not None and failed_in_summary == len(set(section)),
+               "failed_tests": failed, "failures_section": section, "failed_verdict_lines": list(dict.fromkeys(verdict)),
+               "panic_headers_seen": seen, "panic_headers_parsed": len(panics), "panic_headers_unparsed": unparsed,
+               "panic_detail_complete": seen == len(panics),
+               "failed_tests_without_panic": [n for n in failed if n not in threads],
+               "panics": panics}
+        with open(out, "w", encoding="utf-8") as f:
+            json.dump(doc, f, ensure_ascii=False, indent=1)
+        PY
+        write_failures() {
+          local py=python
+          if command -v python3 >/dev/null 2>&1; then py=python3; fi
+          PYTHONDONTWRITEBYTECODE=1 "$py" "$CYSD_DIR/failures.py" "$LOG" "$1" "$FAILS_JSON" \
+            || echo "::warning title=cysd-win 실패 목록::win-cysd-failures.json 을 쓰지 못했다 — 실패 목록은 cargo.log 원문에만 있다"
+        }
+        # ★절단 대비 트랩 — ★★실측으로 **발동하지 않았다**(run 33944971633 · 30.1분 절단 ·
+        #   주석은 GitHub 자체 "timed out after 30 minutes" 한 줄뿐 · 아래 on_cut 산출 0건).
+        #   기전 추정: GitHub 의 타임아웃은 프로세스(그룹)를 강하게 죽이고, bash 트랩은 **명령
+        #   사이**에 도는데 파이프라인 대기 중에는 그 순간이 오지 않는다.
+        #   ⚠ 따라서 **"잘리면 검체명이 주석으로 나온다"고 기대하지 마라 — 그렇게 되지 않는다.**
+        #   현재 사실: 멈춘 검체명은 **러너 로그에는 남지만**(아래 tee·--nocapture 가 실제로 그렇게
+        #   한다) **익명 REST 로는 읽히지 않는다**(실측: 로그 403 · 아티팩트 다운로드 401 · 주석만 200).
+        #   저장소 권한이 있는 사람이 런 페이지를 열면 읽을 수 있다.
+        #   ★다음 판 1순위(IG-31): 죽을 때 뱉는 대신 **도는 동안 주기적으로** tail -1 을 ::notice 로
+        #   올린다 — 강제 종료돼도 마지막 notice 가 남는다. **미검증이므로 이번 판에 넣지 않았다.**
+        #   아래 on_cut/trap 은 무해하여 남겨 두되, 그 산출에 의존하는 설계를 얹지 마라.
+        on_cut() {
+          echo "::error title=cysd-win 절단::타임아웃으로 잘렸다 — 아래가 로그 마지막 25줄이다(멈춘 검체명이 여기 있다)"
+          tail -25 "$LOG" 2>/dev/null | sed 's/^/::error title=cysd-win 꼬리::/'
+          write_failures cut
+          exit 124
+        }
+        trap on_cut TERM INT
+        # ★실시간 스트리밍(tee) — 종전에는 rc 를 잡은 뒤에야 꼬리를 뱉어서, 타임아웃으로
+        #   죽으면 "왜 멈췄는지"가 하나도 안 남았다. tee 로 러너 로그에 흘리면 잘려도 마지막
+        #   줄이 증거로 남는다. rc 는 파이프에 삼켜지지 않게 PIPESTATUS[0] 으로 직독한다.
+        # ★--nocapture: --test-threads=1 이라 libtest 가 검체명을 실행 **전에** 찍는다 —
+        #   멈춘 검체 이름이 마지막 줄에 남는다(그게 없으면 hang 위치를 영영 모른다).
+        # ★(0.14.43 성찰 R1F-PK · S3 minor 7) hwmon **모듈 전체** skip 을 깨질 검체 하나의 정확한 이름으로 좁혔다(release.yml 의 skip 은 그대로).
+        #   남긴 skip = `hwmon::tests::snapshot_has_all_sections`: 윈도우에서는 GPU·NPU 단언이 컴파일되지 않지만(맥 전용 cfg) 코어 열거(PDH 카운터)가 이 러너에서
+        #   0개를 내는지는 재 본 적이 없다 — 확신이 없는 검체는 skip 에 남긴다.
+        # ★(R2F-PK · 성찰 2회차 · A4 M1 의 주석 몫) **이 스텝은 이제 끝까지 돈다 — 그리고 195건이 붉다.** 앞 두 런(37175872869 = 9650334f · 37182205898 = bde5e557)은 `--test-threads=1` 이름순 실행이
+        #   `attach_race_tests::process_and_send_are_atomic_under_parser_lock_no_dup_delivery` 에서 멈춘 채 30분 상한에 닿았다(그 뒤 이름의 모듈 — governance · handlers · hwmon · schedule · state … — 은 윈도우 CI 에서
+        #   한 번도 돈 적이 없었다). 그 검체를 이 스텝에서만 건너뛰자(아래 명령의 두 번째 `--skip`) **bd0a0ca3 의 런(37185687205 · 잡 14.0분)에서 처음 완주**했다:
+        #     · 이 스텝 552초(9분 13초 — 빌드 포함 · 테스트 473.67초) · 결과 **1681 통과 · 195 실패 · 3 무시 · 2 걸러짐** · 판독 annotation `cysd-win 완주·실패(비차단)` · 런·잡은 초록(비차단).
+        #     · hwmon 전용 스텝(아래 · 이 스텝이 이미 빌드해 둔 하네스를 쓰는 **실행만** 2초): **5 통과 · 0 실패**(`e2_non_macos_stub_reports_platform` 의 첫 실행 포함).
+        #     · 6차 진단 런(37188821194 · 같은 명령 · `windows-latest`)은 660초에 **1680 통과 · 196 실패** — 한 건 더 붉다(흔들림 또는 격리 의존).
+        #   195건의 지배적 원인은 제품이 아니라 **검체 격리가 윈도우에서 성립하지 않는 구조**로 보인다(진단 런 원문: 검체들이 한 상태 폴더를 공유 — 소켓 파일 이름이 같아 윈도우의 `state_dir()` 슬러그가 같다 · 경로 구분자가 박힌
+        #   기대값). 다만 196건 전부의 분류와 격리 수리(R2F-DM 몫) 전에는 **'윈도우에서 데몬 검체가 검증했다'고 말하지 않는다** — 그래서 이 스텝은 계속 **비차단**이고 그 뜻은 '실패 195건을 알고도 초록'이다.
+        #   그 사실의 유일한 채널은 아래 판독 스텝의 annotation 이다(런 결론은 success) — `scripts/pre-tag-ci-check.py` 가 성공한 런의 failure·warning annotation 제목을 요약해 태그 전에 사람 눈에 올린다.
+        #   `attach_race_tests::process_and_send_…` 의 skip 은 그대로 둔다 — 그 검체가 윈도우에서 멈추는 **원인은 여전히 미조사**다(skip 은 뒤 검체의 가시화이지 삭제가 아니다 · 맥 레인 ci-branch·release 에서는 그대로 돈다).
+        #   멈춤이 다시 나오면(= 판독 스텝의 '절단') 같은 방식으로 한 건씩 드러낸다 — 시간 예산은 아래 hwmon 스텝 머리 주석의 표(전량 스텝이 다시 30분 상한에 닿는 최악 포함)가 정본이다. 30분 상한·비차단은 그대로다.
+        # ★(R2F-DM · 성찰 2회차 수리 뒤 재측정 · 2026-10-05) **위 문단의 '195건이 붉다'는 bd0a0ca3 시점의 사실이다 — 196건의 분류와 수리가 끝났다.**
+        #   분류(6차 진단 런의 196건): 상태 폴더 공유 154 · 경로 구분자 3 · `HOME` 전제 2 · 유닉스 전제 35 · 제품 결함 2(원인 1건 — 승인 서명이 JSON 저장 뒤 깨짐 · 윈도우 100ns 시계).
+        #   수리: 시험 빌드 전용 `state_dir` 분기(제품 식 불변) · 승인 시각 양자화와 데몬 시각 원천의 마이크로초 통일 · 인계 표식 순번 · 윈도우에서 뜻이 없는 검체 44건(0.14.52 S-a C7b 에서 50건 · C7d 에서 52건)은 `ignore`+사유
+        #   (집합 핀 `r2f_dm_windows_ignore_attributes_are_exactly_the_decided_set_of_103` — 새 `ignore` 는 그 목록을 고쳐야 붉지 않다).
+        #   재측정(같은 명령): 커밋 5c4b2ac2 = 진단 37201047193 `1835 통과 · 15 실패 · 44 무시` / 이 스텝 37201027633 `1841 · 9 · 44`
+        #     → 커밋 2bf75a12 = 진단 37249118071 **`1853 통과 · 0 실패 · 47 무시`** / 이 스텝 37249110248 `1851 · 2 · 47` / 진단 반복 37250481491 `1852 · 1 · 47`.
+        #   **남은 것 = 시점 의존 검체 가족의 흔들림.** 2bf75a12 의 세 실행에서 실패가 0 · 2 · 1 건이고 매번 다른 검체다(`b1_gate_delivers_at_prompt_boundary_while_output_streams` ·
+        #   `b1_merge_delivers_same_sender_burst_in_one_turn` · `j3_queued_send_from_cli_label_reaches_entry_digest_header_and_ledger`). 셋 다 좌석을 만든 직후 화면을 그리거나 큐를 넣고 곧바로 배달·판정을 재는 꼴이다 —
+        #   그 사이에 좌석 출력(윈도우 ConPTY 의 기동 출력으로 본다)이 끼면 제품이 옳게도 '출력 중'으로 보류해 붉어진다. 같은 꼴로 붉었던 4건은 검체를 결정론으로 고쳤고(`state::test_until_no_pty_output` — 그 뒤 세 실행 모두 통과)
+        #   나머지는 손대지 않았다 → **'3회 연속 초록'에 닿지 못했으므로 차단 승격은 아직 하지 않는다**(비차단 유지 · 사실의 채널은 여전히 아래 판독 annotation 과 `scripts/pre-tag-ci-check.py` 의 요약이다).
+        #   승격의 남은 일 = 그 가족의 좌석 픽스처가 조용한 관측 창을 보장하게 하는 것(다음 판 · 검체 수십 건). 이 스텝의 실패가 **그 가족 밖**에서 나오면 흔들림으로 넘기지 말고 원문을 보라.
+        #   `attach_race_tests::process_and_send_…` 가 멈추는 원인의 후보도 생겼다: 그 검체의 관측자 루프는 좌석의 종료 래치(`exited`)를 상한 없이 기다리는데, 이 러너에서는 좌석 프로세스가 끝나거나 죽어도 reader 가
+        #   EOF 를 보지 못했다(같은 뿌리의 검체 3건 — 10~15초 대기 · 두 실행 모두 · 지금은 `ignore`+사유). 인과는 코드로 읽은 것이고 따로 실험하지 않았다 — skip 은 그대로 둔다.
+        CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cysd -- --test-threads=1 --nocapture --skip hwmon::tests::snapshot_has_all_sections --skip attach_race_tests::process_and_send_are_atomic_under_parser_lock_no_dup_delivery 2>&1 | tee "$LOG"
+        rc="${PIPESTATUS[0]}"
+        echo "$rc" > "$CYSD_DIR/rc"
+        write_failures "$rc"
+        [ "$rc" -eq 0 ] && exit 0
+        echo "::error title=cysd-win 실패::rc=$rc — 아래 꼬리 20줄이 원문이다"
+        tail -20 "$LOG" | sed 's/^/::error title=cysd-win 로그::/'
+        summary="$(grep -E '^test result:' "$LOG" | tail -1 || true)"
+        failed="$(printf '%s' "$summary" | grep -oE '[0-9]+ failed' | grep -oE '[0-9]+' || true)"
+        names="$(awk '/^failures:$/{f=1;next} f&&/^    [a-zA-Z_]/{print $1} f&&/^$/{f=0}' "$LOG" | sort -u | tr '\n' ' ')"
+        if [ -z "$summary" ]; then
+          echo "::error title=cysd-win 측정 실패::rc=$rc 인데 'test result' 요약이 없다 — 컴파일 실패이거나 하네스가 요약 전에 죽었다. '실패한 테스트 없음' 이 아니다"
+        elif [ "${failed:-0}" -eq 0 ]; then
+          echo "::error title=cysd-win 측정 실패::rc=$rc 인데 failed=0 이다 — 개별 테스트 실패가 아니라 하네스 이상이다(101=러스트 패닉)"
+        else
+          echo "::error title=cysd-win 테스트 실패::failed=$failed — $names"
+        fi
+        exit "$rc"
+      if: steps.window.outputs.open == 'true'
+    - name: Preserve suite 1 before the next reset
+      id: collect1
+      continue-on-error: true
+      timeout-minutes: 1
+      if: always() && steps.window.outputs.open == 'true' && steps.observer_copy.outcome == 'success'
+      shell: pwsh
+      run: |
+        python "$env:RUNNER_TEMP/schedule-suite-observer/schedule_suite_rate.py" collect --out "$env:RUNNER_TEMP/schedule-suite-${{ matrix.shard }}" --shard ${{ matrix.shard }} --position 1 --step-outcome '${{ steps.cysd_win_1.outcome }}'
+        exit $LASTEXITCODE
+    - name: Suite-regime full cysd invocation 2
+      id: cysd_win_2
+      continue-on-error: true
+      timeout-minutes: 30
+      shell: bash
+      run: |
+        # ★-e 를 명시적으로 끈다(U4 C4-①). GitHub `shell: bash` 는 `bash -eo pipefail` 로 돌고
+        #   `set -uo pipefail` 은 -e 를 끄지 않는다 — 종전엔 cargo 가 비0 이면 파이프 직후 그 자리에서
+        #   스텝이 끝나 아래 `::error` 판독 코드가 **도달 불가**였다(위 '-e 를 빼고 rc 를 잡은 뒤' 의도와
+        #   코드의 불일치 · 로컬 하네스 실측: rc 101 인데 주석 0줄). 판정(스텝 rc)은 그대로다.
+        set +e
+        set -uo pipefail
+        # 스텝 사이 전달용 **고정 경로**(다음 '판독' 스텝이 읽는다 — mktemp 값은 스텝을 넘지 못한다).
+        #   rc 파일은 cargo 가 **끝났을 때만** 생긴다 — 그 부재가 곧 '절단(강제 종료)' 의 표지다.
+        CYSD_DIR="${RUNNER_TEMP:-/tmp}/cysd-win"
+        rm -rf "$CYSD_DIR"
+        mkdir -p "$CYSD_DIR"
+        date +%s > "$CYSD_DIR/start"
+        LOG="$CYSD_DIR/cargo.log"
+        # ★(0.14.52 · CI-RED-FIX-PREP · CEO) The FULL failure list goes into the uploaded artifact (win-health-json →
+        #   win-cysd-failures.json): every failed test name and every panic's location and message, not only the 20-line tail
+        #   below. The parser is written to the step folder first, so the reader step can run it when a timeout cuts this
+        #   step (the trap below did not fire on a real cut). It never changes this step's exit code.
+        FAILS_JSON="${GITHUB_WORKSPACE:-$PWD}/win-cysd-failures.json"
+        rm -f "$FAILS_JSON"
+        cat > "$CYSD_DIR/failures.py" <<'PY'
+        import json, re, sys
+        log, status, out = sys.argv[1], sys.argv[2], sys.argv[3]
+        try:
+            with open(log, encoding="utf-8", errors="replace") as f:
+                text = f.read()
+            readable = True
+        except OSError:
+            text, readable = "", False
+        TEST = re.compile(r"^test (\S+) \.\.\. ?(.*)$")
+        # --nocapture: a panic header often follows `test X ... ` on the same line, so it is searched, not anchored.
+        # Current toolchains put the numeric thread id after the name (real windows-health log, 2026-10-19:
+        # `thread 'activity_tests::exited_seat_serializes_unknown' (12296) panicked at src\bin\cysd\activity_tests.rs:658:5:`);
+        # older ones do not, and the oldest put the message on the header line. All three are read.
+        PANIC = re.compile(r"thread '([^']*)'(?: \((\d+)\))? panicked at (.+:\d+:\d+):$")
+        PANIC_OLD = re.compile(r"thread '([^']*)'(?: \((\d+)\))? panicked at '(.*)', (.+:\d+:\d+)$")
+        # Coverage is measured against a looser header test, so a header form none of the above reads shows up as unparsed.
+        SEEN = re.compile(r"thread '[^']*'.*? panicked at ")
+        NAME = re.compile(r"^    ([A-Za-z_][A-Za-z0-9_:]*)$")
+        summary, verdict, section, panics, seen, unparsed = None, [], [], [], 0, []
+        current, in_section, panic = None, False, None
+        for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            if panic is not None:
+                # a message may hold blank lines (screen dumps), so a blank line does not end it
+                ends = (line.startswith(("note: ", "stack backtrace:", "test result:")) or line in ("failures:", "FAILED", "ok")
+                        or (line.startswith("---- ") and line.endswith(" ----"))   # next captured-output block
+                        or TEST.match(line) or SEEN.search(line))
+                if not ends:
+                    panic["message"].append(line)
+                    continue
+                panic["message"] = "\n".join(panic["message"]).rstrip("\n")
+                panics.append(panic)
+                panic = None
+            t = TEST.match(line)
+            if t:
+                current, rest = t.group(1), t.group(2).rstrip()
+            if SEEN.search(line):
+                seen += 1
+                m = PANIC.search(line)
+                if m:
+                    panic = {"thread": m.group(1), "thread_id": m.group(2), "location": m.group(3), "message": []}
+                    continue
+                m = PANIC_OLD.search(line)
+                if m:
+                    panics.append({"thread": m.group(1), "thread_id": m.group(2), "location": m.group(4), "message": m.group(3)})
+                    continue
+                unparsed.append(line)
+            if line.startswith("test result:"):
+                summary, in_section = line.strip(), False
+                continue
+            if line == "failures:":
+                in_section, section = True, []   # libtest's last failures: block holds the names
+                continue
+            if in_section:
+                m = NAME.match(line)
+                if m:
+                    section.append(m.group(1))
+                continue
+            if t:
+                if rest.endswith("FAILED"):
+                    verdict.append(current)
+                    current = None
+                elif rest.endswith(("ok", "ignored")):
+                    current = None
+                continue
+            if current is not None and line.rstrip().endswith("FAILED"):   # --nocapture: verdict after the test's output
+                verdict.append(current)
+                current = None
+        if panic is not None:
+            panic["message"] = "\n".join(panic["message"]).rstrip("\n")
+            panics.append(panic)
+        m = re.search(r"(\d+) failed", summary or "")
+        failed_in_summary = int(m.group(1)) if m else None
+        # a finished run: libtest's own failures: list; a cut run: the FAILED verdicts seen before the cut
+        failed = sorted(set(section) if summary is not None else set(verdict))
+        threads = {p["thread"] for p in panics}
+        # Two separate questions: are the NAMES complete (libtest's list matches its own count), and is the panic DETAIL
+        # complete (every header line was read; which failed tests have no panic record - a test can also fail without one).
+        doc = {"schema": "cysd-win-failures/2", "log": log, "log_readable": readable, "status": status,
+               "cut": status == "cut", "summary": summary, "failed_in_summary": failed_in_summary,
+               "names_complete": failed_in_summary is not None and failed_in_summary == len(set(section)),
+               "failed_tests": failed, "failures_section": section, "failed_verdict_lines": list(dict.fromkeys(verdict)),
+               "panic_headers_seen": seen, "panic_headers_parsed": len(panics), "panic_headers_unparsed": unparsed,
+               "panic_detail_complete": seen == len(panics),
+               "failed_tests_without_panic": [n for n in failed if n not in threads],
+               "panics": panics}
+        with open(out, "w", encoding="utf-8") as f:
+            json.dump(doc, f, ensure_ascii=False, indent=1)
+        PY
+        write_failures() {
+          local py=python
+          if command -v python3 >/dev/null 2>&1; then py=python3; fi
+          PYTHONDONTWRITEBYTECODE=1 "$py" "$CYSD_DIR/failures.py" "$LOG" "$1" "$FAILS_JSON" \
+            || echo "::warning title=cysd-win 실패 목록::win-cysd-failures.json 을 쓰지 못했다 — 실패 목록은 cargo.log 원문에만 있다"
+        }
+        # ★절단 대비 트랩 — ★★실측으로 **발동하지 않았다**(run 33944971633 · 30.1분 절단 ·
+        #   주석은 GitHub 자체 "timed out after 30 minutes" 한 줄뿐 · 아래 on_cut 산출 0건).
+        #   기전 추정: GitHub 의 타임아웃은 프로세스(그룹)를 강하게 죽이고, bash 트랩은 **명령
+        #   사이**에 도는데 파이프라인 대기 중에는 그 순간이 오지 않는다.
+        #   ⚠ 따라서 **"잘리면 검체명이 주석으로 나온다"고 기대하지 마라 — 그렇게 되지 않는다.**
+        #   현재 사실: 멈춘 검체명은 **러너 로그에는 남지만**(아래 tee·--nocapture 가 실제로 그렇게
+        #   한다) **익명 REST 로는 읽히지 않는다**(실측: 로그 403 · 아티팩트 다운로드 401 · 주석만 200).
+        #   저장소 권한이 있는 사람이 런 페이지를 열면 읽을 수 있다.
+        #   ★다음 판 1순위(IG-31): 죽을 때 뱉는 대신 **도는 동안 주기적으로** tail -1 을 ::notice 로
+        #   올린다 — 강제 종료돼도 마지막 notice 가 남는다. **미검증이므로 이번 판에 넣지 않았다.**
+        #   아래 on_cut/trap 은 무해하여 남겨 두되, 그 산출에 의존하는 설계를 얹지 마라.
+        on_cut() {
+          echo "::error title=cysd-win 절단::타임아웃으로 잘렸다 — 아래가 로그 마지막 25줄이다(멈춘 검체명이 여기 있다)"
+          tail -25 "$LOG" 2>/dev/null | sed 's/^/::error title=cysd-win 꼬리::/'
+          write_failures cut
+          exit 124
+        }
+        trap on_cut TERM INT
+        # ★실시간 스트리밍(tee) — 종전에는 rc 를 잡은 뒤에야 꼬리를 뱉어서, 타임아웃으로
+        #   죽으면 "왜 멈췄는지"가 하나도 안 남았다. tee 로 러너 로그에 흘리면 잘려도 마지막
+        #   줄이 증거로 남는다. rc 는 파이프에 삼켜지지 않게 PIPESTATUS[0] 으로 직독한다.
+        # ★--nocapture: --test-threads=1 이라 libtest 가 검체명을 실행 **전에** 찍는다 —
+        #   멈춘 검체 이름이 마지막 줄에 남는다(그게 없으면 hang 위치를 영영 모른다).
+        # ★(0.14.43 성찰 R1F-PK · S3 minor 7) hwmon **모듈 전체** skip 을 깨질 검체 하나의 정확한 이름으로 좁혔다(release.yml 의 skip 은 그대로).
+        #   남긴 skip = `hwmon::tests::snapshot_has_all_sections`: 윈도우에서는 GPU·NPU 단언이 컴파일되지 않지만(맥 전용 cfg) 코어 열거(PDH 카운터)가 이 러너에서
+        #   0개를 내는지는 재 본 적이 없다 — 확신이 없는 검체는 skip 에 남긴다.
+        # ★(R2F-PK · 성찰 2회차 · A4 M1 의 주석 몫) **이 스텝은 이제 끝까지 돈다 — 그리고 195건이 붉다.** 앞 두 런(37175872869 = 9650334f · 37182205898 = bde5e557)은 `--test-threads=1` 이름순 실행이
+        #   `attach_race_tests::process_and_send_are_atomic_under_parser_lock_no_dup_delivery` 에서 멈춘 채 30분 상한에 닿았다(그 뒤 이름의 모듈 — governance · handlers · hwmon · schedule · state … — 은 윈도우 CI 에서
+        #   한 번도 돈 적이 없었다). 그 검체를 이 스텝에서만 건너뛰자(아래 명령의 두 번째 `--skip`) **bd0a0ca3 의 런(37185687205 · 잡 14.0분)에서 처음 완주**했다:
+        #     · 이 스텝 552초(9분 13초 — 빌드 포함 · 테스트 473.67초) · 결과 **1681 통과 · 195 실패 · 3 무시 · 2 걸러짐** · 판독 annotation `cysd-win 완주·실패(비차단)` · 런·잡은 초록(비차단).
+        #     · hwmon 전용 스텝(아래 · 이 스텝이 이미 빌드해 둔 하네스를 쓰는 **실행만** 2초): **5 통과 · 0 실패**(`e2_non_macos_stub_reports_platform` 의 첫 실행 포함).
+        #     · 6차 진단 런(37188821194 · 같은 명령 · `windows-latest`)은 660초에 **1680 통과 · 196 실패** — 한 건 더 붉다(흔들림 또는 격리 의존).
+        #   195건의 지배적 원인은 제품이 아니라 **검체 격리가 윈도우에서 성립하지 않는 구조**로 보인다(진단 런 원문: 검체들이 한 상태 폴더를 공유 — 소켓 파일 이름이 같아 윈도우의 `state_dir()` 슬러그가 같다 · 경로 구분자가 박힌
+        #   기대값). 다만 196건 전부의 분류와 격리 수리(R2F-DM 몫) 전에는 **'윈도우에서 데몬 검체가 검증했다'고 말하지 않는다** — 그래서 이 스텝은 계속 **비차단**이고 그 뜻은 '실패 195건을 알고도 초록'이다.
+        #   그 사실의 유일한 채널은 아래 판독 스텝의 annotation 이다(런 결론은 success) — `scripts/pre-tag-ci-check.py` 가 성공한 런의 failure·warning annotation 제목을 요약해 태그 전에 사람 눈에 올린다.
+        #   `attach_race_tests::process_and_send_…` 의 skip 은 그대로 둔다 — 그 검체가 윈도우에서 멈추는 **원인은 여전히 미조사**다(skip 은 뒤 검체의 가시화이지 삭제가 아니다 · 맥 레인 ci-branch·release 에서는 그대로 돈다).
+        #   멈춤이 다시 나오면(= 판독 스텝의 '절단') 같은 방식으로 한 건씩 드러낸다 — 시간 예산은 아래 hwmon 스텝 머리 주석의 표(전량 스텝이 다시 30분 상한에 닿는 최악 포함)가 정본이다. 30분 상한·비차단은 그대로다.
+        # ★(R2F-DM · 성찰 2회차 수리 뒤 재측정 · 2026-10-05) **위 문단의 '195건이 붉다'는 bd0a0ca3 시점의 사실이다 — 196건의 분류와 수리가 끝났다.**
+        #   분류(6차 진단 런의 196건): 상태 폴더 공유 154 · 경로 구분자 3 · `HOME` 전제 2 · 유닉스 전제 35 · 제품 결함 2(원인 1건 — 승인 서명이 JSON 저장 뒤 깨짐 · 윈도우 100ns 시계).
+        #   수리: 시험 빌드 전용 `state_dir` 분기(제품 식 불변) · 승인 시각 양자화와 데몬 시각 원천의 마이크로초 통일 · 인계 표식 순번 · 윈도우에서 뜻이 없는 검체 44건(0.14.52 S-a C7b 에서 50건 · C7d 에서 52건)은 `ignore`+사유
+        #   (집합 핀 `r2f_dm_windows_ignore_attributes_are_exactly_the_decided_set_of_103` — 새 `ignore` 는 그 목록을 고쳐야 붉지 않다).
+        #   재측정(같은 명령): 커밋 5c4b2ac2 = 진단 37201047193 `1835 통과 · 15 실패 · 44 무시` / 이 스텝 37201027633 `1841 · 9 · 44`
+        #     → 커밋 2bf75a12 = 진단 37249118071 **`1853 통과 · 0 실패 · 47 무시`** / 이 스텝 37249110248 `1851 · 2 · 47` / 진단 반복 37250481491 `1852 · 1 · 47`.
+        #   **남은 것 = 시점 의존 검체 가족의 흔들림.** 2bf75a12 의 세 실행에서 실패가 0 · 2 · 1 건이고 매번 다른 검체다(`b1_gate_delivers_at_prompt_boundary_while_output_streams` ·
+        #   `b1_merge_delivers_same_sender_burst_in_one_turn` · `j3_queued_send_from_cli_label_reaches_entry_digest_header_and_ledger`). 셋 다 좌석을 만든 직후 화면을 그리거나 큐를 넣고 곧바로 배달·판정을 재는 꼴이다 —
+        #   그 사이에 좌석 출력(윈도우 ConPTY 의 기동 출력으로 본다)이 끼면 제품이 옳게도 '출력 중'으로 보류해 붉어진다. 같은 꼴로 붉었던 4건은 검체를 결정론으로 고쳤고(`state::test_until_no_pty_output` — 그 뒤 세 실행 모두 통과)
+        #   나머지는 손대지 않았다 → **'3회 연속 초록'에 닿지 못했으므로 차단 승격은 아직 하지 않는다**(비차단 유지 · 사실의 채널은 여전히 아래 판독 annotation 과 `scripts/pre-tag-ci-check.py` 의 요약이다).
+        #   승격의 남은 일 = 그 가족의 좌석 픽스처가 조용한 관측 창을 보장하게 하는 것(다음 판 · 검체 수십 건). 이 스텝의 실패가 **그 가족 밖**에서 나오면 흔들림으로 넘기지 말고 원문을 보라.
+        #   `attach_race_tests::process_and_send_…` 가 멈추는 원인의 후보도 생겼다: 그 검체의 관측자 루프는 좌석의 종료 래치(`exited`)를 상한 없이 기다리는데, 이 러너에서는 좌석 프로세스가 끝나거나 죽어도 reader 가
+        #   EOF 를 보지 못했다(같은 뿌리의 검체 3건 — 10~15초 대기 · 두 실행 모두 · 지금은 `ignore`+사유). 인과는 코드로 읽은 것이고 따로 실험하지 않았다 — skip 은 그대로 둔다.
+        CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cysd -- --test-threads=1 --nocapture --skip hwmon::tests::snapshot_has_all_sections --skip attach_race_tests::process_and_send_are_atomic_under_parser_lock_no_dup_delivery 2>&1 | tee "$LOG"
+        rc="${PIPESTATUS[0]}"
+        echo "$rc" > "$CYSD_DIR/rc"
+        write_failures "$rc"
+        [ "$rc" -eq 0 ] && exit 0
+        echo "::error title=cysd-win 실패::rc=$rc — 아래 꼬리 20줄이 원문이다"
+        tail -20 "$LOG" | sed 's/^/::error title=cysd-win 로그::/'
+        summary="$(grep -E '^test result:' "$LOG" | tail -1 || true)"
+        failed="$(printf '%s' "$summary" | grep -oE '[0-9]+ failed' | grep -oE '[0-9]+' || true)"
+        names="$(awk '/^failures:$/{f=1;next} f&&/^    [a-zA-Z_]/{print $1} f&&/^$/{f=0}' "$LOG" | sort -u | tr '\n' ' ')"
+        if [ -z "$summary" ]; then
+          echo "::error title=cysd-win 측정 실패::rc=$rc 인데 'test result' 요약이 없다 — 컴파일 실패이거나 하네스가 요약 전에 죽었다. '실패한 테스트 없음' 이 아니다"
+        elif [ "${failed:-0}" -eq 0 ]; then
+          echo "::error title=cysd-win 측정 실패::rc=$rc 인데 failed=0 이다 — 개별 테스트 실패가 아니라 하네스 이상이다(101=러스트 패닉)"
+        else
+          echo "::error title=cysd-win 테스트 실패::failed=$failed — $names"
+        fi
+        exit "$rc"
+      if: steps.window.outputs.open == 'true' && steps.collect1.outputs.complete == 'true'
+    - name: Preserve suite 2 before the next reset
+      id: collect2
+      continue-on-error: true
+      timeout-minutes: 1
+      if: always() && steps.window.outputs.open == 'true' && steps.observer_copy.outcome == 'success'
+      shell: pwsh
+      run: |
+        python "$env:RUNNER_TEMP/schedule-suite-observer/schedule_suite_rate.py" collect --out "$env:RUNNER_TEMP/schedule-suite-${{ matrix.shard }}" --shard ${{ matrix.shard }} --position 2 --step-outcome '${{ steps.cysd_win_2.outcome }}'
+        exit $LASTEXITCODE
+    - name: Return all suite facts even after red or truncation
+      if: always()
+      uses: actions/upload-artifact@v4
+      timeout-minutes: 3
+      with:
+        name: schedule-lock-suite-regime-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}-shard-${{ matrix.shard
+          }}
+        path: ${{ runner.temp }}/schedule-suite-${{ matrix.shard }}/
+        if-no-files-found: error
+        retention-days: 30
+    - name: Keep collection failure and every inner red visible
+      if: always()
+      shell: pwsh
+      timeout-minutes: 1
+      run: |
+        if ('${{ steps.window.outputs.open }}' -ne 'true') { throw 'Window closed; fixed denominator is incomplete.' }
+        foreach ($position in 1,2) {
+          $sample = 2 * ${{ matrix.shard }} - 2 + $position
+          $path = "$env:RUNNER_TEMP/schedule-suite-${{ matrix.shard }}/sample-$sample/suite-sample.json"
+          if (-not (Test-Path $path)) { throw 'Missing suite record; no rate.' }
+          $row = Get-Content $path -Raw | ConvertFrom-Json
+          if (-not $row.complete) { throw 'Incomplete suite/target observation; no rate.' }
+          if ($row.failed_tests.Count -gt 0) { throw 'Inner failures observed; this is not a release pass.' }
+        }
