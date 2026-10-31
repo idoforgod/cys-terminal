@@ -33971,6 +33971,7 @@ mod p1_cycle_tests {
                 continue; // no request was made on an unpublished/torn fixture paint
             }
             let response = clear(f, me, s, observed);
+            assert!(std::time::Instant::now() < deadline, "own-paste handler returned after the shared fixture deadline; result is not accepted: {}", s.inject_track.win_diag.dump()); // wallclock: guard rejects late completion; does not preempt a blocking handler
             let after = s.output_gen.load(Ordering::Acquire);
             let retry = crate::agent_queue_tests::fixture_zero_write_retry(cfg!(windows),
                 response["error"]["code"].as_str(), before, after, input,
