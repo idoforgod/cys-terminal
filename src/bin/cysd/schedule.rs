@@ -603,14 +603,13 @@ impl ScheduleFileLock {
 
     // One acquisition owns its operations; no global observer, platform override or environment knob.
     fn acquire_with_ops<O: ScheduleLockOps>(path: &std::path::Path, wait: Duration, stale: Duration, windows: bool, ops: &mut O) -> Option<Self> {
-        let _ = windows; // RED scaffold: the original loop has no Windows-denial retry yet.
         let dir = Self::lock_dir_for(path);
         if let Some(parent) = dir.parent() {
             ops.parent(parent);
         }
         let deadline = ops.now() + wait;
         loop {
-            match ops.create(&dir) {
+            let denied_retry = match ops.create(&dir) {
                 Ok(()) => return Some(Self { dir }),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     // 죽은 보유자의 잠금인가 — mtime 이 부패 상한을 넘겼으면 깨고 다시 잡는다.
@@ -630,13 +629,17 @@ impl ScheduleFileLock {
                     //   `ensure_builtin_jobs()`(main.rs)가 accept 루프 **이전**에 동기로 부르므로
                     //   데몬이 소켓을 한 번도 받지 못한다(부트체인 전손 · 자가 회복 경로 없음).
                     //   유계 대기 뒤 `None` = 쓰기 포기(막는 방향).
+                    false
                 }
+                Err(e) if windows && e.kind() == std::io::ErrorKind::PermissionDenied => true,
                 Err(_) => return None, // 잠금 디렉터리를 만들 수 없는 파일시스템 — 쓰기 포기(막는 방향)
-            }
+            };
             if ops.now() >= deadline {
                 return None;
             }
             ops.sleep(Duration::from_millis(10));
+            // Only a just-observed Windows denial gets the new wake fence. AlreadyExists retains its legacy path.
+            if denied_retry && ops.now() >= deadline { return None; }
         }
     }
 }
