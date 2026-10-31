@@ -646,6 +646,12 @@ impl Drop for ScheduleFileLock {
     }
 }
 
+// Call-owned I/O seam: production always supplies std::fs::read. No global fault switch.
+type ScheduleReader<'a> = dyn Fn(&std::path::Path) -> std::io::Result<Vec<u8>> + 'a;
+fn schedule_read_text(path: &std::path::Path, read: &ScheduleReader<'_>) -> std::io::Result<String> {
+    String::from_utf8(read(path)?).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
 /// built-in 잡을 jobs 배열에 idempotent upsert(순수 — 회귀 핀). id 로 대조:
 ///   · 부재 → append(생성)
 ///   · 존재 + built-in 마커(`_builtin`이 코드 정의와 일치: "phoenix"·"learn"·"cycle"·"formation"·"promote") → 버전 상이 시 교체(갱신)·동버전 무접촉
@@ -793,16 +799,22 @@ pub fn ensure_builtin_jobs() {
 
 /// 경로 주입판(검체 가능) — 위 함수의 본체. ★(성찰 A11) **writer 잠금** 아래에서 읽고·접고·쓴다.
 pub fn ensure_builtin_jobs_at(path: &std::path::Path) {
+    ensure_builtin_jobs_at_read(path, &|p| std::fs::read(p));
+}
+fn ensure_builtin_jobs_at_read(path: &std::path::Path, read: &ScheduleReader<'_>) {
     let Some(_lock) = ScheduleFileLock::acquire(path) else {
         eprintln!("[cysd] ensure_builtin_jobs: schedule.json writer 잠금을 {SCHEDULE_LOCK_WAIT_MS}ms 안에 잡지 못했다 — 무접촉(다음 기회에 다시)");
         return;
     };
-    ensure_builtin_jobs_locked(path);
+    ensure_builtin_jobs_locked_read(path, read);
 }
 
 /// 잠금을 **이미 쥔** 호출자용 본체(손상 격리 직후 같은 틱의 복구가 여기로 온다).
 fn ensure_builtin_jobs_locked(path: &std::path::Path) {
-    let mut root: serde_json::Value = match std::fs::read_to_string(path) {
+    ensure_builtin_jobs_locked_read(path, &|p| std::fs::read(p));
+}
+fn ensure_builtin_jobs_locked_read(path: &std::path::Path, read: &ScheduleReader<'_>) {
+    let mut root: serde_json::Value = match schedule_read_text(path, read) {
         Ok(c) => match serde_json::from_str(&c) {
             Ok(v) => v,
             Err(e) => {
@@ -908,6 +920,9 @@ pub enum LoadMode {
 
 /// 경로 주입판(검체 가능) — 두 로더의 본체.
 pub fn load_jobs_at(path: &std::path::Path, mode: LoadMode) -> Vec<Job> {
+    load_jobs_at_read(path, mode, &|p| std::fs::read(p))
+}
+fn load_jobs_at_read(path: &std::path::Path, mode: LoadMode, read: &ScheduleReader<'_>) -> Vec<Job> {
     // 쓰기 모드는 읽기 **전에** 잠근다 — 읽기와 치환 사이에 CLI 추가가 끼어들면 그 추가가
     // 우리의 옛 문서로 덮여 사라진다(CLI 는 이미 성공을 출력한 뒤 = 거짓 성공).
     let lock = match mode {
@@ -917,11 +932,11 @@ pub fn load_jobs_at(path: &std::path::Path, mode: LoadMode) -> Vec<Job> {
             None => {
                 // 잠금을 못 잡았다 — 이번 틱은 **읽기만** 한다(쓰기 없는 경로로 강등 · 발화는 계속).
                 eprintln!("[cysd] schedule: writer 잠금을 {SCHEDULE_LOCK_WAIT_MS}ms 안에 잡지 못했다 — 이번 틱은 읽기만 한다");
-                return load_jobs_at(path, LoadMode::ReadOnly);
+                return load_jobs_at_read(path, LoadMode::ReadOnly, read);
             }
         },
     };
-    let content = match std::fs::read_to_string(path) {
+    let content = match schedule_read_text(path, read) {
         Ok(c) => c,
         // 부재 = 정상(스케줄 미설정). 빈 스케줄로 조용히 진행한다.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
@@ -952,7 +967,7 @@ pub fn load_jobs_at(path: &std::path::Path, mode: LoadMode) -> Vec<Job> {
             //   **데몬 재시작까지 전부 정지**했다(코드 자신이 경고한 무발화 침묵).
             eprintln!("[cysd] schedule.json 파싱 실패: {e} — {note}; 같은 틱에서 built-in 잡을 복구한다");
             ensure_builtin_jobs_locked(path);
-            return match std::fs::read_to_string(path)
+            return match schedule_read_text(path, read)
                 .ok()
                 .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
             {
@@ -1494,11 +1509,14 @@ fn remove_job_from_file(job_id: &str) {
 
 /// 경로 주입판 — ★(성찰 A11) writer 잠금 아래에서 읽고·빼고·쓴다(읽기와 치환 사이의 CLI 추가 보존).
 fn remove_job_from_file_at(path: &std::path::Path, job_id: &str) {
+    remove_job_from_file_at_read(path, job_id, &|p| std::fs::read(p));
+}
+fn remove_job_from_file_at_read(path: &std::path::Path, job_id: &str, read: &ScheduleReader<'_>) {
     let Some(_lock) = ScheduleFileLock::acquire(path) else {
         eprintln!("[cysd] schedule: 원샷 잡 '{job_id}' 제거 — writer 잠금을 잡지 못했다 · 다음 틱이 다시 시도한다");
         return;
     };
-    let Ok(content) = std::fs::read_to_string(path) else {
+    let Ok(content) = schedule_read_text(path, read) else {
         return;
     };
     let Ok(mut root) = serde_json::from_str::<serde_json::Value>(&content) else {
@@ -1518,6 +1536,9 @@ fn requeue_oneshot_after_frozen(daemon: &Arc<Daemon>, job: &Job) {
 }
 
 fn requeue_oneshot_after_frozen_at(daemon: &Arc<Daemon>, path: &std::path::Path, job: &Job) {
+    requeue_oneshot_after_frozen_at_read(daemon, path, job, &|p| std::fs::read(p));
+}
+fn requeue_oneshot_after_frozen_at_read(daemon: &Arc<Daemon>, path: &std::path::Path, job: &Job, read: &ScheduleReader<'_>) {
     let Some(at) = job.at else { return };
     if job.every_minutes.is_some_and(|m| m > 0) {
         return;
@@ -1526,7 +1547,7 @@ fn requeue_oneshot_after_frozen_at(daemon: &Arc<Daemon>, path: &std::path::Path,
     back.at = Some(at.saturating_add(1));
     let ok = (|| {
         let _lock = ScheduleFileLock::acquire(path)?;
-        let mut root: serde_json::Value = std::fs::read_to_string(path)
+        let mut root: serde_json::Value = schedule_read_text(path, read)
             .ok()
             .and_then(|c| serde_json::from_str(&c).ok())
             .unwrap_or_else(|| json!({"jobs": []}));
@@ -7906,3 +7927,7 @@ mod pkg1_auth_hold_tests {
         assert!(pkg1_lapse_events(daemon, s.id).is_empty(), "a wall-clock jump must not lapse the hold");
     }
 }
+
+#[cfg(test)]
+#[path = "schedule_integrity_tests.rs"]
+mod integrity_tests;
