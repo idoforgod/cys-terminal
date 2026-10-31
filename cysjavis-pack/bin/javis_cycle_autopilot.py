@@ -540,6 +540,7 @@ HELD_RETRY_MAX = 3      # 구조적 보류(구 데몬) 하드 상한 — 게이�
 HELD_NOTIFY_EVERY = 3   # 비구조 보류 digest 통지 주기(연속 1회째 + 이후 배수) — 큐 남발 방지 노브
 QUIET_UNREPORTED_DIAG = "quiet_secs_unreported"
 GATE_MODAL_DIAG = "gate_or_modal_foreground"
+GUARD_RETRY_EXHAUSTED_DIAG = "guard_retry_exhausted"
 # ★러스트 src/bin/cys.rs cycle_quiet_timeout_diagnostic 의 rc84 문면
 #   [diag=quiet_secs_unreported] 와 같은 토큰 — cargo 검체가 QUIET_UNREPORTED_DIAG 리터럴을 파싱한다.
 # GATE_MODAL_DIAG 는 러스트 CYCLE_GATE_MODAL_DIAG 와 같은 값 · 구조적 토큰과 달라야 한다.
@@ -605,6 +606,8 @@ def held_classify(rc, tail):
     if rc == 84 and not structural:
         if "[diag=%s]" % GATE_MODAL_DIAG in (tail or ""):
             alive_evidence = "rc84: 관문·모달 전경으로 보류(사람이 1회 통과해야 한다)"
+        elif "[diag=%s]" % GUARD_RETRY_EXHAUSTED_DIAG in (tail or ""):
+            alive_evidence = "rc84: 유휴 관측 뒤 쓰기 전 가드 3회 거부(clear 송신 0건; 지속 바쁨·현재 생존 근거 아님)"
         else:
             alive_evidence = "rc84: 대상이 유휴 대기 창 내내 턴 중(살아 있음)"
     elif rc == 85:
@@ -2818,6 +2821,22 @@ def cmd_self_test(args):
              {"structural": False,
               "alive_evidence": "rc84: 대상이 유휴 대기 창 내내 턴 중(살아 있음)",
               "keys_sent": "0건"}),
+            ("rc84 guard retry exhausted", 84, "cycle_clear_guard_retry_exhausted [diag=guard_retry_exhausted]",
+             {"structural": False,
+              "alive_evidence": "rc84: 유휴 관측 뒤 쓰기 전 가드 3회 거부(clear 송신 0건; 지속 바쁨·현재 생존 근거 아님)",
+              "keys_sent": "0건"}),
+            ("rc84 guard marker suffix is not exact", 84, "[diag=guard_retry_exhausted_x]",
+             {"structural": False,
+              "alive_evidence": "rc84: 대상이 유휴 대기 창 내내 턴 중(살아 있음)",
+              "keys_sent": "0건"}),
+            ("rc84 guard marker prefix is not exact", 84, "[diag=x_guard_retry_exhausted]",
+             {"structural": False,
+              "alive_evidence": "rc84: 대상이 유휴 대기 창 내내 턴 중(살아 있음)",
+              "keys_sent": "0건"}),
+            ("rc84 structural still wins over guard marker", 84, "[diag=quiet_secs_unreported] [diag=guard_retry_exhausted]",
+             {"structural": True, "alive_evidence": None, "keys_sent": "0건"}),
+            ("rc85 does not consume guard marker", 85, "[diag=guard_retry_exhausted]",
+             {"structural": False, "alive_evidence": "rc85: 사람 초안·입력 감지", "keys_sent": "0건"}),
             ("rc84 관문·모달 전경", 84, "…[diag=gate_or_modal_foreground]…",
              {"structural": False,
               "alive_evidence": "rc84: 관문·모달 전경으로 보류(사람이 1회 통과해야 한다)",
