@@ -122,13 +122,13 @@ def main():
         if os.environ.get('GITHUB_SHA') != tip or os.environ.get('GITHUB_REF') != 'refs/heads/diag/0.14.56-schedule-lock-rate':
             raise RuntimeError('Workflow association is not the approved diagnostic tip/ref')
         first = git('rev-parse', 'HEAD^')
-        if git('rev-parse', 'HEAD^^') != BASE:
-            raise RuntimeError('Expected exactly two diagnostic commits above the frozen base')
+        if git('rev-parse', 'HEAD^^^') != BASE:
+            raise RuntimeError('Expected exactly three diagnostic commits above the frozen base')
         if set(git('diff', '--name-only', BASE, first).splitlines()) != {'.github/workflows/diag-schedule-lock-rate.yml', 'scripts/diag/schedule_lock_rate.py'}:
             raise RuntimeError('Baseline commit changed unexpected inputs')
         if git('diff', '--name-only', first, tip) != 'src/bin/cysd/schedule.rs':
             raise RuntimeError('Instrumentation commit changed unexpected inputs')
-        ref = first if args.arm == 'baseline' else tip
+        ref = BASE if args.arm == 'baseline' else tip
         source = out / 'source'
         subprocess.run(['git', 'worktree', 'add', '--detach', str(source), ref], cwd=repo, check=True)
         schedule = source / 'src/bin/cysd/schedule.rs'
@@ -141,7 +141,7 @@ def main():
         manifest['build_environment'] = {key: env.get(key) for key in ['PATH', 'HOME', 'USERPROFILE', 'TEMP', 'TMP', 'CYS_PACK_DIR', 'RUST_MIN_STACK', 'CARGO_TARGET_DIR', 'CARGO_INCREMENTAL', 'CARGO_BUILD_JOBS', 'RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS', 'RUSTUP_TOOLCHAIN', 'PYTHONUTF8']}
         manifest['cargo_path'] = shutil.which('cargo', path=env['PATH'])
         manifest['rustc_path'] = shutil.which('rustc', path=env['PATH'])
-        manifest.update(cpu_count=os.cpu_count(), free_bytes_before_build=shutil.disk_usage(out).free, tip=tip, first_diag_commit=first, measured_ref=ref, schedule_sha256=digest(schedule), baseline_schedule_sha256=hashlib.sha256(base_bytes).hexdigest(), rustc=subprocess.check_output(['rustc', '-Vv'], env=env, text=True), cargo=subprocess.check_output(['cargo', '-V'], env=env, text=True), limits={'build_seconds': 1200, 'iteration_seconds': 30, 'measurement_budget_seconds': 1800}, rust_min_stack=env['RUST_MIN_STACK'])
+        manifest.update(cpu_count=os.cpu_count(), free_bytes_before_build=shutil.disk_usage(out).free, tip=tip, protocol_commit=first, measured_ref=ref, schedule_sha256=digest(schedule), baseline_schedule_sha256=hashlib.sha256(base_bytes).hexdigest(), rustc=subprocess.check_output(['rustc', '-Vv'], env=env, text=True), cargo=subprocess.check_output(['cargo', '-V'], env=env, text=True), limits={'build_seconds': 1200, 'iteration_seconds': 30, 'measurement_budget_seconds': 1800}, rust_min_stack=env['RUST_MIN_STACK'])
         (out / 'manifest.json').write_text(json.dumps(manifest, indent=2))
         build = execute(['cargo', 'test', '--bin', 'cysd', '--no-run', '--message-format=json'], source, env, out / 'build.log', 1200)
         (out / 'build.json').write_text(json.dumps(build, indent=2))
