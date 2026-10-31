@@ -1,0 +1,63 @@
+name: diag-schedule-lock-rate
+on:
+  push:
+    branches: ['diag/0.14.56-schedule-lock-rate']
+permissions:
+  contents: read
+concurrency:
+  group: diag-schedule-lock-rate-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  measure:
+    runs-on: windows-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        arm: [baseline, instrumented]
+    env:
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 5
+        with:
+          fetch-depth: 3
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        timeout-minutes: 5
+        with:
+          python-version: '3.12'
+      - name: Build once and collect 300 exact single-test processes
+        id: measure
+        timeout-minutes: 60
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          python scripts/diag/schedule_lock_rate.py --arm '${{ matrix.arm }}' --out "$env:RUNNER_TEMP/schedule-rate-${{ matrix.arm }}"
+          exit $LASTEXITCODE
+      - name: Return raw evidence even when collection is incomplete
+        if: always()
+        uses: actions/upload-artifact@v4
+        timeout-minutes: 5
+        with:
+          name: schedule-lock-rate-${{ github.sha }}-${{ matrix.arm }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/schedule-rate-${{ matrix.arm }}/manifest.json
+            ${{ runner.temp }}/schedule-rate-${{ matrix.arm }}/summary.json
+            ${{ runner.temp }}/schedule-rate-${{ matrix.arm }}/build.json
+            ${{ runner.temp }}/schedule-rate-${{ matrix.arm }}/build.log
+            ${{ runner.temp }}/schedule-rate-${{ matrix.arm }}/test-list.log
+            ${{ runner.temp }}/schedule-rate-${{ matrix.arm }}/iterations-started.jsonl
+            ${{ runner.temp }}/schedule-rate-${{ matrix.arm }}/iterations.jsonl
+            ${{ runner.temp }}/schedule-rate-${{ matrix.arm }}/iteration-*.log
+            ${{ runner.temp }}/schedule-rate-${{ matrix.arm }}/*.kill.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Keep collection status and inner failures separate
+        if: always()
+        shell: pwsh
+        run: |
+          if ('${{ steps.measure.outcome }}' -ne 'success') { throw 'Rate/diagnostic collection incomplete; read both axes in uploaded evidence.' }
+          $summary = Get-Content "$env:RUNNER_TEMP/schedule-rate-${{ matrix.arm }}/summary.json" -Raw | ConvertFrom-Json
+          if (-not $summary.complete_classified_sample) { throw 'Incomplete sample; no rate verdict.' }
+          if ($summary.counts.fail -gt 0) { throw 'Measured inner failures remain. This is not a release pass.' }
