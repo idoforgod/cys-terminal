@@ -18,7 +18,7 @@
 // absent         : 2   (new in this release - no previous vendor content exists)
 //   + bin/_owned_process.py
 //   + bin/javis_spool_path.py
-// generated from : 26d3380426210567f2152d17d520639c58164072
+// generated from : 13e6b5f1926bf864808b65f42949b07160fcf2b3
 
 /// `(rel, &[sha256 of that path's content in each prior release where it differed])`.
 /// Sorted by `rel`; [`prev_vendor_hashes`] relies on that for a binary search.
@@ -38,7 +38,7 @@ pub static PREV_VENDOR_HASHES: &[(&str, &[&str])] = &[
     ("bin/javis_cleanroom.py", &["f525ffdc762e5fc252c14279a254c5b3e0f29232472493381389873baee5b2c4"]),
     ("bin/javis_compete.py", &["22d08beb508c9284aeed1166fb8eb8c153b76e226852f92c1d1c4836c1d1f217"]),
     ("bin/javis_completion_guard.py", &["0b360be8dea72b25268f750dc1b8782aae9dbb412f64dabbe4b56ec13e981b52", "941c3f0265502665ca158851df2b5ba97feffae02c62eedd43034ca088614c67", "0caabee289230976f02c14a141e446e69c3164f4a306b72c5e89e896da99e462"]),
-    ("bin/javis_cycle_autopilot.py", &["14d538615691bf101f25814e32b90cc75ceb5d20e6deba4cd44943ed09a40941", "6890fd604cc0fe6b1f5e974a72cece59726c26c4730a784eb42e5ffe43137056", "dbea1bf522fdc3884bdd32628e3ddc65b4cc7b66f7a957cd5f242da1a80fbdf9", "0a8b2722c456034ca484cfb19ee48b4d275c5650115425a9876fd1b340677f97", "a88bbf8b7cf1837427d026925e7f293a33eb7062c6eac203123ae52d42f6295f", "f7d0b89213f7172a3f70712bd02a319db11c42d59aa98c05a474884e32909ad6"]),
+    ("bin/javis_cycle_autopilot.py", &["14d538615691bf101f25814e32b90cc75ceb5d20e6deba4cd44943ed09a40941", "6890fd604cc0fe6b1f5e974a72cece59726c26c4730a784eb42e5ffe43137056", "dbea1bf522fdc3884bdd32628e3ddc65b4cc7b66f7a957cd5f242da1a80fbdf9", "0a8b2722c456034ca484cfb19ee48b4d275c5650115425a9876fd1b340677f97", "a88bbf8b7cf1837427d026925e7f293a33eb7062c6eac203123ae52d42f6295f", "f7d0b89213f7172a3f70712bd02a319db11c42d59aa98c05a474884e32909ad6", "7b81fa63e85c445223039a625f39abaa943c9882c5f1bd498d9caaef297de0fb"]),
     ("bin/javis_cycle_verifier.py", &["2494d2a51c22a8faf6395ee17b24639fdfb1f46c8c97775ae1064beed24e9843", "6520732a123c833055a12c48617dc4604508557cf4b253d8cf9ada7fc63a8c62", "af3450b9f5f69c5b0d59882f2da0409ca48b7d09f9e73e36841b4822d2d88772", "8fa45202267d7fcfd27b74138f511b24f4c16603ead07a72bd55c8b86b6c8920", "e5db5415293fcca3433dd56a599d3220eb1ff5eb2e2e7f3644d6004a965f50d8"]),
     ("bin/javis_dept_migrate.py", &["fd3d2ef30e094f2a2d997fc263b3b3e3b9c09ee223dc5376b8a388862ba80c7b", "d3fb3c74c4e82b5d06f5fa04bd2f191c2aad925c93af7a226ebc7b4ff91ed997", "9745d6a1d9e7edf9c8423d351a815d480d569a9c857ebac56f4cb2a49f129d18"]),
     ("bin/javis_detect.py", &["1459a1106e4a303a603380f4de3b0fda5b327ea187357d1558617cc4c607255e", "0edc99c294c7019d323c769a998dda84a738fe2d1f79b273392d33232a4fc073"]),
