@@ -645,7 +645,7 @@ jobs:
           #     (WP6-3 괴리 임계). 실측 2026-09-15 · macOS arm64 · python 3.14.7 · 루프와 같은 env
           #     (CYS_PACK_DIR 임시 + 격리 HOME/CYS_STATE_DIR) · 4종 전건 rc=0 · 합계 약 4s.
           for t in test_todo_decl test_todo_stamp test_report_ghost test_hud_bridge_skew \
-                   test_report_gate test_todo_shared_constants test_import_guard test_radio test_scrub \
+                   test_report_gate test_orchestra_todo_path test_todo_shared_constants test_import_guard test_event_spool_rc test_org_dispatch_delivers test_pkg3a_tools_lane test_radio test_scrub \
                    test_bootstrap_chain test_snapshot \
                    test_dept_name_guard test_preflight_c03_states test_content_pins_parity \
                    test_hud_bridge_backoff test_preflight_c11b_seal test_wakeup_liveness \
@@ -660,8 +660,8 @@ jobs:
                    test_cso_directive_rev test_role_authority test_role_authority_shell \
                    test_role_authority_triage \
                    test_round_stop_reason test_resource_gate test_resource_gate_fleet_cpu test_resource_gate_product_cpu \
-                   test_inject_context_role_seat test_inject_context_soul_l0 test_carry_unproven_scope \
-                   test_wp18_skillscan_failopen \
+                   test_inject_context_role_seat test_inject_context_soul_l0 test_inject_context_owned_cwd test_carry_unproven_scope \
+                   test_wp18_skillscan_failopen test_owned_process test_pkg3a_owned_tools \
                    test_skillscan_orphan_horizon \
                    test_wakeup_durable_receipt test_wakeup_park_failure \
                    test_capgate_remeasure_order test_phoenix_p10_lease_split \
@@ -673,6 +673,8 @@ jobs:
                    test_refl_wakeup_expiry_attribution \
                    test_phoenix_fresh_honest test_phoenix_f1_production_path test_phoenix_g2_ack_only test_phoenix_c6_due test_reap_exited_matrix \
                    test_phoenix_r32_restore_budget test_phoenix_encoding_default \
+                   test_phoenix_plan_cli test_phoenix_plan_certify test_phoenix_plan_identity \
+                   test_phoenix_plan_side_effect_free test_phoenix_result_file \
                    test_report_ctx_axis test_formation_tick_visibility \
                    test_resource_gate_boot_anchor test_ctx_divergence \
                    test_state_rotate test_bootstrap_resource_recheck test_secret_scan_limit test_pack_guard_hooks_guidance test_silentpass_pack_c2 \
@@ -874,6 +876,17 @@ jobs:
             --root "$RT" --out src-tauri/resources/runtime-manifest.json \
             --app-version "$(grep -m1 '"version"' src-tauri/tauri.conf.json | sed -E 's/.*"([0-9][0-9.]*)".*/\1/')" \
             --source win-src
+
+      - name: C-03 owned process native Windows (bundled Python)
+        if: matrix.platform == 'windows-latest'
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Native Job/spawn/no-console tests; local macOS skips are not evidence.
+          # -B protects the staged runtime and pack from bytecode writes.
+          C03_TEST_BASH="$(cygpath -w "$PWD/src-tauri/runtime/git/bin/bash.exe")" src-tauri/runtime/python/python.exe -B -u cysjavis-pack/bin/tests/test_owned_process.py
+
 
       # macOS 자기완결 런타임 동봉 (RC-20/T6b — 순정 맥=개발도구 없는 소비자. python3·git은 CLT-shim이라
       # 실행 시 개발도구 프롬프트 → 동봉 필수). tauri.conf.json bundle.resources("runtime/")가 이 트리를
@@ -1557,7 +1570,7 @@ jobs:
           #     (WP6-3 괴리 임계). 실측 2026-09-15 · macOS arm64 · python 3.14.7 · 루프와 같은 env
           #     (CYS_PACK_DIR 임시 + 격리 HOME/CYS_STATE_DIR) · 4종 전건 rc=0 · 합계 약 4s.
           for t in test_todo_decl test_todo_stamp test_report_ghost test_hud_bridge_skew \
-                   test_report_gate test_todo_shared_constants test_import_guard test_radio test_scrub \
+                   test_report_gate test_orchestra_todo_path test_todo_shared_constants test_import_guard test_event_spool_rc test_org_dispatch_delivers test_pkg3a_tools_lane test_radio test_scrub \
                    test_bootstrap_chain test_snapshot \
                    test_role_bootstrap_hook test_seat_latch_negation \
                    test_hud_bridge_backoff test_preflight_c11b_seal test_wakeup_liveness \
@@ -1572,8 +1585,8 @@ jobs:
                    test_cso_directive_rev test_role_authority test_role_authority_shell \
                    test_role_authority_triage \
                    test_round_stop_reason test_resource_gate test_resource_gate_fleet_cpu test_resource_gate_product_cpu \
-                   test_inject_context_role_seat test_inject_context_soul_l0 test_carry_unproven_scope \
-                   test_wp18_skillscan_failopen \
+                   test_inject_context_role_seat test_inject_context_soul_l0 test_inject_context_owned_cwd test_carry_unproven_scope \
+                   test_wp18_skillscan_failopen test_owned_process test_pkg3a_owned_tools \
                    test_skillscan_orphan_horizon \
                    test_wakeup_durable_receipt test_wakeup_park_failure \
                    test_capgate_remeasure_order test_phoenix_p10_lease_split \
@@ -1585,6 +1598,8 @@ jobs:
                    test_refl_wakeup_expiry_attribution \
                    test_phoenix_fresh_honest test_phoenix_f1_production_path test_phoenix_g2_ack_only test_phoenix_c6_due test_reap_exited_matrix \
                    test_phoenix_r32_restore_budget test_phoenix_encoding_default \
+                   test_phoenix_plan_cli test_phoenix_plan_certify test_phoenix_plan_identity \
+                   test_phoenix_plan_side_effect_free test_phoenix_result_file \
                    test_report_ctx_axis test_formation_tick_visibility \
                    test_resource_gate_boot_anchor test_ctx_divergence \
                    test_state_rotate test_bootstrap_resource_recheck test_secret_scan_limit test_pack_guard_hooks_guidance test_silentpass_pack_c2 \
