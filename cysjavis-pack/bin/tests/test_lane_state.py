@@ -414,6 +414,9 @@ class Paths(Base):
         self.assertEqual(got["preflight_heartbeat"], got["ap"][2])
         other = self.probe(dept="dept-6")
         self.assertNotEqual(other["preflight_heartbeat"], got["preflight_heartbeat"])
+        mixed = self.probe(CYS_SOCKET=self.sock("dept-1"), AITERM_SOCKET=self.sock("dept-2"))
+        control("P1R mixed aliases: verifier equals autopilot=%s" % (mixed["ap"][:4] == mixed["vf"]))
+        self.assertEqual(mixed["ap"][:4], mixed["vf"])
 
     def test_mode_knob_is_per_lane_and_fails_toward_shadow(self):
         base_dir = self.expected("cys")

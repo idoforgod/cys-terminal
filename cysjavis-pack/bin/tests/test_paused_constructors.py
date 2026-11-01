@@ -192,11 +192,19 @@ class Lane(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr[-400:])
         return json.loads([x for x in r.stdout.splitlines() if x.startswith("@@")][-1][2:])
 
+    def outside_rig(self, paths):
+        rig = os.path.realpath(self.home) + os.sep
+        return [p for p in paths if not os.path.realpath(p).startswith(rig)]
+
     def hits(self, mod, fn):
         paths = self.ask(mod, fn)
-        rig = os.path.realpath(self.home) + os.sep
-        self.assertEqual([p for p in paths if not os.path.realpath(p).startswith(rig)], [], "outside the rig")
+        self.assertEqual(self.outside_rig(paths), [], "outside the rig")
         return [p for p in paths if os.path.exists(p)]
+
+    def test_the_rig_check_flags_a_path_outside_the_rig(self):
+        got = self.outside_rig(["/outside/the/rig/AUTOPILOT_PAUSED", self.fleet])
+        control("P1R pause rig check: flagged=%s" % got)
+        self.assertEqual(got, ["/outside/the/rig/AUTOPILOT_PAUSED"])
 
     def test_fleet_file_pauses_a_non_base_lane_per_constructor(self):
         constructors = census(BIN)[0]
