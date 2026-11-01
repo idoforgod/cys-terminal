@@ -2334,9 +2334,9 @@ launch_dept(){   # $1=name
         #   껐다. 재기동 한 번으로 이미 샌 값이 회수된다.
         #   `VAR=.. env -u ..`: 접두 대입은 env 의 환경이 되어 자식(cysd)에 그대로 전달된다(Git Bash coreutils env ✓).
         CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_PROJECT_ROOT="$pack" CYS_ACCOUNT_DIR="$acctdir" \
-          env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
+          env -u JAVIS_SOCKET -u AITERM_SOCKET -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
       else
-        CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_PROJECT_ROOT="$pack" env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
+        CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_PROJECT_ROOT="$pack" env -u JAVIS_SOCKET -u AITERM_SOCKET -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
       fi
       disown
       dept_ready_knob_warn   # ★0.14.43 R2F-PK(S4 m4): 비어 있지 않은 무효 노브 경고 1줄(미설정·유효 값은 무음) — 스폰 뒤 대기 직전
@@ -2602,9 +2602,9 @@ PY
       # ★계정 격리: 데몬을 CYS_ACCOUNT_DIR(fork dir)와 함께 spawn (create와 동형).
       if _cys_detach_ok; then
         # ★fatal-fix X-R4-1: 대화 승인 토큰 경로 — 호출자(대표의 Bash 도구) 프로세스 그룹 밖 새 세션에서 띄운다(pid 불변 exec).
-        CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_PROJECT_ROOT="$pack" CYS_ACCOUNT_DIR="$acctdir" env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE nohup python3 -c "$_CYS_SETSID_PY" "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
+        CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_PROJECT_ROOT="$pack" CYS_ACCOUNT_DIR="$acctdir" env -u JAVIS_SOCKET -u AITERM_SOCKET -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE nohup python3 -c "$_CYS_SETSID_PY" "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
       else
-      CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_PROJECT_ROOT="$pack" CYS_ACCOUNT_DIR="$acctdir" env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
+      CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_PROJECT_ROOT="$pack" CYS_ACCOUNT_DIR="$acctdir" env -u JAVIS_SOCKET -u AITERM_SOCKET -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
       fi
       _dept_spawn_pid=$!
       dept_stage wait   # ★0.14.43 GP: 스폰 뒤 소켓 대기 시작 직전(재사용 분기엔 없다)
@@ -2916,7 +2916,7 @@ PY
       dept_stage spawn   # ★0.14.43 GP: 새 cysd 를 띄우기 직전(재사용 분기엔 없다)
       reg_restamp "$name" create "$mkey"   # ★0.14.43 R2F-PK(S4 m3): NEW·REUSE_DEAD 공통 — 스폰 직전에 예약 시각을 한 번 다시 찍는다(최선 노력 · 등재가 아직 있고 내 mission_key 일 때만)
       # ★계정 격리: 데몬을 CYS_ACCOUNT_DIR 와 함께 spawn(patch2 있으면 자식 전파·없으면 F1 시드가 보장)
-      CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_PROJECT_ROOT="$pack" CYS_ACCOUNT_DIR="$acctdir" env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
+      CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_PROJECT_ROOT="$pack" CYS_ACCOUNT_DIR="$acctdir" env -u JAVIS_SOCKET -u AITERM_SOCKET -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
       _dept_spawn_pid=$!
       dept_stage wait   # ★0.14.43 GP: 스폰 뒤 소켓 대기 시작 직전(재사용 분기엔 없다)
       dept_ready_knob_warn   # ★0.14.43 R2F-PK(S4 m4): 비어 있지 않은 무효 노브 경고 1줄(미설정·유효 값은 무음)
@@ -3314,7 +3314,7 @@ EOF
     if [ "$_pt_cur" != "$_pt_sock" ]; then
       unset CYS_SURFACE_ID JAVIS_SURFACE_ID AITERM_SURFACE_ID CYS_SURFACE_REF
     fi
-    export CYS_SOCKET="$_pt_sock" CYS_PACK_DIR="$(dept_pack "$name")"
+    export CYS_SOCKET="$_pt_sock" CYS_PACK_DIR="$(dept_pack "$name")" CYS_PROJECT_ROOT="$(dept_pack "$name")"
     # ★G3 축1: 부서 컨텍스트 실행에 계정 dir 동반 주입(유도 3순위 resolve_lane_acctdir 재사용) —
     # 부서 스코프 config 시드 표적은 ${CYS_ACCOUNT_DIR}(실소비 SOT · 폴백 dir 없음)이라, 이 주입이
     # 없으면 컨텍스트 CLI(init-pack 등)의 훅 시드가 생략(loud WARN)으로 접힌다. 유도 실패 = 계정격리

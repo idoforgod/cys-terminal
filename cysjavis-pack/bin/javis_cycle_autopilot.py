@@ -122,10 +122,19 @@ def _resolve_project_root():
     return home
 
 
+def lane_socket():
+    """이 프로세스의 소켓 — 제품과 같은 순서(src/lib.rs env_compat: CYS → JAVIS → AITERM). 레인 정체의 단일 출처다.
+    순서가 갈리면 데몬은 부서를 잡는데 여기는 낡은 별칭의 본부를 잡아, 두 부서가 한 커서를 나눠 쓴다."""
+    for key in ("CYS_SOCKET", "JAVIS_SOCKET", "AITERM_SOCKET"):
+        sock = os.environ.get(key, "").strip()
+        if sock:
+            return sock
+    return ""
+
+
 def state_socket_dir():
     """cys 소켓 부모 디렉터리 = 데몬 상태 디렉터리(feed.jsonl 이 사는 곳)."""
-    sock = (os.environ.get("AITERM_SOCKET", "").strip()
-            or os.environ.get("CYS_SOCKET", "").strip())
+    sock = lane_socket()
     if sock:
         return os.path.dirname(os.path.abspath(sock))
     return os.path.join(os.path.expanduser("~"), ".local", "state", "cys")
@@ -137,13 +146,12 @@ def lane_state_parent():
     기본 레인은 소켓 env 가 없든 기본 소켓이든 ~/.local/state/cys 로 경로가 그대로다.
     부서 레인은 ~/.local/state/cys-dept-<부서>(cys-dept dept_sock 규약).
     Windows named pipe 는 파일시스템 부모가 없어(dirname = \\\\.\\pipe) 파이프 이름이 그 자리를 맡는다 —
-    cys-dept 가 같은 이름(cys-dept-<부서>)을 쓰므로 레인 키도 같다.
+    cys-dept 가 같은 이름(cys-dept-<부서>)을 쓰므로 레인 키도 같다. 파이프 이름은 대소문자를 가리지 않으므로
+    여기서 한 번 소문자로 고정한다: 상태 경로와 스윕 가드가 같은 키를 본다.
     """
-    sock = (os.environ.get("AITERM_SOCKET", "").strip()
-            or os.environ.get("CYS_SOCKET", "").strip())
-    pipe = re.match(r"^[\\/]{2}[^\\/]+[\\/]pipe[\\/]([^\\/]+)$", sock, re.IGNORECASE)
+    pipe = re.match(r"^[\\/]{2}[^\\/]+[\\/]pipe[\\/]([^\\/]+)$", lane_socket(), re.IGNORECASE)
     if pipe:
-        return os.path.join(os.path.expanduser("~"), ".local", "state", pipe.group(1))
+        return os.path.join(os.path.expanduser("~"), ".local", "state", pipe.group(1).lower())
     return state_socket_dir()
 
 
@@ -1594,7 +1602,8 @@ def sweep_suppressed_reason():
     """이 틱의 스윕을 막을 사유, 없으면 None. 레인 커서로 남의 루트를 훑으면 실사건 1건이 레인 수만큼 원장에
     찍힌다 — 팩 코드는 데몬 재기동보다 먼저 도착하고 그 창은 끝이 없다. 기본 레인은 언제나 스윕한다."""
     own = lane_own_root()
-    if own is None or os.path.realpath(PROJECT) == os.path.realpath(own):
+    if own is None or (os.path.normcase(os.path.realpath(PROJECT))
+                       == os.path.normcase(os.path.realpath(own))):
         return None
     return "project-not-lane-root"
 

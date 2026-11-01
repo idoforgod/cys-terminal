@@ -4,8 +4,9 @@
 
 Each lane is a real process running the shipped sweep_ledger, with the env a lane's job has: CYS_SOCKET and
 CYS_PACK_DIR from the spawn line, CYS_PROJECT_ROOT as the `_builtin` job sets it (`${CYS_PROJECT_ROOT:-$HOME}`).
-Rows are counted in the real STATE_LEDGER files. Sealed: tmp HOME, inherited CYS_*, JAVIS_*, AITERM_* and
-CLAUDE_CONFIG_DIR dropped, no `cys` reachable except a stub in tmp.
+Rows are counted in the real STATE_LEDGER files. Sealed: HOME, USERPROFILE and LOCALAPPDATA in the rig (Windows
+resolves `~` through USERPROFILE, not HOME), inherited CYS_*, JAVIS_*, AITERM_* and CLAUDE_CONFIG_DIR dropped, no
+`cys` reachable except a stub in tmp. Both drivers check every resolved path is inside the rig before any operation.
 
     python3 -B cysjavis-pack/bin/tests/test_lane_state.py -v
 
@@ -25,10 +26,20 @@ BIN = os.path.dirname(HERE)
 PY = sys.executable
 DEPTS = ["dept-%d" % i for i in range(1, 11)]
 ACTOR = "cycle-autopilot-sweep"
+IN_RIG = """
+def in_rig(*paths):
+    rig = os.path.realpath(os.environ["RIG"])
+    for p in paths:
+        real = os.path.realpath(p)
+        if real != rig and not real.startswith(rig + os.sep):
+            sys.exit("outside the rig, refusing: %s" % p)
+"""
 DRIVER = """
 import json, os, sys
 sys.path.insert(0, sys.argv[1])
 import javis_cycle_autopilot as a
+""" + IN_RIG + """
+in_rig(a.STATE_DIR, a.CYCLE_LOG, a.PROJECT, a.pack_dir(), *a.paused_paths())
 print(json.dumps({"sweep": a.sweep_ledger(), "project": a.PROJECT, "state_dir": a.STATE_DIR,
                   "heartbeat": a.HEARTBEAT, "own_root": a.lane_own_root()}))
 """
@@ -36,6 +47,8 @@ PROBE = """
 import json, os, sys
 sys.path.insert(0, sys.argv[1])
 import javis_cycle_autopilot as a, javis_cycle_verifier as v, javis_preflight as p
+""" + IN_RIG + """
+in_rig(a.STATE_DIR, v.STATE_DIR, a.CYCLE_LOG, *a.paused_paths())
 print(json.dumps({"ap": [a.STATE_DIR, a.STATE_JSON, a.HEARTBEAT, a.BASELINE_DIR, a.SWEEP_STATE],
                   "vf": [v.STATE_DIR, v.STATE_JSON, v.HEARTBEAT, v.BASELINE_DIR],
                   "preflight_heartbeat": p._cycle_autopilot_mod().HEARTBEAT, "mode": a.mode()}))
@@ -51,6 +64,8 @@ class Base(unittest.TestCase):
         self.home = tempfile.mkdtemp(prefix="lane-state-")
         self.addCleanup(shutil.rmtree, self.home, True)
         self.base_round = os.path.join(self.home, "_round")
+        self.local = os.path.join(self.home, "AppData", "Local")
+        os.makedirs(self.local)
         os.makedirs(os.path.join(self.base_round, "handoffs"))
         os.makedirs(os.path.join(self.base_round, "tasks"))
 
@@ -69,8 +84,8 @@ class Base(unittest.TestCase):
     def env(self, dept=None, exported=False, root=None, **extra):
         env = {k: v for k, v in os.environ.items()
                if not k.startswith(("CYS_", "JAVIS_", "AITERM_")) and k != "CLAUDE_CONFIG_DIR"}
-        env.update({"HOME": self.home, "CYS_NO_AUTOSTART": "1", "CYS_AUTOPILOT_NO_SEND": "1",
-                    "PATH": "/usr/bin:/bin"})
+        env.update({"HOME": self.home, "USERPROFILE": self.home, "LOCALAPPDATA": self.local, "RIG": self.home,
+                    "CYS_NO_AUTOSTART": "1", "CYS_AUTOPILOT_NO_SEND": "1", "PATH": "/usr/bin:/bin"})
         env["CYS_PACK_DIR"] = self.pack(dept) if dept else os.path.join(self.home, ".cys", "pack")
         if dept:
             env["CYS_SOCKET"] = self.sock(dept)
@@ -78,9 +93,9 @@ class Base(unittest.TestCase):
         env.update(extra)
         return env
 
-    def tick(self, dept=None, exported=False, root=None):
+    def tick(self, dept=None, exported=False, root=None, **extra):
         r = subprocess.run([PY, "-B", "-c", DRIVER, BIN], capture_output=True, text=True, cwd=self.home,
-                           env=self.env(dept, exported, root), timeout=60)
+                           env=self.env(dept, exported, root, **extra), timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr)
         return json.loads(r.stdout.strip().splitlines()[-1])
 
@@ -231,6 +246,96 @@ class Sweep(Base):
         self.assertEqual(before, after)
 
 
+class Aliases(Base):
+    def base_sock(self):
+        return os.path.join(self.home, ".local", "state", "cys", "cys.sock")
+
+    def test_a_stale_base_alias_does_not_collapse_two_restarted_lanes(self):
+        """The review's case: read [0, 1, 1, 1] when AITERM outranked CYS."""
+        a, b = self.lane_round("dept-1"), self.lane_round("dept-2")
+        self.handoff(a, "a-old")
+        self.handoff(b, "b-old")
+        stale = {"AITERM_SOCKET": self.base_sock()}
+        got = [self.tick(DEPTS[i % 2], exported=True, **stale) for i in range(4)]
+        emitted = [g["sweep"]["emitted"] for g in got]
+        dirs = {os.path.basename(os.path.dirname(g["state_dir"])) for g in got}
+        control("P1R stale base alias, 2 restarted lanes, no new event: emitted=%s state dirs=%s" % (emitted, sorted(dirs)))
+        self.assertEqual(emitted, [0, 0, 0, 0])
+        self.assertEqual(dirs, {"cys-dept-dept-1", "cys-dept-dept-2"})
+        self.handoff(a, "a-real")
+        real = self.tick("dept-1", exported=True, **stale)["sweep"]["emitted"]
+        control("P1R stale base alias, positive control, 1 real handoff: emitted=%d" % real)
+        self.assertEqual(real, 1)
+
+    def test_a_lane_known_only_by_javis_socket_is_still_guarded(self):
+        self.handoff(self.base_round, "old")
+        self.tick(None)
+        self.handoff(self.base_round, "new")
+        got = self.tick("dept-7", CYS_SOCKET="", JAVIS_SOCKET=self.sock("dept-7"))
+        base = self.tick(None)
+        control("P1R JAVIS-only dept lane before export: reason=%s, base emitted=%d, rows=%d" % (
+            got["sweep"].get("suppressed", {}).get("reason"), base["sweep"]["emitted"], self.rows(self.base_round)))
+        self.assertEqual(got["own_root"], self.pack("dept-7"))
+        self.assertEqual(got["sweep"]["suppressed"]["reason"], "project-not-lane-root")
+        self.assertEqual(self.rows(self.base_round), 1)
+
+    def test_case_variant_pipe_gives_one_row_for_one_base_event(self):
+        """The review's case: read 2 rows when the guard compared the raw spelling."""
+        self.handoff(self.base_round, "old")
+        pipe = {"CYS_SOCKET": "\\\\.\\pipe\\CYS-DEPT-DEPT-1"}
+        self.tick(None)
+        first = self.tick("dept-1", **pipe)
+        self.handoff(self.base_round, "new")
+        lane = self.tick("dept-1", **pipe)
+        base = self.tick(None)
+        control("P1R case-variant dept pipe before export: reason=%s, one base event, rows=%d" % (
+            lane["sweep"].get("suppressed", {}).get("reason"), self.rows(self.base_round)))
+        self.assertEqual(first["own_root"], self.pack("dept-1"))
+        self.assertEqual(lane["sweep"]["suppressed"]["reason"], "project-not-lane-root")
+        self.assertEqual((lane["sweep"]["emitted"], base["sweep"]["emitted"], self.rows(self.base_round)), (0, 1, 1))
+
+
+class Staleness(Base):
+    def check(self, dept="dept-5"):
+        code = ("import json, os, sys\nsys.path.insert(0, sys.argv[1])\nimport javis_state_ledger as l\n"
+                "l.append_record('handoff', 'test', {'name': 'x', 'path': 'y'})\n"
+                "print(json.dumps(l.staleness_check(session='s1')))\n")
+        r = subprocess.run([PY, "-B", "-c", code, BIN], capture_output=True, text=True, cwd=self.home,
+                           env=self.env(dept, exported=True, CYS_STATE_DIR=os.path.join(self.home, "st")), timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout.strip().splitlines()[-1])
+
+    def test_a_restarted_lane_compares_against_its_round_dir(self):
+        self.lane_round("dept-5")
+        state = os.path.join(self.pack("dept-5"), "round", "SESSION_STATE.md")
+        os.makedirs(os.path.dirname(state))
+        with open(state, "w", encoding="utf-8") as f:
+            f.write("x")
+        os.utime(state, (1000000000, 1000000000))
+        old = self.check()
+        os.utime(state, None)
+        os.utime(state, (4000000000, 4000000000))
+        new = self.check()
+        os.remove(state)
+        gone = self.check()
+        control("P1R staleness in a restarted lane: state older=%s, state newer=%s, no state=%s" % (
+            old["result"], new["result"], gone["result"]))
+        self.assertEqual((old["result"], new["result"], gone["result"]), ("recorded", "fresh", "session_state_missing"))
+        self.assertEqual(gone["session_state"], state)
+
+    def test_base_still_reads_the_file_beside_its_ledger(self):
+        beside = os.path.join(self.base_round, "SESSION_STATE.md")
+        with open(beside, "w", encoding="utf-8") as f:
+            f.write("x")
+        os.utime(beside, (4000000000, 4000000000))
+        code = ("import sys\nsys.path.insert(0, sys.argv[1])\nimport javis_state_ledger as l\n"
+                "l.append_record('handoff', 'test', {'name': 'x', 'path': 'y'})\nprint(l.staleness_check(session='s2')['result'])\n")
+        r = subprocess.run([PY, "-B", "-c", code, BIN], capture_output=True, text=True, cwd=self.home,
+                           env=self.env(None, CYS_STATE_DIR=os.path.join(self.home, "st")), timeout=60)
+        control("P1R staleness in base, file beside the ledger: %s" % r.stdout.strip())
+        self.assertEqual(r.stdout.strip().splitlines()[-1], "fresh", r.stderr)
+
+
 class Paths(Base):
     def probe(self, dept=None, **extra):
         r = subprocess.run([PY, "-B", "-c", PROBE, BIN], capture_output=True, text=True, cwd=self.home,
@@ -260,9 +365,37 @@ class Paths(Base):
         control("P1 dept pipe: %s" % os.path.relpath(got["ap"][0], self.home))
         self.assertEqual(got["ap"][0], self.expected("cys-dept-dept-5"))
 
-    def test_aiterm_socket_keeps_its_precedence(self):
-        got = self.probe(AITERM_SOCKET=self.sock("dept-2"), CYS_SOCKET=self.sock("dept-1"))
-        self.assertEqual(got["ap"][0], self.expected("cys-dept-dept-2"))
+    def test_socket_order_is_the_products(self):
+        one, two, three = self.sock("dept-1"), self.sock("dept-2"), self.sock("dept-3")
+        got = {
+            "CYS beats all": self.probe(CYS_SOCKET=one, JAVIS_SOCKET=two, AITERM_SOCKET=three)["ap"][0],
+            "JAVIS beats AITERM": self.probe(JAVIS_SOCKET=two, AITERM_SOCKET=three)["ap"][0],
+            "AITERM alone": self.probe(AITERM_SOCKET=three)["ap"][0],
+            "empty CYS falls through": self.probe(CYS_SOCKET="", JAVIS_SOCKET=two)["ap"][0],
+        }
+        control("P1R socket order: %s" % {k: os.path.basename(os.path.dirname(v)) for k, v in got.items()})
+        self.assertEqual(got, {"CYS beats all": self.expected("cys-dept-dept-1"),
+                               "JAVIS beats AITERM": self.expected("cys-dept-dept-2"),
+                               "AITERM alone": self.expected("cys-dept-dept-3"),
+                               "empty CYS falls through": self.expected("cys-dept-dept-2")})
+
+    def test_pipe_case_variants_are_one_lane(self):
+        for pipe, leaf in (("\\\\.\\pipe\\CYS", "cys"), ("\\\\.\\PIPE\\Cys-Dept-Dept-5", "cys-dept-dept-5")):
+            got = self.probe(CYS_SOCKET=pipe)["ap"][0]
+            control("P1R pipe spelling %s: %s" % (pipe, os.path.relpath(got, self.home)))
+            self.assertEqual(got, self.expected(leaf))
+
+    def test_the_rig_check_refuses_a_path_outside_the_rig(self):
+        """Control for the isolation itself: a resolved path outside the rig stops before any operation."""
+        env = self.env("dept-5", CYS_PACK_DIR="/outside/the/rig")
+        r = subprocess.run([PY, "-B", "-c", DRIVER, BIN], capture_output=True, text=True, cwd=self.home, env=env,
+                           timeout=60)
+        state = self.expected("cys-dept-dept-5")
+        control("P1R rig check, pack outside the rig: rc=%s, %s, state dir made=%s" % (
+            r.returncode, r.stderr.strip()[-60:], os.path.exists(state)))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("outside the rig, refusing: /outside/the/rig", r.stderr)
+        self.assertFalse(os.path.exists(state))
 
     def test_autopilot_verifier_and_preflight_agree_inside_a_lane(self):
         got = self.probe(dept="dept-5")

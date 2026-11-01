@@ -147,6 +147,16 @@ class Predicate(unittest.TestCase):
         self.assertEqual(census(d), ([], [], []))
 
 
+class DenyText(unittest.TestCase):
+    def test_guard_deny_messages_name_the_files_really_read(self):
+        with open(os.path.join(os.path.dirname(BIN), "hooks", "guard.sh"), encoding="utf-8") as f:
+            text = f.read()
+        old, new = text.count("<프로젝트루트>/_round/" + FILE), text.count("~/_round/" + FILE)
+        control("P1R guard.sh deny text: old path=%d, ~/_round path=%d" % (old, new))
+        self.assertEqual(old, 0)
+        self.assertGreaterEqual(new, 1)
+
+
 class Lane(unittest.TestCase):
     """A non-base lane after its export: PROJECT, JAVIS_ROOT and cwd all sit in the dept's pack, not in $HOME."""
     DEPT = "dept-7"
@@ -159,13 +169,15 @@ class Lane(unittest.TestCase):
         os.makedirs(os.path.join(self.pack, "_round"))
         os.makedirs(self.other)
         os.makedirs(os.path.join(self.home, "_round"))
+        self.local = os.path.join(self.home, "AppData", "Local")
+        os.makedirs(self.local)
         self.fleet = os.path.join(self.home, "_round", FILE)
         self.lane_file = os.path.join(self.pack, FILE)
 
     def env(self):
         env = {k: v for k, v in os.environ.items()
                if not k.startswith(("CYS_", "JAVIS_", "AITERM_")) and k != "CLAUDE_CONFIG_DIR"}
-        env.update({"HOME": self.home, "CYS_PACK_DIR": self.pack, "CYS_PROJECT_ROOT": self.pack, "JAVIS_ROOT": self.pack,
+        env.update({"HOME": self.home, "USERPROFILE": self.home, "LOCALAPPDATA": self.local, "CYS_PACK_DIR": self.pack, "CYS_PROJECT_ROOT": self.pack, "JAVIS_ROOT": self.pack,
                     "CYS_SOCKET": os.path.join(self.home, ".local", "state", "cys-dept-" + self.DEPT, "cys.sock"),
                     "CYS_NO_AUTOSTART": "1", "PATH": "/usr/bin:/bin"})
         return env
@@ -181,7 +193,10 @@ class Lane(unittest.TestCase):
         return json.loads([x for x in r.stdout.splitlines() if x.startswith("@@")][-1][2:])
 
     def hits(self, mod, fn):
-        return [p for p in self.ask(mod, fn) if os.path.exists(p)]
+        paths = self.ask(mod, fn)
+        rig = os.path.realpath(self.home) + os.sep
+        self.assertEqual([p for p in paths if not os.path.realpath(p).startswith(rig)], [], "outside the rig")
+        return [p for p in paths if os.path.exists(p)]
 
     def test_fleet_file_pauses_a_non_base_lane_per_constructor(self):
         constructors = census(BIN)[0]

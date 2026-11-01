@@ -30,6 +30,7 @@ VERBS = (("launch", ("launch", "dept-1")), ("allocate", ("allocate",)), ("create
 
 
 EXPORT = 'CYS_PROJECT_ROOT="$pack"'
+ALIASES = ("JAVIS_SOCKET", "AITERM_SOCKET")
 
 
 def control(msg):
@@ -46,10 +47,15 @@ def missing_export(text):
     return [ln for ln in spawn_lines(text) if EXPORT not in ln]
 
 
+def missing_scrub(text):
+    return [ln for ln in spawn_lines(text) if not all("-u %s" % a in ln for a in ALIASES)]
+
+
 class Verbs(unittest.TestCase):
     def spawn(self, argv):
         """Run one verb to a real spawn. STUB_PING_OK_FROM carries it past the pre-check and the ready wait."""
-        sb = Sandbox(CYS_NO_AUTOSTART="1", STUB_PING_OK_FROM=UP_AT_PING)
+        sb = Sandbox(CYS_NO_AUTOSTART="1", STUB_PING_OK_FROM=UP_AT_PING, JAVIS_SOCKET="/stale/javis.sock",
+                     AITERM_SOCKET="/stale/aiterm.sock")
         self.addCleanup(sb.cleanup)
         sb.seed_catalog("k1", "m1")
         _write_exec(os.path.join(sb.home, ".local", "bin", "cysd"), ENV_CYSD)
@@ -116,7 +122,20 @@ class SpawnEnv(Verbs):
                 verb, env.get("CYS_PROJECT_ROOT") == pack, env.get("CYS_PACK_DIR") == pack,
                 os.path.isdir(os.path.join(env.get("CYS_PROJECT_ROOT", ""), "_round"))))
             self.assertEqual(env.get("CYS_PROJECT_ROOT"), pack, verb)
+            stale = [a for a in ALIASES if a in env]
+            control("P1R %s: caller had stale aliases, daemon env has=%s" % (verb, stale))
+            self.assertEqual(stale, [], verb)
             self.assertTrue(os.path.isdir(os.path.join(pack, "_round")), verb)
+
+
+class ContextCommand(Verbs):
+    def test_a_context_command_carries_the_lanes_root(self):
+        sb, pack = self.spawn(VERBS[0][1])
+        rc, out, err = sb.run("dept-1", "--", "env")
+        self.assertEqual(rc, 0, err[-400:])
+        env = dict(ln.split("=", 1) for ln in out.splitlines() if "=" in ln)
+        control("P1R context command for dept-1: CYS_PROJECT_ROOT is the lane pack=%s" % (env.get("CYS_PROJECT_ROOT") == pack))
+        self.assertEqual(env.get("CYS_PROJECT_ROOT"), pack)
 
 
 class Census(unittest.TestCase):
@@ -129,11 +148,14 @@ class Census(unittest.TestCase):
         control("P1 census: %d spawn lines, without the export=%d" % (len(lines), len(missing_export(self.text))))
         self.assertGreaterEqual(len(lines), 1, "the census found no spawn line, so it proves nothing")
         self.assertEqual(missing_export(self.text), [])
+        control("P1R census: spawn lines that keep an inherited alias=%d" % len(missing_scrub(self.text)))
+        self.assertEqual(missing_scrub(self.text), [])
 
     def test_positive_control_a_new_spawn_line_without_it_fails(self):
         planted = self.text + '\n      CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" env -u CYS_ROLE nohup "$CYSD" >/dev/null 2>&1 &\n'
         control("P1 census control, one planted line: caught=%d" % len(missing_export(planted)))
         self.assertEqual(len(missing_export(planted)), 1)
+        self.assertEqual(len(missing_scrub(planted)), 1)
 
     def test_positive_control_the_continuation_form_is_seen(self):
         planted = 'CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" \\\n  env -u CYS_ROLE nohup "$CYSD" &\n'

@@ -267,7 +267,7 @@ CYS_KILL_PAUSED_DENY = ("AUTOPILOT_PAUSED: cys %s 전면 금지 — pause 중 �
                         "관측·저장·보고·자기 프로세스 종료 넷뿐이고, **살아있는 타 노드 종료·재기동은 "
                         "전면 금지**다. exited=true 잔재 회수도 pause 중엔 금지 — 해제 후 하라: "
                         "①`cys resume` ②AUTOPILOT_PAUSED 파일 2곳 제거"
-                        "($PACK/AUTOPILOT_PAUSED · <프로젝트루트>/_round/AUTOPILOT_PAUSED)")
+                        "($PACK/AUTOPILOT_PAUSED · ~/_round/AUTOPILOT_PAUSED)")
 
 # ★R-02 부트스트랩 불가침 (2026-08-01 F2): cys 를 ALLOWLIST 에 **통째로** 등재한 부작용으로
 #   STRICT 에서 팩 자기변경 서브커맨드가 열렸다(A=0.14.8 에선 cys 가 allowlist 밖이라 전부 DENY).
@@ -349,7 +349,7 @@ CYS_PAUSED_SUBSUB_OK = {"queue": {"list"}}
 CYS_PAUSED_SUB_DENY = ("AUTOPILOT_PAUSED: cys %s 금지 — pause 중 허용 상한은 **관측·저장·보고·"
                        "자기 프로세스 종료** 넷뿐이다(cys 허용: %s). 해제는 주인님 명시 지시로만 — "
                        "①`cys resume` ②AUTOPILOT_PAUSED 파일 2곳 제거"
-                       "($PACK/AUTOPILOT_PAUSED · <프로젝트루트>/_round/AUTOPILOT_PAUSED)")
+                       "($PACK/AUTOPILOT_PAUSED · ~/_round/AUTOPILOT_PAUSED)")
 
 SHELL_KEYWORDS = {"if", "then", "else", "elif", "fi", "for", "while", "until",
                   "do", "done", "case", "esac", "in", "{", "}", "!", "select", "function"}
@@ -944,7 +944,7 @@ if PAUSED and not PREFLIGHT:
         out_deny("AUTOPILOT_PAUSED (주인님 kill-switch · 호칭 정의처=마스터 헌장 제1조): "
                  "쓰기 도구 차단. 해제는 주인님 명시 지시로만 — ①`cys resume` "
                  "②AUTOPILOT_PAUSED 파일 2곳 제거($PACK/AUTOPILOT_PAUSED · "
-                 "<프로젝트루트>/_round/AUTOPILOT_PAUSED)")
+                 "~/_round/AUTOPILOT_PAUSED)")
     if tool == "Bash":
         nl = norm_loose(command); ntok = nl.split()
         # ★PAUSED 상한(운영계약 v0.4 · 색인 §6 자율주행 메타안전): "pause 중 허용 범위 상한은
@@ -975,7 +975,7 @@ if PAUSED and not PREFLIGHT:
         if not is_control and (has_redirect or first not in readonly):
             out_deny("AUTOPILOT_PAUSED: 비읽기 Bash 차단(%s). 해제는 주인님 명시 지시로만 — "
                      "①`cys resume` ②AUTOPILOT_PAUSED 파일 2곳 제거"
-                     "($PACK/AUTOPILOT_PAUSED · <프로젝트루트>/_round/AUTOPILOT_PAUSED)"
+                     "($PACK/AUTOPILOT_PAUSED · ~/_round/AUTOPILOT_PAUSED)"
                      % (first or "?"))
 
 if tool == "Bash" and command:
