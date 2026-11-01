@@ -832,7 +832,7 @@ def _wlock(task_id, timeout=5.0, stale=30.0):
     어느 동사의 기존 코드도 재사용하지 않으므로 기존 분기의 뜻이 바뀌지 않는다.
     stale 회수는 mtime 만 본다 — 30초 넘게 멈춘 산 소유자의 락도 회수된다. 그래서 락 인스턴스마다 토큰을 두어 막는다:
     해제는 자기 토큰일 때만 지우고, 레코드 쓰기는 rename 직전에 토큰을 확인해 잃었으면 _WlockBusy 로 아무것도 쓰지 않는다.
-    ⚠남는 창: 그 확인과 rename 사이, 해제의 토큰 읽기와 삭제 사이. 좁혔을 뿐 0 이 아니다."""
+    ⚠남는 창은 REPORT-P2-P3-R4 의 목록이다: 멈춘 소유자는 좁아질 뿐 0 이 아니다."""
     os.makedirs(TASKS_DIR, exist_ok=True)
     path = _wlock_dir(task_id)
     deadline = time.time() + timeout
@@ -1057,7 +1057,7 @@ def _write_owner(lock, rec):
         return False
 
 
-def _acquire_lock(task_id, owner_id, pid=None):
+def _acquire_lock(task_id, owner_id, pid=None, claim_gen=None):
     """mkdir 원자성 기반 CAS. 반환: ('acquired'|'reentrant'|'conflict'|'adopted', owner_dict|None)
 
     'acquired' 는 이번에 새로 만든 락뿐이다. 살아 있는 자기 락에 다시 들어온 것은 'reentrant' 다 — 호출자가 소유 1회의
@@ -1073,6 +1073,8 @@ def _acquire_lock(task_id, owner_id, pid=None):
         "host": socket.gethostname(),
         "user": getpass.getuser(),
         "acquired_at": _now(),
+        "claim_gen": claim_gen,
+        "claim_id": uuid.uuid4().hex,  # 이 락 인스턴스의 정체 — 쓰이지 못한 세대가 재사용돼도 갈린다
     }
     try:
         os.mkdir(lock)  # ← 원자적: 경쟁 시 1명만 성공
@@ -1117,17 +1119,16 @@ def _acquire_lock(task_id, owner_id, pid=None):
     return "adopted", owner_rec
 
 
-def _release_lock(task_id, owner_id, force=False):
-    lock = _lock_dir(task_id)
+def _release_claim(task_id, owner_id, claim_gen, claim_id=None):
+    """소유권 락을 지우는 유일한 길. 규칙: 호출자가 쥔 바로 그 소유일 때만, 그 사실을 적은 레코드가 내구화된 뒤에만 지운다.
+    소유자 이름만으론 안 된다 — 같은 이름이 새로 잡은 소유를 지우게 된다. 강제 옵션은 없다. 다른 소유면 아무것도 안 한다."""
     holder = _read_owner(task_id)
-    if not os.path.isdir(lock):
-        return True
-    if not force and holder and holder.get("owner_id") != owner_id:
+    if (not holder or holder.get("owner_id") != owner_id or holder.get("claim_gen") != claim_gen
+            or (claim_id is not None and holder.get("claim_id") != claim_id)):
         return False
+    lock = _lock_dir(task_id)
     try:
-        p = os.path.join(lock, "owner.json")
-        if os.path.exists(p):
-            os.remove(p)
+        os.remove(os.path.join(lock, "owner.json"))
         os.rmdir(lock)
     except OSError:
         return False
@@ -1270,15 +1271,21 @@ def cmd_checkout(a):
             print(f"blocked: 미해소 blocker {unresolved} — 체크아웃 거부", file=sys.stderr)
             return EXIT_BLOCKED
         _wlock_confirm(a.id)
-        # 소유권 락도 wlock 안에서 잡는다: done 이 claim 을 대조한 뒤 _release_lock 하기까지 끼어들 수 없다.
-        verdict, holder = _acquire_lock(a.id, a.owner, pid=a.pid)
+        # 소유권 락도 wlock 안에서 잡는다: done 이 claim 을 대조한 뒤 소유를 지우기까지 끼어들 수 없다.
+        new_gen = int(task.get("claim_gen") or 0) + 1
+        verdict, holder = _acquire_lock(a.id, a.owner, pid=a.pid, claim_gen=new_gen)
         if verdict == "conflict":
             who = (holder or {}).get("owner_id", "unknown")
             print(f"conflict(409): 살아있는 소유자 {who} — 재시도 금지, 다른 태스크로 이동", file=sys.stderr)
             return EXIT_CONFLICT
         # claim_gen: 소유 1회의 정체. 이름만으론 release 뒤 같은 이름의 재체크아웃(ABA)을 못 가른다.
-        if verdict != "reentrant":
-            task["claim_gen"] = int(task.get("claim_gen") or 0) + 1
+        #   재진입은 레코드와 락이 같은 소유를 가리킬 때뿐이다 — 레코드가 비운 뒤 남은 락에 들어온 것은 새 소유다.
+        same_claim = (verdict == "reentrant" and (task.get("owner"), task.get("claim_gen"))
+                      == (holder.get("owner_id"), holder.get("claim_gen")))
+        if not same_claim:
+            task["claim_gen"] = new_gen
+            if verdict == "reentrant":
+                _write_owner(_lock_dir(a.id), dict(holder, claim_gen=new_gen))
         task["status"] = "in_progress"
         task["owner"] = a.owner
         if gate == "grandfather":
@@ -1287,8 +1294,8 @@ def cmd_checkout(a):
         try:
             _write_task(a.id, task)
         except _WlockBusy:
-            if verdict != "reentrant":  # 방금 잡은 소유를 돌려준다 — 거부는 아무것도 바꾸지 않는다
-                _release_lock(a.id, a.owner)
+            if not same_claim:  # 방금 만든 그 소유만 돌려준다
+                _release_claim(a.id, a.owner, new_gen, holder.get("claim_id"))
             raise
     # B1(§2-1)·F3: completion-guard 바인딩 — 성공 경로에서만·명시 --claim-surface 우선
     # ★E1-4(BLOCKER F12/R-25 · 팩 배포 무게이트 발효 강등): **ambient `CYS_SURFACE_ID` 경로는
@@ -1323,25 +1330,28 @@ def cmd_release(a):
         print("error: --force는 --force-reason '<사유>' 필수 — 무검증 탈취 금지(G11)",
               file=sys.stderr)
         return EXIT_USAGE
-    with _wlock(a.id):  # ★WP-8(P-ORCH): JSON 갱신 직렬화 · 소유권 락 해제도 이 안에서(거부가 아무것도 안 바꾸게)
-        _wlock_confirm(a.id)
-        if not _release_lock(a.id, a.owner, force=a.force):
-            holder = _read_owner(a.id)
-            print(f"conflict(409): 락 소유자 불일치 (holder={(holder or {}).get('owner_id')})", file=sys.stderr)
-            return EXIT_CONFLICT
+    with _wlock(a.id):  # ★WP-8(P-ORCH): JSON 갱신 직렬화. 레코드를 먼저 쓴다 — 7 은 아무것도 안 바뀌었다는 뜻이어야 한다
         task = _read_task(a.id)          # 락 안 재독
         if not task:
             print(f"not found: {a.id}", file=sys.stderr)
             return EXIT_NOTFOUND
+        holder = _read_owner(a.id)
+        if not a.force and holder and holder.get("owner_id") != a.owner:
+            print(f"conflict(409): 락 소유자 불일치 (holder={holder.get('owner_id')})", file=sys.stderr)
+            return EXIT_CONFLICT
+        record_claim = task.get("owner") == a.owner or a.force
+        claim = ((task.get("owner"), task.get("claim_gen")) if record_claim
+                 else (a.owner, (holder or {}).get("claim_gen")))
         if a.force:
             task.setdefault("force_history", []).append(
                 {"at": _now(), "by": a.owner, "reason": a.force_reason})
-        if task.get("owner") == a.owner or a.force:
+        if record_claim:
             task["owner"] = None
             if task["status"] == "in_progress":
                 task["status"] = "todo"
             task["updated_at"] = _now()
             _write_task(a.id, task)
+        _release_claim(a.id, *claim)
     _remove_guard_claims(a.id)  # B1(§2-1): 바인딩 해제 — guard 무발동 복귀
     print(f"released: {a.id}")
     return EXIT_OK
@@ -1853,12 +1863,11 @@ def cmd_set_status(a):
                 {"at": _now(), "reason": settle_override_note})
         task["status"] = a.status
         task["updated_at"] = _now()
-        owner_before = task.get("owner")
         if a.status in TERMINAL_STATUSES:
             task["owner"] = None
         _write_task(a.id, task)  # 상태와 owner 를 한 번에 — 락을 잃어 거부되면 반쪽이 남지 않는다
         if a.status in TERMINAL_STATUSES:
-            _release_lock(a.id, owner_before or "", force=True)
+            _release_claim(a.id, *claim_now)  # 판정한 그 소유만 — 지금 거기 있는 것이 아니라
         result = {"id": a.id, "status": a.status}
         if task.get("evidence"):
             result["evidence"] = task["evidence"]

@@ -33,16 +33,31 @@ PY = sys.executable
 PASS_ROW = "settle-gate-pass"
 REMEDY = ("wait out the 30 s stale window · try ONCE · if it still returns 7, report a lock anomaly · "
           "never --settled-override · never immediate repeated retry")
-# A release that removes the ownership lock, then dies at its record write.
+# A release that dies at one of its two steps. argv[4] names the step.
 RELEASE_DIES = """
 import importlib.util, sys
 spec = importlib.util.spec_from_file_location("jt", sys.argv[1])
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
-def boom(path, obj, **kw):
+def boom(*a, **kw):
     raise OSError("injected")
-m._write_json_atomic = boom
+setattr(m, sys.argv[4], boom)
 sys.exit(m.main(["release", sys.argv[2], "--owner", sys.argv[3]]))
+"""
+# Stops one real verb just before it removes the ownership claim.
+CLAIM_HOLDER = """
+import importlib.util, os, sys, time
+spec = importlib.util.spec_from_file_location("jt", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+real = m._release_claim
+def barrier(*a, **kw):
+    open(sys.argv[2], "w").close()
+    while not os.path.exists(sys.argv[3]):
+        time.sleep(0.01)
+    return real(*a, **kw)
+m._release_claim = barrier
+sys.exit(m.main(sys.argv[4:]))
 """
 OWNER_CLAIM = ("살아있는", "소유자", "게이트", "live owner", "gate")
 # Runs one real verb, stopping just before its record write until the test says go. Nothing is mocked but the pause.
@@ -508,10 +523,10 @@ def foreign_writers(bin_dir):
 class Barriers(Base):
     WHO = ("--by", "head", "--why", "hold reviewed, cleared")
 
-    def holder(self, *argv, name="h"):
+    def holder(self, *argv, name="h", code=HOLDER):
         at, go = os.path.join(self.tmp, name + "-at-write"), os.path.join(self.tmp, name + "-go")
         self.addCleanup(lambda: open(go, "w").close())
-        p = subprocess.Popen([PY, "-B", "-c", HOLDER, TASK, at, go] + list(argv), stdout=subprocess.PIPE,
+        p = subprocess.Popen([PY, "-B", "-c", code, TASK, at, go] + list(argv), stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, text=True, env=self.env())
         deadline = time.time() + 30
         while not os.path.exists(at):
@@ -539,6 +554,18 @@ class WriterProtocol(Barriers):
         self.assertEqual(foreign_writers(BIN), [])
         self.assertEqual(raw_task_writes(TASK), ["_write_task"])
         self.assertEqual(writers, set(self.PEERS), "a new writer needs a row in the barrier test below")
+
+    def test_one_path_removes_a_claim_and_it_has_no_force(self):
+        with open(TASK, encoding="utf-8") as f:
+            text = f.read()
+        tree = ast.parse(text)
+        fn = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_release_claim"][0]
+        args = [a.arg for a in fn.args.args]
+        removers = text.count("os.rmdir(lock)")
+        control("P3R4 claim removal: rmdir sites=%d, args=%s" % (removers, args))
+        self.assertEqual(removers, 1)
+        self.assertNotIn("force", args)
+        self.assertNotIn("_release_lock", text)
 
     def test_positive_control_an_unlocked_writer_and_a_foreign_writer_are_caught(self):
         d = tempfile.mkdtemp(prefix="writers-")
@@ -645,6 +672,74 @@ class StaleReclaim(Barriers):
         self.assertEqual(self.rec("RACE")["status"], "in_review")
         self.assertFalse(os.path.exists(self.lock))
 
+    def owner_json(self):
+        with open(os.path.join(self.root, "_round", "tasks", "RACE.lock", "owner.json"), "rb") as f:
+            return f.read()
+
+    def test_a_release_refused_with_7_leaves_the_claim_in_place(self):
+        """Review schedule A: read 7 with the ownership lock already gone."""
+        lock_before = self.owner_json()
+        holder, go = self.holder("release", "RACE", "--owner", "w1")
+        self.age_the_lock()
+        self.assertEqual(self.t("set-status", "RACE", "in_review")[0], 0)
+        record = self.raw("RACE")
+        open(go, "w").close()
+        _, err = holder.communicate(timeout=60)
+        control("P3R4 release reclaimed before its record: rc=%s record unchanged=%s ownership lock unchanged=%s" % (
+            holder.returncode, self.raw("RACE") == record, self.owner_json() == lock_before))
+        self.assertEqual(holder.returncode, 7, err)
+        self.assertEqual(self.raw("RACE"), record)
+        self.assertEqual(self.owner_json(), lock_before)
+
+    def test_an_old_done_cannot_remove_a_newer_claim(self):
+        """Review schedule B: read rc 0 with w2's lock deleted."""
+        holder, go = self.holder("set-status", "RACE", "done", "--evidence", "unit test evidence", code=CLAIM_HOLDER)
+        self.age_the_lock()
+        self.assertEqual(self.t("release", "RACE", "--owner", "w1")[0], 0)
+        self.assertEqual(self.t("set-status", "RACE", "in_progress")[0], 0)
+        self.assertEqual(self.t("checkout", "RACE", "--owner", "w2")[0], 0)
+        before = self.owner_json()
+        open(go, "w").close()
+        holder.communicate(timeout=60)
+        rec = self.rec("RACE")
+        control("P3R4 old done resumes after w2 took the task: rc=%s owner=%s gen=%s w2 lock unchanged=%s" % (
+            holder.returncode, rec["owner"], rec["claim_gen"], self.owner_json() == before))
+        self.assertEqual((rec["owner"], rec["claim_gen"]), ("w2", 2))
+        self.assertEqual(self.owner_json(), before)
+
+    def test_an_old_done_cannot_remove_a_newer_same_name_claim(self):
+        holder, go = self.holder("set-status", "RACE", "done", "--evidence", "unit test evidence", code=CLAIM_HOLDER)
+        self.age_the_lock()
+        self.assertEqual(self.t("release", "RACE", "--owner", "w1")[0], 0)
+        self.assertEqual(self.t("set-status", "RACE", "in_progress")[0], 0)
+        self.assertEqual(self.t("checkout", "RACE", "--owner", "w1")[0], 0)
+        before = self.owner_json()
+        open(go, "w").close()
+        holder.communicate(timeout=60)
+        control("P3R4 old done resumes after w1 claimed again: gen=%s new lock unchanged=%s" % (
+            self.rec("RACE")["claim_gen"], self.owner_json() == before))
+        self.assertEqual(self.owner_json(), before)
+
+    def test_an_aborted_checkout_cannot_remove_a_later_same_name_claim(self):
+        """Review schedule C: read 7 with the peer's same-name lock deleted."""
+        self.t("create", "C", "--id", "C")
+        holder, go = self.holder("checkout", "C", "--owner", "w1")
+        old = time.time() - 31
+        os.utime(os.path.join(self.root, "_round", "tasks", "C.wlock"), (old, old))
+        self.assertEqual(self.t("release", "C", "--owner", "w1")[0], 0)
+        self.assertEqual(self.t("checkout", "C", "--owner", "w1")[0], 0)
+        path = os.path.join(self.root, "_round", "tasks", "C.lock", "owner.json")
+        with open(path, "rb") as f:
+            before = f.read()
+        open(go, "w").close()
+        holder.communicate(timeout=60)
+        with open(path, "rb") as f:
+            kept = f.read() == before
+        rec = self.rec("C")
+        control("P3R4 aborted checkout resumes after a same-name peer: rc=%s owner=%s peer's lock unchanged=%s" % (
+            holder.returncode, rec["owner"], kept))
+        self.assertEqual((holder.returncode, rec["owner"], kept), (7, "w1", True))
+
     def test_a_lock_with_no_token_is_still_reclaimed(self):
         os.mkdir(self.lock)
         self.age_the_lock()
@@ -722,29 +817,41 @@ class ClaimBinding(Base):
     def lock_path(self, tid):
         return os.path.join(self.root, "_round", "tasks", tid + ".lock")
 
-    def test_a_fresh_lock_after_an_interrupted_release_is_a_new_claim(self):
-        """The review's schedule: the record still says w1#1, the lock is gone, w1 checks out again."""
+    def test_a_release_that_dies_after_its_record_is_a_new_claim_next(self):
+        """The review's schedule, moved: the record is first now, so a dead release leaves an orphan lock, not a dead claim."""
         self.checked_out("A")
         mod = self.load_module()
         real = mod._completion_settled
 
         def hooked(owner):
             res = real(owner)
-            r = subprocess.run([PY, "-B", "-c", RELEASE_DIES, TASK, "A", "w1"], capture_output=True, text=True,
-                               env=self.env())
+            r = subprocess.run([PY, "-B", "-c", RELEASE_DIES, TASK, "A", "w1", "_release_claim"], capture_output=True,
+                               text=True, env=self.env())
             self.assertNotEqual(r.returncode, 0)
-            self.assertFalse(os.path.exists(self.lock_path("A")))
-            self.assertEqual(self.rec("A")["claim_gen"], 1)
+            self.assertIsNone(self.rec("A")["owner"])
+            self.assertTrue(os.path.exists(self.lock_path("A")))
             self.assertEqual(self.t("checkout", "A", "--owner", "w1")[0], 0)
             return res
         mod._completion_settled = hooked
         rc = self.call(mod, "set-status", "A", "done", *self.EV)
         rec = self.rec("A")
-        control("P2R3 release died after removing the lock, w1 checked out afresh: rc=%s status=%s gen=%s lock=%s rows=%s" % (
-            rc, rec["status"], rec["claim_gen"], self.lock_owner("A"), self.rows("A")))
-        self.assertEqual((rc, rec["status"], rec["claim_gen"]), (9, "in_progress", 2))
-        self.assertEqual(self.lock_owner("A"), "w1")
+        with open(os.path.join(self.lock_path("A"), "owner.json"), encoding="utf-8") as f:
+            lock_gen = json.load(f)["claim_gen"]
+        control("P2R4 release died after its record, w1 checked out again: rc=%s status=%s gen=%s lock gen=%s rows=%s" % (
+            rc, rec["status"], rec["claim_gen"], lock_gen, self.rows("A")))
+        self.assertEqual((rc, rec["status"], rec["claim_gen"], lock_gen), (9, "in_progress", 2, 2))
         self.assertEqual(self.rows("A"), [])
+
+    def test_a_release_that_cannot_write_its_record_changes_nothing(self):
+        self.checked_out("A")
+        before = self.raw("A")
+        r = subprocess.run([PY, "-B", "-c", RELEASE_DIES, TASK, "A", "w1", "_write_json_atomic"], capture_output=True,
+                           text=True, env=self.env())
+        control("P2R4 release could not write its record: record unchanged=%s lock kept=%s" % (
+            self.raw("A") == before, os.path.exists(self.lock_path("A"))))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(self.raw("A"), before)
+        self.assertEqual(self.lock_owner("A"), "w1")
 
     def test_a_record_with_an_owner_and_no_lock_gets_a_new_generation(self):
         self.checked_out("A")
