@@ -1960,7 +1960,7 @@ _CYS_ROTATE_SELF=0
 #   여전히 exported 인 채로 남아 자식 cysd·좌석에까지 전달된다(정본 §3-4 '상속되는 노브 금지' ·
 #   `_CYS_ROTATE_SELF` 를 env 가 아니라 argv 표식으로 갈아탄 P6 R1 과 같은 이유).
 #   unset 뒤의 대입은 **비상속 셸 변수**다 — 자식에게 넘겨야 하는 값은 스폰 지점에서 명시 전달한다
-#   (`CYS_SOCKET=… CYS_PACK_DIR=… CYS_ACCOUNT_DIR=… env -u … "$CYSD"` — 이 목록에 없다 = 안 넘긴다).
+#   (`CYS_SOCKET=… CYS_PACK_DIR=… CYS_PROJECT_ROOT=… CYS_ACCOUNT_DIR=… env -u … "$CYSD"` — 이 목록에 없다 = 안 넘긴다).
 unset _CYS_ROTATE_ACCT
 # ★0.14.42 R8: 토큰 관문(team_token_gate)의 결과는 **이 셸의 비상속 변수**로만 create 갈래에 넘긴다.
 #   진입 시 전부 지운다(J6 과 같은 이유 — 외부에서 export 한 같은 이름이 '데몬 통과'로 읽히지 않게 ·
@@ -2333,10 +2333,10 @@ launch_dept(){   # $1=name
         #   3기가 전부 그 값을 물고 있었고, 그것이 이 도구의 단일소유 게이트를 그 부서에서 영구히
         #   껐다. 재기동 한 번으로 이미 샌 값이 회수된다.
         #   `VAR=.. env -u ..`: 접두 대입은 env 의 환경이 되어 자식(cysd)에 그대로 전달된다(Git Bash coreutils env ✓).
-        CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_ACCOUNT_DIR="$acctdir" \
+        CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_PROJECT_ROOT="$pack" CYS_ACCOUNT_DIR="$acctdir" \
           env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
       else
-        CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
+        CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_PROJECT_ROOT="$pack" env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
       fi
       disown
       dept_ready_knob_warn   # ★0.14.43 R2F-PK(S4 m4): 비어 있지 않은 무효 노브 경고 1줄(미설정·유효 값은 무음) — 스폰 뒤 대기 직전
@@ -2602,9 +2602,9 @@ PY
       # ★계정 격리: 데몬을 CYS_ACCOUNT_DIR(fork dir)와 함께 spawn (create와 동형).
       if _cys_detach_ok; then
         # ★fatal-fix X-R4-1: 대화 승인 토큰 경로 — 호출자(대표의 Bash 도구) 프로세스 그룹 밖 새 세션에서 띄운다(pid 불변 exec).
-        CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_ACCOUNT_DIR="$acctdir" env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE nohup python3 -c "$_CYS_SETSID_PY" "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
+        CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_PROJECT_ROOT="$pack" CYS_ACCOUNT_DIR="$acctdir" env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE nohup python3 -c "$_CYS_SETSID_PY" "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
       else
-      CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_ACCOUNT_DIR="$acctdir" env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
+      CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_PROJECT_ROOT="$pack" CYS_ACCOUNT_DIR="$acctdir" env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
       fi
       _dept_spawn_pid=$!
       dept_stage wait   # ★0.14.43 GP: 스폰 뒤 소켓 대기 시작 직전(재사용 분기엔 없다)
@@ -2916,7 +2916,7 @@ PY
       dept_stage spawn   # ★0.14.43 GP: 새 cysd 를 띄우기 직전(재사용 분기엔 없다)
       reg_restamp "$name" create "$mkey"   # ★0.14.43 R2F-PK(S4 m3): NEW·REUSE_DEAD 공통 — 스폰 직전에 예약 시각을 한 번 다시 찍는다(최선 노력 · 등재가 아직 있고 내 mission_key 일 때만)
       # ★계정 격리: 데몬을 CYS_ACCOUNT_DIR 와 함께 spawn(patch2 있으면 자식 전파·없으면 F1 시드가 보장)
-      CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_ACCOUNT_DIR="$acctdir" env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
+      CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_PROJECT_ROOT="$pack" CYS_ACCOUNT_DIR="$acctdir" env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
       _dept_spawn_pid=$!
       dept_stage wait   # ★0.14.43 GP: 스폰 뒤 소켓 대기 시작 직전(재사용 분기엔 없다)
       dept_ready_knob_warn   # ★0.14.43 R2F-PK(S4 m4): 비어 있지 않은 무효 노브 경고 1줄(미설정·유효 값은 무음)

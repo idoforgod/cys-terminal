@@ -10,8 +10,10 @@ Each `[control]` line prints what was measured.
 """
 import glob
 import os
+import re
 import subprocess
 import sys
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -27,8 +29,21 @@ exit 0
 VERBS = (("launch", ("launch", "dept-1")), ("allocate", ("allocate",)), ("create", ("create", "k1")))
 
 
+EXPORT = 'CYS_PROJECT_ROOT="$pack"'
+
+
 def control(msg):
     print("[control] " + msg, flush=True)
+
+
+def spawn_lines(text):
+    """Every logical shell line of cys-dept that starts the daemon. Found by what it does, never by line number."""
+    lines = re.sub(r"\\\n\s*", " ", text).splitlines()
+    return [ln.strip() for ln in lines if not ln.lstrip().startswith("#") and "nohup" in ln and '"$CYSD"' in ln]
+
+
+def missing_export(text):
+    return [ln for ln in spawn_lines(text) if EXPORT not in ln]
 
 
 class Verbs(unittest.TestCase):
@@ -80,6 +95,56 @@ class RoundDir(Verbs):
             after = self.formation_pack(sb, pack)
             control("P1 %s, positive control, real marker planted: detector says the pack=%s" % (verb, after == pack))
             self.assertEqual(after, pack)
+
+
+class SpawnEnv(Verbs):
+    def read_env(self, sb):
+        """Wait for the stub daemon, a background child."""
+        path = os.path.join(sb.home, "spawn-env")
+        deadline = time.time() + 30
+        while not os.path.exists(path):
+            self.assertLess(time.time(), deadline, "the stub daemon never ran")  # wallclock: guard 30 s only bounds a hang; the verdict is the env read below
+            time.sleep(0.02)  # wallclock: guard polling a file a child writes once, not a duration the test rests on
+        with open(path, encoding="utf-8") as f:
+            return dict(ln.split("=", 1) for ln in f.read().splitlines() if "=" in ln)
+
+    def test_every_spawn_verb_exports_the_lane_root(self):
+        for verb, argv in VERBS:
+            sb, pack = self.spawn(argv)
+            env = self.read_env(sb)
+            control("P1 %s: daemon env CYS_PROJECT_ROOT is the lane pack=%s, CYS_PACK_DIR same=%s, _round present=%s" % (
+                verb, env.get("CYS_PROJECT_ROOT") == pack, env.get("CYS_PACK_DIR") == pack,
+                os.path.isdir(os.path.join(env.get("CYS_PROJECT_ROOT", ""), "_round"))))
+            self.assertEqual(env.get("CYS_PROJECT_ROOT"), pack, verb)
+            self.assertTrue(os.path.isdir(os.path.join(pack, "_round")), verb)
+
+
+class Census(unittest.TestCase):
+    def setUp(self):
+        with open(DEPT, encoding="utf-8") as f:
+            self.text = f.read()
+
+    def test_every_spawn_line_exports_the_lane_root(self):
+        lines = spawn_lines(self.text)
+        control("P1 census: %d spawn lines, without the export=%d" % (len(lines), len(missing_export(self.text))))
+        self.assertGreaterEqual(len(lines), 1, "the census found no spawn line, so it proves nothing")
+        self.assertEqual(missing_export(self.text), [])
+
+    def test_positive_control_a_new_spawn_line_without_it_fails(self):
+        planted = self.text + '\n      CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" env -u CYS_ROLE nohup "$CYSD" >/dev/null 2>&1 &\n'
+        control("P1 census control, one planted line: caught=%d" % len(missing_export(planted)))
+        self.assertEqual(len(missing_export(planted)), 1)
+
+    def test_positive_control_the_continuation_form_is_seen(self):
+        planted = 'CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" \\\n  env -u CYS_ROLE nohup "$CYSD" &\n'
+        self.assertEqual(len(spawn_lines(planted)), 1)
+        self.assertEqual(len(missing_export(planted)), 1)
+
+    def test_every_pack_dir_mkdir_also_makes_the_round_dir(self):
+        sites = [ln for ln in self.text.splitlines() if "mkdir -p" in ln and '"$pack/directives"' in ln]
+        control("P1 census: %d mkdir sites, all with _round=%s" % (len(sites), all('"$pack/_round"' in s for s in sites)))
+        self.assertGreaterEqual(len(sites), 1)
+        self.assertTrue(all('"$pack/_round"' in s for s in sites), sites)
 
 
 if __name__ == "__main__":
