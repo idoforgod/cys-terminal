@@ -889,6 +889,24 @@ class CheckoutUnderLock(Base):
             co, made, rel, kept))
         self.assertEqual((co, made, rel, kept), (7, False, 7, True))
 
+    def test_a_lost_lock_does_not_adopt_a_dead_owners_lock(self):
+        """Giving back cannot restore an adopted lock, so the check must come before ownership moves."""
+        self.t("create", "A", "--id", "A")
+        self.assertEqual(self.t("checkout", "A", "--owner", "w1")[0], 0)
+        with open(os.path.join(self.lock_path("A"), "owner.json"), "rb") as f:
+            before = f.read()
+        mod = self.load_module()
+
+        def lost(task_id):
+            raise mod._WlockBusy(task_id)
+        mod._wlock_confirm = lost
+        mod._pid_alive = lambda pid: False
+        rc = self.call(mod, "checkout", "A", "--owner", "w2")
+        with open(os.path.join(self.lock_path("A"), "owner.json"), "rb") as f:
+            kept = f.read() == before
+        control("P3R3 lock lost, dead owner's lock in place: rc=%s, that lock unchanged=%s" % (rc, kept))
+        self.assertEqual((rc, kept), (7, True))
+
     def test_a_refused_write_gives_a_fresh_ownership_lock_back(self):
         self.t("create", "A", "--id", "A")
         before = self.raw("A")
