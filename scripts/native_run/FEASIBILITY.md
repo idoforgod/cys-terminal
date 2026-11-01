@@ -83,3 +83,11 @@ including explicit NULL for a missing finish receipt. Network feasibility is
 assigned only after all recorded confinement obligations are combined. Valid
 submission events are accumulated independently from malformed/missing sibling
 streams; completeness becomes NULL without erasing an already observed failure.
+
+The final review delta registers caller-owned pending confinement obligations
+before each helper and each child-starting path. Missing whole helper results
+therefore remain explicit NULL, not absent from a scan of successful returns.
+Cleanup is independent of stop/evidence writes. Exceptions are latched, and a
+verified False is sticky even if later evidence is missing or a close is called
+again. Origin and OPEN result containers are caller-owned as well, retaining
+already observed findings if publication fails before helper return.

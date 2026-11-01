@@ -172,12 +172,23 @@ class ProductReceiver:
 
     def close(self):
         if hasattr(self,'cleanup'):return
-        (self.root/'evidence/stop-receiver').write_bytes(b'owned stop after capture\n')
-        receipt=None
-        try:receipt=bounded_observation('receiver owned cleanup',lambda:read_json(self.root/'evidence/boundary-finish.json') if (self.root/'evidence/boundary-finish.json').is_file() else None,15)
-        except Unavailable:pass
-        if self.daemon:self.daemon.close()
-        daemon_cleanup=None if not self.daemon else self.daemon.cleanup
+        receipt=None;errors=[]
+        try:
+            try:(self.root/'evidence/stop-receiver').write_bytes(b'owned stop after capture\n')
+            except Exception as error:errors.append('stop: '+str(error))
+            if not errors:
+                try:receipt=bounded_observation('receiver owned cleanup',lambda:read_json(self.root/'evidence/boundary-finish.json') if (self.root/'evidence/boundary-finish.json').is_file() else None,15)
+                except Exception as error:errors.append('finish: '+str(error))
+        finally:
+            if self.daemon:
+                try:self.daemon.close()
+                except Exception as error:errors.append('daemon close: '+str(error))
+        daemon_cleanup=getattr(self.daemon,'cleanup',None)
         receiver_cleanup=receipt.get('cleanup') if type(receipt) is dict else None
-        self.cleanup={'receiver':receipt,'daemon':daemon_cleanup,'confinement':(receiver_cleanup or {}).get('confinement'),'complete':cleanup_valid(receiver_cleanup) and cleanup_valid(daemon_cleanup)}
-        atomic_json(self.root/'evidence/fixture-cleanup.json',self.cleanup)
+        self.cleanup={'receiver':receipt,'daemon':daemon_cleanup,'confinement':(receiver_cleanup or {}).get('confinement'),
+                      'complete':not errors and cleanup_valid(receiver_cleanup) and cleanup_valid(daemon_cleanup),'errors':errors}
+        try:atomic_json(self.root/'evidence/fixture-cleanup.json',self.cleanup)
+        except Exception as error:
+            # Idempotent later close cannot erase this publication failure.
+            self.cleanup['complete']=False;self.cleanup['errors'].append('publication: '+str(error))
+            raise

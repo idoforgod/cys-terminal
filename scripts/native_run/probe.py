@@ -29,6 +29,35 @@ def proposed_plan():
             'runner_minutes':30,'phases':[{'name':n,'cap_seconds':s} for n,s in PHASES],
             'main_populations_unchanged':True,'native_hard_gate':'OPEN','release_verdict':'NONE'}
 
+def pending_obligation(ledger,name):
+    if name in ledger:raise Unavailable('confinement obligation reused: '+name)
+    slot={'confinement':None,'state':'pending'};ledger[name]=slot;return slot
+
+def settle_obligation(slot,evidence,complete):
+    value=boundary_conclusion(True,evidence)
+    # Once observed, a failure cannot be erased by any later exception/absence.
+    if slot['confinement'] is False or value is False:
+        slot.update(confinement=False,state='observed_failure');return
+    if 'exception' in slot:
+        slot.update(confinement=None,state='unmeasured');return
+    if complete is True and value is True:slot.update(confinement=True,state='verified')
+    else:slot.update(confinement=None,state='unmeasured')
+
+def obligation_exception(slot,error):
+    slot['exception']=str(error)
+    if slot['confinement'] is not False:slot.update(confinement=None,state='unmeasured')
+
+def close_owned(item,slot):
+    errors=[]
+    try:item.close()
+    except Exception as error:errors.append(str(error))
+    receipt=getattr(item,'cleanup',None)
+    if type(receipt) is not dict:receipt={'receiver':None,'daemon':None,'confinement':None,'complete':False}
+    if errors:
+        obligation_exception(slot,'; '.join(errors));receipt={**receipt,'complete':False,'close_errors':errors}
+    settle_obligation(slot,receipt,receipt.get('complete') is True and not errors)
+    return receipt
+
 class LoopbackCanary:
     def __enter__(self):
         self.socket=socket.socket();self.socket.bind(('127.0.0.1',0));self.socket.listen(4);self.socket.settimeout(.2)
@@ -49,11 +78,12 @@ def parent_connect(address,port):
         with socket.create_connection((address,port),timeout=2):return {'connected':True,'error':None}
     except OSError as e:return {'connected':False,'error':str(e)}
 
-def network_probe(config, grant, parent):
+def network_probe(config, grant, parent,ledger):
     observations=[]
     with LoopbackCanary() as listener:
         endpoints=[listener.endpoint,(config['canary_literal_address'],443)]
-        for address,port in endpoints:
+        for ordinal,(address,port) in enumerate(endpoints):
+            obligation=pending_obligation(ledger,'network/'+str(ordinal))
             if datetime.datetime.now(datetime.timezone.utc)>=datetime.datetime.fromisoformat(grant.latest_end_utc):raise Unavailable('authority expired before boundary control')
             root,exe=prepare_root(parent,config['receiver_helper'],config['receiver_helper_sha256'])
             register(root,config)
@@ -66,13 +96,25 @@ def network_probe(config, grant, parent):
             try:
                 child=OwnedBoundary(spec);receipt=child.release()
                 code=child.wait(10000)
-                if code==0 and output.is_file():result=read_json(output)
+                if code==0 and output.is_file():
+                    result=read_json(output)
+                    if type(result) is dict and type(result.get('pid')) is int and result['pid']==child.process.dwProcessId and result.get('address')==address and type(result.get('port')) is int and result['port']==port and result.get('connected') is True:
+                        settle_obligation(obligation,{'confinement':False},False)
+            except Exception as error:
+                settle_obligation(obligation,getattr(error,'partial_cleanup',None),False)
+                obligation_exception(obligation,error)
+                raise
             finally:
-                if child:child.close();cleanup=child.cleanup
+                if child:
+                    try:child.close()
+                    finally:
+                        cleanup=getattr(child,'cleanup',None)
+                        settle_obligation(obligation,cleanup,False)
             after=parent_connect(address,port)
             row={'expected_pid':None if child is None else child.process.dwProcessId,'endpoint':[address,port],'parent_before':before,'child':result,'parent_after':after,
                  'token':None if child is None else child.token,'cleanup':cleanup}
             observations.append(row);atomic_json(root/'evidence/network.json',row)
+            settle_obligation(obligation,row,cleanup_valid(cleanup))
     for row in observations:
         child=row['child']
         if type(child) is not dict or type(child.get('pid')) is not int or child['pid']!=row['expected_pid'] or child.get('address')!=row['endpoint'][0] or type(child.get('port')) is not int or child['port']!=row['endpoint'][1]:return None,observations
@@ -99,9 +141,11 @@ def application_records(receiver):
     if len(files)!=1:raise Unavailable('application submission transcript unavailable/ambiguous')
     data=files[0].read_bytes();(receiver.root/'evidence/application.jsonl').write_bytes(data);return data
 
-def origin_calibration(config,grant,parent):
-    records=[]
+def origin_calibration(config,grant,parent,ledger,output=None):
+    output={} if output is None else output
+    records=[];output['subcases']=records
     for mode in ('emit','silent'):
+        obligation=pending_obligation(ledger,'origin/'+mode)
         root,exe=prepare_root(parent,config['receiver_helper'],config['receiver_helper_sha256'])
         register(root,config)
         protect_native_root(root)
@@ -110,6 +154,7 @@ def origin_calibration(config,grant,parent):
               'mode':grant.mode,'actor':'origin_control','session_id':str(uuid.uuid4()),
               'control_args':['origin',str(root/'child'),str(sideband),mode,str(go)]}
         item=ProductReceiver(grant,root,spec);row={'mode':mode,'query_role':'calibration_only','eligible_for_R':False}
+        records.append(row)
         try:
             row['launch']=item.start()
             ready=bounded_observation('origin child ready',lambda:read_json(str(sideband)+'.ready.json') if Path(str(sideband)+'.ready.json').is_file() else None,10)
@@ -119,17 +164,27 @@ def origin_calibration(config,grant,parent):
             row['trace_root']=str(root/'trace')
             # Collect fixed observations; matching bytes/timestamps are not an attribution rule.
             row['product_observation']=item.observations();row['attribution']=None
-        except (OSError,Unavailable,ValueError) as e:row['unmeasured']=str(e)
+        except Exception as e:
+            row['unmeasured']=str(e);obligation_exception(obligation,e)
         finally:
-            Path(str(go)+'.stop').write_bytes(b'owned calibration complete')
+            # Stop publication must never suppress the independent close attempt.
             try:
-                row['child_input']=bounded_observation('origin input receipt',lambda:read_json(str(sideband)+'.input.json') if Path(str(sideband)+'.input.json').is_file() else None,3)
-            except (Unavailable,OSError,ValueError) as error:row['input_unmeasured']=str(error)
-            item.close();row['cleanup']=item.cleanup
-        atomic_json(root/'evidence/origin-calibration.json',row);records.append(row)
-        if not row['cleanup'].get('complete'):break
-    return {'subcases':records,'cleanup_complete':len(records)==2 and all(r['cleanup'].get('complete') is True for r in records),'discriminator':None,'release_verdict':'NONE',
-            'meaning':'raw calibration only; no automatic attribution transfer to real receiver'}
+                Path(str(go)+'.stop').write_bytes(b'owned calibration complete')
+                try:
+                    row['child_input']=bounded_observation('origin input receipt',lambda:read_json(str(sideband)+'.input.json') if Path(str(sideband)+'.input.json').is_file() else None,3)
+                except (Unavailable,OSError,ValueError) as error:row['input_unmeasured']=str(error)
+            except Exception as error:
+                row['stop_error']=str(error);obligation_exception(obligation,error)
+            finally:row['cleanup']=close_owned(item,obligation)
+        try:atomic_json(root/'evidence/origin-calibration.json',row)
+        except Exception as error:
+            row['publication_error']=str(error);obligation_exception(obligation,error)
+        complete=row['cleanup'].get('complete') is True and not any(key in row for key in ('stop_error','publication_error','unmeasured','input_unmeasured'))
+        settle_obligation(obligation,row,complete)
+        if obligation['confinement'] is not True:break
+    output.update({'subcases':records,'cleanup_complete':len(records)==2 and all(ledger['origin/'+r['mode']]['confinement'] is True for r in records),'discriminator':None,'release_verdict':'NONE',
+            'meaning':'raw calibration only; no automatic attribution transfer to real receiver'})
+    return output
 
 def passive_interval(receiver, seconds=2):
     """Fixed observation window, not a retry-until-good loop or a write."""
@@ -141,15 +196,16 @@ def passive_interval(receiver, seconds=2):
         time.sleep(.05)
     return frames
 
-def open_control(receiver, config, grant, parent, baseline, before):
+def open_control(receiver, config, grant, parent, baseline, before,ledger,output=None):
     # The OPEN branch uses the existing startup receiver. An independent
     # NOT-OPEN child gets the same baseline and perturbation, never OPEN.
     # All observations inside the interval are read-only; Ctrl-G occurs ONLY
     # before OPEN or after the designated CLOSE boundary.
     sentinel='PERTURB_'+uuid.uuid4().hex[:12]
-    row={'sentinel':sentinel,'oracle_method':'passive_render_plus_final_byte_exports',
-         'origin':None,'eligibility':'SUPPLEMENTAL: real receiver, origin unknown'}
-    plain=None
+    row={} if output is None else output
+    row.update({'sentinel':sentinel,'oracle_method':'passive_render_plus_final_byte_exports',
+         'origin':None,'eligibility':'SUPPLEMENTAL: real receiver, origin unknown'})
+    plain=None;plain_obligation=None
     try:
         start=receiver.trace_sequence()
         receiver.write('\x1b[200~'+sentinel)
@@ -164,8 +220,9 @@ def open_control(receiver, config, grant, parent, baseline, before):
         row['known_failures']=[] if after==before+sentinel.encode() else ['open_composer_changed']
         # Stop this receiver before starting another; failed cleanup is a stop,
         # not an excuse to accumulate jobs or adopt a live child.
-        receiver.close();row['open_cleanup']=receiver.cleanup
-        if receiver.cleanup.get('complete') is not True:raise Unavailable('OPEN cleanup incomplete')
+        row['open_cleanup']=close_owned(receiver,ledger['primary'])
+        if row['open_cleanup'].get('complete') is not True:raise Unavailable('OPEN cleanup incomplete')
+        plain_obligation=pending_obligation(ledger,'open/plain')
         plain=new_receiver(config,grant,parent);row['plain_root']=str(plain.root)
         plain.start();plain.write(baseline);plain_before=plain.export()
         if plain_before!=before:raise Unavailable('NOT-OPEN baseline differs')
@@ -181,10 +238,13 @@ def open_control(receiver, config, grant, parent, baseline, before):
         if plain_after!=before+sentinel.encode():row['known_failures'].append('plain_composer_changed')
         # A calibrated temporal OPEN discriminator still supplies no query origin.
         row['genuine_open_query']=None
-    except (OSError,Unavailable,ValueError,InvalidEvidence) as e:row['unmeasured']=str(e)
+    except Exception as e:
+        row['unmeasured']=str(e)
+        obligation_exception(ledger['open'],e)
+        if plain_obligation is not None:obligation_exception(plain_obligation,e)
     finally:
-        if plain:plain.close();row['plain_cleanup']=plain.cleanup
-        row['cleanup_complete']=row.get('open_cleanup',{}).get('complete') is True and (plain is None or plain.cleanup.get('complete') is True)
+        if plain:row['plain_cleanup']=close_owned(plain,plain_obligation)
+        row['cleanup_complete']=row.get('open_cleanup',{}).get('complete') is True and plain is not None and row.get('plain_cleanup',{}).get('complete') is True and 'unmeasured' not in row
         atomic_json(receiver.root/'evidence/open-control.json',row)
     return row
 
@@ -220,14 +280,18 @@ def boundary_conclusion(initial,details):
 def execute(config,grant,output,phases):
     if sys.platform!='win32':raise Unavailable('native probe cannot execute on this host')
     parent=Path(tempfile.gettempdir());premises=dict.fromkeys(('network_boundary','auth_free_startup','genuine_open_query','no_submit_calibration'))
-    details={};errors=[];network_control=None
+    ledger={};details={'confinement_obligations':ledger};errors=[];network_control=None
     # No receiver is started before the actual boundary discrimination succeeds.
     phases.enter('network_boundary')
-    try:network_control,details['network']=network_probe(config,grant,parent)
-    except (OSError,Unavailable,ValueError) as e:errors.append({'phase':'network_boundary','error':str(e)})
+    network_obligation=pending_obligation(ledger,'network')
+    try:
+        network_control,details['network']=network_probe(config,grant,parent,ledger)
+        settle_obligation(network_obligation,{'confinement':network_control,'observations':details['network']},True)
+    except Exception as e:
+        obligation_exception(network_obligation,e);errors.append({'phase':'network_boundary','error':str(e)})
     if network_control is True:
         phases.enter('auth_free_startup')
-        receiver=None
+        receiver=None;primary_obligation=pending_obligation(ledger,'primary');active_obligation=primary_obligation
         try:
             receiver=new_receiver(config,grant,parent);details['receiver_root']=str(receiver.root);details['launch']=receiver.start()
             baseline='NATIVE_VISIBLE_'+receiver.run_id
@@ -251,18 +315,25 @@ def execute(config,grant,output,phases):
                     errors.append({'phase':'auth_free_startup','observed_failure':'export_oracle_control_failed'})
             if premises['auth_free_startup']:
                 phases.enter('origin_calibration')
-                details['origin_calibration']=origin_calibration(config,grant,parent)
+                origin_obligation=pending_obligation(ledger,'origin');active_obligation=origin_obligation
+                details['origin_calibration']={}
+                details['origin_calibration']=origin_calibration(config,grant,parent,ledger,details['origin_calibration'])
+                settle_obligation(origin_obligation,details['origin_calibration'],details['origin_calibration'].get('cleanup_complete') is True)
                 if details['origin_calibration']['cleanup_complete'] is not True:raise Unavailable('origin cleanup incomplete; no further children')
                 phases.enter('genuine_open_query')
-                details['query']=open_control(receiver,config,grant,parent,baseline,before)
-                for failure in details['query'].get('known_failures',[]):errors.append({'phase':'genuine_open_query','observed_failure':failure})
+                open_obligation=pending_obligation(ledger,'open');active_obligation=open_obligation
+                details['query']={}
+                details['query']=open_control(receiver,config,grant,parent,baseline,before,ledger,details['query'])
+                settle_obligation(open_obligation,details['query'],details['query'].get('cleanup_complete') is True)
                 premises['genuine_open_query']=None
 
-        except (OSError,Unavailable,ValueError,InvalidEvidence) as e:errors.append({'phase':'receiver','error':str(e)})
+        except Exception as e:
+            obligation_exception(active_obligation,e);errors.append({'phase':'receiver','error':str(e)})
         finally:
+            for failure in details.get('query',{}).get('known_failures',[]):errors.append({'phase':'genuine_open_query','observed_failure':failure})
             if receiver:
-                receiver.close();details['cleanup']=receiver.cleanup
-                if receiver.cleanup.get('complete') is not True:
+                details['cleanup']=close_owned(receiver,primary_obligation)
+                if details['cleanup'].get('complete') is not True:
                     premises['auth_free_startup']=None;premises['genuine_open_query']=None
                     errors.append({'phase':'receiver_cleanup','error':'cleanup incomplete; calibration not started'})
         if premises['auth_free_startup'] is True and details.get('query',{}).get('cleanup_complete') is True:
@@ -270,6 +341,7 @@ def execute(config,grant,output,phases):
             pair=[];sentinel='SUBMIT_CALIBRATION_'+uuid.uuid4().hex
             try:
                 for submit in (False,True):
+                    submit_obligation=pending_obligation(ledger,'submit/'+str(submit))
                     item=new_receiver(config,grant,parent);records=None
                     try:
                         item.start();start=item.trace_sequence();item.write(sentinel)
@@ -281,14 +353,17 @@ def execute(config,grant,output,phases):
                         records=application_records(item)
                         accepted=accepted_input(item.trace_events(),item.sid,start,(sentinel+('\r' if submit else '')).encode())
                         details.setdefault('calibration_input_accepted',[]).append(accepted)
-                    except (OSError,Unavailable,ValueError,InvalidEvidence) as error:
+                    except Exception as error:
+                        obligation_exception(submit_obligation,error)
                         errors.append({'phase':'no_submit_calibration','submit_control':submit,'error':str(error)})
                     finally:
-                        pair.append((item.spec['session_id'],records))
-                        partial=calibration_findings(pair,sentinel)
-                        errors.extend({'phase':'no_submit_calibration','observed_failure':f} for f in partial['observed_failures'])
-                        item.close();details.setdefault('calibration_cleanup',[]).append(item.cleanup)
-                    if item.cleanup.get('complete') is not True:raise Unavailable('calibration cleanup incomplete; no more children')
+                        try:
+                            pair.append((item.spec['session_id'],records))
+                            partial=calibration_findings(pair,sentinel)
+                            errors.extend({'phase':'no_submit_calibration','observed_failure':f} for f in partial['observed_failures'])
+                        finally:
+                            cleanup=close_owned(item,submit_obligation);details.setdefault('calibration_cleanup',[]).append(cleanup)
+                    if cleanup.get('complete') is not True:raise Unavailable('calibration cleanup incomplete; no more children')
                 findings=calibration_findings(pair,sentinel)
                 details['submission_counts']=findings['counts']
                 errors.extend({'phase':'no_submit_calibration','observed_failure':f} for f in findings['observed_failures'])
@@ -297,7 +372,7 @@ def execute(config,grant,output,phases):
                 if findings['complete'] and counts[1]>0 and details.get('calibration_input_accepted')==[True,True]:
                     premises['no_submit_calibration']=counts==[0,1]
 
-            except (OSError,Unavailable,ValueError,InvalidEvidence) as e:errors.append({'phase':'no_submit_calibration','error':str(e)})
+            except Exception as e:errors.append({'phase':'no_submit_calibration','error':str(e)})
     premises['network_boundary']=boundary_conclusion(network_control,details)
     result={**decide_feasibility(premises),'details':details,'errors':errors,'source':{'product_sha':grant.product_sha,'diagnostic_sha':grant.diagnostic_sha},'authorization_sha256':grant.digest}
     result['observed_failures'] = sorted(set(result['observed_failures']+[e['observed_failure'] for e in errors if 'observed_failure' in e]))
