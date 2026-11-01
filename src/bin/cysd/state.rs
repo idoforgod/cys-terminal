@@ -848,6 +848,7 @@ pub type SafetyProbe = Arc<dyn Fn() -> bool + Send + Sync>;
 pub struct InjectGuard {
     #[cfg(test)]
     pub(crate) win_diag: crate::agent_queue_tests::WinDiag,
+
     #[cfg(test)]
     win_diag_created: Instant,
     /// 판정이 본 출력 세대(짝수 = 발행 완료). `None` = 이 경로는 출력 세대 불변을 요구하지 않는다.
@@ -1421,6 +1422,8 @@ pub struct ReturnTicket {
 pub struct InjectTrack {
     #[cfg(test)]
     pub(crate) win_diag: crate::agent_queue_tests::WinDiag,
+    #[cfg(test)]
+    native_trace_surface: AtomicU64,
     /// Inject arm 이 (선정리)·붙여넣기·cr_delay·CR 을 쓰는 중이다.
     active: AtomicBool,
     /// 마지막 Inject arm 이 끝난 단조 시각(성공·실패 무관 — 끝난 뒤에는 화면만 남는다).
@@ -1866,7 +1869,7 @@ pub(crate) struct HandoffMark {
 
 /// Only the state-module CPR generator can construct this protocol response.
 /// No public byte constructor: identical bytes sent as Data remain ordinary input.
-pub struct TerminalReply(Vec<u8>);
+pub struct TerminalReply(Vec<u8>, #[cfg(test)] Option<u64>);
 
 /// PTY 쓰기 요청 — surface별 전용 writer 스레드가 순서대로 소비한다.
 pub enum WriteReq {
@@ -3635,7 +3638,7 @@ pub(crate) fn dsr_resume_generated_request() -> WriteReq {
     let (count, _) = count_dsr_queries(&[], query);
     let (response, panicked) = process_chunk_isolated(&mut parser, query, count);
     assert!(!panicked);
-    WriteReq::TerminalReply(TerminalReply(response.expect("generated CPR").into_bytes()))
+    WriteReq::TerminalReply(TerminalReply(response.expect("generated CPR").into_bytes(), None))
 }
 
 #[cfg(test)]
@@ -7695,6 +7698,8 @@ impl Daemon {
 
         #[cfg(test)]
         crate::agent_queue_tests::win_diag_surface_created(&surface);
+        #[cfg(test)]
+        surface.inject_track.native_trace_surface.store(surface.id, Ordering::Release);
 
         // ★W2a: 이 create가 실제 등록한(dedup 후) 역할 — 아래에서 묘비 해제에 쓴다.
         let mut registered_role: Option<String> = None;
@@ -7844,6 +7849,8 @@ impl Daemon {
                             // 패닉 시 그 청크 파싱만 포기하고 파서를 fresh로 재초기화(rows/cols 보존)한다.
                             // reader 스레드는 죽지 않고, 아래 out_tx.send(원시 바이트 broadcast)와
                             // 후속 ingest 경로는 계속 태워 PTY 배수를 절대 멈추지 않는다.
+                            #[cfg(test)]
+                            crate::native_harness_trace::emit("pty_output", surf.id, || serde_json::json!({"bytes":chunk,"dsr_count":dsr_count}));
                             let (resp, panicked) =
                                 process_chunk_isolated(&mut parser, chunk, dsr_count);
                             if panicked {
@@ -7893,7 +7900,11 @@ impl Daemon {
                             // 응답을 조용히 버려 '고부하에서만 ConPTY 스톨'을 만들었다.
                             if send_write_req_bounded(
                                 &surf.write_tx,
-                                WriteReq::TerminalReply(TerminalReply(resp.into_bytes())),
+                                WriteReq::TerminalReply(TerminalReply(
+                                    resp.into_bytes(),
+                                    #[cfg(test)]
+                                    crate::native_harness_trace::emit("reply_generated", surf.id, || serde_json::json!({"producer":"pty_reader","query_origin":"unknown","dsr_count":dsr_count})),
+                                )),
                                 DSR_SEND_DEADLINE,
                             ) {
                                 if debug {
@@ -8481,6 +8492,8 @@ pub(crate) fn run_writer_loop_tracked<W: Write, R: Into<crate::writer_gate::Queu
     stop: Arc<AtomicBool>,
     track: Option<Arc<InjectTrack>>,
 ) {
+    #[cfg(test)]
+    let mut writer = crate::native_harness_trace::Writer::new(writer, track.as_ref().map(|t| t.native_trace_surface.load(Ordering::Acquire)).unwrap_or(0));
     use std::sync::mpsc::RecvTimeoutError;
     let mut last_program_write: Option<std::time::Instant> = None;
     loop {
@@ -8507,6 +8520,18 @@ pub(crate) fn run_writer_loop_tracked<W: Write, R: Into<crate::writer_gate::Queu
             WriteReq::Agent(job) => format!("Agent origin={} request={}", job.request.origin, job.request.id),
             WriteReq::P1ReceiverBarrier(_) => "P1ReceiverBarrier".into(),
         });
+        #[cfg(test)]
+        let native_write = track.as_ref().and_then(|t| crate::native_harness_trace::emit("write_begin", t.native_trace_surface.load(Ordering::Acquire), || {
+            let (origin, bytes, query) = match &req {
+                WriteReq::TerminalReply(r) => ("TerminalReply", Some(r.0.clone()), r.1),
+                WriteReq::Data(b) => ("Data", Some(b.clone()), None),
+                WriteReq::Program(b) => ("Program", Some(b.clone()), None),
+                _ => ("other", None, None),
+            };
+            serde_json::json!({"origin":origin,"bytes":bytes,"query_event":query,"total":t.wrote(),"resume_epoch":t.resume_write_epoch()})
+        }));
+        #[cfg(test)]
+        writer.operation(native_write, track.as_ref().map(|t| t.native_trace_surface.load(Ordering::Acquire)).unwrap_or(0));
         let terminal_reply = matches!(&req, WriteReq::TerminalReply(_));
         let res = match req {
             #[cfg(test)]
@@ -8648,6 +8673,10 @@ pub(crate) fn run_writer_loop_tracked<W: Write, R: Into<crate::writer_gate::Queu
                     }
                     t.end();
                 }
+                #[cfg(test)]
+                if let Some(t) = &track {
+                    crate::native_harness_trace::emit("agent_terminal", t.native_trace_surface.load(Ordering::Acquire), || serde_json::json!({"write_event":native_write,"request_id":job.request.id,"terminal":ex.terminal.kind(),"body_offset":ex.envelope.body_offset,"proof":format!("{:p}",std::sync::Arc::as_ptr(&job.proof)),"total":t.wrote(),"resume_epoch":t.resume_write_epoch()}));
+                }
                 let broken = ex.transport_broken;
                 crate::agent_write::finish(job, &ex);
                 if broken {
@@ -8666,6 +8695,8 @@ pub(crate) fn run_writer_loop_tracked<W: Write, R: Into<crate::writer_gate::Queu
             }
             #[cfg(test)]
             t.win_diag.record(|| format!("write_count={} resume_write_epoch={} origin={win_diag_origin:?} result={res:?}", t.wrote(), t.resume_write_epoch()));
+            #[cfg(test)]
+            crate::native_harness_trace::emit("write_end", t.native_trace_surface.load(Ordering::Acquire), || serde_json::json!({"write_event":native_write,"complete":res.is_ok(),"error":res.as_ref().err().map(|e|format!("{e:?}")),"total":t.wrote(),"resume_epoch":t.resume_write_epoch()}));
         }
         if res.is_err() {
             break; // PTY 닫힘 — 이후 send는 disconnected로 호출자에 드러난다

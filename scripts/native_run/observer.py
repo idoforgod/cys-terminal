@@ -58,11 +58,12 @@ Malformed/unknown records are rejected rather than interpreted as no-submit.
         if not line.strip():continue
         record=json.loads(line)
         if type(record) is not dict:raise InvalidEvidence('application record not an object')
-        if record.get('sessionId') != session_id:raise InvalidEvidence('mixed application session')
+        if record.get('sessionId') not in (None,session_id):raise InvalidEvidence('mixed application session')
         kind=record.get('type')
         if type(kind) is not str:raise InvalidEvidence('application record type absent')
         # Known submission-bearing forms. Every other kind remains retained, not a guessed user event.
         if kind=='user':
+            if record.get('sessionId')!=session_id:raise InvalidEvidence('user session identity absent')
             message=record.get('message')
             if type(message) is not dict or message.get('role')!='user':raise InvalidEvidence('user message shape')
             content=message.get('content')
@@ -74,6 +75,8 @@ Malformed/unknown records are rejected rather than interpreted as no-submit.
         elif kind in ('attachment','queued_command'):
             # No guessed adapter: this version-specific form must be bound during feasibility.
             raise InvalidEvidence('queued-command submission schema unbound')
+        elif kind not in ('assistant','system','progress','file-history-snapshot','summary','queue-operation'):
+            raise InvalidEvidence('unbound application event kind: '+kind)
     return events
 
 def calibrated_no_submit(unsubmitted_raw, submitted_raw, *, no_session, yes_session, sentinel):

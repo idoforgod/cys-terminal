@@ -24,6 +24,8 @@ class Authority:
     latest_end_utc: str
 
 def authorize(path, expected_digest, *, mode, diagnostic_sha, product_sha, now=None):
+    if any(type(x) is not str or not re.fullmatch('[0-9a-f]{40}',x) for x in (diagnostic_sha,product_sha)):
+        raise Unavailable('full source SHAs required')
     raw=Path(path).read_bytes()
     if not re.fullmatch('[0-9a-f]{64}',expected_digest) or sha(raw)!=expected_digest:raise Unavailable('external authority digest mismatch')
     data=read_json(path)
