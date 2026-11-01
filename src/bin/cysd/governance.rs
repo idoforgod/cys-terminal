@@ -26011,6 +26011,7 @@ mod tests {
             .create_surface(None, Some("sleep 30".into()), None, None, 24, 80)
             .expect("create surface");
         daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        s.inject_track.win_diag.enable();
         let e = daemon.next_queue_entry("[보고] 큐 본문".into(), Some("surface:9".into()), "send");
         s.pending_queue.lock().unwrap().push_back(e);
 
@@ -26021,12 +26022,14 @@ mod tests {
             "판정 이후 직접 send 가 입력줄을 점유했는데 큐를 밀어 넣었다 — 두 본문이 한 제출로 합쳐진다"
         );
         assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "미배달분은 보존돼야 한다");
+        assert!(s.inject_track.win_diag.dump().contains("route=queue.pending_changed "), "wrong negative route: {}", s.inject_track.win_diag.dump());
 
         // ⓑ 음성 대조: 값이 그대로면 정상 배달된다(무조건 거부 구현 차단).
         s.pending_input_bytes.store(0, std::sync::atomic::Ordering::Relaxed);
         assert!(
-            deliver_head_locked(&daemon, &s, false, false, None, Some(0), None, None, None).is_some(),
-            "값이 변하지 않았는데 배달을 막으면 그 자체가 기아다"
+            crate::state::test_done_or_no_pty_output(&s, ||
+                deliver_head_locked(&daemon, &s, false, false, None, Some(0), None, None, None).is_some()),
+            "값이 변하지 않았는데 배달을 막으면 그 자체가 기아다: {}", s.inject_track.win_diag.dump()
         );
     }
 
@@ -27518,6 +27521,69 @@ mod tests {
         assert!(events_named(&daemon,"master.deadman").is_empty());
     }
 
+    // Test-owned wait policy, never a production death classifier.
+    fn p7_wait_retained_exit(
+        mut recheck: impl FnMut() -> Result<(), cys::process_observation::Failure>,
+        mut elapsed: impl FnMut() -> Duration,
+        bound: Duration,
+        mut pause: impl FnMut(),
+    ) -> Result<(), String> {
+        let mut first_unknown = None;
+        let mut last_unknown = None;
+        loop { // wallclock: guard waits for positive death evidence within the caller's existing budget
+            if elapsed() >= bound { return Err(format!("retained exit deadline; first={first_unknown:?} latest={last_unknown:?}")); }
+            let reading = recheck();
+            if elapsed() >= bound { return Err(format!("retained exit deadline after query: {reading:?}; first={first_unknown:?} latest={last_unknown:?}")); }
+            match reading {
+                Err(cys::process_observation::Failure::Dead) => return Ok(()),
+                Err(e @ cys::process_observation::Failure::Unknown { .. }) => {
+                    if first_unknown.is_none() { first_unknown = Some(e.clone()); }
+                    last_unknown = Some(e);
+                }
+                Ok(()) => {},
+                other => return Err(format!("not proven: {other:?}")),
+            }
+            pause();
+        }
+    }
+
+    #[test]
+    fn a2cd_retained_unknown_then_dead_uses_one_budget() {
+        use cys::process_observation::Failure;
+        let mut readings = [Err(Failure::Unknown { stage: "fixture", os_error: Some(5) }), Err(Failure::Dead)].into_iter();
+        assert!(p7_wait_retained_exit(|| readings.next().expect("only two observations"),
+            || Duration::ZERO, Duration::from_secs(30), || {}).is_ok());
+    }
+
+    #[test]
+    fn a2cd_retained_late_dead_is_not_success() {
+        use cys::process_observation::Failure;
+        let elapsed = std::cell::Cell::new(Duration::ZERO);
+        let result = p7_wait_retained_exit(|| { elapsed.set(Duration::from_millis(30_001)); Err(Failure::Dead) },
+            || elapsed.get(), Duration::from_secs(30), || {});
+        assert!(result.is_err(), "Dead returned after the unchanged budget must not satisfy the premise");
+    }
+
+    #[test]
+    fn a2cd_retained_permanent_unknown_exhausts_without_death() {
+        use cys::process_observation::Failure;
+        let ticks = std::cell::Cell::new(0u64);
+        let calls = std::cell::Cell::new(0u32);
+        let result = p7_wait_retained_exit(|| { calls.set(calls.get()+1); Err(Failure::Unknown { stage: "persistent", os_error: Some(5) }) },
+            || { let n=ticks.get(); ticks.set(n+1); Duration::from_secs(n) }, Duration::from_secs(3), || {});
+        assert!(result.unwrap_err().contains("persistent"));
+        assert_eq!(calls.get(), 2, "Unknown retries but never becomes Dead");
+    }
+    #[test]
+    fn a2cd_retained_changed_is_not_retried() {
+        use cys::process_observation::Failure;
+        let calls = std::cell::Cell::new(0u32);
+        let result = p7_wait_retained_exit(|| { calls.set(calls.get()+1); Err(Failure::Changed) },
+            || Duration::ZERO, Duration::from_secs(30), || {});
+        assert!(result.unwrap_err().contains("Changed"));
+        assert_eq!(calls.get(), 1);
+    }
+
     #[test]
     fn p7_deadman_socket_rebuttal_vacant_and_shell_dead() {
         let _g=REAP_ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
@@ -27558,17 +27624,9 @@ mod tests {
             .unwrap_or_else(|e|panic!("owned fixture reap: {e}; {witness}; retained={:?}",retained.recheck()));
         // The reap adapter's Some(exit) is not the retained native object's signal. Wait for
         // that signal inside the SAME 30 s stop budget; unknown/changed is never called death.
-        let retained_exit=loop { // wallclock: guard bounds retained fixture exit within the existing 30 s stop budget
-            let reading=retained.recheck();
-            match &reading {
-                Err(cys::process_observation::Failure::Dead)=>break reading,
-                Ok(())=>{},
-                _=>panic!("p7 retained exit is not proven: {reading:?}; elapsed={:?}; {witness}",stop_at.elapsed()),
-            }
-            assert!(stop_at.elapsed()<stop_bound, // wallclock: guard bounds retained fixture exit; never a death premise
-                "p7 retained fixture handle not signaled within 30 s: {reading:?}; {witness}");
-            std::thread::sleep(Duration::from_millis(5));
-        };
+        let retained_exit=p7_wait_retained_exit(|| retained.recheck(), || stop_at.elapsed(), stop_bound,
+            || std::thread::sleep(Duration::from_millis(5)));
+        retained_exit.as_ref().unwrap_or_else(|e| panic!("p7 retained exit not proven: {e}; {witness}"));
         let pid_alive=crate::state::pid_alive(s.pid);
         assert!(!pid_alive,"fixture child not reaped: pid_alive={pid_alive} retained_exit={retained_exit:?} elapsed={:?}; {witness}",stop_at.elapsed());
         struct RestoreExit(Arc<crate::state::Surface>);
