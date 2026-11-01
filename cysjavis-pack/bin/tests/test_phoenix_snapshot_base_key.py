@@ -366,6 +366,70 @@ def key_checks(w, check):
           os.path.join(m.HOME, ".cys", "state-generations") == rig.gen_root and rig.gen_root.startswith(rig.root + os.sep)
           and m._snapshot_tombstones(sock) == {marker}, "%s %s" % (m.HOME, m._LANE_READ))
 
+    # the excluded tree: a link anywhere on the way to a stored copy is refused from the path, and no call reaches through it
+    from test_phoenix_capture_set import BoundarySpy
+    tree = os.path.join(rig.home, "Desktop", "CYSjavis")
+
+    def into_tree(path):
+        """Move `path` into the tree and leave a link in its place."""
+        dest = os.path.join(tree, "moved-%d" % len(os.listdir(tree)))
+        shutil.move(path, dest)
+        os.symlink(dest, path)
+        return dest
+
+    def spied(watched, links):
+        with BoundarySpy(watched, links) as spy:
+            got = m._snapshot_tombstones(sock)
+        return got, spy.touched
+
+    w.reset()
+    shutil.rmtree(tree, ignore_errors=True)
+    os.makedirs(tree)
+    w.gen(NEW_T, dept=R.topo(["dept-role"], tombs=["dept-gone"]), base=R.topo(["master"]))
+    dest = into_tree(rig.gen_root)
+    got, touched = spied([tree, rig.gen_root], [rig.gen_root])
+    check("KEY-14a a linked store: no listing, no call through it, nothing read", got is None and not touched, touched[:3])
+    check("KEY-14b it is refused by name, store_refused", m._LANE_READ["reason"] == "store_refused" and m._LANE_READ["passed_over"] == {"store_refused": 1}, m._LANE_READ)
+    os.remove(rig.gen_root)
+    shutil.rmtree(tree)
+    os.makedirs(tree)
+    w.gen(OLD_T, dept=R.topo(["older-role"], tombs=["older-gone"]), base=R.topo(["master"]))
+    g = w.gen(NEW_T, dept=R.topo(["newer-role"], tombs=["newer-gone"]), base=R.topo(["master"]))
+    gpath = w.gen_path(g)
+    into_tree(gpath)
+    got, touched = spied([tree, gpath], [gpath])
+    check("KEY-14c a linked generation: no call through it, the older generation answers", got == {"older-gone"} and not touched, "%s %s" % (got, touched[:3]))
+    check("KEY-14d it is passed over by name", m._LANE_READ["passed_over"] == {"store_refused": 1}, m._LANE_READ)
+    os.remove(gpath)
+    g = w.gen(NEW_T + 60, dept=R.topo(["newer-role"], tombs=["newer-gone"]), base=R.topo(["master"]))
+    mp = w.gen_path(g, "manifest.json")
+    into_tree(mp)
+    got, touched = spied([tree, mp], [mp])
+    check("KEY-14e a linked manifest: not opened, passed over by name", got == {"older-gone"} and not touched
+          and m._LANE_READ["passed_over"] == {"store_refused": 1}, "%s %s %s" % (got, touched[:3], m._LANE_READ))
+    shutil.rmtree(w.gen_path(g))
+    g = w.gen(NEW_T + 120, dept=R.topo(["newer-role"], tombs=["newer-gone"]), base=R.topo(["master"]))
+    stored = w.gen_path(g, w.stored_as(g, os.path.join(w.dept_dir, "topology.json")))
+    into_tree(stored)
+    got, touched = spied([tree, stored], [stored])
+    check("KEY-14f a linked stored copy: not opened, passed over by name", got == {"older-gone"} and not touched
+          and m._LANE_READ["passed_over"] == {"store_refused": 1}, "%s %s %s" % (got, touched[:3], m._LANE_READ))
+    shutil.rmtree(tree)
+    os.makedirs(tree)
+    # an unreadable store is not an absent one
+    w.reset()
+    w.gen(NEW_T, dept=R.topo(["dept-role"], tombs=["dept-gone"]), base=R.topo(["master"]))
+    os.chmod(rig.gen_root, 0)
+    try:
+        got = m._snapshot_tombstones(sock)
+    finally:
+        os.chmod(rig.gen_root, 0o755)
+    check("KEY-14g a store that exists and cannot be listed: store_unreadable, not generation_absent",
+          got is None and m._LANE_READ["reason"] == "store_unreadable", m._LANE_READ)
+    shutil.rmtree(rig.gen_root)
+    check("KEY-14h a store that is not there: generation_absent", m._snapshot_tombstones(sock) is None
+          and m._LANE_READ["reason"] == "generation_absent", m._LANE_READ)
+
     # the phoenix reader takes the same boundary as the snapshot tool: no policy, nothing opened, a named and counted refusal
     w.reset()
     w.gen(NEW_T, dept=R.topo(["dept-role"], tombs=["dept-gone"]), base=R.topo(["master"]))

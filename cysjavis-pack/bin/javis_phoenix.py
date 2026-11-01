@@ -1500,8 +1500,11 @@ def _lane_topology_in_generation(gen_dir, state):
     레인 키는 두 쪽이다: 살아 있는 쪽은 소켓의 상태 경로 state, 저장된 쪽은 행의 source 다. 접두 파일 이름은 sha256(source) 앞 8자를 싣는다 — 행과 파일
     이름이 서로 다른 레인을 말하면 lane_mismatch 로 거부한다. 저장된 쪽만 읽으면 귀속은 옳은데 받는 쪽이 틀린 묘비가 된다."""
     snap = _snap_mod()
+    mp = os.path.join(gen_dir, "manifest.json")
+    if snap._capture_refused(gen_dir, HOME) or snap._capture_refused(mp, HOME):   # 문자열·링크만 읽는다 — 그 트리 안은 밟지 않는다
+        return None, "store_refused"
     try:
-        with snap.safe_open(os.path.join(gen_dir, "manifest.json"), encoding="utf-8") as f:
+        with snap.safe_open(mp, encoding="utf-8") as f:
             man = json.load(f)
         files = list(man["files"])
     except snap.DatalessPolicyRefused:
@@ -1520,7 +1523,8 @@ def _lane_topology_in_generation(gen_dir, state):
     row = None
     for e in files:
         src = e.get("source") if isinstance(e, dict) else None
-        if isinstance(src, str) and os.path.basename(src) == "topology.json" and os.path.normcase(os.path.realpath(src)) == want:
+        if isinstance(src, str) and os.path.basename(src) == "topology.json" and not snap._capture_refused(src, HOME) \
+                and os.path.normcase(os.path.realpath(src)) == want:
             row = e
             break
     tag = lambda p: hashlib.sha256(p.encode("utf-8")).hexdigest()[:8]
@@ -1533,6 +1537,8 @@ def _lane_topology_in_generation(gen_dir, state):
         return None, "stored_missing"
     if "__" in name and name.split("__", 1)[0] != tag(row["source"]):
         return None, "lane_mismatch"
+    if snap._capture_refused(os.path.join(gen_dir, name), HOME):
+        return None, "store_refused"
     try:
         with snap.safe_open(os.path.join(gen_dir, name), binary=True) as f:
             raw = f.read()
@@ -1554,7 +1560,8 @@ def _lane_topology_in_generation(gen_dir, state):
 # 마지막 레인 판독의 결론 {reason, passed_over: {코드: 세대 수}, generation} — `_read_lane_topology` 만 쓴다. 코드는 데몬(governance.rs)과 같은
 #   문자열이다: found 묘비가 있는 이 레인 사본 · lane_empty 이 레인 사본이 있고 묘비는 정당하게 비었다 · lane_absent manifest 에 이 레인이 없다(스냅샷
 #   없는 레인) · lane_mismatch 행은 찾았는데 저장 키가 살아 있는 키가 아니다(잘못된 주소의 신호) · generation_absent 세대가 없다 · manifest_unreadable manifest 없음/판독 불가 · manifest_undated 날짜를 댈 수 없다 · stored_missing 행의 저장 파일이
-#   없다 · manifest_integrity 저장 파일이 행과 어긋난다 · copy_unreadable 행과 맞는 바이트가 topology 가 아니다 · dataless_policy_unset 내려받기 금지
+#   없다 · manifest_integrity 저장 파일이 행과 어긋난다 · copy_unreadable 행과 맞는 바이트가 topology 가 아니다 · store_refused 저장소·세대·manifest·사본이
+#   제외 트리(Desktop/CYSjavis)에 닿는다 · store_unreadable 저장소는 있는데 목록을 읽지 못했다 · dataless_policy_unset 내려받기 금지
 #   정책을 세우지 못해 열지 않았다(이 코드만 phoenix 쪽이다). 빈 결과 자체는 어느 검사가 발화했는지의 증거가 아니다 — 근거는 이 코드다.
 _LANE_READ = {"reason": None, "passed_over": {}, "generation": None}
 
@@ -1569,10 +1576,17 @@ def _read_lane_topology(socket, skipped=None):
     read = _LANE_READ = {"reason": None, "passed_over": {}, "generation": None}
     state = state_dir_for(socket)
     gen_root = os.path.join(HOME, ".cys", "state-generations")
+    if _snap_mod()._capture_refused(gen_root, HOME):      # 목록을 읽기 전이다: 링크가 그 트리를 가리켜도 listdir 은 없다
+        read["reason"] = "store_refused"
+        read["passed_over"]["store_refused"] = 1
+        return None
     try:
         gens = sorted(g for g in os.listdir(gen_root) if re.match(r"\d{8}T\d{6}Z", g))
-    except Exception:
+    except FileNotFoundError:
         gens = []
+    except OSError:
+        read["reason"] = "store_unreadable"         # 있는데 못 읽는 저장소는 없는 저장소가 아니다
+        return None
     if not gens:
         read["reason"] = "generation_absent"
     # ★E3 주의(gemini W6): 여기는 단일 '최신 세대' 선택(heal 소스)이라 GC 처럼 union 보호가 불가능하다.
