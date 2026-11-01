@@ -79,6 +79,21 @@ Malformed/unknown records are rejected rather than interpreted as no-submit.
             raise InvalidEvidence('unbound application event kind: '+kind)
     return events
 
+def submission_findings(raw,session_id,sentinel):
+    """Retain each independently valid event; malformed lines stay errors.
+
+No fragment is repaired or joined. Errors make completeness unavailable, but
+cannot erase an earlier or later valid, session-bound submission fact.
+"""
+    result={'events':[],'errors':[]}
+    if type(raw) is not bytes:
+        result['errors'].append('application transcript missing/not bytes');return result
+    for number,line in enumerate(raw.splitlines(),1):
+        if not line.strip():continue
+        try:result['events'].extend(submission_events(line,session_id,sentinel))
+        except (ValueError,UnicodeError,TypeError) as error:result['errors'].append({'line':number,'error':str(error)})
+    return result
+
 def calibrated_no_submit(unsubmitted_raw, submitted_raw, *, no_session, yes_session, sentinel):
     no=submission_events(unsubmitted_raw,no_session,sentinel)
     yes=submission_events(submitted_raw,yes_session,sentinel)

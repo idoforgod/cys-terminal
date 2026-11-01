@@ -30,11 +30,25 @@ def checked_authority(raw,expected,context):
     if context.get('event')!='push' or context.get('ref')!='refs/heads/'+doc['branch']:raise Unavailable('not authorized branch push')
     if context.get('sha')!=doc['diagnostic_sha'] or context.get('runner_os')!='Windows':raise Unavailable('checkout/host mismatch')
     if doc.get('host')!='windows-latest':raise Unavailable('standard runner required')
+    ref=doc.get('manifest')
+    if type(ref) is not dict or set(ref)!={'url','sha256'} or type(ref.get('url')) is not str or type(ref.get('sha256')) is not str or not re.fullmatch('[0-9a-f]{64}',ref.get('sha256','')):
+        raise Unavailable('digest-bound reviewed manifest required')
     if type(doc.get('rust_toolchain')) is not str or not re.fullmatch(r'\d+\.\d+\.\d+',doc['rust_toolchain']):raise Unavailable('exact toolchain version required')
     now=datetime.datetime.now(datetime.timezone.utc)
     start=datetime.datetime.fromisoformat(doc['earliest_start_utc']);end=datetime.datetime.fromisoformat(doc['latest_end_utc'])
     if start.tzinfo is None or end.tzinfo is None or not start<=now<end:raise Unavailable('outside approved UTC window')
     return doc
+
+def fetch_manifest(reference):
+    parsed=urllib.parse.urlparse(reference['url'])
+    if parsed.scheme!='https' or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:raise Unavailable('external HTTPS manifest required')
+    with urllib.request.build_opener(NoRedirect).open(reference['url'],timeout=10) as response:raw=response.read(16*1024*1024+1)
+    if len(raw)>16*1024*1024 or sha(raw)!=reference['sha256']:raise Unavailable('manifest size/digest mismatch')
+    return raw
+
+def bind_manifest(doc,raw):
+    from manifest import validate_runtime
+    return validate_runtime(raw,doc['manifest']['sha256'],doc,Path.cwd())
 
 def job_start_utc():
     run=os.environ.get('GITHUB_RUN_ID','');attempt=os.environ.get('GITHUB_RUN_ATTEMPT','')
@@ -63,6 +77,8 @@ def authorize(mode,branch):
     doc=checked_authority(raw,expected,context)
     actual=subprocess.check_output(['git','rev-parse','HEAD']).decode().strip()
     if actual!=doc['diagnostic_sha']:raise Unavailable('working checkout not approved diagnostic SHA')
+    manifest_raw=fetch_manifest(doc['manifest']);bind_manifest(doc,manifest_raw)
+    (root/'manifest.json').write_bytes(manifest_raw)
     (root/'authority.json').write_bytes(raw)
     atomic_json(root/'authorization-receipt.json',{'digest':expected,'context':context,'authority_host':parsed.hostname,
                 'run_id':os.environ.get('GITHUB_RUN_ID'),'job_start_utc':job_start_utc(),'release_verdict':'NONE'})
@@ -74,6 +90,7 @@ def authorize(mode,branch):
 def execute(job):
     root=Path('native-evidence');receipt=read_json(root/'authorization-receipt.json');raw=(root/'authority.json').read_bytes()
     doc=checked_authority(raw,receipt['digest'],receipt['context'])
+    bind_manifest(doc,(root/'manifest.json').read_bytes())
     # Execution driver is installed only when complete and reviewed. A partial
     # local WIP never substitutes simulation or returns a successful empty job.
     if doc['mode']=='feasibility':
@@ -90,6 +107,7 @@ def execute(job):
 def worker(evidence):
     root=Path(evidence);receipt=read_json(root/'authorization-receipt.json')
     doc=checked_authority((root/'authority.json').read_bytes(),receipt['digest'],receipt['context'])
+    bind_manifest(doc,(root/'manifest.json').read_bytes())
     from supervisor import PhasePublisher
     phases=PhasePublisher(root/'phase.json');phases.enter('setup')
     from setup import build_probe

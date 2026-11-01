@@ -107,6 +107,14 @@ def count_submissions(raw,session,sentinel):
             raise Rejected('unbound application-event schema')
     return count
 
+def submission_facts(raw,session,sentinel):
+    count=0;errors=[]
+    for number,line in enumerate(raw.splitlines(),1):
+        if not line.strip():continue
+        try:count+=count_submissions(line,session,sentinel)
+        except (Rejected,ValueError,TypeError,UnicodeError) as error:errors.append('line '+str(number)+': '+str(error))
+    return count,errors
+
 def semantic(root,record,case,issues,failures):
     artifacts=record['artifacts']
     evidence=read_json_bytes(blob(root,artifacts['trace']))
@@ -139,10 +147,17 @@ def semantic(root,record,case,issues,failures):
         needle=exact(case.get('calibration_sentinel'),str,'frozen calibration sentinel')
         counts={}
         for key,artifact_name in [('main','application_events'),('no','calibration_no_events'),('yes','calibration_yes_events')]:
-            session=exact(sessions.get(key),str,'session identity')
-            counts[key]=count_submissions(blob(root,artifacts[artifact_name]),session,needle if key!='main' else None)
-        if counts['main']>0:failures.append('application submission observed')
-        if counts['no']!=0 or counts['yes']!=1:issues.append('no-submit oracle uncalibrated')
+            try:
+                session=exact(sessions.get(key),str,'session identity')
+                count,parse_errors=submission_facts(blob(root,artifacts[artifact_name]),session,needle if key!='main' else None)
+                counts[key]=count
+                if key=='main' and count>0:failures.append('application submission observed')
+                if key=='no' and count>0:failures.append('unsubmitted calibration control submitted')
+                if key=='yes' and count>1:failures.append('positive calibration multiple submissions')
+                issues.extend(artifact_name+': '+error for error in parse_errors)
+            except (Rejected,OSError,KeyError,ValueError,TypeError) as error:
+                issues.append(artifact_name+': '+str(error))
+        if counts.get('no')!=0 or counts.get('yes')!=1:issues.append('no-submit oracle uncalibrated')
         for name in ('network_boundary','open_interval_discriminated'):
             v=evidence.get(name)
             if v is not None:exact(v,bool,name)
@@ -188,6 +203,22 @@ def assess(root,record,case,manifest):
             failures.extend(details['parent']['failures'])
         except (Rejected,ValueError,TypeError) as e:issues.append(str(e))
     if case['arm']=='R':
+        # Submission facts are independent of byte-oracle/other calibration
+        # availability. Inspect each stream before any all-axis gate can throw.
+        try:
+            trace=read_json_bytes(blob(root,record['artifacts']['trace']))
+            sessions=exact(trace.get('application_sessions'),dict,'application sessions')
+            for role,key in [('main','application_events'),('no','calibration_no_events'),('yes','calibration_yes_events')]:
+                try:
+                    session=exact(sessions.get(role),str,'session identity')
+                    sentinel=None if role=='main' else exact(case.get('calibration_sentinel'),str,'calibration sentinel')
+                    count,errors=submission_facts(blob(root,record['artifacts'][key]),session,sentinel)
+                    if role=='main' and count>0:failures.append('application submission observed')
+                    if role=='no' and count>0:failures.append('unsubmitted calibration control submitted')
+                    if role=='yes' and count>1:failures.append('positive calibration multiple submissions')
+                    issues.extend(key+': '+e for e in errors)
+                except (Rejected,OSError,KeyError,TypeError,ValueError) as e:issues.append(key+': '+str(e))
+        except (Rejected,OSError,KeyError,TypeError,ValueError) as e:issues.append(str(e))
         try:
             before=blob(root,record['artifacts']['composer_before']);after=blob(root,record['artifacts']['composer_after'])
             want=before+blob(root,record['artifacts']['sentinel']) if case['cell']=='visible' else before

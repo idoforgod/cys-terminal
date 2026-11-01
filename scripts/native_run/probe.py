@@ -17,7 +17,7 @@ import uuid
 from boundary import OwnedBoundary, Unavailable, cleanup_valid
 from controller import authorize, prepare_root, protect_native_root, fixture_environment, decide_feasibility
 from fixture import ProductReceiver, bounded_observation, pinned_copy
-from observer import compare_composer, calibrate_exports, calibrated_no_submit, InvalidEvidence, accepted_input, open_differential, submission_events
+from observer import compare_composer, calibrate_exports, calibrated_no_submit, InvalidEvidence, accepted_input, open_differential, submission_events, submission_findings
 from protocol import atomic_json, read_json, sha
 from archive import register
 
@@ -188,15 +188,44 @@ def open_control(receiver, config, grant, parent, baseline, before):
         atomic_json(receiver.root/'evidence/open-control.json',row)
     return row
 
+def calibration_findings(pair,sentinel):
+    """Each stream contributes facts even when its sibling is unavailable."""
+    result={'counts':[],'observed_failures':[],'errors':[],'complete':True}
+    for index,(session,raw) in enumerate(pair):
+        findings=submission_findings(raw,session,sentinel);count=len(findings['events'])
+        result['counts'].append(count)
+        if index==0 and count>0:result['observed_failures'].append('unsubmitted_control_submitted')
+        if index==1 and count>1:result['observed_failures'].append('positive_control_multiple_submissions')
+        if findings['errors']:
+            result['complete']=False
+            result['errors'].extend({'control':index,'error':error} for error in findings['errors'])
+    if len(pair)!=2:result['complete']=False;result['errors'].append('calibration pair incomplete')
+    return result
+
+def boundary_conclusion(initial,details):
+    confinements=[]
+    def collect(value):
+        if type(value) is dict:
+            if 'receiver' in value and ('daemon' in value or 'complete' in value):
+                confinements.append(value.get('confinement'))
+            elif 'confinement' in value:confinements.append(value['confinement'])
+            for child in value.values():collect(child)
+        elif type(value) is list:
+            for child in value:collect(child)
+    collect(details)
+    if initial is False or any(v is False for v in confinements):return False
+    if initial is not True or not confinements or any(v is not True for v in confinements):return None
+    return True
+
 def execute(config,grant,output,phases):
     if sys.platform!='win32':raise Unavailable('native probe cannot execute on this host')
     parent=Path(tempfile.gettempdir());premises=dict.fromkeys(('network_boundary','auth_free_startup','genuine_open_query','no_submit_calibration'))
-    details={};errors=[]
+    details={};errors=[];network_control=None
     # No receiver is started before the actual boundary discrimination succeeds.
     phases.enter('network_boundary')
-    try:premises['network_boundary'],details['network']=network_probe(config,grant,parent)
+    try:network_control,details['network']=network_probe(config,grant,parent)
     except (OSError,Unavailable,ValueError) as e:errors.append({'phase':'network_boundary','error':str(e)})
-    if premises['network_boundary'] is True:
+    if network_control is True:
         phases.enter('auth_free_startup')
         receiver=None
         try:
@@ -204,8 +233,10 @@ def execute(config,grant,output,phases):
             baseline='NATIVE_VISIBLE_'+receiver.run_id
             receiver.write(baseline);before=receiver.export()
             # A real editor export, not a static prompt/counter, establishes startup responsiveness.
-            premises['auth_free_startup']=before==baseline.encode()
-            if premises['auth_free_startup']:
+            if before!=baseline.encode():
+                premises['auth_free_startup']=False
+                errors.append({'phase':'auth_free_startup','observed_failure':'startup_baseline_mismatch'})
+            if before==baseline.encode():
                 receiver.write('!');visible=receiver.export()
                 receiver.key('Backspace');receiver.write('X');append_one=receiver.export()
                 receiver.key('Backspace');receiver.key('Backspace');remove_one=receiver.export()
@@ -214,7 +245,8 @@ def execute(config,grant,output,phases):
                 checks['restored']=restored==before
                 details['export_controls']={'checks':checks,'baseline_hex':before.hex(),'visible_hex':visible.hex(),
                     'append_hex':append_one.hex(),'remove_hex':remove_one.hex(),'restored_hex':restored.hex()}
-                if not all(checks.values()):
+                if all(checks.values()):premises['auth_free_startup']=True
+                else:
                     premises['auth_free_startup']=None
                     errors.append({'phase':'auth_free_startup','observed_failure':'export_oracle_control_failed'})
             if premises['auth_free_startup']:
@@ -230,8 +262,6 @@ def execute(config,grant,output,phases):
         finally:
             if receiver:
                 receiver.close();details['cleanup']=receiver.cleanup
-                confinement=(receiver.cleanup.get('receiver') or {}).get('cleanup',{}).get('confinement')
-                if confinement is not True:premises['network_boundary']=confinement
                 if receiver.cleanup.get('complete') is not True:
                     premises['auth_free_startup']=None;premises['genuine_open_query']=None
                     errors.append({'phase':'receiver_cleanup','error':'cleanup incomplete; calibration not started'})
@@ -240,7 +270,7 @@ def execute(config,grant,output,phases):
             pair=[];sentinel='SUBMIT_CALIBRATION_'+uuid.uuid4().hex
             try:
                 for submit in (False,True):
-                    item=new_receiver(config,grant,parent)
+                    item=new_receiver(config,grant,parent);records=None
                     try:
                         item.start();start=item.trace_sequence();item.write(sentinel)
                         if submit:item.key('Return')
@@ -251,36 +281,26 @@ def execute(config,grant,output,phases):
                         records=application_records(item)
                         accepted=accepted_input(item.trace_events(),item.sid,start,(sentinel+('\r' if submit else '')).encode())
                         details.setdefault('calibration_input_accepted',[]).append(accepted)
-                        pair.append((item.spec['session_id'],records))
                     except (OSError,Unavailable,ValueError,InvalidEvidence) as error:
-                        pair.append((item.spec['session_id'],None))
                         errors.append({'phase':'no_submit_calibration','submit_control':submit,'error':str(error)})
                     finally:
+                        pair.append((item.spec['session_id'],records))
+                        partial=calibration_findings(pair,sentinel)
+                        errors.extend({'phase':'no_submit_calibration','observed_failure':f} for f in partial['observed_failures'])
                         item.close();details.setdefault('calibration_cleanup',[]).append(item.cleanup)
                     if item.cleanup.get('complete') is not True:raise Unavailable('calibration cleanup incomplete; no more children')
-                if any(raw is None for _,raw in pair):raise Unavailable('calibration transcript unavailable; absence is not zero')
-                counts=[len(submission_events(raw,session,sentinel)) for session,raw in pair]
-                details['submission_counts']=counts
-                if counts[0]>0:errors.append({'phase':'no_submit_calibration','observed_failure':'unsubmitted_control_submitted'})
-                if counts[1]>1:errors.append({'phase':'no_submit_calibration','observed_failure':'positive_control_multiple_submissions'})
-                # A missing positive receipt is unavailable, never a false FAIL
-                # inferred from an asynchronous logger's bounded silence.
-                if counts[1]>0 and details.get('calibration_input_accepted')==[True,True]:
+                findings=calibration_findings(pair,sentinel)
+                details['submission_counts']=findings['counts']
+                errors.extend({'phase':'no_submit_calibration','observed_failure':f} for f in findings['observed_failures'])
+                errors.extend({'phase':'no_submit_calibration','error':e} for e in findings['errors'])
+                counts=findings['counts']
+                if findings['complete'] and counts[1]>0 and details.get('calibration_input_accepted')==[True,True]:
                     premises['no_submit_calibration']=counts==[0,1]
 
             except (OSError,Unavailable,ValueError,InvalidEvidence) as e:errors.append({'phase':'no_submit_calibration','error':str(e)})
-    confinements=[]
-    def collect_boundaries(value):
-        if type(value) is dict:
-            if 'confinement' in value:confinements.append(value['confinement'])
-            for child in value.values():collect_boundaries(child)
-        elif type(value) is list:
-            for child in value:collect_boundaries(child)
-    collect_boundaries(details)
-    if any(v is False for v in confinements):premises['network_boundary']=False
-    elif any(v is None for v in confinements):premises['network_boundary']=None
+    premises['network_boundary']=boundary_conclusion(network_control,details)
     result={**decide_feasibility(premises),'details':details,'errors':errors,'source':{'product_sha':grant.product_sha,'diagnostic_sha':grant.diagnostic_sha},'authorization_sha256':grant.digest}
-    result['observed_failures'] += [e['observed_failure'] for e in errors if 'observed_failure' in e]
+    result['observed_failures'] = sorted(set(result['observed_failures']+[e['observed_failure'] for e in errors if 'observed_failure' in e]))
     atomic_json(output,result);return result
 
 if __name__=='__main__':

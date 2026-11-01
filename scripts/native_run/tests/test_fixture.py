@@ -19,6 +19,6 @@ class CompletionTests(unittest.TestCase):
             with patch.object(fixture,'bounded_observation',side_effect=await_complete):
                 self.assertEqual(receiver.export(),b'complete')
     def test_collection_error_overrides_worker_success(self):
-        with patch.object(job,'read_json',return_value={'digest':'x','context':{},'job_start_utc':'unused'}),patch.object(pathlib.Path,'read_bytes',return_value=b'authority'),patch.object(job,'checked_authority',return_value={'mode':'feasibility','latest_end_utc':'unused'}),patch('supervisor.run_owned_worker',return_value={'exit_code':0}),patch('archive.collect',return_value={'errors':['missing artifact']}):
+        with patch.object(job,'read_json',return_value={'digest':'x','context':{},'job_start_utc':'unused'}),patch.object(pathlib.Path,'read_bytes',return_value=b'authority'),patch.object(job,'checked_authority',return_value={'mode':'feasibility','latest_end_utc':'unused'}),patch.object(job,'bind_manifest',return_value={}),patch('supervisor.run_owned_worker',return_value={'exit_code':0}),patch('archive.collect',return_value={'errors':['missing artifact']}):
             with self.assertRaisesRegex(Unavailable,'artifact collection incomplete'):job.execute('feasibility')
 if __name__=='__main__':unittest.main()

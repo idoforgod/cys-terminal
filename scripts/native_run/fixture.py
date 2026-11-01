@@ -179,5 +179,5 @@ class ProductReceiver:
         if self.daemon:self.daemon.close()
         daemon_cleanup=None if not self.daemon else self.daemon.cleanup
         receiver_cleanup=receipt.get('cleanup') if type(receipt) is dict else None
-        self.cleanup={'receiver':receipt,'daemon':daemon_cleanup,'complete':cleanup_valid(receiver_cleanup) and cleanup_valid(daemon_cleanup)}
+        self.cleanup={'receiver':receipt,'daemon':daemon_cleanup,'confinement':(receiver_cleanup or {}).get('confinement'),'complete':cleanup_valid(receiver_cleanup) and cleanup_valid(daemon_cleanup)}
         atomic_json(self.root/'evidence/fixture-cleanup.json',self.cleanup)

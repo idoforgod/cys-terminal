@@ -94,7 +94,7 @@ def exact_candidate(candidate,branch):
         if 'uses' in job:raise Refused('reusable workflow outside census')
     return True
 
-def census(repo,tip,branch,candidate_path,positive_ref='fix/0.14.56-candidate'):
+def census(repo,tip,branch,candidate_path,positive_ref='fix/0.14.56-candidate',installed_candidate=None):
     if not re.fullmatch('[0-9a-f]{40}',tip):raise Refused('immutable full tip required')
     def git(*args):return subprocess.check_output(['git','-C',str(repo),*args])
     files=[p for p in git('ls-tree','-r','--name-only',tip,'--','.github/workflows').decode().splitlines() if p.endswith(('.yml','.yaml'))]
@@ -102,10 +102,18 @@ def census(repo,tip,branch,candidate_path,positive_ref='fix/0.14.56-candidate'):
     workflows={p:load(git('show',tip+':'+p)) for p in files}
     hashes={p:sha(git('show',tip+':'+p)) for p in files}
     candidate_raw=Path(candidate_path).read_bytes();candidate=load(candidate_raw);exact_candidate(candidate,branch)
-    existing=[p for p,w in workflows.items() if push_match(w,'branch',branch)]
+    installed_path=None
+    if installed_candidate is not None:
+        if type(installed_candidate) is not dict or set(installed_candidate)!={'path','sha256'}:raise Refused('installed candidate identity fields')
+        installed_path=installed_candidate['path']
+        if type(installed_path) is not str or type(installed_candidate['sha256']) is not str or not re.fullmatch('[0-9a-f]{64}',installed_candidate['sha256']):raise Refused('installed candidate identity types')
+        if installed_path not in workflows or hashes[installed_path]!=installed_candidate['sha256'] or sha(candidate_raw)!=installed_candidate['sha256']:
+            raise Refused('installed candidate path/digest mismatch')
+    others={p:w for p,w in workflows.items() if p!=installed_path}
+    existing=[p for p,w in others.items() if push_match(w,'branch',branch)]
     controls=[]
     for kind,ref in [('branch',branch),('branch','work/unrelated-probe'),('branch','work/other-branch'),('branch',branch+'-suffix'),('branch','main'),('branch',positive_ref),('tag',branch),('tag','v0.14.56')]:
-        old=[p for p,w in workflows.items() if push_match(w,kind,ref)]
+        old=[p for p,w in others.items() if push_match(w,kind,ref)]
         own=push_match(candidate,kind,ref);controls.append({'kind':kind,'ref':ref,'existing_matches':old,'candidate_matches':own})
         if own!=(kind=='branch' and ref==branch):raise Refused('candidate negative/positive control failed')
     positive=next(x for x in controls if x['kind']=='branch' and x['ref']==positive_ref)
@@ -116,16 +124,20 @@ def census(repo,tip,branch,candidate_path,positive_ref='fix/0.14.56-candidate'):
     try:exact_candidate(broad,branch)
     except Refused:broad_rejected=True
     else:raise Refused('broad-filter negative control survived')
-    return {'scope':'LOCAL_PREVIEW_NOT_FINAL','tip':tip,'branch':branch,'candidate_installed':False,
-            'existing_workflows':len(files),'existing_experiment_matches':existing,'workflow_hashes':hashes,
-            'candidate_sha256':sha(candidate_raw),'prospective_population':len(files)+1,
+    return {'scope':'FINAL_INSTALLED_TIP' if installed_path else 'LOCAL_PREVIEW_NOT_FINAL','tip':tip,'branch':branch,'candidate_installed':bool(installed_path),'installed_candidate':installed_candidate,
+            'existing_workflows':len(others),'existing_experiment_matches':existing,'workflow_hashes':hashes,
+            'candidate_sha256':sha(candidate_raw),'prospective_population':len(others)+1,
             'prospective_experiment_matches':1,'P1':True,'P2':True,'P3_by_construction':True,
-            'P3_population_note':'candidate is included in prospective population, not installed in this Git tip',
+            'P3_population_note':('candidate counted once in installed Git population' if installed_path else 'candidate is included in prospective population, not installed in this Git tip'),
             'broad_filter_rejected':broad_rejected,'controls':controls,'release_verdict':'NONE'}
 
 if __name__=='__main__':
-    p=argparse.ArgumentParser();p.add_argument('--repo',required=True);p.add_argument('--tip',required=True);p.add_argument('--branch',required=True);p.add_argument('--candidate',required=True);p.add_argument('--output',required=True);a=p.parse_args()
-    try:result=census(a.repo,a.tip,a.branch,a.candidate)
+    p=argparse.ArgumentParser();p.add_argument('--repo',required=True);p.add_argument('--tip',required=True);p.add_argument('--branch',required=True);p.add_argument('--candidate',required=True);p.add_argument('--output',required=True);p.add_argument('--installed-workflow-path');p.add_argument('--installed-workflow-sha256');a=p.parse_args()
+    installed=None
+    if a.installed_workflow_path or a.installed_workflow_sha256:
+        if not (a.installed_workflow_path and a.installed_workflow_sha256):p.error('installed path and digest required together')
+        installed={'path':a.installed_workflow_path,'sha256':a.installed_workflow_sha256}
+    try:result=census(a.repo,a.tip,a.branch,a.candidate,installed_candidate=installed)
     except (Refused,ValueError,subprocess.CalledProcessError) as e:
         Path(a.output).write_text(json.dumps({'verdict':'REFUSE','reason':str(e),'release_verdict':'NONE'},indent=2));raise SystemExit(2)
     Path(a.output).write_text(json.dumps(result,indent=2))

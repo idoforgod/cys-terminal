@@ -11,7 +11,17 @@ and emits observed binary identities. No receiver installer or unconfined
 The external JSON needs `execution_authorized: true`, `release_verdict: "NONE"`,
 `mode: "feasibility"`, `attempt: 1`, full `product_sha` and `diagnostic_sha`,
 `branch`, `host: "windows-latest"`, exact numeric `rust_toolchain`, and timezone
-qualified `earliest_start_utc` / `latest_end_utc`. `probe_config` needs:
+qualified `earliest_start_utc` / `latest_end_utc`. It must also bind a separately
+reviewed `manifest: {"url": "https://...", "sha256": "..."}`. Before compilation,
+the runtime recomputes product blob maps, diagnostic source hashes, controller
+hashes and allowed deltas; each changed cfg(test) path needs its external
+`review_approval` identifier. The manifest must identify exactly one installed
+candidate as `installed_candidate: {"path": ".github/workflows/<name>.yml",
+"sha256": "..."}`. Both generator and census accept that one digest-bound
+addition and continue rejecting duplicate/altered/other matching workflows.
+Use their `--installed-workflow-path` and `--installed-workflow-sha256` inputs
+only for the eventual authorized installed tip; current preview stays uninstalled.
+`probe_config` needs:
 
 - `receiver_url`: exact reviewed HTTPS binary URL (redirects refused);
 - `receiver_sha256` and `receiver_version`: externally frozen identity;
@@ -66,3 +76,10 @@ This is the first slice only. The main I300/L60/D280/R80/K20 driver and final
 full battery are pending. The main plan stays 14 jobs, max 10 parallel, 1,190
 runner-minutes. `job.py` refuses an incomplete main driver. No native hard gate
 or release verdict is closed by this implementation.
+
+Review delta: auth-free startup remains NULL until all four perturbation controls
+complete successfully. Every receiver cleanup publishes a confinement value,
+including explicit NULL for a missing finish receipt. Network feasibility is
+assigned only after all recorded confinement obligations are combined. Valid
+submission events are accumulated independently from malformed/missing sibling
+streams; completeness becomes NULL without erasing an already observed failure.
