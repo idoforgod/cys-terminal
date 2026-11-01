@@ -83,6 +83,8 @@
   원자적으로 잡고, 상태 전이도 이 도구로 기록한다(충돌 409(exit 9)는 산 소유자가 있다는 뜻 —
   재시도 금지). **done 전이는 `--evidence`(또는 `--evidence-artifact`·`--skip-reason`) 부재 시
   거부된다(exit 5)** — 증거 없는 완료 선언은 도구가 막는다(아래 §4 실측 검증과 같은 원칙).
+  **exit 7 은 쓰기락을 얻지 못했다는 뜻이다** — 아무것도 바뀌지 않았고, 소유자 충돌(exit 9)도 완료 거부도 아니다:
+  「wait out the 30 s stale window · try ONCE · if it still returns 7, report a lock anomaly · never --settled-override · never immediate repeated retry」.
 - **도구-증명 계약(환각0)**: 도구가 `completed`를 반환하지 않은 작업을 완료라고 보고하지
   않는다. `started`는 완료가 아니다. `skipped`는 산출물 실존이 확인된 경우에만 유효하다.
   어휘 계약=`TOOL_RESULT_VOCAB.md`(팩 `round/` 동봉 — 프로젝트 `_round/` 사본이 있으면 그것 우선).
