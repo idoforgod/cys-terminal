@@ -118,6 +118,8 @@ class WindowsAPI:
             (self.a, 'ConvertSidToStringSidW', [P,C.POINTER(P)], C.c_int),
             (self.k, 'LocalFree', [P], P),
             (self.k, 'GetCurrentProcess', [], P),
+            (self.k, 'OpenProcess', [U32,C.c_int,U32], P),
+            (self.k, 'QueryFullProcessImageNameW', [P,U32,C.c_wchar_p,C.POINTER(U32)], C.c_int),
             (self.k, 'GetSystemDirectoryW', [C.c_wchar_p,U32], U32),
             (self.a, 'ConvertStringSecurityDescriptorToSecurityDescriptorW', [C.c_wchar_p,U32,C.POINTER(P),P], C.c_int),
             (self.a, 'ConvertSecurityDescriptorToStringSecurityDescriptorW', [P,U32,U32,C.POINTER(P),P], C.c_int),
@@ -137,6 +139,7 @@ class WindowsAPI:
             (self.k, 'TerminateProcess', [P,U32], C.c_int),
             (self.k, 'WaitForSingleObject', [P,U32], U32),
             (self.k, 'GetExitCodeProcess', [P,C.POINTER(U32)], C.c_int),
+            (self.k, 'GetProcessTimes', [P,C.POINTER(U64),C.POINTER(U64),C.POINTER(U64),C.POINTER(U64)], C.c_int),
             (self.k, 'CloseHandle', [P], C.c_int),
             (self.a, 'OpenProcessToken', [P,U32,C.POINTER(P)], C.c_int),
             (self.a, 'GetTokenInformation', [P,C.c_int,P,U32,C.POINTER(U32)], C.c_int),
@@ -207,7 +210,7 @@ class OwnedBoundary:
         self.profile_created=False; self.closed=False; self.assigned=False
         hr=api.u.CreateAppContainerProfile(self.profile,self.profile,'owned native feasibility',None,0,C.byref(self.sid))
         if hr != 0: raise Unavailable(f'new private profile creation refused: HRESULT {hr & 0xffffffff:08x}')
-        self.profile_created=True
+        self.profile_created=True;self.lineage=[]
         try:
             self.sid_text=api.sid_string(self.sid)
             # Only this private root. Do not grant access to an installed CLI or user directory.
@@ -260,8 +263,34 @@ class OwnedBoundary:
         if self.closed or self.resumed: raise Unavailable('invalid child release state')
         if self.api.k.ResumeThread(self.process.hThread)==0xffffffff: raise Unavailable('ResumeThread failed')
         self.resumed=True
+        self.sample_lineage()
         return {'pid':self.process.dwProcessId,'profile':self.profile,'token':self.token,
                 'acl':self.acl_receipt,'capabilities_requested':[],'job_kill_on_close':True}
+
+    def sample_lineage(self):
+        # Query THIS owned job, never a host process census. Race/exit failures
+        # remain explicit; a count gap prevents an exhaustive lineage claim.
+        row={'monotonic_ns':time.monotonic_ns(),'processes':[],'errors':[]}
+        buffer=C.create_string_buffer(8+8*128)
+        if not self.api.k.QueryInformationJobObject(self.job,3,buffer,C.sizeof(buffer),None):
+            row['errors'].append('owned_job_pid_list_unavailable')
+        else:
+            assigned=U32.from_buffer(buffer,0).value;listed=U32.from_buffer(buffer,4).value
+            row.update(assigned=assigned,listed=listed)
+            if assigned!=listed or listed>128:row['errors'].append('owned_job_pid_list_incomplete')
+            else:
+                for i in range(listed):
+                    pid=SIZE.from_buffer(buffer,8+i*C.sizeof(SIZE)).value;handle=None
+                    try:
+                        handle=self.api.check(self.api.k.OpenProcess(0x1000,False,pid),'open owned job member')
+                        created=U64();exited=U64();kernel=U64();user=U64()
+                        self.api.check(self.api.k.GetProcessTimes(handle,C.byref(created),C.byref(exited),C.byref(kernel),C.byref(user)),'job member creation identity')
+                        row['processes'].append({'pid':pid,'creation_filetime':created.value,'token':self.api.token(handle)})
+                    except Unavailable as error:row['errors'].append({'pid':pid,'error':str(error)})
+                    finally:
+                        if handle:self.api.k.CloseHandle(handle)
+        self.lineage.append(row)
+        return row
 
     def wait(self, timeout_ms):
         if type(timeout_ms) is not int or not 0 <= timeout_ms <= 120000: raise Unavailable('invalid wait bound')
@@ -301,6 +330,9 @@ class OwnedBoundary:
         self.cleanup={'root_exit_observed':exited,'job_accounting':accounting,'errors':errors,
                       'descendant_exit_receipt':True if not self.process.hProcess else (None if accounting is None else accounting['active']==0),
                       'profile_removed':removed,'profile_retained':self.profile_created and not removed}
+        if hasattr(self,'lineage'):
+            self.cleanup['lineage']=self.lineage
+            self.cleanup['confinement']=lineage_verdict(self.lineage,accounting,getattr(self,'token',None))
 
     def __enter__(self): return self
     def __exit__(self,*unused): self.close()
@@ -339,3 +371,16 @@ def cleanup_valid(receipt):
             and receipt.get('descendant_exit_receipt') is True
             and receipt.get('profile_retained') is False
             and type(receipt.get('errors')) is list and not receipt['errors'])
+
+def lineage_verdict(snapshots,accounting,expected):
+    if type(snapshots) is not list or not snapshots or type(expected) is not dict:return None
+    seen=set();missing=False
+    for snapshot in snapshots:
+        if snapshot.get('errors'):missing=True
+        for process in snapshot.get('processes',[]):
+            if process.get('token')!=expected:return False
+            identity=(process.get('pid'),process.get('creation_filetime'))
+            if any(type(x) is not int or x<=0 for x in identity):missing=True
+            else:seen.add(identity)
+    if missing or type(accounting) is not dict or accounting.get('total')!=len(seen):return None
+    return True

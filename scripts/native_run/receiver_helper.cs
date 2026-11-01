@@ -8,6 +8,7 @@ using System.Runtime.InteropServices;
 using System.Diagnostics;
 using System.Threading;
 using System.Collections.Generic;
+using System.Security.Cryptography;
 using System.Web.Script.Serialization;
 class NativeReceiverHelper {
     [DllImport("kernel32.dll",SetLastError=true)] static extern IntPtr GetStdHandle(int kind);
@@ -33,6 +34,14 @@ class NativeReceiverHelper {
                 throw new Exception("reparse path refused");
         return full;
     }
+    static void Publish(string path,string text,Encoding encoding) {
+        string temp=path+"."+Guid.NewGuid().ToString("N")+".tmp";
+        File.WriteAllText(temp,text,encoding);
+        File.Move(temp,path); // publication is the completion receipt, never existence mid-write
+    }
+    static string Hash(byte[] bytes) {
+        using(SHA256 digest=SHA256.Create())return BitConverter.ToString(digest.ComputeHash(bytes)).Replace("-","").ToLowerInvariant();
+    }
     static int Main(string[] args) {
         try {
             if(args.Length<2)throw new Exception("mode/root required");
@@ -45,7 +54,12 @@ class NativeReceiverHelper {
                 string id=Guid.NewGuid().ToString("N");
                 // Observation only: never rewrite the application's editor file.
                 File.WriteAllBytes(Path.Combine(output,id+".bin"),bytes);
-                File.WriteAllText(Path.Combine(output,id+".json"),Json.Serialize(new {input=input,bytes=bytes.Length,pid=System.Diagnostics.Process.GetCurrentProcess().Id,utc=DateTime.UtcNow.ToString("o")}),new UTF8Encoding(false));
+                Publish(Path.Combine(output,id+".json"),Json.Serialize(new {input=input,bytes=bytes.Length,sha256=Hash(bytes),pid=System.Diagnostics.Process.GetCurrentProcess().Id,utc=DateTime.UtcNow.ToString("o")}),new UTF8Encoding(false));
+                Stopwatch editorGuard=Stopwatch.StartNew();
+                while(!File.Exists(Path.Combine(output,id+".ack"))) {
+                    if(editorGuard.ElapsedMilliseconds>=15000)throw new Exception("editor completion acknowledgement absent");
+                    Thread.Sleep(10);
+                }
                 return 0;
             }
             if(mode=="origin") {
@@ -55,13 +69,13 @@ class NativeReceiverHelper {
                 if(!emit && args[3]!="silent")throw new Exception("origin mode");
                 uint inputMode,outputMode;
                 bool gotInput=GetConsoleMode(GetStdHandle(-10),out inputMode),gotOutput=GetConsoleMode(GetStdHandle(-11),out outputMode);
-                File.WriteAllText(sideband+".ready.json",Json.Serialize(new {pid=Process.GetCurrentProcess().Id,mode=args[3],input_mode=gotInput?(uint?)inputMode:null,output_mode=gotOutput?(uint?)outputMode:null}),new UTF8Encoding(false));
+                Publish(sideband+".ready.json",Json.Serialize(new {pid=Process.GetCurrentProcess().Id,mode=args[3],input_mode=gotInput?(uint?)inputMode:null,output_mode=gotOutput?(uint?)outputMode:null}),new UTF8Encoding(false));
                 Stopwatch guard=Stopwatch.StartNew();
                 while(!File.Exists(go)) { if(guard.ElapsedMilliseconds>=20000)throw new Exception("origin handshake absent");Thread.Sleep(10); }
                 long before=Stopwatch.GetTimestamp();int wrote=0;
                 if(emit) { byte[] query=new byte[]{27,91,54,110};Stream output=Console.OpenStandardOutput();output.Write(query,0,query.Length);output.Flush();wrote=query.Length; }
                 long after=Stopwatch.GetTimestamp();
-                File.WriteAllText(sideband+".emission.json",Json.Serialize(new {pid=Process.GetCurrentProcess().Id,mode=args[3],emitted_bytes=wrote,before_ticks=before,after_ticks=after,tick_frequency=Stopwatch.Frequency,utc=DateTime.UtcNow.ToString("o")}),new UTF8Encoding(false));
+                Publish(sideband+".emission.json",Json.Serialize(new {pid=Process.GetCurrentProcess().Id,mode=args[3],emitted_bytes=wrote,before_ticks=before,after_ticks=after,tick_frequency=Stopwatch.Frequency,utc=DateTime.UtcNow.ToString("o")}),new UTF8Encoding(false));
                 // Only this no-Claude child reads its own console input. No mode
                 // changes and no replies are ever fabricated or echoed to output.
                 List<object> inputs=new List<object>();string inputError=null;
@@ -77,7 +91,7 @@ class NativeReceiverHelper {
                     }
                     Thread.Sleep(10);
                 }
-                File.WriteAllText(sideband+".input.json",Json.Serialize(new {pid=Process.GetCurrentProcess().Id,events=inputs,error=inputError,tick_frequency=Stopwatch.Frequency}),new UTF8Encoding(false));
+                Publish(sideband+".input.json",Json.Serialize(new {pid=Process.GetCurrentProcess().Id,events=inputs,error=inputError,tick_frequency=Stopwatch.Frequency}),new UTF8Encoding(false));
                 return 0;
             }
             if(mode=="connect") {
@@ -86,13 +100,15 @@ class NativeReceiverHelper {
                 if(port<1||port>65535)throw new Exception("invalid port");
                 bool connected=false;string error=null;
                 using(Socket s=new Socket(address.AddressFamily,SocketType.Stream,ProtocolType.Tcp)) {
-                    IAsyncResult call=s.BeginConnect(new IPEndPoint(address,port),null,null);
-                    using(WaitHandle wait=call.AsyncWaitHandle) {
-                        if(!wait.WaitOne(2000))error="bounded_connect_timeout";
-                        else {try{s.EndConnect(call);connected=s.Connected;}catch(SocketException e){error=e.SocketErrorCode+":"+e.NativeErrorCode;}}
-                    }
+                    try {
+                        IAsyncResult call=s.BeginConnect(new IPEndPoint(address,port),null,null);
+                        using(WaitHandle wait=call.AsyncWaitHandle) {
+                            if(!wait.WaitOne(2000))error="bounded_connect_timeout";
+                            else {s.EndConnect(call);connected=s.Connected;}
+                        }
+                    } catch(SocketException e) {error=e.SocketErrorCode+":"+e.NativeErrorCode;}
                 }
-                File.WriteAllText(output,Json.Serialize(new {connected=connected,error=error,address=address.ToString(),port=port,pid=System.Diagnostics.Process.GetCurrentProcess().Id,utc=DateTime.UtcNow.ToString("o")}),new UTF8Encoding(false));
+                Publish(output,Json.Serialize(new {connected=connected,error=error,address=address.ToString(),port=port,pid=System.Diagnostics.Process.GetCurrentProcess().Id,utc=DateTime.UtcNow.ToString("o")}),new UTF8Encoding(false));
                 return 0; // outcome is recorded, not interpreted as isolation success
             }
             throw new Exception("unknown mode");

@@ -83,7 +83,8 @@ def execute(job):
         try:
             return run_owned_worker([str(Path(__file__).resolve()),'worker','--evidence',str(root.resolve())],root,doc['latest_end_utc'],receipt['job_start_utc'])
         finally:
-            collect(root)
+            archived=collect(root)
+            if archived.get('errors'):raise Unavailable('artifact collection incomplete; see archive.json')
     raise Unavailable('main native job driver is not yet executable; no empty success')
 
 def worker(evidence):

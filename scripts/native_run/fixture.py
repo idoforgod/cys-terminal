@@ -9,7 +9,7 @@ import os
 import shutil
 import sys
 import time
-from boundary import OwnedProcess, Unavailable, cleanup_valid
+from boundary import OwnedProcess, Unavailable, cleanup_valid, WindowsAPI, U32, C
 from controller import fixture_environment, Authority
 from protocol import atomic_json, read_json, sha
 from rpc import FixtureRPC
@@ -95,6 +95,7 @@ class ProductReceiver:
         token_receipt=receipt.get('token',{})
         if type(token_receipt.get('is_appcontainer')) is not int or type(token_receipt.get('capability_count')) is not int or token_receipt['is_appcontainer']!=1 or token_receipt['capability_count']!=0:
             raise Unavailable('receiver confinement receipt invalid')
+        self.launch_receipt=receipt
         return receipt
 
     def write(self, text):
@@ -106,15 +107,51 @@ class ProductReceiver:
     def key(self,key):
         return self.rpc.call('surface.send_key',{'surface_id':self.sid,'key':key,'human':True,'operator_token':self.operator})
 
+    def finish_editor(self,receipt_path,receipt):
+        pid=receipt.get('pid')
+        if type(pid) is not int or pid<=0:raise Unavailable('editor PID absent')
+        api=WindowsAPI();handle=api.check(api.k.OpenProcess(0x100000|0x1000,False,pid),'open owned editor')
+        try:
+            buffer=C.create_unicode_buffer(32768);length=U32(len(buffer))
+            api.check(api.k.QueryFullProcessImageNameW(handle,0,buffer,C.byref(length)),'editor image identity')
+            expected=self.root/'bin/receiver-helper.exe'
+            if Path(buffer.value).resolve()!=expected.resolve():raise Unavailable('editor process is not owned helper')
+            token=api.token(handle)
+            if token!=self.launch_receipt['token']:raise Unavailable('editor confinement differs from receiver')
+            before=self.passive_frame().get('composer',{}).get('output_gen')
+            if type(before) is not int:raise Unavailable('pre-editor-return frame unavailable')
+            receipt_path.with_suffix('.ack').write_bytes(b'owned observer holds verified editor handle')
+            if api.k.WaitForSingleObject(handle,10000)!=0:raise Unavailable('editor exit not observed')
+            code=U32();api.check(api.k.GetExitCodeProcess(handle,C.byref(code)),'editor exit code')
+            if code.value!=0:raise Unavailable('editor failed')
+            atomic_json(self.root/'evidence'/('editor-exit-'+receipt_path.name),{'pid':pid,'image':str(expected),'token':token,'exit_code':code.value,'output_gen_before_ack':before})
+            return before
+        finally:api.k.CloseHandle(handle)
+
+    def returned_composer(self,data,before):
+        # Require a new application output generation after the editor release acknowledgement. This
+        # is only a readiness receipt; the byte oracle remains the export.
+        text=data.decode('ascii')
+        def ready():
+            frame=self.passive_frame();gen=frame.get('composer',{}).get('output_gen')
+            return frame if type(gen) is int and gen>before and text in frame.get('text','') else None
+        return bounded_observation('application return after editor exit',ready,10)
+
     def export(self):
-        before=set((self.root/'child/captures').glob('*.bin'))
+        before=set((self.root/'child/captures').glob('*.json'))
         self.key('C-g')
         def capture():
-            new=set((self.root/'child/captures').glob('*.bin'))-before
+            new=set((self.root/'child/captures').glob('*.json'))-before
             if len(new)>1:raise Unavailable('ambiguous editor export')
             return next(iter(new)) if new else None
-        path=bounded_observation('real editor export',capture,20)
-        data=path.read_bytes();target=self.root/'evidence'/('composer-'+path.name);target.write_bytes(data)
+        receipt_path=bounded_observation('completed real editor export',capture,20)
+        receipt=read_json(receipt_path);path=receipt_path.with_suffix('.bin');data=path.read_bytes()
+        if type(receipt.get('bytes')) is not int or receipt['bytes']!=len(data) or receipt.get('sha256')!=sha(data):
+            raise Unavailable('editor completion/bytes mismatch')
+        target=self.root/'evidence'/('composer-'+path.name);target.write_bytes(data)
+        atomic_json(target.with_suffix('.json'),receipt)
+        before=self.finish_editor(receipt_path,receipt)
+        atomic_json(target.with_suffix('.returned.json'),self.returned_composer(data,before))
         return data
 
     def trace_events(self):

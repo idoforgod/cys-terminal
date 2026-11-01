@@ -23,6 +23,7 @@ def main():
         stop=root/'evidence'/'stop-receiver'
         end=datetime.datetime.fromisoformat(grant.latest_end_utc)
         while not stop.is_file() and datetime.datetime.now(datetime.timezone.utc)<end:
+            controller.child.sample_lineage()
             code=controller.child.wait(100)
             if code is not None:
                 atomic_json(root/'evidence'/'receiver-exit.json',{'code':code});break

@@ -53,4 +53,15 @@ class AuditControls(unittest.TestCase):
         for key,value in [('root_exit_observed',None),('descendant_exit_receipt',False),('profile_retained',True),('errors',['close failed'])]:
             self.assertFalse(boundary.cleanup_valid({**valid,key:value}))
 
+
+
+class LineageControls(unittest.TestCase):
+    def test_unseen_short_lived_child_is_not_proven_confined(self):
+        token={'is_appcontainer':1,'capability_count':0,'package_sid':'S-1-15-2-123'}
+        rows=[{'errors':[],'processes':[{'pid':3,'creation_filetime':5,'token':token}]}]
+        self.assertIs(boundary.lineage_verdict(rows,{'total':1},token),True)
+        self.assertIsNone(boundary.lineage_verdict(rows,{'total':2},token))
+        rows[0]['processes'].append({'pid':4,'creation_filetime':6,'token':{**token,'capability_count':1}})
+        self.assertIs(boundary.lineage_verdict(rows,{'total':3},token),False)
+
 if __name__=='__main__':unittest.main()

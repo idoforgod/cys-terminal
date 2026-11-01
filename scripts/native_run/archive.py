@@ -14,7 +14,9 @@ def register(root,config):
 
 def collect(output):
     output=Path(output);registry=output/'owned-roots.json';rows=[];errors=[]
-    if not registry.exists():return {'roots':[],'errors':['no owned roots registered'],'release_verdict':'NONE'}
+    if not registry.exists():
+        result={'roots':[],'errors':['no owned roots registered'],'release_verdict':'NONE'}
+        atomic_json(output/'archive.json',result);return result
     for name in read_json(registry):
         root=Path(name)
         try:
