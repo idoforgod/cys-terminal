@@ -1339,6 +1339,13 @@ def cmd_release(a):
         if not a.force and holder and holder.get("owner_id") != a.owner:
             print(f"conflict(409): 락 소유자 불일치 (holder={holder.get('owner_id')})", file=sys.stderr)
             return EXIT_CONFLICT
+        # --force 는 레코드가 지명한 소유를 대신 푸는 것이다. 락이 그 소유가 아니면 쥔 적 없는 소유다 — 아무것도 하지 않는다.
+        if a.force and holder and ((holder.get("owner_id"), holder.get("claim_gen"))
+                                   != (task.get("owner"), task.get("claim_gen"))):
+            print("conflict(409): --force 거부 — 락의 소유 %s#%s 가 레코드의 소유 %s#%s 가 아니다. 아무것도 바뀌지 않았다."
+                  % (holder.get("owner_id"), holder.get("claim_gen"), task.get("owner"), task.get("claim_gen")),
+                  file=sys.stderr)
+            return EXIT_CONFLICT
         record_claim = task.get("owner") == a.owner or a.force
         claim = ((task.get("owner"), task.get("claim_gen")) if record_claim
                  else (a.owner, (holder or {}).get("claim_gen")))

@@ -848,6 +848,37 @@ class ClaimBinding(Base):
         self.assertEqual((rc, rec["status"], rec["claim_gen"], lock_gen), (9, "in_progress", 2, 2))
         self.assertEqual(self.rows("A"), [])
 
+    def test_force_on_a_claim_the_record_does_not_name_does_nothing(self):
+        self.checked_out("A")
+        r = subprocess.run([PY, "-B", "-c", RELEASE_DIES, TASK, "A", "w1", "_release_claim"], capture_output=True,
+                           text=True, env=self.env())
+        self.assertNotEqual(r.returncode, 0)
+        record = self.raw("A")
+        with open(os.path.join(self.lock_path("A"), "owner.json"), "rb") as f:
+            lock = f.read()
+        rc, _, err = self.t("release", "A", "--owner", "w2", "--force", "--force-reason", "unit test")
+        with open(os.path.join(self.lock_path("A"), "owner.json"), "rb") as f:
+            kept = f.read() == lock
+        control("P2R4 --force by w2 on w1's orphan lock: rc=%s record unchanged=%s lock unchanged=%s" % (
+            rc, self.raw("A") == record, kept))
+        self.assertEqual(rc, 9)
+        self.assertEqual(self.raw("A"), record)
+        self.assertTrue(kept)
+        self.assertNotIn("살아있는", err)
+        owner_rc = self.t("release", "A", "--owner", "w1")[0]
+        control("P2R4 the lock's own owner can still clear it: rc=%s lock=%s" % (owner_rc, os.path.exists(self.lock_path("A"))))
+        self.assertEqual(owner_rc, 0)
+        self.assertFalse(os.path.exists(self.lock_path("A")))
+
+    def test_force_on_the_claim_the_record_names_still_works(self):
+        self.checked_out("A")
+        rc = self.t("release", "A", "--owner", "w2", "--force", "--force-reason", "unit test")[0]
+        rec = self.rec("A")
+        control("P2R4 --force on the record's claim: rc=%s owner=%s lock=%s history=%d" % (
+            rc, rec["owner"], os.path.exists(self.lock_path("A")), len(rec["force_history"])))
+        self.assertEqual((rc, rec["owner"], len(rec["force_history"])), (0, None, 1))
+        self.assertFalse(os.path.exists(self.lock_path("A")))
+
     def test_a_release_that_cannot_write_its_record_changes_nothing(self):
         self.checked_out("A")
         before = self.raw("A")
