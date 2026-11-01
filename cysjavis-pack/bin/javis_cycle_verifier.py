@@ -144,6 +144,11 @@ def state_socket_dir():
     return os.path.join(os.path.expanduser("~"), ".local", "state", "cys")
 
 
+def base_state_parent():
+    """본부 레인의 키. 경로 표기를 고정해 둔다 — 본부 STATE_DIR 은 바이트 그대로다."""
+    return os.path.join(os.path.expanduser("~"), ".local", "state", "cys")
+
+
 def lane_state_parent():
     """레인 키 = 소켓 부모(state_socket_dir) — 새 레인 식별자를 만들지 않는다. STATE_DIR 의 부모.
 
@@ -156,7 +161,9 @@ def lane_state_parent():
     pipe = re.match(r"^[\\/]{2}[^\\/]+[\\/]pipe[\\/]([^\\/]+)$", lane_socket(), re.IGNORECASE)
     if pipe:
         return os.path.join(os.path.expanduser("~"), ".local", "state", pipe.group(1).lower())
-    return state_socket_dir()
+    # 심링크로 부른 소켓은 같은 소켓이다 — 경로 표기가 아니라 실제 디렉터리가 레인이다.
+    real = os.path.realpath(state_socket_dir())
+    return base_state_parent() if real == os.path.realpath(base_state_parent()) else real
 
 
 PROJECT = _resolve_project_root()

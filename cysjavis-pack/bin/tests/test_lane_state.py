@@ -63,7 +63,7 @@ def control(msg):
 
 class Base(unittest.TestCase):
     def setUp(self):
-        self.home = tempfile.mkdtemp(prefix="lane-state-")
+        self.home = os.path.realpath(tempfile.mkdtemp(prefix="lane-state-"))
         self.addCleanup(shutil.rmtree, self.home, True)
         self.base_round = os.path.join(self.home, "_round")
         self.local = os.path.join(self.home, "AppData", "Local")
@@ -297,6 +297,55 @@ class Aliases(Base):
         self.assertEqual((lane["sweep"]["emitted"], base["sweep"]["emitted"], self.rows(self.base_round)), (0, 1, 1))
 
 
+class FilesystemAliases(Base):
+    def test_a_directory_symlink_to_a_dept_lane_is_that_lane(self):
+        """The review's case: read 2 rows for one event when the alias's basename decided the lane."""
+        real = os.path.dirname(self.sock("dept-3"))
+        os.makedirs(real)
+        alias = os.path.join(self.home, "socket-alias")
+        os.symlink(real, alias)
+        self.handoff(self.base_round, "old")
+        self.tick(None)
+        via = {"CYS_SOCKET": os.path.join(alias, "cys.sock")}
+        first = self.tick("dept-3", **via)
+        self.handoff(self.base_round, "new")
+        lane = self.tick("dept-3", **via)
+        base = self.tick(None)
+        control("P1R3 dept lane reached through a directory symlink: own_root is the pack=%s reason=%s rows=%d" % (
+            first["own_root"] == self.pack("dept-3"), lane["sweep"].get("suppressed", {}).get("reason"),
+            self.rows(self.base_round)))
+        self.assertEqual(first["own_root"], self.pack("dept-3"))
+        self.assertEqual(first["state_dir"], os.path.join(real, "cycle_autopilot"))
+        self.assertEqual((lane["sweep"]["emitted"], base["sweep"]["emitted"], self.rows(self.base_round)), (0, 1, 1))
+
+    def test_a_directory_symlink_to_base_is_base(self):
+        real = os.path.join(self.home, ".local", "state", "cys")
+        os.makedirs(real)
+        alias = os.path.join(self.home, "base-alias")
+        os.symlink(real, alias)
+        self.handoff(self.base_round, "old")
+        self.tick(None)
+        got = self.tick(None, CYS_SOCKET=os.path.join(alias, "cys.sock"))
+        control("P1R3 base through a symlink: same state dir=%s suppressed=%s" % (
+            got["state_dir"] == os.path.join(real, "cycle_autopilot"), "suppressed" in got["sweep"]))
+        self.assertEqual(got["state_dir"], os.path.join(real, "cycle_autopilot"))
+        self.assertNotIn("suppressed", got["sweep"])
+
+    def test_an_unknown_socket_is_not_unrestricted(self):
+        self.handoff(self.base_round, "old")
+        self.tick(None)
+        elsewhere = os.path.join(self.home, "elsewhere")
+        os.makedirs(elsewhere)
+        via = {"CYS_SOCKET": os.path.join(elsewhere, "cys.sock")}
+        self.tick(None, **via)
+        self.handoff(self.base_round, "new")
+        got = self.tick(None, **via)
+        control("P1R3 socket that is neither base nor a dept: reason=%s emitted=%d" % (
+            got["sweep"].get("suppressed", {}).get("reason"), got["sweep"]["emitted"]))
+        self.assertEqual(got["sweep"]["suppressed"]["reason"], "unknown-lane")
+        self.assertEqual((got["sweep"]["emitted"], self.rows(self.base_round)), (0, 0))
+
+
 class Staleness(Base):
     def check(self, dept="dept-5"):
         code = ("import json, os, sys\nsys.path.insert(0, sys.argv[1])\nimport javis_state_ledger as l\n"
@@ -336,6 +385,28 @@ class Staleness(Base):
                            env=self.env(None, CYS_STATE_DIR=os.path.join(self.home, "st")), timeout=60)
         control("P1R staleness in base, file beside the ledger: %s" % r.stdout.strip())
         self.assertEqual(r.stdout.strip().splitlines()[-1], "fresh", r.stderr)
+
+    def test_base_with_its_card_missing_stays_missing_beside_a_decoy(self):
+        """The review's case: read `fresh` from a neighbouring round/ that is not base's card."""
+        decoy = os.path.join(self.home, "round", "SESSION_STATE.md")
+        os.makedirs(os.path.dirname(decoy))
+        with open(decoy, "w", encoding="utf-8") as f:
+            f.write("x")
+        os.utime(decoy, (4000000000, 4000000000))
+        code = ("import sys\nsys.path.insert(0, sys.argv[1])\nimport javis_state_ledger as l\n"
+                "l.append_record('handoff', 'test', {'name': 'x', 'path': 'y'})\nprint(l.staleness_check(session='s3')['result'])\n")
+        r = subprocess.run([PY, "-B", "-c", code, BIN], capture_output=True, text=True, cwd=self.home,
+                           env=self.env(None, CYS_STATE_DIR=os.path.join(self.home, "st")), timeout=60)
+        control("P1R3 base card missing, newer decoy at ~/round: %s" % r.stdout.strip())
+        self.assertEqual(r.stdout.strip().splitlines()[-1], "session_state_missing", r.stderr)
+
+    def test_a_dept_lane_ignores_a_stray_card_beside_its_ledger(self):
+        r = self.lane_round("dept-5")
+        with open(os.path.join(r, "SESSION_STATE.md"), "w", encoding="utf-8") as f:
+            f.write("x")
+        got = self.check()
+        control("P1R3 stray card in a dept _round, no round/ card: %s" % got["result"])
+        self.assertEqual(got["result"], "session_state_missing")
 
 
 class Paths(Base):
@@ -386,6 +457,17 @@ class Paths(Base):
             got = self.probe(CYS_SOCKET=pipe)["ap"][0]
             control("P1R pipe spelling %s: %s" % (pipe, os.path.relpath(got, self.home)))
             self.assertEqual(got, self.expected(leaf))
+
+    def test_base_path_keeps_its_spelling_when_home_is_a_symlink(self):
+        link = os.path.join(self.home, "home-link")
+        os.symlink(self.home, link)
+        code = ("import sys\nsys.path.insert(0, sys.argv[1])\nimport javis_cycle_autopilot as a\nprint(a.STATE_DIR)\n")
+        r = subprocess.run([PY, "-B", "-c", code, BIN], capture_output=True, text=True, cwd=self.home,
+                           env=self.env(None, HOME=link, USERPROFILE=link), timeout=60)
+        got = r.stdout.strip().splitlines()[-1]
+        want = os.path.join(link, ".local", "state", "cys", "cycle_autopilot")
+        control("P1R3 base STATE_DIR with a symlinked HOME keeps its spelling=%s" % (got == want))
+        self.assertEqual(got, want, r.stderr)
 
     def test_windows_home_resolution_stays_in_the_rig(self):
         """Windows resolves `~` through USERPROFILE. ntpath gives that rule on any host."""

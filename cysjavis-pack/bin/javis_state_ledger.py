@@ -347,12 +347,12 @@ def _marker_path(session):
 
 
 def _session_state_for(ledger):
-    """원장 옆 SESSION_STATE.md, 없으면 같은 루트의 round/ — 부서 레인은 원장이 <pack>/_round, 상태가 <pack>/round 다.
-    옆자리만 보면 부서 레인에서 비교 불능으로 조용히 멈춘다(기록 없음이 '신선함'으로 읽힌다)."""
-    beside = os.path.join(os.path.dirname(ledger), "SESSION_STATE.md")
-    if os.path.exists(beside):
-        return beside
-    return os.path.join(os.path.dirname(os.path.dirname(ledger)), "round", "SESSION_STATE.md")
+    """원장 옆 SESSION_STATE.md. 원장이 부서 팩에 있으면 그 팩의 round/ — 부서 상태의 정본이다.
+    판단은 팩 정체로 한다. 옆 파일이 없다고 이웃의 round/ 를 집으면 본부의 빠진 카드가 '신선함'으로 읽힌다."""
+    root = os.path.dirname(os.path.dirname(ledger))
+    if os.path.basename(root).startswith("pack-dept-"):
+        return os.path.join(root, "round", "SESSION_STATE.md")
+    return os.path.join(os.path.dirname(ledger), "SESSION_STATE.md")
 
 
 def staleness_check(path=None, session=None, session_state=None, now=None):

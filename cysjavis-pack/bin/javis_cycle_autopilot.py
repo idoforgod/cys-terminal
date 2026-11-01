@@ -140,6 +140,11 @@ def state_socket_dir():
     return os.path.join(os.path.expanduser("~"), ".local", "state", "cys")
 
 
+def base_state_parent():
+    """본부 레인의 키. 경로 표기를 고정해 둔다 — 본부 STATE_DIR 은 바이트 그대로다."""
+    return os.path.join(os.path.expanduser("~"), ".local", "state", "cys")
+
+
 def lane_state_parent():
     """레인 키 = 소켓 부모(state_socket_dir) — 새 레인 식별자를 만들지 않는다. STATE_DIR 의 부모.
 
@@ -152,7 +157,9 @@ def lane_state_parent():
     pipe = re.match(r"^[\\/]{2}[^\\/]+[\\/]pipe[\\/]([^\\/]+)$", lane_socket(), re.IGNORECASE)
     if pipe:
         return os.path.join(os.path.expanduser("~"), ".local", "state", pipe.group(1).lower())
-    return state_socket_dir()
+    # 심링크로 부른 소켓은 같은 소켓이다 — 경로 표기가 아니라 실제 디렉터리가 레인이다.
+    real = os.path.realpath(state_socket_dir())
+    return base_state_parent() if real == os.path.realpath(base_state_parent()) else real
 
 
 PROJECT = _resolve_project_root()
@@ -1600,10 +1607,14 @@ def lane_own_root():
 
 def sweep_suppressed_reason():
     """이 틱의 스윕을 막을 사유, 없으면 None. 레인 커서로 남의 루트를 훑으면 실사건 1건이 레인 수만큼 원장에
-    찍힌다 — 팩 코드는 데몬 재기동보다 먼저 도착하고 그 창은 끝이 없다. 기본 레인은 언제나 스윕한다."""
+    찍힌다 — 팩 코드는 데몬 재기동보다 먼저 도착하고 그 창은 끝이 없다. 기본 레인은 언제나 스윕한다.
+    본부도 부서도 아닌 소켓은 정체를 모르는 것이지 권한이 없는 것이 아니다 — 그래도 스윕하지 않는다."""
+    if lane_state_parent() == base_state_parent():
+        return None
     own = lane_own_root()
-    if own is None or (os.path.normcase(os.path.realpath(PROJECT))
-                       == os.path.normcase(os.path.realpath(own))):
+    if own is None:
+        return "unknown-lane"
+    if os.path.normcase(os.path.realpath(PROJECT)) == os.path.normcase(os.path.realpath(own)):
         return None
     return "project-not-lane-root"
 

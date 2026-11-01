@@ -138,6 +138,41 @@ class ContextCommand(Verbs):
         self.assertEqual(env.get("CYS_PROJECT_ROOT"), pack)
 
 
+class UnrestartedLane(Verbs):
+    """A pack with no _round, the case the natural-restart window leaves behind: dept-3, 6, 7, 8, 9, 10 today."""
+    RESOLVE = ("import sys\nsys.path.insert(0, sys.argv[1])\nimport javis_state_ledger as l\n"
+               "print('@@' + l.PROJECT)\nl.append_record('note', 'test', {'text': 'x'})\n")
+
+    def sandbox(self):
+        sb = Sandbox(CYS_NO_AUTOSTART="1")
+        self.addCleanup(sb.cleanup)
+        os.makedirs(os.path.join(sb.home, "_round"))
+        return sb
+
+    def test_a_context_command_resolves_to_the_lane_not_to_base(self):
+        sb = self.sandbox()
+        pack = os.path.join(sb.home, ".cys", "pack-dept-dept-7")
+        os.makedirs(pack)
+        rc, out, err = sb.run("dept-7", "--", sys.executable, "-B", "-c", self.RESOLVE, os.path.dirname(HERE))
+        self.assertEqual(rc, 0, err[-400:])
+        project = [x for x in out.splitlines() if x.startswith("@@")][-1][2:]
+        lane = os.path.join(pack, "_round", "STATE_LEDGER.jsonl")
+        base = os.path.join(sb.home, "_round", "STATE_LEDGER.jsonl")
+        control("P1R3 context command, lane with no _round: resolved to the pack=%s, lane ledger=%s, base ledger=%s" % (
+            project == pack, os.path.exists(lane), os.path.exists(base)))
+        self.assertEqual(project, pack)
+        self.assertTrue(os.path.exists(lane))
+        self.assertFalse(os.path.exists(base))
+
+    def test_a_context_command_for_no_such_lane_makes_no_pack(self):
+        sb = self.sandbox()
+        pack = os.path.join(sb.home, ".cys", "pack-dept-dept-9")
+        rc, _, err = sb.run("dept-9", "--", "true")
+        control("P1R3 context command, no such lane: rc=%s, pack made=%s" % (rc, os.path.exists(pack)))
+        self.assertEqual(rc, 0, err[-300:])
+        self.assertFalse(os.path.exists(pack))
+
+
 class Census(unittest.TestCase):
     def setUp(self):
         with open(DEPT, encoding="utf-8") as f:
