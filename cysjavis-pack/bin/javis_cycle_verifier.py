@@ -126,9 +126,34 @@ def _resolve_project_root():
     return home
 
 
+def state_socket_dir():
+    """cys 소켓 부모 디렉터리 = 데몬 상태 디렉터리(feed.jsonl 이 사는 곳)."""
+    sock = (os.environ.get("AITERM_SOCKET", "").strip()
+            or os.environ.get("CYS_SOCKET", "").strip())
+    if sock:
+        return os.path.dirname(os.path.abspath(sock))
+    return os.path.join(os.path.expanduser("~"), ".local", "state", "cys")
+
+
+def lane_state_parent():
+    """레인 키 = 소켓 부모(state_socket_dir) — 새 레인 식별자를 만들지 않는다. STATE_DIR 의 부모.
+
+    기본 레인은 소켓 env 가 없든 기본 소켓이든 ~/.local/state/cys 로 경로가 그대로다.
+    부서 레인은 ~/.local/state/cys-dept-<부서>(cys-dept dept_sock 규약).
+    Windows named pipe 는 파일시스템 부모가 없어(dirname = \\\\.\\pipe) 파이프 이름이 그 자리를 맡는다 —
+    cys-dept 가 같은 이름(cys-dept-<부서>)을 쓰므로 레인 키도 같다.
+    """
+    sock = (os.environ.get("AITERM_SOCKET", "").strip()
+            or os.environ.get("CYS_SOCKET", "").strip())
+    pipe = re.match(r"^[\\/]{2}[^\\/]+[\\/]pipe[\\/]([^\\/]+)$", sock, re.IGNORECASE)
+    if pipe:
+        return os.path.join(os.path.expanduser("~"), ".local", "state", pipe.group(1))
+    return state_socket_dir()
+
+
 PROJECT = _resolve_project_root()
 CYCLE_LOG = os.path.join(PROJECT, "_round", "cycle_autopilot_log.jsonl")
-STATE_DIR = os.path.join(os.path.expanduser("~"), ".local", "state", "cys", "cycle_autopilot")
+STATE_DIR = os.path.join(lane_state_parent(), "cycle_autopilot")   # 레인별 — sweep.json·state.json·heartbeat 를 레인끼리 나누지 않는다
 STATE_JSON = os.path.join(STATE_DIR, "state.json")
 HEARTBEAT = os.path.join(STATE_DIR, "verifier.heartbeat")
 BASELINE_DIR = os.path.join(STATE_DIR, "baselines")   # [v2.1] 사이클별 baseline 원장
@@ -185,15 +210,6 @@ def paused_paths():
     """kill-switch 파일 경로 2중(절대경로 핀). 하나라도 존재하면 무집행."""
     return [os.path.join(pack_dir(), PAUSED_BASENAME),
             os.path.join(PROJECT, "_round", PAUSED_BASENAME)]
-
-
-def state_socket_dir():
-    """cys 소켓 부모 디렉터리 = 데몬 상태 디렉터리(feed.jsonl 이 사는 곳)."""
-    sock = (os.environ.get("AITERM_SOCKET", "").strip()
-            or os.environ.get("CYS_SOCKET", "").strip())
-    if sock:
-        return os.path.dirname(os.path.abspath(sock))
-    return os.path.join(os.path.expanduser("~"), ".local", "state", "cys")
 
 
 def nonce_for(cycle_id):

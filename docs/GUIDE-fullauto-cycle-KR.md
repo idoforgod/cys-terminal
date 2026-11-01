@@ -35,6 +35,7 @@
    printf 'live' > ~/.local/state/cys/cycle_autopilot/mode
    printf 'worker' > ~/.local/state/cys/cycle_autopilot/roles   # 대상 역할(콤마 구분)
    ```
+   이 경로는 본부 레인 것이다. 부서 레인은 `~/.local/state/cys-dept-<부서>/cycle_autopilot/` 에 따로 둔다 — 본부의 mode·roles 는 부서에 닿지 않고, 없으면 shadow 다.
    강등 = mode 파일 삭제. **Windows 주의**: PowerShell 의 `>`·`Set-Content` 기본 인코딩은 UTF-16(BOM)이다 — `Set-Content -Path $env:USERPROFILE\.local\state\cys\cycle_autopilot\mode -Value live -Encoding ascii -NoNewline` 으로 쓴다(코드에 utf-16 재시도 내성이 있으나 ascii 가 정본). claude 워커 노드 한정(codex·agy는 측정원이 달라 대상 아님).
 6. **master 확대(S2)**: 워커 사이클 성공 이력 확보 후에만 roles 파일에 `worker,master` 로 추가.
 
