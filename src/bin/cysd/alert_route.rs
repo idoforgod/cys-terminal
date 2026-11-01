@@ -472,14 +472,20 @@ impl MinuteWindow {
 }
 
 /// One [`AlertKey`] of a CSO seat's own alerts on its way to the master seat (0.14.57 P6): [`CSO_OWN_REPEAT_SECS`] apart.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct CsoOwnRepeat {
     /// Monotonic time of the last notice that entered the master queue.
     pub sent: Option<f64>,
-    /// Monotonic time of the last overflow-ledger row for this key.
+    /// Monotonic time of the last overflow-ledger row that reached the file. A failed append never sets it.
     pub recorded: Option<f64>,
     /// Arrivals since the last notice; the next notice carries them.
     pub held: u64,
+    /// Monotonic time of the last failed append, for the retry back-off.
+    pub attempted: Option<f64>,
+    /// Failed appends of `retry` so far.
+    pub failed: u64,
+    /// The ledger row whose append failed, kept until one lands. A one-shot event has no later arrival, so this is its only way to the file.
+    pub retry: Option<Value>,
 }
 
 /// 라우터의 살아있는 상태. **전용 Mutex 하나**에 담긴다 — 큐 계열 락 순서 규약
@@ -581,8 +587,17 @@ impl RouteState {
         // (죽은 좌석의 키가 데몬 수명 내내 남지 않게).
         self.last_routed.retain(|_, t| mono - *t <= 2.0 * COOLDOWN_SECS);
         self.last_ignored.retain(|_, t| mono - *t <= 2.0 * COOLDOWN_SECS);
-        self.cso_own.retain(|_, r| {
-            [r.sent, r.recorded].iter().flatten().any(|t| mono - *t <= 2.0 * CSO_OWN_REPEAT_SECS)
+    }
+
+    /// Drop a CSO-own entry only when it holds nothing: no uncounted arrival, no row waiting for a retry, no notice waiting in the master
+    /// queue, and no timestamp inside two repeat windows. `waiting` comes from the caller: no other lock is taken under this one. A key
+    /// with held arrivals and no further arrival stays until the daemon restarts; the keys are bounded by the CSO seats and the health rules.
+    fn prune_cso_own(&mut self, mono: f64, waiting: &std::collections::HashSet<String>) {
+        self.cso_own.retain(|k, r| {
+            r.held > 0
+                || r.retry.is_some()
+                || waiting.contains(&cso_own_notice_key(k))
+                || [r.sent, r.recorded, r.attempted].iter().flatten().any(|t| mono - *t <= 2.0 * CSO_OWN_REPEAT_SECS)
         });
     }
 
@@ -1963,6 +1978,7 @@ pub fn enqueue_into_seat(
     role_guard: Option<RoleGuard<'_>>,
     freeze_guard: FreezeGuard,
     ttl_secs: Option<u64>,
+    notice_key: Option<String>,
 ) -> Result<(String, usize), EnqueueErr> {
     let (entry, depth) = {
         let surfaces = daemon.surfaces.lock().unwrap();
@@ -2007,6 +2023,7 @@ pub fn enqueue_into_seat(
         // ★(0.14.42 · 설계 H2) 명시하는 호출자는 스케줄 하드축 우회 하나다(주기 잡 TTL ≤ 주기 · 대기를 1회분으로).
         let mut entry = daemon.next_queue_entry(text, from, origin);
         entry.ttl_secs = ttl_secs;
+        entry.notice_key = notice_key;
         q.push_back(entry.clone());
         (entry, q.len())
     };
@@ -2040,6 +2057,7 @@ pub fn enqueue_alert(
         CSO_QUEUE_HEADROOM,
         Some(RoleGuard::Prefix(CSO_ROLE_PREFIX)),
         FreezeGuard::DaemonAndSeat,
+        None,
         None,
     )
 }
@@ -3407,6 +3425,9 @@ const CSO_OWN_SEAT_ALERTS: [&str; 3] = ["queue.depth_high", "queue.starved", "he
 /// bounded by time and by the notice still waiting in the master queue. Arrivals in between are carried by the next notice.
 pub const CSO_OWN_REPEAT_SECS: f64 = 1800.0;
 
+/// Back-off between retries of a ledger row whose append failed. The tick is what retries a one-shot event.
+pub const CSO_OWN_RETRY_SECS: f64 = 60.0;
+
 /// Is this one of [`CSO_OWN_SEAT_ALERTS`] of a CSO seat? The same two tests as [`is_cso_self_threshold`]: these events
 /// usually carry the seat's role, and `health.alert` has none.
 fn is_cso_own_seat_alert(daemon: &Arc<Daemon>, event: &Value, item: &AlertItem) -> bool {
@@ -3513,7 +3534,12 @@ fn cso_role_of(daemon: &Arc<Daemon>, payload: &Value, item: &AlertItem) -> Strin
 }
 
 /// Queue `text` for the master seat, or say why it cannot be: the cause goes into the overflow-ledger row's kind.
-fn enqueue_for_master(daemon: &Arc<Daemon>, master: Option<u64>, text: String) -> Result<(u64, String, usize), &'static str> {
+fn enqueue_for_master(
+    daemon: &Arc<Daemon>,
+    master: Option<u64>,
+    text: String,
+    notice_key: Option<String>,
+) -> Result<(u64, String, usize), &'static str> {
     match master {
         None => Err("no_master"),
         Some(sid) => enqueue_into_seat(
@@ -3526,6 +3552,7 @@ fn enqueue_for_master(daemon: &Arc<Daemon>, master: Option<u64>, text: String) -
             Some(RoleGuard::Exact(CSO_SELF_THRESHOLD_TARGET_ROLE)),
             FreezeGuard::DaemonAndSeat,
             None,
+            notice_key,
         )
         .map(|(entry_id, depth)| (sid, entry_id, depth))
         .map_err(|e| match e {
@@ -3537,9 +3564,9 @@ fn enqueue_for_master(daemon: &Arc<Daemon>, master: Option<u64>, text: String) -
     }
 }
 
-/// Head of the sentence [`cso_own_alert_text`] adds, also an anchor of the identity [`cso_own_notice_waits`] reads.
+/// Head of the sentence [`cso_own_alert_text`] adds.
 const CSO_OWN_MARK: &str = " | this alert is about the CSO's OWN seat (";
-/// Tag before the key detail inside that sentence.
+/// Tag before the key detail inside that sentence. Display only: identity is [`cso_own_notice_key`].
 const CSO_OWN_KEY_TAG: &str = ", key ";
 
 /// Text for the master seat: the same `[alert] …` line the CSO gets for other seats, plus one sentence on the same line
@@ -3555,19 +3582,54 @@ pub fn cso_own_alert_text(item: &AlertItem, role: &str, bus_seq: Option<u64>, re
     format!("{}{CSO_OWN_MARK}{role}{CSO_SELF_SEQ_TAG}{seq}{CSO_OWN_KEY_TAG}{key}); {hint}", render_text(item, repeat))
 }
 
-/// Does a notice for this key still wait in the master queue? See [`cso_self_pending_entry`] for what presence means.
-fn cso_own_notice_waits(daemon: &Arc<Daemon>, master: u64, key: &AlertKey) -> bool {
-    let Some(surface) = daemon.get_surface(master) else { return false };
-    let head = format!("{} ", alert_text_prefix(key));
-    let tail = format!("{CSO_OWN_KEY_TAG}{}); ", key.detail.as_deref().unwrap_or("-"));
+/// The identity of a key's notice in the master queue: the whole key, JSON-encoded, so no rule text can stand in for another key.
+fn cso_own_notice_key(key: &AlertKey) -> String {
+    json!([key.name, key.surface, key.detail]).to_string()
+}
+
+/// The notice identities waiting in the master queue. See [`cso_self_pending_entry`] for what presence means. Taken before the route
+/// state lock: that lock is held with no other lock inside it.
+fn cso_own_waiting_keys(daemon: &Arc<Daemon>, master: u64) -> std::collections::HashSet<String> {
+    let Some(surface) = daemon.get_surface(master) else { return Default::default() };
     let q = surface.pending_queue.lock().unwrap();
-    q.iter().any(|e| {
-        e.origin == ALERT_ORIGIN
-            && e.from.as_deref() == Some(ALERT_FROM)
-            && e.text.starts_with(&head)
-            && e.text.contains(CSO_OWN_MARK)
-            && e.text.contains(&tail)
-    })
+    q.iter().filter_map(|e| e.notice_key.clone()).collect()
+}
+
+/// Write the ledger rows whose append failed, each no sooner than [`CSO_OWN_RETRY_SECS`] after its last attempt. A one-shot event has no
+/// later arrival to carry it, so the tick calls this too. Only a row that reached the file counts as recorded. A failed retry is counted
+/// and says nothing on the bus: the first failure already published LOST, and a broken disk must not become a stream.
+fn retry_cso_own_rows(daemon: &Arc<Daemon>, now: Now) {
+    let due: Vec<(AlertKey, Value, u64)> = {
+        let st = state_lock(daemon);
+        st.cso_own
+            .iter()
+            .filter(|(_, r)| !r.attempted.is_some_and(|t| now.mono - t < CSO_OWN_RETRY_SECS))
+            .filter_map(|(k, r)| r.retry.clone().map(|row| (k.clone(), row, r.failed)))
+            .collect()
+    };
+    for (key, mut row, failed) in due {
+        row["failed_appends"] = json!(failed);
+        let archived = append_refused(daemon, std::slice::from_ref(&row));
+        let mut st = state_lock(daemon);
+        let r = st.cso_own.entry(key.clone()).or_default();
+        if archived.is_ok() {
+            r.recorded = Some(now.mono);
+            r.attempted = None;
+            r.retry = None;
+            r.failed = 0;
+            drop(st);
+            publish_route(
+                daemon,
+                "alert_route.cso_own_recorded_late",
+                json!({"name": key.name, "surface_id": key.surface, "detail": key.detail, "failed_appends": failed,
+                       "archived_to": REFUSED_FILE,
+                       "note": "the overflow ledger took this row after a failed append - the LOST event for it is superseded"}),
+            );
+        } else {
+            r.attempted = Some(now.mono);
+            r.failed += 1;
+        }
+    }
 }
 
 /// Deliver one of a CSO seat's own alarms to the master seat queue (0.14.57 P6), the B-439 route with no fire id. A repeat
@@ -3580,10 +3642,13 @@ fn route_cso_own_alert(daemon: &Arc<Daemon>, event: &Value, item: &AlertItem, no
     let role = cso_role_of(daemon, payload, item);
     let bus_seq = event.get("seq").and_then(Value::as_u64);
     let master = daemon.roles.lock().unwrap().get(CSO_SELF_THRESHOLD_TARGET_ROLE).copied();
-    let waiting = master.is_some_and(|sid| cso_own_notice_waits(daemon, sid, &item.key));
+    let waiting_keys = master.map(|sid| cso_own_waiting_keys(daemon, sid)).unwrap_or_default();
+    let notice_key = cso_own_notice_key(&item.key);
+    let waiting = waiting_keys.contains(&notice_key);
     let repeat = {
         let mut st = state_lock(daemon);
         st.prune(now.mono);
+        st.prune_cso_own(now.mono, &waiting_keys);
         let r = st.cso_own.entry(item.key.clone()).or_default();
         r.held += 1;
         if waiting || r.sent.is_some_and(|t| now.mono - t < CSO_OWN_REPEAT_SECS) {
@@ -3592,7 +3657,7 @@ fn route_cso_own_alert(daemon: &Arc<Daemon>, event: &Value, item: &AlertItem, no
         r.held
     };
     let text = cso_own_alert_text(item, &role, bus_seq, repeat);
-    match enqueue_for_master(daemon, master, text) {
+    match enqueue_for_master(daemon, master, text, Some(notice_key)) {
         Ok((sid, entry_id, depth)) => {
             {
                 let mut st = state_lock(daemon);
@@ -3609,14 +3674,11 @@ fn route_cso_own_alert(daemon: &Arc<Daemon>, event: &Value, item: &AlertItem, no
             );
         }
         Err(cause) => {
+            retry_cso_own_rows(daemon, now);
             let write = {
                 let mut st = state_lock(daemon);
                 let r = st.cso_own.entry(item.key.clone()).or_default();
-                let write = !r.recorded.is_some_and(|t| now.mono - t < CSO_OWN_REPEAT_SECS);
-                if write {
-                    r.recorded = Some(now.mono);
-                }
-                write
+                r.retry.is_none() && !r.recorded.is_some_and(|t| now.mono - t < CSO_OWN_REPEAT_SECS)
             };
             if !write {
                 return;
@@ -3624,7 +3686,18 @@ fn route_cso_own_alert(daemon: &Arc<Daemon>, event: &Value, item: &AlertItem, no
             let mut row = cso_self_row(&format!("cso_own_alert_{cause}"), item, bus_seq, now);
             row["role"] = json!(role);
             row["repeat"] = json!(repeat);
-            let archived = append_refused(daemon, &[row]);
+            let archived = append_refused(daemon, std::slice::from_ref(&row));
+            {
+                let mut st = state_lock(daemon);
+                let r = st.cso_own.entry(item.key.clone()).or_default();
+                if archived.is_ok() {
+                    r.recorded = Some(now.mono);
+                } else {
+                    r.attempted = Some(now.mono);
+                    r.failed += 1;
+                    r.retry = Some(row);
+                }
+            }
             publish_route(
                 daemon,
                 "alert_route.cso_own_undelivered",
@@ -3635,7 +3708,7 @@ fn route_cso_own_alert(daemon: &Arc<Daemon>, event: &Value, item: &AlertItem, no
                        "note": if archived.is_ok() {
                            "the CSO's own alarm could not reach the master seat - kept in the overflow ledger"
                        } else {
-                           "LOST: could not reach the master seat and could not be written to the overflow ledger - this event is the last copy"
+                           "LOST for now: could not reach the master seat and could not be written to the overflow ledger - this event is the only copy until a retry lands, and a restart ends the retry"
                        }}),
             );
         }
@@ -3677,7 +3750,7 @@ fn route_cso_self_threshold(daemon: &Arc<Daemon>, event: &Value, item: &AlertIte
             return;
         }
     }
-    match enqueue_for_master(daemon, master, text) {
+    match enqueue_for_master(daemon, master, text, None) {
         Ok((sid, entry_id, depth)) => publish_route(
             daemon,
             "alert_route.cso_self_to_master",
@@ -3917,6 +3990,7 @@ pub fn reevaluate(daemon: &Arc<Daemon>, now: Now) -> usize {
     drain_folded(daemon, now);
     // ③ 보존에 실패해 상한을 넘긴 채 남은 것이 있으면 다시 시도한다(틱은 최소 간격을 무시).
     enforce_pending_bound(daemon, now, true);
+    retry_cso_own_rows(daemon, now);
     let n = dispatch(daemon, now);
     persist_pending(daemon, now, true);
     n
@@ -4372,6 +4446,7 @@ fn office_spool_enqueue(daemon: &Arc<Daemon>, role: &str, text: String) -> Resul
         CSO_QUEUE_HEADROOM,
         Some(RoleGuard::Exact(role)),
         FreezeGuard::DaemonAndSeat,
+        None,
         None,
     )
     .map(|(entry_id, _)| (sid, entry_id))
@@ -5134,7 +5209,7 @@ mod drills {
         let master = seat(&daemon, "master");
         let now = after_grace(&daemon);
         for i in 0..CSO_QUEUE_HEADROOM {
-            enqueue_for_master(&daemon, Some(master), format!("filler {i}")).expect("below the headroom");
+            enqueue_for_master(&daemon, Some(master), format!("filler {i}"), None).expect("below the headroom");
         }
         handle_event(&daemon, &cso_own_ev(&daemon, "queue.starved", cso, 45), now);
         assert_eq!((depth(&daemon, master), depth(&daemon, cso)), (CSO_QUEUE_HEADROOM, 0));
@@ -5224,6 +5299,133 @@ mod drills {
         handle_event(&daemon, &ev("health.alert", Some(cso), json!({"rule": "not_logged_in"})), now);
         handle_event(&daemon, &ev("health.alert", Some(cso), json!({"rule": "auth_401"})), now);
         assert_eq!(depth(&daemon, master), 2, "{:?}", queue_texts(&daemon, master));
+    }
+
+    /// A valid rule name can carry another key's whole detail. State where it fails: identity read out of the notice's display text,
+    /// where the text of A contains the tail searched for B and B is suppressed with neither a notice nor a row.
+    #[test]
+    fn drill_cso_own_a_rule_name_cannot_stand_in_for_another_key() {
+        let daemon = drill_daemon("csoownforge");
+        let cso = seat(&daemon, "cso");
+        let master = seat(&daemon, "master");
+        let now = after_grace(&daemon);
+        let b_detail = key_detail("health.alert", &json!({"rule": "auth_401"})).unwrap();
+        let forged = format!("different, key {b_detail}); note");
+        assert_ne!(key_detail("health.alert", &json!({"rule": forged})).unwrap(), b_detail, "the two keys must differ");
+        handle_event(&daemon, &ev("health.alert", Some(cso), json!({"rule": forged})), now);
+        assert!(queue_texts(&daemon, master)[0].contains(&b_detail), "the fixture must carry B's detail in A's text");
+        handle_event(&daemon, &ev("health.alert", Some(cso), json!({"rule": "auth_401"})), now);
+        assert_eq!(depth(&daemon, master), 2, "{:?}", queue_texts(&daemon, master));
+    }
+
+    /// The identity rides the queue's WAL: a restart empties the route's map and a notice still waiting is still known. State where it
+    /// fails: an identity kept only in memory, or dropped by the row functions.
+    #[test]
+    fn drill_cso_own_notice_identity_survives_the_wal_and_a_reset_map() {
+        let daemon = drill_daemon("csoownwal");
+        let cso = seat(&daemon, "cso");
+        let master = seat(&daemon, "master");
+        let now = after_grace(&daemon);
+        handle_event(&daemon, &cso_own_ev(&daemon, "queue.starved", cso, 70), now);
+        let entry = daemon.get_surface(master).unwrap().pending_queue.lock().unwrap().front().cloned().unwrap();
+        assert!(entry.notice_key.is_some());
+        let row = crate::state::queue_entry_row(master, &Some("master".into()), &entry);
+        assert_eq!(crate::state::queue_entry_from_row(&row).notice_key, entry.notice_key, "the WAL row dropped it");
+        state_lock(&daemon).cso_own.clear();
+        handle_event(&daemon, &cso_own_ev(&daemon, "queue.starved", cso, 71), Now::at(now.mono + 3600.0));
+        assert_eq!(depth(&daemon, master), 1, "a restart must not queue a second notice while one waits");
+    }
+
+    /// Held arrivals outlive a long wait. One notice, 24 arrivals every 300 s while it waits, 7,200 s in all, then master reads it. State
+    /// where it fails: pruning by the last send time, which erases the entry after two windows and the count with it.
+    #[test]
+    fn drill_cso_own_held_arrivals_survive_a_long_wait_and_reach_the_next_notice() {
+        let daemon = drill_daemon("csoownheld");
+        let cso = seat(&daemon, "cso");
+        let master = seat(&daemon, "master");
+        let t0 = after_grace(&daemon).mono;
+        handle_event(&daemon, &cso_own_ev(&daemon, "queue.starved", cso, 100), Now::at(t0));
+        for i in 1..=24u64 {
+            handle_event(&daemon, &cso_own_ev(&daemon, "queue.starved", cso, 100 + i), Now::at(t0 + 300.0 * i as f64));
+        }
+        assert_eq!(depth(&daemon, master), 1, "{:?}", queue_texts(&daemon, master));
+        daemon.get_surface(master).unwrap().pending_queue.lock().unwrap().clear();
+        handle_event(&daemon, &cso_own_ev(&daemon, "queue.starved", cso, 200), Now::at(t0 + 7500.0));
+        let texts = queue_texts(&daemon, master);
+        assert_eq!(texts.len(), 1, "{texts:?}");
+        assert!(texts[0].contains("(반복 25건)"), "the 24 held arrivals and this one: {}", texts[0]);
+    }
+
+    /// An entry stays while its notice waits, even with nothing held. State where it fails: retention that ignores the master queue.
+    #[test]
+    fn drill_cso_own_entry_stays_while_its_notice_waits_then_goes() {
+        let daemon = drill_daemon("csoownwait");
+        let cso = seat(&daemon, "cso");
+        let master = seat(&daemon, "master");
+        let t0 = after_grace(&daemon).mono;
+        let key = AlertKey::new("queue.starved", Some(cso));
+        handle_event(&daemon, &cso_own_ev(&daemon, "queue.starved", cso, 300), Now::at(t0));
+        let other = || cso_own_ev(&daemon, "queue.depth_high", cso, 301);
+        handle_event(&daemon, &other(), Now::at(t0 + 4000.0));
+        assert!(state_lock(&daemon).cso_own.contains_key(&key), "pruned while its notice waits");
+        daemon.get_surface(master).unwrap().pending_queue.lock().unwrap().clear();
+        handle_event(&daemon, &other(), Now::at(t0 + 8000.0));
+        assert!(!state_lock(&daemon).cso_own.contains_key(&key), "nothing held, nothing waiting: it must go");
+    }
+
+    /// Point the overflow ledger at a directory so its append fails.
+    fn break_ledger(daemon: &Arc<Daemon>) -> std::path::PathBuf {
+        let path = crate::state::state_dir(&daemon.socket_path).join(REFUSED_FILE);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    /// A failed append records nothing. State where it fails: the recorded time advanced before the append, which closes the window on a
+    /// row that does not exist. The next arrival after the repair lands the row.
+    #[test]
+    fn drill_cso_own_failed_append_then_repaired_sink_the_row_appears() {
+        let daemon = drill_daemon("csoownledger");
+        let cso = seat(&daemon, "cso");
+        let t0 = after_grace(&daemon).mono;
+        let key = AlertKey::new("queue.starved", Some(cso));
+        let sink = break_ledger(&daemon);
+        handle_event(&daemon, &cso_own_ev(&daemon, "queue.starved", cso, 400), Now::at(t0));
+        {
+            let st = state_lock(&daemon);
+            let r = &st.cso_own[&key];
+            assert_eq!((r.recorded, r.failed, r.retry.is_some()), (None, 1, true), "a failed append recorded something");
+        }
+        std::fs::remove_dir(&sink).unwrap();
+        handle_event(&daemon, &cso_own_ev(&daemon, "queue.starved", cso, 401), Now::at(t0 + 300.0));
+        let rows = cso_own_rows(&daemon, "queue.starved", cso);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["bus_seq"], json!(400), "the first arrival's own row");
+        assert_eq!(rows[0]["failed_appends"], json!(1));
+        let st = state_lock(&daemon);
+        let r = &st.cso_own[&key];
+        assert_eq!((r.recorded, r.retry.is_some()), (Some(t0 + 300.0), false));
+    }
+
+    /// `surface.exited` fires once, so no later arrival can carry its row: the tick retries it. State where it fails: a retry reached only
+    /// from the arrival path. A retry that fails again is counted and publishes nothing new.
+    #[test]
+    fn drill_cso_own_exit_with_a_failed_append_is_retried_by_the_tick() {
+        let daemon = drill_daemon("csoownexit");
+        let cso = seat(&daemon, "cso");
+        let t0 = after_grace(&daemon).mono;
+        let key = AlertKey::new("surface.exited", Some(cso));
+        let sink = break_ledger(&daemon);
+        handle_event(&daemon, &cso_own_ev(&daemon, "surface.exited", cso, 500), Now::at(t0));
+        reevaluate(&daemon, Now::at(t0 + 10.0));
+        assert_eq!(state_lock(&daemon).cso_own[&key].failed, 1, "inside the back-off nothing is attempted");
+        reevaluate(&daemon, Now::at(t0 + CSO_OWN_RETRY_SECS + 1.0));
+        assert_eq!(state_lock(&daemon).cso_own[&key].failed, 2, "a failed retry is counted");
+        std::fs::remove_dir(&sink).unwrap();
+        reevaluate(&daemon, Now::at(t0 + 2.0 * CSO_OWN_RETRY_SECS + 2.0));
+        let rows = cso_own_rows(&daemon, "surface.exited", cso);
+        assert_eq!(rows.len(), 1, "the tick wrote the row: {rows:?}");
+        assert_eq!(rows[0]["failed_appends"], json!(2));
+        assert!(state_lock(&daemon).cso_own[&key].retry.is_none());
     }
 
     /// DISCRIMINATING CASE of the control below: the only part of it that fails on code without the fix (v0.14.56). The rest of
@@ -5318,7 +5520,10 @@ mod drills {
         let (events, texts, parked, rows) = measure_cso_close(crate::governance::CloseCause::Reap, "reap");
         assert_eq!((events.len(), texts.len(), parked, rows.len()), (1, 1, 0, 0));
         let (_, owner, _, _) = measure_cso_close(crate::governance::CloseCause::OwnerClose, "owner close, compared");
-        assert_eq!(texts, owner, "the notice does not tell a deliberate close from a death");
+        // The bus seq differs from run to run: a background event can take a number first. Everything else must match.
+        let no_seq = |v: &[String]| v.iter().map(|t| t.split(", bus seq ").next().unwrap().to_string()).collect::<Vec<_>>();
+        let hint = |v: &[String]| v.iter().map(|t| t.split("); ").nth(1).unwrap_or_default().to_string()).collect::<Vec<_>>();
+        assert_eq!((no_seq(&texts), hint(&texts)), (no_seq(&owner), hint(&owner)), "the notice does not tell a deliberate close from a death");
     }
 
     /// Control (B-439): context.threshold for a non-CSO seat still goes to the CSO inbox only.
@@ -6940,6 +7145,7 @@ mod drills {
             Some(RoleGuard::Prefix(CSO_ROLE_PREFIX)),
             FreezeGuard::Daemon,
             None,
+            None,
         )
         .expect("좌석 pause 를 스케줄 push 의 실패로 접었다(일감이 다음 주기까지 사라진다)");
         assert_eq!(depth, 1, "스케줄 push 가 큐에 들어가지 않았다");
@@ -6956,6 +7162,7 @@ mod drills {
                 50,
                 Some(RoleGuard::Prefix(CSO_ROLE_PREFIX)),
                 FreezeGuard::Daemon,
+                None,
                 None,
             )
             .expect_err("kill-switch 가 스케줄 push 를 막지 못한다"),

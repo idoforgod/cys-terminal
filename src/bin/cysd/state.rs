@@ -211,6 +211,10 @@ pub struct QueueEntry {
     /// cycle owner). The WAL row carries it only when true (ordinary rows stay byte-identical); an old daemon drops it (= ordinary).
     #[serde(default)]
     pub authoritative: bool,
+    /// (0.14.57 P6) The identity of a notice that must not be queued twice while it waits: compared whole, never parsed out of `text`,
+    /// which can hold anything a rule name holds. It rides the WAL so a restart keeps it. Only when Some (ordinary rows stay byte-identical).
+    #[serde(default)]
+    pub notice_key: Option<String>,
 }
 
 /// ★(0.14.31 · WP-5 M) 큐 항목 TTL 기본(초) = 6h. env `CYS_QUEUE_TTL_SECS` 가 덮는다
@@ -246,6 +250,9 @@ pub fn queue_entry_row(surface_id: u64, role: &Option<String>, e: &QueueEntry) -
     // ★(0.14.56 · P1 D9 reinject order) only when true - an ordinary row is byte-identical to the pin's.
     if e.authoritative {
         row["authoritative"] = json!(true);
+    }
+    if let Some(k) = &e.notice_key {
+        row["notice_key"] = json!(k);
     }
     row
 }
@@ -289,6 +296,7 @@ pub fn queue_entry_from_row(it: &Value) -> QueueEntry {
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
         authoritative: it.get("authoritative").and_then(|v| v.as_bool()).unwrap_or(false),
+        notice_key: it.get("notice_key").and_then(|v| v.as_str()).map(String::from),
     }
 }
 
@@ -6890,6 +6898,7 @@ impl Daemon {
             expired_notified: false,
             expired_event_sent: false,
             authoritative: false,
+            notice_key: None,
         }
     }
 
@@ -12573,6 +12582,7 @@ mod tests {
             expired_notified: false,
             expired_event_sent: false,
             authoritative: false,
+            notice_key: None,
         }
     }
 
@@ -12778,6 +12788,7 @@ mod tests {
             expired_notified: false,
             expired_event_sent: false,
             authoritative: false,
+            notice_key: None,
         }
     }
 

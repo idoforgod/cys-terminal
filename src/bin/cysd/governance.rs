@@ -17590,6 +17590,7 @@ mod tests {
             expired_notified: false,
             expired_event_sent: false,
             authoritative: false,
+            notice_key: None,
         }
     }
 
@@ -34735,6 +34736,7 @@ mod h1_queue_quiesce_tests {
             None,
             crate::alert_route::FreezeGuard::Daemon,
             Some(300),
+            None,
         )
         .expect("우회 적재");
         assert_eq!(depth0, 1);

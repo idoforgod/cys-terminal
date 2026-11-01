@@ -1065,6 +1065,7 @@ fn qe(id: &str, from: &str, enqueued_at: f64, authoritative: bool) -> crate::sta
         expired_notified: false,
         expired_event_sent: false,
         authoritative,
+        notice_key: None,
     }
 }
 
