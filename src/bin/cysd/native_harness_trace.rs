@@ -53,7 +53,11 @@ pub(crate) fn emit(kind: &str, surface: u64, data: impl FnOnce() -> Value) -> Op
 fn native_probe_daemon() {
     let root = PathBuf::from(std::env::var("NATIVE_OWNED_ROOT").expect("owned root"));
     let socket = std::env::var("CYS_SOCKET").expect("private pipe");
-    assert!(socket.starts_with(r"\\.\pipe\cys-native-"));
+    let root_name = root.file_name().expect("owned root name").to_str().expect("UTF-8 root name");
+    let nonce = root_name.strip_prefix("cys-native-").expect("owned root prefix");
+    assert_eq!(nonce.len(), 32);
+    assert!(nonce.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+    assert_eq!(socket, format!(r"\\.\pipe\cys-native-{nonce}"));
     let canonical = root.canonicalize().expect("owned root exists");
     for name in ["HOME", "LOCALAPPDATA", "CYS_PACK_DIR"] {
         let path = PathBuf::from(std::env::var(name).expect("isolated path"));

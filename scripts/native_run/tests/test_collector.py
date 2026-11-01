@@ -105,5 +105,4 @@ class OracleGateControls(unittest.TestCase):
         self.put('calibration_yes_events',b'');r=collector.assess(self.root,self.record,self.case,self.manifest)
         self.assertFalse(r['complete']);self.assertIn('no-submit oracle uncalibrated',r['issues'])
 
-
 if __name__=='__main__':unittest.main()

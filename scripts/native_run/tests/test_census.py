@@ -30,5 +30,4 @@ class SyntaxControls(unittest.TestCase):
             w=workflow({'mode':'feasibility','branch':branch})
             with self.assertRaises(Refused):exact_candidate(w,branch)
 
-
 if __name__=='__main__':unittest.main()

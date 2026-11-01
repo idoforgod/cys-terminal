@@ -19,4 +19,28 @@ class ObserverTests(unittest.TestCase):
     def test_bad_artifact_path_rejected(self):
         with tempfile.TemporaryDirectory() as d:
             with self.assertRaises(observer.InvalidEvidence):observer.artifact(d,{'path':'../secret','sha256':'0'*64})
+
+
+class OpenControls(unittest.TestCase):
+    def frame(self,text):return {'text':text,'composer':{'output_gen':2}}
+    def evaluate(self,a,b,**kw):
+        args=dict(baseline=b'BASE',sentinel=b'TOKEN',open_final=b'BASETOKEN',plain_final=b'BASETOKEN',open_accepted=True,plain_accepted=True)
+        args.update(kw)
+        return observer.open_differential(self.frame(a),self.frame(b),**args)
+    def test_discrimination_requires_both_arms_and_exports(self):
+        self.assertIs(self.evaluate('BASE','BASETOKEN')['open_ack'],True)
+        for a,b in [('BASE','BASE'),('BASETOKEN','BASETOKEN'),('BASETOKEN','BASE')]:
+            self.assertIsNone(self.evaluate(a,b)['open_ack'])
+        self.assertIsNone(self.evaluate('BASE','BASETOKEN',open_accepted=None)['open_ack'])
+        row=self.evaluate('BASE','BASETOKEN',open_final=b'LOST')
+        self.assertIsNone(row['open_ack']);self.assertTrue(row['preservation_failure'])
+    def test_receipt_is_not_rpc_success_or_gap(self):
+        rows=[{'seq':0,'surface':7,'kind':'native_write_all','data':{'requested':[65,66],'accepted':2,'error_kind':None}}]
+        self.assertIs(observer.accepted_input(rows,7,-1,b'AB'),True)
+        self.assertIsNone(observer.accepted_input([],7,-1,b'AB'))
+        rows[0]['seq']=1
+        self.assertIsNone(observer.accepted_input(rows,7,-1,b'AB'))
+        rows[0]['seq']=0;rows[0]['data']['accepted']=None
+        self.assertIsNone(observer.accepted_input(rows,7,-1,b'AB'))
+
 if __name__=='__main__':unittest.main()

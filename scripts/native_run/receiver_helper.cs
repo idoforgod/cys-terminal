@@ -7,10 +7,22 @@ using System.Text;
 using System.Runtime.InteropServices;
 using System.Diagnostics;
 using System.Threading;
+using System.Collections.Generic;
 using System.Web.Script.Serialization;
 class NativeReceiverHelper {
     [DllImport("kernel32.dll",SetLastError=true)] static extern IntPtr GetStdHandle(int kind);
     [DllImport("kernel32.dll",SetLastError=true)] static extern bool GetConsoleMode(IntPtr handle,out uint mode);
+    [StructLayout(LayoutKind.Explicit,Size=20)] struct InputRecord {
+        [FieldOffset(0)] public ushort type;
+        [FieldOffset(4)] public int keyDown;
+        [FieldOffset(8)] public ushort repeat;
+        [FieldOffset(10)] public ushort virtualKey;
+        [FieldOffset(12)] public ushort scan;
+        [FieldOffset(14)] public ushort character;
+        [FieldOffset(16)] public uint control;
+    }
+    [DllImport("kernel32.dll",SetLastError=true)] static extern bool GetNumberOfConsoleInputEvents(IntPtr handle,out uint count);
+    [DllImport("kernel32.dll",EntryPoint="ReadConsoleInputW",SetLastError=true)] static extern bool ReadConsoleInput(IntPtr handle,[Out] InputRecord[] records,uint length,out uint read);
     static readonly JavaScriptSerializer Json = new JavaScriptSerializer();
     static string Owned(string root, string input) {
         root=Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar)+Path.DirectorySeparatorChar;
@@ -50,8 +62,22 @@ class NativeReceiverHelper {
                 if(emit) { byte[] query=new byte[]{27,91,54,110};Stream output=Console.OpenStandardOutput();output.Write(query,0,query.Length);output.Flush();wrote=query.Length; }
                 long after=Stopwatch.GetTimestamp();
                 File.WriteAllText(sideband+".emission.json",Json.Serialize(new {pid=Process.GetCurrentProcess().Id,mode=args[3],emitted_bytes=wrote,before_ticks=before,after_ticks=after,tick_frequency=Stopwatch.Frequency,utc=DateTime.UtcNow.ToString("o")}),new UTF8Encoding(false));
-                // Remain for the fixed resize observations; never emit a second query.
-                while(!File.Exists(go+".stop")) { if(guard.ElapsedMilliseconds>=40000)break;Thread.Sleep(10); }
+                // Only this no-Claude child reads its own console input. No mode
+                // changes and no replies are ever fabricated or echoed to output.
+                List<object> inputs=new List<object>();string inputError=null;
+                while(!File.Exists(go+".stop")) {
+                    if(guard.ElapsedMilliseconds>=40000)break;
+                    uint count;
+                    if(!GetNumberOfConsoleInputEvents(GetStdHandle(-10),out count)) {inputError="count:"+Marshal.GetLastWin32Error();break;}
+                    if(count>0) {
+                        InputRecord[] buffer=new InputRecord[Math.Min(count,32)];uint read;
+                        if(!ReadConsoleInput(GetStdHandle(-10),buffer,(uint)buffer.Length,out read)) {inputError="read:"+Marshal.GetLastWin32Error();break;}
+                        for(int i=0;i<read;i++)inputs.Add(new {ticks=Stopwatch.GetTimestamp(),event_type=buffer[i].type,key_down=buffer[i].keyDown,repeat=buffer[i].repeat,virtual_key=buffer[i].virtualKey,scan=buffer[i].scan,character_u16=buffer[i].character,control=buffer[i].control});
+                        if(inputs.Count>4096) {inputError="input_inventory_bound";break;}
+                    }
+                    Thread.Sleep(10);
+                }
+                File.WriteAllText(sideband+".input.json",Json.Serialize(new {pid=Process.GetCurrentProcess().Id,events=inputs,error=inputError,tick_frequency=Stopwatch.Frequency}),new UTF8Encoding(false));
                 return 0;
             }
             if(mode=="connect") {

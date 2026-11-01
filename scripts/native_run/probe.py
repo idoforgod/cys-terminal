@@ -17,8 +17,9 @@ import uuid
 from boundary import OwnedBoundary, Unavailable, cleanup_valid
 from controller import authorize, prepare_root, protect_native_root, fixture_environment, decide_feasibility
 from fixture import ProductReceiver, bounded_observation, pinned_copy
-from observer import compare_composer, calibrate_exports, calibrated_no_submit, InvalidEvidence
+from observer import compare_composer, calibrate_exports, calibrated_no_submit, InvalidEvidence, accepted_input, open_differential
 from protocol import atomic_json, read_json, sha
+from archive import register
 
 PHASES=[('setup',600),('network_boundary',180),('auth_free_startup',240),('origin_calibration',60),('genuine_open_query',180),('no_submit_calibration',240),('collection',300)]
 
@@ -55,6 +56,7 @@ def network_probe(config, grant, parent):
         for address,port in endpoints:
             if datetime.datetime.now(datetime.timezone.utc)>=datetime.datetime.fromisoformat(grant.latest_end_utc):raise Unavailable('authority expired before boundary control')
             root,exe=prepare_root(parent,config['receiver_helper'],config['receiver_helper_sha256'])
+            register(root,config)
             protect_native_root(root)
             output=root/'child/connect.json'
             spec={'run_root':str(root),'executable':str(exe),'executable_sha256':config['receiver_helper_sha256'],
@@ -84,6 +86,7 @@ def network_probe(config, grant, parent):
 
 def new_receiver(config,grant,parent):
     root,exe=prepare_root(parent,config['receiver_executable'],config['receiver_sha256'])
+    register(root,config)
     protect_native_root(root)
     spec={**config,'run_root':str(root),'executable':str(exe),'executable_sha256':config['receiver_sha256'],
           'mode':grant.mode,'session_id':str(uuid.uuid4())}
@@ -99,6 +102,7 @@ def origin_calibration(config,grant,parent):
     records=[]
     for mode in ('emit','silent'):
         root,exe=prepare_root(parent,config['receiver_helper'],config['receiver_helper_sha256'])
+        register(root,config)
         protect_native_root(root)
         sideband=root/'child/origin';go=root/'child/origin-go'
         spec={**config,'run_root':str(root),'executable':str(exe),'executable_sha256':config['receiver_helper_sha256'],
@@ -117,24 +121,82 @@ def origin_calibration(config,grant,parent):
         except (OSError,Unavailable,ValueError) as e:row['unmeasured']=str(e)
         finally:
             Path(str(go)+'.stop').write_bytes(b'owned calibration complete')
+            try:
+                row['child_input']=bounded_observation('origin input receipt',lambda:read_json(str(sideband)+'.input.json') if Path(str(sideband)+'.input.json').is_file() else None,3)
+            except (Unavailable,OSError,ValueError) as error:row['input_unmeasured']=str(error)
             item.close();row['cleanup']=item.cleanup
         atomic_json(root/'evidence/origin-calibration.json',row);records.append(row)
         if not row['cleanup'].get('complete'):break
     return {'subcases':records,'cleanup_complete':len(records)==2 and all(r['cleanup'].get('complete') is True for r in records),'discriminator':None,'release_verdict':'NONE',
             'meaning':'raw calibration only; no automatic attribution transfer to real receiver'}
 
-def execute(config,grant,output):
+def passive_interval(receiver, seconds=2):
+    """Fixed observation window, not a retry-until-good loop or a write."""
+    frames=[];end=time.monotonic()+seconds
+    while True:
+        frame=receiver.passive_frame()
+        frames.append({'controller_ns':time.monotonic_ns(),'trace_seq':receiver.trace_sequence(),'frame':frame})
+        if time.monotonic()>=end:break
+        time.sleep(.05)
+    return frames
+
+def open_control(receiver, config, grant, parent, baseline, before):
+    # The OPEN branch uses the existing startup receiver. An independent
+    # NOT-OPEN child gets the same baseline and perturbation, never OPEN.
+    # All observations inside the interval are read-only; Ctrl-G occurs ONLY
+    # before OPEN or after the designated CLOSE boundary.
+    sentinel='PERTURB_'+uuid.uuid4().hex[:12]
+    row={'sentinel':sentinel,'oracle_method':'passive_render_plus_final_byte_exports',
+         'origin':None,'eligibility':'SUPPLEMENTAL: real receiver, origin unknown'}
+    plain=None
+    try:
+        start=receiver.trace_sequence()
+        receiver.write('\x1b[200~'+sentinel)
+        row['open_frames']=passive_interval(receiver)
+        row['resize_receipts']=receiver.resize_sequence()
+        row['decision_frames']=passive_interval(receiver,2)
+        row['open_input_accepted']=accepted_input(receiver.trace_events(),receiver.sid,start,('\x1b[200~'+sentinel).encode())
+        row['boundary_before_close_seq']=receiver.trace_sequence()
+        receiver.write('\x1b[201~')
+        after=receiver.export()
+        row['open_final_hex']=after.hex();row['baseline_hex']=before.hex()
+        row['known_failures']=[] if after==before+sentinel.encode() else ['open_composer_changed']
+        # Stop this receiver before starting another; failed cleanup is a stop,
+        # not an excuse to accumulate jobs or adopt a live child.
+        receiver.close();row['open_cleanup']=receiver.cleanup
+        if receiver.cleanup.get('complete') is not True:raise Unavailable('OPEN cleanup incomplete')
+        plain=new_receiver(config,grant,parent);row['plain_root']=str(plain.root)
+        plain.start();plain.write(baseline);plain_before=plain.export()
+        if plain_before!=before:raise Unavailable('NOT-OPEN baseline differs')
+        start=plain.trace_sequence();plain.write(sentinel)
+        row['plain_frames']=passive_interval(plain)
+        row['plain_resize_receipts']=plain.resize_sequence()
+        row['plain_decision_frames']=passive_interval(plain,2)
+        row['plain_input_accepted']=accepted_input(plain.trace_events(),plain.sid,start,sentinel.encode())
+        plain_after=plain.export();row['plain_final_hex']=plain_after.hex()
+        row['discrimination']=open_differential(row['decision_frames'][-1]['frame'],row['plain_decision_frames'][-1]['frame'],
+            baseline=before,sentinel=sentinel.encode(),open_final=after,plain_final=plain_after,
+            open_accepted=row['open_input_accepted'],plain_accepted=row['plain_input_accepted'])
+        if plain_after!=before+sentinel.encode():row['known_failures'].append('plain_composer_changed')
+        # A calibrated temporal OPEN discriminator still supplies no query origin.
+        row['genuine_open_query']=None
+    except (OSError,Unavailable,ValueError,InvalidEvidence) as e:row['unmeasured']=str(e)
+    finally:
+        if plain:plain.close();row['plain_cleanup']=plain.cleanup
+        row['cleanup_complete']=row.get('open_cleanup',{}).get('complete') is True and (plain is None or plain.cleanup.get('complete') is True)
+        atomic_json(receiver.root/'evidence/open-control.json',row)
+    return row
+
+def execute(config,grant,output,phases):
     if sys.platform!='win32':raise Unavailable('native probe cannot execute on this host')
     parent=Path(tempfile.gettempdir());premises=dict.fromkeys(('network_boundary','auth_free_startup','genuine_open_query','no_submit_calibration'))
     details={};errors=[]
     # No receiver is started before the actual boundary discrimination succeeds.
+    phases.enter('network_boundary')
     try:premises['network_boundary'],details['network']=network_probe(config,grant,parent)
     except (OSError,Unavailable,ValueError) as e:errors.append({'phase':'network_boundary','error':str(e)})
     if premises['network_boundary'] is True:
-        details['origin_calibration']=origin_calibration(config,grant,parent)
-        if details['origin_calibration']['cleanup_complete'] is not True:
-            result={**decide_feasibility(premises),'details':details,'errors':[{'phase':'origin','error':'cleanup incomplete; no further children'}]}
-            atomic_json(output,result);return result
+        phases.enter('auth_free_startup')
         receiver=None
         try:
             receiver=new_receiver(config,grant,parent);details['receiver_root']=str(receiver.root);details['launch']=receiver.start()
@@ -143,27 +205,26 @@ def execute(config,grant,output):
             # A real editor export, not a static prompt/counter, establishes startup responsiveness.
             premises['auth_free_startup']=before==baseline.encode()
             if premises['auth_free_startup']:
-                pre=receiver.observations()
-                old_events=[read_json(p) for p in sorted((receiver.root/'trace').glob('*.json'))]
-                previous_seq=max((e['seq'] for e in old_events),default=-1)
-                receiver.write('\x1b[200~')
-                interval_start=time.monotonic_ns();resizes=receiver.resize_sequence()
-                # Fixed bounded observation only; no startup or query retries. Absence is NULL.
-                end=time.monotonic()+20
-                while time.monotonic()<end:
-                    events=[read_json(p) for p in sorted((receiver.root/'trace').glob('*.json'))]
-                    if any(e.get('seq',-1)>previous_seq and e.get('kind')=='reply_generated' and e.get('surface')==receiver.sid for e in events):break
-                    time.sleep(.02)
-                decision=receiver.observations();interval_end=time.monotonic_ns()
-                receiver.write('\x1b[201~');after=receiver.export()
-                details['query']={'pre':pre,'decision':decision,'resize_receipts':resizes,
-                    'trace_sequence_before_open':previous_seq,'controller_start_ns':interval_start,'controller_end_ns':interval_end,
-                    'before_sha256':sha(before),'after_sha256':sha(after),'preserved':compare_composer(before,after),
-                    'application_open_ack':None,'genuine_origin':None,
-                    'reason':'raw product trace retained; daemon flag/controller fence is not independent application-open/origin proof'}
-                if before!=after:errors.append({'phase':'genuine_open_query','observed_failure':'composer_changed'})
-                # Do not promote a raw query or daemon flag into the missing semantic premise.
+                receiver.write('!');visible=receiver.export()
+                receiver.key('Backspace');receiver.write('X');append_one=receiver.export()
+                receiver.key('Backspace');receiver.key('Backspace');remove_one=receiver.export()
+                receiver.write(baseline[-1]);restored=receiver.export()
+                checks=calibrate_exports(baseline.encode(),before,visible,append_one,remove_one,b'!')
+                checks['restored']=restored==before
+                details['export_controls']={'checks':checks,'baseline_hex':before.hex(),'visible_hex':visible.hex(),
+                    'append_hex':append_one.hex(),'remove_hex':remove_one.hex(),'restored_hex':restored.hex()}
+                if not all(checks.values()):
+                    premises['auth_free_startup']=None
+                    errors.append({'phase':'auth_free_startup','observed_failure':'export_oracle_control_failed'})
+            if premises['auth_free_startup']:
+                phases.enter('origin_calibration')
+                details['origin_calibration']=origin_calibration(config,grant,parent)
+                if details['origin_calibration']['cleanup_complete'] is not True:raise Unavailable('origin cleanup incomplete; no further children')
+                phases.enter('genuine_open_query')
+                details['query']=open_control(receiver,config,grant,parent,baseline,before)
+                for failure in details['query'].get('known_failures',[]):errors.append({'phase':'genuine_open_query','observed_failure':failure})
                 premises['genuine_open_query']=None
+
         except (OSError,Unavailable,ValueError,InvalidEvidence) as e:errors.append({'phase':'receiver','error':str(e)})
         finally:
             if receiver:
@@ -171,7 +232,8 @@ def execute(config,grant,output):
                 if receiver.cleanup.get('complete') is not True:
                     premises['auth_free_startup']=None;premises['genuine_open_query']=None
                     errors.append({'phase':'receiver_cleanup','error':'cleanup incomplete; calibration not started'})
-        if premises['auth_free_startup'] is True:
+        if premises['auth_free_startup'] is True and details.get('query',{}).get('cleanup_complete') is True:
+            phases.enter('no_submit_calibration')
             pair=[];sentinel='SUBMIT_CALIBRATION_'+uuid.uuid4().hex
             try:
                 for submit in (False,True):
@@ -182,12 +244,17 @@ def execute(config,grant,output):
                         # Only the deliberate calibration child receives Return, never R2/R3.
                         records=bounded_observation('application submission record',lambda: application_records(item) if list((item.root/'child/config').glob('projects/*/'+item.spec['session_id']+'.jsonl')) else None,10)
                         pair.append((item.spec['session_id'],records))
+                    except (OSError,Unavailable,ValueError,InvalidEvidence) as error:
+                        pair.append((item.spec['session_id'],None))
+                        errors.append({'phase':'no_submit_calibration','submit_control':submit,'error':str(error)})
                     finally:
                         item.close();details.setdefault('calibration_cleanup',[]).append(item.cleanup)
                     if item.cleanup.get('complete') is not True:raise Unavailable('calibration cleanup incomplete; no more children')
+                if any(raw is None for _,raw in pair):raise Unavailable('calibration transcript unavailable; absence is not zero')
                 premises['no_submit_calibration']=calibrated_no_submit(pair[0][1],pair[1][1],no_session=pair[0][0],yes_session=pair[1][0],sentinel=sentinel)
             except (OSError,Unavailable,ValueError,InvalidEvidence) as e:errors.append({'phase':'no_submit_calibration','error':str(e)})
     result={**decide_feasibility(premises),'details':details,'errors':errors,'source':{'product_sha':grant.product_sha,'diagnostic_sha':grant.diagnostic_sha},'authorization_sha256':grant.digest}
+    result['observed_failures'] += [e['observed_failure'] for e in errors if 'observed_failure' in e]
     atomic_json(output,result);return result
 
 if __name__=='__main__':
@@ -197,5 +264,5 @@ if __name__=='__main__':
         config=read_json(a.config)
         grant=authorize(a.authority,a.authority_sha256,mode='feasibility',diagnostic_sha=config['diagnostic_sha'],product_sha=config['product_sha'])
         config['authority_path']=a.authority
-        execute(config,grant,a.output)
+        raise Unavailable('direct execution refused; use the externally authorized owned-job supervisor')
     else:p.error('choose inert --plan or separately authorized --execute')

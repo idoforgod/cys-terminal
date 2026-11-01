@@ -117,6 +117,16 @@ class ProductReceiver:
         data=path.read_bytes();target=self.root/'evidence'/('composer-'+path.name);target.write_bytes(data)
         return data
 
+    def trace_events(self):
+        return [read_json(p) for p in sorted((self.root/'trace').glob('*.json'))]
+
+    def trace_sequence(self):
+        return max((e['seq'] for e in self.trace_events()),default=-1)
+
+    def passive_frame(self):
+        # Read-only RPC: no key, editor command, CLOSE, CR or input byte.
+        return self.rpc.call('surface.read_text',{'surface_id':self.sid,'composer':True})
+
     def resize_sequence(self):
         return [self.rpc.call('surface.resize',{'surface_id':self.sid,'rows':r,'cols':c}) for r,c in [(32,100),(24,80)]]
 
@@ -124,6 +134,7 @@ class ProductReceiver:
         return {'surface':self.rpc.call('surface.list',{}),'frame':self.rpc.call('surface.read_text',{'surface_id':self.sid,'composer':True})}
 
     def close(self):
+        if hasattr(self,'cleanup'):return
         (self.root/'evidence/stop-receiver').write_bytes(b'owned stop after capture\n')
         receipt=None
         try:receipt=bounded_observation('receiver owned cleanup',lambda:read_json(self.root/'evidence/boundary-finish.json') if (self.root/'evidence/boundary-finish.json').is_file() else None,15)

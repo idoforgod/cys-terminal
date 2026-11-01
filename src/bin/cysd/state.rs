@@ -8675,7 +8675,7 @@ pub(crate) fn run_writer_loop_tracked<W: Write, R: Into<crate::writer_gate::Queu
                 }
                 #[cfg(test)]
                 if let Some(t) = &track {
-                    crate::native_harness_trace::emit("agent_terminal", t.native_trace_surface.load(Ordering::Acquire), || serde_json::json!({"write_event":native_write,"request_id":job.request.id,"terminal":ex.terminal.kind(),"body_offset":ex.envelope.body_offset,"proof":format!("{:p}",std::sync::Arc::as_ptr(&job.proof)),"total":t.wrote(),"resume_epoch":t.resume_write_epoch()}));
+                    crate::native_harness_trace::emit("agent_execution_before_finish", t.native_trace_surface.load(Ordering::Acquire), || serde_json::json!({"write_event":native_write,"request_id":job.request.id,"terminal":ex.terminal.kind(),"body_offset":ex.envelope.body_offset,"proof":format!("{:p}",std::sync::Arc::as_ptr(&job.proof)),"total":t.wrote(),"resume_epoch":t.resume_write_epoch()}));
                 }
                 let broken = ex.transport_broken;
                 crate::agent_write::finish(job, &ex);

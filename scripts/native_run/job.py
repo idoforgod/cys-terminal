@@ -36,6 +36,15 @@ def checked_authority(raw,expected,context):
     if start.tzinfo is None or end.tzinfo is None or not start<=now<end:raise Unavailable('outside approved UTC window')
     return doc
 
+def job_start_utc():
+    run=os.environ.get('GITHUB_RUN_ID','');attempt=os.environ.get('GITHUB_RUN_ATTEMPT','')
+    if not run.isdigit() or attempt!='1':raise Unavailable('job clock identity absent')
+    stamp=(Path(os.environ['RUNNER_TEMP'])/('cys-native-start-'+run+'-'+attempt+'.txt')).read_text().strip()
+    began=datetime.datetime.fromisoformat(stamp)
+    now=datetime.datetime.now(datetime.timezone.utc)
+    if began.tzinfo is None or not 0<=(now-began).total_seconds()<600:raise Unavailable('setup cap expired or invalid job clock')
+    return stamp
+
 def authorize(mode,branch):
     root=Path('native-evidence')
     if root.exists():raise Unavailable('evidence root already exists; no attempt adoption')
@@ -47,6 +56,7 @@ def authorize(mode,branch):
     if parsed.scheme!='https' or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
         raise Unavailable('external HTTPS authority required')
     expected=os.environ.get('NATIVE_AUTH_SHA256','')
+    if not re.fullmatch('[0-9a-f]{64}',expected):raise Unavailable('authority digest absent')
     opener=urllib.request.build_opener(NoRedirect)
     with opener.open(uri,timeout=10) as response:raw=response.read(2*1024*1024+1)
     if len(raw)>2*1024*1024:raise Unavailable('authority too large')
@@ -55,7 +65,7 @@ def authorize(mode,branch):
     if actual!=doc['diagnostic_sha']:raise Unavailable('working checkout not approved diagnostic SHA')
     (root/'authority.json').write_bytes(raw)
     atomic_json(root/'authorization-receipt.json',{'digest':expected,'context':context,'authority_host':parsed.hostname,
-                'run_id':os.environ.get('GITHUB_RUN_ID'),'release_verdict':'NONE'})
+                'run_id':os.environ.get('GITHUB_RUN_ID'),'job_start_utc':job_start_utc(),'release_verdict':'NONE'})
     with open(os.environ['GITHUB_OUTPUT'],'a',encoding='utf-8') as out:
         out.write('product_sha='+doc['product_sha']+'\n')
         out.write('rust_toolchain='+doc['rust_toolchain']+'\n')
@@ -68,21 +78,36 @@ def execute(job):
     # local WIP never substitutes simulation or returns a successful empty job.
     if doc['mode']=='feasibility':
         if job!='feasibility':raise Unavailable('unexpected feasibility matrix entry')
-        from probe import execute as run_probe
-        from controller import authorize as probe_authorize
-        config=doc.get('probe_config')
-        if type(config) is not dict:raise Unavailable('frozen probe configuration absent')
-        config={**config,'authority_path':str((root/'authority.json').resolve())}
-        grant=probe_authorize(root/'authority.json',receipt['digest'],mode='feasibility',diagnostic_sha=doc['diagnostic_sha'],product_sha=doc['product_sha'])
-        return run_probe(config,grant,root/'probe-result.json')
+        from supervisor import run_owned_worker
+        from archive import collect
+        try:
+            return run_owned_worker([str(Path(__file__).resolve()),'worker','--evidence',str(root.resolve())],root,doc['latest_end_utc'],receipt['job_start_utc'])
+        finally:
+            collect(root)
     raise Unavailable('main native job driver is not yet executable; no empty success')
+
+def worker(evidence):
+    root=Path(evidence);receipt=read_json(root/'authorization-receipt.json')
+    doc=checked_authority((root/'authority.json').read_bytes(),receipt['digest'],receipt['context'])
+    from supervisor import PhasePublisher
+    phases=PhasePublisher(root/'phase.json');phases.enter('setup')
+    from setup import build_probe
+    config=build_probe(doc,root)
+    config['authority_path']=str(root/'authority.json');config['artifact_root']=str(root)
+    from controller import authorize as probe_authorize
+    grant=probe_authorize(root/'authority.json',receipt['digest'],mode='feasibility',diagnostic_sha=doc['diagnostic_sha'],product_sha=doc['product_sha'])
+    from probe import execute as run_probe
+    result=run_probe(config,grant,root/'probe-result.json',phases)
+    return result
 
 if __name__=='__main__':
     p=argparse.ArgumentParser();s=p.add_subparsers(dest='command',required=True)
     a=s.add_parser('authorize');a.add_argument('--mode',choices=['main','feasibility'],required=True);a.add_argument('--branch',required=True)
-    e=s.add_parser('execute');e.add_argument('--job',required=True);args=p.parse_args()
+    e=s.add_parser('execute');e.add_argument('--job',required=True)
+    w=s.add_parser('worker');w.add_argument('--evidence',required=True);args=p.parse_args()
     try:
         if args.command=='authorize':authorize(args.mode,args.branch)
+        elif args.command=='worker':worker(args.evidence)
         else:execute(args.job)
     except (Unavailable,ValueError,OSError,KeyError,subprocess.CalledProcessError) as error:
         atomic_json(Path('native-evidence')/'job-refusal.json',{'state':None,'error':str(error),'release_verdict':'NONE'})

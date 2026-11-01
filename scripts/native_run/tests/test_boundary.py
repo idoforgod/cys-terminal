@@ -28,7 +28,7 @@ class BoundaryTests(unittest.TestCase):
             p=pathlib.Path(d)/'auth.json';record={'mode':'feasibility','diagnostic_sha':'a'*40,'product_sha':'b'*40,'attempt':True,'release_verdict':'NONE','execution_authorized':True,'host':'windows-latest','earliest_start_utc':'2026-01-01T00:00:00+00:00','latest_end_utc':'2027-01-01T00:00:00+00:00'}
             p.write_text(json.dumps(record))
             with self.assertRaises(boundary.Unavailable):controller.authorize(p,sha(p.read_bytes()),mode='feasibility',diagnostic_sha='a'*40,product_sha='b'*40,now=datetime.datetime(2026,2,1,tzinfo=datetime.timezone.utc))
-if __name__=='__main__':unittest.main()
+
 
 class AuditControls(unittest.TestCase):
     def test_authority_uses_the_hashed_bytes(self):
@@ -52,3 +52,5 @@ class AuditControls(unittest.TestCase):
         self.assertTrue(boundary.cleanup_valid(valid))
         for key,value in [('root_exit_observed',None),('descendant_exit_receipt',False),('profile_retained',True),('errors',['close failed'])]:
             self.assertFalse(boundary.cleanup_valid({**valid,key:value}))
+
+if __name__=='__main__':unittest.main()

@@ -109,3 +109,51 @@ def genuine_window(events, raw_output, raw_input):
     if r.get('origin')!='parser_generated' or r.get('write_result')!='complete':return None
     # A daemon paste flag is intentionally not read here.
     return True
+
+
+def accepted_input(events, surface, after_seq, expected):
+    """Native writer receipts, never a successful send RPC, decide acceptance.
+
+The interval must contain exactly the requested bytes (CPRs are separate
+operations). Incomplete writes or recorder gaps refuse the observation.
+"""
+    if type(expected) is not bytes or not expected:raise InvalidEvidence('input bytes absent')
+    selected=[e for e in events if e.get('seq',-1)>after_seq]
+    if not selected:return None
+    sequences=[integer(e.get('seq'),'trace sequence') for e in selected]
+    if sequences!=list(range(after_seq+1,sequences[-1]+1)):return None
+    writes=[]
+    for e in selected:
+        if e.get('surface')!=surface or e.get('kind') not in ('native_write','native_write_all'):continue
+        data=e.get('data',{});raw=data.get('requested')
+        if type(raw) is not list or any(type(v) is not int or not 0<=v<=255 for v in raw):raise InvalidEvidence('native write bytes')
+        n=data.get('accepted')
+        if type(n) is not int or not 0<=n<=len(raw) or data.get('error_kind') is not None:return None
+        chunk=bytes(raw[:n])
+        if CPR.fullmatch(chunk):continue
+        writes.append(chunk)
+    return b''.join(writes)==expected if writes else None
+
+def open_differential(open_frame, plain_frame, *, baseline, sentinel, open_final,
+                      plain_final, open_accepted, plain_accepted):
+    """Read-only rendered response is a temporal discriminator, not a byte oracle.
+
+Exact final editor exports supply the separate byte oracle. Frames alone,
+received fences alone, or a constant renderer cannot establish OPEN.
+"""
+    if type(baseline) is not bytes or type(sentinel) is not bytes or not sentinel:
+        raise InvalidEvidence('differential input types')
+    if any(type(v) is not bytes for v in (open_final,plain_final)):
+        raise InvalidEvidence('final export absent')
+    failure=open_final!=baseline+sentinel or plain_final!=baseline+sentinel
+    frames=[]
+    for frame in (open_frame,plain_frame):
+        if type(frame) is not dict or type(frame.get('text')) is not str:return {'open_ack':None,'preservation_failure':failure}
+        composer=frame.get('composer')
+        if type(composer) is not dict or type(composer.get('output_gen')) is not int:return {'open_ack':None,'preservation_failure':failure}
+        frames.append(frame['text'])
+    token=sentinel.decode('ascii');base=baseline.decode('ascii')
+    discriminates=base in frames[0] and base in frames[1] and token not in frames[0] and token in frames[1]
+    accepted=open_accepted is True and plain_accepted is True
+    return {'open_ack':True if discriminates and accepted and not failure else None,
+            'preservation_failure':failure}

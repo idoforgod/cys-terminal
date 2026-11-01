@@ -53,7 +53,8 @@ def workflow(manifest):
     mode=manifest['mode'];branch=manifest['branch'];jobs=matrix() if mode=='main' else [{'job':'feasibility','arm':'feasibility','minutes':30}]
     guard="github.event_name == 'push' && github.ref == 'refs/heads/"+branch+"' && github.run_attempt == 1"
     # External authority must be supplied by the separate E1. No commit embeds its own SHA.
-    steps=[{'uses':'actions/checkout@v4','with':{'ref':'${{ github.sha }}','fetch-depth':0,'persist-credentials':False}},
+    steps=[{'name':'Start fixed job clock','shell':'pwsh','run':'$p = Join-Path $env:RUNNER_TEMP ("cys-native-start-" + $env:GITHUB_RUN_ID + "-" + $env:GITHUB_RUN_ATTEMPT + ".txt"); if (Test-Path $p) { throw "Clock already exists" }; [IO.File]::WriteAllText($p, [DateTimeOffset]::UtcNow.ToString("o"))'},
+           {'uses':'actions/checkout@v4','with':{'ref':'${{ github.sha }}','fetch-depth':0,'persist-credentials':False}},
            {'uses':'actions/setup-python@v5','with':{'python-version':'3.12'}},
            {'name':'Verify external authority before native work','id':'authorize','shell':'pwsh','env':{
                'NATIVE_AUTH_URI':'${{ vars.CYS_NATIVE_AUTH_URI }}','NATIVE_AUTH_SHA256':'${{ vars.CYS_NATIVE_AUTH_SHA256 }}'},
@@ -62,7 +63,7 @@ def workflow(manifest):
            {'uses':'dtolnay/rust-toolchain@stable','with':{'toolchain':'${{ steps.authorize.outputs.rust_toolchain }}'}},
            {'name':'Fixed owned diagnostic job','shell':'pwsh','run':'python scripts/native_run/job.py execute --job ${{ matrix.job }}'},
            {'name':'Retain every artifact, including NULL and inner reds','if':'always()','uses':'actions/upload-artifact@v4',
-            'with':{'name':'native-${{ matrix.job }}-${{ github.run_id }}-attempt-${{ github.run_attempt }}','path':'native-evidence/','if-no-files-found':'error'}}]
+            'with':{'name':'native-${{ matrix.job }}-${{ github.run_id }}-attempt-${{ github.run_attempt }}','path':'native-evidence/**\n!native-evidence/cargo-target/**\n!native-evidence/binaries/**','if-no-files-found':'error'}}]
     return {'name':'native diagnostic '+mode,'on':{'push':{'branches':[branch]}},'permissions':{'contents':'read'},
             'concurrency':{'group':'native-'+branch.replace('/','-'),'cancel-in-progress':False},
             'jobs':{'native':{'if':guard,'runs-on':'windows-latest','timeout-minutes':'${{ matrix.minutes }}',
