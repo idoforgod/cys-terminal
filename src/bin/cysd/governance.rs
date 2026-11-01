@@ -21046,11 +21046,13 @@ mod tests {
             s.output_gen.fetch_add(1, AtomicOrdering::AcqRel);
         }, |attempt| crate::state::test_done_or_quiet_window(
             || s.output_gen.load(AtomicOrdering::Acquire), false, 3, 0, attempt));
-        assert!(receipt.is_some(), "negative control must reach actual queue admission");
-        assert_eq!(proof.0.load(AtomicOrdering::Relaxed), 1, "negative control must reach the writer refusal");
-        assert_eq!(attempts, 1, "A1 must stop at the admitted refusal, not retry dirty output");
+        let proof_calls = proof.0.load(AtomicOrdering::Relaxed);
         let remaining = s.pending_queue.lock().unwrap().len();
+        // Teardown precedes every discriminator, including when a mutant breaks the latch.
         crate::state::test_stop_daemon(&daemon);
+        assert!(receipt.is_some(), "negative control must reach actual queue admission");
+        assert_eq!(proof_calls, 1, "negative control must reach the writer refusal");
+        assert_eq!(attempts, 1, "A1 must stop at the admitted refusal, not retry dirty output");
         assert_eq!(remaining, 0, "A1 post-admission refusal must keep the delivery assertion RED");
     }
 
