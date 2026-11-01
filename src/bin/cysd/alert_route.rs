@@ -3379,6 +3379,14 @@ pub fn handle_event(daemon: &Arc<Daemon>, event: &Value, now: Now) {
         route_cso_own_alert(daemon, event, &item, now);
         return;
     }
+    // ═══ DEATH PATH (0.14.57 · P6 · CEO ruling 07b4737d1aeb8034, clause 2) ═══════════════════════════════════════════
+    // `surface.exited` of a CSO seat goes to the master seat, on purpose and by name. It is published after exited=true,
+    // so nothing built on the seat set reaches it, and it used to land in the payload-role drop just below and return.
+    // It fires once for a surface. Every other CSO-own event in that branch stays dropped.
+    if is_cso_own_exit(daemon, event, &item) {
+        route_cso_own_alert(daemon, event, &item, now);
+        return;
+    }
     // ★출처가 CSO 자신인 생애 이벤트(`surface.exited{role:"cso*"}`)는 좌석 생존 여부와 무관하게
     //   제외한다 — 발행 시점에 이미 exited=true 라 좌석 집합만으로는 잡히지 않는다.
     if payload_role_is_cso(event) {
@@ -3403,6 +3411,13 @@ pub const CSO_OWN_REPEAT_SECS: f64 = 1800.0;
 /// usually carry the seat's role, and `health.alert` has none.
 fn is_cso_own_seat_alert(daemon: &Arc<Daemon>, event: &Value, item: &AlertItem) -> bool {
     CSO_OWN_SEAT_ALERTS.contains(&item.key.name.as_str())
+        && (payload_role_is_cso(event) || item.key.surface.is_some_and(|s| cso_seats_detail(daemon).0.contains(&s)))
+}
+
+/// Is this the exit of a CSO seat (the death path in [`handle_event`])? Same two tests: the payload role is what a real exit
+/// carries, and a cso-bound seat can publish with another payload role.
+fn is_cso_own_exit(daemon: &Arc<Daemon>, event: &Value, item: &AlertItem) -> bool {
+    item.key.name == "surface.exited"
         && (payload_role_is_cso(event) || item.key.surface.is_some_and(|s| cso_seats_detail(daemon).0.contains(&s)))
 }
 
@@ -5052,6 +5067,33 @@ mod drills {
     }
 
     #[test]
+    fn drill_cso_own_exit_goes_to_master() { check_cso_own_goes_to_master("surface.exited"); }
+    #[test]
+    fn drill_cso_own_exit_without_a_master_is_recorded() { check_cso_own_without_a_master_is_recorded("surface.exited"); }
+    #[test]
+    fn drill_cso_own_exit_while_paused_is_recorded() { check_cso_own_while_paused_is_recorded("surface.exited"); }
+
+    /// (P6, death path) A second exit event for the same surface adds nothing, and the notice says the seat is gone: the
+    /// cycle hint of the alive seat would point at a dead one. An exit of a cso-bound seat with another payload role counts.
+    #[test]
+    fn drill_cso_own_exit_is_told_once_and_names_a_dead_seat() {
+        let daemon = drill_daemon("csoownd");
+        let cso = seat(&daemon, "cso");
+        let master = seat(&daemon, "master");
+        let now = after_grace(&daemon);
+        handle_event(&daemon, &cso_own_ev(&daemon, "surface.exited", cso, 51), now);
+        handle_event(&daemon, &cso_own_ev(&daemon, "surface.exited", cso, 52), now);
+        assert_eq!(depth(&daemon, master), 1);
+        let t = queue_texts(&daemon, master).remove(0);
+        assert!(t.contains("no CSO reads alerts until the seat is back") && t.contains("cys launch-agent --role cso"), "{t}");
+        assert!(!t.contains("cycle-agent"), "{t}");
+        let cso2 = seat(&daemon, "cso-2");
+        handle_event(&daemon, &ev("surface.exited", Some(cso2), json!({"role": "worker", "agent": "claude"})), now);
+        assert_eq!((depth(&daemon, master), depth(&daemon, cso2), pending_len(&daemon)), (2, 0, 0));
+        assert!(queue_texts(&daemon, master).remove(1).contains("--role cso-2"));
+    }
+
+    #[test]
     fn drill_cso_own_queue_depth_high_goes_to_master() { check_cso_own_goes_to_master("queue.depth_high"); }
     #[test]
     fn drill_cso_own_queue_starved_goes_to_master() { check_cso_own_goes_to_master("queue.starved"); }
@@ -5184,17 +5226,29 @@ mod drills {
         assert_eq!(depth(&daemon, master), 2, "{:?}", queue_texts(&daemon, master));
     }
 
-    /// Control (B-439): every other CSO-own event stays excluded exactly as before, with a live master present.
+    /// Control, re-aimed (0.14.57 P6, CEO rulings 07b4737d1aeb8034 and 09fd5e36dce4e8dc). It watched that B-439 leaked no
+    /// further than context.threshold. Its four events now go to master by decision, so it watches the next boundary: a
+    /// seat that is not a CSO behaves as before, whichever seat it is, and a CSO-own event outside the four stays dropped.
     #[test]
-    fn drill_cso_own_non_threshold_events_stay_excluded_with_a_master_seat() {
+    fn drill_cso_own_route_does_not_leak_past_cso_seats_or_the_four_events() {
         let daemon = drill_daemon("csoselfx");
         let cso = seat(&daemon, "cso");
         let master = seat(&daemon, "master");
+        let worker = seat(&daemon, "worker");
         let now = after_grace(&daemon);
-        handle_event(&daemon, &ev("surface.exited", Some(cso), json!({"role": "cso"})), now);
-        assert_eq!(depth(&daemon, master), 0, "master gets nothing for non-threshold CSO-own events");
-        assert_eq!(depth(&daemon, cso), 0, "the CSO inbox gets nothing");
-        assert_eq!(pending_len(&daemon), 0, "nothing parked");
+        // A worker's own events: all four reach the CSO, none reaches master.
+        for (i, name) in ["queue.depth_high", "queue.starved", "health.alert", "surface.exited"].into_iter().enumerate() {
+            handle_event(&daemon, &ev(name, Some(worker), json!({"role": "worker", "depth": 60, "rule": "auth_401"})), now);
+            assert_eq!(depth(&daemon, cso), i + 1, "{name} of a worker still goes to the CSO");
+            assert_eq!(depth(&daemon, master), 0, "{name} of a worker does not go to master");
+        }
+        // The master seat's own event is a seat like any other: it goes to the CSO, not back to master.
+        handle_event(&daemon, &ev("queue.starved", Some(master), json!({"role": "master", "depth": 3})), now);
+        assert_eq!((depth(&daemon, cso), depth(&daemon, master)), (5, 0), "master's own event still goes to the CSO");
+        // A CSO-own event outside the four stays dropped, with and without the role in the payload.
+        handle_event(&daemon, &ev("watchdog.load_high", Some(cso), json!({"role": "cso"})), now);
+        handle_event(&daemon, &ev("watchdog.load_high", Some(cso), json!({})), now);
+        assert_eq!((depth(&daemon, cso), depth(&daemon, master), pending_len(&daemon)), (5, 0, 0), "outside the four: dropped as before");
     }
 
     /// Control (B-439): context.threshold for a non-CSO seat still goes to the CSO inbox only.
