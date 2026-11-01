@@ -1283,6 +1283,50 @@ fn wp17_r2_known_multiline_draft_zero_counter_blocks_then_empty_delivers() {
     }
 }
 
+// Audit only the successful attempt's append, with the real ledger's string surface key.
+fn a2_success_suffix(prefix: &[u8], after: &[u8], surface: &str, entry: &str, reason: &str) -> Result<(), String> {
+    let suffix = after.strip_prefix(prefix).ok_or("ledger prefix changed or rotated")?;
+    let text = std::str::from_utf8(suffix).map_err(|e| e.to_string())?;
+    let records: Vec<Value> = text.lines().filter(|line| !line.trim().is_empty())
+        .map(serde_json::from_str).collect::<Result<_, _>>().map_err(|e| e.to_string())?;
+    let matching: Vec<&Value> = records.iter().filter(|v|
+        v["origin"] == "queue" && v["surface"] == surface && v["queue_entry_id"] == entry).collect();
+    if matching.is_empty() { return Err("successful attempt has no matching admission record".into()); }
+    if matching.iter().all(|v| v["slash_command_admission"] == reason) { Ok(()) }
+    else { Err("successful attempt admission reason differs".into()) }
+}
+
+#[test]
+fn a2cd_audit_rejects_empty_suffix() {
+    assert!(a2_success_suffix(b"", b"", "7", "entry", "fallback_unrecognized_layout").is_err(),
+        "A2-1: empty suffix is no audit");
+}
+#[test]
+fn a2cd_audit_rejects_foreign_only_suffix() {
+    let other = b"{\"origin\":\"queue\",\"surface\":\"8\",\"queue_entry_id\":\"other\",\"slash_command_admission\":\"fallback_unrecognized_layout\"}\n";
+    assert!(a2_success_suffix(b"", other, "7", "entry", "fallback_unrecognized_layout").is_err(),
+        "A2-1: foreign-only suffix is no audit");
+}
+
+#[test]
+fn a2cd_audit_binds_success_reason_and_prefix() {
+    let good = b"{\"origin\":\"queue\",\"surface\":\"7\",\"queue_entry_id\":\"entry\",\"slash_command_admission\":\"right\"}\n";
+    let bad = b"{\"origin\":\"queue\",\"surface\":\"7\",\"queue_entry_id\":\"entry\",\"slash_command_admission\":\"wrong\"}\n";
+    assert!(a2_success_suffix(b"", good, "7", "entry", "right").is_ok());
+    let after = [good.as_slice(), bad.as_slice()].concat();
+    assert!(a2_success_suffix(good, &after, "7", "entry", "right").is_err(), "a refusal's earlier correct reason cannot certify a wrong success");
+    assert!(a2_success_suffix(good, good, "7", "entry", "right").is_err(), "no new successful record");
+    assert!(a2_success_suffix(good, bad, "7", "entry", "right").is_err(), "rotation/truncation refuses");
+}
+
+fn wp17_ledger_bytes(fx: &Fx) -> Vec<u8> {
+    match std::fs::read(crate::delivery::ledger_path(&fx.daemon.socket_path)) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => panic!("read fixture ledger: {e}"),
+    }
+}
+
 #[test]
 fn wp17_r2_unknown_lower_layout_and_framed_hint_keep_fallback() {
     let fx = fx("wp17-r2-unknown");
@@ -1295,14 +1339,28 @@ fn wp17_r2_unknown_lower_layout_and_framed_hint_keep_fallback() {
     ] {
         let s = seat(&fx);
         s.inject_track.win_diag.enable();
-        enqueue(&fx, &s, "/model opus");
-        s.parser.lock().unwrap().process(paint.as_bytes());
-        let recheck = crate::governance::ScreenRecheck {
-            marker: Some(vec!["❯".into()]), placeholder: None,
-            gen_at_verdict: s.output_gen.load(Ordering::Acquire), approval_pending: false,
-        };
-        let d = deliver_head_locked(&fx.daemon, &s, false, false, None, Some(0), None, Some(&recheck), None)
-            .unwrap_or_else(|| panic!("unknown layout/hint retains ordinary progress: {}", s.inject_track.win_diag.dump()));
+        let entry_id = enqueue(&fx, &s, "/model opus");
+        let mut saved = None;
+        let mut success_prefix = Vec::new();
+        let mut success_after = Vec::new();
+        crate::state::test_done_or_no_pty_output(&s, || {
+            // BEFORE paint/call; only the FIRST Some owns this suffix and its effects.
+            let prefix = wp17_ledger_bytes(&fx);
+            s.parser.lock().unwrap().process(paint.as_bytes());
+            let recheck = crate::governance::ScreenRecheck {
+                marker: Some(vec!["❯".into()]), placeholder: None,
+                gen_at_verdict: s.output_gen.load(Ordering::Acquire), approval_pending: false,
+            };
+            saved = deliver_head_locked(&fx.daemon, &s, false, false, None, Some(0), None, Some(&recheck), None);
+            if saved.is_some() {
+                success_prefix = prefix;
+                success_after = wp17_ledger_bytes(&fx);
+            }
+            saved.is_some() // NOT written_submitted: partial/pending/refused Some is never replayed.
+        });
+        let d = saved.unwrap_or_else(|| panic!("unknown layout/hint retains ordinary progress: {}", s.inject_track.win_diag.dump()));
+        a2_success_suffix(&success_prefix, &success_after, &s.id.to_string(), &entry_id, reason)
+            .expect("successful-attempt admission audit (non-empty, owned suffix)");
         assert!(d.written_submitted(), "terminal diagnostic: {}", s.inject_track.win_diag.dump());
         assert_eq!(queue_len(&s), 0);
         assert!(wp17_has_admission_record(&fx, reason));

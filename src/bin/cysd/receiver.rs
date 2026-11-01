@@ -2366,6 +2366,21 @@ mod tests {
     }
 
     #[test]
+    fn a2cd_private_root_excludes_unreadable_sibling_not_descendant() {
+        let nodes = [Node { pid: 10, parent: 1 }, Node { pid: 11, parent: 10 }, Node { pid: 12, parent: 10 }];
+        let root = obs(11, 11, "/fixture/claude", &["claude"]);
+        let bad = Err(Failure::Unknown { stage: "persistent-fixture", os_error: Some(5) });
+        let map = HashMap::from([(11, Ok(root)), (12, bad.clone())]);
+        let broad = descendants(&nodes, 10);
+        assert!(matches!(select_receiver(&recipe("claude"), &broad, &map, None), Err(Unknown::CandidateUnreadable(_))));
+        let mut private = vec![(11, 10)]; private.extend(descendants(&nodes, 11));
+        assert_eq!(select_receiver(&recipe("claude"), &private, &map, None), Ok(11));
+        let mut child_nodes = nodes.to_vec(); child_nodes[2].parent = 11;
+        let mut with_child = vec![(11, 10)]; with_child.extend(descendants(&child_nodes, 11));
+        assert!(matches!(select_receiver(&recipe("claude"), &with_child, &map, None), Err(Unknown::CandidateUnreadable(_))));
+    }
+
+    #[test]
     fn incomparable_matches_unreadable_or_absent_candidates_are_unknown() {
         let (tree, map) = table(vec![
             (

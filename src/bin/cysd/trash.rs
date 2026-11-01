@@ -377,7 +377,21 @@ pub fn certify_entry_until(
     dev_of: DevOf,
     session_deadline: Option<Instant>,
 ) -> CertifyResult {
-    let t0 = Instant::now();
+    certify_entry_until_inner(root, dev_of, session_deadline, #[cfg(test)] None)
+}
+
+fn certify_entry_until_inner(
+    root: &Path,
+    dev_of: DevOf,
+    session_deadline: Option<Instant>,
+    #[cfg(test)] probe: Option<&tests::CertifyProbe>,
+) -> CertifyResult {
+    let now = || {
+        #[cfg(test)]
+        if let Some(p) = probe { return p.now(); }
+        Instant::now()
+    };
+    let t0 = now();
     let root_md = std::fs::symlink_metadata(root).map_err(|e| Refusal {
         code: R_UNREADABLE,
         boundary: Some(root.display().to_string()),
@@ -431,9 +445,11 @@ pub fn certify_entry_until(
     // ★B-162: 마지막으로 디스패치에 양보한 시각(간격은 노드 수가 아니라 **시간**이다 · 상수 주석 참조).
     let mut last_yield = t0;
     while let Some((dir, depth)) = stack.pop() {
+        #[cfg(test)]
+        if let Some(p) = probe { p.head_checks.set(p.head_checks.get() + 1); p.head_before_expiry.set(p.now() < p.deadline()); }
         // ★세션 마감 먼저 — 항목별 상한보다 상위다(넘으면 잡 전체가 끝난다).
         if let Some(dl) = session_deadline {
-            if Instant::now() >= dl {
+            if now() >= dl {
                 return Err(Refusal {
                     code: R_SESSION_TOO_SLOW,
                     boundary: Some(dir.display().to_string()),
@@ -443,7 +459,7 @@ pub fn certify_entry_until(
                 });
             }
         }
-        if t0.elapsed().as_secs() > TRASH_CERTIFY_MAX_SECS {
+        if now().duration_since(t0).as_secs() > TRASH_CERTIFY_MAX_SECS {
             return Err(Refusal {
                 code: R_TOO_SLOW,
                 boundary: Some(dir.display().to_string()),
@@ -460,6 +476,10 @@ pub fn certify_entry_until(
         //   (마지막 검사와 다음 검사 사이의 일 = **자식 K개**이고 **폭 W 와 무관**하다) ⒝폭 W 크기의
         //   할당이 사라진다(그래서 조기 거부 경로에서 **해제할 `kids` 가 없다**) ⒞열린 `ReadDir` 핸들은
         //   **언제나 한 개**다(하위 디렉터리는 프런티어에 쌓고 이 루프가 끝난 뒤에 열기 때문이다).
+        #[cfg(test)]
+        let rd = rd.inspect(|ent| {
+            if ent.is_ok() { if let Some(p) = probe { p.pulls.set(p.pulls.get() + 1); } }
+        });
         for ent in rd {
             let ent = ent.map_err(|e| Refusal {
                 code: R_UNREADABLE,
@@ -468,6 +488,8 @@ pub fn certify_entry_until(
             })?;
             let p = ent.path();
             nodes += 1;
+            #[cfg(test)]
+            if let Some(p) = probe { p.visits.set(p.visits.get() + 1); }
             if nodes > TRASH_CERTIFY_MAX_NODES {
                 return Err(Refusal {
                     code: R_TOO_MANY,
@@ -478,11 +500,13 @@ pub fn certify_entry_until(
             // ★MJR-1 — 예산을 **자식 루프 안에서도** 본다. 시간 검사가 디렉터리 루프 머리에만 있으면
             //   자식이 아주 많은 **한** 디렉터리가 예산을 넘겨 끝나고도 `Ok` → `Done` → `Ready` 가 된다
             //   (동결본 `DESIGN-S8.md:103` 의 「up to the budget」이 최악에서 깨진다).
-            //   ★`Instant::now()` 는 **한 번만** 부르고 세 판정이 그 값을 나눠 쓴다(단가를 두 번 내지 않는다).
+            //   ★`now()` 는 **한 번만** 부르고 세 판정이 그 값을 나눠 쓴다(단가를 두 번 내지 않는다).
             if nodes % TRASH_CERTIFY_BUDGET_CHECK_NODES == 0 {
-                let now_i = Instant::now();
+                let now_i = now();
                 if let Some(dl) = session_deadline {
                     if now_i >= dl {
+                        #[cfg(test)]
+                        if let Some(p) = probe { p.child_refusals.set(p.child_refusals.get() + 1); }
                         return Err(Refusal {
                             code: R_SESSION_TOO_SLOW,
                             boundary: Some(p.display().to_string()),
@@ -507,7 +531,7 @@ pub fn certify_entry_until(
                         >= TRASH_CERTIFY_YIELD_EVERY_MILLIS
                 {
                     dispatch_yield();
-                    last_yield = Instant::now();
+                    last_yield = now();
                 }
             }
             let md = std::fs::symlink_metadata(&p).map_err(|e| Refusal {
@@ -553,7 +577,7 @@ pub fn certify_entry_until(
     //   작은 트리(또는 유별나게 느린 lstat 한 번)가 예산을 넘기고도 `Ok` 로 나갈 수 있다.
     //   ⇒ ★`Ready` 로 가는 길에 **예산을 넘긴 순회가 없다**(부서장이 못 박은 성공 기준).
     if let Some(dl) = session_deadline {
-        if Instant::now() >= dl {
+        if now() >= dl {
             return Err(Refusal {
                 code: R_SESSION_TOO_SLOW,
                 boundary: Some(root.display().to_string()),
@@ -563,7 +587,7 @@ pub fn certify_entry_until(
             });
         }
     }
-    if t0.elapsed().as_secs() > TRASH_CERTIFY_MAX_SECS {
+    if now().duration_since(t0).as_secs() > TRASH_CERTIFY_MAX_SECS {
         return Err(Refusal {
             code: R_TOO_SLOW,
             boundary: Some(root.display().to_string()),
@@ -581,7 +605,7 @@ pub fn certify_entry_until(
         max_depth,
         newest_mtime: newest,
         digest: format!("{set_digest:032x}"),
-        walk_secs: t0.elapsed().as_secs_f64(),
+        walk_secs: now().duration_since(t0).as_secs_f64(),
     })
 }
 
@@ -3631,33 +3655,55 @@ mod tests {
     }
 
     // ───────────────────────────────────────────────────────────────────────────────────────
-    // ★⒟′-7 결박 ⒤ — **마감이 「디렉터리 열거 구간」에서도 집행된다**(관문 codex major 1).
-    //   무엇이 결함이었나: 종전 순회는 디렉터리를 **먼저 전수 열거**해 `Vec` 에 모으고 **정렬**한 뒤에야
-    //   자식 루프로 들어갔고, 그 열거·정렬 구간에는 **시간 검사가 하나도 없었다** ⇒ 마지막 마감 검사와
-    //   다음 검사 사이에 **디렉터리 폭 W** 가 들어갔다(**폐기된 결함의 서술** · `O(W log W)`).
-    //   ★**시간을 상수로 단언하지 않는다**(⛔ms 금지): 이 검체는 **같은 실행 안에서 잰 대조값**으로 기준을
-    //   만든다 — ⒜먼저 **같은 픽스처를 마감 없이 전부 인증**하는 비용을 재고(대조) ⒝마감을 그 **1/64** 로
-    //   주고 ⒞답이 그 비용의 **1/8 미만**에 와야 한다.
-    //   ★**이 비(比)가 무엇을 판별하는가 — 판별자는 `took < full/8` 하나다**(codex N2 로 좁힌 문면):
-    //     · 성립하는 주장: 「답의 비용이 **폭 전체 인증 비용의 1/8 미만**이다」 = **폭을 다 걷기 전에
-    //       멈췄다**. 그것이 ⒟′-7(검사가 열거 구간 안에 있다)의 관측 가능한 그림자다.
-    //     · ⛔**성립하지 않는 주장 셋**(종전 문면이 약속했던 것 — 지웠다): ①어디서 멈췄는지의 **정확한
-    //       순회 위치**(비는 상한 하나이고 위치를 측정하지 않는다) ②**전체 순회가 완료됐다**는 단정
-    //       (측정된 것은 K=16384 에서 ratio **0.982** = 전체 비용에 **가깝다**까지다 · M6) ③**무오탐
-    //       보증**(기준이 같은 실행에서 파생돼 상수 ms 단언보다 강건하다는 것까지이고, 거짓 적색이
-    //       **나지 않는다**는 보증은 아니다 — 실측 여유는 맥 debug 7.3× 다).
-    //     · ★판별자의 **해상도**(실측 · M6): 바를 넘는 가장 가까운 셀이 K=2048 이고 그때
-    //       `full` **105.596792 ms** · `took` **14.999666 ms** ⇒ ratio **0.142** > 바 0.125 로 죽는다.
-    //       K=512 는 ratio 0.0332 로 **살아남는다** ⇒ 이 바는 간격 16배 퇴화를 잡고 4배는 잡지 않는다.
-    //   ★S68 ③ 의 수리: 종전 대조는 **순수 열거**(`read_dir().count()`)였다 — 답은 인증 비용인데 바는
-    //   열거 비용이라 **두 모집단을 나눈 비율**이었고, 플랫폼의 열거/인증 비용비가 달라지면 바가
-    //   **뒤집힌다**(윈도우 적색의 기제 · 판정 §6 · 부록2 §5). 양쪽을 **같은 일**로 만들면 비율은
-    //   속도 차가 아니라 **멈춘 지점의 상한**을 준다 — 성립하는 것은 「폭 전체를 걷기
-    //   전에 멈췄다」까지이고 ⛔「폭의 **어디까지** 걸었나」는 **가리키지 못한다**(codex N2).
-    //   ⒟그리고 **경계가 자식 경로**임을 본다: `assert_ne!` 가 경계 == 항목 뿌리를 배제하고
-    //   `Path::starts_with` 가 경계가 **이 항목 안**임을 단언한다 ⇒ 성립하는 주장은 「끊긴 지점이
-    //   **디렉터리 머리도 항목 뿌리도 아니다**」까지다(⛔「순회 중간의 어느 지점」을 특정하지 않는다).
-    // ───────────────────────────────────────────────────────────────────────────────────────
+    // CEO-approved D contract: trace actual iterator pulls at expiry. The retired ratio
+    // remains a real-clock diagnostic below, never evidence of traversal position.
+    /// Call-owned observation only; never compiled into a shipped binary.
+    pub(super) struct CertifyProbe {
+        base: Instant,
+        expire_on_pull: bool,
+        initially_expired: bool,
+        pub(super) pulls: std::cell::Cell<usize>,
+        pub(super) visits: std::cell::Cell<usize>,
+        pub(super) child_refusals: std::cell::Cell<usize>,
+        pub(super) head_checks: std::cell::Cell<usize>,
+        pub(super) head_before_expiry: std::cell::Cell<bool>,
+    }
+    impl CertifyProbe {
+        fn new(expire_on_pull: bool, initially_expired: bool) -> Self {
+            Self { base: Instant::now(), expire_on_pull, initially_expired,
+                pulls: 0.into(), visits: 0.into(), child_refusals: 0.into(),
+                head_checks: 0.into(), head_before_expiry: false.into() }
+        }
+        pub(super) fn deadline(&self) -> Instant { self.base + std::time::Duration::from_nanos(1) }
+        pub(super) fn now(&self) -> Instant {
+            if self.initially_expired || (self.expire_on_pull && self.pulls.get() > 0) { self.deadline() } else { self.base }
+        }
+    }
+
+    // CEO D-1/D-2: literal structural rule; independent of the production cadence constant.
+    fn d_assert_checkpoint(pulls: usize, visits: usize, refusals: usize) {
+        // NO elapsed-time claim on a stalling filesystem: this checks iterator/checkpoint structure only.
+        assert_eq!(pulls, 128, "D structural rule: exactly 128 underlying iterator pulls");
+        assert_eq!(visits, 128, "D structural rule: exactly 128 visits");
+        assert_eq!(refusals, 1, "D structural rule: one child checkpoint refusal");
+    }
+
+    #[test]
+    fn d_contract_negative_cheap_precollection() {
+        let full = std::time::Duration::from_nanos(426_036_300);
+        let took = std::time::Duration::from_millis(10);
+        assert!(took < full / 8, "the old ratio must accept this named synthetic");
+        eprintln!("D1_OLD_RATIO_ACCEPT full={full:?} took={took:?} pulls=16000 visits=128");
+        let red = std::panic::catch_unwind(|| d_assert_checkpoint(16_000, 128, 1));
+        assert!(red.is_err(), "D-1: new rule must reject the old ratio's cheap precollection");
+    }
+
+    #[test]
+    fn d_contract_negative_127_pulls() {
+        assert!(std::panic::catch_unwind(|| d_assert_checkpoint(127, 128, 1)).is_err(),
+            "D-2: literal 128 must reject 127 pulls");
+    }
+
     #[test]
     fn the_deadline_is_enforced_while_a_wide_directory_is_being_enumerated() {
         let root = rig("dp7-wide");
@@ -3668,55 +3714,28 @@ mod tests {
             std::fs::write(entry.join(format!("f{i:06}")), b"").unwrap();
         }
 
-        // ⒜ ★대조 — **같은 픽스처를 마감 없이 전부 인증**하는 비용(S68 ③ · Option A).
-        //   종전 대조는 **순수 열거**(`read_dir().count()`)였다: 검사도 lstat 도 없는 **다른 일**이라
-        //   양쪽이 서로 다른 모집단이었고, 플랫폼의 열거/인증 비용비가 달라지면 바가 **뒤집힌다**
-        //   (윈도우 적색의 기제 · S68 판정 §6). 이제 양쪽이 **같은 노드당 일**이므로 비율은
-        //   속도 차가 아니라 **멈춘 지점의 상한**을 준다 — 성립하는 것은 「폭 전체를 걷기
-    //   전에 멈췄다」까지이고 ⛔「폭의 **어디까지** 걸었나」는 **가리키지 못한다**(codex N2).
+        // Real-clock no-deadline control: certify the same files and retain the full node count.
+        // Its duration remains diagnostic only; a ratio cannot identify iterator pull count.
         let t_ctl = Instant::now();
         let c = certify_entry_until(&entry, &real_dev, None).expect("대조는 인증에 성공해야 한다");
         let full = t_ctl.elapsed();
         assert_eq!(c.nodes, w, "픽스처 전제: 대조가 자식 {w} 개를 전부 방문해야 한다");
-        assert!(
-            full >= std::time::Duration::from_millis(2),
-            "픽스처 전제: 대조값이 너무 작아 마감을 나눌 수 없다({full:?}) — 폭을 키워라"
-        );
-
-        // ⒝ 마감 = 그 일의 1/64 (절대 ms 가 아니라 **이 실행의 측정값에서 파생**한다).
-        let budget = full / 64;
-        let t = Instant::now();
-        let r = certify_entry_until(&entry, &real_dev, Some(Instant::now() + budget))
+        let probe = CertifyProbe::new(true, false);
+        let r = certify_entry_until_inner(&entry, &real_dev, Some(probe.deadline()), Some(&probe))
             .expect_err("예산을 넘긴 순회는 인증이 아니다");
-        let took = t.elapsed();
         assert_eq!(r.code, R_SESSION_TOO_SLOW, "세션 예산 소진 코드여야 한다: {r:?}");
+        assert_eq!(probe.head_checks.get(), 1);
+        assert!(probe.head_before_expiry.get(), "root must be checked before the first yield expires the clock");
+        assert_eq!(probe.now(), probe.deadline(), "subject must end at equality, not beyond it");
+        // NO elapsed-time claim on a stalling filesystem: the locked 128 is an iterator/checkpoint rule.
+        d_assert_checkpoint(probe.pulls.get(), probe.visits.get(), probe.child_refusals.get());
 
-        // ⒞ ★판별 단언. ★**이 단언의 메시지에는 해석을 넣지 않는다**(부서장 형식 2026-10-14):
-        //    메시지는 ⓐ측정값(took·full) ⓑ바(full/8) ⓒ구조적 요구만 적는다 — 「거의 다」·「전부」·
-        //    「어디까지」 같은 **거리 서술 금지**(비는 **상한 하나**이고 그 외는 메시지의 일이 아니다).
-        //    폭 전체를 인증하는 비용의 **1/8 미만**이어야 「폭 전체를 걷기 전에
-        //    멈췄다」가 성립한다. ⛔이것은 **상한**이고 멈춘 **위치의 측정이 아니다**(codex N2).
-        //    이 줄은 took >= full/8 에서 죽는다(= 전체 인증 비용의 12.5% · ⛔「전체에 가까워지면」이
-        //    아니다 — 그 서술은 실측을 8배 넘어섰다).
-        //    ★이 바가 무엇을 잡고 무엇을 못 잡는지 **실측했다**(M6 · 2026-10-14 · 리그에서
-        //    `TRASH_CERTIFY_BUDGET_CHECK_NODES` 를 거친 간격으로 올리며 이 검체를 돌렸다):
-        //      K=128(출하) ratio 0.0195 초록 · K=512 ratio 0.0332 초록 ·
-        //      K=2048 **적색**(0.142) · K=8192 **적색**(0.500) · K=16384 **적색**(0.982).
-        //    ⇒ 이 바는 **검사 간격이 16배 이상 퇴화한 것(K>=2048 · 실측 적색)**(⒟′-7 그 결함 · 간격 16배↑)을
-        //    잡는다. **4배 정도의 간격 퇴화(K=512)는 잡지 않는다** — 그것은 이 검체의 몫이 아니다.
-        //    ★종전 바(`took < ctl/2` · 대조=순수 열거)와의 **측정된 교환**(M6-B · 같은 스윕을
-        //    `ee67d72e` 의 옛 형태에 돌렸다): 옛 바는 **K=512 에서 죽었다**(K=128 ratio 0.2425 ·
-        //    256 0.3628 초록 · 512 적색) ⇒ 이 교체는 **간격 민감도 4배를 내주고 플랫폼 안정성을
-        //    얻은 것**이다. ⛔그러니 "옛 바가 더 엄격했다"며 되돌리지 마라 — 옛 바는 **다른 모집단**
-        //    (열거 비용)을 재서 윈도우에서 **거짓 적색**이었고, 그것이 S68 ③ 의 결함이다.
-        //    ⛔바를 `full/32` 로 조이는 것도 하지 마라: K=128 의 실측 비율이 0.0170~0.0195 라
-        //    여유가 1.6~1.8× 로 떨어져 느린·부하 높은 러너에서 거짓 적색이 돌아온다(지금은 7.3×).
-        assert!(
-            took < full / 8,
-            "⒟′-7 요구 미충족 — 요구: took < full/8 · 값: took={took:?} · full={full:?} · \
-             바=full/8 · 폭 w={w} · 구조적 요구: 열거와 방문이 한 루프여야 하고 검사 간격이 그 루프 \
-             안에 있어야 한다."
-        );
+        // Non-gating real-clock diagnostics retain the retired full/took/ratio observation.
+        let t = Instant::now();
+        let diagnostic = certify_entry_until(&entry, &real_dev, Some(Instant::now() + full / 64));
+        let took = t.elapsed();
+        eprintln!("D_REAL_CLOCK full={full:?} took={took:?} ratio={} outcome={diagnostic:?} (non-gating)",
+            took.as_secs_f64() / full.as_secs_f64());
         // ⒟ 경계가 자식 경로다(머리 검사는 디렉터리를, 루프 뒤 검사는 항목 뿌리를 적는다).
         let b = r.boundary.clone().expect("경계가 있어야 한다");
         assert_ne!(b, entry.display().to_string(), "경계가 항목 뿌리면 순회 중간에서 끊긴 것이 아니다");
@@ -3725,6 +3744,43 @@ mod tests {
             "경계가 이 항목 안이어야 한다(★문자열 접두가 아니라 **경로**로 비교한다 — addendum-1 교훈): {b}"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn d_expired_root_refuses_before_any_iterator_pull() {
+        let root = rig("d-root");
+        std::fs::write(root.join("one"), b"").unwrap();
+        let p = CertifyProbe::new(false, true);
+        let r = certify_entry_until_inner(&root, &real_dev, Some(p.deadline()), Some(&p)).expect_err("expired root");
+        assert_eq!(r.code, R_SESSION_TOO_SLOW);
+        assert_eq!(r.boundary.as_deref(), Some(root.to_str().unwrap()));
+        assert_eq!(p.pulls.get(), 0, "root check must precede enumeration");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn d_expired_tail_refuses_without_a_certificate() {
+        let root = rig("d-tail");
+        for i in 0..7 { std::fs::write(root.join(format!("f{i}")), b"").unwrap(); }
+        let p = CertifyProbe::new(true, false);
+        let r = certify_entry_until_inner(&root, &real_dev, Some(p.deadline()), Some(&p)).expect_err("expired tail must not certify");
+        assert_eq!(r.code, R_SESSION_TOO_SLOW);
+        assert_eq!(r.boundary.as_deref(), Some(root.to_str().unwrap()));
+        assert_eq!(p.pulls.get(), 7);
+        assert_eq!(p.child_refusals.get(), 0, "width below the child checkpoint");
+        let control = CertifyProbe::new(true, false);
+        let c = certify_entry_until_inner(&root, &real_dev, None, Some(&control)).expect("no deadline control");
+        assert_eq!((c.nodes, control.pulls.get(), control.visits.get()), (7, 7, 7));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn d_public_wrapper_forwards_deadline_and_real_clock() {
+        let root = rig("d-wrapper");
+        let r = certify_entry_until(&root, &real_dev, Some(Instant::now())).expect_err("public wrapper must forward expired deadline");
+        assert_eq!(r.code, R_SESSION_TOO_SLOW);
+        assert!(certify_entry_until(&root, &real_dev, None).is_ok());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     // ───────────────────────────────────────────────────────────────────────────────────────
