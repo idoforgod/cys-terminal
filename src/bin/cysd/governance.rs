@@ -20978,21 +20978,23 @@ mod tests {
     }
 
     /// A1: a true callback means terminal ATTEMPT, never successful delivery. A receipt
-    /// survives settlement clearing the live reservation. Changed IDs also terminate, even
+    /// retains the first request ID and admission ordinal after settlement clears the live reservation.
+    /// Changed IDs also terminate, even
     /// on a bad removal. Callers retain their exact outcome assertions after this window.
     fn a1_queue_window(
         s: &Arc<crate::state::Surface>,
         mut attempt: impl FnMut(),
         window: impl FnOnce(&mut dyn FnMut() -> bool) -> bool,
-    ) -> (Option<String>, usize) {
+    ) -> (Option<(String, usize)>, usize) {
         let original: Vec<_> = s.pending_queue.lock().unwrap().iter().map(|e| e.id.clone()).collect();
         let receipt = std::rc::Rc::new(std::cell::RefCell::new(None));
         let mut attempts = 0;
         window(&mut || {
             attempts += 1;
             let slot = receipt.clone();
+            let ordinal = attempts;
             let _observer = crate::agent_queue_tests::p1_on_queue_reserved(s.id, move |_, request| {
-                *slot.borrow_mut() = Some(request.id.clone());
+                slot.borrow_mut().get_or_insert((request.id.clone(), ordinal));
             });
             attempt();
             let after: Vec<_> = s.pending_queue.lock().unwrap().iter().map(|e| e.id.clone()).collect();
@@ -21035,8 +21037,16 @@ mod tests {
         let proof = Arc::new(Refuse(std::sync::atomic::AtomicUsize::new(0)));
         *s.receiver_proof.lock().unwrap() = Some(proof.clone());
         let (mut depth, mut starve, mut prior) = (HashMap::new(), HashMap::new(), HashMap::new());
+        let mut calls = 0;
         let (receipt, attempts) = a1_queue_window(&s, || {
+            calls += 1;
             paint_prompt(&s, "", "");
+            // A valid pre-admission rejection must not count as a post-admission retry.
+            if calls == 1 {
+                s.output_gen.fetch_add(1, AtomicOrdering::AcqRel);
+                s.parser.lock().unwrap().process(b"\x1b[2J\x1b[H");
+                s.output_gen.fetch_add(1, AtomicOrdering::AcqRel);
+            }
             *s.last_output.lock().unwrap() = Instant::now();
             *s.last_human_input.lock().unwrap() = None;
             deliver_queued(&daemon, &mut depth, &mut starve, &mut prior);
@@ -21044,15 +21054,24 @@ mod tests {
             s.output_gen.fetch_add(1, AtomicOrdering::AcqRel);
             s.parser.lock().unwrap().process(b"");
             s.output_gen.fetch_add(1, AtomicOrdering::AcqRel);
-        }, |attempt| crate::state::test_done_or_quiet_window(
-            || s.output_gen.load(AtomicOrdering::Acquire), false, 3, 0, attempt));
+        }, |attempt| {
+            if cfg!(windows) {
+                // Native Windows keeps the existing fixture helper's bound and scheduling.
+                crate::state::test_done_or_no_pty_output(&s, attempt)
+            } else {
+                // Exercise its non-Unix ordering branch here without a timing premise.
+                crate::state::test_done_or_quiet_window(
+                    || s.output_gen.load(AtomicOrdering::Acquire), false, 3, 0, attempt)
+            }
+        });
         let proof_calls = proof.0.load(AtomicOrdering::Relaxed);
         let remaining = s.pending_queue.lock().unwrap().len();
         // Teardown precedes every discriminator, including when a mutant breaks the latch.
-        crate::state::test_stop_daemon(&daemon);
+        crate::state::p1_e0_stop_daemon(&daemon);
         assert!(receipt.is_some(), "negative control must reach actual queue admission");
+        assert_eq!(attempts, receipt.as_ref().unwrap().1,
+            "A1 must stop at the admitted refusal, not retry dirty output");
         assert_eq!(proof_calls, 1, "negative control must reach the writer refusal");
-        assert_eq!(attempts, 1, "A1 must stop at the admitted refusal, not retry dirty output");
         assert_eq!(remaining, 0, "A1 post-admission refusal must keep the delivery assertion RED");
     }
 
@@ -21076,7 +21095,7 @@ mod tests {
         }, |attempt| crate::state::test_done_or_quiet_window(
             || s.output_gen.load(AtomicOrdering::Acquire), false, 3, 0, attempt));
         let after: Vec<_> = s.pending_queue.lock().unwrap().iter().map(|e| e.id.clone()).collect();
-        crate::state::test_stop_daemon(&daemon);
+        crate::state::p1_e0_stop_daemon(&daemon);
         assert_eq!(attempts, 1, "A1 partial removal must terminate before a second attempt");
         assert!(receipt.is_none(), "ID change is terminal but never an admission receipt");
         assert_eq!(after, original[1..]);
@@ -21100,7 +21119,7 @@ mod tests {
             }
             (super::composer_measured_empty(&s), super::seat_input_line_visibility(&s))
         });
-        crate::state::test_stop_daemon(&daemon);
+        crate::state::p1_e0_stop_daemon(&daemon);
         assert!(attempts >= 2, "the injected publish must invalidate the first window");
         assert_eq!(result, (false, (Some(true), Some(true))), "A1 must repaint before the accepted observation");
     }
