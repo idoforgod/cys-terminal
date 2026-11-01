@@ -1116,6 +1116,19 @@ def _win_state_dir_for_socket(socket):
     return _snap_mod()._win_state_dir_for_socket(socket)
 
 
+def effective_socket(socket):
+    """★0.14.57 P4: 이 프로세스의 레인 하나 — `--socket`, 없으면 `cys` 가 고를 환경 소켓(src/lib.rs socket_path 와 같은 순서).
+    진입에서 한 번 정해 상태 경로·세대 선택·자식 명령에 같은 값을 쓴다. 종전에는 `--socket` 없이 부서 환경에서 돌면 상태 경로와
+    세대는 본부(LIVE_STATE), 자식 `cys` 는 CYS_SOCKET 의 부서로 갈라졌다. 어디에도 없으면 None = 기본 소켓 = 본부(양쪽 같다)."""
+    if socket:
+        return socket
+    for key in ("CYS_SOCKET", "JAVIS_SOCKET", "AITERM_SOCKET"):
+        value = os.environ.get(key)
+        if value:
+            return value
+    return None
+
+
 def state_dir_for(socket):
     """소켓 경로에서 데몬 상태 디렉터리를 파생. unix=소켓 부모(하네스 격리 계약과 동일) ·
     Windows=named pipe 슬러그 매핑(Rust state_dir 규칙 — 파이프엔 파일시스템 부모가 없다)."""
@@ -1479,7 +1492,7 @@ def _base_topology_in_generation(gen_dir):
     if not os.path.exists(mp):
         tp = os.path.join(gen_dir, "topology.json")
         return tp if os.path.exists(tp) else None
-    with open(mp, encoding="utf-8") as f:
+    with _snap_mod().safe_open(mp, encoding="utf-8") as f:
         files = json.load(f)["files"]
     want = os.path.normcase(os.path.realpath(os.path.join(LIVE_STATE, "topology.json")))
     for e in files:
@@ -1510,7 +1523,8 @@ def _snapshot_roster_entries(socket, skipped=None):
             tp = _base_topology_in_generation(os.path.join(gen_root, g))
             if tp is None:
                 continue
-            t = json.load(open(tp, encoding="utf-8"))
+            with _snap_mod().safe_open(tp, encoding="utf-8") as f:
+                t = json.load(f)
             return {e["role"]: e for e in t.get("entries", []) if e.get("role")}
         except Exception:
             if skipped is not None:
@@ -1537,7 +1551,8 @@ def _snapshot_tombstones(socket):
             tp = _base_topology_in_generation(os.path.join(gen_root, g))
             if tp is None:
                 continue
-            t = json.load(open(tp, encoding="utf-8"))
+            with _snap_mod().safe_open(tp, encoding="utf-8") as f:
+                t = json.load(f)
             return set(x for x in t.get("tombstones", []) if isinstance(x, str))
         except Exception:
             continue
@@ -1955,7 +1970,8 @@ def _desired_view(socket, rebase=False, intents=None, intents_truncated=False):
     if intents and not intents_truncated:
         _apply_intents_to_tombstones(intents, tombstones)
 
-    # 우선순위: 기존 desired < 세대 스냅샷 < 현재 topology (최신 관측이 메타를 갱신). ★P2-1: ephemeral 제외(미래 유입 차단).
+    # 우선순위: 세대 스냅샷 < 기존 desired < 현재 topology. 세대는 desired 가 모르는 역할만 채운다 — 최대 6시간 묵은 사본이
+    #   desired 의 더 새로운 세션 핀을 되돌리면 안 된다(0.14.57 P4 VIEW-5 실측). ★P2-1: ephemeral 제외(미래 유입 차단).
     _skipped = []
     if _snapshot_roster_entries is _SNAPSHOT_ROSTER_ENTRIES:
         _snap = _snapshot_roster_entries(socket, _skipped)  # 출하 함수: P7 의 파싱 실패 세대 목록을 함께 받는다
@@ -1965,7 +1981,7 @@ def _desired_view(socket, rebase=False, intents=None, intents_truncated=False):
         _snap = _snapshot_roster_entries(socket)
     for role, e in _snap.items():
         if not _is_ephemeral_role(role, e):
-            roster[role] = e
+            roster.setdefault(role, e)
     for e in topo.get("entries", []):
         if e.get("role") and not _is_ephemeral_role(e["role"], e):
             roster[e["role"]] = e
@@ -2041,8 +2057,11 @@ def _observe_and_persist_roster_locked(socket, rebase=False):
         # ★codex W3 BLOCKING(1): degraded provenance 영속 — 복구본의 recovered_from 을 다음 write 로 이월해
         #   부활 보류가 auto-retry 전반에 지속되게 한다. 해제 조건: 검증된-건강 topology replace(_healthy_replace)
         #   또는 운영자 --rebase(rebase) — 그때만 provenance 를 떨궈 정상 복귀. 그 외에는 계속 보류(fail-safe).
+        #   ★0.14.57 P4: source=snapshot 은 건강한 replace 로 풀리지 않는다 — --rebase 로만 풀린다. 그 경로는 0.14.56 까지 닿지
+        #   않았고(exit 6 · 사람 개입) 사람 없이 부활을 진행시키는 것을 승인한 티켓이 없다. CEO 판정 전까지의 기본값이다.
         _prev_prov = p["prev"].get("recovered_from")
-        if isinstance(_prev_prov, dict) and not p["healthy_replace"] and not rebase:
+        if isinstance(_prev_prov, dict) and not rebase \
+                and (not p["healthy_replace"] or _prev_prov.get("source") == "snapshot"):
             _out["recovered_from"] = _prev_prov
         try:
             _atomic_write_json(desired_roster_path(socket), _out, keep_bak=True)
@@ -3144,7 +3163,8 @@ def _run_restore_locked(socket, ticket="default", stub=False, no_breaker=False, 
                **_c6_result_fields(c6),
                "degraded": _c2_degraded, "held_roles": target_roles,
                "note": ("retention 파일 손상→폴백 복원(recovered_from 영속)으로 묘비 불확실 — 부활 보류(fail-safe). "
-                        "복귀: 검증된-건강 topology replace 또는 `phoenix roster --rebase`.")}
+                        "복귀: 검증된-건강 topology replace 또는 `phoenix roster --rebase` "
+                        "(source=snapshot 은 `--rebase` 로만 풀린다).")}
         if print_result:
             print(json.dumps(out, ensure_ascii=False, indent=2))
         return out
@@ -4947,6 +4967,7 @@ def main():
     dp.add_argument("--no-breaker", action="store_true")
 
     args = ap.parse_args()
+    args.socket = effective_socket(args.socket)  # ★0.14.57 P4: 레인 하나 — 이 뒤로 상태 경로·세대 선택·자식 명령이 같은 값을 쓴다
     # ★W1/B3·§5-1: cys 실행 경로를 여기서(소켓 인지 후) 해석한다 — PHOENIX_CYS > which('cys') > 표준경로
     #   폴백(identity-check·STRICT/하네스 금지). 리터럴 'cys' 최종 폴백 제거로 FileNotFoundError 침묵사를 차단.
     #   미해석/불일치는 _resolve_cys 내부에서 die(exit 6)로 정직 정지한다(라이브 실증 2026-07-06 근원 수리).

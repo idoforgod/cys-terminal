@@ -58,6 +58,8 @@ _FAKE_CLI = r'''#!%s -B
 import json, os, sys
 a = sys.argv[1:]
 if a[:1] == ["--socket"]:
+    with open(os.environ["FAKE_CYS_LOG"] + ".socket", "a") as f:
+        f.write(a[1] + "\n")
     a = a[2:]
 with open(os.environ["FAKE_CYS_LOG"], "a") as f:
     f.write(json.dumps(a) + "\n")
