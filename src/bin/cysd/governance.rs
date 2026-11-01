@@ -28136,6 +28136,9 @@ mod tests {
         let codes = [LANE_FOUND, LANE_EMPTY, LANE_ABSENT, LANE_MISMATCH, GENERATION_ABSENT, MANIFEST_UNREADABLE, MANIFEST_UNDATED,
                      STORED_MISSING, MANIFEST_INTEGRITY, COPY_UNREADABLE, STORE_REFUSED, STORE_UNREADABLE, DATALESS_POLICY_UNSET];
         assert_eq!(codes.iter().collect::<std::collections::BTreeSet<_>>().len(), codes.len(), "two states share a code");
+        // The same strings as `_LANE_READ` in javis_phoenix.py. Phoenix is on another branch, so the strings themselves are pinned here.
+        assert_eq!(codes, ["found", "lane_empty", "lane_absent", "lane_mismatch", "generation_absent", "manifest_unreadable", "manifest_undated",
+                           "stored_missing", "manifest_integrity", "copy_unreadable", "store_refused", "store_unreadable", "dataless_policy_unset"]);
         let tmp = p0_scratch("codes");
         let (me, other) = (p0_lane_dir(&tmp, "cys-dept-dept-5"), p0_lane_dir(&tmp, "cys-dept-dept-6"));
         let socket = me.join("cys.sock");
