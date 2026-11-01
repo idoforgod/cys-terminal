@@ -10,7 +10,7 @@
   "branch": "work/0.14.56-native-feasibility",
   "host": "windows-latest",
   "rust_toolchain": "1.98.0",
-  "earliest_start_utc": "2026-11-01T04:00:00+00:00",
+  "earliest_start_utc": "2026-11-01T03:30:00+00:00",
   "latest_start_utc": "2026-11-01T08:00:00+00:00",
   "latest_end_utc": "2026-11-01T08:30:00+00:00",
   "collection_deadline_utc": "2026-11-01T09:00:00+00:00",
