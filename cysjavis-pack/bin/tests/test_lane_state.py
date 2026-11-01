@@ -500,6 +500,16 @@ class Paths(Base):
         control("P1R mixed aliases: verifier equals autopilot=%s" % (mixed["ap"][:4] == mixed["vf"]))
         self.assertEqual(mixed["ap"][:4], mixed["vf"])
 
+    def test_autopilot_and_verifier_agree_through_a_symlink(self):
+        real = os.path.dirname(self.sock("dept-3"))
+        os.makedirs(real)
+        alias = os.path.join(self.home, "socket-alias")
+        os.symlink(real, alias)
+        got = self.probe(CYS_SOCKET=os.path.join(alias, "cys.sock"))
+        control("P1R3 through a symlink: verifier equals autopilot=%s" % (got["ap"][:4] == got["vf"]))
+        self.assertEqual(got["ap"][:4], got["vf"])
+        self.assertEqual(got["ap"][0], self.expected("cys-dept-dept-3"))
+
     def test_mode_knob_is_per_lane_and_fails_toward_shadow(self):
         base_dir = self.expected("cys")
         os.makedirs(base_dir)
