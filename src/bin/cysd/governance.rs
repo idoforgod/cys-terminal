@@ -27626,7 +27626,7 @@ mod tests {
         // that signal inside the SAME 30 s stop budget; unknown/changed is never called death.
         let retained_exit=p7_wait_retained_exit(|| retained.recheck(), || stop_at.elapsed(), stop_bound,
             || std::thread::sleep(Duration::from_millis(5)));
-        retained_exit.as_ref().unwrap_or_else(|e| panic!("p7 retained exit not proven: {e}; {witness}"));
+        retained_exit.as_ref().unwrap_or_else(|e| panic!("p7 retained exit not proven: {e}; {witness}")); // wallclock: guard waits for actual retained Dead; the 5 ms is pacing, not death evidence
         let pid_alive=crate::state::pid_alive(s.pid);
         assert!(!pid_alive,"fixture child not reaped: pid_alive={pid_alive} retained_exit={retained_exit:?} elapsed={:?}; {witness}",stop_at.elapsed());
         struct RestoreExit(Arc<crate::state::Surface>);

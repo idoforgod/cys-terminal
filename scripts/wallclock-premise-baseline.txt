@@ -268,7 +268,6 @@ src/bin/cysd/main.rs::first_line_idle_tests::established_connection_survives_idl
 src/bin/cysd/main.rs::first_line_idle_tests::silent_client_persists_without_the_cap_instrument_validity
 src/bin/cysd/main.rs::startup_lock_retry_tests::retry_loop_wins_the_lock_a_doctor_briefly_held
 src/bin/cysd/main.rs::write_stall_tests::slow_but_progressing_reader_is_not_cut
-src/bin/cysd/native_publication.rs::tests::native_core_stages_privately_and_activates_only_after_matching_capability
 src/bin/cysd/pending_requests.rs::tests::c8protocol_selection_fsync_holds_exclusion_without_native_mutex_or_early_data
 src/bin/cysd/pending_requests.rs::tests::c8registry_busy_close_revokes_authority_without_waiting_for_fsync
 src/bin/cysd/pending_requests.rs::tests::c8registry_status_does_not_wait_for_fsync_or_publish_a_capability_early

@@ -995,9 +995,103 @@ mod tests {
         fn validate_transition_and_retokenization(&self,_:&TransitionRecord)->Result<String,String> { Err("no durable record".into()) }
     }
 
+    const C2_CHILD_ROOT: &str = "C2_NATIVE_CHILD_ROOT";
+    const C2_TEST: &str = "native_publication::tests::native_core_stages_privately_and_activates_only_after_matching_capability";
+    const C2_COMPLETE: &str = "C2_NATIVE_COMPLETE";
+
+    struct C2OwnedChild(std::process::Child);
+    impl C2OwnedChild {
+        fn stop_and_reap(&mut self) -> Result<(), String> {
+            if self.0.try_wait().map_err(|e| e.to_string())?.is_some() { return Ok(()); }
+            self.0.kill().map_err(|e| format!("owned child stop: {e}"))?;
+            let end = Instant::now() + Duration::from_secs(5);
+            loop { // wallclock: guard bounds reaping only the directly owned child
+                if self.0.try_wait().map_err(|e| e.to_string())?.is_some() { return Ok(()); }
+                if Instant::now() >= end { return Err("owned child cleanup uncertain".into()); }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
+    impl Drop for C2OwnedChild {
+        fn drop(&mut self) {
+            if let Err(e) = self.stop_and_reap() { eprintln!("C2 CLEANUP FAILURE: {e}"); }
+        }
+    }
+
+    fn c2_private_branch() -> bool {
+        use crate::state::HideConsole;
+        use std::process::{Command, Stdio};
+        if let Some(raw) = std::env::var_os(C2_CHILD_ROOT) {
+            let root = std::path::PathBuf::from(raw);
+            // An inherited sentinel alone must FAIL, never bypass isolation.
+            assert_eq!(std::env::var_os("HOME"), Some(root.join("home").into_os_string()), "unowned C2 sentinel");
+            assert_eq!(std::env::var_os("CYS_PACK_DIR"), Some(root.join("pack").into_os_string()), "unowned C2 pack");
+            assert!(!std::fs::symlink_metadata(&root).unwrap().file_type().is_symlink());
+            let parent = process_observation::observe(std::process::id()).expect("child native identity").identity.parent;
+            assert!(root.file_name().unwrap().to_string_lossy().starts_with(&format!("cys-c2-{parent}-")));
+            let end = Instant::now() + Duration::from_secs(5);
+            let owner = loop { // wallclock: guard waits for the direct parent's post-spawn ownership record
+                match std::fs::read_to_string(root.join("owner")) {
+                    Ok(v) => break v,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound && Instant::now() < end => std::thread::sleep(Duration::from_millis(2)),
+                    Err(e) => panic!("C2 ownership record missing: {e}"),
+                }
+            };
+            assert_eq!(owner, format!("{parent} {}", std::process::id()), "sentinel did not name this directly owned child");
+            eprintln!("C2_PRIVATE_ROOT pid={} parent={parent}", std::process::id());
+            return true;
+        }
+        let root = std::env::temp_dir().join(format!("cys-c2-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir(&root).expect("exclusive C2 root");
+        let root = root.canonicalize().unwrap();
+        for name in ["home", "pack", "local", "roaming", "tmp"] { std::fs::create_dir(root.join(name)).unwrap(); }
+        let output_path = root.join("output.log");
+        let output = std::fs::File::create(&output_path).unwrap();
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.hide_console();
+        cmd.env_clear();
+        for key in ["PATH", "SystemRoot", "WINDIR", "LANG", "LC_ALL", "LC_CTYPE"] {
+            if let Some(value) = std::env::var_os(key) { cmd.env(key, value); }
+        }
+        cmd.args(["--exact", C2_TEST, "--test-threads=1", "--nocapture"])
+            .env(C2_CHILD_ROOT, &root).env("HOME", root.join("home"))
+            .env("USERPROFILE", root.join("home")).env("LOCALAPPDATA", root.join("local"))
+            .env("APPDATA", root.join("roaming")).env("TEMP", root.join("tmp")).env("TMP", root.join("tmp"))
+            .env("TMPDIR", root.join("tmp")).env("CYS_PACK_DIR", root.join("pack"))
+            .env("RUST_MIN_STACK", std::env::var_os("RUST_MIN_STACK").unwrap_or_else(|| "8388608".into()))
+            .current_dir(&root).stdin(Stdio::null()).stdout(output.try_clone().unwrap()).stderr(output);
+        let mut child = C2OwnedChild(cmd.spawn().expect("owned exact-test child"));
+        drop(cmd); // release parent-side log handles before reading/removing the output
+        std::fs::write(root.join("owner.tmp"), format!("{} {}", std::process::id(), child.0.id())).unwrap();
+        std::fs::rename(root.join("owner.tmp"), root.join("owner")).unwrap();
+        let end = Instant::now() + Duration::from_secs(60);
+        let status = loop { // wallclock: guard bounds the isolated test process, not receiver correctness
+            if let Some(status) = child.0.try_wait().expect("owned child status") { break status; }
+            if Instant::now() >= end {
+                child.stop_and_reap().expect("timed-out child cleanup");
+                panic!("C2 exact-test child exceeded 60 s; evidence at {}", root.display());
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(std::fs::metadata(&output_path).unwrap().len() < 1_048_576, "unexpected child-output volume");
+        let output = std::fs::read_to_string(&output_path).unwrap();
+        for line in output.lines() { eprintln!("C2 child | {line}"); }
+        assert!(status.success(), "C2 child failed; evidence at {}", root.display());
+        assert_eq!(output.lines().filter(|l| l.contains(C2_COMPLETE)).count(), 1, "completion marker must occur exactly once");
+        assert_eq!(output.lines().filter(|l| l.starts_with("test result: ok. 1 passed; 0 failed;")).count(), 1,
+            "exact child must execute one test, not zero or the whole harness");
+        // Cleanup is bounded independently; uncertainty is a failure, never a rerun.
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || { let _ = tx.send(std::fs::remove_dir_all(root)); });
+        rx.recv_timeout(Duration::from_secs(5)).expect("C2 scratch cleanup guard").expect("C2 scratch cleanup");
+        false
+    }
+
     #[cfg(any(target_os="macos",target_os="linux",windows))]
     #[test]
     fn native_core_stages_privately_and_activates_only_after_matching_capability() {
+        if !c2_private_branch() { return; }
         let observation=process_observation::observe(std::process::id()).unwrap();
         let bin=std::path::Path::new(std::str::from_utf8(&observation.identity.executable).unwrap())
             .file_name().unwrap().to_str().unwrap().to_string();
@@ -1018,10 +1112,18 @@ mod tests {
         // schedule refuses with Busy, the arm sleeps and retries, and an attempt after the release is admitted.
         // (AdmissionBusy takes the same arm; the executor lock that produces it is private to receiver.rs.)
         let (held,holding)=mpsc::channel();let owner=c.clone();
+        let (release,released)=mpsc::channel();
+        let mut release=Some(release);
         let holder=std::thread::spawn(move||{
-            let core=owner.core.lock().unwrap();held.send(()).unwrap();std::thread::sleep(Duration::from_millis(50));drop(core);
+            let core=owner.core.lock().unwrap();held.send(()).unwrap();
+            // A dropped sender also releases on assertion unwind. Timeout is a hang failure, not readiness.
+            let _ = released.recv_timeout(Duration::from_secs(10));
+            drop(core);
         });
         holding.recv_timeout(Duration::from_secs(10)).expect("core holder started");
+        // Deliberately yield before scheduling: elapsed time is not the release signal.
+        for _ in 0..100 { std::thread::yield_now(); }
+        assert!(c.core.try_lock().is_err(), "holder must survive delayed first scheduling");
         let mut retries=0u32;
         loop {
         let (tx,task_cell)=(tx.clone(),c.clone());
@@ -1049,11 +1151,18 @@ mod tests {
             tx.send(outcome).unwrap();
         });
         match scheduled {
-            Ok(())=>break,
+            Ok(())=>{ assert!(release.is_none(), "first schedule must observe the acknowledged core hold"); break },
             Err(CoreError::Busy)|Err(CoreError::Start(StartRefusal::AdmissionBusy)) if Instant::now()<deadline=>
-                { retries+=1;std::thread::sleep(Duration::from_millis(2)) }
+                { retries+=1;
+                  if let Some(release)=release.take() { release.send(()).expect("release holder after observed Busy"); }
+                  std::thread::sleep(Duration::from_millis(2)) }
             Err(e)=>panic!("native fixture admission did not become available: {e:?}"),
         }
+        }
+        let joined_by=Instant::now()+Duration::from_secs(10);
+        while !holder.is_finished() { // wallclock: guard bounds joining the released holder, never lock readiness
+            assert!(Instant::now()<joined_by,"released core holder did not exit");
+            std::thread::sleep(Duration::from_millis(2));
         }
         holder.join().unwrap();
         assert!(retries>=1,"the Busy/AdmissionBusy retry arm did not run (the core holder did not make the first attempt Busy)");
@@ -1063,6 +1172,7 @@ mod tests {
             Err(panic)=>std::panic::resume_unwind(panic),
         }
         assert_eq!(executor.counters().started.load(Ordering::Acquire),1);
+        eprintln!("{C2_COMPLETE}");
     }
 
     #[test]
