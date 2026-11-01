@@ -10,16 +10,21 @@ VIEW   caller 1, `_desired_view`, end to end through `plan` and `run_restore` wi
        knows is named in snapshot_only_roles, not restored: by decision.
 RECOV  caller 2, `_recover_retention_file`, end to end through `run_restore`.
 DEPT   P0: the same two callers for a department lane, whose only protection from the other lanes' copies is the lookup.
+WORDS  the 13 reason strings as literals: each is what the read reports in its state, and its source emits nothing else.
+AGREE  the same 13 against the daemon's const block in src/bin/cysd/governance.rs, by line. If the file holds no block, the
+       output says NOT MEASURED by name, as its last line.
 
 The fake `cys restore` is faithful on one point that matters here: it starts what topology.json lists, nothing else.
 
   python3 test_phoenix_snapshot_base_key.py                  this tree, exit 0 = all PASS
   python3 test_phoenix_snapshot_base_key.py --module <file>  the same checks on another javis_phoenix.py (a pin)
 """
+import ast
 import hashlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import sys
 
@@ -29,7 +34,12 @@ sys.dont_write_bytecode = True
 import phoenix_plan_rig as R  # noqa: E402
 
 SNAP = os.path.normpath(os.path.join(HERE, "..", "javis_state_snapshot.py"))
+GOVERNANCE = os.path.normpath(os.path.join(HERE, "..", "..", "..", "src", "bin", "cysd", "governance.rs"))
 OLD_T, NEW_T = 1790000000, 1790021600        # two generations, 6 h apart
+
+# The 13 lane-read reasons, written out here. Nothing fills this list from the code under test: a list taken from that code pins nothing.
+LANE_READ_WORDS = ["found", "lane_empty", "lane_absent", "lane_mismatch", "generation_absent", "manifest_unreadable", "manifest_undated",
+                   "stored_missing", "manifest_integrity", "copy_unreadable", "store_refused", "store_unreadable", "dataless_policy_unset"]
 
 
 def load_snapshot_module():
@@ -781,12 +791,209 @@ def breaker_checks(w, check):
         m._now = real_now
 
 
+def reason_emissions(phoenix_src, snapshot_src):
+    """Every reason the Python read can emit, from its source: (line, word) pairs, and the lines that do not resolve to a word. The only
+    name it follows is the policy code, read from its own line in javis_state_snapshot.py. Anything else that is not a literal is unresolved."""
+    tree = ast.parse(phoenix_src)
+    fns = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    policy = re.findall(r'^DATALESS_POLICY_CODE = "([^"]*)"', snapshot_src, re.M)
+    words, unresolved = [], []
+
+    def take(e):
+        if isinstance(e, ast.IfExp):
+            take(e.body)
+            take(e.orelse)
+        elif isinstance(e, ast.Constant) and isinstance(e.value, str):
+            words.append((e.lineno, e.value))
+        elif isinstance(e, ast.Attribute) and e.attr == "DATALESS_POLICY_CODE" and len(policy) == 1:
+            words.append((e.lineno, policy[0]))
+        else:
+            unresolved.append(e.lineno)
+
+    for n in ast.walk(fns["_lane_topology_in_generation"]):
+        if isinstance(n, ast.Return):
+            if isinstance(n.value, ast.Tuple) and len(n.value.elts) == 2:
+                reason = n.value.elts[1]
+                if not (isinstance(reason, ast.Constant) and reason.value is None):
+                    take(reason)
+            else:
+                unresolved.append(n.lineno)
+    for n in ast.walk(fns["_read_lane_topology"]):
+        if isinstance(n, ast.Assign):
+            for t in n.targets:
+                target = ast.get_source_segment(phoenix_src, t)
+                if target == 'read["reason"]':
+                    if ast.get_source_segment(phoenix_src, n.value) != 'read["reason"] or reason':     # the callee's reason, passed on
+                        take(n.value)
+                elif target.startswith('read["passed_over"][') and target != 'read["passed_over"][reason]':
+                    take(t.slice)
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Assign):
+            for t in n.targets:
+                if isinstance(t, ast.Subscript) and isinstance(t.value, ast.Name) and t.value.id == "_LANE_READ":
+                    unresolved.append(n.lineno)
+                elif isinstance(t, ast.Name) and t.id == "_LANE_READ":
+                    if not isinstance(n.value, ast.Dict):
+                        unresolved.append(n.lineno)
+                        continue
+                    for k, v in zip(n.value.keys, n.value.values):
+                        if isinstance(k, ast.Constant) and k.value == "reason" and not (isinstance(v, ast.Constant) and v.value is None):
+                            take(v)
+    return words, unresolved
+
+
+def rust_reason_block(path):
+    """The daemon's reason block, read by line: the run of `const X: &str = "...";` lines around the first one holding one of the 13.
+    Returns (first line, words, lines holding one of the 13 outside the run), or None when the file holds none of them."""
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        lines = f.read().split("\n")
+    const = re.compile(r'\s*(?:pub(?:\(\w+\))?\s+)?const\s+\w+\s*:\s*&(?:\'static\s+)?str\s*=\s*"([^"]*)"\s*;')
+    hits = [i for i, line in enumerate(lines) if const.match(line) and const.match(line).group(1) in LANE_READ_WORDS]
+    if not hits:
+        return None
+    start = end = hits[0]
+    while start > 0 and const.match(lines[start - 1]):
+        start -= 1
+    while end + 1 < len(lines) and const.match(lines[end + 1]):
+        end += 1
+    return start + 1, [const.match(line).group(1) for line in lines[start:end + 1]], [i + 1 for i in hits if i > end]
+
+
+def agreement_checks(w, check):
+    """The 13 reasons. Returns the NOT MEASURED line when the daemon's block is not in this tree, else None."""
+    m, rig = w.m, w.rig
+    sock = os.path.join(w.dept_dir, "cys.sock")
+    dept_src = os.path.join(w.dept_dir, "topology.json")
+    marker = "rig-only-%d" % os.getpid()
+    rig.assert_sealed(sock)
+    axes = {"HOME": os.environ["HOME"] == rig.home, "cwd": os.getcwd() == rig.root, "TMPDIR": os.environ["TMPDIR"].startswith(rig.root + os.sep),
+            "CYS_SOCKET": "CYS_SOCKET" not in os.environ, "state-dir env": not [k for k in os.environ if k.startswith(R.STATE_ENV_PREFIXES)],
+            "state dir": m.state_dir_for(sock) == os.path.realpath(w.dept_dir),
+            "generation store": os.path.join(m.HOME, ".cys", "state-generations") == rig.gen_root}
+    check("WORDS-0 each axis by name: %s" % ", ".join(axes), all(axes.values()), [k for k, ok in axes.items() if not ok])
+
+    def one(tombs=(marker,)):
+        w.reset()
+        g = w.gen(NEW_T, dept=R.topo(["dept-role"], tombs=list(tombs)), base=R.topo(["master"]))
+        return w.gen_path(g, w.stored_as(g, dept_src)), w.gen_path(g, "manifest.json")
+
+    def edit(path, fn):
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+        fn(d)
+        R._write(path, d)
+
+    def row_of(d):
+        return [e for e in d["files"] if e["source"] == dept_src][0]
+
+    def not_listed():
+        w.reset()
+        w.gen(NEW_T, base=R.topo(["master"]), other_dept=R.topo(["other-role"], tombs=["other-gone"]))
+
+    def row_at_another_lane():
+        w.reset()
+        g = w.gen(NEW_T, dept=R.topo(["dept-role"], tombs=["dept-gone"]), other_dept=R.topo(["other-role"], tombs=["other-gone"]))
+        foreign = w.gen_path(g, w.stored_as(g, os.path.join(w.dept_dir + "-b", "topology.json")))
+        with open(foreign, "rb") as f:
+            raw = f.read()
+        edit(w.gen_path(g, "manifest.json"), lambda d: row_of(d).update(
+            stored_as=os.path.basename(foreign), sha256=hashlib.sha256(raw).hexdigest(), size=len(raw)))
+
+    def torn():
+        R._write(one()[1], "{ torn")
+
+    def undated():
+        edit(one()[1], lambda d: d.pop("created_at"))
+
+    def gone():
+        os.remove(one()[0])
+
+    def longer():
+        with open(one()[0], "ab") as f:
+            f.write(b" ")
+
+    def not_a_topology():
+        copy, man = one()
+        body = '{"entries": []}'
+        R._write(copy, body)
+        edit(man, lambda d: row_of(d).update(sha256=hashlib.sha256(body.encode("utf-8")).hexdigest(), size=len(body)))
+
+    def in_the_tree():
+        one()
+        tree = os.path.join(rig.home, "Desktop", "CYSjavis")
+        shutil.rmtree(tree, ignore_errors=True)
+        os.makedirs(tree)
+        dest = os.path.join(tree, "store")
+        shutil.move(rig.gen_root, dest)
+        os.symlink(dest, rig.gen_root)
+
+        def undo():
+            os.remove(rig.gen_root)
+            shutil.rmtree(tree)
+        return undo
+
+    def cannot_be_listed():
+        one()
+        os.chmod(rig.gen_root, 0)
+        return lambda: os.chmod(rig.gen_root, 0o755)
+
+    def no_policy():
+        one()
+        snap, real = m._snap_mod(), m._snap_mod()._dataless_gate
+        snap._dataless_gate = lambda: False
+        return lambda: setattr(snap, "_dataless_gate", real)
+
+    states = [("found", one), ("lane_empty", lambda: one(())), ("lane_absent", not_listed), ("lane_mismatch", row_at_another_lane),
+              ("generation_absent", w.reset), ("manifest_unreadable", torn), ("manifest_undated", undated), ("stored_missing", gone),
+              ("manifest_integrity", longer), ("copy_unreadable", not_a_topology), ("store_refused", in_the_tree),
+              ("store_unreadable", cannot_be_listed), ("dataless_policy_unset", no_policy)]
+    check("WORDS-1 13 distinct words, one state for each, in the list's order",
+          len(set(LANE_READ_WORDS)) == 13 and [word for word, _ in states] == LANE_READ_WORDS, [word for word, _ in states])
+    for word, setup in states:
+        undo = setup()
+        try:
+            t = m._read_lane_topology(sock)
+        finally:
+            if callable(undo):
+                undo()
+        check("WORDS-2 the read reports %s in its state" % word, m._LANE_READ["reason"] == word, m._LANE_READ)
+        if word == "found":
+            check("WORDS-2a the store read is the rig's: the marker planted there comes back", t and t["tombstones"] == [marker], t)
+
+    with open(m.__file__, encoding="utf-8") as f:
+        phoenix_src = f.read()
+    with open(SNAP, encoding="utf-8") as f:
+        snapshot_src = f.read()
+    sites, unresolved = reason_emissions(phoenix_src, snapshot_src)
+    print("     emission sites by source line: %s" % ", ".join("%d %s" % s for s in sorted(sites)))
+    outside = sorted(set(word for _, word in sites) - set(LANE_READ_WORDS))
+    check("WORDS-3 the Python read emits no reason outside the 13: %d sites" % len(sites), sites and not outside and not unresolved,
+          "outside %s, unresolved lines %s" % (outside, unresolved))
+    check("WORDS-4 and every one of the 13 has a site", set(word for _, word in sites) == set(LANE_READ_WORDS),
+          sorted(set(LANE_READ_WORDS) - set(word for _, word in sites)))
+
+    block = rust_reason_block(GOVERNANCE)
+    if block is None:
+        note = "NOT MEASURED AGREE-1: %s holds no reason block on this branch, 0 of 13 compared with the daemon" % os.path.relpath(
+            GOVERNANCE, os.path.join(HERE, "..", "..", ".."))
+        print(note)
+        return note
+    start, found, strays = block
+    check("AGREE-1 the daemon's block at governance.rs:%d holds the same 13 words" % start, sorted(found) == sorted(LANE_READ_WORDS) and not strays,
+          "only in the block %s, only in the list %s, outside the block at lines %s"
+          % (sorted(set(found) - set(LANE_READ_WORDS)), sorted(set(LANE_READ_WORDS) - set(found)), strays))
+    return None
+
+
 def main(argv):
     target = R.PH
     if argv[:1] == ["--module"]:
         target = os.path.abspath(argv[1])
     rig = R.Rig(prefix="phx-p4-")
     check = R.Checks()
+    not_measured = None
     try:
         m = rig.load(path=target, name="javis_phoenix_p4")
         if not hasattr(m, "_LANE_READ"):      # --module on a tree from before P0: the checks read red, they do not crash
@@ -799,9 +1006,13 @@ def main(argv):
         recover_checks(w, check)
         dept_checks(w, check)
         breaker_checks(w, check)
+        not_measured = agreement_checks(w, check)
     finally:
         rig.close()
-    return check.finish()
+    rc = check.finish()
+    if not_measured:
+        print(not_measured)     # after the count, so a tail of this output cannot read as the agreement having passed
+    return rc
 
 
 if __name__ == "__main__":
