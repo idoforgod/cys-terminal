@@ -358,6 +358,20 @@ def key_checks(w, check):
     if os.path.exists(sockets_log):      # KEY-9b reads this file for its own run
         os.remove(sockets_log)
 
+    # the phoenix reader takes the same boundary as the snapshot tool: no policy, nothing opened, a named and counted refusal
+    w.reset()
+    w.gen(NEW_T, dept=R.topo(["dept-role"], tombs=["dept-gone"]), base=R.topo(["master"]))
+    snap = m._snap_mod()
+    real_gate, n0 = snap._dataless_gate, snap.policy_refusals()
+    snap._dataless_gate = lambda: False
+    try:
+        got = m._snapshot_tombstones(sock)
+    finally:
+        snap._dataless_gate = real_gate
+    check("KEY-12 the policy cannot be set: nothing is read, code dataless_policy_unset, counted",
+          got is None and m._LANE_READ["passed_over"] == {"dataless_policy_unset": 1} and snap.policy_refusals() == n0 + 1,
+          "%s %s" % (got, m._LANE_READ))
+
     # the same department reached implicitly: no --socket, only the environment a department seat exports
     w.reset(live=R.LIVE_W2_GONE)
     w.gen(NEW_T, base=R.topo(["master", "base-only-role"]), dept=R.topo(["dept-master"]))

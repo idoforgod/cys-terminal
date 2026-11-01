@@ -1504,6 +1504,8 @@ def _lane_topology_in_generation(gen_dir, state):
         with snap.safe_open(os.path.join(gen_dir, "manifest.json"), encoding="utf-8") as f:
             man = json.load(f)
         files = list(man["files"])
+    except snap.DatalessPolicyRefused:
+        return None, snap.DATALESS_POLICY_CODE
     except Exception:
         return None, "manifest_unreadable"
     created = man.get("created_at")
@@ -1534,6 +1536,8 @@ def _lane_topology_in_generation(gen_dir, state):
     try:
         with snap.safe_open(os.path.join(gen_dir, name), binary=True) as f:
             raw = f.read()
+    except snap.DatalessPolicyRefused:
+        return None, snap.DATALESS_POLICY_CODE
     except Exception:
         return None, "stored_missing"
     if len(raw) != row.get("size") or hashlib.sha256(raw).hexdigest() != row.get("sha256"):
@@ -1550,8 +1554,8 @@ def _lane_topology_in_generation(gen_dir, state):
 # 마지막 레인 판독의 결론 {reason, passed_over: {코드: 세대 수}, generation} — `_read_lane_topology` 만 쓴다. 코드는 데몬(governance.rs)과 같은
 #   문자열이다: found 묘비가 있는 이 레인 사본 · lane_empty 이 레인 사본이 있고 묘비는 정당하게 비었다 · lane_absent manifest 에 이 레인이 없다(스냅샷
 #   없는 레인) · lane_mismatch 행은 찾았는데 저장 키가 살아 있는 키가 아니다(잘못된 주소의 신호) · generation_absent 세대가 없다 · manifest_unreadable manifest 없음/판독 불가 · manifest_undated 날짜를 댈 수 없다 · stored_missing 행의 저장 파일이
-#   없다 · manifest_integrity 저장 파일이 행과 어긋난다 · copy_unreadable 행과 맞는 바이트가 topology 가 아니다. 빈 결과 자체는 어느 검사가
-#   발화했는지의 증거가 아니다 — 근거는 이 코드다.
+#   없다 · manifest_integrity 저장 파일이 행과 어긋난다 · copy_unreadable 행과 맞는 바이트가 topology 가 아니다 · dataless_policy_unset 내려받기 금지
+#   정책을 세우지 못해 열지 않았다(이 코드만 phoenix 쪽이다). 빈 결과 자체는 어느 검사가 발화했는지의 증거가 아니다 — 근거는 이 코드다.
 _LANE_READ = {"reason": None, "passed_over": {}, "generation": None}
 
 

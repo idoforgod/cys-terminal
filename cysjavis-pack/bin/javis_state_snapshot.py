@@ -50,6 +50,7 @@ import stat
 import sys
 import tempfile
 import time
+import unicodedata
 from datetime import datetime, timedelta, timezone
 
 HOME = os.path.expanduser("~")
@@ -108,7 +109,7 @@ def _dept_state_dirs(state_root, depts_json=None, windows=None, localappdata=Non
             return False
         return True
     try:
-        for name in os.listdir(state_root):
+        for name in os.listdir(state_root) if add(state_root) else []:
             if name.startswith("cys-dept-"):
                 p = os.path.join(state_root, name)
                 if add(p) and os.path.isdir(p):
@@ -116,7 +117,7 @@ def _dept_state_dirs(state_root, depts_json=None, windows=None, localappdata=Non
     except OSError:
         pass
     dj = depts_json or os.path.join(os.path.dirname(os.path.dirname(state_root)), ".cys", "depts.json")
-    if os.path.isfile(dj):
+    if add(dj) and os.path.isfile(dj):
         try:
             with safe_open(dj, encoding="utf-8-sig") as f:
                 reg = json.load(f)
@@ -126,7 +127,9 @@ def _dept_state_dirs(state_root, depts_json=None, windows=None, localappdata=Non
                 sock = meta.get("socket") if isinstance(meta, dict) else None
                 if isinstance(sock, str) and sock:
                     if win:
-                        dirs.add(os.path.realpath(_win_state_dir_for_socket(sock, localappdata=localappdata)))
+                        wd = _win_state_dir_for_socket(sock, localappdata=localappdata)
+                        if add(wd):
+                            dirs.add(os.path.realpath(wd))
                     elif add(os.path.dirname(sock)):
                         dirs.add(os.path.realpath(os.path.dirname(sock)))
         except Exception:
@@ -183,7 +186,7 @@ def project_round_dir(env=None, cwd=None):
             break
     if not pack_key_set and env.get("HOME"):
         cand = os.path.join(env["HOME"], ".cys", "pack", "round")
-        if os.path.isdir(cand):
+        if not _capture_refused(cand, env["HOME"]) and os.path.isdir(cand):
             return cand
     return os.path.join(cwd or os.getcwd(), "_round")
 
@@ -210,7 +213,8 @@ CAPTURE_LANE_GLOBS = ("*soul.md",)
 CAPTURE_MEMORY_GLOBS = ("*.md",)
 CAPTURE_PATTERNS = ("state", "registry", "lane", "round", "agent-memory")
 SF_DATALESS = 0x40000000           # macOS: 내용이 로컬에 없는 파일. 열면 내려받는다 — stat 으로만 잰다.
-IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_PROCESS, IOPOL_MATERIALIZE_DATALESS_FILES_OFF = 3, 0, 1  # <sys/resource.h>
+IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD, IOPOL_MATERIALIZE_DATALESS_FILES_OFF = 3, 1, 1  # <sys/resource.h>
+DATALESS_POLICY_CODE = "dataless_policy_unset"   # 정책을 세우지 못해 읽지 않았다 — 조용한 건너뛰기가 아니라 이름 있고 세는 거부다
 
 
 def _capture_excluded(path):
@@ -226,24 +230,60 @@ class DatalessFile(OSError):
     """SF_DATALESS 가 선 파일 — 열지 않았다. 호출자는 stat 값만 쓸 수 있다."""
 
 
+class DatalessPolicyRefused(OSError):
+    """내려받기 금지 정책을 세우고 되읽어 확인하지 못했다 — 열지 않았다. 호출자는 이 파일을 읽은 것으로 치지 않는다."""
+
+
+def _policy_libc():
+    import ctypes
+    return ctypes.CDLL(None, use_errno=True)
+
+
 def _dataless_gate():
-    """macOS: 이 프로세스에서 dataless 내용 내려받기를 끈다(setiopolicy_np). 판별기가 아니라 안전벨트다 — 판별은 언제나
+    """macOS: 호출 스레드에서 dataless 내용 내려받기를 끈다(setiopolicy_np)고 되읽어 확인한다. 판별기가 아니라 안전벨트다 — 판별은 언제나
     SF_DATALESS 플래그고, 이 정책은 stat 과 open 사이에 내용이 빠져나간 경우에도 읽기가 내려받기가 아니라 오류가 되게 한다.
+    ★스레드 범위다: 프로세스 범위는 fork·exec 자식으로 상속된다(실측) — phoenix 의 자식이 띄운 데몬과 좌석까지 번지면 그들의 읽기가 깨진다.
     True=켜짐 · False=켜지 못함 · None=해당 없음(macOS 가 아님)."""
     if sys.platform != "darwin":
         return None
     try:
-        import ctypes
-        libc = ctypes.CDLL(None, use_errno=True)
-        return libc.setiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_PROCESS,
-                                   IOPOL_MATERIALIZE_DATALESS_FILES_OFF) == 0
+        libc = _policy_libc()
+        args = (IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD)
+        if libc.getiopolicy_np(*args) == IOPOL_MATERIALIZE_DATALESS_FILES_OFF:
+            return True
+        return libc.setiopolicy_np(*args, IOPOL_MATERIALIZE_DATALESS_FILES_OFF) == 0 \
+            and libc.getiopolicy_np(*args) == IOPOL_MATERIALIZE_DATALESS_FILES_OFF
     except Exception:
         return False
 
 
+_policy_refused, _policy_reported = 0, 0
+
+
+def policy_refusals():
+    return _policy_refused
+
+
+def _refuse_without_policy(path):
+    """모든 독립 읽기 경로의 첫 줄이다(`safe_open`) — 정책이 서기 전에는 stat 도 open 도 없다. 플래그 검사는 경계가 아니다: 검사와 open 사이에 내려갈 수 있다."""
+    global _policy_refused
+    if _dataless_gate() is False:
+        _policy_refused += 1
+        raise DatalessPolicyRefused(errno.EPERM, DATALESS_POLICY_CODE, path)
+
+
+def _report_policy_refusals():
+    """FAILURE 한 줄 — 세대 줄 뒤 마지막 줄이다. 건수는 이 프로세스의 거부 전부다."""
+    global _policy_reported
+    if _policy_refused != _policy_reported:
+        _policy_reported = _policy_refused
+        print("[snapshot] FAILURE %s=%d: nothing was read, no generation is complete" % (DATALESS_POLICY_CODE, _policy_refused))
+
+
 def safe_open(path, encoding=None, binary=False):
     """★읽기 경계 하나(0.14.57 P5 R2 · 오너 규칙): 레지스트리·manifest·소스는 전부 여기로 연다. 판별은 SF_DATALESS 플래그뿐이다
-    (blocks==0 은 심링크를 잡는다). 열기 전 stat, 열고 나서 첫 바이트 전에 fstat — 선택과 복사 사이에 내용이 빠져나간 파일도 읽지 않는다."""
+    (blocks==0 은 심링크를 잡는다). 정책을 먼저 세우고, 열기 전 stat, 열고 나서 첫 바이트 전에 fstat — 선택과 복사 사이에 내용이 빠져나간 파일도 읽지 않는다."""
+    _refuse_without_policy(path)
     if _is_dataless(os.stat(path)):
         raise DatalessFile(errno.EAGAIN, "SF_DATALESS, not opened", path)
     f = open(path, "rb") if binary else open(path, encoding=encoding)   # encoding=None 은 기본 코덱이다 — 과거 manifest 판독이 쓴다
@@ -256,15 +296,24 @@ def safe_open(path, encoding=None, binary=False):
     return f
 
 
+def _boundary_key(path, darwin=None):
+    """경계 비교값. macOS 볼륨은 대소문자·유니코드 정규형을 가리지 않는 것이 기본이다 — `desktop/cysjavis` 는 같은 inode 다(실측). 그 트리 안을
+    밟지 않고는 볼륨을 물을 수 없으니 macOS 에서는 언제나 접어서 비교한다. 가리는 볼륨이면 과거부 쪽으로 틀린다(그쪽이 안전한 방향이다)."""
+    c = os.path.normcase(path)
+    if sys.platform == "darwin" if darwin is None else darwin:
+        return unicodedata.normalize("NFC", c).casefold()
+    return c
+
+
 def _capture_refused(path, home=HOME):
     """`<home>/Desktop/CYSjavis` 와 그 아래는 생성 도구가 **어떤 방식으로도** 들여다보지 않는다 — 훑기도 stat 도 아니다.
     그래서 realpath 를 쓰지 않는다(realpath 는 링크 대상의 구성요소를 lstat 한다). 경로를 앞에서부터 한 칸씩 밟되 **문자열 비교가 먼저**고,
     밖에 있는 구성요소만 lstat·readlink 한다. 링크가 그 트리를 가리키면 readlink 값만 보고 멈춘다. 첫 lstat 은 트리 밖에서 끝난다."""
-    tree = os.path.normcase(os.path.join(os.path.realpath(os.path.join(home, "Desktop")), "CYSjavis"))
-    lexical = os.path.normcase(os.path.join(os.path.abspath(home), "Desktop", "CYSjavis"))
+    tree = _boundary_key(os.path.join(os.path.realpath(os.path.join(home, "Desktop")), "CYSjavis"))
+    lexical = _boundary_key(os.path.join(os.path.abspath(home), "Desktop", "CYSjavis"))
 
     def inside(p):
-        c = os.path.normcase(p)
+        c = _boundary_key(p)
         return any(c == t or c.startswith(t + os.sep) for t in (tree, lexical))
 
     cur = os.path.abspath(path)
@@ -361,7 +410,7 @@ def capture_files(roots, home=HOME, notes=None):
     return out
 
 
-def _registry_pack_dirs(depts_json):
+def _registry_pack_dirs(depts_json, home=HOME):
     """depts.json 의 부서별 pack_dir → ([(부서명, pack_dir)] 이름순, [레지스트리 문제 기술]).
     ⛔레지스트리 실패가 본부·발화 레인 적재를 죽이지 않는다(그 레인들은 레지스트리 없이도 선언된다).
     ★B317-R1 M3(codex) + HEAD/CEO fail-closed: 판독 실패를 「부서 0개」로 접지 않는다 — 문제는 do_snapshot 이
@@ -371,6 +420,8 @@ def _registry_pack_dirs(depts_json):
       · 판독·디코딩·파싱 실패, 최상위·`depts` 꼴 불일치 = 레지스트리 문제 1건(부서 레인을 하나도 알 수 없다).
       · 항목 꼴 불일치(객체 아님 · pack_dir 이 비어 있거나 문자열 아님) = 그 항목 문제 1건 — ⛔유효한 다른 항목은 버리지 않는다.
     GC 쪽(_lane_caps)은 별도 판정이다 — 같은 문제에서 부재를 판정하지 않고 전 레인 48 을 유지한다."""
+    if _capture_refused(depts_json, home):       # 여는 일이 그 트리를 읽는 일이다 — 필터가 뒤에 있으면 늦다
+        return [], ["%s [refused: covenant tree]" % depts_json]
     try:
         with safe_open(depts_json, encoding="utf-8-sig") as f:
             reg = json.load(f)
@@ -415,7 +466,7 @@ def capture_lanes(home=HOME, env=None, depts_json=None, faults=None):
             lanes.append((lane, rd, card))
 
     base_pack = os.path.join(home, ".cys", "pack")
-    if os.path.isdir(base_pack):
+    if not _capture_refused(base_pack, home) and os.path.isdir(base_pack):
         # ★본부 카드 자리 `~/_round` 는 이 배치(본부 master 가 홈에서 돈다 → 부트가 홈의 _round 를 찾는다)의 사실이다.
         #   그 디렉터리가 없는 설치에서는 선언하지 않는다(매 세대 거짓 「누락」 금지 · R2). 디렉터리가 있는데 카드가 없으면
         #   선언된 채 누락으로 뜬다(fail-closed).
@@ -423,7 +474,7 @@ def capture_lanes(home=HOME, env=None, depts_json=None, faults=None):
         bcard = (os.path.join(base_card_dir, ROUND_CARD)
                  if not _capture_refused(base_card_dir, home) and os.path.isdir(base_card_dir) else None)
         _add(BASE_LANE, os.path.join(base_pack, "round"), bcard)
-    entries, errs = _registry_pack_dirs(depts_json or os.path.join(home, ".cys", "depts.json"))
+    entries, errs = _registry_pack_dirs(depts_json or os.path.join(home, ".cys", "depts.json"), home)
     if faults is not None:
         faults.extend(errs)
     for name, pack in entries:
@@ -670,6 +721,11 @@ def do_snapshot(sources=None, gen_root=GEN_ROOT, dry_run=False, crash_hook=None,
     ★B317-R1 M3 + HEAD/CEO: 레지스트리 문제(registry_faults)는 manifest `missing` 에 올라 세대가 INCOMPLETE 로 표시되고,
       요약 줄(phoenix-snapshot-6h 가 `| tail -3` 으로 master 에 push 하는 본문)에 INCOMPLETE 가 찍힌다. rc 는 종전대로 0."""
     gate = _dataless_gate()
+    if gate is False:                   # 읽기 전이다: 세대를 만들지 않는다. dataless_gate: false 인 세대는 없다
+        global _policy_refused
+        _policy_refused += 1
+        _report_policy_refusals()
+        return None
     registry_faults = []
     census = None
     if sources is None:
@@ -717,7 +773,7 @@ def do_snapshot(sources=None, gen_root=GEN_ROOT, dry_run=False, crash_hook=None,
         if cards:
             print(f"[dry-run] 레인별 정본 카드 {len(cards)}건:")
             for lane in sorted(cards):
-                print(f"  * {lane} -> {cards[lane]}  ({'있음' if os.path.isfile(cards[lane]) else '없음'})")
+                print(f"  * {lane} -> {cards[lane]}  ({'있음' if not _capture_refused(cards[lane]) and os.path.isfile(cards[lane]) else '없음'})")
         if incomplete:
             print(f"[dry-run]{incomplete}")
         if census is not None:
@@ -1147,6 +1203,8 @@ def _lane_caps(home=HOME, depts_json=None):
     dj = depts_json or os.path.join(home, ".cys", "depts.json")
     registered = None
     try:
+        if _capture_refused(dj, home):
+            raise OSError(errno.EPERM, "refused: covenant tree", dj)
         with safe_open(dj, encoding="utf-8-sig") as f:
             depts = json.load(f)["depts"]
         if not isinstance(depts, dict):
@@ -1156,7 +1214,8 @@ def _lane_caps(home=HOME, depts_json=None):
             pd = meta.get("pack_dir") if isinstance(meta, dict) else None
             if not (isinstance(pd, str) and pd):
                 raise TypeError("dept entry without a pack_dir")
-            rounds.add(os.path.realpath(os.path.join(pd, "round")))
+            rd = os.path.join(pd, "round")
+            rounds.add(rd if _capture_refused(rd, home) else os.path.realpath(rd))
             names.add(os.path.basename(os.path.normpath(pd)))
         registered = rounds
     except Exception:
@@ -1171,7 +1230,7 @@ def _lane_caps(home=HOME, depts_json=None):
         pack = os.path.dirname(key)
         if os.path.basename(pack) == "pack" or os.path.realpath(pack) == base_pack:
             return KEEP_RECENT          # 본부 팩 — 부서 항목이 아니므로 결코 부재가 아니다
-        if os.path.realpath(key) in registered or os.path.basename(pack) in names:
+        if (key if _capture_refused(key, home) else os.path.realpath(key)) in registered or os.path.basename(pack) in names:
             return KEEP_RECENT
         return ABSENT_LANE_KEEP
 
@@ -1511,6 +1570,14 @@ def do_self_test():
 
 
 def main():
+    rc = _main()
+    if policy_refusals():
+        _report_policy_refusals()
+        return rc or 1
+    return rc
+
+
+def _main():
     # ★Windows 패리티(S5): 과거 os.name=="nt" hard-gate 는 제거됐다 — 디렉터리 fsync 를 Windows 에서 건너뛰고
     # (_fsync_path) os.rename(동일 볼륨 원자 승격)에 의존하므로 snapshot/list/gc/verify 가 Windows 에서 동작한다.
     ap = argparse.ArgumentParser(description="cys 상태 파일 세대 보관기 (무손실 복원 Phase 0)")

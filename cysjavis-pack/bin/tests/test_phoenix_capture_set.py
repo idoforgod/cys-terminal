@@ -461,6 +461,284 @@ def t_dataless_boundary(root):
     check("T13i the kernel policy is set on macOS, not applicable elsewhere", gate is (True if sys.platform == "darwin" else None), gate)
 
 
+FRESH_READER = r"""
+import builtins, ctypes, importlib.util, json, os, subprocess, sys, types
+spec = importlib.util.spec_from_file_location("snap_fresh", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+mode, target = sys.argv[2], sys.argv[3]
+events = []
+real_open, real_stat, real_os_open = builtins.open, os.stat, os.open
+watched = sys.argv[4] if len(sys.argv) > 4 else target
+
+
+def note(kind, path):
+    if str(path).startswith(watched):
+        events.append(kind)
+
+
+def spy_open(file, *a, **k):
+    note("open", file)
+    return real_open(file, *a, **k)
+
+
+def spy_stat(path, *a, **k):
+    note("stat", path)
+    return real_stat(path, *a, **k)
+
+
+def spy_os_open(path, *a, **k):
+    note("open", path)
+    return real_os_open(path, *a, **k)
+
+
+class Libc:
+    def __init__(self, set_rc, get_after):
+        self.value, self.set_rc, self.get_after = 2, set_rc, get_after
+
+    def getiopolicy_np(self, *a):
+        events.append("policy-get")
+        return self.value
+
+    def setiopolicy_np(self, *a):
+        events.append("policy-set")
+        self.value = self.get_after
+        return self.set_rc
+
+
+out = {}
+if mode == "order":
+    if sys.platform == "darwin":
+        real_libc = m._policy_libc
+
+        class Rec:
+            def __getattr__(self, name):
+                fn = getattr(real_libc(), name)
+                return lambda *a: (events.append("policy-" + name[:3]), fn(*a))[1]
+        m._policy_libc = Rec
+    builtins.open, os.stat, os.open = spy_open, spy_stat, spy_os_open
+    try:
+        m.safe_open(target).read()
+    finally:
+        builtins.open, os.stat, os.open = real_open, real_stat, real_os_open
+    out["events"] = events
+    if sys.platform == "darwin":
+        libc = ctypes.CDLL(None)
+        out["thread"] = libc.getiopolicy_np(3, 1)
+        code = "import ctypes; l = ctypes.CDLL(None); print(l.getiopolicy_np(3, 0), l.getiopolicy_np(3, 1))"
+        out["child"] = subprocess.check_output([sys.executable, "-I", "-c", code], text=True).split()
+elif mode in ("set-fails", "readback-fails"):
+    m.sys = types.SimpleNamespace(platform="darwin")
+    m._policy_libc = lambda: Libc(-1, 2) if mode == "set-fails" else Libc(0, 2)
+    builtins.open, os.stat, os.open = spy_open, spy_stat, spy_os_open
+    try:
+        m.safe_open(target)
+        out["raised"] = None
+    except m.DatalessPolicyRefused as e:
+        out["raised"] = e.strerror
+    finally:
+        builtins.open, os.stat, os.open = real_open, real_stat, real_os_open
+    out.update(events=events, refusals=m.policy_refusals())
+elif mode == "cli":
+    m._dataless_gate = lambda: False
+    sys.argv = ["javis_state_snapshot.py", target]
+    builtins.open, os.open = spy_open, spy_os_open
+    try:
+        rc = m.main()
+    finally:
+        builtins.open, os.open = real_open, real_os_open
+    out.update(rc=rc, events=events, refusals=m.policy_refusals())
+sys.stderr.write(json.dumps(out))
+"""
+
+
+def fresh(td, mode, target, watched=None, home=None):
+    """A process that has run nothing else, which is how a standalone reader starts."""
+    script = os.path.join(td, "fresh_reader.py")
+    w(script, FRESH_READER)
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("CYS_", "JAVIS_", "AITERM_")) and k != "CLAUDE_CONFIG_DIR"}
+    env["HOME"] = home or td
+    sealed(td, env["HOME"], target if os.sep in target else td)
+    p = subprocess.run([sys.executable, "-I", "-B", script, SNAP, mode, target] + ([watched] if watched else []),
+                       capture_output=True, text=True, env=env, cwd=td)
+    try:
+        out = json.loads(p.stderr.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        out = {"crash": p.stderr[-400:]}
+    return out, p.stdout
+
+
+def t_policy_before_every_read(root):
+    """R2-1. A flag check before open is not a boundary: the policy is set and read back first, in a fresh process, and a failure to
+    set it is a named, counted refusal with no open. No real SF_DATALESS file exists here."""
+    td = os.path.join(root, "policy")
+    f = os.path.join(td, "manifest.json")
+    w(f, "{}")
+    out, _ = fresh(td, "order", f)
+    ev = out.get("events", [])
+    if sys.platform == "darwin":
+        check("T14a a fresh reader: the policy is set and read back before the first stat or open of the file",
+              ev[:3] == ["policy-get", "policy-set", "policy-get"] and ev[3:] == ["stat", "open"], ev)
+        check("T14b it is on, for this thread", out.get("thread") == 1, out.get("thread"))
+        check("T14c it does not reach a child process: a daemon or seat started from here reads as before",
+              out.get("child") == ["2", "0"], out.get("child"))
+    else:
+        check("T14a off macOS nothing is asked of the kernel", ev == ["stat", "open"], ev)
+    for mode, name in (("set-fails", "the set fails"), ("readback-fails", "the set says yes and the read-back says no")):
+        out, _ = fresh(td, mode, f)
+        ev = out.get("events", [])
+        check("T14d %s: refused by name, counted, no stat, no open" % name,
+              out.get("raised") == "dataless_policy_unset" and out.get("refusals") == 1 and "open" not in ev and "stat" not in ev, out)
+    home = os.path.join(td, "home")
+    src = os.path.join(home, "_round", "SESSION_STATE.md")
+    w(src, "card\n")
+    gen_root = os.path.join(home, ".cys", "state-generations")
+    m = load()
+    os.environ["_CYS_SNAPSHOT_NOW"] = "1790000000"
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            name = m.do_snapshot(sources=[src], gen_root=gen_root)
+    finally:
+        os.environ.pop("_CYS_SNAPSHOT_NOW", None)
+    for cmd in ("verify", "gc"):
+        out, stdout = fresh(td, "cli", cmd, watched=home, home=home)
+        last = stdout.strip().splitlines()[-1] if stdout.strip() else ""
+        check("T14e standalone %s: no open under the home, FAILURE on the last line, counted, rc non-zero" % cmd,
+              out.get("events") == [] and "FAILURE dataless_policy_unset=" in last and out.get("refusals", 0) >= 1 and out.get("rc") == 1,
+              "%s | %s" % (out, last[:80]))
+    before = sorted(os.listdir(gen_root))
+    out, stdout = fresh(td, "cli", "snapshot", watched=home, home=home)
+    last = stdout.strip().splitlines()[-1] if stdout.strip() else ""
+    check("T14f snapshot refused: no generation, no open, FAILURE on the last line, rc non-zero",
+          sorted(os.listdir(gen_root)) == before and out.get("events") == [] and "FAILURE dataless_policy_unset=1" in last and out.get("rc") == 1,
+          "%s | %s" % (out, last[:80]))
+    m2 = load()
+    m2._dataless_gate = lambda: False
+    with contextlib.redirect_stdout(io.StringIO()) as buf:
+        got = m2.do_snapshot(sources=[src], gen_root=os.path.join(td, "gens2"))
+    check("T14g do_snapshot called directly: None, no generation claimed, the line is printed", got is None
+          and not os.path.exists(os.path.join(td, "gens2")) and "FAILURE dataless_policy_unset=1" in buf.getvalue(), buf.getvalue()[:80])
+
+
+class BoundarySpy:
+    """Every I/O call on a path at or under `watched`. lstat, islink and readlink of a link are how the guard reads it, so they are
+    allowed on the link itself and nowhere else."""
+    SPIED = ((os, "listdir"), (os, "scandir"), (os, "stat"), (os.path, "isdir"), (os.path, "isfile"), (os.path, "exists"),
+             (os.path, "getsize"), (builtins, "open"), (os, "open"))
+    LINK_READS = ((os, "lstat"), (os.path, "islink"), (os, "readlink"))
+
+    def __init__(self, watched, links=()):
+        self.watched, self.links, self.touched, self.saved = list(watched), list(links), [], {}
+
+    def __enter__(self):
+        def wrap(obj, name, allow_link):
+            real = getattr(obj, name)
+            self.saved[(obj, name)] = real
+
+            def spy(path=".", *a, **k):
+                try:
+                    r = os.fspath(path)
+                except TypeError:
+                    r = None
+                if isinstance(r, str) and not (allow_link and r in self.links):
+                    if any(r == t or r.startswith(t + os.sep) for t in self.watched):
+                        self.touched.append((name, r))
+                return real(path, *a, **k)
+            setattr(obj, name, spy)
+        for obj, name in self.SPIED:
+            wrap(obj, name, False)
+        for obj, name in self.LINK_READS:
+            wrap(obj, name, True)
+        return self
+
+    def __exit__(self, *exc):
+        for (obj, name), real in self.saved.items():
+            setattr(obj, name, real)
+
+
+def t_boundary_before_every_step(root):
+    """R2-2. Not walking inside that tree is required, not an optimisation. Asserted on attempted I/O, not on what lands in a generation."""
+    td = os.path.join(root, "walk")
+    m = load()
+
+    def world(name):
+        home = os.path.join(td, name)
+        tree = os.path.join(home, "Desktop", "CYSjavis")
+        w(os.path.join(tree, "registry.json"), json.dumps({"depts": {"x": {"pack_dir": os.path.join(tree, "pack")}}}))
+        w(os.path.join(tree, "state", "cys-dept-x", "topology.json"), "{}")
+        w(os.path.join(home, ".cys", "pack", "soul.md"), "s\n")
+        return home, tree
+
+    # the registry itself is a link into the tree
+    home, tree = world("registry")
+    reg = os.path.join(home, ".cys", "depts.json")
+    os.symlink(os.path.join(tree, "registry.json"), reg)
+    faults = []
+    state_root = os.path.join(home, ".local", "state")
+    os.makedirs(state_root)
+    with BoundarySpy([tree, reg], [reg]) as spy:
+        m.capture_lanes(home=home, env={"HOME": home}, faults=faults)
+        m._dept_state_dirs(state_root, windows=False, home=home)
+        m._lane_caps(home=home)
+    check("T15a a linked registry: capture, discovery and the GC attempt no I/O through it", not spy.touched, spy.touched[:3])
+    check("T15b it is a named fault, not an empty list", any("refused: covenant tree" in x for x in faults), faults)
+
+    # the state root itself is a link into the tree
+    home, tree = world("stateroot")
+    os.makedirs(os.path.join(home, ".local"))
+    state_root = os.path.join(home, ".local", "state")
+    os.symlink(os.path.join(tree, "state"), state_root)
+    refused = []
+    with BoundarySpy([tree, state_root], [state_root]) as spy:
+        got = m._dept_state_dirs(state_root, depts_json=os.path.join(home, "no-registry.json"), windows=False, home=home, refused=refused)
+    check("T15c a linked state root: not listed, not one child seen", not spy.touched and got == [], spy.touched[:3])
+    check("T15d it is recorded as refused", state_root in refused, refused)
+
+    # base pack is a link into the tree
+    home, tree = world("pack")
+    shutil.rmtree(os.path.join(home, ".cys", "pack"))
+    pack = os.path.join(home, ".cys", "pack")
+    os.symlink(os.path.join(tree, "pack"), pack)
+    os.makedirs(os.path.join(tree, "pack", "round"))
+    with BoundarySpy([tree, pack], [pack]) as spy:
+        m.capture_lanes(home=home, env={"HOME": home}, depts_json=os.path.join(home, "no-registry.json"))
+    check("T15e a linked base pack: not stat-ed", not spy.touched, spy.touched[:3])
+
+    # the GC's registered pack_dir into the tree: realpath would walk it
+    home, tree = world("gc")
+    reg = os.path.join(home, ".cys", "depts.json")
+    w(reg, json.dumps({"depts": {"x": {"pack_dir": os.path.join(tree, "pack")}}}))
+    with BoundarySpy([tree]) as spy:
+        m._lane_caps(home=home)
+    check("T15f a registered pack in the tree: the GC does not resolve it", not spy.touched, spy.touched[:3])
+
+    # a case alias of the tree, the same folder to the volume
+    home, tree = world("alias")
+    alias_dir = os.path.join(home, "desktop", "cysjavis")
+    alias = os.path.join(alias_dir, "registry.json")
+    for spelled in (alias, os.path.join(home, "DESKTOP", "CYSJAVIS"), os.path.join(home, "Desktop", "cysJAVIS", "state")):
+        check("T15g the case alias %s is the tree" % os.path.relpath(spelled, home),
+              m._boundary_key(os.path.join(home, "Desktop", "CYSjavis"), darwin=True) in m._boundary_key(spelled, darwin=True))
+    if sys.platform == "darwin":
+        same = os.stat(alias).st_ino == os.stat(os.path.join(tree, "registry.json")).st_ino
+        print("     measured: alias and canonical spelling, same inode: %s" % same)
+        with BoundarySpy([os.path.join(home, "desktop", "cysjavis"), tree]) as spy:
+            refused_alias = m._capture_refused(alias, home)
+        check("T15h a case alias is refused, and no call reached that folder to decide it", refused_alias and not spy.touched, spy.touched[:3])
+        reg = os.path.join(home, ".cys", "depts.json")
+        w(reg, json.dumps({"depts": {"x": {"pack_dir": os.path.join(alias_dir, "pack")}}}))
+        with BoundarySpy([alias_dir, tree]) as spy:
+            lanes = m.capture_lanes(home=home, env={"HOME": home})
+            srcs = m.default_sources(home=home, state_root=os.path.join(home, "none"), windows=False, env={"HOME": home}, lanes=lanes)
+        check("T15i a registered pack spelled by alias: nothing in that folder is touched", not spy.touched, spy.touched[:3])
+        real_tree = os.path.join(tree, "")
+        check("T15j and nothing from it is a source", not [s for s in srcs if s.lower().startswith(alias_dir.lower() + os.sep) or s.startswith(real_tree)],
+              [s for s in srcs if "cysjavis" in s.lower()][:3])
+    # an honest neighbour with a similar name is not the tree
+    check("T15k a sibling sharing the prefix is not refused", not m._capture_refused(os.path.join(home, "Desktop", "CYSjavis-old", "a"), home))
+    check("T15l off macOS the spelling stays case-sensitive", m._boundary_key("/a/Desktop", darwin=False) == os.path.normcase("/a/Desktop"))
+
+
 def t_live_churn(root):
     m = load()
     td = os.path.join(root, "churn")
@@ -548,8 +826,24 @@ def t_credentials(root):
     check("T12c the set is decided without opening any file", not opened and not set(plants) & set(got), opened[:3])
 
 
+RIG_ROOT = None
+
+
+def sealed(*paths):
+    """Every path resolves inside the rig, before the step runs. It stops the run, it does not warn."""
+    for p in paths:
+        r = os.path.realpath(p)
+        assert r == RIG_ROOT or r.startswith(RIG_ROOT + os.sep), "outside the rig: %s" % p
+
+
 def main():
-    root = os.path.realpath(tempfile.mkdtemp(prefix="p5-capture-"))
+    global RIG_ROOT
+    root = RIG_ROOT = os.path.realpath(tempfile.mkdtemp(prefix="p5-capture-"))
+    saved_cwd, saved_home = os.getcwd(), os.environ.get("HOME")
+    os.chdir(root)                       # the fallback round is relative to the working directory: HOME alone does not seal this run
+    os.environ["HOME"] = os.path.join(root, "home")
+    os.makedirs(os.environ["HOME"])
+    sealed(os.getcwd(), os.environ["HOME"], load().HOME, load().GEN_ROOT)
     try:
         t_soul_captured(root)
         t_predicate_not_enumeration(root)
@@ -560,11 +854,16 @@ def main():
         t_bound(root)
         t_dataless(root)
         t_dataless_boundary(root)
+        t_policy_before_every_read(root)
+        t_boundary_before_every_step(root)
         t_live_churn(root)
         t_churn_through_the_real_path(root)
         t_false_zero(root)
         t_credentials(root)
     finally:
+        os.chdir(saved_cwd)
+        if saved_home is not None:
+            os.environ["HOME"] = saved_home
         shutil.rmtree(root, ignore_errors=True)
     print("\n=== %d/%d PASS ===" % (checks - len(bad), checks))
     return 1 if bad else 0
