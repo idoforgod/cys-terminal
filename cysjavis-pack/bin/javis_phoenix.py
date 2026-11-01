@@ -1562,7 +1562,7 @@ def _lane_topology_in_generation(gen_dir, state):
 #   없는 레인) · lane_mismatch 행은 찾았는데 저장 키가 살아 있는 키가 아니다(잘못된 주소의 신호) · generation_absent 세대가 없다 · manifest_unreadable manifest 없음/판독 불가 · manifest_undated 날짜를 댈 수 없다 · stored_missing 행의 저장 파일이
 #   없다 · manifest_integrity 저장 파일이 행과 어긋난다 · copy_unreadable 행과 맞는 바이트가 topology 가 아니다 · store_refused 저장소·세대·manifest·사본이
 #   제외 트리(Desktop/CYSjavis)에 닿는다 · store_unreadable 저장소는 있는데 목록을 읽지 못했다 · dataless_policy_unset 내려받기 금지
-#   정책을 세우지 못해 열지 않았다(이 코드만 phoenix 쪽이다). 빈 결과 자체는 어느 검사가 발화했는지의 증거가 아니다 — 근거는 이 코드다.
+#   정책을 세우지 못해 열지 않았다. 빈 결과 자체는 어느 검사가 발화했는지의 증거가 아니다 — 근거는 이 코드다.
 _LANE_READ = {"reason": None, "passed_over": {}, "generation": None}
 
 
