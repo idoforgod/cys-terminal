@@ -810,6 +810,10 @@ def _wlock_dir(task_id):
     return os.path.join(TASKS_DIR, f"{task_id}.wlock")
 
 
+WLOCK_TOKEN_FILE = "token"
+_WLOCK_TOKENS = {}  # task_id → 이 프로세스가 쥔 락 인스턴스의 토큰
+
+
 class _WlockBusy(Exception):
     """_wlock 획득 실패 — main 이 EXIT_BUSY 로 거부한다. 한 곳에서만 코드로 바꾼다."""
 
@@ -826,8 +830,9 @@ def _wlock(task_id, timeout=5.0, stale=30.0):
     종전엔 5초 뒤 경고하고 무락 진행했다(근거: 기존 exit-code 계약 불변). 그 경로는 lift 가 지운 blocker 를
     되살리고 lift_history 를 지웠다(리뷰 실측) — 계약을 지키려다 레코드를 잃었다. 계약은 비어 있던 7 로 지킨다:
     어느 동사의 기존 코드도 재사용하지 않으므로 기존 분기의 뜻이 바뀌지 않는다.
-    ⚠알려진 한계: stale 회수는 mtime 만 본다 — 30초 넘게 멈춘 산 소유자의 락도 회수되고, 그 소유자가 깨어나면
-    임계구역이 겹치거나 남의 락을 rmdir 할 수 있다."""
+    stale 회수는 mtime 만 본다 — 30초 넘게 멈춘 산 소유자의 락도 회수된다. 그래서 락 인스턴스마다 토큰을 두어 막는다:
+    해제는 자기 토큰일 때만 지우고, 레코드 쓰기는 rename 직전에 토큰을 확인해 잃었으면 _WlockBusy 로 아무것도 쓰지 않는다.
+    ⚠남는 창: 그 확인과 rename 사이, 해제의 토큰 읽기와 삭제 사이. 좁혔을 뿐 0 이 아니다."""
     os.makedirs(TASKS_DIR, exist_ok=True)
     path = _wlock_dir(task_id)
     deadline = time.time() + timeout
@@ -841,6 +846,8 @@ def _wlock(task_id, timeout=5.0, stale=30.0):
                     stale_name = f"{path}.stale.{time.time_ns()}"
                     os.rename(path, stale_name)
                     with contextlib.suppress(OSError):
+                        os.remove(os.path.join(stale_name, WLOCK_TOKEN_FILE))
+                    with contextlib.suppress(OSError):
                         os.rmdir(stale_name)
                     continue
             except OSError:
@@ -848,23 +855,66 @@ def _wlock(task_id, timeout=5.0, stale=30.0):
             if time.time() > deadline:
                 raise _WlockBusy(task_id)
             time.sleep(0.02)
+    token = uuid.uuid4().hex
+    token_path = os.path.join(path, WLOCK_TOKEN_FILE)
+    try:  # O_EXCL: mkdir 과 이 줄 사이에 회수당했으면 남의 토큰을 덮지 않는다
+        fd = os.open(token_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except OSError:
+        raise _WlockBusy(task_id)
+    try:
+        os.write(fd, token.encode("ascii"))
+    finally:
+        os.close(fd)
+    _WLOCK_TOKENS[task_id] = token
     try:
         yield
     finally:
+        _WLOCK_TOKENS.pop(task_id, None)
         with contextlib.suppress(OSError):
-            os.rmdir(path)
+            if _read_text(token_path) == token:  # 자기 인스턴스만 지운다
+                os.remove(token_path)
+                os.rmdir(path)
 
 
-def _write_json_atomic(path, obj):
+def _read_text(path):
+    with open(path, encoding="ascii", errors="replace") as f:
+        return f.read()
+
+
+def _wlock_confirm(task_id):
+    """이 프로세스가 아직 그 락 인스턴스를 쥐고 있는가 — 아니면 _WlockBusy(회수당했다·아무것도 쓰지 않는다)."""
+    token = _WLOCK_TOKENS.get(task_id)
+    try:
+        held = _read_text(os.path.join(_wlock_dir(task_id), WLOCK_TOKEN_FILE))
+    except OSError:
+        held = None
+    if token is None or held != token:
+        raise _WlockBusy(task_id)
+
+
+def _write_json_atomic(path, obj, guard=None):
+    """guard 는 fsync 뒤 rename 직전에 불린다 — 쓰기 전체 중 확인이 가장 늦을 수 있는 자리다."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = f"{path}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=1)
         f.flush()
         os.fsync(f.fileno())
+    if guard is not None:
+        try:
+            guard()
+        except _WlockBusy:
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
+            raise
     os.replace(tmp, path)  # 원자적 교체
     if os.path.dirname(os.path.abspath(path)) == os.path.abspath(TASKS_DIR):
         _publish_root()  # D-b: 루트를 정한 쓰기가 그 루트를 공표한다(best effort — 실패해도 쓰기는 완료)
+
+
+def _write_task(task_id, task):
+    """태스크 레코드의 유일한 쓰기 — 락 인스턴스를 잃었으면 쓰지 않는다."""
+    _write_json_atomic(_task_path(task_id), task, guard=lambda: _wlock_confirm(task_id))
 
 
 def _read_task(task_id):
@@ -1008,7 +1058,10 @@ def _write_owner(lock, rec):
 
 
 def _acquire_lock(task_id, owner_id, pid=None):
-    """mkdir 원자성 기반 CAS. 반환: ('acquired'|'conflict'|'adopted', owner_dict|None)
+    """mkdir 원자성 기반 CAS. 반환: ('acquired'|'reentrant'|'conflict'|'adopted', owner_dict|None)
+
+    'acquired' 는 이번에 새로 만든 락뿐이다. 살아 있는 자기 락에 다시 들어온 것은 'reentrant' 다 — 호출자가 소유 1회의
+    시작과 그 소유의 연속을 가른다(release 가 락만 지우고 레코드 쓰기에서 죽어도 다음 체크아웃은 새 소유다).
 
     pid 기본값은 호출자(부모 프로세스) — CLI 자신의 pid는 즉시 종료되어 liveness 근거가
     못 되기 때문. 장수 프로세스(워커 pane 등)에 묶으려면 --pid로 명시.
@@ -1030,7 +1083,7 @@ def _acquire_lock(task_id, owner_id, pid=None):
         pass
     holder = _read_owner(task_id)
     if holder and holder.get("owner_id") == owner_id:
-        return "acquired", holder  # 자기 재진입(멱등)
+        return "reentrant", holder  # 자기 재진입(멱등)
     if holder and _pid_alive(holder.get("pid")):
         return "conflict", holder  # 살아있는 소유자 = 409
     if holder is None:
@@ -1135,7 +1188,7 @@ def cmd_create(a):
         # 치유·복원 티켓이 checkout 게이트에 걸리는 경로 원천 제거(prereg 선서명은 [OT]).
         if a.origin_kind in SYSTEM_ORIGIN_KINDS:
             task["verify_spec"] = _system_verify_spec_template(a.origin_kind)
-        _write_json_atomic(_task_path(task_id), task)
+        _write_task(task_id, task)
     print(task_id)
     return EXIT_OK
 
@@ -1208,6 +1261,15 @@ def cmd_checkout(a):
         if not task:
             print(f"not found: {a.id}", file=sys.stderr)
             return EXIT_NOTFOUND
+        # 위의 검사는 잠기기 전 스냅샷이다. 그 사이 done 이 되었으면 여기서 다시 열면 안 된다 — 소유를 잡기 전에 다시 잰다.
+        if task["status"] in TERMINAL_STATUSES:
+            print(f"conflict: task is terminal ({task['status']}) — 재시도 금지", file=sys.stderr)
+            return EXIT_CONFLICT
+        unresolved = _unresolved_blockers(task)
+        if unresolved:
+            print(f"blocked: 미해소 blocker {unresolved} — 체크아웃 거부", file=sys.stderr)
+            return EXIT_BLOCKED
+        _wlock_confirm(a.id)
         # 소유권 락도 wlock 안에서 잡는다: done 이 claim 을 대조한 뒤 _release_lock 하기까지 끼어들 수 없다.
         verdict, holder = _acquire_lock(a.id, a.owner, pid=a.pid)
         if verdict == "conflict":
@@ -1215,14 +1277,19 @@ def cmd_checkout(a):
             print(f"conflict(409): 살아있는 소유자 {who} — 재시도 금지, 다른 태스크로 이동", file=sys.stderr)
             return EXIT_CONFLICT
         # claim_gen: 소유 1회의 정체. 이름만으론 release 뒤 같은 이름의 재체크아웃(ABA)을 못 가른다.
-        if verdict == "adopted" or task.get("owner") != a.owner:
+        if verdict != "reentrant":
             task["claim_gen"] = int(task.get("claim_gen") or 0) + 1
         task["status"] = "in_progress"
         task["owner"] = a.owner
         if gate == "grandfather":
             task["grandfathered"] = True  # §1-2: WARN 통과 표식(strict 활성 이전 생성분)
         task["updated_at"] = _now()
-        _write_json_atomic(_task_path(a.id), task)
+        try:
+            _write_task(a.id, task)
+        except _WlockBusy:
+            if verdict != "reentrant":  # 방금 잡은 소유를 돌려준다 — 거부는 아무것도 바꾸지 않는다
+                _release_lock(a.id, a.owner)
+            raise
     # B1(§2-1)·F3: completion-guard 바인딩 — 성공 경로에서만·명시 --claim-surface 우선
     # ★E1-4(BLOCKER F12/R-25 · 팩 배포 무게이트 발효 강등): **ambient `CYS_SURFACE_ID` 경로는
     #   기본 OFF**다. 이 파일은 이미 6프로필에서 도는 공용 도구라 팩 install 즉시 발효하는데,
@@ -1239,7 +1306,8 @@ def cmd_checkout(a):
     if _claim_explicit or os.environ.get("CYS_TASK_GUARD_CLAIM") == "1":
         _write_guard_claim(a.id, a.pid, surface=getattr(a, "claim_surface", None),
                            claim_pid=getattr(a, "claim_pid", None))
-    print(json.dumps({"checkout": verdict, "id": a.id, "owner": a.owner}, ensure_ascii=False))
+    print(json.dumps({"checkout": "acquired" if verdict == "reentrant" else verdict, "id": a.id, "owner": a.owner},
+                     ensure_ascii=False))
     return EXIT_OK
 
 
@@ -1256,6 +1324,7 @@ def cmd_release(a):
               file=sys.stderr)
         return EXIT_USAGE
     with _wlock(a.id):  # ★WP-8(P-ORCH): JSON 갱신 직렬화 · 소유권 락 해제도 이 안에서(거부가 아무것도 안 바꾸게)
+        _wlock_confirm(a.id)
         if not _release_lock(a.id, a.owner, force=a.force):
             holder = _read_owner(a.id)
             print(f"conflict(409): 락 소유자 불일치 (holder={(holder or {}).get('owner_id')})", file=sys.stderr)
@@ -1272,7 +1341,7 @@ def cmd_release(a):
             if task["status"] == "in_progress":
                 task["status"] = "todo"
             task["updated_at"] = _now()
-            _write_json_atomic(_task_path(a.id), task)
+            _write_task(a.id, task)
     _remove_guard_claims(a.id)  # B1(§2-1): 바인딩 해제 — guard 무발동 복귀
     print(f"released: {a.id}")
     return EXIT_OK
@@ -1784,11 +1853,12 @@ def cmd_set_status(a):
                 {"at": _now(), "reason": settle_override_note})
         task["status"] = a.status
         task["updated_at"] = _now()
-        _write_json_atomic(_task_path(a.id), task)
+        owner_before = task.get("owner")
         if a.status in TERMINAL_STATUSES:
-            _release_lock(a.id, task.get("owner") or "", force=True)
             task["owner"] = None
-            _write_json_atomic(_task_path(a.id), task)
+        _write_task(a.id, task)  # 상태와 owner 를 한 번에 — 락을 잃어 거부되면 반쪽이 남지 않는다
+        if a.status in TERMINAL_STATUSES:
+            _release_lock(a.id, owner_before or "", force=True)
         result = {"id": a.id, "status": a.status}
         if task.get("evidence"):
             result["evidence"] = task["evidence"]
@@ -1854,7 +1924,7 @@ def cmd_lift(a):
             {"at": _now(), "by": by, "why": why, "blockers": lifted,
              "status_from": status_from, "status_to": task["status"]})
         task["updated_at"] = _now()
-        _write_json_atomic(_task_path(a.id), task)
+        _write_task(a.id, task)
     print(json.dumps({"id": a.id, "status": task["status"], "blocked_by": task["blocked_by"],
                       "lifted": lifted, "ready": not unresolved, "unresolved": unresolved},
                      ensure_ascii=False))
@@ -2014,7 +2084,7 @@ def cmd_set_verify_spec(a):
                 # 소실과 무관하게 이 필드로 발화한다(강등 근거의 영속화).
                 spec["demoted_at"] = _now()
                 task["updated_at"] = _now()
-                _write_json_atomic(_task_path(a.id), task)
+                _write_task(a.id, task)
                 print("calibrated 강등(조건 07②): quick wall-clock 상한 위반 반복(guard "
                       "timeout_violations≥2) — 재캘리브레이션(하네스 워커 calibrate + master "
                       "봉인) 전까지 신뢰 강등", file=sys.stderr)
@@ -2127,7 +2197,7 @@ def cmd_set_verify_spec(a):
             return EXIT_NOTFOUND
         task["verify_spec"] = spec
         task["updated_at"] = _now()
-        _write_json_atomic(_task_path(a.id), task)
+        _write_task(a.id, task)
     if respec_forced:
         _append_audit(a.id, "force-respec")  # G2: 강제 재등록 원장 1줄(우회 가시화 — §3 mine 소비)
     with contextlib.suppress(OSError):
@@ -3150,7 +3220,7 @@ def main(argv=None):
     try:
         return a.fn(a)
     except _WlockBusy as e:  # 이 코드·문면을 쓰는 유일한 자리
-        print("busy(%d): %s 쓰기락을 얻지 못했다 — 아무것도 바뀌지 않았다. %s" % (EXIT_BUSY, e, BUSY_REMEDY), file=sys.stderr)
+        print("busy(%d): %s 쓰기락을 갖지 못했다 — 아무것도 바뀌지 않았다. %s" % (EXIT_BUSY, e, BUSY_REMEDY), file=sys.stderr)
         return EXIT_BUSY
 
 
