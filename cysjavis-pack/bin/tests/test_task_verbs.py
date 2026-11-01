@@ -27,6 +27,9 @@ import unittest
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from rig_axes import AXES, assert_sealed, breaches  # noqa: E402
+
 BIN = os.path.dirname(HERE)
 TASK = os.path.join(BIN, "javis_task.py")
 PY = sys.executable
@@ -83,8 +86,12 @@ def control(msg):
 
 class Base(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="task-verbs-")
+        self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="task-verbs-"))
         self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(self.tmp)
+        for d in ("appdata", "state", "pack"):
+            os.makedirs(os.path.join(self.tmp, d))
         self.root = os.path.join(self.tmp, "root")
         os.makedirs(self.root)
         self.runs = os.path.join(self.tmp, "probe_runs.jsonl")
@@ -94,6 +101,11 @@ class Base(unittest.TestCase):
                if not k.startswith(("CYS_", "JAVIS_", "AITERM_")) and k != "CLAUDE_CONFIG_DIR"}
         env.update({
             "HOME": self.tmp,
+            "USERPROFILE": self.tmp,
+            "LOCALAPPDATA": os.path.join(self.tmp, "appdata"),
+            "CYS_STATE_DIR": os.path.join(self.tmp, "state"),
+            "CYS_PACK_DIR": os.path.join(self.tmp, "pack"),
+            "CYS_SOCKET": os.path.join(self.tmp, "state", "cys.sock"),
             "JAVIS_ROOT": self.root,
             "CYS_PROBE_RUNS": self.runs,
             "CYS_NO_AUTOSTART": "1",
@@ -105,6 +117,7 @@ class Base(unittest.TestCase):
             "CYS_TASK_EVIDENCE_ARTIFACT_GATE": "off",
         })
         env.update(extra)
+        assert_sealed(self, env, self.tmp)
         return env
 
     def t(self, *argv, **extra):
@@ -156,6 +169,24 @@ class Base(unittest.TestCase):
     def checked_out(self, tid):
         self.assertEqual(self.t("create", tid, "--id", tid)[0], 0)
         self.assertEqual(self.t("checkout", tid, "--owner", "w1")[0], 0)
+
+
+class RigAxes(unittest.TestCase):
+    def test_every_axis_is_named_and_a_breach_names_itself(self):
+        rig = os.path.realpath(tempfile.mkdtemp(prefix="axes-"))
+        self.addCleanup(shutil.rmtree, rig, True)
+        good = {a: rig for a in AXES if a != "cwd"}
+        self.assertEqual(breaches(good, rig, rig), {})
+        caught = {}
+        for axis in AXES:
+            env, cwd = dict(good), rig
+            if axis == "cwd":
+                cwd = "/outside/the/rig"
+            else:
+                env[axis] = "/outside/the/rig"
+            caught[axis] = list(breaches(env, cwd, rig))
+        control("A9 each axis pushed outside the rig is named alone: %s" % (caught == {a: [a] for a in AXES}))
+        self.assertEqual(caught, {a: [a] for a in AXES})
 
 
 class P2SettleGatePassRow(Base):
@@ -877,6 +908,23 @@ class ClaimBinding(Base):
         control("P2R4 --force on the record's claim: rc=%s owner=%s lock=%s history=%d" % (
             rc, rec["owner"], os.path.exists(self.lock_path("A")), len(rec["force_history"])))
         self.assertEqual((rc, rec["owner"], len(rec["force_history"])), (0, None, 1))
+        self.assertFalse(os.path.exists(self.lock_path("A")))
+
+    def test_release_claim_compares_every_part_of_the_identity(self):
+        self.checked_out("A")
+        with open(os.path.join(self.lock_path("A"), "owner.json"), encoding="utf-8") as f:
+            held = json.load(f)
+        mod = self.load_module()
+        with mock.patch.dict(os.environ, self.env(), clear=True):
+            wrong = {"owner": mod._release_claim("A", "w9", held["claim_gen"]),
+                     "generation": mod._release_claim("A", "w1", held["claim_gen"] + 1),
+                     "claim_id": mod._release_claim("A", "w1", held["claim_gen"], "not-this-one")}
+            kept = os.path.exists(self.lock_path("A"))
+            right = mod._release_claim("A", "w1", held["claim_gen"], held["claim_id"])
+        control("P2R4 _release_claim: wrong %s, lock kept=%s, exact claim=%s" % (wrong, kept, right))
+        self.assertEqual(wrong, {"owner": False, "generation": False, "claim_id": False})
+        self.assertTrue(kept)
+        self.assertTrue(right)
         self.assertFalse(os.path.exists(self.lock_path("A")))
 
     def test_a_release_that_cannot_write_its_record_changes_nothing(self):
