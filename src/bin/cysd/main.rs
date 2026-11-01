@@ -26,6 +26,8 @@ macro_rules! eprint {
 mod accounts;
 mod activity;
 mod agent_write;
+#[cfg(test)]
+mod native_harness_trace;
 mod input_intent;
 mod alert_route;
 mod alerts;

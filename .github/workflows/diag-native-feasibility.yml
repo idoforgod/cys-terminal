@@ -1,0 +1,102 @@
+{
+  "name": "native diagnostic feasibility",
+  "on": {
+    "push": {
+      "branches": [
+        "work/0.14.56-native-feasibility"
+      ]
+    }
+  },
+  "permissions": {
+    "contents": "read"
+  },
+  "concurrency": {
+    "group": "native-work-0.14.56-native-feasibility",
+    "cancel-in-progress": false
+  },
+  "jobs": {
+    "native": {
+      "if": "github.event_name == 'push' && github.ref == 'refs/heads/work/0.14.56-native-feasibility' && github.run_attempt == 1",
+      "runs-on": "windows-latest",
+      "timeout-minutes": "${{ matrix.minutes }}",
+      "strategy": {
+        "fail-fast": false,
+        "max-parallel": 1,
+        "matrix": {
+          "include": [
+            {
+              "job": "feasibility",
+              "arm": "feasibility",
+              "minutes": 30
+            }
+          ]
+        }
+      },
+      "env": {
+        "PYTHONUTF8": "1",
+        "PYTHONDONTWRITEBYTECODE": "1"
+      },
+      "steps": [
+        {
+          "name": "Start fixed job clock",
+          "shell": "pwsh",
+          "run": "$p = Join-Path $env:RUNNER_TEMP (\"cys-native-start-\" + $env:GITHUB_RUN_ID + \"-\" + $env:GITHUB_RUN_ATTEMPT + \".txt\"); if (Test-Path $p) { throw \"Clock already exists\" }; [IO.File]::WriteAllText($p, [DateTimeOffset]::UtcNow.ToString(\"o\"))"
+        },
+        {
+          "uses": "actions/checkout@v4",
+          "with": {
+            "ref": "${{ github.sha }}",
+            "fetch-depth": 0,
+            "persist-credentials": false
+          }
+        },
+        {
+          "uses": "actions/setup-python@v5",
+          "with": {
+            "python-version": "3.12"
+          }
+        },
+        {
+          "name": "Verify external authority before native work",
+          "id": "authorize",
+          "shell": "pwsh",
+          "env": {
+            "NATIVE_AUTH_URI": "${{ vars.CYS_NATIVE_AUTH_URI }}",
+            "NATIVE_AUTH_SHA256": "${{ vars.CYS_NATIVE_AUTH_SHA256 }}"
+          },
+          "run": "python scripts/native_run/job.py authorize --mode feasibility --branch work/0.14.56-native-feasibility"
+        },
+        {
+          "uses": "actions/checkout@v4",
+          "with": {
+            "ref": "${{ steps.authorize.outputs.product_sha }}",
+            "path": "product",
+            "fetch-depth": 0,
+            "persist-credentials": false
+          }
+        },
+        {
+          "uses": "dtolnay/rust-toolchain@stable",
+          "with": {
+            "toolchain": "${{ steps.authorize.outputs.rust_toolchain }}"
+          }
+        },
+        {
+          "name": "Fixed owned diagnostic job",
+          "shell": "pwsh",
+          "run": "python scripts/native_run/job.py execute --job ${{ matrix.job }}"
+        },
+        {
+          "name": "Retain every artifact, including NULL and inner reds",
+          "if": "always()",
+          "uses": "actions/upload-artifact@v4",
+          "with": {
+            "name": "native-${{ matrix.job }}-${{ github.run_id }}-attempt-${{ github.run_attempt }}",
+            "path": "native-evidence/**\n!native-evidence/cargo-target/**\n!native-evidence/binaries/**",
+            "if-no-files-found": "error"
+          }
+        }
+      ]
+    }
+  }
+}
