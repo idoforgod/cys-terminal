@@ -3171,6 +3171,59 @@ fn lane_file_key(path: &std::path::Path) -> String {
     normcase_path(&resolved.to_string_lossy(), cfg!(windows))
 }
 
+/// Comparison form of a path for the excluded tree: on macOS the volume does not tell case apart.
+fn boundary_key(path: &std::path::Path) -> String {
+    let s = normcase_path(&path.to_string_lossy(), cfg!(windows));
+    if cfg!(target_os = "macos") { s.to_lowercase() } else { s }
+}
+
+/// `<home>/Desktop/CYSjavis` and below are not looked at, the same rule as `_capture_refused` in javis_state_snapshot.py. The path is walked
+/// from the front, string compare first, and only components outside the tree are lstat-ed; a link is read, never followed. Not walking
+/// inside is required: a sweep over that tree materialises it.
+fn in_excluded_tree(path: &std::path::Path, home: &std::path::Path) -> bool {
+    use std::path::{Component, Path, PathBuf};
+    fn lexical(p: &Path) -> PathBuf {
+        let mut out = PathBuf::new();
+        for c in p.components() {
+            match c {
+                Component::ParentDir => {
+                    out.pop();
+                }
+                Component::CurDir => {}
+                other => out.push(other.as_os_str()),
+            }
+        }
+        out
+    }
+    let desktop = home.join("Desktop");
+    let real = std::fs::canonicalize(&desktop).unwrap_or_else(|_| desktop.clone());
+    let trees = [boundary_key(&real.join("CYSjavis")), boundary_key(&desktop.join("CYSjavis"))];
+    let inside = |p: &Path| {
+        let c = boundary_key(p);
+        trees.iter().any(|t| c == *t || c.starts_with(&format!("{t}{}", std::path::MAIN_SEPARATOR)))
+    };
+    let mut cur = lexical(path);
+    'hops: for _ in 0..32 {
+        let parts: Vec<Component<'_>> = cur.components().collect();
+        let mut at = PathBuf::new();
+        for (i, comp) in parts.iter().enumerate() {
+            at.push(comp.as_os_str());
+            if inside(&at) {
+                return true;
+            }
+            if std::fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink()) {
+                let Ok(target) = std::fs::read_link(&at) else { return true };
+                let mut next = lexical(&at.parent().unwrap_or(Path::new("")).join(target));
+                parts[i + 1..].iter().for_each(|c| next.push(c.as_os_str()));
+                cur = next;
+                continue 'hops;
+            }
+        }
+        return false;
+    }
+    true // a chain of links this long is not judged: the safe side
+}
+
 // What one lane read of the generations came to. The same strings as `_LANE_READ` in javis_phoenix.py. An empty result alone does
 // not say which check fired; the code does.
 const LANE_FOUND: &str = "found"; // this lane's copy, with tombstones
@@ -3183,6 +3236,8 @@ const MANIFEST_UNDATED: &str = "manifest_undated"; // its created_at does not na
 const STORED_MISSING: &str = "stored_missing"; // the row's stored file is not there
 const MANIFEST_INTEGRITY: &str = "manifest_integrity"; // the stored file does not match its row
 const COPY_UNREADABLE: &str = "copy_unreadable"; // bytes that match the row are not a topology with a tombstones list
+const STORE_REFUSED: &str = "store_refused"; // the store, a generation, a manifest or a copy reaches the excluded tree
+const STORE_UNREADABLE: &str = "store_unreadable"; // the store exists and cannot be listed: not the same fact as generation_absent
 
 /// One lane read: the tombstones, the code for the conclusion (the newest generation's code when nothing was usable), the generation
 /// that answered, and how many generations it passed over, per code.
@@ -3202,8 +3257,16 @@ struct LaneRead {
 /// The lane key has two halves: `live` is the running socket's state dir, the stored key is the row's `source`. A prefixed file name
 /// carries the first 8 of sha256(source), so a row and a file name can disagree about whose bytes these are. That is a mismatch, and
 /// it is refused: reading the stored half alone returns a well-attributed set to the wrong caller.
-fn lane_topology_in_generation(gen_dir: &std::path::Path, live: &std::path::Path, want: &str) -> Result<serde_json::Value, &'static str> {
+fn lane_topology_in_generation(
+    gen_dir: &std::path::Path,
+    home: &std::path::Path,
+    live: &std::path::Path,
+    want: &str,
+) -> Result<serde_json::Value, &'static str> {
     use sha2::{Digest, Sha256};
+    if in_excluded_tree(gen_dir, home) || in_excluded_tree(&gen_dir.join("manifest.json"), home) {
+        return Err(STORE_REFUSED);
+    }
     let name_tag = |path: &str| format!("{:x}", Sha256::digest(path.as_bytes()))[..8].to_string();
     let stored_name = |row: &serde_json::Value| {
         row["stored_as"].as_str().and_then(|s| std::path::Path::new(s).file_name()).and_then(|n| n.to_str()).map(String::from)
@@ -3224,7 +3287,7 @@ fn lane_topology_in_generation(gen_dir: &std::path::Path, live: &std::path::Path
         .find(|e| {
             e["source"].as_str().is_some_and(|src| {
                 let src = std::path::Path::new(src);
-                src.file_name().is_some_and(|n| n == "topology.json") && lane_file_key(src) == want
+                src.file_name().is_some_and(|n| n == "topology.json") && !in_excluded_tree(src, home) && lane_file_key(src) == want
             })
         })
         .ok_or_else(|| {
@@ -3234,6 +3297,9 @@ fn lane_topology_in_generation(gen_dir: &std::path::Path, live: &std::path::Path
     let name = stored_name(row).ok_or(STORED_MISSING)?;
     if name.split_once("__").is_some_and(|(tag, _)| tag != name_tag(row["source"].as_str().unwrap_or_default())) {
         return Err(LANE_MISMATCH);
+    }
+    if in_excluded_tree(&gen_dir.join(&name), home) {
+        return Err(STORE_REFUSED);
     }
     let bytes = std::fs::read(gen_dir.join(&name)).map_err(|_| STORED_MISSING)?;
     if row["size"].as_u64() != Some(bytes.len() as u64)
@@ -3253,10 +3319,11 @@ fn lane_topology_in_generation(gen_dir: &std::path::Path, live: &std::path::Path
 /// own, and that can stop a live seat resurrecting. Newest first; a generation with nothing usable for this lane falls back to an
 /// older one, which passes the same checks.
 fn tombstones_from_latest_generation(socket_path: &std::path::Path) -> LaneRead {
-    tombstones_from_generations(&cys::home_dir().join(".cys").join("state-generations"), socket_path)
+    let home = cys::home_dir();
+    tombstones_from_generations(&home.join(".cys").join("state-generations"), &home, socket_path)
 }
 
-fn tombstones_from_generations(root: &std::path::Path, socket_path: &std::path::Path) -> LaneRead {
+fn tombstones_from_generations(root: &std::path::Path, home: &std::path::Path, socket_path: &std::path::Path) -> LaneRead {
     let live = crate::state::state_dir(socket_path).join("topology.json");
     let want = lane_file_key(&live);
     let mut read = LaneRead {
@@ -3265,17 +3332,26 @@ fn tombstones_from_generations(root: &std::path::Path, socket_path: &std::path::
         generation: None,
         passed_over: std::collections::BTreeMap::new(),
     };
+    if in_excluded_tree(root, home) {
+        read.reason = STORE_REFUSED;
+        read.passed_over.insert(STORE_REFUSED, 1);
+        return read;
+    }
     let mut gens: Vec<String> = match std::fs::read_dir(root) {
         Ok(rd) => rd
             .flatten()
             .filter_map(|e| e.file_name().into_string().ok())
             .filter(|n| n.len() >= 16 && n.as_bytes()[8] == b'T')
             .collect(),
-        Err(_) => return read,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return read,
+        Err(_) => {
+            read.reason = STORE_UNREADABLE;
+            return read;
+        }
     };
     gens.sort();
     for (i, g) in gens.iter().rev().enumerate() {
-        match lane_topology_in_generation(&root.join(g), &live, &want) {
+        match lane_topology_in_generation(&root.join(g), home, &live, &want) {
             Ok(v) => {
                 read.tombstones = _tombs_from_value(&v);
                 read.reason = if read.tombstones.is_empty() { LANE_EMPTY } else { LANE_FOUND };
@@ -27820,8 +27896,13 @@ mod tests {
 
     // P0-RED-END: the tests below read the conclusion, which the pre-fix tree does not have.
 
-    use super::{tombstones_from_generations, COPY_UNREADABLE, GENERATION_ABSENT, LANE_ABSENT, LANE_EMPTY, LANE_FOUND, LANE_MISMATCH,
-                MANIFEST_INTEGRITY, MANIFEST_UNDATED, MANIFEST_UNREADABLE, STORED_MISSING};
+    use super::{COPY_UNREADABLE, GENERATION_ABSENT, LANE_ABSENT, LANE_EMPTY, LANE_FOUND, LANE_MISMATCH, MANIFEST_INTEGRITY, MANIFEST_UNDATED,
+                MANIFEST_UNREADABLE, STORED_MISSING, STORE_REFUSED, STORE_UNREADABLE};
+
+    /// The read with a HOME that has no excluded tree in it: these specimens are about the lane, the next ones about the tree.
+    fn tombstones_from_generations(root: &std::path::Path, socket: &std::path::Path) -> super::LaneRead {
+        super::tombstones_from_generations(root, root.parent().unwrap(), socket)
+    }
 
     fn p0_sorted(set: std::collections::HashSet<String>) -> Vec<String> {
         let mut v: Vec<String> = set.into_iter().collect();
@@ -27909,7 +27990,7 @@ mod tests {
     #[test]
     fn p0_each_reason_code_fires_in_its_own_state() {
         let codes = [LANE_FOUND, LANE_EMPTY, LANE_ABSENT, LANE_MISMATCH, GENERATION_ABSENT, MANIFEST_UNREADABLE, MANIFEST_UNDATED,
-                     STORED_MISSING, MANIFEST_INTEGRITY, COPY_UNREADABLE];
+                     STORED_MISSING, MANIFEST_INTEGRITY, COPY_UNREADABLE, STORE_REFUSED, STORE_UNREADABLE];
         assert_eq!(codes.iter().collect::<std::collections::BTreeSet<_>>().len(), codes.len(), "two states share a code");
         let tmp = p0_scratch("codes");
         let (me, other) = (p0_lane_dir(&tmp, "cys-dept-dept-5"), p0_lane_dir(&tmp, "cys-dept-dept-6"));
@@ -27971,6 +28052,87 @@ mod tests {
         let g = p0_generation(&root, name, &mine());
         p0_rewrite_copy(&g, &me, "{\"entries\": []}");
         assert_eq!(reason(&root), COPY_UNREADABLE, "bytes that match their row, with no tombstones list");
+    }
+
+    /// The excluded tree. Rust has no call spy, so each target sits behind a directory of mode 000: any attempted read of it would come
+    /// back permission denied and a different code. `store_refused` shows the reader stopped at the path, before touching it.
+    #[cfg(unix)]
+    #[test]
+    fn p0_the_excluded_tree_is_refused_from_the_path_before_any_read() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let home = p0_scratch("tree");
+        let me = p0_lane_dir(&home, "cys-dept-dept-5");
+        let socket = me.join("cys.sock");
+        let tree = home.join("Desktop").join("CYSjavis");
+        let root = home.join(".cys").join("state-generations");
+        let lock = |p: &std::path::Path, mode| std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+        let roles = p0_roles("mine", 2);
+        let body = p0_body(&roles);
+
+        // a linked store
+        let parked = tree.join("store");
+        p0_generation(&parked, "20261101T000000Z", &[P0Lane { state: &me, body: body.clone() }]);
+        std::fs::create_dir_all(root.parent().unwrap()).unwrap();
+        symlink(&parked, &root).unwrap();
+        lock(&parked, 0o000);
+        let read = super::tombstones_from_generations(&root, &home, &socket);
+        lock(&parked, 0o755);
+        assert_eq!((read.reason, read.tombstones.len()), (STORE_REFUSED, 0), "a linked store");
+        std::fs::remove_file(&root).unwrap();
+
+        // a linked generation, a linked manifest, a linked copy: each passed over by name, the older generation answers
+        let older = p0_roles("older", 3);
+        p0_generation(&root, "20261030T000000Z", &[P0Lane { state: &me, body: p0_body(&older) }]);
+        for (stamp, what) in [("20261101T000000Z", "generation"), ("20261102T000000Z", "manifest"), ("20261103T000000Z", "copy")] {
+            let g = p0_generation(&root, stamp, &[P0Lane { state: &me, body: body.clone() }]);
+            let (link, parked): (std::path::PathBuf, std::path::PathBuf) = match what {
+                "generation" => (g.clone(), tree.join("gen")),
+                "manifest" => (g.join("manifest.json"), tree.join("m").join("manifest.json")),
+                _ => (g.join(p0_stored(&me)), tree.join("c").join(p0_stored(&me))),
+            };
+            std::fs::create_dir_all(parked.parent().unwrap()).unwrap();
+            std::fs::rename(&link, &parked).unwrap();
+            symlink(&parked, &link).unwrap();
+            let guard = if what == "generation" { parked.clone() } else { parked.parent().unwrap().to_path_buf() };
+            lock(&guard, 0o000);
+            let read = super::tombstones_from_generations(&root, &home, &socket);
+            lock(&guard, 0o755);
+            assert_eq!(read.passed_over.get(STORE_REFUSED), Some(&1), "a linked {what}: {:?}", read.passed_over);
+            assert_eq!(read.reason, LANE_FOUND, "the older generation answered: a linked {what}");
+            assert_eq!(p0_sorted(read.tombstones), older, "a linked {what}");
+            let _ = std::fs::remove_file(&link);
+            let _ = std::fs::remove_dir_all(&g);
+        }
+
+        // a store that exists and cannot be listed is not an absent one
+        lock(&root, 0o000);
+        let read = super::tombstones_from_generations(&root, &home, &socket);
+        lock(&root, 0o755);
+        assert_eq!(read.reason, STORE_UNREADABLE);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(super::tombstones_from_generations(&root, &home, &socket).reason, GENERATION_ABSENT);
+    }
+
+    /// The tree's rule: a link chain, a case alias on macOS, a sibling sharing the prefix.
+    #[cfg(unix)]
+    #[test]
+    fn p0_the_excluded_tree_rule() {
+        let home = p0_scratch("treerule");
+        let tree = home.join("Desktop").join("CYSjavis");
+        std::fs::create_dir_all(&tree).unwrap();
+        assert!(super::in_excluded_tree(&tree.join("a"), &home), "inside");
+        assert!(!super::in_excluded_tree(&home.join("Desktop").join("CYSjavis-old").join("a"), &home), "a sibling");
+        std::os::unix::fs::symlink(&tree, home.join("one")).unwrap();
+        std::os::unix::fs::symlink(home.join("one"), home.join("two")).unwrap();
+        assert!(super::in_excluded_tree(&home.join("two").join("a"), &home), "a chain of links");
+        std::os::unix::fs::symlink("Desktop/CYSjavis", home.join("relative")).unwrap();
+        assert!(super::in_excluded_tree(&home.join("relative"), &home), "a relative link");
+        std::os::unix::fs::symlink(home.join("loop-b"), home.join("loop-a")).unwrap();
+        std::os::unix::fs::symlink(home.join("loop-a"), home.join("loop-b")).unwrap();
+        assert!(super::in_excluded_tree(&home.join("loop-a"), &home), "a link loop is not judged: refused");
+        if cfg!(target_os = "macos") {
+            assert!(super::in_excluded_tree(&home.join("desktop").join("cysjavis").join("a"), &home), "a case alias");
+        }
     }
 
     /// BINDING, case 1: live == stored returns the set.
