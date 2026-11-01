@@ -694,7 +694,8 @@ class Remedy(unittest.TestCase):
             return f.read()
 
     def test_the_readers_copies_carry_the_remedy_verbatim(self):
-        docs = ("directives/WORKER_DIRECTIVE.md", "round/TOOL_RESULT_VOCAB.md", "bin/javis_task.py")
+        docs = ("directives/WORKER_DIRECTIVE.md", "round/TOOL_RESULT_VOCAB.md", "skills/vibecoding/SKILL.md",
+                "bin/javis_task.py")
         got = {d: has_remedy(self.read(d)) for d in docs}
         control("P3R remedy verbatim: %s" % got)
         self.assertEqual(set(got.values()), {True}, got)
