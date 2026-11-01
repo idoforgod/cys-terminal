@@ -104,7 +104,7 @@ orchestrate)는 vibecoding 파이프라인 **안에서 호출**된다. 트리거
   assertion 감소·skip 삽입 검출 시 run 폐기). 기능 테스트보다 **먼저** 돈다.
 - 위 증거를 모아 `javis_task set-status <id> done --evidence "<검증명령 → 결과>"`로 완료 전이한다.
   evidence·skip-reason 없는 done은 거부(exit 5). "다 됐다"는 말은 완료가 아니다.
-  exit 7 은 쓰기락을 얻지 못했다는 뜻이다(아무것도 바뀌지 않았다): 「wait out the 30 s stale window · try ONCE · if it still returns 7, report a lock anomaly · never --settled-override · never immediate repeated retry」.
+  exit 7 은 락을 지금 판단할 수 없다는 뜻이다(아무것도 바뀌지 않았다): 「wait out the 30 s stale window · try ONCE · if it still returns 7, report a lock anomaly · never --settled-override · never immediate repeated retry」.
 
 ## 6. 증류 — `javis_distill` (§C8 · 헌법 10조)
 

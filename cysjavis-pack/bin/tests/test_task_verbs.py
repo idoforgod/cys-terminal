@@ -621,7 +621,9 @@ class WriterProtocol(Barriers):
                         getattr(c.func, "attr", "") == "rmdir" and ast.unparse(c.args[0]) == "lock" for c in calls):
                     removers.append(f.name)
         control("P3R4 claim removal: functions that remove the ownership lock=%s, args=%s" % (removers, args))
-        self.assertEqual(removers, ["_release_claim"])
+        # Two paths on purpose: a claim, and a lock with no readable owner, which has no claim to protect. Syntactic only:
+        # adoption removes a renamed directory and is not counted, and this says nothing about order against the record.
+        self.assertEqual(sorted(removers), ["_clear_ownerless_lock", "_release_claim"])
         self.assertNotIn("force", args)
         self.assertNotIn("_release_lock", text)
 
@@ -947,6 +949,96 @@ class ClaimBinding(Base):
         self.assertTrue(kept)
         self.assertTrue(right)
         self.assertFalse(os.path.exists(self.lock_path("A")))
+
+    def empty_lock(self, tid, age=0):
+        lock = self.lock_path(tid)
+        os.mkdir(lock)
+        if age:
+            old = time.time() - age
+            os.utime(lock, (old, old))
+        return lock
+
+    def test_force_past_the_grace_removes_an_empty_lock_and_says_so(self):
+        """The review's case: read rc 0 and `released` with the directory still there."""
+        self.t("create", "A", "--id", "A")
+        lock = self.empty_lock("A", age=31)
+        rc, out, err = self.t("release", "A", "--owner", "operator", "--force", "--force-reason", "unit test")
+        co = self.t("checkout", "A", "--owner", "w2")[0]
+        control("P3R5 --force past the grace on an empty lock: rc=%s out=%s, then checkout rc=%s" % (rc, out.strip(), co))
+        self.assertEqual(rc, 0, err)
+        self.assertIn("주인 정보가 없는 락을 지웠다", out)
+        self.assertEqual(co, 0)
+        self.assertEqual(self.lock_owner("A"), "w2")
+        self.assertEqual(len(self.rec("A")["force_history"]), 1)
+        self.assertTrue(os.path.isdir(lock))
+
+    def test_force_past_the_grace_removes_an_unreadable_lock(self):
+        self.t("create", "A", "--id", "A")
+        lock = self.empty_lock("A")
+        with open(os.path.join(lock, "owner.json"), "w", encoding="utf-8") as f:
+            f.write("{not json")
+        old = time.time() - 31
+        os.utime(lock, (old, old))
+        rc = self.t("release", "A", "--owner", "operator", "--force", "--force-reason", "unit test")[0]
+        control("P3R5 --force past the grace on an unreadable owner.json: rc=%s lock=%s" % (rc, os.path.exists(lock)))
+        self.assertEqual(rc, 0)
+        self.assertFalse(os.path.exists(lock))
+
+    def test_inside_the_grace_an_empty_lock_refuses_and_nothing_changes(self):
+        self.t("create", "A", "--id", "A")
+        lock = self.empty_lock("A")
+        before = self.raw("A")
+        got = []
+        for argv in (("--owner", "operator", "--force", "--force-reason", "unit test"), ("--owner", "w1")):
+            rc, out, err = self.t("release", "A", *argv)
+            got.append(rc)
+            self.assertIn(REMEDY, err)
+            self.assertEqual([w for w in OWNER_CLAIM if w in err.replace("--settled-override", "").replace("소유권 락", "")], [])
+            self.assertNotIn("released", out)
+        control("P3R5 inside the grace: rcs=%s record unchanged=%s lock kept=%s" % (
+            got, self.raw("A") == before, os.path.isdir(lock)))
+        self.assertEqual(got, [7, 7])
+        self.assertEqual(self.raw("A"), before)
+        self.assertTrue(os.path.isdir(lock))
+
+    def test_past_the_grace_an_empty_lock_needs_force(self):
+        self.t("create", "A", "--id", "A")
+        lock = self.empty_lock("A", age=31)
+        before = self.raw("A")
+        rc, out, err = self.t("release", "A", "--owner", "w1")
+        control("P3R5 no --force, past the grace: rc=%s record unchanged=%s lock kept=%s" % (
+            rc, self.raw("A") == before, os.path.isdir(lock)))
+        self.assertEqual(rc, 2, err)
+        self.assertEqual(self.raw("A"), before)
+        self.assertTrue(os.path.isdir(lock))
+        self.assertNotIn("released", out)
+
+    def test_release_never_says_released_while_a_lock_remains(self):
+        self.checked_out("A")
+        mod = self.load_module()
+        mod._release_claim = lambda *a, **k: False
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = self.call(mod, "release", "A", "--owner", "w1")
+        control("P3R5 a claim that could not be removed: rc=%s stdout=%r lock=%s" % (
+            rc, out.getvalue().strip(), os.path.exists(self.lock_path("A"))))
+        self.assertEqual(rc, 9)
+        self.assertNotIn("released:", out.getvalue())
+        self.assertTrue(os.path.exists(self.lock_path("A")))
+
+    def test_a_lock_from_the_interim_schema_is_cleared_by_its_owner(self):
+        """A store from before owner.json carried claim_gen: the review's conditional case."""
+        self.checked_out("A")
+        path = os.path.join(self.lock_path("A"), "owner.json")
+        with open(path, encoding="utf-8") as f:
+            rec = json.load(f)
+        del rec["claim_gen"], rec["claim_id"]
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(rec, f)
+        rc = self.t("release", "A", "--owner", "w1")[0]
+        control("P3R5 interim lock with no claim_gen, its owner releases: rc=%s lock=%s owner=%s" % (
+            rc, os.path.exists(self.lock_path("A")), self.rec("A")["owner"]))
+        self.assertEqual((rc, os.path.exists(self.lock_path("A")), self.rec("A")["owner"]), (0, False, None))
 
     def test_a_release_that_cannot_write_its_record_changes_nothing(self):
         self.checked_out("A")

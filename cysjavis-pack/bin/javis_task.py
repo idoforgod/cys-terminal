@@ -17,7 +17,7 @@
 
 exit codes: 0 ok · 1 self-test 실패 · 2 usage · 3 not found · 4 blocked ·
             5 no evidence(W0-3·E1 artifact) · 6 verify-spec missing(T1 게이트) ·
-            7 busy(쓰기락 미획득 — 아무것도 바뀌지 않음 · wait out the 30 s stale window · try ONCE · if it still returns 7, report a lock anomaly · never --settled-override · never immediate repeated retry) ·
+            7 busy(락을 지금 판단할 수 없음 — 쓰기락 미획득 또는 소유권 락 기록 중 · 아무것도 바뀌지 않음 · wait out the 30 s stale window · try ONCE · if it still returns 7, report a lock anomaly · never --settled-override · never immediate repeated retry) ·
             8 duplicate origin · 9 conflict(409)
 
 T0a(2026-07-13 · attention-p0 승인): W0-3 evidence 게이트·W2-1 전이표·W1-2 handoff 리마인더를
@@ -286,7 +286,7 @@ TERMINAL_FROM = ("in_progress", "in_review")  # W2-1 전이표: 터미널 전이
 EXIT_OK, EXIT_USAGE, EXIT_NOTFOUND, EXIT_BLOCKED, EXIT_DUP, EXIT_CONFLICT = 0, 2, 3, 4, 8, 9
 EXIT_NO_EVIDENCE = 5  # W0-3: done 전이에 증거 부재(T0a 이식 · 기존 exit 체계와 무충돌)
 EXIT_VERIFY = 6  # T1: verify_spec 게이트 거부(D9 — 6·7 빈 슬롯 실측 후 배정 · 조건 28)
-EXIT_BUSY = 7  # 쓰기락 미획득. 소유자 판정이 아니다 — 이 경로엔 pid 도 owner_id 도 없다. 처방은 BUSY_REMEDY
+EXIT_BUSY = 7  # 락을 지금 판단할 수 없음. 소유자 판정이 아니다 — 이 경로엔 pid 도 owner_id 도 없다. 처방은 BUSY_REMEDY
 BUSY_REMEDY = "wait out the 30 s stale window · try ONCE · if it still returns 7, report a lock anomaly · never --settled-override · never immediate repeated retry"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -815,7 +815,11 @@ _WLOCK_TOKENS = {}  # task_id → 이 프로세스가 쥔 락 인스턴스의 �
 
 
 class _WlockBusy(Exception):
-    """_wlock 획득 실패 — main 이 EXIT_BUSY 로 거부한다. 한 곳에서만 코드로 바꾼다."""
+    """_wlock 획득 실패 등 판단 불가 — main 이 EXIT_BUSY 로 거부한다. 한 곳에서만 코드와 문면으로 바꾼다."""
+
+    def __init__(self, task_id, what="쓰기락을 갖지 못했다"):
+        super().__init__(task_id)
+        self.what = what
 
 
 @contextlib.contextmanager
@@ -1119,6 +1123,20 @@ def _acquire_lock(task_id, owner_id, pid=None, claim_gen=None):
     return "adopted", owner_rec
 
 
+def _clear_ownerless_lock(task_id):
+    """주인 정보를 읽을 수 없는 락을 지운다. 지킬 소유가 없다 — 정체가 생겼으면 손대지 않는다."""
+    lock = _lock_dir(task_id)
+    if _read_owner(task_id) is not None:
+        return False
+    with contextlib.suppress(OSError):
+        os.remove(os.path.join(lock, "owner.json"))
+    try:
+        os.rmdir(lock)
+    except OSError:
+        return False
+    return True
+
+
 def _release_claim(task_id, owner_id, claim_gen, claim_id=None):
     """소유권 락을 지우는 유일한 길. 규칙: 호출자가 쥔 바로 그 소유일 때만, 그 사실을 적은 레코드가 내구화된 뒤에만 지운다.
     소유자 이름만으론 안 된다 — 같은 이름이 새로 잡은 소유를 지우게 된다. 강제 옵션은 없다. 다른 소유면 아무것도 안 한다."""
@@ -1336,6 +1354,16 @@ def cmd_release(a):
             print(f"not found: {a.id}", file=sys.stderr)
             return EXIT_NOTFOUND
         holder = _read_owner(a.id)
+        lock_dir = _lock_dir(a.id)
+        # 주인을 읽을 수 없는 락(획득 중 크래시 등): 이름으로 풀 수 없고 지킬 소유도 없다. 유예 안에선 기록 중일 수 있어 판단하지 않는다.
+        ownerless = holder is None and os.path.isdir(lock_dir)
+        if ownerless:
+            if time.time() - os.stat(lock_dir).st_mtime < OWNER_WRITE_GRACE_SEC:
+                raise _WlockBusy(a.id, "소유권 락에 주인 정보가 아직 없다(기록 중일 수 있다)")
+            if not a.force:
+                print("error: 주인 정보가 없는 락 — 이름으로 풀 수 없다. --force --force-reason 으로 지운다. 아무것도 바뀌지 "
+                      "않았다.", file=sys.stderr)
+                return EXIT_USAGE
         if not a.force and holder and holder.get("owner_id") != a.owner:
             print(f"conflict(409): 락 소유자 불일치 (holder={holder.get('owner_id')})", file=sys.stderr)
             return EXIT_CONFLICT
@@ -1347,7 +1375,7 @@ def cmd_release(a):
                   file=sys.stderr)
             return EXIT_CONFLICT
         record_claim = task.get("owner") == a.owner or a.force
-        claim = ((task.get("owner"), task.get("claim_gen")) if record_claim
+        claim = ((task.get("owner"), task.get("claim_gen")) if a.force
                  else (a.owner, (holder or {}).get("claim_gen")))
         if a.force:
             task.setdefault("force_history", []).append(
@@ -1358,9 +1386,16 @@ def cmd_release(a):
                 task["status"] = "todo"
             task["updated_at"] = _now()
             _write_task(a.id, task)
-        _release_claim(a.id, *claim)
+        if ownerless:
+            _clear_ownerless_lock(a.id)
+        else:
+            _release_claim(a.id, *claim)
+        if os.path.isdir(lock_dir):  # 락이 남았으면 성공이라 말하지 않는다
+            print("conflict(409): 락이 남아 있다 (holder=%s) — released 아님. 레코드는 이미 갱신됐을 수 있다."
+                  % ((_read_owner(a.id) or {}).get("owner_id")), file=sys.stderr)
+            return EXIT_CONFLICT
     _remove_guard_claims(a.id)  # B1(§2-1): 바인딩 해제 — guard 무발동 복귀
-    print(f"released: {a.id}")
+    print(f"released: {a.id}" + (" (주인 정보가 없는 락을 지웠다)" if ownerless else ""))
     return EXIT_OK
 
 
@@ -3236,7 +3271,7 @@ def main(argv=None):
     try:
         return a.fn(a)
     except _WlockBusy as e:  # 이 코드·문면을 쓰는 유일한 자리
-        print("busy(%d): %s 쓰기락을 갖지 못했다 — 아무것도 바뀌지 않았다. %s" % (EXIT_BUSY, e, BUSY_REMEDY), file=sys.stderr)
+        print("busy(%d): %s %s — 아무것도 바뀌지 않았다. %s" % (EXIT_BUSY, e, e.what, BUSY_REMEDY), file=sys.stderr)
         return EXIT_BUSY
 
 
