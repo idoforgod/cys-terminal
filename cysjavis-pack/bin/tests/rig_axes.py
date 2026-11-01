@@ -32,8 +32,11 @@ def breaches(env, cwd, rig):
 
 
 def assert_sealed(case, env, rig):
-    """One assertion per axis, so a breach names itself. Runs before the operation it guards."""
+    """One assertion per axis, so a breach names itself. Then stop: a failure inside subTest does not end the test, and
+    the operation this guards must not start."""
     bad = breaches(env, os.getcwd(), rig)
     for axis in AXES:
         with case.subTest(axis=axis):
             case.assertNotIn(axis, bad)
+    if bad:
+        case.fail("rig breach, operation not started: %s" % sorted(bad))

@@ -188,6 +188,27 @@ class RigAxes(unittest.TestCase):
         control("A9 each axis pushed outside the rig is named alone: %s" % (caught == {a: [a] for a in AXES}))
         self.assertEqual(caught, {a: [a] for a in AXES})
 
+    def test_a_breach_stops_the_operation_it_guards(self):
+        rig = os.path.realpath(tempfile.mkdtemp(prefix="axes-"))
+        self.addCleanup(shutil.rmtree, rig, True)
+        env = {a: rig for a in AXES if a != "cwd"}
+        env["HOME"] = "/outside/the/rig"
+        started = []
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(rig)
+
+        class Fixture(unittest.TestCase):
+            def runTest(self):
+                assert_sealed(self, env, rig)
+                started.append("operation")
+        result = Fixture().run()
+        named = [str(t) for t, _ in result.failures if "axis='HOME'" in str(t)]
+        control("A9 outside axis: operation started=%s, HOME named=%s, passed=%s" % (
+            bool(started), bool(named), result.wasSuccessful()))
+        self.assertEqual(started, [])
+        self.assertTrue(named)
+        self.assertFalse(result.wasSuccessful())
+
 
 class P2SettleGatePassRow(Base):
     EV = ("--evidence", "unit test evidence")
