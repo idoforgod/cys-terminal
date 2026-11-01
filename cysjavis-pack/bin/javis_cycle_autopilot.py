@@ -157,8 +157,9 @@ def lane_state_parent():
     pipe = re.match(r"^[\\/]{2}[^\\/]+[\\/]pipe[\\/]([^\\/]+)$", lane_socket(), re.IGNORECASE)
     if pipe:
         return os.path.join(os.path.expanduser("~"), ".local", "state", pipe.group(1).lower())
-    # 심링크로 부른 소켓은 같은 소켓이다 — 경로 표기가 아니라 실제 디렉터리가 레인이다.
-    real = os.path.realpath(state_socket_dir())
+    # 심링크로 부른 소켓은 같은 소켓이다 — 소켓 파일째 해석한 뒤 부모를 취한다(파일만 링크일 수 있다).
+    sock = lane_socket()
+    real = os.path.dirname(os.path.realpath(sock)) if sock else os.path.realpath(state_socket_dir())
     return base_state_parent() if real == os.path.realpath(base_state_parent()) else real
 
 

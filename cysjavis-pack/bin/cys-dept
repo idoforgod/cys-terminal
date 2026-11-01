@@ -3315,8 +3315,14 @@ EOF
       unset CYS_SURFACE_ID JAVIS_SURFACE_ID AITERM_SURFACE_ID CYS_SURFACE_REF
     fi
     # 해석기는 <root>/_round 가 있을 때만 CYS_PROJECT_ROOT 를 받는다 — 없으면 본부 원장으로 샌다. 팩이 있을 때만 만든다(유령 팩 금지).
-    if [ -d "$(dept_pack "$name")" ]; then mkdir -p "$(dept_pack "$name")/_round"; fi
-    export CYS_SOCKET="$_pt_sock" CYS_PACK_DIR="$(dept_pack "$name")" CYS_PROJECT_ROOT="$(dept_pack "$name")"
+    #   팩이 없으면 루트를 내세우지 않는다: 복구 명령은 그대로 돌고, 호출자의 다른 레인 루트도 넘기지 않는다.
+    if [ -d "$(dept_pack "$name")" ]; then
+      mkdir -p "$(dept_pack "$name")/_round"
+      export CYS_PROJECT_ROOT="$(dept_pack "$name")"
+    else
+      unset CYS_PROJECT_ROOT
+    fi
+    export CYS_SOCKET="$_pt_sock" CYS_PACK_DIR="$(dept_pack "$name")"
     # ★G3 축1: 부서 컨텍스트 실행에 계정 dir 동반 주입(유도 3순위 resolve_lane_acctdir 재사용) —
     # 부서 스코프 config 시드 표적은 ${CYS_ACCOUNT_DIR}(실소비 SOT · 폴백 dir 없음)이라, 이 주입이
     # 없으면 컨텍스트 CLI(init-pack 등)의 훅 시드가 생략(loud WARN)으로 접힌다. 유도 실패 = 계정격리

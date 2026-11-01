@@ -13,6 +13,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 
@@ -31,6 +32,13 @@ VERBS = (("launch", ("launch", "dept-1")), ("allocate", ("allocate",)), ("create
 
 EXPORT = 'CYS_PROJECT_ROOT="$pack"'
 ALIASES = ("JAVIS_SOCKET", "AITERM_SOCKET")
+
+
+def setUpModule():
+    """Sandbox runs inherit this process's cwd, and the resolvers ascend from cwd. Start from nowhere near a real _round."""
+    cwd = os.getcwd()
+    unittest.addModuleCleanup(os.chdir, cwd)
+    os.chdir(tempfile.gettempdir())
 
 
 def control(msg):
@@ -140,8 +148,13 @@ class ContextCommand(Verbs):
 
 class UnrestartedLane(Verbs):
     """A pack with no _round, the case the natural-restart window leaves behind: dept-3, 6, 7, 8, 9, 10 today."""
-    RESOLVE = ("import sys\nsys.path.insert(0, sys.argv[1])\nimport javis_state_ledger as l\n"
-               "print('@@' + l.PROJECT)\nl.append_record('note', 'test', {'text': 'x'})\n")
+    # cwd first: the resolvers ascend from cwd, and a sealed HOME does not stop that reaching a real ~/_round.
+    RESOLVE = ("import os, sys\nos.chdir(os.environ['HOME'])\nsys.path.insert(0, sys.argv[1])\n"
+               "import javis_state_ledger as l\nprint('@@' + l.PROJECT)\n"
+               "home = os.path.realpath(os.environ['HOME'])\n"
+               "if not os.path.realpath(l.ledger_path()).startswith(home + os.sep):\n"
+               "    sys.exit('outside the rig, refusing: ' + l.ledger_path())\n"
+               "l.append_record('note', 'test', {'text': 'x'})\n")
 
     def sandbox(self):
         sb = Sandbox(CYS_NO_AUTOSTART="1")
@@ -163,6 +176,33 @@ class UnrestartedLane(Verbs):
         self.assertEqual(project, pack)
         self.assertTrue(os.path.exists(lane))
         self.assertFalse(os.path.exists(base))
+
+    def test_a_registered_lane_with_no_pack_claims_no_root(self):
+        """Accepted limit: the ledger falls to HOME as at the tag. The env must not say otherwise."""
+        sb = self.sandbox()
+        sb.seed_entry("dept-9", "m9", age=9999)
+        sb.env["CYS_PROJECT_ROOT"] = "/stale/root/of/the/caller"
+        rc, out, err = sb.run("dept-9", "--", "env")
+        env = dict(ln.split("=", 1) for ln in out.splitlines() if "=" in ln)
+        control("P1R4 registered lane, pack missing: rc=%s, CYS_PROJECT_ROOT exported=%s, pack made=%s" % (
+            rc, "CYS_PROJECT_ROOT" in env, os.path.exists(os.path.join(sb.home, ".cys", "pack-dept-dept-9"))))
+        self.assertEqual(rc, 0, err[-300:])
+        self.assertNotIn("CYS_PROJECT_ROOT", env)
+        self.assertFalse(os.path.exists(os.path.join(sb.home, ".cys", "pack-dept-dept-9")))
+        rc, out, err = sb.run("dept-9", "--", sys.executable, "-B", "-c", self.RESOLVE, os.path.dirname(HERE))
+        project = [x for x in out.splitlines() if x.startswith("@@")][-1][2:]
+        control("P1R4 same lane, the known limit: resolver falls to HOME=%s" % (project == sb.home))
+        self.assertEqual(os.path.realpath(project), os.path.realpath(sb.home))
+
+    def test_the_resolver_refuses_to_write_outside_the_rig(self):
+        """Control for the guard above, written after a run of this file reached the live base ledger."""
+        sb = self.sandbox()
+        os.makedirs(os.path.join(sb.home, ".cys", "pack-dept-dept-7"))
+        code = self.RESOLVE.replace("os.chdir(os.environ['HOME'])", "os.environ['HOME'] = os.path.join(os.environ['HOME'], 'other')")
+        rc, _, err = sb.run("dept-7", "--", sys.executable, "-B", "-c", code, os.path.dirname(HERE))
+        control("P1R4 rig check on the resolver: rc=%s refused=%s" % (rc, "outside the rig" in err))
+        self.assertNotEqual(rc, 0)
+        self.assertIn("outside the rig", err)
 
     def test_a_context_command_for_no_such_lane_makes_no_pack(self):
         sb = self.sandbox()

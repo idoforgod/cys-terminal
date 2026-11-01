@@ -331,6 +331,30 @@ class FilesystemAliases(Base):
         self.assertEqual(got["state_dir"], os.path.join(real, "cycle_autopilot"))
         self.assertNotIn("suppressed", got["sweep"])
 
+    def test_a_socket_file_symlink_to_base_is_base(self):
+        """The review's case: only the file is a link, so its parent is an ordinary directory."""
+        real = os.path.join(self.home, ".local", "state", "cys")
+        os.makedirs(real)
+        link = os.path.join(self.home, "sock-link")
+        os.symlink(os.path.join(real, "cys.sock"), link)
+        self.handoff(self.base_round, "old")
+        self.tick(None)
+        self.handoff(self.base_round, "new")
+        alias = self.tick(None, CYS_SOCKET=link)
+        canonical = self.tick(None)
+        control("P1R4 base through a socket-file link: alias emitted=%d, canonical then=%d, rows=%d" % (
+            alias["sweep"]["emitted"], canonical["sweep"]["emitted"], self.rows(self.base_round)))
+        self.assertEqual((alias["sweep"]["emitted"], canonical["sweep"]["emitted"], self.rows(self.base_round)), (1, 0, 1))
+
+    def test_a_socket_file_symlink_to_a_dept_is_that_dept(self):
+        real = os.path.dirname(self.sock("dept-4"))
+        os.makedirs(real)
+        link = os.path.join(self.home, "sock-link")
+        os.symlink(self.sock("dept-4"), link)
+        got = self.tick("dept-4", CYS_SOCKET=link)
+        control("P1R4 dept through a socket-file link: own_root is the pack=%s" % (got["own_root"] == self.pack("dept-4")))
+        self.assertEqual(got["own_root"], self.pack("dept-4"))
+
     def test_an_unknown_socket_is_not_unrestricted(self):
         self.handoff(self.base_round, "old")
         self.tick(None)
@@ -399,6 +423,40 @@ class Staleness(Base):
                            env=self.env(None, CYS_STATE_DIR=os.path.join(self.home, "st")), timeout=60)
         control("P1R3 base card missing, newer decoy at ~/round: %s" % r.stdout.strip())
         self.assertEqual(r.stdout.strip().splitlines()[-1], "session_state_missing", r.stderr)
+
+    def staleness_at(self, root, pack, session):
+        code = ("import sys\nsys.path.insert(0, sys.argv[1])\nimport javis_state_ledger as l\n"
+                "l.append_record('handoff', 'test', {'name': 'x', 'path': 'y'})\n"
+                "print(l.staleness_check(session=sys.argv[2])['result'])\n")
+        r = subprocess.run([PY, "-B", "-c", code, BIN, session], capture_output=True, text=True, cwd=self.home,
+                           env=self.env(None, root=root, CYS_PACK_DIR=pack, CYS_STATE_DIR=os.path.join(self.home, "st")),
+                           timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout.strip().splitlines()[-1]
+
+    def test_a_pack_reached_through_a_symlink_is_still_the_lane(self):
+        self.lane_round("dept-5")
+        state = os.path.join(self.pack("dept-5"), "round", "SESSION_STATE.md")
+        os.makedirs(os.path.dirname(state))
+        with open(state, "w", encoding="utf-8") as f:
+            f.write("x")
+        os.utime(state, (1000000000, 1000000000))
+        link = os.path.join(self.home, "pack-alias")
+        os.symlink(self.pack("dept-5"), link)
+        got = self.staleness_at(self.pack("dept-5"), link, "s4")
+        control("P1R4 staleness, CYS_PACK_DIR is a symlink to the lane's pack: %s" % got)
+        self.assertEqual(got, "recorded")
+
+    def test_a_project_named_like_a_pack_gets_no_dept_semantics(self):
+        project = os.path.join(self.home, "dev", "pack-dept-x")
+        os.makedirs(os.path.join(project, "_round"))
+        os.makedirs(os.path.join(project, "round"))
+        with open(os.path.join(project, "round", "SESSION_STATE.md"), "w", encoding="utf-8") as f:
+            f.write("x")
+        os.utime(os.path.join(project, "round", "SESSION_STATE.md"), (4000000000, 4000000000))
+        got = self.staleness_at(project, self.pack("dept-5"), "s5")
+        control("P1R4 staleness, ordinary project named pack-dept-x with a newer round/ card: %s" % got)
+        self.assertEqual(got, "session_state_missing")
 
     def test_a_dept_lane_ignores_a_stray_card_beside_its_ledger(self):
         r = self.lane_round("dept-5")

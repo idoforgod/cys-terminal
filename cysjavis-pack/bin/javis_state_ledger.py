@@ -347,10 +347,11 @@ def _marker_path(session):
 
 
 def _session_state_for(ledger):
-    """원장 옆 SESSION_STATE.md. 원장이 부서 팩에 있으면 그 팩의 round/ — 부서 상태의 정본이다.
-    판단은 팩 정체로 한다. 옆 파일이 없다고 이웃의 round/ 를 집으면 본부의 빠진 카드가 '신선함'으로 읽힌다."""
+    """원장 옆 SESSION_STATE.md. 원장의 루트가 이 레인의 팩이면 그 팩의 round/ — 부서 상태의 정본이다.
+    판단은 실제 경로의 일치로 한다. 이름으로 판단하면 pack-dept-x 라는 평범한 프로젝트가 부서가 되고, 심링크로 부른 팩은 부서가 아니게 된다."""
     root = os.path.dirname(os.path.dirname(ledger))
-    if os.path.basename(root).startswith("pack-dept-"):
+    pack = os.environ.get("CYS_PACK_DIR", "").strip()
+    if pack and os.path.realpath(root) == os.path.realpath(pack):
         return os.path.join(root, "round", "SESSION_STATE.md")
     return os.path.join(os.path.dirname(ledger), "SESSION_STATE.md")
 
