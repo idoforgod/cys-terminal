@@ -1970,8 +1970,8 @@ def _desired_view(socket, rebase=False, intents=None, intents_truncated=False):
     if intents and not intents_truncated:
         _apply_intents_to_tombstones(intents, tombstones)
 
-    # 우선순위: 세대 스냅샷 < 기존 desired < 현재 topology. 세대는 desired 가 모르는 역할만 채운다 — 최대 6시간 묵은 사본이
-    #   desired 의 더 새로운 세션 핀을 되돌리면 안 된다(0.14.57 P4 VIEW-5 실측). ★P2-1: ephemeral 제외(미래 유입 차단).
+    # 우선순위: 기존 desired < 현재 topology. ★세대 스냅샷은 여기 들어가지 않는다 — 아래 snapshot_only_roles 로 이름만 알린다.
+    #   ★P2-1: ephemeral 제외(미래 유입 차단).
     _skipped = []
     if _snapshot_roster_entries is _SNAPSHOT_ROSTER_ENTRIES:
         _snap = _snapshot_roster_entries(socket, _skipped)  # 출하 함수: P7 의 파싱 실패 세대 목록을 함께 받는다
@@ -1979,9 +1979,6 @@ def _desired_view(socket, rebase=False, intents=None, intents_truncated=False):
         # 검체가 심은 대역(lambda s: …)은 쓰인 그대로의 1-인자 호출 꼴을 유지한다(r1 §13: 패치되는 이름은 이름·
         # 시그니처·호출 자리를 그대로 둔다). 대역 아래에서는 세대 목록이 비어 P7(generation)이 발화하지 않는다.
         _snap = _snapshot_roster_entries(socket)
-    for role, e in _snap.items():
-        if not _is_ephemeral_role(role, e):
-            roster.setdefault(role, e)
     for e in topo.get("entries", []):
         if e.get("role") and not _is_ephemeral_role(e["role"], e):
             roster[e["role"]] = e
@@ -1998,6 +1995,14 @@ def _desired_view(socket, rebase=False, intents=None, intents_truncated=False):
         elif v == "ambiguous":
             tombstones.add(role)  # 부활 보류(엔트리 보존·target 제외)
             log("★P2-1 escalation: 비표준 ephemeral 변형(%s) 판정 애매 — 부활 보류(사람 판단·untomb 로 재편입)." % role)
+    # ★0.14.57 P4(결정): 세대에만 있는 역할은 부활 대상이 아니고 desired 에 들어가지 않는다. `cys restore` 는 topology 만 읽어 그 역할을
+    #   세우지 못하고, 대상으로 잡으면 FAILED 가 로그에만 남으며 300초 안의 둘째 부팅이 차단기를 열어 다른 역할까지 묶는다(실측).
+    #   복구 없이 해만 는다 — 그래서 이름만 알린다(필드 1 + 로그 1줄). 손상 desired 복구(_recover_retention_file)는 별개다.
+    global _SNAPSHOT_ONLY_ROLES
+    _SNAPSHOT_ONLY_ROLES = sorted(r for r, e in _snap.items()
+                                  if r not in roster and r not in tombstones and not _is_ephemeral_role(r, e))
+    if _SNAPSHOT_ONLY_ROLES:
+        log("세대 스냅샷에만 있는 역할 %s — 복구 대상이 아니다(보고만 · snapshot_only_roles)." % _SNAPSHOT_ONLY_ROLES)
     # ★codex W2 BLOCKING: 묘비 역할의 **roster 엔트리는 보존**한다(pop 금지). 배제는 부활 target 산정 시점에
     #   tombstones 대조로 수행(run_restore·cmd_reconcile). 엔트리·메타(session/cwd/agent)가 남아 있어야 데몬이
     #   묘비를 해제(untomb)하면 즉시 부활 가능하다 — 과거 pop 은 untomb 를 무의미하게 만드는 함정(false-green).
@@ -2013,6 +2018,7 @@ def _desired_view(socket, rebase=False, intents=None, intents_truncated=False):
                           if r not in tombstones
                           and _ephemeral_verdict(r, _prev_roster.get(r)) != "ephemeral")
     meta = {"replace": _replace,
+            "snapshot_only_roles": list(_SNAPSHOT_ONLY_ROLES),
             "topo_tombs": sorted(topo_tombs),
             "snapshot_skipped": list(_skipped),
             "topology_status": ("error" if "_error" in topo else "missing" if topo.get("_missing") else "ok"),
@@ -2218,6 +2224,7 @@ _LAST_LIVENESS_SOURCE = "status_json"      # "status_json" | "list_fallback"
 _LAST_LIVENESS_ENUMERATED = False          # status --json 응답에 "surfaces" 키가 실재했는가
 # 0.14.56 plan 의 observed.status_samples — 실 liveness 판독(_live_surfaces_raw) 횟수. plan 이 시작할 때 0 으로 둔다.
 _LIVENESS_SAMPLES = 0
+_SNAPSHOT_ONLY_ROLES = []                  # 마지막 _desired_view 가 본, 세대에만 있는 역할(0.14.57 P4 · 결과 필드의 재료)
 
 
 def _last_liveness_provenance():
@@ -3668,6 +3675,7 @@ def _run_restore_locked(socket, ticket="default", stub=False, no_breaker=False, 
     result = {
         "phoenix_restore": final,
         "completeness": completeness,          # ★Phase10: readiness 기반 전원 부활 판정
+        "snapshot_only_roles": list(_SNAPSHOT_ONLY_ROLES),  # ★0.14.57 P4: 세대에만 있는 역할 — 복구 대상 아님 · 보고만
         "incomplete_roles": incomplete_roles,  # ★Phase10: 미부활 역할 정직 명시(침묵 성공 금지)
         "manual_seats": manual_seats,          # ★SEAT: 좌석은 있으나 에이전트 부재(사람 개입 필요) — 정직 명시
         "fresh_fallback_roles": fresh_fallback_roles,  # ★Phase11: 독약 세션→fresh 강등 역할 정직 명시(독약만 · 리뷰 R2)
@@ -3879,6 +3887,7 @@ def _plan_compute(socket, compare_plan=None):
                          "c6_exited_surfaces": sum(1 for ss in live.values() for s in ss if s.get("exited")),
                          "status_samples": _LIVENESS_SAMPLES,
                          "view_roles": sorted(roster), "view_tombstones": sorted(tombstones),
+                         "snapshot_only_roles": list(meta["snapshot_only_roles"]),
                          "replace": meta["replace"], "snapshot_skipped": list(meta["snapshot_skipped"]),
                          "restore_units": units, "restore_outer_s": outer_s, "restore_unit_s": unit_s,
                          "restore_budget_source": budget_src}}

@@ -6,7 +6,8 @@ Until 0.14.57 `_snapshot_roster_entries` and `_snapshot_tombstones` opened a bar
 nothing, on every call. This file uses REAL generations: every one is written by javis_state_snapshot.do_snapshot.
 
 KEY    the lookup itself: positive control (the count rises), wrong lane, corrupt newest generation still falls back.
-VIEW   caller 1, `_desired_view`, end to end through `plan` and `run_restore` with a fake daemon.
+VIEW   caller 1, `_desired_view`, end to end through `plan` and `run_restore` with a fake daemon. A role only a generation
+       knows is named in snapshot_only_roles, not restored: by decision.
 RECOV  caller 2, `_recover_retention_file`, end to end through `run_restore`.
 
 The fake `cys restore` is faithful on one point that matters here: it starts what topology.json lists, nothing else.
@@ -231,35 +232,37 @@ def key_checks(w, check):
     check("KEY-9b implicit department environment: every child command names that same socket", sockets and set(sockets) == {sock}, sockets)
     rc, _f, plan, out, err, calls = rig.run_cli(fake, ["plan"], world, script=w.m.__file__)
     roles = (plan or {}).get("observed", {}).get("view_roles")
-    check("KEY-9c control: with no environment socket it is the base lane", rc == 0 and "base-only-role" in (roles or []), roles)
+    names = (plan or {}).get("observed", {}).get("snapshot_only_roles")
+    check("KEY-9c control: with no environment socket it is the base lane", rc == 0 and names == ["base-only-role"], "%s %s" % (roles, names))
 
 
 def view_checks(w, check):
     """Caller 1: `_desired_view`, through plan (no writes) and through run_restore (persists, spawns)."""
     m, rig = w.m, w.rig
-    # the case the snapshot exists for: topology eroded, desired never saw the role
+    # A role only a generation knows. By decision it is reported, not restored: cys restore cannot start it, and as a target it
+    # left FAILED in a log and opened the breaker on a second boot. The same run still has to name it.
     w.reset(live=R.LIVE_W2_GONE)
     w.gen(NEW_T, base=R.topo(R.ROLES), dept=R.topo(["dept-master"]))
     w.live_topology(R.topo(["master", "worker-1"]))
     rc, plan, _ = rig.plan(m)
-    check("VIEW-1a plan: the role only the generation knows is a target", plan and plan["targets"] == ["worker-2"], plan and plan["targets"])
-    check("VIEW-1b plan: the roster holds no department role",
-          plan and plan["observed"]["view_roles"] == R.ROLES, plan and plan["observed"]["view_roles"])
+    check("VIEW-1a plan: the role only a generation knows is not a target", plan and plan["targets"] == [] and plan["outcome"] == "empty",
+          plan and (plan["targets"], plan["outcome"]))
+    check("VIEW-1b plan: it is not in the roster, nor any department role", plan and plan["observed"]["view_roles"] == ["master", "worker-1"],
+          plan and plan["observed"]["view_roles"])
     check("VIEW-1c plan wrote nothing", not os.path.exists(os.path.join(rig.phx, "desired_roster.json")))
     res = w.restore("view1")
-    print("     measured: phoenix_restore=%s, exit %s, cys restore called=%s"
-          % (res.get("phoenix_restore"), m.restore_exit_code(res), w.restore_called()))
-    check("VIEW-1d restore persists the role into desired", "worker-2" in w.desired_file()["roster"])
-    check("VIEW-1e restore calls cys restore for it", w.restore_called())
-    # Not a pass. The review named this line: detection without recovery. The primitive reads topology only; no restore route is
-    # ordered. The state is printed so a run shows it, and it is not counted among the PASS lines.
-    print("OPEN VIEW-1f the role only a generation knows is detected and is NOT restored: alive %s, verdict %s, exit %s"
-          % ("worker-2" in [s["role"] for s in rig.surfaces], res.get("phoenix_restore"), m.restore_exit_code(res)))
-
-    # the merge is one way: once in desired the role stays after generations stop listing it
+    print("     measured: phoenix_restore=%s, exit %s, cys restore called=%s, snapshot_only_roles=%s"
+          % (res.get("phoenix_restore"), m.restore_exit_code(res), w.restore_called(), res.get("snapshot_only_roles")))
+    check("VIEW-1d restore does not put it into desired", "worker-2" not in w.desired_file()["roster"], sorted(w.desired_file()["roster"]))
+    check("VIEW-1e restore is NOOP, exit 0, cys restore is not called", res.get("phoenix_restore") == "NOOP" and m.restore_exit_code(res) == 0
+          and not w.restore_called(), res.get("phoenix_restore"))
+    check("VIEW-1f CONTROL the name appears: plan and restore both carry it in snapshot_only_roles",
+          plan and plan["observed"].get("snapshot_only_roles") == ["worker-2"] and res.get("snapshot_only_roles") == ["worker-2"],
+          "%s %s" % (plan and plan["observed"].get("snapshot_only_roles"), res.get("snapshot_only_roles")))
     w.gen(NEW_T + 21600, base=R.topo(["master", "worker-1"]), dept=R.topo(["dept-master"]))
     rc, plan, _ = rig.plan(m)
-    check("VIEW-1g MEASURED: a newer generation without the role does not take it back out", plan and plan["targets"] == ["worker-2"], plan and plan["targets"])
+    check("VIEW-1g a newer generation without the role: the name is gone too", plan and plan["observed"].get("snapshot_only_roles") == [] and plan["targets"] == [],
+          plan and plan["observed"].get("snapshot_only_roles"))
 
     # closed after the snapshot: the daemon's tombstone wins
     w.reset(live=R.LIVE_W2_GONE)
@@ -267,8 +270,8 @@ def view_checks(w, check):
     w.live_topology(R.topo(["master", "worker-1"], tombs=["worker-2"], rev=2))
     rc, plan, _ = rig.plan(m)
     check("VIEW-2a role tombstoned after the snapshot is not a target", plan and plan["targets"] == [], plan and plan["targets"])
-    check("VIEW-2b its entry is kept, tombstoned", plan and "worker-2" in plan["observed"]["view_roles"]
-          and "worker-2" in plan["observed"]["view_tombstones"], plan and plan["observed"])
+    check("VIEW-2b it is tombstoned, and a tombstoned role is not named as snapshot-only", plan and "worker-2" in plan["observed"]["view_tombstones"]
+          and plan["observed"].get("snapshot_only_roles") == [], plan and plan["observed"])
     w.restore("view2")
     check("VIEW-2c restore does not start it", not w.restore_called())
 
@@ -277,8 +280,8 @@ def view_checks(w, check):
     w.gen(NEW_T, base=R.topo(["master", "worker-1", "worker-fresh-12"]), dept=R.topo(["dept-master"]))
     w.live_topology(R.topo(["master", "worker-1"]))
     rc, plan, _ = rig.plan(m)
-    check("VIEW-3 ephemeral role from a generation is not merged",
-          plan and plan["observed"]["view_roles"] == ["master", "worker-1"], plan and plan["observed"]["view_roles"])
+    check("VIEW-3 ephemeral role from a generation is not merged and not named",
+          plan and plan["observed"]["view_roles"] == ["master", "worker-1"] and plan["observed"].get("snapshot_only_roles") == [], plan and plan["observed"]["view_roles"])
 
     # corrupt newest generation, seen through plan
     w.reset(live=R.LIVE_W2_GONE)
@@ -287,7 +290,8 @@ def view_checks(w, check):
     R._write(w.gen_path(g, w.stored_as(g, w.base_source())), R.CORRUPT)
     w.live_topology(R.topo(["master", "worker-1"]))
     rc, plan, _ = rig.plan(m)
-    check("VIEW-4a corrupt newest: the older generation still gives the target", plan and plan["targets"] == ["worker-2"], plan and plan["targets"])
+    check("VIEW-4a corrupt newest: the older generation still answers, as a name", plan and plan["targets"] == []
+          and plan["observed"].get("snapshot_only_roles") == ["worker-2"], plan and plan["observed"].get("snapshot_only_roles"))
     check("VIEW-4b corrupt newest: plan names it as a reason",
           plan and ("topology_unreadable:generation:" + g) in plan["reasons"], plan and plan["reasons"])
 
@@ -300,17 +304,18 @@ def view_checks(w, check):
     newer["roster"]["worker-2"]["session_id"] = "sid-newer-than-the-generation"
     newer["roster"]["worker-2"]["cwd"] = "/tmp/newer"
     R._write(os.path.join(rig.phx, "desired_roster.json"), newer)
-    w.restore("view5")
+    res = w.restore("view5")
     pinned = w.desired_file()["roster"]["worker-2"].get("session_id")
     check("VIEW-5a a role absent from topology keeps desired's newer entry, the generation does not take it back",
           pinned == "sid-newer-than-the-generation", pinned)
     check("VIEW-5b its other fields stay too", w.desired_file()["roster"]["worker-2"].get("cwd") == "/tmp/newer")
-    # control: the same generation still adds a role desired does not know
+    check("VIEW-5c a role desired knows stays a target as at the tag, it is not snapshot-only", res.get("snapshot_only_roles") == [] and w.restore_called(), res.get("snapshot_only_roles"))
+    # the same generation against a desired that does not know the role: named, not added
     newer = R.desired(["master", "worker-1"])
     R._write(os.path.join(rig.phx, "desired_roster.json"), newer)
     rc, plan, _ = rig.plan(m)
-    check("VIEW-5c control: a role absent from desired is still added from the generation",
-          plan and plan["targets"] == ["worker-2"] and "worker-2" in plan["observed"]["view_roles"], plan and plan["observed"]["view_roles"])
+    check("VIEW-5d a role absent from desired is named, not added", plan and plan["targets"] == [] and "worker-2" not in plan["observed"]["view_roles"]
+          and plan["observed"].get("snapshot_only_roles") == ["worker-2"], plan and plan["observed"]["view_roles"])
 
 
 def recover_checks(w, check):
@@ -419,65 +424,34 @@ def recover_checks(w, check):
 
 
 def breaker_checks(w, check):
-    """A role only a generation knows, driven through repeated restores with the real breaker. One boot is two attempts: the
-    daemon's loop retries a non-zero exit once, 60 s later. Report-only: nothing here asserts a new mechanism."""
+    """A role only a generation knows, driven through repeated boots with the real breaker: it must not count. The numbers that
+    decided this are in REPORT-P4-R2.md: as a target it opened the breaker on the third attempt. One boot is two attempts at most."""
     m, rig = w.m, w.rig
     clock = {"t": 2000000000}
     real_now = m._now
     m._now = lambda: clock["t"]
     try:
-        def world():
-            w.reset(live=[R.surf("surface:1", "master")])
-            w.gen(NEW_T, base=R.topo(R.ROLES), dept=R.topo(["dept-master"]))
-            w.live_topology(R.topo(["master", "worker-1"]))
-        print("     breaker: N=%d in %d s" % (m.BREAKER_N, m.BREAKER_T))
-        world()
-        r1 = w.restore("brk1", no_breaker=False)
-        came = "worker-1" in [s["role"] for s in rig.surfaces]
-        print("     measured attempt 1, t=0: %s exit %s, worker-1 back %s" % (r1.get("phoenix_restore"), m.restore_exit_code(r1), came))
-        check("BREAK-1 first attempt: the role topology lists comes back, the generation-only role fails it, exit 1",
-              came and m.restore_exit_code(r1) == 1, r1.get("phoenix_restore"))
-        clock["t"] += 60
-        r2 = w.restore("brk2", no_breaker=False)
-        print("     measured attempt 2, t=60, the daemon's one retry: %s exit %s" % (r2.get("phoenix_restore"), m.restore_exit_code(r2)))
-        check("BREAK-2 one boot, two attempts: exit 1 twice, the breaker stays shut", m.restore_exit_code(r2) == 1, r2.get("phoenix_restore"))
-        # next boot inside the window, and worker-1 has died again
+        w.reset(live=[R.surf("surface:1", "master"), R.surf("surface:2", "worker-1")])
+        w.gen(NEW_T, base=R.topo(R.ROLES), dept=R.topo(["dept-master"]))
+        w.live_topology(R.topo(["master", "worker-1"]))
+        verdicts = []
+        for i in range(4):
+            res = w.restore("brk%d" % i, no_breaker=False)
+            verdicts.append((res.get("phoenix_restore"), m.restore_exit_code(res)))
+            clock["t"] += 40
+        attempts = []
+        if os.path.exists(m.breaker_file(None)):
+            with open(m.breaker_file(None), encoding="utf-8") as f:
+                attempts = json.load(f).get("attempts", [])
+        print("     measured 4 restores inside the window: %s, breaker attempts %d" % (verdicts, len(attempts)))
+        check("BREAK-1 a generation-only role never counts: NOOP exit 0 each time, 0 attempts", verdicts == [("NOOP", 0)] * 4 and attempts == [], verdicts)
+        # the breaker itself is untouched: a role topology lists still comes back, with the name reported beside it
         rig.surfaces = [s for s in rig.surfaces if s["role"] != "worker-1"]
-        clock["t"] += 100
-        r3 = w.restore("brk3", no_breaker=False)
+        res = w.restore("brk5", no_breaker=False)
         back = "worker-1" in [s["role"] for s in rig.surfaces]
-        print("     measured attempt 3, t=160, next boot: %s exit %s, cys restore called %s, worker-1 back %s"
-              % (r3.get("phoenix_restore"), m.restore_exit_code(r3), w.restore_called(), back))
-        check("BREAK-3 a boot inside the window opens it: BREAKER_OPEN, exit 5", r3.get("phoenix_restore") == "BREAKER_OPEN" and m.restore_exit_code(r3) == 5,
-              r3.get("phoenix_restore"))
-        check("BREAK-4 MEASURED: while open another dead role does not come back, cys restore is not called", not back and not w.restore_called())
-        rs = {}
-        with open(m.breaker_file(None), encoding="utf-8") as f:
-            rs = json.load(f)
-        print("     measured breaker.json attempts offsets: %s" % [a - 2000000000 for a in rs.get("attempts", [])])
-        # the verbs: --no-breaker runs anyway and does not clear it
-        rn = w.restore("brk4", no_breaker=True)
-        back = "worker-1" in [s["role"] for s in rig.surfaces]
-        with open(m.breaker_file(None), encoding="utf-8") as f:
-            left = len(json.load(f).get("attempts", []))
-        print("     measured restore --no-breaker while open: %s exit %s, worker-1 back %s, attempts left %d"
-              % (rn.get("phoenix_restore"), m.restore_exit_code(rn), back, left))
-        check("BREAK-5 restore --no-breaker goes through and brings the other role back, it does not clear the file", back and left >= 3, left)
-        # the window: an open breaker ends by time alone
-        rig.surfaces = [s for s in rig.surfaces if s["role"] != "worker-1"]
-        clock["t"] += 301
-        r5 = w.restore("brk5", no_breaker=False)
-        back = "worker-1" in [s["role"] for s in rig.surfaces]
-        print("     measured 301 s later: %s exit %s, worker-1 back %s" % (r5.get("phoenix_restore"), m.restore_exit_code(r5), back))
-        check("BREAK-6 past the window it runs again, the other role comes back, the generation-only role still fails it", back and m.restore_exit_code(r5) == 1, r5.get("phoenix_restore"))
-        # tombstoning the role removes the target, so the next run has nothing to do and resets the breaker
-        topo = R.topo(["master", "worker-1"], tombs=["worker-2"], rev=2)
-        w.live_topology(topo)
-        r6 = w.restore("brk6", no_breaker=False)
-        with open(m.breaker_file(None), encoding="utf-8") as f:
-            left = len(json.load(f).get("attempts", []))
-        print("     measured after a tombstone for the role: %s exit %s, attempts left %d" % (r6.get("phoenix_restore"), m.restore_exit_code(r6), left))
-        check("BREAK-7 a tombstone for the role ends it: NOOP, exit 0, the breaker is reset", r6.get("phoenix_restore") == "NOOP" and left == 0, r6.get("phoenix_restore"))
+        print("     measured a real dead role beside it: %s exit %s, worker-1 back %s, snapshot_only_roles %s"
+              % (res.get("phoenix_restore"), m.restore_exit_code(res), back, res.get("snapshot_only_roles")))
+        check("BREAK-2 a role topology lists still comes back, and the name still appears", back and res.get("snapshot_only_roles") == ["worker-2"], res.get("phoenix_restore"))
     finally:
         m._now = real_now
 
