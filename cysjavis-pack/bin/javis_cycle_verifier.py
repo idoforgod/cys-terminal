@@ -207,9 +207,14 @@ def pack_dir():
 
 
 def paused_paths():
-    """kill-switch 파일 경로 2중(절대경로 핀). 하나라도 존재하면 무집행."""
+    """kill-switch 파일 경로 2중(절대경로 핀). 하나라도 존재하면 무집행.
+
+    ⒜ <팩>/AUTOPILOT_PAUSED = 그 레인만 · ⒝ ~/_round/AUTOPILOT_PAUSED = 전 레인(모두 같은 $HOME).
+    ⒝ 를 PROJECT 에서 유도하지 않는다: PROJECT 가 레인별이 되는 순간 전 레인 정지가 소리 없이 사라진다.
+    같은 식을 짓는 곳은 tests/test_paused_constructors.py 가 술어로 도출해 대조한다(팩이 찢겨도 돌도록 import 없이 동형 유지).
+    """
     return [os.path.join(pack_dir(), PAUSED_BASENAME),
-            os.path.join(PROJECT, "_round", PAUSED_BASENAME)]
+            os.path.join(os.path.expanduser("~"), "_round", PAUSED_BASENAME)]
 
 
 def nonce_for(cycle_id):

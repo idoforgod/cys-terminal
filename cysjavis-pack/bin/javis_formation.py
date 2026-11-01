@@ -177,11 +177,13 @@ def _truthy_env(name):
 
 
 def paused_paths():
-    """kill-switch 파일 2경로(§9-4 2중 기록 규약 — javis_wakeup·javis_cycle_autopilot 와 동일 식).
+    """kill-switch 파일 2경로(§9-4 2중 기록 규약). 같은 식을 짓는 곳: javis_cycle_autopilot·javis_cycle_verifier·
+    javis_formation·javis_wakeup, javis_radio 는 wakeup 에 위임하고 트리거만 더한다 — tests/test_paused_constructors.py 가
+    이 집합을 술어로 도출해 대조한다(문서가 뒤처지면 그 테스트가 정본이다).
+    ⒝ 는 ~/_round 리터럴 — JAVIS_ROOT 로 지으면 레인별로 좁아진다.
     하나라도 존재하면 paused 다 — 데몬이 죽어 gate-check 가 응답 못 해도 정지가 관철된다."""
-    root = os.environ.get("JAVIS_ROOT") or os.getcwd()
     return [os.path.join(PACK_DIR, PAUSED_BASENAME),
-            os.path.join(root, "_round", PAUSED_BASENAME)]
+            os.path.join(os.path.expanduser("~"), "_round", PAUSED_BASENAME)]
 
 
 def _paused_file_hit():
@@ -1878,6 +1880,8 @@ def self_test():
     ck("판정 불능" in _gate_verdict(3).reason and "3" in _gate_verdict(3).reason,
        "보류 사유(exit 코드 포함)가 detail 로 노출되지 않음 — 자기잠금 진단 불가")
     ck(len(paused_paths()) == 2, "PAUSED kill-switch 파일 2경로 규약(§9-4) 이탈")
+    ck(paused_paths()[1] == os.path.join(os.path.expanduser("~"), "_round", PAUSED_BASENAME),
+       "PAUSED ⒝ 는 ~/_round 리터럴 — 전 레인 정지가 레인별로 좁아졌다")
     # ── ★T9 자원 게이트 3분기 재명세(R3-P03-1) — 순수 분기 핀 + end-to-end 재시도 형상 ──
     ck(_resource_branch(2) == "block", "exit 2 가 block 아님")
     ck(_resource_branch(64) == "retry" and _resource_branch(70) == "retry",

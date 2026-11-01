@@ -17,7 +17,7 @@
 ## 2. 안전 불변식 (설계 계약)
 
 - 자동 clear의 유일 경로는 `cys cycle-agent --verifier`(2-phase handshake) — self-clear 코드 차단 불변.
-- kill-switch 4중: ①`cys pause`(스케줄 동결) ②`cys gate-check` ③`$CYS_PACK_DIR/AUTOPILOT_PAUSED` 또는 `<프로젝트>/_round/AUTOPILOT_PAUSED` 파일(하나라도 존재=무집행) ④집행 중 1~5s 폴링·감지 시 SIGTERM.
+- kill-switch 4중: ①`cys pause`(스케줄 동결) ②`cys gate-check` ③`$CYS_PACK_DIR/AUTOPILOT_PAUSED`(그 레인만) 또는 `~/_round/AUTOPILOT_PAUSED`(전 레인) 파일(하나라도 존재=무집행) ④집행 중 1~5s 폴링·감지 시 SIGTERM.
 - 검증자는 반드시 **별도 pane 포그라운드**로 상주(`bootstrap-verifier`가 생성). detached·데몬 스폰은 데몬의 self-approval 게이트가 범주적으로 거부한다. 맨 셸·LLM pane 금지.
 - 측정은 statusline 서버 진실만 판정 투입(claude 노드 한정). 자기보고·transcript 추정은 판정 금지.
 - **실패**(`failed`·`failed_preclear`·`indeterminate`) 종결 후 재발화는 운영자 `reset` + 쿨다운(180s)으로만. **비파괴 보류**(`held_noop` · cycle-agent exit 84/85)는 실패가 아니라 자동 재시도 대상이다 — §4-b 표. `--force-no-verify`는 어떤 경로로도 사용되지 않는다.
