@@ -19679,16 +19679,26 @@ mod tests {
         assert!(ev["draft_visible"].is_null() && ev["remedy_code"].is_null(), "{ev}");
         assert!(ev.get("settle_ms").is_none(), "pause 중 이벤트에도 증명 키가 없다(종전): {ev}");
         // (c) pause + 증명 없음 — 종전대로 유령 처방이 붙는다.
-        let m = denial(None);
+        let (m, ev) = crate::state::test_until_no_pty_output(&seat, "A1 I6 paused denial", || {
+            c5_paint_prompt(&seat, "", "");
+            (denial(None), c5_last_denied_payload(&daemon))
+        });
         assert!(m.ends_with(suffix), "증명이 처음부터 없던 거부는 pause 중에도 처방이 붙는다: {m}");
-        let ev = c5_last_denied_payload(&daemon);
         assert_eq!((ev["draft_visible"].as_bool(), ev["remedy_code"].as_str()), (Some(false), Some("phantom_count")), "{ev}");
         // (d) pause 아님 + 증명 없음 — 처방이 붙는다.
         daemon.paused.store(false, std::sync::atomic::Ordering::Relaxed);
-        assert!(denial(None).ends_with(suffix));
+        let m = crate::state::test_until_no_pty_output(&seat, "A1 I6 unpaused denial", || {
+            c5_paint_prompt(&seat, "", "");
+            denial(None)
+        });
+        assert!(m.ends_with(suffix));
         // (e) 계수 0 — 처방 없음(계수가 없는데 Ctrl-U 를 권하지 않는다).
         seat.clear_pending_input();
-        assert!(!denial(None).contains(suffix), "계수 0 에는 유령 처방이 없다");
+        let m = crate::state::test_until_no_pty_output(&seat, "A1 I6 cleared denial", || {
+            c5_paint_prompt(&seat, "", "");
+            denial(None)
+        });
+        assert!(!m.contains(suffix), "계수 0 에는 유령 처방이 없다");
         d12_cleanup(&daemon, &dir);
     }
 
