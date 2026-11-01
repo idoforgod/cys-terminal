@@ -22,6 +22,8 @@
 #   depts.json 에서 빠진 부서 레인은 최신 1세대만(최종 상태 보관 · 이력 미보관). compute_gc 참조.
 #   ★B317-R1: 부모(d478d97f) 판정을 바닥으로 합집합 — 이 판은 부모가 보관하던 세대를 지우지 않는다(위 예외만).
 # B-317: 적재 = 전 레인 round(카드·노드 TODO·법 묶음) + 레인별 정본 카드(capture_lanes) · DB/WAL/SHM/.bak 제외.
+# 0.14.57 P5: 적재 집합은 술어(_capture_wanted)로 도출한다 — 나열은 언제나 늦다(`*soul.md` 70세대 0건). 패턴마다 실행마다 통제
+#   시험을 돌리고, 전 세대에서 0건인 패턴은 FAILURE 로 마지막 줄에 찍는다. SF_DATALESS 는 stat 만 하고 열지 않는다.
 # D-07: TODO glob 0건도 필수 누락으로 기록하고, autopilot.json 선택부재는 별도 계수한다.
 # D-07: dry-run 은 디렉터리 생성·임시 세대 청소 없이 보관 대상만 표시한다.
 # D-07: .tmp-* 는 살아 있는 pid 를 보호하고, 죽은 pid 는 60초·pid 불명은 3600초 후 청소한다.
@@ -35,6 +37,7 @@
 #   javis_state_snapshot.py self-test              # 원자성/중단내성 실증(격리 임시폴더)
 
 import argparse
+import collections
 import errno
 import fnmatch
 import glob as _glob
@@ -43,6 +46,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import sys
 import tempfile
 import time
@@ -189,11 +193,87 @@ LAW_CORPUS_GLOB = "CSO_STANDING_RULES*.md"
 CAPTURE_EXCLUDE_GLOBS = ("*.db", "*.sqlite", "*-wal", "*-shm", "*.bak", "*.bak-*")
 BASE_LANE = "base"
 FIRING_LANE = "firing"
+# ★0.14.57 P5(CEO 큐 P5): 집합을 나열하지 않고 **술어**로 도출한다. 나열은 언제나 늦고 새 경로가 합법처럼 통과한다 —
+#   `*soul.md` 는 70세대 0건이었고 2026-10-16 판 27,746 B 는 복구 불능이다. 술어 = 아래 경계 안의 깊이 0 정규 파일 중
+#   패턴의 접미사를 가진 비-dot 파일(CAPTURE_EXCLUDE_GLOBS 제외). 재귀 없음 · 심링크 안 따라감. 상한을 넘으면 재기만 한다.
+#   패턴 이름 = 통제·전 세대 계수의 단위. 전 세대 0건 패턴은 통과가 아니라 FAILURE 다(capture_report).
+CAPTURE_SUFFIXES = {"state": (".json", ".seq"), "lane": (".md", ".json"), "round": (".md", ".json"),
+                    "directives": (".md",), "pack-memory": (".md",), "agent-memory": (".md",)}
+CAPTURE_PATTERNS = ("state", "registry", "lane", "round", "directives", "pack-memory", "agent-memory")
+CAPTURE_MAX_BYTES = 16 * 1024 * 1024
+SF_DATALESS = 0x40000000           # macOS: 내용이 로컬에 없는 파일. 열면 내려받는다 — stat 으로만 잰다.
 
 
 def _capture_excluded(path):
     b = os.path.basename(path)
     return any(fnmatch.fnmatchcase(b, g) for g in CAPTURE_EXCLUDE_GLOBS)
+
+
+def _is_dataless(st):
+    return bool(getattr(st, "st_flags", 0) & SF_DATALESS)
+
+
+def _capture_refused(path, home=HOME):
+    """술어가 훑지 않는 곳: `<home>/Desktop/CYSjavis`(iCloud 트리). 실경로로 본다 — 심링크로 들어가도 같다."""
+    tree = os.path.normcase(os.path.realpath(os.path.join(home, "Desktop", "CYSjavis")))
+    real = os.path.normcase(os.path.realpath(path))
+    return real == tree or real.startswith(tree + os.sep)
+
+
+def _capture_wanted(pattern, name, st):
+    """★술어 한 곳. name = basename, st = lstat 결과(심링크는 정규 파일이 아니라 떨어진다)."""
+    return (not name.startswith(".") and name.endswith(CAPTURE_SUFFIXES[pattern])
+            and not _capture_excluded(name) and stat.S_ISREG(st.st_mode))
+
+
+def capture_roots(lanes, state_dirs, home=HOME):
+    """[(패턴, 디렉터리)] — 술어가 들여다보는 곳 전부. 레인이 늘면 따라 늘고, 이 밖은 어떤 경우에도 훑지 않는다.
+    팩 꼴(`<pack>/round`)인 레인만 팩 자리를 본다 — JAVIS_ROOT 프로젝트의 `_round` 부모는 팩이 아니다."""
+    roots = [("state", d) for d in state_dirs]
+    for _lane, rd, card in lanes:
+        roots.append(("round", rd))
+        if card:
+            roots.append(("round", os.path.dirname(card)))
+        if os.path.basename(rd) == "round":
+            pack = os.path.dirname(rd)
+            roots.extend([("lane", pack), ("directives", os.path.join(pack, "directives")),
+                          ("pack-memory", os.path.join(pack, "memory"))])
+    roots.extend(("agent-memory", d) for d in sorted(_glob.glob(os.path.join(home, ".claude*", "projects", "*", "memory"))))
+    seen, out = set(), []
+    for pat, d in roots:
+        if d not in seen:
+            seen.add(d)
+            out.append((pat, d))
+    return out
+
+
+def capture_files(roots, home=HOME, notes=None):
+    """roots 를 깊이 0 으로 훑어 술어를 통과한 경로를 돌려준다. 파일을 열지 않는다(listdir + lstat).
+    notes(dict) = refused_roots(훑지 않은 루트) · oversize(상한 초과 · 재기만)."""
+    notes = {} if notes is None else notes
+    refused, oversize = notes.setdefault("refused_roots", []), notes.setdefault("oversize", [])
+    out = []
+    for pat, d in roots:
+        try:
+            if _capture_refused(d, home) or _is_dataless(os.stat(d)):
+                refused.append(d)
+                continue
+            names = sorted(os.listdir(d))
+        except OSError:
+            continue
+        for n in names:
+            p = os.path.join(d, n)
+            try:
+                st = os.lstat(p)
+            except OSError:
+                continue
+            if not _capture_wanted(pat, n, st):
+                continue
+            if st.st_size > CAPTURE_MAX_BYTES:
+                oversize.append({"source": p, "size": st.st_size})
+                continue
+            out.append(p)
+    return out
 
 
 def _registry_pack_dirs(depts_json):
@@ -294,12 +374,14 @@ def select_card(manifest, lane=BASE_LANE):
 
 
 def default_sources(home=HOME, state_root=None, depts_json=None, windows=None, localappdata=None, env=None,
-                    lanes=None):
+                    lanes=None, census=None):
     """세대 보관 소스를 동적 산출한다(정적 목록 대체). 메인 선언상태 + 루트 레지스트리 +
     ★발견되는 모든 부서의 선언상태를 자동 포함 = '태어날 때부터 보호'(손 배선 0).
     ★Windows(권고#1): 메인 상태=%LOCALAPPDATA%\\cys, 부서=그 하위 cys-dept-*(state.rs 레이아웃). unix 는 종전대로
     <state_root>/cys + <state_root>/cys-dept-*. windows/localappdata 주입으로 mac 에서도 win 분기 단위검증 가능.
-    lanes = 이미 해소한 capture_lanes() 결과(B317-R1 · gemini minor: 스냅샷당 레인 해소 1회 — 미주입 = 여기서 해소)."""
+    lanes = 이미 해소한 capture_lanes() 결과(B317-R1 · gemini minor: 스냅샷당 레인 해소 1회 — 미주입 = 여기서 해소).
+    ★0.14.57 P5: 아래 선언(카드·TODO·법 묶음·상태 이름)은 **있어야 하는 것의 바닥**으로 남아 부재를 manifest `missing` 에
+    올린다. 무엇이 담기는가는 그 위의 술어(capture_files)가 정한다. census(dict)를 주면 roots·notes 를 채운다."""
     win = IS_WINDOWS if windows is None else windows
     if win:
         base = localappdata or os.environ.get("LOCALAPPDATA") or os.path.join(home, "AppData", "Local")
@@ -312,7 +394,8 @@ def default_sources(home=HOME, state_root=None, depts_json=None, windows=None, l
     srcs = [os.path.join(main_state, b) for b in DECLARATIVE_BASENAMES]
     depts_json = depts_json or os.path.join(home, ".cys", "depts.json")
     srcs.append(depts_json)
-    for dd in _dept_state_dirs(dept_scan_root, depts_json=depts_json, windows=win, localappdata=localappdata):
+    dept_dirs = _dept_state_dirs(dept_scan_root, depts_json=depts_json, windows=win, localappdata=localappdata)
+    for dd in dept_dirs:
         srcs.extend(os.path.join(dd, b) for b in DECLARATIVE_BASENAMES)
     # ★G1(d)(cokacdir 성찰 2026-07-04): 복원 SOT·노드 TODO·장기기억도 세대 보관에 포함 —
     #   SESSION_STATE.md 는 재부팅 복원의 단일 진실인데 세대 보관 대상에서 빠져 있었다.
@@ -333,7 +416,10 @@ def default_sources(home=HOME, state_root=None, depts_json=None, windows=None, l
 
     if lanes is None:
         lanes = capture_lanes(home=home, env=env, depts_json=depts_json)
+    notes = {} if census is None else census.setdefault("notes", {})
     for _lane, proj_round, card in lanes:
+        if _capture_refused(proj_round, home):       # ⛔경계: 글롭도 listdir 다 — 선언 단계에서도 그 트리를 훑지 않는다
+            continue
         _add_src(os.path.join(proj_round, ROUND_CARD))
         # D-07: 종전엔 glob 0건이 조용한 0이라 phoenix 세대에서 노드 TODO 누락이 보이지 않았다.
         todo_pattern = os.path.join(proj_round, ROUND_TODO_GLOB)
@@ -346,8 +432,14 @@ def default_sources(home=HOME, state_root=None, depts_json=None, windows=None, l
                 _add_src(p)
         if card:
             _add_src(card)   # 부서 레인은 round 카드와 같은 경로(중복 제거) · 본부는 `~/_round/SESSION_STATE.md`
-    srcs.extend(sorted(_glob.glob(os.path.join(
-        home, ".claude*", "projects", "*", "memory", "*.md"))))
+    for k in srcs:
+        seen.add(os.path.normpath(k))
+    roots = capture_roots(lanes, [main_state] + list(dept_dirs), home=home)
+    for p in capture_files(roots, home=home, notes=notes):
+        _add_src(p)
+    if census is not None:
+        census.update(roots=roots, depts_json=depts_json,
+                      packs=[os.path.dirname(rd) for _l, rd, _c in lanes if os.path.basename(rd) == "round"])
     return srcs
 
 # GC 파라미터
@@ -484,15 +576,21 @@ def do_snapshot(sources=None, gen_root=GEN_ROOT, dry_run=False, crash_hook=None,
     ★B317-R1 M3 + HEAD/CEO: 레지스트리 문제(registry_faults)는 manifest `missing` 에 올라 세대가 INCOMPLETE 로 표시되고,
       요약 줄(phoenix-snapshot-6h 가 `| tail -3` 으로 master 에 push 하는 본문)에 INCOMPLETE 가 찍힌다. rc 는 종전대로 0."""
     registry_faults = []
+    census = None
     if sources is None:
         lanes = capture_lanes(faults=registry_faults)
-        sources = default_sources(lanes=lanes)
+        census = {}
+        sources = default_sources(lanes=lanes, census=census)
         if cards is None:
             cards = canonical_cards(lanes=lanes)
-    present, missing, optional_absent = [], [], []
+    present, missing, optional_absent, dataless = [], [], [], []
     for s in sources:
         if os.path.isfile(s):
-            present.append(s)
+            st = os.stat(s)
+            if _is_dataless(st):         # ⛔열지 않는다 — 크기·시각만 manifest 에 남는다
+                dataless.append({"source": s, "size": st.st_size, "src_mtime": st.st_mtime})
+            else:
+                present.append(s)
         elif os.path.basename(s) in OPTIONAL_BASENAMES:
             optional_absent.append(s)
         else:
@@ -505,6 +603,8 @@ def do_snapshot(sources=None, gen_root=GEN_ROOT, dry_run=False, crash_hook=None,
         incomplete = " — INCOMPLETE: 누락 %d건" % n_missing
         if registry_faults:
             incomplete += " (그중 depts.json registry 문제 %d건)" % len(registry_faults)
+    if dataless:
+        incomplete += "%s dataless %d건(stat 만 · 내용 미보관)" % (" ·" if incomplete else " — INCOMPLETE:", len(dataless))
 
     if dry_run:
         print(f"[dry-run] 세대 보관 대상 {len(present)}건:")
@@ -522,6 +622,8 @@ def do_snapshot(sources=None, gen_root=GEN_ROOT, dry_run=False, crash_hook=None,
                 print(f"  * {lane} -> {cards[lane]}  ({'있음' if os.path.isfile(cards[lane]) else '없음'})")
         if incomplete:
             print(f"[dry-run]{incomplete}")
+        if census is not None:
+            print(capture_report(census, present, gen_root, incomplete))
         return None
 
     os.makedirs(gen_root, exist_ok=True)
@@ -548,18 +650,29 @@ def do_snapshot(sources=None, gen_root=GEN_ROOT, dry_run=False, crash_hook=None,
     }
     if cards:
         manifest["canonical_cards"] = dict(cards)
+    if dataless:
+        manifest["dataless"] = dataless
+    if census is not None:
+        manifest["capture_notes"] = census.get("notes", {})
+    base_count = collections.Counter(os.path.basename(x) for x in present)
     try:
         for src in present:
-            digest = _sha256(src)
-            st = os.stat(src)
+            # 술어가 담는 파일은 살아 움직인다 — 훑은 뒤 사라진 파일 하나가 세대 전체를 잃게 하지 않는다.
+            try:
+                digest = _sha256(src)
+                st = os.stat(src)
+                fsrc_open = open(src, "rb")
+            except OSError as exc:
+                manifest.setdefault("vanished", []).append({"source": src, "error": type(exc).__name__})
+                continue
             base = os.path.basename(src)
             # 소스명 충돌 방지: 경로 해시 접두
             dest_name = base
-            if any(os.path.basename(x) == base for x in present if x != src):
+            if base_count[base] > 1:
                 tag = hashlib.sha256(src.encode()).hexdigest()[:8]
                 dest_name = f"{tag}__{base}"
             dest = os.path.join(tmp_dir, dest_name)
-            with open(src, "rb") as fsrc, open(dest, "wb") as fdst:
+            with fsrc_open as fsrc, open(dest, "wb") as fdst:
                 shutil.copyfileobj(fsrc, fdst)
                 fdst.flush()
                 os.fsync(fdst.fileno())
@@ -627,7 +740,106 @@ def do_snapshot(sources=None, gen_root=GEN_ROOT, dry_run=False, crash_hook=None,
     kept, deleted = do_gc(gen_root=gen_root, dry_run=False)
     if deleted:
         print(f"[gc] {len(deleted)}세대 삭제, {len(kept)}세대 보관")
+    # ★마지막 줄이어야 한다: phoenix-snapshot-6h 는 `2>&1 | tail -3` 만 master 에 민다. stdout 으로 찍는다 — 파이프에서 stdout 은
+    #   버퍼되어 stderr 뒤에 나오므로 stderr 로 찍으면 앞선 줄들에 밀려날 수 있다. rc 는 종전대로 0(B317-R1 계약).
+    if census is not None:
+        print(capture_report(census, present, gen_root, incomplete))
     return gen_name
+
+
+def capture_pattern_of(path, rootmap, depts_json):
+    """경로 하나가 어느 패턴의 것인가(None=어느 것도 아님) — 이번 실행과 지난 세대 manifest 가 같은 판정을 쓴다."""
+    if path == depts_json:
+        return "registry"
+    pat = rootmap.get(os.path.dirname(path))
+    return pat if pat and os.path.basename(path).endswith(CAPTURE_SUFFIXES[pat]) else None
+
+
+def capture_controls():
+    """★패턴마다 실행마다 양성 통제: 임시 집 안에 패턴별로 파일을 심고 **실제 경로**(default_sources)를 지나게 해
+    잡히면 그 패턴 True. 제외 이름·dot·접미사 외·경계 안 파일이 잡히면 전부 False — 술어가 넓어져도 통제가 깨진다.
+    {패턴: bool}. 쓰는 곳은 시스템 임시 폴더뿐이고 끝나면 지운다."""
+    out = dict.fromkeys(CAPTURE_PATTERNS, False)
+    with tempfile.TemporaryDirectory(prefix="cys-capture-control-") as td:
+        home = os.path.realpath(td)
+        la = os.path.join(home, "AppData", "Local")
+        state_root = os.path.join(home, ".local", "state")
+        main_state = os.path.join(la, "cys") if IS_WINDOWS else os.path.join(state_root, "cys")
+        pack = os.path.join(home, ".cys", "pack")
+        walled = os.path.join(home, "Desktop", "CYSjavis", "pack")
+        dj = os.path.join(home, ".cys", "depts.json")
+        plants = {"state": os.path.join(main_state, "new-state.json"), "registry": dj,
+                  "lane": os.path.join(pack, "soul.md"), "round": os.path.join(pack, "round", "new-note.md"),
+                  "directives": os.path.join(pack, "directives", "NEW_DIRECTIVE.md"),
+                  "pack-memory": os.path.join(pack, "memory", "new-memory.md"),
+                  "agent-memory": os.path.join(home, ".claude", "projects", "p", "memory", "new-memory.md")}
+        # 제외 미끼는 접미사가 맞아야 한다: `soul.bak-1.md` 는 술어의 접미사를 통과하고 제외 규칙에서만 걸린다.
+        decoys = [os.path.join(pack, n) for n in ("soul.bak-1.md", "soul.md.bak-1", "notes.db", ".hidden.md", "log.jsonl")]
+        decoys.append(os.path.join(walled, "soul.md"))
+        decoys.append(os.path.join(walled, "round", "SESSION_STATE.md"))
+        for p in list(plants.values()) + decoys:
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("{}")
+        with open(dj, "w", encoding="utf-8") as f:
+            json.dump({"depts": {}}, f)
+        census = {}
+        # 레인은 직접 준다 — 통제의 대상은 술어이고, 레지스트리 판독은 스냅샷당 1회다(R7).
+        lanes = [(BASE_LANE, os.path.join(pack, "round"), None),
+                 ("walled", os.path.join(walled, "round"), os.path.join(walled, "round", "SESSION_STATE.md"))]
+        srcs = default_sources(home=home, state_root=state_root, depts_json=dj, windows=IS_WINDOWS, localappdata=la,
+                               env={"HOME": home}, lanes=lanes, census=census)
+        rootmap = {d: pat for pat, d in census["roots"]}
+        if not any(d in srcs for d in decoys):
+            for pat, path in plants.items():
+                out[pat] = path in srcs and capture_pattern_of(path, rootmap, dj) == pat
+    return out
+
+
+def capture_report(census, present, gen_root, incomplete=""):
+    """한 줄 요약(마지막 줄). ★전 세대 0건 패턴·통제 실패·soul.md 없는 레인은 FAILURE 다. 이 줄 자체가 스냅샷을 죽이지 않는다.
+    incomplete = 세대 줄의 INCOMPLETE 문구 — 다시 싣는다: [gc] 줄이 둘이면 이 줄 때문에 세대 줄이 tail -3 밖으로 밀린다."""
+    try:
+        rootmap = {d: pat for pat, d in census["roots"]}
+        dj = census["depts_json"]
+        run = collections.Counter(capture_pattern_of(p, rootmap, dj) for p in present)
+        seen = set(p for p in CAPTURE_PATTERNS if run[p])
+        names = list_generations(gen_root)
+        scanned = 0
+        for g in reversed(names):                # 패턴이 다 보이면 멈춘다(평상시 1세대) — 0건 패턴이 있을 때만 전 세대를 읽는다
+            if len(seen) == len(CAPTURE_PATTERNS):
+                break
+            scanned += 1
+            try:
+                with open(os.path.join(gen_root, g, "manifest.json"), encoding="utf-8") as f:
+                    files = json.load(f).get("files", [])
+            except (OSError, ValueError):
+                continue
+            seen.update(capture_pattern_of(e.get("source") or "", rootmap, dj) for e in files)
+        zero = [p for p in CAPTURE_PATTERNS if p not in seen]
+        controls = capture_controls()
+        bad_controls = [p for p in CAPTURE_PATTERNS if not controls[p]]
+        have = set(p for p in present if os.path.basename(p) == "soul.md")
+        no_soul = [pk for pk in census["packs"] if os.path.join(pk, "soul.md") not in have]
+        n_soul = len(census["packs"]) - len(no_soul)
+        tail = "통제 %d/%d · soul.md %d/%d 레인 · 이번 %s" % (
+            len(CAPTURE_PATTERNS) - len(bad_controls), len(CAPTURE_PATTERNS), n_soul, len(census["packs"]),
+            " ".join("%s=%d" % (p, run[p]) for p in CAPTURE_PATTERNS))
+        notes = census.get("notes", {})
+        for key, word in (("refused_roots", "훑지 않은 루트"), ("oversize", "상한 초과")):
+            if notes.get(key):
+                tail += " · %s %d" % (word, len(notes[key]))
+        fails = []
+        if zero:
+            fails.append("전 세대 0건 패턴 %s(%d세대)" % (",".join(zero), len(names)))
+        if bad_controls:
+            fails.append("통제 실패 %s" % ",".join(bad_controls))
+        if no_soul:
+            fails.append("soul.md 없는 레인 %d" % len(no_soul))
+        return "[capture] %s · %s%s" % ("FAILURE " + " · ".join(fails) if fails else "PASS 패턴 %d/%d" % (len(seen), len(CAPTURE_PATTERNS)),
+                                        tail, incomplete)
+    except Exception as exc:                     # 점검 실패는 통과가 아니다
+        return "[capture] FAILURE 점검 예외 %s: %s" % (type(exc).__name__, str(exc)[:120])
 
 
 def _stamp_second(name):
