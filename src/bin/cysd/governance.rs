@@ -3224,6 +3224,111 @@ fn in_excluded_tree(path: &std::path::Path, home: &std::path::Path) -> bool {
     true // a chain of links this long is not judged: the safe side
 }
 
+/// SF_DATALESS: the file's content is not on this machine, and opening it would fetch it. The only detector, never `blocks == 0`.
+const SF_DATALESS: u32 = 0x4000_0000;
+const IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES: std::os::raw::c_int = 3;
+const IOPOL_SCOPE_THREAD: std::os::raw::c_int = 1;
+const IOPOL_MATERIALIZE_DATALESS_FILES_OFF: std::os::raw::c_int = 1;
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn getiopolicy_np(iotype: std::os::raw::c_int, scope: std::os::raw::c_int) -> std::os::raw::c_int;
+    fn setiopolicy_np(iotype: std::os::raw::c_int, scope: std::os::raw::c_int, policy: std::os::raw::c_int) -> std::os::raw::c_int;
+}
+
+/// This thread's no-materialization policy. Off macOS there is none.
+fn thread_iopolicy() -> i32 {
+    #[cfg(target_os = "macos")]
+    // SAFETY: two integer arguments, no pointers, and it touches only the calling thread's policy word.
+    return unsafe { getiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD) };
+    #[cfg(not(target_os = "macos"))]
+    -1
+}
+
+fn set_thread_iopolicy(policy: i32) -> i32 {
+    #[cfg(target_os = "macos")]
+    // SAFETY: as `thread_iopolicy`.
+    return unsafe { setiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD, policy) };
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = policy;
+        -1
+    }
+}
+
+fn flags_are_dataless(flags: u32) -> bool {
+    flags & SF_DATALESS != 0
+}
+
+fn metadata_is_dataless(meta: &std::fs::Metadata) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::macos::fs::MetadataExt;
+        flags_are_dataless(meta.st_flags())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = meta;
+        false
+    }
+}
+
+/// What the lane read depends on outside itself, so a specimen can stand in for the kernel and record the order of calls.
+struct LaneReadEnv<'a> {
+    darwin: bool,
+    get_policy: fn() -> i32,
+    set_policy: fn(i32) -> i32,
+    is_dataless: fn(&std::fs::Metadata) -> bool,
+    trace: Option<&'a std::sync::Mutex<Vec<String>>>,
+}
+
+impl LaneReadEnv<'_> {
+    fn live() -> Self {
+        LaneReadEnv {
+            darwin: cfg!(target_os = "macos"),
+            get_policy: thread_iopolicy,
+            set_policy: set_thread_iopolicy,
+            is_dataless: metadata_is_dataless,
+            trace: None,
+        }
+    }
+
+    fn note(&self, what: &str) {
+        if let Some(t) = self.trace {
+            t.lock().unwrap().push(what.to_string());
+        }
+    }
+
+    /// Set the policy on this thread and read it back. A set that reports success is not enough.
+    fn no_materialization(&self) -> bool {
+        self.note("policy");
+        (self.get_policy)() == IOPOL_MATERIALIZE_DATALESS_FILES_OFF
+            || ((self.set_policy)(IOPOL_MATERIALIZE_DATALESS_FILES_OFF) == 0
+                && (self.get_policy)() == IOPOL_MATERIALIZE_DATALESS_FILES_OFF)
+    }
+
+    /// The one way this reader opens a file, the same order as `safe_open` in javis_state_snapshot.py: stat, open, fstat before the
+    /// first byte. A flagged file is an error here, and each caller gives that its ordinary code. The flag can change between the stat
+    /// and the open, which is why the policy is set first: then the open or the read fails instead of fetching.
+    fn read_guarded(&self, path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+        use std::io::Read;
+        let flagged = || std::io::Error::other("SF_DATALESS, not read");
+        self.note("stat");
+        if (self.is_dataless)(&std::fs::metadata(path)?) {
+            return Err(flagged());
+        }
+        self.note("open");
+        let mut f = std::fs::File::open(path)?;
+        if (self.is_dataless)(&f.metadata()?) {
+            return Err(flagged());
+        }
+        self.note("read");
+        let mut bytes = Vec::new();
+        f.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
+}
+
 // What one lane read of the generations came to. The same strings as `_LANE_READ` in javis_phoenix.py. An empty result alone does
 // not say which check fired; the code does.
 const LANE_FOUND: &str = "found"; // this lane's copy, with tombstones
@@ -3238,6 +3343,7 @@ const MANIFEST_INTEGRITY: &str = "manifest_integrity"; // the stored file does n
 const COPY_UNREADABLE: &str = "copy_unreadable"; // bytes that match the row are not a topology with a tombstones list
 const STORE_REFUSED: &str = "store_refused"; // the store, a generation, a manifest or a copy reaches the excluded tree
 const STORE_UNREADABLE: &str = "store_unreadable"; // the store exists and cannot be listed: not the same fact as generation_absent
+const DATALESS_POLICY_UNSET: &str = "dataless_policy_unset"; // the no-materialization policy could not be set: nothing was read
 
 /// One lane read: the tombstones, the code for the conclusion (the newest generation's code when nothing was usable), the generation
 /// that answered, and how many generations it passed over, per code.
@@ -3262,6 +3368,7 @@ fn lane_topology_in_generation(
     home: &std::path::Path,
     live: &std::path::Path,
     want: &str,
+    env: &LaneReadEnv<'_>,
 ) -> Result<serde_json::Value, &'static str> {
     use sha2::{Digest, Sha256};
     if in_excluded_tree(gen_dir, home) || in_excluded_tree(&gen_dir.join("manifest.json"), home) {
@@ -3271,8 +3378,8 @@ fn lane_topology_in_generation(
     let stored_name = |row: &serde_json::Value| {
         row["stored_as"].as_str().and_then(|s| std::path::Path::new(s).file_name()).and_then(|n| n.to_str()).map(String::from)
     };
-    let manifest = std::fs::read_to_string(gen_dir.join("manifest.json")).ok();
-    let v = manifest.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()).ok_or(MANIFEST_UNREADABLE)?;
+    let manifest = env.read_guarded(&gen_dir.join("manifest.json")).ok();
+    let v = manifest.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()).ok_or(MANIFEST_UNREADABLE)?;
     let files = v["files"].as_array().ok_or(MANIFEST_UNREADABLE)?;
     let stamp = v["created_at"]
         .as_f64()
@@ -3301,7 +3408,7 @@ fn lane_topology_in_generation(
     if in_excluded_tree(&gen_dir.join(&name), home) {
         return Err(STORE_REFUSED);
     }
-    let bytes = std::fs::read(gen_dir.join(&name)).map_err(|_| STORED_MISSING)?;
+    let bytes = env.read_guarded(&gen_dir.join(&name)).map_err(|_| STORED_MISSING)?;
     if row["size"].as_u64() != Some(bytes.len() as u64)
         || row["sha256"].as_str() != Some(format!("{:x}", Sha256::digest(&bytes)).as_str())
     {
@@ -3324,6 +3431,43 @@ fn tombstones_from_latest_generation(socket_path: &std::path::Path) -> LaneRead 
 }
 
 fn tombstones_from_generations(root: &std::path::Path, home: &std::path::Path, socket_path: &std::path::Path) -> LaneRead {
+    lane_read_on_its_own_thread(root, home, socket_path, &LaneReadEnv::live())
+}
+
+/// On macOS the read runs on a thread of its own, and the policy is set on that thread, before anything is stat-ed or opened. It ends with
+/// the thread, so the boot thread, the daemon's other threads and its seats are not touched: process scope is inherited by children
+/// (measured), and a daemon's children are its seats. A refusal is a result, not an error: the seed stays empty and the boot goes on.
+fn lane_read_on_its_own_thread(
+    root: &std::path::Path,
+    home: &std::path::Path,
+    socket_path: &std::path::Path,
+    env: &LaneReadEnv<'_>,
+) -> LaneRead {
+    let refused = || LaneRead {
+        tombstones: std::collections::HashSet::new(),
+        reason: DATALESS_POLICY_UNSET,
+        generation: None,
+        passed_over: [(DATALESS_POLICY_UNSET, 1)].into_iter().collect(),
+    };
+    if !env.darwin {
+        return lane_read(root, home, socket_path, env);
+    }
+    std::thread::scope(|scope| {
+        let reader = std::thread::Builder::new().name("lane-read".into()).spawn_scoped(scope, || {
+            if env.no_materialization() {
+                lane_read(root, home, socket_path, env)
+            } else {
+                refused()
+            }
+        });
+        match reader {
+            Ok(handle) => handle.join().unwrap_or_else(|_| refused()),
+            Err(_) => refused(),
+        }
+    })
+}
+
+fn lane_read(root: &std::path::Path, home: &std::path::Path, socket_path: &std::path::Path, env: &LaneReadEnv<'_>) -> LaneRead {
     let live = crate::state::state_dir(socket_path).join("topology.json");
     let want = lane_file_key(&live);
     let mut read = LaneRead {
@@ -3351,7 +3495,7 @@ fn tombstones_from_generations(root: &std::path::Path, home: &std::path::Path, s
     };
     gens.sort();
     for (i, g) in gens.iter().rev().enumerate() {
-        match lane_topology_in_generation(&root.join(g), home, &live, &want) {
+        match lane_topology_in_generation(&root.join(g), home, &live, &want, env) {
             Ok(v) => {
                 read.tombstones = _tombs_from_value(&v);
                 read.reason = if read.tombstones.is_empty() { LANE_EMPTY } else { LANE_FOUND };
@@ -27896,8 +28040,8 @@ mod tests {
 
     // P0-RED-END: the tests below read the conclusion, which the pre-fix tree does not have.
 
-    use super::{COPY_UNREADABLE, GENERATION_ABSENT, LANE_ABSENT, LANE_EMPTY, LANE_FOUND, LANE_MISMATCH, MANIFEST_INTEGRITY, MANIFEST_UNDATED,
-                MANIFEST_UNREADABLE, STORED_MISSING, STORE_REFUSED, STORE_UNREADABLE};
+    use super::{COPY_UNREADABLE, DATALESS_POLICY_UNSET, GENERATION_ABSENT, LANE_ABSENT, LANE_EMPTY, LANE_FOUND, LANE_MISMATCH, MANIFEST_INTEGRITY,
+                MANIFEST_UNDATED, MANIFEST_UNREADABLE, STORED_MISSING, STORE_REFUSED, STORE_UNREADABLE};
 
     /// The read with a HOME that has no excluded tree in it: these specimens are about the lane, the next ones about the tree.
     fn tombstones_from_generations(root: &std::path::Path, socket: &std::path::Path) -> super::LaneRead {
@@ -27990,7 +28134,7 @@ mod tests {
     #[test]
     fn p0_each_reason_code_fires_in_its_own_state() {
         let codes = [LANE_FOUND, LANE_EMPTY, LANE_ABSENT, LANE_MISMATCH, GENERATION_ABSENT, MANIFEST_UNREADABLE, MANIFEST_UNDATED,
-                     STORED_MISSING, MANIFEST_INTEGRITY, COPY_UNREADABLE, STORE_REFUSED, STORE_UNREADABLE];
+                     STORED_MISSING, MANIFEST_INTEGRITY, COPY_UNREADABLE, STORE_REFUSED, STORE_UNREADABLE, DATALESS_POLICY_UNSET];
         assert_eq!(codes.iter().collect::<std::collections::BTreeSet<_>>().len(), codes.len(), "two states share a code");
         let tmp = p0_scratch("codes");
         let (me, other) = (p0_lane_dir(&tmp, "cys-dept-dept-5"), p0_lane_dir(&tmp, "cys-dept-dept-6"));
@@ -28052,6 +28196,114 @@ mod tests {
         let g = p0_generation(&root, name, &mine());
         p0_rewrite_copy(&g, &me, "{\"entries\": []}");
         assert_eq!(reason(&root), COPY_UNREADABLE, "bytes that match their row, with no tombstones list");
+    }
+
+    /// A one-lane generation and a recording environment, with stand-ins for the kernel and no real dataless file anywhere.
+    fn p0_policy_fixture(tag: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf, Vec<String>) {
+        let tmp = p0_scratch(tag);
+        let me = p0_lane_dir(&tmp, "cys-dept-dept-5");
+        let root = tmp.join("gen");
+        let roles = p0_roles("mine", 2);
+        p0_generation(&root, "20261101T000000Z", &[P0Lane { state: &me, body: p0_body(&roles) }]);
+        (tmp, root, me.join("cys.sock"), roles)
+    }
+
+    fn p0_env<'a>(get: fn() -> i32, set: fn(i32) -> i32, trace: &'a std::sync::Mutex<Vec<String>>) -> super::LaneReadEnv<'a> {
+        super::LaneReadEnv { darwin: true, get_policy: get, set_policy: set, is_dataless: |_| false, trace: Some(trace) }
+    }
+
+    /// A fresh reader: the policy comes before the first stat and the first open. State where it fails: a reader that opens first.
+    #[test]
+    fn p0_the_policy_comes_before_the_first_stat_or_open() {
+        use std::sync::atomic::{AtomicI32, Ordering as O};
+        static VALUE: AtomicI32 = AtomicI32::new(0);
+        let (tmp, root, socket, roles) = p0_policy_fixture("policyorder");
+        let trace = std::sync::Mutex::new(vec![]);
+        let env = p0_env(|| VALUE.load(O::SeqCst), |p| { VALUE.store(p, O::SeqCst); 0 }, &trace);
+        let read = super::lane_read_on_its_own_thread(&root, &tmp, &socket, &env);
+        assert_eq!((read.reason, p0_sorted(read.tombstones)), (LANE_FOUND, roles));
+        let got = trace.into_inner().unwrap();
+        assert_eq!(got[..3], ["policy", "stat", "open"], "{got:?}");
+        assert_eq!(VALUE.load(O::SeqCst), 1, "the policy was set");
+    }
+
+    /// The policy cannot be set: nothing is stat-ed or opened, the refusal is named and counted, the seed stays empty and nothing panics.
+    /// State where it fails: a silent skip, or a read that goes on. Second case: the set reports success and the read-back disagrees.
+    #[test]
+    fn p0_a_policy_that_cannot_be_set_is_a_named_counted_refusal_and_no_open() {
+        let (tmp, root, socket, _) = p0_policy_fixture("policyfail");
+        let setters: [(&str, fn(i32) -> i32); 2] = [("the set fails", |_| -1), ("the read-back disagrees", |_| 0)];
+        for (what, set) in setters {
+            let trace = std::sync::Mutex::new(vec![]);
+            let env = p0_env(|| 2, set, &trace);
+            let read = super::lane_read_on_its_own_thread(&root, &tmp, &socket, &env);
+            assert!(read.tombstones.is_empty(), "{what}");
+            assert_eq!(read.reason, DATALESS_POLICY_UNSET, "{what}");
+            assert_eq!(read.passed_over.get(DATALESS_POLICY_UNSET), Some(&1), "{what}: counted");
+            assert_eq!(trace.into_inner().unwrap(), ["policy"], "{what}: nothing after the policy");
+        }
+    }
+
+    /// The flag is read before the open and again before the first byte. State where it fails: either check gone. The stand-in flags a
+    /// resident file; no dataless file exists here.
+    #[test]
+    fn p0_a_flagged_file_is_not_opened_and_a_file_flagged_after_the_open_is_not_read() {
+        use std::sync::atomic::{AtomicUsize, Ordering as O};
+        static CHECKS: AtomicUsize = AtomicUsize::new(0);
+        static FLAG_FROM: AtomicUsize = AtomicUsize::new(0);
+        let (tmp, root, socket, _) = p0_policy_fixture("policyflag");
+        for (from, last) in [(1, "stat"), (2, "open")] {
+            CHECKS.store(0, O::SeqCst);
+            FLAG_FROM.store(from, O::SeqCst);
+            let trace = std::sync::Mutex::new(vec![]);
+            let mut env = p0_env(|| 1, |_| 0, &trace);
+            env.is_dataless = |_| CHECKS.fetch_add(1, O::SeqCst) + 1 >= FLAG_FROM.load(O::SeqCst);
+            let read = super::lane_read_on_its_own_thread(&root, &tmp, &socket, &env);
+            assert_eq!(read.reason, MANIFEST_UNREADABLE, "flagged from check {from}");
+            let got = trace.into_inner().unwrap();
+            assert_eq!(got.last().map(String::as_str), Some(last), "{got:?}");
+            assert!(!got.iter().any(|e| e == "read"), "a byte was read: {got:?}");
+        }
+    }
+
+    #[test]
+    fn p0_the_flag_is_sf_dataless_and_nothing_else() {
+        assert!(super::flags_are_dataless(0x4000_0000));
+        assert!(super::flags_are_dataless(0x4000_0020));
+        assert!(!super::flags_are_dataless(0x0000_0020));
+        assert!(!super::flags_are_dataless(0));
+    }
+
+    /// The real kernel calls, macOS only: the policy is on inside the read and nowhere else. A thread beside the read keeps reading its own
+    /// policy, and the caller's is the same after. State where it fails: the read run on the caller's thread, or at process scope.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn p0_the_policy_is_on_for_the_read_thread_only() {
+        use std::sync::atomic::{AtomicBool, AtomicI32, Ordering as O};
+        static INSIDE: AtomicI32 = AtomicI32::new(-9);
+        let (tmp, root, socket, roles) = p0_policy_fixture("policyscope");
+        let before = super::thread_iopolicy();
+        assert_ne!(before, 1, "the test thread must start without it");
+        let (stop, beside) = (AtomicBool::new(false), AtomicI32::new(-9));
+        let read = std::thread::scope(|s| {
+            s.spawn(|| {
+                while !stop.load(O::SeqCst) {
+                    beside.fetch_max(super::thread_iopolicy(), O::SeqCst);
+                }
+            });
+            let mut env = super::LaneReadEnv::live();
+            env.is_dataless = |_| {
+                INSIDE.store(super::thread_iopolicy(), O::SeqCst);
+                false
+            };
+            let read = super::lane_read_on_its_own_thread(&root, &tmp, &socket, &env);
+            stop.store(true, O::SeqCst);
+            read
+        });
+        assert_eq!(p0_sorted(read.tombstones), roles);
+        assert_eq!(INSIDE.load(O::SeqCst), 1, "on inside the read");
+        assert_eq!(super::thread_iopolicy(), before, "the caller's thread is unchanged");
+        assert_ne!(beside.load(O::SeqCst), 1, "a thread beside the read saw it");
     }
 
     /// The excluded tree. Rust has no call spy, so each target sits behind a directory of mode 000: any attempted read of it would come
