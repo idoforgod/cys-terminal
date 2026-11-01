@@ -13,6 +13,7 @@ resolves `~` through USERPROFILE, not HOME), inherited CYS_*, JAVIS_*, AITERM_* 
 Each `[control]` line prints what was measured.
 """
 import json
+import ntpath
 import os
 import shutil
 import stat
@@ -20,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BIN = os.path.dirname(HERE)
@@ -384,6 +386,13 @@ class Paths(Base):
             got = self.probe(CYS_SOCKET=pipe)["ap"][0]
             control("P1R pipe spelling %s: %s" % (pipe, os.path.relpath(got, self.home)))
             self.assertEqual(got, self.expected(leaf))
+
+    def test_windows_home_resolution_stays_in_the_rig(self):
+        """Windows resolves `~` through USERPROFILE. ntpath gives that rule on any host."""
+        with mock.patch.dict(os.environ, self.env("dept-5"), clear=True):
+            got = ntpath.expanduser("~")
+        control("P1R Windows ~ with the rig env is the rig=%s" % (got == self.home))
+        self.assertEqual(got, self.home)
 
     def test_the_rig_check_refuses_a_path_outside_the_rig(self):
         """Control for the isolation itself: a resolved path outside the rig stops before any operation."""
