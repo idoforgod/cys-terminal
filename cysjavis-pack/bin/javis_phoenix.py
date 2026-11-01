@@ -45,6 +45,7 @@ spawn(생성) 백엔드 2종:
 import argparse
 import atexit
 import glob
+import hashlib
 import json
 import locale
 import math
@@ -1481,82 +1482,127 @@ def load_desired_roster(socket):
     return {}, set()
 
 
-def _base_topology_in_generation(gen_dir):
-    """세대 하나에서 **본부 레인** topology 파일 경로를 찾는다(이 세대에 없으면 None · manifest 판독 실패는 예외로 올린다).
-    do_snapshot 은 basename 이 겹치면 `<소스 경로 sha 앞 8자>__topology.json` 으로 레인마다 하나씩 담고, 겹치지 않을 때만
-    맨이름으로 담는다. 그래서 신원은 파일 이름이 아니라 manifest 의 source 다 — `*__topology.json` 글롭은 다른 레인의
-    로스터를 집고, 맨이름 `topology.json` 도 소스가 하나뿐이면 부서 레인일 수 있다(0.14.57 P4: 맨이름 조회는 734개 중 0건).
-    경로는 양쪽을 실경로·normcase 로 맞춰 비교한다 — source 는 HOME/LOCALAPPDATA 파생 그대로이고 LIVE_STATE 는 실경로다
-    (Windows 8.3 이름·드라이브 대소문자 포함). manifest 없는 세대는 do_snapshot 산출물이 아니다: 종전대로 맨이름만 본다."""
-    mp = os.path.join(gen_dir, "manifest.json")
-    if not os.path.exists(mp):
-        tp = os.path.join(gen_dir, "topology.json")
-        return tp if os.path.exists(tp) else None
-    with _snap_mod().safe_open(mp, encoding="utf-8") as f:
-        files = json.load(f)["files"]
-    want = os.path.normcase(os.path.realpath(os.path.join(LIVE_STATE, "topology.json")))
+def _lane_file_key(state):
+    """레인 하나의 topology 경로를 비교값으로 — 실경로 뒤 normcase. source 는 HOME/LOCALAPPDATA 파생 그대로이고 상태 경로는
+    실경로다(Windows 8.3 이름·드라이브 대소문자 포함)."""
+    return os.path.normcase(os.path.realpath(os.path.join(state, "topology.json")))
+
+
+def _lane_topology_in_generation(gen_dir, state):
+    """세대 하나에서 **상태 경로 state 의 레인** topology 를 읽는다. 반환 (topology dict, None) 또는 (None, 사유).
+    do_snapshot 은 basename 이 겹치면 `<소스 경로 sha 앞 8자>__topology.json` 으로 레인마다 하나씩 담고, 겹치지 않을 때만 맨이름으로
+    담는다. 그래서 신원은 파일 이름이 아니라 manifest 의 source 다 — `*__topology.json` 글롭은 다른 레인의 로스터를 집고, 맨이름
+    `topology.json` 도 소스가 하나뿐이면 다른 레인일 수 있다(0.14.57 P4: 맨이름 조회는 734개 중 0건).
+    ★가드는 아무것에도 기대지 않았지만 이 조회는 manifest 가 옳다는 데 기댄다(0.14.57 P0 Amendment 4). 그래서 manifest 가 없거나
+    못 읽거나 날짜를 댈 수 없거나 저장 파일이 행과 어긋나면 **읽지 않고 자기 사유로 닫는다** — 레인 없는 뿌리로 내려가는 길은 없다(맨이름 조회 폐지).
+    낡음은 행마다 잰다: stored_as 가 있고 sha256·size 가 맞아야 한다(시계와 비교하지 않는다 — 최근 manifest 도 파일을 잃었을 수 있다). 날짜: created_at 이 세대
+    이름의 시각과 같아야 한다(다른 세대에서 옮겨 온 manifest 를 가른다 · 시계가 아니라 두 기록의 대조다).
+    레인 키는 두 쪽이다: 살아 있는 쪽은 소켓의 상태 경로 state, 저장된 쪽은 행의 source 다. 접두 파일 이름은 sha256(source) 앞 8자를 싣는다 — 행과 파일
+    이름이 서로 다른 레인을 말하면 lane_mismatch 로 거부한다. 저장된 쪽만 읽으면 귀속은 옳은데 받는 쪽이 틀린 묘비가 된다."""
+    snap = _snap_mod()
+    try:
+        with snap.safe_open(os.path.join(gen_dir, "manifest.json"), encoding="utf-8") as f:
+            man = json.load(f)
+        files = list(man["files"])
+    except Exception:
+        return None, "manifest_unreadable"
+    created = man.get("created_at")
+    try:
+        dated = type(created) in (int, float) \
+            and time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(created)) == os.path.basename(gen_dir)[:16]
+    except (ValueError, OverflowError, OSError):
+        dated = False
+    if not dated:
+        return None, "manifest_undated"
+    want = _lane_file_key(state)
+    row = None
     for e in files:
-        src = e.get("source") or ""
-        if os.path.basename(src) == "topology.json" and os.path.normcase(os.path.realpath(src)) == want:
-            return os.path.join(gen_dir, os.path.basename(e["stored_as"]))
-    return None
+        src = e.get("source") if isinstance(e, dict) else None
+        if isinstance(src, str) and os.path.basename(src) == "topology.json" and os.path.normcase(os.path.realpath(src)) == want:
+            row = e
+            break
+    tag = lambda p: hashlib.sha256(p.encode("utf-8")).hexdigest()[:8]
+    if row is None:
+        live_file = tag(os.path.join(state, "topology.json")) + "__topology.json"
+        filed = any(isinstance(e, dict) and os.path.basename(str(e.get("stored_as") or "")) == live_file for e in files)
+        return None, "lane_mismatch" if filed else "lane_absent"
+    name = os.path.basename(str(row.get("stored_as") or ""))
+    if not name:
+        return None, "stored_missing"
+    if "__" in name and name.split("__", 1)[0] != tag(row["source"]):
+        return None, "lane_mismatch"
+    try:
+        with snap.safe_open(os.path.join(gen_dir, name), binary=True) as f:
+            raw = f.read()
+    except Exception:
+        return None, "stored_missing"
+    if len(raw) != row.get("size") or hashlib.sha256(raw).hexdigest() != row.get("sha256"):
+        return None, "manifest_integrity"
+    try:
+        t = json.loads(raw.decode("utf-8"))
+        if isinstance(t["tombstones"], list) and all(isinstance(e, dict) for e in t.get("entries", [])):
+            return t, None
+    except Exception:
+        pass
+    return None, "copy_unreadable"
 
 
-def _snapshot_roster_entries(socket, skipped=None):
-    """직전 세대 스냅샷(javis_state_snapshot)의 topology.json 로스터 — §12가 실증한 안전망.
-    라이브 상태 디렉터리 대상일 때만 유효(격리 하네스는 자기 topology만 씀). best-effort.
-    skipped(list)를 주면 파싱에 실패해 건너뛴 세대 이름을 거기에 덧붙인다(0.14.56 plan P7) — 반환값은 같다."""
-    if state_dir_for(socket) != LIVE_STATE:
-        return {}
-    snap = os.path.join(os.path.dirname(os.path.abspath(__file__)), "javis_state_snapshot.py")
+# 마지막 레인 판독의 결론 {reason, passed_over: {코드: 세대 수}, generation} — `_read_lane_topology` 만 쓴다. 코드는 데몬(governance.rs)과 같은
+#   문자열이다: found 묘비가 있는 이 레인 사본 · lane_empty 이 레인 사본이 있고 묘비는 정당하게 비었다 · lane_absent manifest 에 이 레인이 없다(스냅샷
+#   없는 레인) · lane_mismatch 행은 찾았는데 저장 키가 살아 있는 키가 아니다(잘못된 주소의 신호) · generation_absent 세대가 없다 · manifest_unreadable manifest 없음/판독 불가 · manifest_undated 날짜를 댈 수 없다 · stored_missing 행의 저장 파일이
+#   없다 · manifest_integrity 저장 파일이 행과 어긋난다 · copy_unreadable 행과 맞는 바이트가 topology 가 아니다. 빈 결과 자체는 어느 검사가
+#   발화했는지의 증거가 아니다 — 근거는 이 코드다.
+_LANE_READ = {"reason": None, "passed_over": {}, "generation": None}
+
+
+def _read_lane_topology(socket, skipped=None):
+    """★0.14.57 P0 한 프리미티브: 소켓의 레인이 가진 최신 세대 topology 사본(데몬의 `tombstones_from_latest_generation` 과 같은 규칙).
+    레인 신원은 소켓의 부모 디렉터리(`state_dir_for`)이지 프로젝트 경로가 아니다. 세대 저장소는 HOME 고정 하나라 이 조회가 레인을
+    가르는 유일한 보호다 — 다른 레인의 사본은 읽지 않는다. 명목(이름) 최신 세대부터 보고, 쓸 수 없는 세대는 같은 검사를 받는 더 오래된
+    세대로 넘어간다. 반환 topology dict | None. 결론 코드는 `_LANE_READ` 에 남는다(None 이면 가장 최신 세대의 사유).
+    skipped(list)를 주면 판독에 실패해 건너뛴 세대 이름을 거기에 덧붙인다(0.14.56 plan P7) — 반환값은 같다."""
+    global _LANE_READ
+    read = _LANE_READ = {"reason": None, "passed_over": {}, "generation": None}
+    state = state_dir_for(socket)
     gen_root = os.path.join(HOME, ".cys", "state-generations")
     try:
         gens = sorted(g for g in os.listdir(gen_root) if re.match(r"\d{8}T\d{6}Z", g))
     except Exception:
-        return {}
+        gens = []
+    if not gens:
+        read["reason"] = "generation_absent"
     # ★E3 주의(gemini W6): 여기는 단일 '최신 세대' 선택(heal 소스)이라 GC 처럼 union 보호가 불가능하다.
     #   mtime max 를 쓰면 cp/touch 오염 세대가 '최신'으로 오선택돼 stale topology 로 heal 할 위험이 있어,
     #   명목(이름) 기준을 유지한다(best-effort 소스 — 데이터 손실 아님). P2-5 의 실질 수리(오삭제 방어)는
     #   compute_gc 의 명목∪실효 union 이 담당한다.
     for g in reversed(gens):  # 이름(명목) 최신 세대부터
-        try:
-            tp = _base_topology_in_generation(os.path.join(gen_root, g))
-            if tp is None:
-                continue
-            with _snap_mod().safe_open(tp, encoding="utf-8") as f:
-                t = json.load(f)
-            return {e["role"]: e for e in t.get("entries", []) if e.get("role")}
-        except Exception:
-            if skipped is not None:
-                skipped.append(g)
-            continue
-    return {}
+        t, reason = _lane_topology_in_generation(os.path.join(gen_root, g), state)
+        if t is not None:
+            read["reason"] = "found" if t["tombstones"] else "lane_empty"
+            read["generation"] = g
+            return t
+        read["reason"] = read["reason"] or reason
+        read["passed_over"][reason] = read["passed_over"].get(reason, 0) + 1
+        if reason != "lane_absent" and skipped is not None:
+            skipped.append(g)
+    return None
+
+
+def _snapshot_roster_entries(socket, skipped=None):
+    """직전 세대 스냅샷(javis_state_snapshot)의 이 레인 topology.json 로스터 — §12가 실증한 안전망. best-effort.
+    격리 하네스의 상태 경로는 manifest 에 없어 빈 결과다."""
+    t = _read_lane_topology(socket, skipped)
+    return {e["role"]: e for e in t.get("entries", []) if e.get("role")} if t else {}
 
 
 _SNAPSHOT_ROSTER_ENTRIES = _snapshot_roster_entries  # 출하 함수 객체(검체 대역과 구별 — _desired_view)
 
 
 def _snapshot_tombstones(socket):
-    """직전 세대 스냅샷 topology.json 의 tombstones 필드(옵션A: 데몬이 여기에 묘비를 영속) — desired 손상 시
-    묘비 복원 소스. 라이브 대상일 때만 유효(격리 하네스는 자기 topology 만). 반환 set|None(스냅샷 부재)."""
-    if state_dir_for(socket) != LIVE_STATE:
-        return None
-    gen_root = os.path.join(HOME, ".cys", "state-generations")
-    try:
-        gens = sorted(g for g in os.listdir(gen_root) if re.match(r"\d{8}T\d{6}Z", g))
-    except Exception:
-        return None
-    for g in reversed(gens):  # 명목 최신 세대부터(_snapshot_roster_entries 와 동일 규약)
-        try:
-            tp = _base_topology_in_generation(os.path.join(gen_root, g))
-            if tp is None:
-                continue
-            with _snap_mod().safe_open(tp, encoding="utf-8") as f:
-                t = json.load(f)
-            return set(x for x in t.get("tombstones", []) if isinstance(x, str))
-        except Exception:
-            continue
-    return None
+    """직전 세대 스냅샷의 이 레인 tombstones 필드(옵션A: 데몬이 여기에 묘비를 영속) — desired 손상 시 묘비 복원 소스.
+    반환 set|None(스냅샷 부재). `_snapshot_roster_entries` 와 같은 프리미티브다: 호출자가 하나라 둘이 함께 복구하거나 함께 거부한다."""
+    t = _read_lane_topology(socket)
+    return set(x for x in t["tombstones"] if isinstance(x, str)) if t else None
 
 
 # ---------------- C2(W3): 손상 격리 + 폴백 체인 ----------------
@@ -1670,7 +1716,7 @@ def _recover_retention_file(socket, path, kind):
       · {'status':'valid'}              정상(provenance 없음)
       · {'status':'missing'}            부재(fresh install 정상 — hard-fail 아님)
       · {'status':'degraded','source':..,'isolated':..,'pending':bool}  손상→폴백 복원 또는 valid+provenance(보류 유지)
-      · {'status':'unrecoverable','isolated':..}          손상→전 폴백 실패(exit 6)"""
+      · {'status':'unrecoverable','isolated':..,'lane_read':{reason,passed_over}}  손상→전 폴백 실패(exit 6)"""
     st = _roster_file_status(path)
     if st == "missing":
         return {"status": "missing"}
@@ -1691,9 +1737,11 @@ def _recover_retention_file(socket, path, kind):
             return {"status": "degraded", "source": "bak", "isolated": isolated}
         except Exception:
             pass
+    lane_read = None
     if kind == "desired_roster":
         snap_r = _snapshot_roster_entries(socket)
         snap_t = _snapshot_tombstones(socket)
+        lane_read = dict(_LANE_READ)
         if snap_r or snap_t:
             try:
                 _write_recovered(path, {"roster": snap_r, "tombstones": sorted(snap_t or [])}, "snapshot")
@@ -1708,7 +1756,7 @@ def _recover_retention_file(socket, path, kind):
             return {"status": "degraded", "source": "discovery", "isolated": isolated}
         except Exception:
             pass
-    return {"status": "unrecoverable", "isolated": isolated}
+    return {"status": "unrecoverable", "isolated": isolated, "lane_read": lane_read}
 
 
 # ---------------- A-S3 tombstone intent 저널 (다운타임 폴백) ----------------
@@ -3069,10 +3117,11 @@ def _run_restore_locked(socket, ticket="default", stub=False, no_breaker=False, 
                       (dept_roster_path(socket), "dept_roster")):
         _rec = _recover_retention_file(socket, _p, _kind)
         if _rec["status"] == "unrecoverable":
-            log("★C2 손상 감지: %s 파싱 실패·전 폴백(.bak/스냅샷) 불가 — 부활 중단(exit 6). 격리=%s"
-                % (_kind, _rec.get("isolated")))
+            log("★C2 손상 감지: %s 파싱 실패·전 폴백(.bak/스냅샷) 불가 — 부활 중단(exit 6). 격리=%s 세대 거부=%s"
+                % (_kind, _rec.get("isolated"), json.dumps(_rec.get("lane_read"), sort_keys=True)))
             out = {"phoenix_restore": "CORRUPT", "corruption": True, "corrupt_file": _kind,
                    "corrupt_path": _p, "isolated": _rec.get("isolated"),
+                   "lane_read": _rec.get("lane_read"),
                    "note": ("손상된 %s — .bak·세대 스냅샷 전 폴백 불가. 빈 상태(fresh)로 진행하지 않는다"
                             "(missing≠corrupt). 사람 개입(phoenix roster --rebase 또는 복원) 필요." % _kind)}
             if print_result:
