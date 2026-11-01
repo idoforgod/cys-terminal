@@ -6,7 +6,7 @@ import socket
 import subprocess
 import sys
 from pathlib import Path
-from protocol import atomic_json, read_json
+from protocol import atomic_json, read_json, sha
 from boundary import Unavailable
 
 METHODS={'system.identify','surface.create','surface.list','surface.set_meta','surface.send_text',
@@ -47,9 +47,11 @@ class FixtureRPC:
     def call(self,method,params,timeout=10):
         if method not in METHODS:raise Unavailable('RPC method not allowed')
         self.sequence+=1;request={'id':self.sequence,'method':method,'params':params}
-        path=self.root/'evidence'/f'rpc-{self.sequence:06}.request.json';atomic_json(path,request)
-        args=[sys.executable,'-B',str(Path(__file__).resolve()),'--worker',self.endpoint,str(path)]
-        try:run=subprocess.run(args,capture_output=True,timeout=timeout)
+        path=self.root/'evidence'/f'rpc-{self.sequence:06}.request.json'
+        recorded={**request,'params':{k:({'redacted_sha256':sha(str(v).encode())} if k in ('operator_token','owner_token') else v) for k,v in params.items()}}
+        atomic_json(path,recorded)
+        args=[sys.executable,'-B',str(Path(__file__).resolve()),'--worker',self.endpoint,'-']
+        try:run=subprocess.run(args,input=json.dumps(request).encode(),capture_output=True,timeout=timeout)
         except subprocess.TimeoutExpired as e:raise Unavailable('owned RPC worker deadline') from e
         (self.root/'evidence'/f'rpc-{self.sequence:06}.stdout').write_bytes(run.stdout)
         (self.root/'evidence'/f'rpc-{self.sequence:06}.stderr').write_bytes(run.stderr)
@@ -64,4 +66,5 @@ class FixtureRPC:
 if __name__=='__main__':
     p=argparse.ArgumentParser();p.add_argument('--worker',action='store_true');p.add_argument('endpoint');p.add_argument('request');a=p.parse_args()
     if not a.worker:raise SystemExit('private worker only')
-    print(json.dumps(exchange(a.endpoint,read_json(a.request)),ensure_ascii=False))
+    request=json.loads(sys.stdin.buffer.read()) if a.request=='-' else read_json(a.request)
+    print(json.dumps(exchange(a.endpoint,request),ensure_ascii=False))

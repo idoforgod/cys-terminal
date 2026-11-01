@@ -68,6 +68,7 @@ PREMISES=('network_boundary','auth_free_startup','genuine_open_query','no_submit
 
 def decide_feasibility(observations):
     if type(observations) is not dict:raise ValueError('observations must be object')
+    if set(observations)-set(PREMISES):raise ValueError('unknown premise name')
     failures=[];missing=[]
     for name in PREMISES:
         value=observations.get(name)

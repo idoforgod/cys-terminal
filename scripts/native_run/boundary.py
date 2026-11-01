@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import uuid
 from pathlib import Path
 from protocol import sha
@@ -39,6 +40,8 @@ class BASIC_LIMITS(C.Structure):
 class IO_COUNTERS(C.Structure):
     _fields_ = [(x, U64) for x in ('ReadOperationCount', 'WriteOperationCount', 'OtherOperationCount',
                                   'ReadTransferCount', 'WriteTransferCount', 'OtherTransferCount')]
+class ACCOUNTING(C.Structure):
+    _fields_ = [(x,C.c_int64) for x in ("user","kernel","period_user","period_kernel")]+[(x,U32) for x in ("faults","total","active","terminated")]
 class EXTENDED_LIMITS(C.Structure):
     _fields_ = [('BasicLimitInformation', BASIC_LIMITS), ('IoInfo', IO_COUNTERS),
                 ('ProcessMemoryLimit', SIZE), ('JobMemoryLimit', SIZE),
@@ -106,6 +109,8 @@ class WindowsAPI:
             (self.k, 'LocalFree', [P], P),
             (self.k, 'CreateJobObjectW', [P,C.c_wchar_p], P),
             (self.k, 'SetInformationJobObject', [P,C.c_int,P,U32], C.c_int),
+            (self.k, 'QueryInformationJobObject', [P,C.c_int,P,U32,P], C.c_int),
+            (self.k, 'TerminateJobObject', [P,U32], C.c_int),
             (self.k, 'AssignProcessToJobObject', [P,P], C.c_int),
             (self.k, 'InitializeProcThreadAttributeList', [P,U32,U32,C.POINTER(SIZE)], C.c_int),
             (self.k, 'UpdateProcThreadAttribute', [P,U32,SIZE,P,SIZE,P,P], C.c_int),
@@ -212,22 +217,58 @@ class OwnedBoundary:
 
     def close(self):
         if self.closed: return
-        self.closed=True
-        # Only handles returned by this instance; never PID/name-based termination.
+        self.closed=True;errors=[];accounting=None
+        # Terminate only this unnamed owned job, retaining its handle until the
+        # kernel reports zero active members. No PID/name kill and no root-only inference.
         if self.process.hProcess and not self.assigned:
-            # Failed assignment leaves only our still-suspended child; terminate by its owned handle.
-            self.api.k.TerminateProcess(self.process.hProcess,125)
-        if self.job: self.api.k.CloseHandle(self.job); self.job=None
-        exited = not self.process.hProcess or self.api.k.WaitForSingleObject(self.process.hProcess,10000)==0
-        if self.process.hThread: self.api.k.CloseHandle(self.process.hThread)
-        if self.process.hProcess: self.api.k.CloseHandle(self.process.hProcess)
-        if self.sid: self.api.a.FreeSid(self.sid)
-        # Retain profile on uncertain cleanup; never delete an existing/reused profile.
-        self.cleanup={'root_exit_observed':exited,'profile_removed':False}
-        # Preserve the unique profile/files for audit. No recursive deletion. Native job-event
-        # receipts must establish descendant completion before a controller can claim cleanup.
-        self.cleanup['profile_retained']=self.profile_created
-        self.cleanup['descendant_exit_receipt']=None
+            if not self.api.k.TerminateProcess(self.process.hProcess,125):errors.append('suspended_child_terminate_failed')
+        if self.job:
+            if not self.api.k.TerminateJobObject(self.job,125):errors.append('owned_job_terminate_failed')
+            deadline=time.monotonic()+10
+            while time.monotonic()<deadline:
+                row=ACCOUNTING()
+                if not self.api.k.QueryInformationJobObject(self.job,1,C.byref(row),C.sizeof(row),None):
+                    errors.append('job_accounting_unavailable');break
+                accounting={'total':row.total,'active':row.active,'terminated':row.terminated}
+                if row.active==0:break
+                time.sleep(.01)
+            self.api.k.CloseHandle(self.job);self.job=None
+        exited=not self.process.hProcess or self.api.k.WaitForSingleObject(self.process.hProcess,10000)==0
+        if self.process.hThread:self.api.k.CloseHandle(self.process.hThread)
+        if self.process.hProcess:self.api.k.CloseHandle(self.process.hProcess)
+        if self.sid:self.api.a.FreeSid(self.sid)
+        self.cleanup={'root_exit_observed':exited,'job_accounting':accounting,'errors':errors,
+                      'descendant_exit_receipt':None if accounting is None else accounting['active']==0,
+                      'profile_removed':False,'profile_retained':self.profile_created}
 
     def __enter__(self): return self
     def __exit__(self,*unused): self.close()
+
+class OwnedProcess:
+    """Trusted fixture daemon/controller lifetime, separate from the confined receiver.
+
+The process starts suspended and is assigned to an unnamed kill-on-close job
+before any instruction runs. This does not grant the receiver network access.
+"""
+    def __init__(self, executable, args, environment, cwd, process_limit=32):
+        self.api=WindowsAPI();self.job=None;self.process=PROCESS_INFORMATION();self.assigned=False
+        self.closed=False;self.sid=None;self.profile_created=False
+        try:
+            self.job=self.api.check(self.api.k.CreateJobObjectW(None,None),'fixture job')
+            limits=EXTENDED_LIMITS();limits.BasicLimitInformation.LimitFlags=JOB_KILL_ON_CLOSE|JOB_ACTIVE_LIMIT
+            limits.BasicLimitInformation.ActiveProcessLimit=process_limit
+            self.api.check(self.api.k.SetInformationJobObject(self.job,9,C.byref(limits),C.sizeof(limits)),'fixture job limits')
+            startup=STARTUPINFO();startup.cb=C.sizeof(startup)
+            command=C.create_unicode_buffer(subprocess.list2cmdline([str(executable),*args]))
+            block=C.create_unicode_buffer('\0'.join(k+'='+v for k,v in sorted(environment.items(),key=lambda kv:kv[0].upper()))+'\0\0')
+            self.api.check(self.api.k.CreateProcessW(str(executable),command,None,None,False,CREATE_SUSPENDED|CREATE_UNICODE_ENVIRONMENT,block,str(cwd),C.byref(startup),C.byref(self.process)),'create fixture daemon')
+            self.api.check(self.api.k.AssignProcessToJobObject(self.job,self.process.hProcess),'assign fixture daemon');self.assigned=True
+            if self.api.k.ResumeThread(self.process.hThread)==0xffffffff:raise Unavailable('fixture resume failed')
+        except BaseException:
+            self.close();raise
+    @property
+    def pid(self):return self.process.dwProcessId
+    wait=OwnedBoundary.wait
+    close=OwnedBoundary.close
+    def __enter__(self):return self
+    def __exit__(self,*unused):self.close()

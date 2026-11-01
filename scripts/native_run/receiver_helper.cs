@@ -4,8 +4,13 @@ using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Runtime.InteropServices;
+using System.Diagnostics;
+using System.Threading;
 using System.Web.Script.Serialization;
 class NativeReceiverHelper {
+    [DllImport("kernel32.dll",SetLastError=true)] static extern IntPtr GetStdHandle(int kind);
+    [DllImport("kernel32.dll",SetLastError=true)] static extern bool GetConsoleMode(IntPtr handle,out uint mode);
     static readonly JavaScriptSerializer Json = new JavaScriptSerializer();
     static string Owned(string root, string input) {
         root=Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar)+Path.DirectorySeparatorChar;
@@ -29,6 +34,24 @@ class NativeReceiverHelper {
                 // Observation only: never rewrite the application's editor file.
                 File.WriteAllBytes(Path.Combine(output,id+".bin"),bytes);
                 File.WriteAllText(Path.Combine(output,id+".json"),Json.Serialize(new {input=input,bytes=bytes.Length,pid=System.Diagnostics.Process.GetCurrentProcess().Id,utc=DateTime.UtcNow.ToString("o")}),new UTF8Encoding(false));
+                return 0;
+            }
+            if(mode=="origin") {
+                if(args.Length!=5)throw new Exception("origin root sideband emit|silent go-file");
+                string sideband=Owned(root,args[2]),go=Owned(root,args[4]);
+                bool emit=args[3]=="emit";
+                if(!emit && args[3]!="silent")throw new Exception("origin mode");
+                uint inputMode,outputMode;
+                bool gotInput=GetConsoleMode(GetStdHandle(-10),out inputMode),gotOutput=GetConsoleMode(GetStdHandle(-11),out outputMode);
+                File.WriteAllText(sideband+".ready.json",Json.Serialize(new {pid=Process.GetCurrentProcess().Id,mode=args[3],input_mode=gotInput?(uint?)inputMode:null,output_mode=gotOutput?(uint?)outputMode:null}),new UTF8Encoding(false));
+                Stopwatch guard=Stopwatch.StartNew();
+                while(!File.Exists(go)) { if(guard.ElapsedMilliseconds>=20000)throw new Exception("origin handshake absent");Thread.Sleep(10); }
+                long before=Stopwatch.GetTimestamp();int wrote=0;
+                if(emit) { byte[] query=new byte[]{27,91,54,110};Stream output=Console.OpenStandardOutput();output.Write(query,0,query.Length);output.Flush();wrote=query.Length; }
+                long after=Stopwatch.GetTimestamp();
+                File.WriteAllText(sideband+".emission.json",Json.Serialize(new {pid=Process.GetCurrentProcess().Id,mode=args[3],emitted_bytes=wrote,before_ticks=before,after_ticks=after,tick_frequency=Stopwatch.Frequency,utc=DateTime.UtcNow.ToString("o")}),new UTF8Encoding(false));
+                // Remain for the fixed resize observations; never emit a second query.
+                while(!File.Exists(go+".stop")) { if(guard.ElapsedMilliseconds>=40000)break;Thread.Sleep(10); }
                 return 0;
             }
             if(mode=="connect") {
