@@ -5226,9 +5226,26 @@ mod drills {
         assert_eq!(depth(&daemon, master), 2, "{:?}", queue_texts(&daemon, master));
     }
 
+    /// DISCRIMINATING CASE of the control below: the only part of it that fails on code without the fix (v0.14.56). The rest of
+    /// the control passes there too, and a check with one verdict in both states shows no power, so keep this case by name.
+    /// A CSO seat's own four events each reach master, and none reaches the CSO.
+    fn discriminating_case_the_four_cso_own_events_reach_master(daemon: &Arc<Daemon>, cso: u64, master: u64, now: Now) {
+        for (i, (name, payload)) in [
+            ("queue.depth_high", json!({"role": "cso", "depth": 60, "threshold": 50})),
+            ("queue.starved", json!({"role": "cso", "depth": 3, "waited_secs": 700})),
+            ("health.alert", json!({"rule": "auth_401"})),
+            ("surface.exited", json!({"role": "cso", "agent": "claude"})),
+        ].into_iter().enumerate() {
+            handle_event(daemon, &ev(name, Some(cso), payload), now);
+            assert_eq!(depth(daemon, master), i + 1, "{name} of a CSO seat reaches master");
+            assert_eq!(depth(daemon, cso), 0, "{name} of a CSO seat never enters its own inbox");
+        }
+    }
+
     /// Control, re-aimed (0.14.57 P6, CEO rulings 07b4737d1aeb8034 and 09fd5e36dce4e8dc). It watched that B-439 leaked no
-    /// further than context.threshold. Its four events now go to master by decision, so it watches the next boundary: a
-    /// seat that is not a CSO behaves as before, whichever seat it is, and a CSO-own event outside the four stays dropped.
+    /// further than context.threshold. Its four events now go to master by decision, so it watches the next boundary, on both
+    /// sides: the four reach master, a routable fifth event about a CSO seat does not, and a seat that is not a CSO behaves as
+    /// before. Its power was shown on two planted leaks: a name gate widened to every routable event, and a dropped CSO test.
     #[test]
     fn drill_cso_own_route_does_not_leak_past_cso_seats_or_the_four_events() {
         let daemon = drill_daemon("csoselfx");
@@ -5236,19 +5253,72 @@ mod drills {
         let master = seat(&daemon, "master");
         let worker = seat(&daemon, "worker");
         let now = after_grace(&daemon);
+        // ★The discriminating case: this line fails on tag code, see its comment.
+        discriminating_case_the_four_cso_own_events_reach_master(&daemon, cso, master, now);
+        // A CSO-own event outside the four stays dropped, with and without the role in the payload.
+        handle_event(&daemon, &ev("watchdog.load_high", Some(cso), json!({"role": "cso"})), now);
+        handle_event(&daemon, &ev("watchdog.load_high", Some(cso), json!({})), now);
+        assert_eq!((depth(&daemon, cso), depth(&daemon, master), pending_len(&daemon)), (0, 4, 0), "outside the four: dropped as before");
         // A worker's own events: all four reach the CSO, none reaches master.
         for (i, name) in ["queue.depth_high", "queue.starved", "health.alert", "surface.exited"].into_iter().enumerate() {
             handle_event(&daemon, &ev(name, Some(worker), json!({"role": "worker", "depth": 60, "rule": "auth_401"})), now);
             assert_eq!(depth(&daemon, cso), i + 1, "{name} of a worker still goes to the CSO");
-            assert_eq!(depth(&daemon, master), 0, "{name} of a worker does not go to master");
+            assert_eq!(depth(&daemon, master), 4, "{name} of a worker does not go to master");
         }
         // The master seat's own event is a seat like any other: it goes to the CSO, not back to master.
         handle_event(&daemon, &ev("queue.starved", Some(master), json!({"role": "master", "depth": 3})), now);
-        assert_eq!((depth(&daemon, cso), depth(&daemon, master)), (5, 0), "master's own event still goes to the CSO");
-        // A CSO-own event outside the four stays dropped, with and without the role in the payload.
-        handle_event(&daemon, &ev("watchdog.load_high", Some(cso), json!({"role": "cso"})), now);
-        handle_event(&daemon, &ev("watchdog.load_high", Some(cso), json!({})), now);
-        assert_eq!((depth(&daemon, cso), depth(&daemon, master), pending_len(&daemon)), (5, 0, 0), "outside the four: dropped as before");
+        assert_eq!((depth(&daemon, cso), depth(&daemon, master)), (5, 4), "master's own event still goes to the CSO");
+    }
+
+    /// Everything the bus carried about one seat that the router would take, in order, fed to [`handle_event`] as the
+    /// subscriber does. Waits for the reader's EOF path, which publishes after the close returned.
+    fn feed_router_after_close(daemon: &Arc<Daemon>, sid: u64, now: Now) -> Vec<Value> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let exited = |d: &Arc<Daemon>| d.bus.tail(400).iter().any(|e| e["name"] == "surface.exited" && e["surface_id"] == json!(sid));
+        while !exited(daemon) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let events: Vec<Value> = daemon.bus.tail(400).into_iter()
+            .filter(|e| e["surface_id"] == json!(sid) && e["name"].as_str().is_some_and(routable)).collect();
+        for e in &events {
+            handle_event(daemon, e, now);
+        }
+        events
+    }
+
+    /// (P6, MEASURED) What a close of a CSO seat does on this route, through the real close path and the real reader EOF path,
+    /// not a hand-made event. OwnerClose is the deliberate close, Reap is the daemon collecting a dead seat.
+    fn measure_cso_close(cause: crate::governance::CloseCause, label: &str) -> (Vec<Value>, Vec<String>, usize, Vec<Value>) {
+        let daemon = drill_daemon("csoclose");
+        let cso = seat(&daemon, "cso");
+        let master = seat(&daemon, "master");
+        let now = after_grace(&daemon);
+        crate::governance::close_surface(&daemon, cso, cause).expect("close");
+        let events = feed_router_after_close(&daemon, cso, now);
+        let texts = queue_texts(&daemon, master);
+        let rows = read_refused_rows(&daemon).expect("ledger");
+        println!("P6-CLOSE {label}: routable events {}, master notices {}, parked {}, ledger rows {}", events.len(), texts.len(), pending_len(&daemon), rows.len());
+        for e in &events {
+            println!("P6-CLOSE {label} event: {} payload role {}", e["name"], e["payload"]["role"]);
+        }
+        for t in &texts {
+            println!("P6-CLOSE {label} text: {t}");
+        }
+        (events, texts, pending_len(&daemon), rows)
+    }
+
+    #[test]
+    fn drill_cso_owner_close_measured() {
+        let (events, texts, parked, rows) = measure_cso_close(crate::governance::CloseCause::OwnerClose, "owner close");
+        assert_eq!((events.len(), texts.len(), parked, rows.len()), (1, 1, 0, 0), "a deliberate close sends master one notice");
+    }
+
+    #[test]
+    fn drill_cso_reap_measured() {
+        let (events, texts, parked, rows) = measure_cso_close(crate::governance::CloseCause::Reap, "reap");
+        assert_eq!((events.len(), texts.len(), parked, rows.len()), (1, 1, 0, 0));
+        let (_, owner, _, _) = measure_cso_close(crate::governance::CloseCause::OwnerClose, "owner close, compared");
+        assert_eq!(texts, owner, "the notice does not tell a deliberate close from a death");
     }
 
     /// Control (B-439): context.threshold for a non-CSO seat still goes to the CSO inbox only.
