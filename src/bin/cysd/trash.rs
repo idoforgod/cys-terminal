@@ -3714,12 +3714,8 @@ mod tests {
             std::fs::write(entry.join(format!("f{i:06}")), b"").unwrap();
         }
 
-        // ⒜ ★대조 — **같은 픽스처를 마감 없이 전부 인증**하는 비용(S68 ③ · Option A).
-        //   종전 대조는 **순수 열거**(`read_dir().count()`)였다: 검사도 lstat 도 없는 **다른 일**이라
-        //   양쪽이 서로 다른 모집단이었고, 플랫폼의 열거/인증 비용비가 달라지면 바가 **뒤집힌다**
-        //   (윈도우 적색의 기제 · S68 판정 §6). 이제 양쪽이 **같은 노드당 일**이므로 비율은
-        //   속도 차가 아니라 **멈춘 지점의 상한**을 준다 — 성립하는 것은 「폭 전체를 걷기
-    //   전에 멈췄다」까지이고 ⛔「폭의 **어디까지** 걸었나」는 **가리키지 못한다**(codex N2).
+        // Real-clock no-deadline control: certify the same files and retain the full node count.
+        // Its duration remains diagnostic only; a ratio cannot identify iterator pull count.
         let t_ctl = Instant::now();
         let c = certify_entry_until(&entry, &real_dev, None).expect("대조는 인증에 성공해야 한다");
         let full = t_ctl.elapsed();
