@@ -20977,6 +20977,132 @@ mod tests {
         (daemon, s)
     }
 
+    /// A1: a true callback means terminal ATTEMPT, never successful delivery. A receipt
+    /// survives settlement clearing the live reservation. Changed IDs also terminate, even
+    /// on a bad removal. Callers retain their exact outcome assertions after this window.
+    fn a1_queue_window(
+        s: &Arc<crate::state::Surface>,
+        mut attempt: impl FnMut(),
+        window: impl FnOnce(&mut dyn FnMut() -> bool) -> bool,
+    ) -> (Option<String>, usize) {
+        let original: Vec<_> = s.pending_queue.lock().unwrap().iter().map(|e| e.id.clone()).collect();
+        let receipt = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let mut attempts = 0;
+        window(&mut || {
+            attempts += 1;
+            let slot = receipt.clone();
+            let _observer = crate::agent_queue_tests::p1_on_queue_reserved(s.id, move |_, request| {
+                *slot.borrow_mut() = Some(request.id.clone());
+            });
+            attempt();
+            let after: Vec<_> = s.pending_queue.lock().unwrap().iter().map(|e| e.id.clone()).collect();
+            let admitted = receipt.borrow().is_some();
+            eprintln!("A1 queue attempt={attempts} admitted={admitted} ids_changed={} block={:?}",
+                after != original, s.queue_blocked.lock().unwrap().as_ref().map(|b| b.0.clone()));
+            admitted || after != original
+        });
+        let saved = receipt.borrow().clone();
+        (saved, attempts)
+    }
+
+    fn a1_deliver_at_prompt(daemon: &Arc<Daemon>, s: &Arc<crate::state::Surface>) {
+        let (mut depth, mut starve, mut prior) = (HashMap::new(), HashMap::new(), HashMap::new());
+        let (receipt, _) = a1_queue_window(s, || {
+            paint_prompt(s, "", "");
+            *s.last_output.lock().unwrap() = Instant::now();
+            *s.last_human_input.lock().unwrap() = None;
+            deliver_queued(daemon, &mut depth, &mut starve, &mut prior);
+        }, |attempt| crate::state::test_done_or_no_pty_output(s, attempt));
+        assert!(receipt.is_some(), "A1 outcome requires its own admission receipt");
+    }
+
+    /// CEO A1-1: actual writer proof refusal after queue admission must remain red.
+    #[test]
+    #[should_panic(expected = "A1 post-admission refusal must keep the delivery assertion RED")]
+    fn a1_post_admission_refusal_is_a_hard_failure() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("a1-refusal");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (daemon, s) = marker_seat("a1-refusal");
+        struct Refuse(std::sync::atomic::AtomicUsize);
+        impl crate::agent_write::Proof for Refuse {
+            fn admit(&self) -> Result<(), crate::receiver::ProofLoss> {
+                self.0.fetch_add(1, AtomicOrdering::Relaxed);
+                Err(crate::receiver::ProofLoss::Unknown("A1 injected post-admission refusal".into()))
+            }
+            fn recheck(&self, _: crate::agent_write::Phase) -> Result<(), crate::receiver::ProofLoss> { Ok(()) }
+        }
+        let proof = Arc::new(Refuse(std::sync::atomic::AtomicUsize::new(0)));
+        *s.receiver_proof.lock().unwrap() = Some(proof.clone());
+        let (mut depth, mut starve, mut prior) = (HashMap::new(), HashMap::new(), HashMap::new());
+        let (receipt, attempts) = a1_queue_window(&s, || {
+            paint_prompt(&s, "", "");
+            *s.last_output.lock().unwrap() = Instant::now();
+            *s.last_human_input.lock().unwrap() = None;
+            deliver_queued(&daemon, &mut depth, &mut starve, &mut prior);
+            // A complete fixture publication makes retry tempting; never force an odd frame even.
+            s.output_gen.fetch_add(1, AtomicOrdering::AcqRel);
+            s.parser.lock().unwrap().process(b"");
+            s.output_gen.fetch_add(1, AtomicOrdering::AcqRel);
+        }, |attempt| crate::state::test_done_or_quiet_window(
+            || s.output_gen.load(AtomicOrdering::Acquire), false, 3, 0, attempt));
+        assert!(receipt.is_some(), "negative control must reach actual queue admission");
+        assert_eq!(proof.0.load(AtomicOrdering::Relaxed), 1, "negative control must reach the writer refusal");
+        assert_eq!(attempts, 1, "A1 must stop at the admitted refusal, not retry dirty output");
+        let remaining = s.pending_queue.lock().unwrap().len();
+        crate::state::test_stop_daemon(&daemon);
+        assert_eq!(remaining, 0, "A1 post-admission refusal must keep the delivery assertion RED");
+    }
+
+    #[test]
+    fn a1_queue_partial_id_change_is_terminal_without_admission() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("a1-partial");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (daemon, s) = marker_seat("a1-partial");
+        for body in ["second", "third"] {
+            let e = daemon.next_queue_entry(body.into(), None, "test");
+            s.pending_queue.lock().unwrap().push_back(e);
+        }
+        let original: Vec<_> = s.pending_queue.lock().unwrap().iter().map(|e| e.id.clone()).collect();
+        let (receipt, attempts) = a1_queue_window(&s, || {
+            // A broken consumer removes one item without admission while output moves.
+            s.pending_queue.lock().unwrap().pop_front();
+            s.output_gen.fetch_add(1, AtomicOrdering::AcqRel);
+            s.parser.lock().unwrap().process(b"");
+            s.output_gen.fetch_add(1, AtomicOrdering::AcqRel);
+        }, |attempt| crate::state::test_done_or_quiet_window(
+            || s.output_gen.load(AtomicOrdering::Acquire), false, 3, 0, attempt));
+        let after: Vec<_> = s.pending_queue.lock().unwrap().iter().map(|e| e.id.clone()).collect();
+        crate::state::test_stop_daemon(&daemon);
+        assert_eq!(attempts, 1, "A1 partial removal must terminate before a second attempt");
+        assert!(receipt.is_none(), "ID change is terminal but never an admission receipt");
+        assert_eq!(after, original[1..]);
+    }
+
+    #[test]
+    fn a1_reader_window_repaints_after_a_complete_fixture_publication() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("a1-reader");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (daemon, s) = marker_seat("a1-reader");
+        p1_measured(&s);
+        let mut attempts = 0;
+        let result = crate::state::test_until_no_pty_output(&s, "A1 deterministic frame ordering", || {
+            attempts += 1;
+            paint_prompt(&s, "", "my own words");
+            if attempts == 1 {
+                s.output_gen.fetch_add(1, AtomicOrdering::AcqRel);
+                s.parser.lock().unwrap().process(b"\x1b[2J\x1b[H");
+                s.output_gen.fetch_add(1, AtomicOrdering::AcqRel);
+            }
+            (super::composer_measured_empty(&s), super::seat_input_line_visibility(&s))
+        });
+        crate::state::test_stop_daemon(&daemon);
+        assert!(attempts >= 2, "the injected publish must invalidate the first window");
+        assert_eq!(result, (false, (Some(true), Some(true))), "A1 must repaint before the accepted observation");
+    }
+
     fn empty_pack_dir(tag: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!(
             "cys-b1-pack-{}-{}-{}",
@@ -21000,12 +21126,7 @@ mod tests {
             ("CYS_QUEUE_STARVE_ALERT_SECS", "0"),
         ]);
         let (daemon, s) = marker_seat("b1-stream");
-        paint_prompt(&s, "", "");
-        // 지금 막 출력이 있었다(스피너 재그리기와 같은 상태) → 종전 규칙이면 보류.
-        *s.last_output.lock().unwrap() = std::time::Instant::now();
-        *s.last_human_input.lock().unwrap() = None;
-        let (mut depth, mut starve) = (HashMap::new(), HashMap::new());
-        deliver_queued(&daemon, &mut depth, &mut starve, &mut HashMap::new());
+        a1_deliver_at_prompt(&daemon, &s);
         assert!(
             s.pending_queue.lock().unwrap().is_empty(),
             "프롬프트 박스가 열려 있으면 출력 중이라도 배달한다(기아 봉인의 본체)"
@@ -21618,10 +21739,14 @@ mod tests {
         let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
         let (_daemon, s) = marker_seat("p1-q3");
         p1_measured(&s);
-        paint_prompt(&s, "", "my own words");
-        assert!(!super::composer_measured_empty(&s), "a Home-moved draft must never read as empty");
-        paint_prompt_dim(&s, "", "carry on please");
-        assert!(super::composer_measured_empty(&s), "a suggestion reads empty");
+        let (plain_empty, dim_empty) = crate::state::test_until_no_pty_output(&s, "A1 R3 readers", || {
+            paint_prompt(&s, "", "my own words");
+            let plain = super::composer_measured_empty(&s);
+            paint_prompt_dim(&s, "", "carry on please");
+            (plain, super::composer_measured_empty(&s))
+        });
+        assert!(!plain_empty, "a Home-moved draft must never read as empty");
+        assert!(dim_empty, "a suggestion reads empty");
     }
 
     /// T-G2 (R-5): a direct Text onto a Home-moved draft on a claude seat is refused (pin: passed); onto a dim suggestion it
@@ -21683,10 +21808,14 @@ mod tests {
         let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
         let (_daemon, s) = marker_seat("p1-f1");
         p1_measured(&s);
-        paint_prompt(&s, "", "my own words");
-        assert_eq!(super::seat_input_line_visibility(&s), (Some(true), Some(true)));
-        paint_prompt_dim(&s, "", "carry on please");
-        assert_eq!(super::seat_input_line_visibility(&s), (Some(false), Some(true)));
+        let (plain, dim) = crate::state::test_until_no_pty_output(&s, "A1 R7 readers", || {
+            paint_prompt(&s, "", "my own words");
+            let plain = super::seat_input_line_visibility(&s);
+            paint_prompt_dim(&s, "", "carry on please");
+            (plain, super::seat_input_line_visibility(&s))
+        });
+        assert_eq!(plain, (Some(true), Some(true)));
+        assert_eq!(dim, (Some(false), Some(true)));
     }
     // ----- P1 D1 unit specimens (new functions; coverage, not RED proofs) -----
 
@@ -21769,12 +21898,18 @@ mod tests {
         // The non-queue readers on a Windows seat read a Home-moved draft as at the pin (R-3, R-5, R-6, R-7).
         let (daemon, s) = marker_seat("p1-w1a-readers");
         s.d1_platform.store(false, std::sync::atomic::Ordering::Relaxed);
-        paint_prompt(&s, "", "my own words");
-        assert!(super::composer_measured_empty(&s), "R-3 pin: reads empty");
-        assert_eq!(super::draft_gate(&daemon, &s, DirectSendKind::Text), None, "R-5 pin: passes");
-        let axes = super::MachineHoldAxes { draft: true, ..super::MachineHoldAxes::NONE };
-        assert_eq!(super::machine_direct_hold(&daemon, &s, axes), None, "R-6 pin: no draft");
-        assert_eq!(super::seat_input_line_visibility(&s).0, Some(false), "R-7 pin: not visible");
+        let (empty, draft, hold, visible) = crate::state::test_until_no_pty_output(&s, "A1 W1 readers", || {
+            paint_prompt(&s, "", "my own words");
+            let axes = super::MachineHoldAxes { draft: true, ..super::MachineHoldAxes::NONE };
+            (super::composer_measured_empty(&s),
+                super::draft_gate(&daemon, &s, DirectSendKind::Text),
+                super::machine_direct_hold(&daemon, &s, axes),
+                super::seat_input_line_visibility(&s).0)
+        });
+        assert!(empty, "R-3 pin: reads empty");
+        assert_eq!(draft, None, "R-5 pin: passes");
+        assert_eq!(hold, None, "R-6 pin: no draft");
+        assert_eq!(visible, Some(false), "R-7 pin: not visible");
     }
 
     /// W1 (c): the platform gate is ONE named predicate. Both branches of the pure table are measured on any host; the wrapper is
@@ -26298,17 +26433,15 @@ mod tests {
             Some("surface:99".into()),
             "test",
         );
+        let other_id = other.id.clone();
         s.pending_queue.lock().unwrap().push_back(other);
-        paint_prompt(&s, "", "");
-        *s.last_output.lock().unwrap() = std::time::Instant::now();
-        *s.last_human_input.lock().unwrap() = None;
-        let (mut depth, mut starve) = (HashMap::new(), HashMap::new());
-        deliver_queued(&daemon, &mut depth, &mut starve, &mut HashMap::new());
+        a1_deliver_at_prompt(&daemon, &s);
         assert_eq!(
             s.pending_queue.lock().unwrap().len(),
             1,
             "같은 발신자 3건이 한 턴으로 나가고 다른 발신자 1건만 남아야 한다"
         );
+        assert_eq!(s.pending_queue.lock().unwrap().front().unwrap().id, other_id, "only the original other-sender item remains");
         let ev = daemon
             .bus
             .tail(30)
@@ -26343,12 +26476,8 @@ mod tests {
             ("CYS_QUEUE_STARVE_ALERT_SECS", "0"),
         ]);
         let (daemon, s) = marker_seat("b1-ledger");
-        paint_prompt(&s, "", "");
-        *s.last_output.lock().unwrap() = std::time::Instant::now();
-        *s.last_human_input.lock().unwrap() = None;
         let want_id = s.pending_queue.lock().unwrap().front().unwrap().id.clone();
-        let (mut depth, mut starve) = (HashMap::new(), HashMap::new());
-        deliver_queued(&daemon, &mut depth, &mut starve, &mut HashMap::new());
+        a1_deliver_at_prompt(&daemon, &s);
         assert!(s.pending_queue.lock().unwrap().is_empty(), "배달 전제 미충족");
         let path = crate::delivery::ledger_path(&daemon.socket_path);
         let body = std::fs::read_to_string(&path).expect("배달 원장 파일");
