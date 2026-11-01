@@ -558,7 +558,11 @@ def fresh(td, mode, target, watched=None, home=None):
     w(script, FRESH_READER)
     env = {k: v for k, v in os.environ.items() if not k.startswith(("CYS_", "JAVIS_", "AITERM_")) and k != "CLAUDE_CONFIG_DIR"}
     env["HOME"] = home or td
-    sealed(td, env["HOME"], target if os.sep in target else td)
+    sealed(td)                                          # cwd of the child
+    sealed(env["HOME"])                                 # HOME of the child
+    sealed(env["TMPDIR"])                               # TMPDIR of the child
+    if os.sep in target:
+        sealed(target)
     p = subprocess.run([sys.executable, "-I", "-B", script, SNAP, mode, target] + ([watched] if watched else []),
                        capture_output=True, text=True, env=env, cwd=td)
     try:
@@ -843,7 +847,16 @@ def main():
     os.chdir(root)                       # the fallback round is relative to the working directory: HOME alone does not seal this run
     os.environ["HOME"] = os.path.join(root, "home")
     os.makedirs(os.environ["HOME"])
-    sealed(os.getcwd(), os.environ["HOME"], load().HOME, load().GEN_ROOT)
+    os.environ["TMPDIR"] = os.path.join(root, "tmp")
+    os.makedirs(os.environ["TMPDIR"])
+    tempfile.tempdir = None
+    for k in list(os.environ):
+        if k.startswith(("CYS_", "JAVIS_", "AITERM_", "PHOENIX_")) or k == "CLAUDE_CONFIG_DIR":
+            del os.environ[k]
+    sealed(os.getcwd())                                 # cwd
+    sealed(os.environ["HOME"], load().HOME)             # HOME, as the tool read it
+    sealed(load().GEN_ROOT)                             # the generation store
+    sealed(os.environ["TMPDIR"], tempfile.gettempdir())  # TMPDIR
     try:
         t_soul_captured(root)
         t_predicate_not_enumeration(root)

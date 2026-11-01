@@ -101,6 +101,11 @@ def _write(path, value):
         f.write(value if isinstance(value, str) else json.dumps(value))
 
 
+# Any of these reaches a lane outside the rig. HOME is sealed apart from them.
+STATE_ENV_PREFIXES = ("CYS_", "JAVIS_", "AITERM_", "PHOENIX_")
+STATE_ENV_NAMES = ("CLAUDE_CONFIG_DIR",)
+
+
 class Rig:
     def __init__(self, prefix="phx-plan-"):
         self.root = os.path.realpath(tempfile.mkdtemp(prefix=prefix))
@@ -110,6 +115,11 @@ class Rig:
         # HOME alone does not seal a run: a relative `_round` follows the working directory. Three axes, set here, asserted below.
         self.saved_cwd = os.getcwd()
         os.chdir(self.root)
+        for k in list(os.environ):
+            if k.startswith(STATE_ENV_PREFIXES) or k in STATE_ENV_NAMES:
+                del os.environ[k]
+        os.environ["TMPDIR"] = os.path.join(self.root, "tmp")
+        os.makedirs(os.environ["TMPDIR"])
         os.environ["LOCALAPPDATA"] = os.path.join(self.home, "AppData", "Local")
         os.environ.pop("PHOENIX_FORBID_LIVE", None)
         if os.name == "nt":
@@ -124,11 +134,16 @@ class Rig:
         self.assert_sealed()
 
     def assert_sealed(self, *paths):
-        """HOME, the working directory and every path given resolve inside this rig, before anything runs. It stops the run, it does not warn."""
-        for what in [os.environ["HOME"], os.getcwd()] + [p for p in paths if p]:
+        """Each axis, separately, before anything runs: HOME, the working directory, TMPDIR, no socket or state-dir variable in the process,
+        and every path given. It stops the run, it does not warn."""
+        for axis, what in [("HOME", os.environ["HOME"]), ("cwd", os.getcwd()), ("TMPDIR", os.environ["TMPDIR"]),
+                           ("generation store", self.gen_root)] + [("path", p) for p in paths if p]:
             r = os.path.realpath(what)
             if not (r == self.root or r.startswith(self.root + os.sep)):
-                raise SystemExit("rig refused: %r resolves outside the rig %r" % (what, self.root))
+                raise SystemExit("rig refused: %s %r resolves outside the rig %r" % (axis, what, self.root))
+        left = [k for k in os.environ if k.startswith(STATE_ENV_PREFIXES) or k in STATE_ENV_NAMES]
+        if left:
+            raise SystemExit("rig refused: socket or state variables in the environment: %s" % left)
 
     def load(self, path=PH, name="javis_phoenix_plan_rig"):
         spec = importlib.util.spec_from_file_location(name, path)

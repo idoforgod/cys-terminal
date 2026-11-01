@@ -561,7 +561,16 @@ def dept_corruption_matrix(td):
 
 
 def main():
-    td = tempfile.mkdtemp(prefix="phoenix-w3-")
+    td = os.path.realpath(tempfile.mkdtemp(prefix="phoenix-w3-"))
+    # The generation reader is no longer guarded by lane, so these fixtures must not reach the real store. Each axis, set and asserted.
+    cwd0, home0 = os.getcwd(), m.HOME
+    os.chdir(td)
+    m.HOME = td
+    for k in list(os.environ):
+        if k.startswith(("CYS_", "JAVIS_", "AITERM_")) or k == "CLAUDE_CONFIG_DIR":
+            del os.environ[k]
+    assert os.path.realpath(os.getcwd()) == td, "cwd is outside the rig"
+    assert os.path.join(m.HOME, ".cys", "state-generations").startswith(td + os.sep), "the generation store is outside the rig"
     try:
         c2_bak_fallback(td)
         c2_snapshot_fallback(td)
@@ -586,6 +595,8 @@ def main():
         c5_empty_list_is_known(td)
         dept_corruption_matrix(td)
     finally:
+        os.chdir(cwd0)
+        m.HOME = home0
         shutil.rmtree(td, ignore_errors=True)
     npass = sum(1 for c in _results if c)
     print("\n=== %d/%d PASS ===" % (npass, len(_results)))

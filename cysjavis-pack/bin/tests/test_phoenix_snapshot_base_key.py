@@ -358,6 +358,14 @@ def key_checks(w, check):
     if os.path.exists(sockets_log):      # KEY-9b reads this file for its own run
         os.remove(sockets_log)
 
+    # the store this suite reads is the rig's: a marker that exists nowhere else comes back, and the reader's root is the rig's
+    w.reset()
+    marker = "rig-only-%d" % os.getpid()
+    w.gen(NEW_T, dept=R.topo(["dept-role"], tombs=[marker]), base=R.topo(["master"]))
+    check("KEY-13 the store read is the rig's: its root is under the rig and a marker planted there comes back",
+          os.path.join(m.HOME, ".cys", "state-generations") == rig.gen_root and rig.gen_root.startswith(rig.root + os.sep)
+          and m._snapshot_tombstones(sock) == {marker}, "%s %s" % (m.HOME, m._LANE_READ))
+
     # the phoenix reader takes the same boundary as the snapshot tool: no policy, nothing opened, a named and counted refusal
     w.reset()
     w.gen(NEW_T, dept=R.topo(["dept-role"], tombs=["dept-gone"]), base=R.topo(["master"]))
