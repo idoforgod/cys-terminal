@@ -214,6 +214,11 @@ class WindowsAPI:
         if hasattr(value,'value'):return value.value
         return {'type':type(value).__name__}
 
+    def record_audit_failure(self,error):
+        # Presence is the monotonic latch; an exception message may be empty.
+        if self.audit_error is None:
+            self.audit_error={'type':type(error).__name__,'message':str(error)}
+
     def audit(self,row):
         # A disk failure must not throw between native allocation and ownership.
         # It is latched and checked before release, and invalidates cleanup.
@@ -222,7 +227,7 @@ class WindowsAPI:
             row={**row,'pid':os.getpid(),'monotonic_ns':time.monotonic_ns()}
             with self.audit_path.open('a',encoding='utf-8') as stream:
                 stream.write(json.dumps(row,sort_keys=True)+'\n');stream.flush()
-        except Exception as error:self.audit_error=str(error)
+        except Exception as error:self.record_audit_failure(error)
 
     def bind_call(self,name,fn):
         def call(*args):
@@ -233,7 +238,7 @@ class WindowsAPI:
             # Also retain the enter row if the native call never returns.
             before=C.get_last_error()
             try:self.audit({'call':index,'name':name,'stage':'enter','arguments':operands()})
-            except Exception as error:self.audit_error=str(error)
+            except Exception as error:self.record_audit_failure(error)
             C.set_last_error(before)
             try:result=fn(*args)
             except BaseException as problem:
@@ -242,7 +247,7 @@ class WindowsAPI:
                     self.last_call={'call':index,'name':name,'stage':'exception','arguments':operands(),
                                     'exception':type(problem).__name__,'error':str(problem),'last_error':error}
                     self.audit(self.last_call)
-                except Exception as audit_problem:self.audit_error=str(audit_problem)
+                except Exception as audit_problem:self.record_audit_failure(audit_problem)
                 finally:C.set_last_error(error)
                 raise
             error=C.get_last_error() # Capture BEFORE Python I/O or formatting.
@@ -250,7 +255,7 @@ class WindowsAPI:
                 self.last_call={'call':index,'name':name,'stage':'return','arguments':operands(),
                                 'result':self.argument(result),'last_error':error}
                 self.audit(self.last_call)
-            except Exception as problem:self.audit_error=str(problem)
+            except Exception as problem:self.record_audit_failure(problem)
             finally:C.set_last_error(error)
             return result
         return call
@@ -260,7 +265,7 @@ class WindowsAPI:
                                                 'audit_error':self.audit_error},sort_keys=True))
 
     def ensure_audit(self):
-        if self.audit_error:self.refuse('native audit unavailable')
+        if self.audit_error is not None:self.refuse('native audit unavailable')
 
     def check(self, value, action):
         if not value:self.refuse(action,win32_error=C.get_last_error(),result=value)
@@ -483,7 +488,7 @@ class OwnedBoundary:
         if self.profile_created and exited and (not self.process.hProcess or (accounting is not None and accounting['active']==0)) and not errors:
             removed=self.api.u.DeleteAppContainerProfile(self.profile)==0
             if not removed:errors.append('owned_profile_removal_failed')
-        if self.api.audit_error:errors.append('native_audit_unavailable: '+self.api.audit_error)
+        if self.api.audit_error is not None:errors.append('native_audit_unavailable: '+json.dumps(self.api.audit_error,sort_keys=True))
         self.cleanup={'root_exit_observed':exited,'job_accounting':accounting,'errors':errors,
                       'descendant_exit_receipt':True if not self.process.hProcess else (None if accounting is None else accounting['active']==0),
                       'profile_removed':removed,'profile_retained':self.profile_created and not removed}

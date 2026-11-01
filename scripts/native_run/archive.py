@@ -27,12 +27,22 @@ def collect(output):
             for sub in ('evidence','trace'):
                 directory=root/sub
                 if directory.exists():sources.extend(p for p in directory.rglob('*') if p.is_file())
-            sources.extend((root/'child').glob('origin.*.json'))
+            origin=list((root/'child').glob('origin.*.json'))
+            sources.extend(origin)
+            journal=root/'child/origin.native.jsonl'
+            # The helper writes this before publishing any origin JSON. Include
+            # the exact owned path even if absent, so copy failure is an error.
+            if origin or journal.exists():sources.append(journal)
             for source in sources:
                 rel=source.relative_to(root)
                 for node in (source,*source.parents):
                     if node==root.parent:break
                     if node.is_symlink() or (hasattr(node,'is_junction') and node.is_junction()):raise Unavailable('reparse in collected artifact')
+                if source.name=='origin.input.json' and source.parent==root/'child':
+                    error=read_json(source).get('error')
+                    marker='operands/result in '
+                    if isinstance(error,str) and marker in error and error.split(marker,1)[1]!=str(journal):
+                        raise Unavailable('origin input references an unexpected operand journal: '+repr({'expected':str(journal),'observed':error.split(marker,1)[1]}))
                 target=output/'fixtures'/root.name/rel;target.parent.mkdir(parents=True,exist_ok=True)
                 shutil.copyfile(source,target)
                 rows.append({'original':str(source),'path':str(target.relative_to(output)),'sha256':sha(target.read_bytes()),'bytes':target.stat().st_size})
