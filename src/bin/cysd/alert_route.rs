@@ -471,6 +471,17 @@ impl MinuteWindow {
     }
 }
 
+/// One [`AlertKey`] of a CSO seat's own alerts on its way to the master seat (0.14.57 P6): [`CSO_OWN_REPEAT_SECS`] apart.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CsoOwnRepeat {
+    /// Monotonic time of the last notice that entered the master queue.
+    pub sent: Option<f64>,
+    /// Monotonic time of the last overflow-ledger row for this key.
+    pub recorded: Option<f64>,
+    /// Arrivals since the last notice; the next notice carries them.
+    pub held: u64,
+}
+
 /// 라우터의 살아있는 상태. **전용 Mutex 하나**에 담긴다 — 큐 계열 락 순서 규약
 /// (restored_queue → surfaces → pending_queue) **밖**의 독립 락이고, 이 락을 쥔 채
 /// 다른 어떤 락도 잡지 않는다(그래서 락쌍이 만들어지지 않는다).
@@ -485,6 +496,9 @@ pub struct RouteState {
     /// (룰 10종이면 시간당 1,200줄). 발행에도 같은 쿨다운을 걸어 "억제도 보이되 소음이 되지는 않게"
     /// 한다. **판정에는 쓰이지 않는다**(제외는 시간이 지나도 제외다).
     pub last_ignored: HashMap<AlertKey, f64>,
+    /// A CSO seat's own alerts on their way to the master seat, per key. In memory only: after a restart a key may send
+    /// one notice early, which is the safe direction.
+    pub cso_own: HashMap<AlertKey, CsoOwnRepeat>,
     /// 최근 적재 단조 시각들(상한 창 · **전 키 합산** — 관측 `routed_1h`) — 두 몫의 상한(20 + 26/h)이 길이를 유계로 만든다.
     pub routed_window: VecDeque<f64>,
     /// ★(R1-F1 · 게이트 수정 1회차 R1R3-2) 배차된 **모든** clear 개시 신호([`is_clear_signal`])의 단조 시각들 — [`CLEAR_RESERVE`] 몫의
@@ -567,6 +581,9 @@ impl RouteState {
         // (죽은 좌석의 키가 데몬 수명 내내 남지 않게).
         self.last_routed.retain(|_, t| mono - *t <= 2.0 * COOLDOWN_SECS);
         self.last_ignored.retain(|_, t| mono - *t <= 2.0 * COOLDOWN_SECS);
+        self.cso_own.retain(|_, r| {
+            [r.sent, r.recorded].iter().flatten().any(|t| mono - *t <= 2.0 * CSO_OWN_REPEAT_SECS)
+        });
     }
 
     /// 제외 관측을 지금 발행해도 되는가(쿨다운 1개 창) — 발행하기로 하면 시각을 세운다.
@@ -3355,6 +3372,13 @@ pub fn handle_event(daemon: &Arc<Daemon>, event: &Value, now: Now) {
         route_cso_self_threshold(daemon, event, &item, now);
         return;
     }
+    // ★(0.14.57 · P6) A CSO seat's own queue and health alarms go to the master seat too. The seat whose job is to unblock
+    //   the others cannot report its own blockage, and an alarm delivered into that seat's queue cannot arrive. Same
+    //   shape as B-439: it returns here, so decide() and the CsoOwnSurface drop stay as they are for everything else.
+    if is_cso_own_seat_alert(daemon, event, &item) {
+        route_cso_own_alert(daemon, event, &item, now);
+        return;
+    }
     // ★출처가 CSO 자신인 생애 이벤트(`surface.exited{role:"cso*"}`)는 좌석 생존 여부와 무관하게
     //   제외한다 — 발행 시점에 이미 exited=true 라 좌석 집합만으로는 잡히지 않는다.
     if payload_role_is_cso(event) {
@@ -3366,6 +3390,21 @@ pub fn handle_event(daemon: &Arc<Daemon>, event: &Value, now: Now) {
 
 /// The seat role that receives a CSO's own context.threshold (B-439). Exact match: `master-2` is not the master seat.
 pub const CSO_SELF_THRESHOLD_TARGET_ROLE: &str = "master";
+
+/// A CSO seat's own alarms that go to the master seat, by name (0.14.57 P6). `context.threshold` has its own route (B-439).
+const CSO_OWN_SEAT_ALERTS: [&str; 3] = ["queue.depth_high", "queue.starved", "health.alert"];
+
+/// One notice per [`AlertKey`] in this window enters the master queue, and one overflow-ledger row. These events carry no
+/// fire id, and the two queue events come back every [`COOLDOWN_SECS`] from a seat that stays blocked, so a repeat is
+/// bounded by time and by the notice still waiting in the master queue. Arrivals in between are carried by the next notice.
+pub const CSO_OWN_REPEAT_SECS: f64 = 1800.0;
+
+/// Is this one of [`CSO_OWN_SEAT_ALERTS`] of a CSO seat? The same two tests as [`is_cso_self_threshold`]: these events
+/// usually carry the seat's role, and `health.alert` has none.
+fn is_cso_own_seat_alert(daemon: &Arc<Daemon>, event: &Value, item: &AlertItem) -> bool {
+    CSO_OWN_SEAT_ALERTS.contains(&item.key.name.as_str())
+        && (payload_role_is_cso(event) || item.key.surface.is_some_and(|s| cso_seats_detail(daemon).0.contains(&s)))
+}
 
 /// Is this a CSO seat's own `context.threshold`? Both CSO-own tests of the routing path count: the payload role (the
 /// drop in [`handle_event`]) and the seat being bound to a cso* role (the drop in [`route_once`]).
@@ -3442,17 +3481,10 @@ fn cso_self_row(kind: &str, item: &AlertItem, bus_seq: Option<u64>, now: Now) ->
     row
 }
 
-/// Deliver a CSO's own `context.threshold` to the master seat queue (B-439). When it cannot be delivered (no master
-/// seat, an empty master seat, a frozen or full queue) the fact goes to the existing overflow ledger
-/// ([`REFUSED_FILE`] via [`append_refused`], the same record the became-CSO path writes) and an event says so — it is
-/// never dropped silently. A repeat of a fire whose notice still waits in the master queue adds no second entry and is
-/// recorded the same way (BAR-R2-AMEND-1 C1a); once that notice is delivered, a repeat (a redelivery) enqueues again
-/// (C1b). Thresholds, fire/resolved bookkeeping and the pending set are not touched.
-fn route_cso_self_threshold(daemon: &Arc<Daemon>, event: &Value, item: &AlertItem, now: Now) {
-    let payload = event.get("payload").unwrap_or(&Value::Null);
-    // The hint must name the seat's CSO role: a cso-bound seat can publish with another payload role, and
-    // `--role <that role>` would cycle a different seat (R1-1).
-    let role: String = match payload.get("role").and_then(Value::as_str).filter(|r| !r.is_empty()) {
+/// The seat's CSO role for a hint. It must name the seat's CSO role: a cso-bound seat can publish with another payload
+/// role, and `--role <that role>` would cycle a different seat (R1-1).
+fn cso_role_of(daemon: &Arc<Daemon>, payload: &Value, item: &AlertItem) -> String {
+    match payload.get("role").and_then(Value::as_str).filter(|r| !r.is_empty()) {
         Some(r) if r.starts_with(CSO_ROLE_PREFIX) => r.to_string(),
         _ => item
             .key
@@ -3462,7 +3494,148 @@ fn route_cso_self_threshold(daemon: &Arc<Daemon>, event: &Value, item: &AlertIte
                 roles.iter().find(|(r, s)| **s == sid && is_cso_role(r)).map(|(r, _)| r.clone())
             })
             .unwrap_or_else(|| CSO_ROLE_PREFIX.to_string()),
+    }
+}
+
+/// Queue `text` for the master seat, or say why it cannot be: the cause goes into the overflow-ledger row's kind.
+fn enqueue_for_master(daemon: &Arc<Daemon>, master: Option<u64>, text: String) -> Result<(u64, String, usize), &'static str> {
+    match master {
+        None => Err("no_master"),
+        Some(sid) => enqueue_into_seat(
+            daemon,
+            sid,
+            text,
+            Some(ALERT_FROM.to_string()),
+            ALERT_ORIGIN,
+            CSO_QUEUE_HEADROOM,
+            Some(RoleGuard::Exact(CSO_SELF_THRESHOLD_TARGET_ROLE)),
+            FreezeGuard::DaemonAndSeat,
+            None,
+        )
+        .map(|(entry_id, depth)| (sid, entry_id, depth))
+        .map_err(|e| match e {
+            EnqueueErr::SeatGone | EnqueueErr::RoleChanged => "no_master",
+            EnqueueErr::EmptySeat => "empty_master_seat",
+            EnqueueErr::QueueFull => "master_queue_full",
+            EnqueueErr::Frozen => "paused",
+        }),
+    }
+}
+
+/// Head of the sentence [`cso_own_alert_text`] adds, also an anchor of the identity [`cso_own_notice_waits`] reads.
+const CSO_OWN_MARK: &str = " | this alert is about the CSO's OWN seat (";
+/// Tag before the key detail inside that sentence.
+const CSO_OWN_KEY_TAG: &str = ", key ";
+
+/// Text for the master seat: the same `[alert] …` line the CSO gets for other seats, plus one sentence on the same line
+/// saying whose seat it is and what master can do. It carries the key detail: `health.alert` shares its head between rules.
+pub fn cso_own_alert_text(item: &AlertItem, role: &str, bus_seq: Option<u64>, repeat: u64) -> String {
+    let seq = bus_seq.map_or_else(|| "-".to_string(), |s| s.to_string());
+    let key = item.key.detail.as_deref().unwrap_or("-");
+    let hint = if is_one_shot(&item.key.name) {
+        format!("no CSO reads alerts until the seat is back - master decides: cys status --json, then cys launch-agent --role {role}")
+    } else {
+        format!("the CSO cannot report this itself - master decides: cys status --json, then cys cycle-agent --role {role}")
     };
+    format!("{}{CSO_OWN_MARK}{role}{CSO_SELF_SEQ_TAG}{seq}{CSO_OWN_KEY_TAG}{key}); {hint}", render_text(item, repeat))
+}
+
+/// Does a notice for this key still wait in the master queue? See [`cso_self_pending_entry`] for what presence means.
+fn cso_own_notice_waits(daemon: &Arc<Daemon>, master: u64, key: &AlertKey) -> bool {
+    let Some(surface) = daemon.get_surface(master) else { return false };
+    let head = format!("{} ", alert_text_prefix(key));
+    let tail = format!("{CSO_OWN_KEY_TAG}{}); ", key.detail.as_deref().unwrap_or("-"));
+    let q = surface.pending_queue.lock().unwrap();
+    q.iter().any(|e| {
+        e.origin == ALERT_ORIGIN
+            && e.from.as_deref() == Some(ALERT_FROM)
+            && e.text.starts_with(&head)
+            && e.text.contains(CSO_OWN_MARK)
+            && e.text.contains(&tail)
+    })
+}
+
+/// Deliver one of a CSO seat's own alarms to the master seat queue (0.14.57 P6), the B-439 route with no fire id. A repeat
+/// adds nothing while a notice for its key waits in the master queue or inside [`CSO_OWN_REPEAT_SECS`]; the next notice
+/// carries the count. When it cannot be delivered the cause and the key go to the overflow ledger, one row per key per
+/// [`CSO_OWN_REPEAT_SECS`]: never dropped silently, never put in the CSO inbox. A master that comes back is told at the
+/// next arrival, the ledger window does not hold that back.
+fn route_cso_own_alert(daemon: &Arc<Daemon>, event: &Value, item: &AlertItem, now: Now) {
+    let payload = event.get("payload").unwrap_or(&Value::Null);
+    let role = cso_role_of(daemon, payload, item);
+    let bus_seq = event.get("seq").and_then(Value::as_u64);
+    let master = daemon.roles.lock().unwrap().get(CSO_SELF_THRESHOLD_TARGET_ROLE).copied();
+    let waiting = master.is_some_and(|sid| cso_own_notice_waits(daemon, sid, &item.key));
+    let repeat = {
+        let mut st = state_lock(daemon);
+        st.prune(now.mono);
+        let r = st.cso_own.entry(item.key.clone()).or_default();
+        r.held += 1;
+        if waiting || r.sent.is_some_and(|t| now.mono - t < CSO_OWN_REPEAT_SECS) {
+            return;
+        }
+        r.held
+    };
+    let text = cso_own_alert_text(item, &role, bus_seq, repeat);
+    match enqueue_for_master(daemon, master, text) {
+        Ok((sid, entry_id, depth)) => {
+            {
+                let mut st = state_lock(daemon);
+                let r = st.cso_own.entry(item.key.clone()).or_default();
+                r.sent = Some(now.mono);
+                r.held = 0;
+            }
+            publish_route(
+                daemon,
+                "alert_route.cso_own_to_master",
+                json!({"name": item.key.name, "surface_id": item.key.surface, "detail": item.key.detail,
+                       "role": role, "bus_seq": bus_seq, "repeat": repeat, "master_surface": sid,
+                       "queue_entry_id": entry_id, "depth": depth}),
+            );
+        }
+        Err(cause) => {
+            let write = {
+                let mut st = state_lock(daemon);
+                let r = st.cso_own.entry(item.key.clone()).or_default();
+                let write = !r.recorded.is_some_and(|t| now.mono - t < CSO_OWN_REPEAT_SECS);
+                if write {
+                    r.recorded = Some(now.mono);
+                }
+                write
+            };
+            if !write {
+                return;
+            }
+            let mut row = cso_self_row(&format!("cso_own_alert_{cause}"), item, bus_seq, now);
+            row["role"] = json!(role);
+            row["repeat"] = json!(repeat);
+            let archived = append_refused(daemon, &[row]);
+            publish_route(
+                daemon,
+                "alert_route.cso_own_undelivered",
+                json!({"name": item.key.name, "surface_id": item.key.surface, "detail": item.key.detail,
+                       "role": role, "cause": cause, "repeat": repeat, "summary": item.summary,
+                       "archived_to": if archived.is_ok() { json!(REFUSED_FILE) } else { Value::Null },
+                       "archive_error": match &archived { Err(e) => json!(e.to_string()), Ok(()) => Value::Null },
+                       "note": if archived.is_ok() {
+                           "the CSO's own alarm could not reach the master seat - kept in the overflow ledger"
+                       } else {
+                           "LOST: could not reach the master seat and could not be written to the overflow ledger - this event is the last copy"
+                       }}),
+            );
+        }
+    }
+}
+
+/// Deliver a CSO's own `context.threshold` to the master seat queue (B-439). When it cannot be delivered (no master
+/// seat, an empty master seat, a frozen or full queue) the fact goes to the existing overflow ledger
+/// ([`REFUSED_FILE`] via [`append_refused`], the same record the became-CSO path writes) and an event says so — it is
+/// never dropped silently. A repeat of a fire whose notice still waits in the master queue adds no second entry and is
+/// recorded the same way (BAR-R2-AMEND-1 C1a); once that notice is delivered, a repeat (a redelivery) enqueues again
+/// (C1b). Thresholds, fire/resolved bookkeeping and the pending set are not touched.
+fn route_cso_self_threshold(daemon: &Arc<Daemon>, event: &Value, item: &AlertItem, now: Now) {
+    let payload = event.get("payload").unwrap_or(&Value::Null);
+    let role = cso_role_of(daemon, payload, item);
     let fire = payload.get("fire_id").and_then(Value::as_str).filter(|f| !f.is_empty());
     let bus_seq = event.get("seq").and_then(Value::as_u64);
     let text = cso_self_threshold_text(item, &role, fire, bus_seq);
@@ -3489,28 +3662,7 @@ fn route_cso_self_threshold(daemon: &Arc<Daemon>, event: &Value, item: &AlertIte
             return;
         }
     }
-    let result = match master {
-        None => Err("no_master"),
-        Some(sid) => enqueue_into_seat(
-            daemon,
-            sid,
-            text,
-            Some(ALERT_FROM.to_string()),
-            ALERT_ORIGIN,
-            CSO_QUEUE_HEADROOM,
-            Some(RoleGuard::Exact(CSO_SELF_THRESHOLD_TARGET_ROLE)),
-            FreezeGuard::DaemonAndSeat,
-            None,
-        )
-        .map(|(entry_id, depth)| (sid, entry_id, depth))
-        .map_err(|e| match e {
-            EnqueueErr::SeatGone | EnqueueErr::RoleChanged => "no_master",
-            EnqueueErr::EmptySeat => "empty_master_seat",
-            EnqueueErr::QueueFull => "master_queue_full",
-            EnqueueErr::Frozen => "paused",
-        }),
-    };
-    match result {
+    match enqueue_for_master(daemon, master, text) {
         Ok((sid, entry_id, depth)) => publish_route(
             daemon,
             "alert_route.cso_self_to_master",
@@ -4818,6 +4970,220 @@ mod drills {
         assert_eq!(rows[0]["kind"], "cso_self_threshold_paused");
     }
 
+    /// The event each of the CSO-own routes sees, in its real shape: the queue events carry the seat's role, `health.alert`
+    /// carries none, and `surface.exited` is published after the seat went exited=true.
+    fn cso_own_ev(daemon: &Arc<Daemon>, name: &str, cso: u64, seq: u64) -> Value {
+        let payload = match name {
+            "queue.depth_high" => json!({"role": "cso", "depth": 60, "threshold": 50, "blocked_by": "busy(출력 중)"}),
+            "queue.starved" => json!({"role": "cso", "depth": 3, "waited_secs": 700, "blocked_by": "busy(출력 중)"}),
+            "health.alert" => json!({"rule": "auth_401", "line": "x"}),
+            "surface.exited" => {
+                daemon.get_surface(cso).unwrap().exited.store(true, Ordering::Relaxed);
+                json!({"role": "cso", "agent": "claude"})
+            }
+            other => panic!("not a CSO-own route: {other}"),
+        };
+        let mut e = ev(name, Some(cso), payload);
+        e["seq"] = json!(seq);
+        e
+    }
+
+    fn cso_own_rows(daemon: &Arc<Daemon>, name: &str, cso: u64) -> Vec<Value> {
+        read_refused_rows(daemon).expect("overflow ledger readable").into_iter()
+            .filter(|r| r["name"] == name && r["surface_id"] == json!(cso)).collect()
+    }
+
+    /// (P6) Master +1, the CSO 0, nothing parked, no ledger row. The line names the seat and does not call it a context threshold.
+    fn check_cso_own_goes_to_master(name: &str) {
+        let daemon = drill_daemon("csoownm");
+        let cso = seat(&daemon, "cso");
+        let master = seat(&daemon, "master");
+        let now = after_grace(&daemon);
+        handle_event(&daemon, &cso_own_ev(&daemon, name, cso, 41), now);
+        assert_eq!(depth(&daemon, master), 1, "{name}: master gets exactly one notice");
+        assert_eq!(depth(&daemon, cso), 0, "{name}: never into the CSO's own inbox");
+        assert_eq!(pending_len(&daemon), 0, "{name}: not parked in the pending set");
+        assert!(cso_own_rows(&daemon, name, cso).is_empty(), "{name}: delivered, so no ledger row");
+        let e = daemon.get_surface(master).unwrap().pending_queue.lock().unwrap()[0].clone();
+        assert_eq!((e.origin.as_str(), e.from.as_deref()), (ALERT_ORIGIN, Some(ALERT_FROM)));
+        assert!(e.text.starts_with(&format!("[alert] {name} surface:{cso} ")), "{}", e.text);
+        assert!(e.text.contains("the CSO's OWN seat (cso, bus seq 41"), "{}", e.text);
+        assert!(!e.text.contains("threshold"), "not a context threshold: {}", e.text);
+        assert!(!e.text.contains('\n'), "one line: {}", e.text);
+    }
+
+    /// (P6) Undeliverable: no master seat, then an empty master seat. A ledger row with the cause and the key each time,
+    /// never the CSO inbox, never a silent return.
+    fn check_cso_own_without_a_master_is_recorded(name: &str) {
+        let daemon = drill_daemon("csoownn");
+        let cso = seat(&daemon, "cso");
+        let now = after_grace(&daemon);
+        handle_event(&daemon, &cso_own_ev(&daemon, name, cso, 42), now);
+        assert_eq!((depth(&daemon, cso), pending_len(&daemon)), (0, 0), "{name}");
+        let rows = cso_own_rows(&daemon, name, cso);
+        assert_eq!(rows.len(), 1, "{name}: recorded once: {rows:?}");
+        assert_eq!(rows[0]["kind"], "cso_own_alert_no_master", "{rows:?}");
+        assert_eq!((rows[0]["bus_seq"].clone(), rows[0]["role"].clone()), (json!(42), json!("cso")), "{rows:?}");
+        assert!(!rows[0]["summary"].as_str().unwrap_or("").is_empty(), "the row identifies the fact: {rows:?}");
+        let daemon = drill_daemon("csoowne");
+        let cso = seat(&daemon, "cso");
+        let empty_master = bare_seat(&daemon, "master");
+        handle_event(&daemon, &cso_own_ev(&daemon, name, cso, 43), now);
+        assert_eq!(depth(&daemon, empty_master), 0, "{name}: an empty seat is not a reader");
+        assert_eq!((depth(&daemon, cso), pending_len(&daemon)), (0, 0), "{name}");
+        let rows = cso_own_rows(&daemon, name, cso);
+        assert_eq!(rows.len(), 1, "{name}: {rows:?}");
+        assert_eq!(rows[0]["kind"], "cso_own_alert_empty_master_seat", "{rows:?}");
+    }
+
+    /// (P6) A frozen master queue (kill-switch pause) is a recorded non-delivery, not a queue entry or a drop.
+    fn check_cso_own_while_paused_is_recorded(name: &str) {
+        let daemon = drill_daemon("csoownp");
+        let cso = seat(&daemon, "cso");
+        let master = seat(&daemon, "master");
+        let now = after_grace(&daemon);
+        daemon.paused.store(true, Ordering::Relaxed);
+        handle_event(&daemon, &cso_own_ev(&daemon, name, cso, 44), now);
+        daemon.paused.store(false, Ordering::Relaxed);
+        assert_eq!((depth(&daemon, master), depth(&daemon, cso), pending_len(&daemon)), (0, 0, 0), "{name}");
+        let rows = cso_own_rows(&daemon, name, cso);
+        assert_eq!(rows.len(), 1, "{name}: {rows:?}");
+        assert_eq!(rows[0]["kind"], "cso_own_alert_paused", "{rows:?}");
+    }
+
+    #[test]
+    fn drill_cso_own_queue_depth_high_goes_to_master() { check_cso_own_goes_to_master("queue.depth_high"); }
+    #[test]
+    fn drill_cso_own_queue_starved_goes_to_master() { check_cso_own_goes_to_master("queue.starved"); }
+    #[test]
+    fn drill_cso_own_health_alert_goes_to_master() { check_cso_own_goes_to_master("health.alert"); }
+    #[test]
+    fn drill_cso_own_queue_depth_high_without_a_master_is_recorded() { check_cso_own_without_a_master_is_recorded("queue.depth_high"); }
+    #[test]
+    fn drill_cso_own_queue_starved_without_a_master_is_recorded() { check_cso_own_without_a_master_is_recorded("queue.starved"); }
+    #[test]
+    fn drill_cso_own_health_alert_without_a_master_is_recorded() { check_cso_own_without_a_master_is_recorded("health.alert"); }
+    #[test]
+    fn drill_cso_own_queue_depth_high_while_paused_is_recorded() { check_cso_own_while_paused_is_recorded("queue.depth_high"); }
+    #[test]
+    fn drill_cso_own_queue_starved_while_paused_is_recorded() { check_cso_own_while_paused_is_recorded("queue.starved"); }
+    #[test]
+    fn drill_cso_own_health_alert_while_paused_is_recorded() { check_cso_own_while_paused_is_recorded("health.alert"); }
+
+    /// (P6) A seat bound to a cso* role whose payload role is not cso reaches master too (the route_once drop), and the hint
+    /// names the seat's CSO role.
+    #[test]
+    fn drill_cso_own_alert_of_a_cso_bound_seat_goes_to_master() {
+        let daemon = drill_daemon("csoownb");
+        let cso2 = seat(&daemon, "cso-2");
+        let master = seat(&daemon, "master");
+        let now = after_grace(&daemon);
+        handle_event(&daemon, &ev("queue.depth_high", Some(cso2), json!({"role": "worker", "depth": 60})), now);
+        assert_eq!((depth(&daemon, master), depth(&daemon, cso2), pending_len(&daemon)), (1, 0, 0));
+        let t = queue_texts(&daemon, master).remove(0);
+        assert!(t.contains("cys cycle-agent --role cso-2") && !t.contains("--role worker"), "{t}");
+    }
+
+    /// (P6) A full master queue is a recorded non-delivery with its own cause.
+    #[test]
+    fn drill_cso_own_alert_with_a_full_master_queue_is_recorded() {
+        let daemon = drill_daemon("csoownf");
+        let cso = seat(&daemon, "cso");
+        let master = seat(&daemon, "master");
+        let now = after_grace(&daemon);
+        for i in 0..CSO_QUEUE_HEADROOM {
+            enqueue_for_master(&daemon, Some(master), format!("filler {i}")).expect("below the headroom");
+        }
+        handle_event(&daemon, &cso_own_ev(&daemon, "queue.starved", cso, 45), now);
+        assert_eq!((depth(&daemon, master), depth(&daemon, cso)), (CSO_QUEUE_HEADROOM, 0));
+        let rows = cso_own_rows(&daemon, "queue.starved", cso);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["kind"], "cso_own_alert_master_queue_full");
+    }
+
+    /// (P6, the repeat bound, MEASURED) A CSO stuck for 6 hours: both queue events arrive every 300 s, the publisher's own
+    /// cooldown (governance `QUEUE_ALERT_COOLDOWN_SECS`), and master reads each notice as it comes. Each key sends one
+    /// notice per [`CSO_OWN_REPEAT_SECS`], and each later notice carries the arrivals in between.
+    #[test]
+    fn drill_cso_own_repeat_bound_for_a_seat_stuck_for_hours() {
+        let daemon = drill_daemon("csoownr");
+        let cso = seat(&daemon, "cso");
+        let master = seat(&daemon, "master");
+        let t0 = after_grace(&daemon);
+        let (mut read, mut arrivals) = (Vec::new(), 0u64);
+        for tick in 0..=72u64 {
+            let at = Now::at(t0.mono + 300.0 * tick as f64);
+            for (i, name) in ["queue.starved", "queue.depth_high"].into_iter().enumerate() {
+                handle_event(&daemon, &cso_own_ev(&daemon, name, cso, 1000 + tick * 2 + i as u64), at);
+                arrivals += 1;
+            }
+            read.append(&mut queue_texts(&daemon, master));
+            daemon.get_surface(master).unwrap().pending_queue.lock().unwrap().clear();
+        }
+        println!("P6-MEASURED arrivals {arrivals} over 6 h, notices into master {}", read.len());
+        assert_eq!(arrivals, 146);
+        assert_eq!(read.len(), 26, "13 notices per key in 6 h inclusive: 2 per hour per key, 4 per hour for the seat");
+        assert_eq!(read.iter().filter(|t| t.contains("(반복 6건)")).count(), 24, "each later notice carries the 6 arrivals of its window");
+        assert_eq!((depth(&daemon, cso), pending_len(&daemon)), (0, 0));
+        assert!(read_refused_rows(&daemon).expect("ledger").is_empty(), "delivered, so no row");
+    }
+
+    /// (P6, the repeat bound, MEASURED) The same 6 hours with a master that reads nothing: one waiting notice per key.
+    #[test]
+    fn drill_cso_own_repeat_waits_behind_an_undelivered_notice() {
+        let daemon = drill_daemon("csoownw");
+        let cso = seat(&daemon, "cso");
+        let master = seat(&daemon, "master");
+        let t0 = after_grace(&daemon);
+        for tick in 0..=72u64 {
+            let at = Now::at(t0.mono + 300.0 * tick as f64);
+            for name in ["queue.starved", "queue.depth_high"] {
+                handle_event(&daemon, &cso_own_ev(&daemon, name, cso, 2000 + tick), at);
+            }
+        }
+        println!("P6-MEASURED master reads nothing for 6 h: master depth {}", depth(&daemon, master));
+        assert_eq!(depth(&daemon, master), 2, "one waiting notice per key");
+        assert_eq!((depth(&daemon, cso), pending_len(&daemon)), (0, 0));
+    }
+
+    /// (P6, the repeat bound, MEASURED) 6 hours with no master: the ledger gets one row per key per window, and a master that
+    /// sits down is told at the next arrival even though the ledger window is still closed.
+    #[test]
+    fn drill_cso_own_rows_are_bounded_and_a_returning_master_is_told_at_once() {
+        let daemon = drill_daemon("csoownl");
+        let cso = seat(&daemon, "cso");
+        let t0 = after_grace(&daemon);
+        for tick in 0..=72u64 {
+            let at = Now::at(t0.mono + 300.0 * tick as f64);
+            for name in ["queue.starved", "queue.depth_high"] {
+                handle_event(&daemon, &cso_own_ev(&daemon, name, cso, 3000 + tick), at);
+            }
+        }
+        let rows = read_refused_rows(&daemon).expect("ledger");
+        println!("P6-MEASURED no master for 6 h: ledger rows {}", rows.len());
+        assert_eq!(rows.len(), 26, "13 rows per key");
+        assert_eq!(rows[1]["repeat"], json!(1));
+        assert_eq!(rows.last().unwrap()["repeat"], json!(73), "the last row says how many arrivals went unread");
+        let master = seat(&daemon, "master");
+        let at = Now::at(t0.mono + 300.0 * 73.0);
+        handle_event(&daemon, &cso_own_ev(&daemon, "queue.starved", cso, 3999), at);
+        assert_eq!(depth(&daemon, master), 1, "told at the next arrival");
+        assert!(queue_texts(&daemon, master)[0].contains("(반복 74건)"), "{:?}", queue_texts(&daemon, master));
+    }
+
+    /// (P6) Two health rules are two facts: a notice waiting for one does not hold the other back.
+    #[test]
+    fn drill_cso_own_health_rules_do_not_share_a_notice() {
+        let daemon = drill_daemon("csoownh");
+        let cso = seat(&daemon, "cso");
+        let master = seat(&daemon, "master");
+        let now = after_grace(&daemon);
+        handle_event(&daemon, &ev("health.alert", Some(cso), json!({"rule": "auth_401"})), now);
+        handle_event(&daemon, &ev("health.alert", Some(cso), json!({"rule": "not_logged_in"})), now);
+        handle_event(&daemon, &ev("health.alert", Some(cso), json!({"rule": "auth_401"})), now);
+        assert_eq!(depth(&daemon, master), 2, "{:?}", queue_texts(&daemon, master));
+    }
+
     /// Control (B-439): every other CSO-own event stays excluded exactly as before, with a live master present.
     #[test]
     fn drill_cso_own_non_threshold_events_stay_excluded_with_a_master_seat() {
@@ -4825,10 +5191,6 @@ mod drills {
         let cso = seat(&daemon, "cso");
         let master = seat(&daemon, "master");
         let now = after_grace(&daemon);
-        for name in ["queue.depth_high", "queue.starved", "health.alert"] {
-            handle_event(&daemon, &ev(name, Some(cso), json!({"role": "cso", "depth": 60})), now);
-            handle_event(&daemon, &ev(name, Some(cso), json!({"depth": 60})), now);
-        }
         handle_event(&daemon, &ev("surface.exited", Some(cso), json!({"role": "cso"})), now);
         assert_eq!(depth(&daemon, master), 0, "master gets nothing for non-threshold CSO-own events");
         assert_eq!(depth(&daemon, cso), 0, "the CSO inbox gets nothing");
