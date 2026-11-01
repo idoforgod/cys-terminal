@@ -561,9 +561,15 @@ class WriterProtocol(Barriers):
         tree = ast.parse(text)
         fn = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_release_claim"][0]
         args = [a.arg for a in fn.args.args]
-        removers = text.count("os.rmdir(lock)")
-        control("P3R4 claim removal: rmdir sites=%d, args=%s" % (removers, args))
-        self.assertEqual(removers, 1)
+        removers = []
+        for f in ast.walk(tree):  # a function that holds the ownership lock path and removes that path
+            if isinstance(f, ast.FunctionDef):
+                calls = [n for n in ast.walk(f) if isinstance(n, ast.Call)]
+                if any(getattr(c.func, "id", "") == "_lock_dir" for c in calls) and any(
+                        getattr(c.func, "attr", "") == "rmdir" and ast.unparse(c.args[0]) == "lock" for c in calls):
+                    removers.append(f.name)
+        control("P3R4 claim removal: functions that remove the ownership lock=%s, args=%s" % (removers, args))
+        self.assertEqual(removers, ["_release_claim"])
         self.assertNotIn("force", args)
         self.assertNotIn("_release_lock", text)
 
