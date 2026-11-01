@@ -3161,7 +3161,7 @@ fn normcase_path(s: &str, windows: bool) -> String {
     t.to_lowercase()
 }
 
-/// Which file a manifest `source` names, as `_base_topology_in_generation` in javis_phoenix.py compares it: real path, then
+/// Which file a manifest `source` names, as `_lane_topology_in_generation` in javis_phoenix.py compares it: real path, then
 /// normcase. Only the directory is resolved: this lane's topology.json has just been renamed away, so the file itself is absent.
 fn lane_file_key(path: &std::path::Path) -> String {
     let resolved = match (path.parent(), path.file_name()) {
@@ -27812,9 +27812,6 @@ mod tests {
         assert_eq!(got["persisted"]["tombstones"], json!(roles), "the first persist carries the set");
         assert_eq!(got["persisted"]["tombstones_rev"], json!(1));
         assert_eq!(got["persisted"]["schema_version"], json!(1));
-        if let Ok(path) = std::env::var("P0_PERSISTED_OUT") {
-            std::fs::copy(me.join("topology.json"), path).unwrap();
-        }
 
         let next = p0_run_child(&home, &socket, &other, false);
         assert_eq!(next["seeded"], json!(roles), "the next boot reads it back");
