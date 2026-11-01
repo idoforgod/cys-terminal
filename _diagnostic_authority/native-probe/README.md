@@ -1,0 +1,1 @@
+Local E1 preparation only. No execution authority is granted by creating these files. Publication and repository-variable wiring require the separate CEO E1 decision. The diagnostic branch is separate; this evidence branch must match zero push workflows. No run, push, dispatch or variable write was performed.
