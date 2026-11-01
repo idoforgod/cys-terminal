@@ -9,7 +9,7 @@ import os
 import shutil
 import sys
 import time
-from boundary import OwnedProcess, Unavailable
+from boundary import OwnedProcess, Unavailable, cleanup_valid
 from controller import fixture_environment, Authority
 from protocol import atomic_json, read_json, sha
 from rpc import FixtureRPC
@@ -129,5 +129,7 @@ class ProductReceiver:
         try:receipt=bounded_observation('receiver owned cleanup',lambda:read_json(self.root/'evidence/boundary-finish.json') if (self.root/'evidence/boundary-finish.json').is_file() else None,15)
         except Unavailable:pass
         if self.daemon:self.daemon.close()
-        self.cleanup={'receiver':receipt,'daemon':None if not self.daemon else self.daemon.cleanup}
+        daemon_cleanup=None if not self.daemon else self.daemon.cleanup
+        receiver_cleanup=receipt.get('cleanup') if type(receipt) is dict else None
+        self.cleanup={'receiver':receipt,'daemon':daemon_cleanup,'complete':cleanup_valid(receiver_cleanup) and cleanup_valid(daemon_cleanup)}
         atomic_json(self.root/'evidence/fixture-cleanup.json',self.cleanup)

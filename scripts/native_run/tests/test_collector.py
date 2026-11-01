@@ -13,9 +13,6 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(len({r['id'] for r in rows}), 740)
         self.assertEqual(protocol.cost()['runner_minutes'], 1190)
         self.assertEqual(len(protocol.matrix()), 14)
-    def test_collector_exists_independently(self):
-        spec = importlib.util.find_spec('collector')
-        self.assertIsNotNone(spec, 'COLLECTOR_NOT_IMPLEMENTED: simulator cannot stand in for it')
 
 
 import tempfile,json,copy
@@ -70,6 +67,12 @@ class CollectorRejectionTests(unittest.TestCase):
     def test_witness_owner_comes_only_from_internal_header(self):
         self.assertEqual(collector.witness_owner(b'test actual::owner ... FAILED\n'),'actual::owner')
         with self.assertRaises(collector.Rejected):collector.witness_owner(b'filename says another owner\n')
+    def test_nonempty_wrong_inventory_rejects(self):
+        self.case['tests']=['wrong::name'];self.assertFalse(self.assess()['complete'])
+    def test_unplanned_failure_is_retained(self):
+        self.put('stdout',b'test real::failure ... FAILED\n');self.record['id']='I/unplanned'
+        manifest={**self.manifest,'cases':protocol.plan()}
+        r=collector.collect(self.root,manifest,[self.record]);self.assertTrue(r['unattributed_failures']);self.assertFalse(r['complete'])
     def test_wilson_boundary(self):
         self.assertAlmostEqual(collector.wilson(0,300)[1],0.012643,places=6)
 
@@ -101,5 +104,6 @@ class OracleGateControls(unittest.TestCase):
     def test_unobserved_submission_calibration_not_zero(self):
         self.put('calibration_yes_events',b'');r=collector.assess(self.root,self.record,self.case,self.manifest)
         self.assertFalse(r['complete']);self.assertIn('no-submit oracle uncalibrated',r['issues'])
+
 
 if __name__=='__main__':unittest.main()

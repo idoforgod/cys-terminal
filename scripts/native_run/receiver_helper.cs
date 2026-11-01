@@ -61,8 +61,10 @@ class NativeReceiverHelper {
                 bool connected=false;string error=null;
                 using(Socket s=new Socket(address.AddressFamily,SocketType.Stream,ProtocolType.Tcp)) {
                     IAsyncResult call=s.BeginConnect(new IPEndPoint(address,port),null,null);
-                    if(!call.AsyncWaitHandle.WaitOne(2000))error="bounded_connect_timeout";
-                    else {try{s.EndConnect(call);connected=s.Connected;}catch(SocketException e){error=e.SocketErrorCode+":"+e.NativeErrorCode;}}
+                    using(WaitHandle wait=call.AsyncWaitHandle) {
+                        if(!wait.WaitOne(2000))error="bounded_connect_timeout";
+                        else {try{s.EndConnect(call);connected=s.Connected;}catch(SocketException e){error=e.SocketErrorCode+":"+e.NativeErrorCode;}}
+                    }
                 }
                 File.WriteAllText(output,Json.Serialize(new {connected=connected,error=error,address=address.ToString(),port=port,pid=System.Diagnostics.Process.GetCurrentProcess().Id,utc=DateTime.UtcNow.ToString("o")}),new UTF8Encoding(false));
                 return 0; // outcome is recorded, not interpreted as isolation success

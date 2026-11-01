@@ -12,8 +12,8 @@ import re
 import shutil
 import sys
 import uuid
-from protocol import atomic_json, read_json, sha
-from boundary import OwnedBoundary, Unavailable
+from protocol import atomic_json, read_json, decode_json, sha
+from boundary import OwnedBoundary, Unavailable, WindowsAPI, protected_sddl, cleanup_valid
 
 @dataclass(frozen=True)
 class Authority:
@@ -28,7 +28,7 @@ def authorize(path, expected_digest, *, mode, diagnostic_sha, product_sha, now=N
         raise Unavailable('full source SHAs required')
     raw=Path(path).read_bytes()
     if not re.fullmatch('[0-9a-f]{64}',expected_digest) or sha(raw)!=expected_digest:raise Unavailable('external authority digest mismatch')
-    data=read_json(path)
+    data=decode_json(raw)
     if data.get('mode')!=mode or data.get('diagnostic_sha')!=diagnostic_sha or data.get('product_sha')!=product_sha:
         raise Unavailable('authority mode/source mismatch')
     if data.get('release_verdict')!='NONE' or type(data.get('attempt')) is not int or data['attempt']!=1:
@@ -53,6 +53,14 @@ def prepare_root(parent, executable, expected_sha, *, run_id=None):
     dest=root/'bin'/source.name;shutil.copy2(source,dest)
     if sha(dest.read_bytes())!=expected_sha:raise Unavailable('receiver copy mismatch')
     return root,dest
+
+def protect_native_root(root):
+    api=WindowsAPI();owner=api.user_sid();receipts=[]
+    for path in [Path(root),*sorted(Path(root).rglob('*'),key=lambda p:len(p.parts))]:
+        if path.is_symlink() or (hasattr(path,'is_junction') and path.is_junction()):raise Unavailable('reparse in new private root')
+        receipts.append(api.protect(path,protected_sddl(owner,'S-1-15-2-0','evidence',path.is_dir())))
+    atomic_json(Path(root)/'evidence/root-acl.json',{'owner':owner,'receipts':receipts})
+    return receipts
 
 def fixture_environment(root, system_root):
     root=Path(root)
@@ -83,15 +91,19 @@ class ReceiverController:
     def __init__(self, authority, spec):
         if not isinstance(authority,Authority):raise Unavailable('frozen authority required')
         self.authority=authority;self.spec=spec;self.child=None
-        self.observations=dict.fromkeys(PREMISES)
+        self.observations=dict.fromkeys(PREMISES);self.launch_failure=None
 
     def launch(self):
         # Native probe execution is deliberately not exposed by an import or unit check.
         if sys.platform!='win32':raise Unavailable('native Windows receiver unavailable')
         if datetime.datetime.now(datetime.timezone.utc)>=datetime.datetime.fromisoformat(self.authority.latest_end_utc):
             raise Unavailable('authority expired before launch')
-        self.child=OwnedBoundary(self.spec)
-        return self.child.release()
+        try:
+            self.child=OwnedBoundary(self.spec)
+            return self.child.release()
+        except Unavailable as e:
+            self.launch_failure={'error':str(e),'cleanup':getattr(e,'partial_cleanup',None),'owned_profile':getattr(e,'owned_profile',None)}
+            raise
 
     def observe(self, name, value):
         if name not in PREMISES or (value is not None and type(value) is not bool):raise ValueError('premise type/name')
@@ -100,6 +112,10 @@ class ReceiverController:
 
     def finish(self):
         if self.child:self.child.close()
+        receipt=self.child.cleanup if self.child else (self.launch_failure or {}).get('cleanup')
+        if not cleanup_valid(receipt):
+            self.observations={name:(False if value is False else None) for name,value in self.observations.items()}
         result=decide_feasibility(self.observations)
-        result['cleanup']=None if self.child is None else self.child.cleanup
+        result['cleanup']=receipt
+        result['launch_failure']=self.launch_failure
         return result

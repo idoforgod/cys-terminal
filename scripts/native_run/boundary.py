@@ -95,18 +95,35 @@ def validate_launch(spec):
         raise Unavailable('invalid owned process limit')
     return root, exe, args, env
 
+def protected_sddl(owner,sid,category,directory):
+    if not re.fullmatch(r'S-[0-9-]+',owner) or not re.fullmatch(r'S-1-15-2-[0-9-]+',sid):raise Unavailable('SID grammar')
+    if category not in ('root','bin','child','evidence'):raise Unavailable('unknown ACL role')
+    flags='OICI' if directory else ''
+    value=f'D:P(A;{flags};FA;;;SY)(A;{flags};FA;;;{owner})'
+    if category=='root':value+=f'(A;;RX;;;{sid})'
+    elif category=='bin':value+=f'(A;{flags};RX;;;{sid})'
+    elif category=='child':value+=f'(A;{flags};0x1301bf;;;{sid})'
+    return value
+
 class WindowsAPI:
     def __init__(self):
         if sys.platform != 'win32': raise Unavailable('Windows native boundary unavailable on this host')
-        self.k = C.WinDLL('kernel32', use_last_error=True)
-        self.a = C.WinDLL('advapi32', use_last_error=True)
-        self.u = C.WinDLL('userenv', use_last_error=True)
+        self.k = C.WinDLL('kernel32.dll', use_last_error=True, winmode=0x800)
+        self.a = C.WinDLL('advapi32.dll', use_last_error=True, winmode=0x800)
+        self.u = C.WinDLL('userenv.dll', use_last_error=True, winmode=0x800)
         signatures = [
             (self.u, 'CreateAppContainerProfile', [C.c_wchar_p,C.c_wchar_p,C.c_wchar_p,P,U32,C.POINTER(P)], C.c_int32),
             (self.u, 'DeleteAppContainerProfile', [C.c_wchar_p], C.c_int32),
             (self.a, 'FreeSid', [P], P),
             (self.a, 'ConvertSidToStringSidW', [P,C.POINTER(P)], C.c_int),
             (self.k, 'LocalFree', [P], P),
+            (self.k, 'GetCurrentProcess', [], P),
+            (self.k, 'GetSystemDirectoryW', [C.c_wchar_p,U32], U32),
+            (self.a, 'ConvertStringSecurityDescriptorToSecurityDescriptorW', [C.c_wchar_p,U32,C.POINTER(P),P], C.c_int),
+            (self.a, 'ConvertSecurityDescriptorToStringSecurityDescriptorW', [P,U32,U32,C.POINTER(P),P], C.c_int),
+            (self.a, 'GetSecurityDescriptorDacl', [P,C.POINTER(C.c_int),C.POINTER(P),C.POINTER(C.c_int)], C.c_int),
+            (self.a, 'SetNamedSecurityInfoW', [C.c_wchar_p,C.c_int,U32,P,P,P,P], U32),
+            (self.a, 'GetNamedSecurityInfoW', [C.c_wchar_p,C.c_int,U32,P,P,P,P,C.POINTER(P)], U32),
             (self.k, 'CreateJobObjectW', [P,C.c_wchar_p], P),
             (self.k, 'SetInformationJobObject', [P,C.c_int,P,U32], C.c_int),
             (self.k, 'QueryInformationJobObject', [P,C.c_int,P,U32,P], C.c_int),
@@ -135,6 +152,35 @@ class WindowsAPI:
         result = P(); self.check(self.a.ConvertSidToStringSidW(sid,C.byref(result)), 'SID text')
         try: return C.wstring_at(result)
         finally: self.k.LocalFree(result)
+
+    def user_sid(self):
+        token=P();self.check(self.a.OpenProcessToken(self.k.GetCurrentProcess(),0x8,C.byref(token)),'current token')
+        try:
+            size=U32();self.a.GetTokenInformation(token,1,None,0,C.byref(size));buf=C.create_string_buffer(size.value)
+            self.check(self.a.GetTokenInformation(token,1,buf,size,C.byref(size)),'current user SID')
+            return self.sid_string(P.from_buffer(buf).value)
+        finally:self.k.CloseHandle(token)
+
+    def sddl(self,descriptor):
+        text=P();self.check(self.a.ConvertSecurityDescriptorToStringSecurityDescriptorW(descriptor,1,4,C.byref(text),None),'DACL serialization')
+        try:return C.wstring_at(text)
+        finally:self.k.LocalFree(text)
+
+    def protect(self,path,descriptor_text):
+        descriptor=P();self.check(self.a.ConvertStringSecurityDescriptorToSecurityDescriptorW(descriptor_text,1,C.byref(descriptor),None),'DACL construction')
+        try:
+            expected=self.sddl(descriptor);present=C.c_int();defaulted=C.c_int();acl=P()
+            self.check(self.a.GetSecurityDescriptorDacl(descriptor,C.byref(present),C.byref(acl),C.byref(defaulted)),'DACL extract')
+            if not present.value or not acl.value:raise Unavailable('null DACL forbidden')
+            code=self.a.SetNamedSecurityInfoW(str(path),1,0x80000004,None,None,acl,None)
+            if code:raise Unavailable('private protected DACL failed: '+str(code))
+            actual=P();code=self.a.GetNamedSecurityInfoW(str(path),1,4,None,None,None,None,C.byref(actual))
+            if code:raise Unavailable('private DACL query failed: '+str(code))
+            try:observed=self.sddl(actual)
+            finally:self.k.LocalFree(actual)
+            if observed!=expected:raise Unavailable('private DACL did not round-trip exactly')
+            return {'path':str(path),'sddl':observed,'verified':True}
+        finally:self.k.LocalFree(descriptor)
 
     def token(self, process):
         handle = P(); self.check(self.a.OpenProcessToken(process,0x8,C.byref(handle)), 'open child token')
@@ -165,16 +211,24 @@ class OwnedBoundary:
         try:
             self.sid_text=api.sid_string(self.sid)
             # Only this private root. Do not grant access to an installed CLI or user directory.
-            receipts=[]
-            for target,grant in [(root,f'*{self.sid_text}:RX'),(root/'bin',f'*{self.sid_text}:(OI)(CI)RX'),(root/'child',f'*{self.sid_text}:(OI)(CI)M')]:
-                argv=['icacls.exe',str(target),'/grant',grant,'/Q']
-                if target!=root:argv.append('/T')
-                result=subprocess.run(argv,capture_output=True)
-                if result.returncode:raise Unavailable('private ACL grant failed')
-                receipts.append({'root':str(target),'grant':grant,'rc':result.returncode,'stdout_sha256':sha(result.stdout),'stderr_sha256':sha(result.stderr)})
-            low=subprocess.run(['icacls.exe',str(root/'child'),'/setintegritylevel','(OI)(CI)L','/T','/Q'],capture_output=True)
+            owner=api.user_sid();receipts=[]
+            # Explicit protected DACLs remove inherited grants; never recursively follow links.
+            paths=[root,root/'bin',root/'child',root/'evidence']
+            paths += sorted((root/'bin').rglob('*'),key=lambda p:len(p.parts))
+            paths += sorted((root/'child').rglob('*'),key=lambda p:len(p.parts))
+            paths += [p for p in (root/'daemon',root/'trace') if p.is_dir()]
+            for path in paths:
+                if path.is_symlink() or (hasattr(path,'is_junction') and path.is_junction()):raise Unavailable('reparse point before ACL setup')
+                relative=path.relative_to(root)
+                category='child' if relative.parts and relative.parts[0]=='child' else ('bin' if relative.parts and relative.parts[0]=='bin' else ('root' if path==root else 'evidence'))
+                descriptor=protected_sddl(owner,self.sid_text,category,path.is_dir())
+                receipts.append(api.protect(path,descriptor))
+            buf=C.create_unicode_buffer(32768);n=api.k.GetSystemDirectoryW(buf,len(buf))
+            if not 0<n<len(buf):raise Unavailable('trusted system directory unavailable')
+            icacls=Path(buf.value)/'icacls.exe'
+            low=subprocess.run([str(icacls),str(root/'child'),'/setintegritylevel','(OI)(CI)L','/T','/Q'],capture_output=True)
             if low.returncode:raise Unavailable('private child integrity label failed')
-            self.acl_receipt={'grants':receipts,'low_label_rc':low.returncode,'protected_evidence_root':str(root/'evidence')}
+            self.acl_receipt={'protected_dacls':receipts,'low_label_rc':low.returncode,'icacls':str(icacls),'protected_evidence_root':str(root/'evidence')}
             self.job=api.check(api.k.CreateJobObjectW(None,None),'create owned job')
             limits=EXTENDED_LIMITS(); limits.BasicLimitInformation.LimitFlags=JOB_KILL_ON_CLOSE|JOB_ACTIVE_LIMIT
             limits.BasicLimitInformation.ActiveProcessLimit=spec['process_limit']
@@ -196,8 +250,10 @@ class OwnedBoundary:
             self.token=api.token(self.process.hProcess)
             if self.token != {'is_appcontainer':1,'capability_count':0,'package_sid':self.sid_text}:
                 raise Unavailable('child token is not the requested zero-capability AppContainer')
-        except BaseException:
+        except BaseException as error:
             self.close()
+            error.partial_cleanup=self.cleanup
+            error.owned_profile=self.profile
             raise
 
     def release(self):
@@ -232,14 +288,19 @@ class OwnedBoundary:
                 accounting={'total':row.total,'active':row.active,'terminated':row.terminated}
                 if row.active==0:break
                 time.sleep(.01)
-            self.api.k.CloseHandle(self.job);self.job=None
+            if not self.api.k.CloseHandle(self.job):errors.append('job_handle_close_failed')
+            self.job=None
         exited=not self.process.hProcess or self.api.k.WaitForSingleObject(self.process.hProcess,10000)==0
-        if self.process.hThread:self.api.k.CloseHandle(self.process.hThread)
-        if self.process.hProcess:self.api.k.CloseHandle(self.process.hProcess)
+        if self.process.hThread and not self.api.k.CloseHandle(self.process.hThread):errors.append('thread_handle_close_failed')
+        if self.process.hProcess and not self.api.k.CloseHandle(self.process.hProcess):errors.append('process_handle_close_failed')
         if self.sid:self.api.a.FreeSid(self.sid)
+        removed=False
+        if self.profile_created and exited and (not self.process.hProcess or (accounting is not None and accounting['active']==0)) and not errors:
+            removed=self.api.u.DeleteAppContainerProfile(self.profile)==0
+            if not removed:errors.append('owned_profile_removal_failed')
         self.cleanup={'root_exit_observed':exited,'job_accounting':accounting,'errors':errors,
-                      'descendant_exit_receipt':None if accounting is None else accounting['active']==0,
-                      'profile_removed':False,'profile_retained':self.profile_created}
+                      'descendant_exit_receipt':True if not self.process.hProcess else (None if accounting is None else accounting['active']==0),
+                      'profile_removed':removed,'profile_retained':self.profile_created and not removed}
 
     def __enter__(self): return self
     def __exit__(self,*unused): self.close()
@@ -272,3 +333,9 @@ before any instruction runs. This does not grant the receiver network access.
     close=OwnedBoundary.close
     def __enter__(self):return self
     def __exit__(self,*unused):self.close()
+
+def cleanup_valid(receipt):
+    return (type(receipt) is dict and receipt.get('root_exit_observed') is True
+            and receipt.get('descendant_exit_receipt') is True
+            and receipt.get('profile_retained') is False
+            and type(receipt.get('errors')) is list and not receipt['errors'])

@@ -52,7 +52,9 @@ def parent_summary(raw,selected,ignored,filtered,rc):
         values=list(map(int,m.group(2,3,4,5,6)))
         if sum(values[:3])==len(selected) and values[2]==len(ignored) and values[3]==0 and values[4]==filtered:
             candidates.append((m,values))
-    observed=set(FAILED.findall(text))
+    observed=set()
+    headers=set(HEADER.findall(text))
+    if not set(selected)<=headers:raise Rejected('expected test names absent from raw headers')
     if len(candidates)!=1:raise Rejected('parent summary absent/ambiguous')
     m,v=candidates[0];before=text[:m.start()]
     # libtest's final failures block, never a child summary or a panic-only line.
@@ -61,7 +63,7 @@ def parent_summary(raw,selected,ignored,filtered,rc):
         if not blocks:raise Rejected('parent failure names missing')
         observed.update(re.findall(r'^    ([A-Za-z0-9_:]+)\s*$',blocks[-1],re.M))
     if not observed<=set(selected) or len(observed)!=v[1]:raise Rejected('failure names/count do not reconcile')
-    if (rc==0)!=(v[1]==0 and m.group(1)=='ok'):raise Rejected('exit/parent disagreement')
+    if rc is not None and (rc==0)!=(v[1]==0 and m.group(1)=='ok'):raise Rejected('exit/parent disagreement')
     return {'passed':v[0],'failed':v[1],'ignored':v[2],'filtered':v[4],
             'parent_line':m.group(0),'failures':sorted(observed),
             'all_summary_lines':[x.group(0) for x in SUMMARY.finditer(text)]}
@@ -174,12 +176,17 @@ def read_json_bytes(raw):
     return json.loads(raw.decode('utf-8'),object_pairs_hook=pairs,parse_constant=lambda x:(_ for _ in ()).throw(Rejected('nonfinite JSON')))
 
 def assess(root,record,case,manifest):
-    issues=[];failures=[];details={};raw=None
+    issues=[];failures=[];details={};raw=None;identity_valid=False;raw_failures=[]
     # Retain raw failures even if another axis/record is incomplete. Never trust producer outcome.
     try:
         if type(record.get('artifacts')) is dict and 'stdout' in record['artifacts']:
-            raw=blob(root,record['artifacts']['stdout']);failures=raw_failed_names(raw)
+            raw=blob(root,record['artifacts']['stdout']);raw_failures=raw_failed_names(raw)
     except (Rejected,OSError,ValueError) as e:issues.append(str(e))
+    if case['arm'] in ('I','L','K') and raw is not None:
+        try:
+            details['parent']=parent_summary(raw,case.get('tests'),case.get('ignored'),case.get('filtered'),record.get('rc') if type(record.get('rc')) is int else None)
+            failures.extend(details['parent']['failures'])
+        except (Rejected,ValueError,TypeError) as e:issues.append(str(e))
     if case['arm']=='R':
         try:
             before=blob(root,record['artifacts']['composer_before']);after=blob(root,record['artifacts']['composer_after'])
@@ -195,12 +202,11 @@ def assess(root,record,case,manifest):
         for key in ('product_sha','diagnostic_sha','run_id','attempt'):
             if record[key]!=manifest[key]:raise Rejected('wrong '+key)
         if record['release_verdict']!='NONE':raise Rejected('release authority forged')
+        identity_valid=True
         if not record['exit_observed'] or record['rc'] is None:issues.append('no process exit')
         if case['arm'] in ('I','L','K'):
             if raw is None:raise Rejected('stdout absent')
-            selected=case.get('tests');ignored=case.get('ignored');filtered=case.get('filtered')
-            details['parent']=parent_summary(raw,selected,ignored,filtered,record['rc'])
-            failures=sorted(set(failures+details['parent']['failures']))
+            if 'parent' not in details:raise Rejected('no verified parent summary')
             c8=record.get('c8')
             if c8 not in ('NO_UNMEASURED_MARKER','UNMEASURED','UNREADABLE'):raise Rejected('C8 axis absent/invalid')
             details['c8']=c8
@@ -209,27 +215,37 @@ def assess(root,record,case,manifest):
             details['trace']=semantic(root,record,case,issues,failures)
     except (Rejected,OSError,KeyError,TypeError,ValueError) as e:issues.append(str(e))
     failures=sorted(set(failures));issues=list(dict.fromkeys(issues));complete=not issues
-    return {'id':case['id'],'complete':complete,'outcome':'FAIL' if failures else ('PASS' if complete else None),
-            'observed_failures':failures,'issues':issues,'details':details,'release_verdict':'NONE'}
+    return {'id':case['id'],'complete':complete,'outcome':'FAIL' if failures and identity_valid else ('PASS' if complete else None),
+            'identity_valid':identity_valid,'observed_failures':failures,
+            'unattributed_raw_failures':raw_failures if 'parent' not in details or not identity_valid else [],'issues':issues,'details':details,'release_verdict':'NONE'}
 
 def collect(root,manifest,records):
-    expected=manifest['cases'];ids=[c['id'] for c in expected]
+    exact(manifest,dict,'manifest');expected=exact(manifest.get('cases'),list,'planned cases')
+    for c in expected:
+        exact(c,dict,'planned case');exact(c.get('id'),str,'planned ID');exact(c.get('arm'),str,'planned arm')
+    ids=[c['id'] for c in expected]
     if len(ids)!=len(set(ids)) or not ids:raise Rejected('planned population invalid')
     if {a:sum(c['arm']==a for c in expected) for a in COUNTS}!=COUNTS:raise Rejected('fixed population changed')
     for k in ('product_sha','diagnostic_sha','run_id'):exact(manifest.get(k),str,k)
     exact(manifest.get('attempt'),int,'manifest attempt')
     if manifest['attempt']!=1 or manifest.get('release_verdict')!='NONE':raise Rejected('manifest attempt/release')
-    buckets={};unplanned=[];observed=[]
+    buckets={};unplanned=[];observed=[];unattributed=[]
     for record in records:
         if type(record) is not dict or type(record.get('id')) is not str:raise Rejected('record ID type')
-        if record['id'] not in ids:unplanned.append(record['id'])
+        if record['id'] not in ids:
+            unplanned.append(record['id'])
+            try:
+                for name in raw_failed_names(blob(root,record['artifacts']['stdout'])):unattributed.append({'id':record['id'],'failure':name,'reason':'unplanned record'})
+            except (KeyError,Rejected,OSError,ValueError,TypeError):pass
         buckets.setdefault(record['id'],[]).append(record)
     trials=[]
     for case in expected:
         group=buckets.get(case['id'],[])
         if not group:trials.append({'id':case['id'],'complete':False,'outcome':None,'observed_failures':[],'issues':['missing planned record']});continue
         results=[assess(root,r,case,manifest) for r in group]
-        for r in results:observed.extend({'id':case['id'],'failure':f} for f in r['observed_failures'])
+        for r in results:
+            observed.extend({'id':case['id'],'failure':f,'identity_valid':r['identity_valid']} for f in r['observed_failures'])
+            unattributed.extend({'id':case['id'],'failure':f,'reason':'unverified root/identity'} for f in r['unattributed_raw_failures'])
         result=results[0]
         if len(group)!=1:
             result={**result,'complete':False,'outcome':'FAIL' if any(r['observed_failures'] for r in results) else None,
@@ -242,7 +258,7 @@ def collect(root,manifest,records):
         fails=sum(x['outcome']=='FAIL' for x in selected);complete=completed==n and not unplanned
         arms[arm]={'planned':n,'completed':completed,'observed_failed_trials':fails,'failure_rate':fails/n if complete else None,
                    'wilson95':wilson(fails,n) if complete else None,'rate_null':not complete}
-    return {'arms':arms,'trials':trials,'observed_failures':observed,'unplanned_ids':unplanned,
+    return {'arms':arms,'trials':trials,'observed_failures':observed,'unattributed_failures':unattributed,'unplanned_ids':unplanned,
             'complete':all(not a['rate_null'] for a in arms.values()),'native_hard_gate':'OPEN', 'release_verdict':'NONE'}
 
 if __name__=='__main__':

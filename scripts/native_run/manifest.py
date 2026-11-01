@@ -55,10 +55,11 @@ def workflow(manifest):
     # External authority must be supplied by the separate E1. No commit embeds its own SHA.
     steps=[{'uses':'actions/checkout@v4','with':{'ref':'${{ github.sha }}','fetch-depth':0,'persist-credentials':False}},
            {'uses':'actions/setup-python@v5','with':{'python-version':'3.12'}},
-           {'uses':'dtolnay/rust-toolchain@stable'},
-           {'name':'Verify external authority before native work','shell':'pwsh','env':{
+           {'name':'Verify external authority before native work','id':'authorize','shell':'pwsh','env':{
                'NATIVE_AUTH_URI':'${{ vars.CYS_NATIVE_AUTH_URI }}','NATIVE_AUTH_SHA256':'${{ vars.CYS_NATIVE_AUTH_SHA256 }}'},
             'run':'python scripts/native_run/job.py authorize --mode '+mode+' --branch '+branch},
+           {'uses':'actions/checkout@v4','with':{'ref':'${{ steps.authorize.outputs.product_sha }}','path':'product','fetch-depth':0,'persist-credentials':False}},
+           {'uses':'dtolnay/rust-toolchain@stable','with':{'toolchain':'${{ steps.authorize.outputs.rust_toolchain }}'}},
            {'name':'Fixed owned diagnostic job','shell':'pwsh','run':'python scripts/native_run/job.py execute --job ${{ matrix.job }}'},
            {'name':'Retain every artifact, including NULL and inner reds','if':'always()','uses':'actions/upload-artifact@v4',
             'with':{'name':'native-${{ matrix.job }}-${{ github.run_id }}-attempt-${{ github.run_attempt }}','path':'native-evidence/','if-no-files-found':'error'}}]

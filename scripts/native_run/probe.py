@@ -14,8 +14,8 @@ import tempfile
 import threading
 import time
 import uuid
-from boundary import OwnedBoundary, Unavailable
-from controller import authorize, prepare_root, fixture_environment, decide_feasibility
+from boundary import OwnedBoundary, Unavailable, cleanup_valid
+from controller import authorize, prepare_root, protect_native_root, fixture_environment, decide_feasibility
 from fixture import ProductReceiver, bounded_observation, pinned_copy
 from observer import compare_composer, calibrate_exports, calibrated_no_submit, InvalidEvidence
 from protocol import atomic_json, read_json, sha
@@ -55,6 +55,7 @@ def network_probe(config, grant, parent):
         for address,port in endpoints:
             if datetime.datetime.now(datetime.timezone.utc)>=datetime.datetime.fromisoformat(grant.latest_end_utc):raise Unavailable('authority expired before boundary control')
             root,exe=prepare_root(parent,config['receiver_helper'],config['receiver_helper_sha256'])
+            protect_native_root(root)
             output=root/'child/connect.json'
             spec={'run_root':str(root),'executable':str(exe),'executable_sha256':config['receiver_helper_sha256'],
                   'args':['connect',str(root/'child'),str(output),address,str(port)],
@@ -78,11 +79,12 @@ def network_probe(config, grant, parent):
         if type(child) is not dict or type(child.get('connected')) is not bool:return None,observations
         if child['connected'] is not False or child.get('error')!='AccessDenied:10013':return None,observations
         cleanup=row['cleanup']
-        if not cleanup or cleanup.get('root_exit_observed') is not True or cleanup.get('descendant_exit_receipt') is not True:return None,observations
+        if not cleanup_valid(cleanup):return None,observations
     return True,observations
 
 def new_receiver(config,grant,parent):
     root,exe=prepare_root(parent,config['receiver_executable'],config['receiver_sha256'])
+    protect_native_root(root)
     spec={**config,'run_root':str(root),'executable':str(exe),'executable_sha256':config['receiver_sha256'],
           'mode':grant.mode,'session_id':str(uuid.uuid4())}
     return ProductReceiver(grant,root,spec)
@@ -97,6 +99,7 @@ def origin_calibration(config,grant,parent):
     records=[]
     for mode in ('emit','silent'):
         root,exe=prepare_root(parent,config['receiver_helper'],config['receiver_helper_sha256'])
+        protect_native_root(root)
         sideband=root/'child/origin';go=root/'child/origin-go'
         spec={**config,'run_root':str(root),'executable':str(exe),'executable_sha256':config['receiver_helper_sha256'],
               'mode':grant.mode,'actor':'origin_control','session_id':str(uuid.uuid4()),
@@ -116,7 +119,8 @@ def origin_calibration(config,grant,parent):
             Path(str(go)+'.stop').write_bytes(b'owned calibration complete')
             item.close();row['cleanup']=item.cleanup
         atomic_json(root/'evidence/origin-calibration.json',row);records.append(row)
-    return {'subcases':records,'discriminator':None,'release_verdict':'NONE',
+        if not row['cleanup'].get('complete'):break
+    return {'subcases':records,'cleanup_complete':len(records)==2 and all(r['cleanup'].get('complete') is True for r in records),'discriminator':None,'release_verdict':'NONE',
             'meaning':'raw calibration only; no automatic attribution transfer to real receiver'}
 
 def execute(config,grant,output):
@@ -128,6 +132,9 @@ def execute(config,grant,output):
     except (OSError,Unavailable,ValueError) as e:errors.append({'phase':'network_boundary','error':str(e)})
     if premises['network_boundary'] is True:
         details['origin_calibration']=origin_calibration(config,grant,parent)
+        if details['origin_calibration']['cleanup_complete'] is not True:
+            result={**decide_feasibility(premises),'details':details,'errors':[{'phase':'origin','error':'cleanup incomplete; no further children'}]}
+            atomic_json(output,result);return result
         receiver=None
         try:
             receiver=new_receiver(config,grant,parent);details['receiver_root']=str(receiver.root);details['launch']=receiver.start()
@@ -159,7 +166,11 @@ def execute(config,grant,output):
                 premises['genuine_open_query']=None
         except (OSError,Unavailable,ValueError,InvalidEvidence) as e:errors.append({'phase':'receiver','error':str(e)})
         finally:
-            if receiver:receiver.close();details['cleanup']=receiver.cleanup
+            if receiver:
+                receiver.close();details['cleanup']=receiver.cleanup
+                if receiver.cleanup.get('complete') is not True:
+                    premises['auth_free_startup']=None;premises['genuine_open_query']=None
+                    errors.append({'phase':'receiver_cleanup','error':'cleanup incomplete; calibration not started'})
         if premises['auth_free_startup'] is True:
             pair=[];sentinel='SUBMIT_CALIBRATION_'+uuid.uuid4().hex
             try:
@@ -171,7 +182,9 @@ def execute(config,grant,output):
                         # Only the deliberate calibration child receives Return, never R2/R3.
                         records=bounded_observation('application submission record',lambda: application_records(item) if list((item.root/'child/config').glob('projects/*/'+item.spec['session_id']+'.jsonl')) else None,10)
                         pair.append((item.spec['session_id'],records))
-                    finally:item.close()
+                    finally:
+                        item.close();details.setdefault('calibration_cleanup',[]).append(item.cleanup)
+                    if item.cleanup.get('complete') is not True:raise Unavailable('calibration cleanup incomplete; no more children')
                 premises['no_submit_calibration']=calibrated_no_submit(pair[0][1],pair[1][1],no_session=pair[0][0],yes_session=pair[1][0],sentinel=sentinel)
             except (OSError,Unavailable,ValueError,InvalidEvidence) as e:errors.append({'phase':'no_submit_calibration','error':str(e)})
     result={**decide_feasibility(premises),'details':details,'errors':errors,'source':{'product_sha':grant.product_sha,'diagnostic_sha':grant.diagnostic_sha},'authorization_sha256':grant.digest}

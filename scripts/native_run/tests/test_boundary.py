@@ -29,3 +29,26 @@ class BoundaryTests(unittest.TestCase):
             p.write_text(json.dumps(record))
             with self.assertRaises(boundary.Unavailable):controller.authorize(p,sha(p.read_bytes()),mode='feasibility',diagnostic_sha='a'*40,product_sha='b'*40,now=datetime.datetime(2026,2,1,tzinfo=datetime.timezone.utc))
 if __name__=='__main__':unittest.main()
+
+class AuditControls(unittest.TestCase):
+    def test_authority_uses_the_hashed_bytes(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as d:
+            path=pathlib.Path(d)/'auth.json'
+            raw={'mode':'feasibility','diagnostic_sha':'a'*40,'product_sha':'b'*40,'attempt':1,'release_verdict':'NONE','execution_authorized':False,'host':'windows-latest','earliest_start_utc':'2026-01-01T00:00:00+00:00','latest_end_utc':'2027-01-01T00:00:00+00:00'}
+            path.write_text(json.dumps(raw));changed={**raw,'execution_authorized':True}
+            with patch.object(controller,'read_json',return_value=changed):
+                with self.assertRaises(boundary.Unavailable):controller.authorize(path,sha(path.read_bytes()),mode='feasibility',diagnostic_sha='a'*40,product_sha='b'*40,now=datetime.datetime(2026,2,1,tzinfo=datetime.timezone.utc))
+    def test_protected_acl_has_no_app_write_outside_child(self):
+        owner='S-1-5-21-123';app='S-1-15-2-456'
+        evidence=boundary.protected_sddl(owner,app,'evidence',True)
+        binary=boundary.protected_sddl(owner,app,'bin',True)
+        child=boundary.protected_sddl(owner,app,'child',True)
+        self.assertTrue(evidence.startswith('D:P'));self.assertNotIn(app,evidence)
+        self.assertIn(';RX;;;'+app,binary);self.assertNotIn('0x1301bf',binary)
+        self.assertIn('0x1301bf',child)
+    def test_cleanup_never_defaults_to_complete(self):
+        valid={'root_exit_observed':True,'descendant_exit_receipt':True,'profile_retained':False,'errors':[]}
+        self.assertTrue(boundary.cleanup_valid(valid))
+        for key,value in [('root_exit_observed',None),('descendant_exit_receipt',False),('profile_retained',True),('errors',['close failed'])]:
+            self.assertFalse(boundary.cleanup_valid({**valid,key:value}))

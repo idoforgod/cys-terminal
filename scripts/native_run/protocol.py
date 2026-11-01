@@ -55,12 +55,15 @@ def atomic_json(path, value):
         json.dump(value, f, ensure_ascii=False, indent=2, allow_nan=False); f.write("\n"); f.flush(); os.fsync(f.fileno())
     os.replace(temp, path)
 
-def read_json(path):
+def decode_json(raw):
     def pairs(values):
         result = {}
         for key, value in values:
             if key in result: raise ValueError("duplicate JSON key: " + key)
             result[key] = value
         return result
-    return json.loads(Path(path).read_text(encoding="utf-8"), object_pairs_hook=pairs,
+    return json.loads(raw.decode('utf-8'), object_pairs_hook=pairs,
                       parse_constant=lambda x: (_ for _ in ()).throw(ValueError("nonfinite JSON: " + x)))
+
+def read_json(path):
+    return decode_json(Path(path).read_bytes())
