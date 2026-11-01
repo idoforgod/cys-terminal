@@ -52,7 +52,7 @@ def run_owned_worker(argv,evidence,latest_end,job_start):
     env={k:os.environ[k] for k in names if k in os.environ}
     env.update(PYTHONUTF8='1',PYTHONDONTWRITEBYTECODE='1',PYTHONNOUSERSITE='1')
     try:
-        child=OwnedProcess(sys.executable,['-B',*argv],env,Path.cwd(),process_limit=128)
+        child=OwnedProcess(sys.executable,['-B',*argv],env,Path.cwd(),process_limit=128,audit_path=root/'supervisor-native-calls.jsonl')
         while True:
             now=time.monotonic();phase=root/'phase.json'
             if phase.exists():

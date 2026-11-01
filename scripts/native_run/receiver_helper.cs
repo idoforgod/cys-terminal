@@ -25,6 +25,31 @@ class NativeReceiverHelper {
     [DllImport("kernel32.dll",SetLastError=true)] static extern bool GetNumberOfConsoleInputEvents(IntPtr handle,out uint count);
     [DllImport("kernel32.dll",EntryPoint="ReadConsoleInputW",SetLastError=true)] static extern bool ReadConsoleInput(IntPtr handle,[Out] InputRecord[] records,uint length,out uint read);
     static readonly JavaScriptSerializer Json = new JavaScriptSerializer();
+    static void NativeLog(string path,string name,object operands,object result,int? error) {
+        File.AppendAllText(path,Json.Serialize(new {name=name,operands=operands,result=result,last_error=error,utc=DateTime.UtcNow.ToString("o")})+"\n",new UTF8Encoding(false));
+    }
+    static IntPtr StandardHandle(string path,int kind) {
+        NativeLog(path,"GetStdHandle.enter",new {kind=kind},null,null);
+        IntPtr value=GetStdHandle(kind);int error=Marshal.GetLastWin32Error();
+        NativeLog(path,"GetStdHandle",new {kind=kind},value.ToInt64(),error);return value;
+    }
+    static bool ConsoleMode(string path,IntPtr handle,out uint mode) {
+        NativeLog(path,"GetConsoleMode.enter",new {handle=handle.ToInt64()},null,null);
+        bool ok=GetConsoleMode(handle,out mode);int error=Marshal.GetLastWin32Error();
+        NativeLog(path,"GetConsoleMode",new {handle=handle.ToInt64()},new {ok=ok,mode=mode},error);return ok;
+    }
+    static bool InputCount(string path,IntPtr handle,out uint count) {
+        NativeLog(path,"GetNumberOfConsoleInputEvents.enter",new {handle=handle.ToInt64()},null,null);
+        bool ok=GetNumberOfConsoleInputEvents(handle,out count);int error=Marshal.GetLastWin32Error();
+        NativeLog(path,"GetNumberOfConsoleInputEvents",new {handle=handle.ToInt64()},new {ok=ok,count=count},error);return ok;
+    }
+    static bool InputRead(string path,IntPtr handle,InputRecord[] records,out uint read) {
+        NativeLog(path,"ReadConsoleInputW.enter",new {handle=handle.ToInt64(),capacity=records.Length},null,null);
+        bool ok=ReadConsoleInput(handle,records,(uint)records.Length,out read);int error=Marshal.GetLastWin32Error();
+        NativeLog(path,"ReadConsoleInputW",new {handle=handle.ToInt64(),capacity=records.Length},new {ok=ok,read=read},error);
+        if(read>records.Length)throw new Exception("ReadConsoleInputW read="+read+" capacity="+records.Length);
+        return ok;
+    }
     static string Owned(string root, string input) {
         root=Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar)+Path.DirectorySeparatorChar;
         string full=Path.GetFullPath(input);
@@ -57,7 +82,7 @@ class NativeReceiverHelper {
                 Publish(Path.Combine(output,id+".json"),Json.Serialize(new {input=input,bytes=bytes.Length,sha256=Hash(bytes),pid=System.Diagnostics.Process.GetCurrentProcess().Id,utc=DateTime.UtcNow.ToString("o")}),new UTF8Encoding(false));
                 Stopwatch editorGuard=Stopwatch.StartNew();
                 while(!File.Exists(Path.Combine(output,id+".ack"))) {
-                    if(editorGuard.ElapsedMilliseconds>=15000)throw new Exception("editor completion acknowledgement absent");
+                    if(editorGuard.ElapsedMilliseconds>=15000)throw new Exception("editor completion acknowledgement absent: elapsed_ms="+editorGuard.ElapsedMilliseconds+" limit_ms=15000 ack="+Path.Combine(output,id+".ack"));
                     Thread.Sleep(10);
                 }
                 return 0;
@@ -67,11 +92,12 @@ class NativeReceiverHelper {
                 string sideband=Owned(root,args[2]),go=Owned(root,args[4]);
                 bool emit=args[3]=="emit";
                 if(!emit && args[3]!="silent")throw new Exception("origin mode");
-                uint inputMode,outputMode;
-                bool gotInput=GetConsoleMode(GetStdHandle(-10),out inputMode),gotOutput=GetConsoleMode(GetStdHandle(-11),out outputMode);
+                string nativeLog=sideband+".native.jsonl";uint inputMode,outputMode;
+                IntPtr inputHandle=StandardHandle(nativeLog,-10),outputHandle=StandardHandle(nativeLog,-11);
+                bool gotInput=ConsoleMode(nativeLog,inputHandle,out inputMode),gotOutput=ConsoleMode(nativeLog,outputHandle,out outputMode);
                 Publish(sideband+".ready.json",Json.Serialize(new {pid=Process.GetCurrentProcess().Id,mode=args[3],input_mode=gotInput?(uint?)inputMode:null,output_mode=gotOutput?(uint?)outputMode:null}),new UTF8Encoding(false));
                 Stopwatch guard=Stopwatch.StartNew();
-                while(!File.Exists(go)) { if(guard.ElapsedMilliseconds>=20000)throw new Exception("origin handshake absent");Thread.Sleep(10); }
+                while(!File.Exists(go)) { if(guard.ElapsedMilliseconds>=20000)throw new Exception("origin handshake absent: elapsed_ms="+guard.ElapsedMilliseconds+" limit_ms=20000 go="+go);Thread.Sleep(10); }
                 long before=Stopwatch.GetTimestamp();int wrote=0;
                 if(emit) { byte[] query=new byte[]{27,91,54,110};Stream output=Console.OpenStandardOutput();output.Write(query,0,query.Length);output.Flush();wrote=query.Length; }
                 long after=Stopwatch.GetTimestamp();
@@ -82,10 +108,10 @@ class NativeReceiverHelper {
                 while(!File.Exists(go+".stop")) {
                     if(guard.ElapsedMilliseconds>=40000)break;
                     uint count;
-                    if(!GetNumberOfConsoleInputEvents(GetStdHandle(-10),out count)) {inputError="count:"+Marshal.GetLastWin32Error();break;}
+                    if(!InputCount(nativeLog,inputHandle,out count)) {inputError="count failed; operands/result in "+nativeLog;break;}
                     if(count>0) {
                         InputRecord[] buffer=new InputRecord[Math.Min(count,32)];uint read;
-                        if(!ReadConsoleInput(GetStdHandle(-10),buffer,(uint)buffer.Length,out read)) {inputError="read:"+Marshal.GetLastWin32Error();break;}
+                        if(!InputRead(nativeLog,inputHandle,buffer,out read)) {inputError="read failed; operands/result in "+nativeLog;break;}
                         for(int i=0;i<read;i++)inputs.Add(new {ticks=Stopwatch.GetTimestamp(),event_type=buffer[i].type,key_down=buffer[i].keyDown,repeat=buffer[i].repeat,virtual_key=buffer[i].virtualKey,scan=buffer[i].scan,character_u16=buffer[i].character,control=buffer[i].control});
                         if(inputs.Count>4096) {inputError="input_inventory_bound";break;}
                     }

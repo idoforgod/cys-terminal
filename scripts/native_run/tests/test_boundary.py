@@ -45,7 +45,7 @@ class AuditControls(unittest.TestCase):
         binary=boundary.protected_sddl(owner,app,'bin',True)
         child=boundary.protected_sddl(owner,app,'child',True)
         self.assertTrue(evidence.startswith('D:P'));self.assertNotIn(app,evidence)
-        self.assertIn(';RX;;;'+app,binary);self.assertNotIn('0x1301bf',binary)
+        self.assertIn(';0x1200a9;;;' +app,binary);self.assertNotIn('0x1301bf',binary)
         self.assertIn('0x1301bf',child)
     def test_cleanup_never_defaults_to_complete(self):
         valid={'root_exit_observed':True,'descendant_exit_receipt':True,'profile_retained':False,'errors':[]}

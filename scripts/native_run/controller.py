@@ -55,7 +55,7 @@ def prepare_root(parent, executable, expected_sha, *, run_id=None):
     return root,dest
 
 def protect_native_root(root):
-    api=WindowsAPI();owner=api.user_sid();receipts=[]
+    api=WindowsAPI(Path(root)/'evidence/root-native-calls.jsonl');owner=api.user_sid();receipts=[]
     for path in [Path(root),*sorted(Path(root).rglob('*'),key=lambda p:len(p.parts))]:
         if path.is_symlink() or (hasattr(path,'is_junction') and path.is_junction()):raise Unavailable('reparse in new private root')
         receipts.append(api.protect(path,protected_sddl(owner,'S-1-15-2-0','evidence',path.is_dir())))

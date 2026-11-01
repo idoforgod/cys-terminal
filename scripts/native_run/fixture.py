@@ -56,7 +56,7 @@ class ProductReceiver:
              'NATIVE_OWNED_ROOT':str(root),'NATIVE_EXECUTION_AUTHORIZED':'1',
              'PYTHONUTF8':'1','PYTHONDONTWRITEBYTECODE':'1','PYTHONNOUSERSITE':'1',
              'COMSPEC':str(Path(os.environ['SystemRoot'])/'System32/cmd.exe')}
-        self.daemon=OwnedProcess(daemon_exe,['--exact','native_harness_trace::native_probe_daemon','--ignored','--nocapture','--test-threads=1'],env,root)
+        self.daemon=OwnedProcess(daemon_exe,['--exact','native_harness_trace::native_probe_daemon','--ignored','--nocapture','--test-threads=1'],env,root,audit_path=root/'evidence/daemon-native-calls.jsonl')
         self.rpc=FixtureRPC(self.endpoint,root,self.run_id,self.daemon.pid)
         def identify():
             try:return self.rpc.call('system.identify',{},timeout=2)
@@ -110,20 +110,22 @@ class ProductReceiver:
     def finish_editor(self,receipt_path,receipt):
         pid=receipt.get('pid')
         if type(pid) is not int or pid<=0:raise Unavailable('editor PID absent')
-        api=WindowsAPI();handle=api.check(api.k.OpenProcess(0x100000|0x1000,False,pid),'open owned editor')
+        api=WindowsAPI(self.root/'evidence/editor-native-calls.jsonl');handle=api.check(api.k.OpenProcess(0x100000|0x1000,False,pid),'open owned editor')
         try:
             buffer=C.create_unicode_buffer(32768);length=U32(len(buffer))
             api.check(api.k.QueryFullProcessImageNameW(handle,0,buffer,C.byref(length)),'editor image identity')
             expected=self.root/'bin/receiver-helper.exe'
-            if Path(buffer.value).resolve()!=expected.resolve():raise Unavailable('editor process is not owned helper')
+            if Path(buffer.value).resolve()!=expected.resolve():api.refuse('editor process is not owned helper',expected=str(expected),observed=buffer.value,pid=pid)
             token=api.token(handle)
-            if token!=self.launch_receipt['token']:raise Unavailable('editor confinement differs from receiver')
+            if token!=self.launch_receipt['token']:api.refuse('editor confinement differs from receiver',expected=self.launch_receipt['token'],observed=token,pid=pid)
             before=self.passive_frame().get('composer',{}).get('output_gen')
             if type(before) is not int:raise Unavailable('pre-editor-return frame unavailable')
             receipt_path.with_suffix('.ack').write_bytes(b'owned observer holds verified editor handle')
-            if api.k.WaitForSingleObject(handle,10000)!=0:raise Unavailable('editor exit not observed')
+            wait=api.k.WaitForSingleObject(handle,10000)
+            if wait!=0:api.refuse('editor exit not observed',pid=pid,status=wait,timeout_ms=10000)
             code=U32();api.check(api.k.GetExitCodeProcess(handle,C.byref(code)),'editor exit code')
-            if code.value!=0:raise Unavailable('editor failed')
+            if code.value!=0:api.refuse('editor failed',pid=pid,exit_code=code.value)
+            api.ensure_audit()
             atomic_json(self.root/'evidence'/('editor-exit-'+receipt_path.name),{'pid':pid,'image':str(expected),'token':token,'exit_code':code.value,'output_gen_before_ack':before})
             return before
         finally:api.k.CloseHandle(handle)
