@@ -5406,6 +5406,34 @@ mod drills {
         assert_eq!((r.recorded, r.retry.is_some()), (Some(t0 + 300.0), false));
     }
 
+    /// A row waiting for a retry outlives a delivered notice. The notice clears `held`, and if no tick has run the timestamps can age out
+    /// too. State where it fails: retention that ignores the waiting row, which loses the only copy.
+    #[test]
+    fn drill_cso_own_a_row_waiting_for_a_retry_survives_a_delivered_notice() {
+        let daemon = drill_daemon("csoownretry");
+        let cso = seat(&daemon, "cso");
+        let t0 = after_grace(&daemon).mono;
+        let key = AlertKey::new("queue.starved", Some(cso));
+        let sink = break_ledger(&daemon);
+        handle_event(&daemon, &cso_own_ev(&daemon, "queue.starved", cso, 450), Now::at(t0));
+        let master = seat(&daemon, "master");
+        handle_event(&daemon, &cso_own_ev(&daemon, "queue.starved", cso, 451), Now::at(t0 + 300.0));
+        assert_eq!(depth(&daemon, master), 1, "the master that sat down was told");
+        {
+            let mut st = state_lock(&daemon);
+            let r = st.cso_own.get_mut(&key).unwrap();
+            assert_eq!(r.held, 0);
+            r.sent = Some(t0);
+            r.attempted = Some(t0);
+        }
+        daemon.get_surface(master).unwrap().pending_queue.lock().unwrap().clear();
+        handle_event(&daemon, &cso_own_ev(&daemon, "queue.depth_high", cso, 452), Now::at(t0 + 4000.0));
+        assert!(state_lock(&daemon).cso_own.get(&key).is_some_and(|r| r.retry.is_some()), "the row was pruned");
+        std::fs::remove_dir(&sink).unwrap();
+        reevaluate(&daemon, Now::at(t0 + 4100.0));
+        assert_eq!(cso_own_rows(&daemon, "queue.starved", cso).len(), 1);
+    }
+
     /// `surface.exited` fires once, so no later arrival can carry its row: the tick retries it. State where it fails: a retry reached only
     /// from the arrival path. A retry that fails again is counted and publishes nothing new.
     #[test]
