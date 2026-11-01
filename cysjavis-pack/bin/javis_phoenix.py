@@ -1468,6 +1468,27 @@ def load_desired_roster(socket):
     return {}, set()
 
 
+def _base_topology_in_generation(gen_dir):
+    """세대 하나에서 **본부 레인** topology 파일 경로를 찾는다(이 세대에 없으면 None · manifest 판독 실패는 예외로 올린다).
+    do_snapshot 은 basename 이 겹치면 `<소스 경로 sha 앞 8자>__topology.json` 으로 레인마다 하나씩 담고, 겹치지 않을 때만
+    맨이름으로 담는다. 그래서 신원은 파일 이름이 아니라 manifest 의 source 다 — `*__topology.json` 글롭은 다른 레인의
+    로스터를 집고, 맨이름 `topology.json` 도 소스가 하나뿐이면 부서 레인일 수 있다(0.14.57 P4: 맨이름 조회는 734개 중 0건).
+    경로는 양쪽을 실경로·normcase 로 맞춰 비교한다 — source 는 HOME/LOCALAPPDATA 파생 그대로이고 LIVE_STATE 는 실경로다
+    (Windows 8.3 이름·드라이브 대소문자 포함). manifest 없는 세대는 do_snapshot 산출물이 아니다: 종전대로 맨이름만 본다."""
+    mp = os.path.join(gen_dir, "manifest.json")
+    if not os.path.exists(mp):
+        tp = os.path.join(gen_dir, "topology.json")
+        return tp if os.path.exists(tp) else None
+    with open(mp, encoding="utf-8") as f:
+        files = json.load(f)["files"]
+    want = os.path.normcase(os.path.realpath(os.path.join(LIVE_STATE, "topology.json")))
+    for e in files:
+        src = e.get("source") or ""
+        if os.path.basename(src) == "topology.json" and os.path.normcase(os.path.realpath(src)) == want:
+            return os.path.join(gen_dir, os.path.basename(e["stored_as"]))
+    return None
+
+
 def _snapshot_roster_entries(socket, skipped=None):
     """직전 세대 스냅샷(javis_state_snapshot)의 topology.json 로스터 — §12가 실증한 안전망.
     라이브 상태 디렉터리 대상일 때만 유효(격리 하네스는 자기 topology만 씀). best-effort.
@@ -1485,15 +1506,16 @@ def _snapshot_roster_entries(socket, skipped=None):
     #   명목(이름) 기준을 유지한다(best-effort 소스 — 데이터 손실 아님). P2-5 의 실질 수리(오삭제 방어)는
     #   compute_gc 의 명목∪실효 union 이 담당한다.
     for g in reversed(gens):  # 이름(명목) 최신 세대부터
-        tp = os.path.join(gen_root, g, "topology.json")
-        if os.path.exists(tp):
-            try:
-                t = json.load(open(tp, encoding="utf-8"))
-                return {e["role"]: e for e in t.get("entries", []) if e.get("role")}
-            except Exception:
-                if skipped is not None:
-                    skipped.append(g)
+        try:
+            tp = _base_topology_in_generation(os.path.join(gen_root, g))
+            if tp is None:
                 continue
+            t = json.load(open(tp, encoding="utf-8"))
+            return {e["role"]: e for e in t.get("entries", []) if e.get("role")}
+        except Exception:
+            if skipped is not None:
+                skipped.append(g)
+            continue
     return {}
 
 
@@ -1511,13 +1533,14 @@ def _snapshot_tombstones(socket):
     except Exception:
         return None
     for g in reversed(gens):  # 명목 최신 세대부터(_snapshot_roster_entries 와 동일 규약)
-        tp = os.path.join(gen_root, g, "topology.json")
-        if os.path.exists(tp):
-            try:
-                t = json.load(open(tp, encoding="utf-8"))
-                return set(x for x in t.get("tombstones", []) if isinstance(x, str))
-            except Exception:
+        try:
+            tp = _base_topology_in_generation(os.path.join(gen_root, g))
+            if tp is None:
                 continue
+            t = json.load(open(tp, encoding="utf-8"))
+            return set(x for x in t.get("tombstones", []) if isinstance(x, str))
+        except Exception:
+            continue
     return None
 
 
