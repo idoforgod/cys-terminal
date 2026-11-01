@@ -28324,6 +28324,26 @@ mod tests {
         assert_eq!(reason(&root), COPY_UNREADABLE, "bytes that match their row, with no tombstones list");
     }
 
+    /// The word each state states on the boot line, written out here and not taken from the constants. The two tests through this read
+    /// prove a different reason for a different fact, and a swap of two reasons passes them; this one fails on it. Tip only: the pre-fix
+    /// tree has no words to state, so this test cannot be seen red there.
+    #[cfg(unix)]
+    #[test]
+    fn p0_boot_line_states_each_state_by_its_word() {
+        let r = p0_reads("words");
+        for (state, said, word) in [
+            ("the control, a usable generation", &r.found, "found"),
+            ("the lane's set is empty", &r.lane_empty, "lane_empty"),
+            ("the lane is not listed", &r.lane_unlisted, "lane_absent"),
+            ("truncated manifest", &r.truncated, "manifest_unreadable"),
+            ("garbage manifest", &r.garbage, "manifest_unreadable"),
+            ("store with no generation", &r.store_empty, "generation_absent"),
+            ("no store", &r.store_absent, "generation_absent"),
+        ] {
+            assert_eq!(said.reason.as_deref(), Some(word), "{state}: {}", said.line);
+        }
+    }
+
     /// A one-lane generation and a recording environment, with stand-ins for the kernel and no real dataless file anywhere.
     fn p0_policy_fixture(tag: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf, Vec<String>) {
         let tmp = p0_scratch(tag);
