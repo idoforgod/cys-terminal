@@ -1,0 +1,33 @@
+{
+  "authorization_id": "E1-PROBE-20261101-3e345a57-ONE-ATTEMPT",
+  "document_status": "PROPOSED_ENABLING_BYTES_REQUIRES_CEO_E1_BEFORE_PUBLICATION",
+  "execution_authorized": true,
+  "release_verdict": "NONE",
+  "mode": "feasibility",
+  "attempt": 1,
+  "product_sha": "3a97a9216c4be2030fe17954b723ff0f657ff22b",
+  "diagnostic_sha": "3e345a57c461d12870d1b6f54fbb8bf98c5968d2",
+  "branch": "work/0.14.56-native-feasibility",
+  "host": "windows-latest",
+  "rust_toolchain": "1.98.0",
+  "earliest_start_utc": "2026-11-01T04:00:00+00:00",
+  "latest_start_utc": "2026-11-01T08:00:00+00:00",
+  "latest_end_utc": "2026-11-01T08:30:00+00:00",
+  "collection_deadline_utc": "2026-11-01T09:00:00+00:00",
+  "manifest": {
+    "url": "https://raw.githubusercontent.com/idoforgod/cys-terminal/3b195cb2cd83b8812d28c7b819c583ee8bccf5ab/_diagnostic_authority/native-probe/manifest.json",
+    "sha256": "f257c8abddddaf63423acfe6a14e855a096ab8da97e8c9d7efb82dd8a1e11ec4"
+  },
+  "probe_config": {
+    "receiver_url": "https://downloads.claude.ai/claude-code-releases/2.1.312/win32-x64/claude.exe",
+    "receiver_sha256": "6099672ebe5dcb518b67d1d32dde1e3360bc6bee1dae7f8d28a69c49acc7c865",
+    "receiver_version": "2.1.312",
+    "canary_literal_address": "1.1.1.1",
+    "controller_hashes": {
+      "boundary.py": "7e7854df676c0b98834a47543e3b1af01b6942b93e4f0c5fd27127c8acea679c",
+      "boundary_host.py": "a19e6151f771150d1bb69b9595dbeb697685df678355d71eff18e74bfa5e2f87",
+      "controller.py": "27dfcdf69f002729b22c343ff9f81e14117bb9f45288bc6c288c456ec49d2277",
+      "protocol.py": "6f01f4dcef3937f2b55a2103badfeba454d4f6ac73b1250350f0a4c133fb556e"
+    }
+  }
+}
