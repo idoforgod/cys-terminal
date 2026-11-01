@@ -27866,6 +27866,7 @@ mod tests {
         within("CYS_SOCKET parent", socket.parent().unwrap());
         within("state dir", &crate::state::state_dir(&socket));
         within("generation store", &cys::home_dir().join(".cys").join("state-generations"));
+        within("XDG_STATE_HOME", std::path::Path::new(&std::env::var("XDG_STATE_HOME").unwrap()));
         for (k, _) in std::env::vars() {
             let state_var = (k.starts_with("CYS_") && k != "CYS_SOCKET") || k.starts_with("JAVIS_") || k.starts_with("AITERM_") || k == "CLAUDE_CONFIG_DIR";
             assert!(!state_var, "{k} is set: it can reach a lane outside the rig");
@@ -27895,7 +27896,7 @@ mod tests {
                 child.env_remove(k);
             }
         }
-        child.args(args).current_dir(cwd).env("HOME", rig).env("TMPDIR", &tmp).env("CYS_SOCKET", socket).env("P0_RIG", rig).hide_console();
+        child.args(args).current_dir(cwd).env("HOME", rig).env("TMPDIR", &tmp).env("CYS_SOCKET", socket).env("XDG_STATE_HOME", rig.join(".local").join("state")).env("P0_RIG", rig).hide_console();
         child
     }
 
@@ -28036,6 +28037,128 @@ mod tests {
         let next = p0_run_child(&home, &socket, &other, false);
         assert_eq!(next["seeded"], json!(roles), "the next boot reads it back");
         assert_eq!(next["rev"], json!(1));
+    }
+
+    /// What one read said, through the interface both trees have: `load_tombstones_from_disk` in a sealed child, with its boot line kept.
+    #[cfg(unix)]
+    struct P0Said {
+        seeded: serde_json::Value,
+        reason: Option<String>,
+        line: String,
+    }
+
+    /// One corrupt-boot read of `lane`, with the working directory in `other`. `p0_sealed_child` sets each axis and the child asserts each
+    /// by name in `p0_assert_sealed`; the isolate path on the line shows the state dir that was used. The reason is looked for only after
+    /// the recovered count, because the rig path and the parse error come before it and neither may supply one.
+    #[cfg(unix)]
+    fn p0_said(rig: &std::path::Path, lane: &std::path::Path, other: &std::path::Path) -> P0Said {
+        std::fs::write(lane.join("topology.json"), "{ torn").unwrap();
+        let out = rig.join("said.json");
+        let _ = std::fs::remove_file(&out);
+        let mut child = p0_sealed_child(rig, &lane.join("cys.sock"), other, &["--exact", "governance::tests::p0_boot_child", "--nocapture"]);
+        let run = child.env("P0_BOOT_OUT", &out).env("P0_BOOT_LOAD_ONLY", "1").output().unwrap();
+        let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
+        assert!(run.status.success(), "the child test failed, or an axis is outside the rig: {stderr}");
+        let got: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&out).expect("the child test ran")).unwrap();
+        let lines: Vec<&str> = stderr.lines().filter(|l| l.starts_with("[cysd] ★P0-3 topology.json")).collect();
+        assert_eq!(lines.len(), 1, "one read, one boot line: {stderr}");
+        let line = lines[0].to_string();
+        assert!(line.contains(lane.join("topology.json.corrupt-").to_str().unwrap()), "state dir: the isolate is not in this lane: {line}");
+        let after_count = line.rsplit_once("개 복구").expect("the recovered count").1;
+        let reason = after_count.split_whitespace().find_map(|w| w.strip_prefix("reason=")).filter(|r| !r.is_empty()).map(String::from);
+        P0Said { seeded: got["seeded"].clone(), reason, line }
+    }
+
+    /// Each read both tests compare, in one rig. The first is the control: this reader finds the rig-only set in this store, so a refusal
+    /// below cannot be a read that looked nowhere, and the generation holds that set under its stored name and under the bare name, so a
+    /// reader that ignores the manifest takes it and the refusal cannot be for lack of anything to read.
+    #[cfg(unix)]
+    struct P0Reads {
+        found: P0Said,
+        truncated: P0Said,
+        garbage: P0Said,
+        lane_empty: P0Said,
+        lane_unlisted: P0Said,
+        store_empty: P0Said,
+        store_absent: P0Said,
+    }
+
+    #[cfg(unix)]
+    fn p0_reads(tag: &str) -> P0Reads {
+        let rig = p0_scratch(tag);
+        let state = rig.join(".local").join("state");
+        let (me, other) = (p0_lane_dir(&state, "cys-dept-dept-5"), p0_lane_dir(&state, "cys-dept-dept-6"));
+        let root = rig.join(".cys").join("state-generations");
+        let name = "20261101T104113Z";
+        let mut roles = p0_roles("worker", 3);
+        roles.push(format!("zz-rig-only-{}", std::process::id()));
+
+        let g = p0_generation(&root, name, &[P0Lane { state: &me, body: p0_body(&roles) }]);
+        std::fs::write(g.join("topology.json"), p0_body(&roles)).unwrap();
+        let found = p0_said(&rig, &me, &other);
+        assert_eq!(found.seeded, json!(roles), "the control: {}", found.line);
+
+        let whole = std::fs::read(g.join("manifest.json")).unwrap();
+        let cut = whole[..whole.len() / 2].to_vec();
+        let junk = b"\xff\xfe not a manifest".to_vec();
+        for bytes in [&cut, &junk] {
+            assert!(serde_json::from_slice::<serde_json::Value>(bytes).is_err(), "the fixture must not parse");
+        }
+        std::fs::write(g.join("manifest.json"), &cut).unwrap();
+        let truncated = p0_said(&rig, &me, &other);
+        std::fs::write(g.join("manifest.json"), &junk).unwrap();
+        let garbage = p0_said(&rig, &me, &other);
+
+        std::fs::remove_dir_all(&root).unwrap();
+        p0_generation(&root, name, &[P0Lane { state: &me, body: p0_body(&[]) }]);
+        let lane_empty = p0_said(&rig, &me, &other);
+
+        std::fs::remove_dir_all(&root).unwrap();
+        p0_generation(&root, name, &[P0Lane { state: &other, body: p0_body(&p0_roles("foreign", 2)) }]);
+        let lane_unlisted = p0_said(&rig, &me, &other);
+
+        std::fs::remove_dir_all(&root).unwrap();
+        let stray = root.join("not-a-generation");
+        std::fs::create_dir_all(&stray).unwrap();
+        std::fs::write(stray.join("topology.json"), p0_body(&roles)).unwrap();
+        let store_empty = p0_said(&rig, &me, &other);
+
+        std::fs::remove_dir_all(&root).unwrap();
+        let store_absent = p0_said(&rig, &me, &other);
+        P0Reads { found, truncated, garbage, lane_empty, lane_unlisted, store_empty, store_absent }
+    }
+
+    /// Refused means nothing came back, named means the read stated a reason, and a reason names something only if the other states say
+    /// something else: a word printed for every state would pass a presence check.
+    #[cfg(unix)]
+    fn p0_assert_refused_and_named(case: &str, said: &P0Said, others: &[&P0Said]) {
+        assert!(said.seeded == json!([]) && said.reason.is_some(), "{case}: seeded {}, reason {:?}: {}", said.seeded, said.reason, said.line);
+        for other in others {
+            assert_ne!(said.reason, other.reason, "{case} and another state say the same thing: {} | {}", said.line, other.line);
+        }
+    }
+
+    /// No generation: the store holds none, or there is no store. Both are one fact, so they state one reason.
+    #[cfg(unix)]
+    #[test]
+    fn p0_red_no_generation_is_refused_and_named() {
+        let r = p0_reads("nogen");
+        let others = [&r.found, &r.lane_empty, &r.lane_unlisted, &r.truncated, &r.garbage];
+        p0_assert_refused_and_named("store with no generation", &r.store_empty, &others);
+        p0_assert_refused_and_named("no store", &r.store_absent, &others);
+        assert_eq!(r.store_empty.reason, r.store_absent.reason, "one fact, one reason");
+    }
+
+    /// A manifest that exists and cannot be parsed, truncated or garbage. Without it nothing says whose file is whose, so the lane's copy
+    /// beside it stays unread.
+    #[cfg(unix)]
+    #[test]
+    fn p0_red_an_unparsable_manifest_is_refused_and_named() {
+        let r = p0_reads("garbled");
+        let others = [&r.found, &r.lane_empty, &r.lane_unlisted, &r.store_empty, &r.store_absent];
+        p0_assert_refused_and_named("truncated manifest", &r.truncated, &others);
+        p0_assert_refused_and_named("garbage manifest", &r.garbage, &others);
+        assert_eq!(r.truncated.reason, r.garbage.reason, "one fact, one reason");
     }
 
     // P0-RED-END: the tests below read the conclusion, which the pre-fix tree does not have.
