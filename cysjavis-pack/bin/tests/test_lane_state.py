@@ -24,6 +24,9 @@ import unittest
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from rig_axes import AXES, assert_sealed, breaches  # noqa: E402
+
 BIN = os.path.dirname(HERE)
 PY = sys.executable
 DEPTS = ["dept-%d" % i for i in range(1, 11)]
@@ -65,6 +68,8 @@ class Base(unittest.TestCase):
     def setUp(self):
         self.home = os.path.realpath(tempfile.mkdtemp(prefix="lane-state-"))
         self.addCleanup(shutil.rmtree, self.home, True)
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(self.home)
         self.base_round = os.path.join(self.home, "_round")
         self.local = os.path.join(self.home, "AppData", "Local")
         os.makedirs(self.local)
@@ -83,16 +88,20 @@ class Base(unittest.TestCase):
         os.makedirs(os.path.join(r, "tasks"), exist_ok=True)
         return r
 
-    def env(self, dept=None, exported=False, root=None, **extra):
+    def env(self, dept=None, exported=False, root=None, seal=True, **extra):
         env = {k: v for k, v in os.environ.items()
                if not k.startswith(("CYS_", "JAVIS_", "AITERM_")) and k != "CLAUDE_CONFIG_DIR"}
         env.update({"HOME": self.home, "USERPROFILE": self.home, "LOCALAPPDATA": self.local, "RIG": self.home,
+                    "CYS_STATE_DIR": os.path.join(self.home, "st"), "JAVIS_ROOT": self.home,
+                    "CYS_PROBE_RUNS": os.path.join(self.home, "probe_runs.jsonl"),
                     "CYS_NO_AUTOSTART": "1", "CYS_AUTOPILOT_NO_SEND": "1", "PATH": "/usr/bin:/bin"})
         env["CYS_PACK_DIR"] = self.pack(dept) if dept else os.path.join(self.home, ".cys", "pack")
         if dept:
             env["CYS_SOCKET"] = self.sock(dept)
         env["CYS_PROJECT_ROOT"] = root or (self.pack(dept) if exported else self.home)
         env.update(extra)
+        if seal:
+            assert_sealed(self, env, self.home)
         return env
 
     def tick(self, dept=None, exported=False, root=None, **extra):
@@ -536,7 +545,7 @@ class Paths(Base):
 
     def test_the_rig_check_refuses_a_path_outside_the_rig(self):
         """Control for the isolation itself: a resolved path outside the rig stops before any operation."""
-        env = self.env("dept-5", CYS_PACK_DIR="/outside/the/rig")
+        env = self.env("dept-5", seal=False, CYS_PACK_DIR="/outside/the/rig")
         r = subprocess.run([PY, "-B", "-c", DRIVER, BIN], capture_output=True, text=True, cwd=self.home, env=env,
                            timeout=60)
         state = self.expected("cys-dept-dept-5")
@@ -567,6 +576,29 @@ class Paths(Base):
         control("P1R3 through a symlink: verifier equals autopilot=%s" % (got["ap"][:4] == got["vf"]))
         self.assertEqual(got["ap"][:4], got["vf"])
         self.assertEqual(got["ap"][0], self.expected("cys-dept-dept-3"))
+
+    def test_autopilot_and_verifier_agree_through_a_socket_file_link(self):
+        real = os.path.dirname(self.sock("dept-3"))
+        os.makedirs(real)
+        link = os.path.join(self.home, "sock-link")
+        os.symlink(self.sock("dept-3"), link)
+        got = self.probe(CYS_SOCKET=link)
+        control("P1R4 through a socket-file link: verifier equals autopilot=%s" % (got["ap"][:4] == got["vf"]))
+        self.assertEqual(got["ap"][:4], got["vf"])
+
+    def test_every_axis_is_named_and_a_breach_names_itself(self):
+        good = {a: self.home for a in AXES if a != "cwd"}
+        self.assertEqual(breaches(good, self.home, self.home), {})
+        caught = {}
+        for axis in AXES:
+            env, cwd = dict(good), self.home
+            if axis == "cwd":
+                cwd = "/outside/the/rig"
+            else:
+                env[axis] = "/outside/the/rig"
+            caught[axis] = list(breaches(env, cwd, self.home))
+        control("A9 each axis pushed outside the rig is named alone: %s" % (caught == {a: [a] for a in AXES}))
+        self.assertEqual(caught, {a: [a] for a in AXES})
 
     def test_mode_knob_is_per_lane_and_fails_toward_shadow(self):
         base_dir = self.expected("cys")

@@ -19,6 +19,7 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+from rig_axes import assert_sealed  # noqa: E402
 from test_dept_create_progress import DEPT, Sandbox, UP_AT_PING, _write_exec  # noqa: E402
 
 # The stub daemon dumps its env. It runs as a background child, so a test waits for the rename, never for a partial file.
@@ -59,11 +60,34 @@ def missing_scrub(text):
     return [ln for ln in spawn_lines(text) if not all("-u %s" % a in ln for a in ALIASES)]
 
 
+class RigSandbox(Sandbox):
+    """Sandbox with every axis named. It leaves cwd and the state env to the caller, and that let a test reach a real store."""
+
+    def __init__(self, case, **env_extra):
+        super().__init__(**env_extra)
+        self.case = case
+        local = os.path.join(self.home, "AppData", "Local")
+        os.makedirs(local)
+        self.env.update({"USERPROFILE": self.home, "LOCALAPPDATA": local, "JAVIS_ROOT": self.home,
+                         "CYS_STATE_DIR": os.path.join(self.home, "st"),
+                         "CYS_PACK_DIR": os.path.join(self.home, ".cys", "pack"),
+                         "CYS_PROBE_RUNS": os.path.join(self.home, "runs.jsonl")})
+
+    def run(self, *args, **kw):
+        before = os.getcwd()
+        os.chdir(self.home)
+        try:
+            assert_sealed(self.case, self.env, self.home)
+            return super().run(*args, **kw)
+        finally:
+            os.chdir(before)
+
+
 class Verbs(unittest.TestCase):
     def spawn(self, argv):
         """Run one verb to a real spawn. STUB_PING_OK_FROM carries it past the pre-check and the ready wait."""
-        sb = Sandbox(CYS_NO_AUTOSTART="1", STUB_PING_OK_FROM=UP_AT_PING, JAVIS_SOCKET="/stale/javis.sock",
-                     AITERM_SOCKET="/stale/aiterm.sock")
+        sb = RigSandbox(self, CYS_NO_AUTOSTART="1", STUB_PING_OK_FROM=UP_AT_PING, JAVIS_SOCKET="/stale/javis.sock",
+                        AITERM_SOCKET="/stale/aiterm.sock")
         self.addCleanup(sb.cleanup)
         sb.seed_catalog("k1", "m1")
         _write_exec(os.path.join(sb.home, ".local", "bin", "cysd"), ENV_CYSD)
@@ -78,7 +102,7 @@ class Verbs(unittest.TestCase):
         name = os.path.basename(pack)[len("pack-dept-"):]
         script = ('source "$CYS_DEPT_SCRIPT" sock probe-src >/dev/null 2>&1 || true\n'
                   'formation_lane_pack "$FLP_NAME" "$(dept_sock "$FLP_NAME")"\n')
-        r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, encoding="utf-8",
+        r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, encoding="utf-8", cwd=sb.home,
                            env=dict(sb.env, CYS_DEPT_SCRIPT=DEPT, FLP_NAME=name), timeout=30)
         self.assertEqual(r.returncode, 0, r.stderr[-400:])
         return r.stdout.strip()
@@ -157,7 +181,7 @@ class UnrestartedLane(Verbs):
                "l.append_record('note', 'test', {'text': 'x'})\n")
 
     def sandbox(self):
-        sb = Sandbox(CYS_NO_AUTOSTART="1")
+        sb = RigSandbox(self, CYS_NO_AUTOSTART="1")
         self.addCleanup(sb.cleanup)
         os.makedirs(os.path.join(sb.home, "_round"))
         return sb

@@ -22,6 +22,9 @@ import textwrap
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from rig_axes import assert_sealed  # noqa: E402
+
 BIN = os.path.dirname(HERE)
 PY = sys.executable
 FILE = "AUTOPILOT_PAUSED"
@@ -162,8 +165,10 @@ class Lane(unittest.TestCase):
     DEPT = "dept-7"
 
     def setUp(self):
-        self.home = tempfile.mkdtemp(prefix="paused-lane-")
+        self.home = os.path.realpath(tempfile.mkdtemp(prefix="paused-lane-"))
         self.addCleanup(shutil.rmtree, self.home, True)
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(self.home)
         self.pack = os.path.join(self.home, ".cys", "pack-dept-" + self.DEPT)
         self.other = os.path.join(self.home, ".cys", "pack-dept-dept-8")
         os.makedirs(os.path.join(self.pack, "_round"))
@@ -177,9 +182,12 @@ class Lane(unittest.TestCase):
     def env(self):
         env = {k: v for k, v in os.environ.items()
                if not k.startswith(("CYS_", "JAVIS_", "AITERM_")) and k != "CLAUDE_CONFIG_DIR"}
-        env.update({"HOME": self.home, "USERPROFILE": self.home, "LOCALAPPDATA": self.local, "CYS_PACK_DIR": self.pack, "CYS_PROJECT_ROOT": self.pack, "JAVIS_ROOT": self.pack,
+        env.update({"HOME": self.home, "USERPROFILE": self.home, "LOCALAPPDATA": self.local,
+                    "CYS_STATE_DIR": os.path.join(self.home, "st"), "CYS_PROBE_RUNS": os.path.join(self.home, "runs.jsonl"),
+                    "CYS_PACK_DIR": self.pack, "CYS_PROJECT_ROOT": self.pack, "JAVIS_ROOT": self.pack,
                     "CYS_SOCKET": os.path.join(self.home, ".local", "state", "cys-dept-" + self.DEPT, "cys.sock"),
                     "CYS_NO_AUTOSTART": "1", "PATH": "/usr/bin:/bin"})
+        assert_sealed(self, env, self.home)
         return env
 
     def ask(self, mod, fn):
