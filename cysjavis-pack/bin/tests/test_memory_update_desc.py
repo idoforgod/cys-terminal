@@ -5,7 +5,10 @@
 Seats read the INDEX, so a body changed under an old description is a fact recall cannot see. The tool knew
 (`index_updated: false`) and said so on stdout, where nobody reads it. The gate fails closed: --body needs --desc, or
 --keep-desc saying the description is deliberately unchanged. --keep-desc exists so a typo fix is not blocked, and it
-leaves a durable row, because stdout is the channel that hid this defect.
+leaves a durable row, because stdout is the channel that hid this defect. The row is written before the card, so it
+records an attempt, not a completion.
+
+Round 2: the card was read before the lock, so a keep-desc update could restore a description a peer had just written.
 
 Every case builds its environment from nothing and asserts each axis by name before any operation.
 
@@ -19,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -35,6 +39,50 @@ OLD_DESC = "알파 규칙의 옛 설명"
 OLD_BODY = "옛 본문"
 NEW_DESC = "알파 규칙의 새 설명"
 NEW_BODY = "새 본문 — 사실이 바뀌었다"
+PEER_DESC = "동료가 방금 쓴 설명"
+# Runs one real verb. Nothing is mocked but the named pause or fault. argv: tool, mark, go, where, then the tool's argv.
+HARNESS = """
+import importlib.util, os, sys, time
+spec = importlib.util.spec_from_file_location("jm", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+mark, go, where = sys.argv[2:5]
+sys.argv = ["javis_memory.py"] + sys.argv[5:]
+
+def pause():
+    open(mark, "w").close()
+    limit = time.time() + 30
+    while not os.path.exists(go):
+        if time.time() > limit:
+            os._exit(70)
+        time.sleep(0.01)
+
+real_enter, real_write = m.FileLock.__enter__, m._write_text_atomic
+
+def enter(self):
+    with open(mark + ".enters", "a") as f:
+        f.write("1")
+    if where == "before-lock":
+        pause()
+    return real_enter(self)
+
+def write(path, text):
+    if os.path.basename(path) != m.INDEX_FILE:
+        if where == "before-card-write":
+            pause()
+        if where == "card-write-fails":
+            raise OSError(5, "injected card write failure")
+    return real_write(path, text)
+
+def fsync(fd):
+    raise OSError(5, "injected fsync failure")
+
+m.FileLock.__enter__ = enter
+m._write_text_atomic = write
+if where == "fsync-fails":
+    m.os.fsync = fsync
+sys.exit(m.main())
+"""
 
 
 def control(msg):
@@ -78,6 +126,27 @@ class Base(unittest.TestCase):
         self.assertEqual(os.path.commonpath([self.tmp, self.mdir]), self.tmp)
         return subprocess.run([PY, "-B", TOOL, "--dir", self.mdir] + list(argv), cwd=self.tmp, env=full,
                               capture_output=True, text=True, timeout=60)
+
+    def harness(self, where, *argv, env=None):
+        """Start one real verb under HARNESS. Returns (process, mark, go)."""
+        full = dict(self.env if env is None else env)
+        assert_sealed(self, full, self.tmp)
+        self.assertEqual(os.path.realpath(os.getcwd()), self.tmp)
+        mark, go = os.path.join(self.tmp, "mark"), os.path.join(self.tmp, "go")
+        p = subprocess.Popen([PY, "-B", "-c", HARNESS, TOOL, mark, go, where, "--dir", self.mdir] + list(argv),
+                             cwd=self.tmp, env=full, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(p.kill)
+        self.addCleanup(p.stdout.close)
+        self.addCleanup(p.stderr.close)
+        return p, mark, go
+
+    def wait_for(self, path, proc):
+        for _ in range(3000):
+            if os.path.exists(path):
+                return
+            self.assertIsNone(proc.poll(), "the verb ended before reaching its pause")
+            time.sleep(0.01)
+        self.fail("never reached %s" % path)
 
     def snapshot(self):
         """Every byte in the memory directory, by name, so a stray temp, lock or log file also counts as a write."""
@@ -162,8 +231,8 @@ class Gate(Base):
         self.assertEqual(self.index(), index_before)
         rows = self.rows()
         self.assertEqual(len(rows), 1)
-        self.assertEqual({k: rows[0][k] for k in ("file", "flag", "role", "surface")},
-                         {"file": CARD, "flag": "keep-desc", "role": "rig-role", "surface": "42"})
+        self.assertEqual({k: rows[0][k] for k in ("file", "event", "role", "surface")},
+                         {"file": CARD, "event": "keep-desc-attempt", "role": "rig-role", "surface": "42"})
         self.assertRegex(rows[0]["at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
         control("--keep-desc: rc 0, index byte-identical, durable row %s" % json.dumps(rows[0]))
 
@@ -219,9 +288,38 @@ class Record(Base):
         os.makedirs(os.path.join(self.mdir, LOG))
         before = self.snapshot()
         r = self.run_tool("update", "--name", NAME, "--body", NEW_BODY, "--keep-desc")
-        self.assert_refused(3, r, before, "--keep-desc")
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        self.assertEqual(self.snapshot(), before)
         self.assertIn(OLD_BODY, self.card())
         control("row cannot be written: rc 3, card and index byte-identical")
+
+    def test_a_row_that_landed_before_fsync_failed_is_not_denied(self):
+        card, index = self.card(), self.index()
+        p, _, _ = self.harness("fsync-fails", "update", "--name", NAME, "--body", NEW_BODY, "--keep-desc")
+        out, err = p.communicate(timeout=30)
+        self.assertEqual(p.returncode, 3, out + err)
+        self.assertEqual(out, "")
+        self.assertEqual((self.card(), self.index()), (card, index))
+        rows = self.rows()
+        self.assertEqual(len(rows), 1, "the injected fault did not land after the append")
+        msg = json.loads(err.strip().splitlines()[-1])["error"]
+        self.assertNotIn("아무것도 쓰지", msg)
+        self.assertIn("카드와 색인은 갱신하지 않았다", msg)
+        self.assertIn("남았을 수 있다", msg)
+        control("fsync fails after the append: rc 3, card and index unchanged, 1 row present, says: %s" % msg)
+
+    def test_a_row_records_an_attempt_not_a_completion(self):
+        card, index = self.card(), self.index()
+        p, _, _ = self.harness("card-write-fails", "update", "--name", NAME, "--body", NEW_BODY, "--keep-desc")
+        out, err = p.communicate(timeout=30)
+        self.assertNotEqual(p.returncode, 0, out + err)
+        self.assertEqual(out, "")
+        self.assertEqual((self.card(), self.index()), (card, index))
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["event"], "keep-desc-attempt")
+        control("card write fails after the row: rc %s, no result printed, card unchanged, row reads %s"
+                % (p.returncode, rows[0]["event"]))
 
     def test_readers_of_the_directory_do_not_take_the_log_for_a_card(self):
         r = self.run_tool("update", "--name", NAME, "--body", NEW_BODY, "--keep-desc")
@@ -236,6 +334,61 @@ class Record(Base):
         graph = json.loads(self.run_tool("graph", "--json").stdout)
         self.assertEqual(graph["node_count"], 1)
         control("with a log present: verify files 1, recent 1, health 1, graph 1, none is the log")
+
+
+class Concurrency(Base):
+    def peer(self, *argv):
+        r = self.run_tool(*argv)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_keep_desc_cannot_restore_a_description_a_peer_just_wrote(self):
+        # The review's schedule: A pauses just before the lock, B updates the description and returns, A goes on.
+        a, mark, go = self.harness("before-lock", "update", "--name", NAME, "--body", NEW_BODY, "--keep-desc")
+        self.wait_for(mark, a)
+        self.peer("update", "--name", NAME, "--desc", PEER_DESC)
+        open(go, "w").close()
+        out, err = a.communicate(timeout=30)
+        self.assertEqual(a.returncode, 0, out + err)
+        self.assertIn("description: %s\n" % PEER_DESC, self.card())
+        self.assertIn(NEW_BODY, self.card())
+        self.assertIn(PEER_DESC, self.index())
+        v = self.run_tool("verify", "--desc-strict")
+        self.assertEqual(v.returncode, 0, v.stdout)
+        control("review schedule: card holds the peer's description and A's body, index agrees, verify --desc-strict rc 0")
+
+    def test_a_peer_waits_while_a_holder_is_between_read_and_write(self):
+        a, mark, go = self.harness("before-card-write", "update", "--name", NAME, "--body", NEW_BODY, "--keep-desc")
+        self.wait_for(mark, a)
+        full = dict(self.env)
+        assert_sealed(self, full, self.tmp)
+        b = subprocess.Popen([PY, "-B", TOOL, "--dir", self.mdir, "update", "--name", NAME, "--desc", PEER_DESC],
+                             cwd=self.tmp, env=full, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(b.kill)
+        self.addCleanup(b.stdout.close)
+        self.addCleanup(b.stderr.close)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            b.wait(timeout=1.0)
+        open(go, "w").close()
+        out, err = a.communicate(timeout=30)
+        self.assertEqual(a.returncode, 0, out + err)
+        out, err = b.communicate(timeout=30)
+        self.assertEqual(b.returncode, 0, out + err)
+        self.assertIn("description: %s\n" % PEER_DESC, self.card())
+        self.assertIn(NEW_BODY, self.card())
+        self.assertIn(PEER_DESC, self.index())
+        self.assertEqual(self.run_tool("verify", "--desc-strict").returncode, 0)
+        control("holder between read and write: peer still waiting at 1.0 s, then both landed, verify --desc-strict rc 0")
+
+    def test_one_update_takes_the_lock_once(self):
+        for i, argv in enumerate((["--body", NEW_BODY, "--keep-desc"], ["--desc", NEW_DESC, "--body", NEW_BODY],
+                                  ["--desc", PEER_DESC])):
+            p, mark, _ = self.harness("count", "update", "--name", NAME, *argv)
+            out, err = p.communicate(timeout=30)
+            self.assertEqual(p.returncode, 0, out + err)
+            with open(mark + ".enters") as f:
+                self.assertEqual(f.read(), "1", "read and write must sit under one lock: %r" % (argv,))
+            os.unlink(mark + ".enters")
+        control("each update form entered the lock exactly once")
 
 
 if __name__ == "__main__":

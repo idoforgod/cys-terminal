@@ -467,9 +467,10 @@ def _replace_index_hook(index_text, fn, desc):
 
 
 def _log_keep_desc(mdir, fn):
-    """One row per use of --keep-desc: which card, when, which seat. stdout is not a record, it is the channel that
-    hid `index_updated: false`. The store is fleet-shared, so the writer names itself; unset stays null, never guessed."""
-    row = {"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "file": fn, "flag": "keep-desc",
+    """One row per attempted use of --keep-desc: which card, when, which seat. It lands before the card, so it proves
+    the attempt, not that the card changed. stdout is not a record, it is the channel that hid `index_updated: false`.
+    The store is fleet-shared, so the writer names itself; unset stays null, never guessed."""
+    row = {"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "file": fn, "event": "keep-desc-attempt",
            "role": os.environ.get("CYS_ROLE") or None, "surface": os.environ.get("CYS_SURFACE_ID") or None}
     with open(os.path.join(mdir, UPDATE_LOG), "a", encoding="utf-8", newline="\n") as f:
         f.write(json.dumps(row) + "\n")
@@ -486,7 +487,10 @@ def cmd_update(mdir, args):
 
     A8: seats read the index, so a body changed under an old description is invisible to recall. --body is refused
     unless --desc moves the description too or --keep-desc says it is deliberately unchanged. Refusing, not warning: a
-    warning fails in the passing direction. The opt-out exists so a typo fix is not blocked."""
+    warning fails in the passing direction. The opt-out exists so a typo fix is not blocked.
+
+    Everything is read inside the one lock, as cmd_add does. A card read before it can put back a description or a body
+    that another update has just written."""
     desc = getattr(args, "desc", None)
     body = getattr(args, "body", None)
     keep_desc = getattr(args, "keep_desc", False)
@@ -505,32 +509,32 @@ def cmd_update(mdir, args):
     if not os.path.isfile(index_path):
         return fail(2, "%s 없음 — verify 로 정합부터 복구하라" % INDEX_FILE)
 
-    matches = []
-    for fn in memory_files(mdir):
-        text = open(os.path.join(mdir, fn), encoding="utf-8", errors="replace").read()
-        fm = parse_frontmatter(text)
-        if fm["name"] == args.name:
-            matches.append((fn, text))
-    if not matches:
-        return fail(2, "미등재 슬러그: %r — 파일 frontmatter 의 name 과 일치해야 한다" % args.name)
-    if len(matches) > 1:
-        return fail(2, "중복 슬러그: %r (%s) — verify 로 정합부터 복구하라"
-                    % (args.name, ", ".join(fn for fn, _ in matches)))
-    fn, old_text = matches[0]
-    fpath = os.path.join(mdir, fn)
-
-    new_text = old_text
-    if desc is not None:
-        new_text = _replace_fm_description(new_text, desc)
-        if new_text is None:
-            return fail(2, "%s: frontmatter 형식 불량 — description 줄을 찾지 못했다" % fn)
-    if body is not None:
-        new_text = _replace_body(new_text, body)
-        if new_text is None:
-            return fail(2, "%s: frontmatter 형식 불량 — 본문 경계를 찾지 못했다" % fn)
-
     try:
         with FileLock(index_path):
+            matches = []
+            for fn in memory_files(mdir):
+                text = open(os.path.join(mdir, fn), encoding="utf-8", errors="replace").read()
+                fm = parse_frontmatter(text)
+                if fm["name"] == args.name:
+                    matches.append((fn, text))
+            if not matches:
+                return fail(2, "미등재 슬러그: %r — 파일 frontmatter 의 name 과 일치해야 한다" % args.name)
+            if len(matches) > 1:
+                return fail(2, "중복 슬러그: %r (%s) — verify 로 정합부터 복구하라"
+                            % (args.name, ", ".join(fn for fn, _ in matches)))
+            fn, old_text = matches[0]
+            fpath = os.path.join(mdir, fn)
+
+            new_text = old_text
+            if desc is not None:
+                new_text = _replace_fm_description(new_text, desc)
+                if new_text is None:
+                    return fail(2, "%s: frontmatter 형식 불량 — description 줄을 찾지 못했다" % fn)
+            if body is not None:
+                new_text = _replace_body(new_text, body)
+                if new_text is None:
+                    return fail(2, "%s: frontmatter 형식 불량 — 본문 경계를 찾지 못했다" % fn)
+
             index_text = open(index_path, encoding="utf-8", errors="replace").read()
             new_index, changed = (index_text, 0)
             if desc is not None:
@@ -542,7 +546,8 @@ def cmd_update(mdir, args):
                 try:
                     _log_keep_desc(mdir, fn)
                 except OSError as e:
-                    return fail(3, "--keep-desc 기록 실패 — 아무것도 쓰지 않았다: %s" % e)
+                    return fail(3, "--keep-desc 시도 기록 실패 — 카드와 색인은 갱신하지 않았다"
+                                   "(기록 줄은 남았을 수 있다): %s" % e)
             _write_text_atomic(fpath, new_text)
             if desc is not None:
                 try:
@@ -983,7 +988,7 @@ def main():
     u.add_argument("--desc", default=None, help="새 한 줄 요약(파일 description + 색인 훅 동시 갱신)")
     u.add_argument("--body", default=None, help="새 본문(frontmatter 는 보존) — --desc 또는 --keep-desc 필수")
     u.add_argument("--keep-desc", action="store_true",
-                   help="설명이 그대로 맞다고 명시하고 본문만 고친다(사용 기록이 %s 에 남는다)" % UPDATE_LOG)
+                   help="설명이 그대로 맞다고 명시하고 본문만 고친다(시도 기록이 %s 에 남는다)" % UPDATE_LOG)
 
     r = sub.add_parser("recent", help="최근 N분 내 증류 목록 (게이트 증거)")
     r.add_argument("--minutes", type=int, default=1440)
