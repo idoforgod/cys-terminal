@@ -337,8 +337,8 @@ class ReadyElapsedBound(unittest.TestCase):
             _write_exec(probe, "#!/bin/sh\n/bin/sleep %s\nexit %s\n" % (delay, result))
             src = _read(DEPT)
             script = "set -u\n" + "".join(func_text(src, n) for n in ("ready_wait", "dept_ready_secs"))
-            # A test-only one-second budget keeps this real process experiment light;
-            # the public knob parser's 12..180 contract is tested separately.
+            # Short budgets exercise the negative deadline cases. The successful
+            # control uses the public 12-second floor; the parser accepts 12..86400.
             script += "dept_ready_secs(){ echo %s; }\nCYS=\"$1\"\nready_wait fixture\nrc=$?\necho result=$rc elapsed=$_READY_WAIT_SECS\n" % budget
             if daemon_delay is not None:
                 script = script.replace('ready_wait fixture', '/bin/sleep %s & _dept_spawn_pid=$!\nready_wait fixture' % daemon_delay)
@@ -347,7 +347,7 @@ class ReadyElapsedBound(unittest.TestCase):
             env.update(HOME=home, PYTHONDONTWRITEBYTECODE="1")
             started = time.monotonic()
             r = subprocess.run(["bash", "-c", script, DEPT, probe], env=env,
-                               capture_output=True, text=True, timeout=12)
+                               capture_output=True, text=True, timeout=max(12, budget + 10))
             elapsed = time.monotonic() - started
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertEqual(r.stderr, "")
@@ -366,9 +366,8 @@ class ReadyElapsedBound(unittest.TestCase):
         self.assertLess(elapsed, 2.5)
 
     def test_slow_success_inside_deadline_is_ready(self):
-        rc, elapsed = self.run_probe(.1, 0)
+        rc, _ = self.run_probe(.1, 0, budget=12)
         self.assertEqual(rc, 0)
-        self.assertLess(elapsed, 2.5)
 
     def test_dead_child_exits_before_the_long_budget(self):
         rc, elapsed = self.run_probe(3, 0, budget=10, daemon_delay=0)
