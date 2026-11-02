@@ -340,7 +340,9 @@ class ReadyElapsedBound(unittest.TestCase):
             # Short budgets exercise the negative deadline cases. The successful
             # control uses the public 12-second floor; the parser accepts 12..86400.
             script += "dept_ready_secs(){ echo %s; }\nCYS=\"$1\"\nready_wait fixture\nrc=$?\necho result=$rc elapsed=$_READY_WAIT_SECS\n" % budget
-            if daemon_delay is not None:
+            if daemon_delay == "reaped":
+                script = script.replace('ready_wait fixture', '(exit 1) & _dept_spawn_pid=$!\nwait "$_dept_spawn_pid" || true\nready_wait fixture')
+            elif daemon_delay is not None:
                 script = script.replace('ready_wait fixture', '/bin/sleep %s & _dept_spawn_pid=$!\nready_wait fixture' % daemon_delay)
                 script += 'kill "$_dept_spawn_pid" 2>/dev/null || true\nwait "$_dept_spawn_pid" 2>/dev/null || true\n'
             env = {k: v for k, v in os.environ.items() if not k.startswith("CYS_") and k != "CLAUDE_CONFIG_DIR"}
@@ -354,6 +356,17 @@ class ReadyElapsedBound(unittest.TestCase):
             m = re.fullmatch(r"result=(\d+) elapsed=(\d+)\n", r.stdout)
             self.assertIsNotNone(m, r.stdout)
             return int(m.group(1)), elapsed
+
+    def test_reaped_startup_lock_loser_accepts_healthy_holder_ping(self):
+        # A98: the spawned loser has exited and been reaped before readiness.
+        # The socket ping represents the independently running healthy holder.
+        rc, _ = self.run_probe(.1, 0, budget=12, daemon_delay="reaped")
+        self.assertEqual(rc, 0, "healthy holder ping must win over exited startup-lock loser")
+
+    def test_dead_lock_loser_does_not_accept_a_ping_after_deadline(self):
+        rc, elapsed = self.run_probe(3, 0, budget=1, daemon_delay="reaped")
+        self.assertEqual(rc, 1, "a dead loser cannot exempt the holder ping from the budget")
+        self.assertLess(elapsed, 2.5)  # wallclock: guard owned one-second timeout, not readiness latency
 
     def test_slow_failure_is_bounded_before_first_ten_probes_finish(self):
         rc, elapsed = self.run_probe(.3, 1)
@@ -370,12 +383,12 @@ class ReadyElapsedBound(unittest.TestCase):
         self.assertEqual(rc, 0)
 
     def test_dead_child_exits_before_the_long_budget(self):
-        rc, elapsed = self.run_probe(3, 0, budget=10, daemon_delay=0)
+        rc, elapsed = self.run_probe(.1, 1, budget=10, daemon_delay="reaped")
         self.assertEqual(rc, 1)
         self.assertLess(elapsed, 2.5)
 
     def test_child_dies_during_a_slow_ping(self):
-        rc, elapsed = self.run_probe(3, 0, budget=10, daemon_delay=.2)
+        rc, elapsed = self.run_probe(.4, 1, budget=10, daemon_delay=.2)
         self.assertEqual(rc, 1)
         self.assertLess(elapsed, 2.5)
 

@@ -1349,14 +1349,14 @@ ready_wait(){
       n="$1"; cys="$2"; daemon="$3"
       daemon_gone(){ [ -n "$daemon" ] && ! kill -0 "$daemon" 2>/dev/null; }
       for ((i=0; i<n; i++)); do
-        daemon_gone && exit 2
+        # A startup-lock loser can exit while a healthy holder serves this socket.
+        # Finish this ping under the owned budget before judging the spawned pid.
         "$cys" ping >/dev/null 2>&1 & probe=$!
         while kill -0 "$probe" 2>/dev/null; do
-          daemon_gone && exit 2
           sleep 0.1
         done
-        daemon_gone && exit 2
         wait "$probe" && exit 0
+        daemon_gone && exit 2
         sleep 0.1
       done
       exit 1
