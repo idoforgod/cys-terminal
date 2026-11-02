@@ -9987,7 +9987,7 @@ mod tests {
             "plain",
             "[cys-dept] @stage Done",
             "",
-            "[cys-dept] ERROR: x 데몬 기동 실패 (대기 예산 12초 · 실제 약 13초)",
+            "[cys-dept] ERROR: x 데몬 기동 실패 (대기 예산 180초 · 실제 약 180초)",
             "[cys-dept] @stage up",
         ];
         let mut seed: u32 = 0x1234_5678;
@@ -10016,8 +10016,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn gu_failure_reason_survives_the_first_300_chars_after_marker_strip() {
-        let reason = "[cys-dept] ERROR: dept-3 데몬 기동 실패 (대기 예산 12초 · 실제 약 28초 · 로그: /Users/user/very-long-dirs-example/Library/Caches/cys/state/cys-dept-dept-3/cysd.log · \
-                      느린 디스크라면 CYS_DEPT_READY_SECS=60 처럼 대기 예산을 늘릴 수 있다)";
+        let reason = "[cys-dept] ERROR: dept-3 데몬 기동 실패 (대기 예산 180초 · 실제 약 180초 · 로그: /fixture/very-long-dirs-example/Library/Caches/cys/state/cys-dept-dept-3/cysd.log · \
+                      CYS_DEPT_READY_SECS=360 처럼 더 늘릴 수 있다 · 상한 86400초)";
         let units = |s: &str| s.encode_utf16().count();
         assert!(units(reason) <= 300, "전제: 사유 줄 자체는 300자 안이다({})", units(reason));
         let mut body = String::new();

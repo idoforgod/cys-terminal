@@ -1,5 +1,7 @@
 # v0.14.43 — 큐가 막혀도 이유와 처방이 보이고, 로그인을 바꾸면 옛 계정이 내려가고, 팀 만들기와 업데이트가 말을 합니다
 
+> Historical version note: the readiness defaults, caps, probe counts and caller deadlines below describe **0.14.43**. They are not current configuration instructions. Starting with 0.14.57, use the policy and environment-variable rules in [USER-MANUAL.md §4.4 and §16](../USER-MANUAL.md): a department-count budget, elapsed-time waiting, and timeout preservation. The historical measurements below are retained unchanged.
+
 다섯 갈래를 한 판에 묶었습니다. 한 문장으로 줄이면 이렇습니다 —
 **좌석 큐가 몇 시간 막혀도 아무도 몰랐던 것을 화면 알림·처방 코드·사유 파일로 드러냈고(입력 추천이 떠 있을 때 빈 입력줄의 Esc 한 번이 큐를 멈춰 세우던 결함도 고쳤고),
 다른 계정으로 다시 로그인하면 옛 계정이 주 계정과 한도 경보에 남던 것을 정리했고(별명·`● 사용 중`·오래됨·숨기기), 「팀 직접 만들기」가 경과와 단계를 말하게 했고,

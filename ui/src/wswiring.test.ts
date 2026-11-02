@@ -103,6 +103,9 @@ describe("복원 배선 — 체인의 모든 대기에 시간 상한이 있다",
     // 300ms 데몬 대기 프로브: rpcT 로 감싸지 않는 대신 claimFlight 재진입 가드로 동시 1건을
     // 보장하고, 대기가 어떤 경로로 풀리든 stop() 이 인터벌을 회수한다(무계 적체 없음).
     'const call = invoke("daemon_status");',
+    // A70: the watcher bounds only the view wait, retains native ownership until settlement,
+    // and reports pending instead of failure. Behavioral tests execute both horizons.
+    'watchDeptOperation(launchName, "launch", () => invoke("launch_dept_daemon", { name: launchName })',
     // ★G1(2026-09-17 10라운드): 복원 루프의 묘비 정리는 **await 하지 않는다**(HEAD 의미론). 상한이
     // 필요한 이유는 '복원 체인이 그 호출을 기다리기 때문'인데 여기서는 기다리지 않으므로 화면·예산에
     // 어떤 지연도 얹지 않는다(=다른 방식으로 유계다). 기다리는 판이 되살아나면 아래 G1 핀이 red 다.

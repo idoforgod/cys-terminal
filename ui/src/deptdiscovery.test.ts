@@ -119,4 +119,50 @@ describe("A61 department discovery", () => {
     await r.discover(); expect(r.calls).toEqual([]); expect(r.rows()).toEqual([]);
   });
 
+  it("A70: the startup view deadline is pending, not a launch failure", async () => {
+    const a=src.indexOf("  const deptWsList = workspaces.filter");
+    const b=src.indexOf("  // 무음 생략 금지",a);
+    const deps={restoreLaunchDecision,sameSocket,deptLaunchName,
+      rpcT:async(p:Promise<unknown>,ms:number)=>{if(ms===2)return p;throw Error("rpc timeout")},
+      invoke:async(name:string)=>{if(name==="daemon_status") throw Error("offline");return new Promise(()=>{})},
+      T_STATUS:2,T_LAUNCH:1,daemonIdentOf:()=>({}),startHaltedByReset:()=>false,
+      watchDeptOperation:async(_name:string,_kind:string,start:()=>Promise<unknown>)=>{void start();return {state:"pending"}},
+      applyDeptLaunchInfo:()=>{}};
+    const f=new Function(...Object.keys(deps),tr.transformSync(`async function run(){
+      let workspaces=[{id:1,name:"Sales",tree:null,socket:${JSON.stringify(socket)}}];
+      const ghosts=new Set(); const registered=new Set([${JSON.stringify(socket)}]);
+      const regDepts={sales:{socket:${JSON.stringify(socket)}}}; const deptTombs=new Set();
+      const restoreDeadline=Infinity; const identBySock=new Map(); const info={};
+      let budgetLaunch=0; let tombReapErrCount=0; let launched=0; let cappedLaunch=0; let unnamedLaunch=0;
+      let tombUnknownLaunch=0; let failedLaunch=0; let pendingLaunch=0; let firstLaunchErr=null; const MAX_DEPT_LAUNCH_PER_START=2;
+      ${src.slice(a,b)}
+      return {failedLaunch,pendingLaunch};
+    }`)+"return run;")(...Object.values(deps));
+    expect(await f()).toEqual({failedLaunch:0,pendingLaunch:1});
+  });
+
+  it("A70: late launch updates only its still-open tab and never resurrects a removed object", () => {
+    const rows:any[]=[]; const slugs=new Map(); let rendered=0;
+    const deps={workspaces:rows, socketForSlug:slugs, renderWsTabs:()=>{rendered++}};
+    const api=new Function(...Object.keys(deps),`let factoryResetting=false;let resetCompleted=false;${tr.transformSync(fn("applyDeptLaunchInfo"))};return {apply:applyDeptLaunchInfo,reset:()=>{resetCompleted=true}}`)(...Object.values(deps));
+    const ws:any={id:1,name:"Sales",socket:"old",tree:null,stopFailed:true,autoCreated:true};
+    rows.push(ws);api.apply(ws,{socket:"new",socket_slug:"slug"},true);
+    expect(ws.socket).toBe("new");expect(ws.stopFailed).toBeUndefined();expect(ws.autoCreated).toBeUndefined();expect(rendered).toBe(1);
+    rows.length=0;api.apply(ws,{socket:"removed"});expect(ws.socket).toBe("new");expect(rows).toEqual([]);
+    rows.push(ws);ws.deleting=true;api.apply(ws,{socket:"deleting"});expect(ws.socket).toBe("new");
+    ws.deleting=false;api.reset();api.apply(ws,{socket:"reset"});expect(ws.socket).toBe("new");expect(rendered).toBe(1);
+  });
+
+  it("A70: pending native operation remains a reset gate input after the UI walk returns", async () => {
+    const deps={bootGateClosed:async()=>false,deptOperations:{busy:()=>true}};
+    const f=new Function(...Object.keys(deps),`let startRestoringSince=null;let rotatingDaemon=false;let purgingDept=false;let factoryResetting=false;let resetCompleted=false;${tr.transformSync(fn("resetGateInput"))};return resetGateInput;`)(...Object.values(deps));
+    expect((await f()).busy).toBe(true);
+  });
+  it("A70: pending native operation blocks purge before any preview or destructive RPC", async () => {
+    const calls:string[]=[];
+    const deps={daemonActionBlocked:()=>false,deptOperations:{busy:()=>true},toast:()=>{},stickyToast:()=>{},dismissToast:()=>{},invoke:async(name:string)=>{calls.push(name);throw Error("no real backend")}};
+    const f=new Function(...Object.keys(deps),tr.transformSync(fn("purgeDept"))+";return purgeDept;")(...Object.values(deps));
+    await f({socket:"fixture"});expect(calls).toEqual([]);
+  });
+
 });

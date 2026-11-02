@@ -277,6 +277,7 @@ import {
 import { armDeferredPaneFocus, modalLayerOpen, feedbackOverlayOpen } from "./modalguard";
 import { mountFeedbackButton, openFeedbackModal, type FeedbackFacts } from "./feedbackmodal";
 import { activityExpiryMs, applyDotPaint, deadReason, HIDDEN_DOT, projectActivity, RoleActivityStore } from "./roleactivity"; // ★F-01 역할 점 활동 표시(순수 판정·바뀐 것만 칠하기)
+import { DepartmentOperations, type DeptOperationOutcome, type DeptOperationView } from "./deptoperations";
 import { SurfaceListTransport, type ListArrival } from "./surfacelist"; // ★F-01 끝점별 소유 원 호출 · 응답별 독립 투영
 
 declare global {
@@ -327,7 +328,7 @@ const winScaled = (ms: number): number => scaleForPlatform(ms, IS_WINDOWS);
 const T_REG = winScaled(8_000); //  넘기면: 레지스트리 미조회 — 등재 부서 탭 보장이 이번 기동엔 안 걸린다(다음 기동 재시도)
 const T_LIST = winScaled(8_000); // 넘기면: 그 소켓은 ok:false — 탭은 보존되고 이번 회차 입양만 건너뛴다
 const T_STATUS = winScaled(10_000); // 넘기면: 생존 '판정 불가' — ★재기동하지 않고 보존한다(중복 launch 폭주 차단)
-const T_LAUNCH = winScaled(60_000); // 넘기면: 그 부서는 이번 기동에 확보 실패 — 빈 탭 보존·다음 기동 재시도
+const T_LAUNCH = winScaled(60_000); // A70: view horizon only; expiry is pending, native operation remains owned and watched.
 const T_NEW = winScaled(15_000); //  넘기면: 그 탭은 빈 채로 남고 3초 틱·다음 기동이 받는다
 // ★F3(2026-09-17 8라운드): 부서 데몬 종료(`cys-dept down`) 상한. 넘기면 **종료 미확인**이므로 탭을 지우지
 // 않는다 — 탭이 곧 재시도 손잡이다(다음 기동의 복원 정리가 같은 부서를 다시 본다).
@@ -4721,6 +4722,8 @@ function renderIdleWorkspace(ws: Workspace): HTMLElement {
           const r = (await rpcT(invoke("list_depts"), T_REG)) as { depts?: Record<string, { socket?: string }> };
           return r.depts ?? {};
         });
+        if (factoryResetting || resetCompleted || purgingDept || ws.deleting || !workspaces.includes(ws))
+          throw new Error("부서 기동 보류 — 초기화·삭제 중이거나 탭이 닫혔습니다.");
         const launchName = resolved.name;
         const regQueried = resolved.regQueried;
         if (!launchName) {
@@ -4730,10 +4733,24 @@ function renderIdleWorkspace(ws: Workspace): HTMLElement {
               : `이 탭의 소켓에서 부서명을 찾지 못했습니다(소켓 규약 불일치 · 레지스트리(depts.json) 판독 실패 — 미등재가 아닙니다): ${ws.socket}`,
           );
         }
-        const r = (await invoke("launch_dept_daemon", { name: launchName })) as {
-          socket?: string;
-          socket_slug?: string;
-        };
+        const view = await watchDeptOperation(launchName, "launch", () => invoke("launch_dept_daemon", { name: launchName }),
+          (info) => {
+            applyDeptLaunchInfo(ws, info as { socket?: string; socket_slug?: string }, true);
+            if (workspaces.includes(ws) && !ws.deleting) render();
+          }, "", false, { manual: true, socket: ws.socket, onLateError: () => {
+            if (!host.isConnected || !workspaces.includes(ws) || ws.deleting) return;
+            btn.disabled = false;
+            btn.textContent = "다시 시도";
+          } });
+        if (view.state === "pending") {
+          // A second view may share startup's owner and have no settlement callback
+          // of its own. Keep this view usable; the owner still prevents a second launch.
+          btn.disabled = false;
+          btn.textContent = "진행 확인";
+          toast("feed", "부서 기동 진행 중", `${launchName}: 완료될 때까지 확인을 계속합니다.`);
+          return;
+        }
+        const r = view.value as { socket?: string; socket_slug?: string };
         if (r?.socket_slug && r?.socket) socketForSlug.set(r.socket_slug, r.socket);
         if (r?.socket) ws.socket = r.socket;
         ws.autoCreated = undefined; // 사용자가 직접 켰다 — 다음 기동부터 회차 상한 면제
@@ -5702,6 +5719,10 @@ function buildTab(ws: Workspace): HTMLElement {
   });
   close.addEventListener("click", async () => {
     const socket = ws.socket;
+    if (deptOperationBlocksClose(socket)) {
+      toast("feed", "작업 진행 중", "이 데몬의 기동·교대가 끝난 뒤 닫을 수 있습니다.");
+      return;
+    }
     // ★완전 삭제 확인(오너 2026-07-15 — 발견 불가 UX 수리): 숨은 2-click 무장 패턴을 설명형
     // 확인 다이얼로그로 교체(WKWebView confirm() 무동작 → 기존 confirmModal 재사용). 초보자가
     // "무엇이 어떻게 삭제되는지" 읽고 결정한다. pane 개별 ×(저위험)는 종전 2-click 유지.
@@ -5716,6 +5737,10 @@ function buildTab(ws: Workspace): HTMLElement {
       "삭제",
     );
     if (!ok) return;
+    if (deptOperationBlocksClose(socket)) {
+      toast("feed", "작업 진행 중", "이 데몬의 기동·교대가 끝난 뒤 닫을 수 있습니다.");
+      return;
+    }
     // ★I2(2026-09-17 13라운드 · opus 11R minor m1): '삭제 중'은 **확인 직후**에 선다.
     //   종전에는 stop 직전에야 섰는데, 회수 대상 sid 스냅샷(collectSids)은 그보다 앞에서 떠지고
     //   그 뒤 `await invoke("close_surface"…)` 루프가 sid 마다 이벤트 루프를 놓는다. 그 사이 3초 입양
@@ -5989,6 +6014,10 @@ function startGroupRename(g: GroupMeta) {
 // 멤버 ws 각각에 기존 close 로직(close_surface + 부서면 stop_dept_daemon_by_socket) 재사용 → 부서 teardown 정합 유지.
 let groupDeleteArm: number | null = null;
 async function confirmDeleteGroup(g: GroupMeta) {
+  if (workspaces.some((ws) => ws.groupId === g.id && deptOperationBlocksClose(ws.socket))) {
+    toast("feed", "작업 진행 중", "그룹 안 데몬의 기동·교대가 끝난 뒤 닫을 수 있습니다.");
+    return;
+  }
   if (groupDeleteArm !== g.id) {
     groupDeleteArm = g.id;
     setTimeout(() => {
@@ -8159,20 +8188,66 @@ interface SkewedDept {
   socket: string;
 }
 
+// A70: one native launch/rotation per department, shared by automatic and manual paths.
+const deptOperations = new DepartmentOperations();
+function watchDeptOperation<T>(
+  name: string, kind: "launch" | "rotate", launch: () => Promise<T>,
+  onLateSuccess: (value: T) => void = () => {}, appVer = "", isMain = false,
+  feedback: { manual?: boolean; socket?: string; onLateError?: (error: unknown) => void } = {},
+): Promise<DeptOperationView<T>> {
+  const blocked = () => factoryResetting || resetCompleted || purgingDept || workspaces.some((ws) =>
+    ws.deleting && (isMain ? ws.socket == null : feedback.socket ? sameSocket(ws.socket, feedback.socket) : true));
+  if (blocked()) return Promise.reject(new Error("데몬 기동·교대 보류 — 초기화 또는 삭제가 진행 중입니다."));
+  const key = isMain ? "base" : `dept:${IS_WINDOWS ? name.toLowerCase() : name}`;
+  return deptOperations.observe(key, () => {
+    // observe schedules invocation in a microtask; recheck at the actual action.
+    if (blocked()) throw new Error("데몬 기동·교대 보류 — 초기화 또는 삭제가 진행 중입니다.");
+    return launch();
+  }, T_LAUNCH, (result: DeptOperationOutcome<T>) => {
+    if (factoryResetting || resetCompleted || purgingDept) return;
+    if (result.ok) {
+      onLateSuccess(result.value);
+      const restored = (result.value as { restore_ok?: boolean } | null)?.restore_ok;
+      if (kind === "rotate" && restored === false)
+        toast("health", "부서 복원 실패", `${name}: 교대는 끝났지만 노드 복원을 확인하지 못했습니다.`);
+      else toast("feed", "부서 작업 완료", `${name}: 기다리던 ${kind === "rotate" ? "교대" : "기동"}가 완료됐습니다.`);
+    } else {
+      feedback.onLateError?.(result.error);
+      if (kind === "rotate" && rotationRefused(result.error)) noteRotationBlocked(appVer, feedback.manual === true, isMain ? "main" : "depts");
+      else toast("health", "부서 작업 실패", `${name}: ${String(result.error)}`);
+    }
+  }, isMain ? { kind: "base" } : { kind: "department", socket: feedback.socket });
+}
+function deptOperationBlocksClose(socket: string | undefined): boolean {
+  return deptOperations.blocksClose(socket, sameSocket);
+}
+function watchMainRotation(force: boolean, skipDrain: boolean, appVer = "", manual = false): Promise<DeptOperationView<unknown>> {
+  return watchDeptOperation("본부", "rotate", () => invoke("rotate_daemon", { force, skipDrain }), undefined, appVer, true, { manual });
+}
+function applyDeptLaunchInfo(ws: Workspace, info: { socket?: string; socket_slug?: string }, manual = false): void {
+  // A late response must not resurrect a closed tab or alter a completed reset.
+  if (factoryResetting || resetCompleted || !workspaces.includes(ws) || ws.deleting) return;
+  if (info.socket_slug && info.socket) socketForSlug.set(info.socket_slug, info.socket);
+  if (info.socket) ws.socket = info.socket;
+  ws.daemonEpoch = undefined; // Late launch: the next surface observation establishes the generation.
+  if (manual) { ws.autoCreated = undefined; ws.stopFailed = undefined; }
+  renderWsTabs();
+}
+
 // rotate_daemon/rotate_dept_daemon 래퍼 — force=false면 백엔드가 세션>0 시 "live_sessions:N"로 거부(=보류).
 // skipDrain: verified 재시작 경로만 true(사전 drain --verify로 저장 확인됨) — 기본 false는 plain drain(회귀 0).
-async function rotateMainDaemon(force: boolean, skipDrain = false): Promise<"ok" | "held" | "err" | "blocked"> {
+async function rotateMainDaemon(force: boolean, skipDrain = false, appVer = ""): Promise<"ok" | "held" | "err" | "blocked" | "pending"> {
   try {
-    await invoke("rotate_daemon", { force, skipDrain });
-    return "ok";
+    const view = await watchMainRotation(force, skipDrain, appVer, force);
+    return view.state === "pending" ? "pending" : "ok";
   } catch (e) {
     return rotationRefused(e) ? "blocked" : String(e).includes("live_sessions:") ? "held" : "err";
   }
 }
-async function rotateDeptDaemon(name: string, force: boolean, skipDrain = false): Promise<"ok" | "held" | "err" | "blocked"> {
+async function rotateDeptDaemon(name: string, force: boolean, skipDrain = false, appVer = "", socket?: string): Promise<"ok" | "held" | "err" | "blocked" | "pending"> {
   try {
-    await invoke("rotate_dept_daemon", { name, force, skipDrain });
-    return "ok";
+    const view = await watchDeptOperation(name, "rotate", () => invoke("rotate_dept_daemon", { name, force, skipDrain }), undefined, appVer, false, { manual: force, socket });
+    return view.state === "pending" ? "pending" : "ok";
   } catch (e) {
     return rotationRefused(e) ? "blocked" : String(e).includes("live_sessions:") ? "held" : "err";
   }
@@ -8296,9 +8371,11 @@ async function manualRotateSkewed(appVer: string, heldMain: boolean, heldDepts: 
     // R2 (codex M1 / gemini 1B): the route is latched AT THE STAGE THAT THREW. The outer catch
     // cannot tell a main refusal from a dept refusal, and R1's `heldMain ? "main" : "depts"`
     // falsely latched a healthy main whenever heldMain was true.
+    let pendingMain = false;
     if (heldMain) {
       try {
-        await invoke("rotate_daemon", { force: true, skipDrain: false });
+        const view = await watchMainRotation(true, false, appVer, true);
+        pendingMain = view.state === "pending";
       } catch (e) {
         if (rotationRefused(e)) noteRotationBlocked(appVer, true, "main");
         throw e;
@@ -8306,10 +8383,13 @@ async function manualRotateSkewed(appVer: string, heldMain: boolean, heldDepts: 
     }
     // 경미2: rotate_dept_daemon이 반환하는 restore_ok=false(교대 후 부서 노드 복원 실패)를 삼키지 않고 승격.
     let deptRestoreFailed = false;
+    const pendingDepts: string[] = [];
     for (const d of heldDepts) {
       let info: { restore_ok?: boolean };
       try {
-        info = (await invoke("rotate_dept_daemon", { name: d.name, force: true, skipDrain: false })) as { restore_ok?: boolean };
+        const view = await watchDeptOperation(d.name, "rotate", () => invoke("rotate_dept_daemon", { name: d.name, force: true, skipDrain: false }), undefined, appVer, false, { manual: true, socket: d.socket });
+        if (view.state === "pending") { pendingDepts.push(d.name); continue; }
+        info = view.value as { restore_ok?: boolean };
       } catch (e) {
         if (rotationRefused(e)) noteRotationBlocked(appVer, true, "depts");
         throw e;
@@ -8317,10 +8397,12 @@ async function manualRotateSkewed(appVer: string, heldMain: boolean, heldDepts: 
       if (info?.restore_ok === false) deptRestoreFailed = true;
     }
     dismissToast("rotate-daemon");
-    clearSkewBadge();
+    const pendingNodes = [...(pendingMain ? ["본부"] : []), ...pendingDepts];
+    if (!pendingNodes.length) clearSkewBadge();
+    if (pendingNodes.length) toast("feed", "데몬 교대 진행 중", `${pendingNodes.join(", ")}: 작업은 계속 확인하며, 다른 부서는 먼저 진행했습니다.`);
     if (deptRestoreFailed)
-      toast("health", "⚠ 교대 후 부서 복원 실패", `데몬은 v${appVer}로 교대됐으나 일부 부서 노드 복원이 실패했습니다 — 상태를 점검하세요.`);
-    else toast("watchdog", "✅ 데몬 교대 완료", `데몬이 v${appVer}로 교대됐습니다. 노드 복원이 진행됩니다.`);
+      toast("health", "⚠ 교대 후 부서 복원 실패", `완료된 부서 교대 중 일부 노드 복원을 확인하지 못했습니다 — 상태를 점검하세요.`);
+    else if (!pendingNodes.length) toast("watchdog", "✅ 데몬 교대 완료", `데몬이 v${appVer}로 교대됐습니다. 노드 복원이 진행됩니다.`);
   } catch (e) {
     dismissToast("rotate-daemon");
     if (rotationRefused(e)) {
@@ -8407,12 +8489,14 @@ async function liveDeptRoster(): Promise<{ names: string[]; sockets: Record<stri
   return { names, sockets };
 }
 
-async function restartAllDaemons(skipDrain: boolean, roster?: { names: string[]; sockets: Record<string, string> }, appVer_of_restart = ""): Promise<{ failedDepts: string[]; deptRestoreFailed: boolean }> {
+async function restartAllDaemons(skipDrain: boolean, roster?: { names: string[]; sockets: Record<string, string> }, appVer_of_restart = ""): Promise<{ failedDepts: string[]; pendingDepts: string[]; pendingMain: boolean; deptRestoreFailed: boolean }> {
   // R2 1A (gemini): R1 deleted the latch from manualRestartAllDaemons's catch and added none
   // here, so a rotate refusal AFTER a passing pre-probe latched nothing, showed no toast and
   // was retried on the next tick. The measured R1 sequence was ["main","first","main","first"].
+  let pendingMain = false;
   try {
-    await invoke("rotate_daemon", { force: true, skipDrain });
+    const view = await watchMainRotation(true, skipDrain, appVer_of_restart, true);
+    pendingMain = view.state === "pending";
   } catch (e) {
     if (rotationRefused(e)) noteRotationBlocked(appVer_of_restart, true, "main");
     throw e;
@@ -8422,24 +8506,29 @@ async function restartAllDaemons(skipDrain: boolean, roster?: { names: string[];
   const live = roster ?? (await liveDeptRoster());
   let deptRestoreFailed = false;
   const failedDepts: string[] = [];
+  const pendingDepts: string[] = [];
   for (const name of live.names) {
     try {
-      const info = (await invoke("rotate_dept_daemon", { name, force: true, skipDrain })) as { restore_ok?: boolean };
+      const view = await watchDeptOperation(name, "rotate", () => invoke("rotate_dept_daemon", { name, force: true, skipDrain }), undefined, appVer_of_restart, false, { manual: true, socket: live.sockets[name] });
+      if (view.state === "pending") { pendingDepts.push(name); continue; }
+      const info = view.value as { restore_ok?: boolean };
       if (info?.restore_ok === false) deptRestoreFailed = true;
     } catch (e) {
       if (rotationRefused(e)) { noteRotationBlocked(appVer_of_restart, true, "depts"); throw e; }
       failedDepts.push(name);
     }
   }
-  return { failedDepts, deptRestoreFailed };
+  return { failedDepts, pendingDepts, pendingMain, deptRestoreFailed };
 }
 
-function restartResultToast(failedDepts: string[], deptRestoreFailed: boolean) {
+function restartResultToast(failedDepts: string[], deptRestoreFailed: boolean, pendingDepts: string[] = [], pendingMain = false) {
+  const pendingNodes = [...(pendingMain ? ["본부"] : []), ...pendingDepts];
+  if (pendingNodes.length) toast("feed", "데몬 교대 진행 중", `${pendingNodes.join(", ")}: 완료될 때까지 확인을 계속합니다.`);
   if (failedDepts.length)
-    toast("health", "⚠ 일부 부서 재시작 실패", `메인 데몬은 재시작됐으나 부서 교대가 실패했습니다: ${failedDepts.join(", ")} — 상태를 점검하세요.`);
+    toast("health", "⚠ 일부 부서 재시작 실패", `${pendingMain ? "본부 교대는 아직 진행 중이며" : "메인 데몬은 재시작됐으며"} 부서 교대가 실패했습니다: ${failedDepts.join(", ")} — 상태를 점검하세요.`);
   else if (deptRestoreFailed)
-    toast("health", "⚠ 재시작 후 부서 복원 실패", "데몬은 재시작됐으나 일부 부서 노드 복원이 실패했습니다 — 상태를 점검하세요.");
-  else toast("watchdog", "✅ 데몬 재시작 완료", "데몬이 다시 시작됐습니다. 부서·노드 복원이 진행됩니다.");
+    toast("health", "⚠ 재시작 후 부서 복원 실패", "완료된 부서 교대 중 일부 노드 복원을 확인하지 못했습니다 — 상태를 점검하세요.");
+  else if (!pendingNodes.length) toast("watchdog", "✅ 데몬 재시작 완료", "데몬이 다시 시작됐습니다. 부서·노드 복원이 진행됩니다.");
 }
 
 // ── 상시 "↻ 재시작" 버튼(초보자용) — "저장 검증 후 자동 재시작" 흐름 ──
@@ -8485,9 +8574,9 @@ async function manualRestartAllDaemons() {
       const t = drainVerifyFallbackToast(fallback);
       toast("health", t.title, t.body);
       stickyToast("restart-daemon", "feed", "↻ 데몬 재시작", "저장 후 데몬을 다시 시작하는 중… 부서·노드를 자동 복원합니다.");
-      const { failedDepts, deptRestoreFailed } = await restartAllDaemons(false, roster, appVer);
+      const { failedDepts, pendingDepts, pendingMain, deptRestoreFailed } = await restartAllDaemons(false, roster, appVer);
       dismissToast("restart-daemon");
-      restartResultToast(failedDepts, deptRestoreFailed);
+      restartResultToast(failedDepts, deptRestoreFailed, pendingDepts, pendingMain);
       return;
     }
     // 2) 부분 실패면 노드별 리포트 + [그래도 재시작/취소]. green(all_saved)이면 자동 진행.
@@ -8501,13 +8590,13 @@ async function manualRestartAllDaemons() {
     }
     // 3) verified 재시작 — 사전 검증했으므로 rotate는 이중 drain 생략(skipDrain=true).
     stickyToast("restart-daemon", "feed", "↻ 데몬 재시작", "저장 검증 완료 — 데몬을 다시 시작하고 노드를 복원하는 중…");
-    const { failedDepts, deptRestoreFailed } = await restartAllDaemons(true, roster, appVer);
+    const { failedDepts, pendingDepts, pendingMain, deptRestoreFailed } = await restartAllDaemons(true, roster, appVer);
     dismissToast("restart-daemon");
     // 재시작 창 큐 보존[A3-F3]: 인메모리 미배달 push는 재시작에 유실된다 — 정직하게 고지(무음 유실 금지).
     const pendingLost = (verify?.pending_loss_warning ?? []).reduce((a, p) => a + (p.pending_undelivered || 0), 0);
     if (pendingLost > 0)
       toast("health", "미배달 push 유실", `재시작으로 미배달 큐 ${pendingLost}건이 유실됩니다(대화 원문은 트랜스크립트로 복원).`);
-    restartResultToast(failedDepts, deptRestoreFailed);
+    restartResultToast(failedDepts, deptRestoreFailed, pendingDepts, pendingMain);
   } catch (e) {
     dismissToast("restart-daemon");
     if (!rotationRefused(e)) toast("health", "데몬 재시작 실패", String(e));
@@ -8552,24 +8641,24 @@ async function checkVersionSkew() {
     // clearSkewBadge() wipes the retry badge the user needs to click.
     if (mainSkew && rotationIsBlocked(appVer, "main")) heldMain = true;
     if (mainSkew && !rotationIsBlocked(appVer, "main")) {
-      const r = await rotateMainDaemon(false);
+      const r = await rotateMainDaemon(false, false, appVer);
       if (r === "blocked") {
         noteRotationBlocked(appVer, false, "main");
         heldMain = true;
         holdDepts(heldDepts, skewedDepts);
-      } else if (r === "held" || r === "err") heldMain = true;
+      } else if (r === "held" || r === "err" || r === "pending") heldMain = true;
     }
     if (rotationIsBlocked(appVer, "depts")) holdDepts(heldDepts, skewedDepts);
     if (!rotationIsBlocked(appVer, "depts")) {
       for (let index = 0; index < skewedDepts.length; index++) {
         const d = skewedDepts[index];
-        const r = await rotateDeptDaemon(d.name, false);
+        const r = await rotateDeptDaemon(d.name, false, false, appVer, d.socket);
         if (r === "blocked") {
           noteRotationBlocked(appVer, false, "depts");
           holdDepts(heldDepts, skewedDepts.slice(index));
           break;
         }
-        if (r === "held" || r === "err") holdDepts(heldDepts, [d]);
+        if (r === "held" || r === "err" || r === "pending") holdDepts(heldDepts, [d]);
       }
     }
   } finally {
@@ -9304,6 +9393,10 @@ async function purgeDept(ws: Workspace) {
   if (!socket) return;
   // ★[F3] 데몬 교대(restart)·완전 초기화가 진행/완료 상태면 같은 부서 데몬 경합을 피해 거부·안내.
   if (daemonActionBlocked()) return;
+  if (deptOperations.busy()) {
+    toast("feed", "작업 진행 중", "데몬 기동·교대가 아직 진행 중입니다 — 완료를 확인한 뒤 삭제할 수 있습니다.");
+    return;
+  }
   let info: {
     name?: string;
     size_bytes?: number;
@@ -9337,7 +9430,7 @@ async function purgeDept(ws: Workspace) {
   if (!ok) return;
   // ★[F3-R TOCTOU] 진입 가드는 모달 '전'이라, 부서명 타이핑 모달이 열려 있던 수초간 checkVersionSkew
   // 타이머/수동 restart가 rotatingDaemon을 잡았을 수 있다. 모달 확인 직후·집행 직전에 재확인한다.
-  if (rotatingDaemon) {
+  if (rotatingDaemon || deptOperations.busy()) {
     toast("feed", "작업 진행 중", "데몬 재시작이 진행 중입니다 — 잠시 후 다시 시도하세요.");
     return;
   }
@@ -9492,7 +9585,7 @@ async function factoryResetFlow() {
   const ok = await factoryResetConfirmModal(preview);
   if (!ok) return;
   // TOCTOU 재확인(purgeDept와 동일 근거): 모달이 열려 있던 동안 restart/purge가 시작됐을 수 있다.
-  if (rotatingDaemon || purgingDept) {
+  if (rotatingDaemon || purgingDept || deptOperations.busy()) {
     toast("feed", "작업 진행 중", "데몬 재시작 또는 부서 삭제가 진행 중입니다 — 잠시 후 다시 시도하세요.");
     return;
   }
@@ -9691,7 +9784,7 @@ async function resetGateInput(): Promise<ResetGateInput> {
   return {
     uiRestoringMs: startRestoringSince === null ? null : Date.now() - startRestoringSince,
     bootGateClosed: bootGate,
-    busy: rotatingDaemon || purgingDept,
+    busy: rotatingDaemon || purgingDept || deptOperations.busy(),
     resetting: factoryResetting,
     resetDone: resetCompleted,
   };
@@ -10673,6 +10766,7 @@ async function start() {
   let unnamedLaunch = 0; // ★K2-05: 소켓·레지스트리 어디서도 부서명을 못 구함(표시명으로는 켜지 않는다)
   let tombUnknownLaunch = 0; // ★D2: 묘비 미조회(fail-closed) — 죽은 부서의 자동 launch 를 보류(탭은 그대로 둔다)
   let tombReapErrCount = 0; // ★G1: 묘비 부서 잔존 데몬 정리 실패 건수 — 토스트는 sticky id 하나로 **화면에 1개**
+  let pendingLaunch = 0; // A70: UI horizon expired; original launch remains owned and watched.
   let failedLaunch = 0; // ★C4-b: launch 자체가 실패(cys-dept 비0 · 타임아웃) — 탭은 보존, 사유는 아래 토스트 1회
   let firstLaunchErr: string | null = null; // 첫 실패 사유만(스팸 금지 · 같은 원인이면 한 줄로 충분하다)
   const deptWsList = workspaces.filter((w) => w.socket);
@@ -10791,7 +10885,10 @@ async function start() {
     }
     launched += 1;
     try {
-      const info = (await rpcT(invoke("launch_dept_daemon", { name: launchName }), T_LAUNCH)) as { socket: string; socket_slug?: string };
+      const view = await watchDeptOperation(launchName, "launch", () => invoke("launch_dept_daemon", { name: launchName }),
+        (info) => applyDeptLaunchInfo(ws, info as { socket?: string; socket_slug?: string }), "", false, { socket: ws.socket });
+      if (view.state === "pending") { pendingLaunch += 1; continue; }
+      const info = view.value as { socket: string; socket_slug?: string };
       if (info.socket_slug && info.socket) socketForSlug.set(info.socket_slug, info.socket);
       if (info.socket) ws.socket = info.socket; // 재-launch된 실제 socket 반영(이후 집계·prune·병합 정합)
       // ★U2: 방금 띄운 데몬 — 기동 시각은 지금(빈 역할 칸 보류 대상), 세대는 모름(생존 판정 + 역할 충돌 검사로 본다).
@@ -10847,6 +10944,7 @@ async function start() {
       `삭제 기록(묘비)을 읽지 못해, 지운 부서가 되살아나는 것을 막으려고 이번에는 부서 탭을 새로 만들지 않았고 꺼져 있던 부서 ${tombUnknownLaunch}곳도 자동으로 켜지 않았습니다. 탭과 저장된 창 배치는 **그대로 두었습니다**(생존 검사 실패가 곧 사망은 아니라, 살아 있는 창을 잃지 않으려고 보존합니다). 이번 기동에서 자동으로 다시 시도하지는 않습니다 — 앱을 다시 켜거나, 그 부서가 필요 없으면 탭을 닫으세요.`,
     );
   }
+  if (pendingLaunch > 0) toast("feed", "부서 기동 진행 중", `${pendingLaunch}곳은 아직 기동 중입니다. 탭을 보존하고 완료될 때까지 확인합니다.`);
   if (failedLaunch > 0) {
     // ★C4-b: 자동 복원의 launch 실패 사유를 한 번만 말한다(종전 무음). 탭은 보존됐고 [지금 켜기] 로 재시도할 수 있다.
     const why = (firstLaunchErr ?? "").slice(0, 400);
