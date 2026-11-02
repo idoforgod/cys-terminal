@@ -1184,7 +1184,7 @@ class HookCacheIdentity(_HookEnv):
     def test_surface_role_env_is_an_output_not_an_identity(self):
         """★G6: `CYS_SURFACE_ROLE` 한 줄로 **절대 deny 집합**이 열리지 않는다.
 
-        `CronCreate`/`Task`/`WebSearch` 는 §1-1 이 "TTL 승인으로도 열리지 않는다" 고 못박은
+        `CronCreate`/`TaskOutput`/`WebSearch` 는 §1-1 이 "TTL 승인으로도 열리지 않는다" 고 못박은
         집합이다. 종전 게이트만 `CYS_SURFACE_ROLE` 을 폴백 **1순위**로 써서
         `CYS_SURFACE_ROLE=master CYS_ROLE=cso` 가 그 집합을 열었다 — 자매 두 층
         (`javis_role.py:636` · `_lib.sh:678`)이 검체로 금지한 경로다.
