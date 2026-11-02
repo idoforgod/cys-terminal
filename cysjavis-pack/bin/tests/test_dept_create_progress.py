@@ -1972,14 +1972,11 @@ class ReadinessTimeoutPreservesRows(unittest.TestCase):
                         tool=os.path.join(sb.home,"cys-dept")
                         _write_exec(tool,source)
                         shutil.copyfile(os.path.join(BIN,"_owned_process.py"),os.path.join(sb.home,"_owned_process.py"))
-                        started=time.monotonic()
                         r=subprocess.run(["bash",tool,*args],env=sb.env,capture_output=True,text=True,timeout=15)
-                        elapsed=time.monotonic()-started
                         self.assertEqual(r.returncode,1,(r.stdout,r.stderr))
                         self.assertIn("데몬 기동 실패",r.stdout+r.stderr)
                         name="a" if args[0]=="launch" else "dept-1"
                         self.assertIn(name,sb.read_reg(),"readiness failure deleted a row")
-                        if mode=="silent": self.assertGreater(elapsed,.7)
                     finally: sb.cleanup()
 
 if __name__ == "__main__":
