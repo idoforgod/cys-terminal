@@ -461,6 +461,12 @@ describe("P8 r2 — 리뷰 반례 1: 자동 저장 col(master,cso) · 옛 master
     expect(t).not.toEqual(BAD);
     expect(inLeft(t, 3) && inLeft(t, 2)).toBe(true);
     close(H(t, 3), HEAD_COL_MASTER);
+    // additional-counterexamples.jsonl 1행의 old — 31f87878 의 출력과 글자 그대로 같다
+    expect(t).toEqual({
+      type: "split", dir: "row", ratio: 0.3333333333333333,
+      a: { type: "split", dir: "col", ratio: 0.75, a: { type: "pane", sid: 3, role: "master" }, b: { type: "pane", sid: 2, role: "cso" } },
+      b: { type: "pane", sid: 1, role: "master" },
+    });
   });
   it("adoptSeat: 같은 결과 · 구멍 없음", () => {
     const plan = adoptSeat([{ tree: saved() }], undefined, 3, "master", mapRole(role)) as NonNullable<ReturnType<typeof adoptSeat>>;
