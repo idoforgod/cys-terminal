@@ -3146,28 +3146,371 @@ fn _tombs_from_value(v: &serde_json::Value) -> std::collections::HashSet<String>
         .unwrap_or_default()
 }
 
-/// ★W2/P0-3: 세대 스냅샷(~/.cys/state-generations/<gen>/topology.json)의 최신 tombstones 폴백.
-/// 손상 topology 복구용 — best-effort(스냅샷 부재/없음=빈 집합).
-fn tombstones_from_latest_generation() -> std::collections::HashSet<String> {
-    let root = cys::home_dir().join(".cys").join("state-generations");
-    let mut gens: Vec<String> = match std::fs::read_dir(&root) {
+/// Python `ntpath.normcase` on the paths this reader compares, plus the `\\?\` form `canonicalize` gives on Windows. No-op elsewhere.
+/// Pure, so the Windows rule is testable on every host.
+fn normcase_path(s: &str, windows: bool) -> String {
+    if !windows {
+        return s.to_string();
+    }
+    let t = s.replace('/', "\\");
+    let t = match (t.strip_prefix(r"\\?\UNC\"), t.strip_prefix(r"\\?\")) {
+        (Some(rest), _) => format!(r"\\{rest}"),
+        (None, Some(rest)) => rest.to_string(),
+        (None, None) => t,
+    };
+    t.to_lowercase()
+}
+
+/// Which file a manifest `source` names, as `_lane_topology_in_generation` in javis_phoenix.py compares it: real path, then
+/// normcase. Only the directory is resolved: this lane's topology.json has just been renamed away, so the file itself is absent.
+fn lane_file_key(path: &std::path::Path) -> String {
+    let resolved = match (path.parent(), path.file_name()) {
+        (Some(dir), Some(name)) => std::fs::canonicalize(dir).map(|d| d.join(name)).unwrap_or_else(|_| path.to_path_buf()),
+        _ => path.to_path_buf(),
+    };
+    normcase_path(&resolved.to_string_lossy(), cfg!(windows))
+}
+
+/// Comparison form of a path for the excluded tree: on macOS the volume does not tell case apart.
+fn boundary_key(path: &std::path::Path) -> String {
+    let s = normcase_path(&path.to_string_lossy(), cfg!(windows));
+    if cfg!(target_os = "macos") { s.to_lowercase() } else { s }
+}
+
+/// `<home>/Desktop/CYSjavis` and below are not looked at, the same rule as `_capture_refused` in javis_state_snapshot.py. The path is walked
+/// from the front, string compare first, and only components outside the tree are lstat-ed; a link is read, never followed. Not walking
+/// inside is required: a sweep over that tree materialises it.
+fn in_excluded_tree(path: &std::path::Path, home: &std::path::Path) -> bool {
+    use std::path::{Component, Path, PathBuf};
+    fn lexical(p: &Path) -> PathBuf {
+        let mut out = PathBuf::new();
+        for c in p.components() {
+            match c {
+                Component::ParentDir => {
+                    out.pop();
+                }
+                Component::CurDir => {}
+                other => out.push(other.as_os_str()),
+            }
+        }
+        out
+    }
+    let desktop = home.join("Desktop");
+    let real = std::fs::canonicalize(&desktop).unwrap_or_else(|_| desktop.clone());
+    let trees = [boundary_key(&real.join("CYSjavis")), boundary_key(&desktop.join("CYSjavis"))];
+    let inside = |p: &Path| {
+        let c = boundary_key(p);
+        trees.iter().any(|t| c == *t || c.starts_with(&format!("{t}{}", std::path::MAIN_SEPARATOR)))
+    };
+    let mut cur = lexical(path);
+    'hops: for _ in 0..32 {
+        let parts: Vec<Component<'_>> = cur.components().collect();
+        let mut at = PathBuf::new();
+        for (i, comp) in parts.iter().enumerate() {
+            at.push(comp.as_os_str());
+            if inside(&at) {
+                return true;
+            }
+            if std::fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink()) {
+                let Ok(target) = std::fs::read_link(&at) else { return true };
+                let mut next = lexical(&at.parent().unwrap_or(Path::new("")).join(target));
+                parts[i + 1..].iter().for_each(|c| next.push(c.as_os_str()));
+                cur = next;
+                continue 'hops;
+            }
+        }
+        return false;
+    }
+    true // a chain of links this long is not judged: the safe side
+}
+
+/// SF_DATALESS: the file's content is not on this machine, and opening it would fetch it. The only detector, never `blocks == 0`.
+const SF_DATALESS: u32 = 0x4000_0000;
+const IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES: std::os::raw::c_int = 3;
+const IOPOL_SCOPE_THREAD: std::os::raw::c_int = 1;
+const IOPOL_MATERIALIZE_DATALESS_FILES_OFF: std::os::raw::c_int = 1;
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn getiopolicy_np(iotype: std::os::raw::c_int, scope: std::os::raw::c_int) -> std::os::raw::c_int;
+    fn setiopolicy_np(iotype: std::os::raw::c_int, scope: std::os::raw::c_int, policy: std::os::raw::c_int) -> std::os::raw::c_int;
+}
+
+/// This thread's no-materialization policy. Off macOS there is none.
+fn thread_iopolicy() -> i32 {
+    #[cfg(target_os = "macos")]
+    // SAFETY: two integer arguments, no pointers, and it touches only the calling thread's policy word.
+    return unsafe { getiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD) };
+    #[cfg(not(target_os = "macos"))]
+    -1
+}
+
+fn set_thread_iopolicy(policy: i32) -> i32 {
+    #[cfg(target_os = "macos")]
+    // SAFETY: as `thread_iopolicy`.
+    return unsafe { setiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD, policy) };
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = policy;
+        -1
+    }
+}
+
+fn flags_are_dataless(flags: u32) -> bool {
+    flags & SF_DATALESS != 0
+}
+
+fn metadata_is_dataless(meta: &std::fs::Metadata) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::macos::fs::MetadataExt;
+        flags_are_dataless(meta.st_flags())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = meta;
+        false
+    }
+}
+
+/// What the lane read depends on outside itself, so a specimen can stand in for the kernel and record the order of calls.
+struct LaneReadEnv<'a> {
+    darwin: bool,
+    get_policy: fn() -> i32,
+    set_policy: fn(i32) -> i32,
+    is_dataless: fn(&std::fs::Metadata) -> bool,
+    trace: Option<&'a std::sync::Mutex<Vec<String>>>,
+}
+
+impl LaneReadEnv<'_> {
+    fn live() -> Self {
+        LaneReadEnv {
+            darwin: cfg!(target_os = "macos"),
+            get_policy: thread_iopolicy,
+            set_policy: set_thread_iopolicy,
+            is_dataless: metadata_is_dataless,
+            trace: None,
+        }
+    }
+
+    fn note(&self, what: &str) {
+        if let Some(t) = self.trace {
+            t.lock().unwrap().push(what.to_string());
+        }
+    }
+
+    /// Set the policy on this thread and read it back. A set that reports success is not enough.
+    fn no_materialization(&self) -> bool {
+        self.note("policy");
+        (self.get_policy)() == IOPOL_MATERIALIZE_DATALESS_FILES_OFF
+            || ((self.set_policy)(IOPOL_MATERIALIZE_DATALESS_FILES_OFF) == 0
+                && (self.get_policy)() == IOPOL_MATERIALIZE_DATALESS_FILES_OFF)
+    }
+
+    /// The one way this reader opens a file, the same order as `safe_open` in javis_state_snapshot.py: stat, open, fstat before the
+    /// first byte. A flagged file is an error here, and each caller gives that its ordinary code. The flag can change between the stat
+    /// and the open, which is why the policy is set first: then the open or the read fails instead of fetching.
+    fn read_guarded(&self, path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+        use std::io::Read;
+        let flagged = || std::io::Error::other("SF_DATALESS, not read");
+        self.note("stat");
+        if (self.is_dataless)(&std::fs::metadata(path)?) {
+            return Err(flagged());
+        }
+        self.note("open");
+        let mut f = std::fs::File::open(path)?;
+        if (self.is_dataless)(&f.metadata()?) {
+            return Err(flagged());
+        }
+        self.note("read");
+        let mut bytes = Vec::new();
+        f.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
+}
+
+// What one lane read of the generations came to. The same strings as `_LANE_READ` in javis_phoenix.py. An empty result alone does
+// not say which check fired; the code does.
+const LANE_FOUND: &str = "found"; // this lane's copy, with tombstones
+const LANE_EMPTY: &str = "lane_empty"; // this lane's copy, and its set is legitimately empty
+const LANE_ABSENT: &str = "lane_absent"; // the manifest does not list this lane: a lane with no snapshot
+const LANE_MISMATCH: &str = "lane_mismatch"; // a row found, and its stored key is not the live key: the signature of mis-addressing
+const GENERATION_ABSENT: &str = "generation_absent"; // no generation at all
+const MANIFEST_UNREADABLE: &str = "manifest_unreadable"; // no manifest, or one that cannot be read: nothing says whose file is whose
+const MANIFEST_UNDATED: &str = "manifest_undated"; // its created_at does not name this generation
+const STORED_MISSING: &str = "stored_missing"; // the row's stored file is not there
+const MANIFEST_INTEGRITY: &str = "manifest_integrity"; // the stored file does not match its row
+const COPY_UNREADABLE: &str = "copy_unreadable"; // bytes that match the row are not a topology with a tombstones list
+const STORE_REFUSED: &str = "store_refused"; // the store, a generation, a manifest or a copy reaches the excluded tree
+const STORE_UNREADABLE: &str = "store_unreadable"; // the store exists and cannot be listed: not the same fact as generation_absent
+const DATALESS_POLICY_UNSET: &str = "dataless_policy_unset"; // the no-materialization policy could not be set: nothing was read
+
+/// One lane read: the tombstones, the code for the conclusion (the newest generation's code when nothing was usable), the generation
+/// that answered, and how many generations it passed over, per code.
+struct LaneRead {
+    tombstones: std::collections::HashSet<String>,
+    reason: &'static str,
+    generation: Option<String>,
+    passed_over: std::collections::BTreeMap<&'static str, u64>,
+}
+
+/// This lane's topology in one generation. A generation holds one copy per lane under a content-addressed name, so the identity is
+/// the manifest's `source`, never the file name. The old guard depended on nothing; this lookup depends on the manifest being right.
+/// So a manifest that is absent, unreadable or undated, or a stored file that does not match its row, is refused with its own code,
+/// and there is no way down to a lane-less name. Staleness is measured per row: `stored_as` exists and its sha256 and size match,
+/// never against a clock, since a recent manifest can have lost its files. `created_at` must name this generation, which is two
+/// records compared, not a clock.
+/// The lane key has two halves: `live` is the running socket's state dir, the stored key is the row's `source`. A prefixed file name
+/// carries the first 8 of sha256(source), so a row and a file name can disagree about whose bytes these are. That is a mismatch, and
+/// it is refused: reading the stored half alone returns a well-attributed set to the wrong caller.
+fn lane_topology_in_generation(
+    gen_dir: &std::path::Path,
+    home: &std::path::Path,
+    live: &std::path::Path,
+    want: &str,
+    env: &LaneReadEnv<'_>,
+) -> Result<serde_json::Value, &'static str> {
+    use sha2::{Digest, Sha256};
+    if in_excluded_tree(gen_dir, home) || in_excluded_tree(&gen_dir.join("manifest.json"), home) {
+        return Err(STORE_REFUSED);
+    }
+    let name_tag = |path: &str| format!("{:x}", Sha256::digest(path.as_bytes()))[..8].to_string();
+    let stored_name = |row: &serde_json::Value| {
+        row["stored_as"].as_str().and_then(|s| std::path::Path::new(s).file_name()).and_then(|n| n.to_str()).map(String::from)
+    };
+    let manifest = env.read_guarded(&gen_dir.join("manifest.json")).ok();
+    let v = manifest.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()).ok_or(MANIFEST_UNREADABLE)?;
+    let files = v["files"].as_array().ok_or(MANIFEST_UNREADABLE)?;
+    let stamp = v["created_at"]
+        .as_f64()
+        .and_then(|c| chrono::DateTime::from_timestamp(c.floor() as i64, 0))
+        .map(|d| d.format("%Y%m%dT%H%M%SZ").to_string());
+    let stem = gen_dir.file_name().and_then(|n| n.to_str()).and_then(|n| n.get(..16));
+    if stamp.is_none() || stamp.as_deref() != stem {
+        return Err(MANIFEST_UNDATED);
+    }
+    let row = files
+        .iter()
+        .find(|e| {
+            e["source"].as_str().is_some_and(|src| {
+                let src = std::path::Path::new(src);
+                src.file_name().is_some_and(|n| n == "topology.json") && !in_excluded_tree(src, home) && lane_file_key(src) == want
+            })
+        })
+        .ok_or_else(|| {
+            let live_file = format!("{}__topology.json", name_tag(&live.to_string_lossy()));
+            if files.iter().any(|e| stored_name(e).as_deref() == Some(live_file.as_str())) { LANE_MISMATCH } else { LANE_ABSENT }
+        })?;
+    let name = stored_name(row).ok_or(STORED_MISSING)?;
+    if name.split_once("__").is_some_and(|(tag, _)| tag != name_tag(row["source"].as_str().unwrap_or_default())) {
+        return Err(LANE_MISMATCH);
+    }
+    if in_excluded_tree(&gen_dir.join(&name), home) {
+        return Err(STORE_REFUSED);
+    }
+    let bytes = env.read_guarded(&gen_dir.join(&name)).map_err(|_| STORED_MISSING)?;
+    if row["size"].as_u64() != Some(bytes.len() as u64)
+        || row["sha256"].as_str() != Some(format!("{:x}", Sha256::digest(&bytes)).as_str())
+    {
+        return Err(MANIFEST_INTEGRITY);
+    }
+    serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .filter(|t| t["tombstones"].is_array())
+        .ok_or(COPY_UNREADABLE)
+}
+
+/// ★W2/P0-3 (0.14.57 P0): the tombstones of THIS lane in its newest usable generation, for a corrupt topology.json at boot. The one
+/// lane read, the same rule as `_read_lane_topology` in javis_phoenix.py. The lane is the parent of `source` against the socket's
+/// state dir, never a project root. A lookup without it returns another lane's set, which this daemon would seed and persist as its
+/// own, and that can stop a live seat resurrecting. Newest first; a generation with nothing usable for this lane falls back to an
+/// older one, which passes the same checks.
+fn tombstones_from_latest_generation(socket_path: &std::path::Path) -> LaneRead {
+    let home = cys::home_dir();
+    tombstones_from_generations(&home.join(".cys").join("state-generations"), &home, socket_path)
+}
+
+fn tombstones_from_generations(root: &std::path::Path, home: &std::path::Path, socket_path: &std::path::Path) -> LaneRead {
+    lane_read_on_its_own_thread(root, home, socket_path, &LaneReadEnv::live())
+}
+
+/// On macOS the read runs on a thread of its own, and the policy is set on that thread, before anything is stat-ed or opened. It ends with
+/// the thread, so the boot thread, the daemon's other threads and its seats are not touched: process scope is inherited by children
+/// (measured), and a daemon's children are its seats. A refusal is a result, not an error: the seed stays empty and the boot goes on.
+fn lane_read_on_its_own_thread(
+    root: &std::path::Path,
+    home: &std::path::Path,
+    socket_path: &std::path::Path,
+    env: &LaneReadEnv<'_>,
+) -> LaneRead {
+    let refused = || LaneRead {
+        tombstones: std::collections::HashSet::new(),
+        reason: DATALESS_POLICY_UNSET,
+        generation: None,
+        passed_over: [(DATALESS_POLICY_UNSET, 1)].into_iter().collect(),
+    };
+    if !env.darwin {
+        return lane_read(root, home, socket_path, env);
+    }
+    std::thread::scope(|scope| {
+        let reader = std::thread::Builder::new().name("lane-read".into()).spawn_scoped(scope, || {
+            if env.no_materialization() {
+                lane_read(root, home, socket_path, env)
+            } else {
+                refused()
+            }
+        });
+        match reader {
+            Ok(handle) => handle.join().unwrap_or_else(|_| refused()),
+            Err(_) => refused(),
+        }
+    })
+}
+
+fn lane_read(root: &std::path::Path, home: &std::path::Path, socket_path: &std::path::Path, env: &LaneReadEnv<'_>) -> LaneRead {
+    let live = crate::state::state_dir(socket_path).join("topology.json");
+    let want = lane_file_key(&live);
+    let mut read = LaneRead {
+        tombstones: std::collections::HashSet::new(),
+        reason: GENERATION_ABSENT,
+        generation: None,
+        passed_over: std::collections::BTreeMap::new(),
+    };
+    if in_excluded_tree(root, home) {
+        read.reason = STORE_REFUSED;
+        read.passed_over.insert(STORE_REFUSED, 1);
+        return read;
+    }
+    let mut gens: Vec<String> = match std::fs::read_dir(root) {
         Ok(rd) => rd
             .flatten()
             .filter_map(|e| e.file_name().into_string().ok())
             .filter(|n| n.len() >= 16 && n.as_bytes()[8] == b'T')
             .collect(),
-        Err(_) => return std::collections::HashSet::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return read,
+        Err(_) => {
+            read.reason = STORE_UNREADABLE;
+            return read;
+        }
     };
     gens.sort();
-    for g in gens.iter().rev() {
-        let p = root.join(g).join("topology.json");
-        if let Ok(s) = std::fs::read_to_string(&p) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
-                return _tombs_from_value(&v);
+    for (i, g) in gens.iter().rev().enumerate() {
+        match lane_topology_in_generation(&root.join(g), home, &live, &want, env) {
+            Ok(v) => {
+                read.tombstones = _tombs_from_value(&v);
+                read.reason = if read.tombstones.is_empty() { LANE_EMPTY } else { LANE_FOUND };
+                read.generation = Some(g.clone());
+                return read;
+            }
+            Err(refusal) => {
+                if i == 0 {
+                    read.reason = refusal;
+                }
+                *read.passed_over.entry(refusal).or_default() += 1;
             }
         }
     }
-    std::collections::HashSet::new()
+    read
 }
 
 /// ★W2/P0-3: topology.json에서 묘비 집합을 읽는다(데몬 기동 시 in-메모리 tombstones seed용).
@@ -3245,13 +3588,16 @@ pub fn load_tombstones_from_disk(socket_path: &std::path::Path) -> std::collecti
             let ts = now_epoch() as u64;
             let corrupt = dir.join(format!("topology.json.corrupt-{ts}"));
             let _ = std::fs::rename(&p, &corrupt);
-            let recovered = tombstones_from_latest_generation();
+            let recovered = tombstones_from_latest_generation(socket_path);
             eprintln!(
-                "[cysd] ★P0-3 topology.json 손상({e}) — {} isolate + 세대 스냅샷 tombstones 폴백({}개 복구)",
+                "[cysd] ★P0-3 topology.json 손상({e}) — {} isolate + 세대 스냅샷 tombstones 폴백({}개 복구 · reason={} generation={} passed_over={})",
                 corrupt.display(),
-                recovered.len()
+                recovered.tombstones.len(),
+                recovered.reason,
+                recovered.generation.as_deref().unwrap_or("-"),
+                json!(recovered.passed_over)
             );
-            recovered
+            recovered.tombstones
         }
     }
 }
@@ -27492,6 +27838,884 @@ mod tests {
             .any(|e| e.file_name().to_string_lossy().starts_with("topology.json.corrupt-"));
         assert!(corrupt_isolated, "손상 topology 가 .corrupt-* 로 isolate 되지 않음(조용한 소실)");
         assert!(!dir.join("topology.json").exists(), "손상 원본이 isolate 안 되고 그대로 남음");
+    }
+
+    // ─────────── 0.14.57 P0: the generation reader is addressed by lane, through the manifest ───────────
+    // P0-RED-BEGIN: everything down to P0-RED-END goes through interfaces the pre-fix tree has, so it compiles and runs there.
+
+    /// One lane in a generation fixture: its state dir and the stored bytes.
+    struct P0Lane<'a> {
+        state: &'a std::path::Path,
+        body: String,
+    }
+
+    /// Stop the process unless each axis is inside the rig: HOME, cwd, TMPDIR, the socket's parent, the state dir, the generation store
+    /// the daemon reads, and no other socket or state variable. One assert each, so a failure names its axis. Before any operation.
+    fn p0_assert_sealed(rig: &std::path::Path) {
+        let rig = rig.canonicalize().unwrap();
+        let within = |axis: &str, p: &std::path::Path| {
+            let mut at = p.to_path_buf();
+            while !at.exists() && at.pop() {}
+            let real = at.canonicalize().unwrap();
+            assert!(real.starts_with(&rig), "{axis} {} is outside the rig {}", p.display(), rig.display());
+        };
+        within("HOME", &cys::home_dir());
+        within("cwd", &std::env::current_dir().unwrap());
+        within("TMPDIR", &std::env::temp_dir());
+        let socket = cys::socket_path();
+        within("CYS_SOCKET parent", socket.parent().unwrap());
+        within("state dir", &crate::state::state_dir(&socket));
+        within("generation store", &cys::home_dir().join(".cys").join("state-generations"));
+        within("XDG_STATE_HOME", std::path::Path::new(&std::env::var("XDG_STATE_HOME").unwrap()));
+        for (k, _) in std::env::vars() {
+            let state_var = (k.starts_with("CYS_") && k != "CYS_SOCKET") || k.starts_with("JAVIS_") || k.starts_with("AITERM_") || k == "CLAUDE_CONFIG_DIR";
+            assert!(!state_var, "{k} is set: it can reach a lane outside the rig");
+        }
+    }
+
+    fn p0_scratch(tag: &str) -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if let Ok(rig) = std::env::var("P0_RIG") {
+            p0_assert_sealed(std::path::Path::new(&rig));
+        }
+        let n = SEQ.fetch_add(1, AtomicOrdering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("cys-p0-{tag}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A child test with every axis sealed to the rig: HOME, cwd, TMPDIR and CYS_SOCKET set, every other socket or state variable removed.
+    #[cfg(unix)]
+    fn p0_sealed_child(rig: &std::path::Path, socket: &std::path::Path, cwd: &std::path::Path, args: &[&str]) -> std::process::Command {
+        use crate::state::HideConsole;
+        let tmp = rig.join("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        for (k, _) in std::env::vars() {
+            if k.starts_with("CYS_") || k.starts_with("JAVIS_") || k.starts_with("AITERM_") || k == "CLAUDE_CONFIG_DIR" {
+                child.env_remove(k);
+            }
+        }
+        child.args(args).current_dir(cwd).env("HOME", rig).env("TMPDIR", &tmp).env("CYS_SOCKET", socket).env("XDG_STATE_HOME", rig.join(".local").join("state")).env("P0_RIG", rig).hide_console();
+        child
+    }
+
+    fn p0_lane_dir(tmp: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let d = tmp.join(name);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn p0_body(roles: &[String]) -> String {
+        serde_json::to_string(&json!({"schema_version": 1, "tombstones_rev": 75, "entries": [], "tombstones": roles})).unwrap()
+    }
+
+    fn p0_roles(prefix: &str, n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("{prefix}-{i:02}")).collect()
+    }
+
+    fn p0_sha(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    /// The name do_snapshot stores a lane's copy under: the first 8 of the sha of the source path.
+    fn p0_stored(state: &std::path::Path) -> String {
+        format!("{}__topology.json", &p0_sha(state.join("topology.json").to_string_lossy().as_bytes())[..8])
+    }
+
+    /// A generation in the layout javis_state_snapshot writes: `<sha8>__topology.json` per lane, a row each in manifest.json.
+    fn p0_generation(root: &std::path::Path, name: &str, lanes: &[P0Lane<'_>]) -> std::path::PathBuf {
+        let g = root.join(name);
+        std::fs::create_dir_all(&g).unwrap();
+        let mut files = vec![];
+        for l in lanes {
+            std::fs::write(g.join(p0_stored(l.state)), &l.body).unwrap();
+            files.push(json!({"source": l.state.join("topology.json"), "stored_as": p0_stored(l.state),
+                              "sha256": p0_sha(l.body.as_bytes()), "size": l.body.len()}));
+        }
+        let at = chrono::NaiveDateTime::parse_from_str(&name[..16], "%Y%m%dT%H%M%SZ").unwrap().and_utc().timestamp();
+        let m = json!({"created_at": at as f64 + 0.25, "generator": "javis_state_snapshot.py", "files": files});
+        std::fs::write(g.join("manifest.json"), m.to_string()).unwrap();
+        g
+    }
+
+    /// The child half of the boot test: a real process with a real HOME and CYS_SOCKET. Does nothing in a plain run.
+    #[test]
+    fn p0_boot_child() {
+        let Ok(out) = std::env::var("P0_BOOT_OUT") else { return };
+        p0_assert_sealed(std::path::Path::new(&std::env::var("P0_RIG").unwrap()));
+        let socket = cys::socket_path();
+        let dir = crate::state::state_dir(&socket);
+        let mut seeded: Vec<String> = Vec::new();
+        let (mut baseline, mut rev) = (0, 0);
+        if std::env::var("P0_BOOT_LOAD_ONLY").is_ok() {
+            seeded = load_tombstones_from_disk(&socket).into_iter().collect();
+        } else {
+            let daemon = Daemon::new(socket.clone());
+            seeded.extend(daemon.tombstones.lock().unwrap().iter().cloned());
+            baseline = daemon.last_persisted_tombstones.lock().unwrap().len();
+            rev = daemon.tombstones_rev.load(AtomicOrdering::SeqCst);
+            persist_topology(&daemon);
+        }
+        seeded.sort();
+        let isolates = std::fs::read_dir(&dir).unwrap().flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("topology.json.corrupt-")).count();
+        let persisted: serde_json::Value = std::fs::read_to_string(dir.join("topology.json")).ok()
+            .and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(json!(null));
+        std::fs::write(out, json!({"seeded": seeded, "baseline": baseline, "rev": rev, "isolates": isolates, "persisted": persisted}).to_string()).unwrap();
+    }
+
+    /// Run the boot child with this rig, this CYS_SOCKET and this working directory; the socket and the cwd name different lanes on purpose.
+    #[cfg(unix)]
+    fn p0_run_child(rig: &std::path::Path, socket: &std::path::Path, cwd: &std::path::Path, load_only: bool) -> serde_json::Value {
+        let out = rig.join(format!("child-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&out);
+        let mut child = p0_sealed_child(rig, socket, cwd, &["--exact", "governance::tests::p0_boot_child"]);
+        child.env("P0_BOOT_OUT", &out).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        if load_only {
+            child.env("P0_BOOT_LOAD_ONLY", "1");
+        }
+        assert!(child.status().unwrap().success(), "the child test failed, or an axis is outside the rig");
+        serde_json::from_str(&std::fs::read_to_string(&out).expect("the child test ran")).unwrap()
+    }
+
+    /// SEEN RED on the pre-fix tree: its `load_tombstones_from_disk` reads a bare name that a real generation does not have, so the set
+    /// comes back empty. Corrupt topology.json, a real-layout generation of three lanes, HOME and CYS_SOCKET set, the working directory
+    /// in another lane. Both ways round, so a reader that took the working directory or any other lane fails whichever it picked.
+    /// This is also BINDING case 3: cwd != socket resolves by socket.
+    #[cfg(unix)]
+    #[test]
+    fn p0_red_a_corrupt_topology_loads_the_lanes_known_set_from_its_generation() {
+        let home = p0_scratch("red");
+        let state = home.join(".local").join("state");
+        let (a, b, base) = (p0_lane_dir(&state, "cys-dept-dept-5"), p0_lane_dir(&state, "cys-dept-dept-6"), p0_lane_dir(&state, "cys"));
+        let root = home.join(".cys").join("state-generations");
+        // The marker exists in this rig's store and nowhere else: coming back, it shows which store was read.
+        let mut set_a = p0_roles("worker", 28);
+        set_a.push(format!("zz-rig-only-{}", std::process::id()));
+        let set_b = p0_roles("other", 1);
+        p0_generation(&root, "20261101T104113Z", &[
+            P0Lane { state: &base, body: p0_body(&[]) },
+            P0Lane { state: &a, body: p0_body(&set_a) },
+            P0Lane { state: &b, body: p0_body(&set_b) },
+        ]);
+        for (lane, other, want) in [(&a, &b, &set_a), (&b, &a, &set_b)] {
+            std::fs::write(lane.join("topology.json"), "{ torn").unwrap();
+            let got = p0_run_child(&home, &lane.join("cys.sock"), other, true);
+            assert_eq!(got["seeded"], json!(want), "lane {} from a cwd in {}", lane.display(), other.display());
+        }
+    }
+
+    /// Boot end to end through `Daemon::new`. The first load isolates the corrupt file and recovers the set, the second reads absent,
+    /// and that second result must seed only `last_persisted_tombstones`: that difference makes the first persist write the set at rev 1.
+    #[cfg(unix)]
+    #[test]
+    fn p0_boot_on_a_corrupt_topology_seeds_the_lane_set_and_the_first_persist_carries_it() {
+        let home = p0_scratch("boot");
+        let state = home.join(".local").join("state");
+        let (me, other) = (p0_lane_dir(&state, "cys-dept-dept-5"), p0_lane_dir(&state, "cys-dept-dept-6"));
+        let root = home.join(".cys").join("state-generations");
+        let mut roles = p0_roles("worker", 28);
+        roles.push(format!("zz-rig-only-{}", std::process::id()));
+        p0_generation(&root, "20261101T104113Z", &[
+            P0Lane { state: &other, body: p0_body(&p0_roles("foreign", 1)) },
+            P0Lane { state: &me, body: p0_body(&roles) },
+        ]);
+        std::fs::write(me.join("topology.json"), "{ torn").unwrap();
+        let socket = me.join("cys.sock");
+
+        let got = p0_run_child(&home, &socket, &other, false);
+        assert_eq!(got["seeded"], json!(roles), "the boot seeds the lane's set");
+        assert_eq!(got["baseline"], json!(0), "the second load read an absent file");
+        assert_eq!(got["rev"], json!(0), "rev seeds from the absent file");
+        assert_eq!(got["isolates"], json!(1), "the second load must not isolate anything");
+        assert_eq!(got["persisted"]["tombstones"], json!(roles), "the first persist carries the set");
+        assert_eq!(got["persisted"]["tombstones_rev"], json!(1));
+        assert_eq!(got["persisted"]["schema_version"], json!(1));
+
+        let next = p0_run_child(&home, &socket, &other, false);
+        assert_eq!(next["seeded"], json!(roles), "the next boot reads it back");
+        assert_eq!(next["rev"], json!(1));
+    }
+
+    /// What one read said, through the interface both trees have: `load_tombstones_from_disk` in a sealed child, with its boot line kept.
+    #[cfg(unix)]
+    struct P0Said {
+        seeded: serde_json::Value,
+        reason: Option<String>,
+        line: String,
+    }
+
+    /// One corrupt-boot read of `lane`, with the working directory in `other`. `p0_sealed_child` sets each axis and the child asserts each
+    /// by name in `p0_assert_sealed`; the isolate path on the line shows the state dir that was used. The reason is looked for only after
+    /// the recovered count, because the rig path and the parse error come before it and neither may supply one.
+    #[cfg(unix)]
+    fn p0_said(rig: &std::path::Path, lane: &std::path::Path, other: &std::path::Path) -> P0Said {
+        std::fs::write(lane.join("topology.json"), "{ torn").unwrap();
+        let out = rig.join("said.json");
+        let _ = std::fs::remove_file(&out);
+        let mut child = p0_sealed_child(rig, &lane.join("cys.sock"), other, &["--exact", "governance::tests::p0_boot_child", "--nocapture"]);
+        let run = child.env("P0_BOOT_OUT", &out).env("P0_BOOT_LOAD_ONLY", "1").output().unwrap();
+        let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
+        assert!(run.status.success(), "the child test failed, or an axis is outside the rig: {stderr}");
+        let got: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&out).expect("the child test ran")).unwrap();
+        let lines: Vec<&str> = stderr.lines().filter(|l| l.starts_with("[cysd] ★P0-3 topology.json")).collect();
+        assert_eq!(lines.len(), 1, "one read, one boot line: {stderr}");
+        let line = lines[0].to_string();
+        assert!(line.contains(lane.join("topology.json.corrupt-").to_str().unwrap()), "state dir: the isolate is not in this lane: {line}");
+        let after_count = line.rsplit_once("개 복구").expect("the recovered count").1;
+        let reason = after_count.split_whitespace().find_map(|w| w.strip_prefix("reason=")).filter(|r| !r.is_empty()).map(String::from);
+        P0Said { seeded: got["seeded"].clone(), reason, line }
+    }
+
+    /// Each read both tests compare, in one rig. The first is the control: this reader finds the rig-only set in this store, so a refusal
+    /// below cannot be a read that looked nowhere, and the generation holds that set under its stored name and under the bare name, so a
+    /// reader that ignores the manifest takes it and the refusal cannot be for lack of anything to read.
+    #[cfg(unix)]
+    struct P0Reads {
+        found: P0Said,
+        truncated: P0Said,
+        garbage: P0Said,
+        lane_empty: P0Said,
+        lane_unlisted: P0Said,
+        store_empty: P0Said,
+        store_absent: P0Said,
+    }
+
+    #[cfg(unix)]
+    fn p0_reads(tag: &str) -> P0Reads {
+        let rig = p0_scratch(tag);
+        let state = rig.join(".local").join("state");
+        let (me, other) = (p0_lane_dir(&state, "cys-dept-dept-5"), p0_lane_dir(&state, "cys-dept-dept-6"));
+        let root = rig.join(".cys").join("state-generations");
+        let name = "20261101T104113Z";
+        let mut roles = p0_roles("worker", 3);
+        roles.push(format!("zz-rig-only-{}", std::process::id()));
+
+        let g = p0_generation(&root, name, &[P0Lane { state: &me, body: p0_body(&roles) }]);
+        std::fs::write(g.join("topology.json"), p0_body(&roles)).unwrap();
+        let found = p0_said(&rig, &me, &other);
+        assert_eq!(found.seeded, json!(roles), "the control: {}", found.line);
+
+        let whole = std::fs::read(g.join("manifest.json")).unwrap();
+        let cut = whole[..whole.len() / 2].to_vec();
+        let junk = b"\xff\xfe not a manifest".to_vec();
+        for bytes in [&cut, &junk] {
+            assert!(serde_json::from_slice::<serde_json::Value>(bytes).is_err(), "the fixture must not parse");
+        }
+        std::fs::write(g.join("manifest.json"), &cut).unwrap();
+        let truncated = p0_said(&rig, &me, &other);
+        std::fs::write(g.join("manifest.json"), &junk).unwrap();
+        let garbage = p0_said(&rig, &me, &other);
+
+        std::fs::remove_dir_all(&root).unwrap();
+        p0_generation(&root, name, &[P0Lane { state: &me, body: p0_body(&[]) }]);
+        let lane_empty = p0_said(&rig, &me, &other);
+
+        std::fs::remove_dir_all(&root).unwrap();
+        p0_generation(&root, name, &[P0Lane { state: &other, body: p0_body(&p0_roles("foreign", 2)) }]);
+        let lane_unlisted = p0_said(&rig, &me, &other);
+
+        std::fs::remove_dir_all(&root).unwrap();
+        let stray = root.join("not-a-generation");
+        std::fs::create_dir_all(&stray).unwrap();
+        std::fs::write(stray.join("topology.json"), p0_body(&roles)).unwrap();
+        let store_empty = p0_said(&rig, &me, &other);
+
+        std::fs::remove_dir_all(&root).unwrap();
+        let store_absent = p0_said(&rig, &me, &other);
+        P0Reads { found, truncated, garbage, lane_empty, lane_unlisted, store_empty, store_absent }
+    }
+
+    /// Refused means nothing came back, named means the read stated a reason, and a reason names something only if the other states say
+    /// something else: a word printed for every state would pass a presence check.
+    #[cfg(unix)]
+    fn p0_assert_refused_and_named(case: &str, said: &P0Said, others: &[&P0Said]) {
+        assert!(said.seeded == json!([]) && said.reason.is_some(), "{case}: seeded {}, reason {:?}: {}", said.seeded, said.reason, said.line);
+        for other in others {
+            assert_ne!(said.reason, other.reason, "{case} and another state say the same thing: {} | {}", said.line, other.line);
+        }
+    }
+
+    /// No generation: the store holds none, or there is no store. Both are one fact, so they state one reason.
+    #[cfg(unix)]
+    #[test]
+    fn p0_red_no_generation_is_refused_and_named() {
+        let r = p0_reads("nogen");
+        let others = [&r.found, &r.lane_empty, &r.lane_unlisted, &r.truncated, &r.garbage];
+        p0_assert_refused_and_named("store with no generation", &r.store_empty, &others);
+        p0_assert_refused_and_named("no store", &r.store_absent, &others);
+        assert_eq!(r.store_empty.reason, r.store_absent.reason, "one fact, one reason");
+    }
+
+    /// A manifest that exists and cannot be parsed, truncated or garbage. Without it nothing says whose file is whose, so the lane's copy
+    /// beside it stays unread.
+    #[cfg(unix)]
+    #[test]
+    fn p0_red_an_unparsable_manifest_is_refused_and_named() {
+        let r = p0_reads("garbled");
+        let others = [&r.found, &r.lane_empty, &r.lane_unlisted, &r.store_empty, &r.store_absent];
+        p0_assert_refused_and_named("truncated manifest", &r.truncated, &others);
+        p0_assert_refused_and_named("garbage manifest", &r.garbage, &others);
+        assert_eq!(r.truncated.reason, r.garbage.reason, "one fact, one reason");
+    }
+
+    // P0-RED-END: the tests below read the conclusion, which the pre-fix tree does not have.
+
+    use super::{COPY_UNREADABLE, DATALESS_POLICY_UNSET, GENERATION_ABSENT, LANE_ABSENT, LANE_EMPTY, LANE_FOUND, LANE_MISMATCH, MANIFEST_INTEGRITY,
+                MANIFEST_UNDATED, MANIFEST_UNREADABLE, STORED_MISSING, STORE_REFUSED, STORE_UNREADABLE};
+
+    /// The read with a HOME that has no excluded tree in it: these specimens are about the lane, the next ones about the tree.
+    fn tombstones_from_generations(root: &std::path::Path, socket: &std::path::Path) -> super::LaneRead {
+        super::tombstones_from_generations(root, root.parent().unwrap(), socket)
+    }
+
+    fn p0_sorted(set: std::collections::HashSet<String>) -> Vec<String> {
+        let mut v: Vec<String> = set.into_iter().collect();
+        v.sort();
+        v
+    }
+
+    /// Replace a lane's stored bytes and its row together, so the row still matches.
+    fn p0_rewrite_copy(g: &std::path::Path, state: &std::path::Path, body: &str) {
+        std::fs::write(g.join(p0_stored(state)), body).unwrap();
+        p0_edit_manifest(g, |m| {
+            let row = m["files"].as_array_mut().unwrap().iter_mut()
+                .find(|e| e["stored_as"] == json!(p0_stored(state))).unwrap();
+            row["sha256"] = json!(p0_sha(body.as_bytes()));
+            row["size"] = json!(body.len());
+        });
+    }
+
+    fn p0_edit_manifest(g: &std::path::Path, edit: impl FnOnce(&mut serde_json::Value)) {
+        let p = g.join("manifest.json");
+        let mut m: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        edit(&mut m);
+        std::fs::write(p, m.to_string()).unwrap();
+    }
+
+    /// Every read specimen again, in a process with HOME, cwd, TMPDIR and CYS_SOCKET sealed to a rig. A plain run passes the read an
+    /// absolute root and socket and reads neither HOME nor cwd; this run shows the same specimens with those axes asserted in `p0_scratch`.
+    #[cfg(unix)]
+    #[test]
+    fn p0_every_read_specimen_under_a_sealed_process() {
+        if std::env::var("P0_RIG").is_ok() {
+            return;
+        }
+        let rig = p0_scratch("sealed");
+        let lane = p0_lane_dir(&rig, "cys-dept-dept-5");
+        let cwd = p0_lane_dir(&rig, "cys-dept-dept-6");
+        let got = p0_sealed_child(&rig, &lane.join("cys.sock"), &cwd, &["governance::tests::p0_", "--skip", "p0_boot", "--skip", "p0_red"])
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&got.stdout);
+        let passed = text.lines().find(|l| l.starts_with("test result:")).and_then(|l| l.split_whitespace().nth(3)?.parse::<u32>().ok());
+        assert!(got.status.success() && passed.is_some_and(|n| n >= 13), "{text}");
+    }
+
+    /// CEO's positive control, each run: a known set in a named lane, and a planted file raises the count from 0.
+    #[test]
+    fn p0_positive_control_a_planted_copy_raises_the_count_from_zero() {
+        let tmp = p0_scratch("positive");
+        let lane = p0_lane_dir(&tmp, "cys-dept-dept-5");
+        let root = tmp.join("gen");
+        let socket = lane.join("cys.sock");
+        let before = tombstones_from_generations(&root, &socket);
+        assert_eq!((before.tombstones.len(), before.reason), (0, GENERATION_ABSENT), "before planting");
+        let roles = p0_roles("worker", 29);
+        p0_generation(&root, "20261101T104113Z", &[P0Lane { state: &lane, body: p0_body(&roles) }]);
+        let after = tombstones_from_generations(&root, &socket);
+        assert_eq!(after.reason, LANE_FOUND);
+        assert_eq!(after.generation.as_deref(), Some("20261101T104113Z"));
+        assert_eq!(p0_sorted(after.tombstones), roles, "after planting");
+    }
+
+    /// Fails on a key-only reader: the two foreign lanes come first and last and hold sets of their own. A named lane reads its known
+    /// set in the same run, and a lane with no row refuses with its own code, so the empty result is shown to be the right one.
+    #[test]
+    fn p0_wrong_lane_a_generation_of_three_lanes_gives_only_this_lanes_set() {
+        let tmp = p0_scratch("wronglane");
+        let (a, me, c) = (p0_lane_dir(&tmp, "cys"), p0_lane_dir(&tmp, "cys-dept-dept-5"), p0_lane_dir(&tmp, "cys-dept-dept-6"));
+        let stranger = p0_lane_dir(&tmp, "cys-dept-dept-7");
+        let root = tmp.join("gen");
+        let mine = p0_roles("mine", 3);
+        p0_generation(&root, "20261101T104113Z", &[
+            P0Lane { state: &a, body: p0_body(&p0_roles("foreign-a", 2)) },
+            P0Lane { state: &me, body: p0_body(&mine) },
+            P0Lane { state: &c, body: p0_body(&p0_roles("foreign-c", 1)) },
+        ]);
+        assert_eq!(p0_sorted(tombstones_from_generations(&root, &me.join("cys.sock")).tombstones), mine, "the known set");
+        let refused = tombstones_from_generations(&root, &stranger.join("cys.sock"));
+        assert!(refused.tombstones.is_empty(), "a foreign lane's set leaked: {:?}", refused.tombstones);
+        assert_eq!(refused.reason, LANE_ABSENT, "empty for the wrong reason");
+        assert_eq!(refused.passed_over.get(LANE_ABSENT), Some(&1));
+    }
+
+    /// The codes: each fires in its own well-formed state, and they are distinct. Absent and legitimately empty are both an empty set,
+    /// so only the code tells them apart.
+    #[test]
+    fn p0_each_reason_code_fires_in_its_own_state() {
+        let codes = [LANE_FOUND, LANE_EMPTY, LANE_ABSENT, LANE_MISMATCH, GENERATION_ABSENT, MANIFEST_UNREADABLE, MANIFEST_UNDATED,
+                     STORED_MISSING, MANIFEST_INTEGRITY, COPY_UNREADABLE, STORE_REFUSED, STORE_UNREADABLE, DATALESS_POLICY_UNSET];
+        assert_eq!(codes.iter().collect::<std::collections::BTreeSet<_>>().len(), codes.len(), "two states share a code");
+        // The same strings as `_LANE_READ` in javis_phoenix.py. Phoenix is on another branch, so the strings themselves are pinned here.
+        assert_eq!(codes, ["found", "lane_empty", "lane_absent", "lane_mismatch", "generation_absent", "manifest_unreadable", "manifest_undated",
+                           "stored_missing", "manifest_integrity", "copy_unreadable", "store_refused", "store_unreadable", "dataless_policy_unset"]);
+        let tmp = p0_scratch("codes");
+        let (me, other) = (p0_lane_dir(&tmp, "cys-dept-dept-5"), p0_lane_dir(&tmp, "cys-dept-dept-6"));
+        let socket = me.join("cys.sock");
+        let reason = |root: &std::path::Path| {
+            let r = tombstones_from_generations(root, &socket);
+            assert!(r.tombstones.is_empty(), "{:?}", r.tombstones);
+            r.reason
+        };
+        let mine = || vec![P0Lane { state: &me, body: p0_body(&p0_roles("mine", 2)) }];
+        let name = "20261101T000000Z";
+
+        assert_eq!(reason(&tmp.join("no-such-root")), GENERATION_ABSENT, "no root");
+        let root = tmp.join("empty-root");
+        std::fs::create_dir_all(&root).unwrap();
+        assert_eq!(reason(&root), GENERATION_ABSENT, "a root with no generation");
+
+        let root = tmp.join("absent");
+        p0_generation(&root, name, &[P0Lane { state: &other, body: p0_body(&p0_roles("foreign", 3)) }]);
+        assert_eq!(reason(&root), LANE_ABSENT);
+
+        let root = tmp.join("empty");
+        p0_generation(&root, name, &[P0Lane { state: &me, body: p0_body(&[]) }]);
+        assert_eq!(reason(&root), LANE_EMPTY);
+
+        let root = tmp.join("torn");
+        let g = p0_generation(&root, name, &mine());
+        std::fs::write(g.join("manifest.json"), "{ torn").unwrap();
+        assert_eq!(reason(&root), MANIFEST_UNREADABLE, "a torn manifest");
+        std::fs::remove_file(g.join("manifest.json")).unwrap();
+        assert_eq!(reason(&root), MANIFEST_UNREADABLE, "no manifest");
+
+        let root = tmp.join("undated");
+        let g = p0_generation(&root, name, &mine());
+        p0_edit_manifest(&g, |m| { m.as_object_mut().unwrap().remove("created_at"); });
+        assert_eq!(reason(&root), MANIFEST_UNDATED, "no created_at");
+        p0_edit_manifest(&g, |m| m["created_at"] = json!("yesterday"));
+        assert_eq!(reason(&root), MANIFEST_UNDATED, "not a number");
+        p0_edit_manifest(&g, |m| m["created_at"] = json!(1790000000.0));
+        assert_eq!(reason(&root), MANIFEST_UNDATED, "another generation's date");
+
+        let root = tmp.join("missing");
+        let g = p0_generation(&root, name, &mine());
+        std::fs::remove_file(g.join(p0_stored(&me))).unwrap();
+        assert_eq!(reason(&root), STORED_MISSING);
+
+        let root = tmp.join("sha");
+        let g = p0_generation(&root, name, &mine());
+        let body = std::fs::read_to_string(g.join(p0_stored(&me))).unwrap();
+        std::fs::write(g.join(p0_stored(&me)), body.replace("mine-00", "mine-99")).unwrap();
+        assert_eq!(reason(&root), MANIFEST_INTEGRITY, "same size, other bytes");
+        std::fs::write(g.join(p0_stored(&me)), format!("{body} ")).unwrap();
+        assert_eq!(reason(&root), MANIFEST_INTEGRITY, "one byte more");
+        std::fs::write(g.join(p0_stored(&me)), &body).unwrap();
+        p0_edit_manifest(&g, |m| { m["files"][0].as_object_mut().unwrap().remove("size"); });
+        assert_eq!(reason(&root), MANIFEST_INTEGRITY, "a row with no size");
+
+        let root = tmp.join("copy");
+        let g = p0_generation(&root, name, &mine());
+        p0_rewrite_copy(&g, &me, "{\"entries\": []}");
+        assert_eq!(reason(&root), COPY_UNREADABLE, "bytes that match their row, with no tombstones list");
+    }
+
+    /// The word each state states on the boot line, written out here and not taken from the constants. The two tests through this read
+    /// prove a different reason for a different fact, and a swap of two reasons passes them; this one fails on it. Tip only: the pre-fix
+    /// tree has no words to state, so this test cannot be seen red there.
+    #[cfg(unix)]
+    #[test]
+    fn p0_boot_line_states_each_state_by_its_word() {
+        let r = p0_reads("words");
+        for (state, said, word) in [
+            ("the control, a usable generation", &r.found, "found"),
+            ("the lane's set is empty", &r.lane_empty, "lane_empty"),
+            ("the lane is not listed", &r.lane_unlisted, "lane_absent"),
+            ("truncated manifest", &r.truncated, "manifest_unreadable"),
+            ("garbage manifest", &r.garbage, "manifest_unreadable"),
+            ("store with no generation", &r.store_empty, "generation_absent"),
+            ("no store", &r.store_absent, "generation_absent"),
+        ] {
+            assert_eq!(said.reason.as_deref(), Some(word), "{state}: {}", said.line);
+        }
+    }
+
+    /// A one-lane generation and a recording environment, with stand-ins for the kernel and no real dataless file anywhere.
+    fn p0_policy_fixture(tag: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf, Vec<String>) {
+        let tmp = p0_scratch(tag);
+        let me = p0_lane_dir(&tmp, "cys-dept-dept-5");
+        let root = tmp.join("gen");
+        let roles = p0_roles("mine", 2);
+        p0_generation(&root, "20261101T000000Z", &[P0Lane { state: &me, body: p0_body(&roles) }]);
+        (tmp, root, me.join("cys.sock"), roles)
+    }
+
+    fn p0_env<'a>(get: fn() -> i32, set: fn(i32) -> i32, trace: &'a std::sync::Mutex<Vec<String>>) -> super::LaneReadEnv<'a> {
+        super::LaneReadEnv { darwin: true, get_policy: get, set_policy: set, is_dataless: |_| false, trace: Some(trace) }
+    }
+
+    /// A fresh reader: the policy comes before the first stat and the first open. State where it fails: a reader that opens first.
+    #[test]
+    fn p0_the_policy_comes_before_the_first_stat_or_open() {
+        use std::sync::atomic::{AtomicI32, Ordering as O};
+        static VALUE: AtomicI32 = AtomicI32::new(0);
+        let (tmp, root, socket, roles) = p0_policy_fixture("policyorder");
+        let trace = std::sync::Mutex::new(vec![]);
+        let env = p0_env(|| VALUE.load(O::SeqCst), |p| { VALUE.store(p, O::SeqCst); 0 }, &trace);
+        let read = super::lane_read_on_its_own_thread(&root, &tmp, &socket, &env);
+        assert_eq!((read.reason, p0_sorted(read.tombstones)), (LANE_FOUND, roles));
+        let got = trace.into_inner().unwrap();
+        assert_eq!(got[..3], ["policy", "stat", "open"], "{got:?}");
+        assert_eq!(VALUE.load(O::SeqCst), 1, "the policy was set");
+    }
+
+    /// The policy cannot be set: nothing is stat-ed or opened, the refusal is named and counted, the seed stays empty and nothing panics.
+    /// State where it fails: a silent skip, or a read that goes on. Second case: the set reports success and the read-back disagrees.
+    #[test]
+    fn p0_a_policy_that_cannot_be_set_is_a_named_counted_refusal_and_no_open() {
+        let (tmp, root, socket, _) = p0_policy_fixture("policyfail");
+        let setters: [(&str, fn(i32) -> i32); 2] = [("the set fails", |_| -1), ("the read-back disagrees", |_| 0)];
+        for (what, set) in setters {
+            let trace = std::sync::Mutex::new(vec![]);
+            let env = p0_env(|| 2, set, &trace);
+            let read = super::lane_read_on_its_own_thread(&root, &tmp, &socket, &env);
+            assert!(read.tombstones.is_empty(), "{what}");
+            assert_eq!(read.reason, DATALESS_POLICY_UNSET, "{what}");
+            assert_eq!(read.passed_over.get(DATALESS_POLICY_UNSET), Some(&1), "{what}: counted");
+            assert_eq!(trace.into_inner().unwrap(), ["policy"], "{what}: nothing after the policy");
+        }
+    }
+
+    /// The flag is read before the open and again before the first byte. State where it fails: either check gone. The stand-in flags a
+    /// resident file; no dataless file exists here.
+    #[test]
+    fn p0_a_flagged_file_is_not_opened_and_a_file_flagged_after_the_open_is_not_read() {
+        use std::sync::atomic::{AtomicUsize, Ordering as O};
+        static CHECKS: AtomicUsize = AtomicUsize::new(0);
+        static FLAG_FROM: AtomicUsize = AtomicUsize::new(0);
+        let (tmp, root, socket, _) = p0_policy_fixture("policyflag");
+        for (from, last) in [(1, "stat"), (2, "open")] {
+            CHECKS.store(0, O::SeqCst);
+            FLAG_FROM.store(from, O::SeqCst);
+            let trace = std::sync::Mutex::new(vec![]);
+            let mut env = p0_env(|| 1, |_| 0, &trace);
+            env.is_dataless = |_| CHECKS.fetch_add(1, O::SeqCst) + 1 >= FLAG_FROM.load(O::SeqCst);
+            let read = super::lane_read_on_its_own_thread(&root, &tmp, &socket, &env);
+            assert_eq!(read.reason, MANIFEST_UNREADABLE, "flagged from check {from}");
+            let got = trace.into_inner().unwrap();
+            assert_eq!(got.last().map(String::as_str), Some(last), "{got:?}");
+            assert!(!got.iter().any(|e| e == "read"), "a byte was read: {got:?}");
+        }
+    }
+
+    #[test]
+    fn p0_the_flag_is_sf_dataless_and_nothing_else() {
+        assert!(super::flags_are_dataless(0x4000_0000));
+        assert!(super::flags_are_dataless(0x4000_0020));
+        assert!(!super::flags_are_dataless(0x0000_0020));
+        assert!(!super::flags_are_dataless(0));
+    }
+
+    /// The real kernel calls, macOS only: the policy is on inside the read and nowhere else. A thread beside the read keeps reading its own
+    /// policy, and the caller's is the same after. State where it fails: the read run on the caller's thread, or at process scope.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn p0_the_policy_is_on_for_the_read_thread_only() {
+        use std::sync::atomic::{AtomicBool, AtomicI32, Ordering as O};
+        static INSIDE: AtomicI32 = AtomicI32::new(-9);
+        let (tmp, root, socket, roles) = p0_policy_fixture("policyscope");
+        let before = super::thread_iopolicy();
+        assert_ne!(before, 1, "the test thread must start without it");
+        let (stop, beside) = (AtomicBool::new(false), AtomicI32::new(-9));
+        let read = std::thread::scope(|s| {
+            s.spawn(|| {
+                while !stop.load(O::SeqCst) {
+                    beside.fetch_max(super::thread_iopolicy(), O::SeqCst);
+                }
+            });
+            let mut env = super::LaneReadEnv::live();
+            env.is_dataless = |_| {
+                INSIDE.store(super::thread_iopolicy(), O::SeqCst);
+                false
+            };
+            let read = super::lane_read_on_its_own_thread(&root, &tmp, &socket, &env);
+            stop.store(true, O::SeqCst);
+            read
+        });
+        assert_eq!(p0_sorted(read.tombstones), roles);
+        assert_eq!(INSIDE.load(O::SeqCst), 1, "on inside the read");
+        assert_eq!(super::thread_iopolicy(), before, "the caller's thread is unchanged");
+        assert_ne!(beside.load(O::SeqCst), 1, "a thread beside the read saw it");
+    }
+
+    /// The excluded tree. Rust has no call spy, so each target sits behind a directory of mode 000: any attempted read of it would come
+    /// back permission denied and a different code. `store_refused` shows the reader stopped at the path, before touching it.
+    #[cfg(unix)]
+    #[test]
+    fn p0_the_excluded_tree_is_refused_from_the_path_before_any_read() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let home = p0_scratch("tree");
+        let me = p0_lane_dir(&home, "cys-dept-dept-5");
+        let socket = me.join("cys.sock");
+        let tree = home.join("Desktop").join("CYSjavis");
+        let root = home.join(".cys").join("state-generations");
+        let lock = |p: &std::path::Path, mode| std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+        let roles = p0_roles("mine", 2);
+        let body = p0_body(&roles);
+
+        // a linked store
+        let parked = tree.join("store");
+        p0_generation(&parked, "20261101T000000Z", &[P0Lane { state: &me, body: body.clone() }]);
+        std::fs::create_dir_all(root.parent().unwrap()).unwrap();
+        symlink(&parked, &root).unwrap();
+        lock(&parked, 0o000);
+        let read = super::tombstones_from_generations(&root, &home, &socket);
+        lock(&parked, 0o755);
+        assert_eq!((read.reason, read.tombstones.len()), (STORE_REFUSED, 0), "a linked store");
+        std::fs::remove_file(&root).unwrap();
+
+        // a linked generation, a linked manifest, a linked copy: each passed over by name, the older generation answers
+        let older = p0_roles("older", 3);
+        p0_generation(&root, "20261030T000000Z", &[P0Lane { state: &me, body: p0_body(&older) }]);
+        for (stamp, what) in [("20261101T000000Z", "generation"), ("20261102T000000Z", "manifest"), ("20261103T000000Z", "copy")] {
+            let g = p0_generation(&root, stamp, &[P0Lane { state: &me, body: body.clone() }]);
+            let (link, parked): (std::path::PathBuf, std::path::PathBuf) = match what {
+                "generation" => (g.clone(), tree.join("gen")),
+                "manifest" => (g.join("manifest.json"), tree.join("m").join("manifest.json")),
+                _ => (g.join(p0_stored(&me)), tree.join("c").join(p0_stored(&me))),
+            };
+            std::fs::create_dir_all(parked.parent().unwrap()).unwrap();
+            std::fs::rename(&link, &parked).unwrap();
+            symlink(&parked, &link).unwrap();
+            let guard = if what == "generation" { parked.clone() } else { parked.parent().unwrap().to_path_buf() };
+            lock(&guard, 0o000);
+            let read = super::tombstones_from_generations(&root, &home, &socket);
+            lock(&guard, 0o755);
+            assert_eq!(read.passed_over.get(STORE_REFUSED), Some(&1), "a linked {what}: {:?}", read.passed_over);
+            assert_eq!(read.reason, LANE_FOUND, "the older generation answered: a linked {what}");
+            assert_eq!(p0_sorted(read.tombstones), older, "a linked {what}");
+            let _ = std::fs::remove_file(&link);
+            let _ = std::fs::remove_dir_all(&g);
+        }
+
+        // a store that exists and cannot be listed is not an absent one
+        lock(&root, 0o000);
+        let read = super::tombstones_from_generations(&root, &home, &socket);
+        lock(&root, 0o755);
+        assert_eq!(read.reason, STORE_UNREADABLE);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(super::tombstones_from_generations(&root, &home, &socket).reason, GENERATION_ABSENT);
+    }
+
+    /// The tree's rule: a link chain, a case alias on macOS, a sibling sharing the prefix.
+    #[cfg(unix)]
+    #[test]
+    fn p0_the_excluded_tree_rule() {
+        let home = p0_scratch("treerule");
+        let tree = home.join("Desktop").join("CYSjavis");
+        std::fs::create_dir_all(&tree).unwrap();
+        assert!(super::in_excluded_tree(&tree.join("a"), &home), "inside");
+        assert!(!super::in_excluded_tree(&home.join("Desktop").join("CYSjavis-old").join("a"), &home), "a sibling");
+        std::os::unix::fs::symlink(&tree, home.join("one")).unwrap();
+        std::os::unix::fs::symlink(home.join("one"), home.join("two")).unwrap();
+        assert!(super::in_excluded_tree(&home.join("two").join("a"), &home), "a chain of links");
+        std::os::unix::fs::symlink("Desktop/CYSjavis", home.join("relative")).unwrap();
+        assert!(super::in_excluded_tree(&home.join("relative"), &home), "a relative link");
+        std::os::unix::fs::symlink(home.join("loop-b"), home.join("loop-a")).unwrap();
+        std::os::unix::fs::symlink(home.join("loop-a"), home.join("loop-b")).unwrap();
+        assert!(super::in_excluded_tree(&home.join("loop-a"), &home), "a link loop is not judged: refused");
+        if cfg!(target_os = "macos") {
+            assert!(super::in_excluded_tree(&home.join("desktop").join("cysjavis").join("a"), &home), "a case alias");
+        }
+    }
+
+    /// BINDING, case 1: live == stored returns the set.
+    #[test]
+    fn p0_binding_live_equal_to_stored_returns_the_set() {
+        let tmp = p0_scratch("bind1");
+        let me = p0_lane_dir(&tmp, "cys-dept-dept-5");
+        let root = tmp.join("gen");
+        let roles = p0_roles("worker", 29);
+        p0_generation(&root, "20261101T000000Z", &[P0Lane { state: &me, body: p0_body(&roles) }]);
+        let read = tombstones_from_generations(&root, &me.join("cys.sock"));
+        assert_eq!((read.reason, p0_sorted(read.tombstones)), (LANE_FOUND, roles));
+    }
+
+    /// BINDING, case 2: live != stored must refuse and never return the 29. A row filed under the caller's own name whose `source` is
+    /// another lane, and every data check passes: the bytes are good, sha and size match, the attribution is true. Only the comparison
+    /// of the two keys refuses it. Fails on a reader that takes the stored half alone.
+    #[test]
+    fn p0_binding_live_different_from_stored_refuses_and_never_returns_the_set() {
+        let tmp = p0_scratch("bind2");
+        let (caller, owner) = (p0_lane_dir(&tmp, "cys-dept-dept-6"), p0_lane_dir(&tmp, "cys-dept-dept-5"));
+        let root = tmp.join("gen");
+        let body = p0_body(&p0_roles("worker", 29));
+        let g = p0_generation(&root, "20261101T000000Z", &[P0Lane { state: &owner, body: body.clone() }]);
+        std::fs::rename(g.join(p0_stored(&owner)), g.join(p0_stored(&caller))).unwrap();
+        p0_edit_manifest(&g, |m| m["files"][0]["stored_as"] = json!(p0_stored(&caller)));
+        let read = tombstones_from_generations(&root, &caller.join("cys.sock"));
+        assert!(read.tombstones.is_empty(), "the owner's set went to the wrong caller: {} roles", read.tombstones.len());
+        assert_eq!(read.reason, LANE_MISMATCH);
+    }
+
+    /// A row that says this lane, over another lane's stored file with that file's true sha and size. Also a mismatch: the row's stored
+    /// key and the file's name name two lanes.
+    #[test]
+    fn p0_binding_a_row_pointing_at_another_lanes_file_is_refused() {
+        let tmp = p0_scratch("repoint");
+        let (me, other) = (p0_lane_dir(&tmp, "cys-dept-dept-5"), p0_lane_dir(&tmp, "cys-dept-dept-6"));
+        let root = tmp.join("gen");
+        let foreign = p0_body(&p0_roles("foreign", 3));
+        let g = p0_generation(&root, "20261101T000000Z", &[
+            P0Lane { state: &me, body: p0_body(&p0_roles("mine", 2)) },
+            P0Lane { state: &other, body: foreign.clone() },
+        ]);
+        p0_edit_manifest(&g, |m| {
+            let row = m["files"].as_array_mut().unwrap().iter_mut().find(|e| e["stored_as"] == json!(p0_stored(&me))).unwrap();
+            row["stored_as"] = json!(p0_stored(&other));
+            row["sha256"] = json!(p0_sha(foreign.as_bytes()));
+            row["size"] = json!(foreign.len());
+        });
+        let read = tombstones_from_generations(&root, &me.join("cys.sock"));
+        assert!(read.tombstones.is_empty(), "another lane's set came back: {:?}", read.tombstones);
+        assert_eq!(read.reason, LANE_MISMATCH);
+    }
+
+    /// Base and dept sockets each get their own, and names that share a prefix stay apart. Fails on a prefix or suffix match.
+    #[test]
+    fn p0_base_and_dept_sockets_each_get_their_own_set() {
+        let tmp = p0_scratch("eachown");
+        let root = tmp.join("gen");
+        let names = ["cys", "cys-dept-dept-1", "cys-dept-dept-10"];
+        let dirs: Vec<_> = names.iter().map(|n| p0_lane_dir(&tmp, n)).collect();
+        let sets: Vec<Vec<String>> = (0..3).map(|i| p0_roles(&format!("lane{i}"), i + 1)).collect();
+        let lanes: Vec<P0Lane<'_>> = (0..3).map(|i| P0Lane { state: &dirs[i], body: p0_body(&sets[i]) }).collect();
+        p0_generation(&root, "20261101T104113Z", &lanes);
+        for i in 0..3 {
+            assert_eq!(p0_sorted(tombstones_from_generations(&root, &dirs[i].join("cys.sock")).tombstones), sets[i], "{}", names[i]);
+        }
+    }
+
+    /// Each newest generation below is refused in a different way; the older copy answers, and the code says why it was passed over.
+    #[test]
+    fn p0_a_refused_newest_generation_falls_back_to_an_older_one() {
+        let older = p0_roles("older", 4);
+        type Spoil = fn(&std::path::Path, &std::path::Path, &std::path::Path);
+        let cases: [(&str, &str, Spoil); 7] = [
+            ("copy is not JSON", COPY_UNREADABLE, |g, me, _| p0_rewrite_copy(g, me, "{ torn")),
+            ("copy has no tombstones list", COPY_UNREADABLE, |g, me, _| p0_rewrite_copy(g, me, "{\"entries\": []}")),
+            ("copy is missing", STORED_MISSING, |g, me, _| std::fs::remove_file(g.join(p0_stored(me))).unwrap()),
+            ("copy does not match its row", MANIFEST_INTEGRITY, |g, me, _| std::fs::write(g.join(p0_stored(me)), "{}").unwrap()),
+            ("manifest is not JSON", MANIFEST_UNREADABLE, |g, _, _| std::fs::write(g.join("manifest.json"), "{ torn").unwrap()),
+            ("this lane's file, a row that names another lane", LANE_MISMATCH, |g, me, other| p0_edit_manifest(g, |m| {
+                let row = m["files"].as_array_mut().unwrap().iter_mut().find(|e| e["stored_as"] == json!(p0_stored(me))).unwrap();
+                row["source"] = json!(other.join("topology.json"));
+            })),
+            ("no row for this lane", LANE_ABSENT, |g, _, _| p0_edit_manifest(g, |m| m["files"] = json!([]))),
+        ];
+        for (what, code, spoil) in cases {
+            let tmp = p0_scratch("fallback");
+            let (me, other) = (p0_lane_dir(&tmp, "cys-dept-dept-5"), p0_lane_dir(&tmp, "cys-dept-dept-6"));
+            let root = tmp.join("gen");
+            p0_generation(&root, "20261031T000000Z", &[P0Lane { state: &me, body: p0_body(&older) }]);
+            let newest = p0_generation(&root, "20261101T000000Z", &[P0Lane { state: &me, body: p0_body(&p0_roles("newest", 2)) }]);
+            spoil(&newest, &me, &other);
+            let read = tombstones_from_generations(&root, &me.join("cys.sock"));
+            assert_eq!(read.reason, LANE_FOUND, "{what}");
+            assert_eq!(read.generation.as_deref(), Some("20261031T000000Z"), "{what}");
+            assert_eq!(read.passed_over.get(code), Some(&1), "{what}: {:?}", read.passed_over);
+            assert_eq!(p0_sorted(read.tombstones), older, "{what}");
+        }
+    }
+
+    /// Fails if the walk starts at the oldest: both generations are good, and the newer set is the truth.
+    #[test]
+    fn p0_two_good_generations_the_newest_answers() {
+        let tmp = p0_scratch("newest");
+        let me = p0_lane_dir(&tmp, "cys-dept-dept-5");
+        let root = tmp.join("gen");
+        let newer = p0_roles("newer", 2);
+        p0_generation(&root, "20261031T000000Z", &[P0Lane { state: &me, body: p0_body(&p0_roles("older", 4)) }]);
+        p0_generation(&root, "20261101T000000Z", &[P0Lane { state: &me, body: p0_body(&newer) }]);
+        assert_eq!(p0_sorted(tombstones_from_generations(&root, &me.join("cys.sock")).tombstones), newer);
+    }
+
+    /// A legitimately empty set is the truth, not a gap: the walk stops there, and an older set does not come back.
+    #[test]
+    fn p0_a_legitimately_empty_newest_set_stops_the_walk() {
+        let tmp = p0_scratch("emptystops");
+        let me = p0_lane_dir(&tmp, "cys-dept-dept-5");
+        let root = tmp.join("gen");
+        p0_generation(&root, "20261031T000000Z", &[P0Lane { state: &me, body: p0_body(&p0_roles("reopened", 4)) }]);
+        p0_generation(&root, "20261101T000000Z", &[P0Lane { state: &me, body: p0_body(&[]) }]);
+        let read = tombstones_from_generations(&root, &me.join("cys.sock"));
+        assert!(read.tombstones.is_empty(), "{:?}", read.tombstones);
+        assert_eq!(read.reason, LANE_EMPTY);
+    }
+
+    /// Manifest absent: a bare topology.json and a `*__topology.json` both sit in the generation, and neither is read, by any lane.
+    /// This is the path where a lane-less fallback would silently put the defect back.
+    #[test]
+    fn p0_a_generation_with_no_manifest_never_falls_back_to_a_lane_less_name() {
+        let tmp = p0_scratch("bare");
+        let me = p0_lane_dir(&tmp, "cys-dept-dept-5");
+        let root = tmp.join("gen");
+        let g = root.join("20261101T000000Z");
+        std::fs::create_dir_all(&g).unwrap();
+        std::fs::write(g.join("topology.json"), p0_body(&p0_roles("bare", 3))).unwrap();
+        std::fs::write(g.join(p0_stored(&me)), p0_body(&p0_roles("glob", 3))).unwrap();
+        let read = tombstones_from_generations(&root, &me.join("cys.sock"));
+        assert!(read.tombstones.is_empty(), "read a file nothing names: {:?}", read.tombstones);
+        assert_eq!(read.reason, MANIFEST_UNREADABLE);
+    }
+
+    /// `stored_as` is a name inside the generation: a path in it is reduced to its last part, as P4 does.
+    #[test]
+    fn p0_stored_as_stays_inside_the_generation() {
+        let tmp = p0_scratch("storedas");
+        let me = p0_lane_dir(&tmp, "cys-dept-dept-5");
+        let root = tmp.join("gen");
+        let body = p0_body(&p0_roles("outside", 1));
+        std::fs::write(tmp.join("outside.json"), &body).unwrap();
+        let g = p0_generation(&root, "20261101T000000Z", &[P0Lane { state: &me, body: body.clone() }]);
+        p0_edit_manifest(&g, |m| m["files"][0]["stored_as"] = json!("../../outside.json"));
+        let read = tombstones_from_generations(&root, &me.join("cys.sock"));
+        assert!(read.tombstones.is_empty(), "read outside the generation: {:?}", read.tombstones);
+        assert_eq!(read.reason, STORED_MISSING);
+    }
+
+    /// Fails if the comparison is on spelling alone. A manifest `source` and the state dir can differ by a link.
+    #[cfg(unix)]
+    #[test]
+    fn p0_the_lane_is_compared_by_real_path_not_spelling() {
+        let tmp = p0_scratch("link");
+        let real = p0_lane_dir(&tmp, "cys-dept-dept-5");
+        let link = tmp.join("link-to-lane");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let root = tmp.join("gen");
+        let roles = p0_roles("linked", 2);
+        p0_generation(&root, "20261101T000000Z", &[P0Lane { state: &link, body: p0_body(&roles) }]);
+        assert_eq!(p0_sorted(tombstones_from_generations(&root, &real.join("cys.sock")).tombstones), roles);
+    }
+
+    /// The Windows side of the comparison, on every host.
+    #[test]
+    fn p0_normcase_table() {
+        let windows = [
+            (r"C:\Data\Local\cys\topology.json", r"c:\data\local\cys\topology.json"),
+            ("C:/Data/Local/cys/topology.json", r"c:\data\local\cys\topology.json"),
+            (r"\\?\C:\Data\Local\cys\topology.json", r"c:\data\local\cys\topology.json"),
+            (r"\\?\UNC\Host\Share\cys\topology.json", r"\\host\share\cys\topology.json"),
+            (r"\\Host\Share\cys\topology.json", r"\\host\share\cys\topology.json"),
+        ];
+        for (raw, want) in windows {
+            assert_eq!(super::normcase_path(raw, true), want);
+        }
+        assert_eq!(super::normcase_path("/Data/Lane/topology.json", false), "/Data/Lane/topology.json", "no case fold off Windows");
     }
 
     /// ★W2/P0-3: 부재(fresh install)는 손상과 구분 — isolate 없이 빈집합(정상 부팅).
