@@ -396,6 +396,17 @@ describe("P8 — 수동 탭은 그대로", () => {
     close(W(t, 2), 0.5);
     close(H(t, 9), HEAD_COL_MASTER);
   });
+  it("master 위 / cso 아래만 있는 수동 저장 탭: 새 좌석이 와도 그 컬럼은 1/3 · cso 제자리(오늘 규칙 · 자동 재정렬이 없어 절반이 되면 안 된다)", () => {
+    for (const r of ["worker", "cso-2"]) {
+      const col: LNode = { type: "split", dir: "col", ratio: HEAD_COL_MASTER, a: { type: "pane", sid: 1, role: "master" }, b: { type: "pane", sid: 2, role: "cso" } };
+      const role = new Map<number, string | null>([[1, "master"], [2, "cso"], [3, r]]);
+      const t = placeSeat(col, 3, mapRole(role), true);
+      close(W(t, 1), MASTER_FRAC);
+      close(H(t, 1), HEAD_COL_MASTER);
+      expect(inLeft(t, 2)).toBe(true);
+      expect(inLeft(t, 3)).toBe(false);
+    }
+  });
   it("수동 탭의 cso 는 어디에 있어도 새 좌석·재배치로 움직이지 않는다", () => {
     const role = new Map<number, string | null>([[1, "master"], [2, "cso"], [3, "worker"], [5, "worker-2"]]);
     const t: LNode = { type: "split", dir: "row", ratio: 0.4, a: { type: "pane", sid: 1 }, b: { type: "split", dir: "col", ratio: 0.3, a: { type: "pane", sid: 2 }, b: { type: "pane", sid: 3 } } };
