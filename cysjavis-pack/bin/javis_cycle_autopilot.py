@@ -40,6 +40,9 @@ import sys
 import threading
 import time
 
+# SEAL-1: prevent sibling cache writes even when the caller supplies no seal.
+sys.dont_write_bytecode = True
+
 # ★Windows 즉사 차단(P0): top-level `import fcntl` 은 Windows 에 그 모듈이 없어
 #   ModuleNotFoundError 로 이 스크립트 **전체**를 불능화한다 — javis_org.py:9-22 가 같은
 #   사고를 먼저 겪고 msvcrt 폴백으로 지혈한 선례가 있다.
