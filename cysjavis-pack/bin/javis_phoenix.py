@@ -45,6 +45,7 @@ spawn(생성) 백엔드 2종:
 import argparse
 import atexit
 import glob
+import hashlib
 import json
 import locale
 import math
@@ -1116,6 +1117,19 @@ def _win_state_dir_for_socket(socket):
     return _snap_mod()._win_state_dir_for_socket(socket)
 
 
+def effective_socket(socket):
+    """★0.14.57 P4: 이 프로세스의 레인 하나 — `--socket`, 없으면 `cys` 가 고를 환경 소켓(src/lib.rs socket_path 와 같은 순서).
+    진입에서 한 번 정해 상태 경로·세대 선택·자식 명령에 같은 값을 쓴다. 종전에는 `--socket` 없이 부서 환경에서 돌면 상태 경로와
+    세대는 본부(LIVE_STATE), 자식 `cys` 는 CYS_SOCKET 의 부서로 갈라졌다. 어디에도 없으면 None = 기본 소켓 = 본부(양쪽 같다)."""
+    if socket:
+        return socket
+    for key in ("CYS_SOCKET", "JAVIS_SOCKET", "AITERM_SOCKET"):
+        value = os.environ.get(key)
+        if value:
+            return value
+    return None
+
+
 def state_dir_for(socket):
     """소켓 경로에서 데몬 상태 디렉터리를 파생. unix=소켓 부모(하네스 격리 계약과 동일) ·
     Windows=named pipe 슬러그 매핑(Rust state_dir 규칙 — 파이프엔 파일시스템 부모가 없다)."""
@@ -1468,57 +1482,145 @@ def load_desired_roster(socket):
     return {}, set()
 
 
-def _snapshot_roster_entries(socket, skipped=None):
-    """직전 세대 스냅샷(javis_state_snapshot)의 topology.json 로스터 — §12가 실증한 안전망.
-    라이브 상태 디렉터리 대상일 때만 유효(격리 하네스는 자기 topology만 씀). best-effort.
-    skipped(list)를 주면 파싱에 실패해 건너뛴 세대 이름을 거기에 덧붙인다(0.14.56 plan P7) — 반환값은 같다."""
-    if state_dir_for(socket) != LIVE_STATE:
-        return {}
-    snap = os.path.join(os.path.dirname(os.path.abspath(__file__)), "javis_state_snapshot.py")
+def _lane_file_key(state):
+    """레인 하나의 topology 경로를 비교값으로 — 실경로 뒤 normcase. source 는 HOME/LOCALAPPDATA 파생 그대로이고 상태 경로는
+    실경로다(Windows 8.3 이름·드라이브 대소문자 포함)."""
+    return os.path.normcase(os.path.realpath(os.path.join(state, "topology.json")))
+
+
+def _lane_topology_in_generation(gen_dir, state):
+    """세대 하나에서 **상태 경로 state 의 레인** topology 를 읽는다. 반환 (topology dict, None) 또는 (None, 사유).
+    do_snapshot 은 basename 이 겹치면 `<소스 경로 sha 앞 8자>__topology.json` 으로 레인마다 하나씩 담고, 겹치지 않을 때만 맨이름으로
+    담는다. 그래서 신원은 파일 이름이 아니라 manifest 의 source 다 — `*__topology.json` 글롭은 다른 레인의 로스터를 집고, 맨이름
+    `topology.json` 도 소스가 하나뿐이면 다른 레인일 수 있다(0.14.57 P4: 맨이름 조회는 734개 중 0건).
+    ★가드는 아무것에도 기대지 않았지만 이 조회는 manifest 가 옳다는 데 기댄다(0.14.57 P0 Amendment 4). 그래서 manifest 가 없거나
+    못 읽거나 날짜를 댈 수 없거나 저장 파일이 행과 어긋나면 **읽지 않고 자기 사유로 닫는다** — 레인 없는 뿌리로 내려가는 길은 없다(맨이름 조회 폐지).
+    낡음은 행마다 잰다: stored_as 가 있고 sha256·size 가 맞아야 한다(시계와 비교하지 않는다 — 최근 manifest 도 파일을 잃었을 수 있다). 날짜: created_at 이 세대
+    이름의 시각과 같아야 한다(다른 세대에서 옮겨 온 manifest 를 가른다 · 시계가 아니라 두 기록의 대조다).
+    레인 키는 두 쪽이다: 살아 있는 쪽은 소켓의 상태 경로 state, 저장된 쪽은 행의 source 다. 접두 파일 이름은 sha256(source) 앞 8자를 싣는다 — 행과 파일
+    이름이 서로 다른 레인을 말하면 lane_mismatch 로 거부한다. 저장된 쪽만 읽으면 귀속은 옳은데 받는 쪽이 틀린 묘비가 된다."""
+    snap = _snap_mod()
+    mp = os.path.join(gen_dir, "manifest.json")
+    if snap._capture_refused(gen_dir, HOME) or snap._capture_refused(mp, HOME):   # 문자열·링크만 읽는다 — 그 트리 안은 밟지 않는다
+        return None, "store_refused"
+    try:
+        with snap.safe_open(mp, encoding="utf-8") as f:
+            man = json.load(f)
+        files = list(man["files"])
+    except snap.DatalessPolicyRefused:
+        return None, snap.DATALESS_POLICY_CODE
+    except Exception:
+        return None, "manifest_unreadable"
+    created = man.get("created_at")
+    try:
+        dated = type(created) in (int, float) \
+            and time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(created)) == os.path.basename(gen_dir)[:16]
+    except (ValueError, OverflowError, OSError):
+        dated = False
+    if not dated:
+        return None, "manifest_undated"
+    want = _lane_file_key(state)
+    row = None
+    for e in files:
+        src = e.get("source") if isinstance(e, dict) else None
+        if isinstance(src, str) and os.path.basename(src) == "topology.json" and not snap._capture_refused(src, HOME) \
+                and os.path.normcase(os.path.realpath(src)) == want:
+            row = e
+            break
+    tag = lambda p: hashlib.sha256(p.encode("utf-8")).hexdigest()[:8]
+    if row is None:
+        live_file = tag(os.path.join(state, "topology.json")) + "__topology.json"
+        filed = any(isinstance(e, dict) and os.path.basename(str(e.get("stored_as") or "")) == live_file for e in files)
+        return None, "lane_mismatch" if filed else "lane_absent"
+    name = os.path.basename(str(row.get("stored_as") or ""))
+    if not name:
+        return None, "stored_missing"
+    if "__" in name and name.split("__", 1)[0] != tag(row["source"]):
+        return None, "lane_mismatch"
+    if snap._capture_refused(os.path.join(gen_dir, name), HOME):
+        return None, "store_refused"
+    try:
+        with snap.safe_open(os.path.join(gen_dir, name), binary=True) as f:
+            raw = f.read()
+    except snap.DatalessPolicyRefused:
+        return None, snap.DATALESS_POLICY_CODE
+    except Exception:
+        return None, "stored_missing"
+    if len(raw) != row.get("size") or hashlib.sha256(raw).hexdigest() != row.get("sha256"):
+        return None, "manifest_integrity"
+    try:
+        t = json.loads(raw.decode("utf-8"))
+        if isinstance(t["tombstones"], list) and all(isinstance(e, dict) for e in t.get("entries", [])):
+            return t, None
+    except Exception:
+        pass
+    return None, "copy_unreadable"
+
+
+# 마지막 레인 판독의 결론 {reason, passed_over: {코드: 세대 수}, generation} — `_read_lane_topology` 만 쓴다. 코드는 데몬(governance.rs)과 같은
+#   문자열이다: found 묘비가 있는 이 레인 사본 · lane_empty 이 레인 사본이 있고 묘비는 정당하게 비었다 · lane_absent manifest 에 이 레인이 없다(스냅샷
+#   없는 레인) · lane_mismatch 행은 찾았는데 저장 키가 살아 있는 키가 아니다(잘못된 주소의 신호) · generation_absent 세대가 없다 · manifest_unreadable manifest 없음/판독 불가 · manifest_undated 날짜를 댈 수 없다 · stored_missing 행의 저장 파일이
+#   없다 · manifest_integrity 저장 파일이 행과 어긋난다 · copy_unreadable 행과 맞는 바이트가 topology 가 아니다 · store_refused 저장소·세대·manifest·사본이
+#   제외 트리(Desktop/CYSjavis)에 닿는다 · store_unreadable 저장소는 있는데 목록을 읽지 못했다 · dataless_policy_unset 내려받기 금지
+#   정책을 세우지 못해 열지 않았다. 빈 결과 자체는 어느 검사가 발화했는지의 증거가 아니다 — 근거는 이 코드다.
+_LANE_READ = {"reason": None, "passed_over": {}, "generation": None}
+
+
+def _read_lane_topology(socket, skipped=None):
+    """★0.14.57 P0 한 프리미티브: 소켓의 레인이 가진 최신 세대 topology 사본(데몬의 `tombstones_from_latest_generation` 과 같은 규칙).
+    레인 신원은 소켓의 부모 디렉터리(`state_dir_for`)이지 프로젝트 경로가 아니다. 세대 저장소는 HOME 고정 하나라 이 조회가 레인을
+    가르는 유일한 보호다 — 다른 레인의 사본은 읽지 않는다. 명목(이름) 최신 세대부터 보고, 쓸 수 없는 세대는 같은 검사를 받는 더 오래된
+    세대로 넘어간다. 반환 topology dict | None. 결론 코드는 `_LANE_READ` 에 남는다(None 이면 가장 최신 세대의 사유).
+    skipped(list)를 주면 판독에 실패해 건너뛴 세대 이름을 거기에 덧붙인다(0.14.56 plan P7) — 반환값은 같다."""
+    global _LANE_READ
+    read = _LANE_READ = {"reason": None, "passed_over": {}, "generation": None}
+    state = state_dir_for(socket)
     gen_root = os.path.join(HOME, ".cys", "state-generations")
+    if _snap_mod()._capture_refused(gen_root, HOME):      # 목록을 읽기 전이다: 링크가 그 트리를 가리켜도 listdir 은 없다
+        read["reason"] = "store_refused"
+        read["passed_over"]["store_refused"] = 1
+        return None
     try:
         gens = sorted(g for g in os.listdir(gen_root) if re.match(r"\d{8}T\d{6}Z", g))
-    except Exception:
-        return {}
+    except FileNotFoundError:
+        gens = []
+    except OSError:
+        read["reason"] = "store_unreadable"         # 있는데 못 읽는 저장소는 없는 저장소가 아니다
+        return None
+    if not gens:
+        read["reason"] = "generation_absent"
     # ★E3 주의(gemini W6): 여기는 단일 '최신 세대' 선택(heal 소스)이라 GC 처럼 union 보호가 불가능하다.
     #   mtime max 를 쓰면 cp/touch 오염 세대가 '최신'으로 오선택돼 stale topology 로 heal 할 위험이 있어,
     #   명목(이름) 기준을 유지한다(best-effort 소스 — 데이터 손실 아님). P2-5 의 실질 수리(오삭제 방어)는
     #   compute_gc 의 명목∪실효 union 이 담당한다.
     for g in reversed(gens):  # 이름(명목) 최신 세대부터
-        tp = os.path.join(gen_root, g, "topology.json")
-        if os.path.exists(tp):
-            try:
-                t = json.load(open(tp, encoding="utf-8"))
-                return {e["role"]: e for e in t.get("entries", []) if e.get("role")}
-            except Exception:
-                if skipped is not None:
-                    skipped.append(g)
-                continue
-    return {}
+        t, reason = _lane_topology_in_generation(os.path.join(gen_root, g), state)
+        if t is not None:
+            read["reason"] = "found" if t["tombstones"] else "lane_empty"
+            read["generation"] = g
+            return t
+        read["reason"] = read["reason"] or reason
+        read["passed_over"][reason] = read["passed_over"].get(reason, 0) + 1
+        if reason != "lane_absent" and skipped is not None:
+            skipped.append(g)
+    return None
+
+
+def _snapshot_roster_entries(socket, skipped=None):
+    """직전 세대 스냅샷(javis_state_snapshot)의 이 레인 topology.json 로스터 — §12가 실증한 안전망. best-effort.
+    격리 하네스의 상태 경로는 manifest 에 없어 빈 결과다."""
+    t = _read_lane_topology(socket, skipped)
+    return {e["role"]: e for e in t.get("entries", []) if e.get("role")} if t else {}
 
 
 _SNAPSHOT_ROSTER_ENTRIES = _snapshot_roster_entries  # 출하 함수 객체(검체 대역과 구별 — _desired_view)
 
 
 def _snapshot_tombstones(socket):
-    """직전 세대 스냅샷 topology.json 의 tombstones 필드(옵션A: 데몬이 여기에 묘비를 영속) — desired 손상 시
-    묘비 복원 소스. 라이브 대상일 때만 유효(격리 하네스는 자기 topology 만). 반환 set|None(스냅샷 부재)."""
-    if state_dir_for(socket) != LIVE_STATE:
-        return None
-    gen_root = os.path.join(HOME, ".cys", "state-generations")
-    try:
-        gens = sorted(g for g in os.listdir(gen_root) if re.match(r"\d{8}T\d{6}Z", g))
-    except Exception:
-        return None
-    for g in reversed(gens):  # 명목 최신 세대부터(_snapshot_roster_entries 와 동일 규약)
-        tp = os.path.join(gen_root, g, "topology.json")
-        if os.path.exists(tp):
-            try:
-                t = json.load(open(tp, encoding="utf-8"))
-                return set(x for x in t.get("tombstones", []) if isinstance(x, str))
-            except Exception:
-                continue
-    return None
+    """직전 세대 스냅샷의 이 레인 tombstones 필드(옵션A: 데몬이 여기에 묘비를 영속) — desired 손상 시 묘비 복원 소스.
+    반환 set|None(스냅샷 부재). `_snapshot_roster_entries` 와 같은 프리미티브다: 호출자가 하나라 둘이 함께 복구하거나 함께 거부한다."""
+    t = _read_lane_topology(socket)
+    return set(x for x in t["tombstones"] if isinstance(x, str)) if t else None
 
 
 # ---------------- C2(W3): 손상 격리 + 폴백 체인 ----------------
@@ -1632,7 +1734,7 @@ def _recover_retention_file(socket, path, kind):
       · {'status':'valid'}              정상(provenance 없음)
       · {'status':'missing'}            부재(fresh install 정상 — hard-fail 아님)
       · {'status':'degraded','source':..,'isolated':..,'pending':bool}  손상→폴백 복원 또는 valid+provenance(보류 유지)
-      · {'status':'unrecoverable','isolated':..}          손상→전 폴백 실패(exit 6)"""
+      · {'status':'unrecoverable','isolated':..,'lane_read':{reason,passed_over}}  손상→전 폴백 실패(exit 6)"""
     st = _roster_file_status(path)
     if st == "missing":
         return {"status": "missing"}
@@ -1653,9 +1755,11 @@ def _recover_retention_file(socket, path, kind):
             return {"status": "degraded", "source": "bak", "isolated": isolated}
         except Exception:
             pass
+    lane_read = None
     if kind == "desired_roster":
         snap_r = _snapshot_roster_entries(socket)
         snap_t = _snapshot_tombstones(socket)
+        lane_read = dict(_LANE_READ)
         if snap_r or snap_t:
             try:
                 _write_recovered(path, {"roster": snap_r, "tombstones": sorted(snap_t or [])}, "snapshot")
@@ -1670,7 +1774,7 @@ def _recover_retention_file(socket, path, kind):
             return {"status": "degraded", "source": "discovery", "isolated": isolated}
         except Exception:
             pass
-    return {"status": "unrecoverable", "isolated": isolated}
+    return {"status": "unrecoverable", "isolated": isolated, "lane_read": lane_read}
 
 
 # ---------------- A-S3 tombstone intent 저널 (다운타임 폴백) ----------------
@@ -1932,7 +2036,8 @@ def _desired_view(socket, rebase=False, intents=None, intents_truncated=False):
     if intents and not intents_truncated:
         _apply_intents_to_tombstones(intents, tombstones)
 
-    # 우선순위: 기존 desired < 세대 스냅샷 < 현재 topology (최신 관측이 메타를 갱신). ★P2-1: ephemeral 제외(미래 유입 차단).
+    # 우선순위: 기존 desired < 현재 topology. ★세대 스냅샷은 여기 들어가지 않는다 — 아래 snapshot_only_roles 로 이름만 알린다.
+    #   ★P2-1: ephemeral 제외(미래 유입 차단).
     _skipped = []
     if _snapshot_roster_entries is _SNAPSHOT_ROSTER_ENTRIES:
         _snap = _snapshot_roster_entries(socket, _skipped)  # 출하 함수: P7 의 파싱 실패 세대 목록을 함께 받는다
@@ -1940,9 +2045,6 @@ def _desired_view(socket, rebase=False, intents=None, intents_truncated=False):
         # 검체가 심은 대역(lambda s: …)은 쓰인 그대로의 1-인자 호출 꼴을 유지한다(r1 §13: 패치되는 이름은 이름·
         # 시그니처·호출 자리를 그대로 둔다). 대역 아래에서는 세대 목록이 비어 P7(generation)이 발화하지 않는다.
         _snap = _snapshot_roster_entries(socket)
-    for role, e in _snap.items():
-        if not _is_ephemeral_role(role, e):
-            roster[role] = e
     for e in topo.get("entries", []):
         if e.get("role") and not _is_ephemeral_role(e["role"], e):
             roster[e["role"]] = e
@@ -1959,6 +2061,14 @@ def _desired_view(socket, rebase=False, intents=None, intents_truncated=False):
         elif v == "ambiguous":
             tombstones.add(role)  # 부활 보류(엔트리 보존·target 제외)
             log("★P2-1 escalation: 비표준 ephemeral 변형(%s) 판정 애매 — 부활 보류(사람 판단·untomb 로 재편입)." % role)
+    # ★0.14.57 P4(결정): 세대에만 있는 역할은 부활 대상이 아니고 desired 에 들어가지 않는다. `cys restore` 는 topology 만 읽어 그 역할을
+    #   세우지 못하고, 대상으로 잡으면 FAILED 가 로그에만 남으며 300초 안의 둘째 부팅이 차단기를 열어 다른 역할까지 묶는다(실측).
+    #   복구 없이 해만 는다 — 그래서 이름만 알린다(필드 1 + 로그 1줄). 손상 desired 복구(_recover_retention_file)는 별개다.
+    global _SNAPSHOT_ONLY_ROLES
+    _SNAPSHOT_ONLY_ROLES = sorted(r for r, e in _snap.items()
+                                  if r not in roster and r not in tombstones and not _is_ephemeral_role(r, e))
+    if _SNAPSHOT_ONLY_ROLES:
+        log("세대 스냅샷에만 있는 역할 %s — 복구 대상이 아니다(보고만 · snapshot_only_roles)." % _SNAPSHOT_ONLY_ROLES)
     # ★codex W2 BLOCKING: 묘비 역할의 **roster 엔트리는 보존**한다(pop 금지). 배제는 부활 target 산정 시점에
     #   tombstones 대조로 수행(run_restore·cmd_reconcile). 엔트리·메타(session/cwd/agent)가 남아 있어야 데몬이
     #   묘비를 해제(untomb)하면 즉시 부활 가능하다 — 과거 pop 은 untomb 를 무의미하게 만드는 함정(false-green).
@@ -1974,6 +2084,7 @@ def _desired_view(socket, rebase=False, intents=None, intents_truncated=False):
                           if r not in tombstones
                           and _ephemeral_verdict(r, _prev_roster.get(r)) != "ephemeral")
     meta = {"replace": _replace,
+            "snapshot_only_roles": list(_SNAPSHOT_ONLY_ROLES),
             "topo_tombs": sorted(topo_tombs),
             "snapshot_skipped": list(_skipped),
             "topology_status": ("error" if "_error" in topo else "missing" if topo.get("_missing") else "ok"),
@@ -2018,8 +2129,11 @@ def _observe_and_persist_roster_locked(socket, rebase=False):
         # ★codex W3 BLOCKING(1): degraded provenance 영속 — 복구본의 recovered_from 을 다음 write 로 이월해
         #   부활 보류가 auto-retry 전반에 지속되게 한다. 해제 조건: 검증된-건강 topology replace(_healthy_replace)
         #   또는 운영자 --rebase(rebase) — 그때만 provenance 를 떨궈 정상 복귀. 그 외에는 계속 보류(fail-safe).
+        #   ★0.14.57 P4: source=snapshot 은 건강한 replace 로 풀리지 않는다 — --rebase 로만 풀린다. 그 경로는 0.14.56 까지 닿지
+        #   않았고(exit 6 · 사람 개입) 사람 없이 부활을 진행시키는 것을 승인한 티켓이 없다. CEO 판정 전까지의 기본값이다.
         _prev_prov = p["prev"].get("recovered_from")
-        if isinstance(_prev_prov, dict) and not p["healthy_replace"] and not rebase:
+        if isinstance(_prev_prov, dict) and not rebase \
+                and (not p["healthy_replace"] or _prev_prov.get("source") == "snapshot"):
             _out["recovered_from"] = _prev_prov
         try:
             _atomic_write_json(desired_roster_path(socket), _out, keep_bak=True)
@@ -2176,6 +2290,7 @@ _LAST_LIVENESS_SOURCE = "status_json"      # "status_json" | "list_fallback"
 _LAST_LIVENESS_ENUMERATED = False          # status --json 응답에 "surfaces" 키가 실재했는가
 # 0.14.56 plan 의 observed.status_samples — 실 liveness 판독(_live_surfaces_raw) 횟수. plan 이 시작할 때 0 으로 둔다.
 _LIVENESS_SAMPLES = 0
+_SNAPSHOT_ONLY_ROLES = []                  # 마지막 _desired_view 가 본, 세대에만 있는 역할(0.14.57 P4 · 결과 필드의 재료)
 
 
 def _last_liveness_provenance():
@@ -3020,10 +3135,11 @@ def _run_restore_locked(socket, ticket="default", stub=False, no_breaker=False, 
                       (dept_roster_path(socket), "dept_roster")):
         _rec = _recover_retention_file(socket, _p, _kind)
         if _rec["status"] == "unrecoverable":
-            log("★C2 손상 감지: %s 파싱 실패·전 폴백(.bak/스냅샷) 불가 — 부활 중단(exit 6). 격리=%s"
-                % (_kind, _rec.get("isolated")))
+            log("★C2 손상 감지: %s 파싱 실패·전 폴백(.bak/스냅샷) 불가 — 부활 중단(exit 6). 격리=%s 세대 거부=%s"
+                % (_kind, _rec.get("isolated"), json.dumps(_rec.get("lane_read"), sort_keys=True)))
             out = {"phoenix_restore": "CORRUPT", "corruption": True, "corrupt_file": _kind,
                    "corrupt_path": _p, "isolated": _rec.get("isolated"),
+                   "lane_read": _rec.get("lane_read"),
                    "note": ("손상된 %s — .bak·세대 스냅샷 전 폴백 불가. 빈 상태(fresh)로 진행하지 않는다"
                             "(missing≠corrupt). 사람 개입(phoenix roster --rebase 또는 복원) 필요." % _kind)}
             if print_result:
@@ -3121,7 +3237,8 @@ def _run_restore_locked(socket, ticket="default", stub=False, no_breaker=False, 
                **_c6_result_fields(c6),
                "degraded": _c2_degraded, "held_roles": target_roles,
                "note": ("retention 파일 손상→폴백 복원(recovered_from 영속)으로 묘비 불확실 — 부활 보류(fail-safe). "
-                        "복귀: 검증된-건강 topology replace 또는 `phoenix roster --rebase`.")}
+                        "복귀: 검증된-건강 topology replace 또는 `phoenix roster --rebase` "
+                        "(source=snapshot 은 `--rebase` 로만 풀린다).")}
         if print_result:
             print(json.dumps(out, ensure_ascii=False, indent=2))
         return out
@@ -3625,6 +3742,7 @@ def _run_restore_locked(socket, ticket="default", stub=False, no_breaker=False, 
     result = {
         "phoenix_restore": final,
         "completeness": completeness,          # ★Phase10: readiness 기반 전원 부활 판정
+        "snapshot_only_roles": list(_SNAPSHOT_ONLY_ROLES),  # ★0.14.57 P4: 세대에만 있는 역할 — 복구 대상 아님 · 보고만
         "incomplete_roles": incomplete_roles,  # ★Phase10: 미부활 역할 정직 명시(침묵 성공 금지)
         "manual_seats": manual_seats,          # ★SEAT: 좌석은 있으나 에이전트 부재(사람 개입 필요) — 정직 명시
         "fresh_fallback_roles": fresh_fallback_roles,  # ★Phase11: 독약 세션→fresh 강등 역할 정직 명시(독약만 · 리뷰 R2)
@@ -3836,6 +3954,7 @@ def _plan_compute(socket, compare_plan=None):
                          "c6_exited_surfaces": sum(1 for ss in live.values() for s in ss if s.get("exited")),
                          "status_samples": _LIVENESS_SAMPLES,
                          "view_roles": sorted(roster), "view_tombstones": sorted(tombstones),
+                         "snapshot_only_roles": list(meta["snapshot_only_roles"]),
                          "replace": meta["replace"], "snapshot_skipped": list(meta["snapshot_skipped"]),
                          "restore_units": units, "restore_outer_s": outer_s, "restore_unit_s": unit_s,
                          "restore_budget_source": budget_src}}
@@ -4924,6 +5043,7 @@ def main():
     dp.add_argument("--no-breaker", action="store_true")
 
     args = ap.parse_args()
+    args.socket = effective_socket(args.socket)  # ★0.14.57 P4: 레인 하나 — 이 뒤로 상태 경로·세대 선택·자식 명령이 같은 값을 쓴다
     # ★W1/B3·§5-1: cys 실행 경로를 여기서(소켓 인지 후) 해석한다 — PHOENIX_CYS > which('cys') > 표준경로
     #   폴백(identity-check·STRICT/하네스 금지). 리터럴 'cys' 최종 폴백 제거로 FileNotFoundError 침묵사를 차단.
     #   미해석/불일치는 _resolve_cys 내부에서 die(exit 6)로 정직 정지한다(라이브 실증 2026-07-06 근원 수리).

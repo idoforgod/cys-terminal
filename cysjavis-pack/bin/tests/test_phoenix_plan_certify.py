@@ -211,8 +211,9 @@ def main():
     R.world(desired=None, topo=rig.topo(["master", "worker-1"], rev=3), snapshot=rig.topo(rig.ROLES, rev=3),
             live=rig.LIVE_W2_GONE)
     code, d, _ = plan()
-    check("P7-g control: a valid generation is read (worker-2 known only there -> target)",
-          d.get("targets") == ["worker-2"] and d.get("observed", {}).get("snapshot_skipped") == [], d.get("targets"))
+    check("P7-g control: a valid generation is read (worker-2 known only there -> named, not a target)",
+          d.get("targets") == [] and d.get("observed", {}).get("snapshot_only_roles") == ["worker-2"]
+          and d.get("observed", {}).get("snapshot_skipped") == [], d.get("targets"))
     orig = m._snapshot_roster_entries
     m._snapshot_roster_entries = lambda s: {}
     try:

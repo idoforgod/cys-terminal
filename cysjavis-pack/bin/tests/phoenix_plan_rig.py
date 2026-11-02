@@ -9,7 +9,9 @@ A fake daemon sits behind the module's own `cys()` seam (status --json, list); a
 recorded and refused. Worlds follow the DESIGN-r2 rig (round/_evidence/0.14.56-PHX-PLAN/r2/rig/r2_rig.py).
 """
 import argparse
+import calendar
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -17,6 +19,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PH = os.path.normpath(os.path.join(HERE, "..", "javis_phoenix.py"))
@@ -58,6 +61,8 @@ _FAKE_CLI = r'''#!%s -B
 import json, os, sys
 a = sys.argv[1:]
 if a[:1] == ["--socket"]:
+    with open(os.environ["FAKE_CYS_LOG"] + ".socket", "a") as f:
+        f.write(a[1] + "\n")
     a = a[2:]
 with open(os.environ["FAKE_CYS_LOG"], "a") as f:
     f.write(json.dumps(a) + "\n")
@@ -81,10 +86,24 @@ class _R:
         self.returncode, self.stdout, self.stderr = rc, out, err
 
 
+def write_manifest(gen_dir, source, stored_as):
+    """The manifest do_snapshot would write for one stored file: dated by the generation's name, a row with its sha256 and size."""
+    with open(os.path.join(gen_dir, stored_as), "rb") as f:
+        raw = f.read()
+    at = calendar.timegm(time.strptime(os.path.basename(gen_dir)[:16], "%Y%m%dT%H%M%SZ")) + 0.25
+    _write(os.path.join(gen_dir, "manifest.json"),
+           {"created_at": at, "files": [{"source": source, "stored_as": stored_as, "sha256": hashlib.sha256(raw).hexdigest(), "size": len(raw)}]})
+
+
 def _write(path, value):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         f.write(value if isinstance(value, str) else json.dumps(value))
+
+
+# Any of these reaches a lane outside the rig. HOME is sealed apart from them.
+STATE_ENV_PREFIXES = ("CYS_", "JAVIS_", "AITERM_", "PHOENIX_")
+STATE_ENV_NAMES = ("CLAUDE_CONFIG_DIR",)
 
 
 class Rig:
@@ -93,6 +112,14 @@ class Rig:
         self.home = os.path.join(self.root, "home")
         os.makedirs(self.home)
         os.environ["HOME"] = self.home
+        # HOME alone does not seal a run: a relative `_round` follows the working directory. Three axes, set here, asserted below.
+        self.saved_cwd = os.getcwd()
+        os.chdir(self.root)
+        for k in list(os.environ):
+            if k.startswith(STATE_ENV_PREFIXES) or k in STATE_ENV_NAMES:
+                del os.environ[k]
+        os.environ["TMPDIR"] = os.path.join(self.root, "tmp")
+        os.makedirs(os.environ["TMPDIR"])
         os.environ["LOCALAPPDATA"] = os.path.join(self.home, "AppData", "Local")
         os.environ.pop("PHOENIX_FORBID_LIVE", None)
         if os.name == "nt":
@@ -104,6 +131,19 @@ class Rig:
         self.surfaces, self.calls, self.emits = [], [], []
         self.status_ok, self.list_out = True, ""
         self.reap_outcome = "deferred"
+        self.assert_sealed()
+
+    def assert_sealed(self, *paths):
+        """Each axis, separately, before anything runs: HOME, the working directory, TMPDIR, no socket or state-dir variable in the process,
+        and every path given. It stops the run, it does not warn."""
+        for axis, what in [("HOME", os.environ["HOME"]), ("cwd", os.getcwd()), ("TMPDIR", os.environ["TMPDIR"]),
+                           ("generation store", self.gen_root)] + [("path", p) for p in paths if p]:
+            r = os.path.realpath(what)
+            if not (r == self.root or r.startswith(self.root + os.sep)):
+                raise SystemExit("rig refused: %s %r resolves outside the rig %r" % (axis, what, self.root))
+        left = [k for k in os.environ if k.startswith(STATE_ENV_PREFIXES) or k in STATE_ENV_NAMES]
+        if left:
+            raise SystemExit("rig refused: socket or state variables in the environment: %s" % left)
 
     def load(self, path=PH, name="javis_phoenix_plan_rig"):
         spec = importlib.util.spec_from_file_location(name, path)
@@ -125,7 +165,9 @@ class Rig:
         if topo is not None:
             _write(os.path.join(self.state, "topology.json"), topo)
         if snapshot is not None:
+            # A generation with no manifest is not read (0.14.57 P0): this one names the base lane, as do_snapshot would.
             _write(os.path.join(self.gen_root, GEN, "topology.json"), snapshot)
+            write_manifest(os.path.join(self.gen_root, GEN), os.path.join(self.state, "topology.json"), "topology.json")
         if desired is not None:
             _write(os.path.join(self.phx, "desired_roster.json"), desired)
         if intents is not None:
@@ -180,7 +222,7 @@ class Rig:
         os.chmod(fake, 0o755)
         return fake
 
-    def run_cli(self, fake, args, world, extra_env=None, timeout=120, script=PH):
+    def run_cli(self, fake, args, world, extra_env=None, timeout=120, script=PH, cwd=None):
         """→ (rc, framed lines, parsed framed JSON | None, stdout, stderr, cys calls)."""
         import subprocess
         wpath = os.path.join(self.root, "world.json")
@@ -194,8 +236,10 @@ class Rig:
                "TMPDIR": os.path.join(self.root, "tmp")}
         os.makedirs(env["TMPDIR"], exist_ok=True)
         env.update(extra_env or {})
+        cwd = cwd or self.root
+        self.assert_sealed(cwd, env["HOME"], env["TMPDIR"], env.get("CYS_SOCKET"))
         p = subprocess.run([sys.executable, "-B", script] + list(args), env=env, stdout=subprocess.PIPE,
-                           stderr=subprocess.PIPE, timeout=timeout)
+                           stderr=subprocess.PIPE, timeout=timeout, cwd=cwd)
         out = p.stdout.decode("utf-8", "replace")
         framed = [ln for ln in out.split("\n") if ln.startswith(PREFIX)]
         data = None
@@ -213,6 +257,7 @@ class Rig:
         return p
 
     def close(self):
+        os.chdir(self.saved_cwd)
         shutil.rmtree(self.root, ignore_errors=True)
 
 

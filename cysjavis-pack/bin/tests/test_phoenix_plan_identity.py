@@ -192,6 +192,7 @@ def main():
         R.world(desired=None, topo=T3, live=rig.LIVE_ALL)
         for g, body in layout:
             rig._write(os.path.join(R.gen_root, g, "topology.json"), body)
+            rig.write_manifest(os.path.join(R.gen_root, g), os.path.join(R.state, "topology.json"), "topology.json")   # none is not read (0.14.57 P0)
         a = m._snapshot_roster_entries(None)
         lst = []
         try:
