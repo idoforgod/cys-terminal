@@ -510,6 +510,18 @@ describe("P8 r2 — 리뷰 반례 2: 낡은 pane.role=master 가 데몬이 cso �
     close(H(u, 3), 1);
     expect(inLeft(u, 1)).toBe(false);
   });
+  it("★데몬이 기억을 이긴다: 산 cso 둘의 컬럼에서 한 칸의 기억이 master 여도 master 자리가 아니다(반례 2 의 한 칸은 다른 조건도 막아 주므로 이 모양이 규칙을 판별한다)", () => {
+    const tree: LNode = {
+      type: "split", dir: "row", ratio: 0.5,
+      a: { type: "split", dir: "col", ratio: 0.5, a: { type: "pane", sid: 1, role: "master" }, b: { type: "pane", sid: 5, role: "cso-2" } },
+      b: { type: "pane", sid: 2, role: "worker" },
+    };
+    const r = new Map<number, string | null>([[1, "cso"], [5, "cso-2"], [2, "worker"], [3, "master"]]);
+    const t = placeSeat(tree, 3, mapRole(r), false);
+    close(W(t, 3), MASTER_FRAC);
+    close(H(t, 3), 1);
+    expect(inLeft(t, 1) || inLeft(t, 5)).toBe(false);
+  });
   it("대조(유지해야 할 경우): 같은 칸의 데몬 역할이 null(종료)이면 기억을 믿는다 · cso 가 함께 있으면 그 위로", () => {
     const t = placeSeat(saved2(), 3, mapRole(new Map<number, string | null>([[1, null], [2, "cso"], [3, "master"], [4, "worker"]])), false);
     close(H(t, 3), HEAD_COL_MASTER);
