@@ -615,12 +615,19 @@ describe("부서 삭제 — 탭은 종료가 확인된 뒤에 지운다(F3)", ()
 // 탭 유지 + 트리 비움 + 사유 토스트 1회. 자동 재조회·재시도 없음(수동 [지금 켜기] 또는 앱 재기동).
 // ────────────────────────────────────────────────────────────────────────────
 describe("복원 보류 — 탭은 유지하고 트리만 비운다(F2)", () => {
-  it("★자동 재조회 타이머가 없다 — 이 세션에서 다시 묘비를 묻지 않는다(폭주·상한 우회 제거)", () => {
+  it("A61: no new tombstone retry timer or automatic launch; discovery reuses the sidebar tick", () => {
     for (const gone of ["tombRetryGate", "TOMB_RETRY", "runTombRetry", "scheduleTombRetry"]) {
       expect(src.includes(gone)).toBe(false);
     }
-    // 묘비 조회는 복원 블록의 1회뿐이다(타이머·인터벌에 얹히지 않는다).
-    expect((code.match(/invoke\("dept_tombstones"\)/g) ?? []).length).toBe(1);
+    // Startup plus read-only discovery. Discovery cannot retry automatic launch.
+    expect((code.match(/invoke\("dept_tombstones"\)/g) ?? []).length).toBe(2);
+    const begin = code.indexOf("async function refreshRegisteredWorkspaces(");
+    const end = code.indexOf("async function refreshSidebarStatus(", begin);
+    expect(begin).toBeGreaterThan(0);
+    const discovery = code.slice(begin, end);
+    expect(discovery).not.toContain('invoke("launch_dept_daemon"');
+    expect(discovery).not.toContain('invoke("stop_dept_daemon_by_socket"');
+    expect(discovery).toContain("deptDiscoveryInFlight");
     for (const m of code.matchAll(/setTimeout\(([^\n]*)/g)) expect(m[1]).not.toContain("dept_tombstones");
     for (const m of code.matchAll(/setInterval\(([^\n]*)/g)) expect(m[1]).not.toContain("dept_tombstones");
   });

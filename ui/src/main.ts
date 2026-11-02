@@ -5060,9 +5060,63 @@ async function actionEqualize() {
 
 // ---------- workspace tabs ----------
 
+// A61: registry discovery rides the existing sidebar tick. It only adds tabs;
+// the 3-second surface transport adopts their seats. No launch/stop RPC is sent.
+let deptDiscoveryInFlight = false;
+let deptDiscoveryLastAttempt = -Infinity;
+async function refreshRegisteredWorkspaces(): Promise<void> {
+  if (!started || factoryResetting || resetCompleted || deptLaunchInFlight) return;
+  if (deptDiscoveryInFlight || Date.now() - deptDiscoveryLastAttempt < 10_000) return;
+  deptDiscoveryLastAttempt = Date.now();
+  deptDiscoveryInFlight = true;
+  const atStart = workspaces.map((w) => w.socket);
+  const call = Promise.allSettled([invoke("list_depts"), invoke("dept_tombstones")]).then((results) => {
+    // Wait for BOTH calls even when one rejects; the other still owns its slot.
+    return results.map((r) => { if (r.status === "rejected") throw r.reason; return r.value; });
+  });
+  // A timeout abandons this reading, not its outstanding calls. Only settlement
+  // releases ownership, so a slow backend cannot accumulate discovery requests.
+  const settled = () => { deptDiscoveryInFlight = false; };
+  void call.then(settled, settled);
+  try {
+    const [registry, deleted] = await rpcT(call, T_REG) as [
+      { depts?: Record<string, { socket?: string; display_name?: string }> }, string[]
+    ];
+    if (factoryResetting || resetCompleted || deptLaunchInFlight) return;
+    if (!registry || typeof registry !== "object" || !Array.isArray(deleted)) return;
+    const depts = registry.depts ?? {};
+    const tombstones = new Set(deleted);
+    const known = Object.entries(depts)
+      .filter(([, d]) => typeof d?.socket === "string" && d.socket.length > 0)
+      .map(([name, d]) => ({ socket: d.socket!, label: d.display_name || name }))
+      // A tab removed during these reads was explicitly closed, not missing.
+      .filter((d) => !atStart.some((socket) => sameSocket(socket, d.socket)))
+      .filter((d) => restoreLaunchDecision({ socket: d.socket, regDepts: depts, tombstones }).reason !== "tombstone");
+    let added = false;
+    for (const spec of missingKnownWorkspaces(workspaces, known, tombstones, (socket) => deptLaunchName(socket, depts))) {
+      // Unlike startup, periodic discovery must respect an intentionally closed
+      // base tab. Only registry departments are discovered here.
+      if (!spec.socket) continue;
+      const ws: Workspace = { id: wsCounter++, name: spec.name ?? UNTITLED, tree: null, socket: spec.socket, autoCreated: true };
+      const group = groups.find((g) => g.anchorSocket === spec.socket);
+      if (group) ws.groupId = group.id;
+      workspaces.push(ws);
+      added = true;
+    }
+    if (added) {
+      renderWsTabs();
+      saveLayout();
+      invoke("ensure_dept_forwarders").catch(() => {});
+    }
+  } catch {
+    // Failed registry/deletion reads preserve the layout; the next tick retries.
+  }
+}
+
 // org.status를 워크스페이스별 socket마다 1콜 조회해 노드 신호 맵에 캐싱한다(B3).
 // 응답 키: 노드배열=surfaces, 대기수=중첩 feed.pending (top-level pending 아님).
 async function refreshSidebarStatus() {
+  void refreshRegisteredWorkspaces(); // Independent of per-lane status latency; no new timer.
   const sockets = new Set(workspaces.map((w) => w.socket));
   let pend = 0;
   // 사라진 소켓(워크스페이스 폐기·부서 삭제)의 잔재를 남기지 않는다 — 남기면 배너가 존재하지
@@ -10516,8 +10570,8 @@ async function start() {
   groups = normalizeGroups(workspaces, groups);
   groupCounter = Math.max(groupCounter, 0, ...groups.map((g) => g.id)) + 1;
 
-  // (order 8) 레지스트리 진실원 대조 — 죽은 socket이면서 레지스트리 미등록인 부서 ws는 유령(옛 테스트
-  // 잔재·삭제된 부서)이므로 재-launch 안 하고 드롭. 조회 실패 시엔 보수적으로 전부 보존(기존 동작).
+  // Registry absence is not deletion intent. Preserve saved department tabs;
+  // tombstones alone authorize their removal, and unregistered lanes are not launched.
   let registered: Set<string> | null = null;
   // ★K2-05: 재-launch 부서명의 2차 진실원(소켓 역산 실패 시 레지스트리 키) — 표시명은 인자가 되지 않는다.
   let regDepts: Record<string, { socket?: string; display_name?: string }> | null = null;
@@ -10545,7 +10599,7 @@ async function start() {
     toast(
       "watchdog",
       "부서 레지스트리를 읽지 못했습니다",
-      `이번 기동은 부서 탭을 모두 보존하고 새 탭은 만들지 않습니다. 사유: ${String(e).slice(0, 300)}`,
+      `부서 탭을 모두 보존합니다. 복원이 끝나면 목록 조회를 다시 시도합니다. 사유: ${String(e).slice(0, 300)}`,
     );
   }
   // ★WP-3 리바이버 게이트: base 데몬 dept 묘비 — 삭제-의도 부서 탭은 등재 여부와 무관하게 드롭
@@ -10598,7 +10652,7 @@ async function start() {
       "tomb-unknown",
       "watchdog",
       "삭제 기록을 읽지 못했습니다",
-      "지운 부서가 되살아나는 것을 막기 위해, 이번에는 부서 탭을 새로 만들지 않았습니다. 앱을 다시 켜면 다시 시도합니다(이미 열려 있던 부서 탭은 그대로입니다).",
+      "지운 부서가 되살아나는 것을 막기 위해, 부서 탭을 새로 만들지 않았습니다. 복원이 끝나면 목록 조회를 다시 시도합니다(이미 열려 있던 부서 탭은 그대로입니다).",
     );
   }
 
@@ -10684,12 +10738,11 @@ async function start() {
     // ★무응답은 재기동 사유가 아니다 — 살아 있는(그러나 느린·먹통인) 데몬에 rival launch 를 걸면
     // 중복 데몬·좌석 탈취로 번진다. 판정 불가면 탭만 보존하고 다음 기동에 다시 본다(fail-safe).
     if (statusUnknown) continue;
-    // 죽은 socket + 레지스트리 미등록 → 유령 → 드롭(재-launch로 부활시키지 않음)
-    // ★Windows named pipe 는 대소문자를 구분하지 않는다 — 바이트 일치로 보면 표기만 다른 같은
-    // 부서를 '미등록 유령'으로 오판해 탭을 드롭한다. 탭 생성 쪽(missingKnownWorkspaces)과 같은
-    // 술어를 써야 '만들지도 지키지도 않는' 어긋남이 생기지 않는다.
+    // A61: a failed probe plus registry absence can be a slow restart. Keep
+    // the saved tab so the surface transport can adopt it when it comes up.
+    // Do not launch an unregistered department; only an explicit tombstone
+    // (handled above) proves that this tab should be removed.
     if (registered && ws.socket && ![...registered].some((r) => sameSocket(r, ws.socket))) {
-      ghosts.add(ws.id);
       continue;
     }
     // 등록된(또는 레지스트리 미조회) 부서 → 재-launch. ★시나리오4: rename으로 ws.name이 바뀌어도
