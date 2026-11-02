@@ -1093,6 +1093,18 @@ else:
                 os.kill(winner, 0)  # 파일 존재만으로 성공시키지 않는다: 실제 승자가 살아 있어야 응답
             except (OSError, ValueError):
                 sys.exit(1)
+            # A98 fixture barrier: the holder is published, then the loser exits,
+            # then readiness may succeed. Do not race the no-SIGTERM assertion.
+            loser = int(Path(env["GUARD_PID_FILE"]).read_text())
+            deadline = time.monotonic() + 5
+            while True:
+                try:
+                    os.kill(loser, 0)
+                except ProcessLookupError:
+                    break
+                if time.monotonic() >= deadline:
+                    sys.exit(1)
+                time.sleep(0.02)
             with open(env["GUARD_CALL_LOG"], "a") as out:
                 out.write("pong " + str(winner) + "\\n")
             print(winner)

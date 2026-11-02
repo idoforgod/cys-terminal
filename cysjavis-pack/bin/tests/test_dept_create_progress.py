@@ -133,11 +133,15 @@ exit 0
 # 목 cysd: 스폰 사실을 남기고 소켓 파일을 만든다(STUB_CYSD_MODE=dead 면 소켓 없이 즉시 종료 = 스폰 뒤 대기 실패 재현).
 CYSD_STUB = r'''#!/bin/sh
 echo "cysd spawn $CYS_SOCKET" >> "@CALLS@"
-echo "$$" > "$HOME/.stub-cysd.pid"
 [ "${STUB_CYSD_MODE:-up}" = dead ] && exit 0
 mkdir -p "$(dirname "$CYS_SOCKET")"
-[ "${STUB_CYSD_MODE:-up}" = silent ] || touch "$CYS_SOCKET"
-# A70: a socket fixture must keep its daemon alive; bounded and private-HOME owned.
+if [ "${STUB_CYSD_MODE:-up}" != silent ]; then
+  # A98: socket readiness wins over child death; no long-lived success fixture.
+  touch "$CYS_SOCKET"
+  exit 0
+fi
+# Only the live-silent scenario needs a persistent, private-HOME-owned child.
+echo "$$" > "$HOME/.stub-cysd.pid"
 i=0
 while [ -d "$HOME" ] && [ "$i" -lt 3600 ]; do /bin/sleep 0.05; i=$((i+1)); done
 exit 0
@@ -335,12 +339,21 @@ class ReadyElapsedBound(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="a66-ready-") as home:
             probe = os.path.join(home, "probe")
             _write_exec(probe, "#!/bin/sh\n/bin/sleep %s\nexit %s\n" % (delay, result))
+            if daemon_delay == "first-ping":
+                _write_exec(probe, '#!/bin/sh\nif [ ! -e "$HOME/first-ping" ]; then\n'
+                            '  touch "$HOME/first-ping"\n'
+                            '  while kill -0 "$PROBE_CHILD" 2>/dev/null; do /bin/sleep 0.02; done\n'
+                            '  exit 1\nfi\n/bin/sleep %s\nexit %s\n' % (delay, result))
             src = _read(DEPT)
             script = "set -u\n" + "".join(func_text(src, n) for n in ("ready_wait", "dept_ready_secs"))
             # Short budgets exercise the negative deadline cases. The successful
             # control uses the public 12-second floor; the parser accepts 12..86400.
             script += "dept_ready_secs(){ echo %s; }\nCYS=\"$1\"\nready_wait fixture\nrc=$?\necho result=$rc elapsed=$_READY_WAIT_SECS\n" % budget
-            if daemon_delay == "reaped":
+            if daemon_delay == "first-ping":
+                script = script.replace('ready_wait fixture',
+                    '(while [ ! -e "$HOME/first-ping" ]; do /bin/sleep 0.02; done) & _dept_spawn_pid=$!\n'
+                    'export PROBE_CHILD="$_dept_spawn_pid"\nready_wait fixture')
+            elif daemon_delay == "reaped":
                 script = script.replace('ready_wait fixture', '(exit 1) & _dept_spawn_pid=$!\nwait "$_dept_spawn_pid" || true\nready_wait fixture')
             elif daemon_delay is not None:
                 script = script.replace('ready_wait fixture', '/bin/sleep %s & _dept_spawn_pid=$!\nready_wait fixture' % daemon_delay)
@@ -367,6 +380,17 @@ class ReadyElapsedBound(unittest.TestCase):
         rc, elapsed = self.run_probe(3, 0, budget=1, daemon_delay="reaped")
         self.assertEqual(rc, 1, "a dead loser cannot exempt the holder ping from the budget")
         self.assertLess(elapsed, 2.5)  # wallclock: guard owned one-second timeout, not readiness latency
+
+    def test_failed_ping_before_child_death_rechecks_healthy_holder(self):
+        # First ping observed failure, then releases and observes child exit.
+        # A fresh ping after that observation sees the independently ready holder.
+        rc, _ = self.run_probe(.1, 0, budget=12, daemon_delay="first-ping")
+        self.assertEqual(rc, 0, "child death needs a fresh ping, not the older failed observation")
+
+    def test_final_ping_after_child_death_stays_inside_owned_budget(self):
+        rc, elapsed = self.run_probe(3, 0, budget=1, daemon_delay="first-ping")
+        self.assertEqual(rc, 1)
+        self.assertLess(elapsed, 2.5)  # wallclock: guard bounds the owned probe process
 
     def test_slow_failure_is_bounded_before_first_ten_probes_finish(self):
         rc, elapsed = self.run_probe(.3, 1)

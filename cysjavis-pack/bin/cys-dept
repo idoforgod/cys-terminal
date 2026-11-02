@@ -1356,7 +1356,12 @@ ready_wait(){
           sleep 0.1
         done
         wait "$probe" && exit 0
-        daemon_gone && exit 2
+        if daemon_gone; then
+          # The failed ping may predate holder readiness and contender exit.
+          # Re-observe the socket once, still inside the same owned deadline.
+          "$cys" ping >/dev/null 2>&1 && exit 0
+          exit 2
+        fi
         sleep 0.1
       done
       exit 1
