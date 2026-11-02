@@ -10867,6 +10867,10 @@ async function start() {
           return h;
         },
       });
+      // ★P8 r2(0.14.57): 3초 틱과 같이 산 칸의 역할 기억을 데몬 값으로 고친다 — 입양·S5·첫 틱 전의 자동 경로가 낡은 기억으로
+      //   결정하지 않게. reanchorAuto 기본값과 bareSeat 는 데몬 역할 없이 **칸의 기억만으로** 재정렬한다(실측: 새 master 가
+      //   역할이 바뀐 칸 위에 영구히 쌓였다). 충돌 검사(roleConflictIsDead)는 옛 기억을 봐야 하므로 restoreTree **뒤**다.
+      annotateRoles(ws.tree, (x) => (lb.roles.has(x) ? lb.roles.get(x) : undefined));
     } catch {
       /* 종전 경로 */
     }

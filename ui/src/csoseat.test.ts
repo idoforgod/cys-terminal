@@ -7,8 +7,10 @@ import {
   MASTER_FRAC,
   HEAD_COL_MASTER,
   adoptSeat,
+  annotateRoles,
   anchorHead,
   anchorHeadSafe,
+  holdPane,
   holeSidsOf,
   isAnchored,
   liveSidsOf,
@@ -440,5 +442,245 @@ describe("P8 — 불변식(전역·보존) 유지", () => {
       });
       expect(liveSidsOf(t).sort((a, b) => a - b)).toEqual([1, 2, 3, 4, 5, 6, 7]);
     }
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// r1 리뷰(codex · P8_release_CSO_seat_under_master-r1-codex.json sha16 3773e74a9a8c1aab)의 반례를 **글자 그대로** 박제한다.
+describe("P8 r2 — 리뷰 반례 1: 자동 저장 col(master,cso) · 옛 master 종료 표시 · 새 master", () => {
+  // codex-r1-review/counterexample.json 의 saved · after · adopted.tree
+  const saved = (): LNode => ({ type: "split", dir: "col", ratio: 0.75, a: { type: "pane", sid: 1, role: "master" }, b: { type: "pane", sid: 2, role: "cso" } });
+  const BAD: LNode = {
+    type: "split", dir: "row", ratio: 0.3333333333333333,
+    a: { type: "pane", sid: 3, role: "master" },
+    b: { type: "split", dir: "col", ratio: 0.75, a: { type: "pane", sid: 1, role: "master" }, b: { type: "pane", sid: 2, role: "cso" } },
+  };
+  const role = new Map<number, string | null>([[1, null], [2, "cso"], [3, "master"]]);
+  it("placeSeatSafe: cso 는 새 master 밑에 남는다 · 리뷰가 잡은 트리가 아니다", () => {
+    const t = placeSeatSafe(saved(), 3, mapRole(role), false);
+    expect(t).not.toEqual(BAD);
+    expect(inLeft(t, 3) && inLeft(t, 2)).toBe(true);
+    close(H(t, 3), HEAD_COL_MASTER);
+  });
+  it("adoptSeat: 같은 결과 · 구멍 없음", () => {
+    const plan = adoptSeat([{ tree: saved() }], undefined, 3, "master", mapRole(role)) as NonNullable<ReturnType<typeof adoptSeat>>;
+    expect(plan.tree).not.toEqual(BAD);
+    expect(plan.boundHole).toBeNull();
+    expect(inLeft(plan.tree, 3) && inLeft(plan.tree, 2)).toBe(true);
+  });
+  it("옛 칸이 빠지면 저장 모양 그대로 — col(master, cso) 3/4 · 전체 폭(rm · 이어지는 anchorHead)", () => {
+    const t = placeSeatSafe(saved(), 3, mapRole(role), false);
+    const u = anchorHead(rm(t, 1), mapRole(role)) as LNode;
+    expect(u.type === "split" && u.dir).toBe("col");
+    close(H(u, 3), HEAD_COL_MASTER);
+    close(W(u, 3), 1);
+    close(W(u, 2), 1);
+  });
+  it("옛 칸이 종료 이벤트로 구멍이 된 뒤 위생까지 — 같은 모양(이벤트 경로)", () => {
+    const t = placeSeatSafe(saved(), 3, mapRole(role), false);
+    const held = holdPane(t, 1, -1) as LNode;
+    const [u] = tidyHoles([anchorHeadSafe(held, mapRole(role))], mapRole(role));
+    expect(holeSidsOf(u)).toEqual([]);
+    expect(shape(u)).toEqual(shape(saved()));
+  });
+  it("수동 탭: 재배치 없이 컬럼 위로 · 옛 칸이 빠지면 같은 모양", () => {
+    const t = placeSeat(saved(), 3, mapRole(role), true);
+    expect(rm(t, 1)).toEqual({ type: "split", dir: "col", ratio: 0.75, a: { type: "pane", sid: 3, role: "master" }, b: { type: "pane", sid: 2, role: "cso" } });
+  });
+});
+
+describe("P8 r2 — 리뷰 반례 2: 낡은 pane.role=master 가 데몬이 cso 라 하는 칸 위로 새 master 를 얹지 않는다", () => {
+  // codex-r1-review/additional-counterexamples.jsonl 2행의 restored · adopted · afterMemoRefresh
+  const restored = (): LNode => ({ type: "split", dir: "row", ratio: 0.3333333333333333, a: { type: "pane", sid: 1, role: "master" }, b: { type: "pane", sid: 2, role: "worker" } });
+  const STACK: LNode = {
+    type: "split", dir: "row", ratio: 0.3333333333333333,
+    a: { type: "split", dir: "col", ratio: 0.75, a: { type: "pane", sid: 3, role: "master" }, b: { type: "pane", sid: 1, role: "cso" } },
+    b: { type: "pane", sid: 2, role: "worker" },
+  };
+  const role = new Map<number, string | null>([[1, "cso"], [2, "worker"], [3, "master"]]);
+  it("adoptSeat: master 는 왼쪽 혼자 · cso 는 오른쪽 · 기억 갱신 뒤에도 쌓임이 남지 않는다", () => {
+    const plan = adoptSeat([{ tree: restored() }], undefined, 3, "master", mapRole(role)) as NonNullable<ReturnType<typeof adoptSeat>>;
+    const t = plan.tree;
+    close(W(t, 3), MASTER_FRAC);
+    close(H(t, 3), 1);
+    expect(inLeft(t, 1)).toBe(false);
+    annotateRoles(t, mapRole(role));
+    expect(t).not.toEqual(STACK);
+    const u = anchorHeadSafe(t, mapRole(role)) as LNode;
+    close(H(u, 3), 1);
+    expect(inLeft(u, 1)).toBe(false);
+  });
+  it("대조(유지해야 할 경우): 같은 칸의 데몬 역할이 null(종료)이면 기억을 믿는다 · cso 가 함께 있으면 그 위로", () => {
+    const t = placeSeat(saved2(), 3, mapRole(new Map<number, string | null>([[1, null], [2, "cso"], [3, "master"], [4, "worker"]])), false);
+    close(H(t, 3), HEAD_COL_MASTER);
+    expect(inLeft(t, 2)).toBe(true);
+  });
+  const saved2 = (): LNode => ({ type: "split", dir: "row", ratio: 1 / 3, a: { type: "split", dir: "col", ratio: 0.75, a: { type: "pane", sid: 1, role: "master" }, b: { type: "pane", sid: 2, role: "cso" } }, b: { type: "pane", sid: 4, role: "worker" } });
+});
+
+describe("P8 r2 — 같은 부류: 기억으로 결정하는 다른 입구", () => {
+  it("cso 종료 칸이 아직 트리에 있고 새 cso 가 온다(이벤트 지연): 그 칸이 기억한 자리다 · 옛 칸이 빠지면 저장 모양", () => {
+    for (const manual of [false, true]) {
+      const role = SAVED_ROLE();
+      role.set(17, null);
+      role.set(70, "cso");
+      const t = placeSeat(SAVED(), 70, mapRole(role), manual);
+      expect(inLeft(t, 70)).toBe(true);
+      close(W(t, 18), MASTER_FRAC);
+      close(H(t, 18), HEAD_COL_MASTER);
+      expect(shape(rm(t, 17))).toEqual(shape(SAVED()));
+    }
+  });
+  it("그 자리는 같은 역할의 것이다: cso-2 는 종료된 cso 칸에 앉지 않고 · 산 cso 칸도 나누지 않는다", () => {
+    const exited = SAVED_ROLE();
+    exited.set(17, null);
+    exited.set(70, "cso-2");
+    const a = placeSeat(SAVED(), 70, mapRole(exited), false);
+    expect(inLeft(a, 70)).toBe(false);
+    const alive = SAVED_ROLE();
+    alive.set(71, "cso"); // 같은 역할이 둘 — 산 칸은 기억한 자리가 아니다
+    const b = placeSeat(SAVED(), 71, mapRole(alive), false);
+    expect(inLeft(b, 71)).toBe(false);
+  });
+  it("같은 경합 · 전체 폭 저장 탭 col(master, cso)", () => {
+    const col = (): LNode => ({ type: "split", dir: "col", ratio: 0.75, a: { type: "pane", sid: 1, role: "master" }, b: { type: "pane", sid: 2, role: "cso" } });
+    const role = new Map<number, string | null>([[1, "master"], [2, null], [3, "cso"]]);
+    const t = placeSeat(col(), 3, mapRole(role), false);
+    expect(shape(rm(t, 2))).toEqual(shape(col()));
+  });
+  it("master·cso 가 함께 종료 표시인 채로 둘 다 돌아온다: 저장 모양 그대로(왼쪽 컬럼 · 전체 폭 두 모양)", () => {
+    const col = (): LNode => ({ type: "split", dir: "col", ratio: 0.75, a: { type: "pane", sid: 1, role: "master" }, b: { type: "pane", sid: 2, role: "cso" } });
+    for (const start of [SAVED(), col()]) {
+      const [om, oc] = sids(start).slice(0, 2);
+      const role = SAVED_ROLE();
+      role.set(om, null);
+      role.set(oc, null);
+      role.set(80, "master");
+      role.set(81, "cso");
+      let t = placeSeat(start, 80, mapRole(role), false);
+      t = placeSeat(t, 81, mapRole(role), false);
+      t = anchorHead(rm(rm(t, om) as LNode, oc), mapRole(role)) as LNode;
+      expect(shape(t)).toEqual(shape(start));
+    }
+  });
+  it("cso 만 있는 컬럼은 master 기억이 없으면 평범하다 — 데몬이 cso 라 하고 기억도 cso", () => {
+    const col: LNode = { type: "split", dir: "row", ratio: 0.5, a: { type: "split", dir: "col", ratio: 0.5, a: { type: "pane", sid: 1, role: "cso" }, b: { type: "pane", sid: 2, role: "cso-2" } }, b: { type: "pane", sid: 4, role: "worker" } };
+    const role = new Map<number, string | null>([[1, "cso"], [2, "cso-2"], [4, "worker"], [9, "master"]]);
+    const t = placeSeat(col, 9, mapRole(role), false);
+    close(W(t, 9), MASTER_FRAC);
+    close(H(t, 9), 1);
+    expect(inLeft(t, 1) || inLeft(t, 2)).toBe(false);
+  });
+  it("cso 만 있는 컬럼은 master 가 다른 곳에 있어도 끌려가지 않는다 — master 와 같은 컬럼의 cso 만 함께 간다", () => {
+    const t: LNode = {
+      type: "split", dir: "row", ratio: 0.5,
+      a: { type: "split", dir: "col", ratio: 0.5, a: { type: "pane", sid: 1, role: "cso" }, b: { type: "pane", sid: 2, role: "worker" } },
+      b: { type: "pane", sid: 3, role: "master" },
+    };
+    const role = new Map<number, string | null>([[1, "cso"], [2, "worker"], [3, "master"]]);
+    const u = anchorHead(t, mapRole(role)) as LNode;
+    close(W(u, 3), MASTER_FRAC);
+    expect(inLeft(u, 1)).toBe(false);
+  });
+  it("저장 쌍이 왼쪽이 아닌 곳에 있으면 쌍째 왼쪽으로(떨어뜨리지 않는다 · 오늘과 같은 결과)", () => {
+    const t: LNode = {
+      type: "split", dir: "row", ratio: 0.5,
+      a: { type: "pane", sid: 4, role: "worker" },
+      b: { type: "split", dir: "col", ratio: 0.75, a: { type: "pane", sid: 1, role: "master" }, b: { type: "pane", sid: 2, role: "cso" } },
+    };
+    const role = new Map<number, string | null>([[1, "master"], [2, "cso"], [4, "worker"]]);
+    const u = anchorHead(t, mapRole(role)) as LNode;
+    close(W(u, 1), MASTER_FRAC);
+    close(H(u, 1), HEAD_COL_MASTER);
+    expect(inLeft(u, 2)).toBe(true);
+    close(W(u, 4), 2 / 3);
+  });
+  it("master 와 셸만 있는 col 탭은 오늘 규칙 그대로 — master 1/3 · 셸 2/3(cso 예외가 셸로 번지지 않는다)", () => {
+    const t: LNode = { type: "split", dir: "col", ratio: 0.5, a: { type: "pane", sid: 1, role: "master" }, b: { type: "pane", sid: 2 } };
+    const role = new Map<number, string | null>([[1, "master"], [2, null]]);
+    const u = anchorHead(t, mapRole(role)) as LNode;
+    close(W(u, 1), MASTER_FRAC);
+    close(W(u, 2), 2 / 3);
+  });
+  it("기억만 남은 master 칸 하나(cso 없음): 새 master 는 오늘 규칙대로 자기 컬럼", () => {
+    const t: LNode = { type: "split", dir: "row", ratio: 1 / 3, a: { type: "pane", sid: 1, role: "master" }, b: { type: "pane", sid: 2, role: "worker" } };
+    const role = new Map<number, string | null>([[1, null], [2, "worker"], [3, "master"]]);
+    const u = placeSeat(t, 3, mapRole(role), false);
+    close(W(u, 3), MASTER_FRAC);
+    close(H(u, 3), 1);
+  });
+});
+
+describe("P8 r2 — 기동·재기동 합성(main.ts start() 와 3초 틱의 순수 골격)", () => {
+  type Seat = [number, string];
+  /** start(): restoreTree → 기억 갱신 → 고아 입양(seatPriority 순) → 구멍 위생 → S5 anchorHeadSafe(비수동만). */
+  function start(tree: LNode, manual: boolean, gen: boolean, seats: Seat[]): LNode {
+    const role = new Map<number, string | null>(seats);
+    let h = -100;
+    const t0 = restoreTree(tree, { genChanged: gen, isLive: (s) => role.has(s), liveRole: mapRole(role), roleConflictIsDead: false, allocHole: () => h-- });
+    annotateRoles(t0, mapRole(role)); // main.ts 와 같은 자리 · 소스 핀 wswiring.test.ts
+    let ws: WsView[] = [{ tree: t0, layoutManual: manual }];
+    for (const [s, r] of [...seats].sort((a, b) => seatPriority(a[1]) - seatPriority(b[1]) || a[0] - b[0])) {
+      if (sids(ws[0].tree).includes(s)) continue;
+      const plan = adoptSeat(ws, undefined, s, r, mapRole(role));
+      ws = [{ tree: (plan as NonNullable<typeof plan>).tree, layoutManual: manual }];
+    }
+    const t1 = tidyHoles([ws[0].tree], mapRole(role))[0] as LNode;
+    return manual ? t1 : (anchorHeadSafe(t1, mapRole(role)) as LNode);
+  }
+  /** 3초 틱: 기억 갱신 → 위생 → 비수동 재정렬. 몇 번을 돌아도 모양이 같아야 한다. */
+  function tick(t: LNode, manual: boolean, seats: Seat[]): LNode {
+    const role = new Map<number, string | null>(seats);
+    annotateRoles(t, mapRole(role));
+    const u = tidyHoles([t], mapRole(role))[0] as LNode;
+    return manual ? u : (anchorHeadSafe(u, mapRole(role)) as LNode);
+  }
+  const col = (): LNode => ({ type: "split", dir: "col", ratio: 0.75, a: { type: "pane", sid: 1, role: "master" }, b: { type: "pane", sid: 2, role: "cso" } });
+  it("저장 화면 · 데몬 세대 변경 · 전 좌석 새 sid: 모양 불변 · cso 는 master 밑 · 틱을 돌아도 불변", () => {
+    for (const manual of [false, true]) {
+      const seats: Seat[] = [[26, "worker"], [27, "reviewer-codex"], [28, "worker-2"], [29, "cso"], [30, "master"], [31, "reviewer-gemini"]];
+      let t = start(SAVED(), manual, true, seats);
+      expect(shape(t)).toEqual(shape(SAVED()));
+      for (let i = 0; i < 3; i++) t = tick(t, manual, seats);
+      expect(shape(t)).toEqual(shape(SAVED()));
+    }
+  });
+  it("같은 데몬 · 앱만 재시작 · 저장 칸의 역할이 그 사이 바뀌었다(반례 2 합성): 틱 뒤에도 master 밑에 cso 가 쌓이지 않는다", () => {
+    const seats: Seat[] = [[1, "cso"], [2, "worker"], [3, "master"]];
+    const tree: LNode = { type: "split", dir: "row", ratio: 1 / 3, a: { type: "pane", sid: 1, role: "master" }, b: { type: "pane", sid: 2, role: "worker" } };
+    let t = start(tree, false, false, seats);
+    for (let i = 0; i < 3; i++) t = tick(t, false, seats);
+    close(W(t, 3), MASTER_FRAC);
+    close(H(t, 3), 1);
+    expect(inLeft(t, 1)).toBe(false);
+    expect(JSON.stringify(t)).toContain('"sid":1,"role":"cso"');
+  });
+  it("첫 틱 전의 기억 전용 경로(reanchorAuto 기본값 · +New bareSeat)도 쌓지 않는다 — 기동이 기억을 먼저 고쳤다", () => {
+    const seats: Seat[] = [[1, "cso"], [2, "worker"], [3, "master"]];
+    const tree = (): LNode => ({ type: "split", dir: "row", ratio: 1 / 3, a: { type: "pane", sid: 1, role: "master" }, b: { type: "pane", sid: 2, role: "worker" } });
+    const u = anchorHeadSafe(start(tree(), false, false, seats), () => undefined) as LNode;
+    close(H(u, 3), 1);
+    expect(inLeft(u, 1)).toBe(false);
+    const v = placeSeatSafe(start(tree(), false, false, seats), 9, (x) => (x === 9 ? null : undefined), false);
+    close(H(v, 3), 1);
+    expect(inLeft(v, 1)).toBe(false);
+  });
+  it("전체 폭 저장 탭 · 재시작 · 틱: col(master, cso) 불변(반례 1 의 앞뒤)", () => {
+    const seats: Seat[] = [[41, "master"], [42, "cso"]];
+    let t = start(col(), false, true, seats);
+    expect(shape(t)).toEqual(shape(col()));
+    for (let i = 0; i < 3; i++) t = tick(t, false, seats);
+    expect(shape(t)).toEqual(shape(col()));
+  });
+  it("새 부팅은 넓어지지 않는다: 저장 트리 없이 start() → 왼쪽 master 혼자 · 틱 고정점", () => {
+    const seats: Seat[] = [[1, "cso"], [2, "worker"], [3, "master"], [4, "reviewer-gemini"]];
+    const role = new Map<number, string | null>(seats);
+    let t: LNode | null = null;
+    for (const [s] of [...seats].sort((a, b) => seatPriority(a[1]) - seatPriority(b[1]))) t = placeSeat(t, s, mapRole(role), false);
+    let u = t as unknown as LNode;
+    for (let i = 0; i < 3; i++) u = tick(u, false, seats);
+    close(W(u, 3), MASTER_FRAC);
+    close(H(u, 3), 1);
+    expect(inLeft(u, 1)).toBe(false);
   });
 });

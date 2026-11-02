@@ -215,6 +215,15 @@ function effRole(p: LPane, roleOf: RoleOf): string | null | undefined {
   return r === undefined ? p.role : r;
 }
 const isBare = (r: string | null | undefined): boolean => r === null || r === undefined;
+/**
+ * 칸의 자리 역할: 데몬이 역할을 말하면 그것이 이긴다(앱만 재시작한 기동은 입양 전에 기억을 고치지 않아 칸의 기억이
+ * 낡았을 수 있다 · r1 반례 2). 말하지 않으면(종료 좌석 = null · 모름 · 구멍) 칸의 기억 — 재기동 경합에서 옛 칸이 어느
+ * 자리였는지 아는 길은 이것뿐이다.
+ */
+function seatOf(p: LPane, roleOf: RoleOf): string | null | undefined {
+  const r = effRole(p, roleOf);
+  return isBare(r) ? p.role : r;
+}
 
 function mkPane(sid: number, role?: unknown): LPane {
   const r = sanitizeRole(role);
@@ -275,10 +284,6 @@ function appendColumn(t: LNode, p: LNode): LNode {
 function hasMasterIn(t: LNode, roleOf: RoleOf): boolean {
   return panesOf(t).some((p) => isMasterRole(effRole(p, roleOf)));
 }
-/** 이 칸이 master 자리였다 — 지금 master 이거나(산 칸·구멍) 칸의 기억이 master 다(종료 표시된 옛 master · 입양 틱은 null). */
-function wasMasterIn(t: LNode, roleOf: RoleOf): boolean {
-  return panesOf(t).some((p) => isMasterRole(effRole(p, roleOf)) || isMasterRole(p.role));
-}
 function allHead(t: LNode, roleOf: RoleOf): boolean {
   const ps = panesOf(t);
   return ps.length > 0 && ps.every((p) => isSavedHeadRole(effRole(p, roleOf)));
@@ -293,6 +298,35 @@ function headColumnLike(t: LNode, roleOf: RoleOf): boolean {
     else if (!isBare(r)) return false;
   }
   return head;
+}
+/**
+ * 비수동 탭에서 새 master 가 그 **위로** 갈 자리인가: master 자리가 있고(종료된 옛 master 의 기억 포함) 산 master·구멍이나
+ * cso 자리가 함께 있으며, 나머지는 역할 없는 셸이다. 그래서 다음은 **아니다**:
+ * ★cso 만 있는 컬럼 — 위에 얹으면 cso 를 master 밑에 까는 해제된 규칙이 되살아난다(새 부팅에서 cso 가 먼저 도착한 순서).
+ * ★기억만 남은 master 칸 하나 — 지켜 줄 cso 가 없고, 오늘 규칙대로 새 master 는 자기 컬럼을 세운다.
+ * 비율로는 저장 화면과 가를 수 없다(master 를 잃은 새 배치도 1/3 이 된다).
+ */
+function savedMasterColumn(t: LNode, roleOf: RoleOf): boolean {
+  let master = false;
+  let company = false;
+  for (const p of panesOf(t)) {
+    const r = effRole(p, roleOf);
+    const seat = seatOf(p, roleOf);
+    if (isMasterRole(seat)) master = true;
+    if (isMasterRole(r) || isCsoRole(seat)) company = true;
+    if (!isSavedHeadRole(seat) && !isBare(r)) return false;
+  }
+  return master && company;
+}
+/**
+ * master 와 같은 컬럼(master 를 품은 col 분할)의 cso 자리 — 저장 화면의 master 위 / cso 아래는 떨어뜨리지 않는다.
+ * master 가 없는 컬럼의 cso 는 여기 들지 않는다(그것이 흩어진 cso 이고, 끌어오지 않는다).
+ */
+function csosWithMaster(t: LNode, roleOf: RoleOf): LPane[] {
+  if (t.type === "pane") return [];
+  if (t.dir === "row") return [...csosWithMaster(t.a, roleOf), ...csosWithMaster(t.b, roleOf)];
+  const ps = panesOf(t);
+  return ps.some((p) => isMasterRole(effRole(p, roleOf))) ? ps.filter((p) => isCsoRole(seatOf(p, roleOf))) : [];
 }
 /** 루트가 row 분할이고 왼쪽(a)에 master(산 칸 또는 master 구멍)가 있다 — 새 좌석은 오른쪽(b)으로 간다. */
 function headSide(t: LNode | null, roleOf: RoleOf): t is LSplit {
@@ -312,10 +346,10 @@ function anchoredCore(t: LNode, roleOf: RoleOf): t is LSplit {
   return headColumnLike(t.a, roleOf) && !panesOf(t.b).some((p) => isMasterRole(effRole(p, roleOf)));
 }
 
-/** 대표 컬럼: 첫 master 가 위(3/4), 추가 master 가 아래를 균등히 — master 하나면 그 칸 혼자. masters 는 1개 이상. */
-function headColumn(masters: LNode[]): LNode {
-  const rest = masters.slice(1);
-  return rest.length ? { type: "split", dir: "col", ratio: HEAD_COL_MASTER, a: masters[0], b: evenComb(rest, "col") } : masters[0];
+/** 대표 컬럼: 첫 칸이 위(3/4), 나머지(추가 master · 저장 cso)가 아래를 균등히 — 하나면 그 칸 혼자. cells 는 1개 이상. */
+function headColumn(cells: LNode[]): LNode {
+  const rest = cells.slice(1);
+  return rest.length ? { type: "split", dir: "col", ratio: HEAD_COL_MASTER, a: cells[0], b: evenComb(rest, "col") } : cells[0];
 }
 
 /**
@@ -348,17 +382,21 @@ function insertSeat(tree: LNode | null, sid: number, roleOf: RoleOf, manual: boo
   if (!tree) return p;
   if (isMasterRole(role)) {
     // master 자리였던 컬럼이 이미 왼쪽에 있으면 그 **위**로 — master 재기동이 제자리로 돌아오고 추가 master 도 같다.
-    // ★P8: cso 만 있는 컬럼은 master 자리가 아니다 — 위에 얹으면 cso 를 master 밑에 까는 해제된 규칙이 되살아난다
-    //   (새 부팅에서 cso 가 먼저 도착한 순서). 비율로는 저장 화면과 가를 수 없다(master 를 잃은 새 배치도 1/3 이 된다).
-    //   수동 탭만 예외다 — 사용자가 둔 컬럼에서 폭을 새로 떼어 내지 않는다(반박 R2).
-    const stackOn = (x: LNode) => headColumnLike(x, roleOf) && (manual || wasMasterIn(x, roleOf));
+    // 수동 탭은 오늘 규칙 그대로다 — 사용자가 둔 컬럼에서 폭을 새로 떼어 내지 않는다(반박 R2).
+    const stackOn = (x: LNode) => (manual ? headColumnLike(x, roleOf) : savedMasterColumn(x, roleOf));
     if (tree.type === "split" && tree.dir === "row" && stackOn(tree.a)) {
       return { ...tree, a: { type: "split", dir: "col", ratio: HEAD_COL_MASTER, a: p, b: tree.a } };
     }
     if (stackOn(tree)) return { type: "split", dir: "col", ratio: HEAD_COL_MASTER, a: p, b: tree };
     return { type: "split", dir: "row", ratio: MASTER_FRAC, a: p, b: tree };
   }
-  // ★P8: cso 도 여기부터의 일반 규칙이다. master 가 없는 탭에서 대표 자리를 세우지 않는 것도 같다.
+  // ★P8 r2: 같은 cso 의 종료 칸이 아직 트리에 있으면(종료 이벤트가 늦었다) 그 칸이 곧 기억한 자리다 — 구멍 결속처럼 그
+  //   칸 안에 앉는다. 옛 칸이 빠지면 저장 모양이 그대로 남는다.
+  if (isCsoRole(role)) {
+    const old = panesOf(tree).filter((q) => q.role === role && isBare(effRole(q, roleOf)))[0];
+    if (old) return replacePane(tree, old.sid, { type: "split", dir: "col", ratio: 1 / 2, a: old, b: p });
+  }
+  // ★P8: 그 밖의 cso 는 여기부터의 일반 규칙이다. master 가 없는 탭에서 대표 자리를 세우지 않는 것도 같다.
   if (headSide(tree, roleOf)) return { ...tree, b: appendColumn(tree.b, p) };
   if (allHead(tree, roleOf) && hasMasterIn(tree, roleOf)) return { type: "split", dir: "row", ratio: MASTER_FRAC, a: tree, b: p };
   // 대표가 없는 탭은 **종전 규칙 그대로**(반박 U3 D12 — 오너 지시 범위는 대표 자리 · 놀람 최소화).
@@ -375,11 +413,13 @@ function anchorHeadCore(t: LNode, roleOf: RoleOf): LNode {
   //   1/3 규칙을 받는다(순서가 반대면 전출로 0.5 가 된 탭이 영영 0.5 로 남는다). 루트가 col 인 저장 탭은 앵커가 아니다.
   if (anchoredCore(t, roleOf)) return { ...t, ratio: MASTER_FRAC, b: rebalanceRow(t.b) };
   if (ps.every((p) => isSavedHeadRole(effRole(p, roleOf)))) return t; // master·저장 cso 만 있는 탭 — 전체 폭
-  // master 가 왼쪽 컬럼이 아닌 곳에 있다(구버전 저장본·도착 순서) — master 만 빼서 왼쪽 1/3 컬럼으로, 나머지(cso 포함) 구조는 그대로.
+  // master 가 왼쪽 컬럼이 아닌 곳에 있다(구버전 저장본·도착 순서) — master 만 빼서 왼쪽 1/3 컬럼으로, 나머지 구조는 그대로.
+  // ★P8 r2: 흩어진 cso 는 끌어오지 않지만, master 밑의 저장 cso 는 master 와 함께 간다 — master 만 빼면 저장 쌍이 갈린다.
   const ordered = [...masters.filter((p) => p.sid > 0), ...masters.filter((p) => p.sid < 0)]; // 산 master 가 위
+  const cells = [...ordered, ...csosWithMaster(t, roleOf)];
   let rest: LNode | null = t;
-  for (const p of ordered) rest = rest ? removeSid(rest, p.sid) : null;
-  const head = headColumn(ordered);
+  for (const p of cells) rest = rest ? removeSid(rest, p.sid) : null;
+  const head = headColumn(cells);
   return rest ? { type: "split", dir: "row", ratio: MASTER_FRAC, a: head, b: rebalanceRow(rest) } : head;
 }
 
