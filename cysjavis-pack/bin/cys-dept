@@ -764,7 +764,7 @@ dept_warn_unregistered_socks(){
 }
 # reg_upsert/reg_remove: 동시 부서 운용 시 lost-update 방지 — fcntl.flock으로 RMW 직렬화 +
 # temp+os.replace 원자 교체(읽는 쪽이 부분 파일을 보지 않음). macOS엔 flock(1) CLI가 없어 python fcntl 사용.
-reg_upsert(){ reject_slug_collision "$1"; reg_init; python3 - "$REG" "$1" "$2" "$3" <<'PY' || return $?
+reg_upsert(){ reject_slug_collision "$1"; reg_init; python3 - "$REG" "$1" "$2" "$3" "${4:-}" <<'PY' || return $?
 import json,sys,os
 try:
     import fcntl
@@ -785,11 +785,14 @@ try:
         sys.stderr.write("[cys-dept] depts.json 판독 실패 — 원본 보존: %s: %s · UTF-8(BOM 허용)로 재저장하거나 dept-snapshots 에서 복원\n"%(p,e)); sys.exit(10)
     # F2(codex#2): full-replace 대신 merge — 기존 메타(display_name/account/mission_key) 보존.
     # launch 재진입 시 create가 심은 메타 소실 방지. 신규 엔트리는 3필드만(하위호환).
-    e=d.setdefault('depts',{}).setdefault(n,{})
+    created = n not in d.setdefault('depts',{})
+    e=d['depts'].setdefault(n,{})
     e.update({'socket':s,'pack_dir':k,'role':'dept-master'})
     tmp=p+'.tmp.%d'%os.getpid()
     with open(tmp,'w',encoding='utf-8') as f: json.dump(d,f,ensure_ascii=False,indent=2); f.flush(); os.fsync(f.fileno())
     os.replace(tmp,p)
+    # Report ownership only after the locked write succeeds; legacy callers stay quiet.
+    if sys.argv[5] == "--report-created": print("NEW" if created else "EXISTING")
 finally: _ulk(lf)
 PY
 }
@@ -2248,7 +2251,11 @@ launch_dept(){   # $1=name
     seed_acl "$pack"
     # ★J4: rotate 재귀에서는 등재 갱신 실패가 재기동을 막지 못한다(등재는 kill 이전에 이미 확인됐고
     #   이 호출은 socket/pack_dir 의 **갱신**이다 — 손상 원본에는 아무것도 쓰이지 않는다).
-    rot_reg_quiet reg_upsert "$name" "$sock" "$pack" || { _rc=$?; rot_reg_degraded "$_rc" "등재 갱신(reg_upsert)" || exit "$_rc"; }
+    # A61: ownership is determined by the writer under its lock, not a prior read.
+    # A degraded/failed write grants no rollback ownership (including rotate).
+    _launch_registration=""
+    _launch_registration="$(rot_reg_quiet reg_upsert "$name" "$sock" "$pack" --report-created)" || { _rc=$?; _launch_registration=""; rot_reg_degraded "$_rc" "등재 갱신(reg_upsert)" || exit "$_rc"; }
+    _launch_registration="${_launch_registration%$'\r'}"
     # ★G3(W3): 계정격리 복원 — rotate 가 이 경로를 재귀 호출하므로, 여기서 계정 dir 을 유도하지
     #   않으면 **재기동 한 번으로 격리가 조용히 풀린다**(데몬 env 소실 → 자식 claude 가 오너 base
     #   config 를 공유). 유도값 없음 = 계정격리 미사용 부서(구 launch 산출) → 무동작(회귀 0).
@@ -2340,8 +2347,8 @@ launch_dept(){   # $1=name
       fi
       disown
       dept_ready_knob_warn   # ★0.14.43 R2F-PK(S4 m4): 비어 있지 않은 무효 노브 경고 1줄(미설정·유효 값은 무음) — 스폰 뒤 대기 직전
-      # 기동 실패 시 reg_upsert 롤백 — 유령 부서(데몬 없는 레지스트리 항목) 잔류 방지
-      ready_wait "$sock" || { _lf="$(ready_fail_note "$name")"; echo "[cys-dept] ERROR: $name 데몬 기동 실패${_lf}" >&2; reg_remove "$name" || exit $?; echo "[cys-dept] ERROR: $name 데몬 기동 실패$(ready_fail_note "$name")"; sock_len_diag "$sock"; exit 1; }   # ★K2-07: 소켓 길이 사유(진단만) · ★0.14.43 GP: 스폰 뒤 대기 예산 노브 + 실패 문구 꼬리 · ★R2F-PK(S4 m7): launch·rotate 실패는 stdout 줄만 있어 앱(stderr 만 올린다)에 꼬리가 닿지 않았다 → 같은 꼬리를 stderr 에도 한 줄(가산 — stdout 줄·순서·핀은 그대로)
+      # Roll back only this call's new row; timeout cannot unregister an existing lane.
+      ready_wait "$sock" || { _lf="$(ready_fail_note "$name")"; echo "[cys-dept] ERROR: $name 데몬 기동 실패${_lf}" >&2; if [ "$_launch_registration" = "NEW" ]; then reg_remove "$name" || exit $?; fi; echo "[cys-dept] ERROR: $name 데몬 기동 실패$(ready_fail_note "$name")"; sock_len_diag "$sock"; exit 1; }   # ★K2-07: 소켓 길이 사유(진단만) · ★0.14.43 GP: 스폰 뒤 대기 예산 노브 + 실패 문구 꼬리 · ★R2F-PK(S4 m7): launch·rotate 실패는 stdout 줄만 있어 앱(stderr 만 올린다)에 꼬리가 닿지 않았다 → 같은 꼬리를 stderr 에도 한 줄(가산 — stdout 줄·순서·핀은 그대로)
     fi
     seed_schedule "$pack"   # owner-progress-report 제거(부서는 최상위 보고 안 함) — 데몬 30초 핫리로드로 반영
     # ★G3: 시드 검증(+자기치유) — 데몬 env 전파에 의존하지 않는 belt(구 cysd·재기동 경로 대비).

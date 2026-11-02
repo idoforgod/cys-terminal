@@ -1550,11 +1550,11 @@ class Census(unittest.TestCase):
         self.assertIn('echo "[cys-dept] ERROR: $name 데몬 기동 실패$(ready_fail_note "$name")"; sock_len_diag "$sock"; exit 1; }', post[0])
         self.assertIn('echo "[cys-dept] ERROR: $name 데몬 기동 실패$(ready_fail_note "$name")" >&2; sock_len_diag "$sock"; exit 1; }', post[1])
         self.assertIn('echo "[cys-dept] ERROR: $name 데몬 기동 실패$(ready_fail_note "$name")" >&2; sock_len_diag "$sock"; exit 1; }', post[2])
-        self.assertIn('reg_remove "$name" || exit $?; echo', post[0])
+        self.assertIn('if [ "$_launch_registration" = "NEW" ]; then reg_remove "$name" || exit $?; fi; echo', post[0])
         self.assertIn('reg_remove "$name" || exit $?; echo', post[1])
         self.assertIn('then reg_remove "$name" || exit $?; fi; echo', post[2])
         # R2F-PK(S4 m7): launch 줄만 같은 꼬리를 stderr 에도 한 줄 더 낸다(stdout 줄·순서·위 핀은 그대로 — 복사본은 `reg_remove` **앞**에 있다). allocate·create 는 이미 stderr 라 복사본이 없다.
-        self.assertIn('_lf="$(ready_fail_note "$name")"; echo "[cys-dept] ERROR: $name 데몬 기동 실패${_lf}" >&2; reg_remove', post[0])
+        self.assertIn('_lf="$(ready_fail_note "$name")"; echo "[cys-dept] ERROR: $name 데몬 기동 실패${_lf}" >&2; if [ "$_launch_registration" = "NEW" ]; then reg_remove', post[0])
         self.assertNotIn("_lf", post[1] + post[2], "allocate·create 의 실패 줄은 이미 stderr 다 — 복사본을 더하면 같은 줄이 두 번 난다")
 
     def test_ready_definition_unchanged(self):
@@ -1756,6 +1756,95 @@ class DeptCapDefaultUnlimited(unittest.TestCase):
         self.assertEqual((len(reads), len(guards)), (2, 2), "두 자리(allocate·create)가 같은 규칙이 아니다")
         self.assertNotIn('get("CYS_DEPT_CAP","8")', src, "종전 기본 8 이 남아 있다")
 
+
+
+class RegistryRollbackOwnership(unittest.TestCase):
+    """A61: real command/registry, scripted readiness later than the probe budget.
+
+    No wall-clock sleep or daemon: cysd exits without binding; ping 241 is the
+    first success, after launch's 120 pre-probes and 120 post-spawn probes.
+    """
+
+    def box(self):
+        sb = Sandbox(STUB_CYSD_MODE="dead", STUB_PING_OK_FROM="241")
+        self.addCleanup(sb.cleanup)
+        return sb
+
+    def test_existing_launch_row_survives_late_readiness(self):
+        sb = self.box()
+        sb.seed_entry("a", "existing-mission", age=300)
+        before = sb.read_reg()["a"]
+        rc, out, err = sb.run("launch", "a")
+        self.assertEqual(rc, 1, (out, err))
+        self.assertTrue(sb.spawned("a"))
+        self.assertEqual(sb.ping_count(), 240)
+        self.assertIn("a", sb.read_reg(), "readiness timeout removed a pre-existing row")
+        self.assertEqual(sb.read_reg()["a"], before)
+        late = subprocess.run([os.path.join(sb.home, ".local", "bin", "cys"), "ping"],
+                              env=dict(sb.env, CYS_SOCKET=sb.sock("a")), capture_output=True)
+        self.assertEqual(late.returncode, 0, "fixture must become ready after the budget")
+
+    def test_failed_upsert_cannot_authorize_rollback(self):
+        # Exercise the actual launch body and real registry helpers, replacing
+        # the failed write/readiness edges only. No daemon or live socket.
+        sb = self.box()
+        sb.seed_entry("a", "existing-mission", age=300)
+        before = _read(sb.reg)
+        src = _read(DEPT)
+        names = ("reg_init", "reg_remove", "rot_reg_quiet", "rot_reg_degraded", "launch_dept")
+        script = "set -eu\n" + "".join(func_text(src, n) for n in names) + r'''
+validate_dept_name(){ :; }
+reject_slug_collision(){ :; }
+dept_sock(){ echo "$HOME/rig.sock"; }
+dept_pack(){ echo "$HOME/pack"; }
+dept_logdir(){ echo "$HOME/log"; }
+seed_acl(){ :; }
+reg_upsert(){ return 10; }
+resolve_lane_acctdir(){ :; }
+resolve_dept_cwd(){ echo "$HOME"; }
+reg_get_field(){ echo "$HOME"; }
+ready(){ return 1; }
+ready_wait(){ return 1; }
+dept_ready_knob_warn(){ :; }
+ready_fail_note(){ :; }
+sock_len_diag(){ :; }
+_CYS_ROTATE_SELF=1
+CYSD=/usr/bin/true
+REG="$CYS_DEPTS_JSON"
+launch_dept a
+'''
+        r = subprocess.run(["bash", "-c", script], env=sb.env,
+                           capture_output=True, text=True, timeout=15)
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("kill 이후", r.stderr)
+        self.assertEqual(_read(sb.reg), before, "failed upsert authorized row removal")
+
+    def test_new_launch_row_is_rolled_back_on_failure(self):
+        sb = self.box()
+        rc, out, err = sb.run("launch", "a")
+        self.assertEqual(rc, 1, (out, err))
+        self.assertTrue(sb.spawned("a"))
+        self.assertNotIn("a", sb.read_reg())
+
+    def test_catalog_reuse_dead_row_survives_failure(self):
+        sb = self.box()
+        sb.env.pop("STUB_PING_OK_FROM")
+        sb.seed_catalog("k1", "m1")
+        sb.seed_entry("dept-1", "m1", age=300)
+        rc, out, err = sb.run("create", "k1")
+        self.assertEqual(rc, 1, (out, err))
+        self.assertIn("dept-1", sb.read_reg())
+        self.assertEqual(sb.read_reg()["dept-1"]["mission_key"], "m1")
+
+    def test_allocate_failure_preserves_other_registered_rows(self):
+        sb = self.box()
+        sb.env.pop("STUB_PING_OK_FROM")
+        sb.seed_entry("dept-1", "m1", age=300)
+        before = sb.read_reg()["dept-1"]
+        rc, out, err = sb.run("allocate")
+        self.assertEqual(rc, 1, (out, err))
+        self.assertTrue(sb.spawned("dept-2"))
+        self.assertEqual(sb.read_reg(), {"dept-1": before})
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
