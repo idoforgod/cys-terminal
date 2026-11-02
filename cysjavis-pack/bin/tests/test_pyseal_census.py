@@ -264,6 +264,10 @@ REFERENCING_FILES = (  # 정렬 key=str(코드포인트 순 · LC_ALL=C sort 와
     #   니들 보유 사유는 그 사실을 적어 둔 주석 1줄이다(성격 표기이지 누락이 아니다).
     "cysjavis-pack/bin/javis_role.py",
     "cysjavis-pack/bin/tests/run_bootstrap_health.py",
+    # A101: test-only child environments in bash_eval, ReadyElapsedBound.run_probe
+    # and RemovalAudit.setUp set the seal to "1" before spawning their shell/Python
+    # descendants. No new shipped entry point; this records the reviewed reference.
+    "cysjavis-pack/bin/tests/test_dept_create_progress.py",
     # ★2026-09-04 W-A A2 등재 — 훅 런처/본체 분할 검체. **봉인 점검 결과(등재 = 이 선언)**:
     #   python 서브프로세스를 하나도 띄우지 않는다(스폰 대상은 전부 `sh`/`dash`/`bash` 런처다) —
     #   따라서 새 python 진입점도 강제점도 아니다. 니들을 보유하는 이유는 단 하나, 프리루드의
