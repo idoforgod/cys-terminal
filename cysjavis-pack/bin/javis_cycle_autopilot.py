@@ -30,6 +30,7 @@ exit: 0=정상 / 1=오류 / 2=게이트 미통과(정상 skip) / 4=kill-switch /
 """
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -1629,10 +1630,24 @@ def _sweep_suppressed(why):
            "own_root": lane_own_root(), "first_at": prev.get("first_at") or now_ts, "last_at": now_ts}
     try:
         _ensure_state_dir()
-        tmp = SWEEP_SUPPRESSED + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(rec, f, ensure_ascii=False, sort_keys=True)
-        os.replace(tmp, SWEEP_SUPPRESSED)
+        # Resolve the shipped helper beside this file, including isolated Python
+        # imports that omit the script directory from sys.path. Keep it lazy so
+        # an unavailable sidecar affects only this best-effort diagnostic write.
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "_cycle_atomic_write", os.path.join(os.path.dirname(__file__), "javis_lock.py"))
+            if spec is None or spec.loader is None:
+                raise ImportError("atomic writer has no loader")
+            atomic = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(atomic)
+            writer = getattr(atomic, "atomic_write_text", None)
+            if not callable(writer):
+                raise ImportError("atomic writer is unavailable")
+        except Exception as exc:
+            raise OSError("suppression diagnostic writer unavailable") from exc
+        # The record contains project paths; keep its replacement private even
+        # when the caller uses a permissive umask. Serialization is unchanged.
+        writer(SWEEP_SUPPRESSED, json.dumps(rec, ensure_ascii=False, sort_keys=True), mode=0o600)
     except OSError:
         pass
     return {"seeded": False, "emitted": 0, "failed": 0, "truncated": 0, "suppressed": rec}

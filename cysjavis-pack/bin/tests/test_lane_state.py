@@ -12,6 +12,7 @@ resolves `~` through USERPROFILE, not HOME), inherited CYS_*, JAVIS_*, AITERM_* 
 
 Each `[control]` line prints what was measured.
 """
+import importlib.util
 import json
 import ntpath
 import os
@@ -637,6 +638,73 @@ class Paths(Base):
             base_mode, dept_mode, own))
         self.assertEqual((base_mode, dept_mode, own), ("live", "shadow", "live"))
 
+
+
+class SuppressedAtomicWrite(Base):
+    def load_autopilot(self):
+        patcher = mock.patch.dict(os.environ, self.env("dept-7"), clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        spec = importlib.util.spec_from_file_location("a79_autopilot", os.path.join(BIN, "javis_cycle_autopilot.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertEqual(os.path.commonpath([self.home, module.STATE_DIR]), self.home)
+        return module
+
+    def test_overlapping_writers_publish_their_own_complete_record(self):
+        a = self.load_autopilot()
+        replace = os.replace
+        staged = []
+
+        def interleave(src, dst):
+            self.assertEqual(dst, a.SWEEP_SUPPRESSED)
+            self.assertEqual(os.path.dirname(src), os.path.dirname(dst))
+            staged.append(src)
+            if len(staged) == 1:
+                a._sweep_suppressed("second-writer")
+            return replace(src, dst)
+
+        with mock.patch.object(a.os, "replace", side_effect=interleave):
+            first = a._sweep_suppressed("first-writer")["suppressed"]
+        with open(a.SWEEP_SUPPRESSED, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), first, "the last publisher lost its staged record")
+        self.assertEqual(len(staged), 2)
+        self.assertNotEqual(staged[0], staged[1], "writers shared one staging path")
+        self.assertFalse(any(os.path.exists(p) for p in staged))
+        self.assertFalse(os.path.exists(a.SWEEP_STATE))
+        if os.name != "nt":
+            self.assertEqual(stat.S_IMODE(os.stat(a.SWEEP_SUPPRESSED).st_mode), 0o600)
+
+    def test_replace_failure_preserves_old_record_and_cleans_own_temp(self):
+        a = self.load_autopilot()
+        a._sweep_suppressed("old")
+        with open(a.SWEEP_SUPPRESSED, "rb") as f:
+            before = f.read()
+        files_before = set(os.listdir(a.STATE_DIR))
+        with mock.patch.object(a.os, "replace", side_effect=OSError("injected replace failure")):
+            result = a._sweep_suppressed("new")
+        self.assertEqual(result["suppressed"]["reason"], "new")
+        self.assertEqual(result["suppressed"]["count"], 2)
+        with open(a.SWEEP_SUPPRESSED, "rb") as f:
+            self.assertEqual(f.read(), before)
+        self.assertEqual(set(os.listdir(a.STATE_DIR)), files_before)
+
+    def test_unavailable_helper_keeps_the_suppression_result(self):
+        a = self.load_autopilot()
+        folder = os.path.join(self.home, "missing-helper")
+        os.makedirs(folder)
+        a.__file__ = os.path.join(folder, "javis_cycle_autopilot.py")
+        helper = os.path.join(folder, "javis_lock.py")
+        for body in (None, "invalid syntax !", "atomic_write_text = None"):
+            with self.subTest(body=body):
+                if body is not None:
+                    with open(helper, "w", encoding="utf-8") as f:
+                        f.write(body)
+                result = a._sweep_suppressed("project-not-lane-root")
+                self.assertEqual(result["suppressed"]["reason"], "project-not-lane-root")
+                self.assertEqual(result["emitted"], 0)
+                self.assertFalse(os.path.exists(a.SWEEP_SUPPRESSED))
+                self.assertFalse(os.path.exists(a.SWEEP_STATE))
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
