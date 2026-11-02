@@ -58,6 +58,21 @@ def pause():
         time.sleep(0.01)
 
 real_enter, real_write = m.FileLock.__enter__, m._write_text_atomic
+real_sleep = time.sleep
+
+if where == "observe-lock-wait":
+    # Keep the real exclusive-file lock and its retries. Freeze only its clock
+    # so scheduler delay in the test cannot expire/reclaim the held lock.
+    held_clock = time.time()
+    m.time.time = lambda: held_clock
+
+    def observe_sleep(delay):
+        if sys._getframe(1).f_code is real_enter.__code__:
+            # This call is reached only after the real exclusive open collided.
+            open(mark + ".waiting", "w").close()
+        return real_sleep(delay)
+
+    m.time.sleep = observe_sleep
 
 def enter(self):
     with open(mark + ".enters", "a") as f:
@@ -359,15 +374,11 @@ class Concurrency(Base):
     def test_a_peer_waits_while_a_holder_is_between_read_and_write(self):
         a, mark, go = self.harness("before-card-write", "update", "--name", NAME, "--body", NEW_BODY, "--keep-desc")
         self.wait_for(mark, a)
-        full = dict(self.env)
-        assert_sealed(self, full, self.tmp)
-        b = subprocess.Popen([PY, "-B", TOOL, "--dir", self.mdir, "update", "--name", NAME, "--desc", PEER_DESC],
-                             cwd=self.tmp, env=full, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        self.addCleanup(b.kill)
-        self.addCleanup(b.stdout.close)
-        self.addCleanup(b.stderr.close)
-        with self.assertRaises(subprocess.TimeoutExpired):
-            b.wait(timeout=1.0)
+        b, peer_mark, _ = self.harness("observe-lock-wait", "update", "--name", NAME, "--desc", PEER_DESC)
+        self.wait_for(peer_mark + ".waiting", b)
+        self.assertFalse(os.path.exists(go), "holder was released before the contention witness")
+        self.assertIn(OLD_BODY, self.card())
+        self.assertIn(OLD_DESC, self.index())
         open(go, "w").close()
         out, err = a.communicate(timeout=30)
         self.assertEqual(a.returncode, 0, out + err)
@@ -377,7 +388,8 @@ class Concurrency(Base):
         self.assertIn(NEW_BODY, self.card())
         self.assertIn(PEER_DESC, self.index())
         self.assertEqual(self.run_tool("verify", "--desc-strict").returncode, 0)
-        control("holder between read and write: peer still waiting at 1.0 s, then both landed, verify --desc-strict rc 0")
+        control("holder between read and write: real lock-contention wait witnessed before release; "
+                "then both landed, verify --desc-strict rc 0")
 
     def test_one_update_takes_the_lock_once(self):
         for i, argv in enumerate((["--body", NEW_BODY, "--keep-desc"], ["--desc", NEW_DESC, "--body", NEW_BODY],
