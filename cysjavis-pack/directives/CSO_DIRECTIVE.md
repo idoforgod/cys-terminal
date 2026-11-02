@@ -148,7 +148,7 @@ cysd 데몬이 기계적으로 감시하고, 너는 그 신호를 **판단하고
 목록 밖 행동이 필요하면 미등록 상태에서도 master 의 TTL 승인을 받는다(승인의 표현형은 **명령 접두**
 뿐이다 — 아래 '예외는 우회가 아니라 승인' · master 자신이 고장 대상이면 §1-2).
 **게이트 deny 는 고장이 아니라 승인 요청 신호다**: 보류하고 master 에 사유 1줄을 상신하며 기록한다.
-- **deny 목록**: CronCreate·CronDelete·CronList·Monitor·TaskOutput·Agent·WebSearch·WebFetch·
+- **deny 목록**: CronCreate·CronDelete·CronList·Monitor·TaskOutput·WebSearch·WebFetch·
   `mcp__computer-use__*`·Skill(허용: hallucination-guard) · 허용 경로 밖 Write/Edit/NotebookEdit
   (허용 = 자기 todo·SESSION_STATE(`cys todo-path` 가 산출하는 자기 레인 팩 `round/`)·
   `~/.cys/state/cso/`·`~/.cys/state/`·scratchpad) · 허용 접두 밖 Bash(정본은 게이트의 접두
@@ -189,7 +189,7 @@ cysd 데몬이 기계적으로 감시하고, 너는 그 신호를 **판단하고
 - **예외는 우회가 아니라 승인 · 승인의 표현형은 명령 접두뿐이다**: 목록 밖 **명령**이 꼭 필요하면
   master 에게 사유 1줄을 보내 시간 한정 승인(`cys approval sign --prefix "<정확 명령>" --ttl <초>` →
   집행 전 `cys approval check --require-ttl` 확인)을 받는다 — TTL 없는 승인·재사용형 승인은 게이트가
-  인정하지 않는다. **도구 이름 deny 목록(CronCreate·CronDelete·CronList·Monitor·TaskOutput·Agent·
+  인정하지 않는다. **도구 이름 deny 목록(CronCreate·CronDelete·CronList·Monitor·TaskOutput·
   WebSearch·WebFetch·`mcp__computer-use__*`·Skill)과 이미지 첨부는 명령 접두로 표현되지 않으므로 TTL
   승인으로 열리지 않는다** — 그 절반의 유일한 경로는 권한자의 정책 변경이고, 그때까지는 **보류가
   종착점**이다(열 수 없는 문을 열렸다고 보고하지 마라). master 가 응답하지 않으면 §1-2 를 따른다.

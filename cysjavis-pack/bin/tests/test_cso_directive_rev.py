@@ -307,7 +307,7 @@ SAFETY_CLAUSES = {
         ("예산 카운터 초기화", "카운터는 `cys cycle-agent` 사이클(clear)\n"
                        "  후 초기화된다 — 경고를 받으면 그 자리에서 SESSION_STATE·CSO_TODO 를 저장하고 §2 절차대로 사이클을\n"
                        "  준비하라(예산 소진은 고장이 아니라 사이클 신호다)."),
-        ("TTL 표현형", "**도구 이름 deny 목록(CronCreate·CronDelete·CronList·Monitor·TaskOutput·Agent·\n"
+        ("TTL 표현형", "**도구 이름 deny 목록(CronCreate·CronDelete·CronList·Monitor·TaskOutput·\n"
                    "  WebSearch·WebFetch·`mcp__computer-use__*`·Skill)과 이미지 첨부는 명령 접두로 표현되지 않으므로 TTL\n"
                    "  승인으로 열리지 않는다** — 그 절반의 유일한 경로는 권한자의 정책 변경이고, 그때까지는 **보류가\n"
                    "  종착점**이다(열 수 없는 문을 열렸다고 보고하지 마라)."),
