@@ -3587,7 +3587,10 @@ def self_test_r1(fails):
 
     # ⑫ `queue clear` = [절대규칙] 의 사전 승인 청소(claude major)
     want(False, "Bash", {"command": "cys queue clear 12"}, "queue clear 는 사전 승인 청소")
-    want(True, "Bash", {"command": "cys queue deliver 12"}, "queue deliver 는 사람 전용")
+    # F58 T1-12: the CSO unblocks its lane's queue itself (deliver, revive); drop stays denied
+    want(False, "Bash", {"command": "cys queue deliver 12"}, "queue deliver 는 CSO 허용(F58 T1-12)")
+    want(False, "Bash", {"command": "cys queue revive 12"}, "queue revive 는 CSO 허용(F58 T1-12)")
+    want(True, "Bash", {"command": "cys queue drop 12"}, "queue drop 은 CSO 거부 유지(F58 T1-12)")
 
     # ⑬ 예산 면제의 실제 데이터 흐름(claude major #4 · codex major)
     over = ctx(tool_calls=3000)
