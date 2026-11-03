@@ -6319,6 +6319,89 @@ pub(crate) const WITHHELD_SUBMIT_WAIT_CAP_SECS: u64 = 600;
 /// ★(수정 3회차 FV2-1) '입력줄이 그 본문 그대로'·'창 없음'은 보류 탐침과 **같은 판정**([`submit_cr_verdict`] — 커서가 든 입력
 /// 블록 전체 · 블록 위 서명은 전경 아님)이다. 종전에는 본문 첫 줄의 `❯ 1.`·이력 에코를 창으로 보아 `wait_dialog` 에 영구히
 /// 머물렀다(실 claude · 접힌 줄·여러 줄 본문).
+
+pub(crate) const P10_EXTENT_MEASURED_ADAPTERS: &[&str] = &["unmeasured_placeholder_on_base"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResidueArmInput {
+    pub(crate) cfg_unix: bool,
+    pub(crate) seat_agent_backed: bool,
+    pub(crate) scope: SubmitGuardScope,
+    pub(crate) dialog_open: bool,
+    pub(crate) d9_scope: bool,
+    pub(crate) label_unbound: bool,
+    pub(crate) quiescing: bool,
+    pub(crate) paused: bool,
+    pub(crate) kill_switch: bool,
+    pub(crate) pending_bytes: usize,
+    pub(crate) raw_human_bytes: usize,
+    pub(crate) has_body: bool,
+    pub(crate) cli_body: bool,
+    pub(crate) human_after_body: bool,
+    pub(crate) provenance: bool,
+    pub(crate) slash_body: bool,
+    pub(crate) adapter_extent_measured: bool,
+    pub(crate) box_bounded: bool,
+    pub(crate) representation: bool,
+    pub(crate) after_and_below_empty: bool,
+    pub(crate) cr_age_ok: bool,
+    pub(crate) quiet_ok: bool,
+    pub(crate) withheld_present: bool,
+    pub(crate) queue_hold_present: bool,
+    pub(crate) already_tracked_for_body: bool,
+}
+
+pub(crate) fn residue_arm_verdict(_g: &ResidueArmInput) -> Result<(), &'static str> {
+    Err("unimplemented_on_07994870")
+}
+
+pub(crate) fn p10_block_matches_full_body(
+    _before_cursor: &str,
+    _mark_flat_len: usize,
+    _mark_flat_sha: &[u8; 32],
+) -> bool {
+    false
+}
+
+pub(crate) fn p10_after_and_below_empty(
+    _s: &crate::state::Surface,
+    _obs: &PromptBlockObs,
+    _placeholder: Option<&str>,
+) -> bool {
+    false
+}
+
+pub(crate) fn maybe_arm_swallowed_residue(
+    _daemon: &Arc<Daemon>,
+    _s: &Arc<crate::state::Surface>,
+    _markers: &[String],
+    _placeholder: Option<&str>,
+) {
+}
+
+pub(crate) fn resubmit_swallowed_one(
+    _daemon: &Arc<Daemon>,
+    _s: &Arc<crate::state::Surface>,
+    _w: crate::state::WithheldSubmit,
+    _now: std::time::Instant,
+) -> &'static str {
+    "unimplemented_on_07994870"
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn residue_final_probe(
+    _daemon: &Arc<Daemon>,
+    _s: &Arc<crate::state::Surface>,
+    _markers: Vec<String>,
+    _placeholder: Option<String>,
+    _req_id: String,
+    _body_at: std::time::Instant,
+    _expected_gen: u64,
+    _from_surface: Option<u64>,
+) -> Box<dyn Fn() -> bool + Send + Sync> {
+    Box::new(|| false)
+}
+
 pub(crate) fn resubmit_withheld_submits(daemon: &Arc<Daemon>) {
     resubmit_withheld_submits_at(daemon, std::time::Instant::now());
 }
@@ -8893,6 +8976,7 @@ pub(crate) struct QueueBlockDiag {
     /// ★(codex 2차 검토 #4) 이 좌석은 다시 그리기 요청 **대상이 아니다** — 프롬프트 표지를 모르는 좌석(맨 셸·마커 미선언 어댑터 — 큐 틱의 마커 없는 경로는 nudge 를 부르지 않는다)
     /// 또는 전경이 에이전트가 아닌 대체 화면. 처방은 이 좌석에 요청을 약속하지 않는다.
     pub(crate) nudge_ineligible: bool,
+    pub(crate) residue: crate::state::QueueBlockResidue,
 }
 
 /// ★(0.14.45 · F3) 화면 동기 진단 묶음 — [`QueueBlockDiag`] 의 `cursor_row`·`marker_row`·`cursor_lead_cp`.
@@ -9424,6 +9508,7 @@ pub(crate) fn queue_block_diag_with(
         rows_too_small,
         repaint_unresolved,
         nudge_ineligible,
+        residue: crate::state::QueueBlockResidue::None,
     }
 }
 
@@ -14572,6 +14657,18 @@ fn composer_export_observed(s: &crate::state::Surface) {
         }
     });
 }
+
+#[cfg(test)]
+static P10_EXTENT_OVERRIDE: std::sync::Mutex<Option<&'static [&'static str]>> =
+    std::sync::Mutex::new(None);
+#[cfg(test)]
+static P10_PLATFORM_OVERRIDE: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+static P10_ARM_BEFORE_COMMIT_HOOK: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> =
+    std::sync::Mutex::new(None);
+#[cfg(test)]
+static P10_GAP_HOOK: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> =
+    std::sync::Mutex::new(None);
 
 /// env를 테스트 종료 시(패닉 포함) 이전 값으로 원복하는 가드 —
 /// 없던 값은 remove, 있던 값은 원복. 프로세스 전역 env 누수 차단.
@@ -31078,7 +31175,30 @@ after-tick liveness alone does not attribute a clock defect",
 
         // 3~9행 — 입력줄 계열(두 사유 모두): 계수 0 → 가시성 → 사람 몫 → 커서 뒤 글자.
         for blocked in [ip, sd] {
-            // 3행 human_draft — 계수 0 인데 화면에 글이 보인다.
+            // 3a행 wait(P10) — 계수 0 + 화면에 글이 보임 + 기계 잔여 본문 제출 Return 재전송 대기(Armed).
+            let mut armed_diag = c5_diag_ga(0, 0, Some(true), None);
+            armed_diag.residue = crate::state::QueueBlockResidue::Armed;
+            check(
+                blocked,
+                &armed_diag,
+                "wait",
+                &["기계가 넣고 제출되지 않은 본문이 입력줄에 보인다", "제출 Return 을 한 번 다시 보내는 중", "스스로 풀린다"],
+            );
+            // 3b행 machine_residue(P10) — 계수 0 + 화면에 글이 보임 + 기계 잔여 본문(Spent 또는 Declined).
+            for res in [
+                crate::state::QueueBlockResidue::Spent,
+                crate::state::QueueBlockResidue::Declined("d9_scope"),
+            ] {
+                let mut res_diag = c5_diag_ga(0, 0, Some(true), None);
+                res_diag.residue = res;
+                check(
+                    blocked,
+                    &res_diag,
+                    "machine_residue",
+                    &["기계가 넣고 제출되지 않은 본문이 입력줄에 보인다", "Enter 로 제출하거나 지운다", "원장에는 이미 배달로 기록"],
+                );
+            }
+            // 3행 human_draft — 계수 0 인데 화면에 글이 보인다(residue == None).
             check(
                 blocked,
                 &c5_diag_ga(0, 0, Some(true), None),
@@ -36698,6 +36818,1697 @@ mod r3_1_lineage_tests {
             assert_eq!(stray, None, "{entry}: 루트가 아닌 pid(1)까지는 사슬이 닿지 않아야 한다");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    // ===== P10: Swallowed Queue-Submit Return Recovery & Diagnosis Tests (r1 / r2 / r3) =====
+
+    struct P10TestScopeGuard;
+
+    impl P10TestScopeGuard {
+        fn claude() -> Self {
+            *super::P10_EXTENT_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()) = Some(&["claude"]);
+            *super::P10_PLATFORM_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()) = Some(true);
+            *super::P10_ARM_BEFORE_COMMIT_HOOK.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *super::P10_GAP_HOOK.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            Self
+        }
+
+        fn unmeasured() -> Self {
+            *super::P10_EXTENT_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *super::P10_PLATFORM_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()) = Some(true);
+            *super::P10_ARM_BEFORE_COMMIT_HOOK.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *super::P10_GAP_HOOK.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            Self
+        }
+    }
+
+    impl Drop for P10TestScopeGuard {
+        fn drop(&mut self) {
+            *super::P10_EXTENT_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *super::P10_PLATFORM_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *super::P10_ARM_BEFORE_COMMIT_HOOK.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *super::P10_GAP_HOOK.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
+    fn p10_seed_mark(
+        s: &Arc<crate::state::Surface>,
+        text: &str,
+        age_secs: u64,
+        req_id: Option<&str>,
+    ) -> std::time::Instant {
+        s.set_pending_input(0);
+        s.inject_track.note_body(text, None);
+        let body = s.inject_track.last_body().expect("last_body");
+        let now = std::time::Instant::now();
+        let cr_mono = now.checked_sub(std::time::Duration::from_secs(age_secs)).unwrap_or(now);
+        let (flat_len, flat_sha) = crate::state::flat_text_digest(text);
+        let mark = req_id.map(|id| crate::state::QueueSubmitMark {
+            request_id: id.to_string(),
+            body_at: body.at,
+            gen: s.input_gen.load(AtomicOrdering::Acquire),
+            epoch: s.inject_track.resume_write_epoch(),
+            human_at: *s.last_human_input.lock().unwrap(),
+            agent_epoch: s.agent_epoch.load(AtomicOrdering::Acquire),
+            conversation_epoch: s.conversation_epoch.load(AtomicOrdering::Acquire),
+            cr_mono,
+            flat_len,
+            flat_sha,
+            from: None,
+        });
+        s.inject_track.set_queue_submit_mark(mark);
+        now
+    }
+
+    fn p10_paint_inline_box(s: &Arc<crate::state::Surface>, body_row: &str) {
+        let lines = [
+            "❯ earlier turn",
+            "  ack 1",
+            RULE,
+            body_row,
+            RULE,
+            STATUS1,
+            STATUS2,
+        ];
+        paint_screen(s, &lines, 3, body_row.chars().count() as u16, false);
+        quiet_since(s, 10);
+    }
+
+    fn p10_arm(daemon: &Arc<Daemon>, s: &Arc<crate::state::Surface>) {
+        super::maybe_arm_swallowed_residue(daemon, s, &["❯".to_string()], None);
+    }
+
+    fn p10_valid_arm_input() -> super::ResidueArmInput {
+        super::ResidueArmInput {
+            cfg_unix: true,
+            seat_agent_backed: true,
+            scope: super::SubmitGuardScope::InlineAndAlt,
+            dialog_open: false,
+            d9_scope: false,
+            label_unbound: false,
+            quiescing: false,
+            paused: false,
+            kill_switch: false,
+            pending_bytes: 0,
+            raw_human_bytes: 0,
+            has_body: true,
+            cli_body: false,
+            human_after_body: false,
+            provenance: true,
+            slash_body: false,
+            adapter_extent_measured: true,
+            box_bounded: true,
+            representation: true,
+            after_and_below_empty: true,
+            cr_age_ok: true,
+            quiet_ok: true,
+            withheld_present: false,
+            queue_hold_present: false,
+            already_tracked_for_body: false,
+        }
+    }
+
+    #[test]
+    fn p10_arm_verdict_every_guard_in_order() {
+        let base = p10_valid_arm_input();
+        assert_eq!(super::residue_arm_verdict(&base), Ok(()));
+
+        let mut g = base;
+        g.cfg_unix = false;
+        assert_eq!(super::residue_arm_verdict(&g), Err("platform"));
+
+        let mut g = base;
+        g.seat_agent_backed = false;
+        assert_eq!(super::residue_arm_verdict(&g), Err("seat_off"));
+
+        let mut g = base;
+        g.scope = super::SubmitGuardScope::Off;
+        assert_eq!(super::residue_arm_verdict(&g), Err("seat_off"));
+
+        let mut g = base;
+        g.dialog_open = true;
+        assert_eq!(super::residue_arm_verdict(&g), Err("dialog"));
+
+        let mut g = base;
+        g.d9_scope = true;
+        assert_eq!(super::residue_arm_verdict(&g), Err("d9_scope"));
+
+        let mut g = base;
+        g.label_unbound = true;
+        assert_eq!(super::residue_arm_verdict(&g), Err("label_unbound"));
+
+        let mut g = base;
+        g.quiescing = true;
+        assert_eq!(super::residue_arm_verdict(&g), Err("quiescing"));
+
+        let mut g = base;
+        g.paused = true;
+        assert_eq!(super::residue_arm_verdict(&g), Err("paused"));
+
+        let mut g = base;
+        g.kill_switch = true;
+        assert_eq!(super::residue_arm_verdict(&g), Err("kill_switch"));
+
+        let mut g = base;
+        g.pending_bytes = 2;
+        assert_eq!(super::residue_arm_verdict(&g), Err("count"));
+
+        let mut g = base;
+        g.raw_human_bytes = 1;
+        assert_eq!(super::residue_arm_verdict(&g), Err("raw_human"));
+
+        let mut g = base;
+        g.has_body = false;
+        assert_eq!(super::residue_arm_verdict(&g), Err("no_body"));
+
+        let mut g = base;
+        g.cli_body = true;
+        assert_eq!(super::residue_arm_verdict(&g), Err("cli_body"));
+
+        let mut g = base;
+        g.human_after_body = true;
+        assert_eq!(super::residue_arm_verdict(&g), Err("human_after"));
+
+        let mut g = base;
+        g.provenance = false;
+        assert_eq!(super::residue_arm_verdict(&g), Err("provenance"));
+
+        let mut g = base;
+        g.slash_body = true;
+        assert_eq!(super::residue_arm_verdict(&g), Err("slash_body"));
+
+        let mut g = base;
+        g.adapter_extent_measured = false;
+        assert_eq!(super::residue_arm_verdict(&g), Err("unmeasured_adapter"));
+
+        let mut g = base;
+        g.box_bounded = false;
+        assert_eq!(super::residue_arm_verdict(&g), Err("unbounded_box"));
+
+        let mut g = base;
+        g.representation = false;
+        assert_eq!(super::residue_arm_verdict(&g), Err("representation"));
+
+        let mut g = base;
+        g.after_and_below_empty = false;
+        assert_eq!(super::residue_arm_verdict(&g), Err("below"));
+
+        let mut g = base;
+        g.cr_age_ok = false;
+        assert_eq!(super::residue_arm_verdict(&g), Err("cr_age"));
+
+        let mut g = base;
+        g.quiet_ok = false;
+        assert_eq!(super::residue_arm_verdict(&g), Err("quiet"));
+
+        let mut g = base;
+        g.withheld_present = true;
+        assert_eq!(super::residue_arm_verdict(&g), Err("withheld_owns_cr"));
+
+        let mut g = base;
+        g.queue_hold_present = true;
+        assert_eq!(super::residue_arm_verdict(&g), Err("hold_owns_cr"));
+
+        let mut g = base;
+        g.already_tracked_for_body = true;
+        assert_eq!(super::residue_arm_verdict(&g), Err("spent"));
+    }
+
+    #[test]
+    fn p10_block_proof_not_row_proof() {
+        let (_g, _sc) = (
+            QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner()),
+            P10TestScopeGuard::claude(),
+        );
+        let (_daemon, s) = marker_seat("p10-blk-proof");
+        p1_measured(&s);
+        let _now = p10_seed_mark(&s, "M|x|AAA", 5, Some("q-blk"));
+        // Cursor row matches `M|x|AAA`, but a second draft row sits below inside the composer box.
+        let lines = [
+            "❯ earlier turn",
+            "  ack 1",
+            RULE,
+            "❯ M|x|AAA",
+            "  human extra line",
+            RULE,
+            STATUS1,
+        ];
+        paint_screen(&s, &lines, 3, 9, false);
+        let obs = super::observe_prompt_block(&s, &["❯".to_string()]);
+        let mark = s.inject_track.queue_submit_mark().unwrap();
+        let block = obs.block.as_ref().unwrap();
+        assert!(super::p10_block_matches_full_body(&block.before_cursor, mark.flat_len, &mark.flat_sha));
+        assert!(!super::p10_after_and_below_empty(&s, &obs, None));
+        crate::state::p1_e0_stop_daemon(&_daemon);
+    }
+
+    #[test]
+    fn p10_arm_only_in_input_pending_branch() {
+        let src = include_str!("governance.rs");
+        let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("mod tests anchor")];
+        let mut call_sites = Vec::new();
+        for (idx, line) in prod.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            if trimmed.contains("maybe_arm_swallowed_residue(") {
+                call_sites.push((idx + 1, trimmed.to_string()));
+            }
+        }
+        // Exactly two occurrences in production code: the `fn maybe_arm_swallowed_residue(` definition
+        // and the single call inside the `if why == BLOCKED_INPUT_PENDING` branch of `deliver_queued`.
+        assert_eq!(call_sites.len(), 2, "unexpected maybe_arm_swallowed_residue sites: {call_sites:?}");
+        assert!(call_sites[0].1.starts_with("fn maybe_arm_swallowed_residue("));
+        let dq = &prod[prod.find("fn deliver_queued(").expect("deliver_queued")..];
+        let ip = dq.find("if why == BLOCKED_INPUT_PENDING {").expect("InputPending branch");
+        let arm = dq.find("maybe_arm_swallowed_residue(").expect("arm call");
+        let close = dq[ip..].find("continue;").expect("InputPending continue") + ip;
+        assert!(ip < arm && arm < close, "maybe_arm_swallowed_residue must sit inside the BLOCKED_INPUT_PENDING branch");
+    }
+
+    #[test]
+    fn p10_swallowed_queue_cr_resubmits_once_then_next_item_delivers() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let pack = empty_pack_dir("p10-t1");
+        let _env = QueueEnvGuard::set(&[
+            ("CYS_PACK_DIR", pack.to_str().unwrap()),
+            ("CYS_QUEUE_STARVE_ALERT_SECS", "0"),
+            ("CYS_QUEUE_QUIET_SECS", "1"),
+        ]);
+        let (daemon, s) = p1_seat("p10-t1");
+        let _now = p10_seed_mark(&s, "M|x|AAA", 5, Some("q-t1"));
+        p10_paint_inline_box(&s, "❯ M|x|AAA");
+
+        // Tick 1: `deliver_queued` sees `InputPending` on the swallowed body, arms one `Swallowed` record, and holds item B.
+        tick(&daemon);
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "item B stays queued on arming tick");
+        assert_eq!(
+            s.inject_track.residue_stage_for_current_body(),
+            Some(crate::state::ResidueStage::Armed),
+            "tick 1 must arm Swallowed residue track"
+        );
+        assert_eq!(
+            super::queue_block_diag(&daemon, &s).residue,
+            crate::state::QueueBlockResidue::Armed,
+            "while Armed, remedy row is 3a (wait)"
+        );
+
+        // Tick 2: `resubmit_withheld_one` hands off the single recovery CR, writer drains it (`Written`),
+        // and once the TUI consumes the line (empty box), the next tick delivers item B.
+        let t2 = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let r = super::resubmit_withheld_one(&daemon, &s, t2);
+        assert_eq!(r, "resubmitted");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while s.write_tx.gate().pending() != 0 {
+            assert!(std::time::Instant::now() < deadline, "writer did not drain recovery CR");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            matches!(
+                s.inject_track.residue_stage_for_current_body(),
+                Some(crate::state::ResidueStage::Written { .. })
+            ),
+            "writer completion callback must advance stage to Written"
+        );
+
+        // Simulate TUI consuming the submitted line -> empty composer box -> next tick delivers queued item B.
+        s.clear_pending_input();
+        p10_paint_inline_box(&s, "❯ ");
+        tick(&daemon);
+        assert!(
+            s.pending_queue.lock().unwrap().is_empty(),
+            "once recovery CR clears composer, queued item B must deliver"
+        );
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10_swallowed_cr_claude_paste_placeholder_resubmits() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let pack = empty_pack_dir("p10-t2-chip");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (daemon, s) = wp5_seat("p10-t2-chip", "claude");
+        p1_measured(&s);
+        let long_body = "line1\nline2\nline3\nline4\nline5";
+        let now = p10_seed_mark(&s, long_body, 5, Some("q-t2"));
+        p10_paint_inline_box(&s, "❯ [Pasted text #1 +4 lines]");
+
+        // Under R2b, a paste chip has a different flat_text digest from `long_body` and is refused at `representation`.
+        p10_arm(&daemon, &s);
+        assert_eq!(
+            s.inject_track.residue_stage_for_current_body(),
+            Some(crate::state::ResidueStage::Declined("representation")),
+            "paste chip does not match flat_sha of multi-line body under R2b"
+        );
+        let _ = now;
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10_swallowed_cr_d1_off_pin_path_resubmits() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let pack = empty_pack_dir("p10-t3-d1off");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (daemon, s) = wp5_seat("p10-t3-d1off", "claude");
+        s.d1_platform.store(false, AtomicOrdering::Relaxed);
+        let now = p10_seed_mark(&s, "M|x|D1OFF", 5, Some("q-t3"));
+        p10_paint_inline_box(&s, "❯ M|x|D1OFF");
+
+        let obs = super::observe_prompt_block(&s, &["❯".to_string()]);
+        assert_eq!(obs.label, cys::readiness::ComposerLabel::None);
+        p10_arm(&daemon, &s);
+        assert_eq!(
+            s.inject_track.residue_stage_for_current_body(),
+            Some(crate::state::ResidueStage::Armed),
+            "Unix D1-off seat with bounded box must arm and resubmit"
+        );
+        let r = super::resubmit_withheld_one(&daemon, &s, now + std::time::Duration::from_secs(5));
+        assert_eq!(r, "resubmitted");
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10_remedy_wait_while_armed_machine_residue_when_spent() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let pack = empty_pack_dir("p10-t4-remedy");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (daemon, s) = wp5_seat("p10-t4-remedy", "claude");
+        p1_measured(&s);
+        let now = p10_seed_mark(&s, "M|x|REM", 5, Some("q-t4"));
+        p10_paint_inline_box(&s, "❯ M|x|REM");
+
+        p10_arm(&daemon, &s);
+        let d_wait = super::queue_block_diag(&daemon, &s);
+        assert_eq!(d_wait.residue, crate::state::QueueBlockResidue::Armed);
+        let (code_wait, msg_wait) = super::queue_remedy(super::BLOCKED_INPUT_PENDING, &d_wait);
+        assert_eq!(code_wait, "wait");
+        assert!(msg_wait.contains("데몬이 제출 Return 을 한 번 다시 보내는 중이다"), "row 3a text mismatch: {msg_wait}");
+
+        // Resubmit and let writer write the CR (`Written`), then advance 4s while the line is STILL on screen -> `Spent` -> `machine_residue` (row 3b).
+        assert_eq!(
+            super::resubmit_withheld_one(&daemon, &s, now + std::time::Duration::from_secs(5)),
+            "resubmitted"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while s.write_tx.gate().pending() != 0 {
+            assert!(std::time::Instant::now() < deadline, "writer did not drain");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(matches!(
+            s.inject_track.residue_stage_for_current_body(),
+            Some(crate::state::ResidueStage::Written { .. })
+        ));
+        assert_eq!(super::queue_block_diag(&daemon, &s).residue, crate::state::QueueBlockResidue::Armed);
+
+        // Backdate `written_at` by 4s so the next `maybe_arm_swallowed_residue` transitions `Written -> Spent`.
+        let body_at = s.inject_track.last_body().unwrap().at;
+        s.inject_track.test_backdate_residue_written_at(
+            "q-t4",
+            body_at,
+            std::time::Instant::now() - std::time::Duration::from_secs(4),
+        );
+        p10_arm(&daemon, &s);
+        assert_eq!(
+            s.inject_track.residue_stage_for_current_body(),
+            Some(crate::state::ResidueStage::Spent)
+        );
+        let d_spent = super::queue_block_diag(&daemon, &s);
+        assert_eq!(d_spent.residue, crate::state::QueueBlockResidue::Spent);
+        let (code_spent, msg_spent) = super::queue_remedy(super::BLOCKED_INPUT_PENDING, &d_spent);
+        assert_eq!(code_spent, "machine_residue");
+        assert!(
+            msg_spent.contains("기계가 넣고 제출되지 않은 본문이 입력줄에 보인다")
+                && msg_spent.contains("원장에는 이미 배달로 기록"),
+            "row 3b text mismatch: {msg_spent}"
+        );
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10_resubmit_cr_swallowed_again_writes_no_second_cr() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let pack = empty_pack_dir("p10-t5-once");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (daemon, s) = wp5_seat("p10-t5-once", "claude");
+        p1_measured(&s);
+        let now = p10_seed_mark(&s, "M|x|ONCE", 5, Some("q-t5"));
+        p10_paint_inline_box(&s, "❯ M|x|ONCE");
+
+        p10_arm(&daemon, &s);
+        assert_eq!(
+            super::resubmit_withheld_one(&daemon, &s, now + std::time::Duration::from_secs(5)),
+            "resubmitted"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while s.write_tx.gate().pending() != 0 {
+            assert!(std::time::Instant::now() < deadline, "writer did not drain");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let body_at = s.inject_track.last_body().unwrap().at;
+        s.inject_track.test_backdate_residue_written_at(
+            "q-t5",
+            body_at,
+            std::time::Instant::now() - std::time::Duration::from_secs(4),
+        );
+        // Subsequent ticks transition to `Spent` and stay `Spent`; never arm or write a second CR.
+        p10_arm(&daemon, &s);
+        assert_eq!(
+            s.inject_track.residue_stage_for_current_body(),
+            Some(crate::state::ResidueStage::Spent)
+        );
+        p10_arm(&daemon, &s);
+        assert_eq!(
+            s.inject_track.residue_stage_for_current_body(),
+            Some(crate::state::ResidueStage::Spent)
+        );
+        assert!(s.inject_track.withheld().is_none(), "must never re-arm a second WithheldSubmit");
+        let resub_evs: Vec<_> = daemon
+            .bus
+            .tail(200)
+            .into_iter()
+            .filter(|e| e["name"] == "queue.submit_resubmitted")
+            .collect();
+        assert_eq!(resub_evs.len(), 1, "at most 1 recovery Return for one body_at: {resub_evs:?}");
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10_d9_seat_declines_with_machine_residue_code() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let pack = empty_pack_dir("p10-t7-d9");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (daemon, s) = wp5_seat("p10-t7-d9", "claude");
+        p1_measured(&s);
+        daemon.roles.lock().unwrap().insert("master".to_string(), s.id);
+        let _now = p10_seed_mark(&s, "M|x|MASTER", 5, Some("q-t7"));
+        p10_paint_inline_box(&s, "❯ M|x|MASTER");
+
+        p10_arm(&daemon, &s);
+        assert!(s.inject_track.withheld().is_none(), "D9 seat must never arm auto-Return");
+        assert_eq!(
+            s.inject_track.residue_stage_for_current_body(),
+            Some(crate::state::ResidueStage::Declined("d9_scope")),
+            "D9 seat with proven residue records Declined so operator gets row 3b diagnosis"
+        );
+        assert_eq!(
+            super::queue_block_diag(&daemon, &s).residue,
+            crate::state::QueueBlockResidue::Declined("d9_scope")
+        );
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10_human_draft_counted_never_resubmitted() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let (daemon, s) = wp5_seat("p10-k1-human", "claude");
+        p1_measured(&s);
+        let _now = p10_seed_mark(&s, "M|x|AAA", 5, Some("q-k1"));
+        s.pending_input.lock().unwrap().human = 3;
+        s.pending_input_bytes.store(4, AtomicOrdering::Relaxed);
+        p10_paint_inline_box(&s, "❯ M|x|AAA");
+        p10_arm(&daemon, &s);
+        assert!(s.inject_track.withheld().is_none());
+        assert_eq!(super::queue_block_diag(&daemon, &s).residue, crate::state::QueueBlockResidue::None);
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10_unproven_text_after_restart_never_resubmitted() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let (daemon, s) = wp5_seat("p10-k2-restart", "claude");
+        p1_measured(&s);
+        p10_paint_inline_box(&s, "❯ leftover text after daemon restart");
+        p10_arm(&daemon, &s);
+        assert!(s.inject_track.withheld().is_none());
+        assert_eq!(super::queue_block_diag(&daemon, &s).residue, crate::state::QueueBlockResidue::None);
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10_other_machine_text_never_resubmitted() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let (daemon, s) = wp5_seat("p10-k3-other", "claude");
+        p1_measured(&s);
+        let _now = p10_seed_mark(&s, "M|x|AAA", 5, Some("q-k3"));
+        p10_paint_inline_box(&s, "❯ M|x|BBB");
+        p10_arm(&daemon, &s);
+        assert!(s.inject_track.withheld().is_none());
+        assert_eq!(
+            s.inject_track.residue_stage_for_current_body(),
+            Some(crate::state::ResidueStage::Declined("representation"))
+        );
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10_human_typing_after_arm_drops_the_record_writes_nothing() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let (daemon, s) = wp5_seat("p10-k4-human-after", "claude");
+        p1_measured(&s);
+        let now = p10_seed_mark(&s, "M|x|AAA", 5, Some("q-k4"));
+        p10_paint_inline_box(&s, "❯ M|x|AAA");
+        p10_arm(&daemon, &s);
+        assert!(s.inject_track.withheld().is_some());
+        // Human types a character before `resubmit_withheld_one` runs.
+        s.pending_input.lock().unwrap().human = 1;
+        s.pending_input_bytes.store(2, AtomicOrdering::Relaxed);
+        let r = super::resubmit_withheld_one(&daemon, &s, now + std::time::Duration::from_secs(5));
+        assert_eq!(r, "human");
+        assert!(s.inject_track.withheld().is_none());
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10_human_cursor_key_after_residue_blocks_arming() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let (daemon, s) = wp5_seat("p10-k5-cursor", "claude");
+        p1_measured(&s);
+        let _now = p10_seed_mark(&s, "M|x|AAA", 5, Some("q-k5"));
+        // Cursor moved left by 2 columns (`after_cursor` non-empty).
+        let lines = ["❯ earlier turn", "  ack 1", RULE, "❯ M|x|AAA", RULE, STATUS1, STATUS2];
+        paint_screen(&s, &lines, 3, 7, false);
+        quiet_since(&s, 10);
+        p10_arm(&daemon, &s);
+        assert!(s.inject_track.withheld().is_none());
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10_raw_human_bytes_block_arming() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let (daemon, s) = wp5_seat("p10-k6-raw", "claude");
+        p1_measured(&s);
+        let _now = p10_seed_mark(&s, "M|x|AAA", 5, Some("q-k6"));
+        s.pending_input.lock().unwrap().human = 1;
+        p10_paint_inline_box(&s, "❯ M|x|AAA");
+        p10_arm(&daemon, &s);
+        assert!(s.inject_track.withheld().is_none());
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10_merged_two_residues_unproven_hold() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let (daemon, s) = wp5_seat("p10-k7-merged", "claude");
+        p1_measured(&s);
+        let _now = p10_seed_mark(&s, "M|x|SECOND", 5, Some("q-k7"));
+        p10_paint_inline_box(&s, "❯ M|x|FIRST M|x|SECOND");
+        p10_arm(&daemon, &s);
+        assert!(s.inject_track.withheld().is_none());
+        assert_eq!(
+            s.inject_track.residue_stage_for_current_body(),
+            Some(crate::state::ResidueStage::Declined("representation"))
+        );
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10_empty_composer_delivery_byte_identical_no_arm_observation() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let pack = empty_pack_dir("p10-k8-empty");
+        let _env = QueueEnvGuard::set(&[
+            ("CYS_PACK_DIR", pack.to_str().unwrap()),
+            ("CYS_QUEUE_STARVE_ALERT_SECS", "0"),
+        ]);
+        let (daemon, s) = p1_seat("p10-k8-empty");
+        p10_paint_inline_box(&s, "❯ ");
+        tick(&daemon);
+        assert!(s.pending_queue.lock().unwrap().is_empty(), "empty composer delivers normally");
+        assert!(s.inject_track.withheld().is_none());
+        assert!(s.inject_track.residue_stage_for_current_body().is_none());
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10_unbound_label_blocks_arming() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let (daemon, s) = wp5_seat("p10-k9-unbound", "claude");
+        p1_measured(&s);
+        let _now = p10_seed_mark(&s, "M|x|AAA", 5, Some("q-k9"));
+        let lines = [
+            "❯ earlier turn",
+            "  ack 1",
+            "─────────────────────────────────── my-title ─",
+            "❯ M|x|AAA",
+            RULE,
+            STATUS1,
+            STATUS2,
+        ];
+        paint_screen(&s, &lines, 3, 9, false);
+        p7_set_osc_title(&s, "✳ other-title");
+        quiet_since(&s, 10);
+        let obs = super::observe_prompt_block(&s, &["❯".to_string()]);
+        assert_eq!(obs.label, cys::readiness::ComposerLabel::Unbound);
+        p10_arm(&daemon, &s);
+        assert!(s.inject_track.withheld().is_none());
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10_cli_body_swallowed_return_not_resubmitted_retry_still_queued() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let (daemon, s) = wp5_seat("p10-k10-cli", "claude");
+        p1_measured(&s);
+        // Direct CLI `send_text` records `note_body`, NOT `set_queue_submit_mark`.
+        s.set_pending_input(0);
+        s.inject_track.note_body("direct cli text", None);
+        p10_paint_inline_box(&s, "❯ direct cli text");
+        p10_arm(&daemon, &s);
+        assert!(s.inject_track.withheld().is_none());
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10_slash_body_not_resubmitted() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let (daemon, s) = wp5_seat("p10-k11-slash", "claude");
+        p1_measured(&s);
+        let _now = p10_seed_mark(&s, "/clear", 5, Some("q-k11"));
+        p10_paint_inline_box(&s, "❯ /clear");
+        p10_arm(&daemon, &s);
+        assert!(s.inject_track.withheld().is_none());
+        assert_eq!(
+            s.inject_track.residue_stage_for_current_body(),
+            Some(crate::state::ResidueStage::Declined("slash_body")),
+            "slash_body with proven residue declines to row 3b (no auto-Return)"
+        );
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10_dialog_foreground_blocks_arming() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let (daemon, s) = wp5_seat("p10-k12-modal", "claude");
+        p1_measured(&s);
+        let _now = p10_seed_mark(&s, "M|x|AAA", 5, Some("q-k12"));
+        p10_paint_inline_box(&s, "❯ M|x|AAA");
+        daemon.push_feed_notification("approval", "승인 대기", "body", Some(s.id));
+        p10_arm(&daemon, &s);
+        assert!(s.inject_track.withheld().is_none());
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10_line_cleared_before_write_withholds_the_cr() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let (daemon, s) = wp5_seat("p10-k13-cleared", "claude");
+        p1_measured(&s);
+        let now = p10_seed_mark(&s, "M|x|AAA", 5, Some("q-k13"));
+        p10_paint_inline_box(&s, "❯ M|x|AAA");
+        p10_arm(&daemon, &s);
+        assert!(s.inject_track.withheld().is_some());
+        let s_hook = Arc::clone(&s);
+        *super::P10_GAP_HOOK.lock().unwrap() = Some(Box::new(move || {
+            p10_paint_inline_box(&s_hook, "❯ ");
+        }));
+        assert_eq!(
+            super::resubmit_withheld_one(&daemon, &s, now + std::time::Duration::from_secs(5)),
+            "resubmitted"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while s.write_tx.gate().pending() != 0 {
+            assert!(std::time::Instant::now() < deadline, "writer did not drain");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let settle = s.inject_track.submit_settle_obs(crate::state::settle_mono_ms(), 60_000);
+        assert_eq!(settle.since_written_ms, None, "final probe must withhold when line cleared in gap");
+        assert_eq!(
+            s.inject_track.residue_stage_for_current_body(),
+            Some(crate::state::ResidueStage::Declined("withheld"))
+        );
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10_dead_seat_never_armed_node_recover_unchanged() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let (daemon, s) = wp5_seat("p10-k14-dead", "claude");
+        p1_measured(&s);
+        let _now = p10_seed_mark(&s, "M|x|AAA", 5, Some("q-k14"));
+        p10_paint_inline_box(&s, "❯ M|x|AAA");
+        s.agent_exit_notified.store(true, AtomicOrdering::Relaxed);
+        s.seat_cache.store(SeatState::Empty.as_u8(), AtomicOrdering::Relaxed);
+        p10_arm(&daemon, &s);
+        assert!(s.inject_track.withheld().is_none());
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10_withheld_record_present_no_arm_one_cr() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let (daemon, s) = wp5_seat("p10-k15-withheld", "claude");
+        p1_measured(&s);
+        let now = p10_seed_mark(&s, "M|x|AAA", 5, Some("q-k15"));
+        let body_at = s.inject_track.last_body().unwrap().at;
+        s.inject_track
+            .note_withheld(crate::state::WithheldSubmit::new(now, body_at, None));
+        p10_paint_inline_box(&s, "❯ M|x|AAA");
+        p10_arm(&daemon, &s);
+        assert_eq!(
+            s.inject_track.withheld().unwrap().kind,
+            crate::state::WithheldKind::DialogWithheld
+        );
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10_queue_hold_present_no_arm_one_cr() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let (daemon, s) = wp5_seat("p10-k16-qhold", "claude");
+        p1_measured(&s);
+        let now = p10_seed_mark(&s, "M|x|AAA", 5, Some("q-k16"));
+        *s.queue_hold.lock().unwrap() = Some(crate::state::QueueHold {
+            kind: crate::state::QueueHoldKind::PartialExact,
+            reason: "modal".into(),
+            request_id: "q-k16".into(),
+            entry_ids: vec!["q-k16".into()],
+            since: now,
+            attempts: 1,
+            next_retry: None,
+            envelope: None,
+            notified: false,
+            resume: None,
+            resuming: false,
+        });
+        p10_paint_inline_box(&s, "❯ M|x|AAA");
+        p10_arm(&daemon, &s);
+        assert!(s.inject_track.withheld().is_none());
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10_quiescing_seat_no_arm_no_write() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let (daemon, s) = wp5_seat("p10-k17-quiesce", "claude");
+        p1_measured(&s);
+        let _now = p10_seed_mark(&s, "M|x|AAA", 5, Some("q-k17"));
+        s.quiescing.store(true, AtomicOrdering::Relaxed);
+        p10_paint_inline_box(&s, "❯ M|x|AAA");
+        p10_arm(&daemon, &s);
+        assert!(s.inject_track.withheld().is_none());
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10_kill_switch_drops_swallowed_record() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let pack = empty_pack_dir("p10-k18-kill");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (daemon, s) = wp5_seat("p10-k18-kill", "claude");
+        p1_measured(&s);
+        let now = p10_seed_mark(&s, "M|x|AAA", 5, Some("q-k18"));
+        p10_paint_inline_box(&s, "❯ M|x|AAA");
+        p10_arm(&daemon, &s);
+        assert!(s.inject_track.withheld().is_some());
+        let _kill = QueueEnvGuard::set(&[("CYS_DISABLE_SUBMIT_WITHHOLD", "1")]);
+        let r = super::resubmit_withheld_one(&daemon, &s, now + std::time::Duration::from_secs(5));
+        assert_eq!(r, "kill_switch");
+        assert!(s.inject_track.withheld().is_none());
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10_composer_export_bytes_unchanged() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let pack = empty_pack_dir("p10-k21-export");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (daemon, s) = wp5_seat("p10-k21-export", "claude");
+        p1_measured(&s);
+        p10_paint_inline_box(&s, "❯ M|x|AAA");
+        let before = super::observe_composer_export(&s);
+        let _now = p10_seed_mark(&s, "M|x|AAA", 5, Some("q-k21"));
+        p10_arm(&daemon, &s);
+        assert!(s.inject_track.withheld().is_some());
+        let after = super::observe_composer_export(&s);
+        assert_eq!(before, after, "P10 must not alter read-screen composer export bytes");
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    // ===== r2 behavioural tests (`DESIGN-P10-r2.md` §7) =====
+
+    #[test]
+    fn p10r2_two_paste_chips_never_recovered() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let (daemon, s) = wp5_seat("p10r2-2chips", "claude");
+        p1_measured(&s);
+        let _now = p10_seed_mark(&s, "a\nb\nc\nd\ne", 5, Some("q-r2-1"));
+        p10_paint_inline_box(&s, "❯ [Pasted text #1 +2 lines] [Pasted text #2 +2 lines]");
+        p10_arm(&daemon, &s);
+        assert!(s.inject_track.withheld().is_none());
+        assert_eq!(
+            s.inject_track.residue_stage_for_current_body(),
+            Some(crate::state::ResidueStage::Declined("representation"))
+        );
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10r2_producer_body_never_recovered() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let (daemon, s) = wp5_seat("p10r2-prod", "claude");
+        p1_measured(&s);
+        let _now = p10_seed_mark(&s, "line1\nline2\nline3", 5, Some("q-r2-2"));
+        p10_paint_inline_box(&s, "❯ [Pasted text #1 +4 lines]");
+        p10_arm(&daemon, &s);
+        assert!(s.inject_track.withheld().is_none());
+        assert_eq!(
+            s.inject_track.residue_stage_for_current_body(),
+            Some(crate::state::ResidueStage::Declined("representation"))
+        );
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10r2_partial_paste_never_recovered() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let (daemon, s) = wp5_seat("p10r2-partial", "claude");
+        p1_measured(&s);
+        let _now = p10_seed_mark(&s, "line1\nline2\nline3\nline4\nline5", 5, Some("q-r2-3"));
+        p10_paint_inline_box(&s, "❯ prefix [Pasted text #1 +4 lines]");
+        p10_arm(&daemon, &s);
+        assert!(s.inject_track.withheld().is_none());
+        assert_eq!(
+            s.inject_track.residue_stage_for_current_body(),
+            Some(crate::state::ResidueStage::Declined("representation"))
+        );
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10r2_cursor_key_in_gap_withholds() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let (daemon, s) = wp5_seat("p10r2-cur-gap", "claude");
+        p1_measured(&s);
+        let now = p10_seed_mark(&s, "M|x|GAP", 5, Some("q-r2-4"));
+        p10_paint_inline_box(&s, "❯ M|x|GAP");
+        p10_arm(&daemon, &s);
+        assert!(s.inject_track.withheld().is_some());
+        let s_hook = Arc::clone(&s);
+        *super::P10_GAP_HOOK.lock().unwrap() = Some(Box::new(move || {
+            let lines = ["❯ earlier turn", "  ack 1", RULE, "❯ M|x|GAP", RULE, STATUS1, STATUS2];
+            paint_screen(&s_hook, &lines, 3, 5, false);
+        }));
+        assert_eq!(
+            super::resubmit_withheld_one(&daemon, &s, now + std::time::Duration::from_secs(5)),
+            "resubmitted"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while s.write_tx.gate().pending() != 0 {
+            assert!(std::time::Instant::now() < deadline, "writer did not drain");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let settle = s.inject_track.submit_settle_obs(crate::state::settle_mono_ms(), 60_000);
+        assert_eq!(settle.since_written_ms, None, "cursor move in gap must withhold CR");
+        assert_eq!(
+            s.inject_track.residue_stage_for_current_body(),
+            Some(crate::state::ResidueStage::Declined("withheld"))
+        );
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10r2_unbound_in_gap_withholds() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let (daemon, s) = wp5_seat("p10r2-unb-gap", "claude");
+        p1_measured(&s);
+        let now = p10_seed_mark(&s, "M|x|GAP", 5, Some("q-r2-5"));
+        let lines = [
+            "❯ earlier turn",
+            "  ack 1",
+            "─────────────────────────────────── my-title ─",
+            "❯ M|x|GAP",
+            RULE,
+            STATUS1,
+            STATUS2,
+        ];
+        paint_screen(&s, &lines, 3, 9, false);
+        p7_set_osc_title(&s, "✳ my-title");
+        quiet_since(&s, 10);
+        p10_arm(&daemon, &s);
+        assert!(s.inject_track.withheld().is_some());
+        let s_hook = Arc::clone(&s);
+        *super::P10_GAP_HOOK.lock().unwrap() = Some(Box::new(move || {
+            p7_set_osc_title(&s_hook, "✳ other-title");
+        }));
+        assert_eq!(
+            super::resubmit_withheld_one(&daemon, &s, now + std::time::Duration::from_secs(5)),
+            "resubmitted"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while s.write_tx.gate().pending() != 0 {
+            assert!(std::time::Instant::now() < deadline, "writer did not drain");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let settle = s.inject_track.submit_settle_obs(crate::state::settle_mono_ms(), 60_000);
+        assert_eq!(settle.since_written_ms, None, "Unbound label in gap must withhold CR");
+        assert_eq!(
+            s.inject_track.residue_stage_for_current_body(),
+            Some(crate::state::ResidueStage::Declined("withheld"))
+        );
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10r2_master_promotion_in_gap_withholds() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let (daemon, s) = wp5_seat("p10r2-m-gap", "claude");
+        p1_measured(&s);
+        let now = p10_seed_mark(&s, "M|x|GAP", 5, Some("q-r2-6"));
+        p10_paint_inline_box(&s, "❯ M|x|GAP");
+        p10_arm(&daemon, &s);
+        assert!(s.inject_track.withheld().is_some());
+        let d_hook = Arc::clone(&daemon);
+        let sid = s.id;
+        *super::P10_GAP_HOOK.lock().unwrap() = Some(Box::new(move || {
+            d_hook.roles.lock().unwrap().insert("master".to_string(), sid);
+        }));
+        assert_eq!(
+            super::resubmit_withheld_one(&daemon, &s, now + std::time::Duration::from_secs(5)),
+            "resubmitted"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while s.write_tx.gate().pending() != 0 {
+            assert!(std::time::Instant::now() < deadline, "writer did not drain");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let settle = s.inject_track.submit_settle_obs(crate::state::settle_mono_ms(), 60_000);
+        assert_eq!(settle.since_written_ms, None, "D9 promotion in gap must withhold CR");
+        assert_eq!(
+            s.inject_track.residue_stage_for_current_body(),
+            Some(crate::state::ResidueStage::Declined("withheld"))
+        );
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10r2_space_in_gap_withholds() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let (daemon, s) = wp5_seat("p10r2-sp-gap", "claude");
+        p1_measured(&s);
+        let now = p10_seed_mark(&s, "M|x|GAP", 5, Some("q-r2-7"));
+        p10_paint_inline_box(&s, "❯ M|x|GAP");
+        p10_arm(&daemon, &s);
+        assert!(s.inject_track.withheld().is_some());
+        let s_hook = Arc::clone(&s);
+        *super::P10_GAP_HOOK.lock().unwrap() = Some(Box::new(move || {
+            s_hook.input_gen.fetch_add(1, AtomicOrdering::Release);
+        }));
+        assert_eq!(
+            super::resubmit_withheld_one(&daemon, &s, now + std::time::Duration::from_secs(5)),
+            "resubmitted"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while s.write_tx.gate().pending() != 0 {
+            assert!(std::time::Instant::now() < deadline, "writer did not drain");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let settle = s.inject_track.submit_settle_obs(crate::state::settle_mono_ms(), 60_000);
+        assert_eq!(settle.since_written_ms, None, "input_gen move in gap must withhold CR");
+        assert_eq!(
+            s.inject_track.residue_stage_for_current_body(),
+            Some(crate::state::ResidueStage::Declined("withheld"))
+        );
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10r2_probe_panic_withholds() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let (daemon, s) = wp5_seat("p10r2-panic", "claude");
+        p1_measured(&s);
+        let _now = p10_seed_mark(&s, "M|x|PANIC", 5, Some("q-r2-8"));
+        p10_paint_inline_box(&s, "❯ M|x|PANIC");
+        p10_arm(&daemon, &s);
+        let body_at = s.inject_track.last_body().unwrap().at;
+        let mark = s.inject_track.queue_submit_mark().unwrap();
+        *super::P10_GAP_HOOK.lock().unwrap() = Some(Box::new(|| {
+            panic!("synthetic panic inside residue_final_probe");
+        }));
+        let probe = super::residue_final_probe(
+            &daemon,
+            &s,
+            vec!["❯".to_string()],
+            None,
+            "q-r2-8".to_string(),
+            body_at,
+            mark.gen,
+            None,
+        );
+        assert!(probe(), "panic inside residue_final_probe must fail CLOSED (true = withhold CR)");
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10r2_commit_refuses_over_dialog_record() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let (daemon, s) = wp5_seat("p10r2-cas-dlg", "claude");
+        p1_measured(&s);
+        let now = p10_seed_mark(&s, "M|x|CAS", 5, Some("q-r2-9"));
+        p10_paint_inline_box(&s, "❯ M|x|CAS");
+        let body_at = s.inject_track.last_body().unwrap().at;
+        let s_hook = Arc::clone(&s);
+        *super::P10_ARM_BEFORE_COMMIT_HOOK.lock().unwrap() = Some(Box::new(move || {
+            s_hook
+                .inject_track
+                .note_withheld(crate::state::WithheldSubmit::new(now, body_at, None));
+        }));
+        p10_arm(&daemon, &s);
+        assert_eq!(
+            s.inject_track.withheld().unwrap().kind,
+            crate::state::WithheldKind::DialogWithheld,
+            "commit must refuse to overwrite a DialogWithheld record installed in the race window"
+        );
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10r2_master_promotion_between_passes_drops() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let (daemon, s) = wp5_seat("p10r2-m-pass", "claude");
+        p1_measured(&s);
+        let now = p10_seed_mark(&s, "M|x|MPASS", 5, Some("q-r2-10"));
+        p10_paint_inline_box(&s, "❯ M|x|MPASS");
+        p10_arm(&daemon, &s);
+        assert!(s.inject_track.withheld().is_some());
+        daemon.roles.lock().unwrap().insert("master".to_string(), s.id);
+        let r = super::resubmit_withheld_one(&daemon, &s, now + std::time::Duration::from_secs(5));
+        assert_eq!(r, "d9_scope");
+        assert!(s.inject_track.withheld().is_none());
+        assert_eq!(
+            s.inject_track.residue_stage_for_current_body(),
+            Some(crate::state::ResidueStage::Declined("d9_scope"))
+        );
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10r2_handoff_pass_code_is_wait() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let (daemon, s) = wp5_seat("p10r2-wait-code", "claude");
+        p1_measured(&s);
+        let now = p10_seed_mark(&s, "M|x|WAIT", 5, Some("q-r2-11"));
+        p10_paint_inline_box(&s, "❯ M|x|WAIT");
+        p10_arm(&daemon, &s);
+        let body_at = s.inject_track.last_body().unwrap().at;
+        assert!(s.inject_track.residue_set_handed("q-r2-11", body_at, now));
+        s.inject_track.residue_mark_writing("q-r2-11", body_at, now);
+        assert_eq!(
+            super::queue_block_diag(&daemon, &s).residue,
+            crate::state::QueueBlockResidue::Armed,
+            "while Handed / Writing (in flight), remedy row is 3a (Armed -> wait)"
+        );
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10r2_mark_absent_when_foreign_write_during_job() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_daemon, s) = wp5_seat("p10r2-foreign", "claude");
+        // Verify `HandoffStamp` check in `settle_queue_write`: if `input_gen` moves or `resume_write_epoch`
+        // moves by more than +1 (foreign write), `set_queue_submit_mark(Some(...))` is NOT recorded.
+        let src = include_str!("governance.rs");
+        let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("mod tests anchor")];
+        let sqw = &prod[prod.find("fn settle_queue_write(").expect("settle_queue_write")..];
+        let sqw = &sqw[..sqw.find("\nfn ").expect("next fn")];
+        assert!(
+            sqw.contains("s.input_gen.load(Ordering::Acquire) == stamp.handoff_gen")
+                && sqw.contains("s.inject_track.resume_write_epoch() == stamp.handoff_write_epoch + 1"),
+            "settle_queue_write must require unbroken HandoffStamp gen and epoch+1 before recording QueueSubmitMark"
+        );
+        assert!(s.inject_track.queue_submit_mark().is_none());
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&_daemon);
+    }
+
+    #[test]
+    fn p10r2_mark_epoch_is_job_plus_one() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let pack = empty_pack_dir("p10r2-epoch");
+        let _env = QueueEnvGuard::set(&[
+            ("CYS_PACK_DIR", pack.to_str().unwrap()),
+            ("CYS_QUEUE_STARVE_ALERT_SECS", "0"),
+        ]);
+        let (daemon, s) = p1_seat("p10r2-epoch");
+        p10_paint_inline_box(&s, "❯ ");
+        let gen_before = s.input_gen.load(AtomicOrdering::Acquire);
+        let epoch_before = s.inject_track.resume_write_epoch();
+        tick(&daemon);
+        assert!(s.pending_queue.lock().unwrap().is_empty());
+        let body = s.inject_track.last_body().expect("last_body after delivery");
+        let mark = s.inject_track.queue_submit_mark().expect("QueueSubmitMark after delivery");
+        assert_eq!(mark.body_at, body.at);
+        assert_eq!(mark.gen, gen_before + 1);
+        assert_eq!(mark.epoch, epoch_before + 1);
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10r2_new_body_before_commit_dropped() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let (daemon, s) = wp5_seat("p10r2-newbody", "claude");
+        p1_measured(&s);
+        let _now = p10_seed_mark(&s, "M|x|OLD", 5, Some("q-r2-14"));
+        p10_paint_inline_box(&s, "❯ M|x|OLD");
+        let s_hook = Arc::clone(&s);
+        *super::P10_ARM_BEFORE_COMMIT_HOOK.lock().unwrap() = Some(Box::new(move || {
+            s_hook.inject_track.note_body("M|x|NEWER", None);
+        }));
+        p10_arm(&daemon, &s);
+        assert!(s.inject_track.withheld().is_none());
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10r2_dead_seat_between_passes_dropped() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let (daemon, s) = wp5_seat("p10r2-dead-pass", "claude");
+        p1_measured(&s);
+        let now = p10_seed_mark(&s, "M|x|DEAD", 5, Some("q-r2-15"));
+        p10_paint_inline_box(&s, "❯ M|x|DEAD");
+        p10_arm(&daemon, &s);
+        assert!(s.inject_track.withheld().is_some());
+        s.agent_exit_notified.store(true, AtomicOrdering::Relaxed);
+        s.seat_cache.store(SeatState::Empty.as_u8(), AtomicOrdering::Relaxed);
+        let r = super::resubmit_withheld_one(&daemon, &s, now + std::time::Duration::from_secs(5));
+        assert_eq!(r, "seat_off");
+        assert!(s.inject_track.withheld().is_none());
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    // ===== r3 behavioural & precondition tests (`DESIGN-P10-r3.md` §6 & `TICKET-P10-IMPL-w61.md`) =====
+
+    #[test]
+    fn p10r3_hidden_prefix_never_recovered_unlisted_adapter() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::unmeasured();
+        let (daemon, s) = wp5_seat("p10r3-hidden", "codex");
+        p1_measured(&s);
+        let _now = p10_seed_mark(&s, "visible tail", 5, Some("q-r3-1"));
+        p10_paint_inline_box(&s, "❯ visible tail");
+        p10_arm(&daemon, &s);
+        assert!(s.inject_track.withheld().is_none());
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10r3_indicator_row_breaks_the_box() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let (daemon, s) = wp5_seat("p10r3-ind-box", "claude");
+        p1_measured(&s);
+        let _now = p10_seed_mark(&s, "M|x|NOBOX", 5, Some("q-r3-2"));
+        // Top rule replaced by a non-rule indicator row -> `box_bounded == false`.
+        let lines = [
+            "❯ earlier turn",
+            "  ack 1",
+            "  ↑ scrolled prefix above",
+            "❯ M|x|NOBOX",
+            RULE,
+            STATUS1,
+            STATUS2,
+        ];
+        paint_screen(&s, &lines, 3, 11, false);
+        quiet_since(&s, 10);
+        let obs = super::observe_prompt_block(&s, &["❯".to_string()]);
+        assert!(!obs.block.as_ref().unwrap().box_bounded);
+        p10_arm(&daemon, &s);
+        assert!(s.inject_track.withheld().is_none());
+        assert_eq!(
+            s.inject_track.residue_stage_for_current_body(),
+            Some(crate::state::ResidueStage::Declined("unbounded_box"))
+        );
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10r3_unlisted_adapter_holds_with_machine_residue() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::unmeasured();
+        let (daemon, s) = wp5_seat("p10r3-unlisted", "claude");
+        p1_measured(&s);
+        let _now = p10_seed_mark(&s, "M|x|UNLISTED", 5, Some("q-r3-3"));
+        p10_paint_inline_box(&s, "❯ M|x|UNLISTED");
+        p10_arm(&daemon, &s);
+        assert!(s.inject_track.withheld().is_none(), "0 Returns on unlisted adapter");
+        assert_eq!(
+            s.inject_track.residue_stage_for_current_body(),
+            Some(crate::state::ResidueStage::Declined("unmeasured_adapter")),
+            "unlisted adapter with proven residue records Declined"
+        );
+        assert_eq!(
+            super::queue_block_diag(&daemon, &s).residue,
+            crate::state::QueueBlockResidue::Declined("unmeasured_adapter")
+        );
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10r3_visible_tail_of_long_body_is_not_the_body() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let full_5399 = "x".repeat(5399);
+        let tail_4096 = &full_5399[5399 - 4096..];
+        let (len_5399, sha_5399) = crate::state::flat_text_digest(&full_5399);
+        assert!(
+            !super::p10_block_matches_full_body(tail_4096, len_5399, &sha_5399),
+            "4096-byte visible tail of 5399-char body must not match full body mark"
+        );
+        let (daemon, s) = wp5_seat("p10r3-tail", "claude");
+        p1_measured(&s);
+        let _now = p10_seed_mark(&s, "hidden first line\nvisible second line", 5, Some("q-r3-4"));
+        p10_paint_inline_box(&s, "❯ visible second line");
+        p10_arm(&daemon, &s);
+        assert!(s.inject_track.withheld().is_none());
+        assert_eq!(
+            s.inject_track.residue_stage_for_current_body(),
+            Some(crate::state::ResidueStage::Declined("representation"))
+        );
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10r3_own_record_proceeds() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let (daemon, s) = wp5_seat("p10r3-own", "claude");
+        p1_measured(&s);
+        let now = p10_seed_mark(&s, "M|x|OWN", 5, Some("q-r3-5"));
+        p10_paint_inline_box(&s, "❯ M|x|OWN");
+        p10_arm(&daemon, &s);
+        assert_eq!(
+            super::resubmit_withheld_one(&daemon, &s, now + std::time::Duration::from_secs(5)),
+            "resubmitted"
+        );
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10r3_competing_record_declines_ours_untouched() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let (daemon, s) = wp5_seat("p10r3-compete", "claude");
+        p1_measured(&s);
+        let now = p10_seed_mark(&s, "M|x|COMP", 5, Some("q-r3-6"));
+        let body_at = s.inject_track.last_body().unwrap().at;
+        let _ = s
+            .inject_track
+            .try_commit_swallowed_arm("q-r3-6".into(), body_at, now, None);
+        let sw = crate::state::WithheldSubmit::new_swallowed(now, body_at, None, "q-r3-6".into());
+        // Overwrite `withheld` with a competing `DialogWithheld` record at `now + 1ms` before `resubmit_swallowed_one` runs.
+        s.inject_track.note_withheld(crate::state::WithheldSubmit::new(
+            now + std::time::Duration::from_millis(1),
+            body_at,
+            None,
+        ));
+        let r = super::resubmit_swallowed_one(&daemon, &s, sw, now + std::time::Duration::from_secs(5));
+        assert_eq!(r, "raced");
+        assert_eq!(
+            s.inject_track.withheld().unwrap().kind,
+            crate::state::WithheldKind::DialogWithheld,
+            "competing DialogWithheld record must remain untouched"
+        );
+        assert_eq!(
+            s.inject_track.residue_stage_for_current_body(),
+            Some(crate::state::ResidueStage::Declined("owner_changed"))
+        );
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10r3_full_puts_the_record_back_and_retries() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let (daemon, s) = wp5_seat("p10r3-full", "claude");
+        p1_measured(&s);
+        let now = p10_seed_mark(&s, "M|x|FULL", 5, Some("q-r3-7"));
+        p10_paint_inline_box(&s, "❯ M|x|FULL");
+        p10_arm(&daemon, &s);
+
+        // 1) Exercise real Rust ownership on `WriterSender::channel(1)` filled to capacity so `try_send` returns
+        //    `Err(TrySendError::Full(mut rejected))` containing the armed `SubmitDone`, and verify that
+        //    `rejected.disarm_submit_done()` + `residue_restore_armed` + `restore_withheld_if_empty` + `drop(rejected)`
+        //    keeps the track at `Armed` (NOT `Declined("writer_dropped")`) and restores the `WithheldSubmit` record!
+        let (full_tx, rx) = crate::writer_gate::WriterSender::channel(1);
+        full_tx
+            .try_send(crate::state::WriteReq::Data(Vec::new()))
+            .expect("fill 1-slot channel");
+        let body_at = s.inject_track.last_body().unwrap().at;
+        let taken_w = s
+            .inject_track
+            .take_withheld_if_identity(crate::state::WithheldKind::Swallowed, "q-r3-7", body_at)
+            .expect("take armed record");
+        assert!(s.inject_track.residue_set_handed("q-r3-7", body_at, now));
+        let done = crate::state::SubmitDone::new(&s.inject_track, "q-r3-7".into(), body_at);
+        let req = crate::state::WriteReq::SubmitAfterGap {
+            bytes: b"\r".to_vec(),
+            min_gap_ms: 80,
+            withhold: None,
+            done: Some(done),
+        };
+        match full_tx.try_send(req) {
+            Err(std::sync::mpsc::TrySendError::Full(mut rejected)) => {
+                rejected.disarm_submit_done();
+                s.inject_track.residue_restore_armed("q-r3-7", body_at);
+                assert!(s.inject_track.restore_withheld_if_empty(taken_w));
+                drop(rejected);
+            }
+            other => panic!("expected Full, got {:?}", other.is_ok()),
+        }
+        assert_eq!(
+            s.inject_track.residue_stage_for_current_body(),
+            Some(crate::state::ResidueStage::Armed),
+            "Codex r3 minor: dropping unsent WriteReq after disarm_submit_done must NOT undo Full rollback to Armed"
+        );
+        assert!(
+            s.inject_track.withheld().is_some(),
+            "Full rollback must restore WithheldSubmit so the next tick retries"
+        );
+        drop(rx);
+
+        // 2) Now run `resubmit_withheld_one` on the surface's writer channel -> succeeds (`resubmitted`).
+        assert_eq!(
+            super::resubmit_withheld_one(&daemon, &s, now + std::time::Duration::from_secs(5)),
+            "resubmitted"
+        );
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10r3_full_until_ttl_declines_expired() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let (daemon, s) = wp5_seat("p10r3-ttl", "claude");
+        p1_measured(&s);
+        let now = p10_seed_mark(&s, "M|x|TTL", 5, Some("q-r3-8"));
+        p10_paint_inline_box(&s, "❯ M|x|TTL");
+        p10_arm(&daemon, &s);
+        // Advance past default queue TTL (`queue_ttl_default_secs()` = 21600s).
+        let r = super::resubmit_withheld_one(&daemon, &s, now + std::time::Duration::from_secs(21_605));
+        assert_eq!(r, "expired");
+        assert!(s.inject_track.withheld().is_none());
+        assert_eq!(
+            s.inject_track.residue_stage_for_current_body(),
+            Some(crate::state::ResidueStage::Declined("expired")),
+            "expired Swallowed record must transition ResidueTrack to Declined (row 3b)"
+        );
+        assert_eq!(
+            super::queue_block_diag(&daemon, &s).residue,
+            crate::state::QueueBlockResidue::Declined("expired")
+        );
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10r3_disconnected_declines_writer_gone() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let (_daemon, s) = wp5_seat("p10r3-disc", "claude");
+        p1_measured(&s);
+        let now = p10_seed_mark(&s, "M|x|DISC", 5, Some("q-r3-9"));
+        let body_at = s.inject_track.last_body().unwrap().at;
+        s.inject_track
+            .try_commit_swallowed_arm("q-r3-9".into(), body_at, now, None)
+            .unwrap();
+        assert!(s.inject_track.residue_set_handed("q-r3-9", body_at, now));
+        let (disc_tx, rx) = crate::writer_gate::WriterSender::channel(1);
+        drop(rx);
+        let done = crate::state::SubmitDone::new(&s.inject_track, "q-r3-9".into(), body_at);
+        let req = crate::state::WriteReq::SubmitAfterGap {
+            bytes: b"\r".to_vec(),
+            min_gap_ms: 80,
+            withhold: None,
+            done: Some(done),
+        };
+        match disc_tx.try_send(req) {
+            Err(std::sync::mpsc::TrySendError::Disconnected(mut rejected)) => {
+                rejected.disarm_submit_done();
+                s.inject_track.residue_decline("q-r3-9", body_at, "writer_gone");
+                drop(rejected);
+            }
+            other => panic!("expected Disconnected, got {:?}", other.is_ok()),
+        }
+        assert_eq!(
+            s.inject_track.residue_stage_for_current_body(),
+            Some(crate::state::ResidueStage::Declined("writer_gone"))
+        );
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&_daemon);
+    }
+
+    #[test]
+    fn p10r3_write_error_never_reports_written() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let (_daemon, s) = wp5_seat("p10r3-werr", "claude");
+        let now = p10_seed_mark(&s, "M|x|WERR", 5, Some("q-r3-10"));
+        let body_at = s.inject_track.last_body().unwrap().at;
+        s.inject_track
+            .try_commit_swallowed_arm("q-r3-10".into(), body_at, now, None)
+            .unwrap();
+        assert!(s.inject_track.residue_set_handed("q-r3-10", body_at, now));
+        let mut done = crate::state::SubmitDone::new(&s.inject_track, "q-r3-10".into(), body_at);
+        done.mark_writing();
+        done.complete_failed();
+        drop(done);
+        assert_eq!(
+            s.inject_track.residue_stage_for_current_body(),
+            Some(crate::state::ResidueStage::Declined("write_failed")),
+            "PTY write error must transition to Declined(\"write_failed\"), never Written"
+        );
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&_daemon);
+    }
+
+    #[test]
+    fn p10r3_dropped_request_declines_from_the_drop_guard() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let (_daemon, s) = wp5_seat("p10r3-drop", "claude");
+        let now = p10_seed_mark(&s, "M|x|DROP", 5, Some("q-r3-11"));
+        let body_at = s.inject_track.last_body().unwrap().at;
+        s.inject_track
+            .try_commit_swallowed_arm("q-r3-11".into(), body_at, now, None)
+            .unwrap();
+        assert!(s.inject_track.residue_set_handed("q-r3-11", body_at, now));
+        {
+            let _done = crate::state::SubmitDone::new(&s.inject_track, "q-r3-11".into(), body_at);
+            // Dropped without calling `complete_*` or `disarm()` (simulating writer loop exit with queued items).
+        }
+        assert_eq!(
+            s.inject_track.residue_stage_for_current_body(),
+            Some(crate::state::ResidueStage::Declined("writer_dropped")),
+            "SubmitDone::drop must transition Handed/Writing -> Declined(\"writer_dropped\")"
+        );
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&_daemon);
+    }
+
+    #[test]
+    fn p10r3_stuck_write_stays_writing_then_written() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let (daemon, s) = wp5_seat("p10r3-stuck", "claude");
+        p1_measured(&s);
+        let now = p10_seed_mark(&s, "M|x|STUCK", 5, Some("q-r3-12"));
+        p10_paint_inline_box(&s, "❯ M|x|STUCK");
+        let body_at = s.inject_track.last_body().unwrap().at;
+        s.inject_track
+            .try_commit_swallowed_arm("q-r3-12".into(), body_at, now, None)
+            .unwrap();
+        assert!(s.inject_track.residue_set_handed(
+            "q-r3-12",
+            body_at,
+            now - std::time::Duration::from_secs(20),
+        ));
+        s.inject_track.residue_mark_writing(
+            "q-r3-12",
+            body_at,
+            now - std::time::Duration::from_secs(20),
+        );
+        // Even past 20s, `maybe_arm_swallowed_residue` keeps the stage at `Writing` (never `Declined` while the request is still in the channel).
+        p10_arm(&daemon, &s);
+        assert!(matches!(
+            s.inject_track.residue_stage_for_current_body(),
+            Some(crate::state::ResidueStage::Writing { .. })
+        ));
+        assert_eq!(
+            super::queue_block_diag(&daemon, &s).residue,
+            crate::state::QueueBlockResidue::Armed
+        );
+        // When the writer finally completes, `complete_written` transitions `Writing -> Written`.
+        let mut done = crate::state::SubmitDone::new(&s.inject_track, "q-r3-12".into(), body_at);
+        done.complete_written();
+        assert!(matches!(
+            s.inject_track.residue_stage_for_current_body(),
+            Some(crate::state::ResidueStage::Written { .. })
+        ));
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p10r3_track_invariants_hold_on_every_path() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_daemon, s) = wp5_seat("p10r3-inv", "claude");
+        let now = p10_seed_mark(&s, "M|x|INV", 5, Some("q-r3-13"));
+        let body_at = s.inject_track.last_body().unwrap().at;
+
+        // 1) Fast completion before `try_send` return: setting `Handed` BEFORE `try_send` ensures that if the writer thread
+        //    runs `mark_writing` + `complete_written` immediately, the stage transitions `Armed -> Handed -> Writing -> Written` cleanly.
+        s.inject_track
+            .try_commit_swallowed_arm("q-r3-13".into(), body_at, now, None)
+            .unwrap();
+        assert!(s.inject_track.residue_set_handed("q-r3-13", body_at, now));
+        let mut fast_done = crate::state::SubmitDone::new(&s.inject_track, "q-r3-13".into(), body_at);
+        fast_done.mark_writing();
+        fast_done.complete_written();
+        drop(fast_done);
+        assert!(matches!(
+            s.inject_track.residue_stage_for_current_body(),
+            Some(crate::state::ResidueStage::Written { .. })
+        ));
+
+        // 2) Stale completion identity: a `SubmitDone` from an older `(request_id, body_at)` is a no-op on a newer body's track.
+        let stale_body_at = body_at - std::time::Duration::from_secs(30);
+        let _ = s.inject_track.take_withheld_if(now);
+        s.inject_track.note_body("M|x|NEW_INV", None);
+        let new_body_at = s.inject_track.last_body().unwrap().at;
+        s.inject_track
+            .try_commit_swallowed_arm("q-r3-13-new".into(), new_body_at, now, None)
+            .unwrap();
+        {
+            let mut stale_done = crate::state::SubmitDone::new(&s.inject_track, "q-r3-13".into(), stale_body_at);
+            stale_done.complete_failed();
+        }
+        assert_eq!(
+            s.inject_track.residue_stage_for_current_body(),
+            Some(crate::state::ResidueStage::Armed),
+            "stale SubmitDone from an earlier (request_id, body_at) must not mutate the current body's track"
+        );
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&_daemon);
+    }
+
+    #[test]
+    fn p10_extent_list_is_measured() {
+        assert!(
+            super::P10_EXTENT_MEASURED_ADAPTERS.is_empty(),
+            "X9w / Precondition 2: P10_EXTENT_MEASURED_ADAPTERS must ship empty (&[]) until R5b is measured"
+        );
+    }
+
+    #[test]
+    fn p10r3_existing_submit_after_gap_bytes_unchanged() {
+        let (tracked, rx) = crate::writer_gate::WriterSender::channel(2);
+        tracked
+            .try_send(crate::state::WriteReq::SubmitAfterGap {
+                bytes: b"\r".to_vec(),
+                min_gap_ms: 80,
+                withhold: None,
+                done: None,
+            })
+            .unwrap();
+        let (req, _lease) = rx.recv().unwrap().into_parts();
+        match req {
+            crate::state::WriteReq::SubmitAfterGap {
+                bytes,
+                min_gap_ms,
+                withhold,
+                done,
+            } => {
+                assert_eq!(bytes, b"\r");
+                assert_eq!(min_gap_ms, 80);
+                assert!(withhold.is_none());
+                assert!(done.is_none());
+            }
+            _ => panic!("expected SubmitAfterGap"),
+        }
     }
 }
 

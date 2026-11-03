@@ -8125,7 +8125,7 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
             //   지연은 writer 스레드에서 일어난다(단일 소비자 = 순서 보존 · 핸들러 무블로킹).
             let key_bytes = bytes.clone();
             let write_req = match submit_gap_for_key(&key, cr_min_gap_ms()) {
-                Some(min_gap_ms) => crate::state::WriteReq::SubmitAfterGap { bytes, min_gap_ms, withhold: None },
+                Some(min_gap_ms) => crate::state::WriteReq::SubmitAfterGap { bytes, min_gap_ms, withhold: None, done: None },
                 None => crate::state::WriteReq::Data(bytes),
             };
             // ★(0.14.42 · 수정 2회차 F1) 제출 CR 보류 탐침의 인계 재료 — 게이트 **밖** 1회(어댑터·파서·agent_meta 는

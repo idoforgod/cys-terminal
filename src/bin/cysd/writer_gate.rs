@@ -499,6 +499,7 @@ mod tests {
                         bytes: b"\r".to_vec(),
                         min_gap_ms: 0,
                         withhold: None,
+                        done: None,
                     },
                     b"\r".to_vec(),
                 ),
@@ -659,6 +660,7 @@ mod tests {
                 bytes: b"\r".to_vec(),
                 min_gap_ms: 0,
                 withhold: Some(Arc::new(|| true)),
+                done: None,
             },
         );
         let guard = crate::state::InjectGuard::new(
