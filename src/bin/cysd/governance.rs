@@ -35092,48 +35092,48 @@ after-tick liveness alone does not attribute a clock defect",
         let _ = s.child.lock().unwrap().kill();
         crate::state::p1_e0_stop_daemon(&daemon);
 
-        // 2) Separate `"below"` guard witness in `residue_final_probe`: full `before_cursor` body (`"M|x|GAP"`, cursor at col 9)
-        //    is preserved so `p10_block_matches_full_body` passes, while an extra draft line below the cursor inside the box
-        //    causes `p10_after_and_below_empty` to refuse with `"below"`.
+        // 2) M9b production witness (`residue_final_probe`): inner RULE + draft below + outer RULE passes `box_bounded` & `representation`, fails M9b -> `"below"`.
         let (daemon_b, s_b) = wp5_seat("p10r2-cur-gap-below", "claude");
         p1_measured(&s_b);
         let now_b = p10_seed_mark(&s_b, "M|x|GAP", 5, Some("q-r2-4-below"));
         p10_paint_inline_box(&s_b, "❯ M|x|GAP");
         p10_arm(&daemon_b, &s_b);
         assert!(s_b.inject_track.withheld().is_some());
-        let wrote_b_before = s_b.inject_track.wrote();
-        let s_b_hook = Arc::clone(&s_b);
+        let (wrote_b_before, s_b_hook) = (s_b.inject_track.wrote(), Arc::clone(&s_b));
         *super::P10_GAP_HOOK.lock().unwrap() = Some(Box::new(move || {
-            let lines = [
-                "❯ earlier turn",
-                "  ack 1",
-                RULE,
-                "❯ M|x|GAP",
-                "  extra below",
-                RULE,
-                STATUS1,
-                STATUS2,
-            ];
+            let lines = ["❯ earlier turn", "  ack 1", RULE, "❯ M|x|GAP", RULE, "  extra below", RULE, STATUS1, STATUS2];
             paint_screen(&s_b_hook, &lines, 3, 9, false);
         }));
-        assert_eq!(
-            super::resubmit_withheld_one(&daemon_b, &s_b, now_b + std::time::Duration::from_secs(5)),
-            "resubmitted"
-        );
+        assert_eq!(super::resubmit_withheld_one(&daemon_b, &s_b, now_b + std::time::Duration::from_secs(5)), "resubmitted");
         let deadline_b = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while s_b.write_tx.gate().pending() != 0 {
             assert!(std::time::Instant::now() < deadline_b, "writer did not drain");
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+        let (obs_b, mark_b) = (super::observe_prompt_block(&s_b, &["❯".to_string()]), s_b.inject_track.queue_submit_mark().expect("mark_b"));
+        assert!(obs_b.block.as_ref().unwrap().box_bounded, "M9b Part 2 fixture must pass box_bounded");
+        assert!(super::p10_block_matches_full_body(&obs_b.block.as_ref().unwrap().before_cursor, mark_b.flat_len, &mark_b.flat_sha));
+        assert_eq!(obs_b.line.as_ref().map(|(_, a)| a.as_str()), Some(""));
         let settle_b = s_b.inject_track.submit_settle_obs(crate::state::settle_mono_ms(), 60_000);
         assert_eq!(settle_b.since_written_ms, None, "extra text below cursor in gap must withhold CR");
         assert_eq!(s_b.inject_track.wrote(), wrote_b_before, "no PTY write when below-cursor check fails in gap");
-        assert_eq!(
-            s_b.inject_track.residue_stage_for_current_body(),
-            Some(crate::state::ResidueStage::Declined("below"))
-        );
-        let _ = s_b.child.lock().unwrap().kill();
-        crate::state::p1_e0_stop_daemon(&daemon_b);
+        assert_eq!(s_b.inject_track.residue_stage_for_current_body(), Some(crate::state::ResidueStage::Declined("below")));
+        let _ = s_b.child.lock().unwrap().kill(); crate::state::p1_e0_stop_daemon(&daemon_b);
+        // 3) M9a production witness (`residue_final_probe`): complete chip before cursor (`col = 27`) + suffix `" trailing"` after it.
+        let (daemon_c, s_c) = wp5_seat("p10r3-m9a-chip-suf", "claude");
+        p1_measured(&s_c);
+        let now_c = p10_seed_mark(&s_c, "line1\nline2\nline3\nline4\nline5", 5, Some("q-r3-m9a"));
+        p10_paint_inline_box(&s_c, "❯ [Pasted text #1 +5 lines]");
+        p10_arm(&daemon_c, &s_c);
+        assert!(s_c.inject_track.withheld().is_some());
+        let (wrote_c_before, s_c_hook) = (s_c.inject_track.wrote(), Arc::clone(&s_c));
+        *super::P10_GAP_HOOK.lock().unwrap() = Some(Box::new(move || paint_screen(&s_c_hook, &["❯ earlier turn", "  ack 1", RULE, "❯ [Pasted text #1 +5 lines] trailing", RULE, STATUS1, STATUS2], 3, 27, false)));
+        assert_eq!(super::resubmit_withheld_one(&daemon_c, &s_c, now_c + std::time::Duration::from_secs(5)), "resubmitted");
+        let dl_c = std::time::Instant::now() + std::time::Duration::from_secs(5); while s_c.write_tx.gate().pending() != 0 { assert!(std::time::Instant::now() < dl_c, "writer did not drain"); std::thread::sleep(std::time::Duration::from_millis(10)); }
+        let (obs_c, settle_c, mark_c) = (super::observe_prompt_block(&s_c, &["❯".to_string()]), s_c.inject_track.submit_settle_obs(crate::state::settle_mono_ms(), 60_000), s_c.inject_track.queue_submit_mark().expect("mark_c"));
+        assert!(obs_c.block.as_ref().unwrap().box_bounded && super::p10_block_matches_full_body(&obs_c.block.as_ref().unwrap().before_cursor, mark_c.flat_len, &mark_c.flat_sha) && obs_c.line.as_ref().map(|(_, a)| a.as_str()) == Some(" trailing"));
+        assert_eq!((settle_c.since_written_ms, s_c.inject_track.wrote(), s_c.inject_track.residue_stage_for_current_body()), (None, wrote_c_before, Some(crate::state::ResidueStage::Declined("below"))), "M9a suffix after complete chip must withhold CR with below");
+        let _ = s_c.child.lock().unwrap().kill(); crate::state::p1_e0_stop_daemon(&daemon_c);
     }
 
     #[test]
