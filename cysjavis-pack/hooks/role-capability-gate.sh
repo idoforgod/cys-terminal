@@ -158,7 +158,7 @@ capgate_resolve_role() {
   # ★폴백 후보는 `CYS_ROLE` **하나뿐**이다(0.14.31 성찰 G6 · `javis_role.py:636`·`_lib.sh:678`
   #   과 글자 그대로 같게). `CYS_SURFACE_ROLE` 은 이 훅이 해소 결과로 export 하는 **산출물**이지
   #   신원 입력이 아니다 — 폴백 1순위로 두면 `CYS_SURFACE_ROLE=master CYS_ROLE=cso` 한 줄로
-  #   `CronCreate`/`Task`/`WebSearch`(§1-1 이 "TTL 승인으로도 열리지 않는다" 고 못박은 절대
+  #   `CronCreate`/`TaskOutput`/`WebSearch`(§1-1 이 "TTL 승인으로도 열리지 않는다" 고 못박은 절대
   #   deny 집합)가 열린다. 자매 두 층은 그 경로를 **검체로 금지**했는데 게이트만 열려 있었다.
   _cg_env=""
   [ -n "${CYS_ROLE:-}" ] && _cg_env="$CYS_ROLE"
@@ -807,11 +807,11 @@ ROLE_CACHE_DIRNAME = "cys-role-authority.d"
 
 # ── CSO 정책(0.14.31 WP-3 A) — 정본은 directives/CSO_DIRECTIVE.md §1-1 ────────
 # ★도구 이름 deny: 명령 접두로 표현되지 않으므로 **TTL 승인으로 열리지 않는다**(§1-1 말미).
-#   `Task` 는 정본 목록의 `Agent` 와 같은 것의 다른 하네스 이름이다 — 둘 다 막는다(서브에이전트
-#   스폰은 봉인표 ①(큐 폭주) 경로다 · 좁히는 방향이라 정본 위반이 아니다).
+#   오너 규칙(2026-11-02)은 CSO도 서브에이전트를 허용하므로 `Agent`·`Task`는 제외한다.
+#   나머지 7개 도구 이름 deny와 Bash·경로·호출 예산 판정은 그대로 유지한다.
 CSO_DENY_TOOLS = {
     "CronCreate", "CronDelete", "CronList", "Monitor", "TaskOutput",
-    "Agent", "Task", "WebSearch", "WebFetch",
+    "WebSearch", "WebFetch",
 }
 MCP_COMPUTER_USE_PREFIX = "mcp__computer-use__"
 CSO_SKILL_ALLOW = {"hallucination-guard"}
@@ -3392,7 +3392,12 @@ def self_test_contracts(fails):
     want(True, "CronCreate", {}, "CronCreate 는 TTL 로 안 열린다",
          c=ctx(approver=lambda c: True))
     want(True, "Skill", {"skill": "appbuild"}, "허용 밖 Skill")
-    want(True, "Task", {"prompt": "x"}, "Task=Agent 서브에이전트")
+    # Agent and Task are allowed; each remaining tool-name denial stays pinned.
+    want(False, "Task", {"prompt": "x"}, "Task allowed (A55)")
+    want(False, "Agent", {"prompt": "x"}, "Agent allowed (A55)")
+    for tool in ("CronCreate", "CronDelete", "CronList", "Monitor", "TaskOutput",
+                 "WebSearch", "WebFetch"):
+        want(True, tool, {}, "retained deny: %s" % tool)
     # 역할 접두 — session-start.sh `cso*)` 미러.
     for r in ("cso", "cso-1", "cso-dept-3"):
         b, _ = decide("Bash", {"command": "cys events"}, r, ctx())
