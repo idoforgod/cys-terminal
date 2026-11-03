@@ -2614,7 +2614,7 @@ fn p11_wait_reaped_until<C: P11ProbeChild>(child: &mut C, until: std::time::Inst
 
 /// 증명 자식을 끝내고 정리 시한(`until`)까지 거둔다. 그 안에 거두지 못하면 전용 스레드가 끝까지 기다려 거두고(좀비 금지),
 /// 그동안은 `unreaped` 계수(프로덕션 = [`P11_LSOF_UNREAPED`])가 새 증명을 막는다. 그 스레드조차 못 만들면 계수를 되돌리지
-/// 않는다 — 복구 한계는 [`P11_LSOF_UNREAPED_MAX`] 의 doc(fail-closed · 데몬 재기동까지 주기 증명 꺼짐 · 핀 유지).
+/// 않는다 — 복구 계약은 [`P11_LSOF_UNREAPED_MAX`] 의 doc(상한에 있는 동안만 증명 꺼짐 · 거두면 저절로 재개 · 래치 없음 · 핀 유지).
 #[cfg(not(windows))]
 fn p11_kill_and_reap<C: P11ProbeChild>(
     mut child: C,
