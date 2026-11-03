@@ -1342,6 +1342,119 @@ fn is_rule_line(line: &str) -> bool {
     best >= PROMPT_TRAILER_RULE_MIN_RUN
 }
 
+/// ★(0.14.57 · P7 · DESIGN-P7-r2 §1, r3 §2) Classification of the row directly above the last leading-marker row on a
+/// D1-governed seat. `Bound` rewrites that row to a plain rule of the same length; `Unbound` dominates every reader and writer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ComposerLabel {
+    #[default]
+    None,
+    Bound,
+    Unbound,
+}
+
+impl ComposerLabel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ComposerLabel::None => "none",
+            ComposerLabel::Bound => "bound",
+            ComposerLabel::Unbound => "unbound",
+        }
+    }
+}
+
+fn is_titled_border_shape(line: &str) -> bool {
+    if line.starts_with('\u{2500}') {
+        let rest = line.trim_start_matches('\u{2500}');
+        return rest.starts_with(' ') && !rest[1..].trim().is_empty();
+    }
+    let r = line.trim_end();
+    if let Some(after_space) = r.strip_prefix(' ') {
+        if after_space.starts_with(' ') {
+            return false;
+        }
+        if let Some(inner) = after_space.strip_suffix(" \u{2500}") {
+            return !inner.trim().is_empty();
+        }
+    }
+    false
+}
+
+fn extract_label_text(line: &str) -> Option<&str> {
+    let r = line.trim_end();
+    let rest = r.trim_start_matches('\u{2500}');
+    let after_space = rest.strip_prefix(' ')?;
+    if after_space.starts_with(' ') {
+        return None;
+    }
+    let inner = after_space.strip_suffix(" \u{2500}")?;
+    (!inner.trim().is_empty()).then_some(inner)
+}
+
+fn extract_osc_session_name(osc_title: &str) -> Option<&str> {
+    let t = osc_title.trim();
+    let mut chars = t.chars();
+    let first = chars.next()?;
+    if !matches!(first, '◐' | '◑' | '✳') {
+        return None;
+    }
+    if chars.next() != Some(' ') {
+        return None;
+    }
+    let name = chars.as_str();
+    (!name.trim().is_empty() && name != "Claude Code").then_some(name)
+}
+
+/// ★(0.14.57 · P7 · DESIGN-P7-r2 §1, r3 §2) Classify the row directly above the last leading-marker row against the
+/// terminal's OSC 0/2 title. Returns `(ComposerLabel::Bound, Some(row_idx))` when bound, `(ComposerLabel::Unbound, None)` when
+/// a titled shape fails to bind, and `(ComposerLabel::None, None)` when the row is a plain rule or has no titled shape.
+pub fn composer_label(
+    lines: &[&str],
+    markers: &[String],
+    osc_title: &str,
+) -> (ComposerLabel, Option<usize>) {
+    let Some(li) = lines.iter().rposition(|l| {
+        markers
+            .iter()
+            .any(|m| !m.is_empty() && crate::agent_markers::leading_marker_index(m, l).is_some())
+    }) else {
+        return (ComposerLabel::None, None);
+    };
+    if li == 0 {
+        return (ComposerLabel::None, None);
+    }
+    let row = lines[li - 1];
+    if is_rule_line(row) || !is_titled_border_shape(row) {
+        return (ComposerLabel::None, None);
+    }
+    let ri = li - 1;
+    if let (Some(t), Some(n)) = (extract_label_text(row), extract_osc_session_name(osc_title))
+        && t.split_whitespace().eq(n.split_whitespace())
+    {
+        (ComposerLabel::Bound, Some(ri))
+    } else {
+        (ComposerLabel::Unbound, None)
+    }
+}
+
+/// ★(0.14.57 · P7 · DESIGN-P7-r3 §2) Combine `contents` and `rows` classifications before rewriting either view:
+/// both `Bound` -> `Bound`; both `None` -> `None`; any disagreement or either side `Unbound` -> `Unbound`.
+pub fn combine_labels(contents: ComposerLabel, rows: ComposerLabel) -> ComposerLabel {
+    match (contents, rows) {
+        (ComposerLabel::None, ComposerLabel::None) => ComposerLabel::None,
+        (ComposerLabel::Bound, ComposerLabel::Bound) => ComposerLabel::Bound,
+        _ => ComposerLabel::Unbound,
+    }
+}
+
+/// ★(0.14.57 · P7) Plain rule replacement of the same character length for a `Bound` top border row.
+pub fn plain_rule_for_bound_row(row: &str) -> String {
+    let mut len = 0usize;
+    for _ in row.chars() {
+        len += 1;
+    }
+    "\u{2500}".repeat(len.max(PROMPT_TRAILER_RULE_MIN_RUN))
+}
+
 /// 번호 붙은 선택지 행(`  2. Yes…` · `2.` 문말)인가 — 선택기의 항목 행 그 자체(커서 유무 무관).
 /// 규칙 ⓓ와 같은 번호 문법(1~2자리 · `.` · 뒤 공백/문말)이다.
 fn is_numbered_item_row(line: &str) -> bool {
@@ -5435,5 +5548,352 @@ mod tests {
         o.legacy_v1 = true;
         assert_eq!(judge(&o), Verdict::Ready { evidence: Evidence::Valve }, "롤백이 종전 판정을 되살리지 않는다");
         assert_eq!(ModalSignature { kinds: vec!["a", "b"], flat_end: 0, cursor_on_exit: false }.title(), "미등재 모달(a+b)");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // ★(0.14.57 · P7 · DESIGN-P7-r2 §7, r3 §5) Titled composer border binding
+    // ═══════════════════════════════════════════════════════════════════════
+
+    const P7_HISTORY: &str = "❯ earlier message\n\n⏺ ack 4\n\n";
+    const P7_BOX_BELOW: &str = "──────────────────────\n  ⏵⏵ bypass permissions on (shift+tab to cycle)";
+
+    fn p7_markers() -> Vec<String> {
+        vec!["❯".to_string()]
+    }
+
+    fn p7_classify_and_rewrite(screen: &str, osc_title: &str) -> (ComposerLabel, Option<usize>, String) {
+        let lines: Vec<&str> = screen.lines().collect();
+        let (lbl, idx) = composer_label(&lines, &p7_markers(), osc_title);
+        let rewritten = if let (ComposerLabel::Bound, Some(i)) = (lbl, idx) {
+            let plain = plain_rule_for_bound_row(lines[i]);
+            let mut out: String = lines
+                .iter()
+                .enumerate()
+                .map(|(k, l)| if k == i { plain.as_str() } else { *l })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if screen.ends_with('\n') {
+                out.push('\n');
+            }
+            out
+        } else {
+            screen.to_string()
+        };
+        (lbl, idx, rewritten)
+    }
+
+    #[test]
+    fn p7_bound_rewrites_only_the_top_rule() {
+        let screen = format!(
+            "───────── old-title ─\n❯ first\n  out\n───────── my-session ─\n❯ \n{P7_BOX_BELOW}"
+        );
+        let (lbl, idx, rewritten) = p7_classify_and_rewrite(&screen, "✳ my-session");
+        assert_eq!((lbl, idx), (ComposerLabel::Bound, Some(3)));
+        let rlines: Vec<&str> = rewritten.lines().collect();
+        assert_eq!(rlines[0], "───────── old-title ─", "earlier titled line in transcript must not be rewritten");
+        assert!(is_rule_line(rlines[3]), "the row directly above the last marker row must be rewritten to a plain rule");
+        assert_eq!(rlines[3].chars().count(), "───────── my-session ─".chars().count());
+        assert_eq!(rlines[5], "──────────────────────", "bottom rule untouched");
+    }
+
+    #[test]
+    fn p7_bound_with_earlier_marker_rows_reads_empty() {
+        let title = "SESSION_STATE.md 기반 master 컨텍스트 복원";
+        let top_row = format!("──────────────────────────────────────────────────────────── {title} ─");
+        let screen = format!("{P7_HISTORY}{top_row}\n❯\u{a0}\n{P7_BOX_BELOW}");
+        // Raw screen before rewrite reproduces the 0.14.56 hold when an earlier ❯ row is in the transcript.
+        assert!(!composer_edit_region_empty(&screen, "❯", None));
+        assert!(!composer_layout_static_ok(&screen, "❯", None, Some(true)));
+        let (lbl, idx, rewritten) = p7_classify_and_rewrite(&screen, &format!("✳ {title}"));
+        assert_eq!((lbl, idx), (ComposerLabel::Bound, Some(4)));
+        assert!(composer_edit_region_empty(&rewritten, "❯", None));
+        assert!(composer_layout_static_ok(&rewritten, "❯", None, Some(true)));
+    }
+
+    #[test]
+    fn p7_bound_collapses_space_runs() {
+        let screen = format!("{P7_HISTORY}───────────── a  b ─\n❯ \n{P7_BOX_BELOW}");
+        for osc in ["✳ a  b", "✳ a b", "✳   a    b  "] {
+            let (lbl, idx, rewritten) = p7_classify_and_rewrite(&screen, osc);
+            assert_eq!((lbl, idx), (ComposerLabel::Bound, Some(4)), "osc={osc:?}");
+            assert!(composer_edit_region_empty(&rewritten, "❯", None), "osc={osc:?}");
+        }
+    }
+
+    #[test]
+    fn p7_bound_all_three_title_glyphs() {
+        let screen = format!("{P7_HISTORY}───────── session-name ─\n❯ \n{P7_BOX_BELOW}");
+        for glyph in ['✳', '◐', '◑'] {
+            let osc = format!("{glyph} session-name");
+            let (lbl, idx, _) = p7_classify_and_rewrite(&screen, &osc);
+            assert_eq!((lbl, idx), (ComposerLabel::Bound, Some(4)), "glyph={glyph}");
+        }
+    }
+
+    #[test]
+    fn p7_bound_emoji_wide_and_marker_glyph_names() {
+        for name in [
+            "emoji 🚀 name",
+            "컨텍스트복원이름표",
+            "name.",
+            "x ❯ y",
+        ] {
+            let screen = format!("{P7_HISTORY}────────── {name} ─\n❯ \n{P7_BOX_BELOW}");
+            let (lbl, idx, rewritten) = p7_classify_and_rewrite(&screen, &format!("✳ {name}"));
+            assert_eq!((lbl, idx), (ComposerLabel::Bound, Some(4)), "name={name:?}");
+            assert!(composer_edit_region_empty(&rewritten, "❯", None), "name={name:?}");
+            assert!(composer_layout_static_ok(&rewritten, "❯", None, Some(true)), "name={name:?}");
+        }
+    }
+
+    #[test]
+    fn p7_bound_exact_fit_row_with_leading_space() {
+        // At 40 columns (F = 0), a 37-column name has no leading '─': " <name> ─"
+        for name in [
+            "a".repeat(37),
+            format!("{}a", "가".repeat(18)),
+            format!("{} {}", "a".repeat(18), "b".repeat(18)),
+        ] {
+            let screen = format!("{P7_HISTORY} {name} ─\n❯ \n{P7_BOX_BELOW}");
+            let (lbl, idx, rewritten) = p7_classify_and_rewrite(&screen, &format!("✳ {name}"));
+            assert_eq!((lbl, idx), (ComposerLabel::Bound, Some(4)), "exact fit name={name:?}");
+            assert!(composer_edit_region_empty(&rewritten, "❯", None));
+            assert!(composer_layout_static_ok(&rewritten, "❯", None, Some(true)));
+        }
+    }
+
+    #[test]
+    fn p7_unbound_mismatched_name() {
+        let screen = format!("{P7_HISTORY}───────── name-a ─\n❯ \n{P7_BOX_BELOW}");
+        let (lbl, idx, _) = p7_classify_and_rewrite(&screen, "✳ name-b");
+        assert_eq!((lbl, idx), (ComposerLabel::Unbound, None));
+    }
+
+    #[test]
+    fn p7_unbound_no_glyph_title() {
+        let screen = format!("{P7_HISTORY}───────── name ─\n❯ \n{P7_BOX_BELOW}");
+        for osc in ["name", "• name", "- name"] {
+            let (lbl, idx, _) = p7_classify_and_rewrite(&screen, osc);
+            assert_eq!((lbl, idx), (ComposerLabel::Unbound, None), "osc={osc:?}");
+        }
+    }
+
+    #[test]
+    fn p7_unbound_empty_title() {
+        let screen = format!("{P7_HISTORY}───────── name ─\n❯ \n{P7_BOX_BELOW}");
+        for osc in ["", "   ", "✳", "✳   "] {
+            let (lbl, idx, _) = p7_classify_and_rewrite(&screen, osc);
+            assert_eq!((lbl, idx), (ComposerLabel::Unbound, None), "osc={osc:?}");
+        }
+    }
+
+    #[test]
+    fn p7_unbound_default_title() {
+        for row in ["───────── name ─", "─ Claude Code ─"] {
+            let screen = format!("{P7_HISTORY}{row}\n❯ \n{P7_BOX_BELOW}");
+            for osc in ["✳ Claude Code", "◐ Claude Code", "◑ Claude Code"] {
+                let (lbl, idx, _) = p7_classify_and_rewrite(&screen, osc);
+                assert_eq!((lbl, idx), (ComposerLabel::Unbound, None), "row={row:?} osc={osc:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn p7_unbound_codex_fixture_mismatched_and_equal_title() {
+        let with_earlier = "❯ earlier request\nPrevious output\n─ Workspace filter\n❯ \n────────────────";
+        let without_earlier = "Previous output\n─ Workspace filter\n❯ \n────────────────";
+        for screen in [with_earlier, without_earlier] {
+            for osc in ["✳ other name", "✳ Workspace filter"] {
+                let (lbl, idx, _) = p7_classify_and_rewrite(screen, osc);
+                assert_eq!(
+                    (lbl, idx),
+                    (ComposerLabel::Unbound, None),
+                    "a row without a closing ' ─' must stay Unbound even when the title text matches: osc={osc:?}"
+                );
+            }
+        }
+        // Disclosed residual: if an unknown field also has a closing ' ─' AND the exact session name, it binds.
+        let closed = "Previous output\n─ Workspace filter ─\n❯ \n────────────────";
+        assert_eq!(p7_classify_and_rewrite(closed, "✳ Workspace filter").0, ComposerLabel::Bound);
+    }
+
+    #[test]
+    fn p7_unbound_clipped_name_both_shapes() {
+        let full_title = "✳ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        // Shape 1: leading '─' with clipped '… ─'
+        let s1 = format!("{P7_HISTORY}─ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa… ─\n❯ \n{P7_BOX_BELOW}");
+        assert_eq!(p7_classify_and_rewrite(&s1, full_title), (ComposerLabel::Unbound, None, s1));
+        // Shape 2: F=0 leading single space with clipped '… ─'
+        let s2 = format!("{P7_HISTORY} aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa… ─\n❯ \n{P7_BOX_BELOW}");
+        assert_eq!(p7_classify_and_rewrite(&s2, full_title), (ComposerLabel::Unbound, None, s2));
+    }
+
+    #[test]
+    fn p7_unbound_history_chip() {
+        let screen = format!("{P7_HISTORY}── History 3/7 ─────────────\n❯ \n{P7_BOX_BELOW}");
+        for osc in ["✳ name", "✳ History 3/7"] {
+            let (lbl, idx, _) = p7_classify_and_rewrite(&screen, osc);
+            assert_eq!((lbl, idx), (ComposerLabel::Unbound, None), "osc={osc:?}");
+        }
+    }
+
+    #[test]
+    fn p7_unbound_tag_rows() {
+        for tag_row in [
+            "──────────────────── ↯",
+            "──────────────────── ultracode",
+            "──────────────────── ↯ ─",
+        ] {
+            let screen = format!("{P7_HISTORY}{tag_row}\n❯ \n{P7_BOX_BELOW}");
+            let (lbl, idx, _) = p7_classify_and_rewrite(&screen, "✳ name");
+            assert_eq!((lbl, idx), (ComposerLabel::Unbound, None), "tag_row={tag_row:?}");
+        }
+    }
+
+    #[test]
+    fn p7_unbound_tag_plus_name() {
+        let screen = format!("{P7_HISTORY}──────────── ↯  name ─\n❯ \n{P7_BOX_BELOW}");
+        let (lbl, idx, _) = p7_classify_and_rewrite(&screen, "✳ name");
+        assert_eq!((lbl, idx), (ComposerLabel::Unbound, None));
+    }
+
+    #[test]
+    fn p7_none_plain_rule() {
+        let screen = format!("{P7_HISTORY}──────────────\n❯ \n{P7_BOX_BELOW}");
+        let (lbl, idx, _) = p7_classify_and_rewrite(&screen, "✳ name");
+        assert_eq!((lbl, idx), (ComposerLabel::None, None));
+    }
+
+    #[test]
+    fn p7_none_rule_named_session_title_off() {
+        // Workaround W1 (/rename ─): the border row is all box-drawing + spaces with >= 8 contiguous '─', so is_rule_line is true.
+        let screen = format!("{P7_HISTORY}───────── ─ ─\n❯ \n{P7_BOX_BELOW}");
+        for osc in ["", "✳ ─", "✳ other"] {
+            let (lbl, idx, _) = p7_classify_and_rewrite(&screen, osc);
+            assert_eq!((lbl, idx), (ComposerLabel::None, None), "osc={osc:?}");
+        }
+        assert!(composer_edit_region_empty(&screen, "❯", None));
+        assert!(composer_layout_static_ok(&screen, "❯", None, Some(true)));
+    }
+
+    #[test]
+    fn p7_none_indented_row_in_a_draft() {
+        let screen = format!("────\n❯ draft\n  ──────── name ─\n  ❯ \n{P7_BOX_BELOW}");
+        let (lbl, idx, _) = p7_classify_and_rewrite(&screen, "✳ name");
+        assert_eq!((lbl, idx), (ComposerLabel::None, None));
+    }
+
+    #[test]
+    fn p7_none_two_space_row() {
+        let screen = format!("────\n❯ draft\n  aaaaaaaa ─\n  ❯ \n{P7_BOX_BELOW}");
+        let (lbl, idx, _) = p7_classify_and_rewrite(&screen, "✳ aaaaaaaa");
+        assert_eq!((lbl, idx), (ComposerLabel::None, None));
+    }
+
+    #[test]
+    fn p7_none_row_not_directly_above_marker() {
+        for screen in [
+            format!("{P7_HISTORY}───────── name ─\n\n❯ \n{P7_BOX_BELOW}"),
+            format!("{P7_HISTORY}───────── name ─\n  other line\n❯ \n{P7_BOX_BELOW}"),
+            "❯ \n──────────────────────".to_string(),
+            "───────── name ─\nno marker".to_string(),
+        ] {
+            let (lbl, idx, _) = p7_classify_and_rewrite(&screen, "✳ name");
+            assert_eq!((lbl, idx), (ComposerLabel::None, None), "screen={screen:?}");
+        }
+    }
+
+    #[test]
+    fn p7_raw_screen_scan_results_unchanged() {
+        // Raw readers (CLI boot/reinject gates) have no OSC title and call scan_composer on raw text; their results are byte-for-byte 0.14.56.
+        let raw_with_earlier = format!("{P7_HISTORY}───────── name ─\n❯ \n{P7_BOX_BELOW}");
+        assert!(!composer_edit_region_empty(&raw_with_earlier, "❯", None));
+        assert!(!composer_layout_static_ok(&raw_with_earlier, "❯", None, Some(true)));
+        assert!(!waiting_prompt_with_harmless_trailer(&raw_with_earlier, "❯"));
+        let raw_no_earlier = format!("  ack 1\n───────── name ─\n❯ \n{P7_BOX_BELOW}");
+        assert!(composer_edit_region_empty(&raw_no_earlier, "❯", None));
+        assert!(composer_layout_static_ok(&raw_no_earlier, "❯", None, Some(true)));
+    }
+
+    #[test]
+    fn p7_waiting_prompt_trailer_bound_true_mismatched_false() {
+        let raw = format!("{P7_HISTORY}───────── name ─\n❯\u{a0}\n{P7_BOX_BELOW}");
+        let (lbl_ok, _, bound_screen) = p7_classify_and_rewrite(&raw, "✳ name");
+        let (lbl_bad, _, mismatched_screen) = p7_classify_and_rewrite(&raw, "✳ other");
+        assert_eq!(lbl_ok, ComposerLabel::Bound);
+        assert_eq!(lbl_bad, ComposerLabel::Unbound);
+        assert!(waiting_prompt_with_harmless_trailer(&bound_screen, "❯"));
+        assert!(!waiting_prompt_with_harmless_trailer(&mismatched_screen, "❯"));
+    }
+
+    #[test]
+    fn p7_modal_left_behind_bound_closes_mismatched_stays_open() {
+        let raw = format!(
+            "❯ cat plan.md\n  Enter to confirm · Esc to cancel\n───────── name ─\n❯\u{a0}\n{P7_BOX_BELOW}"
+        );
+        let (_, _, bound_screen) = p7_classify_and_rewrite(&raw, "✳ name");
+        let (_, _, mismatched_screen) = p7_classify_and_rewrite(&raw, "✳ other");
+        assert!(modal_foreground(&bound_screen, Some("❯")).is_none(), "bound rewrite closes modal history behind the waiting prompt");
+        assert!(modal_foreground(&mismatched_screen, Some("❯")).is_some(), "mismatched label leaves modal history open");
+    }
+
+    #[test]
+    fn p7_gate_axis_497_bound_and_mismatched() {
+        let gates = first_run_gates::builtin();
+        let raw = format!(
+            "❯ cat theme.txt\n{}\n───────── name ─\n❯\u{a0}\n{P7_BOX_BELOW}",
+            fixtures::THEME
+        );
+        let (_, _, bound_screen) = p7_classify_and_rewrite(&raw, "✳ name");
+        let (_, _, mismatched_screen) = p7_classify_and_rewrite(&raw, "✳ other");
+        assert!(!gate_or_modal_foreground(&bound_screen, &gates, &p7_markers()));
+        assert!(gate_or_modal_foreground(&mismatched_screen, &gates, &p7_markers()));
+    }
+
+    #[test]
+    fn p7_title_holding_marker_glyph_modal_foreground() {
+        // A session name containing '❯' ("x ❯ y"): when Bound, the rewrite removes '❯' from the border row so modal history
+        // above closes cleanly while a real foreground modal below still holds; when Unbound with modal words in the label, it holds.
+        let history_with_marker_name = format!(
+            "❯ cat plan.md\n  Enter to confirm · Esc to cancel\n───────── x ❯ y ─\n❯\u{a0}\n{P7_BOX_BELOW}"
+        );
+        let (lbl, _, bound_screen) = p7_classify_and_rewrite(&history_with_marker_name, "✳ x ❯ y");
+        assert_eq!(lbl, ComposerLabel::Bound);
+        assert!(modal_foreground(&bound_screen, Some("❯")).is_none());
+        let fg_modal_below = format!("{bound_screen}\nEnter to confirm · Esc to cancel\n");
+        assert!(modal_foreground(&fg_modal_below, Some("❯")).is_some());
+        let unbound_modal_name = format!(
+            "{P7_HISTORY}── Enter to confirm · Esc to cancel ─\n❯\u{a0}\n{P7_BOX_BELOW}"
+        );
+        let (lbl_u, _, unbound_screen) = p7_classify_and_rewrite(&unbound_modal_name, "✳ other");
+        assert_eq!(lbl_u, ComposerLabel::Unbound);
+        assert!(modal_foreground(&unbound_screen, Some("❯")).is_some());
+    }
+
+    #[test]
+    fn p7_combine_unbound_wins_either_side() {
+        use ComposerLabel::*;
+        for (a, b) in [
+            (Unbound, None),
+            (None, Unbound),
+            (Unbound, Bound),
+            (Bound, Unbound),
+            (Unbound, Unbound),
+        ] {
+            assert_eq!(combine_labels(a, b), Unbound, "({a:?}, {b:?})");
+        }
+    }
+
+    #[test]
+    fn p7_combine_bound_needs_both_views() {
+        use ComposerLabel::*;
+        assert_eq!(combine_labels(Bound, Bound), Bound);
+        assert_eq!(combine_labels(Bound, None), Unbound);
+        assert_eq!(combine_labels(None, Bound), Unbound);
+    }
+
+    #[test]
+    fn p7_combine_none_none_is_none() {
+        assert_eq!(combine_labels(ComposerLabel::None, ComposerLabel::None), ComposerLabel::None);
     }
 }

@@ -7219,8 +7219,11 @@ fn machine_hold_probe(
             // ★(0.14.56 · P1 R-6 · design r3 §4-6) Measured seat: a draft is the D1 verdict's draft reading (a Home-moved draft
             //   now holds a CEO push, channel envelope, boot notice or schedule push instead of being typed onto). Unmeasured
             //   seat: the pin's before-only test.
+            // ★(0.14.57 · P7 · DESIGN-P7-r3 §2) `Unbound` dominates `obs.selector_row` when the modal axis is off and dominates
+            //   `ClaimedResidue`/`SubmittedResidue` so neither suppresses the hold.
+            let unbound = obs.label == cys::readiness::ComposerLabel::Unbound;
             let draft_seen = match composer_reads_empty(s, &obs, placeholder.as_deref()) {
-                Some(reading) => !obs.selector_row && reading == Some(false),
+                Some(reading) => unbound || (!obs.selector_row && reading == Some(false)),
                 None => obs_draft_observed(&obs),
             };
             // ★(리뷰 F1·F2) 화면 초안이 기계 소유로 **입증**되면 초안 축의 보류 근거가 아니다([`draft_machine_owned`]).
@@ -7228,18 +7231,19 @@ fn machine_hold_probe(
             input.draft = axes.draft
                 && !(axes.modal && input.modal)
                 && draft_seen
-                && match draft_machine_owned(s, obs.line.as_ref().map(|(before, _)| before.as_str())) {
-                    None => true,
-                    Some(MachineDraft::OwnPaste) => false,
-                    Some(MachineDraft::MachineResidue { owner }) => {
-                        note_machine_residue(daemon, s, owner, "owner_gen");
-                        false
-                    }
-                    Some(MachineDraft::SubmittedResidue { owner }) => {
-                        note_machine_residue_opt(daemon, s, owner, "submitted_body");
-                        false
-                    }
-                };
+                && (unbound
+                    || match draft_machine_owned(s, obs.line.as_ref().map(|(before, _)| before.as_str())) {
+                        None => true,
+                        Some(MachineDraft::OwnPaste) => false,
+                        Some(MachineDraft::MachineResidue { owner }) => {
+                            note_machine_residue(daemon, s, owner, "owner_gen");
+                            false
+                        }
+                        Some(MachineDraft::SubmittedResidue { owner }) => {
+                            note_machine_residue_opt(daemon, s, owner, "submitted_body");
+                            false
+                        }
+                    });
         }
     }
     machine_hold_verdict(&input, axes)
@@ -7599,6 +7603,24 @@ fn draft_gate_with(
             return Some(why);
         }
     }
+    let approval_pending = approval_or_gate_pending(daemon, s.id);
+    // ★(0.14.57 · P7 · DESIGN-P7-r3 §2 + P7-DIRECT) Before `proven_residue`, `Unbound` refuses `Text` and `ClearFirst`
+    //   unconditionally on the governed, agent-backed path; only `SubmitKey` under `selector_row || approval_pending` and
+    //   `CancelKey` on its existing human-count rule stay exempt.
+    if obs
+        .as_ref()
+        .is_some_and(|o| o.label == cys::readiness::ComposerLabel::Unbound)
+    {
+        match kind {
+            DirectSendKind::Text | DirectSendKind::ClearFirst => {
+                return Some(DraftGateDenied::ScreenOccupied);
+            }
+            DirectSendKind::SubmitKey if !(selector_row || approval_pending) => {
+                return Some(DraftGateDenied::ScreenOccupied);
+            }
+            DirectSendKind::SubmitKey | DirectSendKind::CancelKey => {}
+        }
+    }
     // ★(0.14.56 · P1 D3 · design r2 §4) Cycle clear only, from THIS observation's before-cursor text: our own paste is a transient
     //   refusal before the screen axis; a proven machine residue is not an occupied line.
     let machine = cycle_clear.then(|| draft_machine_owned(s, line.as_ref().map(|l| l.before_cursor)));
@@ -7609,7 +7631,6 @@ fn draft_gate_with(
         machine,
         Some(Some(MachineDraft::MachineResidue { .. } | MachineDraft::SubmittedResidue { .. }))
     );
-    let approval_pending = approval_or_gate_pending(daemon, s.id);
     // ★(0.14.56 · P1 R-5 · design r3 §4-5) Measured seat: "screen occupied" is the D1 verdict's draft reading, so a Home-moved
     //   draft (text after the cursor, not dim) refuses a direct Text/SubmitKey/ClearFirst; a suggestion passes as before.
     //   `Unknown` does not refuse (the pin's rule for an unobserved line). Unmeasured seat: the pin's before-only test.
@@ -7723,6 +7744,12 @@ fn cycle_clear_probe(
             }
             let obs = markers.as_deref().map(|m| observe_prompt(&s, m));
             if obs.as_ref().is_some_and(obs_modal_foreground) {
+                return true;
+            }
+            if obs
+                .as_ref()
+                .is_some_and(|o| o.label == cys::readiness::ComposerLabel::Unbound)
+            {
                 return true;
             }
             let line = obs.as_ref().and_then(|o| {
@@ -8247,6 +8274,9 @@ pub(crate) struct PromptObs {
     /// [`after_cursor_dim_of`] inside the SAME parser lock as `line` (one frame). `None` = no glyph after the cursor or the
     /// cursor is off-screen (a missing reading is not a value).
     pub(crate) after_cursor_dim: Option<bool>,
+    /// ★(0.14.57 · P7 · DESIGN-P7-r3 §2) Classification of the row directly above the last leading-marker row on a
+    /// D1-governed, agent-backed seat (`None` | `Bound` | `Unbound`).
+    pub(crate) label: cys::readiness::ComposerLabel,
 }
 
 impl PromptObs {
@@ -8295,6 +8325,9 @@ fn observe_prompt_block(s: &Arc<crate::state::Surface>, markers: &[String]) -> P
 }
 
 fn observe_prompt_ext(s: &Arc<crate::state::Surface>, markers: &[String], want_block: bool) -> PromptObs {
+    // ★(0.14.57 · P7 · DESIGN-P7-r3 §2) Evaluate the label step guard before `parser.lock()` so `agent_meta` is never nested
+    //   under the parser lock. D1-off seats and dead seats (`!seat_is_agent_backed(s)`) skip the entire step and title read.
+    let label_step = d1_governs(s) && crate::alert_route::seat_is_agent_backed(s);
     // ★(0.14.31 · 리뷰 R5 · codex major) 세대는 파서 락 **밖·앞**에서 읽는다. 락 안에서 읽으면
     //   "락을 기다리는 동안 reader 가 새 청크를 반영했다" 는 창이 관측에 흡수돼 보이지 않는다 —
     //   밖에서 읽으면 그 변화까지 세대 불일치로 **거부**되므로 엄밀히 더 보수적이다. 발행 중(홀수)도
@@ -8304,7 +8337,37 @@ fn observe_prompt_ext(s: &Arc<crate::state::Surface>, markers: &[String], want_b
     let screen = p.screen();
     let (rows, cols) = screen.size();
     let (cr, cc) = screen.cursor_position();
-    let contents = screen.contents();
+    let mut contents = screen.contents();
+    let (label, cached_rows) = if label_step {
+        let osc_title = screen.title();
+        let mut rows_text: Vec<String> = screen.rows(0, cols).collect();
+        let content_lines: Vec<&str> = contents.lines().collect();
+        let row_refs: Vec<&str> = rows_text.iter().map(String::as_str).collect();
+        let (c_lbl, c_idx) = cys::readiness::composer_label(&content_lines, markers, osc_title);
+        let (r_lbl, r_idx) = cys::readiness::composer_label(&row_refs, markers, osc_title);
+        let combined = cys::readiness::combine_labels(c_lbl, r_lbl);
+        if combined == cys::readiness::ComposerLabel::Bound
+            && let (Some(ci), Some(ri)) = (c_idx, r_idx)
+        {
+            let c_plain = cys::readiness::plain_rule_for_bound_row(content_lines[ci]);
+            let trailing_nl = contents.ends_with('\n');
+            let mut rebuilt: String = content_lines
+                .iter()
+                .enumerate()
+                .map(|(i, l)| if i == ci { c_plain.as_str() } else { *l })
+                .collect::<Vec<&str>>()
+                .join("\n");
+            if trailing_nl {
+                rebuilt.push('\n');
+            }
+            contents = rebuilt;
+            let r_plain = cys::readiness::plain_rule_for_bound_row(&rows_text[ri]);
+            rows_text[ri] = r_plain;
+        }
+        (combined, Some(rows_text))
+    } else {
+        (cys::readiness::ComposerLabel::None, None)
+    };
     let marker_seen = markers.iter().any(|m| contents.contains(m.as_str()));
     if cr >= rows || markers.is_empty() {
         // 빈 목록은 호출부 불변식 위반이다. 빈 문자열로 contains/rfind 하지 않고 보류한다.
@@ -8326,6 +8389,7 @@ fn observe_prompt_ext(s: &Arc<crate::state::Surface>, markers: &[String], want_b
             alt_screen,
             block: None,
             after_cursor_dim: None,
+            label,
         };
     }
     let before_all = screen.contents_between(cr, 0, cr, cc);
@@ -8363,7 +8427,7 @@ fn observe_prompt_ext(s: &Arc<crate::state::Surface>, markers: &[String], want_b
     let near = screen.contents_between(lo, 0, hi, cols).to_lowercase();
     let busy_near_cursor = PROMPT_BUSY_TOKENS.iter().any(|t| near.contains(t));
     let block = if want_block {
-        let rows_text: Vec<String> = screen.rows(0, cols).collect();
+        let rows_text: Vec<String> = cached_rows.unwrap_or_else(|| screen.rows(0, cols).collect());
         composer_block_of(&rows_text, markers, usize::from(cr), &before_all)
     } else {
         None
@@ -8383,6 +8447,7 @@ fn observe_prompt_ext(s: &Arc<crate::state::Surface>, markers: &[String], want_b
         alt_screen,
         block,
         after_cursor_dim,
+        label,
     }
 }
 
@@ -9049,6 +9114,11 @@ pub(crate) fn d9_scope(daemon: &Daemon, s: &Arc<crate::state::Surface>, owner_ca
 /// U+00A0 is never read as a signal here: `str::trim`/`split_whitespace` treat it as white space, i.e. as part of the CLI's
 /// marker glyph spacing (head constraint, CEO intake #57).
 pub(crate) fn composer_verdict(obs: &PromptObs, placeholder: Option<&str>) -> ComposerVerdict {
+    // ★(0.14.57 · P7 · DESIGN-P7-r3 §2) `Unbound` dominates row 1 (`obs.line` / `obs.selector_row`), so an unbound label is
+    //   never `Unknown` and always reads `Draft`.
+    if obs.label == cys::readiness::ComposerLabel::Unbound {
+        return ComposerVerdict::Draft;
+    }
     // row 1
     if obs.selector_row {
         return ComposerVerdict::Unknown;
@@ -9128,23 +9198,27 @@ pub(crate) fn observe_composer_export(s: &Arc<crate::state::Surface>) -> serde_j
         Some(MachineDraft::SubmittedResidue { owner: None }) => ("machine", "daemon"),
         None => ("none", "unattributed"),
     };
+    let mut composer = serde_json::json!({
+        "verdict": verdict.as_str(),
+        "governed": governed,
+        "modal": obs_modal_foreground(&obs),
+        "owner": owner_name,
+        "owner_kind": owner_kind,
+        "before_cursor_empty": obs.line.as_ref().map(|(before, _)| before.trim().is_empty()),
+        "after_cursor_present": obs.line.as_ref().map(|(_, after)| !after.trim().is_empty()),
+        "after_cursor_dim": obs.after_cursor_dim,
+        "input_gen": input_gen,
+        "output_gen": consistent.then_some(obs.output_gen),
+        "pending_bytes": pending_bytes,
+        "human_bytes": human_bytes,
+    });
+    if governed {
+        composer["label"] = serde_json::Value::from(obs.label.as_str());
+    }
     serde_json::json!({
         "text": obs.screen,
         "quiet_secs": if consistent { obs.quiet_secs as f64 } else { 0.0 },
-        "composer": {
-            "verdict": verdict.as_str(),
-            "governed": governed,
-            "modal": obs_modal_foreground(&obs),
-            "owner": owner_name,
-            "owner_kind": owner_kind,
-            "before_cursor_empty": obs.line.as_ref().map(|(before, _)| before.trim().is_empty()),
-            "after_cursor_present": obs.line.as_ref().map(|(_, after)| !after.trim().is_empty()),
-            "after_cursor_dim": obs.after_cursor_dim,
-            "input_gen": input_gen,
-            "output_gen": consistent.then_some(obs.output_gen),
-            "pending_bytes": pending_bytes,
-            "human_bytes": human_bytes,
-        },
+        "composer": composer,
     })
 }
 
@@ -21963,6 +22037,1076 @@ mod tests {
     }
     // ===== end of the P1 behavioural block =====
 
+    // ===== ★(0.14.57 · P7 · DESIGN-P7-r2 §7, r3 §5, P7-DIRECT) Titled composer border behavioural tests =====
+
+    fn p7_set_osc_title(s: &Arc<crate::state::Surface>, osc: &str) {
+        s.parser
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .process(format!("\x1b]0;{osc}\x07").as_bytes());
+    }
+
+    fn p7_paint_titled_box(
+        s: &Arc<crate::state::Surface>,
+        top_border: &str,
+        osc: &str,
+        earlier_marker: bool,
+        after: &str,
+        alt: bool,
+    ) {
+        let marker_row = if after.is_empty() {
+            "❯\u{a0}".to_string()
+        } else {
+            format!("❯\u{a0}{after}")
+        };
+        let mut lines = Vec::new();
+        if earlier_marker {
+            lines.push("❯ earlier turn".to_string());
+            lines.push("  ack 1".to_string());
+        } else {
+            lines.push("✻ Worked for 12s".to_string());
+        }
+        lines.push(top_border.to_string());
+        lines.push(marker_row);
+        lines.push(RULE.to_string());
+        lines.push(STATUS1.to_string());
+        lines.push(STATUS2.to_string());
+        let cursor_row = if earlier_marker { 3 } else { 2 };
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        paint_screen(s, &refs, cursor_row, 2, alt);
+        p7_set_osc_title(s, osc);
+    }
+
+    #[test]
+    fn p7_verdict_empty_when_bound() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_daemon, s) = marker_seat("p7-v-bound");
+        p1_measured(&s);
+        let title = "SESSION_STATE.md 기반 master 컨텍스트 복원";
+        let top = format!("────────────────────────────────────── {title} ─");
+        p7_paint_titled_box(&s, &top, &format!("✳ {title}"), true, "", false);
+        let obs = super::observe_prompt(&s, &["❯".to_string()]);
+        assert_eq!(obs.label, cys::readiness::ComposerLabel::Bound);
+        assert_eq!(super::composer_verdict(&obs, None), super::ComposerVerdict::Empty);
+        crate::state::p1_e0_stop_daemon(&_daemon);
+    }
+
+    #[test]
+    fn p7_verdict_draft_when_unbound_without_marker_row_above() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_daemon, s) = marker_seat("p7-v-unbound-no-earlier");
+        p1_measured(&s);
+        p7_paint_titled_box(&s, "────────────────────────── my-title ─", "✳ other-title", false, "", false);
+        let obs = super::observe_prompt(&s, &["❯".to_string()]);
+        assert_eq!(obs.label, cys::readiness::ComposerLabel::Unbound);
+        assert_eq!(
+            super::composer_verdict(&obs, None),
+            super::ComposerVerdict::Draft,
+            "Unbound without an earlier ❯ row must still read Draft"
+        );
+        crate::state::p1_e0_stop_daemon(&_daemon);
+    }
+
+    #[test]
+    fn p7_unbound_is_never_unknown() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_daemon, s) = marker_seat("p7-v-never-unknown");
+        p1_measured(&s);
+        // Cursor on an unmarked row, cursor before marker, selector row, and unclosed box: all must return Draft when Unbound.
+        paint_screen(&s, &["────────────────── name ─", "❯ ", "unmarked row"], 2, 0, false);
+        p7_set_osc_title(&s, "✳ other");
+        let obs1 = super::observe_prompt(&s, &["❯".to_string()]);
+        assert!(obs1.line.is_none() && obs1.label == cys::readiness::ComposerLabel::Unbound);
+        assert_eq!(super::composer_verdict(&obs1, None), super::ComposerVerdict::Draft);
+
+        paint_screen(&s, &["────────────────── name ─", "  ❯ "], 1, 0, false);
+        p7_set_osc_title(&s, "✳ other");
+        let obs2 = super::observe_prompt(&s, &["❯".to_string()]);
+        assert!(obs2.line.is_none() && obs2.label == cys::readiness::ComposerLabel::Unbound);
+        assert_eq!(super::composer_verdict(&obs2, None), super::ComposerVerdict::Draft);
+
+        paint_screen(&s, &["────────────────── name ─", "❯ 1. Yes"], 1, 2, false);
+        p7_set_osc_title(&s, "✳ other");
+        let obs3 = super::observe_prompt(&s, &["❯".to_string()]);
+        assert!(obs3.selector_row && obs3.label == cys::readiness::ComposerLabel::Unbound);
+        assert_eq!(super::composer_verdict(&obs3, None), super::ComposerVerdict::Draft);
+        crate::state::p1_e0_stop_daemon(&_daemon);
+    }
+
+    #[test]
+    fn p7_unbound_verdict_is_draft_with_line_none() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_daemon, s) = marker_seat("p7-v-line-none");
+        p1_measured(&s);
+        paint_screen(&s, &["─ Workspace filter", "❯ ", RULE, STATUS1], 3, 2, false);
+        p7_set_osc_title(&s, "✳ Workspace filter");
+        let obs = super::observe_prompt(&s, &["❯".to_string()]);
+        assert!(obs.line.is_none());
+        assert_eq!(obs.label, cys::readiness::ComposerLabel::Unbound);
+        assert_eq!(super::composer_verdict(&obs, None), super::ComposerVerdict::Draft);
+        crate::state::p1_e0_stop_daemon(&_daemon);
+    }
+
+    #[test]
+    fn p7_unbound_verdict_is_draft_on_selector_row() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_daemon, s) = marker_seat("p7-v-selector");
+        p1_measured(&s);
+        paint_screen(&s, &["────────────────── name ─", "❯ 1. Option one", "  2. Option two"], 1, 2, false);
+        p7_set_osc_title(&s, "✳ other");
+        let obs = super::observe_prompt(&s, &["❯".to_string()]);
+        assert!(obs.selector_row);
+        assert_eq!(obs.label, cys::readiness::ComposerLabel::Unbound);
+        assert_eq!(super::composer_verdict(&obs, None), super::ComposerVerdict::Draft);
+        crate::state::p1_e0_stop_daemon(&_daemon);
+    }
+
+    #[test]
+    fn p7_view_disagreement_rewrites_nothing_and_exports_unbound() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p7-disagree");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (daemon, s) = wp5_seat("p7-disagree", "claude");
+        p1_measured(&s);
+        // Set 20 cols so a 20-char prefix ("X" * 20) soft-wraps onto row 1 ("───────── name ─") without a newline:
+        // `screen.rows(0, 20)` sees row 1 as `"───────── name ─"` (Bound), while `screen.contents()` joins row 0 and row 1
+        // into `"XXXXXXXXXXXXXXXXXXXX───────── name ─"` (None).
+        {
+            quiesce(&s);
+            let mut p = s.parser.lock().unwrap_or_else(|e| e.into_inner());
+            p.set_size(24, 20);
+            p.process(b"\x1b[2J\x1b[H");
+            let wrapped = format!("{}───────── name ─\r\n❯ \r\n────────────────────", "X".repeat(20));
+            p.process(wrapped.as_bytes());
+            p.process(b"\x1b[3;3H\x1b]0;\xe2\x9c\xb3 name\x07");
+        }
+        let obs = super::observe_prompt_block(&s, &["❯".to_string()]);
+        assert_eq!(obs.label, cys::readiness::ComposerLabel::Unbound);
+        assert!(obs.screen.contains("───────── name ─"), "contents must not be rewritten on view disagreement");
+        let block = obs.block.expect("block on marker row");
+        assert!(block.as_empty_prompt.contains("───────── name ─"), "rows_text must not be rewritten on view disagreement");
+        let r = crate::state::test_until_no_pty_output(&s, "p7 disagree export", || e0_read(&daemon, &s, true));
+        assert_eq!(r["composer"]["label"], json!("unbound"));
+        assert_eq!(r["composer"]["verdict"], json!("draft"));
+        assert!(r["text"].as_str().unwrap().contains("───────── name ─"));
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p7_wrapped_label_row_contents_none_rows_bound_is_unbound() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_daemon, s) = wp5_seat("p7-wrap-split", "claude");
+        p1_measured(&s);
+        {
+            quiesce(&s);
+            let mut p = s.parser.lock().unwrap_or_else(|e| e.into_inner());
+            p.set_size(24, 20);
+            p.process(b"\x1b[2J\x1b[H");
+            // A wrapped label row: row 0 is "────────────────────" (20 chars) soft-wrapping into row 1 "───────── name ─" (16 chars):
+            // `contents()` joins them into one 36-char line ("───────────────────────────── name ─", Bound) OR if row 0 is
+            // "────────────────────" and row 1 is "not-a-rule" while another wrap splits the label: here row 0 is "prefix              "
+            // (20 chars) soft-wrapping into "───────── name ─": `contents()` sees "prefix              ───────── name ─" (None),
+            // `rows(0, 20)` sees "───────── name ─" (Bound).
+            let wrapped = format!("{:<20}───────── name ─\r\n❯ \r\n────────────────────", "prefix");
+            p.process(wrapped.as_bytes());
+            p.process(b"\x1b[3;3H\x1b]0;\xe2\x9c\xb3 name\x07");
+            let screen = p.screen();
+            let c_lines: Vec<String> = screen.contents().lines().map(String::from).collect();
+            let c_refs: Vec<&str> = c_lines.iter().map(String::as_str).collect();
+            let r_lines: Vec<String> = screen.rows(0, 20).collect();
+            let r_refs: Vec<&str> = r_lines.iter().map(String::as_str).collect();
+            let markers = vec!["❯".to_string()];
+            assert_eq!(cys::readiness::composer_label(&c_refs, &markers, screen.title()).0, cys::readiness::ComposerLabel::None);
+            assert_eq!(cys::readiness::composer_label(&r_refs, &markers, screen.title()).0, cys::readiness::ComposerLabel::Bound);
+        }
+        let obs = super::observe_prompt(&s, &["❯".to_string()]);
+        assert_eq!(obs.label, cys::readiness::ComposerLabel::Unbound);
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&_daemon);
+    }
+
+    #[test]
+    fn p7_label_computed_on_the_early_return_path() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_daemon, s) = marker_seat("p7-early-ret");
+        p1_measured(&s);
+        // Source pin: `label` is computed before `if cr >= rows || markers.is_empty()` and passed into the early-return `PromptObs`.
+        let src = include_str!("governance.rs");
+        let fn_start = src.find("\nfn observe_prompt_ext(").expect("observe_prompt_ext");
+        let fn_body = &src[fn_start..fn_start + src[fn_start..].find("\n}\n").expect("fn end")];
+        let label_at = fn_body.find("let (label, cached_rows) = if label_step").expect("label step");
+        let early_at = fn_body.find("if cr >= rows || markers.is_empty()").expect("early return");
+        assert!(label_at < early_at, "label step must precede the early return");
+        // Runtime check on the early-return branch (`markers` empty yields `None`; and normal path yields `Bound` / `Unbound`).
+        p7_paint_titled_box(&s, "────────────────── name ─", "✳ name", true, "", false);
+        let empty_markers = super::observe_prompt(&s, &[]);
+        assert_eq!(empty_markers.label, cys::readiness::ComposerLabel::None);
+        let bound_obs = super::observe_prompt(&s, &["❯".to_string()]);
+        assert_eq!(bound_obs.label, cys::readiness::ComposerLabel::Bound);
+        crate::state::p1_e0_stop_daemon(&_daemon);
+    }
+
+    #[test]
+    fn p7_dead_seat_skips_the_label_step() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p7-dead-seat");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (daemon, s) = marker_seat("p7-dead-seat");
+        p1_measured(&s);
+        // Unbound titled frame above a shell prompt after agent death: while agent-backed (`true`), it is `Unbound` and refuses
+        // direct Text; once dead (`true -> false` via `agent_exit_notified` or `SeatState::Empty`), it skips the label step
+        // (`obs.label == None`) and admits `node-recover` direct Text; once relaunched (`false -> true`), it enforces `Unbound` again.
+        paint_screen(
+            &s,
+            &["────────────────── name ─", "❯ ", "user@mac ~ % "],
+            2,
+            13,
+            false,
+        );
+        p7_set_osc_title(&s, "✳ other");
+        assert!(crate::alert_route::seat_is_agent_backed(&s));
+        assert_eq!(super::observe_prompt(&s, &["❯".to_string()]).label, cys::readiness::ComposerLabel::Unbound);
+        assert_eq!(super::draft_gate(&daemon, &s, DirectSendKind::Text), Some(DraftGateDenied::ScreenOccupied));
+
+        // Transition true -> false (agent died: `agent_exit_notified = true` and `seat_cache = Empty`)
+        s.agent_exit_notified.store(true, AtomicOrdering::Relaxed);
+        s.seat_cache.store(SeatState::Empty.as_u8(), AtomicOrdering::Relaxed);
+        assert!(!crate::alert_route::seat_is_agent_backed(&s));
+        let dead_obs = super::observe_prompt_block(&s, &["❯".to_string()]);
+        assert_eq!(dead_obs.label, cys::readiness::ComposerLabel::None);
+        assert!(dead_obs.screen.contains("────────────────── name ─"));
+        assert_eq!(super::draft_gate(&daemon, &s, DirectSendKind::Text), None, "dead seat self-heal Text must not be refused by Unbound");
+
+        // Transition false -> true (agent relaunched and observed by watchdog)
+        s.agent_exit_notified.store(false, AtomicOrdering::Relaxed);
+        s.seat_cache.store(SeatState::Idle.as_u8(), AtomicOrdering::Relaxed);
+        assert!(crate::alert_route::seat_is_agent_backed(&s));
+        assert_eq!(super::observe_prompt(&s, &["❯".to_string()]).label, cys::readiness::ComposerLabel::Unbound);
+        assert_eq!(super::draft_gate(&daemon, &s, DirectSendKind::Text), Some(DraftGateDenied::ScreenOccupied));
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p7_queue_delivers_when_bound_inline_and_alt() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p7-q-bound");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap()), ("CYS_QUEUE_STARVE_ALERT_SECS", "0")]);
+        let title = "SESSION_STATE.md 기반 master 컨텍스트 복원";
+        let top = format!("────────────────────────────────────── {title} ─");
+        for alt in [false, true] {
+            let (daemon, s) = p1_seat(if alt { "p7-q-bound-alt" } else { "p7-q-bound-inline" });
+            p7_paint_titled_box(&s, &top, &format!("✳ {title}"), true, "", alt);
+            quiet_since(&s, 10);
+            tick(&daemon);
+            assert!(
+                s.pending_queue.lock().unwrap().is_empty(),
+                "alt={alt}: bound titled border must deliver (blocked: {})",
+                blocked_reason(&s)
+            );
+            let _ = s.child.lock().unwrap().kill();
+            crate::state::p1_e0_stop_daemon(&daemon);
+        }
+    }
+
+    #[test]
+    fn p7_queue_holds_when_mismatched_inline_and_alt() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p7-q-unbound");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap()), ("CYS_QUEUE_STARVE_ALERT_SECS", "0")]);
+        for alt in [false, true] {
+            for earlier in [false, true] {
+                let tag = format!("p7-q-unb-{alt}-{earlier}");
+                let (daemon, s) = p1_seat(&tag);
+                p7_paint_titled_box(&s, "────────────────────────── my-title ─", "✳ other-title", earlier, "", alt);
+                quiet_since(&s, 10);
+                tick(&daemon);
+                assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "alt={alt} earlier={earlier}: mismatched label must hold");
+                assert_eq!(blocked_reason(&s), BLOCKED_INPUT_PENDING, "alt={alt} earlier={earlier}");
+                let _ = s.child.lock().unwrap().kill();
+                crate::state::p1_e0_stop_daemon(&daemon);
+            }
+        }
+    }
+
+    #[test]
+    fn p7_stale_reset_fires_when_bound() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p7-stale-bound");
+        let _env = QueueEnvGuard::set(&[
+            ("CYS_PACK_DIR", pack.to_str().unwrap()),
+            ("CYS_QUEUE_STARVE_ALERT_SECS", "0"),
+            ("CYS_QUEUE_QUIET_SECS", "1"),
+        ]);
+        let (daemon, s) = p1_seat("p7-stale-bound");
+        s.set_pending_input(1);
+        p7_paint_titled_box(&s, "────────────────────────── my-title ─", "✳ my-title", true, "", false);
+        quiet_since(&s, 10);
+        tick(&daemon);
+        assert_eq!(blocked_reason(&s), BLOCKED_INPUT_PENDING, "first tick stamps stale slot");
+        {
+            let mut slot = s.pending_input_stale.lock().unwrap();
+            let (bytes, gen, _) = slot.expect("first tick must arm the stale slot when bound");
+            *slot = Some((bytes, gen, std::time::Instant::now() - std::time::Duration::from_secs(10)));
+        }
+        tick(&daemon);
+        assert_eq!(s.pending_input_bytes.load(AtomicOrdering::Relaxed), 0, "stale count must reset when bound");
+        tick(&daemon);
+        assert!(s.pending_queue.lock().unwrap().is_empty(), "delivered after stale reset");
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p7_stale_reset_keeps_counts_when_mismatched() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p7-stale-unbound");
+        let _env = QueueEnvGuard::set(&[
+            ("CYS_PACK_DIR", pack.to_str().unwrap()),
+            ("CYS_QUEUE_STARVE_ALERT_SECS", "0"),
+            ("CYS_QUEUE_QUIET_SECS", "1"),
+        ]);
+        for earlier in [false, true] {
+            let (daemon, s) = p1_seat(&format!("p7-stale-unb-{earlier}"));
+            s.set_pending_input(1);
+            p7_paint_titled_box(&s, "────────────────────────── my-title ─", "✳ other-title", earlier, "", false);
+            quiet_since(&s, 10);
+            *s.pending_input_stale.lock().unwrap() =
+                Some((1, s.input_gen.load(AtomicOrdering::Acquire), std::time::Instant::now() - std::time::Duration::from_secs(10)));
+            tick(&daemon);
+            tick(&daemon);
+            assert_eq!(s.pending_input_bytes.load(AtomicOrdering::Relaxed), 1, "earlier={earlier}: mismatched label must never reset stale count");
+            assert!(s.pending_input_stale.lock().unwrap().is_none());
+            assert_eq!(s.pending_queue.lock().unwrap().len(), 1);
+            let _ = s.child.lock().unwrap().kill();
+            crate::state::p1_e0_stop_daemon(&daemon);
+        }
+    }
+
+    #[test]
+    fn p7_slash_admitted_when_bound_with_plain_rule_above() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p7-slash-bound");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap()), ("CYS_QUEUE_STARVE_ALERT_SECS", "0")]);
+        let (daemon, s) = wp5_seat("p7-slash-bound", "claude");
+        p1_measured(&s);
+        let e = daemon.next_queue_entry("/compact".into(), None, "test");
+        s.pending_queue.lock().unwrap().push_back(e);
+        // Gemini r1 major: a plain rule in the transcript above a bound titled border. Without rewriting `rows_text` before
+        // `composer_block_of`, `slash_known_occupied_region`'s closure sets `opening` at the transcript plain rule and sees the
+        // titled top border inside the box, returning `false` and refusing `/compact`.
+        paint_screen(
+            &s,
+            &[
+                "❯ earlier turn",
+                RULE,
+                "  markdown section under a horizontal rule",
+                "────────────────────────── my-title ─",
+                "❯\u{a0}",
+                RULE,
+                STATUS1,
+                STATUS2,
+            ],
+            4,
+            2,
+            false,
+        );
+        p7_set_osc_title(&s, "✳ my-title");
+        quiet_since(&s, 10);
+        tick(&daemon);
+        assert!(
+            s.pending_queue.lock().unwrap().is_empty(),
+            "queued /compact on a bound composer with a plain rule in transcript must be delivered (blocked: {})",
+            blocked_reason(&s)
+        );
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p7_slash_refused_at_the_gate_when_unbound() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p7-slash-unbound");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap()), ("CYS_QUEUE_STARVE_ALERT_SECS", "0")]);
+        let (daemon, s) = wp5_seat("p7-slash-unbound", "claude");
+        p1_measured(&s);
+        let e = daemon.next_queue_entry("/compact".into(), None, "test");
+        s.pending_queue.lock().unwrap().push_back(e);
+        p7_paint_titled_box(&s, "────────────────────────── my-title ─", "✳ other-title", false, "", false);
+        quiet_since(&s, 10);
+        tick(&daemon);
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1);
+        assert_eq!(blocked_reason(&s), BLOCKED_INPUT_PENDING);
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p7_d1_off_skips_the_label_step_and_the_title_read() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_daemon, s) = marker_seat("p7-d1-off-skip");
+        s.d1_platform.store(false, AtomicOrdering::Relaxed);
+        assert!(!super::d1_governs(&s));
+        for osc in ["✳ my-title", "✳ other-title"] {
+            p7_paint_titled_box(&s, "────────────────────────── my-title ─", osc, true, "", false);
+            let obs = super::observe_prompt_block(&s, &["❯".to_string()]);
+            assert_eq!(obs.label, cys::readiness::ComposerLabel::None, "osc={osc}");
+            assert!(obs.screen.contains("────────────────────────── my-title ─"), "D1-off must not rewrite obs.screen");
+            assert!(
+                obs.block.as_ref().unwrap().as_empty_prompt.contains("────────────────────────── my-title ─"),
+                "D1-off must not rewrite obs.block"
+            );
+        }
+        crate::state::p1_e0_stop_daemon(&_daemon);
+    }
+
+    #[test]
+    fn p7_d1_off_stale_reset_unchanged_mismatched_label() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p7-d1-off-stale");
+        let _env = QueueEnvGuard::set(&[
+            ("CYS_PACK_DIR", pack.to_str().unwrap()),
+            ("CYS_QUEUE_STARVE_ALERT_SECS", "0"),
+            ("CYS_QUEUE_QUIET_SECS", "1"),
+        ]);
+        let (daemon, s) = p1_seat("p7-d1-off-stale");
+        s.d1_platform.store(false, AtomicOrdering::Relaxed);
+        s.set_pending_input(1);
+        // On a D1-off seat with no earlier ❯ row, 0.14.56 resets the stale count even when a mismatched label is drawn.
+        p7_paint_titled_box(&s, "────────────────────────── my-title ─", "✳ other-title", false, "", false);
+        quiet_since(&s, 10);
+        tick(&daemon);
+        {
+            let mut slot = s.pending_input_stale.lock().unwrap();
+            let (bytes, gen, _) = slot.expect("D1-off with no earlier ❯ row arms stale reset as in 0.14.56");
+            *slot = Some((bytes, gen, std::time::Instant::now() - std::time::Duration::from_secs(10)));
+        }
+        tick(&daemon);
+        assert_eq!(s.pending_input_bytes.load(AtomicOrdering::Relaxed), 0);
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p7_d1_off_slash_unchanged_both_closure_cases() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p7-d1-off-slash");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap()), ("CYS_QUEUE_STARVE_ALERT_SECS", "0")]);
+        // Case 1: no plain rule above in transcript, no earlier ❯ row -> D1-off slash admits by fallback as in 0.14.56.
+        let (daemon1, s1) = wp5_seat("p7-d1-off-slash-1", "claude");
+        s1.d1_platform.store(false, AtomicOrdering::Relaxed);
+        s1.pending_queue.lock().unwrap().push_back(daemon1.next_queue_entry("/compact".into(), None, "test"));
+        p7_paint_titled_box(&s1, "────────────────────────── my-title ─", "✳ my-title", false, "", false);
+        quiet_since(&s1, 10);
+        tick(&daemon1);
+        assert!(s1.pending_queue.lock().unwrap().is_empty(), "D1-off case 1: fallback admits /compact as in 0.14.56");
+        let _ = s1.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon1);
+
+        // Case 2: plain rule above in transcript, no earlier ❯ row -> D1-off does NOT rewrite rows_text, so closure refuses /compact as in 0.14.56.
+        let (daemon2, s2) = wp5_seat("p7-d1-off-slash-2", "claude");
+        s2.d1_platform.store(false, AtomicOrdering::Relaxed);
+        s2.pending_queue.lock().unwrap().push_back(daemon2.next_queue_entry("/compact".into(), None, "test"));
+        paint_screen(
+            &s2,
+            &[
+                "  earlier output",
+                RULE,
+                "────────────────────────── my-title ─",
+                "❯\u{a0}",
+                RULE,
+                STATUS1,
+                STATUS2,
+            ],
+            3,
+            2,
+            false,
+        );
+        p7_set_osc_title(&s2, "✳ my-title");
+        quiet_since(&s2, 10);
+        tick(&daemon2);
+        assert_eq!(s2.pending_queue.lock().unwrap().len(), 1, "D1-off case 2: un-rewritten rows_text keeps 0.14.56 closure refusal");
+        let _ = s2.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon2);
+    }
+
+    #[test]
+    fn p7_d1_off_layout_unchanged_alt() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p7-d1-off-alt");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap()), ("CYS_QUEUE_STARVE_ALERT_SECS", "0")]);
+        // Without earlier ❯ row: delivers on D1-off alt even when label mismatches (0.14.56 parity).
+        let (daemon1, s1) = p1_seat("p7-d1-off-alt-1");
+        s1.d1_platform.store(false, AtomicOrdering::Relaxed);
+        p7_paint_titled_box(&s1, "────────────────────────── my-title ─", "✳ other-title", false, "", true);
+        quiet_since(&s1, 10);
+        tick(&daemon1);
+        assert!(s1.pending_queue.lock().unwrap().is_empty());
+        let _ = s1.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon1);
+
+        // With earlier ❯ row: blocks with BLOCKED_ALT_SCREEN on D1-off alt even when label matches (0.14.56 parity).
+        let (daemon2, s2) = p1_seat("p7-d1-off-alt-2");
+        s2.d1_platform.store(false, AtomicOrdering::Relaxed);
+        p7_paint_titled_box(&s2, "────────────────────────── my-title ─", "✳ my-title", true, "", true);
+        quiet_since(&s2, 10);
+        tick(&daemon2);
+        assert_eq!(s2.pending_queue.lock().unwrap().len(), 1);
+        assert_eq!(blocked_reason(&s2), BLOCKED_ALT_SCREEN);
+        let _ = s2.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon2);
+    }
+
+    #[test]
+    fn p7_d1_off_verdict_never_called() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_daemon, s) = marker_seat("p7-d1-off-verdict");
+        s.d1_platform.store(false, AtomicOrdering::Relaxed);
+        p7_paint_titled_box(&s, "────────────────────────── my-title ─", "✳ other-title", false, "", false);
+        let obs = super::observe_prompt(&s, &["❯".to_string()]);
+        assert_eq!(super::composer_reads_empty(&s, &obs, None), None);
+        let exp = super::observe_composer_export(&s);
+        assert_eq!(exp["composer"]["governed"], json!(false));
+        assert_eq!(exp["composer"]["verdict"], json!("unknown"));
+        assert!(exp["composer"].get("label").is_none());
+        crate::state::p1_e0_stop_daemon(&_daemon);
+    }
+
+    #[test]
+    fn p7_block_rows_rewritten_with_screen() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_daemon, s) = marker_seat("p7-block-rewrite");
+        p1_measured(&s);
+        let top = "────────────────────────── my-title ─";
+        p7_paint_titled_box(&s, top, "✳ my-title", true, "", false);
+        let obs = super::observe_prompt_block(&s, &["❯".to_string()]);
+        assert_eq!(obs.label, cys::readiness::ComposerLabel::Bound);
+        assert!(!obs.screen.contains("my-title"));
+        let block = obs.block.expect("composer block");
+        assert!(!block.as_empty_prompt.contains("my-title"));
+        assert!(cys::readiness::composer_edit_region_empty(&block.as_empty_prompt, "❯", None));
+        crate::state::p1_e0_stop_daemon(&_daemon);
+    }
+
+    #[test]
+    fn p7_with_block_emptied_keeps_rewrite() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_daemon, s) = marker_seat("p7-emptied-rewrite");
+        p1_measured(&s);
+        let top = "────────────────────────── my-title ─";
+        p7_paint_titled_box(&s, top, "✳ my-title", true, "machine body", false);
+        let obs = super::observe_prompt_block(&s, &["❯".to_string()]);
+        assert_eq!(obs.label, cys::readiness::ComposerLabel::Bound);
+        let emptied = obs.with_block_emptied().expect("with_block_emptied");
+        assert_eq!(emptied.label, cys::readiness::ComposerLabel::Bound);
+        assert!(!emptied.screen.contains("my-title"));
+        assert_eq!(super::composer_verdict(&emptied, None), super::ComposerVerdict::Empty);
+        crate::state::p1_e0_stop_daemon(&_daemon);
+    }
+
+    #[test]
+    fn p7_draft_gate_refuses_when_unbound() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p7-dg-unbound");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (daemon, s) = marker_seat("p7-dg-unbound");
+        p1_measured(&s);
+        p7_paint_titled_box(&s, "────────────────────────── my-title ─", "✳ other-title", false, "", false);
+        assert_eq!(super::draft_gate(&daemon, &s, DirectSendKind::Text), Some(DraftGateDenied::ScreenOccupied));
+        p7_paint_titled_box(&s, "────────────────────────── my-title ─", "✳ my-title", true, "", false);
+        assert_eq!(super::draft_gate(&daemon, &s, DirectSendKind::Text), None);
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p7_cycle_clear_probe_bound_and_unbound() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p7-ccp");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (_daemon, s) = marker_seat("p7-ccp");
+        p1_measured(&s);
+        let markers = Some(vec!["❯".to_string()]);
+        p7_paint_titled_box(&s, "────────────────────────── my-title ─", "✳ my-title", true, "", false);
+        let gen = s.input_gen.load(AtomicOrdering::Acquire);
+        let probe_bound = super::cycle_clear_probe(&s, markers.clone(), None, gen, super::CycleAdmitted::Idle);
+        assert!(!probe_bound(), "bound composer must allow cycle clear");
+
+        p7_paint_titled_box(&s, "────────────────────────── my-title ─", "✳ other-title", false, "", false);
+        let gen2 = s.input_gen.load(AtomicOrdering::Acquire);
+        let probe_unbound = super::cycle_clear_probe(&s, markers, None, gen2, super::CycleAdmitted::Idle);
+        assert!(probe_unbound(), "unbound composer must block cycle clear");
+        crate::state::p1_e0_stop_daemon(&_daemon);
+    }
+
+    #[test]
+    fn p7_title_read_in_the_same_observation() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_daemon, s) = marker_seat("p7-same-obs-title");
+        p1_measured(&s);
+        p7_paint_titled_box(&s, "────────────────────────── my-title ─", "✳ my-title", true, "", false);
+        assert_eq!(super::observe_prompt(&s, &["❯".to_string()]).label, cys::readiness::ComposerLabel::Bound);
+        // Updating the OSC 2 title in vt100 immediately flips the next observation to Unbound, and matching OSC 2 flips back to Bound.
+        s.parser
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .process(b"\x1b]2;\xe2\x9c\xb3 new-title\x07");
+        assert_eq!(super::observe_prompt(&s, &["❯".to_string()]).label, cys::readiness::ComposerLabel::Unbound);
+        s.parser
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .process(b"\x1b]2;\xe2\x9d\x90 my-title\x07");
+        assert_eq!(super::observe_prompt(&s, &["❯".to_string()]).label, cys::readiness::ComposerLabel::Bound);
+        crate::state::p1_e0_stop_daemon(&_daemon);
+    }
+
+    #[test]
+    fn p7_other_adapters_stay_none() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for agent in ["codex", "gemini", "grok"] {
+            let (daemon, s) = wp5_seat(&format!("p7-adapt-{agent}"), agent);
+            p1_measured(&s);
+            p7_paint_titled_box(&s, "────────────────────────── my-title ─", "✳ my-title", true, "", false);
+            let obs = super::observe_prompt(&s, &["❯".to_string()]);
+            assert_eq!(obs.label, cys::readiness::ComposerLabel::None, "{agent}");
+            assert!(obs.screen.contains("────────────────────────── my-title ─"), "{agent}");
+            let _ = s.child.lock().unwrap().kill();
+            crate::state::p1_e0_stop_daemon(&daemon);
+        }
+    }
+
+    #[test]
+    fn p7_direct_text_refused_unbound_line_none_cursor_on_unmarked_row() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p7-dt-unmarked");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (daemon, s) = marker_seat("p7-dt-unmarked");
+        p1_measured(&s);
+        paint_screen(
+            &s,
+            &["────────────────────────── my-title ─", "❯\u{a0}", RULE, STATUS1],
+            3,
+            2,
+            false,
+        );
+        p7_set_osc_title(&s, "✳ other-title");
+        let obs = super::observe_prompt(&s, &["❯".to_string()]);
+        assert!(obs.line.is_none() && obs.label == cys::readiness::ComposerLabel::Unbound);
+        assert_eq!(super::draft_gate(&daemon, &s, DirectSendKind::Text), Some(DraftGateDenied::ScreenOccupied));
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p7_direct_text_refused_unbound_cursor_before_marker() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p7-dt-before");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (daemon, s) = marker_seat("p7-dt-before");
+        p1_measured(&s);
+        paint_screen(
+            &s,
+            &["────────────────────────── my-title ─", "  ❯\u{a0}", RULE, STATUS1],
+            1,
+            0,
+            false,
+        );
+        p7_set_osc_title(&s, "✳ other-title");
+        let obs = super::observe_prompt(&s, &["❯".to_string()]);
+        assert!(obs.line.is_none() && obs.label == cys::readiness::ComposerLabel::Unbound);
+        assert_eq!(super::draft_gate(&daemon, &s, DirectSendKind::Text), Some(DraftGateDenied::ScreenOccupied));
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p7_direct_text_refused_unbound_cursor_off_screen() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p7-dt-off");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (daemon, s) = marker_seat("p7-dt-off");
+        p1_measured(&s);
+        paint_screen(
+            &s,
+            &["────────────────────────── my-title ─", "❯\u{a0}", RULE],
+            23,
+            79,
+            false,
+        );
+        p7_set_osc_title(&s, "✳ other-title");
+        let obs = super::observe_prompt(&s, &["❯".to_string()]);
+        assert!(obs.line.is_none() && obs.label == cys::readiness::ComposerLabel::Unbound);
+        assert_eq!(super::draft_gate(&daemon, &s, DirectSendKind::Text), Some(DraftGateDenied::ScreenOccupied));
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p7_direct_text_refused_unbound_empty_line() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p7-dt-empty");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (daemon, s) = marker_seat("p7-dt-empty");
+        p1_measured(&s);
+        p7_paint_titled_box(&s, "────────────────────────── my-title ─", "✳ other-title", false, "", false);
+        let obs = super::observe_prompt(&s, &["❯".to_string()]);
+        assert!(obs.line.is_some() && obs.label == cys::readiness::ComposerLabel::Unbound);
+        assert_eq!(super::draft_gate(&daemon, &s, DirectSendKind::Text), Some(DraftGateDenied::ScreenOccupied));
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p7_submit_key_refused_unbound_with_pending_bytes() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p7-sk-pending");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (daemon, s) = marker_seat("p7-sk-pending");
+        p1_measured(&s);
+        p7_paint_titled_box(&s, "────────────────────────── my-title ─", "✳ other-title", false, "", false);
+        for pending in [0, 5] {
+            s.set_pending_input(pending);
+            s.mark_pending_input_owner(super::InputOwner::Claimed(1));
+            assert_eq!(
+                super::draft_gate(&daemon, &s, DirectSendKind::SubmitKey),
+                Some(DraftGateDenied::ScreenOccupied),
+                "pending={pending}: SubmitKey without selector_row or approval_pending must be refused on Unbound"
+            );
+        }
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p7_clear_first_refused_unbound_with_proven_residue() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p7-cf-residue");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (daemon, s) = marker_seat("p7-cf-residue");
+        p1_measured(&s);
+        paint_screen(
+            &s,
+            &["────────────────────────── my-title ─", "❯ machine words", RULE, STATUS1],
+            1,
+            15,
+            false,
+        );
+        p7_set_osc_title(&s, "✳ other-title");
+        s.set_pending_input(13);
+        s.mark_pending_input_owner(super::InputOwner::Claimed(9));
+        // Both cycle-clear (`draft_gate_cycle_clear`) and ordinary `draft_gate(..., ClearFirst)` must refuse before `proven_residue`.
+        assert_eq!(super::draft_gate_cycle_clear(&daemon, &s), Some(DraftGateDenied::ScreenOccupied));
+        assert_eq!(super::draft_gate(&daemon, &s, DirectSendKind::ClearFirst), Some(DraftGateDenied::ScreenOccupied));
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p7_clear_first_refused_unbound_on_selector_and_approval() {
+        // ★(0.14.57 · P7-DIRECT · codex r3 clearfirst-control-flow.json) Ordinary non-cycle `cys send --clear-first`
+        //   (`DirectSendKind::ClearFirst` = Ctrl-U + body + CR) must be refused on `Unbound` even when `selector_row` or
+        //   `approval_pending` is true, with both zero counters and machine residue.
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p7-cf-sel-app");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (daemon, s) = marker_seat("p7-cf-sel-app");
+        p1_measured(&s);
+
+        // Case 1: ClearFirst × selector_row (both zero counters and machine residue)
+        paint_screen(
+            &s,
+            &["────────────────────────── my-title ─", "❯ 1. Yes", "  2. No"],
+            1,
+            8,
+            false,
+        );
+        p7_set_osc_title(&s, "✳ other-title");
+        for pending in [0, 6] {
+            s.set_pending_input(pending);
+            if pending > 0 {
+                s.mark_pending_input_owner(super::InputOwner::Claimed(1));
+            }
+            assert_eq!(
+                super::draft_gate(&daemon, &s, DirectSendKind::ClearFirst),
+                Some(DraftGateDenied::ScreenOccupied),
+                "ClearFirst × selector_row (pending={pending}) must be refused on Unbound"
+            );
+            assert_eq!(
+                super::draft_gate_cycle_clear(&daemon, &s),
+                Some(DraftGateDenied::ScreenOccupied),
+                "cycle ClearFirst × selector_row (pending={pending}) must be refused on Unbound"
+            );
+        }
+
+        // Case 2: ClearFirst × approval_pending (both zero counters and machine residue)
+        p7_paint_titled_box(&s, "────────────────────────── my-title ─", "✳ other-title", false, "", false);
+        daemon.push_feed_notification("approval", "승인 대기", "body", Some(s.id));
+        assert!(super::approval_or_gate_pending(&daemon, s.id));
+        for pending in [0, 6] {
+            s.set_pending_input(pending);
+            if pending > 0 {
+                s.mark_pending_input_owner(super::InputOwner::Claimed(2));
+            }
+            assert_eq!(
+                super::draft_gate(&daemon, &s, DirectSendKind::ClearFirst),
+                Some(DraftGateDenied::ScreenOccupied),
+                "ClearFirst × approval_pending (pending={pending}) must be refused on Unbound"
+            );
+            assert_eq!(
+                super::draft_gate_cycle_clear(&daemon, &s),
+                Some(DraftGateDenied::ScreenOccupied),
+                "cycle ClearFirst × approval_pending (pending={pending}) must be refused on Unbound"
+            );
+        }
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p7_machine_hold_probe_holds_unbound_with_selector_row() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p7-mh-sel");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (daemon, s) = marker_seat("p7-mh-sel");
+        p1_measured(&s);
+        paint_screen(
+            &s,
+            &["────────────────────────── my-title ─", "❯ 1. Yes", "  2. No"],
+            1,
+            8,
+            false,
+        );
+        p7_set_osc_title(&s, "✳ other-title");
+        let axes = super::MachineHoldAxes { draft: true, ..super::MachineHoldAxes::NONE };
+        assert_eq!(
+            super::machine_direct_hold_masked(&daemon, &s, axes, axes),
+            Some(super::MachineHold::Draft),
+            "selector_row must not suppress Unbound when the modal axis is off"
+        );
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p7_machine_hold_probe_holds_unbound_with_machine_residue() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p7-mh-res");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (daemon, s) = marker_seat("p7-mh-res");
+        p1_measured(&s);
+        paint_screen(
+            &s,
+            &["────────────────────────── my-title ─", "❯ machine words", RULE, STATUS1],
+            1,
+            15,
+            false,
+        );
+        p7_set_osc_title(&s, "✳ other-title");
+        s.set_pending_input(13);
+        s.mark_pending_input_owner(super::InputOwner::Claimed(5));
+        let axes = super::MachineHoldAxes { draft: true, ..super::MachineHoldAxes::NONE };
+        assert_eq!(
+            super::machine_direct_hold_masked(&daemon, &s, axes, axes),
+            Some(super::MachineHold::Draft),
+            "ClaimedResidue must not suppress Unbound in machine_hold_probe"
+        );
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p7_cycle_clear_probe_blocks_unbound_machine_residue_class() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p7-ccp-res");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (_daemon, s) = marker_seat("p7-ccp-res");
+        p1_measured(&s);
+        paint_screen(
+            &s,
+            &["────────────────────────── my-title ─", "❯ machine words", RULE, STATUS1],
+            1,
+            15,
+            false,
+        );
+        p7_set_osc_title(&s, "✳ other-title");
+        s.set_pending_input(13);
+        s.mark_pending_input_owner(super::InputOwner::Claimed(5));
+        let gen = s.input_gen.load(AtomicOrdering::Acquire);
+        let probe = super::cycle_clear_probe(
+            &s,
+            Some(vec!["❯".to_string()]),
+            None,
+            gen,
+            super::CycleAdmitted::MachineResidue,
+        );
+        assert!(probe(), "cycle_clear_probe must block MachineResidue class when Unbound");
+        crate::state::p1_e0_stop_daemon(&_daemon);
+    }
+
+    #[test]
+    fn p7_cycle_clear_probe_blocks_unbound_idle_class() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p7-ccp-idle");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (_daemon, s) = marker_seat("p7-ccp-idle");
+        p1_measured(&s);
+        p7_paint_titled_box(&s, "────────────────────────── my-title ─", "✳ other-title", false, "", false);
+        let gen = s.input_gen.load(AtomicOrdering::Acquire);
+        let probe = super::cycle_clear_probe(
+            &s,
+            Some(vec!["❯".to_string()]),
+            None,
+            gen,
+            super::CycleAdmitted::Idle,
+        );
+        assert!(probe(), "cycle_clear_probe must block Idle class when Unbound");
+        crate::state::p1_e0_stop_daemon(&_daemon);
+    }
+
+    #[test]
+    fn p7_missing_line_with_no_label_stays_unknown_and_admitted() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p7-missing-line-ctl");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (daemon, s) = marker_seat("p7-missing-line-ctl");
+        p1_measured(&s);
+        // Same frame as `p7_direct_text_refused_unbound_line_none_cursor_on_unmarked_row`, but with a plain rule:
+        // label is `None`, verdict is `Unknown`, and direct Text is admitted as in 0.14.56.
+        paint_screen(&s, &[RULE, "❯\u{a0}", RULE, STATUS1], 3, 2, false);
+        p7_set_osc_title(&s, "✳ other-title");
+        let obs = super::observe_prompt(&s, &["❯".to_string()]);
+        assert!(obs.line.is_none());
+        assert_eq!(obs.label, cys::readiness::ComposerLabel::None);
+        assert_eq!(super::composer_verdict(&obs, None), super::ComposerVerdict::Unknown);
+        assert_eq!(super::draft_gate(&daemon, &s, DirectSendKind::Text), None);
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p7_cancel_key_keeps_its_rule_on_unbound() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p7-cancel-unbound");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (daemon, s) = marker_seat("p7-cancel-unbound");
+        p1_measured(&s);
+        p7_paint_titled_box(&s, "────────────────────────── my-title ─", "✳ other-title", false, "", false);
+        assert_eq!(super::draft_gate(&daemon, &s, DirectSendKind::CancelKey), None, "CancelKey with 0 human bytes stays open on Unbound");
+        s.pending_input.lock().unwrap().human = 3;
+        assert_eq!(
+            super::draft_gate(&daemon, &s, DirectSendKind::CancelKey),
+            Some(DraftGateDenied::HumanBytesPending(3)),
+            "CancelKey with human bytes still refuses on Unbound"
+        );
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p7_return_on_selector_and_approval_stays_open_on_unbound() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p7-ret-sel-app");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (daemon, s) = marker_seat("p7-ret-sel-app");
+        p1_measured(&s);
+        // Selector row: SubmitKey stays open on Unbound when human_pending == 0.
+        paint_screen(
+            &s,
+            &["────────────────────────── my-title ─", "❯ 1. Yes", "  2. No"],
+            1,
+            8,
+            false,
+        );
+        p7_set_osc_title(&s, "✳ other-title");
+        assert_eq!(super::draft_gate(&daemon, &s, DirectSendKind::SubmitKey), None);
+
+        // Approval pending: SubmitKey stays open on Unbound when human_pending == 0.
+        p7_paint_titled_box(&s, "────────────────────────── my-title ─", "✳ other-title", false, "", false);
+        assert_eq!(super::draft_gate(&daemon, &s, DirectSendKind::SubmitKey), Some(DraftGateDenied::ScreenOccupied));
+        daemon.push_feed_notification("approval", "승인 대기", "body", Some(s.id));
+        assert_eq!(super::draft_gate(&daemon, &s, DirectSendKind::SubmitKey), None);
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p7_owner_keyboard_stays_open_on_unbound() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p7-owner-kb");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (daemon, s) = wp5_seat("p7-owner-kb", "claude");
+        p1_measured(&s);
+        daemon.roles.lock().unwrap().insert("master".into(), s.id);
+        p7_paint_titled_box(&s, "────────────────────────── my-title ─", "✳ other-title", false, "", false);
+        assert!(!super::d9_scope(&daemon, &s, true), "owner caller is out of D9 scope");
+        let req = cys::Request {
+            id: json!(1),
+            method: "surface.send_text".into(),
+            params: json!({
+                "surface_id": s.id,
+                "text": "/rename ─",
+                "quiet": true,
+                "human": true,
+                "operator_token": daemon.operator_token,
+                "owner_token": daemon.operator_token,
+            }),
+        };
+        let crate::handlers::Reply::Single(resp) = crate::handlers::dispatch(&daemon, req, None) else { panic!("single reply") };
+        assert_eq!(resp["ok"], json!(true), "owner keyboard must stay open on Unbound: {resp}");
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p7_governed_export_carries_label() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p7-exp-gov");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (daemon, s) = wp5_seat("p7-exp-gov", "claude");
+        p1_measured(&s);
+        let read = |label: &str| crate::state::test_until_no_pty_output(&s, label, || e0_read(&daemon, &s, true));
+
+        p1_paint_box(&s, "", false, false);
+        let r_none = read("none");
+        assert_eq!((r_none["composer"]["label"].clone(), r_none["composer"]["verdict"].clone()), (json!("none"), json!("empty")));
+
+        p7_paint_titled_box(&s, "────────────────────────── my-title ─", "✳ my-title", true, "", false);
+        let r_bound = read("bound");
+        assert_eq!((r_bound["composer"]["label"].clone(), r_bound["composer"]["verdict"].clone()), (json!("bound"), json!("empty")));
+        assert!(!r_bound["text"].as_str().unwrap().contains("my-title"), "bound export carries rewritten text");
+
+        p7_paint_titled_box(&s, "────────────────────────── my-title ─", "✳ other-title", false, "", false);
+        let r_unbound = read("unbound");
+        assert_eq!((r_unbound["composer"]["label"].clone(), r_unbound["composer"]["verdict"].clone()), (json!("unbound"), json!("draft")));
+        assert!(r_unbound["text"].as_str().unwrap().contains("my-title"), "unbound export keeps raw text");
+
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p7_d1_off_export_bytes_pinned() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p7-exp-d1-off");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (daemon, s) = wp5_seat("p7-exp-d1-off", "claude");
+        s.d1_platform.store(false, AtomicOrdering::Relaxed);
+        p7_paint_titled_box(&s, "────────────────────────── my-title ─", "✳ my-title", true, "", false);
+        let r = crate::state::test_until_no_pty_output(&s, "d1 off export", || e0_read(&daemon, &s, true));
+        assert!(r["composer"].get("label").is_none(), "D1-off export must omit the label key: {r}");
+        let mut keys: Vec<&str> = r["composer"].as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "after_cursor_dim",
+                "after_cursor_present",
+                "before_cursor_empty",
+                "governed",
+                "human_bytes",
+                "input_gen",
+                "modal",
+                "output_gen",
+                "owner",
+                "owner_kind",
+                "pending_bytes",
+                "verdict",
+            ],
+            "D1-off composer keys must be byte-for-byte 0.14.56"
+        );
+        assert!(r["text"].as_str().unwrap().contains("────────────────────────── my-title ─"));
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+    // ===== end of the P7 behavioural block =====
+
     /// 화면이 비어 보여도 데몬이 센 미제출 바이트가 있으면 배달하지 않는다(1차 축 우선).
     #[test]
     fn b1_gate_pending_bytes_block_even_on_blank_prompt() {
@@ -23317,6 +24461,7 @@ mod tests {
             alt_screen: true,
             block: None,
             after_cursor_dim: None,
+            label: cys::readiness::ComposerLabel::None,
         };
         for knob in ["1", "3", "30"] {
             let _knob = QueueEnvGuard::set(&[("CYS_QUEUE_QUIET_SECS", knob)]);
@@ -23683,6 +24828,7 @@ mod tests {
             alt_screen: alt,
             block: None,
             after_cursor_dim: None,
+            label: cys::readiness::ComposerLabel::None,
         };
         let b = |w: &'static str| PromptGate::Blocked(w);
         let cases: Vec<(&str, PromptGate, super::PromptObs, bool, crate::repaint::ScreenObs)> = vec![
@@ -30520,6 +31666,7 @@ after-tick liveness alone does not attribute a clock defect",
             alt_screen: false,
             block: None,
             after_cursor_dim: None,
+            label: cys::readiness::ComposerLabel::None,
         };
         assert_eq!(input_line_visibility(&base(), None), (Some(false), Some(false)));
         let mut o = base();
@@ -30579,6 +31726,7 @@ after-tick liveness alone does not attribute a clock defect",
             alt_screen: false,
             block: None,
             after_cursor_dim: None,
+            label: cys::readiness::ComposerLabel::None,
         }
     }
 
