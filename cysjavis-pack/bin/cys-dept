@@ -1960,7 +1960,7 @@ _CYS_ROTATE_SELF=0
 #   여전히 exported 인 채로 남아 자식 cysd·좌석에까지 전달된다(정본 §3-4 '상속되는 노브 금지' ·
 #   `_CYS_ROTATE_SELF` 를 env 가 아니라 argv 표식으로 갈아탄 P6 R1 과 같은 이유).
 #   unset 뒤의 대입은 **비상속 셸 변수**다 — 자식에게 넘겨야 하는 값은 스폰 지점에서 명시 전달한다
-#   (`CYS_SOCKET=… CYS_PACK_DIR=… CYS_ACCOUNT_DIR=… env -u … "$CYSD"` — 이 목록에 없다 = 안 넘긴다).
+#   (`CYS_SOCKET=… CYS_PACK_DIR=… CYS_PROJECT_ROOT=… CYS_ACCOUNT_DIR=… env -u … "$CYSD"` — 이 목록에 없다 = 안 넘긴다).
 unset _CYS_ROTATE_ACCT
 # ★0.14.42 R8: 토큰 관문(team_token_gate)의 결과는 **이 셸의 비상속 변수**로만 create 갈래에 넘긴다.
 #   진입 시 전부 지운다(J6 과 같은 이유 — 외부에서 export 한 같은 이름이 '데몬 통과'로 읽히지 않게 ·
@@ -2244,7 +2244,7 @@ launch_dept(){   # $1=name
     validate_dept_name "$name" "launch <name>"
     reject_slug_collision "$name"
     sock="$(dept_sock "$name")"; pack="$(dept_pack "$name")"
-    mkdir -p "$(dept_logdir "$name")" "$pack/directives"
+    mkdir -p "$(dept_logdir "$name")" "$pack/directives" "$pack/_round"
     seed_acl "$pack"
     # ★J4: rotate 재귀에서는 등재 갱신 실패가 재기동을 막지 못한다(등재는 kill 이전에 이미 확인됐고
     #   이 호출은 socket/pack_dir 의 **갱신**이다 — 손상 원본에는 아무것도 쓰이지 않는다).
@@ -2333,10 +2333,10 @@ launch_dept(){   # $1=name
         #   3기가 전부 그 값을 물고 있었고, 그것이 이 도구의 단일소유 게이트를 그 부서에서 영구히
         #   껐다. 재기동 한 번으로 이미 샌 값이 회수된다.
         #   `VAR=.. env -u ..`: 접두 대입은 env 의 환경이 되어 자식(cysd)에 그대로 전달된다(Git Bash coreutils env ✓).
-        CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_ACCOUNT_DIR="$acctdir" \
-          env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
+        CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_PROJECT_ROOT="$pack" CYS_ACCOUNT_DIR="$acctdir" \
+          env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE -u JAVIS_SOCKET -u AITERM_SOCKET nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
       else
-        CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
+        CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_PROJECT_ROOT="$pack" env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE -u JAVIS_SOCKET -u AITERM_SOCKET nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
       fi
       disown
       dept_ready_knob_warn   # ★0.14.43 R2F-PK(S4 m4): 비어 있지 않은 무효 노브 경고 1줄(미설정·유효 값은 무음) — 스폰 뒤 대기 직전
@@ -2578,7 +2578,7 @@ PY
     #   create 는 카탈로그 **원값**을 등재하지만 allocate 의 원값 소스는 CYS_DEPT_CWD 뿐이라 **확정 물리 경로**를 등재한다
     #   (`.` 같은 상대값을 그대로 두면 재기동 호출자의 cwd 에 좌우된다 · codex R4). 실패는 fail-open + WARN 1줄.
     reg_set_field "$name" cwd "$dept_cwd" || echo "[cys-dept] WARN: $name cwd 등재 실패($dept_cwd) — 이후 launch/rotate 가 홈으로 복원될 수 있다" >&2
-    mkdir -p "$(dept_logdir "$name")" "$pack/directives"
+    mkdir -p "$(dept_logdir "$name")" "$pack/directives" "$pack/_round"
     # ★U16: 팀 소개(참고 정보) — 빈 셸·편성보다 먼저 기록해 첫 SessionStart 가 반드시 본다.
     #   기록 실패 = 오너가 본 내용이 팀에 닿지 않는다 → fail-closed(스폰 전 · 위 trap 이 예약 회수 · exit 6=시드).
     #   인자 없는 allocate 는 번호 재사용 때 옛 팀 소개가 새 팀에 주입되지 않게 .stale-<ts> 로 치운다
@@ -2602,9 +2602,9 @@ PY
       # ★계정 격리: 데몬을 CYS_ACCOUNT_DIR(fork dir)와 함께 spawn (create와 동형).
       if _cys_detach_ok; then
         # ★fatal-fix X-R4-1: 대화 승인 토큰 경로 — 호출자(대표의 Bash 도구) 프로세스 그룹 밖 새 세션에서 띄운다(pid 불변 exec).
-        CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_ACCOUNT_DIR="$acctdir" env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE nohup python3 -c "$_CYS_SETSID_PY" "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
+        CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_PROJECT_ROOT="$pack" CYS_ACCOUNT_DIR="$acctdir" env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE -u JAVIS_SOCKET -u AITERM_SOCKET nohup python3 -c "$_CYS_SETSID_PY" "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
       else
-      CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_ACCOUNT_DIR="$acctdir" env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
+      CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_PROJECT_ROOT="$pack" CYS_ACCOUNT_DIR="$acctdir" env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE -u JAVIS_SOCKET -u AITERM_SOCKET nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
       fi
       _dept_spawn_pid=$!
       dept_stage wait   # ★0.14.43 GP: 스폰 뒤 소켓 대기 시작 직전(재사용 분기엔 없다)
@@ -2907,7 +2907,7 @@ PY
     _creation_cleanup=keep
     if [ "$verb" = "NEW" ]; then _creation_cleanup=reserve; fi
     trap 'dept_creation_failed "$?" "$name" "$_creation_cleanup"' EXIT   # NEW만 예약회수, REUSE 등재 보존
-    mkdir -p "$(dept_logdir "$name")" "$pack/directives"
+    mkdir -p "$(dept_logdir "$name")" "$pack/directives" "$pack/_round"
     seed_acl "$pack"
     _spawned=1   # ★⑦: 신규 스폰 여부(0=재사용·REUSE_DEAD 재기동 포함) — 티켓 발급 로그 문면 구분용
     dept_stage probe   # ★0.14.43 GP: 사전 검사(이미 켜진 데몬이 있나 · 12초 고정) 직전
@@ -2916,7 +2916,7 @@ PY
       dept_stage spawn   # ★0.14.43 GP: 새 cysd 를 띄우기 직전(재사용 분기엔 없다)
       reg_restamp "$name" create "$mkey"   # ★0.14.43 R2F-PK(S4 m3): NEW·REUSE_DEAD 공통 — 스폰 직전에 예약 시각을 한 번 다시 찍는다(최선 노력 · 등재가 아직 있고 내 mission_key 일 때만)
       # ★계정 격리: 데몬을 CYS_ACCOUNT_DIR 와 함께 spawn(patch2 있으면 자식 전파·없으면 F1 시드가 보장)
-      CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_ACCOUNT_DIR="$acctdir" env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
+      CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_PROJECT_ROOT="$pack" CYS_ACCOUNT_DIR="$acctdir" env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE -u JAVIS_SOCKET -u AITERM_SOCKET nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
       _dept_spawn_pid=$!
       dept_stage wait   # ★0.14.43 GP: 스폰 뒤 소켓 대기 시작 직전(재사용 분기엔 없다)
       dept_ready_knob_warn   # ★0.14.43 R2F-PK(S4 m4): 비어 있지 않은 무효 노브 경고 1줄(미설정·유효 값은 무음)
@@ -3313,6 +3313,14 @@ EOF
     _pt_cur="${CYS_SOCKET:-${JAVIS_SOCKET:-${AITERM_SOCKET:-}}}"
     if [ "$_pt_cur" != "$_pt_sock" ]; then
       unset CYS_SURFACE_ID JAVIS_SURFACE_ID AITERM_SURFACE_ID CYS_SURFACE_REF
+    fi
+    # 해석기는 <root>/_round 가 있을 때만 CYS_PROJECT_ROOT 를 받는다 — 없으면 본부 원장으로 샌다. 팩이 있을 때만 만든다(유령 팩 금지).
+    #   팩이 없으면 루트를 내세우지 않는다: 복구 명령은 그대로 돌고, 호출자의 다른 레인 루트도 넘기지 않는다.
+    if [ -d "$(dept_pack "$name")" ]; then
+      mkdir -p "$(dept_pack "$name")/_round"
+      export CYS_PROJECT_ROOT="$(dept_pack "$name")"
+    else
+      unset CYS_PROJECT_ROOT
     fi
     export CYS_SOCKET="$_pt_sock" CYS_PACK_DIR="$(dept_pack "$name")"
     # ★G3 축1: 부서 컨텍스트 실행에 계정 dir 동반 주입(유도 3순위 resolve_lane_acctdir 재사용) —

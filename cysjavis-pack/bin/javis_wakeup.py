@@ -95,9 +95,11 @@ def paused_paths():
     """kill-switch 파일 2경로(§9-4 2중 기록 규약과 동일 판정식).
 
     set 은 둘 다 기록하고, 확인은 **어느 하나라도 존재하면 정지**다(fail-closed).
+    ⒝ 는 ROOT 가 아니라 ~/_round 다 — wakeup_env 가 PROJECT 를 JAVIS_ROOT 로 넘기므로 ROOT 로 지으면 레인별로 좁아진다.
+    같은 식을 짓는 곳은 tests/test_paused_constructors.py 가 술어로 도출해 대조한다.
     """
     return [os.path.join(pack_dir(), PAUSED_BASENAME),
-            os.path.join(ROOT, "_round", PAUSED_BASENAME)]
+            os.path.join(os.path.expanduser("~"), "_round", PAUSED_BASENAME)]
 
 
 def paused_evidence():

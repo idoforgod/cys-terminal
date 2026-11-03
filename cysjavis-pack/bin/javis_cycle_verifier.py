@@ -126,9 +126,50 @@ def _resolve_project_root():
     return home
 
 
+def lane_socket():
+    """이 프로세스의 소켓 — 제품과 같은 순서(src/lib.rs env_compat: CYS → JAVIS → AITERM). 레인 정체의 단일 출처다.
+    순서가 갈리면 데몬은 부서를 잡는데 여기는 낡은 별칭의 본부를 잡아, 두 부서가 한 커서를 나눠 쓴다."""
+    for key in ("CYS_SOCKET", "JAVIS_SOCKET", "AITERM_SOCKET"):
+        sock = os.environ.get(key, "").strip()
+        if sock:
+            return sock
+    return ""
+
+
+def state_socket_dir():
+    """cys 소켓 부모 디렉터리 = 데몬 상태 디렉터리(feed.jsonl 이 사는 곳)."""
+    sock = lane_socket()
+    if sock:
+        return os.path.dirname(os.path.abspath(sock))
+    return os.path.join(os.path.expanduser("~"), ".local", "state", "cys")
+
+
+def base_state_parent():
+    """본부 레인의 키. 경로 표기를 고정해 둔다 — 본부 STATE_DIR 은 바이트 그대로다."""
+    return os.path.join(os.path.expanduser("~"), ".local", "state", "cys")
+
+
+def lane_state_parent():
+    """레인 키 = 소켓 부모(state_socket_dir) — 새 레인 식별자를 만들지 않는다. STATE_DIR 의 부모.
+
+    기본 레인은 소켓 env 가 없든 기본 소켓이든 ~/.local/state/cys 로 경로가 그대로다.
+    부서 레인은 ~/.local/state/cys-dept-<부서>(cys-dept dept_sock 규약).
+    Windows named pipe 는 파일시스템 부모가 없어(dirname = \\\\.\\pipe) 파이프 이름이 그 자리를 맡는다 —
+    cys-dept 가 같은 이름(cys-dept-<부서>)을 쓰므로 레인 키도 같다. 파이프 이름은 대소문자를 가리지 않으므로
+    여기서 한 번 소문자로 고정한다: 상태 경로와 스윕 가드가 같은 키를 본다.
+    """
+    pipe = re.match(r"^[\\/]{2}[^\\/]+[\\/]pipe[\\/]([^\\/]+)$", lane_socket(), re.IGNORECASE)
+    if pipe:
+        return os.path.join(os.path.expanduser("~"), ".local", "state", pipe.group(1).lower())
+    # 심링크로 부른 소켓은 같은 소켓이다 — 소켓 파일째 해석한 뒤 부모를 취한다(파일만 링크일 수 있다).
+    sock = lane_socket()
+    real = os.path.dirname(os.path.realpath(sock)) if sock else os.path.realpath(state_socket_dir())
+    return base_state_parent() if real == os.path.realpath(base_state_parent()) else real
+
+
 PROJECT = _resolve_project_root()
 CYCLE_LOG = os.path.join(PROJECT, "_round", "cycle_autopilot_log.jsonl")
-STATE_DIR = os.path.join(os.path.expanduser("~"), ".local", "state", "cys", "cycle_autopilot")
+STATE_DIR = os.path.join(lane_state_parent(), "cycle_autopilot")   # 레인별 — sweep.json·state.json·heartbeat 를 레인끼리 나누지 않는다
 STATE_JSON = os.path.join(STATE_DIR, "state.json")
 HEARTBEAT = os.path.join(STATE_DIR, "verifier.heartbeat")
 BASELINE_DIR = os.path.join(STATE_DIR, "baselines")   # [v2.1] 사이클별 baseline 원장
@@ -182,18 +223,14 @@ def pack_dir():
 
 
 def paused_paths():
-    """kill-switch 파일 경로 2중(절대경로 핀). 하나라도 존재하면 무집행."""
+    """kill-switch 파일 경로 2중(절대경로 핀). 하나라도 존재하면 무집행.
+
+    ⒜ <팩>/AUTOPILOT_PAUSED = 그 레인만 · ⒝ ~/_round/AUTOPILOT_PAUSED = 전 레인(모두 같은 $HOME).
+    ⒝ 를 PROJECT 에서 유도하지 않는다: PROJECT 가 레인별이 되는 순간 전 레인 정지가 소리 없이 사라진다.
+    같은 식을 짓는 곳은 tests/test_paused_constructors.py 가 술어로 도출해 대조한다(팩이 찢겨도 돌도록 import 없이 동형 유지).
+    """
     return [os.path.join(pack_dir(), PAUSED_BASENAME),
-            os.path.join(PROJECT, "_round", PAUSED_BASENAME)]
-
-
-def state_socket_dir():
-    """cys 소켓 부모 디렉터리 = 데몬 상태 디렉터리(feed.jsonl 이 사는 곳)."""
-    sock = (os.environ.get("AITERM_SOCKET", "").strip()
-            or os.environ.get("CYS_SOCKET", "").strip())
-    if sock:
-        return os.path.dirname(os.path.abspath(sock))
-    return os.path.join(os.path.expanduser("~"), ".local", "state", "cys")
+            os.path.join(os.path.expanduser("~"), "_round", PAUSED_BASENAME)]
 
 
 def nonce_for(cycle_id):
@@ -460,8 +497,7 @@ def state_socket_dir():
     매핑 단일 소스 = javis_state_snapshot._win_state_dir_for_socket 재사용(복제 금지)."""
     if os.name != "nt":
         return _state_socket_dir_contract()
-    sock = (os.environ.get("AITERM_SOCKET", "").strip()
-            or os.environ.get("CYS_SOCKET", "").strip())  # 키 순서 = 블록 원형 그대로(변경 금지)
+    sock = lane_socket()  # 키 순서의 단일 출처는 블록이다
     snap = _snapshot_mod()
     if snap is not None:
         return snap._win_state_dir_for_socket(sock or "\\\\.\\pipe\\cys")

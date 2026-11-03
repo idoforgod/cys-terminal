@@ -30,6 +30,7 @@ exit: 0=정상 / 1=오류 / 2=게이트 미통과(정상 skip) / 4=kill-switch /
 """
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -38,6 +39,9 @@ import subprocess
 import sys
 import threading
 import time
+
+# SEAL-1: prevent sibling cache writes even when the caller supplies no seal.
+sys.dont_write_bytecode = True
 
 # ★Windows 즉사 차단(P0): top-level `import fcntl` 은 Windows 에 그 모듈이 없어
 #   ModuleNotFoundError 로 이 스크립트 **전체**를 불능화한다 — javis_org.py:9-22 가 같은
@@ -122,9 +126,50 @@ def _resolve_project_root():
     return home
 
 
+def lane_socket():
+    """이 프로세스의 소켓 — 제품과 같은 순서(src/lib.rs env_compat: CYS → JAVIS → AITERM). 레인 정체의 단일 출처다.
+    순서가 갈리면 데몬은 부서를 잡는데 여기는 낡은 별칭의 본부를 잡아, 두 부서가 한 커서를 나눠 쓴다."""
+    for key in ("CYS_SOCKET", "JAVIS_SOCKET", "AITERM_SOCKET"):
+        sock = os.environ.get(key, "").strip()
+        if sock:
+            return sock
+    return ""
+
+
+def state_socket_dir():
+    """cys 소켓 부모 디렉터리 = 데몬 상태 디렉터리(feed.jsonl 이 사는 곳)."""
+    sock = lane_socket()
+    if sock:
+        return os.path.dirname(os.path.abspath(sock))
+    return os.path.join(os.path.expanduser("~"), ".local", "state", "cys")
+
+
+def base_state_parent():
+    """본부 레인의 키. 경로 표기를 고정해 둔다 — 본부 STATE_DIR 은 바이트 그대로다."""
+    return os.path.join(os.path.expanduser("~"), ".local", "state", "cys")
+
+
+def lane_state_parent():
+    """레인 키 = 소켓 부모(state_socket_dir) — 새 레인 식별자를 만들지 않는다. STATE_DIR 의 부모.
+
+    기본 레인은 소켓 env 가 없든 기본 소켓이든 ~/.local/state/cys 로 경로가 그대로다.
+    부서 레인은 ~/.local/state/cys-dept-<부서>(cys-dept dept_sock 규약).
+    Windows named pipe 는 파일시스템 부모가 없어(dirname = \\\\.\\pipe) 파이프 이름이 그 자리를 맡는다 —
+    cys-dept 가 같은 이름(cys-dept-<부서>)을 쓰므로 레인 키도 같다. 파이프 이름은 대소문자를 가리지 않으므로
+    여기서 한 번 소문자로 고정한다: 상태 경로와 스윕 가드가 같은 키를 본다.
+    """
+    pipe = re.match(r"^[\\/]{2}[^\\/]+[\\/]pipe[\\/]([^\\/]+)$", lane_socket(), re.IGNORECASE)
+    if pipe:
+        return os.path.join(os.path.expanduser("~"), ".local", "state", pipe.group(1).lower())
+    # 심링크로 부른 소켓은 같은 소켓이다 — 소켓 파일째 해석한 뒤 부모를 취한다(파일만 링크일 수 있다).
+    sock = lane_socket()
+    real = os.path.dirname(os.path.realpath(sock)) if sock else os.path.realpath(state_socket_dir())
+    return base_state_parent() if real == os.path.realpath(base_state_parent()) else real
+
+
 PROJECT = _resolve_project_root()
 CYCLE_LOG = os.path.join(PROJECT, "_round", "cycle_autopilot_log.jsonl")
-STATE_DIR = os.path.join(os.path.expanduser("~"), ".local", "state", "cys", "cycle_autopilot")
+STATE_DIR = os.path.join(lane_state_parent(), "cycle_autopilot")   # 레인별 — sweep.json·state.json·heartbeat 를 레인끼리 나누지 않는다
 STATE_JSON = os.path.join(STATE_DIR, "state.json")
 HEARTBEAT = os.path.join(STATE_DIR, "verifier.heartbeat")
 BASELINE_DIR = os.path.join(STATE_DIR, "baselines")   # [v2.1] 사이클별 baseline 원장
@@ -178,18 +223,14 @@ def pack_dir():
 
 
 def paused_paths():
-    """kill-switch 파일 경로 2중(절대경로 핀). 하나라도 존재하면 무집행."""
+    """kill-switch 파일 경로 2중(절대경로 핀). 하나라도 존재하면 무집행.
+
+    ⒜ <팩>/AUTOPILOT_PAUSED = 그 레인만 · ⒝ ~/_round/AUTOPILOT_PAUSED = 전 레인(모두 같은 $HOME).
+    ⒝ 를 PROJECT 에서 유도하지 않는다: PROJECT 가 레인별이 되는 순간 전 레인 정지가 소리 없이 사라진다.
+    같은 식을 짓는 곳은 tests/test_paused_constructors.py 가 술어로 도출해 대조한다(팩이 찢겨도 돌도록 import 없이 동형 유지).
+    """
     return [os.path.join(pack_dir(), PAUSED_BASENAME),
-            os.path.join(PROJECT, "_round", PAUSED_BASENAME)]
-
-
-def state_socket_dir():
-    """cys 소켓 부모 디렉터리 = 데몬 상태 디렉터리(feed.jsonl 이 사는 곳)."""
-    sock = (os.environ.get("AITERM_SOCKET", "").strip()
-            or os.environ.get("CYS_SOCKET", "").strip())
-    if sock:
-        return os.path.dirname(os.path.abspath(sock))
-    return os.path.join(os.path.expanduser("~"), ".local", "state", "cys")
+            os.path.join(os.path.expanduser("~"), "_round", PAUSED_BASENAME)]
 
 
 def nonce_for(cycle_id):
@@ -570,6 +611,8 @@ BOOTSTRAP_BACKOFF_MAX = 3          # 창 내 시도 상한 — 도달 시 자동
 LEASE_TTL = 900.0                 # lease 갱신 없음 + pid 사망 = 인계 대상
 OBSERVE_WINDOW = 180.0            # audit 오탐 oracle 의 사후 관측 창
 SWEEP_STATE = os.path.join(STATE_DIR, "sweep.json")   # [v2.1 ⑤] 틱 스윕 커서
+SWEEP_SUPPRESSED = os.path.join(STATE_DIR, "sweep_suppressed.json")   # 가드가 막은 스윕의 사유·누계
+DEPT_LANE_PREFIX = "cys-dept-"    # 부서 레인 키 접두(cys-dept dept_sock 규약)
 SWEEP_MAX_EMIT = 20               # 1틱당 보충 기록 상한(폭주 차단)
 
 PRENOTICE_TEXT = ("[CYCLE-PRE] 사이클 예정. **[CYCLE] 지시가 도착하면 그때** "
@@ -1554,8 +1597,70 @@ def sweep_plan(prev, cur, max_emit=SWEEP_MAX_EMIT):
     return emits[:max_emit], False, truncated
 
 
+def lane_own_root():
+    """이 레인 자신의 프로젝트 루트 — 레인 정체(소켓 부모)에서만 유도한다. 부서 레인이 아니면 None.
+
+    ⛔PROJECT 로 '자기 루트' 를 정의하지 않는다: export 전 부서 레인의 PROJECT 는 본부 루트라, 그렇게 짜면
+    본부를 스윕하면서 검사를 통과한다. PROJECT 는 이 값과 대조만 당한다.
+    부서 = ~/.cys/pack-dept-<부서>(cys-dept dept_pack · schedule.rs `lp` 와 같은 규칙).
+    """
+    key = os.path.basename(lane_state_parent())
+    if not key.startswith(DEPT_LANE_PREFIX):
+        return None
+    return os.path.join(os.path.expanduser("~"), ".cys", "pack-dept-" + key[len(DEPT_LANE_PREFIX):])
+
+
+def sweep_suppressed_reason():
+    """이 틱의 스윕을 막을 사유, 없으면 None. 레인 커서로 남의 루트를 훑으면 실사건 1건이 레인 수만큼 원장에
+    찍힌다 — 팩 코드는 데몬 재기동보다 먼저 도착하고 그 창은 끝이 없다. 기본 레인은 언제나 스윕한다.
+    본부도 부서도 아닌 소켓은 정체를 모르는 것이지 권한이 없는 것이 아니다 — 그래도 스윕하지 않는다."""
+    if lane_state_parent() == base_state_parent():
+        return None
+    own = lane_own_root()
+    if own is None:
+        return "unknown-lane"
+    if os.path.normcase(os.path.realpath(PROJECT)) == os.path.normcase(os.path.realpath(own)):
+        return None
+    return "project-not-lane-root"
+
+
+def _sweep_suppressed(why):
+    """막힌 스윕의 결과 — 사유 없는 0 은 거짓 부재다. 누계는 레인 STATE_DIR 에 남겨 status 로 읽는다.
+    커서(SWEEP_STATE)는 건드리지 않는다: export 뒤 첫 스윕이 seed 가 되어 과거 항목을 쏟지 않게 한다."""
+    prev = read_json_file(SWEEP_SUPPRESSED) or {}
+    now_ts = time.time()
+    rec = {"reason": why, "count": int(prev.get("count") or 0) + 1, "project": PROJECT,
+           "own_root": lane_own_root(), "first_at": prev.get("first_at") or now_ts, "last_at": now_ts}
+    try:
+        _ensure_state_dir()
+        # Resolve the shipped helper beside this file, including isolated Python
+        # imports that omit the script directory from sys.path. Keep it lazy so
+        # an unavailable sidecar affects only this best-effort diagnostic write.
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "_cycle_atomic_write", os.path.join(os.path.dirname(__file__), "javis_lock.py"))
+            if spec is None or spec.loader is None:
+                raise ImportError("atomic writer has no loader")
+            atomic = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(atomic)
+            writer = getattr(atomic, "atomic_write_text", None)
+            if not callable(writer):
+                raise ImportError("atomic writer is unavailable")
+        except Exception as exc:
+            raise OSError("suppression diagnostic writer unavailable") from exc
+        # The record contains project paths; keep its replacement private even
+        # when the caller uses a permissive umask. Serialization is unchanged.
+        writer(SWEEP_SUPPRESSED, json.dumps(rec, ensure_ascii=False, sort_keys=True), mode=0o600)
+    except OSError:
+        pass
+    return {"seeded": False, "emitted": 0, "failed": 0, "truncated": 0, "suppressed": rec}
+
+
 def sweep_ledger():
     """틱 스윕 집행 — 관측 → 계획 → STATE_LEDGER append → 커서 저장. best-effort."""
+    why = sweep_suppressed_reason()
+    if why:
+        return _sweep_suppressed(why)
     handoff_dir = os.path.join(PROJECT, "_round", "handoffs")
     tasks_dir = os.path.join(PROJECT, "_round", "tasks")
     cur = sweep_scan(handoff_dir, tasks_dir)
@@ -2154,6 +2259,7 @@ def cmd_status(args):
            "heartbeat_age": (None if mtime_of(HEARTBEAT) is None
                              else round(now_ts - mtime_of(HEARTBEAT), 1)),
            "ledger": {"records": len(records), "bad_lines": bad, "path": CYCLE_LOG},
+           "sweep_suppressed": read_json_file(SWEEP_SUPPRESSED),
            "gates": {}}
     for role in roles():
         ctx = collect_ctx(role, now_ts, status or {}, killed, kreason, records, bad,

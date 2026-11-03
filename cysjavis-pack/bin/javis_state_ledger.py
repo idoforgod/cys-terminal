@@ -346,6 +346,16 @@ def _marker_path(session):
     return os.path.join(state_dir(), "staleness-%s.marker" % key)
 
 
+def _session_state_for(ledger):
+    """원장 옆 SESSION_STATE.md. 원장의 루트가 이 레인의 팩이면 그 팩의 round/ — 부서 상태의 정본이다.
+    판단은 실제 경로의 일치로 한다. 이름으로 판단하면 pack-dept-x 라는 평범한 프로젝트가 부서가 되고, 심링크로 부른 팩은 부서가 아니게 된다."""
+    root = os.path.dirname(os.path.dirname(ledger))
+    pack = os.environ.get("CYS_PACK_DIR", "").strip()
+    if pack and os.path.realpath(root) == os.path.realpath(pack):
+        return os.path.join(root, "round", "SESSION_STATE.md")
+    return os.path.join(os.path.dirname(ledger), "SESSION_STATE.md")
+
+
 def staleness_check(path=None, session=None, session_state=None, now=None):
     """마지막 major 이벤트 ts vs SESSION_STATE.md mtime 비교 → 이벤트가 더 새로우면 기록만.
 
@@ -354,7 +364,7 @@ def staleness_check(path=None, session=None, session_state=None, now=None):
     (Stop 훅은 턴마다 발화 → 마커 없으면 같은 사실이 무한 누적된다).
     """
     lp = ledger_path(path)
-    ss = session_state or os.path.join(os.path.dirname(lp), "SESSION_STATE.md")
+    ss = session_state or _session_state_for(lp)
     recs = read_tail(lp, 400)
     major = None
     for rec in reversed(recs):
