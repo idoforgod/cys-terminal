@@ -53034,6 +53034,422 @@ mod b360_tests {
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
+
+    // ── ★(0.14.57 · P9c) cycle-agent rc 85 refusal names its deciding signal ([draft_signal=…]) ──
+
+    fn p9c_wait_idle_with_rpc(list_entry: Value, read_reply: Value) -> Result<CycleTargetFence, String> {
+        let mut prev = NATIVE_CAP_RPC.with(|slot| slot.borrow_mut().take());
+        NATIVE_CAP_RPC.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |method, _params| match method {
+                "surface.list" => Ok(json!({"surfaces": [list_entry.clone()]})),
+                "surface.read_text" => Ok(read_reply.clone()),
+                other => Err(format!("unexpected RPC in p9c test: {other}")),
+            }));
+        });
+        let res = wait_cycle_target_idle(
+            7,
+            &["❯".to_string()],
+            None,
+            &[],
+            std::time::Instant::now() + std::time::Duration::from_secs(3),
+            "clear 직전",
+            true,
+        );
+        NATIVE_CAP_RPC.with(|slot| *slot.borrow_mut() = prev.take());
+        res
+    }
+
+    fn p9c_user_joined_screen() -> String {
+        let rule = "─".repeat(60);
+        let cycle_echo_tail = "[CYCLE] 컨텍스트 순환 절차 개시. ① 아래는 저장 검증이 감시하는 파일 경로 목록이다 — 하나라도 갱신(mtime+내용 해";
+        assert_eq!(cycle_echo_tail.chars().count(), 72);
+        [
+            "● Saved. Ready for clear.".to_string(),
+            String::new(),
+            format!("❯ {cycle_echo_tail}"),
+            String::new(),
+            "● Done.".to_string(),
+            String::new(),
+            format!("{rule}❯\u{00a0}"),
+            rule,
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)".to_string(),
+        ]
+        .join("\n")
+    }
+
+    /// T-c1: the user's reported frame (DESIGN-P9-r3.md §1) -> `wait_cycle_target_idle` returns `Err(msg)` with
+    /// `cycle_agent_exit == 85` and `msg` ends with `[draft_signal=text_row:6_from_bottom tail=72ch own_cycle_text=yes]`.
+    #[test]
+    fn p9c_tc1_user_joined_frame_names_text_row_6_from_bottom_and_own_cycle_text_yes() {
+        let list_entry = json!({
+            "surface_id": 7,
+            "surface_ref": "surface:7",
+            "pending_input_bytes": 0,
+            "pending_input_human_bytes": 0
+        });
+        let read_reply = json!({
+            "text": p9c_user_joined_screen(),
+            "quiet_secs": 45.0,
+            "composer": {
+                "verdict": "unknown",
+                "governed": false,
+                "modal": false,
+                "owner": "none",
+                "output_gen": 2,
+                "input_gen": 1,
+                "pending_bytes": 0,
+                "human_bytes": 0
+            }
+        });
+        let res = p9c_wait_idle_with_rpc(list_entry, read_reply).map(|_| ());
+        assert_eq!(cycle_agent_exit(&res), EXIT_CYCLE_HUMAN_DRAFT);
+        let msg = res.expect_err("T-c1 must hold with HumanDraft");
+        assert!(msg.starts_with(CYCLE_HUMAN_DRAFT_TOKEN), "{msg}");
+        assert!(
+            msg.ends_with(" [draft_signal=text_row:6_from_bottom tail=72ch own_cycle_text=yes]"),
+            "T-c1 expected text_row:6_from_bottom tail=72ch own_cycle_text=yes, got: {msg}"
+        );
+    }
+
+    /// T-c2: `composer.human_bytes = 3` -> `msg` ends with `[draft_signal=human_bytes:3]` (and entry fallback when
+    /// composer `human_bytes` is 0).
+    #[test]
+    fn p9c_tc2_composer_human_bytes_names_human_bytes_3() {
+        let list_entry = json!({
+            "surface_id": 7,
+            "surface_ref": "surface:7",
+            "pending_input_bytes": 3,
+            "pending_input_human_bytes": 0
+        });
+        let read_reply = json!({
+            "text": cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT,
+            "quiet_secs": 5.0,
+            "composer": {
+                "verdict": "empty",
+                "governed": true,
+                "modal": false,
+                "owner": "human",
+                "output_gen": 2,
+                "input_gen": 1,
+                "pending_bytes": 3,
+                "human_bytes": 3
+            }
+        });
+        let res = p9c_wait_idle_with_rpc(list_entry, read_reply).map(|_| ());
+        assert_eq!(cycle_agent_exit(&res), EXIT_CYCLE_HUMAN_DRAFT);
+        let msg = res.expect_err("T-c2 must hold with HumanDraft");
+        assert!(
+            msg.ends_with(" [draft_signal=human_bytes:3]"),
+            "T-c2 expected [draft_signal=human_bytes:3], got: {msg}"
+        );
+
+        let entry_fallback = p9c_wait_idle_with_rpc(
+            json!({
+                "surface_id": 7,
+                "surface_ref": "surface:7",
+                "pending_input_bytes": 4,
+                "pending_input_human_bytes": 4
+            }),
+            json!({
+                "text": cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT,
+                "quiet_secs": 5.0,
+                "composer": {
+                    "verdict": "empty",
+                    "governed": true,
+                    "modal": false,
+                    "owner": "none",
+                    "output_gen": 2,
+                    "input_gen": 1,
+                    "pending_bytes": 0,
+                    "human_bytes": 0
+                }
+            }),
+        )
+        .map(|_| ());
+        let fallback_msg = entry_fallback.expect_err("entry human_bytes > 0 must hold with HumanDraft");
+        assert!(
+            fallback_msg.ends_with(" [draft_signal=human_bytes:4]"),
+            "T-c2 fallback expected [draft_signal=human_bytes:4], got: {fallback_msg}"
+        );
+    }
+
+    /// T-c3: `pending_input_bytes = 5`, `pending_input_human_bytes` absent -> `msg` ends with
+    /// `[draft_signal=pending_unattributed:5]`.
+    #[test]
+    fn p9c_tc3_entry_pending_without_human_axis_names_pending_unattributed_5() {
+        let list_entry = json!({
+            "surface_id": 7,
+            "surface_ref": "surface:7",
+            "pending_input_bytes": 5
+        });
+        let read_reply = json!({
+            "text": cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT,
+            "quiet_secs": 5.0
+        });
+        let res = p9c_wait_idle_with_rpc(list_entry, read_reply).map(|_| ());
+        assert_eq!(cycle_agent_exit(&res), EXIT_CYCLE_HUMAN_DRAFT);
+        let msg = res.expect_err("T-c3 must hold with HumanDraft");
+        assert!(
+            msg.ends_with(" [draft_signal=pending_unattributed:5]"),
+            "T-c3 expected [draft_signal=pending_unattributed:5], got: {msg}"
+        );
+    }
+
+    /// T-c4: `composer.governed = true`, `composer.verdict = "draft"`, `human_bytes = 0`, `pending_bytes = 0` -> `msg`
+    /// ends with `[draft_signal=composer_verdict:draft]`.
+    #[test]
+    fn p9c_tc4_governed_draft_verdict_names_composer_verdict_draft() {
+        let list_entry = json!({
+            "surface_id": 7,
+            "surface_ref": "surface:7",
+            "pending_input_bytes": 0,
+            "pending_input_human_bytes": 0
+        });
+        let read_reply = json!({
+            "text": cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT,
+            "quiet_secs": 5.0,
+            "composer": {
+                "verdict": "draft",
+                "governed": true,
+                "modal": false,
+                "owner": "none",
+                "output_gen": 2,
+                "input_gen": 1,
+                "pending_bytes": 0,
+                "human_bytes": 0
+            }
+        });
+        let res = p9c_wait_idle_with_rpc(list_entry, read_reply).map(|_| ());
+        assert_eq!(cycle_agent_exit(&res), EXIT_CYCLE_HUMAN_DRAFT);
+        let msg = res.expect_err("T-c4 must hold with HumanDraft");
+        assert!(
+            msg.ends_with(" [draft_signal=composer_verdict:draft]"),
+            "T-c4 expected [draft_signal=composer_verdict:draft], got: {msg}"
+        );
+    }
+
+    /// T-c5: `surface.send_text` with `clear_first: true` returns `typing_guard_active` -> `run_cycle_agent` returns
+    /// `85` and stderr contains `[draft_signal=daemon_guard]`.
+    #[test]
+    fn p9c_tc5_typing_guard_on_atomic_clear_names_daemon_guard() {
+        const CHILD_ENV: &str = "CYS_P9C_TC5_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            use std::io::Write;
+            let dir = std::env::temp_dir().join(format!("p9c-tc5-child-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            for sub in ["pack/directives", "pack/round", "config", "local", "_round"] {
+                std::fs::create_dir_all(dir.join(sub)).expect("create child fixture dir");
+            }
+            std::fs::write(dir.join("pack/agents.json"), r#"{"claude":{"clear_cmd":"/clear"}}"#).unwrap();
+            std::fs::write(dir.join("pack/directives/WORKER_DIRECTIVE.md"), "W").unwrap();
+            std::fs::write(dir.join("pack/directives/RSI_LEARNING_DIRECTIVE.md"), "R").unwrap();
+            std::env::set_var("CYS_PACK_DIR", dir.join("pack"));
+            std::env::set_var("CYS_CONFIG_DIR", dir.join("config"));
+            std::env::set_var("CYS_LOCAL_DIR", dir.join("local"));
+            let cwd = dir.to_string_lossy().into_owned();
+            NATIVE_CAP_RPC.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move |method, params| match method {
+                    "surface.cycle_claim" => Ok(json!({"claim": "claimed"})),
+                    "surface.list" => Ok(json!({"surfaces": [{
+                        "surface_id": 7,
+                        "surface_ref": "surface:7",
+                        "role": "worker",
+                        "agent": "claude",
+                        "exited": false,
+                        "awakened_at": 1.0,
+                        "cwd": cwd,
+                        "live_cwd": cwd,
+                        "pending_input_bytes": 0,
+                        "pending_input_human_bytes": 0,
+                        "usage": {"source": "statusline", "session_file": "S1"}
+                    }]})),
+                    "surface.read_text" => Ok(json!({
+                        "text": cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT,
+                        "quiet_secs": 5.0,
+                        "composer": {
+                            "verdict": "empty",
+                            "governed": true,
+                            "modal": false,
+                            "owner": "none",
+                            "owner_kind": "unattributed",
+                            "output_gen": 2,
+                            "input_gen": 1,
+                            "pending_bytes": 0,
+                            "human_bytes": 0
+                        }
+                    })),
+                    "surface.send_text" if params["clear_first"] == true => {
+                        Err(format!("{}: {}", cys::ERR_TYPING_GUARD, cys::MSG_TYPING_GUARD))
+                    }
+                    _ => Ok(json!({})),
+                }));
+            });
+            let rc = run_cycle_agent(None, Some("7".into()), None, vec![], None, None, 3, true, None);
+            let _ = std::io::stdout().flush();
+            let _ = std::io::stderr().flush();
+            let _ = std::fs::remove_dir_all(&dir);
+            std::process::exit(rc);
+        }
+
+        let _guard = super::tests::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "b360_tests::p9c_tc5_typing_guard_on_atomic_clear_names_daemon_guard",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_ENV, "1")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("spawn T-c5 child");
+        let rc = out.status.code().unwrap_or(-1);
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        let line = stderr
+            .lines()
+            .filter(|l| l.starts_with("error: "))
+            .last()
+            .unwrap_or_default();
+        assert_eq!(rc, EXIT_CYCLE_HUMAN_DRAFT, "T-c5 exit code: {stderr}");
+        assert!(
+            line.starts_with(&format!("error: {CYCLE_HUMAN_DRAFT_TOKEN}")),
+            "T-c5 prefix: {line}"
+        );
+        assert!(
+            line.ends_with(" [draft_signal=daemon_guard]"),
+            "T-c5 expected [draft_signal=daemon_guard], got: {line}"
+        );
+    }
+
+    /// T-c6: a screen whose deciding marker row has tail `"CANARY_SECRET_DRAFT_42"` -> `msg` does NOT contain
+    /// `"CANARY_SECRET_DRAFT_42"` and ends with `[draft_signal=text_row:2_from_bottom tail=22ch own_cycle_text=no]`.
+    #[test]
+    fn p9c_tc6_canary_tail_never_leaks_screen_text_into_message() {
+        let rule = "─".repeat(60);
+        let canary = "CANARY_SECRET_DRAFT_42";
+        assert_eq!(canary.chars().count(), 22);
+        let screen = [
+            "● Ready.".to_string(),
+            rule.clone(),
+            format!("❯ {canary}"),
+            rule,
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)".to_string(),
+        ]
+        .join("\n");
+        let list_entry = json!({
+            "surface_id": 7,
+            "surface_ref": "surface:7",
+            "pending_input_bytes": 0,
+            "pending_input_human_bytes": 0
+        });
+        let read_reply = json!({
+            "text": screen,
+            "quiet_secs": 10.0,
+            "composer": {
+                "verdict": "unknown",
+                "governed": false,
+                "modal": false,
+                "owner": "none",
+                "output_gen": 2,
+                "input_gen": 1,
+                "pending_bytes": 0,
+                "human_bytes": 0
+            }
+        });
+        let res = p9c_wait_idle_with_rpc(list_entry, read_reply).map(|_| ());
+        assert_eq!(cycle_agent_exit(&res), EXIT_CYCLE_HUMAN_DRAFT);
+        let msg = res.expect_err("T-c6 must hold with HumanDraft");
+        assert!(
+            !msg.contains(canary),
+            "T-c6 screen text leaked into rc 85 error message: {msg}"
+        );
+        assert!(
+            msg.ends_with(" [draft_signal=text_row:2_from_bottom tail=22ch own_cycle_text=no]"),
+            "T-c6 expected [draft_signal=text_row:2_from_bottom tail=22ch own_cycle_text=no], got: {msg}"
+        );
+    }
+
+    /// T-c7: guard — `msg.starts_with(CYCLE_HUMAN_DRAFT_TOKEN)` holds for all five variants; `cycle_agent_exit(&Err(msg))`
+    /// is `85`; `javis_cycle_autopilot.py`'s `held_classify(85, msg)` returns the same classification with and without
+    /// the trailing token. GREEN on old and new bytes.
+    #[test]
+    fn p9c_tc7_guard_prefix_exit_code_and_autopilot_invariants() {
+        // 1. Live wait_cycle_target_idle HumanDraft paths preserve prefix and exit code 85 on both old and new bytes.
+        let live_cases = [
+            (
+                json!({"surface_id": 7, "surface_ref": "surface:7", "pending_input_bytes": 0, "pending_input_human_bytes": 0}),
+                json!({"text": p9c_user_joined_screen(), "quiet_secs": 45.0, "composer": {"verdict": "unknown", "governed": false, "modal": false, "output_gen": 2, "input_gen": 1, "pending_bytes": 0, "human_bytes": 0}}),
+            ),
+            (
+                json!({"surface_id": 7, "surface_ref": "surface:7", "pending_input_bytes": 3, "pending_input_human_bytes": 0}),
+                json!({"text": cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT, "quiet_secs": 5.0, "composer": {"verdict": "empty", "governed": true, "modal": false, "output_gen": 2, "input_gen": 1, "pending_bytes": 3, "human_bytes": 3}}),
+            ),
+            (
+                json!({"surface_id": 7, "surface_ref": "surface:7", "pending_input_bytes": 5}),
+                json!({"text": cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT, "quiet_secs": 5.0}),
+            ),
+            (
+                json!({"surface_id": 7, "surface_ref": "surface:7", "pending_input_bytes": 0, "pending_input_human_bytes": 0}),
+                json!({"text": cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT, "quiet_secs": 5.0, "composer": {"verdict": "draft", "governed": true, "modal": false, "output_gen": 2, "input_gen": 1, "pending_bytes": 0, "human_bytes": 0}}),
+            ),
+        ];
+        for (list_entry, read_reply) in live_cases {
+            let res = p9c_wait_idle_with_rpc(list_entry, read_reply).map(|_| ());
+            assert_eq!(cycle_agent_exit(&res), EXIT_CYCLE_HUMAN_DRAFT);
+            let msg = res.expect_err("must hold with HumanDraft");
+            assert!(msg.starts_with(CYCLE_HUMAN_DRAFT_TOKEN), "{msg}");
+        }
+
+        // 2. All five trailing token shapes preserve starts_with(CYCLE_HUMAN_DRAFT_TOKEN), cycle_agent_exit == 85,
+        //    and javis_cycle_autopilot.py held_classify(85, msg) parity with and without the trailing token.
+        let autopilot = include_str!("../../cysjavis-pack/bin/javis_cycle_autopilot.py");
+        let markers_literal = autopilot
+            .lines()
+            .find_map(|line| line.strip_prefix("KEYS_SENT_MARKERS = ("))
+            .and_then(|literal| literal.strip_suffix(')'))
+            .expect("KEYS_SENT_MARKERS tuple in javis_cycle_autopilot.py");
+        let keys_sent_markers: Vec<&str> = markers_literal.split('"').skip(1).step_by(2).collect();
+        assert!(
+            autopilot.contains(r#"elif rc == 85:"#)
+                && autopilot.contains(r#"alive_evidence = "rc85: 사람 초안·입력 감지""#),
+            "autopilot held_classify rc == 85 branch contract"
+        );
+        let held_classify_85 = |tail: &str| -> (&'static str, bool, bool) {
+            let alive_evidence = "rc85: 사람 초안·입력 감지";
+            let structural = false;
+            let keys_sent = keys_sent_markers.iter().any(|m| tail.contains(m));
+            (alive_evidence, structural, keys_sent)
+        };
+
+        let base_wait = format!(
+            "{CYCLE_HUMAN_DRAFT_TOKEN} clear 직전: surface:7 입력줄에 사람 초안(또는 미제출 입력)이 있다 — 입력을 보류한다(초안 소거 금지). 처방: 초안을 제출·삭제한 뒤 해당 단계만 재시도"
+        );
+        let base_guard = format!(
+            "{CYCLE_HUMAN_DRAFT_TOKEN} clear 원자 송신 거부(송신 0건 · composer 무변경): {}: {}",
+            cys::ERR_TYPING_GUARD,
+            cys::MSG_TYPING_GUARD
+        );
+        let variants = [
+            (&base_wait, "[draft_signal=human_bytes:3]"),
+            (&base_wait, "[draft_signal=pending_unattributed:5]"),
+            (&base_wait, "[draft_signal=composer_verdict:draft]"),
+            (&base_wait, "[draft_signal=text_row:6_from_bottom tail=72ch own_cycle_text=yes]"),
+            (&base_guard, "[draft_signal=daemon_guard]"),
+        ];
+        for (base, token) in variants {
+            let with_token = format!("{base} {token}");
+            assert!(base.starts_with(CYCLE_HUMAN_DRAFT_TOKEN));
+            assert!(with_token.starts_with(CYCLE_HUMAN_DRAFT_TOKEN));
+            assert_eq!(cycle_agent_exit(&Err(base.clone())), EXIT_CYCLE_HUMAN_DRAFT);
+            assert_eq!(cycle_agent_exit(&Err(with_token.clone())), EXIT_CYCLE_HUMAN_DRAFT);
+            assert!(!token.contains("[diag="), "draft_signal token must never collide with [diag=...]: {token}");
+            assert_eq!(
+                held_classify_85(base),
+                held_classify_85(&with_token),
+                "held_classify(85, msg) must be identical with and without {token}"
+            );
+        }
+    }
 }
 
 /// ★P3-IMPL r1 후속 — **호출부 수준** 검체(codex r1 M1 · gemini-3 r1 major 2-b).
