@@ -6401,6 +6401,9 @@ fn resubmit_withheld_one(
         return drop_it("unobservable");
     }
     let obs = observe_prompt_block(s, &markers);
+    if obs.label == cys::readiness::ComposerLabel::Unbound {
+        return "wait_label";
+    }
     let v = submit_cr_verdict(scope, &obs, Some(body.norm.as_str()));
     let dialog_open = v.hits || approval_or_gate_pending(daemon, s.id);
     // ★(R3C-1) 창 대기 상한은 창이 **열려 있는** 시간만 잰다 — 닫힌 것을 보면 0(다음 창은 새 창).
@@ -23095,6 +23098,54 @@ mod tests {
             "D1-off composer keys must be byte-for-byte 0.14.56"
         );
         assert!(r["text"].as_str().unwrap().contains("────────────────────────── my-title ─"));
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    #[test]
+    fn p7_withheld_resubmit_waits_under_unbound_label() {
+        p10_withheld_resubmit_waits_under_unbound_label();
+    }
+
+    #[test]
+    fn p10_withheld_resubmit_waits_under_unbound_label() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p7-t6-withheld");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (daemon, s) = wp5_seat("p7-t6-withheld", "claude");
+        p1_measured(&s);
+        let now = std::time::Instant::now();
+        s.inject_track.note_body("M|x|AAA", None);
+        let body_at = s.inject_track.last_body().unwrap().at;
+        s.inject_track
+            .note_withheld(crate::state::WithheldSubmit::new(now, body_at, None));
+        let lines = [
+            "❯ earlier turn",
+            "  ack 1",
+            "─────────────────────────────────── my-title ─",
+            "❯ M|x|AAA",
+            RULE,
+            STATUS1,
+            STATUS2,
+        ];
+        paint_screen(&s, &lines, 3, 9, false);
+        p7_set_osc_title(&s, "✳ other-title");
+        let r_unbound = super::resubmit_withheld_one(&daemon, &s, now + std::time::Duration::from_secs(5));
+        assert_eq!(r_unbound, "wait_label", "Unbound inline composer must not resubmit withheld CR");
+        assert!(s.inject_track.withheld().is_some(), "withheld record must stay queued while waiting on Unbound");
+        let resub_events: Vec<_> = daemon
+            .bus
+            .tail(100)
+            .into_iter()
+            .filter(|e| e["name"] == "queue.submit_resubmitted")
+            .collect();
+        assert!(resub_events.is_empty(), "must publish 0 submit_resubmitted events under Unbound: {resub_events:?}");
+
+        // Once the OSC title binds to the border label, the next tick resubmits the withheld CR once.
+        p7_set_osc_title(&s, "✳ my-title");
+        let r_bound = super::resubmit_withheld_one(&daemon, &s, now + std::time::Duration::from_secs(10));
+        assert_eq!(r_bound, "resubmitted", "Bound inline composer must resubmit withheld CR");
+        assert!(s.inject_track.withheld().is_none(), "withheld record consumed after resubmit");
         let _ = s.child.lock().unwrap().kill();
         crate::state::p1_e0_stop_daemon(&daemon);
     }
