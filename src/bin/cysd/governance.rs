@@ -34769,9 +34769,9 @@ after-tick liveness alone does not attribute a clock defect",
         p10_paint_inline_box(&s, "❯ direct cli text");
         p10_assert_positive_premise(&daemon, &s);
 
-        // Direct CLI `send_text` records `note_body` with `Some(owner)` and no `QueueSubmitMark`.
+        // Direct CLI `send_text` records `note_body` with `Some(owner)` (`cli_body == true`).
+        // Even with the prior `QueueSubmitMark` still present, `maybe_arm_swallowed_residue` declines with `"cli_body"`.
         s.set_pending_input(0);
-        s.inject_track.set_queue_submit_mark(None);
         s.inject_track.note_body_at(
             "direct cli text",
             Some(super::InputOwner::Verified(99)),
@@ -35059,12 +35059,15 @@ after-tick liveness alone does not attribute a clock defect",
     fn p10r2_cursor_key_in_gap_withholds() {
         let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _sc = P10TestScopeGuard::claude();
+        // 1) Cursor moved left into the body during the gap (`before_cursor == "M|x"`):
+        //    `residue_final_probe` checks `p10_block_matches_full_body` first and declines with `"representation"`.
         let (daemon, s) = wp5_seat("p10r2-cur-gap", "claude");
         p1_measured(&s);
         let now = p10_seed_mark(&s, "M|x|GAP", 5, Some("q-r2-4"));
         p10_paint_inline_box(&s, "❯ M|x|GAP");
         p10_arm(&daemon, &s);
         assert!(s.inject_track.withheld().is_some());
+        let wrote_before = s.inject_track.wrote();
         let s_hook = Arc::clone(&s);
         *super::P10_GAP_HOOK.lock().unwrap() = Some(Box::new(move || {
             let lines = ["❯ earlier turn", "  ack 1", RULE, "❯ M|x|GAP", RULE, STATUS1, STATUS2];
@@ -35081,12 +35084,56 @@ after-tick liveness alone does not attribute a clock defect",
         }
         let settle = s.inject_track.submit_settle_obs(crate::state::settle_mono_ms(), 60_000);
         assert_eq!(settle.since_written_ms, None, "cursor move in gap must withhold CR");
+        assert_eq!(s.inject_track.wrote(), wrote_before, "no PTY write on cursor-left in gap");
         assert_eq!(
             s.inject_track.residue_stage_for_current_body(),
-            Some(crate::state::ResidueStage::Declined("below"))
+            Some(crate::state::ResidueStage::Declined("representation"))
         );
         let _ = s.child.lock().unwrap().kill();
         crate::state::p1_e0_stop_daemon(&daemon);
+
+        // 2) Separate `"below"` guard witness in `residue_final_probe`: full `before_cursor` body (`"M|x|GAP"`, cursor at col 9)
+        //    is preserved so `p10_block_matches_full_body` passes, while an extra draft line below the cursor inside the box
+        //    causes `p10_after_and_below_empty` to refuse with `"below"`.
+        let (daemon_b, s_b) = wp5_seat("p10r2-cur-gap-below", "claude");
+        p1_measured(&s_b);
+        let now_b = p10_seed_mark(&s_b, "M|x|GAP", 5, Some("q-r2-4-below"));
+        p10_paint_inline_box(&s_b, "❯ M|x|GAP");
+        p10_arm(&daemon_b, &s_b);
+        assert!(s_b.inject_track.withheld().is_some());
+        let wrote_b_before = s_b.inject_track.wrote();
+        let s_b_hook = Arc::clone(&s_b);
+        *super::P10_GAP_HOOK.lock().unwrap() = Some(Box::new(move || {
+            let lines = [
+                "❯ earlier turn",
+                "  ack 1",
+                RULE,
+                "❯ M|x|GAP",
+                "  extra below",
+                RULE,
+                STATUS1,
+                STATUS2,
+            ];
+            paint_screen(&s_b_hook, &lines, 3, 9, false);
+        }));
+        assert_eq!(
+            super::resubmit_withheld_one(&daemon_b, &s_b, now_b + std::time::Duration::from_secs(5)),
+            "resubmitted"
+        );
+        let deadline_b = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while s_b.write_tx.gate().pending() != 0 {
+            assert!(std::time::Instant::now() < deadline_b, "writer did not drain");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let settle_b = s_b.inject_track.submit_settle_obs(crate::state::settle_mono_ms(), 60_000);
+        assert_eq!(settle_b.since_written_ms, None, "extra text below cursor in gap must withhold CR");
+        assert_eq!(s_b.inject_track.wrote(), wrote_b_before, "no PTY write when below-cursor check fails in gap");
+        assert_eq!(
+            s_b.inject_track.residue_stage_for_current_body(),
+            Some(crate::state::ResidueStage::Declined("below"))
+        );
+        let _ = s_b.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon_b);
     }
 
     #[test]
@@ -35386,26 +35433,80 @@ after-tick liveness alone does not attribute a clock defect",
         let _ = s_pos.child.lock().unwrap().kill();
         crate::state::p1_e0_stop_daemon(&daemon_pos);
 
-        // 2) Negative case (M8): a foreign write (`DataAfter`) queued ahead of the job finishes during the hand-off -> settlement
-        //    window, advancing `resume_write_epoch` by +2 (`!= stamp.handoff_write_epoch + 1`). `settle_queue_write` must clear
-        //    `queue_submit_mark` to `None`.
+        // 2) Negative case (M8, R2-I2): a foreign writer request held on a bounded writer-entry/release barrier (`entered_rx` /
+        //    `release_tx`) guarantees that `deliver_head_locked` captures `stamp.handoff_write_epoch == epoch_at_handoff` BEFORE
+        //    the foreign write completes. Releasing the barrier completes the foreign write (+1) and then the queue `AgentJob` (+1),
+        //    so at `settle_queue_write` time `input_gen`, `last_human_input`, `agent_epoch`, and `conversation_epoch` are all
+        //    unchanged while `resume_write_epoch == epoch_at_handoff + 2 != stamp.handoff_write_epoch + 1`.
         let (daemon, s) = p1_seat("p10r2-foreign");
         let _ = p10_seed_mark(&s, "M|x|PRIOR", 5, Some("q-prior"));
         assert!(s.inject_track.queue_submit_mark().is_some());
         s.clear_pending_input();
         p10_paint_inline_box(&s, "❯ ");
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+        let release_rx_w = Arc::clone(&release_rx);
         s.write_tx
-            .try_send(crate::state::WriteReq::DataAfter {
+            .try_send(crate::state::WriteReq::SubmitAfterGap {
                 bytes: Vec::new(),
-                delay_ms: 250,
+                min_gap_ms: 0,
+                withhold: Some(Arc::new(move || {
+                    let _ = entered_tx.try_send(());
+                    let _ = release_rx_w
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(std::time::Duration::from_secs(5));
+                    false
+                })),
+                done: None,
             })
-            .expect("enqueue foreign DataAfter write");
+            .expect("enqueue foreign writer request with entry/release barrier");
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("writer entered foreign request barrier before handoff");
+        let epoch_at_handoff = s.inject_track.resume_write_epoch();
+        let human_at_handoff = *s.last_human_input.lock().unwrap();
+        let agent_epoch_at_handoff = s.agent_epoch.load(AtomicOrdering::Acquire);
+        let conv_epoch_at_handoff = s.conversation_epoch.load(AtomicOrdering::Acquire);
         tick(&daemon);
+        let gen_at_handoff = s.input_gen.load(AtomicOrdering::Acquire);
+        assert_eq!(
+            s.inject_track.resume_write_epoch(),
+            epoch_at_handoff,
+            "barrier holds foreign write so HandoffStamp captures handoff_write_epoch == epoch_at_handoff"
+        );
+        release_tx.send(()).expect("release foreign writer barrier after handoff");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while s.write_tx.gate().pending() != 0 || !s.pending_queue.lock().unwrap().is_empty() {
             assert!(std::time::Instant::now() < deadline, "foreign + queue job did not drain");
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+        assert_eq!(
+            s.input_gen.load(AtomicOrdering::Acquire),
+            gen_at_handoff,
+            "input_gen must remain unchanged between handoff and settlement"
+        );
+        assert_eq!(
+            *s.last_human_input.lock().unwrap(),
+            human_at_handoff,
+            "last_human_input must remain unchanged between handoff and settlement"
+        );
+        assert_eq!(
+            s.agent_epoch.load(AtomicOrdering::Acquire),
+            agent_epoch_at_handoff,
+            "agent_epoch must remain unchanged between handoff and settlement"
+        );
+        assert_eq!(
+            s.conversation_epoch.load(AtomicOrdering::Acquire),
+            conv_epoch_at_handoff,
+            "conversation_epoch must remain unchanged between handoff and settlement"
+        );
+        assert_eq!(
+            s.inject_track.resume_write_epoch(),
+            epoch_at_handoff + 2,
+            "foreign write (+1) + queue AgentJob (+1) must advance resume_write_epoch by exactly +2"
+        );
         assert!(
             s.inject_track.queue_submit_mark().is_none(),
             "foreign write during queue job must prevent/clear QueueSubmitMark in settle_queue_write"
@@ -35997,33 +36098,55 @@ after-tick liveness alone does not attribute a clock defect",
     #[test]
     fn p10r3_track_invariants_hold_on_every_path() {
         let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (_daemon, s) = wp5_seat("p10r3-inv", "claude");
+        let _sc = P10TestScopeGuard::claude();
+        let (daemon, s) = wp5_seat("p10r3-inv", "claude");
+        p1_measured(&s);
         let now = p10_seed_mark(&s, "M|x|INV", 5, Some("q-r3-13"));
+        p10_paint_inline_box(&s, "❯ M|x|INV");
         let body_at = s.inject_track.last_body().unwrap().at;
 
-        // 1) Fast completion through `run_writer_loop_tracked`: setting `Handed` before `try_send` transitions
-        //    `Armed -> Handed -> Writing -> Written` cleanly.
-        s.inject_track
-            .try_commit_swallowed_arm("q-r3-13".into(), body_at, now, None)
-            .unwrap();
-        assert!(s.inject_track.residue_set_handed("q-r3-13", body_at, now));
-        let (tx, rx) = crate::writer_gate::WriterSender::channel(4);
-        tx.try_send(crate::state::WriteReq::SubmitAfterGap {
-            bytes: b"\r".to_vec(),
-            min_gap_ms: 0,
-            withhold: None,
-            done: Some(crate::state::SubmitDone::new(&s.inject_track, "q-r3-13".into(), body_at)),
-        })
-        .unwrap();
-        drop(tx);
-        let mut sink = Vec::new();
-        crate::state::run_writer_loop_tracked(
-            &mut sink,
-            rx,
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            Some(Arc::clone(&s.inject_track)),
+        // 1) Production hand-off through `resubmit_withheld_one -> resubmit_swallowed_one`:
+        //    - Invariant 1 (`Armed <=> withheld().is_some()`): verified right after `p10_arm`.
+        //    - Invariant 2 (`Handed` set before `try_send` while `SubmitDone` is in flight): verified on the writer thread
+        //      inside `P10_GAP_HOOK` before `done.mark_writing()` / `done.complete_written()` run.
+        //    - Invariant 3 (`Written` after writer completion): verified after the writer drains.
+        p10_arm(&daemon, &s);
+        assert!(s.inject_track.withheld().is_some());
+        assert_eq!(
+            s.inject_track.residue_stage_for_current_body(),
+            Some(crate::state::ResidueStage::Armed)
         );
-        assert_eq!(sink, b"\r");
+        let observed_at_probe = Arc::new(std::sync::Mutex::new(None));
+        let obs_clone = Arc::clone(&observed_at_probe);
+        let s_hook = Arc::clone(&s);
+        *super::P10_GAP_HOOK.lock().unwrap() = Some(Box::new(move || {
+            *obs_clone.lock().unwrap() = Some((
+                s_hook.inject_track.withheld().is_none(),
+                s_hook.inject_track.residue_stage_for_current_body(),
+            ));
+        }));
+        assert_eq!(
+            super::resubmit_withheld_one(&daemon, &s, now + std::time::Duration::from_secs(5)),
+            "resubmitted"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while s.write_tx.gate().pending() != 0 {
+            assert!(std::time::Instant::now() < deadline, "writer did not drain");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let (withheld_taken_at_probe, stage_at_probe) = observed_at_probe
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("P10_GAP_HOOK executed on writer thread");
+        assert!(
+            withheld_taken_at_probe,
+            "withheld slot must already be empty when the writer thread executes SubmitAfterGap"
+        );
+        assert!(
+            matches!(stage_at_probe, Some(crate::state::ResidueStage::Handed { .. })),
+            "resubmit_swallowed_one must set ResidueStage::Handed before try_send hands SubmitAfterGap to the writer"
+        );
         assert!(matches!(
             s.inject_track.residue_stage_for_current_body(),
             Some(crate::state::ResidueStage::Written { .. })
@@ -36060,7 +36183,7 @@ after-tick liveness alone does not attribute a clock defect",
             "stale SubmitDone from an earlier (request_id, body_at) must not mutate the current body's track"
         );
         let _ = s.child.lock().unwrap().kill();
-        crate::state::p1_e0_stop_daemon(&_daemon);
+        crate::state::p1_e0_stop_daemon(&daemon);
     }
 
     #[test]
