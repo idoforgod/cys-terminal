@@ -789,6 +789,139 @@ class T2Cases(Base):
         self.assertIn(cid, r.stdout)
 
 
+class U3Guards(Base):
+    """Guard cells added after the U3 mutation round 1 (F58/impl/u3/MUTANTS.md): each pins one rule of
+    final §2.3/§2.4 or U3-SPEC that no T-2 cell held on its own."""
+
+    def test_attempt_on_a_declined_lever_is_4_and_writes_nothing(self):
+        rig = self.rig(entries=[entry("wid", SF, [lever("L1"), lever("L2", risky=True)])])
+        cid = self.triaged(rig, "wid broken")
+        self.rc(rig.run("consent", "--case", cid, "--lever", "L2", "--no"), RC_OK)
+        self.state(rig, cid, "triaged")
+        r = self.attempt(rig, cid, "L2", want=RC_REDIRECT)
+        self.assertIn("declined", r.stdout)
+        self.assertEqual(rig.attempts(cid), [])
+
+    def test_not_applicable_lever_is_skipped_by_the_report_and_by_exhaustion(self):
+        rig = self.rig(entries=[entry("wid", SF, [lever("L1", applicable=False), lever("L2")])])
+        cid = self.triaged(rig, "wid broken")
+        r = self.rc(rig.run("report", "--case", cid), RC_REDIRECT)
+        self.assertIn("next lever first: L2", r.stdout)
+        self.assertNotIn("next lever first: L1", r.stdout)
+        self.attempt(rig, cid, "L1", want=RC_REDIRECT)
+        self.attempt(rig, cid, "L2")
+        self.state(rig, cid, "exhausted")
+
+    def test_recheck_unknown_after_fixed_regresses(self):
+        symj = probe("symj", predicate={"kind": "json_path_eq", "path": "result", "value": "ok"})
+        rig = self.rig(entries=[entry("wid", SF, [lever("L1")], symptom="symj")], extra_probes={"symj": symj})
+        rig.set(symj={"exit": 0, "out": '{"result": "broken"}\n'})
+        cid = self.triaged(rig, "wid broken")
+        rig.set(symj={"exit": 0, "out": '{"result": "ok"}\n'})
+        self.attempt(rig, cid, "L1")
+        self.rc(rig.run("verify", "--case", cid), RC_OK)
+        self.state(rig, cid, "fixed")
+        rig.set(symj={"exit": 0, "out": "not json\n"})
+        self.rc(rig.run("recheck", "--case", cid), RC_NOT_FIXED)
+        c = self.state(rig, cid, "regressed")
+        self.assertEqual(c["observations"][-1]["value"], "unknown")
+
+    def test_all_declined_needs_that_no_lever_was_attempted(self):
+        rig = self.rig(entries=[entry("wid", SF, [lever("L1", risky=True), lever("L2", risky=True)])])
+        cid = self.triaged(rig, "wid broken")
+        self.rc(rig.run("consent", "--case", cid, "--lever", "L1", "--yes"), RC_OK)
+        self.attempt(rig, cid, "L1")
+        self.state(rig, cid, "attempting")
+        self.rc(rig.run("consent", "--case", cid, "--lever", "L1", "--no"), RC_OK)
+        self.state(rig, cid, "attempting")
+        self.rc(rig.run("consent", "--case", cid, "--lever", "L2", "--no"), RC_OK)
+        self.state(rig, cid, "exhausted")
+        self.rc(rig.run("retriage", "--case", cid), RC_OK)
+        c = self.state(rig, cid, "unresolved")
+        self.assertEqual(c["reason"], "declined", "an attempted lever was counted as all_declined")
+        self.rc(rig.run("report", "--case", cid), RC_NEEDS_YES)
+
+    def test_exhaustion_counts_only_the_current_plan(self):
+        rig = self.rig(entries=[entry("wid", SF, [lever("L1"), lever("L2")])])
+        cid = self.triaged(rig, "wid broken")
+        self.attempt(rig, cid, "L1")
+        self.attempt(rig, cid, "L2")
+        self.state(rig, cid, "exhausted")
+        self.rc(rig.run("retriage", "--case", cid), RC_OK)
+        self.state(rig, cid, "unresolved")
+        self.rc(rig.run("triage", "--case", cid), RC_OK)
+        self.attempt(rig, cid, "L1")
+        c = self.state(rig, cid, "attempting")
+        self.assertEqual(c["plan"]["seq"], 2)
+        self.assertEqual(len(rig.attempts(cid)), 3)
+        r = self.rc(rig.run("report", "--case", cid), RC_REDIRECT)
+        self.assertIn("next lever first: L2", r.stdout)
+
+    def test_report_re_runs_the_symptom_probe(self):
+        rig, cid = self.to_mwr()
+        rig.set(sym="fail")
+        self.reported(rig, cid)
+        c = rig.case(cid)
+        mine = [o for o in c["observations"] if o.get("role") == "symptom" and o.get("command") == "report"]
+        self.assertEqual(len(mine), 1)
+        self.assertEqual(mine[0]["value"], "fail")
+        self.assertIn("symptom probe now (re-run for this report): sym value fail", rig.report_text(cid))
+
+    def test_report_answer_lapses_on_a_state_change(self):
+        rig, cid = self.to_mwr()
+        self.rc(rig.run("consent", "--case", cid, "--report", "--no"), RC_OK)
+        self.rc(rig.run("report", "--case", cid), RC_DECLINED)
+        rig.set(sym="fail")
+        self.rc(rig.run("recheck", "--case", cid), RC_NOT_FIXED)
+        self.state(rig, cid, "regressed")
+        self.rc(rig.run("triage", "--case", cid), RC_OK)
+        rig.set(sym="pass")
+        self.attempt(rig, cid, "L1")
+        self.rc(rig.run("verify", "--case", cid), RC_OK)
+        self.state(rig, cid, "mitigated_with_residual")
+        r = self.rc(rig.run("report", "--case", cid), RC_NEEDS_YES, "the old no must not answer the new question")
+        self.assertIn(SR_SENTENCE, r.stdout)
+        self.no_report_file(rig, cid)
+
+    def test_recheck_sweep_takes_recent_fixed_skips_old_fixed_and_open_cases(self):
+        rig = self.rig(entries=[entry("wid", SF, [lever("L1"), lever("L2")])])
+        rig.set(sym="pass")
+        recent = self.triaged(rig, "wid broken")
+        self.attempt(rig, recent, "L1")
+        self.rc(rig.run("verify", "--case", recent), RC_OK)
+        old = self.triaged(rig, "wid broken")
+        self.attempt(rig, old, "L1")
+        self.rc(rig.run("verify", "--case", old), RC_OK)
+        self.state(rig, old, "fixed")
+        p = os.path.join(rig.case_dir(old), "case.json")
+        c = load_json(p)
+        for h in c["history"]:
+            if h["to"] == "fixed":
+                h["at"] = "2000-01-01T00:00:00Z"
+        rig.write_json(p, c)
+        rig.set(sym="fail")
+        busy = self.triaged(rig, "wid broken")
+        self.attempt(rig, busy, "L1")
+        self.state(rig, busy, "attempting")
+        before_old, before_busy = rig.snapshot(old), rig.snapshot(busy)
+        r = self.rc(rig.run("recheck"), RC_NOT_FIXED)
+        self.assertIn("rechecked 1 case(s), regressed 1", r.stdout)
+        self.state(rig, recent, "regressed")
+        self.assertEqual(rig.snapshot(old), before_old, "a case fixed more than 30 days ago was rechecked")
+        self.assertEqual(rig.snapshot(busy), before_busy, "an attempting case was rechecked")
+
+    def test_case_id_outside_the_case_root_is_3(self):
+        rig = self.rig(entries=[entry("wid", SF, [lever("L1")])])
+        cid = rig.open("wid broken")
+        evil = os.path.join(rig.home, ".cys", "local", "evil")
+        os.makedirs(evil)
+        shutil.copy(os.path.join(rig.case_dir(cid), "case.json"), os.path.join(evil, "case.json"))
+        for bad in ("../evil", cid + "/../../evil"):
+            self.rc(rig.run("status", "--case", bad), RC_NO_CASE, "status " + bad)
+            self.rc(rig.run("triage", "--case", bad), RC_NO_CASE, "triage " + bad)
+        self.assertEqual(load_json(os.path.join(evil, "case.json"))["state"], "opened")
+
+
 # ─────────────────────────────── T-3 ───────────────────────────────
 
 class T3Secrets(Base):
