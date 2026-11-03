@@ -1450,14 +1450,23 @@ fn collect_tick(
             // gemini(agy)·grok: 로컬 평문 산출물에 토큰 미기록 — Phase 2 (로컬 RPC) 대상
             _ => {}
         }
+        #[cfg(not(windows))]
+        #[cfg(test)]
+        p11_tick_witness::collected(s.id);
     }
     collect_external(daemon, ext, &surfaces, tails);
     // ★(clear 가드 v3) 관측(위) 뒤에 — 시한(Awaiting·Cycling·Measuring)과 보류해 둔 실측 관측의 재판정(보고가 끊긴 좌석도 발화 · I2).
     for s in surfaces.iter().filter(|s| !s.exited.load(Ordering::Relaxed)) {
         ctx_guard_tick(daemon, s);
+        #[cfg(not(windows))]
+        #[cfg(test)]
+        p11_tick_witness::guarded(s.id);
     }
     // ★(수정 6회차 V42R-1) 비동기 사이클 대기열 — 동결 해제 뒤·자리 난 뒤 시작(접수·작업 끝에도 부르지만 놓친 것을 2초마다 줍는다).
     crate::cycle_jobs::pump(daemon);
+    #[cfg(not(windows))]
+    #[cfg(test)]
+    p11_tick_witness::pumped();
 }
 
 /// 단일 surface 수집: 세션 파일 결정 → 증분 read → 파싱 → 스냅샷 갱신 → 이벤트 발행
@@ -1474,6 +1483,13 @@ fn collect_for(
     #[cfg(not(windows))]
     #[cfg(test)]
     let now = p11_now_seam::get().unwrap_or(now);
+    // 좌석 루트 pid·생성 시각 — 검체는 공유된 Surface 를 변조하지 않고 아래 이음매로만 대체한다(impl-r1 F2).
+    let seat_created_at = s.created_at;
+    #[cfg(not(windows))]
+    let seat_pid = s.pid;
+    #[cfg(not(windows))]
+    #[cfg(test)]
+    let (seat_pid, seat_created_at) = p11_seat_seam::get(s.id).unwrap_or((seat_pid, seat_created_at));
 
     // T5 Phase 2-A 우선순위 병합 — claude는 statusline 보고(rate limit + 서버 진실 ctx)가
     // 신선하면 트랜스크립트 tail이 ctx만 덮어써 rate를 유실시키지 않도록 **관측 스냅샷만** 건너뛴다.
@@ -1508,7 +1524,7 @@ fn collect_for(
             // (자원 거버넌스 — 트랜스크립트가 아직 없는 pane이 틱마다 비용 유발 금지).
             // 신생 pane(1분 미만)은 트랜스크립트 지연 생성이 흔해 5초로 단축(전수조사 C-9 —
             // 구 30초 고정은 세션 초반 최대 30초 미수집 창을 만들었다).
-            let backoff = if now - s.created_at < 60.0 { 5.0 } else { REDISCOVER_SECS };
+            let backoff = if now - seat_created_at < 60.0 { 5.0 } else { REDISCOVER_SECS };
             let recently = attempts
                 .get(&s.id)
                 .map(|t| now - *t < backoff)
@@ -1534,7 +1550,7 @@ fn collect_for(
                             } else {
                                 attempts.insert(s.id, now);
                                 discovered = true;
-                                match discover_codex_rollout_proven(s.pid, bin) {
+                                match discover_codex_rollout_proven(seat_pid, bin) {
                                     Some(p) => {
                                         proven_this_tick = Some(true);
                                         Some((p, true))
@@ -2471,13 +2487,18 @@ fn discover_codex_rollout_proven(surface_pid: u32, bin: &str) -> Option<PathBuf>
     let (elig_pid, elig_start, elig_name) =
         p11_resolve_eligible_process(&sys, surface_pid, bin_base)?;
     let args = p11_codex_lsof_args(elig_pid);
-    let out = std::process::Command::new("lsof")
-        .args(&args)
-        .output()
-        .ok()?;
+    let mut cmd = std::process::Command::new("lsof");
+    cmd.args(&args);
+    #[cfg(test)]
+    if let Some(fake) = p11_lsof_seam::command() {
+        cmd = fake;
+    }
+    let out = cmd.output().ok()?;
     if !out.status.success() {
         return None;
     }
+    #[cfg(test)]
+    p11_post_probe_hook::run();
     let target_pid = sysinfo::Pid::from_u32(elig_pid);
     sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[target_pid]), true);
     let after = sys.process(target_pid).map(|pr| {
@@ -2527,6 +2548,97 @@ pub(crate) mod p11_proof_seam {
     }
     pub(crate) fn get() -> Option<Option<PathBuf>> {
         OVERRIDE.with(|c| c.borrow().clone())
+    }
+}
+
+/// P11 테스트 전용 좌석 신원 이음매(impl-r1 F2) — 공유된 `Surface` 를 변조하지 않고 `collect_for` 가 읽는 좌석 루트
+/// pid·생성 시각을 이 스레드에서만 좌석 id 별로 대체한다(종전 검체의 `Arc::as_ptr → &mut Surface` 캐스트 대체).
+#[cfg(not(windows))]
+#[cfg(test)]
+pub(crate) mod p11_seat_seam {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    thread_local! {
+        static OVERRIDE: RefCell<HashMap<u64, (u32, f64)>> = RefCell::new(HashMap::new());
+    }
+    pub(crate) fn set(surface_id: u64, root_pid: u32, created_at: f64) {
+        OVERRIDE.with(|m| {
+            m.borrow_mut().insert(surface_id, (root_pid, created_at));
+        });
+    }
+    pub(crate) fn get(surface_id: u64) -> Option<(u32, f64)> {
+        OVERRIDE.with(|m| m.borrow().get(&surface_id).copied())
+    }
+}
+
+/// P11 테스트 전용 증명 명령 이음매(impl-r1 F1) — 설정돼 있으면 실제 lsof 대신 이 argv 를 이 스레드에서만 돌린다
+/// (끝나지 않는 증명 자식을 만들기 위함 · 환경은 비우고 PATH 만 준다).
+#[cfg(not(windows))]
+#[cfg(test)]
+pub(crate) mod p11_lsof_seam {
+    use std::cell::RefCell;
+    thread_local! {
+        static ARGV: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    }
+    pub(crate) fn set(v: Option<Vec<String>>) {
+        ARGV.with(|c| *c.borrow_mut() = v);
+    }
+    pub(crate) fn command() -> Option<std::process::Command> {
+        let argv = ARGV.with(|c| c.borrow().clone())?;
+        let (prog, rest) = argv.split_first()?;
+        let mut cmd = std::process::Command::new(prog);
+        cmd.args(rest).env_clear().env("PATH", "/usr/bin:/bin");
+        Some(cmd)
+    }
+}
+
+/// P11 테스트 전용 증명 후 훅(impl-r1 F3) — lsof 가 끝난 뒤·호출 후 신원 재조회 전에 이 스레드에서만 한 번 돈다
+/// (그 사이 적격 프로세스가 사라지는 경우를 만들기 위함).
+#[cfg(not(windows))]
+#[cfg(test)]
+pub(crate) mod p11_post_probe_hook {
+    use std::cell::RefCell;
+    type Hook = Box<dyn FnOnce()>;
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+    pub(crate) fn set(f: Option<Hook>) {
+        HOOK.with(|h| *h.borrow_mut() = f);
+    }
+    pub(crate) fn run() {
+        let f = HOOK.with(|h| h.borrow_mut().take());
+        if let Some(f) = f {
+            f();
+        }
+    }
+}
+
+/// P11 테스트 전용 수집기 틱 목격(impl-r1 F1) — `collect_tick` 이 이 스레드에서 좌석별 수집·가드 틱·사이클 펌프에
+/// 도달했는지 기록한다(멈춘 증명 자식이 뒤 단계를 막지 않음을 직접 보인다).
+#[cfg(not(windows))]
+#[cfg(test)]
+pub(crate) mod p11_tick_witness {
+    use std::cell::RefCell;
+    #[derive(Clone, Debug, Default)]
+    pub(crate) struct Witness {
+        pub(crate) collected: Vec<u64>,
+        pub(crate) guarded: Vec<u64>,
+        pub(crate) pumped: usize,
+    }
+    thread_local! {
+        static W: RefCell<Witness> = RefCell::new(Witness::default());
+    }
+    pub(crate) fn collected(id: u64) {
+        W.with(|w| w.borrow_mut().collected.push(id));
+    }
+    pub(crate) fn guarded(id: u64) {
+        W.with(|w| w.borrow_mut().guarded.push(id));
+    }
+    pub(crate) fn pumped() {
+        W.with(|w| w.borrow_mut().pumped += 1);
+    }
+    pub(crate) fn take() -> Witness {
+        W.with(|w| std::mem::take(&mut *w.borrow_mut()))
     }
 }
 
@@ -4424,6 +4536,8 @@ mod tests {
         fn drop(&mut self) {
             super::p11_now_seam::set(None);
             super::p11_proof_seam::set(None);
+            super::p11_lsof_seam::set(None);
+            super::p11_post_probe_hook::set(None);
         }
     }
 
@@ -4461,9 +4575,8 @@ mod tests {
                 80,
             )
             .expect("create surface");
-        let surf = unsafe { &mut *(Arc::as_ptr(&s) as *mut Surface) };
-        surf.pid = root_pid;
-        surf.created_at = created_at;
+        // impl-r1 F2: 공유된 Surface 를 변조하지 않는다 — 좌석 루트 pid·생성 시각은 이 스레드의 입력 이음매로만 넣는다.
+        super::p11_seat_seam::set(s.id, root_pid, created_at);
         *s.agent_meta.lock().unwrap() = Some((agent.into(), bin.into()));
         s
     }
@@ -4498,9 +4611,124 @@ mod tests {
         std::fs::canonicalize(&p).unwrap_or(p)
     }
 
+    /// 가짜 네이티브 준비 신호 상한(impl-r1 F5) — 넘으면 고정물 구성 실패(자식은 Drop 이 거둔다).
+    #[cfg(not(windows))]
+    const P11_FIXTURE_READY_BOUND: Duration = Duration::from_secs(30);
+    /// 가짜 네이티브 종료 상한(impl-r1 F5) — stdin EOF 뒤 스스로 끝나기를 이만큼 기다리고, 넘으면 SIGKILL 뒤 다시 이만큼.
+    #[cfg(not(windows))]
+    const P11_FIXTURE_EXIT_BOUND: Duration = Duration::from_secs(10);
+
+    /// 가짜 네이티브 자식의 환경(impl-r1 F5) — 비우고 필요한 것만 준다(HOME 은 고정물 폴더 · 좌석·데몬·계정 변수 없음).
+    #[cfg(not(windows))]
+    fn p11_isolate_helper_env(cmd: &mut std::process::Command, filter: &str, home: &std::ffi::OsStr) {
+        cmd.env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", home)
+            .env("CYS_P11_HELPER_MODE", "1")
+            .env("CYS_P11_HELPER_FILTER", filter);
+    }
+
+    /// 자식이 `P11_HELPER_READY` 를 낼 때까지 상한 안에서만 기다린다(impl-r1 F5). 그 앞의 `P11_NESTED_PID <pid>` 줄을
+    /// 읽어 돌려준다. 읽기 스레드는 준비 뒤에도 EOF 까지 표준출력을 비운다(자식의 마지막 출력이 닫힌 파이프에 부딪히지 않게).
+    #[cfg(not(windows))]
+    fn p11_await_ready(child: &mut std::process::Child) -> Result<Option<u32>, String> {
+        use std::io::BufRead;
+        let stdout = child.stdout.take().ok_or_else(|| "no stdout pipe".to_string())?;
+        let (tx, rx) = std::sync::mpsc::channel::<Result<Option<u32>, String>>();
+        std::thread::Builder::new()
+            .name("p11-fixture-ready".into())
+            .spawn(move || {
+                let mut nested: Option<u32> = None;
+                let mut sent = false;
+                for line in std::io::BufReader::new(stdout).lines() {
+                    let Ok(line) = line else { break };
+                    // --nocapture: libtest 의 `test <이름> ... ` 머리(줄바꿈 없음)가 같은 줄 앞에 붙는다 — 줄 안에서 찾는다.
+                    if let Some(i) = line.find("P11_NESTED_PID ") {
+                        nested = line[i + "P11_NESTED_PID ".len()..]
+                            .split_whitespace()
+                            .next()
+                            .and_then(|t| t.parse().ok());
+                    }
+                    if !sent && line.contains("P11_HELPER_READY") {
+                        let _ = tx.send(Ok(nested));
+                        sent = true;
+                    }
+                }
+                if !sent {
+                    let _ = tx.send(Err("exited before P11_HELPER_READY".to_string()));
+                }
+            })
+            .map_err(|e| format!("cannot start the readiness reader: {e}"))?;
+        match rx.recv_timeout(P11_FIXTURE_READY_BOUND) {
+            Ok(r) => r,
+            Err(e) => Err(format!("no P11_HELPER_READY within {P11_FIXTURE_READY_BOUND:?} ({e})")),
+        }
+    }
+
+    /// 자식 종료를 상한 안에서 기다린다(거둠 포함) — 참 = 끝났고 거뒀다.
+    #[cfg(not(windows))]
+    fn p11_wait_exit(child: &mut std::process::Child, bound: Duration) -> bool {
+        let deadline = std::time::Instant::now() + bound;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return true,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    /// 가짜 네이티브 종료(impl-r1 F5): stdin 을 닫아 스스로 끝나게 하고(그 자식은 자기 중첩 자식을 먼저 거둔다) 상한 안에
+    /// 끝나지 않을 때만 SIGKILL 로 올린다. 참 = 끝났고 거뒀다.
+    #[cfg(not(windows))]
+    fn p11_end_child(child: &mut std::process::Child) -> bool {
+        drop(child.stdin.take());
+        if p11_wait_exit(child, P11_FIXTURE_EXIT_BOUND) {
+            return true;
+        }
+        let _ = child.kill();
+        p11_wait_exit(child, P11_FIXTURE_EXIT_BOUND)
+    }
+
+    /// 우리 자식이 아닌 pid(중첩 가짜 네이티브)가 사라졌는지 상한 안에서 확인한다(impl-r1 F5). 남아 있고 이름이 그 가짜
+    /// 네이티브와 같을 때만(재사용된 남의 pid 가 아닐 때만) SIGKILL 을 보내고 다시 확인한다. 참 = 사라짐(ESRCH).
+    #[cfg(not(windows))]
+    fn p11_confirm_gone(pid: u32, bin_base: &str) -> bool {
+        let gone = || {
+            let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+            rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        };
+        let wait_gone = || {
+            let deadline = std::time::Instant::now() + P11_FIXTURE_EXIT_BOUND;
+            loop {
+                if gone() {
+                    return true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        if wait_gone() {
+            return true;
+        }
+        let mut sys = sysinfo::System::new();
+        let p = sysinfo::Pid::from_u32(pid);
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[p]), true);
+        if sys.process(p).is_some_and(|pr| pr.name().to_string_lossy() == bin_base) {
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+        wait_gone()
+    }
+
     #[cfg(not(windows))]
     fn p11_child_helper_entry() {
-        use std::io::{BufRead, Read, Write};
+        use std::io::{Read, Write};
         let _rw = std::env::var_os("CYS_P11_HOLD_RW").map(|p| {
             std::fs::OpenOptions::new()
                 .read(true)
@@ -4511,42 +4739,36 @@ mod tests {
         let _ro = std::env::var_os("CYS_P11_HOLD_RO").map(|p| {
             std::fs::File::open(p).expect("open CYS_P11_HOLD_RO")
         });
-        let mut nested = std::env::var_os("CYS_P11_NESTED_RW").map(|nested_path| {
+        let nested = std::env::var_os("CYS_P11_NESTED_RW").map(|nested_path| {
             let exe = std::env::current_exe().expect("current_exe");
             let filter = std::env::var("CYS_P11_HELPER_FILTER")
                 .unwrap_or_else(|_| "usage::tests::p11_".to_string());
-            let mut child = std::process::Command::new(exe)
-                .args([filter.as_str(), "--test-threads=1", "--nocapture"])
-                .env("CYS_P11_HELPER_MODE", "1")
-                .env("CYS_P11_HOLD_RW", nested_path)
-                .env_remove("CYS_P11_HOLD_RO")
-                .env_remove("CYS_P11_NESTED_RW")
+            let home = std::env::var_os("HOME").unwrap_or_else(|| std::env::temp_dir().into_os_string());
+            let mut cmd = std::process::Command::new(exe);
+            cmd.args([filter.as_str(), "--test-threads=1", "--nocapture"]);
+            p11_isolate_helper_env(&mut cmd, &filter, &home);
+            cmd.env("CYS_P11_HOLD_RW", nested_path)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .expect("spawn nested fake native");
-            let stdout = child.stdout.take().expect("nested stdout");
-            let mut reader = std::io::BufReader::new(stdout);
-            let mut line = String::new();
-            loop {
-                line.clear();
-                let n = reader.read_line(&mut line).expect("read nested stdout");
-                assert!(n > 0, "nested fake native exited before P11_HELPER_READY");
-                if line.contains("P11_HELPER_READY") {
-                    break;
-                }
+                .stderr(std::process::Stdio::null());
+            let mut child = cmd.spawn().expect("spawn nested fake native");
+            if let Err(e) = p11_await_ready(&mut child) {
+                // 준비 실패여도 중첩 자식을 거둔 뒤에 실패한다(고아 금지).
+                p11_end_child(&mut child);
+                panic!("nested fake native not ready: {e}");
             }
             child
         });
         let mut out = std::io::stdout();
+        if let Some(ch) = &nested {
+            let _ = writeln!(out, "P11_NESTED_PID {}", ch.id());
+        }
         let _ = writeln!(out, "P11_HELPER_READY");
         let _ = out.flush();
         let mut buf = [0u8; 1];
         let _ = std::io::stdin().read(&mut buf);
-        if let Some(mut ch) = nested.take() {
-            let _ = ch.kill();
-            let _ = ch.wait();
+        if let Some(mut ch) = nested {
+            p11_end_child(&mut ch);
         }
     }
 
@@ -4555,6 +4777,8 @@ mod tests {
         bin_base: String,
         bin_path: PathBuf,
         child: std::process::Child,
+        /// 중첩 가짜 네이티브의 pid(자식이 알린 값) — 종료 때 사라졌음을 확인한다(impl-r1 F5).
+        nested_pid: Option<u32>,
     }
 
     #[cfg(not(windows))]
@@ -4567,7 +4791,6 @@ mod tests {
             hold_ro: Option<&Path>,
             nested_rw: Option<&Path>,
         ) -> Self {
-            use std::io::BufRead;
             std::fs::create_dir_all(dir).unwrap();
             let bin_base = format!("codex-p11-{tag}");
             assert!(
@@ -4581,54 +4804,66 @@ mod tests {
                 .or_else(|_| std::fs::copy(&exe, &bin_path).map(|_| ()))
                 .expect("stage fake native binary");
             let mut cmd = std::process::Command::new(&bin_path);
-            cmd.args([filter, "--test-threads=1", "--nocapture"])
-                .env("CYS_P11_HELPER_MODE", "1")
-                .env("CYS_P11_HELPER_FILTER", filter)
-                .stdin(std::process::Stdio::piped())
+            cmd.args([filter, "--test-threads=1", "--nocapture"]);
+            // impl-r1 F5: 자식 환경은 비우고 필요한 것만 — 좌석·데몬·계정 변수와 실제 HOME 을 물려주지 않는다.
+            p11_isolate_helper_env(&mut cmd, filter, dir.as_os_str());
+            cmd.stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null());
             if let Some(p) = hold_rw {
                 cmd.env("CYS_P11_HOLD_RW", p);
-            } else {
-                cmd.env_remove("CYS_P11_HOLD_RW");
             }
             if let Some(p) = hold_ro {
                 cmd.env("CYS_P11_HOLD_RO", p);
-            } else {
-                cmd.env_remove("CYS_P11_HOLD_RO");
             }
             if let Some(p) = nested_rw {
                 cmd.env("CYS_P11_NESTED_RW", p);
-            } else {
-                cmd.env_remove("CYS_P11_NESTED_RW");
             }
-            let mut child = cmd.spawn().expect("spawn fake native");
-            let stdout = child.stdout.take().expect("fake native stdout");
-            let mut reader = std::io::BufReader::new(stdout);
-            let mut line = String::new();
-            loop {
-                line.clear();
-                let n = reader.read_line(&mut line).expect("read fake native stdout");
-                assert!(n > 0, "fake native exited before P11_HELPER_READY");
-                if line.contains("P11_HELPER_READY") {
-                    break;
-                }
-            }
-            Self {
+            let child = cmd.spawn().expect("spawn fake native");
+            // impl-r1 F5: 소유자를 먼저 세운다 — 아래 준비 대기가 실패해 패닉해도 Drop 이 자식을 거둔다.
+            let mut me = Self {
                 bin_base,
                 bin_path,
                 child,
+                nested_pid: None,
+            };
+            match p11_await_ready(&mut me.child) {
+                Ok(nested) => me.nested_pid = nested,
+                Err(e) => panic!("fake native {} not ready: {e}", me.bin_base),
             }
+            if nested_rw.is_some() {
+                assert!(me.nested_pid.is_some(), "fake native {} did not report its nested child pid", me.bin_base);
+            }
+            me
         }
     }
 
     #[cfg(not(windows))]
     impl Drop for P11FakeNative {
+        /// impl-r1 F5: stdin EOF 로 스스로 끝나게 하고(자식이 자기 중첩 자식을 먼저 거둔다) 상한을 넘길 때만 SIGKILL 로
+        /// 올린다. 중첩 자식이 사라졌는지는 구성·단언이 실패해 풀리는 중에도 확인한다(그때는 패닉 대신 stderr 1줄).
         fn drop(&mut self) {
-            drop(self.child.stdin.take());
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+            let exited = p11_end_child(&mut self.child);
+            let nested_gone = self
+                .nested_pid
+                .map(|p| p11_confirm_gone(p, &self.bin_base))
+                .unwrap_or(true);
             let _ = std::fs::remove_file(&self.bin_path);
+            if std::thread::panicking() {
+                if !exited || !nested_gone {
+                    eprintln!(
+                        "P11FakeNative {}: exited={exited} nested_pid={:?} nested_gone={nested_gone}",
+                        self.bin_base, self.nested_pid
+                    );
+                }
+            } else {
+                assert!(exited, "fake native {} did not exit even after SIGKILL", self.bin_base);
+                assert!(
+                    nested_gone,
+                    "nested fake native {:?} of {} still exists after shutdown",
+                    self.nested_pid, self.bin_base
+                );
+            }
         }
     }
 
@@ -5499,6 +5734,238 @@ mod tests {
         assert!(tails[&s.id].proven, "부모 본체 파일 증명 후 proven=true 승격");
 
         drop(holder);
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// T17 (impl-r1 F3, proof path): lsof 가 끝난 뒤·호출 후 신원 재조회 전에 적격 프로세스가 사라지면, 증명 경로는 그 lsof
+    /// 출력이 가리키는 쓰기 가능 `cli` rollout 을 반환하지 않는다. 같은 고정물·같은 실제 lsof 에서 훅이 없으면 그 파일이
+    /// 반환된다(대조 — 아래 거부의 원인이 신원 재검증 하나임을 고정). 재검증을 건너뛰는 변이(M11a)를 잡는다.
+    #[cfg(not(windows))]
+    #[test]
+    fn p11_t17_post_probe_identity_vanish_is_rejected_on_the_proof_path() {
+        if std::env::var_os("CYS_P11_HELPER_MODE").is_some() {
+            p11_child_helper_entry();
+            return;
+        }
+        let td = std::env::temp_dir().join(format!("cys-p11-t17-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let sessions = td.join("sessions");
+        let own = p11_write_rollout(
+            &sessions,
+            "rollout-2026-11-03T03-00-00-own.jsonl",
+            "/work/p11",
+            Some("\"cli\""),
+            1_700_001_000,
+        );
+        let holder = P11FakeNative::spawn(
+            &td,
+            "t17",
+            "usage::tests::p11_t17_post_probe_identity_vanish_is_rejected_on_the_proof_path",
+            Some(&own),
+            None,
+            None,
+        );
+        let bin_base = holder.bin_base.clone();
+        let holder_pid = holder.child.id();
+        let _g = P11SeamGuard;
+
+        // 대조: 훅 없이 같은 고정물·같은 실제 lsof → own 을 증명한다.
+        assert_eq!(
+            super::discover_codex_rollout_proven(std::process::id(), &bin_base),
+            Some(own.clone()),
+            "control: without the post-probe vanish the live holder's writable cli rollout must be proven"
+        );
+
+        // lsof 뒤·재조회 전에 적격 프로세스를 끝내고 거둔다(사라짐).
+        let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+        let fired_in_hook = fired.clone();
+        super::p11_post_probe_hook::set(Some(Box::new(move || {
+            drop(holder);
+            fired_in_hook.set(true);
+        })));
+        let proven = super::discover_codex_rollout_proven(std::process::id(), &bin_base);
+        assert!(fired.get(), "precondition: the post-probe hook must have run (lsof succeeded on the live holder)");
+        let rc = unsafe { libc::kill(holder_pid as libc::pid_t, 0) };
+        assert!(
+            rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH),
+            "precondition: holder {holder_pid} must be gone (killed and reaped) before the identity re-read"
+        );
+        assert_eq!(
+            proven, None,
+            "post-probe identity vanished (holder {holder_pid} gone after lsof) but the proof path returned {proven:?} - \
+             the caller skipped the post-probe identity re-check"
+        );
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// T18 (impl-r1 F1, fatal-risk 2): 주기 증명의 lsof 자식이 끝나지 않아도 수집기 틱은 상한 안에 돌아와 뒤 좌석·가드 틱
+    /// (`ctx_guard_tick`)·사이클 펌프(`cycle_jobs::pump`)에 도달하고, 증명 자식은 죽고 거둬져 남지 않으며, 무증명이라 핀은 그대로다.
+    /// 끝나지 않는 증명 좌석을 둘 둔다 — 좌석 순서(HashMap)와 무관하게 하나는 다른 하나의 멈춘 증명 뒤에 수집된다.
+    /// 옛 바이트(상한 없는 `.output()`)에서는 틱이 돌아오지 않아 아래 상한에서 실패한다(스레드 + recv_timeout).
+    #[cfg(not(windows))]
+    #[test]
+    fn p11_t18_never_completing_probe_does_not_hold_the_collector_tick() {
+        if std::env::var_os("CYS_P11_HELPER_MODE").is_some() {
+            p11_child_helper_entry();
+            return;
+        }
+        // 상한: 증명 둘 × (시한 + 거둠) 보다 넉넉히 길고, 끝나지 않는 자식(3600 s)보다 훨씬 짧다.
+        const BOUND: Duration = Duration::from_secs(40);
+        // 바닥: 증명 자식이 실제로 멈췄다는 전제(즉시 끝난 자식이면 틱은 밀리초에 돌아온다).
+        const STALL_FLOOR: Duration = Duration::from_secs(1);
+        let filter = "usage::tests::p11_t18_never_completing_probe_does_not_hold_the_collector_tick";
+        let td = std::env::temp_dir().join(format!("cys-p11-t18-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let sessions = td.join("sessions");
+        let pin_a = p11_write_rollout(
+            &sessions,
+            "rollout-2026-11-03T04-00-00-a.jsonl",
+            "/work/p11",
+            Some("\"cli\""),
+            1_700_002_000,
+        );
+        let pin_b = p11_write_rollout(
+            &sessions,
+            "rollout-2026-11-03T04-00-00-b.jsonl",
+            "/work/p11",
+            Some("\"cli\""),
+            1_700_002_000,
+        );
+        let holder_a = P11FakeNative::spawn(&td, "t18a", filter, Some(&pin_a), None, None);
+        let holder_b = P11FakeNative::spawn(&td, "t18b", filter, Some(&pin_b), None, None);
+        let claude_tx = td.join("claude-registered.jsonl");
+        std::fs::write(&claude_tx, "").unwrap();
+        let pidfile = td.join("probe-pids");
+
+        let d = tick_daemon("p11-t18");
+        let seat = |agent: &str, bin: &str| {
+            let s = d
+                .create_surface(
+                    Some(td.to_string_lossy().into_owned()),
+                    Some("sleep 60".into()),
+                    None,
+                    Some("p11-t18".into()),
+                    24,
+                    80,
+                )
+                .expect("create surface");
+            *s.agent_meta.lock().unwrap() = Some((agent.into(), bin.into()));
+            d.surfaces.lock().unwrap().insert(s.id, s.clone());
+            s
+        };
+        let ca = seat("codex", &holder_a.bin_base);
+        let cb = seat("codex", &holder_b.bin_base);
+        let cl = seat("claude", "claude");
+        *cl.registered_transcript.lock().unwrap() = Some(claude_tx.to_string_lossy().into_owned());
+        let now = now_epoch();
+        let mut tails: HashMap<u64, TailState> = HashMap::new();
+        for (s, pin) in [(&ca, &pin_a), (&cb, &pin_b)] {
+            let mut st = TailState::attach(&d, pin.clone(), true, now - 35.0);
+            st.proven = false;
+            tails.insert(s.id, st);
+        }
+        let seam_seats = [(ca.id, now - 3600.0), (cb.id, now - 3600.0)];
+        // 끝나지 않는 증명 자식: 제 pid 를 남기고 같은 pid 로 sleep 을 exec 한다(손자 없음 · 출력 없음).
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "echo $$ >> \"$0\"; exec /bin/sleep 3600".to_string(),
+            pidfile.to_string_lossy().into_owned(),
+        ];
+        let (tx, rx) = std::sync::mpsc::channel();
+        let d2 = d.clone();
+        let started = std::time::Instant::now();
+        let worker = std::thread::Builder::new()
+            .name("p11-t18-tick".into())
+            .spawn(move || {
+                let _g = P11SeamGuard;
+                for (id, created) in seam_seats {
+                    super::p11_seat_seam::set(id, std::process::id(), created);
+                }
+                super::p11_lsof_seam::set(Some(argv));
+                let _ = super::p11_tick_witness::take();
+                let mut attempts: HashMap<u64, f64> = HashMap::new();
+                let mut ext = ExternalTails::default();
+                ext.last_sweep = now_epoch(); // 외부 세션 훑기 생략(HOME 을 읽지 않는다)
+                collect_tick(&d2, &mut tails, &mut attempts, &mut ext);
+                let _ = tx.send((tails, attempts, super::p11_tick_witness::take()));
+            })
+            .expect("spawn tick thread");
+        let got = rx.recv_timeout(BOUND);
+        let elapsed = started.elapsed();
+        let probe_pids = || -> Vec<libc::pid_t> {
+            std::fs::read_to_string(&pidfile)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| l.trim().parse().ok())
+                .collect()
+        };
+        let Ok((tails, attempts, w)) = got else {
+            // 틱이 상한 안에 돌아오지 않았다 — 우리가 띄운 가짜 증명 자식만 끝내 묶인 스레드를 풀고 치운 뒤 실패로 보고한다.
+            let mut killed: HashSet<libc::pid_t> = HashSet::new();
+            for _ in 0..50 { // wallclock: guard only on the already-failed path: it ends our own fake probe children so the held tick thread can finish; the verdict is the panic below
+                for p in probe_pids() {
+                    if killed.insert(p) {
+                        unsafe {
+                            libc::kill(p, libc::SIGKILL);
+                        }
+                    }
+                }
+                if worker.is_finished() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            for s in [&ca, &cb, &cl] {
+                let _ = s.child.lock().unwrap_or_else(|e| e.into_inner()).kill();
+            }
+            drop((holder_a, holder_b));
+            let _ = std::fs::remove_dir_all(&td);
+            panic!(
+                "collector tick did not return within {BOUND:?} while the periodic proof probe never completes \
+                 (probe pids {killed:?}) - later seats, ctx_guard_tick and cycle_jobs::pump were held (fatal risk 2)"
+            );
+        };
+        worker.join().expect("tick thread");
+
+        let pids = probe_pids();
+        assert_eq!(
+            pids.len(),
+            2,
+            "precondition: each codex seat must have started one never-completing probe child, got {pids:?}"
+        );
+        assert!(
+            elapsed >= STALL_FLOOR,
+            "precondition: the tick returned in {elapsed:?}, so the probe child did not stall"
+        );
+        for p in &pids {
+            let rc = unsafe { libc::kill(*p, 0) };
+            let errno = std::io::Error::last_os_error().raw_os_error();
+            assert!(
+                rc == -1 && errno == Some(libc::ESRCH),
+                "probe child {p} still exists after the tick (rc {rc}, errno {errno:?}) - not killed, or killed but not reaped"
+            );
+        }
+        let mut want = vec![ca.id, cb.id, cl.id];
+        want.sort_unstable();
+        let mut collected = w.collected.clone();
+        collected.sort_unstable();
+        assert_eq!(collected, want, "the tick did not collect every seat: {w:?}");
+        let mut guarded = w.guarded.clone();
+        guarded.sort_unstable();
+        assert_eq!(guarded, want, "ctx_guard_tick did not run for every seat: {w:?}");
+        assert_eq!(w.pumped, 1, "cycle_jobs::pump did not run once: {w:?}");
+        for (s, pin) in [(&ca, &pin_a), (&cb, &pin_b)] {
+            assert_eq!(tails[&s.id].path, *pin, "no proof must keep the existing pin");
+            assert!(!tails[&s.id].proven, "no proof must not mark the pin proven");
+            assert!(attempts.contains_key(&s.id), "the periodic proof must have been attempted");
+        }
+        assert!(tails.contains_key(&cl.id), "the claude seat was not collected");
+
+        for s in [&ca, &cb, &cl] {
+            let _ = s.child.lock().unwrap_or_else(|e| e.into_inner()).kill();
+        }
+        drop((holder_a, holder_b));
         let _ = std::fs::remove_dir_all(&td);
     }
 }
