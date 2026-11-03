@@ -6171,6 +6171,27 @@ fn observe_submit_cr_hits_dialog(s: &Arc<crate::state::Surface>, markers: &[Stri
     submit_cr_verdict(scope, &obs, body.as_ref().map(|b| b.norm.as_str())).hits
 }
 
+/// ★(0.14.57 · P7 impl r2 · codex M1) Final pre-CR probe observation: re-checks both modal/selector dialog hits and
+/// `ComposerLabel::Unbound` on the fresh write-time frame (`obs.label` is `Unbound` only on governed agent-backed seats).
+fn observe_submit_cr_withhold_reason(s: &Arc<crate::state::Surface>, markers: &[String]) -> Option<&'static str> {
+    if markers.is_empty() {
+        return None;
+    }
+    let scope = submit_guard_scope(s);
+    if scope == SubmitGuardScope::Off {
+        return None;
+    }
+    let obs = observe_prompt_block(s, markers);
+    let body = s.inject_track.last_body();
+    if submit_cr_verdict(scope, &obs, body.as_ref().map(|b| b.norm.as_str())).hits {
+        Some("modal")
+    } else if obs.label == cys::readiness::ComposerLabel::Unbound {
+        Some("unbound_label")
+    } else {
+        None
+    }
+}
+
 /// ★(F1) 제출 CR 보류의 인계 시점 재료 — 핸들러가 `input_gate` **밖**에서 1회 만든다(어댑터·파서 락).
 pub(crate) struct SubmitCrGuardCtx {
     /// 탐침이 writer 스레드에서 다시 쓸 마커(어댑터 로드를 writer 에서 반복하지 않는다 — `inject_safety_probe` 규율).
@@ -6225,9 +6246,9 @@ pub(crate) fn submit_cr_withhold_probe_with(
             let (Some(d), Some(s)) = (wd.upgrade(), ws.upgrade()) else {
                 return false;
             };
-            if !observe_submit_cr_hits_dialog(&s, &markers) {
+            let Some(reason) = observe_submit_cr_withhold_reason(&s, &markers) else {
                 return false;
-            }
+            };
             // ★(재개 S91) 보류는 미룸이다 — 입력줄에 남는 기계 본문을 기록해 창이 닫힌 뒤 watchdog 틱이 이 CR 을 한 번 다시
             //   쓴다([`resubmit_withheld_submits`]). 기계 본문 기록이 없으면(빈 줄 위 Return) 다시 쓸 것이 없다.
             if let Some(b) = s.inject_track.last_body().filter(|_| record) {
@@ -6239,7 +6260,7 @@ pub(crate) fn submit_cr_withhold_probe_with(
                 Some(s.id),
                 json!({
                     "surface_ref": cys::surface_ref(s.id),
-                    "reason": "modal",
+                    "reason": reason,
                     "armed_by": armed_by,
                     "from": from.map(cys::surface_ref),
                     "handed_ms_ago": handed.elapsed().as_millis() as u64,
@@ -23149,6 +23170,124 @@ mod tests {
         let _ = s.child.lock().unwrap().kill();
         crate::state::p1_e0_stop_daemon(&daemon);
     }
+
+    #[test]
+    fn p7_withheld_resubmit_late_unbound_before_final_probe_holds_then_resumes_once() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("p7-late-unbound");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let (daemon, s) = wp5_seat("p7-late-unbound", "claude");
+        p1_measured(&s);
+        let now = std::time::Instant::now();
+        s.inject_track.note_body("M|x|AAA", None);
+        let body_at = s.inject_track.last_body().unwrap().at;
+        s.inject_track
+            .note_withheld(crate::state::WithheldSubmit::new(now, body_at, None));
+        let lines = [
+            "❯ earlier turn",
+            "  ack 1",
+            "─────────────────────────────────── my-title ─",
+            "❯ M|x|AAA",
+            RULE,
+            STATUS1,
+            STATUS2,
+        ];
+        paint_screen(&s, &lines, 3, 9, false);
+        p7_set_osc_title(&s, "✳ my-title");
+
+        // Park the writer thread on a bounded barrier so we can mutate the OSC title between resubmit handoff and the final pre-CR probe.
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let release_rx = std::sync::Mutex::new(release_rx);
+        s.inject_track.submit_handed();
+        s.write_tx
+            .send(crate::state::WriteReq::SubmitAfterGap {
+                bytes: b"\r".to_vec(),
+                min_gap_ms: 0,
+                withhold: Some(std::sync::Arc::new(move || {
+                    let _ = entered_tx.send(());
+                    let _ = release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(std::time::Duration::from_secs(5));
+                    true
+                })),
+            })
+            .unwrap();
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("writer parked on barrier");
+
+        // 1. Handoff succeeds while Bound.
+        let r_handoff = super::resubmit_withheld_one(&daemon, &s, now + std::time::Duration::from_secs(5));
+        assert_eq!(r_handoff, "resubmitted", "Bound composer at resubmit tick hands off SubmitAfterGap");
+
+        // 2. Before the writer runs the final pre-CR probe, OSC title changes so the border becomes Unbound.
+        p7_set_osc_title(&s, "✳ other-title");
+        let _ = release_tx.send(());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while s.write_tx.gate().pending() != 0 {
+            assert!(std::time::Instant::now() < deadline, "writer did not drain SubmitAfterGap");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        // Must NOT have written the CR under Unbound, and must have re-recorded the withheld submit for later retry.
+        let settle = s.inject_track.submit_settle_obs(crate::state::settle_mono_ms(), 60_000);
+        assert_eq!(
+            settle.since_written_ms, None,
+            "final pre-CR probe must withhold the CR when label became Unbound after handoff: {settle:?}"
+        );
+        assert!(
+            s.inject_track.withheld().is_some(),
+            "record=true resubmit probe must restore WithheldSubmit when withholding under late Unbound"
+        );
+        let withheld_evs: Vec<_> = daemon
+            .bus
+            .tail(100)
+            .into_iter()
+            .filter(|e| e["name"] == "queue.submit_withheld")
+            .collect();
+        assert_eq!(withheld_evs.len(), 1, "expected 1 queue.submit_withheld event: {withheld_evs:?}");
+        assert_eq!(withheld_evs[0]["payload"]["reason"], json!("unbound_label"));
+        assert_eq!(withheld_evs[0]["payload"]["armed_by"], json!("resubmit"));
+
+        // 3. Subsequent tick while still Unbound waits without writing.
+        let r_still_unbound = super::resubmit_withheld_one(&daemon, &s, now + std::time::Duration::from_secs(10));
+        assert_eq!(r_still_unbound, "wait_label");
+
+        // 4. Subsequent valid binding resumes once and writes the CR.
+        p7_set_osc_title(&s, "✳ my-title");
+        let r_resumed = super::resubmit_withheld_one(&daemon, &s, now + std::time::Duration::from_secs(15));
+        assert_eq!(r_resumed, "resubmitted");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while s.write_tx.gate().pending() != 0 {
+            assert!(std::time::Instant::now() < deadline, "writer did not drain resumed SubmitAfterGap");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let settle_after = s.inject_track.submit_settle_obs(crate::state::settle_mono_ms(), 60_000);
+        assert!(
+            settle_after.since_written_ms.is_some(),
+            "once Bound again, the resumed SubmitAfterGap must write the CR once: {settle_after:?}"
+        );
+        assert!(s.inject_track.withheld().is_none(), "withheld record cleared after successful write");
+
+        // 5. Control: record=false (D9 queue job) withholds on Unbound without creating a WithheldSubmit record.
+        p7_set_osc_title(&s, "✳ other-title");
+        let d9_probe = super::submit_cr_withhold_probe_with(&daemon, &s, vec!["❯".to_string()], "queue_job", None, false);
+        assert!(d9_probe(), "D9 queue_job final probe must withhold on Unbound");
+        assert!(
+            s.inject_track.withheld().is_none(),
+            "record=false must not install a WithheldSubmit record (queue hold owns the CR)"
+        );
+
+        // 6. Control: D1-off seat does not withhold on title border.
+        s.d1_platform.store(false, AtomicOrdering::Relaxed);
+        let d1_off_probe = super::submit_cr_withhold_probe_with(&daemon, &s, vec!["❯".to_string()], "resubmit", None, true);
+        assert!(!d1_off_probe(), "D1-off seat must not withhold on composer title border");
+
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
     // ===== end of the P7 behavioural block =====
 
     /// 화면이 비어 보여도 데몬이 센 미제출 바이트가 있으면 배달하지 않는다(1차 축 우선).
@@ -32388,7 +32527,7 @@ after-tick liveness alone does not attribute a clock defect",
             (delivered.clone(), held(BLOCKED_INPUT_PENDING)), // 안내문: Suggestion vs Home-moved draft
             (held(BLOCKED_INPUT_PENDING), held(BLOCKED_INPUT_PENDING)), // a plain run after the cursor in both
             (held(BLOCKED_INPUT_PENDING), held(BLOCKED_INPUT_PENDING)), // text before the cursor in both
-            (delivered.clone(), delivered.clone()), // dim outside the composer row
+            (held(BLOCKED_INPUT_PENDING), held(BLOCKED_INPUT_PENDING)), // Unbound History chip above the marker holds with or without dim (P7 r2 §1/§4)
             (delivered.clone(), delivered.clone()), // dim output line
             (held(BLOCKED_BUSY), held(BLOCKED_BUSY)), // the working indicator, dim or not
         ];
