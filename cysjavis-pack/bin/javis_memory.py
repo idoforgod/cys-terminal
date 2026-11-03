@@ -11,13 +11,14 @@
     python3 javis_memory.py add --type feedback --name <kebab-slug> \
         --desc "<한 줄 요약>" --body "<사실 본문>"        # 증류 1건 (원자적)
     python3 javis_memory.py verify [--json] [--desc-strict]  # 색인↔파일 정합 + 훅↔description 대조
-    python3 javis_memory.py update --name <slug> [--desc "..."] [--body "..."]  # 갱신(원자적·롤백)
+    python3 javis_memory.py update --name <slug> [--desc "..."] [--body "..."] [--keep-desc]  # 갱신(원자적·롤백)
+                                                           # --body 는 --desc 또는 --keep-desc 없이 거부(exit 2)
     python3 javis_memory.py recent --minutes 1440 [--json] # 최근 증류 목록 (게이트 증거)
     python3 javis_memory.py --self-test                    # 결정론 자기검증 (preflight C18)
 
 공통 옵션: --dir <memory 디렉터리> (기본: $CYS_PACK_DIR/memory 또는 ~/.cys/pack/memory)
 
-종료 코드: 0 성공/정합 · 1 검증 실패 또는 self-test 실패 · 2 인자/입력 오류 · 3 잠금 실패
+종료 코드: 0 성공/정합 · 1 검증 실패 또는 self-test 실패 · 2 인자/입력 오류 · 3 잠금 또는 쓰기 실패
 의존성: 파이썬 표준 라이브러리만 (네트워크·LLM 호출 없음).
 """
 
@@ -63,6 +64,7 @@ VALID_OUTCOMES = ("success", "failure", "neutral")  # ⑥ V사례 — feedback�
 BLOAT_BYTES = 6144  # 단일 사실 메모리 비대 임계 — 초과 시 분할 후보(health·audit가 리포트만)
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 INDEX_FILE = "MEMORY.md"
+UPDATE_LOG = ".update-log.jsonl"  # dot-named and not .md: memory_files() and every *.md glob skip it
 INDEX_LINK_RE = re.compile(r"\]\(([^)\s]+\.md)\)")
 HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
 FENCED_CODE_RE = re.compile(r"```.*?```", re.S)
@@ -464,50 +466,75 @@ def _replace_index_hook(index_text, fn, desc):
     return "\n".join(out), changed
 
 
+def _log_keep_desc(mdir, fn):
+    """One row per attempted use of --keep-desc: which card, when, which seat. It lands before the card, so it proves
+    the attempt, not that the card changed. stdout is not a record, it is the channel that hid `index_updated: false`.
+    The store is fleet-shared, so the writer names itself; unset stays null, never guessed."""
+    row = {"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "file": fn, "event": "keep-desc-attempt",
+           "role": os.environ.get("CYS_ROLE") or None, "surface": os.environ.get("CYS_SURFACE_ID") or None}
+    with open(os.path.join(mdir, UPDATE_LOG), "a", encoding="utf-8", newline="\n") as f:
+        f.write(json.dumps(row) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
 def cmd_update(mdir, args):
     """★A7: 파일(frontmatter description·본문)과 색인 1줄을 **한 번에** 갱신한다.
 
     이 명령이 없어서 갱신은 늘 손편집이었고, 한쪽만 고쳐도 verify 가 못 잡았다(그 두 결함이
     같은 뿌리다). add 의 원자성 규약을 그대로 재사용한다 — 잠금 하에서 파일을 원자 교체하고,
-    **색인 쓰기가 실패하면 파일을 원상 복구**한다(부분 갱신 0)."""
+    **색인 쓰기가 실패하면 파일을 원상 복구**한다(부분 갱신 0).
+
+    A8: seats read the index, so a body changed under an old description is invisible to recall. --body is refused
+    unless --desc moves the description too or --keep-desc says it is deliberately unchanged. Refusing, not warning: a
+    warning fails in the passing direction. The opt-out exists so a typo fix is not blocked.
+
+    Everything is read inside the one lock, as cmd_add does. A card read before it can put back a description or a body
+    that another update has just written."""
     desc = getattr(args, "desc", None)
     body = getattr(args, "body", None)
+    keep_desc = getattr(args, "keep_desc", False)
     if desc is None and body is None:
         return fail(2, "--desc 또는 --body 중 최소 하나는 필요하다")
     if desc is not None and not desc.strip():
         return fail(2, "--desc 는 비울 수 없다")
     if body is not None and not body.strip():
         return fail(2, "--body 는 비울 수 없다")
+    if desc is not None and keep_desc:
+        return fail(2, "--desc 와 --keep-desc 는 함께 쓸 수 없다 — 아무것도 쓰지 않았다")
+    if body is not None and desc is None and not keep_desc:
+        return fail(2, "--body 만 주면 색인 설명이 옛 내용으로 남는다 — --desc 로 새 설명을 함께 주거나, "
+                       "설명이 그대로 맞으면 --keep-desc 를 명시하라. 아무것도 쓰지 않았다")
     index_path = os.path.join(mdir, INDEX_FILE)
     if not os.path.isfile(index_path):
         return fail(2, "%s 없음 — verify 로 정합부터 복구하라" % INDEX_FILE)
 
-    matches = []
-    for fn in memory_files(mdir):
-        text = open(os.path.join(mdir, fn), encoding="utf-8", errors="replace").read()
-        fm = parse_frontmatter(text)
-        if fm["name"] == args.name:
-            matches.append((fn, text))
-    if not matches:
-        return fail(2, "미등재 슬러그: %r — 파일 frontmatter 의 name 과 일치해야 한다" % args.name)
-    if len(matches) > 1:
-        return fail(2, "중복 슬러그: %r (%s) — verify 로 정합부터 복구하라"
-                    % (args.name, ", ".join(fn for fn, _ in matches)))
-    fn, old_text = matches[0]
-    fpath = os.path.join(mdir, fn)
-
-    new_text = old_text
-    if desc is not None:
-        new_text = _replace_fm_description(new_text, desc)
-        if new_text is None:
-            return fail(2, "%s: frontmatter 형식 불량 — description 줄을 찾지 못했다" % fn)
-    if body is not None:
-        new_text = _replace_body(new_text, body)
-        if new_text is None:
-            return fail(2, "%s: frontmatter 형식 불량 — 본문 경계를 찾지 못했다" % fn)
-
     try:
         with FileLock(index_path):
+            matches = []
+            for fn in memory_files(mdir):
+                text = open(os.path.join(mdir, fn), encoding="utf-8", errors="replace").read()
+                fm = parse_frontmatter(text)
+                if fm["name"] == args.name:
+                    matches.append((fn, text))
+            if not matches:
+                return fail(2, "미등재 슬러그: %r — 파일 frontmatter 의 name 과 일치해야 한다" % args.name)
+            if len(matches) > 1:
+                return fail(2, "중복 슬러그: %r (%s) — verify 로 정합부터 복구하라"
+                            % (args.name, ", ".join(fn for fn, _ in matches)))
+            fn, old_text = matches[0]
+            fpath = os.path.join(mdir, fn)
+
+            new_text = old_text
+            if desc is not None:
+                new_text = _replace_fm_description(new_text, desc)
+                if new_text is None:
+                    return fail(2, "%s: frontmatter 형식 불량 — description 줄을 찾지 못했다" % fn)
+            if body is not None:
+                new_text = _replace_body(new_text, body)
+                if new_text is None:
+                    return fail(2, "%s: frontmatter 형식 불량 — 본문 경계를 찾지 못했다" % fn)
+
             index_text = open(index_path, encoding="utf-8", errors="replace").read()
             new_index, changed = (index_text, 0)
             if desc is not None:
@@ -515,6 +542,12 @@ def cmd_update(mdir, args):
                 if changed != 1:
                     return fail(2, "색인 항목이 %d 건 — %s 는 정확히 1건이어야 한다"
                                    "(verify 로 정합부터 복구하라)" % (changed, fn))
+            if keep_desc:           # before the write, so the opt-out cannot be used without leaving its row
+                try:
+                    _log_keep_desc(mdir, fn)
+                except OSError as e:
+                    return fail(3, "--keep-desc 시도 기록 실패 — 카드와 색인은 갱신하지 않았다"
+                                   "(기록 줄은 남았을 수 있다): %s" % e)
             _write_text_atomic(fpath, new_text)
             if desc is not None:
                 try:
@@ -528,11 +561,13 @@ def cmd_update(mdir, args):
     except TimeoutError as e:
         return fail(3, str(e))
 
-    print(json.dumps({"updated": fn,
-                      "fields": [k for k, v in (("description", desc), ("body", body))
-                                 if v is not None],
-                      "index_updated": desc is not None},
-                     ensure_ascii=False))
+    out = {"updated": fn,
+           "fields": [k for k, v in (("description", desc), ("body", body))
+                      if v is not None],
+           "index_updated": desc is not None}
+    if keep_desc:
+        out["keep_desc"] = True
+    print(json.dumps(out, ensure_ascii=False))
     return 0
 
 
@@ -951,7 +986,9 @@ def main():
     u = sub.add_parser("update", help="기존 증류 1건 갱신 — 파일 + 색인 1줄 (원자적·롤백)")
     u.add_argument("--name", required=True, help="kebab 슬러그(파일 frontmatter 의 name)")
     u.add_argument("--desc", default=None, help="새 한 줄 요약(파일 description + 색인 훅 동시 갱신)")
-    u.add_argument("--body", default=None, help="새 본문(frontmatter 는 보존)")
+    u.add_argument("--body", default=None, help="새 본문(frontmatter 는 보존) — --desc 또는 --keep-desc 필수")
+    u.add_argument("--keep-desc", action="store_true",
+                   help="설명이 그대로 맞다고 명시하고 본문만 고친다(시도 기록이 %s 에 남는다)" % UPDATE_LOG)
 
     r = sub.add_parser("recent", help="최근 N분 내 증류 목록 (게이트 증거)")
     r.add_argument("--minutes", type=int, default=1440)
