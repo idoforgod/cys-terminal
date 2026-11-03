@@ -1354,6 +1354,9 @@ struct TailState {
     /// 휴리스틱 매핑 여부 — true면 REDISCOVER_SECS마다 재발견 (등록 매핑은 고정)
     heuristic: bool,
     last_discovery: f64,
+    /// P11(0.14.57): 현재 핀이 좌석 본체 codex 프로세스의 쓰기 가능 `cli` rollout 으로 증명됐는가(R3 활성 스킵용).
+    #[cfg(not(windows))]
+    proven: bool,
     /// statusline이 준 서버 진실 컨텍스트 창 — statusline이 끊긴 뒤 트랜스크립트 폴백의
     /// 200k 하드코딩 추정(1M 세션 5배 과대→임계 조기오발)을 교정한다(전수조사 B-5).
     server_ctx_window: Option<u64>,
@@ -1376,7 +1379,17 @@ impl TailState {
             Some(o) if o <= len => o,
             _ => len.saturating_sub(FIRST_ATTACH_TAIL),
         };
-        TailState { path, offset, carry: String::new(), heuristic, last_discovery: now, server_ctx_window: None, codex_model: None }
+        TailState {
+            path,
+            offset,
+            carry: String::new(),
+            heuristic,
+            last_discovery: now,
+            #[cfg(not(windows))]
+            proven: false,
+            server_ctx_window: None,
+            codex_model: None,
+        }
     }
 }
 
@@ -1458,6 +1471,9 @@ fn collect_for(
 ) {
     let registered = s.registered_transcript.lock().unwrap().clone();
     let now = now_epoch();
+    #[cfg(not(windows))]
+    #[cfg(test)]
+    let now = p11_now_seam::get().unwrap_or(now);
 
     // T5 Phase 2-A 우선순위 병합 — claude는 statusline 보고(rate limit + 서버 진실 ctx)가
     // 신선하면 트랜스크립트 tail이 ctx만 덮어써 rate를 유실시키지 않도록 **관측 스냅샷만** 건너뛴다.
@@ -2188,6 +2204,109 @@ fn rollout_first_line_cwd(path: &Path) -> Option<String> {
         .as_str()
         .or_else(|| v["cwd"].as_str())
         .map(|s| s.to_string())
+}
+
+/// P11(0.14.57) §3.3: codex rollout 첫 줄(`session_meta`)의 `payload.source` 문자열 판독.
+#[cfg(not(windows))]
+pub(crate) fn rollout_first_line_source(path: &Path) -> Option<String> {
+    let f = std::fs::File::open(path).ok()?;
+    let mut line = String::new();
+    std::io::BufReader::new(f).read_line(&mut line).ok()?;
+    let v: Value = serde_json::from_str(&line).ok()?;
+    v["payload"]["source"].as_str().map(|s| s.to_string())
+}
+
+/// P11(0.14.57) §3.2: 순수 프로세스 표 `(pid, parent_pid, os_name, start_time)` 에서 적격 에이전트 프로세스 해소(Commit 1: 구 동작).
+#[cfg(not(windows))]
+pub(crate) fn p11_resolve_eligible_from_table(
+    rows: &[(u32, Option<u32>, &str, u64)],
+    root_pid: u32,
+    bin_base: &str,
+) -> Option<(u32, u64, String)> {
+    for &(pid, ppid, name, start) in rows {
+        if ppid == Some(root_pid) && name == bin_base {
+            return Some((pid, start, name.to_string()));
+        }
+    }
+    None
+}
+
+/// P11(0.14.57) §3.3: lsof 호출 전후 프로세스 신원 비교(Commit 1: 구 동작 — pid 만 비교).
+#[cfg(not(windows))]
+pub(crate) fn p11_same_process_identity(
+    before: (u32, u64, &str),
+    after: Option<(u32, u64, &str)>,
+) -> bool {
+    after.is_some_and(|(p, _, _)| p == before.0)
+}
+
+/// P11(0.14.57) §3.3: codex lsof 인자(Commit 1: 구 동작 `-p <pid> -Fn`).
+#[cfg(not(windows))]
+pub(crate) fn p11_codex_lsof_args(pid: u32) -> Vec<String> {
+    vec!["-p".to_string(), pid.to_string(), "-Fn".to_string()]
+}
+
+/// P11(0.14.57) §3.3: `lsof` 출력 파서(Commit 1: 구 동작 — `n` 접두 첫 매치).
+#[cfg(not(windows))]
+pub(crate) fn p11_parse_lsof_fan(stdout: &str) -> Vec<PathBuf> {
+    stdout
+        .lines()
+        .filter_map(|l| l.strip_prefix('n'))
+        .filter(|p| p.contains("/sessions/") && p.contains("rollout-") && p.ends_with(".jsonl"))
+        .map(PathBuf::from)
+        .collect()
+}
+
+/// P11(0.14.57) §3.3: 후보 중 선택(Commit 1: 구 동작 — lsof 순서 첫 항목).
+#[cfg(not(windows))]
+pub(crate) fn p11_pick_proven_rollout(lsof_stdout: &str) -> Option<PathBuf> {
+    p11_parse_lsof_fan(lsof_stdout).into_iter().next()
+}
+
+/// P11(0.14.57) §3.2–§3.3: 적격 codex 프로세스 소유 증명 발견(Commit 1: 구 동작).
+#[cfg(not(windows))]
+#[allow(dead_code)]
+fn discover_codex_rollout_proven(surface_pid: u32, bin: &str) -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(override_res) = p11_proof_seam::get() {
+        return override_res;
+    }
+    let bin_base = bin.rsplit(['/', '\\']).next().unwrap_or(bin);
+    let (agent_pid, _) = find_agent_descendant(surface_pid, bin_base);
+    agent_pid.and_then(discover_codex_rollout_lsof)
+}
+
+/// P11(0.14.57) 테스트 전용 시계 이음매 — `collect_for` 의 `now` 를 이 스레드에서만 고정한다.
+#[cfg(not(windows))]
+#[cfg(test)]
+pub(crate) mod p11_now_seam {
+    use std::cell::Cell;
+    thread_local! {
+        static OVERRIDE: Cell<Option<f64>> = const { Cell::new(None) };
+    }
+    pub(crate) fn set(v: Option<f64>) {
+        OVERRIDE.with(|c| c.set(v));
+    }
+    pub(crate) fn get() -> Option<f64> {
+        OVERRIDE.with(|c| c.get())
+    }
+}
+
+/// P11(0.14.57) 테스트 전용 증명 이음매 — `discover_codex_rollout_proven` 결과를 이 스레드에서만 대체한다.
+#[cfg(not(windows))]
+#[cfg(test)]
+pub(crate) mod p11_proof_seam {
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+    thread_local! {
+        static OVERRIDE: RefCell<Option<Option<PathBuf>>> = const { RefCell::new(None) };
+    }
+    pub(crate) fn set(v: Option<Option<PathBuf>>) {
+        OVERRIDE.with(|c| *c.borrow_mut() = v);
+    }
+    pub(crate) fn get() -> Option<Option<PathBuf>> {
+        OVERRIDE.with(|c| c.borrow().clone())
+    }
 }
 
 /// (4a) 트랜스크립트 경로에서 agent transcript session_id 추출. claude=파일명 stem, codex=첫줄 payload.id.
@@ -3728,6 +3847,8 @@ mod tests {
             carry: String::new(),
             heuristic: false,
             last_discovery: 0.0,
+            #[cfg(not(windows))]
+            proven: false,
             server_ctx_window: None,
             codex_model: None,
         };
@@ -4070,6 +4191,1094 @@ mod tests {
         let rows = crate::accounts::local_json(&d, now_epoch());
         let agy = rows.as_array().unwrap().iter().find(|r| r["provider"] == "antigravity").cloned().unwrap();
         assert_eq!(agy["source_error"], json!(AGY_ERR_STATUSLINE_REQUIRED), "{agy}");
+    }
+
+    // ───────── P11 (0.14.57) — codex heuristic rollout rediscovery (DESIGN-P11-r3) ─────────
+
+    #[cfg(not(windows))]
+    struct P11SeamGuard;
+
+    #[cfg(not(windows))]
+    impl Drop for P11SeamGuard {
+        fn drop(&mut self) {
+            super::p11_now_seam::set(None);
+            super::p11_proof_seam::set(None);
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn p11_collect_for_at(
+        daemon: &Arc<Daemon>,
+        s: &Arc<Surface>,
+        agent: &str,
+        bin: &str,
+        tails: &mut HashMap<u64, TailState>,
+        attempts: &mut HashMap<u64, f64>,
+        now: f64,
+    ) {
+        let _g = P11SeamGuard;
+        super::p11_now_seam::set(Some(now));
+        collect_for(daemon, s, agent, bin, tails, attempts);
+    }
+
+    #[cfg(not(windows))]
+    fn p11_make_seat(
+        d: &Arc<Daemon>,
+        cwd: &Path,
+        agent: &str,
+        bin: &str,
+        root_pid: u32,
+        created_at: f64,
+    ) -> Arc<Surface> {
+        let s = d
+            .create_surface(
+                Some(cwd.to_string_lossy().into_owned()),
+                Some("true".into()),
+                None,
+                Some("p11-seat".into()),
+                24,
+                80,
+            )
+            .expect("create surface");
+        let surf = unsafe { &mut *(Arc::as_ptr(&s) as *mut Surface) };
+        surf.pid = root_pid;
+        surf.created_at = created_at;
+        *s.agent_meta.lock().unwrap() = Some((agent.into(), bin.into()));
+        s
+    }
+
+    #[cfg(not(windows))]
+    fn p11_write_rollout(
+        sessions_dir: &Path,
+        name: &str,
+        cwd: &str,
+        source_json: Option<&str>,
+        mtime_secs: u64,
+    ) -> PathBuf {
+        std::fs::create_dir_all(sessions_dir).unwrap();
+        let p = sessions_dir.join(name);
+        let content = match source_json {
+            Some("UNPARSABLE") => "not-valid-json\n".to_string(),
+            Some(src) => format!(
+                "{{\"timestamp\":\"2026-11-03T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{name}\",\"cwd\":\"{cwd}\",\"source\":{src}}}}}\n"
+            ),
+            None => format!(
+                "{{\"timestamp\":\"2026-11-03T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{name}\",\"cwd\":\"{cwd}\"}}}}\n"
+            ),
+        };
+        std::fs::write(&p, content).unwrap();
+        let stamp = std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime_secs);
+        std::fs::File::options()
+            .write(true)
+            .open(&p)
+            .unwrap()
+            .set_modified(stamp)
+            .unwrap();
+        std::fs::canonicalize(&p).unwrap_or(p)
+    }
+
+    #[cfg(not(windows))]
+    fn p11_child_helper_entry() {
+        use std::io::{BufRead, Read, Write};
+        let _rw = std::env::var_os("CYS_P11_HOLD_RW").map(|p| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(p)
+                .expect("open CYS_P11_HOLD_RW")
+        });
+        let _ro = std::env::var_os("CYS_P11_HOLD_RO").map(|p| {
+            std::fs::File::open(p).expect("open CYS_P11_HOLD_RO")
+        });
+        let mut nested = std::env::var_os("CYS_P11_NESTED_RW").map(|nested_path| {
+            let exe = std::env::current_exe().expect("current_exe");
+            let filter = std::env::var("CYS_P11_HELPER_FILTER")
+                .unwrap_or_else(|_| "usage::tests::p11_".to_string());
+            let mut child = std::process::Command::new(exe)
+                .args([filter.as_str(), "--test-threads=1", "--nocapture"])
+                .env("CYS_P11_HELPER_MODE", "1")
+                .env("CYS_P11_HOLD_RW", nested_path)
+                .env_remove("CYS_P11_HOLD_RO")
+                .env_remove("CYS_P11_NESTED_RW")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn nested fake native");
+            let stdout = child.stdout.take().expect("nested stdout");
+            let mut reader = std::io::BufReader::new(stdout);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let n = reader.read_line(&mut line).expect("read nested stdout");
+                assert!(n > 0, "nested fake native exited before P11_HELPER_READY");
+                if line.contains("P11_HELPER_READY") {
+                    break;
+                }
+            }
+            child
+        });
+        let mut out = std::io::stdout();
+        let _ = writeln!(out, "P11_HELPER_READY");
+        let _ = out.flush();
+        let mut buf = [0u8; 1];
+        let _ = std::io::stdin().read(&mut buf);
+        if let Some(mut ch) = nested.take() {
+            let _ = ch.kill();
+            let _ = ch.wait();
+        }
+    }
+
+    #[cfg(not(windows))]
+    struct P11FakeNative {
+        bin_base: String,
+        bin_path: PathBuf,
+        child: std::process::Child,
+    }
+
+    #[cfg(not(windows))]
+    impl P11FakeNative {
+        fn spawn(
+            dir: &Path,
+            tag: &str,
+            filter: &str,
+            hold_rw: Option<&Path>,
+            hold_ro: Option<&Path>,
+            nested_rw: Option<&Path>,
+        ) -> Self {
+            use std::io::BufRead;
+            std::fs::create_dir_all(dir).unwrap();
+            let bin_base = format!("codex-p11-{tag}");
+            assert!(
+                bin_base.len() <= 15,
+                "Linux TASK_COMM_LEN(15) 초과 방지: {bin_base}"
+            );
+            let bin_path = dir.join(&bin_base);
+            let _ = std::fs::remove_file(&bin_path);
+            let exe = std::env::current_exe().expect("current_exe");
+            std::fs::hard_link(&exe, &bin_path)
+                .or_else(|_| std::fs::copy(&exe, &bin_path).map(|_| ()))
+                .expect("stage fake native binary");
+            let mut cmd = std::process::Command::new(&bin_path);
+            cmd.args([filter, "--test-threads=1", "--nocapture"])
+                .env("CYS_P11_HELPER_MODE", "1")
+                .env("CYS_P11_HELPER_FILTER", filter)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null());
+            if let Some(p) = hold_rw {
+                cmd.env("CYS_P11_HOLD_RW", p);
+            } else {
+                cmd.env_remove("CYS_P11_HOLD_RW");
+            }
+            if let Some(p) = hold_ro {
+                cmd.env("CYS_P11_HOLD_RO", p);
+            } else {
+                cmd.env_remove("CYS_P11_HOLD_RO");
+            }
+            if let Some(p) = nested_rw {
+                cmd.env("CYS_P11_NESTED_RW", p);
+            } else {
+                cmd.env_remove("CYS_P11_NESTED_RW");
+            }
+            let mut child = cmd.spawn().expect("spawn fake native");
+            let stdout = child.stdout.take().expect("fake native stdout");
+            let mut reader = std::io::BufReader::new(stdout);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let n = reader.read_line(&mut line).expect("read fake native stdout");
+                assert!(n > 0, "fake native exited before P11_HELPER_READY");
+                if line.contains("P11_HELPER_READY") {
+                    break;
+                }
+            }
+            Self {
+                bin_base,
+                bin_path,
+                child,
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    impl Drop for P11FakeNative {
+        fn drop(&mut self) {
+            drop(self.child.stdin.take());
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = std::fs::remove_file(&self.bin_path);
+        }
+    }
+
+    /// T1 (DESIGN-P11-r3 §3.1 R1, old-byte RED on Unix): 발견을 수행하지 않은 틱에서는 codex 휴리스틱 핀의
+    /// `last_discovery` 시계가 움직이지 않아야 한다(M1 차단).
+    #[cfg(not(windows))]
+    #[test]
+    fn p11_t1_clock_does_not_move_on_a_tick_that_did_not_discover() {
+        let td = std::env::temp_dir().join(format!("cys-p11-t1-{}", std::process::id()));
+        let sessions = td.join("sessions");
+        let now = 1_700_000_000.0;
+        let pin_a = p11_write_rollout(
+            &sessions,
+            "rollout-2026-11-03T00-00-00-a.jsonl",
+            "/work/p11",
+            Some("\"cli\""),
+            1_700_000_000,
+        );
+        let d = tick_daemon("p11-t1");
+        let s = p11_make_seat(&d, &td, "codex", "codex", std::process::id(), now - 3600.0);
+        let mut tails = HashMap::new();
+        let mut attempts = HashMap::new();
+        let mut st = TailState::attach(&d, pin_a.clone(), true, now - 10.0);
+        st.proven = false;
+        tails.insert(s.id, st);
+
+        p11_collect_for_at(&d, &s, "codex", "codex", &mut tails, &mut attempts, now);
+
+        assert_eq!(
+            tails[&s.id].last_discovery,
+            now - 10.0,
+            "비발견 틱에서 codex 휴리스틱 핀의 last_discovery 가 갱신되어 30초 주기가 영구 리셋됐다(R1 위반)"
+        );
+        assert!(attempts.is_empty(), "비발견 틱은 attempts 를 기록하지 않는다");
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// T1w (DESIGN-P11-r3 §3.6 & §5, Windows guard): Windows 빌드는 0.14.57 에서 종전 동작(비발견 틱 시계 갱신 +
+    /// B6 강제 틱 발견 실행)을 그대로 유지한다.
+    #[cfg(windows)]
+    #[test]
+    fn p11_t1w_windows_keeps_clock_write_and_b6_rediscovery() {
+        let td = std::env::temp_dir().join(format!("cys-p11-t1w-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&td);
+        let pin_a = td.join("rollout-2026-11-03T00-00-00-a.jsonl");
+        std::fs::write(
+            &pin_a,
+            r#"{"timestamp":"t","type":"session_meta","payload":{"id":"a","cwd":"C:\\work","source":"cli"}}"#,
+        )
+        .unwrap();
+        let d = tick_daemon("p11-t1w");
+        let s = d
+            .create_surface(None, None, None, Some("p11-win".into()), 24, 80)
+            .expect("create surface");
+        *s.agent_meta.lock().unwrap() = Some(("codex".into(), "codex".into()));
+        let before = now_epoch() - 10.0;
+        let mut tails = HashMap::new();
+        let mut attempts = HashMap::new();
+        tails.insert(s.id, TailState::attach(&d, pin_a.clone(), true, before));
+
+        // (a) 비발견 틱: Windows 는 종전처럼 last_discovery 를 현재 시각으로 갱신한다.
+        collect_for(&d, &s, "codex", "codex", &mut tails, &mut attempts);
+        assert!(
+            tails[&s.id].last_discovery > before + 5.0,
+            "Windows 비발견 틱에서 종전 시계 갱신이 사라졌다"
+        );
+        assert!(attempts.is_empty(), "비발견 틱에서는 attempts 기록 없음");
+
+        // (b) B6 강제 틱(last_discovery = 0.0): 종전 발견 경로를 실행해 attempts 를 기록하고 시계를 복구한다.
+        tails.get_mut(&s.id).unwrap().last_discovery = 0.0;
+        collect_for(&d, &s, "codex", "codex", &mut tails, &mut attempts);
+        assert!(
+            attempts.contains_key(&s.id),
+            "Windows B6 강제 틱이 종전 발견 경로를 실행하지 않았다"
+        );
+        assert!(tails[&s.id].last_discovery > 0.0);
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// T2 (DESIGN-P11-r3 §3.1–§3.4, live process): `/new` 뒤 적격 본체 프로세스가 새 `"source":"cli"` rollout 을
+    /// 쓰기 가능(`u`)으로 쥐고 있으면 주기 재발견에서 새 파일로 전환하고 `proven = true` 가 된다(M1 차단).
+    #[cfg(not(windows))]
+    #[test]
+    fn p11_t2_stale_pin_moves_after_new() {
+        if std::env::var_os("CYS_P11_HELPER_MODE").is_some() {
+            p11_child_helper_entry();
+            return;
+        }
+        let td = std::env::temp_dir().join(format!("cys-p11-t2-{}", std::process::id()));
+        let sessions = td.join("sessions");
+        let t0 = 1_700_000_100.0;
+        let pin_a = p11_write_rollout(
+            &sessions,
+            "rollout-2026-11-03T01-00-00-a.jsonl",
+            "/work/p11",
+            Some("\"cli\""),
+            1_700_000_010,
+        );
+        // 서브에이전트 파일이 더 낮은 fd(읽기 전용 또는 subagent source)로 열려 있어도 본체 cli B 만 선택해야 한다.
+        let sub_s = p11_write_rollout(
+            &sessions,
+            "rollout-2026-11-03T01-30-00-sub.jsonl",
+            "/work/p11",
+            Some("{\"subagent\":{\"thread_spawn\":{\"parent_thread_id\":\"a\"}}}"),
+            1_700_000_090,
+        );
+        let pin_b = p11_write_rollout(
+            &sessions,
+            "rollout-2026-11-03T02-00-00-b.jsonl",
+            "/work/p11",
+            Some("\"cli\""),
+            1_700_000_050,
+        );
+        let holder = P11FakeNative::spawn(
+            &td,
+            "t2",
+            "usage::tests::p11_t2_stale_pin_moves_after_new",
+            Some(&pin_b),
+            Some(&sub_s),
+            None,
+        );
+        let d = tick_daemon("p11-t2");
+        let s = p11_make_seat(
+            &d,
+            &td,
+            "codex",
+            &holder.bin_base,
+            std::process::id(),
+            t0 - 3600.0,
+        );
+        let mut tails = HashMap::new();
+        let mut attempts = HashMap::new();
+        tails.insert(s.id, TailState::attach(&d, pin_a.clone(), true, t0 - 10.0));
+
+        // 1틱(t0, 경과 10초 ≤ 30초): 아직 주기 전 — A 유지, 시계 유지.
+        p11_collect_for_at(&d, &s, "codex", &holder.bin_base, &mut tails, &mut attempts, t0);
+        assert_eq!(tails[&s.id].path, pin_a);
+        assert_eq!(tails[&s.id].last_discovery, t0 - 10.0);
+
+        // 2틱(t0 + 25초, 최초 발견 대비 35초 > 30초): 주기 재발견 발동 → B 전환 + proven=true.
+        p11_collect_for_at(
+            &d,
+            &s,
+            "codex",
+            &holder.bin_base,
+            &mut tails,
+            &mut attempts,
+            t0 + 25.0,
+        );
+        assert_eq!(
+            tails[&s.id].path,
+            pin_b,
+            "주기 재발견이 적격 프로세스의 쓰기 가능 cli rollout B 로 전환하지 못했다"
+        );
+        assert!(tails[&s.id].proven, "증명 전환 뒤 proven=true 여야 한다");
+
+        drop(holder);
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// T3 (DESIGN-P11-r3 §3.3–§3.4, guard): 적격 프로세스가 쓰기 가능으로 쥐지 않은 최신 외래 파일은
+    /// 주기 재발견에서 절대 채택되지 않는다(M4·M8 차단).
+    #[cfg(not(windows))]
+    #[test]
+    fn p11_t3_foreign_newer_file_never_adopted() {
+        if std::env::var_os("CYS_P11_HELPER_MODE").is_some() {
+            p11_child_helper_entry();
+            return;
+        }
+        let td = std::env::temp_dir().join(format!("cys-p11-t3-{}", std::process::id()));
+        let sessions = td.join("sessions");
+        let t0 = 1_700_000_200.0;
+        let pin_a = p11_write_rollout(
+            &sessions,
+            "rollout-2026-11-03T01-00-00-a.jsonl",
+            "/work/p11",
+            Some("\"cli\""),
+            1_700_000_010,
+        );
+        let foreign_f = p11_write_rollout(
+            &sessions,
+            "rollout-2026-11-03T02-00-00-foreign.jsonl",
+            "/work/p11",
+            Some("\"cli\""),
+            1_700_000_190,
+        );
+        let holder = P11FakeNative::spawn(
+            &td,
+            "t3",
+            "usage::tests::p11_t3_foreign_newer_file_never_adopted",
+            Some(&pin_a),
+            Some(&foreign_f),
+            None,
+        );
+        let d = tick_daemon("p11-t3");
+        let s = p11_make_seat(
+            &d,
+            &td,
+            "codex",
+            &holder.bin_base,
+            std::process::id(),
+            t0 - 3600.0,
+        );
+        let mut tails = HashMap::new();
+        let mut attempts = HashMap::new();
+        tails.insert(s.id, TailState::attach(&d, pin_a.clone(), true, t0 - 35.0));
+
+        p11_collect_for_at(&d, &s, "codex", &holder.bin_base, &mut tails, &mut attempts, t0);
+        assert_eq!(
+            tails[&s.id].path,
+            pin_a,
+            "쓰기 가능으로 쥐지 않은 최신 외래 파일이 채택됐다"
+        );
+
+        drop(holder);
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// T4 (DESIGN-P11-r3 §3, guard): 등록 매핑(`registered_transcript`)은 발견 시도를 0회 수행하고 경로를 유지한다.
+    #[cfg(not(windows))]
+    #[test]
+    fn p11_t4_registered_mapping_makes_zero_discovery_attempts() {
+        let td = std::env::temp_dir().join(format!("cys-p11-t4-{}", std::process::id()));
+        let sessions = td.join("sessions");
+        let t0 = 1_700_000_300.0;
+        let reg = p11_write_rollout(
+            &sessions,
+            "rollout-2026-11-03T01-00-00-reg.jsonl",
+            "/work/p11",
+            Some("\"cli\""),
+            1_700_000_010,
+        );
+        let d = tick_daemon("p11-t4");
+        let s = p11_make_seat(&d, &td, "codex", "codex", std::process::id(), t0 - 3600.0);
+        *s.registered_transcript.lock().unwrap() = Some(reg.to_string_lossy().into_owned());
+        let mut tails = HashMap::new();
+        let mut attempts = HashMap::new();
+
+        for dt in [0.0, 35.0, 1000.0] {
+            p11_collect_for_at(&d, &s, "codex", "codex", &mut tails, &mut attempts, t0 + dt);
+            assert!(attempts.is_empty(), "등록 매핑이 재발견을 시도했다(dt={dt})");
+            assert_eq!(tails[&s.id].path, reg);
+            assert!(!tails[&s.id].heuristic);
+        }
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// T5 (DESIGN-P11-r3 §3.3 & §5, pure picker): 쓰기 가능(`u`/`w`)하고 첫 줄 `payload.source == "cli"` 인
+    /// 파일만 통과하며, 서브에이전트(낮은 fd)·`vscode`·`exec`·`source` 누락·파싱 불능·읽기 전용(`r`)은 배제되고,
+    /// 복수 적격 시 mtime 최신(동률 시 파일명 최신)이 선택된다(M2·M3·M8 차단).
+    #[cfg(not(windows))]
+    #[test]
+    fn p11_t5_picker_selects_newest_writable_cli_rollout_only() {
+        let td = std::env::temp_dir().join(format!("cys-p11-t5-{}", std::process::id()));
+        let sessions = td.join("sessions");
+        let sub = p11_write_rollout(
+            &sessions,
+            "rollout-2026-11-03T09-00-00-sub.jsonl",
+            "/work/p11",
+            Some("{\"subagent\":{\"thread_spawn\":{\"parent_thread_id\":\"m\"}}}"),
+            1_700_000_900,
+        );
+        let vsc = p11_write_rollout(
+            &sessions,
+            "rollout-2026-11-03T08-00-00-vsc.jsonl",
+            "/work/p11",
+            Some("\"vscode\""),
+            1_700_000_800,
+        );
+        let exc = p11_write_rollout(
+            &sessions,
+            "rollout-2026-11-03T07-00-00-exec.jsonl",
+            "/work/p11",
+            Some("\"exec\""),
+            1_700_000_700,
+        );
+        let no_src = p11_write_rollout(
+            &sessions,
+            "rollout-2026-11-03T06-00-00-nosrc.jsonl",
+            "/work/p11",
+            None,
+            1_700_000_600,
+        );
+        let bad = p11_write_rollout(
+            &sessions,
+            "rollout-2026-11-03T05-00-00-bad.jsonl",
+            "/work/p11",
+            Some("UNPARSABLE"),
+            1_700_000_500,
+        );
+        let ro_cli = p11_write_rollout(
+            &sessions,
+            "rollout-2026-11-03T04-00-00-ro.jsonl",
+            "/work/p11",
+            Some("\"cli\""),
+            1_700_000_400,
+        );
+        let cli_old = p11_write_rollout(
+            &sessions,
+            "rollout-2026-11-03T01-00-00-old.jsonl",
+            "/work/p11",
+            Some("\"cli\""),
+            1_700_000_100,
+        );
+        let cli_new = p11_write_rollout(
+            &sessions,
+            "rollout-2026-11-03T02-00-00-new.jsonl",
+            "/work/p11",
+            Some("\"cli\""),
+            1_700_000_200,
+        );
+
+        let lsof_stream = format!(
+            "p100\n\
+             f10\nau\nn{}\n\
+             f11\nau\nn{}\n\
+             f12\nau\nn{}\n\
+             f13\nau\nn{}\n\
+             f14\nau\nn{}\n\
+             f15\nar\nn{}\n\
+             f16\nau\nn{}\n\
+             f17\naw\nn{}\n",
+            sub.display(),
+            vsc.display(),
+            exc.display(),
+            no_src.display(),
+            bad.display(),
+            ro_cli.display(),
+            cli_old.display(),
+            cli_new.display(),
+        );
+        assert_eq!(
+            super::p11_pick_proven_rollout(&lsof_stream),
+            Some(cli_new.clone()),
+            "서브에이전트/vscode/exec/무source/파싱불능/읽기전용/구버전을 제치고 최신 쓰기 가능 cli 를 골라야 한다"
+        );
+
+        // mtime 동률 시 파일명 사전순 최신 선택 확인
+        let tie_a = p11_write_rollout(
+            &sessions,
+            "rollout-2026-11-03T03-00-00-a.jsonl",
+            "/work/p11",
+            Some("\"cli\""),
+            1_700_000_300,
+        );
+        let tie_b = p11_write_rollout(
+            &sessions,
+            "rollout-2026-11-03T03-00-00-b.jsonl",
+            "/work/p11",
+            Some("\"cli\""),
+            1_700_000_300,
+        );
+        let tie_stream = format!(
+            "p100\nf20\nau\nn{}\nf21\nau\nn{}\n",
+            tie_b.display(),
+            tie_a.display()
+        );
+        assert_eq!(
+            super::p11_pick_proven_rollout(&tie_stream),
+            Some(tie_b),
+            "mtime 동률이면 fd 순서와 무관하게 파일명 최신이 이겨야 한다"
+        );
+
+        // 비적격만 있으면 None
+        let none_stream = format!(
+            "p100\nf10\nau\nn{}\nf15\nar\nn{}\n",
+            sub.display(),
+            ro_cli.display()
+        );
+        assert_eq!(super::p11_pick_proven_rollout(&none_stream), None);
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// T6 (DESIGN-P11-r3 §5, sentinel pin): B6 신선도 가드의 두 분기(무신규줄 idle 전이 · 신규줄 판독 가드) 모두
+    /// `state.last_discovery = 0.0` 센티넬을 기록하고 `needs_rediscovery` 가 이를 강제 재발견으로 읽는다.
+    #[cfg(not(windows))]
+    #[test]
+    fn p11_t6_b6_sentinel_pin() {
+        let src = include_str!("usage.rs");
+        let body = src
+            .split("fn collect_for(")
+            .nth(1)
+            .expect("collect_for 소실");
+        assert_eq!(
+            body.matches("state.last_discovery = 0.0;").count(),
+            2,
+            "collect_for 의 두 B6 가드 분기(idle 전이 · 판독 가드)가 모두 state.last_discovery = 0.0 센티넬을 써야 한다"
+        );
+        assert!(needs_rediscovery(true, true, 1_700_000_000.0, 0.0));
+    }
+
+    /// T8 (DESIGN-P11-r3 §3.1, guard): `agent == "claude"` 휴리스틱 핀은 비발견 틱에서도 종전처럼
+    /// `last_discovery = now` 로 갱신한다(M5 차단).
+    #[cfg(not(windows))]
+    #[test]
+    fn p11_t8_claude_heuristic_clock_still_moves_on_non_discovery_tick() {
+        let td = std::env::temp_dir().join(format!("cys-p11-t8-{}", std::process::id()));
+        std::fs::create_dir_all(&td).unwrap();
+        let tr = td.join("claude-sess.jsonl");
+        std::fs::write(&tr, "{}\n").unwrap();
+        let now = 1_700_000_400.0;
+        let d = tick_daemon("p11-t8");
+        let s = p11_make_seat(&d, &td, "claude", "claude", std::process::id(), now - 3600.0);
+        let mut tails = HashMap::new();
+        let mut attempts = HashMap::new();
+        tails.insert(s.id, TailState::attach(&d, tr, true, now - 10.0));
+
+        p11_collect_for_at(&d, &s, "claude", "claude", &mut tails, &mut attempts, now);
+
+        assert_eq!(
+            tails[&s.id].last_discovery,
+            now,
+            "claude 휴리스틱 핀은 종전처럼 매 틱 last_discovery 가 갱신되어야 한다(S10 = OLD)"
+        );
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// T9 (DESIGN-P11-r3 §3.4 R3): 이미 증명된(`proven == true`) 핀의 mtime 이 `REDISCOVER_SECS` 이내로 살아있으면
+    /// 주기 도래 시에도 프로브(lsof)를 건너뛰고 핀과 시계를 그대로 유지한다(M6 차단).
+    #[cfg(not(windows))]
+    #[test]
+    fn p11_t9_proven_live_pin_skips_probe() {
+        let td = std::env::temp_dir().join(format!("cys-p11-t9-{}", std::process::id()));
+        let sessions = td.join("sessions");
+        let now = 1_700_000_500.0;
+        let pin_a = p11_write_rollout(
+            &sessions,
+            "rollout-2026-11-03T01-00-00-a.jsonl",
+            "/work/p11",
+            Some("\"cli\""),
+            1_700_000_490,
+        );
+        let pin_b = p11_write_rollout(
+            &sessions,
+            "rollout-2026-11-03T02-00-00-b.jsonl",
+            "/work/p11",
+            Some("\"cli\""),
+            1_700_000_499,
+        );
+        let d = tick_daemon("p11-t9");
+        let s = p11_make_seat(&d, &td, "codex", "codex", std::process::id(), now - 3600.0);
+        let mut tails = HashMap::new();
+        let mut attempts = HashMap::new();
+        let mut st = TailState::attach(&d, pin_a.clone(), true, now - 35.0);
+        st.proven = true;
+        tails.insert(s.id, st);
+
+        let _g = P11SeamGuard;
+        super::p11_proof_seam::set(Some(Some(pin_b)));
+        super::p11_now_seam::set(Some(now));
+        collect_for(&d, &s, "codex", "codex", &mut tails, &mut attempts);
+
+        assert_eq!(
+            tails[&s.id].path,
+            pin_a,
+            "살아있는 proven 핀에서 R3 스킵이 작동하지 않고 프로브가 실행됐다"
+        );
+        assert!(
+            attempts.is_empty(),
+            "R3 스킵 시에는 프로브 시도(attempts)가 기록되지 않아야 한다"
+        );
+        assert_eq!(
+            tails[&s.id].last_discovery,
+            now - 35.0,
+            "R3 스킵 시에는 last_discovery 시계가 움직이지 않는다"
+        );
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// T10 (DESIGN-P11-r3 §3.4 R2, S8F counterexample): B6 강제 틱(`last_discovery = 0.0`)에서 소유 증명이 없으면
+    /// 구 발견 경로(`discover_session_file`)로 폴백하지 않고 기존 핀을 유지한다(M7 차단).
+    #[cfg(not(windows))]
+    #[test]
+    fn p11_t10_b6_forced_tick_without_proof_keeps_pin() {
+        if std::env::var_os("CYS_P11_HELPER_MODE").is_some() {
+            p11_child_helper_entry();
+            return;
+        }
+        let td = std::env::temp_dir().join(format!("cys-p11-t10-{}", std::process::id()));
+        let sessions = td.join("sessions");
+        let now = 1_700_000_600.0;
+        let pin_a = p11_write_rollout(
+            &sessions,
+            "rollout-2026-11-03T01-00-00-a.jsonl",
+            "/work/p11",
+            Some("\"cli\""),
+            1_700_000_010,
+        );
+        // 구 discover_codex_rollout_lsof 는 읽기 전용(`r`) 외래 파일도 무분별 채택하지만, P11 증명은 거부한다.
+        let foreign_f = p11_write_rollout(
+            &sessions,
+            "rollout-2026-11-03T02-00-00-foreign.jsonl",
+            "/work/p11",
+            Some("\"cli\""),
+            1_700_000_595,
+        );
+        let holder = P11FakeNative::spawn(
+            &td,
+            "t10",
+            "usage::tests::p11_t10_b6_forced_tick_without_proof_keeps_pin",
+            None,
+            Some(&foreign_f),
+            None,
+        );
+        let d = tick_daemon("p11-t10");
+        let s = p11_make_seat(
+            &d,
+            &td,
+            "codex",
+            &holder.bin_base,
+            std::process::id(),
+            now - 3600.0,
+        );
+        let mut tails = HashMap::new();
+        let mut attempts = HashMap::new();
+        let mut st = TailState::attach(&d, pin_a.clone(), true, 0.0);
+        st.proven = false;
+        tails.insert(s.id, st);
+
+        p11_collect_for_at(&d, &s, "codex", &holder.bin_base, &mut tails, &mut attempts, now);
+
+        assert_eq!(
+            tails[&s.id].path,
+            pin_a,
+            "B6 강제 틱에서 증명 실패 시 맹목 폴백이 일어나 외래 파일 F 가 채택됐다(S8F 위반)"
+        );
+        assert!(!tails[&s.id].proven);
+        assert_eq!(tails[&s.id].last_discovery, now);
+
+        drop(holder);
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// T11 (DESIGN-P11-r3 §3.4 R2, S13 instrument error under sentinel): B6 센티넬(`last_discovery = 0.0`) 아래에서
+    /// 프로브 도구 오류가 나도 외래 파일로 폴백하지 않고 기존 핀을 유지한다(M7 차단).
+    #[cfg(not(windows))]
+    #[test]
+    fn p11_t11_instrument_error_under_sentinel_keeps_pin() {
+        if std::env::var_os("CYS_P11_HELPER_MODE").is_some() {
+            p11_child_helper_entry();
+            return;
+        }
+        let td = std::env::temp_dir().join(format!("cys-p11-t11-{}", std::process::id()));
+        let sessions = td.join("sessions");
+        let now = 1_700_000_700.0;
+        let pin_a = p11_write_rollout(
+            &sessions,
+            "rollout-2026-11-03T01-00-00-a.jsonl",
+            "/work/p11",
+            Some("\"cli\""),
+            1_700_000_010,
+        );
+        let foreign_f = p11_write_rollout(
+            &sessions,
+            "rollout-2026-11-03T02-00-00-foreign.jsonl",
+            "/work/p11",
+            Some("\"cli\""),
+            1_700_000_695,
+        );
+        let holder = P11FakeNative::spawn(
+            &td,
+            "t11",
+            "usage::tests::p11_t11_instrument_error_under_sentinel_keeps_pin",
+            None,
+            Some(&foreign_f),
+            None,
+        );
+        let d = tick_daemon("p11-t11");
+        let s = p11_make_seat(
+            &d,
+            &td,
+            "codex",
+            &holder.bin_base,
+            std::process::id(),
+            now - 3600.0,
+        );
+        let mut tails = HashMap::new();
+        let mut attempts = HashMap::new();
+        let mut st = TailState::attach(&d, pin_a.clone(), true, 0.0);
+        st.proven = true;
+        tails.insert(s.id, st);
+
+        let _g = P11SeamGuard;
+        super::p11_proof_seam::set(Some(None));
+        super::p11_now_seam::set(Some(now));
+        collect_for(&d, &s, "codex", &holder.bin_base, &mut tails, &mut attempts);
+
+        assert_eq!(
+            tails[&s.id].path,
+            pin_a,
+            "센티넬 아래 프로브 오류 시 외래 파일로 폴백해서는 안 된다(S13 위반)"
+        );
+        assert!(!tails[&s.id].proven, "증명 실패 시 제자리에서 proven=false 로 감쇠해야 한다");
+
+        drop(holder);
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// T12 (DESIGN-P11-r3 §3.2 & §4, pure resolver over E1–E11): 11개 프로세스 트리 전수에서
+    /// 최소 깊이 유일 정확 이름(`Process::name() == bin_base`, 하강 0회) 규칙을 검증한다(M10·M12·M13 차단).
+    #[cfg(not(windows))]
+    #[test]
+    fn p11_t12_eligible_process_resolver_trees() {
+        let s = 10u32;
+        let cases: &[(&str, &[(u32, Option<u32>, &str, u64)], Option<u32>)] = &[
+            ("E1 shell -> codex", &[(100, Some(s), "codex", 1000)], Some(100)),
+            (
+                "E2 codex 100 -> direct nested codex 101",
+                &[(100, Some(s), "codex", 1000), (101, Some(100), "codex", 1001)],
+                Some(100),
+            ),
+            (
+                "E3 nested codex under tool shell",
+                &[
+                    (100, Some(s), "codex", 1000),
+                    (200, Some(100), "bash", 1001),
+                    (102, Some(200), "codex", 1002),
+                ],
+                Some(100),
+            ),
+            (
+                "E4 npm spawn fallback: node -> codex",
+                &[(90, Some(s), "node", 1000), (100, Some(90), "codex", 1001)],
+                Some(100),
+            ),
+            (
+                "E5 two codex directly under shell",
+                &[(100, Some(s), "codex", 1000), (101, Some(s), "codex", 1001)],
+                None,
+            ),
+            (
+                "E6 helper and tool children under codex",
+                &[
+                    (100, Some(s), "codex", 1000),
+                    (300, Some(100), "SkyComputerUseSe", 1001),
+                    (301, Some(100), "python3", 1002),
+                ],
+                Some(100),
+            ),
+            ("E7 legacy pure-JS codex (no native)", &[(90, Some(s), "node", 1000)], None),
+            (
+                "E8 script wrapper first, codex at depth 2",
+                &[(80, Some(s), "script", 1000), (100, Some(80), "codex", 1001)],
+                Some(100),
+            ),
+            (
+                "E9 tool child listed before native",
+                &[(300, Some(s), "python3", 1000), (100, Some(s), "codex", 1001)],
+                Some(100),
+            ),
+            (
+                "E10 gemini S17: node -> codex 100 -> direct nested codex 101",
+                &[
+                    (90, Some(s), "node", 1000),
+                    (100, Some(90), "codex", 1001),
+                    (101, Some(100), "codex", 1002),
+                ],
+                Some(100),
+            ),
+            (
+                "E11 codex 100 with direct codex exec child 101",
+                &[(100, Some(s), "codex", 1000), (101, Some(100), "codex", 1001)],
+                Some(100),
+            ),
+        ];
+        for (name, rows, want) in cases {
+            let got = super::p11_resolve_eligible_from_table(rows, s, "codex").map(|(p, _, _)| p);
+            assert_eq!(got, *want, "트리 {name} 적격 프로세스 오판");
+        }
+    }
+
+    /// T13 (DESIGN-P11-r3 §3.3 & §3.4, S15 in-place promotion & decay): 최초 미증명(`proven=false`) 핀이
+    /// 같은 경로로 증명되면 제자리에서 `proven=true` 로 승격되어 이후 살아있는 동안 R3 로 프로브를 생략하며,
+    /// 이후 증명이 실패하면 제자리에서 `proven=false` 로 감쇠한다(M6·M9 차단).
+    #[cfg(not(windows))]
+    #[test]
+    fn p11_t13_in_place_promotion_and_decay() {
+        let td = std::env::temp_dir().join(format!("cys-p11-t13-{}", std::process::id()));
+        let sessions = td.join("sessions");
+        let t0 = 1_700_000_800.0;
+        let pin_a = p11_write_rollout(
+            &sessions,
+            "rollout-2026-11-03T01-00-00-a.jsonl",
+            "/work/p11",
+            Some("\"cli\""),
+            1_700_000_800,
+        );
+        let pin_b = p11_write_rollout(
+            &sessions,
+            "rollout-2026-11-03T02-00-00-b.jsonl",
+            "/work/p11",
+            Some("\"cli\""),
+            1_700_000_820,
+        );
+        let d = tick_daemon("p11-t13");
+        let s = p11_make_seat(&d, &td, "codex", "codex", std::process::id(), t0 - 3600.0);
+        let mut tails = HashMap::new();
+        let mut attempts = HashMap::new();
+        let mut st = TailState::attach(&d, pin_a.clone(), true, t0 - 35.0);
+        st.proven = false;
+        tails.insert(s.id, st);
+
+        let _g = P11SeamGuard;
+        // 1단계: 같은 경로 A 가 증명되면 제자리에서 proven=true 승격.
+        super::p11_proof_seam::set(Some(Some(pin_a.clone())));
+        super::p11_now_seam::set(Some(t0));
+        collect_for(&d, &s, "codex", "codex", &mut tails, &mut attempts);
+        assert_eq!(tails[&s.id].path, pin_a);
+        assert!(
+            tails[&s.id].proven,
+            "동일 경로 증명 뒤 proven 이 제자리에서 true 로 승격되지 않았다(GM-1 / S15 위반)"
+        );
+        assert_eq!(attempts.get(&s.id).copied(), Some(t0));
+
+        // 2단계: A 가 계속 쓰여 신선(mtime = t0 + 20)하면 t0 + 35 주기 도래 시 R3 가 프로브를 건너뛴다.
+        let stamp = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_820);
+        std::fs::File::options()
+            .write(true)
+            .open(&pin_a)
+            .unwrap()
+            .set_modified(stamp)
+            .unwrap();
+        super::p11_proof_seam::set(Some(Some(pin_b)));
+        super::p11_now_seam::set(Some(t0 + 35.0));
+        collect_for(&d, &s, "codex", "codex", &mut tails, &mut attempts);
+        assert_eq!(
+            attempts.get(&s.id).copied(),
+            Some(t0),
+            "제자리 승격 후 활성 파일인데도 다음 주기에 불필요한 프로브가 실행됐다"
+        );
+        assert_eq!(tails[&s.id].path, pin_a);
+
+        // 3단계: A 가 조용해진 뒤(t0 + 90) 프로브가 None 을 반환하면 제자리에서 proven=false 로 감쇠한다.
+        super::p11_proof_seam::set(Some(None));
+        super::p11_now_seam::set(Some(t0 + 90.0));
+        collect_for(&d, &s, "codex", "codex", &mut tails, &mut attempts);
+        assert_eq!(tails[&s.id].path, pin_a);
+        assert!(!tails[&s.id].proven, "무증명 발견 틱 뒤 proven 이 false 로 감쇠하지 않았다");
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// T14 (DESIGN-P11-r3 §3.3 & §4, pure identity comparator): 5개 경계 행 전수 검증(M11 차단).
+    #[cfg(not(windows))]
+    #[test]
+    fn p11_t14_process_identity_comparator_rows() {
+        let base = (100u32, 1000u64, "codex");
+        // 1. 동일 (pid, start, name) → true
+        assert!(super::p11_same_process_identity(base, Some((100, 1000, "codex"))));
+        // 2. start +1s (다음 초 PID 재사용) → false
+        assert!(!super::p11_same_process_identity(base, Some((100, 1001, "codex"))));
+        // 3. 같은 초·다른 프로그램 이름 (PID 재사용) → false
+        assert!(!super::p11_same_process_identity(base, Some((100, 1000, "node"))));
+        // 4. 같은 초·같은 프로그램 이름 (선언된 잔여 한계) → true
+        assert!(super::p11_same_process_identity(base, Some((100, 1000, "codex"))));
+        // 5. 프로브 뒤 PID 소멸 → false
+        assert!(!super::p11_same_process_identity(base, None));
+        // 6. 다른 PID → false
+        assert!(!super::p11_same_process_identity(base, Some((101, 1000, "codex"))));
+    }
+
+    /// T15 (DESIGN-P11-r3 §3.3 & §5, pure lsof `-F fan` parser & args): `f` 경계마다 `access`·`name` 을
+    /// 초기화해 앞선 소켓의 `au` 가 다음 읽기 전용(`ar`) 외래 rollout 레코드로 새지 않음을 검증하고,
+    /// 인자 벡터에 `-b -w -nP -a -p <pid> -F fan` 이 포함됨을 고정한다.
+    #[cfg(not(windows))]
+    #[test]
+    fn p11_t15_lsof_fan_parser_resets_per_fd_and_checks_args() {
+        let args = super::p11_codex_lsof_args(61666);
+        for flag in ["-b", "-w", "-nP", "-a", "-F", "fan"] {
+            assert!(args.iter().any(|x| x == flag), "필수 lsof 인자 누락({flag}): {args:?}");
+        }
+        let p_idx = args.iter().position(|x| x == "-p").expect("-p 인자 누락");
+        assert_eq!(args.get(p_idx + 1).map(String::as_str), Some("61666"));
+
+        let foreign = "/Users/x/.codex/sessions/2026/11/03/rollout-2026-11-03T01-00-00-foreign.jsonl";
+        let no_access = "/Users/x/.codex/sessions/2026/11/03/rollout-2026-11-03T01-00-00-noacc.jsonl";
+        let own_u = "/Users/x/.codex/sessions/2026/11/03/rollout-2026-11-03T01-00-00-ownu.jsonl";
+        let own_w = "/Users/x/.codex/sessions/2026/11/03/rollout-2026-11-03T01-00-00-ownw.jsonl";
+
+        // 소켓 `au` 뒤에 외래 rollout `ar`(읽기 전용) 및 `a` 없는 레코드가 따라오는 스트림
+        let leak_stream = format!(
+            "p61666\n\
+             f5\nau\nn127.0.0.1:8080\n\
+             f6\nar\nn{foreign}\n\
+             f7\nn{no_access}\n"
+        );
+        assert!(
+            super::p11_parse_lsof_fan(&leak_stream).is_empty(),
+            "앞선 fd 레코드의 au 가 다음 f 레코드로 누수되어 읽기 전용 외래 파일이 통과했다"
+        );
+
+        let valid_stream = format!(
+            "p61666\n\
+             f5\nau\nn127.0.0.1:8080\n\
+             f6\nar\nn{foreign}\n\
+             f8\nau\nn{own_u}\n\
+             f9\naw\nn{own_w}\n"
+        );
+        assert_eq!(
+            super::p11_parse_lsof_fan(&valid_stream),
+            vec![PathBuf::from(own_u), PathBuf::from(own_w)]
+        );
+    }
+
+    /// T16 (DESIGN-P11-r3 §5, live composed S12b): 부모 네이티브(`codex-p11-t16`)가 본체 `cli` rollout A 를
+    /// 쓰기 가능으로 쥐고 직접 자식 네이티브(동일 바이너리 이름)가 더 최신인 중첩 `cli` rollout N 을 쓰기 가능으로
+    /// 쥐고 있을 때, 리졸버는 최소 깊이 부모만 선택하고 증명은 자식 파일 N 을 절대 반환하지 않는다(M10·M12 차단).
+    #[cfg(not(windows))]
+    #[test]
+    fn p11_t16_composed_parent_and_nested_child_native() {
+        if std::env::var_os("CYS_P11_HELPER_MODE").is_some() {
+            p11_child_helper_entry();
+            return;
+        }
+        let td = std::env::temp_dir().join(format!("cys-p11-t16-{}", std::process::id()));
+        let sessions = td.join("sessions");
+        let t0 = 1_700_000_900.0;
+        let own_a = p11_write_rollout(
+            &sessions,
+            "rollout-2026-11-03T01-00-00-own.jsonl",
+            "/work/p11",
+            Some("\"cli\""),
+            1_700_000_100,
+        );
+        let nested_n = p11_write_rollout(
+            &sessions,
+            "rollout-2026-11-03T02-00-00-nested.jsonl",
+            "/work/p11",
+            Some("\"cli\""),
+            1_700_000_890,
+        );
+        let holder = P11FakeNative::spawn(
+            &td,
+            "t16",
+            "usage::tests::p11_t16_composed_parent_and_nested_child_native",
+            Some(&own_a),
+            None,
+            Some(&nested_n),
+        );
+
+        let proven = super::discover_codex_rollout_proven(std::process::id(), &holder.bin_base);
+        assert_eq!(
+            proven,
+            Some(own_a.clone()),
+            "부모 네이티브 대신 중첩 자식 네이티브의 파일 N 이나 다른 파일이 반환됐다"
+        );
+
+        let d = tick_daemon("p11-t16");
+        let s = p11_make_seat(
+            &d,
+            &td,
+            "codex",
+            &holder.bin_base,
+            std::process::id(),
+            t0 - 3600.0,
+        );
+        let mut tails = HashMap::new();
+        let mut attempts = HashMap::new();
+        let mut st = TailState::attach(&d, own_a.clone(), true, t0 - 35.0);
+        st.proven = false;
+        tails.insert(s.id, st);
+
+        p11_collect_for_at(&d, &s, "codex", &holder.bin_base, &mut tails, &mut attempts, t0);
+        assert_eq!(
+            tails[&s.id].path,
+            own_a,
+            "중첩 자식 네이티브가 연 최신 rollout N 을 본체 좌석이 채택했다(S12b 위반)"
+        );
+        assert!(tails[&s.id].proven, "부모 본체 파일 증명 후 proven=true 승격");
+
+        drop(holder);
+        let _ = std::fs::remove_dir_all(&td);
     }
 }
 
