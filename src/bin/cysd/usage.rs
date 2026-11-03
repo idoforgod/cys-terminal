@@ -5833,6 +5833,12 @@ mod tests {
                 &[(100, Some(s), "codex", 1000), (101, Some(100), "codex", 1001)],
                 Some(100),
             ),
+            (
+                // impl-r3 m3: 이름이 bin_base 를 **포함만** 하는 얕은 프로세스 — 정확 일치면 깊은 codex, 부분 일치면 이것(M10 차단).
+                "E12 superstring name above the native: codex-helper -> codex",
+                &[(110, Some(s), "codex-helper", 1000), (100, Some(110), "codex", 1001)],
+                Some(100),
+            ),
         ];
         for (name, rows, want) in cases {
             let got = super::p11_resolve_eligible_from_table(rows, s, "codex").map(|(p, _, _)| p);
