@@ -257,6 +257,9 @@ jobs:
                       "without it Windows path rules in the allow-file parser are vouched for only by macOS.",
                   "--bin cysd reclaim::tests::probe_":
                       "0.14.56 PHX: the read-only restore-lock probe's Windows LockFileEx branch runs only here (named guard in the step).",
+                  "--bin cysd usage::tests::p11_":
+                      "0.14.57 P11: the only BLOCKING native Windows run of T1w (p11_t1w_windows_keeps_clock_write_and_b6_rediscovery) - "
+                      "Windows keeps today's codex discovery byte-identical (HEAD-DECISION-P11-r2-windows); the cysd full step is non-blocking.",
               },
           }
 
