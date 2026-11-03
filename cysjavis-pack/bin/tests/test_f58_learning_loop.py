@@ -313,6 +313,11 @@ NAMED = [
     ("default name with own prefix stored", plain_pattern(domain="cache notes"), "stored", (), {}),
     ("default name hides nothing", plain_pattern(domain="rsi gate"), "staged", ("rsi-",), {}),
     ("caller name checked whole", plain_pattern(), "staged", ("rsi-",), {"name": "rsi-gate-note"}),
+    # mutation run u5-mutants: each case below is the only one that names its list (SAFETY_KEYWORDS, the file
+    # names) — without them, dropping that list passed every test. (An undecodable --name is checked in PureAndRows:
+    # on the store path the earlier, unchanged conflict-scan step stops on it first.)
+    ("safety word", plain_pattern(rationale="the autopilot rule applies"), "staged", ("safety autopilot",), {}),
+    ("names settings.json", plain_pattern(rationale="see settings.json"), "staged", ("file settings.json",), {}),
 ]
 
 
@@ -494,6 +499,15 @@ class PureAndRows(unittest.TestCase):
         self.assertFalse(m.promotion_allowed("improved", True, "confirmed")[0])
         self.assertFalse(m.promotion_allowed("flat", False, "provisional")[0])
 
+    def test_undecodable_name_is_not_the_closed_shape(self):
+        m = self.load()
+        body = {"pattern": plain_pattern(), "state": "provisional", "round": ROUND, "verdict": "improved",
+                "evidence_ref": "https://example.org/a"}
+        entry = {"state": "provisional", "desc": "[provisional] build cache: keep the cache folder",
+                 "name": "build-cache", "body": body, "body_text": json.dumps(body, ensure_ascii=False, indent=2)}
+        self.assertEqual(m.closed_shape_problems(entry), [])
+        self.assertIn("name: undecodable", m.closed_shape_problems(dict(entry, name="note\udc80x")))
+
     def test_safety_keywords_match_overrides_rs(self):
         m = self.load()
         with open(os.path.join(ROOT, "src", "overrides.rs"), encoding="utf-8") as f:
@@ -562,15 +576,30 @@ class Revert(RigCase):
         self.assertEqual(rig.memory(["verify"]).returncode, 0)
 
     def test_11f_later_user_edit_wins(self):
-        rig = self.rig()
-        rec = self.stored(rig, "cache-a")
-        with open(os.path.join(rig.mdir, rec["entry_file"]), "a", encoding="utf-8") as f:
-            f.write("\nuser addition\n")
-        before = rig.snapshot()
-        res = self.revert(rig, "cache-a")
-        self.assertEqual(res.returncode, 7, res.stderr)
-        self.assertEqual(rig.snapshot(), before)
-        self.assertEqual(self.reverted_lines(rig), [])
+        # "json value" keeps a valid learning body, so only the sha check can refuse it (mutation M15 survived the
+        # "appended text" edit alone: that one is also refused by the body-scope check).
+        for edit in ("appended text", "json value"):
+            with self.subTest(edit=edit):
+                rig = self.rig()
+                rec = self.stored(rig, "cache-a")
+                p = os.path.join(rig.mdir, rec["entry_file"])
+                with open(p, "rb") as f:
+                    raw = f.read()
+                if edit == "appended text":
+                    raw += b"\nuser addition\n"
+                else:
+                    self.assertEqual(raw.count(b"a rebuild is expected"), 1)   # the body only (desc has the action)
+                    raw = raw.replace(b"a rebuild is expected", b"a rebuild is expected soon")
+                with open(p, "wb") as f:
+                    f.write(raw)
+                before = rig.snapshot()
+                ino = os.stat(rig.index).st_ino
+                res = self.revert(rig, "cache-a")
+                self.assertEqual(res.returncode, 7, res.stderr)
+                self.assertEqual(rig.snapshot(), before)
+                # refused at step 2: the index was never rewritten (a rewrite + restore keeps bytes, not the inode)
+                self.assertEqual(os.stat(rig.index).st_ino, ino)
+                self.assertEqual(self.reverted_lines(rig), [])
 
     def test_11g_selective(self):
         rig = self.rig()
@@ -716,6 +745,38 @@ class Revert(RigCase):
                 self.assertEqual(res.returncode, 7, res.stdout + res.stderr)
                 self.assertIn(want, res.stdout + res.stderr)
                 self.assertEqual(self.reverted_lines(rig), [])
+
+    def test_second_revert_claims_nothing_new(self):
+        rig = self.rig()
+        self.stored(rig, "cache-a")
+        self.assertEqual(self.revert(rig, "cache-a").returncode, 0)
+        res = self.revert(rig, "cache-a")
+        self.assertEqual(res.returncode, 7, res.stdout + res.stderr)
+        self.assertEqual(len(self.reverted_lines(rig)), 1)
+        self.assertIn("reverted", rig.learn(["status"]).stdout)
+
+    def test_entry_edited_inside_the_window_is_refused(self):
+        # The second hash (step 5) is what refuses an entry changed after the step-2 checks. The race itself is the
+        # stated residue; this injects the edit deterministically right after the index write.
+        rig = self.rig()
+        rec = self.stored(rig, "cache-a")
+        index_before = rig.read_index()
+        m = self.load_memory(rig)
+        real = m._write_bytes_atomic
+        entry = os.path.join(rig.mdir, rec["entry_file"])
+
+        def write_then_edit(path, data, _real=real):
+            _real(path, data)
+            if path == rig.index and data != index_before:
+                with open(entry, "ab") as f:
+                    f.write(b"edited in the window\n")
+        m._write_bytes_atomic = write_then_edit
+        rc = self.remove_in_process(m, rig, rec)
+        self.assertEqual(rc, 7)
+        self.assertEqual(rig.read_index(), index_before)
+        with open(entry, "rb") as f:
+            self.assertTrue(f.read().endswith(b"edited in the window\n"))
+        self.assertEqual(rig.trash_files(), [])
 
     def test_11l_uncoordinated_index_edit_refused(self):
         rig = self.rig()

@@ -116,9 +116,10 @@ def v2_pattern():
     p = v1_pattern()
     p.update({"behavioral_claim": "polling interval increase reduces idle load",
               "falsifier": "load unchanged after interval increase",
+              # F58 §4.2: a URL anywhere but the citation is outside the closed shape (staged), so the
+              #   stored v2 fixture carries an empty known_failures list (allowed: "no failure found").
               "maturity": {"first_seen": "2024-05-01", "adoption_evidence": "3개 조직 채택",
-                           "known_failures": [{"source_url": "https://ex.org/postmortem",
-                                               "snapshot_sha256": SHA_A, "summary": "실패 사례"}]}})
+                           "known_failures": []}})
     return p
 
 
@@ -128,7 +129,7 @@ VERDICTS = [{"dimension": "fact_check", "model_family": "gemini", "verdict": "PA
 
 def gi_prov_bundle():
     return {"human_signed": False, "producer_model_family": "claude",
-            "target_paths": ["docs/x.md"], "operations": [],
+            "target_paths": [], "operations": [],
             "dimensions": {"source": {"fetch_log": True, "canonical": False, "distinct_sources": 1},
                            "fact_check": {"cross_checked": True},
                            "evidence": {"quote": "", "context_entailment": "support"},
@@ -139,7 +140,7 @@ def gi_prov_bundle():
 
 def gi_conf_bundle(snap, sha):
     return {"human_signed": False, "producer_model_family": "claude",
-            "target_paths": ["docs/x.md"], "operations": [],
+            "target_paths": [], "operations": [],
             "snapshot": {"path": snap, "sha256_expected": sha},
             # ★P0-1: confirmed는 후보 수 무관 conflict_audit(reviewer2) 무조건 필수.
             "conflict_audit": {"reviewer": "reviewer2", "verdict": "PASS", "note": "의미 감사 통과"},
@@ -328,7 +329,7 @@ def env_a():
         p = v2_pattern(); del p["maturity"]
         pbad = os.path.join(d, "pat_bad.json"); write(pbad, p)
         r = run_learn(["store", "--round", "R1", "--pattern", pbad, "--type", "reference",
-                       "--approved", "--gate-input", gi_prov, "--name", "gapx-badv2"], d)
+                       "--gate-input", gi_prov, "--name", "gapx-badv2"], d)
         check("C8 v2 store 필드 누락 거부(rc2)", r.returncode == 2, f"rc={r.returncode} {r.stderr}")
 
         # C3 마커 — 3타입 실존 검증 + 부재=exit 3.
@@ -337,11 +338,11 @@ def env_a():
         js = os.path.join(d, "impl.json"); write(js, {"_learn_refs": ["gapx-refs"]})
         nomark = os.path.join(d, "nomark.md"); open(nomark, "w").write("마커 없음\n")
         r = run_learn(["store", "--round", "R1", "--pattern", patv2, "--type", "reference",
-                       "--approved", "--gate-input", gi_prov, "--name", "gapx-refs",
+                       "--gate-input", gi_prov, "--name", "gapx-refs",
                        "--refs", f"{md},{nomark}"], d)
         check("C3 store 마커 누락 거부(rc3)", r.returncode == 3, f"rc={r.returncode} {r.stderr}")
         r = run_learn(["store", "--round", "R1", "--pattern", patv2, "--type", "reference",
-                       "--approved", "--gate-input", gi_prov, "--name", "gapx-refs",
+                       "--gate-input", gi_prov, "--name", "gapx-refs",
                        "--refs", f"{md},{py},{js}", "--json"], d)
         check("C3 store 마커 3타입 실존 통과(rc0)", r.returncode == 0, r.stdout + r.stderr)
         st = load_state(d)
@@ -379,18 +380,27 @@ def env_a():
         check("C9 정면충돌 후보 검출", r.returncode == 0 and out["count"] >= 1, r.stdout[:300])
         # confirmed 승격: conflict_audit verdict 부재=차단 · 존재=통과.
         r = run_learn(["store", "--round", "R1", "--pattern", patv2, "--type", "reference",
-                       "--approved", "--state", "confirmed", "--gate-input", gi_conf,
+                       "--state", "confirmed", "--gate-input", gi_conf,
                        "--name", "gapx-conf-noaudit"], d)
         check("C9 정면충돌+confirmed conflict_audit 부재 차단(rc2)", r.returncode == 2,
               f"rc={r.returncode} {r.stderr}")
         r = run_learn(["store", "--round", "R1", "--pattern", patv2, "--type", "reference",
-                       "--approved", "--state", "confirmed", "--gate-input", gi_conf_audit,
+                       "--state", "confirmed", "--gate-input", gi_conf_audit,
                        "--name", "gapx-conf-audited", "--json"], d)
-        check("C9 conflict_audit verdict 동봉 시 confirmed 통과(rc0)", r.returncode == 0,
+        # F58 §3.4: conflict_audit 를 통과한 confirmed 도 자동 채택하지 않는다 — 보류(staged · rc8 · 기억 무기록).
+        check("F58 conflict_audit 동봉 confirmed=보류(rc8·기억 무기록)",
+              r.returncode == 8 and '"staged"' in r.stdout
+              and not os.path.exists(os.path.join(d, "pack", "memory", "reference_gapx-conf-audited.md")),
               r.stdout + r.stderr)
-        check("C1 confirmed expires=+180d",
-              (find_item(load_state(d), "gapx-conf-audited") or {}).get("expires")
+        check("C1 confirmed expires=+180d(순수 new_item_fields)",
+              load_module().new_item_fields("confirmed", [], today)["expires"]
               == (today + timedelta(days=180)).isoformat())
+        # 아래 C11(effect_log·레짐) 시험은 confirmed 레코드 하나를 전제한다 — 0.14.57 이전에 저장된 레코드처럼 심는다.
+        st = load_state(d)
+        rec = {"name": "gapx-conf-audited", "id": "gapx-conf-audited", "type": "reference", "ts": 0}
+        rec.update(load_module().new_item_fields("confirmed", [], today))
+        st["rounds"]["R1"].setdefault("stored", []).append(rec)
+        save_state(d, st)
 
         # C4 challenge — 프리스크린(exit 4)·쿨다운(exit 5)·효력 유지·upheld=tombstone+스윕.
         # ★P0-4 위조 봉쇄 — snapshot_path 실 파일 해시 대조 + quote substring 정박.
@@ -584,18 +594,25 @@ def env_c():
         gi_conf = os.path.join(d, "gi_conf.json"); write(gi_conf, gi_conf_bundle(snap, sha))
         improved_round(d, "R1")
         r = run_learn(["store", "--round", "R1", "--pattern", patv1, "--type", "reference",
-                       "--approved", "--gate-input", gi_prov, "--name", "gapc-prov"], d)
+                       "--gate-input", gi_prov, "--name", "gapc-prov"], d)
         check("ENV C prov store(rc0)", r.returncode == 0, r.stderr)
         # ★P0-1 오답 핀 반전 — v1 pattern의 confirmed 승격은 거부(provisional 상한).
         r = run_learn(["store", "--round", "R1", "--pattern", patv1, "--type", "reference",
-                       "--approved", "--state", "confirmed", "--gate-input", gi_conf,
+                       "--state", "confirmed", "--gate-input", gi_conf,
                        "--name", "gapc-conf-v1"], d)
         check("P0-1 v1 pattern confirmed 승격 거부(rc2)", r.returncode == 2, f"rc={r.returncode} {r.stderr}")
         # confirmed는 v2 pattern + conflict_audit 무조건 필수.
         r = run_learn(["store", "--round", "R1", "--pattern", patv2, "--type", "reference",
-                       "--approved", "--state", "confirmed", "--gate-input", gi_conf,
+                       "--state", "confirmed", "--gate-input", gi_conf,
                        "--name", "gapc-conf"], d)
-        check("ENV C conf store(rc0·v2 pattern+conflict_audit)", r.returncode == 0, r.stdout + r.stderr)
+        check("F58 ENV C conf store=보류(rc8 · confirmed 는 자동 채택 안 함)", r.returncode == 8, r.stdout + r.stderr)
+        # C11 수명(만기·reval·lapse)은 0.14.57 이전에 저장된 confirmed 레코드에도 계속 적용된다 —
+        #   그 레코드를 learn_state 에 심어 같은 수명 경로를 계속 시험한다(기억 파일은 수명 판정에 쓰이지 않는다).
+        st = load_state(d)
+        rec = {"name": "gapc-conf", "id": "gapc-conf", "type": "reference", "ts": 0}
+        rec.update(load_module().new_item_fields("confirmed", [], today))
+        st["rounds"]["R1"].setdefault("stored", []).append(rec)
+        save_state(d, st)
 
         # C11 ① prov 만기=tombstone · conf 만기(유예 내)=wakeup enqueue.
         st = load_state(d)

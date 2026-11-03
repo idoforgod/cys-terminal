@@ -13,7 +13,7 @@
 
 명령(DESIGN §4 계약 + LEARN_GAPS_CONTRACT C1~C11):
   propose  --reason <stuck|gate|ceiling> --topic <S> [--json]
-      트리거 신호 → 학습 후보·근거 payload 산출(승인 요청용). 승인 전 검색·저장·채택 무실행.
+      트리거 신호를 ledger 에 기록만 한다(status recorded · 승인 대기 없음 · F58).
   search   --topic <S> --candidates <path|-> [--json]
       ① 후보 JSON 검증 게이트. source_url·claim·retrieved_at 필수·citation 0이면 hard fail.
       ★C7 v2: 후보가 v2 필드(first_seen·adoption_evidence·known_failures·counterquery_log)를
@@ -29,9 +29,12 @@
       C10: 라운드별 시도 수 ledger 계수 — 4회째=exit 9(ESCALATE)·--owner-approved로만 속행,
       속행(재제출)은 --responds-to <직전 REVISE evidence 참조> 필수(무응답 재제출 거부).
   store    --round <id> --pattern <pattern.json|-> --type <feedback|reference|project>
-           [--approved] [--state <provisional|confirmed>] [--fallback] [--refs <경로,…>]
+           [--state <provisional|confirmed>] [--fallback] [--refs <경로,…>]
            [--name S] [--desc S] [--json]
-      ④ verdict=improved AND --approved일 때만 javis_memory add 위임. fallback 모드 confirmed 차단.
+      ④ verdict=improved 이고 닫힌 저위험 모양(F58 §4: provisional · 명령·경로·주소·코드·실행 낱말 없는
+      문자열 · https 인용 하나 · 본문 2,048 B 이하)이며 번들이 고위험 동작·대상 경로를 선언하지 않을 때만
+      javis_memory add 위임. 그 밖은 보류(staged · exit 8 · 기억 무기록 · 게이트 미실행). 번들의
+      human_signed 는 항상 거짓으로 덮어쓴다. --approved 플래그는 없다. fallback 모드 confirmed 차단.
       C1: 항목 레코드 v2(state/expires(prov+90d·conf+180d)/review_due/reval_count/refs/
       effect_log/challenge). C3: --refs 각 경로 마커 실존 검증(부재=exit 3). C8: pattern이
       v2 필드를 선언하면 behavioral_claim·falsifier·maturity 전부 필수(v1=관용).
@@ -56,14 +59,17 @@
       ④effect_log none 2연속 보고 ⑤C_n vs C_0 체인 대조("직전 승·최초 대비 하락"=hard-fail).
       hard-fail 존재=exit 1. --mark-revaled=reval 완료 기록(reval_count+1·expires +180d 재계산
       — full 의무 회차에 --full 부재=exit 2·경량 연장으로 의무 회피 불가).
+  revert   --entry <name> [--json]
+      F58 §6: store 가 기록한 파일·sha256·색인 줄이 그대로일 때만 javis_memory remove 로 그 항목 1건을
+      되돌린다(휴지통 이동). 0 되돌림 · 3 무변경 · 4 ORPHAN · 5 원장 줄만 빠짐 · 7 REFUSED.
   status   [--json] [--evaluator-hash <h>]
       UI 데이터원 — 라운드·verdict·채택/rollback·발견 누적. C5: --evaluator-hash=해당 해시가
       채점한 라운드 목록(폭발 반경).
 
 종료 코드: 0 성공 · 1 audit hard-fail 존재 · 2 인자/계약 위반(hard fail) · 3 위임 도구 실패
   또는 refs 마커 부재(C3) · 4 challenge 프리스크린 거부 · 5 challenge 쿨다운 · 6 evaluator
-  manifest component 부재 · 7 master freeze 무서명 · 8 freeze 부재/해시 무결 위반 ·
-  9 evaluate 시도 상한 ESCALATE.
+  manifest component 부재 · 7 master freeze 무서명(revert: REFUSED) · 8 freeze 부재/해시 무결 위반
+  (store: STAGED 보류 — F58) · 9 evaluate 시도 상한 ESCALATE.
 의존성: 파이썬 표준 라이브러리 + 같은 bin의 javis_rsi.py·javis_memory.py·javis_wakeup.py.
 네트워크·LLM 호출 없음.
 
@@ -353,15 +359,193 @@ def confidence_of(distinct_sources):
     return "low" if distinct_sources < 2 else "med"
 
 
-def promotion_allowed(verdict, approved, fallback_mode, state):
-    """④ 저장 승격 가부(순수). 반환 (allowed, reason)."""
+def promotion_allowed(verdict, fallback_mode, state):
+    """④ 저장 승격 가부(순수). 반환 (allowed, reason). F58: 승인 플래그를 읽지 않는다(플래그 자체가 없다) —
+    무엇을 스스로 쓸지는 아래 닫힌 저위험 모양 검출기가 정하고, 그 밖은 보류(staged)된다."""
     if state == "confirmed" and fallback_mode:
         return False, "fallback 모드(단일 모델 변형·공통모드 방어 약화)는 confirmed 승격 불가 — provisional만(codex R3)"
     if verdict != "improved":
         return False, f"verdict={verdict} — improved 아니면 저장 거부(측정 우위 없음)"
-    if not approved:
-        return False, "사람 승인(--approved) 없음 — ④저장·⑤채택은 사람 승인(directive §4)"
     return True, "ok"
+
+
+# ───────────────────────── F58: 닫힌 저위험 모양 (DESIGN-F58-final §3.4·§4) ─────────────────────────
+# store 가 스스로 기억에 쓰는 것은 이 모양 하나뿐이다. 그 밖(고위험·confirmed·검출기가 모르는 것)은
+# 보류(staged · exit 8)로 남기고 이유를 보여 준다 — 사용자 승인을 기계로 확인할 길이 이 판에는 없다
+# (§3.3: feed 해소 주체가 오너 GUI 와 같은 사용자 프로세스를 구별하지 못한다).
+# ★이 검출기는 고정 낱말·고정 문자에 대한 어휘 검출기다 — "이런 형태가 없다"만 말하고 "무해하다"는 말하지
+#   못한다. 알려진 놓침(평범한 낱말로 쓴 해로운 처방)은 시험에 박혀 있다(test_f58_learning_loop 'known miss').
+STAGED_EXIT = 8
+STAGED_MESSAGE = "보류 — 닫힌 저위험 모양(명령·경로·주소·코드·실행 낱말이 없는 짧은 provisional 기억 메모)이 아니다(고위험 4축·confirmed·검출기 미인식). 이 판에는 사용자 승인을 기계로 확인할 길이 없어 자동 채택하지 않는다"
+STORE_GATE_OVERRIDE = {"human_signed": False}   # 호출자 번들 뒤에 덮어쓴다 — 번들은 서명을 주장할 수 없다
+HIGH_RISK_OPERATIONS = ("file_write_io", "network_socket", "shell_exec", "infra_change")  # rsi-gate.sh 고위험 4축
+# src/overrides.rs SAFETY_KEYWORDS 사본(순서 포함 — test_f58_learning_loop 가 Rust 배열과 대조한다).
+SAFETY_KEYWORDS = ("denylist", "deny list", "recovery", "kill-switch", "killswitch", "kill switch",
+                   "soul.md", "헌법", "헌장", "autopilot", "자율주행", "안전핵", "eval-driven")
+ACTION_WORDS = frozenset((
+    "run execute exec eval delete remove erase purge wipe clean clear empty reset install uninstall download "
+    "upload push publish send kill format overwrite move rename chmod chown sudo admin root shell terminal "
+    "script command").split())
+COMMAND_WORDS = frozenset((
+    "rm del rd rmdir mv cp curl wget git gh ssh scp nc powershell pwsh cmd bash sh zsh python python3 node "
+    "npm pip brew apt winget choco cys sqlite3").split())
+ACTION_PREFIXES = ("Remove-", "Invoke-", "Set-", "New-", "Start-", "Stop-", "javis_", "rsi-")
+KOREAN_ACTION = ("실행", "삭제", "지우", "지워", "비우", "비워", "설치", "다운로드", "업로드", "발행", "전송",
+                 "덮어", "종료", "포맷", "이동", "권한")
+GUARDED_FILE_NAMES = ("soul.md", "CLAUDE.md", "_DIRECTIVE.md", "MEMORY.md", "settings.json", "agents.json")
+LINE_STARTS = ("$ ", "# ", "> ", "PS ", "C:\\", "~/", "./")
+SHELL_OPERATORS = ("|", "&&", ";", "$(", ">", "<")
+CITATION_FORBIDDEN = frozenset(";|&$`<>\"'(){}\\")
+BODY_MAX_BYTES = 2048
+DESC_MAX_CHARS = 200
+CITATION_MAX_BYTES = 512
+DEFAULT_NAME_PREFIX = "rsi-"      # slugify() 가 붙이는 도구 자신의 접두 — 검사 전에 뗀다(그 뒤는 검사한다)
+_ACTION_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]+")   # §4.3 낱말 = [A-Za-z0-9_-] 최대 연속(별도 이름: 아래 _TOKEN_RE 는 conflict_scan 용)
+_FLAG_RE = re.compile(r"(?<![A-Za-z0-9_-])(--?[A-Za-z][A-Za-z0-9_-]*)")
+_SWITCH_RE = re.compile(r"(?<!\S)(/[A-Za-z][A-Za-z0-9]*)")
+_DRIVE_RE = re.compile(r"[A-Za-z]:[\\/]")
+_HOME_RE = re.compile(r"~[\\/]")
+_SLASH_RE = re.compile(r"\S[/\\]\S")
+
+
+def _is_control(ch):
+    o = ord(ch)
+    return o < 32 or 0x7F <= o <= 0x9F
+
+
+def _dedupe(items):
+    seen, out = set(), []
+    for x in items:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
+def string_problems(s):
+    """한 문자열의 어휘 검출(순수 · §4.3). 각 실패는 이름 붙은 이유 하나다. 빈 목록 = 이 형태들이 없다."""
+    try:
+        s.encode("utf-8")
+    except UnicodeEncodeError:
+        return ["undecodable"]
+    out = []
+    if any(_is_control(ch) and ch != "\n" for ch in s):
+        out.append("control character")
+    if "`" in s:
+        out.append("backtick")
+    for line in s.split("\n"):
+        head = line.lstrip(" ")
+        out += ["line starts with %r" % ls for ls in LINE_STARTS if head.startswith(ls)]
+    if "://" in s:
+        out.append("address ://")
+    if _DRIVE_RE.search(s):
+        out.append("drive path")
+    if _HOME_RE.search(s):
+        out.append("home path ~/")
+    m = _SLASH_RE.search(s)
+    if m:
+        out.append("path %r" % m.group(0))
+    out += ["operator %s" % op for op in SHELL_OPERATORS if op in s]
+    out += ["flag %s" % fm.group(1) for fm in _FLAG_RE.finditer(s)]
+    out += ["switch %s" % sm.group(1) for sm in _SWITCH_RE.finditer(s)]
+    for tok in _ACTION_TOKEN_RE.findall(s):
+        low = tok.lower()
+        if low in ACTION_WORDS:
+            out.append("word %s" % low)
+        if low in COMMAND_WORDS:
+            out.append("command %s" % low)
+        out += ["prefix %s" % px for px in ACTION_PREFIXES if low.startswith(px.lower())]
+    out += ["korean %s" % k for k in KOREAN_ACTION if k in s]
+    low = s.lower()
+    out += ["safety %s" % kw for kw in SAFETY_KEYWORDS if kw.lower() in low]
+    out += ["file %s" % fn for fn in GUARDED_FILE_NAMES if fn.lower() in low]
+    return _dedupe(out)
+
+
+def citation_problems(ref):
+    """evidence_ref 는 인용 토큰 하나다(§4.2 ③): https:// 로 시작 · 공백·제어문자·금지 기호 없음 · 512 B 이하."""
+    if not isinstance(ref, str):
+        return ["citation is not a string"]
+    try:
+        n = len(ref.encode("utf-8"))
+    except UnicodeEncodeError:
+        return ["citation undecodable"]
+    out = []
+    if not ref.startswith("https://"):
+        out.append("citation must start with https://")
+    if any(ch.isspace() for ch in ref):
+        out.append("citation has whitespace")
+    if any(_is_control(ch) for ch in ref):
+        out.append("citation has a control character")
+    bad = sorted(set(ref) & CITATION_FORBIDDEN)
+    if bad:
+        out.append("citation has %s" % "".join(bad))
+    if n > CITATION_MAX_BYTES:
+        out.append("citation %d bytes > %d" % (n, CITATION_MAX_BYTES))
+    return out
+
+
+_CITATION_POSITIONS = (("evidence_ref",), ("pattern", "evidence_ref"))
+
+
+def _walk_strings(obj, path, where, out):
+    """본문 JSON 의 모든 키·값 문자열(깊이 무관)을 검출기에 통과시킨다. 면제는 인용 두 자리의 값뿐이다."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            out += ["%s key %r: %s" % (where, k, p) for p in string_problems(str(k))]
+            sub = path + (k,)
+            if sub in _CITATION_POSITIONS and isinstance(v, str):
+                continue
+            _walk_strings(v, sub, "%s.%s" % (where, k), out)
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            _walk_strings(v, path + (i,), "%s[%d]" % (where, i), out)
+    elif isinstance(obj, str):
+        out += ["%s: %s" % (where, p) for p in string_problems(obj)]
+
+
+def closed_shape_problems(entry):
+    """F58 §4.2 (순수): [] = 닫힌 저위험 모양. entry = {state, desc, name, body(객체), body_text(쓸 문자열)}.
+    검사 대상은 store 가 실제로 쓸 문자열이다 — desc(색인 줄 · 전 좌석 주입) · name · 본문 JSON 전부."""
+    out = []
+    state = entry.get("state")
+    if state != "provisional":
+        out.append("state %s (only provisional is the closed shape)" % state)
+    desc = entry.get("desc") or ""
+    if len(desc) > DESC_MAX_CHARS:
+        out.append("desc %d characters > %d" % (len(desc), DESC_MAX_CHARS))
+    try:
+        size = len((entry.get("body_text") or "").encode("utf-8"))
+        if size > BODY_MAX_BYTES:
+            out.append("body %d bytes > %d" % (size, BODY_MAX_BYTES))
+    except UnicodeEncodeError:
+        out.append("body: undecodable (not valid UTF-8)")
+    out += ["desc: %s" % p for p in string_problems(desc)]
+    out += ["name: %s" % p for p in string_problems(entry.get("name") or "")]
+    body = entry.get("body") if isinstance(entry.get("body"), dict) else {}
+    _walk_strings(body, (), "body", out)
+    pat = body.get("pattern") if isinstance(body.get("pattern"), dict) else {}
+    out += ["body.evidence_ref: %s" % p for p in citation_problems(body.get("evidence_ref"))]
+    out += ["body.pattern.evidence_ref: %s" % p for p in citation_problems(pat.get("evidence_ref"))]
+    return _dedupe(out)
+
+
+def bundle_precheck(gi):
+    """F58 §3.4 ③ (순수): 기억 메모는 자기 파일 말고 아무것도 쓰지 않는다 — 번들이 고위험 동작이나 대상 경로를
+    선언하면 보류. 게이트를 부르기 전이라, 이 뒤의 게이트 거부는 근거(증거) 실패뿐이다(exit 2 그대로)."""
+    if not isinstance(gi, dict):
+        return []
+    out = []
+    ops = gi.get("operations") or []
+    try:
+        hit = [op for op in HIGH_RISK_OPERATIONS if op in ops]
+    except TypeError:
+        hit = ["(unreadable operations)"]
+    if hit:
+        out.append("bundle declares operations %s" % ",".join(hit))
+    if gi.get("target_paths"):
+        out.append("bundle declares target_paths")
+    return out
 
 
 # ───────────────────────── 상태 파일 I/O ─────────────────────────
@@ -727,8 +911,7 @@ def cmd_propose(a):
     if a.reason not in VALID_REASONS:
         return fail(2, f"--reason은 {VALID_REASONS} 중 하나")
     payload = {"event": "propose", "topic": a.topic, "reason": a.reason,
-               "evidence": [], "status": "awaiting_approval", "ts": time.time(),
-               "note": "pending feed approval item 등록 → 사람이 'cys feed reply <id> allow'(또는 feed 패널)로 승인할 때만 ①~⑤ 착수. 거부=무실행."}
+               "evidence": [], "status": "recorded", "ts": time.time(), "note": "기록만 — 착수는 §3 신호로 승인 대기 없이 한다(닫힌 저위험 모양 밖의 저장은 보류된다)."}
     _append_ledger(payload)
     print(json.dumps(payload, ensure_ascii=False, indent=2 if not a.json else None))
     return 0
@@ -857,7 +1040,7 @@ def cmd_store(a):
     verdict = (r or {}).get("verdict")
     if verdict is None:
         return fail(2, f"라운드 '{a.round}' 평가 기록 없음 — 먼저 evaluate 하라(verdict 필요)")
-    allowed, reason = promotion_allowed(verdict, a.approved, a.fallback, a.state)
+    allowed, reason = promotion_allowed(verdict, a.fallback, a.state)
     if not allowed:
         return fail(2, "④ 저장 거부 — " + reason)
     if a.type not in VALID_TYPES:
@@ -907,22 +1090,35 @@ def cmd_store(a):
         if not (isinstance(ca, dict) and str(ca.get("verdict", "")).strip().upper() in ("PASS", "ACCEPT")):
             return fail(2, "④ 저장 거부(C9) — confirmed 승격은 gate-input 번들에 conflict_audit "
                            f"verdict(reviewer2 의미 감사·PASS|ACCEPT) 무조건 필수 (충돌 후보 {len(conflict_candidates)}건)")
+    # ★F58 §3.4 — 기존 검사(위 순서 그대로) 뒤, 쓸 문자열 그대로에 닫힌 저위험 모양 검출 + 번들 사전검사.
+    #   모양 밖이면 기억에 아무것도 쓰지 않고 보류(staged · exit 8) — 게이트는 쓸 항목에만 돈다(gate: not_run).
+    desc = a.desc or f"[{a.state}] {pattern.get('domain')}: {pattern.get('action')}"[:200]
+    body_obj = {"pattern": pattern, "state": a.state, "round": a.round,
+                "verdict": verdict, "evidence_ref": pattern.get("evidence_ref")}
+    body = json.dumps(body_obj, ensure_ascii=False, indent=2)
+    checked_name = name if a.name or not name.startswith(DEFAULT_NAME_PREFIX) else name[len(DEFAULT_NAME_PREFIX):]
+    reasons = closed_shape_problems({"state": a.state, "desc": desc, "name": checked_name,
+                                     "body": body_obj, "body_text": body}) + bundle_precheck(gi)
+    if reasons:
+        return _stage(state, r, a.round, name, reasons, body, a.json)
     # ★rsi-gate 강제 통합(codex BLOCK 보정) — 봉쇄 통과 증명 없이는 저장 불가(존재≠강제 결함 해소).
     #   pattern·conflict_candidates(+라운드 evaluator_hash)는 javis_learn 실측치를 권위 주입.
+    #   F58: human_signed 는 항상 거짓으로 덮어쓴다(STORE_GATE_OVERRIDE · _enforce_gate 가 번들 뒤에 적용).
     extra = {"pattern": pattern, "conflict_candidates": conflict_candidates}
     if (r or {}).get("evaluator_hash"):
         extra["evaluator_hash"] = r["evaluator_hash"]
+    extra.update(STORE_GATE_OVERRIDE)
     ok, gmsg = _enforce_gate(gi, "store", a.state, a.fallback, extra)
     if not ok:
         return fail(2, "④ 저장 거부 — " + gmsg)
-    desc = a.desc or f"[{a.state}] {pattern.get('domain')}: {pattern.get('action')}"[:200]
-    body = json.dumps({"pattern": pattern, "state": a.state, "round": a.round,
-                       "verdict": verdict, "evidence_ref": pattern.get("evidence_ref")},
-                      ensure_ascii=False, indent=2)
     rc, out, err = _run(MEM, ["add", "--type", a.type, "--name", name, "--desc", desc, "--body", body])
     if rc != 0:
         return fail(12, f"javis_memory 위임 실패(일시적·재시도 가능): {err or out}")  # ★P2-1 위임 실패=12
-    rec = {"name": name, "id": name, "type": a.type, "ts": time.time()}
+    added = _last_json(out, "added")
+    # F58 §6 — revert 가 쓸 기록: 항목 파일 이름·경로·쓴 직후 sha256(javis_memory 가 잠금 안에서 읽은 값)·색인 한 줄.
+    rec = {"name": name, "id": name, "type": a.type, "ts": time.time(),
+           "entry_file": added.get("added"), "entry_path": added.get("path"),
+           "entry_sha256": added.get("sha256"), "index_line": added.get("index_line")}
     rec.update(new_item_fields(a.state, refs))  # C1 항목 레코드 v2
     r.setdefault("stored", []).append(rec)
     _save_state(state)
@@ -932,6 +1128,128 @@ def cmd_store(a):
              "refs": refs, "conflict_candidates": len(conflict_candidates), "ts": time.time()}
     _append_ledger(entry)
     print(json.dumps({**entry, "memory": out}, ensure_ascii=False, indent=2 if not a.json else None))
+    return 0
+
+
+def _last_json(out, key):
+    """위임 도구 stdout 에서 key 를 가진 마지막 JSON 객체(없으면 {})."""
+    for line in reversed((out or "").splitlines()):
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(obj, dict) and key in obj:
+            return obj
+    return {}
+
+
+def _printable(s):
+    return str(s).encode("utf-8", "backslashreplace").decode("utf-8")
+
+
+def _stage(state, r, rid, name, reasons, body, as_json):
+    """F58 §3.4 ②: 보류 기록 1건 — ledger 한 줄 + 같은 레코드를 learn_state 라운드에. 기억은 손대지 않는다."""
+    digest = hashlib.sha256(body.encode("utf-8", "surrogatepass")).hexdigest()
+    rec = {"event": "staged", "round": _printable(rid), "name": _printable(name), "reasons": reasons,
+           "entry_sha256": digest, "gate": "not_run", "ts": time.time()}
+    r.setdefault("staged", []).append(dict(rec))
+    _save_state(state)
+    _append_ledger(rec)
+    print(json.dumps({**rec, "message": STAGED_MESSAGE}, ensure_ascii=False, indent=None if as_json else 2))
+    print(f"④ 보류(exit {STAGED_EXIT}) — {STAGED_MESSAGE}", file=sys.stderr)
+    return STAGED_EXIT
+
+
+def _index_has_line(mdir, line):
+    try:
+        with open(os.path.join(mdir, "MEMORY.md"), "rb") as f:
+            data = f.read()
+    except OSError:
+        return False
+    want = line.encode("utf-8")
+    for seg in data.split(b"\n"):
+        if (seg[:-1] if seg.endswith(b"\r") else seg) == want:
+            return True
+    return False
+
+
+def _sha_file(p):
+    try:
+        with open(p, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def _recovery_match(mdir, rec):
+    """F58 §6.3 step 7: 원장 줄이 빠진 되돌리기의 복구 조건. (휴지통 경로, None) 또는 (None, 이유)."""
+    hits = glob.glob(os.path.join(glob.escape(mdir), ".learned-trash", "*", glob.escape(rec["entry_file"])))
+    same = [h for h in hits if _sha_file(h) == rec["entry_sha256"]]
+    if len(same) > 1:
+        return None, "several matches"
+    if not same:
+        return None, "hash differs" if hits else "no matching trash file"
+    if _index_has_line(mdir, rec["index_line"]):
+        return None, "index still has the line"
+    return same[0], None
+
+
+def _presence(rec):
+    """status 표시용: reverted · present · edited · stored-but-missing · None(되돌리기 기록 없는 옛 항목)."""
+    if (rec.get("revert") or {}).get("state") == "reverted":
+        return "reverted"
+    if not rec.get("entry_path"):
+        return None
+    got = _sha_file(rec["entry_path"])
+    if got is None:
+        return "stored-but-missing"
+    return "present" if got == rec.get("entry_sha256") else "edited"
+
+
+def cmd_revert(a):
+    """F58 §6: 학습 항목 1건 되돌리기 — store 기록(파일·sha256·색인 줄)대로 javis_memory remove 에 위임.
+    종료: 0 되돌림 · 3 아무것도 안 바뀜(잠금·입출력) · 4 ORPHAN(remove 가 출력) · 5 기억은 되돌렸고 원장 줄만 빠짐
+    · 7 REFUSED(기록과 다름 · 기록 없음 · 이미 되돌림 · 복구 조건 불충족)."""
+    state = _load_state()
+    rid, kind, rec = _find_item(state, a.entry)
+    if rec is None or kind != "stored":
+        return fail(7, f"REFUSED 저장 기록 없음: {a.entry}")
+    if not all(rec.get(k) for k in ("entry_file", "entry_path", "entry_sha256", "index_line")):
+        return fail(7, "REFUSED 되돌리기 기록 없음(파일·sha256·색인 줄) — 0.14.57 이전 store 이거나 기록이 비었다")
+    if (rec.get("revert") or {}).get("state") == "reverted":
+        return fail(7, f"REFUSED 이미 되돌림: {rec['revert'].get('trash')}")
+    mdir = os.path.dirname(rec["entry_path"])
+    rc, out, err = _run(MEM, ["--dir", mdir, "remove", "--name", rec["entry_file"],
+                              "--expect-sha", rec["entry_sha256"], "--expect-line", rec["index_line"]])
+    recovered = False
+    if rc == 0:
+        trash = _last_json(out, "removed").get("trash")
+    elif rc == 7:
+        trash, why = _recovery_match(mdir, rec)
+        if trash is None:
+            print(json.dumps({"event": "revert_refused", "name": a.entry, "remove": err or out, "recovery": why},
+                             ensure_ascii=False, indent=None if a.json else 2))
+            return fail(7, f"REFUSED javis_memory remove: {err or out} · 복구 조건: {why} — 되돌렸다고 기록하지 않는다")
+        recovered = True
+    else:
+        if out:
+            print(out)
+        return fail(rc if rc in (3, 4) else 3, f"javis_memory remove rc={rc}: {err or out}")
+    line = {"event": "reverted", "round": rid, "name": a.entry, "trash": trash,
+            "entry_sha256": rec["entry_sha256"], "index_line": rec["index_line"],
+            "recovered": recovered, "ts": time.time()}
+    try:
+        _append_ledger(line)
+    except OSError as e:
+        print(json.dumps({**line, "ledger": "not written"}, ensure_ascii=False, indent=None if a.json else 2))
+        return fail(5, f"REVERTED_NO_LEDGER — 기억은 되돌렸다(휴지통 {trash}), 원장 줄만 못 썼다: {e}. "
+                       "같은 revert 를 다시 부르면 휴지통·색인이 정확히 맞을 때만 recovered 줄을 쓴다")
+    rec["revert"] = {"state": "reverted", "trash": trash, "recovered": recovered, "ts": line["ts"]}
+    try:
+        _save_state(state)
+    except OSError as e:
+        return fail(5, f"REVERTED_NO_LEDGER(state) — 원장 줄은 썼고 learn_state 기록만 못 썼다: {e}")
+    print(json.dumps(line, ensure_ascii=False, indent=None if a.json else 2))
     return 0
 
 
@@ -1331,8 +1649,10 @@ def cmd_status(a):
         print("학습 라운드 기록 없음 (propose/search 로 시작)")
         return 0
     for rid, r in rounds.items():
-        st = ", ".join(f"{s['name']}({s['state']})" for s in r.get("stored", [])) or "-"
-        print(f"라운드 {rid}: verdict={r.get('verdict')} · 저장[{st}] · harness {len(r.get('harness', []))}")
+        st = ", ".join(f"{s['name']}({s['state']}" + (f", {_presence(s)}" if _presence(s) else "") + ")"
+                       for s in r.get("stored", [])) or "-"
+        sg = ", ".join(f"{g.get('name')}({'; '.join(g.get('reasons') or [])})" for g in r.get("staged", [])) or "-"
+        print(f"라운드 {rid}: verdict={r.get('verdict')} · 저장[{st}] · 보류[{sg}] · harness {len(r.get('harness', []))}")
     disc = state.get("discovery", {})
     print(f"발견 누적: 기능 {disc.get('capability', 0)} · 관점 {disc.get('perspective', 0)} · 지식 {disc.get('knowledge', 0)}")
     return 0
@@ -1346,19 +1666,20 @@ def main():
     s = sub.add_parser("search"); s.add_argument("--topic", required=True); s.add_argument("--candidates", required=True); s.add_argument("--json", action="store_true")
     e = sub.add_parser("extract"); e.add_argument("--from", required=True, dest="from"); e.add_argument("--pattern", required=True); e.add_argument("--json", action="store_true")
     ev = sub.add_parser("evaluate"); ev.add_argument("--round", required=True); ev.add_argument("--score", type=float, required=True); ev.add_argument("--baseline", action="store_true"); ev.add_argument("--note"); ev.add_argument("--evaluator-manifest", dest="evaluator_manifest", help="C5 evaluator 매니페스트(path|-) — components 실측 트리 해시"); ev.add_argument("--owner-approved", dest="owner_approved", action="store_true", help="C10 시도 상한(4회째 ESCALATE) 속행 승인"); ev.add_argument("--responds-to", dest="responds_to", help="C10 재제출 — 직전 REVISE evidence 참조"); ev.add_argument("--json", action="store_true")
-    st = sub.add_parser("store"); st.add_argument("--round", required=True); st.add_argument("--pattern", required=True); st.add_argument("--type", required=True); st.add_argument("--approved", action="store_true"); st.add_argument("--state", default="provisional", choices=["provisional", "confirmed"]); st.add_argument("--fallback", action="store_true"); st.add_argument("--gate-input", dest="gate_input", help="rsi-gate 검증 증거 번들(path|-) — 강제 봉쇄 통과"); st.add_argument("--refs", help="C3 반영처 경로(콤마 구분) — 각 경로 learn:<id> 마커 실존 필수"); st.add_argument("--name"); st.add_argument("--desc"); st.add_argument("--json", action="store_true")
+    st = sub.add_parser("store"); st.add_argument("--round", required=True); st.add_argument("--pattern", required=True); st.add_argument("--type", required=True);  st.add_argument("--state", default="provisional", choices=["provisional", "confirmed"]); st.add_argument("--fallback", action="store_true"); st.add_argument("--gate-input", dest="gate_input", help="rsi-gate 검증 증거 번들(path|-) — 강제 봉쇄 통과"); st.add_argument("--refs", help="C3 반영처 경로(콤마 구분) — 각 경로 learn:<id> 마커 실존 필수"); st.add_argument("--name"); st.add_argument("--desc"); st.add_argument("--json", action="store_true")
     h = sub.add_parser("harness"); h.add_argument("--round", required=True); h.add_argument("--pattern", required=True); h.add_argument("--evolve"); h.add_argument("--state", default="provisional", choices=["provisional", "confirmed"]); h.add_argument("--fallback", action="store_true"); h.add_argument("--gate-input", dest="gate_input", help="rsi-gate 검증 증거 번들(path|-) — 채택 시 강제"); h.add_argument("--refs", help="C3 반영처 경로(콤마 구분)"); h.add_argument("--json", action="store_true")
     ch = sub.add_parser("challenge"); ch.add_argument("--id", required=True); ch.add_argument("--evidence", help="C4 증거 번들(path|-) — {id, reason, evidence[{source_url, snapshot_path, snapshot_sha256, quote}]}"); ch.add_argument("--resolve", choices=["upheld", "rejected"]); ch.add_argument("--approved", action="store_true", help="P0-4 upheld(tombstone) 사람 서명"); ch.add_argument("--json", action="store_true")
     fz = sub.add_parser("freeze"); fz.add_argument("--round", required=True); fz.add_argument("--benchmarks", required=True, help="C6 {tasks, success_criteria, aux_metrics_protocol}(path|-)"); fz.add_argument("--proposer", required=True); fz.add_argument("--auditor-sig", dest="auditor_sig", help="reviewer2 감사 서명 — proposer=master면 필수"); fz.add_argument("--json", action="store_true")
     cs = sub.add_parser("conflictscan"); cs.add_argument("--pattern", required=True); cs.add_argument("--round"); cs.add_argument("--name"); cs.add_argument("--json", action="store_true")
     au = sub.add_parser("audit"); au.add_argument("--json", action="store_true"); au.add_argument("--mark-revaled", dest="mark_revaled", help="reval 완료 기록 — reval_count+1·expires +180d 재계산"); au.add_argument("--full", action="store_true", help="5차원 full recheck 수행 표기(의무 회차엔 필수)"); au.add_argument("--record-effect", dest="record_effect", help="P1-4 effect_log 기록 대상 id"); au.add_argument("--effect", choices=["improved", "none"], help="P1-4 채택 후 사후 효과"); au.add_argument("--metrics", help="P1-4 효과 지표 JSON(선택)")
+    rv = sub.add_parser("revert"); rv.add_argument("--entry", required=True, help="F58 되돌릴 학습 항목 이름(store 의 name)"); rv.add_argument("--json", action="store_true")
     stt = sub.add_parser("status"); stt.add_argument("--json", action="store_true"); stt.add_argument("--evaluator-hash", dest="evaluator_hash", help="C5 계보 질의 — 해당 해시가 채점한 라운드 목록")
 
     a = ap.parse_args()
     return {"propose": cmd_propose, "search": cmd_search, "extract": cmd_extract,
             "evaluate": cmd_evaluate, "store": cmd_store, "harness": cmd_harness,
             "challenge": cmd_challenge, "freeze": cmd_freeze, "conflictscan": cmd_conflictscan,
-            "audit": cmd_audit, "status": cmd_status}[a.cmd](a)
+            "audit": cmd_audit, "status": cmd_status, "revert": cmd_revert}[a.cmd](a)
 
 
 if __name__ == "__main__":
