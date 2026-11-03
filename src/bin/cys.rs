@@ -1843,6 +1843,31 @@ enum CycleTargetState {
     MachineResidue,
 }
 
+/// ★(0.14.57 · P9c) Deciding signal for a `CycleTargetState::HumanDraft` hold — counts and booleans only, never
+/// screen text (see `IMPL-SPEC-P9c.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DraftSignal {
+    HumanBytes(u64),
+    PendingUnattributed(u64),
+    ComposerVerdictDraft,
+    TextRow { from_bottom: usize, tail_chars: usize, own_cycle_text: bool },
+}
+
+impl std::fmt::Display for DraftSignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::HumanBytes(n) => write!(f, "[draft_signal=human_bytes:{n}]"),
+            Self::PendingUnattributed(n) => write!(f, "[draft_signal=pending_unattributed:{n}]"),
+            Self::ComposerVerdictDraft => write!(f, "[draft_signal=composer_verdict:draft]"),
+            Self::TextRow { from_bottom, tail_chars, own_cycle_text } => write!(
+                f,
+                "[draft_signal=text_row:{from_bottom}_from_bottom tail={tail_chars}ch own_cycle_text={}]",
+                if own_cycle_text { "yes" } else { "no" }
+            ),
+        }
+    }
+}
+
 /// 판정 입력 — 한 왕복의 관측을 그대로 담는다(합성 금지).
 struct CycleTargetObs<'a> {
     composer: Option<&'a Value>,
@@ -1864,17 +1889,22 @@ struct CycleTargetObs<'a> {
 /// Ctrl-U→paste→CR 원자 송신이 나간다(면책 창 기본 포커스 = `No, exit` · 2026-08-23 실측 킬체인 ·
 /// ANCHOR ④ pane 전멸). 실패 방향은 보류(rc 84)이고 그 귀결은 다음 사이클 재시도다.
 fn cycle_target_state(o: &CycleTargetObs<'_>) -> CycleTargetState {
+    cycle_target_state_with_signal(o).0
+}
+
+fn cycle_target_state_with_signal(o: &CycleTargetObs<'_>) -> (CycleTargetState, Option<DraftSignal>) {
     // 사람 초안은 어느 화면에서도 보류한다. 구 데몬의 사람 축 미보고도 종전처럼 보호한다.
-    if o.human_bytes.unwrap_or(0) > 0
-        || o.composer.and_then(|c| c["human_bytes"].as_u64()).unwrap_or(0) > 0
-    {
-        return CycleTargetState::HumanDraft;
+    let entry_human = o.human_bytes.unwrap_or(0);
+    let composer_human = o.composer.and_then(|c| c["human_bytes"].as_u64()).unwrap_or(0);
+    if entry_human > 0 || composer_human > 0 {
+        let n = if composer_human > 0 { composer_human } else { entry_human };
+        return (CycleTargetState::HumanDraft, Some(DraftSignal::HumanBytes(n)));
     }
     let pending = o.composer.and_then(|c| c["pending_bytes"].as_u64()).or(o.pending_bytes);
     let human = o.composer.and_then(|c| c["human_bytes"].as_u64()).or(o.human_bytes);
-    let machine_residue = if pending.unwrap_or(0) > 0 {
+    let machine_residue = if let Some(n) = pending.filter(|&n| n > 0) {
         if human.is_none() {
-            return CycleTargetState::HumanDraft;
+            return (CycleTargetState::HumanDraft, Some(DraftSignal::PendingUnattributed(n)));
         }
         true
     } else {
@@ -1883,27 +1913,29 @@ fn cycle_target_state(o: &CycleTargetObs<'_>) -> CycleTargetState {
     // ★B-1: send_text 뒤 Return 전에 멈춘 기계 잔여를 사람에게 치우라고 하면 무clear가 된다.
     //   화면·정적 축을 통과한 뒤에만 clear 대상으로 넘긴다 — 출력 중인 턴을 소거하지 않는다.
     let Some(screen) = o.screen else {
-        return CycleTargetState::Busy;
+        return (CycleTargetState::Busy, None);
     };
     if let Some(c) = o.composer {
         // A present but torn export never supplies a usable observation/fence.
         if c["output_gen"].as_u64().is_none() || c["input_gen"].as_u64().is_none() {
-            return CycleTargetState::Busy;
+            return (CycleTargetState::Busy, None);
         }
         if c["owner"].as_str() == Some("own_paste") {
-            return CycleTargetState::Busy;
+            return (CycleTargetState::Busy, None);
         }
         if c["modal"].as_bool() != Some(false) {
-            return CycleTargetState::Busy;
+            return (CycleTargetState::Busy, None);
         }
         if c["governed"].as_bool() == Some(true) {
             let residue = machine_residue || (human == Some(0) && c["owner"].as_str() == Some("machine"));
             let ready = o.quiet == Some(true) && !o.gate_or_modal;
             match c["verdict"].as_str() {
-                Some("draft") => return if !ready { CycleTargetState::Busy }
-                    else if residue { CycleTargetState::MachineResidue } else { CycleTargetState::HumanDraft },
-                Some("empty" | "placeholder" | "suggestion") => return if !ready { CycleTargetState::Busy }
-                    else if residue { CycleTargetState::MachineResidue } else { CycleTargetState::Idle },
+                Some("draft") => return if !ready { (CycleTargetState::Busy, None) }
+                    else if residue { (CycleTargetState::MachineResidue, None) }
+                    else { (CycleTargetState::HumanDraft, Some(DraftSignal::ComposerVerdictDraft)) },
+                Some("empty" | "placeholder" | "suggestion") => return if !ready { (CycleTargetState::Busy, None) }
+                    else if residue { (CycleTargetState::MachineResidue, None) }
+                    else { (CycleTargetState::Idle, None) },
                 _ => {} // Old/unknown adapters retain the text-only decision below.
             }
         }
@@ -1911,24 +1943,24 @@ fn cycle_target_state(o: &CycleTargetObs<'_>) -> CycleTargetState {
     let Some(marker) = o.marker else {
         return if o.quiet == Some(true) && !o.gate_or_modal {
             if machine_residue {
-                CycleTargetState::MachineResidue
+                (CycleTargetState::MachineResidue, None)
             } else {
-                CycleTargetState::Idle
+                (CycleTargetState::Idle, None)
             }
         } else {
-            CycleTargetState::Busy
+            (CycleTargetState::Busy, None)
         };
     };
-    if marker_row_has_draft(screen, marker, o.placeholder) {
+    if let Some(signal) = marker_row_draft_signal(screen, marker, o.placeholder) {
         // 선택기 라벨도 초안 문면으로 읽힌다 — 기계 잔여가 있어도 관문에는 clear 를 보내지 않는다.
         return if o.quiet == Some(true) && !o.gate_or_modal {
             if machine_residue {
-                CycleTargetState::MachineResidue
+                (CycleTargetState::MachineResidue, None)
             } else {
-                CycleTargetState::HumanDraft
+                (CycleTargetState::HumanDraft, Some(signal))
             }
         } else {
-            CycleTargetState::Busy
+            (CycleTargetState::Busy, None)
         };
     }
     // ★(0.14.39 · 성찰2 major ②) 권위 계수가 **두 축 모두 0 을 보고**했고(= 이 데몬은 사람 축을
@@ -1949,33 +1981,37 @@ fn cycle_target_state(o: &CycleTargetObs<'_>) -> CycleTargetState {
         && !o.gate_or_modal
     {
         if machine_residue {
-            CycleTargetState::MachineResidue
+            (CycleTargetState::MachineResidue, None)
         } else {
-            CycleTargetState::Idle
+            (CycleTargetState::Idle, None)
         }
     } else {
-        CycleTargetState::Busy
+        (CycleTargetState::Busy, None)
     }
 }
 
 /// 마지막 **선두 후보 행**의 선두 마커 뒤에 초안이 있는가(공백 정규화한 플레이스홀더는 제외).
 /// 출력·푸터의 비선두 글리프는 행 후보가 아니고, 초안 안의 재출현 글리프는 초안 문면이다.
 /// 선택 커서 행(`❯ 1. Yes`)도 초안으로 읽힌다 — 귀결이 clear 보류(비파괴)라 받아들인다.
-fn marker_row_has_draft(screen: &str, marker: &str, placeholder: Option<&str>) -> bool {
+fn marker_row_draft_signal(screen: &str, marker: &str, placeholder: Option<&str>) -> Option<DraftSignal> {
     let lines: Vec<&str> = screen.lines().collect();
-    let Some(row) = lines
+    let row = lines
         .iter()
-        .rposition(|line| cys::agent_markers::leading_marker_index(marker, line).is_some())
-    else {
-        return false;
-    };
+        .rposition(|line| cys::agent_markers::leading_marker_index(marker, line).is_some())?;
     let line = lines[row];
-    let Some(pos) = cys::agent_markers::leading_marker_index(marker, line) else {
-        return false;
-    };
+    let pos = cys::agent_markers::leading_marker_index(marker, line)?;
     let tail = line[pos + marker.len()..].trim();
-    !tail.is_empty()
-        && !placeholder.is_some_and(|p| tail.split_whitespace().eq(p.split_whitespace()))
+    let has_draft = !tail.is_empty()
+        && !placeholder.is_some_and(|p| tail.split_whitespace().eq(p.split_whitespace()));
+    has_draft.then(|| DraftSignal::TextRow {
+        from_bottom: lines.len() - 1 - row,
+        tail_chars: tail.chars().count(),
+        own_cycle_text: tail.starts_with("[CYCLE] 컨텍스트"),
+    })
+}
+
+fn marker_row_has_draft(screen: &str, marker: &str, placeholder: Option<&str>) -> bool {
+    marker_row_draft_signal(screen, marker, placeholder).is_some()
 }
 
 /// An admitted observation carried unchanged from the wait to the atomic clear.
@@ -1990,6 +2026,7 @@ struct CycleTargetObservation {
     composer: Option<Value>,
     observed_at: std::time::Instant,
     state: CycleTargetState,
+    draft_signal: Option<DraftSignal>,
     failure: Option<String>,
     quiet_secs_reported: Option<bool>,
     gate_or_modal: bool,
@@ -2029,7 +2066,7 @@ fn cycle_target_observation(
         .is_some_and(|t| cys::readiness::gate_or_modal_foreground(t, gates, marker));
     let resolved_marker =
         screen_text.and_then(|text| cys::agent_markers::pick_marker_leading_on_screen(marker, text));
-    let state = cycle_target_state(&CycleTargetObs {
+    let (state, draft_signal) = cycle_target_state_with_signal(&CycleTargetObs {
         composer: screen.as_ref().and_then(|r| r.get("composer")).filter(|c| c.is_object()),
         screen: screen_text,
         gate_or_modal,
@@ -2053,6 +2090,7 @@ fn cycle_target_observation(
         } else {
             state
         },
+        draft_signal,
         failure,
         quiet_secs_reported,
         gate_or_modal,
@@ -2150,8 +2188,12 @@ fn wait_cycle_target_idle(
                 });
             }
             CycleTargetState::HumanDraft => {
+                let signal = observed
+                    .draft_signal
+                    .map(|s| format!(" {s}"))
+                    .unwrap_or_default();
                 return Err(format!(
-                    "{CYCLE_HUMAN_DRAFT_TOKEN} {stage}: surface:{sid} 입력줄에 사람 초안(또는 미제출 입력)이 있다 — 입력을 보류한다(초안 소거 금지). 처방: 초안을 제출·삭제한 뒤 해당 단계만 재시도"
+                    "{CYCLE_HUMAN_DRAFT_TOKEN} {stage}: surface:{sid} 입력줄에 사람 초안(또는 미제출 입력)이 있다 — 입력을 보류한다(초안 소거 금지). 처방: 초안을 제출·삭제한 뒤 해당 단계만 재시도{signal}"
                 ));
             }
             CycleTargetState::Busy | CycleTargetState::MachineResidue => {}
@@ -23052,7 +23094,9 @@ fn run_cycle_agent(
                         // Holds precede the retryable zero-byte refusals. Unknown already left the loop above.
                         if is_typing_guard_err(&e) {
                             outcome = CycleOutcome::NotCleared;
-                            return Err(format!("{CYCLE_HUMAN_DRAFT_TOKEN} clear 원자 송신 거부(송신 0건 · composer 무변경): {e}"));
+                            return Err(format!(
+                                "{CYCLE_HUMAN_DRAFT_TOKEN} clear 원자 송신 거부(송신 0건 · composer 무변경): {e} [draft_signal=daemon_guard]"
+                            ));
                         }
                         if e.contains("own_paste_settling:") || e.contains("cycle_clear_unclaimed:") {
                             outcome = CycleOutcome::NotCleared;
