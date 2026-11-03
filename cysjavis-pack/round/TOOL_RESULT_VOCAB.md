@@ -24,6 +24,7 @@
 | 도구 | 기존 exit | 어휘 병기 |
 |---|---|---|
 | javis_task checkout | 0 / 9(충돌) / 4(blocker) | ok / rejected / dependency_missing |
+| javis_task 쓰기 동사 전부(create·checkout·release·set-status·set-verify-spec·lift) | 7(락 판단 불가: 쓰기락 미획득 또는 소유권 락 기록 중 — 무변이) | retryable: wait out the 30 s stale window · try ONCE · if it still returns 7, report a lock anomaly · never --settled-override · never immediate repeated retry |
 | javis_resource_gate check | 0 / 1(soft) / 2(hard) | ok / rejected(soft=경고 후 진행 관례 유지) / rejected |
 | javis_retry classify (A1) | 0 / 1 | retryable / fatal |
 | B2 check_manifest check | 0 / 1 | skipped / (생성 필요 — 어휘 없음, 판정 전 상태) |
