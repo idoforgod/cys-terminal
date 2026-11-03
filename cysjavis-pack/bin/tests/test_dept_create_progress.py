@@ -357,7 +357,7 @@ class ReadyElapsedBound(unittest.TestCase):
                 script = script.replace('ready_wait fixture', '(exit 1) & _dept_spawn_pid=$!\nwait "$_dept_spawn_pid" || true\nready_wait fixture')
             elif daemon_delay is not None:
                 script = script.replace('ready_wait fixture', '/bin/sleep %s & _dept_spawn_pid=$!\nready_wait fixture' % daemon_delay)
-                script += 'kill "$_dept_spawn_pid" 2>/dev/null || true\nwait "$_dept_spawn_pid" 2>/dev/null || true\n'
+                script += '{ kill "$_dept_spawn_pid"; wait "$_dept_spawn_pid"; } 2>/dev/null || true\n'
             env = {k: v for k, v in os.environ.items() if not k.startswith("CYS_") and k != "CLAUDE_CONFIG_DIR"}
             env.update(HOME=home, PYTHONDONTWRITEBYTECODE="1")
             started = time.monotonic()
