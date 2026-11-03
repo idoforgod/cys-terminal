@@ -158,13 +158,13 @@ describe("★재부팅 실측 재현 — 새 sid 로 되살아난 6석이 원래
 
 // ────────────────────────────────────────────────────────────────────────────
 describe("기억이 없는 경우 · 부분 복원 · 1:1", () => {
-  it("옛 저장본(역할 없음) → 구멍 0 · U3 배치로 master 왼쪽 1/3 · cso 는 대표 칸(업그레이드 첫 기동 = 폴백)", () => {
+  it("옛 저장본(역할 없음) → 구멍 0 · U3 배치로 master 왼쪽 1/3 · 기억이 없는 cso 는 오른쪽(P8 · 업그레이드 첫 기동 = 폴백)", () => {
     const legacy: LNode = JSON.parse(JSON.stringify(CEO_SAVED()).replace(/,"role":"[^"]+"/g, ""));
     const [ws] = simulateStart([{ tree: legacy }], REBOOT_LIVE, { genChanged: false, roleConflictIsDead: true });
     const t = ws.tree as LNode;
     expect(holeSidsOf(t)).toEqual([]);
     close(W(t, 30), MASTER_FRAC);
-    expect(t.type === "split" && sids(t.a).includes(29)).toBe(true);
+    expect(t.type === "split" && sids(t.b).includes(29)).toBe(true);
   });
   it("복원 진행 중: worker 만 살아 있으면 worker 결속 · master 칸은 구멍으로 남고 · 다음 틱에 오면 **같은 칸**에 결속", () => {
     const [ws0] = simulateStart([{ tree: CEO_SAVED(), layoutManual: true }], [[40, "worker"]], { genChanged: true, roleConflictIsDead: false });
@@ -193,7 +193,7 @@ describe("기억이 없는 경우 · 부분 복원 · 1:1", () => {
     const plan = adoptSeat([{ tree: t }], undefined, 7, "cso", roleOf) as NonNullable<ReturnType<typeof adoptSeat>>;
     expect(plan.boundHole).toBeNull();
     expect(holeSidsOf(plan.tree)).toEqual([-1]);
-    expect(plan.tree.type === "split" && sids(plan.tree.a).includes(7)).toBe(true); // master 구멍 = 대표 칸 → cso 는 그 아래
+    expect(plan.tree.type === "split" && sids(plan.tree.b).includes(7)).toBe(true); // P8: master 구멍 칸 밑이 아니라 오른쪽 2/3
   });
   // ★리뷰1 F8 P12 — 저장본에 이미 있던(이전 세션의) 역할 없는 구멍은 복원에서 남기지 않는다.
   // 남으면 영원히 채워지지 않는 빈 자리가 트리에 쌓인다(구멍 상한·위생과 별개로 restoreTree 자체가 거른다).

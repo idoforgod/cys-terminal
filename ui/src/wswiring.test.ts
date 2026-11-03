@@ -905,6 +905,15 @@ describe("U2+U3 좌석 배치 배선 — 대표 1/3 · 역할 자리 기억(seat
     expect(fill).toBeGreaterThan(s5);
   });
 
+  it("★P8 r2: 기동은 restoreTree 뒤·죽은 칸 제거 앞에서 칸의 역할 기억을 데몬 값으로 고친다(결과 없는 호출·누락 차단)", () => {
+    const s = restoreSlice();
+    const rt = s.indexOf("restoreTree(");
+    const memo = s.indexOf("annotateRoles(ws.tree, (x) => (lb.roles.has(x) ? lb.roles.get(x) : undefined));");
+    const dl = s.indexOf("deadLiveSids(");
+    expect(memo).toBeGreaterThan(rt);
+    expect(dl).toBeGreaterThan(memo);
+  });
+
   it("기동: 데몬 세대는 **이미 부르는** daemon_status 응답에서 읽는다(새 왕복 0 · daemonIdentOf)", () => {
     const s = startSlice();
     expect(s).toContain("daemonIdentOf(");

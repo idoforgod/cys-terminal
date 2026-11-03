@@ -5051,8 +5051,8 @@ function startGroupDrag(e0: MouseEvent, srcId: number) {
 
 // ---------- 정렬: 역할(role) 기반 고정 배치 ----------
 // 현재 워크스페이스의 살아있는 surface를 역할별 표준 자리로 재배치한다(규칙의 정의처 = seatlayout.ts roleLayout):
-//   · 왼쪽 끝 컬럼  = master(위) / cso·cso-N(아래), 세로 3:1 — ★U3(0.14.41): 폭은 pane 영역의 **1/3** 고정
-//   · 가운데        = worker·미분류 surface를 나머지 2/3 안에서 같은 폭 컬럼으로 균등 분배(좌→우 순서 보존)
+//   · 왼쪽 끝 컬럼  = master 혼자(추가 master 는 아래로 세로 3:1) — ★U3(0.14.41): 폭은 pane 영역의 **1/3** 고정
+//   · 가운데        = cso·cso-N·worker·미분류 surface를 나머지 2/3 안에서 같은 폭 컬럼으로 균등 분배(좌→우 순서 보존 · ★P8 0.14.57)
 //   · 오른쪽 끝 컬럼 = reviewer-gemini(agy, 위) / reviewer-codex(codex, 아래), 세로 1:1
 // ★U3: 정렬은 '표준 복귀'다 — 사용자가 끈 비율·수동 표식(layoutManual)을 초기화하고, 보류 중이던 빈 역할 칸(구멍)
 //   기억도 지운다(살아 있는 칸으로 새로 짠다). 정렬 뒤에도 divider 는 다시 끌 수 있다.
@@ -11018,6 +11018,10 @@ async function start() {
           return h;
         },
       });
+      // ★P8 r2(0.14.57): 3초 틱과 같이 산 칸의 역할 기억을 데몬 값으로 고친다 — 입양·S5·첫 틱 전의 자동 경로가 낡은 기억으로
+      //   결정하지 않게. reanchorAuto 기본값과 bareSeat 는 데몬 역할 없이 **칸의 기억만으로** 재정렬한다(실측: 새 master 가
+      //   역할이 바뀐 칸 위에 영구히 쌓였다). 충돌 검사(roleConflictIsDead)는 옛 기억을 봐야 하므로 restoreTree **뒤**다.
+      annotateRoles(ws.tree, (x) => (lb.roles.has(x) ? lb.roles.get(x) : undefined));
     } catch {
       /* 종전 경로 */
     }
