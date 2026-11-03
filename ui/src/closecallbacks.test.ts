@@ -104,6 +104,8 @@ function harness(workspaces = [ws(1, SOURCE, [42])]) {
     stickyToast: (...args: unknown[]) => { toasts.push(args.join(" | ")); },
     dismissToast: (_id: string) => {},
     daemonActionBlocked: () => false,
+    deptOperations: { busy: () => false },
+    deptOperationBlocksClose: () => false,
     confirmModal: async () => true,
     purgeConfirmModal: async () => true,
     rpcT: (promise: Promise<unknown>, _ms: number) => promise,
@@ -474,4 +476,24 @@ describe("S6 actual batch deletion and purge", () => {
     expect(h.closeCalls()).toEqual([]); expect(h.scope.purgingDept).toBe(false);
     expect(h.toasts.join("\n")).toContain("PURGE_DENIED");
   });
+  test("A70 review: pending target operation prevents workspace close without affecting another lane", async () => {
+    const w=ws(1,SOURCE,[42]);const other=ws(2,DEST,[80]);const h=harness([w,other]);
+    h.scope.deptOperationBlocksClose=(socket:string)=>socket===SOURCE;
+    await h.workspace(w).click();expect(h.scope.workspaces).toContain(w);expect(h.closeCalls()).toEqual([]);
+    await h.workspace(other).click();expect(h.scope.workspaces).not.toContain(other);
+  });
+  test("A70 review: group confirmation rechecks pending target before any tombstone or close", async () => {
+    const w=ws(1,SOURCE,[42],7);const h=harness([w,ws(2,DEST,[80])]);
+    h.scope.deptOperationBlocksClose=()=>true;h.api.armGroup(7);await h.api.confirmDeleteGroup({id:7,name:"group"});
+    expect(h.scope.workspaces).toContain(w);expect(h.closeCalls()).toEqual([]);
+    expect(h.calls.some((c:any)=>c.command==="dept_tombstone_by_socket")).toBe(false);
+  });
+
+  test("R2: workspace close rechecks ownership acquired while confirmation was open",async()=>{
+    const w=ws(1,SOURCE,[42]);const h=harness([w,ws(2,DEST,[80])]);let busy=false;
+    h.scope.deptOperationBlocksClose=()=>busy;h.scope.confirmModal=async()=>{busy=true;return true};
+    await h.workspace(w).click();expect(h.scope.workspaces).toContain(w);expect(h.closeCalls()).toEqual([]);
+    expect(h.calls.some((c:any)=>c.command==="dept_tombstone_by_socket")).toBe(false);
+  });
+
 });

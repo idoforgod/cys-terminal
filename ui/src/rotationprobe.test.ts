@@ -1,6 +1,8 @@
 // WP12 B2: execute the real UI functions, including their asynchronous control flow.
 import { describe, it, expect } from "bun:test";
 import { readFileSync } from "node:fs";
+import { DepartmentOperations } from "./deptoperations";
+import { sameSocket } from "./wsreconcile";
 
 declare const Bun: { Transpiler: new (o: { loader: "ts" }) => { transformSync(s: string): string } };
 const main = readFileSync(new URL("./main.ts", import.meta.url), "utf-8");
@@ -29,7 +31,13 @@ function rig(options: { mainSkew?: boolean; fail?: (call: Call) => unknown; dela
   // r1 m4: the departments-only transition needs departments that STOP being skewed, which is
   // what a successful departments-only retry leaves behind. Defaults to the old behaviour.
   let deptSkew = true;
+  const timers = new Map<number, () => void>(); let timerId=0;
   const scope = {
+    DepartmentOperations: class extends DepartmentOperations {
+      constructor() {super((f)=>{const id=++timerId;timers.set(id,f);return id}, (id)=>{timers.delete(id as number)});}
+    },
+    flushDeptTimers: () => { const run=[...timers.values()]; timers.clear(); for(const f of run) f(); },
+    IS_WINDOWS: false, T_LAUNCH: 60_000, workspaces: [], sameSocket,
     rotatingDaemon: false, purgingDept: false, factoryResetting: false, resetCompleted: false,
     document: {
       getElementById: () => ({ appendChild: () => {} }),
@@ -304,6 +312,75 @@ describe("WP12 rotation refusal latch", () => {
     expect(await r.api.rotateDeptDaemon("first", false)).toBe("blocked");
     const ordinary = rig({ fail: () => new Error("context: " + shellRefusal) });
     expect(await ordinary.api.rotateMainDaemon(false)).toBe("err");
+  });
+
+  it("A70: a hung department remains pending while the serial walk reaches the next lane", async () => {
+    const never = new Promise<void>(() => {});
+    const r = rig({ delay: (c) => c.cmd === "rotate_dept_daemon" && c.args?.name === "first" ? never : undefined });
+    let result:any;void r.api.restartAllDaemons(false).then((v)=>{result=v});
+    for (let i=0;i<30;i++) await Promise.resolve();
+    // The harness advances only the UI observation timer, never the operation.
+    (r.scope as any).flushDeptTimers?.();
+    for (let i=0;i<30;i++) await Promise.resolve();
+    expect(r.rotations().filter((c)=>c.cmd==="rotate_dept_daemon").map((c)=>c.args?.name)).toEqual(["first","later"]);
+    expect(result.pendingDepts).toEqual(["first"]);expect(result.failedDepts).toEqual([]);
+  });
+
+  it("A70: a hung base remains pending while the serial walk reaches departments", async () => {
+    const never=new Promise<void>(()=>{});
+    const r=rig({delay:(c)=>c.cmd==="rotate_daemon"?never:undefined});
+    let result:any;void r.api.restartAllDaemons(false).then((v)=>{result=v});
+    for(let i=0;i<30;i++)await Promise.resolve();r.scope.flushDeptTimers();
+    for(let i=0;i<70;i++)await Promise.resolve();
+    expect(r.rotations().map((c)=>c.cmd)).toEqual(["rotate_daemon","rotate_dept_daemon","rotate_dept_daemon"]);
+    expect(result.pendingMain).toBe(true);expect(result.failedDepts).toEqual([]);
+  });
+  it("A70: repeat rotation of a pending department does not invoke another native operation", async () => {
+    let complete!:()=>void;const pending=new Promise<void>((r)=>{complete=r});
+    const r=rig({mainSkew:false,delay:(c)=>c.cmd==="rotate_dept_daemon"&&c.args?.name==="first"?pending:undefined});
+    const first=r.api.rotateDeptDaemon("first",false);
+    for(let i=0;i<20;i++)await Promise.resolve();r.scope.flushDeptTimers();expect(await first).toBe("pending");
+    expect(await r.api.rotateDeptDaemon("first",false)).toBe("pending");
+    expect(r.rotations().length).toBe(1);complete();for(let i=0;i<30;i++)await Promise.resolve();
+    expect(r.notices.some((n)=>String(n).includes("완료"))).toBe(true);
+  });
+  it("A70: reset completion suppresses late completion notices", async () => {
+    let complete!:()=>void;const pending=new Promise<void>((r)=>{complete=r});
+    const r=rig({delay:(c)=>c.cmd==="rotate_dept_daemon"?pending:undefined});
+    const first=r.api.rotateDeptDaemon("first",false);
+    for(let i=0;i<20;i++)await Promise.resolve();r.scope.flushDeptTimers();await first;
+    r.scope.resetCompleted=true;complete();for(let i=0;i<30;i++)await Promise.resolve();expect(r.notices).toEqual([]);
+  });
+
+  it("A70: pending manual walk does not announce all rotations complete", async () => {
+    let done!:()=>void;const pending=new Promise<void>((r)=>{done=r});
+    const r=rig({delay:(c)=>c.cmd==="rotate_dept_daemon"&&c.args?.name==="first"?pending:undefined});
+    const walk=r.api.manualRotateSkewed("0.14.53",false,[{name:"first",socket:"s1"},{name:"later",socket:"s2"}]);
+    for(let i=0;i<30;i++)await Promise.resolve();r.scope.flushDeptTimers();await walk;
+    expect(r.rotations().map((c)=>c.args?.name)).toEqual(["first","later"]);
+    expect(r.notices.some((n)=>String(n).includes("진행 중"))).toBe(true);
+    expect(r.notices.some((n)=>String(n).includes("✅"))).toBe(false);
+    done();for(let i=0;i<30;i++)await Promise.resolve();expect(r.notices.some((n)=>String(n).includes("작업 완료"))).toBe(true);
+  });
+  it("A70: an actual late native error is reported after pending", async () => {
+    let done!:()=>void;const pending=new Promise<void>((r)=>{done=r});
+    const r=rig({delay:(c)=>c.cmd==="rotate_dept_daemon"?pending:undefined,fail:(c)=>c.cmd==="rotate_dept_daemon"?"actual native error":undefined});
+    const first=r.api.rotateDeptDaemon("first",false);
+    for(let i=0;i<20;i++)await Promise.resolve();r.scope.flushDeptTimers();expect(await first).toBe("pending");
+    expect(r.notices).toEqual([]);done();for(let i=0;i<30;i++)await Promise.resolve();
+    expect(r.notices.some((n)=>String(n).includes("actual native error"))).toBe(true);
+  });
+
+  it("A70 review: a repeated manual late refusal emits fresh feedback each time",async()=>{
+    const pauses:Array<()=>void>=[];
+    const r=rig({delay:(c)=>c.cmd==="rotate_dept_daemon"?new Promise<void>(resolve=>{pauses.push(resolve)}):undefined,
+      fail:(c)=>c.cmd==="rotate_dept_daemon"?shellRefusal:undefined});
+    for(let n=0;n<2;n++){
+      const walk=r.api.manualRotateSkewed("0.14.53",false,[{name:"first",socket:"s1"}]);
+      for(let i=0;i<30;i++)await Promise.resolve();r.scope.flushDeptTimers();await walk;pauses[n]();
+      for(let i=0;i<30;i++)await Promise.resolve();
+    }
+    expect(r.notices.filter((a)=>String(a).includes("새 실행 파일 확인 실패")).length).toBe(2);
   });
 
 });

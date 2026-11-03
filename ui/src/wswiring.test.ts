@@ -103,6 +103,9 @@ describe("복원 배선 — 체인의 모든 대기에 시간 상한이 있다",
     // 300ms 데몬 대기 프로브: rpcT 로 감싸지 않는 대신 claimFlight 재진입 가드로 동시 1건을
     // 보장하고, 대기가 어떤 경로로 풀리든 stop() 이 인터벌을 회수한다(무계 적체 없음).
     'const call = invoke("daemon_status");',
+    // A70: the watcher bounds only the view wait, retains native ownership until settlement,
+    // and reports pending instead of failure. Behavioral tests execute both horizons.
+    'watchDeptOperation(launchName, "launch", () => invoke("launch_dept_daemon", { name: launchName })',
     // ★G1(2026-09-17 10라운드): 복원 루프의 묘비 정리는 **await 하지 않는다**(HEAD 의미론). 상한이
     // 필요한 이유는 '복원 체인이 그 호출을 기다리기 때문'인데 여기서는 기다리지 않으므로 화면·예산에
     // 어떤 지연도 얹지 않는다(=다른 방식으로 유계다). 기다리는 판이 되살아나면 아래 G1 핀이 red 다.
@@ -615,12 +618,19 @@ describe("부서 삭제 — 탭은 종료가 확인된 뒤에 지운다(F3)", ()
 // 탭 유지 + 트리 비움 + 사유 토스트 1회. 자동 재조회·재시도 없음(수동 [지금 켜기] 또는 앱 재기동).
 // ────────────────────────────────────────────────────────────────────────────
 describe("복원 보류 — 탭은 유지하고 트리만 비운다(F2)", () => {
-  it("★자동 재조회 타이머가 없다 — 이 세션에서 다시 묘비를 묻지 않는다(폭주·상한 우회 제거)", () => {
+  it("A61: no new tombstone retry timer or automatic launch; discovery reuses the sidebar tick", () => {
     for (const gone of ["tombRetryGate", "TOMB_RETRY", "runTombRetry", "scheduleTombRetry"]) {
       expect(src.includes(gone)).toBe(false);
     }
-    // 묘비 조회는 복원 블록의 1회뿐이다(타이머·인터벌에 얹히지 않는다).
-    expect((code.match(/invoke\("dept_tombstones"\)/g) ?? []).length).toBe(1);
+    // Startup plus read-only discovery. Discovery cannot retry automatic launch.
+    expect((code.match(/invoke\("dept_tombstones"\)/g) ?? []).length).toBe(2);
+    const begin = code.indexOf("async function refreshRegisteredWorkspaces(");
+    const end = code.indexOf("async function refreshSidebarStatus(", begin);
+    expect(begin).toBeGreaterThan(0);
+    const discovery = code.slice(begin, end);
+    expect(discovery).not.toContain('invoke("launch_dept_daemon"');
+    expect(discovery).not.toContain('invoke("stop_dept_daemon_by_socket"');
+    expect(discovery).toContain("deptDiscoveryInFlight");
     for (const m of code.matchAll(/setTimeout\(([^\n]*)/g)) expect(m[1]).not.toContain("dept_tombstones");
     for (const m of code.matchAll(/setInterval\(([^\n]*)/g)) expect(m[1]).not.toContain("dept_tombstones");
   });

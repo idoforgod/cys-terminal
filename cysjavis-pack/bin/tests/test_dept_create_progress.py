@@ -7,9 +7,8 @@
 코드와 stderr 가 그대로 사용자에게 간다). 그 사이 화면은 스피너뿐이었고(실측 시작→소켓 청취 약 23초) 스폰 뒤 대기 상한을
 넘으면 "데몬 기동 실패" 한 줄이 전부였다. 이 판이 더한 것(전부 가산 · 기본 동작 무변경):
 
-  A. dept_ready_secs   — CYS_DEPT_READY_SECS 해석(정수 12~180 만 유효 · 그 밖 전부 12 — 상한 180 은 부트 폴백의 240초 제한시간보다 낮게 잡은 값) · 순수 함수 · 비어 있지 않은 무효 값은 경고 1줄(R2F-PK · 프로세스당 1회 · 기본 경로 무경고)
-  B. ready_wait/ready  — 스폰 뒤 대기 = 횟수 상한(초×10 · 기본 120 = 종전) **그리고** 121번째 반복부터 `$SECONDS` 경과가 노브 초에 닿으면 끝(R2F-PK · 첫 120회는 시계를 보지 않는다 — 어느 플랫폼에서도 기본보다 짧아지지 않는다) ·
-                          사전 검사 `ready` 는 env 무관 120 고정 · 가짜 시계(핑 목이 SECONDS 를 민다)로 기한을 결정론으로 잰다
+  A. A70 policy=min(180*max(1,N),900); explicit12..86400 override wins; invalid uses policy.
+  B. A66 ready_wait — one owned elapsed budget including slow ping children; the historical precheck ready count is unchanged.
   C. dept_reserve_grace— 노브를 12 보다 올렸을 때만 create 예약 유예 = max(RESERVE_GRACE 또는 25, 노브+17)(R2F-PK — 벽시계 상한이 생겨 종전의 `노브/5` 항은 근거가 없어졌다) · 노브를 올렸는데 RESERVE_GRACE 가 정수가 아니면
                           stderr 경고 1줄(기본 경로에서는 경고 없음) · 노브가 기본이면 종전 인라인 값(`${CYS_DEPT_RESERVE_GRACE:-25}`) 그대로(명시한 낮은 값도) + 실흐름 분기 핀
   D. @stage 표지       — allocate·create 의 stderr 1줄 기계 판독 표지(순서 불변식 · stdout 0회 · launch 무변경) · **`spawn` 표지의 유무는 화면이 '새 팀'을 판정하는 계약**이다(재사용 갈래는 내지 않는다)
@@ -19,7 +18,7 @@
                           기본 경로 출력은 종전과 같다
 
 라이브 무접촉: 격리 HOME + 목 cys/cysd/sleep($HOME/.local/bin — cys-dept 의 PATH 선두). 실 데몬·실 팩·~/.cys 를 건드리지 않는다.
-목 sleep 은 no-op 이라 목 cysd 가 소켓을 열지 않는 실패 시나리오의 12초+12초 대기가 수 초로 줄고, 핑 횟수는 목 cys 가 센다.
+Flow fixtures explicitly set12 seconds; they do not assert the product default. Fake sleep accelerates polling; real elapsed/death tests use real child processes.
 함수 단위 핀은 cys-dept 에서 함수 정의를 **그대로 떼어** bash 로 평가한다(사본 금지 — test_dept_name_guard.SockLenDiag 와 같은 관례).
 
     CYS_PACK_DIR="$(mktemp -d)" python3 cysjavis-pack/bin/tests/test_dept_create_progress.py
@@ -136,16 +135,25 @@ CYSD_STUB = r'''#!/bin/sh
 echo "cysd spawn $CYS_SOCKET" >> "@CALLS@"
 [ "${STUB_CYSD_MODE:-up}" = dead ] && exit 0
 mkdir -p "$(dirname "$CYS_SOCKET")"
-touch "$CYS_SOCKET"
+if [ "${STUB_CYSD_MODE:-up}" != silent ]; then
+  # A98: socket readiness wins over child death; no long-lived success fixture.
+  touch "$CYS_SOCKET"
+  exit 0
+fi
+# Only the live-silent scenario needs a persistent, private-HOME-owned child.
+echo "$$" > "$HOME/.stub-cysd.pid"
+i=0
+while [ -d "$HOME" ] && [ "$i" -lt 3600 ]; do /bin/sleep 0.05; i=$((i+1)); done
 exit 0
 '''
 SLEEP_STUB = "#!/bin/sh\nexit 0\n"
 # 재기록 호출(`reg_restamp` 의 파이썬 — argv 에 `restamp:<종류>` 표지가 있다)만 실패시키는 가짜 python3 — 그 밖의 호출은 진짜 인터프리터로 넘긴다(stdin 의 히어독 그대로 전달).
 PYTHON_WRAP = "#!/bin/sh\ncase \" $* \" in\n  *\" restamp:\"*) echo \"[mock python3] 재기록 호출 실패 모사\" >&2; exit \"${STUB_RESTAMP_RC:-1}\" ;;\nesac\nexec \"@REALPY@\" \"$@\"\n"
-# ★결정론(부하 경주 차단): 목 sleep 이 no-op 이라 `ready_wait` 120회는 수백 ms 에 끝난다 — 백그라운드로 뜬 목 cysd 가 그 안에 소켓 파일을 못 만들면
-#   (부하·nice·샌드박스 exec 지연) 성공 경로가 "데몬 기동 실패"로 뒤집힌다(실측 2회: 부하 중 실행 — 자식이 수 초 늦게 뜬다). 그래서 **성공해야 하는** 신규
-#   스폰 시나리오는 소켓 파일이 아니라 핑 횟수로 '데몬이 떴다'를 정한다 — 소켓별 130 번째 핑부터 응답(번호 점유 확인 1 + 사전 검사 120 은 실패 · 스폰 뒤 대기 10번째 핑에서
-#   성공). 같은 이유로 목 cysd 의 호출 기록(백그라운드 자식이 쓴다)은 어떤 단언에도 쓰지 않고, 스폰 여부는 동기 증거(`Sandbox.spawned` — 부모 셸이 만드는 cysd.log)로 본다.
+# Flow fixtures use an explicit12-second override and no-op sleep, not the
+# production default. Successful scenarios use a deterministic ping-count signal
+# so socket-marker scheduling does not decide readiness. UP_AT_PING includes the
+# fixed120 pre-probes plus any reservation probe. Spawn evidence is the parent's
+# synchronous log redirection, not the asynchronously written child call log.
 UP_AT_PING = "130"
 
 
@@ -173,7 +181,7 @@ class Sandbox(object):
         with open(os.path.join(pack, "agents.json"), "w", encoding="utf-8") as f:
             json.dump({"claude": {"cmd": "claude", "env": {"CLAUDE_CONFIG_DIR": "/base"}}}, f)
         self.reg = os.path.join(self.home, ".cys", "depts.json")
-        env = dict(os.environ)
+        env = {k: v for k, v in os.environ.items() if not k.startswith("CYS_") and k != "CLAUDE_CONFIG_DIR"}
         for k in list(env):
             if k.startswith("STUB_") or k.startswith("_CYS_TT_"):
                 env.pop(k)
@@ -181,13 +189,24 @@ class Sandbox(object):
                   "CYS_DEPT_DEFAULT_ACCOUNT", "CYS_PRIMARY_ACCOUNT", "CYS_DEPT_CWD", "CYS_DEPT_READY_SECS",
                   "CYS_DEPT_RESERVE_GRACE", "CYS_DEPT_CAP", "CYS_SURFACE_ID", "CYS_DEPT_NO_MASTER"):
             env.pop(k, None)
-        env.update({"HOME": self.home, "CYS_DEPTS_JSON": self.reg, "CYS_DEPT_NO_MASTER": "1",
+        env.update({"HOME": self.home, "CYS_DEPTS_JSON": self.reg, "CYS_DEPT_NO_MASTER": "1", "CYS_DEPT_READY_SECS": "12",
                     "PATH": bindir + os.pathsep + env.get("PATH", "")})
         env.update(env_extra)
         self.env = env
 
     def cleanup(self):
+        marker = os.path.join(self.home, ".stub-cysd.pid")
+        try: pid = int(_read(marker).strip())
+        except (OSError, ValueError): pid = None
         shutil.rmtree(self.tmp, ignore_errors=True)
+        # The private fixture observes HOME removal and exits itself; never kill
+        # a guessed/recycled PID. Wait a bounded interval for its exit to land.
+        if pid:
+            for _ in range(40):
+                try: os.kill(pid, 0)
+                except ProcessLookupError: break
+                time.sleep(.05)
+            else: raise AssertionError("private daemon fixture did not exit after HOME cleanup")
 
     def run(self, *args, **kw):
         r = subprocess.run(["bash", DEPT] + list(args), capture_output=True, text=True, encoding="utf-8",
@@ -250,32 +269,32 @@ class Sandbox(object):
 
 
 def bash_eval(script, env_extra=None, unset=()):
-    env = dict(os.environ)
-    for k in ("CYS_DEPT_READY_SECS", "CYS_DEPT_RESERVE_GRACE", "OK_AT") + tuple(unset):
-        env.pop(k, None)
-    env.update(env_extra or {})
-    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, encoding="utf-8", env=env, timeout=60)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("CYS_") and k != "CLAUDE_CONFIG_DIR"}
+    for k in ("OK_AT",) + tuple(unset): env.pop(k, None)
+    with tempfile.TemporaryDirectory(prefix="ready-eval-") as home:
+        env.update(HOME=home, CYS_DEPTS_JSON=os.path.join(home, "depts.json"), PYTHONDONTWRITEBYTECODE="1")
+        env.update(env_extra or {})
+        r = subprocess.run(["bash", "-c", script, DEPT], capture_output=True, text=True, encoding="utf-8", env=env, timeout=60)
     return r.returncode, r.stdout, r.stderr
+
 
 
 # ════════════════════════════════════════════════════════════════════════════════════
 # A. dept_ready_secs — 순수 해석 함수
 # ════════════════════════════════════════════════════════════════════════════════════
 class DeptReadySecs(unittest.TestCase):
-    # (환경변수 값 — None=미설정, 기대 초). 앞 11행은 GP 티켓이 지정한 핀이다 — 0.14.43 성찰(R1F-PK · S4 m2)에서 상한이 600 → 180 으로 내려가 그중 '600 → 600' 행만
-    #   '180 → 180' 으로 바뀌었다(범위 밖은 종전처럼 12 로 읽는다 — 상한으로 접지 않는다). 종전 유효 값(600·599·300 …)은 아래에서 12 로 못박는다.
-    CASES = [(None, "12"), ("12", "12"), ("60", "60"), ("180", "180"), ("181", "12"), ("11", "12"), ("0", "12"),
-             ("-5", "12"), ("abc", "12"), ("30.5", "12"), ("", "12"),
-             # m2 — 상한 경계(179·180·181)와 종전 유효였던 값(600·599·300·182 …): 이제 상한 초과 → 12
-             ("179", "179"), ("182", "12"), ("300", "12"), ("599", "12"), ("600", "12"), ("601", "12"),
-             # 경계·형식 — 선행 0 은 10진(08·09 가 8진 오류로 죽지 않는다) · 공백/부호/지수/긴 숫자는 무효
-             ("13", "13"), ("012", "12"), ("08", "12"), ("09", "12"), ("060", "60"), ("00180", "180"), ("0181", "12"),
-             ("0601", "12"), ("00600", "12"), ("99999999999999999999", "12"), (" 60", "12"), ("60 ", "12"), ("1e2", "12"),
-             ("+60", "12"), ("6 0", "12")]
+    # A70: explicit12..86400 wins; an empty private registry defaults to180.
+    CASES = [(None, "180"), ("", "180"), ("12", "12"), ("60", "60"), ("180", "180"),
+             ("181", "181"), ("600", "600"), ("86400", "86400"), ("086400", "86400"),
+             ("86401", "180"), ("11", "180"), ("0", "180"), ("-5", "180"), ("abc", "180"),
+             ("30.5", "180"), ("012", "12"), ("08", "180"), ("060", "60"),
+             ("99999999999999999999999", "180"), (" 60", "180"), ("60 ", "180"),
+             ("1e2", "180"), ("+60", "180"), ("6 0", "180")]
+
 
     @classmethod
     def setUpClass(cls):
-        cls.fn = func_text(_read(DEPT), "dept_ready_secs")
+        cls.fn = "".join(func_text(_read(DEPT), n) for n in ("dept_ready_default", "dept_ready_secs"))
 
     def test_interpretation_table(self):
         for val, want in self.CASES:
@@ -294,161 +313,167 @@ class DeptReadySecs(unittest.TestCase):
 # B. ready_wait / ready — 핑 횟수 예산
 # ════════════════════════════════════════════════════════════════════════════════════
 class ReadyBudget(unittest.TestCase):
-    """sleep 을 no-op 함수로, CYS 를 호출 횟수를 세는 함수로 바꿔 횟수만 잰다(제품 함수 정의를 그대로 평가)."""
+    """The unchanged pre-spawn probe still has its historical count contract."""
 
-    @classmethod
-    def setUpClass(cls):
-        src = _read(DEPT)
-        cls.funcs = "".join(func_text(src, n) for n in ("ready", "ready_wait", "dept_ready_secs"))
+    def count(self, ok_at=0, knob="12"):
+        script = "set -u\n" + func_text(_read(DEPT), "ready")
+        script += 'sleep(){ :; }\nCOUNT=0\ncys_probe(){ COUNT=$((COUNT+1)); [ "$OK_AT" -gt 0 ] && [ "$COUNT" -ge "$OK_AT" ]; }\nCYS=cys_probe\nready sock\necho rc=$? count=$COUNT\n'
+        rc, out, err = bash_eval(script, {"OK_AT": str(ok_at), "CYS_DEPT_READY_SECS": knob})
+        self.assertEqual((rc, err), (0, ""))
+        return out
 
-    def count(self, call, ready_secs=None, ok_at=0):
-        script = ("set -u\n" + self.funcs + "sleep(){ :; }\nCOUNT=0\n"
-                  'cys_probe(){ COUNT=$((COUNT + 1)); [ "${OK_AT:-0}" -gt 0 ] && [ "$COUNT" -ge "$OK_AT" ]; }\n'
-                  "CYS=cys_probe\n" + call + '\necho "rc=$? count=$COUNT"\n')
-        env = {"OK_AT": str(ok_at)}
-        if ready_secs is not None:
-            env["CYS_DEPT_READY_SECS"] = ready_secs
-        rc, out, err = bash_eval(script, env)
-        self.assertEqual((rc, err), (0, ""), "하네스 오류: %r" % err)
-        m = re.fullmatch(r"rc=(\d+) count=(\d+)\n", out)
-        self.assertIsNotNone(m, "출력 형식: %r" % out)
-        return int(m.group(1)), int(m.group(2))
+    def test_precheck_count_is_knob_independent(self):
+        for knob in ("12", "13", "60", "180", "bad"):
+            self.assertEqual(self.count(knob=knob), "rc=1 count=120\n")
 
-    def test_ready_wait_default_is_120_like_ready(self):
-        self.assertEqual(self.count("ready_wait sock"), (1, 120), "기본에서 ready_wait 는 ready 와 같은 120회여야 한다(기본 무변경)")
-        self.assertEqual(self.count("ready sock"), (1, 120))
-
-    def test_ready_wait_follows_knob(self):
-        for secs, want in (("12", 120), ("13", 130), ("60", 600), ("180", 1800)):
-            with self.subTest(CYS_DEPT_READY_SECS=secs):
-                self.assertEqual(self.count("ready_wait sock", secs), (1, want))
-        for bad in ("11", "181", "600", "601", "abc", "", "30.5", "-5"):   # 무효 값(상한 180 초과 포함)은 12 로 → 120회
-            with self.subTest(CYS_DEPT_READY_SECS=bad):
-                self.assertEqual(self.count("ready_wait sock", bad), (1, 120))
-
-    def test_ready_precheck_is_env_independent(self):
-        for secs in (None, "13", "60", "180", "600", "abc"):
-            with self.subTest(CYS_DEPT_READY_SECS=secs):
-                self.assertEqual(self.count("ready sock", secs), (1, 120), "사전 검사 ready 는 노브와 무관한 120회 고정이어야 한다")
-
-    def test_success_on_kth_probe_returns_zero_at_k(self):
-        for k in (1, 7, 120, 121, 130):
-            with self.subTest(k=k):
-                self.assertEqual(self.count("ready_wait sock", "13", ok_at=k), (0, k))
-        self.assertEqual(self.count("ready_wait sock", "13", ok_at=131), (1, 130), "예산(130) 밖의 성공은 닿지 못한다")
-        self.assertEqual(self.count("ready_wait sock", None, ok_at=121), (1, 120), "기본 예산(120) 밖의 성공은 닿지 못한다")
-        for k in (1, 7, 120):
-            with self.subTest(ready_k=k):
-                self.assertEqual(self.count("ready sock", "60", ok_at=k), (0, k))
-        self.assertEqual(self.count("ready sock", "60", ok_at=121), (1, 120), "사전 검사는 노브를 올려도 120 에서 끝난다")
+    def test_precheck_success_and_count_boundary(self):
+        for n in (1, 7, 120):
+            self.assertEqual(self.count(n), "rc=0 count=%d\n" % n)
+        self.assertEqual(self.count(121), "rc=1 count=120\n")
 
 
-class ReadyWallClock(unittest.TestCase):
-    """B(R2F-PK): 스폰 뒤 대기 = 횟수 상한(초×10) **그리고** 121번째 반복부터 `$SECONDS` 경과가 노브 초에 닿으면 끝. 핑 목이 `SECONDS` 를 대입으로 밀어
-    '느린 기계'를 흉내 낸다(실제로 기다리지 않는다 · bash 3.2 에서 동작 — 4번째 핑마다 +1초 = 윈도우 11 러너(반복 ≈ 0.237초) 모양 · 8번째마다 = 맥(≈ 0.118초) 모양).
-    기존 횟수 핀(ReadyBudget — 목 sleep 이 무동작이라 시계가 안 가므로 횟수로 끝난다)은 그대로 통과해야 하고, 이 클래스가 기한 쪽을 잰다."""
+class ReadyElapsedBound(unittest.TestCase):
+    """A66: actual slow child pings must consume the whole wait's deadline."""
 
-    @classmethod
-    def setUpClass(cls):
-        src = _read(DEPT)
-        cls.funcs = "".join(func_text(src, n) for n in ("ready", "ready_wait", "dept_ready_secs"))   # 기존 ReadyBudget 과 같은 세 함수 — ready_wait 는 자기완결·무소음이다
+    def run_probe(self, delay, result, budget=1, daemon_delay=None):
+        with tempfile.TemporaryDirectory(prefix="a66-ready-") as home:
+            probe = os.path.join(home, "probe")
+            _write_exec(probe, "#!/bin/sh\n/bin/sleep %s\nexit %s\n" % (delay, result))
+            if daemon_delay == "first-ping":
+                _write_exec(probe, '#!/bin/sh\nif [ ! -e "$HOME/first-ping" ]; then\n'
+                            '  touch "$HOME/first-ping"\n'
+                            '  while kill -0 "$PROBE_CHILD" 2>/dev/null; do /bin/sleep 0.02; done\n'
+                            '  exit 1\nfi\n/bin/sleep %s\nexit %s\n' % (delay, result))
+            src = _read(DEPT)
+            script = "set -u\n" + "".join(func_text(src, n) for n in ("ready_wait", "dept_ready_secs"))
+            # Short budgets exercise the negative deadline cases. The successful
+            # control uses the public 12-second floor; the parser accepts 12..86400.
+            script += "dept_ready_secs(){ echo %s; }\nCYS=\"$1\"\nready_wait fixture\nrc=$?\necho result=$rc elapsed=$_READY_WAIT_SECS\n" % budget
+            if daemon_delay == "first-ping":
+                script = script.replace('ready_wait fixture',
+                    '(while [ ! -e "$HOME/first-ping" ]; do /bin/sleep 0.02; done) & _dept_spawn_pid=$!\n'
+                    'export PROBE_CHILD="$_dept_spawn_pid"\nready_wait fixture')
+            elif daemon_delay == "reaped":
+                script = script.replace('ready_wait fixture', '(exit 1) & _dept_spawn_pid=$!\nwait "$_dept_spawn_pid" || true\nready_wait fixture')
+            elif daemon_delay is not None:
+                script = script.replace('ready_wait fixture', '/bin/sleep %s & _dept_spawn_pid=$!\nready_wait fixture' % daemon_delay)
+                script += '{ kill "$_dept_spawn_pid"; wait "$_dept_spawn_pid"; } 2>/dev/null || true\n'
+            env = {k: v for k, v in os.environ.items() if not k.startswith("CYS_") and k != "CLAUDE_CONFIG_DIR"}
+            env.update(HOME=home, PYTHONDONTWRITEBYTECODE="1")
+            started = time.monotonic()
+            r = subprocess.run(["bash", "-c", script, DEPT, probe], env=env,
+                               capture_output=True, text=True, timeout=max(12, budget + 10))
+            elapsed = time.monotonic() - started
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(r.stderr, "")
+            m = re.fullmatch(r"result=(\d+) elapsed=(\d+)\n", r.stdout)
+            self.assertIsNotNone(m, r.stdout)
+            return int(m.group(1)), elapsed
 
-    def run_wait(self, knob, every=1, step=1, ok_at=0, call="ready_wait sock"):
-        # 핑 k 번째마다(k % every == 0) 시계를 step 초 민다. SECONDS 대입은 이 가짜 핑에만 있다(제품 코드는 대입하지 않는다 — Census).
-        script = ("set -u\n" + self.funcs + "sleep(){ :; }\nCOUNT=0\n"
-                  'cys_probe(){ COUNT=$((COUNT + 1)); if [ $((COUNT % EVERY)) -eq 0 ]; then SECONDS=$((SECONDS + STEP)); fi; '
-                  '[ "${OK_AT:-0}" -gt 0 ] && [ "$COUNT" -ge "$OK_AT" ]; }\n'
-                  "CYS=cys_probe\n" + call + '\nrc=$?\necho "rc=$rc count=$COUNT elapsed=${_READY_WAIT_SECS:-none}"\n')
-        env = {"OK_AT": str(ok_at), "EVERY": str(every), "STEP": str(step)}
-        if knob is not None:
-            env["CYS_DEPT_READY_SECS"] = knob
-        rc, out, err = bash_eval(script, env)
-        self.assertEqual((rc, err), (0, ""), "하네스 오류: %r" % err)
-        m = re.fullmatch(r"rc=(\d+) count=(\d+) elapsed=(\d+|none)\n", out)
-        self.assertIsNotNone(m, "출력 형식: %r" % out)
-        return int(m.group(1)), int(m.group(2)), m.group(3)
+    def test_reaped_startup_lock_loser_accepts_healthy_holder_ping(self):
+        # A98: the spawned loser has exited and been reaped before readiness.
+        # The socket ping represents the independently running healthy holder.
+        rc, _ = self.run_probe(.1, 0, budget=12, daemon_delay="reaped")
+        self.assertEqual(rc, 0, "healthy holder ping must win over exited startup-lock loser")
 
-    def test_deadline_cuts_after_the_first_120_iterations(self):
-        # 1초/핑(아주 느린 기계): 120회까지는 시계를 보지 않는다 — 노브가 13·60 이어도 120회를 채우고, 121번째 반복에서 기한이 이미 지나 있어 거기서 끊는다(횟수 상한 130·600 에 못 미친다).
-        for knob in ("13", "60"):
-            with self.subTest(CYS_DEPT_READY_SECS=knob):
-                rc, count, _el = self.run_wait(knob, every=1, step=1)
-                self.assertEqual((rc, count), (1, 121), "120회 뒤 첫 판정(121번째)에서 기한이 끊어야 한다")
-        # 기한이 121번째 이후에 있으면 기한(노브 초)에서 끊는다 — 횟수 상한(1800)보다 한참 일찍. 초 경계를 걸치는 실행을 위해 ±1.
-        rc, count, _el = self.run_wait("180", every=1, step=1)
+    def test_dead_lock_loser_does_not_accept_a_ping_after_deadline(self):
+        rc, elapsed = self.run_probe(3, 0, budget=1, daemon_delay="reaped")
+        self.assertEqual(rc, 1, "a dead loser cannot exempt the holder ping from the budget")
+        self.assertLess(elapsed, 2.5)  # wallclock: guard owned one-second timeout, not readiness latency
+
+    def test_failed_ping_before_child_death_rechecks_healthy_holder(self):
+        # First ping observed failure, then releases and observes child exit.
+        # A fresh ping after that observation sees the independently ready holder.
+        rc, _ = self.run_probe(.1, 0, budget=12, daemon_delay="first-ping")
+        self.assertEqual(rc, 0, "child death needs a fresh ping, not the older failed observation")
+
+    def test_final_ping_after_child_death_stays_inside_owned_budget(self):
+        rc, elapsed = self.run_probe(3, 0, budget=1, daemon_delay="first-ping")
         self.assertEqual(rc, 1)
-        self.assertIn(count, (179, 180), "노브 180·1초/핑: 기한(180초)에서 끊겨야 한다(횟수 상한은 1800)")
+        self.assertLess(elapsed, 2.5)  # wallclock: guard bounds the owned probe process
 
-    def test_knobs_13_to_28_are_never_shorter_than_the_default(self):
-        # 윈도우 11 러너 모양(4번째 핑마다 +1초): 첫 120회가 이미 30초 — 기한(13~28초)은 121번째 시점에 지나 있다. 시계를 처음부터 봤다면(순수 기한판) 노브 13~28 은 13~28초(약 52~112회)에서 끝나
-        #   기본(120회)보다 **짧아진다**(비단조 — "느려서 올렸는데 더 빨리 포기"). 첫 120회는 시계를 보지 않으므로 어느 값도 기본보다 짧지 않다.
-        base = self.run_wait(None, every=4, step=1)
-        self.assertEqual(base[:2], (1, 120), "노브 미설정 = 기본 120회")
-        for knob in range(13, 29):
-            with self.subTest(CYS_DEPT_READY_SECS=knob):
-                rc, count, _el = self.run_wait(str(knob), every=4, step=1)
-                self.assertEqual(rc, 1)
-                self.assertGreaterEqual(count, base[1], "노브 %d 가 기본(%d회)보다 짧아졌다 — 첫 120회에 시계를 본다" % (knob, base[1]))
-                self.assertEqual(count, 121, "첫 120회 뒤 첫 판정에서 끊겨야 한다")
+    def test_slow_failure_is_bounded_before_first_ten_probes_finish(self):
+        rc, elapsed = self.run_probe(.3, 1)
+        self.assertEqual(rc, 1)
+        self.assertLess(elapsed, 2.5, "slow ping time escaped the one-second wait budget")
 
-    def test_count_is_monotone_in_the_knob_on_both_machine_shapes(self):
-        # 노브를 올릴수록 포기까지의 핑 수가 줄지 않는다(윈도우 모양 · 맥 모양 · 아주 느린 모양) — 비단조 회귀(시계를 초반부터 보는 변이)를 한 번에 잡는다.
-        for every in (1, 4, 8):
-            counts = [(k, self.run_wait(str(k), every=every, step=1)[1]) for k in (12, 13, 14, 20, 28, 29, 30, 31, 40, 60, 100, 180)]
-            with self.subTest(every=every):
-                for (k0, c0), (k1, c1) in zip(counts, counts[1:]):
-                    self.assertGreaterEqual(c1, c0 - 1, "노브 %d(%d회) → %d(%d회): 줄었다 — 비단조 %r" % (k0, c0, k1, c1, counts))
-                self.assertEqual(counts[0][1], 120)
+    def test_success_after_deadline_is_not_ready(self):
+        rc, elapsed = self.run_probe(3, 0)
+        self.assertEqual(rc, 1, "a late successful ping must not turn timeout into readiness")
+        self.assertLess(elapsed, 2.5)
 
-    def test_count_cap_still_binds_when_the_clock_barely_moves(self):
-        # 시계가 거의 안 가는 기계(5000핑에 1초): 기한에 닿지 못해도 횟수 상한(노브 × 10)에서 끝난다 — 횟수 상한은 그대로다.
-        for knob, want in (("13", 130), ("60", 600), ("180", 1800)):
-            with self.subTest(CYS_DEPT_READY_SECS=knob):
-                self.assertEqual(self.run_wait(knob, every=5000, step=1)[:2], (1, want))
+    def test_slow_success_inside_deadline_is_ready(self):
+        rc, _ = self.run_probe(.1, 0, budget=12)
+        self.assertEqual(rc, 0)
 
-    def test_default_path_never_reads_the_clock(self):
-        # 노브 미설정·12 이하·무효: 반복이 120회를 넘지 않아 시계 판정이 아예 없다 — 시계가 폭주(핑마다 1000초)해도 120회를 다 채운다(기본 경로 = 종전과 같은 횟수).
-        for knob in (None, "12", "11", "abc", "181", "", "600"):
-            with self.subTest(CYS_DEPT_READY_SECS=knob):
-                self.assertEqual(self.run_wait(knob, every=1, step=1000)[:2], (1, 120))
-        # 사전 검사 `ready` 는 노브·시계와 무관한 120회 고정이다.
-        for knob in (None, "60", "180"):
-            with self.subTest(precheck=knob):
-                self.assertEqual(self.run_wait(knob, every=1, step=1000, call="ready sock")[:2], (1, 120))
+    def test_dead_child_exits_before_the_long_budget(self):
+        rc, elapsed = self.run_probe(.1, 1, budget=10, daemon_delay="reaped")
+        self.assertEqual(rc, 1)
+        self.assertLess(elapsed, 2.5)
 
-    def test_success_after_120_under_the_deadline_still_returns_zero(self):
-        rc, count, _el = self.run_wait("180", every=1, step=1, ok_at=150)
-        self.assertEqual((rc, count), (0, 150), "기한 안(150초 < 180초)의 성공은 닿아야 한다")
-        rc, count, _el = self.run_wait("60", every=1, step=1, ok_at=121)
-        self.assertEqual((rc, count), (0, 121), "121번째 핑의 성공은 같은 반복의 기한 판정보다 먼저다(마지막 기회)")
+    def test_child_dies_during_a_slow_ping(self):
+        rc, elapsed = self.run_probe(.4, 1, budget=10, daemon_delay=.2)
+        self.assertEqual(rc, 1)
+        self.assertLess(elapsed, 2.5)
 
-    def test_elapsed_is_recorded_from_seconds_on_success_and_failure(self):
-        # `_READY_WAIT_SECS` = 이번 대기의 `$SECONDS` 차이 — 실패 문구의 '실제 약 M초'가 읽는다. 시계가 +1초/핑이므로 핑 수만큼(초 경계 걸침 ±1).
-        rc, count, el = self.run_wait("60", every=1, step=1)
-        self.assertEqual((rc, count), (1, 121))
-        self.assertIn(int(el), (121, 122))
-        rc, count, el = self.run_wait("60", every=1, step=1, ok_at=30)
-        self.assertEqual((rc, count), (0, 30))
-        self.assertIn(int(el), (30, 31))
+    def test_live_silent_child_waits_to_the_bound(self):
+        rc, elapsed = self.run_probe(.1, 1, budget=1, daemon_delay=10)
+        self.assertEqual(rc, 1)
+        self.assertGreater(elapsed, .7)
+        self.assertLess(elapsed, 2.5)
+
+
+class ReadyFleetPolicy(unittest.TestCase):
+    def value(self, n, override=None, broken=False):
+        with tempfile.TemporaryDirectory(prefix="ready-fleet-") as home:
+            reg = os.path.join(home, "depts.json")
+            with open(reg, "w") as f:
+                f.write("broken" if broken else json.dumps({"depts": {"d%d" % i: {} for i in range(n)}}))
+            src = _read(DEPT)
+            names = (["dept_ready_default"] if "dept_ready_default(){" in src else []) + ["dept_ready_secs"]
+            script = "set -u\n" + "".join(func_text(src, name) for name in names) + "dept_ready_secs\n"
+            env = {"CYS_DEPTS_JSON": reg}
+            if override is not None: env["CYS_DEPT_READY_SECS"] = override
+            return bash_eval(script, env)
+
+    def test_registered_count_policy_and_cap(self):
+        for n, expected in ((0,180),(1,180),(2,360),(5,900),(9,900)):
+            with self.subTest(n=n): self.assertEqual(self.value(n), (0,str(expected)+"\n",""))
+
+    def test_override_wins_and_invalid_uses_dynamic_default(self):
+        for override, expected in (("12",12),("180",180),("86400",86400),("086400",86400),("11",900),("86401",900),("bad",900)):
+            with self.subTest(override=override): self.assertEqual(self.value(9,override), (0,str(expected)+"\n",""))
+
+    def test_native_python_crlf_is_removed_before_shell_arithmetic(self):
+        # Only the Python result transport is substituted; the production shell
+        # function must normalize its output before arithmetic consumes it.
+        script = "set -eu\n" + func_text(_read(DEPT), "dept_ready_default")
+        script += "python3(){ cat >/dev/null; printf '360\\r\\n'; }\nv=\"$(dept_ready_default)\"\necho $((v * 10))\n"
+        self.assertEqual(bash_eval(script), (0,"3600\n",""))
+
+    def test_unreadable_registry_is_named_fallback_not_zero_claim(self):
+        rc,out,err = self.value(9,broken=True)
+        self.assertEqual((rc,out),(0,"180\n"))
+        self.assertIn("registry unreadable",err)
 
 
 class ReadyKnobWarn(unittest.TestCase):
-    """A(R2F-PK · S4 m4): 노브가 **비어 있지 않은데** 해석이 받아들이지 않은 값(범위 밖·비정수 → 12)이면 stderr 에 정확히 1줄. 미설정·빈 값·유효 값(선행 0 포함)은 경고 0(기본 경로 무변경).
-    경고는 순수 함수(`dept_ready_secs` — 여러 번 불리고 DeptReadySecs 가 stderr 를 비어 있다고 못박는다)도, `ready_wait`(기존 횟수 핀 검체가 무효 노브에서도 stderr 가 비어 있다고 못박는다)도 아니고
-    **스폰 뒤 대기의 호출 지점**(launch·allocate·create)이 `ready_wait` 직전에 부르는 `dept_ready_knob_warn` 의 몫이다 — 함수 단위(아래)와 흐름 단위(KnobWarnFlow)로 잰다."""
+    """Invalid nonempty overrides warn once and use the dynamic policy.
+    Unset/empty/valid overrides do not warn. The warning belongs to the three
+    pre-wait call sites; unreadable-registry fallback has its own diagnostic."""
 
     @classmethod
     def setUpClass(cls):
         src = _read(DEPT)
-        cls.funcs = "".join(func_text(src, n) for n in ("dept_ready_secs", "dept_ready_knob_warn"))
+        cls.funcs = "".join(func_text(src, n) for n in ("dept_ready_default", "dept_ready_secs", "dept_ready_knob_warn"))
 
     def warn(self, knob, calls=1):
         script = "set -u\n" + self.funcs + "dept_ready_knob_warn\n" * calls + "echo done\n"
         env = {} if knob is None else {"CYS_DEPT_READY_SECS": knob}
         return bash_eval(script, env)
 
-    WARN = ["300", "abc", "181", "0", "11", "-5", "30.5", " 60", "60 ", "1e2", "0x20", "+60", "99999999999999999999", "0181", "600"]
-    QUIET = [None, "", "12", "13", "60", "179", "180", "012", "060", "00012", "00180"]
+    WARN = ["86401", "abc", "186400", "0", "11", "-5", "30.5", " 60", "60 ", "1e2", "0x20", "+60", "99999999999999999999", "086401", "100000"]
+    QUIET = [None, "", "12", "13", "60", "179", "180", "300", "600", "86400", "012", "060", "00012", "00180"]
 
     def test_invalid_nonempty_value_warns_exactly_once_on_stderr(self):
         for val in self.WARN:
@@ -466,7 +491,7 @@ class ReadyKnobWarn(unittest.TestCase):
                 self.assertEqual(self.warn(val), (0, "done\n", ""), "기본 경로·유효 값에서 경고가 났다")
 
     def test_warns_once_per_process_even_if_called_again(self):
-        rc, out, err = self.warn("300", calls=3)
+        rc, out, err = self.warn("86401", calls=3)
         self.assertEqual(len(err.splitlines()), 1, "같은 프로세스에서 경고가 되풀이됐다: %r" % err)
 
     def test_value_is_folded_to_one_short_line(self):
@@ -478,19 +503,17 @@ class ReadyKnobWarn(unittest.TestCase):
         self.assertIn("'" + "x" * 40 + "'", err)
         self.assertNotIn("x" * 41, err, "값은 40자까지만 싣는다")
 
-    def test_pure_interpreter_and_ready_wait_stay_silent(self):
-        # 경고를 순수 해석 함수 안에 넣으면(여러 번 불린다) 한 실행에서 되풀이되고, ready_wait 안에 넣으면 기존 횟수 핀의 `err == ""` 가 깨진다 — 둘 다 여기서 못박는다.
-        src = _read(DEPT)
-        fns = "".join(func_text(src, n) for n in ("ready", "ready_wait", "dept_ready_secs"))
-        rc, out, err = bash_eval("set -u\n" + fns + "sleep(){ :; }\ncys_probe(){ return 1; }\nCYS=cys_probe\ndept_ready_secs; ready_wait sock; echo rc=$?\n", {"CYS_DEPT_READY_SECS": "300"})
-        self.assertEqual((rc, out, err), (0, "12\nrc=1\n", ""))
+    def test_pure_interpreter_stays_silent(self):
+        # Real readiness silence is asserted by ReadyElapsedBound, including timeout.
+        rc, out, err = bash_eval("set -u\n" + "".join(func_text(_read(DEPT), n) for n in ("dept_ready_default", "dept_ready_secs")) + "dept_ready_secs\n", {"CYS_DEPT_READY_SECS": "300"})
+        self.assertEqual((rc, out, err), (0, "300\n", ""))
 
 
 class KnobWarnFlow(unittest.TestCase):
     """A(R2F-PK): 호출 지점 세 곳(launch·allocate·create)이 스폰 뒤 대기 직전에 경고를 낸다 — 실흐름에서 무효 노브는 정확히 1줄(stderr · stdout 오염 없음 · 흐름 무변경), 기본·유효 값은 0줄,
     스폰이 없는 재사용 갈래(사전 검사가 이미 켜진 데몬을 찾음)에서는 기다리지 않으므로 경고도 없다."""
 
-    WARN_RE = re.compile(r"^\[cys-dept\] WARN: CYS_DEPT_READY_SECS='300' ")
+    WARN_RE = re.compile(r"^\[cys-dept\] WARN: CYS_DEPT_READY_SECS='86401' ")
 
     def flow(self, args, knob, **kw):
         sb = Sandbox(STUB_PING_OK_FROM=kw.pop("ok_from", UP_AT_PING), **({"CYS_DEPT_READY_SECS": knob} if knob is not None else {}))
@@ -506,7 +529,7 @@ class KnobWarnFlow(unittest.TestCase):
     def test_invalid_knob_warns_once_in_each_waiting_verb(self):
         for args in (("allocate",), ("create", "k1"), ("launch", "a")):
             with self.subTest(args[0]):
-                sb, (rc, out, err) = self.flow(args, "300")
+                sb, (rc, out, err) = self.flow(args, "86401")
                 self.assertEqual(rc, 0, out + err[-800:])
                 w = self.warns(err)
                 self.assertEqual(len(w), 1, "무효 노브 경고가 정확히 1줄이어야 한다:\n" + err[-1200:])
@@ -515,7 +538,7 @@ class KnobWarnFlow(unittest.TestCase):
                 if args[0] != "launch":
                     self.assertEqual(last_line(out), "dept-1")
 
-    def test_valid_and_default_knob_do_not_warn(self):
+    def test_valid_override_and_fixture_explicit_12_do_not_warn(self):
         for knob in (None, "12", "60", "060"):
             with self.subTest(CYS_DEPT_READY_SECS=knob):
                 sb, (rc, out, err) = self.flow(("allocate",), knob)
@@ -523,12 +546,12 @@ class KnobWarnFlow(unittest.TestCase):
                 self.assertEqual(self.warns(err), [], "기본·유효 노브에서 경고가 났다")
 
     def test_no_wait_means_no_warning(self):
-        sb, (rc, out, err) = self.flow(("allocate",), "300", ok_from="2")   # 사전 검사가 이미 켜진 데몬을 찾는다 → 스폰도 대기도 없다
+        sb, (rc, out, err) = self.flow(("allocate",), "86401", ok_from="2")   # 사전 검사가 이미 켜진 데몬을 찾는다 → 스폰도 대기도 없다
         self.assertEqual(rc, 0, err[-800:])
         self.assertEqual(self.warns(err), [], "기다리지 않았는데 노브 경고가 났다(경고는 스폰 뒤 대기 직전의 것이다)")
 
-    def test_invalid_knob_failure_flow_keeps_budget_12_and_warns_before_the_failure_line(self):
-        sb = Sandbox(STUB_CYSD_MODE="dead", CYS_DEPT_READY_SECS="300")
+    def test_invalid_knob_failure_uses_dynamic_budget_and_warns_before_failure(self):
+        sb = Sandbox(STUB_CYSD_MODE="dead", CYS_DEPT_READY_SECS="86401")
         self.addCleanup(sb.cleanup)
         rc, out, err = sb.run("allocate")
         self.assertEqual(rc, 1)
@@ -537,31 +560,24 @@ class KnobWarnFlow(unittest.TestCase):
         wi = next(i for i, l in enumerate(lines) if "CYS_DEPT_READY_SECS=" in l and "WARN" in l)
         fi = next(i for i, l in enumerate(lines) if "데몬 기동 실패" in l)
         self.assertLess(wi, fi, "경고가 실패 줄보다 앞에 있어야 한다(실패 문구 앞 300자에 사유가 보이도록 짧게 앞에)")
-        self.assertIn("대기 예산 12초", lines[fi], "무효 노브(300)는 12 로 읽혀 예산 12초로 적힌다")
+        self.assertIn("대기 예산 180초", lines[fi], "invalid override uses the one-lane policy budget")
         self.assertLess(len(lines[wi]), 130, "경고 줄이 길어 실패 사유를 300자 밖으로 밀어낸다")
 
 
 class ReadyFailNote(unittest.TestCase):
-    """E(R2F-PK · S4 m4): 실패 꼬리 = `(대기 예산 N초 · 실제 약 M초 · 로그: <디렉터리>/cysd.log · 안내)`. N = 노브(공칭 상한) · M = `_READY_WAIT_SECS`(`$SECONDS` 차이 — 대기 동작은 안 바뀐다) ·
-    안내 예시는 **현재 값 기준**: 60 미만 = 종전 그대로 `=60` · 60 이상 = 그 두 배(상한 180) · 이미 상한 = 늘릴 수 없다(이미 60 이상으로 올린 사용자에게 '=60 처럼 늘릴 수 있다'고 안내하지 않는다)."""
+    """Failure note reports the captured wait budget and actual elapsed value;
+    advice doubles the effective budget up to the explicit86400-second cap."""
 
-    TAIL_LOW = "느린 디스크라면 CYS_DEPT_READY_SECS=60 처럼 대기 예산을 늘릴 수 있다"
-    CASES = [
-        (None, "12", TAIL_LOW), ("12", "12", TAIL_LOW), ("13", "13", TAIL_LOW), ("30", "30", TAIL_LOW), ("59", "59", TAIL_LOW),
-        ("60", "60", "CYS_DEPT_READY_SECS=120 처럼 더 늘릴 수 있다 · 상한 180초"),
-        ("89", "89", "CYS_DEPT_READY_SECS=178 처럼 더 늘릴 수 있다 · 상한 180초"),
-        ("90", "90", "CYS_DEPT_READY_SECS=180 처럼 더 늘릴 수 있다 · 상한 180초"),
-        ("100", "100", "CYS_DEPT_READY_SECS=180 처럼 더 늘릴 수 있다 · 상한 180초"),
-        ("179", "179", "CYS_DEPT_READY_SECS=180 처럼 더 늘릴 수 있다 · 상한 180초"),
-        ("180", "180", "대기 예산이 이미 상한(180초)이다 — 더 늘릴 수 없으니 로그를 확인하라"),
-        # 무효 값(범위 밖·비정수)은 12 로 읽힌다 → 예산 12 · 종전 안내
-        ("300", "12", TAIL_LOW), ("181", "12", TAIL_LOW), ("abc", "12", TAIL_LOW), ("11", "12", TAIL_LOW),
-    ]
+    CASES = [(None,"180","CYS_DEPT_READY_SECS=360 처럼 더 늘릴 수 있다 · 상한 86400초"),
+             ("12","12","CYS_DEPT_READY_SECS=24 처럼 더 늘릴 수 있다 · 상한 86400초"),
+             ("60","60","CYS_DEPT_READY_SECS=120 처럼 더 늘릴 수 있다 · 상한 86400초"),
+             ("86400","86400","대기 예산이 이미 상한(86400초)이다 — 로그를 확인하라")]
+
 
     @classmethod
     def setUpClass(cls):
         src = _read(DEPT)
-        cls.funcs = "".join(func_text(src, n) for n in ("dept_ready_secs", "ready_fail_note"))
+        cls.funcs = "".join(func_text(src, n) for n in ("dept_ready_default", "dept_ready_secs", "ready_fail_note"))
 
     def note(self, knob, elapsed="7"):
         pre = "" if elapsed is None else "_READY_WAIT_SECS=%s\n" % elapsed
@@ -570,6 +586,14 @@ class ReadyFailNote(unittest.TestCase):
         rc, out, err = bash_eval(script, env)
         self.assertEqual((rc, err), (0, ""))
         return out
+
+    def test_note_uses_captured_budget_instead_of_a_new_registry_read(self):
+        script = "set -u\n" + self.funcs
+        script += 'dept_logdir(){ echo /fixture; }\ndept_ready_secs(){ echo 900; }\n_READY_WAIT_BUDGET=360\n_READY_WAIT_SECS=4\nready_fail_note n\n'
+        rc,out,err = bash_eval(script)
+        self.assertEqual((rc,err),(0,""))
+        self.assertIn("대기 예산 360초 · 실제 약 4초",out)
+        self.assertNotIn("900",out)
 
     def test_note_table(self):
         for knob, budget, tail in self.CASES:
@@ -582,7 +606,7 @@ class ReadyFailNote(unittest.TestCase):
                 self.assertNotIn("CYS_DEPT_READY_SECS=60 ", self.note(knob), "이미 60 이상으로 올린 사용자에게 '=60 처럼 늘릴 수 있다'고 안내했다")
 
     def test_elapsed_comes_from_the_wait_not_from_the_knob(self):
-        self.assertIn("대기 예산 12초 · 실제 약 28초", self.note(None, "28"))
+        self.assertIn("대기 예산 180초 · 실제 약 28초", self.note(None, "28"))
         self.assertIn("대기 예산 180초 · 실제 약 211초", self.note("180", "211"))
         self.assertIn("실제 약 ?초", self.note(None, None), "대기가 시작되지 않았다면 경과는 모른다고 적는다(지어내지 않는다)")
 
@@ -594,41 +618,21 @@ class ReadyFailNote(unittest.TestCase):
 # C. dept_reserve_grace — 예약 유예 결합
 # ════════════════════════════════════════════════════════════════════════════════════
 class ReserveGraceUnit(unittest.TestCase):
-    # (RESERVE_GRACE, READY_SECS, 파이썬 CYS_GRACE 로 넘어갈 값). None = 미설정.
-    # master 결정(GP 검토): 유예 올림은 **노브를 12 보다 크게 올렸을 때만**이다 — 노브가 12 이하(미설정·명시 12·무효 값 → 12)면 종전 인라인 식 값 그대로.
-    # 0.14.43 성찰(R1F-PK · S4 m1): 올림의 식이 `노브 + 13` → `노브 + 노브/5 + 17`(정수 나눗셈)로 바뀌었다 — 반복 1회가 0.1초가 아니라 약 0.118초라 `노브 + 13` 은
-    #   실제 대기(사전 검사 + 노브 × 1.18)보다 짧았다.
-    # ★2회차(R2F-PK · 티켓 §2): 스폰 뒤 대기가 벽시계로 묶이고(ready_wait — 121번째 반복부터 `$SECONDS` 기한) 생성자가 스폰 직전에 `reserved_at` 을 다시 찍으므로 `노브/5` 항의 근거가 없어졌다 →
-    #   `노브 + 17`(17 = 재기록 → 스폰 사이와 첫 120회의 여유). **노브 ≤ 12 는 종전 값 그대로**(아래 기본 경로 행 · 동치 검체). 기대값은 식에서 손으로 계산했다:
-    #   13→30 · 14→31 · 15→32 · 60→77 · 100→117 · 180→197.
-    CASES = [
-        # ── 노브 기본: 종전 `${CYS_DEPT_RESERVE_GRACE:-25}` 그대로 — 명시한 낮은 값도 올리지 않는다(종전 보존 핀)
-        (None, None, "25"), ("10", None, "10"), ("0", None, "0"), ("10", "12", "10"), ("0", "12", "0"), ("40", "12", "40"),
-        ("25", "12", "25"), ("26", "12", "26"), ("08", None, "08"), ("10", "abc", "10"), ("10", "601", "10"), ("10", "11", "10"),
-        (None, "abc", "25"), (None, "601", "25"),
-        # ── m2: 상한(180)을 넘어 12 로 접힌 노브도 기본 경로다 — 종전에 유효했던 600·300·181 도 유예는 인라인 식 그대로
-        (None, "181", "25"), ("10", "181", "10"), ("10", "600", "10"), (None, "300", "25"), ("2.5", "600", "2.5"),
-        # ── 노브를 12 보다 크게 올린 경우: max(설정값 또는 25, 노브 + 17)  (R2F-PK — 종전 `노브 + 노브/5 + 17` 아님)
-        (None, "60", "77"), ("10", "60", "77"), ("100", "60", "100"), ("73", "60", "77"), ("74", "60", "77"), ("30", "60", "77"),
-        ("08", "60", "77"), (None, "13", "30"), ("25", "13", "30"), ("30", "13", "30"), ("31", "13", "31"), ("32", "13", "32"),
-        ("33", "13", "33"), (None, "14", "31"), (None, "15", "32"), (None, "100", "117"),
-        # 경계(식의 정확한 값 — 한 칸 아래는 올리고 · 같거나 위는 그대로)
-        ("76", "60", "77"), ("77", "60", "77"), ("78", "60", "78"), ("88", "60", "88"), ("89", "60", "89"), ("90", "60", "90"),
-        (None, "180", "197"), ("196", "180", "197"), ("197", "180", "197"), ("198", "180", "198"), ("232", "180", "232"), ("233", "180", "233"),
-        ("234", "180", "234"),
-        # ── 정수가 아니면 노브와 무관하게 그대로(파이썬이 판독 — max 는 정수일 때만) · 노브를 올렸다면 stderr 경고 1줄(아래 WARN_ROWS)
-        ("2.5", None, "2.5"), ("2.5", "60", "2.5"), ("30.5", "60", "30.5"), ("abc", "60", "abc"), ("-5", "60", "-5"),
-        (" 30", "60", " 30"), ("30.5", "180", "30.5"),
-        # ── 값이 옵션으로 삼켜지지 않는다(echo 였다면 -n·-e 가 사라진다)
-        ("-n", None, "-n"), ("-e", "60", "-e")]
-    # m1: 노브를 올렸는데(>12) RESERVE_GRACE 가 정수가 아닌 조합 — 결합이 말없이 풀리지 않게 stderr 경고 정확히 1줄(stdout 값은 그대로). 이 밖의 모든 행은 stderr 가 비어 있다
-    #   (기본 경로 무경고 · 정수 유예 무경고).
-    WARN_ROWS = {("2.5", "60"), ("30.5", "60"), ("abc", "60"), ("-5", "60"), ("-e", "60"), (" 30", "60"), ("30.5", "180")}
+    # Reservation grace follows the effective policy/override; explicit12 retains legacy grace.
+    CASES = [(None,None,"197"),("10",None,"197"),("0",None,"197"),
+             ("10","12","10"),("0","12","0"),("40","12","40"),
+             (None,"13","30"),("31","13","31"),(None,"60","77"),
+             ("76","60","77"),("77","60","77"),("78","60","78"),
+             (None,"180","197"),(None,"181","198"),(None,"600","617"),
+             ("10","bad","197"),(None,"86400","86417"),("2.5","600","2.5"),
+             ("abc","60","abc"),("30.5","180","30.5")]
+    WARN_ROWS = {("2.5","600"),("abc","60"),("30.5","180")}
+
 
     @classmethod
     def setUpClass(cls):
         src = _read(DEPT)
-        cls.fns = "".join(func_text(src, n) for n in ("dept_ready_secs", "dept_reserve_grace"))
+        cls.fns = "".join(func_text(src, n) for n in ("dept_ready_default", "dept_ready_secs", "dept_reserve_grace"))
 
     def test_value_table(self):
         for grace, ready, want in self.CASES:
@@ -652,20 +656,19 @@ class ReserveGraceUnit(unittest.TestCase):
     def test_warn_rows_are_exactly_the_non_integer_graces_under_a_raised_knob(self):
         # 표의 WARN_ROWS 가 정의(노브 > 12 이고 유예가 정수 아님)와 일치하는지 — 정의를 구현과 따로 한 번 더 적어 표가 구현을 베끼지 않았음을 확인한다.
         def raised(r):
-            return r is not None and r.isdigit() and len(r) <= 3 and 12 < int(r) <= 180
+            return r is None or not r.isdigit() or (12 < int(r) <= 86400)
         want = {(g, r) for g, r, _ in self.CASES if raised(r) and g is not None and not g.isdigit()}
         self.assertEqual(want, self.WARN_ROWS)
 
-    def test_default_knob_value_equals_the_old_inline_expression(self):
-        """노브가 12 이하(미설정·명시 12·무효 값)이면 어떤 RESERVE_GRACE 값이든(빈 값·낮은 값·선행 0·비정수·옵션 꼴 포함) 종전 인라인 식
-        `${CYS_DEPT_RESERVE_GRACE:-25}` 와 같은 값이다 — '기본에서 종전과 같다'를 명시 설정까지 지킨다(master 결정)."""
+    def test_explicit_12_override_retains_legacy_grace_expression(self):
+        """An explicit12 override alone retains the historical inline grace value."""
         import shlex
         graces = ["", "0", "10", "24", "25", "26", "40", "08", "0025", "2.5", "abc", "-5", " 30", "-n", "-e", "99999999999999999999"]
         loop = ('bad=""\nfor g in %s; do\n  export CYS_DEPT_RESERVE_GRACE="$g"\n'
                 '  a="$(dept_reserve_grace)"; b="${CYS_DEPT_RESERVE_GRACE:-25}"\n  [ "$a" = "$b" ] || bad="$bad [$g]:new=[$a]:old=[$b]"\ndone\n'
                 'unset CYS_DEPT_RESERVE_GRACE\na="$(dept_reserve_grace)"; b="${CYS_DEPT_RESERVE_GRACE:-25}"\n'
                 '[ "$a" = "$b" ] || bad="$bad [unset]:new=[$a]:old=[$b]"\nprintf "bad=<%%s>\\n" "$bad"\n') % " ".join(shlex.quote(g) for g in graces)
-        for ready in (None, "12", "11", "abc", "", "601", "0", "-5", "30.5", "181", "300", "600"):   # 181·300·600 = 상한(180) 초과 → 12 → 기본 경로(R1F-PK · m2)
+        for ready in ("12",):   # Only explicit12 retains the legacy grace contract.
             with self.subTest(READY_SECS=ready):
                 env = {} if ready is None else {"CYS_DEPT_READY_SECS": ready}
                 rc, out, err = bash_eval("set -u\n" + self.fns + loop, env)
@@ -684,12 +687,12 @@ class ReserveGraceBehavior(unittest.TestCase):
     def tearDown(self):
         self.sb.cleanup()
 
-    def test_default_grace_25_age_40_is_dead_revive(self):
+    def test_explicit_12_grace_25_age_40_is_dead_revive(self):
         self.sb.env["STUB_PING_OK_FROM"] = "2"   # 번호 점유 확인(파이썬 첫 핑)은 실패 · 사전 검사 첫 핑은 성공 → 재사용 분기로 짧게 끝낸다
         self.sb.seed_entry("dept-1", "m1", age=40)
         rc, out, err = self.sb.run("create", "k1")
         self.assertEqual(rc, 0, err[-800:])
-        self.assertIn("등록부 잔존(dept-1)·데몬 사망(grace 경과)", err, "기본 유예(25)에서 나이 40 은 REUSE_DEAD 여야 한다")
+        self.assertIn("등록부 잔존(dept-1)·데몬 사망(grace 경과)", err, "explicit12 fixture grace25 must classify age40 as REUSE_DEAD")
         self.assertEqual(stages(err), ["reserve", "probe", "up", "seat", "done"])
 
     def test_knob_raises_grace_so_same_age_is_booting(self):
@@ -741,7 +744,7 @@ class ReserveGraceBehavior(unittest.TestCase):
         self.assertEqual(rc, 0, err[-800:])
         self.assertIn("생성자 부팅중(dept-1)", err, "더 큰 명시 유예(100)를 노브 유예(47)로 덮어썼다")
 
-    def test_explicit_low_grace_is_honored_at_default_knob(self):
+    def test_explicit_low_grace_is_honored_at_explicit_12(self):
         # 종전 보존(master 결정): 노브가 기본이면 명시한 낮은 유예(10)가 그대로 파이썬으로 간다 — 나이 15 는 유예(10) 밖이라 REUSE_DEAD.
         #   (유예를 25 로 올려 버리면 같은 등재가 REUSE_BOOTING 으로 즉시 반환된다 = 0.14.42 와 다른 동작)
         self.sb.env.update({"CYS_DEPT_RESERVE_GRACE": "10", "STUB_PING_OK_FROM": "2"})
@@ -778,10 +781,10 @@ class ReserveGraceBehavior(unittest.TestCase):
         self.assertEqual(last_line(out), "dept-1")
         self.assertNotIn("WARN", out, "경고가 stdout 으로 샜다(부서 이름 계약 오염)")
 
-    def test_no_grace_warning_on_default_knob_or_integer_grace(self):
-        # 기본 경로(노브 미설정·무효·12 이하)와 정수 유예에서는 경고가 없다 — 비정수 유예여도 노브가 기본이면 종전 동작 그대로(경고 없음).
-        for tag, env in (("기본 노브 + 비정수 유예", {"CYS_DEPT_RESERVE_GRACE": "30.5"}),
-                         ("상한 초과(181 → 12) + 비정수 유예", {"CYS_DEPT_READY_SECS": "181", "CYS_DEPT_RESERVE_GRACE": "30.5"}),
+    def test_no_grace_warning_at_explicit_12_or_with_integer_grace(self):
+        # Sandbox supplies explicit12 unless overridden; fractional grace is quiet only at that floor.
+        for tag, env in (("fixture explicit12 + fractional grace", {"CYS_DEPT_RESERVE_GRACE": "30.5"}),
+                         ("explicit12 override + fractional grace", {"CYS_DEPT_READY_SECS": "12", "CYS_DEPT_RESERVE_GRACE": "30.5"}),
                          ("노브 올림 + 정수 유예", {"CYS_DEPT_READY_SECS": "60", "CYS_DEPT_RESERVE_GRACE": "30"}),
                          ("노브 올림 + 유예 미설정", {"CYS_DEPT_READY_SECS": "60"})):
             with self.subTest(tag):
@@ -932,7 +935,7 @@ class CreateStages(unittest.TestCase):
 # E. 스폰 뒤 대기 실패 — 문구 · 표지 · 회수 · 대기 예산(실흐름 핑 횟수)
 # ════════════════════════════════════════════════════════════════════════════════════
 OLD_PREFIX = "[cys-dept] ERROR: %s 데몬 기동 실패"
-NOTE_TAIL = "/cysd.log · 느린 디스크라면 CYS_DEPT_READY_SECS=60 처럼 대기 예산을 늘릴 수 있다)"
+NOTE_TAIL = "/cysd.log · CYS_DEPT_READY_SECS=24 처럼 더 늘릴 수 있다 · 상한 86400초)"
 # R2F-PK(S4 m4): 꼬리의 숫자는 둘이다 — `대기 예산 N초`(노브 · 공칭 상한) + `실제 약 M초`(이번 스폰 뒤 대기의 $SECONDS 차이). 종전 `소켓 대기 N초` 의 N 은 노브 값이지 경과가 아니었다.
 NOTE_HEAD = re.compile(r" \(대기 예산 (\d+)초 · 실제 약 (\d+)초 · 로그: ")
 
@@ -986,27 +989,27 @@ class WaitFailure(unittest.TestCase):
         # 접두는 줄머리에 그대로(기존 문구 보존)
         self.assertIn("\n" + OLD_PREFIX % "dept-1" + " (", "\n" + b["err"])
 
-    def test_allocate_failure_stages_stop_at_wait_and_registry_reclaimed(self):
+    def test_allocate_failure_stages_stop_at_wait_and_registry_retained(self):
         b = self.box["alloc"]
         self.assertEqual(stages(b["err"]), ["reserve", "probe", "spawn", "wait"], "실패 경로는 낸 데까지 — up·done 이 있으면 안 된다")
-        self.assertEqual(b["reg"], {}, "실패인데 레지스트리 등재가 남았다(예약 회수 종전 동작)")
+        self.assertIn("dept-1", b["reg"], "readiness failure must retain the row")
         self.assertTrue(b["spawned"], "스폰 분기인데 cysd 로그 리다이렉트가 만들어지지 않았다")
         self.assertEqual(last_line(b["out"]), "", "실패 경로 stdout 은 비어 있다")
 
-    def test_allocate_budget_default_pings(self):
-        # 핑 총수 = 사전 검사 120(고정) + 스폰 뒤 W + 번호 점유 확인(파이썬) 소수 회. W=120(기본 = 종전과 같음)
+    def test_dead_child_shortcuts_explicit_12_fixture(self):
+        # The explicit12 fixture has a dead child: stop before consuming a full post-spawn probe allowance.
         b = self.box["alloc"]
-        self.assertIn(b["pings"] - 120, (120, 121, 122, 123), "총 핑 %d — 기본에서 사전 검사 120 + 스폰 뒤 120 이 아니다" % b["pings"])
+        self.assertLess(b["pings"], 240, "dead child did not stop readiness early")
 
-    def test_allocate_budget_follows_knob_and_precheck_stays_fixed(self):
-        # 노브 30 → W=300. 사전 검사까지 노브를 따르면(돌연변이 M1) 총수가 300 + 300 이 된다 → 아래 범위를 벗어난다.
+    def test_dead_child_shortcuts_explicit_30_fixture(self):
+        # Explicit30 must not make the caller wait on a child already known dead; precheck remains120 attempts.
         b = self.box["alloc30"]
         self.assertEqual(b["rc"], 1)
         note = self.note_of(b["err"], "dept-1")
         note_budget(self, note, "30")
-        self.assertIn(b["pings"] - 300, (120, 121, 122, 123), "총 핑 %d — 사전 검사(120 고정) + 스폰 뒤 300 이 아니다" % b["pings"])
+        self.assertLess(b["pings"], 240, "dead child must not consume the longer budget")
 
-    def test_create_failure_message_stage_reclaim(self):
+    def test_create_failure_message_stage_retained(self):
         b = self.box["create"]
         self.assertEqual(b["rc"], 1)
         note = self.note_of(b["err"], "dept-1")
@@ -1015,7 +1018,7 @@ class WaitFailure(unittest.TestCase):
         self.assertIn("로그: %s/cysd.log" % b["sb"].logdir("dept-1"), note)
         self.assertNotIn("데몬 기동 실패", b["out"], "create 의 실패 줄은 종전대로 stderr 다")
         self.assertEqual(stages(b["err"]), ["reserve", "probe", "spawn", "wait"])
-        self.assertEqual(b["reg"], {}, "NEW 실패인데 등재가 남았다(예약 회수 종전 동작)")
+        self.assertIn("dept-1", b["reg"], "readiness failure must retain NEW row")
 
     def test_launch_failure_keeps_stdout_stream_and_has_no_stage(self):
         b = self.box["launch"]
@@ -1033,32 +1036,33 @@ class WaitFailure(unittest.TestCase):
         err_hits = [l for l in b["err"].splitlines() if l.startswith(pre)]
         self.assertEqual(err_hits, out_hits, "launch 실패 꼬리가 stderr 에 stdout 줄과 같은 꼴로 정확히 1줄 있어야 한다:\nerr=%s" % b["err"][-800:])
         self.assertNotIn("@stage", b["out"] + b["err"], "launch 는 무변경 동사 — 표지를 내면 안 된다")
-        self.assertEqual(b["reg"], {}, "launch 실패 뒤 등재 회수(종전 동작)")
+        self.assertIn("a", b["reg"], "launch readiness failure must retain row")
 
 
 class SlowDaemonKnob(unittest.TestCase):
-    """같은 '느린 데몬'(소켓이 300 번째 핑부터 응답 — 번호 점유 확인 1 + 사전 검사 120 + 스폰 뒤 179)을 기본 예산(스폰 뒤 120)으로는
-    종전처럼 놓치고, 노브 30(스폰 뒤 300)으로는 잡는다 — 이 노브가 존재하는 이유(느린 디스크)의 종단 증명."""
+    """With the same scripted success at ping300, the explicit12-second
+    fixture fails while explicit30 succeeds. This compares two overrides,
+    not the production dynamic default; the elapsed bound may beat the count cap."""
 
     def run_alloc(self, **extra):
-        sb = Sandbox(STUB_CYSD_MODE="dead", STUB_PING_OK_FROM="300", **extra)
+        sb = Sandbox(STUB_CYSD_MODE="silent", STUB_PING_OK_FROM="300", **extra)
         self.addCleanup(sb.cleanup)
         return sb, sb.run("allocate")
 
-    def test_default_budget_misses_the_slow_daemon_as_before(self):
+    def test_explicit_12_fixture_misses_scripted_late_readiness(self):
         sb, (rc, out, err) = self.run_alloc()
         self.assertEqual(rc, 1, err[-600:])
         self.assertRegex(err, r" \(대기 예산 12초 · 실제 약 \d+초 · 로그: ")
         self.assertEqual(stages(err), ["reserve", "probe", "spawn", "wait"])
-        self.assertEqual(sb.read_reg(), {}, "실패 뒤 등재 회수(종전 동작)")
-        self.assertLess(sb.ping_count(), 300, "기본 예산은 종전(사전 검사 120 + 스폰 뒤 120)이어야 한다")
+        self.assertIn("dept-1", sb.read_reg())
+        self.assertLess(sb.ping_count(), 300, "explicit12 fixture must stop before scripted success at ping300")
 
-    def test_knob_30_catches_the_slow_daemon(self):
+    def test_explicit_30_fixture_reaches_scripted_late_readiness(self):
         sb, (rc, out, err) = self.run_alloc(CYS_DEPT_READY_SECS="30")
         self.assertEqual(rc, 0, err[-800:])
         self.assertEqual(stages(err), ["reserve", "probe", "spawn", "wait", "up", "done"])
         self.assertEqual(last_line(out), "dept-1")
-        self.assertGreaterEqual(sb.ping_count(), 300, "스폰 뒤 대기가 종전 상한(120)을 넘어 300 번째 핑까지 갔어야 한다")
+        self.assertGreaterEqual(sb.ping_count(), 300, "explicit30 fixture must reach the scripted success at ping300")
         self.assertIn("dept-1", sb.read_reg())
 
 
@@ -1475,8 +1479,8 @@ class ReapBootGrace(unittest.TestCase):
 
 
 class DefaultPathOutput(unittest.TestCase):
-    """기본 경로(노브 미설정 · 성공 흐름)의 표지 순서·출력은 종전과 같다(R2F-PK 티켓 §2 · 기본 경로 무변경): 새 문구(재기록 · 노브 경고 · 대기 예산)가 어떤 줄에도 나오지 않고, 표지 순서와 stdout 계약이 종전 그대로다.
-    (이 변경 전·후의 실제 출력을 같은 시나리오로 대조한 결과 — allocate·create·launch 의 stdout·stderr 가 글자 그대로 같고 allocate 등재에 reserved_at 키만 늘었다 — 는 R2F-PK WORKLOG 에 있다.)"""
+    """The explicit12-second Sandbox fixture preserves stage/output contracts
+    on successful flows. The product dynamic default is tested by ReadyFleetPolicy."""
 
     NEW_TOKENS = ("재기록", "reserved_at", "READY_SECS", "대기 예산", "실제 약")
 
@@ -1537,7 +1541,7 @@ class Census(unittest.TestCase):
         self.assertEqual(len(post), 3, "스폰 뒤 대기 3곳은 `ready_wait` 여야 한다: %r" % post)
         stale = [l for l in self.code if re.search(r'(^|[^_\w])ready "\$sock" \|\|', l)]
         self.assertEqual(stale, [], "스폰 뒤 대기에 노브를 안 타는 `ready` 가 남았다: %r" % stale)
-        self.assertEqual(len([l for l in self.code if re.search(r'(^|[^_\w])ready "\$', l)]), 3, "`ready` 호출은 사전 검사 3곳뿐이어야 한다")
+        self.assertEqual(len([l for l in self.code if re.search(r'(^|\s)ready "\$', l)]), 3, "`ready` 호출은 사전 검사 3곳뿐이어야 한다")
         for l in post:
             self.assertIn("데몬 기동 실패", l)
             self.assertIn("ready_fail_note", l)
@@ -1550,11 +1554,9 @@ class Census(unittest.TestCase):
         self.assertIn('echo "[cys-dept] ERROR: $name 데몬 기동 실패$(ready_fail_note "$name")"; sock_len_diag "$sock"; exit 1; }', post[0])
         self.assertIn('echo "[cys-dept] ERROR: $name 데몬 기동 실패$(ready_fail_note "$name")" >&2; sock_len_diag "$sock"; exit 1; }', post[1])
         self.assertIn('echo "[cys-dept] ERROR: $name 데몬 기동 실패$(ready_fail_note "$name")" >&2; sock_len_diag "$sock"; exit 1; }', post[2])
-        self.assertIn('reg_remove "$name" || exit $?; echo', post[0])
-        self.assertIn('reg_remove "$name" || exit $?; echo', post[1])
-        self.assertIn('then reg_remove "$name" || exit $?; fi; echo', post[2])
-        # R2F-PK(S4 m7): launch 줄만 같은 꼬리를 stderr 에도 한 줄 더 낸다(stdout 줄·순서·위 핀은 그대로 — 복사본은 `reg_remove` **앞**에 있다). allocate·create 는 이미 stderr 라 복사본이 없다.
-        self.assertIn('_lf="$(ready_fail_note "$name")"; echo "[cys-dept] ERROR: $name 데몬 기동 실패${_lf}" >&2; reg_remove', post[0])
+        for line in post:
+            self.assertNotIn("reg_remove", line, "A68 timeout must not remove any row")
+        self.assertIn('_lf="$(ready_fail_note "$name")"; echo "[cys-dept] ERROR: $name 데몬 기동 실패${_lf}" >&2;', post[0])
         self.assertNotIn("_lf", post[1] + post[2], "allocate·create 의 실패 줄은 이미 stderr 다 — 복사본을 더하면 같은 줄이 두 번 난다")
 
     def test_ready_definition_unchanged(self):
@@ -1625,13 +1627,12 @@ class Census(unittest.TestCase):
         bad = [l for l in self.code if re.search(r"(^|[^A-Za-z0-9_$])SECONDS=", l)]
         self.assertEqual(bad, [], "제품 코드가 SECONDS 에 대입한다: %r" % bad)
 
-    def test_ready_wait_reads_the_clock_only_after_iteration_120(self):
+    def test_ready_wait_uses_one_owned_elapsed_budget(self):
         fn = func_text(self.src, "ready_wait")
-        guard = 'if [ "$i" -gt 120 ] && [ $(( SECONDS - t0 )) -ge "$secs" ]; then break; fi'
-        self.assertEqual(fn.count(guard), 1, "벽시계 상한 판정이 `121번째 반복부터`(i > 120) 한 곳에만 있어야 한다")
-        self.assertEqual(len(re.findall(r"SECONDS", "\n".join(l for l in fn.splitlines() if not l.lstrip().startswith("#")))), 4,
-                         "ready_wait 의 SECONDS 읽기는 t0 · 성공 경과 · 기한 판정 · 실패 경과 네 곳뿐이다(첫 120회에 시계를 보는 읽기가 늘면 기본 경로가 달라진다)")
-        self.assertIn('n=$(( secs * 10 ))', fn, "횟수 상한(초 × 10)은 그대로여야 한다")
+        self.assertIn('--bounded "$secs" --native-shell -- "$BASH"', fn)
+        self.assertIn('"$(dirname "$0")/_owned_process.py"', fn)
+        self.assertNotIn('"$i" -gt 120', fn, "the old unbounded first-120 exemption returned")
+        self.assertIn('n=$(( secs * 10 ))', fn)
         self.assertEqual(self.src.count('ready_wait(){'), 1)
 
     def test_knob_warn_is_called_only_at_the_three_wait_sites_and_ready_wait_stays_self_contained(self):
@@ -1756,6 +1757,264 @@ class DeptCapDefaultUnlimited(unittest.TestCase):
         self.assertEqual((len(reads), len(guards)), (2, 2), "두 자리(allocate·create)가 같은 규칙이 아니다")
         self.assertNotIn('get("CYS_DEPT_CAP","8")', src, "종전 기본 8 이 남아 있다")
 
+
+
+class RegistryRollbackOwnership(unittest.TestCase):
+    """A61: real command/registry, scripted readiness later than the probe budget.
+
+    No live daemon: the private cysd stub exits without binding.
+    A68/A70 retains both existing and new rows when readiness fails.
+    """
+
+    def box(self):
+        sb = Sandbox(STUB_CYSD_MODE="dead")
+        self.addCleanup(sb.cleanup)
+        return sb
+
+    def test_existing_launch_row_survives_readiness_failure(self):
+        sb = self.box()
+        sb.seed_entry("a", "existing-mission", age=300)
+        before = sb.read_reg()["a"]
+        rc, out, err = sb.run("launch", "a")
+        self.assertEqual(rc, 1, (out, err))
+        self.assertTrue(sb.spawned("a"))
+        self.assertIn("a", sb.read_reg(), "readiness failure removed a pre-existing row")
+        self.assertEqual(sb.read_reg()["a"], before)
+
+    def test_failed_upsert_cannot_authorize_rollback(self):
+        # Exercise the actual launch body and real registry helpers, replacing
+        # the failed write/readiness edges only. No daemon or live socket.
+        sb = self.box()
+        sb.seed_entry("a", "existing-mission", age=300)
+        before = _read(sb.reg)
+        src = _read(DEPT)
+        names = ("reg_init", "reg_remove", "rot_reg_quiet", "rot_reg_degraded", "launch_dept")
+        script = "set -eu\n" + "".join(func_text(src, n) for n in names) + r'''
+validate_dept_name(){ :; }
+reject_slug_collision(){ :; }
+dept_sock(){ echo "$HOME/rig.sock"; }
+dept_pack(){ echo "$HOME/pack"; }
+dept_logdir(){ echo "$HOME/log"; }
+seed_acl(){ :; }
+reg_upsert(){ return 10; }
+resolve_lane_acctdir(){ :; }
+resolve_dept_cwd(){ echo "$HOME"; }
+reg_get_field(){ echo "$HOME"; }
+ready(){ return 1; }
+ready_wait(){ return 1; }
+dept_ready_knob_warn(){ :; }
+ready_fail_note(){ :; }
+sock_len_diag(){ :; }
+_CYS_ROTATE_SELF=1
+CYSD=/usr/bin/true
+REG="$CYS_DEPTS_JSON"
+launch_dept a
+'''
+        r = subprocess.run(["bash", "-c", script], env=sb.env,
+                           capture_output=True, text=True, timeout=15)
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("kill 이후", r.stderr)
+        self.assertEqual(_read(sb.reg), before, "failed upsert authorized row removal")
+
+    def test_new_launch_row_survives_readiness_failure(self):
+        sb = self.box()
+        rc, out, err = sb.run("launch", "a")
+        self.assertEqual(rc, 1, (out, err))
+        self.assertTrue(sb.spawned("a"))
+        self.assertIn("a", sb.read_reg())
+
+    def test_catalog_reuse_dead_row_survives_failure(self):
+        sb = self.box()
+        sb.env.pop("STUB_PING_OK_FROM", None)
+        sb.seed_catalog("k1", "m1")
+        sb.seed_entry("dept-1", "m1", age=300)
+        rc, out, err = sb.run("create", "k1")
+        self.assertEqual(rc, 1, (out, err))
+        self.assertIn("dept-1", sb.read_reg())
+        self.assertEqual(sb.read_reg()["dept-1"]["mission_key"], "m1")
+
+    def test_allocate_failure_preserves_other_registered_rows(self):
+        sb = self.box()
+        sb.env.pop("STUB_PING_OK_FROM", None)
+        sb.seed_entry("dept-1", "m1", age=300)
+        before = sb.read_reg()["dept-1"]
+        rc, out, err = sb.run("allocate")
+        self.assertEqual(rc, 1, (out, err))
+        self.assertTrue(sb.spawned("dept-2"))
+        self.assertEqual(sb.read_reg()["dept-1"], before)
+        self.assertIn("dept-2", sb.read_reg())
+
+import datetime
+import hashlib
+import json
+import os
+from pathlib import Path
+import shlex
+import subprocess
+import tempfile
+import unittest
+
+import datetime
+import hashlib
+import json
+import os
+from pathlib import Path
+import shlex
+import subprocess
+import tempfile
+import unittest
+import sys
+
+class RemovalAudit(unittest.TestCase):
+    def setUp(self):
+        self.box = tempfile.TemporaryDirectory(prefix="a66-audit-")
+        self.addCleanup(self.box.cleanup)
+        self.home = Path(self.box.name)
+        self.reg = self.home / "depts.json"
+        self.reg.write_text(json.dumps({"depts":{"a":{"x":1},"b":{"x":2}},"other":3}))
+        self.audit = self.home / ".local/state/cys/dept-removals.jsonl"
+        self.env = {k:v for k,v in os.environ.items() if not k.startswith(("CYS_","CLAUDE_"))}
+        self.env.update(HOME=str(self.home),PYTHONDONTWRITEBYTECODE="1")
+        source = Path(os.environ.get("A66_SOURCE", DEPT)).read_text()
+        def fn(name):
+            start=source.index(name+"(){")
+            return source[start:source.index("\n}",start)+2]+"\n"
+        self.functions = "reg_init(){ :; }\n" + fn("reg_remove")
+
+    def run_remove(self, name="a", **extra):
+        env=dict(self.env,**extra)
+        script="set -eu\nREG="+shlex.quote(str(self.reg))+"\ncmd=reap\n"+self.functions+"reg_remove "+shlex.quote(name)+"\n"
+        return subprocess.run(["/bin/bash","-c",script],env=env,capture_output=True,text=True,timeout=10)
+
+    def test_removal_writes_one_durable_record_and_second_appends(self):
+        before=hashlib.sha256(self.reg.read_bytes()).hexdigest()
+        r=self.run_remove();self.assertEqual(r.returncode,0,r.stderr)
+        self.assertTrue(self.audit.exists(), "removal left no durable audit")
+        first=self.audit.read_bytes(); rows=[json.loads(x) for x in first.splitlines()]
+        self.assertEqual(len(rows),1);row=rows[0]
+        self.assertEqual((row["lane"],row["verb"],row["reason"],row["phase"]),("a","reap","dead-socket","remove_intent"))
+        self.assertGreater(row["pid"],0);self.assertGreater(row["parent_pid"],0)
+        self.assertEqual(row["before_sha256"],before)
+        self.assertEqual(row["after_sha256"],hashlib.sha256(self.reg.read_bytes()).hexdigest())
+        self.assertAlmostEqual(datetime.datetime.fromisoformat(row["utc"]).timestamp(),row["epoch"],places=5)
+        self.assertEqual(self.run_remove("b").returncode,0)
+        second=self.audit.read_bytes();self.assertTrue(second.startswith(first))
+        self.assertEqual([json.loads(x)["lane"] for x in second.splitlines()],["a","b"])
+        self.assertEqual(self.run_remove("b").returncode,0)
+        self.assertEqual(self.audit.read_bytes(),second, "absent row made a duplicate removal record")
+
+    def inject_fault(self):
+        bindir=self.home/"bin";bindir.mkdir()
+        wrapper=bindir/"python3"
+        wrapper.write_text("#!"+sys.executable+"\n"+r'''
+import os,sys
+code=sys.stdin.read(); sys.argv=sys.argv[1:]
+fault=os.environ.get("A66_TEST_FAULT")
+write,fsync,replace=os.write,os.fsync,os.replace
+owned=[None]
+def badwrite(fd,data):
+    owned[0]=fd
+    if fault=="short": return write(fd,data[:5])
+    return write(fd,data)
+def badsync(fd):
+    if fault=="fsync" and fd==owned[0]: raise OSError("injected audit fsync")
+    return fsync(fd)
+def badreplace(src,dst):
+    if fault=="replace": raise OSError("injected registry replace")
+    return replace(src,dst)
+os.write=badwrite;os.fsync=badsync;os.replace=badreplace
+exec(compile(code,"<audit-fault-fixture>","exec"))
+''')
+        wrapper.chmod(0o755)
+        self.env["PATH"]=str(bindir)+os.pathsep+self.env["PATH"]
+
+    def test_short_append_is_not_followed_by_registry_change(self):
+        self.inject_fault();before=self.reg.read_bytes()
+        r=self.run_remove(A66_TEST_FAULT="short")
+        self.assertNotEqual(r.returncode,0);self.assertIn("short audit append",r.stderr)
+        self.assertEqual(self.reg.read_bytes(),before)
+        partial=self.audit.read_bytes();self.assertEqual(len(partial),5)
+        again=self.run_remove()
+        self.assertNotEqual(again.returncode,0);self.assertIn("incomplete audit tail",again.stderr)
+        self.assertEqual(self.audit.read_bytes(),partial)
+        self.assertEqual(self.reg.read_bytes(),before)
+
+    def test_failed_audit_fsync_preserves_registry(self):
+        self.inject_fault();before=self.reg.read_bytes()
+        r=self.run_remove(A66_TEST_FAULT="fsync")
+        self.assertNotEqual(r.returncode,0);self.assertIn("injected audit fsync",r.stderr)
+        self.assertEqual(self.reg.read_bytes(),before)
+        self.assertEqual(json.loads(self.audit.read_text())["phase"],"remove_intent")
+
+    def test_replace_failure_leaves_honest_intent_not_false_commit(self):
+        self.inject_fault();before=self.reg.read_bytes()
+        r=self.run_remove(A66_TEST_FAULT="replace")
+        self.assertNotEqual(r.returncode,0);self.assertIn("injected registry replace",r.stderr)
+        self.assertEqual(self.reg.read_bytes(),before)
+        self.assertEqual(json.loads(self.audit.read_text())["phase"],"remove_intent")
+
+    def test_creation_failure_reason_reaches_both_teardown_routes(self):
+        source=Path(os.environ.get("A66_SOURCE", DEPT)).read_text()
+        def fn(name):
+            start=source.index(name+"(){")
+            return source[start:source.index("\n}",start)+2]+"\n"
+        helpers=fn("dept_creation_failed")+fn("dept_teardown_owned")+"cleanup_owned_dept_spawn(){ :; }\n"
+        for token in ("0","1"):
+            with self.subTest(token=token):
+                self.reg.write_text(json.dumps({"depts":{"a":{}}}))
+                child=self.home/("down-"+token+".sh")
+                child.write_text("#!/bin/bash\nset -eu\nREG="+shlex.quote(str(self.reg))+"\ncmd=down\n"+self.functions+'reg_remove "$2"\n')
+                child.chmod(0o755)
+                script="set -eu\nREG="+shlex.quote(str(self.reg))+"\ncmd=create\n_CYS_TT_OK="+token+"\n"+self.functions+helpers+"down_dept(){ reg_remove \"$2\"; }\n"+"dept_creation_failed 6 a down\n"
+                r=subprocess.run(["/bin/bash","-c",script,str(child)],env=self.env,capture_output=True,text=True,timeout=10)
+                self.assertEqual(r.returncode,6,r.stderr)
+                row=json.loads(self.audit.read_text().splitlines()[-1])
+                self.assertEqual(row["reason"],"creation-failed-rc-6")
+                self.assertEqual(row["reason_source"],"cleanup-context")
+                self.assertEqual(row["registry_path"],str(self.reg))
+
+    def test_audit_open_failure_preserves_registry_bytes(self):
+        self.audit.mkdir(parents=True)
+        before=self.reg.read_bytes();r=self.run_remove()
+        self.assertNotEqual(r.returncode,0)
+        self.assertEqual(self.reg.read_bytes(),before)
+
+    def test_full_audit_refuses_without_truncation_or_registry_change(self):
+        self.audit.parent.mkdir(parents=True)
+        self.audit.write_bytes(b"{}\n")
+        before=self.reg.read_bytes();r=self.run_remove(CYS_DEPT_AUDIT_MAX_BYTES="3")
+        self.assertNotEqual(r.returncode,0)
+        self.assertEqual(self.audit.read_bytes(),b"{}\n")
+        self.assertEqual(self.reg.read_bytes(),before)
+
+    def test_partial_tail_refuses_without_rewriting_history(self):
+        self.audit.parent.mkdir(parents=True)
+        self.audit.write_bytes(b'{"unfinished":')
+        before=self.reg.read_bytes();r=self.run_remove()
+        self.assertNotEqual(r.returncode,0)
+        self.assertEqual(self.audit.read_bytes(),b'{"unfinished":')
+        self.assertEqual(self.reg.read_bytes(),before)
+
+
+class ReadinessTimeoutPreservesRows(unittest.TestCase):
+    def test_each_new_row_survives_dead_or_live_silent_readiness_failure(self):
+        for mode in ("dead", "silent"):
+            for args in (("launch", "a"), ("allocate",), ("create", "k1")):
+                with self.subTest(mode=mode,args=args):
+                    sb=Sandbox(STUB_CYSD_MODE=mode)
+                    try:
+                        if args[0]=="create": sb.seed_catalog("k1","m1")
+                        source=_read(DEPT)
+                        source=source.replace(func_text(source,"dept_ready_secs"),"dept_ready_secs(){ echo 1; }\n")
+                        tool=os.path.join(sb.home,"cys-dept")
+                        _write_exec(tool,source)
+                        shutil.copyfile(os.path.join(BIN,"_owned_process.py"),os.path.join(sb.home,"_owned_process.py"))
+                        r=subprocess.run(["bash",tool,*args],env=sb.env,capture_output=True,text=True,timeout=15)
+                        self.assertEqual(r.returncode,1,(r.stdout,r.stderr))
+                        self.assertIn("데몬 기동 실패",r.stdout+r.stderr)
+                        name="a" if args[0]=="launch" else "dept-1"
+                        self.assertIn(name,sb.read_reg(),"readiness failure deleted a row")
+                    finally: sb.cleanup()
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

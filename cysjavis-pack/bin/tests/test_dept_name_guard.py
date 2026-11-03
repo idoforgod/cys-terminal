@@ -956,7 +956,7 @@ class SockLenDiag(Base):
         self.assertNotIn("sun_path", err, "성공 경로에 소켓 길이 사유가 섞임")
         self.assertIn("a", read_reg(env), "launch 완주인데 미등재")
 
-    # 12) 기동 실패 경로: 소켓을 만들지 않는 목 cysd(bind 실패 재현) → exit 1 · 등재 회수 · 상한 초과일 때만 사유
+    # 12) A66-A70: failed start keeps its row; socket-length diagnosis stays conditional.
     def test_daemon_start_failure_names_sock_len(self):
         _write_exec(os.path.join(self.home, ".local", "bin", "cysd"), "#!/bin/sh\nexit 0\n")
         write_reg(self.env, {})
@@ -970,7 +970,7 @@ class SockLenDiag(Base):
             self.assertIn("%dB" % len(sock.encode("utf-8")), err, "상한 초과 실패인데 소켓 길이 사유 부재: %r" % err)
         else:
             self.assertNotIn("sun_path", err, "상한 미만 실패에 소켓 길이 오진단")
-        self.assertNotIn("a", read_reg(self.env), "기동 실패인데 등재 잔존(롤백 회귀)")
+        self.assertIn("a", read_reg(self.env), "A66-A70: failed start must preserve the registered row")
 
     # 12) 배선 census: "데몬 기동 실패" 를 내는 전 지점이 sock_len_diag 를 부른다 · 스폰 전 가드(assert_sock_len) 부활 금지
     def test_failure_sites_wired_and_no_prespawn_guard(self):
@@ -1039,8 +1039,8 @@ def corrupt():
         # 실제 계정시드 fail-closed → down의 registry read rc10 경로를 유발한다.
         (Path(env["HOME"]) / ".cys/pack/agents.json").write_text('{"claude":{}}')
 if sys.argv[1] == "winner":
-    # 이번 cys-dept의 자식이 스폰되고 경쟁 패자로 사망한 뒤에만 승자의 ready를 공개한다.
-    # 실제 두 프로세스를 쓰되 소켓은 기존 하네스처럼 파일 기반 목(실 bind 불필요)이다.
+    # A98: publish the healthy holder before letting the startup-lock loser exit.
+    # A lock loser cannot prove a healthy holder that has not become ready yet.
     pidfile = Path(env["GUARD_PID_FILE"])
     while True:
         try:
@@ -1048,12 +1048,6 @@ if sys.argv[1] == "winner":
             break
         except (OSError, ValueError):
             time.sleep(0.02)
-    while True:
-        try:
-            os.kill(loser, 0)
-        except ProcessLookupError:
-            break
-        time.sleep(0.02)
     corrupt()
     sock = Path(env["GUARD_TARGET_SOCKET"])
     sock.parent.mkdir(parents=True, exist_ok=True)
@@ -1070,7 +1064,13 @@ elif sys.argv[1] == "daemon":
     with open(env["GUARD_START_FILE"], "a") as out:
         out.write(str(os.getpid()) + "\\n")
     if env["GUARD_COMPETING"] == "1":
-        sys.exit(0)  # singleton 경쟁 패자: 소켓/lock을 소유하지 않은 채 종료
+        # Wait for the winner publication, not an arbitrary scheduling delay.
+        deadline = time.monotonic() + 5
+        while not Path(env["GUARD_TARGET_SOCKET"]).exists():
+            if time.monotonic() >= deadline:
+                sys.exit(2)
+            time.sleep(0.02)
+        sys.exit(0)  # Healthy holder already exists; loser owns no socket/lock.
     if env["GUARD_EXISTING"] != "1":
         corrupt()
     sock = Path(env["CYS_SOCKET"])
@@ -1093,6 +1093,18 @@ else:
                 os.kill(winner, 0)  # 파일 존재만으로 성공시키지 않는다: 실제 승자가 살아 있어야 응답
             except (OSError, ValueError):
                 sys.exit(1)
+            # A98 fixture barrier: the holder is published, then the loser exits,
+            # then readiness may succeed. Do not race the no-SIGTERM assertion.
+            loser = int(Path(env["GUARD_PID_FILE"]).read_text())
+            deadline = time.monotonic() + 5
+            while True:
+                try:
+                    os.kill(loser, 0)
+                except ProcessLookupError:
+                    break
+                if time.monotonic() >= deadline:
+                    sys.exit(1)
+                time.sleep(0.02)
             with open(env["GUARD_CALL_LOG"], "a") as out:
                 out.write("pong " + str(winner) + "\\n")
             print(winner)
@@ -1321,19 +1333,47 @@ class RegistryBom(Base):
     def test_no_encoding_blind_registry_reader(self):
         readers, blind = 0, []
         for line, tree in self._registry_python():
+            # Only a byte read fed directly into hashlib.sha256 is exempt.
+            digest_reads = set()
+            for call in ast.walk(tree):
+                if (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+                        and isinstance(call.func.value, ast.Name)
+                        and call.func.value.id == "hashlib" and call.func.attr == "sha256"
+                        and len(call.args) == 1):
+                    read = call.args[0]
+                    if (isinstance(read, ast.Call) and not read.args and not read.keywords
+                            and isinstance(read.func, ast.Attribute) and read.func.attr == "read"):
+                        digest_reads.add(read.func.value)
             for node in ast.walk(tree):
                 if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "open"):
                     continue
                 kw = {k.arg: k.value for k in node.keywords}
                 mode = ast.literal_eval(kw.get("mode", node.args[1] if len(node.args) > 1 else ast.Constant("r")))
                 if not mode.startswith("r"):
-                    continue    # .lock / 원자 교체 tmp 쓰기는 별도 계약(UTF-8 출력).
+                    continue
+                if mode == "rb" and node in digest_reads:
+                    continue  # A66 exact-byte digest, not a registry decoder.
                 readers += 1
                 encoding = kw.get("encoding")
                 if not (isinstance(encoding, ast.Constant) and encoding.value == "utf-8-sig"):
                     blind.append(line + node.lineno)
         self.assertGreater(readers, 0, "레지스트리 read open 0 — census가 무효")
         self.assertEqual(blind, [], "utf-8-sig 아닌 레지스트리 판독 잔존(cys-dept 줄): %r" % blind)
+
+    def test_encoding_census_accepts_only_binary_digest_exception(self):
+        from unittest.mock import patch
+        valid = 'json.load(open(p, encoding="utf-8-sig"))\n'
+        accepted = valid + 'hashlib.sha256(open(p,"rb").read()).hexdigest()'
+        with patch.object(self, "_registry_python", return_value=[(0, ast.parse(accepted))]):
+            self.test_no_encoding_blind_registry_reader()
+        for invalid in ('json.load(open(p,"rb"))',
+                        'open(p,"rb").read().decode("utf-8")',
+                        'json.load(open(p,encoding="utf-8"))',
+                        'hashlib.sha256(open(p,"r").read())'):
+            with self.subTest(invalid=invalid):
+                with patch.object(self, "_registry_python", return_value=[(0, ast.parse(valid + invalid))]):
+                    with self.assertRaises(AssertionError):
+                        self.test_no_encoding_blind_registry_reader()
 
     # P1: except Exception → 빈 레지스트리 복구는 cp949/잘린 JSON 을 원자 덮어쓰기하던 데이터 소실 원인.
     def test_no_exception_resets_registry(self):
