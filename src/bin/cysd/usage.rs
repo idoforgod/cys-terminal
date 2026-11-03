@@ -2470,6 +2470,96 @@ pub(crate) fn p11_pick_proven_rollout(lsof_stdout: &str) -> Option<PathBuf> {
     best.map(|(_, _, p)| p)
 }
 
+/// P11(0.14.57 · impl-r1 F1): 주기 증명 lsof 한 번의 시간 상한 — agy lsof([`AGY_LSOF_TIMEOUT`])와 같은 3초. 수집기 틱은
+/// 좌석을 차례로 돌고 그 뒤에 가드 틱(`ctx_guard_tick`)·사이클 펌프(`cycle_jobs::pump`)를 부르므로, 상한 없는 증명 하나가
+/// 멈추면 그 뒤 전부가 멈춘다(치명 위험 2 계열). 넘기면 무증명(None) — 핀은 그대로다(R2).
+#[cfg(not(windows))]
+const P11_LSOF_TIMEOUT: Duration = Duration::from_secs(3);
+/// 시한을 넘긴(또는 출력을 닫고도 끝나지 않는) 증명 자식을 죽인 뒤 거두기(reap)를 기다리는 상한.
+#[cfg(not(windows))]
+const P11_LSOF_REAP_BUDGET: Duration = Duration::from_secs(2);
+/// 증명 출력 상한(바이트) — 넘으면 무증명(잘린 목록은 증명이 아니다 · 읽기를 멈추면 자식은 쓰기에서 서고 시한이 끝낸다).
+#[cfg(not(windows))]
+const P11_LSOF_OUT_CAP: u64 = 8 * 1024 * 1024;
+/// 죽였는데 상한 안에 거두지 못한(커널 대기 등) 증명 자식이 이만큼 남아 있으면 새 증명을 띄우지 않는다(쌓임 봉쇄 · 무증명).
+#[cfg(not(windows))]
+const P11_LSOF_UNREAPED_MAX: usize = 2;
+#[cfg(not(windows))]
+static P11_LSOF_UNREAPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 자식 종료를 상한 안에서 기다린다(거둠 포함) — Some = 끝났고 거뒀다.
+#[cfg(not(windows))]
+fn p11_wait_reaped(child: &mut std::process::Child, budget: Duration) -> Option<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => return Some(st),
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            _ => return None,
+        }
+    }
+}
+
+/// 증명 자식을 끝내고 거둔다. 상한 안에 거두지 못하면 전용 스레드가 끝까지 기다려 거두고(좀비 금지), 그동안은
+/// [`P11_LSOF_UNREAPED`] 가 새 증명을 막는다. 그 스레드조차 못 만들면 계수를 되돌리지 않는다 — 거두지 못한 자식이 남았다는
+/// 사실이 그대로 다음 증명을 막는다(무증명 = 핀 유지 · 수집기 틱은 계속 돈다).
+#[cfg(not(windows))]
+fn p11_kill_and_reap(mut child: std::process::Child) {
+    let _ = child.kill();
+    if p11_wait_reaped(&mut child, P11_LSOF_REAP_BUDGET).is_some() {
+        return;
+    }
+    P11_LSOF_UNREAPED.fetch_add(1, Ordering::SeqCst);
+    let _ = std::thread::Builder::new().name("p11-lsof-reap".into()).spawn(move || {
+        let _ = child.wait();
+        P11_LSOF_UNREAPED.fetch_sub(1, Ordering::SeqCst);
+    });
+}
+
+/// P11(0.14.57 · impl-r1 F1): 증명 lsof 를 **소유한 자식**으로 상한 안에서만 돌린다(같은 파일 agy lsof 의 규율 ·
+/// `teamtoken.rs`·`agy_statusline.rs` 의 동기 자식 상한과 같은 꼴). 표준출력은 전용 스레드가 EOF 까지 비우고, 수집기는
+/// 그 EOF 를 [`P11_LSOF_TIMEOUT`] 까지만 기다린다 — 넘기면 죽이고 거둔 뒤 None. EOF 뒤 종료도 [`P11_LSOF_REAP_BUDGET`]
+/// 안에서만 기다린다. 성공 종료 ∧ 출력 상한 이내일 때만 출력을 돌려준다.
+#[cfg(not(windows))]
+fn p11_lsof_bounded(mut cmd: std::process::Command, timeout: Duration) -> Option<Vec<u8>> {
+    if P11_LSOF_UNREAPED.load(Ordering::SeqCst) >= P11_LSOF_UNREAPED_MAX {
+        return None;
+    }
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let mut child = cmd.spawn().ok()?;
+    let Some(stdout) = child.stdout.take() else {
+        p11_kill_and_reap(child);
+        return None;
+    };
+    let (tx, rx) = std::sync::mpsc::channel::<(bool, Vec<u8>)>();
+    let reader = std::thread::Builder::new().name("p11-lsof-out".into()).spawn(move || {
+        let mut buf = Vec::new();
+        let ok = stdout.take(P11_LSOF_OUT_CAP + 1).read_to_end(&mut buf).is_ok();
+        let _ = tx.send((ok, buf));
+    });
+    if reader.is_err() {
+        p11_kill_and_reap(child);
+        return None;
+    }
+    let (ok, buf) = match rx.recv_timeout(timeout) {
+        Ok(v) => v,
+        Err(_) => {
+            p11_kill_and_reap(child);
+            return None;
+        }
+    };
+    let Some(status) = p11_wait_reaped(&mut child, P11_LSOF_REAP_BUDGET) else {
+        p11_kill_and_reap(child);
+        return None;
+    };
+    if !ok || !status.success() || buf.len() as u64 > P11_LSOF_OUT_CAP {
+        return None;
+    }
+    Some(buf)
+}
+
 /// P11(0.14.57) §3.2–§3.3: 적격 codex 프로세스 신원 고정 → `lsof -b -w -nP -a -p <pid> -F fan` →
 /// 호출 후 단일 PID 재조회로 `(pid, start_time, name)` 무오차 재검증 → 최신 쓰기 가능 `cli` rollout 반환.
 #[cfg(not(windows))]
@@ -2493,10 +2583,8 @@ fn discover_codex_rollout_proven(surface_pid: u32, bin: &str) -> Option<PathBuf>
     if let Some(fake) = p11_lsof_seam::command() {
         cmd = fake;
     }
-    let out = cmd.output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
+    // impl-r1 F1: 소유한 자식 · 시한 3초 · 넘기면 죽이고 거둔 뒤 무증명(핀 유지).
+    let out = p11_lsof_bounded(cmd, P11_LSOF_TIMEOUT)?;
     #[cfg(test)]
     p11_post_probe_hook::run();
     let target_pid = sysinfo::Pid::from_u32(elig_pid);
@@ -2514,7 +2602,7 @@ fn discover_codex_rollout_proven(surface_pid: u32, bin: &str) -> Option<PathBuf>
     ) {
         return None;
     }
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stdout = String::from_utf8_lossy(&out);
     p11_pick_proven_rollout(&stdout)
 }
 
