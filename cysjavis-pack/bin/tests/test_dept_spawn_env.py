@@ -26,6 +26,11 @@ from test_dept_create_progress import DEPT, Sandbox, UP_AT_PING, _write_exec  # 
 ENV_CYSD = r'''#!/bin/sh
 env > "$HOME/spawn-env.tmp"
 mv "$HOME/spawn-env.tmp" "$HOME/spawn-env"
+# A98: publish the fixture readiness event before exiting. The old stub exited
+# before the synthetic ping-count threshold and never published a ready socket.
+# A successful ping now wins over this exited fixture; no persistent child needed.
+mkdir -p "$(dirname "$CYS_SOCKET")"
+touch "$CYS_SOCKET"
 exit 0
 '''
 VERBS = (("launch", ("launch", "dept-1")), ("allocate", ("allocate",)), ("create", ("create", "k1")))
