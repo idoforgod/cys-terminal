@@ -1438,23 +1438,67 @@ struct CollectorState {
 }
 
 /// P11(impl-r2 G1): 수집기 루프 — `spawn_usage_collector` 가 `tokio::spawn` 으로 띄우는 바로 그 본문(검체 진입점).
+/// 틱은 [`collect_tick_off_worker`] 로 런타임 워커 밖(블로킹 풀)에서 돌고, 이 루프는 그 끝을 await 한다.
 #[cfg(not(windows))]
 async fn usage_collector_loop(daemon: Arc<Daemon>, mut st: CollectorState) {
     loop {
         tokio::time::sleep(Duration::from_secs(poll_secs())).await;
+        let Some(next) = collect_tick_off_worker(&daemon, st).await else {
+            return; // 런타임 종료 중(블로킹 작업 취소) — 수집기도 끝난다
+        };
+        st = next;
+    }
+}
+
+/// P11(impl-r2 G1): 수집기 틱 하나를 **런타임 워커 밖**(`tokio::task::spawn_blocking` 블로킹 풀)에서 돌리고 await 한다.
+///
+/// 【왜】 틱은 동기다 — 좌석마다 sysinfo 갱신·파일 읽기·주기 증명 lsof(소유한 자식 · 상한 [`P11_LSOF_TIMEOUT`] +
+/// [`P11_LSOF_REAP_BUDGET`])를 차례로 기다린다. 이것이 `tokio::spawn` 태스크 안에서 직접 돌면 그동안 워커 하나가 붙잡히고,
+/// 워커가 하나뿐인 런타임(1~2코어 기계 · `#[tokio::main]` 기본 = 코어 수)에서는 accept 루프·RPC dispatch·이벤트 write 가
+/// 함께 선다(거버넌스 루프 Q8 과 같은 사유 · RPC dispatch 는 이미 `spawn_blocking` 을 쓴다).
+///
+/// 【그 스레드에서 도는 것 — e5bac7b3 기준 census】 `collect_tick` 의 도달 범위(`collect_for`·`collect_external`·
+/// `ctx_guard_tick_at`→`handlers::publish_ctx_guard`·`cycle_jobs::pump`·`bus.publish`)에는 `Handle::current()`·`block_on`·
+/// `block_in_place`·`spawn_local` 이 없다 — 데몬 프로덕션 전체에서도 런타임 문맥을 묻는 호출은 `Handle::try_current()` 둘(channels·governance)뿐이고
+/// 그것은 블로킹 풀에서도 Ok 다(tokio 1.52.3 `blocking/pool.rs` 가 풀 스레드마다 런타임 핸들에 enter 한다 — 틱 안의
+/// `tokio::spawn` 도 그대로 동작). 잠금은 전부 `std::sync` 이고 await 를 가로질러 쥐는 잠금은 없다(상태는 소유권째 넘겼다가
+/// 돌려받는다). 프로덕션 `thread_local!` 은 이 도달 범위에 없다(있는 것은 cfg(test) 이음매뿐) — 틱마다 다른 풀 스레드에 앉아도
+/// 잃는 캐시가 없다. 틱은 루프가 await 하므로 동시에 둘이 돌지 않는다(종전과 같다).
+///
+/// 【런타임 종류】 `spawn_blocking` 은 multi-thread·current-thread 둘 다에서 패닉 없이 동작한다(`block_in_place` 는
+/// current-thread 에서 패닉 — 기각). 데몬은 `#[tokio::main]`(multi-thread). current-thread 에서도 await 가 유일한 스레드를
+/// 내주므로 다른 태스크가 돈다. 블로킹 풀이 가득하면 틱이 그 줄에서 기다린다(데몬의 다른 일은 계속 돈다).
+///
+/// 【패닉·취소】 틱 패닉은 블로킹 스레드 안에서 `catch_unwind` 로 잡고 상태를 돌려받는다(종전과 같은 `usage.tick_panic`).
+/// 블로킹 작업이 취소되면(런타임 종료) None. 잡지 못한 패닉으로 JoinError 가 오면(실제로는 닿지 않는 팔) 상태는 잃은 것이라
+/// 빈 상태로 다시 시작한다 — 다음 틱이 좌석별 발견을 다시 하고(핀은 새로 정한다), 읽기 오프셋은 `TailState::attach` 가 데몬
+/// 분석 저장값(`analytics::load_offset`)에서 되살린다.
+#[cfg(not(windows))]
+async fn collect_tick_off_worker(daemon: &Arc<Daemon>, mut st: CollectorState) -> Option<CollectorState> {
+    let d = Arc::clone(daemon);
+    let joined = tokio::task::spawn_blocking(move || {
         // 패닉 격리 — watchdog과 동일: 한 틱의 패닉이 수집기를 영구 침묵시키지 않게
         let tick = std::panic::AssertUnwindSafe(|| {
-            collect_tick(&daemon, &mut st.tails, &mut st.attempts, &mut st.ext)
+            collect_tick(&d, &mut st.tails, &mut st.attempts, &mut st.ext)
         });
-        if std::panic::catch_unwind(tick).is_err() {
-            daemon.bus.publish(
-                "usage.tick_panic",
-                "usage",
-                None,
-                json!({"note": "usage collector tick panicked; continuing next tick"}),
-            );
-        }
+        let panicked = std::panic::catch_unwind(tick).is_err();
+        (st, panicked)
+    })
+    .await;
+    let (st, panicked) = match joined {
+        Ok(v) => v,
+        Err(e) if e.is_cancelled() => return None,
+        Err(_) => (CollectorState::default(), true),
+    };
+    if panicked {
+        daemon.bus.publish(
+            "usage.tick_panic",
+            "usage",
+            None,
+            json!({"note": "usage collector tick panicked; continuing next tick"}),
+        );
     }
+    Some(st)
 }
 
 fn collect_tick(
