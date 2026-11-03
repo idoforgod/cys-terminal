@@ -1327,7 +1327,7 @@ fn modal_left_behind(sig: &ModalSignature, screen: &str, marker: Option<&str>) -
 
 /// 한 줄이 **괘선**(입력 상자 테두리)인가 — 박스 문자(U+2500..=U+259F)가 [`PROMPT_TRAILER_RULE_MIN_RUN`]
 /// 이상 **연달아** 있고, 그 밖의 비공백 문자가 없다(문장 속 `─` 한두 개는 괘선이 아니다).
-fn is_rule_line(line: &str) -> bool {
+pub fn is_rule_line(line: &str) -> bool {
     let (mut run, mut best) = (0usize, 0usize);
     for c in line.chars() {
         if ('\u{2500}'..='\u{259F}').contains(&c) {
