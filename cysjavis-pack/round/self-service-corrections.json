@@ -3,6 +3,14 @@
  "release": "0.14.57",
  "base_commit": "31f878782d966510089df8e71ddc8fb6cc289184",
  "source": "DESIGN-F58-final.md sha16 74cc8cc559f93ffa (rows verified at the base: F58/impl/verify_pins.out)",
+ "withdrawn": [
+  {
+   "id": "T1-12d",
+   "file": "directives/CSO_DIRECTIVE.md",
+   "reason": "the CSO budget-exemption list is observe/save/report only; deliver and revive stay allowed (T1-12) and budgeted",
+   "decision": "HEAD-DECISION-F58-impl-T1-12d.md sha16 7db20ecc42b8a8b9 (2026-11-04 00:37 +0800)"
+  }
+ ],
  "rows": [
   {
    "id": "T1-13+T2-06",
@@ -477,26 +485,6 @@
    ],
    "old": "요약의 `remedy=<코드>`(처방 코드 · 없으면 `blocked_by`)는 master·오너(사람)에게 그대로 전달. **★LLM 에이전트(CSO·master 포함)는 자동 조치(강제 배달 `cys queue deliver`·드레인·키 주입·동결 해제·항목 삭제) 금지 — 사람 운영자 전용(depth_high 와 겹쳐도)**",
    "new": "요약의 `remedy=<코드>`(처방 코드 · 없으면 `blocked_by`)대로 **★CSO 가 직접 푼다(사용자 지침이 막으면 따른다)**: `cys read-screen` 으로 그 창을 먼저 읽고, 만료 항목은 `cys queue revive <id>`(같은 항목은 한 번만), 막힌 머리는 **막힌 이유가 quiet 대기·사이클 창 보류일 때만** `cys queue deliver <id>`(단건 · 항목·remedy 코드마다 10분에 한 번 · 드레인 금지). **초안·모달·승인·전체화면(codex·gemini 좌석은 늘 이렇다)·작업 중·빈 좌석·일시정지·사람 입력 직후·배달 간격으로 막혔으면 강제 배달도 데몬이 거부한다 — 부르지 않는다: 작업 중·사람 입력 직후·배달 간격은 기다리고, 초안·모달·승인·전체화면·빈 좌석·일시정지는 읽은 화면과 함께 master 에게 넘긴다. CSO 는 남의 입력줄에 글·키를 넣지 않는다**. **유령 계수·사람 글·질문 창·항목 폐기·드레인·동결 해제는 master 에게 넘긴다 — master 가 사용자에게 한 번 묻는다(depth_high 와 겹쳐도)**"
-  },
-  {
-   "id": "T1-12d",
-   "class": [
-    1
-   ],
-   "op": "replace",
-   "file": "directives/CSO_DIRECTIVE.md",
-   "repo_path": "cysjavis-pack/directives/CSO_DIRECTIVE.md",
-   "owner_class": "user",
-   "generated": false,
-   "base_blob": "945a8637229c0cbaf9a1984ecd50ca0a2423e409",
-   "line": 174,
-   "k_before": 1,
-   "k_norm": 1,
-   "roles": [
-    "cso"
-   ],
-   "old": "`cys queue list|feed list|feed push|schedule list|approval check`",
-   "new": "`cys queue list|queue revive|queue deliver|feed list|feed push|schedule list|approval check`"
   },
   {
    "id": "T1-12",

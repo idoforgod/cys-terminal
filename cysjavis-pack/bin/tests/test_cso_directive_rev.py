@@ -417,11 +417,15 @@ SAFETY_CLAUSES = {
         #   이 팩이 간다 · 요약이 200바이트에서 잘리면 끝의 코드가 빠진다) — 코드가 없으면 같은 요약의 `blocked_by` 를 전달하라고 적었다
         #   ②0.14.42 의 "사람 운영자 전용" 단정을 되살렸고(`강제 배달`이 '자동'이 아니어도 막는다) depth_high 행과 겹쳐도 이 행이 이긴다고 적었다.
         #   아래 첫 항은 문장 전체를 잡고, 뒤 두 항(가산)은 되살린 낱말·새 조건을 따로 잡아 그 구절만 지워도 붉어지게 한다.
-        ("queue.starved 처방 전달·자동 조치 금지", "요약의 `remedy=<코드>`(처방 코드 · 없으면 `blocked_by`)는 master·오너(사람)에게 그대로 전달. "
-                                 "**★LLM 에이전트(CSO·master 포함)는 자동 조치(강제 배달 `cys queue deliver`·드레인·키 주입·동결 해제·항목 삭제) 금지 — "
-                                 "사람 운영자 전용(depth_high 와 겹쳐도)**"),
-        ("queue.starved 사람 운영자 전용 복원", "금지 — 사람 운영자 전용(depth_high 와 겹쳐도)"),
-        ("queue.starved 처방 코드가 없으면 blocked_by 전달", "(처방 코드 · 없으면 `blocked_by`)는 master·오너(사람)에게 그대로 전달"),
+        ("queue.starved 처방대로 직접 해소·강제 배달 한정", "요약의 `remedy=<코드>`(처방 코드 · 없으면 `blocked_by`)대로 **★CSO 가 직접 푼다(사용자 지침이 막으면 따른다)**: "
+                                 "`cys read-screen` 으로 그 창을 먼저 읽고, 만료 항목은 `cys queue revive <id>`(같은 항목은 한 번만), 막힌 머리는 "
+                                 "**막힌 이유가 quiet 대기·사이클 창 보류일 때만** `cys queue deliver <id>`(단건 · 항목·remedy 코드마다 10분에 한 번 · 드레인 금지)"),
+        ("queue.starved 프롬프트 게이트는 master 에게·입력 주입 금지", "**초안·모달·승인·전체화면(codex·gemini 좌석은 늘 이렇다)·작업 중·빈 좌석·일시정지·사람 입력 직후·배달 간격으로 막혔으면 "
+                                 "강제 배달도 데몬이 거부한다 — 부르지 않는다: 작업 중·사람 입력 직후·배달 간격은 기다리고, 초안·모달·승인·전체화면·빈 좌석·일시정지는 "
+                                 "읽은 화면과 함께 master 에게 넘긴다. CSO 는 남의 입력줄에 글·키를 넣지 않는다**"),
+        ("queue.starved 폐기·드레인·동결 해제는 master 경유 1회 질문", "**유령 계수·사람 글·질문 창·항목 폐기·드레인·동결 해제는 master 에게 넘긴다 — "
+                                 "master 가 사용자에게 한 번 묻는다(depth_high 와 겹쳐도)**"),
+        ("queue.starved 처방 코드가 없으면 blocked_by 대로", "(처방 코드 · 없으면 `blocked_by`)대로"),
         ("한도 경보 낡은 값 읽기(오너 결재 문면)", "`alert.account_rate`·`alert.rate_limit` 는 본문의 `in_use=0 ∧ age>1800` 또는 `reset<0` 이면 "
                                     "신규 작업 제한 판단의 근거로 쓰지 않는다 — `cys status --json` 의 `alert_eligible` 로 재확인"),
     ),
@@ -470,11 +474,15 @@ SAFETY_CLAUSES = {
         # ★(0.14.43 · 성찰 1회차 R1F-DOC · S5 M1·m1·m7 · 의식적 재핀 — CSO 쪽 주석 참조) ①처방 코드가 없을 때의 폴백(`blocked_by`) ②"사람 운영자 전용"
         #   단정 복원(depth_high 와 겹쳐도) ③0.14.42 에 있던 `send-key --queued ... Return` 의 제약 고지 `(Return 한정 큐잉)` 복원 — 낱말 핀은 가산이다.
         #   ★종전 핀은 "에이전트 (master" 로 공백을 넣어 잡았다(줄바꿈이 낀 문면을 접은 값) — 이제 문면이 한 줄 안에서 "에이전트(master" 로 이어진다(티켓 문안 그대로).
-        ("queue.starved 기본값·처방 전달", "(기아 · `CYS_QUEUE_STARVE_ALERT_SECS` 기본 600초 · depth_high와 별도 축)가 발행된다 — "
-                                  "요약의 `remedy=<코드>`(처방 코드 · 없으면 `blocked_by`)는 사람에게 그대로 전달한다."),
-        ("queue.starved 자동 조치 금지", "**★LLM 에이전트(master·CEO·CSO 포함)는 자동 조치(강제 배달 `cys queue deliver`·드레인·키 주입·"
-                                 "동결 해제·항목 삭제) 금지 — 사람 운영자 전용(depth_high 와 겹쳐도).**"),
-        ("queue.starved 사람 운영자 전용 복원", "금지 — 사람 운영자 전용(depth_high 와 겹쳐도)."),
+        ("queue.starved 기본값·처방대로 직접 해소", "(기아 · `CYS_QUEUE_STARVE_ALERT_SECS` 기본 600초 · depth_high와 별도 축)가 발행된다 — "
+                                  "요약의 `remedy=<코드>`(처방 코드 · 없으면 `blocked_by`)대로 **★자비스가 직접 푼다(사용자 지침이 막으면 그 지침을 따른다)**"),
+        ("queue.starved 강제 배달 한정·프롬프트 게이트 불호출", "막힌 머리는 **막힌 이유가 quiet 대기·사이클 창 보류일 때만** `cys queue deliver <id>`(단건 · 항목·remedy 코드마다 10분에 한 번 · 드레인 금지) — "
+                                 "**초안·모달·승인·전체화면·작업 중·빈 좌석·일시정지·사람 입력 직후·배달 간격으로 막혔으면 강제 배달도 데몬이 거부하므로 부르지 않는다"),
+        ("queue.starved 사람 글·질문 창은 사용자에게 한 번", "③유령 계수·사람 글이 걸린 입력줄은 기계가 지우지 못한다(데몬의 사람 글 보호 게이트) — 그 순간 읽은 화면으로 "
+                                 "그 창을 짚어 사용자에게 한 번 청한다(비어 있으면 그 창에서 Ctrl-U, 글이 있으면 제출·지우기·그대로 두기 중 무엇을 할지) "
+                                 "④질문·선택 창은 무엇을 묻는지 사용자에게 한 번 묻고 답대로 고른다."),
+        ("queue.starved 폐기·드레인 1회 질문·동결은 사용자만", "**큐 항목 폐기(`cys queue drop`)·드레인은 사용자에게 한 번 묻고, 하라고 하면 한다. "
+                                 "사용자가 건 kill-switch 동결은 사용자가 풀라고 할 때만 푼다(depth_high 와 겹쳐도).**"),
         ("send-key --queued Return 한정 큐잉 고지", "`cys send-key --queued ... Return`(Return 한정 큐잉)을 쓴다."),
     ),
     # CEO_TEMPLATE 은 MASTER 전문을 바이트 연접한 생성물이다(gen_ceo_template.py) — 배포본에도 같은 문면이 있어야 한다.
@@ -496,11 +504,15 @@ SAFETY_CLAUSES = {
         # ★(0.14.43 · 성찰 1회차 R1F-DOC · S5 M1·m1·m7 · 의식적 재핀 — CSO 쪽 주석 참조) ①처방 코드가 없을 때의 폴백(`blocked_by`) ②"사람 운영자 전용"
         #   단정 복원(depth_high 와 겹쳐도) ③0.14.42 에 있던 `send-key --queued ... Return` 의 제약 고지 `(Return 한정 큐잉)` 복원 — 낱말 핀은 가산이다.
         #   ★종전 핀은 "에이전트 (master" 로 공백을 넣어 잡았다(줄바꿈이 낀 문면을 접은 값) — 이제 문면이 한 줄 안에서 "에이전트(master" 로 이어진다(티켓 문안 그대로).
-        ("queue.starved 기본값·처방 전달", "(기아 · `CYS_QUEUE_STARVE_ALERT_SECS` 기본 600초 · depth_high와 별도 축)가 발행된다 — "
-                                  "요약의 `remedy=<코드>`(처방 코드 · 없으면 `blocked_by`)는 사람에게 그대로 전달한다."),
-        ("queue.starved 자동 조치 금지", "**★LLM 에이전트(master·CEO·CSO 포함)는 자동 조치(강제 배달 `cys queue deliver`·드레인·키 주입·"
-                                 "동결 해제·항목 삭제) 금지 — 사람 운영자 전용(depth_high 와 겹쳐도).**"),
-        ("queue.starved 사람 운영자 전용 복원", "금지 — 사람 운영자 전용(depth_high 와 겹쳐도)."),
+        ("queue.starved 기본값·처방대로 직접 해소", "(기아 · `CYS_QUEUE_STARVE_ALERT_SECS` 기본 600초 · depth_high와 별도 축)가 발행된다 — "
+                                  "요약의 `remedy=<코드>`(처방 코드 · 없으면 `blocked_by`)대로 **★자비스가 직접 푼다(사용자 지침이 막으면 그 지침을 따른다)**"),
+        ("queue.starved 강제 배달 한정·프롬프트 게이트 불호출", "막힌 머리는 **막힌 이유가 quiet 대기·사이클 창 보류일 때만** `cys queue deliver <id>`(단건 · 항목·remedy 코드마다 10분에 한 번 · 드레인 금지) — "
+                                 "**초안·모달·승인·전체화면·작업 중·빈 좌석·일시정지·사람 입력 직후·배달 간격으로 막혔으면 강제 배달도 데몬이 거부하므로 부르지 않는다"),
+        ("queue.starved 사람 글·질문 창은 사용자에게 한 번", "③유령 계수·사람 글이 걸린 입력줄은 기계가 지우지 못한다(데몬의 사람 글 보호 게이트) — 그 순간 읽은 화면으로 "
+                                 "그 창을 짚어 사용자에게 한 번 청한다(비어 있으면 그 창에서 Ctrl-U, 글이 있으면 제출·지우기·그대로 두기 중 무엇을 할지) "
+                                 "④질문·선택 창은 무엇을 묻는지 사용자에게 한 번 묻고 답대로 고른다."),
+        ("queue.starved 폐기·드레인 1회 질문·동결은 사용자만", "**큐 항목 폐기(`cys queue drop`)·드레인은 사용자에게 한 번 묻고, 하라고 하면 한다. "
+                                 "사용자가 건 kill-switch 동결은 사용자가 풀라고 할 때만 푼다(depth_high 와 겹쳐도).**"),
         ("send-key --queued Return 한정 큐잉 고지", "`cys send-key --queued ... Return`(Return 한정 큐잉)을 쓴다."),
     ),
     "REVIEWER_DIRECTIVE.md": (
@@ -3345,21 +3357,24 @@ class QueueStarvedDocContract(unittest.TestCase):
         # ★(성찰 1회차 R1F-DOC) 지침의 폴백 "없으면 `blocked_by`" 의 근거 — 요약은 `blocked_by=` 를 늘 싣고(없으면 `-`) 그 뒤에 `remedy=` 가 붙는다.
         self.assertIn('format!("depth={depth} head_wait={wait}s blocked_by={blocked}{remedy}")', self.route,
                       "경보 요약의 꼴(blocked_by 가 remedy 앞에 늘 실림)이 바뀌었다 — 지침의 폴백('없으면 blocked_by')이 달라진다")
-        found = re.search(r'pub\(crate\) const REMEDY_LLM_SUFFIX: &str = "[^"]*?자동 조치\(([^)]*)\)', self.governance)
-        self.assertIsNotNone(found, "governance.rs REMEDY_LLM_SUFFIX 의 금지 목록을 읽지 못했다(측정 불능)")
-        items = [item.strip() for item in found.group(1).split("·") if item.strip()]
-        self.assertGreaterEqual(len(items), 5, "금지 목록 판독이 비었다: %r" % items)
+        found = re.search(r'pub\(crate\) const REMEDY_LLM_SUFFIX: &str = " · LLM 에이전트는 자동 조치\(remedy 대로 단건 ([^)]*)\)를 한다 — '
+                          r'사용자 지침이 막으면 따르고, ([^"]*)는 사용자에게 한 번 묻는다";', self.governance)
+        self.assertIsNotNone(found, "governance.rs REMEDY_LLM_SUFFIX 의 허용·질문 목록을 읽지 못했다(측정 불능)")
+        verbs = [v.strip() for v in found.group(1).split("·") if v.strip()]
+        asked = [v.strip() for v in found.group(2).split("·") if v.strip()]
+        self.assertEqual(verbs, ["revive", "deliver"], "코드가 허용한 단건 동사가 바뀌었다: %r" % verbs)
+        self.assertIn("드레인", asked, "코드의 '한 번 묻는' 목록에서 드레인이 빠졌다: %r" % asked)
         for name in self.FILES:
             body = self.body(name)
             with self.subTest(directive=name):
-                lists = [g for g in re.findall(r"자동 조치\(([^)]*)\) 금지", body) if "cys queue deliver" in g]
-                self.assertEqual(len(lists), 1, "%s: queue.starved 자동 조치 금지 조항이 정확히 1개여야 한다: %r" % (name, lists))
-                for item in items:
-                    self.assertIn(item, lists[0], "%s: 코드의 금지 항목 %r 이 지침 목록에 없다" % (name, item))
-                self.assertIn("`remedy=<코드>`(처방 코드 · 없으면 `blocked_by`)는", body)
-                # ★(성찰 1회차 R1F-DOC) 0.14.42 의 "사람 운영자 전용" 단정이 되살아나 있다 — 금지 조항의 끝에 붙어 정확히 1번이다.
-                tail = re.findall(r"자동 조치\([^)]*cys queue deliver[^)]*\) 금지 — (사람 운영자 전용\(depth_high 와 겹쳐도\))", body)
-                self.assertEqual(len(tail), 1, "%s: '금지 — 사람 운영자 전용(depth_high 와 겹쳐도)' 이 정확히 1번이어야 한다: %r" % (name, tail))
+                for verb in verbs:
+                    self.assertEqual(body.count("`cys queue %s <id>`" % verb), 1,
+                                     "%s: 코드가 허용한 `cys queue %s <id>` 가 정확히 1번이어야 한다" % (name, verb))
+                self.assertIn("`remedy=<코드>`(처방 코드 · 없으면 `blocked_by`)대로", body)
+                self.assertEqual(body.count("막힌 이유가 quiet 대기·사이클 창 보류일 때만 `cys queue deliver <id>`"
+                                            "(단건 · 항목·remedy 코드마다 10분에 한 번 · 드레인 금지)"), 1,
+                                 "%s: 강제 배달의 한정 조건이 정확히 1번이어야 한다" % name)
+                self.assertNotIn("사람 운영자 전용", body, "%s: 오너가 푼 금지 문면이 되살아났다" % name)
 
     def test_negative_control_catches_each_restored_clause(self):
         """음성 대조(돌연변이) — 되살린 구절을 하나씩 지우면 그 핀이 붉어진다(핀이 공허하지 않다 · 메모리 사본만 바꾼다).
@@ -3368,13 +3383,17 @@ class QueueStarvedDocContract(unittest.TestCase):
         지우면 아무도 모른다 — 낱말 핀을 따로 걸고(가산) 지움 → 붉음을 여기서 증명한다."""
         both = ("MASTER_DIRECTIVE.md", "CEO_TEMPLATE.md")
         cases = [
-            ("CSO_DIRECTIVE.md", "사람 운영자 전용(depth_high 와 겹쳐도)", "사람 판단에 맡긴다", "queue.starved 사람 운영자 전용 복원"),
-            ("CSO_DIRECTIVE.md", "(처방 코드 · 없으면 `blocked_by`)", "(처방 코드)", "queue.starved 처방 코드가 없으면 blocked_by 전달"),
+            ("CSO_DIRECTIVE.md", "master 가 사용자에게 한 번 묻는다(depth_high 와 겹쳐도)", "사람 판단에 맡긴다", "queue.starved 폐기·드레인·동결 해제는 master 경유 1회 질문"),
+            ("CSO_DIRECTIVE.md", "(처방 코드 · 없으면 `blocked_by`)", "(처방 코드)", "queue.starved 처방 코드가 없으면 blocked_by 대로"),
+            ("CSO_DIRECTIVE.md", "읽은 화면과 함께 master 에게 넘긴다", "직접 강제 배달한다", "queue.starved 프롬프트 게이트는 master 에게·입력 주입 금지"),
+            ("CSO_DIRECTIVE.md", "막힌 이유가 quiet 대기·사이클 창 보류일 때만", "언제나", "queue.starved 처방대로 직접 해소·강제 배달 한정"),
         ]
         for name in both:
             cases += [
-                (name, "사람 운영자 전용(depth_high 와 겹쳐도)", "사람 판단에 맡긴다", "queue.starved 사람 운영자 전용 복원"),
-                (name, "(처방 코드 · 없으면 `blocked_by`)", "(처방 코드)", "queue.starved 기본값·처방 전달"),
+                (name, "사용자가 풀라고 할 때만 푼다(depth_high 와 겹쳐도)", "사람 판단에 맡긴다", "queue.starved 폐기·드레인 1회 질문·동결은 사용자만"),
+                (name, "(처방 코드 · 없으면 `blocked_by`)", "(처방 코드)", "queue.starved 기본값·처방대로 직접 해소"),
+                (name, "막힌 이유가 quiet 대기·사이클 창 보류일 때만", "언제나", "queue.starved 강제 배달 한정·프롬프트 게이트 불호출"),
+                (name, "사용자에게 한 번 청한다", "사람이 지운다", "queue.starved 사람 글·질문 창은 사용자에게 한 번"),
                 (name, "(Return 한정 큐잉)", "", "send-key --queued Return 한정 큐잉 고지"),
             ]
         for name, present, absent, label in cases:

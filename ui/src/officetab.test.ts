@@ -38,10 +38,10 @@ describe("planOfficeTab — 브리지가 없거나 느릴 때", () => {
       expect({ stage: p.stage, text: p.text, load: p.loadFrame, poll: p.nextPollMs, btn: p.buttonLabel }).toEqual({ stage: "preparing", text: OFFICE_TEXT_PREPARING, load: false, poll: 3000, btn: "" });
     }
   });
-  it("3분이 지나도 안 되면 긴 안내(컴퓨터를 다시 시작·피드백) · 15초 간격 · 앱만 다시 켜라고 하지 않는다", () => {
+  it("3분이 지나도 안 되면 긴 안내(자비스에게·피드백) · 15초 간격 · 앱만 다시 켜라고 하지 않는다", () => {
     const p = planOfficeTab({ ok: false }, ctx({ elapsedMs: OFFICE_POLL_FAST_WINDOW_MS }));
     expect({ stage: p.stage, text: p.text, poll: p.nextPollMs }).toEqual({ stage: "long", text: OFFICE_TEXT_LONG, poll: 15000 });
-    expect(p.text.includes("컴퓨터를 다시 시작")).toBe(true);
+    expect(p.text.includes("자비스에게")).toBe(true); // F58 T1-24: the user asks the Jarvis first
     expect(p.text.includes("피드백")).toBe(true);
     expect(p.text.includes("앱을 다시")).toBe(false);
   });

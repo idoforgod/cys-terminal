@@ -9390,12 +9390,12 @@ pub(crate) const REMEDY_CODE_AFTER_CURSOR: &str = "after_cursor_text";
 
 /// 모든 조치 문장의 끝에 붙는 **폭주 회로 차단 계약**(경보 실소비자가 LLM — 조치 문장이 자동 반응을 부르지 않게).
 /// ★(RQFIX I-4) 금지 목록에 `동결 해제`·`항목 삭제` 를 더했다. **앞부분 ` · LLM 에이전트는 자동 조치(` 는 바이트 그대로**다 — GUI 가 이 접두로 꼬리를 뗀다.
-pub(crate) const REMEDY_LLM_SUFFIX: &str = " · LLM 에이전트는 자동 조치(강제 배달·드레인·키 주입·동결 해제·항목 삭제) 금지";
+pub(crate) const REMEDY_LLM_SUFFIX: &str = " · LLM 에이전트는 자동 조치(remedy 대로 단건 revive·deliver)를 한다 — 사용자 지침이 막으면 따르고, 드레인·항목 삭제·동결 해제·사람 글에 닿는 키는 사용자에게 한 번 묻는다";
 
 /// ★(R2F-DM · 성찰 2회차 A1 m-2 ⓐ) `empty_seat` 처방(표 13행)에 **입력줄 계수가 0 보다 클 때만** 덧붙는 한 구절 — 죽은 좌석의 계수 1(되돌린 Esc)은 제품의 정상 상태 하나인데(`state.rs` 틱의 되돌리기),
 /// 권위 없는 재기동은 바로 그 계수로 막힌다(node-recover 거부 문구 · 화면 재기동 보류와 같은 안내가 처방에도 있어야 한다). 사람이 하는 일이다(기계가 Ctrl-U 를 보내는 경로는 없다).
 /// code·분기·게이트는 불변이고 문장의 이 한 갈래만 길어진다 — [`REMEDY_LLM_SUFFIX`] 의 위치(문장 맨 끝)와 앞부분은 바이트 그대로다(GUI 가 접두로 꼬리를 뗀다).
-pub(crate) const REMEDY_EMPTY_SEAT_COUNT_CLAUSE: &str = " — 다시 띄우기 전에 사람이 그 창에서 Ctrl-U 한 번(입력줄 계수가 남아 있다)";
+pub(crate) const REMEDY_EMPTY_SEAT_COUNT_CLAUSE: &str = " — 다시 띄울 때는 master·CSO 좌석에서 `cys node-recover --surface <좌석>` 로 띄운다(입력줄 계수 정리를 함께 한다 · 입력줄 계수가 남아 있다)";
 
 /// 유령 계수 처방 — 직접 send 거부 응답·강제 배달 거부 문구의 **맨 끝**에 덧붙는다(앞 문구·접두·태그의 위치·바이트는 불변).
 /// 사람이 하는 일이다(기계가 Ctrl-U 를 보내는 경로는 없다). ★(RQFIX I-8) 정의처는 `src/lib.rs` 다 — `cys` CLI 가 같은 문자열로 stderr 처방 줄을 찍는다(한 정의처 공유).
@@ -9430,12 +9430,11 @@ pub(crate) fn blocked_is_input_line(blocked_by: &str) -> bool {
 /// 다른 구절로 바꿔 쓴다(약속하지 않을 것을 약속하지 않는다). 기본 갈래의 바이트는 종전 그대로다(문서가 인용한다).
 pub(crate) const REMEDY_BODY_INPUT_PENDING_UNKNOWN: &str =
     "입력줄에 미제출 입력이 있다고 계수됐으나 화면을 판독하지 못했다 — 데몬의 화면 사본이 어긋났을 수 있다(1분 넘게 못 읽으면 cys 가 키 입력 없이 \
-     창 크기를 한 칸 흔들어 다시 그리기를 요청한다 · 사람이 그 창 크기를 한 번 바꿔도 다시 그려진다). 다시 그려진 뒤에도 막혀 있으면 사람이 그 창을 확인한다\
-     (비어 있으면 Ctrl-U · 글이 있으면 제출하거나 지운다)";
+     창 크기를 한 칸 흔들어 다시 그리기를 요청한다 · 사람이 그 창 크기를 한 번 바꿔도 다시 그려진다). 다시 그려진 뒤에도 막혀 있으면 자비스가 그 창 화면을 읽는다 — 비어 있으면 사용자에게 그 창에서 Ctrl-U 를 한 번 눌러 달라고 청한다(기계 Ctrl-U 는 데몬의 사람 글 보호 게이트가 거부한다), 글이 있으면 제출할지 지울지 사용자에게 한 번 묻는다";
 /// ★(0.14.45 · F3) 표 14행(`prompt_unknown`) 처방 — 커서 행에서 프롬프트 표지를 못 찾았다. 화면 사본 어긋남이면 다시 그리기로 풀린다. 갈래 규칙은 9행과 같다.
 pub(crate) const REMEDY_BODY_PROMPT_UNKNOWN: &str =
     "입력 대기 표지(프롬프트)를 화면에서 찾지 못했다 — 다른 화면이 떠 있거나 데몬의 화면 사본이 어긋났을 수 있다(사본 어긋남이면 1분 뒤 cys 가 키 입력 없이 \
-     창 크기를 한 칸 흔들어 다시 그리기를 요청한다 · 사람이 그 창 크기를 한 번 바꿔도 풀린다). 그래도 막혀 있으면 그 창이 입력을 기다리는 상태인지 사람이 확인한다";
+     창 크기를 한 칸 흔들어 다시 그리기를 요청한다 · 사람이 그 창 크기를 한 번 바꿔도 풀린다). 그래도 막혀 있으면 자비스가 `cys read-screen` 으로 그 창이 입력을 기다리는 상태인지 확인하고, 다른 화면이 떠 있으면 무엇인지 사용자에게 한 번 알린다";
 
 /// ★(0.14.45 · 성찰 M2) 다시 그리기 요청에 관한 **사실 그대로의 구절**(순수) — `None` = 요청이 **올 것이다**(호출자가 자기 문장의 약속 구절을 그대로 쓴다) ·
 /// `Some(구절)` = 약속할 수 없거나 이미 해 봤다(호출자가 약속 구절 자리에 이 구절을 쓴다). 위에서부터 첫 일치: 노브 끔 → 대상 아님(마커 없는 좌석·전경이 에이전트가 아닌 대체 화면) → 창이 너무 작음 → 요청했으나 풀리지 않음.
@@ -9477,12 +9476,12 @@ const REMEDY_BODY_KILL_SWITCH: &str = "kill-switch 동결 중 — 정체가 아�
      동결 시간은 TTL 에서 빠지므로 해제하면 묵은 항목이 차례로 배달된다 — 오너가 해제 전에 `cys queue list` 로 묵은 항목을 확인한다";
 /// 좌석 큐 pause(헬스 조치) 처방(표 2행) — 시간이 지나면 스스로 풀린다. kill-switch 문장(「해제」「drop」)을 쓰지 않는다.
 const REMEDY_BODY_SEAT_PAUSE: &str =
-    "이 좌석의 큐가 헬스 조치(pause-queue)로 일시정지됐다 — 정해진 시간이 지나면 스스로 풀린다(반복되면 그 창의 출력을 사람이 확인)";
+    "이 좌석의 큐가 헬스 조치(pause-queue)로 일시정지됐다 — 정해진 시간이 지나면 스스로 풀린다(반복되면 자비스가 그 창의 출력을 읽어 원인을 찾는다)";
 /// 사람이 쓰던 글이 입력줄에 있다(표 3·6행).
 /// ★(0.14.56 · P1 D1c · head approval of NOTE-wp5-remedy-text.md c4a104a3) "read the screen first": under D1 a claude seat's rows
 /// under the marker can read as a draft while the frame is a selector, so the person reads the screen before submitting or clearing.
 const REMEDY_BODY_HUMAN_DRAFT: &str =
-    "입력줄에 제출되지 않은 글이 있다 — 기계는 지우지 않는다. 먼저 그 창의 화면을 읽는다(글이 아니라 선택 창일 수 있다). 사람이 그 창에서 제출하거나 지운다(오너에게 알린다)";
+    "입력줄에 제출되지 않은 글이 있다 — 기계는 지우지 않는다. 자비스가 먼저 그 창의 화면을 읽는다(글이 아니라 선택 창일 수 있다). 사용자에게 한 번 알리고 묻는다: 그 창에서 제출할지, 지울지, 그대로 둘지 — 사람 글의 제출·삭제는 사용자 손으로만 된다";
 
 /// 일시정지 처방 문장(표 1·2행) — `(kill-switch, 일시정지 여부)` → 문장. 둘 다 아니면 `None`. 화면을 읽지 않는 순수 표라 `queue.list`·`org.status` 가
 /// 사유가 기록되지 않은 일시정지 좌석에서도 진단(파서 읽기) 없이 같은 문장을 쓴다.
@@ -9553,21 +9552,20 @@ pub(crate) fn queue_remedy(blocked_by: &str, d: &QueueBlockDiag) -> (&'static st
     } else if input_line && d.draft_visible == Some(true) && d.pending_input_human_bytes == 0 {
         (
             "machine_residue",
-            "기계가 넣고 제출되지 않은 본문이 입력줄에 보인다 — 사람이 그 창을 확인하고 Enter 로 제출하거나 지운다".into(),
+            "기계가 넣고 제출되지 않은 본문이 입력줄에 보인다 — 자비스가 그 창 화면을 읽어 입력줄 전체가 그 본문뿐임을 확인하면 제출하고, 확인이 안 되면 그대로 두고 사용자에게 알린다(machine_residue)".into(),
         )
     } else if input_line && d.draft_visible == Some(true) {
         ("human_draft", REMEDY_BODY_HUMAN_DRAFT.into())
     } else if input_line && d.draft_visible == Some(false) && d.ghost_after_cursor == Some(true) {
         (
             REMEDY_CODE_AFTER_CURSOR,
-            "커서 앞은 비어 있는데 커서 뒤에 글자가 있다 — 회색 자동 제안이면 유령 계수다(사람이 그 창을 클릭하고 Ctrl-U 한 번). \
-             직접 쓴 글이면 초안이다(제출하거나 지운다). 사람이 화면을 보고 가린다"
+            "커서 앞은 비어 있는데 커서 뒤에 글자가 있다 — 자비스가 그 창 화면을 읽어 가린다: 회색 자동 제안이면 유령 계수다(사용자에게 그 창에서 Ctrl-U 를 한 번 눌러 달라고 청한다(기계 Ctrl-U 는 데몬의 사람 글 보호 게이트가 거부한다)). 직접 쓴 글이면 초안이다(제출할지 지울지 사용자에게 한 번 묻는다)"
                 .into(),
         )
     } else if input_line && d.draft_visible == Some(false) {
         (
             REMEDY_CODE_PHANTOM,
-            "입력줄은 비어 있는데 미제출 계수가 남았다(유령 계수) — 사람이 그 창을 클릭하고 Ctrl-U 한 번(잠시 뒤 배달 재개)".into(),
+            "입력줄은 비어 있는데 미제출 계수가 남았다(유령 계수) — 자비스가 그 창 화면을 읽어 비어 있음을 확인한 뒤, 사용자에게 그 창에서 Ctrl-U 를 한 번 눌러 달라고 청한다(기계 Ctrl-U 는 데몬의 사람 글 보호 게이트가 거부한다) — 잠시 뒤 배달 재개".into(),
         )
     } else if input_line {
         ("input_pending_unknown", unreadable_body(REMEDY_BODY_INPUT_PENDING_UNKNOWN, d))
@@ -9576,9 +9574,9 @@ pub(crate) fn queue_remedy(blocked_by: &str, d: &QueueBlockDiag) -> (&'static st
         match stale_quiet {
             Some(q) => (
                 "answer_modal",
-                format!("질문·선택 창이 떠 있다 — 사람이 답한다({q}초째 화면 변화가 없다 — 선택 창이 낡은 화면 사본일 수도 있어 {}; 진짜 선택 창이면 다시 그려져도 그대로다)", promise(d)),
+                format!("질문·선택 창이 떠 있다 — 자비스가 화면을 읽어 무엇을 묻는지 사용자에게 한 번 묻고 답대로 고른다(`cys read-screen --composer` 의 output_gen 에 묶어 `cys send-key --expect-output-gen` 으로)({q}초째 화면 변화가 없다 — 선택 창이 낡은 화면 사본일 수도 있어 {}; 진짜 선택 창이면 다시 그려져도 그대로다)", promise(d)),
             ),
-            None => ("answer_modal", "질문·선택 창이 떠 있다 — 사람이 답한다".into()),
+            None => ("answer_modal", "질문·선택 창이 떠 있다 — 자비스가 화면을 읽어 무엇을 묻는지 사용자에게 한 번 묻고 답대로 고른다(`cys read-screen --composer` 의 output_gen 에 묶어 `cys send-key --expect-output-gen` 으로)".into()),
         }
     } else if blocked_by.starts_with("approval_pending") {
         (
@@ -22878,7 +22876,7 @@ mod tests {
         let (code, text) = queue_remedy(BLOCKED_INPUT_PENDING, &queue_block_diag(&daemon, &s));
         assert_eq!(code, "human_draft", "{text}");
         let read = text.find("먼저 그 창의 화면을 읽는다(글이 아니라 선택 창일 수 있다).").expect("the remedy says read the screen");
-        let act = text.find("사람이 그 창에서 제출하거나 지운다").expect("the remedy names the action");
+        let act = text.find("사용자에게 한 번 알리고 묻는다").expect("the remedy names the action");
         assert!(read < act, "the remedy says read the screen BEFORE acting: {text}");
         s.d1_platform.store(false, std::sync::atomic::Ordering::Relaxed);
         *s.queue_blocked.lock().unwrap() = None;
@@ -23785,7 +23783,7 @@ mod tests {
         let (_, t) = queue_remedy(BLOCKED_PROMPT_UNKNOWN, &QueueBlockDiag { repaint_unresolved: true, ..base(None) });
         assert!(t.starts_with("입력 대기 표지(프롬프트)를 화면에서 찾지 못했다 — 다른 화면이 떠 있거나 데몬의 화면 사본이 어긋났을 수 있다(cys 가 다시 그리기를 요청했으나") && t.contains("). 그래도 막혀 있으면"), "{t}");
         let (_, t) = queue_remedy(BLOCKED_INPUT_PENDING, &QueueBlockDiag { pending_input_bytes: 2, repaint_unresolved: true, ..base(None) });
-        assert!(t.contains("). 다시 그려진 뒤에도 막혀 있으면 사람이 그 창을 확인한다(비어 있으면 Ctrl-U"), "{t}");
+        assert!(t.contains("). 다시 그려진 뒤에도 막혀 있으면 자비스가 그 창 화면을 읽는다 — 비어 있으면 사용자에게 그 창에서 Ctrl-U"), "{t}");
         // 패닉 주석은 여전히 본문 뒤·접미 앞.
         let (_, t) = queue_remedy(BLOCKED_BUSY, &QueueBlockDiag { parser_panics: 2, ..base(Some(70)) });
         assert!(t.ends_with(&format!(" (이 좌석 화면 파서 패닉 2회 — 화면 판독이 순간 비었을 수 있다){REMEDY_LLM_SUFFIX}")), "{t}");
@@ -29738,7 +29736,7 @@ after-tick liveness alone does not attribute a clock defect",
         let mut sp = c5_diag_ga(1, 1, Some(false), None);
         sp.paused = true;
         for blocked in every_reason {
-            check(blocked, &sp, "paused", &["헬스 조치(pause-queue)", "스스로 풀린다", "반복되면 그 창의 출력을 사람이 확인"]);
+            check(blocked, &sp, "paused", &["헬스 조치(pause-queue)", "스스로 풀린다", "반복되면 자비스가 그 창의 출력을 읽어 원인을 찾는다"]);
             let (_, text) = queue_remedy(blocked, &sp);
             for banned in ["kill-switch", "cys resume", "drop", "해제는 오너"] {
                 assert!(!text.contains(banned), "좌석 pause 문장에 {banned:?} 가 있다: {text}");
@@ -29754,7 +29752,7 @@ after-tick liveness alone does not attribute a clock defect",
                 blocked,
                 &c5_diag_ga(0, 0, Some(true), None),
                 "human_draft",
-                &["입력줄에 제출되지 않은 글이 있다", "기계는 지우지 않는다", "사람이 그 창에서 제출하거나 지운다", "오너에게 알린다"],
+                &["입력줄에 제출되지 않은 글이 있다", "기계는 지우지 않는다", "사용자에게 한 번 알리고 묻는다", "사람 글의 제출·삭제는 사용자 손으로만 된다"],
             );
             // 4행 wait(I-7) — 계수가 이미 0 이고 글도 안 보이거나 관측 불능이면 처방할 것이 없다.
             for dv in [Some(false), None] {
@@ -29787,7 +29785,7 @@ after-tick liveness alone does not attribute a clock defect",
                         "회색 자동 제안이면 유령 계수다",
                         "클릭하고 Ctrl-U 한 번",
                         "직접 쓴 글이면 초안이다",
-                        "사람이 화면을 보고 가린다",
+                        "자비스가 그 창 화면을 읽어 가린다",
                     ],
                 );
             }
@@ -29809,7 +29807,7 @@ after-tick liveness alone does not attribute a clock defect",
                         blocked,
                         &c5_diag_ga(3, h, None, ga),
                         "input_pending_unknown",
-                        &["화면을 판독하지 못했다", "화면 사본이 어긋났을 수 있다", "다시 그리기를 요청한다", "창 크기를 한 번 바꿔도", "비어 있으면 Ctrl-U", "글이 있으면 제출하거나 지운다"],
+                        &["화면을 판독하지 못했다", "화면 사본이 어긋났을 수 있다", "다시 그리기를 요청한다", "창 크기를 한 번 바꿔도", "비어 있으면 사용자에게 그 창에서 Ctrl-U", "글이 있으면 제출할지 지울지 사용자에게 한 번 묻는다"],
                     );
                 }
             }
@@ -29896,7 +29894,7 @@ after-tick liveness alone does not attribute a clock defect",
     #[test]
     fn r2f_dm_empty_seat_remedy_adds_the_ctrl_u_clause_only_when_the_input_count_is_positive() {
         const BASE: &str = "그 자리에 에이전트가 붙어 있지 않다(빈 셸) — 에이전트를 다시 띄우면 순서대로 배달된다";
-        const CLAUSE: &str = " — 다시 띄우기 전에 사람이 그 창에서 Ctrl-U 한 번(입력줄 계수가 남아 있다)";
+        const CLAUSE: &str = " — 다시 띄울 때는 master·CSO 좌석에서 `cys node-recover --surface <좌석>` 로 띄운다(입력줄 계수 정리를 함께 한다 · 입력줄 계수가 남아 있다)";
         assert_eq!(super::REMEDY_EMPTY_SEAT_COUNT_CLAUSE, CLAUSE, "구절의 바이트 고정(문서·화면이 이 문장을 인용한다)");
         let blocked = "empty_seat(좌석에 에이전트 미연결)";
         // 계수 0 → 종전 문장 그대로.
@@ -30425,7 +30423,7 @@ after-tick liveness alone does not attribute a clock defect",
         assert_eq!(denied, Wp5Denied::PromptGate(BLOCKED_INPUT_PENDING));
         assert_eq!(denied.message(), legacy(BLOCKED_INPUT_PENDING));
         // ⓔ 순수 접미 계약 — 처방은 사람 일이다(기계 키 주입 없음).
-        assert!(GHOST_CTRL_U_SUFFIX.starts_with(" — 입력줄이 비어 보이면 유령 계수다: 그 창에서 사람이 Ctrl-U 한 번"));
+        assert!(GHOST_CTRL_U_SUFFIX.starts_with(" — 입력줄이 비어 보이면 유령 계수다: 자비스가 그 창 화면을 읽어 비어 있음을 확인한 뒤"));
     }
 
     /// 목록에서 빠지는 길 둘 — ⓓ 좌석 종료(exited)와 큐 소멸(drop·clear 로 비었는데 낡은 사유가 남음). 둘 다 다음 틱 끝에서 파일에서 빠진다.
@@ -30679,7 +30677,7 @@ after-tick liveness alone does not attribute a clock defect",
         assert_eq!((d.draft_visible, d.ghost_after_cursor), (Some(false), Some(true)), "{d:?}");
         let (c, text) = queue_remedy(BLOCKED_INPUT_PENDING, &d);
         assert_eq!(c, "after_cursor_text");
-        assert!(text.contains("직접 쓴 글이면 초안이다") && text.contains("사람이 화면을 보고 가린다"), "{text}");
+        assert!(text.contains("직접 쓴 글이면 초안이다") && text.contains("자비스가 그 창 화면을 읽어 가린다"), "{text}");
         // 5) 커서 앞에 글자 → 초안.
         paint_prompt(&s, "abc", "");
         let d = diag();
@@ -30975,7 +30973,7 @@ after-tick liveness alone does not attribute a clock defect",
             REMEDY_LLM_SUFFIX.starts_with(" · LLM 에이전트는 자동 조치("),
             "GUI(starvednotice.ts STARVED_LLM_TAIL)가 이 접두로 꼬리를 뗀다 — 바이트 그대로: {REMEDY_LLM_SUFFIX:?}"
         );
-        assert_eq!(REMEDY_LLM_SUFFIX, " · LLM 에이전트는 자동 조치(강제 배달·드레인·키 주입·동결 해제·항목 삭제) 금지");
+        assert_eq!(REMEDY_LLM_SUFFIX, " · LLM 에이전트는 자동 조치(remedy 대로 단건 revive·deliver)를 한다 — 사용자 지침이 막으면 따르고, 드레인·항목 삭제·동결 해제·사람 글에 닿는 키는 사용자에게 한 번 묻는다");
         assert_eq!(GHOST_CTRL_U_SUFFIX, cys::GHOST_CTRL_U_SUFFIX, "한 정의처(src/lib.rs) — 데몬과 CLI 가 같은 문자열을 쓴다");
         // GUI 어휘 대조(`ui/src/starvednotice.test.ts`)가 소스에서 읽는 두 선언의 꼴 — 같은 문법으로 파싱해 본다.
         let src = include_str!("governance.rs");
@@ -35418,7 +35416,7 @@ mod f3_screen_probe_tests {
     fn unreadable_remedies_mention_repaint_and_sync_note() {
         let (code, t) = queue_remedy(BLOCKED_INPUT_PENDING, &diag(3, 0));
         assert_eq!(code, "input_pending_unknown");
-        for w in ["화면 사본이 어긋났을 수 있다", "키 입력 없이", "다시 그리기를 요청한다", "창 크기를 한 번 바꿔도", "비어 있으면 Ctrl-U"] {
+        for w in ["화면 사본이 어긋났을 수 있다", "키 입력 없이", "다시 그리기를 요청한다", "창 크기를 한 번 바꿔도", "비어 있으면 사용자에게 그 창에서 Ctrl-U"] {
             assert!(t.contains(w), "{w}: {t}");
         }
         assert!(t.ends_with(REMEDY_LLM_SUFFIX));

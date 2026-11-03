@@ -843,7 +843,7 @@ CSO_CYS_SUBVERBS = {
     # `queue clear <surface>` 는 [절대규칙 — exited surface 자동 reap] 이 rc=7
     # `queue_not_empty` 의 **지정 2단계**로 명한 사전 승인 청소다(CSO_DIRECTIVE:362) —
     # 막으면 큐가 빈 pane 만 회수되고 나머지는 매번 TTL 승인 왕복이 된다(좌석 누적 · R1 major).
-    "queue": {"list", "clear"},
+    "queue": {"list", "clear", "revive", "deliver"},
     # `feed push` = §1-2 ② 오너 채널(master 무응답 교착의 출구). 이 접두의 등재는 능력 게이트
     # 릴리스의 **수용 조건**이다(CSO_DIRECTIVE §1-2 ⑤ 이 조문을 명시한다).
     "feed": {"list", "push"},

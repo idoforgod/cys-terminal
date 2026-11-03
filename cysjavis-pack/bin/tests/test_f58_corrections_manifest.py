@@ -4,7 +4,7 @@
 
 What it checks (DESIGN-F58-final.md §7.1, r2 §5.3 and §9.1 T-9):
   The manifest `cysjavis-pack/round/self-service-corrections.json` is the machine form of the
-  F58 clause table (69 rows). For every row, on this tree:
+  F58 clause table (69 rows designed; T1-12d withdrawn by head decision, 68 in the manifest). For every row, on this tree:
     replace (new does not contain old): count(old) == 0 and count(new) == k_before, and the same
         on the string-continuation-normalized text: count(norm(old)) == 0, count(norm(new)) == k_norm.
         (T1-05: raw k_before 1, k_norm 2 — its test pin at state.rs spells the Rust `\\` continuation
@@ -139,13 +139,15 @@ class ManifestShape(unittest.TestCase):
         self.assertEqual(m["release"], "0.14.57")
         self.assertEqual(m["base_commit"], "31f878782d966510089df8e71ddc8fb6cc289184")
         rows = m["rows"]
-        self.assertEqual(len(rows), 69)
+        self.assertEqual(len(rows), 68)  # 69 designed; T1-12d withdrawn by head decision
+        self.assertEqual([w["id"] for w in m["withdrawn"]], ["T1-12d"])
+        self.assertNotIn("T1-12d", {r["id"] for r in rows})
         ids = [r["id"] for r in rows]
         self.assertEqual(len(ids), len(set(ids)), "duplicate row ids")
         ops = {}
         for r in rows:
             ops[r["op"]] = ops.get(r["op"], 0) + 1
-        self.assertEqual(ops, {"replace": 56, "prefix": 12, "delete": 1})
+        self.assertEqual(ops, {"replace": 55, "prefix": 12, "delete": 1})
         self.assertEqual({r["id"] for r in rows if r["op"] == "prefix"}, PREFIX_IDS)
         self.assertEqual([r["id"] for r in rows if r["op"] == "delete"], ["T1-19f"])
         self.assertEqual(sorted(r["k_before"] for r in rows).count(2), 2)
@@ -159,7 +161,7 @@ class ManifestShape(unittest.TestCase):
     def test_owner_class_and_roles(self):
         rows = self.m["rows"]
         user = [r for r in rows if r["owner_class"] == "user"]
-        self.assertEqual(len(user), 28)
+        self.assertEqual(len(user), 27)
         for r in rows:
             if r["owner_class"] == "user":
                 self.assertTrue(r["roles"], r["id"])
@@ -168,7 +170,7 @@ class ManifestShape(unittest.TestCase):
             else:
                 self.assertEqual(r["roles"], [], r["id"])
         per = {role: sum(1 for r in rows if role in r["roles"]) for role in ("master", "worker", "cso", "reviewer")}
-        self.assertEqual(per, {"master": 19, "worker": 16, "cso": 4, "reviewer": 2})
+        self.assertEqual(per, {"master": 19, "worker": 16, "cso": 3, "reviewer": 2})
 
 
 class ManifestAgainstTree(unittest.TestCase):
