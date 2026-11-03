@@ -1,0 +1,1336 @@
+{
+ "schema": 1,
+ "release": "0.14.57",
+ "base_commit": "31f878782d966510089df8e71ddc8fb6cc289184",
+ "source": "DESIGN-F58-final.md sha16 74cc8cc559f93ffa (rows verified at the base: F58/impl/verify_pins.out)",
+ "rows": [
+  {
+   "id": "T1-13+T2-06",
+   "class": [
+    1,
+    2
+   ],
+   "op": "replace",
+   "file": "directives/MASTER_DIRECTIVE.md",
+   "repo_path": "cysjavis-pack/directives/MASTER_DIRECTIVE.md",
+   "owner_class": "user",
+   "generated": false,
+   "base_blob": "bac11e25a60fd39db6aef052061495f83e0d5405",
+   "line": 673,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [
+    "master"
+   ],
+   "old": "①승인된 로드맵(BUILD_PLAN/Phase)을\n  벗어나는 새 범위 ②soul·CLAUDE.md·헌법(디렉티브) 변경 ③외부 발행/발송(git push·메시지\n  전송·공개 배포 = 비가역. **로컬 커밋은 가역 = 허용**) ④비가역 삭제 ⑤오너가 명시 보유한\n  결정권.",
+   "new": "①사용자가 시키지 않은 새 범위(사용자가 시킨 새 기능·수리는 바로 한다) ②사용자가 시키지 않은 soul·CLAUDE.md·헌법(디렉티브) 변경(사용자가 시키면 백업 `<파일>.pre-ss-<UTC>` 을 남기고 바로 한다) ③외부 발행/발송(git push·메시지 전송·공개 배포 = 비가역. **로컬 커밋은 가역 = 허용**) ④비가역 삭제 ⑤오너가 명시 보유한 결정권. ③④는 사용자에게 한 번 묻고, 하라고 하면 한다."
+  },
+  {
+   "id": "T1-13+T2-06m",
+   "class": [
+    1,
+    2
+   ],
+   "op": "replace",
+   "file": "directives/CEO_TEMPLATE.md",
+   "repo_path": "cysjavis-pack/directives/CEO_TEMPLATE.md",
+   "owner_class": "system",
+   "generated": true,
+   "base_blob": "3ee3a181ba47d604c1c942f20a85356172284f13",
+   "line": 813,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [],
+   "old": "①승인된 로드맵(BUILD_PLAN/Phase)을\n  벗어나는 새 범위 ②soul·CLAUDE.md·헌법(디렉티브) 변경 ③외부 발행/발송(git push·메시지\n  전송·공개 배포 = 비가역. **로컬 커밋은 가역 = 허용**) ④비가역 삭제 ⑤오너가 명시 보유한\n  결정권.",
+   "new": "①사용자가 시키지 않은 새 범위(사용자가 시킨 새 기능·수리는 바로 한다) ②사용자가 시키지 않은 soul·CLAUDE.md·헌법(디렉티브) 변경(사용자가 시키면 백업 `<파일>.pre-ss-<UTC>` 을 남기고 바로 한다) ③외부 발행/발송(git push·메시지 전송·공개 배포 = 비가역. **로컬 커밋은 가역 = 허용**) ④비가역 삭제 ⑤오너가 명시 보유한 결정권. ③④는 사용자에게 한 번 묻고, 하라고 하면 한다."
+  },
+  {
+   "id": "T1-13w+T2-07a",
+   "class": [
+    1,
+    2
+   ],
+   "op": "replace",
+   "file": "directives/WORKER_DIRECTIVE.md",
+   "repo_path": "cysjavis-pack/directives/WORKER_DIRECTIVE.md",
+   "owner_class": "user",
+   "generated": false,
+   "base_blob": "0c52b09af359a9f4e0188144d500c66cda16f7a3",
+   "line": 181,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [
+    "worker"
+   ],
+   "old": "오너 금지선(외부 발행·비가역 삭제)은 승인 요청 대상이 아니라 **무조건 중단·보고** 대상이다.",
+   "new": "오너 금지선(외부 발행·비가역 삭제)에 닿으면 멈추고 master 에 보고한다 — master 가 사용자에게 한 번 묻고, 사용자의 답이 오면 그대로 한다."
+  },
+  {
+   "id": "T1-13w+T2-07b",
+   "class": [
+    1,
+    2
+   ],
+   "op": "replace",
+   "file": "directives/WORKER_DIRECTIVE.md",
+   "repo_path": "cysjavis-pack/directives/WORKER_DIRECTIVE.md",
+   "owner_class": "user",
+   "generated": false,
+   "base_blob": "0c52b09af359a9f4e0188144d500c66cda16f7a3",
+   "line": 183,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [
+    "worker"
+   ],
+   "old": "①승인된 로드맵 밖 새 범위 ②soul·CLAUDE.md·디렉티브(헌법) 변경 ③외부 발행/발송(git push·\n  메시지 전송·공개 배포) ④비가역 삭제 ⑤오너가 명시 보유한 결정권. 이 다섯은 feed 승인 요청\n  대상이 아니라 **무조건 중단·master 보고** 대상이며, 작업 내내 상주 적용된다.",
+   "new": "①사용자가 시키지 않은 새 범위 ②사용자가 시키지 않은 soul·CLAUDE.md·디렉티브(헌법) 변경 ③외부 발행/발송(git push·메시지 전송·공개 배포) ④비가역 삭제 ⑤오너가 명시 보유한 결정권. 이 다섯에 닿으면 멈추고 master 에 보고한다 — 사용자의 지시나 답이 이미 있으면(master 가 전한다) 그대로 한다. 작업 내내 상주 적용된다."
+  },
+  {
+   "id": "T1-13c+T2-07c",
+   "class": [
+    1,
+    2
+   ],
+   "op": "replace",
+   "file": "directives/CSO_DIRECTIVE.md",
+   "repo_path": "cysjavis-pack/directives/CSO_DIRECTIVE.md",
+   "owner_class": "user",
+   "generated": false,
+   "base_blob": "945a8637229c0cbaf9a1984ecd50ca0a2423e409",
+   "line": 397,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [
+    "cso"
+   ],
+   "old": "①승인된 로드맵 밖 새 범위 ②soul·CLAUDE.md·디렉티브\n  (헌법) 변경 ③외부 발행/발송 ④비가역 삭제 ⑤오너가 명시 보유한 결정권 — 이 다섯은 자율 조치\n  대상이 아니라 멈추고 승인(오너/master)을 받는 항이며, 시스템 위기라는 이유로도 넘지 않는다.",
+   "new": "①사용자가 시키지 않은 새 범위 ②사용자가 시키지 않은 soul·CLAUDE.md·디렉티브(헌법) 변경 ③외부 발행/발송 ④비가역 삭제 ⑤오너가 명시 보유한 결정권 — 이 다섯은 자율 조치 대상이 아니라 멈추고 master 를 거쳐 사용자에게 한 번 묻는 항이며(사용자가 하라고 하면 master 가 한다), 시스템 위기라는 이유로도 넘지 않는다."
+  },
+  {
+   "id": "T1-13r+T2-07r",
+   "class": [
+    1,
+    2
+   ],
+   "op": "replace",
+   "file": "directives/REVIEWER_DIRECTIVE.md",
+   "repo_path": "cysjavis-pack/directives/REVIEWER_DIRECTIVE.md",
+   "owner_class": "user",
+   "generated": false,
+   "base_blob": "683f425eebb11b2310e6a26a8a9a6750ebe73d1d",
+   "line": 83,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [
+    "reviewer"
+   ],
+   "old": "로드맵 밖 새 범위 · soul/CLAUDE.md/\n  디렉티브(헌법) 변경 · 외부 발행/발송 · 비가역 삭제 · 오너 명시 보유 결정권 — 이 다섯은\n  리뷰어에게도 상주 적용된다. 해당 지점에 닿으면 멈추고 의뢰자·master에 보고한다.",
+   "new": "사용자가 시키지 않은 새 범위 · 사용자가 시키지 않은 soul/CLAUDE.md/디렉티브(헌법) 변경 · 외부 발행/발송 · 비가역 삭제 · 오너 명시 보유 결정권 — 이 다섯은 리뷰어에게도 상주 적용된다. 해당 지점에 닿으면 멈추고 의뢰자·master에 보고한다(사용자에게 한 번 묻는 것은 master 가 한다)."
+  },
+  {
+   "id": "T1-14",
+   "class": [
+    1
+   ],
+   "op": "replace",
+   "file": "directives/MASTER_DIRECTIVE.md",
+   "repo_path": "cysjavis-pack/directives/MASTER_DIRECTIVE.md",
+   "owner_class": "user",
+   "generated": false,
+   "base_blob": "bac11e25a60fd39db6aef052061495f83e0d5405",
+   "line": 247,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [
+    "master"
+   ],
+   "old": "**\"판정 불가\"로 접고 수정 착수 금지·오너 보고**한다.",
+   "new": "**\"판정 불가\"로 접고, 사용자에게 그 글을 직접 썼는지 한 번 묻고 답에 따라 고친다**(답이 없으면 손대지 않는다)."
+  },
+  {
+   "id": "T1-14m",
+   "class": [
+    1
+   ],
+   "op": "replace",
+   "file": "directives/CEO_TEMPLATE.md",
+   "repo_path": "cysjavis-pack/directives/CEO_TEMPLATE.md",
+   "owner_class": "system",
+   "generated": true,
+   "base_blob": "3ee3a181ba47d604c1c942f20a85356172284f13",
+   "line": 387,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [],
+   "old": "**\"판정 불가\"로 접고 수정 착수 금지·오너 보고**한다.",
+   "new": "**\"판정 불가\"로 접고, 사용자에게 그 글을 직접 썼는지 한 번 묻고 답에 따라 고친다**(답이 없으면 손대지 않는다)."
+  },
+  {
+   "id": "T2-08",
+   "class": [
+    2
+   ],
+   "op": "replace",
+   "file": "soul.md",
+   "repo_path": "cysjavis-pack/soul.md",
+   "owner_class": "user",
+   "generated": false,
+   "base_blob": "3ca838a8b9386054a5be5d9aa0a5b1cbf91bc010",
+   "line": 26,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [
+    "master",
+    "worker",
+    "cso",
+    "reviewer"
+   ],
+   "old": "## 금지선 (denylist — 오너 승인 없이 절대 금지)",
+   "new": "## 금지선 (denylist — 오너에게 한 번 묻고, 하라고 하면 한다)"
+  },
+  {
+   "id": "T3-01",
+   "class": [
+    3
+   ],
+   "op": "prefix",
+   "file": "directives/MASTER_DIRECTIVE.md",
+   "repo_path": "cysjavis-pack/directives/MASTER_DIRECTIVE.md",
+   "owner_class": "user",
+   "generated": false,
+   "base_blob": "bac11e25a60fd39db6aef052061495f83e0d5405",
+   "line": 408,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [
+    "master"
+   ],
+   "old": "★**품질의 범위는 제품·서비스다**(오너 2026-09-04",
+   "new": "【본 함대 한정 — `~/.cys/local/fleet-profile` = vendor-fleet 일 때만 적용】 ★**품질의 범위는 제품·서비스다**(오너 2026-09-04"
+  },
+  {
+   "id": "T3-01m",
+   "class": [
+    3
+   ],
+   "op": "prefix",
+   "file": "directives/CEO_TEMPLATE.md",
+   "repo_path": "cysjavis-pack/directives/CEO_TEMPLATE.md",
+   "owner_class": "system",
+   "generated": true,
+   "base_blob": "3ee3a181ba47d604c1c942f20a85356172284f13",
+   "line": 548,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [],
+   "old": "★**품질의 범위는 제품·서비스다**(오너 2026-09-04",
+   "new": "【본 함대 한정 — `~/.cys/local/fleet-profile` = vendor-fleet 일 때만 적용】 ★**품질의 범위는 제품·서비스다**(오너 2026-09-04"
+  },
+  {
+   "id": "T3-02",
+   "class": [
+    3
+   ],
+   "op": "prefix",
+   "file": "directives/WORKER_DIRECTIVE.md",
+   "repo_path": "cysjavis-pack/directives/WORKER_DIRECTIVE.md",
+   "owner_class": "user",
+   "generated": false,
+   "base_blob": "0c52b09af359a9f4e0188144d500c66cda16f7a3",
+   "line": 112,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [
+    "worker"
+   ],
+   "old": "★**품질의 범위는 제품·서비스다**(오너 2026-09-04",
+   "new": "【본 함대 한정 — `~/.cys/local/fleet-profile` = vendor-fleet 일 때만 적용】 ★**품질의 범위는 제품·서비스다**(오너 2026-09-04"
+  },
+  {
+   "id": "T3-03",
+   "class": [
+    3
+   ],
+   "op": "prefix",
+   "file": "directives/MASTER_DIRECTIVE.md",
+   "repo_path": "cysjavis-pack/directives/MASTER_DIRECTIVE.md",
+   "owner_class": "user",
+   "generated": false,
+   "base_blob": "bac11e25a60fd39db6aef052061495f83e0d5405",
+   "line": 443,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [
+    "master"
+   ],
+   "old": "**품질 인상(印象)을 이유로 라운드를 추가하지 않는다.**",
+   "new": "【본 함대 한정 — `~/.cys/local/fleet-profile` = vendor-fleet 일 때만 적용】 **품질 인상(印象)을 이유로 라운드를 추가하지 않는다.**"
+  },
+  {
+   "id": "T3-03m",
+   "class": [
+    3
+   ],
+   "op": "prefix",
+   "file": "directives/CEO_TEMPLATE.md",
+   "repo_path": "cysjavis-pack/directives/CEO_TEMPLATE.md",
+   "owner_class": "system",
+   "generated": true,
+   "base_blob": "3ee3a181ba47d604c1c942f20a85356172284f13",
+   "line": 583,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [],
+   "old": "**품질 인상(印象)을 이유로 라운드를 추가하지 않는다.**",
+   "new": "【본 함대 한정 — `~/.cys/local/fleet-profile` = vendor-fleet 일 때만 적용】 **품질 인상(印象)을 이유로 라운드를 추가하지 않는다.**"
+  },
+  {
+   "id": "T3-04",
+   "class": [
+    3
+   ],
+   "op": "prefix",
+   "file": "directives/MASTER_DIRECTIVE.md",
+   "repo_path": "cysjavis-pack/directives/MASTER_DIRECTIVE.md",
+   "owner_class": "user",
+   "generated": false,
+   "base_blob": "bac11e25a60fd39db6aef052061495f83e0d5405",
+   "line": 460,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [
+    "master"
+   ],
+   "old": "**3R** 에 도달했는데 기준 미달이면 무한 루프 금지",
+   "new": "【본 함대 한정 — `~/.cys/local/fleet-profile` = vendor-fleet 일 때만 적용】 **3R** 에 도달했는데 기준 미달이면 무한 루프 금지"
+  },
+  {
+   "id": "T3-04m",
+   "class": [
+    3
+   ],
+   "op": "prefix",
+   "file": "directives/CEO_TEMPLATE.md",
+   "repo_path": "cysjavis-pack/directives/CEO_TEMPLATE.md",
+   "owner_class": "system",
+   "generated": true,
+   "base_blob": "3ee3a181ba47d604c1c942f20a85356172284f13",
+   "line": 600,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [],
+   "old": "**3R** 에 도달했는데 기준 미달이면 무한 루프 금지",
+   "new": "【본 함대 한정 — `~/.cys/local/fleet-profile` = vendor-fleet 일 때만 적용】 **3R** 에 도달했는데 기준 미달이면 무한 루프 금지"
+  },
+  {
+   "id": "T3-05",
+   "class": [
+    3
+   ],
+   "op": "prefix",
+   "file": "directives/MASTER_DIRECTIVE.md",
+   "repo_path": "cysjavis-pack/directives/MASTER_DIRECTIVE.md",
+   "owner_class": "user",
+   "generated": false,
+   "base_blob": "bac11e25a60fd39db6aef052061495f83e0d5405",
+   "line": 484,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [
+    "master"
+   ],
+   "old": "★**게이트 신설 제한**: 게이트는",
+   "new": "【본 함대 한정 — `~/.cys/local/fleet-profile` = vendor-fleet 일 때만 적용】 ★**게이트 신설 제한**: 게이트는"
+  },
+  {
+   "id": "T3-05m",
+   "class": [
+    3
+   ],
+   "op": "prefix",
+   "file": "directives/CEO_TEMPLATE.md",
+   "repo_path": "cysjavis-pack/directives/CEO_TEMPLATE.md",
+   "owner_class": "system",
+   "generated": true,
+   "base_blob": "3ee3a181ba47d604c1c942f20a85356172284f13",
+   "line": 624,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [],
+   "old": "★**게이트 신설 제한**: 게이트는",
+   "new": "【본 함대 한정 — `~/.cys/local/fleet-profile` = vendor-fleet 일 때만 적용】 ★**게이트 신설 제한**: 게이트는"
+  },
+  {
+   "id": "T3-06",
+   "class": [
+    3
+   ],
+   "op": "prefix",
+   "file": "directives/WORKER_DIRECTIVE.md",
+   "repo_path": "cysjavis-pack/directives/WORKER_DIRECTIVE.md",
+   "owner_class": "user",
+   "generated": false,
+   "base_blob": "0c52b09af359a9f4e0188144d500c66cda16f7a3",
+   "line": 147,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [
+    "worker"
+   ],
+   "old": "★**게이트 신설 제한(CEO 확정 2026-09-04)**",
+   "new": "【본 함대 한정 — `~/.cys/local/fleet-profile` = vendor-fleet 일 때만 적용】 ★**게이트 신설 제한(CEO 확정 2026-09-04)**"
+  },
+  {
+   "id": "T3-07n",
+   "class": [
+    3
+   ],
+   "op": "prefix",
+   "file": null,
+   "repo_path": "scripts/ceo_template_header.md",
+   "owner_class": "system",
+   "generated": false,
+   "base_blob": "a3ea950eba23a7d6a62ab5cc2a52123a989c8b1c",
+   "line": 14,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [],
+   "old": "## [CEO 와 master 의 차이 — ★오너 복원 조항 (오너 제정 · 2026-10-13 복원)]",
+   "new": "> 【본 함대 한정 — `~/.cys/local/fleet-profile` = vendor-fleet 일 때만 적용】 바로 아래 오너 복원 조항 안의 「배포 전담 부서의 작업」(두 곳)과 `~/Desktop/CYSjavis/_evidence/…` 백업 경로는 제조사 함대에만 해당한다. 다른 설치에서 영구 보존 자리는 사용자 로컬(`~/.cys/local/`)이고, 원문 백업은 `~/.cys/local/evidence/` 에 한다. 조항 본문은 바이트 그대로 둔다(오너 원문 · test_bootv2_doc_contract.py:284-286 바이트·sha 고정).\n\n## [CEO 와 master 의 차이 — ★오너 복원 조항 (오너 제정 · 2026-10-13 복원)]"
+  },
+  {
+   "id": "T3-07nm",
+   "class": [
+    3
+   ],
+   "op": "prefix",
+   "file": "directives/CEO_TEMPLATE.md",
+   "repo_path": "cysjavis-pack/directives/CEO_TEMPLATE.md",
+   "owner_class": "system",
+   "generated": true,
+   "base_blob": "3ee3a181ba47d604c1c942f20a85356172284f13",
+   "line": 14,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [],
+   "old": "## [CEO 와 master 의 차이 — ★오너 복원 조항 (오너 제정 · 2026-10-13 복원)]",
+   "new": "> 【본 함대 한정 — `~/.cys/local/fleet-profile` = vendor-fleet 일 때만 적용】 바로 아래 오너 복원 조항 안의 「배포 전담 부서의 작업」(두 곳)과 `~/Desktop/CYSjavis/_evidence/…` 백업 경로는 제조사 함대에만 해당한다. 다른 설치에서 영구 보존 자리는 사용자 로컬(`~/.cys/local/`)이고, 원문 백업은 `~/.cys/local/evidence/` 에 한다. 조항 본문은 바이트 그대로 둔다(오너 원문 · test_bootv2_doc_contract.py:284-286 바이트·sha 고정).\n\n## [CEO 와 master 의 차이 — ★오너 복원 조항 (오너 제정 · 2026-10-13 복원)]"
+  },
+  {
+   "id": "T1-01+T2-01",
+   "class": [
+    1,
+    2
+   ],
+   "op": "replace",
+   "file": "directives/MASTER_DIRECTIVE.md",
+   "repo_path": "cysjavis-pack/directives/MASTER_DIRECTIVE.md",
+   "owner_class": "user",
+   "generated": false,
+   "base_blob": "bac11e25a60fd39db6aef052061495f83e0d5405",
+   "line": 299,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [
+    "master"
+   ],
+   "old": "요약의 `remedy=<코드>`(처방 코드 · 없으면 `blocked_by`)는 사람에게 그대로 전달한다. **★LLM\n  에이전트(master·CEO·CSO 포함)는 자동 조치(강제 배달 `cys queue deliver`·드레인·키 주입·동결\n  해제·항목 삭제) 금지 — 사람 운영자 전용(depth_high 와 겹쳐도).**",
+   "new": "요약의 `remedy=<코드>`(처방 코드 · 없으면 `blocked_by`)대로 **★자비스가 직접 푼다(사용자 지침이 막으면 그 지침을 따른다)**: ①먼저 `cys read-screen --surface <좌석>` 으로 그 창을 읽는다 ②만료 항목은 `cys queue revive <id>`(같은 항목은 한 번만), 막힌 머리는 **막힌 이유가 quiet 대기·사이클 창 보류일 때만** `cys queue deliver <id>`(단건 · 항목·remedy 코드마다 10분에 한 번 · 드레인 금지) — **초안·모달·승인·전체화면·작업 중·빈 좌석·일시정지·사람 입력 직후·배달 간격으로 막혔으면 강제 배달도 데몬이 거부하므로 부르지 않는다: 작업 중·사람 입력 직후·배달 간격은 기다리고, 빈 좌석은 에이전트를 다시 띄우고, 초안·모달·승인은 아래 ③④대로 한다. 전체화면(codex·gemini 좌석은 늘 이렇다)으로 막힌 활성 항목을 살아 있는 좌석에서 옮기는 지원 경로는 이 판에 없다 — 큐 원본은 수명(TTL)이 다할 때까지 그 큐에 남는다(살아 있는 남의 좌석 항목은 `cys queue drop` 도 데몬이 거부한다)** ③유령 계수·사람 글이 걸린 입력줄은 기계가 지우지 못한다(데몬의 사람 글 보호 게이트) — 그 순간 읽은 화면으로 그 창을 짚어 사용자에게 한 번 청한다(비어 있으면 그 창에서 Ctrl-U, 글이 있으면 제출·지우기·그대로 두기 중 무엇을 할지) ④질문·선택 창은 무엇을 묻는지 사용자에게 한 번 묻고 답대로 고른다. **큐 항목 폐기(`cys queue drop`)·드레인은 사용자에게 한 번 묻고, 하라고 하면 한다. 사용자가 건 kill-switch 동결은 사용자가 풀라고 할 때만 푼다(depth_high 와 겹쳐도).**"
+  },
+  {
+   "id": "T1-01+T2-01m",
+   "class": [
+    1,
+    2
+   ],
+   "op": "replace",
+   "file": "directives/CEO_TEMPLATE.md",
+   "repo_path": "cysjavis-pack/directives/CEO_TEMPLATE.md",
+   "owner_class": "system",
+   "generated": true,
+   "base_blob": "3ee3a181ba47d604c1c942f20a85356172284f13",
+   "line": 439,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [],
+   "old": "요약의 `remedy=<코드>`(처방 코드 · 없으면 `blocked_by`)는 사람에게 그대로 전달한다. **★LLM\n  에이전트(master·CEO·CSO 포함)는 자동 조치(강제 배달 `cys queue deliver`·드레인·키 주입·동결\n  해제·항목 삭제) 금지 — 사람 운영자 전용(depth_high 와 겹쳐도).**",
+   "new": "요약의 `remedy=<코드>`(처방 코드 · 없으면 `blocked_by`)대로 **★자비스가 직접 푼다(사용자 지침이 막으면 그 지침을 따른다)**: ①먼저 `cys read-screen --surface <좌석>` 으로 그 창을 읽는다 ②만료 항목은 `cys queue revive <id>`(같은 항목은 한 번만), 막힌 머리는 **막힌 이유가 quiet 대기·사이클 창 보류일 때만** `cys queue deliver <id>`(단건 · 항목·remedy 코드마다 10분에 한 번 · 드레인 금지) — **초안·모달·승인·전체화면·작업 중·빈 좌석·일시정지·사람 입력 직후·배달 간격으로 막혔으면 강제 배달도 데몬이 거부하므로 부르지 않는다: 작업 중·사람 입력 직후·배달 간격은 기다리고, 빈 좌석은 에이전트를 다시 띄우고, 초안·모달·승인은 아래 ③④대로 한다. 전체화면(codex·gemini 좌석은 늘 이렇다)으로 막힌 활성 항목을 살아 있는 좌석에서 옮기는 지원 경로는 이 판에 없다 — 큐 원본은 수명(TTL)이 다할 때까지 그 큐에 남는다(살아 있는 남의 좌석 항목은 `cys queue drop` 도 데몬이 거부한다)** ③유령 계수·사람 글이 걸린 입력줄은 기계가 지우지 못한다(데몬의 사람 글 보호 게이트) — 그 순간 읽은 화면으로 그 창을 짚어 사용자에게 한 번 청한다(비어 있으면 그 창에서 Ctrl-U, 글이 있으면 제출·지우기·그대로 두기 중 무엇을 할지) ④질문·선택 창은 무엇을 묻는지 사용자에게 한 번 묻고 답대로 고른다. **큐 항목 폐기(`cys queue drop`)·드레인은 사용자에게 한 번 묻고, 하라고 하면 한다. 사용자가 건 kill-switch 동결은 사용자가 풀라고 할 때만 푼다(depth_high 와 겹쳐도).**"
+  },
+  {
+   "id": "T1-03+T2-01c",
+   "class": [
+    1,
+    2
+   ],
+   "op": "replace",
+   "file": "directives/CSO_DIRECTIVE.md",
+   "repo_path": "cysjavis-pack/directives/CSO_DIRECTIVE.md",
+   "owner_class": "user",
+   "generated": false,
+   "base_blob": "945a8637229c0cbaf9a1984ecd50ca0a2423e409",
+   "line": 133,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [
+    "cso"
+   ],
+   "old": "요약의 `remedy=<코드>`(처방 코드 · 없으면 `blocked_by`)는 master·오너(사람)에게 그대로 전달. **★LLM 에이전트(CSO·master 포함)는 자동 조치(강제 배달 `cys queue deliver`·드레인·키 주입·동결 해제·항목 삭제) 금지 — 사람 운영자 전용(depth_high 와 겹쳐도)**",
+   "new": "요약의 `remedy=<코드>`(처방 코드 · 없으면 `blocked_by`)대로 **★CSO 가 직접 푼다(사용자 지침이 막으면 따른다)**: `cys read-screen` 으로 그 창을 먼저 읽고, 만료 항목은 `cys queue revive <id>`(같은 항목은 한 번만), 막힌 머리는 **막힌 이유가 quiet 대기·사이클 창 보류일 때만** `cys queue deliver <id>`(단건 · 항목·remedy 코드마다 10분에 한 번 · 드레인 금지). **초안·모달·승인·전체화면(codex·gemini 좌석은 늘 이렇다)·작업 중·빈 좌석·일시정지·사람 입력 직후·배달 간격으로 막혔으면 강제 배달도 데몬이 거부한다 — 부르지 않는다: 작업 중·사람 입력 직후·배달 간격은 기다리고, 초안·모달·승인·전체화면·빈 좌석·일시정지는 읽은 화면과 함께 master 에게 넘긴다. CSO 는 남의 입력줄에 글·키를 넣지 않는다**. **유령 계수·사람 글·질문 창·항목 폐기·드레인·동결 해제는 master 에게 넘긴다 — master 가 사용자에게 한 번 묻는다(depth_high 와 겹쳐도)**"
+  },
+  {
+   "id": "T1-12d",
+   "class": [
+    1
+   ],
+   "op": "replace",
+   "file": "directives/CSO_DIRECTIVE.md",
+   "repo_path": "cysjavis-pack/directives/CSO_DIRECTIVE.md",
+   "owner_class": "user",
+   "generated": false,
+   "base_blob": "945a8637229c0cbaf9a1984ecd50ca0a2423e409",
+   "line": 174,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [
+    "cso"
+   ],
+   "old": "`cys queue list|feed list|feed push|schedule list|approval check`",
+   "new": "`cys queue list|queue revive|queue deliver|feed list|feed push|schedule list|approval check`"
+  },
+  {
+   "id": "T1-12",
+   "class": [
+    1
+   ],
+   "op": "replace",
+   "file": "hooks/role-capability-gate.sh",
+   "repo_path": "cysjavis-pack/hooks/role-capability-gate.sh",
+   "owner_class": "system",
+   "generated": false,
+   "base_blob": "4ac476adc522c5071102de3f08ddae45ac4f3c50",
+   "line": 846,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [],
+   "old": "\"queue\": {\"list\", \"clear\"},",
+   "new": "\"queue\": {\"list\", \"clear\", \"revive\", \"deliver\"},"
+  },
+  {
+   "id": "T1-04",
+   "class": [
+    1
+   ],
+   "op": "replace",
+   "file": null,
+   "repo_path": "src/bin/cysd/governance.rs",
+   "owner_class": "system",
+   "generated": false,
+   "base_blob": "6fd81d609c1ffb1c56d16d91cffaab264ca57cdb",
+   "line": 9393,
+   "k_before": 2,
+   "k_norm": 2,
+   "roles": [],
+   "old": "\" · LLM 에이전트는 자동 조치(강제 배달·드레인·키 주입·동결 해제·항목 삭제) 금지\"",
+   "new": "\" · LLM 에이전트는 자동 조치(remedy 대로 단건 revive·deliver)를 한다 — 사용자 지침이 막으면 따르고, 드레인·항목 삭제·동결 해제·사람 글에 닿는 키는 사용자에게 한 번 묻는다\""
+  },
+  {
+   "id": "T1-08",
+   "class": [
+    1
+   ],
+   "op": "replace",
+   "file": null,
+   "repo_path": "src/bin/cysd/governance.rs",
+   "owner_class": "system",
+   "generated": false,
+   "base_blob": "6fd81d609c1ffb1c56d16d91cffaab264ca57cdb",
+   "line": 9398,
+   "k_before": 2,
+   "k_norm": 2,
+   "roles": [],
+   "old": "\" — 다시 띄우기 전에 사람이 그 창에서 Ctrl-U 한 번(입력줄 계수가 남아 있다)\"",
+   "new": "\" — 다시 띄울 때는 master·CSO 좌석에서 `cys node-recover --surface <좌석>` 로 띄운다(입력줄 계수 정리를 함께 한다 · 입력줄 계수가 남아 있다)\""
+  },
+  {
+   "id": "T1-09",
+   "class": [
+    1
+   ],
+   "op": "replace",
+   "file": null,
+   "repo_path": "src/bin/cysd/governance.rs",
+   "owner_class": "system",
+   "generated": false,
+   "base_blob": "6fd81d609c1ffb1c56d16d91cffaab264ca57cdb",
+   "line": 9556,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [],
+   "old": "\"기계가 넣고 제출되지 않은 본문이 입력줄에 보인다 — 사람이 그 창을 확인하고 Enter 로 제출하거나 지운다\"",
+   "new": "\"기계가 넣고 제출되지 않은 본문이 입력줄에 보인다 — 자비스가 그 창 화면을 읽어 입력줄 전체가 그 본문뿐임을 확인하면 제출하고, 확인이 안 되면 그대로 두고 사용자에게 알린다(machine_residue)\""
+  },
+  {
+   "id": "T2-02",
+   "class": [
+    2
+   ],
+   "op": "replace",
+   "file": null,
+   "repo_path": "src/bin/cysd/governance.rs",
+   "owner_class": "system",
+   "generated": false,
+   "base_blob": "6fd81d609c1ffb1c56d16d91cffaab264ca57cdb",
+   "line": 9485,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [],
+   "old": "\"입력줄에 제출되지 않은 글이 있다 — 기계는 지우지 않는다. 먼저 그 창의 화면을 읽는다(글이 아니라 선택 창일 수 있다). 사람이 그 창에서 제출하거나 지운다(오너에게 알린다)\"",
+   "new": "\"입력줄에 제출되지 않은 글이 있다 — 기계는 지우지 않는다. 자비스가 먼저 그 창의 화면을 읽는다(글이 아니라 선택 창일 수 있다). 사용자에게 한 번 알리고 묻는다: 그 창에서 제출할지, 지울지, 그대로 둘지 — 사람 글의 제출·삭제는 사용자 손으로만 된다\""
+  },
+  {
+   "id": "T1-10+T2-05",
+   "class": [
+    1,
+    2
+   ],
+   "op": "replace",
+   "file": null,
+   "repo_path": "src/bin/cysd/governance.rs",
+   "owner_class": "system",
+   "generated": false,
+   "base_blob": "6fd81d609c1ffb1c56d16d91cffaab264ca57cdb",
+   "line": 9563,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [],
+   "old": "\"커서 앞은 비어 있는데 커서 뒤에 글자가 있다 — 회색 자동 제안이면 유령 계수다(사람이 그 창을 클릭하고 Ctrl-U 한 번). \\\n             직접 쓴 글이면 초안이다(제출하거나 지운다). 사람이 화면을 보고 가린다\"",
+   "new": "\"커서 앞은 비어 있는데 커서 뒤에 글자가 있다 — 자비스가 그 창 화면을 읽어 가린다: 회색 자동 제안이면 유령 계수다(사용자에게 그 창에서 Ctrl-U 를 한 번 눌러 달라고 청한다(기계 Ctrl-U 는 데몬의 사람 글 보호 게이트가 거부한다)). 직접 쓴 글이면 초안이다(제출할지 지울지 사용자에게 한 번 묻는다)\""
+  },
+  {
+   "id": "T1-11",
+   "class": [
+    1
+   ],
+   "op": "replace",
+   "file": null,
+   "repo_path": "src/bin/cysd/governance.rs",
+   "owner_class": "system",
+   "generated": false,
+   "base_blob": "6fd81d609c1ffb1c56d16d91cffaab264ca57cdb",
+   "line": 9570,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [],
+   "old": "\"입력줄은 비어 있는데 미제출 계수가 남았다(유령 계수) — 사람이 그 창을 클릭하고 Ctrl-U 한 번(잠시 뒤 배달 재개)\"",
+   "new": "\"입력줄은 비어 있는데 미제출 계수가 남았다(유령 계수) — 자비스가 그 창 화면을 읽어 비어 있음을 확인한 뒤, 사용자에게 그 창에서 Ctrl-U 를 한 번 눌러 달라고 청한다(기계 Ctrl-U 는 데몬의 사람 글 보호 게이트가 거부한다) — 잠시 뒤 배달 재개\""
+  },
+  {
+   "id": "T2-04a",
+   "class": [
+    2
+   ],
+   "op": "replace",
+   "file": null,
+   "repo_path": "src/bin/cysd/governance.rs",
+   "owner_class": "system",
+   "generated": false,
+   "base_blob": "6fd81d609c1ffb1c56d16d91cffaab264ca57cdb",
+   "line": 9579,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [],
+   "old": "\"질문·선택 창이 떠 있다 — 사람이 답한다({q}초째",
+   "new": "\"질문·선택 창이 떠 있다 — 자비스가 화면을 읽어 무엇을 묻는지 사용자에게 한 번 묻고 답대로 고른다(`cys read-screen --composer` 의 output_gen 에 묶어 `cys send-key --expect-output-gen` 으로)({q}초째"
+  },
+  {
+   "id": "T2-04b",
+   "class": [
+    2
+   ],
+   "op": "replace",
+   "file": null,
+   "repo_path": "src/bin/cysd/governance.rs",
+   "owner_class": "system",
+   "generated": false,
+   "base_blob": "6fd81d609c1ffb1c56d16d91cffaab264ca57cdb",
+   "line": 9581,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [],
+   "old": "\"질문·선택 창이 떠 있다 — 사람이 답한다\".into()",
+   "new": "\"질문·선택 창이 떠 있다 — 자비스가 화면을 읽어 무엇을 묻는지 사용자에게 한 번 묻고 답대로 고른다(`cys read-screen --composer` 의 output_gen 에 묶어 `cys send-key --expect-output-gen` 으로)\".into()"
+  },
+  {
+   "id": "T1-31",
+   "class": [
+    1,
+    2
+   ],
+   "op": "replace",
+   "file": null,
+   "repo_path": "src/bin/cysd/governance.rs",
+   "owner_class": "system",
+   "generated": false,
+   "base_blob": "6fd81d609c1ffb1c56d16d91cffaab264ca57cdb",
+   "line": 9433,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [],
+   "old": "다시 그려진 뒤에도 막혀 있으면 사람이 그 창을 확인한다\\\n     (비어 있으면 Ctrl-U · 글이 있으면 제출하거나 지운다)",
+   "new": "다시 그려진 뒤에도 막혀 있으면 자비스가 그 창 화면을 읽는다 — 비어 있으면 사용자에게 그 창에서 Ctrl-U 를 한 번 눌러 달라고 청한다(기계 Ctrl-U 는 데몬의 사람 글 보호 게이트가 거부한다), 글이 있으면 제출할지 지울지 사용자에게 한 번 묻는다"
+  },
+  {
+   "id": "T1-32",
+   "class": [
+    1
+   ],
+   "op": "replace",
+   "file": null,
+   "repo_path": "src/bin/cysd/governance.rs",
+   "owner_class": "system",
+   "generated": false,
+   "base_blob": "6fd81d609c1ffb1c56d16d91cffaab264ca57cdb",
+   "line": 9438,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [],
+   "old": "그래도 막혀 있으면 그 창이 입력을 기다리는 상태인지 사람이 확인한다",
+   "new": "그래도 막혀 있으면 자비스가 `cys read-screen` 으로 그 창이 입력을 기다리는 상태인지 확인하고, 다른 화면이 떠 있으면 무엇인지 사용자에게 한 번 알린다"
+  },
+  {
+   "id": "T1-33",
+   "class": [
+    1
+   ],
+   "op": "replace",
+   "file": null,
+   "repo_path": "src/bin/cysd/governance.rs",
+   "owner_class": "system",
+   "generated": false,
+   "base_blob": "6fd81d609c1ffb1c56d16d91cffaab264ca57cdb",
+   "line": 9480,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [],
+   "old": "(반복되면 그 창의 출력을 사람이 확인)",
+   "new": "(반복되면 자비스가 그 창의 출력을 읽어 원인을 찾는다)"
+  },
+  {
+   "id": "T1-05",
+   "class": [
+    1
+   ],
+   "op": "replace",
+   "file": null,
+   "repo_path": "src/bin/cysd/state.rs",
+   "owner_class": "system",
+   "generated": false,
+   "base_blob": "2c39cc92072885c164fa6e012d819aefcc1a1a0b",
+   "line": 512,
+   "k_before": 1,
+   "k_norm": 2,
+   "roles": [],
+   "old": "(운영자(사람) 판단 전제). \\\n     LLM 에이전트는 이 경보에 자동 반응(강제 배달·드레인) 금지",
+   "new": "(자비스가 remedy 대로 판단한다). LLM 에이전트는 remedy 대로 단건 강제 배달을 할 수 있다 — 드레인은 사용자에게 한 번 묻는다"
+  },
+  {
+   "id": "T1-06+T2-03",
+   "class": [
+    1,
+    2
+   ],
+   "op": "replace",
+   "file": null,
+   "repo_path": "src/bin/cysd/state.rs",
+   "owner_class": "system",
+   "generated": false,
+   "base_blob": "2c39cc92072885c164fa6e012d819aefcc1a1a0b",
+   "line": 669,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [],
+   "old": "운영자(사람) 판단 하에 cys queue revive <id> 로 재활성 또는 cys queue drop <id> 로 폐기. LLM \\\n     에이전트는 이 통지에 자동 반응(revive·drop·재전송) 금지",
+   "new": "자비스가 판단해 cys queue revive <id> 로 재활성한다(같은 항목은 한 번만 — 다시 만료되면 사용자에게 묻는다 · 통지마다 반사적으로 revive 하지 않는다). cys queue drop <id> 폐기는 사용자에게 한 번 묻고 한다"
+  },
+  {
+   "id": "T1-07",
+   "class": [
+    1
+   ],
+   "op": "replace",
+   "file": null,
+   "repo_path": "src/bin/cys.rs",
+   "owner_class": "system",
+   "generated": false,
+   "base_blob": "e4185c85d18ee5d7bcd965951fb79110fdda8f01",
+   "line": 1008,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [],
+   "old": "운영자(사람) 판단 전제 — LLM 에이전트의 자동 반응(queue.expired 통지에 대한\n    /// 반사적 revive) 금지.",
+   "new": "자비스가 판단해 쓴다(같은 항목은 한 번만 — queue.expired 통지에 대한\n    /// 반사적 revive 는 하지 않는다)."
+  },
+  {
+   "id": "T1-34",
+   "class": [
+    1
+   ],
+   "op": "replace",
+   "file": null,
+   "repo_path": "src/lib.rs",
+   "owner_class": "system",
+   "generated": false,
+   "base_blob": "071b5be1d7e656957687a29c19abc9862b231bd4",
+   "line": 688,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [],
+   "old": "\" — 입력줄이 비어 보이면 유령 계수다: 그 창에서 사람이 Ctrl-U 한 번\"",
+   "new": "\" — 입력줄이 비어 보이면 유령 계수다: 자비스가 그 창 화면을 읽어 비어 있음을 확인한 뒤, 사용자에게 그 창에서 Ctrl-U 를 한 번 눌러 달라고 청한다(기계 Ctrl-U 는 데몬의 사람 글 보호 게이트가 거부한다)\""
+  },
+  {
+   "id": "T1-15",
+   "class": [
+    1
+   ],
+   "op": "replace",
+   "file": "directives/RSI_LEARNING_DIRECTIVE.md",
+   "repo_path": "cysjavis-pack/directives/RSI_LEARNING_DIRECTIVE.md",
+   "owner_class": "user",
+   "generated": false,
+   "base_blob": "9e4210e91aeb41949db3eb32a062d9d9a350ebd6",
+   "line": 9,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [
+    "master",
+    "worker"
+   ],
+   "old": "명령(\"학습하라/공부하라/RSI하라\")을 받거나 master 자율추천이 사람 승인되면, 다음을 순서대로 실행한다:",
+   "new": "명령(\"학습하라/공부하라/RSI하라\")을 받거나 §3 의 세 신호가 오면, 다음을 순서대로 실행한다:"
+  },
+  {
+   "id": "T1-16",
+   "class": [
+    1
+   ],
+   "op": "replace",
+   "file": "directives/RSI_LEARNING_DIRECTIVE.md",
+   "repo_path": "cysjavis-pack/directives/RSI_LEARNING_DIRECTIVE.md",
+   "owner_class": "user",
+   "generated": false,
+   "base_blob": "9e4210e91aeb41949db3eb32a062d9d9a350ebd6",
+   "line": 14,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [
+    "master",
+    "worker"
+   ],
+   "old": "**soul·directive 저장은 사람 승인**.",
+   "new": "**저장 위치는 학습 기억(`<pack>/memory/` — 항목 하나가 파일 하나)뿐이다. 이 판에서 학습 루프는 스킬을 등록하지 않는다(사용자가 스킬을 원하면 `cys skill new` 로 만든다). soul·디렉티브 파일 자체는 학습 루프가 쓰지 않는다**(사용자가 시킬 때만, §4)."
+  },
+  {
+   "id": "T1-17",
+   "class": [
+    1
+   ],
+   "op": "replace",
+   "file": "directives/RSI_LEARNING_DIRECTIVE.md",
+   "repo_path": "cysjavis-pack/directives/RSI_LEARNING_DIRECTIVE.md",
+   "owner_class": "user",
+   "generated": false,
+   "base_blob": "9e4210e91aeb41949db3eb32a062d9d9a350ebd6",
+   "line": 32,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [
+    "master",
+    "worker"
+   ],
+   "old": "(추천만 — 착수는 사람 승인)",
+   "new": "(신호가 오면 예산 상한 안에서 바로 착수한다 — 한 번에 한 라운드, 시작 사실을 사용자에게 한 줄로 알린다)"
+  },
+  {
+   "id": "T1-18",
+   "class": [
+    1
+   ],
+   "op": "replace",
+   "file": "directives/RSI_LEARNING_DIRECTIVE.md",
+   "repo_path": "cysjavis-pack/directives/RSI_LEARNING_DIRECTIVE.md",
+   "owner_class": "user",
+   "generated": false,
+   "base_blob": "9e4210e91aeb41949db3eb32a062d9d9a350ebd6",
+   "line": 40,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [
+    "master",
+    "worker"
+   ],
+   "old": "사람이 실제로 착수를 원할 때만\n`javis_learn propose` 로 항목을 만들고 그때 `feed.push --wait` 승인요청을 낸다.\n**승인(0)에서만** ①~⑤ 착수(거부·타임아웃=무실행).",
+   "new": "착수는 승인 대기 없이 한다(`javis_learn propose` 는 기록만 남긴다). 다이제스트는 사용자에게 보내는 주 1회 보고로 남는다."
+  },
+  {
+   "id": "T1-19",
+   "class": [
+    1,
+    2
+   ],
+   "op": "replace",
+   "file": "directives/RSI_LEARNING_DIRECTIVE.md",
+   "repo_path": "cysjavis-pack/directives/RSI_LEARNING_DIRECTIVE.md",
+   "owner_class": "user",
+   "generated": false,
+   "base_blob": "9e4210e91aeb41949db3eb32a062d9d9a350ebd6",
+   "line": 47,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [
+    "master",
+    "worker"
+   ],
+   "old": "- 자율추천은 '추천'까지만 자율. **④저장·⑤채택은 사람 승인**.",
+   "new": "- 착수는 §3 신호로 바로 한다(한 번에 한 라운드). **④저장·⑤채택은 증거·5차원 검증·평가자 분리·충돌 감사를 통과하고, `javis_learn store` 의 결정론 검출기가 '닫힌 저위험 모양'(명령·경로·주소·코드·실행 낱말이 없는 짧은 provisional 기억 메모)으로 알아본 항목만 바로 한다. 그 밖의 모든 항목(고위험 4축·confirmed 승격·검출기가 알아보지 못한 항목)은 보류(staged)로 남기고 그 이유를 사용자에게 보여 준다 — 이 판에는 사용자의 승인을 기계로 확인할 길이 없어 자동 채택하지 않는다**."
+  },
+  {
+   "id": "T1-20",
+   "class": [
+    1,
+    2
+   ],
+   "op": "replace",
+   "file": "directives/RSI_LEARNING_DIRECTIVE.md",
+   "repo_path": "cysjavis-pack/directives/RSI_LEARNING_DIRECTIVE.md",
+   "owner_class": "user",
+   "generated": false,
+   "base_blob": "9e4210e91aeb41949db3eb32a062d9d9a350ebd6",
+   "line": 48,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [
+    "master",
+    "worker"
+   ],
+   "old": "- soul·CLAUDE·directive·헌법 변경은 사람 승인(자동 저장 금지).",
+   "new": "- soul·CLAUDE·directive·헌법 파일은 학습 루프가 쓰지 않는다(자동 저장 금지) — 사용자가 시킬 때만, 백업을 남기고 고친다."
+  },
+  {
+   "id": "T2-09",
+   "class": [
+    2
+   ],
+   "op": "replace",
+   "file": "directives/RSI_LEARNING_DIRECTIVE.md",
+   "repo_path": "cysjavis-pack/directives/RSI_LEARNING_DIRECTIVE.md",
+   "owner_class": "user",
+   "generated": false,
+   "base_blob": "9e4210e91aeb41949db3eb32a062d9d9a350ebd6",
+   "line": 49,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [
+    "master",
+    "worker"
+   ],
+   "old": "- budget cap 초과·자원/load 한계 시 중단·보고.",
+   "new": "- budget cap 을 넘기 전에 사용자에게 한 번 묻고, 하라고 하면 상한을 올려 계속한다. 자원/load 한계면 중단·보고."
+  },
+  {
+   "id": "T2-10a",
+   "class": [
+    2
+   ],
+   "op": "replace",
+   "file": "directives/RSI_LEARNING_DIRECTIVE.md",
+   "repo_path": "cysjavis-pack/directives/RSI_LEARNING_DIRECTIVE.md",
+   "owner_class": "user",
+   "generated": false,
+   "base_blob": "9e4210e91aeb41949db3eb32a062d9d9a350ebd6",
+   "line": 77,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [
+    "master",
+    "worker"
+   ],
+   "old": "고위험은 인간 서명.",
+   "new": "고위험은 자동 채택하지 않는다(보류 · 이유를 사용자에게 보여 준다 — 이 판에는 사용자 승인을 기계로 확인할 길이 없다)."
+  },
+  {
+   "id": "T2-10b",
+   "class": [
+    2
+   ],
+   "op": "replace",
+   "file": "directives/RSI_LEARNING_DIRECTIVE.md",
+   "repo_path": "cysjavis-pack/directives/RSI_LEARNING_DIRECTIVE.md",
+   "owner_class": "user",
+   "generated": false,
+   "base_blob": "9e4210e91aeb41949db3eb32a062d9d9a350ebd6",
+   "line": 77,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [
+    "master",
+    "worker"
+   ],
+   "old": "(gemini R2 · 무조건 인간 서명, 분류 모호성 없음)",
+   "new": "(gemini R2 · 무조건 보류, 가르는 것은 `javis_learn store` 의 결정론 검출기)"
+  },
+  {
+   "id": "T1-21",
+   "class": [
+    1
+   ],
+   "op": "replace",
+   "file": "directives/RSI_LEARNING_DIRECTIVE.md",
+   "repo_path": "cysjavis-pack/directives/RSI_LEARNING_DIRECTIVE.md",
+   "owner_class": "user",
+   "generated": false,
+   "base_blob": "9e4210e91aeb41949db3eb32a062d9d9a350ebd6",
+   "line": 94,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [
+    "master",
+    "worker"
+   ],
+   "old": "- **오너**: 트리거 승인·directive 승격·고위험 4축 서명·신규 평가 축 승인·주간 다이제스트 수신.",
+   "new": "- **오너(이 자비스의 사용자)**: 보류된 학습 항목을 보고, 원하면 자비스에게 그 내용을 일반 기억으로 저장하라고 시킨다·신규 평가 축 승인·주간 다이제스트 수신·언제든 중단(kill-switch)."
+  },
+  {
+   "id": "T1-23",
+   "class": [
+    1
+   ],
+   "op": "replace",
+   "file": "directives/WORKER_DIRECTIVE.md",
+   "repo_path": "cysjavis-pack/directives/WORKER_DIRECTIVE.md",
+   "owner_class": "user",
+   "generated": false,
+   "base_blob": "0c52b09af359a9f4e0188144d500c66cda16f7a3",
+   "line": 209,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [
+    "worker"
+   ],
+   "old": "신규 등록은 feed push로 master 승인을 받는다.",
+   "new": "신규 등록(`cys skill new` · 위치 `~/.cys/local/skills` — 업데이트 불가침 · 폴더를 치우면 되돌아간다)은 사용자나 master 가 시키면 바로 한다. 스스로 만들고 싶으면 master 에게 한 줄로 제안한다(학습 루프는 이 판에서 스킬을 등록하지 않는다)."
+  },
+  {
+   "id": "T1-23m",
+   "class": [
+    1
+   ],
+   "op": "replace",
+   "file": "directives/MASTER_DIRECTIVE.md",
+   "repo_path": "cysjavis-pack/directives/MASTER_DIRECTIVE.md",
+   "owner_class": "user",
+   "generated": false,
+   "base_blob": "bac11e25a60fd39db6aef052061495f83e0d5405",
+   "line": 556,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [
+    "master"
+   ],
+   "old": "워커의 신규 스킬 등록 요청(feed)을 검토·승인한다.",
+   "new": "워커의 신규 스킬 제안을 보고 사용자의 뜻에 맞으면 `cys skill new` 로 만들게 한다(학습 루프는 이 판에서 스킬을 등록하지 않는다). 문제가 생긴 스킬은 폴더를 백업한 뒤 치운다."
+  },
+  {
+   "id": "T1-23mm",
+   "class": [
+    1
+   ],
+   "op": "replace",
+   "file": "directives/CEO_TEMPLATE.md",
+   "repo_path": "cysjavis-pack/directives/CEO_TEMPLATE.md",
+   "owner_class": "system",
+   "generated": true,
+   "base_blob": "3ee3a181ba47d604c1c942f20a85356172284f13",
+   "line": 696,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [],
+   "old": "워커의 신규 스킬 등록 요청(feed)을 검토·승인한다.",
+   "new": "워커의 신규 스킬 제안을 보고 사용자의 뜻에 맞으면 `cys skill new` 로 만들게 한다(학습 루프는 이 판에서 스킬을 등록하지 않는다). 문제가 생긴 스킬은 폴더를 백업한 뒤 치운다."
+  },
+  {
+   "id": "T1-18s",
+   "class": [
+    1
+   ],
+   "op": "replace",
+   "file": "skills/rsi-learning-loop/SKILL.md",
+   "repo_path": "cysjavis-pack/skills/rsi-learning-loop/SKILL.md",
+   "owner_class": "system",
+   "generated": false,
+   "base_blob": "3631dca2ca7739a9bb083e63b0f62c68a66f541f",
+   "line": 18,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [],
+   "old": "`cys feed push --wait`(또는 `cys feed reply <id> allow`) **승인(exit 0)에서만** ①~⑤ 착수.\n   거부·타임아웃 = 무실행.",
+   "new": "승인 대기 없이 ①~⑤ 착수(한 번에 한 라운드 · 시작 사실을 사용자에게 한 줄로 알린다)."
+  },
+  {
+   "id": "T1-20s",
+   "class": [
+    1,
+    2
+   ],
+   "op": "replace",
+   "file": "skills/rsi-learning-loop/SKILL.md",
+   "repo_path": "cysjavis-pack/skills/rsi-learning-loop/SKILL.md",
+   "owner_class": "system",
+   "generated": false,
+   "base_blob": "3631dca2ca7739a9bb083e63b0f62c68a66f541f",
+   "line": 61,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [],
+   "old": "- **디렉티브 = 자동 초안 + 오너 원클릭 승인**: 초안 생성 후 `cys feed push --wait`로 오너 승인\n  (soul·CLAUDE·directive 변경은 denylist — 자동 저장 금지·루프 유지). 승인(0)에서만 반영.",
+   "new": "- **디렉티브 = 학습 루프가 쓰지 않는다**: soul·CLAUDE·directive 변경은 denylist — 자동 저장 금지·루프 유지. 바꿀 만한 규칙은 학습 기억(memory)에 쓰고, 파일 자체는 사용자가 시킬 때만 고친다."
+  },
+  {
+   "id": "T1-19s",
+   "class": [
+    1,
+    2
+   ],
+   "op": "replace",
+   "file": "skills/rsi-learning-loop/SKILL.md",
+   "repo_path": "cysjavis-pack/skills/rsi-learning-loop/SKILL.md",
+   "owner_class": "system",
+   "generated": false,
+   "base_blob": "3631dca2ca7739a9bb083e63b0f62c68a66f541f",
+   "line": 63,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [],
+   "old": "`javis_learn store --round <id> --pattern <p> --type <feedback|reference|project>\n  --approved --state <provisional|confirmed> --gate-input <bundle>` — verdict=improved AND\n  --approved일 때만 저장.",
+   "new": "`javis_learn store --round <id> --pattern <p> --type <feedback|reference|project> --state <provisional|confirmed> --gate-input <bundle>` — verdict=improved 이고 검출기가 닫힌 저위험 모양으로 알아본 provisional 항목만 저장한다. 나머지는 보류(staged)로 남기고 이유를 보여 준다(`--approved` 플래그는 없다 · 게이트 묶음의 human_signed 는 store 가 항상 거짓으로 덮어쓴다)."
+  },
+  {
+   "id": "T1-19k",
+   "class": [
+    1,
+    2
+   ],
+   "op": "replace",
+   "file": "skills/rsi-learning-loop/SKILL.md",
+   "repo_path": "cysjavis-pack/skills/rsi-learning-loop/SKILL.md",
+   "owner_class": "system",
+   "generated": false,
+   "base_blob": "3631dca2ca7739a9bb083e63b0f62c68a66f541f",
+   "line": 72,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [],
+   "old": "→ **오너 승인** 후에만 팩 레지스트리 진입.",
+   "new": "→ 이 판에서 학습 루프는 스킬을 등록하지 않는다 — 절차는 보류된 메모로 남기고, 사용자가 원하면 `cys skill new` 로 만든다."
+  },
+  {
+   "id": "T1-19c",
+   "class": [
+    1
+   ],
+   "op": "replace",
+   "file": "bin/javis_learn.py",
+   "repo_path": "cysjavis-pack/bin/javis_learn.py",
+   "owner_class": "system",
+   "generated": false,
+   "base_blob": "414fa58541c4c462bdcae29601a43a4b686288e5",
+   "line": 363,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [],
+   "old": "사람 승인(--approved) 없음 — ④저장·⑤채택은 사람 승인(directive §4)",
+   "new": "보류 — 닫힌 저위험 모양(명령·경로·주소·코드·실행 낱말이 없는 짧은 provisional 기억 메모)이 아니다(고위험 4축·confirmed·검출기 미인식). 이 판에는 사용자 승인을 기계로 확인할 길이 없어 자동 채택하지 않는다"
+  },
+  {
+   "id": "T1-19f",
+   "class": [
+    1
+   ],
+   "op": "delete",
+   "file": "bin/javis_learn.py",
+   "repo_path": "cysjavis-pack/bin/javis_learn.py",
+   "owner_class": "system",
+   "generated": false,
+   "base_blob": "414fa58541c4c462bdcae29601a43a4b686288e5",
+   "line": 1349,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [],
+   "old": "st.add_argument(\"--approved\", action=\"store_true\");",
+   "new": ""
+  },
+  {
+   "id": "T1-18c",
+   "class": [
+    1
+   ],
+   "op": "replace",
+   "file": "bin/javis_learn.py",
+   "repo_path": "cysjavis-pack/bin/javis_learn.py",
+   "owner_class": "system",
+   "generated": false,
+   "base_blob": "414fa58541c4c462bdcae29601a43a4b686288e5",
+   "line": 730,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [],
+   "old": "\"status\": \"awaiting_approval\", \"ts\": time.time(),\n               \"note\": \"pending feed approval item 등록 → 사람이 'cys feed reply <id> allow'(또는 feed 패널)로 승인할 때만 ①~⑤ 착수. 거부=무실행.\"",
+   "new": "\"status\": \"recorded\", \"ts\": time.time(), \"note\": \"기록만 — 착수는 §3 신호로 승인 대기 없이 한다(닫힌 저위험 모양 밖의 저장은 보류된다).\""
+  },
+  {
+   "id": "T1-27",
+   "class": [
+    1
+   ],
+   "op": "replace",
+   "file": "hooks/guard.sh",
+   "repo_path": "cysjavis-pack/hooks/guard.sh",
+   "owner_class": "system",
+   "generated": false,
+   "base_blob": "cfba3189833a0d04ec8a83fb5d39452d7c119587",
+   "line": 1013,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [],
+   "old": "헌법파일(%s) %s 차단. 변경 불가 (주인님 직접명령 인가토큰 CONSTITUTION_EDIT_AUTHORIZED 필요)",
+   "new": "헌법파일(%s) %s 보류 — 사용자가 직접 시킨 편집이면: 먼저 원본을 <파일>.pre-ss-<UTC> 로 백업하고, 팩의 hooks 폴더(guard.sh 와 같은 폴더)에 CONSTITUTION_EDIT_AUTHORIZED 파일을 Write 도구로 만들어 첫 줄에 이 파일 이름을 쓴 뒤 다시 편집한다(30분 유효 · 자율주행 중에는 열리지 않는다). 끝나면 그 인가 파일을 Write 도구로 비운다(빈 파일 = 인가 없음). 자기 판단만으로는 만들지 않는다"
+  },
+  {
+   "id": "T1-28",
+   "class": [
+    1
+   ],
+   "op": "replace",
+   "file": "hooks/guard.sh",
+   "repo_path": "cysjavis-pack/hooks/guard.sh",
+   "owner_class": "system",
+   "generated": false,
+   "base_blob": "cfba3189833a0d04ec8a83fb5d39452d7c119587",
+   "line": 935,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [],
+   "old": "헌법파일 쓰기/덮어쓰기 차단(soul·CLAUDE·*_DIRECTIVE). 변경 불가",
+   "new": "헌법파일(soul·CLAUDE·*_DIRECTIVE)은 Bash 로 쓰지 않는다 — 이 판정은 명령 안의 파일 이름과 쓰기 기호만 보고 실제로 어느 파일에 쓰는지는 가리지 못한다(읽기만 하려면 Read 도구로 읽는다). 사용자가 직접 시킨 편집이면 Write/Edit 도구로 고친다(인가 방법은 그 도구의 보류 문구가 알려 준다)"
+  },
+  {
+   "id": "T1-29",
+   "class": [
+    1
+   ],
+   "op": "replace",
+   "file": "hooks/guard.sh",
+   "repo_path": "cysjavis-pack/hooks/guard.sh",
+   "owner_class": "system",
+   "generated": false,
+   "base_blob": "cfba3189833a0d04ec8a83fb5d39452d7c119587",
+   "line": 1048,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [],
+   "old": "백스톱: 헌법파일 쓰기. 변경 불가",
+   "new": "백스톱: python 판정기를 돌리지 못해(python3·python·py 를 못 찾았거나 판정기 오류) 축소 모드다 — 이 모드에는 인가 경로가 없어 헌법파일(soul·CLAUDE·*_DIRECTIVE)에 닿는 호출을 도구를 가리지 않고 막는다. python3(또는 python·py)를 PATH 에 두거나 판정기 오류를 고친 뒤 다시 한다"
+  },
+  {
+   "id": "T1-30",
+   "class": [
+    1
+   ],
+   "op": "replace",
+   "file": null,
+   "repo_path": "src/overrides.rs",
+   "owner_class": "system",
+   "generated": false,
+   "base_blob": "871d6f01e4099c71cf54543284e53a8e8c1e0dae",
+   "line": 42,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [],
+   "old": "- soul.md 운영 헌장 불가침",
+   "new": "- soul.md 운영 헌장은 사용자의 것 — 사용자가 직접 시킬 때만 고친다(자율주행·자기 판단으로는 고치지 않는다)"
+  },
+  {
+   "id": "T1-24",
+   "class": [
+    1
+   ],
+   "op": "replace",
+   "file": null,
+   "repo_path": "ui/src/officetab.ts",
+   "owner_class": "system",
+   "generated": false,
+   "base_blob": "703809e8afaa6561631640188253fb8fddc590f8",
+   "line": 66,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [],
+   "old": "오래 열리지 않으면 컴퓨터를 다시 시작해 보시고, 그래도 안 되면 왼쪽 아래 '피드백'으로 알려 주세요.",
+   "new": "오래 열리지 않으면 자비스에게 '오피스가 안 열린다, 고쳐 줘'라고 말씀하세요 — 자비스가 먼저 고칩니다. 제품 결함이면 자비스가 피드백 초안을 만들어 드립니다."
+  },
+  {
+   "id": "T1-25",
+   "class": [
+    1
+   ],
+   "op": "replace",
+   "file": null,
+   "repo_path": "ui/src/officetab.ts",
+   "owner_class": "system",
+   "generated": false,
+   "base_blob": "703809e8afaa6561631640188253fb8fddc590f8",
+   "line": 70,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [],
+   "old": "오피스 화면 파일을 찾지 못했습니다. 왼쪽 아래 '피드백'으로 알려 주세요.",
+   "new": "오피스 화면 파일을 찾지 못했습니다. 자비스에게 '오피스 파일을 복구해 줘'라고 말씀하세요 — 자비스가 직접 복구합니다."
+  },
+  {
+   "id": "T1-26",
+   "class": [
+    1
+   ],
+   "op": "replace",
+   "file": "bin/javis_preflight.py",
+   "repo_path": "cysjavis-pack/bin/javis_preflight.py",
+   "owner_class": "system",
+   "generated": false,
+   "base_blob": "96a83c60569d3668b9c902e50308e202d4f6d744",
+   "line": 5711,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [],
+   "old": "(가치 있는 수정은 vendor 승격 제보)",
+   "new": "(가치 있는 수정은 이 기계에 그대로 두거나 `~/.cys/local` 로 옮긴다 — 제품 반영 제안은 원할 때 `cys pack-merge --file <rel> --propose`)"
+  },
+  {
+   "id": "T2-11",
+   "class": [
+    2
+   ],
+   "op": "replace",
+   "file": "skills/harness-engineering/SKILL.md",
+   "repo_path": "cysjavis-pack/skills/harness-engineering/SKILL.md",
+   "owner_class": "system",
+   "generated": false,
+   "base_blob": "c2d50880ccff07585de10c54da244d6e50c6ecda",
+   "line": 153,
+   "k_before": 1,
+   "k_norm": 1,
+   "roles": [],
+   "old": "- N7 외부발행(push·머지·계정)은 **닿으면 멈추고 오너께 보고만** — 자율주행 정지 경계(denylist).",
+   "new": "- N7 외부발행(push·머지·계정)은 **닿으면 오너에게 한 번 묻고, 하라고 하면 한다** — 자율주행 정지 경계(denylist)."
+  }
+ ]
+}
