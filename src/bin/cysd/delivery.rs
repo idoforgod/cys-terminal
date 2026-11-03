@@ -1785,6 +1785,7 @@ pub(crate) mod tests {
                 expired_notified: false,
                 expired_event_sent: false,
                 authoritative: false,
+                notice_key: None,
             };
             std::fs::create_dir_all(p.parent().unwrap()).expect("상태 디렉터리");
             // 상한을 넘긴 원장(회전 조건) — 한 줄이 아주 긴 JSON 이어도 상관없다(크기만 본다).
@@ -1890,6 +1891,7 @@ pub(crate) mod tests {
                 expired_notified: false,
                 expired_event_sent: false,
                 authoritative: false,
+                notice_key: None,
             };
             // ① 시도 — 성공 배치는 디렉터리 fsync 를 반드시 거친다.
             let before = dir_sync_probe::attempts();
@@ -2006,6 +2008,7 @@ pub(crate) mod tests {
                 expired_notified: false,
                 expired_event_sent: false,
                 authoritative: false,
+                notice_key: None,
             };
             assert!(record_queue_tombstone(&daemon, 12, &mk("f3-single"), "dropped", 5.0));
             assert!(record_queue_tombstones(&daemon, 12, &[mk("f3-batch")], "expired", 6.0));
@@ -2053,6 +2056,7 @@ pub(crate) mod tests {
                 expired_notified: false,
                 expired_event_sent: false,
                 authoritative: false,
+                notice_key: None,
             };
             let batch = vec![mk("triage-tomb-a", "A 본문"), mk("triage-tomb-b", "B 본문")];
             let p = ledger_path(sock);
@@ -2115,6 +2119,7 @@ pub(crate) mod tests {
                 expired_notified: false,
                 expired_event_sent: false,
                 authoritative: false,
+                notice_key: None,
             };
             // ⓐ 기록 불능 — 원장 경로를 디렉터리로 막는다(POSIX·Windows 공통 실패).
             let p = ledger_path(sock);

@@ -545,6 +545,7 @@ fn deliver(daemon: Arc<Daemon>, id: u64, requester: u64, text: String) {
             None,
             FreezeGuard::Daemon,
             None,
+            None,
         ) {
             Ok(_) => {
                 let mut j = daemon.cycle_jobs.lock().unwrap_or_else(|e| e.into_inner());

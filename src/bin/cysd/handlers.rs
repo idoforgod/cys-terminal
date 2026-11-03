@@ -15788,6 +15788,7 @@ mod tests {
                 expired_notified: true,
                 expired_event_sent: true,
                 authoritative: false,
+                notice_key: None,
             };
             dest.expired_queue.lock().unwrap().push_back(e);
         };

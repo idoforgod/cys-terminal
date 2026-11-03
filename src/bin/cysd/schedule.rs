@@ -2414,6 +2414,7 @@ fn enqueue_schedule_push(
         //   경보(`enqueue_alert`)는 반대다: 보류해도 잃지 않으므로 판정과 같은 술어를 쓴다.
         crate::alert_route::FreezeGuard::Daemon,
         ttl_secs,
+        None,
     )
     .map(|_| ())
     .map_err(|e| format!("via_queue enqueue failed: {}", e.as_str()))
