@@ -1427,9 +1427,10 @@ pub fn composer_label(
         return (ComposerLabel::None, None);
     }
     let ri = li - 1;
-    if let (Some(t), Some(n)) = (extract_label_text(row), extract_osc_session_name(osc_title))
-        && t.split_whitespace().eq(n.split_whitespace())
-    {
+    if matches!(
+        (extract_label_text(row), extract_osc_session_name(osc_title)),
+        (Some(t), Some(n)) if t.split_whitespace().eq(n.split_whitespace())
+    ) {
         (ComposerLabel::Bound, Some(ri))
     } else {
         (ComposerLabel::Unbound, None)

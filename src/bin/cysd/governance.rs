@@ -8346,9 +8346,7 @@ fn observe_prompt_ext(s: &Arc<crate::state::Surface>, markers: &[String], want_b
         let (c_lbl, c_idx) = cys::readiness::composer_label(&content_lines, markers, osc_title);
         let (r_lbl, r_idx) = cys::readiness::composer_label(&row_refs, markers, osc_title);
         let combined = cys::readiness::combine_labels(c_lbl, r_lbl);
-        if combined == cys::readiness::ComposerLabel::Bound
-            && let (Some(ci), Some(ri)) = (c_idx, r_idx)
-        {
+        if let (cys::readiness::ComposerLabel::Bound, Some(ci), Some(ri)) = (combined, c_idx, r_idx) {
             let c_plain = cys::readiness::plain_rule_for_bound_row(content_lines[ci]);
             let trailing_nl = contents.ends_with('\n');
             let mut rebuilt: String = content_lines
@@ -22083,7 +22081,7 @@ mod tests {
         let (_daemon, s) = marker_seat("p7-v-bound");
         p1_measured(&s);
         let title = "SESSION_STATE.md 기반 master 컨텍스트 복원";
-        let top = format!("────────────────────────────────────── {title} ─");
+        let top = format!("─────────────────────────────────── {title} ─");
         p7_paint_titled_box(&s, &top, &format!("✳ {title}"), true, "", false);
         let obs = super::observe_prompt(&s, &["❯".to_string()]);
         assert_eq!(obs.label, cys::readiness::ComposerLabel::Bound);
@@ -22280,7 +22278,7 @@ mod tests {
 
         // Transition false -> true (agent relaunched and observed by watchdog)
         s.agent_exit_notified.store(false, AtomicOrdering::Relaxed);
-        s.seat_cache.store(SeatState::Idle.as_u8(), AtomicOrdering::Relaxed);
+        s.seat_cache.store(SeatState::Occupied.as_u8(), AtomicOrdering::Relaxed);
         assert!(crate::alert_route::seat_is_agent_backed(&s));
         assert_eq!(super::observe_prompt(&s, &["❯".to_string()]).label, cys::readiness::ComposerLabel::Unbound);
         assert_eq!(super::draft_gate(&daemon, &s, DirectSendKind::Text), Some(DraftGateDenied::ScreenOccupied));
@@ -22293,7 +22291,7 @@ mod tests {
         let pack = empty_pack_dir("p7-q-bound");
         let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap()), ("CYS_QUEUE_STARVE_ALERT_SECS", "0")]);
         let title = "SESSION_STATE.md 기반 master 컨텍스트 복원";
-        let top = format!("────────────────────────────────────── {title} ─");
+        let top = format!("─────────────────────────────────── {title} ─");
         for alt in [false, true] {
             let (daemon, s) = p1_seat(if alt { "p7-q-bound-alt" } else { "p7-q-bound-inline" });
             p7_paint_titled_box(&s, &top, &format!("✳ {title}"), true, "", alt);
@@ -22646,15 +22644,9 @@ mod tests {
         p7_paint_titled_box(&s, "────────────────────────── my-title ─", "✳ my-title", true, "", false);
         assert_eq!(super::observe_prompt(&s, &["❯".to_string()]).label, cys::readiness::ComposerLabel::Bound);
         // Updating the OSC 2 title in vt100 immediately flips the next observation to Unbound, and matching OSC 2 flips back to Bound.
-        s.parser
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .process(b"\x1b]2;\xe2\x9c\xb3 new-title\x07");
+        p7_set_osc_title(&s, "✳ new-title");
         assert_eq!(super::observe_prompt(&s, &["❯".to_string()]).label, cys::readiness::ComposerLabel::Unbound);
-        s.parser
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .process(b"\x1b]2;\xe2\x9d\x90 my-title\x07");
+        p7_set_osc_title(&s, "◐ my-title");
         assert_eq!(super::observe_prompt(&s, &["❯".to_string()]).label, cys::readiness::ComposerLabel::Bound);
         crate::state::p1_e0_stop_daemon(&_daemon);
     }
@@ -22981,10 +22973,11 @@ mod tests {
         p1_measured(&s);
         p7_paint_titled_box(&s, "────────────────────────── my-title ─", "✳ other-title", false, "", false);
         assert_eq!(super::draft_gate(&daemon, &s, DirectSendKind::CancelKey), None, "CancelKey with 0 human bytes stays open on Unbound");
+        s.set_pending_input(3);
         s.pending_input.lock().unwrap().human = 3;
         assert_eq!(
             super::draft_gate(&daemon, &s, DirectSendKind::CancelKey),
-            Some(DraftGateDenied::HumanBytesPending(3)),
+            Some(DraftGateDenied::HumanDraft { bytes: 3 }),
             "CancelKey with human bytes still refuses on Unbound"
         );
         crate::state::p1_e0_stop_daemon(&daemon);
