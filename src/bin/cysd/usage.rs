@@ -5006,6 +5006,10 @@ mod tests {
             let mut cmd = std::process::Command::new(exe);
             cmd.args([filter.as_str(), "--test-threads=1", "--nocapture"]);
             p11_isolate_helper_env(&mut cmd, &filter, &home);
+            // 검체 T20 전용(impl-r3 m1): 소유자가 잡은 장벽 — 중첩 자식은 그 파일이 생길 때까지 끝나지 않는다.
+            if let Some(b) = std::env::var_os("CYS_P11_NESTED_HOLD_UNTIL") {
+                cmd.env("CYS_P11_HOLD_UNTIL", b);
+            }
             cmd.env("CYS_P11_HOLD_RW", nested_path)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
@@ -5034,6 +5038,15 @@ mod tests {
         let _ = out.flush();
         let mut buf = [0u8; 1];
         let _ = std::io::stdin().read(&mut buf);
+        // impl-r3 m1: 장벽이 있으면 stdin 이 닫혀도 그 파일이 생길 때까지(상한 30 s) 살아 있는다 — 소유자가 신원을 잡고
+        // 살아 있음을 확인한 뒤에야 풀어 준다.
+        if let Some(b) = std::env::var_os("CYS_P11_HOLD_UNTIL") {
+            let b = PathBuf::from(b);
+            let started = std::time::Instant::now();
+            while !b.exists() && started.elapsed() < Duration::from_secs(30) {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
         if let Some(mut ch) = nested {
             p11_end_child(&mut ch);
         }
@@ -6161,11 +6174,40 @@ mod tests {
         holder_b: Option<P11FakeNative>,
     }
 
+    /// 구성 중 소유(impl-r3 m1) — 좌석은 만들어지는 즉시, 임시 디렉터리는 시작부터 여기 들어간다. 구성이 중간에 실패해
+    /// 풀리면 Drop 이 그때까지 얻은 좌석 자식을 끝내고 디렉터리를 지운다(가짜 네이티브는 제 지역 변수 Drop 이 상한 안에
+    /// 거둔다). 구성이 끝나면 `disarm` 으로 소유를 구성체에 넘긴다.
+    #[cfg(not(windows))]
+    struct P11ConstructionGuard {
+        td: Option<PathBuf>,
+        seats: Vec<Arc<Surface>>,
+    }
+
+    #[cfg(not(windows))]
+    impl P11ConstructionGuard {
+        fn disarm(&mut self) -> (PathBuf, Vec<Arc<Surface>>) {
+            (self.td.take().expect("construction guard already disarmed"), std::mem::take(&mut self.seats))
+        }
+    }
+
+    #[cfg(not(windows))]
+    impl Drop for P11ConstructionGuard {
+        fn drop(&mut self) {
+            for s in &self.seats {
+                let _ = s.child.lock().unwrap_or_else(|e| e.into_inner()).kill();
+            }
+            if let Some(td) = self.td.take() {
+                let _ = std::fs::remove_dir_all(&td);
+            }
+        }
+    }
+
     #[cfg(not(windows))]
     impl P11StallFixture {
         fn new(tag: &str, filter: &str) -> Self {
             let td = std::env::temp_dir().join(format!("cys-p11-{tag}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&td);
+            let mut guard = P11ConstructionGuard { td: Some(td.clone()), seats: Vec::new() };
             let sessions = td.join("sessions");
             let pin_a = p11_write_rollout(
                 &sessions,
@@ -6187,7 +6229,7 @@ mod tests {
             std::fs::write(&claude_tx, "").unwrap();
             let pidfile = td.join("probe-pids");
             let d = tick_daemon(&format!("p11-{tag}"));
-            let seat = |agent: &str, bin: &str| {
+            let mut seat = |agent: &str, bin: &str| {
                 let s = d
                     .create_surface(
                         Some(td.to_string_lossy().into_owned()),
@@ -6198,6 +6240,7 @@ mod tests {
                         80,
                     )
                     .expect("create surface");
+                guard.seats.push(s.clone()); // m1: 얻는 즉시 소유
                 *s.agent_meta.lock().unwrap() = Some((agent.into(), bin.into()));
                 d.surfaces.lock().unwrap().insert(s.id, s.clone());
                 s
@@ -6214,6 +6257,8 @@ mod tests {
                 pidfile.to_string_lossy().into_owned(),
             ];
             let seam_seats = [(ca.id, now - 3600.0), (cb.id, now - 3600.0)];
+            // 여기서부터 정리는 구성체의 Drop 이 맡는다(같은 좌석·같은 디렉터리).
+            let (td, _owned) = guard.disarm();
             Self {
                 ledger: P11ProbeLedger::new(pidfile),
                 td,
@@ -6478,6 +6523,131 @@ mod tests {
         drop(rt);
     }
 
+    /// T24 (impl-r3 m2): current-thread 런타임에서도 멈춘 증명이 런타임을 붙잡지 않는다. T19 와 같은 수집기 루프
+    /// (`usage_collector_loop`)를 current-thread 런타임에 올리고, 그 런타임을 **전용 구동 스레드**가 `block_on` 으로 계속
+    /// 돌린다(current-thread 는 block_on 하는 스레드에서만 태스크가 돈다). 검체 스레드는 T19 처럼 바깥에서 박동을 센다 —
+    /// 틱이 구동 스레드 위에서 돌면(옛 배선) 그 구간 박동은 0 에 가깝다. 이음매는 구동 스레드에 직접, 블로킹 풀 스레드에는
+    /// `on_thread_start` 로 건다.
+    #[cfg(not(windows))]
+    #[test]
+    fn p11_t24_probe_stall_does_not_hold_a_current_thread_runtime() {
+        if std::env::var_os("CYS_P11_HELPER_MODE").is_some() {
+            p11_child_helper_entry();
+            return;
+        }
+        use std::sync::atomic::AtomicU64;
+        const BOUND: Duration = Duration::from_secs(40);
+        const WINDOW: Duration = Duration::from_secs(1);
+        const MIN_BEATS: u64 = 10;
+        let filter = "usage::tests::p11_t24_probe_stall_does_not_hold_a_current_thread_runtime";
+        let mut fx = P11StallFixture::new("t24", filter);
+        let witness = Arc::new(std::sync::Mutex::new(super::p11_tick_witness::Witness::default()));
+        let install = {
+            let (argv, seam_seats, w) = (fx.argv.clone(), fx.seam_seats, Arc::clone(&witness));
+            move || {
+                for (id, created) in seam_seats {
+                    super::p11_seat_seam::set(id, std::process::id(), created);
+                }
+                super::p11_lsof_seam::set(Some(argv.clone()));
+                super::p11_tick_witness::share(Some(Arc::clone(&w)));
+            }
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .on_thread_start(install.clone())
+            .build()
+            .expect("current-thread runtime");
+        let beats = Arc::new(AtomicU64::new(0));
+        let b2 = Arc::clone(&beats);
+        let mut st = super::CollectorState::default();
+        st.tails = fx.seeded_tails();
+        st.ext.last_sweep = now_epoch() + 3600.0; // 외부 세션 훑기 생략(HOME 을 읽지 않는다)
+        let d2 = fx.d.clone();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let driver = std::thread::Builder::new()
+            .name("p11-t24-driver".into())
+            .spawn(move || {
+                install(); // 구동 스레드 자신(옛 배선이면 틱이 여기서 돈다)
+                rt.block_on(async move {
+                    let _beat = tokio::spawn(async move {
+                        loop {
+                            tokio::time::sleep(Duration::from_millis(2)).await;
+                            b2.fetch_add(1, Ordering::Relaxed);
+                        }
+                    });
+                    let _collector = tokio::spawn(super::usage_collector_loop(d2, st));
+                    let _ = stop_rx.await;
+                });
+                rt.shutdown_timeout(Duration::from_secs(10));
+                let _ = done_tx.send(());
+            })
+            .expect("spawn driver thread"); // wallclock: guard thread creation does not depend on time; the 2 ms sleep above is the heartbeat inside the driver, not a premise of this expect
+        // 실패 경로에서도 구동 스레드를 멈춘다(우리 증명 자식은 구성체 Drop 이 끝낸다 · 런타임은 시한 있는 종료).
+        struct Stop(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+        let stop = Stop(Some(stop_tx));
+        let started = std::time::Instant::now();
+        let probe_started = loop { // wallclock: guard the precondition wait; the verdict is the beat count below
+            if !fx.ledger.scan().is_empty() {
+                break true;
+            }
+            if started.elapsed() >= BOUND {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(probe_started, "precondition: no probe child started within {BOUND:?}"); // wallclock: guard the 40 s only ends a hang; the loop's first tick is guaranteed to start the probe child after its 2 s poll sleep
+        let b0 = beats.load(Ordering::Relaxed);
+        std::thread::sleep(WINDOW);
+        let b1 = beats.load(Ordering::Relaxed);
+        let alive_after_window = fx.ledger.remaining().len();
+        let w = loop { // wallclock: guard the tick-completion wait; the verdicts are the assertions below
+            let snap = witness.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if snap.pumped >= 1 || started.elapsed() >= BOUND {
+                break snap;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let pids = fx.ledger.scan();
+        drop(stop);
+        let driver_done = done_rx.recv_timeout(Duration::from_secs(20)).is_ok();
+        if driver_done {
+            let _ = driver.join();
+        }
+        assert!(
+            alive_after_window >= 1,
+            "precondition: the observation window must lie inside a probe stall, but no probe child was alive at its end"
+        );
+        assert!( // wallclock: aging the 1 s window is a deliberate measurement premise: a free current-thread runtime gives hundreds of 2 ms beats, a held one 0-1; a machine too loaded to give 10 beats in 1 s reads as a hold
+            b1 - b0 >= MIN_BEATS,
+            "an independent async task advanced only {} times in {WINDOW:?} while the probe stalled on a current-thread \
+             runtime - the collector tick holds the runtime's only thread (impl-r3 m2)",
+            b1 - b0
+        );
+        assert_eq!(w.pumped, 1, "the first collector tick did not reach cycle_jobs::pump within {BOUND:?}: {w:?}");
+        assert_eq!(pids.len(), 2, "precondition: each codex seat must have started one probe child, got {pids:?}");
+        let remaining = fx.ledger.remaining();
+        assert!(
+            remaining.is_empty(),
+            "probe children still exist after the tick (pid, rc, errno): {remaining:?} - not killed, or killed but not reaped"
+        );
+        let want = fx.seat_ids_sorted();
+        let mut collected = w.collected.clone();
+        collected.sort_unstable();
+        assert_eq!(collected, want, "the tick did not collect every seat: {w:?}");
+        let mut guarded = w.guarded.clone();
+        guarded.sort_unstable();
+        assert_eq!(guarded, want, "ctx_guard_tick did not run for every seat: {w:?}");
+        assert!(driver_done, "the current-thread driver did not stop within 20 s after the stop signal");
+    }
+
     /// T20 (impl-r2 g4): 바깥 가짜 네이티브가 중첩 자식을 띄운 뒤 READY 전에 죽어도 소유자는 그 중첩 자식을 안다(뜨자마자
     /// 알린 pid + 시작 시각) — 그리고 Drop 뒤 그 자식은 없다. 'None = 중첩 자식 없음' 으로 읽지 않는다.
     #[cfg(not(windows))]
@@ -6493,6 +6663,9 @@ mod tests {
         std::fs::create_dir_all(&td).unwrap();
         let nested_rw = td.join("nested.rw");
         std::fs::write(&nested_rw, "").unwrap();
+        // impl-r3 m1: 중첩 자식은 이 장벽 파일이 생길 때까지 살아 있는다 — 신원 포착이 경주가 아니게 한다.
+        let barrier = td.join("release-nested");
+        let barrier_s = barrier.to_string_lossy().into_owned();
         let r = P11FakeNative::try_spawn(
             &td,
             "t20",
@@ -6500,7 +6673,7 @@ mod tests {
             None,
             None,
             Some(&nested_rw),
-            &[("CYS_P11_FAIL_AFTER_NESTED", "1")],
+            &[("CYS_P11_FAIL_AFTER_NESTED", "1"), ("CYS_P11_NESTED_HOLD_UNTIL", barrier_s.as_str())],
         );
         let (err, me) = match r {
             Ok(me) => {
@@ -6513,10 +6686,23 @@ mod tests {
         assert!(err.contains("exited before"), "precondition: the outer fixture must die before READY, got {err:?}");
         let nested = me.nested();
         let Some((npid, nstart)) = nested else {
+            let _ = std::fs::write(&barrier, "");
             drop(me);
             let _ = std::fs::remove_dir_all(&td);
             panic!("the outer fixture died before READY after spawning its nested child, but the owner does not know that child");
         };
+        // 장벽이 쥐고 있으므로 중첩 자식은 아직 살아 있어야 한다(양성 대조) — 그 신원이 지금 신원과 같아야 한다.
+        let alive = unsafe { libc::kill(npid as libc::pid_t, 0) } == 0;
+        let same = nstart.is_some() && p11_proc_start(npid) == nstart;
+        let _ = std::fs::write(&barrier, ""); // 풀어 준다 — 이제 중첩 자식은 stdin EOF 로 스스로 끝난다
+        if !alive || !same {
+            drop(me);
+            let _ = std::fs::remove_dir_all(&td);
+            panic!(
+                "precondition: the owner-held nested child {npid} must be alive with the captured identity \
+                 (alive {alive}, captured {nstart:?}, same {same})"
+            );
+        }
         assert!(nstart.is_some(), "the nested child's identity (start time) was not captured when its pid arrived");
         drop(me); // 단언 상태(패닉 아님)의 Drop: 바깥 자식 종료와 중첩 자식 소멸을 단언한다.
         let rc = unsafe { libc::kill(npid as libc::pid_t, 0) };
