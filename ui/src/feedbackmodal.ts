@@ -73,6 +73,32 @@ interface BundleReport {
 
 let feedbackOpen = false;
 
+// F58 C4-b(DESIGN-F58-r1 C4-b): 작성 칸 맨 앞의 첫 줄 · [자비스에게 맡길 문장 복사] · 자가 수리 기록 위치.
+// 사람은 거절되지 않는다 — 보내기 판정(canSubmit)은 이것과 무관하다. 클립보드만 쓴다(데몬·에이전트 호출 0).
+export const SELF_SERVICE_FIRST_LINE = "먼저 자비스에게 맡겨 보셨나요? 대부분은 자비스가 직접 고칩니다.";
+export const SELF_SERVICE_COPY_LABEL = "자비스에게 맡길 문장 복사";
+export const SELF_SERVICE_HINT =
+  "자비스가 만든 자가 수리 기록: ~/.cys/local/self-service/<최근>/ (vendor-report.txt · attempts.json 을 첨부하세요)";
+
+/** 「자비스, 이 문제를 직접 고쳐 줘: <설명 첫 줄>」 — 첫 줄 = 비어 있지 않은 첫 줄(앞뒤 공백 제거). */
+export function selfServiceSentence(desc: string): string {
+  const first = desc
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .find((l) => l.length > 0);
+  return "자비스, 이 문제를 직접 고쳐 줘: " + (first ?? "");
+}
+
+/** 맡길 문장을 클립보드에 쓴다. 클립보드가 없으면 거절로 끝난다 — 창이 상태줄에 문장을 보여 준다. */
+export function copySelfServiceSentence(
+  desc: string,
+  clip: { writeText: (s: string) => Promise<void> } | null | undefined,
+): Promise<string> {
+  const s = selfServiceSentence(desc);
+  if (!clip || typeof clip.writeText !== "function") return Promise.reject(new Error("clipboard unavailable"));
+  return clip.writeText(s).then(() => s);
+}
+
 const BUTTON_HTML =
   '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/><path d="M8 9h8M8 13h5"/></svg>' +
   "<span>피드백 보내기</span>";
@@ -94,6 +120,9 @@ const MODAL_HTML =
   '<div class="modal feedback-modal" role="dialog" aria-modal="true" aria-labelledby="fb-title">' +
   '<div class="fb-head"><h3 id="fb-title">피드백 보내기</h3><button type="button" class="fb-x" aria-label="닫기">×</button></div>' +
   '<div class="fb-compose">' +
+  '<div class="fb-ss"><p class="fb-ss-line"></p>' +
+  '<button type="button" class="fb-btn fb-ss-copy"></button>' +
+  '<p class="fb-ss-hint"></p></div>' +
   '<p class="fb-intro">불편한 점이나 바라는 점을 알려 주세요. 사진·영상을 함께 넣어 주시면 더 빨리 고칠 수 있습니다.</p>' +
   '<textarea class="modal-input fb-desc" rows="6" maxlength="10000" placeholder="무엇을 하다가 어떤 일이 있었나요? (필수)"></textarea>' +
   '<div class="fb-drop"><div class="fb-drop-row"><span class="fb-drop-hint"></span>' +
@@ -172,6 +201,7 @@ async function runFeedbackModal(deps: FeedbackDeps): Promise<void> {
   const closeBtn = q<HTMLButtonElement>(".fb-close");
   const mailAppBtn = q<HTMLButtonElement>(".fb-mailapp");
   const folderBtn = q<HTMLButtonElement>(".fb-folder");
+  const ssCopyBtn = q<HTMLButtonElement>(".fb-ss-copy");
 
   // 고정 틀 밖의 문구는 textContent 로만 넣는다(사용자·플랫폼 값이 innerHTML 에 닿지 않게).
   const pasteKey = deps.platform === "mac" ? "⌘V" : "Ctrl+V";
@@ -179,6 +209,9 @@ async function runFeedbackModal(deps: FeedbackDeps): Promise<void> {
   q<HTMLElement>(".fb-tip").textContent = captureTips(deps.platform);
   q<HTMLElement>(".fb-privacy-body").textContent = FEEDBACK_PRIVACY_NOTICE;
   fileInput.accept = FEEDBACK_ALLOWED_EXT.map((e) => "." + e).join(",");
+  q<HTMLElement>(".fb-ss-line").textContent = SELF_SERVICE_FIRST_LINE;
+  ssCopyBtn.textContent = SELF_SERVICE_COPY_LABEL;
+  q<HTMLElement>(".fb-ss-hint").textContent = SELF_SERVICE_HINT;
 
   let atts: Attachment[] = [];
   let pending = 0;
@@ -478,6 +511,12 @@ async function runFeedbackModal(deps: FeedbackDeps): Promise<void> {
   };
 
   // ── 배선 ──
+  ssCopyBtn.addEventListener("click", () => {
+    void copySelfServiceSentence(desc.value, navigator.clipboard).then(
+      (s) => setStatus(`자비스에게 맡길 문장을 복사했습니다: ${s}`, "ok"),
+      () => setStatus(`복사하지 못했습니다 — 이 문장을 자비스에게 직접 보내 주세요: ${selfServiceSentence(desc.value)}`, "error"),
+    );
+  });
   desc.addEventListener("input", refresh);
   sendBtn.addEventListener("click", () => void submit());
   q<HTMLButtonElement>(".fb-cancel").addEventListener("click", requestClose);

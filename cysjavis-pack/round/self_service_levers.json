@@ -1,0 +1,1602 @@
+{
+ "schema": 1,
+ "classes": {
+  "T1": "setting",
+  "T2": "pack file state",
+  "T3": "seat or queue state",
+  "T4": "user's own script, job or hook",
+  "T5": "missing feature -> build in user space",
+  "T6": "defect in a product binary -> mitigate first",
+  "T7": "signing, installer or OS policy -> keep the working version"
+ },
+ "probes": {},
+ "entries": [
+  {
+   "id": "g1-r01-1",
+   "source_rows": [
+    "G1 R01-1"
+   ],
+   "title": "dismiss cancels an active cycle-verify job",
+   "match": [
+    "cancels",
+    "active",
+    "cycle-verify"
+   ],
+   "verdict": "self_mitigable_product_defect",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "defect_probe": "none",
+   "defect_probe_reason": "no deterministic defect probe derivable from the classified report (P-6); value is unknown, so a mitigation that restores the symptom ends in mitigated_with_residual, never fixed, until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T3",
+     "action": "`cys cycle-agent` again for the cancelled seat; the Jarvis answers its own verify cards (it is the verifier)",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "r01-2",
+   "source_rows": [
+    "R01-2"
+   ],
+   "title": "RPC path open",
+   "match": [
+    "rpc path",
+    "open"
+   ],
+   "verdict": "product_defect_no_lever",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "defect_probe": "none",
+   "defect_probe_reason": "no deterministic defect probe derivable from the classified report (P-6); value is unknown, so a mitigation that restores the symptom ends in mitigated_with_residual, never fixed, until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T3",
+     "action": "same as R01-1",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "r02-1",
+   "source_rows": [
+    "R02-1"
+   ],
+   "title": "rate_limited re-alerts on a static help line",
+   "match": [
+    "rate_limited",
+    "static",
+    "help line"
+   ],
+   "verdict": "self_mitigable_product_defect",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "defect_probe": "none",
+   "defect_probe_reason": "no deterministic defect probe derivable from the classified report (P-6); value is unknown, so a mitigation that restores the symptom ends in mitigated_with_residual, never fixed, until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T4",
+     "action": "a local skill or hook with a deterministic classifier (the user already built one, which handled 63 of 129); clear the codex `/status` footer from the screen after reading",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "r02-2",
+   "source_rows": [
+    "R02-2"
+   ],
+   "title": "no command to disable built-in rules",
+   "match": [
+    "disable",
+    "built-in"
+   ],
+   "verdict": "product_defect_no_lever",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "defect_probe": "none",
+   "defect_probe_reason": "no deterministic defect probe derivable from the classified report (P-6); value is unknown, so a mitigation that restores the symptom ends in mitigated_with_residual, never fixed, until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T4",
+     "action": "as R02-1",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "r02-3",
+   "source_rows": [
+    "R02-3"
+   ],
+   "title": "ui-help suppression reason",
+   "match": [
+    "ui-help",
+    "suppression"
+   ],
+   "verdict": "product_defect_no_lever",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "defect_probe": "none",
+   "defect_probe_reason": "no deterministic defect probe derivable from the classified report (P-6); value is unknown, so a mitigation that restores the symptom ends in mitigated_with_residual, never fixed, until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T4",
+     "action": "as R02-1",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "r03",
+   "source_rows": [
+    "R03"
+   ],
+   "title": "rc=85 with 0 human bytes (fused divider)",
+   "match": [
+    "human",
+    "bytes",
+    "fused divider"
+   ],
+   "verdict": "self_mitigable_product_defect",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "defect_probe": "none",
+   "defect_probe_reason": "no deterministic defect probe derivable from the classified report (P-6); value is unknown, so a mitigation that restores the symptom ends in mitigated_with_residual, never fixed, until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T1",
+     "action": "`agents.json` `prompt_marker` change (the user's own measured workaround in G2-A; user class, so it survives updates); re-run `cys cycle-agent`",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "r04-1-2",
+   "source_rows": [
+    "R04-1/2"
+   ],
+   "title": "dismissed vs refused labels",
+   "match": [
+    "dismissed",
+    "labels"
+   ],
+   "verdict": "self_mitigable_product_defect",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "defect_probe": "none",
+   "defect_probe_reason": "no deterministic defect probe derivable from the classified report (P-6); value is unknown, so a mitigation that restores the symptom ends in mitigated_with_residual, never fixed, until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T4",
+     "action": "edit the user's own verifier script, which skips manual-cycle requests (that is why they close as dismissed)",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "r05-1",
+   "source_rows": [
+    "R05-1"
+   ],
+   "title": "phoenix UNVERIFIED while master busy",
+   "match": [
+    "unverified",
+    "phoenix unverified"
+   ],
+   "verdict": "self_mitigable_product_defect",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "defect_probe": "none",
+   "defect_probe_reason": "no deterministic defect probe derivable from the classified report (P-6); value is unknown, so a mitigation that restores the symptom ends in mitigated_with_residual, never fixed, until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T4",
+     "action": "the user's boot script checks `completeness` + `awakened_at` (they already do); on 0.14.56+ a `phoenix-allow.sha256` pre-restore script",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "r05-2",
+   "source_rows": [
+    "R05-2"
+   ],
+   "title": "phoenix ping blocked by the user's ACL",
+   "match": [
+    "ping",
+    "blocked",
+    "user's acl"
+   ],
+   "verdict": "product_defect_no_lever",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "defect_probe": "none",
+   "defect_probe_reason": "no deterministic defect probe derivable from the classified report (P-6); value is unknown, so a mitigation that restores the symptom ends in mitigated_with_residual, never fixed, until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T4",
+     "action": "keep the ACL; local labeling in the boot script",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "r05-3",
+   "source_rows": [
+    "R05-3"
+   ],
+   "title": "agy ACK not counted",
+   "match": [
+    "counted",
+    "agy ack"
+   ],
+   "verdict": "product_defect_no_lever",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "defect_probe": "none",
+   "defect_probe_reason": "no deterministic defect probe derivable from the classified report (P-6); value is unknown, so a mitigation that restores the symptom ends in mitigated_with_residual, never fixed, until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T4",
+     "action": "local record",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "r06",
+   "source_rows": [
+    "R06"
+   ],
+   "title": "two role=master seats after reboot",
+   "match": [
+    "role=master",
+    "reboot"
+   ],
+   "verdict": "self_fixable",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T4",
+     "action": "edit the user's boot script (wait for `boot_epoch == started_at`, as they did); close the extra seat (`cys kill` on the duplicate after reading both)",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "r07-1",
+   "source_rows": [
+    "R07-1"
+   ],
+   "title": "verifier restored as a Claude seat",
+   "match": [
+    "restored",
+    "claude seat"
+   ],
+   "verdict": "self_mitigable_product_defect",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "defect_probe": "none",
+   "defect_probe_reason": "no deterministic defect probe derivable from the classified report (P-6); value is unknown, so a mitigation that restores the symptom ends in mitigated_with_residual, never fixed, until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T3",
+     "action": "`cys tombstone cycle-verifier`; on 0.14.56+ a `phoenix-allow.sha256` pre-restore script that removes the agentless entry",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "r07-2",
+   "source_rows": [
+    "R07-2"
+   ],
+   "title": "tombstone erased by verifier creation",
+   "match": [
+    "tombstone",
+    "erased",
+    "creation"
+   ],
+   "verdict": "product_defect_no_lever",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "defect_probe": "none",
+   "defect_probe_reason": "no deterministic defect probe derivable from the classified report (P-6); value is unknown, so a mitigation that restores the symptom ends in mitigated_with_residual, never fixed, until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T4",
+     "action": "`cys schedule add` a re-tombstone job (user job)",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "r07-3",
+   "source_rows": [
+    "R07-3"
+   ],
+   "title": "list shows exited=false after kill",
+   "match": [
+    "exited=false",
+    "shows exited=false"
+   ],
+   "verdict": "self_mitigable_product_defect",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "defect_probe": "none",
+   "defect_probe_reason": "no deterministic defect probe derivable from the classified report (P-6); value is unknown, so a mitigation that restores the symptom ends in mitigated_with_residual, never fixed, until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T4",
+     "action": "retry with a wait in the user's script",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "r08",
+   "source_rows": [
+    "R08"
+   ],
+   "title": "codex usage stale",
+   "match": [
+    "usage stale",
+    "codex usage"
+   ],
+   "verdict": "self_mitigable_product_defect",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "defect_probe": "none",
+   "defect_probe_reason": "no deterministic defect probe derivable from the classified report (P-6); value is unknown, so a mitigation that restores the symptom ends in mitigated_with_residual, never fixed, until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T4",
+     "action": "`cys schedule add` a /status read job (the user's own workaround)",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "r09",
+   "source_rows": [
+    "R09"
+   ],
+   "title": "top-bar user buttons (feature)",
+   "match": [
+    "top-bar",
+    "buttons"
+   ],
+   "verdict": "self_fixable",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T5",
+     "action": "build it in user space (local web page, opened from a user skill or job); avoid the debugging-port injection the user called fragile",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "r10-a",
+   "source_rows": [
+    "R10-A"
+   ],
+   "title": "two worker seats after an update restart",
+   "match": [
+    "two worker",
+    "worker seats"
+   ],
+   "verdict": "self_mitigable_product_defect",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "defect_probe": "none",
+   "defect_probe_reason": "no deterministic defect probe derivable from the classified report (P-6); value is unknown, so a mitigation that restores the symptom ends in mitigated_with_residual, never fixed, until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T3",
+     "action": "read both seats; `cys tombstone worker-2`",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "r10-b",
+   "source_rows": [
+    "R10-B"
+   ],
+   "title": "codex `resume --last` typed into the TUI and identity inheritance",
+   "match": [
+    "resume",
+    "--last",
+    "typed",
+    "identity"
+   ],
+   "verdict": "self_mitigable_product_defect",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "defect_probe": "none",
+   "defect_probe_reason": "no deterministic defect probe derivable from the classified report (P-6); value is unknown, so a mitigation that restores the symptom ends in mitigated_with_residual, never fixed, until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T1",
+     "action": "`agents.json` codex adapter: add `--no-daemon` (the user measured that it fixes identity inheritance; user class)",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "r11",
+   "source_rows": [
+    "R11"
+   ],
+   "title": "safety: directive pasted into a bare shell",
+   "match": [
+    "safety",
+    "bare"
+   ],
+   "verdict": "self_mitigable_product_defect",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "defect_probe": "none",
+   "defect_probe_reason": "no deterministic defect probe derivable from the classified report (P-6); value is unknown, so a mitigation that restores the symptom ends in mitigated_with_residual, never fixed, until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T3",
+     "action": "close the shell seat; the user's boot script checks network before launching codex; `agents.json` `inject_delay_secs` reviewed",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "r11-11",
+   "source_rows": [
+    "R11-11"
+   ],
+   "title": "health re-alerts per redraw",
+   "match": [
+    "health",
+    "redraw"
+   ],
+   "verdict": "self_mitigable_product_defect",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "defect_probe": "none",
+   "defect_probe_reason": "no deterministic defect probe derivable from the classified report (P-6); value is unknown, so a mitigation that restores the symptom ends in mitigated_with_residual, never fixed, until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T4",
+     "action": "as R02-1",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "r11-12",
+   "source_rows": [
+    "R11-12"
+   ],
+   "title": "transcripts.db 1.66 GB",
+   "match": [
+    "transcripts.db",
+    "1.66"
+   ],
+   "verdict": "product_defect_no_lever",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "defect_probe": "none",
+   "defect_probe_reason": "no deterministic defect probe derivable from the classified report (P-6); value is unknown, so a mitigation that restores the symptom ends in mitigated_with_residual, never fixed, until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T3",
+     "action": "measure per seat (read-only); restart or quiet the agy seat that redraws",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "r11-13",
+   "source_rows": [
+    "R11-13"
+   ],
+   "title": "schedule `--command` stdin invalid (WinError 6)",
+   "match": [
+    "schedule",
+    "--command",
+    "stdin",
+    "invalid"
+   ],
+   "verdict": "self_mitigable_product_defect",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "defect_probe": "none",
+   "defect_probe_reason": "no deterministic defect probe derivable from the classified report (P-6); value is unknown, so a mitigation that restores the symptom ends in mitigated_with_residual, never fixed, until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T4",
+     "action": "wrap job scripts with `stdin=DEVNULL` (the user did this for all 31 jobs)",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "r12-5",
+   "source_rows": [
+    "R12-5"
+   ],
+   "title": "pin not updated after /clear",
+   "match": [
+    "updated",
+    "/clear"
+   ],
+   "verdict": "self_mitigable_product_defect",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "defect_probe": "none",
+   "defect_probe_reason": "no deterministic defect probe derivable from the classified report (P-6); value is unknown, so a mitigation that restores the symptom ends in mitigated_with_residual, never fixed, until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T3",
+     "action": "`cys usage-register --surface <self> --transcript <new>` (G2-C's measured route)",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "r12-6",
+   "source_rows": [
+    "R12-6"
+   ],
+   "title": "codex ctx_pct null",
+   "match": [
+    "ctx_pct",
+    "codex ctx_pct"
+   ],
+   "verdict": "product_defect_no_lever",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "defect_probe": "none",
+   "defect_probe_reason": "no deterministic defect probe derivable from the classified report (P-6); value is unknown, so a mitigation that restores the symptom ends in mitigated_with_residual, never fixed, until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T4",
+     "action": "read `token_count` from the rollout in a user script",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "r12-7",
+   "source_rows": [
+    "R12-7"
+   ],
+   "title": "restore pastes the full directive into hooks seats",
+   "match": [
+    "pastes",
+    "full directive",
+    "hooks seats"
+   ],
+   "verdict": "product_defect_no_lever",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "defect_probe": "none",
+   "defect_probe_reason": "no deterministic defect probe derivable from the classified report (P-6); value is unknown, so a mitigation that restores the symptom ends in mitigated_with_residual, never fixed, until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T3",
+     "action": "use `cys reinject` per seat instead of a full `cys restore`",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "r12-8",
+   "source_rows": [
+    "R12-8"
+   ],
+   "title": "boot runs the embedded phoenix copy",
+   "match": [
+    "embedded phoenix",
+    "phoenix copy"
+   ],
+   "verdict": "self_fixable",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T4",
+     "action": "write the pre-restore script; add its hash to `~/.cys/local/phoenix-allow.sha256` (it authorizes code at boot: tell the user in one line)",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "r12-9",
+   "source_rows": [
+    "R12-9"
+   ],
+   "title": "`new-surface --cmd` gives agent null",
+   "match": [
+    "new-surface",
+    "--cmd",
+    "agent null"
+   ],
+   "verdict": "self_fixable",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T3",
+     "action": "`cys launch-agent --role … --agent claude` instead of `new-surface --cmd`",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "g2-a",
+   "source_rows": [
+    "G2-A"
+   ],
+   "title": "rc=85 fused row (0.14.56)",
+   "match": [
+    "0.14.56",
+    "rc=85 fused",
+    "fused row"
+   ],
+   "verdict": "self_mitigable_product_defect",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "defect_probe": "none",
+   "defect_probe_reason": "no deterministic defect probe derivable from the classified report (P-6); value is unknown, so a mitigation that restores the symptom ends in mitigated_with_residual, never fixed, until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T1",
+     "action": "`agents.json` `prompt_marker` (the report's NBSP workaround)",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "g2-b",
+   "source_rows": [
+    "G2-B"
+   ],
+   "title": "machine residue blocks the queue",
+   "match": [
+    "machine",
+    "residue"
+   ],
+   "verdict": "self_mitigable_product_defect",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "defect_probe": "none",
+   "defect_probe_reason": "no deterministic defect probe derivable from the classified report (P-6); value is unknown, so a mitigation that restores the symptom ends in mitigated_with_residual, never fixed, until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T3",
+     "action": "`cys send-key C-u` on the seat (residue only, 0 human bytes), then `cys queue revive`/`deliver` of that item",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "g2-c",
+   "source_rows": [
+    "G2-C"
+   ],
+   "title": "codex /new pin stuck",
+   "match": [
+    "/new",
+    "pin stuck"
+   ],
+   "verdict": "self_mitigable_product_defect",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "defect_probe": "none",
+   "defect_probe_reason": "no deterministic defect probe derivable from the classified report (P-6); value is unknown, so a mitigation that restores the symptom ends in mitigated_with_residual, never fixed, until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T3",
+     "action": "`cys usage-register --surface <self> --transcript <new rollout>`; a user job that watches for a newer rollout",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "g3",
+   "source_rows": [
+    "G3"
+   ],
+   "title": "P7 session-title label inside the divider",
+   "match": [
+    "session-title",
+    "p7 session-title"
+   ],
+   "verdict": "self_fixable",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T3",
+     "action": "`/rename ─` in that seat (measured: `DESIGN-P7-r3.md:80,89`)",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "g4-1",
+   "source_rows": [
+    "G4-1"
+   ],
+   "title": "user phoenix script never runs",
+   "match": [
+    "user phoenix",
+    "phoenix script"
+   ],
+   "verdict": "self_fixable",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T4",
+     "action": "as R12-8",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "g4-2",
+   "source_rows": [
+    "G4-2"
+   ],
+   "title": "LEASE_HELD exits 0",
+   "match": [
+    "lease_held",
+    "lease_held exits"
+   ],
+   "verdict": "self_mitigable_product_defect",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "defect_probe": "none",
+   "defect_probe_reason": "no deterministic defect probe derivable from the classified report (P-6); value is unknown, so a mitigation that restores the symptom ends in mitigated_with_residual, never fixed, until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T4",
+     "action": "the user's boot script re-checks and re-runs `javis_phoenix.py restore` once",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "g5-1",
+   "source_rows": [
+    "G5-1"
+   ],
+   "title": "tab titles do not tell same-role seats apart",
+   "match": [
+    "titles",
+    "same-role",
+    "apart"
+   ],
+   "verdict": "product_defect_no_lever",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "defect_probe": "none",
+   "defect_probe_reason": "no deterministic defect probe derivable from the classified report (P-6); value is unknown, so a mitigation that restores the symptom ends in mitigated_with_residual, never fixed, until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T3",
+     "action": "`cys set-status --task` with the seat number; local statusline tweak",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "g5-2",
+   "source_rows": [
+    "G5-2"
+   ],
+   "title": "pack lost after update restart",
+   "match": [
+    "pack lost",
+    "lost after"
+   ],
+   "verdict": "self_mitigable_product_defect",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "defect_probe": "none",
+   "defect_probe_reason": "no deterministic defect probe derivable from the classified report (P-6); value is unknown, so a mitigation that restores the symptom ends in mitigated_with_residual, never fixed, until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T2",
+     "action": "`cys pack-rollback` (from `.prev`), then verify `round/`, `soul.md`, `schedule.json`, skills and memory",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "g5-3",
+   "source_rows": [
+    "G5-3"
+   ],
+   "title": "agy statusline exit 127 (quoting)",
+   "match": [
+    "statusline",
+    "127",
+    "quoting"
+   ],
+   "verdict": "self_mitigable_product_defect",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "defect_probe": "none",
+   "defect_probe_reason": "no deterministic defect probe derivable from the classified report (P-6); value is unknown, so a mitigation that restores the symptom ends in mitigated_with_residual, never fixed, until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T1",
+     "action": "edit the agy settings (the user did)",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "g5-4",
+   "source_rows": [
+    "G5-4"
+   ],
+   "title": "agy remaining quota shown as usage",
+   "match": [
+    "remaining",
+    "quota"
+   ],
+   "verdict": "product_defect_no_lever",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "defect_probe": "none",
+   "defect_probe_reason": "no deterministic defect probe derivable from the classified report (P-6); value is unknown, so a mitigation that restores the symptom ends in mitigated_with_residual, never fixed, until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T2",
+     "action": "local note in the CSO's overlay",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "g5-5",
+   "source_rows": [
+    "G5-5"
+   ],
+   "title": "directive pasted into PowerShell",
+   "match": [
+    "powershell",
+    "into powershell"
+   ],
+   "verdict": "self_mitigable_product_defect",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "defect_probe": "none",
+   "defect_probe_reason": "no deterministic defect probe derivable from the classified report (P-6); value is unknown, so a mitigation that restores the symptom ends in mitigated_with_residual, never fixed, until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T3",
+     "action": "close the seat; `cys send-key C-c` failed, so kill the shell seat",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "g5-6",
+   "source_rows": [
+    "G5-6"
+   ],
+   "title": "close-surface refused to the creator",
+   "match": [
+    "close-surface",
+    "creator"
+   ],
+   "verdict": "product_defect_no_lever",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "defect_probe": "none",
+   "defect_probe_reason": "no deterministic defect probe derivable from the classified report (P-6); value is unknown, so a mitigation that restores the symptom ends in mitigated_with_residual, never fixed, until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T3",
+     "action": "close from master's seat",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "g5-7",
+   "source_rows": [
+    "G5-7"
+   ],
+   "title": "slash commands bundled into a digest",
+   "match": [
+    "slash",
+    "commands",
+    "bundled",
+    "digest"
+   ],
+   "verdict": "self_mitigable_product_defect",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "defect_probe": "none",
+   "defect_probe_reason": "no deterministic defect probe derivable from the classified report (P-6); value is unknown, so a mitigation that restores the symptom ends in mitigated_with_residual, never fixed, until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T3",
+     "action": "send each slash command separately with a gap",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "g6",
+   "source_rows": [
+    "G6"
+   ],
+   "title": "Smart App Control blocks the unsigned build",
+   "match": [
+    "smart",
+    "control",
+    "unsigned"
+   ],
+   "verdict": "owner_needed",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T7",
+     "action": "keep the working binary; `cys doctor` confirms the pack/binary mismatch is harmless or not",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "g7-i",
+   "source_rows": [
+    "G7-i"
+   ],
+   "title": "SAC error 4551 (0.14.45)",
+   "match": [
+    "4551",
+    "0.14.45",
+    "sac error"
+   ],
+   "verdict": "owner_needed",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T7",
+     "action": "as G6",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "g7-ii",
+   "source_rows": [
+    "G7-ii"
+   ],
+   "title": "phoenix cp949 crash",
+   "match": [
+    "cp949",
+    "phoenix cp949"
+   ],
+   "verdict": "product_defect_no_lever",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "defect_probe": "none",
+   "defect_probe_reason": "no deterministic defect probe derivable from the classified report (P-6); value is unknown, so a mitigation that restores the symptom ends in mitigated_with_residual, never fixed, until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T4",
+     "action": "at 0.14.56+: the patched logic as a `phoenix-allow` pre-restore script, where it applies. The embedded crash itself stays a product defect. **Whether `PYTHONUTF8=1` works with the bundled `python312._pth` is UNVERIFIED.**",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "g7-v",
+   "source_rows": [
+    "G7-v"
+   ],
+   "title": "pack ships a job the daemon refuses",
+   "match": [
+    "ships",
+    "refuses"
+   ],
+   "verdict": "self_fixable",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T1",
+     "action": "`cys schedule remove` the refused job; align the built-in text",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "g8",
+   "source_rows": [
+    "G8"
+   ],
+   "title": "process-overload false alarm (pastor)",
+   "match": [
+    "process-overload",
+    "pastor",
+    "false alarm"
+   ],
+   "verdict": "self_mitigable_product_defect",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "defect_probe": "none",
+   "defect_probe_reason": "no deterministic defect probe derivable from the classified report (P-6); value is unknown, so a mitigation that restores the symptom ends in mitigated_with_residual, never fixed, until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T1",
+     "action": "set `CYS_PROC_THRESHOLD` above the false count (default 50 at `state.rs:3136`) in the daemon's environment, restart the daemon at a quiet moment (ask once: the restart drops running work?)",
+     "risky": true,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "g9",
+   "source_rows": [
+    "G9"
+   ],
+   "title": "approval cwd binding",
+   "match": [
+    "approval",
+    "binding"
+   ],
+   "verdict": "self_mitigable_product_defect",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "defect_probe": "none",
+   "defect_probe_reason": "no deterministic defect probe derivable from the classified report (P-6); value is unknown, so a mitigation that restores the symptom ends in mitigated_with_residual, never fixed, until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T3",
+     "action": "sign with the executor's `--cwd` (the user's own workaround)",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "g10-1",
+   "source_rows": [
+    "G10-1"
+   ],
+   "title": "bridge truncates three.module.js after 1 d 6 h",
+   "match": [
+    "truncates",
+    "three.module.js"
+   ],
+   "verdict": "self_mitigable_product_defect",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "defect_probe": "none",
+   "defect_probe_reason": "no deterministic defect probe derivable from the classified report (P-6); value is unknown, so a mitigation that restores the symptom ends in mitigated_with_residual, never fixed, until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T6",
+     "action": "restart the bridge only (SIGTERM, as the reporter did)",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "g10-2a-2b",
+   "source_rows": [
+    "G10-2a/2b"
+   ],
+   "title": "office says bridge off / destructive banner",
+   "match": [
+    "destructive",
+    "banner",
+    "says bridge",
+    "bridge off"
+   ],
+   "verdict": "self_mitigable_product_defect",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "defect_probe": "none",
+   "defect_probe_reason": "no deterministic defect probe derivable from the classified report (P-6); value is unknown, so a mitigation that restores the symptom ends in mitigated_with_residual, never fixed, until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T2",
+     "action": "`cys pack-heal --missing-only <rel>` or `javis_preflight.py --fix`",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "g10-3",
+   "source_rows": [
+    "G10-3"
+   ],
+   "title": "dept daemon took port 8642",
+   "match": [
+    "port",
+    "8642",
+    "dept daemon",
+    "daemon took"
+   ],
+   "verdict": "product_defect_no_lever",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "defect_probe": "none",
+   "defect_probe_reason": "no deterministic defect probe derivable from the classified report (P-6); value is unknown, so a mitigation that restores the symptom ends in mitigated_with_residual, never fixed, until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T6",
+     "action": "restart order",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "g11",
+   "source_rows": [
+    "G11"
+   ],
+   "title": "dept feed items not actionable; usage panel",
+   "match": [
+    "actionable",
+    "dept feed"
+   ],
+   "verdict": "product_defect_no_lever",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "defect_probe": "none",
+   "defect_probe_reason": "no deterministic defect probe derivable from the classified report (P-6); value is unknown, so a mitigation that restores the symptom ends in mitigated_with_residual, never fixed, until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T3",
+     "action": "act in the department pane",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "g12-1-3",
+   "source_rows": [
+    "G12-1/3"
+   ],
+   "title": "account shown as code, no-observation account",
+   "match": [
+    "no-observation",
+    "no-observation account"
+   ],
+   "verdict": "product_defect_no_lever",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "defect_probe": "none",
+   "defect_probe_reason": "no deterministic defect probe derivable from the classified report (P-6); value is unknown, so a mitigation that restores the symptom ends in mitigated_with_residual, never fixed, until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T4",
+     "action": "read `usage-accounts --json` and map locally",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "g12-2",
+   "source_rows": [
+    "G12-2"
+   ],
+   "title": "stale 100% triggers a CSO alert",
+   "match": [
+    "100%",
+    "triggers",
+    "cso alert"
+   ],
+   "verdict": "self_mitigable_product_defect",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "defect_probe": "none",
+   "defect_probe_reason": "no deterministic defect probe derivable from the classified report (P-6); value is unknown, so a mitigation that restores the symptom ends in mitigated_with_residual, never fixed, until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T2",
+     "action": "a local CSO overlay line",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "g12-4",
+   "source_rows": [
+    "G12-4"
+   ],
+   "title": "one stray byte held the queue 5 h",
+   "match": [
+    "stray",
+    "one stray"
+   ],
+   "verdict": "self_fixable",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T3",
+     "action": "read the screen; if it is not the user's text: `cys send-key C-u`, then the queue drains (if it might be the user's text: ask once)",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "g13",
+   "source_rows": [
+    "G13"
+   ],
+   "title": "Claude Desktop slowdown from cys hooks",
+   "match": [
+    "desktop",
+    "cys hooks"
+   ],
+   "verdict": "self_fixable",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T1",
+     "action": "separate config (`CLAUDE_CONFIG_DIR`) or remove the cys hooks from `~/.claude/settings.json` (preflight re-adds them, so the separate dir is the durable fix)",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "g14-1",
+   "source_rows": [
+    "G14-1"
+   ],
+   "title": "false concurrent-session count (`lsof -c`)",
+   "match": [
+    "concurrent-session",
+    "lsof"
+   ],
+   "verdict": "self_mitigable_product_defect",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "defect_probe": "none",
+   "defect_probe_reason": "no deterministic defect probe derivable from the classified report (P-6); value is unknown, so a mitigation that restores the symptom ends in mitigated_with_residual, never fixed, until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T2",
+     "action": "stop-gap edit of `hooks/inject-context.sh` (kept-drift), recorded; `cys pack-merge --file hooks/inject-context.sh --propose`",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "g14-2",
+   "source_rows": [
+    "G14-2"
+   ],
+   "title": "department stuck in formation",
+   "match": [
+    "department",
+    "formation"
+   ],
+   "verdict": "self_fixable",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T1",
+     "action": "read the shipped code and docs (the gate's criteria) and adjust the resource budget setting",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "g15",
+   "source_rows": [
+    "G15"
+   ],
+   "title": "update error image (0.14.42)",
+   "match": [
+    "0.14.42",
+    "image"
+   ],
+   "verdict": "owner_needed",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T7",
+     "action": "as G6",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "g16",
+   "source_rows": [
+    "G16"
+   ],
+   "title": "slowdown after install (beginner)",
+   "match": [
+    "beginner",
+    "install"
+   ],
+   "verdict": "self_fixable",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T1",
+     "action": "`cys doctor`, process list; then `CYS_NO_AUTORESTORE` or remove background jobs (`cys schedule remove`)",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  },
+  {
+   "id": "g17",
+   "source_rows": [
+    "G17"
+   ],
+   "title": "claude CLI not found on Windows",
+   "match": [
+    "claude cli",
+    "found"
+   ],
+   "verdict": "self_fixable",
+   "symptom_probe": "none",
+   "symptom_probe_reason": "no deterministic symptom probe derivable from the classified report (P-6); value is unknown, so the tool never records success for this class until a probe is added",
+   "levers": [
+    {
+     "id": "L1",
+     "class": "T1",
+     "action": "`agents.json` `cmd` with the full path to `claude.exe` (user class)",
+     "risky": false,
+     "applicable": true,
+     "not_applicable_reason": null,
+     "readback_probe": "none"
+    }
+   ]
+  }
+ ]
+}
