@@ -24425,20 +24425,20 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
         let release_rx = std::sync::Mutex::new(release_rx);
         s.inject_track.submit_handed();
-        s.write_tx
-            .send(crate::state::WriteReq::SubmitAfterGap {
-                bytes: b"\r".to_vec(),
-                min_gap_ms: 0,
-                withhold: Some(std::sync::Arc::new(move || {
-                    let _ = entered_tx.send(());
-                    let _ = release_rx
-                        .lock()
-                        .unwrap()
-                        .recv_timeout(std::time::Duration::from_secs(5));
-                    true
-                })),
-            })
-            .unwrap();
+        s.write_tx.send(crate::state::WriteReq::SubmitAfterGap {
+            bytes: b"\r".to_vec(),
+            min_gap_ms: 0,
+            withhold: Some(std::sync::Arc::new(move || {
+                let _ = entered_tx.send(());
+                let _ = release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(5));
+                true
+            })),
+            done: None,
+        })
+        .unwrap();
         entered_rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("writer parked on barrier");
@@ -34101,7 +34101,7 @@ after-tick liveness alone does not attribute a clock defect",
         super::ResidueArmInput {
             cfg_unix: true,
             seat_agent_backed: true,
-            scope: super::SubmitGuardScope::InlineAndAlt,
+            scope: super::SubmitGuardScope::Full,
             dialog_open: false,
             d9_scope: false,
             label_unbound: false,
@@ -34939,8 +34939,8 @@ after-tick liveness alone does not attribute a clock defect",
         let _now = p10_seed_mark(&s, "M|x|AAA", 5, Some("q-k17"));
         p10_paint_inline_box(&s, "❯ M|x|AAA");
         p10_assert_positive_premise(&daemon, &s);
-
-        s.quiescing.store(true, AtomicOrdering::Relaxed);
+        let _ = crate::handlers::dispatch(&daemon, cys::Request { id: json!(1), method: "surface.quiesce".into(), params: json!({"surface_id": s.id, "on": true, "bind_owner": true}) }, Some(std::process::id()));
+        assert!(super::effective_quiescing_since(&daemon, &s).is_some(), "surface.quiesce must activate hold");
         p10_arm(&daemon, &s);
         assert!(s.inject_track.withheld().is_none());
         let _ = s.child.lock().unwrap().kill();
@@ -37129,7 +37129,7 @@ mod reflect_queue_tests {
         w.observe_dialog(Some(true), e);
         assert_eq!(w.dialog_ms, 5_000, "못 본 구간 뒤 첫 관측은 더하지 않는다: {w:?}");
         // 시계 역행(더 이른 now) — 경과 0 · 잰 시각은 뒤로 가지 않는다.
-        let before = w;
+        let before = w.clone();
         assert_eq!(w.advance(t0 + s(1), false), 0);
         assert_eq!((w.seen_at, w.live_ms), (before.seen_at, before.live_ms), "{w:?}");
     }
