@@ -2560,55 +2560,107 @@ const P11_LSOF_REAP_BUDGET: Duration = Duration::from_secs(2);
 #[cfg(not(windows))]
 const P11_LSOF_OUT_CAP: u64 = 8 * 1024 * 1024;
 /// 죽였는데 상한 안에 거두지 못한(커널 대기 등) 증명 자식이 이만큼 남아 있으면 새 증명을 띄우지 않는다(쌓임 봉쇄 · 무증명).
+///
+/// impl-r2 g3 — **복구 한계(fail-closed · 거둠 대기 목록은 두지 않는다)**: 거두지 못한 자식은 전용 스레드가 끝까지
+/// `wait` 하고, 거둔 뒤에야 계수가 줄어 증명이 다시 돈다. 그 자식이 끝내 끝나지 않거나 그 스레드조차 만들지 못하면(자식
+/// 핸들은 그때 버려지고 계수는 되돌리지 않는다) 계수는 줄지 않는다 — 상한에 닿은 뒤로는 **데몬이 다시 뜰 때까지** 주기 증명이
+/// 꺼진 채이고, 좌석은 기존 핀을 그대로 쓴다(무증명 = 핀 유지 · 수집기 틱은 계속 돈다). 버려진 핸들의 자식이 나중에 끝나면
+/// 데몬이 끝날 때까지 좀비로 남을 수 있다(많아야 이 상한만큼).
 #[cfg(not(windows))]
 const P11_LSOF_UNREAPED_MAX: usize = 2;
 #[cfg(not(windows))]
 static P11_LSOF_UNREAPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// 자식 종료를 상한 안에서 기다린다(거둠 포함) — Some = 끝났고 거뒀다.
+/// 증명 자식이 하는 일 셋(기다림·죽임·끝까지 기다림) — 프로덕션 구현은 `std::process::Child` 하나다. impl-r2 g2: 검체가
+/// '죽여도 끝내 거둬지지 않는 자식'을 꾸며 정리 예산(시한)을 결정론으로 잰다(실제 커널 대기 상태는 이식성 있게 만들 수 없다).
 #[cfg(not(windows))]
-fn p11_wait_reaped(child: &mut std::process::Child, budget: Duration) -> Option<std::process::ExitStatus> {
-    let deadline = std::time::Instant::now() + budget;
+trait P11ProbeChild: Send + 'static {
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>>;
+    fn kill(&mut self) -> std::io::Result<()>;
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus>;
+}
+
+#[cfg(not(windows))]
+impl P11ProbeChild for std::process::Child {
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        std::process::Child::try_wait(self)
+    }
+    fn kill(&mut self) -> std::io::Result<()> {
+        std::process::Child::kill(self)
+    }
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        std::process::Child::wait(self)
+    }
+}
+
+/// 정해진 시각(`until`)까지만 자식 종료를 기다린다(거둠 포함) — Some = 끝났고 거뒀다. 잠은 남은 시간을 넘지 않는다
+/// (impl-r2 g2: 단계마다 새 예산을 여는 대신 호출자가 준 절대 시한 하나를 쓴다).
+#[cfg(not(windows))]
+fn p11_wait_reaped_until<C: P11ProbeChild>(child: &mut C, until: std::time::Instant) -> Option<std::process::ExitStatus> {
     loop {
         match child.try_wait() {
             Ok(Some(st)) => return Some(st),
-            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-            _ => return None,
+            Ok(None) => {
+                let left = until.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    return None;
+                }
+                std::thread::sleep(left.min(Duration::from_millis(10)));
+            }
+            Err(_) => return None,
         }
     }
 }
 
-/// 증명 자식을 끝내고 거둔다. 상한 안에 거두지 못하면 전용 스레드가 끝까지 기다려 거두고(좀비 금지), 그동안은
-/// [`P11_LSOF_UNREAPED`] 가 새 증명을 막는다. 그 스레드조차 못 만들면 계수를 되돌리지 않는다 — 거두지 못한 자식이 남았다는
-/// 사실이 그대로 다음 증명을 막는다(무증명 = 핀 유지 · 수집기 틱은 계속 돈다).
+/// 증명 자식을 끝내고 정리 시한(`until`)까지 거둔다. 그 안에 거두지 못하면 전용 스레드가 끝까지 기다려 거두고(좀비 금지),
+/// 그동안은 `unreaped` 계수(프로덕션 = [`P11_LSOF_UNREAPED`])가 새 증명을 막는다. 그 스레드조차 못 만들면 계수를 되돌리지
+/// 않는다 — 복구 한계는 [`P11_LSOF_UNREAPED_MAX`] 의 doc(fail-closed · 데몬 재기동까지 주기 증명 꺼짐 · 핀 유지).
 #[cfg(not(windows))]
-fn p11_kill_and_reap(mut child: std::process::Child) {
+fn p11_kill_and_reap<C: P11ProbeChild>(
+    mut child: C,
+    until: std::time::Instant,
+    unreaped: &'static std::sync::atomic::AtomicUsize,
+) {
     let _ = child.kill();
-    if p11_wait_reaped(&mut child, P11_LSOF_REAP_BUDGET).is_some() {
+    if p11_wait_reaped_until(&mut child, until).is_some() {
         return;
     }
-    P11_LSOF_UNREAPED.fetch_add(1, Ordering::SeqCst);
+    unreaped.fetch_add(1, Ordering::SeqCst);
     let _ = std::thread::Builder::new().name("p11-lsof-reap".into()).spawn(move || {
         let _ = child.wait();
-        P11_LSOF_UNREAPED.fetch_sub(1, Ordering::SeqCst);
+        unreaped.fetch_sub(1, Ordering::SeqCst);
     });
 }
 
 /// P11(0.14.57 · impl-r1 F1): 증명 lsof 를 **소유한 자식**으로 상한 안에서만 돌린다(같은 파일 agy lsof 의 규율 ·
-/// `teamtoken.rs`·`agy_statusline.rs` 의 동기 자식 상한과 같은 꼴). 표준출력은 전용 스레드가 EOF 까지 비우고, 수집기는
-/// 그 EOF 를 [`P11_LSOF_TIMEOUT`] 까지만 기다린다 — 넘기면 죽이고 거둔 뒤 None. EOF 뒤 종료도 [`P11_LSOF_REAP_BUDGET`]
-/// 안에서만 기다린다. 성공 종료 ∧ 출력 상한 이내일 때만 출력을 돌려준다.
+/// `teamtoken.rs`·`agy_statusline.rs` 의 동기 자식 상한과 같은 꼴). 표준출력은 전용 스레드가 EOF 까지 비운다.
+///
+/// impl-r2 g2 — **시한은 시작 시각 하나에서 나온 절대 시각 둘이다**(단계마다 새 예산을 열지 않는다):
+/// - 증명 시한 `probe_end` = 시작(spawn 직전) + `timeout`: 그 안에 EOF **와** 종료가 둘 다 와야 한다(EOF 뒤 끝나지 않는
+///   자식도 이 시각에 죽인다).
+/// - 정리 시한 `cleanup_end` = `probe_end` + `reap_budget`: 죽인 자식을 그때까지만 거둔다 — 못 거두면 전용 스레드에 넘긴다.
+/// 그래서 이 함수가 기다리는 시간의 상한은 `timeout + reap_budget`(프로덕션 3 s + 2 s = 5 s)이다. 그 밖: spawn 자체·
+/// 마지막 잠 1회(≤ 10 ms · 남은 시간 이하)·스케줄러 지연은 벽시계 보장에 들어가지 않는다(설정된 대기 예산의 합이 5 s 다).
+/// 성공 종료 ∧ 출력 상한 이내일 때만 출력을 돌려준다.
 #[cfg(not(windows))]
-fn p11_lsof_bounded(mut cmd: std::process::Command, timeout: Duration) -> Option<Vec<u8>> {
-    if P11_LSOF_UNREAPED.load(Ordering::SeqCst) >= P11_LSOF_UNREAPED_MAX {
+fn p11_lsof_bounded(
+    mut cmd: std::process::Command,
+    timeout: Duration,
+    reap_budget: Duration,
+    unreaped: &'static std::sync::atomic::AtomicUsize,
+) -> Option<Vec<u8>> {
+    if unreaped.load(Ordering::SeqCst) >= P11_LSOF_UNREAPED_MAX {
         return None;
     }
+    let started = std::time::Instant::now();
+    let probe_end = started + timeout;
+    let cleanup_end = probe_end + reap_budget;
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
     let mut child = cmd.spawn().ok()?;
     let Some(stdout) = child.stdout.take() else {
-        p11_kill_and_reap(child);
+        p11_kill_and_reap(child, cleanup_end, unreaped);
         return None;
     };
     let (tx, rx) = std::sync::mpsc::channel::<(bool, Vec<u8>)>();
@@ -2618,18 +2670,18 @@ fn p11_lsof_bounded(mut cmd: std::process::Command, timeout: Duration) -> Option
         let _ = tx.send((ok, buf));
     });
     if reader.is_err() {
-        p11_kill_and_reap(child);
+        p11_kill_and_reap(child, cleanup_end, unreaped);
         return None;
     }
-    let (ok, buf) = match rx.recv_timeout(timeout) {
+    let (ok, buf) = match rx.recv_timeout(probe_end.saturating_duration_since(std::time::Instant::now())) {
         Ok(v) => v,
         Err(_) => {
-            p11_kill_and_reap(child);
+            p11_kill_and_reap(child, cleanup_end, unreaped);
             return None;
         }
     };
-    let Some(status) = p11_wait_reaped(&mut child, P11_LSOF_REAP_BUDGET) else {
-        p11_kill_and_reap(child);
+    let Some(status) = p11_wait_reaped_until(&mut child, probe_end) else {
+        p11_kill_and_reap(child, cleanup_end, unreaped);
         return None;
     };
     if !ok || !status.success() || buf.len() as u64 > P11_LSOF_OUT_CAP {
@@ -2662,7 +2714,7 @@ fn discover_codex_rollout_proven(surface_pid: u32, bin: &str) -> Option<PathBuf>
         cmd = fake;
     }
     // impl-r1 F1: 소유한 자식 · 시한 3초 · 넘기면 죽이고 거둔 뒤 무증명(핀 유지).
-    let out = p11_lsof_bounded(cmd, P11_LSOF_TIMEOUT)?;
+    let out = p11_lsof_bounded(cmd, P11_LSOF_TIMEOUT, P11_LSOF_REAP_BUDGET, &P11_LSOF_UNREAPED)?;
     #[cfg(test)]
     p11_post_probe_hook::run();
     let target_pid = sysinfo::Pid::from_u32(elig_pid);
@@ -6363,7 +6415,7 @@ mod tests {
             .expect("one-worker runtime");
         let beats = Arc::new(AtomicU64::new(0));
         let b2 = Arc::clone(&beats);
-        rt.spawn(async move {
+        let _beat = rt.spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(2)).await;
                 b2.fetch_add(1, Ordering::Relaxed);
@@ -6372,7 +6424,7 @@ mod tests {
         let mut st = super::CollectorState::default();
         st.tails = fx.seeded_tails();
         st.ext.last_sweep = now_epoch() + 3600.0; // 외부 세션 훑기 생략(HOME 을 읽지 않는다)
-        rt.spawn(super::usage_collector_loop(fx.d.clone(), st));
+        let _collector = rt.spawn(super::usage_collector_loop(fx.d.clone(), st));
         let rt = P11RuntimeGuard(Some(rt));
         let started = std::time::Instant::now();
         // 증명 자식이 뜰 때까지(루프 첫 잠 뒤 첫 틱) — 뜨자마자 신원을 잡는다.
@@ -6475,6 +6527,176 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&td);
         assert!(gone, "nested child {npid} still exists after the owner was dropped (rc {rc}, errno {errno:?})");
+    }
+
+    /// 죽여도 끝내 거둬지지 않는 증명 자식(impl-r2 g2·g3 검체) — `try_wait` 는 늘 None, `kill` 은 기록만, `wait` 는 풀어 줄
+    /// 때까지 선다(커널 대기에 걸린 자식의 꼴 · 실제로는 이식성 있게 만들 수 없다).
+    #[cfg(not(windows))]
+    struct P11StuckChild {
+        killed: Arc<std::sync::atomic::AtomicBool>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    #[cfg(not(windows))]
+    impl super::P11ProbeChild for P11StuckChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+            Ok(None)
+        }
+        fn kill(&mut self) -> std::io::Result<()> {
+            self.killed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+            use std::os::unix::process::ExitStatusExt;
+            let _ = self.release.recv();
+            Ok(std::process::ExitStatus::from_raw(9))
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn p11_stuck_child() -> (P11StuckChild, Arc<std::sync::atomic::AtomicBool>, std::sync::mpsc::Sender<()>) {
+        let killed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        (P11StuckChild { killed: Arc::clone(&killed), release: rx }, killed, tx)
+    }
+
+    /// 계수가 기대값이 될 때까지 상한 안에서 기다린다 — 참 = 도달.
+    #[cfg(not(windows))]
+    fn p11_wait_count(c: &std::sync::atomic::AtomicUsize, want: usize, bound: Duration) -> bool {
+        let started = std::time::Instant::now();
+        loop {
+            if c.load(Ordering::SeqCst) == want {
+                return true;
+            }
+            if started.elapsed() >= bound {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// T21 (impl-r2 g2): 출력을 닫고도(EOF) 끝나지 않는 증명 자식은 **증명 시한**(시작 + `timeout`)에 죽고 정리 시한 안에
+    /// 거둬진다. EOF 를 늦게(0.6 s) 보내 단계별 새 예산과 갈린다 — EOF 뒤 새 `timeout` 을 열면 1.6 s 에야 죽는다.
+    #[cfg(not(windows))]
+    #[test]
+    fn p11_t21_eof_without_exit_is_killed_at_the_probe_deadline() {
+        static UNREAPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        const TIMEOUT: Duration = Duration::from_millis(1000);
+        const REAP: Duration = Duration::from_millis(1000);
+        // 벽시계 여유 — 시한 뒤 죽임·거둠·스케줄러 지연(새 예산이면 0.6 s 를 넘겨 늦는다).
+        const SLACK: Duration = Duration::from_millis(400);
+        let td = std::env::temp_dir().join(format!("cys-p11-t21-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        std::fs::create_dir_all(&td).unwrap();
+        let pidfile = td.join("probe-pids");
+        let mut ledger = P11ProbeLedger::new(pidfile.clone());
+        let pf = pidfile.to_string_lossy().into_owned();
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args([
+            "-c",
+            "echo $$ >> \"$0\"; /bin/sleep 0.6; exec >&-; exec /bin/sleep 3600",
+            pf.as_str(),
+        ])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin");
+        let started = std::time::Instant::now();
+        let out = super::p11_lsof_bounded(cmd, TIMEOUT, REAP, &UNREAPED);
+        let elapsed = started.elapsed();
+        let pids = ledger.scan();
+        let remaining = ledger.remaining();
+        let _ = std::fs::remove_dir_all(&td);
+        assert_eq!(pids.len(), 1, "precondition: the probe child must have started once, got {pids:?}");
+        assert_eq!(out, None, "a probe that never exits must give no proof");
+        assert!(
+            remaining.is_empty(),
+            "the probe child still exists after the call (pid, rc, errno): {remaining:?} - not killed, or not reaped"
+        );
+        assert_eq!(UNREAPED.load(Ordering::SeqCst), 0, "an ordinary killed child must be reaped inside the cleanup budget");
+        assert!(elapsed >= TIMEOUT, "precondition: the call returned in {elapsed:?}, before the probe deadline"); // wallclock: guard TIMEOUT is a lower bound the code itself waits out; the child never exits by itself
+        assert!( // wallclock: aging the 0.4 s slack is a deliberate premise: the shared deadline kills at 1.0 s, a fresh per-phase budget after the 0.6 s EOF kills at 1.6 s
+            elapsed < TIMEOUT + SLACK,
+            "the probe was killed after {elapsed:?}, not at the shared probe deadline {TIMEOUT:?} - a fresh budget after EOF"
+        );
+    }
+
+    /// T22 (impl-r2 g2·g3): 죽여도 거둬지지 않는 자식은 **정리 시한**에 전용 스레드로 넘어가고(새 2 s 예산을 열지 않는다)
+    /// 계수가 하나 는다. 그 자식이 늦게 끝나면 전용 스레드가 거두고 계수가 되돌아간다.
+    #[cfg(not(windows))]
+    #[test]
+    fn p11_t22_unreaped_child_is_handed_off_at_the_cleanup_deadline() {
+        static UNREAPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        const UNTIL: Duration = Duration::from_millis(300);
+        const SLACK: Duration = Duration::from_millis(300);
+        let (child, killed, release) = p11_stuck_child();
+        let started = std::time::Instant::now();
+        super::p11_kill_and_reap(child, started + UNTIL, &UNREAPED);
+        let took = started.elapsed();
+        assert!(killed.load(Ordering::SeqCst), "the child was not killed");
+        assert!(took >= UNTIL, "precondition: returned in {took:?}, before the cleanup deadline"); // wallclock: guard UNTIL is a lower bound the code itself waits out; the fake never reports an exit
+        assert!( // wallclock: aging the 0.3 s slack is a deliberate premise: the shared deadline returns at 0.3 s, a fresh reap budget at 2 s
+            took < UNTIL + SLACK,
+            "kill_and_reap waited {took:?}, past its cleanup deadline {UNTIL:?} - a fresh reap budget"
+        );
+        assert_eq!(UNREAPED.load(Ordering::SeqCst), 1, "an unreaped child must be counted while its reaper thread waits");
+        release.send(()).expect("reaper thread is waiting");
+        assert!(
+            p11_wait_count(&UNREAPED, 0, Duration::from_secs(5)), // wallclock: guard the 5 s only ends a hang; the release above is guaranteed to end the reaper's wait
+            "the reaper thread did not reap the late child (count {})",
+            UNREAPED.load(Ordering::SeqCst)
+        );
+    }
+
+    /// T23 (impl-r2 g3): 거두지 못한 자식이 상한([`P11_LSOF_UNREAPED_MAX`])만큼 쌓이면 새 증명 자식을 띄우지 않고(무증명),
+    /// 계수가 상한 아래로 내려가면 다시 띄운다. 계수는 실제 넘김 경로(`p11_kill_and_reap`)로 채운다. 전용 스레드를 만들지
+    /// 못하는 경우는 프로덕션을 바꾸지 않고는 만들 이음매가 없어 검체가 없다(복구 한계는 그 상수의 doc).
+    #[cfg(not(windows))]
+    #[test]
+    fn p11_t23_unreaped_cap_saturation_suppresses_the_probe_and_recovery_resumes_it() {
+        static UNREAPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let td = std::env::temp_dir().join(format!("cys-p11-t23-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        std::fs::create_dir_all(&td).unwrap();
+        let marker = td.join("spawned");
+        let mk = marker.to_string_lossy().into_owned();
+        let probe = || {
+            let mut c = std::process::Command::new("/bin/sh");
+            c.args(["-c", "echo x >> \"$0\"; echo n/tmp/p11-t23", mk.as_str()])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin");
+            c
+        };
+        let spawned = || std::fs::read_to_string(&marker).unwrap_or_default().lines().count();
+        let mut releases = Vec::new();
+        for _ in 0..super::P11_LSOF_UNREAPED_MAX {
+            let (child, _killed, release) = p11_stuck_child();
+            super::p11_kill_and_reap(child, std::time::Instant::now(), &UNREAPED);
+            releases.push(release);
+        }
+        assert_eq!(
+            UNREAPED.load(Ordering::SeqCst),
+            super::P11_LSOF_UNREAPED_MAX,
+            "precondition: the hand-off path must fill the unreaped count to the cap"
+        );
+        let out = super::p11_lsof_bounded(probe(), Duration::from_secs(3), Duration::from_secs(2), &UNREAPED);
+        assert_eq!(out, None, "a saturated cap must give no proof");
+        assert_eq!(spawned(), 0, "a probe child was spawned although the unreaped cap was saturated");
+        releases.pop().expect("one reaper").send(()).expect("reaper thread is waiting");
+        assert!(
+            p11_wait_count(&UNREAPED, super::P11_LSOF_UNREAPED_MAX - 1, Duration::from_secs(5)), // wallclock: guard the 5 s only ends a hang; the release above is guaranteed to end that reaper's wait
+            "precondition: the released reaper did not lower the count"
+        );
+        let out = super::p11_lsof_bounded(probe(), Duration::from_secs(3), Duration::from_secs(2), &UNREAPED);
+        for r in releases.drain(..) {
+            let _ = r.send(());
+        }
+        let resumed = spawned();
+        let _ = std::fs::remove_dir_all(&td);
+        assert_eq!(resumed, 1, "the probe did not resume once the count fell below the cap");
+        assert_eq!(out.as_deref(), Some(&b"n/tmp/p11-t23\n"[..]), "the resumed probe's output was not returned");
+        assert!(
+            p11_wait_count(&UNREAPED, 0, Duration::from_secs(5)), // wallclock: guard the 5 s only ends a hang; every reaper was released
+            "the remaining reaper threads did not finish"
+        );
     }
 }
 
