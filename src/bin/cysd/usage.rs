@@ -1484,6 +1484,11 @@ fn collect_for(
             prev.source == "statusline" && now - prev.updated_at < STATUSLINE_FRESH_SECS
         });
 
+    #[cfg(not(windows))]
+    let mut discovered = false;
+    #[cfg(not(windows))]
+    let mut proven_this_tick: Option<bool> = None;
+
     // ── 세션 파일 결정 (등록 > lsof > 휴리스틱) ──
     let desired: Option<(PathBuf, bool)> = if let Some(reg) = registered {
         Some((PathBuf::from(reg), false))
@@ -1511,10 +1516,52 @@ fn collect_for(
             if recently {
                 existing()
             } else {
-                attempts.insert(s.id, now);
-                discover_session_file(s, agent, bin)
-                    .map(|p| (p, true))
-                    .or_else(existing)
+                #[cfg(windows)]
+                {
+                    attempts.insert(s.id, now);
+                    discover_session_file(s, agent, bin)
+                        .map(|p| (p, true))
+                        .or_else(existing)
+                }
+                #[cfg(not(windows))]
+                {
+                    let live_tail = tails.get(&s.id).filter(|t| t.path.exists());
+                    if agent == "codex" {
+                        if let Some(t) = live_tail {
+                            let forced = t.last_discovery == 0.0;
+                            if t.proven && !forced && now - mtime_epoch(&t.path) <= REDISCOVER_SECS {
+                                existing()
+                            } else {
+                                attempts.insert(s.id, now);
+                                discovered = true;
+                                match discover_codex_rollout_proven(s.pid, bin) {
+                                    Some(p) => {
+                                        proven_this_tick = Some(true);
+                                        Some((p, true))
+                                    }
+                                    None => {
+                                        proven_this_tick = Some(false);
+                                        existing()
+                                    }
+                                }
+                            }
+                        } else {
+                            attempts.insert(s.id, now);
+                            discovered = true;
+                            proven_this_tick = Some(false);
+                            discover_session_file(s, agent, bin)
+                                .map(|p| (p, true))
+                                .or_else(existing)
+                        }
+                    } else {
+                        attempts.insert(s.id, now);
+                        discovered = true;
+                        proven_this_tick = Some(false);
+                        discover_session_file(s, agent, bin)
+                            .map(|p| (p, true))
+                            .or_else(existing)
+                    }
+                }
             }
         } else {
             existing()
@@ -1541,11 +1588,30 @@ fn collect_for(
     if need_reset {
         // ★(clear 가드 v3) 새 세션 파일은 가드 입력이 아니다(clear 의 증거는 사이클 표지뿐 — 헬퍼·휴리스틱 재발견이 경로를
         //   바꿔도 수준·막대·발화에 닿지 않는다). 경로는 낙폭 판정 범위 이름으로만 게이트에 실린다(`ctx_guard_scope`).
+        #[cfg(windows)]
         tails.insert(s.id, TailState::attach(daemon, path.clone(), heuristic, now));
+        #[cfg(not(windows))]
+        {
+            let mut st = TailState::attach(daemon, path.clone(), heuristic, now);
+            st.proven = proven_this_tick.unwrap_or(false);
+            tails.insert(s.id, st);
+        }
     } else if let Some(t) = tails.get_mut(&s.id) {
         t.heuristic = heuristic;
+        #[cfg(windows)]
         if heuristic {
             t.last_discovery = now;
+        }
+        #[cfg(not(windows))]
+        if heuristic {
+            if agent != "codex" || discovered {
+                t.last_discovery = now;
+            }
+            if agent == "codex" && discovered {
+                if let Some(p) = proven_this_tick {
+                    t.proven = p;
+                }
+            }
         }
     }
     let Some(state) = tails.get_mut(&s.id) else {
@@ -2216,64 +2282,219 @@ pub(crate) fn rollout_first_line_source(path: &Path) -> Option<String> {
     v["payload"]["source"].as_str().map(|s| s.to_string())
 }
 
-/// P11(0.14.57) §3.2: 순수 프로세스 표 `(pid, parent_pid, os_name, start_time)` 에서 적격 에이전트 프로세스 해소(Commit 1: 구 동작).
+/// P11(0.14.57) §3.2: 순수 프로세스 표 `(pid, parent_pid, os_name, start_time)` 에서 좌석 루트(`root_pid`) 자손의
+/// 깊이를 부모 링크로 계산하고, OS 프로세스 이름(`Process::name()`)이 `bin_base` 와 정확히 일치(대소문자 구분)하는
+/// 네이티브 프로세스 중 최소 깊이에 유일하게 존재하는 하나만 적격 프로세스로 반환한다(하강 0회 — T12).
 #[cfg(not(windows))]
 pub(crate) fn p11_resolve_eligible_from_table(
     rows: &[(u32, Option<u32>, &str, u64)],
     root_pid: u32,
     bin_base: &str,
 ) -> Option<(u32, u64, String)> {
-    for &(pid, ppid, name, start) in rows {
-        if ppid == Some(root_pid) && name == bin_base {
-            return Some((pid, start, name.to_string()));
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut by_pid: HashMap<u32, (&str, u64)> = HashMap::new();
+    for &(pid, parent, name, start) in rows {
+        by_pid.insert(pid, (name, start));
+        if let Some(ppid) = parent {
+            children.entry(ppid).or_default().push(pid);
         }
     }
-    None
+    let mut depth: HashMap<u32, usize> = HashMap::new();
+    let mut queue: std::collections::VecDeque<(u32, usize)> = std::collections::VecDeque::new();
+    queue.push_back((root_pid, 0));
+    while let Some((cur, d)) = queue.pop_front() {
+        if let Some(kids) = children.get(&cur) {
+            for &child in kids {
+                if child != root_pid && !depth.contains_key(&child) {
+                    depth.insert(child, d + 1);
+                    queue.push_back((child, d + 1));
+                }
+            }
+        }
+    }
+    let natives: Vec<(u32, usize, &str, u64)> = depth
+        .into_iter()
+        .filter_map(|(pid, d)| {
+            let &(name, start) = by_pid.get(&pid)?;
+            (name == bin_base).then_some((pid, d, name, start))
+        })
+        .collect();
+    let min_depth = natives.iter().map(|&(_, d, _, _)| d).min()?;
+    let mut at_min = natives.into_iter().filter(|&(_, d, _, _)| d == min_depth);
+    let (pid, _, name, start) = at_min.next()?;
+    if at_min.next().is_some() {
+        return None;
+    }
+    Some((pid, start, name.to_string()))
 }
 
-/// P11(0.14.57) §3.3: lsof 호출 전후 프로세스 신원 비교(Commit 1: 구 동작 — pid 만 비교).
+#[cfg(not(windows))]
+fn p11_resolve_eligible_process(
+    sys: &sysinfo::System,
+    surface_pid: u32,
+    bin_base: &str,
+) -> Option<(u32, u64, String)> {
+    let rows: Vec<(u32, Option<u32>, String, u64)> = sys
+        .processes()
+        .iter()
+        .map(|(pid, pr)| {
+            (
+                pid.as_u32(),
+                pr.parent().map(|p| p.as_u32()),
+                pr.name().to_string_lossy().into_owned(),
+                pr.start_time(),
+            )
+        })
+        .collect();
+    let refs: Vec<(u32, Option<u32>, &str, u64)> = rows
+        .iter()
+        .map(|(pid, ppid, name, start)| (*pid, *ppid, name.as_str(), *start))
+        .collect();
+    p11_resolve_eligible_from_table(&refs, surface_pid, bin_base)
+}
+
+/// P11(0.14.57) §3.3: lsof 호출 전후 프로세스 신원 3중 튜플 `(pid, start_time, name)` 무오차 비교(순수 — T14).
+///
+/// 한계(선언된 잔여 · DESIGN-P11-r3 §3.3 / T14): `sysinfo 0.33.1` 의 `Process::start_time()` 은
+/// 초(whole seconds) 단위이므로, 같은 초 안에 같은 `pid` 가 같은 프로세스 이름(`codex`)의 다른 프로세스로
+/// 재사용되는 경우(same-second, same-name PID reuse)는 이 3중 튜플로 구분할 수 없다.
 #[cfg(not(windows))]
 pub(crate) fn p11_same_process_identity(
     before: (u32, u64, &str),
     after: Option<(u32, u64, &str)>,
 ) -> bool {
-    after.is_some_and(|(p, _, _)| p == before.0)
+    after == Some(before)
 }
 
-/// P11(0.14.57) §3.3: codex lsof 인자(Commit 1: 구 동작 `-p <pid> -Fn`).
+/// P11(0.14.57) §3.3: 적격 codex 프로세스의 열린 fd + 접근 모드(`a`) + 경로(`n`) 조회용 lsof 인자(순수 — T15).
 #[cfg(not(windows))]
 pub(crate) fn p11_codex_lsof_args(pid: u32) -> Vec<String> {
-    vec!["-p".to_string(), pid.to_string(), "-Fn".to_string()]
-}
-
-/// P11(0.14.57) §3.3: `lsof` 출력 파서(Commit 1: 구 동작 — `n` 접두 첫 매치).
-#[cfg(not(windows))]
-pub(crate) fn p11_parse_lsof_fan(stdout: &str) -> Vec<PathBuf> {
-    stdout
-        .lines()
-        .filter_map(|l| l.strip_prefix('n'))
-        .filter(|p| p.contains("/sessions/") && p.contains("rollout-") && p.ends_with(".jsonl"))
-        .map(PathBuf::from)
+    let pid = pid.to_string();
+    ["-b", "-w", "-nP", "-a", "-p", pid.as_str(), "-F", "fan"]
+        .iter()
+        .map(|s| s.to_string())
         .collect()
 }
 
-/// P11(0.14.57) §3.3: 후보 중 선택(Commit 1: 구 동작 — lsof 순서 첫 항목).
+/// P11(0.14.57) §3.3: `lsof -F fan` 출력을 레코드 단위(각 `f` 줄마다 `access`·`name` 초기화)로 파싱해
+/// 쓰기 가능(`a` == `u` | `w`) rollout 후보 경로 목록을 반환한다(순수 — T15).
 #[cfg(not(windows))]
-pub(crate) fn p11_pick_proven_rollout(lsof_stdout: &str) -> Option<PathBuf> {
-    p11_parse_lsof_fan(lsof_stdout).into_iter().next()
+pub(crate) fn p11_parse_lsof_fan(stdout: &str) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut in_fd = false;
+    let mut access: Option<char> = None;
+    let mut name: Option<&str> = None;
+
+    let flush = |in_fd: bool, access: Option<char>, name: Option<&str>, out: &mut Vec<PathBuf>| {
+        if !in_fd || !matches!(access, Some('u' | 'w')) {
+            return;
+        }
+        let Some(p) = name else {
+            return;
+        };
+        if p.contains("/sessions/") && p.contains("rollout-") && p.ends_with(".jsonl") {
+            let pb = PathBuf::from(p);
+            if !out.contains(&pb) {
+                out.push(pb);
+            }
+        }
+    };
+
+    for line in stdout.lines() {
+        if line.starts_with('f') {
+            flush(in_fd, access, name, &mut out);
+            in_fd = true;
+            access = None;
+            name = None;
+        } else if line.starts_with('p') {
+            flush(in_fd, access, name, &mut out);
+            in_fd = false;
+            access = None;
+            name = None;
+        } else if in_fd {
+            if let Some(rest) = line.strip_prefix('a') {
+                access = rest.chars().next().filter(|c| !c.is_whitespace());
+            } else if let Some(rest) = line.strip_prefix('n') {
+                name = Some(rest);
+            }
+        }
+    }
+    flush(in_fd, access, name, &mut out);
+    out
 }
 
-/// P11(0.14.57) §3.2–§3.3: 적격 codex 프로세스 소유 증명 발견(Commit 1: 구 동작).
+/// P11(0.14.57) §3.3: `lsof -F fan` 출력에서 쓰기 가능(`u`/`w`)하고 첫 줄 `payload.source == "cli"` 인
+/// rollout 중 mtime 최신(동률 시 파일명 사전순 최신)을 고른다(T5).
 #[cfg(not(windows))]
-#[allow(dead_code)]
+pub(crate) fn p11_pick_proven_rollout(lsof_stdout: &str) -> Option<PathBuf> {
+    let mut best: Option<(f64, String, PathBuf)> = None;
+    for path in p11_parse_lsof_fan(lsof_stdout) {
+        if rollout_first_line_source(&path).as_deref() != Some("cli") {
+            continue;
+        }
+        let mt = mtime_epoch(&path);
+        if mt <= 0.0 {
+            continue;
+        }
+        let fname = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        let replace = match &best {
+            None => true,
+            Some((b_mt, b_name, _)) => {
+                mt > *b_mt || ((mt - *b_mt).abs() <= 1e-9 && fname > *b_name)
+            }
+        };
+        if replace {
+            best = Some((mt, fname, path));
+        }
+    }
+    best.map(|(_, _, p)| p)
+}
+
+/// P11(0.14.57) §3.2–§3.3: 적격 codex 프로세스 신원 고정 → `lsof -b -w -nP -a -p <pid> -F fan` →
+/// 호출 후 단일 PID 재조회로 `(pid, start_time, name)` 무오차 재검증 → 최신 쓰기 가능 `cli` rollout 반환.
+#[cfg(not(windows))]
 fn discover_codex_rollout_proven(surface_pid: u32, bin: &str) -> Option<PathBuf> {
     #[cfg(test)]
     if let Some(override_res) = p11_proof_seam::get() {
         return override_res;
     }
     let bin_base = bin.rsplit(['/', '\\']).next().unwrap_or(bin);
-    let (agent_pid, _) = find_agent_descendant(surface_pid, bin_base);
-    agent_pid.and_then(discover_codex_rollout_lsof)
+    if bin_base.is_empty() {
+        return None;
+    }
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    let (elig_pid, elig_start, elig_name) =
+        p11_resolve_eligible_process(&sys, surface_pid, bin_base)?;
+    let args = p11_codex_lsof_args(elig_pid);
+    let out = std::process::Command::new("lsof")
+        .args(&args)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let target_pid = sysinfo::Pid::from_u32(elig_pid);
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[target_pid]), true);
+    let after = sys.process(target_pid).map(|pr| {
+        (
+            elig_pid,
+            pr.start_time(),
+            pr.name().to_string_lossy().into_owned(),
+        )
+    });
+    if !p11_same_process_identity(
+        (elig_pid, elig_start, elig_name.as_str()),
+        after.as_ref().map(|(p, st, n)| (*p, *st, n.as_str())),
+    ) {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    p11_pick_proven_rollout(&stdout)
 }
 
 /// P11(0.14.57) 테스트 전용 시계 이음매 — `collect_for` 의 `now` 를 이 스레드에서만 고정한다.
