@@ -1566,17 +1566,35 @@ impl SubmitDone {
     }
 
     pub(crate) fn complete_written(&mut self) {
+        if self.completed {
+            return;
+        }
         self.completed = true;
+        if let Some(t) = self.track.upgrade() {
+            t.residue_complete_written(&self.request_id, self.body_at, Instant::now());
+        }
     }
 
     pub(crate) fn complete_failed(&mut self) {
+        if self.completed {
+            return;
+        }
         self.completed = true;
+        if let Some(t) = self.track.upgrade() {
+            t.residue_decline(&self.request_id, self.body_at, "write_failed");
+        }
     }
 }
 
 impl Drop for SubmitDone {
     fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
         self.completed = true;
+        if let Some(t) = self.track.upgrade() {
+            t.residue_drop_unprocessed(&self.request_id, self.body_at);
+        }
     }
 }
 
@@ -8924,7 +8942,7 @@ pub(crate) fn run_writer_loop_tracked<W: Write, R: Into<crate::writer_gate::Queu
             }
             // ★B2′: 제출 CR — 잔여를 **여기서, 소비 시점에** 계산한다. 이 계산이 핸들러에
             // 있으면 적체 구간에서 간격이 붕괴한다(codex 감사 R1 · SubmitAfterGap doc 참조).
-            WriteReq::SubmitAfterGap { bytes, min_gap_ms, withhold, done: _done } => {
+            WriteReq::SubmitAfterGap { bytes, min_gap_ms, withhold, done } => {
                 if let Some(delay) =
                     cr_gap_delay_ms(last_program_write.map(|t| t.elapsed()), min_gap_ms)
                 {
@@ -8937,7 +8955,13 @@ pub(crate) fn run_writer_loop_tracked<W: Write, R: Into<crate::writer_gate::Queu
                     if let Some(t) = &track {
                         t.submit_consumed(false);
                     }
+                    if let Some(mut d) = done {
+                        d.complete_withheld();
+                    }
                     continue;
+                }
+                if let Some(d) = &done {
+                    d.mark_writing();
                 }
                 let r = writer.write_all(&bytes).and_then(|_| writer.flush());
                 // ★B2″(agy 감사 R2-②): 쓴 CR **자신도** 기준점이 된다. 그러지 않으면 연속
@@ -8951,6 +8975,13 @@ pub(crate) fn run_writer_loop_tracked<W: Write, R: Into<crate::writer_gate::Queu
                 //   '대기 CR 뒤에 다음 본문을 붙이지 않는다'(분리 보류)를 판정한다. 원자 쓰기뿐.
                 if let Some(t) = &track {
                     t.submit_consumed(r.is_ok());
+                }
+                if let Some(mut d) = done {
+                    if r.is_ok() {
+                        d.complete_written();
+                    } else {
+                        d.complete_failed();
+                    }
                 }
                 r
             }

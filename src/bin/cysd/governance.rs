@@ -5897,6 +5897,9 @@ pub(crate) struct ComposerBlock {
     pub(crate) below: String,
     /// 이 블록을 **빈 대기 프롬프트**로 바꾼 화면 — 블록 위 행 전부 · 선두 행의 마커까지 · `below`.
     pub(crate) as_empty_prompt: String,
+    /// ★(0.14.57 · P10 · DESIGN-P10-r3 §1 E2) True when `rows[head - 1]` and `rows[cr + 1]` are rule lines
+    /// (`cys::readiness::is_rule_line`), proving the block is bounded directly above and below by the composer box rules.
+    pub(crate) box_bounded: bool,
 }
 
 /// 입력 블록이 거슬러 오를 수 있는 연속행 상한 — 넘으면 블록이 아니다(설명 불가 = 종전 판정).
@@ -5948,7 +5951,10 @@ pub(crate) fn composer_block_of(
         as_empty_prompt.push('\n');
         as_empty_prompt.push_str(&below);
     }
-    Some(ComposerBlock { before_cursor, below, as_empty_prompt })
+    let box_bounded = head > 0
+        && cys::readiness::is_rule_line(&rows[head - 1])
+        && rows.get(cr + 1).is_some_and(|r| cys::readiness::is_rule_line(r));
+    Some(ComposerBlock { before_cursor, below, as_empty_prompt, box_bounded })
 }
 
 /// claude 붙여넣기 자리표시(2.1.282 바이너리 실측 문자열 — `[Pasted text #N]` · `[Pasted text #N +M lines]` ·
@@ -6284,6 +6290,594 @@ pub(crate) fn submit_cr_withhold_probe_with(
     })
 }
 
+/// ★(0.14.57 · P10 · DESIGN-P10-r1 §6.2 guard 12, r2 §1.3 guard 10, r2 §1.6, r3 §3) Judgement quiet/age threshold (seconds)
+/// for arming a swallowed queue Return and for transitioning a `Written` recovery Return to `Spent`.
+pub(crate) const SWALLOWED_SUBMIT_QUIET_SECS: u64 = 3;
+
+/// ★(0.14.57 · P10 · DESIGN-P10-r3 §3) Threshold (seconds) after which an in-flight `Writing` recovery Return is surfaced
+/// as stuck (`machine_residue` row 3b) while its `ResidueStage::Writing` state remains unchanged until the writer completes.
+pub(crate) const SWALLOWED_SUBMIT_STUCK_WRITE_SECS: u64 = 30;
+
+/// ★(0.14.57 · P10 · DESIGN-P10-r3 §1 E1 · TICKET-P10-IMPL precondition 2) Adapters measured not to scroll composer content
+/// above the first visible row without an indicator row (rig cell R5b). Ships empty (`&[]`) until R5b is measured on the
+/// pinned CLI version; with an empty list, P10 on unmeasured adapters is diagnosis-only (`machine_residue`, 0 Returns).
+pub(crate) const P10_EXTENT_MEASURED_ADAPTERS: &[&str] = &[];
+
+#[cfg(not(test))]
+#[inline]
+pub(crate) fn p10_adapter_extent_measured(agent: &str) -> bool {
+    P10_EXTENT_MEASURED_ADAPTERS.contains(&agent)
+}
+
+#[cfg(not(test))]
+#[inline]
+pub(crate) fn p10_platform_enabled_for_seat(_s: &crate::state::Surface) -> bool {
+    cfg!(unix)
+}
+
+#[cfg(not(test))]
+#[inline]
+fn p10_arm_before_commit_hook(_s: &crate::state::Surface) {}
+
+#[cfg(not(test))]
+#[inline]
+fn p10_gap_hook(_s: &crate::state::Surface) {}
+
+pub(crate) fn p10_seat_adapter_extent_measured(s: &crate::state::Surface) -> bool {
+    s.agent_meta
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|(agent, _)| p10_adapter_extent_measured(agent.as_str()))
+}
+
+/// ★(0.14.57 · P10 · DESIGN-P10-r2 §1.1, r3 §1 E3) Pure provenance check: the seat's last machine body is the marked
+/// daemon queue request's (`owner == None`, `body.at == mark.body_at`), and since that request's Return settled, no input
+/// generation move, no writer epoch move, no human key, and no agent/conversation epoch move occurred.
+pub(crate) fn p10_provenance_holds(
+    mark: Option<&crate::state::QueueSubmitMark>,
+    body: Option<&crate::state::MachineBody>,
+    input_gen: u64,
+    resume_write_epoch: u64,
+    last_human_input: Option<std::time::Instant>,
+    agent_epoch: u64,
+    conversation_epoch: u64,
+) -> bool {
+    let (Some(m), Some(b)) = (mark, body) else {
+        return false;
+    };
+    b.owner.is_none()
+        && b.at == m.body_at
+        && input_gen == m.gen
+        && resume_write_epoch == m.epoch
+        && last_human_input == m.human_at
+        && agent_epoch == m.agent_epoch
+        && conversation_epoch == m.conversation_epoch
+}
+
+/// ★(0.14.57 · P10 · DESIGN-P10-r3 §1 E3) Whole-extent representation check: either whitespace-free equality with the full
+/// delivered body (`flat_text_digest`, not the 4,096-char `MachineBody` tail), or a single claude paste placeholder token
+/// consuming the entire block and nothing else.
+pub(crate) fn p10_block_matches_full_body(
+    block_before_cursor: &str,
+    flat_len: usize,
+    flat_sha: &[u8; 32],
+) -> bool {
+    if flat_len == 0 {
+        return false;
+    }
+    let (blk_len, blk_sha) = crate::state::flat_text_digest(block_before_cursor);
+    if blk_len == 0 {
+        return false;
+    }
+    if blk_len == flat_len && &blk_sha == flat_sha {
+        return true;
+    }
+    let flat: Vec<char> = block_before_cursor.chars().filter(|c| !c.is_whitespace()).collect();
+    flat.first() == Some(&'[') && paste_placeholder_len(&flat) == Some(flat.len())
+}
+
+/// ★(0.14.57 · P10 · DESIGN-P10-r1 §6.2 guard 11, r2 §1.3 guard 9) Nothing after the cursor on the cursor row and the area
+/// below the composer block reads as an empty composer box (D1 governed: `composer_verdict` on `with_block_emptied()` is
+/// `Empty` or `Placeholder`; D1 off: `readiness::composer_edit_region_empty` on the emptied screen).
+pub(crate) fn p10_after_and_below_empty(
+    s: &crate::state::Surface,
+    obs: &PromptObs,
+    placeholder: Option<&str>,
+) -> bool {
+    if !obs.line.as_ref().is_some_and(|(_, after)| after.trim().is_empty()) {
+        return false;
+    }
+    let Some(view) = obs.with_block_emptied() else {
+        return false;
+    };
+    if d1_governs(s) {
+        matches!(
+            composer_verdict(&view, placeholder),
+            ComposerVerdict::Empty | ComposerVerdict::Placeholder
+        )
+    } else {
+        cys::readiness::composer_edit_region_empty(&view.screen, &view.marker, placeholder)
+    }
+}
+
+/// ★(0.14.57 · P10 · DESIGN-P10-r1 §6.4, r2 §1.6, r3 §1) Is the visible composer block explainable as untouched machine text
+/// (`pending_bytes == 0`, raw `human == 0`, no human input after `body.at`, `obs.label != Unbound`, and
+/// `composer_block_is_machine_body` holds)? Used to distinguish row 3b (`machine_residue`) from row 3 (`human_draft`) when
+/// recovery is declined or spent.
+pub(crate) fn p10_block_is_proven_machine_text(
+    obs: &PromptObs,
+    body: &crate::state::MachineBody,
+    pending_bytes: u64,
+    raw_human_bytes: u64,
+    last_human_input: Option<std::time::Instant>,
+) -> bool {
+    pending_bytes == 0
+        && raw_human_bytes == 0
+        && !last_human_input.is_some_and(|t| t > body.at)
+        && obs.label != cys::readiness::ComposerLabel::Unbound
+        && composer_block_is_machine_body(
+            obs.block.as_ref().map(|b| b.before_cursor.as_str()),
+            Some(body.norm.as_str()),
+        )
+}
+
+/// ★(0.14.57 · P10 · DESIGN-P10-r1 §6.2, r2 §1.3, r3 §1-2) Pure input to [`residue_arm_verdict`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResidueArmInput {
+    pub(crate) cfg_unix: bool,
+    pub(crate) seat_agent_backed: bool,
+    pub(crate) scope: SubmitGuardScope,
+    pub(crate) dialog_open: bool,
+    pub(crate) d9_scope: bool,
+    pub(crate) label_unbound: bool,
+    pub(crate) quiescing: bool,
+    pub(crate) paused: bool,
+    pub(crate) kill_switch: bool,
+    pub(crate) pending_bytes: u64,
+    pub(crate) raw_human_bytes: u64,
+    pub(crate) has_body: bool,
+    pub(crate) cli_body: bool,
+    pub(crate) human_after_body: bool,
+    pub(crate) provenance: bool,
+    pub(crate) slash_body: bool,
+    pub(crate) adapter_extent_measured: bool,
+    pub(crate) box_bounded: bool,
+    pub(crate) representation: bool,
+    pub(crate) after_and_below_empty: bool,
+    pub(crate) cr_age_ok: bool,
+    pub(crate) quiet_ok: bool,
+    pub(crate) withheld_present: bool,
+    pub(crate) queue_hold_present: bool,
+    pub(crate) already_tracked_for_body: bool,
+}
+
+/// ★(0.14.57 · P10 · DESIGN-P10-r1 §6.2, r2 §1.3, r3 §1-2) Pure guard table for arming a swallowed queue Return.
+/// Every guard is named; the first refusal wins.
+pub(crate) fn residue_arm_verdict(inp: &ResidueArmInput) -> Result<(), &'static str> {
+    if !inp.cfg_unix {
+        return Err("platform");
+    }
+    if !inp.seat_agent_backed || inp.scope == SubmitGuardScope::Off {
+        return Err("seat_off");
+    }
+    if inp.dialog_open {
+        return Err("dialog");
+    }
+    if inp.d9_scope {
+        return Err("d9_scope");
+    }
+    if inp.label_unbound {
+        return Err("label_unbound");
+    }
+    if inp.quiescing {
+        return Err("quiescing");
+    }
+    if inp.paused {
+        return Err("paused");
+    }
+    if inp.kill_switch {
+        return Err("kill_switch");
+    }
+    if inp.pending_bytes != 0 {
+        return Err("count");
+    }
+    if inp.raw_human_bytes != 0 {
+        return Err("raw_human");
+    }
+    if !inp.has_body {
+        return Err("no_body");
+    }
+    if inp.cli_body {
+        return Err("cli_body");
+    }
+    if inp.human_after_body {
+        return Err("human_after");
+    }
+    if !inp.provenance {
+        return Err("provenance");
+    }
+    if inp.slash_body {
+        return Err("slash_body");
+    }
+    if !inp.adapter_extent_measured {
+        return Err("unmeasured_adapter");
+    }
+    if !inp.box_bounded {
+        return Err("unbounded_box");
+    }
+    if !inp.representation {
+        return Err("representation");
+    }
+    if !inp.after_and_below_empty {
+        return Err("below");
+    }
+    if !inp.cr_age_ok {
+        return Err("cr_age");
+    }
+    if !inp.quiet_ok {
+        return Err("quiet");
+    }
+    if inp.withheld_present {
+        return Err("withheld_owns_cr");
+    }
+    if inp.queue_hold_present {
+        return Err("hold_owns_cr");
+    }
+    if inp.already_tracked_for_body {
+        return Err("spent");
+    }
+    Ok(())
+}
+
+/// Does a refusal from [`residue_arm_verdict`] record `Declined(why)` when the composer block is explainable as untouched
+/// machine text (`p10_block_is_proven_machine_text`)? Transient waits (`quiet`, `cr_age`, `paused`, `quiescing`, `dialog`,
+/// `withheld_owns_cr`, `hold_owns_cr`) and non-machine/unbound states do not mark the body `Declined`.
+pub(crate) fn residue_arm_refusal_is_proof_decline(why: &'static str) -> bool {
+    matches!(
+        why,
+        "platform"
+            | "d9_scope"
+            | "kill_switch"
+            | "cli_body"
+            | "provenance"
+            | "slash_body"
+            | "unmeasured_adapter"
+            | "unbounded_box"
+            | "representation"
+            | "below"
+    )
+}
+
+/// ★(0.14.57 · P10 · DESIGN-P10-r2 §1.5, r3 §3) Final writer-thread probe for a `Swallowed` recovery Return (`SubmitAfterGap`).
+/// Re-checks every guard against the provenance mark and a fresh frame after the gap sleep. Fails closed (`unwrap_or(true)`
+/// on panic and `true` on failed `Weak::upgrade`). Never creates a new `WithheldSubmit` record or re-arms.
+pub(crate) fn residue_final_probe(
+    daemon: &Arc<Daemon>,
+    s: &Arc<crate::state::Surface>,
+    markers: Vec<String>,
+    placeholder: Option<String>,
+    request_id: String,
+    body_at: std::time::Instant,
+    expect_gen: u64,
+    from: Option<u64>,
+) -> crate::state::SafetyProbe {
+    let wd = Arc::downgrade(daemon);
+    let ws = Arc::downgrade(s);
+    let handed = std::time::Instant::now();
+    Arc::new(move || {
+        let ws_panic = ws.clone();
+        let req_panic = request_id.clone();
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (Some(d), Some(s)) = (wd.upgrade(), ws.upgrade()) else {
+                if let Some(s) = ws.upgrade() {
+                    s.inject_track.residue_decline(&request_id, body_at, "seat_off");
+                }
+                return true;
+            };
+            p10_gap_hook(&s);
+            let refuse = |why: &'static str| -> bool {
+                s.inject_track.residue_decline(&request_id, body_at, why);
+                d.bus.publish(
+                    "queue.submit_withheld",
+                    "queue",
+                    Some(s.id),
+                    json!({
+                        "surface_ref": cys::surface_ref(s.id),
+                        "reason": why,
+                        "armed_by": "residue_resubmit",
+                        "request_id": request_id,
+                        "from": from.map(cys::surface_ref),
+                        "handed_ms_ago": handed.elapsed().as_millis() as u64,
+                        "note": "삼켜진 제출 Return 의 재전송 직전 재검증이 거부되어 CR 을 쓰지 않았다(재무장 없음).",
+                    }),
+                );
+                true
+            };
+            if d.paused.load(Ordering::Relaxed) {
+                return refuse("paused");
+            }
+            if crate::handlers::send_settle_disabled(&d) {
+                return refuse("kill_switch");
+            }
+            let scope = submit_guard_scope(&s);
+            if !crate::alert_route::seat_is_agent_backed(&s) || scope == SubmitGuardScope::Off {
+                return refuse("seat_off");
+            }
+            if d9_scope(&d, &s, false) {
+                return refuse("d9_scope");
+            }
+            if effective_quiescing_since(&d, &s).is_some() {
+                return refuse("quiescing");
+            }
+            if approval_or_gate_pending(&d, s.id) {
+                return refuse("dialog");
+            }
+            if s.pending_input_bytes.load(Ordering::Relaxed) != 0
+                || s.pending_input.lock().unwrap_or_else(|e| e.into_inner()).human != 0
+            {
+                return refuse("count");
+            }
+            let Some(body) = s.inject_track.last_body() else {
+                return refuse("newer_body");
+            };
+            if body.at != body_at {
+                return refuse("newer_body");
+            }
+            let last_human = *s.last_human_input.lock().unwrap_or_else(|e| e.into_inner());
+            if last_human.is_some_and(|t| t > body_at) {
+                return refuse("human");
+            }
+            let mark = s.inject_track.queue_submit_mark();
+            let input_gen = s.input_gen.load(Ordering::Acquire);
+            let write_epoch = s.inject_track.resume_write_epoch();
+            let agent_epoch = s.agent_epoch.load(Ordering::Acquire);
+            let conv_epoch = s.conversation_epoch.load(Ordering::Acquire);
+            if input_gen != expect_gen
+                || !p10_provenance_holds(
+                    mark.as_ref(),
+                    Some(&body),
+                    input_gen,
+                    write_epoch,
+                    last_human,
+                    agent_epoch,
+                    conv_epoch,
+                )
+                || mark.as_ref().is_none_or(|m| m.request_id != request_id)
+            {
+                return refuse("provenance");
+            }
+            if !p10_seat_adapter_extent_measured(&s) {
+                return refuse("unmeasured_adapter");
+            }
+            let obs = observe_prompt_block(&s, &markers);
+            if obs.label == cys::readiness::ComposerLabel::Unbound {
+                return refuse("label_unbound");
+            }
+            let v = submit_cr_verdict(scope, &obs, Some(body.norm.as_str()));
+            if v.hits {
+                return refuse("dialog");
+            }
+            if !obs.frame_consistent() {
+                return refuse("representation");
+            }
+            let Some(block) = obs.block.as_ref() else {
+                return refuse("representation");
+            };
+            if !block.box_bounded {
+                return refuse("unbounded_box");
+            }
+            let mark = mark.expect("checked Some");
+            if !p10_block_matches_full_body(&block.before_cursor, mark.flat_len, &mark.flat_sha) {
+                return refuse("representation");
+            }
+            if !p10_after_and_below_empty(&s, &obs, placeholder.as_deref()) {
+                return refuse("below");
+            }
+            false
+        }))
+        .unwrap_or_else(|_| {
+            if let Some(s) = ws_panic.upgrade() {
+                s.inject_track.residue_decline(&req_panic, body_at, "panic");
+            }
+            true
+        })
+    })
+}
+
+/// ★(0.14.57 · P10 · DESIGN-P10-r1 §6.2, r2 §1.3, r3 §1-2) Called only in `deliver_queued` on the
+/// `PromptGate::Blocked(BLOCKED_INPUT_PENDING)` branch. Evaluates [`residue_arm_verdict`] on one `observe_prompt_block`
+/// and commits `WithheldKind::Swallowed` + `ResidueStage::Armed` atomically inside `Surface::input_gate`.
+fn maybe_arm_swallowed_residue(
+    daemon: &Arc<Daemon>,
+    s: &Arc<crate::state::Surface>,
+    markers: &[String],
+    placeholder: Option<&str>,
+) {
+    let now = std::time::Instant::now();
+    let body = s.inject_track.last_body();
+    if let (Some(tr), Some(b)) = (s.inject_track.residue_track(), body.as_ref()) {
+        if tr.body_at == b.at {
+            if let crate::state::ResidueStage::Written { written_at } = tr.stage {
+                if now.saturating_duration_since(written_at) >= Duration::from_secs(SWALLOWED_SUBMIT_QUIET_SECS) {
+                    let obs = observe_prompt_block(s, markers);
+                    let pending_bytes = s.pending_input_bytes.load(Ordering::Relaxed);
+                    let raw_human = s.pending_input.lock().unwrap_or_else(|e| e.into_inner()).human;
+                    let last_human = *s.last_human_input.lock().unwrap_or_else(|e| e.into_inner());
+                    if p10_block_is_proven_machine_text(&obs, b, pending_bytes, raw_human, last_human) {
+                        s.inject_track.residue_mark_spent(&tr.request_id, tr.body_at);
+                    }
+                }
+            }
+            return;
+        }
+    }
+    let obs = observe_prompt_block(s, markers);
+    if !obs.frame_consistent() {
+        return;
+    }
+    let scope = submit_guard_scope(s);
+    let seat_agent_backed = crate::alert_route::seat_is_agent_backed(s);
+    let pending_bytes = s.pending_input_bytes.load(Ordering::Relaxed);
+    let raw_human_bytes = s.pending_input.lock().unwrap_or_else(|e| e.into_inner()).human;
+    let last_human = *s.last_human_input.lock().unwrap_or_else(|e| e.into_inner());
+    let mark = s.inject_track.queue_submit_mark();
+    let input_gen = s.input_gen.load(Ordering::Acquire);
+    let write_epoch = s.inject_track.resume_write_epoch();
+    let agent_epoch = s.agent_epoch.load(Ordering::Acquire);
+    let conv_epoch = s.conversation_epoch.load(Ordering::Acquire);
+    let v = submit_cr_verdict(scope, &obs, body.as_ref().map(|b| b.norm.as_str()));
+    let dialog_open = v.hits || approval_or_gate_pending(daemon, s.id);
+    let is_d9 = d9_scope(daemon, s, false);
+    let label_unbound = obs.label == cys::readiness::ComposerLabel::Unbound;
+    let quiescing = effective_quiescing_since(daemon, s).is_some();
+    let paused = daemon.paused.load(Ordering::Relaxed) || queue_injection_paused(daemon, s);
+    let kill_switch = crate::handlers::send_settle_disabled(daemon);
+    let has_body = body.is_some();
+    let cli_body = body.as_ref().is_some_and(|b| b.owner.is_some());
+    let human_after_body = body
+        .as_ref()
+        .is_some_and(|b| last_human.is_some_and(|t| t > b.at));
+    let provenance = p10_provenance_holds(
+        mark.as_ref(),
+        body.as_ref(),
+        input_gen,
+        write_epoch,
+        last_human,
+        agent_epoch,
+        conv_epoch,
+    );
+    let slash_body = body.as_ref().is_some_and(|b| b.norm.starts_with('/'));
+    let adapter_extent_measured = p10_seat_adapter_extent_measured(s);
+    let box_bounded = obs.block.as_ref().is_some_and(|b| b.box_bounded);
+    let representation = match (obs.block.as_ref(), mark.as_ref()) {
+        (Some(blk), Some(m)) => p10_block_matches_full_body(&blk.before_cursor, m.flat_len, &m.flat_sha),
+        _ => false,
+    };
+    let after_and_below_empty = p10_after_and_below_empty(s, &obs, placeholder);
+    let cr_age_ok = mark.as_ref().is_some_and(|m| {
+        m.cr_mono >= m.body_at
+            && now.saturating_duration_since(m.cr_mono) >= Duration::from_secs(SWALLOWED_SUBMIT_QUIET_SECS)
+    });
+    let quiet_ok = obs.quiet_secs >= SWALLOWED_SUBMIT_QUIET_SECS;
+    let withheld_present = s.inject_track.withheld().is_some();
+    let queue_hold_present = s.queue_hold.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+    let already_tracked_for_body = body.as_ref().is_some_and(|b| {
+        s.inject_track
+            .residue_track()
+            .is_some_and(|r| r.body_at == b.at)
+    });
+    let inp = ResidueArmInput {
+        cfg_unix: p10_platform_enabled_for_seat(s),
+        seat_agent_backed,
+        scope,
+        dialog_open,
+        d9_scope: is_d9,
+        label_unbound,
+        quiescing,
+        paused,
+        kill_switch,
+        pending_bytes,
+        raw_human_bytes,
+        has_body,
+        cli_body,
+        human_after_body,
+        provenance,
+        slash_body,
+        adapter_extent_measured,
+        box_bounded,
+        representation,
+        after_and_below_empty,
+        cr_age_ok,
+        quiet_ok,
+        withheld_present,
+        queue_hold_present,
+        already_tracked_for_body,
+    };
+    match residue_arm_verdict(&inp) {
+        Ok(()) => {
+            p10_arm_before_commit_hook(s);
+            let committed = {
+                let _gate = s.input_gate.lock().unwrap();
+                let mark_now = s.inject_track.queue_submit_mark();
+                let body_now = s.inject_track.last_body();
+                let gen_now = s.input_gen.load(Ordering::Acquire);
+                let epoch_now = s.inject_track.resume_write_epoch();
+                let human_now = *s.last_human_input.lock().unwrap_or_else(|e| e.into_inner());
+                let agent_now = s.agent_epoch.load(Ordering::Acquire);
+                let conv_now = s.conversation_epoch.load(Ordering::Acquire);
+                let pending_now = s.pending_input_bytes.load(Ordering::Relaxed);
+                let raw_human_now = s.pending_input.lock().unwrap_or_else(|e| e.into_inner()).human;
+                let hold_now = s.queue_hold.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+                if pending_now != 0
+                    || raw_human_now != 0
+                    || hold_now
+                    || !p10_provenance_holds(
+                        mark_now.as_ref(),
+                        body_now.as_ref(),
+                        gen_now,
+                        epoch_now,
+                        human_now,
+                        agent_now,
+                        conv_now,
+                    )
+                {
+                    if let Some(b) = body_now.as_ref() {
+                        if s.inject_track.withheld().is_none()
+                            && p10_block_is_proven_machine_text(&obs, b, pending_now, raw_human_now, human_now)
+                        {
+                            let req_id = mark_now
+                                .as_ref()
+                                .map(|m| m.request_id.clone())
+                                .unwrap_or_default();
+                            s.inject_track.residue_set_declined_for_body(req_id, b.at, "provenance");
+                        }
+                    }
+                    None
+                } else {
+                    let m = mark_now.expect("checked Some");
+                    match s.inject_track.try_commit_swallowed_arm(
+                        m.request_id.clone(),
+                        m.body_at,
+                        std::time::Instant::now(),
+                        m.from,
+                    ) {
+                        Ok(()) => Some((m.request_id, m.from)),
+                        Err(_) => None,
+                    }
+                }
+            };
+            if let Some((req_id, from)) = committed {
+                daemon.bus.publish(
+                    "queue.residue_resubmit_armed",
+                    "queue",
+                    Some(s.id),
+                    json!({
+                        "surface_ref": cys::surface_ref(s.id),
+                        "request_id": req_id,
+                        "from": from.map(cys::surface_ref),
+                        "note": "큐 배달 본문의 제출 Return 이 삼켜져 입력줄에 그대로 남은 것이 증명됐다 — 다음 재제출 틱이 Return 을 한 번 다시 쓴다.",
+                    }),
+                );
+            }
+        }
+        Err(why) => {
+            if residue_arm_refusal_is_proof_decline(why) {
+                if let Some(b) = body.as_ref() {
+                    if p10_block_is_proven_machine_text(&obs, b, pending_bytes, raw_human_bytes, last_human) {
+                        let req_id = mark
+                            .as_ref()
+                            .filter(|m| m.body_at == b.at)
+                            .map(|m| m.request_id.clone())
+                            .unwrap_or_default();
+                        s.inject_track.residue_set_declined_for_body(req_id, b.at, why);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// ★(0.14.42 · 수정 3회차 FV2-1 ⓒ · 수정 4회차 R3C-1) 보류 기록의 **창 대기 상한**(초) — 재제출 틱이 창(질문·선택 창 —
 /// 또는 창으로 보이는 화면 — ∨ 승인 대기)을 **연달아 열린 것으로 본** 시간([`crate::state::WithheldSubmit::dialog_ms`])이
 /// 이것을 넘으면 기록을 버리고 사유 `wait_cap` 을 1건 발행한다(쓰기 0 — 상한은 '다시 쓰지 않음' 쪽으로만 끝낸다 · 폭주
@@ -6319,89 +6913,6 @@ pub(crate) const WITHHELD_SUBMIT_WAIT_CAP_SECS: u64 = 600;
 /// ★(수정 3회차 FV2-1) '입력줄이 그 본문 그대로'·'창 없음'은 보류 탐침과 **같은 판정**([`submit_cr_verdict`] — 커서가 든 입력
 /// 블록 전체 · 블록 위 서명은 전경 아님)이다. 종전에는 본문 첫 줄의 `❯ 1.`·이력 에코를 창으로 보아 `wait_dialog` 에 영구히
 /// 머물렀다(실 claude · 접힌 줄·여러 줄 본문).
-
-pub(crate) const P10_EXTENT_MEASURED_ADAPTERS: &[&str] = &["unmeasured_placeholder_on_base"];
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ResidueArmInput {
-    pub(crate) cfg_unix: bool,
-    pub(crate) seat_agent_backed: bool,
-    pub(crate) scope: SubmitGuardScope,
-    pub(crate) dialog_open: bool,
-    pub(crate) d9_scope: bool,
-    pub(crate) label_unbound: bool,
-    pub(crate) quiescing: bool,
-    pub(crate) paused: bool,
-    pub(crate) kill_switch: bool,
-    pub(crate) pending_bytes: usize,
-    pub(crate) raw_human_bytes: usize,
-    pub(crate) has_body: bool,
-    pub(crate) cli_body: bool,
-    pub(crate) human_after_body: bool,
-    pub(crate) provenance: bool,
-    pub(crate) slash_body: bool,
-    pub(crate) adapter_extent_measured: bool,
-    pub(crate) box_bounded: bool,
-    pub(crate) representation: bool,
-    pub(crate) after_and_below_empty: bool,
-    pub(crate) cr_age_ok: bool,
-    pub(crate) quiet_ok: bool,
-    pub(crate) withheld_present: bool,
-    pub(crate) queue_hold_present: bool,
-    pub(crate) already_tracked_for_body: bool,
-}
-
-pub(crate) fn residue_arm_verdict(_g: &ResidueArmInput) -> Result<(), &'static str> {
-    Err("unimplemented_on_07994870")
-}
-
-pub(crate) fn p10_block_matches_full_body(
-    _before_cursor: &str,
-    _mark_flat_len: usize,
-    _mark_flat_sha: &[u8; 32],
-) -> bool {
-    false
-}
-
-pub(crate) fn p10_after_and_below_empty(
-    _s: &crate::state::Surface,
-    _obs: &PromptBlockObs,
-    _placeholder: Option<&str>,
-) -> bool {
-    false
-}
-
-pub(crate) fn maybe_arm_swallowed_residue(
-    _daemon: &Arc<Daemon>,
-    _s: &Arc<crate::state::Surface>,
-    _markers: &[String],
-    _placeholder: Option<&str>,
-) {
-}
-
-pub(crate) fn resubmit_swallowed_one(
-    _daemon: &Arc<Daemon>,
-    _s: &Arc<crate::state::Surface>,
-    _w: crate::state::WithheldSubmit,
-    _now: std::time::Instant,
-) -> &'static str {
-    "unimplemented_on_07994870"
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn residue_final_probe(
-    _daemon: &Arc<Daemon>,
-    _s: &Arc<crate::state::Surface>,
-    _markers: Vec<String>,
-    _placeholder: Option<String>,
-    _req_id: String,
-    _body_at: std::time::Instant,
-    _expected_gen: u64,
-    _from_surface: Option<u64>,
-) -> Box<dyn Fn() -> bool + Send + Sync> {
-    Box::new(|| false)
-}
-
 pub(crate) fn resubmit_withheld_submits(daemon: &Arc<Daemon>) {
     resubmit_withheld_submits_at(daemon, std::time::Instant::now());
 }
@@ -6415,7 +6926,12 @@ pub(crate) fn resubmit_withheld_submits_at(daemon: &Arc<Daemon>, now: std::time:
         .lock()
         .unwrap()
         .values()
-        .filter(|s| s.inject_track.withheld().is_some())
+        .filter(|s| {
+            s.inject_track.withheld().is_some()
+                || s.inject_track
+                    .residue_track()
+                    .is_some_and(|r| matches!(r.stage, crate::state::ResidueStage::Armed))
+        })
         .cloned()
         .collect();
     if paused {
@@ -6441,9 +6957,58 @@ fn resubmit_withheld_one(
     s: &Arc<crate::state::Surface>,
     now: std::time::Instant,
 ) -> &'static str {
+    // ★(0.14.57 · P10 · DESIGN-P10-r3 §2) Identity-aware Guard 11 at the head of the resubmit pass:
+    //   if a residue track is `Armed`, the `withheld` slot must hold that exact `Swallowed` record and `queue_hold` must be
+    //   empty. If a competing record replaced ours (or the slot is empty, or a `queue_hold` exists), our track declines as
+    //   `owner_changed` while leaving any competing `withheld` record untouched so its own owner keeps its Return.
+    if let Some(tr) = s.inject_track.residue_track() {
+        if matches!(tr.stage, crate::state::ResidueStage::Armed) {
+            let cur_w = s.inject_track.withheld();
+            let own = cur_w.as_ref().is_some_and(|w| {
+                w.kind == crate::state::WithheldKind::Swallowed
+                    && w.body_at == tr.body_at
+                    && w.request_id.as_deref() == Some(tr.request_id.as_str())
+            });
+            let hold_present = s.queue_hold.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+            if !own {
+                s.inject_track.residue_decline(&tr.request_id, tr.body_at, "owner_changed");
+                if cur_w.is_none() {
+                    return "owner_changed";
+                }
+            } else if hold_present {
+                let gone = s.inject_track.take_withheld_if_identity(
+                    crate::state::WithheldKind::Swallowed,
+                    &tr.request_id,
+                    tr.body_at,
+                );
+                s.inject_track.residue_decline(&tr.request_id, tr.body_at, "owner_changed");
+                if let Some(gone) = gone {
+                    daemon.bus.publish(
+                        "queue.submit_withheld_dropped",
+                        "queue",
+                        Some(s.id),
+                        json!({
+                            "surface_ref": cys::surface_ref(s.id),
+                            "reason": "owner_changed",
+                            "basis": "swallowed",
+                            "request_id": tr.request_id,
+                            "from": gone.from.map(cys::surface_ref),
+                            "withheld_ms_ago": now.saturating_duration_since(gone.at).as_millis() as u64,
+                            "dialog_open_ms": gone.dialog_ms,
+                            "note": "보류한 제출 CR 을 다시 쓰지 않는다 — 입력줄의 본문은 그대로 둔다(사람·다음 주입이 처리).",
+                        }),
+                    );
+                }
+                return "owner_changed";
+            }
+        }
+    }
     let Some(w0) = s.inject_track.withheld() else {
         return "none";
     };
+    if w0.kind == crate::state::WithheldKind::Swallowed {
+        return resubmit_swallowed_one(daemon, s, w0, now);
+    }
     let (at, from) = (w0.at, w0.from);
     // ★(R3C-1) 직전 틱 뒤 경과 — pause 아닌 나이(`live_ms`)에 더하고, 창 시계에 넘길 몫은 아래 창 관측이 쓴다.
     let mut elapsed_ms = 0;
@@ -6563,6 +7128,7 @@ fn resubmit_withheld_one(
             bytes: b"\r".to_vec(),
             min_gap_ms: crate::handlers::cr_min_gap_ms(),
             withhold: Some(probe),
+            done: None,
         };
         s.inject_track.submit_handed();
         if s.write_tx.try_send(req).is_err() {
@@ -6578,9 +7144,312 @@ fn resubmit_withheld_one(
         Some(s.id),
         json!({
             "surface_ref": cys::surface_ref(s.id),
+            "basis": "withheld",
             "from": from.map(cys::surface_ref),
             "withheld_ms_ago": now.saturating_duration_since(at).as_millis() as u64,
             "note": "창이 닫히고 입력줄이 보류한 기계 본문 그대로라 그 제출 CR 을 다시 썼다(쓰기 직전 창이 다시 뜨면 또 보류).",
+        }),
+    );
+    "resubmitted"
+}
+
+/// ★(0.14.57 · P10 · DESIGN-P10-r2 §1.4, r3 §2-3) Resubmit pass for `WithheldKind::Swallowed`.
+fn resubmit_swallowed_one(
+    daemon: &Arc<Daemon>,
+    s: &Arc<crate::state::Surface>,
+    w0: crate::state::WithheldSubmit,
+    now: std::time::Instant,
+) -> &'static str {
+    let (at, body_at, from) = (w0.at, w0.body_at, w0.from);
+    let Some(request_id) = w0.request_id.clone() else {
+        let _ = s.inject_track.take_withheld_if(at);
+        return "owner_changed";
+    };
+    let Some(tr) = s.inject_track.residue_track() else {
+        let _ = s.inject_track.take_withheld_if_identity(
+            crate::state::WithheldKind::Swallowed,
+            &request_id,
+            body_at,
+        );
+        return "owner_changed";
+    };
+    if tr.request_id != request_id || tr.body_at != body_at || !matches!(tr.stage, crate::state::ResidueStage::Armed) {
+        let _ = s.inject_track.take_withheld_if_identity(
+            crate::state::WithheldKind::Swallowed,
+            &request_id,
+            body_at,
+        );
+        s.inject_track.residue_decline(&tr.request_id, tr.body_at, "owner_changed");
+        return "owner_changed";
+    }
+    let mut elapsed_ms = 0;
+    let Some(w) = s.inject_track.update_withheld_if(at, |w| elapsed_ms = w.advance(now, false)) else {
+        s.inject_track.residue_decline(&request_id, body_at, "owner_changed");
+        return "raced";
+    };
+    let drop_swallowed = |why: &'static str| -> &'static str {
+        let gone = s.inject_track.take_withheld_if_identity(
+            crate::state::WithheldKind::Swallowed,
+            &request_id,
+            body_at,
+        );
+        s.inject_track.residue_decline(&request_id, body_at, why);
+        if let Some(gone) = gone {
+            daemon.bus.publish(
+                "queue.submit_withheld_dropped",
+                "queue",
+                Some(s.id),
+                json!({
+                    "surface_ref": cys::surface_ref(s.id),
+                    "reason": why,
+                    "basis": "swallowed",
+                    "request_id": request_id,
+                    "from": from.map(cys::surface_ref),
+                    "withheld_ms_ago": now.saturating_duration_since(at).as_millis() as u64,
+                    "dialog_open_ms": gone.dialog_ms,
+                    "note": "보류한 제출 CR 을 다시 쓰지 않는다 — 입력줄의 본문은 그대로 둔다(사람·다음 주입이 처리).",
+                }),
+            );
+        }
+        why
+    };
+    let ttl = crate::state::queue_ttl_default_secs();
+    if ttl > 0 && w.live_ms / 1000 >= ttl {
+        return drop_swallowed("expired");
+    }
+    if crate::handlers::send_settle_disabled(daemon) {
+        return drop_swallowed("kill_switch");
+    }
+    if !p10_platform_enabled_for_seat(s) {
+        return drop_swallowed("platform");
+    }
+    let scope = submit_guard_scope(s);
+    if !crate::alert_route::seat_is_agent_backed(s) || scope == SubmitGuardScope::Off {
+        return drop_swallowed("seat_off");
+    }
+    if d9_scope(daemon, s, false) {
+        return drop_swallowed("d9_scope");
+    }
+    let Some(body) = s.inject_track.last_body() else {
+        return drop_swallowed("newer_body");
+    };
+    if body.at != body_at {
+        return drop_swallowed("newer_body");
+    }
+    let pending_bytes = s.pending_input_bytes.load(Ordering::Relaxed);
+    let human_bytes = s.pending_input.lock().unwrap_or_else(|e| e.into_inner()).human;
+    let last_human = *s.last_human_input.lock().unwrap_or_else(|e| e.into_inner());
+    let human_after = last_human.is_some_and(|t| t > body.at);
+    if pending_bytes != 0 || human_bytes != 0 || human_after {
+        return drop_swallowed("human");
+    }
+    let mark = s.inject_track.queue_submit_mark();
+    let input_gen = s.input_gen.load(Ordering::Acquire);
+    let write_epoch = s.inject_track.resume_write_epoch();
+    let agent_epoch = s.agent_epoch.load(Ordering::Acquire);
+    let conv_epoch = s.conversation_epoch.load(Ordering::Acquire);
+    if !p10_provenance_holds(
+        mark.as_ref(),
+        Some(&body),
+        input_gen,
+        write_epoch,
+        last_human,
+        agent_epoch,
+        conv_epoch,
+    ) || mark.as_ref().is_none_or(|m| m.request_id != request_id)
+    {
+        return drop_swallowed("provenance");
+    }
+    let mark = mark.expect("checked Some");
+    if body.norm.starts_with('/') {
+        return drop_swallowed("slash_body");
+    }
+    if effective_quiescing_since(daemon, s).is_some() {
+        let _ = s.inject_track.update_withheld_if(at, |w| w.observe_dialog(None, elapsed_ms));
+        return "wait_quiescing";
+    }
+    let adapters = load_adapter_defs();
+    let Some((markers, placeholder)) = surface_prompt_marker(s, &adapters) else {
+        return drop_swallowed("unobservable");
+    };
+    if markers.is_empty() {
+        return drop_swallowed("unobservable");
+    }
+    if !p10_seat_adapter_extent_measured(s) {
+        return drop_swallowed("unmeasured_adapter");
+    }
+    let obs = observe_prompt_block(s, &markers);
+    if obs.label == cys::readiness::ComposerLabel::Unbound {
+        return "wait_label";
+    }
+    let v = submit_cr_verdict(scope, &obs, Some(body.norm.as_str()));
+    let dialog_open = v.hits || approval_or_gate_pending(daemon, s.id);
+    let Some(w) = s.inject_track.update_withheld_if(at, |w| w.observe_dialog(Some(dialog_open), elapsed_ms)) else {
+        s.inject_track.residue_decline(&request_id, body_at, "owner_changed");
+        return "raced";
+    };
+    if dialog_open {
+        if w.dialog_ms / 1000 >= WITHHELD_SUBMIT_WAIT_CAP_SECS {
+            return drop_swallowed("wait_cap");
+        }
+        return "wait_dialog";
+    }
+    if !obs.frame_consistent() {
+        return "wait_prompt";
+    }
+    let Some(block) = obs.block.as_ref() else {
+        return drop_swallowed("representation");
+    };
+    if block.before_cursor.trim().is_empty() {
+        let _ = s.inject_track.take_withheld_if_identity(
+            crate::state::WithheldKind::Swallowed,
+            &request_id,
+            body_at,
+        );
+        s.inject_track.clear_residue_track();
+        daemon.bus.publish(
+            "queue.submit_withheld_dropped",
+            "queue",
+            Some(s.id),
+            json!({
+                "surface_ref": cys::surface_ref(s.id),
+                "reason": "line_empty",
+                "basis": "swallowed",
+                "request_id": request_id,
+                "from": from.map(cys::surface_ref),
+                "withheld_ms_ago": now.saturating_duration_since(at).as_millis() as u64,
+                "dialog_open_ms": w.dialog_ms,
+                "note": "보류한 제출 CR 을 다시 쓰지 않는다 — 입력줄의 본문은 그대로 둔다(사람·다음 주입이 처리).",
+            }),
+        );
+        return "line_empty";
+    }
+    if !block.box_bounded {
+        return drop_swallowed("unbounded_box");
+    }
+    if !p10_block_matches_full_body(&block.before_cursor, mark.flat_len, &mark.flat_sha) {
+        return drop_swallowed("representation");
+    }
+    if !p10_after_and_below_empty(s, &obs, placeholder.as_deref()) {
+        return drop_swallowed("below");
+    }
+    let Some(view) = obs.with_block_emptied() else {
+        return "wait_line";
+    };
+    let mut gate = prompt_gate_input(daemon, s, view.marker.as_str(), placeholder.as_deref(), &view);
+    gate.input = InputLine::Empty;
+    gate.modal_foreground = false;
+    gate.selector_row = false;
+    if prompt_gate_verdict(&gate) != PromptGate::Ready {
+        return "wait_prompt";
+    }
+    if now.saturating_duration_since(mark.cr_mono) < Duration::from_secs(SWALLOWED_SUBMIT_QUIET_SECS)
+        || obs.quiet_secs < SWALLOWED_SUBMIT_QUIET_SECS
+    {
+        return "wait_quiet";
+    }
+    {
+        let _gate = s.input_gate.lock().unwrap();
+        let mark_now = s.inject_track.queue_submit_mark();
+        let body_now = s.inject_track.last_body();
+        let gen_now = s.input_gen.load(Ordering::Acquire);
+        let epoch_now = s.inject_track.resume_write_epoch();
+        let human_now = *s.last_human_input.lock().unwrap_or_else(|e| e.into_inner());
+        let agent_now = s.agent_epoch.load(Ordering::Acquire);
+        let conv_now = s.conversation_epoch.load(Ordering::Acquire);
+        let pending_now = s.pending_input_bytes.load(Ordering::Relaxed);
+        let raw_human_now = s.pending_input.lock().unwrap_or_else(|e| e.into_inner()).human;
+        let hold_now = s.queue_hold.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+        if hold_now {
+            let _ = s.inject_track.take_withheld_if_identity(
+                crate::state::WithheldKind::Swallowed,
+                &request_id,
+                body_at,
+            );
+            s.inject_track.residue_decline(&request_id, body_at, "owner_changed");
+            return "owner_changed";
+        }
+        if pending_now != 0
+            || raw_human_now != 0
+            || !p10_provenance_holds(
+                mark_now.as_ref(),
+                body_now.as_ref(),
+                gen_now,
+                epoch_now,
+                human_now,
+                agent_now,
+                conv_now,
+            )
+            || mark_now.as_ref().is_none_or(|m| m.request_id != request_id)
+        {
+            let _ = s.inject_track.take_withheld_if_identity(
+                crate::state::WithheldKind::Swallowed,
+                &request_id,
+                body_at,
+            );
+            s.inject_track.residue_decline(&request_id, body_at, "provenance");
+            return "raced";
+        }
+        let Some(taken_w) = s.inject_track.take_withheld_if_identity(
+            crate::state::WithheldKind::Swallowed,
+            &request_id,
+            body_at,
+        ) else {
+            s.inject_track.residue_decline(&request_id, body_at, "owner_changed");
+            return "owner_changed";
+        };
+        if !s.inject_track.residue_set_handed(&request_id, body_at, now) {
+            return "owner_changed";
+        }
+        let probe = residue_final_probe(
+            daemon,
+            s,
+            markers,
+            placeholder,
+            request_id.clone(),
+            body_at,
+            mark.gen,
+            from,
+        );
+        let done = crate::state::SubmitDone::new(&s.inject_track, request_id.clone(), body_at);
+        let req = crate::state::WriteReq::SubmitAfterGap {
+            bytes: b"\r".to_vec(),
+            min_gap_ms: crate::handlers::cr_min_gap_ms(),
+            withhold: Some(probe),
+            done: Some(done),
+        };
+        s.inject_track.submit_handed();
+        if let Err(err) = s.write_tx.try_send(req) {
+            s.inject_track.submit_hand_failed();
+            match err {
+                std::sync::mpsc::TrySendError::Full(mut rejected) => {
+                    rejected.disarm_submit_done();
+                    s.inject_track.residue_restore_armed(&request_id, body_at);
+                    if !s.inject_track.restore_withheld_if_empty(taken_w) {
+                        s.inject_track.residue_decline(&request_id, body_at, "owner_changed");
+                        return "owner_changed";
+                    }
+                    return "write_failed";
+                }
+                std::sync::mpsc::TrySendError::Disconnected(mut rejected) => {
+                    rejected.disarm_submit_done();
+                    s.inject_track.residue_decline(&request_id, body_at, "writer_gone");
+                    return "writer_gone";
+                }
+            }
+        }
+    }
+    daemon.bus.publish(
+        "queue.submit_resubmitted",
+        "queue",
+        Some(s.id),
+        json!({
+            "surface_ref": cys::surface_ref(s.id),
+            "basis": "swallowed",
+            "request_id": request_id,
+            "from": from.map(cys::surface_ref),
+            "withheld_ms_ago": now.saturating_duration_since(at).as_millis() as u64,
+            "note": "삼켜진 큐 배달 제출 Return 을 한 번 다시 넘겼다(쓰기 직전 재검증 통과 시 전송).",
         }),
     );
     "resubmitted"
@@ -8976,6 +9845,7 @@ pub(crate) struct QueueBlockDiag {
     /// ★(codex 2차 검토 #4) 이 좌석은 다시 그리기 요청 **대상이 아니다** — 프롬프트 표지를 모르는 좌석(맨 셸·마커 미선언 어댑터 — 큐 틱의 마커 없는 경로는 nudge 를 부르지 않는다)
     /// 또는 전경이 에이전트가 아닌 대체 화면. 처방은 이 좌석에 요청을 약속하지 않는다.
     pub(crate) nudge_ineligible: bool,
+    /// ★(0.14.57 · P10) 기계가 넣은 본문이 입력줄에 남아 있을 때의 복구 상태(`None` | `Armed` | `Spent` | `Declined`).
     pub(crate) residue: crate::state::QueueBlockResidue,
 }
 
@@ -9458,6 +10328,150 @@ pub(crate) fn seat_input_line_visibility(
     seat_input_line_visibility_with(s, &diag_adapter_defs)
 }
 
+/// ★(0.14.57 · P10 · DESIGN-P10-r1 §6.4, r2 §1.6, r3 §3) 좌석의 기계 잔여 본문 상태(`QueueBlockDiag::residue`) 판독 —
+/// `queue_block_diag_with` 가 호출하며, 큐 틱(`deliver_queued`)과 같은 `InjectTrack::residue_track` 및 증명 조건을 읽는다.
+fn seat_queue_block_residue(
+    daemon: &Arc<Daemon>,
+    s: &Arc<crate::state::Surface>,
+    defs: &dyn Fn() -> Arc<(serde_json::Value, serde_json::Value)>,
+    pending: u64,
+    draft_visible: Option<bool>,
+    has_marker: bool,
+) -> crate::state::QueueBlockResidue {
+    if draft_visible == Some(false) {
+        if s.inject_track.residue_track().is_some_and(|r| {
+            matches!(
+                r.stage,
+                crate::state::ResidueStage::Written { .. }
+                    | crate::state::ResidueStage::Spent
+                    | crate::state::ResidueStage::Declined(_)
+            )
+        }) {
+            s.inject_track.clear_residue_track();
+        }
+        return crate::state::QueueBlockResidue::None;
+    }
+    if pending != 0 || draft_visible != Some(true) || !has_marker || s.parser.is_poisoned() {
+        return crate::state::QueueBlockResidue::None;
+    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(body) = s.inject_track.last_body() else {
+            return crate::state::QueueBlockResidue::None;
+        };
+        let Some((markers, placeholder)) = surface_prompt_marker(s, &defs()) else {
+            return crate::state::QueueBlockResidue::None;
+        };
+        let raw_human = s.pending_input.lock().unwrap_or_else(|e| e.into_inner()).human;
+        let last_human = *s.last_human_input.lock().unwrap_or_else(|e| e.into_inner());
+        let obs = observe_prompt_block(s, &markers);
+        let proven = p10_block_is_proven_machine_text(&obs, &body, pending, raw_human, last_human);
+        let now = std::time::Instant::now();
+        match s.inject_track.residue_track().filter(|r| r.body_at == body.at) {
+            Some(r) => match r.stage {
+                crate::state::ResidueStage::Armed | crate::state::ResidueStage::Handed { .. } => {
+                    crate::state::QueueBlockResidue::Armed
+                }
+                crate::state::ResidueStage::Writing { writing_at } => {
+                    if now.saturating_duration_since(writing_at).as_secs() >= SWALLOWED_SUBMIT_STUCK_WRITE_SECS {
+                        crate::state::QueueBlockResidue::Declined("stuck_write")
+                    } else {
+                        crate::state::QueueBlockResidue::Armed
+                    }
+                }
+                crate::state::ResidueStage::Written { written_at } => {
+                    if now.saturating_duration_since(written_at).as_secs() < SWALLOWED_SUBMIT_QUIET_SECS {
+                        crate::state::QueueBlockResidue::Armed
+                    } else if proven {
+                        s.inject_track.residue_mark_spent(&r.request_id, body.at);
+                        crate::state::QueueBlockResidue::Spent
+                    } else {
+                        crate::state::QueueBlockResidue::None
+                    }
+                }
+                crate::state::ResidueStage::Spent => {
+                    if proven {
+                        crate::state::QueueBlockResidue::Spent
+                    } else {
+                        crate::state::QueueBlockResidue::None
+                    }
+                }
+                crate::state::ResidueStage::Declined(why) => {
+                    if proven {
+                        crate::state::QueueBlockResidue::Declined(why)
+                    } else {
+                        crate::state::QueueBlockResidue::None
+                    }
+                }
+            },
+            None => {
+                if !proven {
+                    return crate::state::QueueBlockResidue::None;
+                }
+                let scope = submit_guard_scope(s);
+                let mark = s.inject_track.queue_submit_mark();
+                let input_gen = s.input_gen.load(Ordering::Acquire);
+                let write_epoch = s.inject_track.resume_write_epoch();
+                let agent_epoch = s.agent_epoch.load(Ordering::Acquire);
+                let conv_epoch = s.conversation_epoch.load(Ordering::Acquire);
+                let provenance = p10_provenance_holds(
+                    mark.as_ref(),
+                    Some(&body),
+                    input_gen,
+                    write_epoch,
+                    last_human,
+                    agent_epoch,
+                    conv_epoch,
+                );
+                let representation = match (obs.block.as_ref(), mark.as_ref()) {
+                    (Some(blk), Some(m)) => p10_block_matches_full_body(&blk.before_cursor, m.flat_len, &m.flat_sha),
+                    _ => false,
+                };
+                let after_and_below_empty = p10_after_and_below_empty(s, &obs, placeholder.as_deref());
+                let cr_age_ok = mark.as_ref().is_some_and(|m| {
+                    m.cr_mono >= m.body_at
+                        && now.saturating_duration_since(m.cr_mono) >= Duration::from_secs(SWALLOWED_SUBMIT_QUIET_SECS)
+                });
+                let v = submit_cr_verdict(scope, &obs, Some(body.norm.as_str()));
+                let dialog_open = v.hits || approval_or_gate_pending(daemon, s.id);
+                let arm = ResidueArmInput {
+                    cfg_unix: p10_platform_enabled_for_seat(s),
+                    seat_agent_backed: crate::alert_route::seat_is_agent_backed(s),
+                    scope,
+                    dialog_open,
+                    d9_scope: d9_scope(daemon, s, false),
+                    label_unbound: obs.label == cys::readiness::ComposerLabel::Unbound,
+                    quiescing: effective_quiescing_since(daemon, s).is_some(),
+                    paused: daemon.paused.load(Ordering::Relaxed) || queue_injection_paused(daemon, s),
+                    kill_switch: crate::handlers::send_settle_disabled(daemon),
+                    pending_bytes: pending,
+                    raw_human_bytes: raw_human,
+                    has_body: true,
+                    cli_body: body.owner.is_some(),
+                    human_after_body: last_human.is_some_and(|h| h > body.at),
+                    provenance,
+                    slash_body: body.norm.starts_with('/'),
+                    adapter_extent_measured: p10_seat_adapter_extent_measured(s),
+                    box_bounded: obs.block.as_ref().is_some_and(|b| b.box_bounded),
+                    representation,
+                    after_and_below_empty,
+                    cr_age_ok,
+                    quiet_ok: obs.quiet_secs >= SWALLOWED_SUBMIT_QUIET_SECS,
+                    withheld_present: s.inject_track.withheld().is_some(),
+                    queue_hold_present: s.queue_hold.lock().unwrap_or_else(|e| e.into_inner()).is_some(),
+                    already_tracked_for_body: false,
+                };
+                match residue_arm_verdict(&arm) {
+                    Err(why) if residue_arm_refusal_is_proof_decline(why) => {
+                        crate::state::QueueBlockResidue::Declined(why)
+                    }
+                    _ => crate::state::QueueBlockResidue::None,
+                }
+            }
+        }
+    }))
+    .unwrap_or(crate::state::QueueBlockResidue::None)
+}
+
 /// 좌석 진단 스냅샷(관측 한 곳) — `queue.starved` 발행·`queue.list`·`org.status`·`queue-blocked.json` 이 모두 이 함수 하나를 쓴다. 어댑터 정의는 `defs` 로 받는다.
 /// 큐 락(`pending_queue` 등)을 쥔 채 부르지 않는다(파서 락은 큐 락 밖 — 위 【락 순서】).
 pub(crate) fn queue_block_diag_with(
@@ -9484,6 +10498,7 @@ pub(crate) fn queue_block_diag_with(
     // (codex 2차 검토 #4) nudge 대상 = 마커 좌석(큐 틱의 마커 경로만 nudge 를 부른다) ∧ (비-대체 화면 ∨ 전경 에이전트). 맨 셸은 어댑터를 읽지 않는다(RQFIX F4 와 같은 규율).
     let has_marker = s.agent_meta.lock().map(|m| m.is_some()).unwrap_or(false) && surface_prompt_marker(s, &defs()).is_some();
     let nudge_ineligible = !has_marker || (alt && !alt_fg_agent);
+    let residue = seat_queue_block_residue(daemon, s, defs, pending, draft_visible, has_marker);
     QueueBlockDiag {
         pending_input_bytes: pending,
         pending_input_human_bytes: human,
@@ -9508,7 +10523,7 @@ pub(crate) fn queue_block_diag_with(
         rows_too_small,
         repaint_unresolved,
         nudge_ineligible,
-        residue: crate::state::QueueBlockResidue::None,
+        residue,
     }
 }
 
@@ -9695,6 +10710,8 @@ pub(crate) fn paused_queue_remedy(
 /// |---|---|---|
 /// | 1 | `kill_switch` | `paused`(오너 문장) |
 /// | 2 | `paused`(좌석 pause 만) | `paused`(좌석 문장) |
+/// | 3a | 입력줄 ∧ c == 0 ∧ dv == Some(true) ∧ residue == Armed | `wait` |
+/// | 3b | 입력줄 ∧ c == 0 ∧ dv == Some(true) ∧ residue ∈ {Spent, Declined} | `machine_residue` |
 /// | 3 | 입력줄 ∧ c == 0 ∧ dv == Some(true) | `human_draft` |
 /// | 4 | 입력줄 ∧ c == 0 | `wait` |
 /// | 5 | 입력줄 ∧ dv == Some(true) ∧ h == 0 | `machine_residue` |
@@ -9727,6 +10744,29 @@ pub(crate) fn queue_remedy(blocked_by: &str, d: &QueueBlockDiag) -> (&'static st
     };
     let (code, body): (&'static str, String) = if let Some(body) = pause_remedy_body(d.kill_switch, d.paused) {
         ("paused", body.into())
+    } else if input_line
+        && d.pending_input_bytes == 0
+        && d.draft_visible == Some(true)
+        && d.residue == crate::state::QueueBlockResidue::Armed
+    {
+        (
+            "wait",
+            "기계가 넣고 제출되지 않은 본문이 입력줄에 보인다 — 데몬이 제출 Return 을 한 번 다시 보내는 중이다(스스로 풀린다)".into(),
+        )
+    } else if input_line
+        && d.pending_input_bytes == 0
+        && d.draft_visible == Some(true)
+        && matches!(
+            d.residue,
+            crate::state::QueueBlockResidue::Spent | crate::state::QueueBlockResidue::Declined(_)
+        )
+    {
+        (
+            "machine_residue",
+            "기계가 넣고 제출되지 않은 본문이 입력줄에 보인다(자동 재제출 대상이 아니거나 한 번 보낸 제출 Return 이 먹히지 않았다) — \
+             사람이 그 창을 확인하고 Enter 로 제출하거나 지운다(원장에는 이미 배달로 기록됐으므로 지우면 본문은 전달되지 않는다)"
+                .into(),
+        )
     } else if input_line && d.pending_input_bytes == 0 && d.draft_visible == Some(true) {
         ("human_draft", REMEDY_BODY_HUMAN_DRAFT.into())
     } else if input_line && d.pending_input_bytes == 0 {
@@ -10687,6 +11727,13 @@ struct HandoffStamp {
     agent_epoch: u64,
     conversation_epoch: u64,
     human_at: Option<std::time::Instant>,
+    /// ★(0.14.57 · P10 r2 §1.1) Provenance baseline at hand-off (`input_gen` after `set_pending_input(0)` and
+    /// `resume_write_epoch` before the job writes), plus the flattened body digest and sender surface id.
+    handoff_gen: u64,
+    handoff_write_epoch: u64,
+    flat_len: usize,
+    flat_sha: [u8; 32],
+    from: Option<u64>,
 }
 
 impl HandoffStamp {
@@ -10699,6 +11746,11 @@ impl HandoffStamp {
             agent_epoch: s.agent_epoch.load(Ordering::Acquire),
             conversation_epoch: s.conversation_epoch.load(Ordering::Acquire),
             human_at: *s.last_human_input.lock().unwrap_or_else(|e| e.into_inner()),
+            handoff_gen: 0,
+            handoff_write_epoch: 0,
+            flat_len: 0,
+            flat_sha: [0u8; 32],
+            from: None,
         }
     }
     /// The seat is still on the hand-off's agent and conversation.
@@ -11050,6 +12102,29 @@ fn settle_queue_write(
                         *hold = None;
                     }
                     *slot = None;
+                    // ★(0.14.57 · P10 r2 §1.1) Record the submitted queue write's completion mark ONLY if no foreign
+                    //   input, writer write, human keystroke, or epoch change occurred between hand-off and CR completion.
+                    let clean_window = s.input_gen.load(Ordering::Acquire) == stamp.handoff_gen
+                        && s.inject_track.resume_write_epoch() == stamp.handoff_write_epoch + 1
+                        && *s.last_human_input.lock().unwrap_or_else(|e| e.into_inner()) == stamp.human_at
+                        && stamp.epochs_hold(s);
+                    let mark = clean_window
+                        .then(|| s.inject_track.last_body())
+                        .flatten()
+                        .map(|b| crate::state::QueueSubmitMark {
+                            request_id: request_id.to_string(),
+                            body_at: b.at,
+                            gen: s.input_gen.load(Ordering::Acquire),
+                            epoch: s.inject_track.resume_write_epoch(),
+                            human_at: stamp.human_at,
+                            agent_epoch: stamp.agent_epoch,
+                            conversation_epoch: stamp.conversation_epoch,
+                            cr_mono: std::time::Instant::now(),
+                            flat_len: stamp.flat_len,
+                            flat_sha: stamp.flat_sha,
+                            from: stamp.from,
+                        });
+                    s.inject_track.set_queue_submit_mark(mark);
                 }
                 s.queue_completion_pending.store(true, Ordering::Release);
             }
@@ -12247,6 +13322,12 @@ pub(crate) fn deliver_head_locked(
         };
         let mut stamp = HandoffStamp::of(s, request.clone(), proof, guard.clone());
         stamp.claim = d9_claim.clone();
+        stamp.handoff_gen = f.pending_gen;
+        stamp.handoff_write_epoch = s.inject_track.resume_write_epoch();
+        let (flat_len, flat_sha) = crate::state::flat_text_digest(&d.body);
+        stamp.flat_len = flat_len;
+        stamp.flat_sha = flat_sha;
+        stamp.from = from_surface;
         // ★(0.14.56 · P1 D9 pre-CR · D3-BOUND r2 §1.2) the claim baseline = S0, adjusted by the queue's ONE own mark between S0
         //   and `try_send`: `set_pending_input(0)` above adds exactly 1 to `input_gen`. Set before the job can be claimed.
         if let (Some(c), Some((gen, wrote, human_at))) = (&d9_claim, d9_s0) {
@@ -14370,12 +15451,25 @@ fn deliver_queued(
                 PromptGate::Blocked(why) => {
                     // 사유를 갈라 기록한다 — 손잡이가 다르다(입력줄 점유는 사람이 비워야 풀리고,
                     // 경계 미도달은 화면이 바뀌면 저절로 풀린다).
+                    if why == BLOCKED_INPUT_PENDING {
+                        maybe_arm_swallowed_residue(daemon, &s, markers, placeholder);
+                    }
                     block(why);
                     continue;
                 }
                 // 프롬프트 경계 배달은 quiet 대기를 거치지 않는다 — overdue(제한 배달) 표식도 아니다.
                 // alt-screen 양성 유휴는 정적 기반이라 프레임 신선도를 임계영역에서 재확인한다.
                 PromptGate::Ready => {
+                    if s.inject_track.residue_track().is_some_and(|r| {
+                        matches!(
+                            r.stage,
+                            crate::state::ResidueStage::Written { .. }
+                                | crate::state::ResidueStage::Spent
+                                | crate::state::ResidueStage::Declined(_)
+                        )
+                    }) {
+                        s.inject_track.clear_residue_track();
+                    }
                     let gen = input.alt_screen.then_some(obs.output_gen);
                     // ★(리뷰 R2(R7회차) · codex major M4) 비-alt 경로는 세대를 넘기지 않는다(그 계약이
                     //   스트리밍 중 배달을 허용한다). 그러나 "판정 뒤 인계 전에 **완결된 채로** 바뀐
@@ -14669,6 +15763,38 @@ static P10_ARM_BEFORE_COMMIT_HOOK: std::sync::Mutex<Option<Box<dyn FnOnce() + Se
 #[cfg(test)]
 static P10_GAP_HOOK: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> =
     std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn p10_adapter_extent_measured(agent: &str) -> bool {
+    match *P10_EXTENT_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()) {
+        Some(list) => list.contains(&agent),
+        None => P10_EXTENT_MEASURED_ADAPTERS.contains(&agent),
+    }
+}
+
+#[cfg(test)]
+fn p10_platform_enabled_for_seat(s: &crate::state::Surface) -> bool {
+    P10_PLATFORM_OVERRIDE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(|| cfg!(unix) || s.d1_platform.load(Ordering::Relaxed))
+}
+
+#[cfg(test)]
+fn p10_arm_before_commit_hook(_s: &crate::state::Surface) {
+    let hook = P10_ARM_BEFORE_COMMIT_HOOK.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(f) = hook {
+        f();
+    }
+}
+
+#[cfg(test)]
+fn p10_gap_hook(_s: &crate::state::Surface) {
+    let hook = P10_GAP_HOOK.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(f) = hook {
+        f();
+    }
+}
 
 /// env를 테스트 종료 시(패닉 포함) 이전 값으로 원복하는 가드 —
 /// 없던 값은 remove, 있던 값은 원복. 프로세스 전역 env 누수 차단.
@@ -36819,6 +37945,7 @@ mod r3_1_lineage_tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
+
     // ===== P10: Swallowed Queue-Submit Return Recovery & Diagnosis Tests (r1 / r2 / r3) =====
 
     struct P10TestScopeGuard;
