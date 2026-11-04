@@ -1376,6 +1376,56 @@ jobs:
           set -euo pipefail
           cd ui && bun test
 
+      # ── W60 S1 (0.14.57, owner order 2026-11-04; DESIGN-W60-r2 §9.3, D-W60-4): the Windows named-pipe specimen. BLOCKING.
+      #   mio 1.2.1 aborts a cysd when a client closes a named pipe right after a large write was submitted (named_pipe.rs:969).
+      #   The test re-runs itself as a child, so the abort kills only the child, and prints exactly ONE `W60-S1 RESULT=` line
+      #   bound to GITHUB_SHA, the lock's mio version+checksum and the sha256 of the test executable. The decision reads that
+      #   line, never the step colour: R (mio 1.2.1) must say R-WITNESS; G (mio 1.2.4) must say PASS with rounds >= 10 x r_round.
+      #   On R a `NOT-RUN reason=no-reproduce` passes the step but is NOT a demonstration (D-W60-4).
+      #   ★`if: !cancelled()` only WIDENS when this step runs (an earlier red step cannot skip it); it can never make a green that did
+      #   not run, so it keeps the job rule above. No continue-on-error. Placed after the other blocking steps and BEFORE the
+      #   bootstrap verdict, which must stay the last blocking step (test_ci_branch_cysd_step); every step after this one has
+      #   `if: always()`, so a red here (R, by design) skips nothing.
+      #   The filter is a LITERAL (the C8 marker reader must be able to tell it selects no C8 test); --list proves the literal is
+      #   the specimen's exact path (codex r2 I2) before the run.
+      #   Limit 8 min = up to 3 min harness rebuild + 60 s run + 60 s parent grace + reap; W60_S1_SECS/CLIENTS are the R' rerun knobs
+      #   (120 s / 16 clients => grace 120 s; raise timeout-minutes with them). Realistic job cost about +2.5 min.
+      - name: 'W60 S1 named-pipe specimen (--bin cysd · Windows · blocking)'
+        if: ${{ !cancelled() }}
+        timeout-minutes: 8
+        shell: bash
+        env:
+          W60_S1_SECS: '60'
+          W60_S1_CLIENTS: '8'
+        run: |
+          set -euo pipefail
+          list="${RUNNER_TEMP}/w60-s1-list.txt"; log="w60-s1.log"
+          if CYS_PACK_DIR="$(mktemp -d)" cargo test --locked --bin cysd w60_named_pipe -- --list > "$list" 2>&1; then rc=0; else rc=$?; fi
+          if [ "$rc" -ne 0 ]; then cat "$list"; echo "::error::W60 S1: --list failed (rc=$rc) - no ground for a run (fail-closed)"; exit 1; fi
+          # The literal below must be exactly the path --list prints (codex r2 I2).
+          n=$(grep -cxF 'w60_named_pipe_tests::w60_named_pipe_large_write_while_clients_close: test' "$list" || true)
+          if [ "$n" -ne 1 ]; then cat "$list"; echo "::error::W60 S1: the literal specimen path is listed $n times, expected 1"; exit 1; fi
+          set +e
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --locked --bin cysd w60_named_pipe_tests::w60_named_pipe_large_write_while_clients_close -- --exact --nocapture --test-threads=1 2>&1 | tee "$log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          results=$(grep -c '^W60-S1 RESULT=' "$log" || true)
+          ran=$(grep -cE '^test result: [A-Za-z]+\. (1 passed; 0 failed|0 passed; 1 failed);' "$log" || true)
+          if [ "$results" -ne 1 ] || [ "$ran" -ne 1 ]; then
+            echo "::error::W60 S1: expected 1 RESULT line and 1 executed test, got results=$results executed=$ran (no green that did not run)"
+            exit 1
+          fi
+          echo "::notice title=W60 S1::$(grep '^W60-S1 RESULT=' "$log")"
+          exit "$rc"
+
+      - name: W60 S1 log upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: w60-s1-log
+          path: w60-s1.log
+          if-no-files-found: warn
+
       - name: 결과 업로드 (기계 판독 JSON)
         if: always()
         uses: actions/upload-artifact@v4

@@ -8826,6 +8826,11 @@ mod agent_queue_tests;
 #[cfg(test)]
 mod direct_agent_tests;
 
+// W60 S1 (0.14.57): the Windows named-pipe specimen - mio 1.2.1 must abort the child, 1.2.4 must not
+// (DESIGN-W60-r2 §9.3). Windows only: the race is in mio's Windows named-pipe code.
+#[cfg(all(test, windows))]
+mod w60_named_pipe_tests;
+
 // P4 C-13: the POSIX half of the Ctrl+C / ETX measurement. The Windows half is UNMEASURED by
 // construction and the module note says so - no cell here stands in for it.
 #[cfg(test)]
