@@ -517,17 +517,38 @@ class QueueRemedyTextTests(unittest.TestCase):
                     f"round/self-service-corrections.json[{rid}.note]: missing per-row provenance note: {rnote!r}"
                 )
 
-        # 4) src/bin/cysd/governance.rs REMEDY_LLM_SUFFIX (when repo source tree is present)
+        # 4) src/bin/cysd/governance.rs REMEDY_LLM_SUFFIX, USER-MANUAL.md, and ui/src/starvednotice.test.ts
+        #    (when repo source tree is present)
+        expected_suffix = (
+            " · LLM 에이전트는 자동 조치(remedy 대로 단건 revive(master 또는 보낸 좌석 본인만)·deliver)를 한다 — "
+            "사용자 지침이 막으면 따르고, 드레인·항목 삭제·동결 해제·사람 글에 닿는 키는 사용자에게 한 번 묻는다"
+        )
+        stale_suffix_token = "단건 revive" + "·deliver"
         gov_path = REPO_DIR / "src" / "bin" / "cysd" / "governance.rs"
         if gov_path.exists():
             gov_txt = gov_path.read_text(encoding="utf-8")
             m_suf = re.search(r'pub\(crate\)\s+const\s+REMEDY_LLM_SUFFIX:\s*&str\s*=\s*"([^"]*)";', gov_txt)
             if not m_suf:
                 violations.append("src/bin/cysd/governance.rs: REMEDY_LLM_SUFFIX declaration not found")
-            elif "revive(master 또는 보낸 좌석 본인만)·deliver" not in m_suf.group(1):
+            elif m_suf.group(1) != expected_suffix:
                 violations.append(
-                    f"src/bin/cysd/governance.rs:10940: REMEDY_LLM_SUFFIX missing sender scope "
-                    f"'revive(master 또는 보낸 좌석 본인만)·deliver': {m_suf.group(1)!r}"
+                    f"src/bin/cysd/governance.rs:10940: REMEDY_LLM_SUFFIX mismatch: {m_suf.group(1)!r}"
+                )
+
+        um_path = REPO_DIR / "USER-MANUAL.md"
+        if um_path.exists():
+            um_txt = um_path.read_text(encoding="utf-8")
+            if expected_suffix not in um_txt or stale_suffix_token in um_txt:
+                violations.append(
+                    "USER-MANUAL.md:1117: REMEDY_LLM_SUFFIX quote does not match governance.rs"
+                )
+
+        sn_test_path = REPO_DIR / "ui" / "src" / "starvednotice.test.ts"
+        if sn_test_path.exists():
+            sn_txt = sn_test_path.read_text(encoding="utf-8")
+            if expected_suffix not in sn_txt or stale_suffix_token in sn_txt:
+                violations.append(
+                    "ui/src/starvednotice.test.ts:42: TAIL fixture does not match governance.rs REMEDY_LLM_SUFFIX"
                 )
 
         if violations:

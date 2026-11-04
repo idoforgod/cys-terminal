@@ -1114,7 +1114,7 @@ cys send --queued --to worker "..."    # followup 큐: 대상이 조용해지면
 
 **처방 코드 14종**(0.14.45 성찰 2회차에 `stale_screen` 추가 — 0.14.43~0.14.44 는 13종) — `remedy_code`(와 사람이 읽는 `remedy` 문장)는 아래 표의 조건 가운데 하나로 정해지는데, 데몬이 조건을 보는 순서는 표의 위아래 순서와 다릅니다 — 처음 맞는 것으로 정하고 순서는 이렇습니다: ① 동결·일시정지 `paused` ② 입력줄 점유인데 계수가 이미 0 이면 글이 보일 때 기계 잔여 본문 제출 Return 재전송 대기 중이면 `wait`(3a), 자동 재전송을 마쳤거나 대상이 아닌 기계 잔여 본문이면 `machine_residue`(3b), 그 밖(사람 초안·미증명 글)은 `human_draft`, 글이 안 보이면 `wait` ③ 입력줄 점유(계수 있음)는 글이 보이면 사람이 친 몫이 0 일 때 `machine_residue`·있을 때 `human_draft`, 글이 안 보이면 커서 뒤 글자 유무로 `after_cursor_text`·`phantom_count`, 화면을 읽지 못하면 `input_pending_unknown` ④ 그 밖은 `answer_modal` → `approval` → `alt_screen` → `empty_seat` → `prompt_unknown` → `busy` 가 60초 넘게 정적이면 다시 그리기를 약속할 수 없을 때 `stale_screen`(약속할 수 있으면 `wait`) → `wait`(일시 보류) → `unknown` 입니다.
 조건 가운데 '입력줄 점유'는 `blocked_by` 가 `input_pending…` 이거나 스케줄 push 가 초안 때문에 큐로 돌려진 경우입니다. 모든 처방 문장 끝에는
-` · LLM 에이전트는 자동 조치(remedy 대로 단건 revive·deliver)를 한다 — 사용자 지침이 막으면 따르고, 드레인·항목 삭제·동결 해제·사람 글에 닿는 키는 사용자에게 한 번 묻는다` 가 붙고, 그 좌석의 화면 파서가 패닉을 낸 적이 있으면 문장 뒤에
+` · LLM 에이전트는 자동 조치(remedy 대로 단건 revive(master 또는 보낸 좌석 본인만)·deliver)를 한다 — 사용자 지침이 막으면 따르고, 드레인·항목 삭제·동결 해제·사람 글에 닿는 키는 사용자에게 한 번 묻는다` 가 붙고, 그 좌석의 화면 파서가 패닉을 낸 적이 있으면 문장 뒤에
 `(이 좌석 화면 파서 패닉 N회 — 화면 판독이 순간 비었을 수 있다)` 가 붙습니다(화면을 못 읽어 막힌 `input_pending_unknown`·`prompt_unknown` 에서는
 `(이 좌석 화면 파서 패닉 N회 — 데몬의 화면 사본이 어긋났다)`). 처방은 **안내일 뿐**이라 어떤 배달 판정도 바꾸지 않고, 데몬이 키를 대신 눌러 주는 경로도 없습니다.
 
