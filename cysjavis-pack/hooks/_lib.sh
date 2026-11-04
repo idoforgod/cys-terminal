@@ -1110,7 +1110,7 @@ cys_self_service_rules() {   # $1=머리 표지(■ 끝 블록 · ▶ 앞 사본
 
 cys_self_service_early() {   # session-start 앞 사본(F58-PLACE r2): 고정 5줄 + 끝 안내 1줄 · 도구·하위 프로세스 0 · rc 0 · 쓰기 0
   cys_self_service_rules "▶"
-  printf '%s\n' "- 정정 건수·읽기 명령: 훅 출력 맨 끝의 셀프 서비스(F58) 블록(파일로 빠졌으면 그 파일 끝)."
+  printf '%s\n' "- 정정 건수·읽기 명령: 훅 출력 뒤쪽의 셀프 서비스(F58) 블록(파일로 빠졌으면 그 파일 뒤쪽)."
   return 0
 }
 

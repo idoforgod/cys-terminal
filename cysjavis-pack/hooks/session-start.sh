@@ -600,9 +600,9 @@ if [ -f "$M" ]; then
     echo; echo "⚠ 색인 ${M_SZ}B>${M_CAP} — 앞부분만 주입(컨텍스트 예산 보호). 전문: cat $M"
   fi
 fi
-# ── ★F58(0.14.57) 셀프 서비스 블록 — 읽기 안내 줄(:539)·로컬 지침·soul·기억 색인 뒤, U16 BEGIN 앞
+# ── ★F58(0.14.57) 셀프 서비스 블록 — 읽기 안내 줄(:541)·로컬 지침·soul·기억 색인 뒤, U16 BEGIN 앞
 #   (DESIGN-F58 r2 §7.3 · final §7.2: 안내 줄의 2,000자 위치·U16 바이트·끝의 exit 0 을 바꾸지 않는다).
-#   문안 단일 원본 = _lib.sh cys_self_service_note · 함수가 없는 옛 _lib.sh 면 아무것도 내지 않는다.
+#   N 줄·보류 줄 = _lib.sh cys_self_service_note (고정 5줄 = cys_self_service_rules) · 함수가 없는 옛 _lib.sh 면 아무것도 내지 않는다.
 #   고정 5줄은 cys_self_service_rules 가 단일 원본이고 읽기 안내 줄 바로 뒤에도 한 번 나온다(F58-PLACE r2).
 if command -v cys_self_service_note >/dev/null 2>&1; then
   echo; cys_self_service_note "$CYS_ROLE"
