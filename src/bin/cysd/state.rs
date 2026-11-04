@@ -1464,6 +1464,163 @@ pub struct InjectTrack {
     wrote: AtomicU64,
     /// Ordinary writes and failed terminal replies; successful own replies do not taint resume.
     resume_write_epoch: AtomicU64,
+    /// ★(0.14.57 · P10 · DESIGN-P10-r2 §1.1, r3 §1 E3) Provenance mark of the last settled daemon queue job (`WrittenSubmitted`).
+    queue_submit_mark: Mutex<Option<QueueSubmitMark>>,
+    /// ★(0.14.57 · P10 · DESIGN-P10-r2 §1.6, r3 §3) Lifecycle track of a swallowed queue Return recovery for the current body.
+    residue: Mutex<Option<ResidueTrack>>,
+}
+
+/// ★(0.14.57 · P10 · DESIGN-P10-r1 §6.2, r2 §1.3, r3 §2) Why a [`WithheldSubmit`] record is in the slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum WithheldKind {
+    /// A Return withheld at write time because a modal/selector window or Unbound border was on screen.
+    #[default]
+    DialogWithheld,
+    /// A daemon queue job's Return was written and swallowed by the TUI, leaving the proven body on the composer line.
+    Swallowed,
+}
+
+/// ★(0.14.57 · P10 · DESIGN-P10-r2 §1.1, r3 §1 E3) Provenance mark recorded at `WrittenSubmitted` of a daemon queue job
+/// when no foreign write, input generation move, human key, or agent/conversation epoch move occurred during the job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QueueSubmitMark {
+    pub(crate) request_id: String,
+    pub(crate) body_at: Instant,
+    pub(crate) gen: u64,
+    pub(crate) epoch: u64,
+    pub(crate) human_at: Option<Instant>,
+    pub(crate) agent_epoch: u64,
+    pub(crate) conversation_epoch: u64,
+    pub(crate) cr_mono: Instant,
+    pub(crate) flat_len: usize,
+    pub(crate) flat_sha: [u8; 32],
+    pub(crate) from: Option<u64>,
+}
+
+/// ★(0.14.57 · P10 · DESIGN-P10-r3 §3) Lifecycle stages of the swallowed-Return recovery track.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ResidueStage {
+    Armed,
+    Handed { handed_at: Instant },
+    Writing { writing_at: Instant },
+    Written { written_at: Instant },
+    Spent,
+    Declined(&'static str),
+}
+
+/// ★(0.14.57 · P10 · DESIGN-P10-r2 §1.6, r3 §3) Per-seat recovery track for the current `MachineBody`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResidueTrack {
+    pub(crate) request_id: String,
+    pub(crate) body_at: Instant,
+    pub(crate) record_at: Instant,
+    pub(crate) stage: ResidueStage,
+}
+
+/// ★(0.14.57 · P10 · DESIGN-P10-r1 §6.4, r2 §1.6, r3 §3) Diagnosis projection of [`ResidueTrack`] for [`crate::governance::QueueBlockDiag`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum QueueBlockResidue {
+    #[default]
+    None,
+    Armed,
+    Spent,
+    Declined(&'static str),
+}
+
+/// ★(0.14.57 · P10 · DESIGN-P10-r3 §3 · codex r3 minor) Completion guard attached to the `Swallowed` recovery
+/// `WriteReq::SubmitAfterGap`. Only a request transferred into the writer channel is armed to report `writer_dropped`
+/// on `Drop`; an unsent request returned by `TrySendError::Full` or `Disconnected` is disarmed before rollback.
+#[derive(Debug)]
+pub struct SubmitDone {
+    track: std::sync::Weak<InjectTrack>,
+    request_id: String,
+    body_at: Instant,
+    completed: bool,
+}
+
+impl SubmitDone {
+    pub(crate) fn new(track: &Arc<InjectTrack>, request_id: String, body_at: Instant) -> Self {
+        Self {
+            track: Arc::downgrade(track),
+            request_id,
+            body_at,
+            completed: false,
+        }
+    }
+
+    /// Disarms the drop guard on a producer-owned unsent request (`TrySendError::Full` / `Disconnected`) so dropping
+    /// the rejected `WriteReq` never overwrites the `Full` rollback (`Armed`) or `Disconnected` (`writer_gone`).
+    pub(crate) fn disarm(&mut self) {
+        self.completed = true;
+    }
+
+    pub(crate) fn mark_writing(&self) {
+        if self.completed {
+            return;
+        }
+        if let Some(t) = self.track.upgrade() {
+            t.residue_mark_writing(&self.request_id, self.body_at, Instant::now());
+        }
+    }
+
+    pub(crate) fn complete_withheld(&mut self) {
+        if self.completed {
+            return;
+        }
+        self.completed = true;
+        if let Some(t) = self.track.upgrade() {
+            t.residue_complete_withheld(&self.request_id, self.body_at);
+        }
+    }
+
+    pub(crate) fn complete_written(&mut self) {
+        if self.completed {
+            return;
+        }
+        self.completed = true;
+        if let Some(t) = self.track.upgrade() {
+            t.residue_complete_written(&self.request_id, self.body_at, Instant::now());
+        }
+    }
+
+    pub(crate) fn complete_failed(&mut self) {
+        if self.completed {
+            return;
+        }
+        self.completed = true;
+        if let Some(t) = self.track.upgrade() {
+            t.residue_decline(&self.request_id, self.body_at, "write_failed");
+        }
+    }
+}
+
+impl Drop for SubmitDone {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        self.completed = true;
+        if let Some(t) = self.track.upgrade() {
+            t.residue_drop_unprocessed(&self.request_id, self.body_at);
+        }
+    }
+}
+
+/// ★(0.14.57 · P10 · DESIGN-P10-r3 §1 E3) Whitespace-free char count and SHA-256 of the full text (before the 4,096-char
+/// `MachineBody` tail truncation).
+pub(crate) fn flat_text_digest(s: &str) -> (usize, [u8; 32]) {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut count = 0usize;
+    let mut buf = [0u8; 4];
+    for ch in s.chars().filter(|c| !c.is_whitespace()) {
+        count += 1;
+        hasher.update(ch.encode_utf8(&mut buf).as_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    (count, out)
 }
 
 /// ★(0.14.42 · 수정 2회차 F1 · 재개) 쓰지 않은(보류한) 제출 CR 의 기록 — 보류는 **버림이 아니라 미룸**이다. 창이 닫히고
@@ -1474,7 +1631,7 @@ pub struct InjectTrack {
 /// 열려 있는 창(질문·선택 창 ∨ 승인 대기)을 **연달아** 본 시간(창 대기 상한 `governance::WITHHELD_SUBMIT_WAIT_CAP_SECS` 은
 /// 이것만 잰다 — 창이 닫힌 것을 보면 0). 종전(d59a1f5e)에는 상한이 보류 시각부터의 벽시계라 창이 곧 닫혀도 에이전트의 긴
 /// 작업·pause 동안 기록을 버렸다(실 claude LT2 · 작업이 끝난 뒤 본문 미제출 · CLI 는 OK).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WithheldSubmit {
     /// 보류한 단조 시각(기록 식별 · 이벤트의 `withheld_ms_ago`).
     pub(crate) at: Instant,
@@ -1494,12 +1651,43 @@ pub(crate) struct WithheldSubmit {
     /// byte-exact: the body counted, the unwritten Return not) - the resubmission requires exactly these. `None` = a record
     /// whose Return was counted when it was handed off (the resubmission's own re-withhold): the count must then be 0.
     pub(crate) expect: Option<(u64, u64)>,
+    /// ★(0.14.57 · P10) Whether this record was created by a write-time withhold (`DialogWithheld`) or by a swallowed queue Return (`Swallowed`).
+    pub(crate) kind: WithheldKind,
+    /// ★(0.14.57 · P10 · DESIGN-P10-r3 §2) Bound queue request id when `kind == WithheldKind::Swallowed`.
+    pub(crate) request_id: Option<String>,
 }
 
 impl WithheldSubmit {
     /// 보류 탐침이 창을 본 순간의 기록 — 두 시계 0 · 창 열림.
     pub(crate) fn new(at: Instant, body_at: Instant, from: Option<u64>) -> Self {
-        Self { at, body_at, from, seen_at: at, live_ms: 0, dialog_ms: 0, dialog_open: true, expect: None }
+        Self {
+            at,
+            body_at,
+            from,
+            seen_at: at,
+            live_ms: 0,
+            dialog_ms: 0,
+            dialog_open: true,
+            expect: None,
+            kind: WithheldKind::DialogWithheld,
+            request_id: None,
+        }
+    }
+
+    /// ★(0.14.57 · P10 · DESIGN-P10-r1 §6.2, r2 §1.3, r3 §2) Swallowed queue Return record (`dialog_open = false`, `expect = None`).
+    pub(crate) fn new_swallowed(at: Instant, body_at: Instant, from: Option<u64>, request_id: String) -> Self {
+        Self {
+            at,
+            body_at,
+            from,
+            seen_at: at,
+            live_ms: 0,
+            dialog_ms: 0,
+            dialog_open: false,
+            expect: None,
+            kind: WithheldKind::Swallowed,
+            request_id: Some(request_id),
+        }
     }
 
     /// ★(R3C-1) 순수 — 틱 1회의 경과를 잰다: `seen_at` 을 `now` 로 옮기고, pause 가 아니면 `live_ms` 에 더한다.
@@ -1683,9 +1871,23 @@ impl InjectTrack {
 
     /// ★(R3SH-1) 기계 본문 기록 — writer Inject arm(첫 바이트 앞)과 핸들러 CLI 기계 send 가 부른다.
     pub(crate) fn note_body(&self, text: &str, owner: Option<crate::governance::InputOwner>) {
+        self.note_body_at(text, owner, Instant::now());
+    }
+
+    pub(crate) fn note_body_at(&self, text: &str, owner: Option<crate::governance::InputOwner>, at: Instant) {
         let norm = normalize_input_text(text);
         *self.last_body.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some(MachineBody { norm, owner, at: Instant::now() });
+            Some(MachineBody { norm, owner, at });
+        let mut r = self.residue.lock().unwrap_or_else(|e| e.into_inner());
+        if r.as_ref().is_some_and(|x| {
+            x.body_at != at
+                && matches!(
+                    x.stage,
+                    ResidueStage::Written { .. } | ResidueStage::Spent | ResidueStage::Declined(_)
+                )
+        }) {
+            *r = None;
+        }
     }
 
     /// Writer only: conservative ordinary write attempt, including possibly partial failures.
@@ -1723,7 +1925,7 @@ impl InjectTrack {
 
     /// ★(F1 · 재개) 보류 기록(없으면 None).
     pub(crate) fn withheld(&self) -> Option<WithheldSubmit> {
-        *self.withheld.lock().unwrap_or_else(|e| e.into_inner())
+        self.withheld.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// ★(F1 · 재개) 그 기록(`at`)이 아직 남아 있을 때만 지운다 — 그 사이 새 보류가 섰으면 건드리지 않는다. 지웠으면 true.
@@ -1734,7 +1936,24 @@ impl InjectTrack {
     /// ★(R3C-1) [`Self::clear_withheld_if`] 와 같되 지운 기록(시계 포함)을 돌려준다(버림 이벤트의 표기용).
     pub(crate) fn take_withheld_if(&self, at: Instant) -> Option<WithheldSubmit> {
         let mut g = self.withheld.lock().unwrap_or_else(|e| e.into_inner());
-        if g.is_some_and(|w| w.at == at) {
+        if g.as_ref().is_some_and(|w| w.at == at) {
+            g.take()
+        } else {
+            None
+        }
+    }
+
+    /// ★(0.14.57 · P10 · DESIGN-P10-r3 §2) Take the `withheld` record only when it matches `(kind, request_id, body_at)`.
+    pub(crate) fn take_withheld_if_identity(
+        &self,
+        kind: WithheldKind,
+        request_id: &str,
+        body_at: Instant,
+    ) -> Option<WithheldSubmit> {
+        let mut g = self.withheld.lock().unwrap_or_else(|e| e.into_inner());
+        if g.as_ref().is_some_and(|w| {
+            w.kind == kind && w.body_at == body_at && w.request_id.as_deref() == Some(request_id)
+        }) {
             g.take()
         } else {
             None
@@ -1747,9 +1966,195 @@ impl InjectTrack {
         match g.as_mut() {
             Some(w) if w.at == at => {
                 f(w);
-                Some(*w)
+                Some(w.clone())
             }
             _ => None,
+        }
+    }
+
+    /// ★(0.14.57 · P10 · DESIGN-P10-r3 §3) Put `w` back into `withheld` only if the slot is still empty (CAS rollback on `try_send` `Full`).
+    pub(crate) fn restore_withheld_if_empty(&self, w: WithheldSubmit) -> bool {
+        let mut g = self.withheld.lock().unwrap_or_else(|e| e.into_inner());
+        if g.is_none() {
+            *g = Some(w);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn set_queue_submit_mark(&self, mark: Option<QueueSubmitMark>) {
+        *self.queue_submit_mark.lock().unwrap_or_else(|e| e.into_inner()) = mark;
+    }
+
+    pub(crate) fn queue_submit_mark(&self) -> Option<QueueSubmitMark> {
+        self.queue_submit_mark.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub(crate) fn residue_track(&self) -> Option<ResidueTrack> {
+        self.residue.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub(crate) fn clear_residue_track(&self) {
+        *self.residue.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// ★(0.14.57 · P10 · DESIGN-P10-r2 §1.3, r3 §2) Atomic commit of a `Swallowed` record and `Armed` residue track
+    /// under `withheld` -> `residue` leaf locks (called inside `Surface::input_gate`). Refuses if `withheld` is occupied
+    /// or a residue track for `body_at` already exists.
+    pub(crate) fn try_commit_swallowed_arm(
+        &self,
+        request_id: String,
+        body_at: Instant,
+        record_at: Instant,
+        from: Option<u64>,
+    ) -> Result<(), &'static str> {
+        let mut w_slot = self.withheld.lock().unwrap_or_else(|e| e.into_inner());
+        if w_slot.is_some() {
+            return Err("withheld_owns_cr");
+        }
+        let mut r_slot = self.residue.lock().unwrap_or_else(|e| e.into_inner());
+        if r_slot.as_ref().is_some_and(|r| r.body_at == body_at) {
+            return Err("spent");
+        }
+        *w_slot = Some(WithheldSubmit::new_swallowed(
+            record_at,
+            body_at,
+            from,
+            request_id.clone(),
+        ));
+        *r_slot = Some(ResidueTrack {
+            request_id,
+            body_at,
+            record_at,
+            stage: ResidueStage::Armed,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn residue_set_declined_for_body(&self, request_id: String, body_at: Instant, why: &'static str) {
+        let mut r_slot = self.residue.lock().unwrap_or_else(|e| e.into_inner());
+        if r_slot.as_ref().is_none_or(|r| r.body_at != body_at) {
+            *r_slot = Some(ResidueTrack {
+                request_id,
+                body_at,
+                record_at: body_at,
+                stage: ResidueStage::Declined(why),
+            });
+        }
+    }
+
+    pub(crate) fn residue_set_handed(&self, request_id: &str, body_at: Instant, handed_at: Instant) -> bool {
+        let mut g = self.residue.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(r) = g.as_mut() {
+            if r.request_id == request_id && r.body_at == body_at && r.stage == ResidueStage::Armed {
+                r.stage = ResidueStage::Handed { handed_at };
+                return true;
+            }
+        }
+        false
+    }
+
+    pub(crate) fn residue_restore_armed(&self, request_id: &str, body_at: Instant) {
+        let mut g = self.residue.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(r) = g.as_mut() {
+            if r.request_id == request_id && r.body_at == body_at && matches!(r.stage, ResidueStage::Handed { .. }) {
+                r.stage = ResidueStage::Armed;
+            }
+        }
+    }
+
+    pub(crate) fn residue_decline(&self, request_id: &str, body_at: Instant, why: &'static str) {
+        let mut g = self.residue.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(r) = g.as_mut() {
+            if r.request_id == request_id && r.body_at == body_at {
+                r.stage = ResidueStage::Declined(why);
+            }
+        }
+    }
+
+    pub(crate) fn residue_mark_writing(&self, request_id: &str, body_at: Instant, writing_at: Instant) {
+        let mut g = self.residue.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(r) = g.as_mut() {
+            if r.request_id == request_id && r.body_at == body_at && matches!(r.stage, ResidueStage::Handed { .. }) {
+                r.stage = ResidueStage::Writing { writing_at };
+            }
+        }
+    }
+
+    pub(crate) fn residue_complete_withheld(&self, request_id: &str, body_at: Instant) {
+        let mut g = self.residue.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(r) = g.as_mut() {
+            if r.request_id == request_id
+                && r.body_at == body_at
+                && matches!(r.stage, ResidueStage::Handed { .. } | ResidueStage::Writing { .. })
+            {
+                r.stage = ResidueStage::Declined("withheld");
+            }
+        }
+    }
+
+    pub(crate) fn residue_complete_written(&self, request_id: &str, body_at: Instant, written_at: Instant) {
+        let mut g = self.residue.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(r) = g.as_mut() {
+            if r.request_id == request_id
+                && r.body_at == body_at
+                && matches!(r.stage, ResidueStage::Handed { .. } | ResidueStage::Writing { .. })
+            {
+                r.stage = ResidueStage::Written { written_at };
+            }
+        }
+    }
+
+    pub(crate) fn residue_drop_unprocessed(&self, request_id: &str, body_at: Instant) {
+        let mut g = self.residue.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(r) = g.as_mut() {
+            if r.request_id == request_id
+                && r.body_at == body_at
+                && matches!(r.stage, ResidueStage::Handed { .. } | ResidueStage::Writing { .. })
+            {
+                r.stage = ResidueStage::Declined("writer_dropped");
+                self.submit_hand_failed();
+            }
+        }
+    }
+
+    pub(crate) fn residue_mark_spent(&self, request_id: &str, body_at: Instant) {
+        let mut g = self.residue.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(r) = g.as_mut() {
+            if r.request_id == request_id && r.body_at == body_at && matches!(r.stage, ResidueStage::Written { .. }) {
+                r.stage = ResidueStage::Spent;
+            }
+        }
+    }
+
+    pub(crate) fn residue_stage_for_current_body(&self) -> Option<ResidueStage> {
+        let body_at = self.last_body()?.at;
+        self.residue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .filter(|r| r.body_at == body_at)
+            .map(|r| r.stage.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_backdate_residue_written_at(&self, request_id: &str, body_at: Instant, written_at: Instant) {
+        let mut g = self.residue.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(r) = g.as_mut() {
+            if r.request_id == request_id && r.body_at == body_at {
+                r.stage = ResidueStage::Written { written_at };
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_backdate_residue_writing_at(&self, request_id: &str, body_at: Instant, writing_at: Instant) {
+        let mut g = self.residue.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(r) = g.as_mut() {
+            if r.request_id == request_id && r.body_at == body_at {
+                r.stage = ResidueStage::Writing { writing_at };
+            }
         }
     }
 
@@ -1952,6 +2357,8 @@ pub enum WriteReq {
         /// `governance::submit_cr_withhold_probe` 하나다(규칙·귀결은 그 doc). 보류한 CR 은 표식상 '소비 · 미기록'이고
         /// 최소 간격 기준점(`last_program_write`)도 찍지 않는다 — 화면에 없는 바이트를 기준 삼지 않는다(B2′ 규율).
         withhold: Option<SafetyProbe>,
+        /// ★(0.14.57 · P10 · DESIGN-P10-r2 §1.2, r3 §3) Writer completion handle for swallowed-Return recovery.
+        done: Option<SubmitDone>,
     },
     /// ★(0.14.52 · S-a) Checked agent write: one logical machine request to an agent receiver
     /// ([`crate::agent_write`]). Journal barrier, full admission proof, then every OS call capped at
@@ -1961,6 +2368,15 @@ pub enum WriteReq {
     Agent(Box<crate::agent_write::AgentJob>),
     #[cfg(test)]
     P1ReceiverBarrier(Vec<u8>),
+}
+
+impl WriteReq {
+    /// ★(0.14.57 · P10 · DESIGN-P10-r3 §3) Disarm an unsent `SubmitDone` handle inside a rejected `WriteReq` before dropping it.
+    pub(crate) fn disarm_submit_done(&mut self) {
+        if let WriteReq::SubmitAfterGap { done: Some(d), .. } = self {
+            d.disarm();
+        }
+    }
 }
 
 /// 청크 경계 상태: 미완성 ESC/UTF-8 꼬리·\r 덮어쓰기·진행 중 라인
@@ -8548,7 +8964,7 @@ pub(crate) fn run_writer_loop_tracked<W: Write, R: Into<crate::writer_gate::Queu
             }
             // ★B2′: 제출 CR — 잔여를 **여기서, 소비 시점에** 계산한다. 이 계산이 핸들러에
             // 있으면 적체 구간에서 간격이 붕괴한다(codex 감사 R1 · SubmitAfterGap doc 참조).
-            WriteReq::SubmitAfterGap { bytes, min_gap_ms, withhold } => {
+            WriteReq::SubmitAfterGap { bytes, min_gap_ms, withhold, done } => {
                 if let Some(delay) =
                     cr_gap_delay_ms(last_program_write.map(|t| t.elapsed()), min_gap_ms)
                 {
@@ -8561,7 +8977,13 @@ pub(crate) fn run_writer_loop_tracked<W: Write, R: Into<crate::writer_gate::Queu
                     if let Some(t) = &track {
                         t.submit_consumed(false);
                     }
+                    if let Some(mut d) = done {
+                        d.complete_withheld();
+                    }
                     continue;
+                }
+                if let Some(d) = &done {
+                    d.mark_writing();
                 }
                 let r = writer.write_all(&bytes).and_then(|_| writer.flush());
                 // ★B2″(agy 감사 R2-②): 쓴 CR **자신도** 기준점이 된다. 그러지 않으면 연속
@@ -8575,6 +8997,13 @@ pub(crate) fn run_writer_loop_tracked<W: Write, R: Into<crate::writer_gate::Queu
                 //   '대기 CR 뒤에 다음 본문을 붙이지 않는다'(분리 보류)를 판정한다. 원자 쓰기뿐.
                 if let Some(t) = &track {
                     t.submit_consumed(r.is_ok());
+                }
+                if let Some(mut d) = done {
+                    if r.is_ok() {
+                        d.complete_written();
+                    } else {
+                        d.complete_failed();
+                    }
                 }
                 r
             }
@@ -10163,7 +10592,7 @@ mod tests {
             let handle = std::thread::spawn(move || run_writer_loop_tracked(w, rx, stop, Some(t2)));
             tx.send(WriteReq::Program(b"BODY".to_vec())).unwrap();
             track.submit_handed();
-            tx.send(WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: 30, withhold }).unwrap();
+            tx.send(WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: 30, withhold, done: None }).unwrap();
             tx.send(WriteReq::Data(b"k".to_vec())).unwrap();
             drop(tx);
             handle.join().ok();
@@ -10218,7 +10647,7 @@ mod tests {
         tx.send(WriteReq::Program(b"BODY".to_vec())).unwrap();
         // ③ 200ms 뒤 제출 CR — 핸들러 시계로는 본문 enqueue 후 이미 150ms 초과다.
         std::thread::sleep(std::time::Duration::from_millis(200));
-        tx.send(WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: GAP_MS, withhold: None })
+        tx.send(WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: GAP_MS, withhold: None, done: None })
             .unwrap();
         drop(tx);
         handle.join().ok();
@@ -10306,7 +10735,7 @@ mod tests {
         tx.send(WriteReq::Inject { text: "hi".into(), cr_delay_ms: 0, clear_first: false, guard: None })
             .unwrap();
         let t_enqueue = std::time::Instant::now();
-        tx.send(WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: GAP_MS, withhold: None })
+        tx.send(WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: GAP_MS, withhold: None, done: None })
             .unwrap();
         drop(tx);
         handle.join().ok();
@@ -10335,7 +10764,7 @@ mod tests {
         let handle = std::thread::spawn(move || run_writer_loop(w, rx, stop));
         tx.send(WriteReq::Program(b"BODY".to_vec())).unwrap();
         for _ in 0..2 {
-            tx.send(WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: GAP_MS, withhold: None })
+            tx.send(WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: GAP_MS, withhold: None, done: None })
                 .unwrap();
         }
         drop(tx);
@@ -10380,7 +10809,7 @@ mod tests {
         // 사람 키(Data)는 기준점을 찍지 않는다 — Program 이 아니므로 여전히 '본문 없음'이다.
         tx.send(WriteReq::Data(b"typed".to_vec())).unwrap();
         let t0 = std::time::Instant::now();
-        tx.send(WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: GAP_MS, withhold: None })
+        tx.send(WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: GAP_MS, withhold: None, done: None })
             .unwrap();
         drop(tx);
         handle.join().ok();
@@ -10410,7 +10839,7 @@ mod tests {
             let handle = std::thread::spawn(move || run_writer_loop(w, rx, stop));
             tx.send(WriteReq::Program(b"BODY".to_vec())).unwrap();
             std::thread::sleep(std::time::Duration::from_millis(wait_ms));
-            tx.send(WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: GAP_MS, withhold: None })
+            tx.send(WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: GAP_MS, withhold: None, done: None })
                 .unwrap();
             drop(tx);
             handle.join().ok();
@@ -10443,6 +10872,7 @@ mod tests {
             bytes: b"\r".to_vec(),
             min_gap_ms: OVERWAIT_GAP_MS,
             withhold: None,
+            done: None,
         })
         .unwrap();
         drop(tx);

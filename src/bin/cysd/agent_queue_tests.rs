@@ -765,7 +765,7 @@ fn s4_1_epoch_move_between_the_check_and_the_first_byte_voids_the_resume() {
         std::thread::sleep(Duration::from_millis(800));
         true
     });
-    s.write_tx.send(crate::state::WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: 0, withhold: Some(busy) }).unwrap();
+    s.write_tx.send(crate::state::WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: 0, withhold: Some(busy), done: None }).unwrap();
     let _ = crate::governance::queue_write_hold_block_at(&fx.daemon, &s, since + Duration::from_secs(1));
     assert_eq!(seat_events(&fx, &s, "queue.write_resumed").len(), 1, "premise: the tick handed the resumed run off");
     s.bump_agent_epoch(); // between the check and the claim
@@ -3390,7 +3390,7 @@ fn dsr_resume_case(ahead_of_claim: bool, mode: u8) {
             assert!(*released && !timed.timed_out(), "owned writer barrier not released");
             true // withheld: no bytes or counter increment
         });
-        s.write_tx.send(crate::state::WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: 0, withhold: Some(busy) }).unwrap();
+        s.write_tx.send(crate::state::WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: 0, withhold: Some(busy), done: None }).unwrap();
         dsr_resume_wait("writer parked", || entered.load(Ordering::Acquire) == 1);
     }
     let ordinary_bytes = mode != 0;

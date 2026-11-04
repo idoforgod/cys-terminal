@@ -42671,6 +42671,40 @@ mod tests {
     }
 
     #[test]
+    fn p7_cycle_target_idle_on_bound_export() {
+        let screen = "• Done.\n\n── master ──────────────────────\n❯ \n────────────────────────────────\n  ⏵⏵ bypass permissions on";
+        let classify = |verdict: &str, label: &str| {
+            let reply = json!({
+                "text": screen,
+                "quiet_secs": 10.0,
+                "composer": {
+                    "verdict": verdict,
+                    "label": label,
+                    "governed": true,
+                    "owner": "none",
+                    "owner_kind": "verified",
+                    "modal": false,
+                    "output_gen": 12,
+                    "input_gen": 4,
+                    "pending_bytes": 0,
+                    "human_bytes": 0
+                }
+            });
+            cycle_target_observation(
+                Ok(reply),
+                Ok(json!({"pending_input_bytes": 0, "pending_input_human_bytes": 0})),
+                &["❯".to_string()],
+                None,
+                &[],
+            )
+            .state
+        };
+        assert_eq!(classify("empty", "bound"), CycleTargetState::Idle);
+        assert_eq!(classify("suggestion", "bound"), CycleTargetState::Idle);
+        assert_eq!(classify("draft", "unbound"), CycleTargetState::HumanDraft);
+    }
+
+    #[test]
     fn d16_target_state_busy_when_output_streaming() {
         let mut obs = CycleTargetObs {
         composer: None,
@@ -53410,6 +53444,29 @@ mod d8_read_screen_composer_tests {
         // A failed request is an error (a non-zero exit, so the probe falls back), not an empty object.
         let failing = |_: &str, _: Value| -> Result<Value, String> { Err("socket closed".into()) };
         assert_eq!(read_screen_composer(3, &failing), Err("socket closed".to_string()));
+    }
+
+    #[test]
+    fn p7_export_carries_label() {
+        for (verdict, label) in [("empty", "bound"), ("draft", "unbound"), ("empty", "none")] {
+            let reply = std::cell::RefCell::new(json!({
+                "surface_id": 3,
+                "surface_ref": "surface:3",
+                "text": "── master ──────────\n❯ \n────────────────────",
+                "quiet_secs": 4.0,
+                "composer": {
+                    "verdict": verdict,
+                    "label": label,
+                    "governed": true,
+                    "modal": false,
+                    "output_gen": 42
+                }
+            }));
+            let rpc = |_: &str, _: Value| -> Result<Value, String> { Ok(reply.borrow().clone()) };
+            let out = read_screen_composer(3, &rpc).expect("ok");
+            assert_eq!(out["composer"]["label"], json!(label));
+            assert_eq!(out["composer"]["verdict"], json!(verdict));
+        }
     }
 }
 
