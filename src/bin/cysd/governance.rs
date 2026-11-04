@@ -29902,15 +29902,15 @@ after-tick liveness alone does not attribute a clock defect",
     /// 권위 없는 재기동은 바로 그 계수로 막히는데(node-recover 거부 문구 · 화면 재기동 보류는 이미 안내한다) 처방만 "다시 띄우면 순서대로 배달된다" 고만 말했다.
     /// 계수 0 은 종전 문장 그대로(바이트 불변) · code(`empty_seat`)·분기·게이트는 불변 · 접미 `REMEDY_LLM_SUFFIX` 는 맨 끝 · 일시정지 행(1·2행)이 여전히 맨 앞 · 다른 사유에는 구절이 새지 않는다.
     /// ★(0.14.57 · F58 F-B1) 계수에 **사람 몫**이 있으면(`pending_input_human_bytes > 0` — 화면에 보이든 안 보이든) 그 구절 대신 **먼저 사용자에게 한 번 묻는** 구절이 붙는다:
-    /// node-recover 의 선정리 C-u(권위 호출이라 초안 게이트에 막히지 않는다)가 그 사람 글까지 지우기 때문이다. 사람 몫 0 인 기계 계수는 T1-08 구절 그대로다.
+    /// node-recover 의 선정리 C-u(권위 호출이라 초안 게이트에 막히지 않는다)가 그 사람 입력까지 지우므로 사용자가 그 창에서 먼저 비운다(기계는 지우지 않는다 · 되돌린 Esc 도 사람 몫 1). 사람 몫 0 인 기계 계수는 T1-08 구절 그대로다.
     #[test]
     fn r2f_dm_empty_seat_remedy_adds_the_ctrl_u_clause_only_when_the_input_count_is_positive() {
         const BASE: &str = "그 자리에 에이전트가 붙어 있지 않다(빈 셸) — 에이전트를 다시 띄우면 순서대로 배달된다";
         const CLAUSE: &str = " — 다시 띄울 때는 master·CSO 좌석에서 `cys node-recover --surface <좌석>` 로 띄운다(입력줄 계수 정리를 함께 한다 · 입력줄 계수가 남아 있다)";
         assert_eq!(super::REMEDY_EMPTY_SEAT_COUNT_CLAUSE, CLAUSE, "구절의 바이트 고정(문서·화면이 이 문장을 인용한다)");
-        // ★(F58 F-B1) 사람 몫 구절 — 바이트는 아래 queue_remedy 출력 등식이 고정하고, 성질(먼저 묻는다 · node-recover 가 그 글까지 지운다)은 여기서 이름으로 고정한다.
-        const HUMAN: &str = " — 입력줄에 사람이 쓴 글이 있다: 먼저 사용자에게 한 번 묻는다(`cys node-recover --surface <좌석>` 는 그 글까지 지운다 — 사용자가 지우거나 지워도 된다고 하면 master·CSO 좌석에서 띄운다)";
-        assert!(HUMAN.contains("먼저 사용자에게 한 번 묻는다") && HUMAN.contains("그 글까지 지운다") && HUMAN.contains("node-recover"), "{HUMAN}");
+        // ★(F58 F-B1·FB1r2) 사람 몫 구절 — 바이트는 아래 queue_remedy 출력 등식이 고정하고, 성질(묻는다 · 사용자가 그 창에서 비운다 · 기계는 지우지 않는다)은 여기서 이름으로 고정한다.
+        const HUMAN: &str = " — 사람의 키 입력이 계수돼 있다(글 또는 되돌린 Esc): 사용자에게 한 번 묻고 사용자가 그 창에서 Ctrl-U 로 비운 뒤(기계는 지우지 않는다) master·CSO 좌석에서 `cys node-recover` 로 띄운다(입력줄을 지운다)";
+        assert!(HUMAN.contains("사용자에게 한 번 묻고") && HUMAN.contains("사용자가 그 창에서 Ctrl-U 로 비운 뒤") && HUMAN.contains("기계는 지우지 않는다") && HUMAN.contains("node-recover"), "{HUMAN}");
         assert!(!HUMAN.contains(CLAUSE.trim_start()), "사람 몫 구절은 T1-08 구절을 품지 않는다(manifest T-9 의 T1-08 개수 2 를 바꾸지 않는다)");
         let blocked = "empty_seat(좌석에 에이전트 미연결)";
         // 계수 0 → 종전 문장 그대로.
@@ -29930,6 +29930,9 @@ after-tick liveness alone does not attribute a clock defect",
             assert_eq!(t, format!("{BASE}{HUMAN}{REMEDY_LLM_SUFFIX}"), "c={c} h={h} dv={dv:?}");
             assert!(!t.contains("입력줄 계수 정리를 함께 한다"), "사람 몫인데 node-recover 를 바로 권했다: {t}");
         }
+        // ★(F58 FB1r2) 되돌린 Esc(state.rs recount_exempted_esc: count 1 · human 1 · 화면 관측 없음)는 글이 아니다 — 글이 있다고 주장하거나 기계 삭제를 권하지 않는다.
+        let (_, esc) = queue_remedy(blocked, &c5_diag(1, 1, None));
+        assert!(!esc.contains("사람이 쓴 글이 있다") && !esc.contains("지워도 된다고 하면") && esc.contains("되돌린 Esc"), "되돌린 Esc 모양: {esc}");
         // 계수 0 은 사람 몫 값이 무엇이든 종전 문장 그대로(생산 진단은 사람 몫을 계수 이하로 접는다 — governance.rs queue_block_diag_with 의 `.human.min(pending)` · 접히지 않은 진단에서도 구절 없음).
         for (h, dv) in [(3, None), (3, Some(true))] {
             assert_eq!(queue_remedy(blocked, &c5_diag(0, h, dv)).1, format!("{BASE}{REMEDY_LLM_SUFFIX}"), "계수 0 · h={h} dv={dv:?}");
