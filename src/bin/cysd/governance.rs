@@ -29896,27 +29896,46 @@ after-tick liveness alone does not attribute a clock defect",
     /// ★(R2F-DM · 성찰 2회차 A1 m-2 ⓐ) `empty_seat` 처방 — **입력줄 계수가 0 보다 크면**(죽은 좌석의 되돌린 Esc = 계수 1 · 제품의 정상 상태 하나) 그 좌석을 master·CSO 좌석에서 `cys node-recover` 로 다시 띄우라는(그 경로가 입력줄 계수를 함께 정리한다 — F58 T1-08) 한 구절이 문장에 더해진다.
     /// 권위 없는 재기동은 바로 그 계수로 막히는데(node-recover 거부 문구 · 화면 재기동 보류는 이미 안내한다) 처방만 "다시 띄우면 순서대로 배달된다" 고만 말했다.
     /// 계수 0 은 종전 문장 그대로(바이트 불변) · code(`empty_seat`)·분기·게이트는 불변 · 접미 `REMEDY_LLM_SUFFIX` 는 맨 끝 · 일시정지 행(1·2행)이 여전히 맨 앞 · 다른 사유에는 구절이 새지 않는다.
+    /// ★(0.14.57 · F58 F-B1) 계수에 **사람 몫**이 있으면(`pending_input_human_bytes > 0` — 화면에 보이든 안 보이든) 그 구절 대신 **먼저 사용자에게 한 번 묻는** 구절이 붙는다:
+    /// node-recover 의 선정리 C-u(권위 호출이라 초안 게이트에 막히지 않는다)가 그 사람 글까지 지우기 때문이다. 사람 몫 0 인 기계 계수는 T1-08 구절 그대로다.
     #[test]
     fn r2f_dm_empty_seat_remedy_adds_the_ctrl_u_clause_only_when_the_input_count_is_positive() {
         const BASE: &str = "그 자리에 에이전트가 붙어 있지 않다(빈 셸) — 에이전트를 다시 띄우면 순서대로 배달된다";
         const CLAUSE: &str = " — 다시 띄울 때는 master·CSO 좌석에서 `cys node-recover --surface <좌석>` 로 띄운다(입력줄 계수 정리를 함께 한다 · 입력줄 계수가 남아 있다)";
         assert_eq!(super::REMEDY_EMPTY_SEAT_COUNT_CLAUSE, CLAUSE, "구절의 바이트 고정(문서·화면이 이 문장을 인용한다)");
+        // ★(F58 F-B1) 사람 몫 구절 — 바이트는 아래 queue_remedy 출력 등식이 고정하고, 성질(먼저 묻는다 · node-recover 가 그 글까지 지운다)은 여기서 이름으로 고정한다.
+        const HUMAN: &str = " — 입력줄에 사람이 쓴 글이 있다: 먼저 사용자에게 한 번 묻는다(`cys node-recover --surface <좌석>` 는 그 글까지 지운다 — 사용자가 지우거나 지워도 된다고 하면 master·CSO 좌석에서 띄운다)";
+        assert!(HUMAN.contains("먼저 사용자에게 한 번 묻는다") && HUMAN.contains("그 글까지 지운다") && HUMAN.contains("node-recover"), "{HUMAN}");
+        assert!(!HUMAN.contains(CLAUSE.trim_start()), "사람 몫 구절은 T1-08 구절을 품지 않는다(manifest T-9 의 T1-08 개수 2 를 바꾸지 않는다)");
         let blocked = "empty_seat(좌석에 에이전트 미연결)";
         // 계수 0 → 종전 문장 그대로.
         let (code0, t0) = queue_remedy(blocked, &c5_diag(0, 0, None));
         assert_eq!(code0, "empty_seat");
         assert_eq!(t0, format!("{BASE}{REMEDY_LLM_SUFFIX}"), "계수 0 의 문장은 종전과 바이트가 같아야 한다");
-        // 계수 > 0 → 사람 몫(0·양수)·화면 관측(없음·비어 보임·초안 보임)과 무관하게 구절이 본문 바로 뒤에 붙는다.
-        for (c, h, dv) in [(1, 1, None), (1, 0, None), (7, 3, Some(false)), (3, 3, Some(true)), (u64::MAX, 0, None)] {
+        // 계수 > 0 · 사람 몫 0(기계 계수) → 화면 관측(없음·비어 보임·초안 보임)과 무관하게 T1-08 구절이 본문 바로 뒤에 붙는다.
+        for (c, h, dv) in [(1, 0, None), (u64::MAX, 0, None), (5, 0, Some(false)), (5, 0, Some(true))] {
             let (code, t) = queue_remedy(blocked, &c5_diag(c, h, dv));
             assert_eq!(code, "empty_seat", "c={c} h={h} dv={dv:?}: code 는 그대로");
             assert_eq!(t, format!("{BASE}{CLAUSE}{REMEDY_LLM_SUFFIX}"), "c={c} h={h} dv={dv:?}");
         }
+        // ★(F58 F-B1) 계수 > 0 · 사람 몫 > 0 → 화면 관측(없음·비어 보임·초안 보임)과 무관하게 먼저 묻는 구절(T1-08 구절은 없다).
+        for (c, h, dv) in [(1, 1, None), (7, 3, Some(false)), (3, 3, Some(true)), (u64::MAX, 1, None)] {
+            let (code, t) = queue_remedy(blocked, &c5_diag(c, h, dv));
+            assert_eq!(code, "empty_seat", "c={c} h={h} dv={dv:?}: code 는 그대로");
+            assert_eq!(t, format!("{BASE}{HUMAN}{REMEDY_LLM_SUFFIX}"), "c={c} h={h} dv={dv:?}");
+            assert!(!t.contains("입력줄 계수 정리를 함께 한다"), "사람 몫인데 node-recover 를 바로 권했다: {t}");
+        }
+        // 계수 0 은 사람 몫 값이 무엇이든 종전 문장 그대로(생산 진단은 사람 몫을 계수 이하로 접는다 — governance.rs queue_block_diag_with 의 `.human.min(pending)` · 접히지 않은 진단에서도 구절 없음).
+        for (h, dv) in [(3, None), (3, Some(true))] {
+            assert_eq!(queue_remedy(blocked, &c5_diag(0, h, dv)).1, format!("{BASE}{REMEDY_LLM_SUFFIX}"), "계수 0 · h={h} dv={dv:?}");
+        }
         // 파서 패닉 주석은 구절 뒤 · 접미 앞(순서: 본문 · 구절 · 주석 · 접미).
-        let mut d = c5_diag(1, 1, None);
-        d.parser_panics = 2;
-        let (_, t) = queue_remedy(blocked, &d);
-        assert_eq!(t, format!("{BASE}{CLAUSE} (이 좌석 화면 파서 패닉 2회 — 화면 판독이 순간 비었을 수 있다){REMEDY_LLM_SUFFIX}"));
+        for (h, clause) in [(0, CLAUSE), (1, HUMAN)] {
+            let mut d = c5_diag(1, h, None);
+            d.parser_panics = 2;
+            let (_, t) = queue_remedy(blocked, &d);
+            assert_eq!(t, format!("{BASE}{clause} (이 좌석 화면 파서 패닉 2회 — 화면 판독이 순간 비었을 수 있다){REMEDY_LLM_SUFFIX}"), "h={h}");
+        }
         // 다른 사유에는 구절이 새지 않는다(계수 > 0 이어도).
         for other in [BLOCKED_MODAL, BLOCKED_APPROVAL, BLOCKED_BUSY, BLOCKED_PROMPT_UNKNOWN, BLOCKED_ALT_SCREEN, "zzz"] {
             let (_, t) = queue_remedy(other, &c5_diag(5, 5, None));
@@ -29931,12 +29950,14 @@ after-tick liveness alone does not attribute a clock defect",
         assert!(!t.contains("Ctrl-U") && !t.contains("입력줄 계수가 남아 있다)") && !t.contains("node-recover"), "동결 처방에 구절이 섞였다: {t}");
         // 화면이 이 문장을 읽는 방식(`ui/src/starvednotice.ts`): 접두 ` · LLM 에이전트는 자동 조치` 로 꼬리를 떼고 `<N분째> · <조치 문장>` 을 200자(코드 포인트)로 자른다 — 구절은 꼬리 **앞**이라 정규식·접두가 그대로
         // 맞고, 가장 긴 분 표기(`99999분째`)를 붙여도 200자 안이다.
-        let (_, t) = queue_remedy(blocked, &c5_diag(1, 1, None));
-        let human = t.split(" · LLM 에이전트는 자동 조치").next().expect("꼬리 앞");
-        assert_eq!(human, format!("{BASE}{CLAUSE}"), "꼬리를 뗀 사람 몫 = 본문 + 구절 그대로(구절이 꼬리 앞에서 잘리지 않는다)");
-        assert!(t.ends_with(REMEDY_LLM_SUFFIX), "접미는 문장 맨 끝");
-        let toast = format!("99999분째 · {human}");
-        assert!(toast.chars().count() <= 200, "토스트 본문이 200자를 넘는다({}자): {toast}", toast.chars().count());
+        for (h, clause) in [(0, CLAUSE), (1, HUMAN)] {
+            let (_, t) = queue_remedy(blocked, &c5_diag(1, h, None));
+            let human = t.split(" · LLM 에이전트는 자동 조치").next().expect("꼬리 앞");
+            assert_eq!(human, format!("{BASE}{clause}"), "h={h}: 꼬리를 뗀 사람 몫 = 본문 + 구절 그대로(구절이 꼬리 앞에서 잘리지 않는다)");
+            assert!(t.ends_with(REMEDY_LLM_SUFFIX), "접미는 문장 맨 끝");
+            let toast = format!("99999분째 · {human}");
+            assert!(toast.chars().count() <= 200, "h={h}: 토스트 본문이 200자를 넘는다({}자): {toast}", toast.chars().count());
+        }
     }
 
     /// blocked_by 전수 매핑(WORKLOG 표와 같다) — 상수 문면을 바꾸지 않고 **접두 일치**로 판정한다. 틱이 쓰는 리터럴·상수·직접 `mark_queue_blocked` 호출·
