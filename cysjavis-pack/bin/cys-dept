@@ -531,7 +531,11 @@ PY
       echo "[cys-dept] $name CYS_DEPT_NO_MASTER=1 — 셸 미생성(빈 데몬)" >&2
     elif dept_has_master "$sock"; then
       echo "[cys-dept] $name 이미 master surface 존재 — 셸 생성 생략(멱등)" >&2
-    elif CYS_SOCKET="$sock" "$CYS" new-surface --socket "$sock" --role master --cwd "${CYS_DEPT_CWD:-$HOME}" >/dev/null 2>&1; then
+    #   ★팩소실 방어(2026-08-08 실험확정): 무가드 new-surface 가 죽은 소켓을 만나면 cysd 를 autostart 하고,
+    #   그 데몬이 기동하며 CYS_PACK_DIR 에 팩을 통째 재설치한다(pack→pack.prev 리네임+벤더 설치, 수십 초).
+    #   여기서 CYS_PACK_DIR 를 안 주면 호출자값(=메인 팩)을 상속해 메인 팩이 원복/소거된다.
+    #   위 ready "$sock" 가 데몬 up 을 이미 보증하므로 autostart 는 원래 불필요 — 가드+스코프 이중 차단.
+    elif CYS_NO_AUTOSTART=1 CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" "$CYS" new-surface --socket "$sock" --role master --cwd "${CYS_DEPT_CWD:-$HOME}" >/dev/null 2>&1; then
       echo "[cys-dept] $name role=master 빈 셸 생성 완료 — 사용자가 직접 claude 연결 (cwd=${CYS_DEPT_CWD:-$HOME})" >&2
     else
       echo "[cys-dept] WARN: $name 셸 생성 실패 — read-screen 점검(데몬·격리는 정상)" >&2
@@ -670,7 +674,10 @@ PY
     # ★더블master guard(부트↔수동선언 경합 좀비 방지): 이미 live master surface가 있으면 셸 생성 생략(멱등).
     if dept_has_master "$sock"; then
       echo "[cys-dept] $name 이미 live master surface 존재 — 셸 생성 생략(멱등 더블master 방지)" >&2
-    elif CYS_SOCKET="$sock" "$CYS" new-surface --socket "$sock" --role master --cwd "$cwd" >/dev/null 2>&1; then
+    #   ★팩소실 방어(2026-08-08 실험확정 · 위 allocate 케이스와 동일 기제): 무가드 new-surface → cysd autostart →
+    #   상속된 CYS_PACK_DIR(=메인 팩)에 팩 통째 재설치. 위 ready "$sock" 가 데몬 up 을 보증하므로
+    #   autostart 는 불필요 — 가드로 차단하고, 만에 하나 떠도 부서 팩으로만 향하게 스코프한다.
+    elif CYS_NO_AUTOSTART=1 CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" "$CYS" new-surface --socket "$sock" --role master --cwd "$cwd" >/dev/null 2>&1; then
       echo "[cys-dept] $name role=master 빈 셸 생성 완료 — 사용자가 직접 claude 연결 (미션 파일: $MISS/$key.md)" >&2
     else
       echo "[cys-dept] WARN: $name 셸 생성 실패 — read-screen 점검(데몬·격리는 정상)" >&2
