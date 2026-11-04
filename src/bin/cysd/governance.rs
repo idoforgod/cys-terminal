@@ -5520,6 +5520,9 @@ fn close_surface_effect(daemon: &Arc<Daemon>, operation: CloseOperation<'_>, cau
         let surface = surfaces
             .remove(&id)
             .ok_or_else(|| format!("surface {id} not found"))?;
+        // W60 D2: the panic record's seat snapshot, published inside this critical section after every production
+        // mutation of `surfaces` (census pin: panic_log_tests::census_every_surfaces_mutation_publishes).
+        crate::panic_log::publish_seats(&surfaces);
         let mut roles = daemon.roles.lock().unwrap();
         let srole = surface.role.lock().unwrap();
         let mut master_released = false;

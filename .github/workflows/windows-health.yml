@@ -1426,6 +1426,44 @@ jobs:
           path: w60-s1.log
           if-no-files-found: warn
 
+      # ── W60 D2 (0.14.57; DESIGN-W60-r2 §9.2, codex W60-I2): the panic_log tests on Windows. BLOCKING.
+      #   T-D2-8 (LOCALAPPDATA with spaces and non-ASCII characters) runs only here; the other tests also run on macOS.
+      #   --list first: the literal module filter must list N > 0 tests including T-D2-8, and the run must print exactly one
+      #   "test result: ok. N passed; 0 failed" line (a filter that matched nothing cannot pass). The child-process tests capture
+      #   their child's output, so only the parent's result line reaches this log. --test-threads=1: those tests re-run this binary.
+      - name: 'W60 D2 panic_log tests (--bin cysd · Windows · blocking)'
+        if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          list="${RUNNER_TEMP}/w60-d2-list.txt"; log="w60-d2.log"
+          if CYS_PACK_DIR="$(mktemp -d)" cargo test --locked --bin cysd panic_log_tests:: -- --list > "$list" 2>&1; then rc=0; else rc=$?; fi
+          if [ "$rc" -ne 0 ]; then cat "$list"; echo "::error::W60 D2: --list failed (rc=$rc) - no ground for a run (fail-closed)"; exit 1; fi
+          n=$(grep -cE '^panic_log_tests::[A-Za-z0-9_]+: test$' "$list" || true)
+          if [ "$n" -lt 1 ]; then cat "$list"; echo "::error::W60 D2: the filter lists $n tests"; exit 1; fi
+          if ! grep -qxF 'panic_log_tests::t_d2_8_localappdata_with_spaces_and_non_ascii: test' "$list"; then
+            cat "$list"; echo "::error::W60 D2: T-D2-8 is not listed"; exit 1
+          fi
+          set +e
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --locked --bin cysd panic_log_tests:: -- --test-threads=1 2>&1 | tee "$log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          ok=$(grep -cE "^test result: ok\. ${n} passed; 0 failed;" "$log" || true)
+          if [ "$rc" -ne 0 ] || [ "$ok" -ne 1 ]; then
+            echo "::error::W60 D2: expected rc 0 and one 'test result: ok. ${n} passed; 0 failed' line, got rc=$rc lines=$ok"
+            exit 1
+          fi
+          echo "::notice title=W60 D2::${n} panic_log tests passed on Windows"
+
+      - name: W60 D2 log upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: w60-d2-log
+          path: w60-d2.log
+          if-no-files-found: warn
+
       - name: 결과 업로드 (기계 판독 JSON)
         if: always()
         uses: actions/upload-artifact@v4

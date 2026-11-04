@@ -1289,6 +1289,11 @@ async fn async_main() {
         }
     };
 
+    // W60 D2 (0.14.57): the panic record (<lane state dir>/cysd-panic.log), installed in front of std's hook right after the
+    // single-instance gate on both OSes (unix: the startup lock above; Windows: the first_pipe claim just above), so a gate
+    // loser never creates the file (W1 contract) and the .prev sweep below is already covered (DESIGN-W60-r2 §3.1-§3.2).
+    panic_log::install(&socket_path);
+
     // windows .prev sweep 은 위 싱글턴 게이트 **뒤**에서 수행 — 승자만 잔해를 정리한다(패자는 이미 즉사).
     // ★무중단 rename-swap 잔해 청소(nsis-hooks.nsh의 짝): 업데이트가 잠긴 파일을 죽이는 대신
     // <이름>.prev*(cysd/cys 고정 체인 + unlock-sweep의 <이름>.prev<rand> — msys-2.0.dll 등 세션이
