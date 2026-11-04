@@ -1123,11 +1123,15 @@ jobs:
       #     transcribed frames). The corpus replay is #[ignore] (the corpus is evidence, not repo data) and does not run here.
       #   macOS `--list` (2026-10-16, commit 35007027): u229_ = 4; activity_tests:: = 60 (59 run + the #[ignore] replay, which `--list`
       #   also prints). The count guard only fails on 0.
+      #   · usage::tests::p11_ (0.14.57 P11, DESIGN-P11-r3 T1w): on Windows only the #[cfg(windows)] guard
+      #     p11_t1w_windows_keeps_clock_write_and_b6_rediscovery is compiled under this prefix (every other p11_ test is
+      #     #[cfg(not(windows))]), so the expected Windows count is 1. It pins that Windows keeps today's codex discovery
+      #     (clock write on a non-discovery tick, B6-forced rediscovery) byte-identical (HEAD-DECISION-P11-r2-windows).
       # ★Position / limit: after the cysd full step built the `--bin cysd` test harness, so this step is execution only (seconds). The 3-minute
       #   limit also covers a rebuild if that step was cut mid-build. Budget table (hwmon step header): realistic worst +0.2 min; theoretical
       #   worst 50.3 + 3 = 53.3 min, inside the 55-minute job cap (the table already records that the theoretical worst exceeds the 45-minute
       #   release gate). Placed after F10 for the same reason F10 sits after the non-blocking steps: a red here cannot skip their diagnostics.
-      - name: 'cargo test U cells (--bin cysd u229_ · --bin cysd activity_tests:: · Windows · blocking)'
+      - name: 'cargo test U cells (--bin cysd u229_ · --bin cysd activity_tests:: · --bin cysd usage::tests::p11_ · Windows · blocking)'
         timeout-minutes: 3
         shell: bash
         run: |
@@ -1152,6 +1156,8 @@ jobs:
           CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cysd u229_ -- --test-threads=1
           cargo_filter_count --bin cysd activity_tests::
           CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cysd activity_tests:: -- --test-threads=1
+          cargo_filter_count --bin cysd usage::tests::p11_
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cysd usage::tests::p11_ -- --test-threads=1
 
       # STEP16-STACK (0.14.52, CEO ruling 2026-10-19): the RELEASE-binary stack answer. Measurement only; it judges nothing.
       #   The DEBUG cys.exe overflows its main-thread stack on --help on this runner (the last step of this job: native exit
