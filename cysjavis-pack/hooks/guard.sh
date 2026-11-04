@@ -1025,7 +1025,9 @@ GUARD_ACTIVE=0; [ -e "$ACTIVE_FILE" ] && GUARD_ACTIVE=1
 GUARD_CONST_AUTH=0; GUARD_CONST_SCOPE=""
 CONST_TOKEN="$SCRIPT_DIR/CONSTITUTION_EDIT_AUTHORIZED"
 if [ "$GUARD_ACTIVE" != "1" ] && [ -f "$CONST_TOKEN" ] && [ ! -L "$CONST_TOKEN" ]; then
-  _cnow=$(date +%s); _cmt=$(stat -f %m "$CONST_TOKEN" 2>/dev/null || stat -c %Y "$CONST_TOKEN" 2>/dev/null || echo 0)
+  _cnow=$(date +%s); _cmt=$(stat -f %m "$CONST_TOKEN" 2>/dev/null)
+  case "$_cmt" in ""|*[!0-9]*) _cmt=$(stat -c %Y "$CONST_TOKEN" 2>/dev/null) ;; esac
+  case "$_cmt" in ""|*[!0-9]*) _cmt=0 ;; esac
   if [ $(( _cnow - _cmt )) -le 1800 ]; then
     GUARD_CONST_AUTH=1; GUARD_CONST_SCOPE="$(cat "$CONST_TOKEN" 2>/dev/null)"
   fi
