@@ -60,7 +60,7 @@ HEADER_RE = re.compile(r"^== (\S+) · (\S+)$", re.M)
 OVERLAY_TEXT = "로컬 지침("
 RESTRICTION = "이 작업 공간에서는 큐 자동 배달을 하지 않는다."
 FORBIDDEN_IN_BLOCK = ("set-status", "--ack", "CYS_BOOT_NONCE", "부트 브리지", "\\")
-DESIGN_TOTALS = {"master": 8859, "worker": 6241, "reviewer": 993}  # final §8.1 (cso changed: T1-12d withdrawn)
+DESIGN_TOTALS = {"master": 8873, "worker": 6241, "reviewer": 993}  # final §8.1 (cso changed: T1-12d withdrawn; master +14B for `<좌석> --id ` in T1-01+T2-01)
 
 
 def _read_bytes(p):

@@ -418,8 +418,8 @@ SAFETY_CLAUSES = {
         #   ②0.14.42 의 "사람 운영자 전용" 단정을 되살렸고(`강제 배달`이 '자동'이 아니어도 막는다) depth_high 행과 겹쳐도 이 행이 이긴다고 적었다.
         #   아래 첫 항은 문장 전체를 잡고, 뒤 두 항(가산)은 되살린 낱말·새 조건을 따로 잡아 그 구절만 지워도 붉어지게 한다.
         ("queue.starved 처방대로 직접 해소·강제 배달 한정", "요약의 `remedy=<코드>`(처방 코드 · 없으면 `blocked_by`)대로 **★CSO 가 직접 푼다(사용자 지침이 막으면 따른다)**: "
-                                 "`cys read-screen` 으로 그 창을 먼저 읽고, 만료 항목은 `cys queue revive <id>`(같은 항목은 한 번만), 막힌 머리는 "
-                                 "**막힌 이유가 quiet 대기·사이클 창 보류일 때만** `cys queue deliver <id>`(단건 · 항목·remedy 코드마다 10분에 한 번 · 드레인 금지)"),
+                                 "`cys read-screen` 으로 그 창을 먼저 읽고, 만료 항목은 **네가 보낸 항목만** `cys queue revive <id>`(같은 항목은 한 번만 — 다른 좌석·데몬·스케줄이 보낸 만료 항목은 데몬이 거부하므로(master 전용) 읽은 그 화면과 함께 master 에게 넘긴다), 막힌 머리는 "
+                                 "**막힌 이유가 quiet 대기·사이클 창 보류일 때만** `cys queue deliver <좌석> --id <id>`(단건 · 항목·remedy 코드마다 10분에 한 번 · 드레인 금지)"),
         ("queue.starved 프롬프트 게이트는 master 에게·입력 주입 금지", "**초안·모달·승인·전체화면(codex·gemini 좌석은 늘 이렇다)·작업 중·빈 좌석·일시정지·사람 입력 직후·배달 간격으로 막혔으면 "
                                  "강제 배달도 데몬이 거부한다 — 부르지 않는다: 작업 중·사람 입력 직후·배달 간격은 기다리고, 초안·모달·승인·전체화면·빈 좌석·일시정지는 "
                                  "읽은 화면과 함께 master 에게 넘긴다. CSO 는 남의 입력줄에 글·키를 넣지 않는다**"),
@@ -476,7 +476,7 @@ SAFETY_CLAUSES = {
         #   ★종전 핀은 "에이전트 (master" 로 공백을 넣어 잡았다(줄바꿈이 낀 문면을 접은 값) — 이제 문면이 한 줄 안에서 "에이전트(master" 로 이어진다(티켓 문안 그대로).
         ("queue.starved 기본값·처방대로 직접 해소", "(기아 · `CYS_QUEUE_STARVE_ALERT_SECS` 기본 600초 · depth_high와 별도 축)가 발행된다 — "
                                   "요약의 `remedy=<코드>`(처방 코드 · 없으면 `blocked_by`)대로 **★자비스가 직접 푼다(사용자 지침이 막으면 그 지침을 따른다)**"),
-        ("queue.starved 강제 배달 한정·프롬프트 게이트 불호출", "막힌 머리는 **막힌 이유가 quiet 대기·사이클 창 보류일 때만** `cys queue deliver <id>`(단건 · 항목·remedy 코드마다 10분에 한 번 · 드레인 금지) — "
+        ("queue.starved 강제 배달 한정·프롬프트 게이트 불호출", "막힌 머리는 **막힌 이유가 quiet 대기·사이클 창 보류일 때만** `cys queue deliver <좌석> --id <id>`(단건 · 항목·remedy 코드마다 10분에 한 번 · 드레인 금지) — "
                                  "**초안·모달·승인·전체화면·작업 중·빈 좌석·일시정지·사람 입력 직후·배달 간격으로 막혔으면 강제 배달도 데몬이 거부하므로 부르지 않는다"),
         ("queue.starved 사람 글·질문 창은 사용자에게 한 번", "③유령 계수·사람 글이 걸린 입력줄은 기계가 지우지 못한다(데몬의 사람 글 보호 게이트) — 그 순간 읽은 화면으로 "
                                  "그 창을 짚어 사용자에게 한 번 청한다(비어 있으면 그 창에서 Ctrl-U, 글이 있으면 제출·지우기·그대로 두기 중 무엇을 할지) "
@@ -506,7 +506,7 @@ SAFETY_CLAUSES = {
         #   ★종전 핀은 "에이전트 (master" 로 공백을 넣어 잡았다(줄바꿈이 낀 문면을 접은 값) — 이제 문면이 한 줄 안에서 "에이전트(master" 로 이어진다(티켓 문안 그대로).
         ("queue.starved 기본값·처방대로 직접 해소", "(기아 · `CYS_QUEUE_STARVE_ALERT_SECS` 기본 600초 · depth_high와 별도 축)가 발행된다 — "
                                   "요약의 `remedy=<코드>`(처방 코드 · 없으면 `blocked_by`)대로 **★자비스가 직접 푼다(사용자 지침이 막으면 그 지침을 따른다)**"),
-        ("queue.starved 강제 배달 한정·프롬프트 게이트 불호출", "막힌 머리는 **막힌 이유가 quiet 대기·사이클 창 보류일 때만** `cys queue deliver <id>`(단건 · 항목·remedy 코드마다 10분에 한 번 · 드레인 금지) — "
+        ("queue.starved 강제 배달 한정·프롬프트 게이트 불호출", "막힌 머리는 **막힌 이유가 quiet 대기·사이클 창 보류일 때만** `cys queue deliver <좌석> --id <id>`(단건 · 항목·remedy 코드마다 10분에 한 번 · 드레인 금지) — "
                                  "**초안·모달·승인·전체화면·작업 중·빈 좌석·일시정지·사람 입력 직후·배달 간격으로 막혔으면 강제 배달도 데몬이 거부하므로 부르지 않는다"),
         ("queue.starved 사람 글·질문 창은 사용자에게 한 번", "③유령 계수·사람 글이 걸린 입력줄은 기계가 지우지 못한다(데몬의 사람 글 보호 게이트) — 그 순간 읽은 화면으로 "
                                  "그 창을 짚어 사용자에게 한 번 청한다(비어 있으면 그 창에서 Ctrl-U, 글이 있으면 제출·지우기·그대로 두기 중 무엇을 할지) "
@@ -3367,11 +3367,17 @@ class QueueStarvedDocContract(unittest.TestCase):
         for name in self.FILES:
             body = self.body(name)
             with self.subTest(directive=name):
+                expected_cmd = {
+                    "revive": "`cys queue revive <id>`",
+                    "deliver": "`cys queue deliver <좌석> --id <id>`",
+                }
                 for verb in verbs:
-                    self.assertEqual(body.count("`cys queue %s <id>`" % verb), 1,
-                                     "%s: 코드가 허용한 `cys queue %s <id>` 가 정확히 1번이어야 한다" % (name, verb))
+                    self.assertEqual(body.count(expected_cmd[verb]), 1,
+                                     "%s: 코드가 허용한 %s 가 정확히 1번이어야 한다" % (name, expected_cmd[verb]))
+                self.assertEqual(body.count("`cys queue deliver <id>`"), 0,
+                                 "%s: 첫 위치인자 `<좌석>` 빠진 `cys queue deliver <id>` 오기재가 남아 있다" % name)
                 self.assertIn("`remedy=<코드>`(처방 코드 · 없으면 `blocked_by`)대로", body)
-                self.assertEqual(body.count("막힌 이유가 quiet 대기·사이클 창 보류일 때만 `cys queue deliver <id>`"
+                self.assertEqual(body.count("막힌 이유가 quiet 대기·사이클 창 보류일 때만 `cys queue deliver <좌석> --id <id>`"
                                             "(단건 · 항목·remedy 코드마다 10분에 한 번 · 드레인 금지)"), 1,
                                  "%s: 강제 배달의 한정 조건이 정확히 1번이어야 한다" % name)
                 self.assertNotIn("사람 운영자 전용", body, "%s: 오너가 푼 금지 문면이 되살아났다" % name)
