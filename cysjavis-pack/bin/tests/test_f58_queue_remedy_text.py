@@ -9,9 +9,15 @@ src/bin/cysd/governance.rs `REMEDY_LLM_SUFFIX` when present in the checkout):
 
   1. Every prescribed `[cys] queue deliver <args>` invocation (after normalising
      hard-wrapped lines and Unicode whitespace) is parsed against the clap shape
-     in `src/bin/cys.rs:1031-1039` (`QueueCommand::Deliver { surface, --id, --allow-reorder }`):
-       - exactly one valid seat/surface positional token (`<좌석>`, `<surface>`,
-         `surface:<N>`, or a role/seat name),
+     in `src/bin/cys.rs:1031-1039` (`QueueCommand::Deliver { surface, --id, --allow-reorder }`)
+     and the seat resolver `parse_surface_ref` (`src/bin/cys.rs:6632-6634` ->
+     `src/lib.rs:2800-2804`):
+       - `surface` positional token (exactly one): an angle-bracket seat placeholder
+         from `VALID_SEAT_PLACEHOLDERS` (`<좌석>`, `<surface>`, `<seat>`, `<대상>`,
+         `<대상좌석>`, `<n>`, `<N>`), OR a bare unsigned integer (`u64`), OR
+         `surface:` + (unsigned integer | seat placeholder). Role/seat names
+         (`master`, `cso`, `worker-1`, `surface:cso`, etc.) are rejected by
+         `parse_surface_ref` with `invalid surface ref` and are therefore rejected here.
        - optional `--id <id>` or `--id=<id>` (in any order),
        - optional `--allow-reorder`,
        - zero unknown flags or trailing positional tokens,
@@ -73,27 +79,32 @@ DELIVER_CMD_RE = re.compile(r"(?:\bcys\s+)?\bqueue\s+deliver\b")
 
 # Detects argument-like tokens placed immediately outside a closing backtick (`cys queue deliver` <id>)
 OUTSIDE_ARG_RE = re.compile(
-    r"^\s*(?:<[^>]+>|\{[^}]+\}|--?[A-Za-z0-9_-]+|surface:\S+|\d+\b|\b(?:id|entry|item)\b)"
+    r"^\s*(?:<[^>]+>|\{[^}]+\}|--?[A-Za-z0-9_-]+|[A-Za-z]+:\S+|[+-]?\d+\b|\b(?:id|entry|item)\b)"
 )
 
 # Extracts CLI-like argument tokens from an un-backticked `queue deliver ...` invocation
 UNQUOTED_ARGS_RE = re.compile(
-    r"^((?:(?:<[^>]+>|\{[^}]+\}|--?[A-Za-z0-9_=-]+|surface:\S+|[A-Za-z0-9_.-]+)(?:\s+|$))+)"
+    r"^((?:(?:<[^>]+>|\{[^}]+\}|--?[A-Za-z0-9_=-]+|[A-Za-z]+:\S+|[+-]?[A-Za-z0-9_.-]+)(?:\s+|$))+)"
 )
 
+# Keep in step with `parse_surface_ref(&surface)` in `src/lib.rs:2800-2804`
+# (`s.trim().strip_prefix("surface:").unwrap_or(t).parse::<u64>().ok()`)
+# and its caller in `QueueCommand::Deliver` at `src/bin/cys.rs:6632-6634`.
+# Runtime `cys queue deliver` accepts ONLY an unsigned 64-bit integer (`N` or `surface:N`);
+# role names (`master`, `cso`, `worker-1`, `surface:cso`, etc.) fail at runtime with
+# `invalid surface ref: ...`. In documentation/remedy templates, angle-bracket seat
+# placeholders from `VALID_SEAT_PLACEHOLDERS` stand in for `N`.
 VALID_SEAT_PLACEHOLDERS = {
     "<좌석>",
     "<surface>",
     "<seat>",
     "<대상>",
     "<대상좌석>",
-    "{surface}",
-    "{seat}",
+    "<n>",
+    "<N>",
 }
-VALID_SEAT_SURFACE_RE = re.compile(r"^surface:(?:\d+|<[^>]+>|\{[^}]+\}|[A-Za-z0-9_-]+)$")
-VALID_SEAT_NAME_RE = re.compile(
-    r"^(?:master|cso|ceo|worker(?:-\d+)?|reviewer(?:-?\d+|-[a-z0-9]+)?|builder(?:-\d+)?)$"
-)
+UNSIGNED_INT_RE = re.compile(r"^[0-9]+$")
+U64_MAX = (1 << 64) - 1
 INVALID_SEAT_TOKENS = {
     "<id>",
     "<항목>",
@@ -127,15 +138,21 @@ AMENDED_MANIFEST_ROW_IDS = (
 )
 
 
+def _is_u64_literal(s: str) -> bool:
+    """Return True iff `s` is an ASCII decimal unsigned 64-bit integer (`0..=u64::MAX`)."""
+    return bool(UNSIGNED_INT_RE.match(s)) and int(s) <= U64_MAX
+
+
 def is_valid_seat_token(tok: str) -> bool:
-    """Return True iff `tok` is a valid `surface` positional token per `src/bin/cys.rs:1031-1039`."""
-    if not tok or tok.startswith("-") or tok in INVALID_SEAT_TOKENS or tok.isdigit():
+    """Return True iff `tok` is a valid `surface` positional token per `src/lib.rs:2800-2804` (`parse_surface_ref`) and `src/bin/cys.rs:6632-6634`."""
+    if not tok or tok.startswith("-") or tok in INVALID_SEAT_TOKENS:
         return False
-    return (
-        tok in VALID_SEAT_PLACEHOLDERS
-        or bool(VALID_SEAT_SURFACE_RE.match(tok))
-        or bool(VALID_SEAT_NAME_RE.match(tok))
-    )
+    if tok in VALID_SEAT_PLACEHOLDERS or _is_u64_literal(tok):
+        return True
+    if tok.startswith("surface:"):
+        rest = tok[len("surface:") :]
+        return _is_u64_literal(rest) or rest in VALID_SEAT_PLACEHOLDERS
+    return False
 
 
 def is_valid_id_token(tok: str) -> bool:
@@ -191,7 +208,7 @@ def parse_deliver_args(arg_str: str):
                 return (
                     False,
                     f"positional token {tok!r} is not a valid seat/surface token "
-                    f"(expected <좌석>, <surface>, surface:N, or seat name)",
+                    f"(expected <좌석>, <surface>, <u64>, or surface:<u64>)",
                 )
             seat_token = tok
             i += 1
@@ -557,7 +574,7 @@ class QueueRemedyTextTests(unittest.TestCase):
         self.assertEqual(violations, [], "\n".join(violations))
 
     def test_adversarial_variants_and_must_pass_forms(self):
-        # 1) Every must-fail deliver variant (including w191's 9 bypass forms) must be caught
+        # 1) Every must-fail deliver variant (including w191's 9 bypass forms and role-name inversions) must be caught
         for bad_cmd in (
             "`cys queue deliver <id>`",
             "`cys queue deliver` <id>",
@@ -570,22 +587,44 @@ class QueueRemedyTextTests(unittest.TestCase):
             "`cys queue deliver --id=<id>`",
             "`cys queue deliver <항목>`",
             "`cys queue deliver {id}`",
-            "`cys queue deliver 12`",
             "`cys queue deliver --id <id>`",
+            "`cys queue deliver worker-1 --id 42`",
+            "`cys queue deliver master --id <id>`",
+            "`cys queue deliver worker-2`",
+            "`cys queue deliver surface:cso`",
+            "`cys queue deliver surface:cso --id <id>`",
+            "`cys queue deliver cso`",
+            "`cys queue deliver MASTER --id <id>`",
+            "`cys queue deliver SURFACE:7 --id <id>`",
+            "`cys queue deliver Surface:7 --id <id>`",
+            "`cys queue deliver surface: 7 --id <id>`",
+            "`cys queue deliver +7 --id <id>`",
+            "`cys queue deliver surface:+7 --id <id>`",
+            "`cys queue deliver -7 --id <id>`",
+            "`cys queue deliver surface:-7 --id <id>`",
+            "`cys queue deliver 18446744073709551616 --id <id>`",
+            "`cys queue deliver {surface} --id <id>`",
+            "`cys queue deliver surface:<id> --id <id>`",
         ):
             with self.subTest(bad_deliver=bad_cmd):
                 v, valid = scan_deliver_text("synthetic.md", f"막힌 머리는 {bad_cmd}(단건)", is_hook=False)
                 self.assertEqual(len(v), 1, f"adversarial variant {bad_cmd!r} was not caught: v={v}")
                 self.assertEqual(valid, [], f"adversarial variant {bad_cmd!r} falsely accepted: {valid}")
 
-        # 2) Valid CLI deliver shapes (clap QueueCommand::Deliver at src/bin/cys.rs:1031-1039) must pass
+        # 2) Valid CLI deliver shapes (clap QueueCommand::Deliver at src/bin/cys.rs:1031-1039
+        #    + parse_surface_ref at src/lib.rs:2800-2804 / src/bin/cys.rs:6632-6634) must pass
         for valid_cmd in (
             "`cys queue deliver <좌석> --id <id>`",
             "`cys queue deliver <좌석>`",
             "`cys queue deliver --id <id> <좌석>`",
             "`cys queue deliver <surface> --id <id>`",
+            "`cys queue deliver <seat> --id <id>`",
+            "`cys queue deliver 12`",
+            "`cys queue deliver 12 --id q1a.3`",
+            "`cys queue deliver surface:7 --id <id>`",
             "`cys queue deliver surface:3 --id <id> --allow-reorder`",
-            "`cys queue deliver worker-1 --id 42`",
+            "`cys queue deliver surface:<좌석> --id <id>`",
+            "`cys queue deliver surface:<surface> --id <id>`",
             "`cys queue deliver <좌석> --id=<id>`",
         ):
             with self.subTest(valid_deliver=valid_cmd):
