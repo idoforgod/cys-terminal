@@ -1410,6 +1410,48 @@ jobs:
           set -euo pipefail
           cd ui && bun test
 
+      # F58 M1 (HEAD-RULING-F58-impl-r1, design 6.6): T-11m runs on Windows, blocking. Design 6.6 makes T-11m (another
+      #   process holds MEMORY.md or the entry open -> revert exit 3, the pair byte-identical) a Windows CI job test, and
+      #   test_f58_learning_loop.py skips it unless os.name == 'nt'. Before this step no Windows job ran the file, so T-11m,
+      #   the CRLF index cell and the only cell that can kill mutant M28 (the index written in text mode: identical on POSIX,
+      #   it turns each kept \r\n into \r\r\n on Windows) ran nowhere. Only those two cases run here, to protect the
+      #   45-minute release gate (this job took 38.0 min at 2cbf9e38, run 41774134595).
+      # · Shell bash (Git Bash). `python` is the 3.12 from 'Setup Python 3.12' above, the pin every python step of this job
+      #   uses. Repo-relative forward-slash path; output under $RUNNER_TEMP; PYTHONUTF8=1 comes from the job env.
+      # · Red, never silent: pass only if rc 0, `Ran 2`, the result line is exactly `OK` (a skip prints `OK (skipped=1)`)
+      #   and both case lines end in `... ok`. A missing file, an import error, a skip or a failed subtest is red. Python
+      #   writes \r\n on Windows, so the output is read after `tr -d '\r'`.
+      # · Position: last of the blocking steps, after the UI step, so a red here skips none of the job's diagnostics.
+      # · Time: macOS 3.9.6 sealed, the two cases Ran 2 in 2.83 s with T-11m skipped (T-11m = 2 subtests, each one store
+      #   and one revert, about the CRLF cell's cost). Windows time UNMEASURED [estimate: under a minute]; limit 4 min.
+      #   Budget table (hwmon step header): realistic worst about +1 min; theoretical worst +4 min (already over both caps,
+      #   as recorded there).
+      # ★No `if:` and no `continue-on-error` (blocking, design 6.6). This job is still not in the lane gate's SUBSET_LANES
+      #   (header note above; T-13w already calls a test file directly): a head decision recorded in REPORT-F58-r1fix.
+      - name: F58 T-11m held index and entry + CRLF index cell (Windows blocking)
+        timeout-minutes: 4
+        shell: bash
+        run: |
+          set -uo pipefail
+          raw="${RUNNER_TEMP:-/tmp}/t11m.raw"; out="${RUNNER_TEMP:-/tmp}/t11m.out"
+          python -c "import os, sys; print('[t11m] python', sys.version.split()[0], 'os.name', os.name)"
+          python cysjavis-pack/bin/tests/test_f58_learning_loop.py \
+            Revert.test_11m_windows_held_index_and_entry Revert.test_crlf_index_keeps_every_other_byte > "$raw" 2>&1
+          rc=$?
+          tr -d '\r' < "$raw" > "$out"
+          sed 's/^/[t11m]   | /' "$out"
+          ran=$(grep -Eo '^Ran [0-9]+ test' "$out" | grep -Eo '[0-9]+' | tail -n 1)
+          res=$(grep -E '^(OK|FAILED)' "$out" | tail -n 1)
+          m=$(grep -cE '^test_11m_windows_held_index_and_entry \(.*\) \.\.\. ok$' "$out")
+          c=$(grep -cE '^test_crlf_index_keeps_every_other_byte \(.*\) \.\.\. ok$' "$out")
+          echo "[t11m] RESULT rc=$rc ran=${ran:-0} t11m_ok=$m crlf_ok=$c ${res:-no-result-line}"
+          if [ "$rc" = 0 ] && [ "${ran:-0}" = 2 ] && [ "$res" = OK ] && [ "$m" = 1 ] && [ "$c" = 1 ]; then
+            echo "::notice title=F58 T-11m::T-11m (held index, held entry) and the CRLF index cell passed on Windows"
+          else
+            echo "::error title=F58 T-11m::T-11m or the CRLF index cell did not pass on Windows: rc=$rc ran=${ran:-0} t11m_ok=$m crlf_ok=$c ${res:-no-result-line}"
+            exit 1
+          fi
+
       - name: 결과 업로드 (기계 판독 JSON)
         if: always()
         uses: actions/upload-artifact@v4
