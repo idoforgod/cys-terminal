@@ -34376,6 +34376,11 @@ after-tick liveness alone does not attribute a clock defect",
         assert!(s.inject_track.withheld().is_some());
         let r = super::resubmit_withheld_one(&daemon, &s, now + std::time::Duration::from_secs(5));
         assert_eq!(r, "resubmitted");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while s.write_tx.gate().pending() != 0 {
+            assert!(std::time::Instant::now() < deadline, "timing: writer did not drain recovery CR within 5s");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         let _ = s.child.lock().unwrap().kill();
         crate::state::p1_e0_stop_daemon(&daemon);
     }
@@ -34401,8 +34406,29 @@ after-tick liveness alone does not attribute a clock defect",
         );
         let r = super::resubmit_withheld_one(&daemon, &s, now + std::time::Duration::from_secs(5));
         assert_eq!(r, "resubmitted");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while s.write_tx.gate().pending() != 0 {
+            assert!(std::time::Instant::now() < deadline, "timing: writer did not drain recovery CR within 5s");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         let _ = s.child.lock().unwrap().kill();
         crate::state::p1_e0_stop_daemon(&daemon);
+    }
+
+    fn p10_raw_seat(tag: &str, agent: &str) -> (Arc<Daemon>, Arc<crate::state::Surface>) {
+        let daemon = drill_daemon(tag);
+        let cmd = if cfg!(unix) {
+            "stty raw -echo; exec sleep 30"
+        } else {
+            "sleep 30"
+        };
+        let s = daemon
+            .create_surface(None, Some(cmd.into()), None, None, 24, 80)
+            .expect("create surface");
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        *s.agent_meta.lock().unwrap() = Some((agent.to_string(), "worker".to_string()));
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        (daemon, s)
     }
 
     #[test]
@@ -34411,7 +34437,7 @@ after-tick liveness alone does not attribute a clock defect",
         let _sc = P10TestScopeGuard::claude();
         let pack = empty_pack_dir("p10-t4-remedy");
         let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
-        let (daemon, s) = wp5_seat("p10-t4-remedy", "claude");
+        let (daemon, s) = p10_raw_seat("p10-t4-remedy", "claude");
         p1_measured(&s);
         let now = p10_seed_mark(&s, "M|x|REM", 5, Some("q-t4"));
         p10_paint_inline_box(&s, "❯ M|x|REM");
@@ -34959,7 +34985,7 @@ after-tick liveness alone does not attribute a clock defect",
         p10_paint_inline_box(&s, "❯ M|x|AAA");
         p10_arm(&daemon, &s);
         assert!(s.inject_track.withheld().is_some());
-        let _kill = QueueEnvGuard::set(&[("CYS_DISABLE_SUBMIT_WITHHOLD", "1")]);
+        let _kill = QueueEnvGuard::set(&[("CYS_SEND_SETTLE", "0")]);
         let r = super::resubmit_withheld_one(&daemon, &s, now + std::time::Duration::from_secs(5));
         assert_eq!(r, "kill_switch");
         assert!(s.inject_track.withheld().is_none());
@@ -34976,8 +35002,8 @@ after-tick liveness alone does not attribute a clock defect",
         let (daemon, s) = wp5_seat("p10-k21-export", "claude");
         p1_measured(&s);
         p10_paint_inline_box(&s, "❯ M|x|AAA");
-        let before = super::observe_composer_export(&s);
         let _now = p10_seed_mark(&s, "M|x|AAA", 5, Some("q-k21"));
+        let before = super::observe_composer_export(&s);
         p10_arm(&daemon, &s);
         assert!(s.inject_track.withheld().is_some());
         let after = super::observe_composer_export(&s);
@@ -35444,42 +35470,62 @@ after-tick liveness alone does not attribute a clock defect",
         s.clear_pending_input();
         p10_paint_inline_box(&s, "❯ ");
         let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
-        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
-        let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
-        let release_rx_w = Arc::clone(&release_rx);
+        let (observed_tx, observed_rx) = std::sync::mpsc::sync_channel(1);
+        let s_w = Arc::clone(&s);
         s.write_tx
             .try_send(crate::state::WriteReq::SubmitAfterGap {
                 bytes: Vec::new(),
                 min_gap_ms: 0,
                 withhold: Some(Arc::new(move || {
                     let _ = entered_tx.try_send(());
-                    let _ = release_rx_w
-                        .lock()
-                        .unwrap()
-                        .recv_timeout(std::time::Duration::from_secs(5));
+                    // Wait for the observable handoff point in `deliver_head_locked` (`governance.rs:13377`):
+                    // `s_w.inject_reserved()` becomes true only AFTER `stamp.handoff_write_epoch` is captured (:13328)
+                    // and `WriteReq::Agent` is enqueued (:13353), right as `deliver_head_locked` enters `g.settle_handoff(800ms)` (:13444).
+                    let wait_start = std::time::Instant::now();
+                    while !s_w.inject_reserved() {
+                        if wait_start.elapsed() >= std::time::Duration::from_secs(5) {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    let _ = observed_tx.try_send((
+                        s_w.inject_reserved(),
+                        s_w.inject_track.resume_write_epoch(),
+                    ));
                     false
                 })),
                 done: None,
             })
-            .expect("enqueue foreign writer request with entry/release barrier");
+            .expect("enqueue foreign writer request with observable handoff barrier");
         entered_rx
             .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("writer entered foreign request barrier before handoff");
+            .expect("timing: writer did not enter foreign request barrier within 5s");
         let epoch_at_handoff = s.inject_track.resume_write_epoch();
         let human_at_handoff = *s.last_human_input.lock().unwrap();
         let agent_epoch_at_handoff = s.agent_epoch.load(AtomicOrdering::Acquire);
         let conv_epoch_at_handoff = s.conversation_epoch.load(AtomicOrdering::Acquire);
         tick(&daemon);
-        let gen_at_handoff = s.input_gen.load(AtomicOrdering::Acquire);
-        assert_eq!(
-            s.inject_track.resume_write_epoch(),
-            epoch_at_handoff,
-            "barrier holds foreign write so HandoffStamp captures handoff_write_epoch == epoch_at_handoff"
+        let (reserved_seen, epoch_at_reservation) = observed_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("timing: foreign request did not observe inject_reserved handoff point within 5s");
+        assert!(
+            reserved_seen,
+            "logic: foreign write released without observing s.inject_reserved() at settle_handoff entry"
         );
-        release_tx.send(()).expect("release foreign writer barrier after handoff");
+        assert_eq!(
+            epoch_at_reservation,
+            epoch_at_handoff,
+            "logic: HandoffStamp must capture handoff_write_epoch == epoch_at_handoff before foreign write completes"
+        );
+        let gen_at_handoff = s.input_gen.load(AtomicOrdering::Acquire);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while s.write_tx.gate().pending() != 0 || !s.pending_queue.lock().unwrap().is_empty() {
-            assert!(std::time::Instant::now() < deadline, "foreign + queue job did not drain");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timing: foreign + queue job did not drain within 5s (pending={}, queue_len={})",
+                s.write_tx.gate().pending(),
+                s.pending_queue.lock().unwrap().len()
+            );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert_eq!(
@@ -35692,15 +35738,28 @@ after-tick liveness alone does not attribute a clock defect",
         assert!(!super::p10_block_matches_full_body(&tail_b, mark.flat_len, &mark.flat_sha));
 
         // Also verify that a short visible tail `"visible second line"` of `"hidden first line\nvisible second line"`
-        // does not match `p10_block_matches_full_body` and is never armed (stays `None` since `composer_block_is_machine_body` is false).
+        // fails `p10_block_matches_full_body` (`DESIGN-P10-r3.md` §1 E3): holds with 0 Returns written and
+        // `/seat` remedy code `"machine_residue"` (row 3b, `Declined("representation")`).
         let _now = p10_seed_mark(&s, "hidden first line\nvisible second line", 5, Some("q-r3-4-short"));
         p10_paint_inline_box(&s, "❯ visible second line");
+        let wrote_before = s.inject_track.wrote();
         p10_arm(&daemon, &s);
-        assert!(s.inject_track.withheld().is_none());
-        assert_eq!(s.inject_track.residue_stage_for_current_body(), None);
+        assert!(s.inject_track.withheld().is_none(), "0 Returns armed on visible tail");
+        assert_eq!(s.inject_track.wrote(), wrote_before, "0 Returns written on visible tail");
         assert_eq!(
-            super::queue_block_diag(&daemon, &s).residue,
-            crate::state::QueueBlockResidue::None
+            s.inject_track.residue_stage_for_current_body(),
+            Some(crate::state::ResidueStage::Declined("representation"))
+        );
+        let diag = super::queue_block_diag(&daemon, &s);
+        assert_eq!(
+            diag.residue,
+            crate::state::QueueBlockResidue::Declined("representation")
+        );
+        let (remedy_code, _remedy_msg) = super::queue_remedy(super::BLOCKED_INPUT_PENDING, &diag);
+        assert_eq!(
+            remedy_code,
+            "machine_residue",
+            "DESIGN-P10-r3 §1: missing E3 must hold with code machine_residue"
         );
         let _ = s.child.lock().unwrap().kill();
         crate::state::p1_e0_stop_daemon(&daemon);
@@ -35719,6 +35778,11 @@ after-tick liveness alone does not attribute a clock defect",
             super::resubmit_withheld_one(&daemon, &s, now + std::time::Duration::from_secs(5)),
             "resubmitted"
         );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while s.write_tx.gate().pending() != 0 {
+            assert!(std::time::Instant::now() < deadline, "timing: writer did not drain recovery CR within 5s");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         let _ = s.child.lock().unwrap().kill();
         crate::state::p1_e0_stop_daemon(&daemon);
     }
@@ -35847,10 +35911,23 @@ after-tick liveness alone does not attribute a clock defect",
             Some(crate::state::ResidueStage::Armed)
         );
 
-        // Terminate the child so the reader EOF sets `writer_stop` and the surface's writer loop drops `write_rx`.
+        // Terminate the child so the reader EOF sets `s.exited` (`state.rs:8375`) and `writer_stop` (`state.rs:8381`).
+        // 1) Wait for the observable reader-EOF condition (`s.exited.load(Acquire)`).
         let _ = s.child.lock().unwrap().kill();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let exit_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !s.exited.load(AtomicOrdering::Acquire) {
+            assert!(
+                std::time::Instant::now() < exit_deadline,
+                "timing: reader did not observe child exit (s.exited) within 5s"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // 2) `run_writer_loop_tracked` (`state.rs:8903-8908`) checks `stop.load` only inside `Err(RecvTimeoutError::Timeout)`
+        //    after 200 ms of channel silence. Sleep 250 ms (+50 ms / +25% margin over the 200 ms `recv_timeout` window,
+        //    within a 5,000 ms budget = 20x margin) BEFORE each probe so `try_send` does not reset the 200 ms timer.
+        let disc_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
+            std::thread::sleep(std::time::Duration::from_millis(250));
             let probe_req = crate::state::WriteReq::SubmitAfterGap {
                 bytes: Vec::new(),
                 min_gap_ms: 0,
@@ -35863,17 +35940,22 @@ after-tick liveness alone does not attribute a clock defect",
             ) {
                 break;
             }
-            assert!(std::time::Instant::now() < deadline, "writer did not disconnect");
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            assert!(
+                std::time::Instant::now() < disc_deadline,
+                "timing: writer did not disconnect after s.exited within 5s (200ms recv_timeout window)"
+            );
         }
-        // Simulate the race where the writer loop disconnected just before `try_send` while `exited` was still false at guard 2.
+        // Simulate the race where the writer loop disconnected just before `try_send` while `exited` was still false at guard 2,
+        // then restore `s.exited = true` immediately so `p1_e0_stop_daemon` observes the true exited state.
         s.exited.store(false, AtomicOrdering::Relaxed);
         let r = super::resubmit_withheld_one(&daemon, &s, now + std::time::Duration::from_secs(5));
-        assert_eq!(r, "writer_gone");
-        assert!(s.inject_track.withheld().is_none());
+        s.exited.store(true, AtomicOrdering::Release);
+        assert_eq!(r, "writer_gone", "logic: Disconnected channel must return writer_gone");
+        assert!(s.inject_track.withheld().is_none(), "logic: Disconnected must consume withheld record");
         assert_eq!(
             s.inject_track.residue_stage_for_current_body(),
-            Some(crate::state::ResidueStage::Declined("writer_gone"))
+            Some(crate::state::ResidueStage::Declined("writer_gone")),
+            "logic: Disconnected must transition ResidueTrack to Declined(\"writer_gone\")"
         );
         crate::state::p1_e0_stop_daemon(&daemon);
     }
