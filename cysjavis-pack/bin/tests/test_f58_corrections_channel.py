@@ -47,6 +47,7 @@ IC_HOOK = os.path.join(HOOKS, "inject-context.sh")
 LIB = os.path.join(HOOKS, "_lib.sh")
 OWNED = os.path.join(BIN, "_owned_process.py")
 MANIFEST = os.path.join(PACK, "round", "self-service-corrections.json")
+FIXTURES_056 = os.path.join(SELF, "fixtures", "f58-056")
 BASH = shutil.which("bash") or "/bin/bash"
 
 ROLES = ("master", "worker", "cso", "reviewer")
@@ -150,13 +151,15 @@ class Rig(object):
             tip = _read_bytes(os.path.join(PACK, *rel.split("/")))
             data = tip
             if mode == "056":
-                for r in reversed(rows):
+                data = _read_bytes(os.path.join(FIXTURES_056, *rel.split("/")))
+                for r in rows:
                     n, o = r["new"].encode("utf-8"), r["old"].encode("utf-8")
-                    assert data.count(n) == 1, "%s: new text occurs %d times in the shipped file" % (
-                        r["id"], data.count(n))
-                    data = data.replace(n, o, 1)
+                    assert tip.count(n) == 1, "%s: new text occurs %d times in the shipped file" % (
+                        r["id"], tip.count(n))
+                    assert data.count(o) == 1, "%s: old text occurs %d times in the 0.14.56 file" % (
+                        r["id"], data.count(o))
                 blobs = {r["base_blob"] for r in rows}
-                assert git_blob_id(data) in blobs, "%s rebuilt bytes are not the 31f87878 blob %s" % (rel, blobs)
+                assert git_blob_id(data) in blobs, "%s fixture bytes are not the 31f87878 blob %s" % (rel, blobs)
                 _write_bytes(os.path.join(self.pack, *(rel + ".new").split("/")), tip)
             _write_bytes(os.path.join(self.pack, *rel.split("/")), data)
             self.record[rel] = _sha(data)
