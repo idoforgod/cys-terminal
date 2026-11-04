@@ -14378,7 +14378,7 @@ mod tests {
         );
     }
 
-    /// ★WP-5: 만료 이벤트의 사람 판단·자동 반응 금지 힌트나 회계 키 누락은 소비자의 오판을 부른다.
+    /// ★WP-5: 만료 이벤트의 폭주 회로 차단 힌트(같은 항목은 한 번만 · 반사적 revive 없음 · F58 T1-06)나 회계 키 누락은 소비자의 오판을 부른다.
     #[test]
     fn wp5_expired_payload_pins_hint_and_keys() {
         let text = "가".repeat(81);

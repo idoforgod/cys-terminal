@@ -26873,7 +26873,7 @@ mod tests {
         assert_eq!(
             ev["payload"]["hint"],
             serde_json::json!(c5_expected_starved_hint()),
-            "hint 문구 = 운영자(사람) 판단 계약 그대로(자동 반응 유도 금지) — env 가 고르는 문면(★RQFIX I-11: LEGACY env 에서도 녹색)"
+            "hint 문구 = remedy 판단 계약 그대로(자동 조치는 단건 · 드레인은 묻는다 — F58 T1-05) — env 가 고르는 문면(★RQFIX I-11: LEGACY env 에서도 녹색)"
         );
         // 막힘 지속 → 쿨다운 내 재발행 억제.
         *s.last_output.lock().unwrap() = std::time::Instant::now();
