@@ -30,6 +30,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 BIN = os.path.dirname(TESTS_DIR)
@@ -792,6 +793,33 @@ class T2Cases(Base):
 class U3Guards(Base):
     """Guard cells added after the U3 mutation round 1 (F58/impl/u3/MUTANTS.md): each pins one rule of
     final §2.3/§2.4 or U3-SPEC that no T-2 cell held on its own."""
+
+    def test_probe_timeout_null_zero_missing_or_bad_is_20_s(self):
+        # F58 r1fix m3 (impl review r1): `spec.get('timeout_s', 20)` let null mean no bound (timeout=None: a hanging
+        # probe hangs the tool call) and 0 an instant timeout. Only a finite positive number is a timeout; anything
+        # else runs with 20 s. In-process: subprocess.run is replaced by a recorder, so no probe runs and no clock is read.
+        m = load_tool()
+        seen = []
+
+        def fake_run(argv, **kw):
+            seen.append(kw.get("timeout"))
+            return subprocess.CompletedProcess(argv, 0, (PASS_TEXT + "\n").encode(), b"")
+        absent = object()
+        cells = [(absent, 20), (None, 20), (0, 20), (-5, 20), ("30", 20), (True, 20), (float("nan"), 20),
+                 (float("inf"), 20), (5, 5), (2.5, 2.5)]
+        d = tempfile.mkdtemp(prefix="f58-m3-")
+        self.addCleanup(shutil.rmtree, d, True)
+        for i, (val, want) in enumerate(cells):
+            with self.subTest(timeout_s="missing" if val is absent else repr(val)):
+                spec = {"argv": ["{python}", "-c", "pass"], "ok_exit": 0,
+                        "predicate": {"kind": "contains", "text": PASS_TEXT}}
+                if val is not absent:
+                    spec["timeout_s"] = val
+                del seen[:]
+                with mock.patch.object(m.subprocess, "run", fake_run):
+                    obs = m.run_probe({"probes": {"p": spec}}, "p", d, i, "symptom", "cmd", d)
+                self.assertEqual(seen, [want])
+                self.assertEqual(obs["value"], "pass")
 
     def test_attempt_on_a_declined_lever_is_4_and_writes_nothing(self):
         rig = self.rig(entries=[entry("wid", SF, [lever("L1"), lever("L2", risky=True)])])

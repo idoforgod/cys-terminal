@@ -290,6 +290,12 @@ NAMED = [
     ("cmd switch", plain_pattern(action="cmd /c cleanup"), "staged", ("cmd",), {}),
     ("invoke url", plain_pattern(action="Invoke-WebRequest https://x"), "staged", ("Invoke-", "://"), {}),
     ("rm rf home", plain_pattern(action="rm -rf ~/old"), "staged", ("rm",), {}),
+    # F58 r1fix m1 (impl review r1, worker-2 measured on 040e783f: string_problems() == [] for both): fullwidth
+    # look-alikes of listed words and characters are read after NFKC, so they stage like their ASCII forms.
+    ("fullwidth rm rf home", plain_pattern(action="ｒｍ －ｒｆ ～／ｏｌｄ"), "staged",
+     ("command rm", "flag -rf", "home path ~/"), {}),
+    ("fullwidth path and operators", plain_pattern(action="a／b ｜ c；d"), "staged",
+     ("path 'a/b'", "operator |", "operator ;"), {}),
     ("korean erase", plain_pattern(action="보관 폴더를 통째로 지워라"), "staged", ("지워",), {}),
     ("korean overwrite", plain_pattern(action="설정 파일을 덮어쓴다"), "staged", ("덮어",), {}),
     ("names soul.md", plain_pattern(rationale="see soul.md first"), "staged", ("soul.md",), {}),
