@@ -10937,7 +10937,7 @@ pub(crate) const REMEDY_CODE_AFTER_CURSOR: &str = "after_cursor_text";
 
 /// 모든 조치 문장의 끝에 붙는 **폭주 회로 차단 계약**(경보 실소비자가 LLM — 조치 문장이 자동 반응을 부르지 않게).
 /// ★(RQFIX I-4) 금지 목록에 `동결 해제`·`항목 삭제` 를 더했다. **앞부분 ` · LLM 에이전트는 자동 조치(` 는 바이트 그대로**다 — GUI 가 이 접두로 꼬리를 뗀다.
-pub(crate) const REMEDY_LLM_SUFFIX: &str = " · LLM 에이전트는 자동 조치(remedy 대로 단건 revive·deliver)를 한다 — 사용자 지침이 막으면 따르고, 드레인·항목 삭제·동결 해제·사람 글에 닿는 키는 사용자에게 한 번 묻는다";
+pub(crate) const REMEDY_LLM_SUFFIX: &str = " · LLM 에이전트는 자동 조치(remedy 대로 단건 revive(master 또는 보낸 좌석 본인만)·deliver)를 한다 — 사용자 지침이 막으면 따르고, 드레인·항목 삭제·동결 해제·사람 글에 닿는 키는 사용자에게 한 번 묻는다";
 
 /// ★(R2F-DM · 성찰 2회차 A1 m-2 ⓐ) `empty_seat` 처방(표 13행)에 **입력줄 계수가 0 보다 크고 사람 몫이 0 일 때만**(기계가 넣은 계수) 덧붙는 한 구절 — 되돌린 Esc(`state.rs` 틱의 되돌리기 · 계수 1 = 사람 몫 1)는 사람 몫 구절로 간다.
 /// 권위 없는 재기동은 바로 그 계수로 막힌다(node-recover 거부 문구 · 화면 재기동 보류와 같은 안내가 처방에도 있어야 한다). 이 구절이 가리키는 `cys node-recover` 는 다시 띄우기 전에
@@ -34817,7 +34817,7 @@ after-tick liveness alone does not attribute a clock defect",
             REMEDY_LLM_SUFFIX.starts_with(" · LLM 에이전트는 자동 조치("),
             "GUI(starvednotice.ts STARVED_LLM_TAIL)가 이 접두로 꼬리를 뗀다 — 바이트 그대로: {REMEDY_LLM_SUFFIX:?}"
         );
-        assert_eq!(REMEDY_LLM_SUFFIX, " · LLM 에이전트는 자동 조치(remedy 대로 단건 revive·deliver)를 한다 — 사용자 지침이 막으면 따르고, 드레인·항목 삭제·동결 해제·사람 글에 닿는 키는 사용자에게 한 번 묻는다");
+        assert_eq!(REMEDY_LLM_SUFFIX, " · LLM 에이전트는 자동 조치(remedy 대로 단건 revive(master 또는 보낸 좌석 본인만)·deliver)를 한다 — 사용자 지침이 막으면 따르고, 드레인·항목 삭제·동결 해제·사람 글에 닿는 키는 사용자에게 한 번 묻는다");
         assert_eq!(GHOST_CTRL_U_SUFFIX, cys::GHOST_CTRL_U_SUFFIX, "한 정의처(src/lib.rs) — 데몬과 CLI 가 같은 문자열을 쓴다");
         // GUI 어휘 대조(`ui/src/starvednotice.test.ts`)가 소스에서 읽는 두 선언의 꼴 — 같은 문법으로 파싱해 본다.
         let src = include_str!("governance.rs");

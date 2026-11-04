@@ -790,7 +790,7 @@
     {
      "id": "L1",
      "class": "T3",
-     "action": "`cys send-key C-u` on the seat (residue only, 0 human bytes), then `cys queue revive`/`deliver` of that item",
+     "action": "`cys send-key C-u` on the seat (residue only, 0 human bytes), then `cys queue revive` (master, or the sender for its own items) / `deliver` of that item",
      "risky": false,
      "applicable": true,
      "not_applicable_reason": null,

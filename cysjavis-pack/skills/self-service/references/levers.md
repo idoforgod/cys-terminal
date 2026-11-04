@@ -34,7 +34,7 @@
 ## T3 좌석·큐 상태 (seat or queue state)
 
 - 읽기: `cys status --json`, `cys read-screen --surface <n>`, `cys queue list --surface <n>`.
-- 기계만의 상태는 묻지 않고 고친다: 컨텍스트 순환(`cys cycle-agent`), 세션 고정(`cys usage-register`), 원치 않는 복원 좌석(`cys tombstone`), 지침을 잃은 좌석(`cys reinject`, `cys node-recover`), 큐 되살리기(`cys queue revive`).
+- 기계만의 상태는 묻지 않고 고친다: 컨텍스트 순환(`cys cycle-agent`), 세션 고정(`cys usage-register`), 원치 않는 복원 좌석(`cys tombstone`), 지침을 잃은 좌석(`cys reinject`, `cys node-recover`), 큐 되살리기(`cys queue revive` — master 또는 그 항목을 보낸 좌석 본인만).
 - 큐 강제 배달(`cys queue deliver`)은 데몬이 허락하는 막힘에서만 듣는다 — 데몬이 거부하면 그 거부 문면의 다음 걸음을 따른다.
 - 한 번 묻는다: 큐 항목 버리기, 사람이 친 입력줄 글 지우기. 다른 좌석 입력줄에 Ctrl-U 를 보내지 않는다 — 사용자에게 그 키를 부탁한다.
 - 떠 있는 창(모달)의 키: 창을 읽고(`cys read-screen --surface <n> --composer`), 한 번 묻고, 읽은 output_gen 에 묶어 보낸다(`cys send-key --surface <n> --expect-output-gen <gen> <키>`).

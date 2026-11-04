@@ -3357,10 +3357,13 @@ class QueueStarvedDocContract(unittest.TestCase):
         # ★(성찰 1회차 R1F-DOC) 지침의 폴백 "없으면 `blocked_by`" 의 근거 — 요약은 `blocked_by=` 를 늘 싣고(없으면 `-`) 그 뒤에 `remedy=` 가 붙는다.
         self.assertIn('format!("depth={depth} head_wait={wait}s blocked_by={blocked}{remedy}")', self.route,
                       "경보 요약의 꼴(blocked_by 가 remedy 앞에 늘 실림)이 바뀌었다 — 지침의 폴백('없으면 blocked_by')이 달라진다")
-        found = re.search(r'pub\(crate\) const REMEDY_LLM_SUFFIX: &str = " · LLM 에이전트는 자동 조치\(remedy 대로 단건 ([^)]*)\)를 한다 — '
+        found = re.search(r'pub\(crate\) const REMEDY_LLM_SUFFIX: &str = " · LLM 에이전트는 자동 조치\(remedy 대로 단건 (.+?)\)를 한다 — '
                           r'사용자 지침이 막으면 따르고, ([^"]*)는 사용자에게 한 번 묻는다";', self.governance)
         self.assertIsNotNone(found, "governance.rs REMEDY_LLM_SUFFIX 의 허용·질문 목록을 읽지 못했다(측정 불능)")
-        verbs = [v.strip() for v in found.group(1).split("·") if v.strip()]
+        raw_verbs = [v.strip() for v in found.group(1).split("·") if v.strip()]
+        self.assertEqual(raw_verbs, ["revive(master 또는 보낸 좌석 본인만)", "deliver"],
+                         "코드의 단건 조치·발신자 범위 문면이 바뀌었다: %r" % raw_verbs)
+        verbs = [v.split("(", 1)[0].strip() for v in raw_verbs]
         asked = [v.strip() for v in found.group(2).split("·") if v.strip()]
         self.assertEqual(verbs, ["revive", "deliver"], "코드가 허용한 단건 동사가 바뀌었다: %r" % verbs)
         self.assertIn("드레인", asked, "코드의 '한 번 묻는' 목록에서 드레인이 빠졌다: %r" % asked)
