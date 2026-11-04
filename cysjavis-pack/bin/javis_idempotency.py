@@ -76,7 +76,8 @@ def _extract_verb(argv):
     if not argv:
         return None
     first = os.path.basename(str(argv[0]))
-    if first != "cys":
+    first_noext = os.path.splitext(first)[0]   # Windows: cys.EXE/cys.exe 도 인식
+    if first_noext.lower() != "cys":
         return None
     i = 1
     while i < len(argv):
