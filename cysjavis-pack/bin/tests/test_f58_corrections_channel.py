@@ -701,6 +701,20 @@ class Hooks(Base):
         self.assertEqual(rc, 0)
         self.assertEqual(POINTER_RE.findall(out), [("", "worker")])
 
+    def test_t4_tool_that_exits_0_with_a_non_digit_count_is_ignored(self):
+        # U2 mutant P17 (2026-11-04): removing the digit guard on N in cys_self_service_note survived, because every
+        # other cell's tool either prints a number or fails. A tool that exits 0 but prints text (an older or broken
+        # tool) must be treated like a failing one: the pointer without N, and none of its output in the block.
+        mark = "STUB-OUTPUT-MUST-NOT-BE-INJECTED"
+        for first in ("7x", "oops: corrections failed"):
+            _write_exec(os.path.join(self.rig.pack, "bin", "javis_selfservice.py"),
+                        "print(%r)\nprint(%r)\n" % (first, "- " + mark))
+            for label, (rc, out) in (("session-start", self.rig.session_start("worker")),
+                                     ("inject-context", self.rig.inject("worker", "startup"))):
+                self.assertEqual(rc, 0, label)
+                self.assertEqual(POINTER_RE.findall(out), [("", "worker")], "%s, first line %r" % (label, first))
+                self.assertNotIn(mark, out, "%s, first line %r" % (label, first))
+
     def test_t4_fail_open_tool_hangs(self):
         _write_exec(os.path.join(self.rig.pack, "bin", "javis_selfservice.py"),
                     "import time\ntime.sleep(60)\n")
