@@ -9400,7 +9400,7 @@ pub(crate) const REMEDY_EMPTY_SEAT_COUNT_CLAUSE: &str = " — 다시 띄울 때�
 
 /// ★(0.14.57 · F58 F-B1) `empty_seat` 의 계수에 **사람 몫**이 있을 때(`pending_input_human_bytes > 0` — 진단이 계수 이하로 접은 값) [`REMEDY_EMPTY_SEAT_COUNT_CLAUSE`] 대신 붙는 구절.
 /// 사람 몫은 글일 수도 되돌린 Esc 하나일 수도 있어 글이 있다고 말하지 않는다. node-recover 의 C-u 는 POSIX 셸에서는 입력줄을 지우고 Windows 맨 셸(powershell.exe · `state.rs` `default_shell`)에서는 못 지워 기동 명령과 함께 제출하므로(PSReadLine 기본 Windows 모드 · 문서 근거) 사용자에게 한 번 묻고 사용자가 그 창에서 직접 비운다 — 키 이름은 적지 않는다(셸마다 다르다 · 기계는 지우지 않는다 — 표 3·6행 · [`REMEDY_LLM_SUFFIX`]).
-pub(crate) const REMEDY_EMPTY_SEAT_HUMAN_CLAUSE: &str = " — 사람의 키 입력이 계수돼 있다(글 또는 되돌린 Esc): 사용자에게 한 번 묻고 사용자가 그 창에서 직접 비운 뒤(기계는 지우지 않는다) master·CSO 좌석에서 `cys node-recover` 로 띄운다(입력줄을 지운다)";
+pub(crate) const REMEDY_EMPTY_SEAT_HUMAN_CLAUSE: &str = " — 사람의 키 입력이 계수돼 있다(글 또는 되돌린 Esc): 사용자에게 한 번 묻고 사용자가 그 창에서 직접 비운 뒤(기계는 지우지 않는다) master·CSO 좌석에서 `cys node-recover` 로 띄운다(입력줄 계수를 정리한다)";
 
 /// 유령 계수 처방 — 직접 send 거부 응답·강제 배달 거부 문구의 **맨 끝**에 덧붙는다(앞 문구·접두·태그의 위치·바이트는 불변).
 /// 사람이 하는 일이다(기계가 Ctrl-U 를 보내는 경로는 없다). ★(RQFIX I-8) 정의처는 `src/lib.rs` 다 — `cys` CLI 가 같은 문자열로 stderr 처방 줄을 찍는다(한 정의처 공유).
@@ -29909,7 +29909,7 @@ after-tick liveness alone does not attribute a clock defect",
         const CLAUSE: &str = " — 다시 띄울 때는 master·CSO 좌석에서 `cys node-recover --surface <좌석>` 로 띄운다(입력줄 계수 정리를 함께 한다 · 입력줄 계수가 남아 있다)";
         assert_eq!(super::REMEDY_EMPTY_SEAT_COUNT_CLAUSE, CLAUSE, "구절의 바이트 고정(문서·화면이 이 문장을 인용한다)");
         // ★(F58 F-B1·FB1r2·FB1r3) 사람 몫 구절 — 바이트는 아래 queue_remedy 출력 등식이 고정하고, 성질(묻는다 · 사용자가 그 창에서 직접 비운다 · 키 이름이 없다 · 기계는 지우지 않는다)은 여기서 이름으로 고정한다.
-        const HUMAN: &str = " — 사람의 키 입력이 계수돼 있다(글 또는 되돌린 Esc): 사용자에게 한 번 묻고 사용자가 그 창에서 직접 비운 뒤(기계는 지우지 않는다) master·CSO 좌석에서 `cys node-recover` 로 띄운다(입력줄을 지운다)";
+        const HUMAN: &str = " — 사람의 키 입력이 계수돼 있다(글 또는 되돌린 Esc): 사용자에게 한 번 묻고 사용자가 그 창에서 직접 비운 뒤(기계는 지우지 않는다) master·CSO 좌석에서 `cys node-recover` 로 띄운다(입력줄 계수를 정리한다)";
         assert!(HUMAN.contains("사용자에게 한 번 묻고") && HUMAN.contains("사용자가 그 창에서 직접 비운 뒤") && HUMAN.contains("기계는 지우지 않는다") && HUMAN.contains("node-recover"), "{HUMAN}");
         assert!(!["Ctrl-U", "Ctrl+U", "ctrl-u", "ctrl+u", "C-u", "^U"].iter().any(|k| HUMAN.contains(k)), "사람 몫 구절이 줄 지우기 키 이름을 적었다 — Windows 맨 셸(powershell.exe · state.rs default_shell)의 기본 편집 모드에는 그 키가 없다: {HUMAN}");
         assert!(!HUMAN.contains(CLAUSE.trim_start()), "사람 몫 구절은 T1-08 구절을 품지 않는다(manifest T-9 의 T1-08 개수 2 를 바꾸지 않는다)");
