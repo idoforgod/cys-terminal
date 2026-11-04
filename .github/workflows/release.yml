@@ -662,6 +662,7 @@ jobs:
                    test_f58_corrections_manifest \
                    test_f58_learning_loop \
                    test_f58_selfservice_case \
+                   test_f58_corrections_channel \
                    test_round_stop_reason test_resource_gate test_resource_gate_fleet_cpu test_resource_gate_product_cpu \
                    test_inject_context_role_seat test_inject_context_soul_l0 test_inject_context_owned_cwd test_carry_unproven_scope \
                    test_wp18_skillscan_failopen test_owned_process test_pkg3a_owned_tools \
@@ -1590,6 +1591,7 @@ jobs:
                    test_f58_corrections_manifest \
                    test_f58_learning_loop \
                    test_f58_selfservice_case \
+                   test_f58_corrections_channel \
                    test_round_stop_reason test_resource_gate test_resource_gate_fleet_cpu test_resource_gate_product_cpu \
                    test_inject_context_role_seat test_inject_context_soul_l0 test_inject_context_owned_cwd test_carry_unproven_scope \
                    test_wp18_skillscan_failopen test_owned_process test_pkg3a_owned_tools \
