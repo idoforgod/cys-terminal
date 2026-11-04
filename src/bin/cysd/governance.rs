@@ -23736,11 +23736,12 @@ mod tests {
             assert!(t.starts_with("출력 중 표지가 보이지만 60초째 출력이 없다") && t.ends_with(REMEDY_LLM_SUFFIX), "{t}");
             assert_eq!(queue_remedy(BLOCKED_BUSY, &QueueBlockDiag { quiet_secs: Some(59), ..d.clone() }).0, "wait", "정적 59초는 종전 calm");
         }
-        // 모달: 정적 60초부터 낡은 사본 가능성을 덧붙이되 '사람이 답한다' 는 그대로.
+        // 모달: 정적 60초부터 낡은 사본 가능성을 덧붙이되 답하는 문장(MODAL — F58 T2-04a/b)은 그대로 — 두 갈래가 같은 문장으로 시작한다.
+        const MODAL: &str = "질문·선택 창이 떠 있다 — 자비스가 화면을 읽어 무엇을 묻는지 사용자에게 한 번 묻고 답대로 고른다(`cys read-screen --composer` 의 output_gen 에 묶어 `cys send-key --expect-output-gen` 으로)";
         let (c, t) = queue_remedy(BLOCKED_MODAL, &base(Some(120)));
         assert_eq!(c, "answer_modal");
-        assert!(t.starts_with("질문·선택 창이 떠 있다 — 사람이 답한다(120초째") && t.contains("진짜 선택 창이면 다시 그려져도 그대로다"), "{t}");
-        assert_eq!(queue_remedy(BLOCKED_MODAL, &base(Some(5))).1, format!("질문·선택 창이 떠 있다 — 사람이 답한다{REMEDY_LLM_SUFFIX}"));
+        assert!(t.starts_with(&format!("{MODAL}(120초째")) && t.contains("진짜 선택 창이면 다시 그려져도 그대로다"), "{t}");
+        assert_eq!(queue_remedy(BLOCKED_MODAL, &base(Some(5))).1, format!("{MODAL}{REMEDY_LLM_SUFFIX}"));
         // 대체 화면: 전경이 에이전트일 때만 다시 그리기 약속 · 아니면 종전 문장(약속 없음).
         let (_, t) = queue_remedy(BLOCKED_ALT_SCREEN, &base(None));
         assert!(!t.contains("다시 그리기") && t.contains("전체화면 프로그램을 끝내거나"), "{t}");
@@ -25809,7 +25810,11 @@ mod tests {
         let sq = sender.pending_queue.lock().unwrap();
         assert_eq!(sq.len(), 1, "발신자 큐에 통지 1줄");
         assert_eq!(sq[0].origin, QUEUE_NOTICE_ORIGIN);
-        assert!(sq[0].text.contains(&id) && sq[0].text.contains("자동 반응"), "통지 문면: {}", sq[0].text);
+        assert!(
+            sq[0].text.contains(&id) && sq[0].text.contains("같은 항목은 한 번만") && sq[0].text.contains("통지마다 반사적으로 revive 하지 않는다"),
+            "통지 문면(만료→반사 revive→재만료 회로 차단 구절): {}",
+            sq[0].text
+        );
         assert!(sq[0].from.is_none(), "통지는 발신자가 없다(통지 연쇄 차단)");
         drop(sq);
         assert!(!queue_expiry_pass(&daemon) || sender.pending_queue.lock().unwrap().len() == 1, "중복 통지 없음");
@@ -29700,7 +29705,7 @@ after-tick liveness alone does not attribute a clock defect",
             for n in needles {
                 assert!(text.contains(n), "code={code}: 문장에 {n:?} 가 있어야 한다: {text}");
             }
-            assert!(text.ends_with(REMEDY_LLM_SUFFIX), "code={code}: 모든 문장 끝에 자동 조치 금지 접미: {text}");
+            assert!(text.ends_with(REMEDY_LLM_SUFFIX), "code={code}: 모든 문장 끝에 LLM 자동 조치 계약 접미: {text}");
             assert!(QUEUE_REMEDY_CODES.contains(&got), "code={got} 가 허용 목록 밖이다");
             assert!(!text.contains("30초"), "code={code}: 노브 기본값(30초)을 박은 숫자는 문장에서 뺀다: {text}");
             seen.insert(got);
@@ -29765,14 +29770,14 @@ after-tick liveness alone does not attribute a clock defect",
                 blocked,
                 &c5_diag_ga(5, 0, Some(true), None),
                 "machine_residue",
-                &["기계가 넣고 제출되지 않은 본문이 입력줄에 보인다", "Enter 로 제출하거나 지운다"],
+                &["기계가 넣고 제출되지 않은 본문이 입력줄에 보인다", "입력줄 전체가 그 본문뿐임을 확인하면 제출하고", "확인이 안 되면 그대로 두고 사용자에게 알린다"],
             );
             // 6행 human_draft — 글이 보이고 사람 몫이 있다.
             check(
                 blocked,
                 &c5_diag_ga(5, 2, Some(true), Some(true)),
                 "human_draft",
-                &["입력줄에 제출되지 않은 글이 있다", "오너에게 알린다"],
+                &["입력줄에 제출되지 않은 글이 있다", "사용자에게 한 번 알리고 묻는다"],
             );
             // 7행 after_cursor_text — 커서 앞은 비었는데 커서 뒤에 글자(사람 몫 무관).
             for h in [0, 3] {
@@ -29783,7 +29788,7 @@ after-tick liveness alone does not attribute a clock defect",
                     &[
                         "커서 앞은 비어 있는데 커서 뒤에 글자가 있다",
                         "회색 자동 제안이면 유령 계수다",
-                        "클릭하고 Ctrl-U 한 번",
+                        "사용자에게 그 창에서 Ctrl-U 를 한 번 눌러 달라고 청한다",
                         "직접 쓴 글이면 초안이다",
                         "자비스가 그 창 화면을 읽어 가린다",
                     ],
@@ -29796,7 +29801,7 @@ after-tick liveness alone does not attribute a clock defect",
                         blocked,
                         &c5_diag_ga(3, h, Some(false), ga),
                         "phantom_count",
-                        &["입력줄은 비어 있는데 미제출 계수가 남았다(유령 계수)", "클릭하고 Ctrl-U 한 번", "잠시 뒤 배달 재개"],
+                        &["입력줄은 비어 있는데 미제출 계수가 남았다(유령 계수)", "사용자에게 그 창에서 Ctrl-U 를 한 번 눌러 달라고 청한다", "잠시 뒤 배달 재개"],
                     );
                 }
             }
@@ -29815,7 +29820,7 @@ after-tick liveness alone does not attribute a clock defect",
 
         // 10~14행 — 사유별 고정 처방.
         let d0 = c5_diag(0, 0, None);
-        check(BLOCKED_MODAL, &d0, "answer_modal", &["질문·선택 창이 떠 있다", "사람이 답한다"]);
+        check(BLOCKED_MODAL, &d0, "answer_modal", &["질문·선택 창이 떠 있다", "사용자에게 한 번 묻고 답대로 고른다"]);
         check(BLOCKED_APPROVAL, &d0, "approval", &["승인·관문 대기", "승인 절차(feed)", "큐로 승인을 누르지 않는다"]);
         check(
             BLOCKED_ALT_SCREEN,
@@ -29833,7 +29838,7 @@ after-tick liveness alone does not attribute a clock defect",
             BLOCKED_PROMPT_UNKNOWN,
             &d0,
             "prompt_unknown",
-            &["입력 대기 표지(프롬프트)를 화면에서 찾지 못했다", "사람이 확인한다", "화면 사본이 어긋났을 수 있다", "다시 그리기를 요청한다", "창 크기를 한 번 바꿔도"],
+            &["입력 대기 표지(프롬프트)를 화면에서 찾지 못했다", "자비스가 `cys read-screen` 으로 그 창이 입력을 기다리는 상태인지 확인하고", "화면 사본이 어긋났을 수 있다", "다시 그리기를 요청한다", "창 크기를 한 번 바꿔도"],
         );
         // 15행 wait — 일시 보류(스스로 풀린다).
         for blocked in [
@@ -29888,7 +29893,7 @@ after-tick liveness alone does not attribute a clock defect",
         assert!(text.ends_with(&format!(" (이 좌석 화면 파서 패닉 1회 — 화면 판독이 순간 비었을 수 있다){REMEDY_LLM_SUFFIX}")), "{text}");
     }
 
-    /// ★(R2F-DM · 성찰 2회차 A1 m-2 ⓐ) `empty_seat` 처방 — **입력줄 계수가 0 보다 크면**(죽은 좌석의 되돌린 Esc = 계수 1 · 제품의 정상 상태 하나) 사람이 그 창에서 Ctrl-U 한 번 하라는 한 구절이 문장에 더해진다.
+    /// ★(R2F-DM · 성찰 2회차 A1 m-2 ⓐ) `empty_seat` 처방 — **입력줄 계수가 0 보다 크면**(죽은 좌석의 되돌린 Esc = 계수 1 · 제품의 정상 상태 하나) 그 좌석을 master·CSO 좌석에서 `cys node-recover` 로 다시 띄우라는(그 경로가 입력줄 계수를 함께 정리한다 — F58 T1-08) 한 구절이 문장에 더해진다.
     /// 권위 없는 재기동은 바로 그 계수로 막히는데(node-recover 거부 문구 · 화면 재기동 보류는 이미 안내한다) 처방만 "다시 띄우면 순서대로 배달된다" 고만 말했다.
     /// 계수 0 은 종전 문장 그대로(바이트 불변) · code(`empty_seat`)·분기·게이트는 불변 · 접미 `REMEDY_LLM_SUFFIX` 는 맨 끝 · 일시정지 행(1·2행)이 여전히 맨 앞 · 다른 사유에는 구절이 새지 않는다.
     #[test]
@@ -29915,7 +29920,7 @@ after-tick liveness alone does not attribute a clock defect",
         // 다른 사유에는 구절이 새지 않는다(계수 > 0 이어도).
         for other in [BLOCKED_MODAL, BLOCKED_APPROVAL, BLOCKED_BUSY, BLOCKED_PROMPT_UNKNOWN, BLOCKED_ALT_SCREEN, "zzz"] {
             let (_, t) = queue_remedy(other, &c5_diag(5, 5, None));
-            assert!(!t.contains("Ctrl-U 한 번(입력줄 계수가 남아 있다)"), "{other}: 구절이 다른 사유로 샜다: {t}");
+            assert!(!t.contains("입력줄 계수가 남아 있다)") && !t.contains("node-recover"), "{other}: 구절이 다른 사유로 샜다: {t}");
         }
         // 일시정지(1·2행)가 여전히 맨 앞 — empty_seat 사유라도 동결 중이면 동결 처방(구절 없음).
         let mut k = c5_diag(1, 1, None);
@@ -29923,12 +29928,12 @@ after-tick liveness alone does not attribute a clock defect",
         k.paused = true;
         let (code, t) = queue_remedy(blocked, &k);
         assert_eq!(code, "paused");
-        assert!(!t.contains("Ctrl-U"), "동결 처방에 구절이 섞였다: {t}");
+        assert!(!t.contains("Ctrl-U") && !t.contains("입력줄 계수가 남아 있다)") && !t.contains("node-recover"), "동결 처방에 구절이 섞였다: {t}");
         // 화면이 이 문장을 읽는 방식(`ui/src/starvednotice.ts`): 접두 ` · LLM 에이전트는 자동 조치` 로 꼬리를 떼고 `<N분째> · <조치 문장>` 을 200자(코드 포인트)로 자른다 — 구절은 꼬리 **앞**이라 정규식·접두가 그대로
         // 맞고, 가장 긴 분 표기(`99999분째`)를 붙여도 200자 안이다.
         let (_, t) = queue_remedy(blocked, &c5_diag(1, 1, None));
         let human = t.split(" · LLM 에이전트는 자동 조치").next().expect("꼬리 앞");
-        assert!(human.ends_with("(입력줄 계수가 남아 있다)"), "{human}");
+        assert_eq!(human, format!("{BASE}{CLAUSE}"), "꼬리를 뗀 사람 몫 = 본문 + 구절 그대로(구절이 꼬리 앞에서 잘리지 않는다)");
         assert!(t.ends_with(REMEDY_LLM_SUFFIX), "접미는 문장 맨 끝");
         let toast = format!("99999분째 · {human}");
         assert!(toast.chars().count() <= 200, "토스트 본문이 200자를 넘는다({}자): {toast}", toast.chars().count());

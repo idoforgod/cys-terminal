@@ -12919,7 +12919,7 @@ mod tests {
     }
 
     /// ★G1(W2-D) queue.starved payload 핀 — 스키마 7키 + hint 문구 계약(성찰 BLOCKER):
-    /// hint 는 운영자(사람) 판단 전제를 명시하고 LLM 에이전트 자동 반응을 금지해야 한다.
+    /// hint 는 판단 근거(remedy)를 명시하고 LLM 에이전트의 자동 조치를 단건 강제 배달로 묶으며 드레인은 사용자에게 묻게 해야 한다(F58 T1-05 · 폭주 회로 차단).
     /// 이벤트 실소비자가 LLM 에이전트인 시스템에서 hint 가 강제 배달을 직접 지시하면
     /// '경보 → 반사적 강제 드레인' 폭주 회로가 열린다 — 문면 자체를 핀으로 고정.
     #[test]
@@ -12942,10 +12942,10 @@ mod tests {
         assert_eq!(p["depth"], json!(2));
         assert_eq!(p["blocked_by"], json!("busy(출력 중)"));
         assert_eq!(p["hint"], json!(expected_starved_hint_for_env()), "hint 문구 = env 가 고른 상수 계약 그대로(LEGACY env 에서도 같은 사슬)");
-        // 문구 계약의 핵심 2요소: ①운영자(사람) 판단 명시 ②자동 반응 금지 명시.
-        assert!(QUEUE_STARVED_HINT.contains("운영자(사람) 판단"), "사람 판단 전제 명시");
-        assert!(QUEUE_STARVED_HINT.contains("자동 반응"), "자동 반응 금지 명시");
-        assert!(QUEUE_STARVED_HINT.contains("금지"), "금지 문면 존재");
+        // 문구 계약의 핵심(F58 T1-05 이후 · 폭주 회로 차단): ①판단 근거는 remedy ②LLM 의 자동 조치는 단건 강제 배달로 묶인다 ③드레인(일괄 배출)은 사용자에게 묻는다.
+        assert!(QUEUE_STARVED_HINT.contains("자비스가 remedy 대로 판단한다"), "판단 근거 = remedy 명시");
+        assert!(QUEUE_STARVED_HINT.contains("단건 강제 배달"), "자동 조치는 단건으로 묶인다");
+        assert!(QUEUE_STARVED_HINT.contains("드레인은 사용자에게 한 번 묻는다"), "드레인은 사용자에게 묻는다");
         // role 없는 맨 셸 = null (depth_high 의 role 직렬화 관례와 동형).
         let p2 = queue_starved_payload("surface:8", None, &head, 700, 1, "queue_paused(헬스 조치)", &diag);
         assert_eq!(p2["role"], json!(null));
@@ -13026,14 +13026,14 @@ mod tests {
         assert_eq!(p_paused["remedy_code"], json!("paused"), "동결은 어느 사유보다 앞선다");
     }
 
-    /// hint 문면 정정 — 종전 문면의 "강제 배달 가능" 오류를 고치되 의미(운영자(사람) 판단 전제 · LLM 자동 반응 금지)는 유지하고,
+    /// hint 문면 정정 — 종전 문면의 "강제 배달 가능" 오류를 고치되 의미(판단 근거 remedy · 자동 조치는 단건 · 드레인은 묻는다 — F58 T1-05)는 유지하고,
     /// 종전 문면은 LEGACY 로 바이트 보존한다. env 를 건드리지 않는다(`starved_hint_for` · `starved_hint_legacy_from_env` 순수 함수).
     #[test]
     fn c5_starved_hint_corrected_text_and_legacy_branch() {
         assert_eq!(starved_hint_for(false), QUEUE_STARVED_HINT);
         assert_eq!(starved_hint_for(true), QUEUE_STARVED_HINT_LEGACY);
         assert_ne!(QUEUE_STARVED_HINT, QUEUE_STARVED_HINT_LEGACY);
-        // 정정 문면: 조치는 remedy 를 가리키고, 강제 배달이 면제하지 않는 게이트를 말하며, 의미(사람 판단·자동 반응 금지)는 유지한다.
+        // 정정 문면: 조치는 remedy 를 가리키고, 강제 배달이 면제하지 않는 게이트를 말하며, 의미(판단 근거 remedy · 자동 조치는 단건 · 드레인은 묻는다)는 유지한다.
         // ★(RQFIX F7 · RQFIX2 n-2) 강제 배달이 건너뛰는 것은 **quiet 대기와 사이클 창(quiescing) 보류뿐**이다 — 일시정지·빈 좌석·사람 입력 직후·배달 최소 간격도 면제하지 않는다
         //   (종전 정정 문면은 '간격 대기' 를 건너뛴다고 잘못 말했고, 첫 정정 문면은 사이클 창 보류도 건너뛴다는 사실을 빼먹었다 — `force_deliver_entry` 에 그 판정이 없다).
         for must in [
@@ -13041,9 +13041,9 @@ mod tests {
             "quiet 대기와 사이클 창 보류만 건너뛰고",
             "일시정지·빈 좌석·사람 입력 직후·배달 최소 간격",
             "초안·모달·승인·전체화면·작업 중 게이트는 면제하지 않는다",
-            "운영자(사람) 판단",
-            "자동 반응",
-            "금지",
+            "자비스가 remedy 대로 판단한다",
+            "단건 강제 배달",
+            "드레인은 사용자에게 한 번 묻는다",
         ] {
             assert!(QUEUE_STARVED_HINT.contains(must), "정정 문면에 {must:?} 가 있어야 한다: {QUEUE_STARVED_HINT}");
         }
@@ -14399,10 +14399,10 @@ mod tests {
         for (key, value) in expected.as_object().expect("기대 payload 객체") {
             assert_eq!(p.get(key), Some(value), "만료 payload 키/값 계약: {key}");
         }
-        for phrase in ["운영자(사람) 판단", "자동 반응", "금지"] {
+        for phrase in ["자비스가 판단해", "같은 항목은 한 번만", "다시 만료되면 사용자에게 묻는다", "통지마다 반사적으로 revive 하지 않는다", "폐기는 사용자에게 한 번 묻고"] {
             assert!(
                 QUEUE_EXPIRED_HINT.contains(phrase),
-                "운영자 전용 경고 필수 문구 누락: {phrase}"
+                "만료 hint 의 폭주 회로 차단 문구 누락: {phrase}"
             );
         }
         e.expired_at = None;
