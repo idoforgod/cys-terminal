@@ -8832,8 +8832,8 @@ mod agent_queue_tests;
 #[cfg(test)]
 mod direct_agent_tests;
 
-// W60 S1 (0.14.57): the Windows named-pipe specimen - mio 1.2.1 must abort the child, 1.2.4 must not
-// (DESIGN-W60-r2 §9.3). Windows only: the race is in mio's Windows named-pipe code.
+// W60 S1 (0.14.57): Windows named-pipe SMOKE check (DESIGN-W60-r2 §9.3) - it did not reproduce the mio 1.2.1 crash on hosted
+// runners (dept-5 W60-MIO/RIG-INVESTIGATION-R.md); mio 1.2.4 ships on the upstream fix (mio PR #2014). Windows only.
 #[cfg(all(test, windows))]
 mod w60_named_pipe_tests;
 

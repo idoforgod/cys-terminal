@@ -2,9 +2,16 @@
 //!
 //! The owner's incident: mio 1.2.1 reports a write that the OS already accepted (ERROR_IO_PENDING) as failed when the
 //! client closes the pipe at that moment; the IOCP completion then meets a "no write" state and mio hits
-//! `unreachable!()` at `src/sys/windows/named_pipe.rs:969`, which aborts the whole daemon. mio 1.2.4 fixed it.
+//! `unreachable!()` at `src/sys/windows/named_pipe.rs:969`, which aborts the whole daemon. mio 1.2.4 carries the
+//! upstream fix (mio PR #2014), and 0.14.57 ships it on that basis.
 //!
-//! This module runs the same race on the tokio/mio that `Cargo.lock` pins, in a CHILD process (the test binary
+//! ★Scope after R (HEAD-RULING-W60-AFTER-R.md): this is a SMOKE check, not a demonstration. At R f9dc2af4 (mio 1.2.1,
+//! windows-health run 41761853211) it did NOT reproduce the crash on GitHub's hosted runners — the client close is not
+//! aligned with the write submit and a 4-vCPU runner is not oversubscribed (dept-5 W60-MIO/RIG-INVESTIGATION-R.md). So a
+//! green run shows only that this pipe path does not panic; it does not show the fix. The upstream-shaped reproducer
+//! is backlog row D5H-20261104-W60-S1PRIME-REPRODUCER.
+//!
+//! This module drives that race shape on the tokio/mio that `Cargo.lock` pins, in a CHILD process (the test binary
 //! re-run with `--exact` on [`w60_s1_child`]), so a mio abort kills only the child. The parent prints exactly one
 //! `W60-S1 RESULT=` line that binds the outcome to the commit sha, the mio version and checksum from the lock, and
 //! the sha256 of the executable that ran. The decision reads that line; the step colour alone is never evidence.
@@ -287,7 +294,8 @@ fn echo(label: &str, bytes: &[u8]) {
     }
 }
 
-/// S1. Blocking in windows-health from commit R (D-W60-4). R (mio 1.2.1) must give R-WITNESS; G (mio 1.2.4) PASS.
+/// S1. Blocking in windows-health from commit R (D-W60-4) as a SMOKE check: R (mio 1.2.1) gave NOT-RUN no-reproduce on
+/// hosted runners (an R-WITNESS was the design's hope); G (mio 1.2.4) must give PASS, which means "no panic here", not "fix shown".
 #[test]
 fn w60_named_pipe_large_write_while_clients_close() {
     let secs = env_u64("W60_S1_SECS", 60);

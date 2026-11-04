@@ -380,17 +380,24 @@ fn t_d2_9a_every_interleaving_accepts_only_whole_publications() {
 #[test]
 fn t_d2_9b_stress_no_mixed_snapshot_is_ever_accepted() {
     use std::sync::Arc;
+    const READERS: usize = 3;
     let snap = Arc::new(SeatSnapshot::new());
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let readers: Vec<_> = (0..3)
-        .map(|_| {
-            let (snap, stop) = (snap.clone(), stop.clone());
+    // W60 impl r1 I2: a start rendezvous (every reader is running before the first publication) and a per-reader
+    // acceptance count the publisher watches, so the coverage this test claims is required, not just logged.
+    let start = Arc::new(std::sync::Barrier::new(READERS + 1));
+    let seen: Arc<Vec<std::sync::atomic::AtomicU64>> = Arc::new((0..READERS).map(|_| std::sync::atomic::AtomicU64::new(0)).collect());
+    let readers: Vec<_> = (0..READERS)
+        .map(|me| {
+            let (snap, stop, start, seen) = (snap.clone(), stop.clone(), start.clone(), seen.clone());
             std::thread::spawn(move || {
                 let (mut accepted, mut reads) = (0u64, 0u64);
+                start.wait();
                 while !stop.load(Ordering::SeqCst) {
                     reads += 1;
                     if let Seats::Known { count, ids, held } = snap.read() {
                         accepted += 1;
+                        seen[me].store(accepted, Ordering::SeqCst);
                         if held > 0 {
                             let base = ids[0];
                             assert_eq!(base % 1000, 0, "ids[0] {base}");
@@ -405,22 +412,42 @@ fn t_d2_9b_stress_no_mixed_snapshot_is_ever_accepted() {
             })
         })
         .collect();
-    for k in 1..=200_000u64 {
+    let publish = |k: u64| {
         let n = (k % 49) as usize;
         snap.publish((0..n as u64).map(|i| k * 1000 + i), n);
-    }
+    };
+    start.wait();
+    // At least 200,000 publications, then keep publishing until EVERY reader has accepted at least one snapshot. The
+    // requirement is the event (>= 1 acceptance each), not a rate; 60 s only stops a run that never gets it.
+    let guard_end = Instant::now() + Duration::from_secs(60);
+    let mut k = 0u64;
+    let covered = loop { // wallclock: guard coverage is the event (each reader accepts >= 1 snapshot while publishing runs); 60 s only bounds a run that never gets it, and expiry is reported with the counts
+        k += 1;
+        publish(k);
+        if k >= 200_000 && k % 1024 == 0 {
+            if seen.iter().all(|c| c.load(Ordering::SeqCst) > 0) {
+                break true;
+            }
+            if Instant::now() >= guard_end {
+                break false;
+            }
+        }
+    };
+    // One more publication after the publisher saw every count: each counted acceptance read an EARLIER publication,
+    // so it happened while publishing was still running (the concurrent phase), not after it stopped.
+    k += 1;
+    publish(k);
     stop.store(true, Ordering::SeqCst);
-    let (mut acc, mut reads) = (0, 0);
-    for r in readers {
-        let (a, n) = r.join().expect("reader");
-        acc += a;
-        reads += n;
+    let per_reader: Vec<(u64, u64)> = readers.into_iter().map(|r| r.join().expect("reader")).collect();
+    println!("t_d2_9b: publications={k} per reader (accepted, reads)={per_reader:?}");
+    assert!(covered, "every reader must accept >= 1 snapshot while publishing runs; per reader (accepted, reads)={per_reader:?}");
+    for (i, (accepted, reads)) in per_reader.iter().enumerate() {
+        assert!(*reads > 0 && *accepted > 0, "reader {i}: reads={reads} accepted={accepted}");
     }
-    println!("t_d2_9b: reads={reads} accepted={acc}");
-    // Not vacuous: whatever the readers saw, the last publication (k = 200,000: 200,000 % 49 = 31 ids from 200,000,000)
-    // reads back whole once the publisher has stopped. A snapshot that never accepts anything fails here.
-    let last: Vec<u64> = (0..31u64).map(|i| 200_000_000 + i).collect();
-    assert_eq!(snap.read(), known(&last, 31));
+    // The last publication reads back whole once the publisher has stopped.
+    let n = k % 49;
+    let last: Vec<u64> = (0..n).map(|i| k * 1000 + i).collect();
+    assert_eq!(snap.read(), known(&last, n as u32));
 }
 
 // ---------------------------------------------------------------- flood (§3.9)
@@ -480,7 +507,14 @@ fn fill_pipe(file: &std::fs::File) -> usize {
     n
 }
 
-/// `(was still inside the write after 300 ms, bytes after the filler, write calls)`.
+/// `(the call completed while nobody drained the pipe, bytes after the filler, write calls)`.
+///
+/// The claim is an EVENT, not a duration (W60 impl r1 I1): did the call complete before any reader drained the pipe?
+/// * empty pipe (`fill = false`, the control): a record of at most 1 KiB fits, so a correct call completes without a
+///   drain. The wait is generous (30 s); it only stops a call that never completes, so a descheduled worker cannot
+///   fail the control.
+/// * full pipe (`fill = true`): a correct call CANNOT complete before the drain below, so the 300 ms look can never
+///   fail a correct logger; it can only miss a broken (non-blocking) write if that write is descheduled for 300 ms.
 #[cfg(unix)]
 fn blocked_sink_run(fill: bool) -> (bool, Vec<u8>, u32) {
     use std::os::fd::OwnedFd;
@@ -503,8 +537,9 @@ fn blocked_sink_run(fill: bool) -> (bool, Vec<u8>, u32) {
         })
     };
     entered_rx.recv_timeout(Duration::from_secs(10)).expect("the worker entered the write"); // wallclock: guard bounds thread start; entry is the signal from inside the sink
-    let early = done_rx.recv_timeout(Duration::from_millis(300)); // wallclock: guard a blocked write cannot return before the drain below; an early return on a full pipe is a real failure
-    let still_blocked = early.is_err();
+    let look = if fill { Duration::from_millis(300) } else { Duration::from_secs(30) };
+    let early = done_rx.recv_timeout(look); // wallclock: guard full pipe: a correct write cannot complete before the drain below, so expiry is guaranteed; empty pipe: 30 s only stops a call that never completes (the control's claim is the completion event)
+    let completed_before_drain = early.is_ok();
     // While the hook waits, others can still publish and read the snapshot: the hook holds no lock of its own.
     snap.publish([3u64, 1].into_iter(), 2);
     assert_eq!(snap.read(), known(&[1, 3], 2));
@@ -521,20 +556,20 @@ fn blocked_sink_run(fill: bool) -> (bool, Vec<u8>, u32) {
     worker.join().expect("worker");
     let bytes = reader_thread.join().expect("reader");
     assert!(bytes.len() >= filled);
-    (still_blocked, bytes[filled..].to_vec(), calls.load(Ordering::SeqCst))
+    (completed_before_drain, bytes[filled..].to_vec(), calls.load(Ordering::SeqCst))
 }
 
 #[cfg(unix)]
 #[test]
 fn t_d2_11_blocked_sink_waits_inside_one_write_then_completes() {
-    // Control: an empty pipe — the same call returns at once after entering.
-    let (blocked, record, calls) = blocked_sink_run(false);
-    assert!(!blocked, "control: an unblocked sink returns at once");
+    // Control: an empty pipe — the same call completes with nobody draining (an event, not a time bound).
+    let (completed, record, calls) = blocked_sink_run(false);
+    assert!(completed, "control: an unblocked sink lets the call complete with nobody draining");
     assert_eq!(calls, 1, "one write call");
     assert_eq!(one(&record).get("msg"), Some(&b"blocked-sink"[..]));
-    // Blocked: the call entered the write, was still inside it 300 ms later, and completed after the drain.
-    let (blocked, record, calls) = blocked_sink_run(true);
-    assert!(blocked, "the call waits while the sink is blocked (behaviour, not a bound)");
+    // Blocked: the call entered the write, had not completed before the drain, and completed after it.
+    let (completed, record, calls) = blocked_sink_run(true);
+    assert!(!completed, "the call waits while the sink is blocked (behaviour, not a bound)");
     assert_eq!(calls, 1, "still exactly one write call");
     assert_eq!(one(&record).get("msg"), Some(&b"blocked-sink"[..]));
 }
@@ -887,30 +922,49 @@ fn run_child_with(mode: &str, dir: &Path, env: &[(&str, &Path)]) -> (Option<std:
         .hide_console()
         .spawn()
         .expect("spawn child");
-    let (mut out, mut err) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
-    let out_t = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = out.read_to_end(&mut b);
-        String::from_utf8_lossy(&b).into_owned()
-    });
-    let err_t = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = err.read_to_end(&mut b);
-        String::from_utf8_lossy(&b).into_owned()
-    });
+    // The output readers hand their text over a channel and are never joined, so a pipe held open past the child's
+    // end cannot hang the test or hide the timeout classification below (W60 impl r1 I1).
+    let reader = |mut pipe: Box<dyn Read + Send>| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut b = Vec::new();
+            let _ = pipe.read_to_end(&mut b);
+            let _ = tx.send(String::from_utf8_lossy(&b).into_owned());
+        });
+        rx
+    };
+    let out_rx = reader(Box::new(child.stdout.take().unwrap()));
+    let err_rx = reader(Box::new(child.stderr.take().unwrap()));
+    let mut notes = String::new();
     let deadline = Instant::now() + Duration::from_secs(60);
-    let status = loop { // wallclock: guard the child ends in milliseconds; expiry fails the test as a hang (that is the no-hang check)
+    let status = loop { // wallclock: guard the child ends in milliseconds (the whole 77-test c2b selection with five child runs took 4.75 s), so 60 s is a >10x margin; expiry fails the test as a hang (that is the no-hang check)
         match child.try_wait() {
             Ok(Some(s)) => break Some(s),
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
+            other => {
+                notes.push_str(&format!("[harness] child not finished within 60 s (try_wait {other:?}); kill: {:?}\n", child.kill()));
+                // Cleanup is bounded and reported on its own: a failed reap must not turn into a hang of the harness.
+                let reap_deadline = Instant::now() + Duration::from_secs(10);
+                let reaped = loop { // wallclock: guard a killed child is reaped in milliseconds; 10 s only bounds a reap that never happens, and the test already fails as a hang
+                    match child.try_wait() {
+                        Ok(Some(s)) => break Ok(s),
+                        Ok(None) if Instant::now() < reap_deadline => std::thread::sleep(Duration::from_millis(20)),
+                        r => break Err(format!("{r:?}")),
+                    }
+                };
+                notes.push_str(&format!("[harness] reap after kill: {reaped:?}\n"));
                 break None;
             }
         }
     };
-    (status, out_t.join().unwrap_or_default(), err_t.join().unwrap_or_default())
+    let take = |rx: std::sync::mpsc::Receiver<String>, name: &str| {
+        rx.recv_timeout(Duration::from_secs(10)) // wallclock: guard the pipe closes when the child ends; 10 s only bounds a reader that never ends
+            .unwrap_or_else(|_| format!("[harness] {name} reader did not finish within 10 s\n"))
+    };
+    let out = take(out_rx, "stdout");
+    let mut err = take(err_rx, "stderr");
+    err.push_str(&notes);
+    (status, out, err)
 }
 
 fn log_of(dir: &Path) -> panic_log::Report {
@@ -935,6 +989,8 @@ fn t_d2_6_lock_holder_panic_records_seats_and_does_not_hang() {
     let dir = temp_dir("lock");
     let (status, _, err) = run_child("lock", &dir);
     assert!(status.is_some(), "the child finished within its guard (no hang)\n{err}");
+    // Both panics are caught by join() in the child, so the child test passes (W60 impl r1 I2).
+    assert!(status.map(|s| s.success()).unwrap_or(false), "the lock-holder child must end successfully: {status:?}\n{err}");
     let r = log_of(&dir);
     assert_eq!((r.accepted.len(), r.torn.len()), (2, 0), "{err}");
     let first = &r.accepted[0];
@@ -948,6 +1004,9 @@ fn t_d2_7_tls_teardown_panic_is_recorded_and_the_hook_does_not_panic() {
     let dir = temp_dir("tls");
     let (status, _, err) = run_child("tls", &dir);
     assert!(status.is_some(), "child ended\n{err}");
+    // A panic in a thread-local destructor is fatal in std (the process aborts), so the child must END ABNORMALLY:
+    // that shows the record below was written on the abort path, not by a child that simply returned (W60 impl r1 I2).
+    assert!(status.map(|s| !s.success()).unwrap_or(false), "the TLS-destructor child must end abnormally: {status:?}\n{err}");
     assert!(!err.contains("panicked while processing panic"), "the hook itself must not panic: {err}");
     let r = log_of(&dir);
     assert!(r.accepted.iter().any(|x| x.get("msg") == Some(&b"w60-tls-drop"[..])), "{r:?}\n{err}");

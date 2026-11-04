@@ -1376,12 +1376,12 @@ jobs:
           set -euo pipefail
           cd ui && bun test
 
-      # ── W60 S1 (0.14.57, owner order 2026-11-04; DESIGN-W60-r2 §9.3, D-W60-4): the Windows named-pipe specimen. BLOCKING.
-      #   mio 1.2.1 aborts a cysd when a client closes a named pipe right after a large write was submitted (named_pipe.rs:969).
-      #   The test re-runs itself as a child, so the abort kills only the child, and prints exactly ONE `W60-S1 RESULT=` line
+      # ── W60 S1 (0.14.57, owner order 2026-11-04; DESIGN-W60-r2 §9.3, D-W60-4): the Windows named-pipe SMOKE check. BLOCKING.
+      #   Target: mio 1.2.1 can abort a cysd when a client closes a named pipe right after a large write was submitted (named_pipe.rs:969).
+      #   The test re-runs itself as a child, so an abort kills only the child, and prints exactly ONE `W60-S1 RESULT=` line
       #   bound to GITHUB_SHA, the lock's mio version+checksum and the sha256 of the test executable. The decision reads that
-      #   line, never the step colour: R (mio 1.2.1) must say R-WITNESS; G (mio 1.2.4) must say PASS with rounds >= 10 x r_round.
-      #   On R a `NOT-RUN reason=no-reproduce` passes the step but is NOT a demonstration (D-W60-4).
+      #   line, never the step colour. At G (mio 1.2.4, shipped on the upstream fix, mio PR #2014) a PASS means "no panic on this
+      #   path", not "the fix is shown": on R the line said `NOT-RUN reason=no-reproduce` (D-W60-4), so our CI does not demonstrate it.
       #   ★Measured at R f9dc2af4 (run 41761853211): no reproduction on hosted runners, so this is a SMOKE check, not a demonstration (dept-5 W60-MIO/RIG-INVESTIGATION-R.md).
       #   ★`if: !cancelled()` only WIDENS when this step runs (an earlier red step cannot skip it); it can never make a green that did
       #   not run, so it keeps the job rule above. No continue-on-error. Placed after the other blocking steps and BEFORE the
