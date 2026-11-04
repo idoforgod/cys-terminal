@@ -648,6 +648,20 @@ if { [ "$SOURCE" = "startup" ] || [ "$SOURCE" = "resume" ]; } && [ -n "$STATE" ]
   fi
 fi
 
+# ---------- ★F58(0.14.57) 셀프 서비스 블록 — 페이로드 끝(DESIGN-F58 r2 §7.3 · 단일 원본 _lib.sh) ----------
+# 앞의 내용을 먼저 확정한다: 블록의 N 조회(상한 5초)가 단계 상한을 넘겨도 위 출력은 남는다.
+printf 'OUT\0%s\0' "$OUT"
+if command -v cys_self_service_note >/dev/null 2>&1; then
+  # 역할은 위 착수 게이트 판별이 믿은 값과 같다: 해소된 _IC_ROLE, 없으면 lead 판정이 근거로 쓴 env
+  #   (lead 좌석은 조회 0 이 계약이라 _IC_ROLE 이 비어 있다) · 판별 실패(unknown)면 역할 미상(<ROLE>).
+  _SS_ROLE="$_IC_ROLE"
+  if [ -z "$_SS_ROLE" ] && [ "$_IC_GATE" = lead ] && command -v cys_role_line >/dev/null 2>&1; then
+    _SS_ROLE="$(cys_role_line "${CYS_ROLE:-}")"
+  fi
+  _SS_BLOCK="$(cys_self_service_note "$_SS_ROLE" 2>/dev/null)"
+  [ -n "$_SS_BLOCK" ] && OUT="${OUT}${_SS_BLOCK//\\/\\\\}\n"
+fi
+
 
 ;;
 bookkeeping)

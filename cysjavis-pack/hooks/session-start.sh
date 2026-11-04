@@ -595,6 +595,12 @@ if [ -f "$M" ]; then
     echo; echo "⚠ 색인 ${M_SZ}B>${M_CAP} — 앞부분만 주입(컨텍스트 예산 보호). 전문: cat $M"
   fi
 fi
+# ── ★F58(0.14.57) 셀프 서비스 블록 — 읽기 안내 줄(:539)·로컬 지침·soul·기억 색인 뒤, U16 BEGIN 앞
+#   (DESIGN-F58 r2 §7.3 · final §7.2: 안내 줄의 2,000자 위치·U16 바이트·끝의 exit 0 을 바꾸지 않는다).
+#   문안 단일 원본 = _lib.sh cys_self_service_note · 함수가 없는 옛 _lib.sh 면 아무것도 내지 않는다.
+if command -v cys_self_service_note >/dev/null 2>&1; then
+  echo; cys_self_service_note "$CYS_ROLE"
+fi
 # ── ★U16(0.14.41) 팀 소개(참고 정보) BEGIN — 부서 레인 전용 · TEAM.md 가 있을 때만 ─────────────────
 # 무엇: 대화로 만든 팀(`cys-dept` allocate --team-spec-b64 · 오너 확인 창 뒤)의 이름·하는 일(TEAM.md)을
 #   soul.md·기억 색인 **뒤**에 참고 정보로 붙인다. SessionStart 는 /clear 뒤에도 다시 불리므로 팀 맥락이

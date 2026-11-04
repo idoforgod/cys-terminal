@@ -14,6 +14,10 @@ and is the only shipped route to a vendor report. It never sends anything.
   recheck  [--case <id>]                            -> after an update; 1 if any case regressed
   report   --case <id> [--hypothesis <t>] [--observed <t>]   -> the report gate (final §2.4)
   status   [--case <id>]
+  corrections --role <ROLE> [--from <id>[:<part>]] [--summary]
+           -> the vendor-default corrections (user-class rows of round/self-service-corrections.json) that this
+              install's untouched files still carry; read-only; 16,384 bytes per call, 「계속: --from …」 or the end
+              line 「끝: n/eligible 건 · …」 (DESIGN-F58 r2 §5.2-5.4, final §8.1-8.2)
 
 Exit codes: 0 ok; 1 not fixed / symptom gone at retriage / state has no such step; 2 usage; 3 no such case;
 4 REDIRECT (wrong state, next lever, nothing to report); 5 NO_ATTEMPT; 6 NEEDS_USER_YES; 7 USER_DECLINED;
@@ -963,6 +967,200 @@ def cmd_status(a):
     return RC_OK
 
 
+# ───────────────────────── corrections: vendor defaults this install still carries (U2) ─────────────────────────
+# r2 §5.2-5.4 (H2 as amended): a vendor correction changes vendor DEFAULTS only and never outranks the user's own
+# text. Only user-class rows are presented (system-class rows reach every install by update). File gate: the file
+# is eligible only while its bytes still hash to what the installer recorded for it in .install-manifest.json
+# (pack.rs `content_hash` = sha256 of the text; a kept user file keeps its entry on advance, pack.rs Keep arm). Any
+# edit anywhere in the file holds every row of that file. Row gate: `old` occurs exactly once, byte for byte, and
+# `new` does not occur (D-U2-1: a class-3 prefix row keeps `old` inside `new`, so an installed 0.14.57 file would
+# otherwise list it). Read-only: this verb writes nothing. Framing, paging and the end line: final §8.1-8.2.
+
+CORR_CAP = 16384
+CORR_TAIL = 256  # room kept for the continuation or end line inside the cap
+CORR_ROLE_DIRECTIVE = {"master": "MASTER_DIRECTIVE", "worker": "WORKER_DIRECTIVE", "cso": "CSO_DIRECTIVE",
+                       "reviewer": "REVIEWER_DIRECTIVE"}
+CORR_OVERLAY_LINE = "로컬 지침(%s)이 있다 — 그 지침이 이 정정보다 우선한다\n"
+CORR_HELD_LINE = "사용자가 고친 파일 %s: 이 역할의 제조사 정정 %d건은 %s.new 에 있다 · 사용자 글이 우선한다"
+CORR_NO_RECORD_LINE = "설치 기록(.install-manifest.json)을 읽지 못해 정정을 보이지 않는다 · 사용자 글이 우선한다"
+
+
+def corrections_role(r):
+    """The role prefixes session-start.sh uses to pick a directive: master exact, worker*, cso*, reviewer*."""
+    r = r or ""
+    if r == "master":
+        return "master"
+    for p in ("worker", "cso", "reviewer"):
+        if r.startswith(p):
+            return p
+    return None
+
+
+def _load_corrections(pack):
+    p = os.path.join(pack, "round", "self-service-corrections.json")
+    try:
+        with open(p, "rb") as f:
+            raw = f.read()
+        m = json.loads(raw.decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError) as e:
+        raise TableError("correction manifest unreadable: %s (%s)" % (p, type(e).__name__))
+    if not isinstance(m, dict) or not isinstance(m.get("rows"), list):
+        raise TableError("correction manifest has no rows list: %s" % p)
+    return m, raw
+
+
+def _load_install_record(pack):
+    """The installer's record {rel: sha256}; None when missing, unreadable or not an object (every file held)."""
+    try:
+        with open(os.path.join(pack, ".install-manifest.json"), "rb") as f:
+            m = json.loads(f.read().decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    return m if isinstance(m, dict) else None
+
+
+def _file_gate(pack, rel, record):
+    """(eligible, bytes): eligible only when the installer recorded this file and its bytes still hash to it."""
+    if record is None:
+        return False, None
+    want = record.get(rel)
+    if not isinstance(want, str):
+        return False, None
+    try:
+        with open(os.path.join(pack, *rel.split("/")), "rb") as f:
+            data = f.read()
+    except OSError:
+        return False, None
+    return _sha(data) == want, data
+
+
+def correction_rows(role, pack=None):
+    """The user-class rows for `role` in manifest order, split into eligible rows and held files."""
+    pack = pack or pack_dir()
+    m, raw = _load_corrections(pack)
+    record = _load_install_record(pack)
+    gates, eligible, held = {}, [], {}
+    for row in m["rows"]:
+        if not isinstance(row, dict) or row.get("owner_class") != "user" or not row.get("file"):
+            continue
+        if role not in (row.get("roles") or []):
+            continue
+        rel = row["file"]
+        if rel not in gates:
+            gates[rel] = _file_gate(pack, rel, record)
+        ok, data = gates[rel]
+        if not ok:
+            held[rel] = held.get(rel, 0) + 1
+            continue
+        old = (row.get("old") or "").encode("utf-8")
+        new = (row.get("new") or "").encode("utf-8")
+        if old and new and data.count(old) == 1 and data.count(new) == 0:
+            eligible.append(row)
+    return {"rows": eligible, "held": held, "record_ok": record is not None, "manifest_sha": _sha(raw)}
+
+
+def _overlay_path(role):
+    base = os.environ.get("CYS_LOCAL_DIR") or os.path.join(str(Path.home()), ".cys", "local")
+    return os.path.join(base, "directives", CORR_ROLE_DIRECTIVE[role] + ".local.md")
+
+
+def _row_bytes(row, overlay):
+    return ("== %s · %s\n%s- old:\n%s\n- new:\n%s\n\n"
+            % (row["id"], row["file"], overlay, row["old"], row["new"])).encode("utf-8")
+
+
+def _utf8_parts(data, size):
+    """Cut bytes into pieces of at most `size` bytes, never inside a UTF-8 character."""
+    parts, i = [], 0
+    while i < len(data):
+        j = min(i + size, len(data))
+        while j < len(data) and j > i and (data[j] & 0xC0) == 0x80:
+            j -= 1
+        parts.append(data[i:j])
+        i = j
+    return parts
+
+
+def _row_part_size(row_id):
+    return CORR_CAP - CORR_TAIL - len(("== %s · part 9999/9999\n" % row_id).encode("utf-8"))
+
+
+def _end_line(n, eligible_ids, manifest_sha):
+    ids = _sha("\n".join(eligible_ids[:n]).encode("utf-8"))[:16]
+    return ("끝: %d/%d 건 · ids sha256 %s · manifest sha256 %s\n"
+            % (n, len(eligible_ids), ids, manifest_sha[:16])).encode("utf-8")
+
+
+def cmd_corrections(a):
+    role = corrections_role(a.role)
+    if role is None:
+        print("corrections: unknown role %r (master | worker* | cso* | reviewer*)" % (a.role,))
+        return RC_USAGE
+    got = correction_rows(role)
+    rows = got["rows"]
+    if a.summary:
+        lines = [str(len(rows))]
+        if not got["record_ok"]:
+            if got["held"]:
+                lines.append(CORR_NO_RECORD_LINE)
+        else:
+            for rel, k in got["held"].items():
+                lines.append(CORR_HELD_LINE % (rel, k, rel))
+        sys.stdout.write("\n".join(lines) + "\n")
+        return RC_OK
+    ids = [r["id"] for r in rows]
+    start, part = 0, 1
+    if a.from_:
+        rid, sep, p = a.from_.rpartition(":")
+        if sep and p.isdigit() and rid:
+            frm, part = rid, int(p)
+        else:
+            frm = a.from_
+        if frm not in ids or part < 1:
+            print("corrections: --from %s is not in the current list for %s (start again without --from)"
+                  % (a.from_, role))
+            return RC_USAGE
+        start = ids.index(frm)
+    op = _overlay_path(role)
+    overlay = (CORR_OVERLAY_LINE % scrubber().text(op)) if os.path.isfile(op) else ""
+    out = bytearray()
+    i = start
+    while i < len(rows):
+        row = rows[i]
+        data = _row_bytes(row, overlay)
+        if len(data) <= CORR_CAP - CORR_TAIL and part == 1:
+            if len(out) + len(data) > CORR_CAP - CORR_TAIL:
+                out += ("계속: --from %s\n" % row["id"]).encode("utf-8")
+                break
+            out += data
+            i += 1
+            continue
+        pieces = _utf8_parts(data, _row_part_size(row["id"]))
+        if part > len(pieces):
+            print("corrections: --from %s names a part that does not exist" % a.from_)
+            return RC_USAGE
+        if out:
+            out += ("계속: --from %s\n" % row["id"]).encode("utf-8")
+            break
+        # A piece is cut at a character boundary, not at a line end, so one separator newline always follows
+        # it and is NOT part of the row: a reader drops exactly that one newline before joining the parts.
+        out += ("== %s · part %d/%d\n" % (row["id"], part, len(pieces))).encode("utf-8") + pieces[part - 1] + b"\n"
+        if part < len(pieces):
+            out += ("계속: --from %s:%d\n" % (row["id"], part + 1)).encode("utf-8")
+            break
+        part = 1
+        i += 1
+        if i < len(rows):  # a call that printed a part prints nothing else but its continuation or end line
+            out += ("계속: --from %s\n" % rows[i]["id"]).encode("utf-8")
+            break
+    if i >= len(rows):
+        out += _end_line(len(rows), ids, got["manifest_sha"])
+    sys.stdout.flush()
+    sys.stdout.buffer.write(bytes(out))
+    sys.stdout.buffer.flush()
+    return RC_OK
+
+
 # ───────────────────────── CLI ─────────────────────────
 
 def build_parser():
@@ -999,13 +1197,16 @@ def build_parser():
     s.add_argument("--observed")
     s = sub.add_parser("status")
     s.add_argument("--case")
-    # `corrections --role <ROLE>` (U2: vendor-default corrections for this install) is added here; not in U3.
+    s = sub.add_parser("corrections", help="vendor-default corrections this install still carries (read-only)")
+    s.add_argument("--role", required=True)
+    s.add_argument("--from", dest="from_")
+    s.add_argument("--summary", action="store_true", help="for the hooks: eligible count, then held-file lines")
     return p
 
 
 HANDLERS = {"open": cmd_open, "triage": cmd_triage, "consent": cmd_consent, "attempt": cmd_attempt,
             "verify": cmd_verify, "retriage": cmd_retriage, "recheck": cmd_recheck, "report": cmd_report,
-            "status": cmd_status}
+            "status": cmd_status, "corrections": cmd_corrections}
 
 
 def main(argv=None):
