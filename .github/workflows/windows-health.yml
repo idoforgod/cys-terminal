@@ -1382,6 +1382,7 @@ jobs:
       #   bound to GITHUB_SHA, the lock's mio version+checksum and the sha256 of the test executable. The decision reads that
       #   line, never the step colour: R (mio 1.2.1) must say R-WITNESS; G (mio 1.2.4) must say PASS with rounds >= 10 x r_round.
       #   On R a `NOT-RUN reason=no-reproduce` passes the step but is NOT a demonstration (D-W60-4).
+      #   ★Measured at R f9dc2af4 (run 41761853211): no reproduction on hosted runners, so this is a SMOKE check, not a demonstration (dept-5 W60-MIO/RIG-INVESTIGATION-R.md).
       #   ★`if: !cancelled()` only WIDENS when this step runs (an earlier red step cannot skip it); it can never make a green that did
       #   not run, so it keeps the job rule above. No continue-on-error. Placed after the other blocking steps and BEFORE the
       #   bootstrap verdict, which must stay the last blocking step (test_ci_branch_cysd_step); every step after this one has
@@ -1390,7 +1391,7 @@ jobs:
       #   the specimen's exact path (codex r2 I2) before the run.
       #   Limit 8 min = up to 3 min harness rebuild + 60 s run + 60 s parent grace + reap; W60_S1_SECS/CLIENTS are the R' rerun knobs
       #   (120 s / 16 clients => grace 120 s; raise timeout-minutes with them). Realistic job cost about +2.5 min.
-      - name: 'W60 S1 named-pipe specimen (--bin cysd · Windows · blocking)'
+      - name: 'W60 S1 named-pipe smoke (--bin cysd · Windows · blocking · does not reproduce the mio crash on hosted runners)'
         if: ${{ !cancelled() }}
         timeout-minutes: 8
         shell: bash
@@ -1415,7 +1416,7 @@ jobs:
             echo "::error::W60 S1: expected 1 RESULT line and 1 executed test, got results=$results executed=$ran (no green that did not run)"
             exit 1
           fi
-          echo "::notice title=W60 S1::$(grep '^W60-S1 RESULT=' "$log")"
+          echo "::notice title=W60 S1 smoke (no repro on hosted runners)::$(grep '^W60-S1 RESULT=' "$log")"
           exit "$rc"
 
       - name: W60 S1 log upload
