@@ -52,6 +52,7 @@ mod hwmon;
 mod knobs;
 mod office_bridge;
 mod native_publication;
+mod panic_log;
 mod pending_requests;
 mod phoenix_plan;
 mod policy_loader;
@@ -8830,6 +8831,11 @@ mod direct_agent_tests;
 // (DESIGN-W60-r2 §9.3). Windows only: the race is in mio's Windows named-pipe code.
 #[cfg(all(test, windows))]
 mod w60_named_pipe_tests;
+
+// W60 D2 (0.14.57): the cysd panic record - formatter, reader, seat snapshot, census pin and child-process
+// tests (DESIGN-W60-r2 §9.2). Test-only module, kept at the file end like the other pins above.
+#[cfg(test)]
+mod panic_log_tests;
 
 // P4 C-13: the POSIX half of the Ctrl+C / ETX measurement. The Windows half is UNMEASURED by
 // construction and the module note says so - no cell here stands in for it.
