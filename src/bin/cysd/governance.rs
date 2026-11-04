@@ -9392,15 +9392,15 @@ pub(crate) const REMEDY_CODE_AFTER_CURSOR: &str = "after_cursor_text";
 /// ★(RQFIX I-4) 금지 목록에 `동결 해제`·`항목 삭제` 를 더했다. **앞부분 ` · LLM 에이전트는 자동 조치(` 는 바이트 그대로**다 — GUI 가 이 접두로 꼬리를 뗀다.
 pub(crate) const REMEDY_LLM_SUFFIX: &str = " · LLM 에이전트는 자동 조치(remedy 대로 단건 revive·deliver)를 한다 — 사용자 지침이 막으면 따르고, 드레인·항목 삭제·동결 해제·사람 글에 닿는 키는 사용자에게 한 번 묻는다";
 
-/// ★(R2F-DM · 성찰 2회차 A1 m-2 ⓐ) `empty_seat` 처방(표 13행)에 **입력줄 계수가 0 보다 클 때만** 덧붙는 한 구절 — 죽은 좌석의 계수 1(되돌린 Esc)은 제품의 정상 상태 하나인데(`state.rs` 틱의 되돌리기),
+/// ★(R2F-DM · 성찰 2회차 A1 m-2 ⓐ) `empty_seat` 처방(표 13행)에 **입력줄 계수가 0 보다 크고 사람 몫이 0 일 때만**(기계가 넣은 계수) 덧붙는 한 구절 — 되돌린 Esc(`state.rs` 틱의 되돌리기 · 계수 1 = 사람 몫 1)는 사람 몫 구절로 간다.
 /// 권위 없는 재기동은 바로 그 계수로 막힌다(node-recover 거부 문구 · 화면 재기동 보류와 같은 안내가 처방에도 있어야 한다). 이 구절이 가리키는 `cys node-recover` 는 다시 띄우기 전에
 /// C-u 를 보내 계수를 지운다(master·CSO 좌석의 권위 호출이라 초안 게이트에 막히지 않는다) — 그래서 계수에 사람 몫이 있으면 이 구절 대신 [`REMEDY_EMPTY_SEAT_HUMAN_CLAUSE`] 가 붙는다.
 /// code·분기·게이트는 불변이고 문장의 이 한 갈래만 길어진다 — [`REMEDY_LLM_SUFFIX`] 의 위치(문장 맨 끝)와 앞부분은 바이트 그대로다(GUI 가 접두로 꼬리를 뗀다).
 pub(crate) const REMEDY_EMPTY_SEAT_COUNT_CLAUSE: &str = " — 다시 띄울 때는 master·CSO 좌석에서 `cys node-recover --surface <좌석>` 로 띄운다(입력줄 계수 정리를 함께 한다 · 입력줄 계수가 남아 있다)";
 
 /// ★(0.14.57 · F58 F-B1) `empty_seat` 의 계수에 **사람 몫**이 있을 때(`pending_input_human_bytes > 0` — 진단이 계수 이하로 접은 값) [`REMEDY_EMPTY_SEAT_COUNT_CLAUSE`] 대신 붙는 구절.
-/// node-recover 의 C-u 가 그 사람 글까지 지우므로 먼저 사용자에게 한 번 묻게 한다([`REMEDY_LLM_SUFFIX`] 「사람 글에 닿는 키는 사용자에게 한 번 묻는다」 · 표 3·6행 사람 글 처방과 같은 뜻).
-pub(crate) const REMEDY_EMPTY_SEAT_HUMAN_CLAUSE: &str = " — 입력줄에 사람이 쓴 글이 있다: 먼저 사용자에게 한 번 묻는다(`cys node-recover --surface <좌석>` 는 그 글까지 지운다 — 사용자가 지우거나 지워도 된다고 하면 master·CSO 좌석에서 띄운다)";
+/// 사람 몫은 글일 수도 되돌린 Esc 하나일 수도 있어 글이 있다고 말하지 않는다. node-recover 의 C-u 가 입력줄을 지우므로 사용자에게 한 번 묻고 사용자가 그 창에서 비운다(기계는 지우지 않는다 — 표 3·6행 · [`REMEDY_LLM_SUFFIX`]).
+pub(crate) const REMEDY_EMPTY_SEAT_HUMAN_CLAUSE: &str = " — 사람의 키 입력이 계수돼 있다(글 또는 되돌린 Esc): 사용자에게 한 번 묻고 사용자가 그 창에서 Ctrl-U 로 비운 뒤(기계는 지우지 않는다) master·CSO 좌석에서 `cys node-recover` 로 띄운다(입력줄을 지운다)";
 
 /// 유령 계수 처방 — 직접 send 거부 응답·강제 배달 거부 문구의 **맨 끝**에 덧붙는다(앞 문구·접두·태그의 위치·바이트는 불변).
 /// 사람이 하는 일이다(기계가 Ctrl-U 를 보내는 경로는 없다). ★(RQFIX I-8) 정의처는 `src/lib.rs` 다 — `cys` CLI 가 같은 문자열로 stderr 처방 줄을 찍는다(한 정의처 공유).
