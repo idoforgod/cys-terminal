@@ -9393,9 +9393,14 @@ pub(crate) const REMEDY_CODE_AFTER_CURSOR: &str = "after_cursor_text";
 pub(crate) const REMEDY_LLM_SUFFIX: &str = " · LLM 에이전트는 자동 조치(remedy 대로 단건 revive·deliver)를 한다 — 사용자 지침이 막으면 따르고, 드레인·항목 삭제·동결 해제·사람 글에 닿는 키는 사용자에게 한 번 묻는다";
 
 /// ★(R2F-DM · 성찰 2회차 A1 m-2 ⓐ) `empty_seat` 처방(표 13행)에 **입력줄 계수가 0 보다 클 때만** 덧붙는 한 구절 — 죽은 좌석의 계수 1(되돌린 Esc)은 제품의 정상 상태 하나인데(`state.rs` 틱의 되돌리기),
-/// 권위 없는 재기동은 바로 그 계수로 막힌다(node-recover 거부 문구 · 화면 재기동 보류와 같은 안내가 처방에도 있어야 한다). 사람이 하는 일이다(기계가 Ctrl-U 를 보내는 경로는 없다).
+/// 권위 없는 재기동은 바로 그 계수로 막힌다(node-recover 거부 문구 · 화면 재기동 보류와 같은 안내가 처방에도 있어야 한다). 이 구절이 가리키는 `cys node-recover` 는 다시 띄우기 전에
+/// C-u 를 보내 계수를 지운다(master·CSO 좌석의 권위 호출이라 초안 게이트에 막히지 않는다) — 그래서 계수에 사람 몫이 있으면 이 구절 대신 [`REMEDY_EMPTY_SEAT_HUMAN_CLAUSE`] 가 붙는다.
 /// code·분기·게이트는 불변이고 문장의 이 한 갈래만 길어진다 — [`REMEDY_LLM_SUFFIX`] 의 위치(문장 맨 끝)와 앞부분은 바이트 그대로다(GUI 가 접두로 꼬리를 뗀다).
 pub(crate) const REMEDY_EMPTY_SEAT_COUNT_CLAUSE: &str = " — 다시 띄울 때는 master·CSO 좌석에서 `cys node-recover --surface <좌석>` 로 띄운다(입력줄 계수 정리를 함께 한다 · 입력줄 계수가 남아 있다)";
+
+/// ★(0.14.57 · F58 F-B1) `empty_seat` 의 계수에 **사람 몫**이 있을 때(`pending_input_human_bytes > 0` — 진단이 계수 이하로 접은 값) [`REMEDY_EMPTY_SEAT_COUNT_CLAUSE`] 대신 붙는 구절.
+/// node-recover 의 C-u 가 그 사람 글까지 지우므로 먼저 사용자에게 한 번 묻게 한다([`REMEDY_LLM_SUFFIX`] 「사람 글에 닿는 키는 사용자에게 한 번 묻는다」 · 표 3·6행 사람 글 처방과 같은 뜻).
+pub(crate) const REMEDY_EMPTY_SEAT_HUMAN_CLAUSE: &str = " — 입력줄에 사람이 쓴 글이 있다: 먼저 사용자에게 한 번 묻는다(`cys node-recover --surface <좌석>` 는 그 글까지 지운다 — 사용자가 지우거나 지워도 된다고 하면 master·CSO 좌석에서 띄운다)";
 
 /// 유령 계수 처방 — 직접 send 거부 응답·강제 배달 거부 문구의 **맨 끝**에 덧붙는다(앞 문구·접두·태그의 위치·바이트는 불변).
 /// 사람이 하는 일이다(기계가 Ctrl-U 를 보내는 경로는 없다). ★(RQFIX I-8) 정의처는 `src/lib.rs` 다 — `cys` CLI 가 같은 문자열로 stderr 처방 줄을 찍는다(한 정의처 공유).
@@ -9523,7 +9528,7 @@ pub(crate) fn paused_queue_remedy(
 /// | 10 | `modal_pending` | `answer_modal` |
 /// | 11 | `approval_pending` | `approval` |
 /// | 12 | `alt_screen` | `alt_screen` |
-/// | 13 | `empty_seat` (입력줄 계수 > 0 이면 문장에 [`REMEDY_EMPTY_SEAT_COUNT_CLAUSE`] 한 구절이 더 붙는다 — code 는 같다) | `empty_seat` |
+/// | 13 | `empty_seat` (입력줄 계수 > 0 이면 문장에 [`REMEDY_EMPTY_SEAT_COUNT_CLAUSE`] 한 구절이 더 붙는다 · 그 계수에 사람 몫이 있으면 대신 [`REMEDY_EMPTY_SEAT_HUMAN_CLAUSE`] — code 는 같다) | `empty_seat` |
 /// | 14 | `prompt_unknown` | `prompt_unknown` |
 /// | 15′ | `busy` ∧ 출력 정적 ≥ [`STALE_SCREEN_QUIET_SECS`] ∧ 다시 그리기 약속 불가([`repaint_promise`] = Some — 노브 끔·대상 아님·창 너무 작음·요청했으나 미복구) | `stale_screen`(2회차 M3 · 사람 조치) |
 /// | 15 | `busy`(정적 ≥ 60초여도 cys 가 다시 그리기를 요청할 것이면 여기)·`delivery_interval`·`settle`·`quiescing`·`prompt_not_ready`·`human_typing`·`queue_paused` | `wait` |
@@ -9605,7 +9610,7 @@ pub(crate) fn queue_remedy(blocked_by: &str, d: &QueueBlockDiag) -> (&'static st
         }
     } else if blocked_by.starts_with("empty_seat") {
         if d.pending_input_bytes > 0 {
-            clause = REMEDY_EMPTY_SEAT_COUNT_CLAUSE;
+            clause = if d.pending_input_human_bytes > 0 { REMEDY_EMPTY_SEAT_HUMAN_CLAUSE } else { REMEDY_EMPTY_SEAT_COUNT_CLAUSE };
         }
         (
             "empty_seat",
