@@ -9399,8 +9399,8 @@ pub(crate) const REMEDY_LLM_SUFFIX: &str = " · LLM 에이전트는 자동 조�
 pub(crate) const REMEDY_EMPTY_SEAT_COUNT_CLAUSE: &str = " — 다시 띄울 때는 master·CSO 좌석에서 `cys node-recover --surface <좌석>` 로 띄운다(입력줄 계수 정리를 함께 한다 · 입력줄 계수가 남아 있다)";
 
 /// ★(0.14.57 · F58 F-B1) `empty_seat` 의 계수에 **사람 몫**이 있을 때(`pending_input_human_bytes > 0` — 진단이 계수 이하로 접은 값) [`REMEDY_EMPTY_SEAT_COUNT_CLAUSE`] 대신 붙는 구절.
-/// 사람 몫은 글일 수도 되돌린 Esc 하나일 수도 있어 글이 있다고 말하지 않는다. node-recover 의 C-u 가 입력줄을 지우므로 사용자에게 한 번 묻고 사용자가 그 창에서 비운다(기계는 지우지 않는다 — 표 3·6행 · [`REMEDY_LLM_SUFFIX`]).
-pub(crate) const REMEDY_EMPTY_SEAT_HUMAN_CLAUSE: &str = " — 사람의 키 입력이 계수돼 있다(글 또는 되돌린 Esc): 사용자에게 한 번 묻고 사용자가 그 창에서 Ctrl-U 로 비운 뒤(기계는 지우지 않는다) master·CSO 좌석에서 `cys node-recover` 로 띄운다(입력줄을 지운다)";
+/// 사람 몫은 글일 수도 되돌린 Esc 하나일 수도 있어 글이 있다고 말하지 않는다. node-recover 의 C-u 는 POSIX 셸에서는 입력줄을 지우고 Windows 맨 셸(powershell.exe · `state.rs` `default_shell`)에서는 못 지워 기동 명령과 함께 제출하므로(PSReadLine 기본 Windows 모드 · 문서 근거) 사용자에게 한 번 묻고 사용자가 그 창에서 직접 비운다 — 키 이름은 적지 않는다(셸마다 다르다 · 기계는 지우지 않는다 — 표 3·6행 · [`REMEDY_LLM_SUFFIX`]).
+pub(crate) const REMEDY_EMPTY_SEAT_HUMAN_CLAUSE: &str = " — 사람의 키 입력이 계수돼 있다(글 또는 되돌린 Esc): 사용자에게 한 번 묻고 사용자가 그 창에서 직접 비운 뒤(기계는 지우지 않는다) master·CSO 좌석에서 `cys node-recover` 로 띄운다(입력줄을 지운다)";
 
 /// 유령 계수 처방 — 직접 send 거부 응답·강제 배달 거부 문구의 **맨 끝**에 덧붙는다(앞 문구·접두·태그의 위치·바이트는 불변).
 /// 사람이 하는 일이다(기계가 Ctrl-U 를 보내는 경로는 없다). ★(RQFIX I-8) 정의처는 `src/lib.rs` 다 — `cys` CLI 가 같은 문자열로 stderr 처방 줄을 찍는다(한 정의처 공유).
