@@ -517,8 +517,7 @@ pub struct QueueBlockedRetry {
 /// 종전 문면은 [`QUEUE_STARVED_HINT_LEGACY`] 로 보존하고 env `CYS_QUEUE_STARVED_HINT_LEGACY=1` 이면 그것을 싣는다(롤백 노브 · [`starved_hint_for`]).
 pub const QUEUE_STARVED_HINT: &str = "큐 머리가 장기 대기 중(게이트에 막힘) — 조치는 remedy 참조. \
      강제 배달(cys queue deliver)은 quiet 대기와 사이클 창 보류만 건너뛰고 일시정지·빈 좌석·사람 입력 직후·\
-     배달 최소 간격·초안·모달·승인·전체화면·작업 중 게이트는 면제하지 않는다(운영자(사람) 판단 전제). \
-     LLM 에이전트는 이 경보에 자동 반응(강제 배달·드레인) 금지";
+     배달 최소 간격·초안·모달·승인·전체화면·작업 중 게이트는 면제하지 않는다(자비스가 remedy 대로 판단한다). LLM 에이전트는 remedy 대로 단건 강제 배달을 할 수 있다 — 드레인은 사용자에게 한 번 묻는다";
 
 /// ★(0.14.43 · C5) 종전(0.14.42 이하) hint 문면 — 바이트 보존. `CYS_QUEUE_STARVED_HINT_LEGACY=1` 로 되돌릴 때만 쓴다.
 pub const QUEUE_STARVED_HINT_LEGACY: &str = "큐 머리가 장기 대기 중(게이트에 막힘) — 운영자(사람) \
@@ -674,8 +673,7 @@ pub fn queue_reordered_payload(
 /// LLM 에이전트이고, "만료됐으니 revive 해라"로 읽히면 만료→반사적 revive→재만료 폭주 회로가
 /// 열린다(부트 체인 ①폭주). 문면은 아래 payload 핀 테스트가 고정한다.
 pub const QUEUE_EXPIRED_HINT: &str = "큐 항목이 TTL 을 넘겨 만료됐다(활성 큐에서 제외 · 보존 중). \
-     운영자(사람) 판단 하에 cys queue revive <id> 로 재활성 또는 cys queue drop <id> 로 폐기. LLM \
-     에이전트는 이 통지에 자동 반응(revive·drop·재전송) 금지";
+     자비스가 판단해 cys queue revive <id> 로 재활성한다(같은 항목은 한 번만 — 다시 만료되면 사용자에게 묻는다 · 통지마다 반사적으로 revive 하지 않는다). cys queue drop <id> 폐기는 사용자에게 한 번 묻고 한다";
 
 /// queue.expired payload — 항목이 TTL 을 넘겨 활성 큐(`pending_queue`)에서 `expired_queue` 로
 /// 이동한 사실(신규 이벤트 · WP-5 M). `queue_entry_id` 가 `cys queue revive|drop` 의 조준점이다.
@@ -13365,7 +13363,7 @@ mod tests {
     }
 
     /// ★G1(W2-D) queue.starved payload 핀 — 스키마 7키 + hint 문구 계약(성찰 BLOCKER):
-    /// hint 는 운영자(사람) 판단 전제를 명시하고 LLM 에이전트 자동 반응을 금지해야 한다.
+    /// hint 는 판단 근거(remedy)를 명시하고 LLM 에이전트의 자동 조치를 단건 강제 배달로 묶으며 드레인은 사용자에게 묻게 해야 한다(F58 T1-05 · 폭주 회로 차단).
     /// 이벤트 실소비자가 LLM 에이전트인 시스템에서 hint 가 강제 배달을 직접 지시하면
     /// '경보 → 반사적 강제 드레인' 폭주 회로가 열린다 — 문면 자체를 핀으로 고정.
     #[test]
@@ -13388,10 +13386,10 @@ mod tests {
         assert_eq!(p["depth"], json!(2));
         assert_eq!(p["blocked_by"], json!("busy(출력 중)"));
         assert_eq!(p["hint"], json!(expected_starved_hint_for_env()), "hint 문구 = env 가 고른 상수 계약 그대로(LEGACY env 에서도 같은 사슬)");
-        // 문구 계약의 핵심 2요소: ①운영자(사람) 판단 명시 ②자동 반응 금지 명시.
-        assert!(QUEUE_STARVED_HINT.contains("운영자(사람) 판단"), "사람 판단 전제 명시");
-        assert!(QUEUE_STARVED_HINT.contains("자동 반응"), "자동 반응 금지 명시");
-        assert!(QUEUE_STARVED_HINT.contains("금지"), "금지 문면 존재");
+        // 문구 계약의 핵심(F58 T1-05 이후 · 폭주 회로 차단): ①판단 근거는 remedy ②LLM 의 자동 조치는 단건 강제 배달로 묶인다 ③드레인(일괄 배출)은 사용자에게 묻는다.
+        assert!(QUEUE_STARVED_HINT.contains("자비스가 remedy 대로 판단한다"), "판단 근거 = remedy 명시");
+        assert!(QUEUE_STARVED_HINT.contains("단건 강제 배달"), "자동 조치는 단건으로 묶인다");
+        assert!(QUEUE_STARVED_HINT.contains("드레인은 사용자에게 한 번 묻는다"), "드레인은 사용자에게 묻는다");
         // role 없는 맨 셸 = null (depth_high 의 role 직렬화 관례와 동형).
         let p2 = queue_starved_payload("surface:8", None, &head, 700, 1, "queue_paused(헬스 조치)", &diag);
         assert_eq!(p2["role"], json!(null));
@@ -13458,7 +13456,7 @@ mod tests {
                    "cursor_col": null, "after_cursor_dim": null, "alt_screen": false, "human_idle_secs": null}),
             "결측은 null(값이 아니다) — ★(0.14.47 · 계측) 추가형 키 넷은 screen_diag 객체 안이다(최상위 키 수 16 은 그대로)"
         );
-        // 커서 뒤에 글자가 있으면(회색 제안인지 직접 쓴 글인지 모른다) 유령 단정이 아니라 `after_cursor_text`(표 7행) — 사람이 화면을 보고 가린다.
+        // 커서 뒤에 글자가 있으면(회색 제안인지 직접 쓴 글인지 모른다) 유령 단정이 아니라 `after_cursor_text`(표 7행) — 자비스가 그 창 화면을 읽어 가린다(F58 T1-10).
         let p_after = queue_starved_payload("surface:5", Some("cso".into()), &head, 4200, 3, blocked, &c5_diag_ga(Some(false), Some(true)));
         assert_eq!(p_after["remedy_code"], json!("after_cursor_text"));
         assert_eq!(p_after["ghost_after_cursor"], json!(true));
@@ -13472,14 +13470,14 @@ mod tests {
         assert_eq!(p_paused["remedy_code"], json!("paused"), "동결은 어느 사유보다 앞선다");
     }
 
-    /// hint 문면 정정 — 종전 문면의 "강제 배달 가능" 오류를 고치되 의미(운영자(사람) 판단 전제 · LLM 자동 반응 금지)는 유지하고,
+    /// hint 문면 정정 — 종전 문면의 "강제 배달 가능" 오류를 고치되 의미(판단 근거 remedy · 자동 조치는 단건 · 드레인은 묻는다 — F58 T1-05)는 유지하고,
     /// 종전 문면은 LEGACY 로 바이트 보존한다. env 를 건드리지 않는다(`starved_hint_for` · `starved_hint_legacy_from_env` 순수 함수).
     #[test]
     fn c5_starved_hint_corrected_text_and_legacy_branch() {
         assert_eq!(starved_hint_for(false), QUEUE_STARVED_HINT);
         assert_eq!(starved_hint_for(true), QUEUE_STARVED_HINT_LEGACY);
         assert_ne!(QUEUE_STARVED_HINT, QUEUE_STARVED_HINT_LEGACY);
-        // 정정 문면: 조치는 remedy 를 가리키고, 강제 배달이 면제하지 않는 게이트를 말하며, 의미(사람 판단·자동 반응 금지)는 유지한다.
+        // 정정 문면: 조치는 remedy 를 가리키고, 강제 배달이 면제하지 않는 게이트를 말하며, 의미(판단 근거 remedy · 자동 조치는 단건 · 드레인은 묻는다)는 유지한다.
         // ★(RQFIX F7 · RQFIX2 n-2) 강제 배달이 건너뛰는 것은 **quiet 대기와 사이클 창(quiescing) 보류뿐**이다 — 일시정지·빈 좌석·사람 입력 직후·배달 최소 간격도 면제하지 않는다
         //   (종전 정정 문면은 '간격 대기' 를 건너뛴다고 잘못 말했고, 첫 정정 문면은 사이클 창 보류도 건너뛴다는 사실을 빼먹었다 — `force_deliver_entry` 에 그 판정이 없다).
         for must in [
@@ -13487,9 +13485,9 @@ mod tests {
             "quiet 대기와 사이클 창 보류만 건너뛰고",
             "일시정지·빈 좌석·사람 입력 직후·배달 최소 간격",
             "초안·모달·승인·전체화면·작업 중 게이트는 면제하지 않는다",
-            "운영자(사람) 판단",
-            "자동 반응",
-            "금지",
+            "자비스가 remedy 대로 판단한다",
+            "단건 강제 배달",
+            "드레인은 사용자에게 한 번 묻는다",
         ] {
             assert!(QUEUE_STARVED_HINT.contains(must), "정정 문면에 {must:?} 가 있어야 한다: {QUEUE_STARVED_HINT}");
         }
@@ -13499,8 +13497,8 @@ mod tests {
         assert_eq!(
             QUEUE_STARVED_HINT,
             "큐 머리가 장기 대기 중(게이트에 막힘) — 조치는 remedy 참조. 강제 배달(cys queue deliver)은 quiet 대기와 사이클 창 보류만 건너뛰고 \
-             일시정지·빈 좌석·사람 입력 직후·배달 최소 간격·초안·모달·승인·전체화면·작업 중 게이트는 면제하지 않는다(운영자(사람) 판단 전제). \
-             LLM 에이전트는 이 경보에 자동 반응(강제 배달·드레인) 금지",
+             일시정지·빈 좌석·사람 입력 직후·배달 최소 간격·초안·모달·승인·전체화면·작업 중 게이트는 면제하지 않는다(자비스가 remedy 대로 판단한다). \
+             LLM 에이전트는 remedy 대로 단건 강제 배달을 할 수 있다 — 드레인은 사용자에게 한 번 묻는다",
             "정정 문면 바이트 고정"
         );
         // 종전 문면 바이트 보존(롤백 노브가 되돌리는 값).
@@ -14824,7 +14822,7 @@ mod tests {
         );
     }
 
-    /// ★WP-5: 만료 이벤트의 사람 판단·자동 반응 금지 힌트나 회계 키 누락은 소비자의 오판을 부른다.
+    /// ★WP-5: 만료 이벤트의 폭주 회로 차단 힌트(같은 항목은 한 번만 · 반사적 revive 없음 · F58 T1-06)나 회계 키 누락은 소비자의 오판을 부른다.
     #[test]
     fn wp5_expired_payload_pins_hint_and_keys() {
         let text = "가".repeat(81);
@@ -14845,10 +14843,10 @@ mod tests {
         for (key, value) in expected.as_object().expect("기대 payload 객체") {
             assert_eq!(p.get(key), Some(value), "만료 payload 키/값 계약: {key}");
         }
-        for phrase in ["운영자(사람) 판단", "자동 반응", "금지"] {
+        for phrase in ["자비스가 판단해", "같은 항목은 한 번만", "다시 만료되면 사용자에게 묻는다", "통지마다 반사적으로 revive 하지 않는다", "폐기는 사용자에게 한 번 묻고"] {
             assert!(
                 QUEUE_EXPIRED_HINT.contains(phrase),
-                "운영자 전용 경고 필수 문구 누락: {phrase}"
+                "만료 hint 의 폭주 회로 차단 문구 누락: {phrase}"
             );
         }
         e.expired_at = None;

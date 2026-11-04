@@ -1005,8 +1005,8 @@ enum QueueAction {
     /// Drop all undelivered queued messages for a surface
     Clear { surface: String },
     /// ★(0.14.31 · WP-5 M) 만료 항목 재활성 — 활성 큐 **꼬리**로 되돌린다(TTL 시계 재시작). 이미
-    /// 활성이면 멱등. 운영자(사람) 판단 전제 — LLM 에이전트의 자동 반응(queue.expired 통지에 대한
-    /// 반사적 revive) 금지. exit: 0=재활성 · 7=거부(ACL·상한·원장) · 1=오류(없음·통신).
+    /// 활성이면 멱등. 자비스가 판단해 쓴다(같은 항목은 한 번만 — queue.expired 통지에 대한
+    /// 반사적 revive 는 하지 않는다). exit: 0=재활성 · 7=거부(ACL·상한·원장) · 1=오류(없음·통신).
     Revive {
         /// 큐 항목 id (`cys queue list --expired` 의 id 열)
         id: String,
@@ -2651,7 +2651,7 @@ fn queue_list_full_block(e: &Value) -> Vec<String> {
 }
 
 /// ★(0.14.43 · RQFIX I-8) `--queued` 폴백 뒤의 **유령 계수 처방 줄**(순수) — 데몬 거부 문구 `err` 의 끝에 유령 처방 접미([`cys::GHOST_CTRL_U_SUFFIX`] · 정의처 `src/lib.rs` 한 곳)가 있으면
-/// `[<tag>] surface=<ref> — 입력줄이 비어 보이면 유령 계수다: 그 창에서 사람이 Ctrl-U 한 번` 한 줄을, 없으면 `None`(종전 출력 그대로)을 돌려준다.
+/// `[<tag>] surface=<ref> — 입력줄이 비어 보이면 유령 계수다: 자비스가 그 창 화면을 읽어 …`(F58 T1-34 의 `GHOST_CTRL_U_SUFFIX`) 한 줄을, 없으면 `None`(종전 출력 그대로)을 돌려준다.
 /// 데몬이 그 처방을 붙인 거부는 본문이 큐로 넘어가도 **계수가 남아 큐가 멈춘다** — 이 줄이 사람에게 풀이를 알린다(기계가 키를 보내지는 않는다).
 /// 호출자는 stderr 로만 찍는다 — stdout·종료 코드·요청 순서는 무변경이다.
 fn ghost_fallback_stderr_line(tag: &str, err: &str, sid: u64) -> Option<String> {

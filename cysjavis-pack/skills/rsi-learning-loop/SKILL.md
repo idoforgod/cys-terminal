@@ -15,8 +15,7 @@ description: RSI(재귀적 자기개선) 5단계 학습 루프의 운영 플레�
 1. **사람 직접 명령**: 오너가 "학습/공부/RSI하라"를 명령.
 2. **master 능력 갭 감지**("작업 한계 = 학습 신호"): 워커의 동일 문제 N회 실패·도구 한계·eval
    ceiling(verdict=flat 연속) → master가 `javis_learn propose --reason <stuck|gate|ceiling>` →
-   `cys feed push --wait`(또는 `cys feed reply <id> allow`) **승인(exit 0)에서만** ①~⑤ 착수.
-   거부·타임아웃 = 무실행. ★**기계한계 vs 지식한계 판별(장치 8) 먼저**: API 장애·권한 거부 등
+   승인 대기 없이 ①~⑤ 착수(한 번에 한 라운드 · 시작 사실을 사용자에게 한 줄로 알린다). ★**기계한계 vs 지식한계 판별(장치 8) 먼저**: API 장애·권한 거부 등
    기계한계는 학습 티켓 부적격(허위 교훈 차단) — 방법론 부재(지식한계)만 착수한다.
 
 ## 역할 배정 (LLM 오케스트레이션 앵커 — 분리 불변)
@@ -58,18 +57,15 @@ description: RSI(재귀적 자기개선) 5단계 학습 루프의 운영 플레�
 
 ### ④ 문서·지침 저장 — worker 초안 → 게이트
 - **memory/skill = 자율**: `javis_memory add`(원자적·색인 동기 — MEMORY.md 손편집 금지).
-- **디렉티브 = 자동 초안 + 오너 원클릭 승인**: 초안 생성 후 `cys feed push --wait`로 오너 승인
-  (soul·CLAUDE·directive 변경은 denylist — 자동 저장 금지·루프 유지). 승인(0)에서만 반영.
-- **게이트**: `javis_learn store --round <id> --pattern <p> --type <feedback|reference|project>
-  --approved --state <provisional|confirmed> --gate-input <bundle>` — verdict=improved AND
-  --approved일 때만 저장. `--gate-input`으로 **rsi-gate.sh 봉쇄 통과 증명 필수**(존재≠강제 방지).
+- **디렉티브 = 학습 루프가 쓰지 않는다**: soul·CLAUDE·directive 변경은 denylist — 자동 저장 금지·루프 유지. 바꿀 만한 규칙은 학습 기억(memory)에 쓰고, 파일 자체는 사용자가 시킬 때만 고친다.
+- **게이트**: `javis_learn store --round <id> --pattern <p> --type <feedback|reference|project> --state <provisional|confirmed> --gate-input <bundle>` — verdict=improved 이고 검출기가 닫힌 저위험 모양으로 알아본 provisional 항목만 저장한다. 나머지는 보류(staged)로 남기고 이유를 보여 준다(`--approved` 플래그는 없다 · 게이트 묶음의 human_signed 는 store 가 항상 거짓으로 덮어쓴다). `--gate-input`으로 **rsi-gate.sh 봉쇄 통과 증명 필수**(존재≠강제 방지).
   fallback(단일 모델 변형)은 confirmed 승격 불가(provisional만).
 
 ### ⑤ skill/harness 제작·발전 → 재사용 — worker 제작, master 게이트
 - 배운 것을 도구화: 신설 = `write-a-skill`, 하네스 = `harness-creator`. 기존 skill 발전은
   **버전 사본 + rollback.sh 선행**(롤백 우선 원칙 — 구현 직전 상태 1커맨드 복원).
 - **staging 격리**: 자동 생성·수정 skill은 **`_work/rsi-staging/`에 격리** → `skillscan`
-  (+ `skillscan-semantic`) 통과 → **오너 승인** 후에만 팩 레지스트리 진입. skillscan **CRITICAL
+  (+ `skillscan-semantic`) 통과 → 이 판에서 학습 루프는 스킬을 등록하지 않는다 — 절차는 보류된 메모로 남기고, 사용자가 원하면 `cys skill new` 로 만든다. skillscan **CRITICAL
   BLOCK = 자율주행 정지 경계**(skillscan-gate-policy 준수).
 - **게이트**: `javis_learn harness --round <id> --pattern <p> [--evolve <skill>] --gate-input
   <bundle>` — 채택(keep)은 봉쇄 통과 필수, baseline 못 이기면 `javis_rsi rollback` 권고.

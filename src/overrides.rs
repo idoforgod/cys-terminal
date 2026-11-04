@@ -39,7 +39,7 @@ pub const SAFETY_CORE_REASSERT: &str = "\n■ 안전핵 재확인 (불변 — �
 - recovery 프로토콜·SESSION_STATE 체크포인트 불변\n\
 - kill-switch(주인 입력=즉시 일시정지) 불변\n\
 - RSI eval-driven 무결성(producer≠evaluator 분리) 불변\n\
-- soul.md 운영 헌장 불가침\n";
+- soul.md 운영 헌장은 사용자의 것 — 사용자가 직접 시킬 때만 고친다(자율주행·자기 판단으로는 고치지 않는다)\n";
 
 fn knob(key: &str) -> Option<&'static Knob> {
     KNOBS.iter().find(|k| k.key == key)

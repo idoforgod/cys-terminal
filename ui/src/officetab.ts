@@ -63,11 +63,11 @@ export const OFFICE_POLL_FAST_WINDOW_MS = 180000;
 
 export const OFFICE_TEXT_PREPARING = "오피스를 준비하고 있습니다… 자동으로 다시 확인합니다.";
 export const OFFICE_TEXT_LONG =
-  "오피스가 아직 열리지 않습니다. 자동으로 계속 다시 시도합니다. 오래 열리지 않으면 컴퓨터를 다시 시작해 보시고, 그래도 안 되면 왼쪽 아래 '피드백'으로 알려 주세요.";
+  "오피스가 아직 열리지 않습니다. 자동으로 계속 다시 시도합니다. 오래 열리지 않으면 자비스에게 '오피스가 안 열린다, 고쳐 줘'라고 말씀하세요 — 자비스가 먼저 고칩니다. 제품 결함이면 자비스가 피드백 초안을 만들어 드립니다.";
 export const OFFICE_TEXT_REPAIRING = "오피스 화면 파일을 복구하고 있습니다…";
 export const OFFICE_TEXT_REPAIR_FAILED = "복구하지 못했습니다.";
 export const OFFICE_TEXT_ASSETS_BUTTON = "오피스 화면 파일이 없습니다.";
-export const OFFICE_TEXT_ASSETS_NONE = "오피스 화면 파일을 찾지 못했습니다. 왼쪽 아래 '피드백'으로 알려 주세요.";
+export const OFFICE_TEXT_ASSETS_NONE = "오피스 화면 파일을 찾지 못했습니다. 자비스에게 '오피스 파일을 복구해 줘'라고 말씀하세요 — 자비스가 직접 복구합니다.";
 export const OFFICE_BUTTON_REPAIR = "복구";
 export const OFFICE_BUTTON_RETRY = "다시 시도";
 

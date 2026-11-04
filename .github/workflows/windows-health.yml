@@ -1210,6 +1210,40 @@ jobs:
           esac
           exit 0
 
+      # F58 T-13w (HEAD-DECISIONS-F58-r2 H9; head decision D-U6-1 2026-11-04): REPORT-ONLY measurement of the guard.sh
+      #   constitution-edit token route on Git Bash. It prints (1) what this runner's `stat -f %m` and `stat -c %Y` give
+      #   for a file - the two forms guard.sh's token block tries - and (2) the result of test_f58_guard_rows.py T13b
+      #   (fresh token scoped to soul.md: Write soul.md allowed, Write MASTER_DIRECTIVE.md refused). The release record
+      #   quotes the `[t13w] RESULT` line; read it with the pinned checker. This step must never fail the job:
+      #   continue-on-error, `set +e`, `exit 0`; `!cancelled()` so an earlier red does not hide it. Time: T13b is 4 tests;
+      #   Windows time unmeasured; limit 3 min.
+      - name: F58 T-13w guard token route on Git Bash (report-only · H9)
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set +e
+          set -uo pipefail
+          probe="${RUNNER_TEMP:-/tmp}/t13w-probe"; printf 'x' > "$probe"
+          sf="$(stat -f %m "$probe" 2>&1)"; sfrc=$?
+          sc="$(stat -c %Y "$probe" 2>&1)"; scrc=$?
+          echo "[t13w] stat=$(command -v stat) bash=${BASH_VERSION}"
+          echo "[t13w] stat -f %m rc=$sfrc lines=$(printf '%s\n' "$sf" | wc -l | tr -d ' ') first=$(printf '%s\n' "$sf" | head -n 1)"
+          echo "[t13w] stat -c %Y rc=$scrc first=$(printf '%s\n' "$sc" | head -n 1)"
+          out="${RUNNER_TEMP:-/tmp}/t13w.out"
+          python cysjavis-pack/bin/tests/test_f58_guard_rows.py T13b > "$out" 2>&1; rc=$?
+          sed 's/^/[t13w]   | /' "$out"
+          ran=$(grep -Eo '^Ran [0-9]+ test' "$out" | grep -Eo '[0-9]+' | tail -n 1)
+          res=$(grep -E '^(OK|FAILED)' "$out" | tail -n 1)
+          echo "[t13w] RESULT T13b rc=$rc ran=${ran:-0} ${res:-no-result-line}"
+          if [ "$rc" = 0 ] && [ "${ran:-0}" = 4 ]; then
+            echo "::notice title=F58 T-13w::T13b passed on Git Bash: token route works, out-of-scope file refused (ran=$ran)"
+          else
+            echo "::warning title=F58 T-13w::T13b did not pass on Git Bash (report-only, H9): rc=$rc ran=${ran:-0} ${res:-no-result-line}"
+          fi
+          exit 0
+
       # ★R2F-PK(성찰 2회차 · A4 m5): **화면 검체가 태그 전에 윈도우에서 한 번도 돌지 않는다** — 브랜치 ui-check 는 macOS 뿐이고(ci-branch 잡5), `release.yml` 의 `cd ui && bun test`(윈도우 레그 포함 · `if` 없음)가 첫
       #   윈도우 실행이라 이번 판이 더한 검체 파일(deptprogress · deptprogressseats · deptprogresswiring · sendfailwiring · starvednotice · updatenotice)과 크게 늘어난 기존 검체(usagebar · usagewiring · restartplan · toastttl)의
       #   윈도우 첫 실행이 **태그**다 — 거기서 붉으면 태그(불변 · 버전 소모)가 소모된다. 그래서 같은 명령을 이 잡에서 **차단**으로 먼저 돈다(윈도우 전용으로 깨질 구조는 정적으로 찾지 못했다 — 다른 레인 파일을 `import.meta.url` 로
@@ -1464,6 +1498,51 @@ jobs:
           name: w60-d2-log
           path: w60-d2.log
           if-no-files-found: warn
+      # F58 M1 (HEAD-RULING-F58-impl-r1, design 6.6): T-11m runs on Windows, blocking. Design 6.6 makes T-11m (another
+      #   process holds MEMORY.md or the entry open -> revert exit 3, the pair byte-identical) a Windows CI job test, and
+      #   test_f58_learning_loop.py skips it unless os.name == 'nt'. Before this step no Windows job ran the file, so T-11m,
+      #   the CRLF index cell and the only cell that can kill mutant M28 (the index written in text mode: identical on POSIX,
+      #   it turns each kept \r\n into \r\r\n on Windows) ran nowhere. Only those two cases run here, to protect the
+      #   45-minute release gate (this job took 38.0 min at 2cbf9e38, run 41774134595).
+      # · Shell bash (Git Bash). `python` is the 3.12 from 'Setup Python 3.12' above, the pin every python step of this job
+      #   uses. Repo-relative forward-slash path; output under $RUNNER_TEMP; PYTHONUTF8=1 comes from the job env.
+      # · Red, never silent: pass only if rc 0, `Ran 2`, the result line is exactly `OK` (a skip prints `OK (skipped=1)`)
+      #   and both case ids appear as started case lines of class Revert (`^<case id> \(__main__\.Revert[.)]`: 3.9 prints
+      #   `(__main__.Revert)`, 3.12 `(__main__.Revert.<id>)`; a load failure prints `(unittest.loader._FailedTest)` and does
+      #   not count). A missing file, an import error, a skip, an expected failure or a failed subtest is red. r2fix B1b:
+      #   the verdict is not read from a case line's end, because stderr is merged (2>&1) and a warning printed while a
+      #   case runs lands between ` ... ` and `ok`. Python writes
+      #   \r\n on Windows, so the output is read after `tr -d '\r'`.
+      # · Position: last of the blocking steps, after the UI step, so a red here skips none of the job's diagnostics.
+      # · Time: macOS 3.9.6 sealed, the two cases Ran 2 in 2.83 s with T-11m skipped (T-11m = 2 subtests, each one store
+      #   and one revert, about the CRLF cell's cost). Windows time UNMEASURED [estimate: under a minute]; limit 4 min.
+      #   Budget table (hwmon step header): realistic worst about +1 min; theoretical worst +4 min (already over both caps,
+      #   as recorded there).
+      # ★No `if:` and no `continue-on-error` (blocking, design 6.6). This job is still not in the lane gate's SUBSET_LANES
+      #   (header note above; T-13w already calls a test file directly): a head decision recorded in REPORT-F58-r1fix.
+      - name: F58 T-11m held index and entry + CRLF index cell (Windows blocking)
+        timeout-minutes: 4
+        shell: bash
+        run: |
+          set -uo pipefail
+          raw="${RUNNER_TEMP:-/tmp}/t11m.raw"; out="${RUNNER_TEMP:-/tmp}/t11m.out"
+          python -c "import os, sys; print('[t11m] python', sys.version.split()[0], 'os.name', os.name)"
+          python cysjavis-pack/bin/tests/test_f58_learning_loop.py \
+            Revert.test_11m_windows_held_index_and_entry Revert.test_crlf_index_keeps_every_other_byte > "$raw" 2>&1
+          rc=$?
+          tr -d '\r' < "$raw" > "$out"
+          sed 's/^/[t11m]   | /' "$out"
+          ran=$(grep -Eo '^Ran [0-9]+ test' "$out" | grep -Eo '[0-9]+' | tail -n 1)
+          res=$(grep -E '^(OK|FAILED)' "$out" | tail -n 1)
+          m=$(grep -cE '^test_11m_windows_held_index_and_entry \(__main__\.Revert[.)]' "$out")
+          c=$(grep -cE '^test_crlf_index_keeps_every_other_byte \(__main__\.Revert[.)]' "$out")
+          echo "[t11m] RESULT rc=$rc ran=${ran:-0} t11m_started=$m crlf_started=$c ${res:-no-result-line}"
+          if [ "$rc" = 0 ] && [ "${ran:-0}" = 2 ] && [ "$res" = OK ] && [ "$m" -ge 1 ] && [ "$c" -ge 1 ]; then
+            echo "::notice title=F58 T-11m::T-11m (held index, held entry) and the CRLF index cell passed on Windows"
+          else
+            echo "::error title=F58 T-11m::T-11m or the CRLF index cell did not pass on Windows: rc=$rc ran=${ran:-0} t11m_started=$m crlf_started=$c ${res:-no-result-line}"
+            exit 1
+          fi
 
       - name: 결과 업로드 (기계 판독 JSON)
         if: always()

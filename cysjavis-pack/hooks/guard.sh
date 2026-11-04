@@ -932,7 +932,7 @@ def loose_deny(n, n_slash=""):
             p, a = l_cmd_word(s); seg_progs.add(p)
             if p == "sed" and any(x == "-i" or x.startswith("-i") for x in a): sed_inplace = True
         if (">" in alltoks) or (seg_progs & writers) or sed_inplace:
-            return "헌법파일 쓰기/덮어쓰기 차단(soul·CLAUDE·*_DIRECTIVE). 변경 불가"
+            return "헌법파일(soul·CLAUDE·*_DIRECTIVE)은 Bash 로 쓰지 않는다 — 이 판정은 명령 안의 파일 이름과 쓰기 기호만 보고 실제로 어느 파일에 쓰는지는 가리지 못한다(읽기만 하려면 Read 도구로 읽는다). 사용자가 직접 시킨 편집이면 Write/Edit 도구로 고친다(인가 방법은 그 도구의 보류 문구가 알려 준다)"
     return None
 
 # ================= 메인 =================
@@ -1010,7 +1010,7 @@ if tool in WRITE_TOOLS and file_path:
         if CONST_AUTH and (("*" in _scope_toks) or (basename(file_path).lower() in _scope_toks)):
             sys.stderr.write("AUTOPILOT GUARD: 헌법편집 인가됨(주인님 직접명령 토큰·%s)\n" % basename(file_path))
         else:
-            out_deny("헌법파일(%s) %s 차단. 변경 불가 (주인님 직접명령 인가토큰 CONSTITUTION_EDIT_AUTHORIZED 필요)" % (basename(file_path), tool))
+            out_deny("헌법파일(%s) %s 보류 — 사용자가 직접 시킨 편집이면: 먼저 원본을 <파일>.pre-ss-<UTC> 로 백업하고, 팩의 hooks 폴더(guard.sh 와 같은 폴더)에 CONSTITUTION_EDIT_AUTHORIZED 파일을 Write 도구로 만들어 첫 줄에 이 파일 이름을 쓴 뒤 다시 편집한다(30분 유효 · 자율주행 중에는 열리지 않는다). 끝나면 그 인가 파일을 Write 도구로 비운다(빈 파일 = 인가 없음). 자기 판단만으로는 만들지 않는다" % (basename(file_path), tool))
     if ACTIVE and guard_infra(file_path):   # 잔여3: STRICT trust boundary
         out_deny("[STRICT] guard 인프라(%s) %s 차단(자기보호 trust boundary)" % (basename(file_path), tool))
 
@@ -1025,7 +1025,9 @@ GUARD_ACTIVE=0; [ -e "$ACTIVE_FILE" ] && GUARD_ACTIVE=1
 GUARD_CONST_AUTH=0; GUARD_CONST_SCOPE=""
 CONST_TOKEN="$SCRIPT_DIR/CONSTITUTION_EDIT_AUTHORIZED"
 if [ "$GUARD_ACTIVE" != "1" ] && [ -f "$CONST_TOKEN" ] && [ ! -L "$CONST_TOKEN" ]; then
-  _cnow=$(date +%s); _cmt=$(stat -f %m "$CONST_TOKEN" 2>/dev/null || stat -c %Y "$CONST_TOKEN" 2>/dev/null || echo 0)
+  _cnow=$(date +%s); _cmt=$(stat -f %m "$CONST_TOKEN" 2>/dev/null)
+  case "$_cmt" in ""|*[!0-9]*) _cmt=$(stat -c %Y "$CONST_TOKEN" 2>/dev/null) ;; esac
+  case "$_cmt" in ""|*[!0-9]*) _cmt=0 ;; esac
   if [ $(( _cnow - _cmt )) -le 1800 ]; then
     GUARD_CONST_AUTH=1; GUARD_CONST_SCOPE="$(cat "$CONST_TOKEN" 2>/dev/null)"
   fi
@@ -1045,7 +1047,7 @@ run_loose_backstop() {
     case "$low" in *"_round/autopilot/"*) : ;; *) emit_deny "백스톱: 파괴적 파일연산. 주인님 승인 필요" ;; esac
   fi
   case "$(basename "$fp" 2>/dev/null | tr 'A-Z' 'a-z')" in
-    soul.md|claude.md|*_directive.md) emit_deny "백스톱: 헌법파일 쓰기. 변경 불가" ;;
+    soul.md|claude.md|*_directive.md) emit_deny "백스톱: python 판정기를 돌리지 못해(python3·python·py 를 못 찾았거나 판정기 오류) 축소 모드다 — 이 모드에는 인가 경로가 없어 헌법파일(soul·CLAUDE·*_DIRECTIVE)에 닿는 호출을 도구를 가리지 않고 막는다. python3(또는 python·py)를 PATH 에 두거나 판정기 오류를 고친 뒤 다시 한다" ;;
   esac
   exit 0
 }

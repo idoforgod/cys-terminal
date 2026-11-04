@@ -13,17 +13,22 @@
     python3 javis_memory.py verify [--json] [--desc-strict]  # 색인↔파일 정합 + 훅↔description 대조
     python3 javis_memory.py update --name <slug> [--desc "..."] [--body "..."] [--keep-desc]  # 갱신(원자적·롤백)
                                                            # --body 는 --desc 또는 --keep-desc 없이 거부(exit 2)
+    python3 javis_memory.py remove --name <type>_<slug>.md --expect-sha <sha256> --expect-line "<색인 줄>"
+                                                           # F58 학습 항목 1건 되돌리기(휴지통 이동·삭제 아님)
     python3 javis_memory.py recent --minutes 1440 [--json] # 최근 증류 목록 (게이트 증거)
     python3 javis_memory.py --self-test                    # 결정론 자기검증 (preflight C18)
 
 공통 옵션: --dir <memory 디렉터리> (기본: $CYS_PACK_DIR/memory 또는 ~/.cys/pack/memory)
 
 종료 코드: 0 성공/정합 · 1 검증 실패 또는 self-test 실패 · 2 인자/입력 오류 · 3 잠금 또는 쓰기 실패
+  (remove: 3 = 잠금·입출력 실패로 아무것도 바뀌지 않음 · 4 ORPHAN = 항목은 제자리·색인 줄만 빠짐(복구 줄 출력)
+   · 7 REFUSED = 해시·색인 줄·학습 본문 검사 불일치, 아무것도 건드리지 않음)
 의존성: 파이썬 표준 라이브러리만 (네트워크·LLM 호출 없음).
 """
 
 import argparse
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -267,14 +272,22 @@ def cmd_add(mdir, args):
                 except OSError:
                     pass
                 return fail(3, "색인 갱신 실패(본문 롤백됨): %s" % e)
+            # F58: "path" and "sha256" (the entry bytes as written — CRLF on Windows included — read back
+            #   inside the lock) let a caller record exactly what it added; javis_learn store keeps them so
+            #   `remove` can refuse an entry that was edited later.
+            try:
+                with open(fpath, "rb") as f:
+                    added_sha = hashlib.sha256(f.read()).hexdigest()
+            except OSError:
+                added_sha = None
     except TimeoutError as e:
         return fail(3, str(e))
 
     print("distill-check(비차단): ①구글 5분 검색으로 얻을 수 있는 내용이면 저장 불요 "
           "②이 시스템 특정적인가 ③진짜 시행착오의 산물인가 — 아니면 삭제를 고려하라(W2-4)",
           file=sys.stderr)
-    print(json.dumps({"added": fname, "index_line": index_line.strip()},
-                     ensure_ascii=False))
+    print(json.dumps({"added": fname, "index_line": index_line.strip(), "path": fpath,
+                      "sha256": added_sha}, ensure_ascii=False))
     return 0
 
 
@@ -568,6 +581,183 @@ def cmd_update(mdir, args):
     if keep_desc:
         out["keep_desc"] = True
     print(json.dumps(out, ensure_ascii=False))
+    return 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# F58 (DESIGN-F58-final §6): `remove` — selective revert of ONE learning-loop entry under the same
+# MEMORY.md lock as add/update. Index first, then the entry moves to .learned-trash/<UTC>/ (never
+# deleted); every mismatch is a refusal (exit 7), every failure after a write is compensated.
+# Exit: 0 removed · 2 bad arguments · 3 lock/IO failure, nothing changed · 4 ORPHAN (entry in place,
+# line gone, restore failed — printed) · 7 REFUSED (a check did not match; nothing touched).
+# Residue (stated): a writer that ignores the lock can still change the entry between the second hash
+# and the rename; the 30 s stale-lock reclaim of FileLock applies here as it does to add/update.
+# ─────────────────────────────────────────────────────────────────────────────
+LEARN_BODY_KEYS = frozenset(("pattern", "state", "round", "verdict", "evidence_ref"))
+TRASH_DIR = ".learned-trash"
+
+
+def _write_bytes_atomic(path, data):
+    """Binary twin of _write_text_atomic: temp file in the same directory, fsync, os.replace.
+    Binary so an existing CRLF index stays CRLF (a text-mode write would make it CRCRLF on Windows)."""
+    d = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp-", suffix=".swap")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _make_trash_dir(path):
+    os.makedirs(path, exist_ok=True)
+
+
+def _move_entry(src, dst):
+    os.replace(src, dst)
+
+
+def _line_segments(data):
+    """Split bytes into lines that KEEP their ending; content = line without '\\n' and one '\\r'."""
+    segs, start = [], 0
+    while start < len(data):
+        j = data.find(b"\n", start)
+        if j < 0:
+            segs.append(data[start:])
+            break
+        segs.append(data[start:j + 1])
+        start = j + 1
+    return segs
+
+
+def _seg_content(seg):
+    if seg.endswith(b"\n"):
+        seg = seg[:-1]
+    if seg.endswith(b"\r"):
+        seg = seg[:-1]
+    return seg
+
+
+def index_without_line(index_bytes, line_bytes):
+    """(new bytes, matches) — removes the one whole line equal to line_bytes, with its own ending."""
+    segs = _line_segments(index_bytes)
+    hits = [i for i, s in enumerate(segs) if _seg_content(s) == line_bytes]
+    if len(hits) != 1:
+        return None, len(hits)
+    return b"".join(s for i, s in enumerate(segs) if i != hits[0]), 1
+
+
+def is_learning_body(entry_bytes):
+    """True when the entry's body (after the frontmatter) is the JSON object javis_learn store writes."""
+    try:
+        text = entry_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    if not text.startswith("---"):
+        return False
+    end = text.find("\n---", 3)
+    if end < 0:
+        return False
+    nl = text.find("\n", end + 4)
+    body = text[nl + 1:] if nl >= 0 else ""
+    try:
+        obj = json.loads(body.strip())
+    except ValueError:
+        return False
+    return isinstance(obj, dict) and set(obj) == LEARN_BODY_KEYS
+
+
+def cmd_remove(mdir, args):
+    name = args.name or ""
+    if (not name.endswith(".md") or name == INDEX_FILE or name.startswith(".")
+            or os.path.basename(name) != name or "\\" in name):
+        return fail(2, "--name 은 memory 디렉터리 안의 항목 파일 이름(<type>_<slug>.md)이어야 한다: %r" % name)
+    if not re.match(r"^[0-9a-f]{64}$", args.expect_sha or ""):
+        return fail(2, "--expect-sha 는 64자리 소문자 hex 여야 한다")
+    line_bytes = (args.expect_line or "").encode("utf-8")
+    if not line_bytes or b"\n" in line_bytes or b"\r" in line_bytes:
+        return fail(2, "--expect-line 은 줄바꿈 없는 색인 한 줄이어야 한다")
+    index_path = os.path.join(mdir, INDEX_FILE)
+    fpath = os.path.join(mdir, name)
+    try:
+        with FileLock(index_path):
+            # step 2 — every check before any write; a mismatch is a refusal, never a guess
+            try:
+                with open(index_path, "rb") as f:
+                    old_index = f.read()
+            except OSError as e:
+                return fail(7, "REFUSED index unreadable: %s" % e)
+            try:
+                old_index.decode("utf-8")
+            except UnicodeDecodeError:
+                return fail(7, "REFUSED index is not UTF-8")
+            new_index, hits = index_without_line(old_index, line_bytes)
+            if new_index is None:
+                return fail(7, "REFUSED index line occurs %d times (want exactly 1): %s" % (hits, args.expect_line))
+            try:
+                with open(fpath, "rb") as f:
+                    entry = f.read()
+            except OSError as e:
+                return fail(7, "REFUSED entry missing or unreadable: %s (%s)" % (name, e))
+            got = hashlib.sha256(entry).hexdigest()
+            if got != args.expect_sha:
+                return fail(7, "REFUSED entry sha256 differs: expected %s, file %s (a later edit wins)"
+                            % (args.expect_sha, got))
+            if not is_learning_body(entry):
+                return fail(7, "REFUSED not a learning-loop entry (body is not the store JSON object): %s" % name)
+            # step 3
+            stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+            tdir = os.path.join(mdir, TRASH_DIR, stamp)
+            created = not os.path.isdir(tdir)
+            try:
+                _make_trash_dir(tdir)
+            except OSError as e:
+                return fail(3, "trash folder not created, nothing changed: %s" % e)
+
+            def _drop_empty_trash():
+                if created:
+                    try:
+                        os.rmdir(tdir)
+                    except OSError:
+                        pass
+            # step 4 — index first: a held index fails here, before anything moved
+            try:
+                _write_bytes_atomic(index_path, new_index)
+            except OSError as e:
+                _drop_empty_trash()
+                return fail(3, "index not rewritten, nothing changed: %s" % e)
+            # step 5 — second hash, then the move; any failure restores the old index bytes
+            dst = os.path.join(tdir, name)
+            try:
+                with open(fpath, "rb") as f:
+                    again = hashlib.sha256(f.read()).hexdigest()
+                if again != args.expect_sha:
+                    raise ValueError("entry changed between the checks: %s" % again)
+                if os.path.exists(dst):
+                    raise OSError("trash file already exists: %s" % dst)
+                _move_entry(fpath, dst)
+            except (OSError, ValueError) as e:
+                try:
+                    _write_bytes_atomic(index_path, old_index)
+                except OSError as e2:
+                    print(json.dumps({"orphan": fpath, "restore_line": args.expect_line}, ensure_ascii=False))
+                    return fail(4, "ORPHAN entry %s is in place but no longer indexed (move failed: %s; "
+                                   "index restore failed: %s) — add this line back to %s: %s"
+                                % (fpath, e, e2, index_path, args.expect_line))
+                _drop_empty_trash()
+                code = 7 if isinstance(e, ValueError) else 3
+                return fail(code, ("REFUSED " if code == 7 else "") + "entry not moved, index restored: %s" % e)
+    except TimeoutError as e:
+        return fail(3, str(e))
+    print(json.dumps({"removed": name, "trash": dst, "sha256": args.expect_sha,
+                      "index_line": args.expect_line}, ensure_ascii=False))
     return 0
 
 
@@ -990,6 +1180,12 @@ def main():
     u.add_argument("--keep-desc", action="store_true",
                    help="설명이 그대로 맞다고 명시하고 본문만 고친다(시도 기록이 %s 에 남는다)" % UPDATE_LOG)
 
+    rm = sub.add_parser("remove", help="F58 학습 루프 항목 1건 되돌리기 — 기록된 해시·색인 줄이 맞을 때만 "
+                                       "색인 줄을 지우고 항목을 .learned-trash/<UTC>/ 로 옮긴다(삭제 아님)")
+    rm.add_argument("--name", required=True, help="항목 파일 이름(<type>_<slug>.md)")
+    rm.add_argument("--expect-sha", dest="expect_sha", required=True, help="항목 파일 sha256(저장 직후 기록값)")
+    rm.add_argument("--expect-line", dest="expect_line", required=True, help="정확한 색인 한 줄(줄바꿈 제외)")
+
     r = sub.add_parser("recent", help="최근 N분 내 증류 목록 (게이트 증거)")
     r.add_argument("--minutes", type=int, default=1440)
     r.add_argument("--json", action="store_true")
@@ -1018,6 +1214,8 @@ def main():
         return cmd_verify(mdir, args.json, getattr(args, "desc_strict", False))
     if args.cmd == "update":
         return cmd_update(mdir, args)
+    if args.cmd == "remove":
+        return cmd_remove(mdir, args)
     if args.cmd == "recent":
         return cmd_recent(mdir, args.minutes, args.json)
     if args.cmd == "health":

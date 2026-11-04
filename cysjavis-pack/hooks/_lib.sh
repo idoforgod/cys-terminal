@@ -1086,6 +1086,64 @@ cys_start_gate_note() {      # stdout: 착수 게이트 1줄(개행 없음) — 
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 9-b. F58 셀프 서비스 블록 (0.14.57 · DESIGN-F58 r1 C2-a, r2 §5.4·§7.3, final §7.2)
+# ─────────────────────────────────────────────────────────────────────────────
+# 사용자 자비스가 자기 문제를 스스로 고치게 하는 문안의 **단일 원본**이다. 지침·soul 은 사용자 소유라
+# 팩 갱신이 기존 설치에 닿지 않으므로(src/pack.rs Ownership::User), 팩 소유(System) 훅이 이 블록을 싣는다.
+# 소비처: session-start.sh(지침 읽기 안내·로컬 지침·soul·기억 색인 뒤, U16 앞) · inject-context.sh(post
+# 단계 끝). ★두 훅 출력은 기존 설치에서 1만 자를 넘어 파일로 빠지고 모델은 앞 약 2,000자 미리보기만 본다 —
+# 그래서 고정 5줄(cys_self_service_rules · 단일 원본)을 session-start.sh 가 읽기 안내 줄 바로 뒤(와 역할 미상
+# 갈래 끝)에 한 번 더 낸다(cys_self_service_early · F58-PLACE r2). 미리보기에서 모델이 읽는 사본은 그 앞 사본이고,
+# 끝 블록은 N 줄(정정 건수 · 상한 5초 조회)까지 든 전문이다. 끝 블록의 바이트는 이 분리로 바뀌지 않는다.
+# 계약: ⓐ 정정 문안 0 — 마지막 줄은 정정 목록을 읽는 명령 안내다(r2 §5.4) ⓑ 블록 전체 ≤ 1,600 B(최악:
+#   보류 줄 3개) ⓒ 백슬래시 0(inject-context 는 printf '%b' 로 낸다) ⓓ N 은 같은 도구가 상한 5초 안에서
+#   낸다 — 실패·타임아웃·역할 미상·해석기 부재면 N 없이 안내 줄만 낸다(fail-open: 세션은 시작된다)
+#   ⓔ 항상 rc 0 · stdout 만 ⓕ 사용자 파일에 아무것도 쓰지 않는다(도구도 읽기 전용).
+cys_self_service_rules() {   # $1=머리 표지(■ 끝 블록 · ▶ 앞 사본) · stdout: 블록의 고정 5줄(단일 원본 · F58-PLACE r2)
+  printf '%s\n' "$1 셀프 서비스(F58): 자비스 스스로 모든 문제를 해결하고, 버그를 고치고, 새로운 기능을 만들게 해 주는 능력을 허락해 주는 기능이다."
+  printf '%s\n' "- 첫 대답: 「우리가 직접 고칠 수 있습니다. 먼저 <할 일> 하겠습니다.」 — 사용자 공간에 고칠 길이 없을 때만 「우리가 직접 할 수 있는 것부터 하겠습니다: <할 일>.」 · 고치지 않은 것을 고쳤다고 하지 않는다."
+  printf '%s\n' "- 절차: cys skill show self-service · 경계: 설정·사용자 소유 파일·스킬·도구·작업 폴더는 고친다 / 제품 실행 파일·내장 팩·trusted-keys.json 은 고치지 않는다."
+  printf '%s\n' "- 사용자에게 한 번 묻고 한다: 돈 · 사용자 자료의 되돌릴 수 없는 손실 · 공개 쓰기(git push·발송·발행·제조사 보고)."
+  printf '%s\n' "- 제조사 보고는 마지막 단계 — javis_selfservice.py report 로만."
+  return 0
+}
+
+cys_self_service_early() {   # session-start 앞 사본(F58-PLACE r2): 고정 5줄 + 끝 안내 1줄 · 도구·하위 프로세스 0 · rc 0 · 쓰기 0
+  cys_self_service_rules "▶"
+  printf '%s\n' "- 정정 건수·읽기 명령: 훅 출력 뒤쪽의 셀프 서비스(F58) 블록(파일로 빠졌으면 그 파일 뒤쪽)."
+  return 0
+}
+
+cys_self_service_note() {    # $1=역할 원문(CYS_ROLE) · stdout: 블록(마지막 줄 개행 포함)
+  _ss_role=""
+  case "${1-}" in
+    master) _ss_role=master ;;
+    worker*) _ss_role=worker ;;
+    cso*) _ss_role=cso ;;
+    reviewer*) _ss_role=reviewer ;;
+  esac
+  _ss_tool="${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_selfservice.py"
+  _ss_n=""; _ss_held=""
+  if [ -n "$_ss_role" ] && [ -n "${CYS_PY:-}" ] && [ -f "$_ss_tool" ]; then
+    _ss_out=$(cys_timeout_run 5 "$CYS_PY" -B "$_ss_tool" corrections --role "$_ss_role" --summary </dev/null 2>/dev/null) \
+      || _ss_out=""
+    _ss_n=$(printf '%s\n' "$_ss_out" | head -n 1 | tr -d '\r')
+    case "$_ss_n" in ''|*[!0-9]*) _ss_n=""; _ss_out="" ;; esac
+    _ss_held=$(printf '%s\n' "$_ss_out" | sed -n '2,4p' | tr -d '\r\\')
+  fi
+  cys_self_service_rules "■"
+  # 안내 줄은 r2 §5.4 문면 그대로다(`$CYS_PACK_DIR` 는 글자 그대로 낸다 — 홑따옴표 조각).
+  _ss_cmd='`python3 "$CYS_PACK_DIR/bin/javis_selfservice.py" corrections --role '"${_ss_role:-<ROLE>}"'`'
+  if [ -n "$_ss_n" ]; then
+    printf '%s\n' "- 제조사 기본값 정정 ${_ss_n}건(이 역할) — 읽기: ${_ss_cmd} · 사용자 지침이 우선"
+  else
+    printf '%s\n' "- 제조사 기본값 정정(이 역할) — 읽기: ${_ss_cmd} · 사용자 지침이 우선"
+  fi
+  [ -n "$_ss_held" ] && printf '%s\n' "$_ss_held" | sed 's/^/  /'
+  return 0
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 로드 시 자동 적용 (부작용 없음·stdout 무출력)
 # ─────────────────────────────────────────────────────────────────────────────
 # inject-context's controller loads definitions only. Its owned phase performs

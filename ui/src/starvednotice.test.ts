@@ -39,7 +39,7 @@ const BIDI = String.fromCharCode(0x202e); // 오른쪽→왼쪽 덮어쓰기
 const ZWSP = String.fromCharCode(0x200b); // 제로폭 공백
 const NUL = String.fromCharCode(0);
 /** 데몬이 모든 remedy 끝에 붙이는 꼬리 — 현재 문면(리뷰 반영: 동결 해제·항목 삭제가 금지 목록에 더해졌다). 앞부분 ` · LLM 에이전트는 자동 조치` 는 그대로다. */
-const TAIL = " · LLM 에이전트는 자동 조치(강제 배달·드레인·키 주입·동결 해제·항목 삭제) 금지";
+const TAIL = " · LLM 에이전트는 자동 조치(remedy 대로 단건 revive·deliver)를 한다 — 사용자 지침이 막으면 따르고, 드레인·항목 삭제·동결 해제·사람 글에 닿는 키는 사용자에게 한 번 묻는다"; // F58 T1-04
 /** 앞선 빌드(0.14.43 C5 첫 커밋)의 꼬리 문면 — 구버전 데몬이 보낼 수 있다. */
 const TAIL_V1 = " · LLM 에이전트는 자동 조치(강제 배달·드레인·키 주입) 금지";
 const REMEDY_BODY = "입력줄은 비어 보이는데 미제출 계수가 남았다(유령 계수) — 사람이 그 창을 클릭하고 Ctrl-U 한 번(약 30초 뒤 배달 재개)";

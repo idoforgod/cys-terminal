@@ -438,6 +438,15 @@ jobs:
                   "ci-branch run at the tag SHA, and docs/RELEASE.md section 0-C makes that check mandatory (rc 0) - so a release or "
                   "pack-release entry would only repeat the same verdict on the same SHA.",
               ),
+              "test_f58_readonly_check": (
+                  {"ci-branch"},
+                  "scripts/tests/ suite (not a pack suite; 0.14.57 F58 U4). Controls for scripts/f58_readonly_check.py, the T-6 "
+                  "read-only predicate of DESIGN-F58-final section 7.4 (an eval instrument read by the rig window, not shipped: "
+                  "build.rs embeds cysjavis-pack only), and fact checks of the shipped skill cysjavis-pack/skills/self-service "
+                  "against javis_selfservice.py and _lib.sh. It reads repository files only. ci-branch is the gate before a tag "
+                  "(pre-tag-ci-check.py requires a successful ci-branch run at the tag SHA), so a release or pack-release entry "
+                  "would only repeat the same verdict on the same SHA.",
+              ),
           }
           # (2026-08-12 편입 완료: test_bootstrap_chain 을 3레인 전부에 배선 — 위계 폴백의 유일
           #  회귀 핀 세트가 CI 0회 실행이던 격차를 봉합. ALLOWED 예외도 함께 제거 — 대칭이 정본.)
@@ -1090,6 +1099,11 @@ jobs:
                    test_trust_seed test_capgate_registration test_capgate_hook_shell \
                    test_cso_directive_rev test_role_authority test_role_authority_shell \
                    test_role_authority_triage \
+                   test_f58_corrections_manifest \
+                   test_f58_learning_loop \
+                   test_f58_selfservice_case \
+                   test_f58_corrections_channel \
+                   test_f58_guard_rows \
                    test_round_stop_reason test_resource_gate test_resource_gate_fleet_cpu test_resource_gate_product_cpu \
                    test_inject_context_role_seat test_inject_context_soul_l0 test_inject_context_owned_cwd test_carry_unproven_scope \
                    test_wp18_skillscan_failopen test_owned_process test_pkg3a_owned_tools \
@@ -1684,6 +1698,15 @@ jobs:
           echo "== test_check_wallclock_premise (mac) =="
           python3 "$f"
 
+      - name: F58 T-6 read-only checker controls (design cases · paired controls · skill facts · macOS)
+        shell: bash
+        run: |
+          set -euo pipefail
+          f="scripts/tests/test_f58_readonly_check.py"
+          [ -f "$f" ] || { echo "test file missing: $f (git add?)" >&2; exit 1; }
+          echo "== test_f58_readonly_check (mac) =="
+          python3 "$f"
+
       # ★T6(v2 §12 이월 · merge3 CI 편입): cargo test --lib 완전 레인(macOS). 병합 엔진
       #   (merge3 golden 15종)과 pack 판정·실행부 스위트가 **브랜치 push 마다** 도는 유일한
       #   완전 --lib 레인이다 — release.yml 은 태그 시점(Windows 레그는 필터 3종), 여기는 조기
@@ -1961,6 +1984,11 @@ jobs:
                    test_trust_seed test_capgate_registration test_capgate_hook_shell \
                    test_cso_directive_rev test_role_authority test_role_authority_shell \
                    test_role_authority_triage \
+                   test_f58_corrections_manifest \
+                   test_f58_learning_loop \
+                   test_f58_selfservice_case \
+                   test_f58_corrections_channel \
+                   test_f58_guard_rows \
                    test_round_stop_reason test_resource_gate test_resource_gate_fleet_cpu test_resource_gate_product_cpu \
                    test_inject_context_role_seat test_inject_context_soul_l0 test_inject_context_owned_cwd test_carry_unproven_scope \
                    test_wp18_skillscan_failopen test_owned_process test_pkg3a_owned_tools \

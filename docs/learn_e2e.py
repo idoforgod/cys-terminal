@@ -83,14 +83,15 @@ def main():
     check("validate_pattern 필드 누락 거부",
           not m.validate_pattern({"domain": "d"}, None)["ok"])
 
-    ok1, _ = m.promotion_allowed("improved", True, False, "confirmed")
-    ok2, _ = m.promotion_allowed("improved", True, True, "confirmed")
-    ok3, _ = m.promotion_allowed("flat", True, False, "provisional")
-    ok4, _ = m.promotion_allowed("improved", False, False, "provisional")
-    check("promotion_allowed improved+approved allow", ok1)
+    # F58: promotion_allowed 는 승인 플래그를 읽지 않는다(플래그가 없다) — 무엇을 쓸지는 닫힌 모양 검출기가 정한다.
+    ok1, _ = m.promotion_allowed("improved", False, "confirmed")
+    ok2, _ = m.promotion_allowed("improved", True, "confirmed")
+    ok3, _ = m.promotion_allowed("flat", False, "provisional")
+    check("promotion_allowed improved allow(승인 플래그 없음)", ok1)
     check("promotion_allowed fallback+confirmed 차단", not ok2)
     check("promotion_allowed verdict非improved 차단", not ok3)
-    check("promotion_allowed 무승인 차단", not ok4)
+    check("F58 닫힌 모양 검출기: 명령 낱말이면 보류 이유",
+          bool(m.string_problems("curl the archive")) and not m.string_problems("keep the cache folder"))
     check("slugify 슬러그 안전화", m.slugify("CSS @layer 전파!") .replace("-", "").isalnum())
 
     # ── (2) 정상 경로 (격리 git repo) ──
@@ -119,7 +120,7 @@ def main():
         gi_prov = os.path.join(d, "gi_prov.json")
         write(gi_prov, {
             "human_signed": False, "producer_model_family": "claude",
-            "target_paths": ["docs/x.md"], "operations": [],
+            "target_paths": [], "operations": [],
             "dimensions": {"source": {"fetch_log": True, "canonical": False, "distinct_sources": 1},
                            "fact_check": {"cross_checked": True},
                            "evidence": {"quote": "", "context_entailment": "support"},
@@ -149,7 +150,8 @@ def main():
                                                              "snapshot_sha256": sha, "summary": "실패 사례"}]}})
 
         r = run_learn(["propose", "--reason", "ceiling", "--topic", "T"], d)
-        check("propose 0", r.returncode == 0 and "awaiting_approval" in r.stdout, r.stderr)
+        check("propose 0(F58: status recorded · 승인 대기 없음)", r.returncode == 0 and '"recorded"' in r.stdout
+              and "awaiting_approval" not in r.stdout, r.stderr)
 
         r = run_learn(["search", "--topic", "T", "--candidates", cand_path, "--json"], d)
         check("search 정상 0", r.returncode == 0, r.stderr)
@@ -164,16 +166,22 @@ def main():
         check("evaluate progress improved(→javis_rsi) ", improved, r.stdout + r.stderr)
 
         r = run_learn(["store", "--round", "R1", "--pattern", pat_path, "--type", "reference",
-                       "--approved", "--state", "provisional", "--gate-input", gi_prov,
-                       "--name", "rsi-e2e-x", "--json"], d)
+                       "--state", "provisional", "--gate-input", gi_prov,
+                       "--name", "e2e-x", "--json"], d)
         check("store provisional+gate통과(→javis_memory) 0", r.returncode == 0, r.stdout + r.stderr)
         check("store가 memory 파일 생성",
-              os.path.exists(os.path.join(d, "pack", "memory", "reference_rsi-e2e-x.md")), r.stderr)
+              os.path.exists(os.path.join(d, "pack", "memory", "reference_e2e-x.md")), r.stderr)
 
         r = run_learn(["store", "--round", "R1", "--pattern", pat_v2_path, "--type", "reference",
-                       "--approved", "--state", "confirmed", "--gate-input", gi_conf,
-                       "--name", "rsi-e2e-conf", "--json"], d)
-        check("store confirmed+full gate통과 0", r.returncode == 0, r.stdout + r.stderr)
+                       "--state", "confirmed", "--gate-input", gi_conf,
+                       "--name", "e2e-conf", "--json"], d)
+        check("F58 store confirmed=보류(rc8 · 게이트 미실행 · 기억 무기록)",
+              r.returncode == 8 and '"not_run"' in r.stdout
+              and not os.path.exists(os.path.join(d, "pack", "memory", "reference_e2e-conf.md")), r.stdout + r.stderr)
+        r = run_learn(["store", "--round", "R1", "--pattern", pat_path, "--type", "reference",
+                       "--approved", "--gate-input", gi_prov, "--name", "e2e-fake"], d)
+        check("F58 store --approved=argparse 오류(rc2 · 승인 위조 불가)",
+              r.returncode == 2 and "--approved" in r.stderr, r.stderr)
 
         r = run_learn(["harness", "--round", "R1", "--pattern", pat_path, "--gate-input", gi_prov, "--json"], d)
         check("harness keep(improved)+gate통과 0", r.returncode == 0 and '"retention": "keep"' in r.stdout, r.stderr)
@@ -205,30 +213,30 @@ def main():
         check("extract 정박 실패 거부(rc2)", r.returncode == 2, r.stdout)
 
         r = run_learn(["store", "--round", "R1", "--pattern", pat_path, "--type", "reference",
-                       "--state", "provisional"], d)  # 무승인
-        check("store 무승인 거부(rc2)", r.returncode == 2, r.stdout)
+                       "--state", "provisional"], d)  # gate-input 없음
+        check("store gate-input 없이 거부(rc2)", r.returncode == 2, r.stdout)
 
         r = run_learn(["store", "--round", "R1", "--pattern", pat_path, "--type", "reference",
-                       "--approved", "--state", "confirmed", "--fallback"], d)
+                       "--state", "confirmed", "--fallback"], d)
         check("store fallback+confirmed 차단(rc2)", r.returncode == 2, r.stdout)
 
         # verdict非improved 라운드
         run_learn(["evaluate", "--round", "R2", "--score", "0.90", "--baseline"], d)
         run_learn(["evaluate", "--round", "R2", "--score", "0.80"], d)  # regressed
         r = run_learn(["store", "--round", "R2", "--pattern", pat_path, "--type", "reference",
-                       "--approved", "--gate-input", gi_prov], d)
+                       "--gate-input", gi_prov], d)
         check("store verdict非improved 거부(rc2)", r.returncode == 2, r.stdout)
 
         # ★통합 우회 차단(codex BLOCK 핵심): gate 없이/미통과 confirmed store·harness 불가.
         r = run_learn(["store", "--round", "R1", "--pattern", pat_path, "--type", "reference",
-                       "--approved", "--state", "confirmed", "--name", "rsi-nogate"], d)  # gate-input 없음
+                       "--state", "confirmed", "--name", "rsi-nogate"], d)  # gate-input 없음
         check("★store confirmed gate-input 없이 거부(우회차단·rc2)", r.returncode == 2, r.stdout + r.stderr)
 
         gi_conf_nosnap = os.path.join(d, "gi_conf_nosnap.json")
         bundle = json.load(open(gi_conf)); bundle.pop("snapshot")
         write(gi_conf_nosnap, bundle)
         r = run_learn(["store", "--round", "R1", "--pattern", pat_path, "--type", "reference",
-                       "--approved", "--state", "confirmed", "--gate-input", gi_conf_nosnap,
+                       "--state", "confirmed", "--gate-input", gi_conf_nosnap,
                        "--name", "rsi-nosnap"], d)
         check("★store confirmed 미통과 gate(snapshot 누락) 거부(rc2)", r.returncode == 2, r.stdout + r.stderr)
 
@@ -238,7 +246,7 @@ def main():
                               {"dimension": "logic", "model_family": "claude", "verdict": "PASS"}]
         write(gi_commonmode, bundle)
         r = run_learn(["store", "--round", "R1", "--pattern", pat_path, "--type", "reference",
-                       "--approved", "--state", "confirmed", "--gate-input", gi_commonmode,
+                       "--state", "confirmed", "--gate-input", gi_commonmode,
                        "--name", "rsi-cm"], d)
         check("★store 통합: gate DENY(공통모드) 시 store 거부(rc2)", r.returncode == 2, r.stdout + r.stderr)
 
@@ -341,14 +349,13 @@ def main():
                   "evidence_ref": "https://w3.org/spec",
                   "behavioral_claim": "관찰 가능 행동", "falsifier": "반증 관측 조건",
                   "maturity": {"first_seen": "2024-05-01", "adoption_evidence": "3개 조직",
-                               "known_failures": [{"source_url": "https://ex.org/pm",
-                                                   "snapshot_sha256": sha_a, "summary": "실패 사례"}]}}
+                               "known_failures": []}}  # F58 §4.2: URL 은 인용 자리 밖이면 보류 → 빈 목록
         pv2_path = os.path.join(d, "pat_v2.json")
         write(pv2_path, pat_v2)
         gi_prov2 = os.path.join(d, "gi_prov2.json")
         write(gi_prov2, {
             "human_signed": False, "producer_model_family": "claude",
-            "target_paths": ["docs/x.md"], "operations": [],
+            "target_paths": [], "operations": [],
             "dimensions": {"source": {"fetch_log": True, "canonical": False, "distinct_sources": 1},
                            "fact_check": {"cross_checked": True},
                            "evidence": {"quote": "", "context_entailment": "support"},
@@ -360,17 +367,17 @@ def main():
         run_learn(["evaluate", "--round", "V2R", "--score", "0.90", "--baseline"], d)
         run_learn(["evaluate", "--round", "V2R", "--score", "0.95"], d)
         mark = os.path.join(d, "impl.md")
-        open(mark, "w", encoding="utf-8").write("반영 문서\n<!-- learn:rsi-v2-smoke -->\n")
+        open(mark, "w", encoding="utf-8").write("반영 문서\n<!-- learn:v2-smoke -->\n")
         r = run_learn(["store", "--round", "V2R", "--pattern", pv2_path, "--type", "reference",
-                       "--approved", "--gate-input", gi_prov2, "--refs", mark,
-                       "--name", "rsi-v2-smoke", "--json"], d)
+                       "--gate-input", gi_prov2, "--refs", mark,
+                       "--name", "v2-smoke", "--json"], d)
         check("v2 store(pattern v2+refs 마커) 정상", r.returncode == 0, r.stdout + r.stderr)
         check("v2 store 레코드 TTL(expires) 기록", '"expires"' in r.stdout, r.stdout[:300])
 
         bad_ev = os.path.join(d, "bad_ev.json")
-        write(bad_ev, {"id": "rsi-v2-smoke", "reason": "r",
+        write(bad_ev, {"id": "v2-smoke", "reason": "r",
                        "evidence": [{"source_url": "https://e/x", "quote": "q"}]})  # 해시 부재
-        r = run_learn(["challenge", "--id", "rsi-v2-smoke", "--evidence", bad_ev], d)
+        r = run_learn(["challenge", "--id", "v2-smoke", "--evidence", bad_ev], d)
         check("v2 challenge 프리스크린 거부(rc4)", r.returncode == 4, f"rc={r.returncode}")
 
         r = run_learn(["audit", "--json"], d)
