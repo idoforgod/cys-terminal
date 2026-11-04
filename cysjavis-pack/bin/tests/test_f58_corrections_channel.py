@@ -723,7 +723,7 @@ class Hooks(Base):
         dt = time.time() - t0
         self.assertEqual(rc, 0)
         self.assertEqual(POINTER_RE.findall(out), [("", "worker")])
-        self.assertLess(dt, 45, "the N call is bounded (5 s cap), took %.1f s" % dt)
+        self.assertLess(dt, 45, "the N call is bounded (5 s cap), took %.1f s" % dt)  # wallclock: guard 45 s is 9x the 5 s cap under test and the stub sleeps 60 s; expiry means the N call is unbounded
 
 
 if __name__ == "__main__":
