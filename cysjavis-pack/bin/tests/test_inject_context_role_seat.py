@@ -148,6 +148,10 @@ BASE_REF = "126cfdd0"          # v0.14.40 — U13 이전 트리(lead 바이트 �
 #   핀도 같이 고치는 변경이면) BASE_REF 를 그 변경이 들어간 커밋으로 올린다 — 문자열 핀(12a)
 #   과 바이트 대조(12c)가 같은 순간에 갱신돼야 한다. 통합 단계에서 형제 WP(C3·E 등)와
 #   교차 실행해 이 트리에서 SKIP 이 아니라 실제로 도는지 확인할 것(로컬 전용 집행 — 남은 문제).
+#   ★F58(0.14.57): lead 출력 **끝**에 셀프 서비스 블록(단일 원본 `_lib.sh:cys_self_service_note` · 설계상 전 역할)이
+#   붙는다. 12c 는 기준을 옮기지 않고 그 블록 1벌을 출력 끝에서만 걷어낸 뒤 대조한다(without_ss_block). 기준을 올리는
+#   길은 실측으로 막혔다: old_hooks 는 훅 3파일만 복원하는데, 19dfe13b 의 inject-context.sh 는 그 셋만으로는 owned
+#   executor 를 못 찾아 'restoration degraded' 갈래로 출력이 갈린다(126cfdd0 의 훅은 그 셋으로 완결이다).
 _STRIP = ("CYS_ROLE", "CYS_SURFACE_ROLE", "CYS_SOCKET", "CYS_BIN", "CYS_GATE_LANE_SOCKET", "CYS_SOUL",
           "CYS_ROLE_UID", "CYS_SURFACE_ID", "JAVIS_SURFACE_ID", "AITERM_SURFACE_ID", "JAVIS_SOCKET",
           "AITERM_SOCKET", "CYS_ROOT", "CYS_STATE_DIR", "CYS_MISSION")
@@ -166,6 +170,29 @@ def gate_note():
         return r.stdout
     finally:
         shutil.rmtree(home, ignore_errors=True)
+
+
+def ss_block(role):
+    """F58 셀프 서비스 블록 — 프리루드를 source 해서 함수 출력을 그대로 받는다(사본 금지). 픽스처 팩처럼 도구가 없는
+    팩을 주므로 N 없는 형태다(gate_fixture 팩에도 javis_selfservice.py 가 없다). 함수가 없는 _lib.sh 면 빈 문자열."""
+    home = tempfile.mkdtemp(prefix="ic-ss-note-")
+    try:
+        env = {k: v for k, v in os.environ.items() if k not in _STRIP}
+        env["HOME"] = home
+        env["CYS_PACK_DIR"] = home
+        r = subprocess.run([BASH, "-c", '. "$1" >/dev/null 2>&1; '
+                            'command -v cys_self_service_note >/dev/null 2>&1 && cys_self_service_note "$2"',
+                            "_", LIB, role], capture_output=True, text=True, encoding="utf-8", env=env, timeout=30)
+        return r.stdout
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def without_ss_block(out, blk):
+    """출력 끝의 F58 블록 정확히 1벌만 걷어낸다 — 블록이 끝이 아니거나 2벌 이상이면 그대로 돌려준다(→ 12c 가 갈린다)."""
+    if blk and out.count(blk) == 1 and out.endswith(blk):
+        return out[:-len(blk)]
+    return out
 
 
 def gate_fixture(root, dept=False, state=True, seats=1, daemon="unjudged", checklist=True):
@@ -428,21 +455,22 @@ try:
     else:
         diffs = []
         for role in ("master", "cso-1"):
+            blk = ss_block(role)
             for dept in (False, True):
                 for src in ("startup", "clear", "compact", "resume"):
                     fx = gate_fixture(os.path.join(tmp, "g12c-%s-%d-%s" % (role, dept, src)),
                                       dept=dept, seats=2, daemon=role)
                     a = gate_run(fx, role_env=role, source=src, hook=old)
                     b = gate_run(fx, role_env=role, source=src)
-                    if a.stdout != b.stdout or a.returncode != b.returncode:
+                    if a.stdout != without_ss_block(b.stdout, blk) or a.returncode != b.returncode:
                         diffs.append("%s/%s/%s" % (role, "dept" if dept else "hub", src))
         # 데몬 권위로만 lead 가 확정되는 좌석(env 없음)도 같다.
         fx = gate_fixture(os.path.join(tmp, "g12c-daemon"), seats=2, daemon="master")
         a = gate_run(fx, source="clear", hook=old)
         b = gate_run(fx, source="clear")
-        if a.stdout != b.stdout:
+        if a.stdout != without_ss_block(b.stdout, ss_block("master")):
             diffs.append("daemon-master/hub/clear")
-        check("12c ★lead 전문 바이트 동일(기준 커밋 %s 훅 대조 · 17케이스)" % BASE_REF, not diffs,
+        check("12c ★lead 전문 바이트 동일(기준 커밋 %s 훅 대조 · 17케이스 · 끝의 F58 블록 1벌 제외)" % BASE_REF, not diffs,
               "갈린 케이스: %s" % diffs)
 
     # ⑬ 비용
