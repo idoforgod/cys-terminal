@@ -34416,22 +34416,68 @@ after-tick liveness alone does not attribute a clock defect",
     }
 
     fn p10_raw_seat(tag: &str, agent: &str) -> (Arc<Daemon>, Arc<crate::state::Surface>) {
+        assert!(
+            cfg!(unix),
+            "logic: p10_raw_seat requires POSIX stty raw -echo (test must be ignored on non-unix)"
+        );
         let daemon = drill_daemon(tag);
-        let cmd = if cfg!(unix) {
-            "stty raw -echo; exec sleep 30"
-        } else {
-            "sleep 30"
-        };
+        let cmd = "if stty raw -echo; then printf 'P10_RAW_READY\\r\\n'; exec sleep 30; else printf 'P10_RAW_FAIL\\r\\n'; exit 1; fi";
         let s = daemon
             .create_surface(None, Some(cmd.into()), None, None, 24, 80)
             .expect("create surface");
         daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
         *s.agent_meta.lock().unwrap() = Some((agent.to_string(), "worker".to_string()));
-        std::thread::sleep(std::time::Duration::from_millis(600));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let screen = s.parser.lock().unwrap().screen().contents();
+            if screen.contains("P10_RAW_FAIL") {
+                panic!("logic: stty raw -echo failed on p10_raw_seat: {screen}");
+            }
+            if screen.contains("P10_RAW_READY") {
+                break;
+            }
+            if s.exited.load(AtomicOrdering::Acquire) {
+                panic!("logic: p10_raw_seat exited before printing P10_RAW_READY: {screen}");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timing: p10_raw_seat did not print P10_RAW_READY within 5s: {screen}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Consume the readiness marker before the test paints its fixture frame.
+        s.parser.lock().unwrap().process(b"\x1b[2J\x1b[H");
         (daemon, s)
     }
 
+    fn p10_settle_writer_barrier(s: &Arc<crate::state::Surface>) {
+        let (barrier_tx, barrier_rx) = std::sync::mpsc::sync_channel(1);
+        s.write_tx
+            .try_send(crate::state::WriteReq::SubmitAfterGap {
+                bytes: Vec::new(),
+                min_gap_ms: 0,
+                withhold: Some(Arc::new(move || {
+                    let _ = barrier_tx.try_send(());
+                    true
+                })),
+                done: None,
+            })
+            .expect("enqueue settled-writer FIFO barrier");
+        barrier_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("timing: settled-writer barrier did not fire within 5s");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while s.write_tx.gate().pending() != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timing: writer gate did not drain after settled-writer barrier within 5s"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     #[test]
+    #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
     fn p10_remedy_wait_while_armed_machine_residue_when_spent() {
         let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _sc = P10TestScopeGuard::claude();
@@ -35470,54 +35516,90 @@ after-tick liveness alone does not attribute a clock defect",
         s.clear_pending_input();
         p10_paint_inline_box(&s, "❯ ");
         let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
-        let (observed_tx, observed_rx) = std::sync::mpsc::sync_channel(1);
-        let s_w = Arc::clone(&s);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+        let release_rx_w = Arc::clone(&release_rx);
         s.write_tx
             .try_send(crate::state::WriteReq::SubmitAfterGap {
                 bytes: Vec::new(),
                 min_gap_ms: 0,
                 withhold: Some(Arc::new(move || {
                     let _ = entered_tx.try_send(());
-                    // Wait for the observable handoff point in `deliver_head_locked` (`governance.rs:13377`):
-                    // `s_w.inject_reserved()` becomes true only AFTER `stamp.handoff_write_epoch` is captured (:13328)
-                    // and `WriteReq::Agent` is enqueued (:13353), right as `deliver_head_locked` enters `g.settle_handoff(800ms)` (:13444).
-                    let wait_start = std::time::Instant::now();
-                    while !s_w.inject_reserved() {
-                        if wait_start.elapsed() >= std::time::Duration::from_secs(5) {
-                            break;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                    }
-                    let _ = observed_tx.try_send((
-                        s_w.inject_reserved(),
-                        s_w.inject_track.resume_write_epoch(),
-                    ));
+                    release_rx_w
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .expect("timing: foreign writer barrier was not released by p1_on_queue_reserved within 5s");
                     false
                 })),
                 done: None,
             })
-            .expect("enqueue foreign writer request with observable handoff barrier");
+            .expect("enqueue foreign writer request with p1_on_queue_reserved release barrier");
         entered_rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("timing: writer did not enter foreign request barrier within 5s");
+        let expected_queue_entry_id = s
+            .pending_queue
+            .lock()
+            .unwrap()
+            .front()
+            .expect("queued head entry")
+            .id
+            .clone();
         let epoch_at_handoff = s.inject_track.resume_write_epoch();
         let human_at_handoff = *s.last_human_input.lock().unwrap();
         let agent_epoch_at_handoff = s.agent_epoch.load(AtomicOrdering::Acquire);
         let conv_epoch_at_handoff = s.conversation_epoch.load(AtomicOrdering::Acquire);
+        let captured = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let captured_cb = captured.clone();
+        let sid = s.id;
+        let expected_entry_cb = expected_queue_entry_id.clone();
+        let _observer = crate::agent_queue_tests::p1_on_queue_reserved(s.id, move |surf, req| {
+            assert_eq!(
+                surf.id, sid,
+                "logic: p1_on_queue_reserved surface_id must match target seat"
+            );
+            assert_eq!(
+                req.surface_id, sid,
+                "logic: admitted Request.surface_id must match target seat"
+            );
+            assert_eq!(
+                req.origin, "queue",
+                "logic: admitted Request.origin must be queue"
+            );
+            assert!(
+                !req.id.is_empty(),
+                "logic: admitted Request.id must be non-empty"
+            );
+            let res_ids = surf
+                .inject_reservation
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("logic: inject_reservation must be installed at p1_on_queue_reserved")
+                .ids
+                .clone();
+            assert_eq!(
+                res_ids,
+                vec![expected_entry_cb],
+                "logic: inject_reservation ids must match admitted queue entry"
+            );
+            let epoch_in_cb = surf.inject_track.resume_write_epoch();
+            assert_eq!(
+                epoch_in_cb, epoch_at_handoff,
+                "logic: HandoffStamp must capture handoff_write_epoch == epoch_at_handoff before foreign write completes"
+            );
+            let gen_in_cb = surf.input_gen.load(AtomicOrdering::Acquire);
+            *captured_cb.borrow_mut() = Some((req.id.clone(), gen_in_cb, epoch_in_cb));
+            release_tx
+                .send(())
+                .expect("timing: release blocked foreign writer from inside p1_on_queue_reserved");
+        });
         tick(&daemon);
-        let (reserved_seen, epoch_at_reservation) = observed_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("timing: foreign request did not observe inject_reserved handoff point within 5s");
-        assert!(
-            reserved_seen,
-            "logic: foreign write released without observing s.inject_reserved() at settle_handoff entry"
-        );
-        assert_eq!(
-            epoch_at_reservation,
-            epoch_at_handoff,
-            "logic: HandoffStamp must capture handoff_write_epoch == epoch_at_handoff before foreign write completes"
-        );
-        let gen_at_handoff = s.input_gen.load(AtomicOrdering::Acquire);
+        let (_admitted_req_id, gen_at_admission, _epoch_at_admission) = captured
+            .borrow()
+            .clone()
+            .expect("logic: p1_on_queue_reserved callback did not fire during tick");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while s.write_tx.gate().pending() != 0 || !s.pending_queue.lock().unwrap().is_empty() {
             assert!(
@@ -35530,8 +35612,8 @@ after-tick liveness alone does not attribute a clock defect",
         }
         assert_eq!(
             s.input_gen.load(AtomicOrdering::Acquire),
-            gen_at_handoff,
-            "input_gen must remain unchanged between handoff and settlement"
+            gen_at_admission,
+            "logic: input_gen must remain unchanged between admission and settlement"
         );
         assert_eq!(
             *s.last_human_input.lock().unwrap(),
@@ -35740,16 +35822,10 @@ after-tick liveness alone does not attribute a clock defect",
         // Also verify that a short visible tail `"visible second line"` of `"hidden first line\nvisible second line"`
         // fails `p10_block_matches_full_body` (`DESIGN-P10-r3.md` §1 E3): holds with 0 Returns written and
         // `/seat` remedy code `"machine_residue"` (row 3b, `Declined("representation")`).
-        let _now = p10_seed_mark(&s, "hidden first line\nvisible second line", 5, Some("q-r3-4-short"));
+        let now_short = p10_seed_mark(&s, "hidden first line\nvisible second line", 5, Some("q-r3-4-short"));
         p10_paint_inline_box(&s, "❯ visible second line");
         let wrote_before = s.inject_track.wrote();
         p10_arm(&daemon, &s);
-        assert!(s.inject_track.withheld().is_none(), "0 Returns armed on visible tail");
-        assert_eq!(s.inject_track.wrote(), wrote_before, "0 Returns written on visible tail");
-        assert_eq!(
-            s.inject_track.residue_stage_for_current_body(),
-            Some(crate::state::ResidueStage::Declined("representation"))
-        );
         let diag = super::queue_block_diag(&daemon, &s);
         assert_eq!(
             diag.residue,
@@ -35760,6 +35836,20 @@ after-tick liveness alone does not attribute a clock defect",
             remedy_code,
             "machine_residue",
             "DESIGN-P10-r3 §1: missing E3 must hold with code machine_residue"
+        );
+        assert_eq!(
+            s.inject_track.residue_stage_for_current_body(),
+            Some(crate::state::ResidueStage::Declined("representation"))
+        );
+        assert!(s.inject_track.withheld().is_none(), "0 Returns armed on visible tail");
+        // I3: Run `resubmit_withheld_one` and a FIFO settled-writer barrier BEFORE asserting `wrote() == wrote_before`,
+        // so any mutant that arms or queues a CR is drained by the writer thread and caught by the `wrote()` assertion.
+        let _ = super::resubmit_withheld_one(&daemon, &s, now_short + std::time::Duration::from_secs(5));
+        p10_settle_writer_barrier(&s);
+        assert_eq!(
+            s.inject_track.wrote(),
+            wrote_before,
+            "logic: 0 Returns written on visible tail after settled-writer barrier"
         );
         let _ = s.child.lock().unwrap().kill();
         crate::state::p1_e0_stop_daemon(&daemon);
@@ -39169,8 +39259,10 @@ mod h_machine_hold_tests {
     /// Integration UNION: 55 shared + 6 SOCKET-only + 31 P1-only = 92; the historical parent counts above are superseded.
     /// ★(0.14.56 · PKG1-M1) 92 -> **103**: class C +11 recorder-seat specimens of the `authoritative` hold axis (`pkg1_*`:
     /// agent_queue_tests 2 · boot_supervisor 2 · channels 1 · handlers 2 · schedule 4). Renamed `_of_103` (the CI comment too).
+    /// ★(0.14.57 · P10 GREENFIX I1) 103 -> **104**: class C +1 raw-mode seat specimen (`governance::p10_remedy_wait_while_armed_machine_residue_when_spent`).
+    /// Renamed `_of_104` (the CI comment in windows-health.yml too).
     #[test]
-    fn r2f_dm_windows_ignore_attributes_are_exactly_the_decided_set_of_103() {
+    fn r2f_dm_windows_ignore_attributes_are_exactly_the_decided_set_of_104() {
         const REASON_A: &str = "S21 제출 정착·창 위 CR 보류는 유닉스 한정(send_settle_applies)";
         const REASON_B: &str = "윈도우 기본 H 마스크는 draft 축을 끈다(hold_axes_default(true)) — 이 검체는 유닉스 기본(draft 축) 동작을 본다";
         const REASON_C: &str = "좌석 명령이 POSIX 셸 문법";
@@ -39299,6 +39391,8 @@ mod h_machine_hold_tests {
             ("schedule", "pkg1_s5_jammed_job_lapses_after_the_bound_with_one_event", 'C'),
             ("schedule", "pkg1_s5b_the_oldest_authoritative_entry_governs_the_bound", 'C'),
             ("schedule", "pkg1_s7_the_monotonic_insertion_age_governs_not_the_wall_clock", 'C'),
+            // P10 GREENFIX I1 (0.14.57): raw-mode seat handshake (`stty raw -echo; printf P10_RAW_READY; exec sleep 30`).
+            ("governance", "p10_remedy_wait_while_armed_machine_residue_when_spent", 'C'),
         ];
         let needle = concat!("#[cfg_attr(not(unix), ", "ignore = \"");
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/cysd");
@@ -39328,9 +39422,9 @@ mod h_machine_hold_tests {
         want_sorted.sort();
         let missing: Vec<_> = got.iter().filter(|entry| !want_sorted.contains(entry)).collect();
         let extra: Vec<_> = want_sorted.iter().filter(|entry| !got.contains(entry)).collect();
-        assert_eq!(want.len(), 103, "union registry must contain 103 entries; missing={missing:?}; extra={extra:?}");
-        assert_eq!(got.len(), 103, "윈도우 `ignore` 가 {}건이다(결정 103건) — 새로 더했거나 뺐다: {got:?}", got.len());
-        assert_eq!(got, want_sorted, "윈도우 `ignore` 집합이 결정한 103건과 다르다 — 목록과 `ignore` 사유를 함께 고쳐라");
+        assert_eq!(want.len(), 104, "union registry must contain 104 entries; missing={missing:?}; extra={extra:?}");
+        assert_eq!(got.len(), 104, "윈도우 `ignore` 가 {}건이다(결정 104건) — 새로 더했거나 뺐다: {got:?}", got.len());
+        assert_eq!(got, want_sorted, "윈도우 `ignore` 집합이 결정한 104건과 다르다 — 목록과 `ignore` 사유를 함께 고쳐라");
     }
 }
 
