@@ -726,5 +726,340 @@ class Hooks(Base):
         self.assertLess(dt, 15, "the N call is bounded (5 s cap), took %.1f s" % dt)  # wallclock: guard 15 s is 3x the 5 s cap under test and the stub sleeps 60 s; expiry means the N call is unbounded or its cap plus the hook's own time reaches 15 s (r1fix m4: a 30 s cap fails here)
 
 
+# ───────────────────────── F58-PLACE: the early copy (DESIGN-F58-PLACE-r2 §4 + head ticket) ─────────────────────────
+# session-start.sh prints the block's five fixed lines again right after its read-pointer line (and at the end of
+# the roleless branch), from one definition in _lib.sh (cys_self_service_rules), because a persisted SessionStart
+# output reaches the model only as a ~2,000-char preview of whole lines. "In" = the line ends, newline included, at or
+# before character 1,998 (worker-2 t6 cut; head 2.1.316 bounds L to [1,998, 2,022)).
+
+EARLY_HEAD = "▶ 셀프 서비스(F58): "
+EARLY_TAIL = "- 정정 건수·읽기 명령: 훅 출력 맨 끝의 셀프 서비스(F58) 블록(파일로 빠졌으면 그 파일 끝)."
+EARLY_PREFIXES = (EARLY_HEAD, "- 첫 대답: ", "- 절차: cys skill show self-service · 경계: ", "- 사용자에게 한 번 묻고 한다: ",
+                  "- 제조사 보고는 마지막 단계", EARLY_TAIL)
+S_FORM = "「우리가 직접 고칠 수 있습니다. 먼저 <할 일> 하겠습니다.」"
+RO_FORM = "「우리가 직접 할 수 있는 것부터 하겠습니다: <할 일>.」"
+EARLY_NEEDLES = {  # head ticket item 1: the boundary and ask-once needles are the FULL lines
+    "S form": S_FORM,
+    "R/O condition": "사용자 공간에 고칠 길이 없을 때만",
+    "R/O form": RO_FORM,
+    "no false fix": "고치지 않은 것을 고쳤다고 하지 않는다",
+    "boundary line": "- 절차: cys skill show self-service · 경계: 설정·사용자 소유 파일·스킬·도구·작업 폴더는 고친다 / "
+                     "제품 실행 파일·내장 팩·trusted-keys.json 은 고치지 않는다.",
+    "ask-once line": "- 사용자에게 한 번 묻고 한다: 돈 · 사용자 자료의 되돌릴 수 없는 손실 · 공개 쓰기(git push·발송·발행·제조사 보고).",
+}
+PREVIEW_IN = 1998
+POISON_DEFENSE = "*배경 컨텍스트*다"  # CEO R92 s5: the semantic predicate, never one of its three wordings
+DIRECTIVE_OF = {"master": "MASTER", "worker": "WORKER", "cso": "CSO", "reviewer": "REVIEWER"}
+# cys_self_service_note output sha256 at 1209aadd (impl/place/note-bytes.json, one bash process per case), for the
+# stub tools below: none = no tool, n7 = N only, n7held3 = N + 3 held lines (worst case), nondigit = a failing tool.
+NOTE_SHA_1209AADD = {
+    ('none', 'master'): 'e031b9e4bc7de0aee5cec0990a6fefad0e6858e973d7dea9efa7c6650cd3dabe',
+    ('none', 'worker-59'): '58af7b28cd47df37965be0762921ae71fb828bfce2f255c6339fcd97e8ecffa7',
+    ('none', 'cso-1'): '71b0976eedf391b4f55b4c4a7e4414746f60fe584a6b0ac64b55db7beb814696',
+    ('none', 'reviewer-codex'): '57c39fecf05b3f607cf4c999cc3d37dc5ddcbddb97d05c27409db10003e7ee3f',
+    ('none', ''): '8e0fc9f790bb9a0218bd54618d6f997d84ee1ebec734749f7295126e9d393905',
+    ('n7', 'master'): '7ee9ba4d538dfed1af2d39904a0da795e1e6551a560a6d5d7165759c71b4aaf2',
+    ('n7', 'worker-59'): '4f89099dd3f4480b8e16cd2c04a9bfd40a50e6f5e67100766cb21f2ed86f5894',
+    ('n7', 'cso-1'): '61747a986808ceb5304f2d7f16dde119b793a12c644f9c469a72ee7f6be90e37',
+    ('n7', 'reviewer-codex'): '4d4f5523781f67812d1eea1223742dff0e34f0121bb05b0cb686ada086f8904e',
+    ('n7', ''): '8e0fc9f790bb9a0218bd54618d6f997d84ee1ebec734749f7295126e9d393905',
+    ('n7held3', 'master'): 'adfa6f533cccddae972db069dac5c7986ecc11eb7d0ba135459a64b89bb80335',
+    ('n7held3', 'worker-59'): 'bd003f81b3cf5ed5e29fbb460da8ff1f7b38ef2671225bb0b730724c3be81a5a',
+    ('n7held3', 'cso-1'): 'd732f5b828d9fad3a0029cdfdbc5ba7801134299522915c707b4e87c975b61b2',
+    ('n7held3', 'reviewer-codex'): 'aee45144b7cbffb4ff4d42ab581d546759fc32832fb26126ee4f9b49f1888473',
+    ('n7held3', ''): '8e0fc9f790bb9a0218bd54618d6f997d84ee1ebec734749f7295126e9d393905',
+    ('nondigit', 'master'): 'e031b9e4bc7de0aee5cec0990a6fefad0e6858e973d7dea9efa7c6650cd3dabe',
+    ('nondigit', 'worker-59'): '58af7b28cd47df37965be0762921ae71fb828bfce2f255c6339fcd97e8ecffa7',
+    ('nondigit', 'cso-1'): '71b0976eedf391b4f55b4c4a7e4414746f60fe584a6b0ac64b55db7beb814696',
+    ('nondigit', 'reviewer-codex'): '57c39fecf05b3f607cf4c999cc3d37dc5ddcbddb97d05c27409db10003e7ee3f',
+    ('nondigit', ''): '8e0fc9f790bb9a0218bd54618d6f997d84ee1ebec734749f7295126e9d393905',
+}
+NOTE_STUB_TOOLS = {
+    "none": None,
+    "n7": "print('7')\n",
+    "n7held3": ("print('7')\nprint('사용자가 고친 파일 directives/MASTER_DIRECTIVE.md — 보류 1건(T1-01)')\n"
+                "print('사용자가 고친 파일 directives/RSI_LEARNING_DIRECTIVE.md — 보류 1건(T1-12)')\n"
+                "print('사용자가 고친 파일 soul.md — 보류 1건(T2-01)')\n"),
+    "nondigit": "print('oops: corrections failed')\nprint('- STUB-MUST-NOT-APPEAR')\n",
+}
+
+
+def lines_and_ends(out):
+    """The output's lines and, per line, the character offset just past its newline."""
+    ls = out.split("\n")
+    ends, pos = [], 0
+    for l in ls:
+        pos += len(l) + 1
+        ends.append(pos)
+    return ls, ends
+
+
+def early_copy_problems(test, out, label):
+    """T-P1 checks on a role-path session-start output; returns (read-pointer end, copy lines, copy line ends)."""
+    ls, ends = lines_and_ends(out)
+    heads = [k for k, l in enumerate(ls) if l.startswith(EARLY_HEAD)]
+    test.assertEqual(len(heads), 1, "%s: early-copy head lines %d" % (label, len(heads)))
+    rps = [k for k, l in enumerate(ls) if "이미 있으면" in l and "다시 읽지 않는다" in l]
+    test.assertEqual(len(rps), 1, "%s: read-pointer lines %d" % (label, len(rps)))
+    h = heads[0]
+    test.assertEqual(h, rps[0] + 1, "%s: the copy does not directly follow the read pointer" % label)
+    copy = ls[h:h + len(EARLY_PREFIXES)]
+    for pre, line in zip(EARLY_PREFIXES, copy):
+        test.assertTrue(line.startswith(pre), "%s: copy line %r does not start with %r" % (label, line[:40], pre))
+    test.assertEqual(copy[-1], EARLY_TAIL, label)
+    test.assertNotIn("■ 셀프 서비스(F58)", "\n".join(copy), label)
+    return ends[rps[0]], copy, ends[h:h + len(EARLY_PREFIXES)]
+
+
+def needle_problems(copy):
+    p = []
+    joined = "\n".join(copy)
+    for name, n in EARLY_NEEDLES.items():
+        if name.endswith(" line"):
+            if n not in copy:
+                p.append("%s is not one whole copy line" % name)
+        elif n not in joined:
+            p.append("%s missing" % name)
+    if not any(S_FORM in l and RO_FORM in l for l in copy):
+        p.append("S form and R/O form are not on one line")
+    return p
+
+
+def drop_functions(names):
+    """_lib.sh transform: remove each named function (those absent are skipped); the shell stays valid."""
+    def tr(src):
+        out = src
+        for name in names:
+            i = out.find("%s() {" % name)
+            if i < 0:
+                continue
+            j = out.index("\n}\n", i) + 3
+            out = out[:i] + out[j:]
+        return out
+    return tr
+
+
+def lib_function_body(src, name):
+    i = src.find("%s() {" % name)
+    if i < 0:
+        return None
+    return src[i:src.index("\n}\n", i) + 3]
+
+
+class Place(Base):
+    def run_ss(self, role, source="startup", stub=None, extra=None, hook=SS_HOOK):
+        e = self.rig.env(role)
+        if stub:
+            e["PATH"] = stub + os.pathsep + e["PATH"]
+        e.update(extra or {})
+        payload = json.dumps({"source": source, "cwd": self.rig.work, "transcript_path": ""})
+        r = subprocess.run(["sh", hook], input=payload.encode("utf-8"), capture_output=True, env=e, timeout=120)
+        return r.returncode, r.stdout.decode("utf-8", "replace")
+
+    def stub_dir(self, name, body):
+        d = os.path.join(self.rig.tmp, name)
+        os.makedirs(d, exist_ok=True)
+        _write_exec(os.path.join(d, "cys"), body)
+        return d
+
+    def test_tp1_early_copy_inside_the_preview_for_every_role_and_source(self):
+        for role in ("master", "worker-59", "cso-1", "reviewer-codex"):
+            base = role.split("-")[0]
+            for source in ("startup", "clear"):
+                label = "%s %s" % (role, source)
+                rc, out = self.run_ss(role, source)
+                self.assertEqual(rc, 0, label)
+                self.assertIn("■ CYSJavis 역할 각성 (CYS_ROLE=%s)" % role, out, "%s: role path not taken" % label)
+                rp_end, copy, cends = early_copy_problems(self, out, label)
+                self.assertLessEqual(cends[-1], PREVIEW_IN, "%s: copy ends at %d" % (label, cends[-1]))
+                self.assertEqual(needle_problems(copy), [], label)
+                d_first = _read_bytes(self.rig.path("directives/%s_DIRECTIVE.md" % DIRECTIVE_OF[base])).decode(
+                    "utf-8").split("\n", 1)[0]
+                self.assertTrue(d_first.strip(), "%s: the rig directive starts with an empty line" % label)
+                self.assertGreater(out.find(d_first), cends[-1] - 1, "%s: copy not before the directive body" % label)
+                self.assertEqual(step5_problems(out, base, len(role_rows(base))), [], label)
+
+    UNION_STUB = ("#!/bin/sh\ncase \"$1\" in\n"
+                  "  reclaim-role) printf 'role=master\\nreason=privileged_needs_optin\\nenv_role=other_live\\n"
+                  "detail=reported_cwd_conflict\\n'; exit 0 ;;\n"
+                  "  claim-role) echo 'error: sender identity unresolved (stub)'; exit 6 ;;\n"
+                  "esac\nexit 0\n")
+    UNION_NOTICES = ("■ 고지: 역할 교정", "특권 역할(master·cso)의 빈 좌석", "신고한 폴더와 좌석의 실제 작업 폴더가 달라",
+                     "■ 고지: 발신 신원 미확정", "■ 고지: 역할 재확인 불가", "■ 고지(작업 폴더)")
+
+    def union_run_at(self, target):
+        """Every print before the role line at once (session-start.sh :270-272, :307-309, :320-322, :490, :498, :515),
+        with the cwd-blocked path sized so the read pointer ends exactly at `target` (DESIGN-F58-PLACE-r2 §4
+        T-P1-max: the rig measured 1,425 and 1,765; the rig reached them with exact-length pack symlinks, which a
+        test cannot build under a long temp root, so the free-text cwd-blocked path is sized instead)."""
+        stub = self.stub_dir("stub-union", self.UNION_STUB)
+        b = 260
+        for _ in range(2):
+            extra = {"CYS_ROLE": "reviewer-claude-12", "CYS_CWD_BLOCKED": "/" + "b" * (b - 1)}
+            rc, out = self.run_ss("reviewer-claude-12", stub=stub, extra=extra)
+            self.assertEqual(rc, 0)
+            for n in self.UNION_NOTICES:
+                self.assertIn(n, out.split("■ CYSJavis 역할 각성")[0], "notice not printed before the role line: " + n)
+            rp_end, copy, cends = early_copy_problems(self, out, "union b=%d" % b)
+            if rp_end == target:
+                return out, rp_end, copy, cends
+            b += target - rp_end
+            self.assertGreater(b, 1, "target %d is below the union's own read-pointer end" % target)
+        self.fail("read pointer ends at %d, not the target %d" % (rp_end, target))
+
+    def test_tp1_max_a_union_notices_and_a_long_cwd_path(self):
+        out, rp_end, copy, cends = self.union_run_at(1425)
+        self.assertLessEqual(cends[-1], PREVIEW_IN, "copy ends at %d" % cends[-1])
+        self.assertEqual(needle_problems(copy), [])
+        print("T-P1-max-a: read pointer %d, copy line ends %s" % (rp_end, cends))
+
+    def test_tp1_max_b_beyond_the_envelope_keeps_both_answer_forms_together(self):
+        out, rp_end, copy, cends = self.union_run_at(1765)
+        self.assertLess(rp_end, 2000, "read pointer ends at %d" % rp_end)
+        self.assertLessEqual(cends[1], PREVIEW_IN, "head + first-answer lines end at %d" % cends[1])
+        self.assertTrue(S_FORM in copy[1] and RO_FORM in copy[1], "both first-answer forms on the first-answer line")
+        print("T-P1-max-b: read pointer %d, copy line ends %s, out of the preview: %s" % (
+            rp_end, cends, [EARLY_PREFIXES[k][:12] for k, e in enumerate(cends) if e > PREVIEW_IN]))
+
+    def test_tp1b_roleless_branch_prints_the_copy_last(self):
+        stub170 = self.stub_dir("stub-170", "#!/bin/sh\ncase \"$1\" in\n  surface-role) exit 2 ;;\nesac\nexit 0\n")
+        for label, stub, notice in (("roleless", None, None), ("roleless + :170", stub170, "■ 고지: 역할 판정 불가")):
+            e = self.rig.env(None)
+            if stub:
+                e["PATH"] = stub + os.pathsep + e["PATH"]
+            r = subprocess.run(["sh", SS_HOOK], input=b"{}", capture_output=True, env=e, timeout=120)
+            out = r.stdout.decode("utf-8", "replace")
+            self.assertEqual(r.returncode, 0, label)
+            self.assertIn("■ 이 문단의 출처", out, "%s: roleless branch not taken" % label)
+            self.assertNotIn("■ CYSJavis 역할 각성", out, "%s: role path taken" % label)
+            if notice:
+                self.assertIn(notice, out, "%s: the :170 path was not taken" % label)
+            ls = out.rstrip("\n").split("\n")
+            self.assertEqual(sum(1 for l in ls if l.startswith(EARLY_HEAD)), 1, label)
+            copy = ls[-len(EARLY_PREFIXES):]
+            for pre, line in zip(EARLY_PREFIXES, copy):
+                self.assertTrue(line.startswith(pre), "%s: last lines are not the copy (%r)" % (label, line[:40]))
+            self.assertEqual(needle_problems(copy), [], label)
+            self.assertLess(len(out), 10000, "%s: %d chars - would be persisted, copy out of view" % (label, len(out)))
+            self.assertNotIn("이 출력 맨 끝", out, "%s: claims a block at the end of this output" % label)
+
+    def large_state(self):
+        rows = ["# SESSION_STATE.md", "> ★ROUTE: F58-PLACE T-P2 restore route line", "> ⛔IRREVERSIBLE: none (fixture)"]
+        rows += ["- filler %04d %s" % (k, "x" * 60) for k in range(130)]
+        data = ("\n".join(rows) + "\n").encode("utf-8")
+        self.assertGreater(len(data), 6144)
+        _write_bytes(os.path.join(self.rig.work, "_round", "SESSION_STATE.md"), data)
+
+    def defense_and_route(self, out, label, assert_bound=True):
+        ls, ends = lines_and_ends(out)
+        dk = [k for k, l in enumerate(ls) if POISON_DEFENSE in l]
+        rk = [k for k, l in enumerate(ls) if "★ROUTE: F58-PLACE T-P2" in l]
+        self.assertEqual(len(dk), 1, "%s: poison-defense lines %d (the work-memory branch did not run?)" % (label, len(dk)))
+        self.assertEqual(len(rk), 1, "%s: ROUTE lines %d (the excerpt did not run?)" % (label, len(rk)))
+        if assert_bound:
+            self.assertLessEqual(ends[dk[0]], PREVIEW_IN, "%s: poison defense ends at %d" % (label, ends[dk[0]]))
+            self.assertLessEqual(ends[rk[0]], PREVIEW_IN, "%s: ROUTE ends at %d" % (label, ends[rk[0]]))
+        return ends[dk[0]], ends[rk[0]]
+
+    def test_tp2_inject_context_keeps_the_restore_lines_inside_the_preview(self):
+        self.large_state()
+        for source in ("startup", "clear"):
+            rc, out = self.rig.inject("master", source)
+            self.assertEqual(rc, 0, source)
+            self.assertGreater(len(out), 10000, "%s: the payload is not in the persisted size range" % source)
+            d, r = self.defense_and_route(out, source)
+            print("T-P2 %s: poison defense ends %d, ROUTE ends %d" % (source, d, r))
+        # recorded, not asserted: an owner-grown soul heading list before the work memory at startup - 37 headings,
+        # ~3,700 chars and under the hook's 8,192 B list cap, the shape of the live dept-5 soul (3,713 chars)
+        heads = "".join("## 절 %02d %s %s\n" % (k, "가" * 30, "x" * 60) for k in range(37))
+        self.assertLess(len(heads.encode("utf-8")), 8192)
+        self.rig.rewrite("soul.md", ("# soul\n" + heads).encode("utf-8"))
+        rc, out = self.rig.inject("master", "startup")
+        self.assertEqual(rc, 0)
+        self.assertIn("## 절 36 ", out, "the soul heading list was not printed")
+        print("T-P2 large soul (recorded): poison defense ends %d, ROUTE ends %d" % self.defense_and_route(
+            out, "large soul", assert_bound=False))
+
+    def test_tp2_degraded_path_is_recorded(self):
+        self.large_state()
+        ss, ic = hook_copy(self.rig.tmp, lambda s: s)
+        os.remove(os.path.join(os.path.dirname(os.path.dirname(ic)), "bin", "_owned_process.py"))
+        self.assertFalse(os.path.exists(os.path.join(self.rig.pack, "bin", "_owned_process.py")))
+        rc, out = self.rig.inject("master", "startup", ic)
+        self.assertEqual(rc, 0)
+        self.assertIn("degraded: 앞 6144자만", out, "the degraded path (inject-context.sh _c03_degraded) did not run")
+        ls, ends = lines_and_ends(out)
+        dk = [k for k, l in enumerate(ls) if POISON_DEFENSE in l]
+        print("T-P2 degraded (recorded): poison-defense lines %d, ends %s, payload %d chars" % (
+            len(dk), [ends[k] for k in dk], len(out)))
+
+    def lib_run(self, fn, arg, pack_dir):
+        e = {"HOME": self.rig.home, "TMPDIR": self.rig.tmp, "CYS_PACK_DIR": pack_dir, "CYS_PY": sys.executable,
+             "PATH": os.pathsep.join([os.path.dirname(sys.executable), "/usr/bin", "/bin"]),
+             "LANG": os.environ.get("LANG", "C.UTF-8")}
+        r = subprocess.run([BASH, "-c", '. "$1" >/dev/null 2>&1; %s "$2"' % fn, "x", LIB, arg],
+                           capture_output=True, env=e, timeout=60)
+        return r.returncode, r.stdout
+
+    def test_tp3_early_copy_contract_and_block_bytes(self):
+        empty = os.path.join(self.rig.tmp, "nopack")
+        os.makedirs(empty, exist_ok=True)
+        rc, early = self.lib_run("cys_self_service_early", "", empty)
+        self.assertEqual(rc, 0, "cys_self_service_early is missing or failed")
+        t = early.decode("utf-8")
+        copy = t.rstrip("\n").split("\n")
+        self.assertEqual(len(copy), len(EARLY_PREFIXES))
+        self.assertLessEqual(len(t), 600, "early copy %d chars" % len(t))
+        self.assertNotIn("\\", t)
+        self.assertIn("셀프 서비스(F58)", t)
+        self.assertNotIn("■ 셀프 서비스(F58)", t)
+        self.assertEqual(needle_problems(copy), [])
+        rc, blk = self.lib_run("cys_self_service_note", "master", empty)
+        bl = blk.decode("utf-8").split("\n")
+        self.assertEqual(copy[0], "▶" + bl[0][1:], "head line = block head with the mark swapped")
+        self.assertTrue(bl[0].startswith("■ "))
+        self.assertEqual(copy[1:5], bl[1:5], "copy lines 2-5 = block lines 2-5 (one definition)")
+        with open(LIB, encoding="utf-8") as f:
+            src = f.read()
+        for name in ("cys_self_service_rules", "cys_self_service_early"):
+            body = lib_function_body(src, name)
+            self.assertIsNotNone(body, name)
+            for w in ("$(", "`", "%b"):
+                self.assertNotIn(w, body, "%s body has %r" % (name, w))
+            self.assertNotIn("\\", body.replace("'%s\\n'", ""), "%s body has a backslash outside printf '%%s\\n'" % name)
+        for one in ("고치지 않은 것을 고쳤다고 하지 않는다", "trusted-keys.json 은 고치지 않는다"):
+            self.assertEqual(src.count(one), 1, "%r is defined %d times in _lib.sh" % (one, src.count(one)))
+        # (ii) the end block's bytes are the 1209aadd bytes, 5 roles x 4 tool states, one process per case
+        for tool, body in NOTE_STUB_TOOLS.items():
+            d = os.path.join(self.rig.tmp, "notepack-" + tool)
+            os.makedirs(os.path.join(d, "bin"), exist_ok=True)
+            if body is not None:
+                _write_bytes(os.path.join(d, "bin", "javis_selfservice.py"), body.encode("utf-8"))
+            for role in ("master", "worker-59", "cso-1", "reviewer-codex", ""):
+                rc, b = self.lib_run("cys_self_service_note", role, d)
+                self.assertEqual(rc, 0, (tool, role))
+                s = b.decode("utf-8")
+                ran_tool = tool in ("n7", "n7held3") and role != ""
+                self.assertEqual("정정 7건(이 역할)" in s, ran_tool, "(%s, %r): the N path did not run as expected" % (tool, role))
+                self.assertEqual(s.count("사용자가 고친 파일"), 3 if (tool == "n7held3" and role) else 0, (tool, role))
+                self.assertEqual(_sha(b), NOTE_SHA_1209AADD[(tool, role)], "(%s, %r): block bytes changed" % (tool, role))
+
+    def test_tp4_old_lib_without_the_three_functions_prints_neither_copy(self):
+        names = ("cys_self_service_rules", "cys_self_service_early", "cys_self_service_note")
+        ss, ic = hook_copy(self.rig.tmp, drop_functions(names))
+        with open(os.path.join(os.path.dirname(ss), "_lib.sh"), encoding="utf-8") as f:
+            lib = f.read()
+        for name in names:
+            self.assertNotIn("%s() {" % name, lib, "transform left %s" % name)
+        rc, out = self.rig.session_start("worker", ss)
+        self.assertEqual(rc, 0)
+        self.assertIn("■ CYSJavis 역할 각성", out, "role path not taken")
+        self.assertNotIn(EARLY_HEAD, out)
+        self.assertNotIn(BLOCK_HEAD, out)
+        rc, out = self.rig.inject("worker", "startup", ic)
+        self.assertEqual(rc, 0)
+        self.assertNotIn(BLOCK_HEAD, out)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

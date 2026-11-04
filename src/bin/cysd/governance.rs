@@ -29913,6 +29913,8 @@ after-tick liveness alone does not attribute a clock defect",
         assert!(HUMAN.contains("사용자에게 한 번 묻고") && HUMAN.contains("사용자가 그 창에서 직접 비운 뒤") && HUMAN.contains("기계는 지우지 않는다") && HUMAN.contains("node-recover"), "{HUMAN}");
         assert!(!["Ctrl-U", "Ctrl+U", "ctrl-u", "ctrl+u", "C-u", "^U"].iter().any(|k| HUMAN.contains(k)), "사람 몫 구절이 줄 지우기 키 이름을 적었다 — Windows 맨 셸(powershell.exe · state.rs default_shell)의 기본 편집 모드에는 그 키가 없다: {HUMAN}");
         assert!(!HUMAN.contains(CLAUSE.trim_start()), "사람 몫 구절은 T1-08 구절을 품지 않는다(manifest T-9 의 T1-08 개수 2 를 바꾸지 않는다)");
+        // ★(F58-PLACE T-P5 · bwfix r3 minor 2) 꼬리 고정 — 상수와 이 리터럴을 함께 832eddc7 꼬리 '(입력줄을 지운다)' 로 되돌리면 위아래 등식이 모두 서서 살아남는다(w2 r3_textmodel).
+        assert!(HUMAN.ends_with("(입력줄 계수를 정리한다)") && !HUMAN.contains("입력줄을 지운"), "사람 몫 구절 꼬리가 '(입력줄 계수를 정리한다)' 가 아니다 — Windows 맨 셸에서 C-u 는 입력줄을 지우지 못한다(1209aadd 결정)");
         let blocked = "empty_seat(좌석에 에이전트 미연결)";
         // 계수 0 → 종전 문장 그대로.
         let (code0, t0) = queue_remedy(blocked, &c5_diag(0, 0, None));
