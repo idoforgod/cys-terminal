@@ -1,0 +1,358 @@
+# DRAFT ONLY — DO NOT COMMIT OR PUSH WITHOUT HEAD E1 GRANT
+# Companion to: PLAN-F57-S0-B-ROWS-ON-CI-r2.md (Revision r2)
+# Precedent trigger: 3d2f0a7f (.github/workflows/diag-win11-update.yml) & 408d0141 (.github/workflows/win-measure.yml)
+# Pinned transport: iroh =1.4.1, iroh-relay =1.4.1 (f57-s0-probe/Cargo.toml lines 10-11, Cargo.lock lines 1338-1339)
+
+name: diag-f57-s0-b-rows
+
+on:
+  push:
+    branches:
+      - 'diag/f57-s0-b-rows'
+    paths:
+      - 'f57-s0-probe/**'
+      - 'diag/**'
+      - '.github/workflows/diag-f57-s0-b-rows.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: diag-f57-s0-b-rows-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # =========================================================================
+  # Job 1: Measure 1 (windows-public, windows-private) & Measure 3 (adapters)
+  # Runner: windows-2025 (x86_64-pc-windows-msvc, rustc pre-installed)
+  # Commit-message filter: runs unless another [*-only] tag is in head_commit.message
+  # =========================================================================
+  win-m1-m3-windows-2025:
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/diag/f57-s0-b-rows' &&
+      (
+        contains(github.event.head_commit.message, '[m1-m3-only]') ||
+        (
+          !contains(github.event.head_commit.message, '[m8-sacreal-only]') &&
+          !contains(github.event.head_commit.message, '[m8-sacrules-only]') &&
+          !contains(github.event.head_commit.message, '[m5-m6-only]')
+        )
+      )
+    runs-on: windows-2025
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository and f57-s0-probe harness
+        uses: actions/checkout@v4
+
+      - name: Build f57-s0-probe.exe (locked, iroh =1.4.1)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo build --locked --manifest-path f57-s0-probe/Cargo.toml --bin f57-s0-probe
+          Get-FileHash f57-s0-probe/target/debug/f57-s0-probe.exe -Algorithm SHA256 | Format-List
+
+      - name: Measure 1 — Non-admin local user + Public vs Private profile probe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $rig = "C:\f57-s0-rig\m1"
+          New-Item -ItemType Directory -Force -Path "$rig\public", "$rig\private" | Out-Null
+          $probe = (Resolve-Path "f57-s0-probe\target\debug\f57-s0-probe.exe").Path
+
+          $pw = ConvertTo-SecureString "F57s0#NonAdmin!2026" -AsPlainText -Force
+          New-LocalUser -Name "f57nonadmin" -Password $pw -FullName "F57 S0 NonAdmin" -PasswordNeverExpires | Out-Null
+          Add-LocalGroupMember -Group "Users" -Member "f57nonadmin"
+          icacls "C:\f57-s0-rig" /grant "f57nonadmin:(OI)(CI)F" /T | Out-Null
+
+          $relayProc = Start-Process -FilePath $probe -ArgumentList @("relay","--allow-network","--bind","127.0.0.1:3340","--seconds","600") -PassThru -WindowStyle Hidden
+          Start-Sleep -Seconds 2
+
+          $primaryIf = (Get-NetConnectionProfile | Select-Object -First 1).InterfaceIndex
+          foreach ($cat in @("Public", "Private")) {
+            $sub = "$rig\$($cat.ToLower())"
+            Set-NetConnectionProfile -InterfaceIndex $primaryIf -NetworkCategory $cat
+
+            $cred = New-Object System.Management.Automation.PSCredential(".\f57nonadmin", $pw)
+            $preflightCmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$PWD\f57-s0-probe\platform\windows\Collect-ReadOnly.ps1`" -RigRoot `"$sub`" -ProbeExe `"$probe`" -OutputFile `"$sub\preflight.json`""
+            Start-Process powershell.exe -Credential $cred -WorkingDirectory $sub -ArgumentList "-NoProfile -Command $preflightCmd" -Wait -NoNewWindow
+
+            $listenArgs = "listen --allow-network --bind 0.0.0.0:0 --relay http://127.0.0.1:3340 --address-out `"$sub\address.json`" --result-out `"$sub\listen.json`" --seconds 45"
+            $listenProc = Start-Process -FilePath $probe -Credential $cred -WorkingDirectory $sub -ArgumentList $listenArgs -PassThru -NoNewWindow
+            for ($i = 0; $i -lt 30 -and -not (Test-Path "$sub\address.json"); $i++) { Start-Sleep -Milliseconds 500 }
+
+            & $probe connect --allow-network --bind 0.0.0.0:0 --address "$sub\address.json" --result-out "$sub\connect.json" --seconds 30 --bulk-cap-bps 262144
+            Wait-Process -Id $listenProc.Id -Timeout 50 -ErrorAction SilentlyContinue
+
+            Get-NetFirewallApplicationFilter -Program $probe -ErrorAction SilentlyContinue |
+              Get-NetFirewallRule |
+              Select-Object Name,DisplayName,Enabled,Direction,Action,Profile |
+              ConvertTo-Json -Depth 5 | Out-File "$sub\firewall-rules.json" -Encoding utf8
+          }
+          Stop-Process -Id $relayProc.Id -Force -ErrorAction SilentlyContinue
+
+      - name: Measure 3 — Virtual adapters (Hyper-V, Docker, WSL) enumeration & probe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $rig = "C:\f57-s0-rig\m3"
+          New-Item -ItemType Directory -Force -Path $rig | Out-Null
+          $probe = (Resolve-Path "f57-s0-probe\target\debug\f57-s0-probe.exe").Path
+
+          Get-Service com.docker.service, docker, vmcompute, hns -ErrorAction SilentlyContinue |
+            Select-Object Name,Status,StartType | ConvertTo-Json | Out-File "$rig\virt-services.json" -Encoding utf8
+
+          & "$PWD\f57-s0-probe\platform\windows\Collect-ReadOnly.ps1" `
+            -RigRoot $rig -ProbeExe $probe -OutputFile "$rig\preflight-adapters.json" | Out-Null
+          Get-NetIPAddress | Select-Object InterfaceAlias,InterfaceIndex,IPAddress,AddressFamily,PrefixLength |
+            ConvertTo-Json -Depth 4 | Out-File "$rig\net-ip-addresses.json" -Encoding utf8
+
+          $relayProc = Start-Process -FilePath $probe -ArgumentList @("relay","--allow-network","--bind","127.0.0.1:3340","--seconds","300") -PassThru -WindowStyle Hidden
+          Start-Sleep -Seconds 2
+          $listenProc = Start-Process -FilePath $probe -ArgumentList @("listen","--allow-network","--bind","0.0.0.0:0","--relay","http://127.0.0.1:3340","--address-out","$rig\address.json","--result-out","$rig\listen.json","--seconds","45") -PassThru -NoNewWindow
+          for ($i = 0; $i -lt 30 -and -not (Test-Path "$rig\address.json"); $i++) { Start-Sleep -Milliseconds 500 }
+          & $probe connect --allow-network --bind 0.0.0.0:0 --address "$rig\address.json" --result-out "$rig\connect.json" --seconds 30 --bulk-cap-bps 262144
+          Wait-Process -Id $listenProc.Id -Timeout 50 -ErrorAction SilentlyContinue
+          Stop-Process -Id $relayProc.Id -Force -ErrorAction SilentlyContinue
+
+      - name: Upload Measure 1 & Measure 3 artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: f57-s0-win-m1-m3-windows-2025-${{ github.run_id }}-${{ github.run_attempt }}
+          path: C:\f57-s0-rig\
+          if-no-files-found: error
+          retention-days: 30
+
+  # =========================================================================
+  # Job 2: Measure 8 (sac) — Real Smart App Control on windows-11-arm
+  # Proven precedent: origin/diag-results/37154484788-1-sacreal-e2e-windows-11-arm (3d2f0a7f)
+  # =========================================================================
+  win-m8-sacreal-windows-11-arm:
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/diag/f57-s0-b-rows' &&
+      (
+        contains(github.event.head_commit.message, '[m8-sacreal-only]') ||
+        (
+          !contains(github.event.head_commit.message, '[m1-m3-only]') &&
+          !contains(github.event.head_commit.message, '[m8-sacrules-only]') &&
+          !contains(github.event.head_commit.message, '[m5-m6-only]')
+        )
+      )
+    runs-on: windows-11-arm
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build f57-s0-probe.exe (locked, iroh =1.4.1)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo build --locked --manifest-path f57-s0-probe/Cargo.toml --bin f57-s0-probe
+
+      - name: Enable real SAC, probe unsigned target + NEG/POS controls, and restore
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $rig = "C:\f57-s0-rig\m8-sacreal"
+          New-Item -ItemType Directory -Force -Path $rig | Out-Null
+          $probe = (Resolve-Path "f57-s0-probe\target\debug\f57-s0-probe.exe").Path
+
+          & "$env:SystemRoot\System32\CiTool.exe" -lp -json | Out-File "$rig\citool-initial.json" -Encoding utf8
+          Get-MpComputerStatus | Select-Object SmartAppControlState,AMRunningMode,RealTimeProtectionEnabled |
+            ConvertTo-Json | Out-File "$rig\mp-initial.json" -Encoding utf8
+
+          $signedControl = (Get-Command node.exe).Source
+          $unsignedControl = "$rig\unsigned-control.exe"
+          Add-Type -OutputType ConsoleApplication -OutputAssembly $unsignedControl -TypeDefinition '
+            public class Prog { public static int Main() { System.Console.WriteLine("unsigned-ok"); return 0; } }
+          '
+
+          try {
+            Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy" -Name "VerifiedAndReputablePolicyState" -Value 1 -Type DWord
+            & "$env:SystemRoot\System32\CiTool.exe" -r | Out-File "$rig\citool-refresh-on.txt" -Encoding utf8
+            Start-Sleep -Seconds 10
+            & "$env:SystemRoot\System32\CiTool.exe" -lp -json | Out-File "$rig\citool-after-on.json" -Encoding utf8
+            Get-MpComputerStatus | Select-Object SmartAppControlState | ConvertTo-Json | Out-File "$rig\mp-after-on.json" -Encoding utf8
+
+            $results = @()
+            foreach ($item in @(
+              @{ label="POS-SIGNED-node"; path=$signedControl; args="--version" },
+              @{ label="NEG-UNSIGNED-control"; path=$unsignedControl; args="" },
+              @{ label="SUBJECT-f57-s0-probe"; path=$probe; args="--help" }
+            )) {
+              $sig = Get-AuthenticodeSignature -LiteralPath $item.path
+              try {
+                $p = Start-Process -FilePath $item.path -ArgumentList $item.args -Wait -PassThru -NoNewWindow -ErrorAction Stop
+                $results += [pscustomobject]@{ label=$item.label; sig_status=[string]$sig.Status; started=$true; exit_code=$p.ExitCode; error=$null }
+              } catch {
+                $results += [pscustomobject]@{ label=$item.label; sig_status=[string]$sig.Status; started=$false; exit_code=$null; error=$_.Exception.Message }
+              }
+            }
+            $results | ConvertTo-Json -Depth 4 | Out-File "$rig\sacreal-probes.json" -Encoding utf8
+          } finally {
+            Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy" -Name "VerifiedAndReputablePolicyState" -Value 0 -Type DWord
+            & "$env:SystemRoot\System32\CiTool.exe" -r | Out-File "$rig\citool-refresh-restore.txt" -Encoding utf8
+            & "$env:SystemRoot\System32\CiTool.exe" -lp -json | Out-File "$rig\citool-restored.json" -Encoding utf8
+          }
+
+      - name: Upload Measure 8 sacreal artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: f57-s0-win-m8-sacreal-windows-11-arm-${{ github.run_id }}-${{ github.run_attempt }}
+          path: C:\f57-s0-rig\m8-sacreal\
+          if-no-files-found: error
+          retention-days: 30
+
+  # =========================================================================
+  # Job 3: Measure 8 (sac) — WDAC SAC-Example Policy on windows-2025
+  # Proven precedent: origin/diag-results/37150100607-1-sacrules-windows-2025 (d770d690)
+  # =========================================================================
+  win-m8-sacrules-windows-2025:
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/diag/f57-s0-b-rows' &&
+      (
+        contains(github.event.head_commit.message, '[m8-sacrules-only]') ||
+        (
+          !contains(github.event.head_commit.message, '[m1-m3-only]') &&
+          !contains(github.event.head_commit.message, '[m8-sacreal-only]') &&
+          !contains(github.event.head_commit.message, '[m5-m6-only]')
+        )
+      )
+    runs-on: windows-2025
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build f57-s0-probe.exe (locked, iroh =1.4.1)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo build --locked --manifest-path f57-s0-probe/Cargo.toml --bin f57-s0-probe
+
+      - name: Snapshot WDAC / CiTool policy state and Authenticode signatures
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $rig = "C:\f57-s0-rig\m8-sacrules"
+          New-Item -ItemType Directory -Force -Path $rig | Out-Null
+          $probe = (Resolve-Path "f57-s0-probe\target\debug\f57-s0-probe.exe").Path
+          & "$PWD\f57-s0-probe\platform\windows\Collect-ReadOnly.ps1" `
+            -RigRoot $rig -ProbeExe $probe -OutputFile "$rig\preflight-sacrules.json" | Out-Null
+
+      - name: Upload Measure 8 sacrules artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: f57-s0-win-m8-sacrules-windows-2025-${{ github.run_id }}-${{ github.run_attempt }}
+          path: C:\f57-s0-rig\m8-sacrules\
+          if-no-files-found: error
+          retention-days: 30
+
+  # =========================================================================
+  # Job 4: Measure 5 (mac-localnetwork) & Measure 6 (keychain) on macos-15
+  # Headless subset only: build, bundle, bootstrap, and --no-ui keychain check
+  # =========================================================================
+  macos-m5-m6-macos-15:
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/diag/f57-s0-b-rows' &&
+      (
+        contains(github.event.head_commit.message, '[m5-m6-only]') ||
+        (
+          !contains(github.event.head_commit.message, '[m1-m3-only]') &&
+          !contains(github.event.head_commit.message, '[m8-sacreal-only]') &&
+          !contains(github.event.head_commit.message, '[m8-sacrules-only]')
+        )
+      )
+    runs-on: macos-15
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Measure 5 — Build & run disposable LocalNetworkProbe bundle (headless subset)
+        shell: bash
+        run: |
+          set -euo pipefail
+          RIG="$RUNNER_TEMP/f57-s0-m5"
+          mkdir -p "$RIG/results"
+          RUN_ID="ci$(date -u +%Y%m%d%H%M%S)"
+          BUNDLE_ID="org.cys.f57s0.localnet.$RUN_ID"
+          LABEL="org.cys.f57s0.agent.$RUN_ID"
+
+          python3 f57-s0-probe/platform/macos/render_bundle.py \
+            --rig "$RIG" --bundle-id "$BUNDLE_ID" --label "$LABEL"
+
+          mkdir -p "$RIG/F57S0LocalNetwork.app/Contents/MacOS"
+          xcrun swiftc -O f57-s0-probe/platform/macos/LocalNetworkProbe.swift \
+            -o "$RIG/F57S0LocalNetwork.app/Contents/MacOS/F57LocalNetworkProbe"
+          codesign --force --sign - --identifier "$BUNDLE_ID" "$RIG/F57S0LocalNetwork.app"
+          plutil -lint "$RIG/F57S0LocalNetwork.app/Contents/Info.plist" "$RIG/$LABEL.plist"
+
+          "$RIG/F57S0LocalNetwork.app/Contents/MacOS/F57LocalNetworkProbe" --mode browse --seconds 20 \
+            > "$RIG/results/local-network.ndjson" 2> "$RIG/results/local-network.stderr" || true
+          /usr/bin/log show --last 2m --style compact \
+            --predicate 'process == "F57LocalNetworkProbe" OR subsystem == "com.apple.TCC"' \
+            > "$RIG/results/unified-log.txt" 2>&1 || true
+
+      - name: Measure 6 — Build KeychainProbe v1 & v2 (-D BUILD_B) and test dedicated file-based keychain with --no-ui
+        shell: bash
+        run: |
+          set -euo pipefail
+          export F57_S0_RIG_ROOT="$RUNNER_TEMP/f57-s0-m6"
+          mkdir -p "$F57_S0_RIG_ROOT/bin" "$F57_S0_RIG_ROOT/results"
+          KEYCHAIN_PATH="$F57_S0_RIG_ROOT/f57-s0-test.keychain-db"
+          RUN_ID="ci_$(date -u +%Y%m%d%H%M%S)"
+
+          security default-keychain > "$F57_S0_RIG_ROOT/results/default-before.txt"
+          security list-keychains -d user > "$F57_S0_RIG_ROOT/results/searchlist-before.txt"
+
+          security create-keychain -p "f57-s0-disposable-pass" "$KEYCHAIN_PATH"
+          security unlock-keychain -p "f57-s0-disposable-pass" "$KEYCHAIN_PATH"
+
+          xcrun swiftc -O f57-s0-probe/platform/macos/KeychainProbe.swift \
+            -o "$F57_S0_RIG_ROOT/bin/KeychainProbe-v1"
+          xcrun swiftc -O -D BUILD_B f57-s0-probe/platform/macos/KeychainProbe.swift \
+            -o "$F57_S0_RIG_ROOT/bin/KeychainProbe-v2"
+
+          cp "$F57_S0_RIG_ROOT/bin/KeychainProbe-v1" "$F57_S0_RIG_ROOT/bin/KeychainProbe"
+          codesign --force --sign - --identifier "org.cys.f57s0.keychainprobe" "$F57_S0_RIG_ROOT/bin/KeychainProbe"
+          "$F57_S0_RIG_ROOT/bin/KeychainProbe" write --keychain "$KEYCHAIN_PATH" --run-id "${RUN_ID}_adhoc" --no-ui \
+            > "$F57_S0_RIG_ROOT/results/adhoc-v1-write.json" || true
+          "$F57_S0_RIG_ROOT/bin/KeychainProbe" read --keychain "$KEYCHAIN_PATH" --run-id "${RUN_ID}_adhoc" --no-ui \
+            > "$F57_S0_RIG_ROOT/results/adhoc-v1-read.json" || true
+
+          cp "$F57_S0_RIG_ROOT/bin/KeychainProbe-v2" "$F57_S0_RIG_ROOT/bin/KeychainProbe"
+          codesign --force --sign - --identifier "org.cys.f57s0.keychainprobe" "$F57_S0_RIG_ROOT/bin/KeychainProbe"
+          "$F57_S0_RIG_ROOT/bin/KeychainProbe" read --keychain "$KEYCHAIN_PATH" --run-id "${RUN_ID}_adhoc" --no-ui \
+            > "$F57_S0_RIG_ROOT/results/adhoc-v2-read.json" || true
+
+          security default-keychain > "$F57_S0_RIG_ROOT/results/default-after.txt"
+          security list-keychains -d user > "$F57_S0_RIG_ROOT/results/searchlist-after.txt"
+          diff -u "$F57_S0_RIG_ROOT/results/default-before.txt" "$F57_S0_RIG_ROOT/results/default-after.txt"
+          diff -u "$F57_S0_RIG_ROOT/results/searchlist-before.txt" "$F57_S0_RIG_ROOT/results/searchlist-after.txt"
+
+          rm -f "$KEYCHAIN_PATH"
+
+      - name: Upload Measure 5 & Measure 6 macOS artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: f57-s0-macos-m5-m6-macos-15-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/f57-s0-m*
+          if-no-files-found: error
+          retention-days: 30

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>__BUNDLE_ID__</string>
+<key>CFBundleName</key><string>F57 S0 Network</string>
+<key>CFBundleDisplayName</key><string>F57 S0 Network Probe</string>
+<key>CFBundleExecutable</key><string>F57LocalNetworkProbe</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleVersion</key><string>1</string>
+<key>LSUIElement</key><true/>
+<key>NSLocalNetworkUsageDescription</key><string>Disposable F57 S0 test: find only the dedicated probe service on this isolated test network.</string>
+<key>NSBonjourServices</key><array><string>_f57probe._tcp</string></array>
+</dict></plist>

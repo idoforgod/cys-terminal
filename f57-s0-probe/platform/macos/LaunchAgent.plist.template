@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>__LABEL__</string>
+<key>AssociatedBundleIdentifiers</key><array><string>__BUNDLE_ID__</string></array>
+<key>ProgramArguments</key><array><string>__APP__/Contents/MacOS/F57LocalNetworkProbe</string><string>--mode</string><string>browse</string><string>--seconds</string><string>180</string></array>
+<key>RunAtLoad</key><true/>
+<key>KeepAlive</key><false/>
+<key>StandardOutPath</key><string>__RIG__/results/local-network.ndjson</string>
+<key>StandardErrorPath</key><string>__RIG__/results/local-network.stderr</string>
+</dict></plist>
