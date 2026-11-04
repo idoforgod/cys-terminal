@@ -36393,6 +36393,107 @@ after-tick liveness alone does not attribute a clock defect",
         let _ = s.child.lock().unwrap().kill();
         crate::state::p1_e0_stop_daemon(&_daemon);
     }
+
+    #[test]
+    fn p10_take_withheld_if_identity_checks_every_conjunct() {
+        let track = crate::state::InjectTrack::default();
+        let at = std::time::Instant::now();
+        let body_at = at + std::time::Duration::from_millis(10);
+        track.note_withheld(crate::state::WithheldSubmit::new_swallowed(
+            at,
+            body_at,
+            None,
+            "req-a2".into(),
+        ));
+        let expected_slot = Some((
+            crate::state::WithheldKind::Swallowed,
+            body_at,
+            Some("req-a2".to_string()),
+        ));
+
+        // 1) `kind` mismatched (`DialogWithheld` vs `Swallowed`), `body_at` and `request_id` equal -> nothing taken.
+        assert!(
+            track
+                .take_withheld_if_identity(crate::state::WithheldKind::DialogWithheld, "req-a2", body_at)
+                .is_none(),
+            "kind mismatch must not take the withheld record"
+        );
+        assert_eq!(
+            track.withheld().map(|w| (w.kind, w.body_at, w.request_id)),
+            expected_slot,
+            "kind mismatch must leave the withheld record untouched"
+        );
+
+        // 2) `body_at` mismatched (`body_at + 1ms` vs `body_at`), `kind` and `request_id` equal -> nothing taken.
+        let wrong_body_at = body_at + std::time::Duration::from_millis(1);
+        assert!(
+            track
+                .take_withheld_if_identity(crate::state::WithheldKind::Swallowed, "req-a2", wrong_body_at)
+                .is_none(),
+            "body_at mismatch must not take the withheld record"
+        );
+        assert_eq!(
+            track.withheld().map(|w| (w.kind, w.body_at, w.request_id)),
+            expected_slot,
+            "body_at mismatch must leave the withheld record untouched"
+        );
+
+        // 3) `request_id` mismatched (`"req-other"` vs `"req-a2"`), `kind` and `body_at` equal -> nothing taken.
+        assert!(
+            track
+                .take_withheld_if_identity(crate::state::WithheldKind::Swallowed, "req-other", body_at)
+                .is_none(),
+            "request_id mismatch must not take the withheld record"
+        );
+        assert_eq!(
+            track.withheld().map(|w| (w.kind, w.body_at, w.request_id)),
+            expected_slot,
+            "request_id mismatch must leave the withheld record untouched"
+        );
+
+        // 4) All three conjuncts equal (`kind`, `body_at`, `request_id`) -> record is taken and slot becomes `None`.
+        let taken = track
+            .take_withheld_if_identity(crate::state::WithheldKind::Swallowed, "req-a2", body_at)
+            .expect("all-equal identity must take the withheld record");
+        assert_eq!(
+            (taken.kind, taken.body_at, taken.request_id.as_deref()),
+            (crate::state::WithheldKind::Swallowed, body_at, Some("req-a2"))
+        );
+        assert!(track.withheld().is_none(), "withheld slot must be empty after matching take");
+    }
+
+    #[test]
+    fn p10_competing_record_in_resubmit_window_untouched() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _sc = P10TestScopeGuard::claude();
+        let (daemon, s) = wp5_seat("p10-a3-compete", "claude");
+        p1_measured(&s);
+        let now = p10_seed_mark(&s, "M|x|COMP", 5, Some("q-a3"));
+        p10_paint_inline_box(&s, "❯ M|x|COMP");
+        p10_arm(&daemon, &s);
+        let body_at = s.inject_track.last_body().unwrap().at;
+        let sw = s.inject_track.withheld().expect("armed Swallowed record");
+        let wrote_before = s.inject_track.wrote();
+        // Simulate a competing `DialogWithheld` record replacing `withheld` at the same `at` (`sw.at`) after `w0` was read at :7006,
+        // so execution passes `update_withheld_if(at)` (:7186, :7287) and reaches the in-gate `take_withheld_if_identity` at :7393.
+        s.inject_track
+            .note_withheld(crate::state::WithheldSubmit::new(sw.at, body_at, None));
+        let r = super::resubmit_swallowed_one(&daemon, &s, sw, now + std::time::Duration::from_secs(5));
+        assert_eq!(r, "owner_changed", "competing DialogWithheld at :7393 must decline as owner_changed");
+        assert_eq!(
+            s.inject_track.withheld().map(|w| w.kind),
+            Some(crate::state::WithheldKind::DialogWithheld),
+            "competing DialogWithheld record must remain untouched at :7393"
+        );
+        assert_eq!(
+            s.inject_track.residue_stage_for_current_body(),
+            Some(crate::state::ResidueStage::Declined("owner_changed"))
+        );
+        p10_settle_writer_barrier(&s);
+        assert_eq!(s.inject_track.wrote(), wrote_before, "0 Returns written when competing record owns slot");
+        let _ = s.child.lock().unwrap().kill();
+        crate::state::p1_e0_stop_daemon(&daemon);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
