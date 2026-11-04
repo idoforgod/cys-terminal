@@ -429,6 +429,8 @@ identify→cys identify · list-workspaces→cys list · 상세 대응표는 *_D
 원문을 확인하는 것은 자유다.
 (이 고지는 사용자 언어로 번역해 제시해도 된다 — 경로·명령·파일명은 번역하지 않는다.)
 EOF
+  # ★F58-PLACE r2: 역할 미상 갈래도 같은 앞 사본을 끝에 낸다(이 출력은 1만 자 미만이라 통째로 보인다).
+  if command -v cys_self_service_early >/dev/null 2>&1; then cys_self_service_early; fi
   exit 0
 fi
 
@@ -537,6 +539,9 @@ echo "■ CYSJavis 역할 각성 (CYS_ROLE=$CYS_ROLE)"
 #   두 배로 든다(② · test_session_start_hook 22b). 줄 전체가 미리보기 창(앞 2,000자) 안에서 끝나야 한다.
 #   경로 줄은 printf(G8 — macOS /bin/sh 의 xpg_echo 가 윈도우 백슬래시 경로를 먹는다).
 printf '■ 이 출력이 길어 앞부분 미리보기만 보이고(나머지는 파일로 빠짐) 역할 지침 전문이 이 대화에 따로 없으면, 지침 전문 %s 과 %s 를 Read 도구로 끝까지(offset·limit 로 나눠) 읽은 뒤에 행동하라 — 전문이 이 대화에 이미 있으면(부트·사이클은 CLI 가 붙여 넣는다) 다시 읽지 않는다(같은 지침 중복 적재 금지) · 지침 없이 추측으로 움직이지 않는다.\n' "$(cys_native_path "$D" 2>/dev/null || printf '%s' "$D")" "$(cys_native_path "$JARVIS_DIR/soul.md" 2>/dev/null || printf '%s' "$JARVIS_DIR/soul.md")"
+# ★F58-PLACE r2: 셀프 서비스 고정 5줄의 앞 사본 — 미리보기(앞 약 2,000자) 안에 들도록 읽기 안내 줄 바로 뒤에 낸다
+#   (읽기 안내 줄의 위치는 바꾸지 않는다 · 정적 printf 만 · 함수가 없는 옛 _lib.sh 면 아무것도 내지 않는다).
+if command -v cys_self_service_early >/dev/null 2>&1; then cys_self_service_early; fi
 cat "$D"
 # ★R13 부트 브리지(T2b 전 임시 — hook=system층이라 디렉티브(user-owned) 미개정 기계에도 전파):
 # 구 산문 §0만 아는 master는 부트 스크립트를 몰라 완료 마커가 안 생기고 CEO 승격이 영구
@@ -598,6 +603,7 @@ fi
 # ── ★F58(0.14.57) 셀프 서비스 블록 — 읽기 안내 줄(:539)·로컬 지침·soul·기억 색인 뒤, U16 BEGIN 앞
 #   (DESIGN-F58 r2 §7.3 · final §7.2: 안내 줄의 2,000자 위치·U16 바이트·끝의 exit 0 을 바꾸지 않는다).
 #   문안 단일 원본 = _lib.sh cys_self_service_note · 함수가 없는 옛 _lib.sh 면 아무것도 내지 않는다.
+#   고정 5줄은 cys_self_service_rules 가 단일 원본이고 읽기 안내 줄 바로 뒤에도 한 번 나온다(F58-PLACE r2).
 if command -v cys_self_service_note >/dev/null 2>&1; then
   echo; cys_self_service_note "$CYS_ROLE"
 fi
