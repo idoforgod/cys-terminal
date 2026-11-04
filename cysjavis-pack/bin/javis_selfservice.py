@@ -33,6 +33,7 @@ Lever table: <pack>/round/self_service_levers.json (pack = CYS_PACK_DIR, else th
 import argparse
 import hashlib
 import json
+import math
 import os
 import platform
 import re
@@ -250,7 +251,11 @@ def run_probe(table, pid, case_dir, seq, role, command, pack):
     if spec["argv"][0] == "{python}":
         argv.insert(1, "-B")
     obs["argv"] = argv
-    timeout = spec.get("timeout_s", 20)
+    # F58 r1fix m3: only a finite positive number is a timeout. null, 0, missing, negative, a string, a bool, NaN or
+    # Infinity runs with 20 s, so a probe is never unbounded (a hanging probe must not hang the tool call).
+    t = spec.get("timeout_s")
+    ok = isinstance(t, (int, float)) and not isinstance(t, bool) and math.isfinite(t) and t > 0
+    timeout = t if ok else 20
     raw_out, raw_err, rc = b"", b"", None
     try:
         r = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,

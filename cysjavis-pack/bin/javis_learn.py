@@ -87,6 +87,7 @@ import re
 import subprocess
 import sys
 import time
+import unicodedata
 from datetime import date, timedelta
 from urllib.parse import urlparse
 
@@ -423,11 +424,14 @@ def _dedupe(items):
 
 
 def string_problems(s):
-    """한 문자열의 어휘 검출(순수 · §4.3). 각 실패는 이름 붙은 이유 하나다. 빈 목록 = 이 형태들이 없다."""
+    """한 문자열의 어휘 검출(순수 · §4.3). 각 실패는 이름 붙은 이유 하나다. 빈 목록 = 이 형태들이 없다.
+    F58 r1fix m1: 검사는 NFKC 로 정규화한 문자열에 한다 — 목록에 있는 낱말·문자의 전각·호환 꼴
+    ('ｒｍ －ｒｆ ～／ｏｌｄ')도 ASCII 꼴과 똑같이 걸린다. 이 함수는 검사만 하고, 쓰는 문자열은 원문 그대로다."""
     try:
         s.encode("utf-8")
     except UnicodeEncodeError:
         return ["undecodable"]
+    s = unicodedata.normalize("NFKC", s)
     out = []
     if any(_is_control(ch) and ch != "\n" for ch in s):
         out.append("control character")
