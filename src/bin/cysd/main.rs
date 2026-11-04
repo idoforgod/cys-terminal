@@ -52,6 +52,7 @@ mod hwmon;
 mod knobs;
 mod office_bridge;
 mod native_publication;
+mod panic_log;
 mod pending_requests;
 mod phoenix_plan;
 mod policy_loader;
@@ -1287,6 +1288,11 @@ async fn async_main() {
             }
         }
     };
+
+    // W60 D2 (0.14.57): the panic record (<lane state dir>/cysd-panic.log), installed in front of std's hook right after the
+    // single-instance gate on both OSes (unix: the startup lock above; Windows: the first_pipe claim just above), so a gate
+    // loser never creates the file (W1 contract) and the .prev sweep below is already covered (DESIGN-W60-r2 §3.1-§3.2).
+    panic_log::install(&socket_path);
 
     // windows .prev sweep 은 위 싱글턴 게이트 **뒤**에서 수행 — 승자만 잔해를 정리한다(패자는 이미 즉사).
     // ★무중단 rename-swap 잔해 청소(nsis-hooks.nsh의 짝): 업데이트가 잠긴 파일을 죽이는 대신
@@ -8825,6 +8831,16 @@ mod pty_admission_tests;
 mod agent_queue_tests;
 #[cfg(test)]
 mod direct_agent_tests;
+
+// W60 S1 (0.14.57): Windows named-pipe SMOKE check (DESIGN-W60-r2 §9.3) - it did not reproduce the mio 1.2.1 crash on hosted
+// runners (dept-5 W60-MIO/RIG-INVESTIGATION-R.md); mio 1.2.4 ships on the upstream fix (mio PR #2014). Windows only.
+#[cfg(all(test, windows))]
+mod w60_named_pipe_tests;
+
+// W60 D2 (0.14.57): the cysd panic record - formatter, reader, seat snapshot, census pin and child-process
+// tests (DESIGN-W60-r2 §9.2). Test-only module, kept at the file end like the other pins above.
+#[cfg(test)]
+mod panic_log_tests;
 
 // P4 C-13: the POSIX half of the Ctrl+C / ETX measurement. The Windows half is UNMEASURED by
 // construction and the module note says so - no cell here stands in for it.

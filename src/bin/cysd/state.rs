@@ -7713,6 +7713,9 @@ impl Daemon {
             // 락 순서는 surfaces→roles→surface.role (close_surface와 동일 — AB-BA 데드락 차단).
             let mut surfaces = self.surfaces.lock().unwrap();
             surfaces.insert(id, surface.clone());
+            // W60 D2: the panic record's seat snapshot, published inside this critical section after every production
+            // mutation of `surfaces` (census pin: panic_log_tests::census_every_surfaces_mutation_publishes).
+            crate::panic_log::publish_seats(&surfaces);
             if let Some(r) = &role {
                 let mut roles = self.roles.lock().unwrap();
                 // worker면 충돌 없는 고유 역할명 배정(worker-N) — 복수 워커 todo 충돌 방지.
