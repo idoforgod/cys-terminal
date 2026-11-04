@@ -829,16 +829,19 @@ class Revert(RigCase):
                 with open(hp, "w", encoding="utf-8") as f:
                     f.write(holder_src)
                 path = rig.index if target == "index" else os.path.join(rig.mdir, rec["entry_file"])
-                h = subprocess.Popen([sys.executable, "-B", hp, path], stdin=subprocess.PIPE,
-                                     stdout=subprocess.PIPE, text=True)
-                self.assertEqual(h.stdout.readline().strip(), "held")
-                before = rig.snapshot()
-                try:
-                    res = self.revert(rig, "cache-a")
-                finally:
-                    h.stdin.write("x\n")
-                    h.stdin.flush()
-                    h.wait(timeout=10)
+                # r2fix B1: Popen as a context manager closes the holder's stdin and stdout and reaps it, so the case
+                # leaves no ResourceWarning (unittest.main shows warnings; one between ' ... ' and 'ok' broke the
+                # windows-health line check). Closing stdin also ends the holder if an assertion below fails.
+                with subprocess.Popen([sys.executable, "-B", hp, path], stdin=subprocess.PIPE,
+                                      stdout=subprocess.PIPE, text=True) as h:
+                    self.assertEqual(h.stdout.readline().strip(), "held")
+                    before = rig.snapshot()
+                    try:
+                        res = self.revert(rig, "cache-a")
+                    finally:
+                        h.stdin.write("x\n")
+                        h.stdin.flush()
+                        h.wait(timeout=10)
                 self.assertEqual(res.returncode, 3, res.stdout + res.stderr)
                 after = {k: v for k, v in rig.snapshot().items() if not k.startswith(".learned-trash")}
                 self.assertEqual(after, before)
