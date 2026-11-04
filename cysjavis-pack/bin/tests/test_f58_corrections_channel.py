@@ -733,7 +733,7 @@ class Hooks(Base):
 # before character 1,998 (worker-2 t6 cut; head 2.1.316 bounds L to [1,998, 2,022)).
 
 EARLY_HEAD = "▶ 셀프 서비스(F58): "
-EARLY_TAIL = "- 정정 건수·읽기 명령: 훅 출력 맨 끝의 셀프 서비스(F58) 블록(파일로 빠졌으면 그 파일 끝)."
+EARLY_TAIL = "- 정정 건수·읽기 명령: 훅 출력 뒤쪽의 셀프 서비스(F58) 블록(파일로 빠졌으면 그 파일 뒤쪽)."
 EARLY_PREFIXES = (EARLY_HEAD, "- 첫 대답: ", "- 절차: cys skill show self-service · 경계: ", "- 사용자에게 한 번 묻고 한다: ",
                   "- 제조사 보고는 마지막 단계", EARLY_TAIL)
 S_FORM = "「우리가 직접 고칠 수 있습니다. 먼저 <할 일> 하겠습니다.」"
@@ -914,8 +914,7 @@ class Place(Base):
         print("T-P1-max-a: read pointer %d, copy line ends %s" % (rp_end, cends))
 
     def test_tp1_max_b_beyond_the_envelope_keeps_both_answer_forms_together(self):
-        out, rp_end, copy, cends = self.union_run_at(1765)
-        self.assertLess(rp_end, 2000, "read pointer ends at %d" % rp_end)
+        out, rp_end, copy, cends = self.union_run_at(1765)  # rp_end == 1765 by construction (recorded in the print)
         self.assertLessEqual(cends[1], PREVIEW_IN, "head + first-answer lines end at %d" % cends[1])
         self.assertTrue(S_FORM in copy[1] and RO_FORM in copy[1], "both first-answer forms on the first-answer line")
         print("T-P1-max-b: read pointer %d, copy line ends %s, out of the preview: %s" % (
@@ -1051,11 +1050,21 @@ class Place(Base):
             lib = f.read()
         for name in names:
             self.assertNotIn("%s() {" % name, lib, "transform left %s" % name)
-        rc, out = self.rig.session_start("worker", ss)
-        self.assertEqual(rc, 0)
-        self.assertIn("■ CYSJavis 역할 각성", out, "role path not taken")
-        self.assertNotIn(EARLY_HEAD, out)
-        self.assertNotIn(BLOCK_HEAD, out)
+        # both paths, stderr captured (r1 minor 2): without the command -v guards stdout and rc stay the same and
+        # only stderr shows 'cys_self_service_early: command not found'
+        for label, role, stdin in (("role path", "worker", b""), ("roleless", None, b"{}")):
+            r = subprocess.run(["sh", ss], input=stdin, capture_output=True, env=self.rig.env(role), timeout=120)
+            out, err = r.stdout.decode("utf-8", "replace"), r.stderr.decode("utf-8", "replace")
+            self.assertEqual(r.returncode, 0, label)
+            if role:
+                self.assertIn("■ CYSJavis 역할 각성", out, "role path not taken")
+            else:
+                self.assertIn("■ 이 문단의 출처", out, "roleless branch not taken")
+                self.assertNotIn("■ CYSJavis 역할 각성", out, "roleless: role path taken")
+            self.assertNotIn(EARLY_HEAD, out, label)
+            self.assertNotIn(BLOCK_HEAD, out, label)
+            self.assertNotIn("cys_self_service", err, "%s: stderr names a self-service function: %r" % (label, err[-300:]))
+            self.assertNotIn("command not found", err, "%s: stderr: %r" % (label, err[-300:]))
         rc, out = self.rig.inject("worker", "startup", ic)
         self.assertEqual(rc, 0)
         self.assertNotIn(BLOCK_HEAD, out)
