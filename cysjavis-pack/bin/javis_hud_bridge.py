@@ -10,7 +10,7 @@ WorldState(§4)로 정규화해 127.0.0.1 전용 HTTP(+SSE)로 내보낸다.
   · 소음 필터·코얼레싱 (§6.3) — watchdog 무시, fx 초당 상한, 알림류 중복 병합
   · 이벤트 유실 방어 — --cursor-file 로 시퀀스 영속, 재시작 시 gap 없이 재개
 
-기동:  cys run --scoped -- python3 bin/javis_hud_bridge.py
+기동:  cys run -- python3 bin/javis_hud_bridge.py
 접속:  http://127.0.0.1:8765
 """
 import json

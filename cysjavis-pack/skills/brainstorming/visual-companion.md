@@ -53,7 +53,7 @@ The scripts live in this skill's directory: `SKILL_DIR=${CYS_PACK_DIR:-$HOME/.cy
 
 **cys terminal (this environment):** servers must be lifecycle-scoped — never leave a detached server behind.
 ```bash
-cys run --scoped -- "$SKILL_DIR/scripts/start-server.sh" --project-dir /path/to/project --foreground
+cys run -- "$SKILL_DIR/scripts/start-server.sh" --project-dir /path/to/project --foreground
 ```
 
 **Claude Code (macOS / Linux, outside cys):**
