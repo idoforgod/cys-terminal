@@ -1,7 +1,8 @@
-# DRAFT ONLY — DO NOT COMMIT OR PUSH WITHOUT HEAD E1 GRANT
+# F57 S0 (B)-rows diagnostic workflow — E1 grant authorised (R229 §1, 2026-11-05)
 # Companion to: PLAN-F57-S0-B-ROWS-ON-CI-r2.md (Revision r2)
 # Precedent trigger: 3d2f0a7f (.github/workflows/diag-win11-update.yml) & 408d0141 (.github/workflows/win-measure.yml)
 # Pinned transport: iroh =1.4.1, iroh-relay =1.4.1 (f57-s0-probe/Cargo.toml lines 10-11, Cargo.lock lines 1338-1339)
+# Runner billing (public repo): standard GitHub-hosted runners (windows-2025, windows-11-arm, macos-15) = $0.00/min (free & unlimited)
 
 name: diag-f57-s0-b-rows
 
@@ -55,14 +56,19 @@ jobs:
           Get-FileHash f57-s0-probe/target/debug/f57-s0-probe.exe -Algorithm SHA256 | Format-List
 
       - name: Measure 1 — Non-admin local user + Public vs Private profile probe
+        if: runner.environment == 'github-hosted'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or [string]::IsNullOrWhiteSpace($env:ImageOS) -or [string]::IsNullOrWhiteSpace($env:ImageVersion)) {
+            throw "FAIL-CLOSED: refusing to run outside a GitHub-hosted ephemeral runner (GITHUB_ACTIONS='$env:GITHUB_ACTIONS', RUNNER_ENVIRONMENT='$env:RUNNER_ENVIRONMENT', ImageOS='$env:ImageOS', ImageVersion='$env:ImageVersion')."
+          }
           $rig = "C:\f57-s0-rig\m1"
           New-Item -ItemType Directory -Force -Path "$rig\public", "$rig\private" | Out-Null
           $probe = (Resolve-Path "f57-s0-probe\target\debug\f57-s0-probe.exe").Path
 
-          $pw = ConvertTo-SecureString "F57s0#NonAdmin!2026" -AsPlainText -Force
+          $runtimeGuid = [string][char]90 + [string][char]122 + [string][char]57 + [string][char]33 + [guid]::NewGuid().ToString("N")
+          $pw = ConvertTo-SecureString $runtimeGuid -AsPlainText -Force
           New-LocalUser -Name "f57nonadmin" -Password $pw -FullName "F57 S0 NonAdmin" -PasswordNeverExpires | Out-Null
           Add-LocalGroupMember -Group "Users" -Member "f57nonadmin"
           icacls "C:\f57-s0-rig" /grant "f57nonadmin:(OI)(CI)F" /T | Out-Null
@@ -94,9 +100,13 @@ jobs:
           Stop-Process -Id $relayProc.Id -Force -ErrorAction SilentlyContinue
 
       - name: Measure 3 — Virtual adapters (Hyper-V, Docker, WSL) enumeration & probe
+        if: runner.environment == 'github-hosted'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or [string]::IsNullOrWhiteSpace($env:ImageOS) -or [string]::IsNullOrWhiteSpace($env:ImageVersion)) {
+            throw "FAIL-CLOSED: refusing to run outside a GitHub-hosted ephemeral runner (GITHUB_ACTIONS='$env:GITHUB_ACTIONS', RUNNER_ENVIRONMENT='$env:RUNNER_ENVIRONMENT', ImageOS='$env:ImageOS', ImageVersion='$env:ImageVersion')."
+          }
           $rig = "C:\f57-s0-rig\m3"
           New-Item -ItemType Directory -Force -Path $rig | Out-Null
           $probe = (Resolve-Path "f57-s0-probe\target\debug\f57-s0-probe.exe").Path
@@ -157,9 +167,13 @@ jobs:
           cargo build --locked --manifest-path f57-s0-probe/Cargo.toml --bin f57-s0-probe
 
       - name: Enable real SAC, probe unsigned target + NEG/POS controls, and restore
+        if: runner.environment == 'github-hosted'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or [string]::IsNullOrWhiteSpace($env:ImageOS) -or [string]::IsNullOrWhiteSpace($env:ImageVersion)) {
+            throw "FAIL-CLOSED: refusing to modify Code Integrity / SAC policy outside a GitHub-hosted ephemeral runner (GITHUB_ACTIONS='$env:GITHUB_ACTIONS', RUNNER_ENVIRONMENT='$env:RUNNER_ENVIRONMENT', ImageOS='$env:ImageOS', ImageVersion='$env:ImageVersion')."
+          }
           $rig = "C:\f57-s0-rig\m8-sacreal"
           New-Item -ItemType Directory -Force -Path $rig | Out-Null
           $probe = (Resolve-Path "f57-s0-probe\target\debug\f57-s0-probe.exe").Path
@@ -242,9 +256,13 @@ jobs:
           cargo build --locked --manifest-path f57-s0-probe/Cargo.toml --bin f57-s0-probe
 
       - name: Snapshot WDAC / CiTool policy state and Authenticode signatures
+        if: runner.environment == 'github-hosted'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or [string]::IsNullOrWhiteSpace($env:ImageOS) -or [string]::IsNullOrWhiteSpace($env:ImageVersion)) {
+            throw "FAIL-CLOSED: refusing to run outside a GitHub-hosted ephemeral runner (GITHUB_ACTIONS='$env:GITHUB_ACTIONS', RUNNER_ENVIRONMENT='$env:RUNNER_ENVIRONMENT', ImageOS='$env:ImageOS', ImageVersion='$env:ImageVersion')."
+          }
           $rig = "C:\f57-s0-rig\m8-sacrules"
           New-Item -ItemType Directory -Force -Path $rig | Out-Null
           $probe = (Resolve-Path "f57-s0-probe\target\debug\f57-s0-probe.exe").Path
@@ -285,9 +303,14 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Measure 5 — Build & run disposable LocalNetworkProbe bundle (headless subset)
+        if: runner.environment == 'github-hosted'
         shell: bash
         run: |
           set -euo pipefail
+          if [[ "${GITHUB_ACTIONS:-}" != "true" || "${RUNNER_ENVIRONMENT:-}" != "github-hosted" || -z "${ImageOS:-}" || -z "${ImageVersion:-}" ]]; then
+            echo "FAIL-CLOSED: refusing to run outside a GitHub-hosted ephemeral runner (GITHUB_ACTIONS=${GITHUB_ACTIONS:-}, RUNNER_ENVIRONMENT=${RUNNER_ENVIRONMENT:-}, ImageOS=${ImageOS:-}, ImageVersion=${ImageVersion:-})" >&2
+            exit 1
+          fi
           RIG="$RUNNER_TEMP/f57-s0-m5"
           mkdir -p "$RIG/results"
           RUN_ID="ci$(date -u +%Y%m%d%H%M%S)"
@@ -310,9 +333,14 @@ jobs:
             > "$RIG/results/unified-log.txt" 2>&1 || true
 
       - name: Measure 6 — Build KeychainProbe v1 & v2 (-D BUILD_B) and test dedicated file-based keychain with --no-ui
+        if: runner.environment == 'github-hosted'
         shell: bash
         run: |
           set -euo pipefail
+          if [[ "${GITHUB_ACTIONS:-}" != "true" || "${RUNNER_ENVIRONMENT:-}" != "github-hosted" || -z "${ImageOS:-}" || -z "${ImageVersion:-}" ]]; then
+            echo "FAIL-CLOSED: refusing to run outside a GitHub-hosted ephemeral runner (GITHUB_ACTIONS=${GITHUB_ACTIONS:-}, RUNNER_ENVIRONMENT=${RUNNER_ENVIRONMENT:-}, ImageOS=${ImageOS:-}, ImageVersion=${ImageVersion:-})" >&2
+            exit 1
+          fi
           export F57_S0_RIG_ROOT="$RUNNER_TEMP/f57-s0-m6"
           mkdir -p "$F57_S0_RIG_ROOT/bin" "$F57_S0_RIG_ROOT/results"
           KEYCHAIN_PATH="$F57_S0_RIG_ROOT/f57-s0-test.keychain-db"
@@ -321,8 +349,9 @@ jobs:
           security default-keychain > "$F57_S0_RIG_ROOT/results/default-before.txt"
           security list-keychains -d user > "$F57_S0_RIG_ROOT/results/searchlist-before.txt"
 
-          security create-keychain -p "f57-s0-disposable-pass" "$KEYCHAIN_PATH"
-          security unlock-keychain -p "f57-s0-disposable-pass" "$KEYCHAIN_PATH"
+          KC_RUNTIME_UUID="$(uuidgen)"
+          security create-keychain -p "$KC_RUNTIME_UUID" "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KC_RUNTIME_UUID" "$KEYCHAIN_PATH"
 
           xcrun swiftc -O f57-s0-probe/platform/macos/KeychainProbe.swift \
             -o "$F57_S0_RIG_ROOT/bin/KeychainProbe-v1"
