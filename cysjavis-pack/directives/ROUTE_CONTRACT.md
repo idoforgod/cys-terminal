@@ -98,7 +98,7 @@ unknown이 **2개 이상**이면 판정 결과에 `needs_grill=true`를 달아 �
 ### 3.2 재분류 = 유일 변경 경로 (§C4.5)
 Level 변경은 오직 이 경로만:
 
-> critic finding 또는 인간 이의 → **master 또는 doctor의 명시 승인(`approval_id` = `APR-YYYYMMDD-NNN`)
+> critic finding 또는 인간 이의 → **master 또는 owner(사용자)의 명시 승인(`approval_id` = `APR-YYYYMMDD-NNN`)
 > + `reason_code`** 기록 → 새 Level로 재판정 기록.
 
 reason code enum:

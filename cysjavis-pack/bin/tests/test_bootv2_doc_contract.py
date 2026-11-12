@@ -281,9 +281,14 @@ def ceo_drift(fragment_bytes, master_bytes, ceo_bytes, separator):
 #   의도**다 — 결함은 변경이 아니라 **조용한 소실**이었다.
 #   범위: ⑤와 같이 **repo 전용**(fragment 실재가 조건)이다. 배포 설치본의 옛 템플릿을
 #   적색으로 만들지 않는다(⑦ 축과 같은 규율).
+#   ★0.15.0 M2(설계 v0.5 §4-2 · V05_SPEC_ADDENDUM C3 — 오너 승인 설계): 머리말 조각은 생성기 입력이라 **중립화**됐다 —
+#   오너 원문 인용·날짜·사고 경위·개인 PC 경로·'벤더 팩 … 배포 전담 부서의 작업' 문장은 출하되지도 생성기 입력도
+#   아닌 `scripts/vendor-notes/ceo-header-vendor-notes.md` 로 옮겼고(바이트 그대로), 규칙은 제품 문장으로 다시 썼다.
+#   두 상수는 그 중립화된 조항으로 다시 고정했다(종전 6,918 B · ef982427…). 조용한 소실을 막는 모양은 그대로다.
 OWNER_CLAUSE_HEADING = "## [CEO 와 master 의 차이"
-OWNER_CLAUSE_BYTES = 6918
-OWNER_CLAUSE_SHA256 = "ef982427f25c5b2c9ad18bca217af043f06ac82e899700ee33ba0887493c1e4c"
+OWNER_CLAUSE_BYTES = 5585
+OWNER_CLAUSE_SHA256 = "2e3f871966662a5218fce768b1b67faabae1e8dbf710e38cfcf8e14a77f83422"
+VENDOR_NOTES = os.path.join(SCRIPTS, "vendor-notes", "ceo-header-vendor-notes.md")
 _TOP_SECTION_RE = re.compile(r"(?m)^## \[")
 
 
@@ -429,6 +434,14 @@ try:
                 + owner_clause_violations("fragment", read(FRAGMENT)))
         check("5b 오너 복원 조항이 CEO_TEMPLATE·fragment 양쪽에 선언된 바이트 그대로 실재(gemini minor-1)",
               not _ocl, "%s" % _ocl)
+        # 5c ★0.15.0 M2(C3): 벤더 개인 기록은 **구조적으로** 출하될 수 없는 자리에 있다 — 팩 트리 밖이고,
+        #   생성기가 읽는 두 입력(FRAGMENT·MASTER) 어느 것도 아니다. 텍스트 매칭 게이트가 아니라 배치 검사다.
+        _vn = os.path.realpath(VENDOR_NOTES)
+        check("5c 벤더 개인 기록 파일이 팩 밖·생성기 입력 밖에 실재(설계 §4-2 · C3)",
+              os.path.isfile(_vn)
+              and not _vn.startswith(os.path.realpath(PACK) + os.sep)
+              and _vn not in (os.path.realpath(gen.FRAGMENT), os.path.realpath(gen.MASTER)),
+              _vn)
     else:
         print("SKIP 5 CEO_TEMPLATE 합성 대조 — fragment 부재(배포 팩 트리 · repo 전용 축)")
         gen = None

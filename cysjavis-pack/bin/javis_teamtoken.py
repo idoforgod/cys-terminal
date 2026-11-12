@@ -204,7 +204,7 @@ OWNER_MESSAGES = {
     "ask_expired": "확인 시간이 지나 다시 여쭙습니다 — 이 내용으로 만들까요?",
     "utterance_ambiguous": "'만들어'라고 짧게 한 번만 말씀해 주시면 바로 만들겠습니다.",
     "utterance_rejected": "네, 아직 만들지 않았습니다. 만들 때 말씀해 주세요.",
-    "machine_origin": "방금 문장은 시스템이 보낸 메시지로 확인됩니다 — 주인님이 직접 한 번만 쳐 주세요.",
+    "machine_origin": "방금 문장은 시스템이 보낸 메시지로 확인됩니다 — 직접 한 번만 쳐 주세요.",
     "ledger_absent": _MSG_SAFE_STOP,
     "ledger_unreadable": _MSG_SAFE_STOP,
     "no_pending": "지금 대기 중인 팀 제안이 없습니다 — 만들 팀을 먼저 정해 주세요.",

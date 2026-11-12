@@ -13,7 +13,7 @@
 
 | actor | 실체 | 권한 요지 |
 |---|---|---|
-| `doctor` | 오너(인간) | 헌법 변경·외부발행·비가역 삭제·break-glass·고위험 승격의 유일 승인자 |
+| `owner` | 이 자비스를 설치해 쓰는 사용자(인간) — 도구 인자·장부 값의 식별자는 하위 호환으로 `doctor` | 헌법 변경·외부발행·비가역 삭제·break-glass·고위험 승격의 유일 승인자 |
 | `master` | master 노드(Claude CLI) | 기술 판단·리뷰·위임·검증 집행. 오너가 위임한 기술 결정 대행. 인간 전속 항목은 대행 불가 |
 | `worker` | 구현 노드 | 위임 범위 내 구현·자기검증. 승인 발급 불가 |
 | `verifier` | agy(Gemini)·codex(GPT) 이종모델 | advisory 판정(ACCEPT/REVISE/BLOCK/ESCALATE)·근거 제시. 집행 권한 없음 |
@@ -23,15 +23,15 @@
 
 | 결정 종류 | 승인자 | 근거 |
 |---|---|---|
-| 상태 경계·전이 규칙 확정(6조) | doctor (master는 초안 제안만) | 인간 고정 영역 원칙 |
-| 보안 크리티컬 로직 승인(6조) | doctor | 〃 |
-| prod break-glass(9조·§C3.4) | doctor | 비가역 위험 |
+| 상태 경계·전이 규칙 확정(6조) | owner (master는 초안 제안만) | 인간 고정 영역 원칙 |
+| 보안 크리티컬 로직 승인(6조) | owner | 〃 |
+| prod break-glass(9조·§C3.4) | owner | 비가역 위험 |
 | 헌법(10조 자체) 변경 | doctor | denylist |
-| Level 재분류 승인(§C4.5) | master(APR 발급) 또는 doctor | 기술 판단 위임 범위 |
-| waiver 발급(§C2.3) | master(만료형·저위험) / doctor(고위험) | 〃 |
-| Phase 진행 게이트 | doctor(로드맵 승인) 후 master 자율주행 | 자율주행 위임권과 정합 |
+| Level 재분류 승인(§C4.5) | master(APR 발급) 또는 owner | 기술 판단 위임 범위 |
+| waiver 발급(§C2.3) | master(만료형·저위험) / owner(고위험) | 〃 |
+| Phase 진행 게이트 | owner(로드맵 승인) 후 master 자율주행 | 자율주행 위임권과 정합 |
 
-> **기계화**: `javis_waiver.py` 는 이 표를 강제한다 — `--risk high` waiver 는 `--approver doctor` 가 아니면 발급 거부(exit 2).
+> **기계화**: `javis_waiver.py` 는 이 표를 강제한다 — `--risk high` waiver 는 `--approver doctor`(owner 의 식별자) 가 아니면 발급 거부(exit 2).
 
 ### C1.3 approval_id·fail-closed·감사 증거
 
@@ -77,7 +77,7 @@ waiver = {waiver_id, 대상 규칙, 사유, 승인자(C1.2 기준), 발급일, *
 - **CT-1**: 무테스트 legacy 단일 수정 → waiver 경로로 done 가능, waiver 만료 후 동일 경로 → fail.
 - **CT-2**: 오너 승인 요구 변경 → change-delta 문서 없으면 5조 위반 fail, 있으면 pass.
 - **CT-3**: L1 행동 변경 + 계약 변경 감지 → 자동 격상 발동(문서 0 유지 시 fail).
-- **CT-4**: 긴급 복구(break-glass) → doctor 승인 없으면 차단, 승인 시 일회성 통과+감사 로그.
+- **CT-4**: 긴급 복구(break-glass) → owner 승인 없으면 차단, 승인 시 일회성 통과+감사 로그.
 
 > **기계화**: `bin/tests/test_contracts_ct.py` (CT-1은 실도구 `javis_waiver.py`, CT-3은 `javis_viberoute.py` 있으면 실연동/없으면 §C4.2 판정표 참조 구현). CT-2·CT-4는 전용 도구 도입 전 온디스크 픽스처 기반 참조 구현으로 계약을 기계화(스텁 인터페이스).
 
@@ -85,10 +85,10 @@ waiver = {waiver_id, 대상 규칙, 사유, 승인자(C1.2 기준), 발급일, *
 
 ## §C3. Deployment Identity Contract [B-3]
 
-- **identity 3분리**: ①agent identity(프로덕션 데이터플레인 read-only 자격증명) ②CI identity(배포 전용·인간 트리거로만 발화) ③human deployer identity(doctor). 에이전트가 CI 도구를 호출해 간접 쓰기하는 경로는 CI identity의 "인간 트리거" 조건이 차단한다.
+- **identity 3분리**: ①agent identity(프로덕션 데이터플레인 read-only 자격증명) ②CI identity(배포 전용·인간 트리거로만 발화) ③human deployer identity(owner). 에이전트가 CI 도구를 호출해 간접 쓰기하는 경로는 CI identity의 "인간 트리거" 조건이 차단한다.
 - **최소권한 정책**: 각 identity의 자격증명은 환경 분리(dev/stage/prod) + 스코프 최소화. 에이전트 환경변수에 prod 쓰기 자격증명 자체를 배급하지 않는다(지시가 아니라 인프라 강제).
 - **prod 권한 거부 E2E** (Phase 1 필수 테스트): agent identity로 prod 쓰기 시도 → 거부(exit 비0)를 실측하는 테스트를 CI에 상설 배치. 통과 못 하면 배포 게이트 차단.
-- **C3.4 break-glass**: 일회성·doctor 승인(approval_id)·전 과정 감사 로그·사후 리뷰 의무. 상설 우회 경로 금지.
+- **C3.4 break-glass**: 일회성·owner 승인(approval_id)·전 과정 감사 로그·사후 리뷰 의무. 상설 우회 경로 금지.
 
 ### C3 prod 권한 거부 E2E — 명세 + 실행 하네스
 
@@ -96,7 +96,7 @@ waiver = {waiver_id, 대상 규칙, 사유, 승인자(C1.2 기준), 발급일, *
 
 - **하네스**: `bin/javis_prod_deny_e2e.sh` — `PROD_WRITE_CMD` 환경변수로 "agent identity 로 prod 쓰기를 시도하는 명령"을 주입(플러거블 target). 하네스는 그 명령을 실행해 **거부(exit 비0)** 를 성공으로, **성공(exit 0)** 을 실패(인프라 강제 미배선)로 판정한다.
 - **명세(성공 기준)**: agent identity 자격증명으로 prod 데이터플레인 쓰기(INSERT/UPDATE/DELETE·인프라 변경)를 시도할 때 데이터베이스/인프라 레벨에서 권한 거부가 발생해야 한다 — 애플리케이션 코드의 방어가 아니라 **credential 스코프 자체**의 거부.
-- **break-glass 경로**: doctor의 유효 approval_id(APR ledger 존재·`used=false`) 없이는 우회 불가(CT-4가 이 규칙을 기계화).
+- **break-glass 경로**: owner 의 유효 approval_id(APR ledger 존재·`used=false`) 없이는 우회 불가(CT-4가 이 규칙을 기계화).
 
 ```bash
 # 배포 단계에서 실 target 주입 후 실행(예):
@@ -117,7 +117,7 @@ PROD_WRITE_CMD='psql "$PROD_AGENT_DSN" -c "insert into t values (1)"' \
 인간 결정은 다음 3채널 중 하나의 구조화 형식으로만 서기에게 도달한다:
 
 - ①메시지 라벨: `[DECISION]` 접두 push/메시지 ②issue form(결정 필드 폼) ③커밋 trailer `Decision:`.
-- **의무 필드**: {decision_id(`DEC-YYYYMMDD-NNN`), decider(doctor|위임 범위 내 master), scope(반영 대상 문서·조문 지정), 결정문 원문(verbatim — 서기 수정 금지), effective_date}.
+- **의무 필드**: {decision_id(`DEC-YYYYMMDD-NNN`), decider(`doctor`=owner | 위임 범위 내 master), scope(반영 대상 문서·조문 지정), 결정문 원문(verbatim — 서기 수정 금지), effective_date}.
 
 ### C11.3 서기 동작 규칙
 
@@ -144,5 +144,5 @@ PROD_WRITE_CMD='psql "$PROD_AGENT_DSN" -c "insert into t values (1)"' \
 | §C2.3 waiver | `javis_waiver.py` | CT-1·TestWaiverTool |
 | §C2.4 CT-1~4 | `test_contracts_ct.py` | 4 CT 전수 PASS |
 | §C3 prod-deny E2E | `javis_prod_deny_e2e.sh` | 배포 단계 실측(플러거블 target) |
-| §C3.4 break-glass | APR ledger(doctor·used=false) | CT-4 |
+| §C3.4 break-glass | APR ledger(`doctor`=owner·used=false) | CT-4 |
 | §C11 DECISION | `javis_decision.py` | TestDecisionTool(결손 exit 2·verbatim 보존) |
