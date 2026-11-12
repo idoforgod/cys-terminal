@@ -540,6 +540,19 @@ echo "■ CYSJavis 역할 각성 (CYS_ROLE=$CYS_ROLE)"
 #   두 배로 든다(② · test_session_start_hook 22b). 줄 전체가 미리보기 창(앞 2,000자) 안에서 끝나야 한다.
 #   경로 줄은 printf(G8 — macOS /bin/sh 의 xpg_echo 가 윈도우 백슬래시 경로를 먹는다).
 printf '■ 이 출력이 길어 앞부분 미리보기만 보이고(나머지는 파일로 빠짐) 역할 지침 전문이 이 대화에 따로 없으면, 지침 전문 %s 과 %s 를 Read 도구로 끝까지(offset·limit 로 나눠) 읽은 뒤에 행동하라 — 전문이 이 대화에 이미 있으면(부트·사이클은 CLI 가 붙여 넣는다) 다시 읽지 않는다(같은 지침 중복 적재 금지) · 지침 없이 추측으로 움직이지 않는다.\n' "$(cys_native_path "$D" 2>/dev/null || printf '%s' "$D")" "$(cys_native_path "$JARVIS_DIR/soul.md" 2>/dev/null || printf '%s' "$JARVIS_DIR/soul.md")"
+# ★(0.15.0 · 「스스로 해결」 M1 · RULINGS B10 · C6 6.7) 역할별 규칙 블록 — 읽기 안내 줄 **뒤**·지침 본문 **앞**
+#   (앞 2,000자 미리보기 안 · 안내 줄의 위치는 그대로다 — 부록 A-1 #23). 문구는 프로그램 본체의 컴파일 상수
+#   하나뿐이고 여기에 사본을 두지 않는다 — LOCAL 동사 `cys repair rules` 가 찍는다(데몬 무접촉 · 레인 탐색 전 종료).
+#   실패는 전부 무출력이다: cys 없음·옛 cys(clap 오류 rc 2 — stderr 는 버린다)·비0·빈 출력·2초 초과(그룹 종료).
+#   CYS_NO_AUTOSTART=1 은 위 두 왕복과 같은 봉인이다(부록 A-1 #17 — 이 호출이 데몬을 낳지 않는다). \r 제거(A-3 #9).
+CYS_RULES_OUT=""
+if command -v cys >/dev/null 2>&1; then
+  CYS_RULES_OUT="$( CYS_NO_AUTOSTART=1; export CYS_NO_AUTOSTART
+    cys_timeout_run 2 cys repair rules --role "${CYS_ROLE:-}" </dev/null 2>/dev/null )" || CYS_RULES_OUT=""
+fi
+if [ -n "$CYS_RULES_OUT" ]; then
+  printf '%s\n' "$CYS_RULES_OUT" | tr -d '\r'
+fi
 cat "$D"
 # ★R13 부트 브리지(T2b 전 임시 — hook=system층이라 디렉티브(user-owned) 미개정 기계에도 전파):
 # 구 산문 §0만 아는 master는 부트 스크립트를 몰라 완료 마커가 안 생기고 CEO 승격이 영구

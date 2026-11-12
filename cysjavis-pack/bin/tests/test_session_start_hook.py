@@ -646,5 +646,178 @@ for _role, _body in (("master", "DIRECTIVE-BODY-MASTER"), ("worker", "DIRECTIVE-
           "line=%r end=%d" % (out[_line_start:_i + len(_line)], _i + len(_line)))
 shutil.rmtree(tmp)
 
+# ── 23. ★(0.15.0 · 「스스로 해결」 M1 · RULINGS B10 · CONTRACTS C6 6.7 / O-C6-6) 역할별 규칙 블록 ──
+#   훅은 읽기 안내 줄 **뒤**·지침 본문 **앞**에 `cys repair rules --role "$CYS_ROLE"` 의 출력을 싣는다. 문구의 정본은
+#   프로그램 본체 상수(src/repair/rules.rs)뿐이고 훅에 사본이 없다(B10). 스텁 cys 는 그 상수를 **소스에서 읽어** 그대로
+#   돌려준다(test_pack_guard_hooks_guidance.py 가 src/pack.rs 를 읽는 것과 같은 방식) — 길이·위치 측정이 실제 문구로 된다.
+import re as _re
+_ROOT = os.path.normpath(os.path.join(SELF, "..", "..", ".."))
+_RULES_RS = os.path.join(_ROOT, "src", "repair", "rules.rs")
+
+
+def _rust_rules():
+    try:
+        src = open(_RULES_RS, encoding="utf-8").read()
+    except OSError:
+        return {}
+    return dict(_re.findall(r'pub const (RULES_[A-Z_]+): &str = r#"(.*?)"#;', src, _re.S))
+
+
+_RR = _rust_rules()
+check("23-0 본체 상수 5종을 src/repair/rules.rs 에서 읽었다(측정 가능 — 못 읽으면 미측정=실패)",
+      sorted(_RR) == ["RULES_COMMON", "RULES_CSO", "RULES_MASTER_CEO", "RULES_REVIEWER", "RULES_WORKER"],
+      "%s keys=%r" % (_RULES_RS, sorted(_RR)))
+# 훅이 닿는 역할군(그 밖은 위 case 에서 exit 0)과 각 블록 — 블록 = 공통 + 역할 상수(rules_text · O-C6-2/3).
+_ROLE_CONST = {"master": "RULES_MASTER_CEO", "worker": "RULES_WORKER", "worker-2": "RULES_WORKER",
+               "cso-1": "RULES_CSO", "reviewer-codex": "RULES_REVIEWER", "reviewer-claude-1": "RULES_REVIEWER"}
+_ROLE_BODY = {"master": "DIRECTIVE-BODY-MASTER", "worker": "DIRECTIVE-BODY-WORKER",
+              "worker-2": "DIRECTIVE-BODY-WORKER", "cso-1": "DIRECTIVE-BODY-CSO",
+              "reviewer-codex": "DIRECTIVE-BODY-REVIEWER", "reviewer-claude-1": "DIRECTIVE-BODY-REVIEWER"}
+
+
+def _block(role):
+    return _RR.get("RULES_COMMON", "") + _RR.get(_ROLE_CONST[role], "")
+
+
+def setup_rules(tmp, mode="ok"):
+    """setup() + `cys repair rules` 를 아는 스텁. mode:
+      ok      실제 블록(소스에서 읽은 상수)을 stdout 에 · rc 0
+      unknown repair 를 모르지만 rc 0 · 무출력(기존 스텁의 기본 동작 — 비교 기준선)
+      old     옛 cys: clap 오류를 stderr 에 · rc 2
+      partial stdout 에 일부를 쓰고 rc 1
+      hang    응답 없음(10s — 훅의 2s 상한이 끊어야 한다)
+      crlf    블록을 줄마다 CR 을 붙여 rc 0(네이티브 윈도우 출력 모사)"""
+    env = setup(tmp, "ok")
+    blocks = os.path.join(tmp, "blocks")
+    os.makedirs(blocks, exist_ok=True)
+    for role in _ROLE_CONST:
+        with open(os.path.join(blocks, role + ".txt"), "w", encoding="utf-8", newline="\n") as f:
+            f.write(_block(role))
+    arm = {"ok": 'cat "%s/$4.txt"; exit 0' % blocks,
+           "unknown": "exit 0",
+           "old": "echo \"error: unrecognized subcommand 'repair'\" >&2; exit 2",
+           "partial": "printf 'PARTIAL-RULES-OUTPUT\\n'; exit 1",
+           "hang": "exec sleep 10",
+           "crlf": "sed 's/$/\\r/' \"%s/$4.txt\"; exit 0" % blocks}[mode]
+    with open(os.path.join(tmp, "stubbin", "cys"), "w", encoding="utf-8", newline="\n") as f:
+        f.write("#!/bin/sh\necho \"cys $@\" >> \"%s/calls.log\"\n"
+                "echo \"$1 ${CYS_NO_AUTOSTART:-unset}\" >> \"%s/autostart.log\"\n"
+                "case \"$1\" in\n"
+                "  claim-role) exit 0;;\n"
+                "  surface-role) exit 0;;\n"
+                "  reclaim-role) printf 'role=\\nreason=no_candidate\\nenv_role=unknown\\ndetail=\\n'; exit 0;;\n"
+                "  repair) [ \"$2\" = rules ] && [ \"$3\" = --role ] || exit 2\n"
+                "    %s;;\n"
+                "esac\nexit 0\n" % (tmp, tmp, arm))
+    return env
+
+
+# 23a — 위치: 읽기 안내 줄 < 블록 < 지침 본문, 블록은 상수 그대로(바이트 동일 · 사본 아님)
+tmp = tempfile.mkdtemp(prefix="hook-t23a-")
+env = setup_rules(tmp, "ok")
+_outs = {}
+for _role in ("master", "worker", "cso-1", "reviewer-codex"):
+    code, out, _ = run_hook(env, role=_role)
+    _outs[_role] = out
+    _ig = out.find("Read 도구로 끝까지")
+    _ib = out.find(_block(_role)) if _RR else -1
+    _id = out.find(_ROLE_BODY[_role])
+    check("23a %s: 블록이 읽기 안내 뒤·지침 본문 앞에 상수 그대로 실린다 · exit 0" % _role,
+          code == 0 and 0 <= _ig < _ib < _id and out.count("■ 「스스로 해결」") == 1,
+          "ig=%d ib=%d id=%d" % (_ig, _ib, _id))
+    # 23b — O-C6-6 상한: 머리줄 + 읽기 안내 줄 + 블록 < 1,800자(경로 두 개는 보통 설치 길이로 정규화 — 상한의
+    #   200자 여유가 역할 이름·경로 변동 몫이다), 그리고 실제 출력에서 블록 끝이 앞 2,000자 안이다.
+    _lines = out.split("\n")
+    _head = next((l for l in _lines if l.startswith("■ CYSJavis 역할 각성")), "")
+    _guid = next((l for l in _lines if "Read 도구로 끝까지" in l), "")
+    _m = _re.search(r"지침 전문 (.+) 과 (.+) 를 Read 도구로", _guid)
+    #   정규화 길이 = 보통 설치의 두 경로 길이: 홈 폴더 23자(맥 홈 접두 7자 + 16자 사용자 이름) + 팩 안 경로.
+    _home_len = 23
+    _canon_len = (_home_len + len("/.cys/pack/directives/%s_DIRECTIVE.md" % _ROLE_BODY[_role].split("-")[-1])
+                  + _home_len + len("/.cys/pack/soul.md"))
+    _guid_norm = len(_guid) - (len(_m.group(1)) + len(_m.group(2)) if _m else 0) + _canon_len
+    _total = (len(_head) + 1) + (_guid_norm + 1) + len(_block(_role))
+    check("23b %s: 머리줄+안내 줄+블록 = %d자 < 1,800(정규화) · 블록 끝 %d ≤ 2,000(실측)"
+          % (_role, _total, _ib + len(_block(_role))),
+          bool(_head) and _m is not None and _total < 1800 and 0 <= _ib and _ib + len(_block(_role)) <= 2000,
+          "head=%r" % _head[:60])
+# 23c — 호출 형태: `cys repair rules --role <역할>` · CYS_NO_AUTOSTART=1 안에서(부록 A-1 #17)
+_c = calls_of(tmp)
+check("23c-1 훅이 `cys repair rules --role <역할>` 을 부른다", "cys repair rules --role reviewer-codex" in _c, _c[-300:])
+_al = open(os.path.join(tmp, "autostart.log"), encoding="utf-8").read().splitlines()
+check("23c-2 rules 호출은 CYS_NO_AUTOSTART=1 안에서 돈다", [l for l in _al if l.startswith("repair ")]
+      and all(l == "repair 1" for l in _al if l.startswith("repair ")), repr(_al))
+shutil.rmtree(tmp)
+
+# 23d — 실패는 전부 무출력·exit 0 이고 출력은 'repair 를 모르는 cys' 와 바이트 동일하다(부록 A-1 #26 출력 계약 ·
+#   B10 "prints nothing on any failure"). hang 은 2초 상한이 끊는다(OQ-H-12 (b) · 부록 A-1 #25 예산).
+import time as _t23
+
+
+def _neutral(out, tmp):
+    """출력 속 그 실행의 임시 경로를 지운다 — 실행마다 임시 폴더가 달라 경로 글자만 다르다(비교 대상이 아니다)."""
+    return out.replace(os.path.realpath(tmp), "<TMP>").replace(tmp, "<TMP>")
+
+
+for _role in ("worker", "master"):
+    tmp = tempfile.mkdtemp(prefix="hook-t23d-")
+    _base = _neutral(run_hook(setup_rules(tmp, "unknown"), role=_role)[1], tmp)
+    shutil.rmtree(tmp)
+    check("23d-0 %s: 기준선(repair 모름)에는 블록이 없다" % _role, "■ 「스스로 해결」" not in _base and _ROLE_BODY[_role] in _base)
+    for _mode in ("old", "partial", "hang"):
+        tmp = tempfile.mkdtemp(prefix="hook-t23d-")
+        _env = setup_rules(tmp, _mode)
+        _t0 = _t23.monotonic()
+        code, out, _ = run_hook(_env, role=_role)
+        _dt = _t23.monotonic() - _t0
+        out = _neutral(out, tmp)
+        shutil.rmtree(tmp)
+        check("23d %s/%s: exit 0 · 출력이 기준선과 바이트 동일(무출력) · %.1fs" % (_role, _mode, _dt),
+              code == 0 and out == _base and (_mode != "hang" or _dt < 9.0),
+              "diff head=%r" % out[:200] if out != _base else "dt=%.1f" % _dt)
+    # cys 가 PATH 에 아예 없다 — 다른 단계도 cys 를 건너뛰고, 블록 호출은 시도조차 하지 않는다.
+    tmp = tempfile.mkdtemp(prefix="hook-t23d-")
+    _env = setup_rules(tmp, "ok")
+    _env["PATH"] = os.pathsep.join(d for d in os.environ.get("PATH", "").split(os.pathsep)
+                                   if d and not os.path.exists(os.path.join(d, "cys")))
+    code, out, _ = run_hook(_env, role=_role)
+    out = _neutral(out, tmp)
+    shutil.rmtree(tmp)
+    check("23d %s/absent: cys 없음 → exit 0 · 블록 없음 · 지침은 그대로" % _role,
+          code == 0 and "■ 「스스로 해결」" not in out and _ROLE_BODY[_role] in out and out == _base,
+          repr(out[:200]))
+
+# 23e — 셸 사본 없음(B10 · A-3s-04 (a)): 어떤 블록의 어떤 줄(12자 이상 조각)도 훅 소스에 없다. 탐지기 자기 점검 포함.
+_hook_text = open(HOOK, encoding="utf-8").read()
+
+
+def _copies(text):
+    """블록 문구 조각(한글 6자 이상을 담은 12자 이상 조각) 중 text 에 그대로 있는 것. 코드 이름(`javis_orchestra.py`
+    같은 명령 이름)은 훅이 다른 이유로 쓰므로 문구 사본으로 세지 않는다 — 사본은 한국어 문장 조각으로 드러난다."""
+    found = []
+    for name, val in _RR.items():
+        for ln in val.splitlines():
+            for frag in _re.split(r"[.:·()`\"']", ln):
+                frag = frag.strip()
+                hangul = sum(1 for ch in frag if "\uac00" <= ch <= "\ud7a3")
+                if len(frag) >= 12 and hangul >= 6 and frag in text:
+                    found.append((name, frag))
+    return found
+
+
+check("23e-1 훅 소스에 블록 문구 사본이 없다(본체 상수 하나뿐)", _RR and not _copies(_hook_text), repr(_copies(_hook_text)[:3]))
+_planted = _hook_text + "\necho '%s'\n" % (_RR.get("RULES_MASTER_CEO", "x").splitlines() or ["x"])[0]
+check("23e-2 탐지기 자기 점검: 심어 둔 사본은 잡힌다", bool(_copies(_planted)))
+check("23e-3 훅은 블록을 `cys repair rules --role` 로만 얻는다",
+      'cys_timeout_run 2 cys repair rules --role "${CYS_ROLE:-}"' in _code, "")
+
+# 23f — CRLF(부록 A-3 #9): 훅 파일에 CR 이 없고, CR 을 섞어 내는 cys 여도 훅 출력에는 CR 이 없다.
+check("23f-1 session-start.sh 에 CR 바이트 0", b"\r" not in open(HOOK, "rb").read())
+tmp = tempfile.mkdtemp(prefix="hook-t23f-")
+code, out, _ = run_hook(setup_rules(tmp, "crlf"), role="worker-2")
+shutil.rmtree(tmp)
+check("23f-2 CRLF 출력 cys → 훅 출력에 CR 0 · 블록은 실린다", code == 0 and "\r" not in out and _block("worker-2") in out,
+      repr(out[:120]))
+
 print("\n%d FAIL" % len(fails) if fails else "\nALL PASS")
 sys.exit(1 if fails else 0)
