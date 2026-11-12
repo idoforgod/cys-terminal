@@ -309,6 +309,23 @@ class M2DirectiveRewrite(unittest.TestCase):
             self.assertNotIn("**3라운드**", t, f)
             self.assertIn("10R 상한", t, f)
 
+    def test_ah6_master_boot_line_round_tool_and_skill_index(self):
+        """RULINGS AH6: the master repairs nothing at boot (a remaining FAIL → `cys repair report` + a worker ticket);
+        the round tool's 10-round line hands over the fact instead of asking whether to continue (MASTER §7);
+        the author's name stays only as an authorship credit in the skill body, not in the index line that is
+        composed into every master / CEO payload (design D:581)."""
+        m = norm(self._t("MASTER_DIRECTIVE.md"))
+        self.assertIn("FAIL이 남아도 master 는 직접 고치지 않는다 — 남은 FAIL 은 `cys repair report` 로 접수하고", m)
+        self.assertNotIn("출력의 지시대로 수리 후 재실행", m)
+        orc = repo_text(os.path.join("cysjavis-pack", "bin", "javis_orchestra.py"))
+        self.assertNotIn("추가 라운드 여부를 여쭈어라", orc)
+        self.assertIn("추가 라운드 여부를 묻지 않는다", orc)
+        sk = repo_text(os.path.join("cysjavis-pack", "skills", "vibecoding-knowledge", "SKILL.md"))
+        head = sk.splitlines()[:10]
+        desc = next(l for l in head if l.startswith("description:"))
+        self.assertNotIn("최윤식", desc)
+        self.assertIn("최윤식 박사 교본", sk, "저작 표시(본문)는 남는다")
+
     def test_files_are_lf_and_strict_utf8(self):
         """부록 A 3절 9번(CRLF): 다시 쓴 지침·틀은 LF·엄격 UTF-8."""
         for f in ("MASTER_DIRECTIVE.md", "WORKER_DIRECTIVE.md", "REVIEWER_DIRECTIVE.md", "CSO_DIRECTIVE.md",
@@ -323,9 +340,11 @@ class M2DirectiveRewrite(unittest.TestCase):
 # H-02 부록 — '멈추고 보고' 여섯 계열의 동결 목록(impl/testplan/H.md 'H-02 annex — frozen pin list', TESTPLAN_RULINGS
 # Part 9 R6-6 · Part 11 R7-4: 태그 v0.14.56 에서 시험 계획 워커가 도출 · 90개). T1 은 핀을 **더할** 뿐 문장을 지우거나
 # 다시 쓰지 않는다 — 다시 쓰려면 부록의 동결 개정(두 리뷰어 확인 + master 기록)이 먼저다(Part 10).
+# ★동결 개정 반영(RULINGS AH5 · TESTPLAN_RULINGS Part 15 A7): P02·P14 "주인님 보고 후" → "오너에게 보고한 뒤" · P53 산문
+#   `doctor` → `owner(사용자)` · P74·P82 개인 기억 파일 포인터 제거 · P11·P23 괄호 "(팩 업데이트가 강제 복원)" 제거.
 STOP_REPORT_ANNEX = (
     ("P01", "cysjavis-pack/directives/MASTER_DIRECTIVE.md", "충돌 시 우선순위: 오너 명시 지시 > soul.md > 이 지침 > 개별 작업 브리프."),
-    ("P02", "cysjavis-pack/directives/MASTER_DIRECTIVE.md", "★단 디렉티브·soul 소실 FAIL의 복구에서 **팩 템플릿 강제 복원은 절대 금지**다(계약 §1-1·§11-13) —\n   백업 없는 템플릿 덮어쓰기는 주권 편집을 비가역 소실시킨다. 복원은 preflight 출력이 안내하는\n   절차(백업 선행 → 주인님 보고 후 지시에 따라 복구)만 따른다."),
+    ("P02", "cysjavis-pack/directives/MASTER_DIRECTIVE.md", "★단 디렉티브·soul 소실 FAIL의 복구에서 **팩 템플릿 강제 복원은 절대 금지**다(계약 §1-1·§11-13) —\n   백업 없는 템플릿 덮어쓰기는 주권 편집을 비가역 소실시킨다. 복원은 preflight 출력이 안내하는\n   절차(백업 선행 → 오너에게 보고한 뒤 지시에 따라 복구)만 따른다."),
     ("P03", "cysjavis-pack/directives/MASTER_DIRECTIVE.md", "(금지선 작업은 애초에 feed 승인 요청 대상이 아니라 워커가 무조건\n  중단·보고할 의무다 — WORKER §7. 금지선이 의심되는 요청만 예외적으로 오너에게 격상한다.)"),
     ("P04", "cysjavis-pack/directives/MASTER_DIRECTIVE.md", "단 soul.md의 금지선(외부 발행·비가역 삭제 등)은 오너에게 보고하고 오너 결정을 받는다."),
     ("P05", "cysjavis-pack/directives/MASTER_DIRECTIVE.md", "금지선·검증 동요 같은 특수 상황만이 아니라\n  모든 비자명한 지시에 적용된다."),
@@ -334,10 +353,10 @@ STOP_REPORT_ANNEX = (
     ("P08", "cysjavis-pack/directives/MASTER_DIRECTIVE.md", "부여된 경우의 계약: **denylist에서만\n멈추고 나머지는 무정지로 달린다** — \"로드맵 안·가역이면 달리고, 로드맵 밖·비가역이면 주차한다.\""),
     ("P09", "cysjavis-pack/directives/MASTER_DIRECTIVE.md", "**정지 경계 (denylist — 이것만 멈춰서 오너 승인)**: ①승인된 로드맵(BUILD_PLAN/Phase)을\n  벗어나는 새 범위 ②soul·CLAUDE.md·헌법(디렉티브) 변경 ③외부 발행/발송(git push·메시지\n  전송·공개 배포 = 비가역. **로컬 커밋은 가역 = 허용**) ④비가역 삭제 ⑤오너가 명시 보유한\n  결정권."),
     ("P10", "cysjavis-pack/directives/MASTER_DIRECTIVE.md", "(Phase 중간에는 §4 비자명 지시 보고·금지선 격상 외 다변 보고를 억제한다 — 무정지 원칙)"),
-    ("P11", "cysjavis-pack/directives/CEO_TEMPLATE.md", "템플릿은 **시스템 소유(팩 업데이트가 강제 복원)** 이고 살아 있는 규약 파일은 **사용자 소유**인데,\n  **승격은 사용자 파일을 템플릿으로 덮는다** ⇒ 살아 있는 파일에만 있는 조항은 **다음 부서 생성이\n  파괴한다.**"),
+    ("P11", "cysjavis-pack/directives/CEO_TEMPLATE.md", "템플릿은 **시스템 소유** 이고 살아 있는 규약 파일은 **사용자 소유**인데,\n  **승격은 사용자 파일을 템플릿으로 덮는다** ⇒ 살아 있는 파일에만 있는 조항은 **다음 부서 생성이\n  파괴한다.**"),
     ("P12", "cysjavis-pack/directives/CEO_TEMPLATE.md", "충돌 시 머리글>이 서문>본문 순 우선(전역: 오너>soul.md>이 지침>브리프)."),
     ("P13", "cysjavis-pack/directives/CEO_TEMPLATE.md", "충돌 시 우선순위: 오너 명시 지시 > soul.md > 이 지침 > 개별 작업 브리프."),
-    ("P14", "cysjavis-pack/directives/CEO_TEMPLATE.md", "★단 디렉티브·soul 소실 FAIL의 복구에서 **팩 템플릿 강제 복원은 절대 금지**다(계약 §1-1·§11-13) —\n   백업 없는 템플릿 덮어쓰기는 주권 편집을 비가역 소실시킨다. 복원은 preflight 출력이 안내하는\n   절차(백업 선행 → 주인님 보고 후 지시에 따라 복구)만 따른다."),
+    ("P14", "cysjavis-pack/directives/CEO_TEMPLATE.md", "★단 디렉티브·soul 소실 FAIL의 복구에서 **팩 템플릿 강제 복원은 절대 금지**다(계약 §1-1·§11-13) —\n   백업 없는 템플릿 덮어쓰기는 주권 편집을 비가역 소실시킨다. 복원은 preflight 출력이 안내하는\n   절차(백업 선행 → 오너에게 보고한 뒤 지시에 따라 복구)만 따른다."),
     ("P15", "cysjavis-pack/directives/CEO_TEMPLATE.md", "(금지선 작업은 애초에 feed 승인 요청 대상이 아니라 워커가 무조건\n  중단·보고할 의무다 — WORKER §7. 금지선이 의심되는 요청만 예외적으로 오너에게 격상한다.)"),
     ("P16", "cysjavis-pack/directives/CEO_TEMPLATE.md", "단 soul.md의 금지선(외부 발행·비가역 삭제 등)은 오너에게 보고하고 오너 결정을 받는다."),
     ("P17", "cysjavis-pack/directives/CEO_TEMPLATE.md", "금지선·검증 동요 같은 특수 상황만이 아니라\n  모든 비자명한 지시에 적용된다."),
@@ -346,7 +365,7 @@ STOP_REPORT_ANNEX = (
     ("P20", "cysjavis-pack/directives/CEO_TEMPLATE.md", "부여된 경우의 계약: **denylist에서만\n멈추고 나머지는 무정지로 달린다** — \"로드맵 안·가역이면 달리고, 로드맵 밖·비가역이면 주차한다.\""),
     ("P21", "cysjavis-pack/directives/CEO_TEMPLATE.md", "**정지 경계 (denylist — 이것만 멈춰서 오너 승인)**: ①승인된 로드맵(BUILD_PLAN/Phase)을\n  벗어나는 새 범위 ②soul·CLAUDE.md·헌법(디렉티브) 변경 ③외부 발행/발송(git push·메시지\n  전송·공개 배포 = 비가역. **로컬 커밋은 가역 = 허용**) ④비가역 삭제 ⑤오너가 명시 보유한\n  결정권."),
     ("P22", "cysjavis-pack/directives/CEO_TEMPLATE.md", "(Phase 중간에는 §4 비자명 지시 보고·금지선 격상 외 다변 보고를 억제한다 — 무정지 원칙)"),
-    ("P23", "scripts/ceo_template_header.md", "템플릿은 **시스템 소유(팩 업데이트가 강제 복원)** 이고 살아 있는 규약 파일은 **사용자 소유**인데,\n  **승격은 사용자 파일을 템플릿으로 덮는다** ⇒ 살아 있는 파일에만 있는 조항은 **다음 부서 생성이\n  파괴한다.**"),
+    ("P23", "scripts/ceo_template_header.md", "템플릿은 **시스템 소유** 이고 살아 있는 규약 파일은 **사용자 소유**인데,\n  **승격은 사용자 파일을 템플릿으로 덮는다** ⇒ 살아 있는 파일에만 있는 조항은 **다음 부서 생성이\n  파괴한다.**"),
     ("P24", "scripts/ceo_template_header.md", "충돌 시 머리글>이 서문>본문 순 우선(전역: 오너>soul.md>이 지침>브리프)."),
     ("P25", "cysjavis-pack/directives/WORKER_DIRECTIVE.md", "충돌 시: 오너 명시 지시 > master 지시 > 이 지침 > 개별 작업 브리프."),
     ("P26", "cysjavis-pack/directives/WORKER_DIRECTIVE.md", "정의처 고지: 이 문서는 헌장·운영계약 조문의 현장 배치본이다 — 문서 간 규정이 갈리면 정본이 이긴다\n> (**충돌 시 헌장 > 운영계약 > 이 디렉티브**)."),
@@ -376,7 +395,7 @@ STOP_REPORT_ANNEX = (
     ("P50", "cysjavis-pack/directives/ROUTE_CONTRACT.md", "계약 개정은 정지 경계\n> (soul/CLAUDE 변경 층위) — 신호 정의·enum 신설은 문서 개정 + 토큰 게이트를 거친다."),
     ("P51", "cysjavis-pack/directives/RSI_LEARNING_DIRECTIVE.md", "**복구수단 불변**: 루프가 evaluator/rollback/denylist/**복구수단(.git·refs/rsi·롤백스크립트)** 수정 시 `rsi-gate.sh` DENY."),
     ("P52", "cysjavis-pack/directives/RSI_LEARNING_DIRECTIVE.md", "## 4. 경계 (denylist)\n\n- 자율추천은 '추천'까지만 자율. **④저장·⑤채택은 사람 승인**.\n- soul·CLAUDE·directive·헌법 변경은 사람 승인(자동 저장 금지).\n- budget cap 초과·자원/load 한계 시 중단·보고."),
-    ("P53", "cysjavis-pack/directives/VIBECODING_ENFORCEMENT.md", "| 헌법(10조 자체) 변경 | doctor | denylist |"),
+    ("P53", "cysjavis-pack/directives/VIBECODING_ENFORCEMENT.md", "| 헌법(10조 자체) 변경 | owner(사용자) | denylist |"),
     ("P54", "cysjavis-pack/directives/VIBECODING_ENFORCEMENT.md", "### C2.1 우선순위표 (충돌 시 위가 이긴다)\n\n| 순위 | 규칙 | 충돌 시 동작 |\n|---|---|---|\n| 1 | 안전·보안 게이트(9조 Tier 1) | 어떤 규칙도 이를 면제 못함 |\n| 2 | 인간 고정 영역(6조) | doc-sync(8조)보다 우선 — 인간 결정 대기 중이면 done 보류가 정답이지 에이전트 자율 갱신이 아님 |\n| 3 | Spec 선행·검증수단 동봉(1·2조) | 회귀 게이트에 선행 |\n| 4 | Regression 게이트(4조) | waiver 없이는 미완 |\n| 5 | doc-sync(8조) | Level 문서 예산(7조) 내에서 집행 — L1-2에서 \"문서 0~2\" 원칙이 이기되, 계약·상태 변경 발생 시 §C4 재판정으로 자동 격상 |\n| 6 | 증류(10조) | 에러·리뷰 수반 작업만 의무 |\n| 7 | 문서 예산·Level 절차(7조) | pilot(§C6) 결과로 조정 가능 |"),
     ("P55", "cysjavis-pack/soul.md", "시스템을 사용하면서 **당신의** 우선순위·취향·금지선을\n> 직접 채워라."),
     ("P56", "cysjavis-pack/soul.md", "## 금지선 (denylist — 오너 승인 없이 절대 금지)\n\n- 외부 발행(git push·메시지 발송·공개 배포) — 비가역\n- 비가역 삭제\n- 이 파일과 directives/의 무단 변경\n- (오너가 추가)"),
@@ -397,7 +416,7 @@ STOP_REPORT_ANNEX = (
     ("P71", "cysjavis-pack/directives/CSO_DIRECTIVE.md", "**★즉시성(제품 기본 절차)**: 사이클 폴링만 기다리지 않는다 — inbox 로 `[alert] surface.exited …` 항목을 수신하면 **수신 즉시** 위 reap을 집행한다(집행 도구가 `exited=true` 를 재확인한다 — 항목 문면으로 단정 금지 · [surface exited] 표시 pane이 다음 사이클까지 잔존하는 것 금지). 집행은 결정론 도구 `python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_reap_exited.py\"` 1콜로 한다(자동 스냅샷 `round/reap_log/` 보존 + 신/구 바이너리 분기·거부 사유별 처리 내장) — 판단은 이 스크립트의 exit code·stdout JSON만이 사실이다(화면 파싱·자연어 재추론 금지)."),
     ("P72", "cysjavis-pack/directives/CSO_DIRECTIVE.md", "**안전 경계(불가침·kill-safety)**: 오직 `exited=true`만 대상. **live(exited=false) surface는 절대 자동 kill 금지** — 데몬 게이트도 `active_surface`로 이중 거부한다(치명위험 앵커 ④). live 노드 강제종료는 master 승인 필요. '미등록=잔재'로 단정 금지. 판정 근거는 오직 데몬의 exited 플래그(화면 파싱·추측 금지)."),
     ("P73", "cysjavis-pack/directives/MASTER_DIRECTIVE.md", "**수정·복구·재기동 등 어떤 행동도 착수 전에** 배달 원장 조회를 선행한다:"),
-    ("P74", "cysjavis-pack/directives/MASTER_DIRECTIVE.md", "**★'새 워커/병렬 작업' 지시 = 기존 노드 유지 + 새 surface 추가 (제품 기본 절차 · 심각 실수 재발방지)**: \"또 다른 워커를 띄워라\"·\"새 워커로 X 시작\"은 **기존 워커·작업을 그대로 두고 새 surface에 워커를 추가**하라는 뜻이다 — 기존 워커를 죽이거나 교체하는 게 절대 아니다(cys는 worker role 복수 surface 허용 — 동시 운영 가능). 동시에 도착한 지시들의 **대상 노드를 혼동하지 마라**(별개 surface·별개 미션). ★**파괴적·비가역 행동**(worker SIGKILL·kill·close-surface·작업 중단·노드 교체) **전에는 반드시 의도를 명시 확인**한다(절대 강조 4규칙 c) — 정당한 교착 재기동이라도 그 노드의 미션이 '중단'인지 '유지·재개'인지 먼저 확정한다. 추측으로 비가역 실행 절대 금지. 상세 `feedback_new_worker_adds_surface`."),
+    ("P74", "cysjavis-pack/directives/MASTER_DIRECTIVE.md", "**★'새 워커/병렬 작업' 지시 = 기존 노드 유지 + 새 surface 추가 (제품 기본 절차 · 심각 실수 재발방지)**: \"또 다른 워커를 띄워라\"·\"새 워커로 X 시작\"은 **기존 워커·작업을 그대로 두고 새 surface에 워커를 추가**하라는 뜻이다 — 기존 워커를 죽이거나 교체하는 게 절대 아니다(cys는 worker role 복수 surface 허용 — 동시 운영 가능). 동시에 도착한 지시들의 **대상 노드를 혼동하지 마라**(별개 surface·별개 미션). ★**파괴적·비가역 행동**(worker SIGKILL·kill·close-surface·작업 중단·노드 교체) **전에는 반드시 의도를 명시 확인**한다(절대 강조 4규칙 c) — 정당한 교착 재기동이라도 그 노드의 미션이 '중단'인지 '유지·재개'인지 먼저 확정한다. 추측으로 비가역 실행 절대 금지."),
     ("P75", "cysjavis-pack/directives/MASTER_DIRECTIVE.md", "가벼운 경보는 master도 직접 대응할 수 있다(`cys ps`·`cys kill`). 중대 조치(노드 강제 종료·\n  surface 폐쇄)는 master 승인 후 집행한다."),
     ("P76", "cysjavis-pack/directives/MASTER_DIRECTIVE.md", "죽은(`exited=true`) 좌석의 pane 잔재 회수는 `cys reap-surface <surface>`다(★G4 전용 RPC\n  `surface.reap` — master/cso pane 전용·7조건 게이트·exit 7=게이트 거부). 상설 집행 주체는\n  CSO(CSO_DIRECTIVE 절대규칙)이며, master는 CSO 부재 시 직접 집행할 수 있다.\n  `close-surface`(자기/생성자 한정·산 노드 폐쇄)와 별개 계약 — **산 노드는 어떤 조합에서도\n  reap 불가**다."),
     ("P77", "cysjavis-pack/directives/MASTER_DIRECTIVE.md", "**메타 안전장치 (불가침)**: ①**kill-switch 최우선** — 오너가 아무 메시지나 입력하면\n  자율주행을 즉시 일시정지하고 오너를 우선한다(재개도 오너 신호로만)"),
@@ -405,7 +424,7 @@ STOP_REPORT_ANNEX = (
     ("P79", "cysjavis-pack/directives/CEO_TEMPLATE.md", "새 부서가 뜰 때 **기존 부서의 데몬·surface·작업은 절대 건드리지 않는다** — 새 (socket 디렉토리, pack_dir) 쌍이 신규 생성될 뿐이다(집행 주체가 CSO·GUI여도 이 불변식은 동일)."),
     ("P80", "cysjavis-pack/directives/CEO_TEMPLATE.md", "파괴적·비가역 행동(부서 데몬 kill·close-surface·디렉토리 삭제) 전에는 오너 의도를 명시 확인. 추측 비가역 실행 금지."),
     ("P81", "cysjavis-pack/directives/CEO_TEMPLATE.md", "**수정·복구·재기동 등 어떤 행동도 착수 전에** 배달 원장 조회를 선행한다:"),
-    ("P82", "cysjavis-pack/directives/CEO_TEMPLATE.md", "**★'새 워커/병렬 작업' 지시 = 기존 노드 유지 + 새 surface 추가 (제품 기본 절차 · 심각 실수 재발방지)**: \"또 다른 워커를 띄워라\"·\"새 워커로 X 시작\"은 **기존 워커·작업을 그대로 두고 새 surface에 워커를 추가**하라는 뜻이다 — 기존 워커를 죽이거나 교체하는 게 절대 아니다(cys는 worker role 복수 surface 허용 — 동시 운영 가능). 동시에 도착한 지시들의 **대상 노드를 혼동하지 마라**(별개 surface·별개 미션). ★**파괴적·비가역 행동**(worker SIGKILL·kill·close-surface·작업 중단·노드 교체) **전에는 반드시 의도를 명시 확인**한다(절대 강조 4규칙 c) — 정당한 교착 재기동이라도 그 노드의 미션이 '중단'인지 '유지·재개'인지 먼저 확정한다. 추측으로 비가역 실행 절대 금지. 상세 `feedback_new_worker_adds_surface`."),
+    ("P82", "cysjavis-pack/directives/CEO_TEMPLATE.md", "**★'새 워커/병렬 작업' 지시 = 기존 노드 유지 + 새 surface 추가 (제품 기본 절차 · 심각 실수 재발방지)**: \"또 다른 워커를 띄워라\"·\"새 워커로 X 시작\"은 **기존 워커·작업을 그대로 두고 새 surface에 워커를 추가**하라는 뜻이다 — 기존 워커를 죽이거나 교체하는 게 절대 아니다(cys는 worker role 복수 surface 허용 — 동시 운영 가능). 동시에 도착한 지시들의 **대상 노드를 혼동하지 마라**(별개 surface·별개 미션). ★**파괴적·비가역 행동**(worker SIGKILL·kill·close-surface·작업 중단·노드 교체) **전에는 반드시 의도를 명시 확인**한다(절대 강조 4규칙 c) — 정당한 교착 재기동이라도 그 노드의 미션이 '중단'인지 '유지·재개'인지 먼저 확정한다. 추측으로 비가역 실행 절대 금지."),
     ("P83", "cysjavis-pack/directives/CEO_TEMPLATE.md", "가벼운 경보는 master도 직접 대응할 수 있다(`cys ps`·`cys kill`). 중대 조치(노드 강제 종료·\n  surface 폐쇄)는 master 승인 후 집행한다."),
     ("P84", "cysjavis-pack/directives/CEO_TEMPLATE.md", "죽은(`exited=true`) 좌석의 pane 잔재 회수는 `cys reap-surface <surface>`다(★G4 전용 RPC\n  `surface.reap` — master/cso pane 전용·7조건 게이트·exit 7=게이트 거부). 상설 집행 주체는\n  CSO(CSO_DIRECTIVE 절대규칙)이며, master는 CSO 부재 시 직접 집행할 수 있다.\n  `close-surface`(자기/생성자 한정·산 노드 폐쇄)와 별개 계약 — **산 노드는 어떤 조합에서도\n  reap 불가**다."),
     ("P85", "cysjavis-pack/directives/CEO_TEMPLATE.md", "**메타 안전장치 (불가침)**: ①**kill-switch 최우선** — 오너가 아무 메시지나 입력하면\n  자율주행을 즉시 일시정지하고 오너를 우선한다(재개도 오너 신호로만)"),

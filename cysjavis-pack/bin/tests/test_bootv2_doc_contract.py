@@ -286,8 +286,8 @@ def ceo_drift(fragment_bytes, master_bytes, ceo_bytes, separator):
 #   아닌 `scripts/vendor-notes/ceo-header-vendor-notes.md` 로 옮겼고(바이트 그대로), 규칙은 제품 문장으로 다시 썼다.
 #   두 상수는 그 중립화된 조항으로 다시 고정했다(종전 6,918 B · ef982427…). 조용한 소실을 막는 모양은 그대로다.
 OWNER_CLAUSE_HEADING = "## [CEO 와 master 의 차이"
-OWNER_CLAUSE_BYTES = 5547
-OWNER_CLAUSE_SHA256 = "cfa9354f1195471c94edb2eb9e961eb658d4b5340d4b1752f89d6206c6371715"
+OWNER_CLAUSE_BYTES = 5533
+OWNER_CLAUSE_SHA256 = "d0bf2d4a692f3ee129b89bda42f983829a469f71655002af53c9af729166504d"
 VENDOR_NOTES = os.path.join(SCRIPTS, "vendor-notes", "ceo-header-vendor-notes.md")
 _TOP_SECTION_RE = re.compile(r"(?m)^## \[")
 

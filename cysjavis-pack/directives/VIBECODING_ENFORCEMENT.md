@@ -26,7 +26,7 @@
 | 상태 경계·전이 규칙 확정(6조) | owner (master는 초안 제안만) | 인간 고정 영역 원칙 |
 | 보안 크리티컬 로직 승인(6조) | owner | 〃 |
 | prod break-glass(9조·§C3.4) | owner | 비가역 위험 |
-| 헌법(10조 자체) 변경 | doctor | denylist |
+| 헌법(10조 자체) 변경 | owner(사용자) | denylist |
 | Level 재분류 승인(§C4.5) | master(APR 발급) 또는 owner | 기술 판단 위임 범위 |
 | waiver 발급(§C2.3) | master(만료형·저위험) / owner(고위험) | 〃 |
 | Phase 진행 게이트 | owner(로드맵 승인) 후 master 자율주행 | 자율주행 위임권과 정합 |
