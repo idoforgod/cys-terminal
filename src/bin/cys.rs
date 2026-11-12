@@ -3585,6 +3585,14 @@ fn main() {
     if let Some(s) = &cli.socket {
         std::env::set_var(cys::ENV_SOCKET, s);
     }
+    // ★(0.15.0 · RULINGS Z3 · B10 · 부록 A 1-17) `cys repair` 의 로컬 동사(rules·boot-critical·tombstones·gate·
+    //   auth-helper)는 레인 탐색 **전에** 끝낸다 — 탐색은 데몬에 `system.identify` 를 보낸다. 시작 훅이 부르는
+    //   `cys repair rules` 가 어떤 데몬에도 닿지 않게 하는 한 자리다(핀: repair_cli main_returns_early_for_local_repair_verbs).
+    if let Command::Repair { cmd } = &cli.command {
+        if repair_cli::is_local(cmd) {
+            std::process::exit(repair_cli::run_local(cmd));
+        }
+    }
     initialize_lane_identity(&cli.command);
     // 순수 프로브 명령은 자동 기동 금지 — "데몬이 떠 있는가"라는 질문의 답을 바꾸면 안 된다
     if matches!(
@@ -15263,10 +15271,25 @@ fn compose_directive(role: &str) -> Result<String, String> {
     let expert = std::env::var("CYS_OVERRIDE_EXPERT").map(|v| v == "1").unwrap_or(false);
     let ov = cys::overrides::load_overrides(role, expert);
     let ov_block = cys::overrides::render_block(&ov);
+    // ★(0.15.0 · 「스스로 해결」 M1 · C6 6.5 · O-C6-4 (a)) 역할별 규칙 블록은 조립된 지침의 **맨 끝**이다 —
+    //   안전핵 재확인 문단이 붙는 경우에는 **그 바로 앞**(안전핵이 계속 마지막 말이다). `render_block` 은
+    //   비어 있지 않으면 늘 SAFETY_CORE_REASSERT 로 끝나므로 그 접미에서 갈라 블록을 끼운다(overrides.rs 무변경).
+    //   보통 설치(오버라이드·로컬 지침 없음)에는 안전핵 문단이 없고 블록이 맨 끝이다.
+    let rules_block = role_rules_block(role);
+    let safety = cys::overrides::SAFETY_CORE_REASSERT;
     if ov_block.is_empty() && local_appended {
         // 오버라이드 파일이 없어도 로컬 지침이 붙었으면 안전핵 재선언이 최후(last-word)여야 한다(⑥).
-        directive.push_str(cys::overrides::SAFETY_CORE_REASSERT);
+        directive.push_str(&rules_block);
+        directive.push_str(safety);
+    } else if let Some(head) = ov_block.strip_suffix(safety) {
+        directive.push_str(head);
+        directive.push_str(&rules_block);
+        directive.push_str(safety);
+    } else if ov_block.is_empty() {
+        directive.push_str(&rules_block);
     } else {
+        // render_block 계약 밖(접미 없음) — 블록을 그 앞에 두어 render_block 의 끝이 그대로 마지막이 되게 한다.
+        directive.push_str(&rules_block);
         directive.push_str(&ov_block);
     }
     // T4-3 ②: 런타임 카탈로그 플레이스holder 치환 — 정적 본문에 `$action_catalog`가 있으면
@@ -15275,6 +15298,16 @@ fn compose_directive(role: &str) -> Result<String, String> {
     // (`editor.action_info` RPC) — 전체 산문 미주입.
     let directive = cys::action_catalog::substitute_catalog(&directive);
     Ok(directive)
+}
+
+/// ★(0.15.0 · 「스스로 해결」 M1 · C6 6.4) 이 역할의 규칙 블록 — `cys repair rules --role <role>` 이 찍는 것과 **같은
+/// 컴파일 상수**(`cys::repair::rules::rules_text` · 세 자리 한 출처). 앞에 빈 줄을 둔 꼴로 돌려준다(지침의 다른 `■` 절과
+/// 같은 모양). 실패면 빈 문자열이다 — 블록 때문에 지침 조립·재개 안내가 실패하지 않는다(어느 쪽이든 지침 없는 좌석보다 낫다).
+fn role_rules_block(role: &str) -> String {
+    match cys::repair::rules::rules_text(cys::repair::roles::role_block_for(role)) {
+        Ok(text) if !text.trim().is_empty() => format!("\n\n{text}"),
+        _ => String::new(),
+    }
 }
 
 /// 꼬리 줄이 **Windows 셸 프롬프트의 형태**인가 — `>` 종결자 전용 보강 판정.
@@ -15672,10 +15705,14 @@ fn boot_directive_for(role: &str, effective_resume: bool) -> Result<String, Stri
         let path = cys::pack::role_directive_path(role)
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "<팩>/directives/<역할>_DIRECTIVE.md".into());
+        // ★(0.15.0 · 「스스로 해결」 M1 · C6 6.6) 복원 좌석(데몬 재시작·업데이트 뒤 · 훅 없는 codex·agy 포함)에도 역할
+        //   블록이 닿게 안내문 끝에 붙인다 — 전문이 아니라 짧은 블록 하나다(부록 A-1 #22: 전문 재주입 금지).
+        let block = role_rules_block(role);
         Ok(format!(
             "[RESUME] 직전 작업 컨텍스트가 복원됐다(역할={role}). 절대지침 전문이 이 대화에 있으면 재숙지만 하고, \
              없거나 앞부분만 보이면 `{path}` 와 soul.md 를 Read 도구로 끝까지 먼저 읽어라. 그다음 \
-             _round/SESSION_STATE.md와 자기 TODO를 읽어 상태를 정합한 뒤 이어서 작업하라."
+             _round/SESSION_STATE.md와 자기 TODO를 읽어 상태를 정합한 뒤 이어서 작업하라.{}",
+            block.trim_end()
         ))
     } else {
         compose_directive(role)
@@ -35546,6 +35583,18 @@ mod tests {
         assert!(safety > persona, "안전핵이 persona보다 먼저 — last-word 위반");
         assert!(safety > knob, "안전핵이 노브보다 먼저 — last-word 위반");
         assert!(out[safety..].find("■ 사용자 오버라이드").is_none(), "안전핵 뒤 오버라이드 재등장");
+        // ★(0.15.0 · 「스스로 해결」 M1 · C6 6.5 / 함께 바꿀 곳 (5) · O-C6-4 (a)) 역할 규칙 블록은 안전핵 문단 **바로
+        //   앞**이고 안전핵이 여전히 마지막 글이다. 블록은 `cys repair rules --role master` 가 찍는 상수와 같다(한 출처).
+        let block = cys::repair::rules::rules_text(cys::repair::roles::RoleBlock::MasterCeo).unwrap();
+        assert!(
+            out.ends_with(&format!("{block}{}", cys::overrides::SAFETY_CORE_REASSERT)),
+            "역할 블록이 안전핵 바로 앞에 있지 않거나 안전핵이 마지막이 아니다:\n{}",
+            t1a_tail(&out)
+        );
+        let b = out.find(&block).expect("역할 블록 누락");
+        assert_eq!(out.matches(&block).count(), 1, "역할 블록이 두 번 붙었다");
+        assert!(b > persona && b > knob && b < safety, "블록은 오버라이드 뒤·안전핵 앞이어야 한다");
+        assert!(out[safety..].find("■ 「스스로 해결」").is_none(), "안전핵 뒤에 역할 블록이 있다");
     }
 
     /// 오버라이드 파일 부재 시 오버라이드/안전핵 블록 모두 미등장(회귀 0).
@@ -35568,6 +35617,113 @@ mod tests {
         let _ = std::fs::remove_dir_all(&td);
         assert!(out.find("■ 사용자 오버라이드").is_none(), "오버라이드 없는데 블록 등장");
         assert!(out.find("■ 안전핵 재확인").is_none(), "오버라이드 없으면 안전핵 재선언도 생략");
+    }
+
+    /// ★(0.15.0 · 「스스로 해결」 M1) 시험용 팩: 다섯 지침 파일(본문 표지 포함) + 빈 로컬 영역. `(pack, local)` 을 돌려준다.
+    fn t1a_fixture_pack(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let td = std::env::temp_dir().join(format!("cys-t1a-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let pack = td.join("pack");
+        std::fs::create_dir_all(pack.join("directives")).unwrap();
+        for d in ["MASTER", "WORKER", "CSO", "REVIEWER", "RSI_LEARNING"] {
+            let body = format!("# {d} 절대지침\n{}", format!("DIRECTIVE-BODY-{d} 본문 줄\n").repeat(400));
+            std::fs::write(pack.join(format!("directives/{d}_DIRECTIVE.md")), body).unwrap();
+        }
+        let local = td.join("local");
+        std::fs::create_dir_all(local.join("directives")).unwrap();
+        (pack, local)
+    }
+
+    /// A-3s-01 case 1 (C6 6.5): no overlay → no safety paragraph → the composed directive ENDS with the role's block,
+    /// the same constant `cys repair rules --role <role>` prints. Every role family; `planner*` / unknown get only the
+    /// common part (O-C6-3) and no role row.
+    #[test]
+    fn compose_directive_role_block_is_last_without_safety_paragraph() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (pack, local) = t1a_fixture_pack("last");
+        let _p = cys::pack::EnvGuard::set(cys::pack::ENV_PACK_DIR, &pack);
+        let _l = cys::pack::EnvGuard::set("CYS_LOCAL_DIR", &local);
+        let _x = cys::pack::EnvGuard::remove("CYS_OVERRIDE_EXPERT");
+        let mut outs = Vec::new();
+        for role in [
+            "master", "ceo", "worker", "worker-2", "cso", "cso-1", "reviewer-codex", "reviewer-claude-1", "planner",
+            "scan-bot",
+        ] {
+            outs.push((role, compose_directive(role)));
+        }
+        let _ = std::fs::remove_dir_all(pack.parent().unwrap());
+        for (role, out) in outs {
+            let out = out.unwrap_or_else(|e| panic!("{role}: compose 실패 {e}"));
+            let block = cys::repair::rules::rules_text(cys::repair::roles::role_block_for(role)).unwrap();
+            assert!(out.ends_with(&block), "{role}: 블록이 맨 끝이 아니다:\n{}", t1a_tail(&out));
+            assert_eq!(out.matches("■ 「스스로 해결」").count(), 1, "{role}: 블록 머리가 한 번이 아니다");
+            assert!(out.find("■ 안전핵 재확인").is_none(), "{role}: 덧씌움 없는데 안전핵 문단");
+            assert!(out.contains("DIRECTIVE-BODY-"), "{role}: 지침 본문이 빠졌다");
+        }
+        let planner = t1a_block("planner");
+        assert_eq!(planner, cys::repair::rules::RULES_COMMON, "planner 는 공통 부분만 받는다(O-C6-3)");
+    }
+
+    /// The last ~300 characters of a text, cut on a character boundary (assert messages of the M1 tests).
+    fn t1a_tail(s: &str) -> &str {
+        s.char_indices().rev().nth(300).map(|(i, _)| &s[i..]).unwrap_or(s)
+    }
+
+    /// The block text a role receives (helper of the M1 tests — same mapping as `role_rules_block`).
+    fn t1a_block(role: &str) -> String {
+        cys::repair::rules::rules_text(cys::repair::roles::role_block_for(role)).unwrap()
+    }
+
+    /// A-3s-01 case 2 (C6 6.5, safety paragraph via the local overlay `~/.cys/local/directives/*.local.md`, the
+    /// `ov_block.is_empty() && local_appended` branch): the block sits immediately BEFORE the safety paragraph, which
+    /// stays the last text; the overlay comes before the block.
+    #[test]
+    fn compose_directive_role_block_before_safety_with_local_overlay() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (pack, local) = t1a_fixture_pack("overlay");
+        std::fs::write(local.join("directives/WORKER_DIRECTIVE.local.md"), "내 로컬 지침 LOCAL-MARK-T1A\n").unwrap();
+        let _p = cys::pack::EnvGuard::set(cys::pack::ENV_PACK_DIR, &pack);
+        let _l = cys::pack::EnvGuard::set("CYS_LOCAL_DIR", &local);
+        let _x = cys::pack::EnvGuard::remove("CYS_OVERRIDE_EXPERT");
+        let out = compose_directive("worker-2");
+        let _ = std::fs::remove_dir_all(pack.parent().unwrap());
+        let out = out.expect("compose 실패");
+        let block = t1a_block("worker-2");
+        let safety = cys::overrides::SAFETY_CORE_REASSERT;
+        assert!(out.ends_with(&format!("{block}{safety}")), "{}", t1a_tail(&out));
+        let mark = out.find("LOCAL-MARK-T1A").expect("로컬 지침 누락");
+        assert!(mark < out.rfind(&block).unwrap(), "로컬 지침이 블록 뒤에 있다");
+        assert_eq!(out.matches("■ 안전핵 재확인").count(), 1);
+    }
+
+    /// A-3s-02 (text half) + appendix A-1 #22: every role's `[RESUME]` text carries that role's block and is still a
+    /// SHORT notice — no directive body, far shorter than the full directive (full re-injection doubles the tokens
+    /// and forces a clear right after the restore).
+    #[test]
+    fn resume_text_carries_role_block_and_stays_short() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (pack, local) = t1a_fixture_pack("resume");
+        let _p = cys::pack::EnvGuard::set(cys::pack::ENV_PACK_DIR, &pack);
+        let _l = cys::pack::EnvGuard::set("CYS_LOCAL_DIR", &local);
+        let mut got = Vec::new();
+        for role in ["master", "worker", "worker-3", "cso", "reviewer-codex", "reviewer-claude-2", "planner"] {
+            got.push((role, boot_directive_for(role, true), boot_directive_for(role, false)));
+        }
+        let _ = std::fs::remove_dir_all(pack.parent().unwrap());
+        for (role, short, full) in got {
+            let (short, full) = (short.expect("[RESUME]"), full.expect("full"));
+            let block = t1a_block(role);
+            assert!(short.starts_with("[RESUME]") && short.contains(&format!("역할={role}")), "{short}");
+            assert!(short.ends_with(block.trim_end()), "{role}: [RESUME] 에 역할 블록이 없다:\n{short}");
+            assert!(!short.contains("DIRECTIVE-BODY-"), "{role}: [RESUME] 에 지침 본문이 들어갔다(A-1 #22)");
+            assert!(
+                short.chars().count() <= cys::repair::rules::RULES_MAX_CHARS + 600,
+                "{role}: [RESUME] 이 길다 ({} 자)",
+                short.chars().count()
+            );
+            assert!(short.len() * 4 < full.len(), "{role}: [RESUME] 이 전문에 가깝다");
+            assert!(full.ends_with(&block), "{role}: 전문 끝에 블록이 없다");
+        }
     }
 
     #[test]
@@ -43427,7 +43583,9 @@ mod tests {
         std::env::set_var("CYS_SOCKET", &socket);
         // 디렉티브 파일 누락으로 조기 실패하면 순서 결함을 검증하지 못한다.
         let directive = compose_directive("worker").expect("fixture 디렉티브 합성 성공 전제");
-        assert!(directive.starts_with('W') && directive.ends_with('R'));
+        // ★(0.15.0 · 「스스로 해결」 M1 · C6 6.5) 합성 지침의 끝은 이제 역할 블록이다 — 전제는 'W 로 시작 · RSI 본문 R 뒤에
+        //   워커 블록으로 끝남'(두 파일 다 읽힘 + 블록이 맨 끝)으로 재핀한다(약화 아님 · 블록 위치까지 고정).
+        assert!(directive.starts_with('W') && directive.ends_with(&format!("R{}", role_rules_block("worker"))));
         let clear_cmd = missing_spec.then(|| "/clear".into());
         let exit = run_cycle_agent(None, Some("7".into()), None, vec![], clear_cmd, None, timeout, true, fire.map(String::from));
         drop(stop);
@@ -43837,7 +43995,8 @@ mod tests {
         let stop = D16DaemonStop(Some(Box::new(stop)));
         std::env::set_var("CYS_SOCKET", &socket);
         let directive = compose_directive("worker").expect("fixture 디렉티브 합성 성공 전제");
-        assert!(directive.starts_with('W') && directive.ends_with('R'));
+        // ★(0.15.0 · M1) 위와 같은 재핀 — RSI 본문 R 뒤가 워커 역할 블록이다.
+        assert!(directive.starts_with('W') && directive.ends_with(&format!("R{}", role_rules_block("worker"))));
         let exit = run_cycle_agent(None, Some("7".into()), None, vec![], None, None, 3, true, None);
         drop(stop);
         let recorded = calls.lock().unwrap_or_else(|e| e.into_inner()).clone();

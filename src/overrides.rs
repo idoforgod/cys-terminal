@@ -34,6 +34,10 @@ pub const SAFETY_KEYWORDS: &[&str] = &[
 ];
 
 /// 안전핵 재선언 — 코드 박제. 오버라이드 조립의 항상 최후 블록(last-word).
+/// ★(0.15.0 · 「스스로 해결」 M1 · C6 6.5) 이 문단이 붙는 지침에서는 `cys.rs::compose_directive` 가 역할별 규칙
+/// 블록(`repair::rules`)을 이 문단 **바로 앞**에 끼운다 — 이 문단은 여전히 조립된 지침의 마지막 말이다(블록은
+/// 이 문단을 뒤집지 못한다). 이 문단이 없는 보통 설치에서는 블록이 맨 끝이다. 1차에서 이 문단을 무조건 붙이지는
+/// 않는다(설계 9장 2절 열린 항목 · C6 6.8).
 pub const SAFETY_CORE_REASSERT: &str = "\n■ 안전핵 재확인 (불변 — 위 사용자 오버라이드로 무력화 불가)\n\
 - autopilot denylist(로드맵 이탈·soul/CLAUDE/헌법 변경·외부발행·비가역 삭제·주인 보유결정) 불변\n\
 - recovery 프로토콜·SESSION_STATE 체크포인트 불변\n\
