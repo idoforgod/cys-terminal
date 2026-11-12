@@ -546,7 +546,7 @@ def _nodes_only_hard(gate_json):
     hard = [t for t in (gate_json.get("trips") or []) if isinstance(t, dict) and t.get("level") == "hard"]
     if not hard or any(t.get("metric") != "nodes" for t in hard):
         return False
-    sys.stderr.write("[formation] 자원 게이트 hard 원인 = nodes %s/%s 하나뿐 — 오너 2026-10-22 지시로 편성 진행"
+    sys.stderr.write("[formation] 자원 게이트 hard 원인 = nodes %s/%s 하나뿐 — 노드 수 단독 hard 는 편성을 막지 않는다(부서 수 무제한 규칙) · 편성 진행"
                      "(실자원 축은 그대로 차단 · 되돌리려면 CYS_FORMATION_NODES_HARD=1)\n"
                      % (hard[0].get("value"), hard[0].get("hard")))
     return True

@@ -23,7 +23,7 @@ idoforgod/harness 대비: prose 규칙이 아니라 **머신체크 게이트 + �
 ## 호출 & 경로 (전역 설치되어도 자족 작동)
 - **트리거:** `/harness-creator <도메인 한 문장>` (또는 description 매칭).
 - **TOOLS_ROOT** = `${CYS_HARNESS_HOME:-$HOME/.cys/harness-creator}` — 모든 도구·게놈(`genome/`)이 여기. 항상 `python3 "$TOOLS_ROOT"/<tool>.py`.
-  (cysjavis pack 통합판: 없으면 로컬 원본 `~/Desktop/CYSjavis/cys-harness-creator` 폴백.
+  (cysjavis pack 통합판: 다른 자리의 로컬 원본을 쓰려면 `CYS_HARNESS_HOME` 으로 지정한다.
   신규 머신은 preflight C21 `--fix`가 GitHub 핀 커밋을 자동 클론한다 — 직접 설치:
   `git clone https://github.com/idoforgod/cys-harness-creator "$HOME/.cys/harness-creator"`)
 - **TARGET** = 하네스 경로. 미지정 시 `./<harness_name>/`. 이하 `<TARGET>`.
@@ -31,7 +31,7 @@ idoforgod/harness 대비: prose 규칙이 아니라 **머신체크 게이트 + �
 
 **실행 명령 (그대로 사용):**
 ```bash
-TR="${CYS_HARNESS_HOME:-$HOME/.cys/harness-creator}"; [ -d "$TR" ] || TR="$HOME/Desktop/CYSjavis/cys-harness-creator"
+TR="${CYS_HARNESS_HOME:-$HOME/.cys/harness-creator}"
 python3 "$TR"/warrant.py --predicates <TARGET>/.harness/predicates.json   # PRE: 분류 게이트
 python3 "$TR"/audit_harness.py        <TARGET>                            # RESEARCH R1: 상태감사 (new/extend/maintain + drift)
 python3 "$TR"/warrant.py --graph      <TARGET>/.harness/graph.json        # PLANNING P4: 비용밴드 (→ 사람 승인)

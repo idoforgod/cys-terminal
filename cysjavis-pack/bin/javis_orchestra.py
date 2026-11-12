@@ -3117,7 +3117,7 @@ def cmd_round_status(args):
         print("  → 합격(4자 수렴). 다음 단계는 `gate-status`(임무 게이트 포함)로 확인하라 — "
               "라운드를 더 돌 이유가 없다.")
     elif reason == "stopped_budget":
-        print("  → %dR 상한 도달: 무한 루프 금지. 잠근 합격 기준에 미달이면 주인님께 "
+        print("  → %dR 상한 도달: 무한 루프 금지. 잠근 합격 기준에 미달이면 오너에게 "
               "격차를 보고하고 추가 라운드 여부를 여쭈어라(운영계약 §6-5)." % MAX_ROUNDS)
     elif reason == "stopped_stagnation":
         print("  → **종결(정체)**: stopped_stagnation은 종결이며 minor는 백로그 목록으로 인계한다. "
@@ -3247,7 +3247,7 @@ SILENT_FAILURES = [
      "kind": "deterministic"},
     {"id": "SF-ESCALATION-MISSING",
      "source": "§6 라운드 루프 8(10R escalation)",
-     "constraint": "10R 도달인데 잠근 합격 기준에 미달이면 무한루프 금지 + 주인님께 격차 보고·판단 요청 필수",
+     "constraint": "10R 도달인데 잠근 합격 기준에 미달이면 무한루프 금지 + 오너에게 격차 보고·판단 요청 필수",
      "detection": "기록 라운드>=10 AND 수렴 미달인데 SESSION_STATE에 ESCALATION 레코드+master→owner push가 없으면 위반",
      "kind": "deterministic"},
     {"id": "SF-DIRECTIVE-NOT-INJECTED",

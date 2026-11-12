@@ -999,7 +999,7 @@ def build_report(status, extra_dirs, now=None, sampled_at=None):
 
 def render_text(rep):
     lines = []
-    lines.append("주인님께 보고 (5분 주기 진행 현황 · 결정론 산출):")
+    lines.append("오너에게 보고 (5분 주기 진행 현황 · 결정론 산출):")
     # ── 전체 진행 (★교정 5 계약: 백분율은 **집계 모수 한정**이고, 집계 밖 미완이 있으면
     #    완료를 주장하지 않는다. 계약 근거는 build_report의 해당 주석에 적혀 있다.) ──
     hp = rep.get("hidden_pending") or {}

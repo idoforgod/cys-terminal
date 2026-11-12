@@ -88,7 +88,7 @@ def cmd_issue(args):
         return EXIT_USAGE
     # §C1.2 기계화: 고위험 waiver 는 doctor 만 발급 가능(master 발급은 fail-closed).
     if args.risk == "high" and args.approver != "doctor":
-        print("ERROR: 고위험(--risk high) waiver 는 doctor 승인만 유효합니다(§C1.2). master 발급 거부.", file=sys.stderr)
+        print("ERROR: 고위험(--risk high) waiver 는 doctor(owner — 사람 승인자) 승인만 유효합니다(§C1.2). master 발급 거부.", file=sys.stderr)
         return EXIT_USAGE
 
     today = _today()
@@ -164,10 +164,10 @@ def main(argv=None):
     pi = sub.add_parser("issue", help="waiver 발급(만료일·승인자 필수)")
     pi.add_argument("--rule", required=True, help="대상 규칙(예: 4조-regression)")
     pi.add_argument("--reason", required=True, help="사유")
-    pi.add_argument("--approver", required=True, help="승인자(master|doctor) — §C1.2")
+    pi.add_argument("--approver", required=True, help="승인자(master|doctor — doctor = owner(사용자)의 식별자) — §C1.2")
     pi.add_argument("--expiry", required=True, help="만료일 YYYY-MM-DD(필수)")
     pi.add_argument("--remediation", required=True, help="해소 계획(만료 전 부채 해소)")
-    pi.add_argument("--risk", default="low", help="위험도(low|high) — high는 doctor 승인만")
+    pi.add_argument("--risk", default="low", help="위험도(low|high) — high는 doctor(owner) 승인만")
     pi.set_defaults(func=cmd_issue)
 
     pc = sub.add_parser("check", help="대상 규칙에 유효 waiver 존재? (없거나 만료=exit 1)")

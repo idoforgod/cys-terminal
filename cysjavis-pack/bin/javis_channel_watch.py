@@ -133,7 +133,7 @@ def render_text(report):
         tail = " (여전히 off: %s)" % ",".join(still) if still else " · 변화 없음"
         return "채널 헬스 정상 (%d/%d reachable%s)" % (
             sum(1 for t in tr if t["cur"] == STRONG), len(tr), tail)
-    lines = ["주인님께 보고 — 콘텐츠 채널 상태 변화 감지:"]
+    lines = ["오너에게 보고 — 콘텐츠 채널 상태 변화 감지:"]
     for t in changed:
         mark = "⚠" if t["event"] == "DEGRADED" else "✅"
         lines.append("  %s %s: %s (%s→%s)" % (mark, t["platform"], t["event"],

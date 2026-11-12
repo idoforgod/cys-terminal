@@ -33,7 +33,7 @@ The 7 rules below are now **mechanically enforced**, not merely disciplined. Bef
 - **Adversarial Metric Integrity** (§4.2.5): Sentinel-Pareto (no regression in pytest/SOUL_SMOKE/store-clean), hidden held-out (Rule 6/env-lock), **meta-mutation of the eval itself** (Rule 2 applied to the judge).
 - **Unified Autonomous Boundary** (§4.2.6): RSI Auto-Elevate ⊆ autopilot denylist (Absolute Hard-Stop: 외부발행·비가역·헌법). RSI may ratchet conservatism **up** (human-approved), never down.
 
-Implementation of the enforcer is **Human-Critical** (R9 §4.2.8); once built, rsi-gate/guard/hooks are **immutable** (the loop cannot weaken its own gate). guard.sh = command irreversibility (kill-switch); rsi-gate = RSI-change auto-Elevate license — two defense lines.
+Implementation of the enforcer is **Human-Critical** (R9 §4.2.8); once built, the RSI loop itself never edits rsi-gate/guard/hooks (the loop cannot weaken its own gate) — fixing a broken hook is ordinary self-repair work through the repair flow (`cys repair`), never an RSI round. guard.sh = command irreversibility (kill-switch); rsi-gate = RSI-change auto-Elevate license — two defense lines.
 
 ## The 7 hard-won rules (the part agents skip)
 
