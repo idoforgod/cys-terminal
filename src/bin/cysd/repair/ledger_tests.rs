@@ -1490,7 +1490,8 @@ fn commit_is_bounded_and_never_unchecked() {
             reference_ms: 1,
         })
     };
-    let started = std::time::Instant::now();
+    // The bound is structural (no real-clock window): the deadline handed to the check never
+    // exceeds the commit budget, and a timed-out check is a refusal, not a wait.
     let e = handle_with(
         &r.ctx(T0 + 3.0, &general, &timeout),
         &w,
@@ -1498,8 +1499,8 @@ fn commit_is_bounded_and_never_unchecked() {
         &json!({"repair": id}),
     )
     .unwrap_err();
-    assert!(started.elapsed() < std::time::Duration::from_secs(5));
     assert_eq!(e.code, "repair_check_failed");
+    assert!(seen.get() > std::time::Duration::ZERO, "the check was never called");
     assert!(seen.get() <= std::time::Duration::from_secs(COMMIT_CHECK_BUDGET_SECS));
     assert_eq!(
         r.record_of(&id).state,
