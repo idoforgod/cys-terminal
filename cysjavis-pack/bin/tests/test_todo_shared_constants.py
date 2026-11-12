@@ -392,5 +392,81 @@ class LabelNormalization(unittest.TestCase):
             self.assertEqual(HB.todo_label("/x/_round/" + name, {}), want, name)
 
 
+class ReviewerOwnTodoName(unittest.TestCase):
+    """★0.15.0 T10(설계 §6-12 (5)(6) · 결정 12): 리뷰어가 쓸 수 있는 todo 는 **자기** 파일 하나다 —
+    그 이름은 `cys todo-path` 의 규칙(대문자화 + 하이픈→언더스코어 + `_TODO.md`)이고, 리뷰어 관문
+    (`hooks/role-capability-gate.sh` `reviewer_own_todo_name`)은 그 규칙을 **사본으로** 들고 있다.
+    규칙이 갈리면 ⓐ리뷰어가 자기 todo 를 못 써서 정리의 '저장→검증'(cycle 저장 파일 =
+    `javis_cycle_autopilot.role_todo_file`)이 막히거나(무clear) ⓑ남의 파일을 쓴다. 다섯 구현을 고정
+    벡터와 소스로 대조한다(Rust 쪽은 리터럴 대조 — 표현이 바뀌면 조용히 통과하지 않고 여기서 멈춘다)."""
+
+    VECTORS = (("reviewer-codex", "REVIEWER_CODEX_TODO.md"),
+               ("reviewer-gemini", "REVIEWER_GEMINI_TODO.md"),
+               ("reviewer-claude-1", "REVIEWER_CLAUDE_1_TODO.md"),     # RULINGS B2 대체 좌석
+               ("reviewer-claude-2", "REVIEWER_CLAUDE_2_TODO.md"),
+               ("reviewer", "REVIEWER_TODO.md"),
+               ("planner", "PLANNER_TODO.md"),
+               ("worker-2", "WORKER_2_TODO.md"))
+
+    def gate_ns(self):
+        hook = os.path.join(os.path.dirname(BIN), "hooks", "role-capability-gate.sh")
+        with open(hook, encoding="utf-8") as f:
+            src = f.read().split("<<'PYEOF'\n", 1)[1]
+        src = src.split('\nif os.environ.get("CAPGATE_SELF_TEST"):', 1)[0]
+        ns = {"__name__": "capgate_todo_name_specimen"}
+        exec(compile(src, hook, "exec"), ns)
+        return ns
+
+    def test_python_implementations_and_the_gate_agree(self):
+        import javis_cycle_autopilot as CA
+        name = self.gate_ns()["reviewer_own_todo_name"]
+        for role, want in self.VECTORS:
+            with self.subTest(role=role):
+                self.assertEqual(name(role), want, "리뷰어 관문")
+                self.assertEqual(ORC.todo_file_name(role), want, "javis_orchestra")
+                self.assertEqual(os.path.basename(CA.role_todo_file(role, packdir="/PK")), want,
+                                 "javis_cycle_autopilot(정리 저장 검증 파일)")
+
+    def test_rust_todo_path_uses_the_same_rule(self):
+        src = strip_line_comments(rust_source("src/bin/cys.rs"))
+        rule = re.compile(r'format!\(\s*"\{\}_TODO\.md"\s*,\s*([A-Za-z_][A-Za-z0-9_]*)'
+                          r'\.to_uppercase\(\)\.replace\(\s*\'-\'\s*,\s*"_"\s*\)\s*\)')
+        m = re.search(r"fn run_todo_path\(.*?\n}\n", src, re.S)
+        self.assertTrue(m, "src/bin/cys.rs 에서 run_todo_path 를 찾지 못했다(대조 불가 = 실패)")
+        self.assertEqual(len(rule.findall(m.group(0))), 1,
+                         "`cys todo-path` 의 파일명 식이 대문자화+하이픈→언더스코어가 아니다 — 리뷰어 "
+                         "관문의 자기 todo 허용과 갈렸다")
+        # 같은 파일의 다른 생산자(cycle-agent 저장 검증)도 같은 식이어야 한다 — `_TODO.md` 를 역할에서
+        # 만드는 format! 은 전부 이 모양이다(다른 모양이 하나라도 있으면 갈린 것이다).
+        any_role_todo = [x for x in re.findall(r'format!\(\s*"\{\}_TODO\.md"\s*,[^;]*\)', src)
+                         if "to_uppercase" in x]
+        self.assertGreaterEqual(len(any_role_todo), 2, any_role_todo)
+        self.assertTrue(all(rule.search(x) for x in any_role_todo),
+                        "역할에서 todo 파일명을 만드는 식이 갈렸다: %r" % any_role_todo)
+
+    def test_shipped_acl_keeps_reviewer_to_worker_send_ban(self):
+        """설계 §6-12 '약하게 만들면 안 되는 것' — 리뷰어→워커 송신 금지. 엔진은 데몬 시험이 고정하지만
+        **배포되는 규칙 파일**에 그 줄이 있는지는 아무도 재지 않았다. 규칙은 위에서부터 첫 매칭 승리,
+        글롭은 `*` 만(`acl.json` `_doc`)."""
+        import fnmatch
+        import json
+        with open(os.path.join(os.path.dirname(BIN), "acl.json"), encoding="utf-8") as f:
+            acl = json.load(f)
+
+        def verdict(frm, to):
+            for rule in acl.get("rules", []):
+                pat_f, pat_t = rule.get("from", ""), rule.get("to", "")
+                if (fnmatch.fnmatchcase(frm, pat_f.replace("[", "[[]"))
+                        and fnmatch.fnmatchcase(to, pat_t.replace("[", "[[]"))):
+                    return bool(rule.get("allow"))
+            return acl.get("default", "allow") == "allow"
+
+        for frm in ("reviewer-codex", "reviewer-gemini", "reviewer-claude-1", "reviewer-claude-2"):
+            for to in ("worker", "worker-2"):
+                with self.subTest(frm=frm, to=to):
+                    self.assertFalse(verdict(frm, to), "리뷰어→워커 송신 금지가 배포 규칙에서 빠졌다")
+            self.assertTrue(verdict(frm, "master"), "리뷰어→master 회신이 막혔다(라운드가 닫히지 않는다)")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
