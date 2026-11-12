@@ -1280,7 +1280,8 @@ mod tests {
     ];
 
     /// A-3s-04 (b) / O-C6-1: `cys repair rules --role <role>` prints exactly the compiled block of that
-    /// role (the same text `compose_directive` and `[RESUME]` carry), nothing on stderr, exit 0, fast.
+    /// role (the same text `compose_directive` and `[RESUME]` carry), nothing on stderr, exit 0. (The 2-s
+    /// bound is the hook's — `cys_timeout_run 2`, hook check 23d — no wall-clock premise here.)
     #[test]
     fn rules_prints_the_block_byte_for_byte() {
         // AF4: `rules` must not send a request — a counting rpc stays at zero.
@@ -1292,9 +1293,7 @@ mod tests {
         for role in RULE_ROLES {
             let cmd = parse(&["rules", "--role", role]).unwrap();
             let (mut out, mut err) = (Vec::new(), Vec::new());
-            let t0 = std::time::Instant::now();
             assert_eq!(run_with(&cmd, &mut out, &mut err, &no_request), 0, "{role:?}");
-            assert!(t0.elapsed() < std::time::Duration::from_secs(2), "{role:?} took {:?}", t0.elapsed());
             assert!(err.is_empty(), "{role:?}: {}", String::from_utf8_lossy(&err));
             let want = cys::repair::rules::rules_text(cys::repair::roles::role_block_for(role)).unwrap();
             assert_eq!(String::from_utf8(out).unwrap(), want, "{role:?}");
