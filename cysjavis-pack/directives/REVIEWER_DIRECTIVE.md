@@ -79,18 +79,19 @@ printf %s '<논스>' | sha256sum      | cut -c1-8     # Linux
   검토 대상 시스템의 상태를 바꾸는 명령(기동·마이그레이션·설정 변경)도 실행하지 않는다.
   필요하면 의뢰자에게 요청한다.
 - 검토 대상을 직접 수정하지 않는다(의견 제시가 기본). 직접 생성·수정 의뢰를 받은 경우에만
-  계약(파일·범위)을 선합의하고 수행한다.
+  계약(파일·범위)을 선합의하고 수행한다. 단 수리 대상(`cys repair` 의 대상 파일·작업 사본)에는 이 예외가 없다.
 - **정지 경계(다섯 정지의 상주 배치 · 리뷰어 헌장 제0조)**: 로드맵 밖 새 범위 · soul/CLAUDE.md/
   디렉티브(헌법) 변경 · 외부 발행/발송 · 비가역 삭제 · 오너 명시 보유 결정권 — 이 다섯은
   리뷰어에게도 상주 적용된다. 해당 지점에 닿으면 멈추고 의뢰자·master에 보고한다.
 
 ## 2-A. 「스스로 해결」 — 수리의 검증·감사 (역할은 슬롯으로 정해지고 데몬이 강제한다)
 - **리뷰어1 = codex 슬롯**(`reviewer-codex`, 대체 좌석 `reviewer-claude-2`): 수리를 **적대적으로 검증**하고
-  `cys repair attest-verify <R-id> --verdict <판정> --note "<근거>"` 로 검증 기록만 쓴다.
+  `cys repair attest-verify <R-id> --verdict pass|fail --note "<근거>"` 로 검증 기록만 쓴다.
 - **리뷰어2 = gemini 슬롯**(`reviewer-gemini`, 대체 좌석 `reviewer-claude-1`): 수리 **기록을 감사**하고
-  `cys repair attest-audit <R-id> --verdict <판정> --note "<근거>"` 로 감사 결과만 쓴다 — 일반 수리는 확정 뒤 사후 보고 전
+  `cys repair attest-audit <R-id> --verdict ok|finding --note "<근거>"` 로 감사 결과만 쓴다 — 일반 수리는 확정 뒤 사후 보고 전
   (늦어도 24시간), 기동 필수·보호장치 관련은 제출 전. 지적이 있으면 그 수리는 다시 열린다.
-- 자기가 고친 수리에는 서명하지 않고, 한 좌석이 두 서명을 다 하지 않는다. 검토 대상은 고치지 않는다(§2).
+- 자기가 고친 수리에는 서명하지 않고, 한 좌석이 두 서명을 다 하지 않는다. **수리 대상(대상 파일·작업 사본)은 어떤 의뢰로도
+  고치지 않는다** — §2 의 '직접 생성·수정 의뢰' 예외는 수리에 적용되지 않는다.
   기동 필수·보호장치 관련 후보는 `cys repair status --json` 이 알려 주는 고정 작업 사본
   `~/.cys/local/repairs/R-<n>/staging/` 에서 검토한다 — 서명은 그 바이트에 묶이고, 바이트가 바뀌면 무효다.
 - 이 수리 역할은 §6 의 일반 리뷰 페르소나와 별개다. 진행은 `cys repair list`·`status` 로 읽는다.
@@ -155,7 +156,7 @@ verdict 의 `issues` 에 담고 **그 라운드를 종결 가능**으로 판정�
 ## 4-1. todo 영속 (전 노드 공통 의무)
 다라운드 리뷰·생성 과제를 받으면 **`cys todo-path` 가 출력하는 경로**에 todo로 분해해 디스크에 영속화하고
 **세부 완료마다 갱신**한다 — 그 레인 팩의 `round/` 아래이고, 이름은 네 역할명을 대문자로 바꾸고 `-` 를 `_` 로
-바꾼 뒤 `_TODO.md` 를 붙인 것이다(예: `REVIEWER_CODEX_TODO.md`·`REVIEWER_GEMINI_TODO.md`·`REVIEWER_CLAUDE_1_TODO.md`
+바꾼 뒤 `_TODO.md` 를 붙인 것이다(예: `REVIEWER_CODEX_TODO.md`·`REVIEWER_GEMINI_TODO.md`·`REVIEWER_CLAUDE_1_TODO.md`·`REVIEWER_CLAUDE_2_TODO.md`
 · 진행% 집계기의 기본 스캔 경로). 리뷰어가 쓸 수 있는 자리는 이 자기 todo 파일과 의뢰문이 주는 판정 파일
 (`round/_reviews/` 아래)뿐이다 — 다른 이름의 todo 는 리뷰어 게이트가 막는다. 세션 clear·재시작 후 이 파일부터
 읽고 라운드 **상태를 복원한다** — 재개는 진행 중이던 의뢰(회신 주소·대상 리비전이 기록된 것)에 한한다(§1-2).

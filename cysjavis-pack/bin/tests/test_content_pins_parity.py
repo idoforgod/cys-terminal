@@ -235,6 +235,12 @@ class M2DirectiveRewrite(unittest.TestCase):
         self.assertIn("한 시간에 한 번 이상", w)
         self.assertIn(STAGING, w)
         self.assertIn("접수는 장부의 자료이지 master 에게 보내는 메시지가 아니다", w)
+        # RULINGS AH1: the taught call is accepted by the daemon (--trigger required, AD10) and begin precedes the edit.
+        self.assertIn("고치기 **전에** `cys repair begin --files <rel…> --trigger owner-order|grant|update`", w)
+        self.assertIn("`--owner-token <표>`", w)
+        # RULINGS AH2: `record` renews the lease only while editing — after asking for signatures it would void them.
+        self.assertIn("**리뷰어 서명을 청한 뒤에는 `record` 를 부르지 않는다**", w)
+        self.assertIn("같은 파일로 `begin` 을 다시 불러 그 수리를 이어받은 뒤 `submit`·`commit` 한다", w)
 
     def test_reviewer_slots_match_orchestra_and_name_the_attest_verbs(self):
         """RULINGS B2: 리뷰어1 = codex 슬롯(reviewer-codex·reviewer-claude-2) · 리뷰어2 = gemini 슬롯(reviewer-gemini·
@@ -245,8 +251,12 @@ class M2DirectiveRewrite(unittest.TestCase):
         self.assertEqual(slots, {"reviewer-gemini": "reviewer-claude-1", "reviewer-codex": "reviewer-claude-2"})
         self.assertIn("**리뷰어1 = codex 슬롯**(`reviewer-codex`, 대체 좌석 `%s`)" % slots["reviewer-codex"], r)
         self.assertIn("**리뷰어2 = gemini 슬롯**(`reviewer-gemini`, 대체 좌석 `%s`)" % slots["reviewer-gemini"], r)
-        self.assertIn("cys repair attest-verify", r)
-        self.assertIn("cys repair attest-audit", r)
+        self.assertIn("cys repair attest-verify <R-id> --verdict pass|fail", r)
+        self.assertIn("cys repair attest-audit <R-id> --verdict ok|finding", r)
+        # RULINGS AH6: a repair target admits no edit exception for a reviewer (also in §2, which review prompts inject).
+        self.assertIn("**수리 대상(대상 파일·작업 사본)은 어떤 의뢰로도 고치지 않는다**", r)
+        sec2 = norm(section(self._t("REVIEWER_DIRECTIVE.md"), "\n## 2. 엄격 제약") or "")
+        self.assertIn("단 수리 대상(`cys repair` 의 대상 파일·작업 사본)에는 이 예외가 없다", sec2)
         self.assertIn(STAGING, r)
 
     def test_reviewer_todo_path_follows_the_todo_path_naming_rule(self):
@@ -261,8 +271,7 @@ class M2DirectiveRewrite(unittest.TestCase):
         rule = lambda role: role.upper().replace("-", "_") + "_TODO.md"
         for native, _a, sub, _b in orch.REVIEWER_SLOTS:
             for role in (native, sub):
-                if role in ("reviewer-codex", "reviewer-gemini", "reviewer-claude-1"):
-                    self.assertIn("`%s`" % rule(role), r, role)
+                self.assertIn("`%s`" % rule(role), r, role)
 
     def test_cso_reports_only_and_allowlist_sentence(self):
         """설계 §6-3 (5): CSO 허용 목록 문장에 수리 접수·조회, CSO 는 보고만."""

@@ -67,7 +67,7 @@ case "$REL" in
   # ★F10-B(0.14.50): hooks/ 아래 vendor 파일의 수정 — 보존 사실 + 수리 장부 경로 + 영속 경로(로컬 훅 폴더)를 고지(0.15.0 M2).
   #   문장의 단일 출처는 src/pack.rs 의 HOOKS_LOCAL_GUIDANCE(<rel> 만 $REL 로 치환) — 낱말을 바꾸면 test_pack_guard_hooks_guidance.py 가 붉어진다. 차단 없음.
   hooks/*)
-    MSG="$MSG hooks/ 아래 vendor 파일의 수정은 제자리에 보존됩니다. 「스스로 해결」 수리라면 워커가 cys repair begin --files $REL 로 시작하고 cys repair record 로 수리 장부에 남깁니다 — 장부가 업데이트 뒤 다시 입히기·되돌리기·감사의 근거입니다. 따로 두고 싶은 자기 훅은 ~/.cys/local/hooks/<이벤트>.d/ 에 둡니다(업데이트·치유 불가침)."
+    MSG="$MSG hooks/ 아래 vendor 파일의 수정은 제자리에 보존됩니다. 「스스로 해결」 수리라면 워커가 고치기 전에 cys repair begin --files $REL --trigger owner-order|grant|update 로 시작해 원본을 보관한 뒤 고치고 cys repair record 로 수리 장부에 남깁니다(장부가 업데이트 뒤 다시 입히기·되돌리기·감사의 근거) — 기동 필수·보호장치 관련 훅은 살아 있는 파일이 아니라 begin 이 알려 주는 작업 사본 repairs/R-<n>/staging/ 에서 고쳐 cys repair submit 으로 수정 최종 승인을 받습니다. 따로 두고 싶은 자기 훅은 ~/.cys/local/hooks/<이벤트>.d/ 에 둡니다(업데이트·치유 불가침)."
     ;;
 esac
 

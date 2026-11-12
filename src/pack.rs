@@ -2400,7 +2400,7 @@ pub fn hooks_report_scan(
 
 /// ★F10 C3 — 안내 문장의 **단일 출처**. 이 상수를 `cys doctor` 의 `hooks/` drift 행 아래와 `cys pack-ownership <hooks/…>` 가 찍는다.
 /// `pack-guard.sh` 의 메시지는 같은 낱말을 쓴다(`<rel>` 만 경로로 치환). 0.15.0 M2: 밖으로 보내는 제안 경로 대신 수리 장부(`cys repair`)를 가리킨다.
-pub const HOOKS_LOCAL_GUIDANCE: &str = "hooks/ 아래 vendor 파일의 수정은 제자리에 보존됩니다. 「스스로 해결」 수리라면 워커가 cys repair begin --files <rel> 로 시작하고 cys repair record 로 수리 장부에 남깁니다 — 장부가 업데이트 뒤 다시 입히기·되돌리기·감사의 근거입니다. 따로 두고 싶은 자기 훅은 ~/.cys/local/hooks/<이벤트>.d/ 에 둡니다(업데이트·치유 불가침).";
+pub const HOOKS_LOCAL_GUIDANCE: &str = "hooks/ 아래 vendor 파일의 수정은 제자리에 보존됩니다. 「스스로 해결」 수리라면 워커가 고치기 전에 cys repair begin --files <rel> --trigger owner-order|grant|update 로 시작해 원본을 보관한 뒤 고치고 cys repair record 로 수리 장부에 남깁니다(장부가 업데이트 뒤 다시 입히기·되돌리기·감사의 근거) — 기동 필수·보호장치 관련 훅은 살아 있는 파일이 아니라 begin 이 알려 주는 작업 사본 repairs/R-<n>/staging/ 에서 고쳐 cys repair submit 으로 수정 최종 승인을 받습니다. 따로 두고 싶은 자기 훅은 ~/.cys/local/hooks/<이벤트>.d/ 에 둡니다(업데이트·치유 불가침).";
 
 /// ★B2(§2 축B 소유권 매니페스트): 팩 파일의 system|user 소유권 축. **기본값=system**(임베드 진실 —
 /// 벤더 전진 시 갱신·병합, 벤더 미전진 드리프트는 kept-drift 제자리 보존 · v2 §3 L0-L4),
@@ -11430,11 +11430,18 @@ mod tests {
     fn f10_guidance_names_the_local_folder_and_the_existing_propose_route() {
         for needle in [
             "~/.cys/local/hooks/<이벤트>.d/",
-            "cys repair begin --files",
+            "cys repair begin --files <rel> --trigger owner-order|grant|update",
             "cys repair record",
+            "repairs/R-<n>/staging/",
+            "cys repair submit",
         ] {
             assert!(HOOKS_LOCAL_GUIDANCE.contains(needle), "{needle}");
         }
+        let (begin, record) = (
+            HOOKS_LOCAL_GUIDANCE.find("cys repair begin").unwrap(),
+            HOOKS_LOCAL_GUIDANCE.find("cys repair record").unwrap(),
+        );
+        assert!(begin < record, "begin 은 고치기 전(원본 보관) — record 보다 먼저 가르친다(RULINGS AH1)");
         for old in [["--pro", "pose"].concat(), ["제안", " 패치"].concat()] {
             assert!(
                 !HOOKS_LOCAL_GUIDANCE.contains(&old),

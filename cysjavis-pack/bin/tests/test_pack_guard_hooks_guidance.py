@@ -26,6 +26,9 @@ HOOK = os.path.join(PACK, "hooks", "pack-guard.sh")
 PACK_RS = os.path.join(ROOT, "src", "pack.rs")
 BASH = shutil.which("bash") or "/bin/bash"
 LITERALS = ("~/.cys/local/hooks/<이벤트>.d/", "cys repair begin --files", "cys repair record")
+# RULINGS AH1: the taught call is the one the daemon accepts (--trigger is required, AD10), begin comes BEFORE
+# the edit, and a boot-critical / protection-related hook goes through the working copy + submit.
+CALL_LITERALS = ("--trigger owner-order|grant|update", "고치기 전에", "repairs/R-<n>/staging/", "cys repair submit")
 # the old route, split so this file itself carries no such phrase (shipped-string sweep A-1-05)
 OLD_ROUTE = ("--pro" + "pose", "제안" + " 패치", "pack-merge --file hooks/guard.sh --pro" + "pose")
 
@@ -78,7 +81,9 @@ class PackGuardHooksGuidance(unittest.TestCase):
         ctx = context_of(r)
         for lit in LITERALS:
             self.assertIn(lit, ctx, "hook output lacks %r: %r" % (lit, ctx[:400]))
-        self.assertIn("cys repair begin --files hooks/guard.sh", ctx)
+        self.assertIn("cys repair begin --files hooks/guard.sh --trigger owner-order|grant|update", ctx)
+        for lit in CALL_LITERALS:
+            self.assertIn(lit, ctx, "hook output lacks %r" % lit)
         for old in OLD_ROUTE:
             self.assertNotIn(old, ctx, "the hook still sends the fix away: %r" % old)
 
@@ -99,6 +104,10 @@ class PackGuardHooksGuidance(unittest.TestCase):
                       "the hook's sentence differs from the one origin in src/pack.rs")
         for old in OLD_ROUTE[:2]:
             self.assertNotIn(old, const, "HOOKS_LOCAL_GUIDANCE still carries the old proposal route %r" % old)
+        for lit in CALL_LITERALS:
+            self.assertIn(lit, const, "HOOKS_LOCAL_GUIDANCE lacks %r (RULINGS AH1)" % lit)
+        self.assertLess(const.index("cys repair begin"), const.index("cys repair record"),
+                        "begin must be taught before record (begin stores the pre-image)")
 
     def test_5_non_system_file_is_silent_and_exit_zero(self):
         r = run_hook("hooks/mine.sh", own="custom")
