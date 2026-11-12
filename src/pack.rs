@@ -14048,7 +14048,7 @@ mod m11_tests {
             }
         }
         assert_eq!(on_disk, out.bytes, "색인의 바이트 합 = 실제 사본");
-        assert!(took < std::time::Duration::from_secs(4), "스냅샷 {took:?} — 기동 대기 4초 초과"); // wallclock: aging RULINGS AC4 asks for a time bound on the pre-bind snapshot; 4 s is the design's CLI start wait (§4-11 아), ~10x the measured cost on this machine
+        assert!(took < std::time::Duration::from_secs(4), "스냅샷 {took:?} — 기동 대기 4초 초과"); // wallclock: aging RULINGS AC4 asks for a time bound on the pre-bind snapshot; 4 s is the design's CLI start wait (§4-11 아) and the fixture is the worst case (every embedded file changes)
         // 상한: 파일 하나가 상한을 넘으면 그 파일만 빠지고 색인에 남는다 — 설치는 계속된다.
         let big = "x".repeat((UPDATE_SNAPSHOT_FILE_CAP + 1) as usize);
         rig.write("bin/huge.txt", big.as_bytes());
