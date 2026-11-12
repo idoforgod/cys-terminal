@@ -1696,6 +1696,14 @@ class OpenDefectLine(unittest.TestCase):
         self.assertEqual(len(_defect_wakes(self.run_once(lambda: (True, "base", ["aa"])))), 1,
                          "the set closed and opened again: that is a change")
 
+    def test_unwritable_state_sends_nothing_instead_of_a_line_per_run(self):
+        """RULINGS AK6: the state is written BEFORE the line is queued — a state file that cannot be
+        written means no line at all (never a resend on every run)."""
+        gate_dir = os.path.join(self.tmp, "gate")
+        os.makedirs(os.path.join(gate_dir, G.OPEN_DEFECT_STATE_FILE))   # a directory: cannot be replaced
+        for _ in range(3):
+            self.assertEqual(_defect_wakes(self.run_once(lambda: (True, "base", ["aa"]))), [])
+
     def test_enqueue_failure_is_retried_next_run(self):
         gate_dir = os.path.join(self.tmp, "gate")
         bad = FakeRunner(report_ok=False, err="collector absent", enqueue_rc=1)

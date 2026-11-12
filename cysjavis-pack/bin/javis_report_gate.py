@@ -2180,10 +2180,20 @@ class Gate:
             body, idem = wake
             if idem == last:
                 return 0                                   # 같은 열린 집합 — 이미 배달함
+            #   ★RULINGS AK6: 상태를 **먼저** 쓴다 — 상태 파일을 쓸 수 없으면 줄을 넣지 않는다(쓴 뒤 넣고
+            #     실패하면 매 실행이 같은 줄을 다시 넣는 재발송으로 돌아간다). 넣기가 실패하면 기억을
+            #     되돌려 다음 실행이 다시 시도한다.
+            try:
+                _write_json_atomic(state_path, {"key": idem, "count": len(sigs), "at": self.now_epoch_fn()})
+            except (OSError, TypeError, ValueError):
+                return 0
             rc, _wid = self._enqueue("master", OPEN_DEFECT_TASK, body, idem, SEV_INFO)
             if rc != 0:
+                try:
+                    _write_json_atomic(state_path, {"key": last, "count": None, "at": self.now_epoch_fn()})
+                except (OSError, TypeError, ValueError):
+                    pass
                 return 0                                   # 넣지 못함 = 다음 실행이 다시 시도
-            _write_json_atomic(state_path, {"key": idem, "count": len(sigs), "at": self.now_epoch_fn()})
             self.runner.drain("master")
             return 1
         except Exception:                                  # noqa: BLE001 — 부가 줄은 게이트를 멈추지 않는다
