@@ -5002,6 +5002,8 @@ def _self_test_boot_critical(fails, shutil):
         tdir = tempfile.mkdtemp(prefix="t5a-capgate-")
         log = os.path.join(tdir, "log")
         saved = os.environ.get("CYS_BIN")
+        # the child's CYS_NO_AUTOSTART must come from the gate itself, not from the caller's env
+        saved_na = os.environ.pop("CYS_NO_AUTOSTART", None)
 
         def fake(name, body):
             fp = os.path.join(tdir, name)
@@ -5040,6 +5042,8 @@ def _self_test_boot_critical(fails, shutil):
                 os.environ.pop("CYS_BIN", None)
             else:
                 os.environ["CYS_BIN"] = saved
+            if saved_na is not None:
+                os.environ["CYS_NO_AUTOSTART"] = saved_na
             shutil.rmtree(tdir, ignore_errors=True)
 
 

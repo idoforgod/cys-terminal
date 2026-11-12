@@ -1094,8 +1094,7 @@ fn path_value_target(value: &str, file_dir: &str) -> Option<String> {
         });
     }
     for d in ["bin/", "hooks/"] {
-        if before.ends_with(d) {
-            let pre = &before[..before.len() - d.len()];
+        if let Some(pre) = before.strip_suffix(d) {
             if pre.is_empty() || pre.ends_with('/') || pre.ends_with('"') || pre.ends_with('}') {
                 return Some(format!("{d}{name}"));
             }
@@ -1221,8 +1220,8 @@ pub fn derive(src: &Sources) -> Result<Vec<GenEntry>, String> {
     excluded.extend(pfa.statusline.iter().cloned());
 
     // 1. hooks: script → (events, timeout, sources)
-    let mut hooks: BTreeMap<String, (BTreeSet<String>, Option<u32>, BTreeSet<&'static str>)> =
-        BTreeMap::new();
+    type HookRow = (BTreeSet<String>, Option<u32>, BTreeSet<&'static str>);
+    let mut hooks: BTreeMap<String, HookRow> = BTreeMap::new();
     for r in awakening.iter().chain(pfa.registrations.iter()) {
         if excluded.contains(&r.script) {
             continue;

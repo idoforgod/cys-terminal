@@ -230,13 +230,13 @@ pub fn normalize_lexical(s: &str, windows: bool) -> String {
             t = format!("{}{}", (b[0] as char).to_ascii_uppercase(), &t[1..]);
         }
     }
-    let (prefix, rest) = if windows && t.starts_with("//") {
-        ("//".to_string(), &t[2..])
+    let (prefix, rest) = if let Some(r) = t.strip_prefix("//").filter(|_| windows) {
+        ("//".to_string(), r)
     } else if windows && t.len() >= 2 && t.as_bytes()[1] == b':' {
         let p = t[..2].to_string() + "/";
         (p, t[2..].trim_start_matches('/'))
-    } else if t.starts_with('/') {
-        ("/".to_string(), &t[1..])
+    } else if let Some(r) = t.strip_prefix('/') {
+        ("/".to_string(), r)
     } else {
         (String::new(), t.as_str())
     };
@@ -337,7 +337,7 @@ pub fn classify_with(
             }
             if cl.starts_with(&rl) && cl.as_bytes()[rl.len()] == b'/' {
                 let rel = c[rl.len() + 1..].to_string();
-                if best.as_ref().map_or(true, |(n, _, _)| rl.len() > *n) {
+                if best.as_ref().is_none_or(|(n, _, _)| rl.len() > *n) {
                     best = Some((rl.len(), rel, r));
                 }
             }

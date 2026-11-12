@@ -114,7 +114,11 @@ class _Env(unittest.TestCase):
 
     def run_hook(self, tool, tool_input, cwd=None, **envkw):
         env = dict(self.env)
-        env.update({k: str(v) for k, v in envkw.items()})
+        for k, v in envkw.items():
+            if v is None:
+                env.pop(k, None)        # 키 제거(예: 게이트가 스스로 싣는지 재려고 CYS_NO_AUTOSTART 를 뺀다)
+            else:
+                env[k] = str(v)
         payload = {"session_id": "t5a", "tool_name": tool, "tool_input": tool_input,
                    "hook_event_name": "PreToolUse"}
         if cwd is not None:
@@ -144,7 +148,9 @@ class GateWithStub(_Env):
                              ("Write", {"file_path": target, "content": "x"}),
                              ("Bash", {"command": "echo x > %s" % target})):
                 self.calls.unlink() if self.calls.exists() else None
-                r, _ = self.run_hook(tool, ti, CYS_BIN=self.fake("yes", self.yes_json()), CYS_ROLE=role)
+                # CYS_NO_AUTOSTART 를 호출 env 에서 빼고 돌린다 — 자식이 받은 1 은 게이트가 실은 값이어야 한다
+                r, _ = self.run_hook(tool, ti, CYS_BIN=self.fake("yes", self.yes_json()), CYS_ROLE=role,
+                                     CYS_NO_AUTOSTART=None)
                 dec, reason = self.decision(r)
                 self.assertEqual(r.returncode, 0)
                 self.assertEqual(dec, "deny", "%s/%s 가 거부되지 않았다: %r %r" % (role, tool, r.stdout, r.stderr))
