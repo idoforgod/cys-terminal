@@ -6432,6 +6432,7 @@ fn write_journal(
 ///   single mode rule [`pack_target_mode`]`(current mode, bytes, true)`: an existing exec mode is kept,
 ///   a `#!` file gets 0755, any other mode is kept (the design's second method, "되돌린 뒤 실행 권한
 ///   처리를 다시 돈다").
+///
 /// The bytes are the rollback's first duty: if the filesystem refuses the mode, the bytes are still
 /// restored (mode requested through `open(2)`, so never wider than asked) and the failure is printed —
 /// a mode never aborts a rollback halfway.
