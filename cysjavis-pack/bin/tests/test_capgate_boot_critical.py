@@ -201,6 +201,30 @@ class GateWithStub(_Env):
             self.assertNotEqual(self.decision(r)[0], "deny", "%s 가 거부로 접혔다(fail-open 위반)" % name)
             self.assertLess(dt, 12.0, "%s: 훅이 %.1fs 걸렸다(선언 시한 15s)" % (name, dt))
 
+    def test_reviewer_refusal_stays_t10s_and_spawns_nothing(self):
+        """T10(reviewer 쓰기 정확 목록)과의 상호작용 — reviewer 좌석의 기동 필수 파일 쓰기는 **T10 규칙이**
+        거부한다(그 거부를 이 조언 관문이 허용으로 바꾸지 않고, 이미 거부된 쓰기에 `cys` 를 띄우지 않는다).
+        T10 이 허용한 reviewer 쓰기(판정 파일 자리)는 이 관문이 한 번 묻고, 본체 답이 '아님'이면 통과한다."""
+        target = str(self.pack / REL)
+        if target.startswith(("/tmp/", "/private/tmp/", "/var/tmp/", "/var/folders/")):
+            self.skipTest("검체 팩이 reviewer 임시 폴더 허용 접두 아래라 T10 거부를 재현할 수 없다: %s" % target)
+        stub = self.fake("yes", self.yes_json())
+        for tool, ti in (("Write", {"file_path": target, "content": "x"}),
+                         ("Edit", {"file_path": target, "old_string": "a", "new_string": "b"}),
+                         ("Bash", {"command": "echo x > %s" % target})):
+            r, _ = self.run_hook(tool, ti, CYS_ROLE="reviewer-codex", CYS_BIN=stub)
+            dec, reason = self.decision(r)
+            self.assertEqual(dec, "deny", "%s: reviewer 쓰기가 거부되지 않았다: %r" % (tool, r.stderr[-300:]))
+            self.assertIn("producer != evaluator", reason, "%s: T10 의 거부가 아니다: %r" % (tool, reason))
+            self.assertNotIn("기동 필수 파일", reason)
+        self.assertEqual(self.calls_seen(), [], "T10 이 이미 거부한 쓰기에 cys 를 띄웠다")
+        verdict = self.pack / "round" / "_reviews" / "v1.json"
+        verdict.parent.mkdir(parents=True, exist_ok=True)
+        r, _ = self.run_hook("Write", {"file_path": str(verdict), "content": "{}"}, CYS_ROLE="reviewer-codex",
+                             CYS_BIN=self.fake("no", "printf '{\"decision\":\"no\"}'; exit 1\n"))
+        self.assertNotEqual(self.decision(r)[0], "deny", "T10 이 허용한 판정 파일 쓰기가 막혔다: %r" % r.stdout)
+        self.assertEqual(len(self.calls_seen()), 1, "팩 아래 쓰기는 본체에 한 번 묻는다")
+
     def test_no_python_asymmetry_unchanged(self):
         """부록 A 1-29 — python 이 없으면 reviewer 는 fail-closed(2), CSO·worker 는 열림(0)."""
         need = ["date", "head", "tr", "dirname", "mktemp", "cat", "rm", "mv", "id",
