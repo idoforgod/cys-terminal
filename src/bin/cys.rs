@@ -8630,6 +8630,14 @@ fn run_init_pack(force: bool, no_install_hook: bool, claude_settings: Option<Str
         kept,
         if force { ", forced" } else { "" }
     );
+    if force {
+        // ★0.15.0 M11 자(설계 §4-11 자): --force 는 사용자 수정을 버리지 않는다.
+        println!(
+            "※ --force 는 사용자 수정을 버리지 않습니다 — 고친 파일은 그대로 두고 신버전은 <파일>.new 로 보관합니다\
+             (기동 필수 파일은 신버전을 먼저 살리고 내 수정본을 <파일>.user 로 보관). 수정을 버리는 길은 주인이 요청하는 \
+             공장 초기화와 cys repair revert 뿐입니다."
+        );
+    }
     println!("다음: cys launch-agent --role master --agent claude  (역할 지침 자동 주입)");
 
     if no_install_hook {
@@ -26442,6 +26450,20 @@ fn run_pack_merge(
                     "  🚧 {rel} — 판독 불가+백업 실패로 무접촉 보존 — UTF-8 회복 후 재스윕 또는 cys pack-heal {rel}"
                 ),
                 "adopted" => println!("  ↩ {rel} — 복권됨(다음 스윕에 kept-drift 정규화)"),
+                // ★0.15.0 M11 가·나(O-C8-1).
+                "user-kept" => {
+                    let caution = match e.get("caution").and_then(|v| v.as_str()) {
+                        Some(c) => format!(" · 주의: 손상 의심({c}) — 합칠 때 확인"),
+                        None => String::new(),
+                    };
+                    let reason = e.get("reason").and_then(|v| v.as_str()).unwrap_or("?");
+                    println!(
+                        "  ⏸ {rel} — 내 수정본이 살아 있음(업데이트가 덮지 않음 · 사유 {reason}) · vendor {ver} 신버전은 {side} 에 보관{caution}\n     → 워커가 합친다: cys pack-merge --file {rel} [--take-new|--keep-mine|--ai]"
+                    );
+                }
+                "vendor-first" => println!(
+                    "  🔁 {rel} — 기동 필수 파일: vendor {ver} 본을 먼저 살림 · 내 수정본은 {side} 에 보관(이전 세대는 {rel}.user.prev-*)\n     → 워커가 승인 절차로 다시 입힌다: cys repair reapply <수리번호> · vendor 본 유지 확정: cys pack-merge --file {rel} --take-new(보관본은 지우지 않음)"
+                ),
                 _ => println!("  ? {rel} ({kind})"),
             }
         }
@@ -26513,7 +26535,10 @@ fn run_pack_merge(
     // pristine 미전진 버그 수리 — 호출 4곳 자동 수혜).
     let advance_manifest_base = |content: &str| advance_vendor_baseline(&dir, &rel, content);
     match kind {
-        "new-pending" => {
+        // ★0.15.0 M11 가: user-kept 는 '내 파일 유지 + vendor `.new` 보관' — 해소 경로가 new-pending 과 같다
+        // (take-new = vendor 채택 · keep-mine = 내 것 유지·이번 vendor 본 소화(기준선 전진 → 다음 스윕 kept-drift) ·
+        // 3-way/AI 병합). 합치기는 워커의 일이다(master 직접 병합 금지 — 지침).
+        "new-pending" | "user-kept" => {
             let new_path = dir.join(format!("{rel}.new"));
             let theirs = match std::fs::read_to_string(&new_path) {
                 Ok(s) => s,
@@ -26847,6 +26872,34 @@ fn run_pack_merge(
             );
             1
         }
+        "vendor-first" => {
+            // ★0.15.0 M11 나: 기동 필수 파일 — vendor 본이 살아 있고 내 수정본은 `.user`(+ 이전 세대)에 보관.
+            // 다시 입히기는 승인 절차로만(cys repair reapply — 워커 + 주인 승인). 이 동사가 할 수 있는 것은
+            // 'vendor 본 유지 확정'(원장 항목 해소)뿐이고, 보관본은 지우지 않는다(사용자 수정을 버리지 않는다).
+            if take_new {
+                if dry_run {
+                    println!("(dry-run · 쓰기 0) '{rel}' — vendor 본 유지 확정 예정(보관본 {rel}.user 는 그대로)");
+                    return 0;
+                }
+                if confirm(&format!(
+                    "'{rel}' — vendor 본 유지를 확정하고 다시 입히기 대기를 해소?(보관본 {rel}.user 는 지우지 않음)"
+                )) {
+                    pending.remove(&rel);
+                    cys::pack::save_merge_pending(&dir, &pending);
+                    let cur = std::fs::read_to_string(&target).unwrap_or_default();
+                    audit(&merge_audit_entry(
+                        &rel, "take-new", &cur, &cur, "n/a", &flag_list(&["vendor-first-confirm"]),
+                    ));
+                    println!("✅ {rel} — vendor 본 유지 확정(보관본 {rel}.user 보존)");
+                }
+                return 0;
+            }
+            eprintln!(
+                "'{rel}' 은 기동 필수 파일의 vendor 우선 보관(vendor-first) — 다시 입히기는 워커가 승인 절차로만: cys repair reapply <수리번호>. \
+                 --keep-mine·--to-local·병합·복권은 승인 없이 기동 필수 파일을 바꾸므로 거부한다. vendor 본 유지 확정은 --take-new."
+            );
+            1
+        }
         "adopted" => {
             // ★성찰 차단 수리 2R-3(G3-축3 동형 — 플래그 침묵 무시 금지): 종전엔 플래그 불문
             // 단일 println 후 exit 0 이라, 다음 스윕 전까지(부트 간격만큼) 명시 --take-new
@@ -26932,29 +26985,14 @@ fn heal_prompt_line(kind: Option<&str>, ts: Option<u64>, rel: &str) -> String {
 /// conflicted(reason:capture-failed) 원장의 .user 는 자동 병합 실패 때 살아남은 유일 원본 —
 /// 단일 슬롯(.user) 재사용이 이를 침묵 클로버하면 영구 소실이었다(캡처 없음). 동일 내용이면
 /// 무조치(멱등 재실행의 세대 증식 방지) · 개명 실패 = Err(호출측 fail-closed 거부 의무).
+/// ★0.15.0 M11 사: 본문은 라이브러리(`cys::pack::preserve_prior_user_generation`)로 옮겼다 — 설치 실행부도
+/// 같은 함수를 쓴다(세 번째 방식 금지). 이 이름은 기존 호출부를 위해 남긴 위임이다.
 fn preserve_prior_user_generation(
     dir: &std::path::Path,
     rel: &str,
     incoming: Option<&[u8]>,
 ) -> Result<Option<std::path::PathBuf>, String> {
-    let prior = dir.join(format!("{rel}.user"));
-    if !prior.exists() {
-        return Ok(None);
-    }
-    if let Some(inc) = incoming {
-        if std::fs::read(&prior).ok().as_deref() == Some(inc) {
-            return Ok(None);
-        }
-    }
-    let ts = unix_now();
-    let mut dest = dir.join(format!("{rel}.user.prev-{ts}"));
-    let mut n = 1u32;
-    while dest.exists() {
-        n += 1;
-        dest = dir.join(format!("{rel}.user.prev-{ts}-{n}"));
-    }
-    std::fs::rename(&prior, &dest).map_err(|e| format!("기존 {rel}.user 세대 보존 실패({e})"))?;
-    Ok(Some(dest))
+    cys::pack::preserve_prior_user_generation(dir, rel, incoming)
 }
 
 /// ★T4(v2 §5): 명시 치유 동사 — 드리프트 system 파일을 embed 본으로 복원(백업 선행 · 3중 전진 ·
@@ -27231,27 +27269,40 @@ fn run_pack_adopt(
     let pending = cys::pack::load_merge_pending(&dir);
     if rel.is_none() && !all {
         // 복권 가능 목록(kind∈{healed,conflicted} ∧ .user 실재) — 읽기 전용.
+        // ★0.15.0 M11 차: 예전 업데이트가 `.user` 로 밀어낸 수정의 목록 = 이 출력(주인에게 한 번 보이고 워커가
+        // 하나씩 평가한다). 각 줄에 되살리기 모의 판정을 붙인다 — 무조건 되살리지 않는다.
         let mut n = 0usize;
         for (r, e) in pending.iter() {
             let kind = e.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
             if matches!(kind, "healed" | "conflicted") && dir.join(format!("{r}.user")).is_file() {
-                println!("  {r} [{kind}] → cys pack-adopt {r}");
+                let (verdict, _) = adopt_list_line(&dir, r);
+                println!("  {r} [{kind}] — {verdict} → cys pack-adopt {r}");
                 n += 1;
             }
         }
         if n == 0 {
             println!("복권 가능한 보존본 없음(원장 healed·conflicted ∧ <rel>.user 실재 기준)");
+        } else {
+            println!(
+                "※ 진짜 수정만 다시 입힌다 — 워커가 하나씩 평가(기동 필수는 승인 절차 · 판독 불가는 UTF-8 로 바꿔 수리 흐름으로)"
+            );
         }
         return 0;
     }
     let targets: Vec<String> = if all {
-        pending
-            .iter()
-            .filter(|(_, e)| {
-                matches!(e.get("kind").and_then(|v| v.as_str()), Some("healed") | Some("conflicted"))
-            })
-            .map(|(r, _)| r.clone())
-            .collect()
+        // ★0.15.0 M11 차: --all 은 제외(사용자의 vendor 복귀 선택)·판독 불가(CP949 바이트 백업 — 자동
+        // 되살리기에서만 제외)·기동 필수(승인 절차로만)를 건너뛴다 — 무조건 자동 되살리기 금지.
+        let mut t = Vec::new();
+        for (r, e) in pending.iter() {
+            if !matches!(e.get("kind").and_then(|v| v.as_str()), Some("healed") | Some("conflicted")) {
+                continue;
+            }
+            match adopt_list_line(&dir, r) {
+                (_, None) => t.push(r.clone()),
+                (why, Some(_)) => println!("  ↷ {r} 건너뜀 — {why}"),
+            }
+        }
+        t
     } else {
         vec![rel.clone().unwrap_or_default()]
     };
@@ -27295,6 +27346,107 @@ fn skills_overlay_shadowing_notice(rel: &str) -> Option<String> {
         ))
     } else {
         None
+    }
+}
+
+/// ★0.15.0 M11 차: 되살리기 모의 판정의 결과 — `pack-adopt` 목록(주인에게 한 번 보이는 예전 `.user` 목록)과
+/// 단건 복권이 **같은 판정**을 쓴다(재구현 금지 — H-11cha-N1-01).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdoptVerdict {
+    /// 복원본이 다음 스윕을 그대로 생존(kept-drift · user-kept).
+    Survives,
+    /// vendor 전진 — 복원 즉시 재병합/재치유(--merge-after 옵트인).
+    VendorAdvanced,
+    /// 기동 필수 파일 — 승인 절차로만(이 동사는 거부).
+    BootCritical,
+}
+
+/// 복원 후 상태(disk=소스)로 설치 판정을 모의한다 — 입력원·수집기·판정 함수 모두 설치 실행부와 같다.
+fn adopt_verdict(dir: &std::path::Path, rel: &str, embed: &str, source: &str) -> AdoptVerdict {
+    let sources = cys::pack::UpdateSources::for_live_pack(dir);
+    if sources.is_boot_critical(rel) {
+        return AdoptVerdict::BootCritical;
+    }
+    let scope = cys::pack::pack_scope_of(dir);
+    let (manifest, corrupt) = cys::pack::load_manifest_state(dir);
+    let mhash = manifest.get(rel).cloned();
+    let verified_base = mhash.as_deref().and_then(|mh| {
+        std::fs::read_to_string(dir.join(cys::pack::PRISTINE_DIR).join(rel))
+            .ok()
+            .filter(|p| cys::pack::content_hash_pub(p) == mh)
+    });
+    let pending = cys::pack::load_merge_pending(dir);
+    let ctx = cys::pack::UpdateContext::new(dir, scope, &sources, corrupt);
+    let facts = ctx.facts(rel, embed, true, Some(source), mhash.as_deref(), &pending);
+    match cys::pack::decide_file_action_with(
+        rel,
+        embed,
+        true,
+        Some(source),
+        mhash.as_deref(),
+        false,
+        scope,
+        verified_base.as_deref(),
+        &facts,
+    ) {
+        cys::pack::FileAction::KeepDrift
+        | cys::pack::FileAction::Keep { .. }
+        | cys::pack::FileAction::UserKept { .. }
+        | cys::pack::FileAction::KeepAbsent { .. } => AdoptVerdict::Survives,
+        cys::pack::FileAction::VendorFirst { .. } => AdoptVerdict::BootCritical,
+        cys::pack::FileAction::Merge3 | cys::pack::FileAction::Write { .. } => {
+            AdoptVerdict::VendorAdvanced
+        }
+    }
+}
+
+/// ★0.15.0 M11 차 제외: 사용자가 명시적으로 vendor 본 복귀를 고른 파일(병합 감사의 `pack-heal` ·
+/// `take-new`) — 예전 `.user` 목록·`--all` 에서 뺀다(설계 §4-11 차 "제외: … '복구'").
+fn adopt_excluded_by_vendor_choice(dir: &std::path::Path, rel: &str) -> bool {
+    let Ok(text) = std::fs::read_to_string(dir.join(cys::pack::MERGE_AUDIT_FILE)) else {
+        return false;
+    };
+    text.lines().any(|line| {
+        serde_json::from_str::<serde_json::Value>(line).is_ok_and(|v| {
+            v.get("file").and_then(|f| f.as_str()) == Some(rel)
+                && matches!(
+                    v.get("action").and_then(|a| a.as_str()),
+                    Some("pack-heal") | Some("take-new")
+                )
+                && !v
+                    .get("flags")
+                    .and_then(|f| f.as_array())
+                    .is_some_and(|f| f.iter().any(|x| x.as_str() == Some("refused")))
+        })
+    })
+}
+
+/// 예전 `.user` 한 건의 목록 판정(사람이 읽는 한 줄) — 목록 모드와 `--all` 이 같이 쓴다.
+/// None = 자동 복권 대상(복권 가능 · vendor 전진은 --merge-after 안내), Some(사유) = 자동 복권 제외.
+fn adopt_list_line(dir: &std::path::Path, rel: &str) -> (String, Option<&'static str>) {
+    let src = dir.join(format!("{rel}.user"));
+    let embed = cys::pack::PACK_ALL.iter().find(|(r, _)| *r == rel).map(|(_, c)| *c);
+    if adopt_excluded_by_vendor_choice(dir, rel) {
+        return ("제외 — 사용자가 vendor 본 복귀를 골랐음(병합 감사 pack-heal/take-new)".into(), Some("excluded"));
+    }
+    let Ok(source) = std::fs::read_to_string(&src) else {
+        return (
+            "판독 불가(CP949 등) — 자동 복권 제외 · 워커가 UTF-8 로 바꿔 수리 흐름으로 다시 입힌다".into(),
+            Some("unreadable"),
+        );
+    };
+    let Some(em) = embed else {
+        return ("임베드 밖(custom) — --from 으로만 복원".into(), Some("custom"));
+    };
+    match adopt_verdict(dir, rel, em, &source) {
+        AdoptVerdict::Survives => ("복권 가능(다음 스윕 생존)".into(), None),
+        AdoptVerdict::VendorAdvanced => {
+            ("복권 가능 — vendor 전진: --merge-after 로 복원 후 자동 병합".into(), None)
+        }
+        AdoptVerdict::BootCritical => (
+            "기동 필수 — 승인 절차로만(cys repair begin/reapply · 이 동사는 거부)".into(),
+            Some("boot-critical"),
+        ),
     }
 }
 
@@ -27380,36 +27532,22 @@ fn adopt_one(
             }
         }
     }
-    // ④ 판정 시뮬 — 복원 후 상태(disk=소스)로 decide_file_action 직호출(재구현 금지 — SOT 단일).
+    // ④ 판정 시뮬 — 복원 후 상태(disk=소스)로 설치와 같은 판정(decide_file_action_with + 같은 사실 수집기 —
+    //    재구현 금지 · SOT 단일). ★0.15.0 M11 차: 기동 필수 파일은 승인 절차로만 다시 입힌다 — 이 동사는
+    //    승인 없이 파일을 바꾸므로 거부한다(cys repair reapply / begin).
     if let Some(em) = embed {
         if !cleanup_only {
-            let scope = cys::pack::pack_scope_of(dir);
-            let manifest: std::collections::BTreeMap<String, String> =
-                std::fs::read_to_string(dir.join(cys::pack::INSTALL_MANIFEST))
-                    .ok()
-                    .and_then(|s| serde_json::from_str(&s).ok())
-                    .unwrap_or_default();
-            let mhash = manifest.get(rel).cloned();
-            let verified_base = mhash.as_deref().and_then(|mh| {
-                std::fs::read_to_string(dir.join(cys::pack::PRISTINE_DIR).join(rel))
-                    .ok()
-                    .filter(|p| cys::pack::content_hash_pub(p) == mh)
-            });
-            let action = cys::pack::decide_file_action(
-                rel,
-                em,
-                true,
-                Some(&source),
-                mhash.as_deref(),
-                false,
-                scope,
-                verified_base.as_deref(),
-            );
-            match action {
-                cys::pack::FileAction::KeepDrift | cys::pack::FileAction::Keep { .. } => {
-                    // vendor 미전진 — 복원본이 다음 스윕을 그대로 생존(kept-drift 정규화 예정).
+            match adopt_verdict(dir, rel, em, &source) {
+                AdoptVerdict::Survives => {
+                    // vendor 미전진(kept-drift) 또는 사용자 우선(user-kept) — 복원본이 다음 스윕을 생존.
                 }
-                cys::pack::FileAction::Merge3 | cys::pack::FileAction::Write { .. } => {
+                AdoptVerdict::BootCritical => {
+                    return Err(
+                        "기동 필수 파일 — 승인 없이 되살리지 않는다(설계 §4-11 차). 워커가 수리 흐름으로 다시 입힌다: cys repair begin --files … → 예행·서명 → submit → 주인 승인(업데이트가 보관한 것이면 cys repair reapply)"
+                            .into(),
+                    );
+                }
+                AdoptVerdict::VendorAdvanced => {
                     if !merge_after {
                         return Err(
                             "vendor 전진 검출 — 복원 즉시 재병합/재치유 예상. 착수하려면 --merge-after(복원+즉시 전량 스윕=자동 병합) 옵트인"
@@ -27648,12 +27786,58 @@ fn prev_manifest_hash(prev: &std::path::Path, rel: &str) -> Option<String> {
 fn run_pack_rollback(file: Option<String>, yes: bool, force_vendor: bool, force_unsafe_core: bool) -> i32 {
     let dir = cys::pack::pack_dir();
     let prev = cys::pack::pack_prev_dir(&dir);
-    if !prev.is_dir() {
+    // ★0.15.0 M11 아: 이 레인의 업데이트 전 스냅샷(설치기 관리 파일만 · 복원 계약)이 있으면 그것이 보존본이다
+    // (설계 §7 13행 "pack.prev → 업데이트 전 스냅샷으로 대신한다"). 없으면 종전 `pack.prev` 그대로.
+    let snap: Option<(std::path::PathBuf, cys::pack::SnapshotMeta)> = cys::pack::lane_for_install(&dir)
+        .and_then(|l| {
+            cys::pack::newest_update_snapshot(&cys::pack::local_dir().join("update-snapshots"), &l.0)
+        })
+        .and_then(|p| cys::pack::read_update_snapshot_meta(&p).ok().map(|m| (p, m)));
+    if snap.is_none() && !prev.is_dir() {
         eprintln!("보존본 없음({}) — .prev 는 설치·업데이트가 1회 이상 실행된 뒤 생깁니다.", prev.display());
         return 1;
     }
-    let prev_ver = std::fs::read_to_string(prev.join(".pack-version")).unwrap_or_else(|_| "?".into());
+    let prev_ver = match &snap {
+        Some((_, m)) => m.pack_version.clone(),
+        None => std::fs::read_to_string(prev.join(".pack-version")).unwrap_or_else(|_| "?".into()),
+    };
     let cur_ver = std::fs::read_to_string(dir.join(".pack-version")).unwrap_or_else(|_| "?".into());
+    if file.is_none() {
+        if let Some((sp, meta)) = &snap {
+            // 목록 모드(스냅샷): 기록된 상태와 현재 팩이 다른 파일(복원 후보) — 읽기 전용.
+            println!(
+                "업데이트 전 스냅샷: {} (팩 {} → 현재 {} · {} · 설치기 관리 파일 {}건)\n차이 파일(복원 후보):",
+                sp.display(),
+                prev_ver.trim(),
+                cur_ver.trim(),
+                meta.created_at,
+                meta.files.len()
+            );
+            let mut count = 0usize;
+            for f in &meta.files {
+                let p = dir.join(&f.rel);
+                let differs = match &f.link_target {
+                    Some(t) => std::fs::read_link(&p).map(|x| x.to_string_lossy() != t.as_str()).unwrap_or(true),
+                    None => std::fs::read(&p).map(|b| cys::pack::sha256_hex(&b) != f.sha256).unwrap_or(true),
+                };
+                if differs {
+                    let own = cys::pack::ownership_name_scoped(&f.rel, &dir);
+                    println!("  [{own}] {}", f.rel);
+                    count += 1;
+                    if count >= 200 {
+                        println!("  … (200건 초과 — 생략)");
+                        return 0;
+                    }
+                }
+            }
+            if count == 0 {
+                println!("  (없음 — 스냅샷과 현재 팩이 동일)");
+            } else {
+                println!("복원: cys pack-rollback --file <경로> (스냅샷의 기록 해시로 검증한 뒤에만 씁니다)");
+            }
+            return 0;
+        }
+    }
     let Some(rel) = file else {
         // 목록 모드: .prev 와 현재 팩에서 내용이 다른 파일(복원 후보)을 표시. 읽기 전용.
         println!(
@@ -27734,12 +27918,74 @@ fn run_pack_rollback(file: Option<String>, yes: bool, force_vendor: bool, force_
         }
         return 1;
     }
+    // ★0.15.0 M11 아: 스냅샷에 이 파일이 있으면 스냅샷이 원천이다 — 기록 해시(링크면 링크 대상)로 검증한 뒤에만
+    // 쓴다(복원 계약). 어긋나면 거부(--force-vendor 로만 강행 — M4 와 같은 규칙). 링크는 링크로 되살린다.
+    let snap_entry = snap
+        .as_ref()
+        .and_then(|(sp, m)| m.files.iter().find(|f| f.rel == rel).map(|f| (sp.clone(), f.clone())));
+    let mut snap_mode: Option<u32> = None;
+    let mut from_snapshot = false;
     let src = prev.join(&rel);
-    let content = match std::fs::read(&src) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("보존본에 '{rel}' 없음({e}) — cys pack-rollback 으로 후보 목록 확인");
-            return 1;
+    let content: Vec<u8> = if let Some((sp, f)) = &snap_entry {
+        match cys::pack::verify_snapshot_entry(sp, f) {
+            Ok(bytes) => {
+                if let Some(target) = &f.link_target {
+                    if !yes && !confirm_stdin(&format!("'{rel}' 을 스냅샷(팩 {})의 링크(→ {target})로 복원?", prev_ver.trim())) {
+                        println!("취소됨");
+                        return 0;
+                    }
+                    #[cfg(unix)]
+                    {
+                        let dest = dir.join(&rel);
+                        if std::fs::symlink_metadata(&dest).is_ok() {
+                            if let Err(e) = std::fs::remove_file(&dest) {
+                                eprintln!("기존 항목 제거 실패: {e}");
+                                return 1;
+                            }
+                        }
+                        if let Err(e) = std::os::unix::fs::symlink(target, &dest) {
+                            eprintln!("링크 복원 실패: {e}");
+                            return 1;
+                        }
+                        println!("✅ {rel} 링크 복원(→ {target})");
+                        return 0;
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        eprintln!("'{rel}' 은 링크입니다 — 이 운영체제에서는 링크를 만들 수 없어 복원하지 않았습니다");
+                        return 1;
+                    }
+                }
+                snap_mode = Some(f.mode);
+                from_snapshot = true;
+                bytes
+            }
+            Err(e) if force_vendor => {
+                eprintln!("⚠ --force-vendor: 스냅샷 보관본 검증 실패를 무릅쓰고 진행 — {e}");
+                snap_mode = Some(f.mode);
+                from_snapshot = true;
+                match std::fs::read(sp.join(cys::pack::UPDATE_SNAPSHOT_FILES).join(&rel)) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("스냅샷 보관본 판독 실패: {e}");
+                        return 1;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "⛔ 거부: 스냅샷 보관본이 기록과 다릅니다 — 복원하지 않았습니다.\n\x20  {e}\n\x20  강행하려면 --force-vendor 를 명시하십시오."
+                );
+                return 1;
+            }
+        }
+    } else {
+        match std::fs::read(&src) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("보존본에 '{rel}' 없음({e}) — cys pack-rollback 으로 후보 목록 확인");
+                return 1;
+            }
         }
     };
     // ★M4(0.14.55 · P3): **system 등급**의 보존본은 내용을 검증한 뒤에만 쓴다.
@@ -27754,7 +28000,7 @@ fn run_pack_rollback(file: Option<String>, yes: bool, force_vendor: bool, force_
     //     지적한 "검증 없이 교체되고 새 mode 규칙으로 실행권한까지 받는" 합성을 mode 분기가 아니라
     //     **쓰기 제거**로 막는다.
     //   user 등급은 이 검증 대상이 아니다 — 보존본의 user 파일은 매니페스트와 **정당하게** 다르다.
-    if own == "system" {
+    if own == "system" && !from_snapshot {
         match prev_manifest_hash(&prev, &rel) {
             Some(expected) => {
                 let actual = cys::pack::content_hash_pub(&String::from_utf8_lossy(&content));
@@ -27830,7 +28076,8 @@ fn run_pack_rollback(file: Option<String>, yes: bool, force_vendor: bool, force_
     }
     // H-08: 보존본(원본)이 실행 가능하면 그 mode 가 권위다 — 대상은 이전 치유가 0644 로 망가뜨린
     //   사본일 수 있으므로 **source 를 먼저** 본다.
-    let prior = cys::pack::current_mode(&src)
+    let prior = snap_mode
+        .or_else(|| cys::pack::current_mode(&src))
         .filter(|m| m & 0o111 != 0)
         .or_else(|| cys::pack::current_mode(&dest));
     let sysent = cys::pack::is_system_manifest_entry(&dir, &rel);
@@ -40129,10 +40376,121 @@ mod tests {
         let rc2 = run_pack_adopt(Some(rel.clone()), false, None, true, true);
         assert_eq!(rc2, 0, "--merge-after 옵트인 진행");
         let kind = t4_ledger_kind(&td, &rel);
+        // ★0.15.0 M11 가(H-RW 재작성 — 종전 기대: merged/conflicted): 기동 필수가 아닌 파일의 병합 실패 폴백은 이제
+        //   conflicted(vendor 본 + .user)가 아니라 user-kept(복권한 내 파일 유지 + vendor .new)다.
         assert!(
-            matches!(kind.as_deref(), Some("merged") | Some("conflicted")),
-            "재스윕 후 merged/conflicted 기대 — 실측 {kind:?}"
+            matches!(kind.as_deref(), Some("merged") | Some("user-kept")),
+            "재스윕 후 merged/user-kept 기대 — 실측 {kind:?}"
         );
+        if kind.as_deref() == Some("user-kept") {
+            assert_eq!(std::fs::read_to_string(td.join(&rel)).unwrap(), custom, "user-kept: 복권본 유지");
+            assert_eq!(std::fs::read_to_string(td.join(format!("{rel}.new"))).unwrap(), embed, "user-kept: vendor .new");
+        }
+        let _ = std::fs::remove_dir_all(td.parent().unwrap());
+    }
+
+    /// ★0.15.0 M11 가·나: pack-merge 가 신 kind 2종을 다룬다 — user-kept 는 new-pending 과 같은 해소(keep-mine =
+    /// 내 것 유지 + 기준선 전진 → 다음 스윕 kept-drift), vendor-first 는 승인 절차 밖 해소를 거부하고 'vendor 본 유지
+    /// 확정'만 받는다(보관본은 지우지 않는다 — 사용자 수정을 버리지 않는다).
+    #[test]
+    fn m11_pack_merge_resolves_user_kept_and_guards_vendor_first() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (td, rel, embed, _env) = t4_system_fixture("m11merge");
+        let mine = "MY USER-KEPT EDIT\n";
+        std::fs::write(td.join(&rel), mine).unwrap();
+        std::fs::write(td.join(format!("{rel}.new")), &embed).unwrap();
+        t4_manifest_set(&td, &rel, "OLD VENDOR\n");
+        t4_write_ledger(&td, &rel, serde_json::json!({
+            "kind": "user-kept", "side": format!("{rel}.new"), "reason": "merge-conflict",
+            "version": env!("CARGO_PKG_VERSION"), "ts": 0,
+        }));
+        assert_eq!(run_pack_merge(None, false, false, false, false, false, true, false, false, false, None), 0, "목록");
+        let rc = run_pack_merge(Some(rel.clone()), false, true, false, false, false, true, false, false, false, None);
+        assert_eq!(rc, 0, "user-kept --keep-mine");
+        assert_eq!(std::fs::read_to_string(td.join(&rel)).unwrap(), mine, "내 파일 그대로");
+        assert!(!td.join(format!("{rel}.new")).exists(), ".new 해소");
+        assert_eq!(t4_ledger_kind(&td, &rel), None, "원장 해소");
+        let m: std::collections::BTreeMap<String, String> = serde_json::from_str(
+            &std::fs::read_to_string(td.join(cys::pack::INSTALL_MANIFEST)).unwrap()).unwrap();
+        assert_eq!(m.get(&rel), Some(&cys::pack::content_hash_pub(&embed)), "기준선 = 이번 vendor 본(다음 스윕 kept-drift)");
+
+        // vendor-first: keep-mine 은 거부(승인 절차 밖) · take-new 는 확정만, .user 보존.
+        std::fs::write(td.join(&rel), &embed).unwrap();
+        std::fs::write(td.join(format!("{rel}.user")), mine).unwrap();
+        t4_write_ledger(&td, &rel, serde_json::json!({
+            "kind": "vendor-first", "side": format!("{rel}.user"), "parked_at": 1,
+            "version": env!("CARGO_PKG_VERSION"), "ts": 0,
+        }));
+        assert_eq!(run_pack_merge(Some(rel.clone()), false, true, false, false, false, true, false, false, false, None), 1,
+                   "vendor-first --keep-mine 거부");
+        assert_eq!(t4_ledger_kind(&td, &rel).as_deref(), Some("vendor-first"), "거부 = 무변경");
+        assert_eq!(run_pack_merge(Some(rel.clone()), false, false, false, true, false, true, false, false, false, None), 1,
+                   "vendor-first --to-local 거부");
+        assert_eq!(run_pack_merge(Some(rel.clone()), true, false, false, false, false, true, false, false, false, None), 0,
+                   "vendor-first --take-new = vendor 본 유지 확정");
+        assert_eq!(t4_ledger_kind(&td, &rel), None, "원장 해소");
+        assert_eq!(std::fs::read_to_string(td.join(format!("{rel}.user"))).unwrap(), mine, "보관본은 지우지 않는다");
+        assert_eq!(std::fs::read_to_string(td.join(&rel)).unwrap(), embed, "디스크 무변경");
+        let _ = std::fs::remove_dir_all(td.parent().unwrap());
+    }
+
+    /// ★0.15.0 M11 차: 예전 `.user` 목록·`--all` 은 사용자가 vendor 복귀를 고른 것(감사 pack-heal/take-new)과 판독 불가
+    /// 바이트 백업(CP949)을 자동 되살리기에서 뺀다 — 무조건 되살리기 금지. 판정은 되살리기 모의 하나(재구현 0).
+    #[test]
+    fn m11_pack_adopt_all_skips_excluded_and_unreadable() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (td, rel, embed, _env) = t4_system_fixture("m11adopt");
+        std::fs::write(td.join(&rel), &embed).unwrap();
+        std::fs::write(td.join(format!("{rel}.user")), "MY FIX\n").unwrap();
+        t4_manifest_set(&td, &rel, &embed);
+        t4_pristine_set(&td, &rel, &embed);
+        t4_write_ledger(&td, &rel, serde_json::json!({
+            "kind": "healed", "side": format!("{rel}.user"), "version": "0.14.56", "ts": 0,
+        }));
+        cys::pack::append_merge_audit(&td, &serde_json::json!({"file": rel, "action": "pack-heal", "flags": []})).unwrap();
+        let (line, skip) = adopt_list_line(&td, &rel);
+        assert_eq!(skip, Some("excluded"), "{line}");
+        assert_eq!(run_pack_adopt(None, true, None, false, true), 0, "--all");
+        assert_eq!(std::fs::read_to_string(td.join(&rel)).unwrap(), embed, "제외 항목은 되살리지 않는다");
+        assert_eq!(t4_ledger_kind(&td, &rel).as_deref(), Some("healed"), "원장 무변경");
+        // 판독 불가 백업은 자동 되살리기에서만 제외(목록에는 오른다 — 워커가 UTF-8 로 바꿔 수리 흐름으로).
+        std::fs::write(td.join(cys::pack::MERGE_AUDIT_FILE), b"").unwrap();
+        std::fs::write(td.join(format!("{rel}.user")), [0xC7u8, 0xD1, 0x0A]).unwrap();
+        let (line, skip) = adopt_list_line(&td, &rel);
+        assert_eq!(skip, Some("unreadable"), "{line}");
+        assert_eq!(run_pack_adopt(None, true, None, false, true), 0);
+        assert_eq!(std::fs::read(td.join(format!("{rel}.user"))).unwrap(), vec![0xC7u8, 0xD1, 0x0A], "백업 그대로");
+        // 진짜 수정(판독 가능 · 제외 아님)은 목록에서 '복권 가능'이다(vendor 미전진 = 다음 스윕 생존).
+        std::fs::write(td.join(format!("{rel}.user")), "MY FIX\n").unwrap();
+        let (line, skip) = adopt_list_line(&td, &rel);
+        assert_eq!(skip, None, "{line}");
+        let _ = std::fs::remove_dir_all(td.parent().unwrap());
+    }
+
+    /// ★0.15.0 M11 아: pack-rollback 은 이 레인의 업데이트 전 스냅샷이 있으면 그것을 원천으로 쓰고, 기록 해시로 검증한
+    /// 뒤에만 쓴다(어긋나면 거부 · --force-vendor 로만 강행 — M4 와 같은 규칙). 기록 권한을 되살린다.
+    #[test]
+    fn m11_pack_rollback_restores_from_update_snapshot_with_verification() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (td, rel, embed, _env) = t4_system_fixture("m11rb");
+        let local = td.parent().unwrap().join("local");
+        let _l = cys::pack::EnvGuard::set("CYS_LOCAL_DIR", &local);
+        let old = "PREVIOUS RELEASE BYTES\n";
+        std::fs::write(td.join(&rel), old).unwrap();
+        let mut m = std::collections::BTreeMap::new();
+        m.insert(rel.clone(), cys::pack::content_hash_pub(old));
+        let (snap, n, _) = cys::pack::create_update_snapshot(
+            &td, &local.join("update-snapshots"), "base", "0.14.56", &m, cys::pack::PackScope::Base,
+        ).unwrap();
+        assert_eq!(n, 1);
+        std::fs::write(td.join(&rel), &embed).unwrap(); // 업데이트 뒤 = vendor 본
+        assert_eq!(run_pack_rollback(Some(rel.clone()), true, false, false), 0, "스냅샷에서 복원");
+        assert_eq!(std::fs::read_to_string(td.join(&rel)).unwrap(), old);
+        // 보관본 변조 → 거부(무변경).
+        std::fs::write(td.join(&rel), &embed).unwrap();
+        std::fs::write(snap.join(cys::pack::UPDATE_SNAPSHOT_FILES).join(&rel), "TAMPERED\n").unwrap();
+        assert_eq!(run_pack_rollback(Some(rel.clone()), true, false, false), 1, "기록과 다른 보관본은 쓰지 않는다");
+        assert_eq!(std::fs::read_to_string(td.join(&rel)).unwrap(), embed, "거부 = 무변경");
         let _ = std::fs::remove_dir_all(td.parent().unwrap());
     }
 
