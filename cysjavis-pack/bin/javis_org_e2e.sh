@@ -16,12 +16,12 @@ cat > "$DOC" <<'MD'
 MD
 SHA=$(python3 -c "import hashlib;print(hashlib.sha256(open('$DOC',encoding='utf-8').read().encode()).hexdigest())")
 # catalog에 future-research 등록(good=기존key) — exploit의 shadow-ops는 미등록(fabricated)
-echo '{"version":1,"accounts":{"cysinsight":"x","owner":"y"},"departments":{"future-research":{"display":"미래연구부","account":"cysinsight"}}}' > "$CYS_DEPT_CATALOG"
+echo '{"version":1,"accounts":{"acct-a":"x","owner":"y"},"departments":{"future-research":{"display":"미래연구부","account":"acct-a"}}}' > "$CYS_DEPT_CATALOG"
 cat > "$T/m.json" <<JSON
 {"manifest_version":1,"kind":"org-manifest","reconcile_mode":"additive",
  "source":{"design_doc":"$DOC","design_doc_sha256":"$SHA"},
- "departments":[{"key":"future-research","display":"미래연구부","account":"cysinsight",
-   "cwd":"$T/Desktop/CYSjavis/미래연구부","mission_md":"# 미션","source_quote":"미래연구부는 모든 통찰의 원천 엔진으로 가동한다 충분히 길게."}],
+ "departments":[{"key":"future-research","display":"미래연구부","account":"acct-a",
+   "cwd":"$T/work/미래연구부","mission_md":"# 미션","source_quote":"미래연구부는 모든 통찰의 원천 엔진으로 가동한다 충분히 길게."}],
  "tasks":[{"dept":"future-research","to":"worker","task":"환경스캐닝","scope":"_round/",
    "source_quote":"첫 작업: 미래연구부는 종교·교회의 미래 환경 스캐닝을 수행한다 충분히 길게."}]}
 JSON
@@ -40,7 +40,7 @@ echo "== destroy workdir 부재 (rc0·skip 기대·R1 REVISE-2) =="
 # ★cys-dept 스텁: 실제 down은 격리 reg_count==0 시 라이브 ceo_demote(MASTER_DIRECTIVE.md.pre-ceo)를
 #   건드림 → 무접촉 보장 위해 스텁으로 대체(라이브 cys-dept 무호출).
 mkdir -p "$T/bin"; printf '#!/bin/bash\necho "[stub cys-dept] $*"\nexit 0\n' > "$T/bin/cys-dept"; chmod +x "$T/bin/cys-dept"
-echo '{"depts":{"e2e-dept":{"cwd":"'"$T"'/Desktop/CYSjavis/없는부서","socket":"'"$T"'/fake.sock","mission_key":"e2e-dept"}}}' > "$CYS_DEPTS_JSON"
+echo '{"depts":{"e2e-dept":{"cwd":"'"$T"'/work/없는부서","socket":"'"$T"'/fake.sock","mission_key":"e2e-dept"}}}' > "$CYS_DEPTS_JSON"
 OUT=$(PATH="$T/bin:$PATH" CYS_ROLE=cso python3 "$BIN" destroy --dept e2e-dept --purge-workdir); RC=$?
 echo "$OUT"
 if [ "$RC" != "0" ]; then echo "E2E FAIL: workdir 부재 destroy rc=$RC (영구 락인)"; exit 1; fi

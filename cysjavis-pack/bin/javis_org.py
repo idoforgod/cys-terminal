@@ -339,8 +339,9 @@ def v_quote_binding(depts, doc_text, catalog, dept_level=True):
                     errs.append(f"{tag}: 신규 key '{key}'는 오너 승인 플래그(new_dept_approved) 필요 — account 유효성만으로 통과 불가")
             # cwd 규약 경로
             cwd = d.get("cwd", "")
-            if disp and not cwd.replace("\\", "/").endswith(f"Desktop/CYSjavis/{disp}"):
-                errs.append(f"{tag}: cwd가 규약 경로($HOME/Desktop/CYSjavis/{disp}) 불일치")
+            # 규약: 부서 작업 폴더의 마지막 이름 = 부서 표시명(작업 루트는 사용자마다 다르다 — 특정 PC 의 경로를 요구하지 않는다).
+            if disp and os.path.basename(cwd.replace("\\", "/").rstrip("/")) != disp:
+                errs.append(f"{tag}: cwd 의 마지막 폴더가 부서 표시명({disp})과 다르다(규약: <작업 루트>/{disp})")
     return errs
 
 def intake_ok(surfaces, idle_max=600):
@@ -1130,8 +1131,8 @@ def self_test():
         if not cond: failures.append(f"{name}: {msg}")
     # Task별로 케이스가 여기 누적된다.
     # --- Task2: v_schema ---
-    good_dept = {"key":"future-research","display":"미래연구부","account":"cysinsight",
-                 "cwd":"$HOME/Desktop/CYSjavis/미래연구부","mission_md":"# m","source_quote":"x"}
+    good_dept = {"key":"future-research","display":"미래연구부","account":"acct-a",
+                 "cwd":"$HOME/work/미래연구부","mission_md":"# m","source_quote":"x"}
     m_ok = {"manifest_version":1,"kind":"org-manifest","reconcile_mode":"additive",
             "source":{"design_doc":"/d","design_doc_sha256":"a"},
             "departments":[good_dept],"tasks":[]}
@@ -1146,20 +1147,20 @@ def self_test():
     doc = ("미래연구부는 모든 통찰의 원천 엔진이다. "
            "저술콘텐츠부는 통찰을 칼럼과 책으로 대중에 전파한다. "
            "이 문장은 부서 정체 토큰을 포함하지 않는 충분히 긴 고유 문장이다.")
-    cat = {"accounts":{"cysinsight":"x","owner":"y"},
+    cat = {"accounts":{"acct-a":"x","owner":"y"},
            "departments":{
-             "future-research":{"display":"미래연구부","account":"cysinsight"},
+             "future-research":{"display":"미래연구부","account":"acct-a"},
              "authoring":{"display":"저술콘텐츠부","account":"owner"}}}
-    d_ok = {"key":"future-research","display":"미래연구부","account":"cysinsight",
-            "cwd":"$HOME/Desktop/CYSjavis/미래연구부",
+    d_ok = {"key":"future-research","display":"미래연구부","account":"acct-a",
+            "cwd":"$HOME/work/미래연구부",
             "source_quote":"미래연구부는 모든 통찰의 원천 엔진이다."}
     chk("f1-ok", v_quote_binding([d_ok], doc, cat) == [], f"errs={v_quote_binding([d_ok],doc,cat)}")
-    # 오귀속: 실재(미래연구부) 문장을 엉뚱한 key/account(authoring/cysinsight)에 붙임 → FAIL
-    d_mis = {**d_ok, "key":"authoring", "display":"미래연구부", "account":"cysinsight"}
+    # 오귀속: 실재(미래연구부) 문장을 엉뚱한 key/account(authoring/acct-a)에 붙임 → FAIL
+    d_mis = {**d_ok, "key":"authoring", "display":"미래연구부", "account":"acct-a"}
     chk("f1-misattr", v_quote_binding([d_mis], doc, cat) != [], "오귀속 미검출")
     # key↔account 불일치 (authoring은 owner여야)
-    d_acct = {"key":"authoring","display":"저술콘텐츠부","account":"cysinsight",
-              "cwd":"$HOME/Desktop/CYSjavis/저술콘텐츠부",
+    d_acct = {"key":"authoring","display":"저술콘텐츠부","account":"acct-a",
+              "cwd":"$HOME/work/저술콘텐츠부",
               "source_quote":"저술콘텐츠부는 통찰을 칼럼과 책으로 대중에 전파한다."}
     chk("f1-account", any("account" in e for e in v_quote_binding([d_acct], doc, cat)), "계정 오배정 미검출")
     # quote가 부서정체 토큰 미포함
@@ -1176,16 +1177,16 @@ def self_test():
     d_short = {**d_ok, "source_quote":"미래연구부"}
     chk("f1-short", any("길이" in e or "고유" in e for e in v_quote_binding([d_short], doc, cat)), "짧은 quote 미검출")
     # --- R1 BLOCK-2: 오귀속이 account 대조가 아니라 '결속/승인플래그'로 잡히는가 ---
-    empty_cat = {"accounts":{"cysinsight":"x","owner":"y"},"departments":{}}
+    empty_cat = {"accounts":{"acct-a":"x","owner":"y"},"departments":{}}
     # greenfield(empty catalog) fabricated 신규key + 실재 quote + display 위장 → 승인플래그 없으면 FAIL
-    d_mis_empty = {**d_ok, "key":"shadow-ops", "display":"미래연구부", "account":"cysinsight",
+    d_mis_empty = {**d_ok, "key":"shadow-ops", "display":"미래연구부", "account":"acct-a",
                    "source_quote":"미래연구부는 모든 통찰의 원천 엔진이다."}
     chk("f1-misattr-empty", v_quote_binding([d_mis_empty], doc, empty_cat) != [], "empty-catalog 오귀속(신규key 승인없음) 미검출")
     # 승인 플래그 있으면 greenfield 신규 정상 통과 (account 유효 + 결속 OK)
     d_new_ok = {**d_mis_empty, "key":"future-research", "new_dept_approved":True}
     chk("f1-new-approved", v_quote_binding([d_new_ok], doc, empty_cat) == [], f"승인된 신규부서 오탐: {v_quote_binding([d_new_ok],doc,empty_cat)}")
     # 오귀속이 '결속(역인덱스)'으로 잡히는가: populated catalog, 실재quote↔허위key, account유효+승인있어도 FAIL
-    d_keybind = {**d_ok, "key":"shadow-ops", "display":"미래연구부", "account":"cysinsight",
+    d_keybind = {**d_ok, "key":"shadow-ops", "display":"미래연구부", "account":"acct-a",
                  "new_dept_approved":True, "source_quote":"미래연구부는 모든 통찰의 원천 엔진이다."}
     chk("f1-keybind", any("오귀속" in e for e in v_quote_binding([d_keybind], doc, cat)), "결속(역인덱스)으로 오귀속 미검출")
     # --- Task4: v_refs / v_sha256 / validate_manifest ---
@@ -1197,11 +1198,11 @@ def self_test():
     import tempfile as _tf
     td = _tf.mkdtemp()
     cpath = os.path.join(td, "catalog.json")
-    json.dump({"version":1,"accounts":{"cysinsight":"x","owner":"y"},"departments":{}}, open(cpath,"w"))
+    json.dump({"version":1,"accounts":{"acct-a":"x","owner":"y"},"departments":{}}, open(cpath,"w"))
     catalog_upsert(cpath, {"key":"authoring","display":"저술콘텐츠부","account":"owner",
-                           "cwd":"$HOME/Desktop/CYSjavis/저술콘텐츠부"})
+                           "cwd":"$HOME/work/저술콘텐츠부"})
     catalog_upsert(cpath, {"key":"authoring","display":"저술콘텐츠부","account":"owner",
-                           "cwd":"$HOME/Desktop/CYSjavis/저술콘텐츠부"})  # 멱등
+                           "cwd":"$HOME/work/저술콘텐츠부"})  # 멱등
     c2 = json.load(open(cpath))
     chk("cat-upsert", "authoring" in c2["departments"], "upsert 미반영")
     chk("cat-idem", len(c2["departments"])==1, "멱등 위반(중복)")
@@ -1222,13 +1223,13 @@ def self_test():
         "정확 basename 일치인데 backfill 안 됨")
     # --- R3-1: 한글-display 레거시 cwd backfill 소급 성공 (라이브 규약 커버 — over-correction 해소) ---
     # 라이브 cwd 전건이 한글 display로 끝남(.../미래연구부) → 영문 key(future-research)와 영영 불일치였음
-    json.dump({"depts":{"d3":{"cwd":"$HOME/Desktop/CYSjavis/미래연구부","socket":"s3"}}}, open(dpath,"w"))
+    json.dump({"depts":{"d3":{"cwd":"$HOME/work/미래연구부","socket":"s3"}}}, open(dpath,"w"))
     backfill_mission_key(dpath, "future-research", "future-research", "미래연구부")
     r3 = json.load(open(dpath))
     chk("backfill-hangul-display", r3["depts"]["d3"].get("mission_key") == "future-research",
         "한글 display 레거시 cwd backfill 소급 실패(over-correction)")
     # 한글 display여도 부분문자열 오탐은 여전 차단(정확일치라 suffix-bleed 회귀 없음)
-    json.dump({"depts":{"d4":{"cwd":"$HOME/Desktop/CYSjavis/구미래연구부","socket":"s4"}}}, open(dpath,"w"))
+    json.dump({"depts":{"d4":{"cwd":"$HOME/work/구미래연구부","socket":"s4"}}}, open(dpath,"w"))
     backfill_mission_key(dpath, "future-research", "future-research", "미래연구부")
     r4 = json.load(open(dpath))
     chk("backfill-hangul-no-bleed", r4["depts"]["d4"].get("mission_key") != "future-research",
@@ -1236,7 +1237,7 @@ def self_test():
     # --- K2-06(2026-09-17 한글 사용자명 감사): macOS NFD 등재 cwd ↔ NFC display 정확일치 회귀 핀 ---
     _nfd = unicodedata.normalize("NFD", "미래연구부")
     assert _nfd != "미래연구부" and len(_nfd.encode()) > len("미래연구부".encode())  # 픽스처 자체가 NFD 인지(핀 무효화 방지)
-    json.dump({"depts":{"d5":{"cwd":"$HOME/Desktop/CYSjavis/"+_nfd,"socket":"s5"}}}, open(dpath,"w"))
+    json.dump({"depts":{"d5":{"cwd":"$HOME/work/"+_nfd,"socket":"s5"}}}, open(dpath,"w"))
     backfill_mission_key(dpath, "future-research", "future-research", "미래연구부")
     r5 = json.load(open(dpath))
     chk("backfill-nfd-cwd", r5["depts"]["d5"].get("mission_key") == "future-research",
@@ -1304,13 +1305,13 @@ def self_test():
     except Exception as e:
         chk("load-json-bom", False, f"BOM 카탈로그 판독 실패(K2-03 회귀): {e}")
     # --- R3-2: catalog display/cwd drift 거부 (기존 key 재할당 위장 차단) ---
-    cat_drift = {"accounts":{"cysinsight":"x"},
-                 "departments":{"future-research":{"display":"미래연구부","account":"cysinsight","cwd":"$HOME/Desktop/CYSjavis/미래연구부"}}}
-    d_drift = [{"key":"future-research","display":"위장된딴부서","account":"cysinsight","cwd":"$HOME/Desktop/CYSjavis/미래연구부"}]
+    cat_drift = {"accounts":{"acct-a":"x"},
+                 "departments":{"future-research":{"display":"미래연구부","account":"acct-a","cwd":"$HOME/work/미래연구부"}}}
+    d_drift = [{"key":"future-research","display":"위장된딴부서","account":"acct-a","cwd":"$HOME/work/미래연구부"}]
     chk("catalog-drift-display", any("display" in e for e in v_catalog_consistency(d_drift, cat_drift)), "display drift 미검출")
-    d_cwd_drift = [{"key":"future-research","display":"미래연구부","account":"cysinsight","cwd":"$HOME/Desktop/CYSjavis/딴경로"}]
+    d_cwd_drift = [{"key":"future-research","display":"미래연구부","account":"acct-a","cwd":"$HOME/work/딴경로"}]
     chk("catalog-drift-cwd", any("cwd" in e for e in v_catalog_consistency(d_cwd_drift, cat_drift)), "cwd drift 미검출")
-    d_consistent = [{"key":"future-research","display":"미래연구부","account":"cysinsight","cwd":"$HOME/Desktop/CYSjavis/미래연구부"}]
+    d_consistent = [{"key":"future-research","display":"미래연구부","account":"acct-a","cwd":"$HOME/work/미래연구부"}]
     chk("catalog-consistent", v_catalog_consistency(d_consistent, cat_drift) == [], f"정합인데 오탐: {v_catalog_consistency(d_consistent, cat_drift)}")
     chk("catalog-newkey-skip", v_catalog_consistency([{"key":"brand-new","display":"신규","cwd":"x"}], cat_drift) == [], "신규key를 drift로 오탐")
     # --- Task6: apply 분해(부수효과 없는 plan 생성) ---
