@@ -249,6 +249,21 @@ class M2DirectiveRewrite(unittest.TestCase):
         self.assertIn("cys repair attest-audit", r)
         self.assertIn(STAGING, r)
 
+    def test_reviewer_todo_path_follows_the_todo_path_naming_rule(self):
+        """설계 §6-12 (5)·(6) + TRACKS T10: 리뷰어 지침의 todo 경로 = `cys todo-path` 출력(역할 대문자·`-`→`_`·`_TODO.md`).
+        T10 의 리뷰어 게이트는 그 이름의 자기 todo 와 `round/_reviews/` 만 허용한다 — 고정 이름을 경로로 가르치면 막힌다."""
+        import javis_orchestra as orch
+        r = norm(self._t("REVIEWER_DIRECTIVE.md"))
+        self.assertIn("`cys todo-path` 가 출력하는 경로", r)
+        self.assertIn("`round/_reviews/`", r)
+        self.assertNotIn("`~/.cys/pack/round/REVIEWER_TODO.md`", r)
+        self.assertNotIn("위임 티켓이 경로를 지정하면 그 경로", r)
+        rule = lambda role: role.upper().replace("-", "_") + "_TODO.md"
+        for native, _a, sub, _b in orch.REVIEWER_SLOTS:
+            for role in (native, sub):
+                if role in ("reviewer-codex", "reviewer-gemini", "reviewer-claude-1"):
+                    self.assertIn("`%s`" % rule(role), r, role)
+
     def test_cso_reports_only_and_allowlist_sentence(self):
         """설계 §6-3 (5): CSO 허용 목록 문장에 수리 접수·조회, CSO 는 보고만."""
         c = norm(self._t("CSO_DIRECTIVE.md"))
@@ -439,6 +454,7 @@ class M2MutationControls(unittest.TestCase):
         ("WORKER_DIRECTIVE.md", "한 시간에 한 번 이상", "test_worker_submit_not_wait_and_hourly_verb_and_staging"),
         ("REVIEWER_DIRECTIVE.md", "대체 좌석 `reviewer-claude-2`", "test_reviewer_slots_match_orchestra_and_name_the_attest_verbs"),
         ("CSO_DIRECTIVE.md", "`cys repair report|list|status`", "test_cso_reports_only_and_allowlist_sentence"),
+        ("REVIEWER_DIRECTIVE.md", "`cys todo-path` 가 출력하는 경로", "test_reviewer_todo_path_follows_the_todo_path_naming_rule"),
     )
 
     def test_each_guard_sentence_removed_in_a_temp_copy_is_a_failure(self):

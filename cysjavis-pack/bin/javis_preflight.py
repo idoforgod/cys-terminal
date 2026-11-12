@@ -213,7 +213,9 @@ CONTENT_PINS = {
         ("steelman antithesis", "ACCEPT 전 최강 반론 1개 구성 의무"),
         ("대상 커밋 해시", "리비전 바인딩 — 대상이 바뀌면 검증이 무효(계약 §6-6·§6-7)"),
         ("잠근 합격 기준의 미달 항목 0", "라운드 종료 기준 — 구 리터럴 대체"),
-        ("REVIEWER_TODO.md", "리뷰어 todo 영속(리뷰어 헌장 제8조)"),
+        # ★0.15.0 M2(T10 리뷰어 게이트와 같은 이름): 리뷰어 todo 는 `cys todo-path` 이름 규칙(역할 대문자·`-`→`_`·
+        #   `_TODO.md`)이다 — 고정 이름 핀을 그 규칙의 예시로 바꿨다(옛 문안·새 문안 양쪽에 실존 → 기존 설치 C03 무소음).
+        ("REVIEWER_GEMINI_TODO.md", "리뷰어 todo 영속 — `cys todo-path` 이름 규칙(리뷰어 헌장 제8조)"),
     ],
     # ── CEO_TEMPLATE.md — 라이브 CEO 템플릿 파일 자체의 내용 핀(스펙 v4 §D2 · cid 는
     #    :파일명 첫 토큰 규칙으로 C03.pin.ceo 자연 파생). 승격 '표지' 술어(MARKER_PINS)와
