@@ -70,8 +70,9 @@ pub(crate) enum RepairCmd {
         /// 생명줄·보호장치가 아닌 훅의 등록 해제(일반 수리에서만 — RULINGS V1)
         #[arg(long = "unregister-hook", value_name = "EVENT:SCRIPT")]
         unregister_hook: Vec<String>,
+        /// 수리의 계기 — 필수(기본값 없음 · RULINGS AD10)
         #[arg(long, value_enum)]
-        trigger: Option<TriggerArg>,
+        trigger: TriggerArg,
         /// 규칙 문서 수리의 주인 지시 표
         #[arg(long)]
         owner_token: Option<String>,
@@ -530,13 +531,11 @@ fn t3_request(cmd: &RepairCmd) -> Option<(&'static str, Value, bool)> {
             json,
         } => {
             let mut p = json!({"files": files, "unregister_hook": unregister_hook});
-            if let Some(t) = trigger {
-                p["trigger"] = json!(match t {
-                    TriggerArg::OwnerOrder => "owner_order",
-                    TriggerArg::Grant => "grant",
-                    TriggerArg::Update => "update",
-                });
-            }
+            p["trigger"] = json!(match trigger {
+                TriggerArg::OwnerOrder => "owner_order",
+                TriggerArg::Grant => "grant",
+                TriggerArg::Update => "update",
+            });
             if let Some(o) = owner_token {
                 p["owner_token"] = json!(o);
             }
@@ -811,7 +810,7 @@ mod tests {
         let calls: &[&[&str]] = &[
             &["report", "--file", "bin/a.py", "--error", "boom"],
             &["report", "--file", "bin/a.py", "--error", "boom", "--json"],
-            &["begin", "--files", "bin/a.py"],
+            &["begin", "--files", "bin/a.py", "--trigger", "owner-order"],
             &[
                 "begin",
                 "--files",
@@ -937,7 +936,15 @@ mod tests {
         assert_eq!(covered, all, "not every verb was exercised");
 
         // RULINGS Z2(e): `--files` may be left out only when `--unregister-hook` is given.
-        assert!(parse(&["begin", "--unregister-hook", "Stop:x.sh"]).is_ok());
+        assert!(parse(&[
+            "begin",
+            "--unregister-hook",
+            "Stop:x.sh",
+            "--trigger",
+            "owner-order"
+        ])
+        .is_ok());
+        // RULINGS AD10: `--trigger` is required (no default — fail closed).
         for bad in [
             &["submit", "R-1", "--staging", "/tmp/x"][..], // U3: no --staging
             &["reapply", "R-1", "--staging", "/tmp/x"],
@@ -945,6 +952,9 @@ mod tests {
             &["begin", "--json"],
             &["begin", "--trigger", "grant"],
             &["begin", "--files", "a", "--trigger", "owner_order"],
+            &["begin", "--files", "a"],
+            &["begin", "--unregister-hook", "Stop:x.sh"],
+            &["begin", "--files", "a", "--joins", "R-1"],
             &["boot-critical"],
             &["boot-critical", "--json"],
             &["boot-critical", "--path", "a", "--list"],
@@ -1050,6 +1060,8 @@ mod tests {
             "begin",
             "--files",
             "bin/a.py",
+            "--trigger",
+            "update",
             "--resolves",
             "R-2",
             "--json",
@@ -1064,6 +1076,7 @@ mod tests {
         assert_eq!(m, "repair.begin");
         assert_eq!(p["files"], json!(["bin/a.py"]));
         assert_eq!(p["resolves"], "R-2");
+        assert_eq!(p["trigger"], "update", "the trigger always travels (AD10)");
         assert!(
             p.get("seat").is_none() && p.get("role").is_none(),
             "the CLI never names a seat or role (M1)"
@@ -1074,7 +1087,7 @@ mod tests {
                 json!({"repair": "R-4", "state_label": "진행 중", "attempt": 1, "max_rounds": 10, "classification": "boot_critical", "begin": "new", "staging": "/x/repairs/R-4/staging"}),
             )
         };
-        let cmd = parse(&["begin", "--files", "hooks/a.sh"]).unwrap();
+        let cmd = parse(&["begin", "--files", "hooks/a.sh", "--trigger", "owner-order"]).unwrap();
         let mut out = Vec::new();
         assert_eq!(run_with(&cmd, &mut out, &mut Vec::new(), &rpc2), 0);
         assert!(String::from_utf8(out)
