@@ -2,9 +2,10 @@
 (0.15.0 「스스로 해결」 T2c · M11 카 · CONTRACTS O-C8-5 (ii) · testplan H-11ka-N1-01, H-11ka-N2-01, G-1-26).
 
 A gate that is only ever seen passing cannot be told apart from one that always passes, so every finding is planted
-here on a temp copy of the four real input files and must turn the gate red (exit 1) naming its site, while the
+here on a temp copy of the five real input files (the three sites, security-floor.txt, Cargo.toml) and must turn the gate red (exit 1) naming its site, while the
 unmodified copy and the real tree stay green (exit 0). Raising all three sites together (the release commit) stays
-green. A missing input is exit 2, never a pass. Two guard rails of design §6-11 카 are covered: the min_binary
+green, and a 0.15.0+ program version with a floor below 0.15.0 is red (RULINGS AE3). A missing input is exit 2, never a
+pass. Two guard rails of design §6-11 카 are covered: the min_binary
 verifier step of pack-release.yml (N1, mutations: removed / `if:` / `continue-on-error` / no longer runs the dry run)
 and security-floor.txt (N2: pinned byte for byte to its v0.14.56 content, and the floor never below it).
 
@@ -30,7 +31,8 @@ RELEASE_YML = ".github/workflows/release.yml"
 PACK_YML = ".github/workflows/pack-release.yml"
 RELEASE_MD = "docs/RELEASE.md"
 FLOOR_TXT = "security-floor.txt"
-INPUTS = (RELEASE_YML, PACK_YML, RELEASE_MD, FLOOR_TXT)
+CARGO_TOML = "Cargo.toml"
+INPUTS = (RELEASE_YML, PACK_YML, RELEASE_MD, FLOOR_TXT, CARGO_TOML)
 # security-floor.txt at v0.14.56 (git blob 36d365788464a5db20c672d3a16a30fba7b8fa28). Design §6-11 카: release 1 does
 # not touch the security floor file. Changing it deliberately later means changing this pin in the same commit.
 SECURITY_FLOOR_SHA256_V0_14_56 = "2ae797a7907ddd8434699f3bb8b62ef8689f5f1ded9c1127d464fd3416feb42f"
@@ -58,6 +60,19 @@ def set_md_value(text, value):
         out.append(line)
     assert n == 1, "fixture: expected one '현행 X.Y.Z' literal, found %d" % n
     return "\n".join(out)
+
+
+def set_cargo_version(text, value):
+    """The [package] version of Cargo.toml (the first `version = "…"` line at column 0)."""
+    new, n = re.subn(r'(?m)^version = "\d+\.\d+\.\d+"', 'version = "%s"' % value, text, count=1)
+    assert n == 1, "fixture: no [package] version line"
+    return new
+
+
+def raise_floor(case, value):
+    case.edit(RELEASE_YML, lambda t: set_yaml_value(t, "PACK_MIN_BINARY", value))
+    case.edit(PACK_YML, lambda t: set_yaml_value(t, "PACK_MIN_BINARY_OVERRIDE", value))
+    case.edit(RELEASE_MD, lambda t: set_md_value(t, value))
 
 
 class FloorGate(unittest.TestCase):
@@ -197,6 +212,37 @@ class FloorGate(unittest.TestCase):
             got = hashlib.sha256(f.read()).hexdigest()
         self.assertEqual(got, SECURITY_FLOOR_SHA256_V0_14_56,
                          "security-floor.txt changed — design §6-11 카: release 1 does not touch the security floor file")
+
+    # -- AE3: a 0.15.0+ program version needs a 0.15.0+ floor (RULINGS AE3) --
+    def test_ae3_program_version_raised_without_the_floor_is_red(self):
+        # the release commit that bumps the version but forgets the three floor sites
+        self.edit(CARGO_TOML, lambda t: set_cargo_version(t, "0.15.0"))
+        self.red("AE3", "Cargo.toml version is 0.15.0", "below 0.15.0")
+
+    def test_ae3_release_commit_with_version_and_floor_raised_passes(self):
+        self.edit(CARGO_TOML, lambda t: set_cargo_version(t, "0.15.0"))
+        raise_floor(self, "0.15.0")
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+
+    def test_ae3_a_later_program_with_the_0_15_0_floor_passes(self):
+        self.edit(CARGO_TOML, lambda t: set_cargo_version(t, "0.15.3"))
+        raise_floor(self, "0.15.0")
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 0, out)
+
+    def test_ae3_floor_raised_in_two_sites_only_names_the_low_one(self):
+        self.edit(CARGO_TOML, lambda t: set_cargo_version(t, "0.15.0"))
+        self.edit(RELEASE_YML, lambda t: set_yaml_value(t, "PACK_MIN_BINARY", "0.15.0"))
+        self.edit(RELEASE_MD, lambda t: set_md_value(t, "0.15.0"))
+        out = self.red("AE3", "the three min_binary sites differ")
+        self.assertIn("PACK_MIN_BINARY_OVERRIDE = ", out.split("AE3", 1)[1])
+
+    def test_ae3_missing_program_version_is_exit_2(self):
+        self.edit(CARGO_TOML, lambda t: re.sub(r'(?m)^version = "[^"]*"\n', "", t, count=1))
+        rc, out = self.run_gate()
+        self.assertEqual(rc, 2, out)
+        self.assertIn("Cargo.toml", out)
 
     # -- cannot judge --
     def test_missing_input_is_exit_2_not_a_pass(self):

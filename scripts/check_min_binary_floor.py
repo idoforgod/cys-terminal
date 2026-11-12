@@ -16,9 +16,14 @@ It also lints what the design says must stay untouched (§6-11 카 "하한 검�
       `--min-binary-version "$PACK_MIN_BINARY"`.
   N2  the floor is not below security-floor.txt (docs/RELEASE.md 불변 규칙: "--min-binary-version 0.12.48 이상 필수").
       The file itself is pinned byte for byte by scripts/tests/test_check_min_binary_floor.py.
+  AE3 (RULINGS AE3) once the program version (Cargo.toml [package] version) is 0.15.0 or later, the floor must be
+      0.15.0 or later too: the 0.15.0 pack may only install under a program that has `cys repair` (design §4-11 카).
+      Green at today's values (0.14.56 / 0.14.52); red at a release commit that bumps the version but forgets
+      the three floor sites.
 
 The VALUE is not chosen here: the release commit raises all three sites together; the gate is green at any equal
-value (0.14.52 today, 0.15.0 in the release commit). Text only — no network, no git, no YAML library (stdlib only).
+value that satisfies AE3 (0.14.52 today, 0.15.0 in the release commit). Text only — no network, no git, no YAML
+library (stdlib only).
 
     python3 scripts/check_min_binary_floor.py [--root DIR]
 Exit: 0 = consistent · 1 = inconsistent (every finding named, as ::error:: lines) · 2 = cannot judge (file missing)
@@ -33,6 +38,8 @@ RELEASE_YML = ".github/workflows/release.yml"
 PACK_YML = ".github/workflows/pack-release.yml"
 RELEASE_MD = "docs/RELEASE.md"
 FLOOR_TXT = "security-floor.txt"
+CARGO_TOML = "Cargo.toml"
+SELF_REPAIR_RELEASE = (0, 15, 0)   # RULINGS AE3: from this program version on, the floor is at least this
 VERIFIER_STEP = "Verify with min_binary verifier (해법②)"
 COMPUTE_STEP = "Compute min_binary (policy)"
 EXIT_OK, EXIT_BAD, EXIT_UNJUDGEABLE = 0, 1, 2
@@ -113,10 +120,26 @@ def vtuple(v):
     return tuple(int(x) for x in v.split("."))
 
 
+def cargo_package_version(text):
+    """`version = "X.Y.Z"` of the [package] table of Cargo.toml (the product-version SOT, version-check.sh)."""
+    section = None
+    for line in text.split("\n"):
+        s = line.strip()
+        if s.startswith("["):
+            section = s
+            continue
+        if section == "[package]":
+            m = re.match(r'version\s*=\s*"(' + VER + r')"\s*(?:#.*)?$', s)
+            if m:
+                return m.group(1)
+    raise Unjudgeable("%s: no [package] version = \"X.Y.Z\"" % CARGO_TOML)
+
+
 def check(root):
     """→ (sites {label: value}, problems [str]). Raises Unjudgeable when an input cannot be read."""
     rel_yml, pack_yml = read(root, RELEASE_YML), read(root, PACK_YML)
     md, floor_txt = read(root, RELEASE_MD), read(root, FLOOR_TXT)
+    program = cargo_package_version(read(root, CARGO_TOML))
     sites, problems = {}, []
 
     for path, text, key in ((RELEASE_YML, rel_yml, "PACK_MIN_BINARY"),
@@ -184,6 +207,15 @@ def check(root):
     elif len(distinct) == 1 and vtuple(distinct[0]) < vtuple(floor):
         problems.append("N2: min_binary %s is below the security floor %s (%s; docs/RELEASE.md 불변 규칙)"
                         % (distinct[0], floor, FLOOR_TXT))
+
+    # AE3 — a 0.15.0+ program version with a floor below 0.15.0 = the release commit forgot the bump
+    if vtuple(program) >= SELF_REPAIR_RELEASE:
+        low = ["%s = %s" % kv for kv in sites.items() if vtuple(kv[1]) < SELF_REPAIR_RELEASE]
+        if low:
+            problems.append("AE3: %s version is %s but the min_binary floor is below %d.%d.%d (%s) — the 0.15.0 pack "
+                            "must require a program that has `cys repair`; raise all three sites in the release "
+                            "commit (design §4-11 카, RULINGS AE3)"
+                            % ((CARGO_TOML, program) + SELF_REPAIR_RELEASE + ("; ".join(low),)))
     return sites, problems
 
 

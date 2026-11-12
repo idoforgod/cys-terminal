@@ -11700,6 +11700,39 @@ mod tests {
         assert!(!journal_exists, "journal left behind after rollback");
     }
 
+    /// RULINGS AE2: a recorded mode WITHOUT an exec bit is restored as it was, even on a `#!` file — the
+    /// recorded mode wins over the shebang rule. The partial apply leaves the file at 0755 (as the
+    /// installer's exec loop would), so a restore that adds an exec bit, or keeps the current exec mode,
+    /// fails here.
+    #[cfg(unix)]
+    #[test]
+    fn journal_rollback_keeps_a_recorded_non_exec_mode_on_a_shebang_file() {
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        let (base, pd, _env) = txn_prestate(
+            "m15-noexec",
+            &[("bin/plain.sh", "#!/bin/sh\necho old\n")],
+            "1.0.0",
+        );
+        m15_set_mode(&pd.join("bin/plain.sh"), 0o644);
+        let set: std::collections::BTreeSet<String> =
+            ["bin/plain.sh"].iter().map(|s| (*s).to_string()).collect();
+        write_journal("2.0.0", &set).expect("write_journal");
+        write_atomic(&pd.join("bin/plain.sh"), b"#!/bin/sh\necho partial\n").unwrap();
+        m15_set_mode(&pd.join("bin/plain.sh"), 0o755);
+        let rolled = rollback_journal();
+        let bytes = std::fs::read_to_string(pd.join("bin/plain.sh")).unwrap();
+        let mode = current_mode(&pd.join("bin/plain.sh"));
+        let _ = std::fs::remove_dir_all(&base);
+
+        rolled.expect("rollback_journal");
+        assert_eq!(bytes, "#!/bin/sh\necho old\n");
+        assert_eq!(
+            mode,
+            Some(0o644),
+            "a #! file recorded at 0644 must come back 0644 (the recorded mode wins)"
+        );
+    }
+
     /// I-F3-09 arm 2 (in-process form of the boot-time path): an orphan journal written by
     /// `write_journal` is rolled back by `recover_pack_journal` (`.pack-version` != target) and
     /// `bin/cys-dept` keeps its exec bit — the `[ -x "$pk/bin/cys-dept" ] || exit 0` guards of the

@@ -148,8 +148,10 @@ class Generator(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertEqual(rows_of(self.repo.table()).get("bin/same.py"), [sha("S")])
 
-    def test_check_stays_fresh_when_the_release_tag_is_pushed_on_head_then_stale_after_the_next_commit(self):
-        self.repo.commit({"bin/a.py": "A1"}, tag="v0.14.0")
+    def test_check_stays_fresh_across_a_new_release_tag_until_a_row_changes(self):
+        # RULINGS AE1: a new release tag alone changes only the header (tag count / range) — no branch push may
+        # turn red for that; the next edit of a file that the new release shipped adds a row and IS stale.
+        self.repo.commit({"bin/a.py": "A1", "bin/b.py": "B1"}, tag="v0.14.0")
         head = self.repo.commit({"bin/a.py": "A2"})
         self.assertEqual(self.repo.gen()[0], 0)
         self.repo.git("tag", "v0.15.0", head)          # the release tag on the checked commit
@@ -157,10 +159,38 @@ class Generator(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.repo.commit({"docs/notes.md": "next"})     # next commit: v0.15.0 is now a previous release
         rc, out = self.repo.gen("--check")
+        self.assertEqual(rc, 0, "header-only change after a new tag must stay FRESH (AE1): " + out)
+        self.repo.commit({"bin/a.py": "A3"})            # v0.15.0's bytes of a.py now differ from HEAD
+        rc, out = self.repo.gen("--check")
         self.assertEqual(rc, 1, out)
         self.assertIn("STALE", out)
+        self.assertIn(sha("A2"), out, "the diff hint names the missing v0.15.0 hash")
 
-    def test_check_ignores_only_the_provenance_line(self):
+    def test_check_ignores_header_counts_and_range_but_not_the_window_floor(self):
+        self.history()
+        self.assertEqual(self.repo.gen()[0], 0)
+        p = os.path.join(self.repo.root, OUT_REL)
+        text = self.repo.table()
+
+        def check_with(t):
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(t)
+            return self.repo.gen("--check")
+
+        header_only = re.sub(r"(?m)^(// WINDOW\s+:\s+)\d+( resolvable release tags \(v\*/pack-v\* >= \S+?,[^)]*\)), \S+ \.\. \S+$",
+                             r"\g<1>99\2, v0.14.0 .. v9.9.9", text)
+        header_only = re.sub(r"(?m)^// (PACK_ALL paths|with a row|unchanged|absent)(\s+): \d+", r"// \1\2: 7", header_only)
+        header_only = re.sub(r"(?m)^// generated from : \S+$", "// generated from : 0000", header_only)
+        self.assertNotEqual(header_only, text, "fixture: the header edit changed nothing")
+        rc, out = check_with(header_only)
+        self.assertEqual(rc, 0, "count / range / provenance lines are informational (AE1): " + out)
+        rc, out = check_with(text.replace(">= 0.14.0", ">= 0.13.0", 1))
+        self.assertEqual(rc, 1, out)
+        self.assertIn("window floor", out)
+        rc, out = check_with(re.sub(r"(?m)^// WINDOW.*\n", "", text))
+        self.assertEqual(rc, 1, "a table without its WINDOW line has no stated floor: " + out)
+
+    def test_check_ignores_the_provenance_line_and_catches_a_changed_hash(self):
         self.history()
         self.assertEqual(self.repo.gen()[0], 0)
         p = os.path.join(self.repo.root, OUT_REL)

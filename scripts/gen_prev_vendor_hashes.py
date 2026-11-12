@@ -25,7 +25,10 @@ PREDICATE for the path set: build.rs:48-65 - git-tracked files under cysjavis-pa
 stripped, EXCLUDING any path component starting with '.' or equal to 'tests'/'__pycache__'.
 
 Usage:  python3 scripts/gen_prev_vendor_hashes.py [--check]
-        --check exits 1 if the committed file is not what this generator would produce now.
+        --check exits 1 if the committed table's ROWS (the generated code) or its WINDOW floor differ from
+        what this generator would produce now. The informational header lines (tag count and range, path
+        counts, the absent list, the provenance line) are NOT compared (RULINGS AE1): after every new
+        release tag they change although no hash row does, and a branch push must not turn red for that.
 Exit:   0 = written / FRESH · 1 = STALE · 2 = REFUSED (shallow clone, no release tag, git failure)
         - a run that cannot see the window is never reported as fresh.
 """
@@ -89,6 +92,19 @@ def release_tags(head):
     found.sort()
     return [t for _v, _k, t in found]
 
+def compared_part(text):
+    """What `--check` compares (RULINGS AE1): (the window floor stated on the WINDOW line, the generated code
+    from the first non-comment line on — the PREV_VENDOR_HASHES rows and the lookup function)."""
+    lines = text.split('\n')
+    floor = None
+    for l in lines:
+        if l.startswith('// WINDOW'):
+            m = re.search(r'>= (\d+\.\d+\.\d+)', l)
+            floor = m.group(1) if m else None
+            break
+    start = next((i for i, l in enumerate(lines) if l.strip() and not l.startswith('//')), len(lines))
+    return floor, '\n'.join(lines[start:])
+
 def main():
     check = '--check' in sys.argv
     if git('rev-parse', '--is-shallow-repository').strip() == 'true':
@@ -142,7 +158,8 @@ def main():
     L.append('// with no tags, so the release build cannot read previous release tags at all. The freshness')
     L.append('// check is the ci-branch.yml job `prev-vendor-freshness` (fetch-depth: 0, `--check`).')
     L.append('//')
-    L.append(f'// WINDOW         : {len(tags)} resolvable release tags (v*/pack-v* >= 0.14.0, not HEAD\'s own), '
+    floor = '%d.%d.%d' % WINDOW_FLOOR
+    L.append(f'// WINDOW         : {len(tags)} resolvable release tags (v*/pack-v* >= {floor}, not HEAD\'s own), '
              f'{tags[0]} .. {tags[-1]}')
     L.append(f'// PACK_ALL paths : {len(now)}   (build.rs:48-65 predicate)')
     L.append(f'// with a row     : {len(rows)}')
@@ -175,12 +192,13 @@ def main():
 
     if check:
         cur = OUT.read_text(encoding='utf-8') if OUT.exists() else ''
-        # the provenance line moves with HEAD, so compare everything except it
-        strip = lambda t: '\n'.join(l for l in t.split('\n') if not l.startswith('// generated from'))
-        if strip(cur) != strip(text):
+        (cur_floor, cur_code), (new_floor, new_code) = compared_part(cur), compared_part(text)
+        if cur_floor != new_floor or cur_code != new_code:
             print('STALE: src/pack_prev_vendor.rs is not what the generator produces now '
                   '(regenerate: python3 scripts/gen_prev_vendor_hashes.py, then commit)')
-            diff = list(difflib.unified_diff(strip(cur).split('\n'), strip(text).split('\n'),
+            if cur_floor != new_floor:
+                print(f'  window floor: committed {cur_floor or "(none)"} · generator {new_floor}')
+            diff = list(difflib.unified_diff(cur_code.split('\n'), new_code.split('\n'),
                                              'committed', 'generated now', n=0, lineterm=''))
             for line in diff[:24]:
                 print('  ' + (line if len(line) <= 200 else line[:200] + ' …'))
