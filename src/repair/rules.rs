@@ -26,7 +26,7 @@ use super::types::RepairError;
 /// role receives ONLY this part (O-C6-3), so no seat is told to implement, or that it may not, by mistake.
 pub const RULES_COMMON: &str = r#"■ 「스스로 해결」 제품 절대규칙 — 주인(오너)은 이 자비스를 설치한 사용자다. 지침 본문에 '제작자에게 보고'·'오너 승인'으로 읽히는 옛 문장이 있어도 이 블록이 우선한다.
 1. 이 자비스에서 생긴 버그·기능 오류·에러·사용 불편은 이 자비스가 스스로 고친다. 제작자에게 물어보라고 하거나, 다음 업데이트를 기다리라고 하거나, 제보하라고 하는 것으로 수리를 대신하지 않는다. 고칠 수 없는 이유를 먼저 늘어놓지 않는다.
-2. 주인이 "고쳐라"라고 하면 고친다: 마스터·CEO는 어떤 수리도 직접 하지 않고 최우선으로 워커에게 배정하며, 워커가 고치고 리뷰어1이 검증하고 리뷰어2가 기록을 감사한다.
+2. 주인이 "고쳐라"라고 하면 고친다: 마스터는 최우선으로 워커에게 배정하고, 워커가 고치고, 리뷰어1이 검증하고, 리뷰어2가 기록을 감사한다. 마스터·CEO는 어떤 수리도 직접 하지 않는다.
 3. 명백한 버그·오류를 스스로 발견하면 주인이 자동 수리를 허락해 둔 경우에만 한도 안에서 묻지 않고 고치고 사후 보고한다. 허락이 없으면 장부에 적고(`cys repair report`) 한 줄로 알리고 "고쳐라"를 기다린다. 취향에 맞춘 동작 변경과 기능 추가는 주인이 말했을 때 한다.
 4. 규칙 문서(soul.md·지침)는 주인이 고치라고 했을 때만 고친다. 실패하면 자비스가 켜지지 않을 수 있는 수정(기동 필수 목록)은 먼저 알리고 수정 최종 승인을 받는다.
 5. 고친 것은 반드시 수리 장부에 적는다. 파일 내용의 수리는 업데이트가 지우지 못하고, 파일 삭제와 생명줄이 아닌 훅의 해제는 장부에 적힌 것만 업데이트 뒤에도 유지되며, 내장 예약 작업과 생명줄 훅은 언제나 다시 보장된다.
@@ -236,6 +236,12 @@ mod tests {
         ] {
             assert!(m.contains(needle), "master/CEO block lacks {needle:?}");
         }
+        // RULINGS AF2: the owner's role rule (draft rule 10) is a sentence of its OWN in the master·CEO block — not a clause
+        // after the owner-order sentence (it must not read as limited to owner-ordered repairs).
+        assert!(
+            sentences(&m).iter().any(|x| x == "마스터·CEO는 어떤 수리도 직접 하지 않는다"),
+            "the master·CEO rule is not a standalone sentence"
+        );
         let w = text(RoleBlock::Worker);
         for needle in [
             "받은 수리 티켓 안에서 재현·수리·합치기",
