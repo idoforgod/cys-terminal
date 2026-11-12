@@ -716,7 +716,7 @@ def setup_rules(tmp, mode="ok"):
 tmp = tempfile.mkdtemp(prefix="hook-t23a-")
 env = setup_rules(tmp, "ok")
 _outs = {}
-for _role in ("master", "worker", "cso-1", "reviewer-codex"):
+for _role in _ROLE_CONST:  # every role key, incl. the longest fallback name reviewer-claude-1 (RULINGS AF3)
     code, out, _ = run_hook(env, role=_role)
     _outs[_role] = out
     _ig = out.find("Read 도구로 끝까지")
