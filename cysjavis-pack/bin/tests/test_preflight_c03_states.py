@@ -143,7 +143,11 @@ class StandardMachine(Base):
         r = self.row(self.run_c03(), "C03.pin.worker")
         self.assertEqual(r["status"], FAIL)
         self.assertIn("무수정 배포본", r["detail"])
-        self.assertIn("사용자 과실 아님", r["detail"])
+        # ★0.15.0 M2(설계 v0.5 §2-1·§4-2): 원인 분류는 남에게 수리를 넘기는 문구를 쓰지 않는다(종전 문안이
+        #   "벤더 동기 필요·사용자 과실 아님" — 설계가 책임 전가 원인으로 지목한 1530행). 뜻(사용자 탓이 아님)은 유지.
+        self.assertIn("사용자 편집이 원인이 아니다", r["detail"])
+        for old_phrase in ("벤더 동기", "과실 아님"):
+            self.assertNotIn(old_phrase, r["detail"])
         self.assertIn("cys pack-merge --file directives/WORKER_DIRECTIVE.md --take-new",
                       r["detail"])
         self.assertNotIn("★복원 절차", r["detail"])            # 오진 처방 차단
@@ -453,6 +457,76 @@ class BootContractDelivery(Base):
         self.wf("CEO_TEMPLATE.md", tmpl_body())
         r = self.row(self.run_c03(skips=["C03.boot-contract"]), "C03.boot-contract")
         self.assertEqual(r["status"], SKIP)
+
+
+class SoulC04(Base):
+    """C04.soul — ★0.15.0 M2(설계 v0.5 §4-2 · 부록 A 1절 35번 · 시험 계획 H-02-A1-35-01).
+    이 파일에 둔 이유: 픽스처 팩 하네스($HOME/.cys/pack)를 이미 갖췄고 CI 세 단계에 등록돼 있다.
+    지키는 것: 점검 도구는 soul.md 를 **쓰지 않는다** — 오너가 지운 자율 조항을 되살리지 않고(35번), 호칭 줄을
+    되써넣지 않는다(벤더 개인 호칭이 모든 사용자 설치에 되살아나는 경로 · 규칙 문서를 주인 지시 없이 쓰는 경로)."""
+
+    OWNER_EDITED = ("# soul.md — 운영 헌장\n\n## 정체\n\n- 오너의 이름: 김사용\n"
+                    "- master의 역할: 단일 지휘 노드\n\n## 금지선 (denylist — 오너 승인 없이 절대 금지)\n\n"
+                    "- 외부 발행\n")   # 오너가 호칭 줄과 자율주행 절을 둘 다 지웠다
+
+    def soul(self):
+        return os.path.join(self.pack, "soul.md")
+
+    def write_soul(self, text):
+        with open(self.soul(), "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+
+    def run_c04(self, fix):
+        p = pf.Preflight(fix=fix, skips=[])
+        p.c04_soul()
+        return p.results
+
+    def test_fix_twice_leaves_owner_edited_soul_byte_identical(self):
+        """H-02-A1-35-01: --fix 두 번 → 오너가 지운 자율 조항도, 호칭 줄도 다시 생기지 않는다(바이트 동일)."""
+        self.write_soul(self.OWNER_EDITED)
+        before = open(self.soul(), "rb").read()
+        for _ in range(2):
+            r = self.row(self.run_c04(fix=True), "C04.soul")
+            self.assertIn(r["status"], (PASS, WARN), r)
+            self.assertNotEqual(r["status"], pf.FIXED, r)
+        after = open(self.soul(), "rb").read()
+        self.assertEqual(before, after, "점검 도구가 soul.md 를 썼다(되써넣기 회귀)")
+        self.assertNotIn(pf.SOUL_AUTOPILOT_MARKER.encode("utf-8"), after)
+        self.assertNotIn("주인님".encode("utf-8"), after)
+
+    def test_missing_honorific_is_not_a_failure(self):
+        """호칭 줄 부재는 FAIL 이 아니다(종전: FAIL + --fix 로 특정 호칭 보강) — 관측 문구만 남긴다."""
+        self.write_soul(self.OWNER_EDITED)
+        r = self.row(self.run_c04(fix=False), "C04.soul")
+        self.assertNotEqual(r["status"], FAIL, r)
+        self.assertIn("오너 호칭", r["detail"])
+        self.assertNotIn("주인님", r["detail"])
+
+    def test_shipped_template_owner_identity_first_and_neutral(self):
+        """배포 틀 「정체」의 첫 줄 = 오너는 설치한 사용자·제작자는 주인이 아님·승인은 대화 중인 사용자에게(설계 §4-2).
+        호칭 표지는 있되 특정 호칭은 없다. 그 틀로는 C04 가 PASS/WARN 이고 바이트를 바꾸지 않는다."""
+        tpl = os.path.join(BIN, os.pardir, "soul.md")
+        with open(tpl, encoding="utf-8") as f:
+            text = f.read()
+        ident = text[text.index("## 정체"):]
+        first = ident.split("\n- ", 1)[1]
+        self.assertTrue(first.startswith("**이 자비스의 주인(이하 \"오너\")은 이것을 설치해 쓰고 있는 사용자다."), first[:80])
+        self.assertIn("제작자는 주인이 아니다.", first)
+        self.assertIn(pf.SOUL_MARKER, text)
+        self.assertNotIn("주인님", text)
+        self.assertNotIn(b"\r", open(tpl, "rb").read())
+        self.write_soul(text)
+        before = open(self.soul(), "rb").read()
+        r = self.row(self.run_c04(fix=True), "C04.soul")
+        self.assertIn(r["status"], (PASS, WARN), r)
+        self.assertEqual(open(self.soul(), "rb").read(), before)
+
+    def test_c04_source_has_no_soul_write(self):
+        """구조 핀: c04_soul 본문에 파일 쓰기가 없다(되써넣기 분기를 되살리면 적색 — 위 바이트 시험과 이중)."""
+        import inspect
+        src = inspect.getsource(pf.Preflight.c04_soul)
+        for bad in ('open(p, "w"', "open(p,'w'", ".write(", "SOUL_APPEND", "주인님"):
+            self.assertNotIn(bad, src, "c04_soul 에 %r 가 돌아왔다" % bad)
 
 
 if __name__ == "__main__":
