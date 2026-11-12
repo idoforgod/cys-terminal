@@ -9260,6 +9260,8 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
                     }
                 }
                 roles.insert(final_role.clone(), sid);
+                // 「스스로 해결」(0.15.0 RULINGS AD1 · T3): 좌석이 처음 선 역할 가족을 기억한다(수리 명령만 본다 · 메모리만).
+                crate::repair::note_role_claim(daemon, sid, srole.as_deref(), &final_role);
                 *srole = Some(final_role.clone());
                 // T4-4/T6-P3: 역할 전이와 동기로 능력 집합 재도출(reviewer-*=read/search,
                 // full=worker/master/cso, 그 외 deny-by-default). cysd-매개 변형 게이트의 키 갱신.

@@ -124,6 +124,16 @@ pub struct RepairRecord {
     pub resolves: Option<RepairId>,
     /// (rel, canon) — RULINGS R5, U2; written only by `commit` / the approved apply.
     pub committed: Vec<(String, String)>,
+    /// Every seat that recorded in ANY round of this repair (RULINGS AD1): none of them may verify
+    /// it (B2's "never the fixer" over all rounds). Appended at each `record`.
+    #[serde(default)]
+    pub fixer_seats: Vec<u64>,
+    /// What was checked at commit, per target (RULINGS AD4): `(rel, how)` with `how` = the check
+    /// kind that ran (`sh-syntax` …), `absent-state` for a committed deletion (the path is absent),
+    /// `hook-registrar` for a hook line (the registrar's report inside `hook_lines_step`). A check
+    /// that did not run is never listed.
+    #[serde(default)]
+    pub checks: Vec<(String, String)>,
 }
 
 /// The probation bundle of one lane (C1 1.6, K4, N3).
@@ -666,6 +676,108 @@ pub fn allocate_id_in(root: &Path) -> Result<RepairId, RepairError> {
     ))
 }
 
+/// RULINGS AD9 (S1) / G1 "LOCK FIRST" — creates a repair's record ALREADY LOCKED and returns its
+/// id: the id is allocated by `create_dir`, `make(&id)` builds the record (it may copy pre-images),
+/// the record must carry a lock, and it is written before anything else can see the id. If `make`
+/// fails, the (still empty) id directory is removed with `remove_dir` (never a ledger file). The
+/// caller holds the owning daemon's per-repair serialisation. T4's claim sequence uses this, then
+/// [`bind_claim_in`], and on a lost race [`release_lock_in`].
+pub fn create_locked_in<E: From<RepairError>>(
+    root: &Path,
+    make: impl FnOnce(&RepairId) -> Result<RepairRecord, E>,
+) -> Result<RepairId, E> {
+    let id = allocate_id_in(root)?;
+    let rec = match make(&id) {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = std::fs::remove_dir(repair_dir_in(root, &id));
+            return Err(e);
+        }
+    };
+    if rec.id != id || rec.lock.is_none() {
+        let _ = std::fs::remove_dir(repair_dir_in(root, &id));
+        return Err(RepairError::Precondition(format!(
+            "{}: a record created through create_locked must carry its own id and a lock",
+            id.as_str()
+        ))
+        .into());
+    }
+    write_record_in(root, &rec)?;
+    Ok(id)
+}
+
+/// [`create_locked_in`] under the default repairs root.
+pub fn create_locked<E: From<RepairError>>(
+    make: impl FnOnce(&RepairId) -> Result<RepairRecord, E>,
+) -> Result<RepairId, E> {
+    create_locked_in(&super::paths::repairs_root(), make)
+}
+
+/// RULINGS AD9 (S1) / G1 step 3: binds a grant claim to the lock `owner` holds on the record
+/// (refused when the record carries no lock of that owner — G6).
+pub fn bind_claim_in(
+    root: &Path,
+    id: &RepairId,
+    owner: &super::types::LockOwner,
+    claim: u32,
+) -> Result<(), RepairError> {
+    let mut rec = read_record_in(root, id)?
+        .ok_or_else(|| RepairError::Precondition(format!("{}: no such repair", id.as_str())))?;
+    match rec.lock.as_mut() {
+        Some(l) if super::lock::owned_by(l, owner) => l.claim = Some(claim),
+        _ => {
+            return Err(RepairError::Locked(format!(
+                "{}: the record carries no lock of this owner",
+                id.as_str()
+            )))
+        }
+    }
+    write_record_in(root, &rec)
+}
+
+/// [`bind_claim_in`] under the default repairs root.
+pub fn bind_claim(
+    id: &RepairId,
+    owner: &super::types::LockOwner,
+    claim: u32,
+) -> Result<(), RepairError> {
+    bind_claim_in(&super::paths::repairs_root(), id, owner, claim)
+}
+
+/// RULINGS AD9 (S1) / G1 step 4 / G6: clears the record's lock only when `owner` holds it (and,
+/// when `claim` is given, only when the lock is bound to that claim) — a losing or retried attempt
+/// never clears another attempt's lock. The record stays open and unlocked (visible, reassignable).
+/// Returns whether a lock was cleared.
+pub fn release_lock_in(
+    root: &Path,
+    id: &RepairId,
+    owner: &super::types::LockOwner,
+    claim: Option<u32>,
+) -> Result<bool, RepairError> {
+    let Some(mut rec) = read_record_in(root, id)? else {
+        return Ok(false);
+    };
+    let mine = rec
+        .lock
+        .as_ref()
+        .is_some_and(|l| super::lock::owned_by(l, owner) && (claim.is_none() || l.claim == claim));
+    if !mine {
+        return Ok(false);
+    }
+    rec.lock = None;
+    write_record_in(root, &rec)?;
+    Ok(true)
+}
+
+/// [`release_lock_in`] under the default repairs root.
+pub fn release_lock(
+    id: &RepairId,
+    owner: &super::types::LockOwner,
+    claim: Option<u32>,
+) -> Result<bool, RepairError> {
+    release_lock_in(&super::paths::repairs_root(), id, owner, claim)
+}
+
 /// The full flush of RULINGS E1: `F_FULLFSYNC` on macOS (plain `fsync` lost the exchange in 10/10
 /// simulated power losses), `sync_all` elsewhere. (T6's `durable` module is the shared helper once
 /// it lands; this is the same call for T3's own files.)
@@ -1140,6 +1252,8 @@ mod tests {
             origin_lane: LaneKey("base".into()),
             resolves: Some(id("R-11")),
             committed: vec![("bin/a.py".into(), "file:bb:0755".into())],
+            fixer_seats: vec![3, 9],
+            checks: vec![("bin/a.py".into(), "py-compile".into())],
         };
         let v = serde_json::to_value(&rec).unwrap();
         assert_eq!(
@@ -1170,6 +1284,8 @@ mod tests {
                 "origin_lane",
                 "resolves",
                 "committed",
+                "fixer_seats",
+                "checks",
             ])
         );
         assert_eq!(
@@ -1388,6 +1504,8 @@ mod storage_tests {
             origin_lane: LaneKey("base".into()),
             resolves: None,
             committed: vec![],
+            fixer_seats: vec![],
+            checks: vec![],
         }
     }
 
@@ -1755,6 +1873,74 @@ mod storage_tests {
                 .is_none(),
             "expired lease"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// RULINGS AD9 (S1): a record is created already locked; a claim binds to the owner's lock only;
+    /// the release clears only the owner's (and claim's) lock; a failed `make` leaves no directory.
+    #[test]
+    fn create_locked_bind_and_release() {
+        let root = tmp(line!());
+        let owner = LockOwner {
+            lane: LaneKey("base".into()),
+            seat: 3,
+            incarnation: "i".into(),
+        };
+        let other = LockOwner {
+            seat: 4,
+            ..owner.clone()
+        };
+        let id = create_locked_in::<RepairError>(&root, |id| {
+            let mut r = sample(id);
+            r.lock = Some(crate::repair::lock::new_lease(owner.clone(), 1.0, None));
+            Ok(r)
+        })
+        .unwrap();
+        assert!(
+            read_record_in(&root, &id).unwrap().unwrap().lock.is_some(),
+            "written locked"
+        );
+        assert!(bind_claim_in(&root, &id, &other, 7).is_err());
+        bind_claim_in(&root, &id, &owner, 7).unwrap();
+        assert_eq!(
+            read_record_in(&root, &id)
+                .unwrap()
+                .unwrap()
+                .lock
+                .unwrap()
+                .claim,
+            Some(7)
+        );
+        assert!(
+            !release_lock_in(&root, &id, &other, None).unwrap(),
+            "another owner never clears it"
+        );
+        assert!(
+            !release_lock_in(&root, &id, &owner, Some(8)).unwrap(),
+            "another claim never clears it"
+        );
+        assert!(release_lock_in(&root, &id, &owner, Some(7)).unwrap());
+        let rec = read_record_in(&root, &id).unwrap().unwrap();
+        assert!(rec.lock.is_none());
+        assert_eq!(rec.state, RepairState::InProgress, "the record stays open");
+        // an unlocked record is refused; a failing make leaves no id directory behind
+        assert!(create_locked_in::<RepairError>(&root, |id| Ok(sample(id))).is_err());
+        assert!(create_locked_in(&root, |_| Err(RepairError::Io("x".into()))).is_err());
+        assert_eq!(list_ids_in(&root).len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// AD1 / AD4: a record written before the two fields existed still reads (serde default).
+    #[test]
+    fn old_record_without_new_fields_reads() {
+        let root = tmp(line!());
+        let id = allocate_id_in(&root).unwrap();
+        let mut v = serde_json::to_value(sample(&id)).unwrap();
+        v.as_object_mut().unwrap().remove("fixer_seats");
+        v.as_object_mut().unwrap().remove("checks");
+        std::fs::write(record_path_in(&root, &id), serde_json::to_vec(&v).unwrap()).unwrap();
+        let r = read_record_in(&root, &id).unwrap().unwrap();
+        assert!(r.fixer_seats.is_empty() && r.checks.is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 

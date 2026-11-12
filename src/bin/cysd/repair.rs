@@ -84,6 +84,111 @@ pub(crate) struct Caller {
     pub role: Option<String>,
     /// The app's operator token was presented by a seatless caller (interpretation 36).
     pub app_token: bool,
+    /// RULINGS AD1: the family of the FIRST known-family role this seat held in this daemon
+    /// incarnation (`None` for a seatless caller or a seat that never held a known-family role).
+    pub bound_family: Option<RoleFamily>,
+}
+
+/// The role families of RULINGS AD1. An empty or unknown role has none and binds nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum RoleFamily {
+    /// master · CEO · a department's master
+    Master,
+    Worker,
+    Reviewer,
+    Cso,
+    Planner,
+}
+
+impl RoleFamily {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            RoleFamily::Master => "master·CEO",
+            RoleFamily::Worker => "worker",
+            RoleFamily::Reviewer => "reviewer",
+            RoleFamily::Cso => "CSO",
+            RoleFamily::Planner => "planner",
+        }
+    }
+}
+
+/// The family of a role name (AD1): `master` / `ceo` (+ `-<n>` variants) → master·CEO; `worker`,
+/// `worker-*` → worker; `reviewer*` → reviewer; `cso*` → CSO (the alert-route prefix);
+/// `planner*` → planner; anything else → none.
+pub(crate) fn role_family(role: &str) -> Option<RoleFamily> {
+    let r = role.trim();
+    if r == "master" || r == "ceo" || r.starts_with("master-") || r.starts_with("ceo-") {
+        Some(RoleFamily::Master)
+    } else if r == "worker" || r.starts_with("worker-") {
+        Some(RoleFamily::Worker)
+    } else if r.starts_with("reviewer") {
+        Some(RoleFamily::Reviewer)
+    } else if r.starts_with("cso") {
+        Some(RoleFamily::Cso)
+    } else if r.starts_with("planner") {
+        Some(RoleFamily::Planner)
+    } else {
+        None
+    }
+}
+
+/// RULINGS AD1 — per daemon (lane + incarnation) and seat: the family of the first known-family
+/// role the seat held. Memory only (it dies with the daemon — a new incarnation starts empty); the
+/// entry goes when the surface closes ([`release_locks_for_seat`]). A leaf lock: it is taken while
+/// `claim_role` holds its surface / role locks and never takes another lock itself.
+fn role_bindings() -> &'static Mutex<RoleBindings> {
+    static B: std::sync::OnceLock<Mutex<RoleBindings>> = std::sync::OnceLock::new();
+    B.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// (lane, daemon incarnation, seat) → the family of the seat's first known-family role (AD1).
+type RoleBindings = HashMap<(String, String, u64), RoleFamily>;
+
+/// Binds `role`'s family to the seat unless the seat is already bound or the role has no known
+/// family; returns the binding after the call.
+pub(crate) fn bind_role_family(
+    lane: &str,
+    incarnation: &str,
+    sid: u64,
+    role: Option<&str>,
+) -> Option<RoleFamily> {
+    let mut m = role_bindings().lock().unwrap_or_else(|e| e.into_inner());
+    let key = (lane.to_string(), incarnation.to_string(), sid);
+    if let Some(f) = m.get(&key) {
+        return Some(*f);
+    }
+    let fam = role.and_then(role_family)?;
+    m.insert(key, fam);
+    Some(fam)
+}
+
+/// Drops a closed seat's binding.
+pub(crate) fn forget_role_family(lane: &str, incarnation: &str, sid: u64) {
+    role_bindings()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(lane.to_string(), incarnation.to_string(), sid));
+}
+
+/// RULINGS AD1 — the ONE recording call where a role is claimed (`handlers.rs`, `system.claim_role`,
+/// right before the new role is committed): the role the seat held before the claim binds first
+/// (it is the seat's earlier role), else the claimed one. `claim_role` itself is unchanged.
+pub(crate) fn note_role_claim(daemon: &Daemon, sid: u64, previous: Option<&str>, claimed: &str) {
+    let lane = LaneKey::of_socket(&daemon.socket_path).0;
+    record_role_claim(&lane, &daemon.incarnation, sid, previous, claimed);
+}
+
+/// The body of [`note_role_claim`] (pure over the binding map): the earlier role binds first, else
+/// the claimed one; an existing binding never changes. Returns the binding after the call.
+pub(crate) fn record_role_claim(
+    lane: &str,
+    incarnation: &str,
+    sid: u64,
+    previous: Option<&str>,
+    claimed: &str,
+) -> Option<RoleFamily> {
+    bind_role_family(lane, incarnation, sid, previous)
+        .or_else(|| bind_role_family(lane, incarnation, sid, Some(claimed)))
 }
 
 impl Caller {
@@ -317,6 +422,21 @@ pub(crate) fn role_check(sub: &str, caller: &Caller, windows: bool) -> Result<()
             "`{sub}` 에는 역할 등급이 없습니다 — 어떤 좌석도 받지 않습니다"
         )));
     };
+    // RULINGS AD1: for every verb that is not READ or INTAKE, a seat whose current role family
+    // differs from the family it first held in this daemon incarnation is refused (renaming a seat
+    // with `claim-role` does not change what it may do in the repair flow).
+    if !matches!(class, VerbClass::Read | VerbClass::Intake) {
+        if let (Some(_), Some(bound)) = (caller.seat(), caller.bound_family) {
+            let current = caller.role.as_deref().and_then(role_family);
+            if current != Some(bound) {
+                return Err(VerbError::refused(format!(
+                    "이 좌석은 처음에 '{}' 역할로 섰고 지금은 '{}' 입니다 — 역할 이름을 바꾼 좌석은 수리 명령을 쓸 수 없습니다(RULINGS AD1)",
+                    bound.label(),
+                    caller.role.as_deref().unwrap_or("역할 없음")
+                )));
+            }
+        }
+    }
     match class {
         // O2: any caller — a seat, a human, the app, a scheduler child or a detached process.
         VerbClass::Read | VerbClass::Intake | VerbClass::Trigger => Ok(()),
@@ -368,11 +488,20 @@ pub(crate) fn role_check(sub: &str, caller: &Caller, windows: bool) -> Result<()
             if caller.is_worker() {
                 return Ok(());
             }
-            if matches!(sub, "revert" | "cleanup") && caller.kind == CallerKind::Human {
-                if windows && !caller.app_token {
+            if matches!(sub, "revert" | "cleanup") && caller.seat().is_none() {
+                // interpretation 36: the app's button (operator token) is human on both systems
+                if caller.app_token {
+                    return Ok(());
+                }
+                // M4 / AD2: on Windows a seatless command line is never human — every such caller
+                // (the decision gives it `Detached`: no terminal is observed there) gets the
+                // sentence that points to the app's button
+                if windows {
                     return Err(VerbError::refused(WINDOWS_SEATLESS_REFUSAL_KO));
                 }
-                return Ok(());
+                if caller.kind == CallerKind::Human {
+                    return Ok(());
+                }
             }
             Err(VerbError::refused(match caller.kind {
                 CallerKind::Seat { .. } => "수리 작업 명령은 워커 좌석만 부를 수 있습니다(마스터·CEO·CSO·리뷰어는 거부)",
@@ -394,19 +523,34 @@ fn caller_of(
         let role = daemon
             .get_surface(sid)
             .and_then(|s| s.role.lock().unwrap_or_else(|e| e.into_inner()).clone());
-        return Caller {
-            kind: CallerKind::Seat { sid },
-            role,
-            app_token: false,
-        };
+        let lane = LaneKey::of_socket(&daemon.socket_path).0;
+        return seat_caller(&lane, &daemon.incarnation, sid, role);
     }
     let obs = caller_pid
         .map(|pid| observe_seatless(daemon, pid))
         .unwrap_or_default();
+    seatless_caller(owner_grade, &obs)
+}
+
+/// A seat caller with its AD1 binding: the existing binding, else (a seat that never claimed — its
+/// current role is the first it held) the current role's family is bound now.
+pub(crate) fn seat_caller(lane: &str, incarnation: &str, sid: u64, role: Option<String>) -> Caller {
+    let bound_family = bind_role_family(lane, incarnation, sid, role.as_deref());
     Caller {
-        kind: decide_seatless(owner_grade, &obs),
+        kind: CallerKind::Seat { sid },
+        role,
+        app_token: false,
+        bound_family,
+    }
+}
+
+/// A seatless caller from what the daemon observed (the real decision of `caller_of`).
+pub(crate) fn seatless_caller(owner_grade: bool, obs: &SeatlessObservation) -> Caller {
+    Caller {
+        kind: decide_seatless(owner_grade, obs),
         role: None,
         app_token: owner_grade,
+        bound_family: None,
     }
 }
 
@@ -714,6 +858,10 @@ mod ledger_verbs {
     /// the CLI's 40-s wait (`cys.rs:RPC_IDLE_TIMEOUT_SECS`; F2 — a seat inside a long synchronous command
     /// cannot be cleared). A check that hits its share of the budget is a FAILURE at commit (B3).
     pub(crate) const COMMIT_CHECK_BUDGET_SECS: u64 = 30;
+    /// AD4: how a target committed as Absent is checked — by that state itself.
+    pub(crate) const CHECK_ABSENT_STATE: &str = "absent-state";
+    /// AD4: how a hook line is checked — the registrar's report inside `hook_lines_step`.
+    pub(crate) const CHECK_HOOK_REGISTRAR: &str = "hook-registrar";
     /// Longest accepted note (`record` / `attest-*`), bytes.
     pub(crate) const MAX_NOTE_BYTES: usize = 4096;
     /// Methods kept in a record (oldest dropped first).
@@ -927,7 +1075,7 @@ mod ledger_verbs {
             LockView::MineExpired => {
                 return Err(VerbError::new(
                     cys::repair::types::ERR_LOCKED,
-                    format!("{}: 잠금 임대가 만료됐습니다 — 다시 잡으세요(`cys repair begin --files …`)", rec.id.as_str()),
+                    format!("{}: 잠금 임대가 만료됐습니다 — 다시 잡으세요(`cys repair begin --files … --trigger …`)", rec.id.as_str()),
                 ))
             }
             LockView::HeldByOther(o, _) => {
@@ -938,7 +1086,7 @@ mod ledger_verbs {
             }
             LockView::Free => {
                 return Err(VerbError::refused(format!(
-                    "{}: 이 수리의 잠금을 쥔 좌석만 부를 수 있습니다 — 먼저 `cys repair begin --files …`",
+                    "{}: 이 수리의 잠금을 쥔 좌석만 부를 수 있습니다 — 먼저 `cys repair begin --files … --trigger …`",
                     rec.id.as_str()
                 )))
             }
@@ -1116,7 +1264,13 @@ mod ledger_verbs {
     }
 
     fn trigger_of(p: &Value) -> Result<Trigger, VerbError> {
-        match param_str(p, "trigger").unwrap_or("owner_order") {
+        // AD10: required — no default (fail closed).
+        let Some(t) = param_str(p, "trigger") else {
+            return Err(VerbError::invalid(
+                "--trigger 가 필요합니다(owner-order · grant · update 중 하나 — 기본값 없음)",
+            ));
+        };
+        match t {
             "owner_order" | "owner-order" => Ok(Trigger::OwnerOrder),
             "grant" => Ok(Trigger::Grant),
             "update" => Ok(Trigger::Update),
@@ -1250,6 +1404,16 @@ mod ledger_verbs {
             }
             None => None,
         };
+        // AD6 / C10 10.6: a rule document is refused until T4's owner-token gate is merged (fail closed).
+        if let Some(rel) = files.iter().find(|r| super::is_rule_document(r)) {
+            return Err(VerbError::new(
+                cys::repair::types::ERR_NOT_IMPLEMENTED,
+                format!(
+                    "{} (규칙 문서 수리 — 주인 지시 표 관문 · C10): {rel}",
+                    cys::repair::NOT_IMPLEMENTED_KO
+                ),
+            ));
+        }
         // Classification (C4 · T5a) — refused when it cannot be decided (fail closed).
         let mut class = Classification::General;
         for rel in &files {
@@ -1297,46 +1461,63 @@ mod ledger_verbs {
         resolves: Option<RepairId>,
         key: &[String],
     ) -> Result<Value, VerbError> {
-        // Pick-up (G1 step 3 / R5): an open repair of this lane with the same targets and no live lock.
-        let candidates: Vec<RepairId> = ledger::list_ids_in(&ctx.root)
+        // Pick-up (G1 step 3 / AD7): only UNFINISHED work — a repair of this lane with the same targets
+        // that is `진행 중` or `감사 지적으로 다시 열림` and has no live lock. A repair in force
+        // (`시험 기간` / `사용 중`) or in any other state is never picked up: a new `begin` starts a NEW
+        // repair with its own pre-image.
+        let candidates: Vec<RepairRecord> = ledger::list_ids_in(&ctx.root)
             .into_iter()
-            .filter(|id| match ledger::read_record_in(&ctx.root, id) {
-                Ok(Some(r)) => {
-                    r.origin_lane == ctx.lane
+            .filter_map(|id| match ledger::read_record_in(&ctx.root, &id) {
+                Ok(Some(r))
+                    if r.origin_lane == ctx.lane
                         && r.resolves == resolves
-                        && !matches!(
+                        && matches!(
                             r.state,
-                            RepairState::Reverted
-                                | RepairState::Superseded
-                                | RepairState::UpstreamFixed
+                            RepairState::InProgress | RepairState::ReopenedByAudit
                         )
-                        && record_key(&r) == key
+                        && record_key(&r) == key =>
+                {
+                    Some(r)
                 }
-                _ => false,
+                _ => None,
             })
             .collect();
-        if let Some(id) = candidates.last() {
+        let views: Vec<(RepairId, LockView)> = candidates
+            .iter()
+            .map(|r| {
+                (
+                    r.id.clone(),
+                    lock::view(r.lock.as_ref(), owner, ctx.now, &ctx.lane, &ctx.incarnation),
+                )
+            })
+            .collect();
+        // G6: a retry of this seat's own start gets that start back.
+        if let Some((id, _)) = views.iter().rev().find(|(_, v)| *v == LockView::Mine) {
+            let rec = load(ctx, id)?;
+            return Ok(begin_reply(ctx, &rec, "already-held"));
+        }
+        if let Some((id, _)) = views.iter().rev().find(|(_, v)| *v == LockView::Free) {
             return ctx.locked(id.as_str(), || -> Result<Value, VerbError> {
                 let mut rec = load(ctx, id)?;
-                match lock::view(
+                // re-read under the repair's mutex: still unfinished and still free?
+                let still = matches!(
+                    rec.state,
+                    RepairState::InProgress | RepairState::ReopenedByAudit
+                ) && lock::view(
                     rec.lock.as_ref(),
                     owner,
                     ctx.now,
                     &ctx.lane,
                     &ctx.incarnation,
-                ) {
-                    // G6: a retry gets its own completed start
-                    LockView::Mine => return Ok(begin_reply(ctx, &rec, "already-held")),
-                    LockView::MineExpired | LockView::HeldByOther(..) => {
-                        return Err(VerbError::new(
-                            cys::repair::types::ERR_LOCKED,
-                            format!(
-                                "{}: 이 수리는 이미 잠겨 있습니다(살아 있는 잠금)",
-                                rec.id.as_str()
-                            ),
-                        ))
-                    }
-                    LockView::Free => {}
+                ) == LockView::Free;
+                if !still {
+                    return Err(VerbError::new(
+                        cys::repair::types::ERR_LOCKED,
+                        format!(
+                            "{}: 이 수리는 방금 다른 좌석이 잡았습니다 — 다시 시도하세요",
+                            rec.id.as_str()
+                        ),
+                    ));
                 }
                 let mut claim = None;
                 if rec.trigger == Trigger::Grant && rec.resolves.is_none() {
@@ -1344,40 +1525,35 @@ mod ledger_verbs {
                     claim = claim_for(owner, &rec.id)?;
                 }
                 rec.lock = Some(lock::new_lease(owner.clone(), ctx.now, claim));
-                if matches!(rec.state, RepairState::Probation | RepairState::InUse) {
-                    rec.state = RepairState::InProgress; // R5: before any `record`
-                }
                 // V2(b) / DEFERRED_MINOR #6: pre-images and staging of the first begin are never rewritten.
                 write(ctx, &rec)?;
                 Ok(begin_reply(ctx, &rec, "picked-up"))
             });
         }
-        // A new repair.
-        let id = ledger::allocate_id_in(&ctx.root)?;
-        let claim = if trigger == Trigger::Grant && resolves.is_none() {
-            match claim_for(owner, &id) {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = std::fs::remove_dir(ledger::repair_dir_in(&ctx.root, &id)); // empty → removed; else kept
-                    return Err(e);
-                }
-            }
-        } else {
-            None
-        };
-        ctx.locked(id.as_str(), || -> Result<Value, VerbError> {
+        if let Some((id, _)) = views.last() {
+            // every unfinished repair of these targets is held by a live lock of another seat
+            return Err(VerbError::new(
+                cys::repair::types::ERR_LOCKED,
+                format!(
+                    "{}: 이 수리는 이미 잠겨 있습니다(살아 있는 잠금)",
+                    id.as_str()
+                ),
+            ));
+        }
+        // A new repair — created ALREADY LOCKED through the ledger's seam (AD9 S1 / G1 "lock first"):
+        // the id is allocated, the record is built (claim, pre-images, staging) and written with its
+        // lock before anything else can see it; a failure removes the still-empty id directory.
+        let id = ledger::create_locked_in(&ctx.root, |id| -> Result<RepairRecord, VerbError> {
+            let id = id.clone();
+            let claim = if trigger == Trigger::Grant && resolves.is_none() {
+                claim_for(owner, &id)?
+            } else {
+                None
+            };
             let mut changes = Vec::new();
             for rel in files {
                 let live = live_path(ctx, rel);
-                let pre = match ledger::copy_preimage_in(
-                    &ctx.root, &id, &ctx.lane, rel, &live, ctx.now,
-                ) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        let _ = std::fs::remove_dir(ledger::repair_dir_in(&ctx.root, &id));
-                        return Err(e.into());
-                    }
-                };
+                let pre = ledger::copy_preimage_in(&ctx.root, &id, &ctx.lane, rel, &live, ctx.now)?;
                 let post = pre.state();
                 changes.push(FileChange {
                     rel: rel.clone(),
@@ -1449,10 +1625,13 @@ mod ledger_verbs {
                 origin_lane: ctx.lane.clone(),
                 resolves: resolves.clone(),
                 committed: Vec::new(),
+                fixer_seats: Vec::new(),
+                checks: Vec::new(),
             };
-            write(ctx, &rec)?;
-            Ok(begin_reply(ctx, &rec, "new"))
-        })
+            Ok(rec)
+        })?;
+        let rec = load(ctx, &id)?;
+        Ok(begin_reply(ctx, &rec, "new"))
     }
 
     /// K8 / G1 (T4): the grant claim for an autonomous start. Until T4 lands the stub answers
@@ -1668,7 +1847,7 @@ mod ledger_verbs {
                 RepairState::Probation | RepairState::InUse => {
                     return Err(VerbError::new(
                         cys::repair::types::ERR_PRECONDITION,
-                        format!("{}: 사용 중인 수리입니다 — `cys repair begin --files …` 로 다시 잡은 뒤 기록하세요(RULINGS R5)", id.as_str()),
+                        format!("{}: 이미 적용된 수리입니다 — 더 고치려면 `cys repair begin --files … --trigger …` 로 새 수리를 시작하세요(RULINGS AD7)", id.as_str()),
                     ))
                 }
                 other => {
@@ -1711,6 +1890,10 @@ mod ledger_verbs {
             }
             let voided = rec.verify.is_some() || rec.audit.is_some();
             let sid = caller.seat().unwrap_or(0);
+            // AD1: every seat that recorded in any round stays a fixer of this repair.
+            if !rec.fixer_seats.contains(&sid) {
+                rec.fixer_seats.push(sid);
+            }
             rec.worker_record = Some(Attestation {
                 seat: sid,
                 role: caller.role.clone().unwrap_or_default(),
@@ -1777,7 +1960,11 @@ mod ledger_verbs {
             let worker = rec.worker_record.clone().ok_or_else(|| {
                 VerbError::new(cys::repair::types::ERR_PRECONDITION, format!("{}: 워커의 기록(`record`)이 아직 없습니다", id.as_str()))
             })?;
-            let fixer = worker.seat == sid || rec.lock.as_ref().is_some_and(|l| l.owner.lane == ctx.lane && l.owner.seat == sid);
+            // B2 / AD1: never the fixer — any seat that recorded in ANY round, the last recorder, or
+            // the seat holding the repair's lock.
+            let fixer = rec.fixer_seats.contains(&sid)
+                || worker.seat == sid
+                || rec.lock.as_ref().is_some_and(|l| l.owner.lane == ctx.lane && l.owner.seat == sid);
             if fixer {
                 return Err(VerbError::refused(format!("{}: 자기가 고친 수리에는 서명할 수 없습니다", id.as_str())));
             }
@@ -1870,18 +2057,26 @@ mod ledger_verbs {
         (version, pro)
     }
 
+    /// What the commit's checks produced: the timings of the checks that ran (K4) and, per target,
+    /// how it was checked (AD4 — `RepairRecord.checks`).
+    type Checked = (Vec<CheckTiming>, Vec<(String, String)>);
+
     /// Runs the repair's check on every live target inside the commit budget (B3: a timeout at commit
-    /// is a failure). `Err` = the runner itself is not available (T5b) → the commit is refused.
+    /// is a failure). A target whose committed state is Absent is checked by that state itself (the
+    /// path is absent — `absent-state`, AD4; `current_states` read it so). `Err` = the runner itself
+    /// is not available (T5b) → the commit is refused. Called WITHOUT the per-repair mutex (AD10).
     fn run_checks(
         ctx: &Ctx<'_>,
         states: &[(String, TargetState)],
-    ) -> Result<Result<Vec<CheckTiming>, String>, VerbError> {
+    ) -> Result<Result<Checked, String>, VerbError> {
         let started = std::time::Instant::now();
         let budget = std::time::Duration::from_secs(COMMIT_CHECK_BUDGET_SECS);
         let mut timings = Vec::new();
+        let mut checks = Vec::new();
         for (rel, st) in states {
             if *st == TargetState::Absent {
-                continue; // a deletion: nothing to run
+                checks.push((rel.clone(), CHECK_ABSENT_STATE.to_string()));
+                continue;
             }
             let declared = entries()
                 .iter()
@@ -1909,18 +2104,47 @@ mod ledger_verbs {
                 reference_kind: report.reference_kind,
                 reference_ms: report.reference_ms,
             });
+            checks.push((rel.clone(), check_name(super::check_kind_for(rel))));
         }
-        Ok(Ok(timings))
+        Ok(Ok((timings, checks)))
+    }
+
+    /// AD4: the registrar's report confirms a hook line only when it lists that line as wanted
+    /// `unregistered` and every settings file it touched answers `unregistered`.
+    pub(crate) fn hook_line_confirmed(
+        report: &cys::repair::apply::ReconcileReport,
+        event: &str,
+        script: &str,
+    ) -> bool {
+        report.hooks.iter().any(|h| {
+            h.event == event
+                && h.script == script
+                && h.desired == "unregistered"
+                && !h.targets.is_empty()
+                && h.targets.iter().all(|(_, st)| st == "unregistered")
+        })
+    }
+
+    /// The O-C4-3 spelling of a check kind (`sh-syntax` …) for the record.
+    fn check_name(k: cys::repair::boot_critical::CheckKind) -> String {
+        serde_json::to_value(k)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_else(|| format!("{k:?}"))
     }
 
     /// `cys repair commit <R-id>` — a GENERAL repair (boot-critical / protection-related go through
-    /// submit and the owner's approval): the worker's record + reviewer1's `pass` from a seat other than
-    /// the fixer (C1 1.9) + the live states still reproduce the verified fingerprint (N1 / U2) + the
-    /// repair's check passes on the LIVE files. Then: the committed state durable (E1) → the hook step
-    /// (Y1, only after that) → this lane's own row (K1; 검증됨, or 충돌 on a hook-step error — Y2(c)).
+    /// submit and the owner's approval): the worker's record + reviewer1's `pass` from a seat that never
+    /// fixed it (C1 1.9 · AD1) + the live states still reproduce the verified fingerprint (N1 / U2) +
+    /// the repair's check passes on the LIVE files. Three steps (RULINGS R3 · AD10): (1) under the
+    /// per-repair mutex: the preconditions and the live states; (2) WITHOUT the mutex: the check
+    /// children; (3) the mutex re-taken: the record re-read — aborted if it changed or the live states
+    /// moved — then the committed state durable (E1) → the hook step (Y1, only after that) → the
+    /// lane's File tombstones (AD3) → this lane's own row (K1; 검증됨, or 충돌 on a step error — Y2(c)).
     pub(crate) fn commit(ctx: &Ctx<'_>, caller: &Caller, p: &Value) -> Result<Value, VerbError> {
         let id = repair_id(p)?;
-        ctx.locked(id.as_str(), || -> Result<Value, VerbError> {
+        // (1) preconditions under the per-repair mutex
+        let (snapshot, states) = ctx.locked(id.as_str(), || -> Result<(RepairRecord, Vec<(String, TargetState)>), VerbError> {
             let mut rec = load(ctx, &id)?;
             require_origin(ctx, &rec)?;
             holder_renew(ctx, caller, &mut rec)?;
@@ -1956,7 +2180,10 @@ mod ledger_verbs {
                 return Err(VerbError::new(cys::repair::types::ERR_PRECONDITION, format!("{}: 리뷰어1의 검증이 통과가 아닙니다", id.as_str())));
             }
             let fixer_seat = rec.lock.as_ref().map(|l| l.owner.seat);
-            if verify.seat == worker.seat || Some(verify.seat) == fixer_seat {
+            if verify.seat == worker.seat
+                || Some(verify.seat) == fixer_seat
+                || rec.fixer_seats.contains(&verify.seat)
+            {
                 return Err(VerbError::new(
                     cys::repair::types::ERR_PRECONDITION,
                     format!("{}: 검증 서명이 고친 좌석의 것입니다 — 다른 좌석의 리뷰어1 서명이 필요합니다", id.as_str()),
@@ -1969,7 +2196,32 @@ mod ledger_verbs {
                     format!("{}: 검증 서명 뒤에 살아 있는 파일(내용·권한·링크)이 바뀌었습니다 — 다시 기록하고 검증받으세요", id.as_str()),
                 ));
             }
-            let timings = match run_checks(ctx, &states)? {
+            Ok((rec, states))
+        })?;
+        // (2) the check children — the per-repair mutex is NOT held (AD10 / R3)
+        let checked = run_checks(ctx, &states)?;
+        // (3) re-take, re-read, abort if anything moved, then act
+        ctx.locked(id.as_str(), || -> Result<Value, VerbError> {
+            let mut rec = load(ctx, &id)?;
+            if rec != snapshot {
+                return Err(VerbError::new(
+                    "target_changed",
+                    format!("{}: 검사하는 동안 수리 기록이 바뀌었습니다 — 확정을 멈춥니다(다시 `cys repair commit`)", id.as_str()),
+                ));
+            }
+            if current_states(ctx, &rec)? != states {
+                return Err(VerbError::new(
+                    "target_changed",
+                    format!("{}: 검사하는 동안 살아 있는 파일이 바뀌었습니다 — 다시 기록하고 검증받으세요", id.as_str()),
+                ));
+            }
+            if lock::claim_closed(&ctx.root, rec.lock.as_ref().and_then(|l| l.claim)) {
+                return Err(VerbError::new(
+                    cys::repair::types::ERR_LOCKED,
+                    format!("{}: 이 잠금의 자동 수리 차례가 닫혔습니다 — 새 차례가 필요합니다", id.as_str()),
+                ));
+            }
+            let (timings, mut checks) = match checked {
                 Ok(t) => t,
                 Err(why) => {
                     if let Some(w) = rec.worker_record.as_mut() {
@@ -1986,16 +2238,33 @@ mod ledger_verbs {
             let before = rec.clone();
             let committed = canon_list(&states);
             rec.committed = committed.clone();
+            rec.checks = checks.clone();
             rec.state = RepairState::Probation;
             rec.audit_due_at = Some(ctx.now + AUDIT_WINDOW_SECS as f64);
             rec.lock = None;
             ledger::write_record_durable_in(&ctx.root, &rec)?;
             // RULINGS Y1: the hook step only AFTER the committed state is durable.
             let mut step_error: Option<String> = None;
-            let has_hooks = hook_lines(&rec).next().is_some();
+            let lines: Vec<(String, String)> = hook_lines(&rec)
+                .filter_map(|f| match &f.kind {
+                    ChangeKind::HookUnregister { event, script } => Some((event.clone(), script.clone())),
+                    _ => None,
+                })
+                .collect();
+            let has_hooks = !lines.is_empty();
             if has_hooks {
                 match cys::repair::apply::hook_lines_step(&id, &ctx.lane, cys::repair::apply::HookStep::Unregister) {
-                    Ok(_) => {}
+                    Ok(report) => {
+                        // AD4: a hook line is checked by the registrar's report — claimed only for a
+                        // line the report shows unregistered in every settings file it touched.
+                        for (event, script) in &lines {
+                            if hook_line_confirmed(&report, event, script) {
+                                checks.push((format!("settings:{event}:{script}"), CHECK_HOOK_REGISTRAR.to_string()));
+                            } else {
+                                step_error.get_or_insert_with(|| format!("settings:{event}:{script}: 등록 해제가 등록기의 보고로 확인되지 않았습니다"));
+                            }
+                        }
+                    }
                     Err(RepairError::NotImplemented(f)) => {
                         // Y1: until T6 lands, a commit with a hook line is refused with that sentence;
                         // the stub changed nothing, so the record goes back to its pre-commit state.
@@ -2004,6 +2273,30 @@ mod ledger_verbs {
                     }
                     Err(e) => step_error = Some(VerbError::from(e).message),
                 }
+            }
+            // AD3 / C1 1.5: a committed deletion is tombstoned in this lane; a path committed present
+            // drops the File tombstones it had (both under the lane's tombstone mutex).
+            for (rel, st) in &states {
+                let r = if *st == TargetState::Absent {
+                    cys::repair::tombstones::record_in(
+                        &ctx.root,
+                        &ctx.lane,
+                        &cys::repair::tombstones::Tombstone {
+                            rel: rel.clone(),
+                            kind: cys::repair::tombstones::TombstoneKind::File,
+                            repair: id.clone(),
+                        },
+                    )
+                } else {
+                    cys::repair::tombstones::remove_file_rel_in(&ctx.root, &ctx.lane, rel)
+                };
+                if let Err(e) = r {
+                    step_error.get_or_insert_with(|| format!("{rel}: 삭제 표식(묘비) 기록 실패 — {}", VerbError::from(e).message));
+                }
+            }
+            if rec.checks != checks {
+                rec.checks = checks;
+                ledger::write_record_durable_in(&ctx.root, &rec)?;
             }
             let (version, pro) = pack_generation(&ctx.pack_dir);
             let previous = ledger::read_lane_in(&ctx.root, &id, &ctx.lane).ok().flatten();
@@ -2518,18 +2811,33 @@ pub(crate) fn apply_prompt(
     }
 }
 
+/// C10's rule-document base names (as `guard.sh:PROTECTED_NAMES`), lower-cased.
+const RULE_DOC_NAMES: [&str; 5] = [
+    "soul.md",
+    "claude.md",
+    "vibecoding_constitution.md",
+    "vibecoding_enforcement.md",
+    "route_contract.md",
+];
+
+/// RULINGS AD6 / C10: whether a pack-relative target is a rule document — its base name, lower-cased,
+/// is one of C10's names or `<x>_directive.md` (the same classification as [`named_rule_docs`]).
+pub(crate) fn is_rule_document(rel: &str) -> bool {
+    let base = rel
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(rel)
+        .to_ascii_lowercase();
+    RULE_DOC_NAMES.contains(&base.as_str())
+        || (base.ends_with("_directive.md") && base.len() > "_directive.md".len())
+}
+
 /// Rule-document base names in a prompt, lower-cased, `.md` form (C10's classification, as
 /// `guard.sh:PROTECTED_NAMES` + `*_directive.md`): `soul.md`, `claude.md`,
 /// `vibecoding_constitution.md`, `vibecoding_enforcement.md`, `route_contract.md`, any
 /// `<x>_directive.md`; a bare `<X>_DIRECTIVE` counts as `<x>_directive.md` (Q2's example).
 pub(crate) fn named_rule_docs(text: &str) -> Vec<String> {
-    const NAMES: [&str; 5] = [
-        "soul.md",
-        "claude.md",
-        "vibecoding_constitution.md",
-        "vibecoding_enforcement.md",
-        "route_contract.md",
-    ];
+    const NAMES: [&str; 5] = RULE_DOC_NAMES;
     let mut out: Vec<String> = Vec::new();
     for tok in text.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))) {
         let t = tok.trim_matches('.').to_ascii_lowercase();
@@ -2564,6 +2872,11 @@ pub(crate) fn release_locks_for_seat(daemon: &Arc<Daemon>, sid: u64) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&sid);
+    forget_role_family(
+        &LaneKey::of_socket(&daemon.socket_path).0,
+        &daemon.incarnation,
+        sid,
+    );
     let classify = production_classify;
     let check = production_check;
     let ctx = Ctx {

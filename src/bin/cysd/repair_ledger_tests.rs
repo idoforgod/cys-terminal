@@ -115,11 +115,13 @@ impl Rig {
     }
 }
 
+/// A seat whose current role is the first it held (AD1: bound to that role's family).
 fn seat(sid: u64, role: &str) -> Caller {
     Caller {
         kind: CallerKind::Seat { sid },
         role: Some(role.into()),
         app_token: false,
+        bound_family: role_family(role),
     }
 }
 fn human() -> Caller {
@@ -127,6 +129,7 @@ fn human() -> Caller {
         kind: CallerKind::Human,
         role: None,
         app_token: false,
+        bound_family: None,
     }
 }
 fn app() -> Caller {
@@ -134,6 +137,7 @@ fn app() -> Caller {
         kind: CallerKind::Human,
         role: None,
         app_token: true,
+        bound_family: None,
     }
 }
 fn detached() -> Caller {
@@ -141,6 +145,7 @@ fn detached() -> Caller {
         kind: CallerKind::Detached,
         role: None,
         app_token: false,
+        bound_family: None,
     }
 }
 
@@ -150,7 +155,12 @@ const T0: f64 = 1_800_000_000.0;
 fn committed_general(r: &Rig) -> String {
     let w = seat(3, "worker");
     let b = r
-        .call(T0, &w, "begin", json!({"files": ["bin/a.py"]}))
+        .call(
+            T0,
+            &w,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["bin/a.py"]}),
+        )
         .unwrap();
     let id = b["repair"].as_str().unwrap().to_string();
     std::fs::write(r.pack.join("bin/a.py"), b"print('fixed')\n").unwrap();
@@ -198,6 +208,7 @@ fn role_table_census_every_verb_every_caller() {
                 kind: CallerKind::Seat { sid: 12 },
                 role: None,
                 app_token: false,
+                bound_family: None,
             },
         ),
         ("worker", seat(3, "worker")),
@@ -258,8 +269,8 @@ fn role_table_census_every_verb_every_caller() {
 fn request_fields_and_env_never_name_a_role() {
     let r = rig("m1");
     for p in [
-        json!({"files": ["bin/a.py"], "role": "worker", "seat": 3, "surface_id": 3, "caller": "worker"}),
-        json!({"files": ["bin/a.py"], "CYS_ROLE": "worker", "seat_token": "x"}),
+        json!({"files": ["bin/a.py"], "trigger": "owner_order", "role": "worker", "seat": 3, "surface_id": 3, "caller": "worker"}),
+        json!({"files": ["bin/a.py"], "trigger": "owner_order", "CYS_ROLE": "worker", "seat_token": "x"}),
     ] {
         let e = r.call(T0, &seat(1, "master"), "begin", p).unwrap_err();
         assert_eq!(e.code, "acl_denied");
@@ -494,7 +505,12 @@ fn report_aggregates_excludes_and_joins() {
     );
     // begin on that file takes the open defect in; a later report says it joined
     let begun = r
-        .call(T0, &w, "begin", json!({"files": ["bin/a.py"]}))
+        .call(
+            T0,
+            &w,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["bin/a.py"]}),
+        )
         .unwrap();
     let id = begun["repair"].as_str().unwrap().to_string();
     assert_eq!(begun["intake_signatures"], json!([a["signature"]]));
@@ -623,7 +639,12 @@ fn commit_preconditions() {
     let r = rig("commitpre");
     let w = seat(3, "worker");
     let id = r
-        .call(T0, &w, "begin", json!({"files": ["bin/a.py"]}))
+        .call(
+            T0,
+            &w,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["bin/a.py"]}),
+        )
         .unwrap()["repair"]
         .as_str()
         .unwrap()
@@ -721,7 +742,12 @@ fn record_voids_attestations_and_counts_rounds() {
     let r = rig("rounds");
     let w = seat(3, "worker");
     let id = r
-        .call(T0, &w, "begin", json!({"files": ["bin/a.py"]}))
+        .call(
+            T0,
+            &w,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["bin/a.py"]}),
+        )
         .unwrap()["repair"]
         .as_str()
         .unwrap()
@@ -841,7 +867,12 @@ fn audit_finding_reopens() {
     let r3 = rig("audit3");
     let w = seat(3, "worker");
     let id3 = r3
-        .call(T0, &w, "begin", json!({"files": ["bin/a.py"]}))
+        .call(
+            T0,
+            &w,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["bin/a.py"]}),
+        )
         .unwrap()["repair"]
         .as_str()
         .unwrap()
@@ -870,7 +901,12 @@ fn counters_survive_a_seat_clear() {
     let r = rig("clear");
     let w = seat(3, "worker");
     let id = r
-        .call(T0, &w, "begin", json!({"files": ["bin/a.py"]}))
+        .call(
+            T0,
+            &w,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["bin/a.py"]}),
+        )
         .unwrap()["repair"]
         .as_str()
         .unwrap()
@@ -894,7 +930,7 @@ fn counters_survive_a_seat_clear() {
             T0 + 5.0,
             &seat(13, "worker-3"),
             "begin",
-            json!({"files": ["bin/a.py"]}),
+            json!({"trigger": "owner_order", "files": ["bin/a.py"]}),
         )
         .unwrap();
     assert_eq!(p["begin"], "picked-up");
@@ -918,11 +954,21 @@ fn lock_releases_and_retries() {
     let r = rig("locks");
     let w = seat(3, "worker");
     let first = r
-        .call(T0, &w, "begin", json!({"files": ["bin/a.py"]}))
+        .call(
+            T0,
+            &w,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["bin/a.py"]}),
+        )
         .unwrap();
     let id = first["repair"].as_str().unwrap().to_string();
     let again = r
-        .call(T0 + 1.0, &w, "begin", json!({"files": ["bin/a.py"]}))
+        .call(
+            T0 + 1.0,
+            &w,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["bin/a.py"]}),
+        )
         .unwrap();
     assert_eq!(again["begin"], "already-held");
     assert_eq!(again["repair"], json!(id));
@@ -937,7 +983,7 @@ fn lock_releases_and_retries() {
             T0 + 2.0,
             &seat(13, "worker-3"),
             "begin",
-            json!({"files": ["bin/a.py"]}),
+            json!({"trigger": "owner_order", "files": ["bin/a.py"]}),
         )
         .unwrap_err();
     assert_eq!(e.code, "repair_locked");
@@ -955,7 +1001,7 @@ fn lock_releases_and_retries() {
             T0 + 4.0,
             &seat(13, "worker-3"),
             "begin",
-            json!({"files": ["bin/a.py"]}),
+            json!({"trigger": "owner_order", "files": ["bin/a.py"]}),
         )
         .unwrap();
     assert_eq!(p["begin"], "picked-up");
@@ -975,7 +1021,7 @@ fn lock_releases_and_retries() {
             T0 + 4.0 + 7200.0 + 61.0,
             &seat(14, "worker"),
             "begin",
-            json!({"files": ["bin/a.py"]}),
+            json!({"trigger": "owner_order", "files": ["bin/a.py"]}),
         )
         .unwrap();
     assert_eq!(p["begin"], "picked-up");
@@ -1004,7 +1050,7 @@ fn concurrent_begins_make_one_repair() {
                         T0,
                         &seat(3, "worker"),
                         "begin",
-                        json!({"files": ["bin/a.py"]}),
+                        json!({"trigger": "owner_order", "files": ["bin/a.py"]}),
                     )
                 })
             })
@@ -1027,8 +1073,11 @@ fn concurrent_begins_make_one_repair() {
     }));
 }
 
-/// R5: picking an in-force repair up again sets 진행 중 before any `record`; P4: a worker's `revert`
-/// passes the role table without needing, writing or clearing the repair's lock (the body is T6's).
+/// RULINGS AD7 (rewritten from the R5 pick-up test — AD7 replaces "an in-force repair is picked up
+/// and set back to 진행 중"): a `begin` on the files of a repair in force (`시험 기간`) starts a NEW
+/// repair with its own pre-image and leaves the in-force one exactly as it was; a repair reopened by
+/// the audit IS picked up. P4 (unchanged): a worker's `revert` passes the role table without
+/// needing, writing or clearing the repair's lock (the body is T6's).
 #[test]
 fn pick_up_of_in_force_and_revert_role() {
     let r = rig("inforce");
@@ -1049,21 +1098,55 @@ fn pick_up_of_in_force_and_revert_role() {
         before_lock,
         "revert touched the lock"
     );
+    let in_force = r.record_of(&id);
     let p = r
         .call(
             T0 + 6.0,
             &seat(13, "worker-3"),
             "begin",
-            json!({"files": ["bin/a.py"]}),
+            json!({"trigger": "owner_order", "files": ["bin/a.py"]}),
+        )
+        .unwrap();
+    assert_eq!(p["begin"], "new", "an in-force repair is never picked up");
+    let new_id = p["repair"].as_str().unwrap().to_string();
+    assert_ne!(new_id, id);
+    assert_eq!(
+        r.record_of(&id),
+        in_force,
+        "the in-force repair was touched"
+    );
+    let fresh = r.record_of(&new_id);
+    assert_eq!(fresh.state, RepairState::InProgress);
+    assert_eq!(fresh.attempt, 1);
+    // its own pre-image = the bytes in force now (the committed fix), not the first repair's
+    assert_eq!(
+        fresh.files[0].pre.state(),
+        in_force.files[0].post,
+        "the new repair's pre-image is the committed state"
+    );
+    assert_ne!(fresh.files[0].pre, in_force.files[0].pre);
+    // a repair reopened by the audit is unfinished work: picked up
+    let r2 = rig("reopen-pick");
+    let id2 = committed_general(&r2);
+    r2.call(
+        T0 + 4.0,
+        &seat(8, "reviewer-gemini"),
+        "attest_audit",
+        json!({"repair": id2, "verdict": "finding", "note": "diff ≠ ledger"}),
+    )
+    .unwrap();
+    assert_eq!(r2.record_of(&id2).state, RepairState::ReopenedByAudit);
+    let p = r2
+        .call(
+            T0 + 5.0,
+            &seat(13, "worker-3"),
+            "begin",
+            json!({"trigger": "owner_order", "files": ["bin/a.py"]}),
         )
         .unwrap();
     assert_eq!(p["begin"], "picked-up");
-    assert_eq!(r.record_of(&id).state, RepairState::InProgress);
-    assert_eq!(
-        r.record_of(&id).attempt,
-        1,
-        "a pick-up opens no round by itself"
-    );
+    assert_eq!(p["repair"], json!(id2));
+    assert_eq!(r2.record_of(&id2).lock.unwrap().owner.seat, 13);
 }
 
 /// G7(c): a lock bound to a closed grant claim authorises no mutating verb.
@@ -1072,7 +1155,12 @@ fn closed_claim_refuses_mutating_verbs() {
     let r = rig("claim");
     let w = seat(3, "worker");
     let id = r
-        .call(T0, &w, "begin", json!({"files": ["bin/a.py"]}))
+        .call(
+            T0,
+            &w,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["bin/a.py"]}),
+        )
         .unwrap()["repair"]
         .as_str()
         .unwrap()
@@ -1103,7 +1191,13 @@ fn boot_critical_joins_refused_resolves_accepted() {
     let r = rig("bc");
     let w = seat(3, "worker");
     let ctx = r.ctx(T0, &hooks_boot, &pass);
-    let b = handle_with(&ctx, &w, "begin", &json!({"files": ["hooks/h.sh"]})).unwrap();
+    let b = handle_with(
+        &ctx,
+        &w,
+        "begin",
+        &json!({"trigger": "owner_order", "files": ["hooks/h.sh"]}),
+    )
+    .unwrap();
     let rid = b["repair"].as_str().unwrap().to_string();
     assert_eq!(b["classification"], "boot_critical");
     let staging = b["staging"].as_str().unwrap().to_string();
@@ -1134,7 +1228,7 @@ fn boot_critical_joins_refused_resolves_accepted() {
         &ctx,
         &seat(13, "worker-3"),
         "begin",
-        &json!({"files": ["hooks/h.sh"], "joins": rid}),
+        &json!({"trigger": "owner_order", "files": ["hooks/h.sh"], "joins": rid}),
     )
     .unwrap_err();
     assert_eq!(e.code, "repair_precondition");
@@ -1150,7 +1244,7 @@ fn boot_critical_joins_refused_resolves_accepted() {
         &ctx,
         &seat(13, "worker-3"),
         "begin",
-        &json!({"files": ["hooks/h.sh"], "resolves": rid}),
+        &json!({"trigger": "owner_order", "files": ["hooks/h.sh"], "resolves": rid}),
     )
     .unwrap();
     let rprime = rp["repair"].as_str().unwrap().to_string();
@@ -1178,7 +1272,7 @@ fn boot_critical_joins_refused_resolves_accepted() {
         &r.ctx(T0 + 2.0, &hooks_boot, &pass),
         &seat(14, "worker"),
         "begin",
-        &json!({"files": ["hooks/h.sh"]}),
+        &json!({"trigger": "owner_order", "files": ["hooks/h.sh"]}),
     )
     .unwrap();
     assert_eq!(p["begin"], "picked-up");
@@ -1261,13 +1355,18 @@ fn unregister_hook_rules() {
             T0,
             &w,
             "begin",
-            json!({"unregister_hook": ["SessionStart:session-start.sh"]}),
+            json!({"trigger": "owner_order", "unregister_hook": ["SessionStart:session-start.sh"]}),
         )
         .unwrap_err();
     assert!(e.message.contains("생명줄"), "{}", e.message);
     if cys::repair::boot_critical::entries().is_empty() {
         let e = r
-            .call(T0, &w, "begin", json!({"unregister_hook": ["Stop:x.sh"]}))
+            .call(
+                T0,
+                &w,
+                "begin",
+                json!({"trigger": "owner_order", "unregister_hook": ["Stop:x.sh"]}),
+            )
             .unwrap_err();
         assert!(
             e.message.contains("보호장치 훅인지 가릴 수 없습니다"),
@@ -1280,13 +1379,15 @@ fn unregister_hook_rules() {
         &ctx,
         &w,
         "begin",
-        &json!({"files": ["hooks/h.sh"], "unregister_hook": ["Stop:x.sh"]}),
+        &json!({"trigger": "owner_order", "files": ["hooks/h.sh"], "unregister_hook": ["Stop:x.sh"]}),
     )
     .unwrap_err();
     assert_eq!(e.code, "repair_precondition");
     assert!(e.message.contains("두 수리로 나누세요"), "{}", e.message);
     assert_eq!(
-        r.call(T0, &w, "begin", json!({})).unwrap_err().code,
+        r.call(T0, &w, "begin", json!({"trigger": "owner_order"}))
+            .unwrap_err()
+            .code,
         "invalid_params"
     );
     for bad in [
@@ -1298,9 +1399,14 @@ fn unregister_hook_rules() {
         "St op:x.sh",
     ] {
         assert_eq!(
-            r.call(T0, &w, "begin", json!({"unregister_hook": [bad]}))
-                .unwrap_err()
-                .code,
+            r.call(
+                T0,
+                &w,
+                "begin",
+                json!({"trigger": "owner_order", "unregister_hook": [bad]})
+            )
+            .unwrap_err()
+            .code,
             "invalid_params",
             "{bad}"
         );
@@ -1315,7 +1421,7 @@ fn unregister_hook_rules() {
         &r.ctx(T0, &undecided, &pass),
         &w,
         "begin",
-        &json!({"files": ["bin/a.py"]}),
+        &json!({"trigger": "owner_order", "files": ["bin/a.py"]}),
     )
     .unwrap_err();
     assert_eq!(e.code, "repair_not_implemented");
@@ -1329,7 +1435,12 @@ fn commit_with_hook_line_refused_while_step_is_stub() {
     let r = rig("hookcommit");
     let w = seat(3, "worker");
     let id = r
-        .call(T0, &w, "begin", json!({"files": ["bin/a.py"]}))
+        .call(
+            T0,
+            &w,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["bin/a.py"]}),
+        )
         .unwrap()["repair"]
         .as_str()
         .unwrap()
@@ -1388,7 +1499,12 @@ fn corrupt_record_daemon_keeps_serving() {
     let r = rig("corrupt");
     let w = seat(3, "worker");
     let good = r
-        .call(T0, &w, "begin", json!({"files": ["bin/a.py"]}))
+        .call(
+            T0,
+            &w,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["bin/a.py"]}),
+        )
         .unwrap()["repair"]
         .as_str()
         .unwrap()
@@ -1465,7 +1581,12 @@ fn commit_is_bounded_and_never_unchecked() {
     let r = rig("bound");
     let w = seat(3, "worker");
     let id = r
-        .call(T0, &w, "begin", json!({"files": ["bin/a.py"]}))
+        .call(
+            T0,
+            &w,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["bin/a.py"]}),
+        )
         .unwrap()["repair"]
         .as_str()
         .unwrap()
@@ -1943,7 +2064,7 @@ fn status_summary_fields() {
             T0 + 10.0,
             &seat(13, "worker-3"),
             "begin",
-            json!({"files": ["bin/a.py"], "joins": id}),
+            json!({"trigger": "owner_order", "files": ["bin/a.py"], "joins": id}),
         )
         .unwrap();
     assert_eq!(j["begin"], "joins");
@@ -1970,4 +2091,613 @@ fn status_summary_fields() {
         .unwrap()
         .merge_lock
         .is_none());
+}
+
+// ───────────────────────────── RULINGS AD (review of T3) ─────────────────────────────
+
+static AD_INC: AtomicU64 = AtomicU64::new(0);
+
+/// A fresh (lane, incarnation) for the role-binding map, so tests never share entries.
+fn ad_daemon_key(tag: &str) -> (String, String) {
+    (
+        format!("ad-{tag}"),
+        format!(
+            "inc-{}-{}",
+            std::process::id(),
+            AD_INC.fetch_add(1, Ordering::Relaxed)
+        ),
+    )
+}
+
+/// AD1: a master that renames itself `worker-9` cannot `begin`; READ and INTAKE stay open to it.
+#[test]
+fn ad1_master_renamed_worker_cannot_begin() {
+    let r = rig("ad1-master");
+    let (lane, inc) = ad_daemon_key("m");
+    // first seen as master (its current role binds on the first repair call)
+    assert_eq!(
+        seat_caller(&lane, &inc, 41, Some("master".into())).bound_family,
+        Some(RoleFamily::Master)
+    );
+    // `cys claim-role worker-9` → the recording call in claim_role keeps the first family
+    assert_eq!(
+        record_role_claim(&lane, &inc, 41, Some("master"), "worker-9"),
+        Some(RoleFamily::Master)
+    );
+    let renamed = seat_caller(&lane, &inc, 41, Some("worker-9".into()));
+    assert_eq!(renamed.bound_family, Some(RoleFamily::Master));
+    let e = r
+        .call(
+            T0,
+            &renamed,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["bin/a.py"]}),
+        )
+        .unwrap_err();
+    assert_eq!(e.code, "acl_denied");
+    assert!(
+        e.message.contains("AD1") && e.message.contains("master"),
+        "{}",
+        e.message
+    );
+    assert!(!r.root.exists(), "a refused begin wrote something");
+    // READ / INTAKE unaffected
+    assert!(r.call(T0, &renamed, "list", json!({})).is_ok());
+    assert!(r
+        .call(
+            T0,
+            &renamed,
+            "report",
+            json!({"file": "bin/a.py", "error": "E: x"})
+        )
+        .is_ok());
+    // the plain worker of the same lane still begins
+    assert!(r
+        .call(
+            T0,
+            &seat(3, "worker"),
+            "begin",
+            json!({"trigger": "owner_order", "files": ["bin/a.py"]})
+        )
+        .is_ok());
+}
+
+/// AD1: a worker that renames itself `reviewer-claude-2` cannot sign a verification.
+#[test]
+fn ad1_worker_renamed_reviewer_cannot_verify() {
+    let r = rig("ad1-worker");
+    let (lane, inc) = ad_daemon_key("w");
+    let w = seat_caller(&lane, &inc, 42, Some("worker".into()));
+    let id = r
+        .call(
+            T0,
+            &w,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["bin/a.py"]}),
+        )
+        .unwrap()["repair"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    std::fs::write(r.pack.join("bin/a.py"), b"print('fixed')\n").unwrap();
+    r.call(T0 + 1.0, &w, "record", json!({"repair": id, "note": "n"}))
+        .unwrap();
+    record_role_claim(&lane, &inc, 42, Some("worker"), "reviewer-claude-2");
+    let renamed = seat_caller(&lane, &inc, 42, Some("reviewer-claude-2".into()));
+    assert_eq!(renamed.bound_family, Some(RoleFamily::Worker));
+    let e = r
+        .call(
+            T0 + 2.0,
+            &renamed,
+            "attest_verify",
+            json!({"repair": id, "verdict": "pass", "note": "mine"}),
+        )
+        .unwrap_err();
+    assert_eq!(e.code, "acl_denied");
+    assert!(e.message.contains("AD1"), "{}", e.message);
+    assert!(r.record_of(&id).verify.is_none());
+}
+
+/// AD1 (B2 over every round): a seat that recorded in round 1 cannot verify round 2, even when it
+/// later sits in a reviewer slot (a new daemon incarnation — no binding memory survives).
+#[test]
+fn ad1_round_one_fixer_cannot_verify_round_two() {
+    let r = rig("ad1-rounds");
+    let a = seat(21, "worker");
+    let id = r
+        .call(
+            T0,
+            &a,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["bin/a.py"]}),
+        )
+        .unwrap()["repair"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    r.call(
+        T0 + 1.0,
+        &a,
+        "record",
+        json!({"repair": id, "note": "round 1"}),
+    )
+    .unwrap();
+    r.call(
+        T0 + 2.0,
+        &seat(7, "reviewer-codex"),
+        "attest_verify",
+        json!({"repair": id, "verdict": "fail", "note": "still broken"}),
+    )
+    .unwrap();
+    release_seat(&r.ctx(T0 + 3.0, &general, &pass), 21);
+    let b = seat(22, "worker-2");
+    let p = r
+        .call(
+            T0 + 4.0,
+            &b,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["bin/a.py"]}),
+        )
+        .unwrap();
+    assert_eq!(p["begin"], "picked-up");
+    std::fs::write(r.pack.join("bin/a.py"), b"print('round 2')\n").unwrap();
+    let out = r
+        .call(
+            T0 + 5.0,
+            &b,
+            "record",
+            json!({"repair": id, "note": "round 2"}),
+        )
+        .unwrap();
+    assert_eq!(out["new_round"], true);
+    assert_eq!(r.record_of(&id).fixer_seats, [21, 22]);
+    // seat 21, now in the reviewer1 slot (first role of its new incarnation = reviewer)
+    let e = r
+        .call(
+            T0 + 6.0,
+            &seat(21, "reviewer-codex"),
+            "attest_verify",
+            json!({"repair": id, "verdict": "pass", "note": "looks fine"}),
+        )
+        .unwrap_err();
+    assert_eq!(e.code, "acl_denied");
+    assert!(e.message.contains("자기가 고친"), "{}", e.message);
+    // a seat that never fixed it verifies
+    assert!(r
+        .call(
+            T0 + 6.0,
+            &seat(7, "reviewer-codex"),
+            "attest_verify",
+            json!({"repair": id, "verdict": "pass", "note": "ok"}),
+        )
+        .is_ok());
+}
+
+/// AD1: a seat first seen without a role binds nothing; its first claim (`worker`) binds and works.
+#[test]
+fn ad1_roleless_seat_then_worker_works() {
+    let r = rig("ad1-roleless");
+    let (lane, inc) = ad_daemon_key("r");
+    let first = seat_caller(&lane, &inc, 43, None);
+    assert_eq!(first.bound_family, None, "an empty role binds nothing");
+    assert_eq!(
+        role_family("dept-helper"),
+        None,
+        "an unknown role binds nothing either"
+    );
+    assert_eq!(
+        record_role_claim(&lane, &inc, 43, None, "worker"),
+        Some(RoleFamily::Worker)
+    );
+    let w = seat_caller(&lane, &inc, 43, Some("worker".into()));
+    assert!(r
+        .call(
+            T0,
+            &w,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["bin/a.py"]})
+        )
+        .is_ok());
+    // the families of the table
+    for (role, fam) in [
+        ("master", RoleFamily::Master),
+        ("ceo", RoleFamily::Master),
+        ("worker-12", RoleFamily::Worker),
+        ("reviewer-gemini", RoleFamily::Reviewer),
+        ("cso-fresh-1700000000", RoleFamily::Cso),
+        ("planner", RoleFamily::Planner),
+    ] {
+        assert_eq!(role_family(role), Some(fam), "{role}");
+    }
+    // another incarnation (or lane) has its own memory
+    let (lane2, inc2) = ad_daemon_key("r2");
+    assert_eq!(
+        seat_caller(&lane2, &inc2, 43, Some("reviewer-codex".into())).bound_family,
+        Some(RoleFamily::Reviewer)
+    );
+}
+
+/// AD1 wiring: the daemon's recording call binds, a refused verb names the binding, and the entry
+/// goes with the surface (the close effect's release call); `handlers.rs` records at claim_role.
+#[test]
+fn ad1_binding_lives_on_the_daemon_and_dies_with_the_seat() {
+    let daemon = crate::team_gate_tests::tmp_daemon("t3-ad1", false);
+    note_role_claim(&daemon, 77, Some("master"), "worker-9");
+    let begin = |d: &Arc<Daemon>| -> Value {
+        let Reply::Single(v) = handle(
+            d,
+            "begin",
+            &json!({"trigger": "owner_order", "files": ["bin/a.py"]}),
+            &json!(1),
+            Some(77),
+            false,
+            None,
+        ) else {
+            panic!("single reply")
+        };
+        v
+    };
+    let v = begin(&daemon);
+    assert!(
+        v["error"]["message"].as_str().unwrap_or("").contains("AD1"),
+        "{v}"
+    );
+    release_locks_for_seat(&daemon, 77);
+    let v = begin(&daemon);
+    let msg = v["error"]["message"].as_str().unwrap_or("").to_string();
+    assert!(!msg.contains("AD1"), "the binding outlived the seat: {v}");
+    let handlers = include_str!("handlers.rs");
+    let arm = &handlers[handlers.find("\"system.claim_role\" => {").unwrap()..];
+    let arm = &arm[..arm.find("*srole = Some(final_role.clone());").unwrap()];
+    assert_eq!(
+        arm.matches("crate::repair::note_role_claim(daemon, sid, srole.as_deref(), &final_role);")
+            .count(),
+        1
+    );
+    assert_eq!(
+        handlers.matches("crate::repair::note_role_claim(").count(),
+        1
+    );
+}
+
+/// AD2: on Windows nothing about a seatless caller is observed, so the real decision gives
+/// `Detached` — and `revert` / `cleanup` answer the sentence that points to the app's button; the
+/// app's operator token still passes; on macOS the same caller gets the detached sentence.
+#[test]
+fn ad2_windows_seatless_refusal_is_reachable() {
+    let r = rig("ad2");
+    let windows_cli = seatless_caller(false, &SeatlessObservation::default());
+    assert_eq!(windows_cli.kind, CallerKind::Detached);
+    let app_button = seatless_caller(true, &SeatlessObservation::default());
+    for verb in ["revert", "cleanup"] {
+        let mut ctx = r.ctx(T0, &general, &pass);
+        ctx.windows = true;
+        let e = handle_with(&ctx, &windows_cli, verb, &json!({"repair": "R-1"})).unwrap_err();
+        assert_eq!(e.code, "acl_denied");
+        assert_eq!(e.message, WINDOWS_SEATLESS_REFUSAL_KO, "{verb}");
+        assert!(role_check(verb, &app_button, true).is_ok());
+        let e = role_check(verb, &windows_cli, false).unwrap_err();
+        assert_ne!(e.message, WINDOWS_SEATLESS_REFUSAL_KO);
+        assert!(e.message.contains("좌석도 터미널도 없는"), "{}", e.message);
+    }
+}
+
+/// AD3 / AD4: a committed deletion is checked by its state (no check child runs), the record says
+/// `absent-state`, the lane gets ONE File tombstone; a later repair that commits the path present
+/// removes it. A present target records the check kind that ran.
+#[test]
+fn ad3_ad4_deletion_is_tombstoned_and_checked_by_state() {
+    let r = rig("ad3");
+    let runs = AtomicU64::new(0);
+    let counting = |rel: &str, live: &Path, d: std::time::Duration| {
+        runs.fetch_add(1, Ordering::Relaxed);
+        pass(rel, live, d)
+    };
+    let call = |now: f64, who: &Caller, sub: &str, p: Value| {
+        handle_with(&r.ctx(now, &general, &counting), who, sub, &p)
+    };
+    let w = seat(3, "worker");
+    let id = call(
+        T0,
+        &w,
+        "begin",
+        json!({"trigger": "owner_order", "files": ["bin/a.py"]}),
+    )
+    .unwrap()["repair"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    std::fs::remove_file(r.pack.join("bin/a.py")).unwrap();
+    call(
+        T0 + 1.0,
+        &w,
+        "record",
+        json!({"repair": id, "note": "delete it"}),
+    )
+    .unwrap();
+    call(
+        T0 + 2.0,
+        &seat(7, "reviewer-codex"),
+        "attest_verify",
+        json!({"repair": id, "verdict": "pass", "note": "gone is right"}),
+    )
+    .unwrap();
+    call(T0 + 3.0, &w, "commit", json!({"repair": id})).unwrap();
+    assert_eq!(
+        runs.load(Ordering::Relaxed),
+        0,
+        "a check child ran for an absent target"
+    );
+    let rec = r.record_of(&id);
+    assert_eq!(
+        rec.checks,
+        [("bin/a.py".to_string(), "absent-state".to_string())]
+    );
+    let ts = cys::repair::tombstones::load_in(&r.root, &r.lane).unwrap();
+    assert_eq!(ts.len(), 1);
+    assert_eq!(ts[0].rel, "bin/a.py");
+    assert_eq!(ts[0].kind, cys::repair::tombstones::TombstoneKind::File);
+    assert_eq!(ts[0].repair.as_str(), id);
+    // a later repair brings the file back → the tombstone goes
+    let id2 = call(
+        T0 + 10.0,
+        &w,
+        "begin",
+        json!({"trigger": "owner_order", "files": ["bin/a.py"]}),
+    )
+    .unwrap()["repair"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(id2, id, "an in-force repair is not picked up (AD7)");
+    std::fs::write(r.pack.join("bin/a.py"), b"print('back')\n").unwrap();
+    call(
+        T0 + 11.0,
+        &w,
+        "record",
+        json!({"repair": id2, "note": "restore"}),
+    )
+    .unwrap();
+    call(
+        T0 + 12.0,
+        &seat(7, "reviewer-codex"),
+        "attest_verify",
+        json!({"repair": id2, "verdict": "pass", "note": "ok"}),
+    )
+    .unwrap();
+    call(T0 + 13.0, &w, "commit", json!({"repair": id2})).unwrap();
+    assert_eq!(runs.load(Ordering::Relaxed), 1);
+    assert!(cys::repair::tombstones::load_in(&r.root, &r.lane)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        r.record_of(&id2).checks,
+        [("bin/a.py".to_string(), "py-compile".to_string())]
+    );
+}
+
+/// AD4: the registrar's report confirms a hook line only when it wants it unregistered and every
+/// settings file it touched says so; anything else is no check (never claimed).
+#[test]
+fn ad4_hook_line_confirmed_only_by_the_registrar_report() {
+    use super::ledger_verbs::hook_line_confirmed;
+    use cys::repair::apply::{ReconcileHook, ReconcileReport};
+    let hook = |desired: &str, targets: &[&str]| ReconcileHook {
+        event: "Stop".into(),
+        script: "x.sh".into(),
+        lifeline: false,
+        desired: desired.into(),
+        targets: targets
+            .iter()
+            .map(|t| (PathBuf::from("/s/settings.json"), t.to_string()))
+            .collect(),
+    };
+    let rep = |h: Vec<ReconcileHook>| ReconcileReport { hooks: h };
+    assert!(hook_line_confirmed(
+        &rep(vec![hook(
+            "unregistered",
+            &["unregistered", "unregistered"]
+        )]),
+        "Stop",
+        "x.sh"
+    ));
+    assert!(!hook_line_confirmed(
+        &rep(vec![hook(
+            "unregistered",
+            &["unregistered", "refused:busy"]
+        )]),
+        "Stop",
+        "x.sh"
+    ));
+    assert!(!hook_line_confirmed(
+        &rep(vec![hook("unknown", &["unregistered"])]),
+        "Stop",
+        "x.sh"
+    ));
+    assert!(!hook_line_confirmed(
+        &rep(vec![hook("unregistered", &[])]),
+        "Stop",
+        "x.sh"
+    ));
+    assert!(!hook_line_confirmed(
+        &rep(vec![hook("unregistered", &["unregistered"])]),
+        "Stop",
+        "y.sh"
+    ));
+    assert!(!hook_line_confirmed(&rep(vec![]), "Stop", "x.sh"));
+}
+
+/// AD6: rule documents (C10 names, any folder, any case, `<x>_directive.md`) are refused at `begin`
+/// with the not-implemented sentence, and nothing is written.
+#[test]
+fn ad6_rule_documents_fail_closed() {
+    let r = rig("ad6");
+    let w = seat(3, "worker");
+    for rel in [
+        "soul.md",
+        "CLAUDE.md",
+        "agents/MASTER_DIRECTIVE.md",
+        "docs/route_contract.md",
+        "Vibecoding_Constitution.md",
+    ] {
+        assert!(is_rule_document(rel), "{rel}");
+        let e = r
+            .call(
+                T0,
+                &w,
+                "begin",
+                json!({"trigger": "owner_order", "files": ["bin/a.py", rel]}),
+            )
+            .unwrap_err();
+        assert_eq!(e.code, "repair_not_implemented", "{rel}");
+        assert!(e.message.contains("규칙 문서"), "{}", e.message);
+    }
+    for rel in [
+        "bin/a.py",
+        "_directive.md",
+        "soul.md.bak",
+        "docs/soul.markdown",
+    ] {
+        assert!(!is_rule_document(rel), "{rel}");
+    }
+    assert!(!r.root.exists(), "a refused begin wrote something");
+}
+
+/// AD10: `--trigger` is required (no default); nothing is written without it.
+#[test]
+fn ad10_begin_requires_a_trigger() {
+    let r = rig("ad10-trigger");
+    let e = r
+        .call(
+            T0,
+            &seat(3, "worker"),
+            "begin",
+            json!({"files": ["bin/a.py"]}),
+        )
+        .unwrap_err();
+    assert_eq!(e.code, "invalid_params");
+    assert!(e.message.contains("--trigger"), "{}", e.message);
+    assert!(!r.root.exists());
+    for t in ["owner_order", "owner-order", "update"] {
+        let r = rig("ad10-ok");
+        let b = r
+            .call(
+                T0,
+                &seat(3, "worker"),
+                "begin",
+                json!({"files": ["bin/a.py"], "trigger": t}),
+            )
+            .unwrap();
+        assert_eq!(b["begin"], "new", "{t}");
+    }
+}
+
+/// AD10 / R3: `commit` does not hold the per-repair mutex while its check child runs, and aborts
+/// when the record or the live file changed meanwhile (nothing committed, no lane row).
+#[test]
+fn ad10_commit_releases_the_mutex_around_the_check() {
+    fn prepared(tag: &str) -> (Rig, String) {
+        let r = rig(tag);
+        let w = seat(3, "worker");
+        let id = r
+            .call(
+                T0,
+                &w,
+                "begin",
+                json!({"trigger": "owner_order", "files": ["bin/a.py"]}),
+            )
+            .unwrap()["repair"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        std::fs::write(r.pack.join("bin/a.py"), b"print('fixed')\n").unwrap();
+        r.call(T0 + 1.0, &w, "record", json!({"repair": id, "note": "n"}))
+            .unwrap();
+        r.call(
+            T0 + 2.0,
+            &seat(7, "reviewer-codex"),
+            "attest_verify",
+            json!({"repair": id, "verdict": "pass", "note": "ok"}),
+        )
+        .unwrap();
+        (r, id)
+    }
+    let free_during_check = |r: &Rig, id: &str| -> bool {
+        let m = r
+            .mutexes
+            .lock()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .expect("the repair's mutex exists");
+        let free = m.try_lock().is_ok();
+        free
+    };
+    // (a) the mutex is free while the check runs; the commit then succeeds
+    let (r, id) = prepared("ad10-free");
+    let seen = std::sync::Mutex::new(None);
+    let check = |rel: &str, live: &Path, d: std::time::Duration| {
+        *seen.lock().unwrap() = Some(free_during_check(&r, &id));
+        pass(rel, live, d)
+    };
+    handle_with(
+        &r.ctx(T0 + 3.0, &general, &check),
+        &seat(3, "worker"),
+        "commit",
+        &json!({"repair": id}),
+    )
+    .unwrap();
+    assert_eq!(
+        *seen.lock().unwrap(),
+        Some(true),
+        "the mutex was held across the check child"
+    );
+    assert_eq!(r.record_of(&id).state, RepairState::Probation);
+    // (b) the record changes while the check runs → aborted, nothing committed
+    let (r, id) = prepared("ad10-record");
+    let check = |rel: &str, live: &Path, d: std::time::Duration| {
+        let mut rec = r.record_of(&id);
+        rec.methods.push("written meanwhile".into());
+        ledger::write_record_in(&r.root, &rec).unwrap();
+        pass(rel, live, d)
+    };
+    let e = handle_with(
+        &r.ctx(T0 + 3.0, &general, &check),
+        &seat(3, "worker"),
+        "commit",
+        &json!({"repair": id}),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, "target_changed");
+    assert!(
+        e.message.contains("수리 기록이 바뀌었습니다"),
+        "{}",
+        e.message
+    );
+    let rec = r.record_of(&id);
+    assert_eq!(rec.state, RepairState::InProgress);
+    assert!(rec.committed.is_empty() && rec.lock.is_some());
+    assert!(ledger::read_lane_in(&r.root, &rec.id, &r.lane)
+        .unwrap()
+        .is_none());
+    // (c) the live file changes while the check runs → aborted
+    let (r, id) = prepared("ad10-live");
+    let check = |rel: &str, live: &Path, d: std::time::Duration| {
+        std::fs::write(r.pack.join("bin/a.py"), b"print('moved')\n").unwrap();
+        pass(rel, live, d)
+    };
+    let e = handle_with(
+        &r.ctx(T0 + 3.0, &general, &check),
+        &seat(3, "worker"),
+        "commit",
+        &json!({"repair": id}),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, "target_changed");
+    assert!(
+        e.message.contains("살아 있는 파일이 바뀌었습니다"),
+        "{}",
+        e.message
+    );
+    assert_eq!(r.record_of(&id).state, RepairState::InProgress);
 }
