@@ -6352,6 +6352,17 @@ struct JournalEntry {
     rel: String,
     /// apply 전 파일이 존재했는가. false면 rollback 시 (신규 생성분) 삭제.
     existed: bool,
+    /// M15-가 (0.15.0 「스스로 해결」 · design §2-11 가, §4-15 가): the file's permission mode before the
+    /// apply ([`current_mode`], Unix only), restored exactly by [`rollback_journal`]. Before 0.15.0 the
+    /// rollback rewrote every journaled file with the plain writer, so every script came back without
+    /// its exec bit while `.pack-version` stayed old — no later install restored it, and the built-in
+    /// jobs guarded by `[ -x … ] || exit 0` stopped silently.
+    /// Optional on purpose, so the index stays readable in both directions: absent on Windows (no POSIX
+    /// mode — the JSON is then byte-identical to before) and in journals written by older binaries
+    /// (restore falls back to [`pack_target_mode`]); an older binary reading this field ignores it
+    /// (serde's default for unknown fields — neither struct denies them) and restores bytes as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mode: Option<u32>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -6378,6 +6389,8 @@ fn write_journal(
     for rel in backup_set {
         let src = dir.join(rel);
         if src.is_file() {
+            // M15-가: the mode is read before any write (tmp + rename drops it).
+            let mode = current_mode(&src);
             let bytes = std::fs::read(&src)
                 .map_err(|e| format!("journal 백업 읽기 실패 {}: {e}", src.display()))?;
             let dst = files_dir.join(rel);
@@ -6387,9 +6400,17 @@ fn write_journal(
             }
             write_atomic(&dst, &bytes)
                 .map_err(|e| format!("journal 백업 쓰기 실패 {}: {e}", dst.display()))?;
-            entries.push(JournalEntry { rel: rel.clone(), existed: true });
+            entries.push(JournalEntry {
+                rel: rel.clone(),
+                existed: true,
+                mode,
+            });
         } else {
-            entries.push(JournalEntry { rel: rel.clone(), existed: false });
+            entries.push(JournalEntry {
+                rel: rel.clone(),
+                existed: false,
+                mode: None,
+            });
         }
     }
     let index = JournalIndex {
@@ -6404,9 +6425,43 @@ fn write_journal(
     Ok(())
 }
 
+/// M15-가 (0.15.0 · design §4-15 가): put one journaled file back WITH its mode.
+/// - recorded mode → exactly that mode, set on the tmp descriptor before the rename
+///   ([`write_atomic_mode_exact`]: umask-independent, read back and verified);
+/// - no recorded mode (a journal written by an older binary; every entry on Windows) → the installer's
+///   single mode rule [`pack_target_mode`]`(current mode, bytes, true)`: an existing exec mode is kept,
+///   a `#!` file gets 0755, any other mode is kept (the design's second method, "되돌린 뒤 실행 권한
+///   처리를 다시 돈다").
+/// The bytes are the rollback's first duty: if the filesystem refuses the mode, the bytes are still
+/// restored (mode requested through `open(2)`, so never wider than asked) and the failure is printed —
+/// a mode never aborts a rollback halfway.
+fn restore_journaled_file(
+    target: &Path,
+    bytes: &[u8],
+    recorded: Option<u32>,
+) -> Result<(), String> {
+    let mode = recorded.or_else(|| pack_target_mode(current_mode(target), bytes, true));
+    match write_atomic_mode_exact(target, bytes, mode) {
+        Ok(()) => Ok(()),
+        Err(exact) if mode.is_some() => {
+            write_atomic_mode(target, bytes, mode)
+                .map_err(|e| format!("journal 복원 쓰기 실패 {}: {e}", target.display()))?;
+            eprintln!(
+                "[pack-journal] ⚠ mode {:04o} could not be set on {} ({exact}) — bytes restored, mode \
+                 as far as the filesystem allows",
+                mode.unwrap_or(0),
+                target.display()
+            );
+            Ok(())
+        }
+        Err(e) => Err(format!("journal 복원 쓰기 실패 {}: {e}", target.display())),
+    }
+}
+
 /// 저널에서 pre-state로 복원: existed=true는 백업 bytes를 원위치 atomic 복원, existed=false는
 /// (신규 생성분) 삭제. `.pack-version`은 저널에 없으므로 손대지 않는다(미커밋 = old 유지). 복원
 /// 후 저널 삭제. ★커밋 마커(.pack-version==target)가 아닐 때만 호출(recover_pack_journal이 판정).
+/// M15-가 (0.15.0): bytes AND mode — see [`restore_journaled_file`].
 pub fn rollback_journal() -> Result<(), String> {
     let jdir = pack_journal_dir();
     let index_path = jdir.join("index.json");
@@ -6425,8 +6480,7 @@ pub fn rollback_journal() -> Result<(), String> {
             if let Some(parent) = target.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            write_atomic(&target, &bytes)
-                .map_err(|e| format!("journal 복원 쓰기 실패 {}: {e}", target.display()))?;
+            restore_journaled_file(&target, &bytes, entry.mode)?;
         } else {
             match std::fs::remove_file(&target) {
                 Ok(()) => {}
@@ -11425,10 +11479,21 @@ mod tests {
         #[cfg(unix)]
         {
             let m = |rel: &str| post_modes.get(rel).map(|v| v.1);
-            assert_eq!(m("bin/tool.sh"), Some(0o755), "rollback stripped the exec bit of a #! script (M15-가)");
-            assert_eq!(m("secret.txt"), Some(0o600), "rollback widened a 0600 file (M15-가)");
+            assert_eq!(
+                m("bin/tool.sh"),
+                Some(0o755),
+                "rollback stripped the exec bit of a #! script (M15-가)"
+            );
+            assert_eq!(
+                m("secret.txt"),
+                Some(0o600),
+                "rollback widened a 0600 file (M15-가)"
+            );
         }
-        assert_eq!(pre_modes, post_modes, "rollback did not restore bytes AND modes of the pre-state (M15-가)");
+        assert_eq!(
+            pre_modes, post_modes,
+            "rollback did not restore bytes AND modes of the pre-state (M15-가)"
+        );
     }
 
     /// ★G3-축3 감사 원장 수명주기 핀: append-only(누적·트렁케이트 0)·라인당 유효 JSON 1건 +
@@ -11570,7 +11635,9 @@ mod tests {
 
     /// Bytes AND permission mode per file (`fingerprint_dir` compares bytes only). Modes are Unix-only;
     /// elsewhere the mode column is 0, so the comparison stays a byte comparison there.
-    fn fingerprint_dir_with_modes(root: &Path) -> std::collections::BTreeMap<String, (String, u32)> {
+    fn fingerprint_dir_with_modes(
+        root: &Path,
+    ) -> std::collections::BTreeMap<String, (String, u32)> {
         fingerprint_dir(root)
             .into_iter()
             .map(|(rel, h)| {
@@ -11622,7 +11689,11 @@ mod tests {
         for (rel, _, m) in &files {
             let got = post.get(*rel).map(|v| v.1);
             let shown = got.map(|g| format!("{g:04o}"));
-            assert_eq!(got, Some(*m), "{rel}: mode after rollback {shown:?}, pre-state {m:04o}");
+            assert_eq!(
+                got,
+                Some(*m),
+                "{rel}: mode after rollback {shown:?}, pre-state {m:04o}"
+            );
         }
         assert_eq!(pre, post, "rollback did not restore bytes AND modes");
         assert!(!journal_exists, "journal left behind after rollback");
@@ -11639,13 +11710,18 @@ mod tests {
         let _g = PACK_ENV_LOCK.lock().unwrap();
         let (base, pd, _env) = txn_prestate(
             "m15-orphan",
-            &[("bin/cys-dept", "#!/bin/bash\necho old\n"), ("README.md", "OLD-SOUL")],
+            &[
+                ("bin/cys-dept", "#!/bin/bash\necho old\n"),
+                ("README.md", "OLD-SOUL"),
+            ],
             "1.0.0",
         );
         m15_set_mode(&pd.join("bin/cys-dept"), 0o755);
         let pre = fingerprint_dir_with_modes(&pd);
-        let set: std::collections::BTreeSet<String> =
-            ["bin/cys-dept", "README.md", "new.txt"].iter().map(|s| (*s).to_string()).collect();
+        let set: std::collections::BTreeSet<String> = ["bin/cys-dept", "README.md", "new.txt"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
         write_journal("2.0.0", &set).expect("write_journal");
         // crash mid-apply: both files rewritten 0644, one new file created, marker still 1.0.0
         write_atomic(&pd.join("bin/cys-dept"), b"#!/bin/bash\necho partial\n").unwrap();
@@ -11657,10 +11733,20 @@ mod tests {
         let journal_exists = pack_journal_dir().exists();
         let _ = std::fs::remove_dir_all(&base);
 
-        assert_eq!(recovered.expect("recover_pack_journal"), true, "orphan journal not found");
+        assert_eq!(
+            recovered.expect("recover_pack_journal"),
+            true,
+            "orphan journal not found"
+        );
         let m = post.get("bin/cys-dept").map(|v| v.1).unwrap_or(0);
-        assert!(m & 0o111 != 0, "bin/cys-dept lost its exec bit in the boot-time recovery ({m:04o})");
-        assert_eq!(pre, post, "recovery did not restore bytes AND modes (new.txt must be gone too)");
+        assert!(
+            m & 0o111 != 0,
+            "bin/cys-dept lost its exec bit in the boot-time recovery ({m:04o})"
+        );
+        assert_eq!(
+            pre, post,
+            "recovery did not restore bytes AND modes (new.txt must be gone too)"
+        );
         assert!(!journal_exists, "journal left behind after recovery");
     }
 
@@ -11672,21 +11758,36 @@ mod tests {
         let _g = PACK_ENV_LOCK.lock().unwrap();
         let (base, pd, _env) = txn_prestate("m15-index", &[("bin/run.sh", "#!/bin/sh\n")], "1.0.0");
         m15_set_mode(&pd.join("bin/run.sh"), 0o750);
-        let set: std::collections::BTreeSet<String> =
-            ["bin/run.sh", "absent.txt"].iter().map(|s| (*s).to_string()).collect();
+        let set: std::collections::BTreeSet<String> = ["bin/run.sh", "absent.txt"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
         write_journal("2.0.0", &set).expect("write_journal");
         let raw = std::fs::read_to_string(pack_journal_dir().join("index.json")).unwrap();
         let _ = std::fs::remove_dir_all(&base);
 
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let entries = v["entries"].as_array().expect("entries");
-        let by_rel = |rel: &str| entries.iter().find(|e| e["rel"] == rel).cloned().expect(rel);
+        let by_rel = |rel: &str| {
+            entries
+                .iter()
+                .find(|e| e["rel"] == rel)
+                .cloned()
+                .expect(rel)
+        };
         let run = by_rel("bin/run.sh");
         assert_eq!(run["existed"], true);
-        assert_eq!(run["mode"].as_u64(), Some(0o750), "mode not recorded as an integer: {raw}");
+        assert_eq!(
+            run["mode"].as_u64(),
+            Some(0o750),
+            "mode not recorded as an integer: {raw}"
+        );
         let absent = by_rel("absent.txt");
         assert_eq!(absent["existed"], false);
-        assert!(absent.get("mode").is_none(), "a non-existing entry must carry no mode: {raw}");
+        assert!(
+            absent.get("mode").is_none(),
+            "a non-existing entry must carry no mode: {raw}"
+        );
     }
 
     /// Upgrade direction: a journal written by an older binary has no `mode`. It still parses, and the
@@ -11699,7 +11800,10 @@ mod tests {
         let _g = PACK_ENV_LOCK.lock().unwrap();
         let (base, pd, _env) = txn_prestate(
             "m15-legacy",
-            &[("bin/tool.sh", "#!/bin/sh\necho partial\n"), ("secret.txt", "PARTIAL")],
+            &[
+                ("bin/tool.sh", "#!/bin/sh\necho partial\n"),
+                ("secret.txt", "PARTIAL"),
+            ],
             "1.0.0",
         );
         m15_set_mode(&pd.join("bin/tool.sh"), 0o644); // the partial apply wrote it without the bit
@@ -11730,10 +11834,22 @@ mod tests {
 
         assert_eq!(recovered.expect("recover_pack_journal"), true);
         assert_eq!(tool, "#!/bin/sh\necho old\n");
-        assert_eq!(tool_mode, Some(0o755), "legacy entry: #! file must get its exec bit back");
+        assert_eq!(
+            tool_mode,
+            Some(0o755),
+            "legacy entry: #! file must get its exec bit back"
+        );
         assert_eq!(secret, "OLD-SECRET");
-        assert_eq!(secret_mode, Some(0o600), "legacy entry: a non-#! file keeps its current mode");
-        assert_eq!(gone.as_deref(), Some("GONE-BEFORE"), "legacy entry whose live copy vanished");
+        assert_eq!(
+            secret_mode,
+            Some(0o600),
+            "legacy entry: a non-#! file keeps its current mode"
+        );
+        assert_eq!(
+            gone.as_deref(),
+            Some("GONE-BEFORE"),
+            "legacy entry whose live copy vanished"
+        );
     }
 
     /// Downgrade direction: an index written by this binary (with `mode`) parses with the struct shape
@@ -11753,19 +11869,36 @@ mod tests {
             entries: Vec<OldEntry>,
         }
         let _g = PACK_ENV_LOCK.lock().unwrap();
-        let (base, pd, _env) = txn_prestate("m15-downgrade", &[("bin/tool.sh", "#!/bin/sh\n")], "1.0.0");
+        let (base, pd, _env) =
+            txn_prestate("m15-downgrade", &[("bin/tool.sh", "#!/bin/sh\n")], "1.0.0");
         m15_set_mode(&pd.join("bin/tool.sh"), 0o755);
-        let set: std::collections::BTreeSet<String> =
-            ["bin/tool.sh", "absent.txt"].iter().map(|s| (*s).to_string()).collect();
+        let set: std::collections::BTreeSet<String> = ["bin/tool.sh", "absent.txt"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
         write_journal("2.0.0", &set).expect("write_journal");
         let raw = std::fs::read_to_string(pack_journal_dir().join("index.json")).unwrap();
         let _ = std::fs::remove_dir_all(&base);
 
-        assert!(raw.contains("\"mode\""), "the new index must carry the mode field: {raw}");
-        let old: OldIndex = serde_json::from_str(&raw).expect("v0.14.56 shape must still parse the new index");
+        assert!(
+            raw.contains("\"mode\""),
+            "the new index must carry the mode field: {raw}"
+        );
+        let old: OldIndex =
+            serde_json::from_str(&raw).expect("v0.14.56 shape must still parse the new index");
         assert_eq!(old.target_version, "2.0.0");
-        let got: Vec<(String, bool)> = old.entries.into_iter().map(|e| (e.rel, e.existed)).collect();
-        assert_eq!(got, vec![("absent.txt".to_string(), false), ("bin/tool.sh".to_string(), true)]);
+        let got: Vec<(String, bool)> = old
+            .entries
+            .into_iter()
+            .map(|e| (e.rel, e.existed))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("absent.txt".to_string(), false),
+                ("bin/tool.sh".to_string(), true)
+            ]
+        );
     }
 
     /// ★핵심(R2CODE2 HIGH #1): pack-update 트랜잭션에서 .install-manifest.json write_atomic 실패
