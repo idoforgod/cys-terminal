@@ -1128,6 +1128,7 @@ jobs:
                    test_pyseal_negative_specimen \
                    test_preflight_hook_body test_preflight_npm_prefix test_learn_digest_queue \
                    test_trust_seed test_capgate_registration test_capgate_hook_shell \
+                   test_capgate_boot_critical \
                    test_cso_directive_rev test_role_authority test_role_authority_shell \
                    test_role_authority_triage \
                    test_round_stop_reason test_resource_gate test_resource_gate_fleet_cpu test_resource_gate_product_cpu \
@@ -2021,6 +2022,7 @@ jobs:
                    test_sandbox_state_isolation test_settings_torn_write test_state_snapshot_root test_cysd_accept_emfile \
                    test_preflight_hook_body test_preflight_npm_prefix test_learn_digest_queue \
                    test_trust_seed test_capgate_registration test_capgate_hook_shell \
+                   test_capgate_boot_critical \
                    test_cso_directive_rev test_role_authority test_role_authority_shell \
                    test_role_authority_triage \
                    test_round_stop_reason test_resource_gate test_resource_gate_fleet_cpu test_resource_gate_product_cpu \
