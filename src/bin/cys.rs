@@ -27992,7 +27992,8 @@ fn run_doctor_custom_report() -> i32 {
 }
 
 /// `run_doctor_custom_report` 의 마지막 안내(0.15.0 M2): 리포트는 자기 점검용이고, 고칠 것은 수리 흐름이 고친다.
-const CUSTOM_REPORT_NOTE: &str = "로컬 파일로만 저장했습니다(자동 전송 없음). 내 커스터마이즈 실태를 점검할 때 쓰고, \
+const CUSTOM_REPORT_NOTE: &str =
+    "로컬 파일로만 저장했습니다(자동 전송 없음). 내 커스터마이즈 실태를 점검할 때 쓰고, \
 고칠 것이 보이면 이 자비스의 수리 흐름(cys repair)으로 고칩니다.";
 
 #[cfg(test)]
@@ -28002,9 +28003,18 @@ mod t1b_repair_texts {
     /// 시험 계획 A §5 Tier-1 의 책임 전가 계열(창구 안내·밖으로 보내는 패치·만든 쪽 지목)과 종전 문장의 낱말.
     /// 낱말은 둘로 쪼개 적는다 — 이 시험의 소스 자체가 출하 문자열 전수 검색(A-1-05)에 걸리지 않게.
     const DEFERRAL: &[[&str; 2]] = &[
-        ["지원", " 채널"], ["홈페이지", " 문의"], ["저장소", " 이슈"], ["자발", " 제출"], ["제", "출"],
-        ["--pro", "pose"], ["제안", " 패치"], ["제작", "자"], ["벤", "더"], ["ven", "dor"],
-        ["업데이트를", " 기다"], ["이슈", "를"],
+        ["지원", " 채널"],
+        ["홈페이지", " 문의"],
+        ["저장소", " 이슈"],
+        ["자발", " 제출"],
+        ["제", "출"],
+        ["--pro", "pose"],
+        ["제안", " 패치"],
+        ["제작", "자"],
+        ["벤", "더"],
+        ["ven", "dor"],
+        ["업데이트를", " 기다"],
+        ["이슈", "를"],
     ];
 
     #[test]
@@ -28014,8 +28024,14 @@ mod t1b_repair_texts {
                 let d = pair.concat();
                 assert!(!note.contains(&d), "안내에 책임 전가 낱말 {d:?}: {note}");
             }
-            assert!(note.contains("cys repair"), "수리 장부(cys repair)를 가리키지 않는다: {note}");
-            assert!(note.contains("자동 전송 없음"), "자동 전송 없음 고지가 빠졌다: {note}");
+            assert!(
+                note.contains("cys repair"),
+                "수리 장부(cys repair)를 가리키지 않는다: {note}"
+            );
+            assert!(
+                note.contains("자동 전송 없음"),
+                "자동 전송 없음 고지가 빠졌다: {note}"
+            );
         }
     }
 
@@ -28031,7 +28047,10 @@ mod t1b_repair_texts {
         assert!(body("run_doctor_custom_report").contains("{CUSTOM_REPORT_NOTE}"));
         let old_a = ["지원", " 채널(홈페이지", " 문의/저장소", " 이슈)에 첨부"].concat();
         let old_b = ["지원", " 채널에 자발", " 제출"].concat();
-        assert!(!src.contains(&old_a) && !src.contains(&old_b), "종전 안내 문장이 남았다");
+        assert!(
+            !src.contains(&old_a) && !src.contains(&old_b),
+            "종전 안내 문장이 남았다"
+        );
     }
 }
 

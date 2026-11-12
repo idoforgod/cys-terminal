@@ -11428,11 +11428,18 @@ mod tests {
     /// (이름은 F10 당시의 것 — 0.15.0 M2 에서 계약이 바뀌었다: 안내는 밖으로 보내는 제안 경로 대신 수리 장부를 가리킨다.)
     #[test]
     fn f10_guidance_names_the_local_folder_and_the_existing_propose_route() {
-        for needle in ["~/.cys/local/hooks/<이벤트>.d/", "cys repair begin --files", "cys repair record"] {
+        for needle in [
+            "~/.cys/local/hooks/<이벤트>.d/",
+            "cys repair begin --files",
+            "cys repair record",
+        ] {
             assert!(HOOKS_LOCAL_GUIDANCE.contains(needle), "{needle}");
         }
         for old in [["--pro", "pose"].concat(), ["제안", " 패치"].concat()] {
-            assert!(!HOOKS_LOCAL_GUIDANCE.contains(&old), "옛 제안 경로가 남았다: {old}");
+            assert!(
+                !HOOKS_LOCAL_GUIDANCE.contains(&old),
+                "옛 제안 경로가 남았다: {old}"
+            );
         }
         assert!(!HOOKS_LOCAL_GUIDANCE.contains("pack-drift"), "만들지 않은 명령을 약속하지 않는다");
         assert!(!vendor_hook_hashes().is_empty(), "임베드 팩에 hooks/ 가 있다");
