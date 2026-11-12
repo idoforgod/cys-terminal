@@ -558,5 +558,37 @@ class DeliveryPartCapRoom(unittest.TestCase):
             self.assertLessEqual(units + self.ROLE_BLOCK_ROOM, self.BAR,
                                  "%s 축 %d 단위 + 역할 블록 %d > %d (RULINGS AA2)" % (axis, units, self.ROLE_BLOCK_ROOM, self.BAR))
 
+
+class NoMasterShortcutAnywhere(unittest.TestCase):
+    """RULINGS AH3 (AGREEMENT 28): no shipped directive OR skill text keeps a master / CEO implementation shortcut
+    ("사소한 마무리"는 master 가 직접 한다 류). 문장 단위가 아니라 낱말 묶음으로 잰다 — 금지문("§1-A 사소 예외 없이 금지")은
+    이 낱말을 쓰지 않는다."""
+    PHRASES = MASTER_SMALL_FIX + ("사소한 마무리", "한두 줄 수정처럼 위임 오버헤드", "직접 수정은 사소")
+
+    @classmethod
+    def hits(cls, texts):
+        return sorted({(rel, ph) for rel, text in texts.items() for ph in cls.PHRASES if ph in norm(text)})
+
+    def shipped(self):
+        pack = os.path.dirname(DIRECTIVES_DIR)
+        out = {}
+        for top in ("directives", "skills"):
+            for root, _d, files in os.walk(os.path.join(pack, top)):
+                for f in files:
+                    if f.endswith(".md"):
+                        p = os.path.join(root, f)
+                        with open(p, encoding="utf-8", errors="replace") as fh:
+                            out[os.path.relpath(p, pack)] = fh.read()
+        return out
+
+    def test_no_shortcut_in_any_directive_or_skill(self):
+        texts = self.shipped()
+        self.assertTrue(any(k.startswith("skills" + os.sep) for k in texts), "스킬 텍스트를 읽지 못했다(시험 무효)")
+        self.assertEqual(self.hits(texts), [], "master 직접 수정 허용이 출하 텍스트에 남았다")
+
+    def test_detector_fires_on_a_planted_shortcut(self):
+        planted = {"skills/x/SKILL.md": "master는 직접 구현하지 않는다\n  (사소한 마무리 제외)."}
+        self.assertEqual(self.hits(planted), [("skills/x/SKILL.md", "사소한 마무리")])
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
