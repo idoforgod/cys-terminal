@@ -168,23 +168,53 @@ class LedgerKinds(Rig):
         with open(log, encoding="utf-8") as f:
             return [json.loads(line) for line in f]
 
+    def delivered(self):
+        p = os.path.join(self.pack, "state", "merge-notice-delivered.json")
+        if not os.path.exists(p):
+            return {}
+        with open(p, encoding="utf-8") as f:
+            return json.load(f)
+
     def test_parked_merge_task_one_key_per_parked_set(self):
+        # ★r2(RULINGS AC7): 같은 보관 집합은 **한 번만** 적재한다(배달한 지문을 레인 상태에 둔다) — 종전 r1 은 매 점검마다
+        #   적재를 시도하고 큐의 멱등 키에 기댔는데, 그 키는 대기 중일 때만 묶어 배달 뒤에는 같은 과제가 다시 왔다.
         log = self._wake_rig()
         self.ledger({"bin/a.py": {"kind": "user-kept", "side": "bin/a.py.new", "version": "0.15.0", "ts": 1}})
         self.run_check("c62_pack_heal_ledger", "C62")
         self.run_check("c62_pack_heal_ledger", "C62")
+        self.run_check("c62_pack_heal_ledger", "C62")
         w = [x for x in self.wakes(log) if "parked-merge" in x]
-        self.assertEqual(len(w), 2, "두 실행 모두 적재 시도 — 같은 키라 큐가 하나로 묶는다")
+        self.assertEqual(len(w), 1, "같은 보관 집합은 한 번만(배달 뒤 다시 적재하지 않는다)")
         k = lambda a: a[a.index("--idempotency-key") + 1]  # noqa: E731
-        self.assertEqual(k(w[0]), k(w[1]), "같은 보관 집합 = 같은 멱등 키(부서당 과제 하나)")
         self.assertIn("pack", k(w[0]), "키에 레인(팩 이름)이 들어간다")
+        self.assertIn(k(w[0]).rsplit("-", 1)[1], self.delivered().get("parked-merge", ""), "지문이 레인 상태에 기록된다")
+        self.assertIn("master", w[0], "master 큐 — master 가 워커에게 위임")
+        self.assertTrue(any("직접 병합 금지" in a for a in w[0]))
         self.ledger({"bin/a.py": {"kind": "user-kept", "side": "bin/a.py.new", "version": "0.15.0", "ts": 1},
                      "bin/c.py": {"kind": "user-kept", "side": "bin/c.py.new", "version": "0.15.0", "ts": 1}})
         self.run_check("c62_pack_heal_ledger", "C62")
+        self.run_check("c62_pack_heal_ledger", "C62")
         w = [x for x in self.wakes(log) if "parked-merge" in x]
-        self.assertNotEqual(k(w[-1]), k(w[0]), "집합이 바뀌면 새 과제")
-        self.assertIn("master", w[0], "master 큐 — master 가 워커에게 위임")
-        self.assertTrue(any("직접 병합 금지" in a for a in w[0]))
+        self.assertEqual(len(w), 2, "집합이 바뀌면 새 과제 한 번")
+        self.assertNotEqual(k(w[-1]), k(w[0]))
+        # 집합이 비면 기록을 지운다 — 같은 수정이 나중에 다시 보관되면 다시 보인다.
+        self.ledger({})
+        self.run_check("c62_pack_heal_ledger", "C62")
+        self.assertNotIn("parked-merge", self.delivered())
+        self.ledger({"bin/a.py": {"kind": "user-kept", "side": "bin/a.py.new", "version": "0.15.0", "ts": 1}})
+        self.run_check("c62_pack_heal_ledger", "C62")
+        self.assertEqual(len([x for x in self.wakes(log) if "parked-merge" in x]), 3)
+
+    def test_failed_enqueue_is_retried_not_recorded(self):
+        log = self._wake_rig()
+        wk = os.path.join(self.pack, "bin", "javis_wakeup.py")
+        with open(wk, "w", encoding="utf-8") as f:
+            f.write("import sys,json\nopen(%r,'a').write(json.dumps(sys.argv[1:])+'\\n')\nsys.exit(1)\n" % log)
+        self.ledger({"bin/a.py": {"kind": "user-kept", "side": "bin/a.py.new", "version": "0.15.0", "ts": 1}})
+        self.run_check("c62_pack_heal_ledger", "C62")
+        self.assertEqual(self.delivered(), {}, "적재 실패는 기록하지 않는다")
+        self.run_check("c62_pack_heal_ledger", "C62")
+        self.assertEqual(len([x for x in self.wakes(log) if "parked-merge" in x]), 2, "다음 점검이 다시 시도한다")
 
     def test_legacy_user_list_shown_once_per_set(self):
         log = self._wake_rig()
@@ -194,9 +224,9 @@ class LedgerKinds(Rig):
         self.run_check("c62_pack_heal_ledger", "C62")
         self.run_check("c62_pack_heal_ledger", "C62")
         w = [x for x in self.wakes(log) if "legacy-user-list" in x]
-        self.assertEqual(len(w), 2)
-        self.assertEqual(w[0][w[0].index("--idempotency-key") + 1], w[1][w[1].index("--idempotency-key") + 1])
+        self.assertEqual(len(w), 1, "예전 .user 목록은 주인에게 한 번만(RULINGS AC7)")
         self.assertTrue(any("cys pack-adopt" in a for a in w[0]), "목록 = 되살리기 명령의 모의 판정")
+        self.assertIn("legacy-user-list", self.delivered())
 
     def test_report_mode_enqueues_nothing(self):
         log = self._wake_rig()

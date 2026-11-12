@@ -428,8 +428,15 @@ def _cys_local_json(args, timeout=TOMBSTONE_QUERY_TIMEOUT_S):
         return None
 
 
+# 컴파일된 목록이 생명줄로 답해야 할 다섯 이름(여섯 중 상태줄은 목록 밖 — O-C4-4 · 상태줄은 아래 이름 검사가 따로 지킨다).
+EXPECTED_LIFELINES = ("session-start.sh", "role-bootstrap.sh", "inject-context.sh", "save-state.sh",
+                      "role-capability-gate.sh")
+
+
 def lane_lifeline_scripts():
-    """생명줄 훅 스크립트 basename 집합(컴파일된 목록의 lifeline 항목). 조회 불가 = None(모름)."""
+    """생명줄 훅 스크립트 basename 집합. ★RULINGS AC7: 컴파일된 목록이 다섯 이름(`EXPECTED_LIFELINES`)을 **모두**
+    생명줄로 답할 때만 '안다' — 그때는 다섯을 이름으로 지킨다(목록의 표시 하나가 빠져 그 훅이 묘비로 벗겨지는 일이 없게).
+    하나라도 빠지거나 조회가 안 되면 None(모름 = 어떤 훅 묘비도 적용하지 않는다)."""
     if "lifelines" in _TOMB_CACHE:
         return _TOMB_CACHE["lifelines"]
     data = _cys_local_json(["repair", "boot-critical", "--list", "--json"])
@@ -438,7 +445,8 @@ def lane_lifeline_scripts():
     if isinstance(entries, list):
         found = {os.path.basename(str(e.get("rel") or "").replace("\\", "/"))
                  for e in entries if isinstance(e, dict) and e.get("lifeline") is True}
-        out = found or None      # 생명줄 0 = 계약 위반(여섯 고정) → 모름으로 접는다
+        if set(EXPECTED_LIFELINES) <= found:
+            out = frozenset(EXPECTED_LIFELINES) | frozenset(found)
     _TOMB_CACHE["lifelines"] = out
     return out
 
@@ -517,12 +525,12 @@ def tombstoned_hook(event, script, fresh=False):
     return repair
 
 
-def _write_json_lf_atomic(path, data):
+def _write_json_lf_atomic(path, data, prefix=".schedule."):
     """★H6(2)·§4-10 — preflight 의 `schedule.json` 쓰기: 같은 디렉터리 임시 파일 + 원자 교체, **LF**(윈도우
     텍스트 모드의 CRLF 금지). 잠금은 더하지 않는다(RULINGS H6(2) "no lock added"). 원본 권한을 이어받는다
     (mkstemp 의 0600 으로 좁히지 않는다). 내용 바이트는 종전(`json.dumps(…, indent=2)` · 끝 개행 없음)과 같다."""
     d = os.path.dirname(os.path.abspath(path)) or "."
-    fd, tmp = tempfile.mkstemp(dir=d, prefix=".schedule.", suffix=".tmp")
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=prefix, suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
             f.write(json.dumps(data, ensure_ascii=False, indent=2))
@@ -988,8 +996,10 @@ PACK_DIR_ENV_KEYS = ("CYS_PACK_DIR", "JAVIS_PACK_DIR", "AITERM_PACK_DIR", "AITER
 MERGE_LEDGER_KINDS = ("healed", "new-pending", "kept-drift", "merged",
                       "conflicted", "quarantined", "adopted",
                       "user-kept", "vendor-first")
-# C68 기한 제외 kind — kept-drift·merged(at-rest 보존)·adopted(복권 확정 = 스윕 대기 정상 체류).
-C68_EXEMPT_KINDS = ("kept-drift", "merged", "adopted")
+# C68 기한 제외 kind — kept-drift·merged(at-rest 보존)·adopted(복권 확정 = 스윕 대기 정상 체류)·
+# ★0.15.0 user-kept(사용자가 이겼다 — 살아 있는 파일이 사용자 것이고 합치기 과제는 C62·부서당 과제 하나로 이미
+# 전달된다. 기한 초과를 이유로 master 를 날마다 깨우지 않는다 — RULINGS AC7).
+C68_EXEMPT_KINDS = ("kept-drift", "merged", "adopted", "user-kept")
 
 
 def pack_dir():
@@ -6192,8 +6202,10 @@ class Preflight:
                         if isinstance(v, dict) and v.get("kind") in ("healed", "conflicted")
                         and os.path.isfile(os.path.join(pack_dir(), r + ".user")))
         jobs = []
+        fps = {}
         if parked:
             fp = hashlib.sha1("\n".join(parked).encode("utf-8")).hexdigest()[:16]
+            fps["parked-merge"] = fp
             jobs.append(("parked-merge",
                          "업데이트가 보관한 수정 %d건(%s) — 워커 1명에게 부서당 과제 하나로 맡겨라: "
                          "user-kept 는 합치기(cys pack-merge), vendor-first 는 승인 절차로 다시 입히기"
@@ -6202,20 +6214,47 @@ class Preflight:
                          "parked-merge-%s-%s" % (lane, fp)))
         if legacy:
             fp = hashlib.sha1("\n".join(legacy).encode("utf-8")).hexdigest()[:16]
+            fps["legacy-user-list"] = fp
             jobs.append(("legacy-user-list",
                          "예전 업데이트가 .user 로 밀어낸 수정 %d건(%s) — 주인에게 목록(`cys pack-adopt`)을 "
                          "한 번 보여 주고, 워커 1명에게 부서당 과제 하나로 평가를 맡겨라(진짜 수정만 수리 흐름으로 "
                          "다시 입힘 · 기동 필수는 승인 절차 · 판독 불가는 UTF-8 로 바꿔서 · 무조건 되살리기 금지)"
                          % (len(legacy), lane),
                          "legacy-user-list-%s-%s" % (lane, fp)))
+        # ★RULINGS AC7: 같은 집합은 **한 번만** 보인다 — 배달한 지문을 레인 상태(`<팩>/state/`)에 둔다. 큐의 멱등 키는
+        #   대기 중일 때만 묶으므로, 지문 기록 없이는 배달 뒤 다음 점검이 같은 목록을 다시 적재한다. 집합이 바뀌면 새로
+        #   보이고, 집합이 비면 기록을 지운다(같은 수정이 나중에 다시 보관되면 다시 보인다). 적재가 실패하면 기록하지
+        #   않는다(다음 점검이 다시 시도).
+        state_p = os.path.join(pack_dir(), "state", "merge-notice-delivered.json")
+        try:
+            with open(state_p, encoding="utf-8") as f:
+                delivered = json.load(f)
+            if not isinstance(delivered, dict):
+                delivered = {}
+        except Exception:
+            delivered = {}
+        before = dict(delivered)
+        for task in list(delivered):
+            if task not in fps:
+                del delivered[task]
         for task, reason, key in jobs:
+            if delivered.get(task) == fps[task]:
+                continue
             try:
-                subprocess.run(
+                r = subprocess.run(
                     [sys.executable, wakeup, "enqueue", "--to", "master", "--task", task,
                      "--reason", reason, "--idempotency-key", key],
                     capture_output=True, text=True, timeout=10, env=_utf8_env())
+                if r.returncode == 0:
+                    delivered[task] = fps[task]
             except Exception:
                 pass   # 관측 채널 — 실패가 점검을 막지 않는다(C62 WARN 은 그대로 남는다)
+        if delivered != before:
+            try:
+                os.makedirs(os.path.dirname(state_p), exist_ok=True)
+                _write_json_lf_atomic(state_p, delivered, prefix=".merge-notice.")
+            except Exception:
+                pass
 
     # ── C68 병합 원장 체류 기한 게이트 (★W-D1 커스텀 생존 2026-07-17) ──
     # 고지 채널은 실측으로 반증됐다(원장 항목 9주 체류 — C62 WARN·init-pack 보고 줄이 있었는데도).

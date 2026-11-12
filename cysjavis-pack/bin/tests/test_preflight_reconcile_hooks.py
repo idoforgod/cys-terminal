@@ -164,6 +164,27 @@ class ReconcileMode(Rig):
         for t in self.targets:
             self.assertTrue(self.present(t, "PostToolUse", "pack-guard.sh"), "되돌린 뒤 다시 등록돼야 한다")
 
+    def test_lifeline_answer_is_unknown_unless_all_five_names_are_present(self):
+        # ★RULINGS AC7: 목록이 다섯 생명줄 중 하나라도 생명줄로 답하지 않으면 '모름' = 어떤 훅 묘비도 적용하지 않는다
+        #   (그 하나가 묘비로 벗겨지는 일이 없게). 다섯이 다 있으면 다섯을 이름으로 지킨다.
+        with open(self.life, "w", encoding="utf-8") as f:
+            json.dump([{"rel": "hooks/" + n, "category": "hook", "lifeline": n != "role-capability-gate.sh"}
+                       for n in LIFELINE_FILES], f)
+        pf._TOMB_CACHE.clear()
+        self.assertIsNone(pf.lane_lifeline_scripts(), "다섯 중 하나가 빠지면 모름")
+        self.set_tombs(hooks=[("PreToolUse", "role-capability-gate.sh", "R-5"),
+                              ("PostToolUse", "pack-guard.sh", "R-6")])
+        self.assertIsNone(pf.tombstoned_hook("PreToolUse", "role-capability-gate.sh"), "모름 → 묘비 미적용")
+        self.assertIsNone(pf.tombstoned_hook("PostToolUse", "pack-guard.sh"), "모름 → 어떤 훅 묘비도 미적용")
+        with open(self.life, "w", encoding="utf-8") as f:
+            json.dump([{"rel": "hooks/" + n, "category": "hook", "lifeline": True} for n in LIFELINE_FILES], f)
+        pf._TOMB_CACHE.clear()
+        self.assertEqual(set(pf.lane_lifeline_scripts()), set(LIFELINE_FILES))
+        self.set_tombs(hooks=[("PreToolUse", "role-capability-gate.sh", "R-5"),
+                              ("PostToolUse", "pack-guard.sh", "R-6")])
+        self.assertIsNone(pf.tombstoned_hook("PreToolUse", "role-capability-gate.sh"), "생명줄은 이름으로 지킨다")
+        self.assertEqual(pf.tombstoned_hook("PostToolUse", "pack-guard.sh"), "R-6", "생명줄 아닌 훅 묘비는 적용")
+
     def test_lifelines_never_removed_whatever_the_tombstones_say(self):
         self.set_tombs(hooks=[("SessionStart", "session-start.sh", "R-1"),
                               ("SessionStart", "inject-context.sh", "R-1"),
