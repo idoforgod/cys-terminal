@@ -18,6 +18,11 @@
      (이름이 갈리면 판독기가 파일을 못 찾아 조용히 SKIP 된다 — 가장 비싼 무증상 실패다.)
   ④ 판독기 대칭 — 한쪽 형상에서 뜬 매니페스트를 다른 형상 트리에 대면 반드시 불일치를 낸다
      (스키마가 같다는 것이 "아무 트리나 통과한다"는 뜻이 아님을 못박는다).
+  ⑧ Rust 포트 파리티(0.15.0 · 「스스로 해결」 M16 · RULINGS O-C12-2 (a)) — 앱 업데이트 처리부의 번들 수정
+     감지는 classify 의 Rust 포트다(src-tauri/src/bundle_edits.rs · 프로세스를 띄우지 않는다). 공유 픽스처
+     `fixtures/runtime-seal-rust-parity.json` 의 manifest_entries 가 이 모듈 emitter 의 산출이고 expected 가 이
+     모듈 classify 의 답임을 여기서, 같은 트리에서 Rust 가 같은 entries·같은 답을 냄을 Rust 시험(tests::parity_*)이
+     단언한다 — 어느 한쪽만 바뀌어도 둘 중 하나가 붉어진다(RustPortParityTests).
 
 파일 부재는 SKIP 이 아니라 실패다 — 배선이 사라진 것이 이 검체가 잡아야 할 사고다.
 
@@ -236,6 +241,118 @@ class ManifestSchemaParityTests(unittest.TestCase):
             res = json.load(f)["bundle"]["resources"]
         self.assertIn("resources/%s" % rs.MANIFEST_BASENAME, res,
                       "Windows 번들이 매니페스트를 싣지 않는다 — 설치본에 파일이 없다")
+
+
+
+# ── ⑧ Rust 포트 파리티 (0.15.0 · 「스스로 해결」 M16 · RULINGS O-C12-2 (a)) ──────────────
+FIXTURE = os.path.join(TESTS_DIR, "fixtures", "runtime-seal-rust-parity.json")
+RUST_LEG = os.path.join(REPO, "src-tauri", "src", "bundle_edits.rs")
+
+
+def _win_exec(name):
+    """CPython 의 윈도우 stat 흉내(Modules/posixmodule.c:update_st_mode_from_path): 이름의 마지막 점부터가
+    .exe/.bat/.cmd/.com(대소문자 무시)일 때만 실행 비트 — 윈도우 매니페스트는 러너의 CPython 이 뜬다."""
+    i = name.rfind(".")
+    return i >= 0 and name[i:].lower() in (".exe", ".bat", ".cmd", ".com")
+
+
+def _platform_entries(entries):
+    """픽스처는 유닉스 실행 비트를 담는다 — 윈도우에서는 CPython 이 보고하는 값으로 바꿔 본다."""
+    out = json.loads(json.dumps(entries))
+    if os.name == "nt":
+        for rel, ent in out.items():
+            if ent.get("t") == "f":
+                ent["x"] = _win_exec(rel.rsplit("/", 1)[-1])
+    return out
+
+
+def _materialize(spec, root):
+    """픽스처 트리 명세(f 파일 · l 링크 · p fifo)를 만든다. 이 플랫폼에서 못 만드는 종류면 False."""
+    os.makedirs(root, exist_ok=True)
+    for rel in sorted(spec):
+        ent = spec[rel]
+        p = os.path.join(root, *rel.split("/"))
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        if ent["t"] == "f":
+            with open(p, "wb") as f:
+                f.write(ent["text"].encode("utf-8"))
+            if os.name != "nt":
+                os.chmod(p, 0o755 if ent["x"] else 0o644)
+        elif ent["t"] == "l":
+            if os.name == "nt":
+                return False
+            os.symlink(ent["target"], p)
+        elif ent["t"] == "p":
+            if not hasattr(os, "mkfifo"):
+                return False
+            os.mkfifo(p)
+            os.chmod(p, ent["mode"])
+        else:
+            raise AssertionError("픽스처의 모르는 종류 %r" % (ent,))
+    return True
+
+
+class RustPortParityTests(unittest.TestCase):
+    """★공유 픽스처의 두 사실을 Python 참조 구현으로 잰다(Rust 쪽은 같은 픽스처로 같은 답을 단언한다).
+    픽스처 부재·0건은 SKIP 이 아니라 실패다(측정 불능은 통과가 아니다)."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(FIXTURE, encoding="utf-8") as f:
+            cls.fx = json.load(f)
+        cls.cases = cls.fx["cases"]
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="rtman-rust-parity-")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _runnable(self):
+        return [c for c in self.cases if not (c["unix_only"] and os.name == "nt")]
+
+    def test_fixture_entries_are_the_emitters_output(self):
+        ran = 0
+        for c in self._runnable():
+            root = os.path.join(self.tmp, "s-" + c["name"], "runtime")
+            self.assertTrue(_materialize(c["shipped"], root), c["name"])
+            got = rs.build_manifest(root)["entries"]
+            self.assertEqual(_platform_entries(c["manifest_entries"]), got,
+                             "%s: 픽스처의 manifest_entries 가 emitter 산출과 다르다 — emitter 가 바뀌었으면 Rust 포트를 "
+                             "다시 맞추고 픽스처를 새로 뜬다. 실측: %s" % (c["name"], json.dumps(got, ensure_ascii=False)))
+            ran += 1
+        self.assertGreaterEqual(ran, 4 if os.name != "nt" else 2, "잰 사례가 %d 건뿐이다" % ran)
+
+    def test_fixture_expected_is_what_classify_answers(self):
+        ran = 0
+        for c in self._runnable():
+            root = os.path.join(self.tmp, "f-" + c["name"], "runtime")
+            self.assertTrue(_materialize(c["found"], root), c["name"])
+            entries = _platform_entries(c["manifest_entries"])
+            entries.update(c["manifest_patch"])
+            got = rs.classify({"schema": rs.SCHEMA, "entries": entries}, root)
+            self.assertEqual(c["expected"], got, "%s: classify 의 답이 픽스처 expected 와 다르다 — 실측: %s"
+                             % (c["name"], json.dumps(got, ensure_ascii=False)))
+            ran += 1
+        self.assertGreaterEqual(ran, 4 if os.name != "nt" else 2, "잰 사례가 %d 건뿐이다" % ran)
+
+    def test_fixture_is_not_vacuous(self):
+        for k in ("missing", "added", "changed"):
+            self.assertTrue(any(c["expected"][k] for c in self.cases), "%s 갈래를 가진 사례가 없다" % k)
+        text = json.dumps(self.fx, ensure_ascii=False)
+        for needle in ('"t": "l"', '"t": "p"', "__pycache__", ".prev4213", ".prev2.exe", "홍길동",
+                       "sub/runtime-manifest.json", "not-an-object"):
+            self.assertIn(needle, text, "픽스처에서 %r 이 사라졌다" % needle)
+
+    def test_the_rust_leg_reads_the_same_fixture(self):
+        self.assertTrue(os.path.isfile(RUST_LEG), "Rust 포트가 사라졌다: %s" % RUST_LEG)
+        src = read(RUST_LEG)
+        self.assertIn('include_str!("../../cysjavis-pack/bin/tests/fixtures/runtime-seal-rust-parity.json")', src,
+                      "Rust 쪽 파리티 시험이 이 픽스처를 읽지 않는다")
+        for name in ("fn parity_walk_reproduces_the_python_emitter_entries(",
+                     "fn parity_classify_matches_python_on_the_fixture(",
+                     "fn parity_python_reference_functions_unchanged("):
+            self.assertIn(name, src, "Rust 쪽 파리티 시험 %s 이 사라졌다" % name)
 
 
 if __name__ == "__main__":

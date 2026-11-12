@@ -1,0 +1,512 @@
+{
+ "about": "Shared fixture of the Rust port of javis_runtime_seal.classify (0.15.0 · M16 · O-C12-2). 'manifest_entries' = javis_runtime_seal.build_manifest(<shipped tree>)['entries'] and 'expected' = javis_runtime_seal.classify({'schema': 1, 'entries': manifest_entries + manifest_patch}, <found tree>), both produced by the Python reference. Python leg: cysjavis-pack/bin/tests/test_runtime_manifest_parity.py (RustPortParityTests); Rust leg: src-tauri/src/bundle_edits.rs (tests::parity_*). Tree spec kinds: f = file {text (UTF-8), x = exec bit on Unix}, l = symbolic link {target}, p = fifo {mode}. 'not_edits' = what the capture's filter drops (updater leftovers, __pycache__).",
+ "schema": 1,
+ "cases": [
+  {
+   "name": "edits-leftovers-pycache-korean",
+   "unix_only": false,
+   "shipped": {
+    "python/bin/python3": {
+     "t": "f",
+     "text": "ELF-python\n",
+     "x": true
+    },
+    "python/lib/site.py": {
+     "t": "f",
+     "text": "import os\n",
+     "x": false
+    },
+    "python/lib/mod.py": {
+     "t": "f",
+     "text": "print(1)\n",
+     "x": false
+    },
+    "git/bin/bash.exe": {
+     "t": "f",
+     "text": "MZ-bash\n",
+     "x": true
+    },
+    "git/bin/msys-2.0.dll": {
+     "t": "f",
+     "text": "MZ-msys\n",
+     "x": false
+    },
+    "node/lib/npm-cli.js": {
+     "t": "f",
+     "text": "#!/usr/bin/env node\n",
+     "x": false
+    }
+   },
+   "manifest_entries": {
+    "git/bin/bash.exe": {
+     "t": "f",
+     "sha256": "b7487ccb2283d5e14f5b8d50cb602c2e9c87e0c95c81b93dce400dfdfcaf41b1",
+     "x": true
+    },
+    "git/bin/msys-2.0.dll": {
+     "t": "f",
+     "sha256": "5241c09c1db532bb04573a15d42e3dea1b3f5cc0ecce3284aeabf20d91232f12",
+     "x": false
+    },
+    "node/lib/npm-cli.js": {
+     "t": "f",
+     "sha256": "a59c47872b71f12589942892464e764c0db350c20b72228645615cc36e0a0725",
+     "x": false
+    },
+    "python/bin/python3": {
+     "t": "f",
+     "sha256": "e5487c9a28ce85e11093bf700de57c4e10ac1eab2ca580577fced734e19a0475",
+     "x": true
+    },
+    "python/lib/mod.py": {
+     "t": "f",
+     "sha256": "cc42155088fca5730758db72b2a5bca33112a941dfaa2d43098ec422ce4ea213",
+     "x": false
+    },
+    "python/lib/site.py": {
+     "t": "f",
+     "sha256": "3727adff524e0616022eadd8f4af21a0778b29fc4c77bdfefd1afce2cbf5e4b7",
+     "x": false
+    }
+   },
+   "manifest_patch": {},
+   "found": {
+    "python/bin/python3": {
+     "t": "f",
+     "text": "ELF-python\n",
+     "x": true
+    },
+    "python/lib/site.py": {
+     "t": "f",
+     "text": "import os\n# marker: user edit\n",
+     "x": false
+    },
+    "git/bin/bash.exe": {
+     "t": "f",
+     "text": "MZ-bash\n",
+     "x": true
+    },
+    "git/bin/msys-2.0.dll": {
+     "t": "f",
+     "text": "MZ-msys\n",
+     "x": false
+    },
+    "node/lib/npm-cli.js": {
+     "t": "f",
+     "text": "#!/usr/bin/env node\n",
+     "x": false
+    },
+    "git/bin/msys-2.0.dll.prev4213": {
+     "t": "f",
+     "text": "MZ-msys-old\n",
+     "x": false
+    },
+    "git/bin/cysd.prev2.exe": {
+     "t": "f",
+     "text": "MZ-cysd-old\n",
+     "x": false
+    },
+    "python/lib/__pycache__/site.cpython-312.pyc": {
+     "t": "f",
+     "text": "pyc-bytes\n",
+     "x": false
+    },
+    "node/lib/node_modules/@user/tool/index.js": {
+     "t": "f",
+     "text": "module.exports = 1;\n",
+     "x": false
+    },
+    "python/lib/홍길동 메모.txt": {
+     "t": "f",
+     "text": "메모\n",
+     "x": false
+    },
+    "notes.preview.txt": {
+     "t": "f",
+     "text": "a user file whose name merely contains .prev\n",
+     "x": false
+    }
+   },
+   "expected": {
+    "missing": [
+     "python/lib/mod.py"
+    ],
+    "added": [
+     "git/bin/cysd.prev2.exe",
+     "git/bin/msys-2.0.dll.prev4213",
+     "node/lib/node_modules/@user/tool/index.js",
+     "notes.preview.txt",
+     "python/lib/__pycache__/site.cpython-312.pyc",
+     "python/lib/홍길동 메모.txt"
+    ],
+    "changed": [
+     "python/lib/site.py"
+    ]
+   },
+   "not_edits": [
+    "git/bin/cysd.prev2.exe",
+    "git/bin/msys-2.0.dll.prev4213",
+    "python/lib/__pycache__/site.cpython-312.pyc"
+   ]
+  },
+  {
+   "name": "exec-bits-and-links",
+   "unix_only": true,
+   "shipped": {
+    "tools/run": {
+     "t": "f",
+     "text": "#!/bin/sh\necho run\n",
+     "x": true
+    },
+    "tools/data": {
+     "t": "f",
+     "text": "data\n",
+     "x": false
+    },
+    "node/lib/npm-cli.js": {
+     "t": "f",
+     "text": "#!/usr/bin/env node\n",
+     "x": false
+    },
+    "node/bin/npm": {
+     "t": "l",
+     "target": "../lib/npm-cli.js"
+    },
+    "git/libexec/git": {
+     "t": "f",
+     "text": "GITBIN\n",
+     "x": true
+    },
+    "git/libexec/git-add": {
+     "t": "l",
+     "target": "git"
+    },
+    "linkdir": {
+     "t": "l",
+     "target": "node"
+    }
+   },
+   "manifest_entries": {
+    "linkdir": {
+     "t": "l",
+     "target": "node"
+    },
+    "git/libexec/git": {
+     "t": "f",
+     "sha256": "b43c798bfe41f6a5791486d75439a982cee04b7a83ffb727a871ac833e6e6fcb",
+     "x": true
+    },
+    "git/libexec/git-add": {
+     "t": "l",
+     "target": "git"
+    },
+    "node/bin/npm": {
+     "t": "l",
+     "target": "../lib/npm-cli.js"
+    },
+    "node/lib/npm-cli.js": {
+     "t": "f",
+     "sha256": "a59c47872b71f12589942892464e764c0db350c20b72228645615cc36e0a0725",
+     "x": false
+    },
+    "tools/data": {
+     "t": "f",
+     "sha256": "6667b2d1aab6a00caa5aee5af8ad9f1465e567abf1c209d15727d57b3e8f6e5f",
+     "x": false
+    },
+    "tools/run": {
+     "t": "f",
+     "sha256": "a4e0317eafab5cf1bc4a0041c7c8aeb6ece56fe72e7b2b3017a8a6574614cd35",
+     "x": true
+    }
+   },
+   "manifest_patch": {},
+   "found": {
+    "tools/run": {
+     "t": "f",
+     "text": "#!/bin/sh\necho run\n",
+     "x": false
+    },
+    "tools/data": {
+     "t": "f",
+     "text": "data\n",
+     "x": true
+    },
+    "node/lib/npm-cli.js": {
+     "t": "f",
+     "text": "#!/usr/bin/env node\n",
+     "x": false
+    },
+    "node/bin/npm": {
+     "t": "f",
+     "text": "#!/usr/bin/env node\n",
+     "x": false
+    },
+    "git/libexec/git": {
+     "t": "f",
+     "text": "GITBIN\n",
+     "x": true
+    },
+    "git/libexec/git-add": {
+     "t": "l",
+     "target": "git2"
+    },
+    "linkdir": {
+     "t": "l",
+     "target": "node"
+    },
+    "dangling": {
+     "t": "l",
+     "target": "nowhere"
+    }
+   },
+   "expected": {
+    "missing": [],
+    "added": [
+     "dangling"
+    ],
+    "changed": [
+     "git/libexec/git-add",
+     "node/bin/npm",
+     "tools/data",
+     "tools/run"
+    ]
+   },
+   "not_edits": []
+  },
+  {
+   "name": "manifest-basename-and-special-files",
+   "unix_only": true,
+   "shipped": {
+    "a.txt": {
+     "t": "f",
+     "text": "a\n",
+     "x": false
+    },
+    "pipe0": {
+     "t": "p",
+     "mode": 420
+    }
+   },
+   "manifest_entries": {
+    "a.txt": {
+     "t": "f",
+     "sha256": "87428fc522803d31065e7bce3cf03fe475096631e5e07bbd7a0fde60c4cf25c7",
+     "x": false
+    },
+    "pipe0": {
+     "t": "o",
+     "mode": "0o644"
+    }
+   },
+   "manifest_patch": {},
+   "found": {
+    "a.txt": {
+     "t": "f",
+     "text": "a\n",
+     "x": false
+    },
+    "pipe0": {
+     "t": "p",
+     "mode": 384
+    },
+    "runtime-manifest.json": {
+     "t": "f",
+     "text": "{}\n",
+     "x": false
+    },
+    "sub/runtime-manifest.json": {
+     "t": "f",
+     "text": "{}\n",
+     "x": false
+    },
+    "pipe1": {
+     "t": "p",
+     "mode": 420
+    }
+   },
+   "expected": {
+    "missing": [],
+    "added": [
+     "pipe1",
+     "sub/runtime-manifest.json"
+    ],
+    "changed": [
+     "pipe0"
+    ]
+   },
+   "not_edits": []
+  },
+  {
+   "name": "odd-manifest-entries",
+   "unix_only": false,
+   "shipped": {
+    "f1": {
+     "t": "f",
+     "text": "a\n",
+     "x": false
+    },
+    "f2": {
+     "t": "f",
+     "text": "b\n",
+     "x": false
+    },
+    "f3": {
+     "t": "f",
+     "text": "c\n",
+     "x": false
+    },
+    "f4": {
+     "t": "f",
+     "text": "d\n",
+     "x": false
+    },
+    "f5": {
+     "t": "f",
+     "text": "e\n",
+     "x": false
+    },
+    "f6": {
+     "t": "f",
+     "text": "f\n",
+     "x": false
+    },
+    "f7": {
+     "t": "f",
+     "text": "g\n",
+     "x": false
+    }
+   },
+   "manifest_entries": {
+    "f1": {
+     "t": "f",
+     "sha256": "87428fc522803d31065e7bce3cf03fe475096631e5e07bbd7a0fde60c4cf25c7",
+     "x": false
+    },
+    "f2": {
+     "t": "f",
+     "sha256": "0263829989b6fd954f72baaf2fc64bc2e2f01d692d4de72986ea808f6e99813f",
+     "x": false
+    },
+    "f3": {
+     "t": "f",
+     "sha256": "a3a5e715f0cc574a73c3f9bebb6bc24f32ffd5b67b387244c2c909da779a1478",
+     "x": false
+    },
+    "f4": {
+     "t": "f",
+     "sha256": "8d74beec1be996322ad76813bafb92d40839895d6dd7ee808b17ca201eac98be",
+     "x": false
+    },
+    "f5": {
+     "t": "f",
+     "sha256": "a2bbdb2de53523b8099b37013f251546f3d65dbe7a0774fa41af0a4176992fd4",
+     "x": false
+    },
+    "f6": {
+     "t": "f",
+     "sha256": "092fcfbbcfca3b5be7ae1b5e58538e92c35ab273ae13664fed0d67484c8e78a6",
+     "x": false
+    },
+    "f7": {
+     "t": "f",
+     "sha256": "768c71d785bf6bbbf8c4d6af6582041f2659027140a962cd0c55b11eddfd5e3d",
+     "x": false
+    }
+   },
+   "manifest_patch": {
+    "f1": {
+     "t": "f",
+     "x": false
+    },
+    "f2": {
+     "t": "f",
+     "sha256": "0263829989b6fd954f72baaf2fc64bc2e2f01d692d4de72986ea808f6e99813f",
+     "x": "yes"
+    },
+    "f3": {
+     "t": "f",
+     "sha256": "a3a5e715f0cc574a73c3f9bebb6bc24f32ffd5b67b387244c2c909da779a1478",
+     "x": 0
+    },
+    "f4": {
+     "t": "zz",
+     "mode": ""
+    },
+    "f5": {
+     "t": "f",
+     "sha256": "a2bbdb2de53523b8099b37013f251546f3d65dbe7a0774fa41af0a4176992fd4",
+     "x": false,
+     "extra": 1
+    },
+    "f6": {
+     "t": "f",
+     "sha256": null,
+     "x": false
+    },
+    "f7": {
+     "t": "f",
+     "sha256": "768c71d785bf6bbbf8c4d6af6582041f2659027140a962cd0c55b11eddfd5e3d",
+     "x": []
+    },
+    "ghost": {
+     "t": "f",
+     "sha256": "00",
+     "x": false
+    },
+    "weird": "not-an-object"
+   },
+   "found": {
+    "f1": {
+     "t": "f",
+     "text": "a\n",
+     "x": false
+    },
+    "f2": {
+     "t": "f",
+     "text": "b\n",
+     "x": false
+    },
+    "f3": {
+     "t": "f",
+     "text": "c\n",
+     "x": false
+    },
+    "f4": {
+     "t": "f",
+     "text": "d\n",
+     "x": false
+    },
+    "f5": {
+     "t": "f",
+     "text": "e\n",
+     "x": false
+    },
+    "f6": {
+     "t": "f",
+     "text": "f\n",
+     "x": false
+    },
+    "f7": {
+     "t": "f",
+     "text": "g\n",
+     "x": false
+    }
+   },
+   "expected": {
+    "missing": [
+     "ghost",
+     "weird"
+    ],
+    "added": [],
+    "changed": [
+     "f1",
+     "f2",
+     "f4",
+     "f6"
+    ]
+   },
+   "not_edits": []
+  }
+ ]
+}
