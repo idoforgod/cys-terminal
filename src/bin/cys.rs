@@ -15697,7 +15697,7 @@ fn apply_resume_suffix(cmd: &mut String, resolved: Option<&str>) -> bool {
 /// 접미가 붙지 않은 좌석(세션 없음·파일 없음·빈 인자)은 완전히 새 대화라 **전문**(`compose_directive`)이다 —
 /// `[RESTORE]`/`[RECOVER]` 연속 지시는 부트 공용 함수가 이 결과 뒤에 **한 제출**로 잇는다(`adoption_payload` ·
 /// 0.14.41 U8 P0-M1 — 보류 좌석은 데몬 표식의 `followup` 으로 이월돼 채택이 같은 한 제출을 싣는다).
-fn boot_directive_for(role: &str, effective_resume: bool) -> Result<String, String> {
+fn boot_directive_for(role: &str, effective_resume: bool, seat: Option<u64>) -> Result<String, String> {
     if effective_resume {
         // ★(0.14.42 · R2NC-F1) '이미 보유 중' 을 **단정하지 않는다** — R3-1 은 /clear 뒤 세션으로 resume 핀을 옮기는데, 수동
         //   /clear·compact 뒤 세션에는 지침 전문이 들어간 적이 없을 수 있다(훅 출력 1만 자 상한 → 미리보기만). 거짓 고지를 받은
@@ -15708,15 +15708,96 @@ fn boot_directive_for(role: &str, effective_resume: bool) -> Result<String, Stri
         // ★(0.15.0 · 「스스로 해결」 M1 · C6 6.6) 복원 좌석(데몬 재시작·업데이트 뒤 · 훅 없는 codex·agy 포함)에도 역할
         //   블록이 닿게 안내문 끝에 붙인다 — 전문이 아니라 짧은 블록 하나다(부록 A-1 #22: 전문 재주입 금지).
         let block = role_rules_block(role);
+        // ★(0.15.0 · M1 · C6 6.6 · D:697 · RULINGS AA1) 이 좌석이 쥔 수리가 있으면 한 줄로 알린다 — 장부에서 1초 안에
+        //   읽고 `Ok(Some)` 일 때만 싣는다(실패·시간 초과·없음 = 아무것도 안 싣는다 · 짧은 안내문 유지, 부록 A-1 #22).
+        let held = held_repair_line(seat).map(|line| format!("\n{line}")).unwrap_or_default();
         Ok(format!(
             "[RESUME] 직전 작업 컨텍스트가 복원됐다(역할={role}). 절대지침 전문이 이 대화에 있으면 재숙지만 하고, \
              없거나 앞부분만 보이면 `{path}` 와 soul.md 를 Read 도구로 끝까지 먼저 읽어라. 그다음 \
-             _round/SESSION_STATE.md와 자기 TODO를 읽어 상태를 정합한 뒤 이어서 작업하라.{}",
+             _round/SESSION_STATE.md와 자기 TODO를 읽어 상태를 정합한 뒤 이어서 작업하라.{held}{}",
             block.trim_end()
         ))
     } else {
         compose_directive(role)
     }
+}
+
+/// ★(0.15.0 · 「스스로 해결」 M1 · C6 6.6 · RULINGS AA1) `[RESUME]` 의 "당신은 수리 R-n을 쥐고 있다" 줄 — 장부 읽기의 상한
+/// (≤ 1 s · OQ-H-12 (b): 재개 안내가 장부 때문에 늦어지지 않는다).
+const HELD_REPAIR_READ_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+/// 그 줄의 최대 길이(자) — 시도한 방법 목록이 길어도 안내문은 짧게 남는다(부록 A-1 #22).
+const HELD_REPAIR_LINE_MAX_CHARS: usize = 400;
+
+/// 장부 읽기 함수의 모양(`cys::repair::ledger::held_by_seat` 와 같다). 시험은 `HELD_REPAIR_SEAM` 으로 갈아 끼운다.
+type HeldRepairRead = Box<
+    dyn FnOnce(
+            &cys::repair::types::LaneKey,
+            u64,
+        ) -> Result<Option<cys::repair::ledger::HeldRepair>, cys::repair::types::RepairError>
+        + Send,
+>;
+
+/// 시험 이음매(AA1): `Some(f)` 이면 장부 대신 `f` 를 읽는다. 시험 빌드에만 있다.
+#[cfg(test)]
+static HELD_REPAIR_SEAM: std::sync::Mutex<
+    Option<
+        fn(
+            &cys::repair::types::LaneKey,
+            u64,
+        ) -> Result<Option<cys::repair::ledger::HeldRepair>, cys::repair::types::RepairError>,
+    >,
+> = std::sync::Mutex::new(None);
+
+fn held_repair_reader() -> HeldRepairRead {
+    #[cfg(test)]
+    if let Some(seam) = *HELD_REPAIR_SEAM.lock().unwrap_or_else(|e| e.into_inner()) {
+        return Box::new(seam);
+    }
+    Box::new(|lane, sid| cys::repair::ledger::held_by_seat(lane, sid))
+}
+
+/// 이 좌석(`seat` = surface id)이 이 레인에서 쥔 수리의 한 줄. 좌석이 없으면 읽지 않는다. 읽기는 레인 탐색과 같은
+/// 상한 작업자(`lane_fallback::bounded`)에서 돌고 `Ok(Some)` 일 때만 줄이 된다 — `Err`·시간 초과·`Ok(None)` 은 `None`.
+fn held_repair_line(seat: Option<u64>) -> Option<String> {
+    let sid = seat?;
+    let lane = cys::repair::types::LaneKey::of_socket(&socket_path());
+    held_repair_line_within(lane, sid, held_repair_reader(), HELD_REPAIR_READ_BUDGET)
+}
+
+fn held_repair_line_within(
+    lane: cys::repair::types::LaneKey,
+    sid: u64,
+    read: HeldRepairRead,
+    budget: std::time::Duration,
+) -> Option<String> {
+    let held = lane_fallback::bounded(budget, move |_| read(&lane, sid).map_err(|e| format!("{e:?}"))).ok()??;
+    Some(format_held_repair(&held))
+}
+
+/// D:697 의 문형 "당신은 수리 R-n을 쥐고 있다(상태, k/10회, 시도한 방법)". 장부의 방법 글은 한 줄로 접고(제어 문자 →
+/// 빈칸) 방법 하나는 60자, 목록은 5개까지, 줄 전체는 `HELD_REPAIR_LINE_MAX_CHARS` 까지만 싣는다.
+fn format_held_repair(h: &cys::repair::ledger::HeldRepair) -> String {
+    fn one_line(s: &str, max: usize) -> String {
+        let flat: String = s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+        let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+        if flat.chars().count() > max {
+            format!("{}…", flat.chars().take(max.saturating_sub(1)).collect::<String>())
+        } else {
+            flat
+        }
+    }
+    let shown: Vec<String> = h.methods.iter().map(|m| one_line(m, 60)).filter(|m| !m.is_empty()).take(5).collect();
+    let tried = if shown.is_empty() { "아직 없음".to_string() } else { shown.join(" · ") };
+    let more = h.methods.len().saturating_sub(5);
+    let more = if more > 0 { format!(" 외 {more}건") } else { String::new() };
+    let line = format!(
+        "당신은 수리 {}을 쥐고 있다({}, {}/{}회, 시도한 방법: {tried}{more}).",
+        one_line(h.id.as_str(), 40),
+        h.state.label_ko(),
+        h.attempt,
+        cys::repair::ledger::MAX_ROUNDS
+    );
+    one_line(&line, HELD_REPAIR_LINE_MAX_CHARS)
 }
 
 /// (W1-4) restore 시 agents.json env 템플릿(`${CYS_ACCOUNT_DIR:-...}`) 대신 topology에 기록된 원
@@ -16253,7 +16334,7 @@ fn boot_agent_on_surface(
     // resume 직후 컨텍스트 임계(clear)를 유발한다(적대검증 serious). resume 시엔 짧은 복귀 가드만.
     // ★(F-1) 판단 근거는 `effective_resume` 다 — 접미가 실제로 붙은 좌석만 직전 컨텍스트를 가진다.
     //   선택 자체는 순수 함수 `boot_directive_for` 가 한다(프로덕션 경로를 검체가 직접 실행 — 리뷰 R2).
-    let directive = boot_directive_for(role, effective_resume)?;
+    let directive = boot_directive_for(role, effective_resume, Some(sid))?;
 
     // 1) 에이전트 기동 (authoritative: launch-agent의 모든 시스템 주입은 타이핑 가드 면제)
     // RC-3(B′): OS-aware 렌더 — unix는 `KEY="val" cmd` 인라인(기존 byte-identical·셸 전개),
@@ -17475,7 +17556,7 @@ fn gate_pending_adopt(sid: u64, role: &str, agent: &str) -> Result<BootVerdict, 
     //   "전문 재주입은 토큰 2배·중복 지침 혼선 + resume 직후 컨텍스트 임계(clear) 유발" 로
     //   **명시적으로 금지한** 행위다. 선택은 부트와 **같은 순수 함수**가 한다(사본 금지).
     let directive_held = row.map(gate_directive_held_from_row).unwrap_or(false);
-    let directive = adoption_payload(&boot_directive_for(role, directive_held)?, followup.as_deref());
+    let directive = adoption_payload(&boot_directive_for(role, directive_held, Some(sid))?, followup.as_deref());
     if directive_held {
         eprintln!(
             "[boot] role={role} 표식이 '디렉티브 보유' 를 기록했다 — 채택은 [RESUME] + 복원 지시만 \
@@ -35707,7 +35788,7 @@ mod tests {
         let _l = cys::pack::EnvGuard::set("CYS_LOCAL_DIR", &local);
         let mut got = Vec::new();
         for role in ["master", "worker", "worker-3", "cso", "reviewer-codex", "reviewer-claude-2", "planner"] {
-            got.push((role, boot_directive_for(role, true), boot_directive_for(role, false)));
+            got.push((role, boot_directive_for(role, true, None), boot_directive_for(role, false, None)));
         }
         let _ = std::fs::remove_dir_all(pack.parent().unwrap());
         for (role, short, full) in got {
@@ -35724,6 +35805,139 @@ mod tests {
             assert!(short.len() * 4 < full.len(), "{role}: [RESUME] 이 전문에 가깝다");
             assert!(full.ends_with(&block), "{role}: 전문 끝에 블록이 없다");
         }
+    }
+
+    /// RULINGS AA1 test seam: puts a fake ledger reader in place for one test and always removes it (also on panic).
+    struct T1aHeldSeam;
+    impl T1aHeldSeam {
+        fn set(
+            f: fn(
+                &cys::repair::types::LaneKey,
+                u64,
+            ) -> Result<Option<cys::repair::ledger::HeldRepair>, cys::repair::types::RepairError>,
+        ) -> Self {
+            *HELD_REPAIR_SEAM.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
+            T1aHeldSeam
+        }
+    }
+    impl Drop for T1aHeldSeam {
+        fn drop(&mut self) {
+            *HELD_REPAIR_SEAM.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
+    static T1A_SEAM_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static T1A_SEAM_SID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// A held repair for the seam. `RepairId::parse` is still the T0 stub here, so the id falls back to its serde form.
+    fn t1a_held(id: &str, methods: Vec<String>) -> cys::repair::ledger::HeldRepair {
+        let id = cys::repair::types::RepairId::parse(id)
+            .or_else(|_| serde_json::from_value(json!(id)))
+            .expect("repair id");
+        cys::repair::ledger::HeldRepair { id, state: cys::repair::types::RepairState::InProgress, attempt: 3, methods }
+    }
+
+    fn t1a_seam_some(
+        _: &cys::repair::types::LaneKey,
+        sid: u64,
+    ) -> Result<Option<cys::repair::ledger::HeldRepair>, cys::repair::types::RepairError> {
+        T1A_SEAM_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        T1A_SEAM_SID.store(sid, std::sync::atomic::Ordering::SeqCst);
+        Ok(Some(t1a_held("R-7", vec!["캐시 무효화".into(), "경로\n정규화".into()])))
+    }
+
+    fn t1a_seam_long(
+        _: &cys::repair::types::LaneKey,
+        _: u64,
+    ) -> Result<Option<cys::repair::ledger::HeldRepair>, cys::repair::types::RepairError> {
+        Ok(Some(t1a_held("R-12", (0..40).map(|i| format!("방법{i} 긴 설명 ").repeat(30)).collect())))
+    }
+
+    fn t1a_seam_none(
+        _: &cys::repair::types::LaneKey,
+        _: u64,
+    ) -> Result<Option<cys::repair::ledger::HeldRepair>, cys::repair::types::RepairError> {
+        T1A_SEAM_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(None)
+    }
+
+    fn t1a_seam_err(
+        _: &cys::repair::types::LaneKey,
+        _: u64,
+    ) -> Result<Option<cys::repair::ledger::HeldRepair>, cys::repair::types::RepairError> {
+        T1A_SEAM_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(cys::repair::types::RepairError::Corrupt("unreadable".into()))
+    }
+
+    /// RULINGS AA1 / C6 6.6 / D:697: a seat that holds a repair gets ONE line "당신은 수리 R-n을 쥐고 있다(상태, k/10회,
+    /// 시도한 방법)" in its `[RESUME]`, between the sentence and the role block; the reader is asked for exactly this seat;
+    /// a long method list stays bounded (appendix A-1 #22); no seat or no `[RESUME]` → the ledger is not read at all.
+    #[test]
+    fn resume_text_names_the_held_repair_when_the_ledger_has_one() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (pack, local) = t1a_fixture_pack("held");
+        let _p = cys::pack::EnvGuard::set(cys::pack::ENV_PACK_DIR, &pack);
+        let _l = cys::pack::EnvGuard::set("CYS_LOCAL_DIR", &local);
+        let calls = || T1A_SEAM_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+        let (with_line, long, no_seat, full) = {
+            let _seam = T1aHeldSeam::set(t1a_seam_some);
+            let before = calls();
+            let with_line = boot_directive_for("worker", true, Some(7)).expect("[RESUME]");
+            assert_eq!(calls(), before + 1, "the ledger must be read once for the seat");
+            assert_eq!(T1A_SEAM_SID.load(std::sync::atomic::Ordering::SeqCst), 7, "read for another seat");
+            let no_seat = boot_directive_for("worker", true, None).expect("[RESUME]");
+            let full = boot_directive_for("worker", false, Some(7)).expect("full");
+            assert_eq!(calls(), before + 1, "no seat / full directive must not read the ledger");
+            drop(_seam);
+            let _seam = T1aHeldSeam::set(t1a_seam_long);
+            let long = boot_directive_for("worker", true, Some(7)).expect("[RESUME]");
+            (with_line, long, no_seat, full)
+        };
+        let _ = std::fs::remove_dir_all(pack.parent().unwrap());
+        let want = "\n당신은 수리 R-7을 쥐고 있다(진행 중, 3/10회, 시도한 방법: 캐시 무효화 · 경로 정규화).\n";
+        let at = with_line.find(want).unwrap_or_else(|| panic!("held-repair line missing:\n{with_line}"));
+        let block = t1a_block("worker");
+        assert!(with_line.starts_with("[RESUME]") && at < with_line.find("■ 「스스로 해결」").unwrap());
+        assert!(with_line.ends_with(block.trim_end()), "the role block must stay last");
+        assert_eq!(with_line.replacen(&want[..want.len() - 1], "", 1), no_seat, "the line is the only difference");
+        assert!(!no_seat.contains("당신은 수리") && !full.contains("당신은 수리"));
+        let line = long.lines().find(|l| l.starts_with("당신은 수리 R-12을")).expect("long line");
+        assert!(line.chars().count() <= HELD_REPAIR_LINE_MAX_CHARS, "{} chars", line.chars().count());
+        assert!(
+            long.chars().count()
+                <= cys::repair::rules::RULES_MAX_CHARS + 600 + HELD_REPAIR_LINE_MAX_CHARS + 1,
+            "[RESUME] with a held repair is no longer short"
+        );
+        assert!(!long.contains("DIRECTIVE-BODY-"), "[RESUME] carries the directive body");
+        assert!(format_held_repair(&t1a_held("R-12", (0..40).map(|i| format!("m{i}")).collect())).contains("외 35건"));
+    }
+
+    /// RULINGS AA1: nothing is printed on `Err`, on `Ok(None)` or when the read does not finish within its budget — the
+    /// `[RESUME]` text is then byte-identical to the text without a seat (while the T0 stub stands, the real reader errs).
+    #[test]
+    fn resume_text_has_no_held_line_on_err_none_or_slow_ledger() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let plain = boot_directive_for("cso-1", true, None).expect("[RESUME]");
+        // The real reader (T0 stub → Err).
+        let real = boot_directive_for("cso-1", true, Some(7)).expect("[RESUME]");
+        assert_eq!(real, plain, "a failing ledger read printed something");
+        for seam in [t1a_seam_err as fn(&_, _) -> _, t1a_seam_none] {
+            let _seam = T1aHeldSeam::set(seam);
+            let before = T1A_SEAM_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+            let got = boot_directive_for("cso-1", true, Some(7)).expect("[RESUME]");
+            assert_eq!(T1A_SEAM_CALLS.load(std::sync::atomic::Ordering::SeqCst), before + 1, "seam not consulted");
+            assert_eq!(got, plain, "Err / Ok(None) printed something");
+        }
+        // A reader that cannot answer before the budget ends (it blocks until this test lets it go) → no line.
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let blocked: HeldRepairRead = Box::new(move |_, _| {
+            let _ = wait.recv();
+            Ok(Some(t1a_held("R-9", vec!["늦은 답".into()])))
+        });
+        let lane = cys::repair::types::LaneKey("base".into());
+        let got = held_repair_line_within(lane, 7, blocked, std::time::Duration::from_millis(50));
+        drop(release);
+        assert_eq!(got, None, "a late ledger answer was used");
     }
 
     #[test]
@@ -37074,7 +37288,7 @@ mod tests {
             // ★(성찰 C7) 효력 = 비공백 접미 ∧ **정확 재개**(역할 무관 `--continue`/`resume --last` 제외).
             "effective_resume = apply_resume_suffix(&mut cmd, resolved.as_deref())",
             "&& resume_suffix_is_precise(agent, arg, session_id);",
-            "let directive = boot_directive_for(role, effective_resume)?;",
+            "let directive = boot_directive_for(role, effective_resume, Some(sid))?;",
             "if requested_resume && !effective_resume {",
         ] {
             assert!(body.contains(anchor), "F-1 배선 결손: {anchor}");
@@ -37131,8 +37345,8 @@ mod tests {
         std::fs::write(td.join("directives/CSO_DIRECTIVE.md"), "# CSO 절대지침 R2-MARK\n").unwrap();
         let saved = std::env::var(cys::pack::ENV_PACK_DIR).ok();
         std::env::set_var(cys::pack::ENV_PACK_DIR, &td);
-        let full = boot_directive_for("cso", false);
-        let short = boot_directive_for("cso", true);
+        let full = boot_directive_for("cso", false, None);
+        let short = boot_directive_for("cso", true, None);
         match saved {
             Some(v) => std::env::set_var(cys::pack::ENV_PACK_DIR, v),
             None => std::env::remove_var(cys::pack::ENV_PACK_DIR),
@@ -41487,7 +41701,7 @@ mod tests {
         // ④ 귀결 — 정확한 재개만 `[RESUME]` 이고, 그 밖은 `compose_directive`(전문) 경로다.
         //    (전문 분기는 팩 파일(`directives/*.md`)을 읽으므로 여기서 실행하지 않는다 —
         //     선택 자체는 `boot_directive_for` 소스가 소유하고 형제 핀이 그것을 잰다.)
-        let resumed = boot_directive_for("worker-1", true).expect("resume 디렉티브");
+        let resumed = boot_directive_for("worker-1", true, None).expect("resume 디렉티브");
         assert!(resumed.starts_with("[RESUME]"));
         let src0 = include_str!("cys.rs");
         let choose = refl_fn_body(src0, "boot_directive_for");
@@ -41684,7 +41898,7 @@ mod tests {
     #[test]
     fn resume_guard_does_not_claim_the_directive_is_held() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let g = boot_directive_for("master", true).expect("가드");
+        let g = boot_directive_for("master", true, None).expect("가드");
         assert!(g.starts_with("[RESUME]") && g.contains("역할=master"), "{g}");
         assert!(!g.contains("이미 보유 중이니"), "거짓 고지(지침 이미 보유)가 남았다: {g}");
         assert!(g.contains("MASTER_DIRECTIVE.md") && g.contains("끝까지"), "지침 파일 읽기 안내가 없다: {g}");
@@ -44822,7 +45036,7 @@ mod tests {
             assert!(!gate_directive_held_from_row(&row), "{row}");
         }
         // ③ 채택 페이로드 — 축이 참이면 `[RESUME]` + followup 이고 전문이 아니다.
-        let held = adoption_payload(&boot_directive_for("worker-1", true).expect("resume"),
+        let held = adoption_payload(&boot_directive_for("worker-1", true, None).expect("resume"),
                                     gate_followup_from_row(&row_held).as_deref());
         assert!(held.starts_with("[RESUME]"), "{held}");
         assert!(held.ends_with("[RESTORE] x"), "{held}");
@@ -44831,7 +45045,7 @@ mod tests {
         let src = include_str!("cys.rs");
         let adopt = refl_fn_body(src, "gate_pending_adopt");
         assert!(
-            adopt.contains("boot_directive_for(role, directive_held)?"),
+            adopt.contains("boot_directive_for(role, directive_held, Some(sid))?"),
             "채택이 아직 종류 축을 무시한다(resume 좌석에 전문 재주입)"
         );
         assert!(
@@ -46544,7 +46758,7 @@ mod u10_notice_lane {
         let sock = td.join(".local/state/cys-dept-u10/cys.sock");
         let _p = cys::pack::EnvGuard::set(cys::pack::ENV_PACK_DIR, &dept);
         let _s = cys::pack::EnvGuard::set("CYS_SOCKET", &sock);
-        let out = boot_directive_for("cso", false).expect("compose");
+        let out = boot_directive_for("cso", false, None).expect("compose");
         let _ = std::fs::remove_dir_all(&td);
         assert!(out.contains("DEPT-CSO-DIRECTIVE"), "부서 팩 지침 미합성");
         assert!(out.contains("DEPT-CSO-DIRECTIVE-MEMORY"), "부서 팩 MEMORY 미합성");
