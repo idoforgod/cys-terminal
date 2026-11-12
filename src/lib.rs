@@ -38,6 +38,7 @@ pub mod license;
 pub mod macos_devtools;
 pub mod merge3;
 pub mod pack;
+pub mod repair;
 /// @generated C-07 previous-vendor hash table (scripts/gen_prev_vendor_hashes.py).
 pub mod pack_prev_vendor;
 pub mod pack_update_result;

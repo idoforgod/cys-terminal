@@ -29,6 +29,8 @@ path = "src/bin/cys.rs"
 #   켜는 유일한 정당 경로는 12.W(W1~W8)를 통과한 릴리스 단계다. 손으로 켜면 미검증 삭제가 켜진다.
 default = []
 trash_win_validated = []
+# 「스스로 해결」 시험 전용(TESTPLAN OQ-H-10) — default 에 없고 어떤 릴리스·브랜치 워크플로도 켜지 않는다(핀: repair_test_auth_never_enabled_in_release_workflows).
+repair-test-auth = []
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "process"] }
