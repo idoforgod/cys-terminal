@@ -1,4 +1,5 @@
-//! Track T3 daemon tests — the role table, the verbs, the locks, intake, caller identity.
+//! Track T3 daemon tests (`src/bin/cysd/repair_ledger_tests.rs`, declared test-only from `repair.rs`
+//! through `#[path]`: the boot-health census H-AUTH-SELFLOOP reads only top-level files of src/bin/cysd) — the role table, the verbs, the locks, intake, caller identity.
 //! Every test builds its own ledger root under the temporary directory (no environment variable is
 //! set, no real ledger, no daemon socket); `handle()` is exercised through `tmp_daemon`, whose root is
 //! the per-process temporary root of `production_root` in this binary's tests.
@@ -264,7 +265,7 @@ fn request_fields_and_env_never_name_a_role() {
         assert_eq!(e.code, "acl_denied");
     }
     assert!(!r.root.exists(), "a refused begin wrote something");
-    let src = [include_str!("../repair.rs")];
+    let src = [include_str!("repair.rs")];
     let needles = [
         "env::var",
         "CYS_ROLE",
@@ -426,8 +427,8 @@ fn intake_path_never_reaches_alert_route_or_queues() {
         "checker is blind"
     );
     for (name, text) in [
-        ("repair.rs", include_str!("../repair.rs")),
-        ("intake.rs", include_str!("../../../repair/intake.rs")),
+        ("repair.rs", include_str!("repair.rs")),
+        ("intake.rs", include_str!("../../repair/intake.rs")),
     ] {
         let prod = &text[..text.find("#[cfg(test)]\nmod tests").unwrap_or(text.len())];
         for n in needles {
@@ -439,8 +440,8 @@ fn intake_path_never_reaches_alert_route_or_queues() {
 /// D:658 / appendix A 1-26, 1-28: no per-call intake in the hooks' common frame or the observing hook.
 #[test]
 fn no_per_call_intake_in_hook_lib() {
-    let lib = include_str!("../../../../cysjavis-pack/hooks/_lib.sh");
-    let obs = include_str!("../../../../cysjavis-pack/hooks/cys-hook.sh");
+    let lib = include_str!("../../../cysjavis-pack/hooks/_lib.sh");
+    let obs = include_str!("../../../cysjavis-pack/hooks/cys-hook.sh");
     assert!(lib.len() > 500 && obs.len() > 100);
     for (n, t) in [("_lib.sh", lib), ("cys-hook.sh", obs)] {
         assert!(!t.contains("repair report"), "{n} reports intake per call");
@@ -1500,7 +1501,10 @@ fn commit_is_bounded_and_never_unchecked() {
     )
     .unwrap_err();
     assert_eq!(e.code, "repair_check_failed");
-    assert!(seen.get() > std::time::Duration::ZERO, "the check was never called");
+    assert!(
+        seen.get() > std::time::Duration::ZERO,
+        "the check was never called"
+    );
     assert!(seen.get() <= std::time::Duration::from_secs(COMMIT_CHECK_BUDGET_SECS));
     assert_eq!(
         r.record_of(&id).state,
@@ -1789,14 +1793,14 @@ fn pty_controlling_terminal_is_attributed_to_its_pane() {
 /// it), the seat release in `close_surface_effect`, the prompt record in `hook.machine_origin`.
 #[test]
 fn wiring_pins() {
-    let handlers = include_str!("../handlers.rs");
+    let handlers = include_str!("handlers.rs");
     let walk = &handlers[handlers.find("fn walk_caller_ancestry(").unwrap()..];
     let walk = &walk[..walk.find("\nfn walk_ancestry_with(").unwrap()];
     assert!(walk.contains("crate::repair::seat_of_terminal"));
     let arm = &handlers[handlers.find("\"hook.machine_origin\" => {").unwrap()..];
     let arm = &arm[..arm.find("\"boot.exit_ack\" =>").unwrap()];
     assert!(arm.contains("crate::repair::record_prompt_origin("));
-    let gov = include_str!("../governance.rs");
+    let gov = include_str!("governance.rs");
     let eff = &gov[gov.find("fn close_surface_effect(").unwrap()..];
     let eff = &eff[..eff.find("\n}\n").unwrap()];
     assert_eq!(

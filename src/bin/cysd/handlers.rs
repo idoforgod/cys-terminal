@@ -1583,10 +1583,12 @@ fn walk_caller_ancestry(daemon: &Daemon, caller_pid: u32) -> (Option<u64>, Optio
         let by_terminal = crate::state::proc_brief(caller_pid)
             .and_then(|b| b.tdev)
             .and_then(|t| crate::repair::seat_of_terminal(daemon, t));
-        return (by_terminal, start);
+        (by_terminal, start)
     }
     #[cfg(not(target_os = "macos"))]
-    walk_legacy(&pid_to_sid, caller_pid)
+    {
+        walk_legacy(&pid_to_sid, caller_pid)
+    }
 }
 
 /// 워크 **규칙**의 단일 정의(순수 · 전 OS) — 매 홉 pid_to_sid 선검사 · 최대 32홉 · 자기부모

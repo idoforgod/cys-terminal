@@ -285,6 +285,7 @@ pub fn load_row(path: &Path) -> Result<Option<IntakeRow>, RepairError> {
         .map_err(|e| RepairError::Corrupt(format!("{}: {e}", path.display())))
 }
 
+#[allow(clippy::too_many_arguments)] // one call site (the daemon); every argument is a distinct input
 /// Records one report in `lane`'s row. `new_in_last_hour` = how many NEW rows this lane wrote in
 /// the last hour (the caller keeps that count in memory — the quota is per daemon). The caller
 /// serialises calls for one signature (one writer per file).

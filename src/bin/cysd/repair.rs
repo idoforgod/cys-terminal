@@ -15,6 +15,7 @@
 //! ★Nothing here sends anything to a queue, an alert route or the event bus (F1): intake is data.
 
 #[cfg(test)]
+#[path = "repair_ledger_tests.rs"]
 mod ledger_tests;
 
 use crate::handlers::Reply;
@@ -546,6 +547,7 @@ pub(crate) fn seat_of_terminal(daemon: &Daemon, tdev: u32) -> Option<u64> {
 }
 
 /// Pure part of [`seat_of_terminal`]: the first pane whose slave device equals `tdev`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // only the macOS fallback calls it (and the tests)
 pub(crate) fn seat_by_terminal(
     panes: &[(u64, i32)],
     tdev: u32,
@@ -680,8 +682,8 @@ pub(crate) fn check_kind_for(rel: &str) -> cys::repair::boot_critical::CheckKind
     }
 }
 
-/// Track T3 — the verb bodies (an inline module: the C8 dormancy census follows production file modules
-/// only from `main.rs`, and fails closed on a nested one — `c8_dormancy_proof_tests.rs`).
+// Track T3 — the verb bodies (an inline module: the C8 dormancy census follows production file modules
+// only from `main.rs`, and fails closed on a nested one — `c8_dormancy_proof_tests.rs`).
 mod ledger_verbs {
     //! Track T3 — the bodies of `repair.report|begin|record|commit|attest_verify|attest_audit|list|status|
     //! cleanup` and the seat-reap lock release (C1, C2 2.3(a), C3; RULINGS B1, B2, G4, G6, G7, H8, J1, K1,
@@ -964,9 +966,10 @@ mod ledger_verbs {
     // ─────────────────────────────── report (INTAKE) ───────────────────────────────
 
     /// Per (root, lane): times of the NEW rows written in the last hour, and the over-quota count.
-    fn intake_quota() -> &'static Mutex<HashMap<(PathBuf, String), (VecDeque<f64>, u64)>> {
-        static Q: OnceLock<Mutex<HashMap<(PathBuf, String), (VecDeque<f64>, u64)>>> =
-            OnceLock::new();
+    type IntakeQuota = Mutex<HashMap<(PathBuf, String), (VecDeque<f64>, u64)>>;
+
+    fn intake_quota() -> &'static IntakeQuota {
+        static Q: OnceLock<IntakeQuota> = OnceLock::new();
         Q.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
@@ -1121,8 +1124,11 @@ mod ledger_verbs {
         }
     }
 
+    /// (file targets, hook lines as (event, script)).
+    type BeginTargets = (Vec<String>, Vec<(String, String)>);
+
     /// The declared targets of a `begin`, normalised and de-duplicated (order kept).
-    fn begin_targets(p: &Value) -> Result<(Vec<String>, Vec<(String, String)>), VerbError> {
+    fn begin_targets(p: &Value) -> Result<BeginTargets, VerbError> {
         let mut files = Vec::new();
         if let Some(v) = p.get("files") {
             let arr = v
