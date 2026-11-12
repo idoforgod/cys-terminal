@@ -4666,6 +4666,18 @@ def self_test_r2(fails):
 
 
 def run_self_test():
+    # ★실행 위치와 무관하게(0.15.0 T10 후속 · 리뷰 지적 10): 검체 일부의 입력은 **상대 경로**다 — POSIX
+    #   호스트의 윈도우 철자(`C:\\Users\\…`)·인용된 `~`(`"~/.cys/…"`). 상대 경로는 cwd 아래로 풀리므로
+    #   cwd 가 임시 폴더(`/tmp`)이거나 `/_round/`·`/log/`·`/logs/` 를 품으면 그대로 둔 허용(임시 폴더·
+    #   부분 문자열)에 걸려 '거부' 검체가 '허용' 으로 읽혔다 — 건강한 훅의 자가 시험이 실행 위치 때문에
+    #   적색이 된다(다른 트랙이 이 자가 시험을 임시 예행 사본 안에서 훅의 검사로 돌릴 수 있다). 그래서
+    #   자가 시험은 **파일시스템 루트**(임시 폴더도, 허용 부분 문자열도, 합성 팩 뿌리도 아닌 자리)에서
+    #   돈다. 판정 함수는 바꾸지 않는다 — 운영에서 상대 경로가 cwd 를 따라가는 것은 셸과 같은 의미다.
+    #   (cwd 를 따로 고정하는 블록 둘은 끝에 시작 위치로 — 즉 이 루트로 — 돌아온다.)
+    try:
+        os.chdir(os.path.abspath(os.sep))
+    except OSError:
+        pass                              # 못 옮기면 시작 위치 그대로 — 위치 의존 검체가 시끄럽게 실패한다
     fails, n_block, n_allow, cso_allow, cso_deny = self_test()
     self_test_contracts(fails)
     self_test_r1(fails)

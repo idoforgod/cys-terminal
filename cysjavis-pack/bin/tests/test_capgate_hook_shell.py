@@ -747,6 +747,68 @@ class ReviewerExactPredicate(unittest.TestCase):
         self.assertIsNone(name(None))
 
 
+class GateSelfTestAndPackKeys(unittest.TestCase):
+    """★0.15.0 T10 후속(리뷰 지적 9·10).
+
+    ① 훅 `--self-test` 는 **어디서 시작해도** 같은 답을 낸다. 검체 일부의 입력은 상대 경로다(POSIX
+       호스트의 윈도우 철자 `C:\\…`, 인용된 `~`) — 실행 위치가 임시 폴더나 `/_round/`·`/log/` 를 품은
+       폴더면 그 상대 경로가 그대로 허용 자리로 읽혀 건강한 훅의 자가 시험이 적색이 됐다. 다른 트랙이
+       이 자가 시험을 **임시 예행 사본 안에서** 훅의 검사로 돌릴 수 있으므로 위치 의존은 결함이다.
+    ② 훅의 팩 위치 env 키 목록(`pack_dir` 안의 리터럴)이 제품 정본 목록과 같다 — 한쪽에만 키를 더하면
+       여기서 적색이다(레인 팩이 갈리면 리뷰어 정확 목록이 다른 팩을 가리킨다)."""
+
+    def run_self_test_in(self, cwd):
+        r = subprocess.run([SH, str(HOOK), "--self-test"], cwd=str(cwd), capture_output=True,
+                           text=True, timeout=180)
+        return r.returncode, (r.stderr or "")[-1500:]
+
+    @NEED_SH
+    def test_self_test_does_not_depend_on_the_working_directory(self):
+        roots = []
+        if os.path.isdir("/tmp"):
+            roots.append(tempfile.mkdtemp(prefix="capgate-cwd-", dir="/tmp"))   # macOS: /private/tmp
+        roots.append(tempfile.mkdtemp(prefix="capgate-cwd-"))                   # $TMPDIR
+        try:
+            cwds = list(roots)
+            for sub in (("proj", "_round", "x"), ("var", "log", "x"), ("w", "logs")):
+                d = os.path.join(roots[-1], *sub)
+                os.makedirs(d)
+                cwds.append(d)
+            for cwd in cwds:
+                with self.subTest(cwd=cwd):
+                    rc, err = self.run_self_test_in(cwd)
+                    self.assertEqual(rc, 0, "실행 위치 %s 에서 훅 자가 시험이 적색이다(위치 의존):\n%s"
+                                     % (cwd, err))
+        finally:
+            for r in roots:
+                shutil.rmtree(r, ignore_errors=True)
+
+    def test_gate_pack_dir_env_keys_match_the_product_list(self):
+        import ast
+        sys.path.insert(0, str(BIN))
+        import javis_guard_register as gr
+        import javis_preflight as pf
+        src = HOOK.read_text(encoding="utf-8").split("<<'PYEOF'\n", 1)[1]
+        src = src.split('\nif os.environ.get("CAPGATE_SELF_TEST"):', 1)[0]
+        fn = next((n for n in ast.walk(ast.parse(src))
+                   if isinstance(n, ast.FunctionDef) and n.name == "pack_dir"), None)
+        self.assertIsNotNone(fn, "훅에서 pack_dir 을 찾지 못했다(대조 불가 = 실패)")
+        loops = [n for n in ast.walk(fn) if isinstance(n, ast.For) and isinstance(n.iter, ast.Tuple)]
+        self.assertEqual(len(loops), 1, "훅 pack_dir 의 키 목록 리터럴 모양이 바뀌었다 — 이 대조를 갱신하라")
+        gate_keys = tuple(ast.literal_eval(loops[0].iter))
+        self.assertEqual(gate_keys, tuple(pf.PACK_DIR_ENV_KEYS),
+                         "훅의 팩 위치 env 키 목록이 제품 정본(javis_preflight)과 갈렸다")
+        self.assertEqual(gate_keys, tuple(gr.PACK_DIR_ENV_KEYS))
+        # 행동 대조 — 키 순서까지(앞 키가 없을 때 다음 키 · 전부 없으면 `~/.cys/pack`).
+        ns = {"__name__": "capgate_pack_keys_specimen"}
+        exec(compile(src, str(HOOK), "exec"), ns)
+        for i in range(len(gate_keys) + 1):
+            env = dict((k, "/p/%d" % j) for j, k in enumerate(gate_keys) if j >= i)
+            want = ("/p/%d" % i if i < len(gate_keys)
+                    else os.path.join(os.path.expanduser("~"), ".cys", "pack"))
+            self.assertEqual(ns["pack_dir"](env), want, "첫 %d 키 부재" % i)
+
+
 class NegativeControls(unittest.TestCase):
     """★음성 대조 — 안전 검사를 **지우면** 내장 self-test 가 실패해야 한다.
 
