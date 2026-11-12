@@ -17,6 +17,10 @@
 //! * It NEVER blocks the update: every failure ends in one Korean notice and the caller goes on.
 //!   The work runs on a blocking thread under a cooperative deadline, an outer timeout and a byte
 //!   cap; a panic or a stuck file system read becomes a notice, never a stuck update.
+//! * RULINGS AA3–AA6: below `cap + 2 GiB` free on the store volume nothing is copied (list only); an
+//!   identical earlier capture of the same version is not copied again (`same_as`); index entries
+//!   carry `kind`, `stored`, the scanned hash and the link target; files are opened without
+//!   following links; at the Windows place the notice is recorded and shown at the next app start.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -37,15 +41,28 @@ pub(crate) const RUNTIME_DIR: &str = "runtime";
 pub(crate) const INDEX_SCHEMA: u32 = 1;
 /// The index file inside one capture folder (O-C12-3).
 pub(crate) const INDEX_FILE: &str = "index.json";
-/// Cooperative deadline of one capture (scan + copy), checked before every file. T7a choice (the
-/// design gives no number): long enough for a cold scan of the shipped runtime, short enough that
-/// the update never looks stuck. The real Windows duration is the WIN-04 measurement.
+/// Cooperative deadline of one capture (scan + copy), checked before every file (RATIFIED, RULINGS
+/// AA4: 30 s + 10 s grace — the update waits at most 40 s). The real Windows duration is the WIN-04
+/// measurement.
 pub(crate) const CAPTURE_DEADLINE: Duration = Duration::from_secs(30);
 /// Extra wait of the outer timeout on top of the deadline; past it the update goes on without the
 /// worker (which stops at its next file through the abandon flag).
 pub(crate) const JOIN_GRACE: Duration = Duration::from_secs(10);
-/// Most bytes one capture copies (T7a choice): edits beyond it are listed, not copied.
+/// Most bytes one capture copies (RATIFIED, RULINGS AA4): edits beyond it are listed, not copied.
 pub(crate) const MAX_CAPTURE_BYTES: u64 = 256 * 1024 * 1024;
+/// Free space kept on the store volume on top of the cap (RULINGS AA4): below `cap + 2 GiB` nothing is
+/// copied — on macOS the capture runs before the download and must never be the reason it fails.
+pub(crate) const FREE_SPACE_MARGIN: u64 = 2 * 1024 * 1024 * 1024;
+/// Largest manifest read (RULINGS AA6; the shipped macOS manifest is about 2.4 MB).
+pub(crate) const MAX_MANIFEST_BYTES: u64 = 32 * 1024 * 1024;
+/// Largest earlier `index.json` read when looking for an identical earlier capture.
+const MAX_INDEX_BYTES: u64 = 16 * 1024 * 1024;
+/// Largest pending-notice record read at start.
+const MAX_NOTICE_BYTES: u64 = 64 * 1024;
+/// `<local>/bundle-edits.pending-notice-<leaf>.json` — a notice still to be shown (RULINGS AA3).
+pub(crate) const PENDING_NOTICE_PREFIX: &str = "bundle-edits.pending-notice-";
+/// The same record after it was shown once (renamed, never deleted).
+pub(crate) const SHOWN_NOTICE_PREFIX: &str = "bundle-edits.shown-notice-";
 
 /// The sentence every failure notice ends with (design §1-6 결정 19, limit 11).
 const NOTICE_TAIL_KO: &str =
@@ -257,9 +274,9 @@ pub(crate) fn walk_entries(
 
 /// `javis_runtime_seal.load_manifest`: a JSON object holding `entries`, with `schema` equal to 1 in
 /// Python's sense (`1`, `1.0` and `true` compare equal to 1 there).
+/// Read without following a link and capped at [`MAX_MANIFEST_BYTES`] (RULINGS AA6).
 pub(crate) fn load_manifest(path: &Path) -> Result<Value, String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    parse_manifest(&bytes)
+    parse_manifest(&read_capped(path, MAX_MANIFEST_BYTES)?)
 }
 
 /// The text half of [`load_manifest`].
@@ -447,6 +464,10 @@ pub(crate) struct CaptureInput {
     pub to_version: String,
     pub deadline: Duration,
     pub max_bytes: u64,
+    /// Below this many free bytes on the store volume nothing is copied (RULINGS AA4: cap + 2 GiB).
+    pub free_floor: u64,
+    /// Free bytes of the volume holding a folder (`None` = could not be measured).
+    pub free_space: fn(&Path) -> Option<u64>,
 }
 
 impl CaptureInput {
@@ -465,12 +486,15 @@ impl CaptureInput {
             to_version: to_version.to_string(),
             deadline: CAPTURE_DEADLINE,
             max_bytes: MAX_CAPTURE_BYTES,
+            free_floor: MAX_CAPTURE_BYTES + FREE_SPACE_MARGIN,
+            free_space: store_free_space,
         }
     }
 }
 
 /// The result of one capture. `edits` counts changed + added + deleted files after the filter;
-/// `not_stored` counts edits whose bytes could not be kept (deleted files have none to keep).
+/// `not_stored` counts present edits whose bytes are not in the capture folder (deleted files have
+/// none to keep).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CaptureOutcome {
     /// No bundled runtime (development build) — nothing to do, no notice.
@@ -479,18 +503,28 @@ pub(crate) enum CaptureOutcome {
     Clean { stats: Stats },
     /// Every edit kept and the index written.
     Captured { dir: PathBuf, edits: usize, stats: Stats },
-    /// Edits found but not all of them (or not the index) could be kept.
+    /// The same edits (same paths, kinds and hashes) are already kept by an earlier capture of the
+    /// same version: nothing copied, the new index points to it (`same_as`, RULINGS AA4).
+    AlreadyKept { dir: PathBuf, same_as: PathBuf, edits: usize, stats: Stats },
+    /// Edits found but not all of them (or not the index) could be kept — including "too little free
+    /// space: list only" (RULINGS AA4).
     Incomplete { dir: Option<PathBuf>, edits: usize, not_stored: usize, reason: String, stats: Stats },
     /// Could not tell whether anything was edited.
     Undecidable { reason: String, stats: Stats },
 }
 
-/// One record of `index.json` (O-C12-3).
+/// One record of `index.json` (O-C12-3 as extended by RULINGS AA5): `kind` = "file" | "link" |
+/// "special"; `stored` = the bytes (or the link) are in THIS capture folder; `sha256_found` = the
+/// scanned hash of every file present at capture time (`null` for a file = deleted); `link_target`
+/// = the target of a link present at capture time (`null` otherwise).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct IndexRecord {
     rel: String,
+    kind: &'static str,
+    stored: bool,
     sha256_manifest: Option<String>,
     sha256_found: Option<String>,
+    link_target: Option<String>,
 }
 
 /// UTC `YYYYMMDDTHHMMSSffffffZ` (the `<시각>` format of O-C2-1, used for the capture folder too).
@@ -522,6 +556,86 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (year, month, day)
 }
 
+/// Opens a file for reading WITHOUT following a link (Unix `O_NOFOLLOW | O_NONBLOCK` — a fifo
+/// swapped in cannot block; Windows `FILE_FLAG_OPEN_REPARSE_POINT`) and re-checks through the handle
+/// that it is a regular file (the pattern of `cys::repair::types::TargetState::read`, RULINGS AA6).
+fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(not(unix))]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file"));
+    }
+    Ok(file)
+}
+
+/// Reads at most `cap` bytes of a regular file opened without following links; a longer file is
+/// refused (RULINGS AA6: the manifest, earlier indexes and pending notices are size-capped).
+fn read_capped(path: &Path, cap: u64) -> Result<Vec<u8>, String> {
+    let file = open_no_follow(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut std::io::Read::take(file, cap + 1), &mut bytes)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    if bytes.len() as u64 > cap {
+        return Err(format!("{}: {} 바이트보다 커서 읽지 않음", path.display(), cap));
+    }
+    Ok(bytes)
+}
+
+/// The nearest existing folder at or above `p` (the store may not exist yet).
+fn existing_dir(p: &Path) -> PathBuf {
+    let mut cur = p.to_path_buf();
+    while !cur.is_dir() {
+        match cur.parent() {
+            Some(parent) => cur = parent.to_path_buf(),
+            None => break,
+        }
+    }
+    cur
+}
+
+/// Free bytes available to this user on the volume that holds `dir` (Unix `statvfs`, Windows
+/// `GetDiskFreeSpaceExW`); `None` when it cannot be measured.
+pub(crate) fn store_free_space(dir: &Path) -> Option<u64> {
+    let dir = existing_dir(dir);
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+            return None;
+        }
+        let (avail, block) = (st.f_bavail as u64, st.f_frsize as u64);
+        Some(avail.saturating_mul(block))
+    }
+    #[cfg(not(unix))]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetDiskFreeSpaceExW(dir: *const u16, avail: *mut u64, total: *mut u64, free: *mut u64) -> i32;
+        }
+        let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let (mut avail, mut total, mut free) = (0u64, 0u64, 0u64);
+        if unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut avail, &mut total, &mut free) } == 0 {
+            return None;
+        }
+        Some(avail)
+    }
+}
+
 /// Creates the capture folder with an exclusive create (`-<n>` appended on a collision, as O-C2-1
 /// does for vault slots), after creating the store parent.
 fn create_capture_dir(store_parent: &Path, leaf: &str) -> Result<PathBuf, String> {
@@ -551,17 +665,14 @@ fn store_path(dir: &Path, rel: &str) -> Option<PathBuf> {
 }
 
 /// Copies one regular file byte for byte into a NEW file and returns the sha256 of the stored
-/// copy. Refuses a source that is no longer a regular file.
+/// copy. The source is opened without following links and re-checked through the handle.
 fn copy_exact(src: &Path, dst: &Path) -> Result<String, String> {
     use cys::repair::types::TargetState;
-    let meta = std::fs::symlink_metadata(src).map_err(|e| format!("{}: {e}", src.display()))?;
-    if !meta.file_type().is_file() {
-        return Err(format!("{}: 더 이상 일반 파일이 아님", src.display()));
-    }
+    let mut input = open_no_follow(src).map_err(|e| format!("{}: {e}", src.display()))?;
+    let permissions = input.metadata().map_err(|e| format!("{}: {e}", src.display()))?.permissions();
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
     }
-    let mut input = std::fs::File::open(src).map_err(|e| format!("{}: {e}", src.display()))?;
     let mut output = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -570,7 +681,8 @@ fn copy_exact(src: &Path, dst: &Path) -> Result<String, String> {
     std::io::copy(&mut input, &mut output).map_err(|e| format!("{}: {e}", dst.display()))?;
     output.sync_all().map_err(|e| format!("{}: {e}", dst.display()))?;
     drop(output);
-    let _ = std::fs::set_permissions(dst, meta.permissions());
+    drop(input);
+    let _ = std::fs::set_permissions(dst, permissions);
     match TargetState::read(dst) {
         Ok(TargetState::File { sha256, .. }) => Ok(sha256),
         Ok(_) => Err(format!("{}: 복사본이 일반 파일이 아님", dst.display())),
@@ -579,7 +691,7 @@ fn copy_exact(src: &Path, dst: &Path) -> Result<String, String> {
 }
 
 /// Keeps a link as a link (Unix). Windows does not store links (making one needs a privilege the
-/// app does not ask for) — the edit is listed and counted as not stored.
+/// app does not ask for) — the edit is listed with `stored: false` (RULINGS AA5).
 fn store_link(target: &str, dst: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
@@ -596,15 +708,25 @@ fn store_link(target: &str, dst: &Path) -> Result<(), String> {
 }
 
 /// Writes `index.json` last, through a temporary name and a rename.
-fn write_index(dir: &Path, input: &CaptureInput, records: &[IndexRecord]) -> Result<(), String> {
+fn write_index(dir: &Path, input: &CaptureInput, records: &[IndexRecord], same_as: Option<&str>) -> Result<(), String> {
     let files: Vec<Value> = records
         .iter()
-        .map(|r| json!({"rel": r.rel, "sha256_manifest": r.sha256_manifest, "sha256_found": r.sha256_found}))
+        .map(|r| {
+            json!({
+                "rel": r.rel,
+                "kind": r.kind,
+                "stored": r.stored,
+                "sha256_manifest": r.sha256_manifest,
+                "sha256_found": r.sha256_found,
+                "link_target": r.link_target,
+            })
+        })
         .collect();
     let index = json!({
         "schema": INDEX_SCHEMA,
         "from_version": input.from_version,
         "to_version": input.to_version,
+        "same_as": same_as,
         "files": files,
     });
     let mut bytes = serde_json::to_vec_pretty(&index).map_err(|e| e.to_string())?;
@@ -622,11 +744,89 @@ fn write_index(dir: &Path, input: &CaptureInput, records: &[IndexRecord]) -> Res
     std::fs::rename(&tmp, &fin).map_err(|e| format!("{}: {e}", fin.display()))
 }
 
+/// The identity of an edit set for "already kept" (RULINGS AA4): path, kind, scanned hash, link
+/// target of every entry, sorted.
+fn edit_set(records: &[IndexRecord]) -> Vec<(String, String, Option<String>, Option<String>)> {
+    let mut v: Vec<_> = records
+        .iter()
+        .map(|r| (r.rel.clone(), r.kind.to_string(), r.sha256_found.clone(), r.link_target.clone()))
+        .collect();
+    v.sort();
+    v
+}
+
+/// An earlier capture folder of the same `from_version` that already HOLDS this exact edit set:
+/// its index lists the same entries, it points to no other capture, every present entry is stored
+/// there and every stored file still exists. Newest first; `None` when there is none.
+fn find_same_capture(input: &CaptureInput, records: &[IndexRecord], budget: &Budget) -> Option<PathBuf> {
+    let want = edit_set(records);
+    let prefix = format!("{}-", input.from_version);
+    let mut names: Vec<String> = std::fs::read_dir(&input.store_parent)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.starts_with(&prefix))
+        .collect();
+    names.sort();
+    names.reverse();
+    for name in names {
+        if budget.check().is_err() {
+            return None;
+        }
+        let dir = input.store_parent.join(&name);
+        if std::fs::symlink_metadata(&dir).map(|m| !m.file_type().is_dir()).unwrap_or(true) {
+            continue;
+        }
+        let Ok(bytes) = read_capped(&dir.join(INDEX_FILE), MAX_INDEX_BYTES) else {
+            continue;
+        };
+        let Ok(index) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        if index["from_version"].as_str() != Some(input.from_version.as_str()) || !index["same_as"].is_null() {
+            continue;
+        }
+        let Some(files) = index["files"].as_array() else {
+            continue;
+        };
+        let mut theirs = Vec::with_capacity(files.len());
+        let mut holds_all = true;
+        for f in files {
+            let (Some(rel), Some(kind), Some(stored)) = (f["rel"].as_str(), f["kind"].as_str(), f["stored"].as_bool()) else {
+                holds_all = false;
+                break;
+            };
+            let sha = f["sha256_found"].as_str().map(str::to_string);
+            let target = f["link_target"].as_str().map(str::to_string);
+            let present = sha.is_some() || target.is_some() || kind == "special";
+            if present {
+                let on_disk = rel
+                    .split('/')
+                    .fold(dir.clone(), |acc, c| acc.join(c));
+                if !stored || std::fs::symlink_metadata(&on_disk).is_err() {
+                    holds_all = false;
+                    break;
+                }
+            }
+            theirs.push((rel.to_string(), kind.to_string(), sha, target));
+        }
+        theirs.sort();
+        if holds_all && theirs == want {
+            return Some(dir);
+        }
+    }
+    None
+}
+
 fn halt_reason_ko(h: Halt, deadline: Duration) -> String {
     match h {
         Halt::Deadline => format!("{}초 안에 끝나지 않아 멈춤", deadline.as_secs()),
         Halt::Abandoned => "업데이트를 기다리게 하지 않으려고 멈춤".to_string(),
     }
+}
+
+fn gib(n: u64) -> String {
+    format!("{:.1} GiB", n as f64 / (1024.0 * 1024.0 * 1024.0))
 }
 
 /// One capture (blocking). Never panics on I/O; every early end is an outcome.
@@ -649,6 +849,13 @@ pub(crate) fn capture(input: &CaptureInput, abandon: &AtomicBool) -> CaptureOutc
             }
         }
     };
+    // RULINGS AA6: a runtime folder that is itself a link is not followed (it could lead anywhere).
+    if std::fs::symlink_metadata(&install.runtime).map(|m| m.file_type().is_symlink()).unwrap_or(true) {
+        return CaptureOutcome::Undecidable {
+            reason: format!("동봉 런타임 폴더가 링크라 따라가지 않음 · {}", install.runtime.display()),
+            stats,
+        };
+    }
     let manifest = match load_manifest(&install.manifest) {
         Ok(m) => m,
         Err(e) => return CaptureOutcome::Undecidable { reason: e, stats },
@@ -676,23 +883,89 @@ pub(crate) fn capture(input: &CaptureInput, abandon: &AtomicBool) -> CaptureOutc
         }
     };
     let want = manifest_entries(&manifest).unwrap_or_default();
-    let mut edits: Vec<(String, bool)> = Vec::new(); // (rel, deleted)
-    for rel in classes.changed.iter().chain(classes.added.iter()) {
-        if !not_an_edit(rel) {
-            edits.push((rel.clone(), false));
-        }
-    }
-    for rel in &classes.missing {
-        if !not_an_edit(rel) {
-            edits.push((rel.clone(), true));
-        }
-    }
+    let mut edits: Vec<&String> = classes
+        .changed
+        .iter()
+        .chain(classes.added.iter())
+        .chain(classes.missing.iter())
+        .filter(|rel| !not_an_edit(rel))
+        .collect();
     edits.sort();
     if edits.is_empty() {
         elapsed(&mut stats);
         return CaptureOutcome::Clean { stats };
     }
-    let storable = edits.iter().filter(|(_, deleted)| !*deleted).count();
+
+    // The index records (RULINGS AA5): kind / scanned hash / link target from the scan for a present
+    // entry, kind from the manifest for a deleted one.
+    let mut records: Vec<IndexRecord> = edits
+        .iter()
+        .map(|rel| {
+            let manifest_entry = want.get(*rel).and_then(Value::as_object);
+            let sha256_manifest = manifest_entry
+                .filter(|o| o.get("t").and_then(Value::as_str) == Some("f"))
+                .and_then(|o| o.get("sha256"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let (kind, sha256_found, link_target) = match have.get(*rel).map(|f| &f.entry) {
+                Some(Entry::File { sha256, .. }) => ("file", Some(sha256.clone()), None),
+                Some(Entry::Link { target }) => ("link", None, Some(target.clone())),
+                Some(Entry::Other { .. }) => ("special", None, None),
+                None => match manifest_entry.and_then(|o| o.get("t")).and_then(Value::as_str) {
+                    Some("f") => ("file", None, None),
+                    Some("l") => ("link", None, None),
+                    _ => ("special", None, None),
+                },
+            };
+            IndexRecord {
+                rel: format!("{RUNTIME_DIR}/{rel}"),
+                kind,
+                stored: false,
+                sha256_manifest,
+                sha256_found,
+                link_target,
+            }
+        })
+        .collect();
+    let storable = edits.iter().filter(|rel| have.contains_key(**rel)).count();
+
+    // RULINGS AA4 (1): the same edit set already kept by an earlier capture of this version — copy
+    // nothing again, point to it.
+    if let Some(earlier) = find_same_capture(input, &records, &budget) {
+        let same_as = earlier.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let dir = match create_capture_dir(&input.store_parent, &input.leaf) {
+            Ok(d) => d,
+            Err(reason) => {
+                elapsed(&mut stats);
+                return CaptureOutcome::Incomplete { dir: None, edits: edits.len(), not_stored: storable, reason, stats };
+            }
+        };
+        let index = write_index(&dir, input, &records, Some(&same_as));
+        elapsed(&mut stats);
+        return match index {
+            Ok(()) => CaptureOutcome::AlreadyKept { dir, same_as: earlier, edits: edits.len(), stats },
+            Err(e) => CaptureOutcome::Incomplete {
+                dir: Some(dir),
+                edits: edits.len(),
+                not_stored: storable,
+                reason: format!("목록(index.json)을 쓰지 못함: {e}"),
+                stats,
+            },
+        };
+    }
+
+    // RULINGS AA4 (2): never let the capture be the reason the download fails — below the floor copy
+    // nothing, list the edits only.
+    let low_space = match (input.free_space)(&input.store_parent) {
+        None => Some("디스크 여유 공간을 확인하지 못해 복사하지 않고 목록만 남김".to_string()),
+        Some(free) if free < input.free_floor => Some(format!(
+            "디스크 여유 공간({})이 하한({})보다 적어 복사하지 않고 목록만 남김",
+            gib(free),
+            gib(input.free_floor)
+        )),
+        Some(_) => None,
+    };
+
     let dir = match create_capture_dir(&input.store_parent, &input.leaf) {
         Ok(d) => d,
         Err(reason) => {
@@ -700,61 +973,55 @@ pub(crate) fn capture(input: &CaptureInput, abandon: &AtomicBool) -> CaptureOutc
             return CaptureOutcome::Incomplete { dir: None, edits: edits.len(), not_stored: storable, reason, stats };
         }
     };
-
-    let mut records = Vec::with_capacity(edits.len());
     let mut not_stored = 0usize;
-    let mut first_reason: Option<String> = None;
+    let mut first_reason: Option<String> = low_space.clone();
     let mut copied: u64 = 0;
     let mut halted: Option<Halt> = None;
-    for (rel, deleted) in &edits {
-        let sha256_manifest = want
-            .get(rel)
-            .and_then(Value::as_object)
-            .filter(|o| o.get("t").and_then(Value::as_str) == Some("f"))
-            .and_then(|o| o.get("sha256"))
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let bundle_rel = format!("{RUNTIME_DIR}/{rel}");
-        let mut record = IndexRecord { rel: bundle_rel, sha256_manifest, sha256_found: None };
-        if *deleted {
-            records.push(record);
+    for (rel, record) in edits.iter().zip(records.iter_mut()) {
+        let Some(found) = have.get(*rel) else {
+            continue; // deleted: nothing to keep
+        };
+        if low_space.is_some() {
+            not_stored += 1;
             continue;
         }
         if halted.is_none() {
             halted = budget.check().err();
         }
-        let result: Result<Option<String>, String> = if let Some(h) = halted {
+        let result: Result<(), String> = if let Some(h) = halted {
             Err(halt_reason_ko(h, input.deadline))
         } else {
-            match (have.get(rel), store_path(&dir, rel)) {
-                (_, None) => Err(format!("보관할 수 없는 경로: {rel}")),
-                (None, _) => Err(format!("검사 결과에 없는 경로: {rel}")),
-                (Some(found), Some(dst)) => match &found.entry {
-                    Entry::File { .. } => {
+            match store_path(&dir, rel) {
+                None => Err(format!("보관할 수 없는 경로: {rel}")),
+                Some(dst) => match &found.entry {
+                    Entry::File { sha256, .. } => {
                         if copied.saturating_add(found.len) > input.max_bytes {
                             Err(format!("한 번에 보관하는 크기 상한({} MiB)을 넘음", input.max_bytes / (1024 * 1024)))
                         } else {
-                            copy_exact(&found.path, &dst).map(|sha| {
-                                copied = copied.saturating_add(found.len);
-                                Some(sha)
-                            })
+                            match copy_exact(&found.path, &dst) {
+                                Ok(copy_sha) if &copy_sha == sha256 => {
+                                    copied = copied.saturating_add(found.len);
+                                    Ok(())
+                                }
+                                Ok(_) => Err(format!("검사한 뒤에 바뀌어 검사한 내용과 다름: {rel}")),
+                                Err(e) => Err(e),
+                            }
                         }
                     }
-                    Entry::Link { target } => store_link(target, &dst).map(|()| None),
+                    Entry::Link { target } => store_link(target, &dst),
                     Entry::Other { .. } => Err(format!("특수 파일은 보관하지 않음: {rel}")),
                 },
             }
         };
         match result {
-            Ok(sha) => record.sha256_found = sha,
+            Ok(()) => record.stored = true,
             Err(reason) => {
                 not_stored += 1;
                 first_reason.get_or_insert(reason);
             }
         }
-        records.push(record);
     }
-    let index = write_index(&dir, input, &records);
+    let index = write_index(&dir, input, &records, None);
     elapsed(&mut stats);
     match (not_stored, index) {
         (0, Ok(())) => CaptureOutcome::Captured { dir, edits: edits.len(), stats },
@@ -781,18 +1048,20 @@ pub(crate) fn capture(input: &CaptureInput, abandon: &AtomicBool) -> CaptureOutc
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Notice {
     pub warn: bool,
-    pub title: &'static str,
+    pub title: String,
     pub body: String,
 }
 
 /// The notice of an outcome — `None` when there is nothing to tell (no bundled runtime, nothing
 /// edited). Every failure says that the update goes on.
 pub(crate) fn notice_ko(o: &CaptureOutcome) -> Option<Notice> {
+    const KEPT: &str = "앱 안쪽 수정 보관";
+    const FAILED: &str = "앱 안쪽 수정 보관 실패";
     match o {
         CaptureOutcome::NotApplicable | CaptureOutcome::Clean { .. } => None,
         CaptureOutcome::Captured { dir, edits, .. } => Some(Notice {
             warn: false,
-            title: "앱 안쪽 수정 보관",
+            title: KEPT.to_string(),
             body: format!(
                 "업데이트 전에 앱 안쪽에서 바뀐 파일 {edits}개(고침·추가·삭제)를 찾아, 남아 있는 파일은 {} 에 복사하고 \
                  전부를 목록({INDEX_FILE})에 적었습니다. 업데이트는 그대로 진행합니다. 새 버전에 다시 입히려면 마스터에게 \
@@ -800,9 +1069,20 @@ pub(crate) fn notice_ko(o: &CaptureOutcome) -> Option<Notice> {
                 dir.display()
             ),
         }),
+        CaptureOutcome::AlreadyKept { dir, same_as, edits, .. } => Some(Notice {
+            warn: false,
+            title: KEPT.to_string(),
+            body: format!(
+                "업데이트 전에 앱 안쪽에서 바뀐 파일 {edits}개를 찾았지만, 이전에 {} 에 보관한 것과 같아 다시 복사하지 \
+                 않았습니다(목록: {}). 업데이트는 그대로 진행합니다. 새 버전에 다시 입히려면 마스터에게 맡기세요 — 워커가 \
+                 확인한 뒤 다시 입힙니다.",
+                same_as.display(),
+                dir.join(INDEX_FILE).display()
+            ),
+        }),
         CaptureOutcome::Incomplete { dir: Some(dir), edits, not_stored: 0, reason, .. } => Some(Notice {
             warn: true,
-            title: "앱 안쪽 수정 보관 실패",
+            title: FAILED.to_string(),
             body: format!(
                 "업데이트 전에 앱 안쪽에서 바뀐 파일 {edits}개를 {} 에 복사했지만 목록을 남기지 못했습니다({reason}). \
                  업데이트는 그대로 진행합니다. {NOTICE_TAIL_KO}",
@@ -811,16 +1091,16 @@ pub(crate) fn notice_ko(o: &CaptureOutcome) -> Option<Notice> {
         }),
         CaptureOutcome::Incomplete { dir: Some(dir), edits, not_stored, reason, .. } => Some(Notice {
             warn: true,
-            title: "앱 안쪽 수정 보관 실패",
+            title: FAILED.to_string(),
             body: format!(
                 "앱 안쪽에서 바뀐 파일 {edits}개 가운데 {not_stored}개를 업데이트 전에 보관하지 못했습니다({reason}). \
-                 보관한 것은 {} 에 있습니다(목록: {INDEX_FILE}). 업데이트는 그대로 진행합니다. {NOTICE_TAIL_KO}",
+                 보관한 것과 목록은 {} 에 있습니다(목록: {INDEX_FILE}). 업데이트는 그대로 진행합니다. {NOTICE_TAIL_KO}",
                 dir.display()
             ),
         }),
         CaptureOutcome::Incomplete { dir: None, edits, reason, .. } => Some(Notice {
             warn: true,
-            title: "앱 안쪽 수정 보관 실패",
+            title: FAILED.to_string(),
             body: format!(
                 "앱 안쪽에서 바뀐 파일 {edits}개를 업데이트 전에 보관하지 못했습니다({reason}). \
                  업데이트는 그대로 진행합니다. {NOTICE_TAIL_KO}"
@@ -828,7 +1108,7 @@ pub(crate) fn notice_ko(o: &CaptureOutcome) -> Option<Notice> {
         }),
         CaptureOutcome::Undecidable { reason, .. } => Some(Notice {
             warn: true,
-            title: "앱 안쪽 수정 확인 실패",
+            title: "앱 안쪽 수정 확인 실패".to_string(),
             body: format!(
                 "앱 안쪽 파일이 바뀌었는지 업데이트 전에 확인하지 못했습니다({reason}). \
                  업데이트는 그대로 진행합니다. {NOTICE_TAIL_KO}"
@@ -846,6 +1126,12 @@ pub(crate) fn log_line(o: &CaptureOutcome) -> String {
         CaptureOutcome::Captured { dir, edits, stats } => {
             format!("bundle-edits: {edits} edit(s) kept in {} · {}", dir.display(), st(stats))
         }
+        CaptureOutcome::AlreadyKept { dir, same_as, edits, stats } => format!(
+            "bundle-edits: {edits} edit(s) already kept in {} — index {} · {}",
+            same_as.display(),
+            dir.display(),
+            st(stats)
+        ),
         CaptureOutcome::Incomplete { dir, edits, not_stored, reason, stats } => format!(
             "bundle-edits: {not_stored} of {edits} edit(s) not kept ({reason}) · folder {} · {}",
             dir.as_ref().map(|d| d.display().to_string()).unwrap_or_else(|| "-".to_string()),
@@ -853,6 +1139,73 @@ pub(crate) fn log_line(o: &CaptureOutcome) -> String {
         ),
         CaptureOutcome::Undecidable { reason, stats } => format!("bundle-edits: undecidable ({reason}) · {}", st(stats)),
     }
+}
+
+// ───────────────────────────── the notice that must outlive the app (RULINGS AA3) ─────────────────────────────
+
+/// Where pending notices live: the local area that holds the store (`~/.cys/local`, the parent of
+/// `bundle-edits/`), so a notice can be recorded even when the store itself cannot be created.
+pub(crate) fn notice_dir_of(store_parent: &Path) -> PathBuf {
+    store_parent.parent().map(Path::to_path_buf).unwrap_or_else(|| store_parent.to_path_buf())
+}
+
+/// `<local>/bundle-edits.pending-notice-<leaf>.json` — one write-once record per capture.
+pub(crate) fn pending_notice_path(notice_dir: &Path, leaf: &str) -> PathBuf {
+    notice_dir.join(format!("{PENDING_NOTICE_PREFIX}{leaf}.json"))
+}
+
+/// Records a notice to be shown once at the next app start (write-once: an existing record is never
+/// overwritten).
+pub(crate) fn record_pending_notice(notice_dir: &Path, leaf: &str, notice: &Notice) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(notice_dir).map_err(|e| format!("{}: {e}", notice_dir.display()))?;
+    let path = pending_notice_path(notice_dir, leaf);
+    let body = json!({"schema": 1, "leaf": leaf, "warn": notice.warn, "title": notice.title, "body": notice.body});
+    let mut bytes = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
+    bytes.push(b'\n');
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    std::io::Write::write_all(&mut f, &bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    f.sync_all().map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(path)
+}
+
+/// Takes every pending notice ONCE: each record is renamed to `bundle-edits.shown-notice-<leaf>.json`
+/// BEFORE it is returned (a record that cannot be renamed is not returned, so it can never be shown
+/// twice); unreadable or malformed records are left alone. Nothing is deleted.
+pub(crate) fn take_pending_notices(notice_dir: &Path) -> Vec<Notice> {
+    let Ok(listing) = std::fs::read_dir(notice_dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = listing
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.starts_with(PENDING_NOTICE_PREFIX) && n.ends_with(".json"))
+        .collect();
+    names.sort();
+    let mut out = Vec::new();
+    for name in names {
+        let path = notice_dir.join(&name);
+        let Ok(bytes) = read_capped(&path, MAX_NOTICE_BYTES) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        let (Some(1), Some(warn), Some(title), Some(body)) =
+            (v["schema"].as_u64(), v["warn"].as_bool(), v["title"].as_str(), v["body"].as_str())
+        else {
+            continue;
+        };
+        let leaf = &name[PENDING_NOTICE_PREFIX.len()..name.len() - ".json".len()];
+        let shown = notice_dir.join(format!("{SHOWN_NOTICE_PREFIX}{leaf}.json"));
+        if std::fs::rename(&path, &shown).is_ok() {
+            out.push(Notice { warn, title: title.to_string(), body: body.to_string() });
+        }
+    }
+    out
 }
 
 // ───────────────────────────── the bounded call from the update handler ─────────────────────────────
@@ -884,31 +1237,53 @@ where
     }
 }
 
-/// Tells the outcome: one stderr line; for a warning the existing in-app `update-error` toast
-/// ("업데이트 경고"); for every notice an OS notification through the notification plugin already
-/// registered by the app (it outlives the app, which closes right after the installer starts on
-/// Windows). Each channel is best effort and cannot fail the update.
-fn deliver(app: &tauri::AppHandle, outcome: &CaptureOutcome) {
-    eprintln!("[cys-app] {}", log_line(outcome));
-    let Some(n) = notice_ko(outcome) else {
-        return;
-    };
+/// Shows a notice now: for a warning the existing in-app `update-error` toast ("업데이트 경고"), for every
+/// notice an OS notification through the notification plugin already registered by the app. Each
+/// channel is best effort and cannot fail the update.
+fn deliver_notice(app: &tauri::AppHandle, n: &Notice) {
     if n.warn {
         let _ = app.emit("update-error", n.body.clone());
     }
     if let Some(plugin) = app.try_state::<tauri_plugin_notification::Notification<tauri::Wry>>() {
-        let _ = plugin.builder().title(n.title).body(n.body.clone()).show();
+        let _ = plugin.builder().title(n.title.clone()).body(n.body.clone()).show();
     }
 }
 
 /// THE call of the update handler (both places). Returns when the capture is done, cut off or
-/// failed — never an error: the update goes on in every case.
+/// failed — never an error: the update goes on in every case. The notice is told exactly once: at
+/// the macOS place now; at the Windows place the handler leaves the process right after (write →
+/// launch → exit) before any banner task could run, so it is recorded and shown at the next start
+/// (RULINGS AA3).
 pub(crate) async fn capture_before_install(app: &tauri::AppHandle, to_version: &str, site: Site) {
     if !site_applies(cfg!(target_os = "macos"), site) {
         return;
     }
-    let outcome = run_bounded_with(CaptureInput::for_this_app(to_version), JOIN_GRACE, capture).await;
-    deliver(app, &outcome);
+    let input = CaptureInput::for_this_app(to_version);
+    let (notice_dir, leaf) = (notice_dir_of(&input.store_parent), input.leaf.clone());
+    let outcome = run_bounded_with(input, JOIN_GRACE, capture).await;
+    eprintln!("[cys-app] {}", log_line(&outcome));
+    let Some(notice) = notice_ko(&outcome) else {
+        return;
+    };
+    match site {
+        Site::CheckedLaunch => {
+            if let Err(e) = record_pending_notice(&notice_dir, &leaf, &notice) {
+                eprintln!("[cys-app] bundle-edits: pending notice not recorded ({e})");
+            }
+        }
+        Site::SingleCall => deliver_notice(app, &notice),
+    }
+}
+
+/// At app start (from `update_attempt_report`, the place that already reads the update-attempt
+/// record): shows each pending notice once (RULINGS AA3).
+pub(crate) fn show_pending_notices(app: &tauri::AppHandle) {
+    let store = cys::repair::paths::bundle_edits_dir("0", "0");
+    let store_parent = store.parent().map(Path::to_path_buf).unwrap_or(store);
+    for n in take_pending_notices(&notice_dir_of(&store_parent)) {
+        eprintln!("[cys-app] bundle-edits: showing the notice recorded at the last update");
+        deliver_notice(app, &n);
+    }
 }
 
 #[cfg(test)]
@@ -1290,6 +1665,8 @@ mod tests {
             to_version: "0.15.1".to_string(),
             deadline: Duration::from_secs(120),
             max_bytes: MAX_CAPTURE_BYTES,
+            free_floor: MAX_CAPTURE_BYTES + FREE_SPACE_MARGIN,
+            free_space: store_free_space,
         }
     }
 
@@ -1359,7 +1736,8 @@ mod tests {
         assert_eq!(index["schema"], 1);
         assert_eq!(index["from_version"], "0.15.0");
         assert_eq!(index["to_version"], "0.15.1");
-        assert_eq!(index.as_object().unwrap().len(), 4, "index.json = {{schema, from_version, to_version, files}}");
+        assert_eq!(index.as_object().unwrap().len(), 5, "index.json = {{schema, from_version, to_version, same_as, files}}");
+        assert!(index["same_as"].is_null());
         let files = index["files"].as_array().unwrap();
         let rels: Vec<&str> = files.iter().map(|f| f["rel"].as_str().unwrap()).collect();
         assert_eq!(
@@ -1368,13 +1746,17 @@ mod tests {
         );
         let man = &c["manifest_entries"];
         for f in files {
-            assert_eq!(f.as_object().unwrap().len(), 3, "{f}: {{rel, sha256_manifest, sha256_found}}");
+            assert_eq!(f.as_object().unwrap().len(), 6, "{f}: {{rel, kind, stored, sha256_manifest, sha256_found, link_target}} (AA5)");
             let rel = f["rel"].as_str().unwrap().strip_prefix("runtime/").unwrap();
             let expect_manifest = man.get(rel).map(|e| e["sha256"].clone()).unwrap_or(Value::Null);
             assert_eq!(f["sha256_manifest"], expect_manifest, "{rel}");
+            assert_eq!(f["kind"], "file", "{rel}");
+            assert!(f["link_target"].is_null(), "{rel}");
             let src = join_rel(&res.join(RUNTIME_DIR), rel);
-            let expect_found = if src.exists() { Value::String(sha_of(&src)) } else { Value::Null };
-            assert_eq!(f["sha256_found"], expect_found, "{rel}");
+            let present = src.exists();
+            let expect_found = if present { Value::String(sha_of(&src)) } else { Value::Null };
+            assert_eq!(f["sha256_found"], expect_found, "{rel}: the scanned hash for a present file, null only for a deleted one");
+            assert_eq!(f["stored"], present, "{rel}: every present edit kept, the deleted one not");
         }
         assert_eq!(snapshot(&top), before, "{layout}: the capture changed the bundle");
         assert_eq!(listing(&t.path().join("home")), listing(&store).iter().map(|r| format!(".cys/local/bundle-edits/{r}")).collect::<Vec<_>>(), "nothing written outside the store");
@@ -1479,7 +1861,11 @@ mod tests {
         };
         assert!(reason.contains("상한"), "{reason}");
         let index: Value = serde_json::from_slice(&std::fs::read(dir.join(INDEX_FILE)).unwrap()).unwrap();
-        let found: BTreeMap<&str, bool> = index["files"].as_array().unwrap().iter().map(|f| (f["rel"].as_str().unwrap(), !f["sha256_found"].is_null())).collect();
+        let found: BTreeMap<&str, bool> = index["files"].as_array().unwrap().iter().map(|f| (f["rel"].as_str().unwrap(), f["stored"].as_bool().unwrap())).collect();
+        for f in index["files"].as_array().unwrap() {
+            let deleted = f["rel"] == "runtime/python/lib/mod.py";
+            assert_eq!(f["sha256_found"].is_null(), deleted, "{f}: a present file always carries its scanned hash, kept or not (AA5)");
+        }
         assert_eq!(found["runtime/node/lib/node_modules/@user/tool/index.js"], true);
         assert_eq!(found["runtime/notes.preview.txt"], false);
         assert_eq!(found["runtime/python/lib/site.py"], false);
@@ -1688,7 +2074,8 @@ mod tests {
     fn the_capture_has_no_other_caller() {
         let code: String = main_prod().lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
         assert_eq!(code.matches("capture_before_install(").count(), 2, "the capture is called from the two handler places only");
-        assert_eq!(code.matches("bundle_edits::").count(), 4);
+        assert_eq!(code.matches("show_pending_notices(").count(), 1, "pending notices are shown from one place (the attempt report)");
+        assert_eq!(code.matches("bundle_edits::").count(), 5);
         assert_eq!(code.matches("\nmod bundle_edits;\n").count(), 1);
         for other in [include_str!("feedback.rs"), include_str!("close_surface_tests.rs")] {
             assert!(!other.contains("capture_before_install"));
@@ -1708,8 +2095,11 @@ mod tests {
         }
         // (`nix::` of the app census is left out: the `nix` crate is no dependency of this crate and the
         // substring also matches `std::os::unix::`, which the exec-bit arm uses.)
+        // libc only for the no-follow open flags and the free-space query (AA4, AA6) — nothing else.
+        let allowed = ["libc::O_NOFOLLOW", "libc::O_NONBLOCK", "libc::statvfs"];
+        assert_eq!(code.matches("libc::").count(), allowed.iter().map(|a| code.matches(a).count()).sum::<usize>(), "a libc call beyond {allowed:?}");
         for w in [
-            "Command::new", ".spawn(", "process::exit", "std::process", "libc::", "launchctl", "osascript", "rpc_oneshot(",
+            "Command::new", ".spawn(", "process::exit", "std::process", "launchctl", "osascript", "rpc_oneshot(",
             "rpc_on(", "rpc_once(", " rpc(", "rpc_full", "conn_cell", "request(", "\"surface.", "\"ledger.", "\"system.", "\"daemon.",
             "\"channel.", "remove_file", "remove_dir",
         ] {
@@ -1741,6 +2131,257 @@ mod tests {
                 c.changed.len()
             );
         }
+    }
+
+    // ───────── RULINGS AA4: free space and an identical earlier capture ─────────
+
+    fn unmeasurable(_: &Path) -> Option<u64> {
+        None
+    }
+
+    /// AA4: below the floor (cap + 2 GiB) — or when the free space cannot be measured — nothing is
+    /// copied, the edits are listed, one notice; the update goes on.
+    #[test]
+    fn low_free_space_copies_nothing_and_lists_the_edits() {
+        let cases: [(&str, u64, fn(&Path) -> Option<u64>); 2] =
+            [("below the floor", u64::MAX, store_free_space), ("unmeasurable", 0, unmeasurable)];
+        for (label, floor, measure) in cases {
+            let t = Tmp::new("lowspace");
+            let (exe, _res, _top) = fixture_install(t.path(), "mac");
+            let mut input = input_for(&exe, &t.path().join("store"));
+            input.free_floor = floor;
+            input.free_space = measure;
+            let o = capture(&input, &AtomicBool::new(false));
+            let CaptureOutcome::Incomplete { dir: Some(dir), edits: 5, not_stored: 4, reason, .. } = &o else {
+                panic!("{label}: {o:?}");
+            };
+            assert!(reason.contains("복사하지 않고 목록만 남김"), "{label}: {reason}");
+            assert_eq!(listing(dir), vec![INDEX_FILE.to_string()], "{label}: nothing copied, only the list");
+            let index: Value = serde_json::from_slice(&std::fs::read(dir.join(INDEX_FILE)).unwrap()).unwrap();
+            let files = index["files"].as_array().unwrap();
+            assert_eq!(files.len(), 5, "{label}: every edit listed");
+            assert!(files.iter().all(|f| f["stored"] == false), "{label}: {files:?}");
+            let n = notice_ko(&o).unwrap();
+            assert!(n.warn && n.body.contains("업데이트는 그대로 진행합니다") && n.body.contains("목록만 남김"), "{label}: {}", n.body);
+        }
+    }
+
+    #[test]
+    fn free_space_is_measured_on_the_store_volume() {
+        let t = Tmp::new("free");
+        let free = store_free_space(&t.path().join("not").join("created").join("yet")).expect("measured on the nearest existing folder");
+        assert!(free > 0);
+        assert_eq!(CaptureInput::for_this_app("9.9.9").free_floor, MAX_CAPTURE_BYTES + FREE_SPACE_MARGIN);
+    }
+
+    /// AA4: a retry of the same update (same version, same edit set) copies nothing again and points to
+    /// the earlier capture; another version, a changed edit, an earlier capture that did not keep
+    /// everything or whose copy is gone are never reused.
+    #[test]
+    fn an_identical_earlier_capture_is_not_copied_again() {
+        let t = Tmp::new("dedupe");
+        let (exe, res, _top) = fixture_install(t.path(), "mac");
+        let store = t.path().join("store");
+        let first = capture(&input_for(&exe, &store), &AtomicBool::new(false));
+        let CaptureOutcome::Captured { dir: first_dir, .. } = &first else { panic!("{first:?}") };
+        let with_leaf = |leaf: &str| {
+            let mut i = input_for(&exe, &store);
+            i.leaf = leaf.to_string();
+            i
+        };
+        let second = capture(&with_leaf("0.15.0-20261113T020000000000Z"), &AtomicBool::new(false));
+        let CaptureOutcome::AlreadyKept { dir, same_as, edits: 5, .. } = &second else { panic!("{second:?}") };
+        assert_eq!(same_as, first_dir);
+        assert_eq!(listing(dir), vec![INDEX_FILE.to_string()], "only the index — no second copy");
+        let index: Value = serde_json::from_slice(&std::fs::read(dir.join(INDEX_FILE)).unwrap()).unwrap();
+        assert_eq!(index["same_as"], LEAF);
+        assert!(index["files"].as_array().unwrap().iter().all(|f| f["stored"] == false), "the bytes are in the earlier folder");
+        let n = notice_ko(&second).unwrap();
+        assert!(!n.warn && n.body.contains(&first_dir.display().to_string()) && n.body.contains("다시 복사하지 않았습니다"));
+        // another version never points to it
+        let mut other = with_leaf("0.15.1-20261113T030000000000Z");
+        other.from_version = "0.15.1".to_string();
+        assert!(matches!(capture(&other, &AtomicBool::new(false)), CaptureOutcome::Captured { .. }));
+        // a changed edit is copied again
+        std::fs::write(join_rel(&res.join(RUNTIME_DIR), "python/lib/site.py"), b"import os\n# a second edit\n").unwrap();
+        let changed = capture(&with_leaf("0.15.0-20261113T040000000000Z"), &AtomicBool::new(false));
+        let CaptureOutcome::Captured { dir: changed_dir, .. } = &changed else { panic!("{changed:?}") };
+        // an earlier capture whose stored copy is gone is not reused (the test removes it in its own temp folder)
+        std::fs::remove_file(join_rel(changed_dir, "runtime/notes.preview.txt")).unwrap();
+        assert!(matches!(capture(&with_leaf("0.15.0-20261113T050000000000Z"), &AtomicBool::new(false)), CaptureOutcome::Captured { .. }));
+        // an earlier capture that did not keep every edit is not reused
+        let t2 = Tmp::new("dedupe-partial");
+        let (exe2, _res2, _top2) = fixture_install(t2.path(), "mac");
+        let store2 = t2.path().join("store");
+        let mut capped = input_for(&exe2, &store2);
+        capped.max_bytes = 40;
+        assert!(matches!(capture(&capped, &AtomicBool::new(false)), CaptureOutcome::Incomplete { .. }));
+        let mut again = input_for(&exe2, &store2);
+        again.leaf = "0.15.0-20261113T060000000000Z".to_string();
+        assert!(matches!(capture(&again, &AtomicBool::new(false)), CaptureOutcome::Captured { .. }));
+    }
+
+    // ───────── RULINGS AA5: unambiguous index entries ─────────
+
+    /// AA5 for links and special files (Unix — they cannot be made on Windows here): a link is
+    /// `kind: "link"` with its target and is kept as a link; a fifo is `kind: "special"`, never stored;
+    /// a link replaced by a file is `kind: "file"` with its scanned hash.
+    #[test]
+    fn index_entries_say_kind_stored_and_link_target() {
+        if !cfg!(unix) {
+            return;
+        }
+        let fx = fixture();
+        for name in ["exec-bits-and-links", "manifest-basename-and-special-files"] {
+            let c = case(&fx, name);
+            let t = Tmp::new("kinds");
+            let exe = t.path().join("cys.app/Contents/MacOS/cys-app");
+            let res = t.path().join("cys.app/Contents/Resources");
+            std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+            std::fs::write(&exe, b"app").unwrap();
+            assert!(materialize(&c["found"], &res.join(RUNTIME_DIR)));
+            std::fs::write(res.join(MANIFEST_BASENAME), serde_json::to_vec(&manifest_of(c)).unwrap()).unwrap();
+            let o = capture(&input_for(&exe, &t.path().join("store")), &AtomicBool::new(false));
+            let dir = match (&o, name) {
+                (CaptureOutcome::Captured { dir, .. }, "exec-bits-and-links") => dir.clone(),
+                (CaptureOutcome::Incomplete { dir: Some(dir), not_stored: 2, reason, .. }, _) if reason.contains("특수 파일") => dir.clone(),
+                _ => panic!("{name}: {o:?}"),
+            };
+            let index: Value = serde_json::from_slice(&std::fs::read(dir.join(INDEX_FILE)).unwrap()).unwrap();
+            let by_rel: BTreeMap<String, Value> =
+                index["files"].as_array().unwrap().iter().map(|f| (f["rel"].as_str().unwrap().to_string(), f.clone())).collect();
+            let get = |rel: &str| by_rel.get(&format!("runtime/{rel}")).unwrap_or_else(|| panic!("{name}: {rel} missing")).clone();
+            if name == "exec-bits-and-links" {
+                for (rel, target) in [("dangling", "nowhere"), ("git/libexec/git-add", "git2")] {
+                    let f = get(rel);
+                    assert_eq!((f["kind"].as_str(), f["stored"].as_bool(), f["link_target"].as_str()), (Some("link"), Some(true), Some(target)), "{f}");
+                    assert!(f["sha256_found"].is_null());
+                    assert_eq!(std::fs::read_link(join_rel(&dir, &format!("runtime/{rel}"))).unwrap(), PathBuf::from(target), "kept as a link");
+                }
+                let npm = get("node/bin/npm");
+                assert_eq!((npm["kind"].as_str(), npm["stored"].as_bool()), (Some("file"), Some(true)), "{npm}");
+                assert!(npm["sha256_found"].is_string() && npm["sha256_manifest"].is_null() && npm["link_target"].is_null(), "{npm}");
+                for rel in ["tools/run", "tools/data"] {
+                    assert_eq!(get(rel)["kind"], "file");
+                }
+            } else {
+                for rel in ["pipe0", "pipe1"] {
+                    let f = get(rel);
+                    assert_eq!((f["kind"].as_str(), f["stored"].as_bool()), (Some("special"), Some(false)), "{f}");
+                    assert!(f["sha256_found"].is_null() && f["link_target"].is_null());
+                }
+                let nested = get("sub/runtime-manifest.json");
+                assert_eq!((nested["kind"].as_str(), nested["stored"].as_bool()), (Some("file"), Some(true)));
+            }
+        }
+    }
+
+    // ───────── RULINGS AA6: no link is followed, reads are capped ─────────
+
+    #[test]
+    fn a_symlinked_runtime_root_is_refused() {
+        if !cfg!(unix) {
+            return;
+        }
+        let t = Tmp::new("rootlink");
+        let (exe, res, _top) = fixture_install(t.path(), "mac");
+        let real = t.path().join("elsewhere");
+        std::fs::rename(res.join(RUNTIME_DIR), &real).unwrap();
+        assert!(make_link(real.to_str().unwrap(), &res.join(RUNTIME_DIR)));
+        let o = capture(&input_for(&exe, &t.path().join("store")), &AtomicBool::new(false));
+        assert!(matches!(&o, CaptureOutcome::Undecidable { reason, .. } if reason.contains("링크라 따라가지 않음")), "{o:?}");
+        assert!(!t.path().join("store").exists());
+        assert!(notice_ko(&o).unwrap().warn);
+    }
+
+    #[test]
+    fn reads_are_capped_and_never_follow_links() {
+        let t = Tmp::new("capped");
+        let f = t.path().join("m.json");
+        std::fs::write(&f, b"0123456789").unwrap();
+        assert_eq!(read_capped(&f, 10).unwrap(), b"0123456789".to_vec());
+        assert!(read_capped(&f, 9).is_err(), "a file longer than the cap is refused");
+        let src = include_str!("bundle_edits.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests {").unwrap()];
+        assert!(prod.contains("parse_manifest(&read_capped(path, MAX_MANIFEST_BYTES)?)"), "the manifest goes through the capped read");
+        assert!(prod.contains("let mut input = open_no_follow(src)"), "the copy source is opened without following links");
+        if cfg!(unix) {
+            let link = t.path().join("link.json");
+            assert!(make_link(f.to_str().unwrap(), &link));
+            assert!(open_no_follow(&link).is_err() && read_capped(&link, 100).is_err(), "a link is not followed");
+            assert!(copy_exact(&link, &t.path().join("copy")).is_err(), "a copy source that is a link is refused");
+            assert!(!t.path().join("copy").exists());
+            let fifo = t.path().join("fifo");
+            assert!(make_fifo(&fifo, 0o644));
+            assert!(open_no_follow(&fifo).is_err(), "a fifo is refused at once (O_NONBLOCK + re-check through the handle)");
+        }
+    }
+
+    // ───────── RULINGS AA3: the Windows notice is shown at the next start ─────────
+
+    #[test]
+    fn a_pending_notice_is_written_once_and_shown_once() {
+        let t = Tmp::new("pending");
+        let local = t.path().join("local");
+        let n = Notice { warn: true, title: "앱 안쪽 수정 보관 실패".into(), body: "업데이트는 그대로 진행합니다".into() };
+        let p = record_pending_notice(&local, LEAF, &n).unwrap();
+        assert_eq!(p, local.join(format!("bundle-edits.pending-notice-{LEAF}.json")));
+        let later = Notice { warn: false, title: "x".into(), body: "y".into() };
+        assert!(record_pending_notice(&local, LEAF, &later).is_err(), "write-once: an existing record is never overwritten");
+        assert_eq!(take_pending_notices(&local), vec![n.clone()]);
+        assert!(take_pending_notices(&local).is_empty(), "shown once");
+        assert!(!p.exists() && local.join(format!("bundle-edits.shown-notice-{LEAF}.json")).exists(), "renamed, not deleted");
+        std::fs::write(local.join("bundle-edits.pending-notice-bad.json"), b"{").unwrap();
+        assert!(take_pending_notices(&local).is_empty(), "a malformed record is never shown");
+        assert!(local.join("bundle-edits.pending-notice-bad.json").exists(), "and left alone");
+        // C-p18-06 at the Windows place: the store is blocked by a plain file, the notice is still recorded beside it
+        let t2 = Tmp::new("pending-blocked");
+        let (exe, _res, _top) = fixture_install(t2.path(), "win");
+        let loc = t2.path().join("home").join(".cys").join("local");
+        std::fs::create_dir_all(&loc).unwrap();
+        std::fs::write(loc.join("bundle-edits"), b"a plain file").unwrap();
+        let input = input_for(&exe, &loc.join("bundle-edits"));
+        let o = capture(&input, &AtomicBool::new(false));
+        let n = notice_ko(&o).unwrap();
+        assert_eq!(notice_dir_of(&input.store_parent), loc);
+        record_pending_notice(&notice_dir_of(&input.store_parent), &input.leaf, &n).unwrap();
+        assert_eq!(take_pending_notices(&loc), vec![n]);
+    }
+
+    #[test]
+    fn the_notice_directory_is_the_local_area() {
+        let store = cys::repair::paths::bundle_edits_dir("0", "0");
+        assert_eq!(notice_dir_of(store.parent().unwrap()), cys::pack::local_dir());
+    }
+
+    /// AA3 / AA6: `capture_before_install` checks the site with `site_applies(cfg!(target_os = "macos"), site)`
+    /// and tells the notice exactly once — recorded for the next start at the Windows place, delivered at
+    /// the macOS place.
+    #[test]
+    fn capture_before_install_checks_the_site_and_tells_exactly_once() {
+        let src = include_str!("bundle_edits.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests {").unwrap()];
+        let f = fn_code(prod, "pub(crate) async fn capture_before_install(");
+        assert!(f.contains("    if !site_applies(cfg!(target_os = \"macos\"), site) {\n        return;\n    }"), "{f}");
+        assert_eq!(f.matches("deliver_notice(").count(), 1, "{f}");
+        assert_eq!(f.matches("record_pending_notice(").count(), 1, "{f}");
+        assert!(f.contains("        Site::CheckedLaunch => {\n            if let Err(e) = record_pending_notice(&notice_dir, &leaf, &notice) {"), "{f}");
+        assert!(f.contains("        Site::SingleCall => deliver_notice(app, &notice),"), "{f}");
+        for banned in ["loop", "for ", "while "] {
+            assert!(!f.contains(banned), "`{banned}` in capture_before_install");
+        }
+        assert_eq!(prod.matches("deliver_notice(").count(), 3, "defined once, called by capture_before_install and show_pending_notices");
+    }
+
+    /// AA3: the start-time display sits in `update_attempt_report` (the place that already reads the
+    /// update-attempt record at start) — once, before the attempt-record knob.
+    #[test]
+    fn the_attempt_report_shows_pending_notices_once_before_its_knob() {
+        let report = fn_code(main_prod(), "async fn update_attempt_report(");
+        assert!(report.starts_with("async fn update_attempt_report(app: AppHandle) -> Option<Value> {"), "{report}");
+        assert_eq!(report.matches("bundle_edits::show_pending_notices(&app);").count(), 1);
+        let show = report.find("bundle_edits::show_pending_notices(&app);").unwrap();
+        assert!(show < report.find("update_verify_from_env(").unwrap());
     }
 
     // ───────── the installer byte identity (RULINGS D5 · pass condition I) ─────────

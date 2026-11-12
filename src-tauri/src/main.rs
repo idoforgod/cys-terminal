@@ -3521,7 +3521,10 @@ fn smart_app_control_state() -> Option<&'static str> {
 /// · `{"failed": true, "from", "to", "at", "os", "sac"}`(설치되지 않았다 — 기록은 이 호출이 지웠다: 1회만 알린다).
 /// `CYS_UPDATE_VERIFY=0` 이면 늘 null. 판독·조회 실패는 전부 null — 이 기능 때문에 부팅이나 업데이트가 막히지 않는다.
 #[tauri::command]
-async fn update_attempt_report() -> Option<Value> {
+async fn update_attempt_report(app: AppHandle) -> Option<Value> {
+    // ★(0.15.0 · M16 · RULINGS AA3) 지난 업데이트의 앱 안쪽 수정 보관 알림 — 윈도우 확인 실행 경로는 설치기를 띄우고 곧바로 종료해 그 자리에서 알릴 수 없어
+    //   기록만 남겼다. 기동 때 한 번 보인다(보인 기록은 이름을 바꿔 다시 보이지 않는다). 시도 기록 판정과는 무관 — 노브(CYS_UPDATE_VERIFY)와 상관없이 돈다.
+    bundle_edits::show_pending_notices(&app);
     if !update_verify_from_env(cys::env_compat("CYS_UPDATE_VERIFY").as_deref()) {
         return None;
     }
