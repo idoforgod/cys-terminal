@@ -296,7 +296,17 @@ pub(crate) struct Ctx<'a> {
     pub classify: &'a dyn Fn(&str) -> Result<cys::repair::types::Classification, RepairError>,
     /// Runs the repair's check on a live file with a deadline (T5b's runner in production).
     pub check: &'a dyn Fn(&str, &Path, std::time::Duration) -> Result<CheckReport, RepairError>,
+    /// The hook step of RULINGS Y1 (`apply::hook_lines_step`, T6's, in production).
+    pub hook_step: &'a HookStepFn<'a>,
 }
+
+/// The shape of `apply::hook_lines_step` (injected so the commit's hook half is testable).
+pub(crate) type HookStepFn<'a> = dyn Fn(
+        &cys::repair::types::RepairId,
+        &LaneKey,
+        cys::repair::apply::HookStep,
+    ) -> Result<cys::repair::apply::ReconcileReport, RepairError>
+    + 'a;
 
 impl Ctx<'_> {
     /// Runs `f` under the in-memory per-repair mutex of `key` (RULINGS G6, R3): every
@@ -361,6 +371,7 @@ pub(crate) fn handle(
         },
         classify: &classify,
         check: &check,
+        hook_step: &cys::repair::apply::hook_lines_step,
     };
     Reply::Single(match handle_with(&ctx, &caller, sub, params) {
         Ok(v) => ok_response(id, v),
@@ -430,7 +441,7 @@ pub(crate) fn role_check(sub: &str, caller: &Caller, windows: bool) -> Result<()
             let current = caller.role.as_deref().and_then(role_family);
             if current != Some(bound) {
                 return Err(VerbError::refused(format!(
-                    "이 좌석은 처음에 '{}' 역할로 섰고 지금은 '{}' 입니다 — 역할 이름을 바꾼 좌석은 수리 명령을 쓸 수 없습니다(RULINGS AD1)",
+                    "이 좌석은 처음에 '{}' 역할로 섰고 지금은 '{}' 입니다 — 역할 이름을 바꾼 좌석은 수리 명령을 쓸 수 없습니다(RULINGS AD1). 되돌리는 길: 이 창을 닫고 새 창에서 그 역할을 받으세요",
                     bound.label(),
                     caller.role.as_deref().unwrap_or("역할 없음")
                 )));
@@ -1404,6 +1415,13 @@ mod ledger_verbs {
             }
             None => None,
         };
+        // AK6: a Windows path alias (a part ending in a dot or a space, or containing `:`) opens the
+        // file it aliases there but would escape the classification below — refused on every system.
+        if let Some(rel) = files.iter().find(|r| super::is_windows_alias(r)) {
+            return Err(VerbError::invalid(format!(
+                "{rel:?}: 끝이 점·공백이거나 ':' 가 든 경로 조각은 받지 않습니다(윈도우에서 다른 파일의 별칭이 됩니다)"
+            )));
+        }
         // AD6 / C10 10.6: a rule document is refused until T4's owner-token gate is merged (fail closed).
         if let Some(rel) = files.iter().find(|r| super::is_rule_document(r)) {
             return Err(VerbError::new(
@@ -1692,7 +1710,7 @@ mod ledger_verbs {
             return Err(VerbError::new(
                 cys::repair::types::ERR_PRECONDITION,
                 format!(
-                    "{}: 기동 필수·보호장치 경로는 합치기 모드로 직접 고치지 않습니다 — `cys repair begin --files … --resolves {}` 로 이 부서의 수리를 따로 시작하세요(RULINGS R1/T1)",
+                    "{}: 기동 필수·보호장치 경로는 합치기 모드로 직접 고치지 않습니다 — `cys repair begin --files … --trigger … --resolves {}` 로 이 부서의 수리를 따로 시작하세요(RULINGS R1/T1)",
                     target.as_str(),
                     target.as_str()
                 ),
@@ -1975,6 +1993,13 @@ mod ledger_verbs {
             if other.is_some_and(|a| a.seat == sid) {
                 return Err(VerbError::refused(format!("{}: 검증과 감사를 한 좌석이 둘 다 할 수 없습니다", id.as_str())));
             }
+            if rec.state == RepairState::Superseded {
+                // AK4: a superseded repair is never reopened by an audit (the newer repair is audited).
+                return Err(VerbError::new(
+                    cys::repair::types::ERR_PRECONDITION,
+                    format!("{}: 다른 수리로 대체된 수리는 서명하지 않습니다 — 그 파일의 최신 수리를 감사하세요", id.as_str()),
+                ));
+            }
             let approval_class = is_approval_class(rec.classification);
             let committed_general = !approval_class && matches!(rec.state, RepairState::Probation | RepairState::InUse);
             match slot {
@@ -2200,8 +2225,8 @@ mod ledger_verbs {
         })?;
         // (2) the check children — the per-repair mutex is NOT held (AD10 / R3)
         let checked = run_checks(ctx, &states)?;
-        // (3) re-take, re-read, abort if anything moved, then act
-        ctx.locked(id.as_str(), || -> Result<Value, VerbError> {
+        // (3a) re-take, re-read, abort if anything moved, then write the committed state durably
+        let (before, written, timings, mut checks, lines) = ctx.locked(id.as_str(), || -> Result<CommitStep, VerbError> {
             let mut rec = load(ctx, &id)?;
             if rec != snapshot {
                 return Err(VerbError::new(
@@ -2221,7 +2246,7 @@ mod ledger_verbs {
                     format!("{}: 이 잠금의 자동 수리 차례가 닫혔습니다 — 새 차례가 필요합니다", id.as_str()),
                 ));
             }
-            let (timings, mut checks) = match checked {
+            let (timings, checks) = match checked {
                 Ok(t) => t,
                 Err(why) => {
                     if let Some(w) = rec.worker_record.as_mut() {
@@ -2236,49 +2261,83 @@ mod ledger_verbs {
                 }
             };
             let before = rec.clone();
-            let committed = canon_list(&states);
-            rec.committed = committed.clone();
+            rec.committed = canon_list(&states);
             rec.checks = checks.clone();
             rec.state = RepairState::Probation;
             rec.audit_due_at = Some(ctx.now + AUDIT_WINDOW_SECS as f64);
             rec.lock = None;
             ledger::write_record_durable_in(&ctx.root, &rec)?;
-            // RULINGS Y1: the hook step only AFTER the committed state is durable.
-            let mut step_error: Option<String> = None;
             let lines: Vec<(String, String)> = hook_lines(&rec)
                 .filter_map(|f| match &f.kind {
                     ChangeKind::HookUnregister { event, script } => Some((event.clone(), script.clone())),
                     _ => None,
                 })
                 .collect();
-            let has_hooks = !lines.is_empty();
-            if has_hooks {
-                match cys::repair::apply::hook_lines_step(&id, &ctx.lane, cys::repair::apply::HookStep::Unregister) {
-                    Ok(report) => {
-                        // AD4: a hook line is checked by the registrar's report — claimed only for a
-                        // line the report shows unregistered in every settings file it touched.
-                        for (event, script) in &lines {
-                            if hook_line_confirmed(&report, event, script) {
-                                checks.push((format!("settings:{event}:{script}"), CHECK_HOOK_REGISTRAR.to_string()));
-                            } else {
-                                step_error.get_or_insert_with(|| format!("settings:{event}:{script}: 등록 해제가 등록기의 보고로 확인되지 않았습니다"));
-                            }
+            Ok((before, rec, timings, checks, lines))
+        })?;
+        let committed = written.committed.clone();
+        // RULINGS Y1: the hook step only AFTER the committed state is durable — and (AK5) WITHOUT the
+        // per-repair mutex: the registrar child must not stall a reap or another verb of this repair.
+        let has_hooks = !lines.is_empty();
+        let step = if has_hooks {
+            Some((ctx.hook_step)(
+                &id,
+                &ctx.lane,
+                cys::repair::apply::HookStep::Unregister,
+            ))
+        } else {
+            None
+        };
+        // (3b) the mutex re-taken: the hook step's result, older repairs superseded, tombstones, the row
+        ctx.locked(id.as_str(), || -> Result<Value, VerbError> {
+            let mut step_error: Option<String> = None;
+            let mut warnings: Vec<String> = Vec::new();
+            match step {
+                None => {}
+                Some(Ok(report)) => {
+                    // AD4: a hook line is checked by the registrar's report — claimed only for a
+                    // line the report shows unregistered in every settings file it touched.
+                    for (event, script) in &lines {
+                        if hook_line_confirmed(&report, event, script) {
+                            checks.push((format!("settings:{event}:{script}"), CHECK_HOOK_REGISTRAR.to_string()));
+                        } else {
+                            step_error.get_or_insert_with(|| format!("settings:{event}:{script}: 등록 해제가 등록기의 보고로 확인되지 않았습니다"));
                         }
                     }
-                    Err(RepairError::NotImplemented(f)) => {
-                        // Y1: until T6 lands, a commit with a hook line is refused with that sentence;
-                        // the stub changed nothing, so the record goes back to its pre-commit state.
-                        ledger::write_record_durable_in(&ctx.root, &before)?;
-                        return Err(RepairError::NotImplemented(f).into());
-                    }
-                    Err(e) => step_error = Some(VerbError::from(e).message),
                 }
+                Some(Err(RepairError::NotImplemented(f))) => {
+                    // Y1: until T6 lands, a commit with a hook line is refused with that sentence;
+                    // the stub changed nothing, so the record goes back to its pre-commit state (the
+                    // commit never stood — whatever was signed over it in the meantime is void too).
+                    ledger::write_record_durable_in(&ctx.root, &before)?;
+                    return Err(RepairError::NotImplemented(f).into());
+                }
+                Some(Err(e)) => step_error = Some(VerbError::from(e).message),
             }
-            // AD3 / C1 1.5: a committed deletion is tombstoned in this lane; a path committed present
-            // drops the File tombstones it had (both under the lane's tombstone mutex).
+            // The record as it is now (an audit may have signed while the hook step ran): only the
+            // `checks` field is this step's to change.
+            let mut rec = load(ctx, &id)?;
+            if rec.checks != checks {
+                rec.checks = checks.clone();
+                ledger::write_record_durable_in(&ctx.root, &rec)?;
+            }
+            // AK4 / C1 1.6: every OLDER repair of this lane in force on one of the same targets is
+            // superseded in this step (never reopened by an audit, never picked up afterwards).
+            let superseded = supersede_older(ctx, &written)?;
+            // AD3 / AK3 / C1 1.5: only a REAL deletion (the pre-image was present) is tombstoned;
+            // a path committed present drops only THIS repair's own File tombstone; an unreadable
+            // tombstone file is a warning there (a broken ledger file never stops repairs).
             for (rel, st) in &states {
-                let r = if *st == TargetState::Absent {
-                    cys::repair::tombstones::record_in(
+                let pre_present = written
+                    .files
+                    .iter()
+                    .find(|f| f.rel == *rel)
+                    .is_some_and(|f| f.pre != PreImage::Absent);
+                if *st == TargetState::Absent {
+                    if !pre_present {
+                        continue; // created and deleted again inside this repair: nothing was removed
+                    }
+                    let r = cys::repair::tombstones::record_in(
                         &ctx.root,
                         &ctx.lane,
                         &cys::repair::tombstones::Tombstone {
@@ -2286,17 +2345,13 @@ mod ledger_verbs {
                             kind: cys::repair::tombstones::TombstoneKind::File,
                             repair: id.clone(),
                         },
-                    )
-                } else {
-                    cys::repair::tombstones::remove_file_rel_in(&ctx.root, &ctx.lane, rel)
-                };
-                if let Err(e) = r {
-                    step_error.get_or_insert_with(|| format!("{rel}: 삭제 표식(묘비) 기록 실패 — {}", VerbError::from(e).message));
+                    );
+                    if let Err(e) = r {
+                        step_error.get_or_insert_with(|| format!("{rel}: 삭제 표식(묘비) 기록 실패 — {}", VerbError::from(e).message));
+                    }
+                } else if let Err(e) = cys::repair::tombstones::remove_file_rel_in(&ctx.root, &ctx.lane, rel, &id) {
+                    warnings.push(format!("{rel}: 삭제 표식 파일을 읽을 수 없어 이 수리의 표식을 지우지 못했습니다 — {}", VerbError::from(e).message));
                 }
-            }
-            if rec.checks != checks {
-                rec.checks = checks;
-                ledger::write_record_durable_in(&ctx.root, &rec)?;
             }
             let (version, pro) = pack_generation(&ctx.pack_dir);
             let previous = ledger::read_lane_in(&ctx.root, &id, &ctx.lane).ok().flatten();
@@ -2336,8 +2391,64 @@ mod ledger_verbs {
                 "committed": committed,
                 "audit_due_at": rec.audit_due_at,
                 "hook_step": if !has_hooks { json!(null) } else if let Some(e) = &step_error { json!({"error": e}) } else { json!("ok") },
+                "superseded": superseded.iter().map(|r| r.as_str().to_string()).collect::<Vec<_>>(),
+                "warnings": warnings,
             })))
         })
+    }
+
+    /// What step (3a) of `commit` hands on: the pre-commit record, the record as written, the check
+    /// timings, the checks that ran, the hook lines.
+    type CommitStep = (
+        RepairRecord,
+        RepairRecord,
+        Vec<CheckTiming>,
+        Vec<(String, String)>,
+        Vec<(String, String)>,
+    );
+
+    /// RULINGS AK4 / C1 1.6: marks 다른 수리로 대체됨 every repair of THIS lane (one writer per record —
+    /// B1) that is older than `newer` (lower number), in force (시험 기간 / 사용 중) and shares one of
+    /// its targets. Each is re-read under its own mutex (taken while `newer`'s is held — always from
+    /// the higher number to the lower, so no two commits wait on each other). Returns their ids.
+    fn supersede_older(ctx: &Ctx<'_>, newer: &RepairRecord) -> Result<Vec<RepairId>, VerbError> {
+        let targets: Vec<&str> = newer.files.iter().map(|f| f.rel.as_str()).collect();
+        let shares = |r: &RepairRecord| r.files.iter().any(|f| targets.contains(&f.rel.as_str()));
+        let in_force = |r: &RepairRecord| {
+            r.origin_lane == ctx.lane
+                && matches!(r.state, RepairState::Probation | RepairState::InUse)
+        };
+        let mut done = Vec::new();
+        let mut older: Vec<RepairId> = ledger::list_ids_in(&ctx.root)
+            .into_iter()
+            .filter(|o| *o < newer.id)
+            .collect();
+        older.sort();
+        older.reverse();
+        for oid in older {
+            let candidate = match ledger::read_record_in(&ctx.root, &oid) {
+                Ok(Some(r)) => in_force(&r) && shares(&r),
+                _ => false,
+            };
+            if !candidate {
+                continue;
+            }
+            let changed = ctx.locked(oid.as_str(), || -> Result<bool, VerbError> {
+                let Some(mut r) = ledger::read_record_in(&ctx.root, &oid)? else {
+                    return Ok(false);
+                };
+                if !(in_force(&r) && shares(&r)) {
+                    return Ok(false);
+                }
+                r.state = RepairState::Superseded;
+                ledger::write_record_durable_in(&ctx.root, &r)?;
+                Ok(true)
+            })?;
+            if changed {
+                done.push(oid);
+            }
+        }
+        Ok(done)
     }
 
     // ─────────────────────────────── list / status (READ) ───────────────────────────────
@@ -2832,6 +2943,16 @@ pub(crate) fn is_rule_document(rel: &str) -> bool {
         || (base.ends_with("_directive.md") && base.len() > "_directive.md".len())
 }
 
+/// RULINGS AK6: a path part that Windows resolves to another name — one ending in a dot or a space
+/// (`MASTER_DIRECTIVE.md.`, `soul.md `) or containing `:` (`soul.md::$DATA`, a drive or stream).
+pub(crate) fn is_windows_alias(rel: &str) -> bool {
+    rel.split(['/', '\\']).any(|part| {
+        part.ends_with('.') && part != "." && part != ".."
+            || part.ends_with(' ')
+            || part.contains(':')
+    })
+}
+
 /// Rule-document base names in a prompt, lower-cased, `.md` form (C10's classification, as
 /// `guard.sh:PROTECTED_NAMES` + `*_directive.md`): `soul.md`, `claude.md`,
 /// `vibecoding_constitution.md`, `vibecoding_enforcement.md`, `route_contract.md`, any
@@ -2891,6 +3012,7 @@ pub(crate) fn release_locks_for_seat(daemon: &Arc<Daemon>, sid: u64) {
         seats: Vec::new(),
         classify: &classify,
         check: &check,
+        hook_step: &cys::repair::apply::hook_lines_step,
     };
     ledger_verbs::release_seat(&ctx, sid);
 }

@@ -408,12 +408,35 @@ fn print_ok(out: &mut dyn Write, verb: &str, v: &Value, json_out: bool) {
                 ""
             }
         ),
-        "commit" => writeln!(
-            out,
-            "{id} 확정 — {} · 부서별: {}",
-            s(v, "state_label"),
-            lanes_line(v)
-        ),
+        "commit" => {
+            let mut r = writeln!(
+                out,
+                "{id} 확정 — {} · 부서별: {}",
+                s(v, "state_label"),
+                lanes_line(v)
+            );
+            // RULINGS AK4: older repairs of the same files now superseded; AK3: warnings
+            let ids = |k: &str| -> Vec<String> {
+                v.get(k)
+                    .and_then(|x| x.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let sup = ids("superseded");
+            if r.is_ok() && !sup.is_empty() {
+                r = writeln!(out, "  같은 파일의 이전 수리 대체됨: {}", sup.join(", "));
+            }
+            for w in ids("warnings") {
+                if r.is_ok() {
+                    r = writeln!(out, "  경고: {w}");
+                }
+            }
+            r
+        }
         "attest-verify" | "attest-audit" => {
             let reopened = s(v, "reopened");
             writeln!(
@@ -1093,6 +1116,18 @@ mod tests {
         assert!(String::from_utf8(out)
             .unwrap()
             .contains("작업 사본: /x/repairs/R-4/staging"));
+        // commit's human output names the superseded repairs and the warnings (AK3 / AK4)
+        let rpc3 = |_m: &str, _p: Value| -> Result<Value, String> {
+            Ok(
+                json!({"repair": "R-5", "state_label": "시험 기간", "lanes": {}, "superseded": ["R-2"], "warnings": ["bin/a.py: 삭제 표식 파일을 읽을 수 없어"]}),
+            )
+        };
+        let cmd = parse(&["commit", "R-5"]).unwrap();
+        let mut out = Vec::new();
+        assert_eq!(run_with(&cmd, &mut out, &mut Vec::new(), &rpc3), 0);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("이전 수리 대체됨: R-2"), "{text}");
+        assert!(text.contains("경고: bin/a.py"), "{text}");
     }
 
     /// `repair.*` is in neither the streaming nor the server-wait list: the CLI's 40-s cap applies,

@@ -134,14 +134,20 @@ pub fn remove_for_repair_in(root: &Path, lane: &LaneKey, id: &RepairId) -> Resul
     write_file(root, lane, kept)
 }
 
-/// RULINGS AD3: removes the FILE tombstones of one path from the lane's file (a later repair that
-/// commits that path present). Hook tombstones are left alone. Missing file = nothing to remove.
-pub fn remove_file_rel(lane: &LaneKey, rel: &str) -> Result<(), RepairError> {
-    remove_file_rel_in(&super::paths::repairs_root(), lane, rel)
+/// RULINGS AD3 / AK3: removes ONE repair's FILE tombstone of one path from the lane's file (that
+/// repair committed the path present again). Other repairs' tombstones and Hook tombstones are left
+/// alone. Missing file = nothing to remove.
+pub fn remove_file_rel(lane: &LaneKey, rel: &str, repair: &RepairId) -> Result<(), RepairError> {
+    remove_file_rel_in(&super::paths::repairs_root(), lane, rel, repair)
 }
 
 /// [`remove_file_rel`] under an explicit repairs root.
-pub fn remove_file_rel_in(root: &Path, lane: &LaneKey, rel: &str) -> Result<(), RepairError> {
+pub fn remove_file_rel_in(
+    root: &Path,
+    lane: &LaneKey,
+    rel: &str,
+    repair: &RepairId,
+) -> Result<(), RepairError> {
     let lane_mutex = lane_mutex(root, lane);
     let _lane_guard = lane_mutex.lock().unwrap_or_else(|e| e.into_inner());
     let Some(f) = read_file(root, lane)? else {
@@ -151,7 +157,7 @@ pub fn remove_file_rel_in(root: &Path, lane: &LaneKey, rel: &str) -> Result<(), 
     let kept: Vec<Tombstone> = f
         .tombstones
         .into_iter()
-        .filter(|t| !(t.rel == rel && t.kind == TombstoneKind::File))
+        .filter(|t| !(t.rel == rel && t.kind == TombstoneKind::File && t.repair == *repair))
         .collect();
     if kept.len() == before {
         return Ok(());
@@ -240,7 +246,7 @@ mod tests {
 
     /// RULINGS AD3: concurrent writers of one lane (commit / revert / propagation threads) lose no
     /// entry — the lane-level mutex serialises the read-modify-write; `remove_file_rel` removes only
-    /// the FILE tombstones of that path.
+    /// that repair's FILE tombstone of that path (AK3).
     #[test]
     fn lane_mutex_serialises_writers_and_rel_removal() {
         let r = root(line!());
@@ -274,16 +280,27 @@ mod tests {
             repair: id("R-9"),
         };
         record_in(&r, &lane, &hook).unwrap();
-        remove_file_rel_in(&r, &lane, "bin/t0-0.py").unwrap();
+        // AK3: another repair's File tombstone of the same path stays
+        let other = Tombstone {
+            rel: "bin/t0-0.py".into(),
+            kind: TombstoneKind::File,
+            repair: id("R-5"),
+        };
+        record_in(&r, &lane, &other).unwrap();
+        remove_file_rel_in(&r, &lane, "bin/t0-0.py", &id("R-1")).unwrap();
         let left = load_in(&r, &lane).unwrap();
-        assert_eq!(left.len(), 80);
+        assert_eq!(left.len(), 81);
         assert!(
             left.contains(&hook),
             "a hook tombstone is not removed by path"
         );
-        assert!(!left
-            .iter()
-            .any(|t| t.rel == "bin/t0-0.py" && t.kind == TombstoneKind::File));
+        assert!(
+            left.contains(&other),
+            "another repair's tombstone was removed"
+        );
+        assert!(!left.iter().any(|t| t.rel == "bin/t0-0.py"
+            && t.kind == TombstoneKind::File
+            && t.repair == id("R-1")));
         let _ = std::fs::remove_dir_all(&r);
     }
 

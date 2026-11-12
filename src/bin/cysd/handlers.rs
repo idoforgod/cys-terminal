@@ -881,6 +881,8 @@ fn reclaim_commit(
         // 역할명은 **후보의 그것 그대로** 쓴다(worker dedup 없음): 우리는 새 역할을 만드는 게
         // 아니라 기존 역할 **주소를 이사**시키는 것이고, 구 보유자는 같은 임계영역에서 내려간다.
         roles.insert(role.to_string(), caller_sid);
+        // 「스스로 해결」(0.15.0 RULINGS AK2 · T3): 재결합으로 선 역할도 좌석의 첫 역할 가족으로 기억한다.
+        crate::repair::note_role_claim(daemon, caller_sid, caller.role.lock().unwrap().as_deref(), role);
         *caller.role.lock().unwrap() = Some(role.to_string());
         *caller.caps.lock().unwrap() = crate::caps::Caps::for_role(Some(role));
         *prev.role.lock().unwrap() = None;

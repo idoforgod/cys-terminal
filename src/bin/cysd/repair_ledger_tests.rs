@@ -103,6 +103,7 @@ impl Rig {
             seats: vec![(7, "reviewer-codex".into()), (8, "reviewer-gemini".into())],
             classify,
             check,
+            hook_step: &cys::repair::apply::hook_lines_step,
         }
     }
     fn call(&self, now: f64, who: &Caller, sub: &str, p: Value) -> Result<Value, VerbError> {
@@ -1233,6 +1234,7 @@ fn boot_critical_joins_refused_resolves_accepted() {
     .unwrap_err();
     assert_eq!(e.code, "repair_precondition");
     assert!(e.message.contains("--resolves"), "{}", e.message);
+    assert!(e.message.contains("--trigger"), "AK6: {}", e.message);
     // R′ via --resolves: accepted, own lock, R's row untouched
     let before = std::fs::read(ledger::lane_path_in(
         &r.root,
@@ -2354,9 +2356,18 @@ fn ad1_binding_lives_on_the_daemon_and_dies_with_the_seat() {
             .count(),
         1
     );
+    // AK2: and where `reclaim_commit` sets a role
+    let reclaim = &handlers[handlers.find("\nfn reclaim_commit(").unwrap()..];
+    let reclaim = &reclaim[..reclaim.find("\n}\n").unwrap()];
+    assert_eq!(
+        reclaim
+            .matches("crate::repair::note_role_claim(daemon, caller_sid, caller.role.lock().unwrap().as_deref(), role);")
+            .count(),
+        1
+    );
     assert_eq!(
         handlers.matches("crate::repair::note_role_claim(").count(),
-        1
+        2
     );
 }
 
@@ -2382,9 +2393,10 @@ fn ad2_windows_seatless_refusal_is_reachable() {
     }
 }
 
-/// AD3 / AD4: a committed deletion is checked by its state (no check child runs), the record says
-/// `absent-state`, the lane gets ONE File tombstone; a later repair that commits the path present
-/// removes it. A present target records the check kind that ran.
+/// AD3 / AD4 (rewritten for RULINGS AK3 / AK4: a later repair that brings the path back no longer
+/// removes an EARLIER repair's tombstone, and it supersedes that repair): a committed deletion is
+/// checked by its state (no check child runs), the record says `absent-state`, the lane gets ONE
+/// File tombstone; a present target records the check kind that ran.
 #[test]
 fn ad3_ad4_deletion_is_tombstoned_and_checked_by_state() {
     let r = rig("ad3");
@@ -2438,7 +2450,8 @@ fn ad3_ad4_deletion_is_tombstoned_and_checked_by_state() {
     assert_eq!(ts[0].rel, "bin/a.py");
     assert_eq!(ts[0].kind, cys::repair::tombstones::TombstoneKind::File);
     assert_eq!(ts[0].repair.as_str(), id);
-    // a later repair brings the file back → the tombstone goes
+    // a later repair brings the file back → the earlier repair's tombstone stays (AK3), the earlier
+    // repair is superseded (AK4)
     let id2 = call(
         T0 + 10.0,
         &w,
@@ -2465,11 +2478,13 @@ fn ad3_ad4_deletion_is_tombstoned_and_checked_by_state() {
         json!({"repair": id2, "verdict": "pass", "note": "ok"}),
     )
     .unwrap();
-    call(T0 + 13.0, &w, "commit", json!({"repair": id2})).unwrap();
+    let c = call(T0 + 13.0, &w, "commit", json!({"repair": id2})).unwrap();
     assert_eq!(runs.load(Ordering::Relaxed), 1);
-    assert!(cys::repair::tombstones::load_in(&r.root, &r.lane)
-        .unwrap()
-        .is_empty());
+    assert_eq!(c["superseded"], json!([id]));
+    assert_eq!(r.record_of(&id).state, RepairState::Superseded);
+    let ts = cys::repair::tombstones::load_in(&r.root, &r.lane).unwrap();
+    assert_eq!(ts.len(), 1, "another repair's tombstone was removed");
+    assert_eq!(ts[0].repair.as_str(), id);
     assert_eq!(
         r.record_of(&id2).checks,
         [("bin/a.py".to_string(), "py-compile".to_string())]
@@ -2700,4 +2715,418 @@ fn ad10_commit_releases_the_mutex_around_the_check() {
         e.message
     );
     assert_eq!(r.record_of(&id).state, RepairState::InProgress);
+}
+
+// ───────────────────────────── RULINGS AK (re-check of the fix round) ─────────────────────────────
+
+/// AK1: no exemption — a worker pane re-declared `master` is refused `grant` and `owner-token` (and
+/// `begin`) as AD1 rules, and the sentence tells the way back.
+#[test]
+fn ak1_worker_redeclared_master_refused_with_the_way_back() {
+    let r = rig("ak1");
+    let (lane, inc) = ad_daemon_key("ak1");
+    seat_caller(&lane, &inc, 51, Some("worker".into()));
+    record_role_claim(&lane, &inc, 51, Some("worker"), "master");
+    let master = seat_caller(&lane, &inc, 51, Some("master".into()));
+    assert_eq!(master.bound_family, Some(RoleFamily::Worker));
+    for (verb, p) in [
+        ("grant", json!({"on": true})),
+        ("owner_token", json!({"path": "soul.md"})),
+        (
+            "begin",
+            json!({"trigger": "owner_order", "files": ["bin/a.py"]}),
+        ),
+    ] {
+        let e = r.call(T0, &master, verb, p).unwrap_err();
+        assert_eq!(e.code, "acl_denied", "{verb}");
+        assert!(e.message.contains("AD1"), "{verb}: {}", e.message);
+        assert!(
+            e.message.contains("이 창을 닫고 새 창에서"),
+            "{verb}: the way back is missing: {}",
+            e.message
+        );
+    }
+    assert!(
+        r.call(T0, &master, "status", json!({})).is_ok(),
+        "READ stays open"
+    );
+}
+
+/// AK3: a target that was absent before the repair and is absent at commit is no deletion (no
+/// tombstone); a repair whose deletion was committed and that later commits the path present again
+/// removes its OWN tombstone; an unreadable tombstone file is only a warning for a present target.
+#[test]
+fn ak3_only_real_deletions_and_own_tombstones() {
+    let r = rig("ak3");
+    let w = seat(3, "worker");
+    let rv = seat(7, "reviewer-codex");
+    let flow = |files: Value, edit: &dyn Fn()| -> (String, Value) {
+        let id = r
+            .call(
+                T0,
+                &w,
+                "begin",
+                json!({"trigger": "owner_order", "files": files}),
+            )
+            .unwrap()["repair"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        edit();
+        r.call(T0 + 1.0, &w, "record", json!({"repair": id, "note": "n"}))
+            .unwrap();
+        r.call(
+            T0 + 2.0,
+            &rv,
+            "attest_verify",
+            json!({"repair": id, "verdict": "pass", "note": "ok"}),
+        )
+        .unwrap();
+        let c = r
+            .call(T0 + 3.0, &w, "commit", json!({"repair": id}))
+            .unwrap();
+        (id, c)
+    };
+    // (a) absent before, absent at commit → nothing removed, no tombstone
+    let (_, c) = flow(json!(["bin/new.py"]), &|| {});
+    assert_eq!(c["state"], "probation", "{c}");
+    assert!(cys::repair::tombstones::load_in(&r.root, &r.lane)
+        .unwrap()
+        .is_empty());
+    // (b) a real deletion → its tombstone; reopened by the audit, picked up, the file restored and
+    //     committed again → its own tombstone goes
+    let (id, _) = flow(json!(["bin/a.py"]), &|| {
+        std::fs::remove_file(r.pack.join("bin/a.py")).unwrap()
+    });
+    assert_eq!(
+        cys::repair::tombstones::load_in(&r.root, &r.lane)
+            .unwrap()
+            .len(),
+        1
+    );
+    r.call(
+        T0 + 4.0,
+        &seat(8, "reviewer-gemini"),
+        "attest_audit",
+        json!({"repair": id, "verdict": "finding", "note": "keep the file"}),
+    )
+    .unwrap();
+    let p = r
+        .call(
+            T0 + 5.0,
+            &w,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["bin/a.py"]}),
+        )
+        .unwrap();
+    assert_eq!(p["begin"], "picked-up");
+    std::fs::write(r.pack.join("bin/a.py"), b"print('kept')\n").unwrap();
+    r.call(
+        T0 + 6.0,
+        &w,
+        "record",
+        json!({"repair": id, "note": "restored"}),
+    )
+    .unwrap();
+    r.call(
+        T0 + 7.0,
+        &rv,
+        "attest_verify",
+        json!({"repair": id, "verdict": "pass", "note": "ok"}),
+    )
+    .unwrap();
+    r.call(T0 + 8.0, &w, "commit", json!({"repair": id}))
+        .unwrap();
+    assert!(
+        cys::repair::tombstones::load_in(&r.root, &r.lane)
+            .unwrap()
+            .is_empty(),
+        "the repair's own tombstone stayed"
+    );
+    // (c) an unreadable tombstone file: a present commit stands (검증됨) with a warning
+    let r2 = rig("ak3-broken");
+    std::fs::create_dir_all(r2.root.join("tombstones")).unwrap();
+    std::fs::write(r2.root.join("tombstones").join("base.json"), b"{broken").unwrap();
+    let id2 = r2
+        .call(
+            T0,
+            &w,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["bin/a.py"]}),
+        )
+        .unwrap()["repair"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    std::fs::write(r2.pack.join("bin/a.py"), b"print('fixed')\n").unwrap();
+    r2.call(T0 + 1.0, &w, "record", json!({"repair": id2, "note": "n"}))
+        .unwrap();
+    r2.call(
+        T0 + 2.0,
+        &rv,
+        "attest_verify",
+        json!({"repair": id2, "verdict": "pass", "note": "ok"}),
+    )
+    .unwrap();
+    let c = r2
+        .call(T0 + 3.0, &w, "commit", json!({"repair": id2}))
+        .unwrap();
+    assert_eq!(c["warnings"].as_array().unwrap().len(), 1, "{c}");
+    let row = ledger::read_lane_in(&r2.root, &RepairId::parse(&id2).unwrap(), &r2.lane)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.state,
+        LaneState::Verified,
+        "a broken tombstone file made a 충돌 row"
+    );
+    assert_eq!(
+        std::fs::read(r2.root.join("tombstones").join("base.json")).unwrap(),
+        b"{broken",
+        "the unreadable file was overwritten"
+    );
+}
+
+/// AK4: committing a newer repair on the same file supersedes the older one in force; the older one
+/// is then never reopened by an audit and never picked up.
+#[test]
+fn ak4_newer_commit_supersedes_the_older_in_force() {
+    let r = rig("ak4");
+    let w = seat(3, "worker");
+    let older = committed_general(&r);
+    // a repair in force on ANOTHER file (older too) must be left alone
+    let other = r
+        .call(
+            T0 + 5.0,
+            &w,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["hooks/h.sh"]}),
+        )
+        .unwrap()["repair"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    std::fs::write(r.pack.join("hooks/h.sh"), b"#!/bin/sh\necho h2\n").unwrap();
+    r.call(
+        T0 + 6.0,
+        &w,
+        "record",
+        json!({"repair": other, "note": "n"}),
+    )
+    .unwrap();
+    r.call(
+        T0 + 7.0,
+        &seat(7, "reviewer-codex"),
+        "attest_verify",
+        json!({"repair": other, "verdict": "pass", "note": "ok"}),
+    )
+    .unwrap();
+    r.call(T0 + 8.0, &w, "commit", json!({"repair": other}))
+        .unwrap();
+    assert_eq!(r.record_of(&other).state, RepairState::Probation);
+    let b = r
+        .call(
+            T0 + 10.0,
+            &w,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["bin/a.py"]}),
+        )
+        .unwrap();
+    assert_eq!(b["begin"], "new");
+    let newer = b["repair"].as_str().unwrap().to_string();
+    std::fs::write(r.pack.join("bin/a.py"), b"print('better')\n").unwrap();
+    r.call(
+        T0 + 11.0,
+        &w,
+        "record",
+        json!({"repair": newer, "note": "n"}),
+    )
+    .unwrap();
+    r.call(
+        T0 + 12.0,
+        &seat(7, "reviewer-codex"),
+        "attest_verify",
+        json!({"repair": newer, "verdict": "pass", "note": "ok"}),
+    )
+    .unwrap();
+    let c = r
+        .call(T0 + 13.0, &w, "commit", json!({"repair": newer}))
+        .unwrap();
+    assert_eq!(c["superseded"], json!([older]));
+    assert_eq!(r.record_of(&older).state, RepairState::Superseded);
+    assert_eq!(r.record_of(&newer).state, RepairState::Probation);
+    let e = r
+        .call(
+            T0 + 14.0,
+            &seat(8, "reviewer-gemini"),
+            "attest_audit",
+            json!({"repair": older, "verdict": "finding", "note": "stale"}),
+        )
+        .unwrap_err();
+    assert_eq!(e.code, "repair_precondition");
+    assert!(e.message.contains("대체된"), "{}", e.message);
+    assert_eq!(
+        r.record_of(&older).state,
+        RepairState::Superseded,
+        "an audit reopened it"
+    );
+    let p = r
+        .call(
+            T0 + 15.0,
+            &w,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["bin/a.py"]}),
+        )
+        .unwrap();
+    assert_eq!(p["begin"], "new");
+    assert_ne!(
+        p["repair"],
+        json!(older),
+        "a superseded repair was picked up"
+    );
+    assert_eq!(
+        r.record_of(&other).state,
+        RepairState::Probation,
+        "a repair on another file was superseded"
+    );
+    assert_eq!(r.record_of(&newer).state, RepairState::Probation);
+}
+
+/// AK5 (and AD4 end to end): the hook step runs WITHOUT the per-repair mutex; a confirming report is
+/// recorded as `hook-registrar`, a non-confirming one is never claimed and makes the row 충돌.
+#[test]
+fn ak5_hook_step_runs_without_the_mutex() {
+    use cys::repair::apply::{HookStep, ReconcileHook, ReconcileReport};
+    fn with_hook_line(tag: &str) -> (Rig, String) {
+        let r = rig(tag);
+        let w = seat(3, "worker");
+        let id = r
+            .call(
+                T0,
+                &w,
+                "begin",
+                json!({"trigger": "owner_order", "files": ["bin/a.py"]}),
+            )
+            .unwrap()["repair"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mut rec = r.record_of(&id);
+        rec.files.push(FileChange {
+            rel: "settings:Stop:x.sh".into(),
+            kind: ChangeKind::HookUnregister {
+                event: "Stop".into(),
+                script: "x.sh".into(),
+            },
+            pre: PreImage::Absent,
+            post: TargetState::Absent,
+            diff: None,
+        });
+        ledger::write_record_in(&r.root, &rec).unwrap();
+        std::fs::write(r.pack.join("bin/a.py"), b"print('fixed')\n").unwrap();
+        r.call(T0 + 1.0, &w, "record", json!({"repair": id, "note": "n"}))
+            .unwrap();
+        r.call(
+            T0 + 2.0,
+            &seat(7, "reviewer-codex"),
+            "attest_verify",
+            json!({"repair": id, "verdict": "pass", "note": "ok"}),
+        )
+        .unwrap();
+        (r, id)
+    }
+    let report = |targets: &[&str]| ReconcileReport {
+        hooks: vec![ReconcileHook {
+            event: "Stop".into(),
+            script: "x.sh".into(),
+            lifeline: false,
+            desired: "unregistered".into(),
+            targets: targets
+                .iter()
+                .map(|t| (PathBuf::from("/s/settings.json"), t.to_string()))
+                .collect(),
+        }],
+    };
+    // (a) confirmed
+    let (r, id) = with_hook_line("ak5-ok");
+    let free = std::sync::Mutex::new(None);
+    let step = |rid: &RepairId, _lane: &LaneKey, s: HookStep| {
+        assert_eq!(s, HookStep::Unregister);
+        let m = r
+            .mutexes
+            .lock()
+            .unwrap()
+            .get(rid.as_str())
+            .cloned()
+            .unwrap();
+        let ok = m.try_lock().is_ok();
+        *free.lock().unwrap() = Some(ok);
+        Ok(report(&["unregistered"]))
+    };
+    let mut ctx = r.ctx(T0 + 3.0, &general, &pass);
+    ctx.hook_step = &step;
+    let c = handle_with(&ctx, &seat(3, "worker"), "commit", &json!({"repair": id})).unwrap();
+    assert_eq!(
+        *free.lock().unwrap(),
+        Some(true),
+        "the mutex was held across the hook step"
+    );
+    assert_eq!(c["hook_step"], "ok", "{c}");
+    let rec = r.record_of(&id);
+    assert!(rec.checks.contains(&(
+        "settings:Stop:x.sh".to_string(),
+        "hook-registrar".to_string()
+    )));
+    let row = ledger::read_lane_in(&r.root, &rec.id, &r.lane)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, LaneState::Verified);
+    // (b) not confirmed → never claimed, 충돌
+    let (r, id) = with_hook_line("ak5-no");
+    let step = |_: &RepairId, _: &LaneKey, _: HookStep| Ok(report(&["refused:busy"]));
+    let mut ctx = r.ctx(T0 + 3.0, &general, &pass);
+    ctx.hook_step = &step;
+    let c = handle_with(&ctx, &seat(3, "worker"), "commit", &json!({"repair": id})).unwrap();
+    assert!(
+        c["hook_step"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("확인되지"),
+        "{c}"
+    );
+    let rec = r.record_of(&id);
+    assert!(!rec.checks.iter().any(|(_, how)| how == "hook-registrar"));
+    let row = ledger::read_lane_in(&r.root, &rec.id, &r.lane)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, LaneState::Conflict);
+}
+
+/// AK6: Windows path aliases of a file are refused at `begin` (they would escape the rule-document
+/// classification); nothing is written.
+#[test]
+fn ak6_windows_path_aliases_refused() {
+    let r = rig("ak6");
+    for rel in [
+        "agents/MASTER_DIRECTIVE.md.",
+        "soul.md ",
+        "soul.md::$DATA",
+        "bin/a.py:x",
+        "bin./a.py",
+    ] {
+        assert!(is_windows_alias(rel), "{rel:?}");
+        let e = r
+            .call(
+                T0,
+                &seat(3, "worker"),
+                "begin",
+                json!({"trigger": "owner_order", "files": [rel]}),
+            )
+            .unwrap_err();
+        assert_eq!(e.code, "invalid_params", "{rel:?}");
+    }
+    for rel in ["bin/a.py", "hooks/h.sh", "docs/a.b.md"] {
+        assert!(!is_windows_alias(rel), "{rel:?}");
+    }
+    assert!(!r.root.exists(), "a refused begin wrote something");
 }
