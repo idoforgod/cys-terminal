@@ -535,6 +535,218 @@ class CsoLocalWritePaths(unittest.TestCase):
         self.assertFalse(self.denied("Bash", {"command": 'cat "$HOME/Desktop/CYSjavis/cso/x"'}))
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ★0.15.0 T10 — reviewer 쓰기 허용의 정확한 목록(설계 §4-12 · §6-12 · 시험계획 H-12-A1-29-01 ·
+#   H-12-N1-01 · H-12-N3-01). 넓은 `/.cys/` 부분 문자열 허용 **하나만** 정확한 목록으로 바꿨다:
+#   그 레인 팩의 `round/_reviews/`(판정 파일 — 없으면 라운드 미제출·미종결)와 `round/` 의 **자기**
+#   todo(`cys todo-path` 이름). `/logs/`·`/log/`·`/_round/`·임시 폴더는 그대로다.
+#   ★팩은 임시 폴더 **밖**의 합성 경로(`/w/hm/.cys/pack`)다 — 판정은 경로만 보므로 실재할 필요가
+#     없고, 임시 폴더 안의 팩이면 그대로 둔 임시 폴더 허용이 모든 쓰기를 열어 목록을 재지 못한다.
+# ─────────────────────────────────────────────────────────────────────────────
+@NEED_SH
+class ReviewerExactWritePaths(_HookEnv):
+    """훅을 **실제로 실행**해서 reviewer 정확 쓰기 목록을 잰다(셸 배선·역할 해소·deny JSON 포함)."""
+
+    PACK = "/w/hm/.cys/pack"
+    HOMEP = "/w/hm"
+
+    def w(self, path, role="reviewer-claude-1", pack=None, tool="Write", **kw):
+        ti = {"file_path": path, "content": "x"}
+        if tool == "Edit":
+            ti = {"file_path": path, "old_string": "a", "new_string": "b"}
+        return self.run_hook(tool, ti, CYS_ROLE=role, CYS_PACK_DIR=pack or self.PACK, **kw)
+
+    def sh(self, command, role="reviewer-claude-1", pack=None, **kw):
+        return self.run_hook("Bash", {"command": command}, CYS_ROLE=role,
+                             CYS_PACK_DIR=pack or self.PACK, **kw)
+
+    def assertAllowed(self, r, what):
+        self.assertEqual(r.rc, 0, "%s: rc=%d %r" % (what, r.rc, r.err[-300:]))
+        self.assertFalse(r.denied, "%s 가 막혔다(라운드 미종결 방향 · ORCH/F1): %s" % (what, r.reason))
+        self.assertEqual(r.out.strip(), "", "%s: 허용인데 stdout 출력: %r" % (what, r.out))
+
+    def assertDenied(self, r, what):
+        self.assertEqual(r.rc, 0, "%s: rc=%d %r" % (what, r.rc, r.err[-300:]))
+        self.assertTrue(r.denied, "%s 가 통과했다(producer≠evaluator 약화): %r" % (what, r.out))
+
+    def test_verdict_file_and_own_todo_are_writable_for_every_reviewer_slot(self):
+        """판정 파일 자리와 자기 todo 는 **모든** 리뷰어 슬롯 좌석에 열려 있다(RULINGS B2 대체 좌석 포함)."""
+        for role in ("reviewer-codex", "reviewer-gemini", "reviewer-claude-1", "reviewer-claude-2"):
+            todo = "%s/round/%s_TODO.md" % (self.PACK, role.upper().replace("-", "_"))
+            verdict = "%s/round/_reviews/T10-r1-%s.json" % (self.PACK, role)
+            with self.subTest(role=role):
+                self.assertAllowed(self.w(verdict, role), "%s Write 판정 파일" % role)
+                self.assertAllowed(self.w(todo, role), "%s Write 자기 todo" % role)
+                self.assertAllowed(self.w(todo, role, tool="Edit"), "%s Edit 자기 todo" % role)
+                self.assertAllowed(self.sh("echo '{}' > %s" % verdict, role),
+                                   "%s 리다이렉트 판정 파일" % role)
+                self.assertAllowed(self.sh("cat /w/x >> %s" % todo, role),
+                                   "%s 리다이렉트 자기 todo" % role)
+
+    def test_product_files_ledger_other_lanes_and_foreign_todos_are_denied(self):
+        """막히는 것: 팩 제품 파일 · 수리 장부 · 다른 부서의 팩 · 남의 todo · `~/.cys` 의 그 밖."""
+        for path in (self.PACK + "/bin/javis_orchestra.py",
+                     self.PACK + "/hooks/role-capability-gate.sh",
+                     self.PACK + "/directives/REVIEWER_DIRECTIVE.md",
+                     self.PACK + "/skills/x/SKILL.md",
+                     self.HOMEP + "/.cys/local/repairs/R-1/record.json",
+                     self.HOMEP + "/.cys/local/repairs/R-1/staging/hooks/x.sh",
+                     self.HOMEP + "/.cys/pack-dept-dept-1/round/_reviews/v.json",
+                     self.HOMEP + "/.cys/state/mission.json",
+                     self.PACK + "/round/WORKER_TODO.md",
+                     self.PACK + "/round/MASTER_TODO.md",
+                     self.PACK + "/round/REVIEWER_CLAUDE_2_TODO.md",
+                     self.PACK + "/round/REVIEWER_TODO.md",
+                     self.PACK + "/round/SESSION_STATE.md"):
+            with self.subTest(path=path):
+                self.assertDenied(self.w(path), "Write %s" % path)
+                self.assertDenied(self.sh("echo x > %s" % path), "리다이렉트 %s" % path)
+
+    def test_kept_allowances_are_unchanged(self):
+        """그대로 두는 허용(설계·V05 B9): `/logs/` · `/log/` · `/_round/` · 임시 폴더."""
+        for path in ("/w/proj/logs/run.log", "/w/proj/log/run.log", "/w/proj/_round/notes.md",
+                     str(self.tmpdir / "notes.md")):
+            with self.subTest(path=path):
+                self.assertAllowed(self.w(path), "Write %s" % path)
+
+    def test_windows_path_forms_are_judged_identically(self):
+        """윈도우 철자(`C:\\…` · `C:/…` · Git Bash `/c/…`)는 비교 전에 접힌다.
+
+        팩이 드라이브 문자 철자면 어느 호스트에서도 윈도우 레인으로 판정된다. Git Bash 철자 팩
+        (`/c/Users/…`)은 **윈도우 호스트에서만** 윈도우 레인이다 — POSIX 호스트에서 한 글자 최상위
+        폴더는 POSIX 경로다(그 축은 훅 자가 시험이 `windows` 흉내로 잰다)."""
+        allowed = ("C:\\Users\\x\\.cys\\pack\\round\\_reviews\\T10-r1-codex.json",
+                   "C:/Users/x/.cys/pack/round/_reviews/T10-r1-codex.json",
+                   "/c/Users/x/.cys/pack/round/_reviews/T10-r1-codex.json",
+                   "C:\\Users\\x\\.cys\\pack\\round\\REVIEWER_CLAUDE_1_TODO.md",
+                   "/c/Users/x/.cys/pack/round/REVIEWER_CLAUDE_1_TODO.md")
+        denied = ("C:\\Users\\x\\.cys\\pack\\bin\\javis_orchestra.py",
+                  "/c/Users/x/.cys/pack/hooks/role-capability-gate.sh",
+                  "C:/Users/x/.cys/pack/directives/MASTER_DIRECTIVE.md",
+                  "/c/Users/x/.cys/local/repairs/R-1/record.json",
+                  "C:\\Users\\x\\.cys\\pack-dept-dept-1\\round\\_reviews\\v.json",
+                  "/c/Users/x/.cys/pack/round/WORKER_TODO.md")
+        packs = ("C:\\Users\\x\\.cys\\pack",) + (("/c/Users/x/.cys/pack",) if os.name == "nt" else ())
+        for pack in packs:
+            for path in allowed:
+                with self.subTest(pack=pack, path=path):
+                    self.assertAllowed(self.w(path, pack=pack), "Write %s" % path)
+            for path in denied:
+                with self.subTest(pack=pack, path=path):
+                    self.assertDenied(self.w(path, pack=pack), "Write %s" % path)
+            self.assertAllowed(
+                self.sh("echo x > /c/Users/x/.cys/pack/round/_reviews/v.json", pack=pack),
+                "리다이렉트 /c/ 판정 파일(pack=%s)" % pack)
+            self.assertDenied(self.sh("echo x > /c/Users/x/.cys/pack/bin/x.py", pack=pack),
+                              "리다이렉트 /c/ 제품 파일(pack=%s)" % pack)
+
+    def test_mkdir_for_the_verdict_folder_stays_denied(self):
+        """★시험계획 H-12-N1-01: 폴더가 없을 때의 처리는 mkdir 을 리뷰어에게 여는 것이 아니다 —
+        의뢰문 도구가 폴더를 미리 만든다(`test_review_prompt_verdict_path.py`). mkdir 은 계속 거부."""
+        for cmd in ("mkdir -p %s/round/_reviews" % self.PACK,
+                    "mkdir -p \"%s/round/_reviews\"" % self.PACK,
+                    "mkdir %s/round/_reviews/sub" % self.PACK,
+                    "tee %s/round/_reviews/v.json" % self.PACK):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(self.sh(cmd), cmd)
+
+    def test_deny_reason_names_the_places_a_reviewer_may_write(self):
+        """deny 문면이 판정 파일 자리와 **자기** todo 경로를 말한다 — 막힌 좌석이 다른 곳을 거듭 시도하지
+        않고 바로 옮긴다(재시도 반복을 줄이는 쪽)."""
+        r = self.w(self.PACK + "/round/REVIEWER_TODO.md", role="reviewer-claude-2")
+        self.assertDenied(r, "옛 공용 todo 이름")
+        self.assertIn(self.PACK + "/round/REVIEWER_CLAUDE_2_TODO.md", r.reason)
+        self.assertIn(self.PACK + "/round/_reviews", r.reason)
+        self.assertIn("producer != evaluator", r.reason)
+
+    def test_department_lane_writes_only_its_own_verdict_folder(self):
+        """판정 입력 = 그 좌석의 **레인 팩**(§6-12 (2)) — 부서 리뷰어는 본부 팩의 자리를 쓰지 못한다."""
+        dept = self.HOMEP + "/.cys/pack-dept-dept-3"
+        self.assertAllowed(self.w(dept + "/round/_reviews/v.json", pack=dept), "부서 자기 판정 폴더")
+        self.assertAllowed(self.w(dept + "/round/REVIEWER_CLAUDE_1_TODO.md", pack=dept),
+                           "부서 자기 todo")
+        self.assertDenied(self.w(self.PACK + "/round/_reviews/v.json", pack=dept), "본부 판정 폴더")
+        self.assertDenied(self.w(self.PACK + "/round/REVIEWER_CLAUDE_1_TODO.md", pack=dept),
+                          "본부 todo")
+
+    def test_python_missing_still_fails_closed_even_on_an_allowed_path(self):
+        """부록 A 1-29: python 이 없으면 reviewer 는 **허용 자리여도** fail-closed(exit 2), CSO 는 강등."""
+        d = HookDegradation._nopython_bin(self)
+        env = {"PATH": str(d), "CYS_PY": ""}
+        rev = self.run_hook("Write", {"file_path": self.PACK + "/round/_reviews/v.json",
+                                      "content": "x"},
+                            CYS_ROLE="reviewer-codex", CYS_PACK_DIR=self.PACK, **env)
+        self.assertEqual(rev.rc, 2, "reviewer 가 fail-closed 가 아니다: rc=%d %r" % (rev.rc, rev.err))
+        cso = self.run_hook("Write", {"file_path": self.PACK + "/round/CSO_TODO.md", "content": "x"},
+                            CYS_ROLE="cso", CYS_PACK_DIR=self.PACK, **env)
+        self.assertEqual(cso.rc, 0, "CSO 좌석이 벽돌이 됐다(봉인표 ②③): %r" % cso.err)
+        self.assertIn("강등", cso.err)
+
+
+class ReviewerExactPredicate(unittest.TestCase):
+    """정확 목록 술어(`reviewer_exact_allowed`)를 **실제 파일 트리**에서 잰다 — 폴더가 아직 없을 때와
+    링크 형상. 임시 폴더 허용에 가려지지 않게 술어를 직접 부른다(훅 이름공간을 그대로 실행)."""
+
+    def setUp(self):
+        source = HOOK.read_text(encoding="utf-8").split("<<'PYEOF'\n", 1)[1]
+        source = source.split('\nif os.environ.get("CAPGATE_SELF_TEST"):', 1)[0]
+        self.ns = {"__name__": "capgate_t10_specimen"}
+        exec(compile(source, str(HOOK), "exec"), self.ns)
+        tmp = tempfile.TemporaryDirectory(prefix="capgate-t10-pred-")
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.pack = self.root / "pack"
+        for d in ("bin", "round"):
+            (self.pack / d).mkdir(parents=True)
+
+    def ctx(self, pack=None):
+        return self.ns["Ctx"](pack=str(pack or self.pack), home="/w/hm", state="/w/hm/.cys/state",
+                              tempdir="/w/tmp", reader=lambda p: "", approver=lambda c: False)
+
+    def allowed(self, path, role="reviewer-codex", pack=None):
+        return self.ns["reviewer_exact_allowed"](str(path), self.ctx(pack), role)
+
+    def symlink_or_skip(self, target, link):
+        try:
+            os.symlink(str(target), str(link))
+        except (OSError, NotImplementedError, AttributeError) as e:
+            self.skipTest("심링크를 만들 수 없다(%s) — 링크 형상은 재지 못한다" % e)
+
+    def test_missing_verdict_folder_is_still_the_verdict_place(self):
+        """폴더가 아직 없어도 그 아래 파일은 판정 파일 자리다 — 생긴 뒤에도 같다."""
+        target = self.pack / "round" / "_reviews" / "T10-r1-codex.json"
+        self.assertTrue(self.allowed(target))
+        (self.pack / "round" / "_reviews").mkdir()
+        self.assertTrue(self.allowed(target))
+        self.assertFalse(self.allowed(self.pack / "bin" / "x.py"))
+
+    def test_reviews_symlink_into_bin_does_not_open_bin(self):
+        self.symlink_or_skip(self.pack / "bin", self.pack / "round" / "_reviews")
+        self.assertFalse(self.allowed(self.pack / "round" / "_reviews" / "javis_orchestra.py"),
+                         "`_reviews` 링크가 bin/ 쓰기를 열었다 — 허용 자리가 제품 폴더 통로가 됐다")
+
+    def test_own_todo_symlink_into_bin_does_not_open_bin(self):
+        self.symlink_or_skip(self.pack / "bin" / "evil", self.pack / "round" / "REVIEWER_CODEX_TODO.md")
+        self.assertFalse(self.allowed(self.pack / "round" / "REVIEWER_CODEX_TODO.md"))
+
+    def test_symlinked_round_keeps_the_verdict_place_writable(self):
+        """`round` 자신이 링크인 팩도 판정 파일·자기 todo 를 쓸 수 있다(막히면 ORCH)."""
+        pack = self.root / "pack2"
+        (pack / "bin").mkdir(parents=True)
+        (self.root / "elsewhere" / "round").mkdir(parents=True)
+        self.symlink_or_skip(self.root / "elsewhere" / "round", pack / "round")
+        self.assertTrue(self.allowed(pack / "round" / "_reviews" / "v.json", pack=pack))
+        self.assertTrue(self.allowed(pack / "round" / "REVIEWER_CODEX_TODO.md", pack=pack))
+        self.assertFalse(self.allowed(pack / "bin" / "x.py", pack=pack))
+
+    def test_name_rule_matches_the_todo_path_rule(self):
+        name = self.ns["reviewer_own_todo_name"]
+        self.assertEqual(name("reviewer-claude-1"), "REVIEWER_CLAUDE_1_TODO.md")
+        self.assertEqual(name("reviewer-codex"), "REVIEWER_CODEX_TODO.md")
+        self.assertIsNone(name(""))
+        self.assertIsNone(name(None))
+
+
 class NegativeControls(unittest.TestCase):
     """★음성 대조 — 안전 검사를 **지우면** 내장 self-test 가 실패해야 한다.
 
@@ -717,6 +929,32 @@ class NegativeControls(unittest.TestCase):
         ("러너 설치 옵션(G13)",
          "        if any(a == o or a.startswith(o + \"=\") for o in PKG_RUNNER_INSTALL_OPTS):\n            return True\n",
          "        if False:\n            return True\n"),
+        # ★0.15.0 T10(시험계획 H-12-A1-29-01 · N1-01 · N3-01 의 "Control: mutation …") — reviewer 정확
+        #   쓰기 목록의 각 검사를 **지우면** self-test 가 실패해야 한다.
+        ("T10 넓은 `/.cys/` 허용 복원",
+         'ALLOW_PATH_SUBSTRS = ("/logs/", "/log/", "/_round/")',
+         'ALLOW_PATH_SUBSTRS = ("/.cys/", "/logs/", "/log/", "/_round/")'),
+        ("T10 자기 todo 만(아무 todo 허용 금지)",
+         "    if todo is not None and key == todo:",
+         '    if todo is not None and key.endswith("_todo.md"):'),
+        ("T10 윈도우 `/c/` 접기",
+         "    m = _MSYS_DRIVE_RE.match(t)", "    m = None"),
+        ("T10 윈도우 임시 폴더 철자",
+         "    if win and ctx.tempdir:", "    if False:"),
+        ("T10 mkdir 은 계속 쓰기 명령",
+         '    "ln", "mkdir", "rmdir", "touch", "sed",  # sed -i 등',
+         '    "ln", "rmdir", "touch", "sed",  # sed -i 등'),
+        ("T10 판정 입력 = 레인 팩(문맥 전달)",
+         "        if path_is_allowed(fp, rctx, role):", "        if path_is_allowed(fp):"),
+        ("T10 셸 경로의 레인 문맥",
+         "        _w, _wwhy = bash_write_reason(cmd, ctx=rctx, role=role)",
+         "        _w, _wwhy = bash_write_reason(cmd)"),
+        ("T10 뿌리의 마지막 성분은 글자로(`_reviews` 링크)",
+         '    reviews = rnd + "/" + _fold(REVIEWER_VERDICT_DIRNAME)',
+         '    reviews = _rv_key(os.path.join(ctx.pack, "round", REVIEWER_VERDICT_DIRNAME), win)'),
+        ("T10 리다이렉트는 원 토큰(인용된 `~`)",
+         "                    and not path_is_allowed(target, ctx, role)):",
+         "                    and not path_is_allowed(_txt(target), ctx, role)):"),
     ]
 
     @NEED_SH
