@@ -2923,6 +2923,12 @@ impl UpdateSources {
     pub fn is_boot_critical(&self, rel: &str) -> bool {
         (self.boot_critical)(rel)
     }
+
+    /// 과거 출시 해시 표 조회 — 설치 판정(다 · 바 비수정 판정)과 스냅샷의 출시본 판정(RULINGS AC1)이 이 하나를
+    /// 쓴다. 라이브·`none()` 입력원에서는 `pack_prev_vendor::prev_vendor_hashes(rel)` 그대로다(AC5 핀).
+    pub fn prev_vendor_for(&self, rel: &str) -> Vec<String> {
+        (self.prev_vendor)(rel)
+    }
 }
 
 /// 설치 대상 팩의 레인 키(CONTRACTS O-C8-3: `~/.cys/pack` → `base`, `~/.cys/pack-dept-<name>` → 그 레인).
@@ -3004,7 +3010,7 @@ impl<'s> UpdateContext<'s> {
             return f;
         }
         let dh = content_hash(d);
-        f.prev_vendor_match = (self.sources.prev_vendor)(rel).iter().any(|h| *h == dh);
+        f.prev_vendor_match = self.sources.prev_vendor_for(rel).iter().any(|h| *h == dh);
         match ownership_scoped(rel, self.scope) {
             Ownership::User => {
                 f.audit_keep = self
@@ -3441,9 +3447,22 @@ pub fn plan_install_with(
     target_version: &str,
     sources: &UpdateSources,
 ) -> InstallPlan {
-    let mut plan = InstallPlan::default();
     // ★G3 축2: 스코프 1회 산출(plan 의 dir 는 실 팩 경로 — staging 우회 없음) → 전 판정에 데이터로 주입.
-    let scope = pack_scope_of(dir);
+    plan_install_core(dir, items, force, target_version, pack_scope_of(dir), sources)
+}
+
+/// [`plan_install_with`] 의 스코프 주입판(같은 수집기 · 같은 판정) — 설치 실행부가 이번 설치가 덮거나 지울
+/// 파일을 미리 고를 때(업데이트 전 스냅샷 · RULINGS AC4) 쓴다. 그 자리의 `dir` 는 staging 일 수 있어(팩 루트가
+/// 아니다) 스코프를 호출자가 준다.
+fn plan_install_core(
+    dir: &Path,
+    items: &[(&str, &str)],
+    force: bool,
+    target_version: &str,
+    scope: PackScope,
+    sources: &UpdateSources,
+) -> InstallPlan {
+    let mut plan = InstallPlan::default();
     // 다운그레이드 차단 미러(install_into 와 동일 판정).
     if !force {
         if let Some(dv) = std::fs::read_to_string(dir.join(PACK_VERSION_FILE))
@@ -4256,11 +4275,17 @@ fn remove_empty_dirs_under(root: &Path) {
 pub const UPDATE_SNAPSHOT_SCHEMA: u32 = 1;
 /// 레인당 보존 세대 수.
 pub const UPDATE_SNAPSHOT_KEEP: usize = 3;
+/// ★RULINGS AC4(부록 A-2 #17 — 데몬이 통신을 열기 전에는 느린 일을 하지 않는다): 파일 하나 / 스냅샷 하나의
+/// 바이트 상한. 넘는 파일은 담지 않고 색인(`skipped`)에 이름을 남긴다 — 경고 1줄, 설치는 계속(실패로 만들지
+/// 않는다). 설계 §4-11 아의 추정(설치기 관리 파일 12~25MB)과 이 팩의 실측(내장 약 479개 · 약 11.5MB · 가장 큰
+/// 파일 약 1.3MB) 위에 둔다.
+pub const UPDATE_SNAPSHOT_FILE_CAP: u64 = 4 * 1024 * 1024;
+pub const UPDATE_SNAPSHOT_TOTAL_CAP: u64 = 32 * 1024 * 1024;
 /// 스냅샷 메타 파일명 / 파일 사본 루트.
 pub const UPDATE_SNAPSHOT_META: &str = "meta.json";
 pub const UPDATE_SNAPSHOT_FILES: &str = "files";
 
-/// 복원 계약의 파일 한 줄 — `{rel, sha256, mode, link_target?}`(필드 순서 = 계약 순서).
+/// 복원 계약의 파일 한 줄 — `{rel, sha256, mode, released, link_target?}`(필드 순서 = 계약 순서).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SnapshotFile {
     pub rel: String,
@@ -4268,11 +4293,25 @@ pub struct SnapshotFile {
     pub sha256: String,
     /// 권한 비트(`st_mode & 0o7777` · 윈도우 0).
     pub mode: u32,
+    /// ★RULINGS AC1(부록 A-2 #12 검증된 되돌리기): 이 바이트가 **출시본**인가 — 바꾸기 전 설치 기록(매니페스트
+    /// 해시)과 같거나 과거 출시 해시 표에 있다. system 파일은 이것이 참일 때만 되돌린다. 링크·판독 불가·사용자
+    /// 수정 = 거짓. 이 필드가 없는 메타는 거짓으로 읽는다(안전 방향).
+    #[serde(default)]
+    pub released: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link_target: Option<String>,
 }
 
-/// 복원 계약 — `{schema, lane_key, pack_version, pro_revision, created_at, files}`.
+/// 상한 때문에 담지 않은 파일 — 색인에 이름·크기·사유를 남긴다(RULINGS AC4).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SnapshotSkip {
+    pub rel: String,
+    pub bytes: u64,
+    /// `file-cap` | `total-cap`
+    pub reason: String,
+}
+
+/// 복원 계약 — `{schema, lane_key, pack_version, pro_revision, created_at, files, skipped?}`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SnapshotMeta {
     pub schema: u32,
@@ -4281,6 +4320,18 @@ pub struct SnapshotMeta {
     pub pro_revision: u32,
     pub created_at: String,
     pub files: Vec<SnapshotFile>,
+    /// 상한 때문에 담지 않은 파일(없으면 생략).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<SnapshotSkip>,
+}
+
+/// 스냅샷 하나를 만든 결과.
+#[derive(Debug, Clone)]
+pub struct SnapshotOutcome {
+    pub path: PathBuf,
+    pub files: usize,
+    pub bytes: u64,
+    pub skipped: Vec<SnapshotSkip>,
 }
 
 /// 원본 바이트의 sha256(소문자 16진) — 스냅샷 계약의 `sha256`.
@@ -4295,17 +4346,23 @@ fn path_safe(s: &str) -> String {
         .collect()
 }
 
-/// 업데이트 전 스냅샷을 만든다 — `src_dir`(설치 대상 · staging 이면 라이브 팩의 전량 사본)의 매니페스트
-/// 항목 중 seed-once 가 아닌 파일만, 권한·링크 대상과 함께. 임시 디렉터리에 채운 뒤 한 번에 개명한다
-/// (반쪽 스냅샷이 최신으로 보이지 않게). 반환 = (스냅샷 경로, 파일 수, 바이트 합).
+/// 업데이트 전 스냅샷을 만든다 — `src_dir`(설치 대상 · staging 이면 라이브 팩의 전량 사본)에서 `rels`(이번
+/// 설치가 덮거나 지울 파일 — 호출자가 같은 판정 함수로 고른다, RULINGS AC4)만, 권한·링크 대상·출시본 여부(AC1)와
+/// 함께 복사한다. seed-once 는 담지 않는다. `caps` = (파일 하나, 전체) 바이트 상한 — 넘는 파일은 담지 않고
+/// `skipped` 에 남긴다. 임시 디렉터리에 채운 뒤 한 번에 개명하고(반쪽 스냅샷이 최신으로 보이지 않게), 레인당 최신
+/// [`UPDATE_SNAPSHOT_KEEP`] 세대만 남기되 이 전환(`from_version`)의 가장 오래된 스냅샷은 지우지 않는다(AC3).
+#[allow(clippy::too_many_arguments)]
 pub fn create_update_snapshot(
     src_dir: &Path,
     root: &Path,
     lane_key: &str,
     from_version: &str,
     manifest: &std::collections::BTreeMap<String, String>,
+    rels: &[String],
     scope: PackScope,
-) -> Result<(PathBuf, usize, u64), String> {
+    prev_vendor: &dyn Fn(&str) -> Vec<String>,
+    caps: (u64, u64),
+) -> Result<SnapshotOutcome, String> {
     let lane_dir = root.join(path_safe(lane_key));
     std::fs::create_dir_all(&lane_dir)
         .map_err(|e| format!("스냅샷 레인 생성 실패 {}: {e}", lane_dir.display()))?;
@@ -4315,10 +4372,11 @@ pub fn create_update_snapshot(
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(tmp.join(UPDATE_SNAPSHOT_FILES))
         .map_err(|e| format!("스냅샷 임시 디렉터리 생성 실패 {}: {e}", tmp.display()))?;
-    let fill = || -> Result<(Vec<SnapshotFile>, u64), String> {
+    let fill = || -> Result<(Vec<SnapshotFile>, u64, Vec<SnapshotSkip>), String> {
         let mut files = Vec::new();
+        let mut skipped: Vec<SnapshotSkip> = Vec::new();
         let mut bytes_total = 0u64;
-        for rel in manifest.keys() {
+        for rel in rels {
             if ownership_scoped(rel, scope) == Ownership::SeedOnce
                 || rel.contains("..")
                 || rel.starts_with('/')
@@ -4327,6 +4385,20 @@ pub fn create_update_snapshot(
             }
             let src = src_dir.join(rel);
             let Ok(meta) = std::fs::symlink_metadata(&src) else { continue };
+            if meta.is_file() {
+                let len = meta.len();
+                let reason = if len > caps.0 {
+                    Some("file-cap")
+                } else if bytes_total + len > caps.1 {
+                    Some("total-cap")
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
+                    skipped.push(SnapshotSkip { rel: rel.clone(), bytes: len, reason: reason.into() });
+                    continue;
+                }
+            }
             let dst = tmp.join(UPDATE_SNAPSHOT_FILES).join(rel);
             if let Some(parent) = dst.parent() {
                 std::fs::create_dir_all(parent)
@@ -4343,6 +4415,7 @@ pub fn create_update_snapshot(
                     rel: rel.clone(),
                     sha256: String::new(),
                     mode: 0,
+                    released: false,
                     link_target: Some(target_s),
                 });
                 continue;
@@ -4355,16 +4428,22 @@ pub fn create_update_snapshot(
             std::fs::write(&dst, &data)
                 .map_err(|e| format!("스냅샷 사본 기록 실패 {}: {e}", dst.display()))?;
             bytes_total += data.len() as u64;
+            // 출시본 = 바꾸기 전 설치 기록과 같은 바이트 ∨ 과거 출시 해시 표의 바이트(설치 판정 다와 같은 표).
+            // 설치 기록의 해시(`content_hash`)는 같은 바이트의 sha256 이다 — 한 번만 계산한다.
+            let sha = sha256_hex(&data);
+            let released = std::str::from_utf8(&data).is_ok()
+                && (manifest.get(rel.as_str()) == Some(&sha) || prev_vendor(rel).iter().any(|p| *p == sha));
             files.push(SnapshotFile {
                 rel: rel.clone(),
-                sha256: sha256_hex(&data),
+                sha256: sha,
                 mode: current_mode(&src).unwrap_or(0),
+                released,
                 link_target: None,
             });
         }
-        Ok((files, bytes_total))
+        Ok((files, bytes_total, skipped))
     };
-    let (files, bytes_total) = match fill() {
+    let (files, bytes_total, skipped) = match fill() {
         Ok(v) => v,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&tmp);
@@ -4383,6 +4462,7 @@ pub fn create_update_snapshot(
         // 나노초 고정 폭(9자리 · `Z`) — 같은 초 안의 두 스냅샷도 문자열 순서 = 생성 순서(목록·정리·"최신"이 이 순서를 쓴다).
         created_at: now.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
         files,
+        skipped: skipped.clone(),
     };
     let n = meta.files.len();
     let json = serde_json::to_string_pretty(&meta).map_err(|e| format!("스냅샷 메타 직렬화 실패: {e}"))?;
@@ -4401,8 +4481,8 @@ pub fn create_update_snapshot(
         let _ = std::fs::remove_dir_all(&tmp);
         return Err(format!("스냅샷 확정(개명) 실패 {}: {e}", dest.display()));
     }
-    prune_update_snapshots(&lane_dir, UPDATE_SNAPSHOT_KEEP);
-    Ok((dest, n, bytes_total))
+    prune_update_snapshots(&lane_dir, UPDATE_SNAPSHOT_KEEP, Some(from_version));
+    Ok(SnapshotOutcome { path: dest, files: n, bytes: bytes_total, skipped })
 }
 
 /// 레인 디렉터리의 스냅샷 목록(오래된 것 → 최신, `created_at`(나노초 고정 폭) 기준 · 메타 판독 불가는 빈 시각 = 맨 앞, 그 안에서 이름순).
@@ -4424,13 +4504,28 @@ pub fn list_update_snapshots(lane_dir: &Path) -> Vec<(String, PathBuf)> {
     out
 }
 
-fn prune_update_snapshots(lane_dir: &Path, keep: usize) {
+/// 오래된 것부터 지워 `keep` 세대만 남긴다 — 단 `protect_version`(지금 진행 중인 전환의 출발 버전)을 담은 가장
+/// 오래된 스냅샷은 지우지 않는다(RULINGS AC3: 실패를 거듭하는 업데이트가 진짜 업데이트 전 스냅샷을 밀어내지 않게).
+fn prune_update_snapshots(lane_dir: &Path, keep: usize, protect_version: Option<&str>) {
     let list = list_update_snapshots(lane_dir);
     if list.len() <= keep {
         return;
     }
-    for (_, p) in &list[..list.len() - keep] {
+    let protected: Option<PathBuf> = protect_version.and_then(|v| {
+        list.iter()
+            .find(|(_, p)| read_update_snapshot_meta(p).is_ok_and(|m| m.pack_version == v))
+            .map(|(_, p)| p.clone())
+    });
+    let mut excess = list.len() - keep;
+    for (_, p) in &list {
+        if excess == 0 {
+            break;
+        }
+        if protected.as_ref() == Some(p) {
+            continue;
+        }
         let _ = std::fs::remove_dir_all(p);
+        excess -= 1;
     }
 }
 
@@ -4517,6 +4612,18 @@ pub fn restore_update_snapshot(
     for f in selected {
         if f.rel.contains("..") || f.rel.starts_with('/') {
             return Err(format!("잘못된 경로가 스냅샷에 있습니다: {}", f.rel));
+        }
+        // ★RULINGS AC1(부록 A-2 #12): system 파일은 출시본 바이트일 때만 되돌린다. 파일 단위 요청이면 거부(아무것도
+        // 쓰지 않는다), 전체 복원이면 그 항목만 건너뛴다(사용자 수정본은 그 파일의 병합 장부가 지킨다).
+        if ownership_scoped(&f.rel, scope) == Ownership::System && !f.released {
+            if only.is_some() {
+                return Err(format!(
+                    "'{}' 의 보관본은 출시본 바이트가 아닙니다(바꾸기 전 설치 기록·과거 출시 해시 표와 다름) — \
+                     system 파일은 검증된 출시본으로만 되돌립니다",
+                    f.rel
+                ));
+            }
+            continue;
         }
         verified.push((f, verify_snapshot_entry(snap, f)?));
     }
@@ -5066,6 +5173,84 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
 
 /// [`install_into`] 의 입력원 주입판 — 판정·실행의 본체(★0.15.0 M11 업데이트 규칙).
 #[allow(clippy::too_many_arguments)]
+/// ★0.15.0 M11 아 + RULINGS AC3·AC4: 이번 설치의 업데이트 전 스냅샷. None = 만들 일이 없다(입력원이 루트·레인을
+/// 주지 않음 · 디스크 버전 없음 또는 = 대상 · 매니페스트 없음 · **이 전환의 스냅샷이 이미 있음** · 덮거나 지울 파일 0).
+/// 대상 = 설치 실행부와 같은 판정(plan)이 덮는다(갱신·치유·병합·vendor 우선)·지운다(폐기 정리)로 고른 파일 중 디스크
+/// 바이트가 새 바이트와 다른 것, 그리고 새로 만들 자리에 놓인 링크(쓰기가 링크를 파일로 바꾼다).
+fn take_update_snapshot(
+    dir: &Path,
+    items: &[(&str, &str)],
+    force: bool,
+    target_version: &str,
+    scope: PackScope,
+    sources: &UpdateSources,
+    manifest: &std::collections::BTreeMap<String, String>,
+) -> Option<Result<SnapshotOutcome, String>> {
+    let root = sources.snapshot_root.as_ref()?;
+    let lane = sources.lane.as_ref()?;
+    let dv = std::fs::read_to_string(dir.join(PACK_VERSION_FILE))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
+    if dv == target_version || manifest.is_empty() {
+        return None;
+    }
+    // AC3: 이 전환의 스냅샷이 이미 있으면(실패를 거듭하는 기동 설치 등) 다시 복사하지 않는다 — 첫 시도 직전의
+    // 상태가 진짜 업데이트 전 보존본이다(이후 시도는 이미 일부를 쓴 팩을 본다).
+    if newest_update_snapshot(root, &lane.0)
+        .and_then(|p| read_update_snapshot_meta(&p).ok())
+        .is_some_and(|m| m.pack_version == dv)
+    {
+        return None;
+    }
+    let plan = plan_install_core(dir, items, force, target_version, scope, sources);
+    if plan.blocked.is_some() {
+        return None;
+    }
+    let embed: std::collections::HashMap<&str, &str> = items.iter().copied().collect();
+    let is_link = |r: &str| {
+        std::fs::symlink_metadata(dir.join(r)).is_ok_and(|m| m.file_type().is_symlink())
+    };
+    let mut rels: Vec<String> = Vec::new();
+    for r in plan
+        .update
+        .iter()
+        .chain(&plan.heal)
+        .chain(&plan.merge3)
+        .chain(&plan.vendor_first)
+        .chain(&plan.prune_delete)
+    {
+        // 바이트가 그대로인 재기록(force · 디스크 = 새 바이트)은 되돌릴 것이 없다.
+        let same = !is_link(r)
+            && embed.get(r.as_str()).is_some_and(|c| {
+                std::fs::read(dir.join(r)).is_ok_and(|b| b == c.as_bytes())
+            });
+        if !same && !rels.contains(r) {
+            rels.push(r.clone());
+        }
+    }
+    for r in &plan.create {
+        if is_link(r) && !rels.contains(r) {
+            rels.push(r.clone());
+        }
+    }
+    if rels.is_empty() {
+        return None;
+    }
+    let prev = |rel: &str| sources.prev_vendor_for(rel);
+    Some(create_update_snapshot(
+        dir,
+        root,
+        &lane.0,
+        &dv,
+        manifest,
+        &rels,
+        scope,
+        &prev,
+        (UPDATE_SNAPSHOT_FILE_CAP, UPDATE_SNAPSHOT_TOTAL_CAP),
+    ))
+}
+
 pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
     dir: PathBuf,
     items: I,
@@ -5119,28 +5304,29 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
             }
         }
     }
-    // ★0.15.0 M11 아: 업데이트 전 스냅샷 — 설치기가 관리하는 파일만(매니페스트 항목 · seed-once 제외).
-    // 디스크 팩 버전이 이번 대상과 다를 때(= 업데이트)만, 입력원이 스냅샷 루트를 줄 때만 만든다. 복사만
-    // 한다(살아 있는 팩의 이름을 바꾸지 않는다 — 윈도우 규칙). 실패는 설치를 막지 않는다(경고 1줄).
-    if let (Some(root), Some(lane)) = (sources.snapshot_root.as_ref(), sources.lane.as_ref()) {
-        let disk_ver = std::fs::read_to_string(dir.join(PACK_VERSION_FILE))
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-        if let Some(dv) = disk_ver {
-            if dv != target_version && !manifest.is_empty() {
-                match create_update_snapshot(&dir, root, &lane.0, &dv, &manifest, scope) {
-                    Ok((snap, n, bytes)) => println!(
-                        "[init-pack] 업데이트 전 스냅샷: 설치기 관리 파일 {n}건 · {:.1}MB → {}",
-                        bytes as f64 / 1_048_576.0,
-                        snap.display()
-                    ),
-                    Err(e) => eprintln!(
-                        "[init-pack] ⚠ 업데이트 전 스냅샷 실패(설치는 계속): {e}"
-                    ),
-                }
+    // ★0.15.0 M11 아 + RULINGS AC3·AC4: 업데이트 전 스냅샷 — 이번 설치가 덮거나 지울 파일만(같은 판정 함수로 고른다),
+    // 상한 안에서, 전환마다 한 번. 첫 쓰기보다 **먼저** 확정한다(제자리 쓰기인 기동 설치가 중간에 멈춰도 보존본은
+    // 온전하다). 복사만 한다(살아 있는 팩의 이름을 바꾸지 않는다 — 윈도우 규칙). 실패는 설치를 막지 않는다(경고 1줄).
+    match take_update_snapshot(&dir, &items, force, target_version, scope, sources, &manifest) {
+        Some(Ok(o)) => {
+            println!(
+                "[init-pack] 업데이트 전 스냅샷: 이번 설치가 덮거나 지울 파일 {}건 · {:.1}MB → {}",
+                o.files,
+                o.bytes as f64 / 1_048_576.0,
+                o.path.display()
+            );
+            if !o.skipped.is_empty() {
+                eprintln!(
+                    "[init-pack] ⚠ 스냅샷 상한(파일 하나 {}MB · 전체 {}MB)을 넘어 담지 않은 파일 {}건 — 스냅샷 색인에 기록했습니다(설치는 계속): {}",
+                    UPDATE_SNAPSHOT_FILE_CAP / 1_048_576,
+                    UPDATE_SNAPSHOT_TOTAL_CAP / 1_048_576,
+                    o.skipped.len(),
+                    o.skipped.iter().map(|k| k.rel.as_str()).collect::<Vec<_>>().join(", ")
+                );
             }
         }
+        Some(Err(e)) => eprintln!("[init-pack] ⚠ 업데이트 전 스냅샷 실패(설치는 계속): {e}"),
+        None => {}
     }
     let update_ctx = UpdateContext::new(&dir, scope, sources, manifest_corrupt);
     // ★M11 마: 묘비로 부재를 유지한 파일(rel, 수리 번호) — 같은 실행의 출력에 사실대로 드러낸다.
@@ -5305,6 +5491,9 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                         }) {
                             upsert_pending_v2(&mut pending, &mut pending_dirty, rel, entry);
                         }
+                        // ★RULINGS AC7: 원장을 vendor 바이트보다 **먼저** 저장한다 — 그 사이에 멈춰도 `.user` 가 기록
+                        // 없는 고아가 되지 않는다(다음 스윕은 같은 판정으로 수렴한다).
+                        save_merge_pending(&dir, &pending);
                     }
                     other => {
                         let why = match other {
@@ -5625,6 +5814,8 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                     }) {
                         upsert_pending_v2(&mut pending, &mut pending_dirty, rel, entry);
                     }
+                    // ★RULINGS AC7: 원장을 vendor 바이트보다 먼저 저장(위 vendor 우선 가지와 같은 이유).
+                    save_merge_pending(&dir, &pending);
                 }
             }
             FileAction::Write { heal_user_copy } => {
@@ -13666,71 +13857,99 @@ mod m11_tests {
         assert!(e.get("parked_at").is_some());
     }
 
-    /// 아: 업데이트 전 스냅샷 — 버전이 바뀔 때만, 설치기 관리 파일만(seed-once 제외), 복원은 전부 검증한 뒤에만 쓰고
-    /// (하나라도 어긋나면 아무것도 쓰지 않는다) 권한·링크·버전 표시를 되돌린다. 레인당 3세대.
+    /// 아 + RULINGS AC1·AC4: 업데이트 전 스냅샷 — 버전이 바뀔 때만, **이번 설치가 덮거나 지울 파일만**(변하지 않는 파일·
+    /// 사용자 파일 유지·seed-once 제외), 각 항목에 출시본 여부를 기록하고, 복원은 전부 검증한 뒤에만 쓴다(하나라도
+    /// 어긋나면 아무것도 쓰지 않는다). system 파일은 출시본일 때만 되돌리고, 전체 복원은 user 소유를 되돌리지 않는다.
+    /// ★r2 재작성(종전: 매니페스트 항목 전부를 담는다고 단언 — RULINGS AC4 가 그 범위를 '덮거나 지울 파일'로 좁혔다).
     #[test]
     fn m11_update_snapshot_create_and_restore_contract() {
         let rig = Rig::new("snap");
         let root = rig.base.join("snapshots");
-        rig.write("bin/a.sh", b"#!/bin/bash\necho A1\n");
-        rig.write("memory/MEMORY.md", b"STATE\n");
-        rig.write("directives/WORKER_DIRECTIVE.md", b"# W1\n");
+        let a1 = "#!/bin/bash\necho A1\n";
+        rig.write("bin/a.sh", a1.as_bytes()); // system · 비수정 · vendor 전진 → 덮는다(출시본)
+        rig.write("agents.json", b"{\"a\":1}\n"); // user · 비수정 · vendor 전진 → 자동 갱신으로 덮는다(출시본)
+        rig.write("bin/b.py", b"B\n"); // system · 변화 없음 → 담지 않는다
+        rig.write("bin/c.py", b"MINE\n"); // system · 사용자 수정 · 조상 없음 → 사용자 파일 유지(덮지 않음) → 담지 않는다
+        rig.write("memory/MEMORY.md", b"STATE\n"); // seed-once → 담지 않는다
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(rig.pack.join("bin/a.sh"), std::fs::Permissions::from_mode(0o750)).unwrap();
+            // 새로 만들 자리에 놓인 (끊긴) 링크 — 쓰기가 링크를 파일로 바꾸므로 담는다(출시본 아님).
             std::os::unix::fs::symlink("/nonexistent/target", rig.pack.join("bin/link")).unwrap();
         }
-        rig.manifest(&[("bin/a.sh", "#!/bin/bash\necho A1\n"), ("memory/MEMORY.md", "STATE\n"),
-                       ("directives/WORKER_DIRECTIVE.md", "# W1\n"), ("bin/link", "x")]);
-        std::fs::write(rig.pack.join(PACK_VERSION_FILE), "9.9.9").unwrap();
-        let items = [("bin/a.sh", "#!/bin/bash\necho A2\n"), ("memory/MEMORY.md", "SEED\n"), ("directives/WORKER_DIRECTIVE.md", "# W1\n")];
+        let manifest_v1 = [("bin/a.sh", a1), ("agents.json", "{\"a\":1}\n"), ("bin/b.py", "B\n"),
+                           ("bin/c.py", "C1\n"), ("memory/MEMORY.md", "STATE\n")];
+        rig.manifest(&manifest_v1);
+        let items = [("bin/a.sh", "#!/bin/bash\necho A2\n"), ("agents.json", "{\"a\":2}\n"), ("bin/b.py", "B\n"),
+                     ("bin/c.py", "C2\n"), ("memory/MEMORY.md", "SEED\n"), ("bin/link", "#!/bin/sh\nnew\n")];
         let src = UpdateSources::none().with_snapshot("base", root.clone());
+        std::fs::write(rig.pack.join(PACK_VERSION_FILE), "9.9.9").unwrap();
         rig.install(&items, false, &src);
         assert!(newest_update_snapshot(&root, "base").is_none(), "같은 버전이면 스냅샷을 만들지 않는다");
+        // 업데이트 상황으로 되돌린다(버전 1.0.0 · 같은 디스크 바이트).
         std::fs::write(rig.pack.join(PACK_VERSION_FILE), "1.0.0").unwrap();
-        rig.write("bin/a.sh", b"#!/bin/bash\necho A1\n");
+        rig.write("bin/a.sh", a1.as_bytes());
+        rig.write("agents.json", b"{\"a\":1}\n");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(rig.pack.join("bin/a.sh"), std::fs::Permissions::from_mode(0o750)).unwrap();
+            let _ = std::fs::remove_file(rig.pack.join("bin/link"));
+            std::os::unix::fs::symlink("/nonexistent/target", rig.pack.join("bin/link")).unwrap();
         }
-        rig.manifest(&[("bin/a.sh", "#!/bin/bash\necho A1\n"), ("memory/MEMORY.md", "STATE\n"),
-                       ("directives/WORKER_DIRECTIVE.md", "# W1\n"), ("bin/link", "x")]);
+        rig.manifest(&manifest_v1);
+        let _ = std::fs::remove_file(rig.pack.join(MERGE_PENDING_FILE));
         rig.install(&items, false, &src);
         let snap = newest_update_snapshot(&root, "base").expect("버전이 바뀌면 스냅샷");
         let meta = read_update_snapshot_meta(&snap).unwrap();
         assert_eq!(meta.pack_version, "1.0.0");
         assert_eq!(meta.lane_key, "base");
-        assert!(meta.files.iter().all(|f| f.rel != "memory/MEMORY.md"), "seed-once(런타임 상태)는 담지 않는다");
-        assert!(meta.files.iter().any(|f| f.rel == "directives/WORKER_DIRECTIVE.md"));
+        let mut rels: Vec<&str> = meta.files.iter().map(|f| f.rel.as_str()).collect();
+        rels.sort();
+        #[cfg(unix)]
+        assert_eq!(rels, vec!["agents.json", "bin/a.sh", "bin/link"], "덮거나 지울 파일만 — 변화 없음·사용자 파일 유지·seed-once 는 없다");
+        #[cfg(not(unix))]
+        assert_eq!(rels, vec!["agents.json", "bin/a.sh"]);
+        let released = |r: &str| meta.files.iter().find(|f| f.rel == r).map(|f| f.released);
+        assert_eq!(released("bin/a.sh"), Some(true), "설치 기록과 같은 바이트 = 출시본");
+        assert_eq!(released("agents.json"), Some(true));
+        #[cfg(unix)]
+        assert_eq!(released("bin/link"), Some(false), "링크는 출시본이 아니다");
+        assert!(meta.skipped.is_empty());
         assert_eq!(rig.read("bin/a.sh").as_deref(), Some("#!/bin/bash\necho A2\n"), "설치는 계속됐다");
+        assert_eq!(rig.read("bin/c.py").as_deref(), Some("MINE\n"), "사용자 파일 유지");
         // 기억이 업데이트 뒤에 바뀌어도 복원은 상태를 되돌리지 않는다.
         rig.write("memory/MEMORY.md", b"NEW STATE AFTER UPDATE\n");
         // 보관본 하나가 깨지면 아무것도 쓰지 않는다.
-        std::fs::write(snap.join(UPDATE_SNAPSHOT_FILES).join("directives/WORKER_DIRECTIVE.md"), b"TAMPERED").unwrap();
-        rig.write("directives/WORKER_DIRECTIVE.md", b"# W-after\n");
-        assert!(restore_update_snapshot(&snap, &rig.pack, Some(&["bin/a.sh".to_string(), "directives/WORKER_DIRECTIVE.md".to_string()])).is_err());
+        std::fs::write(snap.join(UPDATE_SNAPSHOT_FILES).join("agents.json"), b"TAMPERED").unwrap();
+        rig.write("agents.json", b"{\"a\":\"after\"}\n");
+        assert!(restore_update_snapshot(&snap, &rig.pack, Some(&["bin/a.sh".to_string(), "agents.json".to_string()])).is_err());
         assert_eq!(rig.read("bin/a.sh").as_deref(), Some("#!/bin/bash\necho A2\n"), "검증 실패 → bin/a.sh 도 쓰지 않았다");
-        std::fs::write(snap.join(UPDATE_SNAPSHOT_FILES).join("directives/WORKER_DIRECTIVE.md"), b"# W1\n").unwrap();
+        std::fs::write(snap.join(UPDATE_SNAPSHOT_FILES).join("agents.json"), b"{\"a\":1}\n").unwrap();
         // 파일 단위 복원: 그 파일만.
         let done = restore_update_snapshot(&snap, &rig.pack, Some(&["bin/a.sh".to_string()])).unwrap();
         assert_eq!(done, vec!["bin/a.sh".to_string()]);
-        assert_eq!(rig.read("bin/a.sh").as_deref(), Some("#!/bin/bash\necho A1\n"));
-        assert_eq!(rig.read("directives/WORKER_DIRECTIVE.md").as_deref(), Some("# W-after\n"), "다른 파일은 그대로");
+        assert_eq!(rig.read("bin/a.sh").as_deref(), Some(a1));
+        assert_eq!(rig.read("agents.json").as_deref(), Some("{\"a\":\"after\"}\n"), "다른 파일은 그대로");
         #[cfg(unix)]
         assert_eq!(current_mode(&rig.pack.join("bin/a.sh")), Some(0o750), "기록된 권한");
-        // 전체 복원: system 파일 + 버전 표시. 사용자 소유·상태는 그대로.
-        std::fs::remove_file(rig.pack.join("bin/link")).ok();
-        restore_update_snapshot(&snap, &rig.pack, None).unwrap();
+        // AC1: 출시본이 아닌 system 항목(링크)은 파일 단위로 되돌리지 않는다.
+        #[cfg(unix)]
+        assert!(restore_update_snapshot(&snap, &rig.pack, Some(&["bin/link".to_string()])).is_err(), "출시본 아님 → 거부");
+        // 전체 복원: 출시본 system 파일 + 버전 표시. 사용자 소유·상태·출시본 아닌 항목은 그대로.
+        rig.write("bin/a.sh", b"#!/bin/bash\necho A2\n");
+        let done = restore_update_snapshot(&snap, &rig.pack, None).unwrap();
+        assert_eq!(done, vec!["bin/a.sh".to_string()], "전체 복원 = 출시본 system 항목만");
+        assert_eq!(rig.read("bin/a.sh").as_deref(), Some(a1));
         assert_eq!(std::fs::read_to_string(rig.pack.join(PACK_VERSION_FILE)).unwrap(), "1.0.0", "버전 표시 = 파일과 일치");
         assert_eq!(rig.read("memory/MEMORY.md").as_deref(), Some("NEW STATE AFTER UPDATE\n"), "상태 불퇴행");
-        assert_eq!(rig.read("directives/WORKER_DIRECTIVE.md").as_deref(), Some("# W-after\n"), "전체 복원은 user 소유를 되돌리지 않는다");
-        #[cfg(unix)]
-        assert_eq!(std::fs::read_link(rig.pack.join("bin/link")).unwrap(), PathBuf::from("/nonexistent/target"), "링크는 링크로");
+        assert_eq!(rig.read("agents.json").as_deref(), Some("{\"a\":\"after\"}\n"), "전체 복원은 user 소유를 되돌리지 않는다");
         // 3세대 보존 — 잠 없이 연달아 만든다(같은 초 안이어도 생성 순서가 목록 순서다).
         for v in ["2.0.0", "3.0.0", "4.0.0"] {
             std::fs::write(rig.pack.join(PACK_VERSION_FILE), v).unwrap();
+            rig.write("bin/a.sh", a1.as_bytes());
+            rig.manifest(&manifest_v1);
             rig.install(&items, false, &src);
         }
         let kept = list_update_snapshots(&root.join("base"));
@@ -13742,6 +13961,201 @@ mod m11_tests {
         assert_eq!(kept_versions, vec!["2.0.0", "3.0.0", "4.0.0"], "가장 오래된 1.0.0 세대가 정리되고 생성 순서가 유지된다");
         let newest = newest_update_snapshot(&root, "base").expect("최신");
         assert_eq!(read_update_snapshot_meta(&newest).unwrap().pack_version, "4.0.0", "최신 = 마지막에 만든 스냅샷");
+    }
+
+    /// RULINGS AC3: 전환마다 스냅샷 하나 — 실패를 거듭하는 기동 설치(버전 표시가 전진하지 못함)는 다시 복사하지 않고,
+    /// 정리는 지금 진행 중인 전환의 가장 오래된 스냅샷을 지우지 않는다(진짜 업데이트 전 보존본이 밀려나지 않는다).
+    #[test]
+    fn m11_snapshot_once_per_transition_and_its_oldest_survives_pruning() {
+        let rig = Rig::new("snaponce");
+        let root = rig.base.join("snapshots");
+        let a1 = "#!/bin/bash\necho A1\n";
+        let items = [("bin/a.sh", "#!/bin/bash\necho A2\n")];
+        let src = UpdateSources::none().with_snapshot("base", root.clone());
+        let attempt = |ver: &str, disk: &str| {
+            std::fs::write(rig.pack.join(PACK_VERSION_FILE), ver).unwrap();
+            rig.write("bin/a.sh", disk.as_bytes());
+            rig.manifest(&[("bin/a.sh", disk)]);
+            rig.install(&items, false, &src);
+        };
+        attempt("1.0.0", a1);
+        assert_eq!(list_update_snapshots(&root.join("base")).len(), 1);
+        let first = newest_update_snapshot(&root, "base").unwrap();
+        // 같은 전환을 다시 시도(버전 표시가 1.0.0 그대로 · 팩은 이미 일부가 바뀐 상태) — 새 스냅샷 없음.
+        for _ in 0..4 {
+            attempt("1.0.0", "#!/bin/bash\necho HALF-WRITTEN\n");
+        }
+        let list = list_update_snapshots(&root.join("base"));
+        assert_eq!(list.len(), 1, "같은 전환은 스냅샷 하나 — 매 기동마다 다시 복사하지 않는다");
+        assert_eq!(list[0].1, first, "첫 스냅샷이 그대로다");
+        assert_eq!(
+            std::fs::read_to_string(first.join(UPDATE_SNAPSHOT_FILES).join("bin/a.sh")).unwrap(),
+            a1,
+            "보존본 = 첫 시도 직전의 바이트"
+        );
+        // 다른 전환 둘(2.0.0 · 3.0.0) 뒤 1.0.0 에서 다시 출발 — 정리는 1.0.0 의 가장 오래된 것(first)을 지키고 2.0.0 을 지운다.
+        attempt("2.0.0", a1);
+        attempt("3.0.0", a1);
+        assert_eq!(list_update_snapshots(&root.join("base")).len(), 3);
+        attempt("1.0.0", a1);
+        let versions: Vec<String> = list_update_snapshots(&root.join("base"))
+            .iter()
+            .map(|(_, p)| read_update_snapshot_meta(p).unwrap().pack_version)
+            .collect();
+        assert_eq!(versions, vec!["1.0.0", "3.0.0", "1.0.0"], "진행 중 전환의 가장 오래된 스냅샷은 정리되지 않는다");
+        assert!(first.is_dir(), "첫 스냅샷 생존");
+    }
+
+    /// RULINGS AC4(부록 A-2 #17): 스냅샷은 유한하다 — 이 팩의 실제 파일 수(내장 전부가 바뀌는 최악의 업데이트)에서
+    /// 크기는 상한 안이고, 걸리는 시간은 명령줄 기동 대기(설계 §4-11 아: 4초) 안이다. 상한을 넘는 파일은 담지 않고
+    /// 색인에 이름을 남기며 설치는 계속된다.
+    #[test]
+    fn m11_snapshot_is_bounded_on_the_real_pack_file_count() {
+        let rig = Rig::new("snapbound");
+        let root = rig.base.join("snapshots");
+        let v1: Vec<(&str, &str)> = PACK_ALL.iter().map(|(r, c)| (*r, *c)).collect();
+        assert!(v1.len() >= 400, "실제 팩 파일 수 픽스처({}개)", v1.len());
+        install_into_with(rig.pack.clone(), v1.iter().copied(), false, "1.0.0", false, false,
+                          PackScope::Base, None, None, &UpdateSources::none()).unwrap();
+        std::fs::write(rig.pack.join(PACK_VERSION_FILE), "1.0.0").unwrap();
+        let (manifest, _) = load_manifest_state(&rig.pack);
+        // 최악: 내장 파일 전부가 바뀐다.
+        let v2_owned: Vec<(String, String)> =
+            v1.iter().map(|(r, c)| (r.to_string(), format!("{c}\n# changed in 9.9.9\n"))).collect();
+        let v2: Vec<(&str, &str)> = v2_owned.iter().map(|(r, c)| (r.as_str(), c.as_str())).collect();
+        let src = UpdateSources::none().with_snapshot("base", root.clone());
+        let t0 = std::time::Instant::now();
+        let out = take_update_snapshot(&rig.pack, &v2, false, "9.9.9", PackScope::Base, &src, &manifest)
+            .expect("스냅샷 대상 있음")
+            .expect("스냅샷 성공");
+        let took = t0.elapsed();
+        // 실측 증거(로그): 파일 수 · 바이트 · 걸린 시간.
+        eprintln!("[m11-snapshot-bound] files={} bytes={} skipped={} took={took:?}", out.files, out.bytes, out.skipped.len());
+        assert!(out.files > 0 && out.files <= v1.len());
+        assert!(out.bytes <= UPDATE_SNAPSHOT_TOTAL_CAP, "총량 {} > 상한", out.bytes);
+        assert!(out.skipped.is_empty(), "실제 팩은 상한 안에 든다: {:?}", out.skipped);
+        let mut stack = vec![out.path.join(UPDATE_SNAPSHOT_FILES)];
+        let mut on_disk = 0u64;
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).unwrap().flatten() {
+                let m = std::fs::symlink_metadata(e.path()).unwrap();
+                if m.is_dir() {
+                    stack.push(e.path());
+                } else {
+                    assert!(m.len() <= UPDATE_SNAPSHOT_FILE_CAP);
+                    on_disk += m.len();
+                }
+            }
+        }
+        assert_eq!(on_disk, out.bytes, "색인의 바이트 합 = 실제 사본");
+        assert!(took < std::time::Duration::from_secs(4), "스냅샷 {took:?} — 기동 대기 4초 초과"); // wallclock: aging RULINGS AC4 asks for a time bound on the pre-bind snapshot; 4 s is the design's CLI start wait (§4-11 아), ~10x the measured cost on this machine
+        // 상한: 파일 하나가 상한을 넘으면 그 파일만 빠지고 색인에 남는다 — 설치는 계속된다.
+        let big = "x".repeat((UPDATE_SNAPSHOT_FILE_CAP + 1) as usize);
+        rig.write("bin/huge.txt", big.as_bytes());
+        rig.write("bin/small.txt", b"small v1\n");
+        rig.manifest(&[("bin/huge.txt", big.as_str()), ("bin/small.txt", "small v1\n")]);
+        std::fs::write(rig.pack.join(PACK_VERSION_FILE), "2.0.0").unwrap();
+        rig.install(&[("bin/huge.txt", "y\n"), ("bin/small.txt", "small v2\n")], false, &src);
+        let snap = newest_update_snapshot(&root, "base").unwrap();
+        let meta = read_update_snapshot_meta(&snap).unwrap();
+        assert_eq!(meta.pack_version, "2.0.0");
+        assert_eq!(meta.files.iter().map(|f| f.rel.as_str()).collect::<Vec<_>>(), vec!["bin/small.txt"]);
+        assert_eq!(meta.skipped.len(), 1);
+        assert_eq!(meta.skipped[0].rel, "bin/huge.txt");
+        assert_eq!(meta.skipped[0].reason, "file-cap");
+        assert_eq!(rig.read("bin/huge.txt").as_deref(), Some("y\n"), "설치는 계속됐다");
+        // 총량 상한(작은 상한으로 직접): 넘치는 파일은 total-cap 으로 빠진다.
+        for (r, n) in [("t/a", 600usize), ("t/b", 900), ("t/c", 2000)] {
+            rig.write(r, "z".repeat(n).as_bytes());
+        }
+        let rels: Vec<String> = ["t/a", "t/b", "t/c"].iter().map(|s| s.to_string()).collect();
+        let none = |_: &str| Vec::new();
+        let o = create_update_snapshot(&rig.pack, &root, "capped", "1.0.0", &std::collections::BTreeMap::new(),
+                                       &rels, PackScope::Base, &none, (1000, 1600)).unwrap();
+        assert_eq!(o.files, 2);
+        assert_eq!(o.skipped, vec![SnapshotSkip { rel: "t/c".into(), bytes: 2000, reason: "file-cap".into() }]);
+        let o = create_update_snapshot(&rig.pack, &root, "capped2", "1.0.0", &std::collections::BTreeMap::new(),
+                                       &rels, PackScope::Base, &none, (5000, 1600)).unwrap();
+        assert_eq!(o.skipped.iter().map(|k| (k.rel.as_str(), k.reason.as_str())).collect::<Vec<_>>(),
+                   vec![("t/c", "total-cap")]);
+    }
+
+    /// RULINGS AC1: 스냅샷 항목의 출시본 여부 — 바꾸기 전 설치 기록과 같은 바이트, 또는 (기록이 없을 때) 과거 출시 해시
+    /// 표의 바이트만 참이다. 사용자 수정본(병합·vendor 우선 대상)은 거짓이다.
+    #[test]
+    fn m11_snapshot_records_whether_bytes_are_released() {
+        let rig = Rig::new("snaprel");
+        let root = rig.base.join("snapshots");
+        rig.write("bin/unedited.sh", b"#!/bin/sh\nv1\n");
+        rig.write("bin/old.sh", b"#!/bin/sh\nold release\n");
+        rig.write("bin/edited.sh", b"#!/bin/sh\nmine\n");
+        rig.manifest(&[("bin/unedited.sh", "#!/bin/sh\nv1\n"), ("bin/edited.sh", "#!/bin/sh\nv1\n")]);
+        rig.pristine("bin/edited.sh", "#!/bin/sh\nv1\n");
+        std::fs::write(rig.pack.join(PACK_VERSION_FILE), "1.0.0").unwrap();
+        let old_hash = content_hash("#!/bin/sh\nold release\n");
+        let src = UpdateSources::none()
+            .with_snapshot("base", root.clone())
+            .with_prev_vendor(move |r| if r == "bin/old.sh" { vec![old_hash.clone()] } else { Vec::new() });
+        rig.install(&[("bin/unedited.sh", "#!/bin/sh\nv2\n"), ("bin/old.sh", "#!/bin/sh\nv2\n"),
+                      ("bin/edited.sh", "#!/bin/sh\nv2\n")], false, &src);
+        let meta = read_update_snapshot_meta(&newest_update_snapshot(&root, "base").unwrap()).unwrap();
+        let rel = |r: &str| meta.files.iter().find(|f| f.rel == r).map(|f| f.released);
+        assert_eq!(rel("bin/unedited.sh"), Some(true), "설치 기록과 같은 바이트");
+        assert_eq!(rel("bin/old.sh"), Some(true), "기록 없음 + 과거 출시 해시 표의 바이트");
+        assert_eq!(rel("bin/edited.sh"), Some(false), "사용자 수정본(병합 대상)");
+    }
+
+    /// RULINGS AC5: 비수정 판정(다 · 바)과 스냅샷의 출시본 판정이 쓰는 과거 출시 해시 표 — 라이브(`for_live_pack`)와
+    /// `none()` 입력원은 `pack_prev_vendor::prev_vendor_hashes(rel)` 를 **그대로** 돌려준다(이음새로 바뀐 표가 제품
+    /// 경로에 남으면 빨갛다). 표의 내용 자체는 T2c 의 것(재생성 · CI 신선도 검사)이다.
+    #[test]
+    fn m11_prev_vendor_lookup_is_the_table_on_production_sources() {
+        let rig = Rig::new("prevtable");
+        let _l = EnvGuard::set("CYS_LOCAL_DIR", rig.base.join("local"));
+        let _p = EnvGuard::set(ENV_PACK_DIR, &rig.pack);
+        let none = UpdateSources::none();
+        let live = UpdateSources::for_live_pack(&rig.pack);
+        let mut with_rows = 0usize;
+        for (rel, _) in PACK_ALL.iter() {
+            let want: Vec<String> = crate::pack_prev_vendor::prev_vendor_hashes(rel)
+                .iter()
+                .map(|h| h.to_string())
+                .collect();
+            if !want.is_empty() {
+                with_rows += 1;
+            }
+            assert_eq!(none.prev_vendor_for(rel), want, "none(): {rel}");
+            assert_eq!(live.prev_vendor_for(rel), want, "for_live_pack(): {rel}");
+        }
+        assert!(with_rows > 0, "표에 행이 없다 — 이 핀이 아무것도 재지 않는다");
+        // 판정 수집기도 같은 조회를 쓴다: 표의 해시와 같은 디스크 바이트는 '과거 vendor 본'이다(시험용 표로 확인).
+        let probe = "#!/bin/sh\nprobe\n";
+        let h = content_hash(probe);
+        let seam = UpdateSources::none().with_prev_vendor(move |_| vec![h.clone()]);
+        let ctx = UpdateContext::new(&rig.pack, PackScope::Base, &seam, false);
+        let f = ctx.facts("bin/probe.sh", "#!/bin/sh\nv2\n", true, Some(probe), None, &serde_json::Map::new());
+        assert!(f.prev_vendor_match);
+    }
+
+    /// RULINGS AC7: vendor-first 원장 항목은 vendor 바이트보다 **먼저** 저장된다 — vendor 쓰기가 실패해(여기서는 살아 있는
+    /// 파일을 바꿀 수 없게 막아) 설치가 멈춰도 `.user` 는 기록된 보관본이다(기록 없는 고아가 아니다).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn m11_vendor_first_record_is_saved_before_the_vendor_bytes() {
+        let rig = Rig::new("vforder");
+        let rel = "bin/boot.sh";
+        rig.write(rel, b"#!/bin/sh\nmine\n");
+        let src = UpdateSources::none().with_boot_critical(|r| r == "bin/boot.sh");
+        let p = rig.pack.join(rel);
+        let c = std::ffi::CString::new(p.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::chflags(c.as_ptr(), libc::UF_IMMUTABLE) }, 0, "불변 표시");
+        let r = install_into_with(rig.pack.clone(), [(rel, "#!/bin/sh\nvendor\n")], false, "9.9.9", false, false,
+                                  PackScope::Base, None, None, &src);
+        unsafe { libc::chflags(c.as_ptr(), 0) };
+        assert!(r.is_err(), "vendor 쓰기가 실패해야 시험이 성립한다: {r:?}");
+        assert_eq!(rig.read(rel).as_deref(), Some("#!/bin/sh\nmine\n"), "살아 있는 파일 무변경");
+        assert_eq!(std::fs::read_to_string(rig.pack.join(format!("{rel}.user"))).unwrap(), "#!/bin/sh\nmine\n");
+        assert_eq!(rig.kind(rel).as_deref(), Some("vendor-first"), "멈춘 자리에서도 .user 는 원장에 기록된 보관본");
     }
 
     /// O-C8-4 (a): 라이브 입력원의 스냅샷 위치가 T0 경로 도우미(`repair::paths::update_snapshot_dir`)와 같은 배치다.
