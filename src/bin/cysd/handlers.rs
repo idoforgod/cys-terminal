@@ -1568,10 +1568,24 @@ fn walk_caller_ancestry(daemon: &Daemon, caller_pid: u32) -> (Option<u64>, Optio
     }
     #[cfg(target_os = "macos")]
     {
-        if crate::state::proc_probe_fast_enabled() {
-            return walk_fast_with(&pid_to_sid, caller_pid, crate::state::proc_brief);
+        let (found, start) = if crate::state::proc_probe_fast_enabled() {
+            walk_fast_with(&pid_to_sid, caller_pid, crate::state::proc_brief)
+        } else {
+            walk_legacy(&pid_to_sid, caller_pid)
+        };
+        if found.is_some() {
+            return (found, start);
         }
+        // ★(0.15.0 「스스로 해결」 RULINGS M4 / interpretation 32 · T3) 제어 터미널 폴백 — 조상 사슬이
+        //   pane 에 닿지 않아도(`(nohup …&)` 처럼 부모가 죽어 launchd 로 재부모화된 작업) 호출자의 제어
+        //   터미널(`e_tdev`)이 어느 pane 의 터미널이면 그 좌석이다. 모든 호출처가 이 확장을 본다(send ACL 포함 —
+        //   분리로 '외부'가 되던 탈출이 닫힌다). 터미널이 없거나 어느 pane 의 것도 아니면 종전 그대로 None.
+        let by_terminal = crate::state::proc_brief(caller_pid)
+            .and_then(|b| b.tdev)
+            .and_then(|t| crate::repair::seat_of_terminal(daemon, t));
+        return (by_terminal, start);
     }
+    #[cfg(not(target_os = "macos"))]
     walk_legacy(&pid_to_sid, caller_pid)
 }
 
@@ -6266,6 +6280,8 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
                 }
             }
             let reply = hook_machine_origin_verdict(daemon, sid, &norm);
+            // 「스스로 해결」(0.15.0 RULINGS T3 / U4(a) · T3): 좌석별 프롬프트 출처 기록(질문 인지 · named_docs) — 메모리만.
+            crate::repair::record_prompt_origin(daemon, sid, &norm, digest_in.as_deref(), reply["origin"].as_str());
             Reply::Single(ok_response(&id, reply))
         }
 
@@ -21321,7 +21337,7 @@ mod tests {
             let reads = std::cell::Cell::new(0u32);
             let (found, start) = walk_fast_with(&map, 5000, |p| {
                 reads.set(reads.get() + 1);
-                Some(ProcBrief { parent: Some(p + 1), start_time: 1234 })
+                Some(ProcBrief { parent: Some(p + 1), start_time: 1234, tdev: None })
             });
             assert_eq!(found, Some(77), "깊이 {d} 루트를 못 찾았다");
             assert_eq!(start, Some(1234), "caller_start 가 기록되지 않았다");
@@ -21334,7 +21350,7 @@ mod tests {
             let (found, _) = walk_fast_with(&map, 6000, |p| {
                 seen.borrow_mut().push(p);
                 let parent = if p < 6003 { p + 1 } else { top };
-                Some(ProcBrief { parent: (parent != 0).then_some(parent), start_time: 1 })
+                Some(ProcBrief { parent: (parent != 0).then_some(parent), start_time: 1, tdev: None })
             });
             assert_eq!(found, None);
             assert_eq!(*seen.borrow(), vec![6000, 6001, 6002, 6003], "판독 순서·횟수(top={top})");

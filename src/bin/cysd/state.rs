@@ -4581,6 +4581,11 @@ pub(crate) struct ProcBrief {
     pub(crate) parent: Option<u32>,
     /// `pbi_start_tvsec`(epoch 초) — pid 재사용 식별자. 타 사용자 프로세스는 0(sysinfo 와 같다).
     pub(crate) start_time: u64,
+    /// ★(0.15.0 「스스로 해결」 RULINGS M4 / O5 · T3) 제어 터미널 장치 번호 — **같은** `PROC_PIDTBSDINFO`
+    /// 판독의 `e_tdev`(추가 시스템 콜 없음). 터미널 없음(`NODEV` = u32::MAX)·0·bsd 판독 불가 = None.
+    /// 호출자 신원 워크의 터미널 폴백(`handlers::walk_caller_ancestry`)과 수리 모듈의 '사람' 판정이 읽는다.
+    /// sysinfo 에는 대응 값이 없다(legacy 판독은 늘 None).
+    pub(crate) tdev: Option<u32>,
 }
 
 /// 존재·필드 **순수 판정**(sysinfo `create_new_process` 와 같은 식).
@@ -4598,12 +4603,12 @@ pub(crate) fn decide_brief(
     match bsd {
         Some((ppid, start_time)) => {
             if pidpath_ok || procargs2_ok() {
-                Some(ProcBrief { parent: (ppid != 0).then_some(ppid), start_time })
+                Some(ProcBrief { parent: (ppid != 0).then_some(ppid), start_time, tdev: None })
             } else {
                 None
             }
         }
-        None => pidpath_ok.then_some(ProcBrief { parent: None, start_time: 0 }),
+        None => pidpath_ok.then_some(ProcBrief { parent: None, start_time: 0, tdev: None }),
     }
 }
 
@@ -4627,15 +4632,18 @@ pub(crate) fn proc_brief(pid: u32) -> Option<ProcBrief> {
             &mut info as *mut libc::proc_bsdinfo as *mut libc::c_void,
             size,
         );
-        (n == size).then_some((info.pbi_ppid, info.pbi_start_tvsec))
+        (n == size).then_some((info.pbi_ppid, info.pbi_start_tvsec, info.e_tdev))
     };
+    // ★(0.15.0 M4) 제어 터미널 — 같은 bsdinfo 판독의 `e_tdev`(NODEV = (dev_t)-1 → u32::MAX).
+    let tdev = bsd.and_then(|(_, _, t)| (t != u32::MAX && t != 0).then_some(t));
+    let bsd = bsd.map(|(ppid, start, _)| (ppid, start));
     // ② proc_pidpath — 고정 스택 버퍼(PROC_PIDPATHINFO_MAXSIZE=4096), 반환 >0 이면 성공.
     let mut path = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
     // SAFETY: 버퍼 길이를 그대로 bufsize 로 넘긴다 — 커널은 그 이하만 쓴다. 내용은 읽지 않는다.
     let pidpath_ok = unsafe {
         libc::proc_pidpath(cpid, path.as_mut_ptr() as *mut libc::c_void, path.len() as u32) > 0
     };
-    decide_brief(bsd, pidpath_ok, || procargs2_ok(cpid))
+    decide_brief(bsd, pidpath_ok, || procargs2_ok(cpid)).map(|b| ProcBrief { tdev, ..b })
 }
 
 /// ③ KERN_PROCARGS2 폴백(bsd=Some ∧ pidpath 실패일 때만 호출된다) — 크기 조회 뒤 **커널이 알려준
@@ -4755,7 +4763,7 @@ mod proc_brief_tests {
         match bsd {
             None => {
                 if pidpath {
-                    Some(ProcBrief { parent: None, start_time: 0 })
+                    Some(ProcBrief { parent: None, start_time: 0, tdev: None })
                 } else {
                     None
                 }
@@ -4765,6 +4773,7 @@ mod proc_brief_tests {
                     Some(ProcBrief {
                         parent: if ppid == 0 { None } else { Some(ppid) },
                         start_time: st,
+                        tdev: None,
                     })
                 } else {
                     None
@@ -4806,7 +4815,7 @@ mod proc_brief_tests {
         assert_eq!(decide_brief(None, false, || true), None, "(bsd None·pidpath 실패·procargs2 성공)=None");
         assert_eq!(
             decide_brief(Some((7, 99)), false, || true),
-            Some(ProcBrief { parent: Some(7), start_time: 99 }),
+            Some(ProcBrief { parent: Some(7), start_time: 99, tdev: None }),
             "(bsd Some·pidpath 실패·procargs2 성공)=Some"
         );
     }
@@ -4842,6 +4851,7 @@ mod proc_brief_tests {
         sys.process(sysinfo::Pid::from_u32(pid)).map(|p| ProcBrief {
             parent: p.parent().map(|x| x.as_u32()),
             start_time: p.start_time(),
+            tdev: None, // sysinfo has no controlling terminal — compared on parent/start only
         })
     }
 
@@ -4869,7 +4879,8 @@ mod proc_brief_tests {
             let fast = reader(pid);
             let legacy = legacy_brief(snap, pid);
             match (fast, legacy) {
-                (Some(a), Some(b)) if a == b => {
+                // ★(0.15.0 M4) `tdev` has no sysinfo counterpart — the oracle compares the two fields it has.
+                (Some(a), Some(b)) if (a.parent, a.start_time) == (b.parent, b.start_time) => {
                     if a.start_time == 0 {
                         t.some_zero += 1;
                     } else {
@@ -5089,8 +5100,10 @@ mod proc_brief_tests {
         };
         assert_eq!(reaped as u32, pid, "판독 시점에 좀비가 아니었다(남이 회수) — 검체 무효");
         eprintln!("T1z 좀비 판독: fast={fast:?} all={all:?} some={some:?}");
-        assert_eq!(fast, all, "좀비: fast 와 sysinfo All 이 다르다");
-        assert_eq!(fast, some, "좀비: fast 와 sysinfo Some 이 다르다");
+        // ★(0.15.0 M4) `tdev` has no sysinfo counterpart — compared on parent/start (the oracle's fields).
+        let ps = |b: Option<ProcBrief>| b.map(|b| (b.parent, b.start_time));
+        assert_eq!(ps(fast), ps(all), "좀비: fast 와 sysinfo All 이 다르다");
+        assert_eq!(ps(fast), ps(some), "좀비: fast 와 sysinfo Some 이 다르다");
     }
 }
 
