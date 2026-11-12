@@ -224,16 +224,55 @@ pub struct HeldRepair {
     pub methods: Vec<String>,
 }
 
-/// Reads one repair record. Stub in T0 (body: T3).
+/// Reads one repair record (O-C1-6/7: unreadable or of a higher schema → `Corrupt`; a missing
+/// record → `Precondition`, the daemon answers `not_found` itself — RULINGS Z1).
 pub fn load_record(id: &RepairId) -> Result<RepairRecord, RepairError> {
-    let _ = id;
-    Err(RepairError::NotImplemented("ledger::load_record"))
+    match read_record_in(&super::paths::repairs_root(), id)? {
+        Some(r) => Ok(r),
+        None => Err(RepairError::Precondition(format!(
+            "{}: 그런 수리가 없습니다",
+            id.as_str()
+        ))),
+    }
 }
 
-/// The repair a seat of a lane holds, if any. Stub in T0 (body: T3).
+/// The repair a seat of a lane holds, if any (for the [RESUME] line, C6 6.6): the newest record
+/// whose lock owner is that lane and seat and whose lease has not passed its expiry + grace.
+/// (The CLI cannot see the daemon's incarnation, so a lock released by a restart but not yet
+/// expired still shows — the daemon itself treats it as released.)
 pub fn held_by_seat(lane: &LaneKey, seat: u64) -> Result<Option<HeldRepair>, RepairError> {
-    let _ = (lane, seat);
-    Err(RepairError::NotImplemented("ledger::held_by_seat"))
+    held_by_seat_in(&super::paths::repairs_root(), lane, seat, now_epoch())
+}
+
+/// [`held_by_seat`] under an explicit repairs root and clock.
+pub fn held_by_seat_in(
+    root: &Path,
+    lane: &LaneKey,
+    seat: u64,
+    now: f64,
+) -> Result<Option<HeldRepair>, RepairError> {
+    let mut ids = list_ids_in(root);
+    ids.reverse();
+    for id in ids {
+        let Ok(Some(rec)) = read_record_in(root, &id) else {
+            continue; // unreadable records are skipped here and listed by `status` (F4)
+        };
+        let Some(lock) = rec.lock.as_ref() else {
+            continue;
+        };
+        if lock.owner.lane == *lane
+            && lock.owner.seat == seat
+            && now <= lock.expires_at + super::grant::EXPIRY_GRACE_SECS as f64
+        {
+            return Ok(Some(HeldRepair {
+                id: rec.id.clone(),
+                state: rec.state,
+                attempt: rec.attempt,
+                methods: rec.methods.clone(),
+            }));
+        }
+    }
+    Ok(None)
 }
 
 /// The job-state reader (RULINGS H3 / I1). Stub in T0.
@@ -249,9 +288,46 @@ pub enum RegisteredLanes {
     Unknown(String),
 }
 
-/// Stub in T0 (body: T3).
+/// RULINGS K1 / L4 / interpretation 27: the HQ lane ∪ every department socket of the lane registry
+/// (`crate::lane::registry_path()`, `~/.cys/depts.json` or `CYS_DEPTS_JSON`). A MISSING registry =
+/// no departments (HQ alone); an unreadable or malformed one = `Unknown` ("전파 완료" is then never
+/// declared). No 64-entry cap (unlike `lane::registry_sockets`).
 pub fn registered_lanes() -> Result<RegisteredLanes, RepairError> {
-    Err(RepairError::NotImplemented("ledger::registered_lanes"))
+    Ok(registered_lanes_from(&crate::lane::registry_path()))
+}
+
+/// [`registered_lanes`] from an explicit registry file.
+pub fn registered_lanes_from(path: &Path) -> RegisteredLanes {
+    let base = LaneKey("base".to_string());
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return RegisteredLanes::Known(vec![base])
+        }
+        Err(e) => return RegisteredLanes::Unknown(format!("{}: {e}", path.display())),
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let v: serde_json::Value = match serde_json::from_str(crate::strip_utf8_bom(&text)) {
+        Ok(v) => v,
+        Err(e) => return RegisteredLanes::Unknown(format!("{}: {e}", path.display())),
+    };
+    let Some(depts) = v.get("depts").and_then(|d| d.as_object()) else {
+        return RegisteredLanes::Unknown(format!("{}: no `depts` object", path.display()));
+    };
+    let mut lanes = vec![base];
+    for d in depts.values() {
+        let Some(sock) = d.get("socket").and_then(|s| s.as_str()) else {
+            continue;
+        };
+        if sock.trim().is_empty() {
+            continue;
+        }
+        let key = LaneKey::of_socket(Path::new(sock));
+        if !lanes.contains(&key) {
+            lanes.push(key);
+        }
+    }
+    RegisteredLanes::Known(lanes)
 }
 
 /// Why the assignment gate holds a lane (RULINGS I1 + I7 + I8 decision table).
@@ -296,10 +372,89 @@ pub fn gate_verdict(lane: &LaneKey) -> Result<GateVerdict, RepairError> {
 
 /// THE candidate reader (RULINGS V2(a)), re-exported as `repair::candidate_states`: one line per
 /// declared FILE target in `rel` order, `TargetState::read(staging_dir(id)/<rel>)`, a missing entry
-/// → `Absent`. Stub in T0 (body: T3).
+/// → `Absent`; hook lines are skipped by kind (W3(b)); a `rel` whose parent chain inside staging
+/// contains a link is refused (U3).
 pub fn candidate_states(id: &RepairId) -> Result<Vec<(String, TargetState)>, RepairError> {
-    let _ = id;
-    Err(RepairError::NotImplemented("ledger::candidate_states"))
+    candidate_states_in(&super::paths::repairs_root(), id)
+}
+
+/// [`candidate_states`] under an explicit repairs root.
+pub fn candidate_states_in(
+    root: &Path,
+    id: &RepairId,
+) -> Result<Vec<(String, TargetState)>, RepairError> {
+    let rec = read_record_in(root, id)?.ok_or_else(|| {
+        RepairError::Precondition(format!("{}: 그런 수리가 없습니다", id.as_str()))
+    })?;
+    let staging = staging_dir_in(root, id);
+    let mut rels: Vec<&str> = file_targets(&rec).map(|f| f.rel.as_str()).collect();
+    rels.sort_unstable();
+    rels.dedup();
+    let mut out = Vec::with_capacity(rels.len());
+    for rel in rels {
+        out.push((rel.to_string(), read_under_no_link(&staging, rel)?));
+    }
+    Ok(out)
+}
+
+/// The record's FILE targets — every walker skips hook lines by kind (RULINGS W3(b)).
+pub fn file_targets(rec: &RepairRecord) -> impl Iterator<Item = &FileChange> {
+    rec.files
+        .iter()
+        .filter(|f| !matches!(f.kind, ChangeKind::HookUnregister { .. }))
+}
+
+/// The record's hook lines (RULINGS V1 / W3(b)).
+pub fn hook_lines(rec: &RepairRecord) -> impl Iterator<Item = &FileChange> {
+    rec.files
+        .iter()
+        .filter(|f| matches!(f.kind, ChangeKind::HookUnregister { .. }))
+}
+
+/// `TargetState::read(base/<rel>)` refusing a `rel` that is not a plain relative path or whose
+/// parent chain inside `base` contains a symbolic link (the base itself must be a real directory,
+/// or absent → every entry is `Absent`).
+pub fn read_under_no_link(base: &Path, rel: &str) -> Result<TargetState, RepairError> {
+    let parts: Vec<&str> = rel.split('/').collect();
+    if rel.is_empty()
+        || parts
+            .iter()
+            .any(|p| p.is_empty() || *p == "." || *p == "..")
+        || rel.contains('\\')
+    {
+        return Err(RepairError::Precondition(format!(
+            "잘못된 대상 경로: {rel:?}"
+        )));
+    }
+    match std::fs::symlink_metadata(base) {
+        Ok(m) if m.file_type().is_symlink() || !m.is_dir() => {
+            return Err(RepairError::Precondition(format!(
+                "{}: 작업 사본 자리가 실제 폴더가 아닙니다",
+                base.display()
+            )))
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(TargetState::Absent),
+        Err(e) => return Err(RepairError::Io(format!("{}: {e}", base.display()))),
+    }
+    let mut cur = base.to_path_buf();
+    for p in &parts[..parts.len() - 1] {
+        cur.push(p);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(m) if m.file_type().is_symlink() => {
+                return Err(RepairError::Precondition(format!(
+                    "{rel}: 작업 사본 안의 상위 경로 {} 가 링크입니다 — 거부",
+                    cur.display()
+                )))
+            }
+            Ok(m) if !m.is_dir() => return Ok(TargetState::Absent),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(TargetState::Absent),
+            Err(e) => return Err(RepairError::Io(format!("{}: {e}", cur.display()))),
+        }
+    }
+    cur.push(parts[parts.len() - 1]);
+    TargetState::read(&cur)
 }
 
 /// Round cap (C1 1.11).
@@ -318,6 +473,561 @@ pub const SWEEP_SECS: u64 = 3_600;
 pub const JOB_EVERY_MINUTES: u64 = 2;
 /// Reviewer2's audit window for general repairs (C1 1.10).
 pub const AUDIT_WINDOW_SECS: u64 = 86_400;
+
+// ───────────────────────── T3: the ledger's storage (C1 · O-C1-1/3/6/7 · C2 2.3(a)) ─────────────────────────
+// Every function takes the repairs root explicitly (`paths::repairs_root()` in production), so tests
+// never touch the process environment. Layouts mirror `paths.rs` (pinned by `layouts_match_paths_rs`).
+// One writer per file (B1): `record.json` only by the origin lane's daemon, `lanes/<lane>.json` only
+// by that lane's daemon — enforced by the daemon module, which serialises every read-modify-write of
+// one repair under its in-memory per-repair mutex (G6, R3). Ledger files are never deleted here.
+
+/// Seconds since the epoch (the ledger's clock).
+pub fn now_epoch() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+/// `<root>/R-<n>/`
+pub fn repair_dir_in(root: &Path, id: &RepairId) -> PathBuf {
+    root.join(id.as_str())
+}
+
+/// `<root>/R-<n>/record.json`
+pub fn record_path_in(root: &Path, id: &RepairId) -> PathBuf {
+    repair_dir_in(root, id).join("record.json")
+}
+
+/// `<root>/R-<n>/lanes/<lane_key>.json`
+pub fn lane_path_in(root: &Path, id: &RepairId, lane: &LaneKey) -> PathBuf {
+    repair_dir_in(root, id)
+        .join("lanes")
+        .join(format!("{}.json", lane.0))
+}
+
+/// `<root>/R-<n>/staging/` — the fixed working copy (U3).
+pub fn staging_dir_in(root: &Path, id: &RepairId) -> PathBuf {
+    repair_dir_in(root, id).join("staging")
+}
+
+/// `<root>/displaced/R-<n>/` — the repair's vault slots (C2 2.1).
+pub fn vault_dir_in(root: &Path, id: &RepairId) -> PathBuf {
+    root.join("displaced").join(id.as_str())
+}
+
+fn corrupt(p: &Path, why: impl std::fmt::Display) -> RepairError {
+    RepairError::Corrupt(format!("{}: {why}", p.display()))
+}
+
+/// Reads a ledger JSON file: `Ok(None)` if absent; `Err(Corrupt)` if unreadable, malformed or of a
+/// higher `schema` than this build knows (O-C1-6 / O-C1-7).
+fn read_json<T: serde::de::DeserializeOwned>(p: &Path) -> Result<Option<T>, RepairError> {
+    let bytes = match std::fs::read(p) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(corrupt(p, e)),
+    };
+    let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| corrupt(p, e))?;
+    let schema = v.get("schema").and_then(|s| s.as_u64()).unwrap_or(u64::MAX);
+    if schema > u64::from(super::REPAIR_SCHEMA) {
+        return Err(corrupt(p, format!("unknown schema {schema}")));
+    }
+    serde_json::from_value(v)
+        .map(Some)
+        .map_err(|e| corrupt(p, e))
+}
+
+/// Reads `R-<n>/record.json` (`None` = no such repair). A record whose `id` differs from its
+/// directory is corrupt.
+pub fn read_record_in(root: &Path, id: &RepairId) -> Result<Option<RepairRecord>, RepairError> {
+    let p = record_path_in(root, id);
+    let rec: Option<RepairRecord> = read_json(&p)?;
+    if let Some(r) = &rec {
+        if r.id != *id {
+            return Err(corrupt(&p, format!("record names {}", r.id.as_str())));
+        }
+    }
+    Ok(rec)
+}
+
+/// Writes `R-<n>/record.json` (tmp + rename, `cys::atomic_write_json`); the schema written is always
+/// this build's (writers never downgrade — a higher-schema record is never loaded, so never written).
+pub fn write_record_in(root: &Path, rec: &RepairRecord) -> Result<(), RepairError> {
+    let p = record_path_in(root, &rec.id);
+    let mut r = rec.clone();
+    r.schema = super::REPAIR_SCHEMA;
+    crate::atomic_write_json(&p, &r).map_err(|e| RepairError::Io(format!("{}: {e}", p.display())))
+}
+
+/// [`write_record_in`] made durable (E1: the file and its directory fully flushed) — used where a
+/// later step must never run ahead of the record (commit before the hook step, RULINGS Y1).
+pub fn write_record_durable_in(root: &Path, rec: &RepairRecord) -> Result<(), RepairError> {
+    write_record_in(root, rec)?;
+    let p = record_path_in(root, &rec.id);
+    let f =
+        std::fs::File::open(&p).map_err(|e| RepairError::Io(format!("{}: {e}", p.display())))?;
+    full_flush_file(&f).map_err(|e| RepairError::Io(format!("{}: {e}", p.display())))?;
+    full_flush_dir(&repair_dir_in(root, &rec.id))
+}
+
+/// Reads one lane row (`None` = the lane has no row for this repair — counts as 대기, K1).
+pub fn read_lane_in(
+    root: &Path,
+    id: &RepairId,
+    lane: &LaneKey,
+) -> Result<Option<LaneRecord>, RepairError> {
+    let p = lane_path_in(root, id, lane);
+    let row: Option<LaneRecord> = read_json(&p)?;
+    if let Some(r) = &row {
+        if r.repair != *id || r.lane != *lane {
+            return Err(corrupt(&p, "row names another repair or lane"));
+        }
+    }
+    Ok(row)
+}
+
+/// Writes one lane row (only that lane's daemon calls this — K1).
+pub fn write_lane_in(root: &Path, row: &LaneRecord) -> Result<(), RepairError> {
+    let p = lane_path_in(root, &row.repair, &row.lane);
+    let mut r = row.clone();
+    r.schema = super::REPAIR_SCHEMA;
+    crate::atomic_write_json(&p, &r).map_err(|e| RepairError::Io(format!("{}: {e}", p.display())))
+}
+
+/// Every lane row of a repair (sorted by lane key) and the unreadable ones (listed, never fatal).
+pub fn lane_rows_in(root: &Path, id: &RepairId) -> (Vec<LaneRecord>, Vec<String>) {
+    let dir = repair_dir_in(root, id).join("lanes");
+    let mut rows = Vec::new();
+    let mut broken = Vec::new();
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return (rows, broken);
+    };
+    let mut files: Vec<PathBuf> = rd.filter_map(Result::ok).map(|e| e.path()).collect();
+    files.sort();
+    for f in files {
+        let Some(stem) = f
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        match read_lane_in(root, id, &LaneKey(stem.to_string())) {
+            Ok(Some(r)) => rows.push(r),
+            Ok(None) => {}
+            Err(RepairError::Corrupt(m)) | Err(RepairError::Io(m)) => broken.push(m),
+            Err(e) => broken.push(format!("{e:?}")),
+        }
+    }
+    (rows, broken)
+}
+
+/// Every `R-<n>` directory under the root, in numeric order (anything else is ignored).
+pub fn list_ids_in(root: &Path) -> Vec<RepairId> {
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut ids: Vec<RepairId> = rd
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter_map(|e| e.file_name().to_str().and_then(|n| RepairId::parse(n).ok()))
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// Allocates the next `R-<n>` by an exclusive directory create (O-C1-2: n = highest + 1; on
+/// `AlreadyExists` — another daemon won that number — the next one is tried). Unique across lanes
+/// because the create is atomic on the shared filesystem.
+pub fn allocate_id_in(root: &Path) -> Result<RepairId, RepairError> {
+    std::fs::create_dir_all(root)
+        .map_err(|e| RepairError::Io(format!("{}: {e}", root.display())))?;
+    for _ in 0..1000 {
+        let next = list_ids_in(root)
+            .last()
+            .and_then(|id| {
+                id.as_str()
+                    .strip_prefix("R-")
+                    .and_then(|n| n.parse::<u64>().ok())
+            })
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| RepairError::Precondition("수리 번호가 다 찼습니다".into()))?;
+        let id = RepairId::parse(&format!("R-{next}"))?;
+        match std::fs::create_dir(repair_dir_in(root, &id)) {
+            Ok(()) => return Ok(id),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(RepairError::Io(format!("{}: {e}", root.display()))),
+        }
+    }
+    Err(RepairError::Io(
+        "repair id allocation: too many concurrent creates".into(),
+    ))
+}
+
+/// The full flush of RULINGS E1: `F_FULLFSYNC` on macOS (plain `fsync` lost the exchange in 10/10
+/// simulated power losses), `sync_all` elsewhere. (T6's `durable` module is the shared helper once
+/// it lands; this is the same call for T3's own files.)
+pub fn full_flush_file(f: &std::fs::File) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: fcntl on a descriptor this function borrows for the duration of the call.
+        if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_FULLFSYNC) } == 0 {
+            return Ok(());
+        }
+    }
+    f.sync_all()
+}
+
+/// [`full_flush_file`] on a directory handle (unix; Windows has no directory flush — no-op there).
+pub fn full_flush_dir(dir: &Path) -> Result<(), RepairError> {
+    #[cfg(unix)]
+    {
+        let f = std::fs::File::open(dir)
+            .map_err(|e| RepairError::Io(format!("{}: {e}", dir.display())))?;
+        full_flush_file(&f).map_err(|e| RepairError::Io(format!("{}: {e}", dir.display())))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
+    Ok(())
+}
+
+/// O-C2-1: a slot name `YYYYMMDDTHHMMSSffffffZ` (UTC, microseconds) for an epoch time.
+pub fn utc_slot_name(epoch: f64) -> String {
+    let micros_total = if epoch.is_finite() && epoch > 0.0 {
+        (epoch * 1_000_000.0) as u64
+    } else {
+        0
+    };
+    let secs = micros_total / 1_000_000;
+    let micros = micros_total % 1_000_000;
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let (h, mi, se) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    // civil-from-days (Howard Hinnant's algorithm), proleptic Gregorian
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}{m:02}{d:02}T{h:02}{mi:02}{se:02}{micros:06}Z")
+}
+
+/// True for a slot directory name of O-C2-1 (`…Z` or `…Z-<n>`).
+pub fn is_slot_name(s: &str) -> bool {
+    let (base, suffix) = match s.split_once('-') {
+        Some((b, n)) => (b, Some(n)),
+        None => (s, None),
+    };
+    let b = base.as_bytes();
+    let shape = b.len() == 22
+        && b[8] == b'T'
+        && b[21] == b'Z'
+        && b.iter()
+            .enumerate()
+            .all(|(i, c)| i == 8 || i == 21 || c.is_ascii_digit());
+    shape
+        && suffix
+            .is_none_or(|n| !n.is_empty() && n.len() <= 6 && n.bytes().all(|c| c.is_ascii_digit()))
+}
+
+/// Opens a regular file for reading without following a link and without blocking on a FIFO.
+fn open_source(p: &Path) -> std::io::Result<std::fs::File> {
+    let mut o = std::fs::OpenOptions::new();
+    o.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    o.open(p)
+}
+
+/// Copies one regular file (bytes + permission bits; the copy gets the CURRENT time as mtime —
+/// E2/E3) to a new path (`create_new` — never over anything), fully flushed. Returns (sha256, mode).
+fn copy_file_new(src: &Path, dst: &Path) -> Result<(String, u32), RepairError> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Write};
+    let io = |p: &Path, e: std::io::Error| RepairError::Io(format!("{}: {e}", p.display()));
+    let mut from = open_source(src).map_err(|e| io(src, e))?;
+    let meta = from.metadata().map_err(|e| io(src, e))?;
+    if !meta.file_type().is_file() {
+        return Err(RepairError::Precondition(format!(
+            "{}: 일반 파일이 아닙니다",
+            src.display()
+        )));
+    }
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o7777
+    };
+    #[cfg(not(unix))]
+    let mode = 0u32;
+    let mut to = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dst)
+        .map_err(|e| io(dst, e))?;
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = from.read(&mut buf).map_err(|e| io(src, e))?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+        to.write_all(&buf[..n]).map_err(|e| io(dst, e))?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        to.set_permissions(std::fs::Permissions::from_mode(mode))
+            .map_err(|e| io(dst, e))?;
+    }
+    full_flush_file(&to).map_err(|e| io(dst, e))?;
+    Ok((
+        h.finalize().iter().map(|b| format!("{b:02x}")).collect(),
+        mode,
+    ))
+}
+
+/// Creates `dst` as a symbolic link with the given target (a link is kept as a link, U3 / C2).
+fn copy_link_new(target: &str, dst: &Path) -> Result<(), RepairError> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, dst)
+            .map_err(|e| RepairError::Io(format!("{}: {e}", dst.display())))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (target, dst);
+        Err(RepairError::PlatformPending(
+            "링크 대상은 이 운영체제에서 보관하지 않습니다",
+        ))
+    }
+}
+
+/// C2 2.3(a) / C1 1.7 — the `begin` pre-image: an existing live entry is COPIED into a fresh,
+/// write-once vault slot `displaced/R-<n>/<시각>/payload/<basename>` with `meta/pre.json` (the live
+/// file is not touched); a path that does not exist is recorded as `absent` (no copy). The slot and
+/// its directories are fully flushed (E1) before this returns. A directory or another kind of entry
+/// is refused.
+pub fn copy_preimage_in(
+    root: &Path,
+    id: &RepairId,
+    lane: &LaneKey,
+    rel: &str,
+    live: &Path,
+    now: f64,
+) -> Result<PreImage, RepairError> {
+    let state = TargetState::read(live)?;
+    if state == TargetState::Absent {
+        return Ok(PreImage::Absent);
+    }
+    let io = |p: &Path, e: std::io::Error| RepairError::Io(format!("{}: {e}", p.display()));
+    let vault = vault_dir_in(root, id);
+    std::fs::create_dir_all(&vault).map_err(|e| io(&vault, e))?;
+    let base_name = utc_slot_name(now);
+    let mut slot = vault.join(&base_name);
+    let mut n = 0u32;
+    loop {
+        match std::fs::create_dir(&slot) {
+            Ok(()) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && n < 999 => {
+                n += 1;
+                slot = vault.join(format!("{base_name}-{n}"));
+            }
+            Err(e) => return Err(io(&slot, e)),
+        }
+    }
+    let payload = slot.join("payload");
+    let meta = slot.join("meta");
+    std::fs::create_dir(&payload).map_err(|e| io(&payload, e))?;
+    std::fs::create_dir(&meta).map_err(|e| io(&meta, e))?;
+    let basename = rel.rsplit('/').next().unwrap_or(rel).to_string();
+    let dst = payload.join(&basename);
+    let (sha256, mode, link_target) = match &state {
+        TargetState::Link { target } => {
+            copy_link_new(target, &dst)?;
+            (String::new(), 0, Some(target.clone()))
+        }
+        _ => {
+            let (sha, mode) = copy_file_new(live, &dst)?;
+            (sha, mode, None)
+        }
+    };
+    let pre = serde_json::json!({
+        "schema": super::REPAIR_SCHEMA,
+        "repair": id.as_str(),
+        "lane_key": lane.0,
+        "rel": rel,
+        "op": "begin",
+        "kind": "pre-image",
+        "sha256": sha256,
+        "mode": mode,
+        "link_target": link_target,
+    });
+    let pre_path = meta.join("pre.json");
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&pre_path)
+            .map_err(|e| io(&pre_path, e))?;
+        let mut bytes =
+            serde_json::to_vec_pretty(&pre).map_err(|e| RepairError::Io(e.to_string()))?;
+        bytes.push(b'\n');
+        f.write_all(&bytes).map_err(|e| io(&pre_path, e))?;
+        full_flush_file(&f).map_err(|e| io(&pre_path, e))?;
+    }
+    for d in [&payload, &meta, &slot, &vault] {
+        full_flush_dir(d)?;
+    }
+    if let Some(parent) = vault.parent() {
+        full_flush_dir(parent)?;
+    }
+    Ok(PreImage::Slot {
+        slot_dir: slot,
+        sha256,
+        mode,
+        link_target,
+    })
+}
+
+/// U3 / V2(b): creates the fixed working copy `R-<n>/staging/` ONLY if it does not exist yet, and
+/// copies every existing declared target into it (bytes and mode; a link as a link; nothing
+/// followed). It is populated in a temporary sibling and renamed into place once, so a crash never
+/// leaves a half-populated `staging/` (DEFERRED_MINOR #5's proposal). Returns the directory and
+/// whether this call created it. After this, the daemon never writes, moves or deletes there.
+pub fn populate_staging_in(
+    root: &Path,
+    id: &RepairId,
+    targets: &[(String, PathBuf)],
+) -> Result<(PathBuf, bool), RepairError> {
+    let staging = staging_dir_in(root, id);
+    if std::fs::symlink_metadata(&staging).is_ok() {
+        return Ok((staging, false));
+    }
+    let io = |p: &Path, e: std::io::Error| RepairError::Io(format!("{}: {e}", p.display()));
+    let parent = repair_dir_in(root, id);
+    let tmp = parent.join(format!(
+        ".staging-tmp-{}-{}",
+        std::process::id(),
+        (now_epoch() * 1e6) as u64
+    ));
+    std::fs::create_dir(&tmp).map_err(|e| io(&tmp, e))?;
+    let fill = || -> Result<(), RepairError> {
+        for (rel, live) in targets {
+            match TargetState::read(live)? {
+                TargetState::Absent => continue,
+                TargetState::Link { target } => {
+                    let dst = tmp.join(rel);
+                    if let Some(p) = dst.parent() {
+                        std::fs::create_dir_all(p).map_err(|e| io(p, e))?;
+                    }
+                    copy_link_new(&target, &dst)?;
+                }
+                TargetState::File { .. } => {
+                    let dst = tmp.join(rel);
+                    if let Some(p) = dst.parent() {
+                        std::fs::create_dir_all(p).map_err(|e| io(p, e))?;
+                    }
+                    copy_file_new(live, &dst)?;
+                }
+            }
+        }
+        full_flush_dir(&tmp)
+    };
+    if let Err(e) = fill() {
+        let _ = std::fs::remove_dir_all(&tmp); // our own temporary directory, never the ledger
+        return Err(e);
+    }
+    std::fs::rename(&tmp, &staging).map_err(|e| {
+        let _ = std::fs::remove_dir_all(&tmp);
+        io(&staging, e)
+    })?;
+    full_flush_dir(&parent)?;
+    Ok((staging, true))
+}
+
+/// One vault slot as `status` shows it (C2 2.5; E4 flag).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SlotInfo {
+    pub name: String,
+    pub dir: PathBuf,
+    pub entries: Vec<String>,
+    /// E4: the payload no longer matches the hash recorded for it (a writer that held the file
+    /// open kept writing) — `None` when nothing recorded can be compared.
+    pub changed_after_deposit: Option<bool>,
+}
+
+/// The repair's vault slots, oldest first.
+pub fn list_slots_in(root: &Path, id: &RepairId) -> Vec<SlotInfo> {
+    let vault = vault_dir_in(root, id);
+    let Ok(rd) = std::fs::read_dir(&vault) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = rd
+        .filter_map(Result::ok)
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .filter(|n| is_slot_name(n))
+        .collect();
+    names.sort();
+    names
+        .into_iter()
+        .map(|name| {
+            let dir = vault.join(&name);
+            let payload = dir.join("payload");
+            let mut entries: Vec<String> = std::fs::read_dir(&payload)
+                .map(|rd| {
+                    rd.filter_map(Result::ok)
+                        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            entries.sort();
+            let recorded: Option<String> = std::fs::read(dir.join("meta").join("sealed.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                .and_then(|v| {
+                    v.get("slot_sha256_at_check")
+                        .and_then(|s| s.as_str())
+                        .map(str::to_string)
+                })
+                .or_else(|| {
+                    std::fs::read(dir.join("meta").join("pre.json"))
+                        .ok()
+                        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                        .and_then(|v| v.get("sha256").and_then(|s| s.as_str()).map(str::to_string))
+                        .filter(|s| !s.is_empty())
+                });
+            let changed_after_deposit = match (recorded, entries.as_slice()) {
+                (Some(want), [one]) => match TargetState::read(&payload.join(one)) {
+                    Ok(TargetState::File { sha256, .. }) => Some(sha256 != want),
+                    _ => None,
+                },
+                _ => None,
+            };
+            SlotInfo {
+                name,
+                dir,
+                entries,
+                changed_after_deposit,
+            }
+        })
+        .collect()
+}
 
 #[cfg(test)]
 mod tests {
@@ -628,5 +1338,442 @@ mod tests {
             "PackGeneration (O4)"
         );
         assert_eq!(serde_json::from_value::<JobState>(v).unwrap(), job);
+    }
+}
+
+/// T3: the ledger's storage (allocation, schema, corruption, pre-image copy, staging, readers).
+#[cfg(test)]
+mod storage_tests {
+    use super::*;
+    use crate::repair::types::LockOwner;
+
+    fn tmp(tag: u32) -> PathBuf {
+        let d =
+            std::env::temp_dir().join(format!("cys-repair-ledger-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    pub(crate) fn sample(id: &RepairId) -> RepairRecord {
+        RepairRecord {
+            schema: crate::repair::REPAIR_SCHEMA,
+            id: id.clone(),
+            created_at: 1.0,
+            trigger: Trigger::OwnerOrder,
+            symptom: String::new(),
+            cause: String::new(),
+            classification: Classification::General,
+            files: vec![FileChange {
+                rel: "bin/a.py".into(),
+                kind: ChangeKind::Edit,
+                pre: PreImage::Absent,
+                post: TargetState::Absent,
+                diff: None,
+            }],
+            worker_record: None,
+            verify: None,
+            audit: None,
+            audit_due_at: None,
+            approval: None,
+            owner_token_sha256: None,
+            attempt: 1,
+            methods: vec![],
+            resubmits: vec![],
+            pending_request: None,
+            lock: None,
+            state: RepairState::InProgress,
+            intake_signatures: vec![],
+            owner_original: false,
+            origin_lane: LaneKey("base".into()),
+            resolves: None,
+            committed: vec![],
+        }
+    }
+
+    /// The `_in` layouts are exactly the T0 path helpers relative to the repairs root.
+    #[test]
+    fn layouts_match_paths_rs() {
+        let _lock = crate::pack::PACK_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let local = tmp(line!());
+        let _env = crate::pack::EnvGuard::set("CYS_LOCAL_DIR", &local);
+        let root = crate::repair::paths::repairs_root();
+        let id = RepairId::parse("R-7").unwrap();
+        let lane = LaneKey("dept-3".into());
+        use crate::repair::paths as p;
+        assert_eq!(record_path_in(&root, &id), p::record_path(&id));
+        assert_eq!(
+            lane_path_in(&root, &id, &lane),
+            p::lane_state_path(&id, &lane)
+        );
+        assert_eq!(staging_dir_in(&root, &id), p::staging_dir(&id));
+        assert_eq!(repair_dir_in(&root, &id), p::repair_dir(&id));
+        assert_eq!(
+            vault_dir_in(&root, &id).join("T"),
+            p::vault_slot_dir(&id, "T")
+        );
+        assert_eq!(
+            crate::repair::intake::row_path_in(&root, &lane, "ab"),
+            p::intake_path(&lane, "ab")
+        );
+        assert_eq!(
+            crate::repair::tombstones::path_in(&root, &lane),
+            p::tombstones_path(&lane)
+        );
+        // lock::claim_closed joins the same marker as paths::grant_closed_path
+        std::fs::create_dir_all(p::grant_seq_dir()).unwrap();
+        assert!(!crate::repair::lock::claim_closed(&root, Some(9)));
+        std::fs::write(p::grant_closed_path(9), b"").unwrap();
+        assert!(crate::repair::lock::claim_closed(&root, Some(9)));
+        let _ = std::fs::remove_dir_all(&local);
+    }
+
+    /// O-C1-2: ids by exclusive directory create — concurrent allocators never share a number.
+    #[test]
+    fn id_allocation_is_exclusive() {
+        let root = tmp(line!());
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let r = root.clone();
+                std::thread::spawn(move || {
+                    (0..10)
+                        .map(|_| allocate_id_in(&r).unwrap())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut all: Vec<RepairId> = threads
+            .into_iter()
+            .flat_map(|t| t.join().unwrap())
+            .collect();
+        all.sort();
+        let n = all.len();
+        all.dedup();
+        assert_eq!(all.len(), n, "two allocators got the same id");
+        assert_eq!(all.first().unwrap().as_str(), "R-1");
+        assert_eq!(all.last().unwrap().as_str(), "R-80");
+        // a stray non-id directory is ignored, numbering continues numerically past R-9 → R-10
+        std::fs::create_dir_all(root.join("intake")).unwrap();
+        assert_eq!(list_ids_in(&root).len(), 80);
+        assert_eq!(allocate_id_in(&root).unwrap().as_str(), "R-81");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// O-C1-6/7: unreadable, higher-schema or mis-named records are `Corrupt` (never a panic, never
+    /// overwritten); a missing one is `None`; writers write this build's schema.
+    #[test]
+    fn corrupt_and_schema() {
+        let root = tmp(line!());
+        let id = allocate_id_in(&root).unwrap();
+        assert!(read_record_in(&root, &id).unwrap().is_none());
+        let mut rec = sample(&id);
+        rec.schema = 0;
+        write_record_in(&root, &rec).unwrap();
+        let back = read_record_in(&root, &id).unwrap().unwrap();
+        assert_eq!(back.schema, crate::repair::REPAIR_SCHEMA);
+        let p = record_path_in(&root, &id);
+        for bad in [
+            &b"{garbage"[..],
+            &b""[..],
+            br#"{"schema": 2}"#,
+            &serde_json::to_vec(&{
+                let mut r = sample(&id);
+                r.id = RepairId::parse("R-99").unwrap();
+                r
+            })
+            .unwrap()[..],
+        ] {
+            std::fs::write(&p, bad).unwrap();
+            assert!(
+                matches!(read_record_in(&root, &id), Err(RepairError::Corrupt(_))),
+                "{:?}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        // a bad id inside a record (not R-<n>) → corrupt, never a path
+        std::fs::write(&p, br#"{"schema":1,"id":"../../x"}"#).unwrap();
+        assert!(matches!(
+            read_record_in(&root, &id),
+            Err(RepairError::Corrupt(_))
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// C2 2.3(a): `begin` COPIES a live file into a fresh write-once slot (mode kept, fresh mtime,
+    /// live untouched), a link as a link, an absent path as `absent`; two copies in the same
+    /// microsecond get distinct slots.
+    #[cfg(unix)]
+    #[test]
+    fn preimage_copy_into_fresh_slot() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tmp(line!());
+        let pack = root.join("pack");
+        std::fs::create_dir_all(pack.join("bin")).unwrap();
+        let live = pack.join("bin").join("a.sh");
+        std::fs::write(&live, b"#!/bin/sh\necho hi\n").unwrap();
+        std::fs::set_permissions(&live, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // an old mtime on the live file — the copy must not inherit it (E3)
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&live)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let before = std::fs::read(&live).unwrap();
+        let id = RepairId::parse("R-3").unwrap();
+        let lane = LaneKey("base".into());
+        let pre = copy_preimage_in(&root, &id, &lane, "bin/a.sh", &live, 1_700_000_000.25).unwrap();
+        let PreImage::Slot {
+            slot_dir,
+            sha256,
+            mode,
+            link_target,
+        } = &pre
+        else {
+            panic!("{pre:?}")
+        };
+        assert_eq!(*mode, 0o755);
+        assert!(link_target.is_none());
+        assert_eq!(pre.state(), TargetState::read(&live).unwrap());
+        let copy = slot_dir.join("payload").join("a.sh");
+        assert_eq!(std::fs::read(&copy).unwrap(), before);
+        assert_eq!(
+            std::fs::metadata(&copy).unwrap().permissions().mode() & 0o7777,
+            0o755
+        );
+        assert!(
+            std::fs::metadata(&copy).unwrap().modified().unwrap()
+                > old + std::time::Duration::from_secs(86_400)
+        );
+        assert_eq!(
+            std::fs::read(&live).unwrap(),
+            before,
+            "the live file was touched"
+        );
+        let meta: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(slot_dir.join("meta").join("pre.json")).unwrap())
+                .unwrap();
+        assert_eq!(meta["kind"], "pre-image");
+        assert_eq!(meta["sha256"], serde_json::json!(sha256));
+        assert_eq!(meta["rel"], "bin/a.sh");
+        let name = slot_dir.file_name().unwrap().to_str().unwrap();
+        assert_eq!(name, "20231114T221320250000Z");
+        assert!(is_slot_name(name));
+        // same instant → a second, distinct slot (`-1`)
+        let pre2 =
+            copy_preimage_in(&root, &id, &lane, "bin/a.sh", &live, 1_700_000_000.25).unwrap();
+        let PreImage::Slot { slot_dir: s2, .. } = &pre2 else {
+            panic!()
+        };
+        assert_ne!(s2, slot_dir);
+        assert!(s2.to_str().unwrap().ends_with("Z-1"));
+        // a link is copied as a link (not followed)
+        let link = pack.join("bin").join("l");
+        std::os::unix::fs::symlink("a.sh", &link).unwrap();
+        let pl = copy_preimage_in(&root, &id, &lane, "bin/l", &link, 5.0).unwrap();
+        assert_eq!(
+            pl.state(),
+            TargetState::Link {
+                target: "a.sh".into()
+            }
+        );
+        // absent → no copy
+        assert_eq!(
+            copy_preimage_in(&root, &id, &lane, "bin/none", &pack.join("bin/none"), 6.0).unwrap(),
+            PreImage::Absent
+        );
+        assert_eq!(list_slots_in(&root, &id).len(), 3);
+        // E4: a payload changed after deposit is flagged
+        std::fs::write(&copy, b"changed").unwrap();
+        let slots = list_slots_in(&root, &id);
+        let by_name = |n: &str| {
+            slots
+                .iter()
+                .find(|s| s.name == n)
+                .unwrap()
+                .changed_after_deposit
+        };
+        assert_eq!(by_name("20231114T221320250000Z"), Some(true));
+        assert_eq!(by_name("20231114T221320250000Z-1"), Some(false));
+        assert_eq!(
+            by_name("19700101T000005000000Z"),
+            None,
+            "a link slot has no content hash to compare"
+        );
+        // a directory target is refused
+        assert!(copy_preimage_in(&root, &id, &lane, "bin", &pack.join("bin"), 7.0).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// U3 / V2(a)(b): staging is populated once (bytes, mode, links as links), never again; the
+    /// candidate reader reads it in rel order, missing → absent, a symlinked parent → refused.
+    #[cfg(unix)]
+    #[test]
+    fn staging_once_and_candidate_reader() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tmp(line!());
+        let pack = root.join("pack");
+        std::fs::create_dir_all(pack.join("hooks")).unwrap();
+        std::fs::write(pack.join("hooks/b.sh"), b"b").unwrap();
+        std::fs::set_permissions(
+            pack.join("hooks/b.sh"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::fs::write(pack.join("a.json"), b"{}").unwrap();
+        let id = allocate_id_in(&root).unwrap();
+        let mut rec = sample(&id);
+        rec.files = ["hooks/b.sh", "a.json", "hooks/new.sh"]
+            .iter()
+            .map(|r| FileChange {
+                rel: r.to_string(),
+                kind: ChangeKind::Edit,
+                pre: PreImage::Absent,
+                post: TargetState::Absent,
+                diff: None,
+            })
+            .chain(std::iter::once(FileChange {
+                rel: "settings:Stop:x.sh".into(),
+                kind: ChangeKind::HookUnregister {
+                    event: "Stop".into(),
+                    script: "x.sh".into(),
+                },
+                pre: PreImage::Absent,
+                post: TargetState::Absent,
+                diff: None,
+            }))
+            .collect();
+        write_record_in(&root, &rec).unwrap();
+        let targets: Vec<(String, PathBuf)> = ["hooks/b.sh", "a.json", "hooks/new.sh"]
+            .iter()
+            .map(|r| (r.to_string(), pack.join(r)))
+            .collect();
+        let (dir, created) = populate_staging_in(&root, &id, &targets).unwrap();
+        assert!(created);
+        assert_eq!(dir, staging_dir_in(&root, &id));
+        let c = candidate_states_in(&root, &id).unwrap();
+        let rels: Vec<&str> = c.iter().map(|(r, _)| r.as_str()).collect();
+        assert_eq!(
+            rels,
+            ["a.json", "hooks/b.sh", "hooks/new.sh"],
+            "rel order, hook line skipped"
+        );
+        assert_eq!(c[1].1, TargetState::read(&pack.join("hooks/b.sh")).unwrap());
+        assert_eq!(c[2].1, TargetState::Absent);
+        // the worker edits staging; a second populate (pick-up) never touches it (V2(b))
+        std::fs::write(dir.join("a.json"), b"{\"x\":1}").unwrap();
+        let (_, again) = populate_staging_in(&root, &id, &targets).unwrap();
+        assert!(!again);
+        assert_eq!(std::fs::read(dir.join("a.json")).unwrap(), b"{\"x\":1}");
+        // a symlinked parent inside staging → refused
+        std::fs::remove_dir_all(dir.join("hooks")).unwrap();
+        std::os::unix::fs::symlink(pack.join("hooks"), dir.join("hooks")).unwrap();
+        assert!(matches!(
+            candidate_states_in(&root, &id),
+            Err(RepairError::Precondition(_))
+        ));
+        // no leftover temporary directory
+        let leftovers: Vec<_> = std::fs::read_dir(repair_dir_in(&root, &id))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".staging-tmp"))
+            .collect();
+        assert!(leftovers.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// K1 / L4 / interpretation 27: missing registry = HQ alone; malformed = unknown; every
+    /// department counted (no 64 cap).
+    #[test]
+    fn registered_lanes_rules() {
+        let root = tmp(line!());
+        let reg = root.join("depts.json");
+        assert_eq!(
+            registered_lanes_from(&reg),
+            RegisteredLanes::Known(vec![LaneKey("base".into())])
+        );
+        std::fs::write(&reg, b"{nope").unwrap();
+        assert!(matches!(
+            registered_lanes_from(&reg),
+            RegisteredLanes::Unknown(_)
+        ));
+        std::fs::write(&reg, br#"{"other": 1}"#).unwrap();
+        assert!(matches!(
+            registered_lanes_from(&reg),
+            RegisteredLanes::Unknown(_)
+        ));
+        let mut depts = serde_json::Map::new();
+        for i in 1..=65 {
+            depts.insert(
+                format!("dept-{i}"),
+                serde_json::json!({"socket": format!("/h/.cys/cys-dept-dept-{i}/cys.sock")}),
+            );
+        }
+        std::fs::write(
+            &reg,
+            serde_json::to_vec(&serde_json::json!({"depts": depts})).unwrap(),
+        )
+        .unwrap();
+        let RegisteredLanes::Known(lanes) = registered_lanes_from(&reg) else {
+            panic!()
+        };
+        assert_eq!(lanes.len(), 66, "HQ + 65 departments");
+        assert_eq!(lanes[0], LaneKey("base".into()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The [RESUME] reader: the seat's live lock, skipping unreadable records (F4).
+    #[test]
+    fn held_by_seat_reader() {
+        let root = tmp(line!());
+        let lane = LaneKey("base".into());
+        let a = allocate_id_in(&root).unwrap();
+        let b = allocate_id_in(&root).unwrap();
+        let mut ra = sample(&a);
+        ra.attempt = 3;
+        ra.methods = vec!["m".into()];
+        ra.lock = Some(crate::repair::lock::new_lease(
+            LockOwner {
+                lane: lane.clone(),
+                seat: 4,
+                incarnation: "i".into(),
+            },
+            100.0,
+            None,
+        ));
+        write_record_in(&root, &ra).unwrap();
+        std::fs::write(record_path_in(&root, &b), b"{broken").unwrap();
+        let h = held_by_seat_in(&root, &lane, 4, 200.0).unwrap().unwrap();
+        assert_eq!((h.id.as_str(), h.attempt, h.methods.len()), ("R-1", 3, 1));
+        assert!(held_by_seat_in(&root, &lane, 5, 200.0).unwrap().is_none());
+        assert!(
+            held_by_seat_in(&root, &lane, 4, 100.0 + 7200.0 + 61.0)
+                .unwrap()
+                .is_none(),
+            "expired lease"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn slot_names() {
+        assert_eq!(utc_slot_name(0.0), "19700101T000000000000Z");
+        assert_eq!(utc_slot_name(951_782_400.5), "20000229T000000500000Z");
+        assert!(is_slot_name("20261112T120000123456Z"));
+        assert!(is_slot_name("20261112T120000123456Z-3"));
+        for bad in [
+            "",
+            "x",
+            "20261112T120000123456",
+            "20261112X120000123456Z",
+            "../x",
+            "20261112T120000123456Z-",
+            "20261112T120000123456Z-a",
+        ] {
+            assert!(!is_slot_name(bad), "{bad}");
+        }
     }
 }
