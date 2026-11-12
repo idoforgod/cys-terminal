@@ -6090,6 +6090,12 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
         let owner_grade = trash_owner_grade_ok(daemon, &params, from_sid);
         return crate::trash::handle(daemon, sub, &params, &id, owner_grade, caller_pid);
     }
+    // 「스스로 해결」(0.15.0 C3): `repair.*` 는 repair 모듈이 전담한다 — 좌석·등급은 trash 와 같이 여기서 도출한다.
+    if let Some(sub) = req.method.strip_prefix("repair.") {
+        let from_sid = caller_pid.and_then(|p| resolve_caller_surface(daemon, p));
+        let owner_grade = trash_owner_grade_ok(daemon, &params, from_sid);
+        return crate::repair::handle(daemon, sub, &params, &id, from_sid, owner_grade, caller_pid);
+    }
     match req.method.as_str() {
         "system.ping" => Reply::Single(ok_response(&id, json!("pong"))),
 

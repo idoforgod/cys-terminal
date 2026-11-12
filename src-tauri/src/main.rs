@@ -5208,6 +5208,27 @@ async fn feed_reply(request_id: String, decision: String, socket: Option<String>
     }
 }
 
+// 「스스로 해결」(0.15.0 · TRACKS §6.4) 앱 명령 세 개 — T0 골격(본문: 승인 둘은 T5b, 되돌리기는 T6).
+//   지금은 아무 일도 하지 않고 "이 빌드에는 아직 구현되지 않았습니다" 로 거절한다(데몬·파일·프로세스 무접촉).
+//   위의 `repair_office_assets`(화면 자산 복구)와는 무관하다.
+#[tauri::command]
+async fn repair_approval_list(socket: Option<String>) -> Result<Value, String> {
+    let _ = socket;
+    Err(cys::repair::NOT_IMPLEMENTED_KO.to_string())
+}
+
+#[tauri::command]
+async fn repair_approval_decide(request_id: String, decision: String, socket: Option<String>) -> Result<(), String> {
+    let _ = (request_id, decision, socket);
+    Err(cys::repair::NOT_IMPLEMENTED_KO.to_string())
+}
+
+#[tauri::command]
+async fn repair_revert_last(socket: Option<String>) -> Result<Value, String> {
+    let _ = socket;
+    Err(cys::repair::NOT_IMPLEMENTED_KO.to_string())
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
 // 0.14.44 WP-B B5·B6 — 오피스 브리지 건강 확인(`office_health`)과 화면 자산 복구(`repair_office_assets`)
 //
@@ -9105,6 +9126,10 @@ fn main() {
             open_privacy_settings,
             // INST-1(P4-4): claude CLI 미설치 온보딩 카드 pull(agent-detect 단일 오라클 소비).
             claude_missing_hint,
+            // 「스스로 해결」(0.15.0 · TRACKS §6.4) — T0 골격 명령 셋(본문 T5b·T6).
+            repair_approval_list,
+            repair_approval_decide,
+            repair_revert_last,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -18785,5 +18810,41 @@ osascript 를 실행할 수 없어 건너뜁니다({e}) — macOS 가 아닌 환
             assert_eq!(seen.load(Ordering::SeqCst), 1, "대조군이 모의 데몬에 닿았다");
         });
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// 「스스로 해결」(0.15.0 · TRACKS §6.6) — T0 골격 앱 명령 셋의 등재 핀.
+#[cfg(test)]
+mod repair_stub_tests {
+    use super::*;
+
+    /// The three stub commands are registered in `generate_handler!` (style of
+    /// `office_iframe_has_no_ipc_path_and_commands_registered`) and refuse with the "not implemented"
+    /// sentence. The unrelated `repair_office_assets` stays registered (not every `repair_*` command
+    /// is this feature's).
+    #[test]
+    fn repair_stub_commands_registered() {
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계 소실")];
+        let head = concat!("tauri::generate_", "handler![");
+        assert_eq!(prod.matches(head).count(), 1, "exactly one invoke_handler registration");
+        let i = prod.find(head).expect("invoke_handler 소실");
+        let reg = &prod[i..i + prod[i..].find("\n        ])").expect("핸들러 목록 끝")];
+        for name in ["repair_approval_list", "repair_approval_decide", "repair_revert_last", "repair_office_assets"] {
+            assert!(reg.lines().any(|l| l.trim() == format!("{name},")), "{name} 이 invoke_handler 에 등재되지 않았다");
+        }
+        for sig in [
+            "async fn repair_approval_list(socket: Option<String>) -> Result<Value, String> {",
+            "async fn repair_approval_decide(request_id: String, decision: String, socket: Option<String>) -> Result<(), String> {",
+            "async fn repair_revert_last(socket: Option<String>) -> Result<Value, String> {",
+        ] {
+            assert_eq!(prod.matches(&format!("#[tauri::command]\n{sig}")).count(), 1, "signature drifted: {sig}");
+        }
+        let nyi = cys::repair::NOT_IMPLEMENTED_KO.to_string();
+        tauri::async_runtime::block_on(async {
+            assert_eq!(repair_approval_list(None).await, Err(nyi.clone()));
+            assert_eq!(repair_approval_decide("rq-1".into(), "approve".into(), Some("/x.sock".into())).await, Err(nyi.clone()));
+            assert_eq!(repair_revert_last(None).await, Err(nyi.clone()));
+        });
     }
 }

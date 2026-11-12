@@ -4403,6 +4403,23 @@ pub struct Daemon {
     /// (B3-2R ⑥·④ⓓ) fence 된 런의 원장 — **회수하지 못한 고아**의 목록이다(무kill 계약).
     /// 길이가 곧 admission 상한의 분모다. 유계는 감독자가 [`crate::boot_supervisor`] 에서 건다.
     pub boot_fenced: Mutex<Vec<FencedRun>>,
+    // 「스스로 해결」(0.15.0 · TRACKS §6.2) — 승인 표(T5b) · 좌석별 주인 입력 기록(T3/T4) · 준비 플래그와 그 시각(T6 · ms, 0 = 미준비)
+    //   · 작업 틱 시각(T6 · ms, 0 = 없음)과 단일 비행 플래그 · 수리별 뮤텍스(G6 · 메모리 전용). 기본값은 생성자 하나에서만 정한다.
+    //   (allow(dead_code): T0 골격에서는 아직 읽는 곳이 없다 — 채우는 트랙이 읽기 시작해도 이 줄은 그대로 둔다.)
+    #[allow(dead_code)]
+    pub repair_approvals: Mutex<crate::repair::ApprovalTable>,
+    #[allow(dead_code)]
+    pub repair_prompt_origin: Mutex<std::collections::HashMap<u64, crate::repair::PromptOrigin>>,
+    #[allow(dead_code)]
+    pub listener_ready: AtomicBool,
+    #[allow(dead_code)]
+    pub ready_since: AtomicU64,
+    #[allow(dead_code)]
+    pub repair_last_tick: AtomicU64,
+    #[allow(dead_code)]
+    pub repair_tick_running: AtomicBool,
+    #[allow(dead_code)]
+    pub repair_mutexes: Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>,
 }
 
 /// (B3 · §3-3) 진행 중인 부트 런의 관측 표. **데몬 인메모리**다 — 영속 소유권은 스풀 인텐트
@@ -6612,6 +6629,14 @@ impl Daemon {
             boot_fenced: Mutex::new(Vec::new()),
             // ★(0.14.31 · WP-3 B) enabled 는 alert_route::spawn 이 실제로 태스크를 열 때만 true.
             alert_route: Mutex::new(Default::default()),
+            // 「스스로 해결」(TRACKS §6.2) — 전부 비었거나 거짓·0 으로 시작한다(listener_ready·ready_since 는 T6 이 post_listen_boot 에서 세운다).
+            repair_approvals: Mutex::new(Default::default()),
+            repair_prompt_origin: Mutex::new(std::collections::HashMap::new()),
+            listener_ready: AtomicBool::new(false),
+            ready_since: AtomicU64::new(0),
+            repair_last_tick: AtomicU64::new(0),
+            repair_tick_running: AtomicBool::new(false),
+            repair_mutexes: Mutex::new(std::collections::HashMap::new()),
         });
         // 재시작에도 오늘 소비/비용/모델믹스/스파크라인 보존 — 최근 12h usage_records 리플레이.
         crate::analytics::seed_consumption(&daemon);

@@ -3,6 +3,8 @@
 
 #[path = "cys/lane_fallback.rs"]
 mod lane_fallback;
+#[path = "cys/repair_cli.rs"]
+mod repair_cli;
 
 use clap::{Parser, Subcommand};
 // ★EXIT_BOOT_BUSY 정본은 lib 상수다(GUI cys-app·python javis_bootstrap 과 3자 공유 — 사본 금지).
@@ -933,6 +935,11 @@ enum Command {
     /// (훅의 stdout 계약은 셸이 소유한다). 판정은 stderr 토큰 1차 + exit 보조 —
     /// 자세한 계약은 [`run_boot_intent`].
     BootIntent,
+    /// 「스스로 해결」 수리 원장 동사(0.15.0) — 모든 동사는 데몬 요청이다(rules·boot-critical·tombstones·gate 는 로컬).
+    Repair {
+        #[command(subcommand)]
+        cmd: repair_cli::RepairCmd,
+    },
 }
 
 /// `cys hook <event>` — 훅 이벤트별 결정 요청. 현재 UserPromptSubmit 하나뿐이다.
@@ -6108,6 +6115,7 @@ fn request_before(
 
 fn run(command: Command) -> i32 {
     let result = match command {
+        Command::Repair { cmd } => return repair_cli::run(cmd),
         Command::Lanes => cys::lane::delivery_inventory(&cys::lane::state_dir())
             .map(|rows| println!("{}", json!({"ledgers": rows})))
             .map_err(|e| e.to_string()),

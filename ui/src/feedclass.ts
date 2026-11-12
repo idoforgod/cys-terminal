@@ -101,6 +101,9 @@ export function feedCreatedToastTitle(kind: unknown): string {
  *  `learn_proposal` 은 데몬이 올리는 학습 제안(state.rs NOTICE_FEED_KINDS 주석이 결정성으로 못박은 kind). */
 export const OWNER_CARD_FEED_KINDS: readonly string[] = [TEAM_CREATE_KIND, "ceo-promote-request", "cycle-verify", "learn_proposal"];
 
+/** 「스스로 해결」(0.15.0) 최종 승인 카드의 feed kind — T0 골격은 상수만 둔다. 위 OWNER_CARD_FEED_KINDS 에는 아직 넣지 않는다(카드 배선은 T5b · 핀 feedclass-0144). */
+export const REPAIR_APPROVAL_KIND = "repair-approval";
+
 export function isOwnerCardKind(kind: unknown): boolean {
   return typeof kind === "string" && OWNER_CARD_FEED_KINDS.indexOf(kind) >= 0;
 }
