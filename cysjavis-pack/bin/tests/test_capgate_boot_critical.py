@@ -143,7 +143,7 @@ class GateWithStub(_Env):
 
     def test_d1_01_direct_write_denied_and_points_to_submit(self):
         target = str(self.pack / REL)
-        for role in ("worker", "master", ""):
+        for role in ("worker", "master"):
             for tool, ti in (("Edit", {"file_path": target, "old_string": "a", "new_string": "b"}),
                              ("Write", {"file_path": target, "content": "x"}),
                              ("Bash", {"command": "echo x > %s" % target})):
@@ -155,11 +155,38 @@ class GateWithStub(_Env):
                 self.assertEqual(r.returncode, 0)
                 self.assertEqual(dec, "deny", "%s/%s 가 거부되지 않았다: %r %r" % (role, tool, r.stdout, r.stderr))
                 self.assertIn(REL, reason)
-                self.assertIn("cys repair submit", reason)
                 self.assertIn("기동 필수", reason)
+                if role == "worker":     # RULINGS AI5 — the worker opens the repair and submits it
+                    self.assertIn("cys repair begin --files %s" % REL, reason)
+                    self.assertIn("cys repair submit", reason)
+                else:                    # master / CEO: a ticket to a worker of the lane, never begin/submit
+                    self.assertIn("티켓", reason)
+                    self.assertNotIn("cys repair submit", reason)
                 seen = self.calls_seen()
                 self.assertEqual(seen, ["1|repair boot-critical --path %s --json" % target],
                                  "cys 한 번 · CYS_NO_AUTOSTART=1 이어야 한다: %r" % seen)
+
+    def test_role_less_session_passes_untouched(self):
+        """RULINGS AI4 — 좌석 역할이 없는 세션(주인 자신 · 사람 · 일반 세션)은 종전 그대로 통과하고
+        `cys` 를 띄우지도 않는다."""
+        target = str(self.pack / REL)
+        for tool, ti in (("Write", {"file_path": target, "content": "x"}),
+                         ("Edit", {"file_path": target, "old_string": "a", "new_string": "b"}),
+                         ("Bash", {"command": "echo x > %s" % target})):
+            r, _ = self.run_hook(tool, ti, CYS_BIN=self.fake("yes", self.yes_json()), CYS_ROLE="")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertNotEqual(self.decision(r)[0], "deny", "역할 없는 세션이 거부됐다(AI4)")
+        self.assertEqual(self.calls_seen(), [], "역할 없는 세션에 cys 를 띄웠다")
+
+    def test_other_lanes_pack_is_named(self):
+        """RULINGS AI5 — 다른 레인의 팩 파일이면 그 팩을 문면에 적는다."""
+        target = str(self.dept / REL)
+        body = "printf '%s'\n" % json.dumps({"decision": "yes", "rel": REL, "lane_pack": str(self.dept)})
+        r, _ = self.run_hook("Write", {"file_path": target, "content": "x"}, CYS_BIN=self.fake("dept", body))
+        dec, reason = self.decision(r)
+        self.assertEqual(dec, "deny")
+        self.assertIn(str(self.dept), reason)
+        self.assertIn("다른 레인", reason)
 
     def test_control_not_on_list_is_allowed(self):
         target = str(self.pack / "hooks" / "README.md")
@@ -266,6 +293,9 @@ class GateNegativeControls(_Env):
          "timeout=min(BOOT_CRITICAL_QUERY_TIMEOUT_S, left - 0.5) + 5)"),
         ("읽기 sed 는 쓰기가 아니다",
          '        elif base == "sed" and any(', '        elif base == "sed" and True or any('),
+        ("좌석 역할이 없으면 보지 않는다(AI4)",
+         "        seat = _bc_seat_role(roles)\n        if not seat:\n            return None",
+         "        seat = _bc_seat_role(roles) or \"worker\"\n        if not seat:\n            return None"),
         ("예외는 통과(fail-open)",
          "    except Exception:\n        return None\n\n\ndef _json_escape",
          "    except KeyError:\n        return None\n\n\ndef _json_escape"),
@@ -298,7 +328,8 @@ class GateNegativeControls(_Env):
     def test_main_calls_the_advisory_block(self):
         """main() 의 호출 한 줄을 지우면 종단 거부가 사라진다(self-test 는 main 을 돌지 않는다)."""
         src = HOOK.read_text(encoding="utf-8")
-        old = "    bc_reason = None if block else boot_critical_deny_reason(tool, tool_input, data.get(\"cwd\"))"
+        old = ("    bc_reason = None if block else boot_critical_deny_reason(tool, tool_input, data.get(\"cwd\"),\n"
+               "                                                             roles=roles)")
         self.assertEqual(src.count(old), 1)
         with tempfile.TemporaryDirectory(prefix="t5a-mut-") as td:
             shutil.copy2(str(LIB), os.path.join(td, "_lib.sh"))

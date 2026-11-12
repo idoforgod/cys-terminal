@@ -3185,9 +3185,61 @@ def _bc_query(path, budget=None):
     return v if isinstance(v, dict) else None
 
 
-def boot_critical_deny_reason(tool, tool_input, cwd=None, runner=None):
-    """기동 필수 파일 직접 쓰기면 거부 사유, 아니면 None. **어떤 실패도 None**(fail-open)."""
+# RULINGS AI4 — the advisory block applies ONLY to resolved seat roles (master / CEO / department
+#   master, worker, CSO, reviewer, planner). A session without a role — the owner's own, any human
+#   or general session — passes exactly as before (the gate's existing rule: no role = pass).
+_BC_SEAT_ROLE_PREFIXES = ("master", "ceo", "worker", "cso", "reviewer", "planner")
+
+
+def _bc_seat_role(roles):
+    """The first resolved seat role among the call's role candidates, or None (no seat role)."""
+    for r in roles or ():
+        r = (r or "").strip().lower() if isinstance(r, str) else ""
+        if r and r.startswith(_BC_SEAT_ROLE_PREFIXES):
+            return r
+    return None
+
+
+def _bc_own_pack():
+    for k in BOOT_CRITICAL_PACK_ENV_KEYS:
+        v = os.environ.get(k)
+        if v:
+            return v
+    return os.path.join(os.path.expanduser("~"), ".cys", "pack")
+
+
+def _bc_text(seat, rel, lane_pack):
+    """RULINGS AI5 — what THIS role can do, and which lane's pack the file is in."""
+    head = ("[기동 필수 파일 — 직접 쓰기 보류] `%s` 은(는) 본체에 컴파일된 기동 필수 목록에 든 파일이다"
+            "(망가지면 제품이 켜지지 않는다)." % rel)
+    lane = ""
+    if isinstance(lane_pack, str) and lane_pack and \
+            _bc_fold(lane_pack).rstrip("/") != _bc_fold(_bc_own_pack()).rstrip("/"):
+        lane = (" 이 파일은 다른 레인의 팩 `%s` 에 있다 — 그 레인의 수리로 그 레인의 워커가 다룬다."
+                % lane_pack)
+    if seat.startswith("worker"):
+        what = (" 살아 있는 기동 필수 파일은 직접 고치지 않는다: `cys repair begin --files %s --trigger "
+                "owner-order|grant|update`(주인의 지시 · 자동 수리 권한 · 업데이트 충돌 중 해당하는 것)로 "
+                "수리를 열고, begin 이 알려 주는 작업 사본을 고친 뒤 예행 · 리뷰어1 검증 · 리뷰어2 감사 "
+                "서명을 받아 `cys repair submit <R-번호>` 로 제출하라. 주인의 수정 최종 승인 뒤 데몬이 "
+                "적용한다." % rel)
+    elif seat.startswith(("master", "ceo")):
+        what = (" 마스터 · CEO 는 begin · submit 을 쓰지 않는다 — 이 레인의 워커에게 이 파일의 수리 "
+                "티켓을 내라(워커가 수리를 열고 작업 사본에서 고친다).")
+    elif seat.startswith("cso"):
+        what = " CSO 는 이 파일을 고치지 않는다 — 마스터에게 보고하라."
+    else:
+        what = (" 리뷰어 · 기획자가 고칠 대상이 아니다 — 판정 · 기획 문서에 적어 마스터에게 넘겨라.")
+    return head + lane + what + " (이 관문은 조언이다 — 고장 나면 열린다.)"
+
+
+def boot_critical_deny_reason(tool, tool_input, cwd=None, runner=None, roles=None):
+    """기동 필수 파일 직접 쓰기면 거부 사유, 아니면 None. **어떤 실패도 None**(fail-open).
+    좌석 역할이 없는 호출(사람 · 일반 세션)은 보지도 띄우지도 않는다(RULINGS AI4)."""
     try:
+        seat = _bc_seat_role(roles)
+        if not seat:
+            return None
         targets = boot_critical_targets(tool, tool_input)
         if not targets:
             return None
@@ -3207,12 +3259,7 @@ def boot_critical_deny_reason(tool, tool_input, cwd=None, runner=None):
         if not isinstance(ans, dict) or ans.get("decision") != "yes":
             return None
         rel = ans.get("rel") if isinstance(ans.get("rel"), str) and ans.get("rel") else cand
-        return ("[기동 필수 파일 — 직접 쓰기 보류] `%s` 은(는) 본체에 컴파일된 기동 필수 목록에 든 파일이다"
-                "(망가지면 제품이 켜지지 않는다). 살아 있는 기동 필수 파일은 직접 고치지 않는다: "
-                "`cys repair begin --files %s` 로 수리를 열면 작업 사본(`~/.cys/local/repairs/R-<번호>/staging/`)이 "
-                "만들어진다 — 거기서 고치고 예행을 돌린 뒤 리뷰어1 검증·리뷰어2 감사 서명을 받아 "
-                "`cys repair submit <R-번호>` 로 제출하라. 주인의 수정 최종 승인 뒤 데몬이 적용한다. "
-                "(이 관문은 조언이다 — 고장 나면 열린다.)" % (rel, rel))
+        return _bc_text(seat, rel, ans.get("lane_pack"))
     except Exception:
         return None
 
@@ -3375,7 +3422,8 @@ def main():
                             % (count, BUDGET_WARN, BUDGET_DENY))
     block, reason = decide_multi(tool, tool_input, roles, ctx)
     # ★T5a(0.15.0 · C4 4.8): 기동 필수 파일 조언 관문 — 역할 정책이 허용한 호출만 · fail-open.
-    bc_reason = None if block else boot_critical_deny_reason(tool, tool_input, data.get("cwd"))
+    bc_reason = None if block else boot_critical_deny_reason(tool, tool_input, data.get("cwd"),
+                                                             roles=roles)
     if bc_reason:
         block, reason = True, bc_reason
     # ★경고 표시(.warned)는 **실제로 전달할 때만** 소비한다(R1 major · codex 실증):
@@ -4926,9 +4974,40 @@ def _self_test_boot_critical(fails, shutil):
 
     yes = {"decision": "yes", "rel": "hooks/inject-context.sh"}
 
-    def deny(tool, ti, answer=yes, cwd=pk):
+    def deny(tool, ti, answer=yes, cwd=pk, roles=("worker",)):
         del calls[:]
-        return boot_critical_deny_reason(tool, ti, cwd, runner(answer))
+        return boot_critical_deny_reason(tool, ti, cwd, runner(answer), roles=list(roles))
+
+    # RULINGS AI4: no seat role (the owner's own / any human or general session) → untouched, no spawn
+    for roles in ([], [""], ["grok"], [None]):
+        if deny("Write", {"file_path": hk, "content": "x"}, roles=roles) is not None or calls:
+            fails.append("BC: 좌석 역할 없는 호출(%r)이 거부되거나 cys 를 띄웠다(AI4)" % (roles,))
+    # RULINGS AI5: each role is told what IT can do
+    texts = {}
+    for role in ("worker", "worker-2", "master", "ceo", "cso", "reviewer-codex", "planner"):
+        texts[role] = deny("Write", {"file_path": hk, "content": "x"}, roles=[role]) or ""
+        if "hooks/inject-context.sh" not in texts[role] or "기동 필수" not in texts[role]:
+            fails.append("BC: %s 거부 문면에 파일·기동 필수가 없다: %r" % (role, texts[role]))
+    for role in ("worker", "worker-2"):
+        for need in ("cys repair begin --files hooks/inject-context.sh", "--trigger", "cys repair submit"):
+            if need not in texts[role]:
+                fails.append("BC: %s 문면에 %r 가 없다(AI5)" % (role, need))
+    for role in ("master", "ceo"):
+        if "티켓" not in texts[role] or "cys repair submit" in texts[role]:
+            fails.append("BC: %s 문면이 워커 티켓을 가리키지 않는다(AI5): %r" % (role, texts[role]))
+    if "마스터에게 보고" not in texts["cso"] or "cys repair begin" in texts["cso"]:
+        fails.append("BC: CSO 문면 불량(AI5): %r" % texts["cso"])
+    for role in ("reviewer-codex", "planner"):
+        if "고칠 대상이 아니다" not in texts[role] or "cys repair begin" in texts[role]:
+            fails.append("BC: %s 문면 불량(AI5): %r" % (role, texts[role]))
+    other = deny("Write", {"file_path": hk}, {"decision": "yes", "rel": "hooks/inject-context.sh",
+                                              "lane_pack": "/elsewhere/.cys/pack-dept-d9"})
+    if not other or "/elsewhere/.cys/pack-dept-d9" not in other or "다른 레인" not in other:
+        fails.append("BC: 다른 레인의 팩 파일인데 그 팩을 문면에 적지 않았다(AI5): %r" % other)
+    own = deny("Write", {"file_path": hk}, {"decision": "yes", "rel": "hooks/inject-context.sh",
+                                            "lane_pack": pk})
+    if not own or "다른 레인" in own:
+        fails.append("BC: 자기 레인의 팩 파일에 '다른 레인' 문면이 붙었다: %r" % own)
 
     # D-1-01: 동작하는 관문은 직접 쓰기를 거부하고 파일과 제출 절차를 가리킨다
     for tool, ti in (("Edit", {"file_path": hk, "old_string": "a", "new_string": "b"}),
@@ -4995,7 +5074,7 @@ def _self_test_boot_critical(fails, shutil):
     for ans in (RuntimeError("boom"), None, "yes", {}, {"decision": "undecidable"}, [1]):
         if deny("Write", {"file_path": hk}, ans) is not None:
             fails.append("BC: 이상 응답 %r 이 거부로 접혔다(fail-open 위반)" % (ans,))
-    if boot_critical_deny_reason("Write", None, pk, runner(yes)) is not None:
+    if boot_critical_deny_reason("Write", None, pk, runner(yes), roles=["worker"]) is not None:
         fails.append("BC: 비-dict 입력이 거부로 접혔다")
     # 실제 자식 경로(유닉스): 인자·CYS_NO_AUTOSTART·비정상 종료·출력 불량·무응답·이진 부재
     if os.name != "nt":
@@ -5015,7 +5094,7 @@ def _self_test_boot_critical(fails, shutil):
             os.environ["CYS_BIN"] = fake("yes", "printf '%%s|%%s\\n' \"$CYS_NO_AUTOSTART\" \"$*\" > '%s'\n"
                                           "printf '{\"decision\":\"yes\",\"rel\":\"hooks/inject-context.sh\"}'\n" % log)
             r = boot_critical_deny_reason("Write", {"file_path": hk}, pk,
-                                          lambda p: _bc_query(p, budget=10.0))
+                                          lambda p: _bc_query(p, budget=10.0), roles=["worker"])
             got = open(log).read().strip() if os.path.exists(log) else ""
             if not r:
                 fails.append("BC: 실제 자식 yes 가 거부로 이어지지 않았다")
