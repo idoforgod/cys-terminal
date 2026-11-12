@@ -286,6 +286,24 @@ jobs:
           # (조용한 드리프트 → 명시적 결정으로 전환). ★"팩 레인이라 생략"은 이유가 아니다 —
           # 그 스위트가 팩 배송과 **왜** 무관한지, 무관하지 않다면 무엇이 막고 있는지를 적어라.
           ALLOWED = {
+              "test_check_min_binary_floor": (
+                  {"ci-branch"},
+                  "scripts/tests/ suite (not a pack suite; 0.15.0 self-repair T2c, M11 카, CONTRACTS O-C8-5 (ii)). Controls for "
+                  "scripts/check_min_binary_floor.py, which reads the three min_binary sites (release.yml PACK_MIN_BINARY, "
+                  "pack-release.yml PACK_MIN_BINARY_OVERRIDE, the docs/RELEASE.md literal) and the min_binary verifier step as TEXT. "
+                  "Neither is shipped (build.rs embeds cysjavis-pack only). It runs in ci-branch job release-floor-parity, the gate "
+                  "before a tag (pre-tag-ci-check.py requires a successful ci-branch run at the tag SHA; docs/RELEASE.md section 0-C). "
+                  "A release or pack-release entry would add a new way to fail a tag run for a text check that already passed on the "
+                  "same SHA.",
+              ),
+              "test_gen_prev_vendor_hashes": (
+                  {"ci-branch"},
+                  "scripts/tests/ suite (not a pack suite; 0.15.0 self-repair T2c, M11 다, CONTRACTS O-C8-5 (i)). Controls for "
+                  "scripts/gen_prev_vendor_hashes.py on temp git repositories (window, stale detection, shallow clone refused). "
+                  "The generator and its --check need full history and every tag; release.yml and pack-release.yml check out at "
+                  "depth 1 (a shallow repository, which the generator refuses with exit 2), so neither lane can run it. It runs in ci-branch job "
+                  "prev-vendor-freshness (fetch-depth: 0) next to the real --check, the gate before a tag.",
+              ),
               "test_phoenix_": (
                   {"release"},
                   "release 전용 글롭(`test_phoenix_*.py`)이 남긴 접두 토큰. 파일은 실측 15종"
@@ -2103,3 +2121,81 @@ jobs:
           bun install --frozen-lockfile
           bunx -p typescript@7.0.2 tsc -v
           bunx -p typescript@7.0.2 tsc -p tsconfig.check.json
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # 잡6 — min_binary 세 곳 동일성 (0.15.0 「스스로 해결」 T2c · M11 카 · CONTRACTS C8 8.13 / O-C8-5 (ii))
+  # ★무엇을 막는가: 팩의 최소 프로그램 버전(min_binary)은 세 곳에 적힌다 — release.yml `PACK_MIN_BINARY`,
+  #   pack-release.yml `PACK_MIN_BINARY_OVERRIDE`, docs/RELEASE.md 팩-온리 2단계의 리터럴 '현행 X.Y.Z'.
+  #   0.15.0 전에는 주석으로만 묶여 있어 한 곳을 빠뜨려도 아무것도 붉어지지 않았다(S26 계급 · 설계 §4-11 카:
+  #   하나라도 빠지면 옛 프로그램이 새 팩을 옛 규칙으로 깐다). 값 자체는 여기서 정하지 않는다 — 릴리스 커밋이
+  #   세 곳을 함께 올리고, 이 잡은 같은 값이면 언제나 초록이다.
+  # ★함께 재는 것(설계 §6-11 카 "하한 검증기, 보안 하한 파일은 건드리지 않음"): pack-release.yml 의 min_binary
+  #   검증기 스텝이 무조건 실행되는가(N1), 하한이 security-floor.txt 아래로 내려가지 않는가(N2 · 파일 자체는
+  #   검체가 v0.14.56 바이트로 핀한다).
+  # ★왜 브랜치 레인만인가: pre-tag-ci-check.py 가 태그 SHA 의 ci-branch 성공을 요구한다(RELEASE.md §0-C) —
+  #   여기가 태그 전 관문이다. 태그 레인(release.yml)에는 넣지 않는다: 같은 SHA 에서 이미 통과한 텍스트 검사로
+  #   태그 런을 죽일 새 경로를 만들 이유가 없다.
+  # ★macOS 인 이유: 레인 예행 도구 5단계가 ci-branch 의 우분투 잡을 정확히 1개로 요구한다(잡5 머리말과 같다).
+  # ★`if:` 없음 · `continue-on-error` 없음. 깊이 1 checkout 으로 충분하다(파일 텍스트만 읽는다 · git·네트워크 0).
+  release-floor-parity:
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: min_binary 세 곳 동일성 + 검증기 스텝 + 보안 하한 (release.yml ⇔ pack-release.yml ⇔ docs/RELEASE.md)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/check_min_binary_floor.py
+
+      - name: min_binary 게이트 대조군 (심은 불일치 적색 · 실제 트리 초록)
+        shell: bash
+        run: |
+          set -euo pipefail
+          f="scripts/tests/test_check_min_binary_floor.py"
+          [ -f "$f" ] || { echo "test file missing: $f (git add?)" >&2; exit 1; }
+          python3 "$f"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # 잡7 — 과거 버전 해시 표 최신성 (0.15.0 「스스로 해결」 T2c · M11 다 · CONTRACTS C8 8.5 / O-C8-5 (i))
+  # ★무엇을 막는가: 설치 기록이 없거나 깨졌을 때 `src/pack_prev_vendor.rs` 가 '옛 벤더 바이트'와 '사용자 수정'을
+  #   가르는 유일한 근거다(설계 §4-11 다 · 부록 A-2 1번). 표가 낡으면 옛 벤더 사본이 조용히 사용자 수정으로
+  #   분류된다. 0.14.56 에는 이 검사를 도는 워크플로가 0개였다(손으로 돌렸고, 한 번은 수정 뒤에 돌지 않아 낡은
+  #   표가 남았다 — docs/RELEASE_NOTES_0.14.56.md:130).
+  # ★fetch-depth: 0 이 필수다: 생성기가 모든 릴리스 태그의 트리를 읽는다(얕은 checkout 이면 생성기가 exit 2 로
+  #   거부한다 — 통과로 접지 않는다). 태그 레인은 깊이 1·태그 없음이라 여기서만 돌 수 있다(생성기 docstring).
+  # ★표가 다시 낡는 때: 배송되는 팩 파일이 바뀔 때, 그리고 새 릴리스 태그가 생긴 뒤 다음 커밋부터. 고치는 법은
+  #   `python3 scripts/gen_prev_vendor_hashes.py` 후 커밋(docs/RELEASE_NOTES_0.14.56.md:151 '최종 후보에서 다시 생성' 관행 그대로).
+  # ★macOS 인 이유·`if:`/`continue-on-error` 없음: 잡6 과 같다.
+  prev-vendor-freshness:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # ★모든 브랜치와 태그 — 생성기가 각 릴리스 태그의 트리를 읽는다
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 과거 버전 해시 표 최신성 (gen_prev_vendor_hashes.py --check · 전체 이력)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/gen_prev_vendor_hashes.py --check
+
+      - name: 해시 표 생성기 대조군 (임시 git 저장소 · 창 · 낡음 탐지 · 얕은 복제 거부)
+        shell: bash
+        run: |
+          set -euo pipefail
+          f="scripts/tests/test_gen_prev_vendor_hashes.py"
+          [ -f "$f" ] || { echo "test file missing: $f (git add?)" >&2; exit 1; }
+          python3 "$f"
