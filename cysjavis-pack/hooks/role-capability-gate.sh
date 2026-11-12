@@ -2995,6 +2995,228 @@ def decide(tool, tool_input, role, ctx=None):
     return False, "non-mutation tool"
 
 
+# ── 기동 필수 파일 조언 관문(0.15.0 · T5a · 설계 §4-7 · CONTRACTS C4 4.8 / O-C4-5) ──────────────
+#   살아 있는 **기동 필수 파일**에 대한 직접 쓰기를 **조언으로** 거부하고 수리 절차(`cys repair submit`)를
+#   가리킨다(TESTPLAN_RULINGS OQ-D1). 판정은 본체(`cys repair boot-critical --path … --json`)에만 있다 —
+#   이 훅은 목록 사본을 두지 않고 경로를 정규화하지 않는다(C4 4.1·4.6; 아래 문자열 사전 판정은 '띄울
+#   만한가'일 뿐 결정이 아니다).
+#   ★비용(O-C4-5): 쓰기 도구이고 대상이 팩 아래일 때만 `cys` 를 **한 번** 띄운다 · 짧은 시한 ·
+#     `CYS_NO_AUTOSTART=1`(부록 A 1-17: 훅이 부른 cys 는 데몬을 띄우지 않는다). 읽기·팩 밖 쓰기는 띄우지 않는다.
+#   ★어디서나 고장 나면 열린다(fail-open): 이진 부재·비정상 종료·시한 초과·출력 불량·예외 → 통과.
+#     닫히면 머리말 24–34행의 사고(파이썬 없는 윈도우에서 좌석 전체가 벽돌)가 그대로 재현된다.
+#     실제 통제는 '승인된 후보를 적용하는 것은 데몬뿐'이다(설계 §4-7).
+#   ★셸 쓰기는 이 게이트가 **이미 아는** 형태만 본다 — 출력 리다이렉트(`_is_redirect_op`)와
+#     `WRITE_SHELL_CMDS` 동사의 경로 인자(같은 토큰화 `cso_prepare`·`_tokenize`). 새 셸 파서를 두지 않는다.
+#     인터프리터 한 줄·`sh -c` 속 쓰기·외부 스크립트는 여기서 보지 않는다 — 그 몫은 미승인 변경 검사(M10)다.
+#   ★역할 정책이 이미 막은 호출은 다시 보지 않는다(reviewer 의 fail-closed·CSO 정책은 그대로).
+BOOT_CRITICAL_QUERY_TIMEOUT_S = 3.0
+# src/pack.rs `PACK_DIR_ENV_KEYS` 와 같은 순서(팩 위치 env) — 사전 판정용(결정은 본체).
+BOOT_CRITICAL_PACK_ENV_KEYS = ("CYS_PACK_DIR", "JAVIS_PACK_DIR", "AITERM_PACK_DIR", "AITERM_JARVIS_DIR")
+_BC_ALL_OPERANDS = {"tee", "rm", "truncate", "touch", "mv", "mkdir", "rmdir"}
+_BC_SKIP_FIRST = {"chmod", "chown"}            # 첫 피연산자는 모드·소유자
+_BC_LAST_OPERAND = {"cp", "install", "ln"}     # 원본은 읽기 — 마지막(또는 -t 디렉터리)만 쓰기
+_BC_TARGET_DIR_VERBS = {"cp", "install", "ln", "mv"}   # `-t DIR` 이 대상 디렉터리인 동사(touch -t 는 시각)
+# 값을 따로 먹는 옵션(그 값을 경로로 오인하지 않게) — 동사별 대표만.
+_BC_VALUE_OPTS = {
+    "truncate": ("-s", "--size", "-r", "--reference"),
+    "touch": ("-t", "-d", "-r", "--date", "--reference"),
+    "mkdir": ("-m", "--mode"),
+    "install": ("-m", "--mode", "-o", "--owner", "-g", "--group", "-S", "--suffix"),
+    "cp": ("-S", "--suffix"), "ln": ("-S", "--suffix"), "mv": ("-S", "--suffix"),
+    "chmod": ("--reference",), "chown": ("--reference",),
+    "sed": ("-e", "-f", "-l", "--expression", "--file", "--line-length"),
+}
+
+
+def _bc_fold(p):
+    return p.replace("\\", "/").lower()
+
+
+def _bc_under_pack_root(path):
+    """**문자열 사전 판정** — 이 경로를 위해 `cys` 를 띄울 만한가(결정은 본체). 실패는 False."""
+    try:
+        forms = {os.path.abspath(path)}
+        try:
+            forms.add(os.path.realpath(path))
+        except (OSError, ValueError):
+            pass
+        roots = [os.environ.get(k) for k in BOOT_CRITICAL_PACK_ENV_KEYS]
+        roots.append(os.path.join(os.path.expanduser("~"), ".cys", "pack"))  # pack-dept-* 도 접두로 걸린다
+        folded = []
+        for r in roots:
+            if not r:
+                continue
+            folded.append(_bc_fold(os.path.abspath(r)).rstrip("/"))
+            try:
+                folded.append(_bc_fold(os.path.realpath(r)).rstrip("/"))
+            except (OSError, ValueError):
+                pass
+        for f in forms:
+            ff = _bc_fold(f)
+            if "/.cys/pack" in ff or any(r and ff.startswith(r) for r in folded):
+                return True
+            if os.name == "nt" and re.search(r"~[0-9]", ff):
+                return True            # 8.3 짧은 이름 — 본체가 푼다
+    except Exception:
+        return False
+    return False
+
+
+def boot_critical_targets(tool, tool_input):
+    """쓰기 대상 경로 후보(순서 보존). 읽기·비쓰기 도구·해석 불가 명령은 빈 목록(= 띄우지 않음)."""
+    if not isinstance(tool_input, dict):
+        return []
+    if tool in MUTATION_TOOLS:
+        p = _target_path(tool, tool_input)
+        return [p] if isinstance(p, str) and p else []
+    if tool != "Bash":
+        return []
+    cmd = tool_input.get("command")
+    if not isinstance(cmd, str) or not cmd:
+        return []
+    prepared, perr = cso_prepare(cmd)
+    if perr:
+        return []
+    tokens = _tokenize(prepared)
+    if tokens is None:
+        return []
+    out = []
+
+    def _segment(seg):
+        i = 0
+        while i < len(seg):
+            t = _txt(seg[i])
+            name = t.split("=", 1)[0]
+            if "=" in t and name and name.replace("_", "").isalnum():
+                i += 1          # 선행 환경 할당
+            elif _wrapper_name(seg[i]) is not None:
+                i += 1          # 래퍼 이름(옵션은 따라가지 않는다 — 한계는 M10 이 덮는다)
+            else:
+                break
+        if i >= len(seg):
+            return
+        base = os.path.basename(_txt(seg[i]).replace("\\", "/"))
+        args = [_txt(a) for a in seg[i + 1:]]
+        value_opts = _BC_VALUE_OPTS.get(base, ())
+        ops, tdir, script_opt, dashdash, skip = [], None, False, False, False
+        for j, a in enumerate(args):
+            if skip:
+                skip = False
+                continue
+            if not dashdash and a == "--":
+                dashdash = True
+                continue
+            if not dashdash and a.startswith("-") and a != "-":
+                if base in _BC_TARGET_DIR_VERBS and a in ("-t", "--target-directory") \
+                        and j + 1 < len(args):
+                    tdir, skip = args[j + 1], True
+                elif base in _BC_TARGET_DIR_VERBS and a.startswith("--target-directory="):
+                    tdir = a.split("=", 1)[1]
+                elif a in value_opts:
+                    skip = True
+                    script_opt = script_opt or a in ("-e", "-f", "--expression", "--file")
+                elif a.startswith(("--expression=", "--file=")):
+                    script_opt = True
+                continue
+            if a:
+                ops.append(a)
+        if base in _BC_ALL_OPERANDS or base in _BC_LAST_OPERAND:
+            if tdir:
+                out.extend(os.path.join(tdir, os.path.basename(o)) for o in ops)
+                if base == "mv":
+                    out.extend(ops)                 # 옮겨 가는 원본도 바뀐다
+            elif base in _BC_ALL_OPERANDS:
+                out.extend(ops)
+            elif len(ops) >= 2:
+                out.append(ops[-1])
+        elif base in _BC_SKIP_FIRST:
+            out.extend(ops[1:])
+        elif base == "sed" and any(a == "-i" or a.startswith("-i") or a.startswith("--in-place")
+                                   for a in args):
+            out.extend(ops if script_opt else ops[1:])
+        elif base == "dd":
+            out.extend(a[3:] for a in args if a.startswith("of=") and len(a) > 3)
+
+    seg = []
+    i, n = 0, len(tokens)
+    while i < n:
+        tok = tokens[i]
+        if _is_redirect_op(tok):
+            target = tokens[i + 1] if i + 1 < n else ""
+            t = _txt(target)
+            if t and t not in NULL_SINKS and not (t.isdigit() and _is_fd_dup_op(tok)):
+                out.append(t)
+            i += 2
+            continue
+        if is_separator(tok):
+            _segment(seg)
+            seg = []
+            i += 1
+            continue
+        seg.append(tok)
+        i += 1
+    _segment(seg)
+    return out
+
+
+def _bc_query(path, budget=None):
+    """`cys repair boot-critical --path <p> --json` **한 번**. exit 0 + JSON 객체일 때만 dict, 그 밖은 None."""
+    left = _deadline_left() if budget is None else budget
+    if left <= 0.5:
+        return None
+    cys = os.environ.get("CYS_BIN") or _which("cys")
+    if not cys:
+        return None
+    env = dict(os.environ)
+    env["CYS_NO_AUTOSTART"] = "1"       # 부록 A 1-17 — 질의가 데몬을 낳지 않는다(이중 봉인)
+    try:
+        r = subprocess.run([cys, "repair", "boot-critical", "--path", path, "--json"],
+                           stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, env=env,
+                           timeout=min(BOOT_CRITICAL_QUERY_TIMEOUT_S, left - 0.5))
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    try:
+        v = json.loads(r.stdout.decode("utf-8", "replace"))
+    except ValueError:
+        return None
+    return v if isinstance(v, dict) else None
+
+
+def boot_critical_deny_reason(tool, tool_input, cwd=None, runner=None):
+    """기동 필수 파일 직접 쓰기면 거부 사유, 아니면 None. **어떤 실패도 None**(fail-open)."""
+    try:
+        targets = boot_critical_targets(tool, tool_input)
+        if not targets:
+            return None
+        base = cwd if isinstance(cwd, str) and cwd else os.getcwd()
+        cand = None
+        for t in targets:
+            if not isinstance(t, str) or not t or "\x00" in t:
+                continue
+            p = os.path.expanduser(t) if t.startswith("~") else t
+            p = p if os.path.isabs(p) else os.path.join(base, p)
+            if _bc_under_pack_root(p):
+                cand = p
+                break                   # 도구 호출당 프로세스 하나(O-C4-5)
+        if cand is None:
+            return None
+        ans = (runner or _bc_query)(cand)
+        if not isinstance(ans, dict) or ans.get("decision") != "yes":
+            return None
+        rel = ans.get("rel") if isinstance(ans.get("rel"), str) and ans.get("rel") else cand
+        return ("[기동 필수 파일 — 직접 쓰기 보류] `%s` 은(는) 본체에 컴파일된 기동 필수 목록에 든 파일이다"
+                "(망가지면 제품이 켜지지 않는다). 살아 있는 기동 필수 파일은 직접 고치지 않는다: "
+                "`cys repair begin --files %s` 로 수리를 열면 작업 사본(`~/.cys/local/repairs/R-<번호>/staging/`)이 "
+                "만들어진다 — 거기서 고치고 예행을 돌린 뒤 리뷰어1 검증·리뷰어2 감사 서명을 받아 "
+                "`cys repair submit <R-번호>` 로 제출하라. 주인의 수정 최종 승인 뒤 데몬이 적용한다. "
+                "(이 관문은 조언이다 — 고장 나면 열린다.)" % (rel, rel))
+    except Exception:
+        return None
+
+
 def _json_escape(s):
     """JSON 문자열 값 이스케이프(고정 형태 emit용 — 외부 의존 없음)."""
     out = []
@@ -3152,6 +3374,10 @@ def main():
                             "예산 소진은 고장이 아니라 사이클 신호다."
                             % (count, BUDGET_WARN, BUDGET_DENY))
     block, reason = decide_multi(tool, tool_input, roles, ctx)
+    # ★T5a(0.15.0 · C4 4.8): 기동 필수 파일 조언 관문 — 역할 정책이 허용한 호출만 · fail-open.
+    bc_reason = None if block else boot_critical_deny_reason(tool, tool_input, data.get("cwd"))
+    if bc_reason:
+        block, reason = True, bc_reason
     # ★경고 표시(.warned)는 **실제로 전달할 때만** 소비한다(R1 major · codex 실증):
     #   종전에는 표시를 먼저 남기고 도구가 deny 면 경고를 싣지 않아, 1,500번째 호출이 deny 면
     #   유일한 예산 경고가 조용히 소모됐다(1,501~1,999 무경고 → 2,000 에서 갑자기 deny).
@@ -3169,6 +3395,8 @@ def main():
         # 진단은 stderr(transcript), 차단 판정은 modern JSON permission-decision(stdout)+exit 0.
         print("role-capability-gate DENY: %s [role=%s tool=%s src=%s]"
               % (reason, role, tool, os.environ.get("CAPGATE_ROLE_SOURCE", "?")), file=sys.stderr)
+        if bc_reason:
+            emit_deny(reason)
         if is_cso(role):
             emit_deny("[CSO 능력 게이트] %s" % reason)
         # ★R2 minor: 진단을 **문면에 싣는다**(claude 리뷰어). 종전엔 사유가 stderr 에만 남아
@@ -4669,6 +4897,152 @@ def self_test_r2(fails):
     return fails
 
 
+def self_test_boot_critical(fails):
+    """T5a 조언 관문(C4 4.8 · O-C4-5 · OQ-D1 · 부록 A 1-17) — 판정 · 비용 · fail-open."""
+    import shutil
+    # hermetic: the pack env overrides of the calling environment must not move the pre-test roots
+    saved_env = {k: os.environ.pop(k) for k in BOOT_CRITICAL_PACK_ENV_KEYS if k in os.environ}
+    try:
+        _self_test_boot_critical(fails, shutil)
+    finally:
+        os.environ.update(saved_env)
+    if BOOT_CRITICAL_QUERY_TIMEOUT_S > 5.0:
+        fails.append("BC: 질의 시한 %.1fs — 짧은 시한이어야 한다(훅 15s 안 · O-C4-5)"
+                     % BOOT_CRITICAL_QUERY_TIMEOUT_S)
+
+
+def _self_test_boot_critical(fails, shutil):
+    pk = os.path.join(os.path.expanduser("~"), ".cys", "pack")
+    hk = os.path.join(pk, "hooks", "inject-context.sh")
+    calls = []
+
+    def runner(answer):
+        def _r(path):
+            calls.append(path)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+        return _r
+
+    yes = {"decision": "yes", "rel": "hooks/inject-context.sh"}
+
+    def deny(tool, ti, answer=yes, cwd=pk):
+        del calls[:]
+        return boot_critical_deny_reason(tool, ti, cwd, runner(answer))
+
+    # D-1-01: 동작하는 관문은 직접 쓰기를 거부하고 파일과 제출 절차를 가리킨다
+    for tool, ti in (("Edit", {"file_path": hk, "old_string": "a", "new_string": "b"}),
+                     ("Write", {"file_path": hk, "content": "x"}),
+                     ("MultiEdit", {"file_path": hk, "edits": []}),
+                     ("NotebookEdit", {"notebook_path": os.path.join(pk, "x.ipynb")})):
+        r = deny(tool, ti)
+        if not r or "hooks/inject-context.sh" not in r or "cys repair submit" not in r \
+                or "기동 필수" not in r:
+            fails.append("BC: %s 직접 쓰기가 거부되지 않았다(사유=%r)" % (tool, r))
+        if len(calls) != 1:
+            fails.append("BC: %s 호출당 cys %d회(1회여야)" % (tool, len(calls)))
+        try:
+            hso = json.loads(deny_payload(r or "x"))["hookSpecificOutput"]
+            if hso.get("permissionDecision") != "deny":
+                fails.append("BC: deny JSON 형태 불량")
+        except (ValueError, KeyError) as e:
+            fails.append("BC: deny JSON 불량: %s" % e)
+    # 대조군: 목록 밖 파일은 판정이 '아님' → 통과
+    if deny("Write", {"file_path": os.path.join(pk, "hooks", "README.md")},
+            {"decision": "no"}) is not None:
+        fails.append("BC: 목록 밖 파일이 거부됐다")
+    # 비용: 읽기·팩 밖 쓰기는 띄우지 않는다
+    for tool, ti in (("Read", {"file_path": hk}), ("Grep", {"pattern": "x", "path": pk}),
+                     ("Write", {"file_path": "/tmp/t5a-x"}),
+                     ("Bash", {"command": "cat hooks/inject-context.sh"}),
+                     ("Bash", {"command": "sed -n 1,5p hooks/inject-context.sh"}),
+                     ("Bash", {"command": "cp hooks/inject-context.sh /tmp/t5a-copy"}),
+                     ("Bash", {"command": "echo x > /tmp/t5a-out"}),
+                     ("Bash", {"command": "python3 -c \"open('hooks/inject-context.sh','w')\""})):
+        r = deny(tool, ti)
+        if r is not None or calls:
+            fails.append("BC: %s %r 에서 cys 를 띄웠다/거부했다(calls=%d)" % (tool, ti, len(calls)))
+    # D-1-10: 게이트가 이미 아는 셸 쓰기 형태는 파일 도구와 똑같이 거부
+    for cmd in ("echo x > hooks/inject-context.sh",
+                "printf x >> hooks/inject-context.sh",
+                "echo x | tee hooks/inject-context.sh",
+                "cp /tmp/a hooks/inject-context.sh",
+                "install -m 755 /tmp/a hooks/inject-context.sh",
+                "ln -sf /tmp/a hooks/inject-context.sh",
+                "cp -t hooks /tmp/inject-context.sh",
+                "mv hooks/inject-context.sh /tmp/old",
+                "rm -f hooks/inject-context.sh",
+                "truncate -s 0 hooks/inject-context.sh",
+                "touch hooks/inject-context.sh",
+                "chmod 644 hooks/inject-context.sh",
+                "sed -i '' 's/a/b/' hooks/inject-context.sh",
+                "sed -i 's/a/b/' hooks/inject-context.sh",
+                "sed -e 's/a/b/' -i hooks/inject-context.sh",
+                "dd if=/dev/zero of=hooks/inject-context.sh",
+                "touch -t 202601010000 hooks/inject-context.sh",
+                "mv -t /tmp hooks/inject-context.sh",
+                "truncate --size=0 -- hooks/inject-context.sh",
+                "FOO=1 env cp /tmp/a hooks/inject-context.sh",
+                "cd /tmp && echo x > %s" % hk):
+        r = deny("Bash", {"command": cmd})
+        if not r or len(calls) != 1 or calls[0] != hk:
+            fails.append("BC: 셸 쓰기 %r 가 거부되지 않았다(calls=%r)" % (cmd, calls))
+    # 도구 호출당 프로세스 하나 — 대상이 여럿이어도
+    r = deny("Bash", {"command": "echo a > hooks/a.sh; echo b > hooks/b.sh; rm hooks/c.sh"})
+    if len(calls) != 1:
+        fails.append("BC: 다중 대상 Bash 에서 cys %d회(1회여야)" % len(calls))
+    # fail-open: 예외 · 이상한 답 · 판정 불가
+    for ans in (RuntimeError("boom"), None, "yes", {}, {"decision": "undecidable"}, [1]):
+        if deny("Write", {"file_path": hk}, ans) is not None:
+            fails.append("BC: 이상 응답 %r 이 거부로 접혔다(fail-open 위반)" % (ans,))
+    if boot_critical_deny_reason("Write", None, pk, runner(yes)) is not None:
+        fails.append("BC: 비-dict 입력이 거부로 접혔다")
+    # 실제 자식 경로(유닉스): 인자·CYS_NO_AUTOSTART·비정상 종료·출력 불량·무응답·이진 부재
+    if os.name != "nt":
+        tdir = tempfile.mkdtemp(prefix="t5a-capgate-")
+        log = os.path.join(tdir, "log")
+        saved = os.environ.get("CYS_BIN")
+
+        def fake(name, body):
+            fp = os.path.join(tdir, name)
+            with open(fp, "w") as f:
+                f.write("#!/bin/sh\n" + body)
+            os.chmod(fp, 0o755)
+            return fp
+        try:
+            os.environ["CYS_BIN"] = fake("yes", "printf '%%s|%%s\\n' \"$CYS_NO_AUTOSTART\" \"$*\" > '%s'\n"
+                                          "printf '{\"decision\":\"yes\",\"rel\":\"hooks/inject-context.sh\"}'\n" % log)
+            r = boot_critical_deny_reason("Write", {"file_path": hk}, pk,
+                                          lambda p: _bc_query(p, budget=10.0))
+            got = open(log).read().strip() if os.path.exists(log) else ""
+            if not r:
+                fails.append("BC: 실제 자식 yes 가 거부로 이어지지 않았다")
+            if got != "1|repair boot-critical --path %s --json" % hk:
+                fails.append("BC: 자식 인자·CYS_NO_AUTOSTART 불일치(부록 A 1-17): %r" % got)
+            for name, body in (("fail", "exit 1\n"), ("garbage", "echo not-json\n"),
+                               ("yes-but-1", "printf '{\"decision\":\"yes\"}'; exit 1\n")):
+                os.environ["CYS_BIN"] = fake(name, body)
+                if _bc_query(hk, budget=10.0) is not None:
+                    fails.append("BC: 자식 %s 가 답으로 읽혔다(fail-open 위반)" % name)
+            os.environ["CYS_BIN"] = fake("hang", "exec sleep 30\n")
+            t0 = time.time()
+            if _bc_query(hk, budget=1.6) is not None:      # 시한 = min(3s, 1.6-0.5) = 1.1s
+                fails.append("BC: 무응답 자식이 답으로 읽혔다")
+            if time.time() - t0 > 2.5:
+                fails.append("BC: 무응답 자식을 %.1fs 기다렸다(시한 1.1s)" % (time.time() - t0))
+            os.environ["CYS_BIN"] = os.path.join(tdir, "missing")
+            if _bc_query(hk, budget=10.0) is not None:
+                fails.append("BC: 이진 부재가 답으로 읽혔다")
+            if _bc_query(hk, budget=0.4) is not None:
+                fails.append("BC: 훅 예산 소진 뒤에도 자식을 띄웠다")
+        finally:
+            if saved is None:
+                os.environ.pop("CYS_BIN", None)
+            else:
+                os.environ["CYS_BIN"] = saved
+            shutil.rmtree(tdir, ignore_errors=True)
+
+
 def run_self_test():
     # ★실행 위치와 무관하게(0.15.0 T10 후속 · 리뷰 지적 10): 검체 일부의 입력은 **상대 경로**다 — POSIX
     #   호스트의 윈도우 철자(`C:\\Users\\…`)·인용된 `~`(`"~/.cys/…"`). 상대 경로는 cwd 아래로 풀리므로
@@ -4686,6 +5060,7 @@ def run_self_test():
     self_test_contracts(fails)
     self_test_r1(fails)
     self_test_r2(fails)
+    self_test_boot_critical(fails)
 
     # ★API 계약 검증: deny 경로는 permissionDecision==deny JSON을 내는가 / 허용은 무출력인가.
     emitted = deny_payload("reviewer-codex surface는 producer 산출물 수정 금지 (producer != evaluator)")
