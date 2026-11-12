@@ -9,7 +9,10 @@
 지시가 갈린 자리다.
 
 밀폐: `CYS_PACK_DIR`(레인)·`JAVIS_ROOT`(handoff 소스)를 임시 디렉터리로 덮어 라이브 팩·라이브
-`_round` 무접촉. 서브프로세스는 review-prompt 생성뿐이고 파일 쓰기는 0이다(생성기는 순수 stdout).
+`_round` 무접촉. 서브프로세스는 review-prompt 생성(과 ⑳의 round-log)뿐이다. ★0.15.0 T10 부터 생성기가
+쓰는 것은 **verdict 폴더 하나**(`<팩>/round/_reviews/`)뿐이다 — 리뷰어 관문이 mkdir 을 쓰기 명령으로
+거부하므로(설계 §4-12 · 시험계획 H-12-N1-01) 의뢰문 도구가 폴더를 미리 만든다(종전 문면 "파일 쓰기는
+0이다"는 그 계약 변경으로 고쳤다 — ⑯이 '그 폴더 말고는 아무것도 쓰지 않는다'를 잰다).
 
   ① 생성문에 **저장 경로**가 실재(레인 팩 파생 · `<팩>/round/_reviews/<task>-r<N>-<evaluator>.json`)
   ② 저장 지시 토큰 실재(정본 저장 · 스키마 계약 · round-log 짝 · mkdir 안내)
@@ -21,6 +24,9 @@
   ⑧ 경로 탈출 0 — task 에 `../`·`/` 가 있어도 basename 에 분리자가 남지 않는다
   ⑨ ★음성 대조(계측 타당성) — 주입 블록을 제거한 **변조 사본**은 위 토큰·경로를 내지 않는다
   ⑩~⑮ D-13 — 설치 팩 계약 경로·상수 파생 프롬프트·스키마 변조·문서 드리프트·revision
+  ⑯~⑳ 0.15.0 T10 — 폴더는 도구가 만든다(그 밖에는 아무것도 쓰지 않는다) · 의뢰문은 mkdir 을 시키지
+     않는다 · 팩이 없으면 만들지 않는다(exit 0 · 경고) · 리뷰어 관문이 그 경로를 받는다 · 파일이
+     있으면 round-log 가 리뷰어 행을 기록한다(라운드 종결) · 없으면 거부(미제출)
 출력: PASS/FAIL 행 · 실패 시 exit 1 · 전부 통과 시 종료 토큰 REVIEW-PROMPT-VERDICT-PATH-OK.
 실행 규약(CI 동형): CYS_PACK_DIR="$(mktemp -d)" python3 bin/tests/test_review_prompt_verdict_path.py
 """
@@ -76,11 +82,23 @@ try:
     check("0 생성 성공", r.returncode == 0, repr(r.stderr[-200:]))
     expect = os.path.join(pack_a, "round", "_reviews", "R3_게이트-r3-codex.json")
     check("1 저장 경로 실재(레인 팩 파생)", expect in out, repr(expect))
+    # ★0.15.0 T10 재핀: 종전 핀은 `mkdir -p` 안내의 **존재**를 요구했다 — 그 지시는 리뷰어 관문이
+    #   거부하는 명령이었다(설계 §4-12). 새 계약: 폴더는 도구가 만들고 의뢰문은 mkdir 을 시키지 않는다.
     for tok, label in (("verdict 정본 저장", "정본 저장 지시"),
                        ("REVIEWER_VERDICT_CONTRACT", "스키마 계약"),
                        ("--verdict-json", "round-log 짝"),
-                       ("mkdir -p", "디렉터리 안내")):
+                       ("폴더는 준비돼 있다", "폴더 준비 안내(T10)")):
         check("2 저장 지시 토큰: %s" % label, tok in out, tok)
+    check("2b 리뷰어에게 mkdir 을 시키지 않는다(T10 · H-12-N1-01)",
+          "mkdir -p" not in out and "mkdir 하지 마라" in out, repr(out[-500:]))
+    # ⑯ T10: 폴더는 의뢰문 도구가 만든다 — 그리고 **그 폴더 말고는** 아무것도 쓰지 않는다.
+    _written = sorted(os.path.relpath(os.path.join(d, n), pack_a)
+                      for d, ds, fs in os.walk(pack_a) for n in ds + fs)
+    check("16 verdict 폴더가 생겼다(없던 폴더 · T10)",
+          os.path.isdir(os.path.dirname(expect)), repr(_written))
+    check("16b 그 폴더 말고는 쓰지 않는다",
+          _written == sorted([os.path.join("round"), os.path.join("round", "_reviews")]),
+          repr(_written))
     check("3 성공 기준에 파일 실재",
           "완료 기준(파일 실재)" in out and "미제출" in out, repr(out[-400:]))
 
@@ -231,6 +249,72 @@ try:
         if rel == "directives/REVIEWER_DIRECTIVE.md":
             check("D13-15 디렉티브 계약·revision 안내",
                   "REVIEWER_VERDICT_CONTRACT.md" in consumer and "revision" in consumer)
+
+    # ⑰ T10: 팩 디렉터리 자체가 없으면 만들지 않는다(오타 난 CYS_PACK_DIR 로 팩을 지어내지 않는다) —
+    #   그래도 의뢰문은 나가고(exit 0 · 리뷰가 멈추면 ORCH) master 에게 stderr 로 알린다.
+    ghost = os.path.join(root, "no-such-pack")
+    rg2 = run_rp(ghost)
+    check("17 팩이 없으면 만들지 않는다(exit 0 · 경고 · 의뢰문은 나간다)",
+          rg2.returncode == 0 and not os.path.exists(ghost) and "주의" in rg2.stderr
+          and "폴더를 미리 준비하지 못했다" in rg2.stdout and "mkdir -p" not in rg2.stdout,
+          repr((rg2.returncode, os.path.exists(ghost), rg2.stderr[-300:])))
+    # ⑱ 이미 있는 폴더는 건드리지 않는다(안의 파일 보존 · 멱등).
+    keep = os.path.join(os.path.dirname(expect), "keep.json")
+    with open(keep, "w", encoding="utf-8") as f:
+        f.write("{}")
+    rk = run_rp(pack_a)
+    check("18 이미 있는 폴더는 그대로(멱등 · 안의 파일 보존)",
+          rk.returncode == 0 and os.path.isfile(keep) and "폴더는 준비돼 있다" in rk.stdout,
+          repr(rk.stderr[-200:]))
+    os.unlink(keep)
+
+    # ⑲ T10: 생산자(verdict_json_path)와 소비자(리뷰어 관문)가 **같은 자리**를 말한다 — 의뢰문이 준
+    #   경로를 리뷰어 관문의 정확 목록이 받는다. 임시 폴더 허용에 가려지지 않게 정확 목록 술어를
+    #   직접 부른다(훅의 파이썬을 그대로 실행 — 사본을 만들지 않는다).
+    hook = os.path.join(PACK, "hooks", "role-capability-gate.sh")
+    with open(hook, encoding="utf-8") as f:
+        _src = f.read().split("<<'PYEOF'\n", 1)[1]
+    _src = _src.split('\nif os.environ.get("CAPGATE_SELF_TEST"):', 1)[0]
+    _ns = {"__name__": "capgate_t10_rp"}
+    exec(compile(_src, hook, "exec"), _ns)
+    _gctx = _ns["Ctx"](pack=pack_a, home=root, state=os.path.join(root, "state"), tempdir="/w/tmp",
+                       reader=lambda p: "", approver=lambda c: False)
+    for _role in ("reviewer-codex", "reviewer-claude-2"):
+        check("19 리뷰어 관문이 의뢰문의 verdict 경로를 받는다(%s)" % _role,
+              _ns["reviewer_exact_allowed"](expect, _gctx, _role) is True, expect)
+    check("19b 같은 문맥에서 팩 제품 파일은 받지 않는다(대조)",
+          _ns["reviewer_exact_allowed"](os.path.join(pack_a, "bin", "x.py"), _gctx,
+                                        "reviewer-codex") is False)
+
+    # ⑳ T10: 판정 파일이 **있으면** 라운드가 그 리뷰어 몫으로 종결된다(round-log 가 행을 기록) —
+    #   **없으면** 미제출로 거부된다. 리뷰어가 판정 파일을 못 쓰는 좁힘은 곧 '라운드가 끝나지 않음'이다.
+    def run_rl(vpath):
+        env = dict(os.environ)
+        env["CYS_PACK_DIR"] = pack_a
+        for k in ("JAVIS_PACK_DIR", "AITERM_PACK_DIR", "AITERM_JARVIS_DIR"):
+            env.pop(k, None)
+        env["JAVIS_ROOT"] = pack_a
+        env["PYTHONPATH"] = BIN
+        env["PATH"] = ""
+        return subprocess.run([PY, ORC, "round-log", "--task", "R3 게이트", "--round", "3",
+                               "--evaluator", "codex", "--verdict", "ACCEPT",
+                               "--verdict-json", vpath],
+                              capture_output=True, text=True, timeout=90, env=env)
+
+    r_missing = run_rl(expect)
+    check("20a 판정 파일이 없으면 미제출(round-log 거부)",
+          r_missing.returncode != 0 and not os.path.exists(expect),
+          repr((r_missing.returncode, r_missing.stderr[-200:])))
+    with open(expect, "w", encoding="utf-8") as f:
+        json.dump({"verdict": "ACCEPT", "justification": "T10 종단 검체",
+                   "evidence": [{"claim": "c", "ref": "bin/x.py:1", "verified": True}],
+                   "issues": []}, f, ensure_ascii=False)
+    r_ok = run_rl(expect)
+    _ledger = os.path.join(pack_a, "round", "ORCHESTRATION-R3_게이트.md")
+    _ledger_txt = open(_ledger, encoding="utf-8").read() if os.path.isfile(_ledger) else ""
+    check("20b 판정 파일이 있으면 리뷰어 행이 기록된다(라운드 종결)",
+          r_ok.returncode == 0 and "| 3 | codex |" in _ledger_txt and "ACCEPT" in _ledger_txt,
+          repr((r_ok.returncode, r_ok.stderr[-300:], _ledger_txt[-300:])))
 finally:
     shutil.rmtree(root, ignore_errors=True)
 
