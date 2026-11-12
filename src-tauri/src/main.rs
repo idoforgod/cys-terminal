@@ -3584,6 +3584,10 @@ fn gui_onboarded_path() -> std::path::PathBuf {
 /// 다음 기동에 온보딩을 다시 돌려 스스로 치유된다. 쓰는 순서를 락 없이 맞추려던 래치(W-2 A4)는 경쟁이 남아
 /// 버렸다 — 경쟁을 이기려 하지 않고 결과를 무해하게 만든다. 이 기능과 무관하게 이미 있던 '훅만 사후 유실
 /// (마커 무결)' 상태도 같은 길로 치유된다(종전엔 doctor --fix·버전 전이에 미뤘다).
+/// ★0.15.0 M11 마(묘비 인지 · 설계 §6-11 마 "앱 온보딩 조건"): 이 조건이 보는 것은 각성 훅(`AWAKENING_HOOKS` —
+/// session-start.sh·role-bootstrap.sh)뿐이고 둘 다 생명줄이라 묘비(장부에 기록된 삭제·해제)가 결코 적용되지 않는다
+/// — 그러므로 묘비 때문에 온보딩이 매 실행 반복되거나 건너뛰어지는 경로는 구조로 없다(`pack.rs`
+/// `m11_awakening_hooks_are_lifelines` 가 고정).
 fn needs_gui_onboard(marker: Option<&str>, current_version: &str, presence: &HookPresence) -> bool {
     *presence != HookPresence::Installed || marker.map(str::trim) != Some(current_version)
 }

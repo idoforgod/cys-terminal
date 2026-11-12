@@ -241,6 +241,10 @@ class TestKindCensus(Base):
         "conflicted": (WARN, WARN),
         "quarantined": (WARN, WARN),
         "adopted": (PASS, PASS),
+        # ★0.15.0 M11(O-C8-1): 업데이트가 보관한 사용자 수정 — 과제가 남아 있으므로 C62 판정 집합(WARN)이고
+        #   C68 기한 제외가 아니다(30일 체류 = 기한 초과 WARN).
+        "user-kept": (WARN, WARN),
+        "vendor-first": (WARN, WARN),
     }
 
     def test_every_registered_kind_is_classified(self):
