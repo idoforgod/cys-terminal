@@ -849,6 +849,10 @@ fn run_with(cmd: &RepairCmd, out: &mut dyn Write, err: &mut dyn Write, rpc: Rpc<
     if let RepairCmd::Tombstones { json } = cmd {
         return tombstones_local(out, err, *json);
     }
+    // T5a — LOCAL query of the compiled boot-critical list (C4 O-C4-2; no daemon request).
+    if let RepairCmd::BootCritical { path, list, json } = cmd {
+        return cys::repair::boot_critical::run_query(path.as_deref(), *list, *json, out, err);
+    }
     if let Some((method, params, json_out)) = t3_request(cmd) {
         return match rpc(method, params) {
             Ok(v) => {
@@ -864,8 +868,8 @@ fn run_with(cmd: &RepairCmd, out: &mut dyn Write, err: &mut dyn Write, rpc: Rpc<
             Err(e) => fail(err, &e),
         };
     }
-    // The verbs whose bodies belong to other tracks (T5a boot-critical · T5b submit/auth-helper ·
-    // T6 revert/sweep/tick/reapply · T7b gate/recheck).
+    // The verbs whose bodies belong to other tracks (T5b submit/auth-helper · T6 revert/sweep/tick/reapply ·
+    // T7b gate/recheck).
     let _ = writeln!(
         err,
         "{}: cys repair {}",
@@ -1023,8 +1027,9 @@ mod tests {
         }
     }
 
-    /// Every verb parses with its contract flags, prints the Korean sentence on stderr, writes
-    /// nothing on stdout and exits 99; malformed calls are refused by the parser.
+    /// Every NOT-yet-implemented verb parses with its contract flags, prints the Korean sentence on
+    /// stderr, writes nothing on stdout and exits 99; every verb parses; malformed calls are
+    /// refused by the parser.
     #[test]
     fn stub_exit_99() {
         let calls: &[&[&str]] = &[
@@ -1133,8 +1138,8 @@ mod tests {
             if !covered.contains(&name) {
                 covered.push(name);
             }
-            if name == "tombstones" {
-                continue;
+            if name == "tombstones" || name == "boot-critical" {
+                continue; // local verbs: their own tests pin them (T5a: boot_critical_* below)
             }
             if name == "rules" {
                 // T1a: the local `rules` prints the block (byte-exact in
@@ -1691,5 +1696,90 @@ mod tests {
         let body = &src[start..start + src[start..].find("\n}\n").expect("end of run_local")];
         assert!(body.contains("&local_rpc)"), "run_local must pass local_rpc");
         assert!(!body.contains("super::request"), "run_local must not reach the daemon");
+    }
+
+    /// T5a: `cys repair boot-critical --list --json` IS the compiled table (the pin of RULINGS
+    /// B6 — the break-each-file tests take their fixed input from it), `--list` is one line per
+    /// row, and the query runs entirely in-process (exit 0; nothing on stderr).
+    #[test]
+    fn boot_critical_list_json_pins_entries() {
+        let no_daemon = |m: &str, _p: Value| -> Result<Value, String> {
+            panic!("`cys repair boot-critical` asked the daemon ({m}) — it is a local query")
+        };
+        let cmd = parse(&["boot-critical", "--list", "--json"]).unwrap();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert_eq!(run_with(&cmd, &mut out, &mut err, &no_daemon), 0);
+        assert!(err.is_empty());
+        let v: serde_json::Value = serde_json::from_slice(&out).expect("--list --json is JSON");
+        assert_eq!(v["schema"], 1);
+        let rows = v["entries"].as_array().unwrap();
+        let table = cys::repair::boot_critical::entries();
+        assert_eq!(rows.len(), table.len());
+        for (r, e) in rows.iter().zip(table) {
+            assert_eq!(r, &cys::repair::boot_critical::entry_json(e));
+            assert_eq!(r["rel"], e.rel);
+            assert_eq!(r["lifeline"], e.lifeline);
+            assert!(r["check"]["kind"].is_string() && r["check"]["arg"].is_string());
+        }
+        let keys: Vec<&str> = rows[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let mut keys = keys;
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["category", "check", "lifeline", "rel", "timeout_s"],
+            "O-C4-3 entry format"
+        );
+        let cmd = parse(&["boot-critical", "--list"]).unwrap();
+        let mut out = Vec::new();
+        assert_eq!(run_with(&cmd, &mut out, &mut Vec::new(), &no_daemon), 0);
+        assert_eq!(String::from_utf8(out).unwrap().lines().count(), table.len());
+    }
+
+    /// T5a: `--path` exit codes 0 (boot-critical) / 1 (not) / 2 (cannot decide) through the CLI arm.
+    #[test]
+    fn boot_critical_path_exit_codes() {
+        let no_daemon = |m: &str, _p: Value| -> Result<Value, String> {
+            panic!("`cys repair boot-critical` asked the daemon ({m}) — it is a local query")
+        };
+        let dir = std::env::temp_dir().join(format!("t5a-cli-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("hooks")).unwrap();
+        let _g = crate::tests::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var(cys::pack::ENV_PACK_DIR).ok();
+        std::env::set_var(cys::pack::ENV_PACK_DIR, &dir);
+        let code = |p: &std::path::Path| {
+            let cmd = RepairCmd::BootCritical {
+                path: Some(p.to_path_buf()),
+                list: false,
+                json: true,
+            };
+            run_with(&cmd, &mut Vec::new(), &mut Vec::new(), &no_daemon)
+        };
+        assert_eq!(code(&dir.join("hooks/session-start.sh")), 0);
+        assert_eq!(code(&dir.join("bin/javis_bootstrap.py")), 0);
+        assert_eq!(code(&dir.join("hooks/README.md")), 1);
+        assert_eq!(code(&std::env::temp_dir().join("t5a-elsewhere.sh")), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert_eq!(
+                code(std::path::Path::new(std::ffi::OsStr::from_bytes(
+                    b"/tmp/\xff"
+                ))),
+                2
+            );
+        }
+        match saved {
+            Some(v) => std::env::set_var(cys::pack::ENV_PACK_DIR, v),
+            None => std::env::remove_var(cys::pack::ENV_PACK_DIR),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
