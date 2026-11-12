@@ -1920,15 +1920,19 @@ class _PollDone(Exception):
 #   접수는 장부의 한 줄이고 마스터 큐로 가지 않는다. 마스터에게 가는 것은 **5분 보고 관문 한 차례에
 #   많아야 한 줄**: "열린 결함 N건 — 워커에게 맡길 것". 장부는 `cys repair list --json`(데몬 읽기 ·
 #   CYS_NO_AUTOSTART=1 · 시간 상한)으로만 읽는다(O-C1-8 — 파이썬은 장부 파일을 직접 해석하지 않는다).
-#   멱등 키 = 열린 결함 서명 집합(부서를 가로질러 서로 다른 서명 — RULINGS G4)의 지문 — 같은 집합이면 깨우기 큐가 억제하고(병합 검토
-#   깨우기와 같은 방식, javis_preflight.py merge-review), 새 결함이 생길 때만 한 줄이 새로 간다.
-#   `cys` 부재·구형(0.15.0 미만)·실패·시간 초과 = 아무것도 보내지 않는다(오늘과 같음) · shadow = 배달 0.
+#   ★RULINGS AD5: 한 줄은 열린 집합이 **바뀔 때만** 간다(실행마다가 아님). 멱등 키 = 이 부서의 열린 결함
+#   서명 집합의 지문이고, 마지막으로 배달한 키를 게이트 상태(`open_defects.json`)에 남겨 같은 집합이면
+#   조용히 있는다(깨우기 큐의 억제는 배달 전까지만 유효하다 — 배달·drain 뒤 같은 키는 다시 들어간다).
+#   부서의 마스터는 **자기 부서**의 열린 결함만 듣는다(행의 `lanes` 에 이 부서가 있는 서명만).
+#   열린 결함이 0건이 되면 기억한 키를 지운다(같은 집합이 다시 열리면 그것도 변화다).
+#   `cys` 부재·구형(0.15.0 미만)·실패·시간 초과 = 아무것도 보내지 않고 기억도 그대로 · shadow = 배달 0.
 OPEN_DEFECT_TASK = "repair-open-defects"
 OPEN_DEFECT_TIMEOUT_S = 10
+OPEN_DEFECT_STATE_FILE = "open_defects.json"
 
 
 def collect_open_defects(cys_bin, timeout=OPEN_DEFECT_TIMEOUT_S):
-    """(ok, lane, [signature…]) — 열린 결함의 서명(정렬 · 부서를 가로질러 서로 다른 서명 — G4). 실패는 (False, None, [])."""
+    """(ok, lane, [signature…]) — **이 부서**의 열린 결함 서명(정렬 · 서로 다른 서명 — G4 · AD5). 실패는 (False, None, [])."""
     env = dict(os.environ, CYS_NO_AUTOSTART="1")
     try:
         r = subprocess.run([cys_bin, "repair", "list", "--json"], capture_output=True, text=True,
@@ -1948,10 +1952,14 @@ def collect_open_defects(cys_bin, timeout=OPEN_DEFECT_TIMEOUT_S):
     if not isinstance(doc, dict) or not isinstance(doc.get("defects"), list):
         return False, None, []
     lane = doc.get("lane")
-    #   RULINGS G4: "열린 결함 N건" counts DISTINCT signatures across lanes (rows are per lane, the
-    #   daemon aggregates them on read — one defect reported by two lanes is one line item).
+    if not isinstance(lane, str) or not lane:
+        return False, None, []
+    #   RULINGS G4: "열린 결함 N건" counts DISTINCT signatures (rows are per lane, the daemon aggregates
+    #   them on read). RULINGS AD5: a lane's master is told only about ITS OWN lane's open defects —
+    #   a signature counts when this lane is among the lanes that reported it.
     sigs = sorted({d.get("signature") for d in doc["defects"]
-                   if isinstance(d, dict) and d.get("open") is True and isinstance(d.get("signature"), str)})
+                   if isinstance(d, dict) and d.get("open") is True and isinstance(d.get("signature"), str)
+                   and isinstance(d.get("lanes"), list) and lane in d["lanes"]})
     return True, lane, sigs
 
 
@@ -2146,19 +2154,36 @@ class Gate:
             return self._fail_open(e, report, counters)
 
     def _open_defect_line(self, shadow):
-        """「스스로 해결」 — 열린 결함이 있으면 master 에게 **이 실행에서 많아야 한 줄**(멱등 키로 같은 집합은
-        억제). 판정·대장·카운터에는 손대지 않고, 어떤 실패도 게이트를 멈추지 않는다(fail-open). 반환 = 넣은 줄 수."""
+        """「스스로 해결」 — 이 부서의 열린 결함 집합이 **지난 배달 뒤 바뀌었을 때만** master 에게 한 줄
+        (RULINGS AD5 — 마지막 배달 키는 게이트 상태에). 판정·대장·카운터에는 손대지 않고, 어떤 실패도
+        게이트를 멈추지 않는다(fail-open). 반환 = 넣은 줄 수."""
         if shadow or self.defect_source is None:
             return 0
         try:
             ok, _lane, sigs = self.defect_source()
-            wake = open_defect_wake(sigs) if ok else None
+            if not ok:
+                return 0                                   # 읽지 못함 = 기억도 그대로
+            state_path = os.path.join(self.state_dir, OPEN_DEFECT_STATE_FILE)
+            last = None
+            try:
+                with open(state_path, encoding="utf-8") as f:
+                    doc = json.load(f)
+                if isinstance(doc, dict) and isinstance(doc.get("key"), str):
+                    last = doc["key"]
+            except (OSError, ValueError):
+                last = None
+            wake = open_defect_wake(sigs)
             if wake is None:
+                if last is not None:                      # 0건 — 다음에 열리는 집합은 변화다
+                    _write_json_atomic(state_path, {"key": None, "count": 0, "at": self.now_epoch_fn()})
                 return 0
             body, idem = wake
+            if idem == last:
+                return 0                                   # 같은 열린 집합 — 이미 배달함
             rc, _wid = self._enqueue("master", OPEN_DEFECT_TASK, body, idem, SEV_INFO)
             if rc != 0:
-                return 0
+                return 0                                   # 넣지 못함 = 다음 실행이 다시 시도
+            _write_json_atomic(state_path, {"key": idem, "count": len(sigs), "at": self.now_epoch_fn()})
             self.runner.drain("master")
             return 1
         except Exception:                                  # noqa: BLE001 — 부가 줄은 게이트를 멈추지 않는다
