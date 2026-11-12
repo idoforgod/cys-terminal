@@ -504,5 +504,50 @@ class M2MutationControls(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+
+class DeliveryPartCapRoom(unittest.TestCase):
+    """RULINGS AA2: 데몬의 조각 상한 핀(src/bin/cysd/delivery.rs `deployed_directive_payload_fits_part_cap_with_headroom`·
+    `deployed_ceo_directive_payload_fits_part_cap_with_headroom` · `MAX_PARTS` 4016 = 4배 여유로 1,004 제출단위)은
+    올리지 않는다. 트랙 T1a 의 역할 블록이 합성 문안에 최대 10 단위를 더하므로, 지침·틀은 블록 없이 **994 단위 이하**여야
+    한다. 단위 = 공백 정규화 뒤 비어 있지 않은 **고유** 줄(delivery.rs `submit_units` 와 같은 규칙). 구성은 그 두 핀과 같다:
+    역할 디렉티브(CEO 는 CEO_TEMPLATE) → RSI → soul.md → memory/MEMORY.md → 스킬 색인(`- name: description`)."""
+    ROLE_BLOCK_ROOM = 10
+    BAR = 4016 // 4
+
+    @staticmethod
+    def _units(text):
+        import re
+        seen = set()
+        for raw in re.split(r"[\n\r]", text):
+            n = " ".join(raw.split())
+            if n:
+                seen.add(n)
+        return len(seen)
+
+    def _tail(self):
+        pack = os.path.dirname(DIRECTIVES_DIR)
+        rd = lambda rel: (open(os.path.join(pack, rel), encoding="utf-8").read()
+                          if os.path.isfile(os.path.join(pack, rel)) else "")
+        t = rd("directives/RSI_LEARNING_DIRECTIVE.md") + rd("soul.md") + rd("memory/MEMORY.md")
+        sk = os.path.join(pack, "skills")
+        for e in (os.listdir(sk) if os.path.isdir(sk) else []):
+            try:
+                with open(os.path.join(sk, e, "SKILL.md"), encoding="utf-8") as fh:
+                    s = fh.read()
+            except OSError:
+                s = ""
+            head = s.splitlines()[:10]
+            field = lambda k: next((l[len(k):].strip() for l in head if l.startswith(k)), "")
+            if field("name:"):
+                t += "\n- %s: %s" % (field("name:"), field("description:"))
+        return rd, t
+
+    def test_ceo_and_master_axes_leave_room_for_the_role_block(self):
+        rd, tail = self._tail()
+        for axis, f in (("ceo", "directives/CEO_TEMPLATE.md"), ("master", "directives/MASTER_DIRECTIVE.md")):
+            units = self._units(rd(f) + tail)
+            self.assertLessEqual(units + self.ROLE_BLOCK_ROOM, self.BAR,
+                                 "%s 축 %d 단위 + 역할 블록 %d > %d (RULINGS AA2)" % (axis, units, self.ROLE_BLOCK_ROOM, self.BAR))
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
