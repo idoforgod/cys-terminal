@@ -3521,10 +3521,7 @@ fn smart_app_control_state() -> Option<&'static str> {
 /// · `{"failed": true, "from", "to", "at", "os", "sac"}`(설치되지 않았다 — 기록은 이 호출이 지웠다: 1회만 알린다).
 /// `CYS_UPDATE_VERIFY=0` 이면 늘 null. 판독·조회 실패는 전부 null — 이 기능 때문에 부팅이나 업데이트가 막히지 않는다.
 #[tauri::command]
-async fn update_attempt_report(app: AppHandle) -> Option<Value> {
-    // ★(0.15.0 · M16 · RULINGS AA3) 지난 업데이트의 앱 안쪽 수정 보관 알림 — 윈도우 확인 실행 경로는 설치기를 띄우고 곧바로 종료해 그 자리에서 알릴 수 없어
-    //   기록만 남겼다. 기동 때 한 번 보인다(보인 기록은 이름을 바꿔 다시 보이지 않는다). 시도 기록 판정과는 무관 — 노브(CYS_UPDATE_VERIFY)와 상관없이 돈다.
-    bundle_edits::show_pending_notices(&app);
+async fn update_attempt_report() -> Option<Value> {
     if !update_verify_from_env(cys::env_compat("CYS_UPDATE_VERIFY").as_deref()) {
         return None;
     }
@@ -8254,6 +8251,14 @@ where
 // ★(0.15.0 · 「스스로 해결」 M16 · 설계 §4-16 · C12 12.8) 업데이트 직전 앱 안쪽(동봉 런타임) 수정 보관 — 아래 두 업데이트 처리부가 부른다.
 mod bundle_edits;
 
+/// ★(0.15.0 · M16 · RULINGS AG3) 지난 업데이트의 앱 안쪽 수정 보관 알림 pull — 윈도우 확인 실행 경로는 설치기를 띄우고 곧바로 닫혀 그 자리에서
+/// 알릴 수 없어 보관소 안(`bundle-edits/.notices/`)에 기록만 남긴다. UI 가 `update-error` 리스너를 붙인 **뒤** 한 번 부르고 각 항목을 기존 토스트로
+/// 보인다. 넘겨준 기록은 그 순간 '보인 것'으로 이름이 바뀐다(다시 오지 않는다 · 지우지 않는다). 판독 실패는 빈 목록 — 부팅에 영향 없음.
+#[tauri::command]
+async fn bundle_edits_pending_notices() -> Vec<Value> {
+    tokio::task::spawn_blocking(bundle_edits::take_pending_notices_for_ui).await.unwrap_or_default()
+}
+
 /// 업데이트 다운로드·설치 후 데몬 핸드오프 + 재시작.
 /// force=false: 살아있는 세션이 있으면 설치 전에 거부(UI가 확인 후 force=true로 재호출).
 /// ★재배선(오너 2026-07-15): 본체 패치(인앱) 설치 경로 재활성화 — UI promptBinaryPatch가 호출한다
@@ -9105,6 +9110,8 @@ fn main() {
             check_pack_update,
             live_session_count,
             install_update,
+            // ★(0.15.0 · M16 · RULINGS AG3) 지난 업데이트의 앱 안쪽 수정 보관 알림 pull — UI 가 update-error 리스너를 붙인 뒤 한 번.
+            bundle_edits_pending_notices,
             // ★(0.14.43 · J2) 업데이트 미설치 알림 — 재시작 뒤 1회 판정 pull · 스마트 앱 컨트롤 상태 pull · 확인 실행 노브 pull(R1F-UA — 전부 읽기 전용).
             update_attempt_report,
             smart_app_control,

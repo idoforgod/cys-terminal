@@ -10380,6 +10380,19 @@ async function start() {
     const msg = typeof e.payload === "string" ? e.payload : "업데이트 후 처리 중 오류가 발생했습니다.";
     toast("health", "업데이트 경고", msg);
   });
+  // ★(0.15.0 · 「스스로 해결」 M16 · RULINGS AG3) 지난 업데이트의 앱 안쪽 수정 보관 알림 — 윈도우는 설치 프로그램을 띄우고 곧바로 닫혀 그 자리에서
+  //   못 알리고 보관소 안에 기록만 남긴다. 위 리스너가 붙은 **뒤** 한 번 당겨 기존 토스트로 보인다(넘겨받은 기록은 백엔드가 '보인 것'으로 바꾼다 —
+  //   다시 오지 않는다). 기다리지 않는다(부팅 무영향) · 실패는 조용히 무시한다(구 백엔드엔 명령이 없다).
+  void invoke("bundle_edits_pending_notices")
+    .then((list) => {
+      for (const raw of Array.isArray(list) ? list : []) {
+        const n = (raw ?? {}) as { warn?: unknown; title?: unknown; body?: unknown };
+        if (typeof n.title === "string" && typeof n.body === "string") toast(n.warn === true ? "health" : "watchdog", n.title, n.body);
+      }
+    })
+    .catch(() => {
+      /* 명령 부재(구 백엔드)·조회 실패 — 알림 없음 · 부팅 무영향 */
+    });
 
   // ★팀 기동 경고(적대검증 D-8): 마스터는 떴으나 cys boot가 팀(CSO·워커·리뷰어)을 못 세운 경우
   // (claude 미설치 등) 침묵하지 않고 안내 — 종전엔 실패를 삼켜 "팀 0개"를 사용자가 몰랐다.

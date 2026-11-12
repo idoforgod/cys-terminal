@@ -20,7 +20,9 @@
 //! * RULINGS AA3–AA6: below `cap + 2 GiB` free on the store volume nothing is copied (list only); an
 //!   identical earlier capture of the same version is not copied again (`same_as`); index entries
 //!   carry `kind`, `stored`, the scanned hash and the link target; files are opened without
-//!   following links; at the Windows place the notice is recorded and shown at the next app start.
+//!   following links; at the Windows place the notice is recorded inside the store
+//!   (`bundle-edits/.notices/`) and handed to the UI at the next app start (AG1–AG3). Nothing is
+//!   written outside `bundle-edits/`.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -59,10 +61,17 @@ pub(crate) const MAX_MANIFEST_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_INDEX_BYTES: u64 = 16 * 1024 * 1024;
 /// Largest pending-notice record read at start.
 const MAX_NOTICE_BYTES: u64 = 64 * 1024;
-/// `<local>/bundle-edits.pending-notice-<leaf>.json` — a notice still to be shown (RULINGS AA3).
-pub(crate) const PENDING_NOTICE_PREFIX: &str = "bundle-edits.pending-notice-";
-/// The same record after it was shown once (renamed, never deleted).
-pub(crate) const SHOWN_NOTICE_PREFIX: &str = "bundle-edits.shown-notice-";
+/// The one sub-folder of the store that holds notice records (RULINGS AG1: nothing is written outside
+/// `bundle-edits/`; the name starts with `.` so it never looks like a capture folder `<version>-<ts>`).
+pub(crate) const NOTICES_DIR: &str = ".notices";
+/// `bundle-edits/.notices/pending-<leaf>.json` — a notice still to be handed to the UI (RULINGS AA3, AG3).
+pub(crate) const PENDING_NOTICE_PREFIX: &str = "pending-";
+/// The same record once handed over (renamed, never deleted).
+pub(crate) const SHOWN_NOTICE_PREFIX: &str = "shown-";
+/// The record write at the Windows place has its own limit, taken out of the grace (RULINGS AG2): the
+/// capture waits at most `CAPTURE_DEADLINE + JOIN_GRACE - RECORD_LIMIT`, the write at most `RECORD_LIMIT`
+/// — 40 s in all, never an unlimited wait before `write_installer`.
+pub(crate) const RECORD_LIMIT: Duration = Duration::from_secs(2);
 
 /// The sentence every failure notice ends with (design §1-6 결정 19, limit 11).
 const NOTICE_TAIL_KO: &str =
@@ -513,14 +522,16 @@ pub(crate) enum CaptureOutcome {
     Undecidable { reason: String, stats: Stats },
 }
 
-/// One record of `index.json` (O-C12-3 as extended by RULINGS AA5): `kind` = "file" | "link" |
-/// "special"; `stored` = the bytes (or the link) are in THIS capture folder; `sha256_found` = the
-/// scanned hash of every file present at capture time (`null` for a file = deleted); `link_target`
-/// = the target of a link present at capture time (`null` otherwise).
+/// One record of `index.json` (O-C12-3 as extended by RULINGS AA5 and AG4): `kind` = "file" | "link" |
+/// "special"; `present` = the entry existed at capture time (`false` = deleted — this field, never an
+/// empty hash, says "deleted"); `stored` = the bytes (or the link) are in THIS capture folder;
+/// `sha256_found` = the scanned hash of a present file (`null` for links, special files and deleted
+/// entries); `link_target` = the target of a present link (`null` otherwise).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct IndexRecord {
     rel: String,
     kind: &'static str,
+    present: bool,
     stored: bool,
     sha256_manifest: Option<String>,
     sha256_found: Option<String>,
@@ -715,6 +726,7 @@ fn write_index(dir: &Path, input: &CaptureInput, records: &[IndexRecord], same_a
             json!({
                 "rel": r.rel,
                 "kind": r.kind,
+                "present": r.present,
                 "stored": r.stored,
                 "sha256_manifest": r.sha256_manifest,
                 "sha256_found": r.sha256_found,
@@ -744,12 +756,13 @@ fn write_index(dir: &Path, input: &CaptureInput, records: &[IndexRecord], same_a
     std::fs::rename(&tmp, &fin).map_err(|e| format!("{}: {e}", fin.display()))
 }
 
-/// The identity of an edit set for "already kept" (RULINGS AA4): path, kind, scanned hash, link
-/// target of every entry, sorted.
-fn edit_set(records: &[IndexRecord]) -> Vec<(String, String, Option<String>, Option<String>)> {
-    let mut v: Vec<_> = records
+/// The identity of an edit set for "already kept" (RULINGS AA4): path, kind, presence, scanned hash,
+/// link target of every entry, sorted.
+type EditKey = (String, String, bool, Option<String>, Option<String>);
+fn edit_set(records: &[IndexRecord]) -> Vec<EditKey> {
+    let mut v: Vec<EditKey> = records
         .iter()
-        .map(|r| (r.rel.clone(), r.kind.to_string(), r.sha256_found.clone(), r.link_target.clone()))
+        .map(|r| (r.rel.clone(), r.kind.to_string(), r.present, r.sha256_found.clone(), r.link_target.clone()))
         .collect();
     v.sort();
     v
@@ -792,13 +805,14 @@ fn find_same_capture(input: &CaptureInput, records: &[IndexRecord], budget: &Bud
         let mut theirs = Vec::with_capacity(files.len());
         let mut holds_all = true;
         for f in files {
-            let (Some(rel), Some(kind), Some(stored)) = (f["rel"].as_str(), f["kind"].as_str(), f["stored"].as_bool()) else {
+            let (Some(rel), Some(kind), Some(present), Some(stored)) =
+                (f["rel"].as_str(), f["kind"].as_str(), f["present"].as_bool(), f["stored"].as_bool())
+            else {
                 holds_all = false;
                 break;
             };
             let sha = f["sha256_found"].as_str().map(str::to_string);
             let target = f["link_target"].as_str().map(str::to_string);
-            let present = sha.is_some() || target.is_some() || kind == "special";
             if present {
                 let on_disk = rel
                     .split('/')
@@ -808,7 +822,7 @@ fn find_same_capture(input: &CaptureInput, records: &[IndexRecord], budget: &Bud
                     break;
                 }
             }
-            theirs.push((rel.to_string(), kind.to_string(), sha, target));
+            theirs.push((rel.to_string(), kind.to_string(), present, sha, target));
         }
         theirs.sort();
         if holds_all && theirs == want {
@@ -920,6 +934,7 @@ pub(crate) fn capture(input: &CaptureInput, abandon: &AtomicBool) -> CaptureOutc
             IndexRecord {
                 rel: format!("{RUNTIME_DIR}/{rel}"),
                 kind,
+                present: have.contains_key(*rel),
                 stored: false,
                 sha256_manifest,
                 sha256_found,
@@ -1143,13 +1158,13 @@ pub(crate) fn log_line(o: &CaptureOutcome) -> String {
 
 // ───────────────────────────── the notice that must outlive the app (RULINGS AA3) ─────────────────────────────
 
-/// Where pending notices live: the local area that holds the store (`~/.cys/local`, the parent of
-/// `bundle-edits/`), so a notice can be recorded even when the store itself cannot be created.
+/// Where notice records live: INSIDE the store, `bundle-edits/.notices/` (RULINGS AG1). When the store
+/// cannot be created (a plain file in its place) no record is written — the caller says why on stderr.
 pub(crate) fn notice_dir_of(store_parent: &Path) -> PathBuf {
-    store_parent.parent().map(Path::to_path_buf).unwrap_or_else(|| store_parent.to_path_buf())
+    store_parent.join(NOTICES_DIR)
 }
 
-/// `<local>/bundle-edits.pending-notice-<leaf>.json` — one write-once record per capture.
+/// `bundle-edits/.notices/pending-<leaf>.json` — one write-once record per capture.
 pub(crate) fn pending_notice_path(notice_dir: &Path, leaf: &str) -> PathBuf {
     notice_dir.join(format!("{PENDING_NOTICE_PREFIX}{leaf}.json"))
 }
@@ -1172,9 +1187,9 @@ pub(crate) fn record_pending_notice(notice_dir: &Path, leaf: &str, notice: &Noti
     Ok(path)
 }
 
-/// Takes every pending notice ONCE: each record is renamed to `bundle-edits.shown-notice-<leaf>.json`
-/// BEFORE it is returned (a record that cannot be renamed is not returned, so it can never be shown
-/// twice); unreadable or malformed records are left alone. Nothing is deleted.
+/// Takes every pending notice ONCE: each record is renamed to `shown-<leaf>.json` BEFORE it is
+/// returned (a record that cannot be renamed is not returned, so it can never be handed over twice);
+/// unreadable or malformed records are left alone. Nothing is deleted.
 pub(crate) fn take_pending_notices(notice_dir: &Path) -> Vec<Notice> {
     let Ok(listing) = std::fs::read_dir(notice_dir) else {
         return Vec::new();
@@ -1237,6 +1252,19 @@ where
     }
 }
 
+/// Runs blocking `work` on the blocking pool and waits at most `limit` (`None` on expiry or a panic —
+/// the caller goes on; the worker is left to finish or die with the process).
+pub(crate) async fn bounded_blocking<T, F>(limit: Duration, work: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    match tokio::time::timeout(limit, tokio::task::spawn_blocking(work)).await {
+        Ok(Ok(value)) => Some(value),
+        _ => None,
+    }
+}
+
 /// Shows a notice now: for a warning the existing in-app `update-error` toast ("업데이트 경고"), for every
 /// notice an OS notification through the notification plugin already registered by the app. Each
 /// channel is best effort and cannot fail the update.
@@ -1252,38 +1280,47 @@ fn deliver_notice(app: &tauri::AppHandle, n: &Notice) {
 /// THE call of the update handler (both places). Returns when the capture is done, cut off or
 /// failed — never an error: the update goes on in every case. The notice is told exactly once: at
 /// the macOS place now; at the Windows place the handler leaves the process right after (write →
-/// launch → exit) before any banner task could run, so it is recorded and shown at the next start
-/// (RULINGS AA3).
+/// launch → exit) before any banner task could run, so it is recorded inside the store and handed to
+/// the UI at the next start (RULINGS AA3, AG1–AG3). The whole call waits at most
+/// `CAPTURE_DEADLINE + JOIN_GRACE` (40 s): at the Windows place the record write's own limit is taken
+/// out of the grace.
 pub(crate) async fn capture_before_install(app: &tauri::AppHandle, to_version: &str, site: Site) {
     if !site_applies(cfg!(target_os = "macos"), site) {
         return;
     }
     let input = CaptureInput::for_this_app(to_version);
     let (notice_dir, leaf) = (notice_dir_of(&input.store_parent), input.leaf.clone());
-    let outcome = run_bounded_with(input, JOIN_GRACE, capture).await;
+    let grace = match site {
+        Site::CheckedLaunch => JOIN_GRACE - RECORD_LIMIT,
+        Site::SingleCall => JOIN_GRACE,
+    };
+    let outcome = run_bounded_with(input, grace, capture).await;
     eprintln!("[cys-app] {}", log_line(&outcome));
     let Some(notice) = notice_ko(&outcome) else {
         return;
     };
     match site {
         Site::CheckedLaunch => {
-            if let Err(e) = record_pending_notice(&notice_dir, &leaf, &notice) {
-                eprintln!("[cys-app] bundle-edits: pending notice not recorded ({e})");
+            match bounded_blocking(RECORD_LIMIT, move || record_pending_notice(&notice_dir, &leaf, &notice)).await {
+                Some(Ok(_)) => {}
+                Some(Err(e)) => eprintln!("[cys-app] bundle-edits: notice not recorded ({e})"),
+                None => eprintln!("[cys-app] bundle-edits: notice not recorded (no answer within {} s)", RECORD_LIMIT.as_secs()),
             }
         }
         Site::SingleCall => deliver_notice(app, &notice),
     }
 }
 
-/// At app start (from `update_attempt_report`, the place that already reads the update-attempt
-/// record): shows each pending notice once (RULINGS AA3).
-pub(crate) fn show_pending_notices(app: &tauri::AppHandle) {
+/// The start-time pull (`bundle_edits_pending_notices`, called by the UI after it registered its
+/// listeners — RULINGS AG3): every pending record of the store, each `{warn, title, body}`, handed over
+/// once (renamed before it is returned).
+pub(crate) fn take_pending_notices_for_ui() -> Vec<Value> {
     let store = cys::repair::paths::bundle_edits_dir("0", "0");
     let store_parent = store.parent().map(Path::to_path_buf).unwrap_or(store);
-    for n in take_pending_notices(&notice_dir_of(&store_parent)) {
-        eprintln!("[cys-app] bundle-edits: showing the notice recorded at the last update");
-        deliver_notice(app, &n);
-    }
+    take_pending_notices(&notice_dir_of(&store_parent))
+        .into_iter()
+        .map(|n| json!({"warn": n.warn, "title": n.title, "body": n.body}))
+        .collect()
 }
 
 #[cfg(test)]
@@ -1666,8 +1703,13 @@ mod tests {
             deadline: Duration::from_secs(120),
             max_bytes: MAX_CAPTURE_BYTES,
             free_floor: MAX_CAPTURE_BYTES + FREE_SPACE_MARGIN,
-            free_space: store_free_space,
+            free_space: plenty, // AG4: a stub by default — no test depends on the temp volume's real free space
         }
+    }
+
+    /// The default free-space stub: always far above the floor.
+    fn plenty(_: &Path) -> Option<u64> {
+        Some(1 << 50)
     }
 
     /// Every entry under `root` (no exclusion), to prove a tree was not touched.
@@ -1746,7 +1788,7 @@ mod tests {
         );
         let man = &c["manifest_entries"];
         for f in files {
-            assert_eq!(f.as_object().unwrap().len(), 6, "{f}: {{rel, kind, stored, sha256_manifest, sha256_found, link_target}} (AA5)");
+            assert_eq!(f.as_object().unwrap().len(), 7, "{f}: {{rel, kind, present, stored, sha256_manifest, sha256_found, link_target}} (AA5, AG4)");
             let rel = f["rel"].as_str().unwrap().strip_prefix("runtime/").unwrap();
             let expect_manifest = man.get(rel).map(|e| e["sha256"].clone()).unwrap_or(Value::Null);
             assert_eq!(f["sha256_manifest"], expect_manifest, "{rel}");
@@ -1757,6 +1799,7 @@ mod tests {
             let expect_found = if present { Value::String(sha_of(&src)) } else { Value::Null };
             assert_eq!(f["sha256_found"], expect_found, "{rel}: the scanned hash for a present file, null only for a deleted one");
             assert_eq!(f["stored"], present, "{rel}: every present edit kept, the deleted one not");
+            assert_eq!(f["present"], present, "{rel}: `present` says deleted (AG4)");
         }
         assert_eq!(snapshot(&top), before, "{layout}: the capture changed the bundle");
         assert_eq!(listing(&t.path().join("home")), listing(&store).iter().map(|r| format!(".cys/local/bundle-edits/{r}")).collect::<Vec<_>>(), "nothing written outside the store");
@@ -1847,7 +1890,8 @@ mod tests {
         assert!(!store.exists());
     }
 
-    /// The byte cap: edits beyond it are listed with `sha256_found: null`, the rest is kept, one notice.
+    /// The byte cap: edits beyond it are listed with `stored: false` (still `present: true` with their
+    /// scanned hash), the rest is kept, one notice.
     #[test]
     fn byte_cap_lists_what_it_did_not_copy() {
         let t = Tmp::new("cap");
@@ -1864,6 +1908,7 @@ mod tests {
         let found: BTreeMap<&str, bool> = index["files"].as_array().unwrap().iter().map(|f| (f["rel"].as_str().unwrap(), f["stored"].as_bool().unwrap())).collect();
         for f in index["files"].as_array().unwrap() {
             let deleted = f["rel"] == "runtime/python/lib/mod.py";
+            assert_eq!(f["present"], !deleted, "{f}");
             assert_eq!(f["sha256_found"].is_null(), deleted, "{f}: a present file always carries its scanned hash, kept or not (AA5)");
         }
         assert_eq!(found["runtime/node/lib/node_modules/@user/tool/index.js"], true);
@@ -2074,7 +2119,7 @@ mod tests {
     fn the_capture_has_no_other_caller() {
         let code: String = main_prod().lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
         assert_eq!(code.matches("capture_before_install(").count(), 2, "the capture is called from the two handler places only");
-        assert_eq!(code.matches("show_pending_notices(").count(), 1, "pending notices are shown from one place (the attempt report)");
+        assert_eq!(code.matches("bundle_edits::take_pending_notices_for_ui").count(), 1, "pending notices are pulled through one command (AG3)");
         assert_eq!(code.matches("bundle_edits::").count(), 5);
         assert_eq!(code.matches("\nmod bundle_edits;\n").count(), 1);
         for other in [include_str!("feedback.rs"), include_str!("close_surface_tests.rs")] {
@@ -2139,18 +2184,20 @@ mod tests {
         None
     }
 
+    fn one_gib(_: &Path) -> Option<u64> {
+        Some(1 << 30)
+    }
+
     /// AA4: below the floor (cap + 2 GiB) — or when the free space cannot be measured — nothing is
     /// copied, the edits are listed, one notice; the update goes on.
     #[test]
     fn low_free_space_copies_nothing_and_lists_the_edits() {
-        let cases: [(&str, u64, fn(&Path) -> Option<u64>); 2] =
-            [("below the floor", u64::MAX, store_free_space), ("unmeasurable", 0, unmeasurable)];
-        for (label, floor, measure) in cases {
+        let cases: [(&str, fn(&Path) -> Option<u64>); 2] = [("below the floor (1 GiB free)", one_gib), ("unmeasurable", unmeasurable)];
+        for (label, measure) in cases {
             let t = Tmp::new("lowspace");
             let (exe, _res, _top) = fixture_install(t.path(), "mac");
             let mut input = input_for(&exe, &t.path().join("store"));
-            input.free_floor = floor;
-            input.free_space = measure;
+            input.free_space = measure; // the production floor (cap + 2 GiB) stays
             let o = capture(&input, &AtomicBool::new(false));
             let CaptureOutcome::Incomplete { dir: Some(dir), edits: 5, not_stored: 4, reason, .. } = &o else {
                 panic!("{label}: {o:?}");
@@ -2164,6 +2211,27 @@ mod tests {
             let n = notice_ko(&o).unwrap();
             assert!(n.warn && n.body.contains("업데이트는 그대로 진행합니다") && n.body.contains("목록만 남김"), "{label}: {}", n.body);
         }
+    }
+
+    static SEEN: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+    fn recording(p: &Path) -> Option<u64> {
+        SEEN.lock().unwrap().push(p.to_path_buf());
+        Some(1 << 50)
+    }
+
+    /// AG4: the free-space query is asked about the STORE (where the copies go), never the runtime.
+    #[test]
+    fn the_free_space_query_receives_the_store_path() {
+        let t = Tmp::new("freepath");
+        let (exe, res, _top) = fixture_install(t.path(), "mac");
+        let store = t.path().join("home").join(".cys").join("local").join("bundle-edits");
+        let mut input = input_for(&exe, &store);
+        input.free_space = recording;
+        SEEN.lock().unwrap().clear();
+        assert!(matches!(capture(&input, &AtomicBool::new(false)), CaptureOutcome::Captured { .. }));
+        let seen = SEEN.lock().unwrap().clone();
+        assert_eq!(seen, vec![store.clone()], "asked exactly once, about the store");
+        assert!(!seen[0].starts_with(res.join(RUNTIME_DIR)));
     }
 
     #[test]
@@ -2255,6 +2323,7 @@ mod tests {
                 for (rel, target) in [("dangling", "nowhere"), ("git/libexec/git-add", "git2")] {
                     let f = get(rel);
                     assert_eq!((f["kind"].as_str(), f["stored"].as_bool(), f["link_target"].as_str()), (Some("link"), Some(true), Some(target)), "{f}");
+                    assert_eq!(f["present"], true, "a link has no hash — `present` says it exists (AG4)");
                     assert!(f["sha256_found"].is_null());
                     assert_eq!(std::fs::read_link(join_rel(&dir, &format!("runtime/{rel}"))).unwrap(), PathBuf::from(target), "kept as a link");
                 }
@@ -2267,7 +2336,7 @@ mod tests {
             } else {
                 for rel in ["pipe0", "pipe1"] {
                     let f = get(rel);
-                    assert_eq!((f["kind"].as_str(), f["stored"].as_bool()), (Some("special"), Some(false)), "{f}");
+                    assert_eq!((f["kind"].as_str(), f["stored"].as_bool(), f["present"].as_bool()), (Some("special"), Some(false), Some(true)), "{f}");
                     assert!(f["sha256_found"].is_null() && f["link_target"].is_null());
                 }
                 let nested = get("sub/runtime-manifest.json");
@@ -2317,71 +2386,108 @@ mod tests {
         }
     }
 
-    // ───────── RULINGS AA3: the Windows notice is shown at the next start ─────────
+    // ───────── RULINGS AA3 / AG1–AG3: the Windows notice, recorded inside the store, pulled by the UI ─────────
 
     #[test]
-    fn a_pending_notice_is_written_once_and_shown_once() {
+    fn a_pending_notice_is_written_once_and_handed_over_once() {
         let t = Tmp::new("pending");
-        let local = t.path().join("local");
+        let store = t.path().join("local").join("bundle-edits");
+        let notices = notice_dir_of(&store);
         let n = Notice { warn: true, title: "앱 안쪽 수정 보관 실패".into(), body: "업데이트는 그대로 진행합니다".into() };
-        let p = record_pending_notice(&local, LEAF, &n).unwrap();
-        assert_eq!(p, local.join(format!("bundle-edits.pending-notice-{LEAF}.json")));
+        let p = record_pending_notice(&notices, LEAF, &n).unwrap();
+        assert_eq!(p, store.join(".notices").join(format!("pending-{LEAF}.json")), "inside the store (AG1)");
         let later = Notice { warn: false, title: "x".into(), body: "y".into() };
-        assert!(record_pending_notice(&local, LEAF, &later).is_err(), "write-once: an existing record is never overwritten");
-        assert_eq!(take_pending_notices(&local), vec![n.clone()]);
-        assert!(take_pending_notices(&local).is_empty(), "shown once");
-        assert!(!p.exists() && local.join(format!("bundle-edits.shown-notice-{LEAF}.json")).exists(), "renamed, not deleted");
-        std::fs::write(local.join("bundle-edits.pending-notice-bad.json"), b"{").unwrap();
-        assert!(take_pending_notices(&local).is_empty(), "a malformed record is never shown");
-        assert!(local.join("bundle-edits.pending-notice-bad.json").exists(), "and left alone");
-        // C-p18-06 at the Windows place: the store is blocked by a plain file, the notice is still recorded beside it
-        let t2 = Tmp::new("pending-blocked");
-        let (exe, _res, _top) = fixture_install(t2.path(), "win");
-        let loc = t2.path().join("home").join(".cys").join("local");
-        std::fs::create_dir_all(&loc).unwrap();
-        std::fs::write(loc.join("bundle-edits"), b"a plain file").unwrap();
-        let input = input_for(&exe, &loc.join("bundle-edits"));
-        let o = capture(&input, &AtomicBool::new(false));
-        let n = notice_ko(&o).unwrap();
-        assert_eq!(notice_dir_of(&input.store_parent), loc);
-        record_pending_notice(&notice_dir_of(&input.store_parent), &input.leaf, &n).unwrap();
-        assert_eq!(take_pending_notices(&loc), vec![n]);
+        assert!(record_pending_notice(&notices, LEAF, &later).is_err(), "write-once: an existing record is never overwritten");
+        assert_eq!(take_pending_notices(&notices), vec![n.clone()]);
+        assert!(take_pending_notices(&notices).is_empty(), "handed over once");
+        assert!(!p.exists() && notices.join(format!("shown-{LEAF}.json")).exists(), "renamed, not deleted");
+        std::fs::write(notices.join("pending-bad.json"), b"{").unwrap();
+        assert!(take_pending_notices(&notices).is_empty(), "a malformed record is never handed over");
+        assert!(notices.join("pending-bad.json").exists(), "and left alone");
+        assert_eq!(listing(&t.path().join("local")).iter().filter(|r| !r.starts_with("bundle-edits/")).count(), 0, "nothing outside the store");
+    }
+
+    /// AG1: when the store cannot be created (C-p18-06: a plain file in its place) no record is written
+    /// anywhere — nothing beside the store either.
+    #[test]
+    fn a_blocked_store_gets_no_notice_record_anywhere() {
+        let t = Tmp::new("pending-blocked");
+        let (exe, _res, _top) = fixture_install(t.path(), "win");
+        let local = t.path().join("home").join(".cys").join("local");
+        std::fs::create_dir_all(&local).unwrap();
+        let blocker = local.join("bundle-edits");
+        std::fs::write(&blocker, b"a plain file").unwrap();
+        let input = input_for(&exe, &blocker);
+        let n = notice_ko(&capture(&input, &AtomicBool::new(false))).unwrap();
+        assert!(record_pending_notice(&notice_dir_of(&input.store_parent), &input.leaf, &n).is_err());
+        assert_eq!(listing(&local), vec!["bundle-edits".to_string()], "only the blocking file — nothing written");
+        assert_eq!(std::fs::read(&blocker).unwrap(), b"a plain file");
     }
 
     #[test]
-    fn the_notice_directory_is_the_local_area() {
+    fn the_notice_records_live_inside_the_store() {
         let store = cys::repair::paths::bundle_edits_dir("0", "0");
-        assert_eq!(notice_dir_of(store.parent().unwrap()), cys::pack::local_dir());
+        let store_parent = store.parent().unwrap();
+        assert_eq!(notice_dir_of(store_parent), store_parent.join(".notices"));
+        assert!(notice_dir_of(store_parent).starts_with(store_parent), "AG1: nothing outside bundle-edits/");
+        assert!(!NOTICES_DIR.contains('-'), "never mistaken for a capture folder <version>-<ts>");
     }
 
-    /// AA3 / AA6: `capture_before_install` checks the site with `site_applies(cfg!(target_os = "macos"), site)`
-    /// and tells the notice exactly once — recorded for the next start at the Windows place, delivered at
-    /// the macOS place.
+    /// AG2: the record write at the Windows place has its own limit (taken out of the grace) — the whole
+    /// call never waits longer than 40 s, and a stuck write does not hold the caller.
+    #[test]
+    fn the_notice_write_is_bounded_inside_the_40_seconds() {
+        assert_eq!(CAPTURE_DEADLINE + (JOIN_GRACE - RECORD_LIMIT) + RECORD_LIMIT, Duration::from_secs(40));
+        assert!(RECORD_LIMIT < JOIN_GRACE);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let started = Instant::now();
+        let stuck = rt.block_on(bounded_blocking(Duration::from_millis(100), || std::thread::sleep(Duration::from_secs(3))));
+        assert_eq!(stuck, None);
+        assert!(started.elapsed() < Duration::from_secs(2), "the caller was held {:?}", started.elapsed());
+        assert_eq!(rt.block_on(bounded_blocking(Duration::from_secs(5), || 7)), Some(7));
+        rt.shutdown_background();
+    }
+
+    /// AA3 / AA6 / AG2: `capture_before_install` checks the site with `site_applies(cfg!(target_os = "macos"), site)`
+    /// and tells the notice exactly once — recorded under `RECORD_LIMIT` at the Windows place (whose capture
+    /// grace is shortened by that limit), delivered at the macOS place.
     #[test]
     fn capture_before_install_checks_the_site_and_tells_exactly_once() {
         let src = include_str!("bundle_edits.rs");
         let prod = &src[..src.find("#[cfg(test)]\nmod tests {").unwrap()];
         let f = fn_code(prod, "pub(crate) async fn capture_before_install(");
         assert!(f.contains("    if !site_applies(cfg!(target_os = \"macos\"), site) {\n        return;\n    }"), "{f}");
+        assert!(f.contains("        Site::CheckedLaunch => JOIN_GRACE - RECORD_LIMIT,\n        Site::SingleCall => JOIN_GRACE,"), "{f}");
+        assert!(f.contains("    let outcome = run_bounded_with(input, grace, capture).await;"), "{f}");
         assert_eq!(f.matches("deliver_notice(").count(), 1, "{f}");
         assert_eq!(f.matches("record_pending_notice(").count(), 1, "{f}");
-        assert!(f.contains("        Site::CheckedLaunch => {\n            if let Err(e) = record_pending_notice(&notice_dir, &leaf, &notice) {"), "{f}");
+        assert!(
+            f.contains("            match bounded_blocking(RECORD_LIMIT, move || record_pending_notice(&notice_dir, &leaf, &notice)).await {"),
+            "the record write runs on the blocking pool under its own limit (AG2): {f}"
+        );
         assert!(f.contains("        Site::SingleCall => deliver_notice(app, &notice),"), "{f}");
-        for banned in ["loop", "for ", "while "] {
+        for banned in ["loop", "for ", "while ", "std::fs::"] {
             assert!(!f.contains(banned), "`{banned}` in capture_before_install");
         }
-        assert_eq!(prod.matches("deliver_notice(").count(), 3, "defined once, called by capture_before_install and show_pending_notices");
+        assert_eq!(prod.matches("deliver_notice(").count(), 2, "defined once, called by capture_before_install only");
     }
 
-    /// AA3: the start-time display sits in `update_attempt_report` (the place that already reads the
-    /// update-attempt record at start) — once, before the attempt-record knob.
+    /// AG3: `update_attempt_report` is exactly its v0.14.56 form again (its J2 pins and doc comment true), and
+    /// the pending notices come through their own command, registered, which the UI calls once AFTER it
+    /// registered its `update-error` listener (the UI side is pinned by `ui/src/bundleeditsnotice.test.ts`).
     #[test]
-    fn the_attempt_report_shows_pending_notices_once_before_its_knob() {
-        let report = fn_code(main_prod(), "async fn update_attempt_report(");
-        assert!(report.starts_with("async fn update_attempt_report(app: AppHandle) -> Option<Value> {"), "{report}");
-        assert_eq!(report.matches("bundle_edits::show_pending_notices(&app);").count(), 1);
-        let show = report.find("bundle_edits::show_pending_notices(&app);").unwrap();
-        assert!(show < report.find("update_verify_from_env(").unwrap());
+    fn the_pending_notices_have_their_own_command_and_the_attempt_report_is_untouched() {
+        let prod = main_prod();
+        let v0_14_56 = "#[tauri::command]\nasync fn update_attempt_report() -> Option<Value> {\n    if !update_verify_from_env(cys::env_compat(\"CYS_UPDATE_VERIFY\").as_deref()) {\n        return None;\n    }\n    tokio::task::spawn_blocking(|| {\n        update_attempt_report_at(\n            &update_attempt_path(),\n            env!(\"CARGO_PKG_VERSION\"),\n            unix_now_secs(),\n            std::env::consts::OS,\n            smart_app_control_state,\n        )\n    })\n    .await\n    .ok()\n    .flatten()\n}\n";
+        assert_eq!(prod.matches(v0_14_56).count(), 1, "update_attempt_report differs from v0.14.56");
+        assert!(prod.contains("#[tauri::command]\nasync fn bundle_edits_pending_notices() -> Vec<Value> {\n    tokio::task::spawn_blocking(bundle_edits::take_pending_notices_for_ui).await.unwrap_or_default()\n}\n"));
+        let i = prod.find("tauri::generate_handler![").unwrap();
+        let reg = &prod[i..i + prod[i..].find("\n        ])").unwrap()];
+        assert_eq!(reg.lines().filter(|l| l.trim() == "bundle_edits_pending_notices,").count(), 1, "registered once");
+        let ui = include_str!("../../ui/src/main.ts");
+        assert_eq!(ui.matches("invoke(\"bundle_edits_pending_notices\")").count(), 1, "the UI pulls once");
+        let listener = ui.find("await listen(\"update-error\"").expect("the update-error listener");
+        assert!(listener < ui.find("invoke(\"bundle_edits_pending_notices\")").unwrap(), "the pull comes after the listener registration");
     }
 
     // ───────── the installer byte identity (RULINGS D5 · pass condition I) ─────────
