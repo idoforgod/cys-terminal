@@ -794,8 +794,9 @@ pub(crate) fn notice_ko(o: &CaptureOutcome) -> Option<Notice> {
             warn: false,
             title: "앱 안쪽 수정 보관",
             body: format!(
-                "업데이트 전에 앱 안쪽에서 바뀐 파일 {edits}개(고침·추가·삭제)를 찾아 {} 에 보관했습니다(목록: {INDEX_FILE}). \
-                 업데이트는 그대로 진행합니다. 새 버전에 다시 입히려면 마스터에게 맡기세요 — 워커가 확인한 뒤 다시 입힙니다.",
+                "업데이트 전에 앱 안쪽에서 바뀐 파일 {edits}개(고침·추가·삭제)를 찾아, 남아 있는 파일은 {} 에 복사하고 \
+                 전부를 목록({INDEX_FILE})에 적었습니다. 업데이트는 그대로 진행합니다. 새 버전에 다시 입히려면 마스터에게 \
+                 맡기세요 — 워커가 확인한 뒤 다시 입힙니다.",
                 dir.display()
             ),
         }),
@@ -1348,6 +1349,8 @@ mod tests {
                 "{layout}: {rel} not byte-exact"
             );
         }
+        let memo = std::fs::read(join_rel(&dir.join(RUNTIME_DIR), "python/lib/홍길동 메모.txt")).unwrap();
+        assert!(memo.starts_with(&[0xEF, 0xBB, 0xBF]) && memo.ends_with(b"\r\n"), "{layout}: BOM and CRLF must be kept byte for byte (A-3 #22, #24)");
         let mut want: Vec<String> = kept.iter().map(|r| format!("runtime/{r}")).collect();
         want.push(INDEX_FILE.to_string());
         want.sort();
@@ -1469,7 +1472,7 @@ mod tests {
         let (exe, _res, _top) = fixture_install(t.path(), "win");
         let store = t.path().join("store");
         let mut input = input_for(&exe, &store);
-        input.max_bytes = 30; // index.js 20 B kept · notes 46 B over · site.py 30 B over (20+30) · 홍길동 메모 7 B kept
+        input.max_bytes = 40; // index.js 20 B kept (20) · notes 46 B over (66) · site.py 30 B over (50) · 홍길동 메모 17 B kept (37)
         let o = capture(&input, &AtomicBool::new(false));
         let CaptureOutcome::Incomplete { dir: Some(dir), edits: 5, not_stored: 2, reason, .. } = &o else {
             panic!("{o:?}");
@@ -1647,13 +1650,12 @@ mod tests {
         seg.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n")
     }
 
-    /// ★C12 12.8 / design §4-16: the capture is called exactly once in each handler, at the designed
-    /// place, as a plain `.await;` statement (no `?`, no `return`, no condition — the update goes on
-    /// whatever it returns), and from nowhere else in the app (no installer route can reach it).
+    /// ★C12 12.8 / design §4-16 (macOS place): `install_update` calls the capture exactly once, as the only statement
+    /// between the Windows branch and the single download-and-install call, as a plain `.await;` statement (no `?`, no
+    /// `return`, no condition — the update goes on whatever it returns), after the J2 attempt record.
     #[test]
-    fn update_handlers_call_the_capture_at_the_designed_places() {
-        let prod = main_prod();
-        let install = fn_code(prod, "async fn install_update(");
+    fn install_update_captures_right_before_the_single_call() {
+        let install = fn_code(main_prod(), "async fn install_update(");
         let call_mac = "bundle_edits::capture_before_install(&app, &update.version, bundle_edits::Site::SingleCall).await;";
         assert_eq!(install.matches("capture_before_install(").count(), 1);
         let branch_end = "        return install_update_checked_windows(&app, &update, &attempt_path, verify_on).await;\n    }\n";
@@ -1661,8 +1663,14 @@ mod tests {
         let (b, o) = (install.find(branch_end).expect("the Windows branch") + branch_end.len(), install.find(old).expect("the single call"));
         assert_eq!(install[b..o].trim(), call_mac, "between the Windows branch and the single download-and-install call there must be exactly the capture call");
         assert!(install.find("write_update_attempt_at(").unwrap() < b, "the J2 attempt record stays before the capture");
+    }
 
-        let win = fn_code(prod, "async fn install_update_checked_windows(");
+    /// ★C12 12.8 / design §4-16 (Windows place): inside the Windows body of `install_update_checked_windows`, after the
+    /// download and after the non-installer branch, the capture is the only statement before the installer file is
+    /// written (so it can never come after the launch or change the attempt record) — a plain `.await;` statement.
+    #[test]
+    fn checked_launch_captures_before_the_installer_is_written() {
+        let win = fn_code(main_prod(), "async fn install_update_checked_windows(");
         let call_win = "bundle_edits::capture_before_install(app, &update.version, bundle_edits::Site::CheckedLaunch).await;";
         assert_eq!(win.matches("capture_before_install(").count(), 1);
         let body_win = win.find("    #[cfg(windows)]\n    {\n").expect("Windows body");
@@ -1670,9 +1678,15 @@ mod tests {
         let non_installer_end = win.find("            return Ok(());\n        }\n").expect("the non-installer branch") + "            return Ok(());\n        }\n".len();
         let write = win.find("        let file = match cys::update_launch::write_installer(").expect("write_installer");
         assert_eq!(win[non_installer_end..write].trim(), call_win, "between the non-installer branch and write_installer there must be exactly the capture call");
-        assert!(body_win < win.find(".download(").unwrap() && win.find(".download(").unwrap() < non_installer_end && write < body_other);
+        let download = win.find(".download(").expect("download");
+        assert!(body_win < download && download < non_installer_end && write < body_other);
+    }
 
-        let code: String = prod.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+    /// C-p18-07/08: no other production code calls the capture — the two handler places are the only callers, so no
+    /// installer route and no other update path can reach it.
+    #[test]
+    fn the_capture_has_no_other_caller() {
+        let code: String = main_prod().lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
         assert_eq!(code.matches("capture_before_install(").count(), 2, "the capture is called from the two handler places only");
         assert_eq!(code.matches("bundle_edits::").count(), 4);
         assert_eq!(code.matches("\nmod bundle_edits;\n").count(), 1);
@@ -1731,12 +1745,12 @@ mod tests {
 
     // ───────── the installer byte identity (RULINGS D5 · pass condition I) ─────────
 
-    /// ★RULINGS D5 / design §4-16 / pass condition I: 0.15.0 does not change the Windows installer.
-    /// `src-tauri/nsis-hooks.nsh` = git blob 6493613d… (CRLF→LF as git's `text eol=crlf` stores it) and
-    /// `src-tauri/tauri.windows.conf.json` = sha256 3ba81752…, both the v0.14.56 values. To change either
+    /// ★RULINGS D5 / design §4-16 / pass condition I (testplan I-WIN-01, H-16-N1-01): 0.15.0 does not change the
+    /// Windows installer. `src-tauri/nsis-hooks.nsh` = git blob 6493613d… (CRLF→LF, as git's `text eol=crlf` stores it)
+    /// and sha256 c3259014… of the CRLF bytes as checked out (what makensis reads) — the v0.14.56 values. To change it
     /// in a later release, change this pin on purpose (owner approval), never to get green.
     #[test]
-    fn installer_files_are_byte_identical_to_v0_14_56() {
+    fn installer_hook_file_is_byte_identical_to_v0_14_56() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let nsh = std::fs::read(dir.join("nsis-hooks.nsh")).expect("nsis-hooks.nsh");
         let mut lf = Vec::with_capacity(nsh.len());
@@ -1750,6 +1764,20 @@ mod tests {
             i += 1;
         }
         assert_eq!(git_blob_id(&lf), "6493613dad28e71c9c4dcd1a5bc38c5734e2abc3", "src-tauri/nsis-hooks.nsh differs from v0.14.56 (fatal class WIN)");
+        // The bytes makensis reads: `.gitattributes` checks `*.nsh` out with CRLF on every platform. sha256 of that form at
+        // v0.14.56 = c3259014… (testplan I-WIN-01 / H-16-N1-01; measured on the reference tree's checkout).
+        assert_eq!(
+            sha_of(&dir.join("nsis-hooks.nsh")),
+            "c3259014d913e22c162d583763dcea577eede7104aa364fb5d31b4c64f9c1085",
+            "src-tauri/nsis-hooks.nsh (CRLF working-tree bytes) differ from v0.14.56 (fatal class WIN)"
+        );
+    }
+
+    /// ★RULINGS D5 / pass condition I (I-WIN-01, H-16-N1-01): `src-tauri/tauri.windows.conf.json` (the NSIS bundle input:
+    /// install mode, hook file, resources; it names no NSIS template) = sha256 3ba81752…, the v0.14.56 value.
+    #[test]
+    fn windows_bundle_config_is_byte_identical_to_v0_14_56() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         assert_eq!(
             sha_of(&dir.join("tauri.windows.conf.json")),
             "3ba81752b26ee9ba34eb8e757efb0dd6dd070d5fd5d49ec516f2ce0101ec1953",

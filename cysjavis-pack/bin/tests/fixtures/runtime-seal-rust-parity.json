@@ -118,7 +118,7 @@
     },
     "python/lib/홍길동 메모.txt": {
      "t": "f",
-     "text": "메모\n",
+     "text": "\ufeff메모 (BOM)\r\n",
      "x": false
     },
     "notes.preview.txt": {
