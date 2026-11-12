@@ -4380,7 +4380,8 @@ pub fn create_update_snapshot(
         lane_key: lane_key.to_string(),
         pack_version: from_version.to_string(),
         pro_revision,
-        created_at: now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        // 나노초 고정 폭(9자리 · `Z`) — 같은 초 안의 두 스냅샷도 문자열 순서 = 생성 순서(목록·정리·"최신"이 이 순서를 쓴다).
+        created_at: now.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
         files,
     };
     let n = meta.files.len();
@@ -4404,7 +4405,7 @@ pub fn create_update_snapshot(
     Ok((dest, n, bytes_total))
 }
 
-/// 레인 디렉터리의 스냅샷 목록(오래된 것 → 최신, `created_at` 기준 · 메타 판독 불가는 뒤로 빼지 않고 이름순).
+/// 레인 디렉터리의 스냅샷 목록(오래된 것 → 최신, `created_at`(나노초 고정 폭) 기준 · 메타 판독 불가는 빈 시각 = 맨 앞, 그 안에서 이름순).
 pub fn list_update_snapshots(lane_dir: &Path) -> Vec<(String, PathBuf)> {
     let mut out: Vec<(String, PathBuf)> = Vec::new();
     let Ok(entries) = std::fs::read_dir(lane_dir) else { return out };
@@ -13727,13 +13728,20 @@ mod m11_tests {
         assert_eq!(rig.read("directives/WORKER_DIRECTIVE.md").as_deref(), Some("# W-after\n"), "전체 복원은 user 소유를 되돌리지 않는다");
         #[cfg(unix)]
         assert_eq!(std::fs::read_link(rig.pack.join("bin/link")).unwrap(), PathBuf::from("/nonexistent/target"), "링크는 링크로");
-        // 3세대 보존.
+        // 3세대 보존 — 잠 없이 연달아 만든다(같은 초 안이어도 생성 순서가 목록 순서다).
         for v in ["2.0.0", "3.0.0", "4.0.0"] {
             std::fs::write(rig.pack.join(PACK_VERSION_FILE), v).unwrap();
             rig.install(&items, false, &src);
-            std::thread::sleep(std::time::Duration::from_millis(1100));
         }
-        assert_eq!(list_update_snapshots(&root.join("base")).len(), UPDATE_SNAPSHOT_KEEP, "레인당 최신 3세대");
+        let kept = list_update_snapshots(&root.join("base"));
+        assert_eq!(kept.len(), UPDATE_SNAPSHOT_KEEP, "레인당 최신 3세대");
+        let kept_versions: Vec<String> = kept
+            .iter()
+            .map(|(_, p)| read_update_snapshot_meta(p).expect("메타").pack_version)
+            .collect();
+        assert_eq!(kept_versions, vec!["2.0.0", "3.0.0", "4.0.0"], "가장 오래된 1.0.0 세대가 정리되고 생성 순서가 유지된다");
+        let newest = newest_update_snapshot(&root, "base").expect("최신");
+        assert_eq!(read_update_snapshot_meta(&newest).unwrap().pack_version, "4.0.0", "최신 = 마지막에 만든 스냅샷");
     }
 
     /// O-C8-4 (a): 라이브 입력원의 스냅샷 위치가 T0 경로 도우미(`repair::paths::update_snapshot_dir`)와 같은 배치다.
