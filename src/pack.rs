@@ -11441,7 +11441,10 @@ mod tests {
             HOOKS_LOCAL_GUIDANCE.find("cys repair begin").unwrap(),
             HOOKS_LOCAL_GUIDANCE.find("cys repair record").unwrap(),
         );
-        assert!(begin < record, "begin 은 고치기 전(원본 보관) — record 보다 먼저 가르친다(RULINGS AH1)");
+        assert!(
+            begin < record,
+            "begin 은 고치기 전(원본 보관) — record 보다 먼저 가르친다(RULINGS AH1)"
+        );
         for old in [["--pro", "pose"].concat(), ["제안", " 패치"].concat()] {
             assert!(
                 !HOOKS_LOCAL_GUIDANCE.contains(&old),
