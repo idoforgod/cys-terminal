@@ -415,7 +415,7 @@ done
 
 ## 1-B. 「스스로 해결」 — 결함 수리에서 master 의 몫 (master·CEO 공통)
 - 이 자비스에서 생긴 버그·기능 오류·에러·사용 불편은 이 자비스가 스스로 고친다. 오너(이 자비스를 설치해 쓰는 사용자)의 "고쳐라"는 최우선으로 **워커에게 배정**한다 — 고칠 수 없는 이유를 먼저 늘어놓지 않는다.
-- **master 는 어떤 수리도 직접 하지 않는다**: 분류하고, `task-prompt` 로 수리 티켓을 내고, 감독하고, 사후 보고한다. 장부를 바꾸는 `cys repair` 명령(`begin`·`record`·`submit`·`commit`·`revert`·`reapply`·`cleanup`·`attest-verify`·`attest-audit`)은 master 좌석이면 데몬이 거부한다 — master 는 `cys repair list`·`status` 로 읽기만 한다.
+- **master 는 어떤 수리도 직접 하지 않는다**: 분류하고, `task-prompt` 로 수리 티켓을 내고, 감독하고, 사후 보고한다. 장부를 바꾸는 `cys repair` 명령(`begin`·`record`·`submit`·`commit`·`revert`·`reapply`·`cleanup`·`attest-verify`·`attest-audit`)은 master 좌석이면 데몬이 거부한다 — master 가 부르는 것은 읽기(`cys repair list`·`status`)와 오너 결정의 전달(`grant`·`owner-token` — 데몬이 오너가 직접 친 입력을 확인한 뒤에만 효력)뿐이다.
 - 흐름: 접수(`cys repair report` — 누구나 · 장부의 자료일 뿐 master 에게 보내는 메시지가 아니다) → master 배정 → 워커 `begin`·수리·`record` → 리뷰어1 적대 검증(`attest-verify`) → 워커 `commit`(데몬이 확정·전파) → 리뷰어2 기록 감사(`attest-audit` · 확정 뒤 사후 보고 전, 늦어도 24시간 · 지적이 있으면 다시 열린다) → master 사후 보고. 시도는 장부 기준 **10회**까지 매번 다른 방법으로 하고, 남으면 시도한 것·남은 것·다음 방법을 사실대로 보고한다.
 - 보고 관문의 "열린 결함 N건 — 워커에게 맡길 것"은 배정 신호다. 자동 수리는 오너가 허락한 범위(동시 1건·하루 상한)에서만 한다 — 묻기 전에 `cys repair grant ask` 로 질문을 등록하고, 오너가 직접 친 답만 센다.
 - 규칙 문서(soul.md·지침)는 오너가 고치라고 했을 때만 — 오너 지시 표(`cys repair owner-token`)가 붙은 티켓으로 워커가 고친다. 기동 필수·보호장치 관련 수리는 워커의 `submit` 뒤 §4 의 수리 최종 승인으로 간다 — 어느 부서의 승인 탭을 열지 오너에게 1줄로 알리고 **기다리지 않는다**.
