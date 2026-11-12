@@ -1926,5 +1926,98 @@ class CsoStateCapSyntheticHome(unittest.TestCase):
                                      big)[0], "읽을 수 있는 축소가 막혔다")
 
 
+
+# ── 「스스로 해결」(0.15.0 · 설계 §4-6 · §6-3 (4) · track T3) — CSO 의 `cys repair` 허용 범위 ──────────────
+#   CSO 는 `cys repair report|list|status` 만 쓴다(결함 접수는 자료일 뿐 권한이 아니다 · 장부 읽기). 장부를 바꾸는
+#   수리 명령은 이 훅이 막고 데몬도 막는다(Rust 시험). 허용은 예산 면제가 아니다(좁은 쪽이 이긴다). 마지막
+#   클래스는 음성 대조다: 훅 사본에서 허용 줄을 지우면 `report` 가 거부된다(위 양성 시험이 붉어질 수 있다는 증거).
+REPAIR_CSO_ALLOWED = [
+    "cys repair report --file bin/javis_a.py --error 'SyntaxError: invalid syntax'",
+    "cys repair list",
+    "cys repair list --json",
+    "cys repair status",
+    "cys repair status R-3 --json",
+]
+REPAIR_CSO_REFUSED = [
+    "cys repair begin --files bin/javis_a.py",
+    "cys repair record R-1 --note n",
+    "cys repair submit R-1",
+    "cys repair commit R-1",
+    "cys repair attest-verify R-1 --verdict pass --note n",
+    "cys repair attest-audit R-1 --verdict ok --note n",
+    "cys repair revert R-1",
+    "cys repair reapply R-1",
+    "cys repair cleanup R-1",
+    "cys repair recheck R-1",
+    "cys repair grant on",
+    "cys repair owner-token --path directives/MASTER_DIRECTIVE.md",
+    "cys repair sweep",
+]
+
+
+def _repair_hook_python(text):
+    lines = text.splitlines()
+    head = [i for i, l in enumerate(lines) if l.strip().endswith("<<'PYEOF'")]
+    assert len(head) == 1, "hook python heredoc not found exactly once"
+    end = [i for i in range(head[0] + 1, len(lines)) if lines[i].rstrip() == "PYEOF"]
+    return "\n".join(lines[head[0] + 1:end[0]])
+
+
+def _repair_module_value(tree, name):
+    import ast
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == name for t in node.targets):
+            return ast.literal_eval(node.value)
+    raise AssertionError("%s not declared at module level" % name)
+
+
+@NEED_SH
+class CsoRepairAllowlist(_HookEnv):
+    """The real hook, run end to end as a CSO seat (env role, no daemon)."""
+
+    def test_report_list_status_allowed(self):
+        for cmd in REPAIR_CSO_ALLOWED:
+            r = self.run_hook("Bash", {"command": cmd}, CYS_ROLE="cso")
+            self.assertEqual(r.rc, 0, r.err)
+            self.assertFalse(r.denied, "CSO refused `%s`: %s" % (cmd, r.reason))
+
+    def test_ledger_changing_verbs_refused(self):
+        for cmd in REPAIR_CSO_REFUSED:
+            r = self.run_hook("Bash", {"command": cmd}, CYS_ROLE="cso")
+            self.assertEqual(r.rc, 0, r.err)
+            self.assertTrue(r.denied, "CSO was allowed `%s`" % cmd)
+            self.assertIn("허용", r.reason)
+
+    def test_allowed_but_not_budget_exempt(self):
+        """Narrower wins: the three verbs are allowed, never in the budget-exemption set."""
+        import ast
+        tree = ast.parse(_repair_hook_python(HOOK.read_text(encoding="utf-8")))
+        sub = _repair_module_value(tree, "CSO_CYS_SUBVERBS")
+        self.assertEqual(sub.get("repair"), {"report", "list", "status"})
+        essential = _repair_module_value(tree, "CSO_CYS_SUBVERB_ESSENTIAL")
+        self.assertFalse([p for p in essential if p[0] == "repair"], essential)
+
+
+@NEED_SH
+class CsoRepairAllowlistMutationControl(_HookEnv):
+    """Negative control: with the allow line removed from a COPY of the hook, `report` is refused."""
+
+    def test_removing_the_line_refuses_report(self):
+        text = HOOK.read_text(encoding="utf-8")
+        line = '    "repair": {"report", "list", "status"},\n'
+        self.assertEqual(text.count(line), 1)
+        d = Path(tempfile.mkdtemp(prefix="capgate-mut-"))
+        self.addCleanup(shutil.rmtree, d, True)
+        (d / "role-capability-gate.sh").write_text(text.replace(line, ""), encoding="utf-8")
+        shutil.copy(LIB, d / "_lib.sh")
+        payload = json.dumps({"session_id": "s-1", "tool_name": "Bash",
+                              "tool_input": {"command": "cys repair report --file a --error b"}})
+        env = dict(self.env, CYS_ROLE="cso")
+        r = subprocess.run([SH, str(d / "role-capability-gate.sh")], input=payload, env=env,
+                           capture_output=True, text=True, timeout=90)
+        self.assertTrue(HookRun(r.returncode, r.stdout, r.stderr).denied,
+                        "the mutated hook still allowed `repair report` — the control is blind")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
