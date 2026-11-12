@@ -23099,6 +23099,13 @@ fn run_cycle_agent(
         let resume_text = resume_text.unwrap_or_else(|| {
             default_resume_text(&role_name, &cwd_round, &pack_round, &role_todo, &|p| p.exists())
         });
+        // ★(0.15.0 · 「스스로 해결」 M1 · C6 6.6 · D:697 · RULINGS AF1) 컨텍스트 임계로 정리되는 좌석의 재개 안내문에도 쥔 수리를
+        //   한 줄로 싣는다 — `[RESUME]`(boot_directive_for)과 같은 1초 상한 장부 읽기, `Ok(Some)` 일 때만(실패·시간 초과·없음 =
+        //   문안 그대로). 받아 온 문안(자동 순환의 `--resume-text` — 임계 정리가 바로 그 경로다)에도 붙인다. 한 줄 문안 유지.
+        let resume_text = match held_repair_line(Some(sid)) {
+            Some(line) => format!("{resume_text} {line}"),
+            None => resume_text,
+        };
         let directive_path = cys::pack::role_directive_path(&role_name)
             .unwrap_or_else(|| cys::pack::pack_dir().join("directives/WORKER_DIRECTIVE.md"));
         let resume_text = cycle_resume_with_hook_fallback(resume_text, &directive_path, hooks_inject);
@@ -35938,6 +35945,74 @@ mod tests {
         let got = held_repair_line_within(lane, 7, blocked, std::time::Duration::from_millis(50));
         drop(release);
         assert_eq!(got, None, "a late ledger answer was used");
+    }
+
+    /// RULINGS AF1 seam that cannot answer in time: it blocks until the test drops the sender stored here.
+    #[cfg(unix)]
+    static T1A_GATE: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>> = std::sync::Mutex::new(None);
+
+    #[cfg(unix)]
+    fn t1a_seam_blocked(
+        _: &cys::repair::types::LaneKey,
+        _: u64,
+    ) -> Result<Option<cys::repair::ledger::HeldRepair>, cys::repair::types::RepairError> {
+        let gate = T1A_GATE.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(gate) = gate {
+            let _ = gate.recv();
+        }
+        Ok(Some(t1a_held("R-9", vec!["늦은 답".into()])))
+    }
+
+    /// RULINGS AF1 / C6 6.6 / D:697: the resume notice of the CONTEXT-CLEAR cycle (`run_cycle_agent`, end to end against the
+    /// d16 fake daemon, surface 7) carries the held-repair line on `Ok(Some)` — one line, the only difference to the plain
+    /// notice, read for exactly that seat — and nothing on `Err`, `Ok(None)` (and the real T0 stub) or a reader that cannot
+    /// answer within the 1-s budget; the notice stays short (appendix A-1 #22).
+    #[cfg(unix)]
+    #[test]
+    fn cycle_resume_notice_names_the_held_repair_and_nothing_on_failure() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let idle = cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT;
+        let fixture_dir = regex::Regex::new(r"d16-\d+-\d+").unwrap();
+        let run = || {
+            let (exit, calls) = d16_cycle_fixture_scenario_timeout(vec![(idle, 5.0)], vec!["S1", "S2"], true, false, None, 10);
+            let resume = calls
+                .iter()
+                .filter(|(method, _)| method == "surface.send_text")
+                .filter_map(|(_, params)| params["text"].as_str())
+                .find(|text| text.contains("[RESUME]"))
+                .map(|text| fixture_dir.replace_all(text, "D16").into_owned());
+            (exit, resume)
+        };
+        let (exit, plain) = run();
+        let plain = plain.unwrap_or_else(|| panic!("no [RESUME] sent (exit {exit})"));
+        assert_eq!(exit, 0);
+        assert!(!plain.contains("당신은 수리"), "the real reader (T0 stub) printed a line: {plain}");
+        let held = {
+            let _seam = T1aHeldSeam::set(t1a_seam_some);
+            T1A_SEAM_SID.store(0, std::sync::atomic::Ordering::SeqCst);
+            let (exit, held) = run();
+            assert_eq!(exit, 0);
+            assert_eq!(T1A_SEAM_SID.load(std::sync::atomic::Ordering::SeqCst), 7, "read for another seat");
+            held.expect("[RESUME] sent")
+        };
+        let line = " 당신은 수리 R-7을 쥐고 있다(진행 중, 3/10회, 시도한 방법: 캐시 무효화 · 경로 정규화).";
+        assert!(held.contains(line), "held-repair line missing from the cycle notice: {held}");
+        assert_eq!(held.replacen(line, "", 1), plain, "the line is the only difference");
+        assert!(!held.contains('\n'), "the cycle notice must stay one line: {held:?}");
+        assert!(held.chars().count() <= plain.chars().count() + HELD_REPAIR_LINE_MAX_CHARS + 1);
+        for seam in [t1a_seam_err as fn(&_, _) -> _, t1a_seam_none] {
+            let _seam = T1aHeldSeam::set(seam);
+            let (exit, got) = run();
+            assert_eq!((exit, got.as_deref()), (0, Some(plain.as_str())), "Err / Ok(None) changed the cycle notice");
+        }
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        *T1A_GATE.lock().unwrap_or_else(|e| e.into_inner()) = Some(gate);
+        let slow = {
+            let _seam = T1aHeldSeam::set(t1a_seam_blocked);
+            run()
+        };
+        drop(release);
+        assert_eq!((slow.0, slow.1.as_deref()), (0, Some(plain.as_str())), "a late ledger answer reached the cycle notice");
     }
 
     #[test]
