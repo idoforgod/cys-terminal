@@ -7,18 +7,16 @@
 // authority for its own correctness.
 //
 // WHY COMMITTED AND NOT GENERATED AT BUILD TIME (measured): release.yml checks out at depth 1
-// with no tags, so the release build cannot read previous release tags at all. A freshness
-// check belongs in a fetch-depth: 0 job (ci-branch.yml has one).
+// with no tags, so the release build cannot read previous release tags at all. The freshness
+// check is the ci-branch.yml job `prev-vendor-freshness` (fetch-depth: 0, `--check`).
 //
-// WINDOW         : 53 resolvable v0.14.* tags, v0.14.0 .. v0.14.55
+// WINDOW         : 54 resolvable release tags (v*/pack-v* >= 0.14.0, not HEAD's own), v0.14.0 .. v0.14.56
 // PACK_ALL paths : 476   (build.rs:48-65 predicate)
 // with a row     : 125
-// unchanged      : 349   (identical in every tag they appeared in -> no row needed:
+// unchanged      : 351   (identical in every tag they appeared in -> no row needed:
 //                  an unedited copy already equals the embed and Arm 1 matches before the table)
-// absent         : 2   (new in this release - no previous vendor content exists)
-//   + bin/_owned_process.py
-//   + bin/javis_spool_path.py
-// generated from : 13e6b5f1926bf864808b65f42949b07160fcf2b3
+// absent         : 0   (new in this release - no previous vendor content exists)
+// generated from : f3dc517b80795bbb573c207c78f85d0456ae0b26
 
 /// `(rel, &[sha256 of that path's content in each prior release where it differed])`.
 /// Sorted by `rel`; [`prev_vendor_hashes`] relies on that for a binary search.
