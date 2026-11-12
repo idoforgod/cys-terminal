@@ -369,6 +369,10 @@ import hashlib, json, os, re, shlex, subprocess, sys, tempfile, time
 MUTATION_TOOLS = {"Edit", "Write", "NotebookEdit", "MultiEdit"}
 
 # write-shell 대표 위험 동사(근본한계: 인터프리터 우회는 못 잡음 — block-dangerous-git와 동형).
+# ★`mkdir` 는 **계속** 여기 있다(0.15.0 T10 · 설계 §4-12 · 시험계획 H-12-N1-01): 판정 파일
+#   폴더(`<팩>/round/_reviews/`)가 없을 때의 처리는 리뷰어에게 mkdir 을 허용해서가 아니라
+#   **의뢰문 도구가 폴더를 미리 만들어서** 고친다(`javis_orchestra.py review-prompt`). 여기서
+#   빼면 리뷰어가 아무 곳에나 디렉터리를 만들 수 있게 된다(쓰기 명령 거부의 약화).
 WRITE_SHELL_CMDS = {
     "rm", "mv", "cp", "dd", "tee", "truncate", "install", "chmod", "chown",
     "ln", "mkdir", "rmdir", "touch", "sed",  # sed -i 등
@@ -553,8 +557,10 @@ def pkg_is_write(base, tokens, i):
     return False
 
 
-def builder_is_write(base, tokens, i):
-    """cargo/go 세그먼트가 **명령 수준 변형**인가. 해석 불가·목록 밖 하위 명령은 True(거부 방향)."""
+def builder_is_write(base, tokens, i, ctx=None, role=None):
+    """cargo/go 세그먼트가 **명령 수준 변형**인가. 해석 불가·목록 밖 하위 명령은 True(거부 방향).
+
+    `ctx`·`role` 은 산출물 경로(`-o`) 판정에 그대로 넘긴다(0.15.0 T10 — 레인 팩 기준 정확 목록)."""
     subs = BUILDER_VERIFY_SUBS.get(base)
     if subs is None:
         return True
@@ -597,7 +603,7 @@ def builder_is_write(base, tokens, i):
             # ★산출물 폐기 장치만 허용한다(R2 · claude 리뷰어 오탐 + codex 반례를 함께 닫는다):
             #   `go build -o /dev/null ./...` 는 컴파일 검증의 표준 관용구지만, 공용
             #   `NULL_SINKS` 를 그대로 쓰면 unix 에서 `-o NUL` 이 저장소에 바이너리를 쓴다.
-            if val not in BUILDER_NULL_SINKS and not path_is_allowed(val):
+            if val not in BUILDER_NULL_SINKS and not path_is_allowed(val, ctx, role):
                 return True              # 산출물을 검증 대상 트리로 내보낸다
             j += 2 if "=" not in t else 1
             continue
@@ -787,7 +793,13 @@ def _wrapper_name(tok):
 
 # 검증 대상 외 허용 경로 접두(과도차단 방지 — reviewer tmp/로그 write 허용).
 ALLOW_PATH_PREFIXES = ("/tmp/", "/private/tmp/", "/var/tmp/", "/var/folders/")
-ALLOW_PATH_SUBSTRS = ("/.cys/", "/logs/", "/log/", "/_round/")
+# ★0.15.0 T10(설계 §4-12 · 결정 12 · V05 B9): 넓은 `/.cys/` 부분 문자열 허용 **하나만** 뺐다.
+#   그 자리는 `reviewer_exact_allowed` 의 정확한 목록이다 — 그 레인 팩의 `round/_reviews/`(판정
+#   파일 자리) 와 `round/` 아래의 **자기** todo 파일(`cys todo-path` 이름 규칙) 둘뿐이다.
+#   종전에는 경로에 `/.cys/` 가 들어 있다는 이유만으로 팩의 제품 파일(bin/·hooks/·directives/·
+#   skills/)·수리 장부(`~/.cys/local/repairs/`)·다른 부서의 팩까지 쓸 수 있었다.
+#   `/logs/`·`/log/`·`/_round/` 와 임시 폴더 허용은 **그대로** 둔다(설계가 명시).
+ALLOW_PATH_SUBSTRS = ("/logs/", "/log/", "/_round/")
 
 # ★게이트 자신의 제어 상태 — **어떤 역할에게도** 쓰기 허용 경로가 아니다(codex P0).
 #   예산 카운터가 CSO 쓰기 허용 영역(`~/.cys/state/`) 안에 있고 역할 캐시가 tmp 안에 있어서,
@@ -1083,20 +1095,166 @@ def _is_protected_state_path(p, ctx):
     return True
 
 
-def path_is_allowed(p):
-    if not p:
+# ── reviewer 정확 쓰기 목록(0.15.0 T10 · 설계 §4-12 · §6-12 (1)(2)(6) · 윈도우 경로 접기) ─────
+# 자리는 둘이고 둘 다 **그 레인의 팩**(`ctx.pack` = 좌석 env 의 `CYS_PACK_DIR` 4단 폴백 — `cys
+# todo-path`·`javis_orchestra.verdict_json_path` 와 같은 해소) 아래다:
+#   ⓐ `round/_reviews/` 아래(리뷰어 판정 파일 — 파일이 없으면 그 라운드는 미제출이고 종결되지 않는다)
+#   ⓑ `round/` 의 **자기** todo 파일 하나(`cys todo-path` 의 이름 규칙 — 정리 절차가 저장·검증하는 파일)
+# 남의 todo·`round/` 의 다른 파일·팩의 제품 파일·수리 장부·다른 부서의 팩은 여기에 없다.
+REVIEWER_VERDICT_DIRNAME = "_reviews"
+REVIEWER_TODO_SUFFIX = "_TODO.md"
+_WIN_DRIVE_RE = re.compile(r"^([A-Za-z]):(?=/|$)")
+_MSYS_DRIVE_RE = re.compile(r"^/([A-Za-z])(?=/|$)")
+_WIN_EXT_PREFIX_RE = re.compile(r"^//[?.]/(?=[A-Za-z]:(?:/|$))")
+
+
+def reviewer_own_todo_name(role):
+    """역할 → 자기 todo 파일명. `cys todo-path`(src/bin/cys.rs `run_todo_path`)와 **같은 규칙**:
+    대문자화 + 하이픈→언더스코어 + `_TODO.md`(`reviewer-claude-1` → `REVIEWER_CLAUDE_1_TODO.md`).
+    역할이 없으면 None(자기 todo 자리 없음).
+
+    ★같은 규칙이 네 곳에 있다(Rust `run_todo_path`·cycle-agent 저장 검증 · `javis_orchestra.
+      todo_file_name` · `javis_cycle_autopilot.role_todo_file`). 갈리면 리뷰어가 자기 todo 를 못 써서
+      정리의 '저장→검증' 이 막히거나(무clear) 남의 파일을 쓴다 — `tests/test_todo_shared_constants.py`
+      `ReviewerOwnTodoName` 이 넷과 이 함수를 기계 대조한다."""
+    r = (role or "").strip()
+    if not r:
+        return None
+    return "%s%s" % (r.upper().replace("-", "_"), REVIEWER_TODO_SUFFIX)
+
+
+def _win_drive_form(s):
+    """윈도우 철자의 절대경로를 `X:/…`(슬래시 · 대문자 드라이브 · `.`/`..` 접기)로 접는다. 아니면 None.
+
+    받는 철자: `C:\\a\\b` · `C:/a/b` · Git Bash(MSYS) `/c/a/b` · 확장 접두 `\\\\?\\C:\\a`.
+    ★왜(설계 §4-12 "윈도우의 `/c/…` 형식 경로를 비교 전에 정규화한다"): 네이티브 파이썬은 `/c/Users/…`
+      를 현재 드라이브 아래 `C:\\c\\Users\\…` 로 읽는다. 종전 부분 문자열 검사는 철자와 무관했지만
+      정확 목록은 그렇지 않다 — 같은 파일의 두 철자를 다른 파일로 보면 리뷰어가 판정 파일을 못 쓰고
+      라운드가 끝나지 않는다(재요청·재회신 반복 = 폭주 방향).
+    """
+    import posixpath
+    t = str(s or "").replace("\\", "/")
+    t = _WIN_EXT_PREFIX_RE.sub("", t, count=1)
+    m = _MSYS_DRIVE_RE.match(t)
+    if m:
+        t = m.group(1) + ":" + t[2:]
+    if not _WIN_DRIVE_RE.match(t):
+        return None
+    rest = re.sub(r"/+", "/", t[2:]) or "/"
+    return t[0].upper() + ":" + posixpath.normpath(rest)
+
+
+def _rv_key(p, win):
+    """정확 목록의 비교 키(대소문자 접음 — `_under` 와 같은 관례: macOS·Windows 기본 볼륨은 대소문자 무시).
+
+    POSIX 철자는 `_norm`(realpath — 링크를 따라간다 · 인용된 `~` 는 펴지 않는다) 그대로다.
+    `win` 이면 윈도우 철자를 먼저 `X:/…` 로 접는다. realpath 는 네이티브 윈도우에서만 태운다 —
+    POSIX 호스트에서 `C:/…` 를 realpath 하면 cwd 아래 상대경로로 바뀐다."""
+    if win:
+        w = _win_drive_form(_txt(p))
+        if w is not None:
+            return _fold(_norm(w) if os.name == "nt" else w)
+    return _fold(_norm(p))
+
+
+def _rv_win(ctx):
+    """윈도우 비교를 켜는가 — 호스트가 윈도우이면 언제나. POSIX 호스트에서는 레인 팩 경로가 **드라이브
+    문자 철자**(`C:\\…`·`C:/…` — POSIX 에서는 절대경로가 될 수 없는 모양)일 때만이다.
+
+    ★POSIX 호스트에서 `/c/…`·`/w/…` 같은 한 글자 최상위 폴더는 **POSIX 경로**다 — 그것을 Git Bash
+      철자로 읽으면 POSIX 팩의 판정이 바뀐다(예: 문맥의 임시 폴더가 리뷰어 허용으로 새어 든다 — 구·신
+      판정 차분이 실제로 잡은 갈래). 문맥 인스턴스의 `windows` 속성(검체 전용 · 운영 코드는 설정하지
+      않는다)이 있으면 그 값을 따른다 — POSIX 호스트에서 윈도우 레인을 흉내 내는 자가 시험용이다."""
+    forced = getattr(ctx, "windows", None)
+    if forced is not None:
+        return bool(forced)
+    if os.name == "nt":
+        return True
+    t = _WIN_EXT_PREFIX_RE.sub("", _txt(ctx.pack).replace("\\", "/"), count=1)
+    return bool(_WIN_DRIVE_RE.match(t))
+
+
+def reviewer_write_roots(ctx, role):
+    """(판정 파일 폴더 키, 자기 todo 키|None, win) — 비교 키(대소문자 접음). 팩이 없으면 (None, None, win).
+
+    ★뿌리 = `realpath(<팩>/round)` 뒤에 `_reviews`·todo 이름을 **글자로** 붙인다. `round` 가 링크여도
+      판정 파일 쓰기는 산다. 반면 `_reviews` 자체가 `bin/` 을 가리키는 링크면 대상의 realpath 가
+      `bin/…` 이라 뿌리 밖이다 — 허용 자리 하나가 제품 폴더를 여는 통로가 되지 않는다(뿌리까지
+      realpath 했다면 `_reviews/x` 쓰기가 곧 `bin/x` 쓰기였다). todo 가 링크인 경우도 같다."""
+    win = _rv_win(ctx)
+    if not ctx.pack:
+        return None, None, win
+    rnd = _rv_key(os.path.join(ctx.pack, "round"), win).rstrip("/")
+    reviews = rnd + "/" + _fold(REVIEWER_VERDICT_DIRNAME)
+    name = reviewer_own_todo_name(role)
+    todo = (rnd + "/" + _fold(name)) if name else None
+    return reviews, todo, win
+
+
+def reviewer_exact_allowed(p, ctx=None, role=None):
+    """정확 목록 판정 — 그 레인 팩 `round/_reviews/` 아래이거나 `round/` 의 **자기** todo 인가.
+
+    윈도우에서는 임시 폴더를 다른 철자(`/c/Users/…/Temp/…`)로 쓴 것도 여기서 받는다 — 같은 폴더의
+    다른 철자일 뿐이고(임시 폴더 허용 그대로) 종전 비교가 그 철자를 놓쳤다."""
+    if ctx is None:
+        ctx = Ctx()
+    if not p or not isinstance(p, str):
         return False
-    if _is_gate_state_path(p):
+    reviews, todo, win = reviewer_write_roots(ctx, role)
+    if reviews is None:
+        return False
+    key = _rv_key(p, win)
+    if not key:
+        return False
+    if key.startswith(reviews + "/"):
+        return True
+    if todo is not None and key == todo:
+        return True
+    if win and ctx.tempdir:
+        tmp = _rv_key(ctx.tempdir, win).rstrip("/")
+        if tmp and key.startswith(tmp + "/"):
+            return True
+    return False
+
+
+def reviewer_write_hint(ctx, role):
+    """deny 문면에 싣는 '쓸 수 있는 자리' 한 줄 — 막힌 좌석이 다른 곳을 거듭 시도하지 않고 바로 옮기게."""
+    if ctx is None:
+        ctx = Ctx()
+    rnd = os.path.join(ctx.pack or "", "round")
+    parts = ["판정 파일 %s/" % os.path.join(rnd, REVIEWER_VERDICT_DIRNAME)]
+    name = reviewer_own_todo_name(role)
+    if name:
+        parts.append("자기 todo %s(`cys todo-path` 가 주는 경로)" % os.path.join(rnd, name))
+    parts.append("임시 폴더 · /logs/ · /log/ · /_round/")
+    return "reviewer 가 쓸 수 있는 자리: " + " · ".join(parts)
+
+
+def path_is_allowed(p, ctx=None, role=None):
+    """reviewer/planner 의 쓰기 허용 경로인가.
+
+    순서: ①게이트 제어 상태는 예외 없이 거부 ②임시 폴더 · `/logs/` · `/log/` · `/_round/`(종전과 같은
+    텍스트·같은 비교 — 그대로 둔 허용) ③정확 목록(`reviewer_exact_allowed` — 0.15.0 T10).
+    `p` 는 원 토큰(인용 센티널 포함)일 수 있다 — ②는 종전과 같은 사람용 텍스트로, ①③은 센티널을
+    아는 `_norm` 으로도 본다(인용된 `~` 를 홈으로 펴지 않는다 — 셸도 펴지 않는다).
+    `ctx`(레인 팩)·`role`(자기 todo)이 없으면 이 좌석의 env 로 만든 문맥 · 자기 todo 없음이다.
+    """
+    if not p or not isinstance(p, str):
+        return False   # 문자열이 아닌 경로 = 판정 불가 = 허용 아님(종전엔 예외로 훅이 죽어 통과했다)
+    pt = _txt(p)
+    if _is_gate_state_path(pt) or (pt != p and _is_gate_state_path(p)):
         return False   # ★게이트 제어 상태는 예외 없음(자기 집행 상태 조작 봉인)
     # RC-10: 백슬래시 정규화(Windows 경로 C:\...\Temp → 슬래시 비교 가능) + OS temp 동적 허용
     # (Windows %TEMP%는 /tmp/ 접두와 안 맞아 reviewer temp write가 과도차단되던 것 수정).
-    ap = os.path.abspath(p).replace("\\", "/")
+    ap = os.path.abspath(pt).replace("\\", "/")
     tmp = tempfile.gettempdir().replace("\\", "/").rstrip("/") + "/"
     if ap.startswith(tmp):
         return True
     if any(ap.startswith(pre) for pre in ALLOW_PATH_PREFIXES):
         return True
-    return any(s in ap for s in ALLOW_PATH_SUBSTRS)
+    if any(s in ap for s in ALLOW_PATH_SUBSTRS):
+        return True
+    return reviewer_exact_allowed(p, ctx, role)
 
 
 def _is_fd_dup_op(tok):
@@ -1586,8 +1744,11 @@ def _eval_script(tokens, i):
     return " ".join(parts), j
 
 
-def bash_write_reason(command, _depth=0):
+def bash_write_reason(command, _depth=0, ctx=None, role=None):
     """(write: bool, why|None) — `bash_has_write` 의 **사유를 잃지 않는** 판(R2 minor).
+
+    `ctx`(레인 팩)·`role`(자기 todo)은 리다이렉트·산출물 경로 판정(`path_is_allowed`)에 넘긴다
+    (0.15.0 T10 · 설계 §6-12 (2) — 정확 목록은 레인 팩 경로가 있어야 판정된다).
 
     ★왜 사유가 필요한가(claude 리뷰어): reviewer 경로의 deny 문면은 "producer 산출물 수정 금지"
       하나여서, `ls dir/{a,b}` 처럼 **읽기 명령이 표기 때문에** 막힌 좌석은 무엇을 고쳐야 하는지
@@ -1630,9 +1791,11 @@ def bash_write_reason(command, _depth=0):
         if _is_redirect_op(tok):
             target = tokens[i + 1] if i + 1 < n else ""
             fd_dup = target.isdigit() and _is_fd_dup_op(tok)
+            # ★원 토큰을 넘긴다(T10): 인용된 `~` 를 홈으로 펴지 않아야 셸이 실제로 쓰는 곳과 같다.
             if (_txt(target) not in NULL_SINKS and not fd_dup
-                    and not path_is_allowed(_txt(target))):
-                return True, ("출력 리다이렉트 대상 %r 이 허용 경로(tmp/log) 밖이다"
+                    and not path_is_allowed(target, ctx, role)):
+                return True, ("출력 리다이렉트 대상 %r 이 허용 경로(임시 폴더 · /logs/ · /log/ · "
+                              "/_round/ · 이 레인 팩의 round/_reviews/ · 자기 todo) 밖이다"
                               % _txt(target))
             i += 2
             continue
@@ -1715,7 +1878,7 @@ def bash_write_reason(command, _depth=0):
                     if _depth + 1 > NESTED_SHELL_MAX_DEPTH:
                         return True, ("중첩 셸 깊이 상한(%d) 초과 — 판정기가 끝까지 볼 수 없으면 "
                                       "거부다" % NESTED_SHELL_MAX_DEPTH)
-                    _w, _why = bash_write_reason(script, _depth + 1)
+                    _w, _why = bash_write_reason(script, _depth + 1, ctx, role)
                     if _w:
                         return True, "`%s -c` 안의 명령이 변형이다: %s" % (_sx, _why)
                     i = nxt
@@ -1730,14 +1893,14 @@ def bash_write_reason(command, _depth=0):
                     if _depth + 1 > NESTED_SHELL_MAX_DEPTH:
                         return True, ("중첩 셸 깊이 상한(%d) 초과 — 판정기가 끝까지 볼 수 없으면 "
                                       "거부다" % NESTED_SHELL_MAX_DEPTH)
-                    _w, _why = bash_write_reason(script, _depth + 1)
+                    _w, _why = bash_write_reason(script, _depth + 1, ctx, role)
                     if _w:
                         return True, "`eval` 인자가 변형이다: %s" % _why
                 i = nxt
                 cmd_pos = False
                 continue
             if base in WRITE_SHELL_BUILDERS:
-                if builder_is_write(base, tokens, i):
+                if builder_is_write(base, tokens, i, ctx, role):
                     return True, ("빌드 도구 `%s` 세그먼트가 명령 수준 변형이다(모르는 하위 "
                                   "명령·쓰기 옵션·실행기 주입)" % base)
                 cmd_pos = False
@@ -1782,9 +1945,9 @@ def bash_write_reason(command, _depth=0):
     return False, None
 
 
-def bash_has_write(command):
+def bash_has_write(command, ctx=None, role=None):
     """`bash_write_reason` 의 불리언 표면(호출 지점·검체가 이 이름을 쓴다)."""
-    return bash_write_reason(command)[0]
+    return bash_write_reason(command, ctx=ctx, role=role)[0]
 
 
 # ── CSO 문맥 · 경로 ──────────────────────────────────────────────────────────
@@ -2806,16 +2969,20 @@ def decide(tool, tool_input, role, ctx=None):
         return decide_cso(tool, tool_input, role, ctx if ctx is not None else Ctx())
     if not is_reviewer_or_planner(role):
         return False, "not reviewer/planner/cso (role=%r) — pass" % role
+    # ★0.15.0 T10(설계 §6-12 (2)): 판정 입력에 **레인 팩 경로**가 필요하다 — 문맥이 없으면 이
+    #   좌석의 env(`CYS_PACK_DIR` 4단 폴백 = `cys todo-path`·`verdict_json_path` 와 같은 해소)로 만든다.
+    rctx = ctx if ctx is not None else Ctx()
     if tool in MUTATION_TOOLS:
         fp = tool_input.get("file_path") if isinstance(tool_input, dict) else None
-        if path_is_allowed(fp):
-            return False, "reviewer write to allowed path %r (tmp/log)" % fp
-        return True, "reviewer/planner may not %s (producer≠evaluator)" % tool
+        if path_is_allowed(fp, rctx, role):
+            return False, "reviewer write to allowed path %r (exact list · tmp/log)" % fp
+        return True, ("reviewer/planner may not %s (producer≠evaluator) — %s"
+                      % (tool, reviewer_write_hint(rctx, role)))
     if tool == "Bash":
         cmd = tool_input.get("command") if isinstance(tool_input, dict) else ""
         if not isinstance(cmd, str) or not cmd:
             return False, "empty bash"
-        _w, _wwhy = bash_write_reason(cmd)
+        _w, _wwhy = bash_write_reason(cmd, ctx=rctx, role=role)
         if _w:
             return True, ("reviewer/planner may not run write-shell"
                           + (" — %s" % _wwhy if _wwhy else ""))
@@ -3069,6 +3236,9 @@ def self_test():
         ("reviewer-codex", "Bash", {"command": "nice sh -c 'echo x > /tmp/cys-role-authority.d/role-3-default'"}),
         ("reviewer-codex", "Bash", {"command": "setsid sh -c 'echo x > /tmp/cys-role-authority.d/role-3-default'"}),
         ("reviewer-codex", "Bash", {"command": "timeout 5 sh -c 'echo x > /tmp/cys-role-authority.d/role-3-default'"}),
+        # ★0.15.0 T10 재핀(종전 allow → block · 계약 변경): 넓은 `/.cys/` 부분 문자열 허용을 정확한
+        #   목록으로 바꿨다 — `~/.cys` 아래라는 이유만으로는 더 이상 쓸 수 없다(설계 §4-12).
+        ("reviewer-codex", "Edit", {"file_path": "/Users/x/.cys/scratch.txt"}),
     ]
     cases_allow = [
         ("worker", "Edit", {"file_path": "/x/a.rs"}),
@@ -3084,7 +3254,6 @@ def self_test():
         ("reviewer-codex", "Bash", {"command": "git status"}),
         ("reviewer-codex", "Bash", {"command": "git -C /repo status"}),
         ("reviewer-codex", "Write", {"file_path": "/tmp/review-notes.md"}),
-        ("reviewer-codex", "Edit", {"file_path": "/Users/x/.cys/scratch.txt"}),
         ("reviewer-codex", "Bash", {"command": "echo hi > /tmp/out.log"}),
         # ★수렴 R2 양성 대조: 래퍼의 **아는** 긴 옵션은 값까지 건너뛰고 진짜 명령을 본다 —
         #   표를 지우면 이 읽기 명령이 '모르는 긴 옵션' 으로 거부되어 self-test 가 적색이 된다
@@ -3113,6 +3282,156 @@ def self_test():
         b, r = decide(tool, ti, role)
         if b:
             fails.append("FALSE-POSITIVE(%s): role=%s %s %r" % (r, role, tool, ti))
+
+    # ── ①-T10 reviewer 정확 쓰기 목록(0.15.0 · 설계 §4-12 · §6-12 · 시험계획 H-12-A1-29-01/N3-01) ──
+    #   넓은 `/.cys/` 허용 하나를 정확한 목록으로 바꿨다. ★열려 있어야 하는 것(판정 파일 자리 · 자기
+    #   todo — 막히면 라운드가 끝나지 않아 재요청·재회신이 반복된다 = ORCH/F1)과 ★닫혀야 하는 것
+    #   (제품 파일 · 수리 장부 · 다른 부서의 팩 · 남의 todo)을 **둘 다** 잰다. 같은 판정이 윈도우
+    #   철자(`C:\\…` · `C:/…` · `/c/…`)에서도 나와야 한다(설계 "비교 전에 정규화").
+    RV_HOME = "/w/hm"
+    RV_PACK = RV_HOME + "/.cys/pack"
+
+    def rv_ctx(pack=RV_PACK, home=RV_HOME, tempdir="/w/tmp"):
+        return Ctx(pack=pack, state=home + "/.cys/state", home=home, tempdir=tempdir,
+                   reader=lambda p: "", approver=lambda c: False)
+
+    t10_allow = [
+        ("reviewer-codex", RV_PACK + "/round/_reviews/T-r1-codex.json"),
+        ("reviewer-gemini", RV_PACK + "/round/_reviews/T-r2-gemini.json"),
+        ("reviewer-codex", RV_PACK + "/round/REVIEWER_CODEX_TODO.md"),
+        # RULINGS B2: 무구독 대체 좌석도 같은 리뷰어 슬롯이다 — 자기 todo 는 `cys todo-path` 이름.
+        ("reviewer-claude-1", RV_PACK + "/round/REVIEWER_CLAUDE_1_TODO.md"),
+        ("reviewer-claude-2", RV_PACK + "/round/REVIEWER_CLAUDE_2_TODO.md"),
+        ("reviewer-claude-1", RV_PACK + "/round/_reviews/T-r1-reviewer2.json"),
+        ("reviewer", RV_PACK + "/round/REVIEWER_TODO.md"),      # 역할 `reviewer` 의 자기 todo
+        ("planner", RV_PACK + "/round/PLANNER_TODO.md"),
+        # 대소문자 무시 볼륨(macOS·Windows)에서 같은 파일 — `_under` 와 같은 접기 관례
+        ("reviewer-codex", RV_PACK + "/round/reviewer_codex_todo.md"),
+        ("reviewer-codex", RV_PACK + "/round/_reviews/../_reviews/x.json"),
+        # 그대로 둔 허용(설계: `/logs/` · `/log/` · `/_round/` · 임시 폴더)
+        ("reviewer-codex", "/w/proj/logs/run.log"),
+        ("reviewer-codex", "/w/proj/log/run.log"),
+        ("reviewer-codex", "/w/proj/_round/notes.md"),
+        ("reviewer-codex", "/tmp/review-notes.md"),
+    ]
+    t10_block = [
+        ("reviewer-codex", RV_PACK + "/bin/javis_orchestra.py"),          # 팩 제품 파일
+        ("reviewer-codex", RV_PACK + "/hooks/role-capability-gate.sh"),
+        ("reviewer-codex", RV_PACK + "/directives/REVIEWER_DIRECTIVE.md"),
+        ("reviewer-codex", RV_PACK + "/skills/x/SKILL.md"),
+        ("reviewer-codex", RV_PACK + "/soul.md"),
+        ("reviewer-codex", RV_HOME + "/.cys/local/repairs/R-1/record.json"),       # 수리 장부
+        ("reviewer-codex", RV_HOME + "/.cys/local/repairs/R-1/staging/bin/x.py"),
+        ("reviewer-codex", RV_HOME + "/.cys/pack-dept-dept-1/round/_reviews/x.json"),  # 다른 부서
+        ("reviewer-codex", RV_HOME + "/.cys/pack-dept-dept-1/round/REVIEWER_CODEX_TODO.md"),
+        ("reviewer-codex", RV_HOME + "/.cys/state/mission.json"),
+        ("reviewer-codex", RV_HOME + "/.cys/scratch.txt"),
+        # 남의 todo(시험계획 H-12-N3-01 — "round/ 아래 아무 todo" 허용이면 적색)
+        ("reviewer-codex", RV_PACK + "/round/WORKER_TODO.md"),
+        ("reviewer-codex", RV_PACK + "/round/MASTER_TODO.md"),
+        ("reviewer-codex", RV_PACK + "/round/REVIEWER_GEMINI_TODO.md"),
+        ("reviewer-claude-1", RV_PACK + "/round/REVIEWER_CLAUDE_2_TODO.md"),
+        ("reviewer-codex", RV_PACK + "/round/REVIEWER_TODO.md"),   # 옛 공용 이름 — 이 좌석의 것이 아니다
+        ("planner", RV_PACK + "/round/REVIEWER_CODEX_TODO.md"),
+        ("reviewer-codex", RV_PACK + "/round/REVIEWER_CODEX_TODO.md.bak"),
+        ("reviewer-codex", RV_PACK + "/round/SESSION_STATE.md"),
+        ("reviewer-codex", RV_PACK + "/round/REVIEWER_VERDICT_CONTRACT.md"),
+        ("reviewer-codex", RV_PACK + "/round/_reviews"),           # 폴더 자체는 파일 자리가 아니다
+        ("reviewer-codex", RV_PACK + "/round/_reviews_x/v.json"),  # 형제 접두
+        ("reviewer-codex", RV_PACK + "/round/_reviews/../../bin/x.py"),   # 접은 뒤 밖
+        # 게이트 제어 상태 이름은 허용 자리 안에서도 예외 없다
+        ("reviewer-codex", RV_PACK + "/round/_reviews/cys-capgate-role-3-x"),
+        ("reviewer-codex", RV_PACK + "/round/_reviews/capgate/x.calls"),
+        ("reviewer-codex", RV_PACK + "/round/_reviews/cys-role-authority.d/r"),
+    ]
+    for role, path in t10_allow:
+        for tool in ("Write", "Edit", "MultiEdit"):
+            b, r = decide(tool, {"file_path": path, "content": "x"}, role, rv_ctx())
+            if b:
+                fails.append("T10-FALSE-POSITIVE(%s): role=%s %s %r" % (r, role, tool, path))
+    for role, path in t10_block:
+        b, r = decide("Write", {"file_path": path, "content": "x"}, role, rv_ctx())
+        if not b:
+            fails.append("T10-BYPASS: role=%s Write %r (%s)" % (role, path, r))
+    # 문자열이 아닌 경로는 판정 불가 = 허용 아님(종전엔 예외로 훅이 죽어 도구가 통과했다)
+    for bad in (["/tmp/x"], 7, {"p": 1}):
+        b, r = decide("Write", {"file_path": bad, "content": "x"}, "reviewer-codex", rv_ctx())
+        if not b:
+            fails.append("T10-BYPASS: 문자열이 아닌 file_path %r 가 통과했다" % (bad,))
+    # deny 문면이 쓸 수 있는 자리를 말한다(막힌 좌석이 다른 곳을 거듭 시도하지 않게)
+    _b, _r = decide("Write", {"file_path": RV_PACK + "/round/REVIEWER_TODO.md", "content": "x"},
+                    "reviewer-codex", rv_ctx())
+    if not (_b and (RV_PACK + "/round/REVIEWER_CODEX_TODO.md") in _r and "_reviews" in _r):
+        fails.append("T10-HINT: deny 문면이 판정 파일 자리·자기 todo 경로를 말하지 않는다: %r" % _r)
+    # ★판정 입력 = **레인 팩**(§6-12 (2)): 부서 리뷰어는 자기 레인의 자리만 쓴다.
+    _dept = rv_ctx(pack=RV_HOME + "/.cys/pack-dept-dept-1")
+    for path, want_block in ((RV_HOME + "/.cys/pack-dept-dept-1/round/_reviews/x.json", False),
+                             (RV_HOME + "/.cys/pack-dept-dept-1/round/REVIEWER_CODEX_TODO.md", False),
+                             (RV_PACK + "/round/_reviews/x.json", True),
+                             (RV_PACK + "/round/REVIEWER_CODEX_TODO.md", True)):
+        b, r = decide("Write", {"file_path": path, "content": "x"}, "reviewer-codex", _dept)
+        if b != want_block:
+            fails.append("T10-LANE: 부서 레인 문맥에서 %r 기대 %s 인데 %s (%s)"
+                         % (path, "deny" if want_block else "allow", "deny" if b else "allow", r))
+    # ★윈도우 철자 — 같은 자리는 같은 판정(설계: `/c/…` 를 비교 전에 정규화). 팩 철자 둘 다.
+    for wpack, wtmp in (("C:\\Users\\x\\.cys\\pack", "C:\\Users\\x\\AppData\\Local\\Temp"),
+                        ("/c/Users/x/.cys/pack", "/c/Users/x/AppData/Local/Temp"),
+                        ("C:/Users/x/.cys/pack", "C:/Users/x/AppData/Local/Temp")):
+        _w = rv_ctx(pack=wpack, home="C:/Users/x", tempdir=wtmp)
+        _w.windows = True                 # 윈도우 레인 흉내(POSIX 호스트에서도 같은 판정을 잰다)
+        for path in ("C:\\Users\\x\\.cys\\pack\\round\\_reviews\\T-r1-codex.json",
+                     "C:/Users/x/.cys/pack/round/_reviews/T-r1-codex.json",
+                     "/c/Users/x/.cys/pack/round/_reviews/T-r1-codex.json",
+                     "c:\\users\\X\\.CYS\\pack\\round\\_reviews\\v.json",
+                     "\\\\?\\C:\\Users\\x\\.cys\\pack\\round\\_reviews\\v.json",
+                     "C:\\Users\\x\\.cys\\pack\\round\\REVIEWER_CODEX_TODO.md",
+                     "/c/Users/x/.cys/pack/round/REVIEWER_CODEX_TODO.md",
+                     "/c/Users/x/AppData/Local/Temp/notes.md",
+                     "C:\\Users\\x\\proj\\logs\\a.log"):
+            b, r = decide("Write", {"file_path": path, "content": "x"}, "reviewer-codex", _w)
+            if b:
+                fails.append("T10-WIN-FALSE-POSITIVE(%s): pack=%r %r" % (r, wpack, path))
+        for path in ("C:\\Users\\x\\.cys\\pack\\bin\\javis_orchestra.py",
+                     "/c/Users/x/.cys/pack/hooks/role-capability-gate.sh",
+                     "C:/Users/x/.cys/pack/directives/MASTER_DIRECTIVE.md",
+                     "/c/Users/x/.cys/pack/skills/x/SKILL.md",
+                     "/c/Users/x/.cys/local/repairs/R-1/record.json",
+                     "C:\\Users\\x\\.cys\\pack-dept-dept-1\\round\\_reviews\\v.json",
+                     "/c/Users/x/.cys/pack/round/WORKER_TODO.md",
+                     "/c/Users/x/.cys/pack/round/_reviews/../../bin/x.py",
+                     "/d/Users/x/.cys/pack/round/_reviews/v.json",
+                     "C:relative\\round\\_reviews\\v.json"):
+            b, r = decide("Write", {"file_path": path, "content": "x"}, "reviewer-codex", _w)
+            if not b:
+                fails.append("T10-WIN-BYPASS: pack=%r %r (%s)" % (wpack, path, r))
+    # ★POSIX 호스트의 POSIX 팩에서 글자 그대로의 `/c/…`·`/w/…` 는 POSIX 경로다 — 윈도우 철자로 접지
+    #   않는다(접으면 문맥의 임시 폴더 `/w/tmp` 가 리뷰어 허용으로 새어 든다 — 구·신 차분이 잡은 갈래).
+    if os.name != "nt":
+        b, _r = decide("Write", {"file_path": "/c/w/hm/.cys/pack/round/_reviews/x.json",
+                                 "content": "x"}, "reviewer-codex", rv_ctx())
+        if not b:
+            fails.append("T10-WIN: POSIX 팩에서 `/c/…` 를 윈도우 철자로 접어 허용했다")
+        for _q in ("/w/tmp/o.log", "/w/tmp/sub/x.md"):
+            b, _r = decide("Write", {"file_path": _q, "content": "x"}, "reviewer-codex",
+                           rv_ctx(pack="/w/pack"))
+            if not b:
+                fails.append("T10-WIN: POSIX 의 한 글자 폴더 팩(`/w/pack`)을 윈도우 레인으로 읽어 "
+                             "문맥 임시 폴더 %r 를 열었다" % _q)
+        _m = rv_ctx(pack="/c/Users/x/.cys/pack")      # POSIX 호스트의 POSIX 경로 — 접지 않는다
+        b, _r = decide("Write", {"file_path": "C:\\Users\\x\\.cys\\pack\\round\\_reviews\\v.json",
+                                 "content": "x"}, "reviewer-codex", _m)
+        if not b:
+            fails.append("T10-WIN: POSIX 호스트에서 `/c/…` 팩을 윈도우 레인으로 읽었다")
+    # CSO 판정은 이 좁힘과 무관하다(설계 §6-12 "CSO 허용 목록" — 같은 경로, 종전과 같은 판정).
+    for path, want_block in ((RV_PACK + "/round/_reviews/x.json", True),
+                             (RV_PACK + "/round/REVIEWER_CODEX_TODO.md", True),
+                             (RV_PACK + "/round/CSO_TODO.md", False),
+                             (RV_HOME + "/.cys/state/cso/audit.md", False),
+                             (RV_HOME + "/.cys/scratch.txt", True)):
+        b, r = decide("Write", {"file_path": path, "content": "x"}, "cso", rv_ctx())
+        if b != want_block:
+            fails.append("T10-CSO-DRIFT: CSO Write %r 기대 %s 인데 %s (%s)"
+                         % (path, "deny" if want_block else "allow", "deny" if b else "allow", r))
 
     # ── ② CSO 픽스처 ───────────────────────────────────────────────────────
     # 합성 홈 루트는 `/w/hm` 이다 — 세그먼트를 `home` 으로 되돌리지 말 것(0.14.32).
@@ -3419,6 +3738,54 @@ def self_test_contracts(fails):
     b, _ = decide("Bash", {"command": "cys gate-check"}, "cso", ctx(tool_calls=None))
     if b:
         fails.append("CONTRACT[예산 결측]: 계수 불가를 초과로 읽었다")
+    # ★0.15.0 T10 판정 입력 계약(설계 §6-12 (2)): reviewer 판정은 **레인 팩**을 입력으로 받는다.
+    #   ⓐ 호출자가 준 문맥(`ctx.pack`)이 이긴다 ⓑ 문맥이 없으면(훅 `main()` 의 reviewer 단독 좌석)
+    #   이 좌석의 env — `CYS_PACK_DIR` 4단 폴백(`cys todo-path`·`verdict_json_path` 와 같은 해소) —
+    #   로 만든다 ⓒ 한 인자 호출 `path_is_allowed(p)` 는 계속 유효하다(자기 todo 없음 · 판정 파일
+    #   자리는 env 레인). env 는 이 블록 안에서만 바꾸고 원래대로 돌려놓는다.
+    _keys = ("CYS_PACK_DIR", "JAVIS_PACK_DIR", "AITERM_PACK_DIR", "AITERM_JARVIS_DIR")
+    _saved = dict((k, os.environ.get(k)) for k in _keys)
+    try:
+        for k in _keys:
+            os.environ.pop(k, None)
+        os.environ["CYS_PACK_DIR"] = "/w/envpack"
+        _rv = "reviewer-codex"
+        for path, want_block in (("/w/envpack/round/_reviews/x.json", False),
+                                 ("/w/envpack/round/REVIEWER_CODEX_TODO.md", False),
+                                 ("/w/envpack/bin/x.py", True),
+                                 (PACK + "/round/_reviews/x.json", True)):
+            b, r = decide("Write", {"file_path": path, "content": "x"}, _rv)
+            if b != want_block:
+                fails.append("CONTRACT[T10 env 레인]: %r 기대 %s 인데 %s (%s)"
+                             % (path, "deny" if want_block else "allow",
+                                "deny" if b else "allow", r))
+        b, r = decide("Write", {"file_path": PACK + "/round/_reviews/x.json", "content": "x"},
+                      _rv, ctx())
+        if b:
+            fails.append("CONTRACT[T10 문맥 우선]: 호출자 문맥의 레인을 쓰지 않았다 (%s)" % r)
+        b, r = decide("Write", {"file_path": "/w/envpack/round/_reviews/x.json", "content": "x"},
+                      _rv, ctx())
+        if not b:
+            fails.append("CONTRACT[T10 문맥 우선]: 문맥이 있는데 env 레인을 함께 열었다 (%s)" % r)
+        if not path_is_allowed("/w/envpack/round/_reviews/x.json"):
+            fails.append("CONTRACT[T10 한 인자 호출]: env 레인의 판정 파일 자리를 막았다")
+        if path_is_allowed("/w/envpack/round/REVIEWER_CODEX_TODO.md"):
+            fails.append("CONTRACT[T10 한 인자 호출]: 역할 없이 todo 를 열었다")
+        if not path_is_allowed("/w/envpack/round/REVIEWER_CODEX_TODO.md", None, _rv):
+            fails.append("CONTRACT[T10 역할 입력]: 역할을 줬는데 자기 todo 를 막았다")
+        # 리다이렉트·산출물 경로도 같은 입력을 받는다(셸 경로가 레인을 잃지 않는다).
+        if bash_has_write("echo x > /w/envpack/round/_reviews/x.json"):
+            fails.append("CONTRACT[T10 셸 경로]: env 레인의 판정 파일 리다이렉트를 막았다")
+        if not bash_has_write("echo x > " + PACK + "/round/_reviews/x.json"):
+            fails.append("CONTRACT[T10 셸 경로]: 문맥 없는 셸 판정이 다른 레인을 열었다")
+        if bash_has_write("echo x > " + PACK + "/round/REVIEWER_CODEX_TODO.md", ctx(), _rv):
+            fails.append("CONTRACT[T10 셸 경로]: 문맥·역할을 준 셸 판정이 자기 todo 를 막았다")
+    finally:
+        for k, v in _saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
     return fails
 
 
@@ -3618,6 +3985,22 @@ def self_test_r1(fails):
                         ["cso", "reviewer-codex"], ctx())
     if b:
         fails.append("R1[미확정 예외]: 사이클 필수 저장이 막혔다 — 봉인표 ② (%s)" % r)
+    # ★0.15.0 T10: 정확 목록 뒤에도 교집합은 교집합이다 — 리뷰어 자리(판정 파일·자기 todo)는 CSO
+    #   정책이 막으므로 후보가 갈리면 막히고, CSO 사이클 필수 저장(`CSO_*`)은 그대로 통과한다.
+    for _p in (PACK + "/round/_reviews/x.json", PACK + "/round/REVIEWER_CODEX_TODO.md"):
+        b, r = decide_multi("Write", {"file_path": _p, "content": "x"},
+                            ["cso", "reviewer-codex"], ctx())
+        if not b:
+            fails.append("R1[T10 미확정 교집합]: CSO 가 막는 리뷰어 자리 %r 가 통과했다 (%s)" % (_p, r))
+    b, r = decide_multi("Write", {"file_path": PACK + "/round/CSO_TODO.md", "content": "x"},
+                        ["reviewer-codex", "cso"], ctx())
+    if b:
+        fails.append("R1[T10 미확정 예외]: 좁힌 리뷰어 목록이 CSO 필수 저장을 막았다 — 봉인표 ② (%s)" % r)
+    # 리뷰어 단독이면 같은 문맥에서 자기 자리는 열린다(교집합 검체가 공허하지 않다는 대조).
+    for _p in (PACK + "/round/_reviews/x.json", PACK + "/round/REVIEWER_CODEX_TODO.md"):
+        b, r = decide("Write", {"file_path": _p, "content": "x"}, "reviewer-codex", ctx())
+        if b:
+            fails.append("R1[T10 대조]: 리뷰어 단독인데 자기 자리 %r 가 막혔다 (%s)" % (_p, r))
 
     # ⑮ reviewer 완화의 경계(claude minor · codex major)
     for cmd in ("go env -w GOPROXY=off", "go env -u GOFLAGS", "git worktree add /w/x",
@@ -4187,10 +4570,114 @@ def self_test_r2(fails):
     if not _db or "중괄호" not in _dr:
         fails.append("R2[T3-진단]: 중괄호 deny 가 사유를 말하지 않는다(좌석이 표기를 고칠 수 "
                      "없다): %r" % _dr)
+
+    # ⑮ 0.15.0 T10 — reviewer 셸 경로의 정확 목록(리다이렉트 대상)과 쓰기 명령 거부의 유지.
+    _P = HOME + "/.cys/pack"
+    _rc = Ctx(pack=_P, state=STATE, home=HOME, tempdir="/w/tmp",
+              reader=lambda p: "", approver=lambda c: False)
+
+    def rvc(deny, cmd, label, role="reviewer-codex", c=None):
+        b, r = decide("Bash", {"command": cmd}, role, _rc if c is None else c)
+        if b != deny:
+            fails.append("R2[T10 %s]: `%s` 기대 %s 인데 %s (%s)"
+                         % (label, cmd, "deny" if deny else "allow", "deny" if b else "allow", r))
+
+    rvc(False, "echo '{}' > %s/round/_reviews/T-r1-codex.json" % _P, "판정 파일 리다이렉트")
+    rvc(False, "cat /w/x >> %s/round/REVIEWER_CODEX_TODO.md" % _P, "자기 todo 덧붙이기")
+    rvc(False, "printf x > %s/round/REVIEWER_CLAUDE_2_TODO.md" % _P, "대체 좌석 자기 todo",
+        role="reviewer-claude-2")
+    rvc(False, "echo x > /c/Users/x/.cys/pack/round/_reviews/v.json", "윈도우 철자 판정 파일",
+        c=Ctx(pack="C:\\Users\\x\\.cys\\pack", state="C:/Users/x/.cys/state",
+              home="C:/Users/x", tempdir="C:/Users/x/AppData/Local/Temp",
+              reader=lambda p: "", approver=lambda c: False))
+    rvc(True, "echo x > %s/bin/javis_orchestra.py" % _P, "제품 파일 리다이렉트")
+    rvc(True, "echo x >> %s/round/WORKER_TODO.md" % _P, "남의 todo 리다이렉트")
+    rvc(True, "echo x > %s/.cys/local/repairs/R-1/record.json" % HOME, "수리 장부 리다이렉트")
+    rvc(True, "echo x > %s/.cys/pack-dept-dept-1/round/_reviews/v.json" % HOME, "다른 부서")
+    # ★쓰기 명령은 허용 자리여도 거부다 — 고친 것은 리다이렉트 대상 목록이지 명령 목록이 아니다.
+    #   `mkdir` 는 특히 그렇다(시험계획 H-12-N1-01: 폴더는 의뢰문 도구가 미리 만든다 — mkdir 을
+    #   리뷰어에게 열어서 고치면 적색).
+    rvc(True, "mkdir -p %s/round/_reviews" % _P, "판정 폴더 mkdir")
+    rvc(True, "mkdir %s/round/_reviews/sub" % _P, "판정 폴더 아래 mkdir")
+    rvc(True, "tee %s/round/_reviews/v.json" % _P, "tee 로 판정 파일")
+    rvc(True, "cp /w/x %s/round/_reviews/v.json" % _P, "cp 로 판정 파일")
+    rvc(True, "sed -i s/a/b/ %s/round/REVIEWER_CODEX_TODO.md" % _P, "sed -i 로 자기 todo")
+    rvc(True, "go build -o %s/bin/app ./cmd" % _P, "산출물을 팩 bin/ 으로")
+    rvc(False, "go build -o %s/round/_reviews/app ./cmd" % _P, "산출물 경로도 같은 목록")
+    rvc(True, "sh -c 'echo x > %s/hooks/x.sh'" % _P, "중첩 셸 안의 제품 파일")
+    rvc(False, "sh -c 'echo x > %s/round/_reviews/v.json'" % _P, "중첩 셸도 레인 문맥을 잃지 않는다")
+    # 인용된 `~` 는 셸이 펴지 않는다 — cwd 아래 `./~/…` 다(판정기가 홈으로 펴면 허용이 새어 나간다).
+    _hp = os.path.join(os.path.expanduser("~"), ".cys", "pack")
+    _hc = Ctx(pack=_hp, state=STATE, home=HOME, tempdir="/w/tmp",
+              reader=lambda p: "", approver=lambda c: False)
+    rvc(False, "echo x > ~/.cys/pack/round/_reviews/v.json", "인용 없는 ~ 는 홈", c=_hc)
+    rvc(True, "echo x > \"~/.cys/pack/round/_reviews/v.json\"", "인용된 ~ 는 cwd", c=_hc)
+    rvc(True, "echo x > '~/.cys/pack/round/_reviews/v.json'", "작은따옴표 ~ 는 cwd", c=_hc)
+
+    # ★실제 파일시스템 — 허용 자리 하나가 제품 폴더를 여는 통로가 되지 않는다(뿌리는 `round` 까지만
+    #   realpath 하고 `_reviews`·todo 이름은 글자로 붙인다). 임시 폴더 허용에 가려지지 않도록 정확
+    #   목록 술어(`reviewer_exact_allowed`)를 직접 잰다. 픽스처는 끝에서 지운다.
+    import shutil as _shutil
+    _fx = tempfile.mkdtemp(prefix="capgate-t10-")
+    try:
+        _fp = os.path.join(_fx, "pack")
+        for _d in ("bin", "round"):
+            os.makedirs(os.path.join(_fp, _d))
+        _fc = Ctx(pack=_fp, state=STATE, home=HOME, tempdir="/w/tmp",
+                  reader=lambda p: "", approver=lambda c: False)
+        if reviewer_exact_allowed(os.path.join(_fp, "round", "_reviews", "v.json"), _fc,
+                                  "reviewer-codex") is not True:
+            fails.append("R2[T10 실FS]: 아직 없는 판정 폴더 아래 파일을 막았다(폴더가 생기기 전에도 자리다)")
+        _link_ok = True
+        try:
+            os.symlink(os.path.join(_fp, "bin"), os.path.join(_fp, "round", "_reviews"))
+            os.symlink(os.path.join(_fp, "bin", "evil"),
+                       os.path.join(_fp, "round", "REVIEWER_CODEX_TODO.md"))
+        except (OSError, NotImplementedError, AttributeError):
+            _link_ok = False              # 링크를 못 만드는 환경(권한 없는 윈도우) — 이 항목만 건너뛴다
+        if _link_ok:
+            if reviewer_exact_allowed(os.path.join(_fp, "round", "_reviews", "x.py"), _fc,
+                                      "reviewer-codex"):
+                fails.append("R2[T10 실FS]: `_reviews` 링크가 bin/ 쓰기를 열었다(뿌리를 끝까지 realpath)")
+            if reviewer_exact_allowed(os.path.join(_fp, "round", "REVIEWER_CODEX_TODO.md"), _fc,
+                                      "reviewer-codex"):
+                fails.append("R2[T10 실FS]: 자기 todo 링크가 bin/ 쓰기를 열었다")
+        # `round` 자신이 링크인 형상은 산다(정상 설치 형상 보존 — 판정 파일 쓰기가 막히면 ORCH).
+        _rp = os.path.join(_fx, "pack2")
+        os.makedirs(os.path.join(_rp, "bin"))
+        os.makedirs(os.path.join(_fx, "elsewhere", "round"))
+        _round_link = True
+        try:
+            os.symlink(os.path.join(_fx, "elsewhere", "round"), os.path.join(_rp, "round"))
+        except (OSError, NotImplementedError, AttributeError):
+            _round_link = False
+        if _round_link:
+            _rc2 = Ctx(pack=_rp, state=STATE, home=HOME, tempdir="/w/tmp",
+                       reader=lambda p: "", approver=lambda c: False)
+            for _q in (os.path.join(_rp, "round", "_reviews", "v.json"),
+                       os.path.join(_rp, "round", "REVIEWER_CODEX_TODO.md")):
+                if not reviewer_exact_allowed(_q, _rc2, "reviewer-codex"):
+                    fails.append("R2[T10 실FS]: `round` 가 링크인 팩에서 %r 를 막았다" % _q)
+            if reviewer_exact_allowed(os.path.join(_rp, "bin", "x.py"), _rc2, "reviewer-codex"):
+                fails.append("R2[T10 실FS]: `round` 링크 팩에서 bin/ 이 열렸다")
+    finally:
+        _shutil.rmtree(_fx, ignore_errors=True)
     return fails
 
 
 def run_self_test():
+    # ★실행 위치와 무관하게(0.15.0 T10 후속 · 리뷰 지적 10): 검체 일부의 입력은 **상대 경로**다 — POSIX
+    #   호스트의 윈도우 철자(`C:\\Users\\…`)·인용된 `~`(`"~/.cys/…"`). 상대 경로는 cwd 아래로 풀리므로
+    #   cwd 가 임시 폴더(`/tmp`)이거나 `/_round/`·`/log/`·`/logs/` 를 품으면 그대로 둔 허용(임시 폴더·
+    #   부분 문자열)에 걸려 '거부' 검체가 '허용' 으로 읽혔다 — 건강한 훅의 자가 시험이 실행 위치 때문에
+    #   적색이 된다(다른 트랙이 이 자가 시험을 임시 예행 사본 안에서 훅의 검사로 돌릴 수 있다). 그래서
+    #   자가 시험은 **파일시스템 루트**(임시 폴더도, 허용 부분 문자열도, 합성 팩 뿌리도 아닌 자리)에서
+    #   돈다. 판정 함수는 바꾸지 않는다 — 운영에서 상대 경로가 cwd 를 따라가는 것은 셸과 같은 의미다.
+    #   (cwd 를 따로 고정하는 블록 둘은 끝에 시작 위치로 — 즉 이 루트로 — 돌아온다.)
+    try:
+        os.chdir(os.path.abspath(os.sep))
+    except OSError:
+        pass                              # 못 옮기면 시작 위치 그대로 — 위치 의존 검체가 시끄럽게 실패한다
     fails, n_block, n_allow, cso_allow, cso_deny = self_test()
     self_test_contracts(fails)
     self_test_r1(fails)

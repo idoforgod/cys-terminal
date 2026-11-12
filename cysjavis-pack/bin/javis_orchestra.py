@@ -1408,6 +1408,36 @@ def verdict_json_path(task, rnd, evaluator):
     return os.path.join(pack_dir(), "round", "_reviews", "%s-r%d-%s.json" % (safe, n, ev))
 
 
+def ensure_verdict_dir(vp, create=True):
+    """verdict 파일 폴더(`<팩>/round/_reviews/`)를 **의뢰문 쪽에서** 준비한다 — (state, note) 반환.
+
+    state ∈ {"exists", "created", "absent", "failed"} · note = 사람용 한 줄. **예외를 내지 않는다**.
+
+    ★왜 도구가 만드는가(0.15.0 T10 · 설계 §4-12 · 시험계획 H-12-N1-01): 종전 의뢰문은 리뷰어에게
+      `mkdir -p` 를 시켰는데 리뷰어 관문(`hooks/role-capability-gate.sh` WRITE_SHELL_CMDS)은 mkdir 을
+      쓰기 명령으로 거부한다 — 지시와 관문이 갈렸다. 관문을 풀지 않고 **폴더를 미리 만든다**. 폴더가
+      없어 판정 파일을 못 쓰면 그 라운드는 미제출이고 종결되지 않는다(재요청·재회신 반복 = 폭주 방향).
+    ★팩 디렉터리 자체가 없으면 만들지 않는다 — 오타 난 `CYS_PACK_DIR` 로 팩을 무에서 지어내지 않는다.
+    ★만들지 못해도 의뢰문은 계속 나간다(exit 무변경) — 폴더 하나 때문에 리뷰가 멈추면 그것이 ORCH 다.
+    `create=False` 는 관찰만 한다(in-process 호출 — `cmd_self_test` 는 preflight C19 가 실설치에서
+    돌리므로 쓰기를 하지 않는다)."""
+    d = os.path.dirname(vp)
+    if os.path.isdir(d):
+        return "exists", "폴더가 이미 있다"
+    if not create:
+        return "absent", "폴더가 아직 없다(%s)" % d
+    pack = os.path.dirname(os.path.dirname(d))
+    if not os.path.isdir(pack):
+        return "failed", "팩 디렉터리가 없다(%s) — 만들지 않았다" % pack
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError as e:
+        return "failed", "%s: %s" % (type(e).__name__, e)
+    if not os.path.isdir(d):
+        return "failed", "만든 뒤에도 폴더가 아니다(%s)" % d
+    return "created", "폴더를 만들었다"
+
+
 def ack_gate_precheck(cmd_label):
     """★(부트 v2 §2-9) **리뷰 게이트 사전검사** — 반환 (blocked: bool, lines: [str]).
 
@@ -1527,7 +1557,18 @@ def cmd_review_prompt(args):
     lines.append("")
     lines.append("verdict 정본 저장(필수 — 이 경로에 JSON 파일로 저장하라):")
     lines.append("  %s" % _vp)
-    lines.append("  · 디렉터리가 없으면 먼저 만들어라: mkdir -p \"%s\"" % os.path.dirname(_vp))
+    # ★0.15.0 T10: 폴더는 **이 도구가** 만든다(리뷰어 관문은 mkdir 을 거부한다 — H-12-N1-01).
+    _vd_state, _vd_note = ensure_verdict_dir(_vp, getattr(args, "prepare_verdict_dir", False))
+    if _vd_state in ("exists", "created"):
+        lines.append("  · 폴더는 준비돼 있다(이 의뢰문 도구가 만든다) — mkdir 하지 마라(리뷰어 관문은 "
+                     "mkdir 을 쓰기 명령으로 거부한다). 파일 쓰기 도구로 위 경로에 바로 저장하라.")
+    else:
+        if _vd_state == "failed":         # 관찰만 한 경우(absent · in-process)는 소음을 내지 않는다
+            print("[review-prompt] 주의: verdict 폴더를 미리 준비하지 못했다 — %s. 리뷰어는 mkdir "
+                  "을 할 수 없다: 이 폴더를 만든 뒤 의뢰하라(%s)" % (_vd_note, os.path.dirname(_vp)),
+                  file=sys.stderr)
+        lines.append("  · ⚠ 폴더를 미리 준비하지 못했다(%s) — mkdir 하지 마라(리뷰어 관문이 거부한다). "
+                     "저장이 막히면 master 에게 이 사실을 회신하라(master 가 폴더를 만든다)." % _vd_note)
     _contract_path = os.path.join(pack_dir(), "round", "REVIEWER_VERDICT_CONTRACT.md")
     try:
         import javis_verdict as _jv
@@ -6075,6 +6116,8 @@ def main():
                          "reviewer2=감사(기각 이력=면역 아닌 감사 자료)")
     rp.add_argument("--slug", default=None,
                     help="handoff 슬러그 접두 우선 필터(T1 기각 재주입 — 같은 작업 우선)")
+    # ★0.15.0 T10: CLI 호출만 verdict 폴더를 만든다(in-process 호출 — self-test — 은 쓰지 않는다).
+    rp.set_defaults(prepare_verdict_dir=True)
 
     tp = sub.add_parser("task-prompt", help="생존 게이트 + 절대 강조 4규칙 포함 위임 티켓 생성")
     tp.add_argument("--task", required=True)
