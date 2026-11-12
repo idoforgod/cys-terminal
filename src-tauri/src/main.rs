@@ -8248,6 +8248,9 @@ where
     Ok(())
 }
 
+// ★(0.15.0 · 「스스로 해결」 M16 · 설계 §4-16 · C12 12.8) 업데이트 직전 앱 안쪽(동봉 런타임) 수정 보관 — 아래 두 업데이트 처리부가 부른다.
+mod bundle_edits;
+
 /// 업데이트 다운로드·설치 후 데몬 핸드오프 + 재시작.
 /// force=false: 살아있는 세션이 있으면 설치 전에 거부(UI가 확인 후 force=true로 재호출).
 /// ★재배선(오너 2026-07-15): 본체 패치(인앱) 설치 경로 재활성화 — UI promptBinaryPatch가 호출한다
@@ -8287,6 +8290,11 @@ async fn install_update(app: AppHandle, force: bool) -> Result<(), String> {
     if update_checked_launch_from_env(cys::env_compat("CYS_UPDATE_CHECKED_LAUNCH").as_deref()) {
         return install_update_checked_windows(&app, &update, &attempt_path, verify_on).await;
     }
+    // ★(0.15.0 · M16 · 설계 §4-16 · C12 12.8) 맥은 내려받기와 설치가 아래 한 호출이므로 그 호출 **앞**에서, 앱 안쪽(동봉 런타임)의 바뀐 파일을
+    //   `~/.cys/local/bundle-edits/` 로 복사해 둔다. 막지 않는다 — 결과가 무엇이든 다음 줄로 그대로 간다(실패는 한국어 알림 1건).
+    //   윈도우에서 이 줄은 확인 실행을 끈 경로에서만 닿는데, 그 경로는 설계대로 덮지 않는다(`bundle_edits::site_applies`).
+    //   프로세스를 띄우지도 멈추지도 않는다(RULINGS X4 — 감지는 Rust 안에서만).
+    bundle_edits::capture_before_install(&app, &update.version, bundle_edits::Site::SingleCall).await;
     if let Err(e) = update
         .download_and_install(
             |chunk, total| {
@@ -8401,6 +8409,10 @@ async fn install_update_checked_windows(
             }
             return Ok(());
         }
+        // ★(0.15.0 · M16 · 설계 §4-16 · C12 12.8) 받은 뒤 · 설치 파일을 쓰고 띄우기 **전**: 앱 안쪽(동봉 런타임)의 바뀐 파일을 보관한다.
+        //   막지 않는다 — 결과가 무엇이든 아래 쓰기·띄우기로 그대로 간다(실패는 한국어 알림 1건). 바로 위 '설치 파일이 아닌 꾸러미' 갈래는 설계대로 덮지 않는다.
+        //   프로세스를 띄우지도 멈추지도 않는다(RULINGS X4).
+        bundle_edits::capture_before_install(app, &update.version, bundle_edits::Site::CheckedLaunch).await;
         // exe — 플러그인과 같은 임시 경로·파일명(`%TEMP%\<앱>-<새버전>-updater-<난수>\<앱>-<새버전>-installer.exe`)에 쓴다. 앱 이름은 플러그인이 쓰는 값
         // 그대로(`package_info().name`)다.
         let file = match cys::update_launch::write_installer(&std::env::temp_dir(), &app.package_info().name, &update.version, &bytes) {
