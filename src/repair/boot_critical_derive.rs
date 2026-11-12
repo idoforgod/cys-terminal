@@ -90,6 +90,24 @@ pub const PROOF_ANCHORS: &[ProofAnchor] = &[
         why: "start: boot step 1 runs preflight --fix",
     },
     ProofAnchor {
+        proof: "cysjavis-pack/bin/javis_bootstrap.py",
+        literal: "orchestra = os.path.join(PACK, \"bin\", \"javis_orchestra.py\")",
+        rel: "bin/javis_orchestra.py",
+        category: "start-script",
+        check: "py-compile",
+        check_arg: "",
+        why: "start: boot step 5 runs `orchestra check`; on failure the boot ends with EXIT_CHECK and writes no completion marker (RULINGS AI1)",
+    },
+    ProofAnchor {
+        proof: "cysjavis-pack/bin/javis_formation.py",
+        literal: "node = os.path.join(PACK_DIR, \"bin\", \"javis_boot_node.py\")",
+        rel: "bin/javis_boot_node.py",
+        category: "start-script",
+        check: "py-compile",
+        check_arg: "",
+        why: "start: formation attaches every seat through it (RULINGS AI1)",
+    },
+    ProofAnchor {
         proof: "src/bin/cysd/schedule.rs",
         literal: "$pk/bin/cys-dept",
         rel: "bin/cys-dept",
@@ -847,6 +865,10 @@ fn squash(s: &str) -> String {
 
 /// Census of the preflight: defs, registrar call sites, loop anchors.
 pub fn preflight_census(pf: &str) -> Vec<String> {
+    // RULINGS AI8: documentation and comments are not code — a registrar named in a docstring or a
+    // comment is not a call site (line structure is kept, so the reported line numbers hold)
+    let code = py_code_view(pf);
+    let pf = code.as_str();
     let mut errs = Vec::new();
     let mut seen_defs: BTreeMap<String, usize> = BTreeMap::new();
     let mut heads: Vec<(usize, String)> = Vec::new();
@@ -964,6 +986,7 @@ pub fn settings_writer_census(src: &Sources) -> Vec<String> {
         let Some(t) = (src.pack_file)(rel) else {
             continue;
         };
+        let t = py_code_view(&lf(&t));
         if t.contains("setdefault(\"hooks\"") && !KNOWN_SETTINGS_WRITERS.contains(&rel.as_str()) {
             errs.push(format!(
                 "census: `{rel}` writes a settings `hooks` table — a registrar outside the anchors (T5a derivation)"
@@ -1103,16 +1126,136 @@ fn path_value_target(value: &str, file_dir: &str) -> Option<String> {
     None
 }
 
-/// Files a pack file binds structurally (rule 2): `(rel, how)`.
+/// Python source with every comment and every triple-quoted region blanked (newlines kept, so
+/// line structure is unchanged); single-line string literals are kept (RULINGS AI8: the census and
+/// the import / launch scan never read documentation or comments).
+pub fn py_code_view(text: &str) -> String {
+    let b: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        // triple-quoted string
+        if (c == '"' || c == '\'') && i + 2 < b.len() && b[i + 1] == c && b[i + 2] == c {
+            out.push_str("   ");
+            i += 3;
+            while i < b.len() {
+                if b[i] == '\\' && i + 1 < b.len() {
+                    out.push(if b[i + 1] == '\n' { '\n' } else { ' ' });
+                    out.push(' ');
+                    i += 2;
+                    continue;
+                }
+                if b[i] == c && i + 2 < b.len() && b[i + 1] == c && b[i + 2] == c {
+                    out.push_str("   ");
+                    i += 3;
+                    break;
+                }
+                out.push(if b[i] == '\n' { '\n' } else { ' ' });
+                i += 1;
+            }
+            continue;
+        }
+        // single-line string: copied as is
+        if c == '"' || c == '\'' {
+            out.push(c);
+            i += 1;
+            while i < b.len() && b[i] != '\n' {
+                if b[i] == '\\' && i + 1 < b.len() {
+                    out.push(b[i]);
+                    out.push(b[i + 1]);
+                    i += 2;
+                    continue;
+                }
+                out.push(b[i]);
+                i += 1;
+                if b[i - 1] == c {
+                    break;
+                }
+            }
+            continue;
+        }
+        // comment
+        if c == '#' {
+            while i < b.len() && b[i] != '\n' {
+                out.push(' ');
+                i += 1;
+            }
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// The balanced-parenthesis argument text after `open` (which ends with `(`), or `None`.
+fn call_args(text: &str, open_end: usize) -> Option<&str> {
+    let mut depth = 1i32;
+    for (k, ch) in text[open_end..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&text[open_end..open_end + k]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The plain string literals of an argument text, in order.
+fn string_literals(args: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let b: Vec<char> = args.chars().collect();
+    let mut i = 0;
+    while i < b.len() {
+        let q = b[i];
+        if q == '"' || q == '\'' {
+            let mut lit = String::new();
+            i += 1;
+            while i < b.len() && b[i] != q {
+                if b[i] == '\\' && i + 1 < b.len() {
+                    i += 1;
+                }
+                lit.push(b[i]);
+                i += 1;
+            }
+            out.push(lit);
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Files a pack file binds (rule 2 — RULINGS AI1): `(rel, how)`.
+/// - Python: imports WHEREVER written (also inside `try:` and function bodies), `import_module("x")`
+///   / `__import__("x")`, and every sibling `bin/` tool it LAUNCHES or opens by path
+///   (`os.path.join(<…>, "bin", "<x>")` — the last literal is a `bin/` file name).
+/// - Shell: a source line, a variable whose value ends with a pack path, and an interpreter
+///   launching a pack tool by path (`python3 "…/bin/x.py"`, `"$CYS_PY" "…/bin/x.py"`).
 pub fn bindings(rel: &str, text: &str, rels: &BTreeSet<&str>) -> Vec<(String, String)> {
     let mut out: BTreeMap<String, String> = BTreeMap::new();
+    let mut add = |cand: String, how: String| {
+        if rels.contains(cand.as_str()) && cand != rel {
+            out.entry(cand).or_insert(how);
+        }
+    };
     if rel.ends_with(".py") || text.lines().next().is_some_and(|l| l.contains("python")) {
-        for line in text.lines() {
-            let mods: Vec<String> = if let Some(r) = line.strip_prefix("import ") {
+        let code = py_code_view(text);
+        for line in code.lines() {
+            let t = line.trim_start();
+            let mods: Vec<String> = if let Some(r) = t.strip_prefix("import ") {
                 r.split(',')
                     .map(|m| m.split_whitespace().next().unwrap_or("").to_string())
                     .collect()
-            } else if let Some(r) = line.strip_prefix("from ") {
+            } else if let Some(r) = t.strip_prefix("from ") {
+                if !r.contains(" import") {
+                    continue;
+                }
                 vec![r.split_whitespace().next().unwrap_or("").to_string()]
             } else {
                 continue;
@@ -1121,10 +1264,27 @@ pub fn bindings(rel: &str, text: &str, rels: &BTreeSet<&str>) -> Vec<(String, St
                 if m.is_empty() || m.contains('.') {
                     continue;
                 }
-                let cand = format!("bin/{m}.py");
-                if rels.contains(cand.as_str()) && cand != rel {
-                    out.entry(cand)
-                        .or_insert_with(|| format!("imported by {rel}"));
+                add(format!("bin/{m}.py"), format!("imported by {rel}"));
+            }
+        }
+        for opener in ["import_module(", "__import__("] {
+            for (at, _) in code.match_indices(opener) {
+                if let Some(args) = call_args(&code, at + opener.len()) {
+                    if let Some(m) = string_literals(args).first() {
+                        add(format!("bin/{m}.py"), format!("imported by {rel}"));
+                    }
+                }
+            }
+        }
+        for (at, _) in code.match_indices("os.path.join(") {
+            if let Some(args) = call_args(&code, at + "os.path.join(".len()) {
+                if let Some(last) = string_literals(args).last() {
+                    if !last.is_empty() && last.chars().all(is_name_char) {
+                        add(
+                            format!("bin/{last}"),
+                            format!("launched or opened by path in {rel}"),
+                        );
+                    }
                 }
             }
         }
@@ -1134,9 +1294,39 @@ pub fn bindings(rel: &str, text: &str, rels: &BTreeSet<&str>) -> Vec<(String, St
         return Vec::new();
     }
     let fdir = dir_of(rel);
+    // heredocs: a Python heredoc body (`"$CYS_PY" - <<'PYEOF'`) is read with the Python rules;
+    // any other heredoc body is data, not commands (its text is never a launch or a binding)
+    let mut heredoc: Option<(String, bool, String)> = None; // (terminator, python, body)
     for line in text.lines() {
+        if let Some((term, python, body)) = heredoc.as_mut() {
+            if line.trim_end() == term.as_str() {
+                if *python {
+                    let inner = format!("{rel}#heredoc.py");
+                    for (c, how) in bindings(&inner, body, rels) {
+                        add(c, how.replace(&inner, rel));
+                    }
+                }
+                heredoc = None;
+            } else {
+                body.push_str(line);
+                body.push('\n');
+            }
+            continue;
+        }
         if line.trim_start().starts_with('#') {
             continue;
+        }
+        if let Some(p) = line.find("<<") {
+            let after = line[p + 2..].trim_start_matches('-').trim_start();
+            let word: String = after
+                .trim_start_matches(['\'', '"'])
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if !word.is_empty() {
+                let python = line[..p].contains("PY") || line[..p].contains("python");
+                heredoc = Some((word, python, String::new()));
+            }
         }
         let mut segs: Vec<&str> = vec![line];
         for sep in [" || ", " && ", "; "] {
@@ -1148,6 +1338,40 @@ pub fn bindings(rel: &str, text: &str, rels: &BTreeSet<&str>) -> Vec<(String, St
                 .trim_start_matches("||")
                 .trim_start_matches("&&")
                 .trim_start();
+            // an interpreter launching a pack tool by path — only in COMMAND position (after
+            // leading assignments / exec / env / nohup / command), never inside a quoted message
+            let words: Vec<&str> = s.split_whitespace().collect();
+            let mut k = 0;
+            while k < words.len()
+                && (matches!(words[k], "exec" | "env" | "nohup" | "command" | "time")
+                    || (words[k].contains('=')
+                        && words[k].split('=').next().is_some_and(|n| {
+                            !n.is_empty()
+                                && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        })))
+            {
+                k += 1;
+            }
+            let unq = |w: &str| w.trim_matches(|c| c == '"' || c == '\'').to_string();
+            if k < words.len()
+                && matches!(
+                    unq(words[k]).as_str(),
+                    "python3" | "python" | "py" | "$CYS_PY" | "${CYS_PY}" | "$PY" | "${PY}"
+                )
+            {
+                if let Some(target) = words[k + 1..]
+                    .iter()
+                    .map(|w| unq(w))
+                    .find(|w| !w.starts_with('-'))
+                {
+                    if let Some(p) = target.rfind("/bin/") {
+                        let name = &target[p + 5..];
+                        if !name.is_empty() && name.chars().all(is_name_char) {
+                            add(format!("bin/{name}"), format!("launched by {rel}"));
+                        }
+                    }
+                }
+            }
             let value = if let Some(r) = s.strip_prefix(". ").or_else(|| s.strip_prefix("source "))
             {
                 Some(("sourced", r))
@@ -1172,9 +1396,7 @@ pub fn bindings(rel: &str, text: &str, rels: &BTreeSet<&str>) -> Vec<(String, St
             };
             let Some((how, v)) = value else { continue };
             if let Some(t) = path_value_target(v, fdir) {
-                if rels.contains(t.as_str()) && t != rel {
-                    out.entry(t).or_insert_with(|| format!("{how} by {rel}"));
-                }
+                add(t, format!("{how} by {rel}"));
             }
         }
     }
@@ -1447,29 +1669,47 @@ fn rust_check(c: &str) -> &'static str {
 /// Rust source of `OUT_DIR/boot_critical.rs` (included by `src/repair/boot_critical.rs`).
 pub fn render(entries: &[GenEntry]) -> String {
     let mut s = String::from(
-        "// @generated by build.rs from src/repair/boot_critical_derive.rs (T5a · C4 · RULINGS B6) — do not edit.\n\
-         /// The compiled boot-critical list (hooks, their dependencies, start scripts, core config) and\n\
-         /// the sibling protection rows — the only source (C4 4.1).\n\
-         static GENERATED: &[Entry] = &[\n",
+        "// @generated by build.rs from src/repair/boot_critical_derive.rs (T5a · C4 · RULINGS B6) — do not edit.\n",
     );
-    for e in entries {
-        let t = match e.timeout_s {
-            Some(n) => format!("Some({n})"),
-            None => "None".to_string(),
-        };
+    // RULINGS AI6: two lists — the boot-critical files, and the SIBLING protection list (C4 4.10)
+    for (name, doc, protection) in [
+        (
+            "GENERATED",
+            "The compiled boot-critical list (hooks, their dependencies, start scripts, core config) — the only source (C4 4.1).",
+            false,
+        ),
+        (
+            "GENERATED_PROTECTION",
+            "The sibling list of the files implementing the four kept protections (C4 4.10 / D:941).",
+            true,
+        ),
+    ] {
+        let rows: Vec<&GenEntry> = entries
+            .iter()
+            .filter(|e| (e.category == "protection") == protection)
+            .collect();
+        s.push_str(&format!("/// {doc}\nstatic {name}: &[Entry] = &[\n"));
+        for e in &rows {
+            let t = match e.timeout_s {
+                Some(n) => format!("Some({n})"),
+                None => "None".to_string(),
+            };
+            s.push_str(&format!(
+                "    Entry {{ rel: {:?}, category: {}, check: {}, check_arg: {:?}, timeout_s: {t}, lifeline: {} }},\n",
+                e.rel,
+                rust_category(e.category),
+                rust_check(e.check),
+                e.check_arg,
+                e.lifeline
+            ));
+        }
         s.push_str(&format!(
-            "    Entry {{ rel: {:?}, category: {}, check: {}, check_arg: {:?}, timeout_s: {t}, lifeline: {} }},\n",
-            e.rel,
-            rust_category(e.category),
-            rust_check(e.check),
-            e.check_arg,
-            e.lifeline
+            "];\n/// Why each row of [`{name}`] exists (same order).\nstatic {name}_WHY: &[&str] = &[\n"
         ));
+        for e in &rows {
+            s.push_str(&format!("    {:?},\n", e.why));
+        }
+        s.push_str("];\n");
     }
-    s.push_str("];\n/// Why each row of [`GENERATED`] exists (same order).\nstatic GENERATED_WHY: &[&str] = &[\n");
-    for e in entries {
-        s.push_str(&format!("    {:?},\n", e.why));
-    }
-    s.push_str("];\n");
     s
 }

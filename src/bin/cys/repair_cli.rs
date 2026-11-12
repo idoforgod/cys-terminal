@@ -1715,6 +1715,15 @@ mod tests {
         let rows = v["entries"].as_array().unwrap();
         let table = cys::repair::boot_critical::entries();
         assert_eq!(rows.len(), table.len());
+        // RULINGS AI6: the protection rows ride in their own key; `entries` holds boot-critical files only
+        let prot = v["protection"].as_array().expect("`protection` key");
+        let ptable = cys::repair::boot_critical::protection_entries();
+        assert_eq!(prot.len(), ptable.len());
+        for (r, e) in prot.iter().zip(ptable) {
+            assert_eq!(r, &cys::repair::boot_critical::entry_json(e));
+            assert_eq!(r["category"], "protection");
+        }
+        assert!(rows.iter().all(|r| r["category"] != "protection"));
         for (r, e) in rows.iter().zip(table) {
             assert_eq!(r, &cys::repair::boot_critical::entry_json(e));
             assert_eq!(r["rel"], e.rel);

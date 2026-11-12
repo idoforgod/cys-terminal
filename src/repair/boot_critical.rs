@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-// `static GENERATED: &[Entry]` and `static GENERATED_WHY: &[&str]` (same order).
+// `static GENERATED` / `GENERATED_WHY` (boot-critical files) and `static GENERATED_PROTECTION` /
+// `GENERATED_PROTECTION_WHY` (the sibling protection list), each pair in the same order.
 include!(concat!(env!("OUT_DIR"), "/boot_critical.rs"));
 
 /// The derivation itself, compiled again for the tests (census, anchors, freshness pin).
@@ -54,18 +55,28 @@ pub struct Entry {
     pub lifeline: bool,
 }
 
-/// The compiled list: boot-critical rows (categories other than `protection`) and the sibling
-/// protection rows (`protection`; a rel may appear in both). Sorted by (rel, category).
+/// The compiled boot-critical list — boot-critical FILES only (hooks, their dependencies, start
+/// scripts, core config); never a protection-only row (RULINGS AI6). Sorted by rel.
 pub fn entries() -> &'static [Entry] {
     GENERATED
 }
 
-/// Why a row exists (the anchor or the binder that put it on the list), by row.
+/// The SIBLING list of the files implementing the four kept protections (C4 4.10 / D:941 ·
+/// RULINGS AI6), category `protection`. A rel may also be a boot-critical file
+/// (`hooks/role-capability-gate.sh`).
+pub fn protection_entries() -> &'static [Entry] {
+    GENERATED_PROTECTION
+}
+
+/// Why a row exists (the anchor or the binder that put it on its list).
 pub fn provenance(entry: &Entry) -> Option<&'static str> {
-    GENERATED
+    if let Some(i) = GENERATED.iter().position(|e| e == entry) {
+        return GENERATED_WHY.get(i).copied();
+    }
+    GENERATED_PROTECTION
         .iter()
         .position(|e| e == entry)
-        .and_then(|i| GENERATED_WHY.get(i).copied())
+        .and_then(|i| GENERATED_PROTECTION_WHY.get(i).copied())
 }
 
 /// A pack-relative rel in comparison form: `/` separators, no leading `./`, ASCII case folded
@@ -79,20 +90,16 @@ fn rel_key(rel: &str) -> String {
     r.trim_start_matches('/').to_ascii_lowercase()
 }
 
-/// The boot-critical row (any category but `protection`) of a pack-relative rel.
+/// The boot-critical row of a pack-relative rel (from [`entries`]).
 pub fn boot_critical_entry(rel: &str) -> Option<&'static Entry> {
     let k = rel_key(rel);
-    GENERATED
-        .iter()
-        .find(|e| e.category != EntryCategory::Protection && rel_key(e.rel) == k)
+    GENERATED.iter().find(|e| rel_key(e.rel) == k)
 }
 
-/// The protection row (D:941) of a pack-relative rel.
+/// The protection row (D:941) of a pack-relative rel (from [`protection_entries`]).
 pub fn protection_entry(rel: &str) -> Option<&'static Entry> {
     let k = rel_key(rel);
-    GENERATED
-        .iter()
-        .find(|e| e.category == EntryCategory::Protection && rel_key(e.rel) == k)
+    GENERATED_PROTECTION.iter().find(|e| rel_key(e.rel) == k)
 }
 
 /// Answer of the boot-critical query (O-C4-2: exit 0 yes, 1 no, 2 cannot decide = fail-open).
@@ -418,11 +425,14 @@ pub fn entry_json(e: &Entry) -> serde_json::Value {
     })
 }
 
-/// `cys repair boot-critical --list --json`: `{"schema": 1, "entries": [<O-C4-3 rows>]}`.
+/// `cys repair boot-critical --list --json`: `{"schema": 1, "entries": [<boot-critical rows>],
+/// "protection": [<protection rows>]}` — O-C4-3 row format in both; `entries` never holds a
+/// protection-only row (RULINGS AI6).
 pub fn list_json() -> serde_json::Value {
     serde_json::json!({
         "schema": super::REPAIR_SCHEMA,
         "entries": GENERATED.iter().map(entry_json).collect::<Vec<_>>(),
+        "protection": GENERATED_PROTECTION.iter().map(entry_json).collect::<Vec<_>>(),
     })
 }
 
@@ -590,8 +600,9 @@ mod tests {
         bool,
     );
 
-    /// The fixed input of the derivation tests (D:734 / RULINGS B6): the compiled list at this
-    /// revision, row by row. A change of the derivation or of an anchor shows up here first.
+    /// The fixed input of the derivation tests (D:734 / RULINGS B6): the compiled boot-critical
+    /// list at this revision, row by row (RULINGS AI1: imports wherever written + tools launched or
+    /// opened by path). A change of the derivation or of an anchor shows up here first.
     const PINNED: &[Row] = &[
         (
             "agents.json",
@@ -619,6 +630,30 @@ mod tests {
             false,
         ),
         (
+            "bin/javis_actprobe.py",
+            C::HookDep,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
+            "bin/javis_backup.py",
+            C::HookDep,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
+            "bin/javis_boot_node.py",
+            C::StartScript,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
             "bin/javis_bootstrap.py",
             C::StartScript,
             K::PyCompile,
@@ -627,7 +662,79 @@ mod tests {
             false,
         ),
         (
+            "bin/javis_brief_lint.py",
+            C::HookDep,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
+            "bin/javis_budget.py",
+            C::HookDep,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
+            "bin/javis_channels.py",
+            C::HookDep,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
             "bin/javis_checklist.py",
+            C::HookDep,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
+            "bin/javis_cleanroom.py",
+            C::HookDep,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
+            "bin/javis_cli_probe.py",
+            C::HookDep,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
+            "bin/javis_completion_guard.py",
+            C::HookDep,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
+            "bin/javis_cycle_autopilot.py",
+            C::HookDep,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
+            "bin/javis_cycle_verifier.py",
+            C::HookDep,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
+            "bin/javis_dept_schedule.py",
             C::HookDep,
             K::PyCompile,
             "",
@@ -643,8 +750,64 @@ mod tests {
             false,
         ),
         (
+            "bin/javis_event.py",
+            C::HookDep,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
+            "bin/javis_factcheck_gate.py",
+            C::HookDep,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
             "bin/javis_formation.py",
-            C::StartDep,
+            C::HookDep,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
+            "bin/javis_guard_register.py",
+            C::HookDep,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
+            "bin/javis_lane.py",
+            C::HookDep,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
+            "bin/javis_lock.py",
+            C::HookDep,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
+            "bin/javis_manifest.py",
+            C::HookDep,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
+            "bin/javis_mcpgate.py",
+            C::HookDep,
             K::PyCompile,
             "",
             None,
@@ -659,8 +822,16 @@ mod tests {
             false,
         ),
         (
+            "bin/javis_orchestra.py",
+            C::StartScript,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
             "bin/javis_phoenix.py",
-            C::StartDep,
+            C::HookDep,
             K::PyCompile,
             "",
             None,
@@ -675,9 +846,177 @@ mod tests {
             false,
         ),
         (
+            "bin/javis_radio.py",
+            C::HookDep,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
+            "bin/javis_reflect.py",
+            C::HookDep,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
+            "bin/javis_registry.py",
+            C::HookDep,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
+            "bin/javis_report.py",
+            C::HookDep,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
+            "bin/javis_resource_gate.py",
+            C::HookDep,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
+            "bin/javis_role.py",
+            C::HookDep,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
+            "bin/javis_route.py",
+            C::HookDep,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
+            "bin/javis_runtime_seal.py",
+            C::HookDep,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
+            "bin/javis_scrub.py",
+            C::HookDep,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
+            "bin/javis_semver.py",
+            C::HookDep,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
+            "bin/javis_serena_probe.py",
+            C::HookDep,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
+            "bin/javis_skillscan.py",
+            C::HookDep,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
             "bin/javis_snapshot.py",
             C::HookDep,
             K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
+            "bin/javis_spool_path.py",
+            C::HookDep,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
+            "bin/javis_state_ledger.py",
+            C::HookDep,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
+            "bin/javis_state_snapshot.py",
+            C::HookDep,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
+            "bin/javis_task.py",
+            C::HookDep,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
+            "bin/javis_todo_decl.py",
+            C::HookDep,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
+            "bin/javis_verdict.py",
+            C::HookDep,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
+            "bin/javis_waiver.py",
+            C::HookDep,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
+            "bin/javis_wakeup.py",
+            C::HookDep,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
+            "bin/skillscan_rules.json",
+            C::HookDep,
+            K::JsonParse,
             "",
             None,
             false,
@@ -740,14 +1079,6 @@ mod tests {
             false,
         ),
         (
-            "hooks/guard.sh",
-            C::Protection,
-            K::ShSyntax,
-            "",
-            None,
-            false,
-        ),
-        (
             "hooks/inject-context.sh",
             C::Hook,
             K::HookReplay,
@@ -796,14 +1127,6 @@ mod tests {
             true,
         ),
         (
-            "hooks/role-capability-gate.sh",
-            C::Protection,
-            K::SelfTest,
-            "--self-test",
-            None,
-            false,
-        ),
-        (
             "hooks/save-state.sh",
             C::Hook,
             K::HookReplay,
@@ -818,6 +1141,27 @@ mod tests {
             "SessionStart",
             None,
             true,
+        ),
+    ];
+
+    /// The sibling protection list (C4 4.10 · RULINGS AI6 — the worker's mapping, accepted as a
+    /// flagged interpretation).
+    const PINNED_PROTECTION: &[Row] = &[
+        (
+            "hooks/guard.sh",
+            C::Protection,
+            K::ShSyntax,
+            "",
+            None,
+            false,
+        ),
+        (
+            "hooks/role-capability-gate.sh",
+            C::Protection,
+            K::SelfTest,
+            "--self-test",
+            None,
+            false,
         ),
         (
             "trusted-keys.json",
@@ -848,8 +1192,11 @@ mod tests {
             PINNED.to_vec(),
             "the compiled boot-critical list moved"
         );
+        let got: Vec<Row> = protection_entries().iter().map(row).collect();
+        assert_eq!(got, PINNED_PROTECTION.to_vec(), "the protection list moved");
         assert_eq!(GENERATED_WHY.len(), GENERATED.len());
-        for e in entries() {
+        assert_eq!(GENERATED_PROTECTION_WHY.len(), GENERATED_PROTECTION.len());
+        for e in entries().iter().chain(protection_entries()) {
             assert!(
                 provenance(e).is_some_and(|w| !w.is_empty()),
                 "{} has no provenance",
@@ -938,8 +1285,13 @@ mod tests {
     #[test]
     fn compiled_table_equals_a_fresh_derivation() {
         let fresh = derive_edited(&|_, t| t, &[]).expect("derivation of the current sources");
-        assert_eq!(fresh.len(), GENERATED.len());
-        for (f, g) in fresh.iter().zip(GENERATED.iter()) {
+        assert_eq!(fresh.len(), GENERATED.len() + GENERATED_PROTECTION.len());
+        let (prot, bc): (Vec<_>, Vec<_>) = fresh.iter().partition(|e| e.category == "protection");
+        let pairs = bc
+            .iter()
+            .zip(GENERATED.iter())
+            .chain(prot.iter().zip(GENERATED_PROTECTION.iter()));
+        for (f, g) in pairs {
             assert_eq!(f.rel, g.rel);
             assert_eq!(f.category, category_wire(g.category), "{}", g.rel);
             assert_eq!(f.check, check_wire(g.check), "{}", g.rel);
@@ -949,6 +1301,7 @@ mod tests {
         }
         let rendered = derive::render(&fresh);
         assert!(rendered.contains("static GENERATED: &[Entry]"));
+        assert!(rendered.contains("static GENERATED_PROTECTION: &[Entry]"));
     }
 
     /// W1 + Y3: the list holds FILES only — every rel is a shipped pack file, none is a
@@ -956,7 +1309,7 @@ mod tests {
     #[test]
     fn list_holds_files_only() {
         let shipped: BTreeSet<&str> = crate::pack::PACK_ALL.iter().map(|(r, _)| *r).collect();
-        for e in entries() {
+        for e in entries().iter().chain(protection_entries()) {
             assert!(
                 shipped.contains(e.rel),
                 "{} is not a file of the embedded pack",
@@ -974,7 +1327,8 @@ mod tests {
             );
         }
         let v = list_json();
-        for row in v["entries"].as_array().unwrap() {
+        let rows = v["entries"].as_array().unwrap().iter();
+        for row in rows.chain(v["protection"].as_array().unwrap().iter()) {
             let rel = row["rel"].as_str().unwrap();
             assert!(
                 shipped.contains(rel),
@@ -1022,7 +1376,7 @@ mod tests {
                 .any(|(r, _)| *r == "round/SESSION_STATE.md"),
             "the control is gone: the pack no longer ships round/SESSION_STATE.md"
         );
-        for e in entries() {
+        for e in entries().iter().chain(protection_entries()) {
             let base = e.rel.rsplit('/').next().unwrap();
             assert!(!base.starts_with("SESSION_STATE"), "{}", e.rel);
             assert!(
@@ -1089,11 +1443,7 @@ mod tests {
     /// protection-only file is not boot-critical (exit 1) but `is_protection_related`.
     #[test]
     fn protection_rows_are_a_sibling_list() {
-        let prot: Vec<&str> = entries()
-            .iter()
-            .filter(|e| e.category == C::Protection)
-            .map(|e| e.rel)
-            .collect();
+        let prot: Vec<&str> = protection_entries().iter().map(|e| e.rel).collect();
         assert_eq!(
             prot,
             vec![
@@ -1102,10 +1452,27 @@ mod tests {
                 "trusted-keys.json"
             ]
         );
+        assert!(protection_entries()
+            .iter()
+            .all(|e| e.category == C::Protection && !e.lifeline));
+        // RULINGS AI6: nothing that asks "is this boot-critical" ever meets a protection-only row
+        assert!(entries().iter().all(|e| e.category != C::Protection));
         assert!(boot_critical_entry("trusted-keys.json").is_none());
+        assert!(boot_critical_entry("hooks/guard.sh").is_none());
         assert!(protection_entry("trusted-keys.json").is_some());
         assert!(boot_critical_entry("hooks/role-capability-gate.sh").is_some());
         assert!(protection_entry("hooks/role-capability-gate.sh").is_some());
+        let v = list_json();
+        let in_entries: BTreeSet<&str> = v["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["rel"].as_str().unwrap())
+            .collect();
+        assert!(
+            !in_entries.contains("trusted-keys.json") && !in_entries.contains("hooks/guard.sh")
+        );
+        assert_eq!(v["protection"].as_array().unwrap().len(), 3);
         let root = PathBuf::from("/h/.cys/pack");
         let a = classify_with(
             Path::new("/h/.cys/pack/trusted-keys.json"),
@@ -1391,6 +1758,38 @@ mod tests {
         }
     }
 
+    /// RULINGS AI3: `stub_dir` first, then every entry of the caller's PATH that does NOT hold a
+    /// `cys` / `cys.exe` binary.
+    #[cfg(unix)]
+    fn hermetic_path(stub_dir: &Path, caller: &str) -> String {
+        let mut parts = vec![stub_dir.to_string_lossy().into_owned()];
+        for d in std::env::split_paths(caller) {
+            if d.as_os_str().is_empty() || d.join("cys").exists() || d.join("cys.exe").exists() {
+                continue;
+            }
+            parts.push(d.to_string_lossy().into_owned());
+        }
+        parts.join(":")
+    }
+
+    /// The hermetic PATH really drops a directory that holds a `cys` and puts the stub first.
+    #[cfg(unix)]
+    #[test]
+    fn hermetic_path_drops_every_cys() {
+        let t = std::env::temp_dir().join(format!("t5a-hpath-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        let (stub, with_cys) = (t.join("stub"), t.join("installed"));
+        std::fs::create_dir_all(&stub).unwrap();
+        std::fs::create_dir_all(&with_cys).unwrap();
+        std::fs::write(with_cys.join("cys"), "#!/bin/sh\n").unwrap();
+        // pure: the caller's PATH is passed in — the process environment is never changed
+        let p = hermetic_path(&stub, &format!("{}:/usr/bin:/bin", with_cys.display()));
+        assert!(p.starts_with(&stub.to_string_lossy().into_owned()), "{p}");
+        assert!(!p.contains(&with_cys.to_string_lossy().into_owned()), "{p}");
+        assert!(p.contains("/usr/bin"), "{p}");
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
     // ── isolated-HOME start replay (D:734 / C4 4.4 — what this level can measure) ───────
 
     /// One hook run of the replay.
@@ -1467,6 +1866,26 @@ mod tests {
             }
         };
         let trip_log = root.join("trip.log");
+        // RULINGS AI3 — hermetic: no PATH entry that holds a `cys` binary survives, and a stub `cys`
+        // (logs its argv, prints nothing, exits 1 like a non-working binary) comes first; no test
+        // of this feature ever executes an installed binary.
+        let stub_dir = root.join("stub-bin");
+        std::fs::create_dir_all(&stub_dir).unwrap();
+        let cys_log = root.join("cys-calls.log");
+        let stub = stub_dir.join("cys");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 1\n",
+                cys_log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let hermetic_path = hermetic_path(
+            &stub_dir,
+            &std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
+        );
         let tripwired = |rel: &str| -> Option<String> {
             let t = original(rel);
             let (first, rest) = match t.split_once('\n') {
@@ -1522,10 +1941,7 @@ mod tests {
             let mut child = Command::new("sh")
                 .arg(pack.join(e.rel))
                 .env_clear()
-                .env(
-                    "PATH",
-                    std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
-                )
+                .env("PATH", &hermetic_path)
                 .env("HOME", &home)
                 .env("TMPDIR", &tmp)
                 .env("CYS_PACK_DIR", &pack)
@@ -1719,6 +2135,11 @@ mod tests {
             }
         }
 
+        let stub_calls = std::fs::read_to_string(&cys_log).unwrap_or_default();
+        matrix.push(format!(
+            "stub cys (the only cys on PATH) was called {} time(s)",
+            stub_calls.lines().count()
+        ));
         let report = format!(
             "{}\nPROBLEMS:\n{}\n",
             matrix.join("\n"),
@@ -1901,6 +2322,88 @@ mod tests {
             .map(|(r, _)| r)
             .collect();
         assert_eq!(got, vec!["bin/a.py".to_string(), "bin/b.py".to_string()]);
+    }
+
+    /// RULINGS AI1: imports wherever written, tools launched or opened by path, Python heredocs
+    /// inside shell scripts, interpreter launches in shell; documentation and comments never bind.
+    #[test]
+    fn binding_rule_follows_what_start_scripts_run() {
+        let rels: BTreeSet<&str> = [
+            "bin/lazy.py",
+            "bin/tool.py",
+            "bin/rules.json",
+            "bin/dyn.py",
+            "bin/doc.py",
+            "bin/cmt.py",
+            "bin/heredoc_mod.py",
+            "bin/launched.py",
+            "bin/echoed.py",
+        ]
+        .into_iter()
+        .collect();
+        let py = concat!(
+            "\"\"\"Module doc: import doc and os.path.join(P, \"bin\", \"doc.py\").\"\"\"\n",
+            "import os\n",
+            "def f():\n",
+            "    try:\n",
+            "        import lazy\n",
+            "    except ImportError:\n",
+            "        pass\n",
+            "    t = os.path.join(PACK, \"bin\",\n",
+            "                     \"tool.py\")\n",
+            "    r = os.path.join(HERE, \"rules.json\")\n",
+            "    m = importlib.import_module(\"dyn\")\n",
+            "    # import cmt\n",
+            "    return [sys.executable, t]\n",
+        );
+        let got: Vec<String> = derive::bindings("bin/start.py", py, &rels)
+            .into_iter()
+            .map(|(r, _)| r)
+            .collect();
+        assert_eq!(
+            got,
+            vec!["bin/dyn.py", "bin/lazy.py", "bin/rules.json", "bin/tool.py"],
+            "doc/comment mentions must not bind"
+        );
+        let sh = concat!(
+            "#!/bin/bash\n",
+            "python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/launched.py\" --x\n",
+            "echo 'run: python3 \"$pk/bin/echoed.py\"' >&2\n",
+            "exec \"$CYS_PY\" - <<'PYEOF'\n",
+            "import heredoc_mod\n",
+            "print(\"python3 '$CYS_PACK_DIR/bin/echoed.py'\")\n",
+            "PYEOF\n",
+            "cat <<EOF\n",
+            "python3 \"$PACK/bin/echoed.py\"\n",
+            "EOF\n",
+        );
+        let got: Vec<String> = derive::bindings("hooks/h.sh", sh, &rels)
+            .into_iter()
+            .map(|(r, _)| r)
+            .collect();
+        assert_eq!(got, vec!["bin/heredoc_mod.py", "bin/launched.py"]);
+    }
+
+    /// RULINGS AI8: a registrar named in a docstring or a comment is not a call site.
+    #[test]
+    fn census_ignores_documentation_and_comments() {
+        let got = derive_edited(
+            &edit_one("cysjavis-pack/bin/javis_preflight.py", |t| {
+                format!(
+                    "{t}\n\"\"\"Doc: err = self._register_event_hook(t, ev, \"x.sh\")\n    def _register_doc_hook(self):\n\"\"\"\n# err = self._register_hook(t)\n"
+                )
+            }),
+            &[],
+        );
+        assert!(got.is_ok(), "{got:?}");
+        let got = derive_edited(
+            &|_, t| t,
+            &[(
+                "bin/javis_doc_tool.py",
+                "\"\"\"Example: data.setdefault(\"hooks\", {})\"\"\"\n# data.setdefault(\"hooks\", {})\n",
+            )],
+        );
+        assert!(got.is_ok(), "{got:?}");
     }
 
     /// B6: no new build-dependency (Rust std + the existing `serde_json`; Windows `winresource`).
