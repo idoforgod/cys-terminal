@@ -20,6 +20,8 @@ pub mod lock;
 pub mod owner_origin;
 pub mod paths;
 pub mod platform;
+/// T6 — the appended job's work: probation re-check, M10, the start-time pass.
+pub mod probation;
 pub mod rehearsal;
 pub mod roles;
 pub mod rules;
@@ -27,6 +29,10 @@ pub mod rules;
 pub mod screen;
 pub mod tombstones;
 pub mod types;
+/// T6 — the vault's fresh write-once slots and the seal (C2).
+pub mod vault;
+/// T6 — write-ahead operation records (C1 1.13).
+pub mod wal;
 
 /// The ONE candidate reader (RULINGS V2(a)) — see [`ledger::candidate_states`].
 pub use ledger::candidate_states;

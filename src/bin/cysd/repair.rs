@@ -1997,6 +1997,7 @@ mod ledger_verbs {
                 committed: Vec::new(),
                 fixer_seats: Vec::new(),
                 checks: Vec::new(),
+                reapplies: None, // T6 (AQ5): `reapply` sets it on R′ after this body created R′
             };
             Ok(rec)
         })?;

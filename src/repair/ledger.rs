@@ -134,6 +134,11 @@ pub struct RepairRecord {
     /// that did not run is never listed.
     #[serde(default)]
     pub checks: Vec<(String, String)>,
+    /// RULINGS AQ5 (T6): set on R′ when `cys repair reapply <R>` started it — `reapplies: R`
+    /// (shown by `status`); `None` for every other repair. AR1: a second `reapply R` is refused while
+    /// a repair with `reapplies: R` is unfinished or in force.
+    #[serde(default)]
+    pub reapplies: Option<RepairId>,
 }
 
 /// The probation bundle of one lane (C1 1.6, K4, N3).
@@ -1254,6 +1259,7 @@ mod tests {
             committed: vec![("bin/a.py".into(), "file:bb:0755".into())],
             fixer_seats: vec![3, 9],
             checks: vec![("bin/a.py".into(), "py-compile".into())],
+            reapplies: Some(id("R-11")),
         };
         let v = serde_json::to_value(&rec).unwrap();
         assert_eq!(
@@ -1286,6 +1292,8 @@ mod tests {
                 "committed",
                 "fixer_seats",
                 "checks",
+                // T6 (RULINGS AQ5) — the old expectation ended at "checks"
+                "reapplies",
             ])
         );
         assert_eq!(
@@ -1506,6 +1514,7 @@ mod storage_tests {
             committed: vec![],
             fixer_seats: vec![],
             checks: vec![],
+            reapplies: None,
         }
     }
 
@@ -1938,9 +1947,10 @@ mod storage_tests {
         let mut v = serde_json::to_value(sample(&id)).unwrap();
         v.as_object_mut().unwrap().remove("fixer_seats");
         v.as_object_mut().unwrap().remove("checks");
+        v.as_object_mut().unwrap().remove("reapplies"); // T6 (AQ5): a record from before the field
         std::fs::write(record_path_in(&root, &id), serde_json::to_vec(&v).unwrap()).unwrap();
         let r = read_record_in(&root, &id).unwrap().unwrap();
-        assert!(r.fixer_seats.is_empty() && r.checks.is_empty());
+        assert!(r.fixer_seats.is_empty() && r.checks.is_empty() && r.reapplies.is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 

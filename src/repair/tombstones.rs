@@ -86,7 +86,9 @@ fn write_file(root: &Path, lane: &LaneKey, list: Vec<Tombstone>) -> Result<(), R
         lane: lane.clone(),
         tombstones: list,
     };
-    crate::atomic_write_json(&p, &f).map_err(|e| RepairError::Io(format!("{}: {e}", p.display())))
+    // RULINGS AK7 (T6): written with the durable helper (full flush of the file and its folder) — a
+    // committed deletion must never be left without its tombstone by a power loss; same bytes as before.
+    super::durable::write_json_durable(&p, &f)
 }
 
 /// Records one tombstone in the lane's file (written only by that lane's daemon — B1). Idempotent:
