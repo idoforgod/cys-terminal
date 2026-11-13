@@ -210,19 +210,123 @@ pub fn signature(rel: &str, class: &str, line: &str) -> String {
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Operations that fail BY DESIGN and must not become intake (design §4-4; precedent
-/// `cysjavis-pack/bin/javis_teamtoken.py` 470–483: on Windows `cys-dept` is not on a pane's PATH, so
-/// the department-creation check always fails with 127 — reported, it would add one row per prompt
-/// per seat). Returns the reason when excluded.
-pub fn excluded(rel: &str, error: &str, windows: bool) -> Option<&'static str> {
-    let low = error.to_ascii_lowercase();
-    let mentions_dept = rel.contains("cys-dept") || low.contains("cys-dept");
-    let not_found =
-        low.contains("127") || low.contains("command not found") || low.contains("not recognized");
-    if windows && mentions_dept && not_found {
-        return Some("windows-cys-dept-not-on-path");
+/// Where an entry of the exclusion list applies (RULINGS AD8 — track T3b owns the list).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExclusionScope {
+    /// `cys repair report` AND the daemon's repeated-failure detector.
+    All,
+    /// Only the detector: the entry needs what only an observed call carries (the subcommand the
+    /// command line gave the script, the exit code at the head of the failure text). The detector's
+    /// own entries live beside it (`cysd` `alerts.rs`, `DETECTOR_EXCLUSIONS`).
+    Detector,
+}
+
+/// How an entry recognises its by-design failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExclusionRule {
+    /// Windows: `cys-dept` is not on a pane's PATH, so the department check always ends 127 /
+    /// "command not found" / "not recognized" (precedent `javis_teamtoken.py` 470–483).
+    DeptNotOnPath,
+    /// A verdict tool whose non-zero exit IS its designed answer ("not ready", "start refused",
+    /// "conflict — do not retry" …), not a defect: `rel` (and, when `sub` is given, that first
+    /// argument) with a failure text whose first line is exactly `Exit code N`, N in `exits`, and
+    /// no Python traceback in it (a crash of the same tool exits 1 WITH a traceback and stays a defect).
+    DesignedAnswer {
+        rel: &'static str,
+        sub: Option<&'static str>,
+        exits: &'static [i64],
+    },
+}
+
+/// One entry of the exclusion list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Exclusion {
+    pub reason: &'static str,
+    pub windows_only: bool,
+    pub scope: ExclusionScope,
+    pub rule: ExclusionRule,
+}
+
+impl Exclusion {
+    /// Whether this entry covers a failure of `rel` (first argument `sub`, when known) with `error`.
+    pub fn matches(&self, rel: &str, sub: Option<&str>, error: &str, windows: bool) -> bool {
+        if self.windows_only && !windows {
+            return false;
+        }
+        match self.rule {
+            ExclusionRule::DeptNotOnPath => {
+                let low = error.to_ascii_lowercase();
+                let mentions_dept = rel.contains("cys-dept") || low.contains("cys-dept");
+                let not_found = low.contains("127")
+                    || low.contains("command not found")
+                    || low.contains("not recognized");
+                mentions_dept && not_found
+            }
+            ExclusionRule::DesignedAnswer {
+                rel: r,
+                sub: want_sub,
+                exits,
+            } => {
+                r == rel
+                    && want_sub.is_none_or(|w| sub == Some(w))
+                    && leading_exit_code(error).is_some_and(|c| exits.contains(&c))
+                    && !has_python_traceback(error)
+            }
+        }
     }
-    None
+}
+
+/// The exclusion list's entries for BOTH intake sources — operations that fail BY DESIGN and must
+/// not become intake (design §4-4, §6-4 (4)): without them a by-design failure files one row per
+/// prompt per seat. The detector adds its own detector-scope entries (the designed answers of verdict
+/// tools, which need the observed call) and consults this table first.
+pub const EXCLUSIONS: &[Exclusion] = &[
+    // precedent javis_teamtoken.py 470–483 (T3's entry, unchanged behaviour)
+    Exclusion {
+        reason: "windows-cys-dept-not-on-path",
+        windows_only: true,
+        scope: ExclusionScope::All,
+        rule: ExclusionRule::DeptNotOnPath,
+    },
+];
+
+/// The exit code a failure text announces on its first non-empty line, when that line is exactly
+/// `Exit code N` (the shape Claude Code gives a failed shell call: "Exit code 1\nError: …").
+pub fn leading_exit_code(error: &str) -> Option<i64> {
+    let first = error.lines().map(str::trim).find(|l| !l.is_empty())?;
+    first
+        .strip_prefix("Exit code ")
+        .and_then(|n| n.trim().parse::<i64>().ok())
+}
+
+/// Whether a failure text carries a Python traceback.
+pub fn has_python_traceback(error: &str) -> bool {
+    error.contains("Traceback (most recent call last)")
+}
+
+/// The first entry of `table` that covers the failure (every scope). Returns its reason.
+pub fn excluded_in(
+    table: &[Exclusion],
+    rel: &str,
+    sub: Option<&str>,
+    error: &str,
+    windows: bool,
+) -> Option<&'static str> {
+    table
+        .iter()
+        .find(|e| e.matches(rel, sub, error, windows))
+        .map(|e| e.reason)
+}
+
+/// Operations that fail BY DESIGN and must not become intake — for `cys repair report` (the entries
+/// of [`EXCLUSIONS`] with scope [`ExclusionScope::All`]; a manual report carries no observed call).
+/// Returns the reason when excluded.
+pub fn excluded(rel: &str, error: &str, windows: bool) -> Option<&'static str> {
+    EXCLUSIONS
+        .iter()
+        .filter(|e| e.scope == ExclusionScope::All)
+        .find(|e| e.matches(rel, None, error, windows))
+        .map(|e| e.reason)
 }
 
 /// What one report did.
@@ -606,6 +710,69 @@ mod tests {
             "an excluded report wrote something"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// T3b (RULINGS AD8): the list's own table keeps T3's entry with its exact behaviour (reports and
+    /// detector alike, Windows only) and every entry has a distinct reason.
+    #[test]
+    fn exclusion_table_keeps_the_windows_dept_entry_for_both_sources() {
+        let mut reasons: Vec<&str> = EXCLUSIONS.iter().map(|e| e.reason).collect();
+        reasons.sort_unstable();
+        reasons.dedup();
+        assert_eq!(reasons.len(), EXCLUSIONS.len(), "a reason names two entries");
+        assert!(EXCLUSIONS.iter().all(|e| e.scope == ExclusionScope::All));
+        let dept = "Exit code 127\n/usr/bin/bash: line 1: cys-dept: command not found";
+        for sub in [None, Some("create")] {
+            assert_eq!(
+                excluded_in(EXCLUSIONS, "bin/cys-dept", sub, dept, true),
+                Some("windows-cys-dept-not-on-path")
+            );
+        }
+        assert_eq!(excluded_in(EXCLUSIONS, "bin/cys-dept", None, dept, false), None, "macOS: a missing cys-dept IS a defect");
+        assert_eq!(excluded("bin/cys-dept", dept, true), Some("windows-cys-dept-not-on-path"));
+        // a detector-scope entry is never applied to a manual report through `excluded`
+        let only_detector = [Exclusion {
+            reason: "t",
+            windows_only: false,
+            scope: ExclusionScope::Detector,
+            rule: ExclusionRule::DesignedAnswer { rel: "bin/x.py", sub: None, exits: &[9] },
+        }];
+        assert_eq!(excluded_in(&only_detector, "bin/x.py", None, "Exit code 9", false), Some("t"));
+        assert_eq!(excluded("bin/x.py", "Exit code 9", false), None);
+    }
+
+    /// The designed-answer rule matches only its exit code (and subcommand, when the entry names
+    /// one), only as the FIRST line `Exit code N`, and never when the text carries a Python traceback.
+    #[test]
+    fn designed_answer_rule_matches_only_its_exit_and_never_a_traceback() {
+        let e = Exclusion {
+            reason: "t",
+            windows_only: false,
+            scope: ExclusionScope::Detector,
+            rule: ExclusionRule::DesignedAnswer { rel: "bin/g.py", sub: Some("check"), exits: &[1, 2] },
+        };
+        assert!(e.matches("bin/g.py", Some("check"), "Exit code 2\nhard_block", false));
+        assert!(e.matches("bin/g.py", Some("check"), "  \nExit code 1", true));
+        assert!(!e.matches("bin/g.py", Some("check"), "Exit code 70\ninternal", false));
+        assert!(!e.matches("bin/g.py", Some("enforce"), "Exit code 2", false), "another subcommand");
+        assert!(!e.matches("bin/g.py", None, "Exit code 2", false), "no subcommand known");
+        assert!(!e.matches("bin/other.py", Some("check"), "Exit code 2", false));
+        assert!(!e.matches(
+            "bin/g.py",
+            Some("check"),
+            "Exit code 1\nTraceback (most recent call last):\n  File \"x\", line 1\nKeyError: 'k'",
+            false
+        ));
+        assert!(!e.matches("bin/g.py", Some("check"), "error\nExit code 2", false), "not the first line");
+        assert!(!e.matches("bin/g.py", Some("check"), "Exit code 2x", false));
+        let any_sub = Exclusion {
+            rule: ExclusionRule::DesignedAnswer { rel: "bin/g.py", sub: None, exits: &[4] },
+            ..e
+        };
+        assert!(any_sub.matches("bin/g.py", Some("drain"), "Exit code 4", false));
+        assert!(any_sub.matches("bin/g.py", None, "Exit code 4", false));
+        assert_eq!(leading_exit_code("\n  Exit code -1 \nx"), Some(-1));
+        assert_eq!(leading_exit_code("SyntaxError: x"), None);
     }
 
     /// A broken row is listed, never fatal, and never overwritten by a report (one writer, O-C1-6).
