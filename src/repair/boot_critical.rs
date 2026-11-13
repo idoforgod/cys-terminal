@@ -3281,6 +3281,9 @@ mod tests {
         }
         assert!(derive::has_err_trap("trap 'echo failed' ERR"));
         assert!(derive::has_err_trap("x=1; trap cleanup EXIT ERR"));
+        // a quoted action holding `&` / `;` / `|` (the form the census test puts in the hook)
+        assert!(derive::has_err_trap("trap 'echo failed >&2; exit 1' ERR"));
+        assert!(derive::has_err_trap("[ -n \"$X\" ] && trap 'a | b' ERR"));
         assert!(!derive::has_err_trap("trap 'rm -f \"$T\"' EXIT"));
         assert!(!derive::has_err_trap("# trap x ERR"));
     }
@@ -3342,7 +3345,7 @@ mod tests {
         );
         // an `ERR` trap in the hook (RULINGS CD2)
         fails_at_51(
-            |t| t.replacen("set +e\n", "set +e\ntrap 'echo failed >&2' ERR\n", 1),
+            |t| t.replacen("set +e\n", "set +e; trap 'echo failed >&2' ERR\n", 1),
             "an `ERR` trap",
         );
         // in the background (RULINGS CD2)

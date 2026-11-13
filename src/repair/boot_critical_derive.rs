@@ -2208,19 +2208,28 @@ pub fn has_errexit(text: &str) -> bool {
         })
 }
 
-/// RULINGS CD2: an `ERR` trap anywhere in the text (`trap '…' ERR`) — a failing command then runs
-/// the trap, so its exit status is not discarded.
+/// RULINGS CD2: an `ERR` trap anywhere in the text (`trap '…' ERR`, `x; trap f EXIT ERR`) — a
+/// failing command then runs the trap, so its exit status is not discarded. Read word by word on
+/// each line (a quoted action may hold `&`, `;` or `|`): a `trap` at the start of a command whose
+/// later words hold `ERR` (quotes and `;` stripped).
 pub fn has_err_trap(text: &str) -> bool {
     text.lines()
-        .map(|l| l.split('#').next().unwrap_or(""))
-        .flat_map(|l| {
-            l.split([';', '&', '|'])
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
-        .any(|cmd| {
-            let words: Vec<&str> = cmd.split_whitespace().collect();
-            words.first() == Some(&"trap") && words.iter().skip(1).any(|w| *w == "ERR")
+        .map(|l| l.split(" #").next().unwrap_or(""))
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .any(|l| {
+            let words: Vec<&str> = l.split_whitespace().collect();
+            words.iter().enumerate().any(|(i, w)| {
+                *w == "trap"
+                    && (i == 0
+                        || words[i - 1].ends_with(';')
+                        || matches!(
+                            words[i - 1],
+                            "&&" | "||" | "|" | "then" | "do" | "else" | "{" | "("
+                        ))
+                    && words[i + 1..]
+                        .iter()
+                        .any(|x| x.trim_matches(|c| c == '\'' || c == '"' || c == ';') == "ERR")
+            })
         })
 }
 
