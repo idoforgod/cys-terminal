@@ -10982,34 +10982,69 @@ exit 0
         let tmpl_v1 = format!("CEO 머리말 v1\n{sep}표준 MASTER\n");
         let tmpl_v2 = format!("CEO 머리말 v2\n{sep}표준 MASTER v2\n");
         let composed_v1 = format!("CEO 머리말 v1\n{sep}표준 MASTER\n");
-        let composed_v1_edited = format!("CEO 머리말 v1\n{sep}표준 MASTER\nUSERFIX-사용자가 고친 줄\n");
+        let composed_v1_edited =
+            format!("CEO 머리말 v1\n{sep}표준 MASTER\nUSERFIX-사용자가 고친 줄\n");
         let (t1, t2) = (Some(tmpl_v1.as_bytes()), Some(tmpl_v2.as_bytes()));
         // ⓐ 현행 머리말로 조립 — 본문이 사용자 수정이든 아니든 비노출(.pre-ceo 유무와 무관).
         assert!(!ceo_drift_verdict(true, Some(composed_v1.as_bytes()), t1));
-        assert!(!ceo_drift_verdict(true, Some(composed_v1_edited.as_bytes()), t1));
-        assert!(!ceo_drift_verdict(false, Some(composed_v1_edited.as_bytes()), t1));
+        assert!(!ceo_drift_verdict(
+            true,
+            Some(composed_v1_edited.as_bytes()),
+            t1
+        ));
+        assert!(!ceo_drift_verdict(
+            false,
+            Some(composed_v1_edited.as_bytes()),
+            t1
+        ));
         // ⓑ 틀 전진(머리말 v1 → v2) — 노출(재실행 = 머리말만 다시 조립 · 본문 유지). 조립 자체가 승격이라 .pre-ceo 불요.
-        assert!(ceo_drift_verdict(true, Some(composed_v1_edited.as_bytes()), t2));
-        assert!(ceo_drift_verdict(false, Some(composed_v1_edited.as_bytes()), t2));
+        assert!(ceo_drift_verdict(
+            true,
+            Some(composed_v1_edited.as_bytes()),
+            t2
+        ));
+        assert!(ceo_drift_verdict(
+            false,
+            Some(composed_v1_edited.as_bytes()),
+            t2
+        ));
         // ⓒ 구분선 없는 옛 승격본(.pre-ceo 실재) → 노출 / 미승격 표준 MASTER(.pre-ceo 부재) → 비노출(주권 편집).
-        assert!(ceo_drift_verdict(true, Some("구 6KB CEO 머리글만 있는 옛 사본\n".as_bytes()), t2));
-        assert!(!ceo_drift_verdict(false, Some("표준 MASTER\nUSERFIX\n".as_bytes()), t2));
+        assert!(ceo_drift_verdict(
+            true,
+            Some("구 6KB CEO 머리글만 있는 옛 사본\n".as_bytes()),
+            t2
+        ));
+        assert!(!ceo_drift_verdict(
+            false,
+            Some("표준 MASTER\nUSERFIX\n".as_bytes()),
+            t2
+        ));
         // CRLF 로 바뀐 같은 구분선도 머리말로 읽는다(cys-dept 와 같은 규칙).
         let crlf = composed_v1_edited.replace('\n', "\r\n");
         let tmpl_crlf = tmpl_v1.replace('\n', "\r\n");
-        assert!(!ceo_drift_verdict(true, Some(crlf.as_bytes()), Some(tmpl_crlf.as_bytes())));
+        assert!(!ceo_drift_verdict(
+            true,
+            Some(crlf.as_bytes()),
+            Some(tmpl_crlf.as_bytes())
+        ));
         // ⓓ 판독 불가(어느 쪽이든)·구분선 없는 틀 → 비노출(보수) — 틀 소실·스텁 시 재실행 권유 금지.
         assert!(!ceo_drift_verdict(true, None, t2));
         assert!(!ceo_drift_verdict(true, Some(composed_v1.as_bytes()), None));
         assert!(!ceo_drift_verdict(true, None, None));
-        assert!(!ceo_drift_verdict(true, Some(composed_v1.as_bytes()), Some("CEO-STUB\n".as_bytes())));
+        assert!(!ceo_drift_verdict(
+            true,
+            Some(composed_v1.as_bytes()),
+            Some("CEO-STUB\n".as_bytes())
+        ));
     }
 
     /// ★T8: 앱의 조립 구분선은 생성기(`scripts/gen_ceo_template.py` SEPARATOR)와 같은 바이트이고, 출하 틀
     /// (`cysjavis-pack/directives/CEO_TEMPLATE.md`)에 정확히 한 번 있으며 그 뒤가 출하 MASTER 전문이다(조립 계약의 원천).
     #[test]
     fn ceo_separator_matches_generator() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap();
         let gen = std::fs::read_to_string(root.join("scripts/gen_ceo_template.py")).unwrap();
         let literal = CEO_SEPARATOR.replace('\n', "\\n");
         assert!(
@@ -11017,12 +11052,21 @@ exit 0
             "생성기의 SEPARATOR 리터럴이 앱 사본과 다르다(재조립 구분선 드리프트)"
         );
         let tmpl = std::fs::read(root.join("cysjavis-pack/directives/CEO_TEMPLATE.md")).unwrap();
-        let master = std::fs::read(root.join("cysjavis-pack/directives/MASTER_DIRECTIVE.md")).unwrap();
+        let master =
+            std::fs::read(root.join("cysjavis-pack/directives/MASTER_DIRECTIVE.md")).unwrap();
         let header = ceo_header(&tmpl).expect("출하 틀에 조립 구분선이 없다");
         let sep = CEO_SEPARATOR.as_bytes();
         assert_eq!(&tmpl[header.len()..header.len() + sep.len()], sep);
-        assert_eq!(&tmpl[header.len() + sep.len()..], &master[..], "구분선 뒤가 출하 MASTER 전문이 아니다");
-        assert_eq!(tmpl.windows(sep.len()).filter(|w| *w == sep).count(), 1, "구분선은 틀에 한 번만");
+        assert_eq!(
+            &tmpl[header.len() + sep.len()..],
+            &master[..],
+            "구분선 뒤가 출하 MASTER 전문이 아니다"
+        );
+        assert_eq!(
+            tmpl.windows(sep.len()).filter(|w| *w == sep).count(),
+            1,
+            "구분선은 틀에 한 번만"
+        );
     }
 
     /// [F1] open_path 실행형 게이트 — 실행비트 파일은 force 없이 executable_confirm으로 거절(fail-closed),

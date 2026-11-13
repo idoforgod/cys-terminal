@@ -29596,15 +29596,25 @@ mod tests {
         let composed = format!("# CEO 머리말\n{sep}표준 MASTER\nUSERFIX-사용자가 고친 줄\n");
         std::fs::write(td.join("directives/CEO_TEMPLATE.md"), &template).unwrap();
         std::fs::write(td.join(rel), &composed).unwrap();
-        std::fs::write(td.join(format!("{rel}.pre-ceo")), "표준 MASTER\nUSERFIX-사용자가 고친 줄\n").unwrap();
-        assert_ne!(composed, template, "전제: 조립된 지침은 틀과 다르다(본문 = 사용자 지침)");
+        std::fs::write(
+            td.join(format!("{rel}.pre-ceo")),
+            "표준 MASTER\nUSERFIX-사용자가 고친 줄\n",
+        )
+        .unwrap();
+        assert_ne!(
+            composed, template,
+            "전제: 조립된 지침은 틀과 다르다(본문 = 사용자 지침)"
+        );
         for verb in [CeoGuardVerb::TakeNew, CeoGuardVerb::Rollback] {
             let msg = ceo_vendor_overwrite_rejection(&td, rel, false, verb)
                 .expect("조립된 CEO 지침(틀 ≠ 지침)도 승격 중으로 잡혀 거부돼야 한다");
             assert!(msg.contains("--force-vendor"), "override 안내 누락: {msg}");
         }
         // 술어는 팩 코어의 한 술어(갱신 규칙 가드 4)와 같다 — 두 자리가 어긋나지 않는다.
-        assert!(cys::pack::ceo_promoted_in(&td), "가드 4 술어도 조립 승격을 승격으로 본다");
+        assert!(
+            cys::pack::ceo_promoted_in(&td),
+            "가드 4 술어도 조립 승격을 승격으로 본다"
+        );
         // ⑦ 강등 뒤(지침 = 구분선 뒤 본문 · .pre-ceo 치움) — 승격 아님 → 두 동사 통과(위경보 금지).
         std::fs::write(td.join(rel), "표준 MASTER\nUSERFIX-사용자가 고친 줄\n").unwrap();
         std::fs::remove_file(td.join(format!("{rel}.pre-ceo"))).unwrap();
