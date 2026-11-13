@@ -38,11 +38,14 @@ describe("planOfficeTab — 브리지가 없거나 느릴 때", () => {
       expect({ stage: p.stage, text: p.text, load: p.loadFrame, poll: p.nextPollMs, btn: p.buttonLabel }).toEqual({ stage: "preparing", text: OFFICE_TEXT_PREPARING, load: false, poll: 3000, btn: "" });
     }
   });
-  it("3분이 지나도 안 되면 긴 안내(컴퓨터를 다시 시작·피드백) · 15초 간격 · 앱만 다시 켜라고 하지 않는다", () => {
+  it("3분이 지나도 안 되면 긴 안내(컴퓨터를 다시 시작·자비스에게 증상을 말하면 스스로 고침) · 15초 간격 · 앱만 다시 켜라고 하지 않는다", () => {
     const p = planOfficeTab({ ok: false }, ctx({ elapsedMs: OFFICE_POLL_FAST_WINDOW_MS }));
     expect({ stage: p.stage, text: p.text, poll: p.nextPollMs }).toEqual({ stage: "long", text: OFFICE_TEXT_LONG, poll: 15000 });
     expect(p.text.includes("컴퓨터를 다시 시작")).toBe(true);
-    expect(p.text.includes("피드백")).toBe(true);
+    // ★0.15.0 「스스로 해결」(RULINGS BZ3): 마지막 길은 제품 자신의 수리다 — 피드백(제작자에게 알리기)으로 보내지 않는다.
+    expect(p.text.includes("자비스에게 이 증상을 말해")).toBe(true);
+    expect(p.text.includes("스스로 고칩니다")).toBe(true);
+    expect(p.text.includes("피드백")).toBe(false);
     expect(p.text.includes("앱을 다시")).toBe(false);
   });
 });
@@ -74,11 +77,13 @@ describe("planOfficeTab — 화면 자산이 없을 때(B6)", () => {
     const p = planOfficeTab(noAssets("button"), ctx());
     expect({ stage: p.stage, text: p.text, btn: p.buttonLabel, auto: p.autoRepair }).toEqual({ stage: "assets_button", text: OFFICE_TEXT_ASSETS_BUTTON, btn: "복구", auto: false });
   });
-  it("none(윈도우 기본): 단추도 자동도 없이 피드백 안내만", () => {
+  it("none(윈도우 기본): 단추도 자동도 없이 안내만(자비스에게 증상을 말하면 스스로 고침)", () => {
     for (const repair of ["none", undefined, "weird"]) {
       const p = planOfficeTab(noAssets(repair as string), ctx());
       expect({ stage: p.stage, text: p.text, btn: p.buttonLabel, auto: p.autoRepair }).toEqual({ stage: "assets_none", text: OFFICE_TEXT_ASSETS_NONE, btn: "", auto: false });
     }
+    expect(OFFICE_TEXT_ASSETS_NONE.includes("자비스에게 이 증상을 말해")).toBe(true);
+    expect(OFFICE_TEXT_ASSETS_NONE.includes("피드백")).toBe(false);
   });
   it("OS 별 표(리뷰 M2): 자산이 없을 때 윈도우는 화면을 싣고(0.14.43 과 같다) 맥은 설계대로 복구/안내", () => {
     const rows: Array<[boolean, string, "none" | "failed" | "blocked", boolean, string]> = [
@@ -98,7 +103,7 @@ describe("planOfficeTab — 화면 자산이 없을 때(B6)", () => {
     const p = planOfficeTab(noAssets("none"), ctx({ isWindows: true }));
     expect({ text: p.text, btn: p.buttonLabel, poll: p.nextPollMs }).toEqual({ text: "", btn: "", poll: 0 });
   });
-  it("앱이 손대지 않는 상태(원장 항목 · 팩 버전 불일치)는 피드백 안내만 — 단추를 내지 않는다", () => {
+  it("앱이 손대지 않는 상태(원장 항목 · 팩 버전 불일치)는 안내만(자비스에게 증상을 말하면 스스로 고침) — 단추를 내지 않는다", () => {
     const p = planOfficeTab(noAssets("auto"), ctx({ repairOutcome: "blocked" }));
     expect({ stage: p.stage, btn: p.buttonLabel, auto: p.autoRepair }).toEqual({ stage: "assets_none", btn: "", auto: false });
   });

@@ -835,7 +835,7 @@ fn find_same_capture(input: &CaptureInput, records: &[IndexRecord], budget: &Bud
 fn halt_reason_ko(h: Halt, deadline: Duration) -> String {
     match h {
         Halt::Deadline => format!("{}초 안에 끝나지 않아 멈춤", deadline.as_secs()),
-        Halt::Abandoned => "업데이트를 기다리게 하지 않으려고 멈춤".to_string(),
+        Halt::Abandoned => "업데이트가 늦어지지 않도록 멈춤".to_string(),
     }
 }
 
@@ -1886,7 +1886,7 @@ mod tests {
         assert!(matches!(&o, CaptureOutcome::Undecidable { reason, .. } if reason.contains("0초 안에 끝나지 않아")), "{o:?}");
         assert!(notice_ko(&o).unwrap().body.contains("업데이트는 그대로 진행합니다"));
         let o = capture(&input_for(&exe, &store), &AtomicBool::new(true));
-        assert!(matches!(&o, CaptureOutcome::Undecidable { reason, .. } if reason.contains("기다리게 하지 않으려고")), "{o:?}");
+        assert!(matches!(&o, CaptureOutcome::Undecidable { reason, .. } if reason.contains("늦어지지 않도록")), "{o:?}");
         assert!(!store.exists());
     }
 

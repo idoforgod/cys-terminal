@@ -2423,6 +2423,95 @@ pub(crate) mod tests {
         });
     }
 
+    /// ★(0.15.0 · RULINGS BB2 (i)) `cys.rs::compose_directive` 가 구성요소마다 앞에 붙이는 **절 머리줄 넷**
+    /// (RSI · soul · 장기메모리 색인(경로 포함) · 스킬 색인) — 실제 페이로드의 고유 줄이므로 두 조각 상한 핀이 함께 센다
+    /// (AA2 「실제 페이로드」). 문구의 단일 출처는 `compose_directive` 다: 그 소스에 같은 리터럴이 없으면 여기서 실패한다
+    /// (머리줄을 바꾸면 이 목록도 함께 바꾼다 — 바뀐 채로 세면 핀이 과소평가한다).
+    fn compose_section_headers(pack: &Path) -> [String; 4] {
+        let src = std::fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/bin/cys.rs"),
+        )
+        .expect("src/bin/cys.rs");
+        let i = src
+            .find("fn compose_directive(")
+            .expect("compose_directive");
+        let body = &src[i..];
+        let body = &body[..body.find("\n}\n").expect("compose_directive 끝")];
+        for lit in [
+            r#""\n\n■ RSI_LEARNING_DIRECTIVE.md (5번째 절대지침 — 학습 루프)\n""#,
+            r#""\n\n■ soul.md (운영 헌장)\n""#,
+            r#""\n\n■ 장기메모리 색인 ({} — 노드 공유 의미 기억 · 증류는 bin/javis_memory.py add)\n""#,
+            r#""\n\n■ 보유 스킬 색인 (본문: `cys skill show <name>`)\n""#,
+        ] {
+            assert!(
+                body.contains(lit),
+                "compose_directive 의 절 머리줄이 바뀌었다 — 핀의 머리줄도 고쳐라: {lit}"
+            );
+        }
+        [
+            "\n\n■ RSI_LEARNING_DIRECTIVE.md (5번째 절대지침 — 학습 루프)\n".to_string(),
+            "\n\n■ soul.md (운영 헌장)\n".to_string(),
+            format!(
+                "\n\n■ 장기메모리 색인 ({} — 노드 공유 의미 기억 · 증류는 bin/javis_memory.py add)\n",
+                pack.join("memory/MEMORY.md").display()
+            ),
+            "\n\n■ 보유 스킬 색인 (본문: `cys skill show <name>`)\n".to_string(),
+        ]
+    }
+
+    /// 스킬 색인 줄(`- <name>: <description>`) — `compose_directive` 와 같은 모양(이름 없는 SKILL.md 는 건너뛴다).
+    fn skill_index_lines(pack: &Path) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(pack.join("skills")) {
+            for e in entries.flatten() {
+                let skill = std::fs::read_to_string(e.path().join("SKILL.md")).unwrap_or_default();
+                let field = |k: &str| {
+                    skill
+                        .lines()
+                        .take(10)
+                        .find_map(|l| l.strip_prefix(k))
+                        .unwrap_or("")
+                        .trim()
+                        .to_string()
+                };
+                let (name, desc) = (field("name:"), field("description:"));
+                if !name.is_empty() {
+                    out.push(format!("- {name}: {desc}\n"));
+                }
+            }
+        }
+        out
+    }
+
+    /// 역할 디렉티브(또는 CEO 합성본) 뒤에 `compose_directive` 와 같은 순서·같은 머리줄로 나머지를 잇는다 —
+    /// 머리줄 → RSI → 머리줄 → soul → 머리줄(경로) → 장기메모리 색인 → 머리줄 → 스킬 색인 → 역할 규칙 블록.
+    fn compose_like_production(head: String, pack: &Path) -> String {
+        let read = |rel: &str| std::fs::read_to_string(pack.join(rel)).unwrap_or_default();
+        let [h_rsi, h_soul, h_mem, h_skill] = compose_section_headers(pack);
+        let mut composed = head;
+        composed.push_str(&h_rsi);
+        composed.push_str(&read("directives/RSI_LEARNING_DIRECTIVE.md"));
+        composed.push_str(&h_soul);
+        composed.push_str(&read("soul.md"));
+        composed.push_str(&h_mem);
+        composed.push_str(&read("memory/MEMORY.md"));
+        let skills = skill_index_lines(pack);
+        if !skills.is_empty() {
+            composed.push_str(&h_skill);
+            for line in &skills {
+                composed.push_str(line);
+            }
+        }
+        // ★(0.15.0 · 「스스로 해결」 M1 · RULINGS AA2) `compose_directive` 는 합성 문안의 **맨 끝**에 역할 규칙 블록을 붙인다
+        //   (`cys::repair::rules::rules_text` — 공통 9줄 + 역할 1줄). 실제 페이로드의 구성요소이므로 여기서도 센다.
+        composed.push_str("\n\n");
+        composed.push_str(
+            &cys::repair::rules::rules_text(cys::repair::roles::RoleBlock::MasterCeo)
+                .expect("role block"),
+        );
+        composed
+    }
+
     /// ★R7 회귀 핀 ① — **실배포 디렉티브가 조각 상한에 얼마나 다가갔는가**를 파일에서 직접 잰다.
     ///
     /// ## 왜 이 핀이 필요한가 (라운드6 검증자 적발의 본체)
@@ -2445,36 +2534,9 @@ pub(crate) mod tests {
         const REQUIRED_HEADROOM: usize = 4;
         let pack = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("cysjavis-pack");
         let read = |rel: &str| std::fs::read_to_string(pack.join(rel)).unwrap_or_default();
-        // compose_directive 와 같은 순서 — 역할 디렉티브 → RSI → soul → 장기메모리 색인 → 스킬 색인 → 역할 규칙 블록
-        let mut composed = read("directives/MASTER_DIRECTIVE.md");
-        composed.push_str(&read("directives/RSI_LEARNING_DIRECTIVE.md"));
-        composed.push_str(&read("soul.md"));
-        composed.push_str(&read("memory/MEMORY.md"));
-        if let Ok(entries) = std::fs::read_dir(pack.join("skills")) {
-            for e in entries.flatten() {
-                let skill = std::fs::read_to_string(e.path().join("SKILL.md")).unwrap_or_default();
-                // 색인은 `- <name>: <description>` 한 줄이다(compose_directive 와 동형).
-                let field = |k: &str| {
-                    skill
-                        .lines()
-                        .take(10)
-                        .find_map(|l| l.strip_prefix(k))
-                        .unwrap_or("")
-                        .trim()
-                        .to_string()
-                };
-                let (name, desc) = (field("name:"), field("description:"));
-                if !name.is_empty() {
-                    composed.push_str(&format!("\n- {name}: {desc}"));
-                }
-            }
-        }
-        // ★(0.15.0 · 「스스로 해결」 M1 · RULINGS AA2) `compose_directive` 는 합성 문안의 **맨 끝**에 역할 규칙 블록을 붙인다
-        //   (`cys::repair::rules::rules_text` — 공통 9줄 + 역할 1줄). 실제 페이로드의 구성요소이므로 여기서도 센다.
-        composed.push_str("\n\n");
-        composed.push_str(
-            &cys::repair::rules::rules_text(cys::repair::roles::RoleBlock::MasterCeo).expect("role block"),
-        );
+        // compose_directive 와 같은 순서·같은 절 머리줄(RULINGS BB2 (i)) — 역할 디렉티브 → RSI → soul → 장기메모리 색인
+        //   → 스킬 색인 → 역할 규칙 블록.
+        let composed = compose_like_production(read("directives/MASTER_DIRECTIVE.md"), &pack);
         assert!(
             !composed.is_empty(),
             "합성 문안이 비었다 — 팩 경로가 갈렸다({})",
@@ -2534,35 +2596,9 @@ pub(crate) mod tests {
             "합성본이 ≈59KB 페이로드 상당이어야 케이스가 성립한다 (실측 {} bytes)",
             synthesized.len()
         );
-        // compose_directive 후첨과 같은 순서 — RSI → soul → 장기메모리 색인 → 스킬 색인 → 역할 규칙 블록(핀 ① 동형).
-        let mut composed = synthesized;
-        composed.push_str(&read("directives/RSI_LEARNING_DIRECTIVE.md"));
-        composed.push_str(&read("soul.md"));
-        composed.push_str(&read("memory/MEMORY.md"));
-        if let Ok(entries) = std::fs::read_dir(pack.join("skills")) {
-            for e in entries.flatten() {
-                let skill = std::fs::read_to_string(e.path().join("SKILL.md")).unwrap_or_default();
-                let field = |k: &str| {
-                    skill
-                        .lines()
-                        .take(10)
-                        .find_map(|l| l.strip_prefix(k))
-                        .unwrap_or("")
-                        .trim()
-                        .to_string()
-                };
-                let (name, desc) = (field("name:"), field("description:"));
-                if !name.is_empty() {
-                    composed.push_str(&format!("\n- {name}: {desc}"));
-                }
-            }
-        }
-        // ★(0.15.0 · 「스스로 해결」 M1 · RULINGS AA2) `compose_directive` 는 합성 문안의 **맨 끝**에 역할 규칙 블록을 붙인다
-        //   (`cys::repair::rules::rules_text` — 공통 9줄 + 역할 1줄). 실제 페이로드의 구성요소이므로 여기서도 센다.
-        composed.push_str("\n\n");
-        composed.push_str(
-            &cys::repair::rules::rules_text(cys::repair::roles::RoleBlock::MasterCeo).expect("role block"),
-        );
+        // compose_directive 후첨과 같은 순서·같은 절 머리줄 — RSI → soul → 장기메모리 색인 → 스킬 색인 → 역할 규칙 블록
+        //   (핀 ① 동형 · RULINGS BB2 (i)).
+        let composed = compose_like_production(synthesized, &pack);
         let units = submit_units(&composed).len();
         assert!(
             units * REQUIRED_HEADROOM <= MAX_PARTS,

@@ -143,8 +143,8 @@ class StandardMachine(Base):
         r = self.row(self.run_c03(), "C03.pin.worker")
         self.assertEqual(r["status"], FAIL)
         self.assertIn("무수정 배포본", r["detail"])
-        # ★0.15.0 M2(설계 v0.5 §2-1·§4-2): 원인 분류는 남에게 수리를 넘기는 문구를 쓰지 않는다(종전 문안이
-        #   "벤더 동기 필요·사용자 과실 아님" — 설계가 책임 전가 원인으로 지목한 1530행). 뜻(사용자 탓이 아님)은 유지.
+        # ★0.15.0 M2(설계 v0.5 §2-1·§4-2): 원인 분류는 남에게 수리를 넘기는 문구를 쓰지 않는다(종전 문안의 두 낱말
+        #   묶음은 아래 단언이 부재를 확인한다 — 설계가 책임 전가 원인으로 지목한 1530행). 뜻(사용자 탓이 아님)은 유지.
         self.assertIn("사용자 편집이 원인이 아니다", r["detail"])
         for old_phrase in ("벤더 동기", "과실 아님"):
             self.assertNotIn(old_phrase, r["detail"])

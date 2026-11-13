@@ -83,7 +83,7 @@ export function mountFeedbackButton(slot: HTMLElement | null, onClick: () => voi
   const b = document.createElement("button");
   b.id = "btn-feedback";
   b.type = "button";
-  b.title = "피드백 보내기 — 불편한 점이나 바라는 점을 사진·영상과 함께 알려 주세요";
+  b.title = "피드백 보내기 — 불편한 점이나 바라는 점을 나누고 싶을 때(선택 · 자동 전송 없음)";
   b.setAttribute("aria-label", "피드백 보내기");
   b.innerHTML = BUTTON_HTML;
   b.addEventListener("click", onClick);
@@ -94,7 +94,7 @@ const MODAL_HTML =
   '<div class="modal feedback-modal" role="dialog" aria-modal="true" aria-labelledby="fb-title">' +
   '<div class="fb-head"><h3 id="fb-title">피드백 보내기</h3><button type="button" class="fb-x" aria-label="닫기">×</button></div>' +
   '<div class="fb-compose">' +
-  '<p class="fb-intro">불편한 점이나 바라는 점을 알려 주세요. 사진·영상을 함께 넣어 주시면 더 빨리 고칠 수 있습니다.</p>' +
+  '<p class="fb-intro">불편한 점이나 바라는 점을 나누고 싶을 때 적어 주세요(보낼지는 직접 정합니다 · 자동 전송 없음). 사진·영상을 함께 넣을 수 있습니다.</p>' +
   '<textarea class="modal-input fb-desc" rows="6" maxlength="10000" placeholder="무엇을 하다가 어떤 일이 있었나요? (필수)"></textarea>' +
   '<div class="fb-drop"><div class="fb-drop-row"><span class="fb-drop-hint"></span>' +
   '<button type="button" class="fb-btn fb-pick">파일 고르기</button></div>' +
@@ -221,7 +221,7 @@ async function runFeedbackModal(deps: FeedbackDeps): Promise<void> {
   /** 첨부 작업은 한 줄로 세운다(칸 번호 배정·합계 상한이 어긋나지 않게 — Rust 잠금과 이중). */
   const enqueue = (label: string, job: () => Promise<void>) => {
     if (done || submitting) {
-      setStatus("묶음을 이미 만들었습니다 — 새 첨부는 새 피드백으로 보내 주세요.", "error");
+      setStatus("묶음을 이미 만들었습니다 — 새 첨부는 피드백을 새로 작성해 담아 주세요.", "error");
       return;
     }
     pending++;
