@@ -26339,7 +26339,7 @@ fn pack_plan_sections(plan: &cys::pack::InstallPlan) -> Vec<(&'static str, &[Str
         (
             "🧬 자동 병합(3-way)",
             &plan.merge3,
-            "수정본+vendor 전진 — 검증된 조상 위 자동 병합(충돌·실패는 내 파일 유지+<파일>.new · 기동 필수는 vendor 우선+<파일>.user)",
+            "일반 파일의 수정본+vendor 전진 — 검증된 조상 위 자동 병합(충돌·실패는 내 파일 유지+<파일>.new) · 기동 필수 파일은 설치 때 병합하지 않는다(vendor 우선 — 아래 버킷)",
         ),
         ("⏸ 사용자 파일 유지(user-kept)", &plan.user_kept, "내 수정본이 그대로 살아 있음 + vendor 신버전 <파일>.new 보관 → 워커가 합친다(cys pack-merge)"),
         ("🔁 기동 필수 vendor 우선(vendor-first)", &plan.vendor_first, "vendor 본을 먼저 살리고 내 수정본은 <파일>.user(이전 세대 보존) → 다시 입히기는 승인 절차(cys repair reapply)"),
@@ -26573,6 +26573,25 @@ fn merge_audit_entry(
     })
 }
 
+/// ★T2f(RULINGS BO2): 명령줄에서 받은 팩 상대경로는 수리 동사의 정규형이어야 한다(`repair::intake::normalize_rel` 의
+/// 규칙 — 절대 경로·`..`·앞의 `./`·`//`·역슬래시 없음). 정규형이 아니면 거부한다(고쳐 쓰지 않는다 — 같은 파일을 여는
+/// 다른 철자가 목록 대조를 돌아가지 못하게). Ok = 이미 정규형.
+fn pack_rel_normal_form(rel: &str) -> Result<(), String> {
+    match cys::repair::intake::normalize_rel(rel) {
+        Ok(n) if n == rel => Ok(()),
+        Ok(n) => Err(format!(
+            "⛔ 거부: '{rel}' 은 팩 기준 상대 경로의 정규형이 아닙니다 — 정규형으로 다시 실행하십시오: '{n}'(아무것도 쓰지 않았습니다)"
+        )),
+        Err(e) => Err(format!("⛔ 거부: {e:?} — 아무것도 쓰지 않았습니다")),
+    }
+}
+
+/// ★T2f(RULINGS BO4): `pack-merge --ai` 의 순수 관문 — 기동 필수·보호 목록 파일이면 AI 를 부르기 **전에** 거부한다
+/// (AI 병합 결과는 출시본이 아니고, 무변경인지는 AI 를 돌려야만 알 수 있다). Some = 거부 문장.
+fn ai_merge_refusal(rel: &str, listed: bool) -> Option<String> {
+    listed.then(|| cys::pack::listed_file_refusal(rel, "cys pack-merge --ai"))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_pack_merge(
     file: Option<String>,
@@ -26630,6 +26649,10 @@ fn run_pack_merge_with(
     if let Some(rrel) = revert_merge {
         if file.is_some() || take_new || keep_mine || ai || to_local || propose || dry_run {
             eprintln!("--revert-merge 는 단독 사용(merged 원장 전용 가역화) — 다른 해소 플래그와 조합 불가");
+            return 1;
+        }
+        if let Err(e) = pack_rel_normal_form(&rrel) {
+            eprintln!("{e}");
             return 1;
         }
         return run_pack_revert_merge(&dir, &rrel, yes, sources);
@@ -26700,6 +26723,11 @@ fn run_pack_merge_with(
         }
         return 0;
     };
+    // ★T2f(RULINGS BO2): 정규형이 아닌 철자는 원장을 보기 전에 거부.
+    if let Err(e) = pack_rel_normal_form(&rel) {
+        eprintln!("{e}");
+        return 1;
+    }
     // rel 검증(원장 기반 — 경로 traversal 차단: 원장에 있는 키만 처리).
     let Some(entry) = pending.get(&rel).cloned() else {
         eprintln!("'{rel}' 은 병합 대기 목록에 없음 — `cys pack-merge` 로 목록 확인");
@@ -26783,6 +26811,17 @@ fn run_pack_merge_with(
                 },
             };
             let ours = std::fs::read_to_string(&target).unwrap_or_default();
+            // ★T2f(RULINGS BD4 · BO3 · BO4 · BO5): 이 쓰기 동사의 단일 술어 호출 — 아래 세 갈래(take-new · keep-mine · 병합)가
+            // 함께 쓴다. 등재 파일의 '출시본'은 내장본·과거 출시 표뿐이다(`.new`·매니페스트는 근거가 아니다).
+            let listed = sources.is_listed(&rel);
+            let theirs_released = !listed || cys::pack::released_bytes(&dir, &rel, theirs.as_bytes(), sources);
+            if take_new && !theirs_released {
+                eprintln!(
+                    "⛔ 거부: '{rel}' 은 기동 필수·보호 목록에 있는 파일이고, 보관된 {rel}.new 는 출시본이 아닙니다(이 바이너리의 \
+                     내장본·과거 출시 해시 표와 다름) — 쓰지 않았습니다. 출시본은 `cys pack-heal {rel}` 이 되살립니다."
+                );
+                return 1;
+            }
             if take_new {
                 // ★A12 승격 가드 — 승격 중 base MASTER 의 vendor 채택은 confirm 이전에 기계 거부.
                 if let Some(msg) =
@@ -26855,17 +26894,23 @@ fn run_pack_merge_with(
                     println!("(dry-run · 쓰기 0) '{rel}' — 내 수정 유지·이번 vendor 신버전 해소 예정");
                     return 0;
                 }
-                advance_manifest_base(&theirs); // 이번 신버전은 '본 것'으로 — vendor 재전진 시에만 재병치
+                // ★RULINGS BO3: 등재 파일의 기준선은 출시본 해시로만 전진한다 — 아니면 기준선을 그대로 두고 말한다.
+                if theirs_released {
+                    advance_manifest_base(&theirs); // 이번 신버전은 '본 것'으로 — vendor 재전진 시에만 재병치
+                } else {
+                    println!("※ {rel}.new 가 출시본이 아니어서 설치 기준선은 그대로 둡니다(기동 필수·보호 목록 파일)");
+                }
                 resolve(&mut pending, ".new");
                 audit(&merge_audit_entry(&rel, "keep-mine", &ours, &ours, "n/a", &flag_list(&[])));
                 println!("✅ {rel} — 내 수정 유지(이번 vendor 신버전 해소)");
                 return 0;
             }
-            // ★T2f(RULINGS BD4): 병합 결과(3-way · AI)는 출시본이 아닌 바이트다 — 기동 필수·보호 목록에 있는 파일에는
-            // 쓰지 않는다(병합을 돌리기 전에 거부 — AI 를 부르지 않는다). 내 사본을 그대로 두는 해소는 --keep-mine(BH6).
-            if sources.is_listed(&rel) {
-                eprintln!("{}", cys::pack::listed_file_refusal(&rel, if ai { "cys pack-merge --ai" } else { "cys pack-merge" }));
-                return 1;
+            // ★T2f(RULINGS BO4): AI 병합은 등재 파일이면 부르기 **전에** 거부(순수 관문 — 아래 AI 호출보다 먼저).
+            if ai {
+                if let Some(refusal) = ai_merge_refusal(&rel, listed) {
+                    eprintln!("{refusal}");
+                    return 1;
+                }
             }
             // 3-way 병합: base = .pristine 조상(사용자가 fork 한 시점의 vendor 본).
             let base_path = dir.join(cys::pack::PRISTINE_DIR).join(&rel);
@@ -26877,10 +26922,20 @@ fn run_pack_merge_with(
             };
             match merged {
                 Some(m) if m == ours => {
+                    // ★RULINGS BO5: 살아 있는 바이트를 바꾸지 않는 병합은 등재 파일에도 허용(무변경 --keep-mine 과 같다).
                     println!("병합 결과 = 현재 내 수정본과 동일(vendor 변경이 이미 반영됨) — 해소만 수행");
-                    advance_manifest_base(&theirs);
+                    if theirs_released {
+                        advance_manifest_base(&theirs);
+                    } else {
+                        println!("※ {rel}.new 가 출시본이 아니어서 설치 기준선은 그대로 둡니다(기동 필수·보호 목록 파일)");
+                    }
                     resolve(&mut pending, ".new");
                     0
+                }
+                // ★T2f(RULINGS BD4): 살아 있는 바이트를 바꾸는 병합 결과는 출시본이 아니다 — 등재 파일에는 쓰지 않는다.
+                Some(_) if listed => {
+                    eprintln!("{}", cys::pack::listed_file_refusal(&rel, "cys pack-merge"));
+                    1
                 }
                 Some(m) => {
                     // ★W-D3: 헌법 파일 병합은 안전핵 소실 결정론 검증을 통과해야 적용 가능
@@ -27523,6 +27578,13 @@ fn run_pack_adopt_with(
     sources: &cys::pack::UpdateSources,
 ) -> i32 {
     let dir = cys::pack::pack_dir();
+    // ★T2f(RULINGS BO2): 명령줄의 rel 은 정규형이어야 한다(목록 대조 전에).
+    if let Some(r) = rel.as_deref() {
+        if let Err(e) = pack_rel_normal_form(r) {
+            eprintln!("{e}");
+            return 1;
+        }
+    }
     // 조합 게이트(fail-closed — 침묵 무시 금지).
     if all && (rel.is_some() || from.is_some()) {
         eprintln!("--all 은 단독 사용(원장 순회) — <rel>·--from 과 조합 불가");
@@ -27639,11 +27701,7 @@ fn adopt_verdict(
     source: &str,
     sources: &cys::pack::UpdateSources,
 ) -> AdoptVerdict {
-    // ★T2f(RULINGS BD4): 되살리기의 단일 술어 호출 지점 — 기동 필수·보호 목록에 있는 파일은 되살리지 않는다(목록 ·
-    // `--all` 건너뛰기 · 단건 · `--from` 모두 이 모의 판정을 지난다).
-    if sources.is_listed(rel) {
-        return AdoptVerdict::BootCritical;
-    }
+    // (★T2f: 등재 파일은 이 모의 판정 **전에** `adopt_one` / `adopt_list_line` 이 거른다 — RULINGS BO2.)
     let scope = cys::pack::pack_scope_of(dir);
     let (manifest, corrupt) = cys::pack::load_manifest_state(dir);
     let mhash = manifest.get(rel).cloned();
@@ -27705,6 +27763,13 @@ fn adopt_list_line(
     rel: &str,
     sources: &cys::pack::UpdateSources,
 ) -> (String, Option<&'static str>) {
+    // ★T2f(RULINGS BO2): 목록 · `--all` 건너뛰기의 술어 호출 — 내장 여부·소유권보다 먼저.
+    if sources.is_listed(rel) {
+        return (
+            "기동 필수·보호 목록 파일 — 되살리지 않음(수리 흐름: cys repair begin / reapply)".to_string(),
+            Some("boot-critical"),
+        );
+    }
     let src = dir.join(format!("{rel}.user"));
     let embed = cys::pack::PACK_ALL.iter().find(|(r, _)| *r == rel).map(|(_, c)| *c);
     if adopt_excluded_by_vendor_choice(dir, rel) {
@@ -27740,6 +27805,8 @@ fn adopt_one(
     yes: bool,
     sources: &cys::pack::UpdateSources,
 ) -> Result<(), String> {
+    // ★T2f(RULINGS BO2): 정규형이 아닌 철자는 무엇보다 먼저 거부(같은 파일을 여는 다른 철자가 목록 대조를 돌아가지 않게).
+    pack_rel_normal_form(rel)?;
     // ① 소스 결정 — read_to_string 실패(비UTF-8·부재) = 거부(수동 복구 안내).
     let (src_label, src_path) = match from {
         Some(p) => (p.to_string(), std::path::PathBuf::from(p)),
@@ -27748,6 +27815,11 @@ fn adopt_one(
     let source = std::fs::read_to_string(&src_path).map_err(|e| {
         format!("소스 {} 판독 실패({e}) — 비UTF-8·부재는 수동 복구 대상", src_path.display())
     })?;
+    // ★T2f(RULINGS BD4 · BO2): 되살리기의 단일 술어 호출 — 내장/자작 갈래와 소유권 검사 **전에**, 파일이 있든 없든.
+    //   살아 있는 바이트를 바꾸지 않는 정리(디스크 = 소스)만 허용한다(무변경 --keep-mine 과 같다 — BH6).
+    if sources.is_listed(rel) && std::fs::read(dir.join(rel)).ok().as_deref() != Some(source.as_bytes()) {
+        return Err(cys::pack::listed_file_refusal(rel, "cys pack-adopt"));
+    }
     // ② embed 조회 — 부재 rel 은 --from 명시 시에만 허용(custom 복원 · 판정 시뮬 생략).
     let embed: Option<&str> = cys::pack::PACK_ALL.iter().find(|(r, _)| *r == rel).map(|(_, c)| *c);
     if embed.is_none() && from.is_none() {
@@ -28211,8 +28283,9 @@ fn run_pack_rollback_with(
         }
         return 0;
     };
-    if rel.contains("..") || rel.starts_with('/') {
-        eprintln!("잘못된 경로: {rel}");
+    // ★T2f(RULINGS BO2): 정규형(수리 동사의 규칙)이 아닌 철자는 거부 — 종전의 `..`·절대 경로 거부를 포함한다.
+    if let Err(e) = pack_rel_normal_form(&rel) {
+        eprintln!("{e}");
         return 1;
     }
     // ★A12 승격 가드 — 롤백 '도구' 자체가 승격 파괴 벡터(R2 치명 분류): 승격 중 MASTER 후진 거부.
@@ -28281,7 +28354,12 @@ fn run_pack_rollback_with(
     let listed = sources.is_listed(&rel);
     let content: Vec<u8> = if let Some((sp, f)) = &snap_entry {
         match cys::pack::verify_snapshot_entry(sp, f) {
-            Ok(_) if listed && !f.released => {
+            // ★RULINGS BO2(c): 등재 파일은 색인의 `released` 표시를 믿지 않고, 쓰려는 바이트를 다시 잰다(링크는 출시본이 아니다).
+            Ok(bytes)
+                if listed
+                    && !(f.link_target.is_none()
+                        && cys::pack::released_bytes(&dir, &rel, &bytes, sources)) =>
+            {
                 eprintln!("{}", cys::pack::listed_file_refusal(&rel, "cys pack-rollback"));
                 return 1;
             }
@@ -28325,7 +28403,8 @@ fn run_pack_rollback_with(
                 from_snapshot = true;
                 bytes
             }
-            Err(e) if force_vendor && own != "system" => {
+            // ★RULINGS BO2(b): '강행'은 등재 파일에 결코 적용되지 않는다(system 이든 아니든).
+            Err(e) if force_vendor && own != "system" && !listed => {
                 eprintln!("⚠ --force-vendor: 스냅샷 보관본 검증 실패를 무릅쓰고 진행 — {e}");
                 snap_mode = Some(f.mode);
                 from_snapshot = true;
@@ -28355,11 +28434,10 @@ fn run_pack_rollback_with(
                 return 1;
             }
         };
-        // pack.prev 경로: 출시본 = 보존본 매니페스트와 같은 바이트 ∨ 내장본·이 설치의 매니페스트·과거 출시 해시 표(AJ2 를 이 술어로).
+        // pack.prev 경로: 출시본 = 이 바이너리의 내장본 ∨ 과거 출시 해시 표(RULINGS BO3 — pack.prev 의 매니페스트는
+        // 일반 쓰기가 바꿀 수 있는 파일이라 근거가 아니다 · AJ2 를 이 술어로).
         if listed {
-            let released = std::str::from_utf8(&c).is_ok_and(|t| {
-                prev_manifest_hash(&prev, &rel).as_deref() == Some(cys::pack::content_hash_pub(t).as_str())
-            }) || cys::pack::released_bytes(&dir, &rel, &c, sources);
+            let released = cys::pack::released_bytes(&dir, &rel, &c, sources);
             if !released {
                 eprintln!("{}", cys::pack::listed_file_refusal(&rel, "cys pack-rollback"));
                 return 1;
@@ -41397,16 +41475,31 @@ mod tests {
         assert_eq!(skip, Some("boot-critical"), "--all 은 등재 파일을 건너뛴다: {line}");
         let _ = run_pack_adopt_with(None, true, None, false, true, &listed);
         assert_eq!(std::fs::read_to_string(td.join(&rel)).unwrap(), embed, "adopt 세 형태 모두 무변경");
-        // ── pack-merge (3-way) · --ai — user-kept 상태(내 사본 살아 있음 + vendor .new) ──
-        std::fs::write(td.join(&rel), mine).unwrap();
-        std::fs::write(td.join(format!("{rel}.new")), &embed).unwrap();
+        // ── pack-merge (3-way) — user-kept 상태(내 사본 살아 있음 + vendor .new) · ★BO4: `.pristine` 조상을 심어 관문이
+        //    없으면 병합이 **실제로** 깨끗하게 돌아 병합본을 쓰는 형상으로 잰다(관문을 빼면 이 단언이 빨갛다).
+        //    `--ai` 는 이 시험에서 부르지 않는다(실제 AI CLI 를 띄울 수 있는 길) — `t2f_ai_merge_gate_*` 가 순수 관문으로 잰다.
+        let base3 = "#!/bin/sh\nline-1\nline-2\nline-3\n";
+        let ours3 = "#!/bin/sh\nline-1 MINE\nline-2\nline-3\n";
+        let theirs3 = "#!/bin/sh\nline-1\nline-2\nline-3 VENDOR\n";
+        std::fs::write(td.join(&rel), ours3).unwrap();
+        std::fs::write(td.join(format!("{rel}.new")), theirs3).unwrap();
+        t4_pristine_set(&td, &rel, base3);
+        t4_manifest_set(&td, &rel, base3);
         t4_write_ledger(&td, &rel, serde_json::json!({"kind": "user-kept", "side": format!("{rel}.new"), "version": "x", "ts": 0}));
         let merge = MergeFlags { yes: true, ..MergeFlags::default() };
-        assert_eq!(run_pack_merge_with(Some(rel.clone()), merge, None, &listed), 1, "pack-merge(3-way)");
-        let ai = MergeFlags { yes: true, ai: true, ..MergeFlags::default() };
-        assert_eq!(run_pack_merge_with(Some(rel.clone()), ai, None, &listed), 1, "pack-merge --ai(AI 를 부르기 전에 거부)");
-        assert_eq!(std::fs::read_to_string(td.join(&rel)).unwrap(), mine, "합치기 무변경");
+        assert_eq!(run_pack_merge_with(Some(rel.clone()), merge, None, &listed), 1, "pack-merge(3-way): 병합본 = 출시본 아님");
+        assert_eq!(std::fs::read_to_string(td.join(&rel)).unwrap(), ours3, "합치기 무변경(병합본을 쓰지 않았다)");
         assert_eq!(t4_ledger_kind(&td, &rel).as_deref(), Some("user-kept"), "거부 = 원장 그대로");
+        // 대조군: 등재되지 않은 같은 형상은 병합본을 쓴다(관문이 없을 때의 거동 = 위 단언이 재는 것).
+        assert_eq!(run_pack_merge_with(Some(rel.clone()), merge, None, &plain), 0);
+        assert_eq!(std::fs::read_to_string(td.join(&rel)).unwrap(), "#!/bin/sh\nline-1 MINE\nline-2\nline-3 VENDOR\n");
+        // ★BO5: 살아 있는 바이트를 바꾸지 않는 병합(병합본 = 내 사본)은 등재 파일에도 허용 — 병합 대기만 닫는다.
+        let now3 = std::fs::read_to_string(td.join(&rel)).unwrap();
+        std::fs::write(td.join(format!("{rel}.new")), &now3).unwrap();
+        t4_write_ledger(&td, &rel, serde_json::json!({"kind": "user-kept", "side": format!("{rel}.new"), "version": "x", "ts": 0}));
+        assert_eq!(run_pack_merge_with(Some(rel.clone()), merge, None, &listed), 0, "무변경 병합은 허용");
+        assert_eq!(std::fs::read_to_string(td.join(&rel)).unwrap(), now3);
+        assert_eq!(t4_ledger_kind(&td, &rel), None, "병합 대기만 닫혔다");
         // ── pack-merge --revert-merge: 캡처본이 출시본이 아니면 거부, 출시본이면 쓴다 ──
         let cap_rel = format!("seg-1/{rel}");
         let cap = cys::pack::pack_captures_dir(&td).join(&cap_rel);
@@ -41444,6 +41537,167 @@ mod tests {
         assert_eq!(std::fs::read_to_string(td.join(&urel)).unwrap(), "AFTER\n");
         assert_eq!(run_pack_rollback_with(Some(urel.clone()), true, false, false, &plain), 0, "대조군: user 파일 종전대로");
         let _ = std::fs::remove_dir_all(td.parent().unwrap());
+    }
+
+    /// ★T2f(RULINGS BO2(a)): 명령줄의 rel 은 정규형이 먼저다 — 같은 파일을 여는 다른 철자(앞의 `./`, `//`, 절대 경로,
+    /// 역슬래시)는 정규형이 아니라서 거부되고, 대소문자 변형은 정규형이지만 목록 대조 키가 접어 등재로 답한다. 되살리기
+    /// (`--from`)와 되돌리기 모두, 등재 파일이 있을 때와 없을 때 모두 거부되고 아무것도 쓰이지 않는다. 사용자 소유 등재 행
+    /// (`agents.json`)은 소유권 오류가 아니라 등재 거부를 받는다(술어가 내장/자작 갈래·소유권 검사보다 먼저).
+    #[test]
+    fn t2f_every_alias_of_a_listed_file_is_refused_by_adopt_and_rollback() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (td, _rel, _embed, _env) = t4_system_fixture("t2falias");
+        let local = td.parent().unwrap().join("local");
+        let _l = cys::pack::EnvGuard::set("CYS_LOCAL_DIR", &local);
+        let rel = "hooks/guard.sh";
+        let listed = cys::pack::UpdateSources::none().with_listed(|r| r == "hooks/guard.sh");
+        let scratch = td.parent().unwrap().join("scratch.sh");
+        std::fs::write(&scratch, "#!/bin/sh\necho NOT RELEASED\n").unwrap();
+        let abs = td.join(rel).display().to_string();
+        let aliases = ["./hooks/guard.sh", "hooks//guard.sh", abs.as_str(), "hooks\\guard.sh", "Hooks/Guard.sh", "HOOKS/GUARD.SH"];
+        std::fs::create_dir_all(td.join("hooks")).unwrap();
+        // 되돌리기 원천이 실제로 있게(pack.prev 에 이 파일의 출시본 아닌 바이트 + 그 바이트와 맞는 보존본 매니페스트) —
+        // 관문이 없으면 정규형 철자는 M4 를 통과해 쓰였을 형상.
+        let prev = cys::pack::pack_prev_dir(&td);
+        std::fs::create_dir_all(prev.join("hooks")).unwrap();
+        std::fs::write(prev.join(".pack-version"), "0.14.56\n").unwrap();
+        std::fs::write(prev.join(rel), "#!/bin/sh\necho PREV\n").unwrap();
+        let mut pm = std::collections::BTreeMap::new();
+        pm.insert(rel.to_string(), cys::pack::content_hash_pub("#!/bin/sh\necho PREV\n"));
+        std::fs::write(prev.join(cys::pack::INSTALL_MANIFEST), serde_json::to_string(&pm).unwrap()).unwrap();
+        for present in [true, false] {
+            if present {
+                std::fs::write(td.join(rel), "#!/bin/sh\necho LIVE\n").unwrap();
+            } else {
+                let _ = std::fs::remove_file(td.join(rel));
+            }
+            for a in aliases {
+                let rc = run_pack_adopt_with(Some(a.to_string()), false, Some(scratch.display().to_string()), false, true, &listed);
+                assert_eq!(rc, 1, "adopt {a:?} (present={present})");
+                let rc = run_pack_rollback_with(Some(a.to_string()), true, true, false, &listed);
+                assert_eq!(rc, 1, "rollback {a:?} (present={present})");
+                if present {
+                    assert_eq!(std::fs::read_to_string(td.join(rel)).unwrap(), "#!/bin/sh\necho LIVE\n", "{a:?}: 무변경");
+                } else {
+                    assert!(!td.join(rel).exists(), "{a:?}: 없던 등재 파일을 만들었다");
+                }
+            }
+            // 정규형 철자도 거부(자작 갈래 · 내장 밖의 rel 이라도 — 미래의 등재 행 `state/hook-targets.json` 와 같은 모양).
+            assert_eq!(run_pack_adopt_with(Some(rel.to_string()), false, Some(scratch.display().to_string()), false, true, &listed), 1);
+            assert_eq!(run_pack_rollback_with(Some(rel.to_string()), true, true, false, &listed), 1, "pack.prev 원천도 거부");
+            if !present {
+                assert!(!td.join(rel).exists());
+            }
+        }
+        assert!(adopt_one(&td, "./hooks/guard.sh", Some(scratch.to_str().unwrap()), false, true, &listed)
+            .unwrap_err()
+            .contains("정규형"));
+        // 사용자 소유 등재 행 → 등재 거부(소유권 오류가 아니다).
+        let lu = cys::pack::UpdateSources::none().with_listed(|r| r == "agents.json");
+        std::fs::write(td.join("agents.json"), "{}\n").unwrap();
+        std::fs::write(td.join("agents.json.user"), "{\"mine\":1}\n").unwrap();
+        let err = adopt_one(&td, "agents.json", None, false, true, &lu).unwrap_err();
+        assert!(err.contains("기동 필수·보호 목록"), "등재 거부여야 한다: {err}");
+        assert!(!err.contains("system 소유가 아님"), "소유권 오류가 먼저 나왔다: {err}");
+        let _ = std::fs::remove_dir_all(td.parent().unwrap());
+    }
+
+    /// ★T2f(RULINGS BO2(b)(c)): 스냅샷 원천의 되돌리기 — 검증에 실패한 보관본을 '강행'하는 갈래는 등재 파일에 결코 적용되지
+    /// 않고(system 이든 아니든), 등재 파일은 색인의 `released` 표시가 아니라 쓰려는 바이트로 출시본을 다시 잰다.
+    #[test]
+    fn t2f_snapshot_rollback_of_a_listed_file_never_forces_and_recomputes_released() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (td, _rel, _embed, _env) = t4_system_fixture("t2fsnap");
+        let local = td.parent().unwrap().join("local");
+        let _l = cys::pack::EnvGuard::set("CYS_LOCAL_DIR", &local);
+        let urel = "agents.json".to_string();
+        let lu = cys::pack::UpdateSources::none().with_listed(|r| r == "agents.json");
+        let none = |_: &str| Vec::<String>::new();
+        let caps = (cys::pack::UPDATE_SNAPSHOT_FILE_CAP, cys::pack::UPDATE_SNAPSHOT_TOTAL_CAP);
+        std::fs::write(td.join(&urel), "SNAPSHOTTED\n").unwrap();
+        let snap = cys::pack::create_update_snapshot(
+            &td, &local.join("update-snapshots"), "base", "0.14.56", &std::collections::BTreeMap::new(),
+            &[urel.clone()], cys::pack::PackScope::Base, &none, caps,
+        )
+        .unwrap();
+        std::fs::write(td.join(&urel), "AFTER\n").unwrap();
+        // (b) 보관본 변조 + --force-vendor: 등재 파일이면 거부(종전: user 파일은 강행으로 썼다).
+        let stored = snap.path.join(cys::pack::UPDATE_SNAPSHOT_FILES).join(&urel);
+        std::fs::write(&stored, "TAMPERED\n").unwrap();
+        assert_eq!(run_pack_rollback_with(Some(urel.clone()), true, true, false, &lu), 1, "등재 파일 강행 불가");
+        assert_eq!(std::fs::read_to_string(td.join(&urel)).unwrap(), "AFTER\n");
+        // 대조군: 등재되지 않은 user 파일은 종전대로 강행한다.
+        assert_eq!(run_pack_rollback_with(Some(urel.clone()), true, true, false, &cys::pack::UpdateSources::none()), 0);
+        assert_eq!(std::fs::read_to_string(td.join(&urel)).unwrap(), "TAMPERED\n");
+        // (c) 색인이 `released: true` 라고 해도(색인 변조) 쓰려는 바이트가 출시본이 아니면 거부.
+        std::fs::write(&stored, "SNAPSHOTTED\n").unwrap();
+        let meta_p = snap.path.join(cys::pack::UPDATE_SNAPSHOT_META);
+        let mut meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&meta_p).unwrap()).unwrap();
+        meta["files"][0]["released"] = serde_json::json!(true);
+        std::fs::write(&meta_p, serde_json::to_string(&meta).unwrap()).unwrap();
+        std::fs::write(td.join(&urel), "AFTER\n").unwrap();
+        assert_eq!(run_pack_rollback_with(Some(urel.clone()), true, false, false, &lu), 1, "색인의 released 를 믿지 않는다");
+        assert_eq!(std::fs::read_to_string(td.join(&urel)).unwrap(), "AFTER\n");
+        let _ = std::fs::remove_dir_all(td.parent().unwrap());
+    }
+
+    /// ★T2f(RULINGS BO3): 등재 파일의 '출시본'은 이 바이너리의 내장본·과거 출시 표뿐이다 — 변조된 `<rel>.new` 는 `--take-new`
+    /// 로 쓰이지 않고, `--keep-mine` 은 기준선을 그 해시로 옮기지 않아 다음 `--take-new` 도 거부된다. 정직한 `.new`(내장본)는
+    /// 둘 다 된다.
+    #[test]
+    fn t2f_tampered_new_of_a_listed_file_is_never_released() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (td, rel, embed, _env) = t4_system_fixture("t2fnew");
+        let r1 = rel.clone();
+        let listed = cys::pack::UpdateSources::none().with_listed(move |r| r == r1);
+        let mine = "MY LIVE COPY\n";
+        let tampered = "TAMPERED PARKED COPY\n";
+        let park = |new: &str| {
+            std::fs::write(td.join(&rel), mine).unwrap();
+            std::fs::write(td.join(format!("{rel}.new")), new).unwrap();
+            t4_write_ledger(&td, &rel, serde_json::json!({"kind": "user-kept", "side": format!("{rel}.new"), "version": "x", "ts": 0}));
+        };
+        let take = MergeFlags { yes: true, take_new: true, ..MergeFlags::default() };
+        let keep = MergeFlags { yes: true, keep_mine: true, ..MergeFlags::default() };
+        let manifest_hash = || -> Option<String> {
+            let m: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(td.join(cys::pack::INSTALL_MANIFEST)).ok()?).ok()?;
+            m.get(&rel).and_then(|v| v.as_str()).map(str::to_string)
+        };
+        park(tampered);
+        assert_eq!(run_pack_merge_with(Some(rel.clone()), take, None, &listed), 1, "변조된 .new → take-new 거부");
+        assert_eq!(std::fs::read_to_string(td.join(&rel)).unwrap(), mine);
+        assert_eq!(run_pack_merge_with(Some(rel.clone()), keep, None, &listed), 0, "keep-mine 은 허용(무변경)");
+        assert_ne!(manifest_hash().as_deref(), Some(cys::pack::content_hash_pub(tampered).as_str()),
+                   "기준선을 변조 해시로 옮기지 않았다");
+        park(tampered);
+        assert_eq!(run_pack_merge_with(Some(rel.clone()), take, None, &listed), 1, "keep-mine 뒤에도 take-new 거부");
+        assert_eq!(std::fs::read_to_string(td.join(&rel)).unwrap(), mine);
+        // 정직한 .new(내장본) → 둘 다 된다.
+        park(&embed);
+        assert_eq!(run_pack_merge_with(Some(rel.clone()), keep, None, &listed), 0);
+        assert_eq!(manifest_hash().as_deref(), Some(cys::pack::content_hash_pub(&embed).as_str()), "기준선 = 내장본 해시");
+        park(&embed);
+        assert_eq!(run_pack_merge_with(Some(rel.clone()), take, None, &listed), 0);
+        assert_eq!(std::fs::read_to_string(td.join(&rel)).unwrap(), embed);
+        let _ = std::fs::remove_dir_all(td.parent().unwrap());
+    }
+
+    /// ★T2f(RULINGS BO4): `--ai` 는 순수 관문으로 잰다(이 시험은 AI CLI 를 띄우는 코드에 닿지 않는다) — 등재 파일이면 거부
+    /// 문장, 아니면 None. 그리고 관문 호출이 `run_pack_merge_with` 안에서 AI 호출(`ai_three_way_merge`)보다 **앞에** 있다는
+    /// 소스 순서 핀(관문을 뒤로 옮기거나 지우면 빨갛다).
+    #[test]
+    fn t2f_ai_merge_gate_refuses_a_listed_file_before_any_agent_spawn() {
+        assert!(ai_merge_refusal("hooks/guard.sh", true).unwrap().contains("cys pack-merge --ai"));
+        assert!(ai_merge_refusal("bin/x.py", false).is_none());
+        let src = include_str!("cys.rs");
+        let start = src.find("fn run_pack_merge_with(").expect("함수");
+        let body = &src[start..];
+        let end = body.find("\nfn ").unwrap_or(body.len());
+        let body = &body[..end];
+        let gate = body.find("ai_merge_refusal(&rel, listed)").expect("관문 호출");
+        let spawn = body.find("ai_three_way_merge(").expect("AI 호출");
+        assert!(gate < spawn, "AI 를 부르기 전에 거부해야 한다");
     }
 
     /// ★T2f(RULINGS BH6): 살아 있는 바이트를 바꾸지 않는 `--keep-mine`(내 사본이 이미 살아 있음 — 보호 목록 파일의 업데이트
