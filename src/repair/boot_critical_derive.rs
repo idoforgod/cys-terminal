@@ -233,7 +233,41 @@ pub const PROOF_ANCHORS: &[ProofAnchor] = &[
         why: "protection 2 (owner approval before irreversible actions / external sends): the irreversible-action gate",
         level: "",
     },
+    // ── RULINGS AP2: the data files whose CONTENT decides whether a protection hook is registered ──
+    ProofAnchor {
+        proof: "cysjavis-pack/bin/javis_preflight.py",
+        literal: "for path in (base, base + \".example\"):",
+        rel: "state/hook-targets.json.example",
+        category: "protection",
+        check: "json-parse",
+        check_arg: "",
+        why: "protections 3 and 4 — registration: the shipped fallback target table; C28 unregisters the capability gate from every profile it marks capgate=deny, whatever the daemon says (preflight 596-637 · 4553-4560); javis_guard_register.py reads the same table to register guard.sh (RULINGS AP2)",
+        level: "",
+    },
+    ProofAnchor {
+        proof: "cysjavis-pack/bin/javis_preflight.py",
+        literal: "import javis_guard_register as _gr",
+        rel: "bin/javis_guard_register.py",
+        category: "protection",
+        check: "py-compile",
+        check_arg: "",
+        why: "protections 3 and 4 — the registrar's decision path: at every boot C28 calls its validate_targets_doc on the target table to decide whether the capability gate is registered (preflight 581-594 · 596-637); also the manual registrar of guard.sh (RULINGS AW2 — corrects AN7 for this file)",
+        level: "",
+    },
 ];
+
+/// RULINGS AP2 — protection rows by PATH RULE: operator files the pack does not ship, which are
+/// protection-related in every lane's pack when they exist.
+pub const PROTECTION_PATH_RULES: &[ProofAnchor] = &[ProofAnchor {
+    proof: "cysjavis-pack/bin/javis_preflight.py",
+    literal: "base = os.path.join(pack, \"state\", \"hook-targets.json\")",
+    rel: "state/hook-targets.json",
+    category: "protection",
+    check: "json-parse",
+    check_arg: "",
+    why: "protections 3 and 4 — registration: the operator's target table (not shipped; read before the .example); C28 unregisters the capability gate from every profile it marks capgate=deny (preflight 596-637 · 4553-4560); javis_guard_register.py registers guard.sh by it (RULINGS AP2)",
+    level: "",
+}];
 
 /// Every `def _register*` / `def _unregister*` the preflight may define (the two MCP registrars
 /// are not hook registrars; `_unregister_event_hook` only removes).
@@ -287,20 +321,90 @@ pub const KNOWN_SETTINGS_WRITERS: &[&str] = &[
     "bin/javis_guard_register.py",
 ];
 
-/// RULINGS AN3 — files a registered hook reaches only through a launch idiom (not the structural
-/// rule) whose breakage CHANGES the hook's result in the hook replay (`isolated_home_start_replay`
-/// (3) with the recipe named here), or that the replay cannot reach (a stage-5 item): listed as
-/// class 1 (`hook-replay`). (rel, hook, measurement)
-pub const MEASURED_HOOK_DEPS: &[(&str, &str, &str)] = &[
+/// RULINGS AN3 / AP3 — class-1 rows the structural rule does not find: files a registered hook
+/// reaches through a launch idiom, an import of such a file, or a guarded import of a listed hook
+/// dependency. (rel, hook, stage-5, record). `stage-5 = false`: measured by the hook replay — the
+/// hook's result changes when the file is broken (`isolated_home_start_replay` (3), the recipe
+/// named). `stage-5 = true`: no recipe at the replay level both runs the file and makes the
+/// hook's result depend on it (AP3 (a)+(b)) → listed and named as a stage-5 item.
+pub const MEASURED_HOOK_DEPS: &[(&str, &str, bool, &str)] = &[
     (
         "bin/javis_teamtoken.py",
         "hooks/role-bootstrap.sh",
-        "role-bootstrap.sh runs hooks/teamtoken-issue.sh, which runs it, when a seat's team-token window is open; broken -> the hook's stdout gains the 'cannot judge the approval' notice (hook replay, recipe teamtoken)",
+        false,
+        "role-bootstrap.sh runs hooks/teamtoken-issue.sh, which runs it, when a seat's team-token window is open; broken -> the hook's stdout gains the 'cannot judge the approval' notice (recipe teamtoken)",
     ),
     (
         "bin/javis_state_snapshot.py",
         "hooks/role-bootstrap.sh",
-        "javis_teamtoken.py imports it on Windows only (feed_jsonl_path); the macOS hook replay cannot reach it -> listed as a stage-5 item (RULINGS AN3)",
+        true,
+        "javis_teamtoken.py imports it on Windows only (feed_jsonl_path); the macOS hook replay cannot reach it (stage-5)",
+    ),
+    (
+        "hooks/inject_gate.py",
+        "hooks/inject-context.sh",
+        false,
+        "the poison gate on the injected working state (inject-context.sh 266-282); broken -> a line the scanner quarantines is injected verbatim (recipe state-poison)",
+    ),
+    (
+        "bin/javis_skillscan.py",
+        "hooks/inject-context.sh",
+        false,
+        "the scanner inject_gate.py imports; broken -> the gate prints its 'gate down' banner and injects verbatim (recipe state-poison)",
+    ),
+    (
+        "bin/skillscan_rules.json",
+        "hooks/inject-context.sh",
+        false,
+        "the rules javis_skillscan.py reads; broken -> the quarantine changes (recipe state-poison)",
+    ),
+    (
+        "hooks/teamtoken-issue.sh",
+        "hooks/role-bootstrap.sh",
+        true,
+        "the team-token issuer; issuing needs an open ask (a pending team proposal in the daemon feed published by this seat, the mission delivery ledger, a hook witness newer than the ask) — not built at the replay level (stage-5)",
+    ),
+    (
+        "bin/javis_memory.py",
+        "hooks/reflect-scan.sh",
+        true,
+        "reflect-scan.sh runs `verify` with its output and exit discarded (reflect-scan.sh 55-60; recipe round runs it) — no recipe can make the hook's result depend on it (stage-5)",
+    ),
+    (
+        "bin/javis_reflect.py",
+        "hooks/reflect-scan.sh",
+        true,
+        "reflect-scan.sh runs `scan` with its output discarded (reflect-scan.sh 50-53; recipe round runs it with a transcript) — no recipe can make the hook's result depend on it (stage-5)",
+    ),
+    (
+        "bin/javis_route.py",
+        "hooks/grill-arm.sh",
+        true,
+        "grill_gate.py `begin` (run by grill-arm.sh with its output discarded) sets the grill floor with it; the effect reaches only a LATER grill-gate run (stage-5)",
+    ),
+    (
+        "bin/javis_role.py",
+        "hooks/save-state.sh",
+        true,
+        "a guarded import of javis_snapshot.py, which save-state.sh runs with its output discarded; the snapshot reaches only a LATER inject-context run (stage-5)",
+    ),
+    (
+        "bin/javis_scrub.py",
+        "hooks/save-state.sh",
+        true,
+        "a guarded import of javis_snapshot.py (secret masking of the snapshot), see javis_role.py (stage-5)",
+    ),
+    (
+        "bin/javis_task.py",
+        "hooks/save-state.sh",
+        true,
+        "imported by javis_snapshot.py (the task section of the snapshot), see javis_role.py (stage-5)",
+    ),
+    (
+        "bin/javis_wakeup.py",
+        "hooks/save-state.sh",
+        true,
+        "imported by javis_snapshot.py (the wake-queue section of the snapshot), see javis_role.py (stage-5)",
     ),
 ];
 
@@ -319,29 +423,19 @@ pub const DROPPED_CANDIDATES: &[(&str, &str)] = &[
     ("bin/javis_cycle_autopilot.py", "(i) read by the boot; broken alone -> the boot completes and the hooks are registered (bootstrap replay, both scenes) (a preflight check's tool) · (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597)"),
     ("bin/javis_dept_schedule.py", "(i) never read by the boot (tripwire, both scenes); broken with every unlisted file -> the boot completes; cys-dept runs it when a department is CREATED · (ii) no stop branch at start: cys-dept consults it only at department creation (cys-dept 1194)"),
     ("bin/javis_event.py", "(i) never read by the boot (tripwire, both scenes); broken with every unlisted file -> the boot completes · (ii) no stop branch: formation emits events best-effort and ignores the answer (formation 1033-1043)"),
-    ("bin/javis_guard_register.py", "(i) never read by the boot (tripwire, both scenes); broken with every unlisted file -> the boot completes · (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597) (the manual guard.sh registrar)"),
     ("bin/javis_manifest.py", "(i) read by the boot; broken alone -> the boot completes and the hooks are registered (bootstrap replay, both scenes) (a preflight check's tool) · (ii) no stop branch: `orchestra check` does not consult it (ticket phases only, orchestra 1736)"),
     ("bin/javis_mcpgate.py", "(i) read by the boot; broken alone -> the boot completes and the hooks are registered (bootstrap replay, both scenes) (a preflight check's tool) · (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597)"),
-    ("bin/javis_memory.py", "(i) never read by the boot (tripwire, both scenes); broken with every unlisted file -> the boot completes; hook layer: reflect-scan.sh (Stop, a `_round` in the cwd) runs `verify` -> broken, the hook completes unchanged (exit 0, same stdout; hook replay AN3) · (ii) no stop branch: a failed verify is one warning line in `.state_log` (reflect-scan.sh 55-60)"),
     ("bin/javis_phoenix.py", "(i) never read by the boot (tripwire, both scenes); broken with every unlisted file -> the boot completes; cys-dept calls it best-effort (`|| true`) and the daemon restores from its EMBEDDED copy first · (ii) no stop branch: cys-dept ignores its answer (cys-dept 109-134)"),
     ("bin/javis_radio.py", "(i) read by the boot; broken alone -> the boot completes and the hooks are registered (bootstrap replay, both scenes) (a preflight check's tool) · (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597)"),
-    ("bin/javis_reflect.py", "(i) never read by the boot (tripwire, both scenes); broken with every unlisted file -> the boot completes; reflect-scan.sh runs it with its output discarded · (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597); reflect-scan.sh discards its answer (reflect-scan.sh 50-53)"),
     ("bin/javis_registry.py", "(i) read by the boot; broken alone -> the boot completes and the hooks are registered (bootstrap replay, both scenes) (a preflight check's tool) · (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597)"),
     ("bin/javis_report.py", "(i) never read by the boot (tripwire, both scenes); broken with every unlisted file -> the boot completes · (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597)"),
-    ("bin/javis_role.py", "(i) never read by the boot (tripwire, both scenes); broken with every unlisted file -> the boot completes (imported by javis_snapshot.py inside a guard) · (ii) no stop branch: none of the five start files consults it"),
-    ("bin/javis_route.py", "(i) read by the boot; broken alone -> the boot completes and the hooks are registered (bootstrap replay, both scenes) (a preflight check's tool; grill_gate.py `begin` only) · (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597); grill_gate.py consults it only in `begin`, never at start"),
     ("bin/javis_runtime_seal.py", "(i) read by the boot; broken alone -> the boot completes and the hooks are registered (bootstrap replay, both scenes) (a preflight check's tool) · (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597)"),
-    ("bin/javis_scrub.py", "(i) read by the boot; broken alone -> the boot completes and the hooks are registered (bootstrap replay, both scenes) (a preflight check's tool; javis_snapshot.py's guarded import) · (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597)"),
     ("bin/javis_semver.py", "(i) read by the boot; broken alone -> the boot completes and the hooks are registered (bootstrap replay, both scenes) (a preflight check's tool) · (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597)"),
     ("bin/javis_serena_probe.py", "(i) never read by the boot (tripwire, both scenes); broken with every unlisted file -> the boot completes · (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597)"),
-    ("bin/javis_skillscan.py", "(i) read by the boot; broken alone -> the boot completes and the hooks are registered (bootstrap replay, both scenes) (a preflight check's tool) · (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597)"),
-    ("bin/javis_task.py", "(i) never read by the boot (tripwire, both scenes); broken with every unlisted file -> the boot completes · (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597)"),
     ("bin/javis_todo_decl.py", "(i) read by the boot; broken alone -> the boot completes and the hooks are registered (bootstrap replay, both scenes) (orchestra's import for ticket prompts) · (ii) no stop branch: `orchestra check` does not consult it (task-prompt only, orchestra 1768)"),
     ("bin/javis_verdict.py", "(i) read by the boot; broken alone -> the boot completes and the hooks are registered (bootstrap replay, both scenes) (orchestra's optional import with a fallback) · (ii) no stop branch: `orchestra check` does not consult it (review commands only)"),
-    ("bin/javis_wakeup.py", "(i) read by the boot; broken alone -> the boot completes and the hooks are registered (bootstrap replay, both scenes) (a preflight check's tool) · (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597)"),
+    ("bin/javis_waiver.py", "(i) never read by the boot (tripwire, both scenes — AL record); reached one step only from javis_task.py, a stage-5 row of the hook layer (RULINGS AP3) · (ii) no stop branch: none of the five start files consults it"),
     ("hooks/brief-lint-warn.sh", "(i) never read by the boot (tripwire, both scenes); broken with every unlisted file -> the boot completes; not a hook the product registers (C74 only checks it exists; an owner registers it by hand) · (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597)"),
-    ("hooks/inject_gate.py", "(i) never read by the boot (tripwire, both scenes); broken with every unlisted file -> the boot completes; hook layer: inject-context.sh with a SESSION_STATE reaches it -> broken, the hook completes unchanged (exit 0, same stdout; the hook passes the original text through by design, inject-context.sh 266-282; hook replay AN3) · (ii) no stop branch: its answer is the filtered text; a failing gate falls back to `cat` (inject-context.sh 274-279)"),
-    ("hooks/teamtoken-issue.sh", "(i) never read by the boot (tripwire, both scenes); broken with every unlisted file -> the boot completes; hook layer: role-bootstrap.sh with a seat and an open team-token window reaches it -> broken, the hook completes unchanged (exit 0, same stdout; hook replay AN3) · (ii) no stop branch: role-bootstrap.sh ignores its exit and only relays its note (role-bootstrap.sh 213-235)"),
 ];
 
 const CATEGORY_ORDER: &[&str] = &[
@@ -1772,6 +1866,108 @@ fn bindings_impl(
 // The derivation
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Everything `root` sources, launches or imports, transitively (the extended rule) — `(rel, how)`,
+/// the root itself excluded (RULINGS AT5 / AU1).
+pub fn protection_closure(
+    src: &Sources,
+    rels: &BTreeSet<&str>,
+    root: &str,
+) -> BTreeMap<String, String> {
+    let mut found: BTreeMap<String, String> = BTreeMap::new();
+    let mut queue: Vec<String> = vec![root.to_string()];
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    while let Some(r) = queue.pop() {
+        if !seen.insert(r.clone()) {
+            continue;
+        }
+        let text = (src.pack_file)(&r).map(|t| lf(&t)).unwrap_or_default();
+        for (c, how) in bindings(&r, &text, rels) {
+            if c != root {
+                found.entry(c.clone()).or_insert(how);
+            }
+            queue.push(c);
+        }
+    }
+    found
+}
+
+/// RULINGS AU1 / AW2 — the protection TESTS: (id, the files it starts from, follow the protection
+/// closure). G (external sends / permanent deletions — the irreversible-action gate), R (reviewer
+/// writes) and C (CSO writes — the capability gate), I2 (the capgate-deny set of the hook-target
+/// table): the rows and everything they source, launch or import, transitively. I3 (registration —
+/// the registrar's decision path): the files C28 and its helpers read or call to decide whether a
+/// protection hook is registered, enumerated by reading them (the report's registrar table); NOT the
+/// transitive closure of `javis_preflight.py` (that is the whole start path).
+pub const PROTECTION_TESTS: &[(&str, &[&str], bool)] = &[
+    ("C", &["hooks/role-capability-gate.sh"], true),
+    ("G", &["hooks/guard.sh"], true),
+    (
+        "I2",
+        &["state/hook-targets.json", "state/hook-targets.json.example"],
+        true,
+    ),
+    (
+        "I3",
+        &[
+            "bin/javis_preflight.py",
+            "bin/javis_guard_register.py",
+            "bin/javis_lock.py",
+            "hooks/role-capability-gate.sh",
+            "state/hook-targets.json",
+            "state/hook-targets.json.example",
+            "directives/CSO_DIRECTIVE.md",
+        ],
+        false,
+    ),
+    ("R", &["hooks/role-capability-gate.sh"], true),
+];
+
+/// Inputs of a protection test that are RULE DOCUMENTS, not list rows: their content is guarded by
+/// the rule-document branch (RULINGS AQ8), so they may stand outside the two lists.
+pub const RULE_DOCUMENT_INPUTS: &[&str] = &["directives/CSO_DIRECTIVE.md"];
+
+/// RULINGS AU1 / AW2 — per protection test, the files it reads (sorted). Every file is a
+/// protection or a boot-critical row (else an error — AT5), or a declared rule document
+/// ([`RULE_DOCUMENT_INPUTS`]), so the daemon's screen can lay out exactly these files.
+pub fn protection_inputs(
+    src: &Sources,
+    entries: &[GenEntry],
+) -> Result<Vec<(String, Vec<String>)>, String> {
+    let rels: BTreeSet<&str> = src.pack_rels.iter().map(String::as_str).collect();
+    let listed: BTreeSet<&str> = entries.iter().map(|e| e.rel.as_str()).collect();
+    let mut errs: Vec<String> = Vec::new();
+    let mut out = Vec::new();
+    for (test, roots, follow) in PROTECTION_TESTS {
+        let mut files: BTreeSet<String> = BTreeSet::new();
+        for r in *roots {
+            if !listed.contains(r) && !RULE_DOCUMENT_INPUTS.contains(r) {
+                errs.push(format!(
+                    "protection test {test}: `{r}` is on neither compiled list and is not a declared rule document (RULINGS AU1 / AW2)"
+                ));
+                continue;
+            }
+            files.insert(r.to_string());
+            if !*follow {
+                continue;
+            }
+            for (c, how) in protection_closure(src, &rels, r) {
+                if !listed.contains(c.as_str()) {
+                    errs.push(format!(
+                        "protection test {test}: `{c}` ({how}) is on neither compiled list (RULINGS AT5 / AU1)"
+                    ));
+                }
+                files.insert(c);
+            }
+        }
+        out.push((test.to_string(), files.into_iter().collect()));
+    }
+    if errs.is_empty() {
+        Ok(out)
+    } else {
+        Err(errs.join("\n"))
+    }
+}
+
 pub fn derive(src: &Sources) -> Result<Vec<GenEntry>, String> {
     let rels: BTreeSet<&str> = src.pack_rels.iter().map(String::as_str).collect();
     let need_repo = |p: &str| -> Result<String, String> {
@@ -1876,7 +2072,11 @@ pub fn derive(src: &Sources) -> Result<Vec<GenEntry>, String> {
 
     // 3/4/5. proof anchors: class 2 / class 3 start rows and the protection list (RULINGS AL1)
     let mut protection: Vec<GenEntry> = Vec::new();
-    for a in PROOF_ANCHORS {
+    let anchors = PROOF_ANCHORS
+        .iter()
+        .map(|a| (a, true))
+        .chain(PROTECTION_PATH_RULES.iter().map(|a| (a, false)));
+    for (a, shipped) in anchors {
         match (src.repo_file)(a.proof).map(|t| lf(&t)) {
             None => errs.push(format!(
                 "proof anchor `{}`: file `{}` unreadable",
@@ -1888,8 +2088,15 @@ pub fn derive(src: &Sources) -> Result<Vec<GenEntry>, String> {
             )),
             Some(_) => {}
         }
-        if !rels.contains(a.rel) {
+        if shipped && !rels.contains(a.rel) {
             errs.push(format!("proof anchor `{}`: not a file of the pack", a.rel));
+            continue;
+        }
+        if !shipped && a.category != "protection" {
+            errs.push(format!(
+                "path rule `{}`: only protection rows may name a file the pack does not ship (RULINGS AP2)",
+                a.rel
+            ));
             continue;
         }
         let row = GenEntry {
@@ -1977,7 +2184,7 @@ pub fn derive(src: &Sources) -> Result<Vec<GenEntry>, String> {
     }
 
     // AN3 — measured class-1 rows reached through a launch idiom
-    for (rel, hook, why) in MEASURED_HOOK_DEPS {
+    for (rel, hook, _stage5, why) in MEASURED_HOOK_DEPS {
         if !rels.contains(*rel) {
             errs.push(format!(
                 "MEASURED_HOOK_DEPS: `{rel}` is not a file of the pack (RULINGS AN3)"
@@ -2009,6 +2216,25 @@ pub fn derive(src: &Sources) -> Result<Vec<GenEntry>, String> {
         );
     }
 
+    // RULINGS AT5 — the protection closure has NO drops: every file a protection row sources,
+    //   launches or imports, transitively, is a protection row or a boot-critical row (so it can only
+    //   change through `submit`, where the protection screen runs) — a measured drop does not count
+    let on_a_list: BTreeSet<String> = rows
+        .keys()
+        .cloned()
+        .chain(protection.iter().map(|e| e.rel.clone()))
+        .collect();
+    for root in protection.iter().filter(|e| rels.contains(e.rel.as_str())) {
+        for (c, how) in protection_closure(src, &rels, &root.rel) {
+            if !on_a_list.contains(&c) {
+                errs.push(format!(
+                    "protection closure: `{c}` ({how}; reached from the protection row `{}`) is on neither compiled list — list it; a measured drop does not count here (RULINGS AT5)",
+                    root.rel
+                ));
+            }
+        }
+    }
+
     // AL3 · AN6 — the extended rule (imports wherever written, tools launched or opened by path,
     //   heredocs, the launch idioms of AN3) FINDS candidates, starting from the LISTED files and
     //   stopping at dropped files (one step: a new import inside an ordinary tool never fails the
@@ -2018,7 +2244,14 @@ pub fn derive(src: &Sources) -> Result<Vec<GenEntry>, String> {
     let dropped: BTreeSet<&str> = DROPPED_CANDIDATES.iter().map(|(r, _)| *r).collect();
     let protected: BTreeSet<&str> = protection.iter().map(|e| e.rel.as_str()).collect();
     let mut found: BTreeMap<String, String> = BTreeMap::new();
-    for r in rows.keys() {
+    // AP5 — the protection rows are census roots too (a file a protection device launches or
+    //   imports is a protection row, listed, or a measured drop)
+    let roots: Vec<String> = rows
+        .keys()
+        .cloned()
+        .chain(protection.iter().map(|e| e.rel.clone()))
+        .collect();
+    for r in &roots {
         let text = (src.pack_file)(r).map(|t| lf(&t)).unwrap_or_default();
         for (rel, how) in bindings(r, &text, &rels) {
             found.entry(rel).or_insert(how);
@@ -2100,7 +2333,7 @@ fn rust_check(c: &str) -> &'static str {
 }
 
 /// Rust source of `OUT_DIR/boot_critical.rs` (included by `src/repair/boot_critical.rs`).
-pub fn render(entries: &[GenEntry]) -> String {
+pub fn render(entries: &[GenEntry], inputs: &[(String, Vec<String>)]) -> String {
     let mut s = String::from(
         "// @generated by build.rs from src/repair/boot_critical_derive.rs (T5a · C4 · RULINGS B6) — do not edit.\n",
     );
@@ -2154,5 +2387,14 @@ pub fn render(entries: &[GenEntry]) -> String {
             s.push_str("];\n");
         }
     }
+    // RULINGS AU1 — per protection test, the files it reads (sorted; every file on a list)
+    s.push_str(
+        "/// Per protection TEST (C · G · I2 · R), the files it reads — its rows and their protection closure (RULINGS AU1).\nstatic GENERATED_PROTECTION_INPUTS: &[(&str, &[&str])] = &[\n",
+    );
+    for (test, files) in inputs {
+        let list: Vec<String> = files.iter().map(|f| format!("{f:?}")).collect();
+        s.push_str(&format!("    ({test:?}, &[{}]),\n", list.join(", ")));
+    }
+    s.push_str("];\n");
     s
 }

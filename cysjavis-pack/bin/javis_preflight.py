@@ -1191,16 +1191,29 @@ def is_dept_pack():
 
 
 def _hermetic_test():
-    """시험 전용 스위치(0.15.0 · T5a · RULINGS AN4) — `CYS_PREFLIGHT_HERMETIC_TEST=1` 은 격리 HOME 표식
-    `CYS_TEST_ISOLATED_HOME` 이 **실제 HOME 과 같을 때만** 듣는다. 켜지면 이 기계의 절대 경로에 손대지 않는다:
-    C65 는 기계 고정 cys 후보(/Applications · /opt/homebrew)를 보지 않고, C11b 는 HOME 밖의 링크를 정리
-    후보로 삼지 않으며, C20 은 인터프리터 pip 설치(`python -m pip install`)를 하지 않는다. 그 밖의 판정은 같다."""
-    if os.environ.get("CYS_PREFLIGHT_HERMETIC_TEST") != "1":
-        return False
-    mark = os.environ.get("CYS_TEST_ISOLATED_HOME", "")
+    """시험 전용 스위치(0.15.0 · T5a · RULINGS AN4 · AP1) — 실제 설치에서는 **켤 수 없다**.
+
+    참은 다음이 **전부** 성립할 때뿐이다: `CYS_PREFLIGHT_HERMETIC_TEST=1` · Windows 가 아니다 ·
+    `CYS_TEST_ISOLATED_HOME` 이 현재 HOME 으로 풀린다 · 그 HOME 이 **계정의 홈이 아니다**
+    (비밀번호 데이터베이스 `pwd.getpwuid(os.getuid()).pw_dir` 를 풀어 비교 — 환경변수로 속일 수 없다).
+    하나라도 없거나 판정 중 오류가 나면 거짓(검사는 제품 그대로 돈다). 켜지면 이 기계의 절대 경로에
+    손대지 않는다: C65 는 기계 고정 cys 후보(/Applications · /opt/homebrew)를 보지 않고, C11b 는 HOME
+    밖의 링크를 정리 후보로 삼지 않으며, C20 은 인터프리터 pip 설치(`python -m pip install`)를 하지 않는다."""
     try:
-        return bool(mark) and os.path.realpath(mark) == os.path.realpath(os.path.expanduser("~"))
-    except (OSError, ValueError):
+        if os.environ.get("CYS_PREFLIGHT_HERMETIC_TEST") != "1":
+            return False
+        if os.name == "nt" or sys.platform.startswith("win"):
+            return False
+        mark = os.environ.get("CYS_TEST_ISOLATED_HOME", "")
+        if not mark:
+            return False
+        home = os.path.realpath(os.path.expanduser("~"))
+        if os.path.realpath(mark) != home:
+            return False
+        import pwd
+        account_home = os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir)
+        return bool(account_home) and account_home != home
+    except Exception:                    # noqa: BLE001 — 판정 불능은 '꺼짐'이다
         return False
 
 

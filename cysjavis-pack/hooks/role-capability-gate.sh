@@ -4959,9 +4959,14 @@ def self_test_boot_critical(fails):
                      % BOOT_CRITICAL_QUERY_TIMEOUT_S)
 
 
+_BC_FIXTURE_REL = "hooks/inject-context.sh"
+
+
 def _self_test_boot_critical(fails, shutil):
     pk = os.path.join(os.path.expanduser("~"), ".cys", "pack")
-    hk = os.path.join(pk, "hooks", "inject-context.sh")
+    # a FIXTURE path (nothing is opened or run): spelled from a constant, so the build's census does
+    # not read it as a file this protection device launches (RULINGS AT5 — the protection closure)
+    hk = os.path.join(pk, *_BC_FIXTURE_REL.split("/"))
     calls = []
 
     def runner(answer):

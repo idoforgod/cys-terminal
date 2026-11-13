@@ -249,9 +249,13 @@ fn gen_boot_critical(manifest_dir: &str, rels: &[String], out_dir: &str) {
         Ok(e) => e,
         Err(msg) => panic!("기동 필수 목록 산출 실패(T5a · RULINGS B6) — 빌드 중단:\n{msg}"),
     };
+    let inputs = match boot_critical_derive::protection_inputs(&src, &entries) {
+        Ok(i) => i,
+        Err(msg) => panic!("보호장치 시험 입력 산출 실패(T5a · RULINGS AU1) — 빌드 중단:\n{msg}"),
+    };
     fs::write(
         Path::new(out_dir).join("boot_critical.rs"),
-        boot_critical_derive::render(&entries),
+        boot_critical_derive::render(&entries, &inputs),
     )
     .expect("boot_critical.rs 생성 실패");
 }

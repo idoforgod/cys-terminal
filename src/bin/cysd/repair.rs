@@ -796,15 +796,16 @@ fn live_seats(daemon: &Daemon) -> Vec<(u64, String)> {
     out
 }
 
-/// Classification of one target from the two compiled lists (C4 · T5a · RULINGS AI6 / AN1): the
-/// protection list FIRST — a file in it is 보호장치 관련, also when it is boot-critical too (the
-/// stricter class) — then the boot-critical list → 기동 필수, else 일반. Either list unavailable,
-/// or a path that cannot be decided → an error: `begin` refuses (a boot-critical or protection
-/// file is never repaired as a general one). Rule documents are T4's gate.
+/// Classification of one target from the two compiled lists (C4 · T5a · RULINGS AI6 / AN1 / AP4):
+/// the protection list FIRST — a file in it is 보호장치 관련, also when it is boot-critical too
+/// (the stricter class) — then the boot-critical list → 기동 필수, else 일반. A path that matches a
+/// row only when case (or the spelling of the separators) is ignored is refused, naming the row's
+/// spelling: the check kind and the timeout are looked up by the exact spelling. Either list
+/// unavailable, or a path that cannot be decided → an error: `begin` refuses (a boot-critical or
+/// protection file is never repaired as a general one). Rule documents are T4's gate.
 fn production_classify(rel: &str) -> Result<cys::repair::types::Classification, RepairError> {
     use cys::repair::boot_critical::{
-        boot_critical_entry, entries, is_boot_critical, is_protection_related, protection_entries,
-        protection_entry, Decision,
+        boot_critical_entry, classify_path, entries, protection_entries, protection_entry, Decision,
     };
     use cys::repair::types::Classification;
     if protection_entries().is_empty() || entries().is_empty() {
@@ -812,27 +813,42 @@ fn production_classify(rel: &str) -> Result<cys::repair::types::Classification, 
             "{rel}: 컴파일된 기동 필수 · 보호장치 목록을 읽을 수 없어 시작하지 않습니다"
         )));
     }
-    if protection_entry(rel).is_some() {
-        return Ok(Classification::ProtectionRelated);
-    }
-    match is_protection_related(Path::new(rel))? {
-        Decision::Yes => return Ok(Classification::ProtectionRelated),
-        Decision::Undecidable => {
-            return Err(RepairError::Precondition(format!(
-                "{rel}: 보호장치 관련 여부를 가릴 수 없어 시작하지 않습니다"
+    let exact = |spelled: &str, row: &str| -> Result<(), RepairError> {
+        if spelled == row {
+            Ok(())
+        } else {
+            Err(RepairError::Precondition(format!(
+                "{rel}: 목록의 표기는 `{row}` 입니다 — 대소문자까지 그 표기로 다시 시작하세요(검사 종류와 시한은 정확한 표기로 찾습니다)"
             )))
         }
-        Decision::No => {}
+    };
+    if let Some(e) = protection_entry(rel) {
+        exact(rel, e.rel)?;
+        return Ok(Classification::ProtectionRelated);
     }
-    if boot_critical_entry(rel).is_some() {
+    let a = classify_path(Path::new(rel));
+    if a.decision == Decision::Undecidable {
+        return Err(RepairError::Precondition(format!(
+            "{rel}: 보호장치 · 기동 필수 여부를 가릴 수 없어 시작하지 않습니다"
+        )));
+    }
+    if let Some(e) = a.protection {
+        exact(a.rel.as_deref().unwrap_or(rel), e.rel)?;
+        return Ok(Classification::ProtectionRelated);
+    }
+    if let Some(e) = boot_critical_entry(rel) {
+        exact(rel, e.rel)?;
         return Ok(Classification::BootCritical);
     }
-    match is_boot_critical(Path::new(rel))? {
-        Decision::Yes => Ok(Classification::BootCritical),
-        Decision::No => Ok(Classification::General),
-        Decision::Undecidable => Err(RepairError::Precondition(format!(
+    match (a.decision, a.entry) {
+        (Decision::Yes, Some(e)) => {
+            exact(a.rel.as_deref().unwrap_or(rel), e.rel)?;
+            Ok(Classification::BootCritical)
+        }
+        (Decision::Yes, None) => Err(RepairError::Precondition(format!(
             "{rel}: 기동 필수 여부를 가릴 수 없어 시작하지 않습니다"
         ))),
+        _ => Ok(Classification::General),
     }
 }
 
@@ -1308,11 +1324,40 @@ mod ledger_verbs {
         Ok((event.to_string(), script.to_string()))
     }
 
-    /// RULINGS V1 / AN1: only a non-lifeline (8.7), non-protection (D:941) hook — the protection
-    /// rows are the sibling list (AI6); while either compiled list is not available a protection
-    /// hook cannot be told apart → refused (fail closed).
+    /// RULINGS V1 / AN1 / AP4 / AW6: only a non-lifeline (8.7), non-protection (D:941) hook — the
+    /// protection rows are the sibling list (AI6); lifeline and protection names compare ignoring
+    /// case, a name ending in a dot or a space or in a short-name form (`~<digit>`) is refused;
+    /// while either compiled list is not available a protection hook cannot be told apart →
+    /// refused (fail closed).
     pub(super) fn hook_allowed(script: &str) -> Result<(), VerbError> {
-        if LIFELINE_HOOKS.contains(&script) {
+        // RULINGS AP4: a name ending in a dot or a space is the same file on APFS / NTFS — refused
+        if script.ends_with('.') || script.ends_with(' ') {
+            return Err(VerbError::new(
+                cys::repair::types::ERR_PRECONDITION,
+                format!("{script:?}: 끝이 점이나 공백인 훅 이름은 받지 않습니다 — 정확한 스크립트 이름으로 다시 하세요"),
+            ));
+        }
+        // RULINGS AW6: a Windows short-name form (`ROLE-C~1.SH`) cannot be told apart from a
+        // protection hook without the volume — refused (the case-folded protection lookup below
+        // catches `GUARD.SH`)
+        if script.split('.').next().is_some_and(|stem| {
+            stem.char_indices().any(|(i, c)| {
+                c == '~'
+                    && stem[i + 1..]
+                        .chars()
+                        .next()
+                        .is_some_and(|d| d.is_ascii_digit())
+            })
+        }) {
+            return Err(VerbError::new(
+                cys::repair::types::ERR_PRECONDITION,
+                format!("{script}: 짧은 이름(8.3) 형태의 훅 이름은 받지 않습니다 — 정확한 스크립트 이름으로 다시 하세요"),
+            ));
+        }
+        if LIFELINE_HOOKS
+            .iter()
+            .any(|l| l.eq_ignore_ascii_case(script))
+        {
             return Err(VerbError::new(
                 cys::repair::types::ERR_PRECONDITION,
                 format!("{script}: 생명줄 훅의 등록은 수리로 해제할 수 없습니다"),

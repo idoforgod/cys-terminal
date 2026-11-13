@@ -533,5 +533,107 @@ class BootstrapStartReplay(unittest.TestCase):
         self.assertEqual(problems, [], report)
 
 
+@unittest.skipIf(os.name == "nt", "pwd 없음 — 스위치는 Windows 에서 언제나 꺼진다(그 자체가 시험 대상)")
+class HermeticSwitch(unittest.TestCase):
+    """RULINGS AP1 — preflight 의 시험 전용 스위치(`CYS_PREFLIGHT_HERMETIC_TEST`)는 실제 설치에서 켤 수 없다.
+
+    계정의 홈은 비밀번호 데이터베이스가 정한다 — 여기서는 `pwd.getpwuid` 를 바꿔 '실제 계정의 홈' 을 임시
+    디렉터리로 흉내 낸다(실제 홈은 읽지도 쓰지도 않는다). 세 경로(C65 · C20 · C11b)는 실행 경로 자체로 잰다:
+    어떤 후보를 보았고 어떤 명령을 만들었는가 — 바깥 명령은 하나도 실행하지 않는다."""
+
+    def setUp(self):
+        from unittest import mock
+        self.mock = mock
+        self.tmp = Path(os.path.realpath(tempfile.mkdtemp(prefix="t5a-sw-")))
+        self.addCleanup(shutil.rmtree, str(self.tmp), True)
+        self.home = self.tmp / "home"
+        self.pack = self.home / ".cys" / "pack"
+        (self.pack / "bin").mkdir(parents=True)
+        (self.pack / "bin" / "cys-dept").write_text("#!/bin/sh\n", encoding="utf-8")
+        (self.pack / "bin" / "cys-dept").chmod(0o755)
+        # HOME 밖의 레거시 링크(잘못된 타깃) — 제품의 C11b 는 이것을 정리 후보로 본다
+        self.outside = self.tmp / "outside"
+        self.outside.mkdir()
+        (self.tmp / "elsewhere").write_text("#!/bin/sh\n", encoding="utf-8")
+        os.symlink(str(self.tmp / "elsewhere"), str(self.outside / "cys-dept"))
+        if str(BIN) not in sys.path:
+            sys.path.insert(0, str(BIN))
+        import javis_preflight
+        self.pf = javis_preflight
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith(("CYS_", "JAVIS_", "AITERM_", "CLAUDE"))}
+        env.update({"HOME": str(self.home), "PATH": str(self.outside) + os.pathsep + "/usr/bin:/bin",
+                    "CYS_PACK_DIR": str(self.pack)})
+        p = self.mock.patch.dict(os.environ, env, clear=True)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def account(self, path):
+        return self.mock.patch("pwd.getpwuid", return_value=type("PW", (), {"pw_dir": str(path)})())
+
+    def switch(self, on=True, mark=None):
+        if on:
+            os.environ["CYS_PREFLIGHT_HERMETIC_TEST"] = "1"
+            os.environ["CYS_TEST_ISOLATED_HOME"] = str(mark or self.home)
+        else:
+            os.environ.pop("CYS_PREFLIGHT_HERMETIC_TEST", None)
+            os.environ.pop("CYS_TEST_ISOLATED_HOME", None)
+
+    def paths(self):
+        """(C65 이 본 cys 후보, C20 이 만든 설치 명령, C11b 의 판정 문면) — 바깥 명령 실행 0."""
+        seen, cmds = [], []
+
+        def isfile(p):
+            seen.append(p)
+            return False
+        pre = self.pf.Preflight(fix=False, skips=[])
+        with self.mock.patch("shutil.which", return_value=None), \
+                self.mock.patch("os.path.isfile", side_effect=isfile):
+            pre.c65_drain_verify()
+        with self.mock.patch("shutil.which", return_value=None), \
+                self.mock.patch("subprocess.run", side_effect=lambda cmd, **k: cmds.append(cmd) or
+                                type("R", (), {"returncode": 1})()):
+            self.pf.Preflight._install_nlm()
+        pre = self.pf.Preflight(fix=False, skips=[])
+        with self.mock.patch("shutil.which",
+                             side_effect=lambda n: str(self.outside / n) if n == "cys-dept" else None):
+            pre.c11b_cys_dept_path()
+        c11b = " ".join(r.get("detail", "") or r.get("msg", "") or str(r) for r in pre.results)
+        return seen, cmds, c11b
+
+    def test_unset_is_inert(self):
+        self.switch(on=False)
+        with self.account(self.tmp / "account"):
+            self.assertFalse(self.pf._hermetic_test())
+
+    def test_real_account_home_refuses_and_the_checks_run_as_in_production(self):
+        self.switch(on=True)
+        with self.account(self.home):           # HOME 가 곧 계정의 홈 = 실제 설치
+            self.assertFalse(self.pf._hermetic_test())
+            seen, cmds, c11b = self.paths()
+        self.assertIn("/Applications/cys.app/Contents/MacOS/cys", seen, "C65 가 기계 후보를 건너뛰었다")
+        self.assertTrue(any(c[:3] == [sys.executable, "-m", "pip"] for c in cmds), cmds)
+        self.assertIn(str(self.outside / "cys-dept"), c11b, "C11b 가 HOME 밖 레거시 링크를 건너뛰었다")
+
+    def test_isolated_home_is_honoured(self):
+        self.switch(on=True)
+        with self.account(self.tmp / "account"):
+            self.assertTrue(self.pf._hermetic_test())
+            seen, cmds, c11b = self.paths()
+        self.assertNotIn("/Applications/cys.app/Contents/MacOS/cys", seen)
+        self.assertFalse(any(c[:3] == [sys.executable, "-m", "pip"] for c in cmds), cmds)
+        self.assertNotIn(str(self.outside / "cys-dept"), c11b)
+
+    def test_marker_must_be_the_current_home_and_windows_is_off(self):
+        self.switch(on=True, mark=self.tmp / "other")
+        with self.account(self.tmp / "account"):
+            self.assertFalse(self.pf._hermetic_test())
+        self.switch(on=True)
+        with self.account(self.tmp / "account"), self.mock.patch("sys.platform", "win32"):
+            self.assertFalse(self.pf._hermetic_test())
+        with self.mock.patch("pwd.getpwuid", side_effect=KeyError("no such uid")):
+            self.assertFalse(self.pf._hermetic_test())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
