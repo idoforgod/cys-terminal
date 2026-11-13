@@ -58,12 +58,33 @@ def sha(text_or_bytes):
     return hashlib.sha256(b).hexdigest()
 
 
+def _slurp(*args, **kw):
+    with open(*args, **kw) as f:
+        return f.read()
+
+
 def _write(path, data, mode=None):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "wb") as f:
         f.write(data.encode("utf-8") if isinstance(data, str) else data)
     if mode is not None:
         os.chmod(path, mode)
+
+
+def _descendant_names(pid):
+    """pid 아래 모든 자손 프로세스의 실행 파일 이름(ps 한 번 — POSIX)."""
+    out = subprocess.run(["ps", "-eo", "pid=,ppid=,comm="], capture_output=True, text=True).stdout
+    kids = {}
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+            kids.setdefault(int(parts[1]), []).append((int(parts[0]), os.path.basename(parts[2].strip())))
+    names, stack = [], [pid]
+    while stack:
+        for child, comm in kids.get(stack.pop(), []):
+            names.append(comm)
+            stack.append(child)
+    return names
 
 
 def extract_shell_function(src, name):
@@ -143,12 +164,13 @@ class Rig(unittest.TestCase):
 
     def receipt(self):
         try:
-            return json.load(open(self.p(".ceo-receipt.json"), encoding="utf-8"))
+            with open(self.p(".ceo-receipt.json"), encoding="utf-8") as f:
+                return json.load(f)
         except (OSError, ValueError):
             return None
 
     def calls(self):
-        return open(self.log, encoding="utf-8").read() if os.path.exists(self.log) else ""
+        return _slurp(self.log, encoding="utf-8") if os.path.exists(self.log) else ""
 
     def captures(self, kind):
         return sorted(glob.glob(self.p("MASTER_DIRECTIVE.md.%s.*" % kind)))
@@ -185,10 +207,10 @@ class Composition(Rig):
         # 대조: 종전 통째 복사였다면 지침 == 틀(사용자 줄 소실) — 지금은 틀과 다르다.
         self.assertNotEqual(self.read("MASTER_DIRECTIVE.md"), TEMPLATE)
         # 두 번째 지명은 이미 현행 — 무변경·성공.
-        before = open(self.p("MASTER_DIRECTIVE.md"), "rb").read()
+        before = _slurp(self.p("MASTER_DIRECTIVE.md"), "rb")
         rc, out, err = self.run_dept("promote-ceo")
         self.assertEqual(rc, 0, out + err)
-        self.assertEqual(open(self.p("MASTER_DIRECTIVE.md"), "rb").read(), before)
+        self.assertEqual(_slurp(self.p("MASTER_DIRECTIVE.md"), "rb"), before)
 
     def test_edits_during_ceo_survive_launch_and_ticks(self):
         """E-6-03: CEO 동안 본문을 고친 뒤 부서 켜기(launch)·지명·대기 틱이 그 수정을 지우지 않는다(재주입도 없음)."""
@@ -222,7 +244,7 @@ class Composition(Rig):
         self.assertIsNone(self.read("MASTER_DIRECTIVE.md.pre-ceo"), "강등 뒤 .pre-ceo 가 남아 '승격 중'으로 보인다")
         kept = sorted(glob.glob(self.p("MASTER_DIRECTIVE.md.pre-ceo.*")))
         self.assertEqual(len(kept), 1, "다른 내용의 백업은 시각을 붙여 보관해야 한다: %r" % os.listdir(self.dirs))
-        self.assertEqual(open(kept[0], encoding="utf-8").read(), USER, "백업이 원본으로 쓰이지 않았는데 내용이 바뀌었다")
+        self.assertEqual(_slurp(kept[0], encoding="utf-8"), USER, "백업이 원본으로 쓰이지 않았는데 내용이 바뀌었다")
         self.assertIsNone(self.read(".ceo-receipt.json"))
         self.assertIn("CEO 강등", out + err)
 
@@ -248,7 +270,7 @@ class Composition(Rig):
         caps = self.captures("before-compose")
         self.assertEqual(len(caps), 1, "고친 머리말을 보관하지 않았다: %r" % os.listdir(self.dirs))
         self.assertRegex(os.path.basename(caps[0]), r"\.before-compose\.\d{8}T\d{6}Z$")
-        self.assertEqual(open(caps[0], encoding="utf-8").read(), live, "보관 사본이 조립 전 바이트가 아니다")
+        self.assertEqual(_slurp(caps[0], encoding="utf-8"), live, "보관 사본이 조립 전 바이트가 아니다")
         self.assert_receipt_for(HEADER_V2, USER + "USERFIX-E6-2\n", self.read("MASTER_DIRECTIVE.md"))
 
     def test_template_advance_recomposes_header_only_without_capture(self):
@@ -332,7 +354,7 @@ class Composition(Rig):
     def test_superset_function_unit_on_the_real_code(self):
         """H-14-N1-01 단위: cys-dept 의 실제 ceo_template_superset_ok·ceo_py 코드를 그대로 돌린다(변이가 그대로 보인다).
         (i) 틀 = 머리말(표지 3핀) + 구분선 + 표준 MASTER 전문 · (ii) 후보 == 머리말 + 구분선 + 사용자 지침 전문."""
-        src = open(DEPT, encoding="utf-8").read()
+        src = _slurp(DEPT, encoding="utf-8")
         funcs = extract_shell_function(src, "ceo_py") + extract_shell_function(src, "ceo_template_superset_ok")
         self.assertTrue(funcs.count("PY\n}") == 1, "ceo_py 추출 경계가 heredoc 끝이 아니다")
         f = {}
@@ -402,13 +424,21 @@ class Composition(Rig):
             proc = subprocess.Popen(["bash", DEPT, "promote-ceo"], env=self.env,
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             try:
-                time.sleep(2.0)
+                # 사건으로 판정한다(시간이 아니라): 승격 프로세스 트리에 `flock` 이 나타나면 그 순간 승격은 락 앞에서
+                # 막혀 있다 — 락을 쥔 동안 끝날 수도, 지침을 바꿀 수도 없다. 락을 지우는 변이는 `flock` 이 끝내 안 나타난다.
+                deadline = time.monotonic() + 60
+                while "flock" not in _descendant_names(proc.pid):
+                    self.assertIsNone(proc.poll(), "락이 잡혀 있는데 승격이 락 없이 끝났다(락 제거)")
+                    self.assertLess(time.monotonic(), deadline, "승격이 락에 닿지 않았다")  # wallclock: guard the promotion always reaches its lock; 60 s only ends a hang
+                    time.sleep(0.05)
                 self.assertIsNone(proc.poll(), "락이 잡혀 있는데 승격이 끝났다(락 없음)")
                 self.assertEqual(self.read("MASTER_DIRECTIVE.md"), USER, "락 밖에서 지침이 바뀌었다")
             finally:
                 fcntl.flock(fd, fcntl.LOCK_UN)
                 os.close(fd)
             self.assertEqual(proc.wait(timeout=120), 0)
+            proc.stdout.close()
+            proc.stderr.close()
         else:
             os.mkdir(md + ".promote.lock.d")       # 남이 쥔 락
             rc, out, err = self.run_dept("promote-ceo")
@@ -530,7 +560,7 @@ class LegacyShapes(Rig):
                          HEADER + SEP + self.OLD_VENDOR + "CEO-EDIT CEO 동안 고친 줄\n", "살아 있는 본문이 바뀌었다")
         caps = self.captures("before-compose")
         self.assertEqual(len(caps), 1)
-        self.assertEqual(open(caps[0], encoding="utf-8").read(), edited)
+        self.assertEqual(_slurp(caps[0], encoding="utf-8"), edited)
         self.assertEqual(self.read("MASTER_DIRECTIVE.md.pre-ceo"), self.USER_OLD, "백업을 덮었다")
 
     def test_copy_without_separator_uses_backup_and_captures(self):
@@ -541,7 +571,7 @@ class LegacyShapes(Rig):
         self.assertEqual(rc, 0, out + err)
         self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + self.USER_OLD)
         caps = self.captures("before-compose")
-        self.assertEqual([open(c, encoding="utf-8").read() for c in caps], [six_kb])
+        self.assertEqual([_slurp(c, encoding="utf-8") for c in caps], [six_kb])
         # 같은 형상의 강등(조립 전) — 백업으로 되돌리고 지금 파일은 보관.
         shutil.rmtree(self.dirs)
         self.seed(md=six_kb)
@@ -549,7 +579,7 @@ class LegacyShapes(Rig):
         rc, out, err = self.run_dept("down", "d0")
         self.assertEqual(rc, 0, out + err)
         self.assertEqual(self.read("MASTER_DIRECTIVE.md"), self.USER_OLD)
-        self.assertEqual([open(c, encoding="utf-8").read() for c in self.captures("before-demote")], [six_kb])
+        self.assertEqual([_slurp(c, encoding="utf-8") for c in self.captures("before-demote")], [six_kb])
 
 
 class HqDirectiveChain(Rig):
@@ -558,7 +588,7 @@ class HqDirectiveChain(Rig):
     REAL_MASTER = os.path.join(PACK, "directives", "MASTER_DIRECTIVE.md")
 
     def _real(self, path):
-        return open(path, encoding="utf-8", newline="").read()
+        return _slurp(path, encoding="utf-8", newline="")
 
     def test_unedited_master_composes_to_the_shipped_template(self):
         """조립은 줄을 더하지 않는다 — 고치지 않은 MASTER 의 조립 == 출하 CEO_TEMPLATE 바이트(CEO 줄 예산 그대로)."""
@@ -566,7 +596,7 @@ class HqDirectiveChain(Rig):
         self.seed(md=master, tmpl=tmpl)
         rc, out, err = self.run_dept("promote-ceo")
         self.assertEqual(rc, 0, out + err)
-        self.assertEqual(open(self.p("MASTER_DIRECTIVE.md"), "rb").read(), open(self.REAL_TMPL, "rb").read())
+        self.assertEqual(_slurp(self.p("MASTER_DIRECTIVE.md"), "rb"), _slurp(self.REAL_TMPL, "rb"))
 
     def test_composed_real_directive_passes_c03_and_org_axis(self):
         tmpl, master = self._real(self.REAL_TMPL), self._real(self.REAL_MASTER)
@@ -612,20 +642,20 @@ class HqDirectiveChain(Rig):
         spec.loader.exec_module(gen)
         canon = gen.SEPARATOR
         self.assertEqual(SEP.encode("utf-8"), canon)
-        dept_src = open(DEPT, encoding="utf-8").read()
+        dept_src = _slurp(DEPT, encoding="utf-8")
         lit = re.search(r'^SEP = "(.*?)"\.encode\("utf-8"\)$', dept_src, re.M)
         self.assertIsNotNone(lit, "cys-dept 의 구분선 정의를 찾지 못했다")
         self.assertEqual(lit.group(1).encode("utf-8").decode("unicode_escape").encode("latin-1"),
                          canon, "cys-dept 구분선 ≠ 생성기")
         self.assertEqual(pf.Preflight._C03_CEO_SEPARATOR, canon, "preflight 구분선 ≠ 생성기")
-        org_src = open(os.path.join(BIN, "javis_org.py"), encoding="utf-8").read()
+        org_src = _slurp(os.path.join(BIN, "javis_org.py"), encoding="utf-8")
         lit = re.search(r'^_CEO_SEPARATOR = "(.*?)"\.encode\("utf-8"\)$', org_src, re.M)
         self.assertIsNotNone(lit)
         self.assertEqual(lit.group(1).encode("utf-8").decode("unicode_escape").encode("latin-1"), canon,
                          "javis_org 구분선 ≠ 생성기")
         app = os.path.join(REPO, "src-tauri", "src", "main.rs")
         if os.path.isfile(app):
-            lit = re.search(r'^const CEO_SEPARATOR: &str = "(.*?)";$', open(app, encoding="utf-8").read(), re.M)
+            lit = re.search(r'^const CEO_SEPARATOR: &str = "(.*?)";$', _slurp(app, encoding="utf-8"), re.M)
             self.assertIsNotNone(lit)
             self.assertEqual(lit.group(1).encode("utf-8").decode("unicode_escape").encode("latin-1"), canon,
                              "앱 구분선 ≠ 생성기")
