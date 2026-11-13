@@ -14805,7 +14805,10 @@ mod m11_tests {
         // 업데이트가 링크를 파일로 바꿨다고 치고 되돌린다.
         std::fs::remove_file(rig.pack.join(rel)).unwrap();
         rig.write(rel, b"{\"vendor\":2}\n");
-        let done = restore_update_snapshot(&o.path, &rig.pack, Some(&[rel.to_string()]), &UpdateSources::none()).unwrap();
+        // ★T5a 재기반 2단계: 이 시험은 '등재되지 않은 user 파일'의 링크 복원을 잰다 — T5a 의 실제 목록에서 `agents.json` 은
+        //   기동 필수 행이라(등재 파일의 링크는 출시본이 아니어서 거부된다 — T2f BO2(c)) 이음새로 '등재 아님'을 명시한다.
+        let unlisted = UpdateSources::none().with_listed(|_| false);
+        let done = restore_update_snapshot(&o.path, &rig.pack, Some(&[rel.to_string()]), &unlisted).unwrap();
         assert_eq!(done, vec![rel.to_string()]);
         let m = std::fs::symlink_metadata(rig.pack.join(rel)).unwrap();
         assert!(m.file_type().is_symlink(), "링크로 되살아나야 한다(파일 사본 아님)");

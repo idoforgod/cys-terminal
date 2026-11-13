@@ -41488,8 +41488,20 @@ mod tests {
         let local = td.parent().unwrap().join("local");
         let _l = cys::pack::EnvGuard::set("CYS_LOCAL_DIR", &local);
         let root = local.join("update-snapshots");
-        let user_rel = "agents.json".to_string();
+        // ★T5a 재기반 2단계: user 파일 갈래의 검체는 두 컴파일 목록에 **없는** user 파일이다(종전 `agents.json` 은 T5a 의
+        //   실제 목록에서 기동 필수 행 — 등재 파일의 되돌리기 거부는 `t2f_*` 시험이 잰다).
+        let user_rel = cys::pack::PACK_ALL
+            .iter()
+            .map(|(r, _)| r.to_string())
+            .find(|r| {
+                // a user-owned JSON setting (not a constitution file — those have their own merge rules)
+                r.ends_with(".json")
+                    && cys::pack::ownership_name_scoped(r, &td) == "user"
+                    && !cys::pack::listed_in_compiled_lists(r)
+            })
+            .expect("an unlisted user-owned pack file");
         assert_eq!(cys::pack::ownership_name_scoped(&user_rel, &td), "user");
+        std::fs::create_dir_all(td.join(&user_rel).parent().unwrap()).unwrap();
         let none = |_: &str| Vec::<String>::new();
         let caps = (cys::pack::UPDATE_SNAPSHOT_FILE_CAP, cys::pack::UPDATE_SNAPSHOT_TOTAL_CAP);
         let old = "PREVIOUS RELEASE BYTES\n";
@@ -41623,7 +41635,9 @@ mod tests {
         // 술어는 목록 대조 키(접은 철자)를 받는다 — 이음새도 접은 키로 비교한다.
         let r1 = cys::pack::list_key(&rel);
         let listed = cys::pack::UpdateSources::none().with_listed(move |r| r == r1);
-        let plain = cys::pack::UpdateSources::none();
+        // ★T5a 재기반 2단계: 대조군은 '등재되지 않음'을 이음새로 명시한다 — T5a 의 실제 목록이 들어온 뒤
+        //   `UpdateSources::none()` 은 `agents.json`(기동 필수 3갈래) 같은 대조군 파일을 등재로 답한다.
+        let plain = cys::pack::UpdateSources::none().with_listed(|_| false);
         let mine = "MY UNAPPROVED BOOT EDIT\n";
         // ── pack-adopt <rel> / --from / --all ──
         std::fs::write(td.join(&rel), &embed).unwrap();
@@ -41789,8 +41803,10 @@ mod tests {
         std::fs::write(&stored, "TAMPERED\n").unwrap();
         assert_eq!(run_pack_rollback_with(Some(urel.clone()), true, true, false, &lu), 1, "등재 파일 강행 불가");
         assert_eq!(std::fs::read_to_string(td.join(&urel)).unwrap(), "AFTER\n");
-        // 대조군: 등재되지 않은 user 파일은 종전대로 강행한다.
-        assert_eq!(run_pack_rollback_with(Some(urel.clone()), true, true, false, &cys::pack::UpdateSources::none()), 0);
+        // 대조군: 등재되지 않은 user 파일은 종전대로 강행한다(★T5a 재기반 2단계: '등재 아님'을 이음새로 명시 — 실제
+        //   목록에서는 `agents.json` 이 기동 필수 행이다).
+        let unlisted = cys::pack::UpdateSources::none().with_listed(|_| false);
+        assert_eq!(run_pack_rollback_with(Some(urel.clone()), true, true, false, &unlisted), 0);
         assert_eq!(std::fs::read_to_string(td.join(&urel)).unwrap(), "TAMPERED\n");
         // (c) 색인이 `released: true` 라고 해도(색인 변조) 쓰려는 바이트가 출시본이 아니면 거부.
         std::fs::write(&stored, "SNAPSHOTTED\n").unwrap();
@@ -42952,6 +42968,9 @@ mod tests {
                     r.starts_with(prefix)
                         && cys::pack::ownership_name_scoped(r, &td) == "system"
                         && *r != "trusted-keys.json"
+                        // ★T5a 재기반 2단계: 사건 형상의 검체는 등재되지 않은 system 파일이다 — 등재 파일(기동 필수·보호
+                        //   목록)은 `--all` 이 건너뛴다(T2f BD4 · `t2f_every_pack_writer_refuses_a_listed_file` 가 잰다).
+                        && !cys::pack::listed_in_compiled_lists(r)
                 })
                 .skip(skip)
                 .take(n)
