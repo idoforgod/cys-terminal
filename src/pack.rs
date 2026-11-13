@@ -14062,8 +14062,11 @@ mod m11_tests {
     }
 
     /// RULINGS AC4(부록 A-2 #17): 스냅샷은 유한하다 — 이 팩의 실제 파일 수(내장 전부가 바뀌는 최악의 업데이트)에서
-    /// 크기는 상한 안이고, 걸리는 시간은 명령줄 기동 대기(설계 §4-11 아: 4초) 안이다. 상한을 넘는 파일은 담지 않고
-    /// 색인에 이름을 남기며 설치는 계속된다.
+    /// 크기는 상한 안이고, 일의 양은 '이번 설치가 덮거나 지울 파일 수'를 넘지 않는다. 상한을 넘는 파일은 담지 않고
+    /// 색인에 이름을 남기며 설치는 계속된다. 걸린 시간은 로그에 남기기만 한다 — 디버그 빌드·부하 걸린 실행기에서 시계
+    /// 한계는 흔들린다(실측: 다른 트랙과 함께 돈 하네스에서 4.13초 — DEFERRED_MINOR #45 의 방향 "일의 양을 단언하고 시간은
+    /// 기록만"; 기동 전 시간은 5단계에서 잰다 — RULINGS AB6(3)).
+    /// ★r3 재작성(종전: `took < 4초` 단언 — 그 단언이 부하로 깨져 같은 잠금을 쓰는 시험 55개를 연쇄로 떨어뜨렸다).
     #[test]
     fn m11_snapshot_is_bounded_on_the_real_pack_file_count() {
         let rig = Rig::new("snapbound");
@@ -14103,7 +14106,15 @@ mod m11_tests {
             }
         }
         assert_eq!(on_disk, out.bytes, "색인의 바이트 합 = 실제 사본");
-        assert!(took < std::time::Duration::from_secs(4), "스냅샷 {took:?} — 기동 대기 4초 초과"); // wallclock: aging RULINGS AC4 asks for a time bound on the pre-bind snapshot; 4 s is the design's CLI start wait (§4-11 아) and the fixture is the worst case (every embedded file changes)
+        // 일의 양(결정론): 담은 파일 + 상한으로 뺀 파일 = 같은 판정이 '덮는다/지운다'로 고른 파일 수.
+        let plan = plan_install_core(&rig.pack, &v2, false, "9.9.9", PackScope::Base, &src);
+        let planned = plan.update.len()
+            + plan.heal.len()
+            + plan.merge3.len()
+            + plan.vendor_first.len()
+            + plan.prune_delete.len();
+        assert_eq!(out.files + out.skipped.len(), planned, "스냅샷의 일 = 이번 설치가 덮거나 지울 파일 수");
+        assert!(planned <= v1.len());
         // 상한: 파일 하나가 상한을 넘으면 그 파일만 빠지고 색인에 남는다 — 설치는 계속된다.
         let big = "x".repeat((UPDATE_SNAPSHOT_FILE_CAP + 1) as usize);
         rig.write("bin/huge.txt", big.as_bytes());
