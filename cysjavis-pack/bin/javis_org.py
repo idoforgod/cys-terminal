@@ -460,6 +460,12 @@ def _audit_ticket_state(name):
 _CEO_SEPARATOR = "\n---\n\n# [본문 — 표준 MASTER 운영 계약 전문]\n\n".encode("utf-8")
 
 
+def _pre_ceo_present(md_path):
+    """★CG2 — .pre-ceo 실재의 한 판정(사본 · 정본 javis_preflight `_c03_pre_ceo_present`): 항목이 있다(사전적 — 끊긴 링크·
+    읽을 수 없는 파일·폴더도 '있다')."""
+    return os.path.lexists(md_path + ".pre-ceo")
+
+
 def _ceo_promoted(md_b, pre_exists):
     """★RULINGS CB1 — '승격'의 한 뜻(사본 · 정본은 javis_preflight `Preflight._c03_ceo_promoted`):
     .pre-ceo 실재 ∨ 살아 있는 MASTER 에 생성기의 구분선(LF·CRLF)이 있다. tests/fixtures/ceo-promoted-cases.json 이
@@ -478,7 +484,6 @@ def _audit_ceo_axis(dept_count):
       정상이다(본문 = 사용자 본부 지침) — 바이트 등가로 판정하지 않는다."""
     base_pack = os.path.join(HOME, ".cys", "pack")          # cys-dept PACK_DEFAULT 동일 규약
     md = os.path.join(base_pack, "directives", "MASTER_DIRECTIVE.md")
-    pre = md + ".pre-ceo"
     receipt = os.path.join(base_pack, "directives", ".ceo-receipt.json")          # O-C11-1(조립 영수증)
     legacy_receipt = os.path.join(base_pack, "directives", ".ceo-template-applied")  # 0.14.x 영수증
     pending = os.path.join(HOME, ".cys", "state", "ceo-pending")
@@ -488,7 +493,7 @@ def _audit_ceo_axis(dept_count):
             mb = a.read()
     except OSError:
         mb = None
-    promoted = _ceo_promoted(mb, os.path.exists(pre))   # 영수증 단독은 승격 증거 아님(강등이 증거 보존)
+    promoted = _ceo_promoted(mb, _pre_ceo_present(md))   # 영수증 단독은 승격 증거 아님(강등이 증거 보존)
     is_pending = os.path.exists(pending)
     base_st, base_probe = _audit_daemon_status(None)
     base_alive = base_st is not None
