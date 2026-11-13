@@ -632,6 +632,99 @@ class NoMasterShortcutAnywhere(unittest.TestCase):
         self.assertEqual(self.hits(planted), [("skills/x/SKILL.md", "사소한 마무리")])
 
 
+class DeferralFamiliesFG(unittest.TestCase):
+    """TESTPLAN_RULINGS Part 23 B55 (+ Part 25 B69): the Tier-1 families T1-f ("the fix is the maker's / vendor's /
+    publishing department's work", no verb needed) and T1-g ("reporting is the regular way to get the defect fixed") of
+    testplan A.md §5 find NOTHING in the shipped directive, soul, skill, hook and manual texts, nor in the compiled role
+    blocks. Sentences are split on [.!?。\\n] after NFC; case-insensitive (A.md §5). The alternations are built from
+    one-per-line tuples so this file is not itself a hit of the sweep. Positive controls: the two base sentences the
+    design names (v0.14.56 CEO_TEMPLATE 37–41 and session-start ~397), written with a '#' that is removed at run time."""
+    NOUNS = (r"최윤식", r"윤식\s*박사", r"박사(?!급)", r"Dr\.?\s*Choi", "제작자", "제작사", "개발자", "개발사", "개발팀",
+             "제조사", "벤더", "vendor", "배포자", "공급자", "upstream", "업스트림", r"배포\s*전담\s*부서", "정비발행부",
+             "maintainer", "developer")
+    WORK = ("일", "작업", "몫", "책임", "소관", "담당",
+            "업무")
+    COPULA = ("이다", "입니다", "이에요", "예요", "이라", "이며", "이므로", "임",
+              "으로")
+    PLACE = ("자리", "위치", "경로",
+             "장소")
+    KEEP = ("보존",
+            "반영")
+    PLACE_NOUNS = ("벤더", "vendor", "upstream", "업스트림", "제작자", r"배포\s*전담\s*부서",
+                   "정비발행부")
+    EN_WHO = ("vendor", "upstream", "maintainer",
+              "developer")
+    EN_WORK = ("job", "responsibility", "work",
+               "task")
+    G_SAY = ("보고", "제보",
+             "문의")
+    G_DEFECT = ("결함", "버그", "오류",
+                "문제")
+    G_FIX = ("고치는", "수정하는",
+             "해결하는")
+    G_REGULAR = ("정규", "공식",
+                 "올바른")
+    G_WAY = ("경로", "길",
+             "방법")
+
+    @classmethod
+    def patterns(cls):
+        import re
+        alt = lambda xs: "(" + "|".join(xs) + ")"
+        s = r"[^.!?。\n]"
+        f = (alt(cls.NOUNS) + s + r"{0,6}?\s*(의|쪽)?\s*(?:(?<=[의쪽])|(?<![가-힣A-Za-z0-9]))" + alt(cls.WORK)
+             + r"\s*" + alt(cls.COPULA)
+             + "|영구" + r"\s*" + alt(cls.KEEP) + r"\s*" + alt(cls.PLACE) + s + "{0,20}" + alt(cls.PLACE_NOUNS)
+             + "|" + alt(cls.EN_WHO) + r"'?s?\s+" + alt(cls.EN_WORK))
+        g = (alt(cls.G_SAY) + s + "{0,20}" + alt(cls.G_DEFECT) + s + "{0,10}" + alt(cls.G_FIX) + r"\s*"
+             + alt(cls.G_REGULAR) + r"?\s*" + alt(cls.G_WAY))
+        return {"T1-f": re.compile(f, re.I), "T1-g": re.compile(g, re.I)}
+
+    @classmethod
+    def hits(cls, rel, text):
+        import re
+        import unicodedata
+        out = []
+        pats = cls.patterns()
+        for m in re.finditer(r"[^.!?。\n]*[.!?。\n]?", unicodedata.normalize("NFC", text)):
+            for fam, rx in pats.items():
+                if m.group(0).strip() and rx.search(m.group(0)):
+                    out.append((rel, fam, " ".join(m.group(0).split())[:160]))
+        return out
+
+    def corpus(self):
+        import glob
+        import re
+        pack = os.path.dirname(DIRECTIVES_DIR)
+        files = [os.path.join(pack, "soul.md"), os.path.join(pack, "hooks", "README.md")]
+        files += glob.glob(os.path.join(pack, "directives", "*.md"))
+        files += glob.glob(os.path.join(pack, "hooks", "*.sh"))
+        files += glob.glob(os.path.join(pack, "skills", "**", "*.md"), recursive=True)
+        out = {}
+        for p in files:
+            with open(p, encoding="utf-8", errors="replace") as fh:
+                out[os.path.relpath(p, pack)] = fh.read()
+        out["USER-MANUAL.md"] = repo_text("USER-MANUAL.md")
+        rules = repo_text(os.path.join("src", "repair", "rules.rs"))
+        for name in ("RULES_COMMON", "RULES_MASTER_CEO", "RULES_WORKER", "RULES_CSO", "RULES_REVIEWER"):
+            out["rules.rs:" + name] = re.search(r'pub const %s: &str = r#"(.*?)"#;' % name, rules, re.S).group(1)
+        return out
+
+    def test_no_t1f_or_t1g_hit_in_the_shipped_texts(self):
+        texts = self.corpus()
+        self.assertGreater(len(texts), 40, "corpus too small — the sweep would be void")
+        found = [h for rel, text in texts.items() for h in self.hits(rel, text)]
+        self.assertEqual(found, [], "Tier-1 T1-f / T1-g deferral sentences in shipped texts")
+
+    def test_positive_controls_and_the_word_boundary(self):
+        ceo = "(upstream)** 이고 그것은 배포 전담 부서의 작#업이다(현재 토큰 정지 중이라 재설정 후).".replace("#", "")
+        hook = "사용자에게 보고하라** — 그 보고가 이 팩의 결함을 고치는 정규 경#로다.".replace("#", "")
+        self.assertEqual([h[1] for h in self.hits("ctl", ceo)], ["T1-f"])
+        self.assertEqual([h[1] for h in self.hits("ctl", hook)], ["T1-g"])
+        # Part 25 B69: the work noun must begin a word — the "일" inside "파일이며" is no hit.
+        self.assertEqual(self.hits("ctl", "이 파일은 벤더 파일이며 수정은 보존된다."), [])
+
+
 class MasterMayFileAReport(unittest.TestCase):
     """RULINGS BB2 (ii): the master's compiled role block and MASTER_DIRECTIVE §1-B say plainly that intake
     (`cys repair report`) is allowed to a master — only the ledger-changing verbs are not."""
