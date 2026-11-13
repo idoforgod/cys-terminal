@@ -365,12 +365,15 @@ fn owner_input_pauses_and_resumes() {
     d.resumed_at = Some(t + 1_800.0);
     write_decision_in(&r2, &d).unwrap();
     assert!(is_paused_in(&r2, t + 60.0));
-    // off: no new round either
+    assert_eq!(new_round_refusal_in(&r2), NEW_ROUND_PAUSED_KO);
+    // off: no new round either, and the refusal says the grant is off (CH7)
     let mut d = read_decision_in(&r2).unwrap().unwrap();
     d.state = GrantState::Off;
     d.paused_at = None;
     write_decision_in(&r2, &d).unwrap();
     assert!(!may_open_new_round_in(&r2, t + 60.0).unwrap());
+    assert_eq!(new_round_refusal_in(&r2), NEW_ROUND_OFF_KO);
+    assert!(NEW_ROUND_OFF_KO.contains("자동 수리 허락이 꺼져 있습니다") && !NEW_ROUND_OFF_KO.contains("일시정지"));
 }
 
 // ───────────────────────────── claim files (F1 / F7(1)) ─────────────────────────────

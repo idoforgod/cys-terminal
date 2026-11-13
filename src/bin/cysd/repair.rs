@@ -2273,7 +2273,8 @@ mod ledger_verbs {
                 if rec.trigger == Trigger::Grant && rec.resolves.is_none() {
                     // B4 / K3: a new round of a grant-triggered repair asks T4 (paused → refused).
                     if !cys::repair::grant::may_open_new_round(&id)? {
-                        return Err(VerbError::new(cys::repair::types::ERR_PRECONDITION, "자동 수리 허락이 일시정지 중이라 새 라운드를 열 수 없습니다"));
+                        // CH7 (T4): the sentence says whether the grant is off or paused
+                        return Err(VerbError::new(cys::repair::types::ERR_PRECONDITION, cys::repair::grant::new_round_refusal(&id)));
                     }
                 }
                 rec.attempt += 1;
@@ -3290,6 +3291,7 @@ mod grant_verbs {
             at: r.at,
             question: r.question.as_ref().map(question_view),
             named_docs: &r.named_docs,
+            last_human: r.last_human.as_ref().map(|(d, at)| (d.as_str(), *at)),
         }
     }
 
@@ -3626,18 +3628,75 @@ mod grant_verbs {
     }
 }
 
-/// T4 (RULINGS B4) — the daemon side of "주인의 아무 입력이면 즉시 정지": marks an owner input seen
-/// by THIS lane's daemon in the grant's pause file (only while the grant is on; nothing is sent to
-/// any queue). ★Not wired yet — its two call sites (an owner-typed prompt in `hook.machine_origin`,
-/// an operator-typed app send) are outside track T4's partition: CONTRACT CHANGE REQUEST CCR-1.
-#[allow(dead_code)] // wired by CCR-1 (call sites in handlers.rs / record_prompt_origin)
+/// T4 (RULINGS B4, CH3) — the daemon side of "주인의 아무 입력이면 즉시 정지": marks an owner input
+/// seen by THIS lane's daemon in the grant's pause file (only while the grant is on; nothing is sent
+/// to any queue). Called at the two places the daemon learns of owner input (`handlers.rs`): an
+/// owner-typed prompt in `hook.machine_origin` (STRICT judgment — CH2) and an operator-typed app send
+/// (`human_verified`). App typing arrives in many small sends, so a lane's mark is rewritten at most
+/// once per `PAUSE_MARK_MIN_GAP_SECS` (the pause may then end that much earlier than 30 minutes after
+/// the very last keystroke).
 pub(crate) fn grant_note_owner_input(daemon: &Daemon) {
     let root = production_root(daemon);
     let lane = LaneKey::of_socket(&daemon.socket_path);
-    if let Err(e) =
-        cys::repair::grant::note_owner_input_in(&root, &lane, cys::repair::ledger::now_epoch())
+    note_owner_input_throttled(&root, &lane, cys::repair::ledger::now_epoch());
+}
+
+/// The smallest gap between two pause-mark writes of one lane (seconds).
+pub(crate) const PAUSE_MARK_MIN_GAP_SECS: f64 = 5.0;
+
+/// [`grant_note_owner_input`]'s body (root and clock explicit for the tests).
+pub(crate) fn note_owner_input_throttled(root: &Path, lane: &LaneKey, now: f64) {
+    static LAST: std::sync::OnceLock<Mutex<HashMap<(PathBuf, String), f64>>> =
+        std::sync::OnceLock::new();
+    let key = (root.to_path_buf(), lane.0.clone());
     {
+        let mut m = LAST
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if m.get(&key)
+            .is_some_and(|t| (now - t).abs() < PAUSE_MARK_MIN_GAP_SECS)
+        {
+            return;
+        }
+        m.insert(key, now);
+    }
+    if let Err(e) = cys::repair::grant::note_owner_input_in(root, lane, now) {
         eprintln!("[cysd] repair grant: owner-input pause not recorded: {e:?}");
+    }
+}
+
+/// RULINGS CH2 (T4) — the origin the per-seat prompt record takes: the STRICT owner judgment
+/// `mission_gate::owner_typed` over `hook.machine_origin`'s verdict (its `origin`, `ledger_status`
+/// and anomaly codes) and the prompt itself. `human` only when the prompt can be shown to be the
+/// owner's own typing; a harness-synthesised notification, an absent / unreadable delivery ledger,
+/// an anomaly that hides deliveries, or a machine / unknown verdict is not (`machine` stays
+/// `machine`, everything else → `unknown`) — so it can neither become a question's first owner
+/// answer nor name a rule document (fail closed).
+pub(crate) fn strict_origin(norm: &str, reply: &Value) -> &'static str {
+    let lenient = reply
+        .get("origin")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let status = reply
+        .get("ledger_status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let codes: Vec<&str> = reply
+        .get("anomalies")
+        .and_then(|a| a.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.get("code").and_then(|c| c.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
+    if cys::mission_gate::owner_typed(norm, lenient, status, &codes).owner {
+        "human"
+    } else if lenient == "machine" {
+        "machine"
+    } else {
+        "unknown"
     }
 }
 
@@ -3647,7 +3706,9 @@ pub(crate) struct ApprovalTable {}
 
 /// The per-seat owner-prompt record (T3 writes, T4 reads). `named_docs` = rule-document base names,
 /// lower-cased, found in the seat's latest owner-typed prompt (RULINGS U4(a)); no prompt text kept.
-/// `digest` / `origin` / `at` describe the seat's LATEST prompt (any origin).
+/// `digest` / `origin` / `at` describe the seat's LATEST prompt (any origin). `origin` is the STRICT
+/// owner judgment (RULINGS CH2 — `strict_origin`): `human` only for the owner's own typing.
+/// `last_human` = (digest, at) of the latest OWNER-TYPED prompt (RULINGS CH4, T4).
 #[derive(Default, Clone)]
 pub(crate) struct PromptOrigin {
     pub digest: String,
@@ -3655,6 +3716,7 @@ pub(crate) struct PromptOrigin {
     pub at: f64,
     pub question: Option<OpenQuestion>,
     pub named_docs: Vec<String>,
+    pub last_human: Option<(String, f64)>,
 }
 
 /// An open question of a master seat (RULINGS T3, Q1 / Q2): `first_human` = (digest, excerpt, at).
@@ -3709,6 +3771,7 @@ pub(crate) fn apply_prompt(
     rec.at = now;
     if human {
         rec.named_docs = named_rule_docs(norm);
+        rec.last_human = Some((digest.to_string(), now)); // CH4 (T4)
     }
     if let Some(q) = rec.question.as_mut() {
         if now > q.asked_at && q.first_human.is_none() {

@@ -822,6 +822,26 @@ pub fn may_open_new_round_in(root: &Path, now: f64) -> Result<bool, RepairError>
     Ok(on && !is_paused_in(root, now))
 }
 
+/// RULINGS CH7: the refusal of a new round when the grant is OFF says so.
+pub const NEW_ROUND_OFF_KO: &str = "자동 수리 허락이 꺼져 있습니다 — 새 라운드를 열 수 없습니다(확정·되돌리기는 그대로 할 수 있습니다)";
+/// B4: the refusal of a new round while the grant is paused (owner input in the last 30 minutes).
+pub const NEW_ROUND_PAUSED_KO: &str = "자동 수리 허락이 일시정지 중이라 새 라운드를 열 수 없습니다";
+
+/// The sentence of a refused new round (`may_open_new_round_in` false): off or paused (CH7).
+pub fn new_round_refusal_in(root: &Path) -> &'static str {
+    if is_on(read_decision_in(root).unwrap_or(None).as_ref()) {
+        NEW_ROUND_PAUSED_KO
+    } else {
+        NEW_ROUND_OFF_KO
+    }
+}
+
+/// [`new_round_refusal_in`] on the production root (the same root `may_open_new_round` reads).
+pub fn new_round_refusal(id: &RepairId) -> &'static str {
+    let _ = id;
+    new_round_refusal_in(&super::paths::repairs_root())
+}
+
 /// B4 / K3 (production root and clock).
 pub fn may_open_new_round(id: &RepairId) -> Result<bool, RepairError> {
     let _ = id; // the rule is the installation's pause, not the repair's (K3: rounds take no claim)

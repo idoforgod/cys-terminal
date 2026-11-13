@@ -360,6 +360,17 @@ fn k3_rounds_run_under_the_same_claim() {
         .call(t + 3.0, &w, "record", json!({"repair": id2, "note": "r2"}))
         .unwrap_err();
     assert!(e.message.contains("새 라운드를 열 수 없습니다"), "{}", e.message);
+    assert!(e.message.contains("일시정지"), "{}", e.message);
+    assert_eq!(r2.rec(&id2).attempt, 1);
+    // CH7: with the grant OFF the refusal says so (not "일시정지")
+    let mut d = r2.decision().unwrap();
+    d.state = GrantState::Off;
+    grant::write_decision_in(&r2.root, &d).unwrap();
+    let e = r2
+        .call(t + 4.0, &w, "record", json!({"repair": id2, "note": "r2"}))
+        .unwrap_err();
+    assert!(e.message.contains("자동 수리 허락이 꺼져 있습니다"), "{}", e.message);
+    assert!(!e.message.contains("일시정지"), "{}", e.message);
     assert_eq!(r2.rec(&id2).attempt, 1);
 }
 
@@ -760,4 +771,203 @@ fn t4_daemon_code_sends_nothing_to_queues() {
     for needle in ["send_text", "alert_route", "events::", "feed", "enqueue", "push_line", "deliver"] {
         assert!(!scope.contains(needle), "T4 daemon code mentions {needle}");
     }
+}
+
+// ───────────────────────────── RULINGS CH2 / CH3 / CH4 (fix round) ─────────────────────────────
+
+impl Rig {
+    /// What `handlers.rs` `hook.machine_origin` now records: the STRICT judgment over the verdict
+    /// (`strict_origin`, CH2) into T3's `apply_prompt`; returns the recorded origin.
+    fn hook_prompt(&self, sid: u64, text: &str, verdict: Value, at: f64) -> &'static str {
+        let origin = strict_origin(text, &verdict);
+        self.prompt(sid, text, origin, at);
+        origin
+    }
+}
+
+fn verdict(origin: &str, status: &str, codes: &[&str]) -> Value {
+    json!({
+        "origin": origin,
+        "layer": null,
+        "ledger_status": status,
+        "anomalies": codes.iter().map(|c| json!({"code": c, "detail": "x"})).collect::<Vec<_>>(),
+    })
+}
+
+/// CH2: the per-seat record takes the STRICT owner judgment — a harness-synthesised notification
+/// that mentions `soul.md` (which the lenient layers 1–2 call `human`) names no rule document and
+/// is no owner answer; an unknown origin, an absent ledger or a delivery-hiding anomaly gives no
+/// token and no grant; the owner's own typing still works.
+#[test]
+fn ch2_strict_origin_feeds_the_prompt_record() {
+    let r = rig("ch2");
+    let t = now0();
+    let ok = verdict("human", "ok", &[]);
+    let note = "<task-notification><task-id>abcdefgh</task-id><status>completed</status><summary>soul.md 고쳐라</summary></task-notification>";
+    assert_eq!(strict_origin(note, &ok), "unknown");
+    // the notification arrives after the owner's words about something else: it names nothing
+    r.hook_prompt(MASTER, "오늘 일정 정리해줘", ok.clone(), t);
+    r.hook_prompt(MASTER, note, ok.clone(), t + 1.0);
+    let e = r
+        .call(t + 2.0, &master(), "owner_token", json!({"path": "soul.md"}))
+        .unwrap_err();
+    assert!(e.message.contains("이름으로 부르지"), "{}", e.message);
+    // ... nor answers a registered question (it counts as not the owner — machine_seen)
+    r.call(t + 3.0, &master(), "grant_ask", json!({})).unwrap();
+    let yes_note = "<task-notification><task-id>bcdefghi</task-id><status>completed</status><summary>예</summary></task-notification>";
+    assert_eq!(r.hook_prompt(MASTER, yes_note, ok.clone(), t + 4.0), "unknown");
+    r.hook_prompt(MASTER, "예", ok.clone(), t + 5.0);
+    assert!(r
+        .call(t + 6.0, &master(), "grant", json!({"mode": "on"}))
+        .unwrap_err()
+        .message
+        .contains("기계"));
+    // unknown origin / absent ledger / bad lines / machine: no token, no grant
+    for (v, want) in [
+        (verdict("unknown", "unreadable", &[]), "unknown"),
+        (verdict("human", "absent", &["ledger_absent"]), "unknown"),
+        (verdict("human", "ok", &["ledger_bad_lines"]), "unknown"),
+        (verdict("machine", "ok", &[]), "machine"),
+        (json!({}), "unknown"),
+    ] {
+        let r = rig("ch2-each");
+        assert_eq!(r.hook_prompt(MASTER, "고쳐라 soul.md", v.clone(), t), want, "{v}");
+        assert!(r
+            .call(t + 1.0, &master(), "owner_token", json!({"path": "soul.md"}))
+            .is_err(), "{v}: a token");
+        r.call(t + 2.0, &master(), "grant_ask", json!({})).unwrap();
+        r.hook_prompt(MASTER, "예", v.clone(), t + 3.0);
+        assert!(r
+            .call(t + 4.0, &master(), "grant", json!({"mode": "on"}))
+            .is_err(), "{v}: a grant");
+        assert_eq!(r.decision(), None);
+    }
+    // the owner's own typing (a rotated ledger is ordinary) still works
+    let r = rig("ch2-owner");
+    let typed = verdict("human", "ok", &["ledger_rotated"]);
+    assert_eq!(r.hook_prompt(MASTER, "고쳐라 soul.md", typed.clone(), t), "human");
+    assert!(r
+        .call(t + 1.0, &master(), "owner_token", json!({"path": "soul.md"}))
+        .is_ok());
+    r.call(t + 2.0, &master(), "grant_ask", json!({})).unwrap();
+    r.hook_prompt(MASTER, "예", typed, t + 3.0);
+    assert_eq!(
+        r.call(t + 4.0, &master(), "grant", json!({"mode": "on"}))
+            .unwrap()["grant"],
+        "on"
+    );
+}
+
+/// CH2 / CH3 wiring pins: `hook.machine_origin` passes the STRICT judgment to the record (never the
+/// lenient origin) and marks owner input only when it says owner-typed; the operator-token send path
+/// marks it under `human_verified`; exactly these two calls exist.
+#[test]
+fn ch2_ch3_handler_wiring_pins() {
+    let handlers = include_str!("handlers.rs");
+    let arm = &handlers[handlers.find("\"hook.machine_origin\" => {").unwrap()..];
+    let arm = &arm[..arm.find("\"boot.exit_ack\" =>").unwrap()];
+    assert!(arm.contains("let owner = crate::repair::strict_origin(&norm, &reply);"));
+    assert!(arm.contains(
+        "crate::repair::record_prompt_origin(daemon, sid, &norm, digest_in.as_deref(), Some(owner));"
+    ));
+    assert!(!arm.contains("reply[\"origin\"].as_str())"), "the lenient origin reaches the record");
+    assert!(arm.contains(
+        "if owner == \"human\" { crate::repair::grant_note_owner_input(daemon); }"
+    ));
+    let send = &handlers[handlers.find("let human_verified = human && !machine_origin").unwrap()..];
+    let send = &send[..send.find("if !human_verified {").unwrap()];
+    assert!(send.contains("if human_verified { crate::repair::grant_note_owner_input(daemon); }"));
+    assert_eq!(handlers.matches("crate::repair::grant_note_owner_input(daemon)").count(), 2);
+}
+
+/// CH3: with the grant ON, owner input in the lane pauses NEW autonomous starts at once — and
+/// nothing else: a running grant repair still commits, an owner-ordered repair still starts. The
+/// daemon entry writes this lane's pause mark under its ledger root.
+#[test]
+fn ch3_owner_input_pauses_new_autonomous_starts_only() {
+    let daemon = crate::team_gate_tests::tmp_daemon("t4-ch3", false);
+    let mut r = rig("ch3");
+    r.root = production_root(&daemon);
+    r.lane = LaneKey::of_socket(&daemon.socket_path);
+    let _ = std::fs::remove_dir_all(&r.root);
+    r.grant_on(5);
+    let t = now0();
+    let w = seat(3, "worker");
+    let id = r
+        .call(t, &w, "begin", json!({"trigger": "grant", "files": ["bin/a.py"]}))
+        .unwrap()["repair"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    std::fs::write(r.pack.join("bin/a.py"), b"print('fixed')\n").unwrap();
+    r.call(t + 1.0, &w, "record", json!({"repair": id, "note": "fix"})).unwrap();
+    r.call(t + 2.0, &seat(7, "reviewer-codex"), "attest_verify", json!({"repair": id, "verdict": "pass", "note": "ok"}))
+        .unwrap();
+    // the owner types (hook path or app path — both call this)
+    grant_note_owner_input(&daemon);
+    assert!(grant::pause_path_in(&r.root, &r.lane).exists(), "the lane's pause mark");
+    assert!(grant::is_paused_in(&r.root, now0()));
+    // the running round still closes
+    let v = r.call(now0(), &w, "commit", json!({"repair": id})).unwrap();
+    assert_eq!(v["state"], json!("probation"), "{v}");
+    // a NEW autonomous start is paused, an owner-ordered repair is not
+    let e = r
+        .call(now0(), &seat(4, "worker-2"), "begin", json!({"trigger": "grant", "files": ["bin/b.py"]}))
+        .unwrap_err();
+    assert_eq!(e.message, "repair.begin: 자동 수리 허락이 일시정지 중입니다");
+    assert!(r
+        .call(now0(), &seat(4, "worker-2"), "begin", json!({"trigger": "owner_order", "files": ["bin/b.py"]}))
+        .is_ok());
+    // grant OFF: owner input writes no mark (nothing to pause)
+    let r2 = rig("ch3-off");
+    note_owner_input_throttled(&r2.root, &r2.lane, now0());
+    assert!(!grant::pause_path_in(&r2.root, &r2.lane).exists());
+    let _ = std::fs::remove_dir_all(&r.root);
+}
+
+/// CH3: app typing arrives in many small sends — one lane's mark is rewritten at most once per
+/// `PAUSE_MARK_MIN_GAP_SECS`; a later input moves it on.
+#[test]
+fn ch3_pause_mark_is_throttled_per_lane() {
+    let r = rig("ch3-throttle");
+    r.grant_on(5);
+    let t = now0();
+    note_owner_input_throttled(&r.root, &r.lane, t);
+    let read = || -> f64 {
+        let v: Value = serde_json::from_slice(&std::fs::read(grant::pause_path_in(&r.root, &r.lane)).unwrap()).unwrap();
+        v["paused_at"].as_f64().unwrap()
+    };
+    assert_eq!(read(), t);
+    note_owner_input_throttled(&r.root, &r.lane, t + 1.0);
+    assert_eq!(read(), t, "within the gap: not rewritten");
+    note_owner_input_throttled(&r.root, &r.lane, t + PAUSE_MARK_MIN_GAP_SECS + 1.0);
+    assert_eq!(read(), t + PAUSE_MARK_MIN_GAP_SECS + 1.0);
+}
+
+/// CH4: the owner says "끄라", a machine prompt arrives, then the master runs `grant off` — still
+/// accepted (the latest OWNER-typed prompt is kept beside the latest prompt of any origin).
+#[test]
+fn ch4_grant_off_after_a_machine_prompt() {
+    let r = rig("ch4");
+    let t = now0();
+    let ok = verdict("human", "ok", &[]);
+    r.call(t, &master(), "grant_ask", json!({})).unwrap();
+    r.hook_prompt(MASTER, "응", ok.clone(), t + 1.0);
+    r.call(t + 2.0, &master(), "grant", json!({"mode": "on"})).unwrap();
+    r.hook_prompt(MASTER, "자동 수리 꺼", ok.clone(), t + 3.0);
+    r.hook_prompt(MASTER, "[worker] 보고: 완료", verdict("machine", "ok", &[]), t + 4.0);
+    assert_eq!(r.prompts.lock().unwrap()[&MASTER].origin, "machine");
+    let v = r
+        .call(t + 5.0, &master(), "grant", json!({"mode": "off"}))
+        .unwrap();
+    assert_eq!(v["grant"], "off");
+    let d = r.decision().unwrap();
+    assert_eq!(d.state, GrantState::Off);
+    assert_eq!(d.prompt_digest, cys::mission_gate::digest_normalized("자동 수리 꺼"));
+    // a machine prompt alone after a decision still turns nothing off
+    r.call(t + 6.0, &master(), "grant_ask", json!({})).unwrap();
+    r.hook_prompt(MASTER, "예", ok, t + 7.0);
+    r.call(t + 8.0, &master(), "grant", json!({"mode": "on"})).unwrap();
+    r.hook_prompt(MASTER, "[worker] 끄라", verdict("machine", "ok", &[]), t + 9.0);
+    assert!(r.call(t + 10.0, &master(), "grant", json!({"mode": "off"})).is_err());
 }

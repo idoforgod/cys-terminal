@@ -61,6 +61,9 @@ pub struct PromptView<'a> {
     pub question: Option<QuestionView<'a>>,
     /// Rule-document base names (lower-cased) of the latest OWNER-TYPED prompt (U4(a)).
     pub named_docs: &'a [String],
+    /// The latest OWNER-TYPED prompt (digest, time) — kept beside the latest prompt of any origin
+    /// (RULINGS CH4), so a machine prompt arriving after the owner's words does not hide them.
+    pub last_human: Option<(&'a str, f64)>,
 }
 
 /// The owner-typed prompt a decision rests on (kept as provenance: digest, short excerpt, time).
@@ -134,12 +137,21 @@ pub fn judge_grant_on(p: Option<&PromptView<'_>>, now: f64) -> Result<Answer, St
 }
 
 /// RULINGS Q1: `grant off` — the safe direction: accepted whenever an owner-typed prompt exists
-/// after the last decision (`decided_at`; `None` = no decision yet). Known from the record: the
-/// seat's latest prompt when it is owner-typed, or the open question's owner-typed answer
-/// (CONTRACT CHANGE REQUEST CCR-2: the record keeps no older owner-typed prompt).
+/// after the last decision (`decided_at`; `None` = no decision yet): the seat's latest OWNER-TYPED
+/// prompt (`last_human`, RULINGS CH4 — a machine prompt after it does not hide it), the latest
+/// prompt when it is owner-typed, or the open question's owner-typed answer.
 pub fn judge_grant_off(p: Option<&PromptView<'_>>, decided_at: Option<f64>) -> Result<Answer, String> {
     let after = |t: f64| decided_at.is_none_or(|d| t > d);
     if let Some(p) = p {
+        if let Some((digest, at)) = p.last_human {
+            if after(at) {
+                return Ok(Answer {
+                    digest: digest.to_string(),
+                    excerpt: String::new(),
+                    at,
+                });
+            }
+        }
         if p.origin == ORIGIN_HUMAN && after(p.at) {
             return Ok(Answer {
                 digest: p.digest.to_string(),
@@ -196,14 +208,18 @@ pub fn judge_owner_token(
         return Err(format!("이 좌석에는 주인이 직접 친 입력의 기록이 없습니다 — 주인이 '고쳐라 {base}'처럼 문서를 말하거나, `cys repair owner-token ask --path {doc_rel}` 뒤 주인이 직접 허락해야 합니다"));
     };
     if p.named_docs.iter().any(|n| fold_name(n) == base) {
-        let latest_is_owner = p.origin == ORIGIN_HUMAN;
+        // `named_docs` and `last_human` are written together, from the same owner-typed prompt (CH4)
+        let (digest, at) = match p.last_human {
+            Some((d, at)) => (d.to_string(), at),
+            None if p.origin == ORIGIN_HUMAN => (p.digest.to_string(), p.at),
+            None => (String::new(), 0.0),
+        };
         return Ok((
             TokenBasis::NamedInPrompt,
             Answer {
-                // the digest of the naming prompt is known only while it is still the latest one
-                digest: if latest_is_owner { p.digest.to_string() } else { String::new() },
+                digest,
                 excerpt: format!("named: {base}"),
-                at: if latest_is_owner { p.at } else { 0.0 },
+                at,
             },
         ));
     }
@@ -444,6 +460,7 @@ mod tests {
             at,
             question,
             named_docs: named,
+            last_human: None,
         }
     }
 
@@ -511,6 +528,11 @@ mod tests {
         }
         let p = view("machine", 50.0, Some(q(41.0, None, Some(("d", "아무 말", 45.0)), false)), &none);
         assert!(judge_grant_off(Some(&p), Some(40.0)).is_ok(), "the question's owner-typed answer");
+        // CH4: the owner's "끄라" at 45, then a machine prompt at 50 — still accepted
+        let mut p = view("machine", 50.0, None, &none);
+        p.last_human = Some(("off-digest", 45.0));
+        assert_eq!(judge_grant_off(Some(&p), Some(40.0)).unwrap().digest, "off-digest");
+        assert!(judge_grant_off(Some(&p), Some(46.0)).is_err(), "the owner's words came before the decision");
     }
 
     /// Q2 / U4: (a) named in the latest owner-typed prompt; (b) an affirmative answer to a question
