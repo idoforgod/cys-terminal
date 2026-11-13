@@ -2826,6 +2826,21 @@ pub fn listed_file_refusal(rel: &str, verb: &str) -> String {
     )
 }
 
+/// ★T2f(RULINGS BV2): 등재 파일에 쓰려는 바이트가 이 바이너리가 아는 출시본(내장본·과거 출시 표)이 아닐 때의 거부
+/// 문장 — `--take-new`(보관된 `.new`)와 되돌리기(스냅샷 · pack.prev)가 쓴다. 이 바이너리는 변조된 바이트와 자기보다 새
+/// 서명 팩(팩만 업데이트)의 바이트를 믿을 만하게 가를 수 없으므로(그 서명 매니페스트를 보관·재검증하지 않는다 — 2차
+/// 출시 후보) 둘을 함께 말하는 한 문장이다. 두 길만 알린다: 수리 흐름(이 사본을 후보로 · 검사·서명·주인 승인), 다음
+/// 프로그램 업데이트. `cys pack-heal` 은 알리지 않는다(이 바이너리의 더 오래된 사본을 쓰기 때문이다).
+pub fn unknown_release_refusal(rel: &str, what: &str) -> String {
+    format!(
+        "⛔ 거부: '{rel}' 은 기동 필수·보호 목록에 있는 파일이고, 이 바이너리는 {what} 의 바이트를 출시본으로 알지 \
+         못합니다(이 바이너리의 내장본·과거 출시 해시 표에 없음 — 변조된 바이트일 수도, 이 바이너리보다 새 서명 팩의 \
+         바이트일 수도 있습니다) — 아무것도 쓰지 않았습니다. 이 바이트를 살리는 길은 둘입니다: (1) 수리 흐름 — 워커가 \
+         이 사본을 후보로 `cys repair begin --files {rel} --trigger …` → 예행·검사·서명 → 주인 승인, (2) 다음 프로그램 \
+         업데이트(그 내장본·과거 출시 표가 이 바이트를 안다)."
+    )
+}
+
 /// ★0.15.0 M11 설치 입력원 — 레인의 묘비(파일만 · 생명줄 제외), 기동 필수 질의, 과거 vendor 해시
 /// 표, 업데이트 전 스냅샷 루트. 설치 실행부·plan·되살리기 모의가 같은 값을 쓴다. 환경 변수 노브 없음.
 pub struct UpdateSources {
@@ -14525,6 +14540,19 @@ mod m11_tests {
         assert!(!seam.is_listed("hooks/other.sh"));
         assert_eq!(list_key("./Hooks\\X.SH"), "hooks/x.sh");
         assert_eq!(list_key("stra\u{DF}e"), "strasse", "전체 접기(ß → ss)");
+    }
+
+    /// ★T2f(RULINGS BV2): 등재 파일의 '출시본으로 모르는 바이트' 거부 문장 — 변조와 더 새 서명 팩을 함께 말하고, 두 길(수리
+    /// 흐름 · 다음 프로그램 업데이트)만 알리며 `cys pack-heal` 은 알리지 않는다(이 바이너리의 더 오래된 사본을 쓰므로).
+    #[test]
+    fn t2f_unknown_release_sentence_names_the_two_routes_only() {
+        let t = unknown_release_refusal("hooks/guard.sh", "보관된 hooks/guard.sh.new");
+        assert!(t.contains("hooks/guard.sh") && t.contains("보관된 hooks/guard.sh.new"));
+        assert!(t.contains("출시본으로 알지 못합니다"));
+        assert!(t.contains("변조된 바이트") && t.contains("새 서명 팩"), "두 경우를 함께 말한다");
+        assert!(t.contains("cys repair begin --files hooks/guard.sh"), "길 1: 수리 흐름");
+        assert!(t.contains("다음 프로그램") && t.contains("업데이트"), "길 2: 다음 프로그램 업데이트");
+        assert!(!t.contains("pack-heal"), "pack-heal 을 알리지 않는다");
     }
 
     /// ★T2f: 출시본 바이트 = 내장 vendor 본 · 이 설치의 매니페스트 · 과거 출시 해시 표 중 하나와 같은 UTF-8 바이트.
