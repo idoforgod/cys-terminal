@@ -867,11 +867,12 @@ fn is_script_rel(rel: &str) -> bool {
     }
 }
 
-// ── RULINGS BU1 as amended by BX2 — the CLOSED GRAMMAR of a call that gets an identity ──────────────
+// ── RULINGS BU1 as amended by BX2 and BY1 — the CLOSED GRAMMAR of a call that gets an identity ──────
 // text      := ONE line (no newline, no carriage return — inside quotes neither); tokens separated by
 //              spaces / tabs
 // command   := ( script | interpreter flag* script ) word* redirection*
-//              (NO `NAME=value` in front: an assignment can stop the call or run other code first)
+//              (NO `NAME=value` in front: an assignment can stop the call or run other code first;
+//              after an interpreter, the script's type must be that interpreter's OWN — RULINGS BY1)
 // word      := part+                            (not beginning with a bare '=')
 // part      := bare | '…' | "…"
 //   bare    := letters / digits (any script) and `_ @ % + = : , . / -`; `~` only as the word's first
@@ -879,26 +880,53 @@ fn is_script_rel(rel: &str) -> bool {
 //   '…'     := single-quoted, no `'` and no control character (newline, CR, NUL, ESC …) inside
 //   "…"     := double-quoted, none of `$` backtick `\` `!` `"` and no control character inside
 // script    := a word of bare parts only: a LITERAL path in THIS lane's pack (`PackRoots`)
-// interpreter := python | python3 | py | sh | bash | zsh | node | pwsh — bare, or a literal absolute
-//              path ending in one of them; its flags only from `INTERPRETER_FLAGS`
+// interpreter := python | python3 | py | bash | node | pwsh — bare, or a literal absolute path ending
+//              in one of them; its flags only from its fixed list; it runs only its own script types:
+//              `.py` ← python / python3 / py · `.sh` `.bash` ← bash · `.js` `.mjs` `.cjs` ← node ·
+//              `.ps1` ← pwsh. `sh` and `zsh` are no interpreter of the grammar (the pack's shell
+//              scripts are bash scripts); a script without an extension only when executed DIRECTLY
+//              (the system reads its own first line). Every mismatch → no identity (the caller's choice).
 // redirection := `2>&1` | `>/dev/null` | `1>/dev/null` | `2>/dev/null` | `&>/dev/null` (spaces allowed
 //              after `>`), only at the end
 // Anything else — every character or form not named here — gives NO identity (a stated miss).
 
-/// The interpreters of BU1 and, for each, the FIXED list of flags that take no argument and no code
-/// (`-c`, `-m`, `-e`, `-s`, `-W`, `-X`, `--rcfile` and every flag not listed → no identity; the `py`
-/// launcher's `-3` is not listed — the launcher reads only its first argument, so after another flag
-/// it reaches python as an unknown option, RULINGS BX2).
-pub const INTERPRETER_FLAGS: &[(&str, &[&str])] = &[
-    ("python", &["-u", "-B", "-O", "-OO", "-q", "-b", "-bb"]),
-    ("python3", &["-u", "-B", "-O", "-OO", "-q", "-b", "-bb"]),
-    ("py", &["-u", "-B", "-O", "-OO", "-q", "-b", "-bb"]),
-    ("sh", &["-x", "-v"]),
-    ("bash", &["-x", "-v", "--norc", "--noprofile"]),
-    ("zsh", &["-x", "-v", "-f"]),
-    ("node", &["--no-warnings", "--no-deprecation", "--trace-warnings", "--trace-uncaught", "--enable-source-maps"]),
-    ("pwsh", &["-NoProfile", "-NonInteractive", "-NoLogo"]),
+/// One interpreter of the grammar (RULINGS BU1, BX2, BY1).
+#[derive(Debug)]
+pub struct Interpreter {
+    pub name: &'static str,
+    /// The FIXED list of flags that take no argument and no code (`-c`, `-m`, `-e`, `-s`, `-W`, `-X`,
+    /// `--rcfile` and every flag not listed → no identity; the `py` launcher's `-3` is not listed — the
+    /// launcher reads only its first argument, so after another flag it reaches python as an unknown
+    /// option, RULINGS BX2).
+    pub flags: &'static [&'static str],
+    /// The script types (extensions) it is the OWN interpreter of (RULINGS BY1).
+    pub scripts: &'static [&'static str],
+}
+
+const PYTHON_FLAGS: &[&str] = &["-u", "-B", "-O", "-OO", "-q", "-b", "-bb"];
+
+/// The interpreters of the grammar — `sh` and `zsh` are not among them (RULINGS BY1).
+pub const INTERPRETERS: &[Interpreter] = &[
+    Interpreter { name: "python", flags: PYTHON_FLAGS, scripts: &["py"] },
+    Interpreter { name: "python3", flags: PYTHON_FLAGS, scripts: &["py"] },
+    Interpreter { name: "py", flags: PYTHON_FLAGS, scripts: &["py"] },
+    Interpreter { name: "bash", flags: &["-x", "-v", "--norc", "--noprofile"], scripts: &["sh", "bash"] },
+    Interpreter {
+        name: "node",
+        flags: &["--no-warnings", "--no-deprecation", "--trace-warnings", "--trace-uncaught", "--enable-source-maps"],
+        scripts: &["js", "mjs", "cjs"],
+    },
+    Interpreter { name: "pwsh", flags: &["-NoProfile", "-NonInteractive", "-NoLogo"], scripts: &["ps1"] },
 ];
+
+impl Interpreter {
+    /// Whether this interpreter is the script's own: by its extension; a script without one never
+    /// (it gets an identity only when executed directly — RULINGS BY1).
+    fn runs(&self, rel: &str) -> bool {
+        let file = rel.rsplit('/').next().unwrap_or(rel);
+        file.rsplit_once('.').is_some_and(|(stem, ext)| !stem.is_empty() && self.scripts.contains(&ext))
+    }
+}
 
 /// The FIXED list of trailing redirections (each with or without spaces after `>`).
 pub const REDIRECTIONS: &[&str] = &["2>&1", ">/dev/null", "1>/dev/null", "2>/dev/null", "&>/dev/null"];
@@ -1015,14 +1043,14 @@ fn grammar_tokens(src: &str, steps: &mut usize) -> Option<Vec<Tok>> {
     Some(out)
 }
 
-/// The flag list of a known interpreter word (bare name, or a literal absolute path ending in it).
-fn interpreter_flags(word: &str) -> Option<&'static [&'static str]> {
+/// The known interpreter a word names (bare name, or a literal absolute path ending in it).
+fn interpreter_of(word: &str) -> Option<&'static Interpreter> {
     let absolute = word.starts_with('/') || (word.as_bytes().get(1) == Some(&b':') && word.as_bytes().get(2) == Some(&b'/'));
     let name = if absolute { word.rsplit('/').next().unwrap_or(word) } else { word };
     if !absolute && name != word {
         return None;
     }
-    INTERPRETER_FLAGS.iter().find(|(n, _)| *n == name).map(|(_, f)| *f)
+    INTERPRETERS.iter().find(|i| i.name == name)
 }
 
 /// The identity of a shell call (RULINGS BF1, BU1): given ONLY when the call's whole text parses under
@@ -1076,15 +1104,18 @@ fn parse_call(toks: &[Tok], roots: &PackRoots, steps: &mut usize) -> Option<Pack
     if let Some(rel) = script(words.first(), steps) {
         return Some(PackCall::One { rel, sub: sub(1) });
     }
-    let flags = prog_bare.then(|| interpreter_flags(prog)).flatten()?;
+    let interp = prog_bare.then(|| interpreter_of(prog)).flatten()?;
     let mut j = 1;
     while let Some((text, bare)) = words.get(j).filter(|(t, _)| t.starts_with('-')) {
-        if !*bare || !flags.contains(text) {
+        if !*bare || !interp.flags.contains(text) {
             return None; // a flag outside the interpreter's fixed list
         }
         j += 1;
     }
     let rel = script(words.get(j), steps)?;
+    if !interp.runs(&rel) {
+        return None; // not the script's own interpreter (RULINGS BY1): the caller's choice
+    }
     Some(PackCall::One { rel, sub: sub(j + 1) })
 }
 
@@ -1102,13 +1133,15 @@ pub enum Classified {
 }
 
 /// RULINGS BX1 — the tool's documented exit shape: the error text's FIRST line is exactly `Exit code N`
-/// with N an integer from 1 to 127 (decimal digits, no sign, no leading zero, nothing else on the line).
+/// with N an integer from 1 to 127 (decimal digits, no sign, no leading zero, nothing else on the line
+/// but ONE trailing carriage return — a Windows line end, RULINGS BY2).
 /// `None` for every other text: the Bash tool's own `Command timed out after …`, an interruption, a
 /// tool / sandbox / permission message, an exit of 128 or more (ended by a signal), a first line that
 /// is not the report. The exclusion list then reads the same code from that same line
 /// (`intake::leading_exit_code`).
 pub fn exit_report(error: &str) -> Option<i64> {
-    let n = error.split('\n').next()?.strip_prefix("Exit code ")?;
+    let first = error.split('\n').next()?;
+    let n = first.strip_suffix('\r').unwrap_or(first).strip_prefix("Exit code ")?;
     if n.is_empty() || n.len() > 3 || n.starts_with('0') || !n.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
@@ -2164,6 +2197,30 @@ mod defect_intake_tests {
         PackCall::One { rel: rel.into(), sub: sub.map(str::to_string) }
     }
 
+    /// RULINGS BY1 as the TESTS state it (independent of `INTERPRETERS`): the interpreter is the
+    /// script's own by its extension; `sh` / `zsh` and an extensionless script through an interpreter: never.
+    fn own(name: &str, ext: Option<&str>) -> bool {
+        matches!(
+            (name, ext),
+            ("python" | "python3" | "py", Some("py")) | ("bash", Some("sh" | "bash")) | ("node", Some("js" | "mjs" | "cjs")) | ("pwsh", Some("ps1"))
+        )
+    }
+
+    /// Pack scripts of every type: (path as written, rel, extension).
+    const TYPED_SCRIPTS: [(&str, &str, Option<&str>); 11] = [
+        ("~/.cys/pack/bin/javis_x.py", "bin/javis_x.py", Some("py")),
+        ("/Users/x/.cys/pack/hooks/sub/g.py", "hooks/sub/g.py", Some("py")),
+        ("/Users/x/.cys/pack/hooks/sub/g.sh", "hooks/sub/g.sh", Some("sh")),
+        ("~/.cys/pack/bin/b.bash", "bin/b.bash", Some("bash")),
+        ("~/.cys/pack/bin/x.js", "bin/x.js", Some("js")),
+        ("~/.cys/pack/bin/x.mjs", "bin/x.mjs", Some("mjs")),
+        ("/Users/x/.cys/pack/bin/x.cjs", "bin/x.cjs", Some("cjs")),
+        ("~/.cys/pack/bin/x.ps1", "bin/x.ps1", Some("ps1")),
+        ("/Users/x/.cys/pack/hooks/h.ps1", "hooks/h.ps1", Some("ps1")),
+        ("~/.cys/pack/bin/cys-dept", "bin/cys-dept", None),
+        ("/Users/x/.cys/pack/bin/tool", "bin/tool", None),
+    ];
+
     /// The base lane of the tests (the same fictional spelling `production_roots` gives under test).
     fn base() -> PackRoots {
         PackRoots::new(Some("/Users/x/.cys/pack"), Some("/Users/x"))
@@ -2213,18 +2270,18 @@ mod defect_intake_tests {
         out
     }
 
-    /// RULINGS BU1 / BX2 — the positive set GENERATED from the grammar: (script alone | interpreter + its
-    /// listed flags) × script × arguments × trailing redirections — every text of the product is
-    /// identified, with its rel and its first argument. Plus the Windows and department roots.
+    /// RULINGS BU1 / BX2 / BY1 — the positive set GENERATED from the grammar: (script alone — every type,
+    /// extensionless too | interpreter + its listed flags + a script of ITS OWN type) × arguments ×
+    /// trailing redirections — every text of the product is identified, with its rel and its first
+    /// argument. Plus the Windows and department roots.
     #[test]
     fn grammar_positives_are_identified() {
-        let mut heads: Vec<String> = vec![String::new()];
-        for (name, flags) in INTERPRETER_FLAGS {
-            heads.push(format!("{name} "));
-            heads.push(format!("{name} {} ", flags.join(" ")));
-            heads.push(format!("/usr/bin/{name} {} ", flags[0]));
+        let mut heads: Vec<(String, Option<&str>)> = vec![(String::new(), None)];
+        for i in INTERPRETERS {
+            heads.push((format!("{} ", i.name), Some(i.name)));
+            heads.push((format!("{} {} ", i.name, i.flags.join(" ")), Some(i.name)));
+            heads.push((format!("/usr/bin/{} {} ", i.name, i.flags[0]), Some(i.name)));
         }
-        let scripts = [("~/.cys/pack/bin/javis_x.py", "bin/javis_x.py"), ("/Users/x/.cys/pack/hooks/sub/g.sh", "hooks/sub/g.sh"), ("~/.cys/pack/bin/cys-dept", "bin/cys-dept")];
         let args = [
             ("", None),
             (" check", Some("check")),
@@ -2234,9 +2291,13 @@ mod defect_intake_tests {
             (" \"a b\"\t'c'", Some("a b")),
         ];
         let redirs = ["", " 2>&1", " >/dev/null 2>&1", " > /dev/null", " &>/dev/null", " 1>/dev/null 2>/dev/null", " 2> /dev/null"];
-        let mut n = 0;
-        for h in &heads {
-            for (path, rel) in scripts {
+        let (mut n, mut pairs) = (0, 0);
+        for (h, name) in &heads {
+            for (path, rel, ext) in TYPED_SCRIPTS {
+                if name.is_some_and(|name| !own(name, ext)) {
+                    continue; // a mismatch: `interpreter_must_be_the_scripts_own`
+                }
+                pairs += 1;
                 for (arg, sub) in args {
                     for r in redirs {
                         let text = format!("{h}{path}{arg}{r}");
@@ -2246,8 +2307,9 @@ mod defect_intake_tests {
                 }
             }
         }
-        assert_eq!(n, heads.len() * scripts.len() * args.len() * redirs.len());
-        assert_eq!(n, 3_150);
+        assert_eq!(pairs, 11 + 39, "11 scripts executed directly + 39 interpreter heads with their own scripts");
+        assert_eq!(n, pairs * args.len() * redirs.len());
+        assert_eq!(n, 2_100);
         // Windows: the drive-letter pack dir and its Git Bash form; a department daemon: ITS pack
         let win = PackRoots::new(Some(r"C:\Users\x\.cys\pack"), Some(r"C:\Users\x"));
         assert_eq!(pack_call(&bash("python C:/Users/x/.cys/pack/bin/javis_x.py check"), &win), one("bin/javis_x.py", Some("check")));
@@ -2258,8 +2320,8 @@ mod defect_intake_tests {
         assert_eq!(pack_call(&json!({"command": ["python3", "/Users/x/.cys/pack/bin/a.py", "x"]}), &base()), one("bin/a.py", Some("x")));
     }
 
-    /// RULINGS BU1 / BX2 — one negative per character and form the grammar leaves out, incl. the third
-    /// and fourth re-checks' routes verbatim; each is also not counted as a call.
+    /// RULINGS BU1 / BX2 / BY1 — one negative per character and form the grammar leaves out, incl. the
+    /// third, fourth and fifth re-checks' routes verbatim; each is also not counted as a call.
     #[test]
     fn grammar_negatives_one_per_character_and_form() {
         let x = "python3 ~/.cys/pack/bin/javis_x.py";
@@ -2331,6 +2393,15 @@ mod defect_intake_tests {
                 format!("{x} 'a\rb'"),
                 format!("{x} 'a\u{0}b'"),
                 format!("{x} \"a\u{1b}[31mb\""),
+                // RULINGS BY1 — the caller's wrong interpreter, verbatim
+                "python3 ~/.cys/pack/bin/cys-dept status".to_string(),
+                "python3 ~/.cys/pack/bin/cys-dept".to_string(),
+                "bash ~/.cys/pack/bin/javis_x.py".to_string(),
+                "zsh ~/.cys/pack/hooks/guard.sh".to_string(),
+                "sh ~/.cys/pack/hooks/guard.sh".to_string(),
+                "node ~/.cys/pack/bin/a.py".to_string(),
+                "python3 ~/.cys/pack/hooks/x.sh".to_string(),
+                "bash ~/.cys/pack/bin/cys-dept".to_string(),
             ]
             .into_iter(),
         );
@@ -2349,10 +2420,57 @@ mod defect_intake_tests {
             assert_eq!(pack_call(&bash(c), &base()), PackCall::None, "outside the grammar but identified: {c:?}");
             assert_eq!(classify(&pre(&bash(c)), &base(), false), Classified::Ignored { failure: false }, "counted as a call: {c:?}");
         }
-        assert_eq!(negatives.len(), 22 + 57 + 22 + 1);
+        assert_eq!(negatives.len(), 22 + 65 + 22 + 1);
     }
 
-    /// The property test's reference — an INDEPENDENT, slow check of the grammar (RULINGS BU1, BX2): splits
+    /// RULINGS BY1 — the interpreter must be the script's own: every interpreter head (bare, with its
+    /// flags, as an absolute path) × every script type — identified EXACTLY for the matching pairs; `sh`
+    /// and `zsh` (bare, flagged, absolute) never; an extensionless script only executed directly. A
+    /// mismatch is not counted as a call, and its failure not against the script. The tests' pairing
+    /// equals the production table.
+    #[test]
+    fn interpreter_must_be_the_scripts_own() {
+        let exts = ["py", "sh", "bash", "js", "mjs", "cjs", "ps1"];
+        let names: Vec<&str> = INTERPRETERS.iter().map(|i| i.name).collect();
+        assert_eq!(names, ["python", "python3", "py", "bash", "node", "pwsh"], "sh and zsh are no interpreter of the grammar");
+        for i in INTERPRETERS {
+            for e in exts {
+                assert_eq!(i.scripts.contains(&e), own(i.name, Some(e)), "{} / .{e}", i.name);
+            }
+        }
+        let mut heads: Vec<(String, &str)> = Vec::new();
+        for i in INTERPRETERS {
+            heads.push((i.name.to_string(), i.name));
+            heads.push((format!("{} {}", i.name, i.flags.join(" ")), i.name));
+            heads.push((format!("/usr/local/bin/{}", i.name), i.name));
+        }
+        for h in ["sh", "sh -x", "sh -v", "/bin/sh", "zsh", "zsh -f", "zsh -x", "/bin/zsh"] {
+            heads.push((h.to_string(), h.rsplit('/').next().unwrap().split(' ').next().unwrap()));
+        }
+        let (mut matched, mut refused) = (0, 0);
+        for (h, name) in &heads {
+            for (path, rel, ext) in TYPED_SCRIPTS {
+                let text = format!("{h} {path} check");
+                let input = bash(&text);
+                if own(name, ext) {
+                    assert_eq!(pack_call(&input, &base()), one(rel, Some("check")), "{text:?}");
+                    matched += 1;
+                } else {
+                    assert_eq!(pack_call(&input, &base()), PackCall::None, "the caller's wrong interpreter got an identity: {text:?}");
+                    assert_eq!(classify(&pre(&input), &base(), false), Classified::Ignored { failure: false }, "{text:?}");
+                    assert_eq!(classify(&fail(&input, Some("Exit code 1\nSyntaxError: invalid syntax")), &base(), false), Classified::Ignored { failure: true }, "{text:?}");
+                    refused += 1;
+                }
+            }
+        }
+        assert_eq!((matched, refused), (39, 18 * 11 - 39 + 8 * 11), "the matrix");
+        // executed directly, every type is the script's own (the system reads its first line)
+        for (path, rel, _) in TYPED_SCRIPTS {
+            assert_eq!(pack_call(&bash(&format!("{path} status")), &base()), one(rel, Some("status")), "{path}");
+        }
+    }
+
+    /// The property test's reference — an INDEPENDENT, slow check of the grammar (RULINGS BU1, BX2, BY1): splits
     /// the text on unquoted spaces / tabs with an explicit state machine, then validates each raw token
     /// with string operations, then applies the command rule. Shares only data (the flag lists, the
     /// redirections, the roots' prefixes) with the production parser.
@@ -2488,7 +2606,7 @@ mod defect_intake_tests {
             return None;
         }
         let name = if prog.0.starts_with('/') || prog.0.get(1..3) == Some(":/") { prog.0.rsplit('/').next()? } else { prog.0.as_str() };
-        let flags = INTERPRETER_FLAGS.iter().find(|(n, _)| *n == name)?.1;
+        let flags = INTERPRETERS.iter().find(|x| x.name == name)?.flags;
         let mut j = i + 1;
         while let Some(w) = words.get(j).filter(|w| w.0.starts_with('-')) {
             if !w.1 || !flags.contains(&w.0.as_str()) {
@@ -2497,12 +2615,16 @@ mod defect_intake_tests {
             j += 1;
         }
         let rel = script_rel(words.get(j)?)?;
+        let ext = rel.rsplit('/').next()?.rsplit_once('.').map(|(_, e)| e);
+        if !own(name, ext) {
+            return None;
+        }
         Some((rel, sub(j + 1)))
     }
 
-    /// RULINGS BU1 / BX2 — the PROPERTY test: for 5,000 pseudo-random texts (fixed seed) — half
+    /// RULINGS BU1 / BX2 / BY1 — the PROPERTY test: for 5,000 pseudo-random texts (fixed seed) — half
     /// grammar-shaped (assignment? interpreter+flags? script args* redirection*, with valid and invalid
-    /// choices — every assignment now invalid), half random fragments — with arbitrary characters inserted
+    /// choices — every assignment invalid, interpreters and script types mixed), half random fragments — with arbitrary characters inserted
     /// into half of them (the full printable ASCII set, tab, CR, LF, NUL, ESC, NEL, some non-ASCII
     /// letters), the production parser gives an identity EXACTLY when the independent reference re-parses
     /// the text — and the same rel and first argument.
@@ -2522,11 +2644,15 @@ mod defect_intake_tests {
             "/Users/x/.cys/pack/hooks/g.sh", "~/.cys/pack/bin/cys-dept", "~/.cys/pack-dept-a/bin/a.py", "/tmp/x.py",
             "$CYS_PACK_DIR/bin/a.py", "A=1", "B='x y'", "C=\"z\"", "'quoted arg'", "\"dq arg\"", "arg", "--flag=v", "2>&1",
             ">/dev/null", ">", "/dev/null", "2>/dev/null", "&>/dev/null", "1>/dev/null", "check", "日本", "é", "~/x", "=x",
-            "'tab\there'", "\"nl\nhere\"", "UID=0", "PATH=/x",
+            "'tab\there'", "\"nl\nhere\"", "UID=0", "PATH=/x", "~/.cys/pack/bin/x.js", "~/.cys/pack/bin/x.ps1",
         ];
         let assigns = ["", "", "", "", "", "A=1", "UID=0", "B='x y'", "PATH=/x", "1A=x", "A=$x"];
-        let heads = ["", "", "python3", "python3 -u -B", "/usr/bin/python3", "bash -x", "zsh -f", "node --no-warnings", "pwsh -NoProfile", "py -u", "py -3", "py -u -3", "python3 -c", "sh -s", "env"];
-        let scripts = ["~/.cys/pack/bin/a.py", "/Users/x/.cys/pack/bin/javis_x.py", "/Users/x/.cys/pack/hooks/g.sh", "~/.cys/pack/bin/cys-dept", "~/.cys/pack-dept-a/bin/a.py", "/tmp/x.py", "$CYS_PACK_DIR/bin/a.py", "\"~/.cys/pack/bin/a.py\""];
+        let heads = ["", "", "python3", "python3 -u -B", "/usr/bin/python3", "bash", "bash -x", "zsh -f", "node", "node --no-warnings", "pwsh -NoProfile", "py -u", "py -3", "py -u -3", "python3 -c", "sh", "sh -s", "env"];
+        let scripts = [
+            "~/.cys/pack/bin/a.py", "/Users/x/.cys/pack/bin/javis_x.py", "/Users/x/.cys/pack/hooks/g.sh", "~/.cys/pack/bin/b.bash",
+            "~/.cys/pack/bin/x.js", "/Users/x/.cys/pack/bin/x.mjs", "~/.cys/pack/bin/x.ps1", "~/.cys/pack/bin/cys-dept",
+            "~/.cys/pack-dept-a/bin/a.py", "/tmp/x.py", "$CYS_PACK_DIR/bin/a.py", "\"~/.cys/pack/bin/a.py\"",
+        ];
         let redirs = ["", "", "2>&1", ">/dev/null", "> /dev/null", "2>/dev/null", "&>/dev/null", ">&2", "> out"];
         let seps = [" ", " ", "\t", "  "];
         let extra = ['ä', 'ß', 'λ', '日'];
@@ -2651,8 +2777,8 @@ mod defect_intake_tests {
         );
     }
 
-    /// RULINGS BX1 — the failure side's closed form: only the tool's exit report `Exit code N`, N an
-    /// integer 1..=127, as the error text's FIRST line. The exclusion list reads the same code from that
+    /// RULINGS BX1 / BY2 — the failure side's closed form: only the tool's exit report `Exit code N`, N an
+    /// integer 1..=127, as the error text's FIRST line (one trailing CR allowed). The exclusion list reads the same code from that
     /// same line (`intake::leading_exit_code`).
     #[test]
     fn exit_report_is_the_first_line_exit_code_1_to_127() {
@@ -2663,6 +2789,10 @@ mod defect_intake_tests {
             ("Exit code 64\n", 64),
             ("Exit code 126\n(eval):1: permission denied: /Users/x/.cys/pack/bin/a.sh", 126),
             ("Exit code 127\n/usr/bin/bash: line 1: cys-dept: command not found", 127),
+            // RULINGS BY2 — ONE trailing carriage return (a Windows line end)
+            ("Exit code 1\r\nKeyError: 'k'\r\n", 1),
+            ("Exit code 127\r\n/usr/bin/bash: line 1: cys-dept: command not found\r\n", 127),
+            ("Exit code 2\r", 2),
         ] {
             assert_eq!(exit_report(text), Some(n), "{text:?}");
             assert_eq!(intake::leading_exit_code(text), Some(n), "the exclusion list reads another code from {text:?}");
@@ -2685,7 +2815,9 @@ mod defect_intake_tests {
             "Exit code  1",
             " Exit code 1",
             "exit code 1",
-            "Exit code 1\r\nKeyError: 'k'",
+            "Exit code 1\r\r\nKeyError: 'k'",
+            "Exit code 1 \r\nKeyError: 'k'",
+            "Exit code 1\rx",
             "Exit code 1.0",
             "Exit code 1x",
             "Exit code",
@@ -2780,8 +2912,9 @@ mod defect_intake_tests {
         let dept = bash("~/.cys/pack/bin/cys-dept create team-x");
         let gate = bash("python3 ~/.cys/pack/bin/javis_resource_gate.py check");
         let chk = bash("python3 ~/.cys/pack/bin/javis_orchestra.py check");
-        let cases: [(&Value, &str, bool, Observed); 10] = [
+        let cases: [(&Value, &str, bool, Observed); 11] = [
             (&dept, "Exit code 127\n/usr/bin/bash: line 1: cys-dept: command not found", true, Observed::Excluded),
+            (&dept, "Exit code 127\r\n/usr/bin/bash: line 1: cys-dept: command not found\r\n", true, Observed::Excluded),
             (&dept, "\nExit code 127\n/usr/bin/bash: line 1: cys-dept: command not found", true, Observed::NotCounted),
             (&dept, "/usr/bin/bash: line 1: cys-dept: command not found", true, Observed::NotCounted),
             (&dept, "Exit code 127\n/usr/bin/bash: line 1: cys-dept: command not found", false, Observed::Failure),
@@ -2989,7 +3122,8 @@ mod defect_intake_tests {
             "fn grammar_tokens(",
             "fn redirection_at(",
             "fn parse_call(",
-            "fn interpreter_flags(",
+            "fn interpreter_of(",
+            "fn runs(",
             "pub fn detector_excluded(",
             "pub fn exit_report(",
             "fn is_failure_event(",
