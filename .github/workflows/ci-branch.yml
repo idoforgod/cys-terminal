@@ -286,6 +286,24 @@ jobs:
           # (조용한 드리프트 → 명시적 결정으로 전환). ★"팩 레인이라 생략"은 이유가 아니다 —
           # 그 스위트가 팩 배송과 **왜** 무관한지, 무관하지 않다면 무엇이 막고 있는지를 적어라.
           ALLOWED = {
+              "test_check_macho_arch": (
+                  {"ci-branch", "release"},
+                  "scripts/tests/ suite (not a pack suite; 0.15.0 T11, RULINGS BQ1(b), owner order addendum 11). Controls for "
+                  "scripts/check_macho_arch.py, the gate that fails when a Mach-O file of the macOS bundle lacks the target "
+                  "architecture (synthetic Mach-O / fat headers only). The gate's consumers are the macOS legs of release.yml "
+                  "(before upload) and scripts/build-macos-signed.sh; it is not shipped (build.rs embeds cysjavis-pack only). "
+                  "ci-branch = early warning before a tag; release = proof of the gate right before the leg trusts it (the "
+                  "test_release_postprocess_gate discipline). pack-release builds no app, so it has nothing to gate.",
+              ),
+              "test_installer_atomic": (
+                  {"ci-branch"},
+                  "scripts/tests/ suite (not a pack suite; was in the UNREGISTERED_OK baseline, registered by 0.15.0 T11 with "
+                  "RULINGS BQ1(d)). Controls for the macOS installer helper: atomic_bundle.py install and the read-only "
+                  "bundled-python runnability check of scripts/installer-app/install-core.sh (CPU / Rosetta 2 / macOS "
+                  "version, one Korean sentence, exit 5) on synthetic headers. macOS-only (codesign, renamex_np). The installer "
+                  "is built and notarised by the release leg from these same files; ci-branch is the gate before a tag "
+                  "(pre-tag-ci-check.py), so a release or pack-release entry would only repeat the verdict on the same SHA.",
+              ),
               "test_check_min_binary_floor": (
                   {"ci-branch"},
                   "scripts/tests/ suite (not a pack suite; 0.15.0 self-repair T2c, M11 카, CONTRACTS O-C8-5 (ii)). Controls for "
@@ -2197,5 +2215,40 @@ jobs:
         run: |
           set -euo pipefail
           f="scripts/tests/test_gen_prev_vendor_hashes.py"
+          [ -f "$f" ] || { echo "test file missing: $f (git add?)" >&2; exit 1; }
+          python3 "$f"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # 잡8 — 번들 아키텍처 게이트 + 설치 도우미 검사 대조군 (0.15.0 · T11 · RULINGS BQ1 · 오너 지시 추가 11)
+  # ★무엇을 막는가: 인텔용 설치 파일에 M칩 전용 python 이 실리거나(아키텍처), 이 Mac 에서 돌 수 없는 동봉 python 을
+  #   설치 도우미가 그대로 실행해 "Bad CPU type"·dyld 원문이 사용자에게 뜨는 것. 게이트(scripts/check_macho_arch.py)는
+  #   release.yml 의 맥 레그 두 개와 build-macos-signed.sh 가 쓰고, 설치 도우미 검사는 install-core.sh 안에 있다 —
+  #   이 잡은 둘의 대조군(합성 Mach-O·fat 헤더)을 태그 전에 돌린다.
+  # ★macOS 인 이유: 설치 도우미 대조군이 codesign·renamex_np 를 쓰고, 레인 예행 도구 5단계가 ci-branch 의 우분투
+  #   잡을 정확히 1개로 요구한다(잡5 머리말). `if:` 없음 · `continue-on-error` 없음.
+  macos-bundle-arch:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 번들 아키텍처 게이트 대조군 (합성 Mach-O·fat 헤더 · macOS)
+        shell: bash
+        run: |
+          set -euo pipefail
+          f="scripts/tests/test_check_macho_arch.py"
+          [ -f "$f" ] || { echo "test file missing: $f (git add?)" >&2; exit 1; }
+          python3 "$f"
+
+      - name: 설치 도우미 대조군 (원자 설치 + 동봉 python 실행 가능성 검사 · macOS)
+        shell: bash
+        run: |
+          set -euo pipefail
+          f="scripts/tests/test_installer_atomic.py"
           [ -f "$f" ] || { echo "test file missing: $f (git add?)" >&2; exit 1; }
           python3 "$f"

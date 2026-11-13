@@ -144,6 +144,138 @@ class InstallerAtomicContract(unittest.TestCase):
         self.assertEqual(residue(self.apps, "cys.app"), [], "실패 후 설치 위치에 잔해가 남음")
 
 
+# ── T11 · RULINGS BQ1(d) · 오너 지시 추가 11 — install-core.sh 의 동봉 python 실행 가능성 검사 ──────────────
+# install-core.sh 자체는 Team ID(Q43YA2NMF9)·공증 게이트 때문에 픽스처로 끝까지 돌릴 수 없다. 그래서 그 파일의
+# `# >>> T11-PY-RUNNABLE` … `# <<< T11-PY-RUNNABLE` 블록을 **그대로** 떼어 /bin/bash 로 돌리고, 기계 조건
+# (칩 · Rosetta 2 · macOS 버전)을 인자로 주입해 합성 Mach-O 헤더에 대해 판정·문장·종료 코드를 잰다.
+# 순서(진위 ①②③ → 이 검사 → python exec)와 설치 도우미의 승격 조건(exit 1 만)은 소스 핀으로 잰다.
+CORE = os.path.join(HERE, "..", "installer-app", "install-core.sh")
+APPLET = os.path.join(HERE, "..", "installer-app", "installer.applescript")
+X86_64, ARM64 = 0x01000007, 0x0100000C
+SENT_INTEL = ("이 설치 파일은 Apple 실리콘(M1·M2 등) Mac 전용이라 이 인텔 Mac에서는 설치할 수 없습니다 — "
+              "www.cysinsight.com 에서 인텔용 설치 파일(이름에 x64가 들어간 .dmg)을 받아 다시 설치해 주세요.")
+SENT_AS = ("이 설치 파일은 인텔 Mac용이라 Rosetta 2가 없는 이 Apple 실리콘(M1·M2 등) Mac에서는 설치할 수 없습니다 — "
+           "www.cysinsight.com 에서 Apple 실리콘용 설치 파일(이름에 aarch64가 들어간 .dmg)을 받아 다시 설치해 주세요.")
+
+
+def _ver(s):
+    p = [int(x) for x in s.split(".")] + [0, 0]
+    return (p[0] << 16) | (p[1] << 8) | p[2]
+
+
+def _thin(cputype, minos=None, legacy=None):
+    import struct
+    cmds, n = b"", 0
+    if minos:
+        cmds += struct.pack("<IIIIII", 0x32, 24, 1, _ver(minos), _ver("15.0"), 0)
+        n += 1
+    if legacy:
+        cmds += struct.pack("<IIII", 0x24, 16, _ver(legacy), _ver("10.15"))
+        n += 1
+    return struct.pack("<IIIIIIII", 0xFEEDFACF, cputype, 3, 2, n, len(cmds), 0, 0) + cmds + b"\0" * 64
+
+
+def _fat(slices):
+    import struct
+    table, body, off = b"", b"", 4096
+    for cputype, data in slices:
+        pad = b"\0" * (4096 - len(data) % 4096)
+        table += struct.pack(">IIIII", cputype, 3, off, len(data), 12)
+        body += data + pad
+        off += len(data) + len(pad)
+    head = struct.pack(">II", 0xCAFEBABE, len(slices)) + table
+    return head + b"\0" * (4096 - len(head)) + body
+
+
+class PythonRunnableCheck(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="cys-pyrun-")
+        with open(CORE, encoding="utf-8") as f:
+            src = f.read()
+        i, j = src.index("# >>> T11-PY-RUNNABLE"), src.index("# <<< T11-PY-RUNNABLE")
+        self.driver = os.path.join(self.root, "driver.sh")
+        with open(self.driver, "w", encoding="utf-8") as f:
+            f.write("#!/bin/bash\nset -euo pipefail\n" + src[i:j] + '\nic_python_runnable "$1" "$2" "$3" "$4"\n')
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def py(self, data, name="python3.12"):
+        p = os.path.join(self.root, "runtime", "python", "bin", name)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "wb") as f:
+            f.write(data)
+        os.chmod(p, 0o755)
+        link = os.path.join(os.path.dirname(p), "python3")
+        if name != "python3" and not os.path.lexists(link):
+            os.symlink(name, link)            # 실제 번들처럼 python3 → python3.12 링크를 통해 읽는다
+        return link if name != "python3" else p
+
+    def run_check(self, py, hw, rosetta, os_ver):
+        bash = "/bin/bash" if os.path.exists("/bin/bash") else "bash"
+        r = subprocess.run([bash, self.driver, py, hw, rosetta, os_ver], capture_output=True, text=True, timeout=60)
+        return r.returncode, r.stdout, r.stderr.strip()
+
+    def test_arm64_only_python_on_an_intel_mac_says_one_korean_sentence_and_exits_5(self):
+        rc, out, err = self.run_check(self.py(_thin(ARM64, minos="11.0")), "x86_64", "no", "13.6")
+        self.assertEqual((rc, out, err), (5, "", SENT_INTEL))
+        self.assertNotIn("Bad CPU", err)
+
+    def test_x86_64_python_on_an_intel_mac_runs(self):
+        rc, out, err = self.run_check(self.py(_thin(X86_64, minos="10.15")), "x86_64", "no", "10.15.7")
+        self.assertEqual((rc, err), (0, ""))
+
+    def test_intel_python_on_apple_silicon_needs_rosetta(self):
+        py = self.py(_thin(X86_64, minos="10.15"))
+        rc, out, err = self.run_check(py, "arm64", "no", "14.5")
+        self.assertEqual((rc, err), (5, SENT_AS))
+        rc, out, err = self.run_check(py, "arm64", "yes", "14.5")
+        self.assertEqual((rc, err), (0, ""), "an Intel python runs on Apple silicon with Rosetta 2")
+
+    def test_arm64_and_universal_pythons_on_apple_silicon_run(self):
+        self.assertEqual(self.run_check(self.py(_thin(ARM64, minos="11.0")), "arm64", "no", "14.5")[0], 0)
+        uni = self.py(_fat([(X86_64, _thin(X86_64, minos="10.15")), (ARM64, _thin(ARM64, minos="11.0"))]), "python3")
+        self.assertEqual(self.run_check(uni, "arm64", "no", "14.5")[0], 0)
+        self.assertEqual(self.run_check(uni, "x86_64", "no", "10.15")[0], 0, "the x86_64 slice's own minimum (10.15) applies")
+
+    def test_macos_older_than_the_python_minimum_names_both_versions(self):
+        rc, out, err = self.run_check(self.py(_thin(X86_64, minos="10.15")), "x86_64", "no", "10.14.6")
+        self.assertEqual(rc, 5)
+        self.assertEqual(err, "이 Mac의 macOS 버전(10.14.6)이 낮아 cys를 설치할 수 없습니다 — "
+                              "macOS 10.15 이상으로 업데이트한 뒤 다시 설치해 주세요.")
+        rc, out, err = self.run_check(self.py(_thin(X86_64, legacy="10.13"), "python3"), "x86_64", "no", "10.12.6")
+        self.assertEqual(rc, 5, "LC_VERSION_MIN_MACOSX is read too")
+        self.assertIn("macOS 10.13 이상", err)
+
+    def test_unreadable_header_does_not_block(self):
+        for data in (b"#!/bin/sh\necho hi\n", b"\xcf\xfa\xed\xfe\x07"):
+            p = self.py(data, "python3")
+            self.assertEqual(self.run_check(p, "x86_64", "no", "13.0")[:2], (0, ""))
+            os.remove(p)
+
+    def test_order_authenticity_first_then_this_check_then_exec_and_exit_5_is_not_escalated(self):
+        with open(CORE, encoding="utf-8") as f:
+            src = f.read()
+        i_spctl = src.index('/usr/sbin/spctl --assess --type execute "$SRC"')
+        i_teamid = src.index('[ "$SRC_TEAM" = "$EXPECTED_TEAM_ID" ]')
+        i_sign = src.index('/usr/bin/codesign --verify --strict "$SRC"')
+        i_block = src.index("# >>> T11-PY-RUNNABLE")
+        i_call = src.index('ic_python_runnable "$PY" "$IC_HW" "$IC_ROSETTA" "$IC_OS" || exit 5')
+        i_exec = src.index('exec "$PY" "$WRAPPER" install "$SRC" "$DEST"')
+        self.assertTrue(i_sign < i_teamid < i_spctl < i_block < i_call < i_exec,
+                        "order must stay: signature -> Team ID -> notarisation -> (read-only) python check -> exec")
+        self.assertIn("5=이 Mac 에서 소스 동봉 python 을 실행할 수 없음", src)
+        block = src[i_block:src.index("# <<< T11-PY-RUNNABLE")]
+        import re
+        runs_python = re.compile(r'(^\s*|[;&|(]\s*|\$\(\s*)(exec\s+)?"?\$\{?(py|PY)\}?"?(\s|$)')
+        for line in block.splitlines():
+            code = line.split("#", 1)[0] if line.lstrip().startswith("#") else line
+            self.assertIsNone(runs_python.search(code), "the check must never run the bundled python: " + line)
+        with open(APPLET, encoding="utf-8") as f:
+            applet = f.read()
+        self.assertIn("if errNum is 1 then", applet, "only exit 1 may trigger the administrator retry")
+
+
 if __name__ == "__main__":
     if sys.platform != "darwin":
         print("SKIP: macOS 전용(codesign/renamex_np)")

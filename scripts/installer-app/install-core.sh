@@ -26,6 +26,7 @@
 # 사용: install-core.sh <SRC cys.app> <DEST cys.app>
 # exit 0=원자 설치 완료 / 1=설치 실패(기존 번들 무접촉·권한 실패 시 applet 이 승격 재시도)
 #      / 2=소스 아님 / 3=번들 내부 도구 결손 / 4=소스 진위 실패(변조·Team ID 불일치·미공증 → 승격 금지)
+#      / 5=이 Mac 에서 소스 동봉 python 을 실행할 수 없음(CPU 아키텍처·macOS 버전 — 한국어 한 문장 안내 · 승격 금지)
 set -euo pipefail
 
 SRC="${1:?SRC (source cys.app) 필요}"
@@ -54,12 +55,117 @@ SRC_TEAM="$(/usr/bin/codesign -dv --verbose=4 "$SRC" 2>&1 | /usr/bin/sed -n 's/^
 /usr/sbin/spctl --assess --type execute "$SRC" >/dev/null 2>&1 || {
   echo "✗ 소스 Gatekeeper/공증 평가 거부(미공증·미신뢰 소스) — 설치 거부: $SRC" >&2; exit 4; }
 
+# ── ★동봉 python 실행 가능성 검사 (0.15.0 · T11 · RULINGS BQ1(d) · 오너 지시 추가 11) ──
+# 위치가 전부다: 진위 게이트 ①②③ **뒤**, 동봉 python 실행 **앞**. 이 검사는 python 파일을 **읽기만** 하고
+#   시스템 실 바이너리(od·sysctl·sw_vers)만 쓴다 — 번들 안의 어떤 코드도 실행하지 않는다.
+# 왜: 이 Mac 에서 돌 수 없는 python(인텔 Mac 의 arm64 전용 · Rosetta 2 없는 Apple 실리콘의 x86_64 전용 ·
+#   python 이 요구하는 것보다 낮은 macOS)을 exec 하면 "Bad CPU type in executable"·dyld 오류 원문이 그대로
+#   사용자에게 뜬다. 대신 무엇이 문제이고 무엇을 하면 되는지 한국어 한 문장을 stderr 로 내고 exit 5 로 멈춘다
+#   (설치 도우미는 exit 1 에서만 관리자 승격을 재시도한다 — 5 는 승격하지 않고 그 문장을 보여 준다).
+# 헤더를 읽지 못하면(서명 검증을 통과한 소스에선 일어나지 않는다) 막지 않는다 — 종전 동작 그대로.
+# >>> T11-PY-RUNNABLE
+ic_u8s() { /usr/bin/od -An -v -t u1 -j "$2" -N "$3" -- "$1" 2>/dev/null || true; }
+ic_u32() {   # <파일> <오프셋> <le|be> → 10진수 (못 읽으면 rc 1)
+  local b
+  b=( $(ic_u8s "$1" "$2" 4) )
+  [ "${#b[@]}" -eq 4 ] || return 1
+  if [ "$3" = le ]; then echo $(( b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24) ))
+  else echo $(( (b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3] )); fi
+}
+ic_cpu() { case "$1" in 16777223) echo x86_64 ;; 16777228) echo arm64 ;; *) echo "cpu$1" ;; esac; }
+ic_slices() {   # <파일> → "<아키텍처>:<오프셋>" 줄들 (Mach-O 가 아니거나 못 읽으면 rc 1)
+  local f="$1" le be n i e cpu off
+  le=$(ic_u32 "$f" 0 le) || return 1
+  be=$(ic_u32 "$f" 0 be) || return 1
+  case "$le" in 4277009103|4277009102)            # 0xfeedfacf · 0xfeedface (단일 아키텍처)
+    cpu=$(ic_u32 "$f" 4 le) || return 1; echo "$(ic_cpu "$cpu"):0"; return 0 ;; esac
+  case "$be" in 3405691582|3405691583)            # 0xcafebabe · 0xcafebabf (유니버설)
+    n=$(ic_u32 "$f" 4 be) || return 1
+    { [ "$n" -ge 1 ] && [ "$n" -le 30 ]; } || return 1
+    e=20; [ "$be" = 3405691583 ] && e=32
+    i=0
+    while [ "$i" -lt "$n" ]; do
+      cpu=$(ic_u32 "$f" $((8 + i * e)) be) || return 1
+      if [ "$e" = 20 ]; then off=$(ic_u32 "$f" $((8 + i * e + 8)) be) || return 1
+      else off=$(ic_u32 "$f" $((8 + i * e + 12)) be) || return 1; fi
+      echo "$(ic_cpu "$cpu"):$off"; i=$((i + 1))
+    done
+    return 0 ;; esac
+  return 1
+}
+ic_minos() {   # <파일> <슬라이스 오프셋> → "X.Y.Z" (LC_BUILD_VERSION · LC_VERSION_MIN_MACOSX · 없으면 빈 출력)
+  local f="$1" o="$2" magic hs ncmds pos cmd size v k=0
+  magic=$(ic_u32 "$f" "$o" le) || return 0
+  case "$magic" in 4277009103) hs=32 ;; 4277009102) hs=28 ;; *) return 0 ;; esac
+  ncmds=$(ic_u32 "$f" $((o + 16)) le) || return 0
+  pos=$((o + hs))
+  while [ "$k" -lt "$ncmds" ] && [ "$k" -lt 512 ]; do
+    cmd=$(ic_u32 "$f" "$pos" le) || return 0
+    size=$(ic_u32 "$f" $((pos + 4)) le) || return 0
+    [ "$size" -ge 8 ] || return 0
+    case "$cmd" in
+      50) v=$(ic_u32 "$f" $((pos + 12)) le) || return 0; echo "$((v >> 16)).$(((v >> 8) & 255)).$((v & 255))"; return 0 ;;
+      36) v=$(ic_u32 "$f" $((pos + 8)) le) || return 0; echo "$((v >> 16)).$(((v >> 8) & 255)).$((v & 255))"; return 0 ;;
+    esac
+    pos=$((pos + size)); k=$((k + 1))
+  done
+  return 0
+}
+ic_ver_lt() {   # <a> <b> → a < b 이면 rc 0 (숫자가 아니면 rc 1 = 막지 않음)
+  local a b i x y
+  a=( $(printf '%s' "$1" | tr '.' ' ') ); b=( $(printf '%s' "$2" | tr '.' ' ') )
+  for i in 0 1 2; do
+    x="${a[$i]:-0}"; y="${b[$i]:-0}"
+    case "$x$y" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$x" -lt "$y" ] && return 0
+    [ "$x" -gt "$y" ] && return 1
+  done
+  return 1
+}
+ic_python_runnable() {   # <python> <이 Mac: arm64|x86_64> <Rosetta 2: yes|no> <macOS 버전> → 0=실행 가능 · 5=불가(문장 출력)
+  local py="$1" hw="$2" rosetta="$3" os="$4" slices run="" s minos
+  slices="$(ic_slices "$py")" || return 0
+  for s in $slices; do
+    if [ "${s%%:*}" = "$hw" ]; then run="$s"; break; fi
+  done
+  if [ -z "$run" ] && [ "$hw" = arm64 ] && [ "$rosetta" = yes ]; then
+    for s in $slices; do
+      if [ "${s%%:*}" = x86_64 ]; then run="$s"; break; fi
+    done
+  fi
+  if [ -z "$run" ]; then
+    if [ "$hw" = arm64 ]; then
+      echo "이 설치 파일은 인텔 Mac용이라 Rosetta 2가 없는 이 Apple 실리콘(M1·M2 등) Mac에서는 설치할 수 없습니다 — www.cysinsight.com 에서 Apple 실리콘용 설치 파일(이름에 aarch64가 들어간 .dmg)을 받아 다시 설치해 주세요." >&2
+    else
+      echo "이 설치 파일은 Apple 실리콘(M1·M2 등) Mac 전용이라 이 인텔 Mac에서는 설치할 수 없습니다 — www.cysinsight.com 에서 인텔용 설치 파일(이름에 x64가 들어간 .dmg)을 받아 다시 설치해 주세요." >&2
+    fi
+    return 5
+  fi
+  minos="$(ic_minos "$py" "${run##*:}")"
+  if [ -n "$minos" ] && [ -n "$os" ] && ic_ver_lt "$os" "$minos"; then
+    echo "이 Mac의 macOS 버전($os)이 낮아 cys를 설치할 수 없습니다 — macOS ${minos%.0} 이상으로 업데이트한 뒤 다시 설치해 주세요." >&2
+    return 5
+  fi
+  return 0
+}
+# <<< T11-PY-RUNNABLE
+
 # ── 실행 인터프리터 선택 (진위 검증을 통과한 소스의 동봉 python 우선) ──
 SRC_PY="$SRC/Contents/Resources/runtime/python/bin/python3"
 if [ -x "$SRC_PY" ]; then
   PY="$SRC_PY"
 else
   PY="/usr/bin/python3"   # 폴백(소스 동봉 python 결손 시) — CLT 미설치 맥에선 실패할 수 있음(finding 7)
+fi
+# T11 · BQ1(d): 동봉 python 을 고른 경우에만, exec 전에 이 Mac 에서 돌 수 있는지 본다(위 블록 · 읽기 전용).
+#   하드웨어는 sysctl hw.optional.arm64(Rosetta 아래에서도 실제 칩을 말한다), Rosetta 2 는 설치 파일의 존재로 본다.
+if [ "$PY" = "$SRC_PY" ]; then
+  IC_HW=x86_64
+  [ "$(/usr/sbin/sysctl -n hw.optional.arm64 2>/dev/null || true)" = 1 ] && IC_HW=arm64
+  IC_ROSETTA=no
+  { [ -e /Library/Apple/usr/share/rosetta/rosetta ] || [ -e /Library/Apple/usr/libexec/oah/libRosettaRuntime ]; } && IC_ROSETTA=yes
+  IC_OS="$(/usr/bin/sw_vers -productVersion 2>/dev/null || true)"
+  ic_python_runnable "$PY" "$IC_HW" "$IC_ROSETTA" "$IC_OS" || exit 5
 fi
 
 # 정본 ATOMIC-1 집행부에 그대로 위임(exec — 종료 코드 그대로 전파).
