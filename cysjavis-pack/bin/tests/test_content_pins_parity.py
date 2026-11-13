@@ -645,12 +645,30 @@ class NoMasterShortcutAnywhere(unittest.TestCase):
 # (faster)" — the fix promised by someone else). Test sources are out of the sweep (B95), so the patterns are written plainly.
 # STATED LIMIT (RULINGS BZ6): a sentence assembled at run time from several literals (`"…" + x + "…"`, `%`-formatting over
 # several constants, `.join`) is checked piece by piece; the stage-5 run-time corpus sees the assembled text.
+def _product_feedback_address():
+    """The feedback feature's address as the PRODUCT keeps it — `FEEDBACK_TO` in src-tauri/src/feedback.rs, read at test time.
+    No pack file spells an e-mail address (scan-pack-secrets: the pack ships to every user). None when the repository's
+    source is not reachable from here (a pack installed without the repository); the tests that need it then skip with a
+    notice — and FAIL inside the repository (`DeferralFamiliesFG.test_dotted_alternatives_are_matched_over_the_whole_string`)."""
+    import re as _re
+    try:
+        with open(os.path.join(REPO_DIR, "src-tauri", "src", "feedback.rs"), encoding="utf-8") as fh:
+            m = _re.search(r'pub const FEEDBACK_TO: &str = "([^"\s]+)";', fh.read())
+    except OSError:
+        return None
+    return m.group(1) if m else None
+
+
+FEEDBACK_TO = _product_feedback_address()
+# A.md §5 T1-b names the address with its dot escaped — assembled here from the product's constant (`re.escape`).
+_T1B_ADDRESS_ALT = (__import__("re").escape(FEEDBACK_TO) + "|") if FEEDBACK_TO else ""
+
 TIER1_NOUN = (r"(최윤식|윤식\s*박사|박사(?!급)|Dr\.?\s*Choi|Yoonsik|제작자|제작사|개발자|개발사|개발팀|제조사|벤더|vendor|배포자|공급자"
               r"|upstream|업스트림|배포\s*전담\s*부서|정비발행부|maintainer|developer)")
 TIER1_VERB = (r"(문의|물어|여쭤|연락|제보|요청|알려|전달|맡기|맡겨|고쳐\s*(줄|주|받)|수정해\s*(줄|주|받)|반영(해|될|되)|기다|ask|contact"
               r"|report|reach\s+out|let\s+(them|the)\s)")
 TIER1_FAMILIES = {
-    "T1-b": r"(지원\s*채널|고객\s*지원|고객\s*센터|홈페이지\s*문의|저장소\s*이슈|깃허브\s*이슈|GitHub\s*(issue|이슈)|이슈(를|로)?\s*(등록|올려|올리|제출|열어)|버그\s*(리포트|제보)|피드백\s*(버튼|으로\s*보내)|cysinsight@gmail\.com|file\s+(an?\s+)?(issue|bug)|open\s+an?\s+issue|support\s+(channel|team|ticket))",
+    "T1-b": r"(지원\s*채널|고객\s*지원|고객\s*센터|홈페이지\s*문의|저장소\s*이슈|깃허브\s*이슈|GitHub\s*(issue|이슈)|이슈(를|로)?\s*(등록|올려|올리|제출|열어)|버그\s*(리포트|제보)|피드백\s*(버튼|으로\s*보내)|" + _T1B_ADDRESS_ALT + r"file\s+(an?\s+)?(issue|bug)|open\s+an?\s+issue|support\s+(channel|team|ticket))",
     "T1-c": r"((다음|차기|향후|새)\s*(버전|업데이트|릴리스|릴리즈|패치|배포)[^.!?。\n]{0,25}(고쳐|수정|해결|반영|기다|나오|제공|포함)|업데이트(를|가)?\s*(기다|나올\s*때까지|될\s*때까지)|wait\s+for\s+(the\s+)?(next|an?|upcoming|future)\s+(update|release|version|patch)|(fixed|addressed|resolved)\s+in\s+(a|the)\s+(future|next|later)\s+(release|version|update))",
     "T1-d": r"((팩|훅|도구|스크립트|지침|제품|코드|이\s*파일|시스템\s*파일)[^.!?。\n]{0,20}(수정|고칠|변경|편집|손댈)\s*(할\s*)?수\s*(가\s*)?없|(고칠|수정할)\s*권한이\s*없|변경\s*불가|수정\s*불가|벤더의\s*일|벤더\s*동기\s*필요|사용자\s*과실\s*아님|immutable|(I|we)\s+(can'?t|cannot|am\s+not\s+(able|allowed)\s+to|don'?t\s+have\s+permission\s+to)\s+(modify|edit|fix|change|patch))",
     "T1-e": r"(--propose|pack-merge\s+--propose|제안\s*패치|개선\s*제안(으로|을|를)?\s*(보내|제출|만들)|patch\s+(to|for)\s+(the\s+)?(vendor|developer|maintainer))",
@@ -677,7 +695,7 @@ ROLE_BLOCK_CONSTS = ("RULES_COMMON", "RULES_MASTER_CEO", "RULES_WORKER", "RULES_
 # feature (its address constant, the modal's title and field labels), not sentences. A sentence that presents feedback or
 # reporting as the way to get a defect fixed is still a hit wherever it stands, the modal included.
 FEEDBACK_FEATURE_IDENTIFIERS = {
-    "src-tauri/src/feedback.rs": ("cysinsight@gmail.com",),                      # FEEDBACK_TO — the address constant
+    "src-tauri/src/feedback.rs": (FEEDBACK_TO,) if FEEDBACK_TO else (),       # FEEDBACK_TO — the address constant
     "ui/src/feedbackmodal.ts": (
         "피드백 보내기",                                                          # the button's aria-label
         "<span>피드백 보내기</span>",                                             # the button's label
@@ -1096,14 +1114,25 @@ class DeferralFamiliesFG(unittest.TestCase):
         self.assertEqual(fams(ts_strings(ts)), ["T1-c"])
 
     def test_dotted_alternatives_are_matched_over_the_whole_string(self):
-        """RULINGS BZ1: an alternative that holds sentence punctuation is found — the e-mail address (T1-b), `Dr.` (T1-f) —
-        and the address constant itself is a hit unless it is the feedback feature's listed identifier (BZ2)."""
-        self.assertEqual(tier1_sentence_hits("문제가 있으면 cysinsight@gmail.com 으로 보내 주세요.", stricter=False), ["T1-b"])
+        """RULINGS BZ1: an alternative that holds sentence punctuation is found — the feedback address (T1-b), `Dr.` (T1-f) —
+        and the address constant itself is a hit unless it is the feedback feature's listed identifier (BZ2). The address is
+        the product's own constant (never spelled in a pack file — scan-pack-secrets); inside the repository an unreadable
+        constant FAILS (the control must not disappear silently in CI), outside it the address cases are skipped."""
+        import re
         self.assertEqual(tier1_sentence_hits("그 수정은 Dr. Choi 의 일이다.", stricter=False), ["T1-f"])
-        self.assertEqual(tier1_sentence_hits("cysinsight@gmail.com", stricter=False), ["T1-b"])
-        rs = 'pub const FEEDBACK_TO: &str = "cysinsight@gmail.com";\n'
-        self.assertEqual([t for _l, t in rs_strings(rs)], ["cysinsight@gmail.com"])
-        self.assertIn("cysinsight@gmail.com", FEEDBACK_FEATURE_IDENTIFIERS["src-tauri/src/feedback.rs"])
+        if FEEDBACK_TO is None:
+            if os.path.isdir(os.path.join(REPO_DIR, "src-tauri", "src")):
+                self.fail("FEEDBACK_TO is not readable from src-tauri/src/feedback.rs inside the repository")
+            print("\n  [skip] the feedback address cases: the repository's src-tauri is not reachable from this pack")
+            self.skipTest("repository source not reachable")
+        escaped = re.escape(FEEDBACK_TO)
+        self.assertIn("\\.", escaped, "the address alternative keeps its dot escaped (A.md §5)")
+        self.assertIn("|" + escaped + "|", TIER1_FAMILIES["T1-b"])
+        self.assertEqual(tier1_sentence_hits("문제가 있으면 %s 으로 보내 주세요." % FEEDBACK_TO, stricter=False), ["T1-b"])
+        self.assertEqual(tier1_sentence_hits(FEEDBACK_TO, stricter=False), ["T1-b"])
+        rs = 'pub const FEEDBACK_TO: &str = "%s";\n' % FEEDBACK_TO
+        self.assertEqual([t for _l, t in rs_strings(rs)], [FEEDBACK_TO])
+        self.assertIn(FEEDBACK_TO, FEEDBACK_FEATURE_IDENTIFIERS["src-tauri/src/feedback.rs"])
 
     def test_stricter_families_find_the_escaped_sentences(self):
         """RULINGS BZ3 / Part 33 B98: the four sentences of v0.14.56 that escaped the frozen list are found by T1-b+ / T1-h
