@@ -17,6 +17,10 @@
 #[cfg(test)]
 #[path = "repair_ledger_tests.rs"]
 mod ledger_tests;
+// Track T5a — the T3 ↔ T5a seam on the REAL compiled lists (RULINGS AN1).
+#[cfg(test)]
+#[path = "repair_t5a_seam_tests.rs"]
+mod t5a_seam_tests;
 
 #[cfg(test)]
 #[path = "repair_grant_tests.rs"]
@@ -792,19 +796,36 @@ fn live_seats(daemon: &Daemon) -> Vec<(u64, String)> {
     out
 }
 
-/// Classification of one target from the compiled boot-critical list (C4 · T5a): listed with
-/// category `protection` → 보호장치 관련, listed → 기동 필수, not listed → 일반. Undecidable or the
-/// list not available → an error: `begin` refuses (a boot-critical file is never repaired as a
-/// general one). Rule documents are T4's gate.
+/// Classification of one target from the two compiled lists (C4 · T5a · RULINGS AI6 / AN1): the
+/// protection list FIRST — a file in it is 보호장치 관련, also when it is boot-critical too (the
+/// stricter class) — then the boot-critical list → 기동 필수, else 일반. Either list unavailable,
+/// or a path that cannot be decided → an error: `begin` refuses (a boot-critical or protection
+/// file is never repaired as a general one). Rule documents are T4's gate.
 fn production_classify(rel: &str) -> Result<cys::repair::types::Classification, RepairError> {
-    use cys::repair::boot_critical::{entries, is_boot_critical, Decision, EntryCategory};
+    use cys::repair::boot_critical::{
+        boot_critical_entry, entries, is_boot_critical, is_protection_related, protection_entries,
+        protection_entry, Decision,
+    };
     use cys::repair::types::Classification;
-    if let Some(e) = entries().iter().find(|e| e.rel == rel) {
-        return Ok(if e.category == EntryCategory::Protection {
-            Classification::ProtectionRelated
-        } else {
-            Classification::BootCritical
-        });
+    if protection_entries().is_empty() || entries().is_empty() {
+        return Err(RepairError::Precondition(format!(
+            "{rel}: 컴파일된 기동 필수 · 보호장치 목록을 읽을 수 없어 시작하지 않습니다"
+        )));
+    }
+    if protection_entry(rel).is_some() {
+        return Ok(Classification::ProtectionRelated);
+    }
+    match is_protection_related(Path::new(rel))? {
+        Decision::Yes => return Ok(Classification::ProtectionRelated),
+        Decision::Undecidable => {
+            return Err(RepairError::Precondition(format!(
+                "{rel}: 보호장치 관련 여부를 가릴 수 없어 시작하지 않습니다"
+            )))
+        }
+        Decision::No => {}
+    }
+    if boot_critical_entry(rel).is_some() {
+        return Ok(Classification::BootCritical);
     }
     match is_boot_critical(Path::new(rel))? {
         Decision::Yes => Ok(Classification::BootCritical),
@@ -1287,26 +1308,25 @@ mod ledger_verbs {
         Ok((event.to_string(), script.to_string()))
     }
 
-    /// RULINGS V1: only a non-lifeline (8.7), non-protection (D:941) hook; while the compiled list is
-    /// not available a protection hook cannot be told apart → refused (fail closed).
-    fn hook_allowed(script: &str) -> Result<(), VerbError> {
+    /// RULINGS V1 / AN1: only a non-lifeline (8.7), non-protection (D:941) hook — the protection
+    /// rows are the sibling list (AI6); while either compiled list is not available a protection
+    /// hook cannot be told apart → refused (fail closed).
+    pub(super) fn hook_allowed(script: &str) -> Result<(), VerbError> {
         if LIFELINE_HOOKS.contains(&script) {
             return Err(VerbError::new(
                 cys::repair::types::ERR_PRECONDITION,
                 format!("{script}: 생명줄 훅의 등록은 수리로 해제할 수 없습니다"),
             ));
         }
-        let list = entries();
-        if list.is_empty() {
+        if entries().is_empty() || cys::repair::boot_critical::protection_entries().is_empty() {
             return Err(VerbError::new(
                 cys::repair::types::ERR_PRECONDITION,
                 format!("{script}: 기동 필수 목록을 읽을 수 없어 보호장치 훅인지 가릴 수 없습니다 — 거부"),
             ));
         }
         let rel = format!("hooks/{script}");
-        if list
-            .iter()
-            .any(|e| e.rel == rel && e.category == EntryCategory::Protection)
+        if cys::repair::boot_critical::protection_entry(&rel)
+            .is_some_and(|e| e.category == EntryCategory::Protection)
         {
             return Err(VerbError::new(
                 cys::repair::types::ERR_PRECONDITION,
