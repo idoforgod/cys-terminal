@@ -248,7 +248,10 @@ fn role_table_census_every_verb_every_caller() {
             checked += 1;
         }
     }
-    assert_eq!(checked, 28 * callers.len());
+    // T4 (RULINGS CI6 (b)): the READ verb `grant_status` joined the table — 28 → 29 verbs (old
+    // expectation `assert_eq!(checked, 28 * callers.len());`)
+    assert_eq!(VERB_CLASSES.len(), 29);
+    assert_eq!(checked, 29 * callers.len());
     // a verb not in the table is refused for every caller, the master included
     for (_, c) in &callers {
         assert_eq!(
