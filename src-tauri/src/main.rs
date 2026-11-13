@@ -7058,6 +7058,22 @@ fn ceo_promoted(pre_ceo_exists: bool, md: Option<&[u8]>) -> bool {
     pre_ceo_exists || md.and_then(ceo_header).is_some()
 }
 
+/// ★RULINGS CG2 — 디렉티브 폴더에서 같은 술어를 판정한다. `.pre-ceo` 의 실재는 사전적이다(`symlink_metadata` — 끊긴 링크·
+/// 읽을 수 없는 파일·폴더도 '있다'; A12·preflight·javis_org·cys-dept 와 같은 판정).
+fn ceo_pre_ceo_present(dir: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(dir.join("MASTER_DIRECTIVE.md.pre-ceo")).is_ok()
+}
+
+#[cfg(test)] // 파리티 시험이 실제 파일로 부르는 경로 — 운영 경로(ceo_promotion_drift)는 같은 두 조각을 쓴다
+fn ceo_promoted_at(dir: &std::path::Path) -> bool {
+    ceo_promoted(
+        ceo_pre_ceo_present(dir),
+        std::fs::read(dir.join("MASTER_DIRECTIVE.md"))
+            .ok()
+            .as_deref(),
+    )
+}
+
 /// 조립 구분선 — `scripts/gen_ceo_template.py` 의 `SEPARATOR` 와 같은 바이트(시험 `ceo_separator_matches_generator`
 /// 가 고정한다 · cys-dept·preflight·javis_org 사본은 `test_ceo_composition.py` 가 고정).
 const CEO_SEPARATOR: &str = "\n---\n\n# [본문 — 표준 MASTER 운영 계약 전문]\n\n";
@@ -7079,8 +7095,10 @@ fn ceo_header(b: &[u8]) -> Option<&[u8]> {
 fn ceo_promotion_drift() -> bool {
     let dir = cys::pack::pack_dir().join("directives");
     ceo_drift_verdict(
-        dir.join("MASTER_DIRECTIVE.md.pre-ceo").exists(),
-        std::fs::read(dir.join("MASTER_DIRECTIVE.md")).ok().as_deref(),
+        ceo_pre_ceo_present(&dir),
+        std::fs::read(dir.join("MASTER_DIRECTIVE.md"))
+            .ok()
+            .as_deref(),
         std::fs::read(dir.join("CEO_TEMPLATE.md")).ok().as_deref(),
     )
 }
@@ -11057,15 +11075,45 @@ exit 0
         )))
         .unwrap();
         assert_eq!(fx["separator"].as_str(), Some(CEO_SEPARATOR));
-        for c in fx["cases"].as_array().unwrap() {
-            let md = c["md"].as_str().map(|m| m.as_bytes());
+        let mut ran = 0;
+        for (i, c) in fx["cases"].as_array().unwrap().iter().enumerate() {
+            // ★CG2: 실제 항목으로 판정한다(디렉티브 폴더 하나 — 운영 경로와 같은 두 조각).
+            let dir = std::env::temp_dir().join(format!("cys-app-cb1-{}-{i}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            if let Some(md) = c["md"].as_str() {
+                std::fs::write(dir.join("MASTER_DIRECTIVE.md"), md).unwrap();
+            }
+            let pre = dir.join("MASTER_DIRECTIVE.md.pre-ceo");
+            match c["pre_ceo"].as_str() {
+                None => {}
+                Some("file") => std::fs::write(&pre, "백업\n").unwrap(),
+                Some("directory") => std::fs::create_dir(&pre).unwrap(),
+                #[cfg(unix)]
+                Some("dangling-link") => {
+                    std::os::unix::fs::symlink(dir.join("nowhere"), &pre).unwrap()
+                }
+                #[cfg(unix)]
+                Some("unreadable") => {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::write(&pre, "백업\n").unwrap();
+                    std::fs::set_permissions(&pre, std::fs::Permissions::from_mode(0o000)).unwrap();
+                }
+                Some(_) => {
+                    let _ = std::fs::remove_dir_all(&dir);
+                    continue;
+                }
+            }
             assert_eq!(
-                ceo_promoted(c["pre_ceo"].as_bool().unwrap(), md),
+                ceo_promoted_at(&dir),
                 c["promoted"].as_bool().unwrap(),
                 "앱 술어 ≠ 픽스처: {}",
                 c["name"]
             );
+            ran += 1;
+            let _ = std::fs::remove_dir_all(&dir);
         }
+        assert!(ran >= 12, "픽스처 행을 거의 못 돌렸다: {ran}");
     }
 
     /// ★T8: 앱의 조립 구분선은 생성기(`scripts/gen_ceo_template.py` SEPARATOR)와 같은 바이트이고, 출하 틀

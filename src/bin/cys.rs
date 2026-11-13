@@ -26499,7 +26499,7 @@ fn ceo_vendor_overwrite_rejection(
     }
     let pre_ceo = pack_dir.join(format!("{MASTER_DIRECTIVE_REL}.pre-ceo"));
     // ★RULINGS CB4: 거부 사유는 실제 근거를 말한다 — 백업이 있으면 그 경로, 없으면 지침 안의 조립 구분선.
-    let why = if pre_ceo.exists() {
+    let why = if ceo_pre_ceo_present(pack_dir) {
         format!("{} 존재", pre_ceo.display())
     } else {
         "지침에 CEO 조립 구분선 — 조립된 CEO 지침".to_string()
@@ -26536,11 +26536,18 @@ fn ceo_vendor_overwrite_rejection(
 /// 같은 술어: javis_preflight `Preflight._c03_ceo_promoted`(파이썬 정본) · javis_org · cys-dept `ceo_py promoted` ·
 /// 앱 `ceo_promoted` — `cysjavis-pack/bin/tests/fixtures/ceo-promoted-cases.json` 한 벌이 전부를 같은 답으로 묶는다.
 /// T2f 병합 뒤에는 `cys::pack::ceo_promoted_in`(갱신 규칙 가드 4) 자체가 이 술어가 되고(CCR-2) 이 함수는 그것만 부른다.
+///
+/// ★RULINGS CG2: `.pre-ceo` 의 실재는 사전적이다(항목이 있다 — 끊긴 링크·읽을 수 없는 파일·폴더도 '있다', 지키는 방향) —
+/// `symlink_metadata` 가 그것이다(`exists()` 는 링크를 따라가 끊긴 링크를 '없다'고 본다).
 fn ceo_directive_promoted(pack_dir: &std::path::Path) -> bool {
-    cys::pack::ceo_promoted_in(pack_dir)
+    ceo_pre_ceo_present(pack_dir)
         || std::fs::read(pack_dir.join(MASTER_DIRECTIVE_REL))
             .map(|b| ceo_has_separator(&b))
             .unwrap_or(false)
+}
+
+fn ceo_pre_ceo_present(pack_dir: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(pack_dir.join(format!("{MASTER_DIRECTIVE_REL}.pre-ceo"))).is_ok()
 }
 
 /// 생성기(`scripts/gen_ceo_template.py` SEPARATOR)의 조립 구분선 — LF 또는 CRLF 철자.
@@ -29693,6 +29700,7 @@ mod tests {
         let cases = fx["cases"].as_array().unwrap();
         assert!(cases.len() >= 10, "픽스처가 비었다");
         let rel = MASTER_DIRECTIVE_REL;
+        let mut ran = 0;
         for (i, c) in cases.iter().enumerate() {
             let td =
                 std::env::temp_dir().join(format!("cys-cb1-fixture-{}-{i}", std::process::id()));
@@ -29701,8 +29709,26 @@ mod tests {
             if let Some(md) = c["md"].as_str() {
                 std::fs::write(td.join(rel), md).unwrap();
             }
-            if c["pre_ceo"].as_bool().unwrap() {
-                std::fs::write(td.join(format!("{rel}.pre-ceo")), "백업\n").unwrap();
+            // ★CG2: 실제 항목을 만든다 — 파일 · 끊긴 링크 · 폴더 · 읽을 수 없는 파일(링크·권한 행은 POSIX 전용).
+            let pre = td.join(format!("{rel}.pre-ceo"));
+            match c["pre_ceo"].as_str() {
+                None => {}
+                Some("file") => std::fs::write(&pre, "백업\n").unwrap(),
+                Some("directory") => std::fs::create_dir(&pre).unwrap(),
+                #[cfg(unix)]
+                Some("dangling-link") => {
+                    std::os::unix::fs::symlink(td.join("nowhere"), &pre).unwrap()
+                }
+                #[cfg(unix)]
+                Some("unreadable") => {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::write(&pre, "백업\n").unwrap();
+                    std::fs::set_permissions(&pre, std::fs::Permissions::from_mode(0o000)).unwrap();
+                }
+                Some(_) => {
+                    let _ = std::fs::remove_dir_all(&td);
+                    continue; // 이 플랫폼에서 만들 수 없는 항목
+                }
             }
             let want = c["promoted"].as_bool().unwrap();
             let name = c["name"].as_str().unwrap();
@@ -29716,8 +29742,10 @@ mod tests {
                 want,
                 "A12 거부 ≠ 픽스처: {name}"
             );
+            ran += 1;
             let _ = std::fs::remove_dir_all(&td);
         }
+        assert!(ran >= 12, "픽스처 행을 거의 못 돌렸다: {ran}");
     }
 
     /// ★G3-축3 게이트 exit 계약 핀: 게이트 거부는 예약 exit({0,1,2,64} — clap 사용오류=2)과
