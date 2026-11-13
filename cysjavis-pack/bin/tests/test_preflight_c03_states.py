@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -52,6 +53,16 @@ def tmpl_body(kind="current"):
 
 def sha256(b):
     return hashlib.sha256(b).hexdigest()
+
+
+def released_template(tag):
+    """로컬 저장소 배포 태그의 CEO_TEMPLATE.md 바이트(`git show` — 네트워크 없음) | None(태그 없는 체크아웃)."""
+    repo = os.path.dirname(os.path.dirname(BIN))
+    if not shutil.which("git") or not os.path.exists(os.path.join(repo, ".git")):
+        return None
+    r = subprocess.run(["git", "-C", repo, "show", "%s:cysjavis-pack/directives/CEO_TEMPLATE.md" % tag],
+                       capture_output=True, timeout=60)
+    return r.stdout if r.returncode == 0 else None
 
 
 class Base(unittest.TestCase):
@@ -421,25 +432,76 @@ class ComposedMachine(Base):
 
     def test_separator_without_evidence_and_v014_promotions(self):
         """★CB2: 구분선 줄만 있고 승격 기록(영수증·0.14 영수증·.pre-ceo·CEO 머리말 표지)이 없다 → 건전성 축 WARN(cys-dept 가
-        승격도 강등도 하지 않는다). ★CB3: 영수증 없는 조립 형상 = 0.14.x 승격 — .pre-ceo 가 있으면 강등은 그것(PASS),
-        없으면 WARN(승격 전 본부 지침은 되살릴 수 없다)."""
+        승격도 강등도 하지 않는다). ★CG1: '0.14.x 승격'은 양성 증거(0.14 영수증 · 배포된 0.14.x 머리말)로만 — .pre-ceo 가
+        있으면 강등은 그것(PASS), 없으면 WARN(되살릴 수 없다), 본문으로 쓸 수 없는 백업이면 WARN. 증거가 머리말 표지·.pre-ceo
+        뿐인 구분선 지침은 조립이다(강등 = 구분선 뒤 · 영수증은 다음 확인이 다시 쓴다)."""
         never = master_body() + "붙여 넣은 문서 조각" + self.SEP + "사용자 줄\n"
         self.wf("CEO_TEMPLATE.md", self.compose(master_body()))
         self.wf("MASTER_DIRECTIVE.md", never)
         g = self.row(self.run_c03(), "C03.demote-guard")
         self.assertEqual(g["status"], WARN)
         self.assertIn("승격 기록", g["detail"])
-        # 0.14.x 승격(머리말 표지 있음 · 영수증 없음) + .pre-ceo.
+        # 머리말 표지 + .pre-ceo, 0.14 영수증 없음, 배포 표 밖 머리말 = 조립(CG1).
         self.wf("MASTER_DIRECTIVE.md", self.compose(master_body()))
         self.wf("MASTER_DIRECTIVE.md.pre-ceo", master_body() + "USERFIX\n")
+        g1 = self.row(self.run_c03(), "C03.demote-guard")
+        self.assertEqual(g1["status"], PASS)
+        self.assertIn("구분선 뒤 본문", g1["detail"])
+        self.assertIn("영수증 없음 — 다음 승격 확인 때 지금 지침을 그대로 두고 영수증을 다시 쓴다", g1["detail"])
+        self.assertNotIn("0.14.x 승격", g1["detail"])
+        # 0.14 영수증(양성 증거) → 0.14.x 승격 + .pre-ceo.
+        self.wf(".ceo-template-applied", sha256(b"v0.14 copy") + "\n")
         g2 = self.row(self.run_c03(), "C03.demote-guard")
         self.assertEqual(g2["status"], PASS)
         self.assertIn("0.14.x 승격", g2["detail"])
         self.assertIn(".pre-ceo", g2["detail"])
+        # 본문으로 쓸 수 없는 백업(CEO 지침 사본) → WARN(cys-dept 는 보류한다).
+        self.wf("MASTER_DIRECTIVE.md.pre-ceo", self.compose(master_body()))
+        g2b = self.row(self.run_c03(), "C03.demote-guard")
+        self.assertEqual(g2b["status"], WARN)
+        self.assertIn("본문으로 쓸 수 없다", g2b["detail"])
         os.remove(os.path.join(self.dirs, "MASTER_DIRECTIVE.md.pre-ceo"))
         g3 = self.row(self.run_c03(), "C03.demote-guard")
         self.assertEqual(g3["status"], WARN)
         self.assertIn("되살릴 수 없다", g3["detail"])
+
+    def test_unproven_stale_header_says_it_will_recompose(self):
+        """★CG1: 영수증이 없거나 손상됐고 머리말이 현행이 아니다 → 다음 승격 확인은 현행 머리말로 다시 조립한다(지금 지침은
+        사본으로 먼저 남는다) — '지금 지침을 그대로 둔다'고 말하지 않는다."""
+        body = master_body()
+        other = "\n".join(p for p, _ in CEO_PINS) + "\n사용자가 고친 옛 머리말 줄\n"
+        self.wf("CEO_TEMPLATE.md", self.compose(body))
+        self.wf("MASTER_DIRECTIVE.md", other + self.SEP + body)
+        self.wf("MASTER_DIRECTIVE.md.pre-ceo", body)
+        g = self.row(self.run_c03(), "C03.demote-guard")
+        self.assertEqual(g["status"], PASS)
+        self.assertIn("현행 머리말로 다시 조립", g["detail"])
+        self.assertNotIn("그대로 두고 영수증", g["detail"])
+        self.wf(".ceo-receipt.json", "{broken")
+        g2 = self.row(self.run_c03(), "C03.demote-guard")
+        self.assertEqual(g2["status"], WARN)
+        self.assertIn("현행 머리말로 다시 조립", g2["detail"])
+
+    def test_released_v014_copies_are_recognized_without_a_legacy_receipt(self):
+        """★CG1: 배포된 v0.14.x 틀(로컬 태그) — 0.14 영수증이 없어도 머리말 표(구분선 있는 틀)·전문 표(v0.14.0–6 처럼 표지
+        3핀이 없는 틀)가 0.14.x 승격을 증명한다. 태그가 없는 체크아웃은 건너뛴다."""
+        late, early = released_template("v0.14.56"), released_template("v0.14.6")
+        if late is None or early is None:
+            self.skipTest("배포 태그 v0.14.x 없음(얕은 클론·배포 팩)")
+        self.wf("CEO_TEMPLATE.md", self.compose(master_body()))
+        self.wf("MASTER_DIRECTIVE.md.pre-ceo", master_body() + "USERFIX\n")
+        with open(os.path.join(self.dirs, "MASTER_DIRECTIVE.md"), "wb") as f:
+            f.write(late)
+        g = self.row(self.run_c03(), "C03.demote-guard")
+        self.assertEqual(g["status"], PASS)
+        self.assertIn("0.14.x 승격", g["detail"])
+        with open(os.path.join(self.dirs, "MASTER_DIRECTIVE.md"), "wb") as f:
+            f.write(early)
+        res = self.run_c03()
+        r = self.row(res, "C03.pin.master")
+        self.assertNotIn("비정형", r["detail"], "표지 3핀 없는 v0.14.0–6 틀을 비정형으로 봤다")
+        self.assertIn("배포된 v0.14.x CEO 틀과 바이트 등가", r["detail"])
+        self.assertEqual(self.row(res, "C03.demote-guard")["status"], PASS)
 
     def test_backup_holding_a_composition_is_degenerate(self):
         """백업에 조립된 지침(구분선)이 들어갔다 = 퇴화(백업은 조립되지 않은 MASTER 여야 한다)."""
@@ -605,6 +667,33 @@ class BootContractDelivery(Base):
         for phrase in ("본문(구분선 뒤)", "합친다", "MASTER_DIRECTIVE.md.new", "A12"):
             self.assertIn(phrase, r2["detail"])
         self.assertNotIn("무수정본이면", r2["detail"])
+
+    def test_v014_and_leftover_backup_texts(self):
+        """★CG1·CG2: 0.14.x 증거가 있는 조립 형상 → '.pre-ceo 를 본문으로 조립' · 평범한 MASTER + 남은 .pre-ceo(비정형) →
+        '지금 지침을 본문으로 조립(.pre-ceo 는 쓰지 않는다)' — 둘 다 take-new 처방 없음."""
+        sep = "\n---\n\n# [본문 — 표준 MASTER 운영 계약 전문]\n\n"
+        tmpl = tmpl_body()
+        self.wf("CEO_TEMPLATE.md", tmpl)
+        self.wf("MASTER_DIRECTIVE.md", tmpl + sep + master_body())
+        self.wf("MASTER_DIRECTIVE.md.pre-ceo", master_body() + "USERFIX\n")
+        self.wf(".ceo-template-applied", sha256(b"v0.14 copy") + "\n")
+        r = self.row(self.run_c03(), "C03.boot-contract")
+        self.assertEqual(r["status"], WARN)
+        self.assertIn("조립 이전(0.14.x 통째 복사)", r["detail"])
+        self.assertIn("승격 전 본부 지침(.pre-ceo", r["detail"])
+        self.assertNotIn("본문(구분선 뒤)이 사용자 본부 지침", r["detail"])
+        os.remove(os.path.join(self.dirs, "MASTER_DIRECTIVE.md.pre-ceo"))
+        r1 = self.row(self.run_c03(), "C03.boot-contract")
+        self.assertIn("구분선 뒤 본문(승격 전 본부 지침 백업 .pre-ceo 가 없다)", r1["detail"])
+        os.remove(os.path.join(self.dirs, ".ceo-template-applied"))
+        self.wf("MASTER_DIRECTIVE.md", master_body())
+        self.wf("MASTER_DIRECTIVE.md.pre-ceo", master_body() + "다른 옛 MASTER\n")
+        r2 = self.row(self.run_c03(), "C03.boot-contract")
+        self.assertEqual(r2["status"], WARN)
+        self.assertIn("조립되지 않은 MASTER 인데 백업 .pre-ceo 가 남아 있다", r2["detail"])
+        self.assertIn(".pre-ceo 는 쓰지 않는다", r2["detail"])
+        for d in (r["detail"], r1["detail"], r2["detail"]):
+            self.assertNotIn("무수정본이면", d)
 
     def test_unreadable_is_not_a_pass(self):
         """판독 불가 = 판정 불가(WARN) — 측정 불능을 초록으로 접지 않는다."""
