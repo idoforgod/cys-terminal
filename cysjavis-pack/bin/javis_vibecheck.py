@@ -147,7 +147,7 @@ class Findings:
         code = self.exit_code()
         verdict = {EXIT_PASS: "pass", EXIT_SOFT: "soft", EXIT_HARD: "hard-fail"}[code]
         # §C5: advisory 지위 — done 판정권 없음(javis_task evidence 공급자).
-        advisory = ("advisory: javis_task evidence 공급자(독자 done 게이트 아님) — "
+        advisory = ("advisory: javis_task 에 증거를 대는 도구(독자 done 게이트 아님) — "
                     "done 판정권은 javis_task에 있음")
         if as_json:
             print(json.dumps({"subcommand": subcmd, "verdict": verdict, "exit": code,
