@@ -385,7 +385,7 @@ pub(crate) fn handle(
         ));
     }
     let caller = caller_of(daemon, caller_sid, owner_grade, caller_pid);
-    let classify = production_classify;
+    let classify = |rel: &str| production_classify(rel, &cys::pack::pack_dir());
     let check = production_check;
     let ctx = Ctx {
         root: production_root(daemon),
@@ -796,21 +796,35 @@ fn live_seats(daemon: &Daemon) -> Vec<(u64, String)> {
     out
 }
 
-/// Classification of one target from the two compiled lists (C4 · T5a · RULINGS AI6 / AN1 / AP4):
-/// the protection list FIRST — a file in it is 보호장치 관련, also when it is boot-critical too
-/// (the stricter class) — then the boot-critical list → 기동 필수, else 일반. A path that matches a
-/// row only when case (or the spelling of the separators) is ignored is refused, naming the row's
-/// spelling: the check kind and the timeout are looked up by the exact spelling. Either list
-/// unavailable, or a path that cannot be decided → an error: `begin` refuses (a boot-critical or
-/// protection file is never repaired as a general one). Rule documents are T4's gate.
-fn production_classify(rel: &str) -> Result<cys::repair::types::Classification, RepairError> {
+/// Classification of one target from the two compiled lists (C4 · T5a · RULINGS AI6 / AN1 / AP4 /
+/// BN1 / BN2): the protection list FIRST — a file in it is 보호장치 관련, also when it is
+/// boot-critical too (the stricter class) — then the boot-critical list → 기동 필수, else 일반. A
+/// path that matches a row only under the full case fold (ASCII case, U+212A, U+017F, … — BN1) or
+/// another spelling of the separators is refused, naming the row's spelling: the check kind and
+/// the timeout are looked up by the exact spelling; this holds whether or not the file exists.
+/// The target is classified as `<pack_root>/<rel>` — the pack root of the lane the request is
+/// served for (`cys::pack::pack_dir()`, the value the verb's `Ctx::pack_dir` holds) — never as a
+/// relative path resolved against the daemon's working directory (BN2). Either list unavailable,
+/// no absolute pack root, or a path that cannot be decided → an error: `begin` refuses (a
+/// boot-critical or protection file is never repaired as a general one). Rule documents are T4's
+/// gate.
+fn production_classify(
+    rel: &str,
+    pack_root: &Path,
+) -> Result<cys::repair::types::Classification, RepairError> {
     use cys::repair::boot_critical::{
-        boot_critical_entry, classify_path, entries, protection_entries, protection_entry, Decision,
+        boot_critical_entry, classify_with, entries, pack_roots, protection_entries,
+        protection_entry, Decision,
     };
     use cys::repair::types::Classification;
     if protection_entries().is_empty() || entries().is_empty() {
         return Err(RepairError::Precondition(format!(
             "{rel}: 컴파일된 기동 필수 · 보호장치 목록을 읽을 수 없어 시작하지 않습니다"
+        )));
+    }
+    if !pack_root.is_absolute() {
+        return Err(RepairError::Precondition(format!(
+            "{rel}: 이 레인의 팩 위치를 알 수 없어 보호장치 · 기동 필수 여부를 가리지 못합니다 — 시작하지 않습니다"
         )));
     }
     let exact = |spelled: &str, row: &str| -> Result<(), RepairError> {
@@ -826,7 +840,13 @@ fn production_classify(rel: &str) -> Result<cys::repair::types::Classification, 
         exact(rel, e.rel)?;
         return Ok(Classification::ProtectionRelated);
     }
-    let a = classify_path(Path::new(rel));
+    // RULINGS BN2: the lane's pack root joined with the rel (absolute — no working directory on
+    // this path); every lane root is a candidate as before, the request's own root included
+    let mut roots = pack_roots();
+    if !roots.iter().any(|r| r == pack_root) {
+        roots.push(pack_root.to_path_buf());
+    }
+    let a = classify_with(&pack_root.join(rel), None, &roots, cfg!(windows));
     if a.decision == Decision::Undecidable {
         return Err(RepairError::Precondition(format!(
             "{rel}: 보호장치 · 기동 필수 여부를 가릴 수 없어 시작하지 않습니다"
@@ -1324,9 +1344,10 @@ mod ledger_verbs {
         Ok((event.to_string(), script.to_string()))
     }
 
-    /// RULINGS V1 / AN1 / AP4 / AW6: only a non-lifeline (8.7), non-protection (D:941) hook — the
-    /// protection rows are the sibling list (AI6); lifeline and protection names compare ignoring
-    /// case, a name ending in a dot or a space or in a short-name form (`~<digit>`) is refused;
+    /// RULINGS V1 / AN1 / AP4 / AW6 / BN1: only a non-lifeline (8.7), non-protection (D:941) hook —
+    /// the protection rows are the sibling list (AI6); lifeline and protection names compare after
+    /// the full case fold, a name ending in a dot or a space or in a short-name form (`~<digit>`) is
+    /// refused;
     /// while either compiled list is not available a protection hook cannot be told apart →
     /// refused (fail closed).
     pub(super) fn hook_allowed(script: &str) -> Result<(), VerbError> {
@@ -1354,10 +1375,10 @@ mod ledger_verbs {
                 format!("{script}: 짧은 이름(8.3) 형태의 훅 이름은 받지 않습니다 — 정확한 스크립트 이름으로 다시 하세요"),
             ));
         }
-        if LIFELINE_HOOKS
-            .iter()
-            .any(|l| l.eq_ignore_ascii_case(script))
-        {
+        // RULINGS BN1: lifeline names compare after the full case fold (the protection lookup
+        // below folds the same way through `rel_key`)
+        let fold = cys::repair::boot_critical::fold_name;
+        if LIFELINE_HOOKS.iter().any(|l| fold(l) == fold(script)) {
             return Err(VerbError::new(
                 cys::repair::types::ERR_PRECONDITION,
                 format!("{script}: 생명줄 훅의 등록은 수리로 해제할 수 없습니다"),
@@ -4102,7 +4123,7 @@ pub(crate) fn release_locks_for_seat(daemon: &Arc<Daemon>, sid: u64) {
         &daemon.incarnation,
         sid,
     );
-    let classify = production_classify;
+    let classify = |rel: &str| production_classify(rel, &cys::pack::pack_dir());
     let check = production_check;
     let ctx = Ctx {
         root: production_root(daemon),

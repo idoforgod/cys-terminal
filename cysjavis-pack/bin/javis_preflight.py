@@ -1194,26 +1194,32 @@ def _hermetic_test():
     """시험 전용 스위치(0.15.0 · T5a · RULINGS AN4 · AP1) — 실제 설치에서는 **켤 수 없다**.
 
     참은 다음이 **전부** 성립할 때뿐이다: `CYS_PREFLIGHT_HERMETIC_TEST=1` · Windows 가 아니다 ·
-    `CYS_TEST_ISOLATED_HOME` 이 현재 HOME 으로 풀린다 · 그 HOME 이 **계정의 홈이 아니다**
-    (비밀번호 데이터베이스 `pwd.getpwuid(os.getuid()).pw_dir` 를 풀어 비교 — 환경변수로 속일 수 없다).
-    하나라도 없거나 판정 중 오류가 나면 거짓(검사는 제품 그대로 돈다). 켜지면 이 기계의 절대 경로에
-    손대지 않는다: C65 는 기계 고정 cys 후보(/Applications · /opt/homebrew)를 보지 않고, C11b 는 HOME
-    밖의 링크를 정리 후보로 삼지 않으며, C20 은 인터프리터 pip 설치(`python -m pip install`)를 하지 않는다."""
+    root(uid 0 · euid 0)가 아니다 · `CYS_TEST_ISOLATED_HOME` 이 현재 HOME 과 **같은 디렉터리**다 · 그 HOME 이
+    **계정의 홈이 아니다**(비밀번호 데이터베이스 `pwd.getpwuid(os.getuid()).pw_dir` 와 비교 — 환경변수로
+    속일 수 없다). 같은지는 `os.path.samefile` 로 잰다(RULINGS BN3 (a) — 경로 문자열 비교는 대소문자만 다른
+    표기 `/users/x` 를 다른 곳으로 본다). 하나라도 없거나 판정 중 오류가 나면 거짓(검사는 제품 그대로
+    돈다). root 거부는 `sudo -E`(uid 0 · 계정의 HOME 유지 — root 의 pw_dir 은 /var/root)를 막는다.
+    켜지면 이 기계의 절대 경로에 손대지 않는다: C65 는 기계 고정 cys 후보(/Applications · /opt/homebrew)를
+    보지 않고, C11b 는 HOME 밖의 링크를 정리 후보로 삼지 않으며, C20 은 인터프리터 pip 설치
+    (`python -m pip install`)를 하지 않는다."""
     try:
         if os.environ.get("CYS_PREFLIGHT_HERMETIC_TEST") != "1":
             return False
         if os.name == "nt" or sys.platform.startswith("win"):
             return False
+        if os.getuid() == 0 or os.geteuid() == 0:
+            return False
         mark = os.environ.get("CYS_TEST_ISOLATED_HOME", "")
         if not mark:
             return False
-        home = os.path.realpath(os.path.expanduser("~"))
-        if os.path.realpath(mark) != home:
+        home = os.path.expanduser("~")
+        if not os.path.samefile(mark, home):
             return False
         import pwd
-        account_home = os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir)
-        return bool(account_home) and account_home != home
-    except Exception:                    # noqa: BLE001 — 판정 불능은 '꺼짐'이다
+        account_home = pwd.getpwuid(os.getuid()).pw_dir
+        # an account home that does not exist cannot be this (existing) HOME
+        return not (os.path.exists(account_home) and os.path.samefile(account_home, home))
+    except Exception:                    # noqa: BLE001 — 판정 불능(없는 경로 포함)은 '꺼짐'이다
         return False
 
 

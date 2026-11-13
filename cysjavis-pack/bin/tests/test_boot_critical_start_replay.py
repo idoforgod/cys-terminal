@@ -21,7 +21,7 @@
   ⑤ 밀폐(AN4): 실행 뒤 스텁 호출 기록에 기계의 절대 경로 `cys` 가 없고, 격리 HOME 의 산출물 어디에도
      기계의 `cys` 위치가 적히지 않았으며, 호출자의 실제 `~/.local/bin` 목록이 그대로다.
 목록의 출처: `src/repair/boot_critical.rs` 의 `PINNED`(산출 목록의 고정 입력) · 뺀 후보는
-`src/repair/boot_critical_derive.rs` 의 `DROPPED_CANDIDATES`. 빌드된 `cys` 가 있으면 그 `--list --json` 과도 대조한다.
+`src/repair/boot_critical_derive.rs` 의 `DROPPED_CANDIDATES` 와 `BY_CONSTRUCTION_DROPS`(RULINGS BM2). 빌드된 `cys` 가 있으면 그 `--list --json` 과도 대조한다.
 preflight 의 시험 전용 스위치(AN4): `CYS_PREFLIGHT_HERMETIC_TEST=1` — 격리 HOME 표식 `CYS_TEST_ISOLATED_HOME`
 이 실제 HOME 과 같을 때만 듣는다(C65 기계 고정 cys 후보 · C11b HOME 밖 링크 정리 · C20 인터프리터 pip 설치 생략).
 격리 HOME 은 임시 디렉터리 밖(`$CARGO_TARGET_DIR` 아래)에 둔다 — preflight 는 임시 팩에서는 훅을 등록하지 않는다.
@@ -105,11 +105,18 @@ def pinned_rows():
 
 
 def dropped_rows():
-    """`DROPPED_CANDIDATES`(측정으로 뺀 후보) → [rel]."""
+    """`DROPPED_CANDIDATES`(측정·선택적 import 기록으로 뺀 후보) + `BY_CONSTRUCTION_DROPS`(RULINGS BM2 —
+    훅이 출력·종료코드를 버리는 실행만 있는 파일) → [rel]. 두 표 모두 부트 층 기록('부트가 읽지 않는다' 등)을
+    이 시험이 트립와이어·망가뜨림으로 잰다."""
     text = DERIVE_RS.read_text(encoding="utf-8")
     at = text.index("pub const DROPPED_CANDIDATES: &[(&str, &str)] = &[")
     block = text[at:text.index("\n];", at)]
-    return re.findall(r'^\s*\(\s*"([^"]+)",', block, re.M)
+    rows = re.findall(r'^\s*\(\s*"([^"]+)",', block, re.M)
+    at = text.index("pub const BY_CONSTRUCTION_DROPS: &[(&str, &str)] = &[")
+    block = text[at:text.index("];", at)]
+    by_construction = re.findall(r'\(\s*"([A-Za-z0-9_./-]+)",', block)
+    assert by_construction, "BY_CONSTRUCTION_DROPS 표를 읽지 못했다(파서가 표 형식과 어긋난다)"
+    return rows + by_construction
 
 
 def copy_pack(dst):
@@ -633,6 +640,34 @@ class HermeticSwitch(unittest.TestCase):
             self.assertFalse(self.pf._hermetic_test())
         with self.mock.patch("pwd.getpwuid", side_effect=KeyError("no such uid")):
             self.assertFalse(self.pf._hermetic_test())
+
+    def test_a_case_variant_home_of_the_account_is_refused(self):
+        """RULINGS BN3 (a): 계정의 홈을 대소문자만 바꿔 적은 HOME 도 계정의 홈이다(samefile 비교)."""
+        variant = str(self.home).upper()
+        if not os.path.isdir(variant):
+            self.skipTest("대소문자를 가리는 볼륨 — 대소문자 변형이 같은 디렉터리가 아니다")
+        os.environ["HOME"] = variant
+        self.switch(on=True, mark=variant)
+        with self.account(self.home):
+            self.assertFalse(self.pf._hermetic_test())
+        # 표식만 대소문자 변형이고 HOME 은 계정의 홈이 아니면: 같은 디렉터리이므로 켜진다
+        os.environ["HOME"] = str(self.home)
+        self.switch(on=True, mark=variant)
+        with self.account(self.tmp / "account"):
+            self.assertTrue(self.pf._hermetic_test())
+
+    def test_uid_0_keeping_the_account_home_is_refused(self):
+        """RULINGS BN3 (a): `sudo -E` — uid 0 이 계정의 HOME 을 그대로 쓴다(root 의 pw_dir 은 다른 곳)."""
+        self.switch(on=True)
+        root_home = self.tmp / "var-root"
+        root_home.mkdir()
+        with self.account(root_home), self.mock.patch("os.getuid", return_value=0), \
+                self.mock.patch("os.geteuid", return_value=0):
+            self.assertFalse(self.pf._hermetic_test())
+        with self.account(root_home), self.mock.patch("os.geteuid", return_value=0):
+            self.assertFalse(self.pf._hermetic_test())
+        with self.account(root_home):            # 같은 조건, root 가 아니면 켜진다(대조군)
+            self.assertTrue(self.pf._hermetic_test())
 
 
 if __name__ == "__main__":

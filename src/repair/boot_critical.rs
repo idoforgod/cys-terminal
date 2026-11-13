@@ -72,8 +72,9 @@ pub fn protection_entries() -> &'static [Entry] {
 /// RULINGS AU1 — per protection TEST, the files it reads: `G` (external sends / permanent
 /// deletions) = `hooks/guard.sh` and everything it sources, launches or imports, transitively;
 /// `R` (reviewer writes) and `C` (CSO writes) = `hooks/role-capability-gate.sh` and its closure;
-/// `I2` (the capgate-deny set) = the two hook-target tables. Generated beside the protection list
-/// (sorted by test id, files sorted); every file is a protection or a boot-critical row (AT5).
+/// `I3` (registration) = the files the registrar's decision path (C28) reads or calls. Exactly
+/// G, R, C, I3 (RULINGS BM5 — I2 withdrawn). Generated beside the protection list (sorted by test
+/// id, files sorted); every file is a protection or a boot-critical row (AT5), or a rule document.
 pub fn protection_inputs() -> &'static [(&'static str, &'static [&'static str])] {
     GENERATED_PROTECTION_INPUTS
 }
@@ -101,15 +102,25 @@ pub fn provenance(entry: &Entry) -> Option<&'static str> {
         .and_then(|i| GENERATED_PROTECTION_WHY.get(i).copied())
 }
 
-/// A pack-relative rel in comparison form: `/` separators, no leading `./`, ASCII case folded
-/// (APFS and NTFS are case-insensitive by default; folding can only make the answer "yes" for a
-/// spelling that names a listed file on such a volume — the conservative direction).
+/// RULINGS BN1 — the FULL case fold of a name: the std Unicode upper-then-lower mapping (U+212A
+/// KELVIN SIGN → `k`, U+017F LATIN SMALL LETTER LONG S → `s`, U+00DF → `ss`), the fold BJ3 gave the
+/// key file. LOCAL COPY, one line, of track T3c's `repair::types::fold_name` (not in this base yet):
+/// at T5a's final rebase this calls T3c's function and the copy is removed (one implementation).
+pub fn fold_name(s: &str) -> String {
+    s.to_uppercase().to_lowercase()
+}
+
+/// A pack-relative rel in comparison form: `/` separators, no leading `./`, FULLY case folded
+/// ([`fold_name`] — RULINGS BN1; APFS and NTFS are case-insensitive by default, and APFS also
+/// opens `hoo<U+212A>s/guard.sh` as `hooks/guard.sh`; folding can only make the answer "yes" for a
+/// spelling that names a listed file on such a volume — the conservative direction). It does not
+/// depend on the file existing.
 fn rel_key(rel: &str) -> String {
     let mut r = rel.replace('\\', "/");
     while let Some(t) = r.strip_prefix("./") {
         r = t.to_string();
     }
-    r.trim_start_matches('/').to_ascii_lowercase()
+    fold_name(r.trim_start_matches('/'))
 }
 
 /// The boot-critical row of a pack-relative rel (from [`entries`]).
@@ -355,20 +366,29 @@ pub fn classify_with(
         }
         root_forms.push((l, r));
     }
-    // the longest root that is a whole-component prefix of a candidate
+    // the longest root that is a whole-component prefix of a candidate — components compared
+    // after the full case fold (RULINGS BN1: a fold may change a component's byte length, so the
+    // match is per component); the rel keeps the candidate's own spelling
     let mut best: Option<(usize, String, &PathBuf)> = None;
     for c in &cands {
-        let cl = c.to_ascii_lowercase();
+        let c_parts: Vec<&str> = c.split('/').collect();
         for (rf, r) in &root_forms {
-            let rl = rf.trim_end_matches('/').to_ascii_lowercase();
-            if rl.is_empty() || cl.len() <= rl.len() + 1 {
+            let rt = rf.trim_end_matches('/');
+            if rt.is_empty() {
                 continue;
             }
-            if cl.starts_with(&rl) && cl.as_bytes()[rl.len()] == b'/' {
-                let rel = c[rl.len() + 1..].to_string();
-                if best.as_ref().is_none_or(|(n, _, _)| rl.len() > *n) {
-                    best = Some((rl.len(), rel, r));
-                }
+            let r_parts: Vec<&str> = rt.split('/').collect();
+            if c_parts.len() <= r_parts.len()
+                || !r_parts
+                    .iter()
+                    .zip(&c_parts)
+                    .all(|(a, b)| fold_name(a) == fold_name(b))
+            {
+                continue;
+            }
+            let rel = c_parts[r_parts.len()..].join("/");
+            if !rel.is_empty() && best.as_ref().is_none_or(|(n, _, _)| r_parts.len() > *n) {
+                best = Some((r_parts.len(), rel, r));
             }
         }
     }
@@ -732,14 +752,6 @@ mod tests {
             false,
         ),
         (
-            "bin/javis_memory.py",
-            C::HookDep,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
             "bin/javis_mission.py",
             C::HookDep,
             K::PyCompile,
@@ -764,40 +776,8 @@ mod tests {
             false,
         ),
         (
-            "bin/javis_reflect.py",
-            C::HookDep,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
             "bin/javis_resource_gate.py",
             C::StartDep,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
-            "bin/javis_role.py",
-            C::HookDep,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
-            "bin/javis_route.py",
-            C::HookDep,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
-            "bin/javis_scrub.py",
-            C::HookDep,
             K::PyCompile,
             "",
             None,
@@ -828,33 +808,9 @@ mod tests {
             false,
         ),
         (
-            "bin/javis_task.py",
-            C::HookDep,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
             "bin/javis_teamtoken.py",
             C::HookDep,
             K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
-            "bin/javis_wakeup.py",
-            C::HookDep,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
-            "bin/skillscan_rules.json",
-            C::HookDep,
-            K::JsonParse,
             "",
             None,
             false,
@@ -1575,10 +1531,6 @@ mod tests {
                 ("C", vec!["hooks/_lib.sh", "hooks/role-capability-gate.sh"]),
                 ("G", vec!["hooks/_lib.sh", "hooks/guard.sh"]),
                 (
-                    "I2",
-                    vec!["state/hook-targets.json", "state/hook-targets.json.example"]
-                ),
-                (
                     "I3",
                     vec![
                         "bin/javis_guard_register.py",
@@ -1805,6 +1757,70 @@ mod tests {
             Decision::Undecidable
         );
         let _ = std::fs::remove_dir_all(&t);
+    }
+
+    /// RULINGS BN1 — every list lookup compares after the FULL case fold: U+212A (Kelvin sign)
+    /// and U+017F (long s) spellings of a row find the row (also for the path-rule row
+    /// `state/hook-targets.json`, which no file needs to back), the fold is the upper-then-lower
+    /// mapping, and a lane root spelled with such a code point still contains its files. A
+    /// non-ASCII name that folds to no row stays off both lists.
+    #[test]
+    fn lookups_use_the_full_case_fold() {
+        assert_eq!(fold_name("hoo\u{212A}s"), "hooks");
+        assert_eq!(fold_name("guard.\u{17F}h"), "guard.sh");
+        assert_eq!(fold_name("Stra\u{DF}e"), "strasse");
+        let variants = |row: &str| -> Vec<String> {
+            let mut v = Vec::new();
+            for (from, to) in [('k', '\u{212A}'), ('s', '\u{17F}')] {
+                if let Some(i) = row.find(from) {
+                    v.push(format!("{}{to}{}", &row[..i], &row[i + 1..]));
+                }
+            }
+            v
+        };
+        let bc = "hooks/inject-context.sh";
+        assert_eq!(variants(bc).len(), 2);
+        for v in variants(bc) {
+            assert_eq!(boot_critical_entry(&v).map(|e| e.rel), Some(bc), "{v}");
+        }
+        for row in protection_entries() {
+            let vs = variants(row.rel);
+            assert!(!vs.is_empty(), "{} has neither k nor s", row.rel);
+            for v in vs {
+                assert_eq!(protection_entry(&v).map(|e| e.rel), Some(row.rel), "{v}");
+            }
+        }
+        assert_eq!(
+            protection_entry("\u{17F}tate/hoo\u{212A}-targets.json").map(|e| e.rel),
+            Some("state/hook-targets.json")
+        );
+        for other in [
+            "bin/caf\u{E9}.py",
+            "bin/javi\u{17F}_phoenix.py",
+            "\u{212A}.sh",
+        ] {
+            assert!(boot_critical_entry(other).is_none(), "{other}");
+            assert!(protection_entry(other).is_none(), "{other}");
+        }
+        // a lane root spelled with U+212A still contains its files (component-wise fold); the rel
+        // keeps the path's own spelling
+        let roots = vec![PathBuf::from("/x/.cys/pack")];
+        let a = classify_with(
+            Path::new("/x/.cys/pac\u{212A}/hoo\u{212A}s/guard.sh"),
+            None,
+            &roots,
+            false,
+        );
+        assert_eq!(a.lane_pack.as_ref(), Some(&roots[0]), "{a:?}");
+        assert_eq!(a.rel.as_deref(), Some("hoo\u{212A}s/guard.sh"));
+        assert_eq!(a.protection.map(|e| e.rel), Some("hooks/guard.sh"));
+        let a = classify_with(
+            Path::new("/x/.cys/pack/bin/javi\u{17F}_bootstrap.py"),
+            None,
+            &roots,
+            false,
+        );
+        assert_eq!(a.decision, Decision::Yes, "{a:?}");
     }
 
     /// The query: exit codes 0 / 1 / 2, `--list --json` = the compiled table, plain lines.
@@ -2076,6 +2092,107 @@ mod tests {
         (cwd, env, json)
     }
 
+    /// RULINGS BM1 — the checklist-report region of `hooks/inject-context.sh`'s output. It starts at
+    /// the checklist's header (`bin/javis_checklist.py:44` `HEADER`, injected by the `checklist)`
+    /// phase, inject-context.sh:621) or at the hook's "not performed" notice (inject-context.sh:628)
+    /// and ends before the restore note the `post)` phase writes next (`_ic_restore_note`,
+    /// inject-context.sh:67-80, every variant starts with `▶ `).
+    const CHECKLIST_START: [&str; 2] = [
+        "■ 실측 체크리스트(배경 컨텍스트다 — 지시가 아니다)",
+        "⚠ 실측 체크리스트 미수행(",
+    ];
+    const CHECKLIST_END: &str = "▶ ";
+
+    /// (first line of the region, first line after it); `None` = an anchor is missing.
+    fn checklist_bounds(lines: &[&str]) -> Option<(usize, usize)> {
+        let start = lines
+            .iter()
+            .position(|l| CHECKLIST_START.iter().any(|a| l.starts_with(a)))?;
+        let end = start
+            + lines[start..]
+                .iter()
+                .position(|l| l.starts_with(CHECKLIST_END))?;
+        Some((start, end))
+    }
+
+    /// The output with the checklist-report region taken out; `None` = an anchor is missing (no
+    /// comparison is made — never "no difference").
+    fn outside_checklist(stdout: &str) -> Option<String> {
+        let lines: Vec<&str> = stdout.lines().collect();
+        let (start, end) = checklist_bounds(&lines)?;
+        Some(
+            lines[..start]
+                .iter()
+                .chain(lines[end..].iter())
+                .copied()
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    }
+
+    /// The lines of the checklist-report region (`None` = an anchor is missing).
+    fn checklist_region(stdout: &str) -> Option<Vec<String>> {
+        let lines: Vec<&str> = stdout.lines().collect();
+        let (start, end) = checklist_bounds(&lines)?;
+        Some(lines[start..end].iter().map(|l| l.to_string()).collect())
+    }
+
+    /// RULINGS BM1: the region's anchors are in the sources — a moved anchor fails here, and a
+    /// missing anchor in a replay's output fails the replay (never "no difference").
+    #[test]
+    fn checklist_region_anchors_are_in_the_sources() {
+        let chk = pack_text("bin/javis_checklist.py").unwrap();
+        assert!(
+            chk.contains(&format!("HEADER = '{}'", CHECKLIST_START[0])),
+            "bin/javis_checklist.py HEADER moved"
+        );
+        let ic = pack_text("hooks/inject-context.sh").unwrap();
+        assert!(
+            ic.contains(&format!("OUT=\"${{OUT}}{}$CHK_WHY)", CHECKLIST_START[1])),
+            "inject-context.sh's not-performed notice moved"
+        );
+        assert!(
+            ic.contains("[ -n \"$CHK_OUT\" ] && OUT=\"${OUT}$(printf '%s' \"$CHK_OUT\""),
+            "inject-context.sh's checklist injection moved"
+        );
+        // every restore-note variant starts with the end anchor, and the post phase writes it
+        let notes: Vec<&str> = ic
+            .lines()
+            .filter(|l| l.contains("OUT=\"${OUT}▶ ") && l.contains("(source="))
+            .collect();
+        assert!(notes.len() >= 6, "restore-note variants moved: {notes:?}");
+        let post = ic
+            .split("\npost)\n")
+            .nth(1)
+            .expect("inject-context.sh post) phase");
+        assert!(
+            post.trim_start()
+                .lines()
+                .find(|l| !l.starts_with('#'))
+                .is_some_and(|l| l.trim() == "_ic_restore_note"),
+            "the post phase no longer starts with the restore note"
+        );
+        let healthy = format!(
+            "a\n{}\npreflight: exit 0\n\n▶ 복원 모드(source=startup): y\nz",
+            CHECKLIST_START[0]
+        );
+        assert_eq!(
+            outside_checklist(&healthy).as_deref(),
+            Some("a\n▶ 복원 모드(source=startup): y\nz")
+        );
+        assert_eq!(
+            checklist_region(&healthy).map(|r| r.len()),
+            Some(3),
+            "header, one line, the blank line"
+        );
+        assert_eq!(outside_checklist("a\nb"), None, "no start anchor");
+        assert_eq!(
+            outside_checklist(&format!("a\n{}\nb", CHECKLIST_START[1])),
+            None,
+            "no end anchor"
+        );
+    }
+
     /// The recorded inputs of RULINGS AN3: (name, hook, the files it is meant to reach, setup).
     #[cfg(target_os = "macos")]
     const RECIPES: &[(&str, &str, &[&str], Setup)] = &[
@@ -2104,6 +2221,10 @@ mod tests {
                 "hooks/inject_gate.py",
                 "bin/javis_skillscan.py",
                 "bin/skillscan_rules.json",
+                "bin/javis_memory.py",
+                "bin/javis_route.py",
+                "bin/javis_scrub.py",
+                "bin/javis_wakeup.py",
             ],
             recipe_state_poison,
         ),
@@ -2346,7 +2467,13 @@ mod tests {
         let hook_rels: BTreeSet<&str> = hooks.iter().map(|e| e.rel).collect();
         let hook_of = |rel: &str| -> &Entry { *hooks.iter().find(|h| h.rel == rel).unwrap() };
         let listed: BTreeSet<&str> = entries().iter().map(|e| e.rel).collect();
-        let dropped: BTreeSet<&str> = derive::DROPPED_CANDIDATES.iter().map(|(r, _)| *r).collect();
+        // RULINGS BM2 / BM3: the dropped candidates of both kinds (measured / optional-import records
+        // and by-construction drops) are tripwired and measured alike
+        let dropped: BTreeSet<&str> = derive::DROPPED_CANDIDATES
+            .iter()
+            .chain(derive::BY_CONSTRUCTION_DROPS.iter())
+            .map(|(r, _)| *r)
+            .collect();
         let deps: Vec<&str> = entries()
             .iter()
             .filter(|e| e.category != C::Protection && !hook_rels.contains(e.rel))
@@ -2372,11 +2499,36 @@ mod tests {
         }
         // the AN3 recipes, healthy twice
         let mut recipe_healthy: Vec<(Run, bool)> = Vec::new();
+        // RULINGS BM1 — for inject-context.sh: is the output OUTSIDE the checklist region the same in
+        // the two healthy runs (`None` = not inject-context.sh)
+        let mut recipe_outside_det: Vec<Option<bool>> = Vec::new();
         for (name, hook, _reach, setup) in RECIPES {
             let h = hook_of(hook);
             let a = run(hook, &first_event(h), h.timeout_s, Some(*setup));
             let b = run(hook, &first_event(h), h.timeout_s, Some(*setup));
             let det = a.stdout == b.stdout;
+            if *hook == "hooks/inject-context.sh" {
+                let lines: Vec<&str> = a.stdout.lines().collect();
+                match (outside_checklist(&a.stdout), outside_checklist(&b.stdout)) {
+                    (Some(x), Some(y)) => {
+                        matrix.push(format!(
+                            "healthy recipe {name}: checklist region = lines {:?} of {} · outside the region deterministic={}",
+                            checklist_bounds(&lines),
+                            lines.len(),
+                            x == y
+                        ));
+                        recipe_outside_det.push(Some(x == y));
+                    }
+                    _ => {
+                        problems.push(format!(
+                            "(1) healthy recipe {name} {hook}: a checklist-region anchor is missing (RULINGS BM1)"
+                        ));
+                        recipe_outside_det.push(Some(false));
+                    }
+                }
+            } else {
+                recipe_outside_det.push(None);
+            }
             matrix.push(format!(
                 "healthy recipe {name} {hook} exit={:?} deterministic_stdout={det} stdout_bytes={}",
                 a.code,
@@ -2456,6 +2608,17 @@ mod tests {
                 .filter(|i| recipe_reads[*i].contains(*d) || RECIPES[*i].2.contains(d))
                 .collect();
             if readers.is_empty() && recipe_readers.is_empty() {
+                // RULINGS BN3 (b): a MEASURED row (stage-5 flag false) that no replay reaches has
+                // lost its measurement — a failure, not "not exercised here"
+                if derive::MEASURED_HOOK_DEPS
+                    .iter()
+                    .any(|(r, _h, s5, _w)| r == d && !*s5)
+                {
+                    problems.push(format!(
+                        "(3) {d} is a measured row (stage-5 false) but no replay reaches it — its measurement is gone (RULINGS BN3 (b))"
+                    ));
+                    continue;
+                }
                 matrix.push(format!(
                     "not exercised here: {d} (proof anchor / stage-5 E2E)"
                 ));
@@ -2488,8 +2651,23 @@ mod tests {
                 let (base, det) = &recipe_healthy[i];
                 let changed = r.result_changed(base, *det);
                 changed_any |= changed;
+                // RULINGS BM1 (recorded for the report): for inject-context.sh, does the change lie
+                // outside the checklist-report region?
+                let outside = if hook == "hooks/inject-context.sh" {
+                    match (
+                        outside_checklist(&base.stdout),
+                        outside_checklist(&r.stdout),
+                    ) {
+                        (Some(a), Some(b)) => {
+                            format!(" · outside the checklist region same={}", a == b)
+                        }
+                        _ => " · a checklist-region anchor is missing".to_string(),
+                    }
+                } else {
+                    String::new()
+                };
                 matrix.push(format!(
-                    "break {d} -> recipe {name} {hook} changed={changed} (exit {:?}->{:?})",
+                    "break {d} -> recipe {name} {hook} changed={changed} (exit {:?}->{:?}){outside}",
                     base.code, r.code
                 ));
             }
@@ -2512,41 +2690,187 @@ mod tests {
             put(d, &original(d));
         }
 
-        // (3b) RULINGS AN3 — every candidate a recipe is meant to reach: unreachable → it must be
-        //      listed (a stage-5 item); its hook's result changes when it is broken → it must be
-        //      listed (class 1); the hook completes unchanged → a measured drop
-        for (i, (name, hook, reach, setup)) in RECIPES.iter().enumerate() {
+        // (3b) RULINGS AN3 — every candidate a recipe is meant to reach is reached; unreachable → it
+        //      must be listed (a stage-5 item)
+        for (i, (name, hook, reach, _setup)) in RECIPES.iter().enumerate() {
             for c in reach.iter() {
-                if listed.contains(c) {
-                    continue; // listed rows are measured by (3)
-                }
-                if !recipe_reads[i].contains(*c) {
+                if !listed.contains(c) && !recipe_reads[i].contains(*c) && tripwired(c).is_none() {
+                    // a data file holds no tripwire: what it changes is measured by (3c)
+                    matrix.push(format!(
+                        "AN3 {c} via recipe {name} {hook}: a data file — reach not observable by a tripwire (measured by (3c))"
+                    ));
+                } else if !listed.contains(c) && !recipe_reads[i].contains(*c) {
                     matrix.push(format!("AN3 {c} via recipe {name} {hook}: NOT REACHED"));
                     problems.push(format!(
                         "(3b) recipe {name} does not reach {c} — extend the input or list it as a stage-5 item (RULINGS AN3)"
                     ));
-                    continue;
-                }
-                put(c, broken(c));
-                let h = hook_of(hook);
-                let r = run(hook, &first_event(h), h.timeout_s, Some(*setup));
-                put(c, &original(c));
-                let (base, det) = &recipe_healthy[i];
-                let changed = r.result_changed(base, *det);
-                matrix.push(format!(
-                    "AN3 break {c} -> recipe {name} {hook} result_changed={changed} (exit {:?}->{:?}, stdout same={}, child error on stderr={})",
-                    base.code,
-                    r.code,
-                    r.stdout == base.stdout,
-                    r.stderr.contains("rror")
-                ));
-                if changed {
-                    problems.push(format!(
-                        "(3b) {c} broken changes the result of {hook} (recipe {name}) — it must be listed (class 1, RULINGS AN3)"
-                    ));
                 }
             }
         }
+
+        // (3c) RULINGS BM3 / BM1 / BM2 (iii) — the replay measurement comes FIRST for every dropped
+        //      candidate a replay reads (default inputs or a recipe), whatever its record says. In
+        //      both break modes — (i) it cannot run, (ii) it gives a failing answer (prints a line,
+        //      exits 1; a data file has no mode (ii)) — the hook keeps its exit code and its output.
+        //      For inject-context.sh the output is compared OUTSIDE the checklist-report region (BM1:
+        //      the hook's designed report of a tool's state is not a dependency); a missing anchor or
+        //      an outside part that is not deterministic is a failure, never "no difference".
+        //      Anything else differs → the file must be listed (class 1).
+        let failing_answer = |rel: &str| -> Option<String> {
+            match broken(rel) {
+                "def (:\n" => Some(
+                    "import sys\nsys.stdout.write('t5a: failing answer\\n')\nsys.exit(1)\n"
+                        .to_string(),
+                ),
+                "#!/bin/sh\n(\n" => {
+                    Some("#!/bin/sh\necho 't5a: failing answer'\nexit 1\n".to_string())
+                }
+                _ => None,
+            }
+        };
+        let cut = |l: &str| -> String { l.chars().take(140).collect() };
+        let mut measured: Vec<&str> = Vec::new();
+        for c in &dropped {
+            // (label, hook, recipe index) of every replay that reads it or is meant to reach it
+            let mut readers: Vec<(String, &str, Option<usize>)> = Vec::new();
+            for h in &hooks {
+                if reads[h.rel].contains(*c) {
+                    readers.push((h.rel.to_string(), h.rel, None));
+                }
+            }
+            for (i, (name, hook, reach, _setup)) in RECIPES.iter().enumerate() {
+                if recipe_reads[i].contains(*c) || reach.contains(c) {
+                    readers.push((format!("recipe {name} {hook}"), hook, Some(i)));
+                }
+            }
+            if readers.is_empty() {
+                if derive::BY_CONSTRUCTION_DROPS.iter().any(|(r, _)| r == c) {
+                    matrix.push(format!(
+                        "BM2 {c}: no replay runs it (by-construction drop; BM2 (iii) has nothing to measure here)"
+                    ));
+                }
+                continue;
+            }
+            measured.push(*c);
+            // (mode, body, asserted): an informational mode is recorded, never failed
+            let mut modes: Vec<(&str, String, bool)> = vec![("(i)", broken(c).to_string(), true)];
+            match failing_answer(c) {
+                Some(f) => modes.push(("(ii)", f, true)),
+                None => matrix.push(format!(
+                    "BM {c}: a data file — break mode (ii) does not apply"
+                )),
+            }
+            if *c == "bin/skillscan_rules.json" {
+                // RULINGS BN3 (c), recorded for the master: a VALID sidecar whose non-empty
+                // `rule_specs` matches nothing replaces the built-in rules (javis_skillscan.py
+                // 192-200) — outside the two ruled break modes
+                modes.push((
+                    "(info: valid sidecar, rules that match nothing)",
+                    "{\"rule_specs\": [{\"rule_id\": \"T5A\", \"message\": \"t5a\", \"severity\": \"LOW\", \"category\": \"t5a\", \"flags\": \"\", \"scope\": \"all\", \"patterns\": [[\"t5a-matches-nothing\", 0.1]]}]}\n".to_string(),
+                    false,
+                ));
+            }
+            for (label, hook, recipe) in &readers {
+                let h = hook_of(hook);
+                let (base, det, outside_det) = match recipe {
+                    Some(i) => (
+                        &recipe_healthy[*i].0,
+                        recipe_healthy[*i].1,
+                        recipe_outside_det[*i],
+                    ),
+                    None => (&healthy[*hook].0, healthy[*hook].1, None),
+                };
+                for (mode, body, asserted) in &modes {
+                    put(c, body);
+                    let r = run(
+                        hook,
+                        &first_event(h),
+                        h.timeout_s,
+                        recipe.map(|i| RECIPES[i].3),
+                    );
+                    put(c, &original(c));
+                    if *hook == "hooks/inject-context.sh" {
+                        let (Some(ob), Some(or), Some(br), Some(rr)) = (
+                            outside_checklist(&base.stdout),
+                            outside_checklist(&r.stdout),
+                            checklist_region(&base.stdout),
+                            checklist_region(&r.stdout),
+                        ) else {
+                            matrix.push(format!(
+                                "BM1 {mode} {c} -> {label}: a checklist-region anchor is missing"
+                            ));
+                            if *asserted {
+                                problems.push(format!(
+                                    "(3c) {c} {mode} -> {label}: a checklist-region anchor is missing — no comparison (RULINGS BM1)"
+                                ));
+                            }
+                            continue;
+                        };
+                        if outside_det != Some(true) {
+                            problems.push(format!(
+                                "(3c) {c} {mode} -> {label}: the output outside the checklist region is not deterministic — no comparison (RULINGS BM1)"
+                            ));
+                            continue;
+                        }
+                        let gone: Vec<String> = br
+                            .iter()
+                            .filter(|l| !rr.contains(l))
+                            .take(3)
+                            .map(|l| cut(l))
+                            .collect();
+                        let new: Vec<String> = rr
+                            .iter()
+                            .filter(|l| !br.contains(l))
+                            .take(3)
+                            .map(|l| cut(l))
+                            .collect();
+                        let outside_same = ob == or;
+                        let (ol, nl): (Vec<&str>, Vec<&str>) =
+                            (ob.split('\n').collect(), or.split('\n').collect());
+                        let out_gone: Vec<String> = ol
+                            .iter()
+                            .filter(|l| !nl.contains(l))
+                            .take(3)
+                            .map(|l| cut(l))
+                            .collect();
+                        let out_new: Vec<String> = nl
+                            .iter()
+                            .filter(|l| !ol.contains(l))
+                            .take(3)
+                            .map(|l| cut(l))
+                            .collect();
+                        matrix.push(format!(
+                            "BM1 {mode} {c} -> {label}: exit {:?}->{:?} · outside the checklist region same={outside_same} (healthy-only {out_gone:?} · broken-only {out_new:?}) · region differs={} · region healthy-only {gone:?} · region broken-only {new:?}",
+                            base.code,
+                            r.code,
+                            br != rr
+                        ));
+                        if *asserted && (r.code != base.code || !outside_same) {
+                            problems.push(format!(
+                                "(3c) {c} {mode} changes {label} outside the checklist report — it must be listed (class 1, RULINGS BM1 / BM3)"
+                            ));
+                        }
+                    } else {
+                        let changed = r.result_changed(base, det);
+                        matrix.push(format!(
+                            "BM {mode} {c} -> {label}: exit {:?}->{:?} · stdout same={} (deterministic={det}) · result_changed={changed}",
+                            base.code,
+                            r.code,
+                            r.stdout == base.stdout
+                        ));
+                        if *asserted && changed {
+                            problems.push(format!(
+                                "(3c) {c} {mode} changes the result of {label} — it must be listed (class 1, RULINGS AN3 / BM2 (iii) / BM3)"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        matrix.push(format!(
+            "(3c) dropped candidates measured by a replay ({}): {measured:?}",
+            measured.len()
+        ));
 
         // (4) break every unlisted file at once → no replay STOPS: its exit code stays the healthy
         //     one and it is not killed at the deadline ("the start survives" — RULINGS AL1), default
@@ -2628,6 +2952,146 @@ mod tests {
 
     fn edit_one(target: &'static str, f: fn(String) -> String) -> impl Fn(&str, String) -> String {
         move |p: &str, t: String| if p == target { f(t) } else { t }
+    }
+
+    /// RULINGS BM2 (ii) — the discarding forms the census knows, and forms it refuses.
+    #[test]
+    fn discarding_launch_forms() {
+        for ok in [
+            r#""$CYS_PY" "$(cys_native_path "$PACK/bin/x.py")" scan >/dev/null 2>&1"#,
+            r#"python3 x.py >/dev/null 2>&1 || true"#,
+            r#""$CYS_PY" x.py >/dev/null 2>&1 || :"#,
+            r#"cys_timeout_run 5 "$CYS_PY" x.py >/dev/null 2>&1 &"#,
+        ] {
+            assert!(derive::is_discarding_launch(ok), "{ok}");
+        }
+        for bad in [
+            r#"OUT=$("$CYS_PY" x.py 2>/dev/null)"#,
+            r#""$CYS_PY" x.py 2>/dev/null"#,
+            r#""$CYS_PY" x.py >/dev/null"#,
+            r#"if ! "$CYS_PY" x.py >/dev/null 2>&1; then"#,
+            r#""$CYS_PY" x.py >/dev/null 2>&1 && echo ok"#,
+            r#""$CYS_PY" x.py >/dev/null 2>&1 || echo failed"#,
+            r#""$CYS_PY" x.py >/dev/null 2>&1; echo $?"#,
+            r#""$CYS_PY" x.py | tee y >/dev/null 2>&1"#,
+            r#"exec "$CYS_PY" x.py >/dev/null 2>&1"#,
+            r#". x.sh >/dev/null 2>&1"#,
+            r#"X=1 "$CYS_PY" x.py >/dev/null 2>&1"#,
+        ] {
+            assert!(!derive::is_discarding_launch(bad), "{bad}");
+        }
+    }
+
+    /// RULINGS BM2 (i)/(ii) — the census pins every launch site of a by-construction drop: the real
+    /// site passes; the output kept, the exit tested (in the line, by the next command, by a bare
+    /// `exit`), `set -e` (in the hook or in a file it sources), a launch inside a function body, a
+    /// class-1 Python file that imports the drop, or no launch site left → the build fails naming
+    /// the file and the line.
+    #[test]
+    fn by_construction_census_pins_the_launch_sites() {
+        assert!(derive_edited(&|_, t| t, &[]).is_ok());
+        let site = "--ledger \"$RD/RSI_LEDGER.md\" >/dev/null 2>&1\nfi\n";
+        let fails_at_51 = |f: fn(String) -> String, why: &str| {
+            let e = derive_edited(&edit_one("cysjavis-pack/hooks/reflect-scan.sh", f), &[])
+                .unwrap_err();
+            assert!(
+                e.contains("by-construction drop `bin/javis_reflect.py`")
+                    && e.contains("hooks/reflect-scan.sh:51")
+                    && e.contains(why),
+                "{e}"
+            );
+        };
+        assert!(pack_text("hooks/reflect-scan.sh").unwrap().contains(site));
+        // the output kept
+        fails_at_51(
+            |t| t.replacen(">/dev/null 2>&1\nfi\n", "2>/dev/null\nfi\n", 1),
+            "not a discarding form",
+        );
+        // the exit tested in the line
+        fails_at_51(
+            |t| {
+                t.replacen(
+                    ">/dev/null 2>&1\nfi\n",
+                    ">/dev/null 2>&1 || echo x\nfi\n",
+                    1,
+                )
+            },
+            "not a discarding form",
+        );
+        // the exit read by the next command
+        fails_at_51(
+            |t| t.replacen(">/dev/null 2>&1\nfi\n", ">/dev/null 2>&1\n  RC=$?\nfi\n", 1),
+            "the next command reads its exit status",
+        );
+        // a bare `exit` after it: its status becomes the hook's
+        fails_at_51(
+            |t| t.replacen(">/dev/null 2>&1\nfi\n", ">/dev/null 2>&1\nfi\nexit\n", 1),
+            "a bare `exit`",
+        );
+        // `set -e` in the hook
+        fails_at_51(
+            |t| t.replacen("set +e\n", "set -e\n", 1),
+            "the file runs with `set -e`",
+        );
+        // a launch inside a function body (one line added above it: the site moves to :52)
+        let e = derive_edited(
+            &edit_one("cysjavis-pack/hooks/reflect-scan.sh", |t| {
+                t.replacen(
+                    "# ① 반복신호 light scan",
+                    "_t5a_g() {\n# ① 반복신호 light scan",
+                    1,
+                )
+                .replacen(
+                    ">/dev/null 2>&1\nfi\n",
+                    ">/dev/null 2>&1\nfi\n}\n_t5a_g\n",
+                    1,
+                )
+            }),
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("hooks/reflect-scan.sh:52") && e.contains("inside a function body"),
+            "{e}"
+        );
+        // `set -e` in a file the hook sources
+        let e = derive_edited(
+            &edit_one("cysjavis-pack/hooks/_lib.sh", |t| format!("set -e\n{t}")),
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("hooks/reflect-scan.sh:51") && e.contains("`set -e`"),
+            "{e}"
+        );
+        // a class-1 Python file imports it
+        let e = derive_edited(
+            &edit_one("cysjavis-pack/bin/javis_detect.py", |t| {
+                format!("{t}\nimport javis_reflect\n")
+            }),
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("by-construction drop `bin/javis_reflect.py`")
+                && e.contains("bin/javis_detect.py")
+                && e.contains("an import is never a drop by construction"),
+            "{e}"
+        );
+        // no launch site left
+        let e = derive_edited(
+            &edit_one("cysjavis-pack/hooks/reflect-scan.sh", |t| {
+                let a = t.find("if [ -n \"$TRANSCRIPT\" ]").unwrap();
+                let b = t[a..].find("\nfi\n").unwrap() + a + 4;
+                format!("{}{}", &t[..a], &t[b..])
+            }),
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("no registered hook or class-1 file launches it"),
+            "{e}"
+        );
     }
 
     #[test]

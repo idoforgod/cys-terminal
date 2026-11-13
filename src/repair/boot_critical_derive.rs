@@ -353,60 +353,22 @@ pub const MEASURED_HOOK_DEPS: &[(&str, &str, bool, &str)] = &[
         "the scanner inject_gate.py imports; broken -> the gate prints its 'gate down' banner and injects verbatim (recipe state-poison)",
     ),
     (
-        "bin/skillscan_rules.json",
-        "hooks/inject-context.sh",
-        false,
-        "the rules javis_skillscan.py reads; broken -> the quarantine changes (recipe state-poison)",
-    ),
-    (
         "hooks/teamtoken-issue.sh",
         "hooks/role-bootstrap.sh",
         true,
         "the team-token issuer; issuing needs an open ask (a pending team proposal in the daemon feed published by this seat, the mission delivery ledger, a hook witness newer than the ask) — not built at the replay level (stage-5)",
     ),
-    (
-        "bin/javis_memory.py",
-        "hooks/reflect-scan.sh",
-        false,
-        "reflect-scan.sh runs `verify` with its output discarded (reflect-scan.sh 55-60), but inject-context.sh's checklist phase runs it too: broken -> inject-context's injected text changes (recipe state-poison)",
-    ),
-    (
-        "bin/javis_reflect.py",
-        "hooks/reflect-scan.sh",
-        true,
-        "reflect-scan.sh runs `scan` with its output discarded (reflect-scan.sh 50-53; recipe round runs it with a transcript) — no recipe can make the hook's result depend on it (stage-5)",
-    ),
-    (
-        "bin/javis_route.py",
-        "hooks/grill-arm.sh",
-        false,
-        "grill_gate.py `begin` sets the grill floor with it (grill-arm.sh, output discarded); inject-context.sh's checklist phase runs it: broken -> inject-context's injected text changes (recipe state-poison)",
-    ),
-    (
-        "bin/javis_role.py",
-        "hooks/save-state.sh",
-        true,
-        "a guarded import of javis_snapshot.py, which save-state.sh runs with its output discarded; the snapshot reaches only a LATER inject-context run (stage-5)",
-    ),
-    (
-        "bin/javis_scrub.py",
-        "hooks/save-state.sh",
-        false,
-        "a guarded import of javis_snapshot.py (secret masking); inject-context.sh's checklist phase runs it: broken -> inject-context's injected text changes (recipe state-poison)",
-    ),
-    (
-        "bin/javis_task.py",
-        "hooks/save-state.sh",
-        true,
-        "imported by javis_snapshot.py (the task section of the snapshot), see javis_role.py (stage-5)",
-    ),
-    (
-        "bin/javis_wakeup.py",
-        "hooks/save-state.sh",
-        false,
-        "imported by javis_snapshot.py (the wake-queue section); inject-context.sh's checklist phase runs it: broken -> inject-context's injected text changes (recipe state-poison)",
-    ),
 ];
+
+/// RULINGS BM2 — drops BY CONSTRUCTION: files a registered hook (or a class-1 file) only LAUNCHES,
+/// at sites that discard both the output and the exit status — breaking the file cannot stop or
+/// change that hook. (rel, record). The census pins every launch site to a discarding form
+/// ([`by_construction_census`]); an import, or a launch in any other form, fails the build naming
+/// the file and the line. Each is a stage-5 CONFIRMATION item, not a row.
+pub const BY_CONSTRUCTION_DROPS: &[(&str, &str)] = &[(
+    "bin/javis_reflect.py",
+    "launched only by hooks/reflect-scan.sh:51-52 (`\"$CYS_PY\" … javis_reflect.py … scan … >/dev/null 2>&1`, exit untested, `set +e`); recipe round runs it (with a transcript): both break modes -> the hook's exit and stdout unchanged; boot layer: never read by the boot, broken with every unlisted file -> the boot completes · (ii) no stop branch",
+)];
 
 /// RULINGS AL1/AL3/AN2/AN6 — the candidates the census finds one step from a LISTED file that are NOT
 /// boot-critical, each with BOTH break modes measured or read: (i) the file cannot run
@@ -425,16 +387,22 @@ pub const DROPPED_CANDIDATES: &[(&str, &str)] = &[
     ("bin/javis_event.py", "(i) never read by the boot (tripwire, both scenes); broken with every unlisted file -> the boot completes · (ii) no stop branch: formation emits events best-effort and ignores the answer (formation 1033-1043)"),
     ("bin/javis_manifest.py", "(i) read by the boot; broken alone -> the boot completes and the hooks are registered (bootstrap replay, both scenes) (a preflight check's tool) · (ii) no stop branch: `orchestra check` does not consult it (ticket phases only, orchestra 1736)"),
     ("bin/javis_mcpgate.py", "(i) read by the boot; broken alone -> the boot completes and the hooks are registered (bootstrap replay, both scenes) (a preflight check's tool) · (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597)"),
+    ("bin/javis_memory.py", "(i) never read by the boot (tripwire, both scenes); broken with every unlisted file -> the boot completes; hook layer (RULINGS BM1): recipe state-poison runs it through inject-context.sh's checklist phase — broken, ONLY the checklist report region differs (from the line `■ 실측 체크리스트(…)` / `⚠ 실측 체크리스트 미수행(` to the restore note `▶ `); the rest of the injected text and the exit are unchanged; reflect-scan.sh:57 tests its exit only to write one `.state_log` line — recipe round: the hook unchanged · (ii) failing answer (exit 1): the same — only the checklist region differs; no start file obeys its answer as a stop"),
     ("bin/javis_phoenix.py", "(i) never read by the boot (tripwire, both scenes); broken with every unlisted file -> the boot completes; cys-dept calls it best-effort (`|| true`) and the daemon restores from its EMBEDDED copy first · (ii) no stop branch: cys-dept ignores its answer (cys-dept 109-134)"),
     ("bin/javis_radio.py", "(i) read by the boot; broken alone -> the boot completes and the hooks are registered (bootstrap replay, both scenes) (a preflight check's tool) · (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597)"),
     ("bin/javis_registry.py", "(i) read by the boot; broken alone -> the boot completes and the hooks are registered (bootstrap replay, both scenes) (a preflight check's tool) · (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597)"),
     ("bin/javis_report.py", "(i) never read by the boot (tripwire, both scenes); broken with every unlisted file -> the boot completes · (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597)"),
+    ("bin/javis_role.py", "(i) never read by the boot (tripwire, both scenes); broken with every unlisted file -> the boot completes; no recipe runs it; reached only through javis_snapshot.py's guarded import `_role_mod` (:49-55, try/except — the role falls back to the env) → AL1's optional import (RULINGS BM3) · (ii) no stop branch: none of the five start files consults it"),
+    ("bin/javis_route.py", "(i) read by the boot; broken alone -> the boot completes and the hooks are registered (bootstrap replay, both scenes); hook layer (RULINGS BM1): recipe state-poison runs it through inject-context.sh's checklist phase — broken, ONLY the checklist report region differs (from the line `■ 실측 체크리스트(…)` / `⚠ 실측 체크리스트 미수행(` to the restore note `▶ `); the rest of the injected text and the exit are unchanged; grill_gate.py:201-211 runs it only in `begin` (grill-arm.sh, output discarded) to set the floor of a LATER grill run (BM2's last sentence) · (ii) failing answer (exit 1): only the checklist region differs; (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597)"),
     ("bin/javis_runtime_seal.py", "(i) read by the boot; broken alone -> the boot completes and the hooks are registered (bootstrap replay, both scenes) (a preflight check's tool) · (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597)"),
+    ("bin/javis_scrub.py", "(i) read by the boot; broken alone -> the boot completes and the hooks are registered (bootstrap replay, both scenes); hook layer (RULINGS BM1): recipe state-poison runs it through inject-context.sh's checklist phase — broken, ONLY the checklist report region differs (from the line `■ 실측 체크리스트(…)` / `⚠ 실측 체크리스트 미수행(` to the restore note `▶ `); the rest of the injected text and the exit are unchanged; javis_snapshot.py:107-113 imports it inside try/except (AL1's optional import) · (ii) failing answer (exit 1): only the checklist region differs; (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597)"),
     ("bin/javis_semver.py", "(i) read by the boot; broken alone -> the boot completes and the hooks are registered (bootstrap replay, both scenes) (a preflight check's tool) · (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597)"),
     ("bin/javis_serena_probe.py", "(i) never read by the boot (tripwire, both scenes); broken with every unlisted file -> the boot completes · (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597)"),
+    ("bin/javis_task.py", "(i) never read by the boot (tripwire, both scenes); broken with every unlisted file -> the boot completes; no recipe runs it; reached only through guarded imports — javis_snapshot.py `_fresh_task_mod` (:67-72, called inside try/except :406-412) and javis_preflight.py C75 (:6395-6399, try/except) → AL1's optional import (RULINGS BM3) · (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597)"),
     ("bin/javis_todo_decl.py", "(i) read by the boot; broken alone -> the boot completes and the hooks are registered (bootstrap replay, both scenes) (orchestra's import for ticket prompts) · (ii) no stop branch: `orchestra check` does not consult it (task-prompt only, orchestra 1768)"),
     ("bin/javis_verdict.py", "(i) read by the boot; broken alone -> the boot completes and the hooks are registered (bootstrap replay, both scenes) (orchestra's optional import with a fallback) · (ii) no stop branch: `orchestra check` does not consult it (review commands only)"),
-    ("bin/javis_waiver.py", "(i) never read by the boot (tripwire, both scenes — AL record); reached one step only from javis_task.py, a stage-5 row of the hook layer (RULINGS AP3) · (ii) no stop branch: none of the five start files consults it"),
+    ("bin/javis_wakeup.py", "(i) read by the boot; broken alone -> the boot completes and the hooks are registered (bootstrap replay, both scenes); hook layer (RULINGS BM1): recipe state-poison runs it through inject-context.sh's checklist phase — broken, ONLY the checklist report region differs (from the line `■ 실측 체크리스트(…)` / `⚠ 실측 체크리스트 미수행(` to the restore note `▶ `); the rest of the injected text and the exit are unchanged; javis_snapshot.py:75-79 / :429-435 imports it inside try/except (AL1's optional import) · (ii) failing answer (exit 1): only the checklist region differs; (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597)"),
+    ("bin/skillscan_rules.json", "(i) read by the boot (preflight C41 checks it beside its tool: `_check_bin_tool(cid, \"javis_skillscan.py\", extra_files=(\"skillscan_rules.json\",))`, preflight:2892); broken alone -> the boot completes and the hooks are registered (bootstrap replay, both scenes); hook layer (RULINGS BM1 / BN3 (c)): recipe state-poison runs javis_skillscan.py through inject-context.sh — broken, it falls back silently to its built-in rules (javis_skillscan.py:192-200: a sidecar that does not load leaves the inline RULE_SPECS, whose P1 quarantines the poisoned line the same way), so the quarantine and the rest of the injected text are unchanged; ONLY the checklist report region differs (preflight's C41 answer in the checklist line) · (ii) a data file: no failing-answer mode; no start file obeys its content as a stop"),
     ("hooks/brief-lint-warn.sh", "(i) never read by the boot (tripwire, both scenes); broken with every unlisted file -> the boot completes; not a hook the product registers (C74 only checks it exists; an owner registers it by hand) · (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597)"),
 ];
 
@@ -1891,21 +1859,16 @@ pub fn protection_closure(
     found
 }
 
-/// RULINGS AU1 / AW2 — the protection TESTS: (id, the files it starts from, follow the protection
-/// closure). G (external sends / permanent deletions — the irreversible-action gate), R (reviewer
-/// writes) and C (CSO writes — the capability gate), I2 (the capgate-deny set of the hook-target
-/// table): the rows and everything they source, launch or import, transitively. I3 (registration —
+/// RULINGS AU1 / AW2 / BM5 — the protection TESTS the frozen contract names: (id, the files it
+/// starts from, follow the protection closure). G (external sends / permanent deletions — the
+/// irreversible-action gate), R (reviewer writes) and C (CSO writes — the capability gate): the
+/// rows and everything they source, launch or import, transitively (I2 is withdrawn — BC1 / BM5). I3 (registration —
 /// the registrar's decision path): the files C28 and its helpers read or call to decide whether a
 /// protection hook is registered, enumerated by reading them (the report's registrar table); NOT the
 /// transitive closure of `javis_preflight.py` (that is the whole start path).
 pub const PROTECTION_TESTS: &[(&str, &[&str], bool)] = &[
     ("C", &["hooks/role-capability-gate.sh"], true),
     ("G", &["hooks/guard.sh"], true),
-    (
-        "I2",
-        &["state/hook-targets.json", "state/hook-targets.json.example"],
-        true,
-    ),
     (
         "I3",
         &[
@@ -1966,6 +1929,234 @@ pub fn protection_inputs(
     } else {
         Err(errs.join("\n"))
     }
+}
+
+/// Lines of a shell text with `\` continuations joined, comments and heredoc bodies left out:
+/// `(first line number, joined text)`.
+fn shell_commands(text: &str) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    let mut heredoc: Option<String> = None;
+    let mut cur: Option<(usize, String)> = None;
+    for (i, line) in text.lines().enumerate() {
+        if let Some(term) = &heredoc {
+            if line.trim_end() == term {
+                heredoc = None;
+            }
+            continue;
+        }
+        if cur.is_none() && line.trim_start().starts_with('#') {
+            continue;
+        }
+        if let Some(p) = line.find("<<") {
+            let word: String = line[p + 2..]
+                .trim_start_matches('-')
+                .trim_start()
+                .trim_start_matches(['\'', '"'])
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if !word.is_empty() {
+                heredoc = Some(word);
+            }
+        }
+        let (n, mut acc) = cur.take().unwrap_or((i + 1, String::new()));
+        let body = line.trim_end();
+        if let Some(head) = body.strip_suffix('\\') {
+            acc.push_str(head);
+            acc.push(' ');
+            cur = Some((n, acc));
+        } else {
+            acc.push_str(body);
+            out.push((n, acc));
+        }
+    }
+    if let Some(c) = cur {
+        out.push(c);
+    }
+    out
+}
+
+/// The command with every file test (`[ -f … ]`, `[ -x … ]`, `[ -e … ]`, `[ -r … ]`) taken out.
+fn without_file_tests(cmd: &str) -> String {
+    let mut s = cmd.to_string();
+    for t in ["[ -f ", "[ -x ", "[ -e ", "[ -r ", "[ -s "] {
+        while let Some(a) = s.find(t) {
+            let Some(b) = s[a..].find(" ]") else { break };
+            s.replace_range(a..a + b + 2, " ");
+        }
+    }
+    s
+}
+
+/// RULINGS BM2 — the discarding forms the census knows: a whole simple command (not an `if` /
+/// `while` condition, not negated, not `exec`, not inside `$(…)`, no `&&` or pipe) whose first word
+/// is an interpreter (optionally after `cys_timeout_run <N>`) and which ends with `>/dev/null 2>&1`,
+/// optionally followed by `|| true`, `|| :` or `&`. The file must not run with `set -e`.
+pub fn is_discarding_launch(cmd: &str) -> bool {
+    let mut t = cmd.trim();
+    for tail in [" &", " || true", " || :"] {
+        if let Some(h) = t.strip_suffix(tail) {
+            t = h.trim_end();
+        }
+    }
+    let Some(head) = t.strip_suffix(">/dev/null 2>&1") else {
+        return false;
+    };
+    if head.contains("&&") || head.contains(" | ") || head.contains("||") {
+        return false;
+    }
+    let mut words = head.split_whitespace();
+    let mut first = words.next().unwrap_or("");
+    if first == "cys_timeout_run" {
+        let _cap = words.next();
+        first = words.next().unwrap_or("");
+    }
+    let first = first.trim_matches(|c| c == '"' || c == '\'');
+    matches!(
+        first,
+        "$CYS_PY" | "${CYS_PY}" | "python3" | "python" | "sh" | "bash"
+    )
+}
+
+/// Line ranges (1-based, inclusive) of the shell function bodies of a text: from a line
+/// `name() {` / `function name {` to the next line that is exactly `}`.
+fn function_bodies(text: &str) -> Vec<(usize, usize)> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = Vec::new();
+    for (i, l) in lines.iter().enumerate() {
+        let t = l.trim();
+        let opens = t.starts_with("function ")
+            || t.split_once("()").is_some_and(|(name, rest)| {
+                let name = name.trim();
+                !name.is_empty()
+                    && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    && rest.trim_start().starts_with('{')
+            });
+        if opens {
+            let end = lines[i + 1..]
+                .iter()
+                .position(|x| *x == "}")
+                .map_or(lines.len(), |p| i + 1 + p + 1);
+            out.push((i + 1, end));
+        }
+    }
+    out
+}
+
+/// What makes a launch's exit status reach someone after it: the next command (structural words
+/// skipped) reads `$?` / `PIPESTATUS` or is a bare `exit` / `return`, or there is no next command
+/// (the launch may be the script's last, so its status would be the hook's).
+fn exit_status_reader(after: &[(usize, String)]) -> Option<&'static str> {
+    let next = after.iter().map(|(_, c)| c.trim()).find(|c| {
+        !matches!(
+            *c,
+            "" | "fi" | "done" | "esac" | ";;" | "}" | "else" | "then" | "do"
+        )
+    });
+    match next {
+        None => Some("it may be the script's last command (its status would be the hook's)"),
+        Some(c) if c.contains("$?") || c.contains("PIPESTATUS") => {
+            Some("the next command reads its exit status")
+        }
+        Some("exit") | Some("return") => {
+            Some("a bare `exit` / `return` follows (its status would be the hook's)")
+        }
+        Some(_) => None,
+    }
+}
+
+/// `set -e` (errexit) anywhere in a shell text.
+fn has_errexit(text: &str) -> bool {
+    text.lines().any(|l| {
+        let l = l.trim();
+        l == "set -e"
+            || l.starts_with("set -e ")
+            || l.starts_with("set -eu")
+            || l.starts_with("set -euo")
+            || l.contains("set -o errexit")
+    })
+}
+
+/// RULINGS BM2 — the census of the by-construction drops over the registered hooks and the class-1
+/// files: a Python file that imports or launches one, a shell line naming it (by its file name —
+/// a path built through a variable still names it somewhere) in any form but a discarding launch,
+/// a shell file that runs with `set -e` (its own text or a pack file it sources), or a drop no
+/// launch site names any more → an error naming the file and the line.
+pub fn by_construction_census(
+    src: &Sources,
+    rels: &BTreeSet<&str>,
+    class1: &[String],
+) -> Vec<String> {
+    let mut errs = Vec::new();
+    for (drop, _) in BY_CONSTRUCTION_DROPS {
+        let name = drop.rsplit('/').next().unwrap_or(drop);
+        let mut sites = 0usize;
+        for f in class1 {
+            let text = (src.pack_file)(f).map(|t| lf(&t)).unwrap_or_default();
+            let python =
+                f.ends_with(".py") || text.lines().next().is_some_and(|l| l.contains("python"));
+            if python {
+                if bindings(f, &text, rels).iter().any(|(c, _)| c == drop) {
+                    errs.push(format!(
+                        "by-construction drop `{drop}`: the class-1 file `{f}` imports or launches it — an import is never a drop by construction (RULINGS BM2)"
+                    ));
+                }
+                continue;
+            }
+            // errexit in the file itself or in a pack file it sources (`. x` / `source x`)
+            let sourced = shell_commands(&text)
+                .into_iter()
+                .filter(|(_, c)| {
+                    let c = c.trim_start();
+                    c.starts_with(". ") || c.starts_with("source ")
+                })
+                .flat_map(|(_, c)| {
+                    rels.iter()
+                        .filter(|r| {
+                            let n = r.rsplit('/').next().unwrap_or(r);
+                            n.contains('.') && c.contains(n)
+                        })
+                        .map(|r| r.to_string())
+                        .collect::<Vec<_>>()
+                })
+                .collect::<BTreeSet<String>>();
+            let errexit = has_errexit(&text)
+                || sourced.iter().any(|r| {
+                    (src.pack_file)(r)
+                        .map(|t| has_errexit(&lf(&t)))
+                        .unwrap_or(false)
+                });
+            let cmds = shell_commands(&text);
+            let fns = function_bodies(&text);
+            for (k, (n, cmd)) in cmds.iter().enumerate() {
+                if !without_file_tests(cmd).contains(name) {
+                    continue;
+                }
+                sites += 1;
+                let why = if errexit {
+                    Some("the file runs with `set -e`")
+                } else if !is_discarding_launch(cmd) {
+                    Some("not a discarding form")
+                } else if fns.iter().any(|(a, b)| a <= n && n <= b) {
+                    Some("inside a function body (its status can become the function's)")
+                } else {
+                    exit_status_reader(&cmds[k + 1..])
+                };
+                if let Some(why) = why {
+                    errs.push(format!(
+                        "by-construction drop `{drop}`: {f}:{n} launches it in a form that does not discard both its output and its exit status — {why} (RULINGS BM2): {}",
+                        cmd.trim()
+                    ));
+                }
+            }
+        }
+        if sites == 0 {
+            errs.push(format!(
+                "by-construction drop `{drop}`: no registered hook or class-1 file launches it any more — remove the entry (RULINGS BM2)"
+            ));
+        }
+    }
+    errs
 }
 
 pub fn derive(src: &Sources) -> Result<Vec<GenEntry>, String> {
@@ -2241,7 +2432,11 @@ pub fn derive(src: &Sources) -> Result<Vec<GenEntry>, String> {
     //   build); a candidate that is neither listed (either list) nor a measured drop is a NEW
     //   start-path file → build failure naming it (measure it — test_boot_critical_start_replay /
     //   the hook replay — then list it or add it to DROPPED_CANDIDATES with both break modes)
-    let dropped: BTreeSet<&str> = DROPPED_CANDIDATES.iter().map(|(r, _)| *r).collect();
+    let dropped: BTreeSet<&str> = DROPPED_CANDIDATES
+        .iter()
+        .chain(BY_CONSTRUCTION_DROPS.iter())
+        .map(|(r, _)| *r)
+        .collect();
     let protected: BTreeSet<&str> = protection.iter().map(|e| e.rel.as_str()).collect();
     let mut found: BTreeMap<String, String> = BTreeMap::new();
     // AP5 — the protection rows are census roots too (a file a protection device launches or
@@ -2272,7 +2467,17 @@ pub fn derive(src: &Sources) -> Result<Vec<GenEntry>, String> {
             "census: new start-path candidate `{rel}` ({how}) — neither listed nor a measured drop; measure both break modes and classify it (RULINGS AL1/AL3/AN2)"
         ));
     }
-    for (rel, _) in DROPPED_CANDIDATES {
+    // RULINGS BM2 — every launch site of a by-construction drop is a discarding form
+    let class1: Vec<String> = rows
+        .values()
+        .filter(|e| e.category == "hook" || e.category == "hook-dep")
+        .map(|e| e.rel.clone())
+        .collect();
+    errs.extend(by_construction_census(src, &rels, &class1));
+    for (rel, _) in DROPPED_CANDIDATES
+        .iter()
+        .chain(BY_CONSTRUCTION_DROPS.iter())
+    {
         if rows.contains_key(*rel) {
             errs.push(format!(
                 "`{rel}` is both listed and in DROPPED_CANDIDATES — remove one (RULINGS AL3)"
@@ -2389,7 +2594,7 @@ pub fn render(entries: &[GenEntry], inputs: &[(String, Vec<String>)]) -> String 
     }
     // RULINGS AU1 — per protection test, the files it reads (sorted; every file on a list)
     s.push_str(
-        "/// Per protection TEST (C · G · I2 · R), the files it reads — its rows and their protection closure (RULINGS AU1).\nstatic GENERATED_PROTECTION_INPUTS: &[(&str, &[&str])] = &[\n",
+        "/// Per protection TEST (C · G · I3 · R), the files it reads — its rows and their protection closure (RULINGS AU1).\nstatic GENERATED_PROTECTION_INPUTS: &[(&str, &[&str])] = &[\n",
     );
     for (test, files) in inputs {
         let list: Vec<String> = files.iter().map(|f| format!("{f:?}")).collect();

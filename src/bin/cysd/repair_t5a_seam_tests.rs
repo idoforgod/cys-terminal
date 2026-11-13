@@ -4,6 +4,13 @@
 use super::ledger_verbs::hook_allowed;
 use super::*;
 use cys::repair::types::Classification;
+use std::path::{Path, PathBuf};
+
+/// A lane pack root for the classification (RULINGS BN2: `<pack root>/<rel>` is classified). It
+/// does not need to exist — the lists decide; the tests that need a real tree make their own.
+fn pk() -> PathBuf {
+    std::env::temp_dir().join(format!("t5a-seam-pack-{}", std::process::id()))
+}
 
 #[test]
 fn protection_rows_classify_protection_related() {
@@ -13,7 +20,7 @@ fn protection_rows_classify_protection_related() {
             "{rel} is not a protection row of the compiled list"
         );
         assert_eq!(
-            production_classify(rel).unwrap(),
+            production_classify(rel, &pk()).unwrap(),
             Classification::ProtectionRelated,
             "{rel}"
         );
@@ -26,7 +33,7 @@ fn a_file_in_both_lists_is_protection_related() {
     assert!(cys::repair::boot_critical::boot_critical_entry(rel).is_some());
     assert!(cys::repair::boot_critical::protection_entry(rel).is_some());
     assert_eq!(
-        production_classify(rel).unwrap(),
+        production_classify(rel, &pk()).unwrap(),
         Classification::ProtectionRelated
     );
 }
@@ -43,14 +50,14 @@ fn a_protection_hook_cannot_be_unregistered() {
 #[test]
 fn a_listed_start_script_is_boot_critical_and_a_dropped_tool_is_general() {
     assert_eq!(
-        production_classify("bin/javis_bootstrap.py").unwrap(),
+        production_classify("bin/javis_bootstrap.py", &pk()).unwrap(),
         Classification::BootCritical
     );
     let dropped = "bin/javis_phoenix.py";
     assert!(cys::repair::boot_critical::boot_critical_entry(dropped).is_none());
     assert!(cys::repair::boot_critical::protection_entry(dropped).is_none());
     assert_eq!(
-        production_classify(dropped).unwrap(),
+        production_classify(dropped, &pk()).unwrap(),
         Classification::General
     );
 }
@@ -63,7 +70,7 @@ fn a_listed_start_script_is_boot_critical_and_a_dropped_tool_is_general() {
 fn registration_tables_classify_protection_related() {
     for rel in ["state/hook-targets.json", "state/hook-targets.json.example"] {
         assert_eq!(
-            production_classify(rel).unwrap(),
+            production_classify(rel, &pk()).unwrap(),
             Classification::ProtectionRelated,
             "{rel}"
         );
@@ -81,13 +88,13 @@ fn a_case_variant_of_a_listed_file_is_refused_naming_the_row() {
         ("BIN/javis_bootstrap.py", "bin/javis_bootstrap.py"),
         ("State/Hook-Targets.json", "state/hook-targets.json"),
     ] {
-        let e = production_classify(spelled).unwrap_err();
+        let e = production_classify(spelled, &pk()).unwrap_err();
         let msg = format!("{e:?}");
         assert!(msg.contains(row), "{spelled}: {msg}");
     }
     // the exact spellings classify
     assert_eq!(
-        production_classify("hooks/inject-context.sh").unwrap(),
+        production_classify("hooks/inject-context.sh", &pk()).unwrap(),
         Classification::BootCritical
     );
 }
@@ -120,7 +127,7 @@ fn hook_names_with_a_trailing_dot_or_space_and_lifeline_case_variants_are_refuse
 #[test]
 fn the_registrars_validator_is_protection_related() {
     assert_eq!(
-        production_classify("bin/javis_guard_register.py").unwrap(),
+        production_classify("bin/javis_guard_register.py", &pk()).unwrap(),
         Classification::ProtectionRelated
     );
 }
@@ -138,6 +145,144 @@ fn protection_hook_names_are_refused_in_any_case_and_short_name_form() {
     ] {
         assert!(hook_allowed(s).is_err(), "{s} was allowed");
     }
-    // a tilde that is not a short-name form is not refused for it
+    // a tilde that is not a short-name form (`~` not followed by a digit) is not refused for it
+    // (RULINGS BN3 (d); `parse_hook` refuses a `~` in a name before `hook_allowed` is reached)
+    assert!(hook_allowed("verify~reminder.sh").is_ok());
     assert!(hook_allowed("verify-reminder.sh").is_ok());
+}
+
+/// The spellings of a row with U+212A (Kelvin sign) for its first `k` and U+017F (long s) for its
+/// first `s` — APFS opens both as the row's file.
+fn fold_variants(row: &str) -> Vec<String> {
+    let mut v = Vec::new();
+    for (from, to) in [('k', '\u{212A}'), ('s', '\u{17F}')] {
+        if let Some(i) = row.find(from) {
+            v.push(format!("{}{to}{}", &row[..i], &row[i + 1..]));
+        }
+    }
+    v
+}
+
+/// RULINGS BN1: a spelling that equals a row only under the FULL case fold is refused naming the
+/// row — one boot-critical row, every protection row, and the path-rule row with its file absent;
+/// a non-ASCII name that folds to no row is General.
+#[test]
+fn full_fold_variants_of_a_row_are_refused_naming_the_row() {
+    let bc = "hooks/inject-context.sh";
+    let mut cases: Vec<(String, &str)> = fold_variants(bc).into_iter().map(|v| (v, bc)).collect();
+    assert_eq!(cases.len(), 2);
+    for row in cys::repair::boot_critical::protection_entries() {
+        let vs = fold_variants(row.rel);
+        assert!(!vs.is_empty(), "{}", row.rel);
+        cases.extend(vs.into_iter().map(|v| (v, row.rel)));
+    }
+    let pack = pk();
+    assert!(
+        !pack.join("state/hook-targets.json").exists(),
+        "the path-rule row's file must be absent here"
+    );
+    cases.push((
+        "\u{17F}tate/hoo\u{212A}-targets.json".to_string(),
+        "state/hook-targets.json",
+    ));
+    for (spelled, row) in &cases {
+        let e = production_classify(spelled, &pack).unwrap_err();
+        let msg = format!("{e:?}");
+        assert!(msg.contains(&format!("`{row}`")), "{spelled}: {msg}");
+    }
+    for other in [
+        "bin/caf\u{E9}.py",
+        "bin/javi\u{17F}_phoenix.py",
+        "hooks/\u{212A}.sh",
+    ] {
+        assert_eq!(
+            production_classify(other, &pack).unwrap(),
+            Classification::General,
+            "{other}"
+        );
+    }
+    // hook names: a protection or lifeline name under the full fold is refused
+    assert!(hook_allowed("guard.\u{17F}h").is_err());
+    assert!(hook_allowed("role-capability-gate.\u{17F}h").is_err());
+    for l in cys::repair::boot_critical::LIFELINE_HOOKS {
+        for v in fold_variants(l) {
+            assert!(
+                hook_allowed(&v).is_err(),
+                "lifeline variant {v} was allowed"
+            );
+        }
+    }
+}
+
+/// Restores the process's working directory when dropped (the cysd suite runs one test at a time).
+struct CwdGuard(PathBuf);
+impl Drop for CwdGuard {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.0);
+    }
+}
+
+fn scratch(tag: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let d = std::env::temp_dir().join(format!("t5a-{tag}-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+/// RULINGS BN2: the classification never depends on the daemon's working directory — removed
+/// after start, a general target still classifies General and a listed one stays listed.
+#[test]
+fn a_removed_working_directory_does_not_change_the_classification() {
+    let _back = CwdGuard(std::env::current_dir().unwrap());
+    let gone = scratch("gone-cwd");
+    std::env::set_current_dir(&gone).unwrap();
+    std::fs::remove_dir(&gone).unwrap();
+    assert!(std::env::current_dir().is_err() || !gone.exists());
+    let pack = pk();
+    assert_eq!(
+        production_classify("bin/javis_phoenix.py", &pack).unwrap(),
+        Classification::General
+    );
+    assert_eq!(
+        production_classify("bin/javis_bootstrap.py", &pack).unwrap(),
+        Classification::BootCritical
+    );
+    assert_eq!(
+        production_classify("hooks/guard.sh", &pack).unwrap(),
+        Classification::ProtectionRelated
+    );
+}
+
+/// RULINGS BN2: the working directory inside a pack's `hooks/` — an unlisted rel named like a
+/// row's basename stays General, the listed rels stay listed; a relative pack root is refused.
+#[test]
+fn a_working_directory_inside_a_pack_does_not_change_the_classification() {
+    let _back = CwdGuard(std::env::current_dir().unwrap());
+    let pack = scratch("cwd-pack");
+    std::fs::create_dir_all(pack.join("hooks")).unwrap();
+    for f in ["guard.sh", "inject-context.sh"] {
+        std::fs::write(pack.join("hooks").join(f), "#!/bin/sh\n").unwrap();
+    }
+    std::env::set_current_dir(pack.join("hooks")).unwrap();
+    for rel in ["guard.sh", "inject-context.sh"] {
+        assert_eq!(
+            production_classify(rel, &pack).unwrap(),
+            Classification::General,
+            "{rel}"
+        );
+    }
+    assert_eq!(
+        production_classify("hooks/guard.sh", &pack).unwrap(),
+        Classification::ProtectionRelated
+    );
+    assert_eq!(
+        production_classify("hooks/inject-context.sh", &pack).unwrap(),
+        Classification::BootCritical
+    );
+    assert!(production_classify("bin/javis_phoenix.py", Path::new("rel/pack")).is_err());
+    drop(_back);
+    let _ = std::fs::remove_dir_all(&pack);
 }
