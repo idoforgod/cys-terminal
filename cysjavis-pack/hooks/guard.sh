@@ -939,6 +939,15 @@ def loose_deny(n, n_slash=""):
 def out_deny(reason):
     print("DENY\t" + reason); sys.exit(2)
 
+# ★0.15.0 「스스로 해결」 M13(C10 10.5 · O-C10-4): 규칙 문서 쓰기를 **주인 지시 표**로 인정한다.
+#   데몬이 "부른 좌석이 이 경로를 덮는 표로 시작한 규칙 문서 수리의 잠금을 쥐고 있다"고 답할 때만(종료 코드 0)
+#   통과다. 조회는 `_cys_exec` 그대로(소켓 실재 선확인 · CYS_NO_AUTOSTART=1 · 합산 예산 안 · soft) — 데몬 없음·
+#   시간 초과·옛 데몬(93)·거부(95)는 전부 오늘의 동작(차단)으로 남는다. 차단 규칙·환경 갈래·deny 지점은 바꾸지
+#   않는다(이 함수는 허용 경로 하나를 더할 뿐이다). Bash 로 규칙 문서를 쓰는 경로는 표가 있어도 그대로 막힌다.
+def owner_token_allows(fp):
+    r = _cys_exec(["repair", "rule-doc-allowed", "--path", fp], soft=True)
+    return r is not None and r[0] == 0
+
 if PAUSED and not PREFLIGHT:
     if tool in WRITE_TOOLS:
         out_deny("AUTOPILOT_PAUSED (오너 kill-switch · 호칭 정의처=마스터 헌장 제1조): "
@@ -1009,6 +1018,8 @@ if tool in WRITE_TOOLS and file_path:
         _scope_toks = (CONST_SCOPE.splitlines()[0].lower().split() if CONST_SCOPE.strip() else [])  # ★스코프=첫 줄 토큰만(주석의 * 오인 차단)·정확매칭
         if CONST_AUTH and (("*" in _scope_toks) or (basename(file_path).lower() in _scope_toks)):
             sys.stderr.write("AUTOPILOT GUARD: 헌법편집 인가됨(오너 직접명령 토큰·%s)\n" % basename(file_path))
+        elif owner_token_allows(file_path):
+            sys.stderr.write("AUTOPILOT GUARD: 주인 지시 표로 허용됨(cys repair rule-doc-allowed · %s)\n" % basename(file_path))
         else:
             out_deny("헌법파일(%s) %s 차단 — 규칙 문서는 오너 지시로만 고친다(오너 직접명령 인가토큰 CONSTITUTION_EDIT_AUTHORIZED 필요)" % (basename(file_path), tool))
     if ACTIVE and guard_infra(file_path):   # 잔여3: STRICT trust boundary

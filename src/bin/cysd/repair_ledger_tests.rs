@@ -22,6 +22,8 @@ struct Rig {
     mutexes: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     lane: LaneKey,
     inc: String,
+    /// T4: the per-seat prompt record `Ctx` carries since the owner-decision verbs.
+    prompts: Mutex<HashMap<u64, PromptOrigin>>,
 }
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -56,6 +58,7 @@ fn rig(tag: &str) -> Rig {
         mutexes: Mutex::new(HashMap::new()),
         lane: LaneKey("base".into()),
         inc: "inc-1".into(),
+        prompts: Mutex::new(HashMap::new()),
     }
 }
 
@@ -105,6 +108,7 @@ impl Rig {
             check,
             hook_step: &cys::repair::apply::hook_lines_step,
             claim: &cys::repair::grant::try_claim_autonomous_start,
+            prompts: &self.prompts,
         }
     }
     fn call(&self, now: f64, who: &Caller, sub: &str, p: Value) -> Result<Value, VerbError> {
@@ -244,7 +248,10 @@ fn role_table_census_every_verb_every_caller() {
             checked += 1;
         }
     }
-    assert_eq!(checked, 28 * callers.len());
+    // T4 (RULINGS CI6 (b)): the READ verb `grant_status` joined the table — 28 → 29 verbs (old
+    // expectation `assert_eq!(checked, 28 * callers.len());`)
+    assert_eq!(VERB_CLASSES.len(), 29);
+    assert_eq!(checked, 29 * callers.len());
     // a verb not in the table is refused for every caller, the master included
     for (_, c) in &callers {
         assert_eq!(
@@ -1944,7 +1951,11 @@ fn wiring_pins() {
 
 /// A question at t0, a machine push at t1, the owner's "예" at t2 → `machine_seen` (T4 then refuses
 /// `grant on`); an unknown origin counts as machine (fail closed); `named_docs` changes only on an
-/// owner-typed prompt; the first owner answer after the question is kept once.
+/// owner-typed prompt; the first owner answer after the question is kept once. RULINGS CI1 (T4):
+/// "owner-typed" for an answer or a naming is Level 2 — the hook's `human` (Level 1) AND the seat's
+/// typing mark, set here first (`typing_mark = Some(<the prompt's time>)`, the test seam of
+/// `mark_app_typing`; RULINGS CJ2 gives the mark a time); the
+/// hook's `human` alone answers nothing and names nothing (pinned at the end).
 #[test]
 fn prompt_origin_is_question_aware() {
     let mut rec = PromptOrigin {
@@ -1954,16 +1965,19 @@ fn prompt_origin_is_question_aware() {
         }),
         ..Default::default()
     };
+    rec.typing_mark = Some(5.0);
     apply_prompt(&mut rec, "d-old", "earlier", "human", 5.0);
     assert!(
         rec.question.as_ref().unwrap().first_human.is_none(),
         "a prompt before the question is no answer"
     );
     apply_prompt(&mut rec, "d1", "[worker] done", "machine", 11.0);
+    rec.typing_mark = Some(12.0);
     apply_prompt(&mut rec, "d2", "예", "human", 12.0);
     let q = rec.question.clone().unwrap();
     assert!(q.machine_seen);
     assert_eq!(q.first_human.as_ref().map(|f| f.0.as_str()), Some("d2"));
+    rec.typing_mark = Some(13.0);
     apply_prompt(&mut rec, "d3", "아니", "human", 13.0);
     assert_eq!(
         rec.question
@@ -1984,7 +1998,10 @@ fn prompt_origin_is_question_aware() {
     };
     apply_prompt(&mut u, "d", "?", "unknown", 2.0);
     assert!(u.question.unwrap().machine_seen);
-    let mut n = PromptOrigin::default();
+    let mut n = PromptOrigin {
+        typing_mark: Some(1.0),
+        ..Default::default()
+    };
     apply_prompt(
         &mut n,
         "d",
@@ -2005,12 +2022,39 @@ fn prompt_origin_is_question_aware() {
         ["claude.md", "route_contract.md", "x_directive.md"]
     );
     assert!(named_rule_docs("_directive.md soul notes.md").is_empty());
+    // CI1: the hook's `human` alone (no typing mark) — Level 1: origin and last_human only
+    let mut h = PromptOrigin {
+        question: Some(OpenQuestion {
+            asked_at: 1.0,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    apply_prompt(&mut h, "d", "예 고쳐라 soul.md", "human", 2.0);
+    assert_eq!(h.origin, "human");
+    assert_eq!(h.last_human, Some(("d".to_string(), 2.0)));
+    assert!(h.named_docs.is_empty() && h.last_typed.is_none());
+    let q = h.question.unwrap();
+    assert!(q.machine_seen && q.first_human.is_none());
 }
 
 /// The record lives in the daemon's map and is dropped with the seat.
 #[test]
 fn prompt_origin_record_on_daemon() {
     let daemon = crate::team_gate_tests::tmp_daemon("t3-origin", false);
+    // RULINGS CI1 (T4): without the seat's typing mark the hook's `human` names nothing
+    record_prompt_origin(&daemon, 5, "고쳐라 soul.md", None, Some("human"));
+    assert!(daemon
+        .repair_prompt_origin
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())[&5]
+        .named_docs
+        .is_empty());
+    mark_app_typing(
+        &daemon.repair_prompt_origin,
+        5,
+        cys::repair::ledger::now_epoch(),
+    );
     record_prompt_origin(&daemon, 5, "고쳐라 soul.md", None, Some("human"));
     {
         let m = daemon
@@ -2543,8 +2587,10 @@ fn ad4_hook_line_confirmed_only_by_the_registrar_report() {
     assert!(!hook_line_confirmed(&rep(vec![]), "Stop", "x.sh"));
 }
 
-/// AD6: rule documents (C10 names, any folder, any case, `<x>_directive.md`) are refused at `begin`
-/// with the not-implemented sentence, and nothing is written.
+/// AD6 (rewritten by T4 — the owner-token gate replaced the interim not-implemented refusal): rule
+/// documents (C10 names, any folder, any case, `<x>_directive.md`) are refused at `begin` without an
+/// owner-instruction token — here mixed with a general file — with T4's rule-document sentence, and
+/// nothing is written.
 #[test]
 fn ad6_rule_documents_fail_closed() {
     let r = rig("ad6");
@@ -2565,8 +2611,9 @@ fn ad6_rule_documents_fail_closed() {
                 json!({"trigger": "owner_order", "files": ["bin/a.py", rel]}),
             )
             .unwrap_err();
-        assert_eq!(e.code, "repair_not_implemented", "{rel}");
+        assert_eq!(e.code, "repair_precondition", "{rel}");
         assert!(e.message.contains("규칙 문서"), "{}", e.message);
+        assert!(e.message.contains(rel), "the refusal names the file: {}", e.message);
     }
     for rel in [
         "bin/a.py",
@@ -3644,7 +3691,9 @@ fn bj3_folded_spellings_of_protected_names_refused() {
                 json!({"trigger": "owner_order", "files": [rel]}),
             )
             .unwrap_err();
-        assert_eq!(e.code, "repair_not_implemented", "{rel}");
+        // T4: refused by the rule-document branch (no owner token), naming the real file (BJ3)
+        assert_eq!(e.code, "repair_precondition", "{rel}");
+        assert!(e.message.contains("주인 지시 표"), "{rel}: {}", e.message);
         assert!(
             e.message.contains(&format!("(= {real})")),
             "{rel}: {}",

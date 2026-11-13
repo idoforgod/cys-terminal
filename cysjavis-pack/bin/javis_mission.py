@@ -1619,6 +1619,58 @@ def machine_origin(prompt, delivery=None, ledger_status=None):
     return False, ""
 
 
+# ── 0.15.0 「스스로 해결」 M5·M13 — 주인 본인 입력 판정(실패 시 닫힘 · Rust `mission_gate::owner_typed` 파리티) ──
+# 임무 판정(`machine_origin`)은 "애매하면 통과"로 맞춰져 있다(오너 지시가 기계로 접히면 부재중 자율 진행이
+# 멈추기 때문). 자동 수리 허락(C9)과 규칙 문서의 주인 지시 표(C10)를 여는 판정은 **반대 방향**이어야 한다 —
+# "확실하지 않으면 주인의 입력이 아닌 것으로"(설계 §4-13 · C10 10.1). 그래서 층1·층2 판정(`origin`)이 `human`
+# 이어도 근거가 불완전하면 주인의 입력으로 세지 않는다: 원장이 `ok` 가 아니거나(부재 = 층1 근거 없음 — 데몬의
+# 기동 표식 불변식 아래에서는 손상), 그 판독에 근거 결손 이상징후가 있거나, 프롬프트가 harness 가 합성한
+# 알림(층0)이거나 기동 명령문(층0-c)이면 아니다. `ledger_rotated` 는 결손으로 세지 않는다(회전은 평시 상태이고
+# 판독 세대가 덮는 창 밖의 옛 배달만 대조를 잃는다 — 정직 고지). 같은 사용자 권한으로 원장·대장을 직접 고치는
+# 위조는 막지 못한다(같은 등급의 한계 — docs/THREAT-MODEL-mission-gate.md).
+OWNER_DOUBT_CODES = ("ledger_bad_lines", "ledger_schema_skew", "delivery_parts_capped")
+
+# RULINGS CI1·CJ3(T4): 알림 가족 — `task-notification` 과 그 안에서만 쓰이는 컨텍스트 마커. 이 가족의
+# **태그**(여는·닫는·자기닫힘 · 대소문자 무관 · 속성·태그 안 공백 허용 · 짝 무관)가 하나라도 든 프롬프트는
+# 주변 글과 무관하게 harness 가 합성한 차례다(Rust `mission_gate::owner_notification_family` ·
+# `holds_notification_tag` 파리티 — `_HARNESS_TAG` 와 같은 모양, 이름만 가족으로 좁힌다).
+OWNER_NOTIFICATION_FAMILY = ("task-notification",) + HARNESS_CONTEXT_MARKERS
+_NOTIFICATION_FAMILY_TAG = re.compile(
+    r"<\s*/?\s*(?:%s)(?![\w-])[^<>]*>"
+    % "|".join(re.escape(m) for m in sorted(OWNER_NOTIFICATION_FAMILY, key=len, reverse=True)),
+    re.IGNORECASE)
+
+
+def holds_notification_tag(prompt):
+    """RULINGS CJ3 — 프롬프트에 알림 가족의 태그가 하나라도 있는가(블록이 아니라 태그 — 짝 무관)."""
+    return _NOTIFICATION_FAMILY_TAG.search(prompt or "") is not None
+
+
+def owner_typed(prompt, origin, ledger_status, anomaly_codes):
+    """(bool, 사유) — 이 프롬프트를 **주인이 직접 친 것**으로 셀 수 있는가(실패 시 닫힘).
+
+    origin = `hook.machine_origin` 의 `human`·`machine`·`unknown` · ledger_status = `ok`·`absent`·
+    `unreadable` · anomaly_codes = 그 판정의 이상징후 코드 목록. 부작용 0."""
+    if origin != "human":
+        return False, "출처 판정이 %r — 기계·판정 불가는 주인의 입력이 아니다" % (origin,)
+    if ledger_status != LEDGER_OK:
+        return False, ("배달 원장 상태 %r — 층1 근거가 없으면 주인의 입력으로 세지 않는다"
+                       % (ledger_status,))
+    doubt = [c for c in (anomaly_codes or ()) if c in OWNER_DOUBT_CODES]
+    if doubt:
+        return False, "원장 근거 결손(%s) — 확실하지 않으므로 주인의 입력이 아니다" % ", ".join(doubt)
+    hit, why = harness_origin(prompt)
+    if hit:
+        return False, "harness 가 합성한 알림(층0) — %s" % why
+    if holds_notification_tag(prompt):
+        return False, ("알림 가족 태그(task-notification 등)가 들어 있다 — 주변 글·짝과 무관하게 harness 가 "
+                       "합성한 차례다(RULINGS CI1 · CJ3)")
+    boot, why = boot_command_origin(prompt)
+    if boot:
+        return False, "기동 명령문(층0-c) — %s" % why
+    return True, ""
+
+
 def _fail_closed(reason):
     """의존 모듈 소실·판독 불가 — 조용히 접지 않고 stderr 1줄(선례 javis_detect CS-8⑤)."""
     sys.stderr.write("[mission] 판정 불가(fail-closed · 임무 없음으로 취급): %s\n" % reason)
@@ -2527,7 +2579,7 @@ def cmd_hook_triage(argv):
 #   · fixture 존재+불량 → **hard fail**(조용한 폴백은 corpus 부식을 통과로 접는다).
 #   · 정상              → fixture ⊇ 내장 리터럴 불변식까지 검사.
 MISSION_CORPUS_SECTIONS = ("layer0", "layer0c", "layer1", "layer2", "digest_vectors",
-                           "mission_extract")
+                           "mission_extract", "owner_typed")
 
 # 내장 폴백(= fixture 의 진부분집합). 축마다 **양방향**(접힘 1 · 통과 1)을 갖춘다 — 한 방향만
 # 두면 "전부 접는다"·"전부 통과시킨다"는 무력화가 초록으로 지나간다.
@@ -2579,6 +2631,13 @@ MISSION_CORPUS_FALLBACK = {
          "expect": {"label": True, "head": "["}},
         {"name": "L2-owner-plain", "text": "다음 액션 착수해줘",
          "expect": {"label": False, "head": "다"}},
+    ],
+    # 0.15.0 M5·M13 주인 본인 입력 판정(`owner_typed`) — 실패 시 닫힘 축(통과 1 · 닫힘 1).
+    "owner_typed": [
+        {"name": "OT-human-ok", "text": "예", "origin": "human", "ledger_status": "ok",
+         "anomalies": [], "expect": {"owner": True}},
+        {"name": "OT-ledger-absent", "text": "예", "origin": "human", "ledger_status": "absent",
+         "anomalies": ["ledger_absent"], "expect": {"owner": False}},
     ],
     # 대장 **writer**(extract_mission) 골든. reader 축들과 달리 "대장에 무엇이 쓰이는가"를 잰다.
     "mission_extract": [
@@ -2849,6 +2908,12 @@ def _selftest_mission_corpus(fails):
             _want = _corpus_text(_want)
         _eq("mission_extract", c["name"], "mission",
             extract_mission(_corpus_text(c["text"]), _me_detect)[0], _want)
+
+    # ── ⑤-d owner_typed — 주인 본인 입력 판정(0.15.0 M5·M13 · 실패 시 닫힘 · Rust 파리티) ──────
+    for c in data.get("owner_typed") or []:
+        _got, _ = owner_typed(_corpus_text(c["text"]), c.get("origin"), c.get("ledger_status"),
+                              c.get("anomalies") or [])
+        _eq("owner_typed", c["name"], "owner", _got, c["expect"]["owner"])
 
     # ── ⑥ 층2 — push 규약 라벨 ───────────────────────────────────────────────
     for c in data["layer2"]:

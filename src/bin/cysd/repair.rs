@@ -18,6 +18,10 @@
 #[path = "repair_ledger_tests.rs"]
 mod ledger_tests;
 
+#[cfg(test)]
+#[path = "repair_grant_tests.rs"]
+mod grant_tests;
+
 use crate::handlers::Reply;
 use crate::state::Daemon;
 use cys::repair::roles::{reviewer_slot_of, verb_class, CallerKind, ReviewerSlot, VerbClass};
@@ -29,7 +33,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 /// The daemon sub-verbs of `repair.` (O-C3-1, N-4; `recheck` H5/H8, `grant_ask` Q1,
-/// `owner_token_ask` Q2) — 23.
+/// `owner_token_ask` Q2, `grant_status` CI6 (b)) — 24.
 pub(crate) const REPAIR_SUBVERBS: &[&str] = &[
     "report",
     "begin",
@@ -54,6 +58,7 @@ pub(crate) const REPAIR_SUBVERBS: &[&str] = &[
     "recheck",
     "grant_ask",
     "owner_token_ask",
+    "grant_status",
 ];
 
 /// The sub-verbs whose bodies are track T3's (the rest answer `repair_not_implemented` after the
@@ -68,6 +73,16 @@ pub(crate) const T3_VERBS: &[&str] = &[
     "list",
     "status",
     "cleanup",
+];
+
+/// The sub-verbs whose bodies are track T4's (C9 grant, C10 owner token).
+pub(crate) const T4_VERBS: &[&str] = &[
+    "grant",
+    "grant_ask",
+    "owner_token",
+    "owner_token_ask",
+    "rule_doc_allowed",
+    "grant_status",
 ];
 
 /// M4 (★OWNER-REPORT with the other Windows limits): on Windows a seatless command line is not a
@@ -300,6 +315,9 @@ pub(crate) struct Ctx<'a> {
     pub hook_step: &'a HookStepFn<'a>,
     /// The grant claim of K8 / G1 (`grant::try_claim_autonomous_start`, T4's, in production).
     pub claim: &'a ClaimFn<'a>,
+    /// T4: the per-seat prompt record (`Daemon.repair_prompt_origin` in production — T3 writes it,
+    /// the owner-decision verbs read it and register their questions in it).
+    pub prompts: &'a Mutex<HashMap<u64, PromptOrigin>>,
 }
 
 /// The shape of `grant::try_claim_autonomous_start` (injected so a pick-up's claim answers —
@@ -383,6 +401,7 @@ pub(crate) fn handle(
         check: &check,
         hook_step: &cys::repair::apply::hook_lines_step,
         claim: &cys::repair::grant::try_claim_autonomous_start,
+        prompts: &daemon.repair_prompt_origin,
     };
     Reply::Single(match handle_with(&ctx, &caller, sub, params) {
         Ok(v) => ok_response(id, v),
@@ -408,13 +427,20 @@ pub(crate) fn handle_with(
         "list" => ledger_verbs::list(ctx),
         "status" => ledger_verbs::status(ctx, params),
         "cleanup" => ledger_verbs::cleanup(ctx, caller, params),
+        // T4 (C9, C10): the owner-decision verbs and the rule-document read
+        "grant" => grant_verbs::grant(ctx, caller, params),
+        "grant_ask" => grant_verbs::grant_ask(ctx, caller, params),
+        "owner_token" => grant_verbs::owner_token(ctx, caller, params),
+        "owner_token_ask" => grant_verbs::owner_token_ask(ctx, caller, params),
+        "rule_doc_allowed" => grant_verbs::rule_doc_allowed(ctx, caller, params),
+        "grant_status" => grant_verbs::grant_status(ctx, params),
         "revert" => {
             ledger_verbs::worker_lane_check(ctx, caller, params).and_then(|_| not_implemented(sub))
         }
         _ => {
             debug_assert!(
-                !T3_VERBS.contains(&sub),
-                "a T3 verb fell through to the stub"
+                !T3_VERBS.contains(&sub) && !T4_VERBS.contains(&sub),
+                "a T3 / T4 verb fell through to the stub"
             );
             not_implemented(sub)
         }
@@ -1409,10 +1435,6 @@ mod ledger_verbs {
                 "--joins 와 --resolves 는 함께 쓸 수 없습니다",
             ));
         }
-        if param_str(p, "owner_token").is_some() {
-            // C10 10.6: the rule-document gate and the token binding are T4's hook into `begin`.
-            return Err(RepairError::NotImplemented("begin --owner-token (규칙 문서 관문)").into());
-        }
         let trigger = trigger_of(p)?;
         let (files, hooks) = begin_targets(p)?;
         // AU4 / BJ3, AK6, AW3 (b): the name and path rules over every named target, before anything
@@ -1420,6 +1442,11 @@ mod ledger_verbs {
         // repair itself — BJ2).
         for rel in &files {
             target_rules(ctx, rel)?;
+        }
+        // T4 (C10 10.6 · AD6 replaced · AW8): the rule-document branch — a rule document (any
+        // spelling that folds to one, also through `--joins`) starts only with a valid owner token.
+        if let Some(v) = begin_rule_document(ctx, caller, p, trigger, &files, &hooks, joins, resolves)? {
+            return Ok(v);
         }
         if let Some(r) = joins {
             let target = RepairId::parse(r).map_err(|_| {
@@ -1437,27 +1464,6 @@ mod ledger_verbs {
             }
             None => None,
         };
-        // AD6 / C10 10.6 / BJ3: a rule document (any spelling that folds to one) is refused until
-        // T4's owner-token gate is merged (fail closed); the sentence names the real file.
-        if let Some((rel, doc)) = files
-            .iter()
-            .find_map(|r| super::rule_document_name(r).map(|d| (r, d)))
-        {
-            let base = rel.rsplit(['/', '\\']).next().unwrap_or(rel);
-            let real = super::real_name_in(&ctx.pack_dir, rel).unwrap_or(doc);
-            let named = if real == base {
-                rel.clone()
-            } else {
-                format!("{rel} (= {real})")
-            };
-            return Err(VerbError::new(
-                cys::repair::types::ERR_NOT_IMPLEMENTED,
-                format!(
-                    "{} (규칙 문서 수리 — 주인 지시 표 관문 · C10): {named}",
-                    cys::repair::NOT_IMPLEMENTED_KO
-                ),
-            ));
-        }
         // Classification (C4 · T5a) — refused when it cannot be decided (fail closed).
         let mut class = Classification::General;
         for rel in &files {
@@ -1706,6 +1712,251 @@ mod ledger_verbs {
         })?;
         let rec = load(ctx, &id)?;
         Ok(begin_reply(ctx, &rec, "new"))
+    }
+
+    /// T4 — THE rule-document branch of `begin` (C10 10.3 / 10.6; RULINGS AD6 replaced, AW8, BJ3, F10,
+    /// F11, O-C10-2, O-C10-5). `None` = not a rule-document begin (no target folds to a rule document,
+    /// no `--joins` of a rule-document repair, no `--owner-token`): T3's flow continues. Otherwise the
+    /// begin is refused or done HERE: every target a rule document (no mixing, no hook line), never
+    /// `--joins`, trigger `owner-order` only (the grant never covers rule documents), a valid token of
+    /// THIS lane, unexpired, covering every target and not bound to another repair; then T3's
+    /// `begin_locked` with `RuleDocument` (its pre-image copy into the vault IS the backup — O-C10-5)
+    /// and the binding — the record's `owner_token_sha256`, the token's `repair` / `used_by_repair`.
+    /// Every refusal names the real file (BJ3) and writes nothing.
+    #[allow(clippy::too_many_arguments)]
+    fn begin_rule_document(
+        ctx: &Ctx<'_>,
+        caller: &Caller,
+        p: &Value,
+        trigger: Trigger,
+        files: &[String],
+        hooks: &[(String, String)],
+        joins: Option<&str>,
+        resolves: Option<&str>,
+    ) -> Result<Option<Value>, VerbError> {
+        use cys::repair::owner_origin as oo;
+        use cys::repair::types::{ERR_CORRUPT, ERR_LOCKED, ERR_PRECONDITION};
+        let token = param_str(p, "owner_token");
+        let named = |rel: &str| -> Option<String> {
+            let doc = super::rule_document_name(rel)?;
+            let base = rel.rsplit(['/', '\\']).next().unwrap_or(rel);
+            let real = super::real_name_in(&ctx.pack_dir, rel).unwrap_or(doc);
+            Some(if real == base {
+                rel.to_string()
+            } else {
+                format!("{rel} (= {real})")
+            })
+        };
+        let docs: Vec<String> = files.iter().filter_map(|r| named(r)).collect();
+        let joined_doc = joins
+            .and_then(|j| RepairId::parse(j).ok())
+            .is_some_and(|jid| {
+                matches!(ledger::read_record_in(&ctx.root, &jid),
+                    Ok(Some(ref r)) if r.classification == Classification::RuleDocument)
+            });
+        if docs.is_empty() && !joined_doc {
+            if token.is_some() {
+                return Err(VerbError::invalid(
+                    "--owner-token 은 규칙 문서(soul.md·CLAUDE.md·*_DIRECTIVE.md …) 수리에만 씁니다",
+                ));
+            }
+            return Ok(None);
+        }
+        let list = if docs.is_empty() {
+            joins.unwrap_or_default().to_string()
+        } else {
+            docs.join(", ")
+        };
+        let refuse = |why: String| -> Result<Option<Value>, VerbError> {
+            Err(VerbError::new(ERR_PRECONDITION, why))
+        };
+        if joins.is_some() {
+            return refuse(format!("규칙 문서는 병합 모드(--joins)로 합칠 수 없습니다: {list} — 이 부서에서 주인 지시 표를 받아 `--owner-token` 으로 새 수리를 시작하세요(C10)"));
+        }
+        if docs.len() != files.len() || !hooks.is_empty() {
+            return refuse(format!("규칙 문서({list})와 다른 파일·훅 등록 해제를 한 수리에 섞지 마세요 — 규칙 문서 수리는 주인 지시 표로 따로 시작합니다(C10)"));
+        }
+        if trigger != Trigger::OwnerOrder {
+            return refuse(format!("규칙 문서({list})는 주인의 지시로만 고칩니다 — 자동 수리 허락·업데이트는 규칙 문서에 미치지 않습니다(`--trigger owner-order` 와 주인 지시 표 · C10 10.3)"));
+        }
+        let Some(token) = token else {
+            return refuse(format!("규칙 문서 수리에는 주인 지시 표가 필요합니다: {list} — 마스터가 `cys repair owner-token --path …` 로 받은 표를 티켓대로 `--owner-token` 에 넘기세요(C10 10.6)"));
+        };
+        if !oo::is_token_shape(token) {
+            return refuse(format!(
+                "주인 지시 표의 형식이 아닙니다(ot- 뒤 26자): {list}"
+            ));
+        }
+        for rel in files {
+            match (ctx.classify)(rel)? {
+                Classification::General | Classification::RuleDocument => {}
+                other => {
+                    return refuse(format!(
+                        "{rel}: 규칙 문서이면서 '{}' 로 분류된 파일입니다 — 1차 출시의 주인 지시 표 경로는 이 조합을 다루지 않습니다",
+                        other.label_ko()
+                    ))
+                }
+            }
+        }
+        let resolves = match resolves {
+            Some(r) => {
+                let rid = RepairId::parse(r).map_err(|_| {
+                    VerbError::invalid(format!("--resolves 값이 수리 번호가 아닙니다: {r:?}"))
+                })?;
+                load(ctx, &rid)?;
+                Some(rid)
+            }
+            None => None,
+        };
+        let sha = oo::token_sha256(token);
+        let sid = caller
+            .seat()
+            .ok_or_else(|| VerbError::refused("좌석이 없습니다"))?;
+        let owner = ctx.owner(sid);
+        let key = target_key(files, &[]);
+        ctx.locked("begin:lane", || -> Result<Option<Value>, VerbError> {
+            let tok = match oo::read_token_in(&ctx.root, &sha) {
+                Ok(Some(t)) => t,
+                Ok(None) => {
+                    return refuse(format!(
+                        "이 주인 지시 표는 이 설치에서 발급된 적이 없습니다: {list}"
+                    ))
+                }
+                Err(e) => {
+                    return Err(VerbError::new(
+                        ERR_CORRUPT,
+                        format!(
+                            "주인 지시 표를 읽을 수 없어 시작하지 않습니다: {}",
+                            VerbError::from(e).message
+                        ),
+                    ))
+                }
+            };
+            // the repair this begin would pick up (T3's pick-up set: this lane, being worked, the same
+            // targets and `--resolves`) — a token is used by ONE repair (O-C10-2)
+            let mut bound_to: Option<RepairId> = None;
+            for id in ledger::list_ids_in(&ctx.root) {
+                let Ok(Some(r)) = ledger::read_record_in(&ctx.root, &id) else {
+                    continue;
+                };
+                if r.origin_lane != ctx.lane
+                    || !pickable(&r.state)
+                    || r.resolves != resolves
+                    || record_key(&r) != key
+                {
+                    continue;
+                }
+                match r.owner_token_sha256.as_deref() {
+                    Some(x) if x == sha => bound_to = Some(r.id.clone()),
+                    Some(_) => {
+                        return refuse(format!(
+                            "{}: 이 파일의 열린 규칙 문서 수리는 다른 주인 지시 표로 시작됐습니다 — 그 표로 이어받으세요",
+                            r.id.as_str()
+                        ))
+                    }
+                    None => {}
+                }
+            }
+            oo::check_token_for_begin(&tok, &ctx.lane, files, ctx.now, bound_to.as_ref())
+                .map_err(|m| VerbError::new(ERR_PRECONDITION, format!("{m}: {list}")))?;
+            let v = begin_locked(
+                ctx,
+                &owner,
+                Classification::RuleDocument,
+                Trigger::OwnerOrder,
+                files,
+                &[],
+                resolves.clone(),
+                &key,
+            )?;
+            let picked = v
+                .get("begin")
+                .and_then(|b| b.as_str())
+                .unwrap_or("new")
+                .to_string();
+            let id = v
+                .get("repair")
+                .and_then(|x| x.as_str())
+                .and_then(|x| RepairId::parse(x).ok())
+                .ok_or_else(|| VerbError::new("io", "begin 응답에 수리 번호가 없습니다"))?;
+            ctx.locked(id.as_str(), || -> Result<(), VerbError> {
+                let mut rec = load(ctx, &id)?;
+                if lock::view(rec.lock.as_ref(), &owner, ctx.now, &ctx.lane, &ctx.incarnation)
+                    != LockView::Mine
+                {
+                    return Err(VerbError::new(
+                        ERR_LOCKED,
+                        format!("{}: 이 수리의 잠금이 이 좌석의 것이 아닙니다", id.as_str()),
+                    ));
+                }
+                if rec.classification != Classification::RuleDocument {
+                    let _ = ledger::release_lock_in(&ctx.root, &id, &owner, None);
+                    return Err(VerbError::new(
+                        ERR_PRECONDITION,
+                        format!(
+                            "{}: 규칙 문서 수리가 아닌 열린 수리입니다 — 주인 지시 표를 묶지 않습니다",
+                            id.as_str()
+                        ),
+                    ));
+                }
+                rec.owner_token_sha256 = Some(sha.clone());
+                write(ctx, &rec)?;
+                let mut t = tok.clone();
+                t.repair = Some(id.clone());
+                t.used_by_repair = Some(id.clone());
+                oo::write_token_in(&ctx.root, &t).map_err(VerbError::from)
+            })?;
+            let rec = load(ctx, &id)?;
+            let mut out = begin_reply(ctx, &rec, &picked);
+            out["owner_token_bound"] = json!(true);
+            Ok(Some(out))
+        })
+    }
+
+    /// T4 — RULINGS AQ8 (AI9; D:937 "CSO 지침을 고치는 수리 후보가 등록 표지를 지우면 데몬이 거부한다"):
+    /// `record` and `commit` refuse a repair whose target is the CSO directive when the pre-image's
+    /// first 20 lines hold the revision marker the registrar reads and the candidate's do not
+    /// (`owner_origin::CSO_DIRECTIVE_REV_MARKER`, parity-tested against `javis_preflight.py`). AS1: the
+    /// CSO directive is a rule document and never a protection row — this is its only guard.
+    fn cso_marker_refusal(
+        ctx: &Ctx<'_>,
+        rec: &RepairRecord,
+        states: &[(String, TargetState)],
+    ) -> Result<(), VerbError> {
+        use cys::repair::owner_origin as oo;
+        let staging = ledger::staging_dir_in(&ctx.root, &rec.id);
+        for f in file_targets(rec) {
+            if oo::folded_base(&f.rel) != oo::CSO_DIRECTIVE_NAME {
+                continue;
+            }
+            let Some(pre) = slot_payload(&f.pre, &f.rel).and_then(|p| std::fs::read(p).ok())
+            else {
+                continue; // absent (or a link) before the repair — no marker to keep
+            };
+            if !oo::cso_marker_in_head(&String::from_utf8_lossy(&pre)) {
+                continue;
+            }
+            let keeps = match states.iter().find(|(r, _)| *r == f.rel) {
+                Some((_, TargetState::File { .. })) => {
+                    let path = if is_approval_class(rec.classification) {
+                        staging.join(&f.rel)
+                    } else {
+                        live_path(ctx, &f.rel)
+                    };
+                    std::fs::read(&path)
+                        .map(|b| oo::cso_marker_in_head(&String::from_utf8_lossy(&b)))
+                        .unwrap_or(false)
+                }
+                _ => false,
+            };
+            if !keeps {
+                return Err(VerbError::new(
+                    cys::repair::types::ERR_PRECONDITION,
+                    oo::cso_marker_refusal_ko(&f.rel),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// The name and path rules of ONE target (used by `begin` for every named file and by
@@ -2025,7 +2276,8 @@ mod ledger_verbs {
                 if rec.trigger == Trigger::Grant && rec.resolves.is_none() {
                     // B4 / K3: a new round of a grant-triggered repair asks T4 (paused → refused).
                     if !cys::repair::grant::may_open_new_round(&id)? {
-                        return Err(VerbError::new(cys::repair::types::ERR_PRECONDITION, "자동 수리 허락이 일시정지 중이라 새 라운드를 열 수 없습니다"));
+                        // CH7 (T4): the sentence says whether the grant is off or paused
+                        return Err(VerbError::new(cys::repair::types::ERR_PRECONDITION, cys::repair::grant::new_round_refusal(&id)));
                     }
                 }
                 rec.attempt += 1;
@@ -2033,6 +2285,7 @@ mod ledger_verbs {
             path_rules(ctx, &rec, None)?;
             let states = current_states(ctx, &rec)?;
             path_rules(ctx, &rec, Some(states.as_slice()))?;
+            cso_marker_refusal(ctx, &rec, &states)?; // T4 (AQ8)
             let staging = ledger::staging_dir_in(&ctx.root, &id);
             let approval_class = is_approval_class(rec.classification);
             for f in rec.files.iter_mut() {
@@ -2356,6 +2609,7 @@ mod ledger_verbs {
             path_rules(ctx, &rec, None)?;
             let states = current_states(ctx, &rec)?;
             path_rules(ctx, &rec, Some(states.as_slice()))?;
+            cso_marker_refusal(ctx, &rec, &states)?; // T4 (AQ8)
             if fingerprint(&states) != verify.fingerprint_sha256 {
                 return Err(VerbError::new(
                     "target_changed",
@@ -2983,14 +3237,596 @@ mod ledger_verbs {
     }
 }
 
+// Track T4 — the owner-decision verbs `grant` / `grant_ask` / `owner_token` / `owner_token_ask` and
+// the READ verb `rule_doc_allowed` (C9, C10; RULINGS B1, B4, F10, F11, Q1, Q2, T3, T5, U4). An inline
+// module for the same reason as `ledger_verbs` (the C8 census follows production file modules only
+// from `main.rs`).
+mod grant_verbs {
+    //! The master seat only conveys the OWNER's decision (the role table admits only a master seat
+    //! whose role family is unchanged — J1, AK1); every decision takes effect only after the daemon's
+    //! own owner-origin check over the per-seat prompt record (`owner_origin`, fail closed). None of
+    //! these verbs writes or changes an `R-*` record (F10). ★No queue / alert / bus traffic (F1) and
+    //! no panic paths (F4).
+
+    use super::{Caller, Ctx, OpenQuestion, PromptOrigin, VerbError};
+    use cys::repair::grant::{self, GrantDecision, GrantState};
+    use cys::repair::owner_origin::{self as oo, PromptView, QuestionView};
+    use cys::repair::types::{Classification, RepairId, ERR_PRECONDITION};
+    use cys::repair::{intake, ledger, lock};
+    use serde_json::{json, Value};
+    use std::path::Path;
+
+    fn param_str<'a>(p: &'a Value, k: &str) -> Option<&'a str> {
+        p.get(k).and_then(|v| v.as_str())
+    }
+
+    fn seat(caller: &Caller) -> Result<u64, VerbError> {
+        caller
+            .seat()
+            .ok_or_else(|| VerbError::refused("좌석이 없습니다"))
+    }
+
+    /// A copy of the seat's prompt record (taken under the lock; judged without it).
+    fn record_of(ctx: &Ctx<'_>, sid: u64) -> Option<PromptOrigin> {
+        ctx.prompts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&sid)
+            .cloned()
+    }
+
+    fn question_view(q: &OpenQuestion) -> QuestionView<'_> {
+        QuestionView {
+            asked_at: q.asked_at,
+            path: q.path.as_deref(),
+            first_human: q
+                .first_human
+                .as_ref()
+                .map(|(d, e, at)| (d.as_str(), e.as_str(), *at)),
+            machine_seen: q.machine_seen,
+        }
+    }
+
+    fn prompt_view(r: &PromptOrigin) -> PromptView<'_> {
+        PromptView {
+            digest: &r.digest,
+            origin: &r.origin,
+            at: r.at,
+            question: r.question.as_ref().map(question_view),
+            named_docs: &r.named_docs,
+            last_human: r.last_human.as_ref().map(|(d, at)| (d.as_str(), *at)),
+            last_typed: r.last_typed.as_ref().map(|(d, at)| (d.as_str(), *at)),
+            named_numbers: &r.named_numbers,
+        }
+    }
+
+    /// Consumes the seat's open question if it is still the one judged (same `asked_at`); `true` =
+    /// this call consumed it (a concurrent call that consumed it first leaves `false`).
+    fn consume_question(ctx: &Ctx<'_>, sid: u64, asked_at: f64) -> bool {
+        let mut map = ctx.prompts.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(r) = map.get_mut(&sid) {
+            if r.question.as_ref().is_some_and(|q| q.asked_at == asked_at) {
+                r.question = None;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// RULINGS CI3: takes the naming of `base` out of the seat's latest Level-2 prompt — only while
+    /// that prompt is still the one judged (`typed` = its digest and time) and still names `base`;
+    /// `true` = this call took it (one naming, one token — a concurrent second call gets `false`).
+    fn take_naming(ctx: &Ctx<'_>, sid: u64, base: &str, typed: (&str, f64)) -> bool {
+        let mut map = ctx.prompts.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(r) = map.get_mut(&sid) else {
+            return false;
+        };
+        if r.last_typed.as_ref().map(|(d, at)| (d.as_str(), *at)) != Some(typed) {
+            return false;
+        }
+        let before = r.named_docs.len();
+        r.named_docs.retain(|n| oo::folded_base(n) != base);
+        r.named_docs.len() != before
+    }
+
+    /// Registers ONE open question for the seat (a newer one replaces an older one — Q1); a grant
+    /// question carries its daily limit (CI4). The seat's typing mark is cleared (CJ2: the typing that
+    /// answers a question comes after the question).
+    fn register(ctx: &Ctx<'_>, sid: u64, path: Option<String>, daily_cap: Option<u32>) -> Value {
+        let mut map = ctx.prompts.lock().unwrap_or_else(|e| e.into_inner());
+        let r = map.entry(sid).or_default();
+        r.typing_mark = None;
+        let replaced = r.question.is_some();
+        r.question = Some(OpenQuestion {
+            asked_at: ctx.now,
+            path: path.clone(),
+            first_human: None,
+            machine_seen: false,
+            daily_cap,
+        });
+        json!({
+            "asked_at": ctx.now,
+            "lapses_at": ctx.now + oo::QUESTION_LAPSE_SECS as f64,
+            "path": path,
+            "replaced_open_question": replaced,
+        })
+    }
+
+    /// The daily limit of the current decision (5 without one — C9; a stored 0 reads as the default).
+    fn current_cap(current: Option<&GrantDecision>) -> u32 {
+        current
+            .map(|d| d.daily_cap)
+            .filter(|c| *c > 0)
+            .unwrap_or(grant::DEFAULT_DAILY_CAP)
+    }
+
+    /// `daily_cap` of a request: absent / null → `None`; an integer 1–100 → `Some`; else refused.
+    fn cap_param(p: &Value) -> Result<Option<u32>, VerbError> {
+        match p.get("daily_cap") {
+            None | Some(Value::Null) => Ok(None),
+            Some(v) => v
+                .as_u64()
+                .filter(|n| (1..=u64::from(grant::MAX_DAILY_CAP)).contains(n))
+                .map(|n| Some(n as u32))
+                .ok_or_else(|| {
+                    VerbError::invalid(format!(
+                        "--daily-cap 은 1~{} 사이의 정수입니다",
+                        grant::MAX_DAILY_CAP
+                    ))
+                }),
+        }
+    }
+
+    /// RULINGS CI4: the limit is set only by `grant ask --daily-cap` (it belongs to the question).
+    const CAP_ON_ASK_ONLY_KO: &str = "하루 상한은 질문에 딸립니다 — `cys repair grant ask --daily-cap N`으로 질문을 등록할 때 정하세요(`grant on`은 주인이 허락한 그 질문의 상한을 쓰고, `grant off`·`grant status`는 상한을 바꾸지 않습니다)";
+
+    /// `pack` + an absolute path → the pack-relative path ('/'-separated), also through the
+    /// canonical forms of both (a path outside the pack → `None`).
+    fn pack_relative(pack: &Path, raw: &Path) -> Option<String> {
+        let strip = |base: &Path, p: &Path| -> Option<String> {
+            p.strip_prefix(base)
+                .ok()
+                .map(|r| r.to_string_lossy().replace('\\', "/"))
+                .filter(|r| !r.is_empty())
+        };
+        if let Some(r) = strip(pack, raw) {
+            return Some(r);
+        }
+        let cpack = std::fs::canonicalize(pack).ok()?;
+        let cparent = std::fs::canonicalize(raw.parent()?).ok()?;
+        strip(&cpack, &cparent.join(raw.file_name()?))
+    }
+
+    /// The pack-relative rule document a `--path` names (absolute paths inside this lane's pack are
+    /// accepted — `guard.sh` passes the tool's absolute path). Not a rule document → refused.
+    pub(super) fn doc_rel(ctx: &Ctx<'_>, raw: &str) -> Result<String, VerbError> {
+        let raw = raw.trim();
+        let p = Path::new(raw);
+        let rel = if p.is_absolute() {
+            pack_relative(&ctx.pack_dir, p).ok_or_else(|| {
+                VerbError::invalid(format!(
+                    "{raw}: 이 부서의 팩 안 경로가 아닙니다 — 규칙 문서는 팩 기준 상대 경로로 적으세요"
+                ))
+            })?
+        } else {
+            raw.to_string()
+        };
+        let rel = intake::normalize_rel(&rel)
+            .map_err(|e| VerbError::invalid(VerbError::from(e).message))?;
+        if super::is_windows_alias(&rel) {
+            return Err(VerbError::invalid(format!(
+                "{rel:?}: 끝이 점·공백이거나 ':' 가 든 경로 조각은 받지 않습니다"
+            )));
+        }
+        if super::rule_document_name(&rel).is_none() {
+            return Err(VerbError::invalid(format!(
+                "{rel}: 규칙 문서(soul.md·CLAUDE.md·*_DIRECTIVE.md·VIBECODING_*·ROUTE_CONTRACT)가 아닙니다 — 주인 지시 표는 규칙 문서에만 씁니다"
+            )));
+        }
+        Ok(rel)
+    }
+
+    /// `cys repair grant ask [--daily-cap N]` (RULINGS Q1, CI4): registers the grant question for
+    /// this master seat with its daily limit — N if given, else the current decision's limit (5
+    /// without one); an N different from that needs the seat's latest Level-2 prompt to hold N as a
+    /// number of its own. The answer is the FIRST Level-2 prompt to this seat after it.
+    pub(crate) fn grant_ask(ctx: &Ctx<'_>, caller: &Caller, p: &Value) -> Result<Value, VerbError> {
+        let sid = seat(caller)?;
+        let requested = cap_param(p)?;
+        let current = current_cap(grant::read_decision_in(&ctx.root).unwrap_or(None).as_ref());
+        let record = record_of(ctx, sid);
+        let view = record.as_ref().map(prompt_view);
+        let cap = oo::judge_daily_cap(view.as_ref(), current, requested)
+            .map_err(|m| VerbError::new(ERR_PRECONDITION, m))?;
+        let mut v = register(ctx, sid, None, Some(cap));
+        v["question"] = json!("grant");
+        v["daily_cap"] = json!(cap);
+        // CJ5: the question the master asks names the limit
+        v["ask_owner"] = json!(oo::grant_question_ko(cap));
+        Ok(v)
+    }
+
+    /// `cys repair owner-token ask --path <doc>` (RULINGS Q2 (b)): registers a token question for
+    /// exactly that rule document.
+    pub(crate) fn owner_token_ask(
+        ctx: &Ctx<'_>,
+        caller: &Caller,
+        p: &Value,
+    ) -> Result<Value, VerbError> {
+        let sid = seat(caller)?;
+        let raw = param_str(p, "path").ok_or_else(|| VerbError::invalid("`path` 가 필요합니다"))?;
+        let rel = doc_rel(ctx, raw)?;
+        let mut v = register(ctx, sid, Some(rel), None);
+        v["question"] = json!("owner_token");
+        Ok(v)
+    }
+
+    /// `cys repair grant on|off` (C9 · RULINGS B1, Q1, T3, T5, U4(b), CI4, CI5 (a)): written to
+    /// `grant.json` (atomic replace, the latest decision wins) only after the owner-origin check.
+    /// `on` takes the daily limit of the answered question; `off` keeps the current limit; neither
+    /// takes `--daily-cap` (CI4 — refused with the sentence naming `grant ask --daily-cap`).
+    pub(crate) fn grant(ctx: &Ctx<'_>, caller: &Caller, p: &Value) -> Result<Value, VerbError> {
+        let sid = seat(caller)?;
+        let mode = param_str(p, "mode").ok_or_else(|| {
+            VerbError::invalid("`mode` 가 필요합니다(on · off — 질문 등록은 `grant ask`)")
+        })?;
+        if !matches!(p.get("daily_cap"), None | Some(Value::Null)) {
+            return Err(VerbError::invalid(CAP_ON_ASK_ONLY_KO));
+        }
+        let current = grant::read_decision_in(&ctx.root).unwrap_or(None);
+        let record = record_of(ctx, sid);
+        let asked_at = record
+            .as_ref()
+            .and_then(|r| r.question.as_ref())
+            .map(|q| q.asked_at);
+        let view = record.as_ref().map(prompt_view);
+        let refuse = |m: String| VerbError::new(ERR_PRECONDITION, m);
+        let decision = match mode {
+            "on" => {
+                let a = oo::judge_grant_on(view.as_ref(), ctx.now).map_err(refuse)?;
+                GrantDecision {
+                    schema: cys::repair::REPAIR_SCHEMA,
+                    state: GrantState::On,
+                    // CI4: the limit of the answered question (registered by `grant ask`)
+                    daily_cap: record
+                        .as_ref()
+                        .and_then(|r| r.question.as_ref())
+                        .and_then(|q| q.daily_cap)
+                        .filter(|c| (1..=grant::MAX_DAILY_CAP).contains(c))
+                        .unwrap_or_else(|| current_cap(current.as_ref())),
+                    decided_at: ctx.now,
+                    decided_lane: ctx.lane.clone(),
+                    decided_seat: sid,
+                    prompt_digest: a.digest,
+                    prompt_excerpt: a.excerpt,
+                    // the owner's answer is itself an owner input (B4); CI5 (a): dated from NOW
+                    paused_at: Some(ctx.now),
+                    resumed_at: Some(ctx.now + grant::PAUSE_QUIET_SECS as f64),
+                }
+            }
+            "off" => {
+                let a = oo::judge_grant_off(view.as_ref(), current.as_ref().map(|d| d.decided_at))
+                    .map_err(refuse)?;
+                GrantDecision {
+                    schema: cys::repair::REPAIR_SCHEMA,
+                    state: GrantState::Off,
+                    daily_cap: current_cap(current.as_ref()), // CI4: `off` never changes the limit
+                    decided_at: ctx.now,
+                    decided_lane: ctx.lane.clone(),
+                    decided_seat: sid,
+                    prompt_digest: a.digest,
+                    prompt_excerpt: a.excerpt,
+                    paused_at: None,
+                    resumed_at: None,
+                }
+            }
+            other => {
+                return Err(VerbError::invalid(format!(
+                    "알 수 없는 mode: {other:?} (on · off)"
+                )))
+            }
+        };
+        grant::write_decision_in(&ctx.root, &decision)?;
+        if let Some(t) = asked_at {
+            if decision.state == GrantState::On
+                || record
+                    .as_ref()
+                    .and_then(|r| r.question.as_ref())
+                    .is_some_and(|q| q.path.is_none())
+            {
+                let _ = consume_question(ctx, sid, t);
+            }
+        }
+        Ok(json!({
+            "grant": decision.state,
+            "daily_cap": decision.daily_cap,
+            "decided_at": decision.decided_at,
+            "decided_lane": decision.decided_lane,
+            "paused_until": decision.resumed_at,
+        }))
+    }
+
+    /// `cys repair owner-token [--repair <R-id>] --path <doc>` (C10 · RULINGS F10, F11, Q2, T3, U4):
+    /// after the owner-origin check, a scoped token `ot-<base32 128 bit>` for exactly that path, valid
+    /// 24 h, single repair, usable by any worker seat of THIS lane; shown once, stored as its hash.
+    pub(crate) fn owner_token(
+        ctx: &Ctx<'_>,
+        caller: &Caller,
+        p: &Value,
+    ) -> Result<Value, VerbError> {
+        let sid = seat(caller)?;
+        let raw = param_str(p, "path").ok_or_else(|| VerbError::invalid("`path` 가 필요합니다"))?;
+        let rel = doc_rel(ctx, raw)?;
+        let repair = match param_str(p, "repair") {
+            None => None,
+            Some(r) => {
+                let id = RepairId::parse(r).map_err(|_| {
+                    VerbError::invalid(format!("--repair 값이 수리 번호가 아닙니다: {r:?}"))
+                })?;
+                match ledger::read_record_in(&ctx.root, &id) {
+                    Ok(Some(rec))
+                        if rec.origin_lane == ctx.lane
+                            && rec.classification == Classification::RuleDocument => {}
+                    Ok(Some(_)) => {
+                        return Err(VerbError::new(
+                            ERR_PRECONDITION,
+                            format!(
+                                "{}: 이 부서의 규칙 문서 수리가 아닙니다",
+                                id.as_str()
+                            ),
+                        ))
+                    }
+                    Ok(None) => {
+                        return Err(VerbError::not_found(format!(
+                            "{}: 그런 수리가 없습니다",
+                            id.as_str()
+                        )))
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+                Some(id)
+            }
+        };
+        let record = record_of(ctx, sid);
+        let view = record.as_ref().map(prompt_view);
+        let (basis, a) = oo::judge_owner_token(view.as_ref(), &rel, ctx.now)
+            .map_err(|m| VerbError::new(ERR_PRECONDITION, m))?;
+        // CI3: the basis is TAKEN before the token exists (one naming / one answer → one token, also
+        // for two concurrent requests); a failure after this point costs the basis (fail closed)
+        let taken = match basis {
+            oo::TokenBasis::NamedInPrompt => {
+                take_naming(ctx, sid, &oo::folded_base(&rel), (a.digest.as_str(), a.at))
+            }
+            oo::TokenBasis::AnsweredQuestion => record
+                .as_ref()
+                .and_then(|r| r.question.as_ref())
+                .is_some_and(|q| consume_question(ctx, sid, q.asked_at)),
+        };
+        if !taken {
+            return Err(VerbError::new(
+                ERR_PRECONDITION,
+                format!("이 근거(주인이 문서를 부른 말 또는 질문의 답)는 방금 다른 요청이 먼저 썼습니다 — 표는 근거 하나에 하나입니다. 주인이 다시 {} 를 부르거나 `cys repair owner-token ask --path {rel}` 뒤 허락해야 합니다", oo::folded_base(&rel)),
+            ));
+        }
+        let hex = crate::channels::random_token_hex()
+            .map_err(|e| VerbError::new("io", format!("난수를 만들 수 없어 표를 만들지 않습니다: {e}")))?;
+        let mut bytes = [0u8; 16];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = hex
+                .get(2 * i..2 * i + 2)
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+                .ok_or_else(|| VerbError::new("io", "난수 형식 오류"))?;
+        }
+        let token = oo::token_from_bytes(&bytes);
+        let record_t = oo::OwnerToken {
+            schema: cys::repair::REPAIR_SCHEMA,
+            token_sha256: oo::token_sha256(&token),
+            lane_key: ctx.lane.clone(),
+            issued_to_seat: sid,
+            paths: vec![rel.clone()],
+            repair,
+            prompt_digest: a.digest,
+            prompt_excerpt: a.excerpt,
+            issued_at: ctx.now,
+            expires_at: ctx.now + oo::TOKEN_TTL_SECS as f64,
+            used_by_repair: None,
+        };
+        oo::create_token_in(&ctx.root, &record_t)?;
+        Ok(json!({
+            "token": token,
+            "path": rel,
+            "expires_at": record_t.expires_at,
+            "basis": match basis {
+                oo::TokenBasis::NamedInPrompt => "named_in_owner_prompt",
+                oo::TokenBasis::AnsweredQuestion => "answered_question",
+            },
+            // O-C10-3: the fixed ticket line (the delegation tool prints it — T7b)
+            "ticket_line": format!("주인 지시 표: {token} (규칙 문서 {rel})"),
+        }))
+    }
+
+    /// `cys repair grant status [--json]` (READ · RULINGS CI6 (b)): the grant as readers need it —
+    /// `{state: on|off, paused, paused_until, daily_cap}`. Any caller the READ class admits (any seat
+    /// of the lane), no owner check; writes and sends nothing. `paused` is the B4 clock (the last
+    /// owner input less than 30 minutes old) whatever the state — a reader combines it with `state`
+    /// (CI6 (c): held while ON and PAUSED). A decision file that exists but cannot be read is an
+    /// error (the reader then behaves as when the state cannot be read); no decision = off.
+    pub(crate) fn grant_status(ctx: &Ctx<'_>, p: &Value) -> Result<Value, VerbError> {
+        if !matches!(p.get("daily_cap"), None | Some(Value::Null)) {
+            return Err(VerbError::invalid(CAP_ON_ASK_ONLY_KO));
+        }
+        let d = grant::read_decision_in(&ctx.root)?;
+        let last = grant::last_owner_input_in(&ctx.root, ctx.now);
+        let paused = grant::is_paused_in(&ctx.root, ctx.now);
+        Ok(json!({
+            "state": if grant::is_on(d.as_ref()) { "on" } else { "off" },
+            "paused": paused,
+            "paused_until": if paused { last.map(|t| t + grant::PAUSE_QUIET_SECS as f64) } else { None },
+            "daily_cap": current_cap(d.as_ref()),
+        }))
+    }
+
+    /// `cys repair rule-doc-allowed --path <p>` (READ · O-C10-4): allowed only when the CALLING seat
+    /// holds this lane's live lock on a being-worked rule-document repair whose bound, unexpired
+    /// token covers that path. Any other case → `allowed: false` (the hook keeps today's behaviour).
+    pub(crate) fn rule_doc_allowed(
+        ctx: &Ctx<'_>,
+        caller: &Caller,
+        p: &Value,
+    ) -> Result<Value, VerbError> {
+        let raw = param_str(p, "path").ok_or_else(|| VerbError::invalid("`path` 가 필요합니다"))?;
+        let no = |why: &str| -> Result<Value, VerbError> {
+            Ok(json!({"allowed": false, "path": raw, "reason": why}))
+        };
+        let Some(sid) = caller.seat() else {
+            return no("좌석이 아닌 호출자");
+        };
+        let rel = match doc_rel(ctx, raw) {
+            Ok(r) => r,
+            Err(e) => return no(&e.message),
+        };
+        let owner = ctx.owner(sid);
+        for id in ledger::list_ids_in(&ctx.root) {
+            let Ok(Some(rec)) = ledger::read_record_in(&ctx.root, &id) else {
+                continue;
+            };
+            if rec.origin_lane != ctx.lane
+                || rec.classification != Classification::RuleDocument
+                || rec.state.closes_for_grant()
+                || lock::view(rec.lock.as_ref(), &owner, ctx.now, &ctx.lane, &ctx.incarnation)
+                    != lock::LockView::Mine
+                || !ledger::file_targets(&rec).any(|f| oo::same_rel(&f.rel, &rel))
+            {
+                continue;
+            }
+            let Some(sha) = rec.owner_token_sha256.as_deref() else {
+                continue;
+            };
+            let Ok(Some(t)) = oo::read_token_in(&ctx.root, sha) else {
+                continue;
+            };
+            if t.lane_key == ctx.lane
+                && t.used_by_repair.as_ref() == Some(&rec.id)
+                && ctx.now < t.expires_at
+                && oo::token_covers(&t, &rel)
+            {
+                return Ok(json!({"allowed": true, "path": rel, "repair": rec.id.as_str()}));
+            }
+        }
+        no("이 좌석이 쥔 규칙 문서 수리(주인 지시 표가 이 경로를 덮는 것)가 없습니다")
+    }
+}
+
+/// T4 (RULINGS B4, CH3) — the daemon side of "주인의 아무 입력이면 즉시 정지": marks an owner input
+/// seen by THIS lane's daemon in the grant's pause file (only while the grant is on; nothing is sent
+/// to any queue). Called at the two places the daemon learns of owner input (`handlers.rs`): an
+/// owner-typed prompt in `hook.machine_origin` (STRICT judgment — CH2) and an operator-typed app send
+/// (`human_verified`). App typing arrives in many small sends, so a lane's mark is rewritten at most
+/// once per `PAUSE_MARK_MIN_GAP_SECS` (the pause may then end that much earlier than 30 minutes after
+/// the very last keystroke).
+pub(crate) fn grant_note_owner_input(daemon: &Daemon) {
+    let root = production_root(daemon);
+    let lane = LaneKey::of_socket(&daemon.socket_path);
+    note_owner_input_throttled(&root, &lane, cys::repair::ledger::now_epoch());
+}
+
+/// T4 (RULINGS CH3 (b), CI1, CJ1) — an operator-verified send into `seat` (`human_verified` in
+/// `handlers.rs`): the pause, for EVERY such send (the safe direction); and the typing mark of Level
+/// 2 only when the operator token did not come from a pane (`verified_from` is none) AND the sent
+/// text is typed or pasted text (`owner_origin::arms_typing_mark` — printable characters plus CR, LF,
+/// TAB only; a focus / mouse report or a terminal's answer to a query arms nothing).
+pub(crate) fn grant_note_app_typing(
+    daemon: &Daemon,
+    seat: u64,
+    verified_from: Option<u64>,
+    text: &str,
+) {
+    grant_note_owner_input(daemon);
+    if verified_from.is_none() && cys::repair::owner_origin::arms_typing_mark(text) {
+        mark_app_typing(
+            &daemon.repair_prompt_origin,
+            seat,
+            cys::repair::ledger::now_epoch(),
+        );
+    }
+}
+
+/// The smallest gap between two pause-mark writes of one lane (seconds).
+pub(crate) const PAUSE_MARK_MIN_GAP_SECS: f64 = 5.0;
+
+/// [`grant_note_owner_input`]'s body (root and clock explicit for the tests).
+pub(crate) fn note_owner_input_throttled(root: &Path, lane: &LaneKey, now: f64) {
+    static LAST: std::sync::OnceLock<Mutex<HashMap<(PathBuf, String), f64>>> =
+        std::sync::OnceLock::new();
+    let key = (root.to_path_buf(), lane.0.clone());
+    let last = LAST.get_or_init(|| Mutex::new(HashMap::new()));
+    if last
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .is_some_and(|t| (now - t).abs() < PAUSE_MARK_MIN_GAP_SECS)
+    {
+        return;
+    }
+    match cys::repair::grant::note_owner_input_in(root, lane, now) {
+        // CI5 (b): the time is remembered only when a mark was actually written
+        Ok(true) => {
+            last.lock().unwrap_or_else(|e| e.into_inner()).insert(key, now);
+        }
+        Ok(false) => {}
+        Err(e) => eprintln!("[cysd] repair grant: owner-input pause not recorded: {e:?}"),
+    }
+}
+
+/// RULINGS CH2 (T4) — the origin the per-seat prompt record takes: the STRICT owner judgment
+/// `mission_gate::owner_typed` over `hook.machine_origin`'s verdict (its `origin`, `ledger_status`
+/// and anomaly codes) and the prompt itself. `human` only when the prompt can be shown to be the
+/// owner's own typing; a harness-synthesised notification, an absent / unreadable delivery ledger,
+/// an anomaly that hides deliveries, or a machine / unknown verdict is not (`machine` stays
+/// `machine`, everything else → `unknown`) — so it can neither become a question's first owner
+/// answer nor name a rule document (fail closed).
+pub(crate) fn strict_origin(norm: &str, reply: &Value) -> &'static str {
+    let lenient = reply
+        .get("origin")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let status = reply
+        .get("ledger_status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let codes: Vec<&str> = reply
+        .get("anomalies")
+        .and_then(|a| a.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.get("code").and_then(|c| c.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
+    if cys::mission_gate::owner_typed(norm, lenient, status, &codes).owner {
+        "human"
+    } else if lenient == "machine" {
+        "machine"
+    } else {
+        "unknown"
+    }
+}
+
 /// The pending final-approval requests (C5; memory only — void after a restart). T5b fills it.
 #[derive(Default)]
 pub(crate) struct ApprovalTable {}
 
 /// The per-seat owner-prompt record (T3 writes, T4 reads). `named_docs` = rule-document base names,
 /// lower-cased, found in the seat's latest owner-typed prompt (RULINGS U4(a)); no prompt text kept.
-/// `digest` / `origin` / `at` describe the seat's LATEST prompt (any origin).
-#[allow(dead_code)] // read by T4's owner-origin helper (wave 2)
+/// `digest` / `origin` / `at` describe the seat's LATEST prompt (any origin). `origin` is LEVEL 1 of
+/// the owner judgment (RULINGS CH2 / CI1 — `strict_origin`): `human` = "may be the owner".
+/// `last_human` = (digest, at) of the latest Level-1 prompt (CH4). LEVEL 2 (CI1, CJ1, CJ2, CJ4) =
+/// Level 1 AND `typing_mark` — the time the daemon last saw the owner's typed or pasted text arrive
+/// from the app into this seat (not from a pane), younger than 30 minutes, not cleared by a question
+/// registered since — AND every harness marker tag of the prompt inside a closed block. The next
+/// Level-1 prompt takes the mark (whether or not it becomes Level 2). `last_typed`, `named_docs`
+/// (U4(a), read from the prompt's free text only) and `named_numbers` (CI4) belong to the latest
+/// Level-2 prompt (T4).
 #[derive(Default, Clone)]
 pub(crate) struct PromptOrigin {
     pub digest: String,
@@ -2998,17 +3834,22 @@ pub(crate) struct PromptOrigin {
     pub at: f64,
     pub question: Option<OpenQuestion>,
     pub named_docs: Vec<String>,
+    pub last_human: Option<(String, f64)>,
+    pub typing_mark: Option<f64>,
+    pub last_typed: Option<(String, f64)>,
+    pub named_numbers: Vec<u32>,
 }
 
 /// An open question of a master seat (RULINGS T3, Q1 / Q2): `first_human` = (digest, excerpt, at).
 /// T4 registers it (`grant ask` / `owner-token ask`); T3 records the answer and `machine_seen`.
-#[allow(dead_code)] // registered and read by T4 (wave 2)
 #[derive(Default, Clone)]
 pub(crate) struct OpenQuestion {
     pub asked_at: f64,
     pub path: Option<String>,
     pub first_human: Option<(String, String, f64)>,
     pub machine_seen: bool,
+    /// RULINGS CI4: the daily limit a grant question carries (`grant ask [--daily-cap N]`).
+    pub daily_cap: Option<u32>,
 }
 
 /// Longest kept excerpt of an owner-typed answer (characters; memory only).
@@ -3039,7 +3880,15 @@ pub(crate) fn record_prompt_origin(
     apply_prompt(entry, &digest, norm, origin.unwrap_or("unknown"), now);
 }
 
-/// Pure part of [`record_prompt_origin`].
+/// Pure part of [`record_prompt_origin`]. RULINGS CI1 (T4): `origin == "human"` is LEVEL 1 ("may be
+/// the owner") and feeds `origin`, `last_human` (and, in `handlers.rs`, the pause); LEVEL 2 = Level 1
+/// AND this seat's typing mark, fresh (CJ2: armed at most 30 minutes ago, not cleared by a question
+/// since), AND no harness marker tag outside a closed block (CJ4). Level 2 feeds what carries
+/// authority — a question's `first_human`, `named_docs`, `named_numbers`, `last_typed` — read from the
+/// prompt's FREE TEXT only ([`owner_free_text`]). Every Level-1 prompt TAKES the mark, fresh or not,
+/// Level 2 or not (fail closed: one typing, one prompt); machine / unknown prompts leave it. A
+/// Level-1-but-not-Level-2 prompt counts for an open question as a non-owner prompt
+/// (`machine_seen`). The digest stays the whole normalised prompt's.
 pub(crate) fn apply_prompt(
     rec: &mut PromptOrigin,
     digest: &str,
@@ -3047,23 +3896,57 @@ pub(crate) fn apply_prompt(
     origin: &str,
     now: f64,
 ) {
-    let human = origin == "human";
+    let level1 = origin == "human";
+    let fresh = level1
+        && rec.typing_mark.take().is_some_and(|armed| {
+            now >= armed && now - armed <= cys::repair::owner_origin::TYPING_MARK_SECS as f64
+        });
+    let level2 = fresh && !cys::mission_gate::harness_tag_outside_closed_blocks(norm);
     rec.digest = digest.to_string();
     rec.origin = origin.to_string();
     rec.at = now;
-    if human {
-        rec.named_docs = named_rule_docs(norm);
+    if level1 {
+        rec.last_human = Some((digest.to_string(), now)); // CH4 (T4)
+    }
+    let free = if level2 { owner_free_text(norm) } else { String::new() };
+    if level2 {
+        rec.named_docs = named_rule_docs(&free);
+        rec.named_numbers = cys::repair::owner_origin::owner_numbers(&free);
+        rec.last_typed = Some((digest.to_string(), now));
     }
     if let Some(q) = rec.question.as_mut() {
         if now > q.asked_at && q.first_human.is_none() {
-            if human {
-                let excerpt: String = norm.chars().take(ANSWER_EXCERPT_CHARS).collect();
+            if level2 {
+                let excerpt: String = free.chars().take(ANSWER_EXCERPT_CHARS).collect();
                 q.first_human = Some((digest.to_string(), excerpt, now));
             } else {
                 q.machine_seen = true;
             }
         }
     }
+}
+
+/// RULINGS CI1 (T4) — what Level 2 reads: the free text outside every tag block and code fence
+/// (`mission_gate::generic_block_free_text`, the structure axis's residual). A masked code fence
+/// stays visible as `▯` (never as letters), so "예 ```x```" is not the answer "예".
+pub(crate) fn owner_free_text(norm: &str) -> String {
+    cys::mission_gate::generic_block_free_text(norm)
+        .0
+        .replace('\0', "▯")
+}
+
+/// RULINGS CI1 / CJ1 / CJ2 (T4) — the typing mark: the owner's typed or pasted text arrived from the
+/// app into `seat` at `at` (the target surface of a `human_verified` send whose operator token did
+/// not come from a pane and whose text `arms_typing_mark`). A later arming moves the time on. Daemon
+/// memory only (a restart loses it — fail closed); good for 30 minutes; cleared when a question is
+/// registered for the seat; taken by the seat's next Level-1 prompt.
+pub(crate) fn mark_app_typing(prompts: &Mutex<HashMap<u64, PromptOrigin>>, seat: u64, at: f64) {
+    prompts
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(seat)
+        .or_default()
+        .typing_mark = Some(at);
 }
 
 /// C10's rule-document base names (as `guard.sh:PROTECTED_NAMES`), lower-cased.
@@ -3170,6 +4053,7 @@ pub(crate) fn release_locks_for_seat(daemon: &Arc<Daemon>, sid: u64) {
         check: &check,
         hook_step: &cys::repair::apply::hook_lines_step,
         claim: &cys::repair::grant::try_claim_autonomous_start,
+        prompts: &daemon.repair_prompt_origin,
     };
     ledger_verbs::release_seat(&ctx, sid);
 }
@@ -3192,19 +4076,24 @@ mod tests {
         )
     }
 
-    /// (T3 rewrite of T0's pin — T3 filled 9 verbs.) Every sub-verb answers ONE structured reply and
-    /// never panics, whatever the params, caller and grade; the 14 verbs whose bodies are other
-    /// tracks' still answer `repair_not_implemented` to a caller the role table admits (the app for
-    /// OWNER-APPROVAL, any caller for READ/TRIGGER) and `acl_denied` otherwise; unknown → `method_not_found`.
+    /// (T3 rewrite of T0's pin — T3 filled 9 verbs; T4 rewrite — T4 filled 5, and a 6th, the READ
+    /// `grant_status` of RULINGS CI6 (b): 23 → 24 sub-verbs.) Every sub-verb answers
+    /// ONE structured reply and never panics, whatever the params, caller and grade; the 9 verbs whose
+    /// bodies are other tracks' still answer `repair_not_implemented` to a caller the role table admits
+    /// (the app for OWNER-APPROVAL, any caller for READ/TRIGGER) and `acl_denied` otherwise; unknown →
+    /// `method_not_found`.
     #[test]
     fn every_subverb_is_not_implemented_and_never_panics() {
-        assert_eq!(REPAIR_SUBVERBS.len(), 23);
+        assert_eq!(REPAIR_SUBVERBS.len(), 24);
         let mut uniq = REPAIR_SUBVERBS.to_vec();
         uniq.sort_unstable();
         uniq.dedup();
-        assert_eq!(uniq.len(), 23, "REPAIR_SUBVERBS has duplicates");
+        assert_eq!(uniq.len(), 24, "REPAIR_SUBVERBS has duplicates");
         assert!(T3_VERBS.iter().all(|v| REPAIR_SUBVERBS.contains(v)));
         assert_eq!(T3_VERBS.len(), 9);
+        assert!(T4_VERBS.iter().all(|v| REPAIR_SUBVERBS.contains(v)));
+        assert!(T4_VERBS.iter().all(|v| !T3_VERBS.contains(v)));
+        assert_eq!(T4_VERBS.len(), 6);
         let daemon = crate::team_gate_tests::tmp_daemon("repair-t0-subverbs", false);
         let params_set = [
             json!({}),
@@ -3223,8 +4112,8 @@ mod tests {
                         code_of(handle(&daemon, sub, params, &json!(7), sid, grade, pid))
                     }));
                     let (code, msg) = result.unwrap_or_else(|_| panic!("repair.{sub} panicked"));
-                    if T3_VERBS.contains(sub) {
-                        // T3's bodies answer a success or a structured error — never the stub
+                    if T3_VERBS.contains(sub) || T4_VERBS.contains(sub) {
+                        // T3's / T4's bodies answer a success or a structured error — never the stub
                         assert_ne!(code, "repair_not_implemented", "repair.{sub}: {msg}");
                         assert_ne!(code, "method_not_found", "repair.{sub}");
                         continue;
@@ -3281,8 +4170,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(production_root(&daemon));
     }
 
-    /// J1 census: every daemon sub-verb has exactly one class; the table is exactly the 23 daemon
-    /// verbs + the 5 local verbs; the WORK / OWNER-DECISION / OWNER-APPROVAL sets as C3.
+    /// J1 census: every daemon sub-verb has exactly one class; the table is exactly the 24 daemon
+    /// verbs + the 5 local verbs; the WORK / OWNER-DECISION / OWNER-APPROVAL sets as C3 (READ gains
+    /// `grant_status`, RULINGS CI6 (b)).
     #[test]
     fn verb_class_census() {
         for sub in REPAIR_SUBVERBS {
@@ -3302,9 +4192,9 @@ mod tests {
         expected.sort_unstable();
         assert_eq!(
             table, expected,
-            "VERB_CLASSES must be exactly the 23 daemon verbs + the 5 local verbs"
+            "VERB_CLASSES must be exactly the 24 daemon verbs + the 5 local verbs"
         );
-        assert_eq!(VERB_CLASSES.len(), 28);
+        assert_eq!(VERB_CLASSES.len(), 29);
         let of = |c: VerbClass| -> Vec<&str> {
             let mut v: Vec<&str> = VERB_CLASSES
                 .iter()
@@ -3344,6 +4234,7 @@ mod tests {
                 "list",
                 "status",
                 "rule_doc_allowed",
+                "grant_status",
                 "approval_list",
                 "gate",
                 "rules",

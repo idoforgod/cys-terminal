@@ -6285,7 +6285,9 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
             }
             let reply = hook_machine_origin_verdict(daemon, sid, &norm);
             // 「스스로 해결」(0.15.0 RULINGS T3 / U4(a) · T3): 좌석별 프롬프트 출처 기록(질문 인지 · named_docs) — 메모리만.
-            crate::repair::record_prompt_origin(daemon, sid, &norm, digest_in.as_deref(), reply["origin"].as_str());
+            let owner = crate::repair::strict_origin(&norm, &reply); // T4 · RULINGS CH2: the STRICT owner judgment
+            crate::repair::record_prompt_origin(daemon, sid, &norm, digest_in.as_deref(), Some(owner));
+            if owner == "human" { crate::repair::grant_note_owner_input(daemon); } // T4 · CH3 (a): owner input pauses the grant
             Reply::Single(ok_response(&id, reply))
         }
 
@@ -7442,6 +7444,7 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
             //   표식이 있으면 토큰이 유효해도 **기록**한다(origin=gui_auto 로 감사에서 구별).
             //   ★불변식 ② 는 그대로다 — 표식 없는 실키 입력(sendRaw)은 여전히 무기록이다.
             let human_verified = human && !machine_origin && operator_token_ok(daemon, &params);
+            if human_verified { crate::repair::grant_note_app_typing(daemon, sid, verified_from, &text); } // 「스스로 해결」 T4 · CH3 (b) + CI1 + CJ1: pauses the grant; the seat's typing mark (Level 2) only for typed / pasted text whose token did not come from a pane
             if human_verified && verified_from.is_some() {
                 // 오퍼레이터 토큰이 **pane 에서** 왔다. GUI(Tauri)는 어떤 surface 의 자손도 아니므로
                 // 정상 경로에서는 나올 수 없는 조합이다 — 토큰 파일을 읽은 동일 UID 프로세스일

@@ -22,7 +22,7 @@
 디렉터리 안에 `javis_mission.py` + `tests/fixtures/` 사본으로 만들고 `PYTHONPATH` 로 형제
 모듈(javis_detect·javis_bootstrap)만 실팩에서 빌려 쓴다(실팩 파일 쓰기 0).
 
-  1  fixture 실재·판독·최상위 스키마(4개 층 + $constants + anomaly_codes + harness_markers)
+  1  fixture 실재·판독·최상위 스키마(4개 층 + owner_typed + $constants + anomaly_codes + harness_markers)
   2  ★ANOMALY_CODES ↔ fixture anomaly_codes **양방향 정확 일치**(티켓 A3 ③)
   3  HARNESS_NOTIFY/CONTEXT_MARKERS ↔ fixture harness_markers **순서까지** 일치
   4  $constants ↔ 모듈 상수(env 를 벗긴 서브프로세스에서 무조건 잰다 — 창/TTL 기본값 포함)
@@ -53,7 +53,7 @@ BIN = os.path.dirname(SELF)
 MISSION = os.path.join(BIN, "javis_mission.py")
 FIXTURE = os.path.join(SELF, "fixtures", "mission-origin-corpus.json")
 PY = sys.executable or "python3"
-SECTIONS = ("layer0", "layer0c", "layer1", "layer2")
+SECTIONS = ("layer0", "layer0c", "layer1", "layer2", "owner_typed")  # owner_typed: 0.15.0 M5·M13 실패 시 닫힘 축
 DEPRECATION_TOKEN = "★deprecated: `record`"
 fails = []
 
@@ -189,7 +189,7 @@ for sec in SECTIONS:
     dupes += ["%s/%s" % (sec, n) for n in names if names.count(n) > 1]
 check("6a 케이스명 유일(층 안)", not dupes, repr(sorted(set(dupes))))
 BOTH = (("layer0", "harness"), ("layer0c", "boot_command"),
-        ("layer1", "machine"), ("layer2", "label"))
+        ("layer1", "machine"), ("layer2", "label"), ("owner_typed", "owner"))
 oneway = []
 for sec, field in BOTH:
     vals = set(c["expect"].get(field) for c in data[sec] if field in c["expect"])
@@ -257,12 +257,12 @@ try:
                 c["expect"][field] = not c["expect"][field]
                 flipped.append("%s/%s" % (sec, c["name"]))
                 break
-    check("11a 변조 앵커 실재(층 4개 전부)", len(flipped) == 4, repr(flipped))
+    check("11a 변조 앵커 실재(축 %d개 전부)" % len(BOTH), len(flipped) == len(BOTH), repr(flipped))
     m11 = make_mutant(root, "mut_fx", src, fx_flip)
     r11 = run(["--self-test"], make_env(os.path.join(root, "m11")), script=m11)
     hit = [n for n in flipped if ("mission-origin-corpus %s:" % n) in r11.stdout + r11.stderr]
     check("11b 뒤집은 fixture 는 self-test 를 통과하지 못한다(계측 타당성)",
-          r11.returncode != 0 and len(hit) == 4, repr((r11.returncode, hit)))
+          r11.returncode != 0 and len(hit) == len(BOTH), repr((r11.returncode, hit)))
 
     # ── 12 ★음성 대조 b — anomaly_codes 1건 제거 ─────────────────────────────
     fx_drop = json.loads(json.dumps(data))
