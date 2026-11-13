@@ -26342,7 +26342,7 @@ fn pack_plan_sections(plan: &cys::pack::InstallPlan) -> Vec<(&'static str, &[Str
             "일반 파일의 수정본+vendor 전진 — 검증된 조상 위 자동 병합(충돌·실패는 내 파일 유지+<파일>.new) · 기동 필수 파일은 설치 때 병합하지 않는다(vendor 우선 — 아래 버킷)",
         ),
         ("⏸ 사용자 파일 유지(user-kept)", &plan.user_kept, "내 수정본이 그대로 살아 있음 + vendor 신버전 <파일>.new 보관 → 워커가 합친다(cys pack-merge)"),
-        ("🔁 기동 필수 vendor 우선(vendor-first)", &plan.vendor_first, "vendor 본을 먼저 살리고 내 수정본은 <파일>.user(이전 세대 보존) → 다시 입히기는 승인 절차(cys repair reapply)"),
+        ("🔁 기동 필수 vendor 우선(vendor-first)", &plan.vendor_first, "vendor 본을 먼저 살리고 내 수정본은 <파일>.user(이전 세대 보존) → 다시 입히기는 승인 절차: 수리로 고친 파일이면 `cys repair reapply <수리번호>`, 직접 고친 파일이면 `cys repair begin --files <파일> --trigger update`"),
         ("🪦 수리 장부의 부재 유지", &plan.keep_absent, "수리가 기록한 삭제 — 만들지 않음(되돌리기: cys repair revert <번호>)"),
         ("📌 제자리 보존(kept-drift)", &plan.kept_drift, "system 수정본+vendor 미전진 — 그대로 둠(다음 vendor 전진 때 자동 병합 후보)"),
         ("⏸ 보존+병합 대기", &plan.merge_new, "user-owned 수정본 유지 + 신버전 <파일>.new 병치 → cys pack-merge"),
@@ -27193,10 +27193,7 @@ fn run_pack_merge_with(
                 }
                 return 0;
             }
-            eprintln!(
-                "'{rel}' 은 기동 필수 파일의 vendor 우선 보관(vendor-first) — 다시 입히기는 워커가 승인 절차로만: cys repair reapply <수리번호>. \
-                 --keep-mine·--to-local·병합·복권은 승인 없이 기동 필수 파일을 바꾸므로 거부한다. vendor 본 유지 확정은 --take-new."
-            );
+            eprintln!("{}", vendor_first_merge_refusal(&rel));
             1
         }
         "adopted" => {
@@ -27798,7 +27795,7 @@ fn adopt_list_line(
     // ★T2f(RULINGS BO2): 목록 · `--all` 건너뛰기의 술어 호출 — 내장 여부·소유권보다 먼저.
     if sources.is_listed(rel) {
         return (
-            "기동 필수·보호 목록 파일 — 되살리지 않음(수리 흐름: cys repair begin / reapply)".to_string(),
+            format!("기동 필수·보호 목록 파일 — 되살리지 않음(수리 흐름: 워커가 이 사본을 후보로 `cys repair begin --files {rel} --trigger …`)"),
             Some("boot-critical"),
         );
     }
@@ -27822,7 +27819,7 @@ fn adopt_list_line(
             ("복권 가능 — vendor 전진: --merge-after 로 복원 후 자동 병합".into(), None)
         }
         AdoptVerdict::BootCritical => (
-            "기동 필수 — 승인 절차로만(cys repair begin/reapply · 이 동사는 거부)".into(),
+            format!("기동 필수 — 승인 절차로만(워커가 이 사본을 후보로 `cys repair begin --files {rel} --trigger …` · 이 동사는 거부)"),
             Some("boot-critical"),
         ),
     }
@@ -28290,7 +28287,8 @@ fn merge_status_line(dir: &std::path::Path, rel: &str, e: &serde_json::Value, li
             }
         }
         "vendor-first" => format!(
-            "  🔁 {rel} — 기동 필수 파일: vendor {ver} 본을 먼저 살림 · 내 수정본은 {side} 에 보관(이전 세대는 {rel}.user.prev-*)\n     → 워커가 승인 절차로 다시 입힌다: cys repair reapply <수리번호> · vendor 본 유지 확정: cys pack-merge --file {rel} --take-new(보관본은 지우지 않음)"
+            "  🔁 {rel} — 기동 필수 파일: vendor {ver} 본을 먼저 살림 · 내 수정본은 {side} 에 보관(이전 세대는 {rel}.user.prev-*)\n     → 다시 입히기(워커 · 주인 승인): {} · vendor 본 유지 확정: cys pack-merge --file {rel} --take-new(보관본은 지우지 않음)",
+            cys::pack::parked_copy_routes(rel)
         ),
         _ => format!("  ? {rel} ({kind})"),
     }
@@ -28451,6 +28449,26 @@ fn parked_facts(
     })
 }
 
+/// ★T2g(RULINGS CL1 · CN2): 보관된 내 수정본을 다시 입히는 길 — 두 경우와 그 조건(`pack::parked_copy_routes`), 그리고 그 뒤의
+/// 절차(새 수리 · 예행·검사 · 주인 최종 승인). `reapply` 혼자는 쓰지 않는다.
+fn parked_reapply_way(rel: &str) -> String {
+    format!(
+        "다시 입히는 길은 수리 흐름입니다: {} — 워커가 그 사본으로 새 수리를 열어 예행·검사를 거치고 주인 최종 승인 뒤에 다시 \
+         입힙니다.",
+        cys::pack::parked_copy_routes(rel)
+    )
+}
+
+/// ★T2g(RULINGS CN2): `pack-merge --file` 를 vendor-first 항목에 플래그 없이(또는 거부되는 플래그로) 썼을 때의 문장.
+fn vendor_first_merge_refusal(rel: &str) -> String {
+    format!(
+        "'{rel}' 은 기동 필수 파일의 vendor 우선 보관(vendor-first) — 보관된 내 사본({rel}.user)을 다시 입히는 길은 워커의 승인 \
+         절차뿐입니다: {}. --keep-mine·--to-local·병합·복권은 승인 없이 기동 필수 파일을 바꾸므로 거부한다. vendor 본 유지 \
+         확정은 --take-new.",
+        cys::pack::parked_copy_routes(rel)
+    )
+}
+
 /// ★T2g(RULINGS CL1): 보관된 내 수정본 한 줄.
 fn parked_copy_line(rel: &str, p: &ParkedFacts) -> String {
     if p.parked_present {
@@ -28462,7 +28480,7 @@ fn parked_copy_line(rel: &str, p: &ParkedFacts) -> String {
 
 /// ★T2g(RULINGS CL1 (b)): vendor-first 파일인데 되돌리기 원천의 사본이 출시본 바이트가 아닐 때의 거부 문장 — 변조·새 서명
 /// 팩 문장(BV2)이 아니라 이 경우에 참인 것: 이 파일은 지금 그대로 남고(다른 파일을 되돌리면 팩이 섞인다), 내 수정본은
-/// 보관되어 있고, 다시 입히는 길은 수리 흐름의 `cys repair reapply`(T6)다.
+/// 보관되어 있고, 다시 입히는 길은 수리 흐름이다(RULINGS CN2: 수리로 고친 파일 → `reapply`, 직접 고친 파일 → `begin --trigger update`).
 fn rollback_parked_refusal(rel: &str, source: &str, p: &ParkedFacts) -> String {
     let stays = if p.live_is_embed {
         format!("이 파일은 지금의 출시본({}) 그대로 남습니다", p.cur_ver)
@@ -28474,12 +28492,12 @@ fn rollback_parked_refusal(rel: &str, source: &str, p: &ParkedFacts) -> String {
          있던 사본(내 수정본)을 {rel}.user 에 보관했습니다. {source}에 있는 이 파일의 사본은 출시본 바이트가 아니고(이 바이너리의 \
          내장본·과거 출시 해시 표에 없음), 되돌리기는 이 파일에 출시본 바이트만 씁니다 — 아무것도 쓰지 않았습니다.\n\
          \x20  {stays}: 다른 파일을 팩 {} 으로 되돌려도 이 파일은 되돌려지지 않아, 팩은 {} 의 파일과 이 파일이 섞인 상태가 됩니다.\n\
-         \x20  {} 다시 입히는 길은 수리 흐름입니다: 워커가 `cys repair reapply <수리번호>` 로 그 사본을 새 수리로 열어 예행·검사를 \
-         거치고 주인 최종 승인 뒤에 다시 입힙니다(수리 없이 고친 사본이면 그 사본을 후보로 `cys repair begin --files {rel} --trigger …`).",
+         \x20  {} {}",
         p.update_ver,
         p.prev_ver,
         p.prev_ver,
-        parked_copy_line(rel, p)
+        parked_copy_line(rel, p),
+        parked_reapply_way(rel)
     )
 }
 
@@ -28516,11 +28534,7 @@ fn guarded_rollback_refusal(
 fn rollback_guarded_restored(rel: &str, source: &str, parked: Option<&ParkedFacts>, system: bool) -> String {
     let head = format!("✅ {rel} 복원({source}의 출시본 바이트 · 기동 필수·보호 목록 파일).");
     match parked {
-        Some(p) if p.parked_present => format!(
-            "{head} {} 다시 입히는 길은 수리 흐름입니다: 워커가 `cys repair reapply <수리번호>` 로 그 사본을 새 수리로 열어 \
-             예행·검사를 거치고 주인 최종 승인 뒤에 다시 입힙니다.",
-            parked_copy_line(rel, p)
-        ),
+        Some(p) if p.parked_present => format!("{head} {} {}", parked_copy_line(rel, p), parked_reapply_way(rel)),
         Some(p) => format!("{head} {}", parked_copy_line(rel, p)),
         None if system => format!(
             "{head} 이 바이너리의 내장본으로 돌아가는 길은 cys pack-heal {rel} 이고, 그 밖의 변경은 수리 흐름입니다: 워커가 \
@@ -28567,10 +28581,10 @@ fn rollback_mixed_warning(stuck: &[String], prev_ver: &str, source: &str) -> Str
     format!(
         "⚠ 되돌리지 않는 기동 필수·보호 목록 파일 {}건: {} — 업데이트가 이 파일들의 출시본을 먼저 살리고 내 수정본을 <파일>.user 에 \
          보관했고, {source}에는 이 파일들의 출시본 바이트가 없습니다. 다른 파일을 팩 {prev_ver} 으로 되돌려도 이 파일들은 지금 그대로 \
-         남아, 팩은 {prev_ver} 의 파일과 이 파일들이 섞인 상태가 됩니다. 내 수정본을 다시 입히는 길은 수리 흐름입니다: 워커가 \
-         `cys repair reapply <수리번호>` 로 그 사본을 새 수리로 열어 예행·검사를 거치고 주인 최종 승인 뒤에 다시 입힙니다.",
+         남아, 팩은 {prev_ver} 의 파일과 이 파일들이 섞인 상태가 됩니다. {}",
         stuck.len(),
-        stuck.join(", ")
+        stuck.join(", "),
+        parked_reapply_way("<파일>")
     )
 }
 
@@ -28800,7 +28814,8 @@ fn run_pack_rollback_with(
     // 먼저 살리고 내 수정본을 `.user` 에 보관)에 되돌리기는 **출시본 바이트만** 쓴다 — 보관본이 스냅샷이든 pack.prev 든,
     // --force-vendor 여도 그 밖의 바이트는 거부한다(링크도). 원천의 사본이 출시본이면 그것을 되돌리고 보관된 내 수정본은
     // 그대로 둔다(CL1 (a)); 아니면 이 경우에 참인 문장으로 거부한다(CL1 (b)). 내 수정본을 다시 입히는 길은 언제나 수리 흐름
-    // (워커 `cys repair reapply` → 주인 최종 승인)이다 — 되돌리기는 규칙 나를 돌아가는 길이 아니다.
+    // (수리로 고친 파일 → 워커 `cys repair reapply`, 직접 고친 파일 → `cys repair begin --trigger update` · 주인 최종 승인 —
+    // RULINGS CN2)이다 — 되돌리기는 규칙 나를 돌아가는 길이 아니다.
     let parked = parked_facts(&dir, &rel, &pending, prev_ver.trim(), cur_ver.trim());
     // ★0.15.0 M11 아: 스냅샷에 이 파일이 있으면 스냅샷이 원천이다 — 기록 해시(링크면 링크 대상)로 검증한 뒤에만
     // 쓴다(복원 계약). 어긋나면 거부(user 파일만 --force-vendor 로 강행 — M4 와 같은 규칙). 링크는 링크로 되살린다.
@@ -42938,13 +42953,20 @@ mod tests {
                     씁니다 — 아무것도 쓰지 않았습니다.\n   ";
         let mixed = ": 다른 파일을 팩 0.14.56 으로 되돌려도 이 파일은 되돌려지지 않아, 팩은 0.14.56 의 파일과 이 파일이 섞인 상태가 \
                      됩니다.\n   ";
-        let reapply = "다시 입히는 길은 수리 흐름입니다: 워커가 `cys repair reapply <수리번호>` 로 그 사본을 새 수리로 열어 예행·검사를 \
-                       거치고 주인 최종 승인 뒤에 다시 입힙니다";
+        // ★RULINGS CN1 · CN2: 보관된 사본을 다시 입히는 두 길과 그 조건 — `reapply` 혼자는 쓰지 않는다.
+        let routes = "수리로 고친 파일이면 `cys repair reapply <수리번호>`, 직접 고친 파일이면 `cys repair begin --files hooks/guard.sh \
+                      --trigger update`";
+        assert_eq!(cys::pack::parked_copy_routes(rel), routes);
+        let reapply = format!(
+            "다시 입히는 길은 수리 흐름입니다: {routes} — 워커가 그 사본으로 새 수리를 열어 예행·검사를 거치고 주인 최종 승인 뒤에 \
+             다시 입힙니다."
+        );
+        assert_eq!(parked_reapply_way(rel), reapply);
         assert_eq!(
             rollback_parked_refusal(rel, src, &p),
             format!(
                 "{head}이 파일은 지금의 출시본(0.15.0) 그대로 남습니다{mixed}내 수정본은 hooks/guard.sh.user 에 그대로 보관되어 \
-                 있습니다. {reapply}(수리 없이 고친 사본이면 그 사본을 후보로 `cys repair begin --files hooks/guard.sh --trigger …`)."
+                 있습니다. {reapply}"
             )
         );
         let present = p.clone();
@@ -42954,7 +42976,7 @@ mod tests {
             rollback_parked_refusal(rel, src, &p),
             format!(
                 "{head}이 파일은 지금의 바이트 그대로 남습니다{mixed}업데이트가 보관한 내 수정본(hooks/guard.sh.user)은 지금 없습니다. \
-                 {reapply}(수리 없이 고친 사본이면 그 사본을 후보로 `cys repair begin --files hooks/guard.sh --trigger …`)."
+                 {reapply}"
             )
         );
         assert_eq!(
@@ -42967,7 +42989,7 @@ mod tests {
         let done = "✅ hooks/guard.sh 복원(업데이트 전 스냅샷(팩 0.14.56)의 출시본 바이트 · 기동 필수·보호 목록 파일).";
         assert_eq!(
             rollback_guarded_restored(rel, src, Some(&present), true),
-            format!("{done} 내 수정본은 hooks/guard.sh.user 에 그대로 보관되어 있습니다. {reapply}.")
+            format!("{done} 내 수정본은 hooks/guard.sh.user 에 그대로 보관되어 있습니다. {reapply}")
         );
         assert_eq!(
             rollback_guarded_restored(rel, src, Some(&p), true),
@@ -43014,10 +43036,37 @@ mod tests {
             format!(
                 "⚠ 되돌리지 않는 기동 필수·보호 목록 파일 2건: hooks/a.sh, hooks/b.sh — 업데이트가 이 파일들의 출시본을 먼저 살리고 \
                  내 수정본을 <파일>.user 에 보관했고, 이 스냅샷에는 이 파일들의 출시본 바이트가 없습니다. 다른 파일을 팩 0.14.56 으로 \
-                 되돌려도 이 파일들은 지금 그대로 남아, 팩은 0.14.56 의 파일과 이 파일들이 섞인 상태가 됩니다. 내 수정본을 다시 입히는 \
-                 길은 수리 흐름입니다: 워커가 `cys repair reapply <수리번호>` 로 그 사본을 새 수리로 열어 예행·검사를 거치고 주인 최종 \
-                 승인 뒤에 다시 입힙니다."
+                 되돌려도 이 파일들은 지금 그대로 남아, 팩은 0.14.56 의 파일과 이 파일들이 섞인 상태가 됩니다. 다시 입히는 길은 수리 \
+                 흐름입니다: 수리로 고친 파일이면 `cys repair reapply <수리번호>`, 직접 고친 파일이면 `cys repair begin --files <파일> \
+                 --trigger update` — 워커가 그 사본으로 새 수리를 열어 예행·검사를 거치고 주인 최종 승인 뒤에 다시 입힙니다."
             )
+        );
+        // ── RULINGS CN2: 보관된 사본으로 보내는 그 밖의 문장 — 두 길과 그 조건 ──
+        assert_eq!(
+            cys::pack::listed_file_refusal(rel, "cys pack-adopt"),
+            format!(
+                "⛔ 거부: 'hooks/guard.sh' 은 기동 필수·보호 목록에 있는 파일입니다 — `cys pack-adopt` 는 이 파일에 출시본이 아닌 바이트를 \
+                 넣지 않습니다(아무것도 쓰지 않았습니다). 이 파일을 바꾸는 길은 수리 흐름뿐입니다: 워커가 `cys repair begin --files \
+                 hooks/guard.sh --trigger …` → 예행·검사 → 주인 승인(업데이트가 보관한 내 사본 hooks/guard.sh.user 을 다시 입히려면: {routes})."
+            )
+        );
+        assert_eq!(
+            vendor_first_merge_refusal(rel),
+            format!(
+                "'hooks/guard.sh' 은 기동 필수 파일의 vendor 우선 보관(vendor-first) — 보관된 내 사본(hooks/guard.sh.user)을 다시 입히는 \
+                 길은 워커의 승인 절차뿐입니다: {routes}. --keep-mine·--to-local·병합·복권은 승인 없이 기동 필수 파일을 바꾸므로 \
+                 거부한다. vendor 본 유지 확정은 --take-new."
+            )
+        );
+        let plan_vf = {
+            let mut plan = cys::pack::InstallPlan::default();
+            plan.vendor_first.push("hooks/x.sh".into());
+            pack_plan_sections(&plan).into_iter().find(|(_, r, _)| r.iter().any(|x| x == "hooks/x.sh")).map(|(_, _, n)| n).unwrap()
+        };
+        assert_eq!(
+            plan_vf,
+            "vendor 본을 먼저 살리고 내 수정본은 <파일>.user(이전 세대 보존) → 다시 입히기는 승인 절차: 수리로 고친 파일이면 \
+             `cys repair reapply <수리번호>`, 직접 고친 파일이면 `cys repair begin --files <파일> --trigger update`"
         );
         // ── CL2: 병합 대기 목록 · pack-merge · pack-heal · --propose 의 등재 파일 안내 ──
         let dir = std::env::temp_dir().join(format!("cys-t2g-pin-{}", std::process::id()));
@@ -43058,6 +43107,20 @@ mod tests {
         assert_eq!(
             line(rel, uk_e.clone(), true),
             format!("  ⏸ hooks/guard.sh — 내 수정본이 살아 있음(업데이트가 덮지 않음 · 사유 protection) · vendor 0.15.0 신버전은 hooks/guard.sh.new 에 보관\n     → cys pack-merge --file hooks/guard.sh [--take-new|--keep-mine] · 기동 필수·보호 목록 파일 — 합친 사본을 쓰는 길은 {route}")
+        );
+        let vf_e = serde_json::json!({"kind": "vendor-first", "side": "hooks/guard.sh.user", "version": "0.15.0"});
+        assert_eq!(
+            line(rel, vf_e, true),
+            format!("  🔁 hooks/guard.sh — 기동 필수 파일: vendor 0.15.0 본을 먼저 살림 · 내 수정본은 hooks/guard.sh.user 에 보관(이전 세대는 hooks/guard.sh.user.prev-*)\n     → 다시 입히기(워커 · 주인 승인): {routes} · vendor 본 유지 확정: cys pack-merge --file hooks/guard.sh --take-new(보관본은 지우지 않음)")
+        );
+        assert_eq!(
+            adopt_list_line(&dir, rel, &cys::pack::UpdateSources::none().with_listed(|_| true)),
+            (
+                "기동 필수·보호 목록 파일 — 되살리지 않음(수리 흐름: 워커가 이 사본을 후보로 `cys repair begin --files hooks/guard.sh --trigger …`)"
+                    .to_string(),
+                Some("boot-critical")
+            ),
+            "되살리기 목록의 사본(healed · conflicted)은 vendor-first 기록이 없어 reapply 가 받지 않는다 — begin 만"
         );
         // 목록에 없는 파일의 안내는 그대로(종전 처방).
         assert!(line(rel, new_e, false).contains("[--take-new|--keep-mine|--ai]"));
@@ -43119,6 +43182,18 @@ mod tests {
             for refused in ["pack-adopt", "--revert-merge", "--ai", "--force-vendor"] {
                 assert!(!t.contains(refused), "{refused} in: {t}");
             }
+        }
+        // 규칙(RULINGS CN2): `reapply` 를 이름 대는 문장은 언제나 직접 고친 파일의 길(`--trigger update`)도 함께 이름 댄다.
+        let mut reapply_texts = texts.clone();
+        reapply_texts.extend([
+            cys::pack::listed_file_refusal(rel, "cys pack-adopt"),
+            vendor_first_merge_refusal(rel),
+            rollback_mixed_warning(&["hooks/a.sh".to_string()], "0.14.56", "이 스냅샷"),
+            rollback_guarded_restored(rel, src, Some(&present), true),
+            plan_vf.to_string(),
+        ]);
+        for t in reapply_texts.iter().filter(|t| t.contains("cys repair reapply")) {
+            assert!(t.contains("수리로 고친 파일이면 `cys repair reapply <수리번호>`") && t.contains("--trigger update`"), "{t}");
         }
     }
 

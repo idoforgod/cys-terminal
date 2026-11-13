@@ -2850,7 +2850,18 @@ pub fn listed_file_refusal(rel: &str, verb: &str) -> String {
     format!(
         "⛔ 거부: '{rel}' 은 기동 필수·보호 목록에 있는 파일입니다 — `{verb}` 는 이 파일에 출시본이 아닌 바이트를 넣지 \
          않습니다(아무것도 쓰지 않았습니다). 이 파일을 바꾸는 길은 수리 흐름뿐입니다: 워커가 `cys repair begin --files {rel} \
-         --trigger …` → 예행·검사 → 주인 승인(업데이트가 보관한 내 사본이면 `cys repair reapply <수리번호>`)."
+         --trigger …` → 예행·검사 → 주인 승인(업데이트가 보관한 내 사본 {rel}.user 을 다시 입히려면: {}).",
+        parked_copy_routes(rel)
+    )
+}
+
+/// ★T2g(RULINGS CN1 · CN2): 업데이트가 vendor 우선으로 보관한 사본(`<rel>.user` · 원장 vendor-first)을 다시 입히는 두 길 —
+/// `cys repair reapply` 는 **수리**가 만든 수정만 받는다(수리 번호가 있어야 한다). 사용자가 손으로 고친 것은 수리 번호가 없으므로
+/// 업데이트 계기의 보통 수리다. 팩 동사는 수리 장부를 읽지 않으므로(읽지 않아야 한다) 어느 쪽인지 모른다 — 조건과 함께 둘 다
+/// 이름 댄다. `reapply` 혼자는 쓰지 않는다. `rel` 은 파일 이름(또는 `<파일>` 같은 자리 표시).
+pub fn parked_copy_routes(rel: &str) -> String {
+    format!(
+        "수리로 고친 파일이면 `cys repair reapply <수리번호>`, 직접 고친 파일이면 `cys repair begin --files {rel} --trigger update`"
     )
 }
 
