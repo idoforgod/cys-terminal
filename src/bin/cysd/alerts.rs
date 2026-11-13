@@ -942,13 +942,14 @@ pub struct Interpreter {
     /// The FIXED list of flags that take no argument and no code (`-c`, `-m`, `-e`, `-s`, `-W`, `-X`,
     /// `--rcfile` and every flag not listed → no identity; the `py` launcher's `-3` is not listed — the
     /// launcher reads only its first argument, so after another flag it reaches python as an unknown
-    /// option, RULINGS BX2).
+    /// option, RULINGS BX2; python's `-b` / `-bb` / `-O` / `-OO` are not listed — they change what the
+    /// script does, RULINGS CF2).
     pub flags: &'static [&'static str],
     /// The script types (extensions) it is the OWN interpreter of (RULINGS BY1).
     pub scripts: &'static [&'static str],
 }
 
-const PYTHON_FLAGS: &[&str] = &["-u", "-B", "-O", "-OO", "-q", "-b", "-bb"];
+const PYTHON_FLAGS: &[&str] = &["-u", "-B", "-q"];
 
 /// The interpreters of the grammar — `sh` and `zsh` are not among them (RULINGS BY1).
 pub const INTERPRETERS: &[Interpreter] = &[
@@ -1198,6 +1199,31 @@ pub fn exit_report(error: &str) -> Option<i64> {
     n.parse::<i64>().ok().filter(|n| (1..=125).contains(n))
 }
 
+/// RULINGS CF1 — the argument parser's rejection of the CALLER's arguments: after the exit line, the
+/// first output line (blank lines skipped) starts with `usage: ` (any case) AND a later line is
+/// `<program>: error: …` where the program is THIS script — its file name, optionally followed by
+/// words without a colon (argparse's `prog` of a subcommand: `javis_orchestra.py check: error: …`).
+/// The script started, refused the call and is healthy: neither a failure nor a call. Another
+/// program's rejection inside the output (the script called a tool wrongly) is the script's failure.
+/// One trailing CR per line is ignored (Windows). For a long text the CLI keeps its first 2 KiB and
+/// its last 8 KiB (RULINGS BE1): the `usage:` line opens the head and argparse's `error:` line ends
+/// the text, so a long usage keeps the shape.
+pub fn rejected_arguments(rel: &str, error: &str) -> bool {
+    let file = rel.rsplit('/').next().unwrap_or(rel);
+    let mut lines = error
+        .split('\n')
+        .skip(1)
+        .map(|l| l.strip_suffix('\r').unwrap_or(l))
+        .skip_while(|l| l.trim().is_empty());
+    let usage_first = lines.next().and_then(|l| l.get(..7)).is_some_and(|h| h.eq_ignore_ascii_case("usage: "));
+    usage_first
+        && lines.any(|l| {
+            l.strip_prefix(file)
+                .and_then(|rest| rest.find(": error: ").map(|k| &rest[..k]))
+                .is_some_and(|between| !between.contains(':') && (between.is_empty() || between.starts_with(' ')))
+        })
+}
+
 /// A post-call event that says the call did not end well (the shapes the CLI forwards — RULINGS BE1).
 fn is_failure_event(o: &ToolObservation<'_>) -> bool {
     o.raw_event == "PostToolUseFailure"
@@ -1263,6 +1289,9 @@ pub fn classify(o: &ToolObservation<'_>, roots: &PackRoots, windows: bool) -> Cl
     }
     // a failure's text begins with its exit report (BX1): the exclusion list reads the code there
     let raw = bounded_error(o.error.unwrap_or_default());
+    if rejected_arguments(&rel, &raw) {
+        return Classified::NotCounted { rel }; // RULINGS CF1: the script refused the caller's arguments
+    }
     if let Some(reason) = detector_excluded(&rel, sub.as_deref(), &raw, windows) {
         return Classified::Excluded { reason };
     }
@@ -2463,6 +2492,8 @@ mod defect_intake_tests {
             ("python3", "-E"), ("python3", "-uB"), ("bash", "-c"), ("bash", "-e"), ("bash", "-s"), ("bash", "--rcfile"),
             ("sh", "-c"), ("zsh", "-c"), ("node", "-e"), ("node", "-r"), ("node", "--require"), ("pwsh", "-Command"),
             ("pwsh", "-File"), ("pwsh", "-noprofile"), ("py", "-c"), ("py", "-3"),
+            // RULINGS CF2 — flags that change what the script does
+            ("python3", "-O"), ("python3", "-OO"), ("python3", "-b"), ("python3", "-bb"),
         ] {
             negatives.push(format!("{name} {bad} ~/.cys/pack/bin/javis_x.py"));
         }
@@ -2472,7 +2503,7 @@ mod defect_intake_tests {
             assert_eq!(pack_call(&bash(c), &base()), PackCall::None, "outside the grammar but identified: {c:?}");
             assert_eq!(classify(&pre(&bash(c)), &base(), false), Classified::Ignored { failure: false }, "counted as a call: {c:?}");
         }
-        assert_eq!(negatives.len(), 22 + 65 + 22 + 1);
+        assert_eq!(negatives.len(), 22 + 65 + 26 + 1);
     }
 
     /// RULINGS CC2 — the named script must be a REAL file of this lane's pack when the call is
@@ -3033,6 +3064,89 @@ mod defect_intake_tests {
         assert_eq!(d.counters.not_counted, 30);
     }
 
+    /// RULINGS CF1 — a call whose arguments the script's parser REJECTED (first output line `usage: `,
+    /// a later `<this script>: error: …` line) is neither a failure nor a call: argparse's shape (exit 2),
+    /// the pack's own parsers that print it with exit 64 (`javis_orchestra.py`, `javis_resource_gate.py`
+    /// — texts composed from their source: `print_usage` + `"%s: error: %s" % (self.prog, message)`), a
+    /// subcommand's prog, CRLF, `Usage:`, and a long usage cut as the CLI cuts it (2 KiB head + 8 KiB
+    /// tail). Still FAILURES: a traceback after a `usage:` line without the `error:` line, ANOTHER
+    /// program's rejection inside the output, a `usage:` line that is not the first output line, and the
+    /// custom parsers without an `error:` line (`javis_intake.py` prints `USAGE  …`, `javis_actprobe.py`
+    /// `actprobe: argument error: …`, hand-written `usage:` lines) — a stated limit.
+    #[test]
+    fn a_rejected_call_is_not_a_failed_script() {
+        let t = 1_800_000_000.0;
+        let task = bash("python3 ~/.cys/pack/bin/javis_task.py --bogus");
+        let orch = bash("python3 ~/.cys/pack/bin/javis_orchestra.py check --bogus");
+        let gate = bash("python3 ~/.cys/pack/bin/javis_resource_gate.py chek");
+        let x = bash("python3 ~/.cys/pack/bin/javis_x.py run");
+        let intake = bash("python3 ~/.cys/pack/bin/javis_intake.py audit");
+        let actprobe = bash("python3 ~/.cys/pack/bin/javis_actprobe.py submit");
+        let snapshot = bash("python3 ~/.cys/pack/bin/javis_snapshot.py");
+        let task_usage = "usage: javis_task.py [-h]\n                     {create,checkout,release,set-status,set-verify-spec,ready,show,list,self-test}\n                     ...";
+        let orch_usage = "usage: javis_orchestra.py [-h]\n                          {check,boot-reviewers,review-prompt,task-prompt,phase-plan,round-init,round-status,round-relocate,gate-status,next-action,silent-failure-catalog,channel-health,guard-master-claim}\n                          ...";
+        // the T2f cut of a long text: its first 2 KiB, a marker line, its last 8 KiB
+        let cli_cut = |e: &str| -> String {
+            if e.len() <= 10 * 1024 {
+                return e.to_string();
+            }
+            let mut h = 2 * 1024;
+            while !e.is_char_boundary(h) {
+                h -= 1;
+            }
+            let mut tl = e.len() - 8 * 1024;
+            while !e.is_char_boundary(tl) {
+                tl += 1;
+            }
+            format!("{}\n…\n{}", &e[..h], &e[tl..])
+        };
+        let long_usage = format!("Exit code 2\nusage: javis_task.py [-h]{}\njavis_task.py: error: unrecognized arguments: --bogus", " [--opt-with-a-long-name OPT]".repeat(500));
+        assert!(long_usage.len() > 12 * 1024);
+        let rejected: Vec<(&Value, String)> = vec![
+            (&task, format!("Exit code 2\n{task_usage}\njavis_task.py: error: unrecognized arguments: --bogus")),
+            (&task, format!("Exit code 2\n{task_usage}\njavis_task.py: error: argument cmd: invalid choice: 'chekout' (choose from 'create', 'checkout', 'release')")),
+            (&orch, format!("Exit code 64\n{orch_usage}\njavis_orchestra.py: error: unrecognized arguments: --bogus")),
+            (&orch, "Exit code 2\nusage: javis_orchestra.py task-prompt [-h] --task TASK\njavis_orchestra.py task-prompt: error: the following arguments are required: --task".to_string()),
+            (&gate, "Exit code 64\nusage: javis_resource_gate.py [-h] {check,status} ...\njavis_resource_gate.py: error: argument cmd: invalid choice: 'chek' (choose from 'check', 'status')".to_string()),
+            (&task, format!("Exit code 2\r\n{}\r\njavis_task.py: error: unrecognized arguments: --bogus\r\n", task_usage.replace('\n', "\r\n"))),
+            (&task, "Exit code 2\nUsage: javis_task.py [-h] {create} ...\njavis_task.py: error: unrecognized arguments: --bogus".to_string()),
+            (&task, "Exit code 2\n\nusage: javis_task.py [-h] {create} ...\njavis_task.py: error: unrecognized arguments: --bogus".to_string()),
+            (&task, cli_cut(&long_usage)),
+        ];
+        for (input, text) in &rejected {
+            assert!(rejected_arguments(&match pack_call(input, &base()) { PackCall::One { rel, .. } => rel, PackCall::None => panic!("{input}") }, text), "{text:.120}");
+            let mut d = Detector::default();
+            for _ in 0..5 {
+                assert_eq!(observe(&mut d, &pre(input), &base(), t, false), Observed::Call);
+                assert_eq!(observe(&mut d, &fail(input, Some(text.as_str())), &base(), t, false), Observed::NotCounted, "{text:.120}");
+            }
+            assert!(due_signatures(&d, t).is_empty(), "five rejected calls made a row: {text:.120}");
+            assert_eq!((d.counters.calls, d.counters.failures, d.counters.not_counted), (0, 0, 5));
+        }
+        let still_failures: Vec<(&Value, String)> = vec![
+            // a traceback after a `usage:` line of normal output — no `error:` line
+            (&x, "Exit code 1\nusage: javis_x.py [-h] run\nTraceback (most recent call last):\n  File \"/Users/x/.cys/pack/bin/javis_x.py\", line 3, in <module>\nKeyError: 'k'".to_string()),
+            // ANOTHER program's rejection inside the script's output: the script called a tool wrongly
+            (&x, "Exit code 2\nusage: javis_other.py [-h] x\njavis_other.py: error: unrecognized arguments: --y".to_string()),
+            (&x, "Exit code 2\nusage: javis_x.py [-h] run\njavis_x.py.bak: error: x".to_string()),
+            (&x, "Exit code 2\nusage: javis_x.py [-h] run\njavis_x.py sub: x: error: y".to_string()),
+            // the `usage:` line is not the first output line
+            (&task, "Exit code 2\nloading config\nusage: javis_task.py [-h] {create} ...\njavis_task.py: error: unrecognized arguments: --bogus".to_string()),
+            // the `error:` line without a `usage:` line
+            (&task, "Exit code 2\njavis_task.py: error: unrecognized arguments: --bogus".to_string()),
+            // custom parsers without an `error:` line — a stated limit
+            (&intake, "Exit code 5\nusage: javis_intake.py [-h] {audit,record} ...\nUSAGE  the following arguments are required: --roots".to_string()),
+            (&actprobe, "Exit code 3\nactprobe: argument error: the following arguments are required: --task".to_string()),
+            (&snapshot, "Exit code 2\nusage: javis_snapshot.py generate --round-dir <dir> [--max-bytes N]".to_string()),
+        ];
+        for (input, text) in &still_failures {
+            let mut d = Detector::default();
+            observe(&mut d, &pre(input), &base(), t, false);
+            assert_eq!(observe(&mut d, &fail(input, Some(text.as_str())), &base(), t, false), Observed::Failure, "{text:.120}");
+        }
+        assert_eq!((rejected.len(), still_failures.len()), (9, 9));
+    }
+
     /// RULINGS BX1 — the exclusion list reads the exit code from the SAME first line: a by-design answer is
     /// excluded only when its text begins with the report; the same text with the report elsewhere, or
     /// without it, counts nothing at all (it is no failure). RULINGS CC1: the Windows `cys-dept` 127 text
@@ -3265,6 +3379,7 @@ mod defect_intake_tests {
             "fn end_of(",
             "fn withdraw_call(",
             "fn bounded_error(",
+            "pub fn rejected_arguments(",
         ] {
             let b = body(head);
             for n in io.iter().chain(send.iter()) {
