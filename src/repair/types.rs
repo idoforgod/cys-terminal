@@ -433,19 +433,29 @@ pub const ERR_CHECK_FAILED: &str = "repair_check_failed";
 pub const ERR_PLATFORM_PENDING: &str = "repair_pending_platform";
 pub const ERR_CORRUPT: &str = "repair_corrupt";
 
-/// RULINGS AU4: whether a pack-relative target is one of the pack's locked security files
-/// (`crate::pack::SYSTEM_LOCKED` — `trusted-keys.json`): never a repair target. Compared ignoring
-/// ASCII case (case-insensitive APFS / NTFS open the same file under another case).
+/// RULINGS AU4 / BJ3: whether a pack-relative target is one of the pack's locked security files
+/// (`crate::pack::SYSTEM_LOCKED` — `trusted-keys.json`): never a repair target. Compared after full
+/// case folding (case-insensitive APFS / NTFS open the same file under another spelling).
 pub fn is_system_locked(rel: &str) -> bool {
     system_locked_entry(rel).is_some()
 }
 
-/// The `SYSTEM_LOCKED` entry `rel` names (ignoring ASCII case), in the pack's own spelling.
+/// The `SYSTEM_LOCKED` entry `rel` names after full case folding ([`fold_name`] — RULINGS BJ3:
+/// `trusted-\u{212A}eys.json`, `tru\u{017F}ted-keys.json` ARE the key file on APFS / NTFS), in the
+/// pack's own spelling.
 pub fn system_locked_entry(rel: &str) -> Option<&'static str> {
+    let folded = fold_name(rel);
     crate::pack::SYSTEM_LOCKED
         .iter()
         .copied()
-        .find(|l| l.eq_ignore_ascii_case(rel))
+        .find(|l| fold_name(l) == folded)
+}
+
+/// RULINGS BJ3 — the ONE name comparison of protected names: Unicode case folding approximated by
+/// upper- then lower-casing every character (`ſ` → `S` → `s`, the Kelvin sign `K` → `k`, `ß` →
+/// `ss`), so every spelling a case-insensitive file system opens as the same name compares equal.
+pub fn fold_name(s: &str) -> String {
+    s.to_uppercase().to_lowercase()
 }
 
 /// Whether a no-follow stat result is a link for the repair rules: a symbolic link, and on Windows
@@ -487,7 +497,7 @@ pub fn parent_chain_link(pack: &Path, rel: &str) -> Result<(), RepairError> {
         };
         if is_link_like(&meta) {
             return Err(RepairError::Precondition(format!(
-                "{rel}: 상위 경로 {} 가 링크(또는 연결 지점)입니다 — 링크를 거친 경로는 수리 대상이 아닙니다(RULINGS AW3)",
+                "{rel}: 상위 경로 {} 가 링크(또는 연결 지점 · 클라우드 동기화 폴더의 자리표시)입니다 — 링크를 거친 경로는 수리 대상이 아닙니다(RULINGS AW3)",
                 parts[..=i].join("/")
             )));
         }
@@ -526,55 +536,91 @@ pub fn lane_pack_roots(pack: &Path) -> Vec<std::path::PathBuf> {
     roots
 }
 
-/// Lexical normalisation of an absolute path (`.` dropped, `..` pops) — no file system access.
-fn lexical(p: &Path) -> std::path::PathBuf {
-    use std::path::Component;
-    let mut out = std::path::PathBuf::new();
-    for c in p.components() {
-        match c {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
-}
-
-/// RULINGS AW3 (c): `None` when a candidate link at `pack/<rel>` pointing to `target` is allowed;
-/// otherwise the reason. Refused: a target that resolves (relative targets against the link's
-/// parent in the pack) to a directory, or to a path inside any lane's pack root
-/// ([`lane_pack_roots`]) — a repair never creates an alias of a pack path. A link to a user file
-/// outside the packs stays allowed.
+/// RULINGS AW3 (c) / BJ1: `None` when a candidate link at `pack/<rel>` pointing to `target` is
+/// allowed; otherwise the reason. The target is resolved PHYSICALLY, as the operating system opens
+/// it: from the link's own canonical parent, component by component, every existing component
+/// canonicalised (so a link inside the target is followed BEFORE a later `..` is applied — no
+/// textual `..` clean-up). Refused when (i) the longest existing prefix lies inside any lane's pack
+/// root ([`lane_pack_roots`]), (ii) the not-yet-existing rest contains `..`, (iii) the fully
+/// resolved target is a directory or lies inside a pack, or the target cannot be resolved (a link
+/// loop, an unreadable component — fail closed). A link to a user file outside the packs (also a
+/// file that does not exist yet) stays allowed: a repair never creates an alias of a pack path.
 pub fn link_target_refusal(pack: &Path, rel: &str, target: &str) -> Option<String> {
+    use std::path::{Component, PathBuf};
+    let roots = lane_pack_roots(pack);
+    let inside = |p: &Path| roots.iter().any(|r| p.starts_with(r));
+    let in_pack = || {
+        Some(format!(
+            "{rel}: 링크가 팩 안의 경로({target})를 가리킵니다 — 수리는 팩 경로의 별칭을 만들지 않습니다(RULINGS AW3)"
+        ))
+    };
+    let unresolved = |why: String| {
+        Some(format!(
+            "{rel}: 링크가 가리키는 곳({target})을 끝까지 확인할 수 없어 받지 않습니다 — {why}"
+        ))
+    };
     let live = pack.join(rel);
-    let parent = live.parent().unwrap_or(pack);
+    let start = match std::fs::canonicalize(live.parent().unwrap_or(pack)) {
+        Ok(p) => p,
+        Err(e) => return unresolved(e.to_string()),
+    };
     let t = Path::new(target);
-    let resolved = lexical(&if t.is_absolute() {
+    let raw = if t.is_absolute() {
         t.to_path_buf()
     } else {
-        parent.join(t)
-    });
-    if std::fs::metadata(&resolved).is_ok_and(|m| m.is_dir()) {
+        start.join(t)
+    };
+    let mut cur = PathBuf::new();
+    let mut rest: Vec<Component<'_>> = Vec::new();
+    for c in raw.components() {
+        if !rest.is_empty() {
+            rest.push(c);
+            continue;
+        }
+        match c {
+            Component::Prefix(_) | Component::RootDir => cur.push(c.as_os_str()),
+            Component::CurDir => {}
+            // `cur` is canonical (every link in it already followed): its parent is the physical one
+            Component::ParentDir => {
+                cur.pop();
+            }
+            Component::Normal(name) => {
+                let next = cur.join(name);
+                match std::fs::symlink_metadata(&next) {
+                    Ok(_) => match std::fs::canonicalize(&next) {
+                        Ok(resolved) => cur = resolved,
+                        Err(e) => return unresolved(e.to_string()),
+                    },
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => rest.push(c),
+                    Err(e) => return unresolved(e.to_string()),
+                }
+            }
+        }
+    }
+    // (i) the longest existing prefix, canonical
+    if inside(cur.as_path()) {
+        return in_pack();
+    }
+    // (ii) `..` in the part that does not exist yet (the OS would resolve it after creation)
+    if rest.iter().any(|c| matches!(c, Component::ParentDir)) {
+        return Some(format!(
+            "{rel}: 링크 대상({target})의 아직 없는 부분에 '..' 가 있습니다 — 받지 않습니다(RULINGS AW3)"
+        ));
+    }
+    // (iii) the fully resolved target
+    let mut full = cur.clone();
+    for c in &rest {
+        if let Component::Normal(name) = c {
+            full.push(name);
+        }
+    }
+    if rest.is_empty() && std::fs::metadata(&full).is_ok_and(|m| m.is_dir()) {
         return Some(format!(
             "{rel}: 링크가 폴더({target})를 가리킵니다 — 수리는 폴더를 가리키는 링크를 만들지 않습니다(RULINGS AW3)"
         ));
     }
-    let mut forms = vec![resolved.clone()];
-    if let Ok(c) = std::fs::canonicalize(&resolved) {
-        forms.push(c);
-    }
-    if let (Some(dir), Some(name)) = (resolved.parent(), resolved.file_name()) {
-        if let Ok(c) = std::fs::canonicalize(dir) {
-            forms.push(c.join(name));
-        }
-    }
-    let roots = lane_pack_roots(pack);
-    if forms.iter().any(|f| roots.iter().any(|r| f.starts_with(r))) {
-        return Some(format!(
-            "{rel}: 링크가 팩 안의 경로({target})를 가리킵니다 — 수리는 팩 경로의 별칭을 만들지 않습니다(RULINGS AW3)"
-        ));
+    if inside(full.as_path()) {
+        return in_pack();
     }
     None
 }
@@ -1068,6 +1114,15 @@ mod t3c_tests {
             assert!(is_system_locked(&rel.to_ascii_uppercase()));
         }
         assert!(is_system_locked("Trusted-Keys.JSON"));
+        // RULINGS BJ3: spellings a case-insensitive file system opens as the key file
+        for rel in [
+            "trusted-\u{212A}eys.json",
+            "tru\u{017F}ted-keys.json",
+            "TRU\u{017F}TED-KEYS.JSON",
+        ] {
+            assert_eq!(system_locked_entry(rel), Some("trusted-keys.json"), "{rel}");
+        }
+        assert_eq!(fold_name("Stra\u{00DF}e"), "strasse");
         for rel in ["bin/trusted-keys.json", "trusted-keys.json.bak", "bin/a.py"] {
             assert!(!is_system_locked(rel), "{rel}");
         }
@@ -1147,6 +1202,26 @@ mod t3c_tests {
             assert!(
                 link_target_refusal(&pack, "bin/a.py", &t).is_none(),
                 "{t} refused"
+            );
+        }
+        // RULINGS BJ1: an outside link followed by `..` resolves physically into the pack's hooks
+        std::fs::create_dir_all(pack.join("hooks")).unwrap();
+        std::fs::write(pack.join("hooks/guard.sh"), b"x").unwrap();
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(pack.join("hooks"), outside.join("lnk")).unwrap();
+        let sneaky = format!("{}/lnk/../hooks/guard.sh", outside.display());
+        let why =
+            link_target_refusal(&pack, "bin/helper.sh", &sneaky).expect("the alias was allowed");
+        assert!(why.contains("팩 안의 경로"), "{why}");
+        // a missing path two levels deep inside a pack; `..` in the part that does not exist yet
+        for t in [
+            pack.join("bin/new/deeper/x.py").display().to_string(),
+            format!("{}/missing/../../pack/hooks.sh", user.display()),
+        ] {
+            assert!(
+                link_target_refusal(&pack, "bin/a.py", &t).is_some(),
+                "{t} allowed"
             );
         }
         // `pack-notes` is not a pack (boundary match)

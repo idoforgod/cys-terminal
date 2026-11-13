@@ -2556,7 +2556,7 @@ fn ad6_rule_documents_fail_closed() {
         "docs/route_contract.md",
         "Vibecoding_Constitution.md",
     ] {
-        assert!(is_rule_document(rel), "{rel}");
+        assert!(rule_document_name(rel).is_some(), "{rel}");
         let e = r
             .call(
                 T0,
@@ -2574,7 +2574,7 @@ fn ad6_rule_documents_fail_closed() {
         "soul.md.bak",
         "docs/soul.markdown",
     ] {
-        assert!(!is_rule_document(rel), "{rel}");
+        assert!(rule_document_name(rel).is_none(), "{rel}");
     }
     assert!(!r.root.exists(), "a refused begin wrote something");
 }
@@ -3167,28 +3167,40 @@ fn aq1_trigger_verbs_outside_the_binding() {
     }
 }
 
-/// A repair of `bin/a.py` put into 승인 대기 (as T5b's submit leaves it), carrying signatures, with
-/// the lock of seat 3 in incarnation `inc-1`.
+/// `begin` on the boot-critical `hooks/h.sh` (classified by the stand-in list `hooks_boot`).
+fn begin_bc(r: &Rig, now: f64, who: &Caller) -> Result<Value, VerbError> {
+    handle_with(
+        &r.ctx(now, &hooks_boot, &pass),
+        who,
+        "begin",
+        &json!({"trigger": "owner_order", "files": ["hooks/h.sh"]}),
+    )
+}
+
+/// The working copy of `hooks/h.sh` of repair `id`.
+fn staged(r: &Rig, id: &str) -> PathBuf {
+    ledger::staging_dir_in(&r.root, &RepairId::parse(id).unwrap()).join("hooks/h.sh")
+}
+
+/// A boot-critical repair of `hooks/h.sh` put into 승인 대기 as T5b's `submit` leaves it (RULINGS
+/// BJ4): a working copy holding the worker's candidate, a pending request, signatures, intake
+/// signatures — with the lock of seat 3 in incarnation `inc-1`.
 fn awaiting_approval(r: &Rig, grant: bool) -> (String, RepairRecord) {
     let w = seat(3, "worker");
     // a grant start is refused while T4's claim is a stub: the repair is started as an owner-order
     // one and turned into a grant one (the pick-up rule is what is under test)
-    let id = r
-        .call(
-            T0,
-            &w,
-            "begin",
-            json!({"trigger": "owner_order", "files": ["bin/a.py"]}),
-        )
-        .unwrap()["repair"]
+    let id = begin_bc(r, T0, &w).unwrap()["repair"]
         .as_str()
         .unwrap()
         .to_string();
+    std::fs::write(staged(r, &id), b"#!/bin/sh\necho candidate\n").unwrap();
     let mut rec = r.record_of(&id);
+    assert_eq!(rec.classification, Classification::BootCritical);
     if grant {
         rec.trigger = cys::repair::types::Trigger::Grant;
     }
     rec.state = RepairState::AwaitingApproval;
+    rec.pending_request = Some(("fp-pending".into(), T0 + 600.0));
     rec.verify = Some(cys::repair::ledger::Attestation {
         seat: 7,
         role: "reviewer-codex".into(),
@@ -3203,43 +3215,23 @@ fn awaiting_approval(r: &Rig, grant: bool) -> (String, RepairRecord) {
     (id, rec)
 }
 
-/// RULINGS AQ11: a lock-less 승인 대기 repair is PICKED UP (never a second open repair on the file);
-/// the pick-up changes only the lock — state, signatures, working copy, pre-images stay — by the
-/// same seat and by another worker seat after a restart; within one incarnation the holder's
-/// retry is "already-held" and another seat is refused.
+/// RULINGS AQ11 / BJ4: a lock-less 승인 대기 repair is PICKED UP (never a second open repair on the
+/// file); the pick-up changes only the lock — state, signatures, the pending request, the working
+/// copy and the pre-images stay — by the same seat and by another worker seat after a restart;
+/// within one incarnation the holder's retry is "already-held" and another seat is refused.
 #[test]
 fn aq11_awaiting_approval_is_picked_up_changing_only_the_lock() {
     let r = rig("aq11");
     let (id, before) = awaiting_approval(&r, false);
+    let candidate = std::fs::read(staged(&r, &id)).unwrap();
     let w = seat(3, "worker");
-    let again = r
-        .call(
-            T0 + 1.0,
-            &w,
-            "begin",
-            json!({"trigger": "owner_order", "files": ["bin/a.py"]}),
-        )
-        .unwrap();
+    let again = begin_bc(&r, T0 + 1.0, &w).unwrap();
     assert_eq!(again["begin"], "already-held");
-    let e = r
-        .call(
-            T0 + 1.0,
-            &seat(13, "worker-3"),
-            "begin",
-            json!({"trigger": "owner_order", "files": ["bin/a.py"]}),
-        )
-        .unwrap_err();
+    let e = begin_bc(&r, T0 + 1.0, &seat(13, "worker-3")).unwrap_err();
     assert_eq!(e.code, "repair_locked");
     // a restart releases the lock: the same seat picks it up
     let r2 = restarted(&r, "inc-2");
-    let p = r2
-        .call(
-            T0 + 2.0,
-            &w,
-            "begin",
-            json!({"trigger": "owner_order", "files": ["bin/a.py"]}),
-        )
-        .unwrap();
+    let p = begin_bc(&r2, T0 + 2.0, &w).unwrap();
     assert_eq!(p["begin"], "picked-up");
     assert_eq!(p["repair"], json!(id));
     let after = r.record_of(&id);
@@ -3256,20 +3248,24 @@ fn aq11_awaiting_approval_is_picked_up_changing_only_the_lock() {
     let mut same = after.clone();
     same.lock = before.lock.clone();
     assert_eq!(same, before, "a pick-up changed more than the lock");
+    assert_eq!(
+        after.pending_request,
+        Some(("fp-pending".to_string(), T0 + 600.0))
+    );
+    assert_eq!(
+        std::fs::read(staged(&r, &id)).unwrap(),
+        candidate,
+        "the working copy changed"
+    );
     // another restart: another worker seat picks it up
     let r3 = restarted(&r, "inc-3");
-    let p = r3
-        .call(
-            T0 + 3.0,
-            &seat(13, "worker-3"),
-            "begin",
-            json!({"trigger": "owner_order", "files": ["bin/a.py"]}),
-        )
-        .unwrap();
+    let p = begin_bc(&r3, T0 + 3.0, &seat(13, "worker-3")).unwrap();
     assert_eq!(p["begin"], "picked-up");
     let after = r.record_of(&id);
     assert_eq!(after.lock.as_ref().unwrap().owner.seat, 13);
     assert_eq!(after.state, RepairState::AwaitingApproval);
+    assert!(after.pending_request.is_some());
+    assert_eq!(std::fs::read(staged(&r, &id)).unwrap(), candidate);
     assert_eq!(
         ledger::list_ids_in(&r.root).len(),
         1,
@@ -3289,13 +3285,13 @@ fn aq11_grant_pick_up_takes_a_new_claim() {
     assert_eq!(before.trigger, cys::repair::types::Trigger::Grant);
     let r2 = restarted(&r, "inc-2");
     fn begin_with(r2: &Rig, claim: &ClaimFn<'_>) -> Result<Value, VerbError> {
-        let mut ctx = r2.ctx(T0 + 2.0, &general, &pass);
+        let mut ctx = r2.ctx(T0 + 2.0, &hooks_boot, &pass);
         ctx.claim = claim;
         handle_with(
             &ctx,
             &seat(3, "worker"),
             "begin",
-            &json!({"trigger": "grant", "files": ["bin/a.py"]}),
+            &json!({"trigger": "grant", "files": ["hooks/h.sh"]}),
         )
     }
     for (verdict, code, sentence) in [
@@ -3501,6 +3497,18 @@ fn aw3_link_candidates_into_packs_refused() {
         assert_eq!(e.code, "repair_precondition", "{}", to.display());
         assert!(e.message.contains(why), "{}: {}", to.display(), e.message);
     }
+    // RULINGS BJ1: an outside link followed by `..` opens the pack's hooks — resolved physically
+    let outside = base.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(r.pack.join("hooks"), outside.join("lnk")).unwrap();
+    relink(Path::new(&format!(
+        "{}/lnk/../hooks/h.sh",
+        outside.display()
+    )));
+    let e = r
+        .call(T0 + 1.0, &w, "record", json!({"repair": id, "note": "n"}))
+        .unwrap_err();
+    assert!(e.message.contains("팩 안의 경로"), "{}", e.message);
     // a link to a user file outside the packs: recorded, verified, committed
     relink(user.join("notes.txt").as_path());
     r.call(
@@ -3529,4 +3537,232 @@ fn aw3_link_candidates_into_packs_refused() {
         .call(T0 + 5.0, &w, "commit", json!({"repair": id}))
         .unwrap();
     assert_eq!(c["state"], "probation", "{c}");
+}
+
+// ───────────────────────────── T3c fix round (RULINGS BJ1–BJ5) ─────────────────────────────
+
+/// RULINGS BJ2: `begin --joins` checks EVERY file of the joined repair (not only those named in
+/// `--files`) before anything is read or copied: a linked parent of another file of the joined
+/// repair refuses the join; no vault slot is made and the lane row is untouched.
+#[cfg(unix)]
+#[test]
+fn bj2_joins_checks_every_file_of_the_joined_repair() {
+    let r = rig("bj2");
+    let w = seat(3, "worker");
+    let rid = r
+        .call(
+            T0,
+            &w,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["bin/a.py", "hooks/h.sh"]}),
+        )
+        .unwrap()["repair"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let row = cys::repair::ledger::LaneRecord {
+        schema: 1,
+        repair: RepairId::parse(&rid).unwrap(),
+        lane: r.lane.clone(),
+        state: LaneState::Conflict,
+        probation: None,
+        merge: None,
+        merge_history: vec![],
+        approval_ref: None,
+        conflict_live: vec![],
+        applied: vec![],
+        applied_history: vec![],
+        merge_base: vec![],
+        merge_lock: None,
+        merge_attempt: 0,
+        updated_at: T0,
+    };
+    ledger::write_lane_in(&r.root, &row).unwrap();
+    let id = RepairId::parse(&rid).unwrap();
+    let slots_before = ledger::list_slots_in(&r.root, &id).len();
+    std::fs::rename(r.pack.join("hooks"), r.pack.join("hooks-real")).unwrap();
+    std::os::unix::fs::symlink(r.pack.join("hooks-real"), r.pack.join("hooks")).unwrap();
+    let e = r
+        .call(
+            T0 + 1.0,
+            &seat(13, "worker-3"),
+            "begin",
+            json!({"trigger": "owner_order", "files": ["bin/a.py"], "joins": rid}),
+        )
+        .unwrap_err();
+    assert_eq!(e.code, "repair_precondition", "{}", e.message);
+    assert!(
+        e.message.contains("hooks/h.sh") && e.message.contains("링크"),
+        "{}",
+        e.message
+    );
+    assert_eq!(
+        ledger::list_slots_in(&r.root, &id).len(),
+        slots_before,
+        "a slot was copied"
+    );
+    let after = ledger::read_lane_in(&r.root, &id, &r.lane)
+        .unwrap()
+        .unwrap();
+    assert_eq!(after, row, "the lane row changed");
+}
+
+/// RULINGS BJ3: spellings that fold to a protected name ARE that file on a case-insensitive file
+/// system: the key file (Kelvin sign, long s) and rule documents are refused naming the real file.
+#[test]
+fn bj3_folded_spellings_of_protected_names_refused() {
+    let r = rig("bj3");
+    let w = seat(3, "worker");
+    for rel in ["trusted-\u{212A}eys.json", "tru\u{017F}ted-keys.json"] {
+        let e = r
+            .call(
+                T0,
+                &w,
+                "begin",
+                json!({"trigger": "owner_order", "files": ["bin/a.py", rel]}),
+            )
+            .unwrap_err();
+        assert_eq!(e.code, "repair_precondition", "{rel}");
+        assert!(
+            e.message.contains("(= trusted-keys.json)")
+                && e.message.contains("cys pack-heal trusted-keys.json"),
+            "{rel}: {}",
+            e.message
+        );
+    }
+    std::fs::write(r.pack.join("SOUL.md"), b"# soul\n").unwrap();
+    for (rel, real) in [
+        ("\u{017F}oul.md", "SOUL.md"),
+        ("agents/MA\u{017F}TER_DIRECTIVE.md", "master_directive.md"),
+    ] {
+        assert!(rule_document_name(rel).is_some(), "{rel}");
+        let e = r
+            .call(
+                T0,
+                &w,
+                "begin",
+                json!({"trigger": "owner_order", "files": [rel]}),
+            )
+            .unwrap_err();
+        assert_eq!(e.code, "repair_not_implemented", "{rel}");
+        assert!(
+            e.message.contains(&format!("(= {real})")),
+            "{rel}: {}",
+            e.message
+        );
+    }
+    assert!(!r.root.exists(), "a refused begin wrote something");
+}
+
+/// RULINGS BJ5: one open repair per file — a `begin` whose files overlap a being-worked repair of
+/// this lane with another target set, or with another `--resolves`, is refused naming that repair;
+/// a 승인 대기 repair counts; the repair a `--resolves` start resolves keeps its own rule; a
+/// repair in force does not block.
+#[test]
+fn bj5_one_open_repair_per_file() {
+    let r = rig("bj5");
+    let w = seat(3, "worker");
+    let r0 = r
+        .call(
+            T0,
+            &w,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["hooks/h.sh"]}),
+        )
+        .unwrap()["repair"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let r1 = r
+        .call(
+            T0,
+            &w,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["bin/a.py"]}),
+        )
+        .unwrap()["repair"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let other = seat(13, "worker-3");
+    // another target set overlapping r1
+    let e = r
+        .call(
+            T0 + 1.0,
+            &other,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["bin/a.py", "bin/b.py"]}),
+        )
+        .unwrap_err();
+    assert_eq!(e.code, "repair_precondition");
+    assert!(
+        e.message.contains(&r1) && e.message.contains(&format!("--joins {r1}")),
+        "{}",
+        e.message
+    );
+    // another `--resolves` on r1's file
+    let e = r
+        .call(
+            T0 + 1.0,
+            &other,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["bin/a.py"], "resolves": r0}),
+        )
+        .unwrap_err();
+    assert!(e.message.contains(&r1), "{}", e.message);
+    // the repair a `--resolves` start resolves keeps its own rule (RULINGS T1)
+    let p = r
+        .call(
+            T0 + 1.0,
+            &other,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["hooks/h.sh"], "resolves": r0}),
+        )
+        .unwrap();
+    assert_eq!(p["begin"], "new");
+    // a lock-less 승인 대기 repair counts too
+    let mut rec = r.record_of(&r1);
+    rec.state = RepairState::AwaitingApproval;
+    rec.lock = None;
+    ledger::write_record_in(&r.root, &rec).unwrap();
+    let e = r
+        .call(
+            T0 + 2.0,
+            &other,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["bin/a.py", "bin/b.py"]}),
+        )
+        .unwrap_err();
+    assert!(e.message.contains(&r1), "{}", e.message);
+    assert_eq!(
+        ledger::list_ids_in(&r.root).len(),
+        3,
+        "a second open repair was made"
+    );
+    // the same files pick it up
+    let p = r
+        .call(
+            T0 + 2.0,
+            &other,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["bin/a.py"]}),
+        )
+        .unwrap();
+    assert_eq!(
+        (p["begin"].as_str(), p["repair"].as_str()),
+        (Some("picked-up"), Some(r1.as_str()))
+    );
+    // a repair in force does not block a new one with another target set
+    let r2 = rig("bj5-inforce");
+    let done = committed_general(&r2);
+    let p = r2
+        .call(
+            T0 + 10.0,
+            &w,
+            "begin",
+            json!({"trigger": "owner_order", "files": ["bin/a.py", "hooks/h.sh"]}),
+        )
+        .unwrap();
+    assert_eq!(p["begin"], "new");
+    assert_ne!(p["repair"], json!(done));
 }
