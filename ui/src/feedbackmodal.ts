@@ -83,7 +83,7 @@ export function mountFeedbackButton(slot: HTMLElement | null, onClick: () => voi
   const b = document.createElement("button");
   b.id = "btn-feedback";
   b.type = "button";
-  b.title = "피드백 보내기 — 불편한 점이나 바라는 점을 사진·영상과 함께 알려 주세요";
+  b.title = "피드백 보내기 — 불편한 점이나 바라는 점을 나누고 싶을 때(선택 · 자동 전송 없음)";
   b.setAttribute("aria-label", "피드백 보내기");
   b.innerHTML = BUTTON_HTML;
   b.addEventListener("click", onClick);

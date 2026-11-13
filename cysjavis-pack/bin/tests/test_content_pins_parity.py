@@ -660,9 +660,12 @@ TIER1_FAMILIES = {
 # Proposed for Part 33 B98 (RULINGS BZ3) — applied by this guard now.
 TIER1_STRICTER = {
     "T1-b+": r"('?피드백'?[^.!?。\n]{0,12}(알려|보내|남겨|제보)|제보해\s*(주|달))",
-    "T1-h": (r"((더\s*)?(빨리|빠르게|신속히|곧)\s*(고칠|고쳐|고치|수정할|수정해|수정하|해결할|해결해|해결하|반영할|반영해|반영하)"
-             r"[^.!?。\n]{0,6}(수\s*있|드리|드릴|겠|게\s*됩)"
-             r"|" + TIER1_NOUN + r"[^.!?。\n]{0,20}(고쳐\s*드리|고쳐\s*드릴|고치겠|수정해\s*드리|수정해\s*드릴|반영하겠|반영해\s*드리))"),
+    # RULINGS CE4: a MAKER noun (the T1-a list) or the conditional form ("…해 주시면 더 빨리 고칠 수 있습니다") in the same
+    #   sentence — the product's own repair promise ("자비스가 곧 고치겠습니다") is not a deferral.
+    "T1-h": (r"(" + TIER1_NOUN + r"[^.!?。\n]{0,30}(고쳐\s*드리|고쳐\s*드릴|고치겠|고칠\s*수\s*있|수정해\s*드리|수정해\s*드릴"
+             r"|수정하겠|반영하겠|반영해\s*드리|해결해\s*드리)"
+             r"|(주시면|주면|하시면|해\s*주시면)[^.!?。\n]{0,20}(더\s*)?(빨리|빠르게|신속히|곧)\s*(고칠|고쳐|고치|수정할|수정해|수정하"
+             r"|해결할|해결해|해결하|반영할|반영해|반영하)[^.!?。\n]{0,6}(수\s*있|드리|드릴|겠|게\s*됩))"),
 }
 TIER1_EX = (
     "제작자에게 물어보라고 하거나, 다음 업데이트를 기다리라고 하거나, 제보하라고 하는 것으로 수리를 대신하지 않는다",
@@ -678,14 +681,14 @@ FEEDBACK_FEATURE_IDENTIFIERS = {
     "ui/src/feedbackmodal.ts": (
         "피드백 보내기",                                                          # the button's aria-label
         "<span>피드백 보내기</span>",                                             # the button's label
-        "피드백 보내기 — 불편한 점이나 바라는 점을 사진·영상과 함께 알려 주세요",       # the button's title
         '<div class="fb-head"><h3 id="fb-title">피드백 보내기</h3><button type="button" class="fb-x" '
         'aria-label="닫기">×</button></div>',                                    # the modal's title
     ),
 }
-# The same feature's NAME inside a longer text (the manual's section heading and its button sentence): a T1-b+ match that is
-# only the name "피드백 보내기" is an identifier (proposed with B98, as Part 15 A5 does for `--propose`).
-FEEDBACK_FEATURE_NAME = r"'?\*{0,2}피드백\*{0,2}'?\s*보내기"
+# The same feature's NAME inside a longer text (the manual's section heading and its button sentence): a T1-b+ match that IS
+# the name "피드백 보내기" in full — nothing before or after it inside the match — is an identifier (RULINGS CE1, as Part 15
+# A5 does for `--propose`); a match that merely starts with or contains the name is counted ("피드백 보내기를 눌러 알려 주세요").
+FEEDBACK_FEATURE_NAME_MATCH = r"'?피드백'?\s*보내"      # T1-b+'s own match on the name stops before its last syllable "기"
 
 
 def _tier1_sentence_spans(t):
@@ -715,7 +718,7 @@ def tier1_text_hits(text, stricter=True):
             i = bisect.bisect_right(starts, m.start()) - 1
             if i < 0 or is_ex(i):
                 continue
-            if fam == "T1-b+" and re.match(FEEDBACK_FEATURE_NAME, t[m.start():]):
+            if fam == "T1-b+" and re.fullmatch(FEEDBACK_FEATURE_NAME_MATCH, m.group(0)) and t[m.end():m.end() + 1] == "기":
                 continue
             if fam == "T1-e":
                 line = t[t.rfind("\n", 0, m.start()) + 1:(t.find("\n", m.end()) + 1 or len(t) + 1) - 1]
@@ -1119,7 +1122,14 @@ class DeferralFamiliesFG(unittest.TestCase):
         for name_only in ("왼쪽 워크스페이스 목록 아래의 **피드백 보내기** 단추를 누르면 작성 창이 열립니다.",
                           "### 4.11 피드백 보내기 (v0.14.41)"):
             self.assertEqual(tier1_sentence_hits(name_only), [], name_only)
+        # RULINGS CE1: a match that merely starts with the name is counted.
+        for starts_with_name in ("문제가 생기면 피드백 보내기를 눌러 알려 주세요", "피드백 보내기 단추로 알려 주세요",
+                                 "피드백 보내기로 제보해 주세요"):
+            self.assertEqual(tier1_sentence_hits(starts_with_name), ["T1-b+"], starts_with_name)
         self.assertEqual(tier1_sentence_hits("제작자가 곧 고쳐 드리겠습니다."), ["T1-h"])
+        # RULINGS CE4: the product's own repair promise is not a deferral.
+        for own in ("자비스가 곧 고치겠습니다.", "워커가 빨리 고칠 수 있다.", "자비스에게 이 증상을 말해 주세요 — 자비스가 스스로 고칩니다."):
+            self.assertEqual(tier1_sentence_hits(own), [], own)
 
     def test_extraction_rule_negative_controls(self):
         """Comments, docstrings, bare string statements, dict keys, `#[cfg(test)]` items and quoted identifiers are not
