@@ -62,6 +62,14 @@ rm -rf "$RT/node/include"
 # ※npm/docs·npm/man(≈2.6MB)은 게이트 전부 통과했으나(`npm help` exit 0) `npm help <주제>` 출력 콘텐츠가
 #   바뀌어 '정보 불변' 엄격 해석에 걸릴 여지가 있어 retention 원칙으로 보존 — 오너 명시 승인 시 추가 트림.
 
+# ── 아키텍처 검증 (0.15.0 · T11 · RULINGS BQ1(c) · 오너 지시 추가 11) ──
+# 내려받은 python·node·git·uv 의 진입점과 트리 안 모든 Mach-O 가 **타깃 아키텍처**를 담는지 헤더 바이트로
+# 확인한다(lipo 불요 · 실행 없음). x86_64 레그는 arm64 러너의 크로스 빌드라, 잘못된 자산이 내려와도
+# 지금까지는 아무것도 붉어지지 않았다 — 인텔용 설치 파일에 M칩 전용 python 이 실리는 경로다.
+# ★반드시 아래 선컴파일(동봉 python 을 **실행**한다) 앞: 다른 아키텍처면 실행 전에 이름을 대고 멈춘다.
+python3 scripts/check_macho_arch.py --target "$TARGET" --quiet \
+  --require python/bin/python3 --require node/bin/node --require git/bin/git --require uv/uv "$RT"
+
 printf 'Bundled runtimes and their licenses (macOS):\n- CPython (python-build-standalone): PSF License (https://github.com/astral-sh/python-build-standalone)\n- git (desktop/dugite-native): GPLv2 (https://github.com/desktop/dugite-native)\n- uv (astral-sh): Apache-2.0 OR MIT (https://github.com/astral-sh/uv)\n- Node.js (+npm/npx): MIT (https://nodejs.org)\nWritten offer for corresponding source: contact the distributor.\n' > "$RT/LICENSES/BUNDLED-RUNTIMES.txt"
 
 # ── SEAL-2: 동봉 python 선컴파일 (서명 전 필수 · 2026-08-01 실사고 구조적 봉인) ──
