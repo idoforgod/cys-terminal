@@ -28,7 +28,11 @@ BASH = shutil.which("bash") or "/bin/bash"
 LITERALS = ("~/.cys/local/hooks/<이벤트>.d/", "cys repair begin --files", "cys repair record")
 # RULINGS AH1: the taught call is the one the daemon accepts (--trigger is required, AD10), begin comes BEFORE
 # the edit, and a boot-critical / protection-related hook goes through the working copy + submit.
-CALL_LITERALS = ("--trigger owner-order|grant|update", "고치기 전에", "repairs/R-<n>/staging/", "cys repair submit")
+CALL_LITERALS = ("--trigger <계기>(owner-order · grant · update 중 하나)", "고치기 전에", "repairs/R-<n>/staging/",
+                 "리뷰어1의 검증과 리뷰어2의 감사 서명을 받은 뒤 cys repair submit")
+# RULINGS AM2: a line an agent can run verbatim carries no shell pipe — `a|b|c` run as is pipes the command and
+# records a false `owner-order` origin (AD10). AM1: the general message ③ says worker / begin BEFORE / working copy.
+GENERAL_3 = ("「스스로 해결」 수리는 워커가 한다 — 고치기 전에 cys repair begin 으로 시작하고", "cys repair submit 으로 최종 승인")
 # the old route, split so this file itself carries no such phrase (shipped-string sweep A-1-05)
 OLD_ROUTE = ("--pro" + "pose", "제안" + " 패치", "pack-merge --file hooks/guard.sh --pro" + "pose")
 
@@ -81,7 +85,8 @@ class PackGuardHooksGuidance(unittest.TestCase):
         ctx = context_of(r)
         for lit in LITERALS:
             self.assertIn(lit, ctx, "hook output lacks %r: %r" % (lit, ctx[:400]))
-        self.assertIn("cys repair begin --files hooks/guard.sh --trigger owner-order|grant|update", ctx)
+        self.assertIn("cys repair begin --files hooks/guard.sh --trigger <계기>(owner-order · grant · update 중 하나)", ctx)
+        self.assertNotIn("owner-order|", ctx, "a filled-in runnable line must not carry shell pipe alternatives (AM2)")
         for lit in CALL_LITERALS:
             self.assertIn(lit, ctx, "hook output lacks %r" % lit)
         for old in OLD_ROUTE:
@@ -92,6 +97,9 @@ class PackGuardHooksGuidance(unittest.TestCase):
         self.assertEqual(r.returncode, 0)
         ctx = context_of(r)
         self.assertIn("pack-guard", ctx, "control: the ordinary warning still prints")
+        for lit in GENERAL_3:
+            self.assertIn(lit, ctx, "general message ③ lacks %r (RULINGS AM1)" % lit)
+        self.assertNotIn("begin·record", ctx)
         self.assertNotIn("~/.cys/local/hooks/<이벤트>.d/", ctx)
         self.assertNotIn("hooks/ 아래 vendor 파일의 수정은", ctx)
 
@@ -105,7 +113,8 @@ class PackGuardHooksGuidance(unittest.TestCase):
         for old in OLD_ROUTE[:2]:
             self.assertNotIn(old, const, "HOOKS_LOCAL_GUIDANCE still carries the old proposal route %r" % old)
         for lit in CALL_LITERALS:
-            self.assertIn(lit, const, "HOOKS_LOCAL_GUIDANCE lacks %r (RULINGS AH1)" % lit)
+            self.assertIn(lit, const, "HOOKS_LOCAL_GUIDANCE lacks %r (RULINGS AH1, AM2, AM3)" % lit)
+        self.assertNotIn("|", const, "no shell pipe character in the printed guidance (RULINGS AM2)")
         self.assertLess(const.index("cys repair begin"), const.index("cys repair record"),
                         "begin must be taught before record (begin stores the pre-image)")
 

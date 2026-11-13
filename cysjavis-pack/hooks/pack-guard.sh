@@ -50,7 +50,7 @@ OWN=$(cys pack-ownership --quiet "$REL" 2>/dev/null)
 [ "$OWN" = "system" ] || exit 0
 : > "$STAMP" 2>/dev/null
 
-MSG="[pack-guard] '$REL' 은 vendor(system) 파일 — 이 수정은 보존됩니다(kept-drift). 다음 벤더 업데이트 때 자동 병합되며, 충돌하면 내 수정본이 살아 있고 vendor 본은 $REL.new 로 보관돼 워커가 합칩니다(기동 필수 파일은 vendor 본이 먼저 서고 내 수정본은 보관돼 워커가 승인 절차로 다시 입힙니다). 보안 잠금 파일(trusted-keys.json)은 예외 — 즉시 vendor 본으로 치유($REL.user 백업). 영속 경로: ① 자작 기능은 새 파일로(비임베드=업데이트 불가침) ② 스킬 커스텀은 ~/.cys/local/skills(shadowing, cys pack-merge --to-local) ③ 「스스로 해결」 수리는 cys repair begin·record 로 수리 장부에 남긴다(업데이트 뒤 다시 입히기·되돌리기의 근거). (WARN — 차단 아님)"
+MSG="[pack-guard] '$REL' 은 vendor(system) 파일 — 이 수정은 보존됩니다(kept-drift). 다음 벤더 업데이트 때 자동 병합되며, 충돌하면 내 수정본이 살아 있고 vendor 본은 $REL.new 로 보관돼 워커가 합칩니다(기동 필수 파일은 vendor 본이 먼저 서고 내 수정본은 보관돼 워커가 승인 절차로 다시 입힙니다). 보안 잠금 파일(trusted-keys.json)은 예외 — 즉시 vendor 본으로 치유($REL.user 백업). 영속 경로: ① 자작 기능은 새 파일로(비임베드=업데이트 불가침) ② 스킬 커스텀은 ~/.cys/local/skills(shadowing, cys pack-merge --to-local) ③ 「스스로 해결」 수리는 워커가 한다 — 고치기 전에 cys repair begin 으로 시작하고(고친 뒤에 부른 begin 은 고친 내용을 원본으로 보관한다) 기동 필수·보호장치 관련 파일은 begin 이 알려 주는 작업 사본에서 고쳐 cys repair submit 으로 최종 승인을 받는다(수리 장부 = 업데이트 뒤 다시 입히기·되돌리기의 근거). (WARN — 차단 아님)"
 
 # ── ★v2 §9 이중 활성 방지 안내(사건표 스킬 4건 처분 — 조건부 동승) ──
 # skills/ rel 에 동명 로컬 오버레이(~/.cys/local/skills/<skill>)가 실재하면 스킬 색인
@@ -67,7 +67,7 @@ case "$REL" in
   # ★F10-B(0.14.50): hooks/ 아래 vendor 파일의 수정 — 보존 사실 + 수리 장부 경로 + 영속 경로(로컬 훅 폴더)를 고지(0.15.0 M2).
   #   문장의 단일 출처는 src/pack.rs 의 HOOKS_LOCAL_GUIDANCE(<rel> 만 $REL 로 치환) — 낱말을 바꾸면 test_pack_guard_hooks_guidance.py 가 붉어진다. 차단 없음.
   hooks/*)
-    MSG="$MSG hooks/ 아래 vendor 파일의 수정은 제자리에 보존됩니다. 「스스로 해결」 수리라면 워커가 고치기 전에 cys repair begin --files $REL --trigger owner-order|grant|update 로 시작해 원본을 보관한 뒤 고치고 cys repair record 로 수리 장부에 남깁니다(장부가 업데이트 뒤 다시 입히기·되돌리기·감사의 근거) — 기동 필수·보호장치 관련 훅은 살아 있는 파일이 아니라 begin 이 알려 주는 작업 사본 repairs/R-<n>/staging/ 에서 고쳐 cys repair submit 으로 수정 최종 승인을 받습니다. 따로 두고 싶은 자기 훅은 ~/.cys/local/hooks/<이벤트>.d/ 에 둡니다(업데이트·치유 불가침)."
+    MSG="$MSG hooks/ 아래 vendor 파일의 수정은 제자리에 보존됩니다. 「스스로 해결」 수리라면 워커가 고치기 전에 cys repair begin --files $REL --trigger <계기>(owner-order · grant · update 중 하나) 로 시작해 원본을 보관한 뒤 고치고 cys repair record 로 수리 장부에 남깁니다(장부가 업데이트 뒤 다시 입히기·되돌리기·감사의 근거) — 기동 필수·보호장치 관련 훅은 살아 있는 파일이 아니라 begin 이 알려 주는 작업 사본 repairs/R-<n>/staging/ 에서 고치고, 리뷰어1의 검증과 리뷰어2의 감사 서명을 받은 뒤 cys repair submit 으로 수정 최종 승인을 받습니다. 따로 두고 싶은 자기 훅은 ~/.cys/local/hooks/<이벤트>.d/ 에 둡니다(업데이트·치유 불가침)."
     ;;
 esac
 
