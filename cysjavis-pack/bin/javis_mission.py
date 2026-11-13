@@ -1630,21 +1630,20 @@ def machine_origin(prompt, delivery=None, ledger_status=None):
 # 위조는 막지 못한다(같은 등급의 한계 — docs/THREAT-MODEL-mission-gate.md).
 OWNER_DOUBT_CODES = ("ledger_bad_lines", "ledger_schema_skew", "delivery_parts_capped")
 
-# RULINGS CI1(T4): 알림 가족 — `task-notification` 과 그 안에서만 쓰이는 컨텍스트 마커. 이 가족의 **블록**
-# (여는 태그 ~ 같은 이름 닫는 태그)이 하나라도 든 프롬프트는 주변 글과 무관하게 harness 가 합성한 차례다
-# (Rust `mission_gate::owner_notification_family` · `holds_notification_block` 파리티).
+# RULINGS CI1·CJ3(T4): 알림 가족 — `task-notification` 과 그 안에서만 쓰이는 컨텍스트 마커. 이 가족의
+# **태그**(여는·닫는·자기닫힘 · 대소문자 무관 · 속성·태그 안 공백 허용 · 짝 무관)가 하나라도 든 프롬프트는
+# 주변 글과 무관하게 harness 가 합성한 차례다(Rust `mission_gate::owner_notification_family` ·
+# `holds_notification_tag` 파리티 — `_HARNESS_TAG` 와 같은 모양, 이름만 가족으로 좁힌다).
 OWNER_NOTIFICATION_FAMILY = ("task-notification",) + HARNESS_CONTEXT_MARKERS
-_NOTIFICATION_FAMILY_BLOCKS = tuple(
-    (re.compile(r"<\s*%s(?![\w-])[^<>]*>.*?<\s*/\s*%s(?![\w-])\s*>"
-                % (re.escape(m), re.escape(m)), re.IGNORECASE | re.DOTALL),
-     re.compile(r"<\s*/\s*%s(?![\w-])\s*>" % re.escape(m), re.IGNORECASE))
-    for m in OWNER_NOTIFICATION_FAMILY)
+_NOTIFICATION_FAMILY_TAG = re.compile(
+    r"<\s*/?\s*(?:%s)(?![\w-])[^<>]*>"
+    % "|".join(re.escape(m) for m in sorted(OWNER_NOTIFICATION_FAMILY, key=len, reverse=True)),
+    re.IGNORECASE)
 
 
-def holds_notification_block(prompt):
-    """RULINGS CI1 — 프롬프트에 알림 가족의 블록이 들어 있는가(닫는 태그가 없으면 블록도 없다)."""
-    p = prompt or ""
-    return any(close.search(p) and block.search(p) for block, close in _NOTIFICATION_FAMILY_BLOCKS)
+def holds_notification_tag(prompt):
+    """RULINGS CJ3 — 프롬프트에 알림 가족의 태그가 하나라도 있는가(블록이 아니라 태그 — 짝 무관)."""
+    return _NOTIFICATION_FAMILY_TAG.search(prompt or "") is not None
 
 
 def owner_typed(prompt, origin, ledger_status, anomaly_codes):
@@ -1663,9 +1662,9 @@ def owner_typed(prompt, origin, ledger_status, anomaly_codes):
     hit, why = harness_origin(prompt)
     if hit:
         return False, "harness 가 합성한 알림(층0) — %s" % why
-    if holds_notification_block(prompt):
-        return False, ("알림 가족 블록(task-notification 등)이 들어 있다 — 주변 글과 무관하게 harness 가 "
-                       "합성한 차례다(RULINGS CI1)")
+    if holds_notification_tag(prompt):
+        return False, ("알림 가족 태그(task-notification 등)가 들어 있다 — 주변 글·짝과 무관하게 harness 가 "
+                       "합성한 차례다(RULINGS CI1 · CJ3)")
     boot, why = boot_command_origin(prompt)
     if boot:
         return False, "기동 명령문(층0-c) — %s" % why

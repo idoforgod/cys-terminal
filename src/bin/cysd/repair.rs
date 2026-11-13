@@ -3330,10 +3330,12 @@ mod grant_verbs {
     }
 
     /// Registers ONE open question for the seat (a newer one replaces an older one — Q1); a grant
-    /// question carries its daily limit (CI4).
+    /// question carries its daily limit (CI4). The seat's typing mark is cleared (CJ2: the typing that
+    /// answers a question comes after the question).
     fn register(ctx: &Ctx<'_>, sid: u64, path: Option<String>, daily_cap: Option<u32>) -> Value {
         let mut map = ctx.prompts.lock().unwrap_or_else(|e| e.into_inner());
         let r = map.entry(sid).or_default();
+        r.typing_mark = None;
         let replaced = r.question.is_some();
         r.question = Some(OpenQuestion {
             asked_at: ctx.now,
@@ -3439,6 +3441,8 @@ mod grant_verbs {
         let mut v = register(ctx, sid, None, Some(cap));
         v["question"] = json!("grant");
         v["daily_cap"] = json!(cap);
+        // CJ5: the question the master asks names the limit
+        v["ask_owner"] = json!(oo::grant_question_ko(cap));
         Ok(v)
     }
 
@@ -3726,13 +3730,24 @@ pub(crate) fn grant_note_owner_input(daemon: &Daemon) {
     note_owner_input_throttled(&root, &lane, cys::repair::ledger::now_epoch());
 }
 
-/// T4 (RULINGS CH3 (b), CI1) — an operator-verified send into `seat` (`human_verified` in
-/// `handlers.rs`): the pause, for every such send; and the app-typing mark of Level 2, only when the
-/// operator token did not come from a pane (`verified_from` is none).
-pub(crate) fn grant_note_app_typing(daemon: &Daemon, seat: u64, verified_from: Option<u64>) {
+/// T4 (RULINGS CH3 (b), CI1, CJ1) — an operator-verified send into `seat` (`human_verified` in
+/// `handlers.rs`): the pause, for EVERY such send (the safe direction); and the typing mark of Level
+/// 2 only when the operator token did not come from a pane (`verified_from` is none) AND the sent
+/// text is typed or pasted text (`owner_origin::arms_typing_mark` — printable characters plus CR, LF,
+/// TAB only; a focus / mouse report or a terminal's answer to a query arms nothing).
+pub(crate) fn grant_note_app_typing(
+    daemon: &Daemon,
+    seat: u64,
+    verified_from: Option<u64>,
+    text: &str,
+) {
     grant_note_owner_input(daemon);
-    if verified_from.is_none() {
-        mark_app_typing(&daemon.repair_prompt_origin, seat);
+    if verified_from.is_none() && cys::repair::owner_origin::arms_typing_mark(text) {
+        mark_app_typing(
+            &daemon.repair_prompt_origin,
+            seat,
+            cys::repair::ledger::now_epoch(),
+        );
     }
 }
 
@@ -3805,11 +3820,13 @@ pub(crate) struct ApprovalTable {}
 /// lower-cased, found in the seat's latest owner-typed prompt (RULINGS U4(a)); no prompt text kept.
 /// `digest` / `origin` / `at` describe the seat's LATEST prompt (any origin). `origin` is LEVEL 1 of
 /// the owner judgment (RULINGS CH2 / CI1 — `strict_origin`): `human` = "may be the owner".
-/// `last_human` = (digest, at) of the latest Level-1 prompt (CH4). LEVEL 2 (CI1) = Level 1 AND
-/// `app_typed` — the daemon saw operator-verified typing from the app into this seat (not from a
-/// pane) since its previous Level-2 prompt; a Level-2 prompt consumes the mark. `last_typed`,
-/// `named_docs` (U4(a), read from the prompt's free text only) and `named_numbers` (CI4) belong to
-/// the latest Level-2 prompt (T4).
+/// `last_human` = (digest, at) of the latest Level-1 prompt (CH4). LEVEL 2 (CI1, CJ1, CJ2, CJ4) =
+/// Level 1 AND `typing_mark` — the time the daemon last saw the owner's typed or pasted text arrive
+/// from the app into this seat (not from a pane), younger than 30 minutes, not cleared by a question
+/// registered since — AND every harness marker tag of the prompt inside a closed block. The next
+/// Level-1 prompt takes the mark (whether or not it becomes Level 2). `last_typed`, `named_docs`
+/// (U4(a), read from the prompt's free text only) and `named_numbers` (CI4) belong to the latest
+/// Level-2 prompt (T4).
 #[derive(Default, Clone)]
 pub(crate) struct PromptOrigin {
     pub digest: String,
@@ -3818,7 +3835,7 @@ pub(crate) struct PromptOrigin {
     pub question: Option<OpenQuestion>,
     pub named_docs: Vec<String>,
     pub last_human: Option<(String, f64)>,
-    pub app_typed: bool,
+    pub typing_mark: Option<f64>,
     pub last_typed: Option<(String, f64)>,
     pub named_numbers: Vec<u32>,
 }
@@ -3865,10 +3882,13 @@ pub(crate) fn record_prompt_origin(
 
 /// Pure part of [`record_prompt_origin`]. RULINGS CI1 (T4): `origin == "human"` is LEVEL 1 ("may be
 /// the owner") and feeds `origin`, `last_human` (and, in `handlers.rs`, the pause); LEVEL 2 = Level 1
-/// AND this seat's app-typing mark (consumed here) and feeds what carries authority — a question's
-/// `first_human`, `named_docs`, `named_numbers`, `last_typed` — read from the prompt's FREE TEXT only
-/// ([`owner_free_text`]). A Level-1-but-not-Level-2 prompt counts for an open question as a
-/// non-owner prompt (`machine_seen`). The digest stays the whole normalised prompt's.
+/// AND this seat's typing mark, fresh (CJ2: armed at most 30 minutes ago, not cleared by a question
+/// since), AND no harness marker tag outside a closed block (CJ4). Level 2 feeds what carries
+/// authority — a question's `first_human`, `named_docs`, `named_numbers`, `last_typed` — read from the
+/// prompt's FREE TEXT only ([`owner_free_text`]). Every Level-1 prompt TAKES the mark, fresh or not,
+/// Level 2 or not (fail closed: one typing, one prompt); machine / unknown prompts leave it. A
+/// Level-1-but-not-Level-2 prompt counts for an open question as a non-owner prompt
+/// (`machine_seen`). The digest stays the whole normalised prompt's.
 pub(crate) fn apply_prompt(
     rec: &mut PromptOrigin,
     digest: &str,
@@ -3877,10 +3897,11 @@ pub(crate) fn apply_prompt(
     now: f64,
 ) {
     let level1 = origin == "human";
-    let level2 = level1 && rec.app_typed;
-    if level2 {
-        rec.app_typed = false; // a Level-2 prompt consumes the mark
-    }
+    let fresh = level1
+        && rec.typing_mark.take().is_some_and(|armed| {
+            now >= armed && now - armed <= cys::repair::owner_origin::TYPING_MARK_SECS as f64
+        });
+    let level2 = fresh && !cys::mission_gate::harness_tag_outside_closed_blocks(norm);
     rec.digest = digest.to_string();
     rec.origin = origin.to_string();
     rec.at = now;
@@ -3914,16 +3935,18 @@ pub(crate) fn owner_free_text(norm: &str) -> String {
         .replace('\0', "▯")
 }
 
-/// RULINGS CI1 (T4) — the app-typing mark: operator-verified typing from the app into `seat` (the
-/// target surface of a `human_verified` send whose operator token did not come from a pane).
-/// Daemon memory only (a restart loses it — fail closed); consumed by the seat's next Level-2 prompt.
-pub(crate) fn mark_app_typing(prompts: &Mutex<HashMap<u64, PromptOrigin>>, seat: u64) {
+/// RULINGS CI1 / CJ1 / CJ2 (T4) — the typing mark: the owner's typed or pasted text arrived from the
+/// app into `seat` at `at` (the target surface of a `human_verified` send whose operator token did
+/// not come from a pane and whose text `arms_typing_mark`). A later arming moves the time on. Daemon
+/// memory only (a restart loses it — fail closed); good for 30 minutes; cleared when a question is
+/// registered for the seat; taken by the seat's next Level-1 prompt.
+pub(crate) fn mark_app_typing(prompts: &Mutex<HashMap<u64, PromptOrigin>>, seat: u64, at: f64) {
     prompts
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .entry(seat)
         .or_default()
-        .app_typed = true;
+        .typing_mark = Some(at);
 }
 
 /// C10's rule-document base names (as `guard.sh:PROTECTED_NAMES`), lower-cased.

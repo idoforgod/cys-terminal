@@ -111,6 +111,39 @@ pub fn is_affirmative(text: &str) -> bool {
         && words.iter().all(|w| AFFIRMATIVE_WORDS.contains(&w.as_str()))
 }
 
+/// RULINGS CJ2 — a seat's typing mark is good for this long after it was armed (the one window of
+/// this feature: the question lapse).
+pub const TYPING_MARK_SECS: u64 = QUESTION_LAPSE_SECS;
+
+/// The bracketed-paste wrappers a terminal puts around pasted text (mode 2004).
+pub const BRACKETED_PASTE_START: &str = "\u{1b}[200~";
+pub const BRACKETED_PASTE_END: &str = "\u{1b}[201~";
+
+/// RULINGS CJ1 — whether an operator-verified send (token not from a pane) ARMS the seat's typing
+/// mark: its text, after removing the bracketed-paste wrappers, is non-empty, holds at least one
+/// non-whitespace character, and consists ENTIRELY of printable characters plus CR, LF and TAB.
+/// Any other control character (C0, DEL, C1 — `char::is_control`) or any ESC anywhere → no mark.
+/// A closed positive rule: typed and pasted text arms it; a control key, Alt+key, an arrow key, a
+/// focus or mouse report and every answer of the terminal to a query (all hold ESC or a control
+/// character) do not — whatever reply a terminal invents later. NOT a list of known replies.
+pub fn arms_typing_mark(text: &str) -> bool {
+    let t = text
+        .replace(BRACKETED_PASTE_START, "")
+        .replace(BRACKETED_PASTE_END, "");
+    !t.is_empty()
+        && t.chars().any(|c| !c.is_whitespace())
+        && t.chars().all(|c| matches!(c, '\r' | '\n' | '\t') || !c.is_control())
+}
+
+/// Contract 9.1's question (the master asks it in chat after the update).
+pub const GRANT_QUESTION_KO: &str = "자비스가 발견한 명백한 버그·오류를 스스로 고쳐도 될까요?";
+
+/// RULINGS CJ5 — the question the master is told to ask, with the daily limit the registered question
+/// carries (CI4): the owner's yes answers a question that names the limit.
+pub fn grant_question_ko(daily_cap: u32) -> String {
+    format!("{GRANT_QUESTION_KO} (하루 {daily_cap}건까지)")
+}
+
 /// RULINGS CI4 — the integers 1–100 written as numbers of their own in an owner-typed free text
 /// (no text is kept): a run of ASCII digits without a leading zero, not glued to a Latin letter, a
 /// digit or an identifier / version / time / path character before it (`._-/:#+`), and not followed
@@ -596,6 +629,70 @@ mod tests {
         for w in ["안", "아니", "아니요", "no", "not", "글쎄", "근데", "만약", "if", "maybe"] {
             assert!(!AFFIRMATIVE_WORDS.contains(&w), "a word of negation / doubt / condition: {w}");
         }
+    }
+
+    /// RULINGS CJ1: what arms the typing mark — the ruling's pins, then the edges.
+    #[test]
+    fn typing_mark_rule() {
+        let esc = "\u{1b}";
+        let no: Vec<String> = vec![
+            format!("{esc}[I"),                                   // focus in
+            format!("{esc}[O"),                                   // focus out
+            format!("{esc}[<0;10;5M"),                            // SGR mouse press
+            format!("{esc}[<0;10;5m"),                            // SGR mouse release
+            format!("{esc}[M !!"),                                // X10 mouse: ESC[M + three bytes
+            format!("{esc}[M#5("),                                // X10 mouse, printable payload
+            format!("{esc}[12;40R"),                              // cursor-position answer
+            format!("{esc}[?1;2c"),                               // DA1 answer
+            format!("{esc}[>0;276;0c"),                           // DA2 answer
+            format!("{esc}[0n"),                                  // status answer
+            format!("{esc}]11;rgb:0000/0000/0000\u{7}"),          // OSC 11 answer ended by BEL
+            format!("{esc}]11;rgb:ffff/ffff/ffff{esc}\\"),        // OSC 11 answer ended by ST
+            format!("{esc}P1$r0m{esc}\\"),                        // DCS answer (DECRQSS)
+            format!("{esc}b"),                                    // ESC + a letter (Alt+b)
+            format!("{esc}[A"),                                   // an arrow key
+            format!("{esc}OA"),                                   // an arrow key, application mode
+            esc.to_string(),                                      // a lone ESC
+            "\u{7f}".to_string(),                                 // a lone backspace (DEL)
+            "\u{8}".to_string(),                                  // a lone backspace (BS)
+            "\r".to_string(),                                     // a lone CR
+            String::new(),                                        // empty
+            "   ".to_string(),                                    // spaces only
+            "\u{3000}\t\r\n".to_string(),                         // whitespace only
+            "\u{3}".to_string(),                                  // Ctrl-C
+            "\u{9b}A".to_string(),                                // a C1 CSI + a letter
+            format!("예{esc}[A"),                                 // text with an ESC in it
+            "예\u{0}".to_string(),                                 // text with a NUL
+            "예\u{85}".to_string(),                                // text with a C1 (NEL)
+            format!("{BRACKETED_PASTE_START}{BRACKETED_PASTE_END}"), // an empty paste
+            format!("{BRACKETED_PASTE_START}예{esc}[31m빨강{BRACKETED_PASTE_END}"), // a paste holding ESC
+        ];
+        for t in &no {
+            assert!(!arms_typing_mark(t), "no mark: {t:?}");
+        }
+        let yes: Vec<String> = vec![
+            "예".to_string(),
+            "예\r".to_string(),
+            "자비스가 찾은 오류를 고쳐도 좋다".to_string(),
+            "Please fix the bug in the parser.".to_string(),
+            format!("{BRACKETED_PASTE_START}붙여 넣은 글\n둘째 줄\t끝{BRACKETED_PASTE_END}"),
+            "예\t켜줘\r\n".to_string(),
+            "a".to_string(),
+            "😀".to_string(),
+        ];
+        for t in &yes {
+            assert!(arms_typing_mark(t), "mark: {t:?}");
+        }
+    }
+
+    /// CJ5: the question shows the limit.
+    #[test]
+    fn grant_question_shows_the_limit() {
+        assert_eq!(
+            grant_question_ko(7),
+            "자비스가 발견한 명백한 버그·오류를 스스로 고쳐도 될까요? (하루 7건까지)"
+        );
+        assert_eq!(TYPING_MARK_SECS, 1_800);
     }
 
     /// CI4: numbers of their own, 1–100, from the owner's free text (no text kept).

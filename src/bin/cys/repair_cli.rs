@@ -714,11 +714,21 @@ fn t4_print(cmd: &RepairCmd, out: &mut dyn Write, err: &mut dyn Write, v: &Value
         RepairCmd::Grant {
             mode: GrantMode::Ask,
             ..
-        } => writeln!(
-            out,
-            "질문을 등록했습니다(하루 상한 {}건) — 이제 주인께 대화로 물으세요: \"자비스가 발견한 명백한 버그·오류를 스스로 고쳐도 될까요?\" (30분 안에 주인이 직접 친 첫 답만 셉니다)",
-            s(v, "daily_cap")
-        ),
+        } => {
+            // CJ5: the daemon's sentence names the limit; an older reply without it is rebuilt here
+            let ask = match v.get("ask_owner").and_then(Value::as_str) {
+                Some(a) => a.to_string(),
+                None => match v.get("daily_cap").and_then(Value::as_u64) {
+                    Some(n) => cys::repair::owner_origin::grant_question_ko(n as u32),
+                    None => cys::repair::owner_origin::GRANT_QUESTION_KO.to_string(),
+                },
+            };
+            writeln!(
+                out,
+                "질문을 등록했습니다(하루 상한 {}건) — 이제 주인께 대화로 물으세요: \"{ask}\" (30분 안에 주인이 직접 친 첫 답만 셉니다)",
+                s(v, "daily_cap")
+            )
+        }
         RepairCmd::Grant {
             mode: GrantMode::Status,
             ..
@@ -1264,7 +1274,10 @@ mod tests {
         assert_eq!((c, o.trim()), (0, "자동 수리 허락: 끔"));
         assert_eq!(seen.borrow().last().unwrap().1, json!({"mode": "off", "daily_cap": null}));
         let (c, o, _) = run(&["grant", "ask"], json!({"daily_cap": 5}));
-        assert!(c == 0 && o.contains("스스로 고쳐도 될까요?") && o.contains("하루 상한 5건"), "{o}");
+        assert!(c == 0 && o.contains("스스로 고쳐도 될까요? (하루 5건까지)") && o.contains("하루 상한 5건"), "{o}");
+        // CJ5: the daemon's sentence is printed as given
+        let (_, o, _) = run(&["grant", "ask"], json!({"daily_cap": 9, "ask_owner": "자비스가 발견한 명백한 버그·오류를 스스로 고쳐도 될까요? (하루 9건까지)"}));
+        assert!(o.contains("\"자비스가 발견한 명백한 버그·오류를 스스로 고쳐도 될까요? (하루 9건까지)\""), "{o}");
         assert_eq!(seen.borrow().last().unwrap(), &("repair.grant_ask".to_string(), json!({"daily_cap": null})));
         // CI4: the limit belongs to the question
         let _ = run(&["grant", "ask", "--daily-cap", "7"], json!({"daily_cap": 7}));

@@ -1950,7 +1950,8 @@ fn wiring_pins() {
 /// `grant on`); an unknown origin counts as machine (fail closed); `named_docs` changes only on an
 /// owner-typed prompt; the first owner answer after the question is kept once. RULINGS CI1 (T4):
 /// "owner-typed" for an answer or a naming is Level 2 — the hook's `human` (Level 1) AND the seat's
-/// app-typing mark, set here first (`app_typed = true`, the test seam of `mark_app_typing`); the
+/// typing mark, set here first (`typing_mark = Some(<the prompt's time>)`, the test seam of
+/// `mark_app_typing`; RULINGS CJ2 gives the mark a time); the
 /// hook's `human` alone answers nothing and names nothing (pinned at the end).
 #[test]
 fn prompt_origin_is_question_aware() {
@@ -1961,19 +1962,19 @@ fn prompt_origin_is_question_aware() {
         }),
         ..Default::default()
     };
-    rec.app_typed = true;
+    rec.typing_mark = Some(5.0);
     apply_prompt(&mut rec, "d-old", "earlier", "human", 5.0);
     assert!(
         rec.question.as_ref().unwrap().first_human.is_none(),
         "a prompt before the question is no answer"
     );
     apply_prompt(&mut rec, "d1", "[worker] done", "machine", 11.0);
-    rec.app_typed = true;
+    rec.typing_mark = Some(12.0);
     apply_prompt(&mut rec, "d2", "예", "human", 12.0);
     let q = rec.question.clone().unwrap();
     assert!(q.machine_seen);
     assert_eq!(q.first_human.as_ref().map(|f| f.0.as_str()), Some("d2"));
-    rec.app_typed = true;
+    rec.typing_mark = Some(13.0);
     apply_prompt(&mut rec, "d3", "아니", "human", 13.0);
     assert_eq!(
         rec.question
@@ -1995,7 +1996,7 @@ fn prompt_origin_is_question_aware() {
     apply_prompt(&mut u, "d", "?", "unknown", 2.0);
     assert!(u.question.unwrap().machine_seen);
     let mut n = PromptOrigin {
-        app_typed: true,
+        typing_mark: Some(1.0),
         ..Default::default()
     };
     apply_prompt(
@@ -2046,7 +2047,11 @@ fn prompt_origin_record_on_daemon() {
         .unwrap_or_else(|e| e.into_inner())[&5]
         .named_docs
         .is_empty());
-    mark_app_typing(&daemon.repair_prompt_origin, 5);
+    mark_app_typing(
+        &daemon.repair_prompt_origin,
+        5,
+        cys::repair::ledger::now_epoch(),
+    );
     record_prompt_origin(&daemon, 5, "고쳐라 soul.md", None, Some("human"));
     {
         let m = daemon
