@@ -999,9 +999,12 @@ jobs:
       #   붉힌다 — 대상 셋: ① 레그가 만든 cys.app ② 올라갈 업데이터 아카이브(cys.app.tar.gz) ③ DMG 안의 두 앱
       #   (.support/cys.app · Install cys.app · 읽기 전용 마운트). 진입점의 최소 macOS 와 LSMinimumSystemVersion 도
       #   찍는다(BQ1(e) 보고용 · 실패 사유 아님). 요약은 GITHUB_STEP_SUMMARY 로 승격 — BQ2(발행 증적에 두 레그 출력 인용).
+      #   CPU 하위 유형까지 본다(x86_64h 만·arm64e 만은 불합격 · CA2(a)), 진입점 넷을 요구한다(CA2(b)), 아카이브는 한 번의
+      #   스트리밍 읽기다(CA1 — 정렬 순서 읽기는 실제 0.14.56 아카이브에서 약 35분이었다). 두 스텝 모두 시간 상한을 단다.
       #   바로 앞 스텝이 게이트의 합성 헤더 대조군을 돌린다(게이트 신뢰 직전 · test_release_postprocess_gate 와 같은 규율).
       - name: 번들 아키텍처 게이트 대조군 (test_check_macho_arch · 게이트 신뢰 직전)
         if: matrix.platform == 'macos-latest'
+        timeout-minutes: 10
         shell: bash
         run: |
           set -euo pipefail
@@ -1011,6 +1014,7 @@ jobs:
 
       - name: 번들 아키텍처 게이트 (Mach-O 헤더 · 앱 · 업데이터 아카이브 · DMG 안 두 앱 · macOS 전용 · 업로드 전)
         if: matrix.platform == 'macos-latest'
+        timeout-minutes: 15
         shell: bash
         run: |
           set -euo pipefail
@@ -1022,13 +1026,17 @@ jobs:
           DST="target/$TRIPLE/release/bundle"
           DMG="$DST/dmg/cys_${VERSION}_${ARCH}.dmg"
           GLOG="$(mktemp)"; rc=0
+          # 진입점 넷(python·node·git·uv)은 최종 게이트마다 **요구**된다 — 없거나 링크가 끊기면 붉다(CA2(b)).
+          REQ=(--require Contents/Resources/runtime/python/bin/python3 --require Contents/Resources/runtime/node/bin/node
+               --require Contents/Resources/runtime/git/bin/git --require Contents/Resources/runtime/uv/uv)
           gate() { python3 scripts/check_macho_arch.py --target "$TRIPLE" "$@" 2>&1 | tee -a "$GLOG" || { r=$?; [ "$r" -gt "$rc" ] && rc=$r; true; }; }
-          gate "$SRC/macos/cys.app"
-          gate "$DST/macos/cys.app.tar.gz"
+          gate "${REQ[@]}" "$SRC/macos/cys.app"
+          gate "${REQ[@]}" "$DST/macos/cys.app.tar.gz"
           MNT="$(mktemp -d)"
           trap 'hdiutil detach "$MNT" -force >/dev/null 2>&1 || true' EXIT
           hdiutil attach -readonly -nobrowse -noautoopen -mountpoint "$MNT" "$DMG" >/dev/null
-          gate "$MNT/.support/cys.app" "$MNT/Install cys.app"
+          gate "${REQ[@]}" "$MNT/.support/cys.app"
+          gate "$MNT/Install cys.app"     # 설치 도우미 애플릿(유니버설이어야 정상 · runtime 없음 → 진입점 요구 없음)
           {
             echo "### 번들 아키텍처 게이트 — ${TRIPLE} (BQ2 증적)"
             grep -E '^(== |  Mach-O files|  Info.plist|  WARN|FAIL|CANNOT JUDGE|RESULT)' "$GLOG" || echo '(게이트 출력 없음)'

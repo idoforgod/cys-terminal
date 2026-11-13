@@ -56,13 +56,16 @@ SRC_TEAM="$(/usr/bin/codesign -dv --verbose=4 "$SRC" 2>&1 | /usr/bin/sed -n 's/^
   echo "✗ 소스 Gatekeeper/공증 평가 거부(미공증·미신뢰 소스) — 설치 거부: $SRC" >&2; exit 4; }
 
 # ── ★동봉 python 실행 가능성 검사 (0.15.0 · T11 · RULINGS BQ1(d) · 오너 지시 추가 11) ──
-# 위치가 전부다: 진위 게이트 ①②③ **뒤**, 동봉 python 실행 **앞**. 이 검사는 python 파일을 **읽기만** 하고
-#   시스템 실 바이너리(od·sysctl·sw_vers)만 쓴다 — 번들 안의 어떤 코드도 실행하지 않는다.
+# 위치가 전부다: 진위 게이트 ①②③ **뒤**, 동봉 python 실행 **앞**. 이 검사는 python·node 파일을 **읽기만** 하고
+#   시스템 실 바이너리(od·tr·sysctl·uname·sw_vers — 전부 절대경로)만 쓴다 — 소스 번들 안의 어떤 코드도 실행하지
+#   않는다. 번역 실행은 Rosetta 2 판정에 시스템의 /usr/bin/true 하나뿐이다(CA3 · 파일 경로 추정 대신 실제로 돌려 본다).
 # 왜: 이 Mac 에서 돌 수 없는 python(인텔 Mac 의 arm64 전용 · Rosetta 2 없는 Apple 실리콘의 x86_64 전용 ·
 #   python 이 요구하는 것보다 낮은 macOS)을 exec 하면 "Bad CPU type in executable"·dyld 오류 원문이 그대로
 #   사용자에게 뜬다. 대신 무엇이 문제이고 무엇을 하면 되는지 한국어 한 문장을 stderr 로 내고 exit 5 로 멈춘다
 #   (설치 도우미는 exit 1 에서만 관리자 승격을 재시도한다 — 5 는 승격하지 않고 그 문장을 보여 준다).
-# 헤더를 읽지 못하면(서명 검증을 통과한 소스에선 일어나지 않는다) 막지 않는다 — 종전 동작 그대로.
+# 헤더나 기계 사실(칩·macOS 버전·Rosetta 2)을 읽지 못하면 막지 않는다 — 종전 동작 그대로(CA3: 확실한 판정에서만 멈춘다).
+# CPU 하위 유형 규칙은 게이트(scripts/check_macho_arch.py)와 같다: arm64e 만 있는 조각은 Apple 실리콘에서 제3자 코드로
+#   실리지 않고, x86_64h 는 Haswell 이상 인텔에서만 돈다(이 Mac 의 hw.cpusubtype 이 8 이거나 모를 때만 인정).
 # >>> T11-PY-RUNNABLE
 ic_u8s() { /usr/bin/od -An -v -t u1 -j "$2" -N "$3" -- "$1" 2>/dev/null || true; }
 ic_u32() {   # <파일> <오프셋> <le|be> → 10진수 (못 읽으면 rc 1)
@@ -72,13 +75,21 @@ ic_u32() {   # <파일> <오프셋> <le|be> → 10진수 (못 읽으면 rc 1)
   if [ "$3" = le ]; then echo $(( b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24) ))
   else echo $(( (b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3] )); fi
 }
-ic_cpu() { case "$1" in 16777223) echo x86_64 ;; 16777228) echo arm64 ;; *) echo "cpu$1" ;; esac; }
+ic_arch() {   # <cputype> <cpusubtype> → 이름 — 하위 유형까지(능력 비트 0xff000000 은 버린다 · 게이트와 같은 규칙)
+  local s=$(( $2 & 16777215 ))
+  case "$1" in
+    16777223) case "$s" in 3) echo x86_64 ;; 8) echo x86_64h ;; *) echo "x86_64/sub$s" ;; esac ;;
+    16777228) case "$s" in 0) echo arm64 ;; 1) echo arm64v8 ;; 2) echo arm64e ;; *) echo "arm64/sub$s" ;; esac ;;
+    *) echo "cpu$1" ;;
+  esac
+}
 ic_slices() {   # <파일> → "<아키텍처>:<오프셋>" 줄들 (Mach-O 가 아니거나 못 읽으면 rc 1)
-  local f="$1" le be n i e cpu off
+  local f="$1" le be n i e cpu sub off
   le=$(ic_u32 "$f" 0 le) || return 1
   be=$(ic_u32 "$f" 0 be) || return 1
   case "$le" in 4277009103|4277009102)            # 0xfeedfacf · 0xfeedface (단일 아키텍처)
-    cpu=$(ic_u32 "$f" 4 le) || return 1; echo "$(ic_cpu "$cpu"):0"; return 0 ;; esac
+    cpu=$(ic_u32 "$f" 4 le) || return 1; sub=$(ic_u32 "$f" 8 le) || return 1
+    echo "$(ic_arch "$cpu" "$sub"):0"; return 0 ;; esac
   case "$be" in 3405691582|3405691583)            # 0xcafebabe · 0xcafebabf (유니버설)
     n=$(ic_u32 "$f" 4 be) || return 1
     { [ "$n" -ge 1 ] && [ "$n" -le 30 ]; } || return 1
@@ -86,9 +97,10 @@ ic_slices() {   # <파일> → "<아키텍처>:<오프셋>" 줄들 (Mach-O 가 �
     i=0
     while [ "$i" -lt "$n" ]; do
       cpu=$(ic_u32 "$f" $((8 + i * e)) be) || return 1
+      sub=$(ic_u32 "$f" $((8 + i * e + 4)) be) || return 1
       if [ "$e" = 20 ]; then off=$(ic_u32 "$f" $((8 + i * e + 8)) be) || return 1
       else off=$(ic_u32 "$f" $((8 + i * e + 12)) be) || return 1; fi
-      echo "$(ic_cpu "$cpu"):$off"; i=$((i + 1))
+      echo "$(ic_arch "$cpu" "$sub"):$off"; i=$((i + 1))
     done
     return 0 ;; esac
   return 1
@@ -111,9 +123,19 @@ ic_minos() {   # <파일> <슬라이스 오프셋> → "X.Y.Z" (LC_BUILD_VERSION
   done
   return 0
 }
+ic_minos_of() {   # <파일> <아키텍처> → 그 아키텍처 조각(없으면 첫 조각)의 최소 macOS (못 읽으면 빈 출력)
+  local sl s first=""
+  sl="$(ic_slices "$1")" || return 0
+  for s in $sl; do
+    [ -n "$first" ] || first="$s"
+    if [ "${s%%:*}" = "$2" ]; then ic_minos "$1" "${s##*:}"; return 0; fi
+  done
+  [ -n "$first" ] && ic_minos "$1" "${first##*:}"
+  return 0
+}
 ic_ver_lt() {   # <a> <b> → a < b 이면 rc 0 (숫자가 아니면 rc 1 = 막지 않음)
   local a b i x y
-  a=( $(printf '%s' "$1" | tr '.' ' ') ); b=( $(printf '%s' "$2" | tr '.' ' ') )
+  a=( $(printf '%s' "$1" | /usr/bin/tr '.' ' ') ); b=( $(printf '%s' "$2" | /usr/bin/tr '.' ' ') )
   for i in 0 1 2; do
     x="${a[$i]:-0}"; y="${b[$i]:-0}"
     case "$x$y" in ''|*[!0-9]*) return 1 ;; esac
@@ -122,28 +144,65 @@ ic_ver_lt() {   # <a> <b> → a < b 이면 rc 0 (숫자가 아니면 rc 1 = 막�
   done
   return 1
 }
-ic_python_runnable() {   # <python> <이 Mac: arm64|x86_64> <Rosetta 2: yes|no> <macOS 버전> → 0=실행 가능 · 5=불가(문장 출력)
-  local py="$1" hw="$2" rosetta="$3" os="$4" slices run="" s minos
+ic_machine() {   # → "<칩> <인텔 하위 유형> <macOS 버전>" (못 읽은 값은 '-') — 시스템 실 바이너리만, 절대경로로
+  local hw="-" sub="-" os
+  [ "$(/usr/sbin/sysctl -n hw.optional.arm64 2>/dev/null || true)" = 1 ] && hw=arm64
+  if [ "$hw" = "-" ] && [ "$(/usr/bin/uname -m 2>/dev/null || true)" = x86_64 ]; then hw=x86_64; fi
+  if [ "$hw" = x86_64 ]; then
+    sub="$(/usr/sbin/sysctl -n hw.cpusubtype 2>/dev/null || true)"
+    case "$sub" in ''|*[!0-9]*) sub="-" ;; esac
+  fi
+  os="$(/usr/bin/sw_vers -productVersion 2>/dev/null || true)"
+  case "$os" in ''|*[!0-9.]*) os="-" ;; esac
+  echo "$hw $sub $os"
+}
+ic_rosetta() {   # → yes(x86_64 번역이 실제로 돈다) · no(돌지 않는다) · -(판정 불가) — 시스템 코드만 번역해 본다(CA3)
+  [ -x /usr/bin/arch ] && [ -x /usr/bin/true ] || { echo "-"; return 0; }
+  if /usr/bin/arch -x86_64 /usr/bin/true >/dev/null 2>&1; then echo yes; else echo no; fi
+}
+# ic_python_runnable <python> <칩 arm64|x86_64|-> <인텔 하위 유형|-> <macOS 버전|-> <Rosetta 2 yes|no|probe|-> [node]
+#   → 0 = 실행 가능 **또는 판정 불가**(막지 않는다 · 종전 동작) · 5 = 확실히 못 돈다(한국어 한 문장을 stderr 로).
+ic_python_runnable() {
+  local py="$1" hw="$2" hwsub="$3" os="$4" rosetta="$5" node="${6:-}" slices run="" s a has_x86=no has_arm=no pymin nodemin
+  [ "$hw" = arm64 ] || [ "$hw" = x86_64 ] || return 0
   slices="$(ic_slices "$py")" || return 0
   for s in $slices; do
-    if [ "${s%%:*}" = "$hw" ]; then run="$s"; break; fi
+    a="${s%%:*}"
+    case "$a" in x86_64*) has_x86=yes ;; arm64*) has_arm=yes ;; esac
+    if [ -z "$run" ] && [ "$hw" = arm64 ]; then
+      case "$a" in arm64|arm64v8) run="$s" ;; esac
+    elif [ -z "$run" ]; then
+      case "$a" in
+        x86_64) run="$s" ;;
+        x86_64h) case "$hwsub" in -|8) run="$s" ;; esac ;;
+      esac
+    fi
   done
-  if [ -z "$run" ] && [ "$hw" = arm64 ] && [ "$rosetta" = yes ]; then
-    for s in $slices; do
-      if [ "${s%%:*}" = x86_64 ]; then run="$s"; break; fi
-    done
+  if [ -z "$run" ] && [ "$hw" = arm64 ] && [ "$has_x86" = yes ]; then
+    [ "$rosetta" = probe ] && rosetta="$(ic_rosetta)"
+    if [ "$rosetta" = no ]; then
+      echo "이 설치 파일은 인텔 Mac용이라 Rosetta 2가 없는 이 Apple 실리콘(M1·M2 등) Mac에서는 설치할 수 없습니다 — www.cysinsight.com 에서 Apple 실리콘용 설치 파일(이름에 aarch64가 들어간 .dmg)을 받아 다시 설치해 주세요." >&2
+      return 5
+    fi
+    for s in $slices; do case "${s%%:*}" in x86_64*) run="$s"; break ;; esac; done
   fi
   if [ -z "$run" ]; then
-    if [ "$hw" = arm64 ]; then
-      echo "이 설치 파일은 인텔 Mac용이라 Rosetta 2가 없는 이 Apple 실리콘(M1·M2 등) Mac에서는 설치할 수 없습니다 — www.cysinsight.com 에서 Apple 실리콘용 설치 파일(이름에 aarch64가 들어간 .dmg)을 받아 다시 설치해 주세요." >&2
-    else
+    if [ "$hw" = x86_64 ] && [ "$has_arm" = yes ] && [ "$has_x86" = no ]; then
       echo "이 설치 파일은 Apple 실리콘(M1·M2 등) Mac 전용이라 이 인텔 Mac에서는 설치할 수 없습니다 — www.cysinsight.com 에서 인텔용 설치 파일(이름에 x64가 들어간 .dmg)을 받아 다시 설치해 주세요." >&2
+      return 5
     fi
-    return 5
+    return 0
   fi
-  minos="$(ic_minos "$py" "${run##*:}")"
-  if [ -n "$minos" ] && [ -n "$os" ] && ic_ver_lt "$os" "$minos"; then
-    echo "이 Mac의 macOS 버전($os)이 낮아 cys를 설치할 수 없습니다 — macOS ${minos%.0} 이상으로 업데이트한 뒤 다시 설치해 주세요." >&2
+  [ "$os" != "-" ] || return 0
+  pymin="$(ic_minos "$py" "${run##*:}")"
+  if [ -n "$pymin" ] && ic_ver_lt "$os" "$pymin"; then
+    nodemin=""
+    [ -n "$node" ] && [ -f "$node" ] && nodemin="$(ic_minos_of "$node" "${run%%:*}")"
+    if [ -n "$nodemin" ] && ic_ver_lt "$pymin" "$nodemin"; then
+      echo "이 Mac의 macOS 버전($os)이 낮아 cys를 설치할 수 없습니다 — 동봉된 Python은 macOS ${pymin%.0} 이상, 제품의 일부(동봉된 node 등)는 macOS ${nodemin%.0} 이상이 필요하니 macOS를 업데이트한 뒤 다시 설치해 주세요." >&2
+    else
+      echo "이 Mac의 macOS 버전($os)이 낮아 cys를 설치할 수 없습니다 — 동봉된 Python은 macOS ${pymin%.0} 이상이 필요하니 macOS를 업데이트한 뒤 다시 설치해 주세요." >&2
+    fi
     return 5
   fi
   return 0
@@ -157,15 +216,14 @@ if [ -x "$SRC_PY" ]; then
 else
   PY="/usr/bin/python3"   # 폴백(소스 동봉 python 결손 시) — CLT 미설치 맥에선 실패할 수 있음(finding 7)
 fi
-# T11 · BQ1(d): 동봉 python 을 고른 경우에만, exec 전에 이 Mac 에서 돌 수 있는지 본다(위 블록 · 읽기 전용).
-#   하드웨어는 sysctl hw.optional.arm64(Rosetta 아래에서도 실제 칩을 말한다), Rosetta 2 는 설치 파일의 존재로 본다.
+# T11 · BQ1(d) · CA3: 동봉 python 을 고른 경우에만, exec 전에 이 Mac 에서 돌 수 있는지 본다(위 블록 · 읽기 전용).
+#   칩은 sysctl hw.optional.arm64(Rosetta 아래에서도 실제 칩), Rosetta 2 는 필요할 때만 시스템 바이너리를 실제로 번역해
+#   본다(/usr/bin/arch -x86_64 /usr/bin/true). 기계 사실을 읽지 못하면 막지 않는다 — **확실한 판정**에서만 멈춘다.
 if [ "$PY" = "$SRC_PY" ]; then
-  IC_HW=x86_64
-  [ "$(/usr/sbin/sysctl -n hw.optional.arm64 2>/dev/null || true)" = 1 ] && IC_HW=arm64
-  IC_ROSETTA=no
-  { [ -e /Library/Apple/usr/share/rosetta/rosetta ] || [ -e /Library/Apple/usr/libexec/oah/libRosettaRuntime ]; } && IC_ROSETTA=yes
-  IC_OS="$(/usr/bin/sw_vers -productVersion 2>/dev/null || true)"
-  ic_python_runnable "$PY" "$IC_HW" "$IC_ROSETTA" "$IC_OS" || exit 5
+  read -r IC_HW IC_HWSUB IC_OS <<IC_EOF
+$(ic_machine)
+IC_EOF
+  ic_python_runnable "$PY" "$IC_HW" "$IC_HWSUB" "$IC_OS" probe "$SRC/Contents/Resources/runtime/node/bin/node" || exit 5
 fi
 
 # 정본 ATOMIC-1 집행부에 그대로 위임(exec — 종료 코드 그대로 전파).
