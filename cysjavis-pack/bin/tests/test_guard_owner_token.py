@@ -134,7 +134,7 @@ def main():
             check("4 Bash 규칙 문서 쓰기는 표가 있어도 차단: %s" % cmd.split()[0], p.returncode == 2,
                   repr(p.stderr[-200:]))
         # 5 — corpus-G representatives (AT9): denied with and without a token
-        for cmd in ("git push origin main", "scp a.txt host:/tmp/", "rm -rf /home/user/project",
+        for cmd in ("git push origin main", "scp a.txt host:/tmp/", "rm -rf /home/x/project",
                     "curl -X POST -d x https://example.invalid", "gh release create v1"):
             for rc in (0, 95):
                 p, _, _ = run({"command": cmd}, tool="Bash", rc=rc)
