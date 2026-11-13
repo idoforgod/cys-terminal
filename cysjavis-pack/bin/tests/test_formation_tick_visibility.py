@@ -214,12 +214,28 @@ def main():
               and not list(path.parent.glob("*.tmp")) and not holder.is_alive(),
               warn.strip()[:160])
         # 대조군(무너지는 방향): 보유자가 놓으면 같은 호출이 즉시 쓴다 — 상한은 보유자에 대한 것이지 락 고장이 아니다.
+        # ★"즉시" = write-lock 을 **첫 시도에** 잡는다(바쁨 재시도 0회). 종전의 벽시계 창(< 1.0s)은 부하 아래
+        #   락과 무관한 지연(스케줄링·디스크)으로 흔들렸다 — 같은 성질을 구조로 잰다(RULINGS BW1 · TH1).
+        #   변이 대조: 잠금이 아직 잡혀 있으면 비블로킹 시도가 바쁨으로 실패해 재시도가 세어지고 FAIL 한다.
+        busy_retries = []
+        real_lk = jf._lk
+
+        def counting_lk(f, blocking=False):
+            try:
+                return real_lk(f, blocking=blocking)
+            except OSError as e:
+                if e.errno in jf._LOCK_BUSY_ERRNOS:
+                    busy_retries.append(e.errno)
+                raise
+
         t0 = time.monotonic()
-        with contextlib.redirect_stderr(io.StringIO()):
+        with mock.patch.object(jf, "_lk", counting_lk), contextlib.redirect_stderr(io.StringIO()):
             resumed = jf._write_state(sock, "complete", "owner latest", roles)
-        check("4i 보유자 해제 뒤 정상 기록 즉시 재개",
-              resumed is not None and time.monotonic() - t0 < 1.0
-              and jf._read_state_obj(sock).get("detail") == "owner latest")
+        elapsed = time.monotonic() - t0
+        check("4i 보유자 해제 뒤 정상 기록 즉시 재개(write-lock 첫 시도 획득 — 바쁨 재시도 0회)",
+              resumed is not None and not busy_retries
+              and jf._read_state_obj(sock).get("detail") == "owner latest",
+              "busy_retries=%d resumed=%s elapsed=%.2fs" % (len(busy_retries), resumed is not None, elapsed))
 
         # 상태가 없거나 손상됐으면 임의 상태를 만들어 판정하지 않는다.
         missing_root = str(Path(root) / "never-written")
