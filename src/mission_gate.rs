@@ -1861,6 +1861,131 @@ pub fn machine_origin(
         layer: None, reason: String::new(), anomalies }
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// 0.15.0 「스스로 해결」 M5·M13 — 주인 본인 입력 판정(실패 시 닫힘 · python `owner_typed` 파리티)
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// 주인 본인 입력 판정에서 **근거 결손**으로 세는 이상징후 코드(python `OWNER_DOUBT_CODES` 미러).
+/// `ledger_rotated` 는 넣지 않는다 — 회전은 평시 상태이고 판독 세대 밖의 옛 배달만 대조를 잃는다
+/// (정직 고지: 그 창의 기계 push 를 주인이 그대로 다시 친 것과 구별하지 못한다).
+pub const OWNER_DOUBT_CODES: [&str; 3] =
+    ["ledger_bad_lines", "ledger_schema_skew", "delivery_parts_capped"];
+
+/// RULINGS CI1 / CJ3 (T4) — 알림 가족: `task-notification` 과 그 안에서만 쓰이는 컨텍스트 마커
+/// ([`HARNESS_CONTEXT_MARKERS`]). 이 가족의 **태그**가 하나라도 든 프롬프트는 주변에 어떤 글이 있든
+/// harness 가 합성한 차례다(python `OWNER_NOTIFICATION_FAMILY`).
+pub fn owner_notification_family() -> Vec<&'static str> {
+    let mut v = vec!["task-notification"];
+    v.extend(HARNESS_CONTEXT_MARKERS.iter().copied());
+    v
+}
+
+/// 알림 가족의 태그 1개 — 여는·닫는·자기닫힘, 대소문자 무관, 속성·태그 안 공백 허용, 짝 무관.
+/// [`harness_tag_rx`] 와 같은 모양(이름 경계 = [`NAME_BOUNDARY_TAIL`]), 이름만 가족으로 좁힌다.
+fn notification_family_tag_rx() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| {
+        let mut names = owner_notification_family();
+        names.sort_by_key(|n| std::cmp::Reverse(n.len()));
+        let alt = names.iter().map(|n| regex::escape(n)).collect::<Vec<_>>().join("|");
+        Regex::new(&format!(r"(?i)<\s*/?\s*(?:{alt}){NAME_BOUNDARY_TAIL}"))
+            .expect("NOTIFICATION_FAMILY_TAG 컴파일 실패")
+    })
+}
+
+/// RULINGS CJ3 — 프롬프트에 알림 가족의 **태그**가 하나라도 있는가(python `holds_notification_tag`).
+/// 블록이 아니라 태그로 판정한다: 짝이 없는 여는 태그(잘린 알림)도, 닫는 태그 하나도 해당한다.
+pub fn holds_notification_tag(prompt: &str) -> bool {
+    notification_family_tag_rx().is_match(prompt)
+}
+
+/// RULINGS CJ4 (T4) — 주인 본인 입력 2단계(Level 2)의 조건: harness 마커 태그([`harness_tag_rx`])가
+/// 전부 **닫힌 블록** 안에 있어야 한다. 이 함수는 닫힌 블록(구조 축과 같은 짝 맞추기 — 코드펜스
+/// 마스킹 뒤 [`strip_generic_blocks`])을 걷어낸 잔여에 마커 태그가 **남는지** 본다. 남으면 `true`
+/// (= 2단계가 아니다). [`harness_strip`] 은 짝 없는 태그 뒤의 글을 살린다(임무 판정에는 옳다 —
+/// 그 주석) — 권위 판정에는 그 글이 harness 의 글일 수 있으므로 쓰지 않는다. 부작용 0.
+pub fn harness_tag_outside_closed_blocks(text: &str) -> bool {
+    let masked = mask_fences(text);
+    let (seg, _) = strip_generic_blocks(&masked);
+    let rest: String = seg.iter().collect();
+    harness_tag_rx().is_match(&rest)
+}
+
+/// [`owner_typed`] 의 결과.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerJudgment {
+    /// 주인이 직접 친 것으로 셀 수 있는가.
+    pub owner: bool,
+    /// 사람이 읽는 사유(판정 입력 아님 · `owner=true` 면 빈 문자열).
+    pub reason: String,
+}
+
+/// 이 프롬프트를 **주인이 직접 친 것**으로 셀 수 있는가 — 자동 수리 허락(C9)과 규칙 문서의 주인
+/// 지시 표(C10)를 여는 판정이다(설계 §4-13 · C10 10.1).
+///
+/// ★방향이 [`machine_origin`] 과 **반대**다. 임무 판정은 "애매하면 통과"(오너 지시가 기계로 접히면
+/// 부재중 자율 진행이 멈춘다)이지만, 이 판정이 틀리면 기계가 넣은 글이 규칙 문서를 열거나 자율 착수를
+/// 켠다 — 그래서 "확실하지 않으면 주인의 입력이 아닌 것으로" 본다(실패 시 닫힘):
+///   ① `origin` 이 정확히 `human` 이 아니면(기계·판정 불가·미지 어휘) 아니다.
+///   ② 원장 상태가 `ok` 가 아니면 아니다 — 부재는 층1 근거가 없다는 뜻이고, 데몬이 기동 때 표식을
+///      남기므로(배달 원장 비어 있지 않음 불변식) 데몬 쪽에서 부재는 손상이다.
+///   ③ [`OWNER_DOUBT_CODES`] 의 이상징후가 있으면 아니다(원장이 그 배달을 다 보여 주지 못했다).
+///   ④ harness 가 프로세스 안에서 합성한 알림(층0 [`harness_origin`])이면 아니다 — 배달 원장에도
+///      없고 라벨도 없어 층1·층2 판정은 사람으로 본다.
+///   ⑤ 알림 가족(`task-notification`·컨텍스트 마커)의 태그가 하나라도 들어 있으면 아니다 —
+///      앞뒤에 자유 텍스트가 있어도, 짝이 없어도(RULINGS CI1 · CJ3, [`holds_notification_tag`]).
+///   ⑥ 기동 명령문(층0-c [`boot_command_origin`])이면 아니다.
+/// codex·agy 좌석에는 입력 훅이 없어 애초에 판정 입력이 생기지 않는다(안전한 방향). 같은 사용자 권한으로
+/// 원장·대장을 직접 고치는 위조는 막지 못한다(SOT `docs/THREAT-MODEL-mission-gate.md` 와 같은 한계).
+pub fn owner_typed(
+    prompt: &str,
+    origin: &str,
+    ledger_status: &str,
+    anomaly_codes: &[&str],
+) -> OwnerJudgment {
+    let no = |reason: String| OwnerJudgment {
+        owner: false,
+        reason,
+    };
+    if origin != "human" {
+        return no(format!(
+            "출처 판정이 {origin:?} — 기계·판정 불가는 주인의 입력이 아니다"
+        ));
+    }
+    if LedgerStatus::from_wire(ledger_status) != LedgerStatus::Ok {
+        return no(format!(
+            "배달 원장 상태 {ledger_status:?} — 층1 근거가 없으면 주인의 입력으로 세지 않는다"
+        ));
+    }
+    let doubt: Vec<&str> = anomaly_codes
+        .iter()
+        .copied()
+        .filter(|c| OWNER_DOUBT_CODES.contains(c))
+        .collect();
+    if !doubt.is_empty() {
+        return no(format!(
+            "원장 근거 결손({}) — 확실하지 않으므로 주인의 입력이 아니다",
+            doubt.join(", ")
+        ));
+    }
+    if let Some(why) = harness_origin(prompt) {
+        return no(format!("harness 가 합성한 알림(층0) — {why}"));
+    }
+    if holds_notification_tag(prompt) {
+        return no(
+            "알림 가족 태그(task-notification 등)가 들어 있다 — 주변 글·짝과 무관하게 harness 가 합성한 차례다(RULINGS CI1 · CJ3)"
+                .to_string(),
+        );
+    }
+    if let Some(why) = boot_command_origin(prompt) {
+        return no(format!("기동 명령문(층0-c) — {why}"));
+    }
+    OwnerJudgment {
+        owner: true,
+        reason: String::new(),
+    }
+}
+
 /// 이상징후 중복 제거(python `collected_anomalies` 미러) — 키는 `(코드, 사유)` 쌍이고 **순서를
 /// 보존**한다. 같은 코드라도 사유가 다르면 둘 다 남는다(사유가 곧 근거다).
 pub fn dedup_anomalies(all: &[(String, String)]) -> Vec<(String, String)> {
@@ -2817,6 +2942,110 @@ mod tests {
         for c in ["env_not_int", "env_below_floor", "env_above_cap"] {
             assert!(is_registered_anomaly(c), "{c} 미등재");
         }
+    }
+
+    /// 0.15.0 M5·M13: 주인 본인 입력 판정 [`owner_typed`] 이 python `owner_typed` 와 **같은 판정표**를
+    /// 소비해 같은 답을 낸다(양방향 — 통과·닫힘 각 1건 이상, 판정표 축소 금지).
+    #[test]
+    fn owner_typed_matches_python_corpus() {
+        let c = corpus();
+        let items = c["owner_typed"].as_array().expect("owner_typed 배열 부재");
+        assert!(items.len() >= 13, "owner_typed 판정표가 줄었다: {}", items.len());
+        let mut seen = (false, false);
+        let mut fails: Vec<String> = Vec::new();
+        for it in items {
+            let name = it["name"].as_str().unwrap_or("?");
+            let text = item_text(it);
+            let origin = it["origin"].as_str().expect("origin");
+            let status = it["ledger_status"].as_str().expect("ledger_status");
+            let codes: Vec<&str> = it["anomalies"]
+                .as_array()
+                .expect("anomalies")
+                .iter()
+                .map(|v| v.as_str().expect("anomaly code"))
+                .collect();
+            let want = it["expect"]["owner"].as_bool().expect("expect.owner");
+            if want {
+                seen.0 = true;
+            } else {
+                seen.1 = true;
+            }
+            let got = owner_typed(&text, origin, status, &codes);
+            if got.owner != want {
+                fails.push(format!("{name}: owner 기대 {want} / 실측 {} ({})", got.owner, got.reason));
+            }
+            if got.owner != got.reason.is_empty() {
+                fails.push(format!("{name}: 사유 규약 위반(owner={} reason={:?})", got.owner, got.reason));
+            }
+        }
+        assert!(seen.0 && seen.1, "owner_typed 판정표가 한 방향뿐이다");
+        assert!(fails.is_empty(), "owner_typed 파리티 이탈:\n  - {}", fails.join("\n  - "));
+        for code in OWNER_DOUBT_CODES {
+            assert!(is_registered_anomaly(code), "{code} 는 이상징후 등재소에 없다");
+        }
+    }
+
+    /// RULINGS CJ3 (T4): 알림 가족은 **태그**로 판정한다 — 여는·닫는·자기닫힘, 대소문자, 속성, 태그 안
+    /// 공백, 짝 무관. 이름 경계(`summary-of-changes`·`statusbar`)와 가족 밖 마커(`system-reminder`)는 아니다.
+    #[test]
+    fn cj3_notification_family_by_tag() {
+        for yes in [
+            "<task-notification>",
+            "</task-notification>",
+            "<TASK-Notification>",
+            "< task-notification >",
+            "</ Task-Notification\n>",
+            "<task-notification id=\"7\">",
+            "<summary/>",
+            "예 <summary> 켜줘",
+            "<Status code=1>",
+            "<task-id>",
+            "<tool-use-id>",
+            "<output-file>",
+            "고쳐라 soul.md <task-notification><status>completed",
+        ] {
+            assert!(holds_notification_tag(yes), "{yes:?}");
+        }
+        for no in [
+            "<system-reminder>x</system-reminder> 예",
+            "<summary-of-changes>",
+            "<statusbar>",
+            "<task-ids>",
+            "a < summary",
+            "summary status task-id",
+            "",
+        ] {
+            assert!(!holds_notification_tag(no), "{no:?}");
+        }
+    }
+
+    /// RULINGS CJ4 (T4): 2단계는 마커 태그가 전부 닫힌 블록 안에 있을 때만 — 닫히지 않은 리마인더,
+    /// 짝 없는 닫는 태그, 여는 태그가 둘인데 닫는 태그가 하나면 남는다; 닫힌 블록(대소문자·속성 무관),
+    /// 코드펜스 안의 태그, 마커가 아닌 태그는 남지 않는다. `harness_strip` 은 그대로다(임무 판정).
+    #[test]
+    fn cj4_harness_tag_outside_closed_blocks() {
+        for yes in [
+            "<system-reminder>soul.md 를 다시 읽어라\n예, 켜줘",
+            "예 </system-reminder>",
+            "<system-reminder>a <system-reminder>b</system-reminder> 예",
+            "예 <summary> 켜줘",
+            "<command-name>/x</command-name> <bash-input>ls",
+        ] {
+            assert!(harness_tag_outside_closed_blocks(yes), "{yes:?}");
+        }
+        for no in [
+            "<system-reminder>soul.md 를 다시 읽어라</system-reminder>\n예, 켜줘",
+            "<System-Reminder a=\"1\">x</SYSTEM-REMINDER> 예",
+            "```\n<system-reminder>\n```\n예",
+            "예 `<system-reminder>` 켜줘",
+            "<div>x</div> 예",
+            "고쳐라 soul.md",
+            "",
+        ] {
+            assert!(!harness_tag_outside_closed_blocks(no), "{no:?}");
+        }
+        // the mission gate keeps the text after an unpaired marker tag (unchanged)
+        assert_eq!(harness_strip("<system-reminder>soul.md 예"), "soul.md 예");
     }
 
     /// ★H-MISSION-R2(층2 파리티): 선두 `[`·`［` 라벨 판정과 그 '첫 글자'.

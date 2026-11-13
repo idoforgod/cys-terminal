@@ -37,12 +37,14 @@ pub(crate) enum AuditVerdict {
     Finding,
 }
 
-/// `grant on|off|ask` (`ask` → `repair.grant_ask`, RULINGS Q1).
+/// `grant on|off|ask|status` (`ask` → `repair.grant_ask`, RULINGS Q1; `status` →
+/// `repair.grant_status`, the READ of RULINGS CI6 (b)).
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GrantMode {
     On,
     Off,
     Ask,
+    Status,
 }
 
 /// `owner-token [ask]` (`ask` → `repair.owner_token_ask`, RULINGS Q2).
@@ -157,12 +159,16 @@ pub(crate) enum RepairCmd {
         #[arg(long, value_name = "시각")]
         slot: Option<String>,
     },
-    /// 자동 수리 허락 켜기·끄기·질문 등록(마스터 · 주인 입력 확인 뒤에만 효력)
+    /// 자동 수리 허락 켜기·끄기·질문 등록(마스터 · 주인 입력 확인 뒤에만 효력) · 상태 보기(status · 누구나)
     Grant {
         #[arg(value_enum)]
         mode: GrantMode,
-        #[arg(long)]
+        /// 하루 상한(1~100) — `grant ask` 에서만: 질문에 딸려 저장되고, 지금 상한과 다른 수는 주인이 직접 친 말에 그 숫자가 있어야 한다(`on`·`off`·`status`는 받지 않음)
+        #[arg(long, value_name = "N")]
         daily_cap: Option<u32>,
+        /// 결과를 JSON 한 줄로(`status`: {state, paused, paused_until, daily_cap})
+        #[arg(long)]
+        json: bool,
     },
     /// 규칙 문서 수리의 주인 지시 표 발급·질문 등록(마스터 · 주인 입력 확인 뒤에만 효력)
     OwnerToken {
@@ -655,6 +661,137 @@ fn t3_request(cmd: &RepairCmd) -> Option<(&'static str, Value, bool)> {
     })
 }
 
+/// The daemon request of a T4 verb (C9 grant, C10 owner token): (wire method, params). `None` = not
+/// a T4 verb. `grant ask` / `owner-token ask` are their own requests (RULINGS Q1 / Q2).
+fn t4_request(cmd: &RepairCmd) -> Option<(&'static str, Value)> {
+    let path_of = |p: &PathBuf| p.to_string_lossy().to_string();
+    Some(match cmd {
+        RepairCmd::Grant {
+            mode: GrantMode::Ask,
+            daily_cap,
+            ..
+        } => ("repair.grant_ask", json!({"daily_cap": daily_cap})),
+        // RULINGS CI6 (b); a `--daily-cap` here is forwarded so the daemon refuses it in one place
+        RepairCmd::Grant {
+            mode: GrantMode::Status,
+            daily_cap,
+            ..
+        } => ("repair.grant_status", json!({"daily_cap": daily_cap})),
+        // CI4: forwarded as given — the daemon refuses `--daily-cap` on `on` / `off` with the
+        // sentence naming `grant ask --daily-cap` (never silently dropped)
+        RepairCmd::Grant {
+            mode, daily_cap, ..
+        } => (
+            "repair.grant",
+            json!({"mode": if *mode == GrantMode::On { "on" } else { "off" }, "daily_cap": daily_cap}),
+        ),
+        RepairCmd::OwnerToken {
+            mode: Some(OwnerTokenMode::Ask),
+            path,
+            ..
+        } => ("repair.owner_token_ask", json!({"path": path_of(path)})),
+        RepairCmd::OwnerToken {
+            mode: None,
+            path,
+            repair,
+        } => (
+            "repair.owner_token",
+            json!({"path": path_of(path), "repair": repair}),
+        ),
+        RepairCmd::RuleDocAllowed { path } => {
+            ("repair.rule_doc_allowed", json!({"path": path_of(path)}))
+        }
+        _ => return None,
+    })
+}
+
+/// Writes the success of a T4 verb and returns the exit code: `rule-doc-allowed` exits 0 only when
+/// the daemon allows (the guard hook reads only the exit code), 95 otherwise with the reason on
+/// stderr and nothing on stdout.
+fn t4_print(cmd: &RepairCmd, out: &mut dyn Write, err: &mut dyn Write, v: &Value) -> i32 {
+    let r = match cmd {
+        RepairCmd::Grant { json: true, .. } => writeln!(out, "{v}"),
+        RepairCmd::Grant {
+            mode: GrantMode::Ask,
+            ..
+        } => {
+            // CJ5: the daemon's sentence names the limit; an older reply without it is rebuilt here
+            let ask = match v.get("ask_owner").and_then(Value::as_str) {
+                Some(a) => a.to_string(),
+                None => match v.get("daily_cap").and_then(Value::as_u64) {
+                    Some(n) => cys::repair::owner_origin::grant_question_ko(n as u32),
+                    None => cys::repair::owner_origin::GRANT_QUESTION_KO.to_string(),
+                },
+            };
+            writeln!(
+                out,
+                "질문을 등록했습니다(하루 상한 {}건) — 이제 주인께 대화로 물으세요: \"{ask}\" (30분 안에 주인이 직접 친 첫 답만 셉니다)",
+                s(v, "daily_cap")
+            )
+        }
+        RepairCmd::Grant {
+            mode: GrantMode::Status,
+            ..
+        } => {
+            if v.get("state") == Some(&json!("on")) {
+                let pause = if v.get("paused") == Some(&Value::Bool(true)) {
+                    let until = v
+                        .get("paused_until")
+                        .and_then(Value::as_f64)
+                        .and_then(|t| chrono::DateTime::from_timestamp(t as i64, 0))
+                        .map(|t| t.with_timezone(&chrono::Local).format("%H:%M").to_string())
+                        .unwrap_or_else(|| "-".into());
+                    format!("일시정지 중({until}까지 · 주인의 입력 뒤 30분)")
+                } else {
+                    "일시정지 아님".to_string()
+                };
+                writeln!(
+                    out,
+                    "자동 수리 허락: 켬 · 하루 상한 {}건 · {pause}",
+                    s(v, "daily_cap")
+                )
+            } else {
+                writeln!(out, "자동 수리 허락: 끔 (하루 상한 {}건)", s(v, "daily_cap"))
+            }
+        }
+        RepairCmd::Grant { .. } => {
+            if v.get("grant") == Some(&json!("on")) {
+                writeln!(
+                    out,
+                    "자동 수리 허락: 켬 (하루 상한 {}건 · 주인의 입력이 있으면 30분 쉼)",
+                    s(v, "daily_cap")
+                )
+            } else {
+                writeln!(out, "자동 수리 허락: 끔")
+            }
+        }
+        RepairCmd::OwnerToken {
+            mode: Some(OwnerTokenMode::Ask),
+            ..
+        } => writeln!(
+            out,
+            "질문을 등록했습니다(규칙 문서 {}) — 주인께 이 문서를 고쳐도 되는지 물으세요(30분 안에 주인이 직접 친 첫 답만 셉니다)",
+            s(v, "path")
+        ),
+        RepairCmd::OwnerToken { .. } => writeln!(
+            out,
+            "{}\n이 표는 지금 한 번만 보입니다 — 유효 24시간 · 이 부서 워커의 티켓에 그대로 붙이세요(`cys repair begin --owner-token …`)",
+            s(v, "ticket_line")
+        ),
+        RepairCmd::RuleDocAllowed { .. } => {
+            if v.get("allowed") == Some(&Value::Bool(true)) {
+                writeln!(out, "허용: {} ({})", s(v, "path"), s(v, "repair"))
+            } else {
+                let _ = writeln!(err, "허용하지 않음: {} — {}", s(v, "path"), s(v, "reason"));
+                return cys::repair::types::EXIT_REPAIR_PRECONDITION;
+            }
+        }
+        _ => Ok(()),
+    };
+    let _ = r;
+    0
+}
+
 /// O-C1-8: `cys repair tombstones [--json]` — a LOCAL read of this lane's tombstone file (no daemon);
 /// the lane is the caller's socket (`CYS_SOCKET`, as `lane_key` does). An unreadable file → the
 /// sentence on stderr and exit 95, nothing on stdout (a reader then behaves as today: no tombstones).
@@ -721,8 +858,14 @@ fn run_with(cmd: &RepairCmd, out: &mut dyn Write, err: &mut dyn Write, rpc: Rpc<
             Err(e) => fail(err, &e),
         };
     }
-    // The verbs whose bodies belong to other tracks (T4 grant/owner-token/rule-doc-allowed ·
-    // T5a boot-critical · T5b submit/auth-helper · T6 revert/sweep/tick/reapply · T7b gate/recheck).
+    if let Some((method, params)) = t4_request(cmd) {
+        return match rpc(method, params) {
+            Ok(v) => t4_print(cmd, out, err, &v),
+            Err(e) => fail(err, &e),
+        };
+    }
+    // The verbs whose bodies belong to other tracks (T5a boot-critical · T5b submit/auth-helper ·
+    // T6 revert/sweep/tick/reapply · T7b gate/recheck).
     let _ = writeln!(
         err,
         "{}: cys repair {}",
@@ -805,8 +948,8 @@ mod tests {
     }
 
     /// The clap names are the 23 contract names; the 18 daemon-backed ones (`-`→`_`) plus the two
-    /// `ask` modes are daemon sub-verbs and the remaining daemon sub-verbs are the app-only three;
-    /// every name has a class in `VERB_CLASSES` (J1).
+    /// `ask` modes and `grant status` (RULINGS CI6 (b)) are daemon sub-verbs and the remaining daemon
+    /// sub-verbs are the app-only three; every name has a class in `VERB_CLASSES` (J1).
     #[test]
     fn verb_names_are_contract() {
         let root = <super::super::Cli as clap::CommandFactory>::command();
@@ -834,7 +977,7 @@ mod tests {
         }
 
         let subverbs = daemon_subverbs();
-        assert_eq!(subverbs.len(), 23, "daemon REPAIR_SUBVERBS: {subverbs:?}");
+        assert_eq!(subverbs.len(), 24, "daemon REPAIR_SUBVERBS: {subverbs:?}");
         let mut backed: Vec<String> = CLI_NAMES
             .iter()
             .filter(|n| !LOCAL.contains(n))
@@ -843,6 +986,7 @@ mod tests {
         assert_eq!(backed.len(), 18);
         backed.push("grant_ask".to_string());
         backed.push("owner_token_ask".to_string());
+        backed.push("grant_status".to_string());
         for b in &backed {
             assert!(
                 subverbs.contains(b),
@@ -928,6 +1072,9 @@ mod tests {
             &["grant", "on", "--daily-cap", "3"],
             &["grant", "off"],
             &["grant", "ask"],
+            &["grant", "ask", "--daily-cap", "7"],
+            &["grant", "status"],
+            &["grant", "status", "--json"],
             &["owner-token", "--path", "directives/MASTER_DIRECTIVE.md"],
             &[
                 "owner-token",
@@ -972,6 +1119,10 @@ mod tests {
             "list",
             "status",
             "cleanup",
+            // T4 (rewrite: its daemon verbs left the stub set — an old daemon → 93 like T3's)
+            "grant",
+            "owner-token",
+            "rule-doc-allowed",
         ];
         let mut covered: Vec<&str> = Vec::new();
         for argv in calls {
@@ -1093,6 +1244,70 @@ mod tests {
                 "repair_cli.rs production code prints to stdout ({needle})"
             );
         }
+    }
+
+    /// T4: the wire requests of `grant on|off|ask`, `owner-token [ask]` and `rule-doc-allowed`, their
+    /// output, and `rule-doc-allowed`'s exit code (0 only when the daemon allows — the guard hook reads
+    /// nothing else; 95 with the reason on stderr and nothing on stdout otherwise).
+    #[test]
+    fn t4_requests_and_outputs() {
+        let seen = std::cell::RefCell::new(Vec::<(String, Value)>::new());
+        let reply = std::cell::RefCell::new(json!({}));
+        let rpc = |m: &str, p: Value| -> Result<Value, String> {
+            seen.borrow_mut().push((m.to_string(), p));
+            Ok(reply.borrow().clone())
+        };
+        let run = |argv: &[&str], r: Value| -> (i32, String, String) {
+            *reply.borrow_mut() = r;
+            let cmd = parse(argv).unwrap();
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = run_with(&cmd, &mut out, &mut err, &rpc);
+            (code, String::from_utf8(out).unwrap(), String::from_utf8(err).unwrap())
+        };
+        let (c, o, _) = run(&["grant", "on"], json!({"grant": "on", "daily_cap": 3}));
+        assert_eq!((c, o.contains("켬") && o.contains("3건")), (0, true));
+        assert_eq!(seen.borrow().last().unwrap(), &("repair.grant".to_string(), json!({"mode": "on", "daily_cap": null})));
+        // CI4: `--daily-cap` on `on` is forwarded as given (never dropped) — the daemon refuses it
+        let _ = run(&["grant", "on", "--daily-cap", "3"], json!({"grant": "on", "daily_cap": 3}));
+        assert_eq!(seen.borrow().last().unwrap(), &("repair.grant".to_string(), json!({"mode": "on", "daily_cap": 3})));
+        let (c, o, _) = run(&["grant", "off"], json!({"grant": "off"}));
+        assert_eq!((c, o.trim()), (0, "자동 수리 허락: 끔"));
+        assert_eq!(seen.borrow().last().unwrap().1, json!({"mode": "off", "daily_cap": null}));
+        let (c, o, _) = run(&["grant", "ask"], json!({"daily_cap": 5}));
+        assert!(c == 0 && o.contains("스스로 고쳐도 될까요? (하루 5건까지)") && o.contains("하루 상한 5건"), "{o}");
+        // CJ5: the daemon's sentence is printed as given
+        let (_, o, _) = run(&["grant", "ask"], json!({"daily_cap": 9, "ask_owner": "자비스가 발견한 명백한 버그·오류를 스스로 고쳐도 될까요? (하루 9건까지)"}));
+        assert!(o.contains("\"자비스가 발견한 명백한 버그·오류를 스스로 고쳐도 될까요? (하루 9건까지)\""), "{o}");
+        assert_eq!(seen.borrow().last().unwrap(), &("repair.grant_ask".to_string(), json!({"daily_cap": null})));
+        // CI4: the limit belongs to the question
+        let _ = run(&["grant", "ask", "--daily-cap", "7"], json!({"daily_cap": 7}));
+        assert_eq!(seen.borrow().last().unwrap(), &("repair.grant_ask".to_string(), json!({"daily_cap": 7})));
+        // CI6 (b): `grant status [--json]`
+        let st = json!({"state": "on", "paused": false, "paused_until": null, "daily_cap": 7});
+        let (c, o, e) = run(&["grant", "status"], st.clone());
+        assert_eq!((c, o.trim(), e.as_str()), (0, "자동 수리 허락: 켬 · 하루 상한 7건 · 일시정지 아님", ""));
+        assert_eq!(seen.borrow().last().unwrap(), &("repair.grant_status".to_string(), json!({"daily_cap": null})));
+        let (c, o, _) = run(&["grant", "status", "--json"], st.clone());
+        assert_eq!(c, 0);
+        assert_eq!(serde_json::from_str::<Value>(o.trim()).unwrap(), st);
+        let (_, o, _) = run(&["grant", "status"], json!({"state": "on", "paused": true, "paused_until": 1_800_000_000.0, "daily_cap": 5}));
+        assert!(o.contains("일시정지 중(") && o.contains("까지"), "{o}");
+        let (_, o, _) = run(&["grant", "status"], json!({"state": "off", "paused": false, "paused_until": null, "daily_cap": 5}));
+        assert_eq!(o.trim(), "자동 수리 허락: 끔 (하루 상한 5건)");
+        let (c, _, _) = run(&["owner-token", "ask", "--path", "soul.md"], json!({"path": "soul.md"}));
+        assert_eq!(c, 0);
+        assert_eq!(seen.borrow().last().unwrap(), &("repair.owner_token_ask".to_string(), json!({"path": "soul.md"})));
+        let line = "주인 지시 표: ot-aaaaaaaaaaaaaaaaaaaaaaaaaa (규칙 문서 soul.md)";
+        let (c, o, _) = run(&["owner-token", "--path", "soul.md", "--repair", "R-2"], json!({"ticket_line": line}));
+        assert!(c == 0 && o.starts_with(line), "{o}");
+        assert_eq!(seen.borrow().last().unwrap(), &("repair.owner_token".to_string(), json!({"path": "soul.md", "repair": "R-2"})));
+        let (c, o, e) = run(&["rule-doc-allowed", "--path", "soul.md"], json!({"allowed": true, "path": "soul.md", "repair": "R-1"}));
+        assert_eq!((c, e.as_str()), (0, ""));
+        assert!(o.contains("R-1"));
+        assert_eq!(seen.borrow().last().unwrap(), &("repair.rule_doc_allowed".to_string(), json!({"path": "soul.md"})));
+        let (c, o, e) = run(&["rule-doc-allowed", "--path", "soul.md"], json!({"allowed": false, "path": "soul.md", "reason": "no"}));
+        assert_eq!((c, o.as_str()), (95, ""));
+        assert!(e.contains("허용하지 않음"));
     }
 
     /// O-C3-6 exit mapping (+ Z1), the old-daemon sentence, an unreachable daemon → 98, and a

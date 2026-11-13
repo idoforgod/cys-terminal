@@ -74,13 +74,15 @@ pub enum VerbClass {
     Work,
 }
 
-/// The per-verb role table: the 23 daemon wire names + the 5 local verbs in CLI spelling, classes
-/// exactly as the CONTRACTS C3 table (J1; `auth-helper` per interpretation 29).
-pub const VERB_CLASSES: [(&str, VerbClass); 28] = [
-    // READ (8)
+/// The per-verb role table: the 24 daemon wire names + the 5 local verbs in CLI spelling, classes
+/// exactly as the CONTRACTS C3 table (J1; `auth-helper` per interpretation 29; `grant_status` READ
+/// per RULINGS CI6 (b)).
+pub const VERB_CLASSES: [(&str, VerbClass); 29] = [
+    // READ (9)
     ("list", VerbClass::Read),
     ("status", VerbClass::Read),
     ("rule_doc_allowed", VerbClass::Read),
+    ("grant_status", VerbClass::Read),
     ("approval_list", VerbClass::Read),
     ("gate", VerbClass::Read),
     ("rules", VerbClass::Read),
