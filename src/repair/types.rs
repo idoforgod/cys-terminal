@@ -433,6 +433,198 @@ pub const ERR_CHECK_FAILED: &str = "repair_check_failed";
 pub const ERR_PLATFORM_PENDING: &str = "repair_pending_platform";
 pub const ERR_CORRUPT: &str = "repair_corrupt";
 
+/// RULINGS AU4 / BJ3: whether a pack-relative target is one of the pack's locked security files
+/// (`crate::pack::SYSTEM_LOCKED` — `trusted-keys.json`): never a repair target. Compared after full
+/// case folding (case-insensitive APFS / NTFS open the same file under another spelling).
+pub fn is_system_locked(rel: &str) -> bool {
+    system_locked_entry(rel).is_some()
+}
+
+/// The `SYSTEM_LOCKED` entry `rel` names after full case folding ([`fold_name`] — RULINGS BJ3:
+/// `trusted-\u{212A}eys.json`, `tru\u{017F}ted-keys.json` ARE the key file on APFS / NTFS), in the
+/// pack's own spelling.
+pub fn system_locked_entry(rel: &str) -> Option<&'static str> {
+    let folded = fold_name(rel);
+    crate::pack::SYSTEM_LOCKED
+        .iter()
+        .copied()
+        .find(|l| fold_name(l) == folded)
+}
+
+/// RULINGS BJ3 — the ONE name comparison of protected names: Unicode case folding approximated by
+/// upper- then lower-casing every character (`ſ` → `S` → `s`, the Kelvin sign `K` → `k`, `ß` →
+/// `ss`), so every spelling a case-insensitive file system opens as the same name compares equal.
+pub fn fold_name(s: &str) -> String {
+    s.to_uppercase().to_lowercase()
+}
+
+/// Whether a no-follow stat result is a link for the repair rules: a symbolic link, and on Windows
+/// any reparse point (a junction, a mount point, a cloud placeholder …) — RULINGS AW3 (b).
+fn is_link_like(meta: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return true;
+        }
+    }
+    meta.file_type().is_symlink()
+}
+
+/// RULINGS AW3 (b) — the ONE parent-chain check (the daemon's `begin` / `record` / `commit` and
+/// T6's apply call it): every PARENT component of `rel` under `pack`, from the pack root down, is
+/// read with a no-follow stat; a symbolic link (on Windows any reparse point) or a component that
+/// is not a directory refuses. A missing component ends the walk (nothing below it exists). The
+/// leaf itself may be a link (U2) and is not checked; the pack root itself is not checked.
+pub fn parent_chain_link(pack: &Path, rel: &str) -> Result<(), RepairError> {
+    let parts: Vec<&str> = rel.split(['/', '\\']).filter(|p| !p.is_empty()).collect();
+    let mut at = pack.to_path_buf();
+    for (i, part) in parts.iter().enumerate() {
+        if i + 1 == parts.len() {
+            break; // the leaf
+        }
+        at.push(part);
+        let meta = match std::fs::symlink_metadata(&at) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(RepairError::Precondition(format!(
+                    "{rel}: 상위 경로 {} 를 확인할 수 없습니다 — {e}",
+                    parts[..=i].join("/")
+                )))
+            }
+        };
+        if is_link_like(&meta) {
+            return Err(RepairError::Precondition(format!(
+                "{rel}: 상위 경로 {} 가 링크(또는 연결 지점 · 클라우드 동기화 폴더의 자리표시)입니다 — 링크를 거친 경로는 수리 대상이 아닙니다(RULINGS AW3)",
+                parts[..=i].join("/")
+            )));
+        }
+        if !meta.is_dir() {
+            return Err(RepairError::Precondition(format!(
+                "{rel}: 상위 경로 {} 가 폴더가 아닙니다",
+                parts[..=i].join("/")
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The pack roots of every lane of this installation as seen from one lane's pack: the pack itself,
+/// and in its parent (the cys base) `pack` and every `pack-dept-*` (the same rule as
+/// `factory_reset::command_points_into_pack`). Each root also in its canonical form.
+pub fn lane_pack_roots(pack: &Path) -> Vec<std::path::PathBuf> {
+    let mut roots = vec![pack.to_path_buf()];
+    if let Some(base) = pack.parent() {
+        if let Ok(rd) = std::fs::read_dir(base) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name == "pack" || name.starts_with("pack-dept-") {
+                    roots.push(e.path());
+                }
+            }
+        }
+    }
+    let canon: Vec<std::path::PathBuf> = roots
+        .iter()
+        .filter_map(|r| std::fs::canonicalize(r).ok())
+        .collect();
+    roots.extend(canon);
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+/// RULINGS AW3 (c) / BJ1: `None` when a candidate link at `pack/<rel>` pointing to `target` is
+/// allowed; otherwise the reason. The target is resolved PHYSICALLY, as the operating system opens
+/// it: from the link's own canonical parent, component by component, every existing component
+/// canonicalised (so a link inside the target is followed BEFORE a later `..` is applied — no
+/// textual `..` clean-up). Refused when (i) the longest existing prefix lies inside any lane's pack
+/// root ([`lane_pack_roots`]), (ii) the not-yet-existing rest contains `..`, (iii) the fully
+/// resolved target is a directory or lies inside a pack, or the target cannot be resolved (a link
+/// loop, an unreadable component — fail closed). A link to a user file outside the packs (also a
+/// file that does not exist yet) stays allowed: a repair never creates an alias of a pack path.
+pub fn link_target_refusal(pack: &Path, rel: &str, target: &str) -> Option<String> {
+    use std::path::{Component, PathBuf};
+    let roots = lane_pack_roots(pack);
+    let inside = |p: &Path| roots.iter().any(|r| p.starts_with(r));
+    let in_pack = || {
+        Some(format!(
+            "{rel}: 링크가 팩 안의 경로({target})를 가리킵니다 — 수리는 팩 경로의 별칭을 만들지 않습니다(RULINGS AW3)"
+        ))
+    };
+    let unresolved = |why: String| {
+        Some(format!(
+            "{rel}: 링크가 가리키는 곳({target})을 끝까지 확인할 수 없어 받지 않습니다 — {why}"
+        ))
+    };
+    let live = pack.join(rel);
+    let start = match std::fs::canonicalize(live.parent().unwrap_or(pack)) {
+        Ok(p) => p,
+        Err(e) => return unresolved(e.to_string()),
+    };
+    let t = Path::new(target);
+    let raw = if t.is_absolute() {
+        t.to_path_buf()
+    } else {
+        start.join(t)
+    };
+    let mut cur = PathBuf::new();
+    let mut rest: Vec<Component<'_>> = Vec::new();
+    for c in raw.components() {
+        if !rest.is_empty() {
+            rest.push(c);
+            continue;
+        }
+        match c {
+            Component::Prefix(_) | Component::RootDir => cur.push(c.as_os_str()),
+            Component::CurDir => {}
+            // `cur` is canonical (every link in it already followed): its parent is the physical one
+            Component::ParentDir => {
+                cur.pop();
+            }
+            Component::Normal(name) => {
+                let next = cur.join(name);
+                match std::fs::symlink_metadata(&next) {
+                    Ok(_) => match std::fs::canonicalize(&next) {
+                        Ok(resolved) => cur = resolved,
+                        Err(e) => return unresolved(e.to_string()),
+                    },
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => rest.push(c),
+                    Err(e) => return unresolved(e.to_string()),
+                }
+            }
+        }
+    }
+    // (i) the longest existing prefix, canonical
+    if inside(cur.as_path()) {
+        return in_pack();
+    }
+    // (ii) `..` in the part that does not exist yet (the OS would resolve it after creation)
+    if rest.iter().any(|c| matches!(c, Component::ParentDir)) {
+        return Some(format!(
+            "{rel}: 링크 대상({target})의 아직 없는 부분에 '..' 가 있습니다 — 받지 않습니다(RULINGS AW3)"
+        ));
+    }
+    // (iii) the fully resolved target
+    let mut full = cur.clone();
+    for c in &rest {
+        if let Component::Normal(name) = c {
+            full.push(name);
+        }
+    }
+    if rest.is_empty() && std::fs::metadata(&full).is_ok_and(|m| m.is_dir()) {
+        return Some(format!(
+            "{rel}: 링크가 폴더({target})를 가리킵니다 — 수리는 폴더를 가리키는 링크를 만들지 않습니다(RULINGS AW3)"
+        ));
+    }
+    if inside(full.as_path()) {
+        return in_pack();
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -899,5 +1091,149 @@ mod z2_tests {
         let got: Vec<&str> = v.iter().map(|i| i.as_str()).collect();
         assert_eq!(got, ["R-1", "R-9", "R-10", "R-11", "R-100"]);
         assert_eq!(p("R-5").cmp(&p("R-5")), std::cmp::Ordering::Equal);
+    }
+}
+
+#[cfg(test)]
+mod t3c_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("cys-t3c-types-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// RULINGS AU4: the locked key file, any case; nothing else.
+    #[test]
+    fn system_locked_is_the_pack_constant() {
+        for rel in crate::pack::SYSTEM_LOCKED {
+            assert!(is_system_locked(rel));
+            assert!(is_system_locked(&rel.to_ascii_uppercase()));
+        }
+        assert!(is_system_locked("Trusted-Keys.JSON"));
+        // RULINGS BJ3: spellings a case-insensitive file system opens as the key file
+        for rel in [
+            "trusted-\u{212A}eys.json",
+            "tru\u{017F}ted-keys.json",
+            "TRU\u{017F}TED-KEYS.JSON",
+        ] {
+            assert_eq!(system_locked_entry(rel), Some("trusted-keys.json"), "{rel}");
+        }
+        assert_eq!(fold_name("Stra\u{00DF}e"), "strasse");
+        for rel in ["bin/trusted-keys.json", "trusted-keys.json.bak", "bin/a.py"] {
+            assert!(!is_system_locked(rel), "{rel}");
+        }
+    }
+
+    /// RULINGS AW3 (b): a link anywhere in the parent chain refuses; the leaf may be a link; a
+    /// missing parent ends the walk; a file used as a parent refuses.
+    #[cfg(unix)]
+    #[test]
+    fn parent_chain_links_refused() {
+        let base = tmp("chain");
+        let pack = base.join("pack");
+        std::fs::create_dir_all(pack.join("hooks/sub")).unwrap();
+        std::fs::write(pack.join("hooks/guard.sh"), b"x").unwrap();
+        std::os::unix::fs::symlink(pack.join("hooks"), pack.join("x")).unwrap();
+        std::os::unix::fs::symlink("sub", pack.join("hooks/rel-link")).unwrap();
+        std::os::unix::fs::symlink(pack.join("hooks/guard.sh"), pack.join("hooks/leaf")).unwrap();
+        assert!(parent_chain_link(&pack, "hooks/guard.sh").is_ok());
+        assert!(
+            parent_chain_link(&pack, "hooks/leaf").is_ok(),
+            "the leaf may be a link (U2)"
+        );
+        assert!(
+            parent_chain_link(&pack, "hooks/new/deeper/file.sh").is_ok(),
+            "missing parents"
+        );
+        let e = parent_chain_link(&pack, "x/guard.sh").unwrap_err();
+        assert!(format!("{e:?}").contains("링크"), "{e:?}");
+        assert!(parent_chain_link(&pack, "hooks/rel-link/a.sh").is_err());
+        assert!(
+            parent_chain_link(&pack, "hooks/guard.sh/a").is_err(),
+            "a file as a parent"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// RULINGS AW3 (c): a link to a directory, or into any lane's pack, is refused; a link to a user
+    /// file outside the packs is allowed.
+    #[cfg(unix)]
+    #[test]
+    fn link_targets_into_packs_or_directories_refused() {
+        let base = tmp("links");
+        let pack = base.join("pack");
+        let dept = base.join("pack-dept-d1");
+        let user = base.join("user");
+        std::fs::create_dir_all(pack.join("bin")).unwrap();
+        std::fs::create_dir_all(dept.join("hooks")).unwrap();
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::write(pack.join("hooks.sh"), b"x").unwrap();
+        std::fs::write(dept.join("hooks/guard.sh"), b"x").unwrap();
+        std::fs::write(user.join("notes.txt"), b"x").unwrap();
+        let roots = lane_pack_roots(&pack);
+        assert!(
+            roots.iter().any(|r| r.ends_with("pack-dept-d1")),
+            "{roots:?}"
+        );
+        // into this pack (relative and absolute), into another lane's pack, a directory
+        for t in [
+            "../hooks.sh".to_string(),
+            pack.join("hooks.sh").display().to_string(),
+            dept.join("hooks/guard.sh").display().to_string(),
+            user.display().to_string(),
+            "..".to_string(),
+            pack.join("bin/not-yet.py").display().to_string(),
+        ] {
+            assert!(
+                link_target_refusal(&pack, "bin/a.py", &t).is_some(),
+                "{t} allowed"
+            );
+        }
+        // a user file outside the packs (also a dangling one)
+        for t in [
+            user.join("notes.txt").display().to_string(),
+            user.join("missing.txt").display().to_string(),
+            "../../user/notes.txt".to_string(),
+        ] {
+            assert!(
+                link_target_refusal(&pack, "bin/a.py", &t).is_none(),
+                "{t} refused"
+            );
+        }
+        // RULINGS BJ1: an outside link followed by `..` resolves physically into the pack's hooks
+        std::fs::create_dir_all(pack.join("hooks")).unwrap();
+        std::fs::write(pack.join("hooks/guard.sh"), b"x").unwrap();
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(pack.join("hooks"), outside.join("lnk")).unwrap();
+        let sneaky = format!("{}/lnk/../hooks/guard.sh", outside.display());
+        let why =
+            link_target_refusal(&pack, "bin/helper.sh", &sneaky).expect("the alias was allowed");
+        assert!(why.contains("팩 안의 경로"), "{why}");
+        // a missing path two levels deep inside a pack; `..` in the part that does not exist yet
+        for t in [
+            pack.join("bin/new/deeper/x.py").display().to_string(),
+            format!("{}/missing/../../pack/hooks.sh", user.display()),
+        ] {
+            assert!(
+                link_target_refusal(&pack, "bin/a.py", &t).is_some(),
+                "{t} allowed"
+            );
+        }
+        // `pack-notes` is not a pack (boundary match)
+        let notes = base.join("pack-notes");
+        std::fs::create_dir_all(&notes).unwrap();
+        std::fs::write(notes.join("n.txt"), b"x").unwrap();
+        assert!(link_target_refusal(
+            &pack,
+            "bin/a.py",
+            &notes.join("n.txt").display().to_string()
+        )
+        .is_none());
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

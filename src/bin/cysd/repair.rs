@@ -298,7 +298,17 @@ pub(crate) struct Ctx<'a> {
     pub check: &'a dyn Fn(&str, &Path, std::time::Duration) -> Result<CheckReport, RepairError>,
     /// The hook step of RULINGS Y1 (`apply::hook_lines_step`, T6's, in production).
     pub hook_step: &'a HookStepFn<'a>,
+    /// The grant claim of K8 / G1 (`grant::try_claim_autonomous_start`, T4's, in production).
+    pub claim: &'a ClaimFn<'a>,
 }
+
+/// The shape of `grant::try_claim_autonomous_start` (injected so a pick-up's claim answers —
+/// CapReached, Busy … — are testable; RULINGS AQ11 / AW8).
+pub(crate) type ClaimFn<'a> = dyn Fn(
+        &cys::repair::types::LockOwner,
+        &cys::repair::types::RepairId,
+    ) -> Result<cys::repair::grant::StartVerdict, RepairError>
+    + 'a;
 
 /// The shape of `apply::hook_lines_step` (injected so the commit's hook half is testable).
 pub(crate) type HookStepFn<'a> = dyn Fn(
@@ -372,6 +382,7 @@ pub(crate) fn handle(
         classify: &classify,
         check: &check,
         hook_step: &cys::repair::apply::hook_lines_step,
+        claim: &cys::repair::grant::try_claim_autonomous_start,
     };
     Reply::Single(match handle_with(&ctx, &caller, sub, params) {
         Ok(v) => ok_response(id, v),
@@ -433,10 +444,15 @@ pub(crate) fn role_check(sub: &str, caller: &Caller, windows: bool) -> Result<()
             "`{sub}` 에는 역할 등급이 없습니다 — 어떤 좌석도 받지 않습니다"
         )));
     };
-    // RULINGS AD1: for every verb that is not READ or INTAKE, a seat whose current role family
-    // differs from the family it first held in this daemon incarnation is refused (renaming a seat
-    // with `claim-role` does not change what it may do in the repair flow).
-    if !matches!(class, VerbClass::Read | VerbClass::Intake) {
+    // RULINGS AD1 / AQ1: for every verb that is not READ, INTAKE or TRIGGER, a seat whose current
+    // role family differs from the family it first held in this daemon incarnation is refused
+    // (renaming a seat with `claim-role` does not change what it may do in the repair flow). A
+    // TRIGGER verb (`sweep`, `tick`) only asks the daemon to run its own job and confers nothing —
+    // the boot path's `repair.sweep` is never refused because a seat was re-declared.
+    if !matches!(
+        class,
+        VerbClass::Read | VerbClass::Intake | VerbClass::Trigger
+    ) {
         if let (Some(_), Some(bound)) = (caller.seat(), caller.bound_family) {
             let current = caller.role.as_deref().and_then(role_family);
             if current != Some(bound) {
@@ -1399,6 +1415,12 @@ mod ledger_verbs {
         }
         let trigger = trigger_of(p)?;
         let (files, hooks) = begin_targets(p)?;
+        // AU4 / BJ3, AK6, AW3 (b): the name and path rules over every named target, before anything
+        // is read, classified or written (also for `--joins`, which checks every file of the joined
+        // repair itself — BJ2).
+        for rel in &files {
+            target_rules(ctx, rel)?;
+        }
         if let Some(r) = joins {
             let target = RepairId::parse(r).map_err(|_| {
                 VerbError::invalid(format!("--joins 값이 수리 번호가 아닙니다: {r:?}"))
@@ -1415,19 +1437,23 @@ mod ledger_verbs {
             }
             None => None,
         };
-        // AK6: a Windows path alias (a part ending in a dot or a space, or containing `:`) opens the
-        // file it aliases there but would escape the classification below — refused on every system.
-        if let Some(rel) = files.iter().find(|r| super::is_windows_alias(r)) {
-            return Err(VerbError::invalid(format!(
-                "{rel:?}: 끝이 점·공백이거나 ':' 가 든 경로 조각은 받지 않습니다(윈도우에서 다른 파일의 별칭이 됩니다)"
-            )));
-        }
-        // AD6 / C10 10.6: a rule document is refused until T4's owner-token gate is merged (fail closed).
-        if let Some(rel) = files.iter().find(|r| super::is_rule_document(r)) {
+        // AD6 / C10 10.6 / BJ3: a rule document (any spelling that folds to one) is refused until
+        // T4's owner-token gate is merged (fail closed); the sentence names the real file.
+        if let Some((rel, doc)) = files
+            .iter()
+            .find_map(|r| super::rule_document_name(r).map(|d| (r, d)))
+        {
+            let base = rel.rsplit(['/', '\\']).next().unwrap_or(rel);
+            let real = super::real_name_in(&ctx.pack_dir, rel).unwrap_or(doc);
+            let named = if real == base {
+                rel.clone()
+            } else {
+                format!("{rel} (= {real})")
+            };
             return Err(VerbError::new(
                 cys::repair::types::ERR_NOT_IMPLEMENTED,
                 format!(
-                    "{} (규칙 문서 수리 — 주인 지시 표 관문 · C10): {rel}",
+                    "{} (규칙 문서 수리 — 주인 지시 표 관문 · C10): {named}",
                     cys::repair::NOT_IMPLEMENTED_KO
                 ),
             ));
@@ -1479,20 +1505,20 @@ mod ledger_verbs {
         resolves: Option<RepairId>,
         key: &[String],
     ) -> Result<Value, VerbError> {
-        // Pick-up (G1 step 3 / AD7): only UNFINISHED work — a repair of this lane with the same targets
-        // that is `진행 중` or `감사 지적으로 다시 열림` and has no live lock. A repair in force
-        // (`시험 기간` / `사용 중`) or in any other state is never picked up: a new `begin` starts a NEW
-        // repair with its own pre-image.
+        // Pick-up (G1 step 3 / AD7 / AQ11): only UNFINISHED work — a repair of this lane with the
+        // same targets in a being-worked state of G2 (`진행 중`, `승인 대기`, `감사 지적으로 다시
+        // 열림`) without a live lock. A pick-up changes ONLY the lock (AH2): the state (a `승인 대기`
+        // repair stays `승인 대기`), the signatures, the working copy and the pre-images are untouched;
+        // a grant repair without `--resolves` takes a new claim (K3). A repair in force (`시험 기간` /
+        // `사용 중`) or in any other state is never picked up: a new `begin` starts a NEW repair with
+        // its own pre-image — never a second open repair beside a being-worked one.
         let candidates: Vec<RepairRecord> = ledger::list_ids_in(&ctx.root)
             .into_iter()
             .filter_map(|id| match ledger::read_record_in(&ctx.root, &id) {
                 Ok(Some(r))
                     if r.origin_lane == ctx.lane
                         && r.resolves == resolves
-                        && matches!(
-                            r.state,
-                            RepairState::InProgress | RepairState::ReopenedByAudit
-                        )
+                        && pickable(&r.state)
                         && record_key(&r) == key =>
                 {
                     Some(r)
@@ -1518,16 +1544,14 @@ mod ledger_verbs {
             return ctx.locked(id.as_str(), || -> Result<Value, VerbError> {
                 let mut rec = load(ctx, id)?;
                 // re-read under the repair's mutex: still unfinished and still free?
-                let still = matches!(
-                    rec.state,
-                    RepairState::InProgress | RepairState::ReopenedByAudit
-                ) && lock::view(
-                    rec.lock.as_ref(),
-                    owner,
-                    ctx.now,
-                    &ctx.lane,
-                    &ctx.incarnation,
-                ) == LockView::Free;
+                let still = pickable(&rec.state)
+                    && lock::view(
+                        rec.lock.as_ref(),
+                        owner,
+                        ctx.now,
+                        &ctx.lane,
+                        &ctx.incarnation,
+                    ) == LockView::Free;
                 if !still {
                     return Err(VerbError::new(
                         cys::repair::types::ERR_LOCKED,
@@ -1540,7 +1564,7 @@ mod ledger_verbs {
                 let mut claim = None;
                 if rec.trigger == Trigger::Grant && rec.resolves.is_none() {
                     // K3: picking a grant repair up again needs a NEW claim (T4).
-                    claim = claim_for(owner, &rec.id)?;
+                    claim = claim_for(ctx, owner, &rec.id)?;
                 }
                 rec.lock = Some(lock::new_lease(owner.clone(), ctx.now, claim));
                 // V2(b) / DEFERRED_MINOR #6: pre-images and staging of the first begin are never rewritten.
@@ -1558,18 +1582,46 @@ mod ledger_verbs {
                 ),
             ));
         }
+        // BJ5: one open repair per file — a being-worked repair of this lane that shares a target
+        // with this start but holds another target set (or another `--resolves`) is never doubled;
+        // the repair this start resolves (`--resolves`, RULINGS T1) keeps its own rule.
+        for oid in ledger::list_ids_in(&ctx.root) {
+            let Ok(Some(r)) = ledger::read_record_in(&ctx.root, &oid) else {
+                continue;
+            };
+            if r.origin_lane != ctx.lane || !pickable(&r.state) || resolves.as_ref() == Some(&r.id)
+            {
+                continue;
+            }
+            let theirs = record_key(&r);
+            if r.resolves == resolves && theirs == key {
+                continue; // a pick-up candidate (handled above)
+            }
+            if let Some(shared) = key.iter().find(|k| theirs.contains(k)) {
+                return Err(VerbError::new(
+                    cys::repair::types::ERR_PRECONDITION,
+                    format!(
+                        "{shared}: 이 파일을 고치는 수리 {id} 가 이미 열려 있습니다(대상 파일 묶음 또는 --resolves 가 다릅니다) — `--joins {id}` 로 합류하거나, 같은 파일들({})로 `cys repair begin` 해서 그 수리를 이어받으세요. 한 파일에 열린 수리는 하나뿐입니다(RULINGS BJ5)",
+                        theirs.join(", "),
+                        id = r.id.as_str()
+                    ),
+                ));
+            }
+        }
         // A new repair — created ALREADY LOCKED through the ledger's seam (AD9 S1 / G1 "lock first"):
         // the id is allocated, the record is built (claim, pre-images, staging) and written with its
         // lock before anything else can see it; a failure removes the still-empty id directory.
         let id = ledger::create_locked_in(&ctx.root, |id| -> Result<RepairRecord, VerbError> {
             let id = id.clone();
             let claim = if trigger == Trigger::Grant && resolves.is_none() {
-                claim_for(owner, &id)?
+                claim_for(ctx, owner, &id)?
             } else {
                 None
             };
             let mut changes = Vec::new();
             for rel in files {
+                // BJ4: the parent chain once more right before the pre-image is copied
+                cys::repair::types::parent_chain_link(&ctx.pack_dir, rel)?;
                 let live = live_path(ctx, rel);
                 let pre = ledger::copy_preimage_in(&ctx.root, &id, &ctx.lane, rel, &live, ctx.now)?;
                 let post = pre.state();
@@ -1599,6 +1651,10 @@ mod ledger_verbs {
                 });
             }
             if is_approval_class(class) {
+                // BJ4: and right before the working copy is populated from the live files
+                for rel in files {
+                    cys::repair::types::parent_chain_link(&ctx.pack_dir, rel)?;
+                }
                 let targets: Vec<(String, PathBuf)> = files
                     .iter()
                     .map(|r| (r.clone(), live_path(ctx, r)))
@@ -1652,14 +1708,87 @@ mod ledger_verbs {
         Ok(begin_reply(ctx, &rec, "new"))
     }
 
+    /// The name and path rules of ONE target (used by `begin` for every named file and by
+    /// `begin --joins` for every file of the joined repair): a pack-relative path without Windows
+    /// short names (AW3 (a)); not the locked key file in any spelling that folds to it (AU4 / BJ3 —
+    /// the sentence names the real file); no Windows alias part (AK6); no link / junction /
+    /// cloud placeholder in its parent chain inside the pack (AW3 (b)).
+    fn target_rules(ctx: &Ctx<'_>, rel: &str) -> Result<(), VerbError> {
+        intake::normalize_rel(rel).map_err(|e| VerbError::invalid(VerbError::from(e).message))?;
+        if let Some(locked) = cys::repair::types::system_locked_entry(rel) {
+            let named = if rel == locked {
+                locked.to_string()
+            } else {
+                format!("{rel:?} (= {locked})")
+            };
+            return Err(VerbError::new(
+                cys::repair::types::ERR_PRECONDITION,
+                format!(
+                    "{named}: 서명 키 파일은 수리 대상이 아닙니다 — 사본이 손상됐다면 `cys pack-heal {locked}` 로 내장본을 되살립니다(RULINGS AU4)"
+                ),
+            ));
+        }
+        if super::is_windows_alias(rel) {
+            return Err(VerbError::invalid(format!(
+                "{rel:?}: 끝이 점·공백이거나 ':' 가 든 경로 조각은 받지 않습니다(윈도우에서 다른 파일의 별칭이 됩니다)"
+            )));
+        }
+        cys::repair::types::parent_chain_link(&ctx.pack_dir, rel)?;
+        Ok(())
+    }
+
+    /// The lane's live states of `rels` (no-follow reads, after the parent chains were checked).
+    fn current_live_states(
+        ctx: &Ctx<'_>,
+        rels: &[String],
+    ) -> Result<Vec<(String, TargetState)>, VerbError> {
+        rels.iter()
+            .map(|rel| -> Result<(String, TargetState), VerbError> {
+                Ok((rel.clone(), TargetState::read(&live_path(ctx, rel))?))
+            })
+            .collect()
+    }
+
+    /// RULINGS AW3 (b) / (c) over a repair's file targets: no link / junction in a target's parent
+    /// chain inside the lane's pack (the leaf may be a link — U2); with `states`, a `Link` state is
+    /// refused when it points to a directory or into any lane's pack.
+    fn path_rules(
+        ctx: &Ctx<'_>,
+        rec: &RepairRecord,
+        states: Option<&[(String, TargetState)]>,
+    ) -> Result<(), VerbError> {
+        for f in file_targets(rec) {
+            cys::repair::types::parent_chain_link(&ctx.pack_dir, &f.rel)?;
+        }
+        for (rel, st) in states.unwrap_or(&[]) {
+            if let TargetState::Link { target } = st {
+                if let Some(why) =
+                    cys::repair::types::link_target_refusal(&ctx.pack_dir, rel, target)
+                {
+                    return Err(VerbError::new(cys::repair::types::ERR_PRECONDITION, why));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// RULINGS AD7 / AQ11: the being-worked states of G2 a lock-less repair can be picked up in.
+    fn pickable(state: &RepairState) -> bool {
+        matches!(
+            state,
+            RepairState::InProgress | RepairState::AwaitingApproval | RepairState::ReopenedByAudit
+        )
+    }
+
     /// K8 / G1 (T4): the grant claim for an autonomous start. Until T4 lands the stub answers
     /// not-implemented and the start is refused.
     fn claim_for(
+        ctx: &Ctx<'_>,
         owner: &cys::repair::types::LockOwner,
         id: &RepairId,
     ) -> Result<Option<u32>, VerbError> {
-        use cys::repair::grant::{try_claim_autonomous_start, StartVerdict};
-        match try_claim_autonomous_start(owner, id)? {
+        use cys::repair::grant::StartVerdict;
+        match (ctx.claim)(owner, id)? {
             StartVerdict::Allowed { claim } => Ok(Some(claim)),
             StartVerdict::Paused => Err(VerbError::new(
                 cys::repair::types::ERR_PRECONDITION,
@@ -1692,6 +1821,14 @@ mod ledger_verbs {
     ) -> Result<Value, VerbError> {
         let rec = load(ctx, target)?;
         let rels: Vec<String> = file_targets(&rec).map(|f| f.rel.clone()).collect();
+        // BJ2: the name / parent-chain rules over EVERY file of the joined repair (not only the
+        // ones named in `--files`) before anything is read or copied; then the link rule on the
+        // lane's current states of those files.
+        for rel in &rels {
+            target_rules(ctx, rel)?;
+        }
+        let live_states = current_live_states(ctx, &rels)?;
+        path_rules(ctx, &rec, Some(live_states.as_slice()))?;
         if let Some(bad) = files.iter().find(|f| !rels.contains(f)) {
             return Err(VerbError::invalid(format!(
                 "{bad}: {} 의 대상 파일이 아닙니다",
@@ -1893,7 +2030,9 @@ mod ledger_verbs {
                 }
                 rec.attempt += 1;
             }
+            path_rules(ctx, &rec, None)?;
             let states = current_states(ctx, &rec)?;
+            path_rules(ctx, &rec, Some(states.as_slice()))?;
             let staging = ledger::staging_dir_in(&ctx.root, &id);
             let approval_class = is_approval_class(rec.classification);
             for f in rec.files.iter_mut() {
@@ -2214,7 +2353,9 @@ mod ledger_verbs {
                     format!("{}: 검증 서명이 고친 좌석의 것입니다 — 다른 좌석의 리뷰어1 서명이 필요합니다", id.as_str()),
                 ));
             }
+            path_rules(ctx, &rec, None)?;
             let states = current_states(ctx, &rec)?;
+            path_rules(ctx, &rec, Some(states.as_slice()))?;
             if fingerprint(&states) != verify.fingerprint_sha256 {
                 return Err(VerbError::new(
                     "target_changed",
@@ -2234,6 +2375,7 @@ mod ledger_verbs {
                     format!("{}: 검사하는 동안 수리 기록이 바뀌었습니다 — 확정을 멈춥니다(다시 `cys repair commit`)", id.as_str()),
                 ));
             }
+            path_rules(ctx, &rec, Some(states.as_slice()))?;
             if current_states(ctx, &rec)? != states {
                 return Err(VerbError::new(
                     "target_changed",
@@ -2407,7 +2549,9 @@ mod ledger_verbs {
         Vec<(String, String)>,
     );
 
-    /// RULINGS AK4 / C1 1.6: marks 다른 수리로 대체됨 every repair of THIS lane (one writer per record —
+    /// RULINGS AK4 / AW9 / C1 1.6 — scope: only the ORIGIN lane's (this daemon's) older in-force
+    /// records are superseded here; another lane's rows of those repairs close through their own
+    /// probation binding. Marks 다른 수리로 대체됨 every repair of THIS lane (one writer per record —
     /// B1) that is older than `newer` (lower number), in force (시험 기간 / 사용 중) and shares one of
     /// its targets. Each is re-read under its own mutex (taken while `newer`'s is held — always from
     /// the higher number to the lower, so no two commits wait on each other). Returns their ids.
@@ -2931,16 +3075,28 @@ const RULE_DOC_NAMES: [&str; 5] = [
     "route_contract.md",
 ];
 
-/// RULINGS AD6 / C10: whether a pack-relative target is a rule document — its base name, lower-cased,
-/// is one of C10's names or `<x>_directive.md` (the same classification as [`named_rule_docs`]).
-pub(crate) fn is_rule_document(rel: &str) -> bool {
-    let base = rel
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(rel)
-        .to_ascii_lowercase();
-    RULE_DOC_NAMES.contains(&base.as_str())
-        || (base.ends_with("_directive.md") && base.len() > "_directive.md".len())
+/// RULINGS AD6 / BJ3: the rule-document name a target's base name folds to (full case folding —
+/// `cys::repair::types::fold_name`, the same helper as the key-file rule), or `None`.
+pub(crate) fn rule_document_name(rel: &str) -> Option<String> {
+    let base = rel.rsplit(['/', '\\']).next().unwrap_or(rel);
+    let folded = cys::repair::types::fold_name(base);
+    let is_doc = RULE_DOC_NAMES.contains(&folded.as_str())
+        || (folded.ends_with("_directive.md") && folded.len() > "_directive.md".len());
+    is_doc.then_some(folded)
+}
+
+/// RULINGS BJ3: the on-disk spelling of the file `rel` names in `pack` — the entry of its folder
+/// whose name folds to the same name as `rel`'s base name — or `None` when there is none.
+pub(crate) fn real_name_in(pack: &Path, rel: &str) -> Option<String> {
+    let base = rel.rsplit(['/', '\\']).next().unwrap_or(rel);
+    let folded = cys::repair::types::fold_name(base);
+    let dir = pack.join(rel);
+    let dir = dir.parent()?;
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .find(|n| cys::repair::types::fold_name(n) == folded)
 }
 
 /// RULINGS AK6: a path part that Windows resolves to another name — one ending in a dot or a space
@@ -3013,6 +3169,7 @@ pub(crate) fn release_locks_for_seat(daemon: &Arc<Daemon>, sid: u64) {
         classify: &classify,
         check: &check,
         hook_step: &cys::repair::apply::hook_lines_step,
+        claim: &cys::repair::grant::try_claim_autonomous_start,
     };
     ledger_verbs::release_seat(&ctx, sid);
 }
