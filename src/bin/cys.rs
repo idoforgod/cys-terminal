@@ -28532,6 +28532,19 @@ fn rollback_guarded_restored(rel: &str, source: &str, parked: Option<&ParkedFact
     }
 }
 
+/// 스냅샷 보관본이 기록(해시 · 링크 대상)과 다를 때 거부 문장의 끝 줄. ★T2g(RULINGS CL2): 기동 필수·보호 목록 파일(또는
+/// vendor-first 기록 파일)이면 `--force-vendor` 를 권하지 않는다 — 이 파일에는 강행이 없다(RULINGS BO2 (b)). 윈도우에서는
+/// 스냅샷이 링크를 보관하지 못해(링크를 만들지 않는다) 링크 항목이 언제나 이 갈래로 온다.
+fn snapshot_mismatch_how(system: bool, guarded: bool) -> &'static str {
+    if guarded {
+        "기동 필수·보호 목록 파일은 기록과 다른 보관본을 쓰지 않습니다(강행 없음 — 검증된 되돌리기)."
+    } else if system {
+        "system 파일은 기록과 다른 보관본을 쓰지 않습니다(--force-vendor 로도 불가 — 검증된 되돌리기)."
+    } else {
+        "강행하려면 --force-vendor 를 명시하십시오."
+    }
+}
+
 /// ★T2g(RULINGS CL1 (c)): 목록(파일을 고르기 전)이 미리 밝히는 표시 — 등재 파일(또는 vendor-first 기록 파일)의 줄 끝.
 fn rollback_list_note(rel: &str, copy: &GuardedCopy, vendor_first: bool) -> String {
     match (copy, vendor_first) {
@@ -28884,11 +28897,7 @@ fn run_pack_rollback_with(
                 }
             }
             Err(e) => {
-                let how = if own == "system" {
-                    "system 파일은 기록과 다른 보관본을 쓰지 않습니다(--force-vendor 로도 불가 — 검증된 되돌리기)."
-                } else {
-                    "강행하려면 --force-vendor 를 명시하십시오."
-                };
+                let how = snapshot_mismatch_how(own == "system", guarded);
                 eprintln!("⛔ 거부: 스냅샷 보관본이 기록과 다릅니다 — 복원하지 않았습니다.\n\x20  {e}\n\x20  {how}");
                 return 1;
             }
@@ -42991,6 +43000,16 @@ mod tests {
         );
         assert_eq!(rollback_list_note(rel, &GuardedCopy::NotReleased, false), " — 출시본 아님(되돌리기 불가)");
         assert_eq!(
+            snapshot_mismatch_how(false, true),
+            "기동 필수·보호 목록 파일은 기록과 다른 보관본을 쓰지 않습니다(강행 없음 — 검증된 되돌리기)."
+        );
+        assert_eq!(snapshot_mismatch_how(true, true), snapshot_mismatch_how(false, true), "등재 파일이면 소유와 무관");
+        assert_eq!(
+            snapshot_mismatch_how(true, false),
+            "system 파일은 기록과 다른 보관본을 쓰지 않습니다(--force-vendor 로도 불가 — 검증된 되돌리기)."
+        );
+        assert_eq!(snapshot_mismatch_how(false, false), "강행하려면 --force-vendor 를 명시하십시오.");
+        assert_eq!(
             rollback_mixed_warning(&["hooks/a.sh".to_string(), "hooks/b.sh".to_string()], "0.14.56", "이 스냅샷"),
             format!(
                 "⚠ 되돌리지 않는 기동 필수·보호 목록 파일 2건: hooks/a.sh, hooks/b.sh — 업데이트가 이 파일들의 출시본을 먼저 살리고 \
@@ -43095,6 +43114,7 @@ mod tests {
         }
         texts.push(rollback_guarded_restored(rel, src, None, true));
         texts.push(rollback_parked_refusal(rel, src, &present));
+        texts.push(snapshot_mismatch_how(false, true).to_string());
         for t in &texts {
             for refused in ["pack-adopt", "--revert-merge", "--ai", "--force-vendor"] {
                 assert!(!t.contains(refused), "{refused} in: {t}");
