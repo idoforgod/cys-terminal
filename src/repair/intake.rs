@@ -66,6 +66,9 @@ pub fn normalize_rel(raw: &str) -> Result<String, RepairError> {
         match c {
             "" | "." => continue,
             ".." => return Err(bad("..")),
+            // RULINGS AW3 (a): a Windows short name (`ROLE-C~1.SH`, `JAVIS_~1.PY`) is another
+            // spelling of a long name — refused on every system (a string rule).
+            other if is_short_name_component(other) => return Err(bad("윈도우 짧은 이름(~숫자)")),
             other => parts.push(other),
         }
     }
@@ -73,6 +76,13 @@ pub fn normalize_rel(raw: &str) -> Result<String, RepairError> {
         return Err(bad("비어 있음"));
     }
     Ok(parts.join("/"))
+}
+
+/// RULINGS AW3 (a): a path component in the Windows 8.3 short-name form — a `~` directly followed
+/// by an ASCII digit anywhere in the component.
+pub fn is_short_name_component(c: &str) -> bool {
+    let b = c.as_bytes();
+    b.windows(2).any(|w| w[0] == b'~' && w[1].is_ascii_digit())
 }
 
 /// The first non-empty line of an error text with its volatile parts masked, so the same defect
@@ -442,6 +452,25 @@ mod tests {
             assert!(normalize_rel(bad).is_err(), "{bad:?} accepted");
         }
         assert!(normalize_rel(&"a".repeat(MAX_REL_BYTES + 1)).is_err());
+    }
+
+    /// RULINGS AW3 (a): Windows short names are refused on every system; a `~` that is not followed
+    /// by a digit stays allowed.
+    #[test]
+    fn short_name_components_refused() {
+        for bad in [
+            "hooks/ROLE-C~1.SH",
+            "bin/JAVIS_~1.PY",
+            "HOOKS~2/guard.sh",
+            "bin\\JAVIS_~12.PY",
+            "a/b/c~9",
+        ] {
+            let e = normalize_rel(bad).unwrap_err();
+            assert!(format!("{e:?}").contains("짧은 이름"), "{bad:?}: {e:?}");
+        }
+        for ok in ["bin/a~b.py", "notes/~draft.md", "bin/x~", "bin/~.py"] {
+            assert!(normalize_rel(ok).is_ok(), "{ok:?} refused");
+        }
     }
 
     /// The same defect gives the same signature whatever pid, temp path, time or address it printed;
