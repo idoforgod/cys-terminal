@@ -991,6 +991,52 @@ jobs:
           if [ "$TRIPLE" = "$HOST_TRIPLE" ]; then SRC="target/release/bundle"; else SRC="target/$TRIPLE/release/bundle"; fi
           bash scripts/check-no-ioreport-link.sh "$SRC/macos/cys.app/Contents/MacOS/cysd"
 
+      # ★(0.15.0 · T11 · RULINGS BQ1(b)(2) · 오너 지시 추가 11) 번들 아키텍처 게이트 — 업로드 **전** · IOReport 게이트 옆.
+      #   무엇을 막는가: 인텔(x86_64) 레그는 arm64 러너의 **크로스 빌드**이고 동봉 runtime(python·node·git·uv)은
+      #   타깃별로 내려받는다 — 그런데 출하되는 Mach-O 의 아키텍처를 보는 장치가 0개였다. 인텔용 설치 파일에
+      #   M칩 전용 python 이 실려도 서명·공증·업로드까지 아무것도 붉어지지 않는 구조다.
+      #   scripts/check_macho_arch.py 가 Mach-O·fat 헤더 바이트를 읽어(lipo·실행 없음) 타깃이 없는 파일을 **이름으로**
+      #   붉힌다 — 대상 셋: ① 레그가 만든 cys.app ② 올라갈 업데이터 아카이브(cys.app.tar.gz) ③ DMG 안의 두 앱
+      #   (.support/cys.app · Install cys.app · 읽기 전용 마운트). 진입점의 최소 macOS 와 LSMinimumSystemVersion 도
+      #   찍는다(BQ1(e) 보고용 · 실패 사유 아님). 요약은 GITHUB_STEP_SUMMARY 로 승격 — BQ2(발행 증적에 두 레그 출력 인용).
+      #   바로 앞 스텝이 게이트의 합성 헤더 대조군을 돌린다(게이트 신뢰 직전 · test_release_postprocess_gate 와 같은 규율).
+      - name: 번들 아키텍처 게이트 대조군 (test_check_macho_arch · 게이트 신뢰 직전)
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          f="scripts/tests/test_check_macho_arch.py"
+          [ -f "$f" ] || { echo "::error::게이트 대조군 누락: $f (git add 누락 의심)" >&2; exit 1; }
+          python3 "$f"
+
+      - name: 번들 아키텍처 게이트 (Mach-O 헤더 · 앱 · 업데이터 아카이브 · DMG 안 두 앱 · macOS 전용 · 업로드 전)
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TRIPLE="${{ matrix.target }}"
+          VERSION="$(grep -m1 '"version"' src-tauri/tauri.conf.json | sed -E 's/.*"([0-9][0-9.]*)".*/\1/')"
+          case "$TRIPLE" in aarch64-apple-darwin) ARCH=aarch64 ;; x86_64-apple-darwin) ARCH=x64 ;; *) echo "::error::unexpected target $TRIPLE"; exit 1 ;; esac
+          HOST_TRIPLE="$([ "$(uname -m)" = "arm64" ] && echo aarch64-apple-darwin || echo x86_64-apple-darwin)"
+          if [ "$TRIPLE" = "$HOST_TRIPLE" ]; then SRC="target/release/bundle"; else SRC="target/$TRIPLE/release/bundle"; fi
+          DST="target/$TRIPLE/release/bundle"
+          DMG="$DST/dmg/cys_${VERSION}_${ARCH}.dmg"
+          GLOG="$(mktemp)"; rc=0
+          gate() { python3 scripts/check_macho_arch.py --target "$TRIPLE" "$@" 2>&1 | tee -a "$GLOG" || { r=$?; [ "$r" -gt "$rc" ] && rc=$r; true; }; }
+          gate "$SRC/macos/cys.app"
+          gate "$DST/macos/cys.app.tar.gz"
+          MNT="$(mktemp -d)"
+          trap 'hdiutil detach "$MNT" -force >/dev/null 2>&1 || true' EXIT
+          hdiutil attach -readonly -nobrowse -noautoopen -mountpoint "$MNT" "$DMG" >/dev/null
+          gate "$MNT/.support/cys.app" "$MNT/Install cys.app"
+          {
+            echo "### 번들 아키텍처 게이트 — ${TRIPLE} (BQ2 증적)"
+            grep -E '^(== |  Mach-O files|  Info.plist|  WARN|FAIL|CANNOT JUDGE|RESULT)' "$GLOG" || echo '(게이트 출력 없음)'
+            grep -E 'python/bin/python3 ' "$GLOG" || true
+            echo "- exit=$rc (0=PASS · 1=FAIL · 2=판정 불가 — 통과 아님)"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+
       # ★macOS 격리 속성 + Gatekeeper 실평가 게이트 — 업로드 **전** (2026-08-13 신설).
       #   위 스텝이 서명·공증·staple 을 끝냈다. 그러나 그 산출물이 **실사용자 환경**에서 열리는지는
       #   아직 측정되지 않았다: 사용자는 브라우저로 받고, 그때 파일에 `com.apple.quarantine` 이 붙으며,

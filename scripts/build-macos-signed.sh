@@ -93,7 +93,22 @@ fi
 # .prep-target 마커로 현재 런타임 아키텍처를 추적한다(없으면 안전측 재준비).
 RT_MARKER="src-tauri/runtime/.prep-target"
 RT_CUR="$(cat "$RT_MARKER" 2>/dev/null || echo '')"
-if [ ! -x "src-tauri/runtime/python/bin/python3" ] || [ "$RT_CUR" != "$TARGET" ]; then
+# ★아키텍처 게이트(0.15.0 · T11 · RULINGS BQ1(b)(c)): scripts/check_macho_arch.py 가 Mach-O 헤더 바이트로
+#   타깃 아키텍처를 확인한다(lipo 불요 · 실행 없음). 실행 python 은 번들 밖 python(아래 runtime-manifest 의
+#   SEAL_PY 와 같은 이유 — 조립 중인 .app 안 바이너리는 exec 하지 않는다).
+GATE_PY="/usr/bin/python3"; [ -x "$GATE_PY" ] || GATE_PY="$(command -v python3)"
+# 마커만 믿지 않는다: 트리의 **실제** 아키텍처가 타깃이 아니면(마커와 내용이 갈린 트리 · 손으로 바꾼 트리)
+# 마커가 무엇이라 하든 재준비한다.
+RT_ARCH_OK=0
+if [ -x "src-tauri/runtime/python/bin/python3" ] && "$GATE_PY" scripts/check_macho_arch.py --target "$TARGET" --quiet \
+     --require python/bin/python3 --require node/bin/node --require git/bin/git --require uv/uv \
+     src-tauri/runtime >/dev/null 2>&1; then
+  RT_ARCH_OK=1
+fi
+if [ ! -x "src-tauri/runtime/python/bin/python3" ] || [ "$RT_CUR" != "$TARGET" ] || [ "$RT_ARCH_OK" != 1 ]; then
+  if [ "$RT_ARCH_OK" != 1 ] && [ "$RT_CUR" = "$TARGET" ]; then
+    echo "  ⚠ runtime 트리의 실제 아키텍처가 $TARGET 이 아니다(.prep-target=$RT_CUR 와 불일치) — 재준비"
+  fi
   echo "== 동봉 런타임 준비($TARGET) =="
   bash scripts/prep-mac-runtime.sh "$TARGET"
   printf '%s' "$TARGET" > "$RT_MARKER"
@@ -147,6 +162,12 @@ env -u APPLE_ID -u APPLE_PASSWORD -u APPLE_TEAM_ID -u APPLE_API_KEY -u APPLE_API
 
 APP="$BUNDLE_BASE/macos/cys.app"
 DMG="$BUNDLE_BASE/dmg/cys_${VERSION}_${DMG_ARCH}.dmg"
+
+# ── 번들 아키텍처 게이트 (T11 · BQ1(b)(1)) — 재봉인·공증 **전** ──
+# 사이드카(cys·cysd)·메인 바이너리·동봉 runtime 의 **모든** Mach-O 가 $TARGET 을 담는지 본다. 하나라도
+# 다른 아키텍처면 파일 이름을 대고 멈춘다(인텔용에 M칩 전용 python 이 실리는 경로 차단).
+echo "== 번들 아키텍처 게이트: $APP ($TARGET) =="
+"$GATE_PY" scripts/check_macho_arch.py --target "$TARGET" "$APP"
 
 # ── SEAL-2 반입 확인: 선컴파일 산출물이 실제로 .app 안에 실렸는가 (fail-closed) ──
 # Tauri 번들러가 `__pycache__` 를 빠뜨리면 선컴파일을 해도 봉인엔 안 들어가고, 사용자 머신에서
@@ -270,6 +291,7 @@ rm -f "$APPZIP"
 if [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
   echo "== 업데이터 tar.gz 재생성(dedup 반영) + 재서명 =="
   ( cd "$(dirname "$APP")" && tar czf cys.app.tar.gz cys.app )
+  "$GATE_PY" scripts/check_macho_arch.py --target "$TARGET" --quiet "$APP.tar.gz"   # T11 · 올리는 바이트 그대로
   bun x "@tauri-apps/cli@${TAURI_CLI_VERSION}" signer sign --private-key "$TAURI_SIGNING_PRIVATE_KEY" --password "" "$APP.tar.gz"
 fi
 
@@ -328,6 +350,8 @@ DMGSTAGE="$(mktemp -d)"
 mkdir -p "$DMGSTAGE/.support"
 ditto "$APP"           "$DMGSTAGE/.support/cys.app"   # 원본 앱(숨김) — staple 티켓 승계(ditto)
 ditto "$INSTALLER_APP" "$DMGSTAGE/Install cys.app"    # 가시 항목 = 설치 도우미
+# T11 · BQ1(b)(1): DMG 에 실리는 두 앱(.support/cys.app · Install cys.app)을 hdiutil 전에 다시 본다.
+"$GATE_PY" scripts/check_macho_arch.py --target "$TARGET" "$DMGSTAGE"
 rm -rf "$INSTALLER_WORK"
 mkdir -p "$(dirname "$DMG")"
 hdiutil create -volname "cys" -srcfolder "$DMGSTAGE" -ov -format UDZO "$DMG"
