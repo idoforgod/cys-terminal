@@ -627,6 +627,848 @@ fn keep_best(map: &mut HashMap<(String, String), (f64, RateMeta)>, key: (String,
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// ★(0.15.0 · 「스스로 해결」 M4 · 설계 §4-4 · §6-4 (1)(4)(7) · RULINGS AD8 · track T3b) 결함 감지기
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The repeated-failure detection above (`evaluate` §3) judges per TOOL ("Bash 반복 실패") — useless for a
+// repair, which needs to know WHICH hook / script failed and how. This section adds that identity and turns a
+// repeated failure into ONE defect-intake row per signature (`repairs/intake/<lane_key>/<sig>.json`, T3's row
+// format and T3's `intake::signature` — O-C1-9), with the same thresholds (`AlertConfig` fail_count /
+// fail_rate / fail_min_calls) applied per identity.
+// The module's doctrine holds: ★자동응답 금지 — 감지·격상만. Escalation here is a ledger row (DATA, never
+// authority); nothing in this section queues, pushes, publishes, alerts or starts anything. The master hears
+// at most one line per report-gate run, built by the gate from the ledger (T3, RULINGS AD5).
+// Where the identity comes from: the observation event `cys-hook.sh` already sends (`usage.event`) carries the
+// tool call's whole `tool_input` — for a shell call, the command that ran the pack hook / script. Nothing is
+// added to any hook (`_lib.sh` frame, appendix A 1-26 / 1-28).
+// Three places, three costs:
+//   ① `observe_tool_event` — on the hook's request path: MEMORY ONLY (no disk, no spawn, no lock but its own
+//      leaf mutexes) — the `hook.decide` arm's rule "핫패스 금지: 스폰 · 외부 조회 · fsync·디스크 쓰기".
+//   ② `flush_defect_intake` — on its own thread (`cysd-defect-intake`, 10 s): the row writes, under T3's
+//      per-file mutex (`intake:<sig>`, one writer per file) and the intake's OWN quota
+//      (`alert_route::IntakeShare` — never the general share, the clear reserve or the CSO queue).
+//      Never on the watchdog tick: a disk that stops answering must not stall seat-death detection (F3/F4).
+//   ③ the exclusion list (`cys::repair::intake::EXCLUSIONS` + this detector's `DETECTOR_EXCLUSIONS`) —
+//      failures that happen BY DESIGN never count.
+
+/// Rollback switch of the detector (default on; `0`/`false`/`off`/`no` → off), read once per process.
+pub const DEFECT_INTAKE_ENV: &str = "CYS_DEFECT_INTAKE";
+/// Pack scripts tracked per daemon (beyond → counted in `over_bound`, not kept).
+pub const DETECTOR_MAX_RELS: usize = 1024;
+/// Signatures tracked per daemon (beyond, an already-written signature with nothing pending is evicted;
+/// else the failure is counted in `over_bound`, not kept).
+pub const DETECTOR_MAX_SIGNATURES: usize = 512;
+/// How much of a command line is scanned for the identity.
+pub const COMMAND_SCAN_MAX_BYTES: usize = 64 * 1024;
+/// The reporter label of rows the detector writes.
+pub const DETECTOR_REPORTER: &str = "detector";
+/// The flusher thread's period (seconds).
+pub const FLUSH_TICK_SECS: u64 = 10;
+// "발견 즉시" (D:37): a row appears within one flusher period of the rule being met — keep it short.
+const _: () = assert!(FLUSH_TICK_SECS > 0 && FLUSH_TICK_SECS <= 30);
+
+/// The detector's own entries of the exclusion list (scope `Detector`): verdict tools whose non-zero
+/// exit IS their designed answer — matched only with the observed call's subcommand / exit code and
+/// never when the text carries a Python traceback (`intake::ExclusionRule::DesignedAnswer`). A start
+/// that polls `orchestra check` until READY would otherwise file "a defect" at every boot ("점검 도구의
+/// 실패 항목은 모든 좌석의 창 열기마다 다시 나오므로", D:658). Every exit set is the tool's own named
+/// constant (file:line beside it); usage errors, internal errors and crashes stay defects.
+pub const DETECTOR_EXCLUSIONS: &[cys::repair::intake::Exclusion] = {
+    use cys::repair::intake::{Exclusion, ExclusionRule, ExclusionScope};
+    &[
+        // javis_resource_gate.py:90 EXIT_SOFT 1 / EXIT_HARD 2 (usage 64, internal 70 stay defects)
+        Exclusion {
+            reason: "designed-answer:javis_resource_gate.check",
+            windows_only: false,
+            scope: ExclusionScope::Detector,
+            rule: ExclusionRule::DesignedAnswer { rel: "bin/javis_resource_gate.py", sub: Some("check"), exits: &[1, 2] },
+        },
+        // javis_orchestra.py:794–798 CHECK_EXIT_MISSING 1 / UNJUDGEABLE 2 / ACK_PENDING 12
+        Exclusion {
+            reason: "designed-answer:javis_orchestra.check",
+            windows_only: false,
+            scope: ExclusionScope::Detector,
+            rule: ExclusionRule::DesignedAnswer { rel: "bin/javis_orchestra.py", sub: Some("check"), exits: &[1, 2, 12] },
+        },
+        // javis_task.py:284–286 NOTFOUND 3 / BLOCKED 4 / NO_EVIDENCE 5 / VERIFY 6 / DUP 8 / CONFLICT 9 (usage 2 stays a defect)
+        Exclusion {
+            reason: "designed-answer:javis_task",
+            windows_only: false,
+            scope: ExclusionScope::Detector,
+            rule: ExclusionRule::DesignedAnswer { rel: "bin/javis_task.py", sub: None, exits: &[3, 4, 5, 6, 8, 9] },
+        },
+        // javis_wakeup.py:71,75 EXIT_EMPTY 5 / EXIT_PAUSED 4 (usage 2, park failure 6 stay defects)
+        Exclusion {
+            reason: "designed-answer:javis_wakeup",
+            windows_only: false,
+            scope: ExclusionScope::Detector,
+            rule: ExclusionRule::DesignedAnswer { rel: "bin/javis_wakeup.py", sub: None, exits: &[4, 5] },
+        },
+    ]
+};
+
+/// The detector's exclusion lookup: the list's shared table first (`intake::EXCLUSIONS` — T3's
+/// Windows `cys-dept` entry), then the detector's own entries. Returns the reason.
+pub fn detector_excluded(rel: &str, sub: Option<&str>, error: &str, windows: bool) -> Option<&'static str> {
+    use cys::repair::intake::{excluded_in, EXCLUSIONS};
+    excluded_in(EXCLUSIONS, rel, sub, error, windows).or_else(|| excluded_in(DETECTOR_EXCLUSIONS, rel, sub, error, windows))
+}
+
+/// One `usage.event` as the detector sees it (built by the `usage.event` arm from its params).
+#[derive(Clone, Copy, Debug)]
+pub struct ToolObservation<'a> {
+    /// `PRE_TOOL` | `POST_TOOL` | … (the CLI's mapping).
+    pub event_type: &'a str,
+    /// The raw hook event name (`PreToolUse`, `PostToolUse`, `PostToolUseFailure` …).
+    pub raw_event: &'a str,
+    pub tool_input: &'a Value,
+    pub exit_code: Option<i64>,
+    /// The failure text, when the event carries one (Claude Code's `PostToolUseFailure` `error`).
+    pub error: Option<&'a str>,
+    /// The failure reached Claude Code as an abort (`is_interrupt`) — not a defect.
+    pub interrupted: bool,
+}
+
+/// The pack hook / script a shell call ran.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PackCall {
+    /// No pack script in the command.
+    None,
+    /// Exactly one pack script: its lane-independent pack-relative path and its first argument.
+    One { rel: String, sub: Option<String> },
+    /// Two or more DIFFERENT pack scripts — which one failed is unknown (no misattribution).
+    Ambiguous,
+}
+
+/// The command string of a shell call (`tool_input.command`, a string or a list of strings).
+fn shell_command(tool_input: &Value) -> Option<String> {
+    match tool_input.get("command")? {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(a) => {
+            let parts: Vec<&str> = a.iter().filter_map(|x| x.as_str()).collect();
+            (!parts.is_empty()).then(|| parts.join(" "))
+        }
+        _ => None,
+    }
+}
+
+fn cut_at_char_boundary(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut i = max;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    &s[..i]
+}
+
+/// A pack-relative path that names a hook / script (not a document, a glob or a directory).
+fn is_script_rel(rel: &str) -> bool {
+    if rel.contains(['*', '?', '[']) {
+        return false;
+    }
+    let last = rel.rsplit('/').next().unwrap_or(rel);
+    if last.is_empty() {
+        return false;
+    }
+    match last.rsplit_once('.') {
+        Some((stem, ext)) => {
+            !stem.is_empty() && matches!(ext, "py" | "sh" | "bash" | "js" | "mjs" | "cjs" | "ps1")
+        }
+        None => rel.starts_with("bin/") && rel.len() > "bin/".len(),
+    }
+}
+
+/// `NAME=value` before a command (`FOO=1 cys-dept …`).
+fn is_env_assignment(w: &str) -> bool {
+    match w.split_once('=') {
+        Some((name, _)) => {
+            name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        None => false,
+    }
+}
+
+fn is_path_delim(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '\'' | '"' | '`' | ';' | '|' | '&' | '(' | ')' | '<' | '>' | '$' | '{' | '}' | ',')
+}
+
+/// The path token starting at `s[at..]` and the first argument after it.
+fn token_and_sub(s: &str, at: usize) -> (String, Option<String>) {
+    let rest = &s[at..];
+    let end = rest.find(is_path_delim).unwrap_or(rest.len());
+    let token = rest[..end].to_string();
+    let after = rest[end..].trim_start_matches(['\'', '"']).trim_start();
+    let word: String = after
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
+        .collect();
+    let sub = (!word.is_empty() && !word.starts_with('-')).then_some(word);
+    (token, sub)
+}
+
+/// The identity of a shell call: the ONE pack hook / script it ran (design §6-4 (1)). Recognised spellings
+/// of the pack root: `…/.cys/pack/`, `…/.cys/pack-dept-<name>/` (a department's pack), `$CYS_PACK_DIR/`,
+/// `${CYS_PACK_DIR}/`, `${CYS_PACK_DIR:-…}/`, the daemon's own pack dir (`pack_dir`), and `cys-dept` at a
+/// command position (`bin/cys-dept`). Windows `\` is read as `/`. The rel is lane-independent (O-C1-9) and
+/// passes T3's `intake::normalize_rel` (no `..`, not absolute).
+pub fn pack_call(tool_input: &Value, pack_dir: Option<&str>) -> PackCall {
+    let Some(cmd) = shell_command(tool_input) else {
+        return PackCall::None;
+    };
+    let s = cut_at_char_boundary(&cmd, COMMAND_SCAN_MAX_BYTES).replace('\\', "/");
+    let own = pack_dir
+        .map(|p| p.replace('\\', "/").trim_end_matches('/').to_string())
+        .filter(|p| p.len() > 1)
+        .map(|p| format!("{p}/"));
+    let mut found: Vec<(String, Option<String>)> = Vec::new();
+    let mut push = |rel: String, sub: Option<String>| {
+        if let Ok(rel) = cys::repair::intake::normalize_rel(&rel) {
+            if is_script_rel(&rel) && !found.iter().any(|(r, _)| *r == rel) {
+                found.push((rel, sub));
+            }
+        }
+    };
+    let mut i = 0;
+    while i < s.len() {
+        if !s.is_char_boundary(i) {
+            i += 1;
+            continue;
+        }
+        let rest = &s[i..];
+        // the start of the rel inside `s`, when a pack-root spelling starts at i
+        let start: Option<usize> = if rest.starts_with(".cys/pack/") {
+            Some(i + ".cys/pack/".len())
+        } else if let Some(r) = rest.strip_prefix(".cys/pack-dept-") {
+            let name = r
+                .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))
+                .unwrap_or(r.len());
+            (name > 0 && r[name..].starts_with('/')).then(|| i + ".cys/pack-dept-".len() + name + 1)
+        } else if rest.starts_with("$CYS_PACK_DIR/") {
+            Some(i + "$CYS_PACK_DIR/".len())
+        } else if rest.starts_with("${CYS_PACK_DIR}") || rest.starts_with("${CYS_PACK_DIR:") {
+            // the matching `}` (the default may hold `${HOME}`), then `/`
+            let mut depth = 0usize;
+            let mut close = None;
+            for (k, c) in rest.char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            close = Some(k);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            close
+                .filter(|k| rest[k + 1..].starts_with('/'))
+                .map(|k| i + k + 2)
+        } else {
+            own.as_deref()
+                .filter(|o| rest.starts_with(*o))
+                .map(|o| i + o.len())
+        };
+        if let Some(at) = start {
+            let (rel, sub) = token_and_sub(&s, at);
+            let consumed = rel.len();
+            push(rel, sub);
+            i = at + consumed.max(1);
+            continue;
+        }
+        i += 1;
+    }
+    // `cys-dept` at a command position (the pack's `bin/cys-dept`, reached through PATH)
+    for seg in s.split([';', '|', '&', '(', ')', '\n']) {
+        let mut words = seg.split_whitespace().skip_while(|w| {
+            is_env_assignment(w)
+                || matches!(*w, "sudo" | "exec" | "command" | "env" | "time" | "nohup" | "!" | "then" | "do" | "else")
+        });
+        if let Some(w) = words.next() {
+            let w = w.trim_matches(['\'', '"']);
+            if w == "cys-dept" || w.ends_with("/.local/bin/cys-dept") {
+                let sub = words
+                    .next()
+                    .map(|x| x.trim_matches(['\'', '"']).to_string())
+                    .filter(|x| !x.is_empty() && !x.starts_with('-'));
+                push("bin/cys-dept".to_string(), sub);
+            }
+        }
+    }
+    match found.len() {
+        0 => PackCall::None,
+        1 => {
+            let (rel, sub) = found.remove(0);
+            PackCall::One { rel, sub }
+        }
+        _ => PackCall::Ambiguous,
+    }
+}
+
+/// The text a detector signature is computed from (then T3's `intake::parse_report`, unchanged):
+/// a leading `Exit code N` line (Claude Code's shell-failure wrapper) is dropped when more text follows;
+/// a Python traceback gives its exception line (the last unindented line after the last
+/// `Traceback (most recent call last):`) — otherwise every crash of one script would share the line
+/// "Traceback (most recent call last):".
+pub fn detector_error_text(raw: &str) -> String {
+    let cut = cut_at_char_boundary(raw, cys::repair::intake::MAX_ERROR_BYTES);
+    let lines: Vec<&str> = cut.lines().collect();
+    let Some(first) = lines.iter().position(|l| !l.trim().is_empty()) else {
+        return cut.trim().to_string();
+    };
+    let mut start = first;
+    if cys::repair::intake::leading_exit_code(lines[first]).is_some()
+        && lines[first + 1..].iter().any(|l| !l.trim().is_empty())
+    {
+        start = first + 1;
+    }
+    let rest = &lines[start..];
+    if let Some(j) = rest
+        .iter()
+        .rposition(|l| l.trim_start().starts_with("Traceback (most recent call last)"))
+    {
+        if let Some(exc) = rest[j + 1..]
+            .iter()
+            .rev()
+            .find(|l| !l.trim().is_empty() && !l.starts_with(char::is_whitespace))
+        {
+            return exc.trim().to_string();
+        }
+    }
+    rest.join("\n").trim().to_string()
+}
+
+#[derive(Clone, Debug, Default)]
+struct RelStats {
+    calls: u64,
+    fails: u64,
+}
+
+#[derive(Clone, Debug)]
+struct SigStats {
+    report: cys::repair::intake::Report,
+    /// Failures seen and not yet in the row.
+    unflushed: u64,
+    first_seen: f64,
+    last_seen: f64,
+    /// A row of this signature was written by this daemon incarnation.
+    written: bool,
+}
+
+/// The detector's counters (memory only).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DetectorCounters {
+    pub calls: u64,
+    pub failures: u64,
+    pub failures_without_identity: u64,
+    pub ambiguous: u64,
+    pub no_error_text: u64,
+    pub excluded: u64,
+    pub excluded_by_reason: std::collections::BTreeMap<&'static str, u64>,
+    pub over_bound: u64,
+    pub rows_new: u64,
+    pub rows_updated: u64,
+    pub corrupt_rows: u64,
+    pub write_failed: u64,
+}
+
+/// The detector's state for one lane daemon (memory only — a restart starts it again, §9).
+#[derive(Debug, Default)]
+pub struct Detector {
+    rels: HashMap<String, RelStats>,
+    sigs: HashMap<String, SigStats>,
+    pub counters: DetectorCounters,
+}
+
+/// What one observation did (for the tests and the counters).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Observed {
+    /// Not a call / failure of a pack script.
+    Ignored,
+    Call,
+    /// A failure with a signature, counted for its row.
+    Failure,
+    /// Counted toward the script's failure rate, but no text → no signature (O-C1-9) → no row.
+    NoErrorText,
+    /// On the exclusion list (the reason is counted in `DetectorCounters::excluded_by_reason`).
+    Excluded,
+    Ambiguous,
+    OverBound,
+}
+
+fn is_failure(o: &ToolObservation<'_>) -> bool {
+    !o.interrupted
+        && (o.raw_event == "PostToolUseFailure"
+            || o.event_type == "PostToolUseFailure"
+            || (o.event_type == "POST_TOOL" && o.exit_code.is_some_and(|c| c != 0)))
+}
+
+impl Detector {
+    fn bump_rel(&mut self, rel: &str, f: impl FnOnce(&mut RelStats)) -> bool {
+        if let Some(r) = self.rels.get_mut(rel) {
+            f(r);
+            return true;
+        }
+        if self.rels.len() >= DETECTOR_MAX_RELS {
+            return false;
+        }
+        let mut r = RelStats::default();
+        f(&mut r);
+        self.rels.insert(rel.to_string(), r);
+        true
+    }
+
+    /// Room for one more signature: evict the oldest signature that is written and has nothing pending.
+    fn make_room(&mut self) -> bool {
+        if self.sigs.len() < DETECTOR_MAX_SIGNATURES {
+            return true;
+        }
+        let victim = self
+            .sigs
+            .iter()
+            .filter(|(_, s)| s.written && s.unflushed == 0)
+            .min_by(|a, b| a.1.last_seen.total_cmp(&b.1.last_seen).then_with(|| a.0.cmp(b.0)))
+            .map(|(k, _)| k.clone());
+        match victim {
+            Some(k) => {
+                self.sigs.remove(&k);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Tracked sizes (rels, signatures, signatures with a pending count).
+    pub fn tracked(&self) -> (usize, usize, usize) {
+        let pending = self.sigs.values().filter(|s| s.unflushed > 0).count();
+        (self.rels.len(), self.sigs.len(), pending)
+    }
+}
+
+/// One observation → memory (PURE: no disk, no spawn, no queue, no bus). A call = `PRE_TOOL` of a pack
+/// script; a failure = `PostToolUseFailure` or `POST_TOOL` with exit ≠ 0 (an abort is not a failure).
+/// The exclusion list is applied BEFORE anything is counted; a failure without text counts toward the
+/// script's rate but forms no signature.
+pub fn observe(det: &mut Detector, o: &ToolObservation<'_>, pack_dir: Option<&str>, now: f64, windows: bool) -> Observed {
+    let failure = is_failure(o);
+    let call = !failure && o.event_type == "PRE_TOOL";
+    if !failure && !call {
+        return Observed::Ignored;
+    }
+    let (rel, sub) = match pack_call(o.tool_input, pack_dir) {
+        PackCall::None => {
+            if failure {
+                det.counters.failures_without_identity += 1;
+            }
+            return Observed::Ignored;
+        }
+        PackCall::Ambiguous => {
+            if failure {
+                det.counters.ambiguous += 1;
+            }
+            return Observed::Ambiguous;
+        }
+        PackCall::One { rel, sub } => (rel, sub),
+    };
+    if call {
+        if !det.bump_rel(&rel, |r| r.calls += 1) {
+            det.counters.over_bound += 1;
+            return Observed::OverBound;
+        }
+        det.counters.calls += 1;
+        return Observed::Call;
+    }
+    det.counters.failures += 1;
+    let raw = o
+        .error
+        .map(|e| cut_at_char_boundary(e, cys::repair::intake::MAX_ERROR_BYTES))
+        .filter(|e| !e.trim().is_empty());
+    if let Some(reason) = detector_excluded(&rel, sub.as_deref(), raw.unwrap_or(""), windows) {
+        det.counters.excluded += 1;
+        *det.counters.excluded_by_reason.entry(reason).or_insert(0) += 1;
+        return Observed::Excluded;
+    }
+    if !det.bump_rel(&rel, |r| r.fails += 1) {
+        det.counters.over_bound += 1;
+        return Observed::OverBound;
+    }
+    let Some(raw) = raw else {
+        det.counters.no_error_text += 1;
+        return Observed::NoErrorText;
+    };
+    let Ok(report) = cys::repair::intake::parse_report(&rel, &detector_error_text(raw)) else {
+        det.counters.no_error_text += 1;
+        return Observed::NoErrorText;
+    };
+    let signature = report.signature.clone();
+    if let Some(s) = det.sigs.get_mut(&signature) {
+        s.unflushed = s.unflushed.saturating_add(1);
+        s.last_seen = now;
+        return Observed::Failure;
+    }
+    if !det.make_room() {
+        det.counters.over_bound += 1;
+        return Observed::OverBound;
+    }
+    det.sigs.insert(
+        signature.clone(),
+        SigStats {
+            report,
+            unflushed: 1,
+            first_seen: now,
+            last_seen: now,
+            written: false,
+        },
+    );
+    Observed::Failure
+}
+
+/// The repeated-failure rule of `evaluate` §3, per IDENTITY: failures ≥ `fail_count`, calls ≥
+/// `fail_min_calls`, failure rate ≥ `fail_rate` (calls = max(PRE_TOOL count, failures) — a failure
+/// whose PRE_TOOL was not seen still was a call).
+fn rel_meets(r: &RelStats, cfg: &AlertConfig) -> bool {
+    let calls = r.calls.max(r.fails);
+    r.fails >= cfg.fail_count
+        && calls >= cfg.fail_min_calls
+        && calls > 0
+        && (r.fails as f64 / calls as f64) >= cfg.fail_rate
+}
+
+/// One row write the flusher owes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DueRow {
+    pub signature: String,
+    pub report: cys::repair::intake::Report,
+    pub delta: u64,
+    pub first_seen: f64,
+    pub last_seen: f64,
+}
+
+/// The signatures whose script meets the rule (or that this incarnation already wrote) and that have
+/// a pending count — sorted by signature (determinism).
+pub fn due_signatures(det: &Detector, cfg: &AlertConfig) -> Vec<DueRow> {
+    let mut out: Vec<DueRow> = det
+        .sigs
+        .iter()
+        .filter(|(_, s)| s.unflushed > 0)
+        .filter(|(_, s)| s.written || det.rels.get(&s.report.rel).is_some_and(|r| rel_meets(r, cfg)))
+        .map(|(k, s)| DueRow {
+            signature: k.clone(),
+            report: s.report.clone(),
+            delta: s.unflushed,
+            first_seen: s.first_seen,
+            last_seen: s.last_seen,
+        })
+        .collect();
+    out.sort_by(|a, b| a.signature.cmp(&b.signature));
+    out
+}
+
+/// One daemon's detector + its own quota share.
+#[derive(Debug, Default)]
+pub struct DefectIntake {
+    pub det: Mutex<Detector>,
+    pub share: Mutex<crate::alert_route::IntakeShare>,
+    /// The daemon's pack dir (one more spelling of the pack root for the identity), read once.
+    pack_dir: Option<String>,
+    /// When the flusher last logged this lane's counters (`Now::mono`; throttled to one line per
+    /// [`crate::alert_route::INTAKE_ROW_COOLDOWN_SECS`]).
+    last_log_mono: Mutex<Option<f64>>,
+}
+
+type IntakeRegistry = Mutex<HashMap<std::path::PathBuf, (std::sync::Weak<Daemon>, Arc<DefectIntake>)>>;
+
+fn intake_registry() -> &'static IntakeRegistry {
+    static R: OnceLock<IntakeRegistry> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// This daemon's detector (one per daemon, keyed by its socket; a dead daemon's entry is dropped).
+pub fn intake_for(daemon: &Arc<Daemon>) -> Arc<DefectIntake> {
+    let mut g = intake_registry().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((w, d)) = g.get(&daemon.socket_path) {
+        if w.strong_count() > 0 && std::sync::Weak::ptr_eq(w, &Arc::downgrade(daemon)) {
+            return Arc::clone(d);
+        }
+    }
+    g.retain(|_, (w, _)| w.strong_count() > 0);
+    let d = Arc::new(DefectIntake {
+        pack_dir: production_pack_dir(),
+        ..DefectIntake::default()
+    });
+    g.insert(daemon.socket_path.clone(), (Arc::downgrade(daemon), Arc::clone(&d)));
+    d
+}
+
+#[cfg(not(test))]
+fn production_pack_dir() -> Option<String> {
+    Some(cys::pack::pack_dir().to_string_lossy().into_owned())
+}
+
+#[cfg(test)]
+fn production_pack_dir() -> Option<String> {
+    None // tests never resolve the real pack dir (they pass spellings to `pack_call` directly)
+}
+
+fn detector_enabled() -> bool {
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| crate::alert_route::enabled_from(std::env::var(DEFECT_INTAKE_ENV).ok().as_deref()))
+}
+
+/// ① The `usage.event` arm's call — MEMORY ONLY, never fails the request, never panics out.
+pub fn observe_tool_event(daemon: &Arc<Daemon>, o: &ToolObservation<'_>) {
+    if !detector_enabled() || o.tool_input.get("command").is_none() {
+        return;
+    }
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let intake = intake_for(daemon);
+        let now = crate::state::now_epoch();
+        let r = {
+            let mut d = intake.det.lock().unwrap_or_else(|e| e.into_inner());
+            observe(&mut d, o, intake.pack_dir.as_deref(), now, cfg!(windows))
+        };
+        if r == Observed::Failure {
+            ensure_flusher();
+        }
+    }));
+}
+
+/// What one flush did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FlushReport {
+    pub due: usize,
+    pub written_new: usize,
+    pub updated: usize,
+    pub held_cooldown: usize,
+    pub held_hourly: usize,
+    pub corrupt: usize,
+    pub failed: usize,
+}
+
+enum RowOutcome {
+    Written { new_row: bool },
+    Held(crate::alert_route::IntakeVerdict),
+    Corrupt,
+    Failed,
+}
+
+/// T3's per-file mutex for intake rows (`ledger_verbs::report` takes the same key in the same map):
+/// one writer per row file inside this daemon.
+fn with_row_mutex<T>(daemon: &Daemon, sig: &str, f: impl FnOnce() -> T) -> T {
+    let m = {
+        let mut map = daemon.repair_mutexes.lock().unwrap_or_else(|e| e.into_inner());
+        Arc::clone(
+            map.entry(format!("intake:{sig}"))
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        )
+    };
+    let _g = m.lock().unwrap_or_else(|e| e.into_inner());
+    f()
+}
+
+/// ② Writes the rows the detector owes, under the intake's OWN quota. Runs on the flusher thread (and in
+/// tests). Writes only THIS lane's rows (G4); a corrupt row is never overwritten (O-C1-6) — its count
+/// stays pending. Nothing is queued, pushed, published or alerted.
+pub fn flush_defect_intake(daemon: &Arc<Daemon>, root: &std::path::Path, cfg: &AlertConfig, now: crate::alert_route::Now) -> FlushReport {
+    use cys::repair::intake::{load_row, row_path_in, IntakeRow, MAX_REPORTERS};
+    use crate::alert_route::IntakeVerdict;
+    let lane = cys::repair::types::LaneKey::of_socket(&daemon.socket_path);
+    let intake = intake_for(daemon);
+    let due = {
+        let d = intake.det.lock().unwrap_or_else(|e| e.into_inner());
+        due_signatures(&d, cfg)
+    };
+    let mut rep = FlushReport {
+        due: due.len(),
+        ..FlushReport::default()
+    };
+    for row in due {
+        let path = row_path_in(root, &lane, &row.signature);
+        let outcome = with_row_mutex(daemon, &row.signature, || {
+            let existing = match load_row(&path) {
+                Ok(x) => x,
+                Err(_) => return RowOutcome::Corrupt,
+            };
+            let new_row = existing.is_none();
+            let verdict = intake
+                .share
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .decide(&row.signature, new_row, now.mono);
+            if verdict != IntakeVerdict::Write {
+                intake.share.lock().unwrap_or_else(|e| e.into_inner()).note_held(verdict);
+                return RowOutcome::Held(verdict);
+            }
+            let out = match existing {
+                Some(mut r) => {
+                    r.count = r.count.saturating_add(row.delta);
+                    r.last_seen = r.last_seen.max(row.last_seen);
+                    if !r.reporters.iter().any(|x| x == DETECTOR_REPORTER) && r.reporters.len() < MAX_REPORTERS {
+                        r.reporters.push(DETECTOR_REPORTER.to_string());
+                    }
+                    r
+                }
+                None => IntakeRow {
+                    schema: cys::repair::REPAIR_SCHEMA,
+                    signature: row.signature.clone(),
+                    lane: lane.clone(),
+                    rel: row.report.rel.clone(),
+                    error_class: row.report.error_class.clone(),
+                    first_line: row.report.first_line.clone(),
+                    first_seen: row.first_seen,
+                    last_seen: row.last_seen,
+                    count: row.delta,
+                    reporters: vec![DETECTOR_REPORTER.to_string()],
+                },
+            };
+            match cys::atomic_write_json(&path, &out) {
+                Ok(()) => {
+                    intake
+                        .share
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .commit(&row.signature, new_row, now.mono);
+                    RowOutcome::Written { new_row }
+                }
+                Err(_) => RowOutcome::Failed,
+            }
+        });
+        let mut d = intake.det.lock().unwrap_or_else(|e| e.into_inner());
+        match outcome {
+            RowOutcome::Written { new_row } => {
+                if let Some(s) = d.sigs.get_mut(&row.signature) {
+                    s.unflushed = s.unflushed.saturating_sub(row.delta);
+                    s.written = true;
+                }
+                if new_row {
+                    d.counters.rows_new += 1;
+                    rep.written_new += 1;
+                } else {
+                    d.counters.rows_updated += 1;
+                    rep.updated += 1;
+                }
+            }
+            RowOutcome::Held(IntakeVerdict::HoldHourly) => rep.held_hourly += 1,
+            RowOutcome::Held(_) => rep.held_cooldown += 1,
+            RowOutcome::Corrupt => {
+                d.counters.corrupt_rows += 1;
+                rep.corrupt += 1;
+            }
+            RowOutcome::Failed => {
+                d.counters.write_failed += 1;
+                rep.failed += 1;
+            }
+        }
+    }
+    rep
+}
+
+/// The detector's and the share's counters (diagnostics / tests — not part of any status contract).
+pub fn defect_intake_snapshot(daemon: &Arc<Daemon>, mono: f64) -> Value {
+    let intake = intake_for(daemon);
+    let (c, tracked) = {
+        let d = intake.det.lock().unwrap_or_else(|e| e.into_inner());
+        (d.counters.clone(), d.tracked())
+    };
+    let share = intake.share.lock().unwrap_or_else(|e| e.into_inner()).snapshot(mono);
+    json!({
+        "calls": c.calls, "failures": c.failures,
+        "failures_without_identity": c.failures_without_identity, "ambiguous": c.ambiguous,
+        "no_error_text": c.no_error_text, "excluded": c.excluded,
+        "excluded_by_reason": c.excluded_by_reason, "over_bound": c.over_bound,
+        "rows_new": c.rows_new, "rows_updated": c.rows_updated,
+        "corrupt_rows": c.corrupt_rows, "write_failed": c.write_failed,
+        "tracked_rels": tracked.0, "tracked_signatures": tracked.1, "pending_signatures": tracked.2,
+        "share": share,
+    })
+}
+
+/// The ledger root the flusher writes under: production `~/.cys/local/repairs` (the same root as the
+/// `repair.*` verbs); in this binary's tests a per-process temporary root (never a real ledger).
+fn intake_root(daemon: &Daemon) -> std::path::PathBuf {
+    #[cfg(test)]
+    {
+        std::env::temp_dir()
+            .join(format!("cys-defect-intake-test-{}", std::process::id()))
+            .join(cys::repair::types::LaneKey::of_socket(&daemon.socket_path).0)
+    }
+    #[cfg(not(test))]
+    {
+        let _ = daemon;
+        cys::repair::paths::repairs_root()
+    }
+}
+
+/// One pass of the flusher over the given daemons (dead ones skipped); each lane under its own
+/// catch_unwind. Returns how many lanes were flushed.
+fn flush_lanes(lanes: &[std::sync::Weak<Daemon>], cfg: &AlertConfig) -> usize {
+    let mut n = 0;
+    for w in lanes {
+        let Some(d) = w.upgrade() else { continue };
+        let root = intake_root(&d);
+        let now = crate::alert_route::Now::live(&d);
+        let flushed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let rep = flush_defect_intake(&d, &root, cfg, now);
+            log_flush(&d, &rep, now.mono);
+        }));
+        if flushed.is_ok() {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// One stderr line (the daemon log) with this lane's counters when a flush wrote, held or failed
+/// something — at most once per [`crate::alert_route::INTAKE_ROW_COOLDOWN_SECS`] per lane. A log line,
+/// never a message: nothing reaches a queue or the event bus.
+fn log_flush(daemon: &Arc<Daemon>, rep: &FlushReport, mono: f64) -> bool {
+    let acted = rep.written_new + rep.updated + rep.held_cooldown + rep.held_hourly + rep.corrupt + rep.failed;
+    if acted == 0 {
+        return false;
+    }
+    let intake = intake_for(daemon);
+    {
+        let mut last = intake.last_log_mono.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_some_and(|t| mono - t < crate::alert_route::INTAKE_ROW_COOLDOWN_SECS) {
+            return false;
+        }
+        *last = Some(mono);
+    }
+    eprintln!("[cysd] defect-intake: due={} {}", rep.due, defect_intake_snapshot(daemon, mono));
+    true
+}
+
+/// Starts the flusher thread once per process (production only; the tests call the flush directly).
+/// Lazy — the first failure of a pack script starts it — so the daemon's start order is untouched.
+fn ensure_flusher() {
+    #[cfg(not(test))]
+    {
+        static STARTED: OnceLock<()> = OnceLock::new();
+        STARTED.get_or_init(|| {
+            let spawned = std::thread::Builder::new()
+                .name("cysd-defect-intake".into())
+                .spawn(|| loop {
+                    std::thread::sleep(std::time::Duration::from_secs(FLUSH_TICK_SECS));
+                    let lanes: Vec<std::sync::Weak<Daemon>> = {
+                        let mut g = intake_registry().lock().unwrap_or_else(|e| e.into_inner());
+                        g.retain(|_, (w, _)| w.strong_count() > 0);
+                        g.values().map(|(w, _)| w.clone()).collect()
+                    };
+                    let cfg = AlertConfig::load();
+                    let _ = flush_lanes(&lanes, &cfg);
+                });
+            if let Err(e) = spawned {
+                eprintln!("[cysd] defect-intake: flusher thread not started ({e}) — rows are not written");
+            }
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -991,5 +1833,678 @@ mod tests {
         let m2 = got2.iter().find(|b| b.key == format!("signal/{name2}")).unwrap();
         assert_eq!(m2.detail["detail"].as_str(), Some("문자열 detail"));
         assert!(m2.detail.get("age_secs").is_some());
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ★(0.15.0 · 「스스로 해결」 M4 · RULINGS AD8 · track T3b) 결함 감지기 검체
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod defect_intake_tests {
+    use super::*;
+    use cys::repair::intake;
+    use cys::repair::types::LaneKey;
+
+    fn bash(cmd: &str) -> Value {
+        json!({ "command": cmd })
+    }
+
+    fn one(rel: &str, sub: Option<&str>) -> PackCall {
+        PackCall::One { rel: rel.into(), sub: sub.map(str::to_string) }
+    }
+
+    fn pre<'a>(input: &'a Value) -> ToolObservation<'a> {
+        ToolObservation {
+            event_type: "PRE_TOOL",
+            raw_event: "PreToolUse",
+            tool_input: input,
+            exit_code: None,
+            error: None,
+            interrupted: false,
+        }
+    }
+
+    /// The failure shape CCR-1 asks the CLI for (`PostToolUseFailure` → POST_TOOL, exit 1, `error`).
+    fn fail<'a>(input: &'a Value, error: Option<&'a str>) -> ToolObservation<'a> {
+        ToolObservation {
+            event_type: "POST_TOOL",
+            raw_event: "PostToolUseFailure",
+            tool_input: input,
+            exit_code: Some(1),
+            error,
+            interrupted: false,
+        }
+    }
+
+    pub(super) fn tmp_root(tag: &str) -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("cys-t3b-{tag}-{}-{n}", std::process::id()))
+    }
+
+    fn rows_in(root: &std::path::Path, lane: &LaneKey) -> Vec<intake::IntakeRow> {
+        let mut out = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(root.join("intake").join(&lane.0)) {
+            for e in rd.flatten() {
+                if let Ok(Some(r)) = intake::load_row(&e.path()) {
+                    out.push(r);
+                }
+            }
+        }
+        out.sort_by(|a, b| a.rel.cmp(&b.rel));
+        out
+    }
+
+    /// The identity: every spelling of the pack root a command uses, Windows separators, department
+    /// packs, the daemon's own pack dir, `cys-dept` at a command position; documents, globs, `..`,
+    /// other words and other tools are not an identity; two different scripts are ambiguous.
+    #[test]
+    fn identity_reads_every_pack_root_spelling() {
+        let pc = |c: &str| pack_call(&bash(c), None);
+        assert_eq!(pc("python3 ~/.cys/pack/bin/javis_x.py check --json"), one("bin/javis_x.py", Some("check")));
+        assert_eq!(pc(r#"python3 "$HOME/.cys/pack/bin/javis_x.py""#), one("bin/javis_x.py", None));
+        assert_eq!(pc("python3 /Users/x/.cys/pack-dept-dept-3/bin/javis_x.py run"), one("bin/javis_x.py", Some("run")));
+        assert_eq!(pc("python3 $CYS_PACK_DIR/bin/javis_x.py status"), one("bin/javis_x.py", Some("status")));
+        assert_eq!(pc(r#"sh "${CYS_PACK_DIR}/hooks/guard.sh""#), one("hooks/guard.sh", None));
+        assert_eq!(pc(r#"python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_x.py" check"#), one("bin/javis_x.py", Some("check")));
+        assert_eq!(pc("python3 ${CYS_PACK_DIR:-${HOME}/.cys/pack}/bin/javis_x.py"), one("bin/javis_x.py", None));
+        assert_eq!(pc(r"python C:\Users\x\.cys\pack\bin\javis_x.py check"), one("bin/javis_x.py", Some("check")));
+        assert_eq!(pc("cd /tmp && python3 /c/Users/x/.cys/pack/hooks/sub/x.sh"), one("hooks/sub/x.sh", None));
+        assert_eq!(pack_call(&bash("sh /opt/jp/hooks/a.sh x"), Some("/opt/jp")), one("hooks/a.sh", Some("x")));
+        assert_eq!(pack_call(&bash("sh /opt/jp/hooks/a.sh x"), None), PackCall::None);
+        // the pack's `bin/cys-dept` at a command position
+        assert_eq!(pc("cys-dept create team-x"), one("bin/cys-dept", Some("create")));
+        assert_eq!(pc("FOO=1 cys-dept list"), one("bin/cys-dept", Some("list")));
+        assert_eq!(pc("cd x && cys-dept status"), one("bin/cys-dept", Some("status")));
+        assert_eq!(pc("bash ~/.cys/pack/bin/cys-dept create t"), one("bin/cys-dept", Some("create")));
+        assert_eq!(pc("grep cys-dept notes.txt"), PackCall::None, "an argument is not the command");
+        // not hooks / scripts
+        assert_eq!(pc("cat ~/.cys/pack/directives/MASTER_DIRECTIVE.md"), PackCall::None);
+        assert_eq!(pc("ls ~/.cys/pack/bin/"), PackCall::None);
+        assert_eq!(pc("python3 ~/.cys/pack/bin/*.py"), PackCall::None);
+        assert_eq!(pc("python3 ~/.cys/pack/../evil.py"), PackCall::None);
+        assert_eq!(pc("python3 ~/.cys/pack/hooks/settings.json"), PackCall::None);
+        assert_eq!(pc("python3 ./javis_x.py"), PackCall::None);
+        // one script named twice is one; two scripts are ambiguous
+        assert_eq!(pc("python3 ~/.cys/pack/bin/a.py && python3 ~/.cys/pack/bin/a.py"), one("bin/a.py", None));
+        assert_eq!(pc("python3 ~/.cys/pack/bin/a.py && python3 ~/.cys/pack/bin/b.py"), PackCall::Ambiguous);
+        // other tools, list commands
+        assert_eq!(pack_call(&json!({"file_path": "/u/.cys/pack/bin/a.py"}), None), PackCall::None);
+        assert_eq!(pack_call(&json!({"command": ["python3", "/u/.cys/pack/bin/a.py", "x"]}), None), one("bin/a.py", Some("x")));
+        // a huge command is cut, never scanned whole (and never panics on a char boundary)
+        let huge = format!("echo {} ~/.cys/pack/bin/a.py", "가".repeat(COMMAND_SCAN_MAX_BYTES));
+        assert_eq!(pc(&huge), PackCall::None);
+    }
+
+    /// The text a signature is computed from keeps what tells defects apart.
+    #[test]
+    fn error_text_keeps_what_tells_defects_apart() {
+        assert_eq!(detector_error_text("Exit code 1\nError: Cannot find module 'express'"), "Error: Cannot find module 'express'");
+        let tb = "Exit code 1\nTraceback (most recent call last):\n  File \"/x/a.py\", line 3, in <module>\n    import javis_y\nModuleNotFoundError: No module named 'javis_y'\n";
+        assert_eq!(detector_error_text(tb), "ModuleNotFoundError: No module named 'javis_y'");
+        let chained = "Traceback (most recent call last):\n  File \"a\", line 1\nKeyError: 'k'\n\nDuring handling of the above exception, another exception occurred:\n\nTraceback (most recent call last):\n  File \"a\", line 2\nValueError: bad";
+        assert_eq!(detector_error_text(chained), "ValueError: bad");
+        assert_eq!(detector_error_text("Exit code 2"), "Exit code 2", "nothing else → the exit line stays");
+        assert_eq!(detector_error_text("\n\nboom\nmore"), "boom\nmore");
+        // signatures: same defect across runs → same; another script or another exception → different
+        let sig = |rel: &str, raw: &str| intake::parse_report(rel, &detector_error_text(raw)).unwrap().signature;
+        let a1 = sig("bin/a.py", "Exit code 1\nTraceback (most recent call last):\n  File \"/tmp/r1/a.py\", line 9\nKeyError: 'k' (pid 40001)");
+        let a2 = sig("bin/a.py", "Exit code 1\nTraceback (most recent call last):\n  File \"/tmp/r2/a.py\", line 9\nKeyError: 'k' (pid 40002)");
+        assert_eq!(a1, a2, "volatile parts (pids) must not split one defect");
+        assert_ne!(a1, sig("bin/b.py", "Exit code 1\nKeyError: 'k' (pid 40001)"));
+        assert_ne!(a1, sig("bin/a.py", "Exit code 1\nValueError: v"));
+        // a manual `cys repair report --file bin/a.py --error "KeyError: 'k'"` lands on the same row
+        assert_eq!(
+            sig("bin/a.py", "Exit code 1\nKeyError: 'k'"),
+            intake::parse_report("bin/a.py", "KeyError: 'k'").unwrap().signature
+        );
+    }
+
+    /// The thresholds of `evaluate` §3 apply per IDENTITY; another script's failures do not count.
+    #[test]
+    fn thresholds_apply_per_identity() {
+        let cfg = AlertConfig::default();
+        let mut d = Detector::default();
+        let a = bash("python3 ~/.cys/pack/bin/a.py run");
+        let b = bash("python3 ~/.cys/pack/bin/b.py run");
+        for i in 0..4 {
+            assert_eq!(observe(&mut d, &pre(&a), None, 1.0 + i as f64, false), Observed::Call);
+            assert_eq!(observe(&mut d, &fail(&a, Some("Exit code 1\nKeyError: 'k'")), None, 1.5, false), Observed::Failure);
+        }
+        observe(&mut d, &pre(&b), None, 2.0, false);
+        observe(&mut d, &fail(&b, Some("E: b")), None, 2.0, false);
+        assert!(due_signatures(&d, &cfg).is_empty(), "4 failures are below fail_count 5");
+        observe(&mut d, &pre(&a), None, 5.0, false);
+        observe(&mut d, &fail(&a, Some("Exit code 1\nKeyError: 'k'")), None, 5.5, false);
+        let due = due_signatures(&d, &cfg);
+        assert_eq!(due.len(), 1, "only a.py met the rule: {due:?}");
+        assert_eq!(due[0].report.rel, "bin/a.py");
+        assert_eq!(due[0].delta, 5);
+        assert_eq!((due[0].first_seen, due[0].last_seen), (1.5, 5.5));
+        // a rate below 30 %: 20 calls, 5 failures → not due; the 6th failure (30 %) → due
+        let mut d = Detector::default();
+        let c = bash("python3 ~/.cys/pack/bin/c.py");
+        for _ in 0..20 {
+            observe(&mut d, &pre(&c), None, 1.0, false);
+        }
+        for _ in 0..5 {
+            observe(&mut d, &fail(&c, Some("E: c")), None, 1.0, false);
+        }
+        assert!(due_signatures(&d, &cfg).is_empty(), "25 % < 30 %");
+        observe(&mut d, &fail(&c, Some("E: c")), None, 1.0, false);
+        assert_eq!(due_signatures(&d, &cfg).len(), 1, "30 % = fail_rate");
+        // the config is honoured (alerts-config.json)
+        let strict = AlertConfig { fail_count: 7, ..AlertConfig::default() };
+        assert!(due_signatures(&d, &strict).is_empty());
+    }
+
+    /// The exclusion list is applied BEFORE counting; a failure without text, an abort, a non-pack
+    /// call and an ambiguous call never form a row.
+    #[test]
+    fn excluded_and_unidentified_failures_never_form_a_row() {
+        let cfg = AlertConfig::default();
+        let dept = bash("cys-dept create team-x");
+        let err127 = "Exit code 127\n/usr/bin/bash: line 1: cys-dept: command not found";
+        // Windows: by design, never counted
+        let mut d = Detector::default();
+        for _ in 0..10 {
+            observe(&mut d, &pre(&dept), None, 1.0, true);
+            assert_eq!(observe(&mut d, &fail(&dept, Some(err127)), None, 1.0, true), Observed::Excluded);
+        }
+        assert!(due_signatures(&d, &cfg).is_empty());
+        assert_eq!(d.counters.excluded, 10);
+        assert_eq!(d.counters.excluded_by_reason.get("windows-cys-dept-not-on-path"), Some(&10));
+        // macOS: a missing cys-dept is a defect
+        let mut d = Detector::default();
+        for _ in 0..5 {
+            observe(&mut d, &pre(&dept), None, 1.0, false);
+            observe(&mut d, &fail(&dept, Some(err127)), None, 1.0, false);
+        }
+        assert_eq!(due_signatures(&d, &cfg).len(), 1);
+        // a verdict tool's designed answer vs its crash
+        let mut d = Detector::default();
+        let chk = bash("python3 ~/.cys/pack/bin/javis_orchestra.py check");
+        for _ in 0..10 {
+            observe(&mut d, &pre(&chk), None, 1.0, false);
+            observe(&mut d, &fail(&chk, Some("Exit code 1\nmissing: worker")), None, 1.0, false);
+        }
+        assert!(due_signatures(&d, &cfg).is_empty(), "a boot that polls `orchestra check` files nothing");
+        assert_eq!(d.counters.excluded_by_reason.get("designed-answer:javis_orchestra.check"), Some(&10));
+        for _ in 0..5 {
+            observe(&mut d, &fail(&chk, Some("Exit code 1\nTraceback (most recent call last):\n  File \"x\"\nKeyError: 'k'")), None, 1.0, false);
+        }
+        assert_eq!(due_signatures(&d, &cfg).len(), 1, "a crash of the same tool is a defect");
+        // no text: counted toward the rate, no signature (O-C1-9) → no row
+        let mut d = Detector::default();
+        let a = bash("python3 ~/.cys/pack/bin/a.py");
+        for _ in 0..10 {
+            observe(&mut d, &pre(&a), None, 1.0, false);
+            let today = ToolObservation { raw_event: "PostToolUse", ..fail(&a, None) };
+            assert_eq!(observe(&mut d, &today, None, 1.0, false), Observed::NoErrorText);
+        }
+        assert!(due_signatures(&d, &cfg).is_empty());
+        assert_eq!(d.counters.no_error_text, 10);
+        // an abort is not a failure; success is not a failure; a non-pack or ambiguous call is no identity
+        let mut d = Detector::default();
+        let abort = ToolObservation { interrupted: true, ..fail(&a, Some("E: x")) };
+        assert_eq!(observe(&mut d, &abort, None, 1.0, false), Observed::Ignored);
+        let ok = ToolObservation { raw_event: "PostToolUse", exit_code: Some(0), ..fail(&a, None) };
+        assert_eq!(observe(&mut d, &ok, None, 1.0, false), Observed::Ignored);
+        assert_eq!(observe(&mut d, &fail(&bash("npm test"), Some("E: x")), None, 1.0, false), Observed::Ignored);
+        let two = bash("python3 ~/.cys/pack/bin/a.py; python3 ~/.cys/pack/bin/b.py");
+        assert_eq!(observe(&mut d, &fail(&two, Some("E: x")), None, 1.0, false), Observed::Ambiguous);
+        assert_eq!((d.counters.failures_without_identity, d.counters.ambiguous), (1, 1));
+        assert_eq!(d.tracked(), (0, 0, 0));
+        let perm = ToolObservation { event_type: "PermissionRequest", raw_event: "PermissionRequest", ..pre(&a) };
+        assert_eq!(observe(&mut d, &perm, None, 1.0, false), Observed::Ignored);
+    }
+
+    /// Memory stays bounded: scripts and signatures beyond the bounds are counted, not kept; a written
+    /// signature with nothing pending makes room.
+    #[test]
+    fn detector_memory_is_bounded() {
+        let mut d = Detector::default();
+        for i in 0..DETECTOR_MAX_RELS {
+            observe(&mut d, &pre(&bash(&format!("python3 ~/.cys/pack/bin/s{i}.py"))), None, 1.0, false);
+        }
+        assert_eq!(observe(&mut d, &pre(&bash("python3 ~/.cys/pack/bin/extra.py")), None, 1.0, false), Observed::OverBound);
+        let mut d = Detector::default();
+        let a = bash("python3 ~/.cys/pack/bin/a.py");
+        for i in 0..DETECTOR_MAX_SIGNATURES {
+            let e = format!("E{i}: x");
+            assert_eq!(observe(&mut d, &fail(&a, Some(&e)), None, i as f64, false), Observed::Failure);
+        }
+        assert_eq!(observe(&mut d, &fail(&a, Some("Enew: x")), None, 9_999.0, false), Observed::OverBound);
+        // mark the oldest written with nothing pending → evictable
+        let oldest = d.sigs.iter().min_by(|x, y| x.1.last_seen.total_cmp(&y.1.last_seen)).map(|(k, _)| k.clone()).unwrap();
+        if let Some(s) = d.sigs.get_mut(&oldest) {
+            s.written = true;
+            s.unflushed = 0;
+        }
+        assert_eq!(observe(&mut d, &fail(&a, Some("Enew: x")), None, 10_000.0, false), Observed::Failure);
+        assert!(!d.sigs.contains_key(&oldest));
+        assert_eq!(d.sigs.len(), DETECTOR_MAX_SIGNATURES);
+    }
+
+    /// Structural pin (A 1-26 / 1-28, F1): the hook-path functions do no I/O and reach no queue, bus
+    /// or alert route; the flush reaches no queue, bus or alert route either. Positive control: the
+    /// scan sees a planted needle.
+    #[test]
+    fn hot_path_is_memory_only_and_nothing_sends() {
+        let src = include_str!("alerts.rs");
+        let body = |head: &str| -> String {
+            let b = src.split(head).nth(1).unwrap_or_else(|| panic!("{head} missing"));
+            b[..b.find("\n}\n").unwrap_or_else(|| panic!("{head} end"))].to_string()
+        };
+        let io = ["std::fs", "atomic_write", "File::", "Command::", "spawn(", "read_to_string", "load()"];
+        let send = ["bus.publish", "enqueue", "pending_queue", "alert_route::route", "handle_event", "javis_wakeup", "send_input", "push_queue"];
+        let planted = "let _ = std::fs::write(p, b);";
+        assert!(io.iter().any(|n| planted.contains(n)), "checker is blind");
+        for head in ["pub fn observe(", "pub fn pack_call(", "pub fn detector_error_text(", "pub fn observe_tool_event(", "fn is_failure(", "pub fn detector_excluded("] {
+            let b = body(head);
+            for n in io.iter().chain(send.iter()) {
+                assert!(!b.contains(n), "{head} reaches `{n}` — the hook path must stay memory-only");
+            }
+        }
+        for head in ["pub fn flush_defect_intake(", "fn flush_lanes(", "fn log_flush("] {
+            let b = body(head);
+            for n in send {
+                assert!(!b.contains(n), "{head} sends through `{n}` — intake is data, never a message");
+            }
+        }
+        // the per-file mutex key is T3's (`ledger_verbs::report`) — one writer per row file
+        assert!(src.contains("map.entry(format!(\"intake:{sig}\"))"));
+        assert!(include_str!("repair.rs").contains("ctx.locked(&format!(\"intake:{}\", rep.signature)"), "T3's report verb changed its row mutex key");
+        // the `usage.event` arm feeds the detector (and nothing else of this track lives in handlers.rs)
+        let h = include_str!("handlers.rs");
+        let arm = h.split("\"usage.event\" => {").nth(1).expect("usage.event arm");
+        let arm = &arm[..arm.find("\"org.status\" =>").expect("next arm")];
+        assert!(arm.contains("crate::alerts::observe_tool_event("), "the observation event no longer reaches the detector");
+        assert_eq!(h.matches("crate::alerts::observe_tool_event(").count(), 1);
+    }
+
+    /// The detector's own exclusion entries: each verdict tool's designed answers (with its
+    /// subcommand where the entry names one) are excluded; usage / internal errors and crashes are not;
+    /// the shared table (T3's Windows `cys-dept` entry) is consulted too. Every entry is detector-scope
+    /// and every reason distinct.
+    #[test]
+    fn detector_exclusions_name_only_designed_answers() {
+        use cys::repair::intake::ExclusionScope;
+        assert!(DETECTOR_EXCLUSIONS.iter().all(|e| e.scope == ExclusionScope::Detector));
+        let mut reasons: Vec<&str> = DETECTOR_EXCLUSIONS.iter().chain(intake::EXCLUSIONS).map(|e| e.reason).collect();
+        let n = reasons.len();
+        reasons.sort_unstable();
+        reasons.dedup();
+        assert_eq!(reasons.len(), n, "a reason names two entries");
+        let ex = |rel: &str, sub: Option<&str>, err: &str| detector_excluded(rel, sub, err, false);
+        assert_eq!(ex("bin/javis_resource_gate.py", Some("check"), "Exit code 2\nhard_block: load"), Some("designed-answer:javis_resource_gate.check"));
+        assert_eq!(ex("bin/javis_resource_gate.py", Some("check"), "Exit code 1"), Some("designed-answer:javis_resource_gate.check"));
+        assert_eq!(ex("bin/javis_resource_gate.py", Some("check"), "Exit code 70\ninternal"), None);
+        assert_eq!(ex("bin/javis_resource_gate.py", Some("check"), "Exit code 64\nusage"), None);
+        assert_eq!(ex("bin/javis_resource_gate.py", Some("enforce"), "Exit code 2"), None);
+        assert_eq!(ex("bin/javis_orchestra.py", Some("check"), "Exit code 12\nACK pending"), Some("designed-answer:javis_orchestra.check"));
+        assert_eq!(ex("bin/javis_orchestra.py", Some("check"), "Exit code 1\nTraceback (most recent call last):\n  File \"x\"\nKeyError: 'k'"), None);
+        assert_eq!(ex("bin/javis_orchestra.py", Some("task-prompt"), "Exit code 1"), None);
+        for c in [3, 4, 5, 6, 8, 9] {
+            assert_eq!(ex("bin/javis_task.py", Some("checkout"), &format!("Exit code {c}")), Some("designed-answer:javis_task"));
+        }
+        assert_eq!(ex("bin/javis_task.py", Some("checkout"), "Exit code 2\nusage: …"), None);
+        assert_eq!(ex("bin/javis_wakeup.py", Some("drain"), "Exit code 4"), Some("designed-answer:javis_wakeup"));
+        assert_eq!(ex("bin/javis_wakeup.py", Some("drain"), "Exit code 6"), None);
+        assert_eq!(ex("bin/javis_other.py", Some("check"), "Exit code 2"), None);
+        // the shared table is consulted first
+        let dept = "Exit code 127\n/usr/bin/bash: line 1: cys-dept: command not found";
+        assert_eq!(detector_excluded("bin/cys-dept", Some("create"), dept, true), Some("windows-cys-dept-not-on-path"));
+        assert_eq!(detector_excluded("bin/cys-dept", Some("create"), dept, false), None);
+    }
+
+    fn feed(daemon: &Arc<Daemon>, cmd: &str, error: &str, n: usize) {
+        let input = bash(cmd);
+        for _ in 0..n {
+            observe_tool_event(daemon, &pre(&input));
+            observe_tool_event(daemon, &fail(&input, Some(error)));
+        }
+    }
+
+    /// ★THE FLOOD TEST (design §6-4 (7) · D:1095 · I-F1-02): the same failure 1,000× → ONE row of this
+    /// lane (count 1,000), the report gate's input is ONE defect, and nothing reaches a queue, the event
+    /// bus or the alert route (so seat-death / context alerts cannot be delayed by it — the router half
+    /// is `alert_route::drills::drill_defect_flood_does_not_delay_seat_death_or_clear_signals`). A second,
+    /// different script gets its own row (rows are per signature, not "one row total").
+    #[test]
+    fn flood_of_one_failure_is_one_row_and_touches_no_queue_bus_or_alert_route() {
+        let daemon = crate::team_gate_tests::tmp_daemon("t3b-flood", false);
+        let root = tmp_root("flood");
+        let lane = LaneKey::of_socket(&daemon.socket_path);
+        let cfg = AlertConfig::default();
+        let alert_before = format!("{:?}", *daemon.alert_route.lock().unwrap_or_else(|e| e.into_inner()));
+        let bus_before = daemon.bus.latest_seq();
+        let t = std::time::Instant::now();
+        feed(&daemon, "python3 ~/.cys/pack/bin/javis_x.py run", "Exit code 1\nTraceback (most recent call last):\n  File \"/tmp/q/javis_x.py\", line 4\nKeyError: 'k' (pid 41234)", 1000);
+        let hot_path = t.elapsed();
+        eprintln!("[t3b-flood] 2,000 observations (1,000 calls + 1,000 failures) on the hook path: {hot_path:?}");
+        let rep = flush_defect_intake(&daemon, &root, &cfg, crate::alert_route::Now::at(1_000.0));
+        assert_eq!((rep.due, rep.written_new), (1, 1), "{rep:?}");
+        let rows = rows_in(&root, &lane);
+        assert_eq!(rows.len(), 1, "1,000 identical failures must be ONE row");
+        assert_eq!(rows[0].count, 1000);
+        assert_eq!(rows[0].rel, "bin/javis_x.py");
+        assert_eq!(rows[0].first_line, "KeyError: 'k' (pid <n>)");
+        assert_eq!(rows[0].reporters, vec![DETECTOR_REPORTER.to_string()]);
+        // only this lane's directory exists (G4: one writer per file, per lane)
+        let lanes: Vec<_> = std::fs::read_dir(root.join("intake")).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(lanes, vec![std::ffi::OsString::from(&lane.0)]);
+        // the report gate's input: ONE open defect (distinct signatures — `cys repair list` aggregates the same way)
+        let (defects, broken) = intake::load_all_in(&root);
+        assert_eq!((defects.len(), broken.len()), (1, 0));
+        assert_eq!(defects[0].count, 1000);
+        // nothing sent anywhere
+        assert_eq!(daemon.bus.latest_seq(), bus_before, "the detector published on the event bus");
+        assert_eq!(format!("{:?}", *daemon.alert_route.lock().unwrap_or_else(|e| e.into_inner())), alert_before, "the detector touched the alert route");
+        assert!(daemon.surfaces.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+        // a flush with nothing new writes nothing
+        assert_eq!(flush_defect_intake(&daemon, &root, &cfg, crate::alert_route::Now::at(1_001.0)).due, 0);
+        // more of the same inside the row cooldown: held (counted, not lost), written after it
+        feed(&daemon, "python3 ~/.cys/pack/bin/javis_x.py run", "Exit code 1\nKeyError: 'k' (pid 50000)", 10);
+        let held = flush_defect_intake(&daemon, &root, &cfg, crate::alert_route::Now::at(1_100.0));
+        assert_eq!((held.due, held.held_cooldown, held.updated), (1, 1, 0));
+        assert_eq!(rows_in(&root, &lane)[0].count, 1000);
+        let after = flush_defect_intake(&daemon, &root, &cfg, crate::alert_route::Now::at(1_000.0 + crate::alert_route::INTAKE_ROW_COOLDOWN_SECS + 1.0));
+        assert_eq!(after.updated, 1);
+        assert_eq!(rows_in(&root, &lane)[0].count, 1010);
+        // control: a different broken script → its own single row
+        feed(&daemon, "python3 ~/.cys/pack/bin/javis_y.py", "Exit code 1\nModuleNotFoundError: No module named 'javis_z'", 5);
+        flush_defect_intake(&daemon, &root, &cfg, crate::alert_route::Now::at(2_000.0));
+        let rows = rows_in(&root, &lane);
+        assert_eq!(rows.len(), 2);
+        assert_eq!((rows[0].rel.as_str(), rows[0].count, rows[1].rel.as_str(), rows[1].count), ("bin/javis_x.py", 1010, "bin/javis_y.py", 5));
+        assert_eq!(daemon.bus.latest_seq(), bus_before);
+        // the guard rails the flood must not weaken (appendix A 1-10; queue cap 100 untouched)
+        assert_eq!(crate::alert_route::HOURLY_CAP, 20);
+        assert_eq!(crate::alert_route::CLEAR_RESERVE, 26);
+        assert_eq!(crate::alert_route::CSO_QUEUE_HEADROOM, 50);
+        assert!(include_str!("handlers.rs").contains("if q.len() >= 100 {"), "the queue cap 100 changed");
+        let snap = defect_intake_snapshot(&daemon, 2_000.0);
+        assert_eq!(snap["rows_new"], 2);
+        assert_eq!(snap["share"]["new_rows_total"], 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A manual `cys repair report` and the detector meet in ONE row (one writer per file: the same
+    /// per-file mutex, an existing row is updated, never replaced) — and an existing row is not a NEW
+    /// row for the hourly share.
+    #[test]
+    fn manual_report_and_detector_share_one_row() {
+        let daemon = crate::team_gate_tests::tmp_daemon("t3b-share", false);
+        let root = tmp_root("share");
+        let lane = LaneKey::of_socket(&daemon.socket_path);
+        let r = intake::parse_report("bin/a.py", "KeyError: 'k'").unwrap();
+        assert!(matches!(
+            intake::record_in(&root, &lane, &r, "worker", 10.0, 0, false, "KeyError: 'k'").unwrap(),
+            intake::Recorded::New(_)
+        ));
+        feed(&daemon, "python3 ~/.cys/pack/bin/a.py", "Exit code 1\nKeyError: 'k'", 5);
+        let rep = flush_defect_intake(&daemon, &root, &AlertConfig::default(), crate::alert_route::Now::at(500.0));
+        assert_eq!((rep.written_new, rep.updated), (0, 1), "{rep:?}");
+        let rows = rows_in(&root, &lane);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].count, 6);
+        assert_eq!(rows[0].first_seen, 10.0, "the first sighting stays the manual one");
+        assert_eq!(rows[0].reporters, vec!["worker".to_string(), DETECTOR_REPORTER.to_string()]);
+        let share = intake_for(&daemon);
+        assert_eq!(share.share.lock().unwrap().new_rows_1h(500.0), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A corrupt row is never overwritten (O-C1-6), its count stays pending, and the other rows of the
+    /// same flush are still written (F4: a broken ledger file never stops the detector).
+    #[test]
+    fn corrupt_row_is_never_overwritten_and_flush_continues() {
+        let daemon = crate::team_gate_tests::tmp_daemon("t3b-corrupt", false);
+        let root = tmp_root("corrupt");
+        let lane = LaneKey::of_socket(&daemon.socket_path);
+        let bad = intake::parse_report("bin/a.py", &detector_error_text("Exit code 1\nE: a")).unwrap();
+        let p = intake::row_path_in(&root, &lane, &bad.signature);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, b"{not json").unwrap();
+        feed(&daemon, "python3 ~/.cys/pack/bin/a.py", "Exit code 1\nE: a", 5);
+        feed(&daemon, "python3 ~/.cys/pack/bin/b.py", "Exit code 1\nE: b", 5);
+        let rep = flush_defect_intake(&daemon, &root, &AlertConfig::default(), crate::alert_route::Now::at(10.0));
+        assert_eq!((rep.due, rep.corrupt, rep.written_new), (2, 1, 1), "{rep:?}");
+        assert_eq!(std::fs::read(&p).unwrap(), b"{not json");
+        assert_eq!(rows_in(&root, &lane).iter().map(|r| r.rel.as_str()).collect::<Vec<_>>(), vec!["bin/b.py"]);
+        let (_, _, pending) = intake_for(&daemon).det.lock().unwrap().tracked();
+        assert_eq!(pending, 1, "the corrupt row's count is kept, not lost");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The intake's own hourly share for NEW rows holds the 31st new signature — in memory, with its
+    /// count — and writes it when the window frees (hold, never drop).
+    #[test]
+    fn hourly_new_row_share_holds_and_never_drops() {
+        let daemon = crate::team_gate_tests::tmp_daemon("t3b-hourly", false);
+        let root = tmp_root("hourly");
+        let lane = LaneKey::of_socket(&daemon.socket_path);
+        let n = crate::alert_route::INTAKE_NEW_ROWS_PER_HOUR + 1;
+        for i in 0..n {
+            feed(&daemon, &format!("python3 ~/.cys/pack/bin/s{i:02}.py"), "Exit code 1\nE: x", 5);
+        }
+        let rep = flush_defect_intake(&daemon, &root, &AlertConfig::default(), crate::alert_route::Now::at(100.0));
+        assert_eq!((rep.due, rep.written_new, rep.held_hourly), (n, n - 1, 1), "{rep:?}");
+        assert_eq!(rows_in(&root, &lane).len(), n - 1);
+        let rep = flush_defect_intake(&daemon, &root, &AlertConfig::default(), crate::alert_route::Now::at(100.0 + crate::alert_route::WINDOW_SECS + 1.0));
+        assert_eq!((rep.due, rep.written_new), (1, 1));
+        let rows = rows_in(&root, &lane);
+        assert_eq!(rows.len(), n);
+        assert!(rows.iter().all(|r| r.count == 5), "the held signature kept its full count");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// G4: two lanes that see the same failure keep one row EACH (no shared file, no lost count);
+    /// the aggregation on read counts ONE defect with both lanes.
+    #[test]
+    fn two_lanes_keep_their_own_rows() {
+        let base = crate::team_gate_tests::tmp_daemon("t3b-lane-a", false);
+        let dept = crate::team_gate_tests::tmp_daemon("t3b-lane-b", true);
+        let root = tmp_root("lanes");
+        for d in [&base, &dept] {
+            feed(d, "python3 ~/.cys/pack/bin/a.py", "Exit code 1\nE: same", 500);
+            flush_defect_intake(d, &root, &AlertConfig::default(), crate::alert_route::Now::at(10.0));
+        }
+        let (la, lb) = (LaneKey::of_socket(&base.socket_path), LaneKey::of_socket(&dept.socket_path));
+        assert_ne!(la, lb);
+        assert_eq!(rows_in(&root, &la)[0].count, 500);
+        assert_eq!(rows_in(&root, &lb)[0].count, 500);
+        let (defects, _) = intake::load_all_in(&root);
+        assert_eq!(defects.len(), 1);
+        assert_eq!(defects[0].count, 1000);
+        assert_eq!(defects[0].lanes.len(), 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The flusher's pass: a live daemon is flushed (into its own root), a dead one is skipped; the
+    /// throttled log line reads the counters at most once per cooldown.
+    #[test]
+    fn flusher_pass_skips_dead_daemons_and_logs_at_most_once_per_cooldown() {
+        let daemon = crate::team_gate_tests::tmp_daemon("t3b-pass", false);
+        feed(&daemon, "python3 ~/.cys/pack/bin/a.py", "Exit code 1\nE: a", 5);
+        let w = Arc::downgrade(&daemon);
+        assert_eq!(flush_lanes(&[w.clone()], &AlertConfig::default()), 1);
+        let root = intake_root(&daemon);
+        assert_eq!(rows_in(&root, &LaneKey::of_socket(&daemon.socket_path)).len(), 1);
+        let rep = FlushReport { due: 1, written_new: 1, ..FlushReport::default() };
+        assert!(log_flush(&daemon, &rep, 1.0e6), "first line");
+        assert!(!log_flush(&daemon, &rep, 1.0e6 + 1.0), "throttled");
+        assert!(!log_flush(&daemon, &FlushReport { due: 3, ..FlushReport::default() }, 2.0e6), "nothing happened → no line");
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(flush_lanes(&[std::sync::Weak::new()], &AlertConfig::default()), 0, "a dead daemon is skipped");
+        drop(w);
+    }
+
+    /// A 1-26 / D:658: no hook that runs on every tool call or every prompt files a report, and the
+    /// common frame never talks to the daemon or the ledger (the observation event of `cys-hook.sh`
+    /// is the only channel). The list = the per-call / per-prompt hooks (impact W2 CH-10 ③).
+    #[test]
+    fn no_hook_files_a_report_per_call() {
+        let hooks = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("cysjavis-pack/hooks");
+        let per_call = [
+            "_lib.sh", "cys-hook.sh", "pre-dispatch.sh", "role-capability-gate.sh", "appbuild-gate.sh",
+            "grill-gate.sh", "grill-arm.sh", "guard.sh", "pack-guard.sh", "commit-memory-nudge.sh",
+            "grill-count.sh", "role-bootstrap.sh",
+        ];
+        let planted = "cys repair report --file x --error y";
+        assert!(planted.contains("repair report"), "checker is blind");
+        for name in per_call {
+            let text = std::fs::read_to_string(hooks.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
+            for needle in ["repair report", "repair.report", "repair_report"] {
+                assert!(!text.contains(needle), "{name} files a defect per call ({needle}) — D:658 forbids it");
+            }
+        }
+        let lib = std::fs::read_to_string(hooks.join("_lib.sh")).unwrap();
+        for needle in ["usage-event", "repair", "cys usage"] {
+            assert!(!lib.contains(needle), "_lib.sh reaches `{needle}` — the frame is shared by 25 hooks (A 1-26)");
+        }
+    }
+}
+
+/// ★The observation hook's contract with a stub `cys` on a private PATH (no daemon, private HOME, no
+/// overlays): exit 0, nothing on stdout, exactly ONE `cys usage-event-stdin` spawn per call and the
+/// hook JSON — identity and failure text included — reaches it byte for byte; a `cys` that exits
+/// without reading still leaves stdin drained; no `cys` at all is silent. (Appendix A 1-26 / 1-28;
+/// the Windows rule "훅 안에서 두 번째 프로세스를 띄우지 않음" is the spawn count.)
+#[cfg(all(test, unix))]
+mod observation_hook_contract {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::{Command, Stdio};
+
+    struct Rig {
+        dir: std::path::PathBuf,
+    }
+
+    impl Drop for Rig {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn rig(tag: &str, stub: Option<&str>) -> Rig {
+        let dir = super::defect_intake_tests::tmp_root(&format!("hook-{tag}"));
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::create_dir_all(dir.join("home/.cys/local/hooks")).unwrap();
+        if let Some(body) = stub {
+            let p = dir.join("bin/cys");
+            std::fs::write(&p, body).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        Rig { dir }
+    }
+
+    /// Runs the real `cys-hook.sh` with `input` on stdin; returns (exit code, stdout, stdin fully written).
+    fn run(r: &Rig, input: &[u8]) -> (i32, Vec<u8>, bool) {
+        let hook = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("cysjavis-pack/hooks/cys-hook.sh");
+        let mut child = Command::new("/bin/sh")
+            .arg(&hook)
+            .env_clear()
+            .env("HOME", r.dir.join("home"))
+            .env("PATH", format!("{}:/usr/bin:/bin", r.dir.join("bin").display()))
+            .env("STUB_LOG", r.dir.join("calls.log"))
+            .env("STUB_IN", r.dir.join("stdin.bin"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("sh");
+        let mut stdin = child.stdin.take().unwrap();
+        let wrote = stdin.write_all(input).is_ok();
+        drop(stdin);
+        let out = child.wait_with_output().expect("wait");
+        (out.status.code().unwrap_or(-1), out.stdout, wrote)
+    }
+
+    const RECORDING_STUB: &str = "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$STUB_LOG\"\ncat >> \"$STUB_IN\"\nexit 0\n";
+
+    #[test]
+    fn cys_hook_carries_the_identity_in_one_silent_spawn() {
+        let failure = serde_json::json!({
+            "hook_event_name": "PostToolUseFailure", "tool_name": "Bash",
+            "tool_input": {"command": "python3 ~/.cys/pack/bin/javis_x.py run"},
+            "error": "Exit code 1\nKeyError: 'k'", "is_interrupt": false
+        })
+        .to_string();
+        for (i, input) in [failure.clone(), "{not json".to_string(), String::new()].iter().enumerate() {
+            let r = rig(&format!("rec{i}"), Some(RECORDING_STUB));
+            for _ in 0..2 {
+                let (code, stdout, wrote) = run(&r, input.as_bytes());
+                assert_eq!(code, 0, "the observation hook must always exit 0");
+                assert!(stdout.is_empty(), "the observation hook wrote to stdout: {stdout:?}");
+                assert!(wrote);
+            }
+            let calls = std::fs::read_to_string(r.dir.join("calls.log")).unwrap_or_default();
+            assert_eq!(calls, "usage-event-stdin\nusage-event-stdin\n", "one `cys` spawn per call, no other verb (input {i})");
+            let got = std::fs::read(r.dir.join("stdin.bin")).unwrap_or_default();
+            assert_eq!(got, [input.as_bytes(), input.as_bytes()].concat(), "the hook JSON must reach the CLI unchanged");
+        }
+    }
+
+    #[test]
+    fn cys_hook_drains_stdin_when_cys_fails_and_is_silent_without_cys() {
+        let big = format!("{{\"hook_event_name\":\"PostToolUse\",\"tool_response\":\"{}\"}}", "x".repeat(1 << 20));
+        let r = rig("fail", Some("#!/bin/sh\nexit 1\n"));
+        let (code, stdout, wrote) = run(&r, big.as_bytes());
+        assert_eq!((code, stdout.is_empty(), wrote), (0, true, true), "a failing cys must not leave the writer with EPIPE");
+        let r = rig("none", None);
+        let (code, stdout, wrote) = run(&r, big.as_bytes());
+        assert_eq!((code, stdout.is_empty(), wrote), (0, true, true));
+    }
+}
+
+/// ★The wiring, through the real request path: `usage.event` from a seat → the detector → a row after
+/// the flush. Today's event shape (a failure only as `exit_code`, no text) files nothing.
+#[cfg(all(test, unix))]
+mod defect_intake_drills {
+    use super::*;
+    use cys::repair::types::LaneKey;
+    use cys::Request;
+
+    fn usage_event(daemon: &Arc<Daemon>, params: Value) -> Value {
+        let req = Request { id: json!(1), method: "usage.event".into(), params };
+        match crate::handlers::dispatch(daemon, req, None) {
+            crate::handlers::Reply::Single(v) => v,
+            _ => panic!("single reply"),
+        }
+    }
+
+    #[test]
+    fn usage_event_failure_reaches_the_detector_through_the_arm() {
+        let daemon = crate::team_gate_tests::tmp_daemon("t3b-arm", false);
+        let sid = crate::team_gate_tests::seat(&daemon, "worker", 4_242_001);
+        let root = super::defect_intake_tests::tmp_root("arm");
+        let input = json!({"command": "python3 ~/.cys/pack/bin/javis_x.py run"});
+        let today = json!({"command": "python3 ~/.cys/pack/bin/javis_today.py"});
+        for _ in 0..5 {
+            for inp in [&input, &today] {
+                let v = usage_event(&daemon, json!({"surface_id": sid, "event_type": "PRE_TOOL", "raw_hook_event": "PreToolUse", "tool_name": "Bash", "tool_input": inp}));
+                assert_eq!(v["ok"], true, "{v}");
+            }
+            // CCR-1's shape
+            let v = usage_event(&daemon, json!({"surface_id": sid, "event_type": "POST_TOOL", "raw_hook_event": "PostToolUseFailure", "tool_name": "Bash", "tool_input": input, "exit_code": 1, "error": "Exit code 1\nKeyError: 'k'"}));
+            assert_eq!(v["ok"], true, "{v}");
+            // today's shape (`tool_response.is_error` → exit_code 1, no text)
+            let v = usage_event(&daemon, json!({"surface_id": sid, "event_type": "POST_TOOL", "raw_hook_event": "PostToolUse", "tool_name": "Bash", "tool_input": today, "exit_code": 1}));
+            assert_eq!(v["ok"], true, "{v}");
+        }
+        let rep = flush_defect_intake(&daemon, &root, &AlertConfig::default(), crate::alert_route::Now::at(10.0));
+        assert_eq!((rep.due, rep.written_new), (1, 1), "{rep:?}");
+        let (defects, _) = cys::repair::intake::load_all_in(&root);
+        assert_eq!(defects.len(), 1);
+        assert_eq!((defects[0].rel.as_str(), defects[0].count), ("bin/javis_x.py", 5));
+        assert_eq!(defects[0].lanes, vec![LaneKey::of_socket(&daemon.socket_path)]);
+        let snap = defect_intake_snapshot(&daemon, 10.0);
+        assert_eq!(snap["no_error_text"], 5, "{snap}");
+        assert_eq!(snap["calls"], 10, "{snap}");
+        let q = daemon.get_surface(sid).map(|s| s.pending_queue.lock().unwrap().len());
+        assert_eq!(q, Some(0), "the seat's queue grew");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
