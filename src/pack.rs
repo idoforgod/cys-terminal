@@ -2791,6 +2791,39 @@ pub fn is_shell_script(rel: &str, vendor: &str) -> bool {
             || first.contains("env zsh"))
 }
 
+/// 팩 상대경로 하나에 대한 질의(기동 필수 · 목록 등재) — 입력원의 판정 함수 칸.
+type RelPredicate = Box<dyn Fn(&str) -> bool + Send + Sync>;
+/// 팩 상대경로 하나의 과거 출시 해시 목록 — 입력원의 표 칸.
+type RelHashes = Box<dyn Fn(&str) -> Vec<String> + Send + Sync>;
+
+/// ★T2f(RULINGS BD4 · BH6 · BC2): **"두 컴파일 목록 중 하나에 있는가"** — 팩 쓰기 동사(되살리기 · 합치기 ·
+/// 병합 되돌리기 · 되돌리기)가 출시본이 아닌 바이트를 넣지 못하는 파일의 단일 술어. 오늘은 기동 필수 목록
+/// (`boot_critical::entries()`)만 답한다 — **T5a 의 마지막 재기반 작업이 보호 목록의 행을 이 함수 안에 더한다**
+/// (BC2 · BD4). 업데이트의 충돌 처리는 이 술어를 쓰지 않는다: 보호 목록에만 있는 파일의 업데이트 충돌은 사용자
+/// 사본이 남는다(주인 결정 20 · AQ12) — 업데이트의 기동 필수 판정은 `boot_critical_rel` 그대로다.
+pub fn listed_in_compiled_lists(rel: &str) -> bool {
+    boot_critical_rel(rel)
+}
+
+/// ★T2f: 이 바이트가 **출시본**인가 — 내장 vendor 본, 이 설치의 매니페스트(마지막에 적용한 vendor 본), 과거 출시
+/// 해시 표 중 하나와 같은 UTF-8 바이트. 팩 쓰기 동사가 등재 파일에 쓸 수 있는 유일한 바이트다.
+pub fn released_bytes(dir: &Path, rel: &str, bytes: &[u8], sources: &UpdateSources) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else { return false };
+    let h = content_hash(text);
+    PACK_ALL.iter().any(|(r, c)| *r == rel && content_hash(c) == h)
+        || load_manifest_state(dir).0.get(rel) == Some(&h)
+        || sources.prev_vendor_for(rel).contains(&h)
+}
+
+/// ★T2f: 등재 파일에 출시본이 아닌 바이트를 넣으려는 팩 쓰기 동사의 거부 문장(동사마다 같은 문장 — 수리 흐름 안내).
+pub fn listed_file_refusal(rel: &str, verb: &str) -> String {
+    format!(
+        "⛔ 거부: '{rel}' 은 기동 필수·보호 목록에 있는 파일입니다 — `{verb}` 는 이 파일에 출시본이 아닌 바이트를 넣지 \
+         않습니다(아무것도 쓰지 않았습니다). 이 파일을 바꾸는 길은 수리 흐름뿐입니다: 워커가 `cys repair begin --files {rel} \
+         --trigger …` → 예행·검사 → 주인 승인(업데이트가 보관한 내 사본이면 `cys repair reapply <수리번호>`)."
+    )
+}
+
 /// ★0.15.0 M11 설치 입력원 — 레인의 묘비(파일만 · 생명줄 제외), 기동 필수 질의, 과거 vendor 해시
 /// 표, 업데이트 전 스냅샷 루트. 설치 실행부·plan·되살리기 모의가 같은 값을 쓴다. 환경 변수 노브 없음.
 pub struct UpdateSources {
@@ -2798,8 +2831,11 @@ pub struct UpdateSources {
     pub lane: Option<crate::repair::types::LaneKey>,
     /// rel → 그 삭제를 기록한 수리 번호(파일 묘비만 · 생명줄 훅 파일 제외 — `with_tombstones` 가 거른다).
     tombstoned_files: std::collections::BTreeMap<String, String>,
-    boot_critical: Box<dyn Fn(&str) -> bool + Send + Sync>,
-    prev_vendor: Box<dyn Fn(&str) -> Vec<String> + Send + Sync>,
+    boot_critical: RelPredicate,
+    /// ★T2f: 팩 쓰기 동사의 등재 술어(기본 = `listed_in_compiled_lists`) — 기동 필수 판정과 따로 둔다(보호 목록에만
+    /// 있는 파일은 등재되지만 업데이트에서는 기동 필수가 아니다 — BC2).
+    listed: RelPredicate,
+    prev_vendor: RelHashes,
     /// 업데이트 전 스냅샷 루트(`~/.cys/local/update-snapshots`). None = 스냅샷을 만들지 않는다.
     pub snapshot_root: Option<PathBuf>,
 }
@@ -2831,6 +2867,7 @@ impl UpdateSources {
             lane: None,
             tombstoned_files: std::collections::BTreeMap::new(),
             boot_critical: Box::new(boot_critical_rel),
+            listed: Box::new(listed_in_compiled_lists),
             prev_vendor: Box::new(|rel: &str| {
                 crate::pack_prev_vendor::prev_vendor_hashes(rel)
                     .iter()
@@ -2892,6 +2929,17 @@ impl UpdateSources {
     pub fn with_boot_critical(mut self, f: impl Fn(&str) -> bool + Send + Sync + 'static) -> Self {
         self.boot_critical = Box::new(f);
         self
+    }
+
+    /// 등재 술어 이음새(시험 — T5a 병합 전 컴파일 목록은 비어 있다).
+    pub fn with_listed(mut self, f: impl Fn(&str) -> bool + Send + Sync + 'static) -> Self {
+        self.listed = Box::new(f);
+        self
+    }
+
+    /// ★T2f: 이 파일이 두 컴파일 목록 중 하나에 있는가(`listed_in_compiled_lists` — 팩 쓰기 동사의 단일 술어).
+    pub fn is_listed(&self, rel: &str) -> bool {
+        (self.listed)(rel)
     }
 
     /// 과거 vendor 해시 표 이음새(시험 — 과거 릴리스 본문은 런타임에 없다).
@@ -3010,7 +3058,7 @@ impl<'s> UpdateContext<'s> {
             return f;
         }
         let dh = content_hash(d);
-        f.prev_vendor_match = self.sources.prev_vendor_for(rel).iter().any(|h| *h == dh);
+        f.prev_vendor_match = self.sources.prev_vendor_for(rel).contains(&dh);
         match ownership_scoped(rel, self.scope) {
             Ownership::User => {
                 f.audit_keep = self
@@ -4433,7 +4481,7 @@ pub fn create_update_snapshot(
             // 설치 기록의 해시(`content_hash`)는 같은 바이트의 sha256 이다 — 한 번만 계산한다.
             let sha = sha256_hex(&data);
             let released = std::str::from_utf8(&data).is_ok()
-                && (manifest.get(rel.as_str()) == Some(&sha) || prev_vendor(rel).iter().any(|p| *p == sha));
+                && (manifest.get(rel.as_str()) == Some(&sha) || prev_vendor(rel).contains(&sha));
             files.push(SnapshotFile {
                 rel: rel.clone(),
                 sha256: sha,
@@ -14365,6 +14413,45 @@ mod m11_tests {
         assert_eq!(kept_versions, vec!["2.0.0", "3.0.0", "4.0.0"], "가장 오래된 1.0.0 세대가 정리되고 생성 순서가 유지된다");
         let newest = newest_update_snapshot(&root, "base").expect("최신");
         assert_eq!(read_update_snapshot_meta(&newest).unwrap().pack_version, "4.0.0", "최신 = 마지막에 만든 스냅샷");
+    }
+
+    /// ★T2f(RULINGS BD4): 팩 쓰기 동사의 단일 술어 — 오늘은 기동 필수 목록(`boot_critical::entries()`)과 같고, 제품 입력원
+    /// (`none()` · `for_live_pack()`)은 이 함수를 그대로 쓴다(이음새로 바뀐 술어가 제품 경로에 남으면 빨갛다). T5a 의 마지막
+    /// 재기반 작업이 보호 목록의 행을 이 함수에 더하면 첫 단언을 그 합집합으로 바꾼다.
+    #[test]
+    fn t2f_one_predicate_for_every_pack_writer() {
+        let rig = Rig::new("t2fpred");
+        let _l = EnvGuard::set("CYS_LOCAL_DIR", rig.base.join("local"));
+        let _p = EnvGuard::set(ENV_PACK_DIR, &rig.pack);
+        let none = UpdateSources::none();
+        let live = UpdateSources::for_live_pack(&rig.pack);
+        let mut probes: Vec<&str> = PACK_ALL.iter().map(|(r, _)| *r).collect();
+        probes.extend(crate::repair::boot_critical::entries().iter().map(|e| e.rel));
+        for rel in probes {
+            assert_eq!(listed_in_compiled_lists(rel), boot_critical_rel(rel), "{rel}");
+            assert_eq!(none.is_listed(rel), listed_in_compiled_lists(rel), "none(): {rel}");
+            assert_eq!(live.is_listed(rel), listed_in_compiled_lists(rel), "for_live_pack(): {rel}");
+        }
+        // 이음새는 기동 필수 판정과 따로다(보호 목록에만 있는 파일 = 등재 ∧ 업데이트에서는 기동 필수 아님 — BC2).
+        let seam = UpdateSources::none().with_listed(|r| r == "bin/x.sh");
+        assert!(seam.is_listed("bin/x.sh") && !seam.is_boot_critical("bin/x.sh"));
+    }
+
+    /// ★T2f: 출시본 바이트 = 내장 vendor 본 · 이 설치의 매니페스트 · 과거 출시 해시 표 중 하나와 같은 UTF-8 바이트.
+    #[test]
+    fn t2f_released_bytes_are_embedded_manifest_or_table_bytes() {
+        let rig = Rig::new("t2frel");
+        let (rel, embed) = PACK_ALL.iter().find(|(r, _)| r.starts_with("bin/")).map(|(r, c)| (*r, *c)).unwrap();
+        let none = UpdateSources::none();
+        assert!(released_bytes(&rig.pack, rel, embed.as_bytes(), &none), "내장 vendor 본");
+        assert!(!released_bytes(&rig.pack, rel, b"MY EDIT\n", &none), "사용자 수정본");
+        assert!(!released_bytes(&rig.pack, rel, &[0xffu8, 0xfe], &none), "비 UTF-8");
+        rig.manifest(&[(rel, "LAST APPLIED VENDOR\n")]);
+        assert!(released_bytes(&rig.pack, rel, b"LAST APPLIED VENDOR\n", &none), "이 설치의 매니페스트");
+        let h = content_hash("OLD RELEASE\n");
+        let table = UpdateSources::none().with_prev_vendor(move |_| vec![h.clone()]);
+        assert!(released_bytes(&rig.pack, rel, b"OLD RELEASE\n", &table), "과거 출시 해시 표");
+        assert!(!released_bytes(&rig.pack, rel, b"OLD RELEASE\n", &none));
     }
 
     /// RULINGS AJ3(복원 계약 O-C8-4 "링크는 링크로"): user 소유 파일 자리에 놓인 링크는 스냅샷에 링크로 기록되고, 파일 단위
