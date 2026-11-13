@@ -2868,7 +2868,7 @@ pub fn boot_critical_rel(rel: &str) -> bool {
 /// 그 철자들은 같은 파일을 연다 — 접기는 '목록에 있다' 쪽으로만 답을 바꾼다(보수 방향). T5a 의 목록 조회
 /// (`boot_critical::boot_critical_entry` · `protection_entry` 의 `rel_key`)와 같은 규칙의 지역 사본이다 — T5a 의 마지막
 /// 재기반 작업이 `listed_in_compiled_lists` 를 그 조회 함수로 바꿀 때 이 사본을 지운다(구현 하나).
-fn list_key(rel: &str) -> String {
+pub fn list_key(rel: &str) -> String {
     let mut r = rel.replace('\\', "/");
     while let Some(t) = r.strip_prefix("./") {
         r = t.to_string();
@@ -9404,6 +9404,8 @@ mod tests {
         // ★RULINGS BO1 재작성(종전: "나(기동 필수): 종전 폴백 기계 — disk=vendor · .user=병합본 · 캡처=ours · pristine
         //   미전진 · vendor-first{pristine-write-failed}" — 병합본을 만든 뒤 pristine 실패로 떨어졌다): 기동 필수 파일은 설치 때
         //   병합하지 않는다 — 병합본은 어디에도 없다. disk=vendor · .user=사용자본(ours) · 캡처 없음 · 원장 vendor-first{vendor-advanced}.
+        // 일반 파일 갈래가 남긴 캡처(증거)를 치우고 잰다 — 이 갈래가 새 캡처를 만들지 않는다는 것을 보기 위해.
+        let _ = std::fs::remove_dir_all(base_td.join("caps"));
         run_arm(true);
         assert_eq!(std::fs::read_to_string(pd.join(rel)).unwrap(), theirs,
             "[pristine-fail] 나: disk=vendor 보증");

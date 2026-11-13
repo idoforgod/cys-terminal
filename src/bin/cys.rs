@@ -41403,14 +41403,15 @@ mod tests {
         pm.insert(rel.clone(), cys::pack::content_hash_pub("RELEASED 0.14.56\n"));
         std::fs::write(prev.join(cys::pack::INSTALL_MANIFEST), serde_json::to_string(&pm).unwrap()).unwrap();
         std::fs::write(td.join(&rel), &embed).unwrap();
-        let bc = rel.clone();
-        // ★T2f 재작성(종전: `with_boot_critical` — AJ2 의 검사는 이제 BD4 의 단일 술어 `is_listed` 를 지난다).
+        // ★T2f 재작성(종전: `with_boot_critical` — AJ2 의 검사는 이제 BD4 의 단일 술어 `is_listed` 를 지난다). 술어는
+        // 목록 대조 키(접은 철자 — RULINGS BO2)를 받으므로 이음새도 접은 키로 비교한다.
+        let bc = cys::pack::list_key(&rel);
         let boot = cys::pack::UpdateSources::none().with_listed(move |r| r == bc);
         // AJ2: 스냅샷 없음 → pack.prev 경로. 기동 필수 + 출시본 아님 → --force-vendor 로도 거부.
         assert_eq!(run_pack_rollback_with(Some(rel.clone()), true, true, false, &boot), 1, "기동 필수: 강행 불가");
         assert_eq!(std::fs::read_to_string(td.join(&rel)).unwrap(), embed, "거부 = 무변경");
         // 같은 바이트가 과거 출시 해시 표에 있으면 출시본이다 — 종전 M4 규칙대로 --force-vendor 로 되돌린다.
-        let bc2 = rel.clone();
+        let bc2 = cys::pack::list_key(&rel);
         let h = cys::pack::content_hash_pub(prev_bytes);
         let boot_released = cys::pack::UpdateSources::none()
             .with_listed(move |r| r == bc2)
@@ -41458,7 +41459,8 @@ mod tests {
         let (td, rel, embed, _env) = t4_system_fixture("t2fw");
         let local = td.parent().unwrap().join("local");
         let _l = cys::pack::EnvGuard::set("CYS_LOCAL_DIR", &local);
-        let r1 = rel.clone();
+        // 술어는 목록 대조 키(접은 철자)를 받는다 — 이음새도 접은 키로 비교한다.
+        let r1 = cys::pack::list_key(&rel);
         let listed = cys::pack::UpdateSources::none().with_listed(move |r| r == r1);
         let plain = cys::pack::UpdateSources::none();
         let mine = "MY UNAPPROVED BOOT EDIT\n";
@@ -41648,7 +41650,8 @@ mod tests {
     fn t2f_tampered_new_of_a_listed_file_is_never_released() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (td, rel, embed, _env) = t4_system_fixture("t2fnew");
-        let r1 = rel.clone();
+        // 술어는 목록 대조 키(접은 철자)를 받는다 — 이음새도 접은 키로 비교한다.
+        let r1 = cys::pack::list_key(&rel);
         let listed = cys::pack::UpdateSources::none().with_listed(move |r| r == r1);
         let mine = "MY LIVE COPY\n";
         let tampered = "TAMPERED PARKED COPY\n";
@@ -41706,7 +41709,8 @@ mod tests {
     fn t2f_keep_mine_that_changes_no_live_byte_is_allowed_on_a_listed_file() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (td, rel, embed, _env) = t4_system_fixture("t2fkm");
-        let r1 = rel.clone();
+        // 술어는 목록 대조 키(접은 철자)를 받는다 — 이음새도 접은 키로 비교한다.
+        let r1 = cys::pack::list_key(&rel);
         let listed = cys::pack::UpdateSources::none().with_listed(move |r| r == r1);
         let mine = "MY COPY STAYS LIVE\n";
         std::fs::write(td.join(&rel), mine).unwrap();
