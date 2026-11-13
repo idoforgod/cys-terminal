@@ -6179,7 +6179,7 @@ class Preflight:
             parts.append("(at-rest) kept-drift %d건·merged %d건 — 조치 불요 보존 상태(정보 병기)"
                          % (atrest_kd, atrest_mg))
         self.add(cid, WARN, "; ".join(parts)
-                 + " — `cys pack-merge`로 검토(가치 있는 수정은 vendor 승격 제보)"
+                 + " — `cys pack-merge`로 검토(내 수정은 이 설치에서 유지·수리한다)"
                  + " · 방금 원복된 파일의 원커맨드 복원: `cys pack-rollback --file <파일>`")
 
     # ── ★0.15.0 M11 가·나·차 — 부서당 과제 하나(설계 §4-11 가 "합치기는 부서당 과제 하나로 묶어 워커가",

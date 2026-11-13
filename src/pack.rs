@@ -3264,7 +3264,8 @@ pub(crate) const LINEAGE_KINDS: [&str; 2] = ["merged", "conflicted"];
 /// vendor 신버전은 `<rel>.new` 보관(합치기 과제 = 워커). `vendor-first` = 기동 필수 파일의 충돌 — vendor 본을
 /// 먼저 살리고 사용자 수정본은 `<rel>.user`(이전 세대는 `.user.prev-<ts>`)로 보관(다시 입히기 = 워커 +
 /// 주인 승인 · `cys repair reapply`). `conflicted` 는 재사용하지 않는다 — 그 kind 를 읽는 모든 곳이 뜻을
-/// 거꾸로 읽는다(설계 §4-11 가). 두 kind 모두 C68 기한 제외가 아니다(과제가 남아 있다).
+/// 거꾸로 읽는다(설계 §4-11 가). C68 기한: `user-kept` 는 **제외**(사용자가 이겼다 — 날마다 master 를 깨우지 않는다 ·
+/// RULINGS AC7), `vendor-first` 는 기한을 **유지**한다(기동 필수 파일의 다시 입히기 = 승인 절차가 남았다).
 pub const LEDGER_KINDS: [&str; 9] = [
     "healed",
     "new-pending",
@@ -5171,8 +5172,6 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
     )
 }
 
-/// [`install_into`] 의 입력원 주입판 — 판정·실행의 본체(★0.15.0 M11 업데이트 규칙).
-#[allow(clippy::too_many_arguments)]
 /// ★0.15.0 M11 아 + RULINGS AC3·AC4: 이번 설치의 업데이트 전 스냅샷. None = 만들 일이 없다(입력원이 루트·레인을
 /// 주지 않음 · 디스크 버전 없음 또는 = 대상 · 매니페스트 없음 · **이 전환의 스냅샷이 이미 있음** · 덮거나 지울 파일 0).
 /// 대상 = 설치 실행부와 같은 판정(plan)이 덮는다(갱신·치유·병합·vendor 우선)·지운다(폐기 정리)로 고른 파일 중 디스크
@@ -5251,6 +5250,8 @@ fn take_update_snapshot(
     ))
 }
 
+/// [`install_into`] 의 입력원 주입판 — 판정·실행의 본체(★0.15.0 M11 업데이트 규칙).
+#[allow(clippy::too_many_arguments)]
 pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
     dir: PathBuf,
     items: I,
@@ -13961,6 +13962,60 @@ mod m11_tests {
         assert_eq!(kept_versions, vec!["2.0.0", "3.0.0", "4.0.0"], "가장 오래된 1.0.0 세대가 정리되고 생성 순서가 유지된다");
         let newest = newest_update_snapshot(&root, "base").expect("최신");
         assert_eq!(read_update_snapshot_meta(&newest).unwrap().pack_version, "4.0.0", "최신 = 마지막에 만든 스냅샷");
+    }
+
+    /// RULINGS AJ3(복원 계약 O-C8-4 "링크는 링크로"): user 소유 파일 자리에 놓인 링크는 스냅샷에 링크로 기록되고, 파일 단위
+    /// 복원은 그것을 **링크로** 되살린다(파일 사본이 아니다). user 파일이라 출시본 여부와 무관하게 되돌린다.
+    #[cfg(unix)]
+    #[test]
+    fn m11_snapshot_restores_a_user_owned_link_as_a_link() {
+        let rig = Rig::new("snaplink");
+        let root = rig.base.join("snapshots");
+        let rel = "agents.json";
+        assert_eq!(ownership_scoped(rel, PackScope::Base), Ownership::User);
+        rig.write("my-agents.json", b"{\"mine\":1}\n");
+        std::os::unix::fs::symlink(rig.pack.join("my-agents.json"), rig.pack.join(rel)).unwrap();
+        let none = |_: &str| Vec::new();
+        let o = create_update_snapshot(&rig.pack, &root, "base", "1.0.0", &std::collections::BTreeMap::new(),
+                                       &[rel.to_string()], PackScope::Base, &none,
+                                       (UPDATE_SNAPSHOT_FILE_CAP, UPDATE_SNAPSHOT_TOTAL_CAP)).unwrap();
+        let meta = read_update_snapshot_meta(&o.path).unwrap();
+        assert_eq!(meta.files[0].link_target.as_deref(), Some(rig.pack.join("my-agents.json").to_str().unwrap()));
+        assert!(!meta.files[0].released);
+        // 업데이트가 링크를 파일로 바꿨다고 치고 되돌린다.
+        std::fs::remove_file(rig.pack.join(rel)).unwrap();
+        rig.write(rel, b"{\"vendor\":2}\n");
+        let done = restore_update_snapshot(&o.path, &rig.pack, Some(&[rel.to_string()])).unwrap();
+        assert_eq!(done, vec![rel.to_string()]);
+        let m = std::fs::symlink_metadata(rig.pack.join(rel)).unwrap();
+        assert!(m.file_type().is_symlink(), "링크로 되살아나야 한다(파일 사본 아님)");
+        assert_eq!(std::fs::read_link(rig.pack.join(rel)).unwrap(), rig.pack.join("my-agents.json"));
+        assert_eq!(rig.read(rel).as_deref(), Some("{\"mine\":1}\n"), "링크 대상 그대로");
+    }
+
+    /// RULINGS AJ3: 파이썬 점검의 다섯 생명줄 이름(`javis_preflight.EXPECTED_LIFELINES`)은 Rust 상수 `LIFELINE_HOOKS` 에서
+    /// 상태줄(목록 밖 — O-C4-4)을 뺀 다섯과 **같다**. 한쪽만 바뀌면 빨갛다.
+    #[test]
+    fn m11_python_expected_lifelines_match_the_rust_constant() {
+        let py = include_str!("../cysjavis-pack/bin/javis_preflight.py");
+        let start = py.find("EXPECTED_LIFELINES = (").expect("EXPECTED_LIFELINES 정의");
+        let body = &py[start..];
+        let body = &body[..body.find(')').expect("튜플 끝")];
+        let mut py_names: Vec<String> = body
+            .split('"')
+            .enumerate()
+            .filter(|(i, _)| i % 2 == 1)
+            .map(|(_, s)| s.to_string())
+            .collect();
+        py_names.sort();
+        let mut rs_names: Vec<String> = crate::repair::boot_critical::LIFELINE_HOOKS
+            .iter()
+            .filter(|n| **n != "cys-statusline.sh")
+            .map(|n| n.to_string())
+            .collect();
+        rs_names.sort();
+        assert_eq!(py_names.len(), 5, "파이썬 쪽 이름 수: {py_names:?}");
+        assert_eq!(py_names, rs_names, "생명줄 이름이 두 언어에서 갈렸다");
     }
 
     /// RULINGS AC3: 전환마다 스냅샷 하나 — 실패를 거듭하는 기동 설치(버전 표시가 전진하지 못함)는 다시 복사하지 않고,
