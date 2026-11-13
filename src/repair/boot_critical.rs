@@ -2450,8 +2450,10 @@ mod tests {
         for d in &deps {
             let readers: Vec<&&Entry> =
                 hooks.iter().filter(|h| reads[h.rel].contains(*d)).collect();
+            // a recipe that NAMES the file as one it reaches counts as a reader even where no
+            // tripwire can be put in (a JSON file such as `bin/skillscan_rules.json`)
             let recipe_readers: Vec<usize> = (0..RECIPES.len())
-                .filter(|i| recipe_reads[*i].contains(*d))
+                .filter(|i| recipe_reads[*i].contains(*d) || RECIPES[*i].2.contains(d))
                 .collect();
             if readers.is_empty() && recipe_readers.is_empty() {
                 matrix.push(format!(

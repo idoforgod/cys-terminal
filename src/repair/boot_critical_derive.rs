@@ -367,8 +367,8 @@ pub const MEASURED_HOOK_DEPS: &[(&str, &str, bool, &str)] = &[
     (
         "bin/javis_memory.py",
         "hooks/reflect-scan.sh",
-        true,
-        "reflect-scan.sh runs `verify` with its output and exit discarded (reflect-scan.sh 55-60; recipe round runs it) — no recipe can make the hook's result depend on it (stage-5)",
+        false,
+        "reflect-scan.sh runs `verify` with its output discarded (reflect-scan.sh 55-60), but inject-context.sh's checklist phase runs it too: broken -> inject-context's injected text changes (recipe state-poison)",
     ),
     (
         "bin/javis_reflect.py",
@@ -379,8 +379,8 @@ pub const MEASURED_HOOK_DEPS: &[(&str, &str, bool, &str)] = &[
     (
         "bin/javis_route.py",
         "hooks/grill-arm.sh",
-        true,
-        "grill_gate.py `begin` (run by grill-arm.sh with its output discarded) sets the grill floor with it; the effect reaches only a LATER grill-gate run (stage-5)",
+        false,
+        "grill_gate.py `begin` sets the grill floor with it (grill-arm.sh, output discarded); inject-context.sh's checklist phase runs it: broken -> inject-context's injected text changes (recipe state-poison)",
     ),
     (
         "bin/javis_role.py",
@@ -391,8 +391,8 @@ pub const MEASURED_HOOK_DEPS: &[(&str, &str, bool, &str)] = &[
     (
         "bin/javis_scrub.py",
         "hooks/save-state.sh",
-        true,
-        "a guarded import of javis_snapshot.py (secret masking of the snapshot), see javis_role.py (stage-5)",
+        false,
+        "a guarded import of javis_snapshot.py (secret masking); inject-context.sh's checklist phase runs it: broken -> inject-context's injected text changes (recipe state-poison)",
     ),
     (
         "bin/javis_task.py",
@@ -403,8 +403,8 @@ pub const MEASURED_HOOK_DEPS: &[(&str, &str, bool, &str)] = &[
     (
         "bin/javis_wakeup.py",
         "hooks/save-state.sh",
-        true,
-        "imported by javis_snapshot.py (the wake-queue section of the snapshot), see javis_role.py (stage-5)",
+        false,
+        "imported by javis_snapshot.py (the wake-queue section); inject-context.sh's checklist phase runs it: broken -> inject-context's injected text changes (recipe state-poison)",
     ),
 ];
 
