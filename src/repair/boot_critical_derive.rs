@@ -41,6 +41,9 @@ pub struct GenEntry {
     pub lifeline: bool,
     /// Why the row exists (anchor / binder) — provenance, not part of the O-C4-3 entry format.
     pub why: String,
+    /// What proves the row (RULINGS AL1): `hook-replay` (class 1), `bootstrap-replay` (class 2),
+    /// `real-level` (class 3 — the stage-5 end-to-end derivation test); `` for protection rows.
+    pub proof: &'static str,
 }
 
 /// The texts the derivation reads. `pack_file` takes a pack-relative rel (`bin/x.py`),
@@ -68,9 +71,14 @@ pub struct ProofAnchor {
     pub check: &'static str,
     pub check_arg: &'static str,
     pub why: &'static str,
+    /// RULINGS AL1: `bootstrap-replay` (class 2 — measured at the bootstrap layer), `real-level`
+    /// (class 3 — named by the design or start-critical through a stated real-machine
+    /// dependency), `` for protection rows.
+    pub level: &'static str,
 }
 
 pub const PROOF_ANCHORS: &[ProofAnchor] = &[
+    // ── class 2 (RULINGS AL1): breaking it stops the start at the bootstrap layer (measured) ──
     ProofAnchor {
         proof: "cysjavis-pack/hooks/role-bootstrap-legacy.sh",
         literal: "BOOT=\"$PACK/bin/javis_bootstrap.py\"",
@@ -78,16 +86,8 @@ pub const PROOF_ANCHORS: &[ProofAnchor] = &[
         category: "start-script",
         check: "py-compile",
         check_arg: "",
-        why: "start: the role-bootstrap body hands the team boot to it (the app's boot button runs the same chain)",
-    },
-    ProofAnchor {
-        proof: "cysjavis-pack/bin/javis_bootstrap.py",
-        literal: "os.path.join(PACK, \"bin\", \"javis_preflight.py\")",
-        rel: "bin/javis_preflight.py",
-        category: "start-script",
-        check: "py-compile",
-        check_arg: "",
-        why: "start: boot step 1 runs preflight --fix",
+        why: "start: the role-bootstrap body hands the team boot to it (the app's boot button runs the same chain); broken → the boot fails (bootstrap replay)",
+        level: "bootstrap-replay",
     },
     ProofAnchor {
         proof: "cysjavis-pack/bin/javis_bootstrap.py",
@@ -96,16 +96,19 @@ pub const PROOF_ANCHORS: &[ProofAnchor] = &[
         category: "start-script",
         check: "py-compile",
         check_arg: "",
-        why: "start: boot step 5 runs `orchestra check`; on failure the boot ends with EXIT_CHECK and writes no completion marker (RULINGS AI1)",
+        why: "start: boot step 5 runs `orchestra check`; broken → EXIT_CHECK, no completion marker (bootstrap replay)",
+        level: "bootstrap-replay",
     },
+    // ── class 3 (RULINGS AL1): named by the design / start-critical on a real machine ──
     ProofAnchor {
-        proof: "cysjavis-pack/bin/javis_formation.py",
-        literal: "node = os.path.join(PACK_DIR, \"bin\", \"javis_boot_node.py\")",
-        rel: "bin/javis_boot_node.py",
+        proof: "cysjavis-pack/bin/javis_bootstrap.py",
+        literal: "os.path.join(PACK, \"bin\", \"javis_preflight.py\")",
+        rel: "bin/javis_preflight.py",
         category: "start-script",
         check: "py-compile",
         check_arg: "",
-        why: "start: formation attaches every seat through it (RULINGS AI1)",
+        why: "start: boot step 1 runs preflight --fix, the step that repairs a broken installation at boot (named, D:730)",
+        level: "real-level",
     },
     ProofAnchor {
         proof: "src/bin/cysd/schedule.rs",
@@ -114,7 +117,8 @@ pub const PROOF_ANCHORS: &[ProofAnchor] = &[
         category: "start-script",
         check: "sh-syntax",
         check_arg: "",
-        why: "restore: the daemon's built-in department restore jobs run it ([ -x … ] || exit 0)",
+        why: "restore: the departments' start and restore (the daemon's built-in department restore jobs run it) (named)",
+        level: "real-level",
     },
     ProofAnchor {
         proof: "src/bin/cys.rs",
@@ -123,8 +127,30 @@ pub const PROOF_ANCHORS: &[ProofAnchor] = &[
         category: "config",
         check: "none-prerehearsal",
         check_arg: "json-parse",
-        why: "config: load_agent_spec fails hard on a parse error, so no seat launches (C4 4.12: approved first, post-checked)",
+        why: "config: read at start; load_agent_spec fails hard on a parse error, so no seat launches (named, D:731; C4 4.12: approved first, post-checked)",
+        level: "real-level",
     },
+    ProofAnchor {
+        proof: "cysjavis-pack/bin/javis_formation.py",
+        literal: "node = os.path.join(PACK_DIR, \"bin\", \"javis_boot_node.py\")",
+        rel: "bin/javis_boot_node.py",
+        category: "start-script",
+        check: "py-compile",
+        check_arg: "",
+        why: "start: every seat is attached through it — without seats boot step 5 fails on a real machine (RULINGS AL1)",
+        level: "real-level",
+    },
+    ProofAnchor {
+        proof: "cysjavis-pack/bin/cys-dept",
+        literal: "fm=\"${CYS_PACK_DIR:-$PACK_DEFAULT}/bin/javis_formation.py\"",
+        rel: "bin/javis_formation.py",
+        category: "start-script",
+        check: "py-compile",
+        check_arg: "",
+        why: "start: the standing formation attaches every department seat (cys-dept launch → formation → boot_node) (RULINGS AL1)",
+        level: "real-level",
+    },
+    // ── the sibling protection list (C4 4.10 · RULINGS AI6) ──
     ProofAnchor {
         proof: "src/pack.rs",
         literal: "SYSTEM_LOCKED: &[&str] = &[\"trusted-keys.json\"]",
@@ -133,6 +159,7 @@ pub const PROOF_ANCHORS: &[ProofAnchor] = &[
         check: "json-parse",
         check_arg: "",
         why: "protection 1 (update signature check): the keyring",
+        level: "",
     },
     ProofAnchor {
         proof: "cysjavis-pack/bin/javis_preflight.py",
@@ -142,6 +169,7 @@ pub const PROOF_ANCHORS: &[ProofAnchor] = &[
         check: "self-test",
         check_arg: "--self-test",
         why: "protections 3 and 4 (reviewers cannot modify review targets; CSO file write limit)",
+        level: "",
     },
     ProofAnchor {
         proof: "cysjavis-pack/bin/javis_preflight.py",
@@ -151,6 +179,7 @@ pub const PROOF_ANCHORS: &[ProofAnchor] = &[
         check: "sh-syntax",
         check_arg: "",
         why: "protection 2 (owner approval before irreversible actions / external sends): the irreversible-action gate",
+        level: "",
     },
 ];
 
@@ -204,6 +233,52 @@ pub const KNOWN_SETTINGS_WRITERS: &[&str] = &[
     "bin/javis_preflight.py",
     "bin/javis_dept_migrate.py",
     "bin/javis_guard_register.py",
+];
+
+/// RULINGS AL1/AL3 — the candidates the extended closure finds that are NOT boot-critical, each
+/// with the measurement that dropped it (`test_boot_critical_start_replay`, bootstrap layer,
+/// 2026-11-13): the start survives their breakage.
+pub const DROPPED_CANDIDATES: &[(&str, &str)] = &[
+    ("bin/javis_actprobe.py", "never read by the boot; broken -> the boot completes (a preflight check or a tool of one, not reached at start)"),
+    ("bin/javis_backup.py", "never read by the boot; imported only by javis_phoenix.py (itself dropped)"),
+    ("bin/javis_brief_lint.py", "never read by the boot; broken -> the boot completes (a preflight check or a tool of one, not reached at start)"),
+    ("bin/javis_budget.py", "read by the boot; broken alone -> the boot completes (an optional import of the boot script / orchestra / boot_node with a fallback)"),
+    ("bin/javis_channels.py", "read by the boot; broken alone -> the boot completes (an optional import of the boot script / orchestra / boot_node with a fallback)"),
+    ("bin/javis_cleanroom.py", "read by the boot; broken alone -> the boot completes (a preflight check or its tool; a failing check is reported, not fatal)"),
+    ("bin/javis_cli_probe.py", "never read by the boot; formation's optional import (try/except, explicit fallback)"),
+    ("bin/javis_completion_guard.py", "read by the boot; broken alone -> the boot completes (a preflight check or its tool; a failing check is reported, not fatal)"),
+    ("bin/javis_cycle_autopilot.py", "read by the boot; broken alone -> the boot completes (a preflight check or its tool; a failing check is reported, not fatal)"),
+    ("bin/javis_cycle_verifier.py", "never read by the boot; broken -> the boot completes (a preflight check or a tool of one, not reached at start)"),
+    ("bin/javis_dept_schedule.py", "never read by the boot; cys-dept runs it when a department is CREATED, not at start"),
+    ("bin/javis_event.py", "never read by the boot; broken -> the boot completes (a preflight check or a tool of one, not reached at start)"),
+    ("bin/javis_factcheck_gate.py", "never read by the boot; broken -> the boot completes (a preflight check or a tool of one, not reached at start)"),
+    ("bin/javis_guard_register.py", "never read by the boot; broken -> the boot completes (a preflight check or a tool of one, not reached at start)"),
+    ("bin/javis_lane.py", "read by the boot; broken alone -> the boot completes (an optional import of the boot script / orchestra / boot_node with a fallback)"),
+    ("bin/javis_lock.py", "read by the boot; broken alone -> the boot completes (a preflight check or its tool; a failing check is reported, not fatal)"),
+    ("bin/javis_manifest.py", "read by the boot; broken alone -> the boot completes (a preflight check or its tool; a failing check is reported, not fatal)"),
+    ("bin/javis_mcpgate.py", "read by the boot; broken alone -> the boot completes (a preflight check or its tool; a failing check is reported, not fatal)"),
+    ("bin/javis_phoenix.py", "never read by the boot; cys-dept calls it best-effort (`|| true`, tombstones) and the daemon restores from the EMBEDDED copy first"),
+    ("bin/javis_radio.py", "read by the boot; broken alone -> the boot completes (a preflight check or its tool; a failing check is reported, not fatal)"),
+    ("bin/javis_reflect.py", "never read by the boot; broken -> the boot completes (a preflight check or a tool of one, not reached at start)"),
+    ("bin/javis_registry.py", "read by the boot; broken alone -> the boot completes (a preflight check or its tool; a failing check is reported, not fatal)"),
+    ("bin/javis_report.py", "never read by the boot; broken -> the boot completes (a preflight check or a tool of one, not reached at start)"),
+    ("bin/javis_resource_gate.py", "read by the boot; broken alone -> the boot completes (a preflight check or its tool; a failing check is reported, not fatal)"),
+    ("bin/javis_role.py", "never read by the boot; broken -> the boot completes (a preflight check or a tool of one, not reached at start)"),
+    ("bin/javis_route.py", "read by the boot; broken alone -> the boot completes (a preflight check or its tool; a failing check is reported, not fatal)"),
+    ("bin/javis_runtime_seal.py", "read by the boot; broken alone -> the boot completes (a preflight check or its tool; a failing check is reported, not fatal)"),
+    ("bin/javis_scrub.py", "read by the boot; broken alone -> the boot completes (a preflight check or its tool; a failing check is reported, not fatal)"),
+    ("bin/javis_semver.py", "read by the boot; broken alone -> the boot completes (a preflight check or its tool; a failing check is reported, not fatal)"),
+    ("bin/javis_serena_probe.py", "never read by the boot; broken -> the boot completes (a preflight check or a tool of one, not reached at start)"),
+    ("bin/javis_skillscan.py", "read by the boot; broken alone -> the boot completes (a preflight check or its tool; a failing check is reported, not fatal)"),
+    ("bin/javis_spool_path.py", "never read by the boot; broken -> the boot completes (a preflight check or a tool of one, not reached at start)"),
+    ("bin/javis_state_ledger.py", "never read by the boot; broken -> the boot completes (a preflight check or a tool of one, not reached at start)"),
+    ("bin/javis_state_snapshot.py", "never read by the boot; broken -> the boot completes (a preflight check or a tool of one, not reached at start)"),
+    ("bin/javis_task.py", "never read by the boot; broken -> the boot completes (a preflight check or a tool of one, not reached at start)"),
+    ("bin/javis_todo_decl.py", "read by the boot; broken alone -> the boot completes (a preflight check or its tool; a failing check is reported, not fatal)"),
+    ("bin/javis_verdict.py", "read by the boot; broken alone -> the boot completes (an optional import of the boot script / orchestra / boot_node with a fallback)"),
+    ("bin/javis_waiver.py", "never read by the boot; broken -> the boot completes (a preflight check or a tool of one, not reached at start)"),
+    ("bin/javis_wakeup.py", "read by the boot; broken alone -> the boot completes (a preflight check or its tool; a failing check is reported, not fatal)"),
+    ("bin/skillscan_rules.json", "read by the boot; broken alone -> the boot completes (a preflight check or its tool; a failing check is reported, not fatal)"),
 ];
 
 const CATEGORY_ORDER: &[&str] = &[
@@ -1238,6 +1313,22 @@ fn string_literals(args: &str) -> Vec<String> {
 /// - Shell: a source line, a variable whose value ends with a pack path, and an interpreter
 ///   launching a pack tool by path (`python3 "…/bin/x.py"`, `"$CYS_PY" "…/bin/x.py"`).
 pub fn bindings(rel: &str, text: &str, rels: &BTreeSet<&str>) -> Vec<(String, String)> {
+    bindings_impl(rel, text, rels, true)
+}
+
+/// The STRUCTURAL bindings of a hook (class 1 of RULINGS AL1 — the files the hook uses: a source
+/// line, a variable whose value ends with a pack path, a column-0 Python import). The extended
+/// rule ([`bindings`]) finds candidates for the census; this one builds the hook-dependency rows.
+pub fn hook_bindings(rel: &str, text: &str, rels: &BTreeSet<&str>) -> Vec<(String, String)> {
+    bindings_impl(rel, text, rels, false)
+}
+
+fn bindings_impl(
+    rel: &str,
+    text: &str,
+    rels: &BTreeSet<&str>,
+    extended: bool,
+) -> Vec<(String, String)> {
     let mut out: BTreeMap<String, String> = BTreeMap::new();
     let mut add = |cand: String, how: String| {
         if rels.contains(cand.as_str()) && cand != rel {
@@ -1247,7 +1338,8 @@ pub fn bindings(rel: &str, text: &str, rels: &BTreeSet<&str>) -> Vec<(String, St
     if rel.ends_with(".py") || text.lines().next().is_some_and(|l| l.contains("python")) {
         let code = py_code_view(text);
         for line in code.lines() {
-            let t = line.trim_start();
+            // structural mode: module-level imports only; extended: wherever written
+            let t = if extended { line.trim_start() } else { line };
             let mods: Vec<String> = if let Some(r) = t.strip_prefix("import ") {
                 r.split(',')
                     .map(|m| m.split_whitespace().next().unwrap_or("").to_string())
@@ -1266,6 +1358,9 @@ pub fn bindings(rel: &str, text: &str, rels: &BTreeSet<&str>) -> Vec<(String, St
                 }
                 add(format!("bin/{m}.py"), format!("imported by {rel}"));
             }
+        }
+        if !extended {
+            return out.into_iter().collect();
         }
         for opener in ["import_module(", "__import__("] {
             for (at, _) in code.match_indices(opener) {
@@ -1302,7 +1397,7 @@ pub fn bindings(rel: &str, text: &str, rels: &BTreeSet<&str>) -> Vec<(String, St
             if line.trim_end() == term.as_str() {
                 if *python {
                     let inner = format!("{rel}#heredoc.py");
-                    for (c, how) in bindings(&inner, body, rels) {
+                    for (c, how) in bindings_impl(&inner, body, rels, extended) {
                         add(c, how.replace(&inner, rel));
                     }
                 }
@@ -1353,7 +1448,8 @@ pub fn bindings(rel: &str, text: &str, rels: &BTreeSet<&str>) -> Vec<(String, St
                 k += 1;
             }
             let unq = |w: &str| w.trim_matches(|c| c == '"' || c == '\'').to_string();
-            if k < words.len()
+            if extended
+                && k < words.len()
                 && matches!(
                     unq(words[k]).as_str(),
                     "python3" | "python" | "py" | "$CYS_PY" | "${CYS_PY}" | "$PY" | "${PY}"
@@ -1504,13 +1600,13 @@ pub fn derive(src: &Sources) -> Result<Vec<GenEntry>, String> {
                     "registered: {}",
                     sources.iter().copied().collect::<Vec<_>>().join("; ")
                 ),
+                proof: "hook-replay",
             },
         );
     }
 
-    // 3/4/5. proof anchors (start, config, protection)
+    // 3/4/5. proof anchors: class 2 / class 3 start rows and the protection list (RULINGS AL1)
     let mut protection: Vec<GenEntry> = Vec::new();
-    let mut starts: Vec<String> = Vec::new();
     for a in PROOF_ANCHORS {
         match (src.repo_file)(a.proof).map(|t| lf(&t)) {
             None => errs.push(format!(
@@ -1535,13 +1631,11 @@ pub fn derive(src: &Sources) -> Result<Vec<GenEntry>, String> {
             timeout_s: None,
             lifeline: false,
             why: format!("{} (proof: {})", a.why, a.proof),
+            proof: a.level,
         };
         if a.category == "protection" {
             protection.push(row);
             continue;
-        }
-        if a.category == "start-script" {
-            starts.push(a.rel.to_string());
         }
         match rows.get(a.rel) {
             Some(existing) if existing.category == "hook" => {}
@@ -1551,8 +1645,10 @@ pub fn derive(src: &Sources) -> Result<Vec<GenEntry>, String> {
         }
     }
 
-    // 2. closure: hooks (+ declared hook bodies) → hook-dep; starts → start-dep
-    let walk = |roots: Vec<(String, String)>| -> Vec<(String, String)> {
+    // 2. class 1: the files the hooks use — STRUCTURAL closure (source lines, path-valued
+    //    variables, HOOK_BODY_FILES, module-level imports), each row proven by the hook replay
+    type Binder = fn(&str, &str, &BTreeSet<&str>) -> Vec<(String, String)>;
+    let walk = |roots: Vec<(String, String)>, bind: Binder| -> Vec<(String, String)> {
         let mut seen: BTreeMap<String, String> = BTreeMap::new();
         let mut queue: Vec<(String, String)> = roots;
         while let Some((r, why)) = queue.pop() {
@@ -1560,7 +1656,7 @@ pub fn derive(src: &Sources) -> Result<Vec<GenEntry>, String> {
                 continue;
             }
             let text = (src.pack_file)(&r).map(|t| lf(&t)).unwrap_or_default();
-            for (child, how) in bindings(&r, &text, &rels) {
+            for (child, how) in bind(&r, &text, &rels) {
                 if !seen.contains_key(&child) {
                     queue.push((child, how));
                 }
@@ -1587,35 +1683,56 @@ pub fn derive(src: &Sources) -> Result<Vec<GenEntry>, String> {
             ));
         }
     }
-    let start_roots: Vec<(String, String)> = starts
-        .iter()
-        .map(|s| (s.clone(), "start".to_string()))
+    for (rel, why) in walk(hook_roots, hook_bindings) {
+        if rows.contains_key(&rel) {
+            continue;
+        }
+        let base = rel.rsplit('/').next().unwrap_or(&rel).to_string();
+        if excluded.contains(&base) || is_clear_procedure_rel(&rel) {
+            continue;
+        }
+        let text = (src.pack_file)(&rel).map(|t| lf(&t));
+        rows.insert(
+            rel.clone(),
+            GenEntry {
+                check: file_kind_check(&rel, text.as_deref()),
+                rel,
+                category: "hook-dep",
+                check_arg: String::new(),
+                timeout_s: None,
+                lifeline: false,
+                why,
+                proof: "hook-replay",
+            },
+        );
+    }
+
+    // AL3 — the extended closure (imports wherever written, tools launched or opened by path,
+    //   heredocs) FINDS candidates from every listed row; a candidate that is neither listed nor
+    //   a measured drop is a NEW start-path file → build failure naming it (measure it with
+    //   test_boot_critical_start_replay, then list it or add it to DROPPED_CANDIDATES)
+    let listed_roots: Vec<(String, String)> = rows
+        .keys()
+        .map(|r| (r.clone(), "listed".to_string()))
         .collect();
-    for (closure, cat) in [
-        (walk(hook_roots), "hook-dep"),
-        (walk(start_roots), "start-dep"),
-    ] {
-        for (rel, why) in closure {
-            if rows.contains_key(&rel) {
-                continue;
-            }
-            let base = rel.rsplit('/').next().unwrap_or(&rel).to_string();
-            if excluded.contains(&base) || is_clear_procedure_rel(&rel) {
-                continue;
-            }
-            let text = (src.pack_file)(&rel).map(|t| lf(&t));
-            rows.insert(
-                rel.clone(),
-                GenEntry {
-                    check: file_kind_check(&rel, text.as_deref()),
-                    rel,
-                    category: cat,
-                    check_arg: String::new(),
-                    timeout_s: None,
-                    lifeline: false,
-                    why,
-                },
-            );
+    let dropped: BTreeSet<&str> = DROPPED_CANDIDATES.iter().map(|(r, _)| *r).collect();
+    for (rel, how) in walk(listed_roots, bindings) {
+        if rows.contains_key(&rel) || dropped.contains(rel.as_str()) {
+            continue;
+        }
+        let base = rel.rsplit('/').next().unwrap_or(&rel).to_string();
+        if excluded.contains(&base) || is_clear_procedure_rel(&rel) {
+            continue;
+        }
+        errs.push(format!(
+            "census: new start-path candidate `{rel}` ({how}) — neither listed nor a measured drop; run test_boot_critical_start_replay and classify it (RULINGS AL1/AL3)"
+        ));
+    }
+    for (rel, _) in DROPPED_CANDIDATES {
+        if rows.contains_key(*rel) {
+            errs.push(format!(
+                "`{rel}` is both listed and in DROPPED_CANDIDATES — remove one (RULINGS AL3)"
+            ));
         }
     }
 
@@ -1710,6 +1827,16 @@ pub fn render(entries: &[GenEntry]) -> String {
             s.push_str(&format!("    {:?},\n", e.why));
         }
         s.push_str("];\n");
+        if !protection {
+            // RULINGS AL1 — what proves each row: hook-replay | bootstrap-replay | real-level
+            s.push_str(&format!(
+                "/// What proves each row of [`{name}`] (same order): `hook-replay` (class 1), `bootstrap-replay` (class 2), `real-level` (class 3).\nstatic {name}_PROOF: &[&str] = &[\n"
+            ));
+            for e in &rows {
+                s.push_str(&format!("    {:?},\n", e.proof));
+            }
+            s.push_str("];\n");
+        }
     }
     s
 }

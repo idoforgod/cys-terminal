@@ -1725,7 +1725,7 @@ mod tests {
         }
         assert!(rows.iter().all(|r| r["category"] != "protection"));
         for (r, e) in rows.iter().zip(table) {
-            assert_eq!(r, &cys::repair::boot_critical::entry_json(e));
+            assert_eq!(r, &cys::repair::boot_critical::list_entry_json(e));
             assert_eq!(r["rel"], e.rel);
             assert_eq!(r["lifeline"], e.lifeline);
             assert!(r["check"]["kind"].is_string() && r["check"]["arg"].is_string());
@@ -1740,6 +1740,19 @@ mod tests {
         keys.sort_unstable();
         assert_eq!(
             keys,
+            ["category", "check", "lifeline", "proof", "rel", "timeout_s"],
+            "O-C4-3 entry format + `proof` (RULINGS AL1)"
+        );
+        let pkeys: Vec<&str> = prot[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let mut pkeys = pkeys;
+        pkeys.sort_unstable();
+        assert_eq!(
+            pkeys,
             ["category", "check", "lifeline", "rel", "timeout_s"],
             "O-C4-3 entry format"
         );

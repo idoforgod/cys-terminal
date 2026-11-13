@@ -9,8 +9,9 @@ use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-// `static GENERATED` / `GENERATED_WHY` (boot-critical files) and `static GENERATED_PROTECTION` /
-// `GENERATED_PROTECTION_WHY` (the sibling protection list), each pair in the same order.
+// `static GENERATED` / `GENERATED_WHY` / `GENERATED_PROOF` (boot-critical files) and
+// `static GENERATED_PROTECTION` / `GENERATED_PROTECTION_WHY` (the sibling protection list), each
+// group in the same order.
 include!(concat!(env!("OUT_DIR"), "/boot_critical.rs"));
 
 /// The derivation itself, compiled again for the tests (census, anchors, freshness pin).
@@ -66,6 +67,18 @@ pub fn entries() -> &'static [Entry] {
 /// (`hooks/role-capability-gate.sh`).
 pub fn protection_entries() -> &'static [Entry] {
     GENERATED_PROTECTION
+}
+
+/// What proves a boot-critical row (RULINGS AL1): `hook-replay` (class 1 — a registered hook or a
+/// file it uses; breaking it stops that hook), `bootstrap-replay` (class 2 — breaking it stops the
+/// start at the bootstrap layer), `real-level` (class 3 — named by the design or start-critical
+/// through a stated real-machine dependency; an item of the stage-5 end-to-end derivation test).
+/// `None` for a protection row.
+pub fn proof(entry: &Entry) -> Option<&'static str> {
+    GENERATED
+        .iter()
+        .position(|e| e == entry)
+        .and_then(|i| GENERATED_PROOF.get(i).copied())
 }
 
 /// Why a row exists (the anchor or the binder that put it on its list).
@@ -425,13 +438,21 @@ pub fn entry_json(e: &Entry) -> serde_json::Value {
     })
 }
 
-/// `cys repair boot-critical --list --json`: `{"schema": 1, "entries": [<boot-critical rows>],
-/// "protection": [<protection rows>]}` — O-C4-3 row format in both; `entries` never holds a
+/// A boot-critical row: the O-C4-3 row plus `proof` (RULINGS AL1: `hook-replay` |
+/// `bootstrap-replay` | `real-level`).
+pub fn list_entry_json(e: &Entry) -> serde_json::Value {
+    let mut v = entry_json(e);
+    v["proof"] = serde_json::json!(proof(e));
+    v
+}
+
+/// `cys repair boot-critical --list --json`: `{"schema": 1, "entries": [<boot-critical rows,
+/// O-C4-3 + "proof">], "protection": [<protection rows, O-C4-3>]}`; `entries` never holds a
 /// protection-only row (RULINGS AI6).
 pub fn list_json() -> serde_json::Value {
     serde_json::json!({
         "schema": super::REPAIR_SCHEMA,
-        "entries": GENERATED.iter().map(entry_json).collect::<Vec<_>>(),
+        "entries": GENERATED.iter().map(list_entry_json).collect::<Vec<_>>(),
         "protection": GENERATED_PROTECTION.iter().map(entry_json).collect::<Vec<_>>(),
     })
 }
@@ -444,7 +465,7 @@ fn answer_json(input: &Path, a: &PathAnswer) -> serde_json::Value {
         "protection": a.protection.is_some(),
         "lane_pack": a.lane_pack.as_ref().map(|p| p.to_string_lossy().into_owned()),
         "rel": a.rel,
-        "entry": a.entry.map(entry_json),
+        "entry": a.entry.map(list_entry_json),
         "reason": a.reason,
     })
 }
@@ -601,8 +622,8 @@ mod tests {
     );
 
     /// The fixed input of the derivation tests (D:734 / RULINGS B6): the compiled boot-critical
-    /// list at this revision, row by row (RULINGS AI1: imports wherever written + tools launched or
-    /// opened by path). A change of the derivation or of an anchor shows up here first.
+    /// list at this revision, row by row — the three classes of RULINGS AL1 (registered hooks and
+    /// the files they use · start scripts measured at the bootstrap layer · real-level rows).
     const PINNED: &[Row] = &[
         (
             "agents.json",
@@ -630,22 +651,6 @@ mod tests {
             false,
         ),
         (
-            "bin/javis_actprobe.py",
-            C::HookDep,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
-            "bin/javis_backup.py",
-            C::HookDep,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
             "bin/javis_boot_node.py",
             C::StartScript,
             K::PyCompile,
@@ -662,79 +667,7 @@ mod tests {
             false,
         ),
         (
-            "bin/javis_brief_lint.py",
-            C::HookDep,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
-            "bin/javis_budget.py",
-            C::HookDep,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
-            "bin/javis_channels.py",
-            C::HookDep,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
             "bin/javis_checklist.py",
-            C::HookDep,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
-            "bin/javis_cleanroom.py",
-            C::HookDep,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
-            "bin/javis_cli_probe.py",
-            C::HookDep,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
-            "bin/javis_completion_guard.py",
-            C::HookDep,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
-            "bin/javis_cycle_autopilot.py",
-            C::HookDep,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
-            "bin/javis_cycle_verifier.py",
-            C::HookDep,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
-            "bin/javis_dept_schedule.py",
             C::HookDep,
             K::PyCompile,
             "",
@@ -750,64 +683,8 @@ mod tests {
             false,
         ),
         (
-            "bin/javis_event.py",
-            C::HookDep,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
-            "bin/javis_factcheck_gate.py",
-            C::HookDep,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
             "bin/javis_formation.py",
-            C::HookDep,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
-            "bin/javis_guard_register.py",
-            C::HookDep,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
-            "bin/javis_lane.py",
-            C::HookDep,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
-            "bin/javis_lock.py",
-            C::HookDep,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
-            "bin/javis_manifest.py",
-            C::HookDep,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
-            "bin/javis_mcpgate.py",
-            C::HookDep,
+            C::StartScript,
             K::PyCompile,
             "",
             None,
@@ -830,112 +707,8 @@ mod tests {
             false,
         ),
         (
-            "bin/javis_phoenix.py",
-            C::HookDep,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
             "bin/javis_preflight.py",
             C::StartScript,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
-            "bin/javis_radio.py",
-            C::HookDep,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
-            "bin/javis_reflect.py",
-            C::HookDep,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
-            "bin/javis_registry.py",
-            C::HookDep,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
-            "bin/javis_report.py",
-            C::HookDep,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
-            "bin/javis_resource_gate.py",
-            C::HookDep,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
-            "bin/javis_role.py",
-            C::HookDep,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
-            "bin/javis_route.py",
-            C::HookDep,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
-            "bin/javis_runtime_seal.py",
-            C::HookDep,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
-            "bin/javis_scrub.py",
-            C::HookDep,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
-            "bin/javis_semver.py",
-            C::HookDep,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
-            "bin/javis_serena_probe.py",
-            C::HookDep,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
-            "bin/javis_skillscan.py",
-            C::HookDep,
             K::PyCompile,
             "",
             None,
@@ -945,78 +718,6 @@ mod tests {
             "bin/javis_snapshot.py",
             C::HookDep,
             K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
-            "bin/javis_spool_path.py",
-            C::HookDep,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
-            "bin/javis_state_ledger.py",
-            C::HookDep,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
-            "bin/javis_state_snapshot.py",
-            C::HookDep,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
-            "bin/javis_task.py",
-            C::HookDep,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
-            "bin/javis_todo_decl.py",
-            C::HookDep,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
-            "bin/javis_verdict.py",
-            C::HookDep,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
-            "bin/javis_waiver.py",
-            C::HookDep,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
-            "bin/javis_wakeup.py",
-            C::HookDep,
-            K::PyCompile,
-            "",
-            None,
-            false,
-        ),
-        (
-            "bin/skillscan_rules.json",
-            C::HookDep,
-            K::JsonParse,
             "",
             None,
             false,
@@ -1143,6 +844,17 @@ mod tests {
             true,
         ),
     ];
+
+    /// RULINGS AL1 class 3 — `proof: real-level` (the stage-5 end-to-end derivation items).
+    const REAL_LEVEL: [&str; 5] = [
+        "agents.json",
+        "bin/cys-dept",
+        "bin/javis_boot_node.py",
+        "bin/javis_formation.py",
+        "bin/javis_preflight.py",
+    ];
+    /// RULINGS AL1 class 2 — measured at the bootstrap layer.
+    const BOOTSTRAP_LEVEL: [&str; 2] = ["bin/javis_bootstrap.py", "bin/javis_orchestra.py"];
 
     /// The sibling protection list (C4 4.10 · RULINGS AI6 — the worker's mapping, accepted as a
     /// flagged interpretation).
@@ -1291,6 +1003,12 @@ mod tests {
             .iter()
             .zip(GENERATED.iter())
             .chain(prot.iter().zip(GENERATED_PROTECTION.iter()));
+        let proofs: Vec<&str> = bc.iter().map(|e| e.proof).collect();
+        assert_eq!(
+            proofs,
+            GENERATED_PROOF.to_vec(),
+            "proof markers differ from a fresh derivation"
+        );
         for (f, g) in pairs {
             assert_eq!(f.rel, g.rel);
             assert_eq!(f.category, category_wire(g.category), "{}", g.rel);
@@ -1491,6 +1209,71 @@ mod tests {
         assert_eq!((a.decision, a.protection.is_some()), (Decision::No, true));
     }
 
+    /// RULINGS AL1: every row carries what proves it — `real-level` exactly on the five class-3
+    /// rows, `bootstrap-replay` exactly on the two class-2 rows, `hook-replay` on every hook row
+    /// and every file a hook uses; `--list --json` carries the marker as `proof`.
+    #[test]
+    fn proof_markers_by_class() {
+        assert_eq!(GENERATED_PROOF.len(), GENERATED.len());
+        let by = |want: &str| -> Vec<&str> {
+            entries()
+                .iter()
+                .filter(|e| proof(e) == Some(want))
+                .map(|e| e.rel)
+                .collect()
+        };
+        assert_eq!(by("real-level"), REAL_LEVEL.to_vec());
+        assert_eq!(by("bootstrap-replay"), BOOTSTRAP_LEVEL.to_vec());
+        for e in entries() {
+            if proof(e) == Some("hook-replay") {
+                assert!(
+                    matches!(e.category, C::Hook | C::HookDep),
+                    "{} is hook-replay but not a hook row",
+                    e.rel
+                );
+            }
+        }
+        assert_eq!(
+            entries().len(),
+            by("hook-replay").len() + REAL_LEVEL.len() + BOOTSTRAP_LEVEL.len()
+        );
+        for p in protection_entries() {
+            assert_eq!(proof(p), None);
+        }
+        let v = list_json();
+        for row in v["entries"].as_array().unwrap() {
+            assert!(row["proof"].is_string(), "{row}");
+        }
+        for row in v["protection"].as_array().unwrap() {
+            assert!(row.get("proof").is_none(), "{row}");
+        }
+        // every candidate the closure finds is either listed or dropped with its measurement
+        for (rel, why) in derive::DROPPED_CANDIDATES {
+            assert!(
+                boot_critical_entry(rel).is_none(),
+                "{rel} is dropped AND listed"
+            );
+            assert!(why.contains("boot"), "{rel}: the drop names no measurement");
+        }
+    }
+
+    /// RULINGS AL3: a NEW file reached from a start script (here: imported inside a function of
+    /// the boot script) is neither listed nor a measured drop → the build fails naming it.
+    #[test]
+    fn census_fails_on_a_new_start_candidate() {
+        let e = derive_edited(
+            &edit_one("cysjavis-pack/bin/javis_bootstrap.py", |t| {
+                format!("{t}\ndef _t5a_probe():\n    import javis_t5a_new_tool\n")
+            }),
+            &[("bin/javis_t5a_new_tool.py", "x = 1\n")],
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("new start-path candidate") && e.contains("bin/javis_t5a_new_tool.py"),
+            "{e}"
+        );
+    }
+
     /// 4.6 / D:1125(3): Windows forms — separator, case, drive letter, `/c/…`, `\\?\`, `..`,
     /// short names (unresolvable → cannot decide = fail-open for hooks).
     #[test]
@@ -1667,6 +1450,7 @@ mod tests {
         let rows = v["entries"].as_array().unwrap();
         assert_eq!(rows.len(), PINNED.len());
         assert_eq!(rows[0]["rel"], "agents.json");
+        assert_eq!(rows[0]["proof"], "real-level");
         assert_eq!(rows[0]["check"]["kind"], "none-prerehearsal");
         assert_eq!(rows[0]["check"]["arg"], "json-parse");
         assert!(rows.iter().any(|r| r["rel"] == "hooks/role-bootstrap.sh"
@@ -2308,7 +2092,7 @@ mod tests {
             .collect();
         let sh = "#!/bin/sh\n. \"$(dirname \"$0\")/_lib.sh\" 2>/dev/null \\\n  || . \"${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks/_lib.sh\"\n\
                   A=\"$PACK/bin/a.py\"\nMSG='run \"$PACK/bin/b.py\" add'\nR=\"$(\"$PY\" \"$PACK/bin/b.py\" 2>/dev/null)\"\n# B=\"$PACK/bin/b.py\"\n";
-        let got: Vec<String> = derive::bindings("hooks/x.sh", sh, &rels)
+        let got: Vec<String> = derive::hook_bindings("hooks/x.sh", sh, &rels)
             .into_iter()
             .map(|(r, _)| r)
             .collect();
@@ -2316,12 +2100,30 @@ mod tests {
             got,
             vec!["bin/a.py".to_string(), "hooks/_lib.sh".to_string()]
         );
-        let py = "import os, b\nfrom a import x\ndef f():\n    import zzz\n";
-        let got: Vec<String> = derive::bindings("bin/c.py", py, &rels)
+        let py = "import os, b\nfrom a import x\ndef f():\n    import zzz\n    import x\n";
+        let rels2: BTreeSet<&str> = ["bin/a.py", "bin/b.py", "bin/x.py"].into_iter().collect();
+        let structural: Vec<String> = derive::hook_bindings("bin/c.py", py, &rels2)
             .into_iter()
             .map(|(r, _)| r)
             .collect();
-        assert_eq!(got, vec!["bin/a.py".to_string(), "bin/b.py".to_string()]);
+        assert_eq!(
+            structural,
+            vec!["bin/a.py".to_string(), "bin/b.py".to_string()],
+            "the hook rows follow module-level imports only"
+        );
+        let extended: Vec<String> = derive::bindings("bin/c.py", py, &rels2)
+            .into_iter()
+            .map(|(r, _)| r)
+            .collect();
+        assert_eq!(
+            extended,
+            vec![
+                "bin/a.py".to_string(),
+                "bin/b.py".to_string(),
+                "bin/x.py".to_string()
+            ],
+            "the candidate finder follows imports wherever written"
+        );
     }
 
     /// RULINGS AI1: imports wherever written, tools launched or opened by path, Python heredocs
