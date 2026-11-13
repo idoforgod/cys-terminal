@@ -633,11 +633,18 @@ class NoMasterShortcutAnywhere(unittest.TestCase):
 
 
 
-# ─────────────────────────── A-1-05 deferral sweep (testplan A.md §5 · TESTPLAN_RULINGS B55 / B69 / B95) ───────────────────────────
-# The seven Tier-1 families of A.md §5 (rev bcd755bc660f3150), verbatim regexes; NFC, case-insensitive, sentences split on
-# [.!?。\n]; T1-a needs its noun AND its verb in one sentence. The single exclusion EX (EX-1, EX-2 — sentences that also
-# appear in the compiled role blocks) and the identifier rule (a T1-e match that is only `--propose` / `pack-merge --propose`
-# or lies in the patch header line) are applied. Test sources are out of the sweep (B95), so the patterns are written plainly.
+# ─────────────────────────── A-1-05 deferral sweep (testplan A.md §5 · TESTPLAN_RULINGS B55 / B69 / B95 / Part 33) ───────────────────────────
+# The seven Tier-1 families of A.md §5 (rev bcd755bc660f3150), verbatim regexes; NFC, case-insensitive. HOW THEY ARE READ
+# (RULINGS BZ1): only T1-a ("same sentence: noun AND verb") and the EX comparison are per sentence — sentences split on
+# [.!?。\n]; every other family is matched over the WHOLE extracted string (an alternative may hold sentence punctuation:
+# the e-mail address, `Dr.`), and a match is reported with the sentence its first character lies in. The single exclusion
+# EX (EX-1, EX-2 — a match whose sentence equals one of them) and the identifier rules apply: a T1-e match that is only
+# `--propose` / `pack-merge --propose` or lies in the patch header line (Part 15 A5), and the feedback feature's own names,
+# by exact string (RULINGS BZ2 / Part 33 B97). STRICTER THAN THE FROZEN LIST (RULINGS BZ3, proposed for Part 33 B98 — the
+# guard applies them now): T1-b+ (feedback / a bare "제보해 주세요" presented as the way out) and T1-h ("it will be fixed
+# (faster)" — the fix promised by someone else). Test sources are out of the sweep (B95), so the patterns are written plainly.
+# STATED LIMIT (RULINGS BZ6): a sentence assembled at run time from several literals (`"…" + x + "…"`, `%`-formatting over
+# several constants, `.join`) is checked piece by piece; the stage-5 run-time corpus sees the assembled text.
 TIER1_NOUN = (r"(최윤식|윤식\s*박사|박사(?!급)|Dr\.?\s*Choi|Yoonsik|제작자|제작사|개발자|개발사|개발팀|제조사|벤더|vendor|배포자|공급자"
               r"|upstream|업스트림|배포\s*전담\s*부서|정비발행부|maintainer|developer)")
 TIER1_VERB = (r"(문의|물어|여쭤|연락|제보|요청|알려|전달|맡기|맡겨|고쳐\s*(줄|주|받)|수정해\s*(줄|주|받)|반영(해|될|되)|기다|ask|contact"
@@ -650,54 +657,87 @@ TIER1_FAMILIES = {
     "T1-f": r"((최윤식|윤식\s*박사|박사(?!급)|Dr\.?\s*Choi|제작자|제작사|개발자|개발사|개발팀|제조사|벤더|vendor|배포자|공급자|upstream|업스트림|배포\s*전담\s*부서|정비발행부|maintainer|developer)[^.!?。\n]{0,6}?\s*(의|쪽)?\s*(?:(?<=[의쪽])|(?<![가-힣A-Za-z0-9]))(일|작업|몫|책임|소관|담당|업무)\s*(이다|입니다|이에요|예요|이라|이며|이므로|임|으로)|영구\s*(보존|반영)\s*(자리|위치|경로|장소)[^.!?。\n]{0,20}(벤더|vendor|upstream|업스트림|제작자|배포\s*전담\s*부서|정비발행부)|(vendor|upstream|maintainer|developer)'?s?\s+(job|responsibility|work|task))",
     "T1-g": r"((보고|제보|문의)[^.!?。\n]{0,20}(결함|버그|오류|문제)[^.!?。\n]{0,10}(고치는|수정하는|해결하는)\s*(정규|공식|올바른)?\s*(경로|길|방법))",
 }
+# Proposed for Part 33 B98 (RULINGS BZ3) — applied by this guard now.
+TIER1_STRICTER = {
+    "T1-b+": r"('?피드백'?[^.!?。\n]{0,12}(알려|보내|남겨|제보)|제보해\s*(주|달))",
+    "T1-h": (r"((더\s*)?(빨리|빠르게|신속히|곧)\s*(고칠|고쳐|고치|수정할|수정해|수정하|해결할|해결해|해결하|반영할|반영해|반영하)"
+             r"[^.!?。\n]{0,6}(수\s*있|드리|드릴|겠|게\s*됩)"
+             r"|" + TIER1_NOUN + r"[^.!?。\n]{0,20}(고쳐\s*드리|고쳐\s*드릴|고치겠|수정해\s*드리|수정해\s*드릴|반영하겠|반영해\s*드리))"),
+}
 TIER1_EX = (
     "제작자에게 물어보라고 하거나, 다음 업데이트를 기다리라고 하거나, 제보하라고 하는 것으로 수리를 대신하지 않는다",
     "자비스 밖에 원인이 있으면(운영체제의 차단, 외부 서비스 장애) 우회해서 고칠 수 있는 데까지 고치고, 무엇이 막고 있고 주인이 "
     "무엇을 하면 풀리는지 사실대로 말한다",
 )
 ROLE_BLOCK_CONSTS = ("RULES_COMMON", "RULES_MASTER_CEO", "RULES_WORKER", "RULES_CSO", "RULES_REVIEWER")
+# RULINGS BZ2 / Part 33 B97: the optional feedback feature names itself — these EXACT extracted strings are identifiers of that
+# feature (its address constant, the modal's title and field labels), not sentences. A sentence that presents feedback or
+# reporting as the way to get a defect fixed is still a hit wherever it stands, the modal included.
+FEEDBACK_FEATURE_IDENTIFIERS = {
+    "src-tauri/src/feedback.rs": ("cysinsight@gmail.com",),                      # FEEDBACK_TO — the address constant
+    "ui/src/feedbackmodal.ts": (
+        "피드백 보내기",                                                          # the button's aria-label
+        "<span>피드백 보내기</span>",                                             # the button's label
+        "피드백 보내기 — 불편한 점이나 바라는 점을 사진·영상과 함께 알려 주세요",       # the button's title
+        '<div class="fb-head"><h3 id="fb-title">피드백 보내기</h3><button type="button" class="fb-x" '
+        'aria-label="닫기">×</button></div>',                                    # the modal's title
+    ),
+}
+# The same feature's NAME inside a longer text (the manual's section heading and its button sentence): a T1-b+ match that is
+# only the name "피드백 보내기" is an identifier (proposed with B98, as Part 15 A5 does for `--propose`).
+FEEDBACK_FEATURE_NAME = r"'?\*{0,2}피드백\*{0,2}'?\s*보내기"
 
 
-def tier1_sentence_hits(sentence):
-    """The Tier-1 families one sentence matches, after EX and the identifier rule (A.md §5)."""
+def _tier1_sentence_spans(t):
     import re
-    import unicodedata
-    s = unicodedata.normalize("NFC", sentence)
-    body = " ".join(s.split()).rstrip(".!?。")
-    if not body or body in TIER1_EX:
-        return []
-    hits = []
-    if re.search(TIER1_NOUN, s, re.I) and re.search(TIER1_VERB, s, re.I):
-        hits.append("T1-a")
-    for fam, pat in TIER1_FAMILIES.items():
-        ms = list(re.finditer(pat, s, re.I))
-        if fam == "T1-e":
-            header = re.search(r"#\s*생성:\s*cys pack-merge --file \S+ --propose", s)
-            ms = [m for m in ms if not header and not re.fullmatch(r"(pack-merge\s+)?--propose", m.group(0), re.I)]
-        if ms:
-            hits.append(fam)
-    return hits
+    return [(m.start(), m.end()) for m in re.finditer(r"[^.!?。\n]*[.!?。\n]?", t) if m.group(0).strip()]
 
 
-def tier1_text_hits(text):
-    """[(line offset within text, families, sentence)] — sentences split on [.!?。\\n] after NFC."""
+def tier1_text_hits(text, stricter=True):
+    """[(line offset within text, sorted families, sentence)] — T1-a and EX per sentence, every other family over the WHOLE
+    text (RULINGS BZ1); a match is reported with the sentence its first character lies in."""
+    import bisect
     import re
     import unicodedata
     t = unicodedata.normalize("NFC", text)
-    out = []
-    for m in re.finditer(r"[^.!?。\n]*[.!?。\n]?", t):
-        if m.group(0).strip():
-            fams = tier1_sentence_hits(m.group(0))
-            if fams:
-                out.append((t.count("\n", 0, m.start()), fams, " ".join(m.group(0).split())))
-    return out
+    spans = _tier1_sentence_spans(t)
+    starts = [a for a, _b in spans]
+    collapse = lambda a, b: " ".join(t[a:b].split())
+    is_ex = lambda i: collapse(*spans[i]).rstrip(".!?。") in TIER1_EX
+    found = {}
+    for i, (a, b) in enumerate(spans):
+        s = t[a:b]
+        if re.search(TIER1_NOUN, s, re.I) and re.search(TIER1_VERB, s, re.I) and not is_ex(i):
+            found.setdefault(i, set()).add("T1-a")
+    fams = dict(TIER1_FAMILIES, **(TIER1_STRICTER if stricter else {}))
+    for fam, pat in fams.items():
+        for m in re.finditer(pat, t, re.I):
+            i = bisect.bisect_right(starts, m.start()) - 1
+            if i < 0 or is_ex(i):
+                continue
+            if fam == "T1-b+" and re.match(FEEDBACK_FEATURE_NAME, t[m.start():]):
+                continue
+            if fam == "T1-e":
+                line = t[t.rfind("\n", 0, m.start()) + 1:(t.find("\n", m.end()) + 1 or len(t) + 1) - 1]
+                if (re.fullmatch(r"(pack-merge\s+)?--propose", m.group(0), re.I)
+                        or re.search(r"#\s*생성:\s*cys pack-merge --file \S+ --propose", line)):
+                    continue
+            found.setdefault(i, set()).add(fam)
+    return [(t.count("\n", 0, spans[i][0]), sorted(f), collapse(*spans[i])) for i, f in sorted(found.items())]
+
+
+def tier1_sentence_hits(sentence, stricter=True):
+    """The families one text matches (all its sentences together), after EX and the identifier rules."""
+    return sorted({f for _o, fs, _s in tier1_text_hits(sentence, stricter) for f in fs})
 
 
 # ── extraction: what the product SAYS (B95 class 2) — string literals and heredoc bodies, never comments, identifiers,
 #    docstrings or dict / JSON keys. Each extractor returns [(line, text)] with the 1-based line where the string starts.
 def py_strings(src):
-    """Python: the parser's own string constants (implicit concatenation already joined; an f-string is one text with
-    `{}` for each field). Excluded: docstrings and every other bare string statement, dict keys."""
+    """Python: the parser's own string constants (implicit concatenation already joined; an f-string is one text with `{}`
+    for each field, and the literals INSIDE its fields are taken separately — RULINGS BZ6). Excluded: docstrings and every
+    other bare string statement, dict keys — except a module docstring the module prints itself (`__doc__` used in its
+    code: `description=__doc__`, `print(__doc__)`, `epilog=__doc__`), which is class 2 (RULINGS BZ6)."""
     import ast
     tree = ast.parse(src)
     skip = set()
@@ -707,8 +747,15 @@ def py_strings(src):
         if isinstance(node, ast.Dict):
             skip.update(id(k) for k in node.keys if k is not None)
         if isinstance(node, ast.JoinedStr):
-            skip.update(id(v) for v in ast.walk(node) if v is not node)
+            for v in node.values:
+                if isinstance(v, ast.Constant):
+                    skip.add(id(v))
+                elif isinstance(v, ast.FormattedValue) and v.format_spec is not None:
+                    skip.update(id(x) for x in ast.walk(v.format_spec))
     out = []
+    doc = ast.get_docstring(tree, clean=False)
+    if doc and any(isinstance(n, ast.Name) and n.id == "__doc__" for n in ast.walk(tree)):
+        out.append((tree.body[0].lineno, doc))
     for node in ast.walk(tree):
         if id(node) in skip:
             continue
@@ -934,10 +981,11 @@ def deferral_class(rel):
     return "out"
 
 
-def deferral_sweep(repo, rels):
+def deferral_sweep(repo, rels, stricter=True):
     """Every Tier-1 hit of the given repository files: [(class, rel, line, families, sentence)]. Class 1 files are swept
     whole; class 2 / skills code through the extractors; the compiled role constants of src/repair/rules.rs count as
-    class 1. A source the extractor cannot read is reported as class 'unreadable' (a sweep that skips a file is void)."""
+    class 1. A source the extractor cannot read is reported as class 'unreadable' (a sweep that skips a file is void).
+    `stricter=False` = the frozen seven families only (A.md §5); True adds TIER1_STRICTER (RULINGS BZ3)."""
     import re
     out = []
     for rel in rels:
@@ -969,29 +1017,37 @@ def deferral_sweep(repo, rels):
             for name in ROLE_BLOCK_CONSTS:
                 m = re.search(r'pub const %s: &str = r#"(.*?)"#;' % name, src, re.S)
                 role_consts[m.group(1)] = src.count("\n", 0, m.start()) + 1
+        feature_names = FEEDBACK_FEATURE_IDENTIFIERS.get(rel, ())
         for line, text in pieces:
-            if is_identifier_literal(text):
+            if is_identifier_literal(text) or text in feature_names:
                 continue
             c = "1" if text in role_consts else cls
-            for off, fams, sentence in tier1_text_hits(text):
+            for off, fams, sentence in tier1_text_hits(text, stricter):
                 out.append((c, rel, line + off, fams, sentence))
     return out
 
 
 class DeferralFamiliesFG(unittest.TestCase):
-    """TESTPLAN_RULINGS Part 23 B55, Part 25 B69, Part 32 B95 / B96 (RULINGS BT1): the seven Tier-1 families of testplan
-    A.md §5 find nothing in THE PRODUCT'S OWN VOICE — class 1 (directives, soul.md, the compiled role blocks,
-    hooks/README.md, USER-MANUAL.md, and the two documents the program injects whole: memory/MEMORY.md and
-    CLAUDE.md.template) and class 2 (the strings hook scripts, pack tools and the program print or inject: string
-    literals and here-document bodies of shell / Python / Rust / TypeScript sources — never comments, identifiers,
-    docstrings or dict keys). EX and the `--propose` identifier rule apply. Skill texts are swept by the scratch tool and
-    ruled hit by hit by the grader (not asserted here); tests, fixtures and `scripts/` are out.
-    KNOWN_OTHER_TRACKS lists the in-scope hits that remain in OTHER owners' texts (B96: corrected by their owners) —
-    one entry, T8's — every hit not on that list fails."""
-    KNOWN_OTHER_TRACKS = {
-        # ★The ONLY allowed entry: T8's C03 cause line (`_c03_master_axis`, RULINGS AH4 (a)). Track T8 rewords the string
-        #   and removes this entry in the same commit — after that, nothing in the product's own voice may hit.
-        ("cysjavis-pack/bin/javis_preflight.py", "핀 기준 선행(벤더 동기 필요·사용자 과실 아님)"): "T8 — RULINGS AH4 (a)",
+    """TESTPLAN_RULINGS Part 23 B55, Part 25 B69, Part 32 B95 / B96, Part 33 B97–B99 (RULINGS BT1, BZ1–BZ3, BZ6): the Tier-1
+    families of testplan A.md §5 (+ the stricter T1-b+ / T1-h proposed for B98) find nothing in THE PRODUCT'S OWN VOICE —
+    class 1 (directives, soul.md, the compiled role blocks, hooks/README.md, USER-MANUAL.md, and the two documents the
+    program injects whole: memory/MEMORY.md and CLAUDE.md.template) and class 2 (the strings hook scripts, pack tools and the
+    program print or inject: string literals — incl. those inside f-string fields — and here-document bodies of shell /
+    Python / Rust / TypeScript sources, and a module docstring the module prints itself; never comments, identifiers, other
+    docstrings or dict keys). T1-a and EX per sentence, every other family over the whole string (BZ1). The `--propose` and
+    feedback-feature identifier rules apply. Skill texts are swept by the scratch tool and ruled hit by hit by the grader (not
+    asserted here); tests, fixtures and `scripts/` are out. ALLOWED lists, by EXACT sentence and families, the hits that
+    stay — every other hit fails."""
+    ALLOWED = {
+        # T8's C03 cause line (`_c03_master_axis`, RULINGS AH4 (a)): track T8 rewords the string and removes this entry in
+        #   the same commit.
+        ("cysjavis-pack/bin/javis_preflight.py", "pristine) — 핀 기준 선행(벤더 동기 필요·사용자 과실 아님)", ("T1-d",)):
+            "T8 — RULINGS AH4 (a)",
+        # A subject-matter word caught by an over-broad alternative (RULINGS BZ6 → Part 33 B99, tightening proposed in
+        #   impl/reports/T1c-report.md §2): the vibe-coding route contract's critic cannot change the Level — the docstring
+        #   is printed by `--help` (epilog=__doc__). Not reworded; the entry goes when B99 tightens T1-d's bare "변경 불가".
+        ("cysjavis-pack/bin/javis_viberoute.py", "Level 변경 불가.", ("T1-d",)):
+            "Part 33 B99 — bare 변경 불가 (subject matter)",
     }
     ROOTS = ("cysjavis-pack", "src", os.path.join("src-tauri", "src"), os.path.join("ui", "src"))
 
@@ -1003,8 +1059,8 @@ class DeferralFamiliesFG(unittest.TestCase):
                 rels += [os.path.relpath(os.path.join(d, f), REPO_DIR).replace(os.sep, "/") for f in fs]
         return rels
 
-    def known(self, hit):
-        return any(rel == hit[1] and frag in hit[4] for rel, frag in self.KNOWN_OTHER_TRACKS)
+    def allowed(self, hit):
+        return (hit[1], hit[4], tuple(hit[3])) in self.ALLOWED
 
     def test_the_products_own_voice_has_no_tier1_hit(self):
         rels = self.files()
@@ -1015,7 +1071,7 @@ class DeferralFamiliesFG(unittest.TestCase):
         self.assertEqual([h[1] for h in hits if h[0] == "unreadable"], [], "a source the extractor cannot read")
         role_texts = [t for _l, t in rs_strings(repo_text(os.path.join("src", "repair", "rules.rs")))]
         self.assertTrue(any(t.startswith("■ 「스스로 해결」") for t in role_texts), "the compiled role blocks are not read")
-        bad = [h for h in hits if h[0] in ("1", "2") and not self.known(h)]
+        bad = [h for h in hits if h[0] in ("1", "2") and not self.allowed(h)]
         self.assertEqual(bad, [], "Tier-1 deferral hits in the product's own voice (A-1-05 machine half)")
 
     def test_positive_controls_through_the_extractors(self):
@@ -1036,6 +1092,35 @@ class DeferralFamiliesFG(unittest.TestCase):
         ts = "setStatus(`다음 업데이트를 기다려 주세요 ${n}`, 'error');\n"
         self.assertEqual(fams(ts_strings(ts)), ["T1-c"])
 
+    def test_dotted_alternatives_are_matched_over_the_whole_string(self):
+        """RULINGS BZ1: an alternative that holds sentence punctuation is found — the e-mail address (T1-b), `Dr.` (T1-f) —
+        and the address constant itself is a hit unless it is the feedback feature's listed identifier (BZ2)."""
+        self.assertEqual(tier1_sentence_hits("문제가 있으면 cysinsight@gmail.com 으로 보내 주세요.", stricter=False), ["T1-b"])
+        self.assertEqual(tier1_sentence_hits("그 수정은 Dr. Choi 의 일이다.", stricter=False), ["T1-f"])
+        self.assertEqual(tier1_sentence_hits("cysinsight@gmail.com", stricter=False), ["T1-b"])
+        rs = 'pub const FEEDBACK_TO: &str = "cysinsight@gmail.com";\n'
+        self.assertEqual([t for _l, t in rs_strings(rs)], ["cysinsight@gmail.com"])
+        self.assertIn("cysinsight@gmail.com", FEEDBACK_FEATURE_IDENTIFIERS["src-tauri/src/feedback.rs"])
+
+    def test_stricter_families_find_the_escaped_sentences(self):
+        """RULINGS BZ3 / Part 33 B98: the four sentences of v0.14.56 that escaped the frozen list are found by T1-b+ / T1-h
+        (and NOT by the frozen seven — the reason for B98); the feature's own name is an identifier."""
+        escaped = {
+            "오피스가 아직 열리지 않습니다. 자동으로 계속 다시 시도합니다. 오래 열리지 않으면 컴퓨터를 다시 시작해 보시고, "
+            "그래도 안 되면 왼쪽 아래 '피드백'으로 알려 주세요.": "T1-b+",
+            "오피스 화면 파일을 찾지 못했습니다. 왼쪽 아래 '피드백'으로 알려 주세요.": "T1-b+",
+            "Windows 에서 다시 그리기 뒤 `cys read-screen --since` 의 `repaint_echo_skipped` 가 크게\n"
+            "  나오거나 경보가 재발하면 제보해 주세요(끄는 법은 위 노브).": "T1-b+",
+            "불편한 점이나 바라는 점을 알려 주세요. 사진·영상을 함께 넣어 주시면 더 빨리 고칠 수 있습니다.": "T1-h",
+        }
+        for text, fam in escaped.items():
+            self.assertEqual(tier1_sentence_hits(text), [fam], text)
+            self.assertEqual(tier1_sentence_hits(text, stricter=False), [], text)
+        for name_only in ("왼쪽 워크스페이스 목록 아래의 **피드백 보내기** 단추를 누르면 작성 창이 열립니다.",
+                          "### 4.11 피드백 보내기 (v0.14.41)"):
+            self.assertEqual(tier1_sentence_hits(name_only), [], name_only)
+        self.assertEqual(tier1_sentence_hits("제작자가 곧 고쳐 드리겠습니다."), ["T1-h"])
+
     def test_extraction_rule_negative_controls(self):
         """Comments, docstrings, bare string statements, dict keys, `#[cfg(test)]` items and quoted identifiers are not
         what the product says; EX sentences and the bare `--propose` flag are not counted (A.md §5)."""
@@ -1053,9 +1138,20 @@ class DeferralFamiliesFG(unittest.TestCase):
         self.assertEqual(tier1_sentence_hits("cys pack-merge --propose"), [])
         self.assertEqual(tier1_sentence_hits("cys pack-merge --propose 로 제안 패치를 만든다"), ["T1-e"])
 
+    def test_wider_python_extraction(self):
+        """RULINGS BZ6: literals inside f-string fields are extracted; a module docstring the module prints is class 2."""
+        d = "다음 업데이트를 기다려 주세요"
+        texts = [t for _l, t in py_strings("x = 1\nprint(f\"상태: {'%s' if x else 'ok'}\")\n" % d)]
+        self.assertIn(d, texts)
+        self.assertIn("상태: {}", texts)
+        printed = '"""%s"""\nimport argparse\nargparse.ArgumentParser(epilog=__doc__)\n' % d
+        self.assertEqual([t for _l, t in py_strings(printed)], [d])
+        self.assertEqual(py_strings('"""%s"""\nimport argparse\n' % d), [])
+
     def test_word_boundary_b69(self):
         """Part 25 B69: the work noun must begin a word — the "일" inside "파일이며" is no hit."""
         self.assertEqual(tier1_text_hits("이 파일은 벤더 파일이며 수정은 보존된다."), [])
+
 
 class MasterMayFileAReport(unittest.TestCase):
     """RULINGS BB2 (ii): the master's compiled role block and MASTER_DIRECTIVE §1-B say plainly that intake
