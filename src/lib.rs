@@ -38,6 +38,8 @@ pub mod license;
 pub mod macos_devtools;
 pub mod merge3;
 pub mod pack;
+/// The pack-apply lock (RULINGS B7 — moved from the CLI by a pure move; the repair mechanism's only lock).
+pub mod pack_apply_lock;
 pub mod repair;
 /// @generated C-07 previous-vendor hash table (scripts/gen_prev_vendor_hashes.py).
 pub mod pack_prev_vendor;

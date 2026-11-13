@@ -754,7 +754,7 @@ fn same_filesystem(a: &Path, b: &Path) -> bool {
 /// 이 "전부 아니면 전무"가 rename 2단(중간에 목적지가 없는 창이 생긴다)보다 나은 유일한 이유다.
 /// 대상 중 하나라도 없으면 ENOENT(신규 설치 경로에서는 이 함수를 부르지 않는다).
 #[cfg(target_os = "macos")]
-fn swap_paths(a: &Path, b: &Path) -> std::io::Result<()> {
+pub(crate) fn swap_paths(a: &Path, b: &Path) -> std::io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let ca = std::ffi::CString::new(a.as_os_str().as_bytes())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
@@ -772,7 +772,7 @@ fn swap_paths(a: &Path, b: &Path) -> std::io::Result<()> {
 
 /// RENAME_SWAP 은 macOS 전용(리눅스의 `RENAME_EXCHANGE` 는 별도 API) — 폴백 2단을 타게 한다.
 #[cfg(all(unix, not(target_os = "macos")))]
-fn swap_paths(_a: &Path, _b: &Path) -> std::io::Result<()> {
+pub(crate) fn swap_paths(_a: &Path, _b: &Path) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "RENAME_SWAP unsupported",
