@@ -2025,7 +2025,7 @@ class Preflight:
                         % (prefix, "; ".join(l for _, l in lost_pre), legacy_tail))
             st["classification"] = "promoted-backup-pins-lost"
             if st["pristine_b"] is not None and st["pre_b"] == st["pristine_b"]:
-                # 검사 표면(.pre-ceo)이 무수정 배포본 — 사용자 과실 아님. 주의: 승격 중
+                # 검사 표면(.pre-ceo)이 무수정 배포본 — 사용자 편집이 원인이 아니다. 주의: 승격 중
                 # MASTER 에 --take-new 를 처방하지 않는다(A12 가드 — 재사용 금지 경로).
                 # ★AH4(a)(T8): 수리를 남에게 넘기지 않는다 — T1b 가 _c03_cause_line 에 준 문안(뜻: 사용자 탓이 아님).
                 cause = ("원인 분류: 무수정 배포본(.pre-ceo==.pristine) — 이 팩의 핀 기준이 디렉티브보다 "
