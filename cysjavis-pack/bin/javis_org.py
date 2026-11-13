@@ -455,23 +455,35 @@ def _audit_ticket_state(name):
         return "used"
     return "none"
 
+# ★0.15.0 T8(「스스로 해결」 M14 · C11 11.8–11.9): CEO 지침 = 생성된 머리말 + 이 구분선 + 사용자 본부 지침(조립).
+#   scripts/gen_ceo_template.py SEPARATOR 와 같은 바이트(test_ceo_composition 이 cys-dept·preflight·앱과 함께 고정).
+_CEO_SEPARATOR = "\n---\n\n# [본문 — 표준 MASTER 운영 계약 전문]\n\n".encode("utf-8")
+
+
 def _audit_ceo_axis(dept_count):
     """CEO 축 파생: 마커(부트·pending)·.pre-ceo·영수증·디렉티브 등가로 승격 상태를 계산.
-    수렴 = (부서 0 ∧ 미승격) 또는 (부서 ≥1 ∧ 승격 ∧ PENDING 없음 ∧ base 데몬 생존)."""
+    수렴 = (부서 0 ∧ 미승격) 또는 (부서 ≥1 ∧ 승격 ∧ PENDING 없음 ∧ base 데몬 생존).
+    ★T8: 승격 = .pre-ceo 실재 ∨ 지침이 조립된 CEO 지침(구분선 실재) ∨ 지침 == 틀(구분선 없는 옛 형상).
+      조립에서는 '지침 ≠ 틀'이 정상이다(본문 = 사용자 본부 지침) — 바이트 등가만으로 판정하지 않는다."""
     base_pack = os.path.join(HOME, ".cys", "pack")          # cys-dept PACK_DEFAULT 동일 규약
     md = os.path.join(base_pack, "directives", "MASTER_DIRECTIVE.md")
     ceo = os.path.join(base_pack, "directives", "CEO_TEMPLATE.md")
     pre = md + ".pre-ceo"
-    receipt = os.path.join(base_pack, "directives", ".ceo-template-applied")
+    receipt = os.path.join(base_pack, "directives", ".ceo-receipt.json")          # O-C11-1(조립 영수증)
+    legacy_receipt = os.path.join(base_pack, "directives", ".ceo-template-applied")  # 0.14.x 영수증
     pending = os.path.join(HOME, ".cys", "state", "ceo-pending")
     marker = os.path.join(HOME, ".cys", ".master-bootstrapped")
-    same = False
+    same = composed = False
     try:
-        with open(md, "rb") as a, open(ceo, "rb") as b:
-            same = a.read() == b.read()
+        with open(md, "rb") as a:
+            mb = a.read()
+        composed = (_CEO_SEPARATOR in mb
+                    or _CEO_SEPARATOR.replace(b"\n", b"\r\n") in mb)
+        with open(ceo, "rb") as b:
+            same = mb == b.read()
     except OSError:
         same = False
-    promoted = os.path.exists(pre) or same   # 영수증 단독은 승격 증거 아님(강등이 증거 보존)
+    promoted = os.path.exists(pre) or same or composed   # 영수증 단독은 승격 증거 아님(강등이 증거 보존)
     is_pending = os.path.exists(pending)
     base_st, base_probe = _audit_daemon_status(None)
     base_alive = base_st is not None
@@ -482,7 +494,8 @@ def _audit_ceo_axis(dept_count):
         state = "demote-due" if promoted else "master"
         conv = not promoted   # 부서 0 이면 base 데몬 생존은 편제 수렴 판정 밖(정보 필드로만)
     return {"state": state, "promoted": promoted, "pending": is_pending,
-            "boot_marker": os.path.exists(marker), "receipt": os.path.exists(receipt),
+            "boot_marker": os.path.exists(marker),
+            "receipt": os.path.exists(receipt) or os.path.exists(legacy_receipt),
             "daemon_alive": base_alive, "daemon_probe": base_probe,  # 실패 사유(생존 시 None·SF-3)
             "dept_count": dept_count, "converged": conv}
 

@@ -1756,12 +1756,64 @@ class Preflight:
                      "(무수정본 한정)" % f)
         return line
 
+    # ── ★0.15.0 「스스로 해결」 M14·M15-나(C11 11.8–11.11 · O-C11-1/2 · 설계 §4-14): 조립된 CEO 지침의 판독 ──
+    #   CEO 지침 = 생성된 머리말(CEO_TEMPLATE 의 첫 구분선 앞) + 구분선 + 사용자 자신의 본부 지침. cys-dept 가 조립하고
+    #   directives/.ceo-receipt.json 에 영수증을 남긴다(src/repair/paths.rs:ceo_receipt_path). C03 은 읽기만 한다(무-fix 계약).
+    #   구분선 = scripts/gen_ceo_template.py SEPARATOR 와 같은 바이트(test_ceo_composition 이 cys-dept·javis_org·앱과 함께 고정).
+    _C03_CEO_SEPARATOR = "\n---\n\n# [본문 — 표준 MASTER 운영 계약 전문]\n\n".encode("utf-8")
+    _C03_CEO_RECEIPT = ".ceo-receipt.json"
+
+    @classmethod
+    def _c03_ceo_split(cls, b):
+        """(머리말, 구분선, 본문) | None — 첫 구분선(LF·CRLF 철자 중 먼저 나오는 것)에서 자른다(cys-dept 와 같은 규칙)."""
+        if b is None:
+            return None
+        sep = cls._C03_CEO_SEPARATOR
+        hits = [(b.find(s), s) for s in (sep, sep.replace(b"\n", b"\r\n"))]
+        hits = [h for h in hits if h[0] >= 0]
+        if not hits:
+            return None
+        i, s = min(hits)
+        return b[:i], s, b[i + len(s):]
+
+    @classmethod
+    def _c03_ceo_receipt(cls, path):
+        """승격 영수증 판독 — ('absent', None) | ('valid', dict) | ('invalid', 사유). cys-dept 와 같은 규칙:
+        schema 정수 ≥1 · 세 해시 64자리 소문자 hex · separator == 조립 구분선(LF/CRLF 철자) · composed_at 문자열."""
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+        except FileNotFoundError:
+            return "absent", None
+        except OSError as e:
+            return "invalid", "판독 불가(%s)" % e
+        try:
+            d = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            return "invalid", "JSON 이 아니다"
+        if not isinstance(d, dict):
+            return "invalid", "JSON 객체가 아니다"
+        sc = d.get("schema")
+        if not isinstance(sc, int) or isinstance(sc, bool) or sc < 1:
+            return "invalid", "schema 값이 없거나 틀렸다"
+        for k in ("header_sha256", "master_sha256_at_compose", "composed_sha256"):
+            if not isinstance(d.get(k), str) or not re.fullmatch(r"[0-9a-f]{64}", d[k]):
+                return "invalid", "%s 값이 없거나 틀렸다" % k
+        sep = cls._C03_CEO_SEPARATOR
+        sp = d.get("separator")
+        if not isinstance(sp, str) or sp.encode("utf-8") not in (sep, sep.replace(b"\n", b"\r\n")):
+            return "invalid", "separator 값이 조립 구분선이 아니다"
+        if not isinstance(d.get("composed_at"), str) or not d["composed_at"]:
+            return "invalid", "composed_at 값이 없다"
+        return "valid", d
+
     def _c03_promotion_state(self):
         """승격 판정에 필요한 파일 전부를 1회 읽어 상태 dict 로 환원한다(순수 관찰).
 
-        승격 '표지' 판정 우선순위(스펙 결정 D3):
-          ① md == 라이브 CEO_TEMPLATE 바이트 등가
-          ② 승격 영수증 해시 == md sha256 — stale 영수증(부등)은 판정 근거로
+        승격 '표지' 판정 우선순위(스펙 결정 D3 · ★0.15.0 T8 조립):
+          ⓪ md 가 조립된 CEO 지침(조립 구분선 실재) — 0.15.0 의 승격 형상. 검사 표면 = 구분선 뒤 본문
+          ① md == 라이브 CEO_TEMPLATE 바이트 등가(구분선 없는 옛 틀)
+          ② 승격 영수증(0.14.x .ceo-template-applied) 해시 == md sha256 — stale 영수증(부등)은 판정 근거로
              미사용·경고 없이 무시(R3 시나리오3)
           ③ 폴백: md 가 표지 3핀(MARKER_PINS) 전수 포함 ∧ .pre-ceo 존재"""
         d = os.path.join(pack_dir(), "directives")
@@ -1769,6 +1821,7 @@ class Preflight:
         st = {"tmpl_p": os.path.join(d, "CEO_TEMPLATE.md"),
               "pre_p": md_p + ".pre-ceo", "new_p": md_p + ".new",
               "receipt_p": os.path.join(d, ".ceo-template-applied"),
+              "ceo_receipt_p": os.path.join(d, self._C03_CEO_RECEIPT),
               "pristine_p": os.path.join(pack_dir(), ".pristine", "directives",
                                          "MASTER_DIRECTIVE.md")}
         md_b = self._c03_read_bytes(md_p)
@@ -1789,13 +1842,25 @@ class Preflight:
                         and all(p in st["md_text"] for p in MARKER_PINS))
         st.update(byte_equal=byte_equal, receipt_equal=receipt_equal,
                   marker_pins_ok=marker_pins_ok, pre_exists=pre_b is not None)
-        st["marker"] = byte_equal or receipt_equal or (marker_pins_ok and st["pre_exists"])
-        st["marker_via"] = ("md==라이브 CEO_TEMPLATE 바이트 등가" if byte_equal
+        # ★T8: 조립 형상 — 머리말 + 구분선 + 본문. 본문(구분선 뒤 바이트)이 사용자 본부 지침이자 강등 원본이다.
+        comp = self._c03_ceo_split(md_b)
+        tcomp = self._c03_ceo_split(tmpl_b)
+        rstate, rinfo = self._c03_ceo_receipt(st["ceo_receipt_p"])
+        st.update(composed=comp is not None, comp=comp, tcomp=tcomp,
+                  header_current=(comp is not None and tcomp is not None and comp[0] == tcomp[0]),
+                  ceo_receipt_state=rstate, ceo_receipt_info=rinfo,
+                  body_text=comp[2].decode("utf-8", "replace") if comp is not None else None)
+        st["marker"] = (st["composed"] or byte_equal or receipt_equal
+                        or (marker_pins_ok and st["pre_exists"]))
+        st["marker_via"] = ("조립된 CEO 지침(머리말 + 구분선 + 본부 지침)" if st["composed"]
+                           else "md==라이브 CEO_TEMPLATE 바이트 등가" if byte_equal
                            else "승격 영수증 해시 등가" if receipt_equal
                            else "표지 3핀+.pre-ceo 폴백" if st["marker"] else None)
         # 퇴화 = .pre-ceo 가 CEO 템플릿 사본으로 오염(동시 승격 레이스 잔재 · R1 E3) —
-        # 강등하면 템플릿을 재적용하게 되어 강등 경로 자체가 파괴된 상태.
-        st["degenerate"] = st["pre_exists"] and tmpl_b is not None and pre_b == tmpl_b
+        # 강등하면 템플릿을 재적용하게 되어 강등 경로 자체가 파괴된 상태. ★T8: 백업이 조립 구분선을 담은 경우
+        # (조립된 CEO 지침이 백업에 들어감)도 같은 퇴화다 — 백업은 조립되지 않은 MASTER 여야 한다.
+        st["degenerate"] = st["pre_exists"] and (
+            (tmpl_b is not None and pre_b == tmpl_b) or self._c03_ceo_split(pre_b) is not None)
         st["classification"] = None   # 주축 분류 — _c03_master_axis 가 채운다(지문 성분).
         st["guard_bits"] = None       # demote-guard 3항 비트 — _c03_demote_guard 가 채운다.
         return st
@@ -1806,7 +1871,10 @@ class Preflight:
         판정 우선순위(R1 시나리오5 — md 직접/우회 이중 판정 충돌 소멸):
           ① md 표준 핀 전수 → PASS(승격 무관 — D2 합성본 자연 통과·사용자 주권 편집 허용.
              '개행 변경도 비정형 판정됨' 문구는 ③ 비정형 FAIL 쪽에 둔다 — 스펙 §D3(ii)①)
-          ② 승격 표지 → 검사 표면을 .pre-ceo 로 승격 상태 세분(정상/구판/구본화/파괴/소실)
+          ①′ ★0.15.0 T8: 조립된 CEO 지침 → 검사 표면 = 구분선 뒤 본문(사용자 본부 지침 — 살아 있는 지침의
+             본문이자 강등 원본). '지침 ≠ 틀'은 정상 상태라 경고하지 않고, 본문의 소실 조항에 '재적용'을 권하지
+             않는다(조립은 본문을 바꾸지 않는다 — 설계 §4-14 "그 경고와 '재적용'을 함께 다시 맞춘다")
+          ② 승격 표지(구분선 없는 옛 형상) → 검사 표면을 .pre-ceo 로 승격 상태 세분(정상/구판/구본화/파괴/소실)
           ③ .pre-ceo 존재 ∧ 표지 전부 실패 → '비정형 승격 상태' FAIL(파괴적 조치 금지)
           ④ 그 외 → 현행 소실 FAIL(+원인 분류 1줄)"""
         if st["md_text"] is None:
@@ -1817,10 +1885,38 @@ class Preflight:
             st["classification"] = "pins-pass"
             return (PASS, "MASTER_DIRECTIVE.md 핀 %d개 전부 존재"
                           "(승격 여부 무관 — 사용자 주권 편집 허용)" % len(pins))
-        promote_hint = ("신 템플릿 재적용: promote-ceo 재실행 — 오너 role-less 셸 또는 CSO "
+        # ★T8: 재승격은 이제 조립이다 — 틀의 머리말 + 사용자 본부 지침(구분선 없는 옛 사본이면 .pre-ceo)이고, 살아 있는
+        #   지침은 시각을 붙인 사본으로 먼저 남는다. 그래서 '신 템플릿 재적용'(통째 복사 — 사용자 수정을 지우던 처방)이 아니다.
+        promote_hint = ("조립으로 다시 승격: promote-ceo 재실행(생성된 머리말 + 사용자 본부 지침 — 지금 지침은 "
+                        "시각을 붙인 사본으로 먼저 남는다) — 오너 role-less 셸 또는 CSO "
                         "seat CLI `bash ~/.cys/pack/bin/cys-dept promote-ceo`"
                         "(CEO/master pane 의 exit 7 거부는 계약)")
         rebuild_hint = ".pristine/directives/MASTER_DIRECTIVE.md 로 .pre-ceo 재건(오너 승인)"
+        if st["composed"]:
+            # ①′ 조립된 CEO 지침 — 본문(구분선 뒤)이 사용자 본부 지침이다. ① 에서 md 가 핀을 잃었으므로 본문도 잃었다.
+            body = st["body_text"]
+            lost_body = [(pin, label) for pin, label in pins if pin not in body]
+            prefix = ("승격 상태(조립된 CEO 지침 — 생성된 머리말 + 사용자 본부 지침) — 표준 핀은 구분선 뒤 "
+                      "본문에서 검사")
+            new_text = (st["new_b"].decode("utf-8", "replace")
+                        if st["new_b"] is not None else None)
+            if new_text is not None and all(pin in new_text for pin, _ in lost_body):
+                st["classification"] = "composed-awaiting-new"
+                return (FAIL, "%s: 신본 채택 대기 — 소실 조항(%s) 전부가 MASTER_DIRECTIVE.md.new 에 있다. "
+                              "규칙 문서이므로 오너에게 1줄로 알리고, 오너 지시로 워커가 신본의 그 조항을 구분선 "
+                              "뒤 본문에 합친다(승격 중 `--take-new` 는 조립된 지침을 통째로 덮어 머리말을 "
+                              "지우므로 거부된다 — A12)"
+                        % (prefix, "; ".join(l for _, l in lost_body)))
+            st["classification"] = "composed-pins-lost"
+            if st["pristine_b"] is not None and st["comp"][2] == st["pristine_b"]:
+                # 본문이 무수정 배포본 — 사용자 편집이 원인이 아니다(_c03_cause_line 과 같은 문안 · AH4(a)).
+                cause = ("원인 분류: 무수정 배포본(본문==.pristine) — 이 팩의 핀 기준이 디렉티브보다 "
+                         "앞서 있다(사용자 편집이 원인이 아니다). 규칙 문서이므로 오너에게 1줄로 알리고 "
+                         "오너 지시로 신본을 받는다")
+            else:
+                cause = _C03_RESTORE_GUIDE
+            return (FAIL, "%s: 소실된 조항: %s — %s"
+                    % (prefix, "; ".join(l for _, l in lost_body), cause))
         if st["marker"]:
             if not st["pre_exists"]:
                 # ④ 사분면(R1 시나리오6): 등가/영수증 승격인데 강등 백업이 없다 — demote 로
@@ -1870,8 +1966,10 @@ class Preflight:
             if st["pristine_b"] is not None and st["pre_b"] == st["pristine_b"]:
                 # 검사 표면(.pre-ceo)이 무수정 배포본 — 사용자 과실 아님. 주의: 승격 중
                 # MASTER 에 --take-new 를 처방하지 않는다(A12 가드 — 재사용 금지 경로).
-                cause = ("원인 분류: 무수정 배포본(.pre-ceo==.pristine) — 핀 기준 선행"
-                         "(벤더 동기 필요·사용자 과실 아님)")
+                # ★AH4(a)(T8): 수리를 남에게 넘기지 않는다 — T1b 가 _c03_cause_line 에 준 문안(뜻: 사용자 탓이 아님).
+                cause = ("원인 분류: 무수정 배포본(.pre-ceo==.pristine) — 이 팩의 핀 기준이 디렉티브보다 "
+                         "앞서 있다(사용자 편집이 원인이 아니다). 규칙 문서이므로 오너에게 1줄로 알리고 "
+                         "오너 지시로 신본을 받는다")
             else:
                 cause = _C03_RESTORE_GUIDE
             return (FAIL, "%s: 소실된 조항: %s — %s%s"
@@ -1879,13 +1977,17 @@ class Preflight:
         if st["pre_exists"]:
             # ③ 비정형 승격 상태 — 파괴적 조치 금지·cmp 진단 첨부(R1 시나리오4).
             st["classification"] = "anomalous-promotion"
+            # ★AH4(a)(T8): 안전 의미(파괴적 조치 금지·보고 후 지시 대기)는 그대로, 벤더 호칭 없이(AH5 와 같은 치환).
+            # ★T8: 조립은 살아 있는 지침을 본문으로 쓰므로 promote-ceo 재실행만으로는 이 상태가 풀리지 않는다 —
+            #   보존된 백업이 사용자 본부 지침이면 오너 지시로 그것을 되돌린 **뒤에** 재승격한다.
             return (FAIL, "비정형 승격 상태 — .pre-ceo 존재 ∧ md 표준 핀 실패 ∧ 승격 표지"
-                          "(바이트 등가·영수증·표지 3핀) 전부 실패. ★파괴적 조치 금지(주인님께 "
-                          "보고 후 지시 대기). 사용자 주권 편집은 허용이나 개행 변경도 비정형 "
+                          "(조립 구분선·바이트 등가·영수증·표지 3핀) 전부 실패. ★파괴적 조치 금지(오너에게 "
+                          "보고한 뒤 지시 대기). 사용자 주권 편집은 허용이나 개행 변경도 비정형 "
                           "판정됨(바이트 등가 기준·정규화 없음). cmp: md vs .pre-ceo=%s · "
                           "md vs .pristine(MASTER)=%s · md vs 라이브 CEO_TEMPLATE=%s. "
-                          "CEO_TEMPLATE 전진 직후라면 promote-ceo 재실행으로 해소(재스왑·"
-                          ".pre-ceo 보존). 소실된 조항: %s"
+                          "보존된 백업(.pre-ceo)이 사용자 본부 지침이면 오너 지시로 그것을 MASTER_DIRECTIVE.md 로 "
+                          "되돌린 뒤 promote-ceo 재실행(조립은 지금 파일을 본문으로 쓴다 — 지금 파일은 시각을 붙인 "
+                          "사본으로 먼저 남는다). 소실된 조항: %s"
                     % (self._c03_cmp_label(st["md_b"], st["pre_b"]),
                        self._c03_cmp_label(st["md_b"], st["pristine_b"]),
                        self._c03_cmp_label(st["md_b"], st["tmpl_b"]),
@@ -1906,9 +2008,30 @@ class Preflight:
           FAIL 로 두면 승격 함대 전체의 부트가 관측 목적에 볼모로 잡힌다. 같은 상태를 핀
           축이 FAIL 로 병행 발화할 수 있고(④ 백업 소실 등) 그 중복은 의도다(독립 축 —
           모순 아닌 중복 신호 · R3 minor).
-        guard_bits = [pre 존재, 퇴화, 핀 전수] (1/0 · 부재 단락 시 후속 = None) — 지문 성분."""
+        guard_bits = [pre 존재, 퇴화, 핀 전수] (1/0 · 부재 단락 시 후속 = None) — 지문 성분.
+        ★0.15.0 T8: 조립된 CEO 지침의 강등 원본은 구분선 뒤 본문이다(.pre-ceo 는 백업일 뿐) — 그 형상의
+          guard_bits = ["composed", 본문 건전 1/0, 영수증 상태]."""
         if not st["marker"]:
             return None    # 비승격 — 건전성 축 해당 없음(행 미발화 · 소음 0)
+        if st["composed"]:
+            body_b = st["comp"][2]
+            sound = body_b.strip() != b"" and self._c03_ceo_split(body_b) is None
+            rstate = st["ceo_receipt_state"]
+            st["guard_bits"] = ["composed", 1 if sound else 0, rstate]
+            if not sound:
+                return (WARN, "강등 경로 이상 — 구분선 뒤 본문이 비었거나 또 하나의 조립을 담고 있다(강등 원본이 "
+                              "될 수 없다 — cys-dept 는 이 상태에서 강등하지 않고 경고한다). 오너에게 보고")
+            if rstate == "invalid":
+                return (WARN, "승격 영수증(directives/%s) 손상(%s) — 승격 확인이 성공으로 보고되지 않는다. "
+                              "파일을 확인하고, 손상이면 지운 뒤 다시 승격하면 지금 지침은 그대로 두고 영수증만 "
+                              "새로 기록된다" % (self._C03_CEO_RECEIPT, st["ceo_receipt_info"]))
+            if rstate == "absent" and st["receipt_equal"] and st["pre_exists"] and not st["degenerate"]:
+                return (PASS, "강등 경로 건전 — 0.14.x 통째 복사본이 그대로라 백업(.pre-ceo = 사용자 본부 지침)으로 "
+                              "되돌린다 · 영수증 없음(0.15.0 이전 승격 — 다음 승격 확인 때 기록)")
+            return (PASS, "강등 경로 건전 — 부서를 모두 정리하면 구분선 뒤 본문(사용자 본부 지침, CEO 동안 고친 "
+                          "것 포함)으로 되돌린다(.pre-ceo 는 백업일 뿐 강등 원본이 아니다)%s"
+                    % ("" if rstate == "valid"
+                       else " · 영수증 없음(0.15.0 이전 승격 — 다음 승격 확인 때 기록)"))
         if not st["pre_exists"]:
             st["guard_bits"] = [0, None, None]
             return (WARN, "승격 표지(%s)인데 .pre-ceo 부재 — 강등 불능. 후속 검사(퇴화·핀) "
