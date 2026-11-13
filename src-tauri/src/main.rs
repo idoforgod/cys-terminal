@@ -7028,16 +7028,77 @@ fn ceo_pending() -> bool {
 /// 비정형 승격 상태의 진단·안내는 preflight C03 의 관할이지 팔레트가 아니다.
 /// 경로 규약 = cys-dept `ceo_promote`(`$PACK_DEFAULT/directives/…`)와 동일 파일 쌍 · ceo_pending 관례
 /// (동기 fn·프론트 온디맨드 조회 — 신규 타이머 금지).
+///
+/// ★0.15.0 「스스로 해결」 T8(C11 11.8–11.9 · 설계 §4-14): CEO 지침은 이제 **조립**이다 — 생성된 머리말 + 구분선 +
+/// 사용자 본부 지침. 그래서 '지침 ≠ 틀'은 정상 상태다(본문 = 사용자 지침 — 종전 판정은 사용자가 본부 지침을 고치기만 해도
+/// 늘 켜져 '재적용'(통째 복사 = 수정 소실)을 권했다 · W4 CH-19 §9). 드리프트 = 승격 상태(`.pre-ceo` 실재 또는 조립된 지침)
+/// 인데 지침의 머리말(첫 구분선 앞 바이트)이 현행 틀의 머리말과 다를 때만이다 — 틀이 전진했거나 구분선 없는 옛 승격본이다.
+/// 이때의 재실행은 머리말만 다시 조립하고 본문은 그대로 둔다(사용자가 고친 머리말은 cys-dept 가 시각 붙여 먼저 보관).
+/// 틀에 구분선이 없거나 판독 불가면 노출하지 않는다(보수 — 비정형 상태 안내는 C03 관할).
 fn ceo_drift_verdict(pre_ceo_exists: bool, md: Option<&[u8]>, template: Option<&[u8]>) -> bool {
-    pre_ceo_exists && matches!((md, template), (Some(m), Some(t)) if m != t)
+    if !ceo_promoted(pre_ceo_exists, md) {
+        return false;
+    }
+    let (Some(md), Some(template)) = (md, template) else {
+        return false;
+    };
+    let Some(current_header) = ceo_header(template) else {
+        return false;
+    };
+    match ceo_header(md) {
+        Some(header) => header != current_header,
+        None => true, // 구분선 없는 옛 승격본(.pre-ceo 실재) — 조립으로 다시 승격하라고 노출
+    }
+}
+
+/// ★RULINGS CB1 — '승격'의 한 뜻: `.pre-ceo` 실재 ∨ 살아 있는 MASTER 에 생성기의 조립 구분선(LF·CRLF)이 있다.
+/// 같은 술어: A12(`src/bin/cys.rs`)·`cys::pack::ceo_promoted_in`·javis_preflight(파이썬 정본)·javis_org·cys-dept —
+/// `cysjavis-pack/bin/tests/fixtures/ceo-promoted-cases.json` 한 벌이 전부를 같은 답으로 묶는다.
+fn ceo_promoted(pre_ceo_exists: bool, md: Option<&[u8]>) -> bool {
+    pre_ceo_exists || md.and_then(ceo_header).is_some()
+}
+
+/// ★RULINGS CG2 — 디렉티브 폴더에서 같은 술어를 판정한다. `.pre-ceo` 의 실재는 사전적이다(`symlink_metadata` — 끊긴 링크·
+/// 읽을 수 없는 파일·폴더도 '있다'; A12·preflight·javis_org·cys-dept 와 같은 판정).
+fn ceo_pre_ceo_present(dir: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(dir.join("MASTER_DIRECTIVE.md.pre-ceo")).is_ok()
+}
+
+#[cfg(test)] // 파리티 시험이 실제 파일로 부르는 경로 — 운영 경로(ceo_promotion_drift)는 같은 두 조각을 쓴다
+fn ceo_promoted_at(dir: &std::path::Path) -> bool {
+    ceo_promoted(
+        ceo_pre_ceo_present(dir),
+        std::fs::read(dir.join("MASTER_DIRECTIVE.md"))
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// 조립 구분선 — `scripts/gen_ceo_template.py` 의 `SEPARATOR` 와 같은 바이트(시험 `ceo_separator_matches_generator`
+/// 가 고정한다 · cys-dept·preflight·javis_org 사본은 `test_ceo_composition.py` 가 고정).
+const CEO_SEPARATOR: &str = "\n---\n\n# [본문 — 표준 MASTER 운영 계약 전문]\n\n";
+
+/// 조립된 지침의 머리말(첫 구분선 앞 바이트) — 구분선이 없으면 None. CRLF 로 바뀐 파일의 같은 구분선도 본다(cys-dept 와 같은 규칙).
+fn ceo_header(b: &[u8]) -> Option<&[u8]> {
+    let lf = CEO_SEPARATOR.as_bytes();
+    let crlf = CEO_SEPARATOR.replace('\n', "\r\n");
+    let find = |needle: &[u8]| b.windows(needle.len()).position(|w| w == needle);
+    match (find(lf), find(crlf.as_bytes())) {
+        (Some(a), Some(c)) => Some(&b[..a.min(c)]),
+        (Some(a), None) => Some(&b[..a]),
+        (None, Some(c)) => Some(&b[..c]),
+        (None, None) => None,
+    }
 }
 
 #[tauri::command]
 fn ceo_promotion_drift() -> bool {
     let dir = cys::pack::pack_dir().join("directives");
     ceo_drift_verdict(
-        dir.join("MASTER_DIRECTIVE.md.pre-ceo").exists(),
-        std::fs::read(dir.join("MASTER_DIRECTIVE.md")).ok().as_deref(),
+        ceo_pre_ceo_present(&dir),
+        std::fs::read(dir.join("MASTER_DIRECTIVE.md"))
+            .ok()
+            .as_deref(),
         std::fs::read(dir.join("CEO_TEMPLATE.md")).ok().as_deref(),
     )
 }
@@ -10939,23 +11000,151 @@ exit 0
         assert_eq!(merge_integrity_pull(s(), b()), b());
     }
 
-    /// ★D4 팔레트 노출 게이트 회귀 핀: 드리프트 = [.pre-ceo 존재 ∧ md≠라이브 CEO_TEMPLATE] **만**이다.
-    /// 특히 R2 실측 교정 두 가지를 고정한다 — ⓐ md==템플릿(정상 승격 최신)은 .pre-ceo 가 있어도
-    /// 비노출(위경보 0) ⓑ 판독 불가(부재·IO 실패)는 보수적 비노출(비정형 상태 안내는 C03 관할).
+    /// ★D4 팔레트 노출 게이트 회귀 핀 → ★0.15.0 T8(조립 · C11 11.9): 드리프트 = 승격 상태인데 지침의 **머리말**이 현행
+    /// 틀의 머리말과 다를 때**만**이다. 고정하는 것 — ⓐ 조립된 지침의 본문(사용자 본부 지침)을 고친 것은 드리프트가 아니다
+    /// (종전 'md≠틀' 판정은 이것으로 늘 켜져 수정을 지우는 '재적용'을 권했다) ⓑ 틀 전진(머리말 변경)은 드리프트 ⓒ 구분선
+    /// 없는 옛 승격본(.pre-ceo 실재)은 조립으로 다시 승격하라고 노출 ⓓ 판독 불가·구분선 없는 틀은 보수적 비노출(C03 관할).
     #[test]
     fn ceo_drift_verdict_gate_matrix() {
-        let old = Some("CEO v1".as_bytes());
-        let new = Some("CEO v2".as_bytes());
-        // 유일한 노출 케이스: 승격 상태(.pre-ceo)에서 템플릿 전진으로 md 가 구본화됨.
-        assert!(ceo_drift_verdict(true, old, new));
-        // 정상 승격 최신(md==템플릿) → 비노출.
-        assert!(!ceo_drift_verdict(true, new, new));
-        // 미승격(.pre-ceo 부재) → md 가 달라도 비노출(주권 편집·미승격 머신).
-        assert!(!ceo_drift_verdict(false, old, new));
-        // 판독 불가(어느 쪽이든) → 비노출(보수) — 템플릿 소실 시 promote-ceo 재실행 권유 금지.
-        assert!(!ceo_drift_verdict(true, None, new));
-        assert!(!ceo_drift_verdict(true, old, None));
+        let sep = CEO_SEPARATOR;
+        let tmpl_v1 = format!("CEO 머리말 v1\n{sep}표준 MASTER\n");
+        let tmpl_v2 = format!("CEO 머리말 v2\n{sep}표준 MASTER v2\n");
+        let composed_v1 = format!("CEO 머리말 v1\n{sep}표준 MASTER\n");
+        let composed_v1_edited =
+            format!("CEO 머리말 v1\n{sep}표준 MASTER\nUSERFIX-사용자가 고친 줄\n");
+        let (t1, t2) = (Some(tmpl_v1.as_bytes()), Some(tmpl_v2.as_bytes()));
+        // ⓐ 현행 머리말로 조립 — 본문이 사용자 수정이든 아니든 비노출(.pre-ceo 유무와 무관).
+        assert!(!ceo_drift_verdict(true, Some(composed_v1.as_bytes()), t1));
+        assert!(!ceo_drift_verdict(
+            true,
+            Some(composed_v1_edited.as_bytes()),
+            t1
+        ));
+        assert!(!ceo_drift_verdict(
+            false,
+            Some(composed_v1_edited.as_bytes()),
+            t1
+        ));
+        // ⓑ 틀 전진(머리말 v1 → v2) — 노출(재실행 = 머리말만 다시 조립 · 본문 유지). 조립 자체가 승격이라 .pre-ceo 불요.
+        assert!(ceo_drift_verdict(
+            true,
+            Some(composed_v1_edited.as_bytes()),
+            t2
+        ));
+        assert!(ceo_drift_verdict(
+            false,
+            Some(composed_v1_edited.as_bytes()),
+            t2
+        ));
+        // ⓒ 구분선 없는 옛 승격본(.pre-ceo 실재) → 노출 / 미승격 표준 MASTER(.pre-ceo 부재) → 비노출(주권 편집).
+        assert!(ceo_drift_verdict(
+            true,
+            Some("구 6KB CEO 머리글만 있는 옛 사본\n".as_bytes()),
+            t2
+        ));
+        assert!(!ceo_drift_verdict(
+            false,
+            Some("표준 MASTER\nUSERFIX\n".as_bytes()),
+            t2
+        ));
+        // CRLF 로 바뀐 같은 구분선도 머리말로 읽는다(cys-dept 와 같은 규칙).
+        let crlf = composed_v1_edited.replace('\n', "\r\n");
+        let tmpl_crlf = tmpl_v1.replace('\n', "\r\n");
+        assert!(!ceo_drift_verdict(
+            true,
+            Some(crlf.as_bytes()),
+            Some(tmpl_crlf.as_bytes())
+        ));
+        // ⓓ 판독 불가(어느 쪽이든)·구분선 없는 틀 → 비노출(보수) — 틀 소실·스텁 시 재실행 권유 금지.
+        assert!(!ceo_drift_verdict(true, None, t2));
+        assert!(!ceo_drift_verdict(true, Some(composed_v1.as_bytes()), None));
         assert!(!ceo_drift_verdict(true, None, None));
+        assert!(!ceo_drift_verdict(
+            true,
+            Some(composed_v1.as_bytes()),
+            Some("CEO-STUB\n".as_bytes())
+        ));
+    }
+
+    /// ★RULINGS CB1 파리티: 앱의 '승격' 술어가 A12·preflight·javis_org·cys-dept 와 같은 픽스처 한 벌에 같은 답을 낸다.
+    #[test]
+    fn ceo_promoted_matches_the_shared_fixture() {
+        let fx: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../cysjavis-pack/bin/tests/fixtures/ceo-promoted-cases.json"
+        )))
+        .unwrap();
+        assert_eq!(fx["separator"].as_str(), Some(CEO_SEPARATOR));
+        let mut ran = 0;
+        for (i, c) in fx["cases"].as_array().unwrap().iter().enumerate() {
+            // ★CG2: 실제 항목으로 판정한다(디렉티브 폴더 하나 — 운영 경로와 같은 두 조각).
+            let dir = std::env::temp_dir().join(format!("cys-app-cb1-{}-{i}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            if let Some(md) = c["md"].as_str() {
+                std::fs::write(dir.join("MASTER_DIRECTIVE.md"), md).unwrap();
+            }
+            let pre = dir.join("MASTER_DIRECTIVE.md.pre-ceo");
+            match c["pre_ceo"].as_str() {
+                None => {}
+                Some("file") => std::fs::write(&pre, "백업\n").unwrap(),
+                Some("directory") => std::fs::create_dir(&pre).unwrap(),
+                #[cfg(unix)]
+                Some("dangling-link") => {
+                    std::os::unix::fs::symlink(dir.join("nowhere"), &pre).unwrap()
+                }
+                #[cfg(unix)]
+                Some("unreadable") => {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::write(&pre, "백업\n").unwrap();
+                    std::fs::set_permissions(&pre, std::fs::Permissions::from_mode(0o000)).unwrap();
+                }
+                Some(_) => {
+                    let _ = std::fs::remove_dir_all(&dir);
+                    continue;
+                }
+            }
+            assert_eq!(
+                ceo_promoted_at(&dir),
+                c["promoted"].as_bool().unwrap(),
+                "앱 술어 ≠ 픽스처: {}",
+                c["name"]
+            );
+            ran += 1;
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        assert!(ran >= 12, "픽스처 행을 거의 못 돌렸다: {ran}");
+    }
+
+    /// ★T8: 앱의 조립 구분선은 생성기(`scripts/gen_ceo_template.py` SEPARATOR)와 같은 바이트이고, 출하 틀
+    /// (`cysjavis-pack/directives/CEO_TEMPLATE.md`)에 정확히 한 번 있으며 그 뒤가 출하 MASTER 전문이다(조립 계약의 원천).
+    #[test]
+    fn ceo_separator_matches_generator() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap();
+        let gen = std::fs::read_to_string(root.join("scripts/gen_ceo_template.py")).unwrap();
+        let literal = CEO_SEPARATOR.replace('\n', "\\n");
+        assert!(
+            gen.contains(&format!("SEPARATOR = \"{literal}\".encode(\"utf-8\")")),
+            "생성기의 SEPARATOR 리터럴이 앱 사본과 다르다(재조립 구분선 드리프트)"
+        );
+        let tmpl = std::fs::read(root.join("cysjavis-pack/directives/CEO_TEMPLATE.md")).unwrap();
+        let master =
+            std::fs::read(root.join("cysjavis-pack/directives/MASTER_DIRECTIVE.md")).unwrap();
+        let header = ceo_header(&tmpl).expect("출하 틀에 조립 구분선이 없다");
+        let sep = CEO_SEPARATOR.as_bytes();
+        assert_eq!(&tmpl[header.len()..header.len() + sep.len()], sep);
+        assert_eq!(
+            &tmpl[header.len() + sep.len()..],
+            &master[..],
+            "구분선 뒤가 출하 MASTER 전문이 아니다"
+        );
+        assert_eq!(
+            tmpl.windows(sep.len()).filter(|w| *w == sep).count(),
+            1,
+            "구분선은 틀에 한 번만"
+        );
     }
 
     /// [F1] open_path 실행형 게이트 — 실행비트 파일은 force 없이 executable_confirm으로 거절(fail-closed),

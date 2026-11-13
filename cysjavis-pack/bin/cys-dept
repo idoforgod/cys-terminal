@@ -1612,7 +1612,8 @@ ceo_reinject_deferred(){
     echo "[cys-dept] WARN: 재주입 포인터 큐 배달 실패 — 대표는 이 턴을 마친 뒤 \`cys reinject --role master\` 를 직접 1회 실행하라" >&2
   fi
 }
-# CEO 승격: 부서가 1개 이상이면 기본 데몬을 CEO로(디렉티브 교체, 가역 백업). 부서 0이면 표준 master 보존(하위호환).
+# CEO 승격: 부서가 1개 이상이면 기본 데몬을 CEO로(★0.15.0 T8: 디렉티브 **조립** — 생성된 머리말 + 사용자 본부 지침,
+#   가역 = 구분선 뒤 바이트). 부서 0이면 표준 master 보존(하위호환).
 # ★자동 승격(제품 기본 정책): 부서(최소 1개 마스터) 생성 자체를 승격 동의로 간주해 자동 승격한다.
 #   (종전 2026-07-14 'feed 승인/지명 필요'는 폐기 — GUI 승인 버튼이 §3.2 자기승인 차단·토큰 불일치로 침묵
 #   실패해 승격이 걸리던 문제 해소). 지명(promote-ceo)은 여전히 오너 직접 경로다. 마커(.pre-ceo)=기승인 상태라 조정(무결 유지)은 묻지 않는다.
@@ -1622,43 +1623,822 @@ ceo_reinject_deferred(){
 #   stale 정책(설계 §4.1): 이 게이트는 마커 '존재만' 본다(버전 무관 — 승격은 조직 사실).
 BOOT_MARKER="$HOME/.cys/.master-bootstrapped"
 CEO_PENDING="$HOME/.cys/state/ceo-pending"
-# ★DCE-3(T10·오너 결정 ⑨): CEO_TEMPLATE ⊇ MASTER_DIRECTIVE 상위집합 런타임 검사 —
-#   반쪽마스터 실사고(승격이 표준 디렉티브를 스텁으로 replace — 팩 업데이트로 수리가 되돌려져
-#   라이브 FAIL) 재발의 **런타임 층** 방어. 빌드 층(gen_ceo_template --check)은 배포 회귀를 못
-#   막는다(보증이 템플릿 빌드에만 있으면 배포본 드리프트 시 재발 — REPORT DCE-3).
-#   판정 = ref(표준 MASTER 전문) 바이트열이 CEO 템플릿 안에 verbatim 포함되는가(합성 계약
-#   gen_ceo_template: fragment + 구분선 + MASTER 바이트 무수정 연접 — 정상 템플릿은 항상 참).
+# ── ★0.15.0 「스스로 해결」 M14·M15-나(C11 11.8–11.11 · O-C11-1/2 · 설계 §4-14): CEO 지침 = 조립 ──
+#   종전 승격은 CEO_TEMPLATE 을 MASTER_DIRECTIVE.md 위에 **통째로 복사**(cp)해, 사용자가 고친 본부 지침을 켤 때마다
+#   지웠다(2026-10-13 dept-6 사고 · W4 CH-19: launch·rotate·create·allocate·promote-if-pending 모두). 이제 승격은
+#   결정론 조립이다: CEO 지침 = [틀의 머리말(첫 구분선 앞 바이트)] + [구분선 — scripts/gen_ceo_template.py 의
+#   SEPARATOR 그대로(새 구분선 금지)] + [사용자 자신의 본부 지침 바이트]. 에이전트·병합·충돌이 없다.
+#   · 강등 = 구분선 뒤 바이트(CEO 동안 고친 본문도 남는다). .pre-ceo 는 **백업으로만** 남는다(승격 확인이 없으면 다시 만든다).
+#     승격 판정은 한 술어 — .pre-ceo 사전적 실재 ∨ 지침에 조립 구분선(RULINGS CB1·CG2): A12 가드
+#     `cys.rs:ceo_vendor_overwrite_rejection` 와 팩 갱신 가드 4 가 같은 함수 `pack.rs:ceo_promoted_in` 을 쓴다.
+#   · 영수증 = directives/.ceo-receipt.json(src/repair/paths.rs:ceo_receipt_path) — {schema, header_sha256,
+#     master_sha256_at_compose, composed_sha256, separator, composed_at}. 종전 .ceo-template-applied 는 더 쓰지 않는다
+#     (조립·강등이 지운다 — 0.14.x 승격 기계의 판독 근거로만 읽는다).
+#   · 생성되지 않은 바이트(사용자가 고친 머리말 · 0.14.x 의 정체 모를 머리말 · 구분선 없는 옛 CEO 사본)가 살아 있는 파일에서
+#     빠질 때는 그 파일 전체를 시각을 붙여 먼저 보관한다(MASTER_DIRECTIVE.md.before-compose.<UTC> · before-demote.<UTC>).
+#   · 모든 쓰기는 같은 폴더 임시 파일 → flush·fsync → 다시 읽어 확인 → 원자 교체(반쪽 파일 없음 · 윈도우 공유 위반은 짧게 재시도).
+#   · 실패는 전부 rc 로 돌려 호출부가 보류한다 — 이 도구는 늘 0 으로 끝나 부서 생명주기를 깨지 않는다(아래 1767–1772행 규칙).
+#   ceo_py 의 인자는 전부 경로다 — 윈도우(MSYS)의 경로 변환은 argv 에서만 일어나므로 파이썬 안에서 HOME 으로 경로를 만들지 않는다.
+CEO_RECEIPT_NAME=".ceo-receipt.json"
+ceo_py(){  # $1 = superset | state | compose | demote | verify | promoted
+  python3 - "$@" <<'PY'
+import hashlib, json, os, re, sys, tempfile, time
+
+# 구분선 — scripts/gen_ceo_template.py SEPARATOR 와 같은 바이트(O-C11-2 · test_ceo_composition 이 고정한다).
+SEP = "\n---\n\n# [본문 — 표준 MASTER 운영 계약 전문]\n\n".encode("utf-8")
+SEP_CRLF = SEP.replace(b"\n", b"\r\n")   # 에디터·체크아웃이 CRLF 로 바꾼 파일(SF-2) — 같은 구분선의 다른 철자
+# 머리말 표지 3핀 — javis_preflight.MARKER_PINS 와 같은 값(test_ceo_composition 이 고정한다). 3핀 전수일 때만 'CEO 문면'.
+MARKER_PINS = ("master of master", "단일소유 강제", "exit 7")
+RECEIPT = ".ceo-receipt.json"
+LEGACY_RECEIPT = ".ceo-template-applied"
+HEX64 = re.compile(r"[0-9a-f]{64}")
+
+
+def err(msg):
+    sys.stderr.write("[cys-dept] %s\n" % msg)
+
+
+def sha(b):
+    return hashlib.sha256(b).hexdigest()
+
+
+def read(p):
+    """bytes | None(부재). 그 밖의 판독 실패는 OSError 로 올린다(호출부 = 판독 불능)."""
+    try:
+        with open(p, "rb") as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
+
+
+def split(b):
+    """첫 구분선(LF·CRLF 철자 중 먼저 나오는 것)에서 (머리말, 구분선, 본문) — 구분선이 없으면 None."""
+    if b is None:
+        return None
+    hits = [(b.find(s), s) for s in (SEP, SEP_CRLF)]
+    hits = [h for h in hits if h[0] >= 0]
+    if not hits:
+        return None
+    i, s = min(hits)
+    return b[:i], s, b[i + len(s):]
+
+
+def ceo_marked(b):
+    t = b.decode("utf-8", "replace")
+    return all(p in t for p in MARKER_PINS)
+
+
+def plain_master(b):
+    """조립되지 않은 MASTER 인가 — 비어 있지 않고 구분선이 없다(겹친 머리말 방지)."""
+    return b is not None and b.strip() != b"" and split(b) is None
+
+
+def receipt_load(p):
+    """('absent', None) | ('valid', dict) | ('invalid', 사유) — preflight C03 과 같은 규칙."""
+    try:
+        raw = read(p)
+    except OSError as e:
+        return "invalid", "판독 불가(%s)" % e
+    if raw is None:
+        return "absent", None
+    try:
+        d = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return "invalid", "JSON 이 아니다"
+    if not isinstance(d, dict):
+        return "invalid", "JSON 객체가 아니다"
+    s = d.get("schema")
+    if not isinstance(s, int) or isinstance(s, bool) or s < 1:
+        return "invalid", "schema 값이 없거나 틀렸다"
+    for k in ("header_sha256", "master_sha256_at_compose", "composed_sha256"):
+        if not isinstance(d.get(k), str) or not HEX64.fullmatch(d[k]):
+            return "invalid", "%s 값이 없거나 틀렸다" % k
+    sp = d.get("separator")
+    if not isinstance(sp, str) or sp.encode("utf-8") not in (SEP, SEP_CRLF):
+        return "invalid", "separator 값이 조립 구분선이 아니다"
+    if not isinstance(d.get("composed_at"), str) or not d["composed_at"]:
+        return "invalid", "composed_at 값이 없다"
+    return "valid", d
+
+
+def legacy_hash(p):
+    """0.14.x 영수증(.ceo-template-applied) — 그때 복사한 지침의 sha256 hex(관용: 첫 64자리 hex)."""
+    try:
+        raw = read(p)
+    except OSError:
+        return None
+    if raw is None:
+        return None
+    m = re.search(r"\b[0-9a-fA-F]{64}\b", raw.decode("utf-8", "replace"))
+    return m.group(0).lower() if m else None
+
+
+def stamp():
+    return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+
+
+def fsync_dir(d):
+    if os.name != "posix":
+        return
+    try:
+        fd = os.open(d, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def replace_retry(src, dst):
+    # 윈도우: 다른 프로세스가 대상을 막 읽는 중이면 공유 위반(PermissionError) — 짧게 다시 해 본다(그래도 안 되면 무변경 실패).
+    for n in range(6):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if n == 5:
+                raise
+            time.sleep(0.1)
+
+
+def write_atomic(path, data, expect=None):
+    """같은 폴더 임시 파일 → flush·fsync → (expect) 다시 읽어 확인 → 원자 교체. 실패 = 살아 있는 파일 무변경."""
+    d = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(dir=d, prefix="." + os.path.basename(path) + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.chmod(tmp, os.stat(path).st_mode & 0o7777)   # 기존 파일의 권한을 그대로(cp 와 같은 결과)
+        except OSError:
+            try:
+                os.chmod(tmp, 0o644)
+            except OSError:
+                pass
+        if expect is not None:
+            with open(tmp, "rb") as f:
+                back = f.read()
+            if not expect(back):
+                raise ValueError("다시 읽은 후보가 조립 결과와 다르다(반쪽 기록 — 교체하지 않음)")
+        replace_retry(tmp, path)
+        tmp = None
+        fsync_dir(d)
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def keep_copy(base, data):
+    """시각을 붙인 사본 — 덮지 않는다(같은 초에 또 있으면 -2, -3 …). 경로를 돌려준다."""
+    first = "%s.%s" % (base, stamp())
+    p = first
+    for n in range(2, 1000):
+        try:
+            fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o644)
+            break
+        except FileExistsError:
+            p = "%s-%d" % (first, n)
+    else:
+        raise OSError("보관 사본 이름을 만들지 못했다(%s)" % first)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    return p
+
+
+def set_aside(path):
+    """파일을 시각을 붙인 이름으로 옮긴다(덮지 않는다) — 옮긴 경로."""
+    first = "%s.%s" % (path, stamp())
+    p, n = first, 1
+    while os.path.lexists(p):
+        n += 1
+        if n > 999:
+            raise OSError("보관 이름을 만들지 못했다(%s)" % first)
+        p = "%s-%d" % (first, n)
+    os.rename(path, p)
+    return p
+
+
+def write_receipt(p, header, sep, body, composed):
+    doc = {"schema": 1, "header_sha256": sha(header), "master_sha256_at_compose": sha(body),
+           "composed_sha256": sha(composed), "separator": sep.decode("utf-8"),
+           "composed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    write_atomic(p, (json.dumps(doc, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+
+
+def drop(p):
+    try:
+        os.unlink(p)
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def load_preflight(pack_bin, self_path):
+    """C03 핀의 정본(javis_preflight)을 본부 팩에서, 없으면 이 스크립트 옆에서 읽는다(사본 금지 — 같은 팩의 같은 판)."""
+    cands = [os.path.join(pack_bin, "javis_preflight.py"),
+             os.path.join(os.path.dirname(os.path.realpath(self_path)), "javis_preflight.py")]
+    for c in cands:
+        if os.path.isfile(c):
+            sys.path.insert(0, os.path.dirname(c))
+            import javis_preflight
+            return javis_preflight
+    raise OSError("javis_preflight.py 를 찾지 못했다(%s)" % ", ".join(cands))
+
+
+def template_problem(pf, tb):
+    """틀이 '생성된 머리말 + 구분선 + 표준 MASTER 전문' 인가 — 문제 문장 | None(★DCE-3 상위집합, 조립판)."""
+    c = split(tb)
+    if c is None:
+        return "CEO_TEMPLATE.md 에 조립 구분선이 없다(스텁·옛 틀 의심)"
+    h, _s, body = c
+    if not h.strip():
+        return "CEO_TEMPLATE.md 의 머리말이 비어 있다"
+    ht = h.decode("utf-8", "replace")
+    miss = [p for p in pf.MARKER_PINS if p not in ht]
+    if miss:
+        return "CEO_TEMPLATE.md 머리말에 CEO 표지 핀이 없다: %s" % ", ".join(miss)
+    bt = body.decode("utf-8", "replace")
+    lost = [label for pin, label in pf.CONTENT_PINS["MASTER_DIRECTIVE.md"] if pin not in bt]
+    if lost:
+        return ("CEO_TEMPLATE.md 의 본문이 표준 MASTER 전문이 아니다(반쪽 — 소실 조항 %d개: %s%s)"
+                % (len(lost), "; ".join(lost[:3]), " …" if len(lost) > 3 else ""))
+    return None
+
+
+def do_superset(a):
+    # a = pack_bin self tmpl [candidate master]
+    pf = load_preflight(a[0], a[1])
+    tb = read(a[2])
+    if tb is None:
+        err("상위집합 검사: CEO_TEMPLATE.md 없음(%s)" % a[2])
+        return 2
+    prob = template_problem(pf, tb)
+    if prob:
+        err("상위집합 검사 실패: %s" % prob)
+        return 1
+    if len(a) >= 5 and a[3]:
+        cand, master = read(a[3]), read(a[4])
+        if cand is None or master is None:
+            err("상위집합 검사: 조립 후보 또는 본부 지침 없음")
+            return 2
+        h, s, _ = split(tb)
+        if cand != h + s + master:
+            err("상위집합 검사 실패: 조립 후보가 '머리말 + 구분선 + 사용자 본부 지침 전문'과 다르다(반쪽 조립)")
+            return 1
+    print(sha(tb))
+    return 0
+
+
+# ★RULINGS CG1 — 배포된 v0.14.x CEO 틀의 해시(이 표에 있어야만 '0.14.x 승격'의 양성 증거가 된다). 로컬 저장소의 배포 태그
+#   v0.14.0 … v0.14.56(54개 — 저장소에 없는 v0.14.34·35·39 는 발행되지 않았다)에서 `git show <tag>:cysjavis-pack/directives/
+#   CEO_TEMPLATE.md` 로 만들었다(네트워크 없음). 머리말 = 첫 구분선 앞 바이트 — 각 태그의 scripts/ceo_template_header.md 와
+#   같다. v0.14.0–15 의 틀에는 구분선이 없다(머리말 표 밖) — 구분선 없는 통째 복사본은 CEO 머리말 표지 3핀(v0.14.7–15)
+#   또는 아래 전문 표와의 바이트 등가로 안다(★v0.14.0–6 의 틀에는 표지 3핀이 없다 — `v014_whole_copy`).
+#   test_ceo_composition.py::V014Tables 가 태그에서 다시 만들어 이 두 표와 javis_preflight 의 사본을 대조한다.
+V014_HEADER_SHA256 = frozenset((
+    "843cc05d20867c5719c2272af5a5e54acbb5fa87b915e558e8bd71edf1bb78fd",  # v0.14.16 … v0.14.21
+    "06471deffc8d68f3cdce86003f61e647229616b1636f5a5b7a4ed1e8ccc0f793",  # v0.14.22 … v0.14.40
+    "11d02be05789b3ce083af81162a263d86fb0783edb0560f1989af327a427dfd2",  # v0.14.41
+    "8c039dd4b0442be710c6bc87bfeaf4f4b9f70c0378e57535044dd23a4aa52d29",  # v0.14.42 … v0.14.50
+    "912f545c59a541743639b6416ae1468f898f3149e23a4aa7b7f22f3121cd8bef",  # v0.14.51 … v0.14.56
+))
+V014_TEMPLATE_SHA256 = frozenset((   # 배포된 CEO_TEMPLATE.md 전문(15종 — src/pack_prev_vendor.rs 의 같은 행과 일치)
+    "e5eb70cdf98c6d90727a9289314f76381e9531cf409e009e49e3d1deb948e484",  # v0.14.0 … v0.14.6
+    "66d2d6a4885241faa80f1e46445a04fb9d06b8f49d9bd279040b4b09e153e09e",  # v0.14.7 … v0.14.9
+    "379271fa65d44d09d4b3b2aeb799bb04a18e84ea00fe93e5ff30f1ebe13fa069",  # v0.14.10 … v0.14.15
+    "270cf7910147d47d891e6527a13e4a9e860954adf9571958e4052a3cb6d553f1",  # v0.14.16 … v0.14.20
+    "a6d88382b10f631b387fd0e4f7d5cb84208aaac89ee696cf04db5e5c65e3e84f",  # v0.14.21
+    "d82090f48ec3f6f4ebae8e0a84e9b4d6d03ca5ca54f22ba8f93ff046c2605ad9",  # v0.14.22 … v0.14.26
+    "7dab0335f3c8986f2398eb7a00f0ec765e3fc6977593369d398775f6225fa742",  # v0.14.27 … v0.14.29
+    "500a987e9177aed078498e28d4612a7d60dba171dea4d334686f1c236bfec4d8",  # v0.14.30
+    "5a798872af8b01866098be0833068375b6e6a813c69a178a4a42d458d3ba1c17",  # v0.14.31 … v0.14.38
+    "c539f34d562729311fe9d4f62f919818b06785598efb2f81661f76f17d7c60d1",  # v0.14.40
+    "d7dab79b1ec210f1a40e3a9dcb95dfbd9eefaf571a2aed6248b232814ffde208",  # v0.14.41
+    "a794d2a738db2b9e8e00cd5818cdce66bee3f88e74cd6f181a9ac146533a4fff",  # v0.14.42
+    "513050d7320767758dd4478cc6daf63eafd424b4374e999402bceec25a932fff",  # v0.14.43 … v0.14.50
+    "a866e9440e19778acb3ad39c917d3916b4bbdb4af2b26db13f096d965b5c454c",  # v0.14.51 … v0.14.54
+    "15c72552a6f1921140e7308025dd0d04005686f7fdc4778950192b174824e33e",  # v0.14.55, v0.14.56
+))
+
+
+def pre_present(pre_p):
+    """★CG2 — .pre-ceo 의 실재 판정은 한 가지: 항목이 있다(사전적 의미 — 끊긴 링크·읽을 수 없는 파일·폴더도 '있다').
+    지키는 방향이다. 같은 판정: javis_preflight `_c03_pre_ceo_present` · javis_org · A12 · 앱 `ceo_promoted_at`."""
+    return os.path.lexists(pre_p)
+
+
+def promoted(mb, pre_exists):
+    """★RULINGS CB1 — '승격'의 한 뜻: .pre-ceo 실재(사전적) ∨ 살아 있는 MASTER 에 생성기의 구분선(LF·CRLF)이 있다.
+    내용이 승격을 정하고, 백업은 덮어쓰기 가드가 지키는 범위를 넓히기만 한다. 정본 = javis_preflight
+    `Preflight._c03_ceo_promoted`; 같은 판정이 javis_org·`cys::pack::ceo_promoted_in`(가드 4 — A12 가 그것만 부른다)·앱에 있고
+    tests/fixtures/ceo-promoted-cases.json 한 벌(실제 파일)이 전부를 같은 답으로 묶는다."""
+    return bool(pre_exists) or split(mb) is not None
+
+
+def note(nf, title, body):
+    """bash 가 제목 완전일치 dedupe 로 1건만 올리는 알림 — 줄 하나(NOTICE\t제목\t본문)를 인자로 받은 파일에 덧붙인다.
+    ★CG2: 알림 쓰기가 실패해도 이미 끝난 교체의 결과를 바꾸지 않는다(예외를 올리지 않고 stderr 에 한 줄)."""
+    if not nf:
+        return
+    clean = lambda t: t.replace("\t", " ").replace("\r", " ").replace("\n", " ")
+    try:
+        with open(nf, "a", encoding="utf-8") as f:
+            f.write("NOTICE\t%s\t%s\n" % (clean(title), clean(body)))
+    except OSError as e:
+        err("알림 기록 실패(%s) — 결과는 그대로다: %s" % (e, title))
+
+
+def best_effort(fn, *args):
+    """교체가 끝난 뒤의 정리(옛 영수증 지우기·백업 옮기기) — 실패는 경고일 뿐, 교체의 결과를 바꾸지 않는다(CG2)."""
+    try:
+        return fn(*args)
+    except OSError as e:
+        err("정리 단계 실패(%s) — 지침 교체는 끝났다" % e)
+        return None
+
+
+T_HOLD_UNPROVEN = "CEO 승격 보류(본부 지침에 조립 구분선 — 승격 기록 없음)"
+T_HOLD_CHECK = "CEO 승격 보류(본부 지침 확인 필요)"
+T_DEMOTE_HOLD = "CEO 강등 보류(본부 지침 확인 필요)"
+SEP_LINE = "# [본문 — 표준 MASTER 운영 계약 전문]"
+
+
+def copy_title(kind, path):
+    """보관 사본 알림의 제목 — 사본 이름을 담는다(같은 제목 dedupe 가 다른 사본의 경로를 가리지 않게 · CG2)."""
+    return "CEO 지침 사본 보관(%s) — %s" % (kind, os.path.basename(path))
+
+
+def pre_read(pre_p):
+    """('absent', None) | ('ok', bytes) | ('unreadable', 사유) — 실재는 사전적(pre_present)으로 본다."""
+    if not pre_present(pre_p):
+        return "absent", None
+    try:
+        with open(pre_p, "rb") as f:
+            return "ok", f.read()
+    except OSError as e:
+        return "unreadable", str(e)
+
+
+def pre_unusable(pstate, pb):
+    """백업을 본문으로 쓸 수 없는 이유(없으면 None) — 읽을 수 없음·비었음·구분선·CEO 머리말 표지(CG2: CEO 문면은 본문이 아니다)."""
+    if pstate == "unreadable":
+        return "읽을 수 없다"
+    if pb.strip() == b"":
+        return "비어 있다"
+    if split(pb) is not None:
+        return "조립 구분선을 담고 있다(CEO 지침 사본)"
+    if ceo_marked(pb):
+        return "CEO 머리말 표지를 담고 있다(CEO 지침 사본)"
+    return None
+
+
+def evidence(mh, rs, leg, pexist):
+    """CB2 — 승격된 적이 있다는 증거: 유효한 영수증 · 0.14.x 영수증 · .pre-ceo(사전적 실재) · 구분선 앞이 CEO 머리말 표지 3핀."""
+    return (rs == "valid" or leg is not None or pexist
+            or all(p in mh.decode("utf-8", "replace") for p in MARKER_PINS))
+
+
+def is_v014(mh, rs, leg):
+    """★CG1 — 0.14.x 통째 복사 승격의 양성 증거: 유효한 조립 영수증이 없고(0.15.0 의 조립만 그것을 쓰고, 쓸 때 0.14 영수증을
+    지운다 — I-T8-6), 0.14 영수증이 있거나 구분선 앞이 배포된 v0.14.x 머리말과 바이트까지 같다. 그 밖은 모두 조립이다."""
+    return rs != "valid" and (leg is not None or sha(mh) in V014_HEADER_SHA256)
+
+
+def v014_whole_copy(mb, leg):
+    """구분선 없는 0.14.x 통째 복사본의 양성 증거(CG1): CEO 머리말 표지 3핀(v0.14.7–15 의 틀) · 배포된 v0.14.x CEO 틀과
+    바이트까지 같음(v0.14.0–6 의 틀에는 표지 3핀이 없다 — 표가 유일한 증거) · 0.14 영수증의 해시와 같음. 0.14 영수증만
+    있는 평범한 MASTER 는 아니다(0.14.x 의 '강등 불능' 안내대로 .pristine 에서 되살린 지침에 영수증이 남는다)."""
+    h = sha(mb)
+    return ceo_marked(mb) or h in V014_TEMPLATE_SHA256 or (leg is not None and leg == h)
+
+
+def released_equal(mb, tb, leg):
+    """CB3 — 살아 있는 옛 CEO 지침이 배포된 CEO 틀과 바이트까지 같은가: 지금 설치된 틀 · 0.14 영수증(그때 복사한 바이트의
+    sha256) · 배포된 v0.14.x CEO_TEMPLATE.md 표(V014_TEMPLATE_SHA256). 그 밖은 '고친 것'으로 본다."""
+    h = sha(mb)
+    return (tb is not None and mb == tb) or (leg is not None and leg == h) or h in V014_TEMPLATE_SHA256
+
+
+def held_symlink(nf, md, pre_p, title):
+    for path in (md, pre_p):
+        if os.path.islink(path):
+            err("%s 은(는) 심볼릭 링크다 — 일반 파일로 바꿔 쓰지 않고 보류한다" % path)
+            note(nf, title, "본부 지침 파일(%s)이 심볼릭 링크라 CEO 지침을 바꾸지 않았습니다(링크를 일반 파일로 "
+                            "덮어쓰지 않습니다). 링크를 실제 파일로 바꾼 뒤 다시 시도하십시오. 지침은 그대로입니다." % path)
+            return True
+    return False
+
+
+def hold_unusable_pre(nf, title, pre_p, why, action):
+    err("%s 보류: 승격 전 본부 지침 백업(%s)이 %s — 본문으로 쓰지 않는다" % (action, pre_p, why))
+    note(nf, title, "0.14.x 방식으로 승격된 본부 지침의 사용자 본부 지침은 백업 %s 에 있어야 하는데, 그 백업이 %s. 그래서 %s을(를) "
+                    "하지 않았고 아무것도 바꾸지 않았습니다. 백업을 확인해 승격 전 본부 지침으로 되돌린 뒤 다시 시도하거나, "
+                    "오너 지시로 정리하십시오." % (pre_p, why, action))
+
+
+def do_promoted(a):
+    # a = md — CB1 술어(파리티 시험용): yes/no 한 줄.
+    md = a[0]
+    try:
+        mb = read(md)
+    except OSError:
+        mb = None
+    print("yes" if promoted(mb, pre_present(md + ".pre-ceo")) else "no")
+    return 0
+
+
+def do_state(a):
+    # a = tmpl md — 읽기 전용 상태 한 낱말(락 밖 · 쓰기 0).
+    #   current(현행 머리말·유효 영수증·백업) · current-fix(영수증/백업 보정만) · drift(머리말 낡음 — 조립)
+    #   legacy(0.14.x 승격 — 양성 증거, CG1) · unproven(구분선만 있고 승격 증거 없음 — CB2) · uncomposed · missing · unreadable
+    tmpl, md = a[0], a[1]
+    d = os.path.dirname(md)
+    try:
+        tb, mb = read(tmpl), read(md)
+    except OSError:
+        print("unreadable")
+        return 0
+    if mb is None:
+        print("missing")
+        return 0
+    mc = split(mb)
+    if mc is None:
+        print("uncomposed")
+        return 0
+    rs, rd = receipt_load(os.path.join(d, RECEIPT))
+    leg = legacy_hash(os.path.join(d, LEGACY_RECEIPT))
+    pexist = pre_present(md + ".pre-ceo")
+    if not evidence(mc[0], rs, leg, pexist):
+        print("unproven")
+        return 0
+    if is_v014(mc[0], rs, leg):
+        print("legacy")
+        return 0
+    tc = split(tb)
+    if tc is None or mc[0] != tc[0]:
+        print("drift")
+        return 0
+    ok = (rs == "valid" and rd["header_sha256"] == sha(tc[0]) and rd["separator"].encode("utf-8") == mc[1] and pexist)
+    print("current" if ok else "current-fix")
+    return 0
+
+
+def pre_differs(pstate, pb, body, rs):
+    """CG1 — 영수증으로 증명되지 않는 조립에서 .pre-ceo 가 지금 본문과 다른 MASTER 를 담고 있는가(읽을 수 없어도 '다르다').
+    고친 0.14.x 머리말 + 0.14 영수증 없음 = 조립인데, 그 .pre-ceo 는 0.14.x 승격 전의 본부 지침이다 — 알림이 그것을 알린다."""
+    return rs != "valid" and pstate != "absent" and not (pstate == "ok" and pb == body)
+
+
+def pre_differs_text(pre_p):
+    return (" 승격 전 본부 지침 백업 %s 은(는) 지금 본문과 다른 MASTER(옛 승격 전의 본부 지침일 수 있음)를 담고 있습니다 — "
+            "조립은 그것을 쓰지 않았고 백업은 그대로 둡니다(강등 때 시각을 붙여 보관). 그쪽 내용이 필요하면 오너 지시로 워커가 "
+            "본문에 반영하십시오." % pre_p)
+
+
+def do_compose(a):
+    # a = tmpl md tmpl_sha(락 밖 상위집합 검사를 통과한 틀의 해시) [notice-file]
+    # rc: 0 새 승격 · 12 다시 조립(머리말 갱신 · 0.14.x 이전) · 10 이미 현행 · 11 영수증/백업만 기록(지침 무변경)
+    #     2 판독 불능 · 3 틀이 검사 뒤 바뀜 · 6 보류(지침 무변경 — 이유는 stderr + 알림)
+    tmpl, md, tsha = a[0], a[1], a[2]
+    nf = a[3] if len(a) > 3 else ""
+    d = os.path.dirname(md)
+    pre_p, rec_p, leg_p = md + ".pre-ceo", os.path.join(d, RECEIPT), os.path.join(d, LEGACY_RECEIPT)
+    if held_symlink(nf, md, pre_p, T_HOLD_CHECK):       # CB5 — 링크를 일반 파일로 바꾸지 않는다
+        return 6
+    tb, mb = read(tmpl), read(md)
+    pstate, pb = pre_read(pre_p)
+    if tb is None or mb is None:
+        err("CEO 조립: %s 없음" % ("CEO_TEMPLATE.md" if tb is None else "MASTER_DIRECTIVE.md"))
+        return 2
+    if sha(tb) != tsha or split(tb) is None:
+        err("CEO 조립: CEO_TEMPLATE.md 가 상위집합 검사 뒤에 바뀌었다 — 이번엔 조립하지 않는다(다음 승격 확인 때 다시 검사)")
+        return 3
+    H, S, _ = split(tb)
+    rs, rd = receipt_load(rec_p)
+    leg = legacy_hash(leg_p)        # CB5 — 0.14.x 영수증은 머리말 갈래보다 먼저 읽는다
+    mc = split(mb)
+    new = False
+    keep = None                     # None | "header"(고친 머리말) | "migration"(0.14.x 옛 CEO 지침) | "migration-nobackup"
+    differs_check = False
+    if mc is not None:
+        mh, ms, tail = mc
+        if not evidence(mh, rs, leg, pstate != "absent"):
+            # CB2 — 구분선 줄은 있는데 승격된 적이 있다는 증거가 하나도 없다. 바이트 무이동.
+            err("CEO 조립 보류: 본부 지침에 조립 구분선 줄이 있지만 승격 기록(영수증·0.14 영수증·.pre-ceo·CEO 머리말 표지)이 "
+                "없다 — 아무것도 바꾸지 않는다")
+            note(nf, T_HOLD_UNPROVEN,
+                 "본부 지침(directives/MASTER_DIRECTIVE.md)에 CEO 조립 구분선 줄('%s')이 들어 있지만 승격된 적이 있다는 기록"
+                 "(승격 영수증 · 0.14 영수증 · .pre-ceo 백업 · CEO 머리말 표지)이 없어 아무것도 바꾸지 않고 승격을 보류했습니다. "
+                 "할 수 있는 일은 둘입니다: ① 이 파일이 원래 CEO 지침이었다면 구분선과 그 앞(머리말)을 지우고 구분선 뒤 본문만 "
+                 "남기십시오 — 그것이 본부 지침이고, 다시 승격하면 새 머리말로 조립됩니다(머리말을 본문에 남기지 마십시오). "
+                 "② 본부 지침에 그 줄이 우연히 들어간 것이라면 그 줄과 바로 위의 '---' 줄만 지우고 다시 승격하십시오. "
+                 "지침은 한 바이트도 바뀌지 않았습니다." % SEP_LINE)
+            return 6
+        if is_v014(mh, rs, leg):
+            # CB3 / CG1 — 양성 증거가 있는 0.14.x 통째 복사 승격: 사용자 본부 지침은 .pre-ceo 에 있다.
+            if pstate == "absent":
+                body, keep = tail, "migration-nobackup"
+            else:
+                why = pre_unusable(pstate, pb)
+                if why:
+                    hold_unusable_pre(nf, T_HOLD_CHECK, pre_p, why, "조립 이전")
+                    return 6
+                body = pb
+                if not released_equal(mb, tb, leg):
+                    keep = "migration"
+        else:
+            # CG1 — 조립(영수증 상태와 무관): 본문 = 구분선 뒤. 빠졌거나 손상된 영수증은 다시 쓰고 .pre-ceo 는 그대로 둔다.
+            body = tail
+            differs_check = True
+            if mh == H and plain_master(tail):      # 빈·겹친 본문은 아래 보류로 간다(영수증을 쓰지 않는다)
+                wrote = []
+                if not (rs == "valid" and rd["header_sha256"] == sha(H) and rd["separator"].encode("utf-8") == ms):
+                    write_receipt(rec_p, H, ms, tail, mb)
+                    wrote.append("영수증")
+                if pstate == "absent":
+                    write_atomic(pre_p, tail)   # A12·가드 4 불변식: 승격 중 .pre-ceo 는 실재한다(백업 = 지금 본문)
+                    wrote.append(".pre-ceo")
+                if wrote and best_effort(drop, leg_p):
+                    wrote.append("옛 영수증 정리")
+                # 현행 머리말 = 이 0.15.0 조립 자신의 결과다 — .pre-ceo 는 그때의 백업이고 CEO 동안 고친 본문과 다른 것이
+                #   정상이다(알림 없음 · 바이트 무이동 — CG1 "stale .pre-ceo changes nothing").
+                if wrote:
+                    print("[cys-dept] CEO 지침은 그대로(현행 머리말로 조립됨) — %s 기록" % "·".join(wrote))
+                    return 11
+                return 10
+            if not (rs == "valid" and rd["header_sha256"] == sha(mh)):
+                keep = "header"     # 영수증이 증명하지 못하는 머리말 = 사용자가 고쳤을 수 있다 — 다시 조립하기 전에 보관
+    else:
+        if v014_whole_copy(mb, leg):
+            # 구분선 없는 옛 CEO 사본(v0.14.0–15 의 틀) — 사용자 본부 지침은 백업에 있다.
+            if pstate == "absent":
+                err("CEO 조립 보류: 지침이 구분선 없는 옛 CEO 지침(0.14.x 통째 복사본)인데 사용자 본부 지침 백업(.pre-ceo)이 "
+                    "없다 — 어느 바이트가 사용자 지침인지 정할 수 없다(오너에게 보고)")
+                note(nf, T_HOLD_CHECK, "본부 지침이 구분선 없는 옛 CEO 지침이고 승격 전 본부 지침 백업(.pre-ceo)도 없어, "
+                                       "어느 부분이 사용자 본부 지침인지 정할 수 없습니다. 아무것도 바꾸지 않았습니다. "
+                                       "본부 지침을 확인한 뒤 오너 지시로 정리하십시오.")
+                return 6
+            why = pre_unusable(pstate, pb)
+            if why:
+                hold_unusable_pre(nf, T_HOLD_CHECK, pre_p, why, "조립 이전")
+                return 6
+            body = pb
+            if not released_equal(mb, tb, leg):
+                keep = "migration"
+        else:
+            body, new = mb, True        # 새 승격 — 지금 파일이 사용자 본부 지침이다
+    if not plain_master(body):
+        err("CEO 조립 보류: 사용자 본부 지침이 비었거나 이미 조립된 지침을 담고 있다(겹친 머리말 방지)")
+        note(nf, T_HOLD_CHECK, "CEO 지침의 본문이 될 본부 지침이 비어 있거나 조립 구분선을 또 담고 있어 조립하지 않았습니다"
+                               "(머리말이 겹치는 것을 막습니다). 아무것도 바꾸지 않았습니다. 본부 지침을 확인하십시오.")
+        return 6
+    cand = H + S + body
+    if cand == mb:
+        # 살아 있는 파일이 이미 그 조립 결과다 — 바이트를 옮기지 않고 영수증·백업만 맞춘다(rc 11 · 재주입 없음).
+        if pstate == "absent":
+            write_atomic(pre_p, body)
+        write_receipt(rec_p, H, S, body, cand)
+        best_effort(drop, leg_p)
+        print("[cys-dept] CEO 지침은 그대로(이미 그 조립 결과) — 영수증 기록")
+        return 11
+    kept = keep_copy(md + ".before-compose", mb) if keep else None
+    if pstate == "absent":
+        write_atomic(pre_p, body)       # 백업 = 이 조립에 쓴 사용자 본부 지침(조립된 바이트는 절대 넣지 않는다 — D-5)
+    write_atomic(md, cand, expect=lambda back: back == cand and split(back) == (H, S, body))
+    write_receipt(rec_p, H, S, body, cand)
+    # ── 여기부터는 교체가 끝났다: 정리·알림의 실패는 결과(rc)를 바꾸지 않는다(CG2) ──
+    best_effort(drop, leg_p)
+    differs = differs_check and pre_differs(pstate, pb, body, rs)
+    if kept:
+        print("[cys-dept] 조립 전 지침 사본 보관: %s" % kept)
+        if keep == "header":
+            # 알림 1건 — .pre-ceo 가 본문과 다르면 그 사실과 경로도 같은 알림에 싣는다(고친 0.14.x 머리말 + 0.14 영수증 없음
+            #   = 조립 + 이 알림 하나 · CG1). 영수증이 증명하지 못하는 머리말이면 언제나 이 갈래로 온다(keep == "header").
+            note(nf, copy_title("머리말", kept),
+                 "본부 CEO 지침의 머리말(구분선 앞)이 지금 생성되는 머리말과 달라(고쳤거나 출처를 영수증으로 증명할 수 없음), "
+                 "다시 조립하기 전에 지침 전체를 %s 에 보관했습니다. 본문(본부 지침 = 구분선 뒤)은 그대로입니다. 머리말은 제품이 "
+                 "생성하는 부분이라 고친 내용은 자동으로 반영되지 않습니다.%s"
+                 % (kept, pre_differs_text(pre_p) if differs else ""))
+        elif keep == "migration":
+            note(nf, copy_title("0.14.x 이전", kept),
+                 "0.14.x 방식(통째 복사)으로 승격돼 있던 본부 지침을 조립 방식으로 옮겼습니다. 새 CEO 지침의 본문은 승격 전 본부 "
+                 "지침(.pre-ceo)입니다. 옛 CEO 지침은 배포된 틀과 바이트가 달라(CEO 동안 고쳤거나 출처를 확인할 수 없음) 통째로 "
+                 "%s 에 보관했습니다 — 그 수정은 자동으로 합치지 않습니다. 필요하면 워커에게 규칙 문서 수리로 다시 반영하게 "
+                 "하십시오." % kept)
+        else:
+            note(nf, copy_title("0.14.x 이전", kept),
+                 "0.14.x 방식(통째 복사)으로 승격돼 있던 본부 지침을 조립 방식으로 옮겼습니다. 승격 전 본부 지침 백업(.pre-ceo)이 "
+                 "없어 옛 CEO 지침의 구분선 뒤 본문을 새 본문으로 썼습니다. 옛 CEO 지침 전체는 %s 에 보관했습니다 — 자동으로 "
+                 "합치지 않습니다. 필요하면 워커에게 규칙 문서 수리로 다시 반영하게 하십시오." % kept)
+    return 0 if new else 12
+
+
+def dispose_backup(pre_p, pstate, pb, cur):
+    """강등 뒤 .pre-ceo — 지금 지침과 같으면 지우고, 다르거나 읽을 수 없으면 시각을 붙여 옮겨 둔다(백업일 뿐 · 승격 중에만
+    .pre-ceo 가 있게)."""
+    if pstate == "absent":
+        return None
+    if pstate == "ok" and pb == cur:
+        drop(pre_p)
+        return "삭제(지금 지침과 같음)"
+    return "보관 %s" % set_aside(pre_p)
+
+
+def do_demote(a):
+    # a = tmpl md [notice-file] — rc: 0 강등 · 10 강등할 것 없음 · 6 보류(지침 무변경 + 알림) · 7 강등 불능(구분선·백업 없음)
+    #   · 2 판독 불능
+    tmpl, md = a[0], a[1]
+    nf = a[2] if len(a) > 2 else ""
+    d = os.path.dirname(md)
+    pre_p, rec_p, leg_p = md + ".pre-ceo", os.path.join(d, RECEIPT), os.path.join(d, LEGACY_RECEIPT)
+    if held_symlink(nf, md, pre_p, T_DEMOTE_HOLD):      # CB5
+        return 6
+    tb, mb = read(tmpl), read(md)
+    pstate, pb = pre_read(pre_p)
+    if mb is None:
+        err("CEO 강등: MASTER_DIRECTIVE.md 없음 — 강등할 지침이 없다")
+        return 2
+    rs, rd = receipt_load(rec_p)
+    leg = legacy_hash(leg_p)
+    mc = split(mb)
+    keep = None
+    if mc is not None:
+        mh, _ms, tail = mc
+        if not evidence(mh, rs, leg, pstate != "absent"):
+            # CB2 — 승격된 적 없는 파일에 구분선 줄이 있을 뿐이다: 잘라 내지 않는다.
+            err("CEO 강등 보류: 본부 지침에 조립 구분선 줄이 있지만 승격 기록이 없다 — 잘라 내지 않는다")
+            note(nf, T_DEMOTE_HOLD, "부서 0개 도달로 CEO 강등을 하려 했으나, 본부 지침(directives/MASTER_DIRECTIVE.md)에 CEO 조립 "
+                                    "구분선 줄('%s')만 있고 승격된 적이 있다는 기록이 없어 아무것도 바꾸지 않았습니다. 그 줄이 본부 "
+                                    "지침의 일부라면 그대로 두어도 됩니다." % SEP_LINE)
+            return 6
+        if is_v014(mh, rs, leg):
+            # CB3 / CG1 — 0.14.x 승격: 0.14.x 처럼 승격 전 본부 지침(.pre-ceo)으로 되돌린다.
+            if pstate == "absent":
+                new_md, via, keep = tail, "구분선 뒤 본문 — 0.14.x 승격인데 .pre-ceo 없음", "migration-nobackup"
+            else:
+                why = pre_unusable(pstate, pb)
+                if why:
+                    hold_unusable_pre(nf, T_DEMOTE_HOLD, pre_p, why, "강등")
+                    return 6
+                new_md, via = pb, "승격 전 본부 지침(.pre-ceo) — 0.14.x 승격"
+                if not released_equal(mb, tb, leg):
+                    keep = "migration"
+        else:
+            # CG1 — 조립: 강등 = 구분선 뒤 바이트(CEO 동안 고친 본문 포함). 영수증 상태와 무관.
+            new_md, via = tail, "구분선 뒤 본문"
+            tc = split(tb)
+            known = ((tc is not None and mh == tc[0])
+                     or (rs == "valid" and rd["header_sha256"] == sha(mh)))
+            if not known:
+                keep = "header"     # 사용자가 고친 머리말은 버리지 않는다
+        if not plain_master(new_md):
+            err("CEO 강등 보류: 되돌릴 본문이 비었거나 또 하나의 조립을 담고 있다 — 지침을 그대로 둔다(오너에게 보고)")
+            note(nf, T_DEMOTE_HOLD, "부서 0개 도달로 CEO 강등을 하려 했으나 되돌릴 본부 지침(구분선 뒤 본문 또는 .pre-ceo)이 "
+                                    "비어 있거나 조립 구분선을 또 담고 있어 아무것도 바꾸지 않았습니다. 본부 지침을 확인한 뒤 "
+                                    "오너 지시로 정리하십시오.")
+            return 6
+    elif v014_whole_copy(mb, leg):
+        if pstate == "absent":
+            return 7
+        why = pre_unusable(pstate, pb)
+        if why:
+            hold_unusable_pre(nf, T_DEMOTE_HOLD, pre_p, why, "강등")
+            return 6
+        new_md, via = pb, "백업(.pre-ceo) — 지침에 조립 구분선이 없다(0.14.x 승격)"
+        if not released_equal(mb, tb, leg):
+            keep = "migration"
+    else:
+        # 조립되지 않은 MASTER — 강등할 것이 없다. 남은 백업·영수증만 정리한다(승격 중에만 .pre-ceo 가 있게).
+        moved = best_effort(dispose_backup, pre_p, pstate, pb, mb)
+        best_effort(drop, rec_p)
+        best_effort(drop, leg_p)
+        if moved:
+            print("[cys-dept] 승격 백업 정리(지침은 이미 표준 MASTER): .pre-ceo %s" % moved)
+        return 10
+    kept = keep_copy(md + ".before-demote", mb) if keep else None
+    write_atomic(md, new_md, expect=lambda back: back == new_md)
+    # ── 교체 끝: 정리·알림 실패는 결과를 바꾸지 않는다(CG2) ──
+    moved = best_effort(dispose_backup, pre_p, pstate, pb, new_md)
+    best_effort(drop, rec_p)   # ★승격 영수증 삭제(G0 D3) — 강등=승격 사실 소멸. 강등 불능(rc 7)·보류(rc 6)에선 지우지 않는다.
+    best_effort(drop, leg_p)
+    print("[cys-dept] CEO 강등 원본: %s%s%s" % (via, " · CEO 지침 사본 %s" % kept if kept else "",
+                                             " · .pre-ceo %s" % moved if moved else ""))
+    if kept:
+        note(nf, copy_title("강등", kept),
+             "CEO 강등 때 본부 지침을 %s(으)로 되돌렸고, 강등 전 CEO 지침 전체를 %s 에 보관했습니다(배포된 틀과 다르거나 "
+             "머리말을 고친 지침 — 자동으로 합치지 않습니다). 필요하면 워커에게 규칙 문서 수리로 다시 반영하게 하십시오."
+             % (via, kept))
+    return 0
+
+
+def do_verify(a):
+    # a = tmpl md — promote-ceo 의 승격 확인(C11 11.10 · O-C11-1). stdout 한 줄 = 판정 사유.
+    tmpl, md = a[0], a[1]
+    tb, mb = read(tmpl), read(md)
+    tc, mc = split(tb), split(mb)
+    if tc is None:
+        print("CEO_TEMPLATE.md 에 조립 구분선이 없다")
+        return 1
+    if mc is None:
+        print("본부 지침이 조립되어 있지 않다(생성된 머리말 + 구분선 + 본부 지침이 아니다)")
+        return 1
+    rs, rd = receipt_load(os.path.join(os.path.dirname(md), RECEIPT))
+    if rs != "valid":
+        print("승격 영수증(%s)%s" % (RECEIPT, "이 없다" if rs == "absent" else "을 믿을 수 없다(%s)" % rd))
+        return 1
+    H = tc[0]
+    mh, ms, tail = mc
+    if mh != H:
+        print("머리말이 현행 CEO_TEMPLATE.md 의 머리말과 다르다")
+        return 1
+    if rd["header_sha256"] != sha(H):
+        print("영수증의 머리말 해시가 현행 머리말과 다르다")
+        return 1
+    if rd["separator"].encode("utf-8") != ms:
+        print("영수증의 구분선이 지침의 구분선과 다르다")
+        return 1
+    if not plain_master(tail):
+        print("구분선 뒤 본문이 비었거나 또 하나의 조립을 담고 있다")
+        return 1
+    if sha(H + ms + tail) == rd["composed_sha256"]:
+        print("조립된 지침·영수증 일치")
+    else:
+        print("머리말·영수증 일치 · 본문은 조립 뒤 사용자가 고친 본부 지침")
+    return 0
+
+
+def main(argv):
+    cmd, rest = (argv[1] if len(argv) > 1 else ""), argv[2:]
+    acts = {"superset": do_superset, "state": do_state, "compose": do_compose,
+            "demote": do_demote, "verify": do_verify, "promoted": do_promoted}
+    if cmd not in acts:
+        err("ceo_py: 알 수 없는 동작 %r" % cmd)
+        return 2
+    try:
+        return acts[cmd](rest)
+    except Exception as e:   # 어떤 예외도 부서 생명주기를 깨지 않는다 — 호출부가 rc 로 보류한다(쓰기는 원자 교체뿐)
+        err("CEO %s 실패(%s: %s) — 살아 있는 지침은 원자 교체로만 바뀌므로 반쪽 파일은 없다" % (cmd, type(e).__name__, e))
+        return 2
+
+
+sys.exit(main(sys.argv))
+PY
+}
+# ★DCE-3(T10·오너 결정 ⑨) 상위집합 런타임 검사 — 반쪽마스터 실사고(승격이 표준 디렉티브를 스텁으로 replace — 팩
+#   업데이트로 수리가 되돌려져 라이브 FAIL) 재발의 **런타임 층** 방어(빌드 층 gen_ceo_template --check 는 배포본 드리프트를
+#   못 막는다 — REPORT DCE-3). 실패(비포함·판독 불능·검사기 실행 실패)는 전부 보류(fail-closed — '측정 불능은 통과가 아니다').
+# ★0.15.0 T8(설계 §6-14 "상위집합 불변 조건의 다시 쓰기"): 조립에서는 사용자 본부 지침을 그대로 쓰므로 종전 판정
+#   (틀 ⊇ md·.new·.pre-ceo 중 하나 — MF-1·R3-CEO-2)은 사용자가 본부 지침을 고치기만 해도 거짓이 되어 승격을 영구 보류시켰다.
+#   이제 두 갈래다 — (i) 틀이 진짜 생성물인가: 구분선이 있고, 머리말이 CEO 표지 3핀을 담고, 구분선 뒤가 표준 MASTER
+#   **전문**이다(C03 의 MASTER 내용 핀 전수 — 정본은 같은 팩의 javis_preflight.CONTENT_PINS). 스텁·반쪽 틀은 거부.
+#   (ii) 조립 후보 ⊇ 사용자 본부 지침 전문: 후보 == 머리말 + 구분선 + 본부 지침(바이트 그대로) — 아니면 반쪽 조립(거부).
+#   조립(ceo_py compose)은 (ii)를 임시 파일을 다시 읽어 매번 확인한 뒤에만 교체한다. 개행은 CRLF 철자도 같은 구분선으로 본다(SF-2).
+#   ── 종전(통째 복사) 판정의 이력 — 사고 기록 보존(원문). 조립에서는 아래 형상이 더는 보류 사유가 아니다 ──
 #   ref 는 OR-포함(★MF-1 수정 라운드): ceo ⊇ md **또는** ceo ⊇ .pre-ceo 중 하나면 통과 —
 #   종전 단일 결박(.pre-ceo 존재=무조건 .pre-ceo 기준)은 교차버전 실사고 형상(팩 업데이트가
 #   md 를 새 표준 MASTER v2 로 갱신·.pre-ceo 엔 구 v1 잔존)에서 정상 v2 템플릿도 영구 보류시켜
 #   반쪽마스터 수복 경로를 자기봉쇄했다. 스텁은 둘 다 미포함 = 차단 강도 불변.
 #   비교는 개행(CRLF→LF) 정규화 후(★SF-2: Windows 체크아웃·에디터 변환 드리프트 false hold 방지).
-#   실패(비포함·판독 불능·검사기 실행 실패)는 전부 보류(fail-closed — '측정 불능은 통과가 아니다').
-ceo_template_superset_ok(){  # $1=CEO 템플릿 경로 $2=기준(표준 MASTER 전문) 경로 — 0=상위집합
-  python3 - "$1" "$2" <<'PY'
-import sys
-ceo_p, ref_p = sys.argv[1], sys.argv[2]
-try:
-    with open(ceo_p, "rb") as f: ceo = f.read()
-    with open(ref_p, "rb") as f: ref = f.read()
-except OSError as e:
-    sys.stderr.write("[cys-dept] superset 검사 판독 불능: %s\n" % e); sys.exit(2)
-if not ref:
-    sys.stderr.write("[cys-dept] superset 검사: 기준본이 비어 있음(%s)\n" % ref_p); sys.exit(2)
-# ★SF-2: 개행 정규화(CRLF→LF) 후 포함 판정 — 개행은 표현 계층이라 인코딩 드리프트만으로
-#   보류하지 않는다(문면 동일성 판정은 유지 — 실내용 결손·스텁은 여전히 비포함=1).
-sys.exit(0 if ref.replace(b"\r\n", b"\n") in ceo.replace(b"\r\n", b"\n") else 1)
-PY
+#   ★R3-CEO-2(2026-08-26 적대검증) — ref 집합에 **vendor 신본 `$md.new`** 를 추가한다.
+#   MF-1 이 상정한 구제 형상('팩 업데이트가 md 를 새 표준 v2 로 갱신')은 **실제 업데이트
+#   경로에서 발생할 수 없다**: `directives/*_DIRECTIVE.md` 는 pack.rs `ownership()` 상
+#   Ownership::User 라 디스크≠임베드이면 `Keep{new_pending}` 로 **영구 보존**되고(force
+#   여도) 신본은 `<rel>.new` 로만 병치된다(pack.rs decide_file_action). 그래서 이미 승격된
+#   기계의 업그레이드 후 형상은
+#     md=구 CEO 템플릿 사본(User·불가침) · .pre-ceo=승격 시점 구 표준 MASTER(백업·팩 대상
+#     아님) · ceo=신 CEO_TEMPLATE(**System 등급이라 강제 치유로 갱신됨**)
+#   이고 ceo⊇md·ceo⊇.pre-ceo 가 **둘 다 거짓**이다 — MASTER_DIRECTIVE 본문을 한 줄만
+#   고쳐도 전 기승격 함대가 rc 3 영구 보류 + `ceo-promote-pending-tick`(10분)의 무한
+#   재판정에 빠진다. `$md.new` 는 그 형상에서 유일하게 **현행 임베드 표준 MASTER 전문**을
+#   담고 있는 vendor 소유 파일이라 교차버전 형상의 정당한 ref 다.
+#   ★T8: 조립은 그 형상(머리말이 현행과 같은 조립 지침)을 '이미 승격됨'으로 보고 영수증만 기록한다 — 본문은 사용자 것.
+#   ★승격 영수증(G0 D3·스펙 D3(ii)): 종전 _swap 은 cp 후 적용 템플릿의 sha256 을 directives/.ceo-template-applied 에
+#   기록했다(위치를 ~/.cys/state가 아닌 pack 트리에 두는 근거=Tier1 백업 원자성 — .pre-ceo와 같은 축·복원 시 세대
+#   불일치 방지). 조립 영수증 .ceo-receipt.json 도 같은 근거로 같은 폴더에 둔다.
+ceo_template_superset_ok(){  # $1=CEO 템플릿 [$2=조립 후보 $3=사용자 본부 지침] — 0=상위집합(stdout=틀 sha256)·1=아님·2=판독 불능
+  ceo_py superset "$PACK_DEFAULT/bin" "$0" "$@"
 }
 # ★U10(0.14.41): 승격 성공 = '보류/대기' 알림의 사유 소멸 → 그 제목의 pending 항목을 **비허가 결정**으로 닫는다.
 #   종전엔 승격이 끝나도 닫는 코드가 없어(cys-dept·GUI feed reply 0건) '📥 승인 요청' 으로 영구 잔존했다(U10 반박 M2).
 #   결정 = ceo-promoted(allow 아님 → §3.2 자기승인 가드 무관 · 승인 게이트 약화 0). 제목 완전일치만(무관 항목 무접촉) ·
 #   상한 20건(유계) · 조회 실패(데몬 미기동) = 무동작(fail-open — 다음 lifecycle·재시작 TTL 이 받는다).
+#   ★0.15.0 T8: 조립 보류 제목들도 같은 규칙으로 닫는다('CEO 승격 보류(영수증 손상)' 은 개발판에만 있던 제목 — 남은 것이
+#   있으면 닫는다; RULINGS CG1 이후 손상된 영수증은 보류 사유가 아니다).
 CEO_NOTICE_CLOSE_DECISION="ceo-promoted"
 ceo_notices_close(){
   local ids id n=0
   ids="$(env -u CYS_SOCKET "$CYS" feed list --status pending 2>/dev/null \
-    | awk -F'\t' '$2=="[pending]" && ($4=="CEO 승격 보류(부트 필요)" || $4=="CEO 승격 대기" || $4=="CEO 승격 보류(템플릿 상위집합 검사 실패)"){print $1}')" \
+    | awk -F'\t' '$2=="[pending]" && ($4=="CEO 승격 보류(부트 필요)" || $4=="CEO 승격 대기" || $4=="CEO 승격 보류(템플릿 상위집합 검사 실패)" || $4=="CEO 승격 보류(영수증 손상)" || $4=="CEO 승격 보류(본부 지침에 조립 구분선 — 승격 기록 없음)" || $4=="CEO 승격 보류(본부 지침 확인 필요)"){print $1}')" \
     || return 0
   for id in $ids; do
     [ "$n" -lt 20 ] || break
@@ -1668,17 +2448,61 @@ ceo_notices_close(){
   [ "$n" -gt 0 ] && echo "[cys-dept] CEO 알림 ${n}건 종결(승격 완료 — decision=$CEO_NOTICE_CLOSE_DECISION)" >&2
   return 0
 }
+# ★0.15.0 T8(RULINGS CB2·CB3·CB5): ceo_py 가 남긴 알림(파일 한 줄 = NOTICE\t제목\t본문)을 제목 완전일치 dedupe 로
+#   1건만 올린다(A11 동형 · kind=ceo-notice · 조회 실패 = fail-open). 파일 경로는 인자로만 넘긴다(MSYS 경로 변환은 argv 뿐).
+ceo_notice_once(){  # $1=제목 $2=본문
+  if ! env -u CYS_SOCKET "$CYS" feed list --status pending 2>/dev/null \
+       | awk -F'\t' -v t="$1" '$4==t{found=1} END{exit !found}'; then
+    env -u CYS_SOCKET "$CYS" feed push --title "$1" --body "$2" --kind ceo-notice >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+# ★CG2: 강등이 끝나면 강등 보류·불능 알림을 비허가 결정으로 닫는다(ceo_notices_close 와 같은 규칙 · 상한 20 · fail-open).
+ceo_demote_notices_close(){
+  local ids id n=0
+  ids="$(env -u CYS_SOCKET "$CYS" feed list --status pending 2>/dev/null \
+    | awk -F'\t' '$2=="[pending]" && ($4=="CEO 강등 보류(본부 지침 확인 필요)" || $4=="CEO 강등 불능(구분선·백업 없음)"){print $1}')" \
+    || return 0
+  for id in $ids; do
+    [ "$n" -lt 20 ] || break
+    env -u CYS_SOCKET "$CYS" feed reply "$id" "ceo-demoted" >/dev/null 2>&1 || true
+    n=$((n+1))
+  done
+  [ "$n" -gt 0 ] && echo "[cys-dept] CEO 강등 알림 ${n}건 종결(강등 완료 — decision=ceo-demoted)" >&2
+  return 0
+}
+ceo_notices_from(){  # $1=알림 파일(없거나 비면 무동작) — 다 올린 뒤 지운다
+  local _k _t _b
+  [ -n "${1:-}" ] || return 0
+  if [ -s "$1" ]; then
+    while IFS=$'\t' read -r _k _t _b; do
+      [ "$_k" = "NOTICE" ] && [ -n "$_t" ] && ceo_notice_once "$_t" "$_b"
+    done < "$1"
+  fi
+  rm -f "$1" 2>/dev/null || true
+  return 0
+}
+# ★CG2: .pre-ceo 실재는 사전적 한 판정(끊긴 링크·폴더·읽을 수 없는 파일도 '있다') — ceo_py `pre_present` 와 같다.
+ceo_pre_present(){ [ -e "$1" ] || [ -L "$1" ]; }
 ceo_promote(){  # $1: "consented"면 오너 지명(promote-ceo) 경로 — 자동 승격 알림 생략
   local md="$PACK_DEFAULT/directives/MASTER_DIRECTIVE.md"
   local ceo="$PACK_DEFAULT/directives/CEO_TEMPLATE.md"
   [ -f "$ceo" ] || { echo "[cys-dept] CEO 템플릿 없음 — 승격 생략(cys init-pack 필요)"; return 0; }
-  # ★리뷰1 M1: '이미 승격됨'(md==ceo) 분기는 launch_dept 가 켤 때마다 통과하는 상시 경로다.
+  # ★리뷰1 M1: '이미 승격됨' 분기는 launch_dept 가 켤 때마다 통과하는 상시 경로다.
   #   승격 성공 시 닫기는 종전엔 :1301(전이 성공 분기)에서만 돌아, 0.14.40 이하에서 이미
   #   승격까지 끝난 기계에 쌓인 '보류/대기' 더미(구 kind=permission, 24h 만료 대상 아님)가
   #   업그레이드 후에도 닫히는 경로 0개로 영구 잔존했다(재현: probe_already_promoted.py).
   #   여기서도 부르면 켤 때마다(상시 경로) 돌아 20건 상한을 여러 번 넘겨 결국 전건 닫힌다.
-  cmp -s "$md" "$ceo" 2>/dev/null && { rm -f "$CEO_PENDING" 2>/dev/null || true; ceo_notices_close; return 0; }
-  if [ ! -f "$md.pre-ceo" ] && [ ! -f "$BOOT_MARKER" ]; then
+  # ★0.15.0 T8: '이미 승격됨' = 현행 머리말로 조립돼 있고 영수증·백업이 맞다(읽기만 · 락 밖). 종전 `cmp md ceo` 는
+  #   사용자가 본문을 한 줄만 고쳐도 거짓이 되어 켤 때마다 틀을 통째로 다시 덮었다(W4 CH-19) — 이제 본문은 보지 않는다.
+  local _st
+  _st="$(ceo_py state "$ceo" "$md" 2>/dev/null)" || _st="unreadable"
+  if [ "$_st" = "current" ]; then rm -f "$CEO_PENDING" 2>/dev/null || true; ceo_notices_close; return 0; fi
+  # 조립된 지침(머리말만 낡음·영수증/백업 보정·0.14.x 승격) = 이미 승격된 기계 — 부트 게이트는 새 승격에만
+  #   건다. ★CB2: 구분선 줄만 있고 승격 증거가 없는 파일(unproven)은 승격된 기계가 아니다 — 게이트를 건너뛰지 않는다.
+  local _composed=0
+  case "$_st" in current-fix|drift|legacy) _composed=1 ;; esac
+  if [ "$_composed" -eq 0 ] && ! ceo_pre_present "$md.pre-ceo" && [ ! -f "$BOOT_MARKER" ]; then
     # PENDING: 부서 생성 자체는 성공 유지(return 0). 침묵 금지 — feed(비대기·보조)+stderr 고지,
     # GUI 상시 배지는 ceo-pending 파일 존재로 렌더(WP-2/T6). 해소=부트 ⑦ one-shot 또는 차기 lifecycle.
     mkdir -p "$(dirname "$CEO_PENDING")"
@@ -1698,56 +2522,23 @@ ceo_promote(){  # $1: "consented"면 오너 지명(promote-ceo) 경로 — 자�
   #   간주해 자동 승격한다(GUI 승인 버튼이 §3.2 자기승인 차단·토큰 불일치로 침묵 실패해 승격이 걸리던 문제 해소).
   #   위 ③ 부트 마커 PENDING 게이트는 불변(미부트 머신 승격 금지). consented(오너 지명)는 원래 자동 아님 — 알림 생략 판별용.
   local _auto=0
-  if [ ! -f "$md.pre-ceo" ] && [ "${1:-}" != "consented" ]; then _auto=1; fi
+  if [ "$_composed" -eq 0 ] && ! ceo_pre_present "$md.pre-ceo" && [ "${1:-}" != "consented" ]; then _auto=1; fi
   # ★동시 승격 직렬화(2026-07-15 적대검증 D-5): 두 promote가 겹치면 두 번째가 "pre-ceo 없음"을
   # 읽은 뒤 첫 번째의 cp(ceo→md) 이후 실행돼 CEO 템플릿을 .pre-ceo로 복사→ceo_demote 원복 불능.
   # flock으로 백업+교체를 원자화(flock 미설치 환경은 그대로 진행 — 인간 페이스 더블클릭은 저위험).
-  # ★승격 영수증(G0 D3·스펙 D3(ii)): _swap이 cp 후 적용 템플릿의 sha256을 pack 트리 내
-  #   directives/.ceo-template-applied 에 기록(내용=hex 해시 1줄) — preflight C03이 '영수증 해시
-  #   등가 > 표지 3핀 폴백' 우선순위로 승격 표지를 결정론 판정한다. 위치를 ~/.cys/state가 아닌
-  #   pack 트리에 두는 근거=Tier1 백업 원자성(.pre-ceo와 같은 축·복원 시 세대 불일치 방지).
-  #   기록 실패는 승격 불차단(fail-open — 판정은 표지 핀 폴백). shasum=mac/win PortableGit 공통 가용.
+  # ★0.15.0 T8: 조립은 .pre-ceo 를 '조립되지 않은 MASTER 바이트'로만 쓰고(조립된 바이트는 절대 백업에 넣지 않는다),
+  #   지침·영수증은 원자 교체라 락이 없어도 섞인 파일이 생기지 않는다 — 락은 그대로 둔다(같은 입력이면 같은 바이트).
+  #   임계 구간을 복사만큼 짧게(설계 §6-14 윈도우): 무거운 상위집합 검사(i)는 락 **밖**에서 한 번 하고, 락 안에서는
+  #   틀의 해시가 검사 때와 같은지만 다시 본다(검사·조립 원자성 유지).
+  local _tsha="" _pre_rc=0 _nf=""
+  _nf="$(mktemp "${TMPDIR:-/tmp}/cys-ceo-notice.XXXXXX" 2>/dev/null)" || _nf=""
+  _tsha="$(ceo_template_superset_ok "$ceo")" || _pre_rc=3
   _swap(){
-    # ★DCE-3(T10) 1단계 — 스왑 '직전' 상위집합 런타임 검사(락 안 = 검사·스왑 원자). 실패 rc 3
-    #   = 스왑 미실행(md·.pre-ceo·영수증 전부 무접촉) — 보류 처리(PENDING 유지+loud)는 호출부.
-    # ★MF-1(P3 수정 라운드): OR-포함 판정 — ceo ⊇ md 또는 ceo ⊇ .pre-ceo 중 하나면 통과.
-    #   근거: 단일 ref 결박은 '팩 업데이트로 md=새 표준 v2·.pre-ceo=구 v1' 교차버전 형상에서
-    #   정상 템플릿을 영구 보류시킨다(반쪽마스터 실사고의 기계 수복 재차단 — 리뷰어1 MF-1).
-    #   스텁(반쪽마스터)은 md·.pre-ceo 어느 쪽도 포함하지 않아 차단 강도는 불변이다.
-    # ★R3-CEO-2(2026-08-26 적대검증) — ref 집합에 **vendor 신본 `$md.new`** 를 추가한다.
-    #   MF-1 이 상정한 구제 형상('팩 업데이트가 md 를 새 표준 v2 로 갱신')은 **실제 업데이트
-    #   경로에서 발생할 수 없다**: `directives/*_DIRECTIVE.md` 는 pack.rs `ownership()` 상
-    #   Ownership::User 라 디스크≠임베드이면 `Keep{new_pending}` 로 **영구 보존**되고(force
-    #   여도) 신본은 `<rel>.new` 로만 병치된다(pack.rs decide_file_action). 그래서 이미 승격된
-    #   기계의 업그레이드 후 형상은
-    #     md=구 CEO 템플릿 사본(User·불가침) · .pre-ceo=승격 시점 구 표준 MASTER(백업·팩 대상
-    #     아님) · ceo=신 CEO_TEMPLATE(**System 등급이라 강제 치유로 갱신됨**)
-    #   이고 ceo⊇md·ceo⊇.pre-ceo 가 **둘 다 거짓**이다 — MASTER_DIRECTIVE 본문을 한 줄만
-    #   고쳐도 전 기승격 함대가 rc 3 영구 보류 + `ceo-promote-pending-tick`(10분)의 무한
-    #   재판정에 빠진다. `$md.new` 는 그 형상에서 유일하게 **현행 임베드 표준 MASTER 전문**을
-    #   담고 있는 vendor 소유 파일이라 교차버전 형상의 정당한 ref 다.
-    #   ★차단 강도 불변: 스텁 템플릿은 md·.new·.pre-ceo 어느 전문도 포함하지 않는다(3-ref
-    #   전부 미포함 = 여전히 rc 3). `.pristine/directives/MASTER_DIRECTIVE.md` 는 ref 로 쓰지
-    #   않는다 — 동결된 user-owned 파일의 pristine 은 갱신되지 않아(pack.rs: "동결 파일 조상은
-    #   미갱신") 구 표준이 박혀 있어 구제력이 없다.
-    #   잔존 both/three-fail 형상(md=구 CEO 문면 + 낡은 .pre-ceo + .new 부재)은 fail-closed
-    #   보류가 옳다 — 해소 절차는 호출부 보류 메시지에 명시(stale .pre-ceo 갱신/제거).
-    local _sup_ok=1
-    ceo_template_superset_ok "$ceo" "$md" && _sup_ok=0
-    if [ "$_sup_ok" -ne 0 ] && [ -f "$md.new" ]; then
-      ceo_template_superset_ok "$ceo" "$md.new" && _sup_ok=0
-    fi
-    if [ "$_sup_ok" -ne 0 ] && [ -f "$md.pre-ceo" ]; then
-      ceo_template_superset_ok "$ceo" "$md.pre-ceo" && _sup_ok=0
-    fi
-    [ "$_sup_ok" -eq 0 ] || return 3
-    [ -f "$md.pre-ceo" ] || cp "$md" "$md.pre-ceo"; cp "$ceo" "$md"
-    local h
-    if h="$(shasum -a 256 "$md" 2>/dev/null)" && [ -n "$h" ]; then
-      printf '%s\n' "${h%% *}" > "$PACK_DEFAULT/directives/.ceo-template-applied"
-    else
-      echo "[cys-dept] WARN: 승격 영수증 기록 실패(.ceo-template-applied) — C03은 표지 핀 폴백으로 판정" >&2
-    fi
+    # ★T8 rc: 0 새 승격 · 12 머리말 재조립(본문 유지) · 10 이미 현행 · 11 영수증/백업만 기록 — 여기까지 성공.
+    #   2 판독 불능 · 3 상위집합(틀) 실패 · 6 보류(승격 기록 없는 구분선·링크·쓸 수 없는 백업 등) — md·.pre-ceo·영수증 무변경.
+    #   ★RULINGS CG1: 빠졌거나 손상된 영수증은 보류 사유가 아니다 — 조립이 지금 지침 그대로 다시 쓴다(종전 rc 4 없음).
+    [ "$_pre_rc" -eq 0 ] || return "$_pre_rc"   # 락 밖 상위집합(i) 실패 = 조립 자체를 하지 않는다
+    ceo_py compose "$ceo" "$md" "$_tsha" "$_nf"
   }
   local _swap_rc=0
   if command -v flock >/dev/null 2>&1; then
@@ -1764,12 +2555,17 @@ ceo_promote(){  # $1: "consented"면 오너 지명(promote-ceo) 경로 — 자�
       _swap || _swap_rc=$?
     fi
   fi
+  # ★T8: 조립 rc 10·11·12 도 성공이다(지침 무변경·영수증/백업 기록·머리말 재조립) — 보류 판정은 그 밖의 rc 만 본다.
+  #   조립 rc 자체는 아래 성공 문구·재주입·자동 알림 판정이 쓴다.
+  local _comp_rc="$_swap_rc"
+  case "$_comp_rc" in 10|11|12) _swap_rc=0 ;; esac
+  ceo_notices_from "$_nf"   # ★CB2·CB3·CB5: 보류 이유·보관 사본을 알림 1건으로(제목 dedupe)
   if [ "$_swap_rc" -ne 0 ]; then
-    # ★DCE-3(T10): 스왑 미완 = **승격 보류** — PENDING 유지(부재면 기록 — GUI 상시 배지가 보류를
+    # ★DCE-3(T10): 조립 미완 = **승격 보류** — PENDING 유지(부재면 기록 — GUI 상시 배지가 보류를
     #   렌더)+loud stderr. return 0 = lifecycle 불파괴(부트 마커 PENDING 게이트와 같은 비치명
-    #   계약 — 지명 경로의 truthful 실패는 promote-ceo post-verify(D-2)가 md 미교체를 보고
-    #   exit 5 로 담당). rc 3 = 상위집합 검사 실패(스왑 자체가 미실행 — md·.pre-ceo·영수증
-    #   무접촉), 그 외 = 스왑 중 오류(종전엔 set -e 로 스크립트 전체 즉사하던 경로의 가청 강등).
+    #   계약 — 지명 경로의 truthful 실패는 promote-ceo post-verify(D-2)가 조립·영수증 미확인을 보고
+    #   exit 5 로 담당). rc 3 = 상위집합 검사 실패(조립 자체가 미실행 — md·.pre-ceo·영수증
+    #   무접촉), rc 6 = 보류(이유는 stderr + 알림 1건), 그 외 = 판독·쓰기 오류(종전엔 set -e 로 스크립트 전체 즉사하던 경로의 가청 강등).
     mkdir -p "$(dirname "$CEO_PENDING")"
     # ★SF-1(P3 수정 라운드): 계약 문면은 'PENDING **유지**'다 — 보류 시 신규 생성은 자동/대기형
     #   경로 한정. 오너 지명(consented·promote-ceo 1회성) 경로의 보류까지 PENDING 을 생성하면
@@ -1780,56 +2576,79 @@ ceo_promote(){  # $1: "consented"면 오너 지명(promote-ceo) 경로 — 자�
         "$(date +%Y-%m-%dT%H:%M:%S 2>/dev/null || echo unknown)" > "$CEO_PENDING"
     fi
     if [ "$_swap_rc" -eq 3 ]; then
-      echo "[cys-dept] ★CEO 승격 보류(DCE-3 상위집합 검사 실패) — CEO_TEMPLATE 이 표준 MASTER_DIRECTIVE 전문(md·.new·.pre-ceo 어느 쪽도)을 verbatim 포함하지 않는다(스텁/드리프트 의심 — 반쪽마스터 재발 차단). 해소: ①스텁이면 scripts/gen_ceo_template.py 재합성 또는 팩 갱신 ②md 가 이미 CEO 문면인데 .pre-ceo 가 낡았으면 .pre-ceo 를 현행 표준 MASTER 전문으로 갱신(또는 제거) 후 재시도 ③팩 업데이트 직후의 교차버전 형상(md=구 CEO 사본·.pre-ceo=구 표준)이면 vendor 신본 MASTER_DIRECTIVE.md.new 가 있어야 자동 통과한다 — .new 가 없으면 \`cys init-pack\` 으로 병치본을 재생성하라. PENDING 유지." >&2
+      echo "[cys-dept] ★CEO 승격 보류(DCE-3 상위집합 검사 실패) — CEO_TEMPLATE 이 '생성된 머리말(CEO 표지 3핀) + 조립 구분선 + 표준 MASTER 전문'이 아니다(스텁/반쪽 틀 의심 — 반쪽마스터 재발 차단 · 위 stderr 에 이유). 조립은 사용자 본부 지침을 그대로 쓰므로 본부 지침을 고친 것은 보류 사유가 아니다. 해소: 팩 갱신(cys init-pack) 또는 scripts/gen_ceo_template.py 재합성으로 틀을 되살린 뒤 재시도. 지침·.pre-ceo·영수증은 그대로다. PENDING 유지." >&2
       # 비대기 feed — 제목 완전일치 dedupe(A11 동형): 주기 집행 틱이 10분마다 재밀어도 적체 0.
       if ! env -u CYS_SOCKET "$CYS" feed list --status pending 2>/dev/null \
            | awk -F'\t' '$4=="CEO 승격 보류(템플릿 상위집합 검사 실패)"{found=1} END{exit !found}'; then
         env -u CYS_SOCKET "$CYS" feed push --title "CEO 승격 보류(템플릿 상위집합 검사 실패)" \
-          --body "CEO_TEMPLATE.md 가 표준 MASTER_DIRECTIVE.md 전문(현행 md·vendor 신본 .new·백업 .pre-ceo 어느 쪽도)을 포함하지 않아 승격을 보류했습니다(스텁 교체 = 반쪽마스터 재발 경로 차단). 해소: ①스텁이면 팩 갱신 또는 gen_ceo_template.py 재합성 ②.pre-ceo 만 낡은 형상이면 .pre-ceo 를 현행 표준 전문으로 갱신 후 재시도 ③팩 업데이트 직후의 교차버전 형상(이미 CEO 로 승격된 기계는 MASTER_DIRECTIVE.md 가 user 소유라 갱신되지 않고 신본이 .new 로만 병치됩니다)이면 그 .new 실재를 확인하십시오 — 없으면 cys init-pack 으로 재생성. 승격 대기(PENDING)는 유지됩니다." --kind ceo-notice >/dev/null 2>&1 || true
+          --body "CEO_TEMPLATE.md 가 '생성된 머리말 + 조립 구분선 + 표준 MASTER 전문'이 아니어서(스텁·반쪽 틀) 승격을 보류했습니다 — 반쪽마스터 재발 경로 차단. 승격은 이 틀의 머리말에 사용자 본부 지침을 그대로 붙이는 조립이라, 본부 지침을 고친 것은 보류 사유가 아닙니다. 해소: 팩 갱신(cys init-pack) 또는 gen_ceo_template.py 재합성으로 틀을 되살린 뒤 재시도. 본부 지침은 바뀌지 않았고 승격 대기(PENDING)는 유지됩니다." --kind ceo-notice >/dev/null 2>&1 || true
       fi
     else
-      echo "[cys-dept] WARN: CEO 승격 스왑 미완(rc=$_swap_rc) — 승격 보류·PENDING 유지. 디스크/권한 점검 후 재시도." >&2
+      echo "[cys-dept] WARN: CEO 조립 미완(rc=$_swap_rc) — 승격 보류·PENDING 유지. 위 stderr 의 이유(판독·쓰기 오류, 승격 기록 없는 구분선 줄, 심볼릭 링크, 사용자 본부 지침 불명 — rc 6 은 알림 1건도 남긴다)를 점검한 뒤 재시도. 지침은 원자 교체로만 바뀌므로 반쪽 파일은 없다." >&2
     fi
     return 0
   fi
   rm -f "$CEO_PENDING" 2>/dev/null || true   # 승격 완료 = PENDING 해소
   ceo_notices_close   # ★U10: 사유가 소멸한 '보류/대기' 알림을 닫는다(비허가 결정 · fail-open)
-  echo "[cys-dept] 기본 데몬 CEO 승격(directives 교체·백업 .pre-ceo)"
-  ceo_reinject_master "CEO 승격"   # ★fatal-fix R4-N2·F2: 대화 승인 경로면 함수 안에서 보류(큐 배달 포인터)
-  if [ "$_auto" -eq 1 ]; then
+  case "$_comp_rc" in
+    0)  echo "[cys-dept] 기본 데몬 CEO 승격(조립: 생성된 머리말 + 본부 지침 · 백업 .pre-ceo · 영수증 $CEO_RECEIPT_NAME)"
+        ceo_reinject_master "CEO 승격" ;;   # ★fatal-fix R4-N2·F2: 대화 승인 경로면 함수 안에서 보류(큐 배달 포인터)
+    12) echo "[cys-dept] CEO 지침 다시 조립(현행 머리말 + 본부 지침 — 조립된 지침이면 본문 그대로, 0.14.x 승격본이면 본문 = 승격 전 본부 지침(.pre-ceo) · 보관 사본은 위 줄·알림 · 영수증 $CEO_RECEIPT_NAME)"
+        ceo_reinject_master "CEO 지침 재조립" ;;
+    *)  : ;;   # 10·11: 지침 바이트 무변경 — 재주입 없음
+  esac
+  if [ "$_auto" -eq 1 ] && [ "$_comp_rc" -eq 0 ]; then
     # ★자동 승격 직후 비대기 알림(제품 기본 정책). 승격 차단 금지(fail-open).
     #   ★리뷰어1 F4: 종전 `|| true`는 push 실패(데몬 미기동 등)를 삼켜 오너가 정체성 변경을 통지받지 못했다 →
     #   실패 시 stderr 1줄 가시화(exit code 무오염 — || 리스트 마지막이 echo라 set -e 안전).
-    #   가역 사실 근거: ceo_demote는 부서 0개(reg_count=0) 시 down/down-sock에서 자동 호출되어 .pre-ceo
-    #   백업을 복원한다(수동 강등 명령은 없음 — 환각 금지).
+    #   가역 사실 근거: ceo_demote는 부서 0개(reg_count=0) 시 down/down-sock에서 자동 호출되어 구분선 뒤
+    #   본문(사용자 본부 지침)으로 되돌린다(수동 강등 명령은 없음 — 환각 금지).
     env -u CYS_SOCKET "$CYS" feed push --title "CEO 승격 완료(자동)" \
-      --body "부서 생성 감지 — 제품 기본 정책에 따라 기본 데몬 master를 CEO로 자동 승격했습니다. 가역: 부서를 모두 정리해 0개가 되면 자동으로 표준 master로 강등(원복)됩니다(.pre-ceo 백업 복원)." --kind ceo-notice >/dev/null 2>&1 \
+      --body "부서 생성 감지 — 제품 기본 정책에 따라 기본 데몬 master를 CEO로 자동 승격했습니다. CEO 지침은 생성된 머리말에 본부 지침을 그대로 붙인 조립이라 본부 지침에 고친 내용이 남습니다. 가역: 부서를 모두 정리해 0개가 되면 구분선 뒤 본문(본부 지침 — CEO 동안 고친 것 포함)으로 자동 강등(원복)됩니다." --kind ceo-notice >/dev/null 2>&1 \
       || echo "[cys-dept] 승격 완료 알림 push 실패(데몬 미기동?) — 승격 자체는 완료됨" >&2
   fi
 }
 ceo_demote(){
   local md="$PACK_DEFAULT/directives/MASTER_DIRECTIVE.md"
   local ceo="$PACK_DEFAULT/directives/CEO_TEMPLATE.md"
-  local receipt="$PACK_DEFAULT/directives/.ceo-template-applied"
   rm -f "$CEO_PENDING" 2>/dev/null || true   # 부서 0 = 승격 사유 소멸 — PENDING 청소(승격 이력 무관)
-  if [ ! -f "$md.pre-ceo" ]; then
-    # ★무음 no-op 승격(스펙 A6/E2): 승격 표지(md==CEO 템플릿 또는 영수증 실재)가 있는데 복원 백업이
-    #   없으면 '강등 불능(비가역 상태)'다 — 종전 무음 return 0은 이 상태를 영구 잠복시켰다. stderr
-    #   경보+feed push(비대기)로 가시화하되 return 0 유지(teardown 체인 불파괴 — 부트 비치명 계약).
-    #   미승격 머신(표지 없음)의 .pre-ceo 부재는 정상 no-op — 경보 없음(위경보 소음 금지).
-    #   영수증은 여기서 삭제하지 않는다(비가역 상태의 판정 증거 보존 — C03 소관).
-    if cmp -s "$md" "$ceo" 2>/dev/null || [ -f "$receipt" ]; then
-      echo "[cys-dept] WARN: CEO 강등 불능 — 복원 백업(.pre-ceo) 부재(비가역 상태). preflight C03 안내(.pristine 재건/pack-merge)로 MASTER_DIRECTIVE.md 복원 필요" >&2
-      env -u CYS_SOCKET "$CYS" feed push --title "CEO 강등 불능(.pre-ceo 부재)" \
-        --body "부서 0개 도달로 CEO 강등을 시도했으나 복원 백업(MASTER_DIRECTIVE.md.pre-ceo)이 없어 표준 master로 원복하지 못했습니다. preflight C03 안내에 따라 .pristine 재건 또는 pack-merge로 MASTER_DIRECTIVE.md를 복원하십시오." --kind ceo-notice >/dev/null 2>&1 \
-        || echo "[cys-dept] WARN: 강등 불능 알림 push 실패(데몬 미기동?) — 위 stderr 경보가 유일 흔적" >&2
-    fi
-    return 0
+  # ★0.15.0 T8(C11 11.8 · 설계 §4-14): 강등 = 구분선 뒤의 바이트(CEO 동안 고친 본문도 남는다). .pre-ceo 는 백업일 뿐
+  #   원본이 아니다 — 쓰이는 것은 구분선이 없는 옛 CEO 사본(먼저 시각 붙여 보관)과 0.14.x 통째 복사본이 그대로인 경우뿐.
+  #   강등 뒤 .pre-ceo 는 지금 지침과 같으면 지우고 다르면 시각을 붙여 옮긴다(승격 중에만 .pre-ceo 가 있게 — A12·가드 4).
+  #   승격과 같은 락(D-5) 안에서 한다 — 강등과 승격이 겹쳐도 섞인 파일이 생기지 않는다.
+  local _nf=""
+  _nf="$(mktemp "${TMPDIR:-/tmp}/cys-ceo-notice.XXXXXX" 2>/dev/null)" || _nf=""
+  _demote_swap(){ ceo_py demote "$ceo" "$md" "$_nf"; }
+  local _rc=0
+  if command -v flock >/dev/null 2>&1; then
+    ( flock 9; _demote_swap ) 9>"$md.promote.lock" || _rc=$?
+  elif mkdir "$md.promote.lock.d" 2>/dev/null; then
+    _demote_swap || _rc=$?
+    rmdir "$md.promote.lock.d" 2>/dev/null || true
+  else
+    echo "[cys-dept] WARN: 승격 락($md.promote.lock.d) 획득 실패 — 동시 승격·강등 의심, 무락 진행(잔존 락은 rmdir로 정리)" >&2
+    _demote_swap || _rc=$?
   fi
-  cp "$md.pre-ceo" "$md"; rm -f "$md.pre-ceo"
-  rm -f "$receipt" 2>/dev/null || true   # ★승격 영수증 삭제(G0 D3) — 강등=승격 사실 소멸(stale 영수증 방지)
-  echo "[cys-dept] CEO 강등(표준 master 원복)"
-  ceo_reinject_master "표준 master 복귀"
+  ceo_notices_from "$_nf"   # ★CB5: 강등 보류(rc 6)·보관 사본도 알림 1건(제목 dedupe) — stderr 만으로 끝내지 않는다
+  case "$_rc" in
+    0)
+      echo "[cys-dept] CEO 강등(표준 master 원복 — 위 줄의 원본)"
+      ceo_demote_notices_close   # ★CG2: 강등이 끝나면 '강등 보류/불능' 알림의 사유가 사라진다
+      ceo_reinject_master "표준 master 복귀" ;;
+    10) : ;;   # 미승격 머신 — 정상 no-op(경보 없음 · 위경보 소음 금지)
+    7)
+      # ★무음 no-op 승격(스펙 A6/E2)의 조립판: CEO 문면(표지 3핀)인데 조립 구분선도 복원 백업도 없으면 '강등 불능'이다.
+      #   stderr 경보+feed push(비대기)로 가시화하되 return 0 유지(teardown 체인 불파괴 — 부트 비치명 계약).
+      #   영수증은 지우지 않는다(비가역 상태의 판정 증거 보존 — C03 소관).
+      #   ★CG2: C03 은 이 파일을 승격이 아닌 MASTER 로 본다(구분선·.pre-ceo 없음 — CB1) — 소실 조항과 '★복원 절차'가 그 안내다.
+      echo "[cys-dept] WARN: CEO 강등 불능 — 지침이 구분선 없는 옛 CEO 지침이고 복원 백업(.pre-ceo)도 없다(비가역 상태). 지침은 그대로다. preflight C03 의 MASTER 핀 행이 소실 조항과 '★복원 절차'(먼저 사본을 남기고 오너 지시로 복구)를 보인다" >&2
+      env -u CYS_SOCKET "$CYS" feed push --title "CEO 강등 불능(구분선·백업 없음)" \
+        --body "부서 0개 도달로 CEO 강등을 시도했으나 본부 지침이 구분선 없는 옛 CEO 지침이고 승격 전 본부 지침 백업(MASTER_DIRECTIVE.md.pre-ceo)도 없어 표준 master로 원복하지 못했습니다. 지침은 바뀌지 않았습니다. preflight C03 의 MASTER 핀 행이 빠진 조항과 '★복원 절차'(먼저 사본을 남기고 오너에게 보고해 지시에 따라 복구)를 보입니다 — 그 절차를 따르십시오." --kind ceo-notice >/dev/null 2>&1 \
+        || echo "[cys-dept] WARN: 강등 불능 알림 push 실패(데몬 미기동?) — 위 stderr 경보가 유일 흔적" >&2 ;;
+    *)
+      echo "[cys-dept] WARN: CEO 강등 보류(rc=$_rc) — 위 stderr 의 이유를 점검하라(rc 6 은 알림 'CEO 강등 보류(본부 지침 확인 필요)' 1건도 남긴다). 지침은 그대로다(부서 흐름 불파괴)" >&2 ;;
+  esac
+  return 0
 }
 
 # ── ★결함#1: 부서 생성 = CEO 티켓 자동 발급 (오너 절대규칙) ────────────────────────
@@ -3186,13 +4005,17 @@ EOF
     ceo_promote consented
     # ★진짜 승격 검증(2026-07-15 적대검증 D-2): consented(오너 지명)든 자동 승격이든 boot-marker
     # PENDING 게이트(부트 미완)는 못 뚫어 ceo_promote가 미승격인데 return 0 할 수 있다. GUI가 그 exit 0을
-    # "✅ 승격 완료"로 오보하지 않게, 실제 승격 여부(md==CEO 템플릿 또는 .pre-ceo 백업 존재)를 post-verify해
-    # 미승격이면 exit 5로 truthful 실패를 반환한다(approve_ceo_promotion→Err→GUI 실패 표시).
+    # "✅ 승격 완료"로 오보하지 않게, 실제 승격 여부를 post-verify해 미승격이면 exit 5로 truthful 실패를
+    # 반환한다(approve_ceo_promotion→Err→GUI 실패 표시).
+    # ★0.15.0 T8(C11 11.10 · 설계 §4-14·§6-14 · O-C11-1): 확인 대상 = **조립된 지침과 영수증** — 지침이 현행 머리말 +
+    #   조립 구분선 + 본부 지침이고, 영수증(.ceo-receipt.json)이 유효하며 그 머리말 해시·구분선이 지침과 맞아야 승격이다
+    #   (본문 해시가 영수증과 다르면 조립 뒤 사용자가 고친 본부 지침으로 본다). '백업(.pre-ceo)이 있다'는 것만으로는
+    #   더 이상 성공이 아니다(종전 `cmp md ceo || [ -f .pre-ceo ]`).
     _md="$PACK_DEFAULT/directives/MASTER_DIRECTIVE.md"; _ceo="$PACK_DEFAULT/directives/CEO_TEMPLATE.md"
-    if cmp -s "$_md" "$_ceo" 2>/dev/null || [ -f "$_md.pre-ceo" ]; then
-      :   # 승격 확정(directive=CEO 또는 백업 존재)
+    if _pv="$(ceo_py verify "$_ceo" "$_md" 2>&1)"; then
+      echo "[cys-dept] CEO 승격 확인 — ${_pv}"   # 승격 확정(조립된 지침 + 유효한 영수증 — 근거 1줄)
     else
-      echo "[cys-dept] CEO 승격 미완(보류) — base master 미부트(.master-bootstrapped 부재) 또는 템플릿 상위집합 검사 실패(DCE-3 — 위 stderr 확인) 등. 원인 해소 후 재시도." >&2
+      echo "[cys-dept] CEO 승격 미완(보류) — ${_pv:-승격 확인 실패}. base master 미부트(.master-bootstrapped 부재)·템플릿 상위집합 검사 실패(DCE-3)·조립 보류(위 stderr·알림 확인) 등 원인 해소 후 재시도." >&2
       exit 5
     fi
     ;;

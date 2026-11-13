@@ -2733,11 +2733,36 @@ pub struct UpdateFacts {
 /// 본부 지침 상대경로 — 바 가드 4 의 대상(`cys.rs` `MASTER_DIRECTIVE_REL` 과 같은 값).
 pub const MASTER_DIRECTIVE_REL: &str = "directives/MASTER_DIRECTIVE.md";
 
-/// 바 가드 4 의 조건 — `cys.rs:ceo_vendor_overwrite_rejection`(A12) 과 **같은 조건**:
-/// `<pack>/directives/MASTER_DIRECTIVE.md.pre-ceo` 가 있으면 CEO 승격 중이다(설계 §6-11 바 "가드
-/// 2개를 `src/pack.rs` 쪽에 재현"). ★T8 이 승격 상태 판정을 바꾸면 이 자리도 함께 바뀐다(7번째 자리).
+/// 바 가드 4 의 조건 — `cys.rs:ceo_vendor_overwrite_rejection`(A12) 과 **같은 함수**(설계 §6-11 바 "가드 2개를
+/// `src/pack.rs` 쪽에 재현"). ★T8(RULINGS CB1·CG2 · CCR-2 승인): '승격'의 한 뜻 —
+/// `<pack>/directives/MASTER_DIRECTIVE.md.pre-ceo` 가 **사전적으로** 있다(끊긴 링크·읽을 수 없는 파일·폴더도 '있다' —
+/// [`ceo_pre_ceo_present_in`]) **또는** 살아 있는 본부 지침에 생성기의 조립 구분선([`CEO_SEPARATOR`], LF·CRLF)이 있다.
+/// 0.15.0 의 CEO 지침은 조립(생성된 머리말 + 구분선 + 사용자 본부 지침)이라 백업이 지워져도 내용이 승격을 말한다 —
+/// 그 지침을 vendor 본으로 덮으면 CEO 머리말과 본문 수정이 함께 사라진다. 같은 술어: javis_preflight
+/// `Preflight._c03_ceo_promoted`(파이썬 정본) · javis_org · cys-dept `ceo_py promoted` · 앱 `ceo_promoted` —
+/// `cysjavis-pack/bin/tests/fixtures/ceo-promoted-cases.json` 한 벌이 여섯 판독자를 같은 답으로 묶는다
+/// (시험 `ceo_promoted_in_matches_the_shared_fixture`).
 pub fn ceo_promoted_in(dir: &Path) -> bool {
-    dir.join(format!("{MASTER_DIRECTIVE_REL}.pre-ceo")).exists()
+    ceo_pre_ceo_present_in(dir)
+        || std::fs::read(dir.join(MASTER_DIRECTIVE_REL))
+            .map(|b| has_ceo_separator(&b))
+            .unwrap_or(false)
+}
+
+/// `.pre-ceo` 의 실재 — 사전적(`symlink_metadata`: 항목이 있으면 '있다'). `exists()` 는 링크를 따라가 끊긴 링크를
+/// '없다'고 본다(RULINGS CG2 — 지키는 방향의 한 판정).
+pub fn ceo_pre_ceo_present_in(dir: &Path) -> bool {
+    std::fs::symlink_metadata(dir.join(format!("{MASTER_DIRECTIVE_REL}.pre-ceo"))).is_ok()
+}
+
+/// 조립 구분선 — `scripts/gen_ceo_template.py` 의 `SEPARATOR` 와 같은 바이트(`test_ceo_composition.py` 가 고정한다).
+pub const CEO_SEPARATOR: &str = "\n---\n\n# [본문 — 표준 MASTER 운영 계약 전문]\n\n";
+
+/// 지침에 조립 구분선이 있는가 — LF 철자 또는 같은 바이트의 CRLF 철자.
+fn has_ceo_separator(b: &[u8]) -> bool {
+    let crlf = CEO_SEPARATOR.replace('\n', "\r\n");
+    let has = |needle: &[u8]| b.windows(needle.len()).any(|w| w == needle);
+    has(CEO_SEPARATOR.as_bytes()) || has(crlf.as_bytes())
 }
 
 /// 바 가드 2 — `.merge-audit.jsonl` 에서 사용자가 일부러 옛 버전을 유지한 기록이 있는 파일 집합.
@@ -14244,6 +14269,149 @@ mod m11_tests {
             let reason = rig.entry("bin/mine.py").unwrap()["reason"].as_str().unwrap().to_string();
             assert_eq!(reason, if corrupt { "manifest-corrupt" } else { "no-base" });
         }
+    }
+
+    /// ★T8(CCR-2 · RULINGS CB1·CG2·CG3): 가드 4 는 '승격'의 한 뜻을 쓴다 — 조립된 본부 지침(생성된 머리말 + 조립
+    /// 구분선 + 사용자 본부 지침)은 `.pre-ceo` 가 지워졌어도 자동 vendor 갱신이 덮지 않는다(LF·CRLF 두 철자).
+    /// ① 가드 4 가 정하는 경로: 설치 기록이 이 바이트를 '한 번도 고치지 않은 것'으로 적었다고 둔다 — 제품의 어떤 명령도
+    ///    조립 지침의 해시를 설치 기록에 적지 않지만(CG3), 그래야 가드 1–3 이 모두 통과하고 가드 4 하나만 남는다(사실로 확인).
+    /// ② 실제 기록(조립 전 vendor 본의 해시): 조립 지침은 '고친 파일'이라 보존 + `.new`.
+    /// ③ 대조: 구분선 없는 평범한 MASTER 는 같은 기록·같은 vendor 본에서 갱신된다(가드 4 가 아무것이나 막지 않는다).
+    #[test]
+    fn t8_composed_master_without_backup_is_not_replaced_by_an_update() {
+        let header = "# CEO 머리말 (master of master · 단일소유 강제 · exit 7)\n";
+        let body = "# M\nautopilot denylist\n";
+        let vendor_new = "# M\nautopilot denylist v2\n";
+        let none = serde_json::Map::new();
+        for (tag, sep) in [
+            ("lf", CEO_SEPARATOR.to_string()),
+            ("crlf", CEO_SEPARATOR.replace('\n', "\r\n")),
+        ] {
+            let composed = format!("{header}{sep}{body}");
+            let src = UpdateSources::none();
+            // ①
+            let rig = Rig::new(&format!("t8-g4-{tag}"));
+            rig.write(MASTER_DIRECTIVE_REL, composed.as_bytes());
+            rig.manifest(&[(MASTER_DIRECTIVE_REL, composed.as_str())]);
+            assert!(
+                !ceo_pre_ceo_present_in(&rig.pack),
+                "이 시험은 백업이 없는 조립 지침을 잰다"
+            );
+            let ctx = UpdateContext::new(&rig.pack, PackScope::Base, &src, false);
+            let f = ctx.facts(
+                MASTER_DIRECTIVE_REL,
+                vendor_new,
+                true,
+                Some(composed.as_str()),
+                Some(content_hash(&composed).as_str()),
+                &none,
+            );
+            assert!(
+                f.ceo_promoted,
+                "{tag}: 조립 지침이 승격으로 잡히지 않았다(가드 4 가 .pre-ceo 만 본다)"
+            );
+            assert!(
+                f.takeover_ok,
+                "{tag}: 가드 3 이 따로 막으면 이 시험은 가드 4 를 재지 못한다"
+            );
+            rig.install(&[(MASTER_DIRECTIVE_REL, vendor_new)], false, &src);
+            assert_eq!(
+                rig.read(MASTER_DIRECTIVE_REL).as_deref(),
+                Some(composed.as_str()),
+                "{tag}: 자동 갱신이 조립된 CEO 지침을 vendor 본으로 덮었다(CEO 머리말·본문 수정 소실)"
+            );
+            drop(rig);
+            // ②
+            let rig = Rig::new(&format!("t8-real-{tag}"));
+            rig.write(MASTER_DIRECTIVE_REL, composed.as_bytes());
+            rig.manifest(&[(MASTER_DIRECTIVE_REL, body)]);
+            rig.install(&[(MASTER_DIRECTIVE_REL, vendor_new)], false, &src);
+            assert_eq!(
+                rig.read(MASTER_DIRECTIVE_REL).as_deref(),
+                Some(composed.as_str()),
+                "{tag}: 실제 기록에서도 보존"
+            );
+            assert_eq!(
+                rig.read(&format!("{MASTER_DIRECTIVE_REL}.new")).as_deref(),
+                Some(vendor_new),
+                "{tag}: 신본은 .new 로 곁에 둔다"
+            );
+            drop(rig);
+        }
+        // ③
+        let rig = Rig::new("t8-plain");
+        rig.write(MASTER_DIRECTIVE_REL, body.as_bytes());
+        rig.manifest(&[(MASTER_DIRECTIVE_REL, body)]);
+        rig.install(
+            &[(MASTER_DIRECTIVE_REL, vendor_new)],
+            false,
+            &UpdateSources::none(),
+        );
+        assert_eq!(
+            rig.read(MASTER_DIRECTIVE_REL).as_deref(),
+            Some(vendor_new),
+            "평범한 미수정 MASTER 는 갱신된다"
+        );
+    }
+
+    /// ★T8(CCR-2 · RULINGS CB1·CG2): `ceo_promoted_in` 은 '승격'의 한 뜻을 여섯 번째 판독자로 낸다 — 다른 다섯
+    /// (javis_preflight·javis_org·cys-dept·A12·앱)과 같은 픽스처 한 벌, 실제 항목(파일·끊긴 링크·폴더·읽을 수 없는 파일).
+    #[test]
+    fn ceo_promoted_in_matches_the_shared_fixture() {
+        let fx: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/cysjavis-pack/bin/tests/fixtures/ceo-promoted-cases.json"
+        )))
+        .unwrap();
+        assert_eq!(
+            fx["separator"].as_str(),
+            Some(CEO_SEPARATOR),
+            "팩 코어의 구분선 사본 ≠ 픽스처"
+        );
+        let mut ran = 0;
+        for (i, c) in fx["cases"].as_array().unwrap().iter().enumerate() {
+            let td = std::env::temp_dir().join(format!("cys-pack-cb1-{}-{i}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&td);
+            std::fs::create_dir_all(td.join("directives")).unwrap();
+            if let Some(md) = c["md"].as_str() {
+                std::fs::write(td.join(MASTER_DIRECTIVE_REL), md).unwrap();
+            }
+            let pre = td.join(format!("{MASTER_DIRECTIVE_REL}.pre-ceo"));
+            match c["pre_ceo"].as_str() {
+                None => {}
+                Some("file") => std::fs::write(&pre, "백업\n").unwrap(),
+                Some("directory") => std::fs::create_dir(&pre).unwrap(),
+                #[cfg(unix)]
+                Some("dangling-link") => {
+                    std::os::unix::fs::symlink(td.join("nowhere"), &pre).unwrap()
+                }
+                #[cfg(unix)]
+                Some("unreadable") => {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::write(&pre, "백업\n").unwrap();
+                    std::fs::set_permissions(&pre, std::fs::Permissions::from_mode(0o000)).unwrap();
+                }
+                Some(_) => {
+                    let _ = std::fs::remove_dir_all(&td);
+                    continue; // 이 플랫폼에서 만들 수 없는 항목
+                }
+            }
+            assert_eq!(
+                ceo_promoted_in(&td),
+                c["promoted"].as_bool().unwrap(),
+                "ceo_promoted_in ≠ 픽스처: {}",
+                c["name"]
+            );
+            assert_eq!(
+                ceo_pre_ceo_present_in(&td),
+                !c["pre_ceo"].is_null(),
+                "사전적 실재 ≠ 픽스처: {}",
+                c["name"]
+            );
+            ran += 1;
+            let _ = std::fs::remove_dir_all(&td);
+        }
+        assert!(ran >= 12, "픽스처 행을 거의 못 돌렸다: {ran}");
     }
 
     /// 바: 한 번도 고치지 않은 사용자 소유 파일은 새 버전으로 — 가드 넷(그 파일만 대조 · 감사 유지 · 규칙 문서 인수

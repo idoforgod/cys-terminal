@@ -26470,6 +26470,13 @@ fn advance_vendor_baseline(dir: &std::path::Path, rel: &str, content: &str) {
 /// `pack-rollback --file` (R2 가 치명 분류한 승격 파괴 벡터 — 후자는 롤백 '도구'라서 더
 /// 위험하다). '금지 명문화'(runbook)를 기계 집행으로 승격한 것이며, keep-mine(승격본 유지)
 /// 절차는 종전대로 통과한다. 반환 = Some(stderr 전문·exit 비0) / None = 통과.
+///
+/// ★0.15.0 「스스로 해결」 T8(C11 11.8–11.9 · 설계 §4-14 · H-14-N5-01): CEO 지침은 이제 **조립**이다(생성된 머리말 +
+/// 구분선 + 사용자 본부 지침 — `cys-dept` `ceo_promote`). 조립된 지침은 틀과 바이트가 다른 것이 정상이므로 승격 판정은
+/// '지침 == 틀'로 하지 않는다. 판정은 팩 코어의 한 술어 [`cys::pack::ceo_promoted_in`](갱신 규칙 바 가드 4 — 7번째 자리)
+/// 하나로 묻는다: `.pre-ceo` 가 사전적으로 있다 ∨ 지침에 조립 구분선이 있다(RULINGS CB1·CG2 · CCR-2) — 백업이 지워진
+/// 조립 지침도 잡히고, 두 자리(A12·가드 4)는 같은 함수다. 거부 문안은 실제 근거를 말한다(RULINGS CB4 — H-14-N5-01 의
+/// '문안 불변'보다 뒤의 판정).
 #[derive(Clone, Copy, PartialEq)]
 enum CeoGuardVerb {
     TakeNew,  // pack-merge --take-new
@@ -26487,17 +26494,26 @@ fn ceo_vendor_overwrite_rejection(
     if rel != MASTER_DIRECTIVE_REL || force_vendor {
         return None;
     }
-    let pre_ceo = pack_dir.join(format!("{MASTER_DIRECTIVE_REL}.pre-ceo"));
-    if !pre_ceo.exists() {
+    if !ceo_directive_promoted(pack_dir) {
         return None;
     }
+    let pre_ceo = pack_dir.join(format!("{MASTER_DIRECTIVE_REL}.pre-ceo"));
+    // ★RULINGS CB4: 거부 사유는 실제 근거를 말한다 — 백업이 있으면 그 경로, 없으면 지침 안의 조립 구분선.
+    let why = if cys::pack::ceo_pre_ceo_present_in(pack_dir) {
+        format!("{} 존재", pre_ceo.display())
+    } else {
+        "지침에 CEO 조립 구분선 — 조립된 CEO 지침".to_string()
+    };
     let (verb_label, procedure) = match verb {
         CeoGuardVerb::TakeNew => (
             "--take-new",
             // D1(a) MASTER 정본 절차 — ①② 순서 역전 금지(keep-mine 이 .new 를 삭제한다).
+            // ★T8(조립 · CB4): 조립된 지침의 본문(구분선 뒤)이 사용자 본부 지침이라 신본은 거기에 합친다. 구분선 없는 옛
+            //   승격본은 종전처럼 백업을 신본으로 갱신하면 다음 승격 확인이 그것을 본문으로 조립한다.
             format!(
                 " 올바른 절차(A12 runbook · keep-mine):\n\
-                 \x20  ① cp <pack>/{MASTER_DIRECTIVE_REL}.new <pack>/{MASTER_DIRECTIVE_REL}.pre-ceo   # 복원 백업을 신본으로 갱신\n\
+                 \x20  ① 조립된 지침이면: 신본(<pack>/{MASTER_DIRECTIVE_REL}.new)의 바뀐 조항을 구분선 뒤 본문에 합친다(오너 지시·워커)\n\
+                 \x20     구분선 없는 옛 승격본이면: cp <pack>/{MASTER_DIRECTIVE_REL}.new <pack>/{MASTER_DIRECTIVE_REL}.pre-ceo   # 다음 승격 확인이 본문으로 조립\n\
                  \x20  ② cys pack-merge --file {MASTER_DIRECTIVE_REL} --keep-mine   # 승격본 유지(.new 해소 — ①② 역전 금지)"
             ),
         ),
@@ -26509,11 +26525,20 @@ fn ceo_vendor_overwrite_rejection(
         ),
     };
     Some(format!(
-        "⛔ 거부: '{MASTER_DIRECTIVE_REL}' 는 CEO 승격 중이다({} 존재) — {verb_label} 는 승격본을 \
-         덮어 강등 가역성(.pre-ceo↔md 쌍)을 파괴한다.\n{procedure}\n\
-         \x20 정말 덮으려면(승격 파괴 승인) --force-vendor 를 명시하라.",
-        pre_ceo.display()
+        "⛔ 거부: '{MASTER_DIRECTIVE_REL}' 는 CEO 승격 중이다({why}) — {verb_label} 는 승격본(CEO 머리말 + \
+         사용자 본부 지침)을 통째로 덮어 CEO 머리말과 본문 수정을 지운다.\n{procedure}\n\
+         \x20 정말 덮으려면(승격 파괴 승인) --force-vendor 를 명시하라."
     ))
+}
+
+/// ★RULINGS CB1 — '승격'의 한 뜻: `.pre-ceo` 실재 ∨ 살아 있는 MASTER 에 생성기의 조립 구분선(LF·CRLF)이 있다.
+/// 내용이 승격을 정하고, 백업은 덮어쓰기 가드가 지키는 범위를 넓힐 뿐이다(덮어쓰기 가드 = 가장 넓은 읽기).
+/// 같은 술어: javis_preflight `Preflight._c03_ceo_promoted`(파이썬 정본) · javis_org · cys-dept `ceo_py promoted` ·
+/// 앱 `ceo_promoted` — `cysjavis-pack/bin/tests/fixtures/ceo-promoted-cases.json` 한 벌이 전부를 같은 답으로 묶는다.
+/// ★T2f 병합 뒤(CCR-2): 이 함수는 `cys::pack::ceo_promoted_in`(갱신 규칙 가드 4) 하나만 부른다 — A12 와 가드 4 는
+/// 같은 함수다. `.pre-ceo` 의 실재는 사전적이다(RULINGS CG2 — `cys::pack::ceo_pre_ceo_present_in`).
+fn ceo_directive_promoted(pack_dir: &std::path::Path) -> bool {
+    cys::pack::ceo_promoted_in(pack_dir)
 }
 
 /// ★G3-축3 안전핵 게이트 거부 exit — 예약 규약({0,1,2,64} 충돌 금지 · clap 사용오류=2)과
@@ -29580,7 +29605,128 @@ mod tests {
             .is_none(),
             "MASTER 외 파일은 가드 대상이 아니다"
         );
+
+        // ⑥ ★0.15.0 T8(H-14-N5-01): 조립 승격 — 지침 = 생성된 머리말 + 구분선 + 사용자 본부 지침(틀과 바이트가 다르다)
+        //   이고 `.pre-ceo` 는 백업으로 남는다. 이 상태가 '승격 중'으로 잡혀 두 동사가 거부돼야 한다 — 판정을 '지침 == 틀'로
+        //   바꾸면 조립된 지침을 못 알아봐 덮어써지므로(강등) 이 행이 적색이 된다.
+        let sep = "\n---\n\n# [본문 — 표준 MASTER 운영 계약 전문]\n\n";
+        let template = format!("# CEO 머리말\n{sep}표준 MASTER\n");
+        let composed = format!("# CEO 머리말\n{sep}표준 MASTER\nUSERFIX-사용자가 고친 줄\n");
+        std::fs::write(td.join("directives/CEO_TEMPLATE.md"), &template).unwrap();
+        std::fs::write(td.join(rel), &composed).unwrap();
+        std::fs::write(
+            td.join(format!("{rel}.pre-ceo")),
+            "표준 MASTER\nUSERFIX-사용자가 고친 줄\n",
+        )
+        .unwrap();
+        assert_ne!(
+            composed, template,
+            "전제: 조립된 지침은 틀과 다르다(본문 = 사용자 지침)"
+        );
+        for verb in [CeoGuardVerb::TakeNew, CeoGuardVerb::Rollback] {
+            let msg = ceo_vendor_overwrite_rejection(&td, rel, false, verb)
+                .expect("조립된 CEO 지침(틀 ≠ 지침)도 승격 중으로 잡혀 거부돼야 한다");
+            assert!(msg.contains("--force-vendor"), "override 안내 누락: {msg}");
+        }
+        // ⑥′ ★RULINGS CB1: 같은 조립 지침인데 `.pre-ceo` 를 사용자가 지웠다 — 내용(구분선)이 승격을 정하므로 여전히
+        //   거부(종전 술어 '.pre-ceo 실재'는 여기서 덮어쓰기를 통과시켰다). 사유는 백업이 아니라 구분선을 말한다(CB4).
+        std::fs::remove_file(td.join(format!("{rel}.pre-ceo"))).unwrap();
+        for verb in [CeoGuardVerb::TakeNew, CeoGuardVerb::Rollback] {
+            let msg = ceo_vendor_overwrite_rejection(&td, rel, false, verb)
+                .expect("조립된 CEO 지침은 .pre-ceo 가 없어도 승격 중으로 잡혀 거부돼야 한다(CB1)");
+            assert!(
+                msg.contains("조립 구분선"),
+                "거부 사유가 실제 근거(구분선)를 말하지 않는다: {msg}"
+            );
+            assert!(
+                !msg.contains(".pre-ceo 존재"),
+                "없는 백업을 근거로 댄다: {msg}"
+            );
+        }
+        // CRLF 로 바뀐 같은 구분선도 승격이다.
+        std::fs::write(td.join(rel), composed.replace('\n', "\r\n")).unwrap();
+        assert!(ceo_vendor_overwrite_rejection(&td, rel, false, CeoGuardVerb::TakeNew).is_some());
+        std::fs::write(
+            td.join(format!("{rel}.pre-ceo")),
+            "표준 MASTER\nUSERFIX-사용자가 고친 줄\n",
+        )
+        .unwrap();
+        // ⑦ 강등 뒤(지침 = 구분선 뒤 본문 · .pre-ceo 치움) — 승격 아님 → 두 동사 통과(위경보 금지).
+        std::fs::write(td.join(rel), "표준 MASTER\nUSERFIX-사용자가 고친 줄\n").unwrap();
+        std::fs::remove_file(td.join(format!("{rel}.pre-ceo"))).unwrap();
+        for verb in [CeoGuardVerb::TakeNew, CeoGuardVerb::Rollback] {
+            assert!(
+                ceo_vendor_overwrite_rejection(&td, rel, false, verb).is_none(),
+                "강등된 표준 MASTER 에 가드가 발화하면 안 된다"
+            );
+        }
         let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// ★RULINGS CB1 파리티: '승격'의 한 뜻을 여섯 판독자가 같은 픽스처 한 벌로 같은 답을 낸다 — 여기는 A12 와
+    /// `cys::pack::ceo_promoted_in`(가드 4) 쪽. 파이썬(preflight·javis_org·cys-dept)은 test_ceo_composition.py, 앱은
+    /// src-tauri `ceo_promoted_matches_the_shared_fixture` 가 같은 파일을 읽는다.
+    #[test]
+    fn ceo_promoted_matches_the_shared_fixture() {
+        let fx: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/cysjavis-pack/bin/tests/fixtures/ceo-promoted-cases.json"
+        )))
+        .unwrap();
+        assert_eq!(
+            fx["separator"].as_str(),
+            Some(cys::pack::CEO_SEPARATOR),
+            "A12 의 구분선 사본 ≠ 픽스처"
+        );
+        let cases = fx["cases"].as_array().unwrap();
+        assert!(cases.len() >= 10, "픽스처가 비었다");
+        let rel = MASTER_DIRECTIVE_REL;
+        let mut ran = 0;
+        for (i, c) in cases.iter().enumerate() {
+            let td =
+                std::env::temp_dir().join(format!("cys-cb1-fixture-{}-{i}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&td);
+            std::fs::create_dir_all(td.join("directives")).unwrap();
+            if let Some(md) = c["md"].as_str() {
+                std::fs::write(td.join(rel), md).unwrap();
+            }
+            // ★CG2: 실제 항목을 만든다 — 파일 · 끊긴 링크 · 폴더 · 읽을 수 없는 파일(링크·권한 행은 POSIX 전용).
+            let pre = td.join(format!("{rel}.pre-ceo"));
+            match c["pre_ceo"].as_str() {
+                None => {}
+                Some("file") => std::fs::write(&pre, "백업\n").unwrap(),
+                Some("directory") => std::fs::create_dir(&pre).unwrap(),
+                #[cfg(unix)]
+                Some("dangling-link") => {
+                    std::os::unix::fs::symlink(td.join("nowhere"), &pre).unwrap()
+                }
+                #[cfg(unix)]
+                Some("unreadable") => {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::write(&pre, "백업\n").unwrap();
+                    std::fs::set_permissions(&pre, std::fs::Permissions::from_mode(0o000)).unwrap();
+                }
+                Some(_) => {
+                    let _ = std::fs::remove_dir_all(&td);
+                    continue; // 이 플랫폼에서 만들 수 없는 항목
+                }
+            }
+            let want = c["promoted"].as_bool().unwrap();
+            let name = c["name"].as_str().unwrap();
+            assert_eq!(
+                ceo_directive_promoted(&td),
+                want,
+                "A12 술어 ≠ 픽스처: {name}"
+            );
+            assert_eq!(
+                ceo_vendor_overwrite_rejection(&td, rel, false, CeoGuardVerb::TakeNew).is_some(),
+                want,
+                "A12 거부 ≠ 픽스처: {name}"
+            );
+            ran += 1;
+            let _ = std::fs::remove_dir_all(&td);
+        }
+        assert!(ran >= 12, "픽스처 행을 거의 못 돌렸다: {ran}");
     }
 
     /// ★G3-축3 게이트 exit 계약 핀: 게이트 거부는 예약 exit({0,1,2,64} — clap 사용오류=2)과

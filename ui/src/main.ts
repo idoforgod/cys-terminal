@@ -8841,9 +8841,12 @@ async function buildPaletteItems(): Promise<PaletteItem[]> {
   }
 
   // ── (4-b) ★R8(WP-2): CEO 승격 대기 해소 — cys-dept PENDING(부트 게이트 보류)의 즉시 경로.
-  // ── (4-c) ★D4(v4 · 결정 D4): CEO 승격 재실행(템플릿 전진 적용) — 노출 게이트=[.pre-ceo 존재
-  // ∧ md≠라이브 CEO_TEMPLATE](ceo_promotion_drift · 파일 실측). 템플릿 전진 릴리스 후 구본화된
-  // 승격본을 갱신하는 오너 GUI 경로(종전엔 CLI promote-ceo 재실행이 유일 — 막다른 흐름 제거).
+  // ── (4-c) ★D4(v4 · 결정 D4): CEO 승격 재실행(템플릿 전진 적용) — 노출 게이트=ceo_promotion_drift(파일 실측).
+  // ★0.15.0 T8(조립 · C11 11.9): CEO 지침 = 생성된 머리말 + 구분선 + 사용자 본부 지침이라 '지침 ≠ 틀'은 정상이다 —
+  // 게이트는 승격 상태(RULINGS CB1: .pre-ceo 실재 ∨ 지침에 조립 구분선 — 앱 `ceo_promoted`)인데 지침의 **머리말**이 현행
+  // 틀과 다를 때만 열리고(본문 수정은 드리프트 아님), 재실행은 조립된 지침이면 머리말만 다시 조립하고 본문(사용자 본부
+  // 지침)은 그대로 둔다. 0.14.x 방식 승격본(0.14 영수증 또는 배포된 0.14.x 머리말 — CG1)이면 승격 전 본부 지침(.pre-ceo)을
+  // 본문으로 조립하고 옛 CEO 지침은 사본으로 남긴다(CB3). 종전 '새 템플릿 재적용' = 통째 복사 = 수정 소실.
   // 둘 다 온디맨드 조회(팔레트 열 때만 — 신규 타이머 0)·상호 배타 노출(pending 우선 — 결정
   // 로직은 selfdiag.ceoPaletteEntries 순수 함수에 고정, 회귀 핀 selfdiag.test.ts).
   const [ceoPend, ceoDrift] = await Promise.all([
@@ -8856,9 +8859,9 @@ async function buildPaletteItems(): Promise<PaletteItem[]> {
       items.push({
         id: "act:ceo-promote",
         title: "CEO 승격 진행 (대기 중)",
-        subtitle: "부서가 존재·base 부트 완료 — 동의 게이트(feed)를 거쳐 승격합니다",
+        subtitle: "부서가 존재·base 부트 완료 — 본부 지침을 그대로 둔 조립으로 승격합니다",
         keywords: "ceo promote 승격 pending 대기",
-        confirm: { title: "CEO 승격", body: "기본 데몬 master를 CEO로 승격합니다(동의 요청이 feed에 뜹니다 · .pre-ceo 백업으로 가역)." },
+        confirm: { title: "CEO 승격", body: "기본 데몬 master를 CEO로 승격합니다 — CEO 지침은 생성된 머리말에 지금 본부 지침을 그대로 붙인 조립입니다(고친 내용 유지). 가역: 부서를 모두 정리하면 구분선 뒤 본문(본부 지침)으로 되돌립니다." },
         action: async () => {
           try {
             const r = (await invoke("promote_pending_ceo")) as string;
@@ -8869,21 +8872,22 @@ async function buildPaletteItems(): Promise<PaletteItem[]> {
         },
       });
     } else {
-      // 재실행=approve_ceo_promotion(promote-ceo consented) 재사용 — _swap 이 기존 .pre-ceo 를
-      // 보존한 채 새 템플릿만 md 에 적용(가역성 불파괴). 실패는 exit 5 truthful 표시 관례(:3963).
+      // 재실행=approve_ceo_promotion(promote-ceo consented) 재사용 — ★T8: 조립은 현행 틀의 머리말에 지금 본문
+      // (사용자 본부 지침)을 붙인다. 사용자가 머리말을 고쳤으면 cys-dept 가 시각 붙인 사본을 먼저 남긴다. .pre-ceo 백업은
+      // 보존(가역성 불파괴). 실패는 exit 5 truthful 표시 관례(조립된 지침 + 영수증 확인 실패).
       items.push({
         id: "act:ceo-repromote",
         title: "CEO 승격 재실행 (템플릿 전진 적용)",
-        subtitle: "릴리스 전진으로 승격본이 구본화됨(md≠라이브 CEO_TEMPLATE) — 새 템플릿을 재적용합니다",
+        subtitle: "CEO 지침의 머리말이 현행 틀과 다름 — 현행 머리말로 다시 조립합니다(조립된 지침이면 본문은 그대로)",
         keywords: "ceo promote 승격 재실행 템플릿 전진 drift repromote",
         confirm: {
           title: "CEO 승격 재실행",
-          body: "새 CEO_TEMPLATE를 MASTER_DIRECTIVE.md에 재적용합니다(.pre-ceo 백업은 보존 — 부서 0개 시 자동 강등 가역성 유지).",
+          body: "현행 CEO_TEMPLATE의 머리말 + 본부 지침으로 다시 조립합니다. 조립된 지침이면 본문(구분선 뒤 — 사용자 본부 지침, 고친 내용 포함)은 그대로이고, 영수증이 빠졌거나 손상됐어도 보류하지 않고 새 조립의 영수증을 씁니다. 지금 머리말을 영수증으로 증명할 수 없으면(고쳤거나 영수증이 없음) 지금 지침 전체를 시각을 붙인 사본으로 먼저 남기고 알림을 띄웁니다. 0.14.x 방식(통째 복사) 승격본으로 확인되면(0.14 영수증 또는 배포된 0.14.x 머리말) 승격 전 본부 지침(.pre-ceo — 없으면 옛 지침의 구분선 뒤 본문)을 본문으로 조립하고, 옛 CEO 지침이 배포 틀과 다르면 통째로 사본을 남기고 알림을 띄웁니다. 부서를 모두 정리하면 그 본문으로 되돌립니다.",
         },
         action: async () => {
           try {
             const r = (await invoke("approve_ceo_promotion")) as string;
-            toast("watchdog", "✅ CEO 승격 재실행 완료", r || "새 템플릿을 적용했습니다.");
+            toast("watchdog", "✅ CEO 승격 재실행 완료", r || "현행 머리말로 다시 조립했습니다.");
           } catch (e) {
             toast("health", "CEO 승격 재실행 실패", String(e));
           }

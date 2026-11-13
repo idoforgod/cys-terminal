@@ -241,11 +241,20 @@ class CeoNoticeStatic(unittest.TestCase):
         self.assertNotIn("feed reply \"$id\" allow", src)
 
 
+def _ceo_fixture():
+    """★0.15.0 T8: 승격 = 조립(머리말 + 실제 구분선 + 사용자 본부 지침). 틀은 머리말 표지 3핀 + gen_ceo_template 구분선 +
+    MASTER 내용 핀 전수여야 상위집합 불변식 (i)을 통과한다(test_ceo_pending_gate 동형 픽스처)."""
+    sys.path.insert(0, BIN)
+    import javis_preflight as pf
+    master = "STANDARD-MASTER\n" + "\n".join(p for p, _ in pf.CONTENT_PINS["MASTER_DIRECTIVE.md"]) + "\n"
+    sep = "\n---\n\n# [본문 — 표준 MASTER 운영 계약 전문]\n\n"
+    return master, "# CEO-HEADER (master of master · 단일소유 강제 · exit 7)\n" + sep + master
+
+
 class CeoNoticeRuntime(_Home):
     """3·4 — 실행 확인(test_ceo_pending_gate 동형 픽스처)."""
 
-    MASTER = "STANDARD-MASTER\n"
-    CEO = "CEO-HEADER\n---\n" + MASTER
+    MASTER, CEO = _ceo_fixture()
 
     def setUp(self):
         super().setUp()

@@ -16,8 +16,10 @@
      비실존·비정형 exit 2. sock 동사 '-' 선두 exit 2(레거시 비정형 등재명은 fan-out 호환 통과).
   7) 인자 위생 — cys tombstone 호출이 `--dept [--remove] -- <name>`(clap `--` 종단) 형식.
   8) 기존명 재-launch 통과(slug-fold 자기 제외) / slug 충돌쌍(대소·'.'-fold) 거부.
-  9) 승격 영수증 — promote 시 directives/.ceo-template-applied=적용 템플릿 sha256, 강등 시 삭제.
- 10) demote 무음 경보 — 승격 표지+.pre-ceo 부재='강등 불능' stderr 경보+feed push(비대기),
+  9) 승격 영수증 — ★0.15.0 T8(O-C11-1): promote 시 directives/.ceo-receipt.json = {schema, header_sha256,
+     master_sha256_at_compose, composed_sha256, separator, composed_at}(조립 해시), 강등 시 삭제.
+ 10) demote 무음 경보 — ★T8: 조립된 지침은 .pre-ceo 없이도 구분선 뒤 본문으로 강등된다(경보 없음). '강등 불능'은
+     CEO 문면(표지 3핀)인데 조립 구분선도 .pre-ceo 도 없을 때뿐 — stderr 경보+feed push(비대기),
      미승격 머신은 무경보(위경보 금지).
  11) A11 — promote-if-pending --request-only가 미해결 동종(제목 'CEO 승격 대기') pending 존재 시
      push 생략(로그 1줄), 부재 시 발행.
@@ -43,14 +45,23 @@ import sys
 import tempfile
 import unicodedata
 
-# ★T10(DCE-3) 픽스처 계약: CEO 템플릿 = MASTER 전문의 상위집합(합성 계약 동형) — 스왑 직전
-#   런타임 상위집합 검사를 통과해야 승격 계열 테스트가 승격 상태에 도달한다.
-CEO_BODY = "CEO-HEADER\n---\nSTANDARD-MASTER\n"
 import time
 import unittest
 
 SELF = os.path.dirname(os.path.abspath(__file__))
 DEPT = os.path.join(SELF, "..", "cys-dept")
+sys.path.insert(0, os.path.join(SELF, ".."))
+import javis_preflight as _pf  # noqa: E402 — MASTER 내용 핀 정본(상위집합 불변식의 기준)
+
+# ★T10(DCE-3) 픽스처 계약: CEO 템플릿 = MASTER 전문의 상위집합(합성 계약 동형) — 스왑 직전
+#   런타임 상위집합 검사를 통과해야 승격 계열 테스트가 승격 상태에 도달한다.
+# ★0.15.0 T8: 승격 = 조립(머리말 + 실제 구분선 + 사용자 본부 지침). 틀은 머리말 표지 3핀 + gen_ceo_template 의 구분선 +
+#   MASTER 내용 핀 전수(상위집합 불변식 (i) — 반쪽·스텁 틀 거부)여야 승격 상태에 도달한다.
+CEO_SEP = "\n---\n\n# [본문 — 표준 MASTER 운영 계약 전문]\n\n"
+MASTER_BODY = ("STANDARD-MASTER\n"
+               + "\n".join(p for p, _ in _pf.CONTENT_PINS["MASTER_DIRECTIVE.md"]) + "\n")
+CEO_HEADER = "# CEO-HEADER (master of master · 단일소유 강제 · exit 7)\n"
+CEO_BODY = CEO_HEADER + CEO_SEP + MASTER_BODY
 
 
 def startup_lock(sock):
@@ -156,7 +167,7 @@ class Base(unittest.TestCase):
         pack = os.path.join(self.home, ".cys", "pack", "directives")
         os.makedirs(pack, exist_ok=True)
         with open(os.path.join(pack, "MASTER_DIRECTIVE.md"), "w", encoding="utf-8") as f:
-            f.write("STANDARD-MASTER\n")
+            f.write(MASTER_BODY)
         with open(os.path.join(pack, "CEO_TEMPLATE.md"), "w", encoding="utf-8") as f:
             f.write(CEO_BODY)
         with open(os.path.join(self.home, ".cys", ".master-bootstrapped"), "w") as f:
@@ -166,7 +177,8 @@ class Base(unittest.TestCase):
         return pack
 
     def _receipt(self):
-        return os.path.join(self.home, ".cys", "pack", "directives", ".ceo-template-applied")
+        # ★T8(O-C11-1): 조립 영수증. 0.14.x 영수증(.ceo-template-applied)은 더 쓰지 않는다(조립·강등이 지운다).
+        return os.path.join(self.home, ".cys", "pack", "directives", ".ceo-receipt.json")
 
 
 class AcceptRejectTable(Base):
@@ -813,33 +825,56 @@ class SlugFold(Base):
 
 
 class PromotionReceiptAndDemote(Base):
-    # 9) 승격 영수증: _swap 후 적용 템플릿 sha256(hex 1줄) 기록 → 강등 시 삭제
+    # 9) 승격 영수증(★T8 O-C11-1): 조립 후 directives/.ceo-receipt.json = 조립 해시 → 강등 시 삭제
     def test_receipt_written_and_deleted(self):
         pack = self._seed_promotable(ndepts=1)
         rc, out, err = self.run_dept("promote-ceo")
         self.assertEqual(rc, 0, "promote-ceo 실패\n%s%s" % (out, err))
-        expected = hashlib.sha256(
-            open(os.path.join(pack, "CEO_TEMPLATE.md"), "rb").read()).hexdigest()
+        md_bytes = open(os.path.join(pack, "MASTER_DIRECTIVE.md"), "rb").read()
         self.assertTrue(os.path.exists(self._receipt()), "승격 영수증 미기록")
-        self.assertEqual(open(self._receipt(), encoding="utf-8").read().strip(), expected,
-                         "영수증 내용≠적용 템플릿 sha256")
+        rec = json.load(open(self._receipt(), encoding="utf-8"))
+        h = lambda b: hashlib.sha256(b).hexdigest()
+        self.assertEqual(rec.get("schema"), 1)
+        self.assertEqual(rec.get("composed_sha256"), h(md_bytes), "영수증 조립 해시≠살아 있는 지침")
+        self.assertEqual(rec.get("header_sha256"), h(CEO_HEADER.encode("utf-8")))
+        self.assertEqual(rec.get("master_sha256_at_compose"), h(MASTER_BODY.encode("utf-8")))
+        self.assertEqual(rec.get("separator"), CEO_SEP)
+        self.assertTrue(isinstance(rec.get("composed_at"), str) and rec["composed_at"])
+        self.assertFalse(os.path.exists(os.path.join(pack, ".ceo-template-applied")),
+                         "0.14.x 영수증을 계속 쓴다")
         self.assertTrue(os.path.exists(os.path.join(pack, "MASTER_DIRECTIVE.md.pre-ceo")))
-        # 마지막 부서 down → ceo_demote: 원복+영수증 삭제
+        # 마지막 부서 down → ceo_demote: 구분선 뒤 본문으로 원복+영수증 삭제
         rc, out, err = self.run_dept("down", "d0")
         self.assertEqual(rc, 0, "down 실패\n%s%s" % (out, err))
         self.assertEqual(open(os.path.join(pack, "MASTER_DIRECTIVE.md"),
-                              encoding="utf-8").read(), "STANDARD-MASTER\n", "강등 원복 실패")
+                              encoding="utf-8").read(), MASTER_BODY, "강등 원복 실패")
         self.assertFalse(os.path.exists(self._receipt()), "강등 후 영수증 잔존(stale)")
 
-    # 10) demote 무음 경보: 승격 표지(md==템플릿)+.pre-ceo 부재 → stderr 경보+feed push(비대기)
-    def test_demote_missing_backup_alerts(self):
+    # 10) ★T8: 조립된 지침(구분선 실재)은 .pre-ceo 가 없어도 구분선 뒤 본문으로 강등된다 — 경보 없음
+    #     (종전 '승격 표지+.pre-ceo 부재=강등 불능'은 통째 복사 시절의 계약이다 — 조립에선 백업이 강등 원본이 아니다).
+    def test_demote_composed_without_backup_uses_separator(self):
         pack = self._seed_promotable(ndepts=1)
         with open(os.path.join(pack, "MASTER_DIRECTIVE.md"), "w", encoding="utf-8") as f:
-            f.write(CEO_BODY)   # 승격 표지(md==템플릿) — .pre-ceo는 없음(비가역 상태)
+            f.write(CEO_BODY)   # 조립된 지침(머리말+구분선+본부 지침) — .pre-ceo 없음
+        rc, out, err = self.run_dept("down", "d0")
+        self.assertEqual(rc, 0, "강등 경로가 teardown을 파괴(exit=%d)" % rc)
+        self.assertEqual(open(os.path.join(pack, "MASTER_DIRECTIVE.md"), encoding="utf-8").read(),
+                         MASTER_BODY, "구분선 뒤 본문으로 강등되지 않았다")
+        self.assertNotIn("강등 불능", err)
+        self.assertNotIn("CEO 강등 불능", self.calls())
+
+    # 10) demote 무음 경보: CEO 문면(표지 3핀)인데 조립 구분선도 .pre-ceo 도 없다 → stderr 경보+feed push(비대기)
+    def test_demote_missing_backup_alerts(self):
+        pack = self._seed_promotable(ndepts=1)
+        old_copy = CEO_HEADER + "옛 CEO 사본 — 조립 구분선 없음\n"
+        with open(os.path.join(pack, "MASTER_DIRECTIVE.md"), "w", encoding="utf-8") as f:
+            f.write(old_copy)   # 승격 표지(표지 3핀) — 구분선도 .pre-ceo 도 없음(비가역 상태)
         rc, out, err = self.run_dept("down", "d0")
         self.assertEqual(rc, 0, "경보 경로가 teardown을 파괴(exit=%d)" % rc)
         self.assertIn("강등 불능", err, "무음 no-op 잔존 — stderr 경보 부재")
         self.assertIn("feed push --title CEO 강등 불능", self.calls(), "feed push 경보 부재")
+        self.assertEqual(open(os.path.join(pack, "MASTER_DIRECTIVE.md"), encoding="utf-8").read(),
+                         old_copy, "강등 불능인데 지침이 바뀌었다")
 
     # 10) 미승격 머신: .pre-ceo 부재는 정상 no-op — 위경보 금지
     def test_demote_unpromoted_no_false_alarm(self):
@@ -1414,7 +1449,7 @@ class RegistryBom(Base):
         pack = self._seed_promotable(ndepts=1)
         self._assert_registry_read_failure(b'{"depts":', "promote-ceo")
         with open(os.path.join(pack, "MASTER_DIRECTIVE.md"), encoding="utf-8") as f:
-            self.assertEqual(f.read(), "STANDARD-MASTER\n", "판독 실패인데 CEO 승격 발생")
+            self.assertEqual(f.read(), MASTER_BODY, "판독 실패인데 CEO 승격 발생")
         self.assertFalse(os.path.exists(self._receipt()), "판독 실패인데 승격 영수증 생성")
 
     # P1: 등재/역인덱스 판독 실패 시 teardown·reg_count=0 오판·CEO 강등 모두 금지.

@@ -1060,10 +1060,6 @@ class DeferralFamiliesFG(unittest.TestCase):
     asserted here); tests, fixtures and `scripts/` are out. ALLOWED lists, by EXACT sentence and families, the hits that
     stay — every other hit fails."""
     ALLOWED = {
-        # T8's C03 cause line (`_c03_master_axis`, RULINGS AH4 (a)): track T8 rewords the string and removes this entry in
-        #   the same commit.
-        ("cysjavis-pack/bin/javis_preflight.py", "pristine) — 핀 기준 선행(벤더 동기 필요·사용자 과실 아님)", ("T1-d",)):
-            "T8 — RULINGS AH4 (a)",
         # A subject-matter word caught by an over-broad alternative (RULINGS BZ6 → Part 33 B99, tightening proposed in
         #   impl/reports/T1c-report.md §2): the vibe-coding route contract's critic cannot change the Level — the docstring
         #   is printed by `--help` (epilog=__doc__). Not reworded; the entry goes when B99 tightens T1-d's bare "변경 불가".

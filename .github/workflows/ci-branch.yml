@@ -1114,7 +1114,7 @@ jobs:
           #     · 하네스 모드(실 cysd) GATE 1 45행 rc=0.
           for t in test_report_ghost test_hud_bridge_skew test_todo_shared_constants test_orchestra_todo_path test_todo_stamp \
                    test_import_guard test_event_spool_rc test_org_dispatch_delivers test_pkg3a_tools_lane test_radio test_scrub test_bootstrap_chain test_snapshot \
-                   test_dept_name_guard test_preflight_c03_states test_content_pins_parity \
+                   test_dept_name_guard test_preflight_c03_states test_content_pins_parity test_ceo_composition \
                    test_role_bootstrap_hook test_seat_latch_negation \
                    test_hud_bridge_backoff test_preflight_c11b_seal test_wakeup_liveness \
                    test_preflight_c62_c68_ledger \
