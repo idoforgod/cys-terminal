@@ -1190,6 +1190,20 @@ def is_dept_pack():
         return False
 
 
+def _hermetic_test():
+    """시험 전용 스위치(0.15.0 · T5a · RULINGS AN4) — `CYS_PREFLIGHT_HERMETIC_TEST=1` 은 격리 HOME 표식
+    `CYS_TEST_ISOLATED_HOME` 이 **실제 HOME 과 같을 때만** 듣는다. 켜지면 이 기계의 절대 경로에 손대지 않는다:
+    C65 는 기계 고정 cys 후보(/Applications · /opt/homebrew)를 보지 않고, C11b 는 HOME 밖의 링크를 정리
+    후보로 삼지 않으며, C20 은 인터프리터 pip 설치(`python -m pip install`)를 하지 않는다. 그 밖의 판정은 같다."""
+    if os.environ.get("CYS_PREFLIGHT_HERMETIC_TEST") != "1":
+        return False
+    mark = os.environ.get("CYS_TEST_ISOLATED_HOME", "")
+    try:
+        return bool(mark) and os.path.realpath(mark) == os.path.realpath(os.path.expanduser("~"))
+    except (OSError, ValueError):
+        return False
+
+
 def _path_under_tempdir(p):
     """p 가 임시 디렉터리(/tmp·/private/tmp·$TMPDIR·/var/folders·/private/var/folders) 아래인가.
     임시 pack 예방 가드(discover_claude_settings)와 C57 temp-훅 청소기의 공용 술어.
@@ -3150,6 +3164,8 @@ class Preflight:
             if not cand:
                 continue
             cand = os.path.abspath(cand)
+            if _hermetic_test() and not cand.startswith(os.path.expanduser("~") + os.sep):
+                continue                 # T5a · AN4 시험 전용 스위치 — HOME 밖 링크는 정리 후보가 아니다
             if cand != link and cand not in seen:
                 seen.add(cand)
                 cands.append(cand)
@@ -3634,8 +3650,9 @@ class Preflight:
             candidates.append(["uv", "tool", "install", "--force", NLM_PIN])
         if shutil.which("pipx"):
             candidates.append(["pipx", "install", "--force", NLM_PIN])
-        candidates.append([sys.executable, "-m", "pip", "install", "--user",
-                           "--upgrade", NLM_PIN])
+        if not _hermetic_test():         # T5a · AN4 시험 전용 스위치 — 인터프리터 pip 설치 생략
+            candidates.append([sys.executable, "-m", "pip", "install", "--user",
+                               "--upgrade", NLM_PIN])
         for cmd in candidates:
             try:
                 if subprocess.run(cmd, capture_output=True, timeout=600).returncode == 0:
@@ -6575,12 +6592,13 @@ class Preflight:
         candidates = []
         if os.environ.get("CYS_BIN"):
             candidates.append(os.environ["CYS_BIN"])
-        candidates += [
-            "/Applications/cys.app/Contents/MacOS/cys",
-            os.path.expanduser("~/Applications/cys.app/Contents/MacOS/cys"),
-            os.path.expanduser("~/.local/bin/cys"),
-            "/opt/homebrew/bin/cys",
-        ]
+        if not _hermetic_test():         # T5a · AN4 시험 전용 스위치 — 기계 고정 후보 생략
+            candidates += [
+                "/Applications/cys.app/Contents/MacOS/cys",
+                os.path.expanduser("~/Applications/cys.app/Contents/MacOS/cys"),
+                os.path.expanduser("~/.local/bin/cys"),
+                "/opt/homebrew/bin/cys",
+            ]
         w = shutil.which("cys")
         if w:
             candidates.append(w)

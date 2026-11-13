@@ -667,8 +667,24 @@ mod tests {
             false,
         ),
         (
+            "bin/javis_budget.py",
+            C::StartDep,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
             "bin/javis_checklist.py",
             C::HookDep,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
+            "bin/javis_cli_probe.py",
+            C::StartDep,
             K::PyCompile,
             "",
             None,
@@ -685,6 +701,22 @@ mod tests {
         (
             "bin/javis_formation.py",
             C::StartScript,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
+            "bin/javis_lane.py",
+            C::StartDep,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
+            "bin/javis_lock.py",
+            C::StartDep,
             K::PyCompile,
             "",
             None,
@@ -715,7 +747,31 @@ mod tests {
             false,
         ),
         (
+            "bin/javis_resource_gate.py",
+            C::StartDep,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
             "bin/javis_snapshot.py",
+            C::HookDep,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
+            "bin/javis_state_snapshot.py",
+            C::HookDep,
+            K::PyCompile,
+            "",
+            None,
+            false,
+        ),
+        (
+            "bin/javis_teamtoken.py",
             C::HookDep,
             K::PyCompile,
             "",
@@ -846,15 +902,25 @@ mod tests {
     ];
 
     /// RULINGS AL1 class 3 — `proof: real-level` (the stage-5 end-to-end derivation items).
-    const REAL_LEVEL: [&str; 5] = [
+    const REAL_LEVEL: [&str; 6] = [
         "agents.json",
         "bin/cys-dept",
         "bin/javis_boot_node.py",
+        "bin/javis_cli_probe.py",
         "bin/javis_formation.py",
         "bin/javis_preflight.py",
     ];
-    /// RULINGS AL1 class 2 — measured at the bootstrap layer.
-    const BOOTSTRAP_LEVEL: [&str; 2] = ["bin/javis_bootstrap.py", "bin/javis_orchestra.py"];
+    /// RULINGS AL1 class 2 — measured at the bootstrap layer: break mode (i) for the two start
+    /// scripts, break mode (ii) — the file gives the answer the boot obeys as a stop — for the four
+    /// tools of RULINGS AN2.
+    const BOOTSTRAP_LEVEL: [&str; 6] = [
+        "bin/javis_bootstrap.py",
+        "bin/javis_budget.py",
+        "bin/javis_lane.py",
+        "bin/javis_lock.py",
+        "bin/javis_orchestra.py",
+        "bin/javis_resource_gate.py",
+    ];
 
     /// The sibling protection list (C4 4.10 · RULINGS AI6 — the worker's mapping, accepted as a
     /// flagged interpretation).
@@ -942,7 +1008,17 @@ mod tests {
         edit: &dyn Fn(&str, String) -> String,
         extra: &[(&str, &str)],
     ) -> Result<Vec<derive::GenEntry>, String> {
+        derive_with(edit, extra, &[])
+    }
+
+    /// [`derive_edited`] with some pack files REMOVED from the pack.
+    fn derive_with(
+        edit: &dyn Fn(&str, String) -> String,
+        extra: &[(&str, &str)],
+        removed: &[&str],
+    ) -> Result<Vec<derive::GenEntry>, String> {
         let mut rels = pack_rels();
+        rels.retain(|r| !removed.contains(&r.as_str()));
         rels.extend(extra.iter().map(|(r, _)| r.to_string()));
         let pack_file = |rel: &str| -> Option<String> {
             extra
@@ -1209,8 +1285,8 @@ mod tests {
         assert_eq!((a.decision, a.protection.is_some()), (Decision::No, true));
     }
 
-    /// RULINGS AL1: every row carries what proves it — `real-level` exactly on the five class-3
-    /// rows, `bootstrap-replay` exactly on the two class-2 rows, `hook-replay` on every hook row
+    /// RULINGS AL1 / AN2: every row carries what proves it — `real-level` exactly on the six class-3
+    /// rows, `bootstrap-replay` exactly on the six class-2 rows, `hook-replay` on every hook row
     /// and every file a hook uses; `--list --json` carries the marker as `proof`.
     #[test]
     fn proof_markers_by_class() {
@@ -1254,6 +1330,11 @@ mod tests {
                 "{rel} is dropped AND listed"
             );
             assert!(why.contains("boot"), "{rel}: the drop names no measurement");
+            // RULINGS AN2: every dropped row's record states BOTH break modes
+            assert!(
+                why.contains("(i) ") && why.contains("(ii) "),
+                "{rel}: the drop does not state both break modes"
+            );
         }
     }
 
@@ -1270,6 +1351,25 @@ mod tests {
         .unwrap_err();
         assert!(
             e.contains("new start-path candidate") && e.contains("bin/javis_t5a_new_tool.py"),
+            "{e}"
+        );
+    }
+
+    /// RULINGS AN6: the census starts from LISTED files and stops at dropped files — a new import
+    /// inside an ordinary (dropped) tool does not fail the build; a dropped entry that is no longer
+    /// a pack file does, naming it.
+    #[test]
+    fn census_starts_from_listed_files_and_stops_at_drops() {
+        let ok = derive_edited(
+            &edit_one("cysjavis-pack/bin/javis_phoenix.py", |t| {
+                format!("{t}\ndef _t5a_probe():\n    import javis_t5a_new_tool\n")
+            }),
+            &[("bin/javis_t5a_new_tool.py", "x = 1\n")],
+        );
+        assert!(ok.is_ok(), "{ok:?}");
+        let e = derive_with(&|_, t| t, &[], &["bin/javis_phoenix.py"]).unwrap_err();
+        assert!(
+            e.contains("DROPPED_CANDIDATES") && e.contains("bin/javis_phoenix.py"),
             "{e}"
         );
     }
@@ -1594,7 +1694,128 @@ mod tests {
                 || self.stderr.contains("SyntaxError")
                 || self.stderr.contains("_lib.sh 소실")
         }
+        /// RULINGS AN3 — the hook's RESULT changed against its healthy run: what Claude Code
+        /// receives from a hook is its exit code (or a kill at the deadline) and its stdout (stderr
+        /// is shown only with a non-zero exit). A child's error text on stderr alone, with the
+        /// same exit and the same stdout, is not a changed result.
+        fn result_changed(&self, healthy: &Run, deterministic: bool) -> bool {
+            self.code != healthy.code || (deterministic && self.stdout != healthy.stdout)
+        }
     }
+
+    /// RULINGS AN3 — a recorded input that REACHES a code path the default replay does not:
+    /// (name, hook rel, what it is for, setup). The setup gets the run's private HOME and the
+    /// hook's registered event and returns the cwd, extra environment and the event JSON.
+    #[cfg(target_os = "macos")]
+    type Setup = fn(&Path, &str) -> (PathBuf, Vec<(String, String)>, String);
+
+    #[cfg(target_os = "macos")]
+    fn event_json_at(ev: &str, cwd: &Path, prompt: &str, tool: &str) -> String {
+        let cwd = cwd.to_string_lossy();
+        match ev {
+            "UserPromptSubmit" => format!(
+                r#"{{"hook_event_name":"UserPromptSubmit","session_id":"t5a","prompt":"{prompt}","cwd":"{cwd}"}}"#
+            ),
+            "PreToolUse" => format!(
+                r#"{{"hook_event_name":"PreToolUse","session_id":"t5a","tool_name":"{tool}","tool_input":{{"file_path":"{cwd}/x.txt","content":"x"}},"cwd":"{cwd}"}}"#
+            ),
+            "SessionStart" => format!(
+                r#"{{"hook_event_name":"SessionStart","session_id":"t5a","source":"startup","cwd":"{cwd}"}}"#
+            ),
+            other => format!(r#"{{"hook_event_name":"{other}","session_id":"t5a","cwd":"{cwd}"}}"#),
+        }
+    }
+
+    /// An active grill session below its floor (the gate's job: it blocks).
+    #[cfg(target_os = "macos")]
+    fn recipe_grill_active(home: &Path, ev: &str) -> (PathBuf, Vec<(String, String)>, String) {
+        let marker = home.join("grill-marker.json");
+        std::fs::write(
+            &marker,
+            r#"{"status":"collecting","floor":20,"axes":[],"raw_count":0}"#,
+        )
+        .unwrap();
+        let cwd = home.join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let env = vec![("GRILL_MARKER".to_string(), marker.display().to_string())];
+        let json = event_json_at(ev, &cwd, "hello", "Write");
+        (cwd, env, json)
+    }
+
+    /// A project with a `_round` (reflect-scan.sh's memory verify runs only there).
+    #[cfg(target_os = "macos")]
+    fn recipe_round(home: &Path, ev: &str) -> (PathBuf, Vec<(String, String)>, String) {
+        let cwd = home.join("proj");
+        std::fs::create_dir_all(cwd.join("_round")).unwrap();
+        let json = event_json_at(ev, &cwd, "hello", "Read");
+        (cwd, Vec::new(), json)
+    }
+
+    /// A project with an ordinary working state (inject-context.sh passes it through its gate).
+    #[cfg(target_os = "macos")]
+    fn recipe_state(home: &Path, ev: &str) -> (PathBuf, Vec<(String, String)>, String) {
+        let cwd = home.join("proj");
+        std::fs::create_dir_all(cwd.join("_round")).unwrap();
+        std::fs::write(
+            cwd.join("_round").join("SESSION_STATE.md"),
+            "# 작업기억\n\n- 진행 중: 시험 항목 정리\n- 다음: 결과 기록\n",
+        )
+        .unwrap();
+        let json = event_json_at(ev, &cwd, "hello", "Read");
+        (cwd, Vec::new(), json)
+    }
+
+    /// A seat with an open team-token window and an approving prompt (role-bootstrap.sh runs
+    /// the team-token issuer only then).
+    #[cfg(target_os = "macos")]
+    fn recipe_teamtoken(home: &Path, ev: &str) -> (PathBuf, Vec<(String, String)>, String) {
+        let state = home.join(".cys").join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(state.join("teamtoken-open-t5a-s7"), "{}\n").unwrap();
+        let cwd = home.join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let env = vec![
+            ("CYS_SURFACE_ID".to_string(), "7".to_string()),
+            ("CYS_STATE_DIR".to_string(), state.display().to_string()),
+        ];
+        let json = event_json_at(ev, &cwd, "승인", "Read");
+        (cwd, env, json)
+    }
+
+    /// The recorded inputs of RULINGS AN3: (name, hook, the files it is meant to reach, setup).
+    #[cfg(target_os = "macos")]
+    const RECIPES: &[(&str, &str, &[&str], Setup)] = &[
+        (
+            "grill-active",
+            "hooks/grill-gate.sh",
+            &["bin/grill_gate.py"],
+            recipe_grill_active,
+        ),
+        (
+            "grill-active",
+            "hooks/grill-stop.sh",
+            &["bin/grill_gate.py"],
+            recipe_grill_active,
+        ),
+        (
+            "round",
+            "hooks/reflect-scan.sh",
+            &["bin/javis_memory.py"],
+            recipe_round,
+        ),
+        (
+            "state",
+            "hooks/inject-context.sh",
+            &["hooks/inject_gate.py"],
+            recipe_state,
+        ),
+        (
+            "teamtoken",
+            "hooks/role-bootstrap.sh",
+            &["hooks/teamtoken-issue.sh", "bin/javis_teamtoken.py"],
+            recipe_teamtoken,
+        ),
+    ];
 
     /// The derivation test of D:734 at the level a library test can reach without agent CLIs or
     /// a daemon: every registered hook (the `hook` rows) is run the way the product registers it
@@ -1603,9 +1824,15 @@ mod tests {
     /// that does not exist. Measured:
     ///   (1) healthy: every hook replay succeeds (exit 0, no degradation line — A-1 26);
     ///   (2) break each listed hook file → its replay fails;
-    ///   (3) break each listed non-hook file that a replay actually reads (tripwire) → at
-    ///       least one replay that read it changes (fails, or its deterministic output changes);
-    ///   (4) break EVERY unlisted pack file at once → no replay fails ("still starts");
+    ///   (3) break each listed non-hook file that a replay actually reads (tripwire) → the
+    ///       RESULT of at least one replay that read it changes (exit code or deterministic stdout
+    ///       — what Claude Code receives; RULINGS AN3), the AN3 recipes included;
+    ///   (3b) RULINGS AN3 — the recorded inputs are extended ([`RECIPES`]) so a replay reaches the
+    ///       candidates the launch idioms find (`$(…)` launches, `$(cd … && pwd)/x`, scripts run
+    ///       through a variable): unreachable → listed + stage-5 item; the hook's result changes
+    ///       when it is broken → listed (class 1); the hook completes unchanged → a measured drop;
+    ///   (4) break EVERY unlisted pack file at once → no replay stops (its exit code stays the
+    ///       healthy one), default inputs and recipes ("still starts" — RULINGS AL1);
     ///   (5) W1: no lifeline hook's replay reads a non-lifeline hook's file, so removing a
     ///       non-lifeline registration (that hook simply never runs) leaves them unchanged.
     /// Listed files that no replay reads (start scripts that need a daemon / agent CLI to run,
@@ -1711,87 +1938,111 @@ mod tests {
             }
         };
         let mut counter = 0u32;
-        let mut run = |e: &Entry| -> Run {
-            counter += 1;
-            let home = root.join(format!("home-{counter}"));
-            let tmp = root.join(format!("tmp-{counter}"));
-            std::fs::create_dir_all(&home).unwrap();
-            std::fs::create_dir_all(&tmp).unwrap();
-            let (out_p, err_p) = (
-                root.join(format!("o-{counter}")),
-                root.join(format!("e-{counter}")),
-            );
-            let event = e.check_arg.split(',').next().unwrap_or("SessionStart");
-            let mut child = Command::new("sh")
-                .arg(pack.join(e.rel))
-                .env_clear()
-                .env("PATH", &hermetic_path)
-                .env("HOME", &home)
-                .env("TMPDIR", &tmp)
-                .env("CYS_PACK_DIR", &pack)
-                .env("CYS_SOCKET", root.join("no-daemon.sock"))
-                .env("CYS_NO_AUTOSTART", "1")
-                .env("CYS_NO_OFFICE_BRIDGE", "1")
-                .env("CYS_NO_PERSONAL_HOOK_MERGE", "1")
-                .env("CYS_NO_AUTORESTORE", "1")
-                .env("T5A_TRIP_LOG", &trip_log)
-                .current_dir(&root)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::from(std::fs::File::create(&out_p).unwrap()))
-                .stderr(Stdio::from(std::fs::File::create(&err_p).unwrap()))
-                .process_group(0)
-                .spawn()
-                .expect("spawn sh");
-            {
-                use std::io::Write as _;
-                let mut stdin = child.stdin.take().unwrap();
-                let _ = stdin.write_all(event_json(event).as_bytes());
-            }
-            let deadline = std::time::Instant::now()
-                + std::time::Duration::from_secs(u64::from(clamp_check_timeout(e.timeout_s)));
-            // Wait WITHOUT reaping (WNOWAIT): while the leader is an unreaped zombie its pid — and
-            // so its process-group id — cannot be reused, so the group kill below can only reach
-            // what this hook left behind (no process outlives the test, no pattern kill).
-            let pid = child.id() as libc::pid_t;
-            let exited = || -> bool {
-                let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-                let r = unsafe {
-                    libc::waitid(
-                        libc::P_PID,
-                        pid as libc::id_t,
-                        &mut info,
-                        libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-                    )
+        // one replay: `sh <pack>/<rel>` with the recorded event on stdin — the default input
+        // (cwd = the replay root) or an AN3 recipe (its own cwd, environment and event)
+        let mut run =
+            |rel: &str, event: &str, timeout: Option<u32>, recipe: Option<Setup>| -> Run {
+                counter += 1;
+                let home = root.join(format!("home-{counter}"));
+                let tmp = root.join(format!("tmp-{counter}"));
+                std::fs::create_dir_all(&home).unwrap();
+                std::fs::create_dir_all(&tmp).unwrap();
+                let (out_p, err_p) = (
+                    root.join(format!("o-{counter}")),
+                    root.join(format!("e-{counter}")),
+                );
+                let (cwd, extra, json) = match recipe {
+                    Some(setup) => setup(&home, event),
+                    None => (root.clone(), Vec::new(), event_json(event)),
                 };
-                r == 0 && info.si_pid != 0
-            };
-            let mut timed_out = false;
-            while !exited() {
-                if std::time::Instant::now() >= deadline {
-                    timed_out = true;
-                    break;
+                let mut cmd = Command::new("sh");
+                cmd.arg(pack.join(rel))
+                    .env_clear()
+                    .env("PATH", &hermetic_path)
+                    .env("HOME", &home)
+                    .env("TMPDIR", &tmp)
+                    .env("CYS_PACK_DIR", &pack)
+                    .env("CYS_SOCKET", root.join("no-daemon.sock"))
+                    .env("CYS_NO_AUTOSTART", "1")
+                    .env("CYS_NO_OFFICE_BRIDGE", "1")
+                    .env("CYS_NO_PERSONAL_HOOK_MERGE", "1")
+                    .env("CYS_NO_AUTORESTORE", "1")
+                    .env("T5A_TRIP_LOG", &trip_log);
+                for (k, v) in &extra {
+                    cmd.env(k, v);
                 }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            unsafe {
-                libc::kill(-pid, libc::SIGKILL);
-            }
-            let status = child.wait().ok();
-            let code = if timed_out {
-                None
-            } else {
-                status.and_then(|s| s.code())
+                let mut child = cmd
+                    .current_dir(&cwd)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::from(std::fs::File::create(&out_p).unwrap()))
+                    .stderr(Stdio::from(std::fs::File::create(&err_p).unwrap()))
+                    .process_group(0)
+                    .spawn()
+                    .expect("spawn sh");
+                {
+                    use std::io::Write as _;
+                    let mut stdin = child.stdin.take().unwrap();
+                    let _ = stdin.write_all(json.as_bytes());
+                }
+                let deadline = std::time::Instant::now()
+                    + std::time::Duration::from_secs(u64::from(clamp_check_timeout(timeout)));
+                // Wait WITHOUT reaping (WNOWAIT): while the leader is an unreaped zombie its pid — and
+                // so its process-group id — cannot be reused, so the group kill below can only reach
+                // what this hook left behind (no process outlives the test, no pattern kill).
+                let pid = child.id() as libc::pid_t;
+                let exited = || -> bool {
+                    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                    let r = unsafe {
+                        libc::waitid(
+                            libc::P_PID,
+                            pid as libc::id_t,
+                            &mut info,
+                            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                        )
+                    };
+                    r == 0 && info.si_pid != 0
+                };
+                let mut timed_out = false;
+                while !exited() {
+                    if std::time::Instant::now() >= deadline {
+                        timed_out = true;
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                }
+                let status = child.wait().ok();
+                let code = if timed_out {
+                    None
+                } else {
+                    status.and_then(|s| s.code())
+                };
+                // the run's private HOME / TMPDIR differ per run: they are not part of a result
+                let norm = |t: String| -> String {
+                    t.replace(&home.display().to_string(), "<HOME>")
+                        .replace(&tmp.display().to_string(), "<TMP>")
+                };
+                Run {
+                    code,
+                    stdout: norm(std::fs::read_to_string(&out_p).unwrap_or_default()),
+                    stderr: norm(std::fs::read_to_string(&err_p).unwrap_or_default()),
+                }
             };
-            Run {
-                code,
-                stdout: std::fs::read_to_string(&out_p).unwrap_or_default(),
-                stderr: std::fs::read_to_string(&err_p).unwrap_or_default(),
-            }
+        let first_event = |e: &Entry| -> String {
+            e.check_arg
+                .split(',')
+                .next()
+                .unwrap_or("SessionStart")
+                .to_string()
         };
 
         let hooks: Vec<&Entry> = entries().iter().filter(|e| e.category == C::Hook).collect();
         let hook_rels: BTreeSet<&str> = hooks.iter().map(|e| e.rel).collect();
+        let hook_of = |rel: &str| -> &Entry { *hooks.iter().find(|h| h.rel == rel).unwrap() };
         let listed: BTreeSet<&str> = entries().iter().map(|e| e.rel).collect();
+        let dropped: BTreeSet<&str> = derive::DROPPED_CANDIDATES.iter().map(|(r, _)| *r).collect();
         let deps: Vec<&str> = entries()
             .iter()
             .filter(|e| e.category != C::Protection && !hook_rels.contains(e.rel))
@@ -1803,8 +2054,8 @@ mod tests {
         // (1) healthy, twice (the second run tells whether stdout is deterministic)
         let mut healthy: BTreeMap<&str, (Run, bool)> = BTreeMap::new();
         for h in &hooks {
-            let a = run(h);
-            let b = run(h);
+            let a = run(h.rel, &first_event(h), h.timeout_s, None);
+            let b = run(h.rel, &first_event(h), h.timeout_s, None);
             if a.failed() || b.failed() {
                 problems.push(format!("(1) healthy replay of {} failed: {a:?}", h.rel));
             }
@@ -1815,9 +2066,29 @@ mod tests {
             ));
             healthy.insert(h.rel, (a, det));
         }
+        // the AN3 recipes, healthy twice
+        let mut recipe_healthy: Vec<(Run, bool)> = Vec::new();
+        for (name, hook, _reach, setup) in RECIPES {
+            let h = hook_of(hook);
+            let a = run(hook, &first_event(h), h.timeout_s, Some(*setup));
+            let b = run(hook, &first_event(h), h.timeout_s, Some(*setup));
+            let det = a.stdout == b.stdout;
+            matrix.push(format!(
+                "healthy recipe {name} {hook} exit={:?} deterministic_stdout={det} stdout_bytes={}",
+                a.code,
+                a.stdout.len()
+            ));
+            recipe_healthy.push((a, det));
+        }
 
-        // tripwires: which listed files each replay reads
-        for rel in listed.iter().copied() {
+        // tripwires: which listed files and candidates each replay reads
+        let tripped: Vec<&str> = listed
+            .iter()
+            .copied()
+            .chain(dropped.iter().copied())
+            .chain(["bin/javis_teamtoken.py"])
+            .collect();
+        for rel in &tripped {
             if let Some(t) = tripwired(rel) {
                 put(rel, &t);
             }
@@ -1825,7 +2096,7 @@ mod tests {
         let mut reads: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
         for h in &hooks {
             let _ = std::fs::remove_file(&trip_log);
-            let r = run(h);
+            let r = run(h.rel, &first_event(h), h.timeout_s, None);
             if r.failed() {
                 problems.push(format!("tripwire replay of {} failed: {r:?}", h.rel));
             }
@@ -1838,14 +2109,28 @@ mod tests {
             matrix.push(format!("reads {} -> {used:?}", h.rel));
             reads.insert(h.rel, used);
         }
-        for rel in listed.iter().copied() {
+        let mut recipe_reads: Vec<BTreeSet<String>> = Vec::new();
+        for (name, hook, _reach, setup) in RECIPES {
+            let h = hook_of(hook);
+            let _ = std::fs::remove_file(&trip_log);
+            let _ = run(hook, &first_event(h), h.timeout_s, Some(*setup));
+            let used: BTreeSet<String> = std::fs::read_to_string(&trip_log)
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| l != hook)
+                .map(str::to_string)
+                .collect();
+            matrix.push(format!("reads recipe {name} {hook} -> {used:?}"));
+            recipe_reads.push(used);
+        }
+        for rel in &tripped {
             put(rel, &original(rel));
         }
 
         // (2) break each listed hook file → its replay fails
         for h in &hooks {
             put(h.rel, broken(h.rel));
-            let r = run(h);
+            let r = run(h.rel, &first_event(h), h.timeout_s, None);
             if !r.failed() {
                 problems.push(format!(
                     "(2) {} broken but its replay still succeeded: {r:?}",
@@ -1855,36 +2140,105 @@ mod tests {
             put(h.rel, &original(h.rel));
         }
 
-        // (3) break each listed non-hook file that a replay reads → at least one start step
-        //     (a replay that read it) changes; readers whose recorded input does not reach the
-        //     broken path are recorded, not failed (e.g. a counter hook on a tool it ignores)
+        // (3) break each listed non-hook file that a replay reads → the RESULT of at least one
+        //     replay that read it changes (exit code or deterministic stdout — RULINGS AN3);
+        //     readers whose recorded input does not reach the broken path are recorded, not failed
         for d in &deps {
             let readers: Vec<&&Entry> =
                 hooks.iter().filter(|h| reads[h.rel].contains(*d)).collect();
-            if readers.is_empty() {
+            let recipe_readers: Vec<usize> = (0..RECIPES.len())
+                .filter(|i| recipe_reads[*i].contains(*d))
+                .collect();
+            if readers.is_empty() && recipe_readers.is_empty() {
                 matrix.push(format!(
                     "not exercised here: {d} (proof anchor / stage-5 E2E)"
                 ));
                 continue;
             }
+            // a start / config row read by a hook replay is proven at ITS level (bootstrap replay or
+            // real-level, RULINGS AL1) — recorded here, asserted only for class-1 rows
+            let class1 =
+                entries().iter().find(|e| e.rel == *d).and_then(proof) == Some("hook-replay");
             put(d, broken(d));
             let mut changed_any = false;
             for h in readers {
-                let r = run(h);
+                let r = run(h.rel, &first_event(h), h.timeout_s, None);
                 let (base, det) = &healthy[h.rel];
-                let changed = r.failed() || (*det && r.stdout != base.stdout);
+                let changed = r.result_changed(base, *det);
                 changed_any |= changed;
-                matrix.push(format!("break {d} -> {} changed={changed}", h.rel));
+                matrix.push(format!(
+                    "break {d} -> {} changed={changed} (exit {:?}->{:?})",
+                    h.rel, base.code, r.code
+                ));
             }
-            if !changed_any {
+            for i in recipe_readers {
+                let (name, hook, _reach, setup) = RECIPES[i];
+                let r = run(
+                    hook,
+                    &first_event(hook_of(hook)),
+                    hook_of(hook).timeout_s,
+                    Some(setup),
+                );
+                let (base, det) = &recipe_healthy[i];
+                let changed = r.result_changed(base, *det);
+                changed_any |= changed;
+                matrix.push(format!(
+                    "break {d} -> recipe {name} {hook} changed={changed} (exit {:?}->{:?})",
+                    base.code, r.code
+                ));
+            }
+            if !changed_any && class1 {
                 problems.push(format!(
-                    "(3) {d} broken but no start step that reads it changed"
+                    "(3) {d} broken but no start step that reads it changed its result"
+                ));
+            } else if !changed_any {
+                matrix.push(format!(
+                    "  {d}: read by a hook replay, proven at its own level (not class 1)"
                 ));
             }
             put(d, &original(d));
         }
 
-        // (4) break every unlisted file at once → no replay fails
+        // (3b) RULINGS AN3 — every candidate a recipe is meant to reach: unreachable → it must be
+        //      listed (a stage-5 item); its hook's result changes when it is broken → it must be
+        //      listed (class 1); the hook completes unchanged → a measured drop
+        for (i, (name, hook, reach, setup)) in RECIPES.iter().enumerate() {
+            for c in reach.iter() {
+                if listed.contains(c) {
+                    continue; // listed rows are measured by (3)
+                }
+                if !recipe_reads[i].contains(*c) {
+                    matrix.push(format!("AN3 {c} via recipe {name} {hook}: NOT REACHED"));
+                    problems.push(format!(
+                        "(3b) recipe {name} does not reach {c} — extend the input or list it as a stage-5 item (RULINGS AN3)"
+                    ));
+                    continue;
+                }
+                put(c, broken(c));
+                let h = hook_of(hook);
+                let r = run(hook, &first_event(h), h.timeout_s, Some(*setup));
+                put(c, &original(c));
+                let (base, det) = &recipe_healthy[i];
+                let changed = r.result_changed(base, *det);
+                matrix.push(format!(
+                    "AN3 break {c} -> recipe {name} {hook} result_changed={changed} (exit {:?}->{:?}, stdout same={}, child error on stderr={})",
+                    base.code,
+                    r.code,
+                    r.stdout == base.stdout,
+                    r.stderr.contains("rror")
+                ));
+                if changed {
+                    problems.push(format!(
+                        "(3b) {c} broken changes the result of {hook} (recipe {name}) — it must be listed (class 1, RULINGS AN3)"
+                    ));
+                }
+            }
+        }
+
+        // (4) break every unlisted file at once → no replay STOPS: its exit code stays the healthy
+        //     one and it is not killed at the deadline ("the start survives" — RULINGS AL1), default
+        //     inputs and the AN3 recipes; a changed stdout (e.g. the injected text of a data file) is
+        //     recorded, not failed
         let unlisted: Vec<&str> = crate::pack::PACK_ALL
             .iter()
             .map(|(r, _)| *r)
@@ -1894,11 +2248,32 @@ mod tests {
             put(rel, broken(rel));
         }
         for h in &hooks {
-            let r = run(h);
-            if r.failed() {
+            let r = run(h.rel, &first_event(h), h.timeout_s, None);
+            let (base, det) = &healthy[h.rel];
+            if r.code != base.code {
                 problems.push(format!(
-                    "(4) unlisted files broken and the replay of {} failed: {r:?}",
+                    "(4) unlisted files broken and the replay of {} stopped: {r:?}",
                     h.rel
+                ));
+            } else if *det && r.stdout != base.stdout {
+                matrix.push(format!(
+                    "(4) {}: completes (exit {:?}); its stdout differs (injected data text)",
+                    h.rel, r.code
+                ));
+            }
+        }
+        for (i, (name, hook, _reach, setup)) in RECIPES.iter().enumerate() {
+            let h = hook_of(hook);
+            let r = run(hook, &first_event(h), h.timeout_s, Some(*setup));
+            let (base, det) = &recipe_healthy[i];
+            if r.code != base.code {
+                problems.push(format!(
+                    "(4) unlisted files broken and the replay of recipe {name} {hook} stopped: {r:?}"
+                ));
+            } else if *det && r.stdout != base.stdout {
+                matrix.push(format!(
+                    "(4) recipe {name} {hook}: completes (exit {:?}); its stdout differs",
+                    r.code
                 ));
             }
         }
@@ -2184,6 +2559,79 @@ mod tests {
             .map(|(r, _)| r)
             .collect();
         assert_eq!(got, vec!["bin/heredoc_mod.py", "bin/launched.py"]);
+
+        // RULINGS AN3 — the pack's launch idioms
+        let rels: BTreeSet<&str> = [
+            "bin/memory.py",
+            "bin/pathy.py",
+            "bin/loop_a.sh",
+            "bin/joined.sh",
+            "hooks/gate.py",
+            "hooks/issue.sh",
+            "hooks/sib.sh",
+            "hooks/hk.sh",
+            "hooks/README.md",
+            "hooks/never.sh",
+        ]
+        .into_iter()
+        .collect();
+        let sh = concat!(
+            "#!/bin/bash\n",
+            // a launch whose path is wrapped in `$(…)` (reflect-scan.sh:57)
+            "if ! \"$CYS_PY\" \"$(cys_native_path \"$PACK/bin/memory.py\")\" verify >/dev/null 2>&1; then\n",
+            "  :\n",
+            "fi\n",
+            // a path built as `$(cd … && pwd)/x` (inject-context.sh:272)
+            "GATE=\"$(cd \"$_C03_HOOK_DIR\" 2>/dev/null && pwd)/gate.py\"\n",
+            // a script found by a loop over directories, run through a variable (role-bootstrap.sh:214-226)
+            "for _d in \"$(dirname \"$0\")\" \"${CYS_PACK_DIR:-$HOME/.cys/pack}/hooks\"; do\n",
+            "  if [ -f \"$_d/issue.sh\" ]; then\n",
+            "    _TTH=\"$_d/issue.sh\"\n",
+            "  fi\n",
+            "done\n",
+            "sh \"$_TTH\" \"$IN\" </dev/null >/dev/null\n",
+            // `sh "$DIR/x.sh"` with a directory variable
+            "sh \"$HOOK_DIR/sib.sh\" \"$IN\"\n",
+            // file names a `for` loop walks
+            "for t in loop_a.sh; do :; done\n",
+            // a launch INSIDE `$(…)`
+            "out=\"$(python3 \"$PACK/bin/pathy.py\" --q)\"\n",
+            // never: a message that mentions a launch
+            "echo \"run: sh $HOOK_DIR/never.sh\"\n",
+        );
+        let got: Vec<String> = derive::bindings("hooks/h2.sh", sh, &rels)
+            .into_iter()
+            .map(|(r, _)| r)
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                "bin/loop_a.sh",
+                "bin/memory.py",
+                "bin/pathy.py",
+                "hooks/gate.py",
+                "hooks/issue.sh",
+                "hooks/sib.sh"
+            ]
+        );
+        let py = concat!(
+            "import os\n",
+            "a = os.path.join(PACK, \"hooks\", \"hk.sh\")\n",
+            "b = os.path.join(HOOKS_DIR, \"sib.sh\")\n",
+            "c = PACK / \"bin\" / \"joined.sh\"\n",
+            "d = os.path.join(pk, \"hooks\", \"README.md\")\n",
+        );
+        let got: Vec<String> = derive::bindings("bin/tool.py", py, &rels)
+            .into_iter()
+            .map(|(r, _)| r)
+            .collect();
+        assert_eq!(got, vec!["bin/joined.sh", "hooks/hk.sh", "hooks/sib.sh"]);
+        // the structural rule (class 1 rows) is unchanged by the idioms: only the source line
+        let got: Vec<String> = derive::hook_bindings("hooks/h2.sh", sh, &rels)
+            .into_iter()
+            .map(|(r, _)| r)
+            .collect();
+        assert!(got.is_empty(), "{got:?}");
     }
 
     /// RULINGS AI8: a registrar named in a docstring or a comment is not a call site.

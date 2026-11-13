@@ -3219,8 +3219,8 @@ def _bc_text(seat, rel, lane_pack):
                 % lane_pack)
     if seat.startswith("worker"):
         what = (" 살아 있는 기동 필수 파일은 직접 고치지 않는다: `cys repair begin --files %s --trigger "
-                "owner-order|grant|update`(주인의 지시 · 자동 수리 권한 · 업데이트 충돌 중 해당하는 것)로 "
-                "수리를 열고, begin 이 알려 주는 작업 사본을 고친 뒤 예행 · 리뷰어1 검증 · 리뷰어2 감사 "
+                "<계기>`(계기는 `owner-order` · `grant` · `update` 중 하나 — 주인의 지시 · 자동 수리 권한 · "
+                "업데이트 충돌 중 해당하는 것)로 수리를 열고, begin 이 알려 주는 작업 사본을 고친 뒤 예행 · 리뷰어1 검증 · 리뷰어2 감사 "
                 "서명을 받아 `cys repair submit <R-번호>` 로 제출하라. 주인의 수정 최종 승인 뒤 데몬이 "
                 "적용한다." % rel)
     elif seat.startswith(("master", "ceo")):
@@ -4989,9 +4989,14 @@ def _self_test_boot_critical(fails, shutil):
         if "hooks/inject-context.sh" not in texts[role] or "기동 필수" not in texts[role]:
             fails.append("BC: %s 거부 문면에 파일·기동 필수가 없다: %r" % (role, texts[role]))
     for role in ("worker", "worker-2"):
-        for need in ("cys repair begin --files hooks/inject-context.sh", "--trigger", "cys repair submit"):
+        for need in ("cys repair begin --files hooks/inject-context.sh", "--trigger <계기>",
+                     "`owner-order` · `grant` · `update`", "cys repair submit"):
             if need not in texts[role]:
-                fails.append("BC: %s 문면에 %r 가 없다(AI5)" % (role, need))
+                fails.append("BC: %s 문면에 %r 가 없다(AI5 · AM2)" % (role, need))
+        # RULINGS AM2/AN6: no shell pipe inside a line the agent can run verbatim (a backtick span)
+        for span in texts[role].split("`")[1::2]:
+            if "|" in span:
+                fails.append("BC: %s 문면의 실행 가능한 줄에 `|` 가 있다(AM2): %r" % (role, span))
     for role in ("master", "ceo"):
         if "티켓" not in texts[role] or "cys repair submit" in texts[role]:
             fails.append("BC: %s 문면이 워커 티켓을 가리키지 않는다(AI5): %r" % (role, texts[role]))

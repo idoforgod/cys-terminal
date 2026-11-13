@@ -159,6 +159,10 @@ class GateWithStub(_Env):
                 if role == "worker":     # RULINGS AI5 — the worker opens the repair and submits it
                     self.assertIn("cys repair begin --files %s" % REL, reason)
                     self.assertIn("cys repair submit", reason)
+                    # RULINGS AM2 / AN6 — `--trigger <계기>` + the three values in words, no `|` to run
+                    self.assertIn("--trigger <계기>", reason)
+                    self.assertIn("`owner-order` · `grant` · `update`", reason)
+                    self.assertNotIn("owner-order|grant|update", reason)
                 else:                    # master / CEO: a ticket to a worker of the lane, never begin/submit
                     self.assertIn("티켓", reason)
                     self.assertNotIn("cys repair submit", reason)

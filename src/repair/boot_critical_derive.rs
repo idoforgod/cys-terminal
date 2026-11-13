@@ -99,6 +99,48 @@ pub const PROOF_ANCHORS: &[ProofAnchor] = &[
         why: "start: boot step 5 runs `orchestra check`; broken → EXIT_CHECK, no completion marker (bootstrap replay)",
         level: "bootstrap-replay",
     },
+    // ── class 2 by break mode (ii) (RULINGS AN2): the start path obeys the file's ANSWER as a
+    //    stop — the file giving that answer stops the boot at the bootstrap layer (measured) ──
+    ProofAnchor {
+        proof: "cysjavis-pack/bin/javis_bootstrap.py",
+        literal: "gate = os.path.join(PACK, \"bin\", \"javis_resource_gate.py\")",
+        rel: "bin/javis_resource_gate.py",
+        category: "start-dep",
+        check: "py-compile",
+        check_arg: "",
+        why: "start: with a team deficit the boot obeys its hard answer (exit 2) → EXIT_RESOURCE_HARD 9, no team (bootstrap 3176-3233 · 3893; formation 505-523 likewise); mode (ii) stops the boot (bootstrap replay)",
+        level: "bootstrap-replay",
+    },
+    ProofAnchor {
+        proof: "cysjavis-pack/bin/javis_bootstrap.py",
+        literal: "    import javis_lock as _lock",
+        rel: "bin/javis_lock.py",
+        category: "start-dep",
+        check: "py-compile",
+        check_arg: "",
+        why: "start: the boot's single-flight lock — its BUSY answer folds the run into the exit-11 loser, no team (bootstrap 1526-1548 · 1447); mode (ii) stops the boot (bootstrap replay)",
+        level: "bootstrap-replay",
+    },
+    ProofAnchor {
+        proof: "cysjavis-pack/bin/javis_bootstrap.py",
+        literal: "    import javis_lane as _lane_mod",
+        rel: "bin/javis_lane.py",
+        category: "start-dep",
+        check: "py-compile",
+        check_arg: "",
+        why: "start: the lane rules — a malformed-lane answer, or a department other than the pack's, is the exit-8 lane guard (bootstrap 3511-3539); mode (ii) stops the boot (bootstrap replay)",
+        level: "bootstrap-replay",
+    },
+    ProofAnchor {
+        proof: "cysjavis-pack/bin/javis_bootstrap.py",
+        literal: "    import javis_budget as _budget_mod",
+        rel: "bin/javis_budget.py",
+        category: "start-dep",
+        check: "py-compile",
+        check_arg: "",
+        why: "start: the time limits of every boot wait — a zero limit is obeyed (ping 0 s → EXIT_PING; bootstrap 235-267 · 3621-3646; orchestra check 361-383); mode (ii) stops the boot (bootstrap replay)",
+        level: "bootstrap-replay",
+    },
     // ── class 3 (RULINGS AL1): named by the design / start-critical on a real machine ──
     ProofAnchor {
         proof: "cysjavis-pack/bin/javis_bootstrap.py",
@@ -148,6 +190,16 @@ pub const PROOF_ANCHORS: &[ProofAnchor] = &[
         check: "py-compile",
         check_arg: "",
         why: "start: the standing formation attaches every department seat (cys-dept launch → formation → boot_node) (RULINGS AL1)",
+        level: "real-level",
+    },
+    ProofAnchor {
+        proof: "cysjavis-pack/bin/javis_formation.py",
+        literal: "        import javis_cli_probe",
+        rel: "bin/javis_cli_probe.py",
+        category: "start-dep",
+        check: "py-compile",
+        check_arg: "",
+        why: "start: formation decides the installed CLIs with it — all 'absent' is pending-cli (no seat), a syntax error escapes `except ImportError` and ends ensure (formation 488-496 · 1670-1678); a stop branch only the seat-attach level reaches (RULINGS AN2)",
         level: "real-level",
     },
     // ── the sibling protection list (C4 4.10 · RULINGS AI6) ──
@@ -235,50 +287,61 @@ pub const KNOWN_SETTINGS_WRITERS: &[&str] = &[
     "bin/javis_guard_register.py",
 ];
 
-/// RULINGS AL1/AL3 — the candidates the extended closure finds that are NOT boot-critical, each
-/// with the measurement that dropped it (`test_boot_critical_start_replay`, bootstrap layer,
-/// 2026-11-13): the start survives their breakage.
+/// RULINGS AN3 — files a registered hook reaches only through a launch idiom (not the structural
+/// rule) whose breakage CHANGES the hook's result in the hook replay (`isolated_home_start_replay`
+/// (3) with the recipe named here), or that the replay cannot reach (a stage-5 item): listed as
+/// class 1 (`hook-replay`). (rel, hook, measurement)
+pub const MEASURED_HOOK_DEPS: &[(&str, &str, &str)] = &[
+    (
+        "bin/javis_teamtoken.py",
+        "hooks/role-bootstrap.sh",
+        "role-bootstrap.sh runs hooks/teamtoken-issue.sh, which runs it, when a seat's team-token window is open; broken -> the hook's stdout gains the 'cannot judge the approval' notice (hook replay, recipe teamtoken)",
+    ),
+    (
+        "bin/javis_state_snapshot.py",
+        "hooks/role-bootstrap.sh",
+        "javis_teamtoken.py imports it on Windows only (feed_jsonl_path); the macOS hook replay cannot reach it -> listed as a stage-5 item (RULINGS AN3)",
+    ),
+];
+
+/// RULINGS AL1/AL3/AN2/AN6 — the candidates the census finds one step from a LISTED file that are NOT
+/// boot-critical, each with BOTH break modes measured or read: (i) the file cannot run
+/// (`test_boot_critical_start_replay` — bootstrap layer, normal and team-deficit scenes, registered
+/// hooks checked; the hook replay for the hook-layer candidates of AN3) and (ii) the stop branches
+/// of the start path (`javis_bootstrap.py`, `javis_orchestra.py check`, `javis_boot_node.py`,
+/// `javis_formation.py`, `cys-dept`) — none obeys this file's answer as a stop. Stated limit (not
+/// measured): a file that hangs.
 pub const DROPPED_CANDIDATES: &[(&str, &str)] = &[
-    ("bin/javis_actprobe.py", "never read by the boot; broken -> the boot completes (a preflight check or a tool of one, not reached at start)"),
-    ("bin/javis_backup.py", "never read by the boot; imported only by javis_phoenix.py (itself dropped)"),
-    ("bin/javis_brief_lint.py", "never read by the boot; broken -> the boot completes (a preflight check or a tool of one, not reached at start)"),
-    ("bin/javis_budget.py", "read by the boot; broken alone -> the boot completes (an optional import of the boot script / orchestra / boot_node with a fallback)"),
-    ("bin/javis_channels.py", "read by the boot; broken alone -> the boot completes (an optional import of the boot script / orchestra / boot_node with a fallback)"),
-    ("bin/javis_cleanroom.py", "read by the boot; broken alone -> the boot completes (a preflight check or its tool; a failing check is reported, not fatal)"),
-    ("bin/javis_cli_probe.py", "never read by the boot; formation's optional import (try/except, explicit fallback)"),
-    ("bin/javis_completion_guard.py", "read by the boot; broken alone -> the boot completes (a preflight check or its tool; a failing check is reported, not fatal)"),
-    ("bin/javis_cycle_autopilot.py", "read by the boot; broken alone -> the boot completes (a preflight check or its tool; a failing check is reported, not fatal)"),
-    ("bin/javis_cycle_verifier.py", "never read by the boot; broken -> the boot completes (a preflight check or a tool of one, not reached at start)"),
-    ("bin/javis_dept_schedule.py", "never read by the boot; cys-dept runs it when a department is CREATED, not at start"),
-    ("bin/javis_event.py", "never read by the boot; broken -> the boot completes (a preflight check or a tool of one, not reached at start)"),
-    ("bin/javis_factcheck_gate.py", "never read by the boot; broken -> the boot completes (a preflight check or a tool of one, not reached at start)"),
-    ("bin/javis_guard_register.py", "never read by the boot; broken -> the boot completes (a preflight check or a tool of one, not reached at start)"),
-    ("bin/javis_lane.py", "read by the boot; broken alone -> the boot completes (an optional import of the boot script / orchestra / boot_node with a fallback)"),
-    ("bin/javis_lock.py", "read by the boot; broken alone -> the boot completes (a preflight check or its tool; a failing check is reported, not fatal)"),
-    ("bin/javis_manifest.py", "read by the boot; broken alone -> the boot completes (a preflight check or its tool; a failing check is reported, not fatal)"),
-    ("bin/javis_mcpgate.py", "read by the boot; broken alone -> the boot completes (a preflight check or its tool; a failing check is reported, not fatal)"),
-    ("bin/javis_phoenix.py", "never read by the boot; cys-dept calls it best-effort (`|| true`, tombstones) and the daemon restores from the EMBEDDED copy first"),
-    ("bin/javis_radio.py", "read by the boot; broken alone -> the boot completes (a preflight check or its tool; a failing check is reported, not fatal)"),
-    ("bin/javis_reflect.py", "never read by the boot; broken -> the boot completes (a preflight check or a tool of one, not reached at start)"),
-    ("bin/javis_registry.py", "read by the boot; broken alone -> the boot completes (a preflight check or its tool; a failing check is reported, not fatal)"),
-    ("bin/javis_report.py", "never read by the boot; broken -> the boot completes (a preflight check or a tool of one, not reached at start)"),
-    ("bin/javis_resource_gate.py", "read by the boot; broken alone -> the boot completes (a preflight check or its tool; a failing check is reported, not fatal)"),
-    ("bin/javis_role.py", "never read by the boot; broken -> the boot completes (a preflight check or a tool of one, not reached at start)"),
-    ("bin/javis_route.py", "read by the boot; broken alone -> the boot completes (a preflight check or its tool; a failing check is reported, not fatal)"),
-    ("bin/javis_runtime_seal.py", "read by the boot; broken alone -> the boot completes (a preflight check or its tool; a failing check is reported, not fatal)"),
-    ("bin/javis_scrub.py", "read by the boot; broken alone -> the boot completes (a preflight check or its tool; a failing check is reported, not fatal)"),
-    ("bin/javis_semver.py", "read by the boot; broken alone -> the boot completes (a preflight check or its tool; a failing check is reported, not fatal)"),
-    ("bin/javis_serena_probe.py", "never read by the boot; broken -> the boot completes (a preflight check or a tool of one, not reached at start)"),
-    ("bin/javis_skillscan.py", "read by the boot; broken alone -> the boot completes (a preflight check or its tool; a failing check is reported, not fatal)"),
-    ("bin/javis_spool_path.py", "never read by the boot; broken -> the boot completes (a preflight check or a tool of one, not reached at start)"),
-    ("bin/javis_state_ledger.py", "never read by the boot; broken -> the boot completes (a preflight check or a tool of one, not reached at start)"),
-    ("bin/javis_state_snapshot.py", "never read by the boot; broken -> the boot completes (a preflight check or a tool of one, not reached at start)"),
-    ("bin/javis_task.py", "never read by the boot; broken -> the boot completes (a preflight check or a tool of one, not reached at start)"),
-    ("bin/javis_todo_decl.py", "read by the boot; broken alone -> the boot completes (a preflight check or its tool; a failing check is reported, not fatal)"),
-    ("bin/javis_verdict.py", "read by the boot; broken alone -> the boot completes (an optional import of the boot script / orchestra / boot_node with a fallback)"),
-    ("bin/javis_waiver.py", "never read by the boot; broken -> the boot completes (a preflight check or a tool of one, not reached at start)"),
-    ("bin/javis_wakeup.py", "read by the boot; broken alone -> the boot completes (a preflight check or its tool; a failing check is reported, not fatal)"),
-    ("bin/skillscan_rules.json", "read by the boot; broken alone -> the boot completes (a preflight check or its tool; a failing check is reported, not fatal)"),
+    ("bin/javis_brief_lint.py", "(i) never read by the boot (tripwire, both scenes); broken with every unlisted file -> the boot completes · (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597) (C74 checks it exists)"),
+    ("bin/javis_channels.py", "(i) read by the boot; broken alone -> the boot completes and the hooks are registered (bootstrap replay, both scenes) (orchestra's optional import with a fallback) · (ii) no stop branch: `orchestra check` does not consult it (only `channel-health`, orchestra 4858)"),
+    ("bin/javis_cleanroom.py", "(i) read by the boot; broken alone -> the boot completes and the hooks are registered (bootstrap replay, both scenes) (a preflight check's tool) · (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597)"),
+    ("bin/javis_completion_guard.py", "(i) read by the boot; broken alone -> the boot completes and the hooks are registered (bootstrap replay, both scenes) (a preflight check's tool) · (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597)"),
+    ("bin/javis_cycle_autopilot.py", "(i) read by the boot; broken alone -> the boot completes and the hooks are registered (bootstrap replay, both scenes) (a preflight check's tool) · (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597)"),
+    ("bin/javis_dept_schedule.py", "(i) never read by the boot (tripwire, both scenes); broken with every unlisted file -> the boot completes; cys-dept runs it when a department is CREATED · (ii) no stop branch at start: cys-dept consults it only at department creation (cys-dept 1194)"),
+    ("bin/javis_event.py", "(i) never read by the boot (tripwire, both scenes); broken with every unlisted file -> the boot completes · (ii) no stop branch: formation emits events best-effort and ignores the answer (formation 1033-1043)"),
+    ("bin/javis_guard_register.py", "(i) never read by the boot (tripwire, both scenes); broken with every unlisted file -> the boot completes · (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597) (the manual guard.sh registrar)"),
+    ("bin/javis_manifest.py", "(i) read by the boot; broken alone -> the boot completes and the hooks are registered (bootstrap replay, both scenes) (a preflight check's tool) · (ii) no stop branch: `orchestra check` does not consult it (ticket phases only, orchestra 1736)"),
+    ("bin/javis_mcpgate.py", "(i) read by the boot; broken alone -> the boot completes and the hooks are registered (bootstrap replay, both scenes) (a preflight check's tool) · (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597)"),
+    ("bin/javis_memory.py", "(i) never read by the boot (tripwire, both scenes); broken with every unlisted file -> the boot completes; hook layer: reflect-scan.sh (Stop, a `_round` in the cwd) runs `verify` -> broken, the hook completes unchanged (exit 0, same stdout; hook replay AN3) · (ii) no stop branch: a failed verify is one warning line in `.state_log` (reflect-scan.sh 55-60)"),
+    ("bin/javis_phoenix.py", "(i) never read by the boot (tripwire, both scenes); broken with every unlisted file -> the boot completes; cys-dept calls it best-effort (`|| true`) and the daemon restores from its EMBEDDED copy first · (ii) no stop branch: cys-dept ignores its answer (cys-dept 109-134)"),
+    ("bin/javis_radio.py", "(i) read by the boot; broken alone -> the boot completes and the hooks are registered (bootstrap replay, both scenes) (a preflight check's tool) · (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597)"),
+    ("bin/javis_reflect.py", "(i) never read by the boot (tripwire, both scenes); broken with every unlisted file -> the boot completes; reflect-scan.sh runs it with its output discarded · (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597); reflect-scan.sh discards its answer (reflect-scan.sh 50-53)"),
+    ("bin/javis_registry.py", "(i) read by the boot; broken alone -> the boot completes and the hooks are registered (bootstrap replay, both scenes) (a preflight check's tool) · (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597)"),
+    ("bin/javis_report.py", "(i) never read by the boot (tripwire, both scenes); broken with every unlisted file -> the boot completes · (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597)"),
+    ("bin/javis_role.py", "(i) never read by the boot (tripwire, both scenes); broken with every unlisted file -> the boot completes (imported by javis_snapshot.py inside a guard) · (ii) no stop branch: none of the five start files consults it"),
+    ("bin/javis_route.py", "(i) read by the boot; broken alone -> the boot completes and the hooks are registered (bootstrap replay, both scenes) (a preflight check's tool; grill_gate.py `begin` only) · (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597); grill_gate.py consults it only in `begin`, never at start"),
+    ("bin/javis_runtime_seal.py", "(i) read by the boot; broken alone -> the boot completes and the hooks are registered (bootstrap replay, both scenes) (a preflight check's tool) · (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597)"),
+    ("bin/javis_scrub.py", "(i) read by the boot; broken alone -> the boot completes and the hooks are registered (bootstrap replay, both scenes) (a preflight check's tool; javis_snapshot.py's guarded import) · (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597)"),
+    ("bin/javis_semver.py", "(i) read by the boot; broken alone -> the boot completes and the hooks are registered (bootstrap replay, both scenes) (a preflight check's tool) · (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597)"),
+    ("bin/javis_serena_probe.py", "(i) never read by the boot (tripwire, both scenes); broken with every unlisted file -> the boot completes · (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597)"),
+    ("bin/javis_skillscan.py", "(i) read by the boot; broken alone -> the boot completes and the hooks are registered (bootstrap replay, both scenes) (a preflight check's tool) · (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597)"),
+    ("bin/javis_task.py", "(i) never read by the boot (tripwire, both scenes); broken with every unlisted file -> the boot completes · (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597)"),
+    ("bin/javis_todo_decl.py", "(i) read by the boot; broken alone -> the boot completes and the hooks are registered (bootstrap replay, both scenes) (orchestra's import for ticket prompts) · (ii) no stop branch: `orchestra check` does not consult it (task-prompt only, orchestra 1768)"),
+    ("bin/javis_verdict.py", "(i) read by the boot; broken alone -> the boot completes and the hooks are registered (bootstrap replay, both scenes) (orchestra's optional import with a fallback) · (ii) no stop branch: `orchestra check` does not consult it (review commands only)"),
+    ("bin/javis_wakeup.py", "(i) read by the boot; broken alone -> the boot completes and the hooks are registered (bootstrap replay, both scenes) (a preflight check's tool) · (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597)"),
+    ("hooks/brief-lint-warn.sh", "(i) never read by the boot (tripwire, both scenes); broken with every unlisted file -> the boot completes; not a hook the product registers (C74 only checks it exists; an owner registers it by hand) · (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597)"),
+    ("hooks/inject_gate.py", "(i) never read by the boot (tripwire, both scenes); broken with every unlisted file -> the boot completes; hook layer: inject-context.sh with a SESSION_STATE reaches it -> broken, the hook completes unchanged (exit 0, same stdout; the hook passes the original text through by design, inject-context.sh 266-282; hook replay AN3) · (ii) no stop branch: its answer is the filtered text; a failing gate falls back to `cat` (inject-context.sh 274-279)"),
+    ("hooks/teamtoken-issue.sh", "(i) never read by the boot (tripwire, both scenes); broken with every unlisted file -> the boot completes; hook layer: role-bootstrap.sh with a seat and an open team-token window reaches it -> broken, the hook completes unchanged (exit 0, same stdout; hook replay AN3) · (ii) no stop branch: role-bootstrap.sh ignores its exit and only relays its note (role-bootstrap.sh 213-235)"),
 ];
 
 const CATEGORY_ORDER: &[&str] = &[
@@ -1306,12 +1369,17 @@ fn string_literals(args: &str) -> Vec<String> {
     out
 }
 
-/// Files a pack file binds (rule 2 — RULINGS AI1): `(rel, how)`.
+/// Files a pack file binds (rule 2 — RULINGS AI1 · AN3): `(rel, how)`.
 /// - Python: imports WHEREVER written (also inside `try:` and function bodies), `import_module("x")`
-///   / `__import__("x")`, and every sibling `bin/` tool it LAUNCHES or opens by path
-///   (`os.path.join(<…>, "bin", "<x>")` — the last literal is a `bin/` file name).
+///   / `__import__("x")`, and every sibling tool it LAUNCHES or opens by path:
+///   `os.path.join(<…>, "bin", "<x>")`, `os.path.join(<…>, "hooks", "<x>")`, a join whose
+///   directory is a variable (the name is looked up beside the file, in `bin/` and in `hooks/`),
+///   and `<dir> / "bin" / "<x>"` paths.
 /// - Shell: a source line, a variable whose value ends with a pack path, and an interpreter
-///   launching a pack tool by path (`python3 "…/bin/x.py"`, `"$CYS_PY" "…/bin/x.py"`).
+///   (`python3`, `"$CYS_PY"`, `sh`, `bash`) launching a pack file — in command position, also after
+///   `if` / `!` / a pipe and INSIDE `$(…)`; the launched path may be wrapped
+///   (`"$(cys_native_path "$PACK/bin/x.py")"`) or built from a directory variable (`"$D/x.sh"`,
+///   loops over directories); a path built as `$(cd … && pwd)/x`; file names a `for` loop walks.
 pub fn bindings(rel: &str, text: &str, rels: &BTreeSet<&str>) -> Vec<(String, String)> {
     bindings_impl(rel, text, rels, true)
 }
@@ -1323,6 +1391,68 @@ pub fn hook_bindings(rel: &str, text: &str, rels: &BTreeSet<&str>) -> Vec<(Strin
     bindings_impl(rel, text, rels, false)
 }
 
+/// Candidate pack paths for a file NAME whose directory the text does not spell out (a variable or
+/// loop directory): a sibling of the file, a `bin/` tool, a hook (RULINGS AN3).
+fn by_name(name: &str, file_dir: &str) -> Vec<String> {
+    let mut v = vec![if file_dir.is_empty() {
+        name.to_string()
+    } else {
+        format!("{file_dir}/{name}")
+    }];
+    for d in ["bin", "hooks"] {
+        let c = format!("{d}/{name}");
+        if !v.contains(&c) {
+            v.push(c);
+        }
+    }
+    v
+}
+
+/// The pack files a launch argument names (RULINGS AN3): the FIRST `…/bin/x` or `…/hooks/x` in it,
+/// or `$VAR/x` / `${VAR}/x` (a directory variable) looked up by name.
+fn launch_targets(arg: &str, file_dir: &str) -> Vec<String> {
+    let first = ["/bin/", "/hooks/"]
+        .iter()
+        .filter_map(|d| arg.find(d).map(|p| (p, *d)))
+        .min_by_key(|(p, _)| *p);
+    if let Some((p, d)) = first {
+        let name: String = arg[p + d.len()..]
+            .chars()
+            .take_while(|c| is_name_char(*c))
+            .collect();
+        return if name.is_empty() {
+            Vec::new()
+        } else {
+            vec![format!("{}{name}", &d[1..])]
+        };
+    }
+    var_dir_name(arg)
+        .map(|n| by_name(&n, file_dir))
+        .unwrap_or_default()
+}
+
+/// `$VAR/name`, `${VAR}/name`, `${VAR:-…}/name` (quotes stripped) → `name` when it is a script
+/// (`.sh` / `.py`).
+fn var_dir_name(value: &str) -> Option<String> {
+    let w = value.trim().trim_matches(|c| c == '"' || c == '\'');
+    if !w.starts_with('$') || w.starts_with("$(") {
+        return None;
+    }
+    let slash = w.rfind('/')?;
+    let (dir, name) = (&w[..slash], &w[slash + 1..]);
+    let dir_is_one_var = if let Some(inner) = dir.strip_prefix("${") {
+        inner.ends_with('}') && !inner[..inner.len() - 1].contains('}')
+    } else {
+        dir[1..]
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    };
+    (dir_is_one_var
+        && (name.ends_with(".sh") || name.ends_with(".py"))
+        && name.chars().all(is_name_char))
+    .then(|| name.to_string())
+}
+
 fn bindings_impl(
     rel: &str,
     text: &str,
@@ -1331,10 +1461,12 @@ fn bindings_impl(
 ) -> Vec<(String, String)> {
     let mut out: BTreeMap<String, String> = BTreeMap::new();
     let mut add = |cand: String, how: String| {
-        if rels.contains(cand.as_str()) && cand != rel {
+        // documentation never runs: a `.md` file is not a launch / open candidate of the census
+        if rels.contains(cand.as_str()) && cand != rel && !(extended && cand.ends_with(".md")) {
             out.entry(cand).or_insert(how);
         }
     };
+    let fdir = dir_of(rel);
     if rel.ends_with(".py") || text.lines().next().is_some_and(|l| l.contains("python")) {
         let code = py_code_view(text);
         for line in code.lines() {
@@ -1371,15 +1503,49 @@ fn bindings_impl(
                 }
             }
         }
+        let how = format!("launched or opened by path in {rel}");
         for (at, _) in code.match_indices("os.path.join(") {
             if let Some(args) = call_args(&code, at + "os.path.join(".len()) {
-                if let Some(last) = string_literals(args).last() {
-                    if !last.is_empty() && last.chars().all(is_name_char) {
-                        add(
-                            format!("bin/{last}"),
-                            format!("launched or opened by path in {rel}"),
-                        );
-                    }
+                let lits = string_literals(args);
+                let Some(last) = lits.last() else { continue };
+                if last.contains('/') {
+                    let l = last.trim_start_matches("./").to_string();
+                    add(l, how.clone());
+                    continue;
+                }
+                if last.is_empty() || !last.chars().all(is_name_char) {
+                    continue;
+                }
+                let prev = lits.len().checked_sub(2).map(|i| lits[i].as_str());
+                let cands = match prev {
+                    Some("bin") => vec![format!("bin/{last}")],
+                    Some("hooks") => vec![format!("hooks/{last}")],
+                    // a variable directory: a script is looked up by name, a data file only in bin/
+                    _ if last.ends_with(".py") || last.ends_with(".sh") => by_name(last, fdir),
+                    _ => vec![format!("bin/{last}")],
+                };
+                for c in cands {
+                    add(c, how.clone());
+                }
+            }
+        }
+        // `<dir> / "bin" / "x"` paths
+        for d in ["\"bin\"", "\"hooks\"", "'bin'", "'hooks'"] {
+            for (at, _) in code.match_indices(d) {
+                let rest = code[at + d.len()..].trim_start();
+                let Some(rest) = rest.strip_prefix('/') else {
+                    continue;
+                };
+                let rest = rest.trim_start();
+                let Some(q) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') else {
+                    continue;
+                };
+                let name: String = rest[1..].chars().take_while(|c| *c != q).collect();
+                if !name.is_empty() && name.chars().all(is_name_char) {
+                    add(
+                        format!("{}/{name}", d.trim_matches(['"', '\''])),
+                        how.clone(),
+                    );
                 }
             }
         }
@@ -1388,7 +1554,6 @@ fn bindings_impl(
     if !is_shell(rel, text) {
         return Vec::new();
     }
-    let fdir = dir_of(rel);
     // heredocs: a Python heredoc body (`"$CYS_PY" - <<'PYEOF'`) is read with the Python rules;
     // any other heredoc body is data, not commands (its text is never a launch or a binding)
     let mut heredoc: Option<(String, bool, String)> = None; // (terminator, python, body)
@@ -1423,48 +1588,139 @@ fn bindings_impl(
                 heredoc = Some((word, python, String::new()));
             }
         }
-        let mut segs: Vec<&str> = vec![line];
-        for sep in [" || ", " && ", "; "] {
-            segs = segs.iter().flat_map(|s| s.split(sep)).collect();
+        if extended {
+            // a path built as `$(cd <dir> && pwd)/<name>` (whole line: the `&&` is inside it)
+            let mut from = 0;
+            while let Some(p) = line[from..].find("pwd)/") {
+                let at = from + p;
+                let name: String = line[at + 5..]
+                    .chars()
+                    .take_while(|c| is_name_char(*c))
+                    .collect();
+                if let Some(cd) = line[..at].rfind("$(cd ") {
+                    let dir = &line[cd + 5..at];
+                    let cands = if dir.contains("/bin") {
+                        vec![format!("bin/{name}")]
+                    } else if dir.contains("/hooks") {
+                        vec![format!("hooks/{name}")]
+                    } else {
+                        by_name(&name, fdir)
+                    };
+                    for c in cands {
+                        add(c, format!("launched or opened by path in {rel}"));
+                    }
+                }
+                from = at + 5;
+            }
+            // file names a `for` loop walks (`for h in a.sh b.sh; do …`)
+            if let Some(r) = line.trim_start().strip_prefix("for ") {
+                if let Some((_, list)) = r.split_once(" in ") {
+                    let list = list.split("; do").next().unwrap_or(list);
+                    for w in list.split_whitespace() {
+                        let w = w.trim_matches(|c| c == '"' || c == '\'');
+                        if !w.contains('$')
+                            && !w.contains('/')
+                            && (w.ends_with(".sh") || w.ends_with(".py"))
+                            && w.chars().all(is_name_char)
+                        {
+                            for c in by_name(w, fdir) {
+                                add(c, format!("launched by {rel} (loop)"));
+                            }
+                        }
+                    }
+                }
+            }
         }
-        for seg in segs {
+        let seps: &[&str] = if extended {
+            &[" || ", " && ", "; ", " | "]
+        } else {
+            &[" || ", " && ", "; "]
+        };
+        let mut segs: Vec<String> = vec![line.to_string()];
+        for sep in seps {
+            segs = segs
+                .iter()
+                .flat_map(|s| s.split(sep).map(str::to_string))
+                .collect();
+        }
+        if extended {
+            // every `$(` opens a command of its own
+            let inner: Vec<String> = segs
+                .iter()
+                .flat_map(|s| {
+                    s.match_indices("$(")
+                        .map(|(p, _)| s[p + 2..].to_string())
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            segs.extend(inner);
+        }
+        for seg in &segs {
             let s = seg
                 .trim_start()
                 .trim_start_matches("||")
                 .trim_start_matches("&&")
                 .trim_start();
-            // an interpreter launching a pack tool by path — only in COMMAND position (after
-            // leading assignments / exec / env / nohup / command), never inside a quoted message
+            // an interpreter launching a pack file — only in COMMAND position (after leading
+            // keywords / assignments / exec / env / nohup / command), never inside a quoted message
             let words: Vec<&str> = s.split_whitespace().collect();
             let mut k = 0;
             while k < words.len()
-                && (matches!(words[k], "exec" | "env" | "nohup" | "command" | "time")
-                    || (words[k].contains('=')
-                        && words[k].split('=').next().is_some_and(|n| {
-                            !n.is_empty()
-                                && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                        })))
+                && (matches!(
+                    words[k],
+                    "exec"
+                        | "env"
+                        | "nohup"
+                        | "command"
+                        | "time"
+                        | "if"
+                        | "!"
+                        | "then"
+                        | "do"
+                        | "else"
+                        | "elif"
+                        | "while"
+                        | "until"
+                        | "{"
+                        | "("
+                ) || (words[k].contains('=')
+                    && words[k].split('=').next().is_some_and(|n| {
+                        !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    })))
             {
                 k += 1;
             }
             let unq = |w: &str| w.trim_matches(|c| c == '"' || c == '\'').to_string();
-            if extended
-                && k < words.len()
-                && matches!(
-                    unq(words[k]).as_str(),
-                    "python3" | "python" | "py" | "$CYS_PY" | "${CYS_PY}" | "$PY" | "${PY}"
-                )
-            {
-                if let Some(target) = words[k + 1..]
-                    .iter()
-                    .map(|w| unq(w))
-                    .find(|w| !w.starts_with('-'))
-                {
-                    if let Some(p) = target.rfind("/bin/") {
-                        let name = &target[p + 5..];
-                        if !name.is_empty() && name.chars().all(is_name_char) {
-                            add(format!("bin/{name}"), format!("launched by {rel}"));
-                        }
+            let interpreters: &[&str] = if extended {
+                &[
+                    "python3",
+                    "python",
+                    "py",
+                    "$CYS_PY",
+                    "${CYS_PY}",
+                    "$PY",
+                    "${PY}",
+                    "sh",
+                    "bash",
+                ]
+            } else {
+                &[]
+            };
+            if k < words.len() && interpreters.contains(&unq(words[k]).as_str()) {
+                let rest = &words[k + 1..];
+                if let Some(i) = rest.iter().position(|w| !unq(w).starts_with('-')) {
+                    let w0 = rest[i];
+                    let arg: String = if w0.trim_start_matches('"').starts_with("$(") {
+                        let joined = rest[i..].join(" ");
+                        let start = joined.find("$(").map(|p| p + 2).unwrap_or(0);
+                        call_args(&joined, start)
+                            .map(str::to_string)
+                            .unwrap_or_else(|| joined[start..].to_string())
+                    } else {
+                        w0.to_string()
+                    };
+                    for t in launch_targets(&arg, fdir) {
+                        add(t, format!("launched by {rel}"));
                     }
                 }
             }
@@ -1493,6 +1749,19 @@ fn bindings_impl(
             let Some((how, v)) = value else { continue };
             if let Some(t) = path_value_target(v, fdir) {
                 add(t, format!("{how} by {rel}"));
+            } else if extended {
+                // a value built from a directory variable (`X="$D/name.sh"` — loops over dirs)
+                let mut vv = v.trim();
+                for cut in [" 2>", " >", " ;", ";"] {
+                    if let Some(p) = vv.find(cut) {
+                        vv = &vv[..p];
+                    }
+                }
+                if let Some(n) = var_dir_name(vv) {
+                    for c in by_name(&n, fdir) {
+                        add(c, format!("{how} by {rel}"));
+                    }
+                }
             }
         }
     }
@@ -1707,31 +1976,78 @@ pub fn derive(src: &Sources) -> Result<Vec<GenEntry>, String> {
         );
     }
 
-    // AL3 — the extended closure (imports wherever written, tools launched or opened by path,
-    //   heredocs) FINDS candidates from every listed row; a candidate that is neither listed nor
-    //   a measured drop is a NEW start-path file → build failure naming it (measure it with
-    //   test_boot_critical_start_replay, then list it or add it to DROPPED_CANDIDATES)
-    let listed_roots: Vec<(String, String)> = rows
-        .keys()
-        .map(|r| (r.clone(), "listed".to_string()))
-        .collect();
-    let dropped: BTreeSet<&str> = DROPPED_CANDIDATES.iter().map(|(r, _)| *r).collect();
-    for (rel, how) in walk(listed_roots, bindings) {
-        if rows.contains_key(&rel) || dropped.contains(rel.as_str()) {
+    // AN3 — measured class-1 rows reached through a launch idiom
+    for (rel, hook, why) in MEASURED_HOOK_DEPS {
+        if !rels.contains(*rel) {
+            errs.push(format!(
+                "MEASURED_HOOK_DEPS: `{rel}` is not a file of the pack (RULINGS AN3)"
+            ));
             continue;
         }
-        let base = rel.rsplit('/').next().unwrap_or(&rel).to_string();
-        if excluded.contains(&base) || is_clear_procedure_rel(&rel) {
+        if rows.get(*hook).map(|r| r.category) != Some("hook") {
+            errs.push(format!(
+                "MEASURED_HOOK_DEPS: `{rel}` names `{hook}`, which is not a registered hook (RULINGS AN3)"
+            ));
+            continue;
+        }
+        if rows.contains_key(*rel) {
+            continue;
+        }
+        let text = (src.pack_file)(rel).map(|t| lf(&t));
+        rows.insert(
+            rel.to_string(),
+            GenEntry {
+                check: file_kind_check(rel, text.as_deref()),
+                rel: rel.to_string(),
+                category: "hook-dep",
+                check_arg: String::new(),
+                timeout_s: None,
+                lifeline: false,
+                why: format!("used by {hook}: {why}"),
+                proof: "hook-replay",
+            },
+        );
+    }
+
+    // AL3 · AN6 — the extended rule (imports wherever written, tools launched or opened by path,
+    //   heredocs, the launch idioms of AN3) FINDS candidates, starting from the LISTED files and
+    //   stopping at dropped files (one step: a new import inside an ordinary tool never fails the
+    //   build); a candidate that is neither listed (either list) nor a measured drop is a NEW
+    //   start-path file → build failure naming it (measure it — test_boot_critical_start_replay /
+    //   the hook replay — then list it or add it to DROPPED_CANDIDATES with both break modes)
+    let dropped: BTreeSet<&str> = DROPPED_CANDIDATES.iter().map(|(r, _)| *r).collect();
+    let protected: BTreeSet<&str> = protection.iter().map(|e| e.rel.as_str()).collect();
+    let mut found: BTreeMap<String, String> = BTreeMap::new();
+    for r in rows.keys() {
+        let text = (src.pack_file)(r).map(|t| lf(&t)).unwrap_or_default();
+        for (rel, how) in bindings(r, &text, &rels) {
+            found.entry(rel).or_insert(how);
+        }
+    }
+    for (rel, how) in &found {
+        if rows.contains_key(rel)
+            || protected.contains(rel.as_str())
+            || dropped.contains(rel.as_str())
+        {
+            continue;
+        }
+        let base = rel.rsplit('/').next().unwrap_or(rel).to_string();
+        if excluded.contains(&base) || is_clear_procedure_rel(rel) {
             continue;
         }
         errs.push(format!(
-            "census: new start-path candidate `{rel}` ({how}) — neither listed nor a measured drop; run test_boot_critical_start_replay and classify it (RULINGS AL1/AL3)"
+            "census: new start-path candidate `{rel}` ({how}) — neither listed nor a measured drop; measure both break modes and classify it (RULINGS AL1/AL3/AN2)"
         ));
     }
     for (rel, _) in DROPPED_CANDIDATES {
         if rows.contains_key(*rel) {
             errs.push(format!(
                 "`{rel}` is both listed and in DROPPED_CANDIDATES — remove one (RULINGS AL3)"
+            ));
+        }
+        if !rels.contains(*rel) {
+            errs.push(format!(
+                "DROPPED_CANDIDATES: `{rel}` is no longer a file of the pack — remove or rename the entry (RULINGS AN6)"
             ));
         }
     }
