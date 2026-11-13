@@ -123,6 +123,117 @@ pub const REEVAL_INTERVAL_SECS: u64 = 30;
 /// 둘을 같은 숫자로 묶으면 쿨다운 중인 앞쪽 키들이 뒤쪽의 적재 가능한 키를 굶긴다.
 pub const REEVAL_SCAN_MAX: usize = 256;
 
+// ─── ★(0.15.0 · 「스스로 해결」 M4 · 설계 §4-4 · §6-4 (2) · RULINGS AD8 · track T3b) 결함 접수의 **자기 몫** ───
+// The daemon's repeated-failure detector (`alerts.rs`, "결함 감지기") writes defect intake rows — DATA in the
+// repair ledger, never a message. It reuses this router's quota METHOD (a per-key cooldown, a rolling
+// one-hour cap, hold — never drop) with its OWN counters: nothing here is in `RouteState`, so a defect
+// flood can never spend the general share ([`HOURLY_CAP`]), the clear-signal reserve ([`CLEAR_RESERVE`])
+// or the CSO's queue headroom ([`CSO_QUEUE_HEADROOM`]). The record that made this a rule: when clear
+// signals shared the general share, seat-death alerts were held up to 1,805 s (치명위험 ③).
+
+/// A signature's ledger row is rewritten at most once per this many seconds; failures seen meanwhile
+/// accumulate in memory and go into the next write (nothing is dropped).
+pub const INTAKE_ROW_COOLDOWN_SECS: f64 = COOLDOWN_SECS;
+/// NEW signature rows the detector writes per lane in a rolling hour ([`WINDOW_SECS`]). A further new
+/// signature is HELD in memory with its count and written when the window frees.
+pub const INTAKE_NEW_ROWS_PER_HOUR: usize = 30;
+/// Names reserved for defect intake — this PREFIX and everything that extends it (RULINGS BF6). They are
+/// NEVER routable ([`routable`]): even a future publisher of a defect notice cannot reach the CSO queue
+/// through the general share (every other `alert.*` name is routable).
+pub const DEFECT_INTAKE_ALERT_NAME: &str = "alert.defect_intake";
+/// Reserved prefix (`repair.intake…`), see [`DEFECT_INTAKE_ALERT_NAME`].
+pub const DEFECT_INTAKE_NAME_PREFIX: &str = "repair.intake";
+
+/// Is `name` reserved for defect intake (and therefore never routed)?
+pub fn is_defect_intake_name(name: &str) -> bool {
+    name.starts_with(DEFECT_INTAKE_ALERT_NAME) || name.starts_with(DEFECT_INTAKE_NAME_PREFIX)
+}
+
+/// What the intake share says about one row write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IntakeVerdict {
+    Write,
+    /// This signature's row was written less than [`INTAKE_ROW_COOLDOWN_SECS`] ago.
+    HoldCooldown,
+    /// A NEW row while [`INTAKE_NEW_ROWS_PER_HOUR`] new rows were written in the last hour.
+    HoldHourly,
+}
+
+/// The intake share's own state (one per lane daemon, memory only — a restart resets it, like every
+/// other in-memory guard of the design, §9). Times are [`Now::mono`].
+#[derive(Debug, Default)]
+pub struct IntakeShare {
+    new_rows: VecDeque<f64>,
+    last_write: HashMap<String, f64>,
+    pub new_rows_total: u64,
+    pub updates_total: u64,
+    pub held_cooldown_total: u64,
+    pub held_hourly_total: u64,
+}
+
+impl IntakeShare {
+    fn prune(&mut self, mono: f64) {
+        while self.new_rows.front().is_some_and(|t| mono - *t > WINDOW_SECS) {
+            self.new_rows.pop_front();
+        }
+        self.last_write.retain(|_, t| mono - *t < INTAKE_ROW_COOLDOWN_SECS);
+    }
+
+    /// New rows written in the last hour (the share's own counter — never `RouteState::general_1h`).
+    pub fn new_rows_1h(&self, mono: f64) -> usize {
+        self.new_rows.iter().filter(|t| mono - **t <= WINDOW_SECS).count()
+    }
+
+    /// Pure decision for one row write of `sig` (`new_row` = no row of this lane exists yet).
+    pub fn decide(&self, sig: &str, new_row: bool, mono: f64) -> IntakeVerdict {
+        if self
+            .last_write
+            .get(sig)
+            .is_some_and(|t| mono - *t < INTAKE_ROW_COOLDOWN_SECS)
+        {
+            return IntakeVerdict::HoldCooldown;
+        }
+        if new_row && self.new_rows_1h(mono) >= INTAKE_NEW_ROWS_PER_HOUR {
+            return IntakeVerdict::HoldHourly;
+        }
+        IntakeVerdict::Write
+    }
+
+    /// Counts a hold (the held counts stay in the detector's memory).
+    pub fn note_held(&mut self, v: IntakeVerdict) {
+        match v {
+            IntakeVerdict::HoldCooldown => self.held_cooldown_total += 1,
+            IntakeVerdict::HoldHourly => self.held_hourly_total += 1,
+            IntakeVerdict::Write => {}
+        }
+    }
+
+    /// Records a row that WAS written.
+    pub fn commit(&mut self, sig: &str, new_row: bool, mono: f64) {
+        self.prune(mono);
+        if new_row {
+            self.new_rows.push_back(mono);
+            self.new_rows_total += 1;
+        } else {
+            self.updates_total += 1;
+        }
+        self.last_write.insert(sig.to_string(), mono);
+    }
+
+    /// The share's counters (diagnostics / tests; NOT part of `cys status --json`'s 4-key `alert_route`).
+    pub fn snapshot(&self, mono: f64) -> Value {
+        json!({
+            "new_rows_1h": self.new_rows_1h(mono),
+            "new_rows_per_hour": INTAKE_NEW_ROWS_PER_HOUR,
+            "row_cooldown_secs": INTAKE_ROW_COOLDOWN_SECS,
+            "new_rows_total": self.new_rows_total,
+            "updates_total": self.updates_total,
+            "held_cooldown_total": self.held_cooldown_total,
+            "held_hourly_total": self.held_hourly_total,
+        })
+    }
+}
+
 /// 적재 경로 태그(`QueueEntry::origin`) — 계약 문자열(CONTRACTS §C).
 pub const ALERT_ORIGIN: &str = "alert";
 /// 발신자 라벨(`QueueEntry::from`) — surface ref 가 아니므로 원장에서는 `from_label` 로 간다
@@ -247,6 +358,10 @@ impl Now {
 /// 판단하라" 고 시키는데 그 사실은 오지 않았다. 억제·상한·접기는 그대로 적용되므로 폭주 축이
 /// 새로 열리지 않는다(발행부는 키당 30분 리마인드).
 pub fn routable(name: &str) -> bool {
+    // ★(0.15.0 · RULINGS AD8) 결함 접수용 예약 이름은 어떤 몫으로도 라우팅하지 않는다(자기 몫 = 장부 · 위 IntakeShare).
+    if is_defect_intake_name(name) {
+        return false;
+    }
     name == OVERFLOW_NAME
         || name == GAP_NAME
         || matches!(
@@ -6529,6 +6644,135 @@ mod drills {
         let block_end = body.find("    };").expect("임계영역 종료 소실");
         assert!(persist > block_end, "persist 가 락 안으로 들어갔다(재진입 데드락)");
     }
+
+    /// ★(0.15.0 · 「스스로 해결」 M4 · RULINGS AD8 · H-04-A1-10-01 · I-F1-04) THE FLOOD TEST, router half — a defect
+    /// flood (1,000 identical failures + 30 distinct defect signatures, through the real detector and its flush)
+    /// does not delay a seat-death alert or the master / CEO clear signals: in the baseline run and in the
+    /// flood run all three reach the CSO queue in the SAME tick they arise (0 extra ticks — measured below),
+    /// the general share and the clear reserve count exactly the same, the CSO queue holds exactly the same,
+    /// and the event bus carried nothing from the detector. Control (else the drill is void): the same 31
+    /// defects pushed as routable `alert.repeated_failure` keys (= "intake routed through the general share")
+    /// fill the general share and HOLD the seat-death alert. And the reserved intake names never enter the router.
+    #[test]
+    fn drill_defect_flood_does_not_delay_seat_death_or_clear_signals() {
+        #[derive(Clone, Copy, PartialEq, Debug)]
+        enum Arm {
+            Baseline,
+            Flood,
+            ControlGeneralShare,
+            ReservedNames,
+        }
+        struct Out {
+            routed_same_tick: usize,
+            exited_routed: bool,
+            general_1h: usize,
+            clear_1h: usize,
+            cso_depth: usize,
+            master_depth: usize,
+            edge_micros: u128,
+        }
+        let run = |arm: Arm| -> Out {
+            let daemon = drill_daemon(&format!("t3b-flood-{arm:?}"));
+            let cso = seat(&daemon, "cso");
+            let master = seat(&daemon, "master");
+            let ceo = seat(&daemon, "ceo");
+            let worker = seat(&daemon, "worker");
+            let t0 = after_grace(&daemon);
+            let root = std::env::temp_dir().join(format!("cys-t3b-drill-{arm:?}-{}", std::process::id()));
+            let bus_before = daemon.bus.latest_seq();
+            match arm {
+                Arm::Baseline => {}
+                Arm::Flood => {
+                    let t = std::time::Instant::now();
+                    let feed = |cmd: &str, err: &str, n: usize| {
+                        let input = json!({ "command": cmd });
+                        for _ in 0..n {
+                            for (et, raw, exit, e) in [("PRE_TOOL", "PreToolUse", None, None), ("POST_TOOL", "PostToolUseFailure", Some(1), Some(err))] {
+                                crate::alerts::observe_tool_event(
+                                    &daemon,
+                                    &crate::alerts::ToolObservation { event_type: et, raw_event: raw, tool_name: "Bash", tool_input: &input, exit_code: exit, error: e, interrupted: false },
+                                );
+                            }
+                        }
+                    };
+                    let cfg = crate::alerts::AlertConfig::default();
+                    feed("python3 ~/.cys/pack/bin/javis_x.py run", "Exit code 1\nKeyError: 'k'", 1000);
+                    let first = crate::alerts::flush_defect_intake(&daemon, &root, &cfg, t0);
+                    assert_eq!((first.due, first.written_new), (1, 1), "{first:?}");
+                    for i in 0..30 {
+                        feed(&format!("python3 ~/.cys/pack/bin/javis_d{i:02}.py"), "Exit code 1\nE: d", 5);
+                    }
+                    let rep = crate::alerts::flush_defect_intake(&daemon, &root, &cfg, t0);
+                    eprintln!("[t3b-drill] 1,150 calls + 1,150 failures observed and flushed in {:?}: {first:?} then {rep:?}", t.elapsed());
+                    assert_eq!(rep.due, 30);
+                    assert_eq!(rep.written_new, INTAKE_NEW_ROWS_PER_HOUR - 1, "the intake's own share wrote up to its hourly maximum");
+                    assert_eq!(rep.held_hourly, 1, "the rest is held, not dropped");
+                    assert_eq!(daemon.bus.latest_seq(), bus_before, "the detector published on the event bus");
+                    let (defects, _) = cys::repair::intake::load_all_in(&root);
+                    assert_eq!(defects.len(), INTAKE_NEW_ROWS_PER_HOUR, "defect intake produced ledger rows");
+                    assert_eq!(defects.iter().filter(|d| d.count == 1000).count(), 1, "the 1,000 identical failures are one row");
+                }
+                Arm::ControlGeneralShare => {
+                    for i in 0..31 {
+                        handle_event(&daemon, &ev("alert.repeated_failure", None, json!({"key": format!("repeated_failure:sig{i:02}"), "severity": "warn", "message": "x"})), t0);
+                    }
+                }
+                Arm::ReservedNames => {
+                    for i in 0..31 {
+                        handle_event(&daemon, &ev(DEFECT_INTAKE_ALERT_NAME, None, json!({"key": format!("defect:sig{i:02}")})), t0);
+                        handle_event(&daemon, &ev("repair.intake_recorded", None, json!({"key": format!("defect:sig{i:02}")})), t0);
+                    }
+                    assert_eq!((depth(&daemon, cso), pending_len(&daemon)), (0, 0), "a reserved intake name entered the router");
+                }
+            }
+            let before = depth(&daemon, cso);
+            let master_depth = depth(&daemon, master);
+            let t = std::time::Instant::now();
+            handle_event(&daemon, &ev("surface.exited", Some(worker), json!({"role": "worker", "agent": "claude"})), t0);
+            let after_exit = depth(&daemon, cso);
+            for (sid, role) in [(master, "master"), (ceo, "ceo")] {
+                handle_event(&daemon, &ev("context.threshold", Some(sid), json!({"role": role, "context_pct": 86, "threshold": 85})), t0);
+            }
+            let edge_micros = t.elapsed().as_micros();
+            let cso_depth = depth(&daemon, cso);
+            let st = daemon.alert_route.lock().unwrap();
+            let out = Out {
+                routed_same_tick: cso_depth - before,
+                exited_routed: after_exit > before,
+                general_1h: st.general_1h(t0.mono),
+                clear_1h: st.clear_1h(t0.mono),
+                cso_depth,
+                master_depth,
+                edge_micros,
+            };
+            drop(st);
+            let _ = std::fs::remove_dir_all(&root);
+            out
+        };
+        let base = run(Arm::Baseline);
+        let flood = run(Arm::Flood);
+        let control = run(Arm::ControlGeneralShare);
+        let reserved = run(Arm::ReservedNames);
+        eprintln!(
+            "[t3b-drill] edge alerts routed in the arising tick — baseline {}/3 ({} µs) · flood {}/3 ({} µs) · control {}/3 · reserved {}/3",
+            base.routed_same_tick, base.edge_micros, flood.routed_same_tick, flood.edge_micros, control.routed_same_tick, reserved.routed_same_tick
+        );
+        // baseline: seat death + two clear signals in the tick they arise
+        assert_eq!((base.routed_same_tick, base.exited_routed, base.general_1h, base.clear_1h), (3, true, 1, 2));
+        // flood: identical to the baseline (0 extra ticks of delay; general share / clear reserve / CSO queue untouched)
+        assert_eq!(
+            (flood.routed_same_tick, flood.exited_routed, flood.general_1h, flood.clear_1h, flood.cso_depth, flood.master_depth),
+            (base.routed_same_tick, base.exited_routed, base.general_1h, base.clear_1h, base.cso_depth, base.master_depth),
+            "the defect flood delayed or displaced an alert"
+        );
+        assert_eq!(flood.master_depth, 0, "a defect reached the master's queue");
+        // control: the drill CAN see a flood that shares the general share — seat death is held
+        assert!(!control.exited_routed, "control void: 31 routable defect keys did not hold the seat-death alert");
+        assert_eq!(control.general_1h, HOURLY_CAP);
+        assert!(control.routed_same_tick < base.routed_same_tick);
+        // reserved names: nothing entered, nothing held
+        assert_eq!((reserved.routed_same_tick, reserved.exited_routed, reserved.general_1h), (3, true, 1));
+    }
 }
 
 // ═══════════ 순수층 검체(PTY 불요 · Windows CI 에서도 돈다) ═══════════
@@ -10438,5 +10682,74 @@ mod office_spool_drills {
         assert!(!read_error_ok, "an unreadable record + an all-ok observation publishes nothing");
         assert!(corrupt_fault, "a corrupt record + a fault still publishes");
         assert_eq!((entries, overwritten), (1, true), "the fault is one master entry and its save overwrites the corrupt file");
+    }
+}
+
+// ═══════════ (0.15.0 · 「스스로 해결」 M4 · RULINGS AD8 · track T3b) 결함 접수 자기 몫 — 순수층 ═══════════
+#[cfg(test)]
+mod defect_intake_share {
+    use super::*;
+
+    /// The reserved intake names are never routable (even under the `alert.` prefix every other engine
+    /// name routes with); everything that routed before still routes. Mutation: drop the guard →
+    /// `alert.defect_intake` becomes routable → red.
+    #[test]
+    fn defect_intake_names_are_never_routable() {
+        assert!(is_defect_intake_name(DEFECT_INTAKE_ALERT_NAME));
+        for suffixed in ["alert.defect_intake_v2", "alert.defect_intake.sig", "alert.defect_intakes"] {
+            assert!(is_defect_intake_name(suffixed) && !routable(suffixed), "{suffixed} routes (the name is reserved by prefix)");
+        }
+        assert!(is_defect_intake_name("repair.intake"));
+        assert!(is_defect_intake_name("repair.intake_recorded"));
+        assert!(!routable(DEFECT_INTAKE_ALERT_NAME));
+        assert!(!routable("repair.intake_recorded"));
+        let ctx = RouteCtx {
+            now: 10_000.0,
+            cso_surface: Some(1),
+            cso_seats: vec![1],
+            cso_seat_empty: false,
+            delivery_frozen: false,
+            cso_queue_depth: 0,
+            clear_seats: vec![2, 3],
+        };
+        let st = RouteState::default();
+        assert_eq!(
+            decide(&st, &AlertKey::with_detail(DEFECT_INTAKE_ALERT_NAME, None, Some("k".into())), &ctx),
+            Verdict::Ignore(IgnoreReason::NotRoutable)
+        );
+        // unchanged: the engine's own names, edge facts, the summary keys
+        for name in ["alert.repeated_failure", "alert.rate_limit", "alert.node_liveness", "surface.exited", "context.threshold", "health.alert", OVERFLOW_NAME, GAP_NAME] {
+            assert!(routable(name), "{name} stopped routing");
+        }
+        assert!(!is_defect_intake_name("alert.repeated_failure"));
+    }
+
+    // (round 1's `intake_share_never_touches_the_general_pool_or_the_clear_reserve` filled a RouteState
+    //  the share never saw — vacuous, RULINGS BF6. The connected form lives with the detector:
+    //  `alerts::defect_intake_tests::full_general_share_and_clear_reserve_never_hold_an_intake_row`.)
+
+    /// Cooldown per signature, hourly cap for NEW rows only, the window slides, holds are counted.
+    #[test]
+    fn intake_share_cooldown_and_hourly_decisions() {
+        let mut s = IntakeShare::default();
+        assert_eq!(s.decide("a", true, 0.0), IntakeVerdict::Write);
+        s.commit("a", true, 0.0);
+        assert_eq!(s.decide("a", false, INTAKE_ROW_COOLDOWN_SECS - 1.0), IntakeVerdict::HoldCooldown);
+        assert_eq!(s.decide("a", false, INTAKE_ROW_COOLDOWN_SECS), IntakeVerdict::Write);
+        s.commit("a", false, INTAKE_ROW_COOLDOWN_SECS);
+        assert_eq!((s.new_rows_total, s.updates_total), (1, 1));
+        for i in 1..INTAKE_NEW_ROWS_PER_HOUR {
+            s.commit(&format!("n{i}"), true, 10.0);
+        }
+        assert_eq!(s.decide("late", true, 20.0), IntakeVerdict::HoldHourly);
+        s.note_held(IntakeVerdict::HoldHourly);
+        s.note_held(IntakeVerdict::HoldCooldown);
+        assert_eq!((s.held_hourly_total, s.held_cooldown_total), (1, 1));
+        assert_eq!(s.decide("old", false, 20.0), IntakeVerdict::Write, "updates of existing rows are not capped by the hourly share");
+        // the window slides: an hour after the first rows they no longer count
+        assert_eq!(s.decide("late", true, 10.0 + WINDOW_SECS + 1.0), IntakeVerdict::Write);
+        // the cooldown map stays bounded (entries older than the cooldown are pruned at each commit)
+        s.commit("z", true, 10.0 * WINDOW_SECS);
+        assert_eq!(s.last_write.len(), 1);
     }
 }

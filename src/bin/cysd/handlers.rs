@@ -11133,6 +11133,20 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
                     "tool_input_len": tool_input.to_string().len(),
                 }),
             );
+            // ★(0.15.0 · 「스스로 해결」 M4 · RULINGS AD8) 결함 감지기에 관찰 1건 — 메모리 계수뿐(디스크·스폰·큐·버스 0).
+            //   행 쓰기는 감지기 자기 스레드가 자기 몫으로 한다(`alerts.rs` 결함 감지기).
+            crate::alerts::observe_tool_event(
+                daemon,
+                &crate::alerts::ToolObservation {
+                    event_type: &event_type,
+                    raw_event: &hook_event,
+                    tool_name: &tool_name,
+                    tool_input: &tool_input,
+                    exit_code,
+                    error: params.get("error").and_then(|v| v.as_str()),
+                    interrupted: params.get("is_interrupt").and_then(|v| v.as_bool()).unwrap_or(false),
+                },
+            );
             Reply::Single(ok_response(&id, json!({"surface_id": sid})))
         }
 

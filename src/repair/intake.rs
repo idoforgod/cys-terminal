@@ -199,6 +199,38 @@ pub fn error_class(first_line: &str) -> String {
     "error".to_string()
 }
 
+/// The ONE normaliser of a signature's error line (O-C1-9 "first stable line", RULINGS BF3) —
+/// `repair.report` ([`parse_report`]) and the daemon's repeated-failure detector both go through it,
+/// so one failure gives one signature whichever source files it. For a multi-line text: a leading
+/// `Exit code N` line (Claude Code's wrapper of a failed shell call) is skipped; a Python traceback
+/// gives its LAST exception line (the last unindented line after the last
+/// `Traceback (most recent call last):`); otherwise the first non-empty line is taken. Then the
+/// volatile parts are masked ([`first_stable_line`]). A single-line text is masked exactly as before.
+/// The whole text is read (a traceback ends a long output); callers bound its size (`report`: 32 KiB).
+pub fn stable_error_line(error: &str) -> String {
+    let lines: Vec<&str> = error.lines().collect();
+    let Some(first) = lines.iter().position(|l| !l.trim().is_empty()) else {
+        return first_stable_line(error);
+    };
+    let mut rest = &lines[first..];
+    if leading_exit_code(rest[0]).is_some() && rest[1..].iter().any(|l| !l.trim().is_empty()) {
+        rest = &rest[1..];
+    }
+    if let Some(j) = rest
+        .iter()
+        .rposition(|l| l.trim_start().starts_with("Traceback (most recent call last)"))
+    {
+        if let Some(exc) = rest[j + 1..]
+            .iter()
+            .rev()
+            .find(|l| !l.trim().is_empty() && !l.starts_with(char::is_whitespace))
+        {
+            return first_stable_line(exc);
+        }
+    }
+    first_stable_line(&rest.join("\n"))
+}
+
 /// O-C1-9: `sha256(rel NUL class NUL line)` in lowercase hex.
 pub fn signature(rel: &str, class: &str, line: &str) -> String {
     let mut h = Sha256::new();
@@ -210,19 +242,159 @@ pub fn signature(rel: &str, class: &str, line: &str) -> String {
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Operations that fail BY DESIGN and must not become intake (design §4-4; precedent
-/// `cysjavis-pack/bin/javis_teamtoken.py` 470–483: on Windows `cys-dept` is not on a pane's PATH, so
-/// the department-creation check always fails with 127 — reported, it would add one row per prompt
-/// per seat). Returns the reason when excluded.
-pub fn excluded(rel: &str, error: &str, windows: bool) -> Option<&'static str> {
-    let low = error.to_ascii_lowercase();
-    let mentions_dept = rel.contains("cys-dept") || low.contains("cys-dept");
-    let not_found =
-        low.contains("127") || low.contains("command not found") || low.contains("not recognized");
-    if windows && mentions_dept && not_found {
-        return Some("windows-cys-dept-not-on-path");
+/// Where an entry of the exclusion list applies (RULINGS AD8 — track T3b owns the list).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExclusionScope {
+    /// `cys repair report` AND the daemon's repeated-failure detector.
+    All,
+    /// Only the detector: the entry needs what only an observed call carries (the subcommand the
+    /// command line gave the script, the exit code at the head of the failure text). The detector's
+    /// own entries live beside it (`cysd` `alerts.rs`, `DETECTOR_EXCLUSIONS`).
+    Detector,
+}
+
+/// How an entry recognises its by-design failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExclusionRule {
+    /// Windows: `cys-dept` is not on a pane's PATH, so the department check always ends 127 /
+    /// "command not found" / "not recognized" (precedent `javis_teamtoken.py` 470–483).
+    DeptNotOnPath,
+    /// A verdict tool whose non-zero exit IS its designed answer ("not ready", "start refused"),
+    /// not a defect — on POSITIVE evidence only (RULINGS BF2): `rel` (and, when `sub` is given, that
+    /// first argument) with a failure text whose first line is exactly `Exit code N` AND that carries
+    /// the tool's own fixed verdict marker for that N (one of the marker groups listed with it; a group
+    /// matches when every one of its strings is in the text), and NEVER when the text shows an
+    /// interpreter or launch failure ([`shows_launch_failure`]).
+    DesignedAnswer {
+        rel: &'static str,
+        sub: Option<&'static str>,
+        answers: &'static [DesignedExit],
+    },
+}
+
+/// One designed answer of a verdict tool: its exit code and its verdict markers (alternatives; each
+/// an AND-list of fixed strings the tool prints with that answer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DesignedExit {
+    pub exit: i64,
+    pub markers: &'static [&'static [&'static str]],
+}
+
+/// Texts that show an interpreter or launch failure — a designed-answer entry never excludes them
+/// (RULINGS BF2): a syntax error, a crash, a missing script or a missing command is exactly the
+/// post-update breakage the intake exists for.
+pub const LAUNCH_FAILURE_MARKERS: &[&str] = &[
+    "SyntaxError",
+    "IndentationError",
+    "Traceback",
+    "can't open file",
+    "No such file or directory",
+    "command not found",
+    "not recognized",
+];
+
+/// Whether a failure text shows an interpreter or launch failure ([`LAUNCH_FAILURE_MARKERS`]).
+pub fn shows_launch_failure(error: &str) -> bool {
+    LAUNCH_FAILURE_MARKERS.iter().any(|m| error.contains(m))
+}
+
+/// One entry of the exclusion list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Exclusion {
+    pub reason: &'static str,
+    pub windows_only: bool,
+    pub scope: ExclusionScope,
+    pub rule: ExclusionRule,
+}
+
+impl Exclusion {
+    /// Whether this entry covers a failure of `rel` (first argument `sub`, when known) with `error`.
+    pub fn matches(&self, rel: &str, sub: Option<&str>, error: &str, windows: bool) -> bool {
+        if self.windows_only && !windows {
+            return false;
+        }
+        match self.rule {
+            ExclusionRule::DeptNotOnPath => {
+                // RULINGS BF2: `Exit code 127` as the FIRST line (a call of cys-dept), or the
+                // "command not found" / "not recognized" sentence that names cys-dept — never a
+                // "127" anywhere in the text.
+                let low = error.to_ascii_lowercase();
+                let first_127 = leading_exit_code(error) == Some(127)
+                    && (rel.contains("cys-dept") || low.contains("cys-dept"));
+                let sentence = low.lines().any(|l| {
+                    l.contains("cys-dept")
+                        && (l.contains("command not found") || l.contains("not recognized"))
+                });
+                first_127 || sentence
+            }
+            ExclusionRule::DesignedAnswer {
+                rel: r,
+                sub: want_sub,
+                answers,
+            } => {
+                let Some(code) = leading_exit_code(error) else {
+                    return false;
+                };
+                r == rel
+                    && want_sub.is_none_or(|w| sub == Some(w))
+                    && !shows_launch_failure(error)
+                    && answers.iter().any(|a| {
+                        a.exit == code
+                            && a.markers
+                                .iter()
+                                .any(|group| group.iter().all(|m| error.contains(m)))
+                    })
+            }
+        }
     }
-    None
+}
+
+/// The exclusion list's entries for BOTH intake sources — operations that fail BY DESIGN and must
+/// not become intake (design §4-4, §6-4 (4)): without them a by-design failure files one row per
+/// prompt per seat. The detector adds its own detector-scope entries (the designed answers of verdict
+/// tools, which need the observed call) and consults this table first.
+pub const EXCLUSIONS: &[Exclusion] = &[
+    // precedent javis_teamtoken.py 470–483 (T3's entry, unchanged behaviour)
+    Exclusion {
+        reason: "windows-cys-dept-not-on-path",
+        windows_only: true,
+        scope: ExclusionScope::All,
+        rule: ExclusionRule::DeptNotOnPath,
+    },
+];
+
+/// The exit code a failure text announces on its first non-empty line, when that line is exactly
+/// `Exit code N` (the shape Claude Code gives a failed shell call: "Exit code 1\nError: …").
+pub fn leading_exit_code(error: &str) -> Option<i64> {
+    let first = error.lines().map(str::trim).find(|l| !l.is_empty())?;
+    first
+        .strip_prefix("Exit code ")
+        .and_then(|n| n.trim().parse::<i64>().ok())
+}
+
+/// The first entry of `table` that covers the failure (every scope). Returns its reason.
+pub fn excluded_in(
+    table: &[Exclusion],
+    rel: &str,
+    sub: Option<&str>,
+    error: &str,
+    windows: bool,
+) -> Option<&'static str> {
+    table
+        .iter()
+        .find(|e| e.matches(rel, sub, error, windows))
+        .map(|e| e.reason)
+}
+
+/// Operations that fail BY DESIGN and must not become intake — for `cys repair report` (the entries
+/// of [`EXCLUSIONS`] with scope [`ExclusionScope::All`]; a manual report carries no observed call).
+/// Returns the reason when excluded.
+pub fn excluded(rel: &str, error: &str, windows: bool) -> Option<&'static str> {
+    EXCLUSIONS
+        .iter()
+        .filter(|e| e.scope == ExclusionScope::All)
+        .find(|e| e.matches(rel, None, error, windows))
+        .map(|e| e.reason)
 }
 
 /// What one report did.
@@ -255,7 +427,7 @@ pub fn parse_report(file: &str, error: &str) -> Result<Report, RepairError> {
             "오류 내용이 비어 있습니다".into(),
         ));
     }
-    let first_line = first_stable_line(error);
+    let first_line = stable_error_line(error);
     let class = error_class(&first_line);
     let sig = signature(&rel, &class, &first_line);
     Ok(Report {
@@ -606,6 +778,139 @@ mod tests {
             "an excluded report wrote something"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// T3b (RULINGS AD8, BF2): the list's own table keeps T3's entry for both intake sources,
+    /// Windows only, and it matches `Exit code 127` as the FIRST line or the "command not found" /
+    /// "not recognized" sentence naming cys-dept — never a "127" anywhere.
+    #[test]
+    fn exclusion_table_keeps_the_windows_dept_entry_for_both_sources() {
+        let mut reasons: Vec<&str> = EXCLUSIONS.iter().map(|e| e.reason).collect();
+        reasons.sort_unstable();
+        reasons.dedup();
+        assert_eq!(reasons.len(), EXCLUSIONS.len(), "a reason names two entries");
+        assert!(EXCLUSIONS.iter().all(|e| e.scope == ExclusionScope::All));
+        let dept = "Exit code 127\n/usr/bin/bash: line 1: cys-dept: command not found";
+        for sub in [None, Some("create")] {
+            assert_eq!(
+                excluded_in(EXCLUSIONS, "bin/cys-dept", sub, dept, true),
+                Some("windows-cys-dept-not-on-path")
+            );
+        }
+        assert_eq!(excluded_in(EXCLUSIONS, "bin/cys-dept", None, dept, false), None, "macOS: a missing cys-dept IS a defect");
+        assert_eq!(excluded("bin/cys-dept", dept, true), Some("windows-cys-dept-not-on-path"));
+        assert_eq!(excluded("bin/cys-dept", "Exit code 127", true), Some("windows-cys-dept-not-on-path"));
+        assert_eq!(
+            excluded("bin/javis_teamtoken.py", "'cys-dept' is not recognized as an internal or external command", true),
+            Some("windows-cys-dept-not-on-path")
+        );
+        // a "127" elsewhere is not the precedent: a cys-dept failure that is not "not on PATH" is a defect
+        assert_eq!(excluded("bin/cys-dept", "Exit code 1\ncys-dept: team 127 already exists", true), None);
+        assert_eq!(excluded("bin/cys-dept", "Exit code 2\nretry in 127 s", true), None);
+        assert_eq!(excluded("bin/a.py", "Exit code 127\nfoo: command not found", true), None, "names no cys-dept");
+        // a detector-scope entry is never applied to a manual report through `excluded`
+        let only_detector = [Exclusion {
+            reason: "t",
+            windows_only: false,
+            scope: ExclusionScope::Detector,
+            rule: ExclusionRule::DesignedAnswer {
+                rel: "bin/x.py",
+                sub: None,
+                answers: &[DesignedExit { exit: 9, markers: &[&["verdict: no"]] }],
+            },
+        }];
+        assert_eq!(excluded_in(&only_detector, "bin/x.py", None, "Exit code 9\nverdict: no", false), Some("t"));
+        assert_eq!(excluded("bin/x.py", "Exit code 9\nverdict: no", false), None);
+    }
+
+    /// RULINGS BF2: a designed answer needs POSITIVE evidence — its exit code as the first line AND one
+    /// of its own verdict-marker groups (every string of the group) for THAT exit code; a launch or
+    /// interpreter failure is never excluded; a subcommand named by the entry must match.
+    #[test]
+    fn designed_answer_rule_needs_its_marker_and_never_a_launch_failure() {
+        let e = Exclusion {
+            reason: "t",
+            windows_only: false,
+            scope: ExclusionScope::Detector,
+            rule: ExclusionRule::DesignedAnswer {
+                rel: "bin/g.py",
+                sub: Some("check"),
+                answers: &[
+                    DesignedExit { exit: 2, markers: &[&["verdict: hard_block"], &["\"verdict\": \"hard_block\""]] },
+                    DesignedExit { exit: 1, markers: &[&["summary:", " missing "]] },
+                ],
+            },
+        };
+        assert!(e.matches("bin/g.py", Some("check"), "Exit code 2\nverdict: hard_block\n  x", false));
+        assert!(e.matches("bin/g.py", Some("check"), "Exit code 2\n{\"verdict\": \"hard_block\"}", true));
+        assert!(e.matches("bin/g.py", Some("check"), "Exit code 1\nsummary: 3 missing worker", false), "every string of the group");
+        assert!(!e.matches("bin/g.py", Some("check"), "Exit code 1\nsummary: all here", false), "half a group is no marker");
+        assert!(!e.matches("bin/g.py", Some("check"), "Exit code 2", false), "an exit code alone is no evidence");
+        assert!(!e.matches("bin/g.py", Some("check"), "Exit code 1\nverdict: hard_block", false), "the marker of ANOTHER exit code");
+        assert!(!e.matches("bin/g.py", Some("enforce"), "Exit code 2\nverdict: hard_block", false), "another subcommand");
+        assert!(!e.matches("bin/g.py", None, "Exit code 2\nverdict: hard_block", false), "no subcommand known");
+        assert!(!e.matches("bin/other.py", Some("check"), "Exit code 2\nverdict: hard_block", false));
+        assert!(!e.matches("bin/g.py", Some("check"), "verdict: hard_block\nExit code 2", false), "not the first line");
+        for launch in [
+            "Exit code 2\nverdict: hard_block\nTraceback (most recent call last):\n  File \"x\"\nKeyError: 'k'",
+            "Exit code 1\n  File \"g.py\", line 3\n    def (\n        ^\nSyntaxError: invalid syntax\nsummary: 3 missing x",
+            "Exit code 1\nIndentationError: unexpected indent\nsummary: 1 missing x",
+            "Exit code 2\npython3: can't open file '/x/bin/g.py': [Errno 2] No such file or directory\nverdict: hard_block",
+            "Exit code 1\nbash: g.py: command not found\nsummary: 1 missing x",
+            "Exit code 1\n'g.py' is not recognized as an internal or external command\nsummary: 1 missing x",
+        ] {
+            assert!(!e.matches("bin/g.py", Some("check"), launch, false), "a launch failure was excluded: {launch:?}");
+            assert!(shows_launch_failure(launch));
+        }
+        let any_sub = Exclusion {
+            rule: ExclusionRule::DesignedAnswer {
+                rel: "bin/g.py",
+                sub: None,
+                answers: &[DesignedExit { exit: 4, markers: &[&["refused: PAUSED"]] }],
+            },
+            ..e
+        };
+        assert!(any_sub.matches("bin/g.py", Some("drain"), "Exit code 4\nrefused: PAUSED", false));
+        assert!(any_sub.matches("bin/g.py", None, "Exit code 4\nrefused: PAUSED", false));
+        assert_eq!(leading_exit_code("\n  Exit code -1 \nx"), Some(-1));
+        assert_eq!(leading_exit_code("SyntaxError: x"), None);
+        assert_eq!(leading_exit_code("Exit code 9x"), None);
+    }
+
+    /// RULINGS BF3: ONE normaliser. A single-line text is masked exactly as `first_stable_line` always
+    /// did (so a `cys repair report --error "<one line>"` keeps its signature); a multi-line text skips
+    /// the `Exit code N` wrapper and takes a traceback's LAST exception line; `parse_report` uses it.
+    #[test]
+    fn one_normaliser_for_the_error_line() {
+        for one in [
+            "SyntaxError: invalid syntax (line 12) pid 48213 at /var/folders/xy/T/tmp.AbC9/run.py",
+            "KeyError: 'k' (pid 41234)",
+            "Traceback: KeyError 'k' (pid 40001)",
+            "Exit code 1",
+            "boom at 2026-11-13T01:02:03.123Z id deadbeefcafe1234",
+        ] {
+            assert_eq!(stable_error_line(one), first_stable_line(one), "a single line changed: {one:?}");
+        }
+        assert_eq!(stable_error_line("Exit code 1\nError: Cannot find module 'express'"), "Error: Cannot find module 'express'");
+        assert_eq!(
+            stable_error_line("Exit code 1\nTraceback (most recent call last):\n  File \"/x/a.py\", line 3, in <module>\n    import javis_y\nModuleNotFoundError: No module named 'javis_y'\n"),
+            "ModuleNotFoundError: No module named 'javis_y'"
+        );
+        let chained = "Traceback (most recent call last):\n  File \"a\", line 1\nKeyError: 'k'\n\nDuring handling of the above exception, another exception occurred:\n\nTraceback (most recent call last):\n  File \"a\", line 2\nValueError: bad (pid 77777)";
+        assert_eq!(stable_error_line(chained), "ValueError: bad (pid <n>)");
+        assert_eq!(stable_error_line("Exit code 2"), "Exit code 2", "nothing else → the exit line stays");
+        assert_eq!(stable_error_line("\n\nboom\nmore"), "boom");
+        // stdout before the traceback (Claude Code puts stdout first): the exception line still wins
+        assert_eq!(
+            stable_error_line("Exit code 1\nloading 12 rows\nTraceback (most recent call last):\n  File \"a\"\nKeyError: 'k'"),
+            "KeyError: 'k'"
+        );
+        // parse_report uses it: the same failure, wrapped or not, is one signature
+        let wrapped = parse_report("bin/a.py", "Exit code 1\nTraceback (most recent call last):\n  File \"/tmp/r1/a.py\", line 9\nKeyError: 'k' (pid 40001)").unwrap();
+        let plain = parse_report("bin/a.py", "KeyError: 'k' (pid 40002)").unwrap();
+        assert_eq!(wrapped.signature, plain.signature);
+        assert_eq!(wrapped.first_line, "KeyError: 'k' (pid <n>)");
+        assert_eq!(wrapped.error_class, "KeyError");
     }
 
     /// A broken row is listed, never fatal, and never overwritten by a report (one writer, O-C1-6).
