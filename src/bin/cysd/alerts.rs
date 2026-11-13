@@ -628,39 +628,47 @@ fn keep_best(map: &mut HashMap<(String, String), (f64, RateMeta)>, key: (String,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ★(0.15.0 · 「스스로 해결」 M4 · 설계 §4-4 · §6-4 (1)(4)(7) · RULINGS AD8 · track T3b) 결함 감지기
+// ★(0.15.0 · 「스스로 해결」 M4 · 설계 §4-4 · §6-4 (1)(4)(7) · RULINGS AD8, BF1–BF6 · track T3b) 결함 감지기
 // ─────────────────────────────────────────────────────────────────────────────
 //
 // The repeated-failure detection above (`evaluate` §3) judges per TOOL ("Bash 반복 실패") — useless for a
 // repair, which needs to know WHICH hook / script failed and how. This section adds that identity and turns a
 // repeated failure into ONE defect-intake row per signature (`repairs/intake/<lane_key>/<sig>.json`, T3's row
-// format and T3's `intake::signature` — O-C1-9), with the same thresholds (`AlertConfig` fail_count /
-// fail_rate / fail_min_calls) applied per identity.
+// format; the signature is T3's `intake::parse_report` over the ONE normaliser `intake::stable_error_line`,
+// RULINGS BF3), with the same thresholds (`AlertConfig` fail_count / fail_rate / fail_min_calls) applied per
+// identity over the same 7-day window.
 // The module's doctrine holds: ★자동응답 금지 — 감지·격상만. Escalation here is a ledger row (DATA, never
-// authority); nothing in this section queues, pushes, publishes, alerts or starts anything. The master hears
+// authority); nothing in this section queues, pushes, publishes, alerts or starts a repair. The master hears
 // at most one line per report-gate run, built by the gate from the ledger (T3, RULINGS AD5).
-// Where the identity comes from: the observation event `cys-hook.sh` already sends (`usage.event`) carries the
-// tool call's whole `tool_input` — for a shell call, the command that ran the pack hook / script. Nothing is
-// added to any hook (`_lib.sh` frame, appendix A 1-26 / 1-28).
+// IDENTITY (RULINGS BF1) = the EXECUTED program: a failure belongs to a pack hook / script only when that file
+// is what the shell call RAN — the program of the call's FINAL simple command, or the script operand of an
+// interpreter there — and only in THIS lane's pack. A mention (an argument of grep / cat / diff / a user's
+// script, a pipeline member piped onward, a heredoc body, a quoted string, a comment) is no identity.
+// INPUT (RULINGS BE1 — the CLI forwards it from Claude Code's `PostToolUseFailure`): `tool_name` "Bash",
+// `tool_input.command`, the top-level `error` (head + tail), `is_interrupt`; a call is a `PRE_TOOL` event.
 // Three places, three costs:
-//   ① `observe_tool_event` — on the hook's request path: MEMORY ONLY (no disk, no spawn, no lock but its own
-//      leaf mutexes) — the `hook.decide` arm's rule "핫패스 금지: 스폰 · 외부 조회 · fsync·디스크 쓰기".
+//   ① `observe_tool_event` — on the hook's request path: the command is classified BEFORE any lock (one
+//      bounded linear pass, RULINGS BF5), then a short update of in-memory tables under the detector's own
+//      leaf mutex. No disk, no spawn on the path (the flusher is started once, lazily, by an injectable hook).
 //   ② `flush_defect_intake` — on its own thread (`cysd-defect-intake`, 10 s): the row writes, under T3's
 //      per-file mutex (`intake:<sig>`, one writer per file) and the intake's OWN quota
 //      (`alert_route::IntakeShare` — never the general share, the clear reserve or the CSO queue).
 //      Never on the watchdog tick: a disk that stops answering must not stall seat-death detection (F3/F4).
 //   ③ the exclusion list (`cys::repair::intake::EXCLUSIONS` + this detector's `DETECTOR_EXCLUSIONS`) —
-//      failures that happen BY DESIGN never count.
+//      failures that happen BY DESIGN, on positive evidence only (RULINGS BF2), never count.
 
 /// Rollback switch of the detector (default on; `0`/`false`/`off`/`no` → off), read once per process.
 pub const DEFECT_INTAKE_ENV: &str = "CYS_DEFECT_INTAKE";
-/// Pack scripts tracked per daemon (beyond → counted in `over_bound`, not kept).
+/// Pack scripts tracked per daemon (beyond: the idlest one that has nothing due is evicted — RULINGS BF4).
 pub const DETECTOR_MAX_RELS: usize = 1024;
-/// Signatures tracked per daemon (beyond, an already-written signature with nothing pending is evicted;
-/// else the failure is counted in `over_bound`, not kept).
+/// Signatures tracked per daemon (beyond: the oldest one that is not due is evicted, else the oldest).
 pub const DETECTOR_MAX_SIGNATURES: usize = 512;
-/// How much of a command line is scanned for the identity.
+/// How much of a command line is classified (longer → cut at a char boundary).
 pub const COMMAND_SCAN_MAX_BYTES: usize = 64 * 1024;
+/// How much failure text is kept (longer → its head and its tail, where a traceback ends).
+pub const ERROR_KEEP_BYTES: usize = 32 * 1024;
+/// The rule's window in days — like `evaluate` §3's 7-day usage window (RULINGS BF4).
+pub const DETECTOR_WINDOW_DAYS: i64 = 7;
 /// The reporter label of rows the detector writes.
 pub const DETECTOR_REPORTER: &str = "detector";
 /// The flusher thread's period (seconds).
@@ -668,48 +676,81 @@ pub const FLUSH_TICK_SECS: u64 = 10;
 // "발견 즉시" (D:37): a row appears within one flusher period of the rule being met — keep it short.
 const _: () = assert!(FLUSH_TICK_SECS > 0 && FLUSH_TICK_SECS <= 30);
 
-/// The detector's own entries of the exclusion list (scope `Detector`): verdict tools whose non-zero
-/// exit IS their designed answer — matched only with the observed call's subcommand / exit code and
-/// never when the text carries a Python traceback (`intake::ExclusionRule::DesignedAnswer`). A start
-/// that polls `orchestra check` until READY would otherwise file "a defect" at every boot ("점검 도구의
-/// 실패 항목은 모든 좌석의 창 열기마다 다시 나오므로", D:658). Every exit set is the tool's own named
-/// constant (file:line beside it); usage errors, internal errors and crashes stay defects.
+/// The detector's own entries of the exclusion list (scope `Detector`): a verdict tool whose non-zero
+/// exit IS its designed answer — excluded only on POSITIVE evidence (RULINGS BF2): the exit code as the
+/// first line AND the tool's own fixed verdict marker for that code (read from the tool; file:line
+/// beside each), never when the text shows an interpreter or launch failure
+/// (`intake::shows_launch_failure`). A tool without a stable marker per answer has NO entry — its
+/// by-design "no" becomes one bundled row (D:658): `bin/javis_task.py` (its exits 3/4/5/8/9 are printed
+/// with different texts at different call sites).
 pub const DETECTOR_EXCLUSIONS: &[cys::repair::intake::Exclusion] = {
-    use cys::repair::intake::{Exclusion, ExclusionRule, ExclusionScope};
+    use cys::repair::intake::{DesignedExit, Exclusion, ExclusionRule, ExclusionScope};
     &[
-        // javis_resource_gate.py:90 EXIT_SOFT 1 / EXIT_HARD 2 (usage 64, internal 70 stay defects)
+        // javis_resource_gate.py:90 EXIT_SOFT 1 / EXIT_HARD 2; cmd_check prints `verdict: <v>` (text,
+        // :2528) or `"verdict": "<v>"` (--json, :2526). Usage 64 and internal 70 stay defects.
         Exclusion {
             reason: "designed-answer:javis_resource_gate.check",
             windows_only: false,
             scope: ExclusionScope::Detector,
-            rule: ExclusionRule::DesignedAnswer { rel: "bin/javis_resource_gate.py", sub: Some("check"), exits: &[1, 2] },
+            rule: ExclusionRule::DesignedAnswer {
+                rel: "bin/javis_resource_gate.py",
+                sub: Some("check"),
+                answers: &[
+                    DesignedExit { exit: 2, markers: &[&["verdict: hard_block"], &["\"verdict\": \"hard_block\""]] },
+                    DesignedExit { exit: 1, markers: &[&["verdict: soft_warn"], &["\"verdict\": \"soft_warn\""]] },
+                ],
+            },
         },
-        // javis_orchestra.py:794–798 CHECK_EXIT_MISSING 1 / UNJUDGEABLE 2 / ACK_PENDING 12
+        // javis_orchestra.py:794–798 CHECK_EXIT_MISSING 1 / UNJUDGEABLE 2 / ACK_PENDING 12; cmd_check's
+        // summary lines (:1146 "종합: 필수 …/… 생존 — 부재:", :1162 "… 각성 ACK 미확인", :1067 the status
+        // failure) or the --json payload id `"schema": "orchestra-check/v1"` with `"exit": N` (:1011, :1044).
         Exclusion {
             reason: "designed-answer:javis_orchestra.check",
             windows_only: false,
             scope: ExclusionScope::Detector,
-            rule: ExclusionRule::DesignedAnswer { rel: "bin/javis_orchestra.py", sub: Some("check"), exits: &[1, 2, 12] },
+            rule: ExclusionRule::DesignedAnswer {
+                rel: "bin/javis_orchestra.py",
+                sub: Some("check"),
+                answers: &[
+                    DesignedExit {
+                        exit: 1,
+                        markers: &[&["종합: 필수 ", " 생존 — 부재: "], &["\"schema\": \"orchestra-check/v1\"", "\"exit\": 1"]],
+                    },
+                    DesignedExit {
+                        exit: 12,
+                        markers: &[&["종합: ", "각성 ACK 미확인"], &["\"schema\": \"orchestra-check/v1\"", "\"exit\": 12"]],
+                    },
+                    DesignedExit {
+                        exit: 2,
+                        markers: &[&["[orchestra check] cys status 수집 실패"], &["\"schema\": \"orchestra-check/v1\"", "\"exit\": 2"]],
+                    },
+                ],
+            },
         },
-        // javis_task.py:284–286 NOTFOUND 3 / BLOCKED 4 / NO_EVIDENCE 5 / VERIFY 6 / DUP 8 / CONFLICT 9 (usage 2 stays a defect)
-        Exclusion {
-            reason: "designed-answer:javis_task",
-            windows_only: false,
-            scope: ExclusionScope::Detector,
-            rule: ExclusionRule::DesignedAnswer { rel: "bin/javis_task.py", sub: None, exits: &[3, 4, 5, 6, 8, 9] },
-        },
-        // javis_wakeup.py:71,75 EXIT_EMPTY 5 / EXIT_PAUSED 4 (usage 2, park failure 6 stay defects)
+        // javis_wakeup.py:71,75 EXIT_EMPTY 5 / EXIT_PAUSED 4; cmd_drain prints "refused: AUTOPILOT_PAUSED"
+        // (:656) or `"refused": "paused"` (:659) and "nothing pending" (:670); cmd_cancel "nothing to
+        // cancel" (:617) or `{"cancelled": 0` (:632). Usage 2 and park failure 6 stay defects.
         Exclusion {
             reason: "designed-answer:javis_wakeup",
             windows_only: false,
             scope: ExclusionScope::Detector,
-            rule: ExclusionRule::DesignedAnswer { rel: "bin/javis_wakeup.py", sub: None, exits: &[4, 5] },
+            rule: ExclusionRule::DesignedAnswer {
+                rel: "bin/javis_wakeup.py",
+                sub: None,
+                answers: &[
+                    DesignedExit { exit: 4, markers: &[&["refused: AUTOPILOT_PAUSED"], &["\"refused\": \"paused\""]] },
+                    DesignedExit {
+                        exit: 5,
+                        markers: &[&["nothing pending"], &["nothing to cancel"], &["\"cancelled\": 0"]],
+                    },
+                ],
+            },
         },
     ]
 };
 
-/// The detector's exclusion lookup: the list's shared table first (`intake::EXCLUSIONS` — T3's
-/// Windows `cys-dept` entry), then the detector's own entries. Returns the reason.
+/// The detector's exclusion lookup: the list's shared table first (`intake::EXCLUSIONS` — T3's Windows
+/// `cys-dept` entry), then the detector's own entries. Returns the reason.
 pub fn detector_excluded(rel: &str, sub: Option<&str>, error: &str, windows: bool) -> Option<&'static str> {
     use cys::repair::intake::{excluded_in, EXCLUSIONS};
     excluded_in(EXCLUSIONS, rel, sub, error, windows).or_else(|| excluded_in(DETECTOR_EXCLUSIONS, rel, sub, error, windows))
@@ -722,23 +763,90 @@ pub struct ToolObservation<'a> {
     pub event_type: &'a str,
     /// The raw hook event name (`PreToolUse`, `PostToolUse`, `PostToolUseFailure` …).
     pub raw_event: &'a str,
+    /// Claude Code's tool name; only `Bash` runs a command line.
+    pub tool_name: &'a str,
     pub tool_input: &'a Value,
     pub exit_code: Option<i64>,
-    /// The failure text, when the event carries one (Claude Code's `PostToolUseFailure` `error`).
+    /// The failure text (`PostToolUseFailure` `error`, head + tail — RULINGS BE1).
     pub error: Option<&'a str>,
-    /// The failure reached Claude Code as an abort (`is_interrupt`) — not a defect.
+    /// The failure reached Claude Code as an abort (`is_interrupt`) — not a failure of the script.
     pub interrupted: bool,
 }
 
-/// The pack hook / script a shell call ran.
+/// The pack hook / script a shell call RAN (RULINGS BF1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PackCall {
-    /// No pack script in the command.
+    /// The call ran no pack hook / script of this lane.
     None,
-    /// Exactly one pack script: its lane-independent pack-relative path and its first argument.
+    /// It ran exactly this one: its lane-independent pack-relative path and its first argument.
     One { rel: String, sub: Option<String> },
-    /// Two or more DIFFERENT pack scripts — which one failed is unknown (no misattribution).
-    Ambiguous,
+}
+
+/// This lane's pack-root spellings, built once per daemon: the daemon's own pack dir (and its Git Bash
+/// `/c/…` form, and its `~` / `$HOME` / `${HOME}` forms when it lies under the home), plus the seat's
+/// lane-scoped `$CYS_PACK_DIR` / `${CYS_PACK_DIR}` / `${CYS_PACK_DIR:-…}`. Another lane's pack, a copy
+/// in a test rig or any other directory is not this lane's pack.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PackRoots {
+    prefixes: Vec<String>,
+}
+
+fn slash_path(p: &str) -> String {
+    p.replace('\\', "/").trim_end_matches('/').to_string()
+}
+
+impl PackRoots {
+    pub fn new(pack_dir: Option<&str>, home: Option<&str>) -> Self {
+        let mut prefixes = vec!["$CYS_PACK_DIR/".to_string(), "${CYS_PACK_DIR}/".to_string()];
+        if let Some(pd) = pack_dir.map(slash_path).filter(|p| p.len() > 1) {
+            prefixes.push(format!("{pd}/"));
+            let b = pd.as_bytes();
+            if b.len() > 2 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'/' {
+                prefixes.push(format!("/{}{}/", (b[0] as char).to_ascii_lowercase(), &pd[2..]));
+            }
+            if let Some(h) = home.map(slash_path).filter(|h| h.len() > 1) {
+                if let Some(rest) = pd.strip_prefix(&h).filter(|r| r.starts_with('/')) {
+                    for head in ["~", "$HOME", "${HOME}"] {
+                        prefixes.push(format!("{head}{rest}/"));
+                    }
+                }
+            }
+        }
+        PackRoots { prefixes }
+    }
+
+    /// The rel of `word` when it names a hook / script inside this lane's pack. Linear in the word.
+    fn rel_of(&self, word: &str, steps: &mut usize) -> Option<String> {
+        let w = word.replace('\\', "/");
+        *steps += w.len();
+        let rest = if let Some(after) = w.strip_prefix("${CYS_PACK_DIR:") {
+            // `${CYS_PACK_DIR:-<default>}/…` — the matching `}` of THIS word, then `/` (one pass)
+            let mut depth = 1usize;
+            let mut close = None;
+            for (k, c) in after.char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = Some(k);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            after[close? + 1..].strip_prefix('/')?.to_string()
+        } else {
+            let p = self.prefixes.iter().find(|p| w.starts_with(p.as_str()))?;
+            w[p.len()..].to_string()
+        };
+        if rest.contains(['$', '`', '(', ')', '{', '}', '*', '?', '[', ']']) {
+            return None;
+        }
+        let rel = cys::repair::intake::normalize_rel(&rest).ok()?;
+        is_script_rel(&rel).then_some(rel)
+    }
 }
 
 /// The command string of a shell call (`tool_input.command`, a string or a list of strings).
@@ -766,9 +874,6 @@ fn cut_at_char_boundary(s: &str, max: usize) -> &str {
 
 /// A pack-relative path that names a hook / script (not a document, a glob or a directory).
 fn is_script_rel(rel: &str) -> bool {
-    if rel.contains(['*', '?', '[']) {
-        return false;
-    }
     let last = rel.rsplit('/').next().unwrap_or(rel);
     if last.is_empty() {
         return false;
@@ -781,7 +886,7 @@ fn is_script_rel(rel: &str) -> bool {
     }
 }
 
-/// `NAME=value` before a command (`FOO=1 cys-dept …`).
+/// `NAME=value` before a command (`FOO=1 python3 …`).
 fn is_env_assignment(w: &str) -> bool {
     match w.split_once('=') {
         Some((name, _)) => {
@@ -792,161 +897,500 @@ fn is_env_assignment(w: &str) -> bool {
     }
 }
 
-fn is_path_delim(c: char) -> bool {
-    c.is_whitespace() || matches!(c, '\'' | '"' | '`' | ';' | '|' | '&' | '(' | ')' | '<' | '>' | '$' | '{' | '}' | ',')
+/// How a simple command ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Term {
+    /// `;` `&&` `||` newline `(` `)` or the end — the next command (if any) runs after it.
+    Seq,
+    /// `|` `|&` — its output is piped onward; the exit code belongs to a later command.
+    Pipe,
+    /// `&` — backgrounded; its exit code is not the call's.
+    Background,
 }
 
-/// The path token starting at `s[at..]` and the first argument after it.
-fn token_and_sub(s: &str, at: usize) -> (String, Option<String>) {
-    let rest = &s[at..];
-    let end = rest.find(is_path_delim).unwrap_or(rest.len());
-    let token = rest[..end].to_string();
-    let after = rest[end..].trim_start_matches(['\'', '"']).trim_start();
-    let word: String = after
-        .chars()
-        .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
-        .collect();
-    let sub = (!word.is_empty() && !word.starts_with('-')).then_some(word);
-    (token, sub)
-}
+/// The words of the call's FINAL simple command — the one whose exit code is the call's — read by ONE
+/// left-to-right pass over the command (every char is visited once; a heredoc body is skipped while
+/// passing over it; `steps` counts the visits — RULINGS BF5). Quotes are removed from words (a quoted
+/// string is ONE word and is never parsed as a command); `$(…)`, `` `…` ``, `${…}`, `<(…)` stay inside
+/// their word; comments, redirection targets and heredoc bodies are dropped. `None` when the final
+/// command is piped onward or backgrounded.
+fn final_simple_command(src: &str, steps: &mut usize) -> Option<Vec<String>> {
+    let cs: Vec<char> = src.chars().collect();
+    let n = cs.len();
+    let mut i = 0usize;
+    let mut cur: Vec<String> = Vec::new();
+    let mut last: Option<(Vec<String>, Term)> = None;
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut skip_word = false; // the next word is a redirection target / here-string
+    let mut heredocs: Vec<(String, bool)> = Vec::new();
+    let mut want_delim: Option<bool> = None; // after `<<` / `<<-`: the next word is a heredoc delimiter
 
-/// The identity of a shell call: the ONE pack hook / script it ran (design §6-4 (1)). Recognised spellings
-/// of the pack root: `…/.cys/pack/`, `…/.cys/pack-dept-<name>/` (a department's pack), `$CYS_PACK_DIR/`,
-/// `${CYS_PACK_DIR}/`, `${CYS_PACK_DIR:-…}/`, the daemon's own pack dir (`pack_dir`), and `cys-dept` at a
-/// command position (`bin/cys-dept`). Windows `\` is read as `/`. The rel is lane-independent (O-C1-9) and
-/// passes T3's `intake::normalize_rel` (no `..`, not absolute).
-pub fn pack_call(tool_input: &Value, pack_dir: Option<&str>) -> PackCall {
-    let Some(cmd) = shell_command(tool_input) else {
-        return PackCall::None;
-    };
-    let s = cut_at_char_boundary(&cmd, COMMAND_SCAN_MAX_BYTES).replace('\\', "/");
-    let own = pack_dir
-        .map(|p| p.replace('\\', "/").trim_end_matches('/').to_string())
-        .filter(|p| p.len() > 1)
-        .map(|p| format!("{p}/"));
-    let mut found: Vec<(String, Option<String>)> = Vec::new();
-    let mut push = |rel: String, sub: Option<String>| {
-        if let Ok(rel) = cys::repair::intake::normalize_rel(&rel) {
-            if is_script_rel(&rel) && !found.iter().any(|(r, _)| *r == rel) {
-                found.push((rel, sub));
+    fn end_word(word: &mut String, in_word: &mut bool, skip_word: &mut bool, want_delim: &mut Option<bool>, heredocs: &mut Vec<(String, bool)>, cur: &mut Vec<String>) {
+        if !*in_word {
+            return;
+        }
+        if let Some(strip) = want_delim.take() {
+            heredocs.push((std::mem::take(word), strip));
+        } else if *skip_word {
+            *skip_word = false;
+            word.clear();
+        } else {
+            cur.push(std::mem::take(word));
+        }
+        *in_word = false;
+    }
+    fn end_cmd(cur: &mut Vec<String>, last: &mut Option<(Vec<String>, Term)>, term: Term) {
+        if !cur.is_empty() {
+            *last = Some((std::mem::take(cur), term));
+        } else if let Some((_, t)) = last.as_mut() {
+            // `a &` then `;` — the empty command does not hide the background / pipe ending
+            if term != Term::Seq {
+                *t = term;
             }
         }
-    };
-    let mut i = 0;
-    while i < s.len() {
-        if !s.is_char_boundary(i) {
-            i += 1;
-            continue;
-        }
-        let rest = &s[i..];
-        // the start of the rel inside `s`, when a pack-root spelling starts at i
-        let start: Option<usize> = if rest.starts_with(".cys/pack/") {
-            Some(i + ".cys/pack/".len())
-        } else if let Some(r) = rest.strip_prefix(".cys/pack-dept-") {
-            let name = r
-                .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))
-                .unwrap_or(r.len());
-            (name > 0 && r[name..].starts_with('/')).then(|| i + ".cys/pack-dept-".len() + name + 1)
-        } else if rest.starts_with("$CYS_PACK_DIR/") {
-            Some(i + "$CYS_PACK_DIR/".len())
-        } else if rest.starts_with("${CYS_PACK_DIR}") || rest.starts_with("${CYS_PACK_DIR:") {
-            // the matching `}` (the default may hold `${HOME}`), then `/`
-            let mut depth = 0usize;
-            let mut close = None;
-            for (k, c) in rest.char_indices() {
-                match c {
-                    '{' => depth += 1,
-                    '}' => {
-                        depth = depth.saturating_sub(1);
-                        if depth == 0 {
-                            close = Some(k);
+    }
+    macro_rules! ew {
+        () => {
+            end_word(&mut word, &mut in_word, &mut skip_word, &mut want_delim, &mut heredocs, &mut cur)
+        };
+    }
+
+    while i < n {
+        let c = cs[i];
+        *steps += 1;
+        match c {
+            ' ' | '\t' | '\r' => {
+                ew!();
+                i += 1;
+            }
+            '\n' => {
+                ew!();
+                end_cmd(&mut cur, &mut last, Term::Seq);
+                i += 1;
+                // heredoc bodies start on the next line: skip each up to its delimiter line
+                for (delim, strip) in std::mem::take(&mut heredocs) {
+                    while i < n {
+                        let start = i;
+                        while i < n && cs[i] != '\n' {
+                            i += 1;
+                        }
+                        *steps += i - start + 1;
+                        let line: String = cs[start..i].iter().collect();
+                        let line = if strip { line.trim_start_matches('\t').to_string() } else { line };
+                        i += 1; // past the newline
+                        if line == delim {
                             break;
                         }
                     }
-                    _ => {}
                 }
             }
-            close
-                .filter(|k| rest[k + 1..].starts_with('/'))
-                .map(|k| i + k + 2)
-        } else {
-            own.as_deref()
-                .filter(|o| rest.starts_with(*o))
-                .map(|o| i + o.len())
-        };
-        if let Some(at) = start {
-            let (rel, sub) = token_and_sub(&s, at);
-            let consumed = rel.len();
-            push(rel, sub);
-            i = at + consumed.max(1);
-            continue;
-        }
-        i += 1;
-    }
-    // `cys-dept` at a command position (the pack's `bin/cys-dept`, reached through PATH)
-    for seg in s.split([';', '|', '&', '(', ')', '\n']) {
-        let mut words = seg.split_whitespace().skip_while(|w| {
-            is_env_assignment(w)
-                || matches!(*w, "sudo" | "exec" | "command" | "env" | "time" | "nohup" | "!" | "then" | "do" | "else")
-        });
-        if let Some(w) = words.next() {
-            let w = w.trim_matches(['\'', '"']);
-            if w == "cys-dept" || w.ends_with("/.local/bin/cys-dept") {
-                let sub = words
-                    .next()
-                    .map(|x| x.trim_matches(['\'', '"']).to_string())
-                    .filter(|x| !x.is_empty() && !x.starts_with('-'));
-                push("bin/cys-dept".to_string(), sub);
+            '#' if !in_word => {
+                while i < n && cs[i] != '\n' {
+                    i += 1;
+                    *steps += 1;
+                }
+            }
+            '\\' => {
+                if i + 1 < n && cs[i + 1] == '\n' {
+                    i += 2; // line continuation
+                } else {
+                    if i + 1 < n {
+                        word.push(cs[i + 1]);
+                    }
+                    in_word = true;
+                    i += 2;
+                }
+                *steps += 1;
+            }
+            '\'' => {
+                in_word = true;
+                i += 1;
+                while i < n && cs[i] != '\'' {
+                    word.push(cs[i]);
+                    i += 1;
+                    *steps += 1;
+                }
+                i += 1;
+            }
+            '"' => {
+                in_word = true;
+                i += 1;
+                while i < n && cs[i] != '"' {
+                    if cs[i] == '\\' && i + 1 < n && matches!(cs[i + 1], '"' | '\\' | '$' | '`') {
+                        i += 1;
+                        *steps += 1;
+                    }
+                    word.push(cs[i]);
+                    i += 1;
+                    *steps += 1;
+                }
+                i += 1;
+            }
+            '$' if i + 1 < n && (cs[i + 1] == '(' || cs[i + 1] == '{') => {
+                // `$(…)` / `${…}` stay inside the word, nested pairs counted (one pass)
+                let (open, close) = if cs[i + 1] == '(' { ('(', ')') } else { ('{', '}') };
+                in_word = true;
+                word.push('$');
+                word.push(open);
+                i += 2;
+                let mut depth = 1usize;
+                while i < n && depth > 0 {
+                    let d = cs[i];
+                    if d == open {
+                        depth += 1;
+                    } else if d == close {
+                        depth -= 1;
+                    }
+                    word.push(d);
+                    i += 1;
+                    *steps += 1;
+                }
+            }
+            '`' => {
+                in_word = true;
+                word.push('`');
+                i += 1;
+                while i < n && cs[i] != '`' {
+                    word.push(cs[i]);
+                    i += 1;
+                    *steps += 1;
+                }
+                word.push('`');
+                i += 1;
+            }
+            ';' | '(' | ')' => {
+                ew!();
+                end_cmd(&mut cur, &mut last, Term::Seq);
+                i += 1;
+            }
+            '&' => {
+                if i + 1 < n && cs[i + 1] == '&' {
+                    ew!();
+                    end_cmd(&mut cur, &mut last, Term::Seq);
+                    i += 2;
+                } else if i + 1 < n && cs[i + 1] == '>' {
+                    ew!(); // `&>` / `&>>`: a redirection of both streams
+                    i += 2;
+                    if i < n && cs[i] == '>' {
+                        i += 1;
+                    }
+                    skip_word = true;
+                } else {
+                    ew!();
+                    end_cmd(&mut cur, &mut last, Term::Background);
+                    i += 1;
+                }
+            }
+            '|' => {
+                ew!();
+                if i + 1 < n && cs[i + 1] == '|' {
+                    end_cmd(&mut cur, &mut last, Term::Seq);
+                    i += 2;
+                } else {
+                    end_cmd(&mut cur, &mut last, Term::Pipe);
+                    i += if i + 1 < n && cs[i + 1] == '&' { 2 } else { 1 };
+                }
+            }
+            '<' | '>' => {
+                // an fd number right before it (`2>`) is part of the redirection, not a word
+                if in_word && !word.is_empty() && word.chars().all(|d| d.is_ascii_digit()) {
+                    word.clear();
+                    in_word = false;
+                }
+                ew!();
+                if i + 1 < n && cs[i + 1] == '(' {
+                    // process substitution: a word of its own, dropped
+                    i += 2;
+                    let mut depth = 1usize;
+                    while i < n && depth > 0 {
+                        if cs[i] == '(' {
+                            depth += 1;
+                        } else if cs[i] == ')' {
+                            depth -= 1;
+                        }
+                        i += 1;
+                        *steps += 1;
+                    }
+                } else if c == '<' && i + 2 < n && cs[i + 1] == '<' && cs[i + 2] == '<' {
+                    i += 3; // here-string: the next word is data
+                    skip_word = true;
+                } else if c == '<' && i + 1 < n && cs[i + 1] == '<' {
+                    i += 2;
+                    let strip = i < n && cs[i] == '-';
+                    if strip {
+                        i += 1;
+                    }
+                    want_delim = Some(strip);
+                } else {
+                    i += 1;
+                    while i < n && matches!(cs[i], '>' | '<' | '|') {
+                        i += 1;
+                        *steps += 1;
+                    }
+                    if i < n && cs[i] == '&' {
+                        // `>&2`, `2>&1`, `<&-`: the fd is part of the operator
+                        i += 1;
+                        while i < n && (cs[i].is_ascii_digit() || cs[i] == '-') {
+                            i += 1;
+                            *steps += 1;
+                        }
+                    } else {
+                        skip_word = true;
+                    }
+                }
+            }
+            _ => {
+                in_word = true;
+                word.push(c);
+                i += 1;
             }
         }
     }
-    match found.len() {
-        0 => PackCall::None,
-        1 => {
-            let (rel, sub) = found.remove(0);
-            PackCall::One { rel, sub }
-        }
-        _ => PackCall::Ambiguous,
+    ew!();
+    end_cmd(&mut cur, &mut last, Term::Seq);
+    match last {
+        Some((words, Term::Seq)) => Some(words),
+        _ => None,
     }
 }
 
-/// The text a detector signature is computed from (then T3's `intake::parse_report`, unchanged):
-/// a leading `Exit code N` line (Claude Code's shell-failure wrapper) is dropped when more text follows;
-/// a Python traceback gives its exception line (the last unindented line after the last
-/// `Traceback (most recent call last):`) — otherwise every crash of one script would share the line
-/// "Traceback (most recent call last):".
-pub fn detector_error_text(raw: &str) -> String {
-    let cut = cut_at_char_boundary(raw, cys::repair::intake::MAX_ERROR_BYTES);
-    let lines: Vec<&str> = cut.lines().collect();
-    let Some(first) = lines.iter().position(|l| !l.trim().is_empty()) else {
-        return cut.trim().to_string();
+/// The next word as a subcommand (`None` for a flag or nothing).
+fn sub_at(words: &[String], k: usize) -> Option<String> {
+    words
+        .get(k)
+        .filter(|w| !w.is_empty() && !w.starts_with('-'))
+        .map(|w| w.chars().take(64).collect())
+}
+
+/// The script operand of an interpreter at `words[k]` (`None` = runs inline code / a module / nothing).
+fn interpreter_operand(prog: &str, words: &[String], mut k: usize) -> Option<usize> {
+    let base = prog.rsplit('/').next().unwrap_or(prog);
+    let base = base.strip_suffix(".exe").or_else(|| base.strip_suffix(".EXE")).unwrap_or(base);
+    let is_python = base == "py"
+        || base
+            .strip_prefix("python")
+            .is_some_and(|v| v.chars().all(|c| c.is_ascii_digit() || c == '.'));
+    let is_shell = matches!(base, "sh" | "bash" | "zsh");
+    let is_node = base == "node";
+    let is_pwsh = base.eq_ignore_ascii_case("pwsh");
+    if !(is_python || is_shell || is_node || is_pwsh) {
+        return None;
+    }
+    while let Some(w) = words.get(k) {
+        if w == "--" {
+            return (k + 1 < words.len()).then_some(k + 1);
+        }
+        let flag = w.starts_with('-') || (is_shell && w.starts_with('+'));
+        if !flag {
+            return Some(k);
+        }
+        let low = w.to_ascii_lowercase();
+        if is_python {
+            let letters = &w[1..];
+            if !w.starts_with("--") && (letters.contains('c') || letters.contains('m')) {
+                return None; // `-c code` / `-m module`
+            }
+            if w == "-W" || w == "-X" {
+                k += 1;
+            }
+        } else if is_shell {
+            if !w.starts_with("--") && w[1..].contains('c') {
+                return None; // `-c string`
+            }
+            if matches!(w.as_str(), "-o" | "+o" | "-O" | "+O") {
+                k += 1;
+            }
+        } else if is_node {
+            if matches!(w.as_str(), "-e" | "--eval" | "-p" | "--print") {
+                return None;
+            }
+            if matches!(w.as_str(), "-r" | "--require" | "--import" | "--loader" | "--experimental-loader" | "-C" | "--conditions") {
+                k += 1;
+            }
+        } else {
+            if matches!(low.as_str(), "-file" | "-f") {
+                return (k + 1 < words.len()).then_some(k + 1);
+            }
+            if matches!(low.as_str(), "-command" | "-c" | "-encodedcommand" | "-e" | "-ec") {
+                return None;
+            }
+            if matches!(
+                low.as_str(),
+                "-executionpolicy" | "-ex" | "-ep" | "-workingdirectory" | "-wd" | "-configurationname" | "-outputformat" | "-of" | "-inputformat" | "-if" | "-windowstyle" | "-w" | "-version" | "-v" | "-settingsfile" | "-custompipename"
+            ) {
+                k += 1;
+            }
+        }
+        k += 1;
+    }
+    None
+}
+
+/// The identity of a shell call (RULINGS BF1): the pack hook / script of THIS lane that the call RAN —
+/// the program of its final simple command (after `NAME=value` assignments and `exec` / `command` /
+/// `nohup` / `time` / `env`), or the script operand of `python` / `python3` / `py` / `sh` / `bash` /
+/// `zsh` / `node` / `pwsh` there; `cys-dept` run through PATH is the pack's `bin/cys-dept`. Linear in
+/// the command's length (RULINGS BF5).
+pub fn pack_call(tool_input: &Value, roots: &PackRoots) -> PackCall {
+    pack_call_counted(tool_input, roots).0
+}
+
+/// [`pack_call`] and the number of steps it took (the linear-cost pin of RULINGS BF5).
+pub fn pack_call_counted(tool_input: &Value, roots: &PackRoots) -> (PackCall, usize) {
+    let mut steps = 0usize;
+    let Some(cmd) = shell_command(tool_input) else {
+        return (PackCall::None, steps);
     };
-    let mut start = first;
-    if cys::repair::intake::leading_exit_code(lines[first]).is_some()
-        && lines[first + 1..].iter().any(|l| !l.trim().is_empty())
-    {
-        start = first + 1;
+    let cmd = cut_at_char_boundary(&cmd, COMMAND_SCAN_MAX_BYTES);
+    let Some(words) = final_simple_command(cmd, &mut steps) else {
+        return (PackCall::None, steps);
+    };
+    let mut k = 0;
+    while words.get(k).is_some_and(|w| is_env_assignment(w)) {
+        k += 1;
     }
-    let rest = &lines[start..];
-    if let Some(j) = rest
-        .iter()
-        .rposition(|l| l.trim_start().starts_with("Traceback (most recent call last)"))
-    {
-        if let Some(exc) = rest[j + 1..]
-            .iter()
-            .rev()
-            .find(|l| !l.trim().is_empty() && !l.starts_with(char::is_whitespace))
-        {
-            return exc.trim().to_string();
+    loop {
+        match words.get(k).map(String::as_str) {
+            Some("exec" | "nohup") => k += 1,
+            Some("command") => {
+                k += 1;
+                while let Some(w) = words.get(k).filter(|w| w.starts_with('-')) {
+                    if w == "-v" || w == "-V" {
+                        return (PackCall::None, steps); // a lookup, not a run
+                    }
+                    k += 1;
+                }
+            }
+            Some("time") => {
+                k += 1;
+                while words.get(k).is_some_and(|w| w.starts_with('-')) {
+                    k += 1;
+                }
+            }
+            Some("env") => {
+                k += 1;
+                while let Some(w) = words.get(k) {
+                    if w == "-u" || w == "--unset" {
+                        k += 2;
+                    } else if w.starts_with('-') || is_env_assignment(w) {
+                        k += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            _ => break,
         }
     }
-    rest.join("\n").trim().to_string()
+    let Some(prog) = words.get(k) else {
+        return (PackCall::None, steps);
+    };
+    if let Some(rel) = roots.rel_of(prog, &mut steps) {
+        return (PackCall::One { rel, sub: sub_at(&words, k + 1) }, steps);
+    }
+    if prog == "cys-dept" || prog.ends_with("/.local/bin/cys-dept") {
+        return (PackCall::One { rel: "bin/cys-dept".into(), sub: sub_at(&words, k + 1) }, steps);
+    }
+    if let Some(op) = interpreter_operand(prog, &words, k + 1) {
+        if let Some(rel) = roots.rel_of(&words[op], &mut steps) {
+            return (PackCall::One { rel, sub: sub_at(&words, op + 1) }, steps);
+        }
+    }
+    (PackCall::None, steps)
 }
 
+/// What one observation is, decided WITHOUT the detector's state (so it runs before the lock).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Classified {
+    /// Not a call / failure of this lane's pack script (counted when it was a failure).
+    Ignored { failure: bool },
+    Call { rel: String },
+    Excluded { reason: &'static str },
+    /// A failure of `rel` without a text → it counts toward the rate but forms no signature (O-C1-9).
+    FailureNoText { rel: String },
+    Failure { report: cys::repair::intake::Report },
+}
+
+fn is_failure(o: &ToolObservation<'_>) -> bool {
+    !o.interrupted
+        && (o.raw_event == "PostToolUseFailure"
+            || o.event_type == "PostToolUseFailure"
+            || (o.event_type == "POST_TOOL" && o.exit_code.is_some_and(|c| c != 0)))
+}
+
+/// Keeps a failure text bounded: the whole text up to [`ERROR_KEEP_BYTES`], else its head and its tail.
+fn bounded_error(e: &str) -> std::borrow::Cow<'_, str> {
+    if e.len() <= ERROR_KEEP_BYTES {
+        return std::borrow::Cow::Borrowed(e);
+    }
+    let head = cut_at_char_boundary(e, ERROR_KEEP_BYTES / 2);
+    let mut t = e.len() - ERROR_KEEP_BYTES / 2;
+    while !e.is_char_boundary(t) {
+        t += 1;
+    }
+    std::borrow::Cow::Owned(format!("{head}\n…\n{}", &e[t..]))
+}
+
+/// ① part 1 — PURE and lock-free: identity, failure or call, exclusion, signature.
+pub fn classify(o: &ToolObservation<'_>, roots: &PackRoots, windows: bool) -> Classified {
+    let failure = is_failure(o);
+    let call = !failure && !o.interrupted && o.event_type == "PRE_TOOL";
+    if (!failure && !call) || o.tool_name != "Bash" {
+        return Classified::Ignored { failure };
+    }
+    let (rel, sub) = match pack_call(o.tool_input, roots) {
+        PackCall::None => return Classified::Ignored { failure },
+        PackCall::One { rel, sub } => (rel, sub),
+    };
+    if call {
+        return Classified::Call { rel };
+    }
+    let raw = o.error.map(bounded_error).filter(|e| !e.trim().is_empty());
+    if let Some(reason) = detector_excluded(&rel, sub.as_deref(), raw.as_deref().unwrap_or(""), windows) {
+        return Classified::Excluded { reason };
+    }
+    match raw.as_deref().map(|e| cys::repair::intake::parse_report(&rel, e)) {
+        Some(Ok(report)) => Classified::Failure { report },
+        _ => Classified::FailureNoText { rel },
+    }
+}
+
+/// One script's calls and failures per day (the rule's window — RULINGS BF4).
 #[derive(Clone, Debug, Default)]
 struct RelStats {
-    calls: u64,
-    fails: u64,
+    days: std::collections::VecDeque<(i64, u64, u64)>,
+    last_seen: f64,
+}
+
+fn day_of(t: f64) -> i64 {
+    (t / 86_400.0).floor() as i64
+}
+
+impl RelStats {
+    fn add(&mut self, now: f64, calls: u64, fails: u64) {
+        let d = day_of(now);
+        while self.days.front().is_some_and(|(x, _, _)| *x <= d - DETECTOR_WINDOW_DAYS) {
+            self.days.pop_front();
+        }
+        match self.days.back_mut() {
+            Some((x, c, f)) if *x == d => {
+                *c = c.saturating_add(calls);
+                *f = f.saturating_add(fails);
+            }
+            _ => self.days.push_back((d, calls, fails)),
+        }
+        self.last_seen = self.last_seen.max(now);
+    }
+
+    /// (calls, failures) inside the window.
+    fn totals(&self, now: f64) -> (u64, u64) {
+        let d = day_of(now);
+        self.days
+            .iter()
+            .filter(|(x, _, _)| *x > d - DETECTOR_WINDOW_DAYS)
+            .fold((0, 0), |(c, f), (_, x, y)| (c + x, f + y))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -966,11 +1410,12 @@ pub struct DetectorCounters {
     pub calls: u64,
     pub failures: u64,
     pub failures_without_identity: u64,
-    pub ambiguous: u64,
     pub no_error_text: u64,
     pub excluded: u64,
     pub excluded_by_reason: std::collections::BTreeMap<&'static str, u64>,
-    pub over_bound: u64,
+    pub evicted_signatures: u64,
+    pub evicted_pending_signatures: u64,
+    pub evicted_rels: u64,
     pub rows_new: u64,
     pub rows_updated: u64,
     pub corrupt_rows: u64,
@@ -982,13 +1427,14 @@ pub struct DetectorCounters {
 pub struct Detector {
     rels: HashMap<String, RelStats>,
     sigs: HashMap<String, SigStats>,
+    /// The rule's thresholds, refreshed by the flusher from alerts-config.json (no I/O on the hook path).
+    cfg: AlertConfig,
     pub counters: DetectorCounters,
 }
 
 /// What one observation did (for the tests and the counters).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Observed {
-    /// Not a call / failure of a pack script.
     Ignored,
     Call,
     /// A failure with a signature, counted for its row.
@@ -997,50 +1443,72 @@ pub enum Observed {
     NoErrorText,
     /// On the exclusion list (the reason is counted in `DetectorCounters::excluded_by_reason`).
     Excluded,
-    Ambiguous,
-    OverBound,
 }
 
-fn is_failure(o: &ToolObservation<'_>) -> bool {
-    !o.interrupted
-        && (o.raw_event == "PostToolUseFailure"
-            || o.event_type == "PostToolUseFailure"
-            || (o.event_type == "POST_TOOL" && o.exit_code.is_some_and(|c| c != 0)))
+/// The repeated-failure rule of `evaluate` §3, per IDENTITY, inside the window: failures ≥ `fail_count`,
+/// calls ≥ `fail_min_calls`, failure rate ≥ `fail_rate` (calls = max(PRE_TOOL count, failures)).
+fn rel_meets(r: &RelStats, cfg: &AlertConfig, now: f64) -> bool {
+    let (calls, fails) = r.totals(now);
+    let calls = calls.max(fails);
+    fails >= cfg.fail_count && calls >= cfg.fail_min_calls && calls > 0 && (fails as f64 / calls as f64) >= cfg.fail_rate
 }
 
 impl Detector {
-    fn bump_rel(&mut self, rel: &str, f: impl FnOnce(&mut RelStats)) -> bool {
-        if let Some(r) = self.rels.get_mut(rel) {
-            f(r);
-            return true;
-        }
-        if self.rels.len() >= DETECTOR_MAX_RELS {
-            return false;
-        }
-        let mut r = RelStats::default();
-        f(&mut r);
-        self.rels.insert(rel.to_string(), r);
-        true
+    fn is_due(&self, s: &SigStats, now: f64) -> bool {
+        s.unflushed > 0 && (s.written || self.rels.get(&s.report.rel).is_some_and(|r| rel_meets(r, &self.cfg, now)))
     }
 
-    /// Room for one more signature: evict the oldest signature that is written and has nothing pending.
-    fn make_room(&mut self) -> bool {
-        if self.sigs.len() < DETECTOR_MAX_SIGNATURES {
-            return true;
+    /// Room for one more script: evict the idlest script that has no due signature, else the idlest.
+    fn room_for_rel(&mut self, now: f64) {
+        if self.rels.len() < DETECTOR_MAX_RELS {
+            return;
         }
-        let victim = self
+        let busy: std::collections::HashSet<&str> = self
             .sigs
-            .iter()
-            .filter(|(_, s)| s.written && s.unflushed == 0)
-            .min_by(|a, b| a.1.last_seen.total_cmp(&b.1.last_seen).then_with(|| a.0.cmp(b.0)))
-            .map(|(k, _)| k.clone());
-        match victim {
-            Some(k) => {
-                self.sigs.remove(&k);
-                true
-            }
-            None => false,
+            .values()
+            .filter(|s| self.is_due(s, now))
+            .map(|s| s.report.rel.as_str())
+            .collect();
+        let pick = |only_idle: bool| {
+            self.rels
+                .iter()
+                .filter(|(k, _)| !only_idle || !busy.contains(k.as_str()))
+                .min_by(|a, b| a.1.last_seen.total_cmp(&b.1.last_seen).then_with(|| a.0.cmp(b.0)))
+                .map(|(k, _)| k.clone())
+        };
+        if let Some(k) = pick(true).or_else(|| pick(false)) {
+            self.rels.remove(&k);
+            self.counters.evicted_rels += 1;
         }
+    }
+
+    /// Room for one more signature: evict the oldest that is not due, else the oldest (RULINGS BF4 —
+    /// a full table never blinds the detector: a NEW defect is always recorded).
+    fn room_for_sig(&mut self, now: f64) {
+        if self.sigs.len() < DETECTOR_MAX_SIGNATURES {
+            return;
+        }
+        let pick = |only_not_due: bool| {
+            self.sigs
+                .iter()
+                .filter(|(_, s)| !only_not_due || !self.is_due(s, now))
+                .min_by(|a, b| a.1.last_seen.total_cmp(&b.1.last_seen).then_with(|| a.0.cmp(b.0)))
+                .map(|(k, s)| (k.clone(), s.unflushed > 0))
+        };
+        if let Some((k, pending)) = pick(true).or_else(|| pick(false)) {
+            self.sigs.remove(&k);
+            self.counters.evicted_signatures += 1;
+            if pending {
+                self.counters.evicted_pending_signatures += 1;
+            }
+        }
+    }
+
+    fn bump_rel(&mut self, rel: &str, now: f64, calls: u64, fails: u64) {
+        if !self.rels.contains_key(rel) {
+            self.room_for_rel(now);
+        }
+        self.rels.entry(rel.to_string()).or_default().add(now, calls, fails);
     }
 
     /// Tracked sizes (rels, signatures, signatures with a pending count).
@@ -1050,93 +1518,56 @@ impl Detector {
     }
 }
 
-/// One observation → memory (PURE: no disk, no spawn, no queue, no bus). A call = `PRE_TOOL` of a pack
-/// script; a failure = `PostToolUseFailure` or `POST_TOOL` with exit ≠ 0 (an abort is not a failure).
-/// The exclusion list is applied BEFORE anything is counted; a failure without text counts toward the
-/// script's rate but forms no signature.
-pub fn observe(det: &mut Detector, o: &ToolObservation<'_>, pack_dir: Option<&str>, now: f64, windows: bool) -> Observed {
-    let failure = is_failure(o);
-    let call = !failure && o.event_type == "PRE_TOOL";
-    if !failure && !call {
-        return Observed::Ignored;
-    }
-    let (rel, sub) = match pack_call(o.tool_input, pack_dir) {
-        PackCall::None => {
+/// ① part 2 — the short update under the detector's lock (bounded: map updates; a table scan of at most
+/// [`DETECTOR_MAX_SIGNATURES`] + [`DETECTOR_MAX_RELS`] entries only when a table is full).
+pub fn record(det: &mut Detector, c: Classified, now: f64) -> Observed {
+    match c {
+        Classified::Ignored { failure } => {
             if failure {
                 det.counters.failures_without_identity += 1;
             }
-            return Observed::Ignored;
+            Observed::Ignored
         }
-        PackCall::Ambiguous => {
-            if failure {
-                det.counters.ambiguous += 1;
+        Classified::Call { rel } => {
+            det.bump_rel(&rel, now, 1, 0);
+            det.counters.calls += 1;
+            Observed::Call
+        }
+        Classified::Excluded { reason } => {
+            det.counters.failures += 1;
+            det.counters.excluded += 1;
+            *det.counters.excluded_by_reason.entry(reason).or_insert(0) += 1;
+            Observed::Excluded
+        }
+        Classified::FailureNoText { rel } => {
+            det.counters.failures += 1;
+            det.counters.no_error_text += 1;
+            det.bump_rel(&rel, now, 0, 1);
+            Observed::NoErrorText
+        }
+        Classified::Failure { report } => {
+            det.counters.failures += 1;
+            det.bump_rel(&report.rel, now, 0, 1);
+            if let Some(s) = det.sigs.get_mut(&report.signature) {
+                s.unflushed = s.unflushed.saturating_add(1);
+                s.last_seen = now;
+                return Observed::Failure;
             }
-            return Observed::Ambiguous;
+            det.room_for_sig(now);
+            det.sigs.insert(
+                report.signature.clone(),
+                SigStats { report, unflushed: 1, first_seen: now, last_seen: now, written: false },
+            );
+            Observed::Failure
         }
-        PackCall::One { rel, sub } => (rel, sub),
-    };
-    if call {
-        if !det.bump_rel(&rel, |r| r.calls += 1) {
-            det.counters.over_bound += 1;
-            return Observed::OverBound;
-        }
-        det.counters.calls += 1;
-        return Observed::Call;
     }
-    det.counters.failures += 1;
-    let raw = o
-        .error
-        .map(|e| cut_at_char_boundary(e, cys::repair::intake::MAX_ERROR_BYTES))
-        .filter(|e| !e.trim().is_empty());
-    if let Some(reason) = detector_excluded(&rel, sub.as_deref(), raw.unwrap_or(""), windows) {
-        det.counters.excluded += 1;
-        *det.counters.excluded_by_reason.entry(reason).or_insert(0) += 1;
-        return Observed::Excluded;
-    }
-    if !det.bump_rel(&rel, |r| r.fails += 1) {
-        det.counters.over_bound += 1;
-        return Observed::OverBound;
-    }
-    let Some(raw) = raw else {
-        det.counters.no_error_text += 1;
-        return Observed::NoErrorText;
-    };
-    let Ok(report) = cys::repair::intake::parse_report(&rel, &detector_error_text(raw)) else {
-        det.counters.no_error_text += 1;
-        return Observed::NoErrorText;
-    };
-    let signature = report.signature.clone();
-    if let Some(s) = det.sigs.get_mut(&signature) {
-        s.unflushed = s.unflushed.saturating_add(1);
-        s.last_seen = now;
-        return Observed::Failure;
-    }
-    if !det.make_room() {
-        det.counters.over_bound += 1;
-        return Observed::OverBound;
-    }
-    det.sigs.insert(
-        signature.clone(),
-        SigStats {
-            report,
-            unflushed: 1,
-            first_seen: now,
-            last_seen: now,
-            written: false,
-        },
-    );
-    Observed::Failure
 }
 
-/// The repeated-failure rule of `evaluate` §3, per IDENTITY: failures ≥ `fail_count`, calls ≥
-/// `fail_min_calls`, failure rate ≥ `fail_rate` (calls = max(PRE_TOOL count, failures) — a failure
-/// whose PRE_TOOL was not seen still was a call).
-fn rel_meets(r: &RelStats, cfg: &AlertConfig) -> bool {
-    let calls = r.calls.max(r.fails);
-    r.fails >= cfg.fail_count
-        && calls >= cfg.fail_min_calls
-        && calls > 0
-        && (r.fails as f64 / calls as f64) >= cfg.fail_rate
+/// `classify` + `record` in one call (tests).
+#[cfg(test)]
+pub fn observe(det: &mut Detector, o: &ToolObservation<'_>, roots: &PackRoots, now: f64, windows: bool) -> Observed {
+    let c = classify(o, roots, windows);
+    record(det, c, now)
 }
 
 /// One row write the flusher owes.
@@ -1149,14 +1580,13 @@ pub struct DueRow {
     pub last_seen: f64,
 }
 
-/// The signatures whose script meets the rule (or that this incarnation already wrote) and that have
-/// a pending count — sorted by signature (determinism).
-pub fn due_signatures(det: &Detector, cfg: &AlertConfig) -> Vec<DueRow> {
+/// The signatures whose script meets the rule inside the window (or that this incarnation already wrote)
+/// and that have a pending count — sorted by signature (determinism).
+pub fn due_signatures(det: &Detector, now: f64) -> Vec<DueRow> {
     let mut out: Vec<DueRow> = det
         .sigs
         .iter()
-        .filter(|(_, s)| s.unflushed > 0)
-        .filter(|(_, s)| s.written || det.rels.get(&s.report.rel).is_some_and(|r| rel_meets(r, cfg)))
+        .filter(|(_, s)| det.is_due(s, now))
         .map(|(k, s)| DueRow {
             signature: k.clone(),
             report: s.report.clone(),
@@ -1174,8 +1604,8 @@ pub fn due_signatures(det: &Detector, cfg: &AlertConfig) -> Vec<DueRow> {
 pub struct DefectIntake {
     pub det: Mutex<Detector>,
     pub share: Mutex<crate::alert_route::IntakeShare>,
-    /// The daemon's pack dir (one more spelling of the pack root for the identity), read once.
-    pack_dir: Option<String>,
+    /// This lane's pack-root spellings (the identity's "this lane"), built once.
+    roots: PackRoots,
     /// When the flusher last logged this lane's counters (`Now::mono`; throttled to one line per
     /// [`crate::alert_route::INTAKE_ROW_COOLDOWN_SECS`]).
     last_log_mono: Mutex<Option<f64>>,
@@ -1198,21 +1628,31 @@ pub fn intake_for(daemon: &Arc<Daemon>) -> Arc<DefectIntake> {
     }
     g.retain(|_, (w, _)| w.strong_count() > 0);
     let d = Arc::new(DefectIntake {
-        pack_dir: production_pack_dir(),
+        roots: production_roots(),
         ..DefectIntake::default()
     });
     g.insert(daemon.socket_path.clone(), (Arc::downgrade(daemon), Arc::clone(&d)));
     d
 }
 
+/// The daemons the flusher serves (the live entries of the registry).
+fn registered_lanes() -> Vec<std::sync::Weak<Daemon>> {
+    let mut g = intake_registry().lock().unwrap_or_else(|e| e.into_inner());
+    g.retain(|_, (w, _)| w.strong_count() > 0);
+    g.values().map(|(w, _)| w.clone()).collect()
+}
+
 #[cfg(not(test))]
-fn production_pack_dir() -> Option<String> {
-    Some(cys::pack::pack_dir().to_string_lossy().into_owned())
+fn production_roots() -> PackRoots {
+    let pd = cys::pack::pack_dir();
+    let home = cys::home_dir();
+    PackRoots::new(Some(&pd.to_string_lossy()), Some(&home.to_string_lossy()))
 }
 
 #[cfg(test)]
-fn production_pack_dir() -> Option<String> {
-    None // tests never resolve the real pack dir (they pass spellings to `pack_call` directly)
+fn production_roots() -> PackRoots {
+    // tests never resolve the real pack dir or home: a fixed, fictional base-lane spelling
+    PackRoots::new(Some("/Users/x/.cys/pack"), Some("/Users/x"))
 }
 
 fn detector_enabled() -> bool {
@@ -1220,20 +1660,37 @@ fn detector_enabled() -> bool {
     *E.get_or_init(|| crate::alert_route::enabled_from(std::env::var(DEFECT_INTAKE_ENV).ok().as_deref()))
 }
 
-/// ① The `usage.event` arm's call — MEMORY ONLY, never fails the request, never panics out.
+/// How the flusher is started: once per process (`once`), by `start` (RULINGS BF6 — injectable).
+pub struct FlusherStart<'a> {
+    pub once: &'a OnceLock<()>,
+    pub start: &'a dyn Fn(),
+}
+
+/// ① The `usage.event` arm's call — never fails the request, never panics out.
 pub fn observe_tool_event(daemon: &Arc<Daemon>, o: &ToolObservation<'_>) {
+    static FLUSHER: OnceLock<()> = OnceLock::new();
+    observe_tool_event_with(daemon, o, &FlusherStart { once: &FLUSHER, start: &start_flusher_thread });
+}
+
+/// [`observe_tool_event`] with the flusher's start injected. The command is classified BEFORE the
+/// detector's lock is taken (RULINGS BF5); under the lock only the in-memory tables change.
+pub fn observe_tool_event_with(daemon: &Arc<Daemon>, o: &ToolObservation<'_>, flusher: &FlusherStart<'_>) {
     if !detector_enabled() || o.tool_input.get("command").is_none() {
         return;
     }
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let intake = intake_for(daemon);
+        let c = classify(o, &intake.roots, cfg!(windows));
+        if c == (Classified::Ignored { failure: false }) {
+            return;
+        }
         let now = crate::state::now_epoch();
         let r = {
             let mut d = intake.det.lock().unwrap_or_else(|e| e.into_inner());
-            observe(&mut d, o, intake.pack_dir.as_deref(), now, cfg!(windows))
+            record(&mut d, c, now)
         };
         if r == Observed::Failure {
-            ensure_flusher();
+            flusher.once.get_or_init(|| (flusher.start)());
         }
     }));
 }
@@ -1273,15 +1730,17 @@ fn with_row_mutex<T>(daemon: &Daemon, sig: &str, f: impl FnOnce() -> T) -> T {
 
 /// ② Writes the rows the detector owes, under the intake's OWN quota. Runs on the flusher thread (and in
 /// tests). Writes only THIS lane's rows (G4); a corrupt row is never overwritten (O-C1-6) — its count
-/// stays pending. Nothing is queued, pushed, published or alerted.
+/// stays pending. Nothing is queued, pushed, published or alerted. `cfg` (alerts-config.json, read by the
+/// flusher) also becomes the thresholds the hook path's table eviction uses.
 pub fn flush_defect_intake(daemon: &Arc<Daemon>, root: &std::path::Path, cfg: &AlertConfig, now: crate::alert_route::Now) -> FlushReport {
-    use cys::repair::intake::{load_row, row_path_in, IntakeRow, MAX_REPORTERS};
     use crate::alert_route::IntakeVerdict;
+    use cys::repair::intake::{load_row, row_path_in, IntakeRow, MAX_REPORTERS};
     let lane = cys::repair::types::LaneKey::of_socket(&daemon.socket_path);
     let intake = intake_for(daemon);
     let due = {
-        let d = intake.det.lock().unwrap_or_else(|e| e.into_inner());
-        due_signatures(&d, cfg)
+        let mut d = intake.det.lock().unwrap_or_else(|e| e.into_inner());
+        d.cfg = cfg.clone();
+        due_signatures(&d, now.epoch)
     };
     let mut rep = FlushReport {
         due: due.len(),
@@ -1368,7 +1827,7 @@ pub fn flush_defect_intake(daemon: &Arc<Daemon>, root: &std::path::Path, cfg: &A
     rep
 }
 
-/// The detector's and the share's counters (diagnostics / tests — not part of any status contract).
+/// The detector's and the share's counters (the daemon log line; tests).
 pub fn defect_intake_snapshot(daemon: &Arc<Daemon>, mono: f64) -> Value {
     let intake = intake_for(daemon);
     let (c, tracked) = {
@@ -1378,9 +1837,11 @@ pub fn defect_intake_snapshot(daemon: &Arc<Daemon>, mono: f64) -> Value {
     let share = intake.share.lock().unwrap_or_else(|e| e.into_inner()).snapshot(mono);
     json!({
         "calls": c.calls, "failures": c.failures,
-        "failures_without_identity": c.failures_without_identity, "ambiguous": c.ambiguous,
+        "failures_without_identity": c.failures_without_identity,
         "no_error_text": c.no_error_text, "excluded": c.excluded,
-        "excluded_by_reason": c.excluded_by_reason, "over_bound": c.over_bound,
+        "excluded_by_reason": c.excluded_by_reason,
+        "evicted_signatures": c.evicted_signatures, "evicted_pending_signatures": c.evicted_pending_signatures,
+        "evicted_rels": c.evicted_rels,
         "rows_new": c.rows_new, "rows_updated": c.rows_updated,
         "corrupt_rows": c.corrupt_rows, "write_failed": c.write_failed,
         "tracked_rels": tracked.0, "tracked_signatures": tracked.1, "pending_signatures": tracked.2,
@@ -1404,16 +1865,26 @@ fn intake_root(daemon: &Daemon) -> std::path::PathBuf {
     }
 }
 
-/// One pass of the flusher over the given daemons (dead ones skipped); each lane under its own
-/// catch_unwind. Returns how many lanes were flushed.
-fn flush_lanes(lanes: &[std::sync::Weak<Daemon>], cfg: &AlertConfig) -> usize {
+/// ONE pass of the flusher thread — its whole loop body (RULINGS BF6): the lanes, the thresholds and the
+/// ledger root come from the injected sources (production: the registry, alerts-config.json,
+/// [`intake_root`]); each lane is flushed under its own catch_unwind. Returns how many lanes were flushed.
+pub fn flusher_pass(
+    lanes: &dyn Fn() -> Vec<std::sync::Weak<Daemon>>,
+    cfg: &dyn Fn() -> AlertConfig,
+    root_of: &dyn Fn(&Daemon) -> std::path::PathBuf,
+) -> usize {
+    let lanes = lanes();
+    if lanes.is_empty() {
+        return 0;
+    }
+    let cfg = cfg();
     let mut n = 0;
-    for w in lanes {
+    for w in &lanes {
         let Some(d) = w.upgrade() else { continue };
-        let root = intake_root(&d);
+        let root = root_of(&d);
         let now = crate::alert_route::Now::live(&d);
         let flushed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let rep = flush_defect_intake(&d, &root, cfg, now);
+            let rep = flush_defect_intake(&d, &root, &cfg, now);
             log_flush(&d, &rep, now.mono);
         }));
         if flushed.is_ok() {
@@ -1443,29 +1914,21 @@ fn log_flush(daemon: &Arc<Daemon>, rep: &FlushReport, mono: f64) -> bool {
     true
 }
 
-/// Starts the flusher thread once per process (production only; the tests call the flush directly).
-/// Lazy — the first failure of a pack script starts it — so the daemon's start order is untouched.
-fn ensure_flusher() {
+/// The production start of the flusher thread (`cysd-defect-intake`): a loop of [`flusher_pass`] every
+/// [`FLUSH_TICK_SECS`]. Started lazily by the first identified failure — the daemon's start order is
+/// untouched. In this binary's tests it starts nothing (they drive [`flusher_pass`] directly).
+fn start_flusher_thread() {
     #[cfg(not(test))]
     {
-        static STARTED: OnceLock<()> = OnceLock::new();
-        STARTED.get_or_init(|| {
-            let spawned = std::thread::Builder::new()
-                .name("cysd-defect-intake".into())
-                .spawn(|| loop {
-                    std::thread::sleep(std::time::Duration::from_secs(FLUSH_TICK_SECS));
-                    let lanes: Vec<std::sync::Weak<Daemon>> = {
-                        let mut g = intake_registry().lock().unwrap_or_else(|e| e.into_inner());
-                        g.retain(|_, (w, _)| w.strong_count() > 0);
-                        g.values().map(|(w, _)| w.clone()).collect()
-                    };
-                    let cfg = AlertConfig::load();
-                    let _ = flush_lanes(&lanes, &cfg);
-                });
-            if let Err(e) = spawned {
-                eprintln!("[cysd] defect-intake: flusher thread not started ({e}) — rows are not written");
-            }
-        });
+        let spawned = std::thread::Builder::new()
+            .name("cysd-defect-intake".into())
+            .spawn(|| loop {
+                std::thread::sleep(std::time::Duration::from_secs(FLUSH_TICK_SECS));
+                let _ = flusher_pass(&registered_lanes, &AlertConfig::load, &intake_root);
+            });
+        if let Err(e) = spawned {
+            eprintln!("[cysd] defect-intake: flusher thread not started ({e}) — rows are not written");
+        }
     }
 }
 
@@ -1837,7 +2300,7 @@ mod tests {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ★(0.15.0 · 「스스로 해결」 M4 · RULINGS AD8 · track T3b) 결함 감지기 검체
+// ★(0.15.0 · 「스스로 해결」 M4 · RULINGS AD8, BF1–BF6 · track T3b) 결함 감지기 검체
 // ─────────────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod defect_intake_tests {
@@ -1853,10 +2316,16 @@ mod defect_intake_tests {
         PackCall::One { rel: rel.into(), sub: sub.map(str::to_string) }
     }
 
+    /// The base lane of the tests (the same fictional spelling `production_roots` gives under test).
+    fn base() -> PackRoots {
+        PackRoots::new(Some("/Users/x/.cys/pack"), Some("/Users/x"))
+    }
+
     fn pre<'a>(input: &'a Value) -> ToolObservation<'a> {
         ToolObservation {
             event_type: "PRE_TOOL",
             raw_event: "PreToolUse",
+            tool_name: "Bash",
             tool_input: input,
             exit_code: None,
             error: None,
@@ -1864,11 +2333,12 @@ mod defect_intake_tests {
         }
     }
 
-    /// The failure shape CCR-1 asks the CLI for (`PostToolUseFailure` → POST_TOOL, exit 1, `error`).
+    /// The failure shape RULINGS BE1 has the CLI forward (`PostToolUseFailure` → POST_TOOL, exit 1, `error`).
     fn fail<'a>(input: &'a Value, error: Option<&'a str>) -> ToolObservation<'a> {
         ToolObservation {
             event_type: "POST_TOOL",
             raw_event: "PostToolUseFailure",
+            tool_name: "Bash",
             tool_input: input,
             exit_code: Some(1),
             error,
@@ -1895,200 +2365,158 @@ mod defect_intake_tests {
         out
     }
 
-    /// The identity: every spelling of the pack root a command uses, Windows separators, department
-    /// packs, the daemon's own pack dir, `cys-dept` at a command position; documents, globs, `..`,
-    /// other words and other tools are not an identity; two different scripts are ambiguous.
+    /// RULINGS BF1 — positives: the identity is the program the call RAN (its final simple command's
+    /// program, or an interpreter's script operand there), spelled with any of THIS lane's pack roots.
     #[test]
-    fn identity_reads_every_pack_root_spelling() {
-        let pc = |c: &str| pack_call(&bash(c), None);
+    fn identity_is_the_executed_program() {
+        let pc = |c: &str| pack_call(&bash(c), &base());
         assert_eq!(pc("python3 ~/.cys/pack/bin/javis_x.py check --json"), one("bin/javis_x.py", Some("check")));
         assert_eq!(pc(r#"python3 "$HOME/.cys/pack/bin/javis_x.py""#), one("bin/javis_x.py", None));
-        assert_eq!(pc("python3 /Users/x/.cys/pack-dept-dept-3/bin/javis_x.py run"), one("bin/javis_x.py", Some("run")));
-        assert_eq!(pc("python3 $CYS_PACK_DIR/bin/javis_x.py status"), one("bin/javis_x.py", Some("status")));
+        assert_eq!(pc("python3 ${HOME}/.cys/pack/bin/javis_x.py run"), one("bin/javis_x.py", Some("run")));
+        assert_eq!(pc("python3 /Users/x/.cys/pack/bin/javis_x.py run"), one("bin/javis_x.py", Some("run")));
+        assert_eq!(pc("$CYS_PACK_DIR/bin/javis_x.py status"), one("bin/javis_x.py", Some("status")));
         assert_eq!(pc(r#"sh "${CYS_PACK_DIR}/hooks/guard.sh""#), one("hooks/guard.sh", None));
         assert_eq!(pc(r#"python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_x.py" check"#), one("bin/javis_x.py", Some("check")));
         assert_eq!(pc("python3 ${CYS_PACK_DIR:-${HOME}/.cys/pack}/bin/javis_x.py"), one("bin/javis_x.py", None));
-        assert_eq!(pc(r"python C:\Users\x\.cys\pack\bin\javis_x.py check"), one("bin/javis_x.py", Some("check")));
-        assert_eq!(pc("cd /tmp && python3 /c/Users/x/.cys/pack/hooks/sub/x.sh"), one("hooks/sub/x.sh", None));
-        assert_eq!(pack_call(&bash("sh /opt/jp/hooks/a.sh x"), Some("/opt/jp")), one("hooks/a.sh", Some("x")));
-        assert_eq!(pack_call(&bash("sh /opt/jp/hooks/a.sh x"), None), PackCall::None);
-        // the pack's `bin/cys-dept` at a command position
+        assert_eq!(pc("cd /tmp && FOO=1 python3 -u -X importtime ~/.cys/pack/bin/javis_x.py run 2>&1"), one("bin/javis_x.py", Some("run")));
+        assert_eq!(pc("python3 ~/.cys/pack/bin/javis_x.py run > out.txt 2>/dev/null"), one("bin/javis_x.py", Some("run")));
+        assert_eq!(pc("python3 ~/.cys/pack/bin/javis_x.py <<'EOF'\ninput line\nEOF\n"), one("bin/javis_x.py", None));
+        assert_eq!(pc("env -i A=1 nohup bash -e ~/.cys/pack/hooks/sub/x.sh go"), one("hooks/sub/x.sh", Some("go")));
+        assert_eq!(pc("node --require ./r.js ~/.cys/pack/bin/x.mjs"), one("bin/x.mjs", None));
+        assert_eq!(pc("(cd x && python3 ~/.cys/pack/bin/javis_x.py run)"), one("bin/javis_x.py", Some("run")));
+        assert_eq!(pc("~/.cys/pack/bin/cys-dept status"), one("bin/cys-dept", Some("status")));
         assert_eq!(pc("cys-dept create team-x"), one("bin/cys-dept", Some("create")));
-        assert_eq!(pc("FOO=1 cys-dept list"), one("bin/cys-dept", Some("list")));
-        assert_eq!(pc("cd x && cys-dept status"), one("bin/cys-dept", Some("status")));
-        assert_eq!(pc("bash ~/.cys/pack/bin/cys-dept create t"), one("bin/cys-dept", Some("create")));
-        assert_eq!(pc("grep cys-dept notes.txt"), PackCall::None, "an argument is not the command");
-        // not hooks / scripts
-        assert_eq!(pc("cat ~/.cys/pack/directives/MASTER_DIRECTIVE.md"), PackCall::None);
-        assert_eq!(pc("ls ~/.cys/pack/bin/"), PackCall::None);
-        assert_eq!(pc("python3 ~/.cys/pack/bin/*.py"), PackCall::None);
-        assert_eq!(pc("python3 ~/.cys/pack/../evil.py"), PackCall::None);
-        assert_eq!(pc("python3 ~/.cys/pack/hooks/settings.json"), PackCall::None);
-        assert_eq!(pc("python3 ./javis_x.py"), PackCall::None);
-        // one script named twice is one; two scripts are ambiguous
-        assert_eq!(pc("python3 ~/.cys/pack/bin/a.py && python3 ~/.cys/pack/bin/a.py"), one("bin/a.py", None));
-        assert_eq!(pc("python3 ~/.cys/pack/bin/a.py && python3 ~/.cys/pack/bin/b.py"), PackCall::Ambiguous);
-        // other tools, list commands
-        assert_eq!(pack_call(&json!({"file_path": "/u/.cys/pack/bin/a.py"}), None), PackCall::None);
-        assert_eq!(pack_call(&json!({"command": ["python3", "/u/.cys/pack/bin/a.py", "x"]}), None), one("bin/a.py", Some("x")));
-        // a huge command is cut, never scanned whole (and never panics on a char boundary)
-        let huge = format!("echo {} ~/.cys/pack/bin/a.py", "가".repeat(COMMAND_SCAN_MAX_BYTES));
-        assert_eq!(pc(&huge), PackCall::None);
+        assert_eq!(pc("ls;\n# list first\ncys-dept list   # then this"), one("bin/cys-dept", Some("list")));
+        // Windows: the pack dir with a drive letter, its Git Bash `/c/…` form, `pwsh -File`
+        let win = PackRoots::new(Some(r"C:\Users\x\.cys\pack"), Some(r"C:\Users\x"));
+        assert_eq!(pack_call(&bash(r#"python "C:\Users\x\.cys\pack\bin\javis_x.py" check"#), &win), one("bin/javis_x.py", Some("check")));
+        assert_eq!(pack_call(&bash("python /c/Users/x/.cys/pack/bin/javis_x.py"), &win), one("bin/javis_x.py", None));
+        assert_eq!(pack_call(&bash("pwsh -NoProfile -File C:/Users/x/.cys/pack/bin/x.ps1"), &win), one("bin/x.ps1", None));
+        // a department daemon: ITS pack
+        let dept = PackRoots::new(Some("/Users/x/.cys/pack-dept-a"), Some("/Users/x"));
+        assert_eq!(pack_call(&bash("python3 ~/.cys/pack-dept-a/bin/javis_x.py"), &dept), one("bin/javis_x.py", None));
+        assert_eq!(pack_call(&bash("python3 $CYS_PACK_DIR/bin/javis_x.py"), &dept), one("bin/javis_x.py", None));
+        // a list command
+        assert_eq!(pack_call(&json!({"command": ["python3", "/Users/x/.cys/pack/bin/a.py", "x"]}), &base()), one("bin/a.py", Some("x")));
     }
 
-    /// The text a signature is computed from keeps what tells defects apart.
+    /// RULINGS BF1 — negatives: a MENTION is never an identity — an operand of another program, a user
+    /// script's argument, a pipeline member piped onward, a heredoc body, a quoted string, a comment,
+    /// another lane's pack, a test rig, a command followed by another, a background or negated command,
+    /// inline code, a lookup, a non-script.
     #[test]
-    fn error_text_keeps_what_tells_defects_apart() {
-        assert_eq!(detector_error_text("Exit code 1\nError: Cannot find module 'express'"), "Error: Cannot find module 'express'");
-        let tb = "Exit code 1\nTraceback (most recent call last):\n  File \"/x/a.py\", line 3, in <module>\n    import javis_y\nModuleNotFoundError: No module named 'javis_y'\n";
-        assert_eq!(detector_error_text(tb), "ModuleNotFoundError: No module named 'javis_y'");
-        let chained = "Traceback (most recent call last):\n  File \"a\", line 1\nKeyError: 'k'\n\nDuring handling of the above exception, another exception occurred:\n\nTraceback (most recent call last):\n  File \"a\", line 2\nValueError: bad";
-        assert_eq!(detector_error_text(chained), "ValueError: bad");
-        assert_eq!(detector_error_text("Exit code 2"), "Exit code 2", "nothing else → the exit line stays");
-        assert_eq!(detector_error_text("\n\nboom\nmore"), "boom\nmore");
-        // signatures: same defect across runs → same; another script or another exception → different
-        let sig = |rel: &str, raw: &str| intake::parse_report(rel, &detector_error_text(raw)).unwrap().signature;
-        let a1 = sig("bin/a.py", "Exit code 1\nTraceback (most recent call last):\n  File \"/tmp/r1/a.py\", line 9\nKeyError: 'k' (pid 40001)");
-        let a2 = sig("bin/a.py", "Exit code 1\nTraceback (most recent call last):\n  File \"/tmp/r2/a.py\", line 9\nKeyError: 'k' (pid 40002)");
-        assert_eq!(a1, a2, "volatile parts (pids) must not split one defect");
-        assert_ne!(a1, sig("bin/b.py", "Exit code 1\nKeyError: 'k' (pid 40001)"));
-        assert_ne!(a1, sig("bin/a.py", "Exit code 1\nValueError: v"));
-        // a manual `cys repair report --file bin/a.py --error "KeyError: 'k'"` lands on the same row
-        assert_eq!(
-            sig("bin/a.py", "Exit code 1\nKeyError: 'k'"),
-            intake::parse_report("bin/a.py", "KeyError: 'k'").unwrap().signature
-        );
+    fn mentions_are_never_an_identity() {
+        for c in [
+            "grep pat ~/.cys/pack/hooks/guard.sh",
+            "cat ~/.cys/pack/bin/javis_x.py",
+            "diff ~/.cys/pack/bin/a.py b.py",
+            "test -f ~/.cys/pack/bin/a.py",
+            "[ -x ~/.cys/pack/bin/a.py ]",
+            "python3 ./mytool.py ~/.cys/pack/bin/javis_x.py",
+            "./run.sh ~/.cys/pack/hooks/guard.sh",
+            "python3 ~/.cys/pack/bin/javis_x.py | grep x",
+            "python3 ~/.cys/pack/bin/javis_x.py |& tee log",
+            "cat > /tmp/a.sh <<EOF\npython3 ~/.cys/pack/bin/javis_x.py\nEOF\n",
+            "bash <<'EOF'\npython3 ~/.cys/pack/bin/javis_x.py\nEOF\n",
+            "cat <<-EOF\n\tpython3 ~/.cys/pack/bin/javis_x.py\n\tEOF\necho done",
+            "echo \"python3 ~/.cys/pack/bin/javis_x.py\"",
+            "bash -c \"python3 ~/.cys/pack/bin/javis_x.py\"",
+            "bash -lc 'python3 ~/.cys/pack/bin/javis_x.py'",
+            "ls # python3 ~/.cys/pack/bin/javis_x.py",
+            "python3 ~/.cys/pack-dept-a/bin/javis_x.py",
+            "python3 /tmp/rig/.cys/pack/bin/javis_x.py",
+            "python3 /Users/user/.cys/pack/bin/javis_x.py",
+            "python3 ~/.cys/pack/bin/javis_x.py && echo ok",
+            "python3 ~/.cys/pack/bin/javis_x.py || true",
+            "python3 ~/.cys/pack/bin/javis_x.py &",
+            "python3 ~/.cys/pack/bin/javis_x.py & ",
+            "! python3 ~/.cys/pack/bin/javis_x.py",
+            "python3 -c 'import x' ~/.cys/pack/bin/javis_x.py",
+            "python3 -m pytest ~/.cys/pack/bin/tests/test_x.py",
+            "node -e 'x' ~/.cys/pack/bin/x.js",
+            "command -v ~/.cys/pack/bin/javis_x.py",
+            "python3 ~/.cys/pack/directives/MASTER_DIRECTIVE.md",
+            "python3 ~/.cys/pack/bin/*.py",
+            "python3 ~/.cys/pack/../evil.py",
+            "python3 ~/.cys/pack/bin/$(name).py",
+            "python3 ./javis_x.py",
+            "npm test",
+        ] {
+            assert_eq!(pack_call(&bash(c), &base()), PackCall::None, "a mention became an identity: {c:?}");
+        }
+        // the base lane's pack is not a department daemon's
+        let dept = PackRoots::new(Some("/Users/x/.cys/pack-dept-a"), Some("/Users/x"));
+        assert_eq!(pack_call(&bash("python3 ~/.cys/pack/bin/javis_x.py"), &dept), PackCall::None);
+        // other tools and other events are never classified as calls / failures of a script
+        let g = bash("grep pat ~/.cys/pack/hooks/guard.sh");
+        assert_eq!(classify(&fail(&g, Some("Exit code 1")), &base(), false), Classified::Ignored { failure: true });
+        assert_eq!(classify(&pre(&g), &base(), false), Classified::Ignored { failure: false });
+        let x = bash("python3 ~/.cys/pack/bin/javis_x.py");
+        let edit = ToolObservation { tool_name: "Edit", ..fail(&x, Some("E: x")) };
+        assert_eq!(classify(&edit, &base(), false), Classified::Ignored { failure: true });
+        let abort = ToolObservation { interrupted: true, ..fail(&x, Some("E: x")) };
+        assert_eq!(classify(&abort, &base(), false), Classified::Ignored { failure: false }, "an abort is not a failure of the script");
     }
 
-    /// The thresholds of `evaluate` §3 apply per IDENTITY; another script's failures do not count.
+    /// RULINGS BF1 at the daemon: five failing `grep pat ~/.cys/pack/hooks/guard.sh` calls (no match →
+    /// exit 1) file NO row and count NO call — ordinary user activity produces nothing.
     #[test]
-    fn thresholds_apply_per_identity() {
-        let cfg = AlertConfig::default();
-        let mut d = Detector::default();
-        let a = bash("python3 ~/.cys/pack/bin/a.py run");
-        let b = bash("python3 ~/.cys/pack/bin/b.py run");
-        for i in 0..4 {
-            assert_eq!(observe(&mut d, &pre(&a), None, 1.0 + i as f64, false), Observed::Call);
-            assert_eq!(observe(&mut d, &fail(&a, Some("Exit code 1\nKeyError: 'k'")), None, 1.5, false), Observed::Failure);
-        }
-        observe(&mut d, &pre(&b), None, 2.0, false);
-        observe(&mut d, &fail(&b, Some("E: b")), None, 2.0, false);
-        assert!(due_signatures(&d, &cfg).is_empty(), "4 failures are below fail_count 5");
-        observe(&mut d, &pre(&a), None, 5.0, false);
-        observe(&mut d, &fail(&a, Some("Exit code 1\nKeyError: 'k'")), None, 5.5, false);
-        let due = due_signatures(&d, &cfg);
-        assert_eq!(due.len(), 1, "only a.py met the rule: {due:?}");
-        assert_eq!(due[0].report.rel, "bin/a.py");
-        assert_eq!(due[0].delta, 5);
-        assert_eq!((due[0].first_seen, due[0].last_seen), (1.5, 5.5));
-        // a rate below 30 %: 20 calls, 5 failures → not due; the 6th failure (30 %) → due
-        let mut d = Detector::default();
-        let c = bash("python3 ~/.cys/pack/bin/c.py");
-        for _ in 0..20 {
-            observe(&mut d, &pre(&c), None, 1.0, false);
-        }
+    fn five_failing_greps_of_a_pack_file_file_nothing() {
+        let daemon = crate::team_gate_tests::tmp_daemon("t3b-grep", false);
+        let root = tmp_root("grep");
+        let g = bash("grep pat ~/.cys/pack/hooks/guard.sh");
         for _ in 0..5 {
-            observe(&mut d, &fail(&c, Some("E: c")), None, 1.0, false);
+            observe_tool_event(&daemon, &pre(&g));
+            observe_tool_event(&daemon, &fail(&g, Some("Exit code 1")));
         }
-        assert!(due_signatures(&d, &cfg).is_empty(), "25 % < 30 %");
-        observe(&mut d, &fail(&c, Some("E: c")), None, 1.0, false);
-        assert_eq!(due_signatures(&d, &cfg).len(), 1, "30 % = fail_rate");
-        // the config is honoured (alerts-config.json)
-        let strict = AlertConfig { fail_count: 7, ..AlertConfig::default() };
-        assert!(due_signatures(&d, &strict).is_empty());
+        let rep = flush_defect_intake(&daemon, &root, &AlertConfig::default(), crate::alert_route::Now::at(10.0));
+        assert_eq!(rep.due, 0);
+        assert!(!root.join("intake").exists(), "a grep of a pack file filed a defect");
+        let snap = defect_intake_snapshot(&daemon, 10.0);
+        assert_eq!((snap["calls"].as_u64(), snap["failures"].as_u64(), snap["tracked_rels"].as_u64()), (Some(0), Some(0), Some(0)), "{snap}");
+        assert_eq!(snap["failures_without_identity"], 5);
     }
 
-    /// The exclusion list is applied BEFORE counting; a failure without text, an abort, a non-pack
-    /// call and an ambiguous call never form a row.
+    /// RULINGS BF5: classification is ONE pass — the steps stay linear in the command's length for the
+    /// worst inputs (unclosed `${CYS_PACK_DIR:`, unclosed `$(`, heredocs that never end, quotes, escapes);
+    /// a structural pin, no wall clock.
     #[test]
-    fn excluded_and_unidentified_failures_never_form_a_row() {
-        let cfg = AlertConfig::default();
-        let dept = bash("cys-dept create team-x");
-        let err127 = "Exit code 127\n/usr/bin/bash: line 1: cys-dept: command not found";
-        // Windows: by design, never counted
-        let mut d = Detector::default();
-        for _ in 0..10 {
-            observe(&mut d, &pre(&dept), None, 1.0, true);
-            assert_eq!(observe(&mut d, &fail(&dept, Some(err127)), None, 1.0, true), Observed::Excluded);
+    fn classification_cost_is_linear_in_the_command() {
+        let roots = base();
+        let unit = [
+            "${CYS_PACK_DIR:",
+            "$(",
+            "x <<A\n",
+            "\"",
+            "'",
+            "\\",
+            "a | ",
+            "${CYS_PACK_DIR:-${HOME}/.cys/pack}/bin/x.py ",
+            "python3 ~/.cys/pack/bin/javis_x.py; ",
+            "<(",
+            "#\n",
+        ];
+        for u in unit {
+            let reps = COMMAND_SCAN_MAX_BYTES / u.len() + 1;
+            let cmd = u.repeat(reps);
+            let chars = cut_at_char_boundary(&cmd, COMMAND_SCAN_MAX_BYTES).chars().count();
+            let (_, steps) = pack_call_counted(&bash(&cmd), &roots);
+            assert!(steps <= 3 * chars + 64, "{u:?}: {steps} steps for {chars} chars — not linear");
         }
-        assert!(due_signatures(&d, &cfg).is_empty());
-        assert_eq!(d.counters.excluded, 10);
-        assert_eq!(d.counters.excluded_by_reason.get("windows-cys-dept-not-on-path"), Some(&10));
-        // macOS: a missing cys-dept is a defect
-        let mut d = Detector::default();
-        for _ in 0..5 {
-            observe(&mut d, &pre(&dept), None, 1.0, false);
-            observe(&mut d, &fail(&dept, Some(err127)), None, 1.0, false);
-        }
-        assert_eq!(due_signatures(&d, &cfg).len(), 1);
-        // a verdict tool's designed answer vs its crash
-        let mut d = Detector::default();
-        let chk = bash("python3 ~/.cys/pack/bin/javis_orchestra.py check");
-        for _ in 0..10 {
-            observe(&mut d, &pre(&chk), None, 1.0, false);
-            observe(&mut d, &fail(&chk, Some("Exit code 1\nmissing: worker")), None, 1.0, false);
-        }
-        assert!(due_signatures(&d, &cfg).is_empty(), "a boot that polls `orchestra check` files nothing");
-        assert_eq!(d.counters.excluded_by_reason.get("designed-answer:javis_orchestra.check"), Some(&10));
-        for _ in 0..5 {
-            observe(&mut d, &fail(&chk, Some("Exit code 1\nTraceback (most recent call last):\n  File \"x\"\nKeyError: 'k'")), None, 1.0, false);
-        }
-        assert_eq!(due_signatures(&d, &cfg).len(), 1, "a crash of the same tool is a defect");
-        // no text: counted toward the rate, no signature (O-C1-9) → no row
-        let mut d = Detector::default();
-        let a = bash("python3 ~/.cys/pack/bin/a.py");
-        for _ in 0..10 {
-            observe(&mut d, &pre(&a), None, 1.0, false);
-            let today = ToolObservation { raw_event: "PostToolUse", ..fail(&a, None) };
-            assert_eq!(observe(&mut d, &today, None, 1.0, false), Observed::NoErrorText);
-        }
-        assert!(due_signatures(&d, &cfg).is_empty());
-        assert_eq!(d.counters.no_error_text, 10);
-        // an abort is not a failure; success is not a failure; a non-pack or ambiguous call is no identity
-        let mut d = Detector::default();
-        let abort = ToolObservation { interrupted: true, ..fail(&a, Some("E: x")) };
-        assert_eq!(observe(&mut d, &abort, None, 1.0, false), Observed::Ignored);
-        let ok = ToolObservation { raw_event: "PostToolUse", exit_code: Some(0), ..fail(&a, None) };
-        assert_eq!(observe(&mut d, &ok, None, 1.0, false), Observed::Ignored);
-        assert_eq!(observe(&mut d, &fail(&bash("npm test"), Some("E: x")), None, 1.0, false), Observed::Ignored);
-        let two = bash("python3 ~/.cys/pack/bin/a.py; python3 ~/.cys/pack/bin/b.py");
-        assert_eq!(observe(&mut d, &fail(&two, Some("E: x")), None, 1.0, false), Observed::Ambiguous);
-        assert_eq!((d.counters.failures_without_identity, d.counters.ambiguous), (1, 1));
-        assert_eq!(d.tracked(), (0, 0, 0));
-        let perm = ToolObservation { event_type: "PermissionRequest", raw_event: "PermissionRequest", ..pre(&a) };
-        assert_eq!(observe(&mut d, &perm, None, 1.0, false), Observed::Ignored);
+        // the hook path: classify before the lock, nothing else under it but the table update
+        let src = include_str!("alerts.rs");
+        let body = src.split("pub fn observe_tool_event_with(").nth(1).expect("observe_tool_event_with");
+        let body = &body[..body.find("\n}\n").expect("end")];
+        let (cl, lk) = (body.find("classify(").expect("classify"), body.find(".det.lock(").expect("lock"));
+        assert!(cl < lk, "the command is classified under the detector's lock");
+        assert_eq!(body.matches("classify(").count(), 1);
+        let locked = &body[lk..];
+        assert!(!locked.contains("classify(") && !locked.contains("pack_call"), "classification inside the lock");
     }
 
-    /// Memory stays bounded: scripts and signatures beyond the bounds are counted, not kept; a written
-    /// signature with nothing pending makes room.
-    #[test]
-    fn detector_memory_is_bounded() {
-        let mut d = Detector::default();
-        for i in 0..DETECTOR_MAX_RELS {
-            observe(&mut d, &pre(&bash(&format!("python3 ~/.cys/pack/bin/s{i}.py"))), None, 1.0, false);
-        }
-        assert_eq!(observe(&mut d, &pre(&bash("python3 ~/.cys/pack/bin/extra.py")), None, 1.0, false), Observed::OverBound);
-        let mut d = Detector::default();
-        let a = bash("python3 ~/.cys/pack/bin/a.py");
-        for i in 0..DETECTOR_MAX_SIGNATURES {
-            let e = format!("E{i}: x");
-            assert_eq!(observe(&mut d, &fail(&a, Some(&e)), None, i as f64, false), Observed::Failure);
-        }
-        assert_eq!(observe(&mut d, &fail(&a, Some("Enew: x")), None, 9_999.0, false), Observed::OverBound);
-        // mark the oldest written with nothing pending → evictable
-        let oldest = d.sigs.iter().min_by(|x, y| x.1.last_seen.total_cmp(&y.1.last_seen)).map(|(k, _)| k.clone()).unwrap();
-        if let Some(s) = d.sigs.get_mut(&oldest) {
-            s.written = true;
-            s.unflushed = 0;
-        }
-        assert_eq!(observe(&mut d, &fail(&a, Some("Enew: x")), None, 10_000.0, false), Observed::Failure);
-        assert!(!d.sigs.contains_key(&oldest));
-        assert_eq!(d.sigs.len(), DETECTOR_MAX_SIGNATURES);
-    }
-
-    /// Structural pin (A 1-26 / 1-28, F1): the hook-path functions do no I/O and reach no queue, bus
-    /// or alert route; the flush reaches no queue, bus or alert route either. Positive control: the
-    /// scan sees a planted needle.
+    /// Structural pin (A 1-26 / 1-28, F1): the hook-path functions do no I/O, spawn nothing themselves
+    /// (the flusher's start is the injected `FlusherStart`, once) and reach no queue, bus or alert
+    /// route; the writer reaches no queue, bus or alert route either. Positive control included.
     #[test]
     fn hot_path_is_memory_only_and_nothing_sends() {
         let src = include_str!("alerts.rs");
@@ -2096,17 +2524,29 @@ mod defect_intake_tests {
             let b = src.split(head).nth(1).unwrap_or_else(|| panic!("{head} missing"));
             b[..b.find("\n}\n").unwrap_or_else(|| panic!("{head} end"))].to_string()
         };
-        let io = ["std::fs", "atomic_write", "File::", "Command::", "spawn(", "read_to_string", "load()"];
+        let io = ["std::fs", "atomic_write", "File::", "Command::", "spawn(", "read_to_string", "load()", "thread::"];
         let send = ["bus.publish", "enqueue", "pending_queue", "alert_route::route", "handle_event", "javis_wakeup", "send_input", "push_queue"];
         let planted = "let _ = std::fs::write(p, b);";
         assert!(io.iter().any(|n| planted.contains(n)), "checker is blind");
-        for head in ["pub fn observe(", "pub fn pack_call(", "pub fn detector_error_text(", "pub fn observe_tool_event(", "fn is_failure(", "pub fn detector_excluded("] {
+        for head in [
+            "pub fn observe_tool_event(",
+            "pub fn observe_tool_event_with(",
+            "pub fn classify(",
+            "pub fn record(",
+            "pub fn pack_call_counted(",
+            "fn final_simple_command(",
+            "fn interpreter_operand(",
+            "pub fn detector_excluded(",
+            "fn is_failure(",
+            "fn bounded_error(",
+        ] {
             let b = body(head);
             for n in io.iter().chain(send.iter()) {
                 assert!(!b.contains(n), "{head} reaches `{n}` — the hook path must stay memory-only");
             }
         }
-        for head in ["pub fn flush_defect_intake(", "fn flush_lanes(", "fn log_flush("] {
+        assert!(body("pub fn observe_tool_event_with(").contains("flusher.once.get_or_init("), "the flusher must start once, through the injected hook");
+        for head in ["pub fn flush_defect_intake(", "pub fn flusher_pass(", "fn log_flush("] {
             let b = body(head);
             for n in send {
                 assert!(!b.contains(n), "{head} sends through `{n}` — intake is data, never a message");
@@ -2115,7 +2555,7 @@ mod defect_intake_tests {
         // the per-file mutex key is T3's (`ledger_verbs::report`) — one writer per row file
         assert!(src.contains("map.entry(format!(\"intake:{sig}\"))"));
         assert!(include_str!("repair.rs").contains("ctx.locked(&format!(\"intake:{}\", rep.signature)"), "T3's report verb changed its row mutex key");
-        // the `usage.event` arm feeds the detector (and nothing else of this track lives in handlers.rs)
+        // the `usage.event` arm feeds the detector once
         let h = include_str!("handlers.rs");
         let arm = h.split("\"usage.event\" => {").nth(1).expect("usage.event arm");
         let arm = &arm[..arm.find("\"org.status\" =>").expect("next arm")];
@@ -2123,12 +2563,104 @@ mod defect_intake_tests {
         assert_eq!(h.matches("crate::alerts::observe_tool_event(").count(), 1);
     }
 
-    /// The detector's own exclusion entries: each verdict tool's designed answers (with its
-    /// subcommand where the entry names one) are excluded; usage / internal errors and crashes are not;
-    /// the shared table (T3's Windows `cys-dept` entry) is consulted too. Every entry is detector-scope
-    /// and every reason distinct.
+    /// The thresholds of `evaluate` §3 apply per IDENTITY inside the 7-day window (RULINGS BF4); another
+    /// script's failures do not count; the config is honoured.
     #[test]
-    fn detector_exclusions_name_only_designed_answers() {
+    fn thresholds_apply_per_identity_inside_the_window() {
+        let mut d = Detector::default();
+        assert_eq!(d.cfg, AlertConfig::default(), "the rule starts from the default thresholds");
+        let a = bash("python3 ~/.cys/pack/bin/a.py run");
+        let b = bash("python3 ~/.cys/pack/bin/b.py run");
+        let t = 1_800_000_000.0;
+        for i in 0..4 {
+            assert_eq!(observe(&mut d, &pre(&a), &base(), t + i as f64, false), Observed::Call);
+            assert_eq!(observe(&mut d, &fail(&a, Some("Exit code 1\nKeyError: 'k'")), &base(), t + 0.5, false), Observed::Failure);
+        }
+        observe(&mut d, &pre(&b), &base(), t, false);
+        observe(&mut d, &fail(&b, Some("E: b")), &base(), t, false);
+        assert!(due_signatures(&d, t).is_empty(), "4 failures are below fail_count 5");
+        observe(&mut d, &pre(&a), &base(), t + 5.0, false);
+        observe(&mut d, &fail(&a, Some("Exit code 1\nKeyError: 'k'")), &base(), t + 5.5, false);
+        let due = due_signatures(&d, t + 6.0);
+        assert_eq!(due.len(), 1, "only a.py met the rule: {due:?}");
+        assert_eq!((due[0].report.rel.as_str(), due[0].delta, due[0].first_seen, due[0].last_seen), ("bin/a.py", 5, t + 0.5, t + 5.5));
+        // a week later the same counts are outside the window
+        assert!(due_signatures(&d, t + 8.0 * 86_400.0).is_empty(), "counts older than 7 days still met the rule");
+        // a rate below 30 %: 20 calls, 5 failures → not due; the 6th failure (30 %) → due
+        let mut d = Detector::default();
+        let c = bash("python3 ~/.cys/pack/bin/c.py");
+        for _ in 0..20 {
+            observe(&mut d, &pre(&c), &base(), t, false);
+        }
+        for _ in 0..5 {
+            observe(&mut d, &fail(&c, Some("E: c")), &base(), t, false);
+        }
+        assert!(due_signatures(&d, t).is_empty(), "25 % < 30 %");
+        observe(&mut d, &fail(&c, Some("E: c")), &base(), t, false);
+        assert_eq!(due_signatures(&d, t).len(), 1, "30 % = fail_rate");
+        d.cfg = AlertConfig { fail_count: 7, ..AlertConfig::default() };
+        assert!(due_signatures(&d, t).is_empty(), "alerts-config.json's fail_count is honoured");
+    }
+
+    /// The exclusion list on POSITIVE evidence (RULINGS BF2) before anything is counted; a failure
+    /// without text forms no row.
+    #[test]
+    fn exclusions_need_positive_evidence_and_unnamed_failures_form_no_row() {
+        let cfg_t = 1_800_000_000.0;
+        let dept = bash("cys-dept create team-x");
+        let err127 = "Exit code 127\n/usr/bin/bash: line 1: cys-dept: command not found";
+        // Windows: by design, never counted
+        let mut d = Detector::default();
+        for _ in 0..10 {
+            observe(&mut d, &pre(&dept), &base(), cfg_t, true);
+            assert_eq!(observe(&mut d, &fail(&dept, Some(err127)), &base(), cfg_t, true), Observed::Excluded);
+        }
+        assert!(due_signatures(&d, cfg_t).is_empty());
+        assert_eq!(d.counters.excluded_by_reason.get("windows-cys-dept-not-on-path"), Some(&10));
+        // macOS: a missing cys-dept is a defect
+        let mut d = Detector::default();
+        for _ in 0..5 {
+            observe(&mut d, &pre(&dept), &base(), cfg_t, false);
+            observe(&mut d, &fail(&dept, Some(err127)), &base(), cfg_t, false);
+        }
+        assert_eq!(due_signatures(&d, cfg_t).len(), 1);
+        // a polled `orchestra check` with its designed answer files nothing; its crash or a syntax error does
+        let mut d = Detector::default();
+        let chk = bash("python3 ~/.cys/pack/bin/javis_orchestra.py check");
+        for _ in 0..10 {
+            observe(&mut d, &pre(&chk), &base(), cfg_t, false);
+            observe(&mut d, &fail(&chk, Some("Exit code 1\nLLM orchestrating 노드 점검 (4종 의무 + grok 선택):\n  ✗ worker — 미기동 (x)\n종합: 필수 3/4 생존 — 부재: worker → `cys boot`로 기동하라")), &base(), cfg_t, false);
+        }
+        assert!(due_signatures(&d, cfg_t).is_empty(), "a boot that polls `orchestra check` files nothing");
+        assert_eq!(d.counters.excluded_by_reason.get("designed-answer:javis_orchestra.check"), Some(&10));
+        for _ in 0..5 {
+            observe(&mut d, &fail(&chk, Some("Exit code 1\n  File \"/Users/x/.cys/pack/bin/javis_orchestra.py\", line 9\n    def (\n        ^\nSyntaxError: invalid syntax")), &base(), cfg_t, false);
+        }
+        assert_eq!(due_signatures(&d, cfg_t).len(), 1, "a syntax error of the same tool is a defect");
+        // the same exit code WITHOUT the tool's marker is a defect (no positive evidence)
+        let mut d = Detector::default();
+        let gate = bash("python3 ~/.cys/pack/bin/javis_resource_gate.py check");
+        for _ in 0..5 {
+            observe(&mut d, &pre(&gate), &base(), cfg_t, false);
+            observe(&mut d, &fail(&gate, Some("Exit code 2\nusage: javis_resource_gate.py [-h]")), &base(), cfg_t, false);
+        }
+        assert_eq!(due_signatures(&d, cfg_t).len(), 1, "an exit code alone excluded a failure");
+        // no text: counted toward the rate, no signature (O-C1-9) → no row
+        let mut d = Detector::default();
+        let a = bash("python3 ~/.cys/pack/bin/a.py");
+        for _ in 0..10 {
+            observe(&mut d, &pre(&a), &base(), cfg_t, false);
+            let today = ToolObservation { raw_event: "PostToolUse", ..fail(&a, None) };
+            assert_eq!(observe(&mut d, &today, &base(), cfg_t, false), Observed::NoErrorText);
+        }
+        assert!(due_signatures(&d, cfg_t).is_empty());
+        assert_eq!(d.counters.no_error_text, 10);
+    }
+
+    /// The detector's own exclusion entries match each tool's verdict marker with its exit code, never
+    /// a launch failure, never `javis_task.py` (no stable marker → no entry); every reason distinct.
+    #[test]
+    fn detector_exclusions_name_only_marked_designed_answers() {
         use cys::repair::intake::ExclusionScope;
         assert!(DETECTOR_EXCLUSIONS.iter().all(|e| e.scope == ExclusionScope::Detector));
         let mut reasons: Vec<&str> = DETECTOR_EXCLUSIONS.iter().chain(intake::EXCLUSIONS).map(|e| e.reason).collect();
@@ -2137,25 +2669,70 @@ mod defect_intake_tests {
         reasons.dedup();
         assert_eq!(reasons.len(), n, "a reason names two entries");
         let ex = |rel: &str, sub: Option<&str>, err: &str| detector_excluded(rel, sub, err, false);
-        assert_eq!(ex("bin/javis_resource_gate.py", Some("check"), "Exit code 2\nhard_block: load"), Some("designed-answer:javis_resource_gate.check"));
-        assert_eq!(ex("bin/javis_resource_gate.py", Some("check"), "Exit code 1"), Some("designed-answer:javis_resource_gate.check"));
-        assert_eq!(ex("bin/javis_resource_gate.py", Some("check"), "Exit code 70\ninternal"), None);
-        assert_eq!(ex("bin/javis_resource_gate.py", Some("check"), "Exit code 64\nusage"), None);
-        assert_eq!(ex("bin/javis_resource_gate.py", Some("enforce"), "Exit code 2"), None);
-        assert_eq!(ex("bin/javis_orchestra.py", Some("check"), "Exit code 12\nACK pending"), Some("designed-answer:javis_orchestra.check"));
-        assert_eq!(ex("bin/javis_orchestra.py", Some("check"), "Exit code 1\nTraceback (most recent call last):\n  File \"x\"\nKeyError: 'k'"), None);
-        assert_eq!(ex("bin/javis_orchestra.py", Some("task-prompt"), "Exit code 1"), None);
+        let rg = "bin/javis_resource_gate.py";
+        assert_eq!(ex(rg, Some("check"), "Exit code 2\nverdict: hard_block\n  ✗ load"), Some("designed-answer:javis_resource_gate.check"));
+        assert_eq!(ex(rg, Some("check"), "Exit code 1\n{\n \"verdict\": \"soft_warn\"\n}"), Some("designed-answer:javis_resource_gate.check"));
+        assert_eq!(ex(rg, Some("check"), "Exit code 1\nverdict: hard_block"), None, "the marker of another answer");
+        assert_eq!(ex(rg, Some("check"), "Exit code 70\ninternal"), None);
+        assert_eq!(ex(rg, Some("check"), "Exit code 2\npython3: can't open file '/x/javis_resource_gate.py': [Errno 2] No such file or directory"), None);
+        let oc = "bin/javis_orchestra.py";
+        assert_eq!(ex(oc, Some("check"), "Exit code 12\n종합: 4종 의무 노드 전부 생존(ready) — 그러나 각성 ACK 미확인: worker"), Some("designed-answer:javis_orchestra.check"));
+        assert_eq!(ex(oc, Some("check"), "Exit code 1\n{\"exit\": 1, \"schema\": \"orchestra-check/v1\"}"), Some("designed-answer:javis_orchestra.check"));
+        assert_eq!(ex(oc, Some("check"), "Exit code 2\n[orchestra check] cys status 수집 실패(데몬 미가동?) — `cys ping` 확인 후 재실행"), Some("designed-answer:javis_orchestra.check"));
+        assert_eq!(ex(oc, Some("check"), "Exit code 1\nTraceback (most recent call last):\n  File \"x\"\nKeyError: 'k'\n종합: 필수 3/4 생존 — 부재: x"), None);
+        assert_eq!(ex(oc, Some("task-prompt"), "Exit code 1\n종합: 필수 3/4 생존 — 부재: x"), None);
+        let wk = "bin/javis_wakeup.py";
+        assert_eq!(ex(wk, Some("drain"), "Exit code 4\nrefused: AUTOPILOT_PAUSED — 정지 중에는 wake 를 배달하지 않는다"), Some("designed-answer:javis_wakeup"));
+        assert_eq!(ex(wk, Some("drain"), "Exit code 5\nnothing pending"), Some("designed-answer:javis_wakeup"));
+        assert_eq!(ex(wk, Some("cancel"), "Exit code 5\n{\"cancelled\": 0, \"ids\": []}"), Some("designed-answer:javis_wakeup"));
+        assert_eq!(ex(wk, Some("drain"), "Exit code 6\npark failed"), None);
+        assert_eq!(ex(wk, Some("drain"), "Exit code 5"), None, "no marker");
+        // javis_task.py has no entry: its "no" is one bundled row
         for c in [3, 4, 5, 6, 8, 9] {
-            assert_eq!(ex("bin/javis_task.py", Some("checkout"), &format!("Exit code {c}")), Some("designed-answer:javis_task"));
+            assert_eq!(ex("bin/javis_task.py", Some("checkout"), &format!("Exit code {c}\nconflict: x")), None);
         }
-        assert_eq!(ex("bin/javis_task.py", Some("checkout"), "Exit code 2\nusage: …"), None);
-        assert_eq!(ex("bin/javis_wakeup.py", Some("drain"), "Exit code 4"), Some("designed-answer:javis_wakeup"));
-        assert_eq!(ex("bin/javis_wakeup.py", Some("drain"), "Exit code 6"), None);
-        assert_eq!(ex("bin/javis_other.py", Some("check"), "Exit code 2"), None);
-        // the shared table is consulted first
+        // the shared table (T3's Windows cys-dept entry) is consulted too
         let dept = "Exit code 127\n/usr/bin/bash: line 1: cys-dept: command not found";
         assert_eq!(detector_excluded("bin/cys-dept", Some("create"), dept, true), Some("windows-cys-dept-not-on-path"));
         assert_eq!(detector_excluded("bin/cys-dept", Some("create"), dept, false), None);
+    }
+
+    /// RULINGS BF4: a full table never blinds the detector — with every signature slot taken (each one
+    /// pending, none due) and every script slot taken, a NEW defect is still recorded and becomes a row.
+    #[test]
+    fn full_tables_still_record_a_new_defect() {
+        let t = 1_800_000_000.0;
+        let mut d = Detector::default();
+        for i in 0..DETECTOR_MAX_SIGNATURES {
+            let s = bash(&format!("python3 ~/.cys/pack/bin/s{i}.py"));
+            assert_eq!(observe(&mut d, &fail(&s, Some(&format!("E{i}: x"))), &base(), t + i as f64, false), Observed::Failure);
+        }
+        for i in DETECTOR_MAX_SIGNATURES..DETECTOR_MAX_RELS {
+            observe(&mut d, &pre(&bash(&format!("python3 ~/.cys/pack/bin/s{i}.py"))), &base(), t + i as f64, false);
+        }
+        assert_eq!((d.tracked().0, d.tracked().1), (DETECTOR_MAX_RELS, DETECTOR_MAX_SIGNATURES));
+        assert!(due_signatures(&d, t + 2_000.0).is_empty(), "one failure each is below the rule");
+        // a new script with a new defect, five times
+        let fresh = bash("python3 ~/.cys/pack/bin/fresh.py run");
+        for _ in 0..5 {
+            observe(&mut d, &pre(&fresh), &base(), t + 2_000.0, false);
+            assert_eq!(observe(&mut d, &fail(&fresh, Some("Exit code 1\nValueError: new")), &base(), t + 2_000.0, false), Observed::Failure);
+        }
+        let due = due_signatures(&d, t + 2_000.0);
+        assert_eq!(due.len(), 1, "{due:?}");
+        assert_eq!((due[0].report.rel.as_str(), due[0].delta), ("bin/fresh.py", 5), "the new defect was not recorded");
+        assert_eq!((d.counters.evicted_signatures, d.counters.evicted_pending_signatures), (1, 1));
+        assert!(d.counters.evicted_rels >= 1);
+        assert_eq!((d.tracked().0, d.tracked().1), (DETECTOR_MAX_RELS, DETECTOR_MAX_SIGNATURES), "still bounded");
+        // and it becomes a row
+        let daemon = crate::team_gate_tests::tmp_daemon("t3b-full", false);
+        let root = tmp_root("full");
+        *intake_for(&daemon).det.lock().unwrap() = d;
+        let rep = flush_defect_intake(&daemon, &root, &AlertConfig::default(), crate::alert_route::Now { mono: 10.0, epoch: t + 2_000.0 });
+        assert_eq!(rep.written_new, 1, "{rep:?}");
+        let rows = rows_in(&root, &LaneKey::of_socket(&daemon.socket_path));
+        assert_eq!((rows.len(), rows[0].rel.as_str(), rows[0].count), (1, "bin/fresh.py", 5));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn feed(daemon: &Arc<Daemon>, cmd: &str, error: &str, n: usize) {
@@ -2168,9 +2745,8 @@ mod defect_intake_tests {
 
     /// ★THE FLOOD TEST (design §6-4 (7) · D:1095 · I-F1-02): the same failure 1,000× → ONE row of this
     /// lane (count 1,000), the report gate's input is ONE defect, and nothing reaches a queue, the event
-    /// bus or the alert route (so seat-death / context alerts cannot be delayed by it — the router half
-    /// is `alert_route::drills::drill_defect_flood_does_not_delay_seat_death_or_clear_signals`). A second,
-    /// different script gets its own row (rows are per signature, not "one row total").
+    /// bus or the alert route (the router half is `alert_route::drills::drill_defect_flood_does_not_delay_
+    /// seat_death_or_clear_signals`). A second, different script gets its own row.
     #[test]
     fn flood_of_one_failure_is_one_row_and_touches_no_queue_bus_or_alert_route() {
         let daemon = crate::team_gate_tests::tmp_daemon("t3b-flood", false);
@@ -2179,32 +2755,22 @@ mod defect_intake_tests {
         let cfg = AlertConfig::default();
         let alert_before = format!("{:?}", *daemon.alert_route.lock().unwrap_or_else(|e| e.into_inner()));
         let bus_before = daemon.bus.latest_seq();
-        let t = std::time::Instant::now();
         feed(&daemon, "python3 ~/.cys/pack/bin/javis_x.py run", "Exit code 1\nTraceback (most recent call last):\n  File \"/tmp/q/javis_x.py\", line 4\nKeyError: 'k' (pid 41234)", 1000);
-        let hot_path = t.elapsed();
-        eprintln!("[t3b-flood] 2,000 observations (1,000 calls + 1,000 failures) on the hook path: {hot_path:?}");
         let rep = flush_defect_intake(&daemon, &root, &cfg, crate::alert_route::Now::at(1_000.0));
         assert_eq!((rep.due, rep.written_new), (1, 1), "{rep:?}");
         let rows = rows_in(&root, &lane);
         assert_eq!(rows.len(), 1, "1,000 identical failures must be ONE row");
-        assert_eq!(rows[0].count, 1000);
-        assert_eq!(rows[0].rel, "bin/javis_x.py");
-        assert_eq!(rows[0].first_line, "KeyError: 'k' (pid <n>)");
+        assert_eq!((rows[0].count, rows[0].rel.as_str(), rows[0].first_line.as_str()), (1000, "bin/javis_x.py", "KeyError: 'k' (pid <n>)"));
         assert_eq!(rows[0].reporters, vec![DETECTOR_REPORTER.to_string()]);
-        // only this lane's directory exists (G4: one writer per file, per lane)
         let lanes: Vec<_> = std::fs::read_dir(root.join("intake")).unwrap().flatten().map(|e| e.file_name()).collect();
         assert_eq!(lanes, vec![std::ffi::OsString::from(&lane.0)]);
-        // the report gate's input: ONE open defect (distinct signatures — `cys repair list` aggregates the same way)
         let (defects, broken) = intake::load_all_in(&root);
-        assert_eq!((defects.len(), broken.len()), (1, 0));
-        assert_eq!(defects[0].count, 1000);
-        // nothing sent anywhere
+        assert_eq!((defects.len(), broken.len(), defects[0].count), (1, 0, 1000));
         assert_eq!(daemon.bus.latest_seq(), bus_before, "the detector published on the event bus");
         assert_eq!(format!("{:?}", *daemon.alert_route.lock().unwrap_or_else(|e| e.into_inner())), alert_before, "the detector touched the alert route");
         assert!(daemon.surfaces.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
-        // a flush with nothing new writes nothing
         assert_eq!(flush_defect_intake(&daemon, &root, &cfg, crate::alert_route::Now::at(1_001.0)).due, 0);
-        // more of the same inside the row cooldown: held (counted, not lost), written after it
+        // inside the row cooldown: held (counted, not lost); after it: written
         feed(&daemon, "python3 ~/.cys/pack/bin/javis_x.py run", "Exit code 1\nKeyError: 'k' (pid 50000)", 10);
         let held = flush_defect_intake(&daemon, &root, &cfg, crate::alert_route::Now::at(1_100.0));
         assert_eq!((held.due, held.held_cooldown, held.updated), (1, 1, 0));
@@ -2216,54 +2782,45 @@ mod defect_intake_tests {
         feed(&daemon, "python3 ~/.cys/pack/bin/javis_y.py", "Exit code 1\nModuleNotFoundError: No module named 'javis_z'", 5);
         flush_defect_intake(&daemon, &root, &cfg, crate::alert_route::Now::at(2_000.0));
         let rows = rows_in(&root, &lane);
-        assert_eq!(rows.len(), 2);
-        assert_eq!((rows[0].rel.as_str(), rows[0].count, rows[1].rel.as_str(), rows[1].count), ("bin/javis_x.py", 1010, "bin/javis_y.py", 5));
+        assert_eq!((rows.len(), rows[1].rel.as_str(), rows[1].count), (2, "bin/javis_y.py", 5));
         assert_eq!(daemon.bus.latest_seq(), bus_before);
         // the guard rails the flood must not weaken (appendix A 1-10; queue cap 100 untouched)
-        assert_eq!(crate::alert_route::HOURLY_CAP, 20);
-        assert_eq!(crate::alert_route::CLEAR_RESERVE, 26);
-        assert_eq!(crate::alert_route::CSO_QUEUE_HEADROOM, 50);
+        assert_eq!((crate::alert_route::HOURLY_CAP, crate::alert_route::CLEAR_RESERVE, crate::alert_route::CSO_QUEUE_HEADROOM), (20, 26, 50));
         assert!(include_str!("handlers.rs").contains("if q.len() >= 100 {"), "the queue cap 100 changed");
         let snap = defect_intake_snapshot(&daemon, 2_000.0);
-        assert_eq!(snap["rows_new"], 2);
-        assert_eq!(snap["share"]["new_rows_total"], 2);
+        assert_eq!((snap["rows_new"].as_u64(), snap["share"]["new_rows_total"].as_u64()), (Some(2), Some(2)));
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A manual `cys repair report` and the detector meet in ONE row (one writer per file: the same
-    /// per-file mutex, an existing row is updated, never replaced) — and an existing row is not a NEW
-    /// row for the hourly share.
+    /// RULINGS BF3: the SAME raw failure text filed by `cys repair report` and observed by the detector
+    /// is ONE row (one normaliser), updated, never replaced; an existing row is not a NEW row for the share.
     #[test]
     fn manual_report_and_detector_share_one_row() {
         let daemon = crate::team_gate_tests::tmp_daemon("t3b-share", false);
         let root = tmp_root("share");
         let lane = LaneKey::of_socket(&daemon.socket_path);
-        let r = intake::parse_report("bin/a.py", "KeyError: 'k'").unwrap();
-        assert!(matches!(
-            intake::record_in(&root, &lane, &r, "worker", 10.0, 0, false, "KeyError: 'k'").unwrap(),
-            intake::Recorded::New(_)
-        ));
-        feed(&daemon, "python3 ~/.cys/pack/bin/a.py", "Exit code 1\nKeyError: 'k'", 5);
+        let raw = "Exit code 1\nloading 3 rows\nTraceback (most recent call last):\n  File \"/tmp/r9/a.py\", line 9, in <module>\nKeyError: 'k' (pid 40001)";
+        let r = intake::parse_report("bin/a.py", raw).unwrap();
+        assert!(matches!(intake::record_in(&root, &lane, &r, "worker", 10.0, 0, false, raw).unwrap(), intake::Recorded::New(_)));
+        feed(&daemon, "python3 ~/.cys/pack/bin/a.py", raw, 5);
         let rep = flush_defect_intake(&daemon, &root, &AlertConfig::default(), crate::alert_route::Now::at(500.0));
         assert_eq!((rep.written_new, rep.updated), (0, 1), "{rep:?}");
         let rows = rows_in(&root, &lane);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].count, 6);
-        assert_eq!(rows[0].first_seen, 10.0, "the first sighting stays the manual one");
+        assert_eq!(rows.len(), 1, "two sources, one failure → one row");
+        assert_eq!((rows[0].count, rows[0].first_seen, rows[0].first_line.as_str()), (6, 10.0, "KeyError: 'k' (pid <n>)"));
         assert_eq!(rows[0].reporters, vec!["worker".to_string(), DETECTOR_REPORTER.to_string()]);
-        let share = intake_for(&daemon);
-        assert_eq!(share.share.lock().unwrap().new_rows_1h(500.0), 0);
+        assert_eq!(intake_for(&daemon).share.lock().unwrap().new_rows_1h(500.0), 0);
         let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A corrupt row is never overwritten (O-C1-6), its count stays pending, and the other rows of the
-    /// same flush are still written (F4: a broken ledger file never stops the detector).
+    /// same flush are still written (F4).
     #[test]
     fn corrupt_row_is_never_overwritten_and_flush_continues() {
         let daemon = crate::team_gate_tests::tmp_daemon("t3b-corrupt", false);
         let root = tmp_root("corrupt");
         let lane = LaneKey::of_socket(&daemon.socket_path);
-        let bad = intake::parse_report("bin/a.py", &detector_error_text("Exit code 1\nE: a")).unwrap();
+        let bad = intake::parse_report("bin/a.py", "Exit code 1\nE: a").unwrap();
         let p = intake::row_path_in(&root, &lane, &bad.signature);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(&p, b"{not json").unwrap();
@@ -2273,8 +2830,7 @@ mod defect_intake_tests {
         assert_eq!((rep.due, rep.corrupt, rep.written_new), (2, 1, 1), "{rep:?}");
         assert_eq!(std::fs::read(&p).unwrap(), b"{not json");
         assert_eq!(rows_in(&root, &lane).iter().map(|r| r.rel.as_str()).collect::<Vec<_>>(), vec!["bin/b.py"]);
-        let (_, _, pending) = intake_for(&daemon).det.lock().unwrap().tracked();
-        assert_eq!(pending, 1, "the corrupt row's count is kept, not lost");
+        assert_eq!(intake_for(&daemon).det.lock().unwrap().tracked().2, 1, "the corrupt row's count is kept, not lost");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2291,7 +2847,6 @@ mod defect_intake_tests {
         }
         let rep = flush_defect_intake(&daemon, &root, &AlertConfig::default(), crate::alert_route::Now::at(100.0));
         assert_eq!((rep.due, rep.written_new, rep.held_hourly), (n, n - 1, 1), "{rep:?}");
-        assert_eq!(rows_in(&root, &lane).len(), n - 1);
         let rep = flush_defect_intake(&daemon, &root, &AlertConfig::default(), crate::alert_route::Now::at(100.0 + crate::alert_route::WINDOW_SECS + 1.0));
         assert_eq!((rep.due, rep.written_new), (1, 1));
         let rows = rows_in(&root, &lane);
@@ -2300,45 +2855,90 @@ mod defect_intake_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// G4: two lanes that see the same failure keep one row EACH (no shared file, no lost count);
-    /// the aggregation on read counts ONE defect with both lanes.
+    /// G4: two lanes that see the same failure keep one row EACH; the aggregation on read counts ONE
+    /// defect with both lanes. (Each lane runs its OWN pack: `$CYS_PACK_DIR` is lane-scoped.)
     #[test]
     fn two_lanes_keep_their_own_rows() {
-        let base = crate::team_gate_tests::tmp_daemon("t3b-lane-a", false);
-        let dept = crate::team_gate_tests::tmp_daemon("t3b-lane-b", true);
+        let base_d = crate::team_gate_tests::tmp_daemon("t3b-lane-a", false);
+        let dept_d = crate::team_gate_tests::tmp_daemon("t3b-lane-b", true);
         let root = tmp_root("lanes");
-        for d in [&base, &dept] {
-            feed(d, "python3 ~/.cys/pack/bin/a.py", "Exit code 1\nE: same", 500);
+        for d in [&base_d, &dept_d] {
+            feed(d, "python3 $CYS_PACK_DIR/bin/a.py", "Exit code 1\nE: same", 500);
             flush_defect_intake(d, &root, &AlertConfig::default(), crate::alert_route::Now::at(10.0));
         }
-        let (la, lb) = (LaneKey::of_socket(&base.socket_path), LaneKey::of_socket(&dept.socket_path));
+        let (la, lb) = (LaneKey::of_socket(&base_d.socket_path), LaneKey::of_socket(&dept_d.socket_path));
         assert_ne!(la, lb);
-        assert_eq!(rows_in(&root, &la)[0].count, 500);
-        assert_eq!(rows_in(&root, &lb)[0].count, 500);
+        assert_eq!((rows_in(&root, &la)[0].count, rows_in(&root, &lb)[0].count), (500, 500));
         let (defects, _) = intake::load_all_in(&root);
-        assert_eq!(defects.len(), 1);
-        assert_eq!(defects[0].count, 1000);
-        assert_eq!(defects[0].lanes.len(), 2);
+        assert_eq!((defects.len(), defects[0].count, defects[0].lanes.len()), (1, 1000, 2));
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The flusher's pass: a live daemon is flushed (into its own root), a dead one is skipped; the
-    /// throttled log line reads the counters at most once per cooldown.
+    /// RULINGS BF6: the first IDENTIFIED failure starts the flusher exactly once (an injected start; a
+    /// call, a mention or an unidentified failure starts nothing); one pass of the flusher's loop body
+    /// writes the row into an isolated root; a dead daemon is skipped; the log line is throttled.
     #[test]
-    fn flusher_pass_skips_dead_daemons_and_logs_at_most_once_per_cooldown() {
+    fn first_failure_starts_the_flusher_once_and_a_pass_writes_the_row() {
         let daemon = crate::team_gate_tests::tmp_daemon("t3b-pass", false);
-        feed(&daemon, "python3 ~/.cys/pack/bin/a.py", "Exit code 1\nE: a", 5);
+        let starts = std::sync::atomic::AtomicUsize::new(0);
+        let once = OnceLock::new();
+        let start = || {
+            starts.fetch_add(1, Ordering::SeqCst);
+        };
+        let fl = FlusherStart { once: &once, start: &start };
+        let x = bash("python3 ~/.cys/pack/bin/a.py");
+        let g = bash("grep a ~/.cys/pack/bin/a.py");
+        observe_tool_event_with(&daemon, &pre(&x), &fl);
+        observe_tool_event_with(&daemon, &fail(&g, Some("Exit code 1")), &fl);
+        observe_tool_event_with(&daemon, &fail(&x, None), &fl);
+        assert_eq!(starts.load(Ordering::SeqCst), 0, "a call, a mention or a failure without text started the flusher");
+        for _ in 0..4 {
+            observe_tool_event_with(&daemon, &pre(&x), &fl);
+            observe_tool_event_with(&daemon, &fail(&x, Some("Exit code 1\nE: a")), &fl);
+        }
+        observe_tool_event_with(&daemon, &fail(&x, Some("Exit code 1\nE: a")), &fl);
+        assert_eq!(starts.load(Ordering::SeqCst), 1, "the flusher must start once");
+        assert!(registered_lanes().iter().any(|w| w.upgrade().is_some_and(|d| Arc::ptr_eq(&d, &daemon))));
         let w = Arc::downgrade(&daemon);
-        assert_eq!(flush_lanes(&[w.clone()], &AlertConfig::default()), 1);
+        let flushed = flusher_pass(&|| vec![w.clone(), std::sync::Weak::new()], &AlertConfig::default, &intake_root);
+        assert_eq!(flushed, 1, "the live lane is flushed, the dead one skipped");
         let root = intake_root(&daemon);
-        assert_eq!(rows_in(&root, &LaneKey::of_socket(&daemon.socket_path)).len(), 1);
+        let rows = rows_in(&root, &LaneKey::of_socket(&daemon.socket_path));
+        assert_eq!((rows.len(), rows[0].count), (1, 5));
+        assert_eq!(flusher_pass(&Vec::<std::sync::Weak<Daemon>>::new, &AlertConfig::default, &intake_root), 0);
         let rep = FlushReport { due: 1, written_new: 1, ..FlushReport::default() };
-        assert!(log_flush(&daemon, &rep, 1.0e6), "first line");
-        assert!(!log_flush(&daemon, &rep, 1.0e6 + 1.0), "throttled");
+        assert!(!log_flush(&daemon, &rep, 1.0), "the pass above logged — throttled");
+        assert!(log_flush(&daemon, &rep, 1.0e6), "after the cooldown");
         assert!(!log_flush(&daemon, &FlushReport { due: 3, ..FlushReport::default() }, 2.0e6), "nothing happened → no line");
         let _ = std::fs::remove_dir_all(&root);
-        assert_eq!(flush_lanes(&[std::sync::Weak::new()], &AlertConfig::default()), 0, "a dead daemon is skipped");
-        drop(w);
+    }
+
+    /// RULINGS BF6: the share is CONNECTED — with the router's general share (20/h) and clear reserve
+    /// (26/h) full on this daemon, the detector still writes its rows, and the router's state is unchanged.
+    #[test]
+    fn full_general_share_and_clear_reserve_never_hold_an_intake_row() {
+        let daemon = crate::team_gate_tests::tmp_daemon("t3b-full-router", false);
+        let root = tmp_root("router");
+        let mono = 5_000.0;
+        {
+            let mut st = daemon.alert_route.lock().unwrap();
+            for i in 0..crate::alert_route::HOURLY_CAP {
+                st.routed_window.push_back(mono - 1.0 - i as f64);
+            }
+            for i in 0..crate::alert_route::CLEAR_RESERVE {
+                st.clear_window.push_back(mono - 1.0 - i as f64);
+                st.routed_window.push_back(mono - 1.0 - i as f64);
+            }
+            assert_eq!((st.general_1h(mono), st.clear_1h(mono)), (crate::alert_route::HOURLY_CAP, crate::alert_route::CLEAR_RESERVE));
+        }
+        let before = format!("{:?}", *daemon.alert_route.lock().unwrap());
+        for i in 0..3 {
+            feed(&daemon, &format!("python3 ~/.cys/pack/bin/r{i}.py"), "Exit code 1\nE: r", 5);
+        }
+        let rep = flush_defect_intake(&daemon, &root, &AlertConfig::default(), crate::alert_route::Now::at(mono));
+        assert_eq!((rep.written_new, rep.held_hourly, rep.held_cooldown), (3, 0, 0), "a full router share held an intake row: {rep:?}");
+        assert_eq!(format!("{:?}", *daemon.alert_route.lock().unwrap()), before, "the detector moved the router's counters");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A 1-26 / D:658: no hook that runs on every tool call or every prompt files a report, and the
@@ -2493,6 +3093,12 @@ mod defect_intake_drills {
             // today's shape (`tool_response.is_error` → exit_code 1, no text)
             let v = usage_event(&daemon, json!({"surface_id": sid, "event_type": "POST_TOOL", "raw_hook_event": "PostToolUse", "tool_name": "Bash", "tool_input": today, "exit_code": 1}));
             assert_eq!(v["ok"], true, "{v}");
+            // an abort of the same script (`is_interrupt: true`) is not a failure of the script
+            let v = usage_event(&daemon, json!({"surface_id": sid, "event_type": "POST_TOOL", "raw_hook_event": "PostToolUseFailure", "tool_name": "Bash", "tool_input": input, "exit_code": 1, "error": "Exit code 130\nKeyboardInterrupt", "is_interrupt": true}));
+            assert_eq!(v["ok"], true, "{v}");
+            // a mention: a failing grep of a pack file
+            let v = usage_event(&daemon, json!({"surface_id": sid, "event_type": "POST_TOOL", "raw_hook_event": "PostToolUseFailure", "tool_name": "Bash", "tool_input": {"command": "grep x ~/.cys/pack/bin/javis_x.py"}, "exit_code": 1, "error": "Exit code 1"}));
+            assert_eq!(v["ok"], true, "{v}");
         }
         let rep = flush_defect_intake(&daemon, &root, &AlertConfig::default(), crate::alert_route::Now::at(10.0));
         assert_eq!((rep.due, rep.written_new), (1, 1), "{rep:?}");
@@ -2503,6 +3109,8 @@ mod defect_intake_drills {
         let snap = defect_intake_snapshot(&daemon, 10.0);
         assert_eq!(snap["no_error_text"], 5, "{snap}");
         assert_eq!(snap["calls"], 10, "{snap}");
+        assert_eq!(snap["failures"], 10, "the abort and the grep were counted as script failures: {snap}");
+        assert_eq!(snap["failures_without_identity"], 5, "{snap}");
         let q = daemon.get_surface(sid).map(|s| s.pending_queue.lock().unwrap().len());
         assert_eq!(q, Some(0), "the seat's queue grew");
         let _ = std::fs::remove_dir_all(&root);

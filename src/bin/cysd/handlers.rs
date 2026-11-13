@@ -11140,6 +11140,7 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
                 &crate::alerts::ToolObservation {
                     event_type: &event_type,
                     raw_event: &hook_event,
+                    tool_name: &tool_name,
                     tool_input: &tool_input,
                     exit_code,
                     error: params.get("error").and_then(|v| v.as_str()),

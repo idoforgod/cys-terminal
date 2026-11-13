@@ -137,16 +137,16 @@ pub const INTAKE_ROW_COOLDOWN_SECS: f64 = COOLDOWN_SECS;
 /// NEW signature rows the detector writes per lane in a rolling hour ([`WINDOW_SECS`]). A further new
 /// signature is HELD in memory with its count and written when the window frees.
 pub const INTAKE_NEW_ROWS_PER_HOUR: usize = 30;
-/// Names reserved for defect intake. They are NEVER routable ([`routable`]): even a future publisher of
-/// a defect notice cannot reach the CSO queue through the general share (every other `alert.*` name is
-/// routable).
+/// Names reserved for defect intake — this PREFIX and everything that extends it (RULINGS BF6). They are
+/// NEVER routable ([`routable`]): even a future publisher of a defect notice cannot reach the CSO queue
+/// through the general share (every other `alert.*` name is routable).
 pub const DEFECT_INTAKE_ALERT_NAME: &str = "alert.defect_intake";
 /// Reserved prefix (`repair.intake…`), see [`DEFECT_INTAKE_ALERT_NAME`].
 pub const DEFECT_INTAKE_NAME_PREFIX: &str = "repair.intake";
 
 /// Is `name` reserved for defect intake (and therefore never routed)?
 pub fn is_defect_intake_name(name: &str) -> bool {
-    name == DEFECT_INTAKE_ALERT_NAME || name.starts_with(DEFECT_INTAKE_NAME_PREFIX)
+    name.starts_with(DEFECT_INTAKE_ALERT_NAME) || name.starts_with(DEFECT_INTAKE_NAME_PREFIX)
 }
 
 /// What the intake share says about one row write.
@@ -6690,7 +6690,7 @@ mod drills {
                             for (et, raw, exit, e) in [("PRE_TOOL", "PreToolUse", None, None), ("POST_TOOL", "PostToolUseFailure", Some(1), Some(err))] {
                                 crate::alerts::observe_tool_event(
                                     &daemon,
-                                    &crate::alerts::ToolObservation { event_type: et, raw_event: raw, tool_input: &input, exit_code: exit, error: e, interrupted: false },
+                                    &crate::alerts::ToolObservation { event_type: et, raw_event: raw, tool_name: "Bash", tool_input: &input, exit_code: exit, error: e, interrupted: false },
                                 );
                             }
                         }
@@ -10696,6 +10696,9 @@ mod defect_intake_share {
     #[test]
     fn defect_intake_names_are_never_routable() {
         assert!(is_defect_intake_name(DEFECT_INTAKE_ALERT_NAME));
+        for suffixed in ["alert.defect_intake_v2", "alert.defect_intake.sig", "alert.defect_intakes"] {
+            assert!(is_defect_intake_name(suffixed) && !routable(suffixed), "{suffixed} routes (the name is reserved by prefix)");
+        }
         assert!(is_defect_intake_name("repair.intake"));
         assert!(is_defect_intake_name("repair.intake_recorded"));
         assert!(!routable(DEFECT_INTAKE_ALERT_NAME));
@@ -10721,32 +10724,9 @@ mod defect_intake_share {
         assert!(!is_defect_intake_name("alert.repeated_failure"));
     }
 
-    /// The share is its OWN counter: writing rows never moves the general share or the clear reserve,
-    /// and a full general share / clear reserve never holds an intake row.
-    #[test]
-    fn intake_share_never_touches_the_general_pool_or_the_clear_reserve() {
-        let mut st = RouteState::default();
-        let mut share = IntakeShare::default();
-        for i in 0..200 {
-            let sig = format!("s{i}");
-            if share.decide(&sig, true, 100.0) == IntakeVerdict::Write {
-                share.commit(&sig, true, 100.0);
-            }
-        }
-        assert_eq!((st.general_1h(100.0), st.clear_1h(100.0), st.routed_1h(100.0)), (0, 0, 0));
-        assert_eq!(share.new_rows_1h(100.0), INTAKE_NEW_ROWS_PER_HOUR);
-        for i in 0..HOURLY_CAP {
-            st.routed_window.push_back(200.0 - i as f64);
-        }
-        for i in 0..CLEAR_RESERVE {
-            st.clear_window.push_back(200.0 - i as f64);
-            st.routed_window.push_back(200.0 - i as f64);
-        }
-        let fresh = IntakeShare::default();
-        assert_eq!(fresh.decide("x", true, 200.0), IntakeVerdict::Write, "a full general share held an intake row");
-        let snap = share.snapshot(100.0);
-        assert_eq!(snap["new_rows_total"], INTAKE_NEW_ROWS_PER_HOUR as u64);
-    }
+    // (round 1's `intake_share_never_touches_the_general_pool_or_the_clear_reserve` filled a RouteState
+    //  the share never saw — vacuous, RULINGS BF6. The connected form lives with the detector:
+    //  `alerts::defect_intake_tests::full_general_share_and_clear_reserve_never_hold_an_intake_row`.)
 
     /// Cooldown per signature, hourly cap for NEW rows only, the window slides, holds are counted.
     #[test]
