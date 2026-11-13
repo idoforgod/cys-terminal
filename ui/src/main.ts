@@ -8843,8 +8843,10 @@ async function buildPaletteItems(): Promise<PaletteItem[]> {
   // ── (4-b) ★R8(WP-2): CEO 승격 대기 해소 — cys-dept PENDING(부트 게이트 보류)의 즉시 경로.
   // ── (4-c) ★D4(v4 · 결정 D4): CEO 승격 재실행(템플릿 전진 적용) — 노출 게이트=ceo_promotion_drift(파일 실측).
   // ★0.15.0 T8(조립 · C11 11.9): CEO 지침 = 생성된 머리말 + 구분선 + 사용자 본부 지침이라 '지침 ≠ 틀'은 정상이다 —
-  // 게이트는 승격 상태인데 지침의 **머리말**이 현행 틀과 다를 때만 열리고(본문 수정은 드리프트 아님), 재실행은
-  // 머리말만 다시 조립하고 본문(사용자 본부 지침)은 그대로 둔다(종전 '새 템플릿 재적용' = 통째 복사 = 수정 소실).
+  // 게이트는 승격 상태(RULINGS CB1: .pre-ceo 실재 ∨ 지침에 조립 구분선 — 앱 `ceo_promoted`)인데 지침의 **머리말**이 현행
+  // 틀과 다를 때만 열리고(본문 수정은 드리프트 아님), 재실행은 조립된 지침이면 머리말만 다시 조립하고 본문(사용자 본부
+  // 지침)은 그대로 둔다. 0.14.x 방식 승격본이면 승격 전 본부 지침(.pre-ceo)을 본문으로 조립하고 옛 CEO 지침은 사본으로
+  // 남긴다(CB3). 종전 '새 템플릿 재적용' = 통째 복사 = 수정 소실.
   // 둘 다 온디맨드 조회(팔레트 열 때만 — 신규 타이머 0)·상호 배타 노출(pending 우선 — 결정
   // 로직은 selfdiag.ceoPaletteEntries 순수 함수에 고정, 회귀 핀 selfdiag.test.ts).
   const [ceoPend, ceoDrift] = await Promise.all([
@@ -8876,11 +8878,11 @@ async function buildPaletteItems(): Promise<PaletteItem[]> {
       items.push({
         id: "act:ceo-repromote",
         title: "CEO 승격 재실행 (템플릿 전진 적용)",
-        subtitle: "릴리스 전진으로 CEO 지침의 머리말이 현행 틀과 다름 — 머리말만 다시 조립합니다(본부 지침 본문은 그대로)",
+        subtitle: "CEO 지침의 머리말이 현행 틀과 다름 — 현행 머리말로 다시 조립합니다(조립된 지침이면 본문은 그대로)",
         keywords: "ceo promote 승격 재실행 템플릿 전진 drift repromote",
         confirm: {
           title: "CEO 승격 재실행",
-          body: "현행 CEO_TEMPLATE의 머리말 + 지금 MASTER_DIRECTIVE.md의 본문(사용자 본부 지침 — 고친 내용 포함)으로 다시 조립합니다. 머리말을 직접 고쳤다면 시각을 붙인 사본을 먼저 남깁니다(.pre-ceo 백업 보존 — 부서 0개 시 자동 강등 가역성 유지).",
+          body: "현행 CEO_TEMPLATE의 머리말 + 본부 지침으로 다시 조립합니다. 조립된 지침이면 본문(사용자 본부 지침 — 고친 내용 포함)은 그대로이고, 머리말을 직접 고쳤다면 시각을 붙인 사본을 먼저 남깁니다. 0.14.x 방식(통째 복사) 승격본이면 승격 전 본부 지침(.pre-ceo)을 본문으로 조립하고, 옛 CEO 지침이 배포 틀과 다르면 통째로 사본을 남기고 알림 1건을 띄웁니다. 부서를 모두 정리하면 그 본문으로 되돌립니다.",
         },
         action: async () => {
           try {

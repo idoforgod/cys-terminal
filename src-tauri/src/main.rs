@@ -7036,6 +7036,9 @@ fn ceo_pending() -> bool {
 /// 이때의 재실행은 머리말만 다시 조립하고 본문은 그대로 둔다(사용자가 고친 머리말은 cys-dept 가 시각 붙여 먼저 보관).
 /// 틀에 구분선이 없거나 판독 불가면 노출하지 않는다(보수 — 비정형 상태 안내는 C03 관할).
 fn ceo_drift_verdict(pre_ceo_exists: bool, md: Option<&[u8]>, template: Option<&[u8]>) -> bool {
+    if !ceo_promoted(pre_ceo_exists, md) {
+        return false;
+    }
     let (Some(md), Some(template)) = (md, template) else {
         return false;
     };
@@ -7044,8 +7047,15 @@ fn ceo_drift_verdict(pre_ceo_exists: bool, md: Option<&[u8]>, template: Option<&
     };
     match ceo_header(md) {
         Some(header) => header != current_header,
-        None => pre_ceo_exists,
+        None => true, // 구분선 없는 옛 승격본(.pre-ceo 실재) — 조립으로 다시 승격하라고 노출
     }
+}
+
+/// ★RULINGS CB1 — '승격'의 한 뜻: `.pre-ceo` 실재 ∨ 살아 있는 MASTER 에 생성기의 조립 구분선(LF·CRLF)이 있다.
+/// 같은 술어: A12(`src/bin/cys.rs`)·`cys::pack::ceo_promoted_in`·javis_preflight(파이썬 정본)·javis_org·cys-dept —
+/// `cysjavis-pack/bin/tests/fixtures/ceo-promoted-cases.json` 한 벌이 전부를 같은 답으로 묶는다.
+fn ceo_promoted(pre_ceo_exists: bool, md: Option<&[u8]>) -> bool {
+    pre_ceo_exists || md.and_then(ceo_header).is_some()
 }
 
 /// 조립 구분선 — `scripts/gen_ceo_template.py` 의 `SEPARATOR` 와 같은 바이트(시험 `ceo_separator_matches_generator`
@@ -11036,6 +11046,26 @@ exit 0
             Some(composed_v1.as_bytes()),
             Some("CEO-STUB\n".as_bytes())
         ));
+    }
+
+    /// ★RULINGS CB1 파리티: 앱의 '승격' 술어가 A12·preflight·javis_org·cys-dept 와 같은 픽스처 한 벌에 같은 답을 낸다.
+    #[test]
+    fn ceo_promoted_matches_the_shared_fixture() {
+        let fx: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../cysjavis-pack/bin/tests/fixtures/ceo-promoted-cases.json"
+        )))
+        .unwrap();
+        assert_eq!(fx["separator"].as_str(), Some(CEO_SEPARATOR));
+        for c in fx["cases"].as_array().unwrap() {
+            let md = c["md"].as_str().map(|m| m.as_bytes());
+            assert_eq!(
+                ceo_promoted(c["pre_ceo"].as_bool().unwrap(), md),
+                c["promoted"].as_bool().unwrap(),
+                "앱 술어 ≠ 픽스처: {}",
+                c["name"]
+            );
+        }
     }
 
     /// ★T8: 앱의 조립 구분선은 생성기(`scripts/gen_ceo_template.py` SEPARATOR)와 같은 바이트이고, 출하 틀
