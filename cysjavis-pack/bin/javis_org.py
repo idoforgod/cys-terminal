@@ -460,30 +460,35 @@ def _audit_ticket_state(name):
 _CEO_SEPARATOR = "\n---\n\n# [본문 — 표준 MASTER 운영 계약 전문]\n\n".encode("utf-8")
 
 
+def _ceo_promoted(md_b, pre_exists):
+    """★RULINGS CB1 — '승격'의 한 뜻(사본 · 정본은 javis_preflight `Preflight._c03_ceo_promoted`):
+    .pre-ceo 실재 ∨ 살아 있는 MASTER 에 생성기의 구분선(LF·CRLF)이 있다. tests/fixtures/ceo-promoted-cases.json 이
+    정본·cys-dept·A12·앱과 같은 답임을 고정한다."""
+    if pre_exists:
+        return True
+    if md_b is None:
+        return False
+    return _CEO_SEPARATOR in md_b or _CEO_SEPARATOR.replace(b"\n", b"\r\n") in md_b
+
+
 def _audit_ceo_axis(dept_count):
     """CEO 축 파생: 마커(부트·pending)·.pre-ceo·영수증·디렉티브 등가로 승격 상태를 계산.
     수렴 = (부서 0 ∧ 미승격) 또는 (부서 ≥1 ∧ 승격 ∧ PENDING 없음 ∧ base 데몬 생존).
-    ★T8: 승격 = .pre-ceo 실재 ∨ 지침이 조립된 CEO 지침(구분선 실재) ∨ 지침 == 틀(구분선 없는 옛 형상).
-      조립에서는 '지침 ≠ 틀'이 정상이다(본문 = 사용자 본부 지침) — 바이트 등가만으로 판정하지 않는다."""
+    ★T8(RULINGS CB1): 승격 = 한 술어 `_ceo_promoted` — .pre-ceo 실재 ∨ 지침에 조립 구분선. 조립에서는 '지침 ≠ 틀'이
+      정상이다(본문 = 사용자 본부 지침) — 바이트 등가로 판정하지 않는다."""
     base_pack = os.path.join(HOME, ".cys", "pack")          # cys-dept PACK_DEFAULT 동일 규약
     md = os.path.join(base_pack, "directives", "MASTER_DIRECTIVE.md")
-    ceo = os.path.join(base_pack, "directives", "CEO_TEMPLATE.md")
     pre = md + ".pre-ceo"
     receipt = os.path.join(base_pack, "directives", ".ceo-receipt.json")          # O-C11-1(조립 영수증)
     legacy_receipt = os.path.join(base_pack, "directives", ".ceo-template-applied")  # 0.14.x 영수증
     pending = os.path.join(HOME, ".cys", "state", "ceo-pending")
     marker = os.path.join(HOME, ".cys", ".master-bootstrapped")
-    same = composed = False
     try:
         with open(md, "rb") as a:
             mb = a.read()
-        composed = (_CEO_SEPARATOR in mb
-                    or _CEO_SEPARATOR.replace(b"\n", b"\r\n") in mb)
-        with open(ceo, "rb") as b:
-            same = mb == b.read()
     except OSError:
-        same = False
-    promoted = os.path.exists(pre) or same or composed   # 영수증 단독은 승격 증거 아님(강등이 증거 보존)
+        mb = None
+    promoted = _ceo_promoted(mb, os.path.exists(pre))   # 영수증 단독은 승격 증거 아님(강등이 증거 보존)
     is_pending = os.path.exists(pending)
     base_st, base_probe = _audit_daemon_status(None)
     base_alive = base_st is not None

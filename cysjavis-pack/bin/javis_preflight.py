@@ -1777,6 +1777,14 @@ class Preflight:
         return b[:i], s, b[i + len(s):]
 
     @classmethod
+    def _c03_ceo_promoted(cls, md_b, pre_exists):
+        """★RULINGS CB1 — '승격'의 한 뜻(정본): `.pre-ceo` 실재 ∨ 살아 있는 MASTER 에 생성기의 구분선(LF·CRLF)이 있다.
+        내용이 승격을 정하고 백업은 덮어쓰기 가드가 지키는 범위를 넓힐 뿐이다. 같은 판정의 사본: cys-dept `ceo_py promoted`,
+        javis_org `_ceo_promoted`, A12(src/bin/cys.rs)·`cys::pack::ceo_promoted_in`, 앱 `ceo_promoted` — 시험 픽스처
+        tests/fixtures/ceo-promoted-cases.json 한 벌이 전부를 같은 답으로 묶는다."""
+        return bool(pre_exists) or cls._c03_ceo_split(md_b) is not None
+
+    @classmethod
     def _c03_ceo_receipt(cls, path):
         """승격 영수증 판독 — ('absent', None) | ('valid', dict) | ('invalid', 사유). cys-dept 와 같은 규칙:
         schema 정수 ≥1 · 세 해시 64자리 소문자 hex · separator == 조립 구분선(LF/CRLF 철자) · composed_at 문자열."""
@@ -1850,12 +1858,22 @@ class Preflight:
                   header_current=(comp is not None and tcomp is not None and comp[0] == tcomp[0]),
                   ceo_receipt_state=rstate, ceo_receipt_info=rinfo,
                   body_text=comp[2].decode("utf-8", "replace") if comp is not None else None)
-        st["marker"] = (st["composed"] or byte_equal or receipt_equal
-                        or (marker_pins_ok and st["pre_exists"]))
-        st["marker_via"] = ("조립된 CEO 지침(머리말 + 구분선 + 본부 지침)" if st["composed"]
+        # ★CB1: 승격 = 한 술어(구분선 ∨ .pre-ceo). 분류 표지는 그 부분집합이다 — 구분선 없는 옛 형상(바이트 등가·0.14.x
+        #   영수증·표지 3핀)은 .pre-ceo 가 있을 때만 승격으로 센다(백업도 구분선도 없으면 내용상 승격이 아니다).
+        #   .pre-ceo 는 있는데 표지가 하나도 없으면 아래 ③ 비정형 승격 상태다(역시 술어상 승격).
+        st["promoted"] = self._c03_ceo_promoted(md_b, st["pre_exists"])
+        # CB2 — 승격된 적이 있다는 증거(cys-dept 와 같은 규칙): 유효한 영수증 · 0.14.x 영수증 · .pre-ceo · 구분선 앞이
+        #   CEO 머리말 표지 3핀. 구분선만 있고 증거가 없는 파일은 cys-dept 가 승격도 강등도 하지 않는다(보류).
+        st["evidence"] = (rstate == "valid" or receipt is not None or st["pre_exists"]
+                          or (comp is not None and all(
+                              p in comp[0].decode("utf-8", "replace") for p in MARKER_PINS)))
+        st["marker"] = (st["composed"]
+                        or (st["pre_exists"] and (byte_equal or receipt_equal or marker_pins_ok)))
+        st["marker_via"] = (None if not st["marker"]
+                           else "조립된 CEO 지침(머리말 + 구분선 + 본부 지침)" if st["composed"]
                            else "md==라이브 CEO_TEMPLATE 바이트 등가" if byte_equal
                            else "승격 영수증 해시 등가" if receipt_equal
-                           else "표지 3핀+.pre-ceo 폴백" if st["marker"] else None)
+                           else "표지 3핀+.pre-ceo 폴백")
         # 퇴화 = .pre-ceo 가 CEO 템플릿 사본으로 오염(동시 승격 레이스 잔재 · R1 E3) —
         # 강등하면 템플릿을 재적용하게 되어 강등 경로 자체가 파괴된 상태. ★T8: 백업이 조립 구분선을 담은 경우
         # (조립된 CEO 지침이 백업에 들어감)도 같은 퇴화다 — 백업은 조립되지 않은 MASTER 여야 한다.
@@ -1918,14 +1936,9 @@ class Preflight:
             return (FAIL, "%s: 소실된 조항: %s — %s"
                     % (prefix, "; ".join(l for _, l in lost_body), cause))
         if st["marker"]:
-            if not st["pre_exists"]:
-                # ④ 사분면(R1 시나리오6): 등가/영수증 승격인데 강등 백업이 없다 — demote 로
-                #   자연 회복 불가한 고착 상태라 전용 FAIL. demote-guard 의 부재 WARN 과
-                #   중복 발화는 의도(독립 축).
-                st["classification"] = "promoted-backup-missing"
-                return (FAIL, "복원 백업 소실(강등 불능) — 승격 상태(%s)인데 "
-                              "MASTER_DIRECTIVE.md.pre-ceo 부재. 파괴적 조치 금지 — %s"
-                        % (st["marker_via"], rebuild_hint))
+            # ★CB1: 여기(구분선 없는 옛 형상)에 오는 승격은 언제나 .pre-ceo 가 있다 — 종전 ④ '복원 백업 소실(강등 불능)'
+            #   사분면(바이트 등가/영수증인데 백업 없음)은 이제 승격 상태가 아니다(구분선 있는 지침은 ①′ 조립 갈래가
+            #   구분선 뒤 본문으로 강등하므로 백업이 없어도 강등할 수 있다).
             prefix = "승격 상태 — 표준 핀은 MASTER_DIRECTIVE.md.pre-ceo에서 검사"
             if st["degenerate"]:
                 # ★연동 규칙(R3 conflicts2): 퇴화 검출 시 '구본화' 분류를 **억제**하고 전용
@@ -2025,19 +2038,24 @@ class Preflight:
                 return (WARN, "승격 영수증(directives/%s) 손상(%s) — 승격 확인이 성공으로 보고되지 않는다. "
                               "파일을 확인하고, 손상이면 지운 뒤 다시 승격하면 지금 지침은 그대로 두고 영수증만 "
                               "새로 기록된다" % (self._C03_CEO_RECEIPT, st["ceo_receipt_info"]))
-            if rstate == "absent" and st["receipt_equal"] and st["pre_exists"] and not st["degenerate"]:
-                return (PASS, "강등 경로 건전 — 0.14.x 통째 복사본이 그대로라 백업(.pre-ceo = 사용자 본부 지침)으로 "
-                              "되돌린다 · 영수증 없음(0.15.0 이전 승격 — 다음 승격 확인 때 기록)")
+            if not st["evidence"]:
+                return (WARN, "구분선 줄만 있고 승격 기록(영수증·0.14 영수증·.pre-ceo·CEO 머리말 표지)이 없다 — cys-dept 는 "
+                              "이 지침을 승격도 강등도 하지 않고 보류한다(알림 1건). 그 줄이 본부 지침의 일부로 들어간 것이면 "
+                              "그 줄을 지우거나 고친다")
+            if rstate == "absent":
+                # CB3 — 영수증 없는 조립 형상 = 0.14.x 통째 복사 승격: 강등은 0.14.x 처럼 승격 전 본부 지침(.pre-ceo)이다.
+                if st["pre_exists"] and not st["degenerate"]:
+                    return (PASS, "강등 경로 건전 — 0.14.x 승격(영수증 없음): 부서를 모두 정리하면 승격 전 본부 지침"
+                                  "(.pre-ceo)으로 되돌린다(옛 CEO 지침이 배포 틀과 다르면 통째로 사본 보관 + 알림 1건) · "
+                                  "다음 승격 확인 때 .pre-ceo 를 본문으로 조립하고 영수증을 기록한다")
+                return (WARN, "0.14.x 승격(영수증 없음)인데 승격 전 본부 지침 백업(.pre-ceo)이 %s — 강등·이전 때 옛 CEO 지침의 "
+                              "구분선 뒤 본문을 쓰고 옛 CEO 지침 전체는 사본으로 보관한다(알림 1건). 승격 전 본부 지침은 "
+                              "되살릴 수 없다" % ("CEO 사본으로 오염됐다" if st["degenerate"] else "없다"))
             return (PASS, "강등 경로 건전 — 부서를 모두 정리하면 구분선 뒤 본문(사용자 본부 지침, CEO 동안 고친 "
                           "것 포함)으로 되돌린다(.pre-ceo 는 백업일 뿐 강등 원본이 아니다)%s"
                     % ("" if rstate == "valid"
                        else " · 영수증 없음(0.15.0 이전 승격 — 다음 승격 확인 때 기록)"))
-        if not st["pre_exists"]:
-            st["guard_bits"] = [0, None, None]
-            return (WARN, "승격 표지(%s)인데 .pre-ceo 부재 — 강등 불능. 후속 검사(퇴화·핀) "
-                          "단락. .pristine/directives/MASTER_DIRECTIVE.md 로 재건(오너 승인). "
-                          "핀 축 '복원 백업 소실' FAIL 과의 중복 발화는 의도(독립 축)"
-                    % st["marker_via"])
+        # ★CB1: 구분선 없는 옛 형상의 승격 표지는 언제나 .pre-ceo 를 동반한다(종전 '.pre-ceo 부재 — 강등 불능' 갈래 소멸).
         pins_lost = [(pin, label) for pin, label in CONTENT_PINS["MASTER_DIRECTIVE.md"]
                      if pin not in st["pre_text"]]
         st["guard_bits"] = [1, 1 if st["degenerate"] else 0, 0 if pins_lost else 1]
@@ -2173,13 +2191,24 @@ class Preflight:
                      "§0-A session_error 행(P0-3 래치 소비면) 실재 — 훅 브리지와 동일 규칙")
             return
         new_p = st.get("new_p")
-        if new_p and os.path.isfile(new_p):
+        new_note = (" — 신본은 %s 에 있다" % os.path.basename(new_p)
+                    if new_p and os.path.isfile(new_p) else "")
+        if st.get("promoted"):
+            # ★RULINGS CB4(T8): 조립 승격에서 재승격은 머리말만 다시 만들고 본문(사용자 본부 지침)은 그대로다 — 종전
+            #   '재합성 후 promote-ceo 재실행으로 표준 전문 갱신'은 거짓이 됐다. 승격된 지침에는 `--take-new` 를 처방하지
+            #   않는다(지침을 통째로 덮어 CEO 머리말을 지우므로 A12 가 거부한다 — 구분선 ∨ .pre-ceo, CB1).
+            if st.get("composed"):
+                fix = ("해소(승격 기계): 조립된 CEO 지침의 본문(구분선 뒤)이 사용자 본부 지침이다 — 오너 지시로 워커가 그 행을 "
+                       "본문에 합친다%s(재승격은 머리말만 다시 조립해 본문을 바꾸지 않는다 · `--take-new` 는 지침을 통째로 "
+                       "덮어 CEO 머리말을 지우므로 A12 가 거부한다)" % new_note)
+            else:
+                fix = ("해소(승격 기계): 이 지침은 조립 이전(0.14.x) 형식이다 — 다음 승격 확인(부서 켜기·`cys-dept "
+                       "promote-ceo`) 때 승격 전 본부 지침(.pre-ceo)을 본문으로 조립한다. 그 행은 오너 지시로 워커가 그 "
+                       "본문에 합친다%s(`--take-new` 는 A12 가 거부한다)" % new_note)
+        elif new_p and os.path.isfile(new_p):
             fix = ("해소: `cys pack-merge --file directives/MASTER_DIRECTIVE.md`"
                    "(무수정본이면 `--take-new`) — vendor 신본이 이미 %s 로 병치돼 있다"
                    % os.path.basename(new_p))
-        elif st.get("marker"):
-            fix = ("해소(승격 기계): CEO_TEMPLATE 재합성/팩 갱신 후 `cys-dept promote-ceo` 재실행 "
-                   "— 승격 md 는 CEO 템플릿 사본이라 표준 전문이 그 경유로만 갱신된다")
         else:
             fix = "해소: `cys init-pack` 으로 vendor 신본(.new) 병치 재생성 후 `cys pack-merge`"
         self.add(cid, WARN,
