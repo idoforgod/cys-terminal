@@ -26474,9 +26474,9 @@ fn advance_vendor_baseline(dir: &std::path::Path, rel: &str, content: &str) {
 /// ★0.15.0 「스스로 해결」 T8(C11 11.8–11.9 · 설계 §4-14 · H-14-N5-01): CEO 지침은 이제 **조립**이다(생성된 머리말 +
 /// 구분선 + 사용자 본부 지침 — `cys-dept` `ceo_promote`). 조립된 지침은 틀과 바이트가 다른 것이 정상이므로 승격 판정은
 /// '지침 == 틀'로 하지 않는다. 판정은 팩 코어의 한 술어 [`cys::pack::ceo_promoted_in`](갱신 규칙 바 가드 4 — 7번째 자리)
-/// 하나로 묻는다: 조립 승격은 `.pre-ceo` 를 백업으로 남기고 승격 중엔 늘 실재시킨다(없으면 다음 승격 확인이 본문으로
-/// 다시 만든다 · 강등은 그것을 치운다) — 그래서 조립된 지침도 이 술어로 잡히고, 두 자리(A12·가드 4)의 조건이 구조적으로
-/// 같다. 거부 문안은 바꾸지 않는다(H-14-N5-01).
+/// 하나로 묻는다: `.pre-ceo` 가 사전적으로 있다 ∨ 지침에 조립 구분선이 있다(RULINGS CB1·CG2 · CCR-2) — 백업이 지워진
+/// 조립 지침도 잡히고, 두 자리(A12·가드 4)는 같은 함수다. 거부 문안은 실제 근거를 말한다(RULINGS CB4 — H-14-N5-01 의
+/// '문안 불변'보다 뒤의 판정).
 #[derive(Clone, Copy, PartialEq)]
 enum CeoGuardVerb {
     TakeNew,  // pack-merge --take-new
@@ -26499,7 +26499,7 @@ fn ceo_vendor_overwrite_rejection(
     }
     let pre_ceo = pack_dir.join(format!("{MASTER_DIRECTIVE_REL}.pre-ceo"));
     // ★RULINGS CB4: 거부 사유는 실제 근거를 말한다 — 백업이 있으면 그 경로, 없으면 지침 안의 조립 구분선.
-    let why = if ceo_pre_ceo_present(pack_dir) {
+    let why = if cys::pack::ceo_pre_ceo_present_in(pack_dir) {
         format!("{} 존재", pre_ceo.display())
     } else {
         "지침에 CEO 조립 구분선 — 조립된 CEO 지침".to_string()
@@ -26535,29 +26535,10 @@ fn ceo_vendor_overwrite_rejection(
 /// 내용이 승격을 정하고, 백업은 덮어쓰기 가드가 지키는 범위를 넓힐 뿐이다(덮어쓰기 가드 = 가장 넓은 읽기).
 /// 같은 술어: javis_preflight `Preflight._c03_ceo_promoted`(파이썬 정본) · javis_org · cys-dept `ceo_py promoted` ·
 /// 앱 `ceo_promoted` — `cysjavis-pack/bin/tests/fixtures/ceo-promoted-cases.json` 한 벌이 전부를 같은 답으로 묶는다.
-/// T2f 병합 뒤에는 `cys::pack::ceo_promoted_in`(갱신 규칙 가드 4) 자체가 이 술어가 되고(CCR-2) 이 함수는 그것만 부른다.
-///
-/// ★RULINGS CG2: `.pre-ceo` 의 실재는 사전적이다(항목이 있다 — 끊긴 링크·읽을 수 없는 파일·폴더도 '있다', 지키는 방향) —
-/// `symlink_metadata` 가 그것이다(`exists()` 는 링크를 따라가 끊긴 링크를 '없다'고 본다).
+/// ★T2f 병합 뒤(CCR-2): 이 함수는 `cys::pack::ceo_promoted_in`(갱신 규칙 가드 4) 하나만 부른다 — A12 와 가드 4 는
+/// 같은 함수다. `.pre-ceo` 의 실재는 사전적이다(RULINGS CG2 — `cys::pack::ceo_pre_ceo_present_in`).
 fn ceo_directive_promoted(pack_dir: &std::path::Path) -> bool {
-    ceo_pre_ceo_present(pack_dir)
-        || std::fs::read(pack_dir.join(MASTER_DIRECTIVE_REL))
-            .map(|b| ceo_has_separator(&b))
-            .unwrap_or(false)
-}
-
-fn ceo_pre_ceo_present(pack_dir: &std::path::Path) -> bool {
-    std::fs::symlink_metadata(pack_dir.join(format!("{MASTER_DIRECTIVE_REL}.pre-ceo"))).is_ok()
-}
-
-/// 생성기(`scripts/gen_ceo_template.py` SEPARATOR)의 조립 구분선 — LF 또는 CRLF 철자.
-const CEO_SEPARATOR: &str = "\n---\n\n# [본문 — 표준 MASTER 운영 계약 전문]\n\n";
-
-fn ceo_has_separator(b: &[u8]) -> bool {
-    let lf = CEO_SEPARATOR.as_bytes();
-    let crlf = CEO_SEPARATOR.replace('\n', "\r\n");
-    let has = |needle: &[u8]| b.windows(needle.len()).any(|w| w == needle);
-    has(lf) || has(crlf.as_bytes())
+    cys::pack::ceo_promoted_in(pack_dir)
 }
 
 /// ★G3-축3 안전핵 게이트 거부 exit — 예약 규약({0,1,2,64} 충돌 금지 · clap 사용오류=2)과
@@ -29694,7 +29675,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             fx["separator"].as_str(),
-            Some(CEO_SEPARATOR),
+            Some(cys::pack::CEO_SEPARATOR),
             "A12 의 구분선 사본 ≠ 픽스처"
         );
         let cases = fx["cases"].as_array().unwrap();

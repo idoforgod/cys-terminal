@@ -1815,7 +1815,7 @@ class Preflight:
     def _c03_ceo_promoted(cls, md_b, pre_exists):
         """★RULINGS CB1 — '승격'의 한 뜻(정본): `.pre-ceo` 실재 ∨ 살아 있는 MASTER 에 생성기의 구분선(LF·CRLF)이 있다.
         내용이 승격을 정하고 백업은 덮어쓰기 가드가 지키는 범위를 넓힐 뿐이다. 같은 판정의 사본: cys-dept `ceo_py promoted`,
-        javis_org `_ceo_promoted`, A12(src/bin/cys.rs)·`cys::pack::ceo_promoted_in`, 앱 `ceo_promoted` — 시험 픽스처
+        javis_org `_ceo_promoted`, `cys::pack::ceo_promoted_in`(가드 4 — A12 가 그것만 부른다), 앱 `ceo_promoted` — 시험 픽스처
         tests/fixtures/ceo-promoted-cases.json 한 벌이 전부를 같은 답으로 묶는다."""
         return bool(pre_exists) or cls._c03_ceo_split(md_b) is not None
 

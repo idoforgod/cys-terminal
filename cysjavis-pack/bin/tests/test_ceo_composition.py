@@ -1050,7 +1050,8 @@ class SymlinkedDirective(Rig):
 class OnePredicate(Rig):
     """★RULINGS CB1·CG2 — '승격'의 한 뜻(.pre-ceo 실재 ∨ 구분선)을 파이썬 판독자 셋(정본 javis_preflight, javis_org, cys-dept 의
     ceo_py 와 bash 게이트)이 같은 픽스처 한 벌에 같은 답으로 낸다. .pre-ceo 는 실제 항목(파일·끊긴 링크·폴더·읽을 수 없는
-    파일)으로 만들고 각 판독자의 사전적 실재 판정으로 읽는다. Rust(A12)와 앱은 같은 파일을 cargo 시험이 읽는다."""
+    파일)으로 만들고 각 판독자의 사전적 실재 판정으로 읽는다. Rust — 팩 코어 `cys::pack::ceo_promoted_in`(가드 4 · A12 가
+    그것 하나만 부른다)과 앱 — 은 같은 파일을 cargo 시험이 읽는다."""
     FIXTURE = os.path.join(SELF, "fixtures", "ceo-promoted-cases.json")
 
     def make_pre(self, md_p, kind):
@@ -1224,7 +1225,7 @@ class HqDirectiveChain(Rig):
         self.assertTrue(axis["receipt"], axis)
 
     def test_separator_and_marker_copies_match_the_generator(self):
-        """O-C11-2: 구분선은 생성기의 것 하나 — cys-dept·preflight·javis_org·앱 사본이 모두 같은 바이트여야 한다."""
+        """O-C11-2: 구분선은 생성기의 것 하나 — cys-dept·preflight·javis_org·팩 코어(src/pack.rs)·앱 사본이 모두 같은 바이트여야 한다."""
         gen_p = os.path.join(REPO, "scripts", "gen_ceo_template.py")
         if not os.path.isfile(gen_p):
             self.skipTest("scripts/gen_ceo_template.py 없음(배포 팩 트리 — repo 전용 축)")
@@ -1244,6 +1245,12 @@ class HqDirectiveChain(Rig):
         self.assertIsNotNone(lit)
         self.assertEqual(lit.group(1).encode("utf-8").decode("unicode_escape").encode("latin-1"), canon,
                          "javis_org 구분선 ≠ 생성기")
+        core = os.path.join(REPO, "src", "pack.rs")
+        if os.path.isfile(core):
+            lit = re.search(r'^pub const CEO_SEPARATOR: &str = "(.*?)";$', _slurp(core, encoding="utf-8"), re.M)
+            self.assertIsNotNone(lit, "src/pack.rs 의 구분선 정의(가드 4 · A12)를 찾지 못했다")
+            self.assertEqual(lit.group(1).encode("utf-8").decode("unicode_escape").encode("latin-1"), canon,
+                             "팩 코어(ceo_promoted_in) 구분선 ≠ 생성기")
         app = os.path.join(REPO, "src-tauri", "src", "main.rs")
         if os.path.isfile(app):
             lit = re.search(r'^const CEO_SEPARATOR: &str = "(.*?)";$', _slurp(app, encoding="utf-8"), re.M)
