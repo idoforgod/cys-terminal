@@ -1065,7 +1065,9 @@ class MasterMayFileAReport(unittest.TestCase):
         rules = repo_text(os.path.join("src", "repair", "rules.rs"))
         self.assertIn("장부를 바꾸는 `cys repair` 동사(begin·commit 등)는 쓰지 않는다(접수 `cys repair report`는 쓴다).", rules)
         m = norm(open(os.path.join(DIRECTIVES_DIR, "MASTER_DIRECTIVE.md"), encoding="utf-8").read())
-        self.assertIn("master 가 부르는 것은 결함 접수(`cys repair report` — 누구나, 장부를 바꾸지 않는다), 읽기(", m)
+        self.assertIn("master 가 부르는 것은 결함 접수(`cys repair report` — 누구나 부를 수 있다 · 접수 줄만 남기고 수리를 시작하지는 "
+                      "않는다), 읽기(", m)
+        self.assertNotIn("장부를 바꾸지 않는다", m, "an intake record IS a ledger row (design §4-4, RULINGS BZ4)")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
