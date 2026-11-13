@@ -132,17 +132,34 @@ class FormationLane(_Home):
     def install_dept_pack_bin(self):
         _write(os.path.join(self.dept_pack(), "bin", "javis_boot_node.py"), "# stub\n")
 
+    def _complete_record(self):
+        """The stub's last COMPLETE record — the file ends with a newline and its last line parses
+        as JSON — or None (absent, or created but not yet fully written: the stub runs in the
+        background and `open(..., 'a').write(...)` is not atomic for a reader)."""
+        if not os.path.exists(self.fmlog):
+            return None
+        text = _read(self.fmlog)
+        if not text.endswith("\n"):
+            return None
+        try:
+            return json.loads(text.splitlines()[-1])
+        except (ValueError, IndexError):
+            return None
+
     def launch(self, **extra):
         if os.path.exists(self.fmlog):
             os.unlink(self.fmlog)
         r = self.run_dept("launch", self.NAME, **extra)
-        for _ in range(100):                      # 편성은 백그라운드 — 기록을 기다린다
-            if os.path.exists(self.fmlog):
+        rec = None
+        for _ in range(100):                      # 편성은 백그라운드 — 완결된 기록(개행으로 끝나는 JSON 한 줄)을 기다린다
+            rec = self._complete_record()
+            if rec is not None:
                 break
             time.sleep(0.1)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertTrue(os.path.exists(self.fmlog), "편성 스텁이 호출되지 않았다: %s" % r.stderr[-400:])
-        rec = json.loads(_read(self.fmlog).splitlines()[-1])
+        self.assertIsNotNone(rec, "편성 스텁의 기록이 완결되지 않았다(the stub's record is incomplete): %r"
+                             % _read(self.fmlog)[-400:])
         self.assertIn("--socket", rec["argv"])
         return r, rec
 
