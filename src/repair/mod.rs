@@ -23,6 +23,8 @@ pub mod platform;
 pub mod rehearsal;
 pub mod roles;
 pub mod rules;
+/// Track T5b — the protection screen beside the rehearsal runner (RULINGS AT9).
+pub mod screen;
 pub mod tombstones;
 pub mod types;
 
