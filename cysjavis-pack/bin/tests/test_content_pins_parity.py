@@ -614,5 +614,16 @@ class NoMasterShortcutAnywhere(unittest.TestCase):
         planted = {"skills/x/SKILL.md": "master는 직접 구현하지 않는다\n  (사소한 마무리 제외)."}
         self.assertEqual(self.hits(planted), [("skills/x/SKILL.md", "사소한 마무리")])
 
+
+class MasterMayFileAReport(unittest.TestCase):
+    """RULINGS BB2 (ii): the master's compiled role block and MASTER_DIRECTIVE §1-B say plainly that intake
+    (`cys repair report`) is allowed to a master — only the ledger-changing verbs are not."""
+
+    def test_block_and_directive_allow_report(self):
+        rules = repo_text(os.path.join("src", "repair", "rules.rs"))
+        self.assertIn("장부를 바꾸는 `cys repair` 동사(begin·commit 등)는 쓰지 않는다(접수 `cys repair report`는 쓴다).", rules)
+        m = norm(open(os.path.join(DIRECTIVES_DIR, "MASTER_DIRECTIVE.md"), encoding="utf-8").read())
+        self.assertIn("master 가 부르는 것은 결함 접수(`cys repair report` — 누구나, 장부를 바꾸지 않는다), 읽기(", m)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

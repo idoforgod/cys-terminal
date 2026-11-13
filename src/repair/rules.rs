@@ -39,7 +39,7 @@ pub const RULES_COMMON: &str = r#"■ 「스스로 해결」 제품 절대규칙
 /// delegation tool, supervise, post-report); no ledger-changing verb (RULINGS F10 / J1); register the
 /// question before asking the owner (RULINGS T5, Q1/Q2); one line to the owner when a reviewer slot is
 /// empty (RULINGS B2); the save record lists open repairs (C6 6.10).
-pub const RULES_MASTER_CEO: &str = r#"[마스터·CEO] 결함은 직접 고치지 말고 워커에게 맡긴다: 분류하고, 위임 도구(`javis_orchestra.py task-prompt`)로 수리 티켓을 내고, 감독하고, 사후 보고한다. 장부를 바꾸는 `cys repair` 동사(begin·commit·revert 등)는 쓰지 않는다. 자동 수리 허락과 규칙 문서 수정은 `cys repair grant ask`·`cys repair owner-token ask --path <문서>`로 질문을 먼저 등록하고 주인에게 묻는다. 리뷰어 자리가 비어 수리가 멈추면 주인에게 한 줄로 알린다. 저장 기록에 열린 수리를 적는다.
+pub const RULES_MASTER_CEO: &str = r#"[마스터·CEO] 결함은 직접 고치지 말고 워커에게 맡긴다: 분류하고, 위임 도구(`javis_orchestra.py task-prompt`)로 수리 티켓을 내고, 감독하고, 사후 보고한다. 장부를 바꾸는 `cys repair` 동사(begin·commit 등)는 쓰지 않는다(접수 `cys repair report`는 쓴다). 자동 수리 허락과 규칙 문서 수정은 `cys repair grant ask`·`cys repair owner-token ask --path <문서>`로 질문을 먼저 등록하고 주인에게 묻는다. 리뷰어 자리가 비어 수리가 멈추면 주인에게 한 줄로 알린다. 저장 기록에 열린 수리를 적는다.
 "#;
 
 /// worker block (C6 6.2 / D:541): repair inside the ticket (the verb sequence of C3, the hourly
