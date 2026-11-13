@@ -156,9 +156,14 @@ ic_machine() {   # → "<칩> <인텔 하위 유형> <macOS 버전>" (못 읽은
   case "$os" in ''|*[!0-9.]*) os="-" ;; esac
   echo "$hw $sub $os"
 }
-ic_rosetta() {   # → yes(x86_64 번역이 실제로 돈다) · no(돌지 않는다) · -(판정 불가) — 시스템 코드만 번역해 본다(CA3)
-  [ -x /usr/bin/arch ] && [ -x /usr/bin/true ] || { echo "-"; return 0; }
-  if /usr/bin/arch -x86_64 /usr/bin/true >/dev/null 2>&1; then echo yes; else echo no; fi
+ic_rosetta() {   # [번역해 볼 시스템 바이너리 — 기본 /usr/bin/true] → yes(번역이 실제로 돈다) · no(돌지 않는다) · -(판정 불가)
+  # 시스템 코드만 번역해 본다(CA3). 그 바이너리에 x86_64 조각이 없으면 "번역 실패"가 Rosetta 부재를 뜻하지 않는다
+  #   → 판정 불가(-) = 막지 않는다. 설치 도우미의 관리자 재시도에서는 root 로 돈다 — 시스템 바이너리만 실행한다.
+  local t="${1:-/usr/bin/true}" sl
+  [ -x /usr/bin/arch ] && [ -x "$t" ] || { echo "-"; return 0; }
+  sl="$(ic_slices "$t")" || { echo "-"; return 0; }
+  case " $(echo $sl) " in *" x86_64:"*|*" x86_64h:"*) ;; *) echo "-"; return 0 ;; esac
+  if /usr/bin/arch -x86_64 "$t" >/dev/null 2>&1; then echo yes; else echo no; fi
 }
 # ic_python_runnable <python> <칩 arm64|x86_64|-> <인텔 하위 유형|-> <macOS 버전|-> <Rosetta 2 yes|no|probe|-> [node]
 #   → 0 = 실행 가능 **또는 판정 불가**(막지 않는다 · 종전 동작) · 5 = 확실히 못 돈다(한국어 한 문장을 stderr 로).

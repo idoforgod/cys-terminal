@@ -360,6 +360,7 @@ class Gate(unittest.TestCase):
         members, read, size = (int(x) for x in m.groups())
         self.assertEqual(members, n_text + n_macho + 6, out)
         self.assertLessEqual(read, size, "the compressed stream was read more than once (a rewind) — RULINGS CA1")
+        self.assertEqual(read, size, "every compressed byte must pass through the counting reader exactly once")
         self.assertIn("x86_64 ", out)
         self.assertRegex(out, r"python3 -> python3\.12\s+x86_64\s+min 10\.15")
 

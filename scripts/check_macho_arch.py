@@ -312,6 +312,8 @@ def scan_tar(path, target_arch, out):
                     continue
                 if info is not None:
                     records[rel] = info
+        while raw.read(1 << 16):        # the end-of-archive padding / gzip trailer: count it, still one pass
+            pass
     finally:
         raw.close()
     out.append("  archive read in one pass: %d members, %d of %d compressed bytes"

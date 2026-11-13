@@ -204,7 +204,7 @@ class PythonRunnableCheck(unittest.TestCase):
         self.driver = os.path.join(self.root, "driver.sh")
         with open(self.driver, "w", encoding="utf-8") as f:
             f.write("#!/bin/bash\nset -euo pipefail\n" + self.block +
-                    '\ncase "$1" in machine) ic_machine ;; rosetta) ic_rosetta ;; '
+                    '\ncase "$1" in machine) ic_machine ;; rosetta) shift; ic_rosetta "$@" ;; '
                     '*) ic_python_runnable "$@" ;; esac\n')
 
     def tearDown(self):
@@ -285,6 +285,16 @@ class PythonRunnableCheck(unittest.TestCase):
         # arm64e-only on Apple silicon / x86_64h-only on a pre-Haswell Intel: not runnable, but no sentence fits -> no block
         self.assertEqual(self.check(self.py(_thin(ARM64, subtype=2)), "arm64", "-", "14.5", "no"), (0, ""))
         self.assertEqual(self.check(self.py(_thin(X86_64, subtype=8)), "x86_64", "4", "13.0", "-"), (0, ""))
+
+    def test_rosetta_probe_target_without_an_x86_64_slice_is_unknown_not_missing(self):
+        # if the system binary used for the probe has no x86_64 slice, a failed translation says nothing about
+        # Rosetta 2 -> '-' (unknown) -> the installer proceeds; it never reaches the arch probe in that case
+        for data in (_thin(ARM64), _fat([(ARM64, _thin(ARM64), 0x80000002)]), b"#!/bin/sh\nexit 1\n"):
+            probe = self.put("probe/true", data)
+            rc, out, err = self.bash("rosetta", probe)
+            self.assertEqual((rc, out.strip()), (0, "-"), err)
+        x86 = self.py(_thin(X86_64, minos="10.15"))
+        self.assertEqual(self.check(x86, "arm64", "-", "14.5", "-"), (0, ""), "unknown Rosetta 2 never refuses")
 
     # -- the subtype rule (CA2(a)) --
     def test_subtypes_are_read_like_the_gate(self):
