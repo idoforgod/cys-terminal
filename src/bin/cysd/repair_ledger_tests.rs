@@ -324,7 +324,17 @@ fn detached_caller_reads_reports_triggers_only() {
             json!({"file": "bin/a.py", "error": "E: x"})
         )
         .is_ok());
-    for verb in ["tick", "sweep", "approval_list"] {
+    for verb in ["tick", "sweep"] {
+        // T6 (rewrite — the old expectation was `repair_not_implemented`): accepted by the role table;
+        // the bare dispatcher holds no daemon state, so it refuses with a sentence — the daemon's own
+        // `handle` answers these two (`repair_job::trigger`, tested in repair_job_tests.rs)
+        assert_eq!(
+            r.call(T0, &detached(), verb, json!({})).unwrap_err().code,
+            "repair_precondition",
+            "{verb}"
+        );
+    }
+    for verb in ["approval_list"] {
         // accepted by the role table, the body is another track's
         assert_eq!(
             r.call(T0, &detached(), verb, json!({})).unwrap_err().code,
@@ -1092,21 +1102,28 @@ fn pick_up_of_in_force_and_revert_role() {
     let r = rig("inforce");
     let id = committed_general(&r);
     assert_eq!(r.record_of(&id).state, RepairState::Probation);
-    let before_lock = r.record_of(&id).lock.clone();
-    let e = r
-        .call(
-            T0 + 5.0,
-            &seat(13, "worker-3"),
-            "revert",
-            json!({"repair": id}),
-        )
-        .unwrap_err();
-    assert_eq!(e.code, "repair_not_implemented", "{}", e.message);
-    assert_eq!(
-        r.record_of(&id).lock,
-        before_lock,
-        "revert touched the lock"
-    );
+    // T6 (rewrite — the old expectation was `repair_not_implemented` from the stub): a worker seat of
+    // the lane passes the role table, the revert body runs and never touches the lock (C1 1.12 / P4).
+    // On its own rig, so the in-force repair below stays in force for the pick-up check.
+    {
+        let rr = rig("inforce-revert");
+        let rid_ = committed_general(&rr);
+        let before_lock = rr.record_of(&rid_).lock.clone();
+        let v = rr
+            .call(
+                T0 + 5.0,
+                &seat(13, "worker-3"),
+                "revert",
+                json!({"repair": rid_}),
+            )
+            .unwrap();
+        assert_eq!(v["repair"], json!(rid_), "{v}");
+        assert_eq!(
+            rr.record_of(&rid_).lock,
+            before_lock,
+            "revert touched the lock"
+        );
+    }
     let in_force = r.record_of(&id);
     let p = r
         .call(

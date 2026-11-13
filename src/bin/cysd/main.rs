@@ -72,6 +72,8 @@ mod submit_assoc;
 mod teamtoken;
 mod trash;
 mod repair;
+// 「스스로 해결」 T6 — the appended job's readiness flag and its tick / sweep request side (C7).
+mod repair_job;
 mod undo;
 mod usage;
 // ★U16(0.14.41) 팀 만들기 제안 데몬 잠금 핀 — 테스트 전용 모듈(프로덕션 코드 0).
@@ -2193,6 +2195,9 @@ pub(crate) fn bundled_python3(exe_dir: &std::path::Path) -> Option<String> {
 /// 안 하고(triggered/skipped 라인 전무) phoenix-restore.log 가 빈 파일이던 P0-7 마지막 결함(CI 주입 우회가
 /// 가려온 미배선)을 봉인. cfg 무관 단일 함수라 한쪽 누락이 재발하지 않는다(회귀 테스트로 소스 잠금).
 fn post_listen_boot(socket_path: &std::path::Path, daemon: &Arc<Daemon>) {
+    // 「스스로 해결」(T6 · C7 O-C7-3 / RULINGS F8): the listener is bound and the startup lock is held —
+    // the readiness flag and its time are set FIRST, at one instant; the appended job does nothing before.
+    crate::repair_job::mark_ready(daemon);
     let state_dir = crate::state::state_dir(socket_path);
     prune_stale_phoenix_embed(&state_dir);
     spawn_auto_restore(&state_dir, socket_path, daemon);

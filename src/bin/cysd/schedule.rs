@@ -457,7 +457,34 @@ fn builtin_jobs() -> Vec<serde_json::Value> {
             "_builtin": "alert",
             "_builtin_version": BUILTIN_JOBS_VERSION
         }),
+        // ── ★0.15.0 「스스로 해결」(T6 · 계약 C7 O-C7-1 · O-C7-2) — 덧붙이는 내장 작업 **하나** ─────────
+        // **신규 id 라 BUILTIN_JOBS_VERSION 범프 불요·금지**(위 선례와 같다 — 범프하면 기존 내장 작업이 코드
+        //   정의로 통째 교체돼 운영자 편집이 소리 없이 사라진다). 2분 간격으로 불리고 할 일은 작업이 스스로 정한다
+        //   (새 데몬 기동 회차 → 시험 기간 재검사 즉시 · 아니면 10분이 지났을 때 재검사 · 한 시간이 지났을 때 미승인
+        //   변경 훑기). ★command 레인(마스터 입력창 주입 0 — 부록 A 1-9) · base_only 없음(부서 데몬도 자기
+        //   수리를 재검사 — `javis_dept_schedule.py` 의 본부 전용 목록에 넣지 않는다) · via_queue 없음.
+        //   데몬은 `repair.tick` 에 곧바로 답하고(started|busy|not_ready|idle) 일은 데몬 스레드 하나가 한다 —
+        //   예약기의 발화 규칙·600초 시간 초과·다른 작업은 그대로다. 결과는 장부에만 남는다(큐·경보·버스 0).
+        json!({
+            "id": REPAIR_JOB_ID,
+            "every_minutes": 2,
+            "action": "command",
+            "command": "CYS_NO_AUTOSTART=1 cys repair tick",
+            "_builtin": "repair",
+            "_builtin_version": BUILTIN_JOBS_VERSION
+        }),
     ]
+}
+
+/// ★0.15.0 (T6 · C7 O-C7-1): the ONE appended built-in job's id.
+pub(crate) const REPAIR_JOB_ID: &str = "repair-probation-tick";
+
+/// ★0.15.0 (T6 · RULINGS H6(1) / X1): the scheduler's OWN check of a `schedule.json` held at `path` —
+/// the same read + validation a normal read-modify-write uses (`read_schedule_root` →
+/// `validate_schedule_root`). The repair mechanism re-lives displaced schedule bytes only when this
+/// passes; it never writes through this module's writer (placement stays rule one's exchange).
+pub(crate) fn schedule_file_passes_own_check(path: &std::path::Path) -> bool {
+    matches!(read_schedule_root(path, &|p| std::fs::read(p)), Ok(Some(_)))
 }
 
 /// 저장된 잡 배열에서 `action:"push" + via_queue:true` 를 `action:"push_queued"` 로 접는다(순수).
@@ -735,6 +762,32 @@ fn apply_builtin_jobs(
             Some(s) => s.to_string(),
             None => continue,
         };
+        // ★0.15.0 (T6 · RULINGS AW7 as amended by AY7 · AGREEMENT 21 "내장 자가치유 작업"): the appended
+        //   self-repair job is not removable or editable through schedule.json — its ENTIRE definition is
+        //   restored from code (every field, compared canonically: serde_json values compare as maps),
+        //   whatever the stored entry holds (marker or not), logged once per restore. Every OTHER built-in
+        //   keeps the rule below unchanged (a user may hold their ids).
+        if id == REPAIR_JOB_ID {
+            match jobs
+                .iter()
+                .position(|j| j.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
+            {
+                Some(pos) if jobs[pos] == bj => {}
+                Some(pos) => {
+                    eprintln!(
+                        "[cysd] ensure_builtin_jobs: 내장 자가치유 작업 '{id}' 의 정의를 코드 정의로 되살림(이 작업은 schedule.json 으로 바꾸거나 지울 수 없다 — RULINGS AY7) · 구 항목: {}",
+                        jobs[pos]
+                    );
+                    jobs[pos] = bj;
+                    changed = true;
+                }
+                None => {
+                    jobs.push(bj);
+                    changed = true;
+                }
+            }
+            continue;
+        }
         let want_ver = bj.get("_builtin_version").and_then(|v| v.as_u64()).unwrap_or(0);
         match jobs
             .iter()
@@ -3295,7 +3348,10 @@ mod tests {
             "T10 P3-2 대기형 승격 집행 틱 잡 생성"
         );
         assert!(ids.contains(&"user-custom-job"), "사용자 잡은 보존돼야 한다");
-        assert_eq!(jobs.len(), 10, "사용자1 + built-in9");
+        // ★0.15.0 (T6 · C7 7.13): the appended `repair-probation-tick` — the old expectation was
+        //   `assert_eq!(jobs.len(), 10, "사용자1 + built-in9")`; the version pin below stays 2.
+        assert_eq!(jobs.len(), 11, "사용자1 + built-in10");
+        assert!(ids.contains(&REPAIR_JOB_ID), "T6 appended job created");
         // 주기 정합(typed): snapshot=6h(360), drill=7일(10080), audit=일(1440), digest=7일(10080),
         // cycle tick=매분(1), verifier watchdog=10분(10), formation heartbeat=10분(10),
         // ceo promote tick=10분(10).
@@ -3386,7 +3442,8 @@ mod tests {
             .filter(|j| j["id"].as_str() == Some("phoenix-snapshot-6h"))
             .count();
         assert_eq!(snap_count, 1, "재실행에도 중복 생성 0");
-        assert_eq!(jobs.len(), 10, "중복 없이 10개 유지");
+        // ★0.15.0 (T6): old expectation `assert_eq!(jobs.len(), 10, "중복 없이 10개 유지")`.
+        assert_eq!(jobs.len(), 11, "중복 없이 11개 유지");
 
         // 3차: 구버전(마커=0) 항목이 있으면 갱신(교체) → changed=true, 여전히 중복 0.
         for j in jobs.iter_mut() {
@@ -7959,3 +8016,101 @@ mod integrity_tests;
 #[cfg(test)]
 #[path = "schedule_lock_policy_tests.rs"]
 mod lock_policy_tests;
+
+/// ★0.15.0 (T6 · contract C7) — the ONE appended built-in job: its definition, its ensure rule (RULINGS
+/// AW7 as amended by AY7) and the proof that every pre-existing built-in stays as at v0.14.56.
+#[cfg(test)]
+mod repair_job_schedule_tests {
+    use super::*;
+
+    fn def() -> serde_json::Value {
+        builtin_jobs()
+            .into_iter()
+            .find(|j| j["id"].as_str() == Some(REPAIR_JOB_ID))
+            .expect("the appended job")
+    }
+
+    /// O-C7-1 / O-C7-2 / 7.6 / X1: id, marker, version (no bump), every 2 minutes, COMMAND mode
+    /// (never the master's input — appendix A 1-9), no `to` / `via_queue` / `base_only` / text, the
+    /// command the contract fixes; it passes the scheduler's own `Job` deserialisation.
+    #[test]
+    fn appended_job_is_command_mode_no_queue() {
+        let j = def();
+        assert_eq!(j["_builtin"], "repair");
+        assert_eq!(j["_builtin_version"].as_u64(), Some(BUILTIN_JOBS_VERSION));
+        assert_eq!(BUILTIN_JOBS_VERSION, 2, "no bump for an appended id");
+        assert_eq!(j["every_minutes"].as_u64(), Some(2));
+        assert_eq!(j["action"], "command");
+        assert_eq!(j["command"], "CYS_NO_AUTOSTART=1 cys repair tick");
+        for absent in ["to", "via_queue", "base_only", "text", "text_command", "if_absent", "at"] {
+            assert!(j.get(absent).is_none(), "{absent} must not be set");
+        }
+        let job: Job = serde_json::from_value(j.clone()).expect("Job deserialisation");
+        assert_eq!(job.id, REPAIR_JOB_ID);
+        assert_eq!(builtin_jobs().iter().filter(|b| b["id"].as_str() == Some(REPAIR_JOB_ID)).count(), 1, "exactly ONE appended job");
+        assert_eq!(builtin_jobs().last().and_then(|b| b["id"].as_str()), Some(REPAIR_JOB_ID), "appended at the end");
+    }
+
+    /// The nine pre-existing definitions are byte-identical to v0.14.56: the source text of
+    /// `builtin_jobs()` up to the appended block hashes to the tag's text (verified against
+    /// `git show v0.14.56:src/bin/cysd/schedule.rs` when this pin was written).
+    #[test]
+    fn appended_job_does_not_change_other_builtins_source() {
+        let src = include_str!("schedule.rs");
+        let a = src.find("fn builtin_jobs() -> Vec<serde_json::Value> {").unwrap();
+        let b = a + src[a..].find("        // ── ★0.15.0 「스스로 해결」(T6").unwrap();
+        use sha2::{Digest, Sha256};
+        let h: String = Sha256::digest(src[a..b].as_bytes()).iter().map(|x| format!("{x:02x}")).collect();
+        assert_eq!(h, "2ee0b15ea96bfabfcd7922b65f33990c1adde6ffd924cd34ac2f02f1ee1a9924");
+    }
+
+    /// AW7 / AY7: a stored `repair-probation-tick` that was edited, stripped of its marker or deleted
+    /// gets back its ENTIRE code definition — and NOTHING else moves: the user's job, a built-in whose
+    /// action the operator edited, a built-in whose command the operator edited, every other entry
+    /// stay byte-identical (removing or breaking the appended job leaves every pre-existing job as at
+    /// v0.14.56). The rule of the other built-ins is unchanged (a user job holding THEIR id is kept).
+    #[test]
+    fn appended_job_restored_whole_others_untouched() {
+        let mut jobs: Vec<serde_json::Value> = vec![json!({"id": "user-custom-job", "every_minutes": 30, "action": "push", "to": "master"})];
+        apply_builtin_jobs(&mut jobs);
+        // operator edits of other built-ins, and a user job holding a built-in id without the marker
+        for j in jobs.iter_mut() {
+            if j["id"] == "cycle-autopilot-tick" {
+                j["command"] = json!("echo operator-edited");
+            }
+            if j["id"] == "cso-alert-inbox-check-60m" {
+                j["action"] = json!("command");
+            }
+        }
+        jobs.retain(|j| j["id"] != "fleet-digest");
+        jobs.push(json!({"id": "fleet-digest", "every_minutes": 5, "action": "push", "to": "master", "text": "mine"}));
+        let others_before: Vec<serde_json::Value> = jobs.iter().filter(|j| j["id"] != REPAIR_JOB_ID).cloned().collect();
+        for breakage in ["edited", "unmarked", "deleted"] {
+            let mut js = jobs.clone();
+            match breakage {
+                "edited" => {
+                    for j in js.iter_mut().filter(|j| j["id"] == REPAIR_JOB_ID) {
+                        j["every_minutes"] = json!(99999);
+                        j["command"] = json!("true");
+                    }
+                }
+                "unmarked" => {
+                    for j in js.iter_mut().filter(|j| j["id"] == REPAIR_JOB_ID) {
+                        j.as_object_mut().unwrap().remove("_builtin");
+                    }
+                }
+                _ => js.retain(|j| j["id"] != REPAIR_JOB_ID),
+            }
+            let (changed, conflicts, _) = apply_builtin_jobs(&mut js);
+            assert!(changed, "{breakage}: restored");
+            assert!(!conflicts.contains(&REPAIR_JOB_ID.to_string()), "{breakage}: never a preemption");
+            assert_eq!(js.iter().find(|j| j["id"] == REPAIR_JOB_ID).unwrap(), &def(), "{breakage}: the whole definition");
+            let others: Vec<serde_json::Value> = js.iter().filter(|j| j["id"] != REPAIR_JOB_ID).cloned().collect();
+            assert_eq!(others, others_before, "{breakage}: another job moved");
+        }
+        // a second ensure changes nothing (idempotent)
+        let mut js = jobs.clone();
+        let (changed, _, _) = apply_builtin_jobs(&mut js);
+        assert!(!changed);
+    }
+}
