@@ -632,98 +632,430 @@ class NoMasterShortcutAnywhere(unittest.TestCase):
         self.assertEqual(self.hits(planted), [("skills/x/SKILL.md", "사소한 마무리")])
 
 
+
+# ─────────────────────────── A-1-05 deferral sweep (testplan A.md §5 · TESTPLAN_RULINGS B55 / B69 / B95) ───────────────────────────
+# The seven Tier-1 families of A.md §5 (rev bcd755bc660f3150), verbatim regexes; NFC, case-insensitive, sentences split on
+# [.!?。\n]; T1-a needs its noun AND its verb in one sentence. The single exclusion EX (EX-1, EX-2 — sentences that also
+# appear in the compiled role blocks) and the identifier rule (a T1-e match that is only `--propose` / `pack-merge --propose`
+# or lies in the patch header line) are applied. Test sources are out of the sweep (B95), so the patterns are written plainly.
+TIER1_NOUN = (r"(최윤식|윤식\s*박사|박사(?!급)|Dr\.?\s*Choi|Yoonsik|제작자|제작사|개발자|개발사|개발팀|제조사|벤더|vendor|배포자|공급자"
+              r"|upstream|업스트림|배포\s*전담\s*부서|정비발행부|maintainer|developer)")
+TIER1_VERB = (r"(문의|물어|여쭤|연락|제보|요청|알려|전달|맡기|맡겨|고쳐\s*(줄|주|받)|수정해\s*(줄|주|받)|반영(해|될|되)|기다|ask|contact"
+              r"|report|reach\s+out|let\s+(them|the)\s)")
+TIER1_FAMILIES = {
+    "T1-b": r"(지원\s*채널|고객\s*지원|고객\s*센터|홈페이지\s*문의|저장소\s*이슈|깃허브\s*이슈|GitHub\s*(issue|이슈)|이슈(를|로)?\s*(등록|올려|올리|제출|열어)|버그\s*(리포트|제보)|피드백\s*(버튼|으로\s*보내)|cysinsight@gmail\.com|file\s+(an?\s+)?(issue|bug)|open\s+an?\s+issue|support\s+(channel|team|ticket))",
+    "T1-c": r"((다음|차기|향후|새)\s*(버전|업데이트|릴리스|릴리즈|패치|배포)[^.!?。\n]{0,25}(고쳐|수정|해결|반영|기다|나오|제공|포함)|업데이트(를|가)?\s*(기다|나올\s*때까지|될\s*때까지)|wait\s+for\s+(the\s+)?(next|an?|upcoming|future)\s+(update|release|version|patch)|(fixed|addressed|resolved)\s+in\s+(a|the)\s+(future|next|later)\s+(release|version|update))",
+    "T1-d": r"((팩|훅|도구|스크립트|지침|제품|코드|이\s*파일|시스템\s*파일)[^.!?。\n]{0,20}(수정|고칠|변경|편집|손댈)\s*(할\s*)?수\s*(가\s*)?없|(고칠|수정할)\s*권한이\s*없|변경\s*불가|수정\s*불가|벤더의\s*일|벤더\s*동기\s*필요|사용자\s*과실\s*아님|immutable|(I|we)\s+(can'?t|cannot|am\s+not\s+(able|allowed)\s+to|don'?t\s+have\s+permission\s+to)\s+(modify|edit|fix|change|patch))",
+    "T1-e": r"(--propose|pack-merge\s+--propose|제안\s*패치|개선\s*제안(으로|을|를)?\s*(보내|제출|만들)|patch\s+(to|for)\s+(the\s+)?(vendor|developer|maintainer))",
+    "T1-f": r"((최윤식|윤식\s*박사|박사(?!급)|Dr\.?\s*Choi|제작자|제작사|개발자|개발사|개발팀|제조사|벤더|vendor|배포자|공급자|upstream|업스트림|배포\s*전담\s*부서|정비발행부|maintainer|developer)[^.!?。\n]{0,6}?\s*(의|쪽)?\s*(?:(?<=[의쪽])|(?<![가-힣A-Za-z0-9]))(일|작업|몫|책임|소관|담당|업무)\s*(이다|입니다|이에요|예요|이라|이며|이므로|임|으로)|영구\s*(보존|반영)\s*(자리|위치|경로|장소)[^.!?。\n]{0,20}(벤더|vendor|upstream|업스트림|제작자|배포\s*전담\s*부서|정비발행부)|(vendor|upstream|maintainer|developer)'?s?\s+(job|responsibility|work|task))",
+    "T1-g": r"((보고|제보|문의)[^.!?。\n]{0,20}(결함|버그|오류|문제)[^.!?。\n]{0,10}(고치는|수정하는|해결하는)\s*(정규|공식|올바른)?\s*(경로|길|방법))",
+}
+TIER1_EX = (
+    "제작자에게 물어보라고 하거나, 다음 업데이트를 기다리라고 하거나, 제보하라고 하는 것으로 수리를 대신하지 않는다",
+    "자비스 밖에 원인이 있으면(운영체제의 차단, 외부 서비스 장애) 우회해서 고칠 수 있는 데까지 고치고, 무엇이 막고 있고 주인이 "
+    "무엇을 하면 풀리는지 사실대로 말한다",
+)
+ROLE_BLOCK_CONSTS = ("RULES_COMMON", "RULES_MASTER_CEO", "RULES_WORKER", "RULES_CSO", "RULES_REVIEWER")
+
+
+def tier1_sentence_hits(sentence):
+    """The Tier-1 families one sentence matches, after EX and the identifier rule (A.md §5)."""
+    import re
+    import unicodedata
+    s = unicodedata.normalize("NFC", sentence)
+    body = " ".join(s.split()).rstrip(".!?。")
+    if not body or body in TIER1_EX:
+        return []
+    hits = []
+    if re.search(TIER1_NOUN, s, re.I) and re.search(TIER1_VERB, s, re.I):
+        hits.append("T1-a")
+    for fam, pat in TIER1_FAMILIES.items():
+        ms = list(re.finditer(pat, s, re.I))
+        if fam == "T1-e":
+            header = re.search(r"#\s*생성:\s*cys pack-merge --file \S+ --propose", s)
+            ms = [m for m in ms if not header and not re.fullmatch(r"(pack-merge\s+)?--propose", m.group(0), re.I)]
+        if ms:
+            hits.append(fam)
+    return hits
+
+
+def tier1_text_hits(text):
+    """[(line offset within text, families, sentence)] — sentences split on [.!?。\\n] after NFC."""
+    import re
+    import unicodedata
+    t = unicodedata.normalize("NFC", text)
+    out = []
+    for m in re.finditer(r"[^.!?。\n]*[.!?。\n]?", t):
+        if m.group(0).strip():
+            fams = tier1_sentence_hits(m.group(0))
+            if fams:
+                out.append((t.count("\n", 0, m.start()), fams, " ".join(m.group(0).split())))
+    return out
+
+
+# ── extraction: what the product SAYS (B95 class 2) — string literals and heredoc bodies, never comments, identifiers,
+#    docstrings or dict / JSON keys. Each extractor returns [(line, text)] with the 1-based line where the string starts.
+def py_strings(src):
+    """Python: the parser's own string constants (implicit concatenation already joined; an f-string is one text with
+    `{}` for each field). Excluded: docstrings and every other bare string statement, dict keys."""
+    import ast
+    tree = ast.parse(src)
+    skip = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Expr) and isinstance(node.value, (ast.Constant, ast.JoinedStr)):
+            skip.add(id(node.value))
+        if isinstance(node, ast.Dict):
+            skip.update(id(k) for k in node.keys if k is not None)
+        if isinstance(node, ast.JoinedStr):
+            skip.update(id(v) for v in ast.walk(node) if v is not node)
+    out = []
+    for node in ast.walk(tree):
+        if id(node) in skip:
+            continue
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            out.append((node.lineno, node.value))
+        elif isinstance(node, ast.JoinedStr):
+            parts = [v.value if isinstance(v, ast.Constant) else "{}" for v in node.values]
+            out.append((node.lineno, "".join(parts)))
+    return out
+
+
+def sh_strings(src):
+    """Shell: the contents of '…', "…", $'…' and every here-document body. A `#` that starts a word outside quotes
+    begins a comment to the end of the line. Unquoted words are not extracted (the product's messages are quoted)."""
+    import re
+    out, i, n, line, pending = [], 0, len(src), 1, []
+    word_start = True
+    while i < n:
+        c = src[i]
+        if c == "\n":
+            line += 1
+            i += 1
+            word_start = True
+            while pending:                      # here-document bodies start on the next line
+                delim, strip_tabs = pending.pop(0)
+                body, start = [], line
+                while i < n:
+                    j = src.find("\n", i)
+                    j = n if j < 0 else j
+                    raw = src[i:j]
+                    i = j + 1
+                    line += 1
+                    if (raw.lstrip("\t") if strip_tabs else raw) == delim:
+                        break
+                    body.append(raw)
+                out.append((start, "\n".join(body)))
+            continue
+        if c == "\\":
+            i += 2
+            word_start = False
+            continue
+        if c == "#" and word_start:
+            j = src.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        if c == "<" and src.startswith("<<", i) and not src.startswith("<<<", i):
+            m = re.compile(r"<<(-?)\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2").match(src, i)
+            if m:
+                pending.append((m.group(3), m.group(1) == "-"))
+                i = m.end()
+                word_start = False
+                continue
+        if c == "'" or (c == "$" and src.startswith("$'", i)):
+            k = i + (2 if c == "$" else 1)
+            j = k
+            while j < n and src[j] != "'":
+                j += 2 if (c == "$" and src[j] == "\\") else 1
+            out.append((line, src[k:j]))
+            line += src.count("\n", i, j)
+            i = j + 1
+            word_start = False
+            continue
+        if c == '"':
+            j = i + 1
+            while j < n and src[j] != '"':
+                j += 2 if src[j] == "\\" else 1
+            out.append((line, src[i + 1:j].replace('\\"', '"')))
+            line += src.count("\n", i, j)
+            i = j + 1
+            word_start = False
+            continue
+        word_start = c in " \t;|&()"
+        i += 1
+    return out
+
+
+def _rs_unescape(s):
+    import re
+    s = re.sub(r"\\\n\s*", "", s)                    # line continuation
+    rep = {"n": "\n", "t": "\t", "r": "\r", "0": "", "\\": "\\", '"': '"', "'": "'"}
+    s = re.sub(r"\\u\{([0-9a-fA-F]+)\}", lambda m: chr(int(m.group(1), 16)), s)
+    s = re.sub(r"\\x([0-9a-fA-F]{2})", lambda m: chr(int(m.group(1), 16)), s)
+    return re.sub(r"\\(.)", lambda m: rep.get(m.group(1), m.group(1)), s)
+
+
+RS_TOKEN = (r"(?P<lc>//[^\n]*)|(?P<bc>/\*.*?\*/)"
+            r"|(?<![A-Za-z0-9_])(?P<raw>b?r(?P<h>#*)\"(?P<rawbody>.*?)\"(?P=h))"
+            r"|(?<![A-Za-z0-9_])(?P<str>b?\"(?P<body>(?:[^\"\\]|\\.)*)\")"
+            r"|(?P<chr>'(?:[^'\\\n]|\\(?:u\{[0-9a-fA-F]+\}|x[0-9a-fA-F]{2}|.))')"
+            r"|(?P<life>'[A-Za-z_][A-Za-z0-9_]*)")
+
+
+def rs_strings(src):
+    """Rust: "…" (unescaped), r#"…"# and byte strings; line, block and doc comments skipped; char literals and lifetimes
+    told apart; every item under `#[cfg(test)]` / `#[cfg(all(test, …))]` excluded (brace-matched on the code with
+    literals and comments blanked)."""
+    import re
+    lits, code, last = [], [], 0
+    for m in re.finditer(RS_TOKEN, src, re.S):
+        code.append(src[last:m.start()])
+        code.append(re.sub(r"[^\n]", " ", m.group(0)))
+        last = m.end()
+        if m.group("raw") is not None:
+            lits.append((m.start(), m.group("rawbody")))
+        elif m.group("str") is not None:
+            lits.append((m.start(), _rs_unescape(m.group("body"))))
+    code.append(src[last:])
+    code = "".join(code)
+    excluded = []
+    for m in re.finditer(r"#\[cfg\((?:test|all\(test[^\]]*|any\(test[^\]]*)\)\]", code):
+        j = m.end()
+        while j < len(code) and code[j] not in "{;":
+            j += 1
+        if j < len(code) and code[j] == "{":
+            depth, k = 0, j
+            while k < len(code):
+                depth += {"{": 1, "}": -1}.get(code[k], 0)
+                k += 1
+                if depth == 0:
+                    break
+            excluded.append((m.start(), k))
+        else:
+            excluded.append((m.start(), j))
+    return [(src.count("\n", 0, p) + 1, t) for p, t in lits if not any(a <= p < b for a, b in excluded)]
+
+
+def ts_strings(src):
+    """TypeScript / JavaScript: '…', "…" and template literals (the text parts; `${…}` fields become `{}` and their own
+    literals are taken separately); comments and regular-expression literals skipped."""
+    out, i, n = [], 0, len(src)
+    prev = ""
+    while i < n:
+        c = src[i]
+        if src.startswith("//", i):
+            j = src.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        if src.startswith("/*", i):
+            j = src.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+            continue
+        if c == "/" and prev in "(,=:[!&|?{};+-*%<>~^" + "":
+            j = i + 1
+            in_class = False
+            while j < n and src[j] != "\n":
+                if src[j] == "\\":
+                    j += 2
+                    continue
+                if src[j] == "[":
+                    in_class = True
+                elif src[j] == "]":
+                    in_class = False
+                elif src[j] == "/" and not in_class:
+                    break
+                j += 1
+            i = j + 1
+            prev = "x"
+            continue
+        if c in "'\"":
+            j = i + 1
+            while j < n and src[j] != c and src[j] != "\n":
+                j += 2 if src[j] == "\\" else 1
+            out.append((src.count("\n", 0, i) + 1, src[i + 1:j].replace("\\" + c, c).replace("\\n", "\n")))
+            i = j + 1
+            prev = "x"
+            continue
+        if c == "`":
+            j, parts, start = i + 1, [], i
+            while j < n and src[j] != "`":
+                if src[j] == "\\":
+                    parts.append(src[j:j + 2])
+                    j += 2
+                    continue
+                if src.startswith("${", j):
+                    depth, k = 1, j + 2
+                    while k < n and depth:
+                        depth += {"{": 1, "}": -1}.get(src[k], 0)
+                        k += 1
+                    out.extend((ln + src.count("\n", 0, j + 2) , t) for ln, t in ts_strings(src[j + 2:k - 1]))
+                    parts.append("{}")
+                    j = k
+                    continue
+                parts.append(src[j])
+                j += 1
+            out.append((src.count("\n", 0, start) + 1, "".join(parts)))
+            i = j + 1
+            prev = "x"
+            continue
+        if not c.isspace():
+            prev = c
+        i += 1
+    return out
+
+
+def is_identifier_literal(text):
+    """A quoted identifier (CamelCase or snake_case, one token — e.g. a Debug struct name) is not a sentence (B95)."""
+    import re
+    return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", text) and re.search(r"[a-z][A-Z]|_", text))
+
+
+def deferral_class(rel):
+    """B95 class of a repository path: '1' (the product's own documents), '2' (sources whose PRINTED / INJECTED strings
+    are swept), 'skills' (swept, every hit listed for the grader), or 'out' (tests, fixtures, non-shipped scripts, data)."""
+    import re
+    if re.search(r"(^|/)(tests?|__tests__|fixtures)/", rel) or re.search(r"(_tests?\.rs|\.test\.ts|\.spec\.ts)$", rel):
+        return "out"
+    if rel.startswith("scripts/"):
+        return "out"
+    if rel.startswith("cysjavis-pack/skills/"):
+        return "skills"
+    # class 1 = B95's list + the two documents the program injects whole (the memory index composed into every
+    # directive, the CLAUDE.md template it installs).
+    if (rel.startswith("cysjavis-pack/directives/") or rel in (
+            "cysjavis-pack/soul.md", "cysjavis-pack/hooks/README.md", "USER-MANUAL.md",
+            "cysjavis-pack/memory/MEMORY.md", "cysjavis-pack/CLAUDE.md.template")):
+        return "1"
+    if rel.startswith("cysjavis-pack/web/vendor/"):
+        return "out"                                    # third-party library (three.js)
+    if rel.startswith("cysjavis-pack/") and re.search(r"\.(py|sh|js)$|^cysjavis-pack/bin/cys-dept$", rel):
+        return "2"
+    if re.match(r"(src|src-tauri/src)/.*\.rs$", rel) or re.match(r"ui/src/.*\.ts$", rel):
+        return "2"
+    return "out"
+
+
+def deferral_sweep(repo, rels):
+    """Every Tier-1 hit of the given repository files: [(class, rel, line, families, sentence)]. Class 1 files are swept
+    whole; class 2 / skills code through the extractors; the compiled role constants of src/repair/rules.rs count as
+    class 1. A source the extractor cannot read is reported as class 'unreadable' (a sweep that skips a file is void)."""
+    import re
+    out = []
+    for rel in rels:
+        cls = deferral_class(rel)
+        if cls == "out":
+            continue
+        try:
+            with open(os.path.join(repo, rel), encoding="utf-8") as fh:
+                src = fh.read()
+        except (OSError, UnicodeDecodeError):
+            out.append(("unreadable", rel, 0, [], ""))
+            continue
+        try:
+            if rel.endswith(".py"):
+                pieces = py_strings(src)
+            elif rel.endswith(".sh") or rel.endswith("/cys-dept"):
+                pieces = sh_strings(src)
+            elif rel.endswith(".rs"):
+                pieces = rs_strings(src)
+            elif rel.endswith((".ts", ".js")):
+                pieces = ts_strings(src)
+            else:
+                pieces = [(1, src)]
+        except SyntaxError:
+            out.append(("unreadable", rel, 0, [], ""))
+            continue
+        role_consts = {}
+        if rel == "src/repair/rules.rs":
+            for name in ROLE_BLOCK_CONSTS:
+                m = re.search(r'pub const %s: &str = r#"(.*?)"#;' % name, src, re.S)
+                role_consts[m.group(1)] = src.count("\n", 0, m.start()) + 1
+        for line, text in pieces:
+            if is_identifier_literal(text):
+                continue
+            c = "1" if text in role_consts else cls
+            for off, fams, sentence in tier1_text_hits(text):
+                out.append((c, rel, line + off, fams, sentence))
+    return out
+
+
 class DeferralFamiliesFG(unittest.TestCase):
-    """TESTPLAN_RULINGS Part 23 B55 (+ Part 25 B69): the Tier-1 families T1-f ("the fix is the maker's / vendor's /
-    publishing department's work", no verb needed) and T1-g ("reporting is the regular way to get the defect fixed") of
-    testplan A.md §5 find NOTHING in the shipped directive, soul, skill, hook and manual texts, nor in the compiled role
-    blocks. Sentences are split on [.!?。\\n] after NFC; case-insensitive (A.md §5). The alternations are built from
-    one-per-line tuples so this file is not itself a hit of the sweep. Positive controls: the two base sentences the
-    design names (v0.14.56 CEO_TEMPLATE 37–41 and session-start ~397), written with a '#' that is removed at run time."""
-    NOUNS = (r"최윤식", r"윤식\s*박사", r"박사(?!급)", r"Dr\.?\s*Choi", "제작자", "제작사", "개발자", "개발사", "개발팀",
-             "제조사", "벤더", "vendor", "배포자", "공급자", "upstream", "업스트림", r"배포\s*전담\s*부서", "정비발행부",
-             "maintainer", "developer")
-    WORK = ("일", "작업", "몫", "책임", "소관", "담당",
-            "업무")
-    COPULA = ("이다", "입니다", "이에요", "예요", "이라", "이며", "이므로", "임",
-              "으로")
-    PLACE = ("자리", "위치", "경로",
-             "장소")
-    KEEP = ("보존",
-            "반영")
-    PLACE_NOUNS = ("벤더", "vendor", "upstream", "업스트림", "제작자", r"배포\s*전담\s*부서",
-                   "정비발행부")
-    EN_WHO = ("vendor", "upstream", "maintainer",
-              "developer")
-    EN_WORK = ("job", "responsibility", "work",
-               "task")
-    G_SAY = ("보고", "제보",
-             "문의")
-    G_DEFECT = ("결함", "버그", "오류",
-                "문제")
-    G_FIX = ("고치는", "수정하는",
-             "해결하는")
-    G_REGULAR = ("정규", "공식",
-                 "올바른")
-    G_WAY = ("경로", "길",
-             "방법")
+    """TESTPLAN_RULINGS Part 23 B55, Part 25 B69, Part 32 B95 / B96 (RULINGS BT1): the seven Tier-1 families of testplan
+    A.md §5 find nothing in THE PRODUCT'S OWN VOICE — class 1 (directives, soul.md, the compiled role blocks,
+    hooks/README.md, USER-MANUAL.md, and the two documents the program injects whole: memory/MEMORY.md and
+    CLAUDE.md.template) and class 2 (the strings hook scripts, pack tools and the program print or inject: string
+    literals and here-document bodies of shell / Python / Rust / TypeScript sources — never comments, identifiers,
+    docstrings or dict keys). EX and the `--propose` identifier rule apply. Skill texts are swept by the scratch tool and
+    ruled hit by hit by the grader (not asserted here); tests, fixtures and `scripts/` are out.
+    KNOWN_OTHER_TRACKS lists the in-scope hits that remain in OTHER owners' texts (B96: corrected by their owners) —
+    every hit not on that list fails."""
+    KNOWN_OTHER_TRACKS = {
+        ("cysjavis-pack/bin/javis_preflight.py", "핀 기준 선행(벤더 동기 필요·사용자 과실 아님)"): "T8 — RULINGS AH4 (a)",
+        ("cysjavis-pack/bin/javis_preflight.py", "워커 1명에게 부서당 과제 하나로 맡겨라"): "T2 — the parked-merge job line",
+        ("ui/src/feedbackmodal.ts", "새 첨부는 새 피드백으로 보내 주세요"): "the U6 feedback modal (no 0.15.0 track)",
+    }
+    ROOTS = ("cysjavis-pack", "src", os.path.join("src-tauri", "src"), os.path.join("ui", "src"))
 
-    @classmethod
-    def patterns(cls):
-        import re
-        alt = lambda xs: "(" + "|".join(xs) + ")"
-        s = r"[^.!?。\n]"
-        f = (alt(cls.NOUNS) + s + r"{0,6}?\s*(의|쪽)?\s*(?:(?<=[의쪽])|(?<![가-힣A-Za-z0-9]))" + alt(cls.WORK)
-             + r"\s*" + alt(cls.COPULA)
-             + "|영구" + r"\s*" + alt(cls.KEEP) + r"\s*" + alt(cls.PLACE) + s + "{0,20}" + alt(cls.PLACE_NOUNS)
-             + "|" + alt(cls.EN_WHO) + r"'?s?\s+" + alt(cls.EN_WORK))
-        g = (alt(cls.G_SAY) + s + "{0,20}" + alt(cls.G_DEFECT) + s + "{0,10}" + alt(cls.G_FIX) + r"\s*"
-             + alt(cls.G_REGULAR) + r"?\s*" + alt(cls.G_WAY))
-        return {"T1-f": re.compile(f, re.I), "T1-g": re.compile(g, re.I)}
+    def files(self):
+        rels = ["USER-MANUAL.md"]
+        for root in self.ROOTS:
+            for d, dirs, fs in os.walk(os.path.join(REPO_DIR, root)):
+                dirs[:] = [x for x in dirs if x not in ("__pycache__", "node_modules", "target")]
+                rels += [os.path.relpath(os.path.join(d, f), REPO_DIR).replace(os.sep, "/") for f in fs]
+        return rels
 
-    @classmethod
-    def hits(cls, rel, text):
-        import re
-        import unicodedata
-        out = []
-        pats = cls.patterns()
-        for m in re.finditer(r"[^.!?。\n]*[.!?。\n]?", unicodedata.normalize("NFC", text)):
-            for fam, rx in pats.items():
-                if m.group(0).strip() and rx.search(m.group(0)):
-                    out.append((rel, fam, " ".join(m.group(0).split())[:160]))
-        return out
+    def known(self, hit):
+        return any(rel == hit[1] and frag in hit[4] for rel, frag in self.KNOWN_OTHER_TRACKS)
 
-    def corpus(self):
-        import glob
-        import re
-        pack = os.path.dirname(DIRECTIVES_DIR)
-        files = [os.path.join(pack, "soul.md"), os.path.join(pack, "hooks", "README.md")]
-        files += glob.glob(os.path.join(pack, "directives", "*.md"))
-        files += glob.glob(os.path.join(pack, "hooks", "*.sh"))
-        files += glob.glob(os.path.join(pack, "skills", "**", "*.md"), recursive=True)
-        out = {}
-        for p in files:
-            with open(p, encoding="utf-8", errors="replace") as fh:
-                out[os.path.relpath(p, pack)] = fh.read()
-        out["USER-MANUAL.md"] = repo_text("USER-MANUAL.md")
-        rules = repo_text(os.path.join("src", "repair", "rules.rs"))
-        for name in ("RULES_COMMON", "RULES_MASTER_CEO", "RULES_WORKER", "RULES_CSO", "RULES_REVIEWER"):
-            out["rules.rs:" + name] = re.search(r'pub const %s: &str = r#"(.*?)"#;' % name, rules, re.S).group(1)
-        return out
+    def test_the_products_own_voice_has_no_tier1_hit(self):
+        rels = self.files()
+        classes = [deferral_class(r) for r in rels]
+        self.assertGreaterEqual(classes.count("1"), 10, "class 1 too small — the sweep would be void")
+        self.assertGreaterEqual(classes.count("2"), 250, "class 2 too small — the sweep would be void")
+        hits = deferral_sweep(REPO_DIR, rels)
+        self.assertEqual([h[1] for h in hits if h[0] == "unreadable"], [], "a source the extractor cannot read")
+        role_texts = [t for _l, t in rs_strings(repo_text(os.path.join("src", "repair", "rules.rs")))]
+        self.assertTrue(any(t.startswith("■ 「스스로 해결」") for t in role_texts), "the compiled role blocks are not read")
+        bad = [h for h in hits if h[0] in ("1", "2") and not self.known(h)]
+        self.assertEqual(bad, [], "Tier-1 deferral hits in the product's own voice (A-1-05 machine half)")
 
-    def test_no_t1f_or_t1g_hit_in_the_shipped_texts(self):
-        texts = self.corpus()
-        self.assertGreater(len(texts), 40, "corpus too small — the sweep would be void")
-        found = [h for rel, text in texts.items() for h in self.hits(rel, text)]
-        self.assertEqual(found, [], "Tier-1 T1-f / T1-g deferral sentences in shipped texts")
+    def test_positive_controls_through_the_extractors(self):
+        """The five design-named deferral sentences of v0.14.56 (D:251), each in its own source form."""
+        fams = lambda pieces: sorted({f for _l, t in pieces for _o, fs, _s in tier1_text_hits(t) for f in fs})
+        ceo = ("파괴한다.** ⚠**팩 업데이트는 템플릿 쪽 사본도 되돌릴 수 있다** — 영구 보존 자리는 **벤더 팩\n"
+               "  (upstream)** 이고 그것은 배포 전담 부서의 작업이다(현재 토큰 정지 중이라 재설정 후).\n")
+        self.assertEqual(fams([(1, ceo)]), ["T1-f"])
+        py = ('detail = ("원인 분류: 무수정 배포본(.pre-ceo==.pristine) — 핀 기준 선행"\n'
+              '          "(벤더 동기 필요·사용자 과실 아님)")\n')
+        self.assertEqual(fams(py_strings(py)), ["T1-d"])
+        sh_heredoc = "cat <<EOF\n· 사용자에게 보고하라** — 그 보고가 이 팩의 결함을 고치는 정규 경로다.\nEOF\n"
+        self.assertEqual(fams(sh_strings(sh_heredoc)), ["T1-g"])
+        sh_dq = 'MSG="제품에 반영할 개선이면 cys pack-merge --file $REL --propose 로 제안 패치를 만드세요."\n'
+        self.assertEqual(fams(sh_strings(sh_dq)), ["T1-e"])
+        rs = 'println!("제출: 위 파일을 지원 채널(홈페이지 문의/저장소 이슈)에 첨부 — 자동 전송은 하지 않습니다.");\n'
+        self.assertEqual(fams(rs_strings(rs)), ["T1-b"])
+        ts = "setStatus(`다음 업데이트를 기다려 주세요 ${n}`, 'error');\n"
+        self.assertEqual(fams(ts_strings(ts)), ["T1-c"])
 
-    def test_positive_controls_and_the_word_boundary(self):
-        ceo = "(upstream)** 이고 그것은 배포 전담 부서의 작#업이다(현재 토큰 정지 중이라 재설정 후).".replace("#", "")
-        hook = "사용자에게 보고하라** — 그 보고가 이 팩의 결함을 고치는 정규 경#로다.".replace("#", "")
-        self.assertEqual([h[1] for h in self.hits("ctl", ceo)], ["T1-f"])
-        self.assertEqual([h[1] for h in self.hits("ctl", hook)], ["T1-g"])
-        # Part 25 B69: the work noun must begin a word — the "일" inside "파일이며" is no hit.
-        self.assertEqual(self.hits("ctl", "이 파일은 벤더 파일이며 수정은 보존된다."), [])
+    def test_extraction_rule_negative_controls(self):
+        """Comments, docstrings, bare string statements, dict keys, `#[cfg(test)]` items and quoted identifiers are not
+        what the product says; EX sentences and the bare `--propose` flag are not counted (A.md §5)."""
+        d = "다음 업데이트를 기다려 주세요"
+        py = '"""%s"""\n# %s\ndef f():\n    """%s"""\n    "%s"\n    return {"%s": 1}\n' % (d, d, d, d, d)
+        self.assertEqual(py_strings(py), [])
+        self.assertEqual(sh_strings("# %s\necho ok # %s\n" % (d, d)), [])
+        rs = '// %s\n/// %s\n/* %s */\n#[cfg(test)]\nmod t {\n    const X: &str = "%s";\n}\nfn f() { let _ = "ok"; }\n' % (
+            d, d, d, d)
+        self.assertEqual([t for _l, t in rs_strings(rs)], ["ok"])
+        self.assertEqual([t for _l, t in ts_strings("// %s\n/* %s */\nconst a = 'ok';\n" % (d, d))], ["ok"])
+        self.assertTrue(is_identifier_literal("ImmutableIngress") and is_identifier_literal("hook_targets"))
+        self.assertFalse(is_identifier_literal("immutable"))
+        self.assertEqual(tier1_sentence_hits(TIER1_EX[0] + "."), [])
+        self.assertEqual(tier1_sentence_hits("cys pack-merge --propose"), [])
+        self.assertEqual(tier1_sentence_hits("cys pack-merge --propose 로 제안 패치를 만든다"), ["T1-e"])
 
+    def test_word_boundary_b69(self):
+        """Part 25 B69: the work noun must begin a word — the "일" inside "파일이며" is no hit."""
+        self.assertEqual(tier1_text_hits("이 파일은 벤더 파일이며 수정은 보존된다."), [])
 
 class MasterMayFileAReport(unittest.TestCase):
     """RULINGS BB2 (ii): the master's compiled role block and MASTER_DIRECTIVE §1-B say plainly that intake
