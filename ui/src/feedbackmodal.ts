@@ -94,7 +94,7 @@ const MODAL_HTML =
   '<div class="modal feedback-modal" role="dialog" aria-modal="true" aria-labelledby="fb-title">' +
   '<div class="fb-head"><h3 id="fb-title">피드백 보내기</h3><button type="button" class="fb-x" aria-label="닫기">×</button></div>' +
   '<div class="fb-compose">' +
-  '<p class="fb-intro">불편한 점이나 바라는 점을 알려 주세요. 사진·영상을 함께 넣어 주시면 더 빨리 고칠 수 있습니다.</p>' +
+  '<p class="fb-intro">불편한 점이나 바라는 점을 나누고 싶을 때 적어 주세요(보낼지는 직접 정합니다 · 자동 전송 없음). 사진·영상을 함께 넣을 수 있습니다.</p>' +
   '<textarea class="modal-input fb-desc" rows="6" maxlength="10000" placeholder="무엇을 하다가 어떤 일이 있었나요? (필수)"></textarea>' +
   '<div class="fb-drop"><div class="fb-drop-row"><span class="fb-drop-hint"></span>' +
   '<button type="button" class="fb-btn fb-pick">파일 고르기</button></div>' +
