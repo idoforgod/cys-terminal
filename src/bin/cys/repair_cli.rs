@@ -668,6 +668,72 @@ fn t3_request(cmd: &RepairCmd) -> Option<(&'static str, Value, bool)> {
     })
 }
 
+/// The daemon request of a T6 verb (C3 `revert`, `reapply`; C7 `sweep`, hidden `tick`): (wire
+/// method, params). `None` = not a T6 verb.
+fn t6_request(cmd: &RepairCmd) -> Option<(&'static str, Value)> {
+    Some(match cmd {
+        RepairCmd::Revert { repair } => ("repair.revert", json!({"repair": repair})),
+        RepairCmd::Reapply { repair } => ("repair.reapply", json!({"repair": repair})),
+        RepairCmd::Sweep { .. } => ("repair.sweep", json!({})),
+        RepairCmd::Tick => ("repair.tick", json!({})),
+        _ => return None,
+    })
+}
+
+/// The printed result of a T6 verb (a refusal is the daemon's sentence on stderr — `fail`).
+fn t6_print(cmd: &RepairCmd, out: &mut dyn Write, v: &Value) -> i32 {
+    let r = match cmd {
+        RepairCmd::Sweep { json: true } => writeln!(out, "{v}"),
+        RepairCmd::Revert { .. } => {
+            let id = s(v, "repair");
+            if v.get("reverted") == Some(&Value::Bool(true)) {
+                writeln!(out, "{id} 를 되돌렸습니다 — 고친 사본은 보관소에 남아 있습니다(cys repair status {id})")
+            } else {
+                writeln!(
+                    out,
+                    "{id} 는 되돌리지 않았습니다 — {}",
+                    v.get("result").map(|r| s(r, "why")).unwrap_or_default()
+                )
+            }
+        }
+        RepairCmd::Reapply { .. } => {
+            let id = s(v, "repair");
+            let mut r = writeln!(
+                out,
+                "수리 {id} 시작 — {} 의 보관된 수정본을 다시 입힙니다({} · 계기: 업데이트 · 시도 {}/{})",
+                s(v, "reapplies"),
+                s(v, "classification"),
+                s(v, "attempt"),
+                s(v, "max_rounds"),
+            );
+            if let Some(st) = v.get("staging").and_then(|x| x.as_str()) {
+                r = r.and_then(|_| writeln!(out, "작업 사본: {st} — 보관된 수정본을 여기서 지금 판과 합칩니다"));
+            }
+            for p in v.get("parked").and_then(|x| x.as_array()).into_iter().flatten() {
+                r = r.and_then(|_| {
+                    writeln!(out, "보관된 수정본: {} → {}", s(p, "parked_copy"), s(p, "rel"))
+                });
+            }
+            r.and_then(|_| {
+                writeln!(
+                    out,
+                    "합친 뒤: cys repair record {id} → 검증·감사 서명 → cys repair submit {id}(기동 필수·보호장치 — 주인 최종 승인) 또는 cys repair commit {id}(일반)"
+                )
+            })
+        }
+        RepairCmd::Sweep { .. } => {
+            let mut r = writeln!(out, "미승인 변경 검사: {}", s(v, "tick"));
+            for n in v.get("notices").and_then(|x| x.as_array()).into_iter().flatten() {
+                r = r.and_then(|_| writeln!(out, "  {} — {} ({})", s(n, "rel"), s(n, "note"), s(n, "kind")));
+            }
+            r
+        }
+        _ => writeln!(out, "{v}"),
+    };
+    let _ = r;
+    0
+}
+
 /// The daemon request of a T4 verb (C9 grant, C10 owner token): (wire method, params). `None` = not
 /// a T4 verb. `grant ask` / `owner-token ask` are their own requests (RULINGS Q1 / Q2).
 fn t4_request(cmd: &RepairCmd) -> Option<(&'static str, Value)> {
@@ -875,8 +941,13 @@ fn run_with(cmd: &RepairCmd, out: &mut dyn Write, err: &mut dyn Write, rpc: Rpc<
             Err(e) => fail(err, &e),
         };
     }
-    // The verbs whose bodies belong to other tracks (T5b submit/auth-helper · T6 revert/sweep/tick/reapply ·
-    // T7b gate/recheck).
+    if let Some((method, params)) = t6_request(cmd) {
+        return match rpc(method, params) {
+            Ok(v) => t6_print(cmd, out, &v),
+            Err(e) => fail(err, &e),
+        };
+    }
+    // The verbs whose bodies belong to other tracks (T5b submit/auth-helper · T7b gate/recheck).
     let _ = writeln!(
         err,
         "{}: cys repair {}",
@@ -1135,6 +1206,12 @@ mod tests {
             "grant",
             "owner-token",
             "rule-doc-allowed",
+            // T6 (rewrite: its daemon verbs left the stub set — an old daemon → 93 like T3's / T4's;
+            // the old expectation was exit 99 with the not-implemented sentence)
+            "revert",
+            "reapply",
+            "sweep",
+            "tick",
         ];
         let mut covered: Vec<&str> = Vec::new();
         for argv in calls {

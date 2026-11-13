@@ -8896,6 +8896,33 @@ async function buildPaletteItems(): Promise<PaletteItem[]> {
     }
   }
 
+  // ── (4-d) ★0.15.0 「스스로 해결」(T6 · 설계 §4-9 · §6-9 (7)) — '직전 수리 되돌리기' 단추 ──
+  // 이 부서에서 가장 최근의 시험 기간·사용 중 수리 한 건을 데몬이 규칙 하나(맞바꾸기)로 되돌린다. 모든 창이 죽어 있어도
+  // 동작한다(백엔드 `repair_revert_last` 는 좌석을 거치지 않고 데몬 소켓에 직접 묻는다 · 데몬을 띄우지 않는다 — 부록 A 1-16).
+  // 정적 항목(팔레트를 열 때 조회 0 · 새 타이머 0). 결과는 토스트 한 줄.
+  items.push({
+    id: "act:repair-revert-last",
+    title: "직전 수리 되돌리기",
+    subtitle: "이 부서의 가장 최근 수리(시험 기간·사용 중) 한 건을 되돌립니다 — 고친 사본은 보관소에 남습니다",
+    keywords: "repair revert 수리 되돌리기 직전 스스로 해결 롤백",
+    confirm: {
+      title: "직전 수리 되돌리기",
+      body: "이 부서에서 가장 최근에 적용된 수리 한 건을 적용 전 내용으로 되돌립니다. 되돌리기는 원자적 맞바꾸기로 하고, 고친 사본은 보관소에 남습니다(cys repair status 로 확인). 업데이트가 그 파일을 이미 바꿨으면 아무것도 바꾸지 않고 그 사실을 알립니다.",
+    },
+    action: async () => {
+      try {
+        const r = (await invoke("repair_revert_last", { socket: null })) as { repair?: string; reverted?: boolean; result?: { why?: string } } | null;
+        if (r?.reverted) {
+          toast("watchdog", "✅ 직전 수리 되돌림", `${r.repair ?? ""} — 고친 사본은 보관소에 남아 있습니다`);
+        } else {
+          toast("health", "직전 수리를 되돌리지 않았습니다", `${r?.repair ?? ""} ${r?.result?.why ?? ""}`.trim());
+        }
+      } catch (e) {
+        toast("health", "직전 수리 되돌리기 실패", String(e));
+      }
+    },
+  });
+
   // ── (5) 빌트인 webview 액션(정적) ──
   items.push(
     { id: "act:new-tab", title: "새 탭", keywords: "new tab 탭", action: () => actionNew() },
