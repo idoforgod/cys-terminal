@@ -8,7 +8,8 @@
   "digest_vectors(2026-09-04 R2 적대검증 MAJOR 반영): 정규화·해시 골든 벡터 10건. **왜 필요한가** — 층1 케이스의 원장 레코드는 전부 소비자 자신의 정규화·digest 로 만들어지므로, python↔Rust 가 **같은 방향으로 함께 틀린**(대칭) 이탈은 그 케이스들로 탐지되지 않는다. 명세 §2-3 이 층1 파리티의 핵심으로 지목한 것이 바로 `해시 = digest_normalized(delivery.rs:709 재사용)` 다. 종전에는 이 앵커가 python self-test **인라인 리터럴**에만 있어 include_str! 로 Rust 에 전달되지 않았고, B1 은 사본을 다시 쓸 수밖에 없었다(이 fixture 가 없애려던 바로 그것). `normalized`·`sha256` 은 실측값이다.",
   "mission_extract(2026-09-04 · B1-5 대장 writer 파리티): `extract_mission` 골든 10건. **왜 필요한가** — 층0/층0-c/층1/층2 는 전부 대장의 **reader**(무엇을 기계유래로 볼 것인가)를 재고, 대장에 무엇이 **쓰이는가**(writer)는 어느 축도 재지 않았다. 임무 문자열이 갈리면 reader 가 아무리 정확해도 자율 착수 게이트가 다른 값을 본다. 기대값은 python `extract_mission` 실측이며(impl/W-B/evidence/b15-python-parity.txt 와 10/10 일치) Rust 측이 include_str! 로 **같은 값을** 소비한다. `expect.mission` 은 문자열·null 또는 {repeat:{unit,times}} 이며, **사유(reason) 산문은 계약면에 넣지 않는다** — 한국어 진단 문구를 다듬는 순간 계측기가 거짓말을 시작한다(위 확장 규칙과 같은 근거).",
   "$constants 의 FENCE_OPEN·FENCE_CLOSE: 괄호 붙여넣기 봉투 표지이며 **정의처는 src/paste_fence.rs** 다. 두 소비자가 각자 자기 값과 이 값을 대조하므로(Rust=crate::paste_fence::{OPEN,CLOSE} · python=javis_mission.FENCE_*) 둘이 함께 통과할 때만 사본 분화가 없다 — 수치 상수들과 같은 기제다(R2-1).",
-  "layer1 레코드의 `preview_mode`(2026-10-23 R2 codex F1 · major): `omit` 은 `preview` 키를 쓰지 않고 `null` 은 JSON null 을 싣는다 — **값 사본이 아니라 모양 지정**이다(sha256·chars·preview 값 사본 금지 규약은 그대로). 왜 필요한가: `preview` 는 선택 필드이고 판독자는 그 부재를 스키마 이탈로 보지 않는데(`ledger_schema_skew` 는 `v` 불일치에서만 발행), 종전 `framed_match` 는 봉투 preview 의 존재를 선행 조건으로 삼아 preview 없는 봉투 행을 통째로 못 보고 층1 을 미스로 떨어뜨렸다. 그 모양을 검체가 직접 실을 수 없으면 이 누락은 두 구현에서 영원히 초록이다. 미지 값은 양쪽 소비자가 **소리내어 실패**한다(python ValueError · Rust panic) — fixture 오타가 '유도' 로 조용히 떨어지면 계약이 아무것도 재지 않는다"
+  "layer1 레코드의 `preview_mode`(2026-10-23 R2 codex F1 · major): `omit` 은 `preview` 키를 쓰지 않고 `null` 은 JSON null 을 싣는다 — **값 사본이 아니라 모양 지정**이다(sha256·chars·preview 값 사본 금지 규약은 그대로). 왜 필요한가: `preview` 는 선택 필드이고 판독자는 그 부재를 스키마 이탈로 보지 않는데(`ledger_schema_skew` 는 `v` 불일치에서만 발행), 종전 `framed_match` 는 봉투 preview 의 존재를 선행 조건으로 삼아 preview 없는 봉투 행을 통째로 못 보고 층1 을 미스로 떨어뜨렸다. 그 모양을 검체가 직접 실을 수 없으면 이 누락은 두 구현에서 영원히 초록이다. 미지 값은 양쪽 소비자가 **소리내어 실패**한다(python ValueError · Rust panic) — fixture 오타가 '유도' 로 조용히 떨어지면 계약이 아무것도 재지 않는다",
+  "owner_typed:[{name,text,origin,ledger_status,anomalies,expect:{owner},why}] — 0.15.0 M5·M13 주인 본인 입력 판정(`owner_typed`, 실패 시 닫힘)의 2언어 판정표: javis_mission.py --self-test 와 Rust src/mission_gate.rs 가 함께 소비한다."
  ],
  "$constants": {
   "SCHEMA_VERSION": 1,
@@ -1282,6 +1283,161 @@
     "sha256": "0e9f64031fcb2bc708b531c2a20441580425d151a38503f38592a7dd36019d3b"
    },
    "why": "내부 다중 공백 → 각 1칸"
+  }
+ ],
+ "owner_typed": [
+  {
+   "name": "OT-human-ok",
+   "text": "예",
+   "origin": "human",
+   "ledger_status": "ok",
+   "anomalies": [],
+   "expect": {
+    "owner": true
+   },
+   "why": "층1·층2 가 사람이고 원장이 온전하다 — 주인이 친 답(통과 축)"
+  },
+  {
+   "name": "OT-ledger-absent",
+   "text": "예",
+   "origin": "human",
+   "ledger_status": "absent",
+   "anomalies": [
+    "ledger_absent"
+   ],
+   "expect": {
+    "owner": false
+   },
+   "why": "원장 부재 = 층1 근거 없음 — 데몬 기동 표식 불변식 아래에서는 손상이다(실패 시 닫힘 축)"
+  },
+  {
+   "name": "OT-named-doc",
+   "text": "고쳐라 soul.md",
+   "origin": "human",
+   "ledger_status": "ok",
+   "anomalies": [],
+   "expect": {
+    "owner": true
+   },
+   "why": "주인이 문서를 이름으로 부른 지시(Q2 (a)의 입력)"
+  },
+  {
+   "name": "OT-rotated-ok",
+   "text": "네",
+   "origin": "human",
+   "ledger_status": "ok",
+   "anomalies": [
+    "ledger_rotated"
+   ],
+   "expect": {
+    "owner": true
+   },
+   "why": "회전은 평시 상태 — 판독 세대 밖의 옛 배달만 대조를 잃는다(정직 고지 · 결손으로 세지 않는다)"
+  },
+  {
+   "name": "OT-machine",
+   "text": "예",
+   "origin": "machine",
+   "ledger_status": "ok",
+   "anomalies": [],
+   "expect": {
+    "owner": false
+   },
+   "why": "기계가 넣은 '예'로는 허락이 켜지지 않는다(C9 9.5)"
+  },
+  {
+   "name": "OT-unknown",
+   "text": "예",
+   "origin": "unknown",
+   "ledger_status": "unreadable",
+   "anomalies": [],
+   "expect": {
+    "owner": false
+   },
+   "why": "판정 불가 = 주인의 입력이 아니다(실패 시 닫힘)"
+  },
+  {
+   "name": "OT-origin-case",
+   "text": "예",
+   "origin": "Human",
+   "ledger_status": "ok",
+   "anomalies": [],
+   "expect": {
+    "owner": false
+   },
+   "why": "미지 어휘는 사람으로 접지 않는다(정확 일치만 human)"
+  },
+  {
+   "name": "OT-unreadable-status",
+   "text": "예",
+   "origin": "human",
+   "ledger_status": "unreadable",
+   "anomalies": [],
+   "expect": {
+    "owner": false
+   },
+   "why": "원장 판독 불가"
+  },
+  {
+   "name": "OT-bad-lines",
+   "text": "예",
+   "origin": "human",
+   "ledger_status": "ok",
+   "anomalies": [
+    "ledger_bad_lines"
+   ],
+   "expect": {
+    "owner": false
+   },
+   "why": "해석 불가 줄 — 그 안의 배달을 대조하지 못했다"
+  },
+  {
+   "name": "OT-schema-skew",
+   "text": "예",
+   "origin": "human",
+   "ledger_status": "ok",
+   "anomalies": [
+    "ledger_schema_skew"
+   ],
+   "expect": {
+    "owner": false
+   },
+   "why": "모르는 스키마의 배달은 층1 에서 보이지 않는다"
+  },
+  {
+   "name": "OT-parts-capped",
+   "text": "예",
+   "origin": "human",
+   "ledger_status": "ok",
+   "anomalies": [
+    "delivery_parts_capped"
+   ],
+   "expect": {
+    "owner": false
+   },
+   "why": "조각 상한 초과 — 원장이 배달을 다 담지 못했다"
+  },
+  {
+   "name": "OT-harness-notification",
+   "text": "<task-notification><task-id>abcdefgh</task-id><status>completed</status><summary>soul.md 수정 완료</summary></task-notification>",
+   "origin": "human",
+   "ledger_status": "ok",
+   "anomalies": [],
+   "expect": {
+    "owner": false
+   },
+   "why": "harness 가 프로세스 안에서 합성한 알림은 배달 원장에 없고 라벨도 없다 — 데몬의 층1·층2 판정은 사람으로 보지만 주인이 친 것이 아니다(층0)"
+  },
+  {
+   "name": "OT-boot-command",
+   "text": "cys launch-agent --role master --agent claude",
+   "origin": "human",
+   "ledger_status": "ok",
+   "anomalies": [],
+   "expect": {
+    "owner": false
+   },
+   "why": "기동 명령문(층0-c)은 주인의 지시가 아니다"
   }
  ],
  "mission_extract": [
