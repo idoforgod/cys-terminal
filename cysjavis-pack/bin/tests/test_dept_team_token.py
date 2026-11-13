@@ -420,10 +420,15 @@ def _promotable(home):
     cys_dir = os.path.join(home, ".cys")
     d = os.path.join(cys_dir, "pack", "directives")
     os.makedirs(d, exist_ok=True)
+    # ★0.15.0 T8: 승격 = 조립 — 틀은 머리말 표지 3핀 + gen_ceo_template 구분선 + MASTER 내용 핀 전수(상위집합 불변식).
+    sys.path.insert(0, BIN)
+    import javis_preflight as pf
+    master = "# MASTER\n\n본문\n" + "\n".join(p for p, _ in pf.CONTENT_PINS["MASTER_DIRECTIVE.md"]) + "\n"
+    sep = "\n---\n\n# [본문 — 표준 MASTER 운영 계약 전문]\n\n"
     with open(os.path.join(d, "MASTER_DIRECTIVE.md"), "w", encoding="utf-8") as f:
-        f.write("# MASTER\n\n본문\n")
+        f.write(master)
     with open(os.path.join(d, "CEO_TEMPLATE.md"), "w", encoding="utf-8") as f:
-        f.write("# CEO 머리글\n\n# MASTER\n\n본문\n")
+        f.write("# CEO 머리글 (master of master · 단일소유 강제 · exit 7)\n" + sep + master)
     with open(os.path.join(cys_dir, ".master-bootstrapped"), "w") as f:
         f.write("ok\n")
     return json.dumps({"surfaces": [{"id": 22, "role": "master", "agent": "claude", "exited": False}]})

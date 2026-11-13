@@ -27,6 +27,14 @@
 연접)과 동형으로 **MASTER 본문을 포함**해야 승격이 통과한다 — 종전 무관 문자열("CEO-TEMPLATE")
 픽스처는 DCE-3 검사에 걸리므로 상위집합 형태(CEO_BODY ⊇ MASTER_BODY)로 갱신(핀 약화 아님 —
 승격 시 교체 단언은 동일하게 유지·검사 대상만 실계약 동형화).
+
+★0.15.0 T8(「스스로 해결」 M14·M15-나 · C11 11.8–11.10 · 설계 §4-14 · H-RW-10): 승격은 이제 **조립**이다 —
+CEO 지침 = 틀의 머리말(첫 구분선 앞) + 구분선(gen_ceo_template SEPARATOR 그대로) + 사용자 자신의 본부 지침.
+그래서 픽스처를 실계약 형상으로 다시 썼다: 틀 = CEO 머리말(표지 3핀) + **실제 구분선** + MASTER 내용 핀 전수를 담은
+표준 본문(상위집합 불변식 (i) — 반쪽·스텁 틀 거부), 사용자 본부 지침 = 표준 본문 + 사용자 수정 줄(USERFIX).
+'승격됨' 단언(2b·4c·5c)은 '틀 전체와 같음'이 아니라 '머리말 + 구분선 + 사용자 지침(수정 포함) 바이트 그대로'와
+유효한 영수증(.ceo-receipt.json)이다(종전보다 강하다 — 사용자 수정이 살아남는지까지 본다). 8·8′·10 은 통째 복사
+시절의 형상 규칙(OR-포함·.new ref·CRLF 정규화 복사)이 조립에서 어떻게 귀결되는지로 다시 썼다(각 줄 주석에 사유).
 """
 import json
 import os
@@ -37,8 +45,23 @@ import tempfile
 
 SELF = os.path.dirname(os.path.abspath(__file__))
 DEPT = os.path.join(SELF, "..", "cys-dept")
-MASTER_BODY = "STANDARD-MASTER\n"
-CEO_BODY = "CEO-HEADER\n---\n" + MASTER_BODY   # 상위집합(합성 계약 동형: 머리글+구분선+전문)
+sys.path.insert(0, os.path.join(SELF, ".."))
+import javis_preflight as _pf  # noqa: E402 — MASTER 내용 핀 정본(상위집합 불변식 (i)의 기준)
+
+# ★T8: 실제 조립 구분선(scripts/gen_ceo_template.py SEPARATOR — test_ceo_composition 이 정본과의 동일성을 고정).
+SEP = "\n---\n\n# [본문 — 표준 MASTER 운영 계약 전문]\n\n"
+CEO_HEADER = "# CEO-HEADER (master of master · 단일소유 강제 · exit 7)\n"   # 머리말 표지 3핀(MARKER_PINS)
+
+
+def master_text(tag):
+    """MASTER 내용 핀 전수를 담은 표준 본문 픽스처(핀 개정 시 자동 추종)."""
+    return tag + "\n" + "\n".join(p for p, _ in _pf.CONTENT_PINS["MASTER_DIRECTIVE.md"]) + "\n"
+
+
+MASTER_BODY = master_text("STANDARD-MASTER")                 # 틀이 담은 표준(vendor) 본문
+USER_MASTER = MASTER_BODY + "USERFIX-사용자가 고친 본부 지침 줄\n"   # 사용자 자신의 본부 지침(수정 포함)
+CEO_BODY = CEO_HEADER + SEP + MASTER_BODY                    # 틀(합성 계약 동형: 머리말+구분선+전문)
+COMPOSED = CEO_HEADER + SEP + USER_MASTER                    # 조립 결과 = 머리말 + 구분선 + 사용자 지침
 fails = []
 
 
@@ -55,7 +78,7 @@ def setup(tmp, ndepts=1):
     os.makedirs(pack, exist_ok=True)
     os.makedirs(bindir, exist_ok=True)
     with open(os.path.join(pack, "MASTER_DIRECTIVE.md"), "w", encoding="utf-8") as f:
-        f.write(MASTER_BODY)
+        f.write(USER_MASTER)
     with open(os.path.join(pack, "CEO_TEMPLATE.md"), "w", encoding="utf-8") as f:
         f.write(CEO_BODY)
     reg = os.path.join(home, ".cys", "depts.json")
@@ -95,6 +118,20 @@ def md(home):
     return open(paths(home)[0], encoding="utf-8").read()
 
 
+def receipt(home):
+    """★T8: 승격 영수증(directives/.ceo-receipt.json) — 없거나 깨졌으면 None."""
+    try:
+        return json.load(open(os.path.join(home, ".cys", "pack", "directives", ".ceo-receipt.json"),
+                              encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def sha(text):
+    import hashlib
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 # ── 1. 마커 無 → PENDING·무교체 (실사고 R2 봉쇄) ──
 tmp = tempfile.mkdtemp(prefix="ceo-t1-")
 env, home = setup(tmp)
@@ -103,7 +140,7 @@ mdp, pre, pend, marker = paths(home)
 check("1a 승격 시도 truthful exit 5(미승격 오보 차단·D-2 post-verify)", code == 5,
       "exit=%d %s" % (code, out[-150:]))
 check("1b PENDING 기록", os.path.exists(pend))
-check("1c 디렉티브 무교체", md(home) == MASTER_BODY)
+check("1c 디렉티브 무교체", md(home) == USER_MASTER)
 check("1d .pre-ceo 미생성", not os.path.exists(pre))
 check("1e fail-visible(feed 알림)", "feed push" in open(os.path.join(tmp, "calls.log"), encoding="utf-8").read())
 
@@ -112,8 +149,16 @@ with open(marker, "w", encoding="utf-8") as f:
     json.dump({"orchestra_check": "exit 0"}, f)
 code, out = run(env, "promote-if-pending")
 check("2a 대기형 exit 0", code == 0, out[-150:])
-check("2b 승격됨(CEO 템플릿)", md(home) == CEO_BODY)
-check("2c .pre-ceo 보존 헌법", os.path.exists(pre) and open(pre, encoding="utf-8").read() == MASTER_BODY)
+# ★H-RW-10(T8): '틀 전체와 같음'(md == CEO_BODY)이 아니라 조립 — 머리말 + 구분선 + 사용자 지침(수정 줄 포함) 바이트
+#   그대로이고 영수증 해시가 그 조립을 가리킨다(종전 단언은 사용자 수정을 지우는 승격도 통과시켰다).
+check("2b 승격됨(조립: 머리말+구분선+사용자 본부 지침 — 사용자 수정 유지)", md(home) == COMPOSED,
+      md(home)[-80:])
+_r = receipt(home)
+check("2b′ 영수증(.ceo-receipt.json) = 조립 해시", _r is not None and _r.get("schema") == 1
+      and _r.get("composed_sha256") == sha(COMPOSED) and _r.get("header_sha256") == sha(CEO_HEADER)
+      and _r.get("master_sha256_at_compose") == sha(USER_MASTER) and _r.get("separator") == SEP
+      and isinstance(_r.get("composed_at"), str), "%r" % (_r,))
+check("2c .pre-ceo 보존 헌법", os.path.exists(pre) and open(pre, encoding="utf-8").read() == USER_MASTER)
 check("2d PENDING 해소", not os.path.exists(pend))
 calls = open(os.path.join(tmp, "calls.log"), encoding="utf-8").read()
 # ★자동 승격 정책 전환(2026-07·v4 A14 재정의): 종전 feed --wait 동의 게이트는 소스에서 폐지 —
@@ -129,7 +174,7 @@ with open(pend, "w", encoding="utf-8") as f:
 code, out = run(env, "promote-ceo")
 check("5a 멱등 exit 0", code == 0)
 check("5b stale PENDING 청소", not os.path.exists(pend))
-check("5c 디렉티브 불변", md(home) == CEO_BODY)
+check("5c 디렉티브 불변", md(home) == COMPOSED)
 shutil.rmtree(tmp)
 
 # ── 3. --request-only: 무변조·알림만 (부트 ⑦ 계약) ──
@@ -141,7 +186,7 @@ with open(marker, "w", encoding="utf-8") as f:
     f.write("{}")
 code, out = run(env, "promote-if-pending", "--request-only", role="master")
 check("3a request-only exit 0(master 세션 허용)", code == 0, out[-150:])
-check("3b 무변조(디렉티브 표준 유지)", md(home) == MASTER_BODY)
+check("3b 무변조(디렉티브 표준 유지)", md(home) == USER_MASTER)
 check("3c PENDING 유지(해소는 대기형/lifecycle)", os.path.exists(pend))
 calls = open(os.path.join(tmp, "calls.log"), encoding="utf-8").read()
 check("3d 비대기(--wait 없는 알림)", "CEO 승격 대기" in out or "feed push --title CEO 승격 대기" in calls)
@@ -149,9 +194,9 @@ check("3d 비대기(--wait 없는 알림)", "CEO 승격 대기" in out or "feed 
 # ── 4. 단일소유 가드: master 대기형=차단 / CSO·role-less=허용 ──
 code, out = run(env, "promote-if-pending", role="master")
 check("4a master 대기형 exit 7", code == 7, "exit=%d" % code)
-check("4b 차단 시 무변조", md(home) == MASTER_BODY)
+check("4b 차단 시 무변조", md(home) == USER_MASTER)
 code, out = run(env, "promote-if-pending", role="cso")
-check("4c cso 대기형 허용·승격", code == 0 and md(home) == CEO_BODY)
+check("4c cso 대기형 허용·승격", code == 0 and md(home) == COMPOSED)
 shutil.rmtree(tmp)
 
 # ── 6. 조건 미충족(부서 0·마커 有) → no-op ──
@@ -165,7 +210,7 @@ with open(pend, "w", encoding="utf-8") as f:
     f.write("pending\n")
 code, out = run(env, "promote-if-pending")
 check("6a 부서 0 no-op", code == 0 and "no-op" in out)
-check("6b 무교체", md(home) == MASTER_BODY)
+check("6b 무교체", md(home) == USER_MASTER)
 shutil.rmtree(tmp)
 
 # ── 7. ★T10(DCE-3): 스텁 템플릿 주입 → 승격 보류(무교체·PENDING 유지·loud) ──
@@ -184,11 +229,12 @@ with open(pend, "w", encoding="utf-8") as f:
     f.write("pending\n")
 code, out = run(env, "promote-if-pending")      # 대기형(role-less) — 조건 3중 전부 충족
 check("7a 대기형 exit 0(lifecycle 불파괴)", code == 0, "exit=%d %s" % (code, out[-200:]))
-check("7b 무교체(표준 디렉티브 유지 — 스텁 replace 차단)", md(home) == MASTER_BODY)
+check("7b 무교체(표준 디렉티브 유지 — 스텁 replace 차단)", md(home) == USER_MASTER)
 check("7c PENDING 유지(보류)", os.path.exists(pend))
 check("7d .pre-ceo 미생성(스왑 자체 미실행)", not os.path.exists(pre))
 check("7e 영수증 미기록", not os.path.exists(
-    os.path.join(home, ".cys", "pack", "directives", ".ceo-template-applied")))
+    os.path.join(home, ".cys", "pack", "directives", ".ceo-template-applied"))
+      and not os.path.exists(os.path.join(home, ".cys", "pack", "directives", ".ceo-receipt.json")))
 check("7f loud(상위집합 보류 stderr)", "상위집합" in out and "보류" in out, out[-250:])
 calls = open(os.path.join(tmp, "calls.log"), encoding="utf-8").read()
 check("7g 보류 feed 고지(비대기)", "CEO 승격 보류(템플릿 상위집합 검사 실패)" in calls,
@@ -196,7 +242,7 @@ check("7g 보류 feed 고지(비대기)", "CEO 승격 보류(템플릿 상위집
 # 지명(promote-ceo) 경로도 같은 보류 — D-2 post-verify 가 truthful exit 5 를 낸다.
 code, out = run(env, "promote-ceo")
 check("7h 지명 경로 truthful exit 5(승격 미완 보고)", code == 5, "exit=%d" % code)
-check("7i 지명 경로도 무교체", md(home) == MASTER_BODY)
+check("7i 지명 경로도 무교체", md(home) == USER_MASTER)
 shutil.rmtree(tmp)
 
 # ── 8. ★MF-1(P3 수정 라운드): 교차버전 형상 — md=v2·낡은 .pre-ceo=v1 → OR-포함으로 승격 통과 ──
@@ -206,8 +252,8 @@ shutil.rmtree(tmp)
 tmp = tempfile.mkdtemp(prefix="ceo-t8-")
 env, home = setup(tmp)
 mdp, pre, pend, marker = paths(home)
-V2_BODY = "STANDARD-MASTER-V2\n"
-CEO_V2 = "CEO-HEADER\n---\n" + V2_BODY
+V2_BODY = master_text("STANDARD-MASTER-V2")
+CEO_V2 = CEO_HEADER + SEP + V2_BODY
 _dirs = os.path.join(home, ".cys", "pack", "directives")
 with open(mdp, "w", encoding="utf-8") as f:
     f.write(V2_BODY)                                # 팩 업데이트: md=새 표준 v2
@@ -221,7 +267,9 @@ os.makedirs(os.path.dirname(pend), exist_ok=True)
 with open(pend, "w", encoding="utf-8") as f:
     f.write("pending\n")
 code, out = run(env, "promote-if-pending")
-check("8a 교차버전 승격 통과(OR-포함: ceo ⊇ md)", code == 0 and md(home) == CEO_V2,
+# ★T8: 조립에서는 이 형상이 그냥 '지금 본부 지침(v2)을 본문으로 쓰는 새 승격'이다(OR-포함 판정이 필요 없다) —
+#   결과가 CEO_V2 와 같은 것은 사용자 지침이 vendor v2 와 같기 때문이다(머리말 + 구분선 + v2).
+check("8a 교차버전 승격 통과(조립: 머리말 + 구분선 + 지금 본부 지침 v2)", code == 0 and md(home) == CEO_V2,
       "exit=%d md=%r %s" % (code, md(home)[:40], out[-200:]))
 check("8b 낡은 .pre-ceo 무접촉(백업 덮어쓰기 금지)",
       open(pre, encoding="utf-8").read() == MASTER_BODY)
@@ -248,9 +296,9 @@ shutil.rmtree(tmp)
 tmp = tempfile.mkdtemp(prefix="ceo-t8b-")
 env, home = setup(tmp)
 mdp, pre, pend, marker = paths(home)
-V2_BODY = "STANDARD-MASTER-V2\n"
-CEO_V1 = "CEO-HEADER\n---\n" + MASTER_BODY          # 승격 당시 적용된 구 CEO 템플릿
-CEO_V2 = "CEO-HEADER\n---\n" + V2_BODY              # 팩 갱신이 치유한 신 CEO 템플릿(System 등급)
+V2_BODY = master_text("STANDARD-MASTER-V2")
+CEO_V1 = CEO_HEADER + SEP + MASTER_BODY             # 승격 당시 적용된 구 CEO 템플릿
+CEO_V2 = CEO_HEADER + SEP + V2_BODY                 # 팩 갱신이 치유한 신 CEO 템플릿(System 등급)
 _dirs = os.path.join(home, ".cys", "pack", "directives")
 with open(mdp, "w", encoding="utf-8") as f:
     f.write(CEO_V1)                                 # md = 구 CEO 사본(User 소유 — 갱신 불가)
@@ -266,7 +314,11 @@ os.makedirs(os.path.dirname(pend), exist_ok=True)
 with open(pend, "w", encoding="utf-8") as f:
     f.write("pending\n")
 code, out = run(env, "promote-if-pending")
-check("8′a 기승격+팩업데이트 3파일 형상 통과(ref=.new)", code == 0 and md(home) == CEO_V2,
+# ★T8: 조립에서 이 형상(머리말이 현행과 같은 조립 지침)은 이미 승격된 상태다 — 영구 보류 루프 없이 영수증만
+#   기록하고 **본문은 사용자 것 그대로** 둔다(종전 기대 md==CEO_V2 는 vendor v2 로 사용자 지침을 덮는 통째 복사였다 —
+#   vendor 신본 .new 는 규칙 문서 갱신 규칙(병합)으로 들어온다).
+check("8′a 기승격+팩업데이트 3파일 형상 통과(보류 루프 없음·본문 유지·영수증 기록)",
+      code == 0 and md(home) == CEO_V1 and (receipt(home) or {}).get("composed_sha256") == sha(CEO_V1),
       "exit=%d md=%r %s" % (code, md(home)[:40], out[-300:]))
 check("8′b 낡은 .pre-ceo 무접촉", open(pre, encoding="utf-8").read() == MASTER_BODY)
 check("8′c PENDING 해소(영구 보류 루프 소멸)", not os.path.exists(pend))
@@ -281,7 +333,10 @@ code, out = run(env, "promote-if-pending")
 check("8′d 3-ref 전부 미포함 스텁은 여전히 보류(차단 강도 불변)",
       code == 0 and md(home) == CEO_V1 and os.path.exists(pend),
       "exit=%d %s" % (code, out[-200:]))
-check("8′e 보류 문안이 교차버전 갈래를 안내(.new 언급)", ".new" in out, out[-300:])
+# ★T8: 교차버전 갈래(.new ref) 안내는 통째 복사 시절의 처방이다 — 조립은 그 형상을 보류하지 않는다. 보류 문안은 이제
+#   무엇을 검사했는지(생성된 머리말 + 조립 구분선 + 표준 MASTER 전문)와 '본부 지침 수정은 보류 사유가 아님'을 말한다.
+check("8′e 보류 문안이 조립 검사를 안내(구분선·표준 전문·본부 지침 수정은 사유 아님)",
+      "조립 구분선" in out and "표준 MASTER 전문" in out and "보류 사유가 아니다" in out, out[-300:])
 shutil.rmtree(tmp)
 
 # ── 9. ★SF-1: 지명(consented) 경로의 superset 보류 = PENDING 신규 생성 금지 ──
@@ -298,14 +353,14 @@ with open(marker, "w", encoding="utf-8") as f:
 code, out = run(env, "promote-ceo")                 # PENDING 부재 상태에서 지명 → 보류
 check("9a 지명 보류 truthful exit 5", code == 5, "exit=%d" % code)
 check("9b PENDING 신규 생성 금지(자동승격 예약 확폭 차단)", not os.path.exists(pend))
-check("9c 무교체", md(home) == MASTER_BODY)
+check("9c 무교체", md(home) == USER_MASTER)
 shutil.rmtree(tmp)
 
 # ── 10. ★SF-2: CRLF 개행 드리프트 = false hold 아님(정규화 후 포함 판정) ──
 tmp = tempfile.mkdtemp(prefix="ceo-t10-")
 env, home = setup(tmp)
 mdp, pre, pend, marker = paths(home)
-CEO_CRLF = "CEO-HEADER\r\n---\r\n" + MASTER_BODY.replace("\n", "\r\n")
+CEO_CRLF = (CEO_HEADER + SEP + MASTER_BODY).replace("\n", "\r\n")
 with open(os.path.join(home, ".cys", "pack", "directives", "CEO_TEMPLATE.md"),
           "w", encoding="utf-8", newline="") as f:
     f.write(CEO_CRLF)                               # Windows 체크아웃/에디터 변환 재현
@@ -316,8 +371,11 @@ with open(pend, "w", encoding="utf-8") as f:
     f.write("pending\n")
 code, out = run(env, "promote-if-pending")
 _md_raw = open(mdp, "rb").read()
-check("10a CRLF 드리프트 통과(정규화 후 ⊇ = 승격)",
-      code == 0 and _md_raw == CEO_CRLF.encode("utf-8"),
+# ★T8: CRLF 틀은 같은 구분선의 다른 철자로 본다(false hold 없음 — SF-2 유지). 조립은 틀의 머리말·구분선 바이트를
+#   그대로 쓰고 사용자 본부 지침 바이트는 한 바이트도 바꾸지 않는다(종전 기대 = CRLF 틀 통째 복사).
+_crlf_head = (CEO_HEADER + SEP).replace("\n", "\r\n")
+check("10a CRLF 드리프트 통과(조립 — 틀의 머리말·구분선 + 사용자 지침 바이트 그대로)",
+      code == 0 and _md_raw == (_crlf_head + USER_MASTER).encode("utf-8"),
       "exit=%d md=%r %s" % (code, _md_raw[:40], out[-200:]))
 check("10b PENDING 해소", not os.path.exists(pend))
 shutil.rmtree(tmp)
