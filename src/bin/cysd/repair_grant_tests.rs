@@ -300,6 +300,69 @@ fn owner_input_pauses_grant_starts_only() {
     assert_eq!(r.claims(), 1, "an R′ takes no claim and no cap unit");
 }
 
+/// K3: rounds 2…10 of one grant repair run under the SAME claim — no new claim file, no cap use,
+/// never `Busy` against its own claim (a retried `begin` of the holder finds its own start); while
+/// paused (B4) a new round is refused. (T3's `record` asks `grant::may_open_new_round` on the
+/// production root, so this test points `CYS_LOCAL_DIR` at the rig under the env lock.)
+#[test]
+fn k3_rounds_run_under_the_same_claim() {
+    let _g = crate::governance::PACK_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let r = rig("k3");
+    let _env = cys::pack::EnvGuard::set("CYS_LOCAL_DIR", r.root.parent().unwrap());
+    assert_eq!(cys::repair::paths::repairs_root(), r.root);
+    r.grant_on(1);
+    let t = now0();
+    let w = seat(3, "worker");
+    let id = r
+        .call(t, &w, "begin", json!({"trigger": "grant", "files": ["bin/a.py"]}))
+        .unwrap()["repair"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let rv = seat(7, "reviewer-codex");
+    for round in 1..=10u32 {
+        let at = t + f64::from(round) * 10.0;
+        std::fs::write(r.pack.join("bin/a.py"), format!("print({round})\n")).unwrap();
+        let v = r
+            .call(at, &w, "record", json!({"repair": id, "note": format!("round {round}")}))
+            .unwrap();
+        assert_eq!(v["attempt"], json!(round), "{v}");
+        r.call(at + 1.0, &rv, "attest_verify", json!({"repair": id, "verdict": "fail", "note": "again"}))
+            .unwrap();
+        assert_eq!(r.claims(), 1, "round {round}: a round takes no claim");
+        assert_eq!(r.rec(&id).lock.unwrap().claim, Some(1));
+        // the holder's retried begin finds its own start — never Busy against its own claim
+        let again = r
+            .call(at + 2.0, &w, "begin", json!({"trigger": "grant", "files": ["bin/a.py"]}))
+            .unwrap();
+        assert_eq!(again["begin"], "already-held");
+    }
+    assert_eq!(r.claims(), 1);
+    // the cap (1) is not used up by the rounds: the decision is unchanged, and the pause refuses a
+    // new round (B4)
+    let r2 = rig("k3-pause");
+    let _env2 = cys::pack::EnvGuard::set("CYS_LOCAL_DIR", r2.root.parent().unwrap());
+    r2.grant_on(5);
+    let id2 = r2
+        .call(t, &w, "begin", json!({"trigger": "grant", "files": ["bin/b.py"]}))
+        .unwrap()["repair"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    std::fs::write(r2.pack.join("bin/b.py"), b"print(1)\n").unwrap();
+    r2.call(t + 1.0, &w, "record", json!({"repair": id2, "note": "r1"})).unwrap();
+    r2.call(t + 2.0, &rv, "attest_verify", json!({"repair": id2, "verdict": "fail", "note": "x"}))
+        .unwrap();
+    assert!(grant::note_owner_input_in(&r2.root, &r2.lane, now0()).unwrap());
+    let e = r2
+        .call(t + 3.0, &w, "record", json!({"repair": id2, "note": "r2"}))
+        .unwrap_err();
+    assert!(e.message.contains("새 라운드를 열 수 없습니다"), "{}", e.message);
+    assert_eq!(r2.rec(&id2).attempt, 1);
+}
+
 // ───────────────────────────── grant on / off (Q1, T3, T5, U4) ─────────────────────────────
 
 /// `grant on` only after `grant ask` and the owner's FIRST typed answer, affirmative, with no machine
