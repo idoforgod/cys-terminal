@@ -3364,6 +3364,38 @@ mod tests {
         );
     }
 
+    /// RULINGS AI2: T2's reconcile table is pinned row by row, and each registrar head is counted
+    /// exactly — a new reconcile row, or a third copy of a known head, fails the build.
+    #[test]
+    fn census_pins_the_reconcile_table_and_the_head_counts() {
+        let e = derive_edited(
+            &edit_one("cysjavis-pack/bin/javis_preflight.py", |t| {
+                t.replacen(
+                    "        for name, ev, m in GRILL_HOOKS:\n            rows.append((ev, name, False, \"event\", m, None))\n",
+                    "        for name, ev, m in GRILL_HOOKS:\n            rows.append((ev, name, False, \"event\", m, None))\n        rows.append((\"Stop\", \"verify-reminder.sh\", False, \"event\", \"\", None))\n",
+                    1,
+                )
+            }),
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("_reconcile_hook_table") && e.contains("expected 1 and 5"),
+            "{e}"
+        );
+        let e = derive_edited(
+            &edit_one("cysjavis-pack/bin/javis_preflight.py", |t| {
+                format!("{t}\n    def _t5a(self, t):\n        return self._register_hook(t)\n")
+            }),
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("`self._register_hook(t)`") && e.contains("found 3 times (expected 2)"),
+            "{e}"
+        );
+    }
+
     #[test]
     fn census_fails_on_a_new_registrar_def() {
         let e = derive_edited(
