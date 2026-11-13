@@ -815,6 +815,14 @@ mod tests {
             None,
             false,
         ),
+        (
+            "bin/skillscan_rules.json",
+            C::HookDep,
+            K::JsonParse,
+            "",
+            None,
+            false,
+        ),
         ("hooks/_lib.sh", C::HookDep, K::ShSyntax, "", None, false),
         (
             "hooks/appbuild-gate.sh",
@@ -2152,6 +2160,33 @@ mod tests {
         Some(lines[start..end].iter().map(|l| l.to_string()).collect())
     }
 
+    /// RULINGS BR1 — the file that PRODUCES the checklist-report region, found from the launch site
+    /// at the region's anchor in `hooks/inject-context.sh`: the anchor line injects `"$<out>"`, the
+    /// line `<out>=$(…)` runs the interpreter `"$CYS_PY"` on `"$<script>"` (flags skipped), and
+    /// `<script>="…/bin/<name>"` names the file. `None` = any of the three is missing.
+    fn checklist_producer(ic: &str) -> Option<String> {
+        let anchor = ic
+            .lines()
+            .find(|l| l.contains("&& OUT=\"${OUT}$(printf '%s' \"$"))?;
+        let out = anchor.split("printf '%s' \"$").nth(1)?.split('"').next()?;
+        let launch = ic
+            .lines()
+            .map(str::trim)
+            .find(|l| l.starts_with(&format!("{out}=$(")))?;
+        let after = launch.split("\"$CYS_PY\"").nth(1)?;
+        let script = after
+            .split_whitespace()
+            .find(|w| !w.starts_with('-'))?
+            .strip_prefix("\"$")?
+            .strip_suffix('"')?;
+        let def = ic
+            .lines()
+            .map(str::trim)
+            .find(|l| l.starts_with(&format!("{script}=\"")) && l.contains("/bin/"))?;
+        let name = def.rsplit("/bin/").next()?.trim_end_matches('"');
+        Some(format!("bin/{name}"))
+    }
+
     /// RULINGS BM1: the region's anchors are in the sources — a moved anchor fails here, and a
     /// missing anchor in a replay's output fails the replay (never "no difference").
     #[test]
@@ -2176,6 +2211,12 @@ mod tests {
             .filter(|l| l.contains("OUT=\"${OUT}▶ ") && l.contains("(source="))
             .collect();
         assert!(notes.len() >= 6, "restore-note variants moved: {notes:?}");
+        // RULINGS BR1: the region's producer, from the launch site at its anchor
+        assert_eq!(
+            checklist_producer(&ic).as_deref(),
+            Some("bin/javis_checklist.py")
+        );
+        assert_eq!(checklist_producer("OUT=x"), None);
         let post = ic
             .split("\npost)\n")
             .nth(1)
@@ -2207,6 +2248,16 @@ mod tests {
             "no end anchor"
         );
     }
+
+    /// RULINGS BR2 — the third break mode of a DATA file a class-1 row reads, "valid but matching
+    /// nothing": per data file, a valid body of the same shape whose entries match nothing. Every
+    /// data file of the hook layer with non-empty JSON content needs one (the replay fails
+    /// otherwise); "valid but emptied" (the same top-level type, empty) is derived.
+    #[cfg(target_os = "macos")]
+    const DATA_MATCH_NOTHING: &[(&str, &str)] = &[(
+        "bin/skillscan_rules.json",
+        "{\"rule_specs\": [{\"rule_id\": \"T5A\", \"message\": \"t5a\", \"severity\": \"LOW\", \"category\": \"t5a\", \"flags\": \"\", \"scope\": \"all\", \"patterns\": [[\"t5a-matches-nothing\", 0.1]]}], \"rule_meta\": {}}\n",
+    )];
 
     /// The recorded inputs of RULINGS AN3: (name, hook, the files it is meant to reach, setup).
     #[cfg(target_os = "macos")]
@@ -2611,9 +2662,113 @@ mod tests {
             put(h.rel, &original(h.rel));
         }
 
+        // RULINGS BR1 — the producer of the checklist-report region (measured ON the region)
+        let producer = checklist_producer(&original("hooks/inject-context.sh"));
+        if producer.is_none() {
+            problems.push(
+                "(BR1) the checklist region's producer is not found from the launch site at its anchor in hooks/inject-context.sh".to_string(),
+            );
+        }
+        matrix.push(format!("(BR1) checklist region producer: {producer:?}"));
+        // RULINGS BR2 — the DATA files the class-1 rows read (their bindings that are no code)
+        let all_rels: BTreeSet<&str> = crate::pack::PACK_ALL.iter().map(|(r, _)| *r).collect();
+        let is_data = |rel: &str| -> bool {
+            !(rel.ends_with(".py") || rel.ends_with(".sh") || original(rel).starts_with("#!"))
+        };
+        let mut data_files: BTreeSet<String> = BTreeSet::new();
+        for e in entries().iter().filter(|e| proof(e) == Some("hook-replay")) {
+            for (c, _how) in derive::bindings(e.rel, &original(e.rel), &all_rels) {
+                if is_data(&c) {
+                    data_files.insert(c);
+                }
+            }
+        }
+        matrix.push(format!(
+            "(BR2) data files of the hook layer: {data_files:?}"
+        ));
+        // the third mode's bodies: "valid but emptied" (same top-level type, empty) and "valid but
+        // matching nothing" (DATA_MATCH_NOTHING) — a non-empty JSON data file without the latter
+        // is a failure
+        let mut third: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+        for f in &data_files {
+            let text = original(f);
+            let parsed = serde_json::from_str::<serde_json::Value>(&text).ok();
+            let emptied = match &parsed {
+                Some(serde_json::Value::Object(_)) => "{}\n",
+                Some(serde_json::Value::Array(_)) => "[]\n",
+                _ => "",
+            };
+            let mut v = vec![("(iii) valid but emptied".to_string(), emptied.to_string())];
+            match DATA_MATCH_NOTHING.iter().find(|(r, _)| r == f) {
+                Some((_, body)) => {
+                    v.push(("(iii) valid but matching nothing".to_string(), body.to_string()))
+                }
+                None if parsed.as_ref().is_some_and(|p| {
+                    p.as_object().is_some_and(|o| !o.is_empty())
+                        || p.as_array().is_some_and(|a| !a.is_empty())
+                }) =>
+                {
+                    problems.push(format!(
+                        "(BR2) data file {f}: no 'valid but matching nothing' body (DATA_MATCH_NOTHING)"
+                    ))
+                }
+                None => {}
+            }
+            third.insert(f.clone(), v);
+        }
+        // RULINGS BM1 / BR1 — the hook's RESULT changed: its exit; for inject-context.sh output that
+        // carries the checklist region, the output OUTSIDE the region (a vanished region = the
+        // hook's output broken beyond the report); measured ON the region for the producer;
+        // otherwise the deterministic output
+        let bm1_changed =
+            |base: &Run, r: &Run, det: bool, outside_det: Option<bool>, on_region: bool| -> bool {
+                if r.code != base.code {
+                    return true;
+                }
+                if on_region {
+                    return det && r.stdout != base.stdout;
+                }
+                match (
+                    outside_checklist(&base.stdout),
+                    outside_checklist(&r.stdout),
+                ) {
+                    (Some(a), Some(b)) => outside_det == Some(true) && a != b,
+                    (Some(_), None) => true,
+                    (None, _) => det && r.stdout != base.stdout,
+                }
+            };
+        let region_note = |base: &Run, r: &Run| -> String {
+            match (
+                outside_checklist(&base.stdout),
+                outside_checklist(&r.stdout),
+                checklist_region(&base.stdout),
+                checklist_region(&r.stdout),
+            ) {
+                (Some(a), Some(b), Some(br), Some(rr)) => {
+                    let only = |x: &[String], y: &[String]| -> Vec<String> {
+                        x.iter()
+                            .filter(|l| !y.contains(l))
+                            .take(2)
+                            .map(|l| l.chars().take(120).collect())
+                            .collect()
+                    };
+                    format!(
+                        " · outside the checklist region same={} · region healthy-only {:?} · region broken-only {:?}",
+                        a == b,
+                        only(&br, &rr),
+                        only(&rr, &br)
+                    )
+                }
+                (Some(_), _, _, _) => " · the checklist region vanished".to_string(),
+                _ => String::new(),
+            }
+        };
+
         // (3) break each listed non-hook file that a replay reads → the RESULT of at least one
-        //     replay that read it changes (exit code or deterministic stdout — RULINGS AN3);
-        //     readers whose recorded input does not reach the broken path are recorded, not failed
+        //     replay that read it changes (RULINGS AN3 / BM1 / BR1: exit code, or the output
+        //     outside the checklist region — on the region for its producer); a data file is
+        //     broken in its third mode too (BR2); readers whose recorded input does not reach the
+        //     broken path are recorded, not failed
         for d in &deps {
             let readers: Vec<&&Entry> =
                 hooks.iter().filter(|h| reads[h.rel].contains(*d)).collect();
@@ -2643,80 +2798,73 @@ mod tests {
             // real-level, RULINGS AL1) — recorded here, asserted only for class-1 rows
             let class1 =
                 entries().iter().find(|e| e.rel == *d).and_then(proof) == Some("hook-replay");
-            put(d, broken(d));
-            let mut changed_any = false;
-            for h in readers {
-                let r = run(h.rel, &first_event(h), h.timeout_s, None);
-                let (base, det) = &healthy[h.rel];
-                let changed = r.result_changed(base, *det);
-                changed_any |= changed;
-                matrix.push(format!(
-                    "break {d} -> {} changed={changed} (exit {:?}->{:?})",
-                    h.rel, base.code, r.code
-                ));
+            let on_region = producer.as_deref() == Some(*d);
+            let mut modes: Vec<(String, String)> = vec![("(i)".to_string(), broken(d).to_string())];
+            if let Some(v) = third.get(*d) {
+                modes.extend(v.iter().cloned());
             }
-            for i in recipe_readers {
-                let (name, hook, _reach, setup) = RECIPES[i];
-                let r = run(
-                    hook,
-                    &first_event(hook_of(hook)),
-                    hook_of(hook).timeout_s,
-                    Some(setup),
-                );
-                let (base, det) = &recipe_healthy[i];
-                let changed = r.result_changed(base, *det);
-                changed_any |= changed;
-                // RULINGS BM1 (recorded for the report): for inject-context.sh, does the change lie
-                // outside the checklist-report region?
-                let outside = if hook == "hooks/inject-context.sh" {
-                    match (
-                        outside_checklist(&base.stdout),
-                        outside_checklist(&r.stdout),
-                        checklist_region(&base.stdout),
-                        checklist_region(&r.stdout),
-                    ) {
-                        (Some(a), Some(b), Some(br), Some(rr)) => {
-                            let only = |x: &[String], y: &[String]| -> Vec<String> {
-                                x.iter()
-                                    .filter(|l| !y.contains(l))
-                                    .take(2)
-                                    .map(|l| l.chars().take(120).collect())
-                                    .collect()
-                            };
-                            format!(
-                                " · outside the checklist region same={} · region healthy-only {:?} · region broken-only {:?}",
-                                a == b,
-                                only(&br, &rr),
-                                only(&rr, &br)
-                            )
-                        }
-                        _ => " · a checklist-region anchor is missing".to_string(),
-                    }
-                } else {
-                    String::new()
-                };
-                matrix.push(format!(
-                    "break {d} -> recipe {name} {hook} changed={changed} (exit {:?}->{:?}){outside}",
-                    base.code, r.code
-                ));
+            let mut changed_any = false;
+            for (mode, body) in &modes {
+                put(d, body);
+                for h in &readers {
+                    let r = run(h.rel, &first_event(h), h.timeout_s, None);
+                    let (base, det) = &healthy[h.rel];
+                    let changed = bm1_changed(base, &r, *det, None, on_region);
+                    changed_any |= changed;
+                    matrix.push(format!(
+                        "break {mode} {d} -> {} changed={changed} (exit {:?}->{:?}){}",
+                        h.rel,
+                        base.code,
+                        r.code,
+                        region_note(base, &r)
+                    ));
+                }
+                for i in &recipe_readers {
+                    let (name, hook, _reach, setup) = RECIPES[*i];
+                    let r = run(
+                        hook,
+                        &first_event(hook_of(hook)),
+                        hook_of(hook).timeout_s,
+                        Some(setup),
+                    );
+                    let (base, det) = &recipe_healthy[*i];
+                    let changed = bm1_changed(base, &r, *det, recipe_outside_det[*i], on_region);
+                    changed_any |= changed;
+                    matrix.push(format!(
+                        "break {mode} {d} -> recipe {name} {hook} changed={changed} (exit {:?}->{:?}){}{}",
+                        base.code,
+                        r.code,
+                        if on_region { " · measured ON the region (its producer, BR1)" } else { "" },
+                        region_note(base, &r)
+                    ));
+                }
+                put(d, &original(d));
             }
             let stage5 = derive::MEASURED_HOOK_DEPS
                 .iter()
                 .any(|(r, _h, s5, _w)| r == d && *s5);
+            let stage5_listed = derive::STAGE5_HOOK_ROWS.iter().any(|(r, _w)| r == d);
             if !changed_any && class1 && stage5 {
                 matrix.push(format!(
                     "  {d}: read, result unchanged — a stage-5 row (no recipe makes the hook's result depend on it, RULINGS AP3)"
                 ));
+            } else if !changed_any && class1 && stage5_listed {
+                matrix.push(format!(
+                    "  {d}: read, result unchanged outside the checklist region — a listed stage-5 row (its output is used on a path no recipe reaches, RULINGS BR1)"
+                ));
             } else if !changed_any && class1 {
                 problems.push(format!(
-                    "(3) {d} broken but no start step that reads it changed its result"
+                    "(3) {d} broken but no start step that reads it changed its result (outside the checklist region — RULINGS BM1 / BR1)"
                 ));
             } else if !changed_any {
                 matrix.push(format!(
                     "  {d}: read by a hook replay, proven at its own level (not class 1)"
                 ));
+            } else if stage5_listed {
+                problems.push(format!(
+                    "(3) {d} is a listed stage-5 row (STAGE5_HOOK_ROWS) but a replay MEASURES it — make it a measured row (RULINGS BR1)"
+                ));
             }
-            put(d, &original(d));
         }
 
         // (3b) RULINGS AN3 — every candidate a recipe is meant to reach is reached; unreachable → it
@@ -2782,22 +2930,17 @@ mod tests {
             }
             measured.push(*c);
             // (mode, body, asserted): an informational mode is recorded, never failed
-            let mut modes: Vec<(&str, String, bool)> = vec![("(i)", broken(c).to_string(), true)];
+            let mut modes: Vec<(String, String, bool)> =
+                vec![("(i)".to_string(), broken(c).to_string(), true)];
             match failing_answer(c) {
-                Some(f) => modes.push(("(ii)", f, true)),
+                Some(f) => modes.push(("(ii)".to_string(), f, true)),
                 None => matrix.push(format!(
                     "BM {c}: a data file — break mode (ii) does not apply"
                 )),
             }
-            if *c == "bin/skillscan_rules.json" {
-                // RULINGS BN3 (c), recorded for the master: a VALID sidecar whose non-empty
-                // `rule_specs` matches nothing replaces the built-in rules (javis_skillscan.py
-                // 192-200) — outside the two ruled break modes
-                modes.push((
-                    "(info: valid sidecar, rules that match nothing)",
-                    "{\"rule_specs\": [{\"rule_id\": \"T5A\", \"message\": \"t5a\", \"severity\": \"LOW\", \"category\": \"t5a\", \"flags\": \"\", \"scope\": \"all\", \"patterns\": [[\"t5a-matches-nothing\", 0.1]]}]}\n".to_string(),
-                    false,
-                ));
+            // RULINGS BR2: a data file of the hook layer is broken in its third mode too
+            if let Some(v) = third.get(*c) {
+                modes.extend(v.iter().map(|(l, b)| (l.clone(), b.clone(), true)));
             }
             for (label, hook, recipe) in &readers {
                 let h = hook_of(hook);

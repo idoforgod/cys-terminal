@@ -353,10 +353,31 @@ pub const MEASURED_HOOK_DEPS: &[(&str, &str, bool, &str)] = &[
         "the scanner inject_gate.py imports; broken -> the gate prints its 'gate down' banner and injects verbatim (recipe state-poison)",
     ),
     (
+        "bin/skillscan_rules.json",
+        "hooks/inject-context.sh",
+        false,
+        "the rules javis_skillscan.py reads (a data table, RULINGS BR2): VALID BUT MATCHING NOTHING (a non-empty `rule_specs` whose patterns match nothing) -> it replaces the built-in rules (javis_skillscan.py:192-200) and the poisoned line is injected verbatim instead of quarantined (recipe state-poison, third mode); unparsable or emptied -> the built-in rules apply and nothing in the hook's output differs",
+    ),
+    (
         "hooks/teamtoken-issue.sh",
         "hooks/role-bootstrap.sh",
         true,
         "the team-token issuer; issuing needs an open ask (a pending team proposal in the daemon feed published by this seat, the mission delivery ledger, a hook witness newer than the ask) — not built at the replay level (stage-5)",
+    ),
+];
+
+/// RULINGS BR1 — LISTED class-1 rows proven at stage 5 although a replay reads them: what a replay
+/// can break of theirs changes only the checklist-report region (a report — BM1), while their
+/// output is USED on a path no recipe reaches. (rel, record). Each must be a class-1 row; the hook
+/// replay's step (3) records them instead of failing ("listed rows to be proven").
+pub const STAGE5_HOOK_ROWS: &[(&str, &str)] = &[
+    (
+        "bin/javis_detect.py",
+        "hooks/role-bootstrap-legacy.sh:531-545 / :633 (`DETECT_VERDICT=$(… javis_detect.py hook-gate)`) uses its answer on the master-declaration path (no recipe reaches it); the state recipes reach it only through preflight, where breaking it changes the checklist's preflight count (FAIL 6 -> 7) and nothing else",
+    ),
+    (
+        "bin/javis_mission.py",
+        "hooks/role-bootstrap-legacy.sh:554-625 / :697 (records and judges the mission through it) uses its answer on the master-declaration path (no recipe reaches it); the state recipes reach it only through preflight, where breaking it changes the checklist's preflight count (FAIL 6 -> 7) and nothing else",
     ),
 ];
 
@@ -402,7 +423,6 @@ pub const DROPPED_CANDIDATES: &[(&str, &str)] = &[
     ("bin/javis_todo_decl.py", "(i) read by the boot; broken alone -> the boot completes and the hooks are registered (bootstrap replay, both scenes) (orchestra's import for ticket prompts) · (ii) no stop branch: `orchestra check` does not consult it (task-prompt only, orchestra 1768)"),
     ("bin/javis_verdict.py", "(i) read by the boot; broken alone -> the boot completes and the hooks are registered (bootstrap replay, both scenes) (orchestra's optional import with a fallback) · (ii) no stop branch: `orchestra check` does not consult it (review commands only)"),
     ("bin/javis_wakeup.py", "(i) read by the boot; broken alone -> the boot completes and the hooks are registered (bootstrap replay, both scenes) (a preflight check's tool); hook layer (RULINGS BM1): recipes state-poison and state run it through inject-context.sh's checklist phase (preflight) — broken, ONLY the checklist report region (from the line `■ 실측 체크리스트(…)` / `⚠ 실측 체크리스트 미수행(` to the restore note `▶ `) differs: preflight's summary line, `WARN 20` -> `WARN 21`; the rest of the injected text and the exit are unchanged; javis_snapshot.py:75-79 / :429-435 imports it inside try/except (AL1's optional import) · (ii) failing answer (prints a line, exit 1): the same difference, only inside the region; no start file obeys its answer as a stop: only preflight consults it at the boot, and the boot does not stop on preflight's answer (bootstrap 3594-3597)"),
-    ("bin/skillscan_rules.json", "(i) read by the boot (preflight C41 checks it beside its tool: `_check_bin_tool(cid, \"javis_skillscan.py\", extra_files=(\"skillscan_rules.json\",))`, preflight:2898); broken alone -> the boot completes and the hooks are registered (bootstrap replay, both scenes); hook layer (RULINGS BM1 / BN3 (c)): recipe state-poison runs javis_skillscan.py through inject-context.sh — broken, it falls back silently to its built-in rules (javis_skillscan.py:192-200: a sidecar that does not load leaves the inline RULE_SPECS, whose P1 quarantines the poisoned line the same way): NOTHING in the hook's output differs — exit, injected text and the checklist report (C41 still passes) are identical · (ii) a data file: no failing-answer mode; no start file obeys its content as a stop. Recorded, outside the ruled modes: a VALID sidecar whose non-empty `rule_specs` matches nothing replaces the built-in rules and the poisoned line is injected verbatim"),
     ("hooks/brief-lint-warn.sh", "(i) never read by the boot (tripwire, both scenes); broken with every unlisted file -> the boot completes; not a hook the product registers (C74 only checks it exists; an owner registers it by hand) · (ii) no stop branch: only preflight consults it, and the boot does not stop on preflight's answer (bootstrap 3594-3597)"),
 ];
 
@@ -2405,6 +2425,18 @@ pub fn derive(src: &Sources) -> Result<Vec<GenEntry>, String> {
                 proof: "hook-replay",
             },
         );
+    }
+
+    // RULINGS BR1 — listed class-1 rows proven at stage 5: each must be a class-1 row
+    for (rel, why) in STAGE5_HOOK_ROWS {
+        match rows.get_mut(*rel) {
+            Some(r) if r.category == "hook" || r.category == "hook-dep" => {
+                r.why = format!("{} · stage-5 (RULINGS BR1): {why}", r.why);
+            }
+            _ => errs.push(format!(
+                "STAGE5_HOOK_ROWS: `{rel}` is not a class-1 row (RULINGS BR1)"
+            )),
+        }
     }
 
     // RULINGS AT5 — the protection closure has NO drops: every file a protection row sources,
