@@ -646,6 +646,11 @@ fn keep_best(map: &mut HashMap<(String, String), (f64, RateMeta)>, key: (String,
 // script, a pipeline member piped onward, a heredoc body, a quoted string, a comment) is no identity.
 // INPUT (RULINGS BE1 — the CLI forwards it from Claude Code's `PostToolUseFailure`): `tool_name` "Bash",
 // `tool_input.command`, the top-level `error` (head + tail), `is_interrupt`; a call is a `PRE_TOOL` event.
+// FAILURE (RULINGS BX1) = only the tool's documented exit shape: the error text's FIRST line is exactly
+// `Exit code N`, N an integer 1..=127 (`exit_report`). Every other end — the Bash tool's own
+// `Command timed out after …`, an interruption, a tool / sandbox / permission message, an exit of 128 or
+// more (ended by a signal), no text — is NEITHER a failure NOR a call: it takes its call back out of the
+// rate (numerator and denominator). A hanging, timed-out or signalled script is a stated miss.
 // Three places, three costs:
 //   ① `observe_tool_event` — on the hook's request path: the command is classified BEFORE any lock (one
 //      bounded linear pass, RULINGS BF5), then a short update of in-memory tables under the detector's own
@@ -862,16 +867,17 @@ fn is_script_rel(rel: &str) -> bool {
     }
 }
 
-// ── RULINGS BU1 — the CLOSED GRAMMAR of a call that gets an identity ─────────────────────────────────
-// text      := ONE line (no newline, no carriage return); tokens separated by spaces / tabs
-// command   := assign* ( script | interpreter flag* script ) word* redirection*
-// assign    := NAME '=' word-rest               (NAME = [A-Za-z_][A-Za-z0-9_]*, written bare)
+// ── RULINGS BU1 as amended by BX2 — the CLOSED GRAMMAR of a call that gets an identity ──────────────
+// text      := ONE line (no newline, no carriage return — inside quotes neither); tokens separated by
+//              spaces / tabs
+// command   := ( script | interpreter flag* script ) word* redirection*
+//              (NO `NAME=value` in front: an assignment can stop the call or run other code first)
 // word      := part+                            (not beginning with a bare '=')
 // part      := bare | '…' | "…"
 //   bare    := letters / digits (any script) and `_ @ % + = : , . / -`; `~` only as the word's first
 //              two characters `~/`
-//   '…'     := single-quoted, no `'` inside
-//   "…"     := double-quoted, none of `$` backtick `\` `!` `"` inside
+//   '…'     := single-quoted, no `'` and no control character (newline, CR, NUL, ESC …) inside
+//   "…"     := double-quoted, none of `$` backtick `\` `!` `"` and no control character inside
 // script    := a word of bare parts only: a LITERAL path in THIS lane's pack (`PackRoots`)
 // interpreter := python | python3 | py | sh | bash | zsh | node | pwsh — bare, or a literal absolute
 //              path ending in one of them; its flags only from `INTERPRETER_FLAGS`
@@ -880,11 +886,13 @@ fn is_script_rel(rel: &str) -> bool {
 // Anything else — every character or form not named here — gives NO identity (a stated miss).
 
 /// The interpreters of BU1 and, for each, the FIXED list of flags that take no argument and no code
-/// (`-c`, `-m`, `-e`, `-s`, `-W`, `-X`, `--rcfile` and every flag not listed → no identity).
+/// (`-c`, `-m`, `-e`, `-s`, `-W`, `-X`, `--rcfile` and every flag not listed → no identity; the `py`
+/// launcher's `-3` is not listed — the launcher reads only its first argument, so after another flag
+/// it reaches python as an unknown option, RULINGS BX2).
 pub const INTERPRETER_FLAGS: &[(&str, &[&str])] = &[
     ("python", &["-u", "-B", "-O", "-OO", "-q", "-b", "-bb"]),
     ("python3", &["-u", "-B", "-O", "-OO", "-q", "-b", "-bb"]),
-    ("py", &["-u", "-B", "-O", "-OO", "-q", "-b", "-bb", "-3"]),
+    ("py", &["-u", "-B", "-O", "-OO", "-q", "-b", "-bb"]),
     ("sh", &["-x", "-v"]),
     ("bash", &["-x", "-v", "--norc", "--noprofile"]),
     ("zsh", &["-x", "-v", "-f"]),
@@ -898,8 +906,8 @@ pub const REDIRECTIONS: &[&str] = &["2>&1", ">/dev/null", "1>/dev/null", "2>/dev
 /// One token of the grammar.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Tok {
-    /// A word: its text (quotes removed), whether every part is bare, and its leading bare text.
-    Word { text: String, bare: bool, lead: String },
+    /// A word: its text (quotes removed) and whether every part is bare.
+    Word { text: String, bare: bool },
     Redirection,
 }
 
@@ -955,7 +963,7 @@ fn grammar_tokens(src: &str, steps: &mut usize) -> Option<Vec<Tok>> {
             continue;
         }
         let start = i;
-        let (mut text, mut lead, mut bare) = (String::new(), String::new(), true);
+        let (mut text, mut bare) = (String::new(), true);
         while i < n && cs[i] != ' ' && cs[i] != '\t' {
             *steps += 1;
             match cs[i] {
@@ -963,6 +971,9 @@ fn grammar_tokens(src: &str, steps: &mut usize) -> Option<Vec<Tok>> {
                     bare = false;
                     i += 1;
                     while i < n && cs[i] != '\'' {
+                        if cs[i].is_control() {
+                            return None; // a newline, a CR or another control character (RULINGS BX2)
+                        }
                         text.push(cs[i]);
                         i += 1;
                         *steps += 1;
@@ -976,7 +987,7 @@ fn grammar_tokens(src: &str, steps: &mut usize) -> Option<Vec<Tok>> {
                     bare = false;
                     i += 1;
                     while i < n && cs[i] != '"' {
-                        if matches!(cs[i], '$' | '`' | '\\' | '!') {
+                        if matches!(cs[i], '$' | '`' | '\\' | '!') || cs[i].is_control() {
                             return None;
                         }
                         text.push(cs[i]);
@@ -990,31 +1001,18 @@ fn grammar_tokens(src: &str, steps: &mut usize) -> Option<Vec<Tok>> {
                 }
                 '~' if i == start && cs.get(i + 1) == Some(&'/') => {
                     text.push('~');
-                    lead.push('~');
                     i += 1;
                 }
                 c if is_bare_char(c) && !(c == '=' && i == start) => {
                     text.push(c);
-                    if bare {
-                        lead.push(c);
-                    }
                     i += 1;
                 }
                 _ => return None,
             }
         }
-        out.push(Tok::Word { text, bare, lead });
+        out.push(Tok::Word { text, bare });
     }
     Some(out)
-}
-
-/// `NAME=` at the head of a word's bare text.
-fn is_assignment_lead(lead: &str) -> bool {
-    let Some((name, _)) = lead.split_once('=') else {
-        return false;
-    };
-    name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// The flag list of a known interpreter word (bare name, or a literal absolute path ending in it).
@@ -1030,7 +1028,7 @@ fn interpreter_flags(word: &str) -> Option<&'static [&'static str]> {
 /// The identity of a shell call (RULINGS BF1, BU1): given ONLY when the call's whole text parses under
 /// the closed grammar above — then the pack hook / script of THIS lane it runs and its first argument.
 /// Every other call is a stated miss (DEFERRED #76: compound calls, variable paths, globs, escapes,
-/// ANSI-C quotes …). Linear in the command's length (RULINGS BF5).
+/// ANSI-C quotes, an environment assignment in front …). Linear in the command's length (RULINGS BF5).
 pub fn pack_call(tool_input: &Value, roots: &PackRoots) -> PackCall {
     pack_call_counted(tool_input, roots).0
 }
@@ -1051,19 +1049,15 @@ fn parse_call(toks: &[Tok], roots: &PackRoots, steps: &mut usize) -> Option<Pack
     if toks[end..].iter().any(|t| *t != Tok::Redirection) {
         return None; // a word after a redirection
     }
-    let words: Vec<(&str, bool, &str)> = toks[..end]
+    let words: Vec<(&str, bool)> = toks[..end]
         .iter()
         .filter_map(|t| match t {
-            Tok::Word { text, bare, lead } => Some((text.as_str(), *bare, lead.as_str())),
+            Tok::Word { text, bare } => Some((text.as_str(), *bare)),
             Tok::Redirection => None,
         })
         .collect();
-    let mut k = 0;
-    while words.get(k).is_some_and(|(_, _, lead)| is_assignment_lead(lead)) {
-        k += 1;
-    }
-    let script = |w: Option<&(&str, bool, &str)>, steps: &mut usize| -> Option<String> {
-        let (text, bare, _) = w?;
+    let script = |w: Option<&(&str, bool)>, steps: &mut usize| -> Option<String> {
+        let (text, bare) = w?;
         if !*bare {
             return None;
         }
@@ -1072,17 +1066,19 @@ fn parse_call(toks: &[Tok], roots: &PackRoots, steps: &mut usize) -> Option<Pack
     let sub = |j: usize| -> Option<String> {
         words
             .get(j)
-            .map(|(t, _, _)| *t)
+            .map(|(t, _)| *t)
             .filter(|t| !t.is_empty() && !t.starts_with('-'))
             .map(|t| t.chars().take(64).collect())
     };
-    let (prog, prog_bare, _) = *words.get(k)?;
-    if let Some(rel) = script(words.get(k), steps) {
-        return Some(PackCall::One { rel, sub: sub(k + 1) });
+    // the FIRST word is the script or the interpreter (RULINGS BX2): a `NAME=value` in front is
+    // neither — it is no pack path and no interpreter name, so the call gets no identity
+    let (prog, prog_bare) = *words.first()?;
+    if let Some(rel) = script(words.first(), steps) {
+        return Some(PackCall::One { rel, sub: sub(1) });
     }
     let flags = prog_bare.then(|| interpreter_flags(prog)).flatten()?;
-    let mut j = k + 1;
-    while let Some((text, bare, _)) = words.get(j).filter(|(t, _, _)| t.starts_with('-')) {
+    let mut j = 1;
+    while let Some((text, bare)) = words.get(j).filter(|(t, _)| t.starts_with('-')) {
         if !*bare || !flags.contains(text) {
             return None; // a flag outside the interpreter's fixed list
         }
@@ -1099,16 +1095,58 @@ pub enum Classified {
     Ignored { failure: bool },
     Call { rel: String },
     Excluded { reason: &'static str },
-    /// A failure of `rel` without a text → it counts toward the rate but forms no signature (O-C1-9).
-    FailureNoText { rel: String },
+    /// An end of `rel`'s call that is neither a failure nor a call (RULINGS BX1: no exit report
+    /// `Exit code 1..=127` on the error text's first line) → its call leaves the rate.
+    NotCounted { rel: String },
     Failure { report: cys::repair::intake::Report },
 }
 
-fn is_failure(o: &ToolObservation<'_>) -> bool {
-    !o.interrupted
-        && (o.raw_event == "PostToolUseFailure"
-            || o.event_type == "PostToolUseFailure"
-            || (o.event_type == "POST_TOOL" && o.exit_code.is_some_and(|c| c != 0)))
+/// RULINGS BX1 — the tool's documented exit shape: the error text's FIRST line is exactly `Exit code N`
+/// with N an integer from 1 to 127 (decimal digits, no sign, no leading zero, nothing else on the line).
+/// `None` for every other text: the Bash tool's own `Command timed out after …`, an interruption, a
+/// tool / sandbox / permission message, an exit of 128 or more (ended by a signal), a first line that
+/// is not the report. The exclusion list then reads the same code from that same line
+/// (`intake::leading_exit_code`).
+pub fn exit_report(error: &str) -> Option<i64> {
+    let n = error.split('\n').next()?.strip_prefix("Exit code ")?;
+    if n.is_empty() || n.len() > 3 || n.starts_with('0') || !n.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    n.parse::<i64>().ok().filter(|n| (1..=127).contains(n))
+}
+
+/// A post-call event that says the call did not end well (the shapes the CLI forwards — RULINGS BE1).
+fn is_failure_event(o: &ToolObservation<'_>) -> bool {
+    o.raw_event == "PostToolUseFailure"
+        || o.event_type == "PostToolUseFailure"
+        || (o.event_type == "POST_TOOL" && o.exit_code.is_some_and(|c| c != 0))
+}
+
+/// What one event is for the rate (RULINGS BX1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum End {
+    /// A call (`PRE_TOOL`): the denominator.
+    Call,
+    /// A failure in the tool's exit shape: the numerator.
+    Failure,
+    /// Any other bad end: neither — its call leaves the denominator.
+    NotCounted,
+    /// A success or another event: nothing.
+    Other,
+}
+
+fn end_of(o: &ToolObservation<'_>) -> End {
+    if is_failure_event(o) {
+        if !o.interrupted && o.error.and_then(exit_report).is_some() {
+            End::Failure
+        } else {
+            End::NotCounted
+        }
+    } else if o.event_type == "PRE_TOOL" && !o.interrupted {
+        End::Call
+    } else {
+        End::Other
+    }
 }
 
 /// Keeps a failure text bounded: the whole text up to [`ERROR_KEEP_BYTES`], else its head and its tail.
@@ -1126,25 +1164,28 @@ fn bounded_error(e: &str) -> std::borrow::Cow<'_, str> {
 
 /// ① part 1 — PURE and lock-free: identity, failure or call, exclusion, signature.
 pub fn classify(o: &ToolObservation<'_>, roots: &PackRoots, windows: bool) -> Classified {
-    let failure = is_failure(o);
-    let call = !failure && !o.interrupted && o.event_type == "PRE_TOOL";
-    if (!failure && !call) || o.tool_name != "Bash" {
+    let end = end_of(o);
+    let failure = end == End::Failure;
+    if end == End::Other || o.tool_name != "Bash" {
         return Classified::Ignored { failure };
     }
     let (rel, sub) = match pack_call(o.tool_input, roots) {
         PackCall::None => return Classified::Ignored { failure },
         PackCall::One { rel, sub } => (rel, sub),
     };
-    if call {
-        return Classified::Call { rel };
+    match end {
+        End::Call => return Classified::Call { rel },
+        End::Failure => {}
+        End::NotCounted | End::Other => return Classified::NotCounted { rel },
     }
-    let raw = o.error.map(bounded_error).filter(|e| !e.trim().is_empty());
-    if let Some(reason) = detector_excluded(&rel, sub.as_deref(), raw.as_deref().unwrap_or(""), windows) {
+    // a failure's text begins with its exit report (BX1): the exclusion list reads the code there
+    let raw = bounded_error(o.error.unwrap_or_default());
+    if let Some(reason) = detector_excluded(&rel, sub.as_deref(), &raw, windows) {
         return Classified::Excluded { reason };
     }
-    match raw.as_deref().map(|e| cys::repair::intake::parse_report(&rel, e)) {
-        Some(Ok(report)) => Classified::Failure { report },
-        _ => Classified::FailureNoText { rel },
+    match cys::repair::intake::parse_report(&rel, &raw) {
+        Ok(report) => Classified::Failure { report },
+        Err(_) => Classified::NotCounted { rel }, // not reached: the text holds at least its exit report
     }
 }
 
@@ -1175,6 +1216,19 @@ impl RelStats {
         self.last_seen = self.last_seen.max(now);
     }
 
+    /// Takes one call back out of the window (RULINGS BX1 — an end that is neither a failure nor a call),
+    /// from the newest day that holds one; false when the window holds none (the call was not seen).
+    fn withdraw_call(&mut self, now: f64) -> bool {
+        let d = day_of(now);
+        match self.days.iter_mut().rev().find(|(x, c, _)| *c > 0 && *x > d - DETECTOR_WINDOW_DAYS) {
+            Some((_, c, _)) => {
+                *c -= 1;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// (calls, failures) inside the window.
     fn totals(&self, now: f64) -> (u64, u64) {
         let d = day_of(now);
@@ -1202,7 +1256,8 @@ pub struct DetectorCounters {
     pub calls: u64,
     pub failures: u64,
     pub failures_without_identity: u64,
-    pub no_error_text: u64,
+    /// Ends that were neither a failure nor a call (RULINGS BX1: timeout, interruption, signal, tool message).
+    pub not_counted: u64,
     pub excluded: u64,
     pub excluded_by_reason: std::collections::BTreeMap<&'static str, u64>,
     pub evicted_signatures: u64,
@@ -1231,8 +1286,8 @@ pub enum Observed {
     Call,
     /// A failure with a signature, counted for its row.
     Failure,
-    /// Counted toward the script's failure rate, but no text → no signature (O-C1-9) → no row.
-    NoErrorText,
+    /// Neither a failure nor a call (RULINGS BX1): the call left the rate.
+    NotCounted,
     /// On the exclusion list (the reason is counted in `DetectorCounters::excluded_by_reason`).
     Excluded,
 }
@@ -1331,11 +1386,12 @@ pub fn record(det: &mut Detector, c: Classified, now: f64) -> Observed {
             *det.counters.excluded_by_reason.entry(reason).or_insert(0) += 1;
             Observed::Excluded
         }
-        Classified::FailureNoText { rel } => {
-            det.counters.failures += 1;
-            det.counters.no_error_text += 1;
-            det.bump_rel(&rel, now, 0, 1);
-            Observed::NoErrorText
+        Classified::NotCounted { rel } => {
+            det.counters.not_counted += 1;
+            if det.rels.get_mut(&rel).is_some_and(|r| r.withdraw_call(now)) {
+                det.counters.calls = det.counters.calls.saturating_sub(1);
+            }
+            Observed::NotCounted
         }
         Classified::Failure { report } => {
             det.counters.failures += 1;
@@ -1630,7 +1686,7 @@ pub fn defect_intake_snapshot(daemon: &Arc<Daemon>, mono: f64) -> Value {
     json!({
         "calls": c.calls, "failures": c.failures,
         "failures_without_identity": c.failures_without_identity,
-        "no_error_text": c.no_error_text, "excluded": c.excluded,
+        "not_counted": c.not_counted, "excluded": c.excluded,
         "excluded_by_reason": c.excluded_by_reason,
         "evicted_signatures": c.evicted_signatures, "evicted_pending_signatures": c.evicted_pending_signatures,
         "evicted_rels": c.evicted_rels,
@@ -2157,12 +2213,11 @@ mod defect_intake_tests {
         out
     }
 
-    /// RULINGS BU1 — the positive set GENERATED from the grammar: assignments × (script alone |
-    /// interpreter + its listed flags) × script × arguments × trailing redirections — every text of the
-    /// product is identified, with its rel and its first argument. Plus the Windows and department roots.
+    /// RULINGS BU1 / BX2 — the positive set GENERATED from the grammar: (script alone | interpreter + its
+    /// listed flags) × script × arguments × trailing redirections — every text of the product is
+    /// identified, with its rel and its first argument. Plus the Windows and department roots.
     #[test]
     fn grammar_positives_are_identified() {
-        let assigns = ["", "A=1 ", "A=1 B='x y' ", "C=\"v w\" ", "D=é_1 "];
         let mut heads: Vec<String> = vec![String::new()];
         for (name, flags) in INTERPRETER_FLAGS {
             heads.push(format!("{name} "));
@@ -2170,24 +2225,29 @@ mod defect_intake_tests {
             heads.push(format!("/usr/bin/{name} {} ", flags[0]));
         }
         let scripts = [("~/.cys/pack/bin/javis_x.py", "bin/javis_x.py"), ("/Users/x/.cys/pack/hooks/sub/g.sh", "hooks/sub/g.sh"), ("~/.cys/pack/bin/cys-dept", "bin/cys-dept")];
-        let args = [("", None), (" check", Some("check")), (" check --json 'a b' \"c d\" x=1 é@%+:,./- 日本", Some("check")), ("\t--flag=v", None)];
+        let args = [
+            ("", None),
+            (" check", Some("check")),
+            (" check --json 'a b' \"c d\" x=1 é@%+:,./- 日本", Some("check")),
+            ("\t--flag=v", None),
+            (" 'check' x", Some("check")),
+            (" \"a b\"\t'c'", Some("a b")),
+        ];
         let redirs = ["", " 2>&1", " >/dev/null 2>&1", " > /dev/null", " &>/dev/null", " 1>/dev/null 2>/dev/null", " 2> /dev/null"];
         let mut n = 0;
-        for a in assigns {
-            for h in &heads {
-                for (path, rel) in scripts {
-                    for (arg, sub) in args {
-                        for r in redirs {
-                            let text = format!("{a}{h}{path}{arg}{r}");
-                            assert_eq!(pack_call(&bash(&text), &base()), one(rel, sub), "{text:?}");
-                            n += 1;
-                        }
+        for h in &heads {
+            for (path, rel) in scripts {
+                for (arg, sub) in args {
+                    for r in redirs {
+                        let text = format!("{h}{path}{arg}{r}");
+                        assert_eq!(pack_call(&bash(&text), &base()), one(rel, sub), "{text:?}");
+                        n += 1;
                     }
                 }
             }
         }
-        assert_eq!(n, assigns.len() * heads.len() * scripts.len() * args.len() * redirs.len());
-        assert!(n > 2_000, "{n}");
+        assert_eq!(n, heads.len() * scripts.len() * args.len() * redirs.len());
+        assert_eq!(n, 3_150);
         // Windows: the drive-letter pack dir and its Git Bash form; a department daemon: ITS pack
         let win = PackRoots::new(Some(r"C:\Users\x\.cys\pack"), Some(r"C:\Users\x"));
         assert_eq!(pack_call(&bash("python C:/Users/x/.cys/pack/bin/javis_x.py check"), &win), one("bin/javis_x.py", Some("check")));
@@ -2198,8 +2258,8 @@ mod defect_intake_tests {
         assert_eq!(pack_call(&json!({"command": ["python3", "/Users/x/.cys/pack/bin/a.py", "x"]}), &base()), one("bin/a.py", Some("x")));
     }
 
-    /// RULINGS BU1 — one negative per character and form the grammar leaves out, incl. the third
-    /// re-check's routes verbatim; each is also not counted as a call.
+    /// RULINGS BU1 / BX2 — one negative per character and form the grammar leaves out, incl. the third
+    /// and fourth re-checks' routes verbatim; each is also not counted as a call.
     #[test]
     fn grammar_negatives_one_per_character_and_form() {
         let x = "python3 ~/.cys/pack/bin/javis_x.py";
@@ -2253,6 +2313,24 @@ mod defect_intake_tests {
                 "env A=1 python3 ~/.cys/pack/bin/javis_x.py".to_string(),
                 "~/.cys/pack/bin/javis_x.md".to_string(),
                 "python3 ~/.cys/pack/bin/".to_string(),
+                // RULINGS BX2 — no assignment in front (it can stop the call or run other code first)
+                "UID=0 python3 ~/.cys/pack/bin/javis_x.py".to_string(),
+                "BASH_ENV=/x bash ~/.cys/pack/hooks/g.sh".to_string(),
+                "NODE_OPTIONS=--require=/x node ~/.cys/pack/bin/x.js".to_string(),
+                "PATH=/elsewhere python3 ~/.cys/pack/bin/javis_x.py".to_string(),
+                "VAR=1 ~/.cys/pack/bin/javis_x.py".to_string(),
+                format!("A=1 B='x y' {x}"),
+                format!("C=\"v w\" {x}"),
+                format!("D=é_1 {x}"),
+                format!("_A=1 {x}"),
+                // RULINGS BX2 — `py -3` is no listed flag
+                "py -u -3 ~/.cys/pack/bin/javis_x.py".to_string(),
+                // RULINGS BX2 — no newline / CR anywhere, inside quotes neither; nor another control character
+                format!("{x} 'a\nb'"),
+                format!("{x} \"a\nb\""),
+                format!("{x} 'a\rb'"),
+                format!("{x} 'a\u{0}b'"),
+                format!("{x} \"a\u{1b}[31mb\""),
             ]
             .into_iter(),
         );
@@ -2261,7 +2339,7 @@ mod defect_intake_tests {
             ("python3", "-c"), ("python3", "-m"), ("python3", "-W"), ("python3", "-X"), ("python3", "-s"), ("python3", "-I"),
             ("python3", "-E"), ("python3", "-uB"), ("bash", "-c"), ("bash", "-e"), ("bash", "-s"), ("bash", "--rcfile"),
             ("sh", "-c"), ("zsh", "-c"), ("node", "-e"), ("node", "-r"), ("node", "--require"), ("pwsh", "-Command"),
-            ("pwsh", "-File"), ("pwsh", "-noprofile"), ("py", "-c"),
+            ("pwsh", "-File"), ("pwsh", "-noprofile"), ("py", "-c"), ("py", "-3"),
         ] {
             negatives.push(format!("{name} {bad} ~/.cys/pack/bin/javis_x.py"));
         }
@@ -2271,10 +2349,10 @@ mod defect_intake_tests {
             assert_eq!(pack_call(&bash(c), &base()), PackCall::None, "outside the grammar but identified: {c:?}");
             assert_eq!(classify(&pre(&bash(c)), &base(), false), Classified::Ignored { failure: false }, "counted as a call: {c:?}");
         }
-        assert_eq!(negatives.len(), 22 + 42 + 21 + 1);
+        assert_eq!(negatives.len(), 22 + 57 + 22 + 1);
     }
 
-    /// The property test's reference — an INDEPENDENT, slow check of the grammar (RULINGS BU1): splits
+    /// The property test's reference — an INDEPENDENT, slow check of the grammar (RULINGS BU1, BX2): splits
     /// the text on unquoted spaces / tabs with an explicit state machine, then validates each raw token
     /// with string operations, then applies the command rule. Shares only data (the flag lists, the
     /// redirections, the roots' prefixes) with the production parser.
@@ -2348,19 +2426,22 @@ mod defect_intake_tests {
         }
         // 3. each word: parts by string operations
         let bare_ok = |s: &str| s.chars().all(|c| c.is_alphanumeric() || "_@%+=:,./-".contains(c));
-        let mut words: Vec<(String, bool, String)> = Vec::new(); // (text, all bare, leading bare text)
+        let mut words: Vec<(String, bool)> = Vec::new(); // (text, all bare)
         for t in toks[..first_redir].iter().flatten() {
             let mut rest = t.as_str();
-            let (mut text, mut lead, mut all_bare, mut first) = (String::new(), String::new(), true, true);
+            let (mut text, mut all_bare, mut first) = (String::new(), true, true);
             while !rest.is_empty() {
                 if let Some(r) = rest.strip_prefix('\'') {
                     let close = r.find('\'')?;
+                    if r[..close].contains(char::is_control) {
+                        return None;
+                    }
                     text.push_str(&r[..close]);
                     rest = &r[close + 1..];
                     all_bare = false;
                 } else if let Some(r) = rest.strip_prefix('"') {
                     let close = r.find('"')?;
-                    if r[..close].contains(['$', '`', '\\', '!']) {
+                    if r[..close].contains(['$', '`', '\\', '!']) || r[..close].contains(char::is_control) {
                         return None;
                     }
                     text.push_str(&r[..close]);
@@ -2371,36 +2452,21 @@ mod defect_intake_tests {
                     let mut seg = &rest[..stop];
                     if first && seg.starts_with("~/") {
                         text.push('~');
-                        if all_bare {
-                            lead.push('~');
-                        }
                         seg = &seg[1..];
                     }
                     if !bare_ok(seg) || (first && seg.starts_with('=') && text.is_empty()) {
                         return None;
                     }
                     text.push_str(seg);
-                    if all_bare {
-                        lead.push_str(seg);
-                    }
                     rest = &rest[stop..];
                 }
                 first = false;
             }
-            words.push((text, all_bare, lead));
+            words.push((text, all_bare));
         }
-        // 4. the command rule
-        let assignment = |lead: &str| {
-            lead.find('=').is_some_and(|p| {
-                let name = &lead[..p];
-                !name.is_empty() && !name.starts_with(|c: char| c.is_ascii_digit()) && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
-            })
-        };
-        let mut i = 0;
-        while i < words.len() && assignment(&words[i].2) {
-            i += 1;
-        }
-        let script_rel = |w: &(String, bool, String)| -> Option<String> {
+        // 4. the command rule: the first word is the script or the interpreter (no assignment in front)
+        let i = 0;
+        let script_rel = |w: &(String, bool)| -> Option<String> {
             if !w.1 {
                 return None;
             }
@@ -2434,11 +2500,12 @@ mod defect_intake_tests {
         Some((rel, sub(j + 1)))
     }
 
-    /// RULINGS BU1 — the PROPERTY test: for 5,000 pseudo-random texts (fixed seed) — half grammar-shaped
-    /// (assignment? interpreter+flags? script args* redirection*, with valid and invalid choices), half
-    /// random fragments — with arbitrary characters inserted into half of them (the full printable ASCII
-    /// set, tab, CR, LF, some non-ASCII letters), the production parser gives an identity EXACTLY when the
-    /// independent reference re-parses the text — and the same rel and first argument.
+    /// RULINGS BU1 / BX2 — the PROPERTY test: for 5,000 pseudo-random texts (fixed seed) — half
+    /// grammar-shaped (assignment? interpreter+flags? script args* redirection*, with valid and invalid
+    /// choices — every assignment now invalid), half random fragments — with arbitrary characters inserted
+    /// into half of them (the full printable ASCII set, tab, CR, LF, NUL, ESC, NEL, some non-ASCII
+    /// letters), the production parser gives an identity EXACTLY when the independent reference re-parses
+    /// the text — and the same rel and first argument.
     #[test]
     fn property_identity_only_when_the_reference_reparses() {
         let roots = base();
@@ -2455,9 +2522,10 @@ mod defect_intake_tests {
             "/Users/x/.cys/pack/hooks/g.sh", "~/.cys/pack/bin/cys-dept", "~/.cys/pack-dept-a/bin/a.py", "/tmp/x.py",
             "$CYS_PACK_DIR/bin/a.py", "A=1", "B='x y'", "C=\"z\"", "'quoted arg'", "\"dq arg\"", "arg", "--flag=v", "2>&1",
             ">/dev/null", ">", "/dev/null", "2>/dev/null", "&>/dev/null", "1>/dev/null", "check", "日本", "é", "~/x", "=x",
+            "'tab\there'", "\"nl\nhere\"", "UID=0", "PATH=/x",
         ];
-        let assigns = ["", "", "A=1", "B='x y'", "C=\"z\"", "1A=x", "A=$x"];
-        let heads = ["", "", "python3", "python3 -u -B", "/usr/bin/python3", "bash -x", "zsh -f", "node --no-warnings", "pwsh -NoProfile", "py -3", "python3 -c", "sh -s", "env"];
+        let assigns = ["", "", "", "", "", "A=1", "UID=0", "B='x y'", "PATH=/x", "1A=x", "A=$x"];
+        let heads = ["", "", "python3", "python3 -u -B", "/usr/bin/python3", "bash -x", "zsh -f", "node --no-warnings", "pwsh -NoProfile", "py -u", "py -3", "py -u -3", "python3 -c", "sh -s", "env"];
         let scripts = ["~/.cys/pack/bin/a.py", "/Users/x/.cys/pack/bin/javis_x.py", "/Users/x/.cys/pack/hooks/g.sh", "~/.cys/pack/bin/cys-dept", "~/.cys/pack-dept-a/bin/a.py", "/tmp/x.py", "$CYS_PACK_DIR/bin/a.py", "\"~/.cys/pack/bin/a.py\""];
         let redirs = ["", "", "2>&1", ">/dev/null", "> /dev/null", "2>/dev/null", "&>/dev/null", ">&2", "> out"];
         let seps = [" ", " ", "\t", "  "];
@@ -2496,7 +2564,7 @@ mod defect_intake_tests {
             for _ in 0..inserts {
                 let c = match rnd(10) {
                     0 => extra[rnd(extra.len())],
-                    1 => ['\t', '\r', '\n'][rnd(3)],
+                    1 => ['\t', '\r', '\n', '\u{0}', '\u{1b}', '\u{85}'][rnd(6)],
                     _ => (0x20u8 + rnd(95) as u8) as char,
                 };
                 let mut chars: Vec<char> = text.chars().collect();
@@ -2573,10 +2641,165 @@ mod defect_intake_tests {
         assert_eq!(classify(&fail(&g, Some("Exit code 1")), &base(), false), Classified::Ignored { failure: true });
         assert_eq!(classify(&pre(&g), &base(), false), Classified::Ignored { failure: false });
         let x = bash("python3 ~/.cys/pack/bin/javis_x.py");
-        let edit = ToolObservation { tool_name: "Edit", ..fail(&x, Some("E: x")) };
+        let edit = ToolObservation { tool_name: "Edit", ..fail(&x, Some("Exit code 1\nE: x")) };
         assert_eq!(classify(&edit, &base(), false), Classified::Ignored { failure: true });
-        let abort = ToolObservation { interrupted: true, ..fail(&x, Some("E: x")) };
-        assert_eq!(classify(&abort, &base(), false), Classified::Ignored { failure: false }, "an abort is not a failure of the script");
+        let abort = ToolObservation { interrupted: true, ..fail(&x, Some("Exit code 1\nE: x")) };
+        assert_eq!(
+            classify(&abort, &base(), false),
+            Classified::NotCounted { rel: "bin/javis_x.py".into() },
+            "an abort is not a failure of the script (RULINGS BX1: its call leaves the rate)"
+        );
+    }
+
+    /// RULINGS BX1 — the failure side's closed form: only the tool's exit report `Exit code N`, N an
+    /// integer 1..=127, as the error text's FIRST line. The exclusion list reads the same code from that
+    /// same line (`intake::leading_exit_code`).
+    #[test]
+    fn exit_report_is_the_first_line_exit_code_1_to_127() {
+        for (text, n) in [
+            ("Exit code 1", 1),
+            ("Exit code 1\nKeyError: 'k'", 1),
+            ("Exit code 2\nusage: x", 2),
+            ("Exit code 64\n", 64),
+            ("Exit code 126\n(eval):1: permission denied: /Users/x/.cys/pack/bin/a.sh", 126),
+            ("Exit code 127\n/usr/bin/bash: line 1: cys-dept: command not found", 127),
+        ] {
+            assert_eq!(exit_report(text), Some(n), "{text:?}");
+            assert_eq!(intake::leading_exit_code(text), Some(n), "the exclusion list reads another code from {text:?}");
+        }
+        for text in [
+            "Command timed out after 2m 0s",
+            "Command timed out after 10m 0s\nExit code 1",
+            "Exit code 0",
+            "Exit code 128",
+            "Exit code 130\nKeyboardInterrupt",
+            "Exit code 137",
+            "Exit code 143\nTerminated",
+            "Exit code 255",
+            "Exit code 256",
+            "Exit code 1000",
+            "Exit code -1",
+            "Exit code +1",
+            "Exit code 01",
+            "Exit code 1 ",
+            "Exit code  1",
+            " Exit code 1",
+            "exit code 1",
+            "Exit code 1\r\nKeyError: 'k'",
+            "Exit code 1.0",
+            "Exit code 1x",
+            "Exit code",
+            "Exit code ",
+            "\nExit code 1\nKeyError: 'k'",
+            "warning: x\nExit code 1",
+            "KeyError: 'k'",
+            "Permission to use Bash has been denied.",
+            "Error: sandbox: operation not permitted",
+            "",
+        ] {
+            assert_eq!(exit_report(text), None, "{text:?}");
+        }
+    }
+
+    /// RULINGS BX1 at the detector, with a grammar-valid command: the Bash tool's own timeout (verbatim),
+    /// an exit of 128 or more, an interruption and any text without a first-line exit report count
+    /// NOTHING — neither a failure nor a call (the PRE_TOOL's call leaves the rate); exits 1, 2, 126 and
+    /// 127 are failures. A healthy slow script files nothing, and its timeouts do not dilute a real
+    /// defect's rate.
+    #[test]
+    fn only_the_tools_exit_report_is_a_failure_and_other_ends_leave_the_rate() {
+        let t = 1_800_000_000.0;
+        let x = bash("python3 ~/.cys/pack/bin/javis_x.py run");
+        assert_eq!(pack_call(&x, &base()), one("bin/javis_x.py", Some("run")), "the command must be inside the grammar");
+        for text in [
+            "Command timed out after 2m 0s",
+            "Exit code 137",
+            "Exit code 143",
+            "Exit code 130\nKeyboardInterrupt",
+            "Exit code 128",
+            "Exit code 255",
+            "KeyError: 'k'",
+            "\nExit code 1\nKeyError: 'k'",
+            "warning: x\nExit code 1",
+            "Permission to use Bash has been denied.",
+            "Error: sandbox: operation not permitted",
+        ] {
+            let mut d = Detector::default();
+            assert_eq!(observe(&mut d, &pre(&x), &base(), t, false), Observed::Call);
+            assert_eq!(observe(&mut d, &fail(&x, Some(text)), &base(), t + 1.0, false), Observed::NotCounted, "{text:?}");
+            assert_eq!(d.rels["bin/javis_x.py"].totals(t + 1.0), (0, 0), "{text:?} was counted");
+            assert_eq!((d.counters.calls, d.counters.failures, d.counters.not_counted), (0, 0, 1), "{text:?}");
+        }
+        // an interruption, even with an exit report, is no failure
+        let mut d = Detector::default();
+        observe(&mut d, &pre(&x), &base(), t, false);
+        let abort = ToolObservation { interrupted: true, ..fail(&x, Some("Exit code 1\nKeyError: 'k'")) };
+        assert_eq!(observe(&mut d, &abort, &base(), t, false), Observed::NotCounted);
+        assert_eq!(d.rels["bin/javis_x.py"].totals(t), (0, 0));
+        // the failures
+        for n in [1, 2, 126, 127] {
+            let mut d = Detector::default();
+            observe(&mut d, &pre(&x), &base(), t, false);
+            let text = format!("Exit code {n}\nE: x");
+            assert_eq!(observe(&mut d, &fail(&x, Some(&text)), &base(), t, false), Observed::Failure, "{text:?}");
+            assert_eq!((d.rels["bin/javis_x.py"].totals(t), d.counters.failures), ((1, 1), 1));
+        }
+        // an end whose call was never seen (a restart in between) takes nothing and tracks nothing
+        let mut d = Detector::default();
+        assert_eq!(observe(&mut d, &fail(&x, Some("Command timed out after 2m 0s")), &base(), t, false), Observed::NotCounted);
+        assert_eq!((d.tracked().0, d.counters.calls), (0, 0));
+        // a healthy slow script: ten calls, ten timeouts → nothing counted, no row
+        let mut d = Detector::default();
+        for i in 0..10 {
+            observe(&mut d, &pre(&x), &base(), t + i as f64, false);
+            observe(&mut d, &fail(&x, Some("Command timed out after 2m 0s")), &base(), t + i as f64 + 120.0, false);
+        }
+        assert!(due_signatures(&d, t + 200.0).is_empty());
+        assert_eq!(d.rels["bin/javis_x.py"].totals(t + 200.0), (0, 0));
+        // timeouts do not dilute a real defect: 20 timed-out calls + 5 failing calls → 5 / 5 → due
+        // (had the timeouts stayed in the denominator: 5 / 25 = 20 % < 30 % → never due)
+        for _ in 0..20 {
+            observe(&mut d, &pre(&x), &base(), t + 300.0, false);
+            observe(&mut d, &fail(&x, Some("Command timed out after 2m 0s")), &base(), t + 420.0, false);
+        }
+        for _ in 0..5 {
+            observe(&mut d, &pre(&x), &base(), t + 500.0, false);
+            observe(&mut d, &fail(&x, Some("Exit code 1\nKeyError: 'k'")), &base(), t + 501.0, false);
+        }
+        assert_eq!(d.rels["bin/javis_x.py"].totals(t + 600.0), (5, 5));
+        assert_eq!(due_signatures(&d, t + 600.0).len(), 1);
+        assert_eq!(d.counters.not_counted, 30);
+    }
+
+    /// RULINGS BX1 — the exclusion list and the Windows `127` rule read the exit code from the SAME first
+    /// line: a by-design answer is excluded only when its text begins with the report; the same text with
+    /// the report elsewhere, or without it, counts nothing at all (it is no failure).
+    #[test]
+    fn exclusions_read_the_code_from_the_first_line() {
+        let t = 1_800_000_000.0;
+        let dept = bash("~/.cys/pack/bin/cys-dept create team-x");
+        let gate = bash("python3 ~/.cys/pack/bin/javis_resource_gate.py check");
+        let chk = bash("python3 ~/.cys/pack/bin/javis_orchestra.py check");
+        let cases: [(&Value, &str, bool, Observed); 10] = [
+            (&dept, "Exit code 127\n/usr/bin/bash: line 1: cys-dept: command not found", true, Observed::Excluded),
+            (&dept, "\nExit code 127\n/usr/bin/bash: line 1: cys-dept: command not found", true, Observed::NotCounted),
+            (&dept, "/usr/bin/bash: line 1: cys-dept: command not found", true, Observed::NotCounted),
+            (&dept, "Exit code 127\n/usr/bin/bash: line 1: cys-dept: command not found", false, Observed::Failure),
+            (&gate, "Exit code 2\nverdict: hard_block", false, Observed::Excluded),
+            (&gate, " Exit code 2\nverdict: hard_block", false, Observed::NotCounted),
+            (&gate, "verdict: hard_block\nExit code 2", false, Observed::NotCounted),
+            (&chk, "Exit code 12\n종합: 4종 의무 노드 전부 생존(ready) — 그러나 각성 ACK 미확인: worker", false, Observed::Excluded),
+            (&chk, "Exit code 1\n종합: 필수 3/4 생존 — 부재: worker", false, Observed::Excluded),
+            (&chk, "Exit code 137\n종합: 필수 3/4 생존 — 부재: worker", false, Observed::NotCounted),
+        ];
+        for (input, text, windows, want) in cases {
+            let mut d = Detector::default();
+            observe(&mut d, &pre(input), &base(), t, windows);
+            assert_eq!(observe(&mut d, &fail(input, Some(text)), &base(), t, windows), want, "{text:?} windows={windows}");
+            if want == Observed::Excluded {
+                assert_eq!(intake::leading_exit_code(text), exit_report(text), "the list read another code than the gate: {text:?}");
+            }
+        }
     }
 
     /// RULINGS BS1 — ONLY a call that is one simple command gets an identity: one negative per control
@@ -2768,7 +2991,10 @@ mod defect_intake_tests {
             "fn parse_call(",
             "fn interpreter_flags(",
             "pub fn detector_excluded(",
-            "fn is_failure(",
+            "pub fn exit_report(",
+            "fn is_failure_event(",
+            "fn end_of(",
+            "fn withdraw_call(",
             "fn bounded_error(",
         ] {
             let b = body(head);
@@ -2808,7 +3034,7 @@ mod defect_intake_tests {
             assert_eq!(observe(&mut d, &fail(&a, Some("Exit code 1\nKeyError: 'k'")), &base(), t + 0.5, false), Observed::Failure);
         }
         observe(&mut d, &pre(&b), &base(), t, false);
-        observe(&mut d, &fail(&b, Some("E: b")), &base(), t, false);
+        observe(&mut d, &fail(&b, Some("Exit code 1\nE: b")), &base(), t, false);
         assert!(due_signatures(&d, t).is_empty(), "4 failures are below fail_count 5");
         observe(&mut d, &pre(&a), &base(), t + 5.0, false);
         observe(&mut d, &fail(&a, Some("Exit code 1\nKeyError: 'k'")), &base(), t + 5.5, false);
@@ -2824,17 +3050,17 @@ mod defect_intake_tests {
             observe(&mut d, &pre(&c), &base(), t, false);
         }
         for _ in 0..5 {
-            observe(&mut d, &fail(&c, Some("E: c")), &base(), t, false);
+            observe(&mut d, &fail(&c, Some("Exit code 1\nE: c")), &base(), t, false);
         }
         assert!(due_signatures(&d, t).is_empty(), "25 % < 30 %");
-        observe(&mut d, &fail(&c, Some("E: c")), &base(), t, false);
+        observe(&mut d, &fail(&c, Some("Exit code 1\nE: c")), &base(), t, false);
         assert_eq!(due_signatures(&d, t).len(), 1, "30 % = fail_rate");
         d.cfg = AlertConfig { fail_count: 7, ..AlertConfig::default() };
         assert!(due_signatures(&d, t).is_empty(), "alerts-config.json's fail_count is honoured");
     }
 
-    /// The exclusion list on POSITIVE evidence (RULINGS BF2) before anything is counted; a failure
-    /// without text forms no row.
+    /// The exclusion list on POSITIVE evidence (RULINGS BF2) before anything is counted; an end without
+    /// the tool's exit report (no text) is neither a failure nor a call (RULINGS BX1) and forms no row.
     #[test]
     fn exclusions_need_positive_evidence_and_unnamed_failures_form_no_row() {
         let cfg_t = 1_800_000_000.0;
@@ -2876,16 +3102,17 @@ mod defect_intake_tests {
             observe(&mut d, &fail(&gate, Some("Exit code 2\nusage: javis_resource_gate.py [-h]")), &base(), cfg_t, false);
         }
         assert_eq!(due_signatures(&d, cfg_t).len(), 1, "an exit code alone excluded a failure");
-        // no text: counted toward the rate, no signature (O-C1-9) → no row
+        // no text (no exit report): neither a failure nor a call (RULINGS BX1) → nothing counted, no row
         let mut d = Detector::default();
         let a = bash("python3 ~/.cys/pack/bin/a.py");
         for _ in 0..10 {
             observe(&mut d, &pre(&a), &base(), cfg_t, false);
             let today = ToolObservation { raw_event: "PostToolUse", ..fail(&a, None) };
-            assert_eq!(observe(&mut d, &today, &base(), cfg_t, false), Observed::NoErrorText);
+            assert_eq!(observe(&mut d, &today, &base(), cfg_t, false), Observed::NotCounted);
         }
         assert!(due_signatures(&d, cfg_t).is_empty());
-        assert_eq!(d.counters.no_error_text, 10);
+        assert_eq!(d.rels["bin/a.py"].totals(cfg_t), (0, 0));
+        assert_eq!((d.counters.not_counted, d.counters.calls, d.counters.failures), (10, 0, 0));
     }
 
     /// The detector's own exclusion entries match each tool's verdict marker with its exit code, never
@@ -2939,7 +3166,7 @@ mod defect_intake_tests {
         let mut d = Detector::default();
         for i in 0..DETECTOR_MAX_SIGNATURES {
             let s = bash(&format!("python3 ~/.cys/pack/bin/s{i}.py"));
-            assert_eq!(observe(&mut d, &fail(&s, Some(&format!("E{i}: x"))), &base(), t + i as f64, false), Observed::Failure);
+            assert_eq!(observe(&mut d, &fail(&s, Some(&format!("Exit code 1\nE{i}: x"))), &base(), t + i as f64, false), Observed::Failure);
         }
         for i in DETECTOR_MAX_SIGNATURES..DETECTOR_MAX_RELS {
             observe(&mut d, &pre(&bash(&format!("python3 ~/.cys/pack/bin/s{i}.py"))), &base(), t + i as f64, false);
@@ -3125,7 +3352,7 @@ mod defect_intake_tests {
         observe_tool_event_with(&daemon, &pre(&x), &fl);
         observe_tool_event_with(&daemon, &fail(&g, Some("Exit code 1")), &fl);
         observe_tool_event_with(&daemon, &fail(&x, None), &fl);
-        assert_eq!(starts.load(Ordering::SeqCst), 0, "a call, a mention or a failure without text started the flusher");
+        assert_eq!(starts.load(Ordering::SeqCst), 0, "a call, a mention or an end without an exit report started the flusher");
         for _ in 0..4 {
             observe_tool_event_with(&daemon, &pre(&x), &fl);
             observe_tool_event_with(&daemon, &fail(&x, Some("Exit code 1\nE: a")), &fl);
@@ -3294,7 +3521,8 @@ mod observation_hook_contract {
 }
 
 /// ★The wiring, through the real request path: `usage.event` from a seat → the detector → a row after
-/// the flush. Today's event shape (a failure only as `exit_code`, no text) files nothing.
+/// the flush. Today's event shape (a failure only as `exit_code`, no text), an abort and the Bash tool's
+/// own timeout file nothing and count nothing (RULINGS BX1: each takes its call back out of the rate).
 #[cfg(all(test, unix))]
 mod defect_intake_drills {
     use super::*;
@@ -3316,8 +3544,9 @@ mod defect_intake_drills {
         let root = super::defect_intake_tests::tmp_root("arm");
         let input = json!({"command": "python3 ~/.cys/pack/bin/javis_x.py run"});
         let today = json!({"command": "python3 ~/.cys/pack/bin/javis_today.py"});
+        let slow = json!({"command": "python3 ~/.cys/pack/bin/javis_slow.py run"});
         for _ in 0..5 {
-            for inp in [&input, &today] {
+            for inp in [&input, &today, &slow] {
                 let v = usage_event(&daemon, json!({"surface_id": sid, "event_type": "PRE_TOOL", "raw_hook_event": "PreToolUse", "tool_name": "Bash", "tool_input": inp}));
                 assert_eq!(v["ok"], true, "{v}");
             }
@@ -3330,6 +3559,9 @@ mod defect_intake_drills {
             // an abort of the same script (`is_interrupt: true`) is not a failure of the script
             let v = usage_event(&daemon, json!({"surface_id": sid, "event_type": "POST_TOOL", "raw_hook_event": "PostToolUseFailure", "tool_name": "Bash", "tool_input": input, "exit_code": 1, "error": "Exit code 130\nKeyboardInterrupt", "is_interrupt": true}));
             assert_eq!(v["ok"], true, "{v}");
+            // the Bash tool's own timeout of a healthy but slow script (RULINGS BX1) — verbatim, no abort
+            let v = usage_event(&daemon, json!({"surface_id": sid, "event_type": "POST_TOOL", "raw_hook_event": "PostToolUseFailure", "tool_name": "Bash", "tool_input": slow, "exit_code": 1, "error": "Command timed out after 2m 0s", "is_interrupt": false}));
+            assert_eq!(v["ok"], true, "{v}");
             // a mention: a failing grep of a pack file
             let v = usage_event(&daemon, json!({"surface_id": sid, "event_type": "POST_TOOL", "raw_hook_event": "PostToolUseFailure", "tool_name": "Bash", "tool_input": {"command": "grep x ~/.cys/pack/bin/javis_x.py"}, "exit_code": 1, "error": "Exit code 1"}));
             assert_eq!(v["ok"], true, "{v}");
@@ -3341,9 +3573,9 @@ mod defect_intake_drills {
         assert_eq!((defects[0].rel.as_str(), defects[0].count), ("bin/javis_x.py", 5));
         assert_eq!(defects[0].lanes, vec![LaneKey::of_socket(&daemon.socket_path)]);
         let snap = defect_intake_snapshot(&daemon, 10.0);
-        assert_eq!(snap["no_error_text"], 5, "{snap}");
-        assert_eq!(snap["calls"], 10, "{snap}");
-        assert_eq!(snap["failures"], 10, "the abort and the grep were counted as script failures: {snap}");
+        assert_eq!(snap["not_counted"], 15, "{snap}");
+        assert_eq!(snap["calls"], 0, "every call ended in a failure or left the rate: {snap}");
+        assert_eq!(snap["failures"], 5, "the abort, the timeout or the grep was counted as a script failure: {snap}");
         assert_eq!(snap["failures_without_identity"], 5, "{snap}");
         let q = daemon.get_surface(sid).map(|s| s.pending_queue.lock().unwrap().len());
         assert_eq!(q, Some(0), "the seat's queue grew");
