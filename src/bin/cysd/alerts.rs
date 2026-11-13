@@ -776,10 +776,8 @@ pub struct ToolObservation<'a> {
 pub enum PackCall {
     /// The call ran no pack hook / script of this lane.
     None,
-    /// It ran exactly this one: its lane-independent pack-relative path and its first argument;
-    /// `after_cd` = it is reached through `&&` from a `cd` (a failure whose text shows the shell's
-    /// `cd` diagnostic is the `cd`'s, not the script's — RULINGS BP1 (a)).
-    One { rel: String, sub: Option<String>, after_cd: bool },
+    /// It ran exactly this one: its lane-independent pack-relative path and its first argument.
+    One { rel: String, sub: Option<String> },
 }
 
 /// This lane's pack-root spellings, built once per daemon: the daemon's own pack dir (and its Git Bash
@@ -897,148 +895,54 @@ fn is_env_assignment(w: &str) -> bool {
     }
 }
 
-/// How a simple command ended (the connector that follows it).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Term {
-    /// `;`, newline, `(` or the end — the next command runs regardless of this one.
-    List,
-    /// `&&` — the next command runs only if this one succeeded.
-    And,
-    /// `||` — the next command runs only if this one failed.
-    Or,
-    /// `|` `|&` — its output is piped onward; the exit code belongs to a later command.
-    Pipe,
-    /// `&` — backgrounded; its exit code is not the call's.
-    Background,
-    /// `)` — the end of a subshell group (an `&&` / `||` / `|` / `&` right after it replaces this).
-    Close,
-}
-
-/// The call's final simple command and what gates it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct FinalCommand {
-    words: Vec<String>,
-    /// It is reached through `&&` from a left side that holds a `cd` (RULINGS BP1 (a)): a failure is
-    /// still the script's only when the failure text shows no `cd` diagnostic of the shell.
-    after_cd: bool,
-}
-
-/// `cd`, `cd <path>`, `cd -P <path>` … (a left side of `&&` that may precede the script, BP1 (a)).
-fn is_cd_command(w: &[String]) -> bool {
-    w.first().is_some_and(|c| c == "cd") && w.len() <= 3
-}
-
-/// A left side of `&&` that cannot itself be the failure the call reports (BP1 (a)): `cd <path>`,
-/// environment assignments only (`A=1 B=2`), `export NAME=value` / `export NAME`.
-fn is_safe_left(w: &[String]) -> bool {
-    if w.is_empty() {
-        return false;
-    }
-    if w.iter().all(|x| is_env_assignment(x)) || is_cd_command(w) {
-        return true;
-    }
-    w[0] == "export"
-        && w.len() > 1
-        && w[1..].iter().all(|x| {
-            is_env_assignment(x)
-                || (x.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-                    && x.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
-        })
-}
-
-/// A failure text that shows the shell's own `cd` diagnostic (`cd: …`, `bash: line 1: cd: …`,
-/// `sh: 1: cd: …`) — the `cd` on the left of `&&` failed and the script never started (BP1 (a)).
-pub fn shows_cd_diagnostic(error: &str) -> bool {
-    error.lines().map(str::trim_start).any(|l| l.starts_with("cd: ") || l.contains(": cd: "))
-}
-
-/// The call's FINAL simple command — the one whose exit code is the call's — read by ONE left-to-right
-/// pass over the command (every char is visited once; a heredoc body is skipped while passing over it;
-/// `steps` counts the visits — RULINGS BF5). Quotes are removed from words (a quoted string is ONE word
-/// and is never parsed as a command); `$(…)`, `` `…` ``, `${…}`, `<(…)` stay inside their word;
-/// comments, redirection targets and heredoc bodies are dropped. `None` (RULINGS BP1) when:
-/// the final command is piped onward or backgrounded; it is reached through `&&` from a left side that
-/// is not only `cd` / assignments / `export` (the left side may be what failed — the script may never
-/// have started); or the reading is not certain — an unterminated quote, `$(`, `${`, backtick or `<(`,
-/// a heredoc whose delimiter never comes, an arithmetic `((…))` command, a `(` after a word.
-/// `;` and `||` keep the identity: the call's exit status is the final command's.
-fn final_simple_command(src: &str, steps: &mut usize) -> Option<FinalCommand> {
+/// The words of the call when its WHOLE text is exactly ONE simple command (RULINGS BS1), read by ONE
+/// left-to-right pass (every char is visited at most once; `steps` counts the visits — RULINGS BF5).
+/// Quotes are removed from words (single quotes are literal); `${…}` stays inside its word. `None` — a
+/// stated MISS — for any control operator (`&&` `||` `;` `|` `|&` `&`, a newline between commands), a
+/// subshell or group parenthesis, any substitution (`$(`, `$((`, a backtick — inside double quotes
+/// too —, `<(`, `>(`), a heredoc, here-string or input redirection, an output redirection to anything
+/// but `/dev/null` or a descriptor copy (`2>&1`, `>&2`), and any reading that is not certain (an
+/// unterminated quote or `${`, a trailing backslash, a redirection without its target).
+fn single_simple_command(src: &str, steps: &mut usize) -> Option<Vec<String>> {
     let cs: Vec<char> = src.chars().collect();
     let n = cs.len();
     let mut i = 0usize;
-    let mut cur: Vec<String> = Vec::new();
-    let mut done: Vec<(Vec<String>, Term)> = Vec::new();
+    let mut words: Vec<String> = Vec::new();
     let mut word = String::new();
     let mut in_word = false;
-    let mut skip_word = false; // the next word is a redirection target / here-string
-    let mut heredocs: Vec<(String, bool)> = Vec::new();
-    let mut want_delim: Option<bool> = None; // after `<<` / `<<-`: the next word is a heredoc delimiter
-    let mut uncertain = false;
-
-    fn end_word(word: &mut String, in_word: &mut bool, skip_word: &mut bool, want_delim: &mut Option<bool>, heredocs: &mut Vec<(String, bool)>, cur: &mut Vec<String>) {
-        if !*in_word {
-            return;
-        }
-        if let Some(strip) = want_delim.take() {
-            heredocs.push((std::mem::take(word), strip));
-        } else if *skip_word {
-            *skip_word = false;
-            word.clear();
-        } else {
-            cur.push(std::mem::take(word));
-        }
-        *in_word = false;
-    }
-    fn end_cmd(cur: &mut Vec<String>, done: &mut Vec<(Vec<String>, Term)>, term: Term) {
-        if !cur.is_empty() {
-            done.push((std::mem::take(cur), term));
-        } else if let Some((_, t)) = done.last_mut() {
-            // `(a) && b`, `a &` then `;`: an empty command passes its connector to the one before
-            // (a later `;` / newline does not hide a background / pipe ending)
-            if term != Term::List {
-                *t = term;
-            }
-        }
-    }
-    macro_rules! ew {
+    let mut to_devnull = false; // the next word is an output redirection's target: only `/dev/null`
+    macro_rules! end_word {
         () => {
-            end_word(&mut word, &mut in_word, &mut skip_word, &mut want_delim, &mut heredocs, &mut cur)
+            if in_word {
+                let w = std::mem::take(&mut word);
+                if to_devnull {
+                    if w != "/dev/null" {
+                        return None;
+                    }
+                    to_devnull = false;
+                } else {
+                    words.push(w);
+                }
+                in_word = false;
+            }
         };
     }
-
     while i < n {
         let c = cs[i];
         *steps += 1;
         match c {
             ' ' | '\t' | '\r' => {
-                ew!();
+                end_word!();
                 i += 1;
             }
             '\n' => {
-                ew!();
-                end_cmd(&mut cur, &mut done, Term::List);
-                i += 1;
-                // heredoc bodies start on the next line: skip each up to its delimiter line
-                for (delim, strip) in std::mem::take(&mut heredocs) {
-                    let mut found = false;
-                    while i < n {
-                        let start = i;
-                        while i < n && cs[i] != '\n' {
-                            i += 1;
-                        }
-                        *steps += i - start + 1;
-                        let line: String = cs[start..i].iter().collect();
-                        let line = if strip { line.trim_start_matches('\t').to_string() } else { line };
-                        i += 1; // past the newline
-                        if line == delim {
-                            found = true;
-                            break;
-                        }
-                    }
-                    if !found {
-                        uncertain = true; // a heredoc that swallows the rest
-                    }
+                // only whitespace may follow: a newline BETWEEN commands is a second command
+                end_word!();
+                if cs[i..].iter().any(|d| !d.is_whitespace()) {
+                    return None;
                 }
+                *steps += n - i;
+                i = n;
             }
             '#' if !in_word => {
                 while i < n && cs[i] != '\n' {
@@ -1047,15 +951,14 @@ fn final_simple_command(src: &str, steps: &mut usize) -> Option<FinalCommand> {
                 }
             }
             '\\' => {
-                if i + 1 < n && cs[i + 1] == '\n' {
-                    i += 2; // line continuation
-                } else {
-                    if i + 1 < n {
-                        word.push(cs[i + 1]);
-                    }
-                    in_word = true;
-                    i += 2;
+                if i + 1 >= n {
+                    return None;
                 }
+                if cs[i + 1] != '\n' {
+                    word.push(cs[i + 1]);
+                    in_word = true;
+                }
+                i += 2;
                 *steps += 1;
             }
             '\'' => {
@@ -1066,13 +969,18 @@ fn final_simple_command(src: &str, steps: &mut usize) -> Option<FinalCommand> {
                     i += 1;
                     *steps += 1;
                 }
-                uncertain |= i >= n; // unterminated
+                if i >= n {
+                    return None;
+                }
                 i += 1;
             }
             '"' => {
                 in_word = true;
                 i += 1;
                 while i < n && cs[i] != '"' {
+                    if cs[i] == '`' || (cs[i] == '$' && i + 1 < n && cs[i + 1] == '(') {
+                        return None;
+                    }
                     if cs[i] == '\\' && i + 1 < n && matches!(cs[i + 1], '"' | '\\' | '$' | '`') {
                         i += 1;
                         *steps += 1;
@@ -1081,138 +989,78 @@ fn final_simple_command(src: &str, steps: &mut usize) -> Option<FinalCommand> {
                     i += 1;
                     *steps += 1;
                 }
-                uncertain |= i >= n; // unterminated
+                if i >= n {
+                    return None;
+                }
                 i += 1;
             }
-            '$' if i + 1 < n && (cs[i + 1] == '(' || cs[i + 1] == '{') => {
-                // `$(…)` / `$((…))` / `${…}` stay inside the word, nested pairs counted (one pass) —
-                // an arithmetic `$(( a << 2 ))` never arms a heredoc
-                let (open, close) = if cs[i + 1] == '(' { ('(', ')') } else { ('{', '}') };
+            '$' if i + 1 < n && cs[i + 1] == '(' => return None,
+            '$' if i + 1 < n && cs[i + 1] == '{' => {
                 in_word = true;
-                word.push('$');
-                word.push(open);
+                word.push_str("${");
                 i += 2;
                 let mut depth = 1usize;
                 while i < n && depth > 0 {
                     let d = cs[i];
-                    if d == open {
+                    if d == '`' || (d == '$' && i + 1 < n && cs[i + 1] == '(') {
+                        return None;
+                    }
+                    if d == '{' {
                         depth += 1;
-                    } else if d == close {
+                    } else if d == '}' {
                         depth -= 1;
                     }
                     word.push(d);
                     i += 1;
                     *steps += 1;
                 }
-                uncertain |= depth > 0; // unterminated
-            }
-            '`' => {
-                in_word = true;
-                word.push('`');
-                i += 1;
-                while i < n && cs[i] != '`' {
-                    word.push(cs[i]);
-                    i += 1;
-                    *steps += 1;
+                if depth > 0 {
+                    return None;
                 }
-                uncertain |= i >= n; // unterminated
-                word.push('`');
-                i += 1;
             }
-            ';' => {
-                ew!();
-                end_cmd(&mut cur, &mut done, Term::List);
-                i += 1;
-            }
-            '(' => {
-                ew!();
-                // `((…))` is an arithmetic command and `name (` a function definition — not modelled
-                if (i + 1 < n && cs[i + 1] == '(') || !cur.is_empty() {
-                    uncertain = true;
+            '&' if i + 1 < n && cs[i + 1] == '>' => {
+                // `&>` / `&>>`: both streams — to `/dev/null` only
+                end_word!();
+                if to_devnull {
+                    return None; // the previous redirection never got its target
                 }
-                end_cmd(&mut cur, &mut done, Term::List);
-                i += 1;
-            }
-            ')' => {
-                ew!();
-                end_cmd(&mut cur, &mut done, Term::Close);
-                i += 1;
-            }
-            '&' => {
-                if i + 1 < n && cs[i + 1] == '&' {
-                    ew!();
-                    end_cmd(&mut cur, &mut done, Term::And);
-                    i += 2;
-                } else if i + 1 < n && cs[i + 1] == '>' {
-                    ew!(); // `&>` / `&>>`: a redirection of both streams
-                    i += 2;
-                    if i < n && cs[i] == '>' {
-                        i += 1;
-                    }
-                    skip_word = true;
-                } else {
-                    ew!();
-                    end_cmd(&mut cur, &mut done, Term::Background);
+                i += 2;
+                if i < n && cs[i] == '>' {
                     i += 1;
                 }
+                to_devnull = true;
             }
-            '|' => {
-                ew!();
-                if i + 1 < n && cs[i + 1] == '|' {
-                    end_cmd(&mut cur, &mut done, Term::Or);
-                    i += 2;
-                } else {
-                    end_cmd(&mut cur, &mut done, Term::Pipe);
-                    i += if i + 1 < n && cs[i + 1] == '&' { 2 } else { 1 };
-                }
-            }
-            '<' | '>' => {
-                // an fd number right before it (`2>`) is part of the redirection, not a word
+            '`' | ';' | '&' | '|' | '(' | ')' | '<' => return None,
+            '>' => {
+                // an fd number right before it (`2>`) belongs to the redirection
                 if in_word && !word.is_empty() && word.chars().all(|d| d.is_ascii_digit()) {
                     word.clear();
                     in_word = false;
                 }
-                ew!();
-                if i + 1 < n && cs[i + 1] == '(' {
-                    // process substitution: a word of its own, dropped
-                    i += 2;
-                    let mut depth = 1usize;
-                    while i < n && depth > 0 {
-                        if cs[i] == '(' {
-                            depth += 1;
-                        } else if cs[i] == ')' {
-                            depth -= 1;
-                        }
-                        i += 1;
-                        *steps += 1;
-                    }
-                    uncertain |= depth > 0; // unterminated
-                } else if c == '<' && i + 2 < n && cs[i + 1] == '<' && cs[i + 2] == '<' {
-                    i += 3; // here-string: the next word is data
-                    skip_word = true;
-                } else if c == '<' && i + 1 < n && cs[i + 1] == '<' {
-                    i += 2;
-                    let strip = i < n && cs[i] == '-';
-                    if strip {
-                        i += 1;
-                    }
-                    want_delim = Some(strip);
-                } else {
+                end_word!();
+                if to_devnull {
+                    return None; // the previous redirection never got its target (`> 2>…`)
+                }
+                i += 1;
+                if i < n && cs[i] == '(' {
+                    return None; // `>(…)`
+                }
+                if i < n && (cs[i] == '>' || cs[i] == '|') {
                     i += 1;
-                    while i < n && matches!(cs[i], '>' | '<' | '|') {
+                }
+                if i < n && cs[i] == '&' {
+                    // a descriptor copy: `>&2`, `2>&1` (digits only — `>&-` and `>&file` are not)
+                    i += 1;
+                    let start = i;
+                    while i < n && cs[i].is_ascii_digit() {
                         i += 1;
                         *steps += 1;
                     }
-                    if i < n && cs[i] == '&' {
-                        // `>&2`, `2>&1`, `<&-`: the fd is part of the operator
-                        i += 1;
-                        while i < n && (cs[i].is_ascii_digit() || cs[i] == '-') {
-                            i += 1;
-                            *steps += 1;
-                        }
-                    } else {
-                        skip_word = true;
+                    if i == start {
+                        return None;
                     }
+                } else {
+                    to_devnull = true;
                 }
             }
             _ => {
@@ -1222,30 +1070,13 @@ fn final_simple_command(src: &str, steps: &mut usize) -> Option<FinalCommand> {
             }
         }
     }
-    ew!();
-    end_cmd(&mut cur, &mut done, Term::List);
-    // a heredoc announced but never given a body (no newline after it) swallows nothing it can show
-    if uncertain || want_delim.is_some() || !heredocs.is_empty() {
-        return None;
-    }
-    let (words, term) = done.pop()?;
-    if matches!(term, Term::Pipe | Term::Background) {
-        return None;
-    }
-    // BP1 (a): through `&&`, every command that gates this one must be unable to be the failure
-    let mut after_cd = false;
-    if done.last().is_some_and(|(_, t)| *t == Term::And) {
-        for (w, t) in done.iter().rev() {
-            if !matches!(t, Term::And | Term::Or | Term::Pipe | Term::Close) {
-                break;
-            }
-            if !is_safe_left(w) {
-                return None;
-            }
-            after_cd |= is_cd_command(w);
+    if in_word {
+        if to_devnull {
+            return (word == "/dev/null" && !words.is_empty()).then_some(words);
         }
+        words.push(word);
     }
-    Some(FinalCommand { words, after_cd })
+    (!to_devnull && !words.is_empty()).then_some(words)
 }
 
 /// The next word as a subcommand (`None` for a flag or nothing).
@@ -1295,10 +1126,13 @@ fn interpreter_operand(prog: &str, words: &[String], mut k: usize) -> Option<usi
                 k += 1;
             }
         } else if is_node {
-            if matches!(w.as_str(), "-e" | "--eval" | "-p" | "--print") {
-                return None;
+            if matches!(
+                w.as_str(),
+                "-e" | "--eval" | "-p" | "--print" | "-r" | "--require" | "--import" | "--loader" | "--experimental-loader"
+            ) {
+                return None; // inline code or a preloaded module (RULINGS BS1: flags that take no code)
             }
-            if matches!(w.as_str(), "-r" | "--require" | "--import" | "--loader" | "--experimental-loader" | "-C" | "--conditions") {
+            if matches!(w.as_str(), "-C" | "--conditions") {
                 k += 1;
             }
         } else {
@@ -1320,11 +1154,12 @@ fn interpreter_operand(prog: &str, words: &[String], mut k: usize) -> Option<usi
     None
 }
 
-/// The identity of a shell call (RULINGS BF1): the pack hook / script of THIS lane that the call RAN —
-/// the program of its final simple command (after `NAME=value` assignments and `exec` / `command` /
-/// `nohup` / `time` / `env`), or the script operand of `python` / `python3` / `py` / `sh` / `bash` /
-/// `zsh` / `node` / `pwsh` there; `cys-dept` run through PATH is the pack's `bin/cys-dept`. Linear in
-/// the command's length (RULINGS BF5).
+/// The identity of a shell call (RULINGS BF1, BS1): given ONLY when the call's whole text is ONE simple
+/// command — optional `NAME=value` assignments (the value holding no `${`; `$(` and backticks are
+/// refused anywhere), optionally ONE interpreter (`python*` / `py` / `sh` / `bash` / `zsh` / `node` /
+/// `pwsh`, with flags that take no code), then a hook / script of THIS lane's pack and its arguments
+/// (`cys-dept` run through PATH is the pack's `bin/cys-dept`). Every compound call is a stated miss
+/// (`cd dir && <script>` included — DEFERRED #76). Linear in the command's length (RULINGS BF5).
 pub fn pack_call(tool_input: &Value, roots: &PackRoots) -> PackCall {
     pack_call_counted(tool_input, roots).0
 }
@@ -1336,58 +1171,28 @@ pub fn pack_call_counted(tool_input: &Value, roots: &PackRoots) -> (PackCall, us
         return (PackCall::None, steps);
     };
     let cmd = cut_at_char_boundary(&cmd, COMMAND_SCAN_MAX_BYTES);
-    let Some(FinalCommand { words, after_cd }) = final_simple_command(cmd, &mut steps) else {
+    let Some(words) = single_simple_command(cmd, &mut steps) else {
         return (PackCall::None, steps);
     };
     let mut k = 0;
-    while words.get(k).is_some_and(|w| is_env_assignment(w)) {
-        k += 1;
-    }
-    loop {
-        match words.get(k).map(String::as_str) {
-            Some("exec" | "nohup") => k += 1,
-            Some("command") => {
-                k += 1;
-                while let Some(w) = words.get(k).filter(|w| w.starts_with('-')) {
-                    if w == "-v" || w == "-V" {
-                        return (PackCall::None, steps); // a lookup, not a run
-                    }
-                    k += 1;
-                }
-            }
-            Some("time") => {
-                k += 1;
-                while words.get(k).is_some_and(|w| w.starts_with('-')) {
-                    k += 1;
-                }
-            }
-            Some("env") => {
-                k += 1;
-                while let Some(w) = words.get(k) {
-                    if w == "-u" || w == "--unset" {
-                        k += 2;
-                    } else if w.starts_with('-') || is_env_assignment(w) {
-                        k += 1;
-                    } else {
-                        break;
-                    }
-                }
-            }
-            _ => break,
+    while let Some(w) = words.get(k).filter(|w| is_env_assignment(w)) {
+        if w.contains("${") {
+            return (PackCall::None, steps); // an assignment that expands (RULINGS BS1)
         }
+        k += 1;
     }
     let Some(prog) = words.get(k) else {
         return (PackCall::None, steps);
     };
     if let Some(rel) = roots.rel_of(prog, &mut steps) {
-        return (PackCall::One { rel, sub: sub_at(&words, k + 1), after_cd }, steps);
+        return (PackCall::One { rel, sub: sub_at(&words, k + 1) }, steps);
     }
     if prog == "cys-dept" || prog.ends_with("/.local/bin/cys-dept") {
-        return (PackCall::One { rel: "bin/cys-dept".into(), sub: sub_at(&words, k + 1), after_cd }, steps);
+        return (PackCall::One { rel: "bin/cys-dept".into(), sub: sub_at(&words, k + 1) }, steps);
     }
     if let Some(op) = interpreter_operand(prog, &words, k + 1) {
         if let Some(rel) = roots.rel_of(&words[op], &mut steps) {
-            return (PackCall::One { rel, sub: sub_at(&words, op + 1), after_cd }, steps);
+            return (PackCall::One { rel, sub: sub_at(&words, op + 1) }, steps);
         }
     }
     (PackCall::None, steps)
@@ -1432,19 +1237,14 @@ pub fn classify(o: &ToolObservation<'_>, roots: &PackRoots, windows: bool) -> Cl
     if (!failure && !call) || o.tool_name != "Bash" {
         return Classified::Ignored { failure };
     }
-    let (rel, sub, after_cd) = match pack_call(o.tool_input, roots) {
+    let (rel, sub) = match pack_call(o.tool_input, roots) {
         PackCall::None => return Classified::Ignored { failure },
-        PackCall::One { rel, sub, after_cd } => (rel, sub, after_cd),
+        PackCall::One { rel, sub } => (rel, sub),
     };
     if call {
         return Classified::Call { rel };
     }
     let raw = o.error.map(bounded_error).filter(|e| !e.trim().is_empty());
-    // RULINGS BP1 (a): `cd <dir> && <script>` — the shell's `cd` diagnostic means the `cd` failed and
-    // the script never started: not the script's failure
-    if after_cd && raw.as_deref().is_some_and(shows_cd_diagnostic) {
-        return Classified::Ignored { failure: true };
-    }
     if let Some(reason) = detector_excluded(&rel, sub.as_deref(), raw.as_deref().unwrap_or(""), windows) {
         return Classified::Excluded { reason };
     }
@@ -2411,12 +2211,7 @@ mod defect_intake_tests {
     }
 
     fn one(rel: &str, sub: Option<&str>) -> PackCall {
-        PackCall::One { rel: rel.into(), sub: sub.map(str::to_string), after_cd: false }
-    }
-
-    /// Reached through `cd <dir> &&` (RULINGS BP1 (a)).
-    fn one_cd(rel: &str, sub: Option<&str>) -> PackCall {
-        PackCall::One { rel: rel.into(), sub: sub.map(str::to_string), after_cd: true }
+        PackCall::One { rel: rel.into(), sub: sub.map(str::to_string) }
     }
 
     /// The base lane of the tests (the same fictional spelling `production_roots` gives under test).
@@ -2468,28 +2263,40 @@ mod defect_intake_tests {
         out
     }
 
-    /// RULINGS BF1 — positives: the identity is the program the call RAN (its final simple command's
-    /// program, or an interpreter's script operand there), spelled with any of THIS lane's pack roots.
+    /// RULINGS BF1 / BS1 — positives: the identity is the pack script of THIS lane that a call made of
+    /// ONE simple command ran — bare, or through one interpreter, with assignments in front, with an
+    /// output redirection to `/dev/null` or a descriptor copy — spelled with any of the lane's pack roots.
     #[test]
     fn identity_is_the_executed_program() {
         let pc = |c: &str| pack_call(&bash(c), &base());
+        // bare script
+        assert_eq!(pc("~/.cys/pack/bin/cys-dept status"), one("bin/cys-dept", Some("status")));
+        assert_eq!(pc("$CYS_PACK_DIR/bin/javis_x.py status"), one("bin/javis_x.py", Some("status")));
+        assert_eq!(pc("cys-dept create team-x"), one("bin/cys-dept", Some("create")));
+        // interpreter + script
         assert_eq!(pc("python3 ~/.cys/pack/bin/javis_x.py check --json"), one("bin/javis_x.py", Some("check")));
         assert_eq!(pc(r#"python3 "$HOME/.cys/pack/bin/javis_x.py""#), one("bin/javis_x.py", None));
         assert_eq!(pc("python3 ${HOME}/.cys/pack/bin/javis_x.py run"), one("bin/javis_x.py", Some("run")));
         assert_eq!(pc("python3 /Users/x/.cys/pack/bin/javis_x.py run"), one("bin/javis_x.py", Some("run")));
-        assert_eq!(pc("$CYS_PACK_DIR/bin/javis_x.py status"), one("bin/javis_x.py", Some("status")));
         assert_eq!(pc(r#"sh "${CYS_PACK_DIR}/hooks/guard.sh""#), one("hooks/guard.sh", None));
         assert_eq!(pc(r#"python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_x.py" check"#), one("bin/javis_x.py", Some("check")));
         assert_eq!(pc("python3 ${CYS_PACK_DIR:-${HOME}/.cys/pack}/bin/javis_x.py"), one("bin/javis_x.py", None));
-        assert_eq!(pc("cd /tmp && FOO=1 python3 -u -X importtime ~/.cys/pack/bin/javis_x.py run 2>&1"), one_cd("bin/javis_x.py", Some("run")));
-        assert_eq!(pc("python3 ~/.cys/pack/bin/javis_x.py run > out.txt 2>/dev/null"), one("bin/javis_x.py", Some("run")));
-        assert_eq!(pc("python3 ~/.cys/pack/bin/javis_x.py <<'EOF'\ninput line\nEOF\n"), one("bin/javis_x.py", None));
-        assert_eq!(pc("env -i A=1 nohup bash -e ~/.cys/pack/hooks/sub/x.sh go"), one("hooks/sub/x.sh", Some("go")));
-        assert_eq!(pc("node --require ./r.js ~/.cys/pack/bin/x.mjs"), one("bin/x.mjs", None));
-        assert_eq!(pc("(cd x && python3 ~/.cys/pack/bin/javis_x.py run)"), one_cd("bin/javis_x.py", Some("run")));
-        assert_eq!(pc("~/.cys/pack/bin/cys-dept status"), one("bin/cys-dept", Some("status")));
-        assert_eq!(pc("cys-dept create team-x"), one("bin/cys-dept", Some("create")));
-        assert_eq!(pc("ls;\n# list first\ncys-dept list   # then this"), one("bin/cys-dept", Some("list")));
+        assert_eq!(pc("python3 -u -B -X importtime ~/.cys/pack/bin/javis_x.py run"), one("bin/javis_x.py", Some("run")));
+        assert_eq!(pc("bash -e ~/.cys/pack/hooks/sub/x.sh go"), one("hooks/sub/x.sh", Some("go")));
+        assert_eq!(pc("node ~/.cys/pack/bin/x.mjs"), one("bin/x.mjs", None));
+        assert_eq!(pc("python3 ~/.cys/pack/bin/javis_x.py 'a $(b) `c`; d'"), one("bin/javis_x.py", Some("a $(b) `c`; d")), "single quotes are literal");
+        // assignments + script
+        assert_eq!(pc("FOO=1 BAR=x python3 ~/.cys/pack/bin/javis_x.py run"), one("bin/javis_x.py", Some("run")));
+        assert_eq!(pc("A=1 ~/.cys/pack/bin/cys-dept list"), one("bin/cys-dept", Some("list")));
+        // redirections to /dev/null or a descriptor copy
+        assert_eq!(pc("python3 ~/.cys/pack/bin/javis_x.py run 2>&1"), one("bin/javis_x.py", Some("run")));
+        assert_eq!(pc("python3 ~/.cys/pack/bin/javis_x.py run >/dev/null"), one("bin/javis_x.py", Some("run")));
+        assert_eq!(pc("python3 ~/.cys/pack/bin/javis_x.py run > /dev/null 2>&1"), one("bin/javis_x.py", Some("run")));
+        assert_eq!(pc("python3 ~/.cys/pack/bin/javis_x.py run 2>/dev/null >&2"), one("bin/javis_x.py", Some("run")));
+        assert_eq!(pc("python3 ~/.cys/pack/bin/javis_x.py run &>/dev/null"), one("bin/javis_x.py", Some("run")));
+        // a trailing newline or comment is not a second command
+        assert_eq!(pc("python3 ~/.cys/pack/bin/javis_x.py run\n"), one("bin/javis_x.py", Some("run")));
+        assert_eq!(pc("cys-dept list   # the teams"), one("bin/cys-dept", Some("list")));
         // Windows: the pack dir with a drive letter, its Git Bash `/c/…` form, `pwsh -File`
         let win = PackRoots::new(Some(r"C:\Users\x\.cys\pack"), Some(r"C:\Users\x"));
         assert_eq!(pack_call(&bash(r#"python "C:\Users\x\.cys\pack\bin\javis_x.py" check"#), &win), one("bin/javis_x.py", Some("check")));
@@ -2561,86 +2368,106 @@ mod defect_intake_tests {
         assert_eq!(classify(&abort, &base(), false), Classified::Ignored { failure: false }, "an abort is not a failure of the script");
     }
 
-    /// RULINGS BP1 — a failure that may belong to ANOTHER command gives no identity: (a) after `&&`
-    /// only a left side of `cd <path>` / assignments / `export` keeps it, and a `cd` diagnostic in the
-    /// text takes it away; (b) an uncertain reading (unterminated quote / `$(` / backtick, a heredoc that
-    /// swallows the rest, an arithmetic `((…))`, a function definition) gives none; (c) `;` and `||` keep it.
+    /// RULINGS BS1 — ONLY a call that is one simple command gets an identity: one negative per control
+    /// operator and construct that can end or replace the call before or after the script, the three
+    /// routes of the second re-check verbatim, and the forms earlier rounds let through (`cd … &&`, `;`,
+    /// `||`) — every one a stated miss. Calls are counted by the same rule as failures.
     #[test]
-    fn and_lists_and_uncertain_readings_give_no_identity() {
+    fn only_one_simple_command_gets_an_identity() {
         let pc = |c: &str| pack_call(&bash(c), &base());
         let x = "python3 ~/.cys/pack/bin/javis_x.py";
-        for c in [
-            format!("false && {x}"),
-            format!("[ -f x ] && {x}"),
-            "python3 ~/.cys/pack/bin/a.py && python3 ~/.cys/pack/bin/b.py".to_string(),
-            format!("python3 ~/.cys/pack/bin/javis_orchestra.py check && {x}"),
-            format!("a || b && {x}"),
-            format!("(false) && {x}"),
-            format!("export PATH=/x:$PATH && false && {x}"),
-            format!("cd /tmp && make && {x}"),
-            format!("(( x << 2 )); {x}"),
-            format!("x=1; (( x > 0 )) && {x}"),
+        let negatives = [
+            format!("true && {x}"),
+            format!("false || {x}"),
+            format!("echo a; {x}"),
+            format!("echo a\n{x}"),
+            format!("echo a | {x}"),
+            format!("echo a |& {x}"),
+            format!("{x} &"),
+            format!("({x})"),
+            format!("{{ {x}; }}"),
+            format!("{x} $(cat .args)"),
+            format!("{x} \"$(date)\""),
+            format!("{x} `date`"),
+            format!("{x} $((1 + 2))"),
+            format!("{x} <(echo a)"),
+            format!("{x} >(cat)"),
+            format!("exit 0; {x}"),
+            format!("return 1 2>/dev/null; {x}"),
+            format!("set -e; {x}"),
+            format!("cd /tmp && {x}"),
+            format!("! {x}"),
+            format!("time {x}"),
+            format!("timeout 5 {x}"),
+            format!("{x} <<EOF\nin\nEOF\n"),
+            format!("{x} <<< data"),
+            format!("{x} < in.txt"),
+            format!("{x} > out.txt"),
+            format!("{x} >> log.txt"),
+            format!("{x} 2> err.txt"),
+            format!("{x} &> out.txt"),
+            format!("{x} >&-"),
+            format!("{x} > /unwritable/file"),
+            format!("{x} > 2>/dev/null"),
+            format!("A=${{HOME}} {x}"),
             format!("{x} 'unterminated"),
-            format!("echo \"open; {x}"),
-            format!("echo $(date; {x}"),
-            format!("echo `date; {x}"),
-            format!("cat <<EOF\nline\n{x}"),
-            format!("{x} <<EOF"),
-            format!("f() {{ {x}; }}; f"),
-        ] {
-            assert_eq!(pc(&c), PackCall::None, "a failure that may be another command's got an identity: {c:?}");
+            format!("{x} ${{X"),
+            format!("{x} \\"),
+            format!("env A=1 {x}"),
+            format!("nohup {x}"),
+            format!("node -r ./pre.js ~/.cys/pack/bin/x.js"),
+            // the second re-check's routes, verbatim
+            format!("cd /nonexistent && {x}"),
+            format!("ID=$(cat .id) && {x}"),
+            format!("cd x || exit 1; {x}"),
+            format!("set -euo pipefail; {x}"),
+            format!("set -o pipefail; a | {x}"),
+        ];
+        for c in &negatives {
+            assert_eq!(pc(c), PackCall::None, "a compound or uncertain call got an identity: {c:?}");
+            assert_eq!(classify(&pre(&bash(c)), &base(), false), Classified::Ignored { failure: false }, "counted as a call: {c:?}");
         }
-        // positives
-        assert_eq!(pc(&format!("VAR=1 {x} run")), one("bin/javis_x.py", Some("run")));
-        assert_eq!(pc(&format!("export A=1 && {x}")), one("bin/javis_x.py", None));
-        assert_eq!(pc(&format!("A=1 B=2 && {x}")), one("bin/javis_x.py", None));
-        assert_eq!(pc(&format!("cd /tmp && cd sub && {x} run")), one_cd("bin/javis_x.py", Some("run")));
-        assert_eq!(pc(&format!("false; {x}")), one("bin/javis_x.py", None), "(c) `;` keeps the identity");
-        assert_eq!(pc(&format!("false || {x}")), one("bin/javis_x.py", None), "(c) `||` keeps the identity");
-        assert_eq!(pc(&format!("n=$(( 1 << 2 )); {x}")), one("bin/javis_x.py", None), "arithmetic inside $(( )) arms no heredoc");
-        assert_eq!(pc(&format!("{x} <<EOF\nin\nEOF\n")), one("bin/javis_x.py", None));
-        // (a) the `cd` diagnostic: the cd failed, the script never started
-        let cd_bad = bash(&format!("cd /nonexistent && {x}"));
-        for diag in [
-            "Exit code 1\n/usr/bin/bash: line 1: cd: /nonexistent: No such file or directory",
-            "Exit code 1\nsh: 1: cd: can't cd to /nonexistent",
-            "Exit code 1\ncd: no such file or directory: /nonexistent",
-        ] {
-            assert_eq!(classify(&fail(&cd_bad, Some(diag)), &base(), false), Classified::Ignored { failure: true }, "{diag:?}");
-            assert!(shows_cd_diagnostic(diag));
-        }
-        // … while the script failing INSIDE after a good cd is the script's
-        let cd_ok = bash(&format!("cd /tmp && {x} run"));
-        let inside = "Exit code 1\nTraceback (most recent call last):\n  File \"/Users/x/.cys/pack/bin/javis_x.py\", line 4\nKeyError: 'k'";
-        assert!(!shows_cd_diagnostic(inside));
-        assert!(matches!(classify(&fail(&cd_ok, Some(inside)), &base(), false), Classified::Failure { .. }));
-        assert_eq!(classify(&pre(&cd_ok), &base(), false), Classified::Call { rel: "bin/javis_x.py".into() }, "calls are counted by the same rule");
-        assert_eq!(classify(&pre(&bash(&format!("[ -f x ] && {x}"))), &base(), false), Classified::Ignored { failure: false });
+        assert_eq!(negatives.len(), 44);
+        // zsh's wording of the failed `cd` (Claude Code on macOS runs commands through zsh `eval`)
+        let zsh = bash(&format!("cd /nonexistent && {x}"));
+        assert_eq!(
+            classify(&fail(&zsh, Some("Exit code 1\n(eval):cd:1: no such file or directory: /nonexistent")), &base(), false),
+            Classified::Ignored { failure: true }
+        );
     }
 
-    /// RULINGS BP1 at the daemon: `[ -f x ] && <pack>` and `cd /nonexistent && <pack>` (with the shell's
-    /// `cd` diagnostic) failing five times file NO row; the script failing inside after a good `cd` does.
+    /// RULINGS BS1 at the daemon: the second re-check's routes failing five times each file NO row and
+    /// count no call (a `cd … && <script>` failing INSIDE the script is a stated miss too); the same
+    /// script run as one simple command and failing five times files its row.
     #[test]
-    fn a_left_side_that_failed_files_nothing_against_the_script() {
-        let daemon = crate::team_gate_tests::tmp_daemon("t3b-and", false);
-        let root = tmp_root("and");
-        let gated = bash("[ -f /x/flag ] && python3 ~/.cys/pack/bin/javis_x.py run");
-        let cd_bad = bash("cd /nonexistent && python3 ~/.cys/pack/bin/javis_x.py run");
-        for _ in 0..5 {
-            observe_tool_event(&daemon, &pre(&gated));
-            observe_tool_event(&daemon, &fail(&gated, Some("Exit code 1")));
-            observe_tool_event(&daemon, &pre(&cd_bad));
-            observe_tool_event(&daemon, &fail(&cd_bad, Some("Exit code 1\n/usr/bin/bash: line 1: cd: /nonexistent: No such file or directory")));
+    fn compound_calls_file_nothing_a_single_call_does() {
+        let daemon = crate::team_gate_tests::tmp_daemon("t3b-bs1", false);
+        let root = tmp_root("bs1");
+        let routes = [
+            ("cd /nonexistent && python3 ~/.cys/pack/bin/javis_x.py run", "Exit code 1\n(eval):cd:1: no such file or directory: /nonexistent"),
+            ("ID=$(cat .id) && python3 ~/.cys/pack/bin/javis_x.py run", "Exit code 1\ncat: .id: No such file or directory"),
+            ("cd x || exit 1; python3 ~/.cys/pack/bin/javis_x.py run", "Exit code 1\n(eval):cd:1: no such file or directory: x"),
+            ("set -euo pipefail; python3 ~/.cys/pack/bin/javis_x.py run", "Exit code 1\nKeyError: 'k'"),
+            ("set -o pipefail; a | python3 ~/.cys/pack/bin/javis_x.py run", "Exit code 127\n(eval):1: command not found: a"),
+            ("cd /tmp && python3 ~/.cys/pack/bin/javis_x.py run", "Exit code 1\nKeyError: 'k'"),
+        ];
+        for (cmd, err) in routes {
+            let input = bash(cmd);
+            for _ in 0..5 {
+                observe_tool_event(&daemon, &pre(&input));
+                observe_tool_event(&daemon, &fail(&input, Some(err)));
+            }
         }
         let rep = flush_defect_intake(&daemon, &root, &AlertConfig::default(), crate::alert_route::Now::at(10.0));
         assert_eq!(rep.due, 0, "{rep:?}");
-        assert!(!root.join("intake").exists(), "a failing left side was filed against a healthy script");
+        assert!(!root.join("intake").exists(), "a compound call was filed against the script");
         let snap = defect_intake_snapshot(&daemon, 10.0);
-        assert_eq!((snap["failures"].as_u64(), snap["failures_without_identity"].as_u64()), (Some(0), Some(10)), "{snap}");
-        // the same script failing inside, after a good cd → a row
-        let cd_ok = bash("cd /tmp && python3 ~/.cys/pack/bin/javis_x.py run");
+        assert_eq!((snap["calls"].as_u64(), snap["failures"].as_u64(), snap["failures_without_identity"].as_u64()), (Some(0), Some(0), Some(30)), "{snap}");
+        // the same script as ONE simple command → its row
+        let single = bash("python3 ~/.cys/pack/bin/javis_x.py run 2>&1");
         for _ in 0..5 {
-            observe_tool_event(&daemon, &fail(&cd_ok, Some("Exit code 1\nKeyError: 'k'")));
+            observe_tool_event(&daemon, &pre(&single));
+            observe_tool_event(&daemon, &fail(&single, Some("Exit code 1\nKeyError: 'k'")));
         }
         let rep = flush_defect_intake(&daemon, &root, &AlertConfig::default(), crate::alert_route::Now::at(20.0));
         assert_eq!((rep.due, rep.written_new), (1, 1), "{rep:?}");
@@ -2725,7 +2552,7 @@ mod defect_intake_tests {
             "pub fn classify(",
             "pub fn record(",
             "pub fn pack_call_counted(",
-            "fn final_simple_command(",
+            "fn single_simple_command(",
             "fn interpreter_operand(",
             "pub fn detector_excluded(",
             "fn is_failure(",
