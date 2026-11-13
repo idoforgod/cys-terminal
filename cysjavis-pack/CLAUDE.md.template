@@ -58,7 +58,7 @@ cys send --queued --to worker "[라벨] ..."      # 대상이 조용할 때 자�
 #   in-band 로 구별되지 않는다(2026-08-01 사고 기제). 1차 방어는 데몬의 배달 원장이고
 #   라벨은 원장이 없을 때의 2차 방어다 — 둘 다 있어야 심층 방어가 성립한다.
 cys status --json                               # 전 노드 1콜 스냅샷 (주기적 능동 점검·폴링 대체)
-python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_report.py"   # 진행% 결정론 산출 (5분 주기 주인님 보고)
+python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_report.py"   # 진행% 결정론 산출 (5분 주기 오너 보고)
 python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_route.py" --request "<요청>"  # 3단 사고 라우팅 (slow>deliberate>fast)
 python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_memory.py" add --type <t> --name <slug> --desc "..." --body "..."  # 장기기억 증류 (원자적·색인 동기 — MEMORY.md 손편집 금지)
 nlm login                                       # NotebookLM SOT 인증 (사람 단계 — 설치·MCP 등록은 preflight --fix가 자동, C20)

@@ -16,11 +16,11 @@ cat > "$DOC" <<'MD'
 MD
 SHA=$(python3 -c "import hashlib;print(hashlib.sha256(open('$DOC',encoding='utf-8').read().encode()).hexdigest())")
 # catalog에 future-research 등록(good=기존key) — exploit의 shadow-ops는 미등록(fabricated)
-echo '{"version":1,"accounts":{"cysinsight":"x","owner":"y"},"departments":{"future-research":{"display":"미래연구부","account":"cysinsight"}}}' > "$CYS_DEPT_CATALOG"
+echo '{"version":1,"accounts":{"acct-a":"x","owner":"y"},"departments":{"future-research":{"display":"미래연구부","account":"acct-a"}}}' > "$CYS_DEPT_CATALOG"
 cat > "$T/m.json" <<JSON
 {"manifest_version":1,"kind":"org-manifest","reconcile_mode":"additive",
  "source":{"design_doc":"$DOC","design_doc_sha256":"$SHA"},
- "departments":[{"key":"future-research","display":"미래연구부","account":"cysinsight",
+ "departments":[{"key":"future-research","display":"미래연구부","account":"acct-a",
    "cwd":"$T/Desktop/CYSjavis/미래연구부","mission_md":"# 미션","source_quote":"미래연구부는 모든 통찰의 원천 엔진으로 가동한다 충분히 길게."}],
  "tasks":[{"dept":"future-research","to":"worker","task":"환경스캐닝","scope":"_round/",
    "source_quote":"첫 작업: 미래연구부는 종교·교회의 미래 환경 스캐닝을 수행한다 충분히 길게."}]}

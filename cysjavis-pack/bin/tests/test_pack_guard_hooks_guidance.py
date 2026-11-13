@@ -2,7 +2,9 @@
 """F10-B (0.14.50): pack-guard.sh carries the guidance sentence for an edit under hooks/ - and only there.
 
 Pins (lane A's Rust test pins the const + CLI output; this file pins the hook side, per INTERFACE-F10-laneA.md section 2):
-  1. the three literal strings are in pack-guard.sh: `~/.cys/local/hooks/<이벤트>.d/`, `cys pack-merge --file`, `--propose`
+  1. the three literal strings are in pack-guard.sh: `~/.cys/local/hooks/<이벤트>.d/`, `cys repair begin --files`, `cys repair record`
+     (0.15.0 M2, design v0.5 §2-1/§4-2: the old third route "make a proposal patch for the product" pointed the fix away
+     from this Jarvis; the guidance now names the repair ledger and must not carry the old route — asserted below)
   2. the hook, run for an edit of a hooks/ file of a system-owned pack file, prints the sentence with `<rel>` = that path
   3. an edit outside hooks/ does not get the sentence (no spread of the text)
   4. the sentence in the hook is the SAME words as the const HOOKS_LOCAL_GUIDANCE in src/pack.rs (one origin; only <rel> differs)
@@ -23,7 +25,16 @@ ROOT = os.path.dirname(PACK)
 HOOK = os.path.join(PACK, "hooks", "pack-guard.sh")
 PACK_RS = os.path.join(ROOT, "src", "pack.rs")
 BASH = shutil.which("bash") or "/bin/bash"
-LITERALS = ("~/.cys/local/hooks/<이벤트>.d/", "cys pack-merge --file", "--propose")
+LITERALS = ("~/.cys/local/hooks/<이벤트>.d/", "cys repair begin --files", "cys repair record")
+# RULINGS AH1: the taught call is the one the daemon accepts (--trigger is required, AD10), begin comes BEFORE
+# the edit, and a boot-critical / protection-related hook goes through the working copy + submit.
+CALL_LITERALS = ("--trigger <계기>(owner-order · grant · update 중 하나)", "고치기 전에", "repairs/R-<n>/staging/",
+                 "리뷰어1의 검증과 리뷰어2의 감사 서명을 받은 뒤 cys repair submit")
+# RULINGS AM2: a line an agent can run verbatim carries no shell pipe — `a|b|c` run as is pipes the command and
+# records a false `owner-order` origin (AD10). AM1: the general message ③ says worker / begin BEFORE / working copy.
+GENERAL_3 = ("「스스로 해결」 수리는 워커가 한다 — 고치기 전에 cys repair begin 으로 시작하고", "cys repair submit 으로 최종 승인")
+# the old route, split so this file itself carries no such phrase (shipped-string sweep A-1-05)
+OLD_ROUTE = ("--pro" + "pose", "제안" + " 패치", "pack-merge --file hooks/guard.sh --pro" + "pose")
 
 
 def rust_const():
@@ -65,6 +76,8 @@ class PackGuardHooksGuidance(unittest.TestCase):
             src = f.read()
         for lit in LITERALS:
             self.assertIn(lit, src, "pack-guard.sh must carry %r" % lit)
+        for old in OLD_ROUTE[:2]:
+            self.assertNotIn(old, src, "pack-guard.sh still carries the old proposal route %r" % old)
 
     def test_2_edit_under_hooks_prints_the_sentence_with_the_path(self):
         r = run_hook("hooks/guard.sh")
@@ -72,13 +85,21 @@ class PackGuardHooksGuidance(unittest.TestCase):
         ctx = context_of(r)
         for lit in LITERALS:
             self.assertIn(lit, ctx, "hook output lacks %r: %r" % (lit, ctx[:400]))
-        self.assertIn("cys pack-merge --file hooks/guard.sh --propose", ctx)
+        self.assertIn("cys repair begin --files hooks/guard.sh --trigger <계기>(owner-order · grant · update 중 하나)", ctx)
+        self.assertNotIn("owner-order|", ctx, "a filled-in runnable line must not carry shell pipe alternatives (AM2)")
+        for lit in CALL_LITERALS:
+            self.assertIn(lit, ctx, "hook output lacks %r" % lit)
+        for old in OLD_ROUTE:
+            self.assertNotIn(old, ctx, "the hook still sends the fix away: %r" % old)
 
     def test_3_edit_outside_hooks_does_not_get_the_sentence(self):
         r = run_hook("bin/javis_x.py")
         self.assertEqual(r.returncode, 0)
         ctx = context_of(r)
         self.assertIn("pack-guard", ctx, "control: the ordinary warning still prints")
+        for lit in GENERAL_3:
+            self.assertIn(lit, ctx, "general message ③ lacks %r (RULINGS AM1)" % lit)
+        self.assertNotIn("begin·record", ctx)
         self.assertNotIn("~/.cys/local/hooks/<이벤트>.d/", ctx)
         self.assertNotIn("hooks/ 아래 vendor 파일의 수정은", ctx)
 
@@ -89,6 +110,13 @@ class PackGuardHooksGuidance(unittest.TestCase):
         ctx = context_of(r)
         self.assertIn(const.replace("<rel>", "hooks/guard.sh"), ctx,
                       "the hook's sentence differs from the one origin in src/pack.rs")
+        for old in OLD_ROUTE[:2]:
+            self.assertNotIn(old, const, "HOOKS_LOCAL_GUIDANCE still carries the old proposal route %r" % old)
+        for lit in CALL_LITERALS:
+            self.assertIn(lit, const, "HOOKS_LOCAL_GUIDANCE lacks %r (RULINGS AH1, AM2, AM3)" % lit)
+        self.assertNotIn("|", const, "no shell pipe character in the printed guidance (RULINGS AM2)")
+        self.assertLess(const.index("cys repair begin"), const.index("cys repair record"),
+                        "begin must be taught before record (begin stores the pre-image)")
 
     def test_5_non_system_file_is_silent_and_exit_zero(self):
         r = run_hook("hooks/mine.sh", own="custom")

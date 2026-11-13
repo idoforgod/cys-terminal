@@ -1590,5 +1590,47 @@ class Wp6TriageRsiProjectScope(unittest.TestCase):
                          "나간 적 없는 추천을 B 의 ledger 에 backfill 했다: %r" % recs)
 
 
+class CompeteDefaultWorkRoot(unittest.TestCase):
+    """javis_compete 기본 작업 루트(0.15.0 M2 · 시험 계획 관찰 'javis_compete.py 71행' · TESTPLAN_RULINGS Part 2).
+    이 파일에 둔 이유: javis_compete 의 R0 기록 배선을 이미 다루고 CI 세 단계에 등록돼 있다.
+    CYS_ROOT 가 없으면 지금 작업 폴더(어느 사용자 PC 에도 실재) — 한 PC 에만 있는 경로를 기본값으로 쓰지 않는다."""
+
+    def _root(self, cwd, env):
+        code = ("import sys; sys.path.insert(0, %r); import javis_compete as c; print(c._cys_root())" % BIN)
+        r = subprocess.run([PY, "-c", code], cwd=cwd, env=env, capture_output=True, text=True,
+                           encoding="utf-8", timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr[-400:])
+        return r.stdout.strip()
+
+    def test_default_is_cwd_and_cys_root_wins(self):
+        tmp = tempfile.mkdtemp(prefix="cmp-root-")
+        try:
+            home = os.path.join(tmp, "home")
+            work = os.path.join(tmp, "work")
+            os.makedirs(home)
+            os.makedirs(work)
+            env = {k: v for k, v in os.environ.items() if k != "CYS_ROOT"}
+            env["HOME"] = home                       # 이 HOME 에는 Desktop 이 없다
+            got = self._root(work, env)
+            self.assertEqual(os.path.realpath(got), os.path.realpath(work))
+            self.assertTrue(os.path.isdir(got))
+            self.assertNotIn("Desktop" + os.sep + "CYSjavis", got)
+            env["CYS_ROOT"] = os.path.join(tmp, "explicit")
+            self.assertEqual(self._root(work, env), os.path.join(tmp, "explicit"))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_compete_self_test_still_passes(self):
+        tmp = tempfile.mkdtemp(prefix="cmp-st-")
+        try:
+            env = {k: v for k, v in os.environ.items() if k != "CYS_ROOT"}
+            env["HOME"] = tmp
+            r = subprocess.run([PY, os.path.join(BIN, "javis_compete.py"), "--self-test"], cwd=tmp, env=env,
+                               capture_output=True, text=True, encoding="utf-8", timeout=120)
+            self.assertEqual(r.returncode, 0, (r.stdout + r.stderr)[-600:])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -132,7 +132,9 @@ CONTENT_PINS = {
         # 헌장 제7조·제11조 — 컨텍스트·영속
         ("60%", "컨텍스트 임계 명문화(제7조)"),
         ("MASTER_TODO.md", "master 자신의 todo 영속(제11조·계약 §8-1)"),
-        ("Phase 종료 시 주인님께 1줄 push", "Phase 보고 의무(계약 §9-2) — 구 문안 대체"),
+        # ★0.15.0 M2(호칭 중립화): 핀은 호칭을 담지 않는 꼬리 — 옛 문안(호칭이 든 "…께 1줄 push만** 한다(계약 §9-2)")과
+        #   새 문안("오너에게 1줄 push만** 한다(계약 §9-2)") 양쪽에 실존한다(병합 전 기존 설치의 C03 무소음).
+        ("1줄 push만** 한다(계약 §9-2)", "Phase 보고 의무(계약 §9-2) — 매 Phase 종료 시 오너에게 1줄"),
         ("품질 게이트를 무르게 하지 않는다", "자율화=전환 주체만·게이트 엄격성 불변(제5조)"),
     ],
     "WORKER_DIRECTIVE.md": [
@@ -211,7 +213,9 @@ CONTENT_PINS = {
         ("steelman antithesis", "ACCEPT 전 최강 반론 1개 구성 의무"),
         ("대상 커밋 해시", "리비전 바인딩 — 대상이 바뀌면 검증이 무효(계약 §6-6·§6-7)"),
         ("잠근 합격 기준의 미달 항목 0", "라운드 종료 기준 — 구 리터럴 대체"),
-        ("REVIEWER_TODO.md", "리뷰어 todo 영속(리뷰어 헌장 제8조)"),
+        # ★0.15.0 M2(T10 리뷰어 게이트와 같은 이름): 리뷰어 todo 는 `cys todo-path` 이름 규칙(역할 대문자·`-`→`_`·
+        #   `_TODO.md`)이다 — 고정 이름 핀을 그 규칙의 예시로 바꿨다(옛 문안·새 문안 양쪽에 실존 → 기존 설치 C03 무소음).
+        ("REVIEWER_GEMINI_TODO.md", "리뷰어 todo 영속 — `cys todo-path` 이름 규칙(리뷰어 헌장 제8조)"),
     ],
     # ── CEO_TEMPLATE.md — 라이브 CEO 템플릿 파일 자체의 내용 핀(스펙 v4 §D2 · cid 는
     #    :파일명 첫 토큰 규칙으로 C03.pin.ceo 자연 파생). 승격 '표지' 술어(MARKER_PINS)와
@@ -242,7 +246,7 @@ MARKER_PINS = ("master of master", "단일소유 강제", "exit 7")
 # _c03_cause_line 의 원인 분류가 이 문안을 대체한다 · R1 시나리오10 오진 차단).
 _C03_RESTORE_GUIDE = ("★복원 절차(운영계약 §9-7-6·§11-13): "
                       "①먼저 백업한다 `cp <파일> <파일>.bak-$(date +%Y%m%dT%H%M%S)` "
-                      "②주인님께 보고하고 지시에 따라 복구한다. 팩 템플릿 강제 복원은 "
+                      "②오너에게 보고하고 지시에 따라 복구한다. 팩 템플릿 강제 복원은 "
                       "사용자 수정을 무백업으로 덮어쓰는 비가역 조작이라 절대 금지다.")
 
 ROLES = ["master", "worker", "cso", "reviewer"]
@@ -776,14 +780,11 @@ FOREIGN_AGENT_OS = {
     },
 }
 
-# 핀은 '오너 호칭' 규정 라인의 존재다 — 구체 호칭("주인님" 기본값)은 오너가 자유로이
-# 바꿀 수 있어야 하므로 특정 단어를 핀으로 삼지 않는다(오너 주권과 결정론의 양립).
+# '오너 호칭' 규정 라인 표지 — ★0.15.0 M2(설계 v0.5 §4-2): **관측 전용**이다. 종전에는 이 표지가 없으면
+# --fix 가 특정 호칭 줄을 soul.md 에 되써넣었다 — 중립화된 배포 틀에서는 그 되써넣기가 모든 사용자 설치에
+# 벤더 개인 호칭을 되살리고, 규칙 문서를 주인 지시 없이 쓰는 셈이었다. 표지와 되써넣기를 같은 커밋에서
+# 함께 거뒀다: 점검 도구는 soul.md 를 호칭 때문에 쓰지 않는다(호칭이 없으면 마스터 헌장 제1조 기본값 "오너").
 SOUL_MARKER = "오너 호칭"
-SOUL_PLACEHOLDER = "(이름/호칭을 적어라)"
-SOUL_APPEND = (
-    "\n## 호칭 (절대지침 — preflight 자동 보강)\n\n"
-    '- **오너 호칭: master는 오너를 "주인님"으로 호칭한다** (오너가 다른 호칭을 원하면 이 줄을 수정하라)\n'
-)
 
 # 자율주행 위임권(앵커6) — soul이 권한을 부여해야 MASTER §14가 발효된다(이 절이 없으면
 # master는 자율주행하지 않는다). 오너가 회수·축소하려면 soul의 이 절을 수정·삭제한다.
@@ -1520,15 +1521,17 @@ class Preflight:
 
     def _c03_cause_line(self, f, live_b):
         """FAIL 원인 분류 1줄(R1 시나리오10 — 오진 처방 차단): live==.pristine/directives/<f>
-        등가면 벤더 동기 문제(사용자 과실 아님 — '사용자 소실 복원 절차' 처방은 오진)라 전용
-        문안을 반환하고, 부등/판정 불능이면 None(호출부가 현행 복원 절차 문안 유지).
+        등가면 이 팩이 싣고 온 디렉티브가 핀 기준보다 오래된 경우(사용자 편집이 원인이 아니다 — '사용자
+        소실 복원 절차' 처방은 오진)라 전용 문안을 반환하고, 부등/판정 불능이면 None(호출부가 현행 복원
+        절차 문안 유지). ★0.15.0 M2: 문안은 수리를 남에게 넘기지 않는다 — 신본(.new) 채택 명령을 싣고,
+        규칙 문서이므로 오너 지시로 한다고 적는다(설계 v0.5 §2-1 · §4-2).
         .pristine 미러는 pack.rs:1324 커스터마이즈 절충 원장이 실존을 보장한다."""
         pristine_b = self._c03_read_bytes(
             os.path.join(pack_dir(), ".pristine", "directives", f))
         if live_b is None or pristine_b is None or live_b != pristine_b:
             return None
-        line = ("원인 분류: 무수정 배포본(live==.pristine) — 핀 기준 선행"
-                "(벤더 동기 필요·사용자 과실 아님)")
+        line = ("원인 분류: 무수정 배포본(live==.pristine) — 이 팩의 핀 기준이 디렉티브보다 앞서 있다"
+                "(사용자 편집이 원인이 아니다). 규칙 문서이므로 오너에게 1줄로 알리고 오너 지시로 신본을 받는다")
         if os.path.isfile(os.path.join(pack_dir(), "directives", f + ".new")):
             line += (" · .new 병치 — `cys pack-merge --file directives/%s --take-new`"
                      "(무수정본 한정)" % f)
@@ -1856,23 +1859,13 @@ class Preflight:
                 self.add(cid, FAIL, "soul.md 없음")
                 return
         text = open(p, encoding="utf-8", errors="replace").read()
-        # 2개 정책 마커: ①오너 호칭 ②자율주행 위임권(앵커6 — soul이 권한을 부여해야
-        # MASTER §14 발효). 둘 다 --fix로 기본 골격을 보강할 수 있다(내용은 오너 주권).
-        fixed = []
+        # 2개 정책 표지: ①오너 호칭 ②자율주행 위임권(앵커6 — soul이 권한을 부여해야 MASTER §14 발효).
+        # ★둘 다 **관측만** 한다 — soul.md 는 규칙 문서이고 오너 주권이라 이 점검은 어느 쪽 때문에도 쓰지 않는다
+        # (0.15.0 M2: 호칭 되써넣기 철거 · 자율주행 절은 종전부터 자동 재주입 금지 — 부록 A 1절 35번).
+        honorific_note = ""
         if SOUL_MARKER not in text:
-            if not self.fix:
-                self.add(cid, FAIL,
-                         "soul.md에 '오너 호칭' 규정 부재 — --fix로 기본값(주인님) 보강 가능")
-                return
-            if SOUL_PLACEHOLDER in text:
-                text = text.replace(
-                    SOUL_PLACEHOLDER,
-                    '(이름을 적어라)\n- **오너 호칭: master는 오너를 "주인님"으로 호칭한다** (수정 가능)',
-                    1,
-                )
-            else:
-                text += SOUL_APPEND
-            fixed.append("호칭 규정(기본 주인님)")
+            honorific_note = (" · '오너 호칭' 규정 없음 — master 는 마스터 헌장 제1조 기본값(\"오너\")으로 부른다"
+                              "(점검 도구는 soul.md 를 쓰지 않는다 · 호칭을 정하려면 오너가 직접 적는다)")
         # 자율주행 절은 '권한 부여 조항'이라 --fix가 자동 재주입하지 않는다(적대 검증 6차
         # H-2: 오너가 권한 회수 의사로 절을 삭제하면 다음 부트의 의무 --fix가 권한을 자동
         # 복원해 "절 부재=자율주행 안 함" 상태가 도달 불가능해진다 — 부여 주체는 오너뿐).
@@ -1882,11 +1875,11 @@ class Preflight:
             autopilot_note = (" · 자율주행 위임권 절 부재 — 자율주행 비활성(MASTER §14 미발효). "
                               "부여하려면 오너가 soul.md에 절을 직접 추가하라"
                               "(표준 문안: 이 스크립트의 SOUL_AUTOPILOT_TEMPLATE)")
-        if fixed:
-            open(p, "w", encoding="utf-8").write(text)
-            self.add(cid, FIXED, "soul.md 보강: %s%s" % (", ".join(fixed), autopilot_note))
-        elif autopilot_note:
-            self.add(cid, WARN, "호칭 규정 존재%s" % autopilot_note)
+        if autopilot_note:
+            self.add(cid, WARN, "%s%s%s" % ("호칭 규정 존재" if not honorific_note else "soul.md 관측",
+                                         honorific_note, autopilot_note))
+        elif honorific_note:
+            self.add(cid, PASS, "자율주행 위임권 절 존재%s" % honorific_note)
         else:
             self.add(cid, PASS, "호칭 규정 + 자율주행 위임권 절 존재 (내용은 오너 주권)")
 
@@ -3743,7 +3736,7 @@ class Preflight:
                      "work 스킬 결함: %s — `cys init-pack` 또는 --fix"
                      "(파일이 존재하되 깨진/약화된 경우 init-pack은 보존한다 — "
                      "강제 복원 플래그는 사용자 수정을 전량 vendor 본으로 되돌리는 광범위 조작이라(<rel>.user 백업은 남는다) "
-                     "쓰지 않는다. 백업 선행 + 주인님 보고 후 복구 · 운영계약 §11-13)"
+                     "쓰지 않는다. 백업 선행 + 오너 보고 후 복구 · 운영계약 §11-13)"
                      % "; ".join(problems))
         elif repaired:
             self.add(cid, FIXED, "init-pack 수리 완료: %s" % "; ".join(repaired))
@@ -3919,7 +3912,7 @@ class Preflight:
         lost = [pin for pin in AUTOPILOT_MEMORY_PINS if pin not in ftext]
         if lost:
             self.add(cid, FAIL, "자율주행 메모리 본문 핀 소실: %s — ★복원 절차"
-                     "(운영계약 §9-7-6·§11-13): ①먼저 백업 ②주인님께 보고 후 지시에 따라 복구. "
+                     "(운영계약 §9-7-6·§11-13): ①먼저 백업 ②오너에게 보고한 뒤 지시에 따라 복구. "
                      "팩 템플릿 강제 복원은 무백업 소실을 낳는 비가역 조작이라 절대 금지다."
                      % "·".join(lost))
             return

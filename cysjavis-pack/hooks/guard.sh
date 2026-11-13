@@ -261,7 +261,7 @@ CYS_KILL_SUBS = {"close-surface", "kill"}
 CYS_VAL_OPTS = {"--socket"}
 # deny 사유 공통 꼬리(주인님 가이드 문구 고정)
 CYS_KILL_DENY_TAIL = ("오살 금지 — exited=true(죽은 잔재)만 회수 가능. 강제는 승인 경유"
-                      "(주인님 승인 · `cys approval` 서명 prefix).")
+                      "(오너 승인 · `cys approval` 서명 prefix).")
 # PAUSED 전용 사유(전면 금지 · 해제 경로 안내로 자기잠금 방지)
 CYS_KILL_PAUSED_DENY = ("AUTOPILOT_PAUSED: cys %s 전면 금지 — pause 중 허용 상한은 "
                         "관측·저장·보고·자기 프로세스 종료 넷뿐이고, **살아있는 타 노드 종료·재기동은 "
@@ -307,10 +307,10 @@ CYS_RUN_GATED_TOKENS = CYS_OWNER_ONLY_SUBS | CYS_PACK_MUTATING_SUBS | CYS_KILL_S
 CYS_RUN_DENY = ("[우회 차단] cys run 의 내부 명령에 게이팅 대상 서브커맨드(%s)가 있다 — "
                 "run 으로 감싸도 같은 규칙이 적용된다. 직접 실행 경로의 안내를 따르라.")
 CYS_OWNER_ONLY_DENY = ("[완전 초기화 불가침] cys %s 금지 — 전 데몬 종료 + 팩(guard.sh 포함)·부서·"
-                       "대화기억·훅 전량 격리는 에이전트가 실행할 명령이 아니다. 주인님이 직접 "
+                       "대화기억·훅 전량 격리는 에이전트가 실행할 명령이 아니다. 오너가 직접 "
                        "GUI '완전 초기화' 버튼 또는 **에이전트 pane 밖 터미널**에서 실행한다.")
 CYS_PACK_DENY = ("[부트스트랩 불가침] cys %s 금지 — 팩 자기변경(guard.sh 를 포함한 팩 전체 재설치·"
-                 "복원)은 자율주행이 자기 안전장치를 갈아끼우는 경로다. 승인 경유로만 — 주인님 직접 "
+                 "복원)은 자율주행이 자기 안전장치를 갈아끼우는 경로다. 승인 경유로만 — 오너 직접 "
                  "실행 또는 AUTOPILOT_ACTIVE 해제 후(평시 LOOSE 는 허용).")
 
 # ★R-03 PAUSED 상한 화이트리스트 (2026-08-01 F2): `cys` 가 PAUSED readonly 집합에 **통째로** 등재된
@@ -347,7 +347,7 @@ CYS_PAUSED_OK = {"status", "list", "read-screen", "identify", "ps", "todo-path",
 #   attest·drain 은 하위·플래그가 전부 조회·저장이라 분리 불필요(위 근거 주석 참조).
 CYS_PAUSED_SUBSUB_OK = {"queue": {"list"}}
 CYS_PAUSED_SUB_DENY = ("AUTOPILOT_PAUSED: cys %s 금지 — pause 중 허용 상한은 **관측·저장·보고·"
-                       "자기 프로세스 종료** 넷뿐이다(cys 허용: %s). 해제는 주인님 명시 지시로만 — "
+                       "자기 프로세스 종료** 넷뿐이다(cys 허용: %s). 해제는 오너 명시 지시로만 — "
                        "①`cys resume` ②AUTOPILOT_PAUSED 파일 2곳 제거"
                        "($PACK/AUTOPILOT_PAUSED · <프로젝트루트>/_round/AUTOPILOT_PAUSED)")
 
@@ -890,26 +890,26 @@ def loose_deny(n, n_slash=""):
                     return CYS_RUN_DENY % ", ".join(sorted(set(hit)))
         if prog == "git":
             sub, subargs = l_git_sub(args)
-            if sub == "push": return "git push (외부발행=비가역). 주인님 승인 필요"
+            if sub == "push": return "git push (외부발행=비가역). 오너 승인 필요"
             if sub == "remote" and any(x in subargs for x in ("set-url", "add", "remove", "rm", "rename")):
-                return "git remote set-url/add/remove/rename (발행대상 변경). 주인님 승인 필요"
+                return "git remote set-url/add/remove/rename (발행대상 변경). 오너 승인 필요"
             if sub == "tag":
                 create = any(x in subargs for x in ("-a", "-s", "-d", "-f", "-m")) or any(not x.startswith("-") for x in subargs)
                 if create and not any(x in subargs for x in ("-l", "--list", "-n")):
-                    return "git tag 생성/삭제. 주인님 승인 필요"
+                    return "git tag 생성/삭제. 오너 승인 필요"
         if prog == "gh":
             if "release" in args and any(x in args for x in ("create", "upload", "delete", "edit")):
-                return "gh release 발행. 주인님 승인 필요"
+                return "gh release 발행. 오너 승인 필요"
             if "pr" in args and any(x in args for x in ("create", "merge")):
-                return "gh pr create/merge. 주인님 승인 필요"
+                return "gh pr create/merge. 오너 승인 필요"
         if prog in ("rm", "rmdir", "mv", "truncate", "chmod", "chown"):
             if not l_fileop_allowed(args):
-                return "%s (비가역 파일연산). _round/autopilot/ 외 → 주인님 승인 필요" % prog
+                return "%s (비가역 파일연산). _round/autopilot/ 외 → 오너 승인 필요" % prog
         if prog == "scp":
-            return "scp (외부전송). 주인님 승인 필요"
+            return "scp (외부전송). 오너 승인 필요"
         if prog == "rsync":
             if any(("@" in a) or re.match(r"^[^/\-][^/]*:", a) or "::" in a for a in args):
-                return "rsync 원격전송. 주인님 승인 필요"
+                return "rsync 원격전송. 오너 승인 필요"
         if prog in ("curl", "wget"):
             up = False
             if prog == "curl":
@@ -922,7 +922,7 @@ def loose_deny(n, n_slash=""):
             else:
                 up = any(a.startswith("--post-data") or a.startswith("--post-file") or a.startswith("--method=post") for a in (x.lower() for x in args))
             if up:
-                return "%s 업로드/POST (외부전송). 주인님 승인 필요" % prog
+                return "%s 업로드/POST (외부전송). 오너 승인 필요" % prog
     # G18: 두 정규화 변형(백슬래시 삭제형 + 슬래시 변환형)의 토큰을 합쳐 보호파일을 스캔한다.
     alltoks = n.split() + (n_slash.split() if n_slash else [])
     if any(protected(t) for t in alltoks):
@@ -932,7 +932,7 @@ def loose_deny(n, n_slash=""):
             p, a = l_cmd_word(s); seg_progs.add(p)
             if p == "sed" and any(x == "-i" or x.startswith("-i") for x in a): sed_inplace = True
         if (">" in alltoks) or (seg_progs & writers) or sed_inplace:
-            return "헌법파일 쓰기/덮어쓰기 차단(soul·CLAUDE·*_DIRECTIVE). 변경 불가"
+            return "헌법파일 쓰기/덮어쓰기 차단(soul·CLAUDE·*_DIRECTIVE) — 규칙 문서는 오너 지시로만 고친다"
     return None
 
 # ================= 메인 =================
@@ -941,8 +941,8 @@ def out_deny(reason):
 
 if PAUSED and not PREFLIGHT:
     if tool in WRITE_TOOLS:
-        out_deny("AUTOPILOT_PAUSED (주인님 kill-switch · 호칭 정의처=마스터 헌장 제1조): "
-                 "쓰기 도구 차단. 해제는 주인님 명시 지시로만 — ①`cys resume` "
+        out_deny("AUTOPILOT_PAUSED (오너 kill-switch · 호칭 정의처=마스터 헌장 제1조): "
+                 "쓰기 도구 차단. 해제는 오너 명시 지시로만 — ①`cys resume` "
                  "②AUTOPILOT_PAUSED 파일 2곳 제거($PACK/AUTOPILOT_PAUSED · "
                  "<프로젝트루트>/_round/AUTOPILOT_PAUSED)")
     if tool == "Bash":
@@ -973,7 +973,7 @@ if PAUSED and not PREFLIGHT:
         is_control = bool(re.match(r"\s*cys\s+(resume|pause|gate-check)\b", nl))
         has_redirect = (">" in ntok) or (">>" in ntok) or any(w.startswith(">") for w in ntok)
         if not is_control and (has_redirect or first not in readonly):
-            out_deny("AUTOPILOT_PAUSED: 비읽기 Bash 차단(%s). 해제는 주인님 명시 지시로만 — "
+            out_deny("AUTOPILOT_PAUSED: 비읽기 Bash 차단(%s). 해제는 오너 명시 지시로만 — "
                      "①`cys resume` ②AUTOPILOT_PAUSED 파일 2곳 제거"
                      "($PACK/AUTOPILOT_PAUSED · <프로젝트루트>/_round/AUTOPILOT_PAUSED)"
                      % (first or "?"))
@@ -1008,9 +1008,9 @@ if tool in WRITE_TOOLS and file_path:
         #   ★autopilot(ACTIVE) 중엔 CONST_AUTH=0 강제(bash)=자율주행 자기인가·실수 차단 · TTL30분 · master 편집 직후 토큰 제거(단일배치).
         _scope_toks = (CONST_SCOPE.splitlines()[0].lower().split() if CONST_SCOPE.strip() else [])  # ★스코프=첫 줄 토큰만(주석의 * 오인 차단)·정확매칭
         if CONST_AUTH and (("*" in _scope_toks) or (basename(file_path).lower() in _scope_toks)):
-            sys.stderr.write("AUTOPILOT GUARD: 헌법편집 인가됨(주인님 직접명령 토큰·%s)\n" % basename(file_path))
+            sys.stderr.write("AUTOPILOT GUARD: 헌법편집 인가됨(오너 직접명령 토큰·%s)\n" % basename(file_path))
         else:
-            out_deny("헌법파일(%s) %s 차단. 변경 불가 (주인님 직접명령 인가토큰 CONSTITUTION_EDIT_AUTHORIZED 필요)" % (basename(file_path), tool))
+            out_deny("헌법파일(%s) %s 차단 — 규칙 문서는 오너 지시로만 고친다(오너 직접명령 인가토큰 CONSTITUTION_EDIT_AUTHORIZED 필요)" % (basename(file_path), tool))
     if ACTIVE and guard_infra(file_path):   # 잔여3: STRICT trust boundary
         out_deny("[STRICT] guard 인프라(%s) %s 차단(자기보호 trust boundary)" % (basename(file_path), tool))
 
@@ -1039,13 +1039,13 @@ run_loose_backstop() {
   low="$(printf '%s' "$cmd" | tr 'A-Z' 'a-z' | tr -s ' \t' ' ')"
   case "$low" in
     *"git push"*|*"git remote set-url"*|*"git remote remove"*|*"gh release create"*|*"gh pr create"*|*"scp "*)
-      emit_deny "백스톱: 비가역 명령. 주인님 승인 필요" ;;
+      emit_deny "백스톱: 비가역 명령. 오너 승인 필요" ;;
   esac
   if printf '%s' "$low" | grep -Eq '(^| )rm +-[a-z]*[rf]|(^| )(rmdir|chmod|chown|truncate) '; then
-    case "$low" in *"_round/autopilot/"*) : ;; *) emit_deny "백스톱: 파괴적 파일연산. 주인님 승인 필요" ;; esac
+    case "$low" in *"_round/autopilot/"*) : ;; *) emit_deny "백스톱: 파괴적 파일연산. 오너 승인 필요" ;; esac
   fi
   case "$(basename "$fp" 2>/dev/null | tr 'A-Z' 'a-z')" in
-    soul.md|claude.md|*_directive.md) emit_deny "백스톱: 헌법파일 쓰기. 변경 불가" ;;
+    soul.md|claude.md|*_directive.md) emit_deny "백스톱: 헌법파일 쓰기 차단 — 규칙 문서는 오너 지시로만 고친다" ;;
   esac
   exit 0
 }

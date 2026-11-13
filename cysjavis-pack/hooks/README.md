@@ -159,9 +159,14 @@ command -v cys_lane_redirect >/dev/null 2>&1 && cys_lane_redirect "$@"
 - `hooks/` 순회가 상한(깊이 8 · 항목 4096) 또는 열 수 없는 폴더에 막혀 끝까지 못 갔으면 "순회 불완전" 을 밝히고 WARN 이다 —
   깨끗하다는 뜻이 아니다.
 
-수정을 **오래 두려면** 팩 파일을 고치지 말고 `~/.cys/local/hooks/<이벤트>.d/` 에 자기 훅 파일을 둔다(§1 의 사용자 오버레이 —
-업데이트·치유 불가침). 제품에 반영할 개선이면 `cys pack-merge --file <rel> --propose` 로 제안 패치를 만든다. `pack-guard.sh` 는
-`hooks/` 아래 파일을 고칠 때 이 안내를 한 문장으로 낸다(문장의 단일 출처는 `src/pack.rs` 의 `HOOKS_LOCAL_GUIDANCE` — 훅 쪽
+팩 파일을 고친 수정은 제자리에 보존된다. 「스스로 해결」 수리라면 워커가 고치기 **전에**
+`cys repair begin --files <rel> --trigger <계기>`(`<계기>` 는 `owner-order` · `grant` · `update` 중 하나) 로 시작해 원본을 보관한 뒤
+고치고 `cys repair record` 로
+수리 장부에 남긴다(업데이트 뒤 다시 입히기·되돌리기·감사의 근거). 기동 필수·보호장치 관련 훅은 살아 있는 파일이 아니라
+`begin` 이 알려 주는 작업 사본 `repairs/R-<n>/staging/` 에서 고치고, 리뷰어1의 검증과 리뷰어2의 감사 서명을 받은 뒤
+`cys repair submit` 으로 수정 최종 승인을 받는다. 따로 두고 싶은 자기 훅은
+`~/.cys/local/hooks/<이벤트>.d/` 에 둔다(§1 의 사용자 오버레이 — 업데이트·치유 불가침). `pack-guard.sh` 는
+`hooks/` 아래 파일을 고칠 때 이 안내를 낸다(문장의 단일 출처는 `src/pack.rs` 의 `HOOKS_LOCAL_GUIDANCE` — 훅 쪽
 문구가 달라지면 `bin/tests/test_pack_guard_hooks_guidance.py` 가 붉어진다).
 
 이 릴리스가 만들지 **않은** 것: `cys pack-drift` 명령 · 내보내기(`--export`) · 앱의 업데이트 알림에 고친 파일 수 표시(백로그 B-072).

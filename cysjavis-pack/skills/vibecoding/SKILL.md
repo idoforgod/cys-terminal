@@ -86,8 +86,7 @@ orchestrate)는 vibecoding 파이프라인 **안에서 호출**된다. 트리거
 
 ## 4. 구현 위임 — 구현자≠검증자 (헌법 3조)
 
-- 구현 노동은 워커(Agent 도구 model=opus, 또는 cys 워커)에게 위임한다. master는 직접 구현하지 않는다
-  (사소한 마무리 제외).
+- 구현 노동은 워커(Agent 도구 model=opus, 또는 cys 워커)에게 위임한다. master는 직접 구현하지 않는다.
 - **검증은 만든 에이전트가 아닌 다른 페인·다른 모델**이 한다(자기채점 금지). 이종모델 검증(agy·codex),
   벤더 장애 시 failover는 §C10.3.
 - 위임 브리프에 Level·필수 문서·완료 기준(통과해야 할 vibecheck 게이트)·"완료 시 master surface로 결과

@@ -2408,7 +2408,7 @@ def _resource_gate_decision(gate_exit, gate_json, live_node_count):
                     "1회 경고 후 진행" % (nodes_hard[0].get("value"), live_node_count, eff))
         if _nodes_only_hard(gate_json):
             return "nodes-only", (
-                "자원 게이트 hard 원인 = nodes %s/%s 하나뿐 — 오너 2026-10-22 지시로 팀 기동 진행"
+                "자원 게이트 hard 원인 = nodes %s/%s 하나뿐 — 노드 수 단독 hard 는 팀 기동을 막지 않는다(부서 수 무제한 규칙) · 팀 기동 진행"
                 "(실자원 축은 그대로 차단 · 되돌리려면 CYS_FORMATION_NODES_HARD=1)"
                 % (nodes_hard[0].get("value"), nodes_hard[0].get("hard")))
         detail = ", ".join("%s=%s" % (t.get("metric"), t.get("value")) for t in hard) or "미상"

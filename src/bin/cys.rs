@@ -686,7 +686,7 @@ enum Command {
         /// 진단 결과를 JSON으로 출력.
         #[arg(long)]
         json: bool,
-        /// 커스터마이즈 실태 리포트 생성(로컬 파일 — 자발 제출용·자동 전송 없음)
+        /// 커스터마이즈 실태 리포트 생성(로컬 파일 · 자동 전송 없음)
         #[arg(long)]
         custom_report: bool,
         /// ★F10: 모든 레인(기본 팩 + pack-dept-*)의 hooks/ 드리프트 표 — 읽기 전용(아무것도 쓰지 않고 데몬에 닿지 않는다 · 종료코드는 항상 0).
@@ -27593,14 +27593,19 @@ fn run_pack_propose(dir: &std::path::Path, rel: &str, kind: &str, embed_now: Opt
     println!("✅ 제안 patch 생성: {}", out.display());
     if !secret_hits.is_empty() {
         println!(
-            "⚠ 비밀/개인정보 의심 {}건 — 제출 전 반드시 검토·마스킹하세요:\n{}",
+            "⚠ 비밀/개인정보 의심 {}건 — 이 파일을 누구와 공유하든 그 전에 반드시 검토·마스킹하세요:\n{}",
             secret_hits.len(),
             secret_hits.join("\n")
         );
     }
-    println!("제출: 위 파일을 지원 채널(홈페이지 문의/저장소 이슈)에 첨부 — 자동 전송은 하지 않습니다.");
+    println!("{PACK_PROPOSE_NOTE}");
     0
 }
+
+/// `run_pack_propose` 의 마지막 안내(0.15.0 M2 · 설계 v0.5 §2-1·§4-2): 수리를 남에게 넘기지 않는다 — 이 자비스의
+/// 수정은 수리 장부가 유지한다. 종전 문장은 지원 창구에 첨부하라고 안내했다(책임 전가 경로).
+const PACK_PROPOSE_NOTE: &str = "이 파일은 내 수정본과 기준본의 차이를 적은 기록입니다(자동 전송 없음). \
+수정의 유지·다시 입히기·되돌리기는 이 자비스의 수리 장부(cys repair)가 맡습니다 — 이 파일을 다른 곳에 보낼 필요는 없습니다.";
 
 /// diff -u 외부 명령으로 unified diff 생성(결정론) — 도구 부재·실행 실패면 None(호출측 폴백).
 fn unified_diff_via_cmd(vendor: &str, mine: &str, rel: &str) -> Option<String> {
@@ -27855,9 +27860,8 @@ fn run_pack_rollback(file: Option<String>, yes: bool, force_vendor: bool, force_
     0
 }
 
-/// ★W-F3(표본 수집 도구): 이 기계의 커스터마이즈 실태를 로컬 리포트로 산출 — 병합 원장·보존본·
-/// 오버레이·자작 파일 통계. 배포 사용자가 "무엇을 만들다 잃는가"의 실분포 표본을 자발 제출할 수
-/// 있게 한다(자동 전송 없음 — 파일 생성+출력까지만. 개인 경로 등은 파일명 수준만 담는다).
+/// ★W-F3: 이 기계의 커스터마이즈 실태를 로컬 리포트로 산출 — 병합 원장·보존본·오버레이·자작 파일 통계.
+/// 자기 점검용이다(자동 전송 없음 — 파일 생성+출력까지만. 개인 경로 등은 파일명 수준만 담는다).
 fn run_doctor_custom_report() -> i32 {
     let dir = cys::pack::pack_dir();
     let local = cys::pack::local_dir();
@@ -27983,8 +27987,71 @@ fn run_doctor_custom_report() -> i32 {
         return 1;
     }
     print!("{md}");
-    println!("\n✅ 저장: {} — 개선에 도움이 됩니다: 지원 채널에 자발 제출(자동 전송 없음)", out.display());
+    println!("\n✅ 저장: {} — {CUSTOM_REPORT_NOTE}", out.display());
     0
+}
+
+/// `run_doctor_custom_report` 의 마지막 안내(0.15.0 M2): 리포트는 자기 점검용이고, 고칠 것은 수리 흐름이 고친다.
+const CUSTOM_REPORT_NOTE: &str =
+    "로컬 파일로만 저장했습니다(자동 전송 없음). 내 커스터마이즈 실태를 점검할 때 쓰고, \
+고칠 것이 보이면 이 자비스의 수리 흐름(cys repair)으로 고칩니다.";
+
+#[cfg(test)]
+mod t1b_repair_texts {
+    //! 0.15.0 M2(트랙 T1b): `run_pack_propose`·`run_doctor_custom_report` 의 마지막 안내가 수리를 밖으로 넘기지 않는다.
+    use super::{CUSTOM_REPORT_NOTE, PACK_PROPOSE_NOTE};
+    /// 시험 계획 A §5 Tier-1 의 책임 전가 계열(창구 안내·밖으로 보내는 패치·만든 쪽 지목)과 종전 문장의 낱말.
+    /// 낱말은 둘로 쪼개 적는다 — 이 시험의 소스 자체가 출하 문자열 전수 검색(A-1-05)에 걸리지 않게.
+    const DEFERRAL: &[[&str; 2]] = &[
+        ["지원", " 채널"],
+        ["홈페이지", " 문의"],
+        ["저장소", " 이슈"],
+        ["자발", " 제출"],
+        ["제", "출"],
+        ["--pro", "pose"],
+        ["제안", " 패치"],
+        ["제작", "자"],
+        ["벤", "더"],
+        ["ven", "dor"],
+        ["업데이트를", " 기다"],
+        ["이슈", "를"],
+    ];
+
+    #[test]
+    fn notes_keep_the_fix_here_and_name_the_repair_ledger() {
+        for note in [PACK_PROPOSE_NOTE, CUSTOM_REPORT_NOTE] {
+            for pair in DEFERRAL {
+                let d = pair.concat();
+                assert!(!note.contains(&d), "안내에 책임 전가 낱말 {d:?}: {note}");
+            }
+            assert!(
+                note.contains("cys repair"),
+                "수리 장부(cys repair)를 가리키지 않는다: {note}"
+            );
+            assert!(
+                note.contains("자동 전송 없음"),
+                "자동 전송 없음 고지가 빠졌다: {note}"
+            );
+        }
+    }
+
+    #[test]
+    fn both_functions_print_the_notes_and_the_old_sentences_are_gone() {
+        let src = include_str!("cys.rs");
+        let body = |name: &str| {
+            let i = src.find(&format!("fn {name}(")).expect("함수");
+            let j = src[i..].find("\n}\n").expect("함수 끝") + i;
+            src[i..j].to_string()
+        };
+        assert!(body("run_pack_propose").contains("println!(\"{PACK_PROPOSE_NOTE}\")"));
+        assert!(body("run_doctor_custom_report").contains("{CUSTOM_REPORT_NOTE}"));
+        let old_a = ["지원", " 채널(홈페이지", " 문의/저장소", " 이슈)에 첨부"].concat();
+        let old_b = ["지원", " 채널에 자발", " 제출"].concat();
+        assert!(
+            !src.contains(&old_a) && !src.contains(&old_b),
+            "종전 안내 문장이 남았다"
+        );
+    }
 }
 
 /// 디렉터리 트리의 파일 수(재귀·읽기 전용) — custom-report 보조.

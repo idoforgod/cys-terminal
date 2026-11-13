@@ -65,10 +65,12 @@ ORCHESTRA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "javis_orch
 
 # ── 경로(grill_gate.py 하우스 스타일 준수 — CYS_ROOT 오버라이드 가능) ──────────
 def _cys_root():
+    """작업 루트: `CYS_ROOT` 가 있으면 그것, 없으면 **지금 작업 폴더**(어느 사용자 PC 에도 실재한다).
+    ★0.15.0 M2(시험 계획 관찰 · TESTPLAN_RULINGS Part 2): 종전 기본값은 한 PC 에만 있는 경로였다."""
     v = os.environ.get("CYS_ROOT", "").strip()
     if v:
         return v
-    return os.path.join(os.path.expanduser("~"), "Desktop", "CYSjavis")
+    return os.getcwd()
 
 
 def _safe(task):
@@ -639,6 +641,14 @@ def self_test():
     def want(name, cond):
         if not cond:
             fails.append(name)
+
+    # ── 기본 작업 루트(0.15.0 M2) — CYS_ROOT 가 없으면 지금 작업 폴더(실재) ──
+    _saved_root = os.environ.pop("CYS_ROOT", None)
+    try:
+        want("기본 루트:CYS_ROOT 부재 → 작업 폴더", _cys_root() == os.getcwd() and os.path.isdir(_cys_root()))
+    finally:
+        if _saved_root is not None:
+            os.environ["CYS_ROOT"] = _saved_root
 
     # ── 다양성 게이트 ──
     ok, _ = check_approaches(["a", "b"], 2)
