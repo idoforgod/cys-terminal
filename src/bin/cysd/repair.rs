@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 /// The daemon sub-verbs of `repair.` (O-C3-1, N-4; `recheck` H5/H8, `grant_ask` Q1,
-/// `owner_token_ask` Q2) — 23.
+/// `owner_token_ask` Q2, `grant_status` CI6 (b)) — 24.
 pub(crate) const REPAIR_SUBVERBS: &[&str] = &[
     "report",
     "begin",
@@ -58,6 +58,7 @@ pub(crate) const REPAIR_SUBVERBS: &[&str] = &[
     "recheck",
     "grant_ask",
     "owner_token_ask",
+    "grant_status",
 ];
 
 /// The sub-verbs whose bodies are track T3's (the rest answer `repair_not_implemented` after the
@@ -81,6 +82,7 @@ pub(crate) const T4_VERBS: &[&str] = &[
     "owner_token",
     "owner_token_ask",
     "rule_doc_allowed",
+    "grant_status",
 ];
 
 /// M4 (★OWNER-REPORT with the other Windows limits): on Windows a seatless command line is not a
@@ -431,6 +433,7 @@ pub(crate) fn handle_with(
         "owner_token" => grant_verbs::owner_token(ctx, caller, params),
         "owner_token_ask" => grant_verbs::owner_token_ask(ctx, caller, params),
         "rule_doc_allowed" => grant_verbs::rule_doc_allowed(ctx, caller, params),
+        "grant_status" => grant_verbs::grant_status(ctx, params),
         "revert" => {
             ledger_verbs::worker_lane_check(ctx, caller, params).and_then(|_| not_implemented(sub))
         }
@@ -3292,21 +3295,43 @@ mod grant_verbs {
             question: r.question.as_ref().map(question_view),
             named_docs: &r.named_docs,
             last_human: r.last_human.as_ref().map(|(d, at)| (d.as_str(), *at)),
+            last_typed: r.last_typed.as_ref().map(|(d, at)| (d.as_str(), *at)),
+            named_numbers: &r.named_numbers,
         }
     }
 
-    /// Consumes the seat's open question if it is still the one judged (same `asked_at`).
-    fn consume_question(ctx: &Ctx<'_>, sid: u64, asked_at: f64) {
+    /// Consumes the seat's open question if it is still the one judged (same `asked_at`); `true` =
+    /// this call consumed it (a concurrent call that consumed it first leaves `false`).
+    fn consume_question(ctx: &Ctx<'_>, sid: u64, asked_at: f64) -> bool {
         let mut map = ctx.prompts.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(r) = map.get_mut(&sid) {
             if r.question.as_ref().is_some_and(|q| q.asked_at == asked_at) {
                 r.question = None;
+                return true;
             }
         }
+        false
     }
 
-    /// Registers ONE open question for the seat (a newer one replaces an older one — Q1).
-    fn register(ctx: &Ctx<'_>, sid: u64, path: Option<String>) -> Value {
+    /// RULINGS CI3: takes the naming of `base` out of the seat's latest Level-2 prompt — only while
+    /// that prompt is still the one judged (`typed` = its digest and time) and still names `base`;
+    /// `true` = this call took it (one naming, one token — a concurrent second call gets `false`).
+    fn take_naming(ctx: &Ctx<'_>, sid: u64, base: &str, typed: (&str, f64)) -> bool {
+        let mut map = ctx.prompts.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(r) = map.get_mut(&sid) else {
+            return false;
+        };
+        if r.last_typed.as_ref().map(|(d, at)| (d.as_str(), *at)) != Some(typed) {
+            return false;
+        }
+        let before = r.named_docs.len();
+        r.named_docs.retain(|n| oo::folded_base(n) != base);
+        r.named_docs.len() != before
+    }
+
+    /// Registers ONE open question for the seat (a newer one replaces an older one — Q1); a grant
+    /// question carries its daily limit (CI4).
+    fn register(ctx: &Ctx<'_>, sid: u64, path: Option<String>, daily_cap: Option<u32>) -> Value {
         let mut map = ctx.prompts.lock().unwrap_or_else(|e| e.into_inner());
         let r = map.entry(sid).or_default();
         let replaced = r.question.is_some();
@@ -3315,6 +3340,7 @@ mod grant_verbs {
             path: path.clone(),
             first_human: None,
             machine_seen: false,
+            daily_cap,
         });
         json!({
             "asked_at": ctx.now,
@@ -3323,6 +3349,34 @@ mod grant_verbs {
             "replaced_open_question": replaced,
         })
     }
+
+    /// The daily limit of the current decision (5 without one — C9; a stored 0 reads as the default).
+    fn current_cap(current: Option<&GrantDecision>) -> u32 {
+        current
+            .map(|d| d.daily_cap)
+            .filter(|c| *c > 0)
+            .unwrap_or(grant::DEFAULT_DAILY_CAP)
+    }
+
+    /// `daily_cap` of a request: absent / null → `None`; an integer 1–100 → `Some`; else refused.
+    fn cap_param(p: &Value) -> Result<Option<u32>, VerbError> {
+        match p.get("daily_cap") {
+            None | Some(Value::Null) => Ok(None),
+            Some(v) => v
+                .as_u64()
+                .filter(|n| (1..=u64::from(grant::MAX_DAILY_CAP)).contains(n))
+                .map(|n| Some(n as u32))
+                .ok_or_else(|| {
+                    VerbError::invalid(format!(
+                        "--daily-cap 은 1~{} 사이의 정수입니다",
+                        grant::MAX_DAILY_CAP
+                    ))
+                }),
+        }
+    }
+
+    /// RULINGS CI4: the limit is set only by `grant ask --daily-cap` (it belongs to the question).
+    const CAP_ON_ASK_ONLY_KO: &str = "하루 상한은 질문에 딸립니다 — `cys repair grant ask --daily-cap N`으로 질문을 등록할 때 정하세요(`grant on`은 주인이 허락한 그 질문의 상한을 쓰고, `grant off`·`grant status`는 상한을 바꾸지 않습니다)";
 
     /// `pack` + an absolute path → the pack-relative path ('/'-separated), also through the
     /// canonical forms of both (a path outside the pack → `None`).
@@ -3370,12 +3424,21 @@ mod grant_verbs {
         Ok(rel)
     }
 
-    /// `cys repair grant ask` (RULINGS Q1): registers the grant question for this master seat; the
-    /// answer is the FIRST owner-typed prompt to this seat after it (T3 records it).
-    pub(crate) fn grant_ask(ctx: &Ctx<'_>, caller: &Caller, _p: &Value) -> Result<Value, VerbError> {
+    /// `cys repair grant ask [--daily-cap N]` (RULINGS Q1, CI4): registers the grant question for
+    /// this master seat with its daily limit — N if given, else the current decision's limit (5
+    /// without one); an N different from that needs the seat's latest Level-2 prompt to hold N as a
+    /// number of its own. The answer is the FIRST Level-2 prompt to this seat after it.
+    pub(crate) fn grant_ask(ctx: &Ctx<'_>, caller: &Caller, p: &Value) -> Result<Value, VerbError> {
         let sid = seat(caller)?;
-        let mut v = register(ctx, sid, None);
+        let requested = cap_param(p)?;
+        let current = current_cap(grant::read_decision_in(&ctx.root).unwrap_or(None).as_ref());
+        let record = record_of(ctx, sid);
+        let view = record.as_ref().map(prompt_view);
+        let cap = oo::judge_daily_cap(view.as_ref(), current, requested)
+            .map_err(|m| VerbError::new(ERR_PRECONDITION, m))?;
+        let mut v = register(ctx, sid, None, Some(cap));
         v["question"] = json!("grant");
+        v["daily_cap"] = json!(cap);
         Ok(v)
     }
 
@@ -3389,33 +3452,23 @@ mod grant_verbs {
         let sid = seat(caller)?;
         let raw = param_str(p, "path").ok_or_else(|| VerbError::invalid("`path` 가 필요합니다"))?;
         let rel = doc_rel(ctx, raw)?;
-        let mut v = register(ctx, sid, Some(rel));
+        let mut v = register(ctx, sid, Some(rel), None);
         v["question"] = json!("owner_token");
         Ok(v)
     }
 
-    /// `cys repair grant on|off [--daily-cap N]` (C9 · RULINGS B1, Q1, T3, T5, U4(b)): written to
+    /// `cys repair grant on|off` (C9 · RULINGS B1, Q1, T3, T5, U4(b), CI4, CI5 (a)): written to
     /// `grant.json` (atomic replace, the latest decision wins) only after the owner-origin check.
+    /// `on` takes the daily limit of the answered question; `off` keeps the current limit; neither
+    /// takes `--daily-cap` (CI4 — refused with the sentence naming `grant ask --daily-cap`).
     pub(crate) fn grant(ctx: &Ctx<'_>, caller: &Caller, p: &Value) -> Result<Value, VerbError> {
         let sid = seat(caller)?;
         let mode = param_str(p, "mode").ok_or_else(|| {
             VerbError::invalid("`mode` 가 필요합니다(on · off — 질문 등록은 `grant ask`)")
         })?;
-        let cap = match p.get("daily_cap") {
-            None | Some(Value::Null) => None,
-            Some(v) => {
-                let n = v
-                    .as_u64()
-                    .filter(|n| (1..=u64::from(grant::MAX_DAILY_CAP)).contains(n))
-                    .ok_or_else(|| {
-                        VerbError::invalid(format!(
-                            "--daily-cap 은 1~{} 사이의 정수입니다",
-                            grant::MAX_DAILY_CAP
-                        ))
-                    })?;
-                Some(n as u32)
-            }
-        };
+        if !matches!(p.get("daily_cap"), None | Some(Value::Null)) {
+            return Err(VerbError::invalid(CAP_ON_ASK_ONLY_KO));
+        }
         let current = grant::read_decision_in(&ctx.root).unwrap_or(None);
         let record = record_of(ctx, sid);
         let asked_at = record
@@ -3430,18 +3483,21 @@ mod grant_verbs {
                 GrantDecision {
                     schema: cys::repair::REPAIR_SCHEMA,
                     state: GrantState::On,
-                    daily_cap: cap
-                        .or(current.as_ref().map(|d| d.daily_cap))
-                        .filter(|c| *c > 0)
-                        .unwrap_or(grant::DEFAULT_DAILY_CAP),
+                    // CI4: the limit of the answered question (registered by `grant ask`)
+                    daily_cap: record
+                        .as_ref()
+                        .and_then(|r| r.question.as_ref())
+                        .and_then(|q| q.daily_cap)
+                        .filter(|c| (1..=grant::MAX_DAILY_CAP).contains(c))
+                        .unwrap_or_else(|| current_cap(current.as_ref())),
                     decided_at: ctx.now,
                     decided_lane: ctx.lane.clone(),
                     decided_seat: sid,
                     prompt_digest: a.digest,
                     prompt_excerpt: a.excerpt,
-                    // the owner's answer is itself an owner input (B4)
-                    paused_at: Some(a.at),
-                    resumed_at: Some(a.at + grant::PAUSE_QUIET_SECS as f64),
+                    // the owner's answer is itself an owner input (B4); CI5 (a): dated from NOW
+                    paused_at: Some(ctx.now),
+                    resumed_at: Some(ctx.now + grant::PAUSE_QUIET_SECS as f64),
                 }
             }
             "off" => {
@@ -3450,11 +3506,7 @@ mod grant_verbs {
                 GrantDecision {
                     schema: cys::repair::REPAIR_SCHEMA,
                     state: GrantState::Off,
-                    daily_cap: current
-                        .as_ref()
-                        .map(|d| d.daily_cap)
-                        .filter(|c| *c > 0)
-                        .unwrap_or(grant::DEFAULT_DAILY_CAP),
+                    daily_cap: current_cap(current.as_ref()), // CI4: `off` never changes the limit
                     decided_at: ctx.now,
                     decided_lane: ctx.lane.clone(),
                     decided_seat: sid,
@@ -3478,7 +3530,7 @@ mod grant_verbs {
                     .and_then(|r| r.question.as_ref())
                     .is_some_and(|q| q.path.is_none())
             {
-                consume_question(ctx, sid, t);
+                let _ = consume_question(ctx, sid, t);
             }
         }
         Ok(json!({
@@ -3535,6 +3587,23 @@ mod grant_verbs {
         let view = record.as_ref().map(prompt_view);
         let (basis, a) = oo::judge_owner_token(view.as_ref(), &rel, ctx.now)
             .map_err(|m| VerbError::new(ERR_PRECONDITION, m))?;
+        // CI3: the basis is TAKEN before the token exists (one naming / one answer → one token, also
+        // for two concurrent requests); a failure after this point costs the basis (fail closed)
+        let taken = match basis {
+            oo::TokenBasis::NamedInPrompt => {
+                take_naming(ctx, sid, &oo::folded_base(&rel), (a.digest.as_str(), a.at))
+            }
+            oo::TokenBasis::AnsweredQuestion => record
+                .as_ref()
+                .and_then(|r| r.question.as_ref())
+                .is_some_and(|q| consume_question(ctx, sid, q.asked_at)),
+        };
+        if !taken {
+            return Err(VerbError::new(
+                ERR_PRECONDITION,
+                format!("이 근거(주인이 문서를 부른 말 또는 질문의 답)는 방금 다른 요청이 먼저 썼습니다 — 표는 근거 하나에 하나입니다. 주인이 다시 {} 를 부르거나 `cys repair owner-token ask --path {rel}` 뒤 허락해야 합니다", oo::folded_base(&rel)),
+            ));
+        }
         let hex = crate::channels::random_token_hex()
             .map_err(|e| VerbError::new("io", format!("난수를 만들 수 없어 표를 만들지 않습니다: {e}")))?;
         let mut bytes = [0u8; 16];
@@ -3559,11 +3628,6 @@ mod grant_verbs {
             used_by_repair: None,
         };
         oo::create_token_in(&ctx.root, &record_t)?;
-        if basis == oo::TokenBasis::AnsweredQuestion {
-            if let Some(t) = record.as_ref().and_then(|r| r.question.as_ref()).map(|q| q.asked_at) {
-                consume_question(ctx, sid, t);
-            }
-        }
         Ok(json!({
             "token": token,
             "path": rel,
@@ -3574,6 +3638,27 @@ mod grant_verbs {
             },
             // O-C10-3: the fixed ticket line (the delegation tool prints it — T7b)
             "ticket_line": format!("주인 지시 표: {token} (규칙 문서 {rel})"),
+        }))
+    }
+
+    /// `cys repair grant status [--json]` (READ · RULINGS CI6 (b)): the grant as readers need it —
+    /// `{state: on|off, paused, paused_until, daily_cap}`. Any caller the READ class admits (any seat
+    /// of the lane), no owner check; writes and sends nothing. `paused` is the B4 clock (the last
+    /// owner input less than 30 minutes old) whatever the state — a reader combines it with `state`
+    /// (CI6 (c): held while ON and PAUSED). A decision file that exists but cannot be read is an
+    /// error (the reader then behaves as when the state cannot be read); no decision = off.
+    pub(crate) fn grant_status(ctx: &Ctx<'_>, p: &Value) -> Result<Value, VerbError> {
+        if !matches!(p.get("daily_cap"), None | Some(Value::Null)) {
+            return Err(VerbError::invalid(CAP_ON_ASK_ONLY_KO));
+        }
+        let d = grant::read_decision_in(&ctx.root)?;
+        let last = grant::last_owner_input_in(&ctx.root, ctx.now);
+        let paused = grant::is_paused_in(&ctx.root, ctx.now);
+        Ok(json!({
+            "state": if grant::is_on(d.as_ref()) { "on" } else { "off" },
+            "paused": paused,
+            "paused_until": if paused { last.map(|t| t + grant::PAUSE_QUIET_SECS as f64) } else { None },
+            "daily_cap": current_cap(d.as_ref()),
         }))
     }
 
@@ -3641,6 +3726,16 @@ pub(crate) fn grant_note_owner_input(daemon: &Daemon) {
     note_owner_input_throttled(&root, &lane, cys::repair::ledger::now_epoch());
 }
 
+/// T4 (RULINGS CH3 (b), CI1) — an operator-verified send into `seat` (`human_verified` in
+/// `handlers.rs`): the pause, for every such send; and the app-typing mark of Level 2, only when the
+/// operator token did not come from a pane (`verified_from` is none).
+pub(crate) fn grant_note_app_typing(daemon: &Daemon, seat: u64, verified_from: Option<u64>) {
+    grant_note_owner_input(daemon);
+    if verified_from.is_none() {
+        mark_app_typing(&daemon.repair_prompt_origin, seat);
+    }
+}
+
 /// The smallest gap between two pause-mark writes of one lane (seconds).
 pub(crate) const PAUSE_MARK_MIN_GAP_SECS: f64 = 5.0;
 
@@ -3649,20 +3744,22 @@ pub(crate) fn note_owner_input_throttled(root: &Path, lane: &LaneKey, now: f64) 
     static LAST: std::sync::OnceLock<Mutex<HashMap<(PathBuf, String), f64>>> =
         std::sync::OnceLock::new();
     let key = (root.to_path_buf(), lane.0.clone());
+    let last = LAST.get_or_init(|| Mutex::new(HashMap::new()));
+    if last
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .is_some_and(|t| (now - t).abs() < PAUSE_MARK_MIN_GAP_SECS)
     {
-        let mut m = LAST
-            .get_or_init(|| Mutex::new(HashMap::new()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if m.get(&key)
-            .is_some_and(|t| (now - t).abs() < PAUSE_MARK_MIN_GAP_SECS)
-        {
-            return;
-        }
-        m.insert(key, now);
+        return;
     }
-    if let Err(e) = cys::repair::grant::note_owner_input_in(root, lane, now) {
-        eprintln!("[cysd] repair grant: owner-input pause not recorded: {e:?}");
+    match cys::repair::grant::note_owner_input_in(root, lane, now) {
+        // CI5 (b): the time is remembered only when a mark was actually written
+        Ok(true) => {
+            last.lock().unwrap_or_else(|e| e.into_inner()).insert(key, now);
+        }
+        Ok(false) => {}
+        Err(e) => eprintln!("[cysd] repair grant: owner-input pause not recorded: {e:?}"),
     }
 }
 
@@ -3706,9 +3803,13 @@ pub(crate) struct ApprovalTable {}
 
 /// The per-seat owner-prompt record (T3 writes, T4 reads). `named_docs` = rule-document base names,
 /// lower-cased, found in the seat's latest owner-typed prompt (RULINGS U4(a)); no prompt text kept.
-/// `digest` / `origin` / `at` describe the seat's LATEST prompt (any origin). `origin` is the STRICT
-/// owner judgment (RULINGS CH2 — `strict_origin`): `human` only for the owner's own typing.
-/// `last_human` = (digest, at) of the latest OWNER-TYPED prompt (RULINGS CH4, T4).
+/// `digest` / `origin` / `at` describe the seat's LATEST prompt (any origin). `origin` is LEVEL 1 of
+/// the owner judgment (RULINGS CH2 / CI1 — `strict_origin`): `human` = "may be the owner".
+/// `last_human` = (digest, at) of the latest Level-1 prompt (CH4). LEVEL 2 (CI1) = Level 1 AND
+/// `app_typed` — the daemon saw operator-verified typing from the app into this seat (not from a
+/// pane) since its previous Level-2 prompt; a Level-2 prompt consumes the mark. `last_typed`,
+/// `named_docs` (U4(a), read from the prompt's free text only) and `named_numbers` (CI4) belong to
+/// the latest Level-2 prompt (T4).
 #[derive(Default, Clone)]
 pub(crate) struct PromptOrigin {
     pub digest: String,
@@ -3717,6 +3818,9 @@ pub(crate) struct PromptOrigin {
     pub question: Option<OpenQuestion>,
     pub named_docs: Vec<String>,
     pub last_human: Option<(String, f64)>,
+    pub app_typed: bool,
+    pub last_typed: Option<(String, f64)>,
+    pub named_numbers: Vec<u32>,
 }
 
 /// An open question of a master seat (RULINGS T3, Q1 / Q2): `first_human` = (digest, excerpt, at).
@@ -3727,6 +3831,8 @@ pub(crate) struct OpenQuestion {
     pub path: Option<String>,
     pub first_human: Option<(String, String, f64)>,
     pub machine_seen: bool,
+    /// RULINGS CI4: the daily limit a grant question carries (`grant ask [--daily-cap N]`).
+    pub daily_cap: Option<u32>,
 }
 
 /// Longest kept excerpt of an owner-typed answer (characters; memory only).
@@ -3757,7 +3863,12 @@ pub(crate) fn record_prompt_origin(
     apply_prompt(entry, &digest, norm, origin.unwrap_or("unknown"), now);
 }
 
-/// Pure part of [`record_prompt_origin`].
+/// Pure part of [`record_prompt_origin`]. RULINGS CI1 (T4): `origin == "human"` is LEVEL 1 ("may be
+/// the owner") and feeds `origin`, `last_human` (and, in `handlers.rs`, the pause); LEVEL 2 = Level 1
+/// AND this seat's app-typing mark (consumed here) and feeds what carries authority — a question's
+/// `first_human`, `named_docs`, `named_numbers`, `last_typed` — read from the prompt's FREE TEXT only
+/// ([`owner_free_text`]). A Level-1-but-not-Level-2 prompt counts for an open question as a
+/// non-owner prompt (`machine_seen`). The digest stays the whole normalised prompt's.
 pub(crate) fn apply_prompt(
     rec: &mut PromptOrigin,
     digest: &str,
@@ -3765,24 +3876,54 @@ pub(crate) fn apply_prompt(
     origin: &str,
     now: f64,
 ) {
-    let human = origin == "human";
+    let level1 = origin == "human";
+    let level2 = level1 && rec.app_typed;
+    if level2 {
+        rec.app_typed = false; // a Level-2 prompt consumes the mark
+    }
     rec.digest = digest.to_string();
     rec.origin = origin.to_string();
     rec.at = now;
-    if human {
-        rec.named_docs = named_rule_docs(norm);
+    if level1 {
         rec.last_human = Some((digest.to_string(), now)); // CH4 (T4)
+    }
+    let free = if level2 { owner_free_text(norm) } else { String::new() };
+    if level2 {
+        rec.named_docs = named_rule_docs(&free);
+        rec.named_numbers = cys::repair::owner_origin::owner_numbers(&free);
+        rec.last_typed = Some((digest.to_string(), now));
     }
     if let Some(q) = rec.question.as_mut() {
         if now > q.asked_at && q.first_human.is_none() {
-            if human {
-                let excerpt: String = norm.chars().take(ANSWER_EXCERPT_CHARS).collect();
+            if level2 {
+                let excerpt: String = free.chars().take(ANSWER_EXCERPT_CHARS).collect();
                 q.first_human = Some((digest.to_string(), excerpt, now));
             } else {
                 q.machine_seen = true;
             }
         }
     }
+}
+
+/// RULINGS CI1 (T4) — what Level 2 reads: the free text outside every tag block and code fence
+/// (`mission_gate::generic_block_free_text`, the structure axis's residual). A masked code fence
+/// stays visible as `▯` (never as letters), so "예 ```x```" is not the answer "예".
+pub(crate) fn owner_free_text(norm: &str) -> String {
+    cys::mission_gate::generic_block_free_text(norm)
+        .0
+        .replace('\0', "▯")
+}
+
+/// RULINGS CI1 (T4) — the app-typing mark: operator-verified typing from the app into `seat` (the
+/// target surface of a `human_verified` send whose operator token did not come from a pane).
+/// Daemon memory only (a restart loses it — fail closed); consumed by the seat's next Level-2 prompt.
+pub(crate) fn mark_app_typing(prompts: &Mutex<HashMap<u64, PromptOrigin>>, seat: u64) {
+    prompts
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(seat)
+        .or_default()
+        .app_typed = true;
 }
 
 /// C10's rule-document base names (as `guard.sh:PROTECTED_NAMES`), lower-cased.
@@ -3912,23 +4053,24 @@ mod tests {
         )
     }
 
-    /// (T3 rewrite of T0's pin — T3 filled 9 verbs; T4 rewrite — T4 filled 5.) Every sub-verb answers
+    /// (T3 rewrite of T0's pin — T3 filled 9 verbs; T4 rewrite — T4 filled 5, and a 6th, the READ
+    /// `grant_status` of RULINGS CI6 (b): 23 → 24 sub-verbs.) Every sub-verb answers
     /// ONE structured reply and never panics, whatever the params, caller and grade; the 9 verbs whose
     /// bodies are other tracks' still answer `repair_not_implemented` to a caller the role table admits
     /// (the app for OWNER-APPROVAL, any caller for READ/TRIGGER) and `acl_denied` otherwise; unknown →
     /// `method_not_found`.
     #[test]
     fn every_subverb_is_not_implemented_and_never_panics() {
-        assert_eq!(REPAIR_SUBVERBS.len(), 23);
+        assert_eq!(REPAIR_SUBVERBS.len(), 24);
         let mut uniq = REPAIR_SUBVERBS.to_vec();
         uniq.sort_unstable();
         uniq.dedup();
-        assert_eq!(uniq.len(), 23, "REPAIR_SUBVERBS has duplicates");
+        assert_eq!(uniq.len(), 24, "REPAIR_SUBVERBS has duplicates");
         assert!(T3_VERBS.iter().all(|v| REPAIR_SUBVERBS.contains(v)));
         assert_eq!(T3_VERBS.len(), 9);
         assert!(T4_VERBS.iter().all(|v| REPAIR_SUBVERBS.contains(v)));
         assert!(T4_VERBS.iter().all(|v| !T3_VERBS.contains(v)));
-        assert_eq!(T4_VERBS.len(), 5);
+        assert_eq!(T4_VERBS.len(), 6);
         let daemon = crate::team_gate_tests::tmp_daemon("repair-t0-subverbs", false);
         let params_set = [
             json!({}),
@@ -4005,8 +4147,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(production_root(&daemon));
     }
 
-    /// J1 census: every daemon sub-verb has exactly one class; the table is exactly the 23 daemon
-    /// verbs + the 5 local verbs; the WORK / OWNER-DECISION / OWNER-APPROVAL sets as C3.
+    /// J1 census: every daemon sub-verb has exactly one class; the table is exactly the 24 daemon
+    /// verbs + the 5 local verbs; the WORK / OWNER-DECISION / OWNER-APPROVAL sets as C3 (READ gains
+    /// `grant_status`, RULINGS CI6 (b)).
     #[test]
     fn verb_class_census() {
         for sub in REPAIR_SUBVERBS {
@@ -4026,9 +4169,9 @@ mod tests {
         expected.sort_unstable();
         assert_eq!(
             table, expected,
-            "VERB_CLASSES must be exactly the 23 daemon verbs + the 5 local verbs"
+            "VERB_CLASSES must be exactly the 24 daemon verbs + the 5 local verbs"
         );
-        assert_eq!(VERB_CLASSES.len(), 28);
+        assert_eq!(VERB_CLASSES.len(), 29);
         let of = |c: VerbClass| -> Vec<&str> {
             let mut v: Vec<&str> = VERB_CLASSES
                 .iter()
@@ -4068,6 +4211,7 @@ mod tests {
                 "list",
                 "status",
                 "rule_doc_allowed",
+                "grant_status",
                 "approval_list",
                 "gate",
                 "rules",

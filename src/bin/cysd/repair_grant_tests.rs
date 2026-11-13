@@ -117,11 +117,21 @@ impl Rig {
     fn call(&self, now: f64, who: &Caller, sub: &str, p: Value) -> Result<Value, VerbError> {
         self.call_with(now, &general, who, sub, p)
     }
-    /// What `hook.machine_origin` records for a prompt to seat `sid` (T3's own pure function).
+    /// What `hook.machine_origin` records for a prompt to seat `sid` (T3's own pure function). With
+    /// `origin = "human"` this is the hook request ALONE — Level 1 (RULINGS CI1), never an answer or
+    /// a naming unless the seat's typing mark was set first ([`Rig::typed`]).
     fn prompt(&self, sid: u64, text: &str, origin: &str, at: f64) {
         let mut m = self.prompts.lock().unwrap();
         let e = m.entry(sid).or_default();
         apply_prompt(e, &cys::mission_gate::digest_normalized(text), text, origin, at);
+    }
+    /// RULINGS CI1 test seam — the owner's own typing (Level 2): the app-typing mark the send path
+    /// sets for the seat (`mark_app_typing`, as `grant_note_app_typing` does for a `human_verified`
+    /// send whose operator token did not come from a pane), then the prompt through the hook path
+    /// with a Level-1 origin.
+    fn typed(&self, sid: u64, text: &str, at: f64) {
+        mark_app_typing(&self.prompts, sid);
+        self.prompt(sid, text, "human", at);
     }
     fn decision(&self) -> Option<GrantDecision> {
         grant::read_decision_in(&self.root).unwrap()
@@ -182,9 +192,9 @@ fn master() -> Caller {
     seat(MASTER, "master")
 }
 
-/// The master gets a token for `rel` the Q2 (a) way: the owner typed "고쳐라 <rel>".
+/// The master gets a token for `rel` the Q2 (a) way: the owner typed "고쳐라 <rel>" (Level 2 — CI1).
 fn token_for(r: &Rig, rel: &str, t: f64) -> String {
-    r.prompt(MASTER, &format!("고쳐라 {rel}"), "human", t);
+    r.typed(MASTER, &format!("고쳐라 {rel}"), t);
     let v = r
         .call(t + 1.0, &master(), "owner_token", json!({"path": rel}))
         .unwrap();
@@ -398,22 +408,27 @@ fn grant_on_needs_the_registered_question_and_an_owner_typed_yes() {
     assert!(on(t + 5.0).is_err());
     // an unrelated owner line → off
     r.call(t + 6.0, &master(), "grant_ask", json!({})).unwrap();
-    r.prompt(MASTER, "오늘 일정 정리해줘", "human", t + 7.0);
-    r.prompt(MASTER, "예", "human", t + 8.0); // not the FIRST answer
+    r.typed(MASTER, "오늘 일정 정리해줘", t + 7.0);
+    r.typed(MASTER, "예", t + 8.0); // not the FIRST answer
     assert!(on(t + 9.0).unwrap_err().message.contains("허락"));
     // an answer typed BEFORE the question is ignored
-    r.prompt(MASTER, "예", "human", t + 10.0);
+    r.typed(MASTER, "예", t + 10.0);
     r.call(t + 11.0, &master(), "grant_ask", json!({})).unwrap();
     assert!(on(t + 12.0).unwrap_err().message.contains("아직 없습니다"));
     // a 31-minute-old question has lapsed
-    r.prompt(MASTER, "예", "human", t + 13.0);
+    r.typed(MASTER, "예", t + 13.0);
     assert!(on(t + 11.0 + 31.0 * 60.0).unwrap_err().message.contains("만료"));
     assert_eq!(r.decision(), None, "no refused call wrote the decision");
-    // the owner's typed "네" → on
-    r.call(t + 2_000.0, &master(), "grant_ask", json!({})).unwrap();
-    r.prompt(MASTER, "네", "human", t + 2_001.0);
+    // the owner's typed "네" → on, with the limit the question carries (CI4: the owner's own words
+    // hold the 3; `grant ask --daily-cap 3` stores it in the question)
+    r.typed(MASTER, "하루 3건까지만 해라", t + 1_999.0);
     let v = r
-        .call(t + 2_002.0, &master(), "grant", json!({"mode": "on", "daily_cap": 3}))
+        .call(t + 2_000.0, &master(), "grant_ask", json!({"daily_cap": 3}))
+        .unwrap();
+    assert_eq!(v["daily_cap"], 3);
+    r.typed(MASTER, "네", t + 2_001.0);
+    let v = r
+        .call(t + 2_002.0, &master(), "grant", json!({"mode": "on"}))
         .unwrap();
     assert_eq!(v["grant"], "on");
     let d = r.decision().unwrap();
@@ -421,15 +436,20 @@ fn grant_on_needs_the_registered_question_and_an_owner_typed_yes() {
     assert_eq!(d.decided_lane, r.lane);
     assert_eq!(d.prompt_excerpt, "네");
     assert_eq!(d.prompt_digest, cys::mission_gate::digest_normalized("네"));
-    assert_eq!(d.paused_at, Some(t + 2_001.0), "the answer is an owner input (B4)");
+    // CI5 (a): the pause is dated from the decision (NOW), not from the answer's time
+    assert_eq!(d.paused_at, Some(t + 2_002.0), "the answer is an owner input (B4), dated now");
+    assert_eq!(d.resumed_at, Some(t + 2_002.0 + 1_800.0));
     assert!(r.prompts.lock().unwrap()[&MASTER].question.is_none(), "the question is consumed");
     assert!(on(t + 2_003.0).is_err(), "one answer turns it on once");
     assert!(r.ids().is_empty(), "no R-* record");
-    // a bad cap is refused
-    let e = r
-        .call(t, &master(), "grant", json!({"mode": "on", "daily_cap": 0}))
-        .unwrap_err();
-    assert_eq!(e.code, "invalid_params");
+    // CI4: `--daily-cap` on `on` is refused (good or bad value) with the sentence naming `grant ask`
+    for cap in [json!(3), json!(0)] {
+        let e = r
+            .call(t, &master(), "grant", json!({"mode": "on", "daily_cap": cap}))
+            .unwrap_err();
+        assert_eq!(e.code, "invalid_params");
+        assert!(e.message.contains("grant ask --daily-cap"), "{}", e.message);
+    }
 }
 
 /// U4(b): an owner "예" to an OWNER-TOKEN question never turns the grant on.
@@ -439,7 +459,7 @@ fn a_token_questions_yes_is_not_a_grant() {
     let t = now0();
     r.call(t, &master(), "owner_token_ask", json!({"path": "soul.md"}))
         .unwrap();
-    r.prompt(MASTER, "예", "human", t + 1.0);
+    r.typed(MASTER, "예", t + 1.0);
     let e = r
         .call(t + 2.0, &master(), "grant", json!({"mode": "on"}))
         .unwrap_err();
@@ -453,13 +473,14 @@ fn grant_off_after_an_owner_typed_prompt() {
     let r = rig("off2");
     let t = now0();
     r.call(t, &master(), "grant_ask", json!({})).unwrap();
-    r.prompt(MASTER, "응", "human", t + 1.0);
+    r.typed(MASTER, "응", t + 1.0);
     r.call(t + 2.0, &master(), "grant", json!({"mode": "on"}))
         .unwrap();
     let off = |at: f64| r.call(at, &master(), "grant", json!({"mode": "off"}));
     assert!(off(t + 3.0).is_err(), "no owner input after the decision");
     r.prompt(MASTER, "worker report", "machine", t + 4.0);
     assert!(off(t + 5.0).is_err(), "a machine prompt is not the owner's");
+    // CI1: the safe direction needs Level 1 only — the hook request alone, no typing mark
     r.prompt(MASTER, "자동 수리 꺼", "human", t + 6.0);
     assert_eq!(off(t + 7.0).unwrap()["grant"], "off");
     assert_eq!(r.decision().unwrap().state, GrantState::Off);
@@ -506,7 +527,10 @@ fn owner_token_only_for_the_document_the_owner_named() {
     assert!(tok(MASTER, "soul.md").is_err(), "machine-origin prompt → no token");
     r.prompt(MASTER, "고쳐라 soul.md", "unknown", t);
     assert!(tok(MASTER, "soul.md").is_err(), "unknown origin → no token");
+    // CI1: the hook request alone (Level 1, no typing mark) names nothing
     r.prompt(MASTER, "고쳐라 soul.md", "human", t);
+    assert!(tok(MASTER, "soul.md").unwrap_err().message.contains("이름으로 부르지"));
+    r.typed(MASTER, "고쳐라 soul.md", t);
     let v = tok(MASTER, "soul.md").unwrap();
     let token = v["token"].as_str().unwrap();
     assert!(oo::is_token_shape(token));
@@ -522,6 +546,9 @@ fn owner_token_only_for_the_document_the_owner_named() {
     let e = tok(MASTER, "directives/MASTER_DIRECTIVE.md").unwrap_err();
     assert!(e.message.contains("이름으로 부르지"), "{}", e.message);
     assert_eq!(tok(MASTER, "bin/a.py").unwrap_err().code, "invalid_params");
+    // CI3: that naming is spent — the owner names it again for the next token
+    assert!(tok(MASTER, "soul.md").is_err(), "one naming, one token");
+    r.typed(MASTER, "고쳐라 soul.md", t);
     // an absolute path inside the pack names the same document
     let abs = r.pack.join("soul.md");
     assert!(tok(MASTER, abs.to_str().unwrap()).is_ok());
@@ -537,7 +564,7 @@ fn owner_token_by_registered_question() {
     r.prompt(MASTER, "규칙 하나 바꿔야겠다", "human", t);
     r.call(t + 1.0, &master(), "owner_token_ask", json!({"path": "soul.md"}))
         .unwrap();
-    r.prompt(MASTER, "네", "human", t + 2.0);
+    r.typed(MASTER, "네", t + 2.0);
     let e = r
         .call(t + 3.0, &master(), "owner_token", json!({"path": "directives/MASTER_DIRECTIVE.md"}))
         .unwrap_err();
@@ -783,6 +810,11 @@ impl Rig {
         self.prompt(sid, text, origin, at);
         origin
     }
+    /// RULINGS CI1 test seam: the seat's app-typing mark, then [`Rig::hook_prompt`].
+    fn hook_typed(&self, sid: u64, text: &str, verdict: Value, at: f64) -> &'static str {
+        mark_app_typing(&self.prompts, sid);
+        self.hook_prompt(sid, text, verdict, at)
+    }
 }
 
 fn verdict(origin: &str, status: &str, codes: &[&str]) -> Value {
@@ -822,7 +854,8 @@ fn ch2_strict_origin_feeds_the_prompt_record() {
         .unwrap_err()
         .message
         .contains("기계"));
-    // unknown origin / absent ledger / bad lines / machine: no token, no grant
+    // unknown origin / absent ledger / bad lines / machine: no token, no grant — even with the
+    // seat's typing mark set (CI1: the mark never lifts a prompt that is not Level 1)
     for (v, want) in [
         (verdict("unknown", "unreadable", &[]), "unknown"),
         (verdict("human", "absent", &["ledger_absent"]), "unknown"),
@@ -831,26 +864,27 @@ fn ch2_strict_origin_feeds_the_prompt_record() {
         (json!({}), "unknown"),
     ] {
         let r = rig("ch2-each");
-        assert_eq!(r.hook_prompt(MASTER, "고쳐라 soul.md", v.clone(), t), want, "{v}");
+        assert_eq!(r.hook_typed(MASTER, "고쳐라 soul.md", v.clone(), t), want, "{v}");
         assert!(r
             .call(t + 1.0, &master(), "owner_token", json!({"path": "soul.md"}))
             .is_err(), "{v}: a token");
         r.call(t + 2.0, &master(), "grant_ask", json!({})).unwrap();
-        r.hook_prompt(MASTER, "예", v.clone(), t + 3.0);
+        r.hook_typed(MASTER, "예", v.clone(), t + 3.0);
         assert!(r
             .call(t + 4.0, &master(), "grant", json!({"mode": "on"}))
             .is_err(), "{v}: a grant");
         assert_eq!(r.decision(), None);
     }
-    // the owner's own typing (a rotated ledger is ordinary) still works
+    // the owner's own typing (a rotated ledger is ordinary) still works — through the app's
+    // keyboard (the typing mark, CI1)
     let r = rig("ch2-owner");
     let typed = verdict("human", "ok", &["ledger_rotated"]);
-    assert_eq!(r.hook_prompt(MASTER, "고쳐라 soul.md", typed.clone(), t), "human");
+    assert_eq!(r.hook_typed(MASTER, "고쳐라 soul.md", typed.clone(), t), "human");
     assert!(r
         .call(t + 1.0, &master(), "owner_token", json!({"path": "soul.md"}))
         .is_ok());
     r.call(t + 2.0, &master(), "grant_ask", json!({})).unwrap();
-    r.hook_prompt(MASTER, "예", typed, t + 3.0);
+    r.hook_typed(MASTER, "예", typed, t + 3.0);
     assert_eq!(
         r.call(t + 4.0, &master(), "grant", json!({"mode": "on"}))
             .unwrap()["grant"],
@@ -876,8 +910,14 @@ fn ch2_ch3_handler_wiring_pins() {
     ));
     let send = &handlers[handlers.find("let human_verified = human && !machine_origin").unwrap()..];
     let send = &send[..send.find("if !human_verified {").unwrap()];
-    assert!(send.contains("if human_verified { crate::repair::grant_note_owner_input(daemon); }"));
-    assert_eq!(handlers.matches("crate::repair::grant_note_owner_input(daemon)").count(), 2);
+    // CI1: the send path calls the app-typing entry (pause for every `human_verified` send + the
+    // seat's typing mark when the token did not come from a pane) with the TARGET seat
+    assert!(send.contains(
+        "if human_verified { crate::repair::grant_note_app_typing(daemon, sid, verified_from); }"
+    ));
+    assert_eq!(handlers.matches("crate::repair::grant_note_owner_input(daemon)").count(), 1);
+    assert_eq!(handlers.matches("crate::repair::grant_note_app_typing(").count(), 1);
+    assert_eq!(handlers.matches("crate::repair::mark_app_typing(").count(), 0);
 }
 
 /// CH3: with the grant ON, owner input in the lane pauses NEW autonomous starts at once — and
@@ -952,9 +992,9 @@ fn ch4_grant_off_after_a_machine_prompt() {
     let t = now0();
     let ok = verdict("human", "ok", &[]);
     r.call(t, &master(), "grant_ask", json!({})).unwrap();
-    r.hook_prompt(MASTER, "응", ok.clone(), t + 1.0);
+    r.hook_typed(MASTER, "응", ok.clone(), t + 1.0);
     r.call(t + 2.0, &master(), "grant", json!({"mode": "on"})).unwrap();
-    r.hook_prompt(MASTER, "자동 수리 꺼", ok.clone(), t + 3.0);
+    r.hook_prompt(MASTER, "자동 수리 꺼", ok.clone(), t + 3.0); // Level 1 suffices for `off` (CI1)
     r.hook_prompt(MASTER, "[worker] 보고: 완료", verdict("machine", "ok", &[]), t + 4.0);
     assert_eq!(r.prompts.lock().unwrap()[&MASTER].origin, "machine");
     let v = r
@@ -966,8 +1006,310 @@ fn ch4_grant_off_after_a_machine_prompt() {
     assert_eq!(d.prompt_digest, cys::mission_gate::digest_normalized("자동 수리 꺼"));
     // a machine prompt alone after a decision still turns nothing off
     r.call(t + 6.0, &master(), "grant_ask", json!({})).unwrap();
-    r.hook_prompt(MASTER, "예", ok, t + 7.0);
+    r.hook_typed(MASTER, "예", ok, t + 7.0);
     r.call(t + 8.0, &master(), "grant", json!({"mode": "on"})).unwrap();
     r.hook_prompt(MASTER, "[worker] 끄라", verdict("machine", "ok", &[]), t + 9.0);
     assert!(r.call(t + 10.0, &master(), "grant", json!({"mode": "off"})).is_err());
+}
+
+// ───────────────────────────── RULINGS CI (fix round) ─────────────────────────────
+
+/// CI1: the hook request ALONE is Level 1 — `origin = human` and `last_human` (so `grant off`
+/// works), but it answers no question (it counts as `machine_seen`) and names nothing. The typing
+/// mark is per seat, survives a non-Level-1 prompt, and is consumed by ONE Level-2 prompt (stated
+/// limit (iii): of two prompts typed before either reached the hook, only the first is Level 2).
+#[test]
+fn ci1_hook_request_alone_is_not_level_2() {
+    let r = rig("ci1");
+    let t = now0();
+    let on = |at: f64| r.call(at, &master(), "grant", json!({"mode": "on"}));
+    r.call(t, &master(), "grant_ask", json!({})).unwrap();
+    r.prompt(MASTER, "예", "human", t + 1.0);
+    {
+        let m = r.prompts.lock().unwrap();
+        let rec = &m[&MASTER];
+        assert_eq!(rec.origin, "human");
+        assert_eq!(rec.last_human.as_ref().map(|x| x.1), Some(t + 1.0));
+        assert_eq!(rec.last_typed, None);
+        let q = rec.question.as_ref().unwrap();
+        assert!(q.machine_seen && q.first_human.is_none(), "Level 1 only = not the owner's answer");
+    }
+    assert!(on(t + 2.0).unwrap_err().message.contains("기계"));
+    // a mark for ANOTHER seat does not count for this one
+    r.call(t + 3.0, &master(), "grant_ask", json!({})).unwrap();
+    mark_app_typing(&r.prompts, 2);
+    r.prompt(MASTER, "예", "human", t + 4.0);
+    assert!(on(t + 5.0).is_err());
+    // the mark survives machine / unknown prompts; one Level-2 prompt consumes it
+    mark_app_typing(&r.prompts, MASTER);
+    r.prompt(MASTER, "[worker] 보고", "machine", t + 6.0);
+    r.prompt(MASTER, "?", "unknown", t + 6.5);
+    assert!(r.prompts.lock().unwrap()[&MASTER].app_typed, "only a Level-2 prompt consumes the mark");
+    r.call(t + 7.0, &master(), "grant_ask", json!({})).unwrap();
+    r.prompt(MASTER, "예", "human", t + 8.0);
+    assert!(!r.prompts.lock().unwrap()[&MASTER].app_typed, "consumed");
+    assert_eq!(on(t + 9.0).unwrap()["grant"], "on");
+    // the next prompt with no new typing is Level 1 only: it names nothing …
+    r.prompt(MASTER, "고쳐라 soul.md", "human", t + 10.0);
+    assert!(r.prompts.lock().unwrap()[&MASTER].named_docs.is_empty());
+    assert!(r
+        .call(t + 11.0, &master(), "owner_token", json!({"path": "soul.md"}))
+        .is_err());
+    // … and still serves the safe direction
+    assert_eq!(
+        r.call(t + 12.0, &master(), "grant", json!({"mode": "off"})).unwrap()["grant"],
+        "off"
+    );
+}
+
+/// CI1: what Level 2 reads is the FREE TEXT outside every tag block and code fence — a name inside
+/// a reminder or a fence names nothing; the answer test runs on the free text and the excerpt is
+/// taken from it, while the digest stays the whole prompt's; a notification block with free text
+/// around it is not even Level 1.
+#[test]
+fn ci1_level_2_reads_the_free_text_only() {
+    let r = rig("ci1-free");
+    let t = now0();
+    let ok = verdict("human", "ok", &[]);
+    let named = || r.prompts.lock().unwrap()[&MASTER].named_docs.clone();
+    let reminder = "<system-reminder>soul.md 를 다시 읽어라</system-reminder>\n계속 진행해";
+    assert_eq!(r.hook_typed(MASTER, reminder, ok.clone(), t), "human");
+    assert!(named().is_empty(), "a name inside a reminder names nothing");
+    assert!(r
+        .call(t + 1.0, &master(), "owner_token", json!({"path": "soul.md"}))
+        .unwrap_err()
+        .message
+        .contains("이름으로 부르지"));
+    assert_eq!(r.hook_typed(MASTER, "```\nsoul.md\n```\n이거 봐줘", ok.clone(), t + 2.0), "human");
+    assert!(named().is_empty(), "a name inside a code fence names nothing");
+    let own = "<system-reminder>오늘은 토요일이다</system-reminder>\n고쳐라 soul.md";
+    assert_eq!(r.hook_typed(MASTER, own, ok.clone(), t + 3.0), "human");
+    assert_eq!(named(), ["soul.md"], "the owner's own words name it");
+    // the answer: free text "예, 켜줘" behind a reminder
+    r.call(t + 4.0, &master(), "grant_ask", json!({})).unwrap();
+    let ans = "<system-reminder>오늘은 토요일이다</system-reminder>\n예, 켜줘";
+    assert_eq!(r.hook_typed(MASTER, ans, ok.clone(), t + 5.0), "human");
+    r.call(t + 6.0, &master(), "grant", json!({"mode": "on"})).unwrap();
+    let d = r.decision().unwrap();
+    assert_eq!(d.prompt_excerpt, "예, 켜줘", "the excerpt comes from the free text");
+    assert_eq!(d.prompt_digest, cys::mission_gate::digest_normalized(ans), "the digest is the whole prompt's");
+    // a code fence after a yes is not a bare yes (the fence stays visible as ▯)
+    r.call(t + 7.0, &master(), "grant_ask", json!({})).unwrap();
+    assert_eq!(r.hook_typed(MASTER, "예 `rm -rf x`", ok.clone(), t + 8.0), "human");
+    assert!(r
+        .call(t + 9.0, &master(), "grant", json!({"mode": "on"}))
+        .unwrap_err()
+        .message
+        .contains("허락"));
+    assert_eq!(owner_free_text("예 `x`"), "예 ▯▯▯");
+    // a notification block with owner-looking text on both sides: not Level 1, so no answer
+    r.call(t + 10.0, &master(), "grant_ask", json!({})).unwrap();
+    let mixed = "예 <task-notification><task-id>abcdefgh</task-id><status>completed</status><summary>x</summary></task-notification> 켜줘";
+    assert_eq!(r.hook_typed(MASTER, mixed, ok.clone(), t + 11.0), "unknown");
+    assert!(r
+        .call(t + 12.0, &master(), "grant", json!({"mode": "on"}))
+        .unwrap_err()
+        .message
+        .contains("기계"));
+}
+
+/// CI1 wiring: the send path's entry pauses the grant for every `human_verified` send, and sets the
+/// TARGET seat's typing mark only when the operator token did not come from a pane; the record the
+/// hook writes consumes it (and is Level 2 then).
+#[test]
+fn ci1_app_typing_entry_marks_only_app_sends() {
+    let daemon = crate::team_gate_tests::tmp_daemon("t4-ci1", false);
+    let mut r = rig("ci1-entry");
+    r.root = production_root(&daemon);
+    r.lane = LaneKey::of_socket(&daemon.socket_path);
+    let _ = std::fs::remove_dir_all(&r.root);
+    r.grant_on(5);
+    let marked = |seat: u64| {
+        daemon
+            .repair_prompt_origin
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&seat)
+            .is_some_and(|p| p.app_typed)
+    };
+    grant_note_app_typing(&daemon, 5, Some(9));
+    assert!(grant::pause_path_in(&r.root, &r.lane).exists(), "a pane's verified send still pauses");
+    assert!(!marked(5), "a token from a pane sets no typing mark");
+    // without the mark the hook's record is Level 1 only
+    record_prompt_origin(&daemon, 5, "고쳐라 soul.md", None, Some("human"));
+    assert!(daemon.repair_prompt_origin.lock().unwrap()[&5].named_docs.is_empty());
+    grant_note_app_typing(&daemon, 5, None);
+    assert!(marked(5) && !marked(6), "the target seat only");
+    record_prompt_origin(&daemon, 5, "고쳐라 soul.md", None, Some("human"));
+    {
+        let m = daemon.repair_prompt_origin.lock().unwrap();
+        assert!(!m[&5].app_typed, "consumed by the Level-2 prompt");
+        assert_eq!(m[&5].named_docs, ["soul.md"]);
+    }
+    release_locks_for_seat(&daemon, 5);
+    assert!(!marked(5), "dropped with the seat");
+    let _ = std::fs::remove_dir_all(&r.root);
+}
+
+/// CI3: one naming → one token; a naming older than 30 minutes is refused; a newer Level-2 prompt
+/// that names nothing ends the naming; a machine prompt does not; naming again → issued.
+#[test]
+fn ci3_one_naming_one_token() {
+    let r = rig("ci3");
+    let t = now0();
+    let tok = |at: f64| r.call(at, &master(), "owner_token", json!({"path": "soul.md"}));
+    r.typed(MASTER, "고쳐라 soul.md", t);
+    assert_eq!(tok(t + 1.0).unwrap()["basis"], "named_in_owner_prompt");
+    let e = tok(t + 2.0).unwrap_err();
+    assert_eq!(e.code, "repair_precondition");
+    assert!(e.message.contains("이름으로 부르지"), "{}", e.message);
+    assert!(r.prompts.lock().unwrap()[&MASTER].named_docs.is_empty(), "issuing took the naming");
+    // older than 30 minutes → refused (and nothing taken)
+    r.typed(MASTER, "고쳐라 soul.md", t + 10.0);
+    let e = tok(t + 10.0 + 1_801.0).unwrap_err();
+    assert!(e.message.contains("30분"), "{}", e.message);
+    // a machine prompt after the naming does not end it; a Level-2 prompt naming nothing does
+    r.typed(MASTER, "고쳐라 soul.md", t + 2_000.0);
+    r.prompt(MASTER, "[worker] 보고: 완료", "machine", t + 2_001.0);
+    assert!(tok(t + 2_002.0).is_ok());
+    r.typed(MASTER, "고쳐라 soul.md", t + 2_003.0);
+    r.typed(MASTER, "오늘 일정 정리해줘", t + 2_004.0);
+    assert!(tok(t + 2_005.0).is_err(), "the naming prompt is no longer the latest Level-2 prompt");
+    // naming again → issued
+    r.typed(MASTER, "soul.md 다시 고쳐라", t + 2_006.0);
+    assert!(tok(t + 2_007.0).is_ok());
+    let tokens = std::fs::read_dir(r.root.join("owner-tokens")).unwrap().count();
+    assert_eq!(tokens, 3, "three namings, three tokens");
+}
+
+/// CI4: the daily limit belongs to the question — `grant ask` stores N, else the current limit, else
+/// 5; a different N needs the owner's own typed words to hold it (a Level-1 prompt, a number inside a
+/// tag block or inside another token holds none); `grant on` takes the question's limit and refuses
+/// `--daily-cap`; `grant off` never changes it.
+#[test]
+fn ci4_the_daily_limit_belongs_to_the_question() {
+    let r = rig("ci4");
+    let t = now0();
+    let ask = |at: f64, p: Value| r.call(at, &master(), "grant_ask", p);
+    let question_cap = || {
+        r.prompts.lock().unwrap()[&MASTER]
+            .question
+            .as_ref()
+            .and_then(|q| q.daily_cap)
+    };
+    assert_eq!(ask(t, json!({})).unwrap()["daily_cap"], 5);
+    assert_eq!(question_cap(), Some(5));
+    assert_eq!(ask(t, json!({"daily_cap": 5})).unwrap()["daily_cap"], 5, "equal to the current limit");
+    let e = ask(t, json!({"daily_cap": 7})).unwrap_err();
+    assert_eq!(e.code, "repair_precondition");
+    assert!(e.message.contains("grant ask --daily-cap 7"), "{}", e.message);
+    assert_eq!(question_cap(), Some(5), "a refused ask registers nothing");
+    r.prompt(MASTER, "하루 7건까지", "human", t + 1.0);
+    assert!(ask(t + 2.0, json!({"daily_cap": 7})).is_err(), "Level 1 holds no number");
+    r.typed(MASTER, "<system-reminder>7</system-reminder> 하루 상한 바꾸자", t + 3.0);
+    assert!(ask(t + 4.0, json!({"daily_cap": 7})).is_err(), "inside a tag block");
+    r.typed(MASTER, "R-7 다시 봐줘", t + 4.5);
+    assert!(ask(t + 4.6, json!({"daily_cap": 7})).is_err(), "inside another token");
+    r.typed(MASTER, "하루 7건까지 해도 된다", t + 5.0);
+    assert_eq!(r.prompts.lock().unwrap()[&MASTER].named_numbers, [7]);
+    assert_eq!(ask(t + 6.0, json!({"daily_cap": 7})).unwrap()["daily_cap"], 7);
+    assert_eq!(question_cap(), Some(7));
+    for bad in [json!(0), json!(101), json!("7"), json!(-1), json!(2.5)] {
+        assert_eq!(ask(t + 6.0, json!({"daily_cap": bad})).unwrap_err().code, "invalid_params", "{bad}");
+    }
+    r.typed(MASTER, "예", t + 7.0);
+    let e = r
+        .call(t + 8.0, &master(), "grant", json!({"mode": "on", "daily_cap": 7}))
+        .unwrap_err();
+    assert!(e.message.contains("grant ask --daily-cap"), "{}", e.message);
+    let v = r.call(t + 8.0, &master(), "grant", json!({"mode": "on"})).unwrap();
+    assert_eq!((v["daily_cap"].clone(), r.decision().unwrap().daily_cap), (json!(7), 7));
+    // `off`: never changes the limit, refuses `--daily-cap`
+    r.prompt(MASTER, "자동 수리 꺼라", "human", t + 9.0);
+    assert_eq!(
+        r.call(t + 10.0, &master(), "grant", json!({"mode": "off", "daily_cap": 3}))
+            .unwrap_err()
+            .code,
+        "invalid_params"
+    );
+    assert_eq!(
+        r.call(t + 10.0, &master(), "grant", json!({"mode": "off"})).unwrap()["daily_cap"],
+        7
+    );
+    assert_eq!(r.decision().unwrap().daily_cap, 7);
+    // the next question carries the current limit; back to 5 needs the owner's words
+    assert_eq!(ask(t + 11.0, json!({})).unwrap()["daily_cap"], 7);
+    assert!(ask(t + 11.0, json!({"daily_cap": 5})).is_err());
+}
+
+/// CI5 (b): the throttle remembers a time only when a pause mark was actually written — an input
+/// while the grant is off (no mark) does not swallow the first input after it turns on.
+#[test]
+fn ci5b_throttle_remembers_only_written_marks() {
+    let r = rig("ci5b");
+    let t = now0();
+    note_owner_input_throttled(&r.root, &r.lane, t);
+    assert!(!grant::pause_path_in(&r.root, &r.lane).exists(), "grant off: no mark");
+    r.grant_on(5);
+    note_owner_input_throttled(&r.root, &r.lane, t + 1.0);
+    let v: Value = serde_json::from_slice(&std::fs::read(grant::pause_path_in(&r.root, &r.lane)).unwrap()).unwrap();
+    assert_eq!(v["paused_at"].as_f64(), Some(t + 1.0), "written although within the gap of the unwritten call");
+}
+
+/// CI6 (b): `grant_status` — any caller the READ class admits, no owner check, writes nothing:
+/// `{state, paused, paused_until, daily_cap}`; an unreadable decision is an error; `daily_cap` as a
+/// parameter is refused.
+#[test]
+fn ci6b_grant_status_reads_the_state() {
+    let r = rig("ci6b");
+    let t = now0();
+    let status = |who: &Caller, at: f64| r.call(at, who, "grant_status", json!({}));
+    fn files(d: &Path, out: &mut Vec<String>) {
+        if let Ok(rd) = std::fs::read_dir(d) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    files(&p, out);
+                } else {
+                    out.push(p.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+    let listing = || {
+        let mut v = Vec::new();
+        files(&r.root, &mut v);
+        v.sort();
+        v
+    };
+    let before = listing();
+    for who in [master(), seat(3, "worker"), seat(7, "reviewer-codex"), seat(8, "cso")] {
+        assert_eq!(
+            status(&who, t).unwrap(),
+            json!({"state": "off", "paused": false, "paused_until": null, "daily_cap": 5}),
+            "{:?}",
+            who.role
+        );
+    }
+    assert_eq!(listing(), before, "writes nothing");
+    r.grant_on(9);
+    assert_eq!(
+        status(&master(), t).unwrap(),
+        json!({"state": "on", "paused": false, "paused_until": null, "daily_cap": 9})
+    );
+    note_owner_input_throttled(&r.root, &r.lane, t);
+    let v = status(&seat(3, "worker"), t + 10.0).unwrap();
+    assert_eq!(
+        (v["state"].clone(), v["paused"].clone(), v["paused_until"].as_f64()),
+        (json!("on"), json!(true), Some(t + 1_800.0))
+    );
+    assert_eq!(status(&master(), t + 1_801.0).unwrap()["paused"], false);
+    assert_eq!(
+        r.call(t, &master(), "grant_status", json!({"daily_cap": 3}))
+            .unwrap_err()
+            .code,
+        "invalid_params"
+    );
+    std::fs::write(grant::grant_path_in(&r.root), b"{not json").unwrap();
+    assert!(status(&master(), t).is_err(), "an unreadable decision is not reported as off");
 }

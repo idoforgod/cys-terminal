@@ -37,12 +37,14 @@ pub(crate) enum AuditVerdict {
     Finding,
 }
 
-/// `grant on|off|ask` (`ask` → `repair.grant_ask`, RULINGS Q1).
+/// `grant on|off|ask|status` (`ask` → `repair.grant_ask`, RULINGS Q1; `status` →
+/// `repair.grant_status`, the READ of RULINGS CI6 (b)).
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GrantMode {
     On,
     Off,
     Ask,
+    Status,
 }
 
 /// `owner-token [ask]` (`ask` → `repair.owner_token_ask`, RULINGS Q2).
@@ -157,12 +159,16 @@ pub(crate) enum RepairCmd {
         #[arg(long, value_name = "시각")]
         slot: Option<String>,
     },
-    /// 자동 수리 허락 켜기·끄기·질문 등록(마스터 · 주인 입력 확인 뒤에만 효력)
+    /// 자동 수리 허락 켜기·끄기·질문 등록(마스터 · 주인 입력 확인 뒤에만 효력) · 상태 보기(status · 누구나)
     Grant {
         #[arg(value_enum)]
         mode: GrantMode,
-        #[arg(long)]
+        /// 하루 상한(1~100) — `grant ask` 에서만: 질문에 딸려 저장되고, 지금 상한과 다른 수는 주인이 직접 친 말에 그 숫자가 있어야 한다(`on`·`off`·`status`는 받지 않음)
+        #[arg(long, value_name = "N")]
         daily_cap: Option<u32>,
+        /// 결과를 JSON 한 줄로(`status`: {state, paused, paused_until, daily_cap})
+        #[arg(long)]
+        json: bool,
     },
     /// 규칙 문서 수리의 주인 지시 표 발급·질문 등록(마스터 · 주인 입력 확인 뒤에만 효력)
     OwnerToken {
@@ -662,9 +668,20 @@ fn t4_request(cmd: &RepairCmd) -> Option<(&'static str, Value)> {
     Some(match cmd {
         RepairCmd::Grant {
             mode: GrantMode::Ask,
+            daily_cap,
             ..
-        } => ("repair.grant_ask", json!({})),
-        RepairCmd::Grant { mode, daily_cap } => (
+        } => ("repair.grant_ask", json!({"daily_cap": daily_cap})),
+        // RULINGS CI6 (b); a `--daily-cap` here is forwarded so the daemon refuses it in one place
+        RepairCmd::Grant {
+            mode: GrantMode::Status,
+            daily_cap,
+            ..
+        } => ("repair.grant_status", json!({"daily_cap": daily_cap})),
+        // CI4: forwarded as given — the daemon refuses `--daily-cap` on `on` / `off` with the
+        // sentence naming `grant ask --daily-cap` (never silently dropped)
+        RepairCmd::Grant {
+            mode, daily_cap, ..
+        } => (
             "repair.grant",
             json!({"mode": if *mode == GrantMode::On { "on" } else { "off" }, "daily_cap": daily_cap}),
         ),
@@ -693,13 +710,40 @@ fn t4_request(cmd: &RepairCmd) -> Option<(&'static str, Value)> {
 /// stderr and nothing on stdout.
 fn t4_print(cmd: &RepairCmd, out: &mut dyn Write, err: &mut dyn Write, v: &Value) -> i32 {
     let r = match cmd {
+        RepairCmd::Grant { json: true, .. } => writeln!(out, "{v}"),
         RepairCmd::Grant {
             mode: GrantMode::Ask,
             ..
         } => writeln!(
             out,
-            "질문을 등록했습니다 — 이제 주인께 대화로 물으세요: \"자비스가 발견한 명백한 버그·오류를 스스로 고쳐도 될까요?\" (30분 안에 주인이 직접 친 첫 답만 셉니다)"
+            "질문을 등록했습니다(하루 상한 {}건) — 이제 주인께 대화로 물으세요: \"자비스가 발견한 명백한 버그·오류를 스스로 고쳐도 될까요?\" (30분 안에 주인이 직접 친 첫 답만 셉니다)",
+            s(v, "daily_cap")
         ),
+        RepairCmd::Grant {
+            mode: GrantMode::Status,
+            ..
+        } => {
+            if v.get("state") == Some(&json!("on")) {
+                let pause = if v.get("paused") == Some(&Value::Bool(true)) {
+                    let until = v
+                        .get("paused_until")
+                        .and_then(Value::as_f64)
+                        .and_then(|t| chrono::DateTime::from_timestamp(t as i64, 0))
+                        .map(|t| t.with_timezone(&chrono::Local).format("%H:%M").to_string())
+                        .unwrap_or_else(|| "-".into());
+                    format!("일시정지 중({until}까지 · 주인의 입력 뒤 30분)")
+                } else {
+                    "일시정지 아님".to_string()
+                };
+                writeln!(
+                    out,
+                    "자동 수리 허락: 켬 · 하루 상한 {}건 · {pause}",
+                    s(v, "daily_cap")
+                )
+            } else {
+                writeln!(out, "자동 수리 허락: 끔 (하루 상한 {}건)", s(v, "daily_cap"))
+            }
+        }
         RepairCmd::Grant { .. } => {
             if v.get("grant") == Some(&json!("on")) {
                 writeln!(
@@ -894,8 +938,8 @@ mod tests {
     }
 
     /// The clap names are the 23 contract names; the 18 daemon-backed ones (`-`→`_`) plus the two
-    /// `ask` modes are daemon sub-verbs and the remaining daemon sub-verbs are the app-only three;
-    /// every name has a class in `VERB_CLASSES` (J1).
+    /// `ask` modes and `grant status` (RULINGS CI6 (b)) are daemon sub-verbs and the remaining daemon
+    /// sub-verbs are the app-only three; every name has a class in `VERB_CLASSES` (J1).
     #[test]
     fn verb_names_are_contract() {
         let root = <super::super::Cli as clap::CommandFactory>::command();
@@ -923,7 +967,7 @@ mod tests {
         }
 
         let subverbs = daemon_subverbs();
-        assert_eq!(subverbs.len(), 23, "daemon REPAIR_SUBVERBS: {subverbs:?}");
+        assert_eq!(subverbs.len(), 24, "daemon REPAIR_SUBVERBS: {subverbs:?}");
         let mut backed: Vec<String> = CLI_NAMES
             .iter()
             .filter(|n| !LOCAL.contains(n))
@@ -932,6 +976,7 @@ mod tests {
         assert_eq!(backed.len(), 18);
         backed.push("grant_ask".to_string());
         backed.push("owner_token_ask".to_string());
+        backed.push("grant_status".to_string());
         for b in &backed {
             assert!(
                 subverbs.contains(b),
@@ -1017,6 +1062,9 @@ mod tests {
             &["grant", "on", "--daily-cap", "3"],
             &["grant", "off"],
             &["grant", "ask"],
+            &["grant", "ask", "--daily-cap", "7"],
+            &["grant", "status"],
+            &["grant", "status", "--json"],
             &["owner-token", "--path", "directives/MASTER_DIRECTIVE.md"],
             &[
                 "owner-token",
@@ -1206,15 +1254,33 @@ mod tests {
             let code = run_with(&cmd, &mut out, &mut err, &rpc);
             (code, String::from_utf8(out).unwrap(), String::from_utf8(err).unwrap())
         };
-        let (c, o, _) = run(&["grant", "on", "--daily-cap", "3"], json!({"grant": "on", "daily_cap": 3}));
+        let (c, o, _) = run(&["grant", "on"], json!({"grant": "on", "daily_cap": 3}));
         assert_eq!((c, o.contains("켬") && o.contains("3건")), (0, true));
+        assert_eq!(seen.borrow().last().unwrap(), &("repair.grant".to_string(), json!({"mode": "on", "daily_cap": null})));
+        // CI4: `--daily-cap` on `on` is forwarded as given (never dropped) — the daemon refuses it
+        let _ = run(&["grant", "on", "--daily-cap", "3"], json!({"grant": "on", "daily_cap": 3}));
         assert_eq!(seen.borrow().last().unwrap(), &("repair.grant".to_string(), json!({"mode": "on", "daily_cap": 3})));
         let (c, o, _) = run(&["grant", "off"], json!({"grant": "off"}));
         assert_eq!((c, o.trim()), (0, "자동 수리 허락: 끔"));
         assert_eq!(seen.borrow().last().unwrap().1, json!({"mode": "off", "daily_cap": null}));
-        let (c, o, _) = run(&["grant", "ask"], json!({}));
-        assert!(c == 0 && o.contains("스스로 고쳐도 될까요?"));
-        assert_eq!(seen.borrow().last().unwrap(), &("repair.grant_ask".to_string(), json!({})));
+        let (c, o, _) = run(&["grant", "ask"], json!({"daily_cap": 5}));
+        assert!(c == 0 && o.contains("스스로 고쳐도 될까요?") && o.contains("하루 상한 5건"), "{o}");
+        assert_eq!(seen.borrow().last().unwrap(), &("repair.grant_ask".to_string(), json!({"daily_cap": null})));
+        // CI4: the limit belongs to the question
+        let _ = run(&["grant", "ask", "--daily-cap", "7"], json!({"daily_cap": 7}));
+        assert_eq!(seen.borrow().last().unwrap(), &("repair.grant_ask".to_string(), json!({"daily_cap": 7})));
+        // CI6 (b): `grant status [--json]`
+        let st = json!({"state": "on", "paused": false, "paused_until": null, "daily_cap": 7});
+        let (c, o, e) = run(&["grant", "status"], st.clone());
+        assert_eq!((c, o.trim(), e.as_str()), (0, "자동 수리 허락: 켬 · 하루 상한 7건 · 일시정지 아님", ""));
+        assert_eq!(seen.borrow().last().unwrap(), &("repair.grant_status".to_string(), json!({"daily_cap": null})));
+        let (c, o, _) = run(&["grant", "status", "--json"], st.clone());
+        assert_eq!(c, 0);
+        assert_eq!(serde_json::from_str::<Value>(o.trim()).unwrap(), st);
+        let (_, o, _) = run(&["grant", "status"], json!({"state": "on", "paused": true, "paused_until": 1_800_000_000.0, "daily_cap": 5}));
+        assert!(o.contains("일시정지 중(") && o.contains("까지"), "{o}");
+        let (_, o, _) = run(&["grant", "status"], json!({"state": "off", "paused": false, "paused_until": null, "daily_cap": 5}));
+        assert_eq!(o.trim(), "자동 수리 허락: 끔 (하루 상한 5건)");
         let (c, _, _) = run(&["owner-token", "ask", "--path", "soul.md"], json!({"path": "soul.md"}));
         assert_eq!(c, 0);
         assert_eq!(seen.borrow().last().unwrap(), &("repair.owner_token_ask".to_string(), json!({"path": "soul.md"})));

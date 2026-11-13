@@ -1948,7 +1948,10 @@ fn wiring_pins() {
 
 /// A question at t0, a machine push at t1, the owner's "예" at t2 → `machine_seen` (T4 then refuses
 /// `grant on`); an unknown origin counts as machine (fail closed); `named_docs` changes only on an
-/// owner-typed prompt; the first owner answer after the question is kept once.
+/// owner-typed prompt; the first owner answer after the question is kept once. RULINGS CI1 (T4):
+/// "owner-typed" for an answer or a naming is Level 2 — the hook's `human` (Level 1) AND the seat's
+/// app-typing mark, set here first (`app_typed = true`, the test seam of `mark_app_typing`); the
+/// hook's `human` alone answers nothing and names nothing (pinned at the end).
 #[test]
 fn prompt_origin_is_question_aware() {
     let mut rec = PromptOrigin {
@@ -1958,16 +1961,19 @@ fn prompt_origin_is_question_aware() {
         }),
         ..Default::default()
     };
+    rec.app_typed = true;
     apply_prompt(&mut rec, "d-old", "earlier", "human", 5.0);
     assert!(
         rec.question.as_ref().unwrap().first_human.is_none(),
         "a prompt before the question is no answer"
     );
     apply_prompt(&mut rec, "d1", "[worker] done", "machine", 11.0);
+    rec.app_typed = true;
     apply_prompt(&mut rec, "d2", "예", "human", 12.0);
     let q = rec.question.clone().unwrap();
     assert!(q.machine_seen);
     assert_eq!(q.first_human.as_ref().map(|f| f.0.as_str()), Some("d2"));
+    rec.app_typed = true;
     apply_prompt(&mut rec, "d3", "아니", "human", 13.0);
     assert_eq!(
         rec.question
@@ -1988,7 +1994,10 @@ fn prompt_origin_is_question_aware() {
     };
     apply_prompt(&mut u, "d", "?", "unknown", 2.0);
     assert!(u.question.unwrap().machine_seen);
-    let mut n = PromptOrigin::default();
+    let mut n = PromptOrigin {
+        app_typed: true,
+        ..Default::default()
+    };
     apply_prompt(
         &mut n,
         "d",
@@ -2009,12 +2018,35 @@ fn prompt_origin_is_question_aware() {
         ["claude.md", "route_contract.md", "x_directive.md"]
     );
     assert!(named_rule_docs("_directive.md soul notes.md").is_empty());
+    // CI1: the hook's `human` alone (no typing mark) — Level 1: origin and last_human only
+    let mut h = PromptOrigin {
+        question: Some(OpenQuestion {
+            asked_at: 1.0,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    apply_prompt(&mut h, "d", "예 고쳐라 soul.md", "human", 2.0);
+    assert_eq!(h.origin, "human");
+    assert_eq!(h.last_human, Some(("d".to_string(), 2.0)));
+    assert!(h.named_docs.is_empty() && h.last_typed.is_none());
+    let q = h.question.unwrap();
+    assert!(q.machine_seen && q.first_human.is_none());
 }
 
 /// The record lives in the daemon's map and is dropped with the seat.
 #[test]
 fn prompt_origin_record_on_daemon() {
     let daemon = crate::team_gate_tests::tmp_daemon("t3-origin", false);
+    // RULINGS CI1 (T4): without the seat's typing mark the hook's `human` names nothing
+    record_prompt_origin(&daemon, 5, "고쳐라 soul.md", None, Some("human"));
+    assert!(daemon
+        .repair_prompt_origin
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())[&5]
+        .named_docs
+        .is_empty());
+    mark_app_typing(&daemon.repair_prompt_origin, 5);
     record_prompt_origin(&daemon, 5, "고쳐라 soul.md", None, Some("human"));
     {
         let m = daemon

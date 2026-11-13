@@ -29,13 +29,22 @@ pub const TOKEN_PREFIX: &str = "ot-";
 /// sentence" is not an answer — interpretation: a short reply only).
 pub const AFFIRMATIVE_MAX_CHARS: usize = 40;
 
-/// The daemon's fixed list of affirmative replies (RULINGS Q1: 예, 네, 응, 그래, 좋아, 허락, 켜, yes, y,
-/// ok, … — polite and casual forms of the same words). Matched on the whole trimmed prompt or its
-/// leading word (trailing punctuation removed), Latin letters case-insensitively.
+/// The daemon's fixed list of affirmative words (RULINGS CI2 — a closed vocabulary over the WHOLE
+/// answer; Q1's "or its leading word" is withdrawn). Latin letters case-insensitive.
+/// ★NO word of negation, doubt or condition may EVER be added to this list (CI2): every word of an
+/// answer must be on it, so one such word would turn "안 돼" / "글쎄" / "근데" into a yes.
 pub const AFFIRMATIVE_WORDS: &[&str] = &[
-    "예", "예예", "네", "네네", "넵", "응", "웅", "그래", "그래요", "그럼", "좋아", "좋아요", "좋습니다",
-    "허락", "허락해", "허락합니다", "허락해요", "켜", "켜요", "켜줘", "켜세요", "yes", "y", "ok", "okay",
+    // Q1's words without `그럼` (CI2)
+    "예", "예예", "네", "네네", "넵", "응", "웅", "그래", "그래요", "좋아", "좋아요", "좋습니다",
+    "허락", "허락해", "허락해요", "허락합니다", "허락한다", "켜", "켜요", "켜줘", "켜라", "켜세요",
+    "켜주세요", "yes", "y", "ok", "okay",
+    // the do-it forms (CI2)
+    "해", "해줘", "해라", "하세요", "해주세요", "진행", "진행해", "진행해줘", "진행하라", "진행하세요",
+    "고쳐", "고쳐줘", "고쳐라", "고치세요", "고쳐주세요", "승인", "승인해", "승인한다", "승인합니다",
 ];
+
+/// Words an affirmative answer may hold (CI2: one to three).
+pub const AFFIRMATIVE_MAX_WORDS: usize = 3;
 
 /// The prompt-hook verdict strings of the per-seat record (`hook.machine_origin`).
 pub const ORIGIN_HUMAN: &str = "human";
@@ -61,9 +70,14 @@ pub struct PromptView<'a> {
     pub question: Option<QuestionView<'a>>,
     /// Rule-document base names (lower-cased) of the latest OWNER-TYPED prompt (U4(a)).
     pub named_docs: &'a [String],
-    /// The latest OWNER-TYPED prompt (digest, time) — kept beside the latest prompt of any origin
-    /// (RULINGS CH4), so a machine prompt arriving after the owner's words does not hide them.
+    /// The latest Level-1 OWNER-TYPED prompt (digest, time) — kept beside the latest prompt of any
+    /// origin (RULINGS CH4), so a machine prompt arriving after the owner's words does not hide them.
     pub last_human: Option<(&'a str, f64)>,
+    /// The latest LEVEL-2 prompt (digest, time) — the owner's own typing seen through the app
+    /// (RULINGS CI1); `named_docs` and `named_numbers` belong to it (CI3, CI4).
+    pub last_typed: Option<(&'a str, f64)>,
+    /// The integers 1–100 written in the latest Level-2 prompt's free text (CI4).
+    pub named_numbers: &'a [u32],
 }
 
 /// The owner-typed prompt a decision rests on (kept as provenance: digest, short excerpt, time).
@@ -74,22 +88,67 @@ pub struct Answer {
     pub at: f64,
 }
 
-/// Q1's affirmative test: the whole trimmed prompt, or its leading word, is on the fixed list —
-/// and the prompt is short (a long sentence is not an answer).
+/// RULINGS CI2 — an affirmative answer is a closed vocabulary over the WHOLE answer (the Level-2
+/// free text): no `?` / `？`; after removing one trailing run of `.` `!` `~` (ASCII and full-width)
+/// and reading `,` as a space it is ONE to THREE words; EVERY word is on [`AFFIRMATIVE_WORDS`]; at
+/// most [`AFFIRMATIVE_MAX_CHARS`] characters.
 pub fn is_affirmative(text: &str) -> bool {
     let t = text.trim();
     if t.is_empty() || t.chars().count() > AFFIRMATIVE_MAX_CHARS {
         return false;
     }
-    let clean = |w: &str| -> String {
-        w.trim_matches(|c: char| {
-            c.is_ascii_punctuation() || matches!(c, '。' | '、' | '…' | '~' | '！' | '？' | '，' | '．')
-        })
-        .to_lowercase()
-    };
-    let whole = clean(t);
-    let lead = clean(t.split_whitespace().next().unwrap_or(""));
-    AFFIRMATIVE_WORDS.contains(&whole.as_str()) || AFFIRMATIVE_WORDS.contains(&lead.as_str())
+    // no question mark anywhere (ASCII or full-width)
+    if t.contains('?') || t.contains('？') {
+        return false;
+    }
+    // one trailing run of `.` `!` `~` (ASCII and full-width) removed
+    let t = t.trim_end_matches(['.', '!', '~', '．', '！', '～']);
+    // `,` read as a space; ONE to THREE words, EVERY word on the list
+    let spaced = t.replace(',', " ");
+    let words: Vec<String> = spaced.split_whitespace().map(|w| w.to_lowercase()).collect();
+    !words.is_empty()
+        && words.len() <= AFFIRMATIVE_MAX_WORDS
+        && words.iter().all(|w| AFFIRMATIVE_WORDS.contains(&w.as_str()))
+}
+
+/// RULINGS CI4 — the integers 1–100 written as numbers of their own in an owner-typed free text
+/// (no text is kept): a run of ASCII digits without a leading zero, not glued to a Latin letter, a
+/// digit or an identifier / version / time / path character before it (`._-/:#+`), and not followed
+/// by a Latin letter, `/`, `:` or a decimal / thousands continuation (`.` or `,` + digit). A Korean
+/// counter after it ("20건") is fine.
+pub fn owner_numbers(free: &str) -> Vec<u32> {
+    let chars: Vec<char> = free.chars().collect();
+    let mut out: Vec<u32> = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if !chars[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < chars.len() && chars[i].is_ascii_digit() {
+            i += 1;
+        }
+        let run: String = chars[start..i].iter().collect();
+        let before_ok = start == 0 || {
+            let b = chars[start - 1];
+            !(b.is_ascii_alphanumeric() || "._-/:#+".contains(b))
+        };
+        let after_ok = i == chars.len() || {
+            let a = chars[i];
+            let continuation = matches!(a, '.' | ',')
+                && chars.get(i + 1).is_some_and(|c| c.is_ascii_digit());
+            !(a.is_ascii_alphanumeric() || a == '/' || a == ':' || continuation)
+        };
+        if before_ok && after_ok && !run.starts_with('0') && run.len() <= 3 {
+            if let Ok(n) = run.parse::<u32>() {
+                if (1..=100).contains(&n) && !out.contains(&n) {
+                    out.push(n);
+                }
+            }
+        }
+    }
+    out
 }
 
 fn lapsed(q: &QuestionView<'_>, now: f64) -> bool {
@@ -172,6 +231,24 @@ pub fn judge_grant_off(p: Option<&PromptView<'_>>, decided_at: Option<f64>) -> R
     Err("마지막 결정 뒤에 주인이 직접 친 입력이 없습니다 — 주인이 대화창에 '끄라'고 한 바로 그 뒤에 하세요(다른 글이 먼저 들어왔다면 `cys repair grant ask` 뒤 주인의 답)".into())
 }
 
+/// RULINGS CI4 — the daily limit a `grant ask` registers: `requested` if given, else `current`
+/// (the current decision's limit, 5 without one). A `requested` limit different from `current` is
+/// registered only when the seat's latest Level-2 prompt holds that number as a number of its own
+/// (`named_numbers`). `Err` = the reason. (The range 1–100 is checked by the caller.)
+pub fn judge_daily_cap(
+    p: Option<&PromptView<'_>>,
+    current: u32,
+    requested: Option<u32>,
+) -> Result<u32, String> {
+    let Some(n) = requested else {
+        return Ok(current);
+    };
+    if n == current || p.is_some_and(|p| p.named_numbers.contains(&n)) {
+        return Ok(n);
+    }
+    Err(format!("하루 상한 {n}건은 지금 상한({current}건)과 다릅니다 — 주인이 직접 친 말에 그 숫자({n})가 있어야 합니다(주인께 상한을 여쭌 뒤 `cys repair grant ask --daily-cap {n}`)"))
+}
+
 /// How a token request was proven to be the owner's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenBasis {
@@ -194,8 +271,9 @@ pub fn same_rel(a: &str, b: &str) -> bool {
     fold_name(&a.replace('\\', "/")) == fold_name(&b.replace('\\', "/"))
 }
 
-/// RULINGS Q2 / T3 / U4: `owner-token --path <doc>` — (a) the seat's latest owner-typed prompt
-/// names the document (`named_docs` holds its folded base name), or (b) the open question is a
+/// RULINGS Q2 / T3 / U4 / CI3: `owner-token --path <doc>` — (a) the seat's latest Level-2 prompt,
+/// younger than 30 minutes, names the document (`named_docs` holds its folded base name; one naming
+/// is good for one token — the daemon takes it on issuing), or (b) the open question is a
 /// token question for EXACTLY this path, not lapsed, answered first by an owner-typed affirmative
 /// prompt with no machine prompt between. The token is then scoped to exactly that path.
 pub fn judge_owner_token(
@@ -207,22 +285,25 @@ pub fn judge_owner_token(
     let Some(p) = p else {
         return Err(format!("이 좌석에는 주인이 직접 친 입력의 기록이 없습니다 — 주인이 '고쳐라 {base}'처럼 문서를 말하거나, `cys repair owner-token ask --path {doc_rel}` 뒤 주인이 직접 허락해야 합니다"));
     };
-    if p.named_docs.iter().any(|n| fold_name(n) == base) {
-        // `named_docs` and `last_human` are written together, from the same owner-typed prompt (CH4)
-        let (digest, at) = match p.last_human {
-            Some((d, at)) => (d.to_string(), at),
-            None if p.origin == ORIGIN_HUMAN => (p.digest.to_string(), p.at),
-            None => (String::new(), 0.0),
-        };
-        return Ok((
-            TokenBasis::NamedInPrompt,
-            Answer {
-                digest,
-                excerpt: format!("named: {base}"),
-                at,
-            },
-        ));
+    let named = p.named_docs.iter().any(|n| fold_name(n) == base);
+    if named {
+        // CI3: `named_docs` belong to the seat's latest Level-2 prompt; good for ONE token while that
+        // prompt is younger than the question lapse (the daemon removes the document on issuing)
+        if let Some((digest, at)) = p.last_typed {
+            if now - at <= QUESTION_LAPSE_SECS as f64 {
+                return Ok((
+                    TokenBasis::NamedInPrompt,
+                    Answer {
+                        digest: digest.to_string(),
+                        excerpt: format!("named: {base}"),
+                        at,
+                    },
+                ));
+            }
+        }
     }
+    // a stale naming does not hide an answered token question (Q2 (b) stays open)
+    let stale_naming = || format!("주인이 이 문서({base})를 부른 지 30분이 지났습니다 — 주인이 다시 이름을 부르거나, `cys repair owner-token ask --path {doc_rel}` 뒤 주인이 직접 허락해야 합니다");
     if let Some(q) = p.question {
         match q.path {
             Some(qp) if same_rel(qp, doc_rel) => {
@@ -247,11 +328,14 @@ pub fn judge_owner_token(
                     },
                 ));
             }
-            Some(qp) => {
+            Some(qp) if !named => {
                 return Err(format!("열린 질문은 다른 문서({qp})에 대한 것입니다 — 주인이 이 문서({base})를 말하지 않았으므로 표를 만들지 않습니다"));
             }
-            None => {}
+            _ => {}
         }
+    }
+    if named {
+        return Err(stale_naming());
     }
     Err(format!("주인이 직접 친 마지막 입력이 이 문서({base})를 이름으로 부르지 않았습니다 — 주인이 '고쳐라 {base}'처럼 문서를 말하거나, `cys repair owner-token ask --path {doc_rel}` 뒤 주인이 직접 허락해야 합니다"))
 }
@@ -428,9 +512,11 @@ pub const CSO_DIRECTIVE_NAME: &str = "cso_directive.md";
 
 /// `capgate_marker_ok` of `javis_preflight.py`: a line of the first 20, stripped, equals the marker.
 pub fn cso_marker_in_head(text: &str) -> bool {
-    text.lines()
+    // RULINGS CI5 (c): the registrar's `str.splitlines()` and `str.strip()` exactly
+    crate::mission_gate::py_splitlines(text)
+        .into_iter()
         .take(CSO_DIRECTIVE_MARKER_MAX_LINE)
-        .any(|l| l.trim() == CSO_DIRECTIVE_REV_MARKER)
+        .any(|l| l.trim_matches(crate::mission_gate::is_py_space) == CSO_DIRECTIVE_REV_MARKER)
 }
 
 /// The refusal sentence of a CSO-directive candidate that drops the marker (AQ8).
@@ -461,17 +547,33 @@ mod tests {
             question,
             named_docs: named,
             last_human: None,
+            last_typed: Some(("typed", at)),
+            named_numbers: &[],
         }
     }
 
-    /// Q1: the fixed list, whole prompt or leading word; long sentences, other words, empty → no.
+    /// RULINGS CI2 (rewritten from Q1's "whole prompt or leading word"): the ten fixed vectors, then
+    /// the closed vocabulary's edges. The OLD expectations "네, 켜 주세요", "예 고쳐도 됩니다", "Yes
+    /// please" → yes are withdrawn ("주세요", "고쳐도", "됩니다", "please" are not on the list).
     #[test]
     fn affirmative_list() {
-        for yes in ["예", " 네 ", "네.", "응!", "그래요", "좋아", "허락", "켜", "yes", "Y", "OK", "ok.", "네, 켜 주세요", "예 고쳐도 됩니다", "Yes please"] {
+        // CI2's ten fixed vectors
+        for no in ["네?", "예? 안 돼요", "그럼 안 되지", "좋아 보이지 않아", "예 근데 내일"] {
+            assert!(!is_affirmative(no), "CI2 refuses {no:?}");
+        }
+        for yes in ["예", "네!", "예, 켜줘", "응 고쳐라", "OK"] {
+            assert!(is_affirmative(yes), "CI2 passes {yes:?}");
+        }
+        // edges of the rule
+        for yes in [" 네 ", "네.", "응!!", "좋아요~", "네！", "예．", "그래요～", "yes", "Y", "ok.", "Okay", "네, 진행해", "허락 승인 해", "켜주세요", "고쳐주세요"] {
             assert!(is_affirmative(yes), "{yes:?}");
         }
         for no in [
             "",
+            "?",
+            "네？",
+            "예!?",
+            "그럼",
             "아니요",
             "안 돼",
             "no",
@@ -479,11 +581,48 @@ mod tests {
             "noted",
             "yesterday",
             "글쎄",
+            "네, 켜 주세요",
+            "예 고쳐도 됩니다",
+            "Yes please",
+            "네 네 네 네",
+            "예.켜줘",
             "네 그런데 잠깐만 다른 얘기부터 하자 이건 아주 긴 문장이라서 대답이 아니다",
             "고쳐라 soul.md",
+            "예 \0\0\0",
         ] {
             assert!(!is_affirmative(no), "{no:?}");
         }
+        assert!(!AFFIRMATIVE_WORDS.contains(&"그럼"));
+        for w in ["안", "아니", "아니요", "no", "not", "글쎄", "근데", "만약", "if", "maybe"] {
+            assert!(!AFFIRMATIVE_WORDS.contains(&w), "a word of negation / doubt / condition: {w}");
+        }
+    }
+
+    /// CI4: numbers of their own, 1–100, from the owner's free text (no text kept).
+    #[test]
+    fn owner_numbers_rule() {
+        assert_eq!(owner_numbers("하루 20건으로 바꿔"), [20]);
+        assert_eq!(owner_numbers("3, 7 그리고 100"), [3, 7, 100]);
+        assert_eq!(owner_numbers("20 20"), [20]);
+        for none in ["v0.20", "R-20", "20.5", "1,000", "10:30", "a20", "20x", "0", "05", "101", "path/20", "#20", "+20"] {
+            assert!(owner_numbers(none).is_empty(), "{none:?} → {:?}", owner_numbers(none));
+        }
+        assert_eq!(owner_numbers("상한은 20."), [20], "a sentence end after the number is fine");
+    }
+
+    /// CI4: a new limit needs the owner's own number; the current limit (or none) needs nothing.
+    #[test]
+    fn daily_cap_judgment() {
+        let none: Vec<String> = vec![];
+        let mut p = view("human", 5.0, None, &none);
+        assert_eq!(judge_daily_cap(Some(&p), 5, None), Ok(5));
+        assert_eq!(judge_daily_cap(Some(&p), 5, Some(5)), Ok(5));
+        assert!(judge_daily_cap(Some(&p), 5, Some(20)).unwrap_err().contains("grant ask --daily-cap 20"));
+        assert!(judge_daily_cap(None, 5, Some(20)).is_err());
+        let nums = [20u32];
+        p.named_numbers = &nums;
+        assert_eq!(judge_daily_cap(Some(&p), 5, Some(20)), Ok(20));
+        assert!(judge_daily_cap(Some(&p), 5, Some(3)).is_err());
     }
 
     /// Q1 / T3 / T5 / U4(b): every refusal of `grant on` names its reason; the accepted answer is the
@@ -546,11 +685,17 @@ mod tests {
         assert_eq!(judge_owner_token(Some(&p), "soul.md", 10.0).unwrap().0, TokenBasis::NamedInPrompt);
         assert_eq!(judge_owner_token(Some(&p), "SOUL.md", 10.0).unwrap().0, TokenBasis::NamedInPrompt);
         assert!(judge_owner_token(Some(&p), "directives/MASTER_DIRECTIVE.md", 10.0).is_err());
-        // a later machine prompt does not erase what the owner named (named_docs changes only on an
-        // owner-typed prompt) — provenance digest is then unknown
+        // a later machine prompt does not erase what the owner named (named_docs change only on a
+        // Level-2 prompt) — the provenance is that Level-2 prompt (CI3; OLD expectation: digest "")
         let p = view("machine", 6.0, None, &soul);
+        let mut p = p;
+        p.last_typed = Some(("named-digest", 5.0));
         let (_, a) = judge_owner_token(Some(&p), "soul.md", 10.0).unwrap();
-        assert_eq!(a.digest, "");
+        assert_eq!((a.digest.as_str(), a.at), ("named-digest", 5.0));
+        // CI3: a naming older than 30 minutes is refused; no Level-2 prompt at all → refused
+        assert!(judge_owner_token(Some(&p), "soul.md", 5.0 + 1_801.0).unwrap_err().contains("30분"));
+        p.last_typed = None;
+        assert!(judge_owner_token(Some(&p), "soul.md", 10.0).is_err());
         // nothing named, no question
         let p = view("human", 5.0, None, &none);
         assert!(judge_owner_token(Some(&p), "soul.md", 10.0).unwrap_err().contains("이름으로 부르지"));
@@ -568,6 +713,14 @@ mod tests {
         // the grant question does not issue tokens
         let p = view("human", 5.0, Some(q(1.0, None, Some(("d", "네", 2.0)), false)), &none);
         assert!(judge_owner_token(Some(&p), "soul.md", 10.0).is_err());
+        // a stale naming does not hide an answered token question for the same document (Q2 (b))
+        let mut p = view("human", 5.0, Some(q(2_000.0, Some("soul.md"), Some(("d", "네", 2_001.0)), false)), &soul);
+        p.last_typed = Some(("named-digest", 5.0));
+        assert_eq!(judge_owner_token(Some(&p), "soul.md", 2_010.0).unwrap().0, TokenBasis::AnsweredQuestion);
+        // … nor a fresh naming an open question about another document
+        let mut p = view("human", 5.0, Some(q(1.0, Some("directives/MASTER_DIRECTIVE.md"), None, false)), &soul);
+        p.last_typed = Some(("named-digest", 5.0));
+        assert_eq!(judge_owner_token(Some(&p), "soul.md", 10.0).unwrap().0, TokenBasis::NamedInPrompt);
     }
 
     /// O-C10-2: `ot-` + base32 of 128 bits; the hash is the ledger key; the layout is `paths.rs`'s.
@@ -659,6 +812,19 @@ mod tests {
         let mut far = "x\n".repeat(20);
         far.push_str(m);
         assert!(!cso_marker_in_head(&far), "line 21 is outside the head");
+        // CI5 (c) parity with the registrar's `str.splitlines()` / `str.strip()` (measured with
+        // python 3.12 `capgate_marker_ok` on the same strings: True, True, False, True):
+        // `\r`, `\x0c` and U+2028 break lines; `\x0c` / U+3000 around the marker are stripped
+        assert!(cso_marker_in_head(&format!("a\rb\x0cc\u{2028}{m}\n")));
+        assert!(cso_marker_in_head(&format!("# x\r\n\x0c{m}\u{3000}\r\nbody")));
+        let mut far = "x\r".repeat(10);
+        far.push_str(&"y\u{2028}".repeat(10));
+        far.push_str(m);
+        assert!(!cso_marker_in_head(&far), "the 21st python line");
+        let mut near = "x\r".repeat(10);
+        near.push_str(&"y\u{2028}".repeat(9));
+        near.push_str(m);
+        assert!(cso_marker_in_head(&near), "the 20th python line");
         assert_eq!(folded_base("directives/CSO_DIRECTIVE.md"), CSO_DIRECTIVE_NAME);
     }
 }

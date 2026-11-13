@@ -1630,6 +1630,22 @@ def machine_origin(prompt, delivery=None, ledger_status=None):
 # 위조는 막지 못한다(같은 등급의 한계 — docs/THREAT-MODEL-mission-gate.md).
 OWNER_DOUBT_CODES = ("ledger_bad_lines", "ledger_schema_skew", "delivery_parts_capped")
 
+# RULINGS CI1(T4): 알림 가족 — `task-notification` 과 그 안에서만 쓰이는 컨텍스트 마커. 이 가족의 **블록**
+# (여는 태그 ~ 같은 이름 닫는 태그)이 하나라도 든 프롬프트는 주변 글과 무관하게 harness 가 합성한 차례다
+# (Rust `mission_gate::owner_notification_family` · `holds_notification_block` 파리티).
+OWNER_NOTIFICATION_FAMILY = ("task-notification",) + HARNESS_CONTEXT_MARKERS
+_NOTIFICATION_FAMILY_BLOCKS = tuple(
+    (re.compile(r"<\s*%s(?![\w-])[^<>]*>.*?<\s*/\s*%s(?![\w-])\s*>"
+                % (re.escape(m), re.escape(m)), re.IGNORECASE | re.DOTALL),
+     re.compile(r"<\s*/\s*%s(?![\w-])\s*>" % re.escape(m), re.IGNORECASE))
+    for m in OWNER_NOTIFICATION_FAMILY)
+
+
+def holds_notification_block(prompt):
+    """RULINGS CI1 — 프롬프트에 알림 가족의 블록이 들어 있는가(닫는 태그가 없으면 블록도 없다)."""
+    p = prompt or ""
+    return any(close.search(p) and block.search(p) for block, close in _NOTIFICATION_FAMILY_BLOCKS)
+
 
 def owner_typed(prompt, origin, ledger_status, anomaly_codes):
     """(bool, 사유) — 이 프롬프트를 **주인이 직접 친 것**으로 셀 수 있는가(실패 시 닫힘).
@@ -1647,6 +1663,9 @@ def owner_typed(prompt, origin, ledger_status, anomaly_codes):
     hit, why = harness_origin(prompt)
     if hit:
         return False, "harness 가 합성한 알림(층0) — %s" % why
+    if holds_notification_block(prompt):
+        return False, ("알림 가족 블록(task-notification 등)이 들어 있다 — 주변 글과 무관하게 harness 가 "
+                       "합성한 차례다(RULINGS CI1)")
     boot, why = boot_command_origin(prompt)
     if boot:
         return False, "기동 명령문(층0-c) — %s" % why

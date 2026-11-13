@@ -1871,6 +1871,43 @@ pub fn machine_origin(
 pub const OWNER_DOUBT_CODES: [&str; 3] =
     ["ledger_bad_lines", "ledger_schema_skew", "delivery_parts_capped"];
 
+/// RULINGS CI1 (T4) — 알림 가족: `task-notification` 과 그 안에서만 쓰이는 컨텍스트 마커
+/// ([`HARNESS_CONTEXT_MARKERS`]). 이 가족의 **블록**(여는 태그 ~ 같은 이름의 닫는 태그)이 하나라도
+/// 든 프롬프트는 주변에 어떤 글이 있든 harness 가 합성한 차례다(python `OWNER_NOTIFICATION_FAMILY`).
+pub fn owner_notification_family() -> Vec<&'static str> {
+    let mut v = vec!["task-notification"];
+    v.extend(HARNESS_CONTEXT_MARKERS.iter().copied());
+    v
+}
+
+fn notification_family_blocks() -> &'static Vec<(Regex, Regex)> {
+    static R: OnceLock<Vec<(Regex, Regex)>> = OnceLock::new();
+    R.get_or_init(|| {
+        owner_notification_family()
+            .iter()
+            .map(|m| {
+                let e = regex::escape(m);
+                (
+                    Regex::new(&format!(
+                        r"(?is)<\s*{e}{NAME_BOUNDARY_TAIL}.*?<\s*/\s*{e}\s*>"
+                    ))
+                    .expect("NOTIFICATION_FAMILY_BLOCK 컴파일 실패"),
+                    Regex::new(&format!(r"(?i)<\s*/\s*{e}\s*>"))
+                        .expect("NOTIFICATION_FAMILY_CLOSE 컴파일 실패"),
+                )
+            })
+            .collect()
+    })
+}
+
+/// RULINGS CI1 — 프롬프트에 알림 가족의 블록이 들어 있는가(python `holds_notification_block`).
+/// 닫는 태그가 없으면 짝 블록도 없다(비용 가드 — [`harness_strip`] 과 같은 규율).
+pub fn holds_notification_block(prompt: &str) -> bool {
+    notification_family_blocks()
+        .iter()
+        .any(|(block, close)| close.is_match(prompt) && block.is_match(prompt))
+}
+
 /// [`owner_typed`] 의 결과.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnerJudgment {
@@ -1892,7 +1929,9 @@ pub struct OwnerJudgment {
 ///   ③ [`OWNER_DOUBT_CODES`] 의 이상징후가 있으면 아니다(원장이 그 배달을 다 보여 주지 못했다).
 ///   ④ harness 가 프로세스 안에서 합성한 알림(층0 [`harness_origin`])이면 아니다 — 배달 원장에도
 ///      없고 라벨도 없어 층1·층2 판정은 사람으로 본다.
-///   ⑤ 기동 명령문(층0-c [`boot_command_origin`])이면 아니다.
+///   ⑤ 알림 가족(`task-notification`·컨텍스트 마커)의 블록이 하나라도 들어 있으면 아니다 —
+///      앞뒤에 자유 텍스트가 있어도(RULINGS CI1, [`holds_notification_block`]).
+///   ⑥ 기동 명령문(층0-c [`boot_command_origin`])이면 아니다.
 /// codex·agy 좌석에는 입력 훅이 없어 애초에 판정 입력이 생기지 않는다(안전한 방향). 같은 사용자 권한으로
 /// 원장·대장을 직접 고치는 위조는 막지 못한다(SOT `docs/THREAT-MODEL-mission-gate.md` 와 같은 한계).
 pub fn owner_typed(
@@ -1928,6 +1967,12 @@ pub fn owner_typed(
     }
     if let Some(why) = harness_origin(prompt) {
         return no(format!("harness 가 합성한 알림(층0) — {why}"));
+    }
+    if holds_notification_block(prompt) {
+        return no(
+            "알림 가족 블록(task-notification 등)이 들어 있다 — 주변 글과 무관하게 harness 가 합성한 차례다(RULINGS CI1)"
+                .to_string(),
+        );
     }
     if let Some(why) = boot_command_origin(prompt) {
         return no(format!("기동 명령문(층0-c) — {why}"));
