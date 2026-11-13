@@ -2432,7 +2432,7 @@ pub(crate) mod tests {
     ///
     /// ## 무엇을 재는가 — 파일 하나가 아니라 **합성 문안**
     /// pane 에 실제로 들어가는 것은 `cys.rs::compose_directive` 의 출력이다(역할 디렉티브 +
-    /// RSI + soul.md + 장기메모리 색인 + 스킬 색인). 라운드6 은 `MASTER_DIRECTIVE.md` **단독**
+    /// RSI + soul.md + 장기메모리 색인 + 스킬 색인 + 0.15.0 의 역할 규칙 블록). 라운드6 은 `MASTER_DIRECTIVE.md` **단독**
     /// 454 단위만 보고 "여유 46" 이라고 했지만, 합성본은 master 기준 700 단위대여서 종전 상한
     /// 500 은 **이미 초과 상태**였다. 이 핀은 그 착시를 다시 만들지 않는다.
     /// (합성 로직은 `cys` 바이너리에 있으므로 여기서는 **같은 구성요소를 같은 순서로 이어붙여**
@@ -2445,7 +2445,7 @@ pub(crate) mod tests {
         const REQUIRED_HEADROOM: usize = 4;
         let pack = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("cysjavis-pack");
         let read = |rel: &str| std::fs::read_to_string(pack.join(rel)).unwrap_or_default();
-        // compose_directive 와 같은 순서 — 역할 디렉티브 → RSI → soul → 장기메모리 색인 → 스킬 색인
+        // compose_directive 와 같은 순서 — 역할 디렉티브 → RSI → soul → 장기메모리 색인 → 스킬 색인 → 역할 규칙 블록
         let mut composed = read("directives/MASTER_DIRECTIVE.md");
         composed.push_str(&read("directives/RSI_LEARNING_DIRECTIVE.md"));
         composed.push_str(&read("soul.md"));
@@ -2469,6 +2469,12 @@ pub(crate) mod tests {
                 }
             }
         }
+        // ★(0.15.0 · 「스스로 해결」 M1 · RULINGS AA2) `compose_directive` 는 합성 문안의 **맨 끝**에 역할 규칙 블록을 붙인다
+        //   (`cys::repair::rules::rules_text` — 공통 9줄 + 역할 1줄). 실제 페이로드의 구성요소이므로 여기서도 센다.
+        composed.push_str("\n\n");
+        composed.push_str(
+            &cys::repair::rules::rules_text(cys::repair::roles::RoleBlock::MasterCeo).expect("role block"),
+        );
         assert!(
             !composed.is_empty(),
             "합성 문안이 비었다 — 팩 경로가 갈렸다({})",
@@ -2528,7 +2534,7 @@ pub(crate) mod tests {
             "합성본이 ≈59KB 페이로드 상당이어야 케이스가 성립한다 (실측 {} bytes)",
             synthesized.len()
         );
-        // compose_directive 후첨과 같은 순서 — RSI → soul → 장기메모리 색인 → 스킬 색인(핀 ① 동형).
+        // compose_directive 후첨과 같은 순서 — RSI → soul → 장기메모리 색인 → 스킬 색인 → 역할 규칙 블록(핀 ① 동형).
         let mut composed = synthesized;
         composed.push_str(&read("directives/RSI_LEARNING_DIRECTIVE.md"));
         composed.push_str(&read("soul.md"));
@@ -2551,6 +2557,12 @@ pub(crate) mod tests {
                 }
             }
         }
+        // ★(0.15.0 · 「스스로 해결」 M1 · RULINGS AA2) `compose_directive` 는 합성 문안의 **맨 끝**에 역할 규칙 블록을 붙인다
+        //   (`cys::repair::rules::rules_text` — 공통 9줄 + 역할 1줄). 실제 페이로드의 구성요소이므로 여기서도 센다.
+        composed.push_str("\n\n");
+        composed.push_str(
+            &cys::repair::rules::rules_text(cys::repair::roles::RoleBlock::MasterCeo).expect("role block"),
+        );
         let units = submit_units(&composed).len();
         assert!(
             units * REQUIRED_HEADROOM <= MAX_PARTS,

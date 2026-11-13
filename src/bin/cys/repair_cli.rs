@@ -8,6 +8,8 @@
 //! code (93 + the O-C3-7 sentence for an old daemon, 98 when no daemon answers — never autostarted).
 //! Every other verb still prints `"이 빌드에는 아직 구현되지 않았습니다: cys repair <verb>"` and exits
 //! 99 (N-2) until its track fills it. The verb names and flags below are contract (TRACKS §6.3).
+//! T1a fills the local `rules` (the role rule block, C6). The local verbs run before lane discovery
+//! (`is_local` / `run_local`, called from `main()` — RULINGS Z3) with an rpc that always errors (AF4).
 
 use serde_json::{json, Value};
 use std::io::Write;
@@ -261,6 +263,54 @@ pub(crate) fn run(cmd: RepairCmd) -> i32 {
     super::AUTOSTART.store(false, std::sync::atomic::Ordering::SeqCst);
     let rpc = |method: &str, params: Value| super::request(method, params);
     run_with(&cmd, &mut std::io::stdout(), &mut std::io::stderr(), &rpc)
+}
+
+/// The LOCAL verbs (C3 O-C3-1): they never send a daemon request. `main()` runs them through
+/// [`run_local`] BEFORE lane discovery, so not even `system.identify` reaches a daemon (RULINGS Z3 ·
+/// B10 · appendix A 1-17).
+pub(crate) fn is_local(cmd: &RepairCmd) -> bool {
+    matches!(
+        cmd,
+        RepairCmd::Rules { .. }
+            | RepairCmd::BootCritical { .. }
+            | RepairCmd::Tombstones { .. }
+            | RepairCmd::Gate { .. }
+            | RepairCmd::AuthHelper { .. }
+    )
+}
+
+/// The rpc a LOCAL verb runs with: it ALWAYS errors, so a local verb can never send a request
+/// (RULINGS AF4). A local verb that tried would fail closed (exit 98, nothing on stdout).
+fn local_rpc(method: &str, _params: Value) -> Result<Value, String> {
+    Err(format!("local verb: no daemon request is sent ({method})"))
+}
+
+/// [`run`] by reference for the early return of `main()` (RULINGS Z3) — the same dispatch, with
+/// [`local_rpc`] in place of the daemon.
+pub(crate) fn run_local(cmd: &RepairCmd) -> i32 {
+    super::AUTOSTART.store(false, std::sync::atomic::Ordering::SeqCst);
+    run_with(cmd, &mut std::io::stdout(), &mut std::io::stderr(), &local_rpc)
+}
+
+/// `cys repair rules --role <role>` (C6 O-C6-1, RULINGS B10 — T1a): prints the role's compiled rule
+/// block (`rules_text(role_block_for(role))`, the same text `compose_directive` and the `[RESUME]` text
+/// carry) to `out` and exits 0. LOCAL and pure: no daemon, no file, no environment read. On any error
+/// NOTHING goes to `out` (the session-start hook prints `out` only on exit 0), the reason goes to `err`.
+fn run_rules(role: &str, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    let block = cys::repair::roles::role_block_for(role);
+    match cys::repair::rules::rules_text(block) {
+        Ok(text) => match out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
+            Ok(()) => 0,
+            Err(e) => {
+                let _ = writeln!(err, "cys repair rules: 출력 실패: {e}");
+                1
+            }
+        },
+        Err(e) => {
+            let _ = writeln!(err, "cys repair rules: {e:?}");
+            e.exit_code()
+        }
+    }
 }
 
 /// O-C3-7: a new CLI meeting an old daemon fails closed with this sentence and exit 93.
@@ -656,6 +706,9 @@ fn tombstones_local_in(
 /// Runs a verb against `rpc` (the daemon in production, a fake in the tests). A failing stderr write
 /// is ignored (a closed stderr must not turn into a panic).
 fn run_with(cmd: &RepairCmd, out: &mut dyn Write, err: &mut dyn Write, rpc: Rpc<'_>) -> i32 {
+    if let RepairCmd::Rules { role } = cmd {
+        return run_rules(role, out, err);
+    }
     if let RepairCmd::Tombstones { json } = cmd {
         return tombstones_local(out, err, *json);
     }
@@ -668,7 +721,7 @@ fn run_with(cmd: &RepairCmd, out: &mut dyn Write, err: &mut dyn Write, rpc: Rpc<
             Err(e) => fail(err, &e),
         };
     }
-    // The verbs whose bodies belong to other tracks (T1a rules · T4 grant/owner-token/rule-doc-allowed ·
+    // The verbs whose bodies belong to other tracks (T4 grant/owner-token/rule-doc-allowed ·
     // T5a boot-critical · T5b submit/auth-helper · T6 revert/sweep/tick/reapply · T7b gate/recheck).
     let _ = writeln!(
         err,
@@ -932,6 +985,14 @@ mod tests {
             if name == "tombstones" {
                 continue;
             }
+            if name == "rules" {
+                // T1a: the local `rules` prints the block (byte-exact in
+                // `rules_prints_the_block_byte_for_byte`), nothing on stderr, exit 0, no request.
+                let (mut out, mut err) = (Vec::new(), Vec::new());
+                assert_eq!(run_with(&cmd, &mut out, &mut err, &old_daemon), 0);
+                assert!(err.is_empty() && !out.is_empty(), "`cys repair {}`", argv.join(" "));
+                continue;
+            }
             let (mut out, mut err) = (Vec::new(), Vec::new());
             let code = run_with(&cmd, &mut out, &mut err, &old_daemon);
             assert!(
@@ -1022,7 +1083,8 @@ mod tests {
             93
         );
 
-        // Structure: production code of this module never prints to stdout.
+        // Structure: production code of this module never prints to stdout directly — only through
+        // the `out` writer of `run_with` (the local `rules` verb, T1a).
         let src = include_str!("repair_cli.rs");
         let prod = &src[..src.find("#[cfg(test)]").expect("test module boundary")];
         for needle in ["println!", "print!(", "stdout().write", "io::stdout().lock"] {
@@ -1199,5 +1261,220 @@ mod tests {
         assert!(out.is_empty());
         assert!(!err.is_empty());
         let _ = std::fs::remove_dir_all(&root);
+    }
+    /// The role strings `rules --role` accepts in practice: the six of O-C6-1 and real seat names.
+    const RULE_ROLES: [&str; 13] = [
+        "master",
+        "ceo",
+        "worker",
+        "worker-3",
+        "cso",
+        "cso-2",
+        "reviewer1",
+        "reviewer2",
+        "reviewer-codex",
+        "reviewer-claude-1",
+        "planner",
+        "scan-bot",
+        "",
+    ];
+
+    /// A-3s-04 (b) / O-C6-1: `cys repair rules --role <role>` prints exactly the compiled block of that
+    /// role (the same text `compose_directive` and `[RESUME]` carry), nothing on stderr, exit 0. (The 2-s
+    /// bound is the hook's — `cys_timeout_run 2`, hook check 23d — no wall-clock premise here.)
+    #[test]
+    fn rules_prints_the_block_byte_for_byte() {
+        // AF4: `rules` must not send a request — a counting rpc stays at zero.
+        let requests = std::cell::Cell::new(0usize);
+        let no_request = |_m: &str, _p: Value| -> Result<Value, String> {
+            requests.set(requests.get() + 1);
+            Err("no request expected".into())
+        };
+        for role in RULE_ROLES {
+            let cmd = parse(&["rules", "--role", role]).unwrap();
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            assert_eq!(run_with(&cmd, &mut out, &mut err, &no_request), 0, "{role:?}");
+            assert!(err.is_empty(), "{role:?}: {}", String::from_utf8_lossy(&err));
+            let want = cys::repair::rules::rules_text(cys::repair::roles::role_block_for(role)).unwrap();
+            assert_eq!(String::from_utf8(out).unwrap(), want, "{role:?}");
+        }
+        // The master text is the common part + the master/CEO constant, byte for byte.
+        let cmd = parse(&["rules", "--role", "master"]).unwrap();
+        let mut out = Vec::new();
+        assert_eq!(run_with(&cmd, &mut out, &mut Vec::new(), &no_request), 0);
+        let want = format!(
+            "{}{}",
+            cys::repair::rules::RULES_COMMON,
+            cys::repair::rules::RULES_MASTER_CEO
+        );
+        assert_eq!(out, want.into_bytes());
+        // A failing stdout is reported on stderr with a non-zero exit (the hook then prints nothing).
+        struct Broken;
+        impl Write for Broken {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "closed"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut err = Vec::new();
+        assert_ne!(run_with(&cmd, &mut Broken, &mut err, &no_request), 0);
+        assert!(!err.is_empty());
+        assert_eq!(requests.get(), 0, "`rules` sent a request");
+    }
+
+    /// A-3s-04 (b) / RULINGS B10: `rules` never contacts a daemon. The socket the CLI would use is a
+    /// listener of this test; after every `rules` call nothing has connected to it.
+    #[cfg(unix)]
+    #[test]
+    fn rules_never_contacts_a_daemon() {
+        let _env = crate::tests::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("cys-t1a-rules-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("d.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind test socket");
+        listener.set_nonblocking(true).unwrap();
+        let saved = std::env::var_os(cys::ENV_SOCKET);
+        std::env::set_var(cys::ENV_SOCKET, &sock);
+        let no_request = local_rpc;
+        let mut outs = Vec::new();
+        for role in RULE_ROLES {
+            let cmd = parse(&["rules", "--role", role]).unwrap();
+            let mut out = Vec::new();
+            outs.push(run_with(&cmd, &mut out, &mut Vec::new(), &no_request));
+        }
+        let accepted = listener.accept();
+        match saved {
+            Some(v) => std::env::set_var(cys::ENV_SOCKET, v),
+            None => std::env::remove_var(cys::ENV_SOCKET),
+        }
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(outs.iter().all(|rc| *rc == 0), "{outs:?}");
+        match accepted {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Ok(_) => panic!("`cys repair rules` connected to the daemon socket"),
+            Err(e) => panic!("unexpected accept error: {e}"),
+        }
+    }
+
+    /// RULINGS Z3: `is_local` is exactly the five LOCAL verbs of C3 — no daemon-backed verb ever takes
+    /// the early return, and no local verb ever reaches lane discovery.
+    #[test]
+    fn local_verbs_are_exactly_the_contract_five() {
+        let minimal: [&[&str]; 23] = [
+            &["report", "--file", "a", "--error", "e"],
+            &["begin", "--files", "a", "--trigger", "owner-order"],
+            &["record", "R-1", "--note", "n"],
+            &["submit", "R-1"],
+            &["commit", "R-1"],
+            &["attest-verify", "R-1", "--verdict", "pass", "--note", "n"],
+            &["attest-audit", "R-1", "--verdict", "ok", "--note", "n"],
+            &["list"],
+            &["status"],
+            &["revert", "R-1"],
+            &["reapply", "R-1"],
+            &["cleanup", "R-1"],
+            &["grant", "ask"],
+            &["owner-token", "--path", "p"],
+            &["rule-doc-allowed", "--path", "p"],
+            &["sweep"],
+            &["recheck", "R-1"],
+            &["tick"],
+            &["rules", "--role", "worker"],
+            &["boot-critical", "--list"],
+            &["tombstones"],
+            &["gate", "--lane", "base"],
+            &["auth-helper", "--request", "r", "--reason", "x"],
+        ];
+        let mut seen = Vec::new();
+        for argv in minimal {
+            let cmd = parse(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            let name = verb_name(&cmd);
+            assert_eq!(is_local(&cmd), LOCAL.contains(&name), "{name}");
+            seen.push(name);
+        }
+        seen.sort_unstable();
+        let mut all = CLI_NAMES.to_vec();
+        all.sort_unstable();
+        assert_eq!(seen, all, "not every verb was classified");
+    }
+
+    /// RULINGS Z3 (B10 · appendix A 1-17): in `main()` the local repair verbs leave through `run_local`
+    /// BEFORE `initialize_lane_identity` (lane discovery sends `system.identify`). Fails when the early
+    /// return is removed or moved below discovery. Comment lines are ignored (a comment is no code).
+    #[test]
+    fn main_returns_early_for_local_repair_verbs() {
+        let src = include_str!("../cys.rs");
+        let start = src.find("\nfn main() {\n").expect("fn main() of the cys CLI");
+        let end = start + 1 + src[start + 1..].find("\n}\n").expect("end of fn main()");
+        let code: String = src[start..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let parse_at = code.find("let cli = Cli::parse();").expect("argument parsing in main()");
+        let early = code
+            .find("if let Command::Repair { cmd } = &cli.command {")
+            .expect("RULINGS Z3 early return is missing from main()");
+        let local = code.find("repair_cli::is_local(cmd)").expect("Z3: is_local test");
+        let exit = code
+            .find("std::process::exit(repair_cli::run_local(cmd));")
+            .expect("Z3: exit through run_local");
+        let discovery = code
+            .find("initialize_lane_identity(&cli.command);")
+            .expect("lane discovery call in main()");
+        assert!(
+            parse_at < early && early < local && local < exit && exit < discovery,
+            "the local-verb early return must sit between argument parsing and lane discovery"
+        );
+        assert_eq!(code.matches("repair_cli::run_local(").count(), 1, "one insertion only");
+    }
+
+    /// C3: every `cys repair <verb>` quoted in a role block is a real `cys repair` sub-command, and the
+    /// two quoted `ask` forms parse exactly as written in the master block.
+    #[test]
+    fn quoted_verbs_are_cli_verbs() {
+        use cys::repair::roles::RoleBlock;
+        let rx = regex::Regex::new(r"cys repair ([a-z][a-z-]*)").unwrap();
+        for b in [
+            RoleBlock::MasterCeo,
+            RoleBlock::Worker,
+            RoleBlock::Cso,
+            RoleBlock::Reviewer,
+            RoleBlock::CommonOnly,
+        ] {
+            let text = cys::repair::rules::rules_text(b).unwrap();
+            for c in rx.captures_iter(&text) {
+                assert!(CLI_NAMES.contains(&&c[1]), "{b:?} quotes `cys repair {}` — no such verb", &c[1]);
+            }
+        }
+        let master = cys::repair::rules::RULES_MASTER_CEO;
+        assert!(master.contains("`cys repair grant ask`"));
+        assert!(master.contains("`cys repair owner-token ask --path <문서>`"));
+        assert!(matches!(
+            parse(&["grant", "ask"]).unwrap(),
+            RepairCmd::Grant { mode: GrantMode::Ask, .. }
+        ));
+        assert!(matches!(
+            parse(&["owner-token", "ask", "--path", "directives/WORKER_DIRECTIVE.md"]).unwrap(),
+            RepairCmd::OwnerToken { mode: Some(OwnerTokenMode::Ask), .. }
+        ));
+    }
+
+    /// RULINGS AF4: the rpc of `run_local` ALWAYS errors (for every method), and `run_local` uses it — a
+    /// local verb run from `main()` can never send a request.
+    #[test]
+    fn run_local_uses_an_rpc_that_always_errors() {
+        for m in ["repair.list", "repair.status", "repair.begin", "system.identify", ""] {
+            assert!(local_rpc(m, json!({})).is_err(), "{m}");
+        }
+        let src = include_str!("repair_cli.rs");
+        let start = src.find("\npub(crate) fn run_local(").expect("run_local");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("end of run_local")];
+        assert!(body.contains("&local_rpc)"), "run_local must pass local_rpc");
+        assert!(!body.contains("super::request"), "run_local must not reach the daemon");
     }
 }
