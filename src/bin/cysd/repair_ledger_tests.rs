@@ -22,6 +22,8 @@ struct Rig {
     mutexes: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     lane: LaneKey,
     inc: String,
+    /// T4: the per-seat prompt record `Ctx` carries since the owner-decision verbs.
+    prompts: Mutex<HashMap<u64, PromptOrigin>>,
 }
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -56,6 +58,7 @@ fn rig(tag: &str) -> Rig {
         mutexes: Mutex::new(HashMap::new()),
         lane: LaneKey("base".into()),
         inc: "inc-1".into(),
+        prompts: Mutex::new(HashMap::new()),
     }
 }
 
@@ -105,6 +108,7 @@ impl Rig {
             check,
             hook_step: &cys::repair::apply::hook_lines_step,
             claim: &cys::repair::grant::try_claim_autonomous_start,
+            prompts: &self.prompts,
         }
     }
     fn call(&self, now: f64, who: &Caller, sub: &str, p: Value) -> Result<Value, VerbError> {
@@ -2543,8 +2547,10 @@ fn ad4_hook_line_confirmed_only_by_the_registrar_report() {
     assert!(!hook_line_confirmed(&rep(vec![]), "Stop", "x.sh"));
 }
 
-/// AD6: rule documents (C10 names, any folder, any case, `<x>_directive.md`) are refused at `begin`
-/// with the not-implemented sentence, and nothing is written.
+/// AD6 (rewritten by T4 — the owner-token gate replaced the interim not-implemented refusal): rule
+/// documents (C10 names, any folder, any case, `<x>_directive.md`) are refused at `begin` without an
+/// owner-instruction token — here mixed with a general file — with T4's rule-document sentence, and
+/// nothing is written.
 #[test]
 fn ad6_rule_documents_fail_closed() {
     let r = rig("ad6");
@@ -2565,8 +2571,9 @@ fn ad6_rule_documents_fail_closed() {
                 json!({"trigger": "owner_order", "files": ["bin/a.py", rel]}),
             )
             .unwrap_err();
-        assert_eq!(e.code, "repair_not_implemented", "{rel}");
+        assert_eq!(e.code, "repair_precondition", "{rel}");
         assert!(e.message.contains("규칙 문서"), "{}", e.message);
+        assert!(e.message.contains(rel), "the refusal names the file: {}", e.message);
     }
     for rel in [
         "bin/a.py",
@@ -3644,7 +3651,9 @@ fn bj3_folded_spellings_of_protected_names_refused() {
                 json!({"trigger": "owner_order", "files": [rel]}),
             )
             .unwrap_err();
-        assert_eq!(e.code, "repair_not_implemented", "{rel}");
+        // T4: refused by the rule-document branch (no owner token), naming the real file (BJ3)
+        assert_eq!(e.code, "repair_precondition", "{rel}");
+        assert!(e.message.contains("주인 지시 표"), "{rel}: {}", e.message);
         assert!(
             e.message.contains(&format!("(= {real})")),
             "{rel}: {}",
