@@ -1916,13 +1916,73 @@ class _PollDone(Exception):
 
 # ─────────────────────────── 게이트 코어 ───────────────────────────
 
+# ── 「스스로 해결」(0.15.0 · 설계 §4-4 · §6-4 (3) · RULINGS S2 · T3) — 열린 결함 한 줄 ─────────────────
+#   접수는 장부의 한 줄이고 마스터 큐로 가지 않는다. 마스터에게 가는 것은 **5분 보고 관문 한 차례에
+#   많아야 한 줄**: "열린 결함 N건 — 워커에게 맡길 것". 장부는 `cys repair list --json`(데몬 읽기 ·
+#   CYS_NO_AUTOSTART=1 · 시간 상한)으로만 읽는다(O-C1-8 — 파이썬은 장부 파일을 직접 해석하지 않는다).
+#   ★RULINGS AD5: 한 줄은 열린 집합이 **바뀔 때만** 간다(실행마다가 아님). 멱등 키 = 이 부서의 열린 결함
+#   서명 집합의 지문이고, 마지막으로 배달한 키를 게이트 상태(`open_defects.json`)에 남겨 같은 집합이면
+#   조용히 있는다(깨우기 큐의 억제는 배달 전까지만 유효하다 — 배달·drain 뒤 같은 키는 다시 들어간다).
+#   부서의 마스터는 **자기 부서**의 열린 결함만 듣는다(행의 `lanes` 에 이 부서가 있는 서명만).
+#   열린 결함이 0건이 되면 기억한 키를 지운다(같은 집합이 다시 열리면 그것도 변화다).
+#   `cys` 부재·구형(0.15.0 미만)·실패·시간 초과 = 아무것도 보내지 않고 기억도 그대로 · shadow = 배달 0.
+OPEN_DEFECT_TASK = "repair-open-defects"
+OPEN_DEFECT_TIMEOUT_S = 10
+OPEN_DEFECT_STATE_FILE = "open_defects.json"
+
+
+def collect_open_defects(cys_bin, timeout=OPEN_DEFECT_TIMEOUT_S):
+    """(ok, lane, [signature…]) — **이 부서**의 열린 결함 서명(정렬 · 서로 다른 서명 — G4 · AD5). 실패는 (False, None, [])."""
+    env = dict(os.environ, CYS_NO_AUTOSTART="1")
+    try:
+        r = subprocess.run([cys_bin, "repair", "list", "--json"], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=timeout, env=env)
+    except (subprocess.SubprocessError, OSError):
+        return False, None, []
+    if r.returncode != 0:
+        return False, None, []
+    doc = None
+    for line in (r.stdout or "").splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                doc = json.loads(line)
+            except ValueError:
+                doc = None
+    if not isinstance(doc, dict) or not isinstance(doc.get("defects"), list):
+        return False, None, []
+    lane = doc.get("lane")
+    if not isinstance(lane, str) or not lane:
+        return False, None, []
+    #   RULINGS G4: "열린 결함 N건" counts DISTINCT signatures (rows are per lane, the daemon aggregates
+    #   them on read). RULINGS AD5: a lane's master is told only about ITS OWN lane's open defects —
+    #   a signature counts when this lane is among the lanes that reported it.
+    sigs = sorted({d.get("signature") for d in doc["defects"]
+                   if isinstance(d, dict) and d.get("open") is True and isinstance(d.get("signature"), str)
+                   and isinstance(d.get("lanes"), list) and lane in d["lanes"]})
+    return True, lane, sigs
+
+
+def open_defect_wake(sigs):
+    """(본문, 멱등 키) 또는 None(열린 결함 0건)."""
+    if not sigs:
+        return None
+    import hashlib
+    fp = hashlib.sha256("\n".join(sorted(sigs)).encode("utf-8")).hexdigest()[:16]
+    return ("열린 결함 %d건 — 워커에게 맡길 것" % len(sigs), "repair-open-defects-%s" % fp)
+
+
 class Gate:
     def __init__(self, state_dir, runner, cycle_minutes=CYCLE_MINUTES_DEFAULT,
                  stall_cycles=STALL_CYCLES_DEFAULT, quiet_cycles=QUIET_CYCLES_DEFAULT,
                  now_epoch_fn=time.time, now_iso_fn=_now_iso,
-                 edge_cooldown=EDGE_COOLDOWN_SECS, seen_ttl=SEEN_TTL_SECS):
+                 edge_cooldown=EDGE_COOLDOWN_SECS, seen_ttl=SEEN_TTL_SECS,
+                 defect_source=None):
         self.state_dir = state_dir
         self.runner = runner
+        #   「스스로 해결」 열린 결함 원천 — () -> (ok, lane, sigs). None = 끔(시험 대역·직접 구성한 게이트).
+        #   운영 진입점(main)만 `cys repair list` 원천을 넘긴다.
+        self.defect_source = defect_source
         self.cycle_minutes = cycle_minutes
         self.stall_cycles = stall_cycles
         self.quiet_cycles = quiet_cycles
@@ -2086,11 +2146,58 @@ class Gate:
             self._reconcile_inflight(counters, now_epoch)
             seen_gc(self.state_dir, now_epoch, self.seen_ttl)
             report = self._judge_and_route(shadow, counters)
+            self._open_defect_line(shadow)
             counters["failopen_streak"] = 0
             self._write_counters(counters)
             return 0
         except Exception as e:                                   # noqa: BLE001 (최상위 fail-open)
             return self._fail_open(e, report, counters)
+
+    def _open_defect_line(self, shadow):
+        """「스스로 해결」 — 이 부서의 열린 결함 집합이 **지난 배달 뒤 바뀌었을 때만** master 에게 한 줄
+        (RULINGS AD5 — 마지막 배달 키는 게이트 상태에). 판정·대장·카운터에는 손대지 않고, 어떤 실패도
+        게이트를 멈추지 않는다(fail-open). 반환 = 넣은 줄 수."""
+        if shadow or self.defect_source is None:
+            return 0
+        try:
+            ok, _lane, sigs = self.defect_source()
+            if not ok:
+                return 0                                   # 읽지 못함 = 기억도 그대로
+            state_path = os.path.join(self.state_dir, OPEN_DEFECT_STATE_FILE)
+            last = None
+            try:
+                with open(state_path, encoding="utf-8") as f:
+                    doc = json.load(f)
+                if isinstance(doc, dict) and isinstance(doc.get("key"), str):
+                    last = doc["key"]
+            except (OSError, ValueError):
+                last = None
+            wake = open_defect_wake(sigs)
+            if wake is None:
+                if last is not None:                      # 0건 — 다음에 열리는 집합은 변화다
+                    _write_json_atomic(state_path, {"key": None, "count": 0, "at": self.now_epoch_fn()})
+                return 0
+            body, idem = wake
+            if idem == last:
+                return 0                                   # 같은 열린 집합 — 이미 배달함
+            #   ★RULINGS AK6: 상태를 **먼저** 쓴다 — 상태 파일을 쓸 수 없으면 줄을 넣지 않는다(쓴 뒤 넣고
+            #     실패하면 매 실행이 같은 줄을 다시 넣는 재발송으로 돌아간다). 넣기가 실패하면 기억을
+            #     되돌려 다음 실행이 다시 시도한다.
+            try:
+                _write_json_atomic(state_path, {"key": idem, "count": len(sigs), "at": self.now_epoch_fn()})
+            except (OSError, TypeError, ValueError):
+                return 0
+            rc, _wid = self._enqueue("master", OPEN_DEFECT_TASK, body, idem, SEV_INFO)
+            if rc != 0:
+                try:
+                    _write_json_atomic(state_path, {"key": last, "count": None, "at": self.now_epoch_fn()})
+                except (OSError, TypeError, ValueError):
+                    pass
+                return 0                                   # 넣지 못함 = 다음 실행이 다시 시도
+            self.runner.drain("master")
+            return 1
+        except Exception:                                  # noqa: BLE001 — 부가 줄은 게이트를 멈추지 않는다
+            return 0
 
     def _fail_open(self, exc, report, counters):
         """게이트 내부 오류 → **직송 없이** 대장+배지 기록 후 exit 0(설계 층1 I2 수렴).
@@ -2867,7 +2974,8 @@ def main(argv=None):
     if a.cmd == "status":
         return cmd_status(state_dir, a.n)
     runner = Runner(default_pack_bin(), state_dir)
-    return Gate(state_dir, runner).run(shadow=a.shadow)
+    return Gate(state_dir, runner,
+                defect_source=lambda: collect_open_defects(runner.cys_bin)).run(shadow=a.shadow)
 
 
 if __name__ == "__main__":

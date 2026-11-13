@@ -5,19 +5,59 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 
 /// A repair number `R-<n>` (O-C1-2: monotonic, allocated by an exclusive directory create).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+/// RULINGS Z2(c): a value only ever comes from [`RepairId::parse`] — deserialisation goes through it,
+/// so nothing that is not `R-<n>` can become a path component. Z2(d): ordering is numeric.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct RepairId(String);
 
+/// The number of a canonical `R-<n>` (n ≥ 1, decimal, no sign, no leading zero, fits `u64`).
+fn repair_number(s: &str) -> Option<u64> {
+    let digits = s.strip_prefix("R-")?;
+    if digits.is_empty()
+        || digits.len() > 20
+        || digits.starts_with('0')
+        || !digits.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    digits.parse::<u64>().ok()
+}
+
 impl RepairId {
-    /// Parses `R-<n>`. Stub in T0 (body: T3).
+    /// Parses `R-<n>` (canonical spelling only: `R-07`, `R-0`, `r-7`, `R-7 ` are refused, so one
+    /// number has exactly one directory name).
     pub fn parse(s: &str) -> Result<Self, RepairError> {
-        let _ = s;
-        Err(RepairError::NotImplemented("RepairId::parse"))
+        match repair_number(s) {
+            Some(_) => Ok(RepairId(s.to_string())),
+            None => Err(RepairError::Precondition(format!(
+                "수리 번호는 R-<숫자> 형식이어야 합니다: {s:?}"
+            ))),
+        }
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for RepairId {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        RepairId::parse(&s).map_err(|_| serde::de::Error::custom(format!("not a repair id: {s:?}")))
+    }
+}
+
+impl Ord for RepairId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Both are canonical (only `parse` builds a value), so equal numbers ⇔ equal strings.
+        (repair_number(&self.0), &self.0).cmp(&(repair_number(&other.0), &other.0))
+    }
+}
+
+impl PartialOrd for RepairId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -245,18 +285,22 @@ impl TargetState {
     pub fn canon(&self) -> String {
         match self {
             TargetState::Absent => "absent".to_string(),
-            TargetState::File { sha256, mode } => format!("file:{sha256}:{mode:04o}"),
+            // RULINGS Z2(a): only the permission bits — a raw `st_mode` read back from a record
+            // must not produce 5–6 digits.
+            TargetState::File { sha256, mode } => format!("file:{sha256}:{:04o}", mode & 0o7777),
             TargetState::Link { target } => format!("link:{target}"),
         }
     }
 }
 
+/// RULINGS Z2(b): `O_NONBLOCK` beside `O_NOFOLLOW` — a FIFO swapped in after the `lstat` must not
+/// block a daemon thread on `open`; the is-file re-check on the opened handle then refuses it.
 #[cfg(unix)]
 fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
 }
 
@@ -723,5 +767,137 @@ mod tests {
         }
         assert_eq!(PreImage::Absent.state(), TargetState::Absent);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// RULINGS Z2 — the five small corrections T3 carries to the T0 library (each with a test).
+#[cfg(test)]
+mod z2_tests {
+    use super::*;
+
+    /// Z2(a): `canon` formats only the permission bits of a raw `st_mode`.
+    #[test]
+    fn canon_masks_mode_bits() {
+        let raw = TargetState::File {
+            sha256: "ab".into(),
+            mode: 0o100_755, // S_IFREG | 0755 as `st_mode` reports it
+        };
+        assert_eq!(raw.canon(), "file:ab:0755");
+        let setuid = TargetState::File {
+            sha256: "ab".into(),
+            mode: 0o104_755,
+        };
+        assert_eq!(setuid.canon(), "file:ab:4755");
+        // the fingerprint follows the canon, so a raw mode and its bits fingerprint alike
+        assert_eq!(
+            fingerprint(&[("a".into(), raw)]),
+            fingerprint(&[(
+                "a".into(),
+                TargetState::File {
+                    sha256: "ab".into(),
+                    mode: 0o755
+                }
+            )])
+        );
+    }
+
+    /// Z2(b): the no-follow open does not block on a FIFO (O_NONBLOCK), and `read` refuses a FIFO.
+    /// Without O_NONBLOCK the open of a FIFO with no writer blocks forever — the thread below would
+    /// not answer within the deadline.
+    #[cfg(unix)]
+    #[test]
+    fn read_opens_nonblocking() {
+        let dir =
+            std::env::temp_dir().join(format!("cys-repair-z2b-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("pipe");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: a valid NUL-terminated path; mkfifo only creates the node.
+        assert_eq!(
+            unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+            0,
+            "mkfifo failed"
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let f2 = fifo.clone();
+        std::thread::spawn(move || {
+            let r = open_no_follow(&f2).map(|f| f.metadata().map(|m| m.file_type().is_fifo()));
+            let _ = tx.send(r.is_ok());
+        });
+        let answered = rx.recv_timeout(std::time::Duration::from_secs(5));
+        if answered.is_err() {
+            // unblock the stuck opener before failing (open for writing releases it)
+            let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+        }
+        assert_eq!(
+            answered,
+            Ok(true),
+            "open of a FIFO blocked — O_NONBLOCK missing"
+        );
+        assert!(matches!(
+            TargetState::read(&fifo),
+            Err(RepairError::Precondition(_))
+        ));
+        let src = include_str!("types.rs");
+        let prod = &src[..src.find("#[cfg(test)]").unwrap()];
+        assert!(prod.contains("libc::O_NOFOLLOW | libc::O_NONBLOCK"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    use std::os::unix::fs::FileTypeExt;
+
+    /// Z2(c): `RepairId` deserialises through `parse` — nothing that is not `R-<n>` becomes an id.
+    #[test]
+    fn repair_id_deserialises_through_parse() {
+        for ok in ["R-1", "R-12", "R-18446744073709551615"] {
+            let id: RepairId = serde_json::from_value(serde_json::json!(ok)).unwrap();
+            assert_eq!(id.as_str(), ok);
+            assert_eq!(RepairId::parse(ok).unwrap(), id);
+            assert_eq!(serde_json::to_value(&id).unwrap(), serde_json::json!(ok));
+        }
+        for bad in [
+            "",
+            "R-",
+            "R-0",
+            "R-07",
+            "r-7",
+            "R7",
+            "R-7 ",
+            " R-7",
+            "R-+7",
+            "R--7",
+            "R-7a",
+            "R-1/..",
+            "../R-1",
+            "R-1\u{0}",
+            "R-18446744073709551616",
+            "R-１",
+            "staging",
+            "intake",
+        ] {
+            assert!(RepairId::parse(bad).is_err(), "parse accepted {bad:?}");
+            assert!(
+                serde_json::from_value::<RepairId>(serde_json::json!(bad)).is_err(),
+                "deserialise accepted {bad:?}"
+            );
+        }
+        // inside a record, a bad id makes the whole record unreadable (O-C1-6), never a path
+        assert!(serde_json::from_value::<RepairId>(serde_json::json!(7)).is_err());
+    }
+
+    /// Z2(d): ordering is numeric — `R-10` is after `R-9`.
+    #[test]
+    fn repair_id_orders_numerically() {
+        let p = |s: &str| RepairId::parse(s).unwrap();
+        assert!(p("R-9") < p("R-10"));
+        assert!(p("R-2") < p("R-100"));
+        assert!(p("R-100") > p("R-99"));
+        let mut v = vec![p("R-10"), p("R-9"), p("R-1"), p("R-100"), p("R-11")];
+        v.sort();
+        let got: Vec<&str> = v.iter().map(|i| i.as_str()).collect();
+        assert_eq!(got, ["R-1", "R-9", "R-10", "R-11", "R-100"]);
+        assert_eq!(p("R-5").cmp(&p("R-5")), std::cmp::Ordering::Equal);
     }
 }

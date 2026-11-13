@@ -863,6 +863,10 @@ CSO_CYS_SUBVERBS = {
     # `approval check` = §1-1 이 집행 **전**에 요구하는 확인 절차(읽기 전용). `sign` 은 master
     # 발신만 허용되므로(§1-2 ③-1) CSO 에게는 deny 다.
     "approval": {"check"},
+    # 「스스로 해결」(0.15.0 · 설계 §4-6 · §6-3 (4)): CSO 는 결함을 **접수**(자료일 뿐 권한 아님)하고 장부를
+    # **읽기**만 한다. 장부를 바꾸는 수리 명령(begin·record·commit·attest-*·revert·cleanup …)은 여기 없다 —
+    # 데몬도 CSO 좌석을 거부한다. 예산 면제(ESSENTIAL)에는 넣지 않는다(좁은 쪽이 이긴다).
+    "repair": {"report", "list", "status"},
 }
 # ★예산 **면제**는 관측·저장·상신에만 준다(R2 minor · claude 리뷰어). `queue clear` 는 큐 항목을
 #   **파기**하는 변이이고 사이클 절차의 선행 조건이 아니다 — 예산 소진 뒤에도 무제한 반복되면

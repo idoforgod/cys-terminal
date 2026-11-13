@@ -1627,5 +1627,162 @@ class DeadlockRootShadowTest(unittest.TestCase):
         self.assert_never_paged(r, e)
 
 
+
+# ── 「스스로 해결」(0.15.0 · 설계 §4-4 · §6-4 (3)(7) · RULINGS G4, S2 · track T3) — 열린 결함 한 줄 ──────────
+#   접수는 장부의 한 줄이고 마스터 큐로 가지 않는다. 5분 보고 관문은 이 부서의 열린 집합이 **바뀔 때만**
+#   한 줄("열린 결함 N건 — 워커에게 맡길 것")을 master 에게 넣는다(RULINGS AD5 — N = 이 부서의 서로 다른
+#   열린 서명 · 마지막 배달 키는 게이트 상태에). `cys` 부재·실패·shadow 는 아무것도 보내지 않는다.
+#   라이브 무접촉: 시험 대역 러너 + 임시 폴더의 가짜 `cys` + 임시 JAVIS_ROOT.
+def _defect_gate(state_dir, runner, source):
+    clk = Clock(1_000_000.0)
+    return G.Gate(state_dir, runner, cycle_minutes=5, now_epoch_fn=clk.now_epoch,
+                  now_iso_fn=clk.now_iso, defect_source=source)
+
+
+def _defect_wakes(runner):
+    return [e for e in runner.enqueues if e[1] == G.OPEN_DEFECT_TASK]
+
+
+class OpenDefectLine(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="gate-defects-")
+        self.addCleanup(__import__("shutil").rmtree, self.tmp, True)
+
+    def run_once(self, source, shadow=False):
+        r = FakeRunner(report_ok=False, err="collector absent")   # the gate's own path stays minimal
+        rc = _defect_gate(os.path.join(self.tmp, "gate"), r, source).run(shadow=shadow)
+        self.assertEqual(rc, 0)
+        return r
+
+    def test_one_line_to_master_per_run(self):
+        r = self.run_once(lambda: (True, "base", ["aa", "bb"]))
+        wakes = _defect_wakes(r)
+        self.assertEqual(len(wakes), 1, r.enqueues)
+        to, task, body, idem, severity = wakes[0]
+        self.assertEqual(to, "master")
+        self.assertEqual(body, "열린 결함 2건 — 워커에게 맡길 것")
+        self.assertTrue(idem.startswith("repair-open-defects-"))
+        self.assertEqual(severity, G.SEV_INFO)
+        self.assertIn("master", r.drains)
+
+    def test_same_open_set_same_key_new_defect_new_key(self):
+        """Rewritten for RULINGS AD5 (the line is sent when the open set CHANGES, not per tick): the
+        key is the set's fingerprint (order-free); a run on an unchanged set sends nothing; a new
+        defect sends a line with a new key."""
+        self.assertEqual(G.open_defect_wake(["bb", "aa"])[1], G.open_defect_wake(["aa", "bb"])[1])
+        r1 = self.run_once(lambda: (True, "base", ["bb", "aa"]))
+        k1 = _defect_wakes(r1)[0][3]
+        self.assertEqual(_defect_wakes(self.run_once(lambda: (True, "base", ["aa", "bb"]))), [],
+                         "an unchanged open set must stay silent")
+        k3 = _defect_wakes(self.run_once(lambda: (True, "base", ["aa", "bb", "cc"])))[0][3]
+        self.assertNotEqual(k1, k3)
+
+    def test_two_runs_with_a_drain_between_send_one_line(self):
+        """RULINGS AD5's test: run → line delivered and drained → run again on the same open set → no
+        second line (the wake queue would accept the same key again once the first was drained)."""
+        r1 = self.run_once(lambda: (True, "base", ["aa", "bb"]))
+        self.assertEqual(len(_defect_wakes(r1)), 1)
+        self.assertIn("master", r1.drains, "the first line was drained")
+        r2 = self.run_once(lambda: (True, "base", ["aa", "bb"]))
+        self.assertEqual(_defect_wakes(r2), [], r2.enqueues)
+        self.assertEqual(sum(len(_defect_wakes(r)) for r in (r1, r2)), 1)
+
+    def test_set_closing_then_reopening_is_a_change_and_failures_keep_the_memory(self):
+        self.assertEqual(len(_defect_wakes(self.run_once(lambda: (True, "base", ["aa"])))), 1)
+        self.assertEqual(_defect_wakes(self.run_once(lambda: (False, None, []))), [])
+        self.assertEqual(_defect_wakes(self.run_once(lambda: (True, "base", ["aa"]))), [],
+                         "a failed read must not make the next run repeat the line")
+        self.assertEqual(_defect_wakes(self.run_once(lambda: (True, "base", []))), [])
+        self.assertEqual(len(_defect_wakes(self.run_once(lambda: (True, "base", ["aa"])))), 1,
+                         "the set closed and opened again: that is a change")
+
+    def test_unwritable_state_sends_nothing_instead_of_a_line_per_run(self):
+        """RULINGS AK6: the state is written BEFORE the line is queued — a state file that cannot be
+        written means no line at all (never a resend on every run)."""
+        gate_dir = os.path.join(self.tmp, "gate")
+        os.makedirs(os.path.join(gate_dir, G.OPEN_DEFECT_STATE_FILE))   # a directory: cannot be replaced
+        for _ in range(3):
+            self.assertEqual(_defect_wakes(self.run_once(lambda: (True, "base", ["aa"]))), [])
+
+    def test_enqueue_failure_is_retried_next_run(self):
+        gate_dir = os.path.join(self.tmp, "gate")
+        bad = FakeRunner(report_ok=False, err="collector absent", enqueue_rc=1)
+        _defect_gate(gate_dir, bad, lambda: (True, "base", ["aa"])).run(shadow=False)
+        self.assertEqual(len(_defect_wakes(bad)), 1)
+        self.assertNotIn("master", bad.drains)
+        self.assertEqual(len(_defect_wakes(self.run_once(lambda: (True, "base", ["aa"])))), 1,
+                         "an enqueue that failed must not be remembered as delivered")
+
+    def test_nothing_when_empty_failing_off_or_shadow(self):
+        for source in (lambda: (True, "base", []), lambda: (False, None, []), None):
+            self.assertEqual(_defect_wakes(self.run_once(source)), [])
+
+        def boom():
+            raise RuntimeError("source exploded")
+        self.assertEqual(_defect_wakes(self.run_once(boom)), [], "a failing source must not stop the gate")
+        self.assertEqual(_defect_wakes(self.run_once(lambda: (True, "base", ["aa"]), shadow=True)), [])
+
+    def test_wake_queue_suppresses_the_same_key(self):
+        """The coalescing is the wake queue's own (javis_wakeup.py): the same key twice → one pending."""
+        root = tempfile.mkdtemp(prefix="wk-root-")
+        self.addCleanup(__import__("shutil").rmtree, root, True)
+        os.makedirs(os.path.join(root, "_round"), exist_ok=True)
+        body, idem = G.open_defect_wake(["aa", "bb"])
+        script = os.path.join(BIN, "javis_wakeup.py")
+        env = dict(os.environ, JAVIS_ROOT=root)
+        for _ in range(3):
+            p = subprocess.run([sys.executable, script, "enqueue", "--to", "master", "--task", G.OPEN_DEFECT_TASK,
+                                "--reason", body, "--idempotency-key", idem],
+                               capture_output=True, text=True, env=env, timeout=30)
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        pending = os.listdir(os.path.join(root, "_round", "wakeups", "pending"))
+        self.assertEqual(len([f for f in pending if f.endswith(".json")]), 1, pending)
+
+
+class CollectOpenDefects(unittest.TestCase):
+    """`cys repair list --json` parsing with a fake `cys` (bounded, CYS_NO_AUTOSTART=1, distinct signatures — G4)."""
+
+    def fake_cys(self, body, rc=0):
+        d = tempfile.mkdtemp(prefix="fake-cys-")
+        self.addCleanup(__import__("shutil").rmtree, d, True)
+        envlog = os.path.join(d, "env.log")
+        p = os.path.join(d, "cys")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("#!/bin/sh\nprintf '%%s\\n' \"$CYS_NO_AUTOSTART\" > '%s'\ncat <<'JSON'\n%s\nJSON\nexit %d\n" % (envlog, body, rc))
+        os.chmod(p, 0o755)
+        return p, envlog
+
+    @unittest.skipIf(os.name == "nt", "shell fake")
+    def test_counts_distinct_open_signatures_of_its_own_lane(self):
+        """Rewritten for RULINGS AD5 (was: across lanes): a lane's master hears only its OWN lane's
+        open defects — a signature reported by another lane only is not counted."""
+        doc = {"lane": "base", "defects": [
+            {"signature": "s1", "open": True, "lanes": ["base"]},
+            {"signature": "s2", "open": False, "lanes": ["base"]},
+            {"signature": "s3", "open": True, "lanes": ["dept-1"]},
+            {"signature": "s4", "open": True, "lanes": ["dept-1", "base"]},
+            {"signature": "s5", "open": True},
+        ]}
+        cys, envlog = self.fake_cys(json.dumps(doc))
+        ok, lane, sigs = G.collect_open_defects(cys)
+        self.assertTrue(ok)
+        self.assertEqual(lane, "base")
+        self.assertEqual(sigs, ["s1", "s4"], "AD5: own lane's distinct open signatures, closed ones excluded")
+        doc["lane"] = "dept-1"
+        cys2, _ = self.fake_cys(json.dumps(doc))
+        self.assertEqual(G.collect_open_defects(cys2), (True, "dept-1", ["s3", "s4"]))
+        with open(envlog, encoding="utf-8") as f:
+            self.assertEqual(f.read().strip(), "1", "CYS_NO_AUTOSTART=1 must be passed")
+
+    @unittest.skipIf(os.name == "nt", "shell fake")
+    def test_failures_send_nothing(self):
+        for body, rc in (("not json", 0), ('{"lane": "base"}', 0), ('{"lane":"base","defects":[]}', 93),
+                         ('{"defects":[]}', 0)):
+            cys, _ = self.fake_cys(body, rc)
+            self.assertEqual(G.collect_open_defects(cys), (False, None, []), body)
+        self.assertEqual(G.collect_open_defects("/nonexistent/cys"), (False, None, []))
+        self.assertIsNone(G.open_defect_wake([]))
+
+
 if __name__ == "__main__":
     unittest.main()

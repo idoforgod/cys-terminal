@@ -5229,6 +5229,8 @@ fn close_surface_effect(daemon: &Arc<Daemon>, operation: CloseOperation<'_>, cau
     // Membership and role queue ownership have transferred; no later caller can
     // enter preparation for this incarnation. Do not hold the gate across kill/wait.
     drop(operation);
+    // 「스스로 해결」(0.15.0 C1 1.12 / RULINGS O5 · T3): 이 좌석이 쥔 수리 잠금을 데몬이 푼다(수거·닫기 둘 다 이 길).
+    crate::repair::release_locks_for_seat(daemon, id);
     // ★D7(BOOTSTRAP_HARDENING WP-3): 묘비를 kill 루프 **이전**에 선영속 — 아래 kill 구간에서
     // 데몬이 SIGKILL/크래시로 죽으면 in-memory 묘비가 디스크에 없어 다음 콜드부트 phoenix가
     // "의도 삭제된 역할"을 부활시켰다. surfaces 락 해제 직후라 persist_topology 재진입 안전

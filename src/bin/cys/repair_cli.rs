@@ -2,10 +2,14 @@
 //!
 //! Every verb except the LOCAL ones (`rules`, `boot-critical`, `tombstones`, `gate`, hidden
 //! `auth-helper`) is a daemon request `repair.<verb>` (C1 1.15: the CLI never writes the ledger).
-//! T0: every verb prints `"이 빌드에는 아직 구현되지 않았습니다: cys repair <verb>"` on stderr,
-//! writes NOTHING on stdout (so a hook that prints stdout prints nothing — RULINGS B10) and exits 99
-//! (N-2). The tracks fill `run` in place; the verb names and flags below are contract (TRACKS §6.3).
+//! T3 fills `report`, `begin`, `record`, `commit`, `attest-verify`, `attest-audit`, `list`, `status`,
+//! `cleanup` (daemon requests) and the local `tombstones`; a failure prints one sentence on stderr and
+//! NOTHING on stdout (so a hook that prints stdout prints nothing — RULINGS B10) with the O-C3-6 exit
+//! code (93 + the O-C3-7 sentence for an old daemon, 98 when no daemon answers — never autostarted).
+//! Every other verb still prints `"이 빌드에는 아직 구현되지 않았습니다: cys repair <verb>"` and exits
+//! 99 (N-2) until its track fills it. The verb names and flags below are contract (TRACKS §6.3).
 
+use serde_json::{json, Value};
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -60,14 +64,15 @@ pub(crate) enum RepairCmd {
     },
     /// 수리 시작 — 대상 파일·분류·잠금·고치기 전 원본 기록(워커)
     Begin {
-        /// 대상 파일들(팩 기준 상대 경로)
-        #[arg(long, num_args = 1.., required = true)]
+        /// 대상 파일들(팩 기준 상대 경로) — `--unregister-hook` 만 있는 일반 수리는 생략 가능(RULINGS Z2(e))
+        #[arg(long, num_args = 1.., required_unless_present = "unregister_hook")]
         files: Vec<String>,
         /// 생명줄·보호장치가 아닌 훅의 등록 해제(일반 수리에서만 — RULINGS V1)
         #[arg(long = "unregister-hook", value_name = "EVENT:SCRIPT")]
         unregister_hook: Vec<String>,
+        /// 수리의 계기 — 필수(기본값 없음 · RULINGS AD10)
         #[arg(long, value_enum)]
-        trigger: Option<TriggerArg>,
+        trigger: TriggerArg,
         /// 규칙 문서 수리의 주인 지시 표
         #[arg(long)]
         owner_token: Option<String>,
@@ -249,15 +254,422 @@ fn verb_name(cmd: &RepairCmd) -> &'static str {
     }
 }
 
-/// Runs a `cys repair` verb and returns the process exit code.
+/// Runs a `cys repair` verb and returns the process exit code. A `cys repair` never starts a
+/// daemon (appendix A 1-17 — a hook's `cys` must not; exit 98 when none answers): autostart is
+/// switched off for this process before the first request.
 pub(crate) fn run(cmd: RepairCmd) -> i32 {
-    run_with(&cmd, &mut std::io::stdout(), &mut std::io::stderr())
+    super::AUTOSTART.store(false, std::sync::atomic::Ordering::SeqCst);
+    let rpc = |method: &str, params: Value| super::request(method, params);
+    run_with(&cmd, &mut std::io::stdout(), &mut std::io::stderr(), &rpc)
 }
 
-/// T0 stub: the sentence on `err`, nothing on `out`, exit 99. A failing stderr write is ignored
-/// (a closed stderr must not turn into a panic).
-fn run_with(cmd: &RepairCmd, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
-    let _ = out;
+/// O-C3-7: a new CLI meeting an old daemon fails closed with this sentence and exit 93.
+pub(crate) const OLD_DAEMON_KO: &str = "이 데몬은 `cys repair`를 모릅니다(0.15.0 미만) — 아무것도 기록되지 않았습니다. 프로그램을 0.15.0 이상으로 업데이트한 뒤 다시 하세요.";
+
+/// The daemon error codes of the `repair.*` namespace (O-C3-6 + Z1) → CLI exit codes.
+fn exit_for(code: &str) -> Option<i32> {
+    use cys::repair::types as t;
+    Some(match code {
+        "acl_denied" => t::EXIT_REPAIR_ROLE_REFUSED,
+        "method_not_found" => t::EXIT_REPAIR_OLD_DAEMON,
+        c if c == t::ERR_LOCKED || c == "target_changed" => t::EXIT_REPAIR_LOCKED,
+        c if c == t::ERR_PRECONDITION || c == t::ERR_CORRUPT || c == "not_found" => {
+            t::EXIT_REPAIR_PRECONDITION
+        }
+        c if c == t::ERR_CHECK_FAILED => t::EXIT_REPAIR_CHECK_FAILED,
+        c if c == t::ERR_PLATFORM_PENDING => t::EXIT_REPAIR_PLATFORM_PENDING,
+        c if c == t::ERR_NOT_IMPLEMENTED => t::EXIT_REPAIR_NOT_IMPLEMENTED,
+        "invalid_params" => 2,
+        "io" => 1,
+        _ => return None,
+    })
+}
+
+/// Turns a failed request (`"<code>: <message>"` from the daemon, or a transport error) into the
+/// sentence on `err` and the exit code. Nothing is written on stdout.
+fn fail(err: &mut dyn Write, e: &str) -> i32 {
+    let (code, msg) = e.split_once(": ").unwrap_or(("", e));
+    match exit_for(code) {
+        Some(93) => {
+            let _ = writeln!(err, "{OLD_DAEMON_KO}");
+            93
+        }
+        Some(x) => {
+            let _ = writeln!(err, "{msg}");
+            x
+        }
+        None => {
+            let _ = writeln!(
+                err,
+                "cysd 에 닿지 못했습니다(cys repair 는 데몬을 자동으로 띄우지 않습니다): {e}"
+            );
+            cys::repair::types::EXIT_REPAIR_DAEMON_UNREACHABLE
+        }
+    }
+}
+
+type Rpc<'a> = &'a dyn Fn(&str, Value) -> Result<Value, String>;
+
+fn s(v: &Value, k: &str) -> String {
+    match v.get(k) {
+        Some(Value::String(x)) => x.clone(),
+        Some(Value::Null) | None => String::new(),
+        Some(other) => other.to_string(),
+    }
+}
+
+fn short(h: &str) -> &str {
+    h.get(..12).unwrap_or(h)
+}
+
+fn lanes_line(v: &Value) -> String {
+    match v.get("lanes").and_then(|l| l.as_object()) {
+        Some(m) if !m.is_empty() => m
+            .iter()
+            .map(|(k, st)| format!("{k}={}", st.as_str().unwrap_or("?")))
+            .collect::<Vec<_>>()
+            .join(" · "),
+        _ => "-".into(),
+    }
+}
+
+/// Writes the success of a daemon verb: the JSON reply with `--json`, else readable lines.
+fn print_ok(out: &mut dyn Write, verb: &str, v: &Value, json_out: bool) {
+    if json_out {
+        let _ = writeln!(out, "{v}");
+        return;
+    }
+    let id = s(v, "repair");
+    let _ = match verb {
+        "report" => {
+            if v.get("excluded").is_some_and(|x| !x.is_null()) {
+                writeln!(
+                    out,
+                    "접수하지 않음(설계상 늘 실패하는 동작 제외 목록: {}) — {}",
+                    s(v, "excluded"),
+                    s(v, "rel")
+                )
+            } else if v.get("over_quota") == Some(&Value::Bool(true)) {
+                writeln!(
+                    out,
+                    "접수 한도 초과 — 이번 한 시간 새 결함 접수가 다 찼습니다(기록 안 됨): {}",
+                    s(v, "rel")
+                )
+            } else {
+                let joined = s(v, "joined");
+                writeln!(
+                    out,
+                    "결함 접수: {} ({}) — 같은 결함 {}건째 · 서명 {}{}",
+                    s(v, "rel"),
+                    s(v, "error_class"),
+                    s(v, "count"),
+                    short(&s(v, "signature")),
+                    if joined.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · 열린 수리 {joined} 에 합류")
+                    }
+                )
+            }
+        }
+        "begin" if v.get("begin").and_then(|b| b.as_str()) == Some("joins") => writeln!(
+            out,
+            "{id}: 이 부서({})에서 합치기 시작 — 합친 뒤 `cys repair recheck {id}`",
+            s(v, "lane")
+        ),
+        "begin" => {
+            let mut r = writeln!(
+                out,
+                "수리 {id} {} — {} · 시도 {}/{} · 상태 {}",
+                match v.get("begin").and_then(|b| b.as_str()) {
+                    Some("picked-up") => "다시 잡음",
+                    Some("already-held") => "이미 쥐고 있음",
+                    _ => "시작",
+                },
+                s(v, "classification"),
+                s(v, "attempt"),
+                s(v, "max_rounds"),
+                s(v, "state_label"),
+            );
+            if let Some(st) = v.get("staging").and_then(|x| x.as_str()) {
+                r = r.and_then(|_| writeln!(out, "작업 사본: {st} — 후보는 여기서만 고칩니다"));
+            }
+            r
+        }
+        "record" => writeln!(
+            out,
+            "{id} 기록 — 지문 {} · 시도 {}/{}{}",
+            short(&s(v, "fingerprint")),
+            s(v, "attempt"),
+            s(v, "max_rounds"),
+            if v.get("attestations_voided") == Some(&Value::Bool(true)) {
+                " · 이전 서명은 무효(다시 받아야 함)"
+            } else {
+                ""
+            }
+        ),
+        "commit" => {
+            let mut r = writeln!(
+                out,
+                "{id} 확정 — {} · 부서별: {}",
+                s(v, "state_label"),
+                lanes_line(v)
+            );
+            // RULINGS AK4: older repairs of the same files now superseded; AK3: warnings
+            let ids = |k: &str| -> Vec<String> {
+                v.get(k)
+                    .and_then(|x| x.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let sup = ids("superseded");
+            if r.is_ok() && !sup.is_empty() {
+                r = writeln!(out, "  같은 파일의 이전 수리 대체됨: {}", sup.join(", "));
+            }
+            for w in ids("warnings") {
+                if r.is_ok() {
+                    r = writeln!(out, "  경고: {w}");
+                }
+            }
+            r
+        }
+        "attest-verify" | "attest-audit" => {
+            let reopened = s(v, "reopened");
+            writeln!(
+                out,
+                "{id} {} 서명({}) — 상태 {}{}",
+                if verb == "attest-verify" {
+                    "검증"
+                } else {
+                    "감사"
+                },
+                s(v, "verdict"),
+                s(v, "state_label"),
+                if reopened.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · 다시 열림: {reopened}")
+                }
+            )
+        }
+        "list" => {
+            let mut r = Ok(());
+            for rep in v
+                .get("repairs")
+                .and_then(|x| x.as_array())
+                .into_iter()
+                .flatten()
+            {
+                r = r.and_then(|_| {
+                    writeln!(
+                        out,
+                        "{}\t{}\t{}\t{}/{}\t{}",
+                        s(rep, "repair"),
+                        s(rep, "state_label"),
+                        s(rep, "classification_label"),
+                        s(rep, "attempt"),
+                        s(rep, "max_rounds"),
+                        rep.get("files")
+                            .and_then(|f| f.as_array())
+                            .map(|f| f
+                                .iter()
+                                .filter_map(|x| x.as_str())
+                                .collect::<Vec<_>>()
+                                .join(","))
+                            .unwrap_or_default()
+                    )
+                });
+            }
+            for c in v
+                .get("corrupt")
+                .and_then(|x| x.as_array())
+                .into_iter()
+                .flatten()
+            {
+                r = r.and_then(|_| {
+                    writeln!(out, "{}\t읽을 수 없음\t{}", s(c, "repair"), s(c, "corrupt"))
+                });
+            }
+            r.and_then(|_| writeln!(out, "열린 결함 {}건", s(v, "open_defects")))
+        }
+        "status" if v.get("repair").is_some() => writeln!(
+            out,
+            "{id}: {} · {} · 시도 {}/{} · 부서별: {}{}",
+            s(v, "state_label"),
+            s(v, "classification_label"),
+            s(v, "attempt"),
+            s(v, "max_rounds"),
+            lanes_line(v),
+            match v.get("propagation_complete") {
+                Some(Value::Bool(true)) => " · 전파 완료".to_string(),
+                Some(Value::Bool(false)) => " · 전파 미완".to_string(),
+                _ => format!(" · 전파 완료 판정 불가({})", s(v, "propagation_note")),
+            }
+        ),
+        "status" => writeln!(
+            out,
+            "레인 {} — 수리 {}건 · 열린 결함 {}건{}",
+            s(v, "lane"),
+            s(v, "repairs"),
+            s(v, "open_defects"),
+            if v.pointer("/reviewer_slots/waiting") == Some(&Value::Bool(true)) {
+                " · 리뷰어 칸이 비어 있어 수리가 기다립니다"
+            } else {
+                ""
+            }
+        ),
+        "cleanup" => writeln!(
+            out,
+            "{id}: 보관소 칸 정리 {}개 · 거부 {}개",
+            v.get("removed")
+                .and_then(|x| x.as_array())
+                .map_or(0, |a| a.len()),
+            v.get("refused")
+                .and_then(|x| x.as_array())
+                .map_or(0, |a| a.len())
+        ),
+        _ => writeln!(out, "{v}"),
+    };
+}
+
+/// The daemon request of a T3 verb: (wire method, params, `--json`). `None` = not a T3 daemon verb.
+fn t3_request(cmd: &RepairCmd) -> Option<(&'static str, Value, bool)> {
+    Some(match cmd {
+        RepairCmd::Report { file, error, json } => (
+            "repair.report",
+            json!({"file": file, "error": error}),
+            *json,
+        ),
+        RepairCmd::Begin {
+            files,
+            unregister_hook,
+            trigger,
+            owner_token,
+            joins,
+            resolves,
+            json,
+        } => {
+            let mut p = json!({"files": files, "unregister_hook": unregister_hook});
+            p["trigger"] = json!(match trigger {
+                TriggerArg::OwnerOrder => "owner_order",
+                TriggerArg::Grant => "grant",
+                TriggerArg::Update => "update",
+            });
+            if let Some(o) = owner_token {
+                p["owner_token"] = json!(o);
+            }
+            if let Some(j) = joins {
+                p["joins"] = json!(j);
+            }
+            if let Some(r) = resolves {
+                p["resolves"] = json!(r);
+            }
+            ("repair.begin", p, *json)
+        }
+        RepairCmd::Record { repair, note, json } => (
+            "repair.record",
+            json!({"repair": repair, "note": note}),
+            *json,
+        ),
+        RepairCmd::Commit { repair, json } => ("repair.commit", json!({"repair": repair}), *json),
+        RepairCmd::AttestVerify {
+            repair,
+            verdict,
+            note,
+        } => (
+            "repair.attest_verify",
+            json!({"repair": repair, "note": note, "verdict": match verdict { VerifyVerdict::Pass => "pass", VerifyVerdict::Fail => "fail" }}),
+            false,
+        ),
+        RepairCmd::AttestAudit {
+            repair,
+            verdict,
+            note,
+        } => (
+            "repair.attest_audit",
+            json!({"repair": repair, "note": note, "verdict": match verdict { AuditVerdict::Ok => "ok", AuditVerdict::Finding => "finding" }}),
+            false,
+        ),
+        RepairCmd::List { json } => ("repair.list", json!({}), *json),
+        RepairCmd::Status { repair, json } => ("repair.status", json!({"repair": repair}), *json),
+        RepairCmd::Cleanup { repair, slot } => (
+            "repair.cleanup",
+            json!({"repair": repair, "slot": slot}),
+            false,
+        ),
+        _ => return None,
+    })
+}
+
+/// O-C1-8: `cys repair tombstones [--json]` — a LOCAL read of this lane's tombstone file (no daemon);
+/// the lane is the caller's socket (`CYS_SOCKET`, as `lane_key` does). An unreadable file → the
+/// sentence on stderr and exit 95, nothing on stdout (a reader then behaves as today: no tombstones).
+fn tombstones_local(out: &mut dyn Write, err: &mut dyn Write, json_out: bool) -> i32 {
+    let lane = cys::repair::types::LaneKey::of_socket(&super::socket_path());
+    tombstones_local_in(
+        out,
+        err,
+        json_out,
+        lane,
+        &cys::repair::paths::repairs_root(),
+    )
+}
+
+fn tombstones_local_in(
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    json_out: bool,
+    lane: cys::repair::types::LaneKey,
+    root: &std::path::Path,
+) -> i32 {
+    match cys::repair::tombstones::load_in(root, &lane) {
+        Ok(list) => {
+            if json_out {
+                let f = cys::repair::tombstones::TombstoneFile {
+                    schema: cys::repair::REPAIR_SCHEMA,
+                    lane,
+                    tombstones: list,
+                };
+                let _ = writeln!(
+                    out,
+                    "{}",
+                    serde_json::to_string(&f).unwrap_or_else(|_| "{}".into())
+                );
+            } else {
+                for t in &list {
+                    let _ = writeln!(out, "{}\t{}", t.rel, t.repair.as_str());
+                }
+            }
+            0
+        }
+        Err(e) => {
+            let _ = writeln!(err, "이 레인의 묘비 파일을 읽을 수 없습니다(지운 것이 업데이트로 되돌아올 수 있음): {e:?}");
+            cys::repair::types::EXIT_REPAIR_PRECONDITION
+        }
+    }
+}
+
+/// Runs a verb against `rpc` (the daemon in production, a fake in the tests). A failing stderr write
+/// is ignored (a closed stderr must not turn into a panic).
+fn run_with(cmd: &RepairCmd, out: &mut dyn Write, err: &mut dyn Write, rpc: Rpc<'_>) -> i32 {
+    if let RepairCmd::Tombstones { json } = cmd {
+        return tombstones_local(out, err, *json);
+    }
+    if let Some((method, params, json_out)) = t3_request(cmd) {
+        return match rpc(method, params) {
+            Ok(v) => {
+                print_ok(out, verb_name(cmd), &v, json_out);
+                0
+            }
+            Err(e) => fail(err, &e),
+        };
+    }
+    // The verbs whose bodies belong to other tracks (T1a rules · T4 grant/owner-token/rule-doc-allowed ·
+    // T5a boot-critical · T5b submit/auth-helper · T6 revert/sweep/tick/reapply · T7b gate/recheck).
     let _ = writeln!(
         err,
         "{}: cys repair {}",
@@ -421,7 +833,7 @@ mod tests {
         let calls: &[&[&str]] = &[
             &["report", "--file", "bin/a.py", "--error", "boom"],
             &["report", "--file", "bin/a.py", "--error", "boom", "--json"],
-            &["begin", "--files", "bin/a.py"],
+            &["begin", "--files", "bin/a.py", "--trigger", "owner-order"],
             &[
                 "begin",
                 "--files",
@@ -490,25 +902,55 @@ mod tests {
             &["gate", "--lane", "base", "--json"],
             &["auth-helper", "--request", "rq-1", "--reason", "r"],
         ];
+        // T3 (rewritten from T0's "every verb exits 99"): the verbs whose bodies are other tracks'
+        // still exit 99 with the sentence and nothing on stdout; T3's daemon verbs meeting an OLD
+        // daemon exit 93 with the O-C3-7 sentence and nothing on stdout (no request reaches a ledger);
+        // the local `tombstones` is T3's reader (tested in `tombstones_local_reader`).
+        let old_daemon = |m: &str, _p: Value| -> Result<Value, String> {
+            Err(format!("method_not_found: unknown method: {m}"))
+        };
+        let t3 = [
+            "report",
+            "begin",
+            "record",
+            "commit",
+            "attest-verify",
+            "attest-audit",
+            "list",
+            "status",
+            "cleanup",
+        ];
         let mut covered: Vec<&str> = Vec::new();
         for argv in calls {
             let cmd = parse(argv)
                 .unwrap_or_else(|e| panic!("`cys repair {}` did not parse: {e}", argv.join(" ")));
             let name = verb_name(&cmd);
             assert_eq!(name, argv[0], "verb_name disagrees with the command line");
+            if !covered.contains(&name) {
+                covered.push(name);
+            }
+            if name == "tombstones" {
+                continue;
+            }
             let (mut out, mut err) = (Vec::new(), Vec::new());
-            assert_eq!(run_with(&cmd, &mut out, &mut err), 99, "{}", argv.join(" "));
+            let code = run_with(&cmd, &mut out, &mut err, &old_daemon);
             assert!(
                 out.is_empty(),
                 "`cys repair {}` wrote to stdout",
                 argv.join(" ")
             );
-            assert_eq!(
-                String::from_utf8(err).unwrap(),
-                format!("이 빌드에는 아직 구현되지 않았습니다: cys repair {name}\n")
-            );
-            if !covered.contains(&name) {
-                covered.push(name);
+            if t3.contains(&name) {
+                assert_eq!(code, 93, "{}", argv.join(" "));
+                assert_eq!(
+                    String::from_utf8(err).unwrap(),
+                    format!("{OLD_DAEMON_KO}\n")
+                );
+            } else {
+                assert_eq!(code, 99, "{}", argv.join(" "));
+                assert_eq!(
+                    String::from_utf8(err).unwrap(),
+                    format!("이 빌드에는 아직 구현되지 않았습니다: cys repair {name}\n")
+                );
             }
         }
         covered.sort_unstable();
@@ -516,12 +958,26 @@ mod tests {
         all.sort_unstable();
         assert_eq!(covered, all, "not every verb was exercised");
 
+        // RULINGS Z2(e): `--files` may be left out only when `--unregister-hook` is given.
+        assert!(parse(&[
+            "begin",
+            "--unregister-hook",
+            "Stop:x.sh",
+            "--trigger",
+            "owner-order"
+        ])
+        .is_ok());
+        // RULINGS AD10: `--trigger` is required (no default — fail closed).
         for bad in [
             &["submit", "R-1", "--staging", "/tmp/x"][..], // U3: no --staging
             &["reapply", "R-1", "--staging", "/tmp/x"],
             &["begin"],
+            &["begin", "--json"],
             &["begin", "--trigger", "grant"],
             &["begin", "--files", "a", "--trigger", "owner_order"],
+            &["begin", "--files", "a"],
+            &["begin", "--unregister-hook", "Stop:x.sh"],
+            &["begin", "--files", "a", "--joins", "R-1"],
             &["boot-critical"],
             &["boot-critical", "--json"],
             &["boot-critical", "--path", "a", "--list"],
@@ -555,8 +1011,16 @@ mod tests {
                 Ok(())
             }
         }
+        let cmd = parse(&["submit", "R-1"]).unwrap();
+        assert_eq!(
+            run_with(&cmd, &mut Vec::new(), &mut Broken, &old_daemon),
+            99
+        );
         let cmd = parse(&["list"]).unwrap();
-        assert_eq!(run_with(&cmd, &mut Vec::new(), &mut Broken), 99);
+        assert_eq!(
+            run_with(&cmd, &mut Vec::new(), &mut Broken, &old_daemon),
+            93
+        );
 
         // Structure: production code of this module never prints to stdout.
         let src = include_str!("repair_cli.rs");
@@ -567,5 +1031,173 @@ mod tests {
                 "repair_cli.rs production code prints to stdout ({needle})"
             );
         }
+    }
+
+    /// O-C3-6 exit mapping (+ Z1), the old-daemon sentence, an unreachable daemon → 98, and a
+    /// successful reply printed (JSON with `--json`). Nothing on stdout on any failure.
+    #[test]
+    fn exit_codes_and_sentences() {
+        let cases: [(&str, i32); 13] = [
+            ("acl_denied: x", 92),
+            ("method_not_found: unknown method: repair.begin", 93),
+            ("repair_locked: x", 94),
+            ("target_changed: x", 94),
+            ("repair_precondition: x", 95),
+            ("repair_corrupt: x", 95),
+            ("not_found: x", 95),
+            ("repair_check_failed: x", 96),
+            ("repair_pending_platform: x", 97),
+            (
+                "cannot connect to cysd at /x/cysd.sock: No such file or directory",
+                98,
+            ),
+            ("rpc_timeout: …", 98),
+            ("repair_not_implemented: x", 99),
+            ("invalid_params: x", 2),
+        ];
+        let cmd = parse(&["status", "R-1"]).unwrap();
+        for (e, want) in cases {
+            let err_s = e.to_string();
+            let rpc = move |_m: &str, _p: Value| -> Result<Value, String> { Err(err_s.clone()) };
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            assert_eq!(run_with(&cmd, &mut out, &mut err, &rpc), want, "{e}");
+            assert!(out.is_empty(), "{e}: wrote to stdout");
+            let text = String::from_utf8(err).unwrap();
+            if want == 93 {
+                assert_eq!(text, format!("{OLD_DAEMON_KO}\n"));
+            } else if want == 98 {
+                assert!(text.contains("자동으로 띄우지 않습니다"), "{text}");
+            } else {
+                assert!(!text.is_empty());
+            }
+        }
+        // the request carries the verb's wire name and params; a success prints the JSON reply
+        let seen = std::cell::RefCell::new(Vec::new());
+        let rpc = |m: &str, p: Value| -> Result<Value, String> {
+            seen.borrow_mut().push((m.to_string(), p));
+            Ok(
+                json!({"repair": "R-3", "state_label": "진행 중", "attempt": 1, "max_rounds": 10, "classification": "general", "begin": "new", "staging": null}),
+            )
+        };
+        let cmd = parse(&[
+            "begin",
+            "--files",
+            "bin/a.py",
+            "--trigger",
+            "update",
+            "--resolves",
+            "R-2",
+            "--json",
+        ])
+        .unwrap();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert_eq!(run_with(&cmd, &mut out, &mut err, &rpc), 0);
+        assert!(err.is_empty());
+        let printed: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(printed["repair"], "R-3");
+        let (m, p) = seen.borrow()[0].clone();
+        assert_eq!(m, "repair.begin");
+        assert_eq!(p["files"], json!(["bin/a.py"]));
+        assert_eq!(p["resolves"], "R-2");
+        assert_eq!(p["trigger"], "update", "the trigger always travels (AD10)");
+        assert!(
+            p.get("seat").is_none() && p.get("role").is_none(),
+            "the CLI never names a seat or role (M1)"
+        );
+        // human output names the working copy (U3: `begin` prints it)
+        let rpc2 = |_m: &str, _p: Value| -> Result<Value, String> {
+            Ok(
+                json!({"repair": "R-4", "state_label": "진행 중", "attempt": 1, "max_rounds": 10, "classification": "boot_critical", "begin": "new", "staging": "/x/repairs/R-4/staging"}),
+            )
+        };
+        let cmd = parse(&["begin", "--files", "hooks/a.sh", "--trigger", "owner-order"]).unwrap();
+        let mut out = Vec::new();
+        assert_eq!(run_with(&cmd, &mut out, &mut Vec::new(), &rpc2), 0);
+        assert!(String::from_utf8(out)
+            .unwrap()
+            .contains("작업 사본: /x/repairs/R-4/staging"));
+        // commit's human output names the superseded repairs and the warnings (AK3 / AK4)
+        let rpc3 = |_m: &str, _p: Value| -> Result<Value, String> {
+            Ok(
+                json!({"repair": "R-5", "state_label": "시험 기간", "lanes": {}, "superseded": ["R-2"], "warnings": ["bin/a.py: 삭제 표식 파일을 읽을 수 없어"]}),
+            )
+        };
+        let cmd = parse(&["commit", "R-5"]).unwrap();
+        let mut out = Vec::new();
+        assert_eq!(run_with(&cmd, &mut out, &mut Vec::new(), &rpc3), 0);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("이전 수리 대체됨: R-2"), "{text}");
+        assert!(text.contains("경고: bin/a.py"), "{text}");
+    }
+
+    /// `repair.*` is in neither the streaming nor the server-wait list: the CLI's 40-s cap applies,
+    /// so a verb must answer at once (F2; `submit` returns its number only).
+    #[test]
+    fn repair_requests_keep_the_40s_cap() {
+        for m in [
+            "repair.report",
+            "repair.begin",
+            "repair.record",
+            "repair.commit",
+            "repair.submit",
+            "repair.status",
+        ] {
+            assert_eq!(
+                super::super::rpc_idle_timeout_with(
+                    m,
+                    &json!({"timeout_secs": 3600, "wait": true}),
+                    None
+                ),
+                Some(std::time::Duration::from_secs(40)),
+                "{m}"
+            );
+        }
+        // and the repair CLI turns autostart off before any request (appendix A 1-17)
+        let src = include_str!("repair_cli.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests").unwrap()];
+        assert!(prod.contains("super::AUTOSTART.store(false"));
+    }
+
+    /// O-C1-8: the local tombstone reader prints the struct's JSON (field order fixed) for the
+    /// caller's lane; an unreadable file → exit 95, nothing on stdout.
+    #[test]
+    fn tombstones_local_reader() {
+        use cys::repair::tombstones::{record_in, Tombstone, TombstoneKind};
+        use cys::repair::types::{LaneKey, RepairId};
+        let root = std::env::temp_dir().join(format!("cys-cli-tomb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let lane = LaneKey("base".into());
+        let mut out = Vec::new();
+        assert_eq!(
+            tombstones_local_in(&mut out, &mut Vec::new(), true, lane.clone(), &root),
+            0
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap().trim(),
+            r#"{"schema":1,"lane":"base","tombstones":[]}"#
+        );
+        let t = Tombstone {
+            rel: "bin/old.py".into(),
+            kind: TombstoneKind::File,
+            repair: RepairId::parse("R-2").unwrap(),
+        };
+        record_in(&root, &lane, &t).unwrap();
+        let mut out = Vec::new();
+        assert_eq!(
+            tombstones_local_in(&mut out, &mut Vec::new(), true, lane.clone(), &root),
+            0
+        );
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["tombstones"][0]["rel"], "bin/old.py");
+        assert_eq!(v["tombstones"][0]["repair"], "R-2");
+        std::fs::write(root.join("tombstones").join("base.json"), b"{bad").unwrap();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert_eq!(
+            tombstones_local_in(&mut out, &mut err, true, lane, &root),
+            95
+        );
+        assert!(out.is_empty());
+        assert!(!err.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
