@@ -646,15 +646,19 @@ fn keep_best(map: &mut HashMap<(String, String), (f64, RateMeta)>, key: (String,
 // script, a pipeline member piped onward, a heredoc body, a quoted string, a comment) is no identity.
 // INPUT (RULINGS BE1 — the CLI forwards it from Claude Code's `PostToolUseFailure`): `tool_name` "Bash",
 // `tool_input.command`, the top-level `error` (head + tail), `is_interrupt`; a call is a `PRE_TOOL` event.
-// FAILURE (RULINGS BX1) = only the tool's documented exit shape: the error text's FIRST line is exactly
-// `Exit code N`, N an integer 1..=127 (`exit_report`). Every other end — the Bash tool's own
-// `Command timed out after …`, an interruption, a tool / sandbox / permission message, an exit of 128 or
-// more (ended by a signal), no text — is NEITHER a failure NOR a call: it takes its call back out of the
-// rate (numerator and denominator). A hanging, timed-out or signalled script is a stated miss.
+// FAILURE (RULINGS BX1, CC1) = only the tool's documented exit shape: the error text's FIRST line is
+// exactly `Exit code N`, N an integer 1..=125 (`exit_report`). Every other end — the Bash tool's own
+// `Command timed out after …`, an interruption, a tool / sandbox / permission message, 126 / 127 (the
+// shell's "nothing was started": not executable, not found), an exit of 128 or more (ended by a signal),
+// no text — is NEITHER a failure NOR a call: it takes its call back out of the rate (numerator and
+// denominator). A hanging, timed-out or signalled script is a stated miss.
+// IDENTITY needs the named script to be a REAL file of this lane's pack at classification time (RULINGS
+// CC2): ONE `lstat` of `<pack dir>/<rel>` — a regular file, not a link — outside the detector's lock.
 // Three places, three costs:
 //   ① `observe_tool_event` — on the hook's request path: the command is classified BEFORE any lock (one
-//      bounded linear pass, RULINGS BF5), then a short update of in-memory tables under the detector's own
-//      leaf mutex. No disk, no spawn on the path (the flusher is started once, lazily, by an injectable hook).
+//      bounded linear pass, RULINGS BF5, and at most ONE `lstat` of the named script, RULINGS CC2), then a
+//      short update of in-memory tables under the detector's own leaf mutex. No other disk access, no spawn
+//      on the path (the flusher is started once, lazily, by an injectable hook).
 //   ② `flush_defect_intake` — on its own thread (`cysd-defect-intake`, 10 s): the row writes, under T3's
 //      per-file mutex (`intake:<sig>`, one writer per file) and the intake's OWN quota
 //      (`alert_route::IntakeShare` — never the general share, the clear reserve or the CSO queue).
@@ -753,7 +757,9 @@ pub const DETECTOR_EXCLUSIONS: &[cys::repair::intake::Exclusion] = {
 };
 
 /// The detector's exclusion lookup: the list's shared table first (`intake::EXCLUSIONS` — T3's Windows
-/// `cys-dept` entry), then the detector's own entries. Returns the reason.
+/// `cys-dept` entry), then the detector's own entries. Returns the reason. (That entry is KEPT and is
+/// harmless here: since RULINGS CC1 an `Exit code 127` is no failure, so its 127 branch never sees a
+/// detector failure; it stays for `cys repair report`, which shares the table — `intake.rs` is untouched.)
 pub fn detector_excluded(rel: &str, sub: Option<&str>, error: &str, windows: bool) -> Option<&'static str> {
     use cys::repair::intake::{excluded_in, EXCLUSIONS};
     excluded_in(EXCLUSIONS, rel, sub, error, windows).or_else(|| excluded_in(DETECTOR_EXCLUSIONS, rel, sub, error, windows))
@@ -788,9 +794,16 @@ pub enum PackCall {
 /// This lane's pack root as LITERAL path spellings (RULINGS BU1), built once per daemon: the daemon's own
 /// pack dir, its Git Bash `/c/…` form, and its `~/…` form when it lies under the home. A path holding a
 /// variable (`$CYS_PACK_DIR/…`, `${…}`), another lane's pack or any other directory is not this lane's pack.
+/// The named script must also be a real file there (RULINGS CC2 — `is_pack_file`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PackRoots {
     prefixes: Vec<String>,
+    /// The pack dir the named script is looked up in (one `lstat`, RULINGS CC2).
+    dir: Option<std::path::PathBuf>,
+    /// Tests only: the fictional base lane's scripts are taken as present (the CC2 tests use real temp
+    /// packs instead; a production `PackRoots` cannot set this — the field does not exist there).
+    #[cfg(test)]
+    assume_files: bool,
 }
 
 fn slash_path(p: &str) -> String {
@@ -812,7 +825,26 @@ impl PackRoots {
                 }
             }
         }
-        PackRoots { prefixes }
+        PackRoots {
+            prefixes,
+            dir: pack_dir.filter(|p| !p.is_empty()).map(std::path::PathBuf::from),
+            #[cfg(test)]
+            assume_files: false,
+        }
+    }
+
+    /// Tests only: take the scripts of this (fictional) lane as present.
+    #[cfg(test)]
+    pub(crate) fn assuming_files(mut self) -> Self {
+        self.assume_files = true;
+        self
+    }
+
+    /// Tests only: spell the lane as given, but look the scripts up in `dir` (a real temp pack).
+    #[cfg(test)]
+    pub(crate) fn on_disk(mut self, dir: &std::path::Path) -> Self {
+        self.dir = Some(dir.to_path_buf());
+        self
     }
 
     /// The prefixes (the property test's reference reads the same data).
@@ -827,6 +859,19 @@ impl PackRoots {
         let p = self.prefixes.iter().find(|p| path.starts_with(p.as_str()))?;
         let rel = cys::repair::intake::normalize_rel(&path[p.len()..]).ok()?;
         is_script_rel(&rel).then_some(rel)
+    }
+
+    /// RULINGS CC2 — the named script is a REAL file of this lane's pack now: ONE `lstat` of
+    /// `<pack dir>/<rel>`; a missing path, a link (to anything) or a directory → false. Part of
+    /// classification, so it runs before the detector's lock.
+    fn is_pack_file(&self, rel: &str) -> bool {
+        #[cfg(test)]
+        if self.assume_files {
+            return true;
+        }
+        self.dir
+            .as_ref()
+            .is_some_and(|d| std::fs::symlink_metadata(d.join(rel)).is_ok_and(|m| m.file_type().is_file()))
     }
 }
 
@@ -1053,8 +1098,9 @@ fn interpreter_of(word: &str) -> Option<&'static Interpreter> {
     INTERPRETERS.iter().find(|i| i.name == name)
 }
 
-/// The identity of a shell call (RULINGS BF1, BU1): given ONLY when the call's whole text parses under
-/// the closed grammar above — then the pack hook / script of THIS lane it runs and its first argument.
+/// The identity of a shell call (RULINGS BF1, BU1, CC2): given ONLY when the call's whole text parses
+/// under the closed grammar above AND the script it names is a real file of THIS lane's pack now — then
+/// that pack hook / script and its first argument.
 /// Every other call is a stated miss (DEFERRED #76: compound calls, variable paths, globs, escapes,
 /// ANSI-C quotes, an environment assignment in front …). Linear in the command's length (RULINGS BF5).
 pub fn pack_call(tool_input: &Value, roots: &PackRoots) -> PackCall {
@@ -1067,7 +1113,11 @@ pub fn pack_call_counted(tool_input: &Value, roots: &PackRoots) -> (PackCall, us
     let call = shell_command(tool_input)
         .filter(|cmd| cmd.len() <= COMMAND_SCAN_MAX_BYTES) // never a prefix of a longer text
         .and_then(|cmd| grammar_tokens(&cmd, &mut steps))
-        .and_then(|toks| parse_call(&toks, roots, &mut steps));
+        .and_then(|toks| parse_call(&toks, roots, &mut steps))
+        .filter(|c| match c {
+            PackCall::One { rel, .. } => roots.is_pack_file(rel), // RULINGS CC2: one lstat
+            PackCall::None => true,
+        });
     (call.unwrap_or(PackCall::None), steps)
 }
 
@@ -1126,18 +1176,18 @@ pub enum Classified {
     Ignored { failure: bool },
     Call { rel: String },
     Excluded { reason: &'static str },
-    /// An end of `rel`'s call that is neither a failure nor a call (RULINGS BX1: no exit report
-    /// `Exit code 1..=127` on the error text's first line) → its call leaves the rate.
+    /// An end of `rel`'s call that is neither a failure nor a call (RULINGS BX1 / CC1: no exit report
+    /// `Exit code 1..=125` on the error text's first line) → its call leaves the rate.
     NotCounted { rel: String },
     Failure { report: cys::repair::intake::Report },
 }
 
-/// RULINGS BX1 — the tool's documented exit shape: the error text's FIRST line is exactly `Exit code N`
-/// with N an integer from 1 to 127 (decimal digits, no sign, no leading zero, nothing else on the line
-/// but ONE trailing carriage return — a Windows line end, RULINGS BY2).
+/// RULINGS BX1 / CC1 — the tool's documented exit shape: the error text's FIRST line is exactly
+/// `Exit code N` with N an integer from 1 to 125 (decimal digits, no sign, no leading zero, nothing else
+/// on the line but ONE trailing carriage return — a Windows line end, RULINGS BY2).
 /// `None` for every other text: the Bash tool's own `Command timed out after …`, an interruption, a
-/// tool / sandbox / permission message, an exit of 128 or more (ended by a signal), a first line that
-/// is not the report. The exclusion list then reads the same code from that same line
+/// tool / sandbox / permission message, 126 / 127 (the shell started nothing: not executable, not
+/// found — RULINGS CC1), an exit of 128 or more (ended by a signal), a first line that is not the report. The exclusion list then reads the same code from that same line
 /// (`intake::leading_exit_code`).
 pub fn exit_report(error: &str) -> Option<i64> {
     let first = error.split('\n').next()?;
@@ -1145,7 +1195,7 @@ pub fn exit_report(error: &str) -> Option<i64> {
     if n.is_empty() || n.len() > 3 || n.starts_with('0') || !n.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    n.parse::<i64>().ok().filter(|n| (1..=127).contains(n))
+    n.parse::<i64>().ok().filter(|n| (1..=125).contains(n))
 }
 
 /// A post-call event that says the call did not end well (the shapes the CLI forwards — RULINGS BE1).
@@ -1532,8 +1582,9 @@ fn production_roots() -> PackRoots {
 
 #[cfg(test)]
 fn production_roots() -> PackRoots {
-    // tests never resolve the real pack dir or home: a fixed, fictional base-lane spelling
-    PackRoots::new(Some("/Users/x/.cys/pack"), Some("/Users/x"))
+    // tests never resolve the real pack dir or home: a fixed, fictional base-lane spelling whose scripts
+    // are taken as present (the CC2 tests use real temp packs)
+    PackRoots::new(Some("/Users/x/.cys/pack"), Some("/Users/x")).assuming_files()
 }
 
 fn detector_enabled() -> bool {
@@ -2221,9 +2272,10 @@ mod defect_intake_tests {
         ("/Users/x/.cys/pack/bin/tool", "bin/tool", None),
     ];
 
-    /// The base lane of the tests (the same fictional spelling `production_roots` gives under test).
+    /// The base lane of the tests (the same fictional spelling `production_roots` gives under test; its
+    /// scripts are taken as present — `named_script_must_be_a_real_pack_file` checks the real lookup).
     fn base() -> PackRoots {
-        PackRoots::new(Some("/Users/x/.cys/pack"), Some("/Users/x"))
+        PackRoots::new(Some("/Users/x/.cys/pack"), Some("/Users/x")).assuming_files()
     }
 
     fn pre<'a>(input: &'a Value) -> ToolObservation<'a> {
@@ -2311,11 +2363,11 @@ mod defect_intake_tests {
         assert_eq!(n, pairs * args.len() * redirs.len());
         assert_eq!(n, 2_100);
         // Windows: the drive-letter pack dir and its Git Bash form; a department daemon: ITS pack
-        let win = PackRoots::new(Some(r"C:\Users\x\.cys\pack"), Some(r"C:\Users\x"));
+        let win = PackRoots::new(Some(r"C:\Users\x\.cys\pack"), Some(r"C:\Users\x")).assuming_files();
         assert_eq!(pack_call(&bash("python C:/Users/x/.cys/pack/bin/javis_x.py check"), &win), one("bin/javis_x.py", Some("check")));
         assert_eq!(pack_call(&bash("python /c/Users/x/.cys/pack/bin/javis_x.py"), &win), one("bin/javis_x.py", None));
         assert_eq!(pack_call(&bash("pwsh -NoProfile ~/.cys/pack/bin/x.ps1"), &win), one("bin/x.ps1", None));
-        let dept = PackRoots::new(Some("/Users/x/.cys/pack-dept-a"), Some("/Users/x"));
+        let dept = PackRoots::new(Some("/Users/x/.cys/pack-dept-a"), Some("/Users/x")).assuming_files();
         assert_eq!(pack_call(&bash("python3 ~/.cys/pack-dept-a/bin/javis_x.py"), &dept), one("bin/javis_x.py", None));
         assert_eq!(pack_call(&json!({"command": ["python3", "/Users/x/.cys/pack/bin/a.py", "x"]}), &base()), one("bin/a.py", Some("x")));
     }
@@ -2421,6 +2473,60 @@ mod defect_intake_tests {
             assert_eq!(classify(&pre(&bash(c)), &base(), false), Classified::Ignored { failure: false }, "counted as a call: {c:?}");
         }
         assert_eq!(negatives.len(), 22 + 65 + 22 + 1);
+    }
+
+    /// RULINGS CC2 — the named script must be a REAL file of this lane's pack when the call is
+    /// classified: one `lstat` (a regular file — not a link, not a directory). A mistyped name through an
+    /// interpreter, a link as the script and a script deleted since get no identity: not counted as a
+    /// call, their failure not counted against the script. The real `PackRoots::new` on a temp home.
+    #[test]
+    fn named_script_must_be_a_real_pack_file() {
+        let home = tmp_root("cc2");
+        let pack = home.join(".cys").join("pack");
+        for rel in ["bin/javis_x.py", "bin/cys-dept", "hooks/guard.sh"] {
+            let f = pack.join(rel);
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(&f, b"#\n").unwrap();
+        }
+        std::fs::create_dir_all(pack.join("bin/dir.py")).unwrap();
+        let roots = PackRoots::new(Some(&pack.to_string_lossy()), Some(&home.to_string_lossy()));
+        let p = pack.to_string_lossy().to_string();
+        // existing regular files: unchanged
+        let x = bash("python3 ~/.cys/pack/bin/javis_x.py check");
+        assert_eq!(pack_call(&x, &roots), one("bin/javis_x.py", Some("check")));
+        assert_eq!(pack_call(&bash(&format!("python3 {p}/bin/javis_x.py check")), &roots), one("bin/javis_x.py", Some("check")));
+        assert_eq!(pack_call(&bash(&format!("{p}/bin/cys-dept status")), &roots), one("bin/cys-dept", Some("status")));
+        assert_eq!(pack_call(&bash("bash ~/.cys/pack/hooks/guard.sh"), &roots), one("hooks/guard.sh", None));
+        assert_eq!(classify(&pre(&x), &roots, false), Classified::Call { rel: "bin/javis_x.py".into() });
+        assert!(matches!(classify(&fail(&x, Some("Exit code 1\nKeyError: 'k'")), &roots, false), Classified::Failure { .. }));
+        // a mistyped name through an interpreter (python exits 2, in the exit shape) → no identity
+        let typo = bash(&format!("python3 {p}/bin/javis_typo.py check"));
+        assert_eq!(pack_call(&typo, &roots), PackCall::None);
+        assert_eq!(classify(&pre(&typo), &roots, false), Classified::Ignored { failure: false });
+        let err = format!("Exit code 2\n/usr/bin/python3: can't open file '{p}/bin/javis_typo.py': [Errno 2] No such file or directory");
+        assert_eq!(classify(&fail(&typo, Some(&err)), &roots, false), Classified::Ignored { failure: true });
+        // a directory named like a script → no identity
+        assert_eq!(pack_call(&bash("python3 ~/.cys/pack/bin/dir.py"), &roots), PackCall::None);
+        // a link as the script — to a pack file, to a file outside the pack, extensionless → no identity
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(pack.join("bin/javis_x.py"), pack.join("bin/link.py")).unwrap();
+            let outside = home.join("outside.py");
+            std::fs::write(&outside, b"#\n").unwrap();
+            std::os::unix::fs::symlink(&outside, pack.join("bin/out.py")).unwrap();
+            std::os::unix::fs::symlink(pack.join("bin/cys-dept"), pack.join("bin/dept-link")).unwrap();
+            for c in ["python3 ~/.cys/pack/bin/link.py", "python3 ~/.cys/pack/bin/out.py", "~/.cys/pack/bin/dept-link status"] {
+                let input = bash(c);
+                assert_eq!(pack_call(&input, &roots), PackCall::None, "a link got an identity: {c}");
+                assert_eq!(classify(&pre(&input), &roots, false), Classified::Ignored { failure: false }, "{c}");
+                assert_eq!(classify(&fail(&input, Some("Exit code 1\nE: x")), &roots, false), Classified::Ignored { failure: true }, "{c}");
+            }
+        }
+        // looked up at the moment of classification: a script deleted since → no identity
+        std::fs::remove_file(pack.join("bin/javis_x.py")).unwrap();
+        assert_eq!(pack_call(&x, &roots), PackCall::None);
+        assert_eq!(classify(&pre(&x), &roots, false), Classified::Ignored { failure: false });
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// RULINGS BY1 — the interpreter must be the script's own: every interpreter head (bare, with its
@@ -2627,10 +2733,22 @@ mod defect_intake_tests {
     /// choices — every assignment invalid, interpreters and script types mixed), half random fragments — with arbitrary characters inserted
     /// into half of them (the full printable ASCII set, tab, CR, LF, NUL, ESC, NEL, some non-ASCII
     /// letters), the production parser gives an identity EXACTLY when the independent reference re-parses
-    /// the text — and the same rel and first argument.
+    /// the text AND the script is one of the test pack's regular files (RULINGS CC2) — and the same rel
+    /// and first argument.
     #[test]
     fn property_identity_only_when_the_reference_reparses() {
-        let roots = base();
+        // RULINGS CC2 — the generator's scripts live in the test's OWN temp pack: regular files, one link
+        // (`bin/x.mjs`) and one missing script (`bin/gone.py`); an identity only for a real regular file
+        let pack = tmp_root("prop-pack");
+        let present = ["bin/a.py", "bin/javis_x.py", "hooks/g.sh", "bin/b.bash", "bin/x.js", "bin/x.ps1", "bin/cys-dept"];
+        for rel in present {
+            let f = pack.join(rel);
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(&f, b"#\n").unwrap();
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(pack.join("bin/x.js"), pack.join("bin/x.mjs")).unwrap();
+        let roots = PackRoots::new(Some("/Users/x/.cys/pack"), Some("/Users/x")).on_disk(&pack);
         let mut state: u64 = 0x5eed_7a3b_0001;
         let mut rnd = move |n: usize| -> usize {
             state ^= state << 13;
@@ -2652,11 +2770,12 @@ mod defect_intake_tests {
             "~/.cys/pack/bin/a.py", "/Users/x/.cys/pack/bin/javis_x.py", "/Users/x/.cys/pack/hooks/g.sh", "~/.cys/pack/bin/b.bash",
             "~/.cys/pack/bin/x.js", "/Users/x/.cys/pack/bin/x.mjs", "~/.cys/pack/bin/x.ps1", "~/.cys/pack/bin/cys-dept",
             "~/.cys/pack-dept-a/bin/a.py", "/tmp/x.py", "$CYS_PACK_DIR/bin/a.py", "\"~/.cys/pack/bin/a.py\"",
+            "~/.cys/pack/bin/gone.py",
         ];
         let redirs = ["", "", "2>&1", ">/dev/null", "> /dev/null", "2>/dev/null", "&>/dev/null", ">&2", "> out"];
         let seps = [" ", " ", "\t", "  "];
         let extra = ['ä', 'ß', 'λ', '日'];
-        let (mut positives, mut total) = (0usize, 0usize);
+        let (mut positives, mut total, mut absent) = (0usize, 0usize, 0usize);
         for _ in 0..5_000 {
             let mut parts: Vec<&str> = Vec::new();
             if rnd(2) == 0 {
@@ -2700,7 +2819,11 @@ mod defect_intake_tests {
             }
             total += 1;
             let got = pack_call(&bash(&text), &roots);
-            let want = reference_identity(&text, roots.prefixes());
+            let parsed = reference_identity(&text, roots.prefixes());
+            if parsed.as_ref().is_some_and(|(rel, _)| !present.contains(&rel.as_str())) {
+                absent += 1;
+            }
+            let want = parsed.filter(|(rel, _)| present.contains(&rel.as_str()));
             match (&got, &want) {
                 (PackCall::One { rel, sub }, Some((r, s))) => {
                     assert_eq!((rel, sub), (r, s), "{text:?}");
@@ -2710,7 +2833,9 @@ mod defect_intake_tests {
                 _ => panic!("parser and reference disagree on {text:?}: {got:?} vs {want:?}"),
             }
         }
-        eprintln!("[t3b-property] {total} texts, {positives} identified, {} refused", total - positives);
+        let _ = std::fs::remove_dir_all(&pack);
+        eprintln!("[t3b-property] {total} texts, {positives} identified, {} refused ({absent} grammar-valid but no real pack file)", total - positives);
+        assert!(absent >= 5, "the generator rarely names a missing or linked script ({absent}) — CC2 untested here");
         assert!(positives >= 100, "the generator rarely produces a grammar text ({positives}) — the property would be vacuous");
         assert!(total - positives >= 1_000);
     }
@@ -2760,7 +2885,7 @@ mod defect_intake_tests {
             assert_eq!(pack_call(&bash(c), &base()), PackCall::None, "a mention became an identity: {c:?}");
         }
         // the base lane's pack is not a department daemon's
-        let dept = PackRoots::new(Some("/Users/x/.cys/pack-dept-a"), Some("/Users/x"));
+        let dept = PackRoots::new(Some("/Users/x/.cys/pack-dept-a"), Some("/Users/x")).assuming_files();
         assert_eq!(pack_call(&bash("python3 ~/.cys/pack/bin/javis_x.py"), &dept), PackCall::None);
         // other tools and other events are never classified as calls / failures of a script
         let g = bash("grep pat ~/.cys/pack/hooks/guard.sh");
@@ -2777,21 +2902,20 @@ mod defect_intake_tests {
         );
     }
 
-    /// RULINGS BX1 / BY2 — the failure side's closed form: only the tool's exit report `Exit code N`, N an
-    /// integer 1..=127, as the error text's FIRST line (one trailing CR allowed). The exclusion list reads the same code from that
+    /// RULINGS BX1 / BY2 / CC1 — the failure side's closed form: only the tool's exit report `Exit code N`,
+    /// N an integer 1..=125, as the error text's FIRST line (one trailing CR allowed). The exclusion list reads the same code from that
     /// same line (`intake::leading_exit_code`).
     #[test]
-    fn exit_report_is_the_first_line_exit_code_1_to_127() {
+    fn exit_report_is_the_first_line_exit_code_1_to_125() {
         for (text, n) in [
             ("Exit code 1", 1),
             ("Exit code 1\nKeyError: 'k'", 1),
             ("Exit code 2\nusage: x", 2),
             ("Exit code 64\n", 64),
-            ("Exit code 126\n(eval):1: permission denied: /Users/x/.cys/pack/bin/a.sh", 126),
-            ("Exit code 127\n/usr/bin/bash: line 1: cys-dept: command not found", 127),
+            ("Exit code 125\nE: x", 125),
             // RULINGS BY2 — ONE trailing carriage return (a Windows line end)
             ("Exit code 1\r\nKeyError: 'k'\r\n", 1),
-            ("Exit code 127\r\n/usr/bin/bash: line 1: cys-dept: command not found\r\n", 127),
+            ("Exit code 125\r\nE: x\r\n", 125),
             ("Exit code 2\r", 2),
         ] {
             assert_eq!(exit_report(text), Some(n), "{text:?}");
@@ -2801,6 +2925,10 @@ mod defect_intake_tests {
             "Command timed out after 2m 0s",
             "Command timed out after 10m 0s\nExit code 1",
             "Exit code 0",
+            // RULINGS CC1 — the shell started nothing
+            "Exit code 126\n(eval):1: permission denied: /Users/x/.cys/pack/bin/a.sh",
+            "Exit code 127\n/usr/bin/bash: line 1: cys-dept: command not found",
+            "Exit code 127\r\n/usr/bin/bash: line 1: cys-dept: command not found\r\n",
             "Exit code 128",
             "Exit code 130\nKeyboardInterrupt",
             "Exit code 137",
@@ -2833,10 +2961,10 @@ mod defect_intake_tests {
         }
     }
 
-    /// RULINGS BX1 at the detector, with a grammar-valid command: the Bash tool's own timeout (verbatim),
-    /// an exit of 128 or more, an interruption and any text without a first-line exit report count
-    /// NOTHING — neither a failure nor a call (the PRE_TOOL's call leaves the rate); exits 1, 2, 126 and
-    /// 127 are failures. A healthy slow script files nothing, and its timeouts do not dilute a real
+    /// RULINGS BX1 / CC1 at the detector, with a grammar-valid command: the Bash tool's own timeout
+    /// (verbatim), 126 / 127 (nothing was started), an exit of 128 or more, an interruption and any text
+    /// without a first-line exit report count NOTHING — neither a failure nor a call (the PRE_TOOL's call
+    /// leaves the rate); exits 1, 2 and 125 are failures. A healthy slow script files nothing, and its timeouts do not dilute a real
     /// defect's rate.
     #[test]
     fn only_the_tools_exit_report_is_a_failure_and_other_ends_leave_the_rate() {
@@ -2845,6 +2973,8 @@ mod defect_intake_tests {
         assert_eq!(pack_call(&x, &base()), one("bin/javis_x.py", Some("run")), "the command must be inside the grammar");
         for text in [
             "Command timed out after 2m 0s",
+            "Exit code 126\n(eval):1: permission denied: /Users/x/.cys/pack/bin/javis_x.py",
+            "Exit code 127\n(eval):1: command not found: python3",
             "Exit code 137",
             "Exit code 143",
             "Exit code 130\nKeyboardInterrupt",
@@ -2869,7 +2999,7 @@ mod defect_intake_tests {
         assert_eq!(observe(&mut d, &abort, &base(), t, false), Observed::NotCounted);
         assert_eq!(d.rels["bin/javis_x.py"].totals(t), (0, 0));
         // the failures
-        for n in [1, 2, 126, 127] {
+        for n in [1, 2, 125] {
             let mut d = Detector::default();
             observe(&mut d, &pre(&x), &base(), t, false);
             let text = format!("Exit code {n}\nE: x");
@@ -2903,21 +3033,25 @@ mod defect_intake_tests {
         assert_eq!(d.counters.not_counted, 30);
     }
 
-    /// RULINGS BX1 — the exclusion list and the Windows `127` rule read the exit code from the SAME first
-    /// line: a by-design answer is excluded only when its text begins with the report; the same text with
-    /// the report elsewhere, or without it, counts nothing at all (it is no failure).
+    /// RULINGS BX1 — the exclusion list reads the exit code from the SAME first line: a by-design answer is
+    /// excluded only when its text begins with the report; the same text with the report elsewhere, or
+    /// without it, counts nothing at all (it is no failure). RULINGS CC1: the Windows `cys-dept` 127 text
+    /// is no failure on any system (kept entry, harmless); its "not recognized" sentence after an
+    /// `Exit code 1` is still excluded on Windows.
     #[test]
     fn exclusions_read_the_code_from_the_first_line() {
         let t = 1_800_000_000.0;
         let dept = bash("~/.cys/pack/bin/cys-dept create team-x");
         let gate = bash("python3 ~/.cys/pack/bin/javis_resource_gate.py check");
         let chk = bash("python3 ~/.cys/pack/bin/javis_orchestra.py check");
-        let cases: [(&Value, &str, bool, Observed); 11] = [
-            (&dept, "Exit code 127\n/usr/bin/bash: line 1: cys-dept: command not found", true, Observed::Excluded),
-            (&dept, "Exit code 127\r\n/usr/bin/bash: line 1: cys-dept: command not found\r\n", true, Observed::Excluded),
+        let cases: [(&Value, &str, bool, Observed); 13] = [
+            (&dept, "Exit code 127\n/usr/bin/bash: line 1: cys-dept: command not found", true, Observed::NotCounted),
+            (&dept, "Exit code 127\r\n/usr/bin/bash: line 1: cys-dept: command not found\r\n", true, Observed::NotCounted),
             (&dept, "\nExit code 127\n/usr/bin/bash: line 1: cys-dept: command not found", true, Observed::NotCounted),
             (&dept, "/usr/bin/bash: line 1: cys-dept: command not found", true, Observed::NotCounted),
-            (&dept, "Exit code 127\n/usr/bin/bash: line 1: cys-dept: command not found", false, Observed::Failure),
+            (&dept, "Exit code 127\n/usr/bin/bash: line 1: cys-dept: command not found", false, Observed::NotCounted),
+            (&dept, "Exit code 1\r\n'cys-dept' is not recognized as an internal or external command,\r\n", true, Observed::Excluded),
+            (&dept, "Exit code 1\r\n'cys-dept' is not recognized as an internal or external command,\r\n", false, Observed::Failure),
             (&gate, "Exit code 2\nverdict: hard_block", false, Observed::Excluded),
             (&gate, " Exit code 2\nverdict: hard_block", false, Observed::NotCounted),
             (&gate, "verdict: hard_block\nExit code 2", false, Observed::NotCounted),
@@ -3029,7 +3163,8 @@ mod defect_intake_tests {
         assert_eq!(rep.due, 0, "{rep:?}");
         assert!(!root.join("intake").exists(), "a compound call was filed against the script");
         let snap = defect_intake_snapshot(&daemon, 10.0);
-        assert_eq!((snap["calls"].as_u64(), snap["failures"].as_u64(), snap["failures_without_identity"].as_u64()), (Some(0), Some(0), Some(30)), "{snap}");
+        // 6 routes × 5 — the `a | …` route ends 127 (nothing started, RULINGS CC1): not a failure at all
+        assert_eq!((snap["calls"].as_u64(), snap["failures"].as_u64(), snap["failures_without_identity"].as_u64()), (Some(0), Some(0), Some(25)), "{snap}");
         // the same script as ONE simple command → its row
         let single = bash("python3 ~/.cys/pack/bin/javis_x.py run 2>&1");
         for _ in 0..5 {
@@ -3137,6 +3272,11 @@ mod defect_intake_tests {
             }
         }
         assert!(body("pub fn observe_tool_event_with(").contains("flusher.once.get_or_init("), "the flusher must start once, through the injected hook");
+        // RULINGS CC2: the hook path's ONLY file-system access is ONE lstat of the named script
+        let fsb = body("fn is_pack_file(");
+        assert_eq!(fsb.matches("std::fs::").count(), 1, "is_pack_file does more than one file-system call");
+        assert!(fsb.contains("std::fs::symlink_metadata("), "the script lookup must not follow a link");
+        assert_eq!(body("pub fn pack_call_counted(").matches("is_pack_file(").count(), 1);
         for head in ["pub fn flush_defect_intake(", "pub fn flusher_pass(", "fn log_flush("] {
             let b = body(head);
             for n in send {
@@ -3200,19 +3340,30 @@ mod defect_intake_tests {
         let cfg_t = 1_800_000_000.0;
         let dept = bash("~/.cys/pack/bin/cys-dept create team-x");
         let err127 = "Exit code 127\n/usr/bin/bash: line 1: cys-dept: command not found";
-        // Windows: by design, never counted
+        let not_recognized = "Exit code 1\r\n'cys-dept' is not recognized as an internal or external command,";
+        // RULINGS CC1: 127 (not found) is no failure on any system — nothing counted, no row
+        for windows in [true, false] {
+            let mut d = Detector::default();
+            for _ in 0..10 {
+                observe(&mut d, &pre(&dept), &base(), cfg_t, windows);
+                assert_eq!(observe(&mut d, &fail(&dept, Some(err127)), &base(), cfg_t, windows), Observed::NotCounted);
+            }
+            assert!(due_signatures(&d, cfg_t).is_empty());
+            assert_eq!((d.counters.failures, d.counters.excluded, d.rels["bin/cys-dept"].totals(cfg_t)), (0, 0, (0, 0)));
+        }
+        // Windows: the "not recognized" sentence in the failure shape — by design, never counted
         let mut d = Detector::default();
         for _ in 0..10 {
             observe(&mut d, &pre(&dept), &base(), cfg_t, true);
-            assert_eq!(observe(&mut d, &fail(&dept, Some(err127)), &base(), cfg_t, true), Observed::Excluded);
+            assert_eq!(observe(&mut d, &fail(&dept, Some(not_recognized)), &base(), cfg_t, true), Observed::Excluded);
         }
         assert!(due_signatures(&d, cfg_t).is_empty());
         assert_eq!(d.counters.excluded_by_reason.get("windows-cys-dept-not-on-path"), Some(&10));
-        // macOS: a missing cys-dept is a defect
+        // macOS: the same failure is a defect
         let mut d = Detector::default();
         for _ in 0..5 {
             observe(&mut d, &pre(&dept), &base(), cfg_t, false);
-            observe(&mut d, &fail(&dept, Some(err127)), &base(), cfg_t, false);
+            observe(&mut d, &fail(&dept, Some(not_recognized)), &base(), cfg_t, false);
         }
         assert_eq!(due_signatures(&d, cfg_t).len(), 1);
         // a polled `orchestra check` with its designed answer files nothing; its crash or a syntax error does
@@ -3286,7 +3437,8 @@ mod defect_intake_tests {
         for c in [3, 4, 5, 6, 8, 9] {
             assert_eq!(ex("bin/javis_task.py", Some("checkout"), &format!("Exit code {c}\nconflict: x")), None);
         }
-        // the shared table (T3's Windows cys-dept entry) is consulted too
+        // the shared table (T3's Windows cys-dept entry, kept — RULINGS CC1 makes its 127 branch moot for
+        // the detector, `exclusions_read_the_code_from_the_first_line`) is consulted too
         let dept = "Exit code 127\n/usr/bin/bash: line 1: cys-dept: command not found";
         assert_eq!(detector_excluded("bin/cys-dept", Some("create"), dept, true), Some("windows-cys-dept-not-on-path"));
         assert_eq!(detector_excluded("bin/cys-dept", Some("create"), dept, false), None);
