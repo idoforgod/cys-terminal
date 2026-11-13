@@ -2433,7 +2433,7 @@ pub(crate) fn is_seed_once(rel: &str) -> bool {
 /// 화이트리스트가 술어 2개(is_user_owned/is_seed_once)로 분산되면 교집합(이중 등급) 시 동작이
 /// 호출 순서에 숨는다 — 단일 match 가 배타 등급 하나만 반환하게 구조로 보장한다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Ownership {
+pub enum Ownership {
     /// 임베드 진실(기본값) — 벤더 전진 불일치 시 치유/3-way 병합(P0-4 계승) · 벤더 미전진
     /// 드리프트는 kept-drift 보존 · 비수정 자동 갱신·prune 대상.
     System,
@@ -2609,13 +2609,460 @@ pub enum FileAction {
     /// 백필 가드는 T3.
     KeepDrift,
     /// ★NEW(v2 §3 L3): 벤더 전진 + 드리프트 + 검증된 base — 3-way 병합 시도(실행부 T3 · 실패 전부
-    /// healed 폴백).
+    /// healed 폴백). ★0.15.0 M11: 실패 폴백은 기동 필수 파일이면 `VendorFirst`, 아니면 `UserKept`.
     Merge3,
+    /// ★0.15.0 M11 가(사용자 우선): 기동 필수가 아닌 시스템 파일의 충돌·기준본 없음·손상 의심 —
+    /// **사용자 파일이 살아 있는 파일로 남고** vendor 신버전은 `<rel>.new` 로 보관, 원장 kind
+    /// `user-kept`. 설치 기록(매니페스트)은 앞당기지 않는다(앞당기면 '고친 상태로 안정'으로
+    /// 분류돼 다시는 알리지 않는다 — 설계 §4-11 가). `reason` 은 원장에 남는 판정 사유.
+    UserKept { reason: &'static str },
+    /// ★0.15.0 M11 나(기동 필수 충돌): vendor 본을 먼저 살리고 사용자 수정본은 `<rel>.user`
+    /// (이전 세대는 `.user.prev-<시각>`)로 보관, 원장 kind `vendor-first` — 켜진 뒤 워커가 승인
+    /// 절차(`cys repair reapply`)로 다시 입힌다. 보관이 불가능하면 덮지 않고 격리한다(부록 A-2 #4).
+    VendorFirst { reason: &'static str },
+    /// ★0.15.0 M11 마(묘비): 수리 장부에 기록된 삭제 — 부재를 유지한다(만들지 않는다). 생명줄 훅
+    /// 여섯은 이 판정에 오지 않는다(묘비가 걸러진다). `repair` = 그 삭제를 기록한 수리 번호.
+    KeepAbsent { repair: String },
 }
 
-/// 순수 판정 SOT — User·SeedOnce 조기 분기 불변, system은 L0(locked 즉시 치유)/L1(판독불가 백업 후
-/// 치유)/L2(벤더 미전진 kept-drift)/L3(벤더 전진 검증 base 3-way)/L4(레거시 종전 거동) 판정표(v2 §3).
+/// ★0.15.0 M11(CONTRACTS O-C8-2): 설치 기록에서 본 이 파일의 기준 상태 — 있음(해시) · 없음 · 깨짐.
+/// 깨짐은 매니페스트 파일이 있으나 읽을 수 없는 경우다(그때 지금 코드는 모든 파일을 '기준본
+/// 없음'으로 본다 — 설계 §4-11 다).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManifestBase<'a> {
+    Some(&'a str),
+    None,
+    Corrupt,
+}
+
+/// ★0.15.0 M11(CONTRACTS O-C8-2) 순수 분류기의 결과 — 업데이트 규칙의 네 갈래.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateClass {
+    /// 가: 사용자 파일 유지 + vendor 신버전 `.new` 보관(`park_new` 는 늘 참 — 계약 모양 보존).
+    UserWins { park_new: bool },
+    /// 나: vendor 본 우선 + 사용자 수정본 시각별 보관(`park_user_ts` 는 늘 참).
+    VendorFirst { park_user_ts: bool },
+    /// 사용자 수정이 아니다(설치 당시 해시 · 과거 vendor 본과 바이트 동일) — 새 버전으로 갱신.
+    VendorUpdate,
+    /// 이 규칙의 대상이 아니다 — 지금 동작 그대로(판독 불가 가-2 · 잠금 자산 L0 · vendor 미전진
+    /// kept-drift · seed-once · 사용자가 고친 user-owned 의 `.new` 병치).
+    KeepAsToday,
+}
+
+/// ★0.15.0 M11(CONTRACTS O-C8-2 · RULINGS A) **순수 분류기** — `decide_file_action` 옆에 둔다.
+/// 입력은 호출자가 모은 사실이고(IO 0), 존재하며 vendor 본과 다른 파일 하나에 대해 업데이트
+/// 규칙의 갈래를 정한다:
+/// - 판독 불가(`encoding_ok=false` 또는 해시 없음) → `KeepAsToday`(가-2: 시스템 파일은 바이트 백업 뒤
+///   vendor 본, 사용자 소유 파일은 강제 설치에서도 그대로 — 부록 A-2 #3).
+/// - user-owned: 그 파일 자신의 설치 기록 해시 또는 그 파일의 과거 vendor 해시와 바이트가 같고
+///   (가드 1) 병합 감사에 '내 것 유지'·'되돌림'이 없으면(가드 2) → `VendorUpdate`(바). 가드 3(규칙
+///   문서 인수 검사)·가드 4(CEO 승격 중 MASTER)·부서 재작성 파일 제외는 호출자가 거부권으로 적용한다.
+/// - system: 설치 기록 해시와 같음 → `VendorUpdate` · 기록 없음/깨짐 + 과거 vendor 본과 같음 →
+///   `VendorUpdate`(다 — 사용자 수정으로 판정하기 **전에** 표부터, 부록 A-2 #1) · vendor 미전진 →
+///   `KeepAsToday`(kept-drift) · 그 밖 → 기동 필수면 `VendorFirst`, 아니면 `UserWins`.
+#[allow(clippy::too_many_arguments)]
+pub fn classify_update(
+    rel: &str,
+    ownership: Ownership,
+    boot_critical: bool,
+    base: ManifestBase<'_>,
+    disk_hash: Option<&str>,
+    vendor_hash: &str,
+    prev_vendor_match: bool,
+    audit_keep: bool,
+    encoding_ok: bool,
+) -> UpdateClass {
+    let Some(d) = disk_hash.filter(|_| encoding_ok) else {
+        return UpdateClass::KeepAsToday;
+    };
+    if d == vendor_hash {
+        return UpdateClass::KeepAsToday;
+    }
+    match ownership {
+        Ownership::SeedOnce => UpdateClass::KeepAsToday,
+        Ownership::User => {
+            let unedited = matches!(base, ManifestBase::Some(h) if h == d) || prev_vendor_match;
+            if unedited && !audit_keep {
+                UpdateClass::VendorUpdate
+            } else {
+                UpdateClass::KeepAsToday
+            }
+        }
+        Ownership::System => {
+            if system_locked(rel) {
+                return UpdateClass::KeepAsToday;
+            }
+            match base {
+                ManifestBase::Some(h) if h == d => UpdateClass::VendorUpdate,
+                ManifestBase::Some(h) if h == vendor_hash => UpdateClass::KeepAsToday,
+                ManifestBase::None | ManifestBase::Corrupt if prev_vendor_match => {
+                    UpdateClass::VendorUpdate
+                }
+                _ if boot_critical => UpdateClass::VendorFirst { park_user_ts: true },
+                _ => UpdateClass::UserWins { park_new: true },
+            }
+        }
+    }
+}
+
+/// ★0.15.0 M11: 한 파일의 판정 입력 중 **IO 로만 알 수 있는 사실** — 설치 실행부·드라이런(plan)·
+/// 되살리기 모의 판정이 같은 수집기(`UpdateContext::facts`)로 만든다('계획 = 실제').
+/// `Default` = 중립 사실(묘비 없음 · 기동 필수 아님 · 과거 vendor 일치 없음 · 감사 유지 없음 ·
+/// 인수 검사 미통과 · 승격 아님) — 옛 시그니처 `decide_file_action` 이 이것으로 위임한다.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UpdateFacts {
+    /// C4 질의(컴파일된 기동 필수 목록) — T5a 병합 전에는 목록이 비어 늘 거짓(계약의 시험 이음새).
+    pub boot_critical: bool,
+    /// 매니페스트 파일이 있으나 깨져 읽을 수 없음(다).
+    pub manifest_corrupt: bool,
+    /// 디스크 바이트가 이 파일의 과거 vendor 본 해시 중 하나와 같음(다 · 바 가드 1).
+    pub prev_vendor_match: bool,
+    /// 병합 감사 원장에 이 파일의 '내 것 유지'(keep-mine)·'되돌림'(rollback) 기록이 있음(바 가드 2 ·
+    /// RULINGS C X2: `.merge-audit.jsonl` 을 읽는다).
+    pub audit_keep: bool,
+    /// 규칙 문서(헌법 파일)의 안전 조항 인수 검사 통과(바 가드 3 — 실패 시 `.new`).
+    pub takeover_ok: bool,
+    /// 본부 지침이 CEO 승격 상태(바 가드 4 — `cys.rs` A12 가드와 같은 조건).
+    pub ceo_promoted: bool,
+    /// 이 레인의 묘비가 이 파일의 삭제를 기록함 — 그 수리 번호(마). 생명줄은 결코 Some 이 아니다.
+    pub tombstoned: Option<String>,
+    /// 이미 `user-kept` 로 보관 중이고 `<rel>.new` 가 지금 vendor 본과 같음 — 다시 합치지 않는다(가).
+    pub parked_same_vendor: bool,
+}
+
+/// 본부 지침 상대경로 — 바 가드 4 의 대상(`cys.rs` `MASTER_DIRECTIVE_REL` 과 같은 값).
+pub const MASTER_DIRECTIVE_REL: &str = "directives/MASTER_DIRECTIVE.md";
+
+/// 바 가드 4 의 조건 — `cys.rs:ceo_vendor_overwrite_rejection`(A12) 과 **같은 조건**:
+/// `<pack>/directives/MASTER_DIRECTIVE.md.pre-ceo` 가 있으면 CEO 승격 중이다(설계 §6-11 바 "가드
+/// 2개를 `src/pack.rs` 쪽에 재현"). ★T8 이 승격 상태 판정을 바꾸면 이 자리도 함께 바뀐다(7번째 자리).
+pub fn ceo_promoted_in(dir: &Path) -> bool {
+    dir.join(format!("{MASTER_DIRECTIVE_REL}.pre-ceo")).exists()
+}
+
+/// 바 가드 2 — `.merge-audit.jsonl` 에서 사용자가 일부러 옛 버전을 유지한 기록이 있는 파일 집합.
+/// 행동 `keep-mine`(pack-merge)·`rollback`(pack-rollback)만 센다. 거부 기록(flags 에 `refused`)은
+/// 사용자의 선택이 아니라 게이트의 거부이므로 세지 않는다. 판독 실패 행은 건너뛴다(파일 부재 = 빈 집합).
+pub fn merge_audit_keep_rels(dir: &Path) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    let Ok(text) = std::fs::read_to_string(dir.join(MERGE_AUDIT_FILE)) else {
+        return out;
+    };
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let action = v.get("action").and_then(|a| a.as_str()).unwrap_or("");
+        if action != "keep-mine" && action != "rollback" {
+            continue;
+        }
+        let refused = v
+            .get("flags")
+            .and_then(|f| f.as_array())
+            .is_some_and(|f| f.iter().any(|x| x.as_str() == Some("refused")));
+        if refused {
+            continue;
+        }
+        if let Some(file) = v.get("file").and_then(|f| f.as_str()) {
+            out.insert(file.to_string());
+        }
+    }
+    out
+}
+
+/// 생명줄 훅 파일인가 — `hooks/<여섯 이름>`(CONTRACTS 8.7 · `repair::boot_critical::LIFELINE_HOOKS`).
+/// 묘비는 이 파일들에 결코 적용되지 않는다(언제나 되살린다 — 설계 §7 6행).
+pub fn is_lifeline_rel(rel: &str) -> bool {
+    rel.strip_prefix("hooks/")
+        .is_some_and(|name| crate::repair::boot_critical::LIFELINE_HOOKS.contains(&name))
+}
+
+/// 셸 스크립트인가 — 라(CR 금지)의 대상. 확장자 `.sh`, `hooks/` 아래 파일, 또는 첫 줄이 셸
+/// 인터프리터(`#!…sh`)인 파일. 판정은 vendor 본(임베드) 기준이다(사용자본의 첫 줄은 깨져 있을 수 있다).
+pub fn is_shell_script(rel: &str, vendor: &str) -> bool {
+    if rel.ends_with(".sh") || rel.starts_with("hooks/") {
+        return true;
+    }
+    let first = vendor.lines().next().unwrap_or("");
+    first.starts_with("#!")
+        && (first.ends_with("/sh")
+            || first.ends_with("/bash")
+            || first.ends_with("/zsh")
+            || first.contains("env bash")
+            || first.contains("env sh")
+            || first.contains("env zsh"))
+}
+
+/// ★0.15.0 M11 설치 입력원 — 레인의 묘비(파일만 · 생명줄 제외), 기동 필수 질의, 과거 vendor 해시
+/// 표, 업데이트 전 스냅샷 루트. 설치 실행부·plan·되살리기 모의가 같은 값을 쓴다. 환경 변수 노브 없음.
+pub struct UpdateSources {
+    /// 설치 대상 팩의 레인(`base` 또는 그 부서 소켓의 레인 키). None = 판정 불가 → 묘비 없음(지금 동작).
+    pub lane: Option<crate::repair::types::LaneKey>,
+    /// rel → 그 삭제를 기록한 수리 번호(파일 묘비만 · 생명줄 훅 파일 제외 — `with_tombstones` 가 거른다).
+    tombstoned_files: std::collections::BTreeMap<String, String>,
+    boot_critical: Box<dyn Fn(&str) -> bool + Send + Sync>,
+    prev_vendor: Box<dyn Fn(&str) -> Vec<String> + Send + Sync>,
+    /// 업데이트 전 스냅샷 루트(`~/.cys/local/update-snapshots`). None = 스냅샷을 만들지 않는다.
+    pub snapshot_root: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for UpdateSources {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpdateSources")
+            .field("lane", &self.lane)
+            .field("tombstoned_files", &self.tombstoned_files)
+            .field("snapshot_root", &self.snapshot_root)
+            .finish_non_exhaustive()
+    }
+}
+
+/// 컴파일된 기동 필수 목록(C4 · `repair::boot_critical::entries`)에 이 팩 상대경로가 있는가.
+/// 설치기는 팩 상대경로를 이미 알고 있으므로 경로 정규화·레인 해소가 필요 없는 정확 일치로 묻는다
+/// (staging 경로는 팩 루트가 아니라 경로 질의가 '판정 불가'가 된다 — INFERRED 선택, 보고서 기재).
+/// T5a 병합 전에는 목록이 비어 늘 거짓 = '기동 필수 아님'(CONTRACTS C4 — 이음새: `with_boot_critical`).
+pub fn boot_critical_rel(rel: &str) -> bool {
+    crate::repair::boot_critical::entries()
+        .iter()
+        .any(|e| e.rel == rel)
+}
+
+impl UpdateSources {
+    /// 묘비 없음 · 기동 필수 없음 · 실제 과거 vendor 표 · 스냅샷 없음 — 옛 `install_into` 래퍼(시험 전용)가 쓴다.
+    pub fn none() -> Self {
+        UpdateSources {
+            lane: None,
+            tombstoned_files: std::collections::BTreeMap::new(),
+            boot_critical: Box::new(boot_critical_rel),
+            prev_vendor: Box::new(|rel: &str| {
+                crate::pack_prev_vendor::prev_vendor_hashes(rel)
+                    .iter()
+                    .map(|h| h.to_string())
+                    .collect()
+            }),
+            snapshot_root: None,
+        }
+    }
+
+    /// 라이브 팩용 — 레인을 해소해 그 레인의 묘비만 읽고(`repair::tombstones::load`, 실패·부재 = 빈
+    /// 집합 = 지금 동작 — CONTRACTS O-C8-3 · O-C1-6), 스냅샷 루트를 `local_dir()/update-snapshots` 로 둔다.
+    /// ★테스트 빌드에서 팩 경로 환경 변수가 없으면 `local_dir()`→`pack_dir()` 가 격리 봉인으로 멈추므로
+    /// (부록 A-1 #41), 그때는 묘비·스냅샷을 건너뛴다(빈 집합 — 라이브를 결코 읽지 않는다).
+    pub fn for_live_pack(dir: &Path) -> Self {
+        let mut s = UpdateSources::none();
+        let resolvable = cfg!(not(test))
+            || pack_dir_from_env().is_some()
+            || crate::env_compat("CYS_LOCAL_DIR").is_some();
+        if !resolvable {
+            return s;
+        }
+        s.lane = lane_for_install(dir);
+        if let Some(lane) = s.lane.clone() {
+            match crate::repair::tombstones::load(&lane) {
+                Ok(list) => s = s.with_tombstones(list),
+                Err(crate::repair::types::RepairError::NotImplemented(_)) => {}
+                Err(e) => eprintln!(
+                    "[init-pack] ⚠ 레인 '{}' 의 묘비 기록을 읽지 못했습니다({}) — 지금 동작대로 지운 파일을 되살립니다",
+                    lane.0,
+                    e.code()
+                ),
+            }
+            // 경로 = `repair::paths::update_snapshot_dir` 와 같은 배치(`local/update-snapshots/<lane>/<from>-<ts>`).
+            // 테스트 빌드는 `CYS_LOCAL_DIR` 을 명시한 시험만 스냅샷을 만든다(공용 임시 디렉터리의 `local/` 오염 방지).
+            if cfg!(not(test)) || crate::env_compat("CYS_LOCAL_DIR").is_some() {
+                s.snapshot_root = Some(local_dir().join("update-snapshots"));
+            }
+        }
+        s
+    }
+
+    /// 묘비 목록을 싣는다 — 파일 묘비만(훅 묘비는 종류로 건너뛴다 — RULINGS W3(b)), 생명줄 훅 파일은
+    /// 버린다(CONTRACTS 8.7: 언제나 되살린다).
+    pub fn with_tombstones(mut self, list: Vec<crate::repair::tombstones::Tombstone>) -> Self {
+        for t in list {
+            if t.kind != crate::repair::tombstones::TombstoneKind::File {
+                continue;
+            }
+            if is_lifeline_rel(&t.rel) || t.rel.starts_with("settings:") {
+                continue;
+            }
+            self.tombstoned_files.insert(t.rel, t.repair.as_str().to_string());
+        }
+        self
+    }
+
+    /// 기동 필수 질의 이음새(시험).
+    pub fn with_boot_critical(mut self, f: impl Fn(&str) -> bool + Send + Sync + 'static) -> Self {
+        self.boot_critical = Box::new(f);
+        self
+    }
+
+    /// 과거 vendor 해시 표 이음새(시험 — 과거 릴리스 본문은 런타임에 없다).
+    pub fn with_prev_vendor(
+        mut self,
+        f: impl Fn(&str) -> Vec<String> + Send + Sync + 'static,
+    ) -> Self {
+        self.prev_vendor = Box::new(f);
+        self
+    }
+
+    /// 스냅샷 루트·레인 이음새(시험).
+    pub fn with_snapshot(mut self, lane: &str, root: PathBuf) -> Self {
+        self.lane = Some(crate::repair::types::LaneKey(lane.to_string()));
+        self.snapshot_root = Some(root);
+        self
+    }
+
+    /// 이 파일의 삭제를 기록한 수리 번호(생명줄은 결코 None 이 아닌 값을 갖지 않는다).
+    pub fn tombstone_for(&self, rel: &str) -> Option<&str> {
+        self.tombstoned_files.get(rel).map(String::as_str)
+    }
+
+    /// 허가된 부재 집합 — 설치 준비본 존재 검사(`verify_staging_with`)가 쓴다.
+    pub fn authorised_absent(&self) -> std::collections::BTreeSet<String> {
+        self.tombstoned_files.keys().cloned().collect()
+    }
+
+    pub fn is_boot_critical(&self, rel: &str) -> bool {
+        (self.boot_critical)(rel)
+    }
+
+    /// 과거 출시 해시 표 조회 — 설치 판정(다 · 바 비수정 판정)과 스냅샷의 출시본 판정(RULINGS AC1)이 이 하나를
+    /// 쓴다. 라이브·`none()` 입력원에서는 `pack_prev_vendor::prev_vendor_hashes(rel)` 그대로다(AC5 핀).
+    pub fn prev_vendor_for(&self, rel: &str) -> Vec<String> {
+        (self.prev_vendor)(rel)
+    }
+}
+
+/// 설치 대상 팩의 레인 키(CONTRACTS O-C8-3: `~/.cys/pack` → `base`, `~/.cys/pack-dept-<name>` → 그 레인).
+/// 부서 레인 키는 소켓 경로에서 나오므로(`lane::lane_key`), 이 프로세스의 `CYS_SOCKET` 이 그 부서의
+/// 소켓일 때만(`lane_pack_for_socket` 이 같은 팩을 가리킬 때) 해소한다. 어긋나면 None = 묘비 없음(지금 동작).
+pub fn lane_for_install(pack: &Path) -> Option<crate::repair::types::LaneKey> {
+    if dept_scope_of(pack).is_none() {
+        return Some(crate::repair::types::LaneKey("base".to_string()));
+    }
+    let sock = crate::socket_path();
+    let lane_pack = lane_pack_for_socket(&sock)?;
+    if lane_pack.file_name() == absolutize(pack).file_name() {
+        Some(crate::repair::types::LaneKey::of_socket(&sock))
+    } else {
+        None
+    }
+}
+
+/// 매니페스트 로드 + 깨짐 여부(파일이 있는데 JSON 으로 읽히지 않음). 깨지면 빈 표(지금 동작)와 true.
+pub fn load_manifest_state(dir: &Path) -> (std::collections::BTreeMap<String, String>, bool) {
+    match std::fs::read_to_string(dir.join(INSTALL_MANIFEST)) {
+        Ok(s) => match serde_json::from_str(&s) {
+            Ok(m) => (m, false),
+            Err(_) => (std::collections::BTreeMap::new(), true),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            (std::collections::BTreeMap::new(), false)
+        }
+        Err(_) => (std::collections::BTreeMap::new(), true),
+    }
+}
+
+/// ★0.15.0 M11 사실 수집기 — 한 설치(또는 plan·모의 판정)당 하나. 팩 전체 사실(매니페스트 깨짐 ·
+/// CEO 승격 · 병합 감사)은 한 번만 읽는다.
+pub struct UpdateContext<'s> {
+    dir: PathBuf,
+    scope: PackScope,
+    sources: &'s UpdateSources,
+    manifest_corrupt: bool,
+    ceo_promoted: bool,
+    audit_keep: std::cell::OnceCell<std::collections::BTreeSet<String>>,
+}
+
+impl<'s> UpdateContext<'s> {
+    /// `dir` = 사실을 읽을 물리 디렉터리(staging 이면 staging — 라이브 팩의 전량 사본이다).
+    pub fn new(dir: &Path, scope: PackScope, sources: &'s UpdateSources, manifest_corrupt: bool) -> Self {
+        UpdateContext {
+            dir: dir.to_path_buf(),
+            scope,
+            sources,
+            manifest_corrupt,
+            ceo_promoted: ceo_promoted_in(dir),
+            audit_keep: std::cell::OnceCell::new(),
+        }
+    }
+
+    pub fn sources(&self) -> &UpdateSources {
+        self.sources
+    }
+
+    /// 한 파일의 사실 — `decide_file_action_with` 의 입력.
+    pub fn facts(
+        &self,
+        rel: &str,
+        embed: &str,
+        exists: bool,
+        disk: Option<&str>,
+        manifest_hash: Option<&str>,
+        pending: &serde_json::Map<String, serde_json::Value>,
+    ) -> UpdateFacts {
+        let mut f = UpdateFacts { manifest_corrupt: self.manifest_corrupt, ..UpdateFacts::default() };
+        if !exists {
+            f.tombstoned = self.sources.tombstone_for(rel).map(str::to_string);
+            return f;
+        }
+        f.boot_critical = self.sources.is_boot_critical(rel);
+        let Some(d) = disk else { return f };
+        if d == embed {
+            return f;
+        }
+        let dh = content_hash(d);
+        f.prev_vendor_match = self.sources.prev_vendor_for(rel).iter().any(|h| *h == dh);
+        match ownership_scoped(rel, self.scope) {
+            Ownership::User => {
+                f.audit_keep = self
+                    .audit_keep
+                    .get_or_init(|| merge_audit_keep_rels(&self.dir))
+                    .contains(rel);
+                f.ceo_promoted = rel == MASTER_DIRECTIVE_REL && self.ceo_promoted;
+                let unedited = manifest_hash == Some(dh.as_str()) || f.prev_vendor_match;
+                if unedited && is_constitution_file(rel) {
+                    f.takeover_ok = crate::overrides::verify_constitution_takeover(d, embed).is_ok();
+                }
+            }
+            Ownership::System => {
+                // 재시도 금지는 '합쳐 봤는데 안 된' 보관에만 — 병합 전 사본조차 못 만들어 시도하지 못한 보관
+                // (capture-failed)은 회복 뒤 다음 스윕이 다시 시도해야 수렴한다(부록 A-2 #4 회복 수렴).
+                let e = pending.get(rel);
+                let parked = e.and_then(|e| e.get("kind")).and_then(|k| k.as_str()) == Some("user-kept")
+                    && e.and_then(|e| e.get("reason")).and_then(|r| r.as_str()) != Some("capture-failed");
+                if parked {
+                    f.parked_same_vendor = std::fs::read_to_string(self.dir.join(format!("{rel}.new")))
+                        .ok()
+                        .as_deref()
+                        == Some(embed);
+                }
+            }
+            Ownership::SeedOnce => {}
+        }
+        f
+    }
+}
+
+/// 바: 한 번도 고치지 않은 사용자 소유 파일의 자동 갱신에 대한 거부권 — 가드 3·4 와 부서 재작성 파일.
+/// (가드 1·2 는 `classify_update` 안에 있다.)
+fn user_owned_auto_update_vetoed(rel: &str, scope: PackScope, facts: &UpdateFacts) -> bool {
+    // 부서의 agents.json·acl.json·schedule.json 은 cys-dept 가 다시 쓴다 — 이 규칙에 걸리지 않는다.
+    if scope == PackScope::Dept && matches!(rel, "agents.json" | "acl.json" | "schedule.json") {
+        return true;
+    }
+    // 가드 3: 규칙 문서는 안전 조항 인수 검사를 통과해야 바꾼다(실패 시 `.new`).
+    if is_constitution_file(rel) && !facts.takeover_ok {
+        return true;
+    }
+    // 가드 4: 본부 지침이 CEO 승격 상태면 건너뛴다.
+    rel == MASTER_DIRECTIVE_REL && facts.ceo_promoted
+}
+
+/// 순수 판정 SOT(옛 시그니처) — 중립 사실(`UpdateFacts::default()`)로 [`decide_file_action_with`] 에
+/// 위임한다. 설치 실행부·plan·되살리기 모의는 `_with` 를 쓰고 사실은 `UpdateContext::facts` 하나로
+/// 모은다('계획 = 실제'). 중립 사실 = 묘비 없음·기동 필수 아님·과거 vendor 일치 없음·감사 유지 없음·
+/// 인수 검사 미통과(규칙 문서 자동 갱신 안 함)·승격 아님.
 /// ★T4 CLI 동사 소비(pack-adopt 스윕 생존 판정 시뮬) — 재구현 금지.
+#[allow(clippy::too_many_arguments)]
 pub fn decide_file_action(
     rel: &str,
     embed: &str,
@@ -2624,94 +3071,137 @@ pub fn decide_file_action(
     manifest_hash: Option<&str>,
     force: bool,
     scope: PackScope,
-    // 호출자가 content_hash(pristine)==manifest_hash 검증을 마친 base(v2 §2 원칙 3). 미검증·부재·
-    // manifest 부재면 None — IO·해시 검증은 호출자 몫(순수성 유지·scope 주입과 동형). T2 호출자
-    // 전원 None(L3 도달 불가·배선은 T3).
     verified_base: Option<&str>,
 ) -> FileAction {
-    // ★B2-2 seed-once 상태: 존재하면 불가침(force 여도·읽기 실패여도) — 부재 시에만 아래 시드 설치.
-    // (dept 스코프의 soul.md 도 이 조기 반환을 탄다 — 병치 판정보다 먼저라 결함4 가 구조 소멸.)
-    if exists && ownership_scoped(rel, scope) == Ownership::SeedOnce {
+    decide_file_action_with(
+        rel,
+        embed,
+        exists,
+        disk,
+        manifest_hash,
+        force,
+        scope,
+        verified_base,
+        &UpdateFacts::default(),
+    )
+}
+
+/// ★0.15.0 M11 판정 SOT — 설치(프로그램·팩만 받는 업데이트·모든 `init-pack`·데몬 기동 설치)가 같이
+/// 쓰는 판정(설계 §4-11 · CONTRACTS 8.1). 순서:
+/// ⓪ 부재: 묘비가 있으면 `KeepAbsent`(생명줄은 묘비가 걸러져 오지 않는다), 아니면 새로 만든다(기록
+///    없는 삭제는 지금처럼 돌아온다 — 문서화된 '지운 뒤 init-pack' 초기화).
+/// ① seed-once 불가침 · user-owned: 판독 불가 보존(A-2 #3) · 같으면 채택 · 바(한 번도 고치지 않은
+///    파일은 가드 넷과 함께 새 버전) · 그 밖은 지금처럼 보존 + `.new` 병치.
+/// ② system: 같으면 채택 · 설치 당시 해시면 갱신 · 잠금 자산 L0 / 판독 불가 L1 은 지금 동작(가-2) ·
+///    [`classify_update`] 로 다(과거 vendor 표)·kept-drift·가/나 를 가른다. 가/나 는 검증된 기준본이
+///    있으면 먼저 3-way(`Merge3` — 실패 폴백이 가/나), 이미 같은 vendor 본으로 보관 중이면 다시
+///    합치지 않는다(가 — 매번 합치기 전 사본이 쌓이는 것을 막는다).
+/// `force` 는 사용자 수정의 판정을 바꾸지 않는다 — `cys init-pack --force` 는 사용자 수정을 버리지 않는다(자).
+/// 강제의 효력은 디스크가 이미 vendor 본일 때 같은 내용을 다시 쓰는 것(종전 동일)과 호출자의 다운그레이드
+/// 차단 우회·C-07 제자리 보존 우회뿐이다.
+#[allow(clippy::too_many_arguments)]
+pub fn decide_file_action_with(
+    rel: &str,
+    embed: &str,
+    exists: bool,
+    disk: Option<&str>,
+    manifest_hash: Option<&str>,
+    force: bool,
+    scope: PackScope,
+    verified_base: Option<&str>,
+    facts: &UpdateFacts,
+) -> FileAction {
+    // ⓪ 부재 — 묘비만 부재를 유지한다.
+    if !exists {
+        if let Some(r) = &facts.tombstoned {
+            return FileAction::KeepAbsent { repair: r.clone() };
+        }
+        return FileAction::Write { heal_user_copy: false };
+    }
+    let own = ownership_scoped(rel, scope);
+    // ★B2-2 seed-once 상태: 존재하면 불가침(force 여도·읽기 실패여도).
+    if own == Ownership::SeedOnce {
         return FileAction::Keep { adopt_hash: false, new_pending: false };
     }
-    // ★B2 user-owned 영구 보존 (force 여도) — 읽기 성공 + 내용 상이일 때.
-    if exists && ownership_scoped(rel, scope) == Ownership::User {
-        if let Some(d) = disk {
-            if d != embed {
-                // 임베드가 마지막 적용본(매니페스트 해시)에서 전진했으면 신버전 병치(병합 대기).
-                // 매니페스트 부재(구설치본)도 안전측으로 병치해 가시화한다(base 없는 2-way 병합).
-                let new_pending = manifest_hash != Some(content_hash(embed).as_str());
-                return FileAction::Keep { adopt_hash: false, new_pending };
-            }
-        } else {
-            // ★W-1 수리(P0 · 2026-08-01): **판독 불가(disk=None)면 force 여도 무조건 보존.**
-            // read_to_string 실패(ko-KR Windows 의 CP949/ANSI 저장·권한·잠금)는 "사용자 수정이
-            // 없다"는 증거가 아니라 **비교 자체가 불가능하다**는 뜻이다. 종전엔 위 Some(d) 가드와
-            // 아래 `exists && !force` 가드를 둘 다 통과해 최종 폴백의 Write{heal_user_copy:false}로
-            // 떨어졌다 — 헌법 파일(*_DIRECTIVE.md·soul.md·CLAUDE.md·schedule.json·agents.json)이
-            // **무경고·무백업**으로 임베드에 덮여 비가역 소실된다(발화 경로: preflight C03 가 CP949
-            // 파일의 한국어 핀을 전부 '소실'로 오판 → 화면이 `cys init-pack --force` 를 권고).
-            // ★백업 후 교체가 아니라 Keep 이 기본인 이유: 백업 실행부(install_into 의 heal_user_copy)
-            // 자체가 `disk.as_deref()` 의 Some 에 갇혀 있어 disk=None 에선 어떤 백업도 뜨지 못한다
-            // — 플래그만 켜는 수리는 실효 0(측정 완료). 읽을 수 없는 사용자 파일은 더더욱 덮으면
-            // 안 된다. system 등급은 이 분기 밖 — L0/L1이 치유+백업 의무로 처리(v2 §3).
+    let base = match manifest_hash {
+        Some(h) => ManifestBase::Some(h),
+        None if facts.manifest_corrupt => ManifestBase::Corrupt,
+        None => ManifestBase::None,
+    };
+    let Some(d) = disk else {
+        // 판독 불가(비UTF-8·권한·잠금) — 가-2 는 지금 동작을 유지한다.
+        if own == Ownership::User {
+            // ★W-1(P0 · 2026-08-01): 판독 불가 user-owned 는 force 여도 무조건 보존(부록 A-2 #3).
             return FileAction::Keep { adopt_hash: false, new_pending: false };
         }
+        // ★L0/L1(v2 §3): system — 바이트 백업 뒤 vendor 본(백업 실행부·격리는 install_into).
+        return FileAction::Write { heal_user_copy: true };
+    };
+    if d == embed {
+        // 종전 동일: force 는 같은 내용을 다시 쓴다(매니페스트·pristine 전진 — `w1_*` 핀 ②가 고정한다).
+        if force {
+            return FileAction::Write { heal_user_copy: false };
+        }
+        return FileAction::Keep { adopt_hash: true, new_pending: false };
     }
-    if exists && !force {
-        match disk {
-            Some(d) if d == embed => {
-                return FileAction::Keep { adopt_hash: true, new_pending: false };
+    let dh = content_hash(d);
+    let vendor_hash = content_hash(embed);
+    let class = classify_update(
+        rel,
+        own,
+        facts.boot_critical,
+        base,
+        Some(dh.as_str()),
+        vendor_hash.as_str(),
+        facts.prev_vendor_match,
+        facts.audit_keep,
+        true,
+    );
+    if own == Ownership::User {
+        if class == UpdateClass::VendorUpdate && !user_owned_auto_update_vetoed(rel, scope, facts) {
+            return FileAction::Write { heal_user_copy: false };
+        }
+        // 사용자가 고친 파일(또는 가드가 막은 파일) — 영구 보존 + vendor 전진 시 `.new` 병치.
+        let new_pending = manifest_hash != Some(vendor_hash.as_str());
+        return FileAction::Keep { adopt_hash: false, new_pending };
+    }
+    // ── system ──
+    // 설치-당시 해시 그대로(사용자 비수정) + 임베드가 더 새 버전 → 갱신.
+    if manifest_hash == Some(dh.as_str()) {
+        return FileAction::Write { heal_user_copy: false };
+    }
+    // ★L0(v2 §3·§7): 잠금 보안 자산 — 전 클래스 즉시 치유(현행 유지 — 설계 §7 5행 주인님 승인 예외).
+    if system_locked(rel) {
+        return FileAction::Write { heal_user_copy: true };
+    }
+    let base_reason = if manifest_hash.is_none() {
+        if facts.manifest_corrupt {
+            "manifest-corrupt"
+        } else {
+            "no-base"
+        }
+    } else {
+        "base-unverified"
+    };
+    match class {
+        UpdateClass::VendorUpdate => FileAction::Write { heal_user_copy: false },
+        UpdateClass::KeepAsToday => FileAction::KeepDrift,
+        UpdateClass::UserWins { .. } => {
+            if facts.parked_same_vendor {
+                return FileAction::UserKept { reason: "parked" };
             }
-            Some(d) if manifest_hash == Some(content_hash(d).as_str()) => {
-                // 설치-당시 해시 그대로(사용자 비수정) + 임베드가 더 새 버전 → 갱신.
-                return FileAction::Write { heal_user_copy: false };
+            if manifest_hash.is_some() && verified_base.is_some() {
+                return FileAction::Merge3;
             }
-            _ => {
-                // 사용자 수정본·매니페스트 부재·읽기 실패.
-                if ownership_scoped(rel, scope) == Ownership::User {
-                    // ★W-1 이후 이 가지는 도달 불가다(읽기 실패는 위 else 가 force 무관하게 먼저
-                    // 잡고, 내용 상이는 첫 블록이 잡는다). 다중 방어로 남겨둔다 — 위 분기가 훗날
-                    // 리팩터링으로 흔들려도 force=false 경로의 보존은 여기서 한 번 더 성립한다.
-                    return FileAction::Keep { adopt_hash: false, new_pending: false };
-                }
-                // ★L0(v2 §3·§7): 잠금 보안 자산 — 전 클래스 즉시 치유(벤더 미전진·판독 불가 포함).
-                //   disk=Some(d)면 이 arm 도달 조건상 d != embed ∧ manifest != hash(d)라 현행 heal 식과 동치(항상 true).
-                //   disk=None은 L0 하위 케이스 명문(v2 §3) — 바이트 백업 의무 신호(실행부 T3 · T2 런타임 쓰기는 현행 동형).
-                if system_locked(rel) {
-                    return FileAction::Write { heal_user_copy: true };
-                }
-                // ★L1(v2 §3): 판독 불가(비UTF-8·권한·잠금) — 치유 유지 + 백업 의무 신호(현행 heal:false→true 전환).
-                if disk.is_none() {
-                    return FileAction::Write { heal_user_copy: true };
-                }
-                // ★L2(v2 §3 — v1 Patch 1 흡수): 벤더 미전진 + 드리프트 → 제자리 보존(kept-drift).
-                //   이 arm 도달 조건상 disk=Some(d) ∧ d != embed (arm1·fast-path 선점) — matches! 가드는 리팩터링 내성용.
-                let vendor_advanced = manifest_hash != Some(content_hash(embed).as_str());
-                if !vendor_advanced && matches!(disk, Some(d) if d != embed) {
-                    return FileAction::KeepDrift;
-                }
-                // ★L3(v2 §3): 벤더 전진 + 드리프트 + 검증된 base → 3-way(실행부 T3 — T2는 호출자 verified_base=None 고정이라 도달 불가).
-                //   manifest_hash.is_some() 방어 conjunct(master 결정): base 검증 계약이 manifest 부재에선 불성립 — 계약 위반 입력은 L4로.
-                if manifest_hash.is_some() && vendor_advanced && verified_base.is_some() {
-                    return FileAction::Merge3;
-                }
-                // L4: 레거시(manifest 부재)·base 미검증 — 종전 P0-4 거동(치유 + .user 보존).
-                let heal = matches!(disk, Some(d) if d != embed
-                    && manifest_hash != Some(content_hash(d).as_str()));
-                return FileAction::Write { heal_user_copy: heal };
+            FileAction::UserKept { reason: base_reason }
+        }
+        UpdateClass::VendorFirst { .. } => {
+            if manifest_hash.is_some() && verified_base.is_some() {
+                return FileAction::Merge3;
             }
+            FileAction::VendorFirst { reason: base_reason }
         }
     }
-    // 신규 생성 또는 force 갱신 — force 로 수정본을 덮을 때도 사용자본은 보존한다(파괴 0).
-    // ★v2 §3(이식 ⑤): 판독 불가(disk=None)도 백업 의무 신호(heal:true) — 이 지점 도달 ∧ disk=None ⇒ system 전용
-    //   (User disk=None은 W-1 조기 분기가, SeedOnce는 조기 반환이 force 무관 선행). !exists는 exists&& 가드로 heal=false 불변.
-    //   T2 런타임 FS 파급 0: 백업 실행부가 Some(d) 게이트(install_into)라 disk=None에선 플래그 무력 — w1 bytewise 핀 무수정 초록이 기계 증거.
-    let heal = exists
-        && (disk.is_none()
-            || matches!(disk, Some(d) if d != embed
-                && manifest_hash != Some(content_hash(d).as_str())));
-    FileAction::Write { heal_user_copy: heal }
 }
 
 /// 병합 대기 원장 로드(부재·손상 = 빈 원장, 기동 차단 0).
@@ -2768,8 +3258,25 @@ pub(crate) const LINEAGE_KINDS: [&str; 2] = ["merged", "conflicted"];
 /// javis_preflight MERGE_LEDGER_KINDS 등재 + C62/C68 분류 결정(2언어 census 핀 + 행동 census
 /// `test_kind_census_c62_c68_classification` 이 강제). 주의: 감사 원장(.merge-audit)의
 /// "pre-merge-capture" 는 다른 파일의 다른 계약이다 — 여기 등재 대상이 아니다.
-pub const LEDGER_KINDS: [&str; 7] =
-    ["healed", "new-pending", "kept-drift", "merged", "conflicted", "quarantined", "adopted"];
+///
+/// ★0.15.0 「스스로 해결」 M11 가·나 (CONTRACTS O-C8-1 · RULINGS A): 신 kind 2종을 위 절차로 등재한다.
+/// `user-kept` = 기동 필수가 아닌 시스템 파일의 충돌·기준본 없음·손상 의심 — **사용자 파일이 살아 있고**
+/// vendor 신버전은 `<rel>.new` 보관(합치기 과제 = 워커). `vendor-first` = 기동 필수 파일의 충돌 — vendor 본을
+/// 먼저 살리고 사용자 수정본은 `<rel>.user`(이전 세대는 `.user.prev-<ts>`)로 보관(다시 입히기 = 워커 +
+/// 주인 승인 · `cys repair reapply`). `conflicted` 는 재사용하지 않는다 — 그 kind 를 읽는 모든 곳이 뜻을
+/// 거꾸로 읽는다(설계 §4-11 가). C68 기한: `user-kept` 는 **제외**(사용자가 이겼다 — 날마다 master 를 깨우지 않는다 ·
+/// RULINGS AC7), `vendor-first` 는 기한을 **유지**한다(기동 필수 파일의 다시 입히기 = 승인 절차가 남았다).
+pub const LEDGER_KINDS: [&str; 9] = [
+    "healed",
+    "new-pending",
+    "kept-drift",
+    "merged",
+    "conflicted",
+    "quarantined",
+    "adopted",
+    "user-kept",
+    "vendor-first",
+];
 
 /// ★T3(D7): 계보 인지 원장 upsert — 기존 upsert_pending 클로저는 자구 불변(new-pending 현행
 /// 경로 회귀 0)이며, 신 kind(kept-drift·merged·conflicted·quarantined)와 healed 의 계보 승계는
@@ -2853,6 +3360,10 @@ pub struct PendingKindCounts {
     pub conflicted: usize,
     pub quarantined: usize,
     pub adopted: usize,
+    /// ★M11 가: 사용자 파일 유지 + vendor `.new` 보관(합치기 대기).
+    pub user_kept: usize,
+    /// ★M11 나: vendor 본 우선 + 사용자 수정본 보관(다시 입히기 대기).
+    pub vendor_first: usize,
     pub unknown: usize,
 }
 
@@ -2862,7 +3373,13 @@ impl PendingKindCounts {
     /// pack-plan 자구('kept-drift·merged 외 전부 검토 대상')를 보존해 포함한다 — pack-merge
     /// 목록이 '조치 불요(복권됨)' 안내로 해소하는 일시 상태라 과보고가 안전측이다.
     pub fn actionable(&self) -> usize {
-        self.healed + self.new_pending + self.conflicted + self.quarantined + self.adopted
+        self.healed
+            + self.new_pending
+            + self.conflicted
+            + self.quarantined
+            + self.adopted
+            + self.user_kept
+            + self.vendor_first
             + self.unknown
     }
 }
@@ -2880,6 +3397,8 @@ pub fn pending_kind_counts(
             Some("conflicted") => c.conflicted += 1,
             Some("quarantined") => c.quarantined += 1,
             Some("adopted") => c.adopted += 1,
+            Some("user-kept") => c.user_kept += 1,
+            Some("vendor-first") => c.vendor_first += 1,
             _ => c.unknown += 1, // 미지 kind — 기존 버킷 오계상 금지(명시 unknown 계상)
         }
     }
@@ -2898,6 +3417,10 @@ pub struct InstallPlan {
     // 재사용은 컴파일은 통과하나 pack-plan 이 병합을 치유로 오보하는 의미 드리프트).
     pub kept_drift: Vec<String>,          // ★L2: system 수정본 + vendor 미전진 — 제자리 보존(kept-drift)
     pub merge3: Vec<String>,              // ★L3: 수정본 + vendor 전진 + 검증 base — 자동 3-way 병합
+    // ★0.15.0 M11('계획 = 실제' — 설계 §6-11 가 "결과 모델 5곳"): 신설 3버킷.
+    pub user_kept: Vec<String>,           // ★가: 사용자 파일 유지 + vendor 신버전 <파일>.new 보관(합치기 = 워커)
+    pub vendor_first: Vec<String>,        // ★나: 기동 필수 충돌 — vendor 본 우선 + 사용자본 시각별 보관(다시 입히기 = 워커+승인)
+    pub keep_absent: Vec<String>,         // ★마: 수리 장부의 묘비 — 부재 유지(만들지 않음)
     pub unchanged: usize,                 // 최신(변화 없음)
     pub prune_delete: Vec<String>,        // 폐기 파일 제거(비수정)
     pub prune_keep_modified: Vec<String>, // 폐기됐지만 수정본이라 보존
@@ -2905,15 +3428,42 @@ pub struct InstallPlan {
 }
 
 /// install_into 와 **같은 판정 함수**로 드라이런 리포트를 만든다(쓰기 0·드리프트 0).
+/// ★0.15.0 M11: 입력원은 라이브 팩용(`UpdateSources::for_live_pack` — 그 레인의 묘비·기동 필수 질의)
+/// 이다 — `cys pack-plan` 이 이 래퍼를 부르므로 설치 실행부와 같은 사실을 본다.
 pub fn plan_install(
     dir: &Path,
     items: &[(&str, &str)],
     force: bool,
     target_version: &str,
 ) -> InstallPlan {
-    let mut plan = InstallPlan::default();
+    let sources = UpdateSources::for_live_pack(dir);
+    plan_install_with(dir, items, force, target_version, &sources)
+}
+
+/// [`plan_install`] 의 입력원 주입판 — 설치 실행부(`install_into_with`)와 같은 수집기·같은 판정.
+pub fn plan_install_with(
+    dir: &Path,
+    items: &[(&str, &str)],
+    force: bool,
+    target_version: &str,
+    sources: &UpdateSources,
+) -> InstallPlan {
     // ★G3 축2: 스코프 1회 산출(plan 의 dir 는 실 팩 경로 — staging 우회 없음) → 전 판정에 데이터로 주입.
-    let scope = pack_scope_of(dir);
+    plan_install_core(dir, items, force, target_version, pack_scope_of(dir), sources)
+}
+
+/// [`plan_install_with`] 의 스코프 주입판(같은 수집기 · 같은 판정) — 설치 실행부가 이번 설치가 덮거나 지울
+/// 파일을 미리 고를 때(업데이트 전 스냅샷 · RULINGS AC4) 쓴다. 그 자리의 `dir` 는 staging 일 수 있어(팩 루트가
+/// 아니다) 스코프를 호출자가 준다.
+fn plan_install_core(
+    dir: &Path,
+    items: &[(&str, &str)],
+    force: bool,
+    target_version: &str,
+    scope: PackScope,
+    sources: &UpdateSources,
+) -> InstallPlan {
+    let mut plan = InstallPlan::default();
     // 다운그레이드 차단 미러(install_into 와 동일 판정).
     if !force {
         if let Some(dv) = std::fs::read_to_string(dir.join(PACK_VERSION_FILE))
@@ -2928,13 +3478,10 @@ pub fn plan_install(
             }
         }
     }
-    let manifest: std::collections::BTreeMap<String, String> =
-        std::fs::read_to_string(dir.join(INSTALL_MANIFEST))
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
+    let (manifest, manifest_corrupt) = load_manifest_state(dir);
     // ★판정 좁힘의 입력 — 루프 밖에서 한 번만 읽는다(파일마다 읽으면 474회 IO 가 된다).
     let pending_now = load_merge_pending(dir);
+    let ctx = UpdateContext::new(dir, scope, sources, manifest_corrupt);
     for (rel, content) in items.iter().copied() {
         let path = dir.join(rel);
         let exists = path.exists();
@@ -2964,7 +3511,8 @@ pub fn plan_install(
             (true, Some(d), Some(m)) if d != content => load_verified_base(dir, rel, m),
             _ => None,
         };
-        match decide_file_action(
+        let facts = ctx.facts(rel, content, exists, disk.as_deref(), mh, &pending_now);
+        match decide_file_action_with(
             rel,
             content,
             exists,
@@ -2973,6 +3521,7 @@ pub fn plan_install(
             force,
             scope,
             verified_base.as_deref(),
+            &facts,
         ) {
             FileAction::Write { heal_user_copy: true } => plan.heal.push(rel.to_string()),
             FileAction::Write { heal_user_copy: false } => {
@@ -2995,6 +3544,9 @@ pub fn plan_install(
             }
             FileAction::KeepDrift => plan.kept_drift.push(rel.to_string()), // ★T3(D14): 전용 버킷 계상
             FileAction::Merge3 => plan.merge3.push(rel.to_string()),        // ★T3(D14): 전용 버킷 계상
+            FileAction::UserKept { .. } => plan.user_kept.push(rel.to_string()),
+            FileAction::VendorFirst { .. } => plan.vendor_first.push(rel.to_string()),
+            FileAction::KeepAbsent { .. } => plan.keep_absent.push(rel.to_string()),
         }
     }
     // prune 프리뷰(install_into prune 블록과 동일 판정).
@@ -3576,6 +4128,551 @@ fn load_verified_base(dir: &Path, rel: &str, manifest_hash: &str) -> Option<Stri
     }
 }
 
+/// ★0.15.0 M11 사(`.user` 한 칸 → 시각별 보관 · 설계 §4-11 사): `{rel}.user` 세대 보존 — 명령줄 도구에 이미
+/// 있던 함수(`cys.rs` T4-fix R1-적대 #2)를 **그대로** 라이브러리로 옮겼다(세 번째 방식을 만들지 않는다).
+/// 백업 덮어쓰기 직전, 기존 보존본이 있고 내용이 이번에 쓸 내용과 다르면 `{rel}.user.prev-<ts>[-n]` 으로
+/// 원자 개명해 이전 세대를 지킨다. 동일 내용이면 무조치(멱등 재실행의 세대 증식 방지) · 개명 실패 = Err
+/// (호출측 fail-closed 거부 의무). 설치 실행부(병합 폴백·판독 불가 바이트 백업·vendor 우선 보관)와
+/// `cys pack-heal`·`revert-merge` 가 같이 쓴다.
+pub fn preserve_prior_user_generation(
+    dir: &Path,
+    rel: &str,
+    incoming: Option<&[u8]>,
+) -> Result<Option<PathBuf>, String> {
+    let prior = dir.join(format!("{rel}.user"));
+    if !prior.exists() {
+        return Ok(None);
+    }
+    if let Some(inc) = incoming {
+        if std::fs::read(&prior).ok().as_deref() == Some(inc) {
+            return Ok(None);
+        }
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut dest = dir.join(format!("{rel}.user.prev-{ts}"));
+    let mut n = 1u32;
+    while dest.exists() {
+        n += 1;
+        dest = dir.join(format!("{rel}.user.prev-{ts}-{n}"));
+    }
+    std::fs::rename(&prior, &dest).map_err(|e| format!("기존 {rel}.user 세대 보존 실패({e})"))?;
+    Ok(Some(dest))
+}
+
+/// 설치 실행부 전용 세대 보존: `{rel}.user` 가 **일반 파일**일 때만 이전 세대로 비켜 세운다. 그 자리에 파일이
+/// 아닌 것(디렉터리 등)이 있으면 세대가 아니라 장애물이다 — 옮기지 않고 Err(백업 불가 → 호출자는 덮지 않는다,
+/// 부록 A-2 #4). 부재 = Ok(할 일 없음).
+fn preserve_prior_user_file(dir: &Path, rel: &str, incoming: Option<&[u8]>) -> Result<(), String> {
+    match std::fs::symlink_metadata(dir.join(format!("{rel}.user"))) {
+        Err(_) => Ok(()),
+        Ok(m) if m.file_type().is_file() => {
+            preserve_prior_user_generation(dir, rel, incoming).map(|_| ())
+        }
+        Ok(_) => Err(format!("{rel}.user 자리에 파일이 아닌 항목이 있어 세대 보존·백업을 할 수 없습니다")),
+    }
+}
+
+/// ★M11 나: 사용자 수정본을 `{rel}.user` 로 보관(이전 세대 보존 선행). 이미 같은 내용이면 무조치.
+/// Err = 보관 불가(호출자는 덮지 않고 격리한다 — 부록 A-2 #4).
+fn park_user_copy(dir: &Path, rel: &str, bytes: &[u8]) -> Result<(), String> {
+    let user_path = dir.join(format!("{rel}.user"));
+    if std::fs::read(&user_path).ok().as_deref() == Some(bytes) {
+        return Ok(());
+    }
+    preserve_prior_user_file(dir, rel, Some(bytes))?;
+    write_atomic(&user_path, bytes).map_err(|e| format!("{rel}.user 기록 실패: {e}"))
+}
+
+/// ★M11 가: 사용자 파일 유지 + vendor 신버전 `<rel>.new` 보관 + 원장 `user-kept`. 셸 스크립트는 살아 있는
+/// 사용자본에서 CR 을 뺀다(라 — 보존 결과든 셸 스크립트는 LF). 같은 vendor 본으로 이미 보관 중(`parked`)
+/// 이면 원장 항목을 다시 쓰지 않는다(첫 판정 사유 보존 · 매 스윕 rewrite 0).
+#[allow(clippy::too_many_arguments)]
+fn park_user_kept(
+    dir: &Path,
+    rel: &str,
+    vendor: &str,
+    live: Option<&str>,
+    reason: &str,
+    caution: Option<String>,
+    capture: Option<String>,
+    pending: &mut serde_json::Map<String, serde_json::Value>,
+    dirty: &mut bool,
+    version: &str,
+    ts: u64,
+) {
+    let new_path = dir.join(format!("{rel}.new"));
+    if std::fs::read_to_string(&new_path).ok().as_deref() != Some(vendor) {
+        if let Err(e) = write_atomic(&new_path, vendor.as_bytes()) {
+            eprintln!("[init-pack] ⚠ {rel}: vendor 신버전 보관({rel}.new) 기록 실패({e}) — 사용자 파일은 그대로");
+        }
+    }
+    let mut eol_fixed = false;
+    if is_shell_script(rel, vendor) {
+        if let Some(l) = live.filter(|l| l.contains('\r')) {
+            let p = dir.join(rel);
+            let fixed = l.replace('\r', "");
+            match write_pack_file(&p, fixed.as_bytes(), current_mode(&p), true) {
+                Ok(()) => eol_fixed = true,
+                Err(e) => eprintln!("[init-pack] ⚠ {rel}: 셸 스크립트 CR 제거 실패({e})"),
+            }
+        }
+    }
+    let already = pending.get(rel).and_then(|e| e.get("kind")).and_then(|k| k.as_str())
+        == Some("user-kept");
+    if reason == "parked" && already && !eol_fixed {
+        return;
+    }
+    let mut entry = serde_json::Map::new();
+    entry.insert("kind".into(), serde_json::json!("user-kept"));
+    entry.insert("side".into(), serde_json::json!(format!("{rel}.new")));
+    entry.insert("reason".into(), serde_json::json!(reason));
+    if let Some(c) = caution {
+        entry.insert("caution".into(), serde_json::json!(c));
+    }
+    if let Some(c) = capture {
+        entry.insert("capture".into(), serde_json::json!(c));
+    }
+    if eol_fixed {
+        entry.insert("eol".into(), serde_json::json!("lf"));
+    }
+    entry.insert("version".into(), serde_json::json!(version));
+    entry.insert("ts".into(), serde_json::json!(ts));
+    if reason == "parked" && already {
+        // CR 만 고친 재방문 — 첫 사유를 지키고 eol 표시만 더한다.
+        if let Some(serde_json::Value::Object(old)) = pending.get(rel).cloned() {
+            let mut e2 = old;
+            e2.insert("eol".into(), serde_json::json!("lf"));
+            upsert_pending_v2(pending, dirty, rel, e2);
+            return;
+        }
+    }
+    upsert_pending_v2(pending, dirty, rel, entry);
+}
+
+/// `root` 아래의 빈 디렉터리를 깊이 우선으로 지운다(파일이 있으면 그대로 — `remove_dir` 는 빈 것만 지운다).
+fn remove_empty_dirs_under(root: &Path) {
+    let Ok(entries) = std::fs::read_dir(root) else { return };
+    for e in entries.flatten() {
+        let p = e.path();
+        if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            remove_empty_dirs_under(&p);
+            let _ = std::fs::remove_dir(&p);
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ★0.15.0 M11 아 — 업데이트 전 스냅샷(설치기가 관리하는 파일만) + 복원 계약(CONTRACTS 8.10 · O-C8-4 (a))
+// 위치 `~/.cys/local/update-snapshots/<lane_key>/<from-version>-<UTC 시각>/` (로컬 오버레이 — 공장 초기화
+// 최상위 목록 무변경, `--purge-local` 이 함께 옮긴다). 팩 폴더 전체가 아니라 매니페스트 항목만 담는다
+// (사용자 작업 자료·기억·세션 상태는 담지 않는다 — seed-once 제외). 복사로만 만든다(살아 있는 팩 폴더의
+// 이름을 바꾸지 않는다 — 윈도우 파괴적 대체 동작 4753–4760 때문). 레인마다 최신 3세대만 둔다.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 스냅샷 메타 스키마(정수 · 읽는 쪽은 더 높은 값을 읽을 수 없음으로 다룬다 — O-C1-7 과 같은 규칙).
+pub const UPDATE_SNAPSHOT_SCHEMA: u32 = 1;
+/// 레인당 보존 세대 수.
+pub const UPDATE_SNAPSHOT_KEEP: usize = 3;
+/// ★RULINGS AC4(부록 A-2 #17 — 데몬이 통신을 열기 전에는 느린 일을 하지 않는다): 파일 하나 / 스냅샷 하나의
+/// 바이트 상한. 넘는 파일은 담지 않고 색인(`skipped`)에 이름을 남긴다 — 경고 1줄, 설치는 계속(실패로 만들지
+/// 않는다). 설계 §4-11 아의 추정(설치기 관리 파일 12~25MB)과 이 팩의 실측(내장 약 479개 · 약 11.5MB · 가장 큰
+/// 파일 약 1.3MB) 위에 둔다.
+pub const UPDATE_SNAPSHOT_FILE_CAP: u64 = 4 * 1024 * 1024;
+pub const UPDATE_SNAPSHOT_TOTAL_CAP: u64 = 32 * 1024 * 1024;
+/// 스냅샷 메타 파일명 / 파일 사본 루트.
+pub const UPDATE_SNAPSHOT_META: &str = "meta.json";
+pub const UPDATE_SNAPSHOT_FILES: &str = "files";
+
+/// 복원 계약의 파일 한 줄 — `{rel, sha256, mode, released, link_target?}`(필드 순서 = 계약 순서).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SnapshotFile {
+    pub rel: String,
+    /// 원본 바이트의 sha256(링크면 빈 문자열 — 링크는 `link_target` 이 정체다).
+    pub sha256: String,
+    /// 권한 비트(`st_mode & 0o7777` · 윈도우 0).
+    pub mode: u32,
+    /// ★RULINGS AC1(부록 A-2 #12 검증된 되돌리기): 이 바이트가 **출시본**인가 — 바꾸기 전 설치 기록(매니페스트
+    /// 해시)과 같거나 과거 출시 해시 표에 있다. system 파일은 이것이 참일 때만 되돌린다. 링크·판독 불가·사용자
+    /// 수정 = 거짓. 이 필드가 없는 메타는 거짓으로 읽는다(안전 방향).
+    #[serde(default)]
+    pub released: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_target: Option<String>,
+}
+
+/// 상한 때문에 담지 않은 파일 — 색인에 이름·크기·사유를 남긴다(RULINGS AC4).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SnapshotSkip {
+    pub rel: String,
+    pub bytes: u64,
+    /// `file-cap` | `total-cap`
+    pub reason: String,
+}
+
+/// 복원 계약 — `{schema, lane_key, pack_version, pro_revision, created_at, files, skipped?}`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SnapshotMeta {
+    pub schema: u32,
+    pub lane_key: String,
+    pub pack_version: String,
+    pub pro_revision: u32,
+    pub created_at: String,
+    pub files: Vec<SnapshotFile>,
+    /// 상한 때문에 담지 않은 파일(없으면 생략).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<SnapshotSkip>,
+}
+
+/// 스냅샷 하나를 만든 결과.
+#[derive(Debug, Clone)]
+pub struct SnapshotOutcome {
+    pub path: PathBuf,
+    pub files: usize,
+    pub bytes: u64,
+    pub skipped: Vec<SnapshotSkip>,
+}
+
+/// 원본 바이트의 sha256(소문자 16진) — 스냅샷 계약의 `sha256`.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn path_safe(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' })
+        .collect()
+}
+
+/// 업데이트 전 스냅샷을 만든다 — `src_dir`(설치 대상 · staging 이면 라이브 팩의 전량 사본)에서 `rels`(이번
+/// 설치가 덮거나 지울 파일 — 호출자가 같은 판정 함수로 고른다, RULINGS AC4)만, 권한·링크 대상·출시본 여부(AC1)와
+/// 함께 복사한다. seed-once 는 담지 않는다. `caps` = (파일 하나, 전체) 바이트 상한 — 넘는 파일은 담지 않고
+/// `skipped` 에 남긴다. 임시 디렉터리에 채운 뒤 한 번에 개명하고(반쪽 스냅샷이 최신으로 보이지 않게), 레인당 최신
+/// [`UPDATE_SNAPSHOT_KEEP`] 세대만 남기되 이 전환(`from_version`)의 가장 오래된 스냅샷은 지우지 않는다(AC3).
+#[allow(clippy::too_many_arguments)]
+pub fn create_update_snapshot(
+    src_dir: &Path,
+    root: &Path,
+    lane_key: &str,
+    from_version: &str,
+    manifest: &std::collections::BTreeMap<String, String>,
+    rels: &[String],
+    scope: PackScope,
+    prev_vendor: &dyn Fn(&str) -> Vec<String>,
+    caps: (u64, u64),
+) -> Result<SnapshotOutcome, String> {
+    let lane_dir = root.join(path_safe(lane_key));
+    std::fs::create_dir_all(&lane_dir)
+        .map_err(|e| format!("스냅샷 레인 생성 실패 {}: {e}", lane_dir.display()))?;
+    let now = chrono::Utc::now();
+    let ts = now.format("%Y%m%dT%H%M%SZ").to_string();
+    let tmp = lane_dir.join(format!(".tmp-{ts}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(tmp.join(UPDATE_SNAPSHOT_FILES))
+        .map_err(|e| format!("스냅샷 임시 디렉터리 생성 실패 {}: {e}", tmp.display()))?;
+    let fill = || -> Result<(Vec<SnapshotFile>, u64, Vec<SnapshotSkip>), String> {
+        let mut files = Vec::new();
+        let mut skipped: Vec<SnapshotSkip> = Vec::new();
+        let mut bytes_total = 0u64;
+        for rel in rels {
+            if ownership_scoped(rel, scope) == Ownership::SeedOnce
+                || rel.contains("..")
+                || rel.starts_with('/')
+            {
+                continue;
+            }
+            let src = src_dir.join(rel);
+            let Ok(meta) = std::fs::symlink_metadata(&src) else { continue };
+            if meta.is_file() {
+                let len = meta.len();
+                let reason = if len > caps.0 {
+                    Some("file-cap")
+                } else if bytes_total + len > caps.1 {
+                    Some("total-cap")
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
+                    skipped.push(SnapshotSkip { rel: rel.clone(), bytes: len, reason: reason.into() });
+                    continue;
+                }
+            }
+            let dst = tmp.join(UPDATE_SNAPSHOT_FILES).join(rel);
+            if let Some(parent) = dst.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("스냅샷 디렉터리 생성 실패 {}: {e}", parent.display()))?;
+            }
+            if meta.file_type().is_symlink() {
+                let target = std::fs::read_link(&src)
+                    .map_err(|e| format!("링크 대상 판독 실패 {}: {e}", src.display()))?;
+                let target_s = target.to_string_lossy().to_string();
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(&target, &dst)
+                    .map_err(|e| format!("스냅샷 링크 생성 실패 {}: {e}", dst.display()))?;
+                files.push(SnapshotFile {
+                    rel: rel.clone(),
+                    sha256: String::new(),
+                    mode: 0,
+                    released: false,
+                    link_target: Some(target_s),
+                });
+                continue;
+            }
+            if !meta.is_file() {
+                continue;
+            }
+            let data = std::fs::read(&src)
+                .map_err(|e| format!("스냅샷 원본 판독 실패 {}: {e}", src.display()))?;
+            std::fs::write(&dst, &data)
+                .map_err(|e| format!("스냅샷 사본 기록 실패 {}: {e}", dst.display()))?;
+            bytes_total += data.len() as u64;
+            // 출시본 = 바꾸기 전 설치 기록과 같은 바이트 ∨ 과거 출시 해시 표의 바이트(설치 판정 다와 같은 표).
+            // 설치 기록의 해시(`content_hash`)는 같은 바이트의 sha256 이다 — 한 번만 계산한다.
+            let sha = sha256_hex(&data);
+            let released = std::str::from_utf8(&data).is_ok()
+                && (manifest.get(rel.as_str()) == Some(&sha) || prev_vendor(rel).iter().any(|p| *p == sha));
+            files.push(SnapshotFile {
+                rel: rel.clone(),
+                sha256: sha,
+                mode: current_mode(&src).unwrap_or(0),
+                released,
+                link_target: None,
+            });
+        }
+        Ok((files, bytes_total, skipped))
+    };
+    let (files, bytes_total, skipped) = match fill() {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err(e);
+        }
+    };
+    let pro_revision = match read_pack_state(src_dir) {
+        PackStateRead::Valid(st) => st.pro_revision,
+        _ => 0,
+    };
+    let meta = SnapshotMeta {
+        schema: UPDATE_SNAPSHOT_SCHEMA,
+        lane_key: lane_key.to_string(),
+        pack_version: from_version.to_string(),
+        pro_revision,
+        // 나노초 고정 폭(9자리 · `Z`) — 같은 초 안의 두 스냅샷도 문자열 순서 = 생성 순서(목록·정리·"최신"이 이 순서를 쓴다).
+        created_at: now.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+        files,
+        skipped: skipped.clone(),
+    };
+    let n = meta.files.len();
+    let json = serde_json::to_string_pretty(&meta).map_err(|e| format!("스냅샷 메타 직렬화 실패: {e}"))?;
+    if let Err(e) = write_atomic(&tmp.join(UPDATE_SNAPSHOT_META), json.as_bytes()) {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(format!("스냅샷 메타 기록 실패: {e}"));
+    }
+    let base_name = format!("{}-{ts}", path_safe(from_version));
+    let mut dest = lane_dir.join(&base_name);
+    let mut k = 1u32;
+    while dest.exists() {
+        k += 1;
+        dest = lane_dir.join(format!("{base_name}-{k}"));
+    }
+    if let Err(e) = std::fs::rename(&tmp, &dest) {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(format!("스냅샷 확정(개명) 실패 {}: {e}", dest.display()));
+    }
+    prune_update_snapshots(&lane_dir, UPDATE_SNAPSHOT_KEEP, Some(from_version));
+    Ok(SnapshotOutcome { path: dest, files: n, bytes: bytes_total, skipped })
+}
+
+/// 레인 디렉터리의 스냅샷 목록(오래된 것 → 최신, `created_at`(나노초 고정 폭) 기준 · 메타 판독 불가는 빈 시각 = 맨 앞, 그 안에서 이름순).
+pub fn list_update_snapshots(lane_dir: &Path) -> Vec<(String, PathBuf)> {
+    let mut out: Vec<(String, PathBuf)> = Vec::new();
+    let Ok(entries) = std::fs::read_dir(lane_dir) else { return out };
+    for e in entries.flatten() {
+        let p = e.path();
+        let name = e.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') || !p.is_dir() {
+            continue;
+        }
+        let created = read_update_snapshot_meta(&p)
+            .map(|m| m.created_at)
+            .unwrap_or_default();
+        out.push((format!("{created}\u{0}{name}"), p));
+    }
+    out.sort();
+    out
+}
+
+/// 오래된 것부터 지워 `keep` 세대만 남긴다 — 단 `protect_version`(지금 진행 중인 전환의 출발 버전)을 담은 가장
+/// 오래된 스냅샷은 지우지 않는다(RULINGS AC3: 실패를 거듭하는 업데이트가 진짜 업데이트 전 스냅샷을 밀어내지 않게).
+fn prune_update_snapshots(lane_dir: &Path, keep: usize, protect_version: Option<&str>) {
+    let list = list_update_snapshots(lane_dir);
+    if list.len() <= keep {
+        return;
+    }
+    let protected: Option<PathBuf> = protect_version.and_then(|v| {
+        list.iter()
+            .find(|(_, p)| read_update_snapshot_meta(p).is_ok_and(|m| m.pack_version == v))
+            .map(|(_, p)| p.clone())
+    });
+    let mut excess = list.len() - keep;
+    for (_, p) in &list {
+        if excess == 0 {
+            break;
+        }
+        if protected.as_ref() == Some(p) {
+            continue;
+        }
+        let _ = std::fs::remove_dir_all(p);
+        excess -= 1;
+    }
+}
+
+/// 이 레인의 가장 최근 스냅샷(`root` = `update-snapshots` 루트).
+pub fn newest_update_snapshot(root: &Path, lane_key: &str) -> Option<PathBuf> {
+    list_update_snapshots(&root.join(path_safe(lane_key)))
+        .pop()
+        .map(|(_, p)| p)
+}
+
+/// 스냅샷 메타 판독(스키마가 더 높으면 Err — 읽을 수 없음).
+pub fn read_update_snapshot_meta(snap: &Path) -> Result<SnapshotMeta, String> {
+    let s = std::fs::read_to_string(snap.join(UPDATE_SNAPSHOT_META))
+        .map_err(|e| format!("스냅샷 메타 판독 실패 {}: {e}", snap.display()))?;
+    let m: SnapshotMeta =
+        serde_json::from_str(&s).map_err(|e| format!("스냅샷 메타 파싱 실패: {e}"))?;
+    if m.schema > UPDATE_SNAPSHOT_SCHEMA {
+        return Err(format!(
+            "스냅샷 메타 스키마 {} 는 이 프로그램({UPDATE_SNAPSHOT_SCHEMA})보다 새롭습니다 — 읽지 않습니다",
+            m.schema
+        ));
+    }
+    Ok(m)
+}
+
+/// 스냅샷 한 항목의 보관본 검증 — 파일은 sha256, 링크는 링크 대상. Ok = 복원해도 되는 바이트(링크면 빈 벡터).
+pub fn verify_snapshot_entry(snap: &Path, f: &SnapshotFile) -> Result<Vec<u8>, String> {
+    let stored = snap.join(UPDATE_SNAPSHOT_FILES).join(&f.rel);
+    if let Some(target) = &f.link_target {
+        let got = std::fs::read_link(&stored)
+            .map_err(|e| format!("'{}' 링크 보관본 판독 실패: {e}", f.rel))?;
+        if got.to_string_lossy() != target.as_str() {
+            return Err(format!(
+                "'{}' 링크 보관본의 대상이 기록과 다릅니다(기록 {target} · 실제 {})",
+                f.rel,
+                got.display()
+            ));
+        }
+        return Ok(Vec::new());
+    }
+    let data = std::fs::read(&stored).map_err(|e| format!("'{}' 보관본 판독 실패: {e}", f.rel))?;
+    let got = sha256_hex(&data);
+    if got != f.sha256 {
+        return Err(format!(
+            "'{}' 보관본이 기록과 다릅니다(기록 {} · 실제 {got})",
+            f.rel, f.sha256
+        ));
+    }
+    Ok(data)
+}
+
+/// 복원 계약(CONTRACTS O-C8-4): 선택한 항목을 **전부 검증한 뒤에만** 쓴다(하나라도 어긋나면 아무것도
+/// 쓰지 않는다). `only=None` = 전체 복원 = system 파일 전부 + `.pack-version` + 팩 상태 revision(버전
+/// 표시와 상태의 일관성) — user 소유 파일은 전체 복원에서 제외(업데이트 뒤 사용자 편집 보호 · 파일 단위
+/// `only` 로만). seed-once 는 스냅샷에 없다. 권한은 기록값 그대로, 링크는 링크로. 반환 = 복원한 rel.
+pub fn restore_update_snapshot(
+    snap: &Path,
+    pack_dir: &Path,
+    only: Option<&[String]>,
+) -> Result<Vec<String>, String> {
+    let meta = read_update_snapshot_meta(snap)?;
+    let scope = pack_scope_of(pack_dir);
+    let selected: Vec<&SnapshotFile> = match only {
+        Some(list) => {
+            let mut v = Vec::new();
+            for rel in list {
+                let f = meta
+                    .files
+                    .iter()
+                    .find(|f| &f.rel == rel)
+                    .ok_or_else(|| format!("'{rel}' 은 이 스냅샷에 없습니다"))?;
+                v.push(f);
+            }
+            v
+        }
+        None => meta
+            .files
+            .iter()
+            .filter(|f| ownership_scoped(&f.rel, scope) == Ownership::System)
+            .collect(),
+    };
+    // ① 전부 검증(쓰기 0).
+    let mut verified: Vec<(&SnapshotFile, Vec<u8>)> = Vec::with_capacity(selected.len());
+    for f in selected {
+        if f.rel.contains("..") || f.rel.starts_with('/') {
+            return Err(format!("잘못된 경로가 스냅샷에 있습니다: {}", f.rel));
+        }
+        // ★RULINGS AC1(부록 A-2 #12): system 파일은 출시본 바이트일 때만 되돌린다. 파일 단위 요청이면 거부(아무것도
+        // 쓰지 않는다), 전체 복원이면 그 항목만 건너뛴다(사용자 수정본은 그 파일의 병합 장부가 지킨다).
+        if ownership_scoped(&f.rel, scope) == Ownership::System && !f.released {
+            if only.is_some() {
+                return Err(format!(
+                    "'{}' 의 보관본은 출시본 바이트가 아닙니다(바꾸기 전 설치 기록·과거 출시 해시 표와 다름) — \
+                     system 파일은 검증된 출시본으로만 되돌립니다",
+                    f.rel
+                ));
+            }
+            continue;
+        }
+        verified.push((f, verify_snapshot_entry(snap, f)?));
+    }
+    // ② 쓰기.
+    let mut restored = Vec::new();
+    for (f, data) in verified {
+        let dest = pack_dir.join(&f.rel);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("디렉터리 생성 실패 {}: {e}", parent.display()))?;
+        }
+        if let Some(target) = &f.link_target {
+            #[cfg(unix)]
+            {
+                if std::fs::symlink_metadata(&dest).is_ok() {
+                    std::fs::remove_file(&dest)
+                        .map_err(|e| format!("'{}' 기존 항목 제거 실패: {e}", f.rel))?;
+                }
+                std::os::unix::fs::symlink(target, &dest)
+                    .map_err(|e| format!("'{}' 링크 복원 실패: {e}", f.rel))?;
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = target;
+                return Err(format!(
+                    "'{}' 는 링크입니다 — 이 운영체제에서는 링크를 만들 수 없어 복원하지 않았습니다",
+                    f.rel
+                ));
+            }
+        } else {
+            let mode = if cfg!(unix) { Some(f.mode) } else { None };
+            write_atomic_mode_exact(&dest, &data, mode)
+                .map_err(|e| format!("'{}' 복원 기록 실패: {e}", f.rel))?;
+        }
+        restored.push(f.rel.clone());
+    }
+    if only.is_none() {
+        write_atomic(&pack_dir.join(PACK_VERSION_FILE), meta.pack_version.as_bytes())
+            .map_err(|e| format!(".pack-version 복원 실패: {e}"))?;
+        if let PackStateRead::Valid(mut st) = read_pack_state(pack_dir) {
+            st.base_version = meta.pack_version.clone();
+            st.pro_revision = meta.pro_revision;
+            write_pack_state(pack_dir, &st)?;
+        }
+    }
+    Ok(restored)
+}
+
 /// PACK 템플릿 설치 (CLI init-pack과 데몬 첫 기동 자동 설치의 공용 코어).
 /// force=false: 사용자 수정 파일 불가침 + **비수정 파일은 임베드 신버전으로 자동 갱신**
 /// (설치 매니페스트의 설치-당시 해시와 현재 파일 해시가 일치 = 비수정). 매니페스트가
@@ -4025,7 +5122,9 @@ fn seed_dept_soul_content(dir: &Path, rel: &str, embed: &str) -> String {
 /// embed PACK_ALL iter(기존 경로)와 staged-tree iter(무중단 채널)가 같은 로직을 공유한다(중복 0·회귀 0).
 /// 다운그레이드 가드 비교 기준은 `target_version`(env! 직접 참조 제거 — staged 입력은 자기 버전을 넘김).
 /// force=false: user-owned·seed-once 불가침, 수정된 system 파일은 벤더 미전진=kept-drift 제자리
-/// 보존·벤더 전진=검증 base 3-way(충돌=치유+`<rel>.user` 보존), 비수정 파일은 입력 신버전으로 자동 갱신.
+/// 보존·벤더 전진=검증 base 3-way(★0.15.0 M11: 충돌·기준본 없음·손상 의심 = 기동 필수가 아니면 사용자 파일
+/// 유지 + `<rel>.new`(user-kept) · 기동 필수면 vendor 본 우선 + `<rel>.user` 보관(vendor-first)), 비수정 파일은
+/// 입력 신버전으로 자동 갱신. 묘비(장부에 기록된 삭제)는 부재 유지 · 생명줄은 언제나 되살린다.
 /// ("사용자 수정 파일 불가침" 구 문구는 user-owned 등급에만 참인데 전체로 읽혀 배포 현장의 오판을
 /// 낳았다 — 2026-07-12 치유 원복 사고 시정.) 반환: (written, kept).
 /// `transactional`: false면 embed/cysd/init-pack 경로 — 종전대로 마지막에 `.pack-version`을
@@ -4044,6 +5143,7 @@ fn seed_dept_soul_content(dir: &Path, rel: &str, embed: &str) -> String {
 /// basename(`.pack-staging-init-<pid>` — ls 비표시 dot·pid 휘발 명명)이 아니라 **논리 대상
 /// (pack_dir) basename** 을 데이터로 주입한다 — 스코프의 "staging basename 재판정 금지" 와
 /// 자기모순이던 내부 계약의 정합화(캡처 실파일·원장 capture 포인터가 은닉 레인에 흩어지는 것 차단).
+#[allow(clippy::too_many_arguments)]
 pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
     dir: PathBuf,
     items: I,
@@ -4054,6 +5154,115 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
     scope: PackScope,
     auth: Option<PackWriteAuth>,
     capture_ns: Option<&str>,
+) -> Result<(usize, usize), String> {
+    // ★0.15.0 M11: 이 래퍼는 묘비·기동 필수·스냅샷이 없는 입력원(`UpdateSources::none()`)으로
+    // 위임한다 — 운영 호출자(install_from_iter·install_staged)는 `install_into_with` 에 라이브 팩용
+    // 입력원(`UpdateSources::for_live_pack`)을 넘긴다. 이 래퍼는 시험 전용이다(운영 호출 0 — grep).
+    install_into_with(
+        dir,
+        items,
+        force,
+        target_version,
+        transactional,
+        setup_config,
+        scope,
+        auth,
+        capture_ns,
+        &UpdateSources::none(),
+    )
+}
+
+/// ★0.15.0 M11 아 + RULINGS AC3·AC4: 이번 설치의 업데이트 전 스냅샷. None = 만들 일이 없다(입력원이 루트·레인을
+/// 주지 않음 · 디스크 버전 없음 또는 = 대상 · 매니페스트 없음 · **이 전환의 스냅샷이 이미 있음** · 덮거나 지울 파일 0).
+/// 대상 = 설치 실행부와 같은 판정(plan)이 덮는다(갱신·치유·병합·vendor 우선)·지운다(폐기 정리)로 고른 파일 중 디스크
+/// 바이트가 새 바이트와 다른 것, 그리고 새로 만들 자리에 놓인 링크(쓰기가 링크를 파일로 바꾼다).
+fn take_update_snapshot(
+    dir: &Path,
+    items: &[(&str, &str)],
+    force: bool,
+    target_version: &str,
+    scope: PackScope,
+    sources: &UpdateSources,
+    manifest: &std::collections::BTreeMap<String, String>,
+) -> Option<Result<SnapshotOutcome, String>> {
+    let root = sources.snapshot_root.as_ref()?;
+    let lane = sources.lane.as_ref()?;
+    let dv = std::fs::read_to_string(dir.join(PACK_VERSION_FILE))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
+    if dv == target_version || manifest.is_empty() {
+        return None;
+    }
+    // AC3: 이 전환의 스냅샷이 이미 있으면(실패를 거듭하는 기동 설치 등) 다시 복사하지 않는다 — 첫 시도 직전의
+    // 상태가 진짜 업데이트 전 보존본이다(이후 시도는 이미 일부를 쓴 팩을 본다).
+    if newest_update_snapshot(root, &lane.0)
+        .and_then(|p| read_update_snapshot_meta(&p).ok())
+        .is_some_and(|m| m.pack_version == dv)
+    {
+        return None;
+    }
+    let plan = plan_install_core(dir, items, force, target_version, scope, sources);
+    if plan.blocked.is_some() {
+        return None;
+    }
+    let embed: std::collections::HashMap<&str, &str> = items.iter().copied().collect();
+    let is_link = |r: &str| {
+        std::fs::symlink_metadata(dir.join(r)).is_ok_and(|m| m.file_type().is_symlink())
+    };
+    let mut rels: Vec<String> = Vec::new();
+    for r in plan
+        .update
+        .iter()
+        .chain(&plan.heal)
+        .chain(&plan.merge3)
+        .chain(&plan.vendor_first)
+        .chain(&plan.prune_delete)
+    {
+        // 바이트가 그대로인 재기록(force · 디스크 = 새 바이트)은 되돌릴 것이 없다.
+        let same = !is_link(r)
+            && embed.get(r.as_str()).is_some_and(|c| {
+                std::fs::read(dir.join(r)).is_ok_and(|b| b == c.as_bytes())
+            });
+        if !same && !rels.contains(r) {
+            rels.push(r.clone());
+        }
+    }
+    for r in &plan.create {
+        if is_link(r) && !rels.contains(r) {
+            rels.push(r.clone());
+        }
+    }
+    if rels.is_empty() {
+        return None;
+    }
+    let prev = |rel: &str| sources.prev_vendor_for(rel);
+    Some(create_update_snapshot(
+        dir,
+        root,
+        &lane.0,
+        &dv,
+        manifest,
+        &rels,
+        scope,
+        &prev,
+        (UPDATE_SNAPSHOT_FILE_CAP, UPDATE_SNAPSHOT_TOTAL_CAP),
+    ))
+}
+
+/// [`install_into`] 의 입력원 주입판 — 판정·실행의 본체(★0.15.0 M11 업데이트 규칙).
+#[allow(clippy::too_many_arguments)]
+pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
+    dir: PathBuf,
+    items: I,
+    force: bool,
+    target_version: &str,
+    transactional: bool,
+    setup_config: bool,
+    scope: PackScope,
+    auth: Option<PackWriteAuth>,
+    capture_ns: Option<&str>,
+    sources: &UpdateSources,
 ) -> Result<(usize, usize), String> {
     // ★W0-d 양성 인가 게이트(최후 방어) — 어떤 부수효과보다 먼저. 대상이 라이브 기본 경로면
     // 인가 없이는 하드 거부한다(테스트 재오염 벡터 구조적 봉인). 비라이브·인가 보유는 통과.
@@ -4070,12 +5279,15 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
         }
     }
     let manifest_path = dir.join(INSTALL_MANIFEST);
-    let mut manifest: std::collections::BTreeMap<String, String> = std::fs::read_to_string(
-        &manifest_path,
-    )
-    .ok()
-    .and_then(|s| serde_json::from_str(&s).ok())
-    .unwrap_or_default();
+    // ★0.15.0 M11 다: 깨진 매니페스트는 빈 표(지금 동작)이되 '깨짐'을 판정 입력으로 넘긴다 — 사용자
+    // 수정으로 다루기 전에 과거 vendor 해시 표를 본다(부록 A-2 #1).
+    let (mut manifest, manifest_corrupt) = load_manifest_state(&dir);
+    if manifest_corrupt {
+        eprintln!(
+            "[init-pack] ⚠ 설치 기록({INSTALL_MANIFEST})이 깨져 읽을 수 없습니다 — 과거 버전 해시 표로 \
+             옛 vendor 본을 먼저 가려 갱신하고, 그 밖의 수정본은 사용자 것으로 보존합니다"
+        );
+    }
     // 다운그레이드 차단: 디스크 팩 버전이 입력 버전(target_version)보다 새것이면(구버전 cys로 롤백/오설치)
     // 비강제 install이 비수정 파일·prune으로 신기능을 구 내용으로 후퇴시키는 사일런트 회귀를 막는다.
     // force(수동 init-pack --force)면 우회 — 의도적 재설치는 허용.
@@ -4093,6 +5305,35 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
             }
         }
     }
+    // ★0.15.0 M11 아 + RULINGS AC3·AC4: 업데이트 전 스냅샷 — 이번 설치가 덮거나 지울 파일만(같은 판정 함수로 고른다),
+    // 상한 안에서, 전환마다 한 번. 첫 쓰기보다 **먼저** 확정한다(제자리 쓰기인 기동 설치가 중간에 멈춰도 보존본은
+    // 온전하다). 복사만 한다(살아 있는 팩의 이름을 바꾸지 않는다 — 윈도우 규칙). 실패는 설치를 막지 않는다(경고 1줄).
+    match take_update_snapshot(&dir, &items, force, target_version, scope, sources, &manifest) {
+        Some(Ok(o)) => {
+            println!(
+                "[init-pack] 업데이트 전 스냅샷: 이번 설치가 덮거나 지울 파일 {}건 · {:.1}MB → {}",
+                o.files,
+                o.bytes as f64 / 1_048_576.0,
+                o.path.display()
+            );
+            if !o.skipped.is_empty() {
+                eprintln!(
+                    "[init-pack] ⚠ 스냅샷 상한(파일 하나 {}MB · 전체 {}MB)을 넘어 담지 않은 파일 {}건 — 스냅샷 색인에 기록했습니다(설치는 계속): {}",
+                    UPDATE_SNAPSHOT_FILE_CAP / 1_048_576,
+                    UPDATE_SNAPSHOT_TOTAL_CAP / 1_048_576,
+                    o.skipped.len(),
+                    o.skipped.iter().map(|k| k.rel.as_str()).collect::<Vec<_>>().join(", ")
+                );
+            }
+        }
+        Some(Err(e)) => eprintln!("[init-pack] ⚠ 업데이트 전 스냅샷 실패(설치는 계속): {e}"),
+        None => {}
+    }
+    let update_ctx = UpdateContext::new(&dir, scope, sources, manifest_corrupt);
+    // ★M11 마: 묘비로 부재를 유지한 파일(rel, 수리 번호) — 같은 실행의 출력에 사실대로 드러낸다.
+    let mut absent_kept: Vec<String> = Vec::new();
+    // ★M11 가: 사용자 우선 폴백으로 불필요해진 이번 스윕의 병합 전 사본(정리 대상 — 설계 §4-11 가).
+    let mut capture_cleanup: Vec<PathBuf> = Vec::new();
     let mut written = 0;
     let mut kept = 0;
     // ★커스터마이즈 절충 원장(②): .new/.user 병치·pristine 미러·병합 대기 기록.
@@ -4162,6 +5403,21 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
             }
             _ => mhash_raw.clone(),
         };
+        // ★0.15.0 M11 사실 수집(plan_install_with 와 같은 수집기 — '계획 = 실제').
+        let facts =
+            update_ctx.facts(rel, content, exists, disk.as_deref(), mhash.as_deref(), &pending);
+        // ★M11 마: 수리 장부에 기록된 삭제(묘비) — 만들지 않는다. 판정은 decide_file_action_with 의
+        // ⓪과 같다(부재 ∧ 묘비 → KeepAbsent). 시드 승계(부서 soul)·병합보다 **먼저** 끊는다 — 승계는 감사
+        // 원장에 한 줄을 남기는 부수효과가 있다. 매니페스트 항목은 지운다(설치되지 않은 파일이다 —
+        // 묘비가 풀리면 다음 설치가 '기록 없는 부재'로 보고 지금처럼 되살린다).
+        if !exists {
+            if let Some(repair) = facts.tombstoned.as_deref() {
+                manifest.remove(rel);
+                absent_kept.push(format!("{rel} ({repair})"));
+                kept += 1;
+                continue;
+            }
+        }
         // ★G3 축2(seed-from-base): 부서 soul.md 의 최초 시드는 임베드 템플릿이 아니라 **base 팩의
         // 현행 soul.md 승계**다(부서는 base 헌장 아래에서 태어난다 — 2026-08-21 확정). `!exists`
         // 에만 발동하므로 이후 SeedOnce 불가침과 정합하고, 치환된 content 가 아래 판정·write·
@@ -4194,10 +5450,69 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
             );
             continue;
         }
-        match decide_file_action(
+        match decide_file_action_with(
             rel, content, exists, disk.as_deref(), mhash.as_deref(), force, scope,
-            verified_base.as_deref(),
+            verified_base.as_deref(), &facts,
         ) {
+            FileAction::KeepAbsent { repair } => {
+                // 위 조기 분기와 같은 판정(도달 불가 — 망라 일치용).
+                manifest.remove(rel);
+                absent_kept.push(format!("{rel} ({repair})"));
+                kept += 1;
+                continue;
+            }
+            FileAction::UserKept { reason } => {
+                // ★M11 가(사용자 우선): 살아 있는 파일은 사용자 것 그대로 — vendor 신버전은 `.new`.
+                // 매니페스트·pristine 은 앞당기지 않는다(재시도 금지와 짝 — 같은 vendor 본이면 다음
+                // 스윕은 `parked` 로 곧장 여기 온다: 합치기 전 사본이 다시 생기지 않는다).
+                park_user_kept(
+                    &dir, rel, content, disk.as_deref(), reason, None, None,
+                    &mut pending, &mut pending_dirty, target_version, now_ts,
+                );
+                kept += 1;
+                continue;
+            }
+            FileAction::VendorFirst { reason } => {
+                // ★M11 나(기동 필수 충돌): 사용자 수정본을 먼저 보관(이전 세대는 .user.prev-<시각>) —
+                // 보관이 안 되면 덮지 않는다(격리 · 부록 A-2 #4). 보관되면 아래 공용 경로가 vendor 본을 쓴다.
+                let user_bytes: Option<Vec<u8>> = std::fs::read(&path).ok();
+                match user_bytes.as_deref().map(|b| park_user_copy(&dir, rel, b)) {
+                    Some(Ok(())) => {
+                        // 앞서 user-kept·new-pending 으로 보관하던 `.new` 는 이제 살아 있는 vendor 본과 같아진다 — 치운다.
+                        if matches!(
+                            pending.get(rel).and_then(|e| e.get("kind")).and_then(|k| k.as_str()),
+                            Some("new-pending") | Some("user-kept")
+                        ) {
+                            let _ = std::fs::remove_file(dir.join(format!("{rel}.new")));
+                        }
+                        if let serde_json::Value::Object(entry) = serde_json::json!({
+                            "kind": "vendor-first", "side": format!("{rel}.user"),
+                            "reason": reason, "parked_at": now_ts,
+                            "version": target_version, "ts": now_ts,
+                        }) {
+                            upsert_pending_v2(&mut pending, &mut pending_dirty, rel, entry);
+                        }
+                        // ★RULINGS AC7: 원장을 vendor 바이트보다 **먼저** 저장한다 — 그 사이에 멈춰도 `.user` 가 기록
+                        // 없는 고아가 되지 않는다(다음 스윕은 같은 판정으로 수렴한다).
+                        save_merge_pending(&dir, &pending);
+                    }
+                    other => {
+                        let why = match other {
+                            Some(Err(e)) => e,
+                            _ => "사용자본 판독 실패".to_string(),
+                        };
+                        eprintln!("[init-pack] ⚠ 격리(quarantined): {rel} — 기동 필수 파일의 사용자 수정본을 보관하지 못했습니다({why}). 파일 무접촉 보존 — 보관 가능 회복 후 재스윕 시 vendor 본 우선 적용.");
+                        if let serde_json::Value::Object(entry) = serde_json::json!({
+                            "kind": "quarantined", "reason": "user-backup-failed", "side": rel,
+                            "version": target_version, "ts": now_ts,
+                        }) {
+                            upsert_pending_v2(&mut pending, &mut pending_dirty, rel, entry);
+                        }
+                        kept += 1;
+                        continue;
+                    }
+                }
+            }
             FileAction::Keep { adopt_hash, new_pending } => {
                 if adopt_hash {
                     // 디스크 = 임베드: 최신. 매니페스트 공백(구설치본)이면 채택 기록해
@@ -4235,13 +5550,13 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                     }
                     upsert_pending(&mut pending, &mut pending_dirty, rel, "new-pending", format!("{rel}.new"));
                 } else if !unreadable
-                    && pending
-                        .get(rel)
-                        .and_then(|e| e.get("kind"))
-                        .and_then(|k| k.as_str())
-                        == Some("new-pending")
+                    && matches!(
+                        pending.get(rel).and_then(|e| e.get("kind")).and_then(|k| k.as_str()),
+                        Some("new-pending") | Some("user-kept")
+                    )
                 {
                     // 병합 대기 해소(사용자가 vendor 본 채택 등) — 원장·.new 잔재 청소.
+                    // ★M11 가: user-kept 도 같다 — 디스크가 vendor 본과 같아졌으면 보관할 것이 없다.
                     // ★W-1: 판독 불가로 보존된 건은 '해소'가 아니라 '비교 불가'다 — 대기 상태를
                     // 그대로 둬야 한다(읽지 못했다는 이유로 vendor 신버전 사본을 지우면 정보 손실).
                     pending.remove(rel);
@@ -4293,6 +5608,7 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                 // json 게이트·손상 의심·pristine 검증형)는 전부 ⑤ healed 폴백 = 현행 Write{heal:
                 // true} 경로 동형 낙하(.user 보존 + vendor 기록 + 원장 conflicted{base_side} +
                 // <rel>.base 조상 사이드카) — 어떤 실패도 "0.14.28 처럼 동작"으로 강등될 뿐 손실 0.
+                let shell = is_shell_script(rel, content); // ★M11 라: 결과·보존본의 CR 제거 대상
                 let fallback_reason: String; // ⑤ 원장 reason 토큰(T4 doctor 소비) — 전 ⑤ 경로 확정 대입
                 let mut fallback_user_src: Option<String> = None; // pristine-write-failed 만 merged
                 let gates: Result<String, String> = (|| {
@@ -4334,8 +5650,19 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                         // best-effort 전례 동형(cys.rs audit closure) — loud 경고 후 계속.
                         eprintln!("[init-pack] 감사 원장 기록 실패(계속 진행): {e}");
                     }
+                    // ★0.15.0 M11 라: 줄바꿈만 다른 사용자본(CRLF)은 맞춘 뒤 합친다 — 조상·vendor 가 LF 이고
+                    //   사용자본만 CRLF 면 LF 로 맞춰 병합한다(merge3.rs 의 '섞인 줄바꿈 = 충돌' 규칙은 그대로).
+                    //   결과는 사용자의 CRLF 로 되돌리되, 셸 스크립트는 LF 로 둔다(부록 A-2 #16 · CR 이 든 훅은
+                    //   통째로 죽는다). 캡처(①)는 사용자 원본 바이트 그대로다.
+                    let user_crlf =
+                        ours.contains("\r\n") && !base.contains("\r\n") && !content.contains("\r\n");
+                    let ours_norm: std::borrow::Cow<str> = if user_crlf {
+                        std::borrow::Cow::Owned(ours.replace("\r\n", "\n"))
+                    } else {
+                        std::borrow::Cow::Borrowed(ours)
+                    };
                     // ② 병합: diffy 순수 Rust(셸아웃 0) — 충돌 마커 = ⑤.
-                    let merged = match crate::merge3::merge3(base, ours, content) {
+                    let merged = match crate::merge3::merge3(base, &ours_norm, content) {
                         crate::merge3::Merge3Outcome::Clean(m) => m,
                         crate::merge3::Merge3Outcome::Conflict(_) => {
                             return Err("merge-conflict".to_string())
@@ -4345,9 +5672,16 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                     if !crate::merge3::json_gate(rel, &merged) {
                         return Err("json-gate".to_string());
                     }
-                    if let Some(rsn) = crate::merge3::suspect_damage(base, ours, &merged) {
+                    if let Some(rsn) = crate::merge3::suspect_damage(base, &ours_norm, &merged) {
                         return Err(format!("suspect:{rsn:?}"));
                     }
+                    let merged = if shell {
+                        merged.replace('\r', "")
+                    } else if user_crlf {
+                        merged.replace("\r\n", "\n").replace('\n', "\r\n")
+                    } else {
+                        merged
+                    };
                     Ok(merged)
                 })();
                 match gates {
@@ -4363,12 +5697,10 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                         match ensure_pristine_checked(&dir, rel, content) {
                             Ok(()) => {
                                 manifest.insert(rel.to_string(), content_hash(content));
-                                if pending
-                                    .get(rel)
-                                    .and_then(|e| e.get("kind"))
-                                    .and_then(|k| k.as_str())
-                                    == Some("new-pending")
-                                {
+                                if matches!(
+                                    pending.get(rel).and_then(|e| e.get("kind")).and_then(|k| k.as_str()),
+                                    Some("new-pending") | Some("user-kept")
+                                ) {
                                     pending.remove(rel);
                                     pending_dirty = true;
                                     let _ = std::fs::remove_file(dir.join(format!("{rel}.new")));
@@ -4397,14 +5729,47 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                     }
                     Err(reason) => fallback_reason = reason,
                 }
-                // ⑤ healed 폴백 — 현행 Write{heal:true} 경로 동형 낙하 + 충돌 계보 사이드카.
+                // ★0.15.0 M11 가: 기동 필수가 아닌 파일 — 어느 실패든(충돌·손상 의심·json 게이트·캡처 실패·
+                //   pristine 실패) **사용자 파일이 살아 있는 파일로 남는다**. vendor 신버전은 `.new`, 원장
+                //   user-kept. 손상 의심은 덮는 이유가 아니라 합칠 때의 주의 표시(caution)다(설계 §7 2행). 이번
+                //   시도의 병합 전 사본은 정리한다 — 사용자본이 살아 있어 그 사본이 지킬 것이 없고, 남기면 같은
+                //   보관 파일을 다시 볼 때마다 사본이 쌓인다(설계 §4-11 가 · 정리 장치 부재 3507–3509). pristine
+                //   전진 실패만은 디스크에 이미 병합본(사용자 수정 + vendor 변경)이 있으므로 그대로 두고 캡처를
+                //   증거로 남긴다.
+                if !facts.boot_critical {
+                    let caution = fallback_reason
+                        .strip_prefix("suspect:")
+                        .map(|r| format!("suspect:{r}"));
+                    let mut capture_ptr: Option<String> = None;
+                    if fallback_reason == "pristine-write-failed" {
+                        capture_ptr = capture_seg.as_ref().map(|(_, seg)| format!("{seg}/{rel}"));
+                    } else if let Some((seg_path, _)) = capture_seg.as_ref() {
+                        if fallback_reason != "capture-failed" {
+                            capture_cleanup.push(seg_path.join(rel));
+                        }
+                    }
+                    let live_now: Option<String> = fallback_user_src.clone().or_else(|| disk.clone());
+                    park_user_kept(
+                        &dir, rel, content, live_now.as_deref(), &fallback_reason, caution,
+                        capture_ptr, &mut pending, &mut pending_dirty, target_version, now_ts,
+                    );
+                    kept += 1;
+                    continue;
+                }
+                // ⑤ 나(기동 필수): vendor 본 우선 폴백 — 현행 healed 폴백 경로 동형 낙하(.user 보존 + vendor
+                //   기록 + 조상 사이드카 <rel>.base)이되 원장 kind 는 vendor-first(다시 입히기 = 워커 + 승인)이고
+                //   `.user` 를 쓰기 전에 이전 세대를 보존한다(사).
                 //   .user 소스 = 그 시점의 디스크 실체(통상 ours=디스크 원본 · pristine-write-failed
                 //   만 이미 기록된 merged — v2 §4 크래시표 2행 정합 · ours 원본은 ①캡처가 별도 보존).
                 let user_src: Option<String> = fallback_user_src.or_else(|| disk.clone());
                 if let Some(d) = user_src.as_deref() {
                     let user_path = dir.join(format!("{rel}.user"));
                     if std::fs::read_to_string(&user_path).ok().as_deref() != Some(d) {
-                        match write_atomic(&user_path, d.as_bytes()) {
+                        let backup = preserve_prior_user_file(&dir, rel, Some(d.as_bytes()))
+                            .and_then(|_| {
+                                write_atomic(&user_path, d.as_bytes()).map_err(|e| e.to_string())
+                            });
+                        match backup {
                             Ok(()) => {}
                             Err(e) if fallback_reason == "capture-failed" => {
                                 // ★성찰 차단 수리 2R-5(v2 §2 원칙 4 — 백업 불가면 덮지 않는다):
@@ -4443,21 +5808,26 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                         }
                     }
                     if let serde_json::Value::Object(entry) = serde_json::json!({
-                        "kind": "conflicted", "side": format!("{rel}.user"),
+                        "kind": "vendor-first", "side": format!("{rel}.user"),
                         "base_side": format!("{rel}.base"),
-                        "reason": fallback_reason,
+                        "reason": fallback_reason, "parked_at": now_ts,
                         "version": target_version, "ts": now_ts,
                     }) {
                         upsert_pending_v2(&mut pending, &mut pending_dirty, rel, entry);
                     }
+                    // ★RULINGS AC7: 원장을 vendor 바이트보다 먼저 저장(위 vendor 우선 가지와 같은 이유).
+                    save_merge_pending(&dir, &pending);
                 }
             }
             FileAction::Write { heal_user_copy } => {
                 if heal_user_copy {
                     // system 강제 치유(P0-4)·force 갱신이 사용자 수정본을 덮기 **전에** 보존(파괴 0).
+                    // ★0.15.0: 이 가지는 L0(잠금 보안 자산)만 남는다 — 무결성 우선의 명시 예외라 보존은
+                    // best-effort 그대로이되, 이전 세대를 덮지 않는다(사 — `.user.prev-<시각>`).
                     if let Some(d) = disk.as_deref() {
                         let user_path = dir.join(format!("{rel}.user"));
                         if std::fs::read_to_string(&user_path).ok().as_deref() != Some(d) {
+                            let _ = preserve_prior_user_file(&dir, rel, Some(d.as_bytes()));
                             let _ = write_atomic(&user_path, d.as_bytes());
                         }
                         // ★T3(D7): healed upsert 는 계보 인지 헬퍼 경유 — 크래시 창 재스윕 healed 가
@@ -4472,7 +5842,15 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                         // ★T3 L0/L1 실행부(v2 §3 · §2 원칙 4 · D4·D11): 판독 불가(disk=None) —
                         // 문자열 백업이 구조적으로 못 뜨던 유일 무백업 파괴 edge 를 바이트 백업
                         // (tmp+copy+rename 원자화)으로 봉인한다.
-                        match byte_backup_user(&dir, rel, &path) {
+                        // ★0.15.0 사: 이전 세대 보존을 먼저 — 두 번 밀려나도 첫 백업이 덮이지 않는다(CP949
+                        // 파일 A·B). 세대 보존 실패는 백업 실패와 같다(fail-closed → 아래 격리).
+                        let backup = preserve_prior_user_file(
+                            &dir,
+                            rel,
+                            std::fs::read(&path).ok().as_deref(),
+                        )
+                        .and_then(|_| byte_backup_user(&dir, rel, &path));
+                        match backup {
                             Ok(()) => {
                                 if let serde_json::Value::Object(entry) = serde_json::json!({
                                     "kind": "healed", "side": format!("{rel}.user"),
@@ -4524,12 +5902,12 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
         manifest.insert(rel.to_string(), content_hash(content));
         ensure_pristine(&dir, rel, content);
         // 정상 갱신으로 합류(비수정 update·신규 생성) — 남은 new-pending 잔재는 무의미하므로 청소.
-        if pending
-            .get(rel)
-            .and_then(|e| e.get("kind"))
-            .and_then(|k| k.as_str())
-            == Some("new-pending")
-        {
+        // ★M11 가: user-kept 잔재도 같다(디스크가 vendor 본이 됐다). vendor-first 는 다시 입히기가 남아
+        // 있으므로 지우지 않는다.
+        if matches!(
+            pending.get(rel).and_then(|e| e.get("kind")).and_then(|k| k.as_str()),
+            Some("new-pending") | Some("user-kept")
+        ) {
             pending.remove(rel);
             pending_dirty = true;
             let _ = std::fs::remove_file(dir.join(format!("{rel}.new")));
@@ -4538,6 +5916,24 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
     }
     if pending_dirty {
         save_merge_pending(&dir, &pending);
+    }
+    // ★M11 가: 사용자 우선 폴백으로 불필요해진 이번 스윕의 병합 전 사본 정리(파일 → 빈 상위 디렉터리만).
+    if !capture_cleanup.is_empty() {
+        for f in &capture_cleanup {
+            let _ = std::fs::remove_file(f);
+        }
+        if let Some((seg, _)) = capture_seg.as_ref() {
+            remove_empty_dirs_under(seg);
+            let _ = std::fs::remove_dir(seg);
+        }
+    }
+    // ★M11 마: 묘비로 부재를 유지한 파일 — 사실대로 한 줄(어느 수리가 부재를 유지하는지).
+    if !absent_kept.is_empty() {
+        println!(
+            "[init-pack] 수리 장부에 기록된 삭제 {}건은 만들지 않았습니다(부재 유지): {} — 되돌리려면 그 수리를 `cys repair revert <번호>`",
+            absent_kept.len(),
+            absent_kept.join(", ")
+        );
     }
     // ★W-1(P0): 판독 불가라 손대지 않은 파일은 **같은 실행의 출력에 반드시 드러난다.** 침묵하면
     // 사용자는 "덮어썼는지 아닌지"를 알 길이 없고, 아래 병합 대기 수치를 전량으로 오독한다.
@@ -4570,10 +5966,28 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
             );
         }
         // ★T3(D13 · v2 §5 가시성 채널 1): 부트 요약 1줄 — 어느 하나라도 0 이 아닐 때만.
-        if c.healed + c.merged + c.kept_drift + c.conflicted + c.quarantined > 0 {
+        if c.healed + c.merged + c.kept_drift + c.conflicted + c.quarantined + c.user_kept
+            + c.vendor_first
+            > 0
+        {
             println!(
-                "[init-pack] pack: healed={} merged={} kept-drift={} conflicted={} quarantined={} — cys pack-merge 로 확인",
-                c.healed, c.merged, c.kept_drift, c.conflicted, c.quarantined
+                "[init-pack] pack: healed={} merged={} kept-drift={} conflicted={} quarantined={} user-kept={} vendor-first={} — cys pack-merge 로 확인",
+                c.healed, c.merged, c.kept_drift, c.conflicted, c.quarantined, c.user_kept,
+                c.vendor_first
+            );
+        }
+        // ★0.15.0 M11: 업데이트 뒤 보고의 설치기 몫(설계 §4-11 "보존된 수정 N건, 합쳐진 것 M건, …,
+        // 합치기 대기 J건" — '원본에 반영되어 내린 것'은 수리 장부의 상태라 여기서 세지 않는다).
+        if c.user_kept + c.vendor_first > 0 {
+            println!(
+                "[init-pack] 보존된 수정 {}건(사용자 파일 유지 {} · 제자리 보존 {}) · 합쳐진 것 {}건 · 합치기·다시 입히기 대기 {}건(사용자 파일 유지 + .new {} · 기동 필수 vendor 우선 + 사용자본 보관 {}) — 워커가 부서당 과제 하나로 처리",
+                c.user_kept + c.kept_drift,
+                c.user_kept,
+                c.kept_drift,
+                c.merged,
+                c.user_kept + c.vendor_first,
+                c.user_kept,
+                c.vendor_first
             );
         }
     }
@@ -4707,7 +6121,11 @@ pub fn install_from_iter<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
     let dir = pack_dir();
     // ★G3 축2: 스코프는 실 pack_dir 에서 산출(부서 데몬 자동설치가 이 경로 — dept soul 승계·불가침).
     let scope = pack_scope_of(&dir);
-    install_into(dir, items, force, target_version, transactional, true, scope, auth, None)
+    // ★0.15.0 M11: 라이브 팩용 입력원 — 그 레인의 묘비·기동 필수 질의·업데이트 전 스냅샷 루트.
+    let sources = UpdateSources::for_live_pack(&dir);
+    install_into_with(
+        dir, items, force, target_version, transactional, true, scope, auth, None, &sources,
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -4730,8 +6148,12 @@ pub fn pack_prev_dir(dir: &Path) -> PathBuf {
     PathBuf::from(format!("{}.prev", dir.display()))
 }
 
-/// 재귀 디렉터리 복사(파일=fs::copy로 권한 보존, 하위 dir 재귀). 팩엔 심링크가 없다(오너 결정 —
-/// 심링크 마이그레이션 안 함). staging 전량 복사로 상태파일·user-edit·비임베드·디렉티브를 보존한다.
+/// 재귀 디렉터리 복사(파일=fs::copy로 권한 보존, 하위 dir 재귀). 팩 자체는 심링크를 배포하지 않는다(오너
+/// 결정 — 심링크 마이그레이션 안 함). staging 전량 복사로 상태파일·user-edit·비임베드·디렉티브를 보존한다.
+/// ★0.15.0 M11(설계 §7 20행 "링크를 링크로 보존한다"): 사용자가 만든 심볼릭 링크는 유닉스에서 **링크로**
+/// 복사한다 — 종전 `fs::copy` 는 링크를 따라가 파일 링크를 사본으로 바꾸고, 대상이 없는 링크에서는
+/// 실패해 `init-pack` 이 exit 1 로 멈췄다(조사 손실 시나리오 20). 윈도우는 개발자 모드 없이 링크를 만들 수
+/// 없으므로 지금 동작 그대로다(운영체제 제약).
 fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
@@ -4739,6 +6161,11 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
         let ft = entry.file_type()?;
         let from = entry.path();
         let to = dst.join(entry.file_name());
+        #[cfg(unix)]
+        if ft.is_symlink() {
+            std::os::unix::fs::symlink(std::fs::read_link(&from)?, &to)?;
+            continue;
+        }
         if ft.is_dir() {
             copy_dir_all(&from, &to)?;
         } else {
@@ -4793,10 +6220,25 @@ pub fn atomic_swap(dir: &Path, staging: &Path) -> Result<(), String> {
 /// sha256·minisign 검증은 pack-update 경로(packsig)가 이미 수행하므로, init-pack staging은
 /// 존재·수 검증이다(디스크 오류로 반쯤 쓰인 staging을 교체 전에 차단하는 방어선).
 pub fn verify_staging(staging: &Path, items: &[(&str, &str)]) -> Result<(), String> {
+    verify_staging_with(staging, items, &std::collections::BTreeSet::new())
+}
+
+/// ★0.15.0 M11 마(설계 §4-11 "이 검사를 묘비와 함께 바꾸는 묶음에 넣는다"): **허가된 부재**(그 레인의 묘비가
+/// 부재를 유지하는 파일 — 생명줄은 결코 들어오지 않는다)와 **덜 만들어진 준비본**을 구분한다. 허가 집합에
+/// 없는 누락은 지금처럼 실패다(앱이 좌석 복원을 보류하는 근거 — 부록 A-2 #13). 링크는 링크로 보존되므로
+/// (copy_dir_all) 대상 파일 존재 대신 항목 존재(`symlink_metadata`)도 인정한다(대상이 없는 링크 포함).
+pub fn verify_staging_with(
+    staging: &Path,
+    items: &[(&str, &str)],
+    authorised_absent: &std::collections::BTreeSet<String>,
+) -> Result<(), String> {
     let mut missing = 0usize;
     let mut first: Option<String> = None;
     for (rel, _) in items {
-        if !staging.join(rel).is_file() {
+        let p = staging.join(rel);
+        let present = p.is_file()
+            || std::fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_symlink());
+        if !present && !authorised_absent.contains(*rel) {
             missing += 1;
             if first.is_none() {
                 first = Some((*rel).to_string());
@@ -4851,7 +6293,9 @@ pub fn install_staged(
     }
     // ② 임베드 반영을 staging에(config 격리 셋업은 교체 후 실 dir에 — setup_config=false).
     let items: Vec<(&str, &str)> = PACK_ALL.iter().map(|(r, c)| (*r, *c)).collect();
-    let (written, kept) = match install_into(
+    // ★0.15.0 M11: 입력원은 **논리 대상**(pack_dir)에서 — 레인(묘비)·스냅샷은 staging 이 아니라 그 팩의 것.
+    let sources = UpdateSources::for_live_pack(&dir);
+    let (written, kept) = match install_into_with(
         staging.clone(),
         items.iter().copied(),
         force,
@@ -4861,6 +6305,7 @@ pub fn install_staged(
         scope, // 논리 대상(pack_dir)의 스코프 — staging basename 재판정 금지(위 주석).
         None, // staging은 비라이브 형제 경로 — 여기 쓰기는 인가 불요(라이브 인가는 위 swap 게이트가 담당).
         capture_ns.as_deref(), // 캡처 레인 = 논리 대상 basename(스코프와 동일 주입 계약).
+        &sources,
     ) {
         Ok(v) => v,
         Err(e) => {
@@ -4868,8 +6313,9 @@ pub fn install_staged(
             return Err(e);
         }
     };
-    // ③ 검증(존재·수) — 실패 시 staging 폐기·교체 안 함(기존 팩 온전).
-    if let Err(e) = verify_staging(&staging, &items) {
+    // ③ 검증(존재·수) — 실패 시 staging 폐기·교체 안 함(기존 팩 온전). ★M11 마: 묘비가 부재를 유지하는
+    // 파일은 허가된 부재다(덜 만들어진 준비본과 구분 — 그 밖의 누락은 지금처럼 실패).
+    if let Err(e) = verify_staging_with(&staging, &items, &sources.authorised_absent()) {
         let _ = std::fs::remove_dir_all(&staging);
         return Err(e);
     }
@@ -5461,12 +6907,16 @@ mod tests {
             "--force 에서는 단축이 걸리지 않아야 한다(강제의 침묵 무시 금지): {:?}",
             plan_forced.kept_drift
         );
+        // ★0.15.0 M11 자(H-RW 재작성 — 종전: "--force 는 분류로 내려가 치유/갱신으로 잡혀야 한다"): 강제는 여전히
+        //   단축을 건너뛰어 분류로 내려가지만(침묵 무시 금지), 분류는 사용자 수정을 버리지 않는다 — 출처 불명의
+        //   운영자 바이트는 사용자 우선(user-kept)이고 치유로 잡히지 않는다.
         assert!(
-            plan_forced.heal.iter().any(|r| r == sysrel) || plan_forced.update.iter().any(|r| r == sysrel),
-            "--force 는 분류로 내려가 치유/갱신으로 잡혀야 한다: heal={:?} update={:?}",
-            plan_forced.heal,
-            plan_forced.update
+            plan_forced.user_kept.iter().any(|r| r == sysrel),
+            "--force 는 분류로 내려가 사용자 우선으로 잡혀야 한다: user_kept={:?} heal={:?}",
+            plan_forced.user_kept,
+            plan_forced.heal
         );
+        assert!(!plan_forced.heal.iter().any(|r| r == sysrel), "--force 가 사용자 수정을 치유로 덮지 않는다(자)");
         let _ = std::fs::remove_dir_all(&td);
     }
 
@@ -6852,12 +8302,25 @@ mod tests {
         assert_eq!(decide_file_action("bin/x.py", embed, true, Some("OLD"),
                        Some(content_hash("OLD").as_str()), false),
                    Write { heal_user_copy: false });
-        // system 수정본(매니페스트 부재·상이) → 강제 치유(P0-4)하되 사용자본 .user 보존.
+        // ★0.15.0 M11 가(H-RW 재작성 — 종전: "system 수정본(매니페스트 부재·상이) → 강제 치유(P0-4)하되
+        //   사용자본 .user 보존"): 이제 사용자 파일이 살아 있는 파일로 남고 vendor 신버전은 `.new`(user-kept).
+        //   P0-4(설치 기록 부재 ≠ 사용자 수정)는 과거 vendor 해시 표가 지킨다(아래 다 행 · 부록 A-2 #1).
         assert_eq!(decide_file_action("bin/x.py", embed, true, Some("HACKED"), None, false),
-                   Write { heal_user_copy: true });
-        // force 로 system 수정본을 덮을 때도 사용자본 보존.
+                   UserKept { reason: "no-base" });
+        // ★0.15.0 M11 자(종전: "force 로 system 수정본을 덮을 때도 사용자본 보존"): force 는 사용자 수정을
+        //   버리지 않는다 — 같은 판정(user-kept).
         assert_eq!(decide_file_action("bin/x.py", embed, true, Some("HACKED"), None, true),
-                   Write { heal_user_copy: true });
+                   UserKept { reason: "no-base" });
+        // ★나: 기동 필수 파일이면 vendor 본 우선 + 사용자본 시각별 보관(vendor-first).
+        let bc = UpdateFacts { boot_critical: true, ..UpdateFacts::default() };
+        assert_eq!(super::decide_file_action_with("bin/x.py", embed, true, Some("HACKED"), None,
+                       false, PackScope::Base, None, &bc),
+                   VendorFirst { reason: "no-base" });
+        // ★다(P0-4 계승): 매니페스트 부재여도 디스크가 이 파일의 과거 vendor 본이면 사용자 수정이 아니다 → 갱신.
+        let prev = UpdateFacts { prev_vendor_match: true, ..UpdateFacts::default() };
+        assert_eq!(super::decide_file_action_with("bin/x.py", embed, true, Some("HACKED"), None,
+                       false, PackScope::Base, None, &prev),
+                   Write { heal_user_copy: false });
         // user-owned 수정 + 임베드가 마지막 적용본에서 전진 → 보존 + 신버전 병치(병합 대기).
         assert_eq!(decide_file_action("soul.md", embed, true, Some("MY-SOUL"),
                        Some(content_hash("EMBED-V1").as_str()), false),
@@ -6904,15 +8367,18 @@ mod tests {
         // ① user-owned: 보존 + 신버전 .new 병치 + 원장 new-pending.
         assert_eq!(read(user_b), "USER-SOUL", "user-owned 보존 불변");
         assert_eq!(read("soul.md.new"), get(user_b), ".new = 임베드 신버전");
-        // ② system 수정본: 치유(임베드) + 사용자본 .user 보존 + 원장 healed.
-        assert_eq!(read(sys_c), get(sys_c), "system 치유(P0-4 불변)");
-        assert_eq!(read(&format!("{sys_c}.user")), "SYS-DRIFT", "치유 전 사용자본 보존(파괴 0)");
+        // ② ★0.15.0 M11 가(H-RW 재작성 — 종전: "system 수정본: 치유(임베드) + 사용자본 .user 보존 + 원장 healed"):
+        //   기준본 없는 system 수정본은 사용자 파일이 살아 있고 vendor 신버전은 `.new`, 원장 user-kept(파괴 0 은 그대로).
+        assert_eq!(read(sys_c), "SYS-DRIFT", "system 수정본 = 사용자 파일 유지(가)");
+        assert_eq!(read(&format!("{sys_c}.new")), get(sys_c), "vendor 신버전 .new 보관");
+        assert!(!td.join(format!("{sys_c}.user")).exists(), "사용자 우선 — .user 미생성");
         let pending = load_merge_pending(&td);
         assert_eq!(pending.get(user_b).and_then(|e| e["kind"].as_str()), Some("new-pending"));
-        assert_eq!(pending.get(sys_c).and_then(|e| e["kind"].as_str()), Some("healed"));
-        // ③ pristine 미러: 적용된 vendor 본만(sys_a·sys_c), 동결 user-owned(user_b)는 미기록(조상 보존).
+        assert_eq!(pending.get(sys_c).and_then(|e| e["kind"].as_str()), Some("user-kept"));
+        // ③ pristine 미러: 적용된 vendor 본만(sys_a), 동결 user-owned(user_b)·사용자 우선 system(sys_c)은 미기록
+        //   (조상 보존 — sys_c 는 vendor 본이 디스크에 적용되지 않았다).
         assert_eq!(read(&format!("{PRISTINE_DIR}/{sys_a}")), get(sys_a));
-        assert_eq!(read(&format!("{PRISTINE_DIR}/{sys_c}")), get(sys_c));
+        assert!(!td.join(PRISTINE_DIR).join(sys_c).exists(), "적용되지 않은 vendor 본은 조상으로 쓰지 않는다");
         assert!(!td.join(PRISTINE_DIR).join(user_b).exists(), "동결 파일 조상은 미갱신");
         // ④ 멱등: 재실행해도 상태 동일(원장 중복 기록·불필요 rewrite 없음).
         install(false, None).expect("재실행 실패");
@@ -7048,7 +8514,10 @@ mod tests {
         assert!(plan.blocked.is_none());
         assert!(plan.update.iter().any(|r| r == "README.md"), "비수정 → update");
         assert!(plan.merge_new.iter().any(|r| r == "soul.md"), "user-owned+전진 → merge_new");
-        assert!(plan.heal.iter().any(|r| r == "alerts-config.json"), "system 수정 → heal");
+        // ★0.15.0 M11 가(H-RW-11 재작성 — 종전: "system 수정 → heal"): 기록 없는 system 수정본은 사용자 우선
+        //   (user-kept) 버킷이다 — heal 로 오보하지 않는다.
+        assert!(plan.user_kept.iter().any(|r| r == "alerts-config.json"), "system 수정(기준본 없음) → user_kept");
+        assert!(!plan.heal.iter().any(|r| r == "alerts-config.json"), "user-kept 를 heal 로 오보 금지");
         assert!(plan.kept_drift.iter().any(|r| r == kd_rel),
                 "★T3: system 수정+vendor 미전진 → kept_drift 버킷");
         assert!(!plan.heal.iter().any(|r| r == kd_rel), "kept-drift 를 heal 로 오보 금지(R7)");
@@ -7060,7 +8529,15 @@ mod tests {
         let read = |rel: &str| std::fs::read_to_string(td.join(rel)).unwrap();
         assert_eq!(read("soul.md"), "USER-SOUL");
         assert!(td.join("soul.md.new").exists());
-        assert!(td.join("alerts-config.json.user").exists());
+        // ★0.15.0 M11 가(plan=actual — 종전: alerts-config.json.user 존재): 사용자 파일 유지 + vendor `.new` + 원장 user-kept.
+        assert_eq!(read("alerts-config.json"), "SYS-DRIFT", "user-kept: 사용자 파일 유지(plan=actual)");
+        assert!(td.join("alerts-config.json.new").exists(), "user-kept: vendor 신버전 .new");
+        assert!(!td.join("alerts-config.json.user").exists(), "user-kept: .user 미생성");
+        assert_eq!(
+            load_merge_pending(&td).get("alerts-config.json").and_then(|e| e["kind"].as_str()),
+            Some("user-kept"),
+            "user-kept 원장 계상(plan=actual)"
+        );
         // ★T3 plan=actual 확장: kept-drift 는 제자리 보존 + 원장 계상(파일 쓰기 0).
         assert_eq!(read(kd_rel), "KD-DRIFT-EDIT", "kept-drift 제자리 보존(plan=actual)");
         let pend = load_merge_pending(&td);
@@ -7145,13 +8622,14 @@ mod tests {
         .unwrap();
         install_from_iter([(rel, e1)], false, "1.1.0", false, None).unwrap();
         let pend2 = load_merge_pending(&pd);
-        let ent2 = pend2.get(rel).expect("healed 전환 후 항목 잔존");
-        assert_eq!(ent2["kind"].as_str(), Some("healed"), "★D7 healed 쪽: kind 전환 허용");
+        let ent2 = pend2.get(rel).expect("전환 후 항목 잔존");
+        // ★0.15.0 M11 가(H-RW 재작성 — 종전: kind=healed · .user=병합본 · disk=vendor): L4 결말이 사용자 우선이라
+        //   kind 는 user-kept 로 전환되고 병합본이 디스크에 남는다 — D7 계보 규칙(capture 승계)은 그대로 고정한다.
+        assert_eq!(ent2["kind"].as_str(), Some("user-kept"), "★D7: kind 전환 허용(user-kept)");
         assert_eq!(ent2["capture"].as_str(), Some(capture_ptr),
-                   "★D7 healed 쪽: capture 승계(크래시 창 캡처 포인터 소실 금지)");
-        assert_eq!(std::fs::read_to_string(pd.join(format!("{rel}.user"))).unwrap(), merged_disk,
-                   ".user = 병합본 바이트 보존(손실 0)");
-        assert_eq!(std::fs::read_to_string(&p).unwrap(), e1, "disk = vendor 보증(healed)");
+                   "★D7: capture 승계(크래시 창 캡처 포인터 소실 금지)");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), merged_disk, "disk = 병합본 유지(손실 0)");
+        assert_eq!(std::fs::read_to_string(pd.join(format!("{rel}.new"))).unwrap(), e1, "vendor 본 .new");
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -7220,8 +8698,22 @@ mod tests {
                 + c.merged
                 + c.conflicted
                 + c.quarantined
-                + c.adopted;
+                + c.adopted
+                + c.user_kept
+                + c.vendor_first;
             assert_eq!(named_sum, 1, "등재 kind {kind:?} 계상 오류(명시 버킷 합 {named_sum})");
+        }
+        // ①-b ★0.15.0 M11(O-C8-1): 신 kind 2종이 등재돼 있고 조치 대상(actionable)이다 — 둘 다 과제가
+        // 남은 상태(user-kept = 워커의 합치기, vendor-first = 워커의 다시 입히기 + 주인 승인)라 at-rest 가 아니다.
+        assert_eq!(LEDGER_KINDS.len(), 9, "등재 kind 수(0.15.0: 7 + user-kept·vendor-first)");
+        for kind in ["user-kept", "vendor-first"] {
+            assert!(LEDGER_KINDS.contains(&kind), "신 kind {kind} 미등재");
+            let mut pending = serde_json::Map::new();
+            pending.insert(
+                "z".into(),
+                serde_json::json!({"kind": kind, "side": "z", "version": "1.0.0", "ts": 1}),
+            );
+            assert_eq!(pending_kind_counts(&pending).actionable(), 1, "{kind} 는 조치 대상이어야 한다");
         }
         // ② 전 kind 1건씩 — 전필드 struct 리터럴(컴파일 강제: 필드 추가 시 여기 미갱신 = 거부).
         let mut pending = serde_json::Map::new();
@@ -7241,6 +8733,8 @@ mod tests {
                 conflicted: 1,
                 quarantined: 1,
                 adopted: 1,
+                user_kept: 1,
+                vendor_first: 1,
                 unknown: 0,
             },
             "LEDGER_KINDS ↔ 버킷 전단사 파괴"
@@ -7350,12 +8844,15 @@ mod tests {
         install_from_iter(items3.iter().copied(), false, "1.1.0", false, None).unwrap();
         let pend3 = load_merge_pending(&pd);
         for rel in w3s {
-            assert_eq!(std::fs::read_to_string(pd.join(rel)).unwrap(), e1,
-                       "[W3] disk=vendor 보증(healed) — {rel}");
-            assert_eq!(std::fs::read_to_string(pd.join(format!("{rel}.user"))).unwrap(), merged,
-                       "[W3] .user=병합본 바이트 보존(손실 0) — {rel}");
+            // ★0.15.0 M11 가(H-RW 재작성 — 종전: "[W3] disk=vendor 보증(healed) · .user=병합본 · kind=healed"):
+            //   좁힘(병합 대기 항목 → 출처 '그 병합' — 부록 A-2 #5)은 그대로이고, base 검증 실패의 L4 결말이 사용자
+            //   우선으로 바뀌었다 — 병합본(사용자 δ 포함)이 살아 있고 vendor 본은 `.new`, 계보 capture 는 승계.
+            assert_eq!(std::fs::read_to_string(pd.join(rel)).unwrap(), merged,
+                       "[W3] 가: 병합본(사용자 δ) 유지 — {rel}");
+            assert_eq!(std::fs::read_to_string(pd.join(format!("{rel}.new"))).unwrap(), e1,
+                       "[W3] 가: vendor 본 .new — {rel}");
             let e = pend3.get(rel).unwrap();
-            assert_eq!(e["kind"].as_str(), Some("healed"), "[W3] kind=healed — {rel}");
+            assert_eq!(e["kind"].as_str(), Some("user-kept"), "[W3] kind=user-kept — {rel}");
             assert_eq!(e["capture"].as_str(), Some(format!("pack/1-1/{rel}").as_str()),
                        "[W3] ★D7: merged 항목의 capture 승계 — {rel}");
         }
@@ -7394,17 +8891,38 @@ mod tests {
         std::fs::write(pd2.join(INSTALL_MANIFEST),
             serde_json::json!({ wc: content_hash(e_old) }).to_string()).unwrap();
         install_from_iter([(wc, e1)], false, "1.1.0", false, None).unwrap();
-        assert_eq!(std::fs::read_to_string(pd2.join(wc)).unwrap(), e1, "[W-cap] vendor 본 기록");
-        assert_eq!(std::fs::read_to_string(pd2.join(format!("{wc}.user"))).unwrap(), ours,
-                   "[W-cap] .user=사용자본(캡처 실패 시에도 §2 원칙 4 보존)");
-        assert_eq!(std::fs::read_to_string(pd2.join(format!("{wc}.base"))).unwrap(), e_old,
-                   "[W-cap] .base=조상 전문(사후 3-way 재료)");
+        // ★0.15.0 M11 가(H-RW 재작성 — 종전: vendor 본 기록 + .user + .base + conflicted): 캡처 금지면 병합을
+        //   시도하지 않는 것은 그대로이고(§2 원칙 4), 기동 필수가 아닌 파일은 사용자 파일이 살아 있다.
+        assert_eq!(std::fs::read_to_string(pd2.join(wc)).unwrap(), ours, "[W-cap] 가: 사용자 파일 유지");
+        assert_eq!(std::fs::read_to_string(pd2.join(format!("{wc}.new"))).unwrap(), e1,
+                   "[W-cap] 가: vendor 본 .new");
         let pend_c = load_merge_pending(&pd2);
         let ec = pend_c.get(wc).unwrap();
-        assert_eq!(ec["kind"].as_str(), Some("conflicted"), "[W-cap] 원장 conflicted");
+        assert_eq!(ec["kind"].as_str(), Some("user-kept"), "[W-cap] 원장 user-kept");
         assert_eq!(ec["reason"].as_str(), Some("capture-failed"), "[W-cap] reason 토큰");
-        assert_eq!(ec["base_side"].as_str(), Some(format!("{wc}.base").as_str()),
-                   "[W-cap] base_side 포인터");
+        // 나(기동 필수): 종전 폴백 — vendor 본 + .user + .base + 원장 vendor-first{capture-failed}.
+        let wb = "skills/wcb/SKILL.md";
+        {
+            let p = pd2.join(wb);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, ours).unwrap();
+            let pp = pd2.join(PRISTINE_DIR).join(wb);
+            std::fs::create_dir_all(pp.parent().unwrap()).unwrap();
+            std::fs::write(&pp, e_old).unwrap();
+        }
+        std::fs::write(pd2.join(INSTALL_MANIFEST),
+            serde_json::json!({ wb: content_hash(e_old) }).to_string()).unwrap();
+        install_boot_critical(&pd2, &[(wb, e1)], "1.1.0");
+        assert_eq!(std::fs::read_to_string(pd2.join(wb)).unwrap(), e1, "[W-cap] 나: vendor 본 기록");
+        assert_eq!(std::fs::read_to_string(pd2.join(format!("{wb}.user"))).unwrap(), ours,
+                   "[W-cap] 나: .user=사용자본(캡처 실패 시에도 §2 원칙 4 보존)");
+        assert_eq!(std::fs::read_to_string(pd2.join(format!("{wb}.base"))).unwrap(), e_old,
+                   "[W-cap] 나: .base=조상 전문(사후 3-way 재료)");
+        let eb = load_merge_pending(&pd2).get(wb).cloned().unwrap();
+        assert_eq!(eb["kind"].as_str(), Some("vendor-first"), "[W-cap] 나: 원장 vendor-first");
+        assert_eq!(eb["reason"].as_str(), Some("capture-failed"), "[W-cap] 나: reason 토큰");
+        assert_eq!(eb["base_side"].as_str(), Some(format!("{wb}.base").as_str()),
+                   "[W-cap] 나: base_side 포인터");
 
         let _ = std::fs::remove_dir_all(&base_td);
         let _ = std::fs::remove_dir_all(&base2);
@@ -7444,31 +8962,26 @@ mod tests {
         )
         .unwrap();
         // 이중 실패 주입: ①캡처 루트 자리 파일 점유(W-cap 프리미티브 — 캡처 불가) ②<rel>.user
-        // 자리 디렉터리 점유(rename 불가 — .user 백업 불가).
+        // 자리 디렉터리 점유.
         std::fs::write(base.join("pack-captures"), "OCCUPIED").unwrap();
         std::fs::create_dir_all(pd.join(format!("{rel}.user"))).unwrap();
 
+        // ★0.15.0 M11 가(H-RW 재작성 — 종전: 이중 실패 → quarantined): 기동 필수가 아닌 파일은 덮어쓸 일이
+        //   없다 — 캡처 실패면 병합을 시도하지 않고 사용자 파일이 살아 있다(손실 경로 자체가 없다).
         install_from_iter([(rel, e1)], false, "1.1.0", false, None).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(pd.join(rel)).unwrap(),
-            ours,
-            "이중 실패 = 파일 무접촉(vendor 기록 스킵 — 사용자 바이트 소실 경로 봉인)"
-        );
+        assert_eq!(std::fs::read_to_string(pd.join(rel)).unwrap(), ours,
+                   "가: 파일 무접촉(사용자 우선)");
         let mani: std::collections::BTreeMap<String, String> =
             serde_json::from_str(&std::fs::read_to_string(pd.join(INSTALL_MANIFEST)).unwrap())
                 .unwrap();
         assert_eq!(mani.get(rel), Some(&content_hash(e_old)), "manifest 미전진(재스윕 수렴 조건)");
-        assert_eq!(
-            std::fs::read_to_string(pd.join(PRISTINE_DIR).join(rel)).unwrap(),
-            e_old,
-            "pristine 미전진"
-        );
-        let pend = load_merge_pending(&pd);
-        let e = pend.get(rel).unwrap();
-        assert_eq!(e["kind"].as_str(), Some("quarantined"), "원장 quarantined 전이(D11 동형)");
-        assert_eq!(e["reason"].as_str(), Some("user-backup-failed"), "이중 실패 사유 토큰");
-
-        // 회복 후 재스윕 = 동일 Merge3 판정 재도달 → 정상 병합 수렴(침묵 실패 0 · 손실 0).
+        assert_eq!(std::fs::read_to_string(pd.join(PRISTINE_DIR).join(rel)).unwrap(), e_old,
+                   "pristine 미전진");
+        assert!(pd.join(format!("{rel}.user")).is_dir(), "가: .user 자리를 건드리지 않는다");
+        let e = load_merge_pending(&pd).get(rel).cloned().unwrap();
+        assert_eq!(e["kind"].as_str(), Some("user-kept"), "가: 원장 user-kept");
+        assert_eq!(e["reason"].as_str(), Some("capture-failed"), "가: 사유 토큰");
+        // 회복 후 재스윕 = 병합을 다시 시도한다(capture-failed 보관은 재시도 금지 대상이 아니다) → 정상 3-way 수렴.
         std::fs::remove_file(base.join("pack-captures")).unwrap();
         std::fs::remove_dir_all(pd.join(format!("{rel}.user"))).unwrap();
         install_from_iter([(rel, e1)], false, "1.1.0", false, None).unwrap();
@@ -7482,6 +8995,36 @@ mod tests {
             Some("merged"),
             "원장 merged 정규화"
         );
+
+        // 나(기동 필수 · 부록 A-2 #4 '백업이 없으면 덮지 않는다'): 캡처도 .user 백업도 불가능하면 vendor 기록·
+        //   manifest·pristine 전진을 전부 멈추고 격리한다(종전 이중 실패 주입 그대로 — 캡처 루트 파일 점유 +
+        //   `.user` 자리 디렉터리 점유; 설치기는 파일이 아닌 `.user` 를 세대로 옮기지 않는다).
+        std::fs::write(pd.join(rel), ours).unwrap();
+        std::fs::write(pd.join(PRISTINE_DIR).join(rel), e_old).unwrap();
+        std::fs::write(pd.join(INSTALL_MANIFEST),
+            serde_json::json!({ rel: content_hash(e_old) }).to_string()).unwrap();
+        save_merge_pending(&pd, &serde_json::Map::new());
+        let _ = std::fs::remove_dir_all(base.join("pack-captures")); // 가 회복 스윕이 만든 캡처 디렉터리
+        std::fs::write(base.join("pack-captures"), "OCCUPIED").unwrap();
+        std::fs::create_dir_all(pd.join(format!("{rel}.user"))).unwrap();
+        install_boot_critical(&pd, &[(rel, e1)], "1.1.0");
+        assert_eq!(std::fs::read_to_string(pd.join(rel)).unwrap(), ours,
+                   "나: 이중 실패 = 파일 무접촉(vendor 기록 스킵 — 사용자 바이트 소실 경로 봉인)");
+        let mani: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(&std::fs::read_to_string(pd.join(INSTALL_MANIFEST)).unwrap())
+                .unwrap();
+        assert_eq!(mani.get(rel), Some(&content_hash(e_old)), "나: manifest 미전진");
+        assert_eq!(std::fs::read_to_string(pd.join(PRISTINE_DIR).join(rel)).unwrap(), e_old,
+                   "나: pristine 미전진");
+        let e = load_merge_pending(&pd).get(rel).cloned().unwrap();
+        assert_eq!(e["kind"].as_str(), Some("quarantined"), "나: 원장 quarantined 전이(D11 동형)");
+        assert_eq!(e["reason"].as_str(), Some("user-backup-failed"), "나: 이중 실패 사유 토큰");
+        // 회복 후 재스윕 = 동일 Merge3 판정 재도달 → 정상 병합 수렴(침묵 실패 0 · 손실 0).
+        std::fs::remove_file(base.join("pack-captures")).unwrap();
+        std::fs::remove_dir_all(pd.join(format!("{rel}.user"))).unwrap();
+        install_boot_critical(&pd, &[(rel, e1)], "1.1.0");
+        assert_eq!(std::fs::read_to_string(pd.join(rel)).unwrap(),
+                   "head-new\ncommon body\nuser-tail-delta\n", "나: 회복 후 정상 3-way 수렴");
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -7499,6 +9042,14 @@ mod tests {
             serde_json::json!({ rel: content_hash(base) }).to_string(),
         )
         .unwrap();
+    }
+
+    /// ★0.15.0 M11: 기동 필수 이음새로 설치(나 — vendor 본 우선 폴백 기계를 그대로 고정하는 재작성 시험용).
+    fn install_boot_critical(pd: &std::path::Path, items: &[(&str, &str)], version: &str) {
+        let rels: Vec<String> = items.iter().map(|(r, _)| r.to_string()).collect();
+        let src = UpdateSources::none().with_boot_critical(move |r: &str| rels.iter().any(|x| x == r));
+        install_into_with(pd.to_path_buf(), items.iter().copied(), false, version, false, false,
+                          PackScope::Base, None, None, &src).unwrap();
     }
 
     /// 캡처 루트 아래에서 rel 캡처 실물을 찾아 내용 반환(세그먼트 ts-pid 동적 명명 대응).
@@ -7542,19 +9093,36 @@ mod tests {
             crate::merge3::Merge3Outcome::Conflict(_) => panic!("픽스처 전제: clean 병합이어야 함"),
         }
         seed_merge3_shape(&pd, rel, ours, base);
+        // ★0.15.0 M11 가(H-RW 재작성 — 종전: json 게이트 → vendor 본 + .user + .base + conflicted): 게이트 배선은
+        //   그대로 박제하되(손상 병합 차단), 기동 필수가 아닌 파일은 사용자 파일이 살아 있다.
         install_from_iter([(rel, theirs)], false, "1.1.0", false, None).unwrap();
-        assert_eq!(std::fs::read_to_string(pd.join(rel)).unwrap(), theirs,
-            "[json-gate] disk=vendor 보증(healed 폴백)");
-        assert_eq!(std::fs::read_to_string(pd.join(format!("{rel}.user"))).unwrap(), ours,
-            "[json-gate] .user=사용자본 보존");
-        assert_eq!(std::fs::read_to_string(pd.join(format!("{rel}.base"))).unwrap(), base,
-            "[json-gate] .base=조상 보존(사후 3-way 재료)");
-        assert_eq!(find_capture(&base_td.join("caps"), rel).as_deref(), Some(ours),
-            "[json-gate] 캡처 보존(병합 시도 전 원본)");
+        assert_eq!(std::fs::read_to_string(pd.join(rel)).unwrap(), ours,
+            "[json-gate] 가: 파스 불능 병합본은 쓰지 않고 사용자 파일 유지");
+        assert_eq!(std::fs::read_to_string(pd.join(format!("{rel}.new"))).unwrap(), theirs,
+            "[json-gate] 가: vendor 신버전 .new");
+        assert_eq!(find_capture(&base_td.join("caps"), rel), None,
+            "[json-gate] 가: 이번 시도의 병합 전 사본 정리");
         let pend = load_merge_pending(&pd);
         let e = pend.get(rel).unwrap();
-        assert_eq!(e["kind"].as_str(), Some("conflicted"), "[json-gate] 원장 conflicted");
+        assert_eq!(e["kind"].as_str(), Some("user-kept"), "[json-gate] 원장 user-kept");
         assert_eq!(e["reason"].as_str(), Some("json-gate"), "[json-gate] reason 토큰");
+        // 나(기동 필수): 종전 폴백 기계 그대로 — vendor 본 + .user + .base + 캡처 + 원장 vendor-first{json-gate}.
+        let _ = std::fs::remove_dir_all(&pd);
+        std::fs::create_dir_all(&pd).unwrap();
+        seed_merge3_shape(&pd, rel, ours, base);
+        install_boot_critical(&pd, &[(rel, theirs)], "1.1.0");
+        assert_eq!(std::fs::read_to_string(pd.join(rel)).unwrap(), theirs,
+            "[json-gate] 나: disk=vendor 보증");
+        assert_eq!(std::fs::read_to_string(pd.join(format!("{rel}.user"))).unwrap(), ours,
+            "[json-gate] 나: .user=사용자본 보존");
+        assert_eq!(std::fs::read_to_string(pd.join(format!("{rel}.base"))).unwrap(), base,
+            "[json-gate] 나: .base=조상 보존(사후 3-way 재료)");
+        assert_eq!(find_capture(&base_td.join("caps"), rel).as_deref(), Some(ours),
+            "[json-gate] 나: 캡처 보존(병합 시도 전 원본)");
+        let pend = load_merge_pending(&pd);
+        let e = pend.get(rel).unwrap();
+        assert_eq!(e["kind"].as_str(), Some("vendor-first"), "[json-gate] 나: 원장 vendor-first");
+        assert_eq!(e["reason"].as_str(), Some("json-gate"), "[json-gate] 나: reason 토큰");
         let _ = std::fs::remove_dir_all(&base_td);
     }
 
@@ -7577,19 +9145,34 @@ mod tests {
         let theirs = "head-new\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n";
         let ours = "head-old\nl2\nl3\nl4\nl5\n"; // 꼬리 5/10 순삭제(잘림 손상과 문자적 동형)
         seed_merge3_shape(&pd, rel, ours, base);
+        // ★0.15.0 M11 가(H-RW 재작성 — 종전: suspect → vendor 본 + .user + .base + conflicted): 세탁 clean 병합은
+        //   여전히 받아들이지 않되(부록 A-2 #6), 의심은 '덮는 이유'가 아니라 합칠 때의 주의 표시다(설계 §7 2행).
         install_from_iter([(rel, theirs)], false, "1.1.0", false, None).unwrap();
-        assert_eq!(std::fs::read_to_string(pd.join(rel)).unwrap(), theirs,
-            "[suspect] disk=vendor 보증(세탁 clean 병합 차단)");
-        assert_eq!(std::fs::read_to_string(pd.join(format!("{rel}.user"))).unwrap(), ours,
-            "[suspect] .user=사용자본 보존");
-        assert_eq!(std::fs::read_to_string(pd.join(format!("{rel}.base"))).unwrap(), base,
-            "[suspect] .base=조상 보존");
+        assert_eq!(std::fs::read_to_string(pd.join(rel)).unwrap(), ours,
+            "[suspect] 가: 세탁 병합본을 쓰지 않고 사용자 파일 유지");
+        assert_eq!(std::fs::read_to_string(pd.join(format!("{rel}.new"))).unwrap(), theirs);
         let pend = load_merge_pending(&pd);
         let e = pend.get(rel).unwrap();
-        assert_eq!(e["kind"].as_str(), Some("conflicted"), "[suspect] 원장 conflicted");
+        assert_eq!(e["kind"].as_str(), Some("user-kept"), "[suspect] 가: 원장 user-kept");
         let reason = e["reason"].as_str().unwrap_or("");
         assert!(reason.starts_with("suspect:PureDeletionMajority"),
             "[suspect] reason=순삭제 휴리스틱 토큰(실측: {reason})");
+        assert!(e["caution"].as_str().unwrap_or("").starts_with("suspect:PureDeletionMajority"),
+            "[suspect] 가: 주의 표시(caution)");
+        // 나(기동 필수): 종전 폴백 기계 — vendor 본 + .user + .base + 원장 vendor-first{suspect}.
+        let _ = std::fs::remove_dir_all(&pd);
+        std::fs::create_dir_all(&pd).unwrap();
+        seed_merge3_shape(&pd, rel, ours, base);
+        install_boot_critical(&pd, &[(rel, theirs)], "1.1.0");
+        assert_eq!(std::fs::read_to_string(pd.join(rel)).unwrap(), theirs,
+            "[suspect] 나: disk=vendor 보증(세탁 clean 병합 차단)");
+        assert_eq!(std::fs::read_to_string(pd.join(format!("{rel}.user"))).unwrap(), ours,
+            "[suspect] 나: .user=사용자본 보존");
+        assert_eq!(std::fs::read_to_string(pd.join(format!("{rel}.base"))).unwrap(), base,
+            "[suspect] 나: .base=조상 보존");
+        let e = load_merge_pending(&pd).get(rel).cloned().unwrap();
+        assert_eq!(e["kind"].as_str(), Some("vendor-first"), "[suspect] 나: 원장 vendor-first");
+        assert!(e["reason"].as_str().unwrap_or("").starts_with("suspect:PureDeletionMajority"));
         let _ = std::fs::remove_dir_all(&base_td);
     }
 
@@ -7623,40 +9206,70 @@ mod tests {
         let theirs = "head-new\ncommon body\n";
         let ours = "head-old\ncommon body\nuser-tail-delta\n";
         let merged = "head-new\ncommon body\nuser-tail-delta\n";
-        seed_merge3_shape(&pd, rel, ours, base);
-        // 주입(이름 비의존 · 위 머리말 참조) — 결정론으로 pristine 기록만 실패시킨다.
-        #[cfg(unix)]
-        let restore = {
-            use std::os::unix::fs::PermissionsExt;
-            let dir = pd.join(PRISTINE_DIR).join("skills/wpri");
-            let prev = std::fs::metadata(&dir).unwrap().permissions();
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-            (dir, prev)
+        // 주입(이름 비의존 · 위 머리말 참조) — 결정론으로 pristine 기록만 실패시킨다. bc = 기동 필수 이음새.
+        let run_arm = |bc: bool| {
+            let _ = std::fs::remove_dir_all(&pd);
+            std::fs::create_dir_all(&pd).unwrap();
+            seed_merge3_shape(&pd, rel, ours, base);
+            #[cfg(unix)]
+            let restore = {
+                use std::os::unix::fs::PermissionsExt;
+                let dir = pd.join(PRISTINE_DIR).join("skills/wpri");
+                let prev = std::fs::metadata(&dir).unwrap().permissions();
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+                (dir, prev)
+            };
+            #[cfg(not(unix))]
+            let restore = {
+                let f = pd.join(PRISTINE_DIR).join(rel);
+                let prev = std::fs::metadata(&f).unwrap().permissions();
+                let mut ro = prev.clone();
+                ro.set_readonly(true);
+                std::fs::set_permissions(&f, ro).unwrap();
+                (f, prev)
+            };
+            let installed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if bc {
+                    install_boot_critical(&pd, &[(rel, theirs)], "1.1.0");
+                } else {
+                    install_from_iter([(rel, theirs)], false, "1.1.0", false, None).unwrap();
+                }
+            }));
+            // 단언 **전에** 원복한다 — 패닉으로 빠져나가도 읽기전용 잔재가 다음 런을 막지 않게.
+            std::fs::set_permissions(&restore.0, restore.1).unwrap();
+            if let Err(p) = installed {
+                std::panic::resume_unwind(p);
+            }
         };
-        #[cfg(not(unix))]
-        let restore = {
-            let f = pd.join(PRISTINE_DIR).join(rel);
-            let prev = std::fs::metadata(&f).unwrap().permissions();
-            let mut ro = prev.clone();
-            ro.set_readonly(true);
-            std::fs::set_permissions(&f, ro).unwrap();
-            (f, prev)
-        };
-        let installed = install_from_iter([(rel, theirs)], false, "1.1.0", false, None);
-        // 단언 **전에** 원복한다 — 패닉으로 빠져나가도 읽기전용 잔재가 다음 런을 막지 않게.
-        std::fs::set_permissions(&restore.0, restore.1).unwrap();
-        installed.unwrap();
-        assert_eq!(std::fs::read_to_string(pd.join(rel)).unwrap(), theirs,
-            "[pristine-fail] disk=vendor 보증(⑤ 강등 후 공용 레인)");
-        assert_eq!(std::fs::read_to_string(pd.join(format!("{rel}.user"))).unwrap(), merged,
-            "[pristine-fail] .user=병합본(크래시표 2행 정합 — ours 원본은 캡처 보존)");
-        assert_eq!(find_capture(&base_td.join("caps"), rel).as_deref(), Some(ours),
-            "[pristine-fail] 캡처=ours 원본");
+        // ★0.15.0 M11 가(H-RW 재작성 — 종전: "disk=vendor · .user=병합본 · conflicted"): 기동 필수가 아닌 파일은
+        //   pristine 실패로 ④ 를 끝내지 못해도 vendor 본으로 덮지 않는다 — 디스크에는 이미 병합본(사용자 수정 +
+        //   vendor 변경)이 있고 그대로 남는다. pristine 미전진 · 캡처 보존 · 원장 user-kept{pristine-write-failed}.
+        run_arm(false);
+        assert_eq!(std::fs::read_to_string(pd.join(rel)).unwrap(), merged,
+            "[pristine-fail] 가: 디스크 = 병합본(사용자 수정 생존)");
+        assert_eq!(std::fs::read_to_string(pd.join(format!("{rel}.new"))).unwrap(), theirs);
+        assert!(!pd.join(format!("{rel}.user")).exists(), "[pristine-fail] 가: .user 미생성");
         assert_eq!(std::fs::read_to_string(pd.join(PRISTINE_DIR).join(rel)).unwrap(), base,
             "[pristine-fail] pristine 미전진(실패 격리)");
+        let e = load_merge_pending(&pd).get(rel).cloned().unwrap();
+        assert_eq!(e["kind"].as_str(), Some("user-kept"), "[pristine-fail] 가: 원장 user-kept");
+        assert_eq!(e["reason"].as_str(), Some("pristine-write-failed"), "[pristine-fail] reason 토큰");
+        let cap = e["capture"].as_str().expect("[pristine-fail] 가: 캡처 포인터(ours 원본 증거)").to_string();
+        assert_eq!(std::fs::read_to_string(base_td.join("caps").join(cap)).unwrap(), ours,
+            "[pristine-fail] 가: 캡처=ours 원본");
+        // 나(기동 필수): 종전 폴백 기계 — disk=vendor · .user=병합본 · 캡처=ours · pristine 미전진 · vendor-first.
+        run_arm(true);
+        assert_eq!(std::fs::read_to_string(pd.join(rel)).unwrap(), theirs,
+            "[pristine-fail] 나: disk=vendor 보증(⑤ 강등 후 공용 레인)");
+        assert_eq!(std::fs::read_to_string(pd.join(format!("{rel}.user"))).unwrap(), merged,
+            "[pristine-fail] 나: .user=병합본(크래시표 2행 정합 — ours 원본은 캡처 보존)");
+        assert_eq!(find_capture(&base_td.join("caps"), rel).as_deref(), Some(ours),
+            "[pristine-fail] 나: 캡처=ours 원본");
+        assert_eq!(std::fs::read_to_string(pd.join(PRISTINE_DIR).join(rel)).unwrap(), base,
+            "[pristine-fail] 나: pristine 미전진(실패 격리)");
         let pend = load_merge_pending(&pd);
         let e = pend.get(rel).unwrap();
-        assert_eq!(e["kind"].as_str(), Some("conflicted"), "[pristine-fail] 원장 conflicted");
+        assert_eq!(e["kind"].as_str(), Some("vendor-first"), "[pristine-fail] 나: 원장 vendor-first");
         assert_eq!(e["reason"].as_str(), Some("pristine-write-failed"), "[pristine-fail] reason 토큰");
         assert_eq!(e["base_side"].as_str(), Some(format!("{rel}.base").as_str()),
             "[pristine-fail] base_side 포인터");
@@ -7902,7 +9515,16 @@ mod tests {
 
         assert_eq!(read(sys_a), sys_a_c, "①system 비수정 → 임베드로 갱신");
         assert_eq!(read(user_b), "USER-MODIFIED", "②user 수정본 불가침");
-        assert_eq!(read(sys_c), sys_c_c, "③★B2/P0-4: system 매니페스트부재·상이 → 강제 갱신(동결 금지)");
+        // ★0.15.0 M11 가(H-RW 재작성 — 종전: "③★B2/P0-4: system 매니페스트부재·상이 → 강제 갱신(동결 금지)"):
+        //   과거 vendor 본이 아닌 바이트는 사용자 수정이다 → 사용자 파일 유지 + vendor `.new` + 원장 user-kept.
+        //   P0-4(동결 금지)는 과거 vendor 해시 표가 지킨다 — 옛 vendor 바이트는 갱신된다(m11_manifest_missing_* 가 고정).
+        assert_eq!(read(sys_c), "SYS-DRIFT", "③system 매니페스트부재·상이(과거 vendor 아님) → 사용자 파일 유지");
+        assert_eq!(read(&format!("{sys_c}.new")), sys_c_c, "③vendor 신버전은 .new 보관");
+        assert_eq!(
+            load_merge_pending(&td).get(sys_c).and_then(|e| e["kind"].as_str()),
+            Some("user-kept"),
+            "③원장 user-kept"
+        );
         assert_eq!(read(user_d), "USER-CUSTOM", "④user 매니페스트부재·상이 → 보존");
 
         // ⑤ 채택 기록 + 멱등: 재실행이 아무것도 다시 쓰지 않고 user 보존 유지.
@@ -8046,8 +9668,11 @@ mod tests {
             assert_eq!(decide_file_action(rel, embed, true, None, None, false),
                        Write { heal_user_copy: true }, "③system·판독불가·비force → 치유 유지: {rel}");
         }
+        // ★0.15.0 M11 자(이 한 행만 재작성 — 종전: "③system 수정본은 .user 보존 후 치유"): `--force` 는 사용자
+        //   수정을 버리지 않는다(설계 §4-11 자 · 판독 가능한 system 수정본은 user-kept). 위 판독 불가 행(A-2 #3·
+        //   L1)과 ①②④ 는 무수정이다.
         assert_eq!(decide_file_action("alerts-config.json", embed, true, Some("SYS-DRIFT"), None, true),
-                   Write { heal_user_copy: true }, "③system 수정본은 .user 보존 후 치유(종전 동일)");
+                   UserKept { reason: "no-base" }, "③system 수정본 + force → 사용자 파일 유지(자)");
 
         // ④ seed-once 는 종전부터 판독 불가에도 불가침 — 우선순위가 뒤집히지 않았음을 재확인.
         assert_eq!(decide_file_action("memory/MEMORY.md", embed, true, None, None, true), keep,
@@ -8118,10 +9743,15 @@ mod tests {
         assert_eq!(std::fs::read_to_string(pd.join(format!("{readable_user}.new"))).unwrap(),
                    embed_of(readable_user), "②vendor 신버전 .new 병치(종전 동작 불변)");
         // ③ system-owned: 판독 가능/불가 모두 강제 치유 유지(P0-4 마비 없음).
-        assert_eq!(std::fs::read_to_string(pd.join(readable_sys)).unwrap(), embed_of(readable_sys),
-                   "③system 수정본 → 임베드 치유(종전 동작 불변)");
-        assert_eq!(std::fs::read_to_string(pd.join(format!("{readable_sys}.user"))).unwrap(),
-                   "SYS-EDIT-XYZ", "③치유 전 사용자본 .user 보존(종전 동작 불변)");
+        // ★0.15.0 M11 자(이 두 행만 재작성 — 종전: "③system 수정본 → 임베드 치유" · "치유 전 사용자본 .user 보존"):
+        //   `--force` 는 판독 가능한 사용자 수정을 버리지 않는다(설계 §4-11 자). README.md 는 vendor 미전진이라
+        //   kept-drift 로 제자리 보존된다. 판독 불가 system(③ 아래 행 · ③-b)은 가-2 지금 동작 그대로다.
+        assert_eq!(std::fs::read_to_string(pd.join(readable_sys)).unwrap(), "SYS-EDIT-XYZ",
+                   "③system 수정본 + force → 버리지 않는다(자 · vendor 미전진 = kept-drift)");
+        assert!(!pd.join(format!("{readable_sys}.user")).exists(),
+                "③덮지 않았으므로 .user 도 없다");
+        assert_eq!(load_merge_pending(&pd).get(readable_sys).and_then(|e| e["kind"].as_str()),
+                   Some("kept-drift"), "③원장 kept-drift");
         assert_eq!(std::fs::read(pd.join(unreadable_sys)).unwrap(), embed_of(unreadable_sys).as_bytes(),
                    "③system 은 판독 불가여도 치유 — 수리가 Keep 범위를 넓히지 않았다");
         // ★T3(커밋② · D4·D11) ③-b: L1 바이트 백업 사이드카 — CP949 원본 **바이트 왕복**(.user)
@@ -8314,11 +9944,19 @@ mod tests {
             super::decide_file_action("soul.md", embed, false, None, None, false, PackScope::Base, None),
             Write { heal_user_copy: false }
         );
-        // dept 에서 soul 외 파일은 base 등급표 그대로(system 강제 치유 불변).
+        // dept 에서 soul 외 파일은 base 등급표 그대로 — ★0.15.0 M11(H-RW 재작성 — 종전 기대값 "system 강제
+        //   치유"): 그 등급표의 system 수정본 판정은 이제 user-kept(가). 스코프가 판정을 흔들지 않는다는 핀은
+        //   Base 결과와의 동치로 그대로 남긴다.
         assert_eq!(
             super::decide_file_action("bin/x.py", embed, true, Some("HACKED"), None, false, d, None),
-            Write { heal_user_copy: true },
-            "dept 스코프가 system 치유를 흔들면 안 된다"
+            super::decide_file_action("bin/x.py", embed, true, Some("HACKED"), None, false,
+                PackScope::Base, None),
+            "dept 스코프가 system 판정을 흔들면 안 된다"
+        );
+        assert_eq!(
+            super::decide_file_action("bin/x.py", embed, true, Some("HACKED"), None, false, d, None),
+            UserKept { reason: "no-base" },
+            "dept·system 수정본 → 사용자 파일 유지(가)"
         );
     }
 
@@ -8362,13 +10000,24 @@ mod tests {
         assert_eq!(super::decide_file_action("alerts-config.json", embed, true, Some("DRIFT"),
                        Some(e1h.as_str()), false, PackScope::Base, Some("E1")),
                    Merge3, "L3: 벤더 전진+검증 base → Merge3");
+        // ★0.15.0 M11 가(H-RW 재작성 — 종전 L4 기대값 "Write{heal:true}"): L4 는 이제 사용자 우선(user-kept),
+        //   기동 필수면 vendor 우선(vendor-first). 'Merge3 아님' 방어 핀은 그대로다.
         assert_eq!(super::decide_file_action("alerts-config.json", embed, true, Some("DRIFT"),
                        None, false, PackScope::Base, Some("B")),
-                   Write { heal_user_copy: true },
+                   UserKept { reason: "no-base" },
                    "★방어: manifest=None∧base=Some 계약위반 입력 → L4(Merge3 아님)");
         assert_eq!(super::decide_file_action("alerts-config.json", embed, true, Some("DRIFT"),
                        Some(e1h.as_str()), false, PackScope::Base, None),
-                   Write { heal_user_copy: true }, "★base=None: 벤더 전진+base 부재 → L4 치유");
+                   UserKept { reason: "base-unverified" },
+                   "★base=None: 벤더 전진+base 부재 → L4 사용자 우선");
+        let bc = UpdateFacts { boot_critical: true, ..UpdateFacts::default() };
+        assert_eq!(super::decide_file_action_with("alerts-config.json", embed, true, Some("DRIFT"),
+                       Some(e1h.as_str()), false, PackScope::Base, None, &bc),
+                   VendorFirst { reason: "base-unverified" },
+                   "★나: 기동 필수 L4 → vendor 우선");
+        assert_eq!(super::decide_file_action_with("alerts-config.json", embed, true, Some("DRIFT"),
+                       Some(e1h.as_str()), false, PackScope::Base, Some("E1"), &bc),
+                   Merge3, "★나: 기동 필수도 검증 base 가 있으면 먼저 3-way(폴백이 vendor 우선)");
 
         // force 폴백: 판독 불가 heal 개정 + !exists 불변.
         assert_eq!(super::decide_file_action("alerts-config.json", embed, true, None,
@@ -10529,11 +12178,14 @@ mod tests {
         assert_eq!(read(l2), "DEPT-DRIFT-L2\n", "L2 제자리 보존");
         assert!(!dpack.join(format!("{l2}.user")).exists(), "L2 .user 미생성");
         assert_eq!(kind(l2).as_deref(), Some("kept-drift"), "L2 원장 kept-drift");
-        // L3: Merge3 → 3자 상이 충돌 → vendor 본 + .user + .base 조상 + 원장 conflicted.
-        assert_eq!(read(l3), embed_of(l3), "L3 충돌 폴백 = vendor 본");
-        assert_eq!(read(&format!("{l3}.user")), l3_mine, "L3 .user 보존");
-        assert_eq!(read(&format!("{l3}.base")), l3_base, "L3 .base 조상 보존");
-        assert_eq!(kind(l3).as_deref(), Some("conflicted"), "L3 원장 conflicted");
+        // L3: Merge3 → 3자 상이 충돌 → ★0.15.0 M11 가(H-RW 재작성 — 종전: "vendor 본 + .user + .base 조상 +
+        //   원장 conflicted"): 기동 필수가 아닌 파일이라 **사용자 파일이 살아 있고** vendor 신버전은 `.new`,
+        //   원장 user-kept. 이번 시도의 병합 전 사본은 정리된다. (기동 필수 폴백 = vendor 본 + .user + .base +
+        //   vendor-first 는 `m11_boot_critical_merge_conflict_vendor_first_keeps_fallback_mechanics` 가 고정.)
+        assert_eq!(read(l3), l3_mine, "L3 충돌 폴백 = 사용자 파일 유지(가)");
+        assert_eq!(read(&format!("{l3}.new")), embed_of(l3), "L3 vendor 신버전 .new 보관");
+        assert!(!dpack.join(format!("{l3}.user")).exists(), "L3 사용자 우선 — .user 미생성");
+        assert_eq!(kind(l3).as_deref(), Some("user-kept"), "L3 원장 user-kept");
         // L4: base 미검증 — ★0.14.55(C-07 · P3)부터 **제자리 보존 + 보고**다(종전 healed 가 아니다).
         //   근거: HEAD-DISPOSITION-P3-R3.md "What proceeds" 2 — "unknown disk hash -> keep in place +
         //   report (no heal, no .user parking, no Merge3)". 이 파일은 매니페스트 항목이 디스크와도
@@ -11589,4 +13241,1024 @@ mod tests {
         let _ = std::fs::remove_dir_all(pack);
     }
 
+}
+
+/// ★0.15.0 「스스로 해결」 M11 — 업데이트 규칙의 회귀 시험(설계 §4-11 · §6-11 · CONTRACTS C8 · testplan H §6-11).
+/// 각 시험은 그 안전장치를 없애면 적색이 되도록 짰다(통과 조건 H). 임시 팩만 쓰고(라이브 무접촉), 묘비·
+/// 기동 필수·과거 vendor 표는 입력원 이음새(`UpdateSources::with_*`)로 주입한다.
+#[cfg(test)]
+mod m11_tests {
+    use super::*;
+    use crate::repair::tombstones::{Tombstone, TombstoneKind};
+    use crate::repair::types::RepairId;
+
+    fn tomb(rel: &str, repair: &str) -> Tombstone {
+        Tombstone {
+            rel: rel.to_string(),
+            kind: TombstoneKind::File,
+            repair: RepairId::parse(repair).unwrap_or_else(|_| {
+                serde_json::from_value(serde_json::json!(repair)).expect("repair id")
+            }),
+        }
+    }
+
+    fn hook_tomb(event: &str, script: &str, repair: &str) -> Tombstone {
+        Tombstone {
+            rel: format!("settings:{event}:{script}"),
+            kind: TombstoneKind::Hook { event: event.into(), script: script.into() },
+            repair: serde_json::from_value(serde_json::json!(repair)).expect("repair id"),
+        }
+    }
+
+    /// 임시 팩 루트(`<base>/pack`) + 캡처 루트 격리(`CYS_PACK_CAPTURES_DIR`) — 반환된 가드가 살아 있는 동안만.
+    struct Rig {
+        base: PathBuf,
+        pack: PathBuf,
+        _g: std::sync::MutexGuard<'static, ()>,
+        _cap: EnvGuard,
+    }
+
+    impl Rig {
+        fn new(tag: &str) -> Rig {
+            let g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let base = std::env::temp_dir().join(format!(
+                "cys-m11-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&base);
+            let pack = base.join("pack");
+            std::fs::create_dir_all(&pack).unwrap();
+            let cap = EnvGuard::set("CYS_PACK_CAPTURES_DIR", base.join("captures"));
+            Rig { base, pack, _g: g, _cap: cap }
+        }
+        fn write(&self, rel: &str, content: &[u8]) {
+            let p = self.pack.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, content).unwrap();
+        }
+        fn read(&self, rel: &str) -> Option<String> {
+            std::fs::read_to_string(self.pack.join(rel)).ok()
+        }
+        fn manifest(&self, entries: &[(&str, &str)]) {
+            let m: std::collections::BTreeMap<String, String> = entries
+                .iter()
+                .map(|(r, c)| (r.to_string(), content_hash(c)))
+                .collect();
+            std::fs::write(self.pack.join(INSTALL_MANIFEST), serde_json::to_string(&m).unwrap())
+                .unwrap();
+        }
+        fn pristine(&self, rel: &str, content: &str) {
+            let p = self.pack.join(PRISTINE_DIR).join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, content).unwrap();
+        }
+        fn kind(&self, rel: &str) -> Option<String> {
+            load_merge_pending(&self.pack)
+                .get(rel)
+                .and_then(|e| e.get("kind"))
+                .and_then(|k| k.as_str())
+                .map(str::to_string)
+        }
+        fn entry(&self, rel: &str) -> Option<serde_json::Value> {
+            load_merge_pending(&self.pack).get(rel).cloned()
+        }
+        fn install(&self, items: &[(&str, &str)], force: bool, sources: &UpdateSources) {
+            install_into_with(
+                self.pack.clone(),
+                items.iter().copied(),
+                force,
+                "9.9.9",
+                false,
+                false,
+                PackScope::Base,
+                None,
+                None,
+                sources,
+            )
+            .expect("install_into_with");
+        }
+        fn plan(&self, items: &[(&str, &str)], force: bool, sources: &UpdateSources) -> InstallPlan {
+            plan_install_with(&self.pack, items, force, "9.9.9", sources)
+        }
+        fn capture_files(&self) -> usize {
+            let mut n = 0;
+            let mut stack = vec![self.base.join("captures")];
+            while let Some(d) = stack.pop() {
+                let Ok(rd) = std::fs::read_dir(&d) else { continue };
+                for e in rd.flatten() {
+                    if e.path().is_dir() {
+                        stack.push(e.path());
+                    } else {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        }
+    }
+
+    impl Drop for Rig {
+        fn drop(&mut self) {
+            #[cfg(unix)]
+            {
+                // 권한 시험이 남긴 0555 디렉터리도 지울 수 있게.
+                use std::os::unix::fs::PermissionsExt;
+                let mut stack = vec![self.base.clone()];
+                while let Some(d) = stack.pop() {
+                    let _ = std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755));
+                    if let Ok(rd) = std::fs::read_dir(&d) {
+                        for e in rd.flatten() {
+                            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                                stack.push(e.path());
+                            }
+                        }
+                    }
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.base);
+        }
+    }
+
+    fn bc_only(rels: &'static [&'static str]) -> impl Fn(&str) -> bool + Send + Sync + 'static {
+        move |r: &str| rels.contains(&r)
+    }
+
+    /// O-C8-2 순수 분류기 — 입력 갈래 전수(ruled 결과표). 각 행이 계약의 한 문장이다.
+    #[test]
+    fn m11_classify_update_matrix() {
+        use UpdateClass::*;
+        let v = "VENDOR";
+        let d = "DISK";
+        let s = Ownership::System;
+        let u = Ownership::User;
+        // 판독 불가 → 지금 동작(가-2).
+        assert_eq!(classify_update("bin/x.py", s, false, ManifestBase::None, None, v, false, false, false), KeepAsToday);
+        assert_eq!(classify_update("bin/x.py", s, true, ManifestBase::None, Some(d), v, false, false, false), KeepAsToday);
+        // 이미 vendor 본.
+        assert_eq!(classify_update("bin/x.py", s, true, ManifestBase::None, Some(v), v, false, false, true), KeepAsToday);
+        // system: 설치 당시 해시 = 비수정 → 갱신.
+        assert_eq!(classify_update("bin/x.py", s, true, ManifestBase::Some(d), Some(d), v, false, false, true), VendorUpdate);
+        // system: vendor 미전진 → kept-drift(지금 동작).
+        assert_eq!(classify_update("bin/x.py", s, true, ManifestBase::Some(v), Some(d), v, false, false, true), KeepAsToday);
+        // system: 기록 없음/깨짐 + 과거 vendor 본 → 갱신(다 — 사용자 수정 판정 전에 표부터).
+        assert_eq!(classify_update("bin/x.py", s, false, ManifestBase::None, Some(d), v, true, false, true), VendorUpdate);
+        assert_eq!(classify_update("bin/x.py", s, true, ManifestBase::Corrupt, Some(d), v, true, false, true), VendorUpdate);
+        // system: 기록이 있는데 다른 해시 + 과거 vendor 일치 → 표는 기록 부재일 때만(크래시 창 좁힘 보존).
+        assert_eq!(classify_update("bin/x.py", s, false, ManifestBase::Some("OLD"), Some(d), v, true, false, true), UserWins { park_new: true });
+        // system: 그 밖의 수정본 → 가/나.
+        assert_eq!(classify_update("bin/x.py", s, false, ManifestBase::None, Some(d), v, false, false, true), UserWins { park_new: true });
+        assert_eq!(classify_update("bin/x.py", s, true, ManifestBase::None, Some(d), v, false, false, true), VendorFirst { park_user_ts: true });
+        assert_eq!(classify_update("bin/x.py", s, false, ManifestBase::Corrupt, Some(d), v, false, false, true), UserWins { park_new: true });
+        assert_eq!(classify_update("bin/x.py", s, true, ManifestBase::Some("OLD"), Some(d), v, false, false, true), VendorFirst { park_user_ts: true });
+        // 잠금 보안 자산은 이 규칙 밖(L0 지금 동작).
+        assert_eq!(classify_update("trusted-keys.json", s, false, ManifestBase::None, Some(d), v, false, false, true), KeepAsToday);
+        // user-owned: 비수정(기록 해시 일치) → 갱신(바 가드 1).
+        assert_eq!(classify_update("acl.json", u, false, ManifestBase::Some(d), Some(d), v, false, false, true), VendorUpdate);
+        // user-owned: 과거 vendor 본과 같음 → 갱신(가드 1 — 그 파일 자신의 과거 해시).
+        assert_eq!(classify_update("acl.json", u, false, ManifestBase::None, Some(d), v, true, false, true), VendorUpdate);
+        // user-owned: 감사 '내 것 유지'·'되돌림' → 건너뜀(가드 2).
+        assert_eq!(classify_update("acl.json", u, false, ManifestBase::Some(d), Some(d), v, false, true, true), KeepAsToday);
+        // user-owned: 고친 파일 → 지금 동작(.new).
+        assert_eq!(classify_update("acl.json", u, false, ManifestBase::Some("OLD"), Some(d), v, false, false, true), KeepAsToday);
+        // seed-once: 이 규칙 밖.
+        assert_eq!(classify_update("memory/MEMORY.md", Ownership::SeedOnce, true, ManifestBase::None, Some(d), v, true, false, true), KeepAsToday);
+    }
+
+    /// '계획 = 실제'(설계 §6-11 가 결과 모델 5곳 · H-RW-11 의 신 kind 확장): 같은 입력원으로 plan 과 실제 설치가
+    /// 한 파일도 다르지 않다 — 사용자 우선 보관, 기동 필수 vendor 우선, 묘비 부재 유지, 생명줄 복원, 과거 vendor
+    /// 갱신, 바 자동 갱신과 그 가드, 판독 불가 보존·백업.
+    #[test]
+    fn m11_plan_equals_actual_for_update_rules() {
+        let rig = Rig::new("plan");
+        let items: Vec<(&str, &str)> = vec![
+            ("bin/general.py", "VENDOR-GENERAL-2\n"),
+            ("hooks/bootdep.sh", "#!/bin/bash\necho vendor-boot-2\n"),
+            ("bin/tomb.py", "VENDOR-TOMB\n"),
+            ("hooks/session-start.sh", "#!/bin/bash\necho session-start\n"),
+            ("bin/prev.py", "VENDOR-PREV-2\n"),
+            ("acl.json", "{\"rules\": [2]}\n"),
+            ("agents.json", "{\"agents\": 2}\n"),
+            ("bin/cp949.py", "VENDOR-CP949\n"),
+            ("soul.md", "# soul vendor 2 — 헌법\n"),
+            ("bin/new.py", "VENDOR-NEW\n"),
+        ];
+        rig.write("bin/general.py", b"USER-EDIT-GENERAL\n");
+        rig.write("hooks/bootdep.sh", b"#!/bin/bash\necho USER-BOOT\n");
+        rig.write("bin/prev.py", b"OLD-RELEASED-PREV\n");
+        rig.write("acl.json", b"{\"rules\": [1]}\n");
+        rig.write("agents.json", b"{\"agents\": 1}\n");
+        rig.write("bin/cp949.py", &[0xC7, 0xD1, 0xB1, 0xDB, 0x0A]);
+        rig.write("soul.md", &[0xC7, 0xD1, 0x0A]);
+        // bin/tomb.py 와 hooks/session-start.sh 는 부재(둘 다 묘비 — 생명줄은 걸러진다).
+        rig.manifest(&[("acl.json", "{\"rules\": [1]}\n"), ("agents.json", "{\"agents\": 1}\n")]);
+        // 바 가드 2: agents.json 은 사용자가 일부러 옛 버전을 유지했다.
+        append_merge_audit(
+            &rig.pack,
+            &serde_json::json!({"file": "agents.json", "action": "keep-mine", "flags": []}),
+        )
+        .unwrap();
+        let sources = || {
+            UpdateSources::none()
+                .with_tombstones(vec![
+                    tomb("bin/tomb.py", "R-1"),
+                    tomb("hooks/session-start.sh", "R-2"),
+                    hook_tomb("PostToolUse", "pack-guard.sh", "R-3"),
+                ])
+                .with_boot_critical(bc_only(&["hooks/bootdep.sh"]))
+                .with_prev_vendor(|rel: &str| {
+                    if rel == "bin/prev.py" {
+                        vec![content_hash("OLD-RELEASED-PREV\n")]
+                    } else {
+                        Vec::new()
+                    }
+                })
+        };
+        let plan = rig.plan(&items, false, &sources());
+        rig.install(&items, false, &sources());
+        let set = |v: &Vec<String>| v.iter().cloned().collect::<std::collections::BTreeSet<_>>();
+        let bs = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<std::collections::BTreeSet<_>>();
+        // plan 버킷 = 기대 버킷
+        assert_eq!(set(&plan.user_kept), bs(&["bin/general.py"]), "plan user_kept");
+        assert_eq!(set(&plan.vendor_first), bs(&["hooks/bootdep.sh"]), "plan vendor_first");
+        assert_eq!(set(&plan.keep_absent), bs(&["bin/tomb.py"]), "plan keep_absent");
+        assert_eq!(set(&plan.update), bs(&["bin/prev.py", "acl.json"]), "plan update");
+        assert_eq!(set(&plan.create), bs(&["hooks/session-start.sh", "bin/new.py"]), "plan create");
+        assert_eq!(set(&plan.heal), bs(&["bin/cp949.py"]), "plan heal(판독 불가 system)");
+        assert_eq!(set(&plan.merge_new), bs(&["agents.json"]), "plan merge_new(가드 2)");
+        assert_eq!(set(&plan.keep_user), bs(&["soul.md"]), "plan keep_user(판독 불가 user-owned)");
+        // 실제 = plan
+        for r in &plan.user_kept {
+            assert_eq!(rig.kind(r).as_deref(), Some("user-kept"), "{r} 실제 user-kept");
+            assert_eq!(rig.read(&format!("{r}.new")).as_deref(),
+                       items.iter().find(|(x, _)| x == r).map(|(_, c)| *c), "{r} .new = vendor");
+        }
+        assert_eq!(rig.read("bin/general.py").as_deref(), Some("USER-EDIT-GENERAL\n"), "사용자 파일 유지");
+        for r in &plan.vendor_first {
+            assert_eq!(rig.kind(r).as_deref(), Some("vendor-first"), "{r} 실제 vendor-first");
+        }
+        assert_eq!(rig.read("hooks/bootdep.sh").as_deref(), Some("#!/bin/bash\necho vendor-boot-2\n"), "기동 필수 = vendor 먼저");
+        assert_eq!(rig.read("hooks/bootdep.sh.user").as_deref(), Some("#!/bin/bash\necho USER-BOOT\n"), "사용자본 보관");
+        for r in &plan.keep_absent {
+            assert!(!rig.pack.join(r).exists(), "{r} 부재 유지(묘비)");
+        }
+        for r in &plan.update {
+            assert_eq!(rig.read(r).as_deref(), items.iter().find(|(x, _)| x == r).map(|(_, c)| *c), "{r} 갱신");
+            assert!(!rig.pack.join(format!("{r}.user")).exists(), "{r} 사용자 수정이 아니다 — .user 없음");
+        }
+        for r in &plan.create {
+            assert_eq!(rig.read(r).as_deref(), items.iter().find(|(x, _)| x == r).map(|(_, c)| *c), "{r} 생성(생명줄은 묘비 무시)");
+        }
+        assert_eq!(rig.read("bin/cp949.py").as_deref(), Some("VENDOR-CP949\n"), "판독 불가 system → vendor");
+        assert_eq!(std::fs::read(rig.pack.join("bin/cp949.py.user")).unwrap(), vec![0xC7, 0xD1, 0xB1, 0xDB, 0x0A], "바이트 백업");
+        assert_eq!(rig.read("agents.json").as_deref(), Some("{\"agents\": 1}\n"), "가드 2 — 갱신 안 함");
+        assert_eq!(rig.read("agents.json.new").as_deref(), Some("{\"agents\": 2}\n"), "가드 2 — .new");
+        assert_eq!(std::fs::read(rig.pack.join("soul.md")).unwrap(), vec![0xC7, 0xD1, 0x0A], "판독 불가 user-owned 바이트 그대로");
+        // 묘비 파일의 매니페스트 항목은 설치되지 않은 파일이라 지운다.
+        let (m, _) = load_manifest_state(&rig.pack);
+        assert!(!m.contains_key("bin/tomb.py"), "묘비 rel 은 매니페스트에 없다");
+        // 두 번째 스윕 — plan 이 변화 없음과 보관 유지(재시도 금지)를 말하고 실제도 같다.
+        let plan2 = rig.plan(&items, false, &sources());
+        assert_eq!(set(&plan2.user_kept), bs(&["bin/general.py"]), "두 번째도 user-kept(같은 vendor 본 — 다시 합치지 않음)");
+        assert!(plan2.vendor_first.is_empty(), "vendor 우선은 한 번 — 이제 디스크=vendor");
+        assert_eq!(set(&plan2.keep_absent), bs(&["bin/tomb.py"]));
+        rig.install(&items, false, &sources());
+        assert_eq!(rig.kind("hooks/bootdep.sh").as_deref(), Some("vendor-first"), "다시 입히기 대기는 지워지지 않는다");
+    }
+
+    /// 가: 보관 중인 항목은 매 업데이트·점검마다 다시 합치지 않는다 — 두 번째 스윕은 병합 전 사본을 만들지 않고,
+    /// 첫 스윕의 사본은 정리된다(사용자본이 살아 있어 지킬 것이 없다). 설치 기록은 앞당기지 않는다.
+    #[test]
+    fn m11_user_kept_second_sweep_no_new_capture_and_manifest_not_advanced() {
+        let rig = Rig::new("retry");
+        let base = "line1\nline2\nline3\n";
+        let mine = "line1\nMINE\nline3\n";
+        let vendor = "line1\nVENDOR\nline3\n"; // 같은 줄 → 충돌
+        let items = [("bin/conf.py", vendor)];
+        rig.write("bin/conf.py", mine.as_bytes());
+        rig.manifest(&[("bin/conf.py", base)]);
+        rig.pristine("bin/conf.py", base);
+        let src = UpdateSources::none();
+        rig.install(&items, false, &src);
+        assert_eq!(rig.read("bin/conf.py").as_deref(), Some(mine), "사용자 파일 유지");
+        assert_eq!(rig.kind("bin/conf.py").as_deref(), Some("user-kept"));
+        assert_eq!(rig.entry("bin/conf.py").unwrap()["reason"], "merge-conflict");
+        assert_eq!(rig.capture_files(), 0, "병합 전 사본 정리");
+        let (m, _) = load_manifest_state(&rig.pack);
+        assert_eq!(m.get("bin/conf.py"), Some(&content_hash(base)), "설치 기록을 앞당기지 않는다(앞당기면 '안정'으로 분류돼 다시 알리지 않는다)");
+        let before = std::fs::read_to_string(rig.pack.join(MERGE_PENDING_FILE)).unwrap();
+        rig.install(&items, false, &src);
+        assert_eq!(rig.capture_files(), 0, "두 번째 스윕은 병합 전 사본을 만들지 않는다");
+        assert_eq!(std::fs::read_to_string(rig.pack.join(MERGE_PENDING_FILE)).unwrap(), before, "원장 무변경(재시도 없음 · rewrite 0)");
+        assert_eq!(rig.read("bin/conf.py").as_deref(), Some(mine));
+        // vendor 가 다시 전진하면 그 새 본으로 .new 갱신(새 vendor 본에 한 번은 다시 합쳐 본다).
+        let vendor3 = "line1\nVENDOR3\nline3\n";
+        rig.install(&[("bin/conf.py", vendor3)], false, &src);
+        assert_eq!(rig.read("bin/conf.py.new").as_deref(), Some(vendor3));
+        assert_eq!(rig.read("bin/conf.py").as_deref(), Some(mine));
+        assert_eq!(rig.capture_files(), 0);
+    }
+
+    /// 나 + 사: 기동 필수 파일이 두 번 밀려나도 첫 수정본이 덮이지 않는다(.user + .user.prev-<시각>).
+    #[test]
+    fn m11_vendor_first_parks_user_with_generations() {
+        let rig = Rig::new("gen");
+        let src = || UpdateSources::none().with_boot_critical(bc_only(&["hooks/inject.sh"]));
+        rig.write("hooks/inject.sh", b"#!/bin/bash\necho USER-A\n");
+        rig.install(&[("hooks/inject.sh", "#!/bin/bash\necho V1\n")], false, &src());
+        assert_eq!(rig.read("hooks/inject.sh").as_deref(), Some("#!/bin/bash\necho V1\n"));
+        assert_eq!(rig.kind("hooks/inject.sh").as_deref(), Some("vendor-first"));
+        assert!(rig.entry("hooks/inject.sh").unwrap().get("parked_at").is_some(), "보관 시각 기록");
+        rig.write("hooks/inject.sh", b"#!/bin/bash\necho USER-B\n");
+        rig.install(&[("hooks/inject.sh", "#!/bin/bash\necho V2\n")], false, &src());
+        assert_eq!(rig.read("hooks/inject.sh").as_deref(), Some("#!/bin/bash\necho V2\n"));
+        assert_eq!(rig.read("hooks/inject.sh.user").as_deref(), Some("#!/bin/bash\necho USER-B\n"));
+        let prev: Vec<_> = std::fs::read_dir(rig.pack.join("hooks"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("inject.sh.user.prev-"))
+            .collect();
+        assert_eq!(prev.len(), 1, "첫 수정본 세대 1개");
+        assert_eq!(std::fs::read_to_string(prev[0].path()).unwrap(), "#!/bin/bash\necho USER-A\n", "A 가 B 로 덮이지 않았다");
+    }
+
+    /// 부록 A-2 #4(백업이 없으면 덮지 않는다): 기동 필수 파일의 사용자본을 보관할 수 없으면 vendor 본을 쓰지 않고 격리.
+    #[cfg(unix)]
+    #[test]
+    fn m11_vendor_first_backup_failure_quarantines() {
+        use std::os::unix::fs::PermissionsExt;
+        let rig = Rig::new("bkfail");
+        let src = UpdateSources::none().with_boot_critical(bc_only(&["hooks/only.sh"]));
+        rig.write("hooks/only.sh", b"#!/bin/bash\necho USER\n");
+        std::fs::set_permissions(rig.pack.join("hooks"), std::fs::Permissions::from_mode(0o555)).unwrap();
+        rig.install(&[("hooks/only.sh", "#!/bin/bash\necho VENDOR\n")], false, &src);
+        std::fs::set_permissions(rig.pack.join("hooks"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(rig.read("hooks/only.sh").as_deref(), Some("#!/bin/bash\necho USER\n"), "사본 없이 덮지 않는다");
+        assert_eq!(rig.kind("hooks/only.sh").as_deref(), Some("quarantined"));
+    }
+
+    /// 마: 묘비가 있는 삭제만 유지되고, 묘비가 없으면(또는 풀리면) 지금처럼 돌아온다. 생명줄 여섯은 묘비를 무시하고
+    /// 언제나 되살아난다(F2/F3). 훅 묘비는 파일 경로를 걷는 판정이 종류로 건너뛴다(W3(b)).
+    #[test]
+    fn m11_tombstones_files_only_lifelines_always_restored() {
+        let rig = Rig::new("tomb");
+        let mut items: Vec<(String, String)> = vec![("bin/gone.py".into(), "V\n".into())];
+        for h in crate::repair::boot_critical::LIFELINE_HOOKS {
+            items.push((format!("hooks/{h}"), format!("#!/bin/bash\necho {h}\n")));
+        }
+        let items_ref: Vec<(&str, &str)> = items.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let mut ts = vec![tomb("bin/gone.py", "R-7"), hook_tomb("PostToolUse", "pack-guard.sh", "R-8")];
+        for h in crate::repair::boot_critical::LIFELINE_HOOKS {
+            ts.push(tomb(&format!("hooks/{h}"), "R-9"));
+            ts.push(hook_tomb("SessionStart", h, "R-9"));
+        }
+        let with = UpdateSources::none().with_tombstones(ts);
+        assert_eq!(with.authorised_absent(), ["bin/gone.py".to_string()].into_iter().collect(),
+                   "허가된 부재 = 생명줄이 아닌 파일 묘비뿐(훅 묘비·생명줄 묘비는 걸러진다)");
+        rig.install(&items_ref, false, &with);
+        assert!(!rig.pack.join("bin/gone.py").exists(), "기록된 삭제 유지");
+        for h in crate::repair::boot_critical::LIFELINE_HOOKS {
+            assert!(rig.pack.join("hooks").join(h).is_file(), "생명줄 {h} 은 묘비가 있어도 되살린다");
+        }
+        // 묘비가 없으면(되돌림 뒤) 지금처럼 되살아난다.
+        rig.install(&items_ref, false, &UpdateSources::none());
+        assert_eq!(rig.read("bin/gone.py").as_deref(), Some("V\n"), "묘비 없음 = 지금 동작(되살림)");
+        // 묘비 없는 부재(편집기로 지움)는 돌아온다.
+        std::fs::remove_file(rig.pack.join("bin/gone.py")).unwrap();
+        rig.install(&items_ref, false, &UpdateSources::none());
+        assert_eq!(rig.read("bin/gone.py").as_deref(), Some("V\n"), "기록 없는 삭제는 되살린다");
+    }
+
+    /// 부록 A-2 #2: 문서화된 초기화('지운 뒤 init-pack')는 묘비 없이 그대로 동작하고, seed-once 는 덮지 않는다.
+    #[test]
+    fn m11_seed_once_documented_reset_still_reseeds() {
+        let rig = Rig::new("seed");
+        let items = [("memory/MEMORY.md", "SEED\n")];
+        rig.write("memory/MEMORY.md", b"MY MEMORY\n");
+        rig.install(&items, true, &UpdateSources::none());
+        assert_eq!(rig.read("memory/MEMORY.md").as_deref(), Some("MY MEMORY\n"), "seed-once 불가침(force 여도)");
+        std::fs::remove_file(rig.pack.join("memory/MEMORY.md")).unwrap();
+        rig.install(&items, false, &UpdateSources::none());
+        assert_eq!(rig.read("memory/MEMORY.md").as_deref(), Some("SEED\n"), "지운 뒤 init-pack = 다시 심김");
+        std::fs::remove_file(rig.pack.join("memory/MEMORY.md")).unwrap();
+        rig.install(&items, false, &UpdateSources::none().with_tombstones(vec![tomb("memory/MEMORY.md", "R-4")]));
+        assert!(!rig.pack.join("memory/MEMORY.md").exists(), "묘비가 있으면 부재 유지(명시 기록만)");
+    }
+
+    /// 마 + 부록 A-2 #13: 준비본 존재 검사는 허가된 부재와 덜 만들어진 준비본을 구분한다.
+    #[test]
+    fn m11_verify_staging_authorised_absence_vs_half_built() {
+        let rig = Rig::new("staging");
+        rig.write("a.txt", b"A");
+        let items = [("a.txt", "A"), ("b.txt", "B")];
+        let none = std::collections::BTreeSet::new();
+        assert!(verify_staging_with(&rig.pack, &items, &none).is_err(), "b.txt 누락 = 덜 만들어진 준비본");
+        assert!(verify_staging(&rig.pack, &items).is_err(), "옛 이름도 같은 판정");
+        let ok: std::collections::BTreeSet<String> = ["b.txt".to_string()].into_iter().collect();
+        assert!(verify_staging_with(&rig.pack, &items, &ok).is_ok(), "묘비가 부재를 유지하는 b.txt = 허가된 부재");
+        let other: std::collections::BTreeSet<String> = ["c.txt".to_string()].into_iter().collect();
+        assert!(verify_staging_with(&rig.pack, &items, &other).is_err(), "다른 파일의 허가로 누락을 덮지 않는다");
+    }
+
+    /// 마(실행 권한은 언제나 되살린다 — 부록 A-2 #7): 사용자 우선으로 남은 셸 스크립트도, 설치기가 방금 만든 0644 도
+    /// 사용자의 뜻으로 읽지 않는다.
+    #[cfg(unix)]
+    #[test]
+    fn m11_exec_bits_restored_even_on_user_kept() {
+        use std::os::unix::fs::PermissionsExt;
+        let rig = Rig::new("exec");
+        rig.write("bin/tool.sh", b"#!/bin/bash\necho MINE\n");
+        std::fs::set_permissions(rig.pack.join("bin/tool.sh"), std::fs::Permissions::from_mode(0o644)).unwrap();
+        rig.install(&[("bin/tool.sh", "#!/bin/bash\necho VENDOR\n"), ("bin/fresh.sh", "#!/bin/sh\n:\n")], false, &UpdateSources::none());
+        assert_eq!(rig.kind("bin/tool.sh").as_deref(), Some("user-kept"));
+        assert_eq!(current_mode(&rig.pack.join("bin/tool.sh")), Some(0o755), "사용자 우선 파일도 실행 권한 복원");
+        assert_eq!(current_mode(&rig.pack.join("bin/fresh.sh")), Some(0o755), "새로 쓴 파일 0755");
+    }
+
+    /// 앱 온보딩 조건(`src-tauri needs_gui_onboard`)은 각성 훅만 본다 — 그 둘이 생명줄이라 묘비가 결코 닿지 않는다.
+    #[test]
+    fn m11_awakening_hooks_are_lifelines() {
+        for h in AWAKENING_HOOKS {
+            assert!(crate::repair::boot_critical::LIFELINE_HOOKS.contains(&h.script),
+                    "각성 훅 {} 이 생명줄이 아니다 — 앱 온보딩이 묘비를 만날 수 있다", h.script);
+            assert!(is_lifeline_rel(&format!("hooks/{}", h.script)));
+        }
+    }
+
+    /// 자: `init-pack --force` 는 사용자 수정을 버리지 않는다(일반 = 사용자 우선, 기동 필수 = vendor 우선 + 보관).
+    #[test]
+    fn m11_force_never_discards_user_edit() {
+        let rig = Rig::new("force");
+        rig.write("bin/a.py", b"MINE-A\n");
+        rig.write("hooks/b.sh", b"#!/bin/bash\necho MINE-B\n");
+        let src = UpdateSources::none().with_boot_critical(bc_only(&["hooks/b.sh"]));
+        rig.install(&[("bin/a.py", "VENDOR-A\n"), ("hooks/b.sh", "#!/bin/bash\necho VENDOR-B\n")], true, &src);
+        assert_eq!(rig.read("bin/a.py").as_deref(), Some("MINE-A\n"), "force 여도 사용자 파일 유지");
+        assert_eq!(rig.read("bin/a.py.new").as_deref(), Some("VENDOR-A\n"));
+        assert_eq!(rig.read("hooks/b.sh.user").as_deref(), Some("#!/bin/bash\necho MINE-B\n"), "기동 필수도 사용자본 보관");
+    }
+
+    /// 가-2 + 사: 판독 불가(CP949) system 파일은 지금처럼 바이트 백업 뒤 vendor 본이되, 두 번 밀려나도 첫 백업이 남는다.
+    #[test]
+    fn m11_cp949_system_backup_generations() {
+        let rig = Rig::new("cp949");
+        let items = [("bin/doc.py", "VENDOR\n")];
+        rig.write("bin/doc.py", &[0xB0, 0xA1, 0x41, 0x0A]);
+        rig.install(&items, false, &UpdateSources::none());
+        rig.write("bin/doc.py", &[0xB0, 0xA1, 0x42, 0x0A]);
+        rig.install(&items, false, &UpdateSources::none());
+        assert_eq!(std::fs::read(rig.pack.join("bin/doc.py.user")).unwrap(), vec![0xB0, 0xA1, 0x42, 0x0A], "B 백업");
+        let prev: Vec<_> = std::fs::read_dir(rig.pack.join("bin")).unwrap().flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("doc.py.user.prev-")).collect();
+        assert_eq!(prev.len(), 1);
+        assert_eq!(std::fs::read(prev[0].path()).unwrap(), vec![0xB0, 0xA1, 0x41, 0x0A], "A 백업이 덮이지 않았다");
+        assert_eq!(rig.read("bin/doc.py").as_deref(), Some("VENDOR\n"));
+    }
+
+    /// 다(부록 A-2 #1): 설치 기록이 없거나 깨져도, 과거 vendor 본과 같은 바이트는 사용자 수정이 아니다 → 갱신.
+    /// 표에 없는 바이트만 사용자 우선으로 보존된다.
+    #[test]
+    fn m11_manifest_missing_or_corrupt_consults_prev_table_first() {
+        for corrupt in [false, true] {
+            let rig = Rig::new(if corrupt { "corrupt" } else { "missing" });
+            rig.write("bin/old.py", b"RELEASED-0.14.9\n");
+            rig.write("bin/mine.py", b"MY EDIT\n");
+            if corrupt {
+                std::fs::write(rig.pack.join(INSTALL_MANIFEST), b"{ not json").unwrap();
+            }
+            let src = UpdateSources::none().with_prev_vendor(|rel: &str| {
+                if rel == "bin/old.py" { vec![content_hash("RELEASED-0.14.9\n")] } else { Vec::new() }
+            });
+            rig.install(&[("bin/old.py", "VENDOR-NOW\n"), ("bin/mine.py", "VENDOR-MINE\n")], false, &src);
+            assert_eq!(rig.read("bin/old.py").as_deref(), Some("VENDOR-NOW\n"), "옛 vendor 본 → 갱신(corrupt={corrupt})");
+            assert!(!rig.pack.join("bin/old.py.user").exists(), "사용자 수정이 아니다 — .user 없음");
+            assert_eq!(rig.read("bin/mine.py").as_deref(), Some("MY EDIT\n"), "표에 없는 바이트 = 사용자 수정 보존");
+            let reason = rig.entry("bin/mine.py").unwrap()["reason"].as_str().unwrap().to_string();
+            assert_eq!(reason, if corrupt { "manifest-corrupt" } else { "no-base" });
+        }
+    }
+
+    /// 바: 한 번도 고치지 않은 사용자 소유 파일은 새 버전으로 — 가드 넷(그 파일만 대조 · 감사 유지 · 규칙 문서 인수
+    /// 검사 · CEO 승격 중 MASTER)과 부서 재작성 파일 제외. 각 가드를 빼면 해당 단언이 적색이 된다.
+    #[test]
+    fn m11_never_edited_user_owned_auto_update_and_four_guards() {
+        let rig = Rig::new("bau");
+        let old_acl = "{\"a\":1}\n";
+        let old_sched = "{\"jobs\":[]}\n";
+        let old_dir = "# W\nautopilot denylist 헌법\n";
+        let new_dir_drops = "# W\n(안전 조항 없음)\n"; // 인수 검사 실패
+        let old_master = "# M\nautopilot denylist\n";
+        let old_sched_kept = "{\"jobs\":[1]}\n";
+        rig.write("acl.json", old_acl.as_bytes());
+        rig.write("agents.json", b"{\"x\":0}\n"); // 과거 vendor 본(표 일치)
+        rig.write("schedule.json", old_sched_kept.as_bytes());
+        rig.write("directives/WORKER_DIRECTIVE.md", old_dir.as_bytes());
+        rig.write("directives/MASTER_DIRECTIVE.md", old_master.as_bytes());
+        rig.write("directives/MASTER_DIRECTIVE.md.pre-ceo", b"backup");
+        rig.manifest(&[
+            ("acl.json", old_acl),
+            ("schedule.json", old_sched_kept),
+            ("directives/WORKER_DIRECTIVE.md", old_dir),
+            ("directives/MASTER_DIRECTIVE.md", old_master),
+        ]);
+        append_merge_audit(&rig.pack, &serde_json::json!({"file": "schedule.json", "action": "rollback", "flags": []})).unwrap();
+        // 거부 기록은 사용자의 선택이 아니다(가드 2 가 세지 않는다).
+        append_merge_audit(&rig.pack, &serde_json::json!({"file": "acl.json", "action": "keep-mine", "flags": ["refused"]})).unwrap();
+        let src = UpdateSources::none().with_prev_vendor(|rel: &str| {
+            if rel == "agents.json" { vec![content_hash("{\"x\":0}\n")] } else { Vec::new() }
+        });
+        let items = [
+            ("acl.json", "{\"a\":2}\n"),
+            ("agents.json", "{\"x\":9}\n"),
+            ("schedule.json", old_sched),
+            ("directives/WORKER_DIRECTIVE.md", new_dir_drops),
+            ("directives/MASTER_DIRECTIVE.md", "# M\nautopilot denylist v2\n"),
+        ];
+        rig.install(&items, false, &src);
+        assert_eq!(rig.read("acl.json").as_deref(), Some("{\"a\":2}\n"), "가드 1: 설치 기록 해시 일치 → 갱신");
+        assert_eq!(rig.read("agents.json").as_deref(), Some("{\"x\":9}\n"), "가드 1: 그 파일의 과거 vendor 본 → 갱신");
+        assert_eq!(rig.read("schedule.json").as_deref(), Some(old_sched_kept), "가드 2: '되돌림' 기록 → 건너뜀");
+        assert_eq!(rig.read("directives/WORKER_DIRECTIVE.md").as_deref(), Some(old_dir), "가드 3: 안전 조항을 잃는 새 규칙 문서는 바꾸지 않는다");
+        assert_eq!(rig.read("directives/WORKER_DIRECTIVE.md.new").as_deref(), Some(new_dir_drops), "가드 3 실패 → .new");
+        assert_eq!(rig.read("directives/MASTER_DIRECTIVE.md").as_deref(), Some(old_master), "가드 4: CEO 승격 중 MASTER 건너뜀");
+        // 부서: agents.json·acl.json·schedule.json 은 cys-dept 가 다시 쓴다 — 이 규칙에 걸리지 않는다.
+        let f = UpdateFacts { prev_vendor_match: true, ..UpdateFacts::default() };
+        assert_eq!(
+            decide_file_action_with("acl.json", "{\"a\":2}\n", true, Some(old_acl), Some(content_hash(old_acl).as_str()), false, PackScope::Dept, None, &f),
+            FileAction::Keep { adopt_hash: false, new_pending: true },
+            "부서 acl.json 은 자동 갱신하지 않는다"
+        );
+        // 규칙 문서도 인수 검사를 통과하면 갱신된다(가드 3 이 무조건 거부가 아님).
+        let ok = UpdateFacts { takeover_ok: true, ..UpdateFacts::default() };
+        assert_eq!(
+            decide_file_action_with("directives/WORKER_DIRECTIVE.md", "new", true, Some(old_dir), Some(content_hash(old_dir).as_str()), false, PackScope::Base, None, &ok),
+            FileAction::Write { heal_user_copy: false }
+        );
+    }
+
+    /// 라 + TESTPLAN Q-C4: 줄바꿈만 다른 사용자본(CRLF)은 맞춘 뒤 합치고 결과는 사용자의 CRLF 를 지킨다. 셸 스크립트는
+    /// 합친 결과·보존 결과 모두 CR 이 없다(부록 A-2 #16 · A-3 #9).
+    #[test]
+    fn m11_line_endings_crlf_text_and_lf_shell() {
+        let rig = Rig::new("eol");
+        let base = "a\nb\nc\nd\ne\n";
+        let vendor = "a\nb\nc\nd\nE-VENDOR\n";
+        rig.write("skills/x/SKILL.md", b"A-USER\r\nb\r\nc\r\nd\r\ne\r\n");
+        rig.write("skills/x/run.sh", b"A-USER\r\nb\r\nc\r\nd\r\ne\r\n");
+        rig.write("hooks/clash.sh", b"#!/bin/bash\r\necho MINE\r\n");
+        rig.manifest(&[("skills/x/SKILL.md", base), ("skills/x/run.sh", base), ("hooks/clash.sh", "#!/bin/bash\necho old\n")]);
+        rig.pristine("skills/x/SKILL.md", base);
+        rig.pristine("skills/x/run.sh", base);
+        rig.pristine("hooks/clash.sh", "#!/bin/bash\necho old\n");
+        rig.install(&[("skills/x/SKILL.md", vendor), ("skills/x/run.sh", vendor), ("hooks/clash.sh", "#!/bin/bash\necho vendor\n")], false, &UpdateSources::none());
+        assert_eq!(rig.read("skills/x/SKILL.md").as_deref(), Some("A-USER\r\nb\r\nc\r\nd\r\nE-VENDOR\r\n"), "텍스트: 두 수정 모두 + 사용자 CRLF 유지");
+        assert_eq!(rig.read("skills/x/run.sh").as_deref(), Some("A-USER\nb\nc\nd\nE-VENDOR\n"), "셸: 합친 결과는 LF");
+        assert_eq!(rig.kind("hooks/clash.sh").as_deref(), Some("user-kept"), "같은 줄 충돌 → 사용자 우선");
+        assert_eq!(rig.read("hooks/clash.sh").as_deref(), Some("#!/bin/bash\necho MINE\n"), "셸 보존 결과에도 CR 없음");
+        assert!(!std::fs::read(rig.pack.join("hooks/clash.sh")).unwrap().contains(&b'\r'));
+    }
+
+    /// 부록 A-2 #6(손상 의심 검사): 의심 병합은 받아들이지 않고 사용자 파일을 살린다 — 표시는 덮는 이유가 아니라
+    /// 합칠 때의 주의(caution).
+    #[test]
+    fn m11_suspect_merge_keeps_user_file_with_caution() {
+        let rig = Rig::new("suspect");
+        let base: String = (0..20).map(|i| format!("line {i}\n")).collect();
+        // 사용자본 = 앞 10줄만(뒤 10줄 삭제 — 삭제 위주 50%), vendor = 첫 줄만 변경 → 깨끗하게 합쳐지지만 의심.
+        let mine: String = (0..10).map(|i| format!("line {i}\n")).collect();
+        let mine = mine.as_str();
+        let vendor = base.replacen("line 0\n", "line 0 vendor\n", 1);
+        rig.write("bin/s.py", mine.as_bytes());
+        rig.manifest(&[("bin/s.py", base.as_str())]);
+        rig.pristine("bin/s.py", &base);
+        rig.install(&[("bin/s.py", vendor.as_str())], false, &UpdateSources::none());
+        assert_eq!(rig.read("bin/s.py").as_deref(), Some(mine), "의심 병합 → 사용자 파일 유지");
+        let e = rig.entry("bin/s.py").unwrap();
+        assert_eq!(e["kind"], "user-kept");
+        assert!(e["caution"].as_str().unwrap_or("").starts_with("suspect:"), "caution 표시: {e}");
+    }
+
+    /// 나(기동 필수 병합 충돌)의 폴백 기계 — vendor 본 + `.user`(이전 세대 보존) + `.base` 조상 + 원장 vendor-first.
+    #[test]
+    fn m11_boot_critical_merge_conflict_vendor_first_keeps_fallback_mechanics() {
+        let rig = Rig::new("bcmerge");
+        let base = "#!/bin/bash\nx\n";
+        let mine = "#!/bin/bash\nMINE\n";
+        let vendor = "#!/bin/bash\nVENDOR\n";
+        rig.write("hooks/h.sh", mine.as_bytes());
+        rig.manifest(&[("hooks/h.sh", base)]);
+        rig.pristine("hooks/h.sh", base);
+        rig.install(&[("hooks/h.sh", vendor)], false, &UpdateSources::none().with_boot_critical(bc_only(&["hooks/h.sh"])));
+        assert_eq!(rig.read("hooks/h.sh").as_deref(), Some(vendor), "vendor 본 먼저");
+        assert_eq!(rig.read("hooks/h.sh.user").as_deref(), Some(mine));
+        assert_eq!(rig.read("hooks/h.sh.base").as_deref(), Some(base));
+        let e = rig.entry("hooks/h.sh").unwrap();
+        assert_eq!(e["kind"], "vendor-first");
+        assert_eq!(e["reason"], "merge-conflict");
+        assert!(e.get("parked_at").is_some());
+    }
+
+    /// 아 + RULINGS AC1·AC4: 업데이트 전 스냅샷 — 버전이 바뀔 때만, **이번 설치가 덮거나 지울 파일만**(변하지 않는 파일·
+    /// 사용자 파일 유지·seed-once 제외), 각 항목에 출시본 여부를 기록하고, 복원은 전부 검증한 뒤에만 쓴다(하나라도
+    /// 어긋나면 아무것도 쓰지 않는다). system 파일은 출시본일 때만 되돌리고, 전체 복원은 user 소유를 되돌리지 않는다.
+    /// ★r2 재작성(종전: 매니페스트 항목 전부를 담는다고 단언 — RULINGS AC4 가 그 범위를 '덮거나 지울 파일'로 좁혔다).
+    #[test]
+    fn m11_update_snapshot_create_and_restore_contract() {
+        let rig = Rig::new("snap");
+        let root = rig.base.join("snapshots");
+        let a1 = "#!/bin/bash\necho A1\n";
+        rig.write("bin/a.sh", a1.as_bytes()); // system · 비수정 · vendor 전진 → 덮는다(출시본)
+        rig.write("agents.json", b"{\"a\":1}\n"); // user · 비수정 · vendor 전진 → 자동 갱신으로 덮는다(출시본)
+        rig.write("bin/b.py", b"B\n"); // system · 변화 없음 → 담지 않는다
+        rig.write("bin/c.py", b"MINE\n"); // system · 사용자 수정 · 조상 없음 → 사용자 파일 유지(덮지 않음) → 담지 않는다
+        rig.write("memory/MEMORY.md", b"STATE\n"); // seed-once → 담지 않는다
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(rig.pack.join("bin/a.sh"), std::fs::Permissions::from_mode(0o750)).unwrap();
+            // 새로 만들 자리에 놓인 (끊긴) 링크 — 쓰기가 링크를 파일로 바꾸므로 담는다(출시본 아님).
+            std::os::unix::fs::symlink("/nonexistent/target", rig.pack.join("bin/link")).unwrap();
+        }
+        let manifest_v1 = [("bin/a.sh", a1), ("agents.json", "{\"a\":1}\n"), ("bin/b.py", "B\n"),
+                           ("bin/c.py", "C1\n"), ("memory/MEMORY.md", "STATE\n")];
+        rig.manifest(&manifest_v1);
+        let items = [("bin/a.sh", "#!/bin/bash\necho A2\n"), ("agents.json", "{\"a\":2}\n"), ("bin/b.py", "B\n"),
+                     ("bin/c.py", "C2\n"), ("memory/MEMORY.md", "SEED\n"), ("bin/link", "#!/bin/sh\nnew\n")];
+        let src = UpdateSources::none().with_snapshot("base", root.clone());
+        std::fs::write(rig.pack.join(PACK_VERSION_FILE), "9.9.9").unwrap();
+        rig.install(&items, false, &src);
+        assert!(newest_update_snapshot(&root, "base").is_none(), "같은 버전이면 스냅샷을 만들지 않는다");
+        // 업데이트 상황으로 되돌린다(버전 1.0.0 · 같은 디스크 바이트).
+        std::fs::write(rig.pack.join(PACK_VERSION_FILE), "1.0.0").unwrap();
+        rig.write("bin/a.sh", a1.as_bytes());
+        rig.write("agents.json", b"{\"a\":1}\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(rig.pack.join("bin/a.sh"), std::fs::Permissions::from_mode(0o750)).unwrap();
+            let _ = std::fs::remove_file(rig.pack.join("bin/link"));
+            std::os::unix::fs::symlink("/nonexistent/target", rig.pack.join("bin/link")).unwrap();
+        }
+        rig.manifest(&manifest_v1);
+        let _ = std::fs::remove_file(rig.pack.join(MERGE_PENDING_FILE));
+        rig.install(&items, false, &src);
+        let snap = newest_update_snapshot(&root, "base").expect("버전이 바뀌면 스냅샷");
+        let meta = read_update_snapshot_meta(&snap).unwrap();
+        assert_eq!(meta.pack_version, "1.0.0");
+        assert_eq!(meta.lane_key, "base");
+        let mut rels: Vec<&str> = meta.files.iter().map(|f| f.rel.as_str()).collect();
+        rels.sort();
+        #[cfg(unix)]
+        assert_eq!(rels, vec!["agents.json", "bin/a.sh", "bin/link"], "덮거나 지울 파일만 — 변화 없음·사용자 파일 유지·seed-once 는 없다");
+        #[cfg(not(unix))]
+        assert_eq!(rels, vec!["agents.json", "bin/a.sh"]);
+        let released = |r: &str| meta.files.iter().find(|f| f.rel == r).map(|f| f.released);
+        assert_eq!(released("bin/a.sh"), Some(true), "설치 기록과 같은 바이트 = 출시본");
+        assert_eq!(released("agents.json"), Some(true));
+        #[cfg(unix)]
+        assert_eq!(released("bin/link"), Some(false), "링크는 출시본이 아니다");
+        assert!(meta.skipped.is_empty());
+        assert_eq!(rig.read("bin/a.sh").as_deref(), Some("#!/bin/bash\necho A2\n"), "설치는 계속됐다");
+        assert_eq!(rig.read("bin/c.py").as_deref(), Some("MINE\n"), "사용자 파일 유지");
+        // 기억이 업데이트 뒤에 바뀌어도 복원은 상태를 되돌리지 않는다.
+        rig.write("memory/MEMORY.md", b"NEW STATE AFTER UPDATE\n");
+        // 보관본 하나가 깨지면 아무것도 쓰지 않는다.
+        std::fs::write(snap.join(UPDATE_SNAPSHOT_FILES).join("agents.json"), b"TAMPERED").unwrap();
+        rig.write("agents.json", b"{\"a\":\"after\"}\n");
+        assert!(restore_update_snapshot(&snap, &rig.pack, Some(&["bin/a.sh".to_string(), "agents.json".to_string()])).is_err());
+        assert_eq!(rig.read("bin/a.sh").as_deref(), Some("#!/bin/bash\necho A2\n"), "검증 실패 → bin/a.sh 도 쓰지 않았다");
+        std::fs::write(snap.join(UPDATE_SNAPSHOT_FILES).join("agents.json"), b"{\"a\":1}\n").unwrap();
+        // 파일 단위 복원: 그 파일만.
+        let done = restore_update_snapshot(&snap, &rig.pack, Some(&["bin/a.sh".to_string()])).unwrap();
+        assert_eq!(done, vec!["bin/a.sh".to_string()]);
+        assert_eq!(rig.read("bin/a.sh").as_deref(), Some(a1));
+        assert_eq!(rig.read("agents.json").as_deref(), Some("{\"a\":\"after\"}\n"), "다른 파일은 그대로");
+        #[cfg(unix)]
+        assert_eq!(current_mode(&rig.pack.join("bin/a.sh")), Some(0o750), "기록된 권한");
+        // AC1: 출시본이 아닌 system 항목(링크)은 파일 단위로 되돌리지 않는다.
+        #[cfg(unix)]
+        assert!(restore_update_snapshot(&snap, &rig.pack, Some(&["bin/link".to_string()])).is_err(), "출시본 아님 → 거부");
+        // 전체 복원: 출시본 system 파일 + 버전 표시. 사용자 소유·상태·출시본 아닌 항목은 그대로.
+        rig.write("bin/a.sh", b"#!/bin/bash\necho A2\n");
+        let done = restore_update_snapshot(&snap, &rig.pack, None).unwrap();
+        assert_eq!(done, vec!["bin/a.sh".to_string()], "전체 복원 = 출시본 system 항목만");
+        assert_eq!(rig.read("bin/a.sh").as_deref(), Some(a1));
+        assert_eq!(std::fs::read_to_string(rig.pack.join(PACK_VERSION_FILE)).unwrap(), "1.0.0", "버전 표시 = 파일과 일치");
+        assert_eq!(rig.read("memory/MEMORY.md").as_deref(), Some("NEW STATE AFTER UPDATE\n"), "상태 불퇴행");
+        assert_eq!(rig.read("agents.json").as_deref(), Some("{\"a\":\"after\"}\n"), "전체 복원은 user 소유를 되돌리지 않는다");
+        // 3세대 보존 — 잠 없이 연달아 만든다(같은 초 안이어도 생성 순서가 목록 순서다).
+        for v in ["2.0.0", "3.0.0", "4.0.0"] {
+            std::fs::write(rig.pack.join(PACK_VERSION_FILE), v).unwrap();
+            rig.write("bin/a.sh", a1.as_bytes());
+            rig.manifest(&manifest_v1);
+            rig.install(&items, false, &src);
+        }
+        let kept = list_update_snapshots(&root.join("base"));
+        assert_eq!(kept.len(), UPDATE_SNAPSHOT_KEEP, "레인당 최신 3세대");
+        let kept_versions: Vec<String> = kept
+            .iter()
+            .map(|(_, p)| read_update_snapshot_meta(p).expect("메타").pack_version)
+            .collect();
+        assert_eq!(kept_versions, vec!["2.0.0", "3.0.0", "4.0.0"], "가장 오래된 1.0.0 세대가 정리되고 생성 순서가 유지된다");
+        let newest = newest_update_snapshot(&root, "base").expect("최신");
+        assert_eq!(read_update_snapshot_meta(&newest).unwrap().pack_version, "4.0.0", "최신 = 마지막에 만든 스냅샷");
+    }
+
+    /// RULINGS AJ3(복원 계약 O-C8-4 "링크는 링크로"): user 소유 파일 자리에 놓인 링크는 스냅샷에 링크로 기록되고, 파일 단위
+    /// 복원은 그것을 **링크로** 되살린다(파일 사본이 아니다). user 파일이라 출시본 여부와 무관하게 되돌린다.
+    #[cfg(unix)]
+    #[test]
+    fn m11_snapshot_restores_a_user_owned_link_as_a_link() {
+        let rig = Rig::new("snaplink");
+        let root = rig.base.join("snapshots");
+        let rel = "agents.json";
+        assert_eq!(ownership_scoped(rel, PackScope::Base), Ownership::User);
+        rig.write("my-agents.json", b"{\"mine\":1}\n");
+        std::os::unix::fs::symlink(rig.pack.join("my-agents.json"), rig.pack.join(rel)).unwrap();
+        let none = |_: &str| Vec::new();
+        let o = create_update_snapshot(&rig.pack, &root, "base", "1.0.0", &std::collections::BTreeMap::new(),
+                                       &[rel.to_string()], PackScope::Base, &none,
+                                       (UPDATE_SNAPSHOT_FILE_CAP, UPDATE_SNAPSHOT_TOTAL_CAP)).unwrap();
+        let meta = read_update_snapshot_meta(&o.path).unwrap();
+        assert_eq!(meta.files[0].link_target.as_deref(), Some(rig.pack.join("my-agents.json").to_str().unwrap()));
+        assert!(!meta.files[0].released);
+        // 업데이트가 링크를 파일로 바꿨다고 치고 되돌린다.
+        std::fs::remove_file(rig.pack.join(rel)).unwrap();
+        rig.write(rel, b"{\"vendor\":2}\n");
+        let done = restore_update_snapshot(&o.path, &rig.pack, Some(&[rel.to_string()])).unwrap();
+        assert_eq!(done, vec![rel.to_string()]);
+        let m = std::fs::symlink_metadata(rig.pack.join(rel)).unwrap();
+        assert!(m.file_type().is_symlink(), "링크로 되살아나야 한다(파일 사본 아님)");
+        assert_eq!(std::fs::read_link(rig.pack.join(rel)).unwrap(), rig.pack.join("my-agents.json"));
+        assert_eq!(rig.read(rel).as_deref(), Some("{\"mine\":1}\n"), "링크 대상 그대로");
+    }
+
+    /// RULINGS AJ3: 파이썬 점검의 다섯 생명줄 이름(`javis_preflight.EXPECTED_LIFELINES`)은 Rust 상수 `LIFELINE_HOOKS` 에서
+    /// 상태줄(목록 밖 — O-C4-4)을 뺀 다섯과 **같다**. 한쪽만 바뀌면 빨갛다.
+    #[test]
+    fn m11_python_expected_lifelines_match_the_rust_constant() {
+        let py = include_str!("../cysjavis-pack/bin/javis_preflight.py");
+        let start = py.find("EXPECTED_LIFELINES = (").expect("EXPECTED_LIFELINES 정의");
+        let body = &py[start..];
+        let body = &body[..body.find(')').expect("튜플 끝")];
+        let mut py_names: Vec<String> = body
+            .split('"')
+            .enumerate()
+            .filter(|(i, _)| i % 2 == 1)
+            .map(|(_, s)| s.to_string())
+            .collect();
+        py_names.sort();
+        let mut rs_names: Vec<String> = crate::repair::boot_critical::LIFELINE_HOOKS
+            .iter()
+            .filter(|n| **n != "cys-statusline.sh")
+            .map(|n| n.to_string())
+            .collect();
+        rs_names.sort();
+        assert_eq!(py_names.len(), 5, "파이썬 쪽 이름 수: {py_names:?}");
+        assert_eq!(py_names, rs_names, "생명줄 이름이 두 언어에서 갈렸다");
+    }
+
+    /// RULINGS AC3: 전환마다 스냅샷 하나 — 실패를 거듭하는 기동 설치(버전 표시가 전진하지 못함)는 다시 복사하지 않고,
+    /// 정리는 지금 진행 중인 전환의 가장 오래된 스냅샷을 지우지 않는다(진짜 업데이트 전 보존본이 밀려나지 않는다).
+    #[test]
+    fn m11_snapshot_once_per_transition_and_its_oldest_survives_pruning() {
+        let rig = Rig::new("snaponce");
+        let root = rig.base.join("snapshots");
+        let a1 = "#!/bin/bash\necho A1\n";
+        let items = [("bin/a.sh", "#!/bin/bash\necho A2\n")];
+        let src = UpdateSources::none().with_snapshot("base", root.clone());
+        let attempt = |ver: &str, disk: &str| {
+            std::fs::write(rig.pack.join(PACK_VERSION_FILE), ver).unwrap();
+            rig.write("bin/a.sh", disk.as_bytes());
+            rig.manifest(&[("bin/a.sh", disk)]);
+            rig.install(&items, false, &src);
+        };
+        attempt("1.0.0", a1);
+        assert_eq!(list_update_snapshots(&root.join("base")).len(), 1);
+        let first = newest_update_snapshot(&root, "base").unwrap();
+        // 같은 전환을 다시 시도(버전 표시가 1.0.0 그대로 · 팩은 이미 일부가 바뀐 상태) — 새 스냅샷 없음.
+        for _ in 0..4 {
+            attempt("1.0.0", "#!/bin/bash\necho HALF-WRITTEN\n");
+        }
+        let list = list_update_snapshots(&root.join("base"));
+        assert_eq!(list.len(), 1, "같은 전환은 스냅샷 하나 — 매 기동마다 다시 복사하지 않는다");
+        assert_eq!(list[0].1, first, "첫 스냅샷이 그대로다");
+        assert_eq!(
+            std::fs::read_to_string(first.join(UPDATE_SNAPSHOT_FILES).join("bin/a.sh")).unwrap(),
+            a1,
+            "보존본 = 첫 시도 직전의 바이트"
+        );
+        // 다른 전환 둘(2.0.0 · 3.0.0) 뒤 1.0.0 에서 다시 출발 — 정리는 1.0.0 의 가장 오래된 것(first)을 지키고 2.0.0 을 지운다.
+        attempt("2.0.0", a1);
+        attempt("3.0.0", a1);
+        assert_eq!(list_update_snapshots(&root.join("base")).len(), 3);
+        attempt("1.0.0", a1);
+        let versions: Vec<String> = list_update_snapshots(&root.join("base"))
+            .iter()
+            .map(|(_, p)| read_update_snapshot_meta(p).unwrap().pack_version)
+            .collect();
+        assert_eq!(versions, vec!["1.0.0", "3.0.0", "1.0.0"], "진행 중 전환의 가장 오래된 스냅샷은 정리되지 않는다");
+        assert!(first.is_dir(), "첫 스냅샷 생존");
+    }
+
+    /// RULINGS AC4(부록 A-2 #17): 스냅샷은 유한하다 — 이 팩의 실제 파일 수(내장 전부가 바뀌는 최악의 업데이트)에서
+    /// 크기는 상한 안이고, 일의 양은 '이번 설치가 덮거나 지울 파일 수'를 넘지 않는다. 상한을 넘는 파일은 담지 않고
+    /// 색인에 이름을 남기며 설치는 계속된다. 걸린 시간은 로그에 남기기만 한다 — 디버그 빌드·부하 걸린 실행기에서 시계
+    /// 한계는 흔들린다(실측: 다른 트랙과 함께 돈 하네스에서 4.13초 — DEFERRED_MINOR #45 의 방향 "일의 양을 단언하고 시간은
+    /// 기록만"; 기동 전 시간은 5단계에서 잰다 — RULINGS AB6(3)).
+    /// ★r3 재작성(종전: `took < 4초` 단언 — 그 단언이 부하로 깨져 같은 잠금을 쓰는 시험 55개를 연쇄로 떨어뜨렸다).
+    #[test]
+    fn m11_snapshot_is_bounded_on_the_real_pack_file_count() {
+        let rig = Rig::new("snapbound");
+        let root = rig.base.join("snapshots");
+        let v1: Vec<(&str, &str)> = PACK_ALL.iter().map(|(r, c)| (*r, *c)).collect();
+        assert!(v1.len() >= 400, "실제 팩 파일 수 픽스처({}개)", v1.len());
+        install_into_with(rig.pack.clone(), v1.iter().copied(), false, "1.0.0", false, false,
+                          PackScope::Base, None, None, &UpdateSources::none()).unwrap();
+        std::fs::write(rig.pack.join(PACK_VERSION_FILE), "1.0.0").unwrap();
+        let (manifest, _) = load_manifest_state(&rig.pack);
+        // 최악: 내장 파일 전부가 바뀐다.
+        let v2_owned: Vec<(String, String)> =
+            v1.iter().map(|(r, c)| (r.to_string(), format!("{c}\n# changed in 9.9.9\n"))).collect();
+        let v2: Vec<(&str, &str)> = v2_owned.iter().map(|(r, c)| (r.as_str(), c.as_str())).collect();
+        let src = UpdateSources::none().with_snapshot("base", root.clone());
+        let t0 = std::time::Instant::now();
+        let out = take_update_snapshot(&rig.pack, &v2, false, "9.9.9", PackScope::Base, &src, &manifest)
+            .expect("스냅샷 대상 있음")
+            .expect("스냅샷 성공");
+        let took = t0.elapsed();
+        // 실측 증거(로그): 파일 수 · 바이트 · 걸린 시간.
+        eprintln!("[m11-snapshot-bound] files={} bytes={} skipped={} took={took:?}", out.files, out.bytes, out.skipped.len());
+        assert!(out.files > 0 && out.files <= v1.len());
+        assert!(out.bytes <= UPDATE_SNAPSHOT_TOTAL_CAP, "총량 {} > 상한", out.bytes);
+        assert!(out.skipped.is_empty(), "실제 팩은 상한 안에 든다: {:?}", out.skipped);
+        let mut stack = vec![out.path.join(UPDATE_SNAPSHOT_FILES)];
+        let mut on_disk = 0u64;
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).unwrap().flatten() {
+                let m = std::fs::symlink_metadata(e.path()).unwrap();
+                if m.is_dir() {
+                    stack.push(e.path());
+                } else {
+                    assert!(m.len() <= UPDATE_SNAPSHOT_FILE_CAP);
+                    on_disk += m.len();
+                }
+            }
+        }
+        assert_eq!(on_disk, out.bytes, "색인의 바이트 합 = 실제 사본");
+        // 일의 양(결정론): 담은 파일 + 상한으로 뺀 파일 = 같은 판정이 '덮는다/지운다'로 고른 파일 수.
+        let plan = plan_install_core(&rig.pack, &v2, false, "9.9.9", PackScope::Base, &src);
+        let planned = plan.update.len()
+            + plan.heal.len()
+            + plan.merge3.len()
+            + plan.vendor_first.len()
+            + plan.prune_delete.len();
+        assert_eq!(out.files + out.skipped.len(), planned, "스냅샷의 일 = 이번 설치가 덮거나 지울 파일 수");
+        assert!(planned <= v1.len());
+        // 상한: 파일 하나가 상한을 넘으면 그 파일만 빠지고 색인에 남는다 — 설치는 계속된다.
+        let big = "x".repeat((UPDATE_SNAPSHOT_FILE_CAP + 1) as usize);
+        rig.write("bin/huge.txt", big.as_bytes());
+        rig.write("bin/small.txt", b"small v1\n");
+        rig.manifest(&[("bin/huge.txt", big.as_str()), ("bin/small.txt", "small v1\n")]);
+        std::fs::write(rig.pack.join(PACK_VERSION_FILE), "2.0.0").unwrap();
+        rig.install(&[("bin/huge.txt", "y\n"), ("bin/small.txt", "small v2\n")], false, &src);
+        let snap = newest_update_snapshot(&root, "base").unwrap();
+        let meta = read_update_snapshot_meta(&snap).unwrap();
+        assert_eq!(meta.pack_version, "2.0.0");
+        assert_eq!(meta.files.iter().map(|f| f.rel.as_str()).collect::<Vec<_>>(), vec!["bin/small.txt"]);
+        assert_eq!(meta.skipped.len(), 1);
+        assert_eq!(meta.skipped[0].rel, "bin/huge.txt");
+        assert_eq!(meta.skipped[0].reason, "file-cap");
+        assert_eq!(rig.read("bin/huge.txt").as_deref(), Some("y\n"), "설치는 계속됐다");
+        // 총량 상한(작은 상한으로 직접): 넘치는 파일은 total-cap 으로 빠진다.
+        for (r, n) in [("t/a", 600usize), ("t/b", 900), ("t/c", 2000)] {
+            rig.write(r, "z".repeat(n).as_bytes());
+        }
+        let rels: Vec<String> = ["t/a", "t/b", "t/c"].iter().map(|s| s.to_string()).collect();
+        let none = |_: &str| Vec::new();
+        let o = create_update_snapshot(&rig.pack, &root, "capped", "1.0.0", &std::collections::BTreeMap::new(),
+                                       &rels, PackScope::Base, &none, (1000, 1600)).unwrap();
+        assert_eq!(o.files, 2);
+        assert_eq!(o.skipped, vec![SnapshotSkip { rel: "t/c".into(), bytes: 2000, reason: "file-cap".into() }]);
+        let o = create_update_snapshot(&rig.pack, &root, "capped2", "1.0.0", &std::collections::BTreeMap::new(),
+                                       &rels, PackScope::Base, &none, (5000, 1600)).unwrap();
+        assert_eq!(o.skipped.iter().map(|k| (k.rel.as_str(), k.reason.as_str())).collect::<Vec<_>>(),
+                   vec![("t/c", "total-cap")]);
+    }
+
+    /// RULINGS AC1: 스냅샷 항목의 출시본 여부 — 바꾸기 전 설치 기록과 같은 바이트, 또는 (기록이 없을 때) 과거 출시 해시
+    /// 표의 바이트만 참이다. 사용자 수정본(병합·vendor 우선 대상)은 거짓이다.
+    #[test]
+    fn m11_snapshot_records_whether_bytes_are_released() {
+        let rig = Rig::new("snaprel");
+        let root = rig.base.join("snapshots");
+        rig.write("bin/unedited.sh", b"#!/bin/sh\nv1\n");
+        rig.write("bin/old.sh", b"#!/bin/sh\nold release\n");
+        rig.write("bin/edited.sh", b"#!/bin/sh\nmine\n");
+        rig.manifest(&[("bin/unedited.sh", "#!/bin/sh\nv1\n"), ("bin/edited.sh", "#!/bin/sh\nv1\n")]);
+        rig.pristine("bin/edited.sh", "#!/bin/sh\nv1\n");
+        std::fs::write(rig.pack.join(PACK_VERSION_FILE), "1.0.0").unwrap();
+        let old_hash = content_hash("#!/bin/sh\nold release\n");
+        let src = UpdateSources::none()
+            .with_snapshot("base", root.clone())
+            .with_prev_vendor(move |r| if r == "bin/old.sh" { vec![old_hash.clone()] } else { Vec::new() });
+        rig.install(&[("bin/unedited.sh", "#!/bin/sh\nv2\n"), ("bin/old.sh", "#!/bin/sh\nv2\n"),
+                      ("bin/edited.sh", "#!/bin/sh\nv2\n")], false, &src);
+        let meta = read_update_snapshot_meta(&newest_update_snapshot(&root, "base").unwrap()).unwrap();
+        let rel = |r: &str| meta.files.iter().find(|f| f.rel == r).map(|f| f.released);
+        assert_eq!(rel("bin/unedited.sh"), Some(true), "설치 기록과 같은 바이트");
+        assert_eq!(rel("bin/old.sh"), Some(true), "기록 없음 + 과거 출시 해시 표의 바이트");
+        assert_eq!(rel("bin/edited.sh"), Some(false), "사용자 수정본(병합 대상)");
+    }
+
+    /// RULINGS AC5: 비수정 판정(다 · 바)과 스냅샷의 출시본 판정이 쓰는 과거 출시 해시 표 — 라이브(`for_live_pack`)와
+    /// `none()` 입력원은 `pack_prev_vendor::prev_vendor_hashes(rel)` 를 **그대로** 돌려준다(이음새로 바뀐 표가 제품
+    /// 경로에 남으면 빨갛다). 표의 내용 자체는 T2c 의 것(재생성 · CI 신선도 검사)이다.
+    #[test]
+    fn m11_prev_vendor_lookup_is_the_table_on_production_sources() {
+        let rig = Rig::new("prevtable");
+        let _l = EnvGuard::set("CYS_LOCAL_DIR", rig.base.join("local"));
+        let _p = EnvGuard::set(ENV_PACK_DIR, &rig.pack);
+        let none = UpdateSources::none();
+        let live = UpdateSources::for_live_pack(&rig.pack);
+        let mut with_rows = 0usize;
+        for (rel, _) in PACK_ALL.iter() {
+            let want: Vec<String> = crate::pack_prev_vendor::prev_vendor_hashes(rel)
+                .iter()
+                .map(|h| h.to_string())
+                .collect();
+            if !want.is_empty() {
+                with_rows += 1;
+            }
+            assert_eq!(none.prev_vendor_for(rel), want, "none(): {rel}");
+            assert_eq!(live.prev_vendor_for(rel), want, "for_live_pack(): {rel}");
+        }
+        assert!(with_rows > 0, "표에 행이 없다 — 이 핀이 아무것도 재지 않는다");
+        // 판정 수집기도 같은 조회를 쓴다: 표의 해시와 같은 디스크 바이트는 '과거 vendor 본'이다(시험용 표로 확인).
+        let probe = "#!/bin/sh\nprobe\n";
+        let h = content_hash(probe);
+        let seam = UpdateSources::none().with_prev_vendor(move |_| vec![h.clone()]);
+        let ctx = UpdateContext::new(&rig.pack, PackScope::Base, &seam, false);
+        let f = ctx.facts("bin/probe.sh", "#!/bin/sh\nv2\n", true, Some(probe), None, &serde_json::Map::new());
+        assert!(f.prev_vendor_match);
+    }
+
+    /// RULINGS AC7: vendor-first 원장 항목은 vendor 바이트보다 **먼저** 저장된다 — vendor 쓰기가 실패해(여기서는 살아 있는
+    /// 파일을 바꿀 수 없게 막아) 설치가 멈춰도 `.user` 는 기록된 보관본이다(기록 없는 고아가 아니다).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn m11_vendor_first_record_is_saved_before_the_vendor_bytes() {
+        let rig = Rig::new("vforder");
+        let rel = "bin/boot.sh";
+        rig.write(rel, b"#!/bin/sh\nmine\n");
+        let src = UpdateSources::none().with_boot_critical(|r| r == "bin/boot.sh");
+        let p = rig.pack.join(rel);
+        let c = std::ffi::CString::new(p.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::chflags(c.as_ptr(), libc::UF_IMMUTABLE) }, 0, "불변 표시");
+        let r = install_into_with(rig.pack.clone(), [(rel, "#!/bin/sh\nvendor\n")], false, "9.9.9", false, false,
+                                  PackScope::Base, None, None, &src);
+        unsafe { libc::chflags(c.as_ptr(), 0) };
+        assert!(r.is_err(), "vendor 쓰기가 실패해야 시험이 성립한다: {r:?}");
+        assert_eq!(rig.read(rel).as_deref(), Some("#!/bin/sh\nmine\n"), "살아 있는 파일 무변경");
+        assert_eq!(std::fs::read_to_string(rig.pack.join(format!("{rel}.user"))).unwrap(), "#!/bin/sh\nmine\n");
+        assert_eq!(rig.kind(rel).as_deref(), Some("vendor-first"), "멈춘 자리에서도 .user 는 원장에 기록된 보관본");
+    }
+
+    /// O-C8-4 (a): 라이브 입력원의 스냅샷 위치가 T0 경로 도우미(`repair::paths::update_snapshot_dir`)와 같은 배치다.
+    #[test]
+    fn m11_snapshot_root_matches_t0_path_helper() {
+        let rig = Rig::new("snaproot");
+        let local = rig.base.join("local");
+        let _l = EnvGuard::set("CYS_LOCAL_DIR", &local);
+        let _p = EnvGuard::set(ENV_PACK_DIR, &rig.pack);
+        let src = UpdateSources::for_live_pack(&rig.pack);
+        let lane = src.lane.clone().expect("base 팩 = base 레인");
+        assert_eq!(lane.0, "base");
+        let root = src.snapshot_root.clone().expect("스냅샷 루트");
+        assert_eq!(
+            crate::repair::paths::update_snapshot_dir(&lane, "1.0.0", "20261113T000000Z"),
+            root.join("base").join("1.0.0-20261113T000000Z"),
+            "스냅샷 경로가 T0 계약 경로와 갈렸다"
+        );
+    }
+
+    /// 설계 §7 20행: staged init-pack 의 전량 복사가 심볼릭 링크를 링크로 지킨다(대상 없는 링크 포함 — 종전엔
+    /// 복사가 실패해 init-pack 이 멈췄다).
+    #[cfg(unix)]
+    #[test]
+    fn m11_staged_copy_preserves_symlinks() {
+        let rig = Rig::new("links");
+        let src = rig.base.join("src");
+        std::fs::create_dir_all(src.join("skills")).unwrap();
+        std::fs::write(rig.base.join("outside.md"), "MARK").unwrap();
+        std::os::unix::fs::symlink(rig.base.join("outside.md"), src.join("skills/file-link.md")).unwrap();
+        std::os::unix::fs::symlink("/nonexistent/x", src.join("skills/dangling")).unwrap();
+        std::os::unix::fs::symlink(rig.base.join("src/skills"), src.join("dir-link")).unwrap();
+        let dst = rig.base.join("dst");
+        copy_dir_all(&src, &dst).expect("대상 없는 링크가 있어도 복사가 끝난다");
+        for l in ["skills/file-link.md", "skills/dangling", "dir-link"] {
+            assert!(std::fs::symlink_metadata(dst.join(l)).unwrap().file_type().is_symlink(), "{l} 은 링크로 남는다");
+        }
+        assert_eq!(std::fs::read_link(dst.join("skills/dangling")).unwrap(), PathBuf::from("/nonexistent/x"));
+    }
 }

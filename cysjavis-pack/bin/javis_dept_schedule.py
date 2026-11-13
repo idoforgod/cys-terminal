@@ -62,7 +62,8 @@ def seed(path):
     try:
         os.makedirs(dirn, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=dirn, prefix=".sched.", suffix=".tmp")
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        # ★0.15.0 §4-10/§6-10(6): LF 로 쓴다(윈도우 텍스트 모드의 CRLF 금지 — 기동 필수 파일 작성자 LF).
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
             json.dump(out, fh, ensure_ascii=False, indent=2)
             fh.write("\n")
             fh.flush()

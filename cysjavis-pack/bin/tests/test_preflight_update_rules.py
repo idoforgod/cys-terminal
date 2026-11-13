@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""test_preflight_update_rules.py — 0.15.0 「스스로 해결」 M11 의 점검 도구 쪽 회귀 하네스.
+
+무엇을 막는가(각 시험은 그 장치를 빼면 적색):
+  ① 18개 복구 지점이 묘비(장부에 기록된 삭제)를 '누락'으로 보고 매번 init-pack 을 부르며 FAIL 을 내는 회귀
+     (부트 게이트가 영영 READY 가 안 된다 — 설계 §6-11 마).
+  ② 훅 묘비를 파일 복구 지점이 '허가된 부재'로 읽는 회귀(종류로 건너뛴다 — RULINGS W3(b)).
+  ③ 생명줄 훅 파일(창 시작 훅)이 묘비로 부재 유지되는 회귀(언제나 되살린다 — CONTRACTS 8.7).
+  ④ C62 가 user-kept·vendor-first 를 침묵하는 회귀(과제가 남은 상태 — O-C8-1).
+  ⑤ 부서당 과제 하나가 실행마다 새 키로 쌓이는 회귀(멱등 키 = 레인 + 보관 집합 지문 — 부록 A-2 #15).
+  ⑥ C16 이 schedule.json 을 제자리 덮어쓰기(잠금 없는 절단)로 쓰는 회귀 · 텍스트 모드 CRLF(H6(2) · §4-10).
+  ⑦ 부서 일정 심기가 텍스트 모드 CRLF 로 쓰는 회귀(§6-10(6)).
+
+라이브 무접촉: CYS_PACK_DIR·HOME·PATH 는 임시 루트 안 · `cys` 는 스텁 · wakeup 은 팩 안 스텁 스크립트.
+
+실행: CYS_PACK_DIR="$(mktemp -d)" python3 cysjavis-pack/bin/tests/test_preflight_update_rules.py
+"""
+import json
+import os
+import shlex
+import shutil
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+BIN = os.path.dirname(TESTS_DIR)
+sys.path.insert(0, BIN)
+sys.dont_write_bytecode = True
+import javis_preflight as pf  # noqa: E402
+import javis_dept_schedule as ds  # noqa: E402
+
+PASS, WARN, FAIL, FIXED = pf.PASS, pf.WARN, pf.FAIL, pf.FIXED
+
+
+class Rig(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="pf-m11-")
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.pack = os.path.join(self.root, "pack")
+        self.bin = os.path.join(self.root, "bin")
+        for d in (self.pack, self.bin, os.path.join(self.root, "home"),
+                  os.path.join(self.root, "local", "repairs", "tombstones")):
+            os.makedirs(d, exist_ok=True)
+        with open(os.path.join(self.root, "local", "repairs", "tombstones", "base.json"), "w") as f:
+            f.write("{}")
+        self.calls = os.path.join(self.root, "calls.log")
+        self.tombs = os.path.join(self.root, "tombs.json")
+        self.life = os.path.join(self.root, "life.json")
+        open(self.calls, "w").close()
+        with open(self.life, "w", encoding="utf-8") as f:
+            json.dump([{"rel": "hooks/session-start.sh", "lifeline": True},
+                       {"rel": "hooks/role-bootstrap.sh", "lifeline": True}], f)
+        self.set_tombs()
+        stub = os.path.join(self.bin, "cys")
+        with open(stub, "w", encoding="utf-8") as f:
+            f.write("#!/bin/sh\n"
+                    "printf '%%s\\n' \"cys $*\" >> %s\n"
+                    "case \"$*\" in\n"
+                    "  'repair tombstones --json') /bin/cat %s; exit 0 ;;\n"
+                    "  'repair boot-critical --list --json') /bin/cat %s; exit 0 ;;\n"
+                    "  *) exit 97 ;;\n"
+                    "esac\n" % (shlex.quote(self.calls), shlex.quote(self.tombs), shlex.quote(self.life)))
+        os.chmod(stub, 0o755)
+        env = mock.patch.dict(os.environ, {
+            "HOME": os.path.join(self.root, "home"), "PATH": self.bin, "CYS_PACK_DIR": self.pack,
+        }, clear=True)
+        env.start()
+        self.addCleanup(env.stop)
+        pf._TOMB_CACHE.clear()
+        self.addCleanup(pf._TOMB_CACHE.clear)
+
+    def set_tombs(self, files=(), hooks=()):
+        items = [{"rel": r, "kind": "file", "repair": rep} for r, rep in files]
+        items += [{"rel": "settings:%s:%s" % (e, s), "kind": {"hook": {"event": e, "script": s}},
+                   "repair": rep} for e, s, rep in hooks]
+        with open(self.tombs, "w", encoding="utf-8") as f:
+            json.dump(items, f)
+        pf._TOMB_CACHE.clear()
+
+    def run_check(self, method, prefix, fix=True):
+        p = pf.Preflight(fix=fix, skips=[], mode="fix" if fix else "report")
+        getattr(p, method)()
+        rows = [r for r in p.results if r["id"].startswith(prefix)]
+        self.assertEqual(len(rows), 1, p.results)
+        return rows[0]["status"], rows[0]["detail"]
+
+    def init_pack_called(self):
+        with open(self.calls, encoding="utf-8") as f:
+            return any("init-pack" in line for line in f)
+
+
+class RestorePoints(Rig):
+    def test_tombstoned_bin_tool_is_reported_not_restored(self):
+        self.set_tombs(files=[("bin/javis_report.py", "R-11")])
+        st, detail = self.run_check("c15_report_tool", "C15")
+        self.assertEqual(st, WARN, detail)
+        self.assertIn("R-11", detail)
+        self.assertFalse(self.init_pack_called(), "묘비 파일 때문에 init-pack 을 부르지 않는다")
+
+    def test_untombstoned_missing_file_still_fails_and_tries_init_pack(self):
+        st, detail = self.run_check("c15_report_tool", "C15")
+        self.assertEqual(st, FAIL, detail)
+        self.assertTrue(self.init_pack_called(), "기록 없는 부재는 지금처럼 복구를 시도한다")
+
+    def test_tombstoned_config_files_c06(self):
+        self.set_tombs(files=[("acl.json", "R-12")])
+        with open(os.path.join(self.pack, "schedule.json"), "w", encoding="utf-8") as f:
+            f.write('{"jobs": []}')
+        st, detail = self.run_check("c06_json_files", "C06")
+        self.assertEqual(st, WARN, detail)
+        self.assertIn("acl.json", detail)
+        self.assertIn("R-12", detail)
+        self.assertFalse(self.init_pack_called())
+
+    def test_hook_tombstone_does_not_authorise_a_missing_file(self):
+        # pack-guard 의 '등록 해제' 묘비는 hooks/pack-guard.sh 파일의 부재를 허가하지 않는다.
+        self.set_tombs(hooks=[("PostToolUse", "pack-guard.sh", "R-13")])
+        self.assertIsNone(pf.tombstoned_file("hooks/pack-guard.sh"))
+
+    def test_lifeline_file_never_tombstoned(self):
+        self.set_tombs(files=[("hooks/session-start.sh", "R-14"), ("hooks/cys-statusline.sh", "R-14")])
+        self.assertIsNone(pf.tombstoned_file("hooks/session-start.sh"), "생명줄 파일 묘비는 무효")
+        self.assertIsNone(pf.tombstoned_file("hooks/cys-statusline.sh"), "상태줄(목록 밖 생명줄)도 무효")
+        st, _ = self.run_check("c07_hook_script", "C07")
+        self.assertEqual(st, FAIL, "생명줄 파일 부재는 지금처럼 FAIL")
+        self.assertTrue(self.init_pack_called())
+
+    def test_no_cys_means_todays_behaviour(self):
+        os.remove(os.path.join(self.bin, "cys"))
+        self.set_tombs(files=[("bin/javis_report.py", "R-15")])
+        self.assertIsNone(pf.tombstoned_file("bin/javis_report.py"), "cys 부재 = 묘비 없음(지금 동작)")
+
+
+class LedgerKinds(Rig):
+    def ledger(self, entries):
+        with open(os.path.join(self.pack, ".merge-pending.json"), "w", encoding="utf-8") as f:
+            json.dump(entries, f)
+
+    def test_c62_lists_user_kept_and_vendor_first(self):
+        self.ledger({"bin/a.py": {"kind": "user-kept", "side": "bin/a.py.new", "reason": "merge-conflict",
+                                  "caution": "suspect:Empty", "version": "0.15.0", "ts": 1},
+                     "hooks/b.sh": {"kind": "vendor-first", "side": "hooks/b.sh.user", "version": "0.15.0", "ts": 1}})
+        st, detail = self.run_check("c62_pack_heal_ledger", "C62", fix=False)
+        self.assertEqual(st, WARN)
+        self.assertIn("user-kept", detail)
+        self.assertIn("bin/a.py", detail)
+        self.assertIn("suspect:Empty", detail)
+        self.assertIn("vendor-first", detail)
+        self.assertIn("cys repair reapply", detail)
+
+    def _wake_rig(self):
+        wk = os.path.join(self.pack, "bin")
+        os.makedirs(wk, exist_ok=True)
+        log = os.path.join(self.root, "wake.log")
+        with open(os.path.join(wk, "javis_wakeup.py"), "w", encoding="utf-8") as f:
+            f.write("import sys,json\nopen(%r,'a').write(json.dumps(sys.argv[1:])+'\\n')\n" % log)
+        ws = os.path.join(self.root, "ws")
+        os.makedirs(os.path.join(ws, "_round"), exist_ok=True)
+        os.environ["JAVIS_ROOT"] = ws
+        return log
+
+    def wakes(self, log):
+        if not os.path.exists(log):
+            return []
+        with open(log, encoding="utf-8") as f:
+            return [json.loads(line) for line in f]
+
+    def delivered(self):
+        p = os.path.join(self.pack, "state", "merge-notice-delivered.json")
+        if not os.path.exists(p):
+            return {}
+        with open(p, encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_parked_merge_task_one_key_per_parked_set(self):
+        # ★r2(RULINGS AC7): 같은 보관 집합은 **한 번만** 적재한다(배달한 지문을 레인 상태에 둔다) — 종전 r1 은 매 점검마다
+        #   적재를 시도하고 큐의 멱등 키에 기댔는데, 그 키는 대기 중일 때만 묶어 배달 뒤에는 같은 과제가 다시 왔다.
+        log = self._wake_rig()
+        self.ledger({"bin/a.py": {"kind": "user-kept", "side": "bin/a.py.new", "version": "0.15.0", "ts": 1}})
+        self.run_check("c62_pack_heal_ledger", "C62")
+        self.run_check("c62_pack_heal_ledger", "C62")
+        self.run_check("c62_pack_heal_ledger", "C62")
+        w = [x for x in self.wakes(log) if "parked-merge" in x]
+        self.assertEqual(len(w), 1, "같은 보관 집합은 한 번만(배달 뒤 다시 적재하지 않는다)")
+        k = lambda a: a[a.index("--idempotency-key") + 1]  # noqa: E731
+        self.assertIn("pack", k(w[0]), "키에 레인(팩 이름)이 들어간다")
+        self.assertIn(k(w[0]).rsplit("-", 1)[1], self.delivered().get("parked-merge", ""), "지문이 레인 상태에 기록된다")
+        self.assertIn("master", w[0], "master 큐 — master 가 워커에게 위임")
+        self.assertTrue(any("직접 병합 금지" in a for a in w[0]))
+        self.ledger({"bin/a.py": {"kind": "user-kept", "side": "bin/a.py.new", "version": "0.15.0", "ts": 1},
+                     "bin/c.py": {"kind": "user-kept", "side": "bin/c.py.new", "version": "0.15.0", "ts": 1}})
+        self.run_check("c62_pack_heal_ledger", "C62")
+        self.run_check("c62_pack_heal_ledger", "C62")
+        w = [x for x in self.wakes(log) if "parked-merge" in x]
+        self.assertEqual(len(w), 2, "집합이 바뀌면 새 과제 한 번")
+        self.assertNotEqual(k(w[-1]), k(w[0]))
+        # 집합이 비면 기록을 지운다 — 같은 수정이 나중에 다시 보관되면 다시 보인다.
+        self.ledger({})
+        self.run_check("c62_pack_heal_ledger", "C62")
+        self.assertNotIn("parked-merge", self.delivered())
+        self.ledger({"bin/a.py": {"kind": "user-kept", "side": "bin/a.py.new", "version": "0.15.0", "ts": 1}})
+        self.run_check("c62_pack_heal_ledger", "C62")
+        self.assertEqual(len([x for x in self.wakes(log) if "parked-merge" in x]), 3)
+
+    def test_failed_enqueue_is_retried_not_recorded(self):
+        log = self._wake_rig()
+        wk = os.path.join(self.pack, "bin", "javis_wakeup.py")
+        with open(wk, "w", encoding="utf-8") as f:
+            f.write("import sys,json\nopen(%r,'a').write(json.dumps(sys.argv[1:])+'\\n')\nsys.exit(1)\n" % log)
+        self.ledger({"bin/a.py": {"kind": "user-kept", "side": "bin/a.py.new", "version": "0.15.0", "ts": 1}})
+        self.run_check("c62_pack_heal_ledger", "C62")
+        self.assertEqual(self.delivered(), {}, "적재 실패는 기록하지 않는다")
+        self.run_check("c62_pack_heal_ledger", "C62")
+        self.assertEqual(len([x for x in self.wakes(log) if "parked-merge" in x]), 2, "다음 점검이 다시 시도한다")
+
+    def test_legacy_user_list_shown_once_per_set(self):
+        log = self._wake_rig()
+        with open(os.path.join(self.pack, "x.md.user"), "w") as f:
+            f.write("old fix")
+        self.ledger({"x.md": {"kind": "healed", "side": "x.md.user", "version": "0.14.56", "ts": 1}})
+        self.run_check("c62_pack_heal_ledger", "C62")
+        self.run_check("c62_pack_heal_ledger", "C62")
+        w = [x for x in self.wakes(log) if "legacy-user-list" in x]
+        self.assertEqual(len(w), 1, "예전 .user 목록은 주인에게 한 번만(RULINGS AC7)")
+        self.assertTrue(any("cys pack-adopt" in a for a in w[0]), "목록 = 되살리기 명령의 모의 판정")
+        self.assertIn("legacy-user-list", self.delivered())
+
+    def test_report_mode_enqueues_nothing(self):
+        log = self._wake_rig()
+        self.ledger({"bin/a.py": {"kind": "user-kept", "side": "bin/a.py.new", "version": "0.15.0", "ts": 1}})
+        self.run_check("c62_pack_heal_ledger", "C62", fix=False)
+        self.assertEqual(self.wakes(log), [], "report 모드는 관찰만")
+
+
+class ScheduleWriters(Rig):
+    def _spy_fdopen(self):
+        seen = []
+        real = os.fdopen
+
+        def spy(fd, *a, **kw):
+            seen.append(kw.get("newline"))
+            return real(fd, *a, **kw)
+        return seen, spy
+
+    def test_c16_writes_atomically_with_lf_and_keeps_mode(self):
+        p = os.path.join(self.pack, "schedule.json")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write('{"jobs": []}')
+        os.chmod(p, 0o640)
+        ino = os.stat(p).st_ino
+        seen, spy = self._spy_fdopen()
+        with mock.patch.object(pf.os, "fdopen", spy):
+            st, detail = self.run_check("c16_report_schedule", "C16")
+        self.assertEqual(st, FIXED, detail)
+        self.assertIn("\n", seen, "임시 파일을 LF(newline='\\n')로 쓴다")
+        self.assertNotEqual(os.stat(p).st_ino, ino, "제자리 절단이 아니라 임시 파일 + 원자 교체")
+        self.assertEqual(os.stat(p).st_mode & 0o777, 0o640, "원본 권한 유지")
+        data = json.load(open(p, encoding="utf-8"))
+        self.assertTrue(any(j.get("id") == "owner-progress-gate-5min" for j in data["jobs"]))
+        self.assertNotIn(b"\r", open(p, "rb").read())
+        leftovers = [n for n in os.listdir(self.pack) if n.startswith(".schedule.")]
+        self.assertEqual(leftovers, [], "임시 파일 잔재 없음")
+
+    def test_dept_schedule_seed_writes_lf(self):
+        p = os.path.join(self.root, "dept-schedule.json")
+        seen, spy = self._spy_fdopen()
+        with mock.patch.object(ds.os, "fdopen", spy):
+            self.assertEqual(ds.seed(p), 0)
+        self.assertEqual(seen, ["\n"], "부서 일정 심기는 LF")
+        self.assertNotIn(b"\r", open(p, "rb").read())
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

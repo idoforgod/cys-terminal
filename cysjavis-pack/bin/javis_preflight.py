@@ -394,6 +394,161 @@ CSO_DIRECTIVE_REV_MARKER = "<!-- cso-directive-rev: 2026-09-06-alert-inbox -->"
 CSO_DIRECTIVE_MARKER_MAX_LINE = 20      # 표지는 파일 첫 20행 안에 있어야 한다(P3 와 공유하는 계약)
 
 
+# ── ★0.15.0 M11 마 — 묘비(장부에 기록된 파일 삭제 · 생명줄이 아닌 훅 해제)의 읽기 창구 ──────────────
+# 정본은 수리 장부의 레인별 묘비 파일(`~/.cys/local/repairs/tombstones/<lane_key>.json`, 그 레인의 데몬만
+# 쓴다 — RULINGS B1)이고, 파이썬은 장부 파일을 직접 파싱하지 않는다: `cys repair tombstones --json`(CLI 의
+# 로컬 읽기 — 데몬 무접촉, 호출자 레인의 묘비만 — CONTRACTS O-C1-8)으로만 읽는다. `cys` 부재·옛 바이너리·
+# 비0·파싱 실패 = **빈 집합 = 지금 동작**(지운 것은 되살아나고 해제한 훅은 다시 등록된다 — 생명줄 안전 방향).
+# 생명줄 훅 여섯은 묘비가 결코 적용되지 않는다(CONTRACTS 8.7): 생명줄 판정은 컴파일된 한 목록
+# (`cys repair boot-critical --list --json` 의 `lifeline` — O-C8-6)으로 하고, 그 조회가 안 되면 "모름" =
+# 어떤 훅 묘비도 적용하지 않는다(지금 동작). 상태줄 훅(`cys-statusline.sh`)은 그 목록에서 빠지지만
+# (O-C4-4) 그 등록기(C32)는 묘비를 아예 보지 않으므로 언제나 등록된다(구조로 생명줄).
+TOMBSTONE_QUERY_TIMEOUT_S = 5
+_REG_TOMBSTONED = "__registration-refused-by-tombstone__"   # 등록기 반환 표식(실패 아님)
+_TOMB_CACHE = {}
+
+
+def _cys_local_json(args, timeout=TOMBSTONE_QUERY_TIMEOUT_S):
+    """`cys <args>` 로컬 질의 → JSON(실패 = None). 데몬을 깨우지 않는다(CYS_NO_AUTOSTART=1)."""
+    cys = shutil.which("cys")
+    if not cys:
+        return None
+    env = _utf8_env({"CYS_NO_AUTOSTART": "1"})
+    try:
+        # 명시적 UTF-8(윈도우 cp949 로케일에서도 — 부록 A-3 #22).
+        r = subprocess.run([cys] + list(args), capture_output=True, encoding="utf-8",
+                           errors="replace", timeout=timeout, env=env)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    try:
+        return json.loads(r.stdout or "null")
+    except ValueError:
+        return None
+
+
+# 컴파일된 목록이 생명줄로 답해야 할 다섯 이름(여섯 중 상태줄은 목록 밖 — O-C4-4 · 상태줄은 아래 이름 검사가 따로 지킨다).
+EXPECTED_LIFELINES = ("session-start.sh", "role-bootstrap.sh", "inject-context.sh", "save-state.sh",
+                      "role-capability-gate.sh")
+
+
+def lane_lifeline_scripts():
+    """생명줄 훅 스크립트 basename 집합. ★RULINGS AC7: 컴파일된 목록이 다섯 이름(`EXPECTED_LIFELINES`)을 **모두**
+    생명줄로 답할 때만 '안다' — 그때는 다섯을 이름으로 지킨다(목록의 표시 하나가 빠져 그 훅이 묘비로 벗겨지는 일이 없게).
+    하나라도 빠지거나 조회가 안 되면 None(모름 = 어떤 훅 묘비도 적용하지 않는다)."""
+    if "lifelines" in _TOMB_CACHE:
+        return _TOMB_CACHE["lifelines"]
+    data = _cys_local_json(["repair", "boot-critical", "--list", "--json"])
+    entries = data.get("entries") if isinstance(data, dict) else data
+    out = None
+    if isinstance(entries, list):
+        found = {os.path.basename(str(e.get("rel") or "").replace("\\", "/"))
+                 for e in entries if isinstance(e, dict) and e.get("lifeline") is True}
+        if set(EXPECTED_LIFELINES) <= found:
+            out = frozenset(EXPECTED_LIFELINES) | frozenset(found)
+    _TOMB_CACHE["lifelines"] = out
+    return out
+
+
+def _tombstones_may_exist():
+    """묘비 파일이 하나라도 있을 수 있는가 — 존재 탐침만(내용은 읽지 않는다: 장부 파싱은 `cys` 만 한다).
+    `repairs/tombstones/` 에 `*.json` 이 하나도 없으면 묘비 = 빈 집합이 확정이므로 `cys` 를 띄우지 않는다
+    (매 부트 비용 0 · 수리를 한 번도 하지 않은 설치는 지금과 똑같다). 로컬 루트 = `CYS_LOCAL_DIR` 또는 팩의
+    형제 `local`(`src/pack.rs:local_dir` 과 같은 규칙)."""
+    local = os.environ.get("CYS_LOCAL_DIR") or os.path.join(
+        os.path.dirname(os.path.normpath(pack_dir())), "local")
+    tdir = os.path.join(local, "repairs", "tombstones")
+    try:
+        return any(n.endswith(".json") for n in os.listdir(tdir))
+    except OSError:
+        return False
+
+
+def lane_tombstones(fresh=False):
+    """이 레인의 묘비 `(files, hooks)` — files = {팩 상대 rel: 수리 번호}, hooks = {(event, script): 수리 번호}.
+    `fresh=True` 는 캐시를 무시하고 다시 읽는다(등록기가 settings 잠금 **안에서** 결정 직전에 쓴다 — Y2(e)).
+    판독 실패 = 빈 집합(지금 동작)."""
+    if not fresh and "tombs" in _TOMB_CACHE:
+        return _TOMB_CACHE["tombs"]
+    if not _tombstones_may_exist():
+        _TOMB_CACHE["tombs"] = ({}, {})
+        return _TOMB_CACHE["tombs"]
+    data = _cys_local_json(["repair", "tombstones", "--json"])
+    items = data.get("tombstones") if isinstance(data, dict) else data
+    files, hooks = {}, {}
+    if isinstance(items, list):
+        for t in items:
+            if not isinstance(t, dict):
+                continue
+            rel = str(t.get("rel") or "").replace("\\", "/")
+            repair = str(t.get("repair") or "?")
+            kind = t.get("kind")
+            hook = None
+            if isinstance(kind, dict) and isinstance(kind.get("hook"), dict):
+                hook = (kind["hook"].get("event"), kind["hook"].get("script"))
+            elif rel.startswith("settings:"):
+                parts = rel.split(":", 2)
+                if len(parts) == 3:
+                    hook = (parts[1], parts[2])
+            if hook is not None:
+                ev, sc = hook
+                if ev and sc:
+                    hooks[(str(ev), os.path.basename(str(sc)))] = repair
+                continue
+            if kind == "file" and rel and not rel.startswith("/") and ".." not in rel:
+                files[rel] = repair
+    _TOMB_CACHE["tombs"] = (files, hooks)
+    return files, hooks
+
+
+def tombstoned_file(rel):
+    """팩 상대 rel 의 삭제를 이 레인의 묘비가 기록했으면 그 수리 번호(생명줄 훅 파일은 결코 아니다)."""
+    rel = rel.replace("\\", "/")
+    repair = lane_tombstones()[0].get(rel)
+    if repair and rel.startswith("hooks/"):
+        life = lane_lifeline_scripts()
+        if life is None or os.path.basename(rel) in life or os.path.basename(rel) == "cys-statusline.sh":
+            return None
+    return repair
+
+
+def tombstoned_hook(event, script, fresh=False):
+    """(event, script) 등록 해제를 이 레인의 묘비가 기록했으면 그 수리 번호. 생명줄·생명줄 모름 = None.
+    묘비가 없으면 생명줄 목록도 묻지 않는다(질의 0 — 수리를 하지 않은 설치는 지금과 똑같다)."""
+    repair = lane_tombstones(fresh=fresh)[1].get((event, script))
+    if not repair:
+        return None
+    life = lane_lifeline_scripts()
+    if life is None or script in life or script == "cys-statusline.sh":
+        return None
+    return repair
+
+
+def _write_json_lf_atomic(path, data, prefix=".schedule."):
+    """★H6(2)·§4-10 — preflight 의 `schedule.json` 쓰기: 같은 디렉터리 임시 파일 + 원자 교체, **LF**(윈도우
+    텍스트 모드의 CRLF 금지). 잠금은 더하지 않는다(RULINGS H6(2) "no lock added"). 원본 권한을 이어받는다
+    (mkstemp 의 0600 으로 좁히지 않는다). 내용 바이트는 종전(`json.dumps(…, indent=2)` · 끝 개행 없음)과 같다."""
+    d = os.path.dirname(os.path.abspath(path)) or "."
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=prefix, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write(json.dumps(data, ensure_ascii=False, indent=2))
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.chmod(tmp, stat.S_IMODE(os.stat(path).st_mode))
+        except OSError:
+            pass
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 # ★triage T11: 판정 불능(`unknown`)은 등록도 해제도 하지 않는데 **그 사실이 어디에도 남지
 #   않았다**. preflight 를 자동으로 돌리는 유일 지점(`javis_bootstrap.py` ①) 앞의 레인 마커
 #   fast path 가 같은 pack_version 이면 preflight 를 통째로 생략하므로, 그 팩 버전의 첫 부팅이
@@ -835,10 +990,16 @@ PACK_DIR_ENV_KEYS = ("CYS_PACK_DIR", "JAVIS_PACK_DIR", "AITERM_PACK_DIR", "AITER
 #   실제로 wakeup 일일 재배달 소음(C68)으로 실현됐다(0.14.29 성찰 차단). 미러가 정본과 갈리면
 #   bin/tests/test_todo_shared_constants.py 의 census 핀이 멈추고, 신 kind 의 C62/C68 분류
 #   미결정은 bin/tests/test_preflight_c62_c68_ledger.py 의 행동 census 가 멈춘다.
+# ★0.15.0 「스스로 해결」 M11(CONTRACTS O-C8-1): user-kept(사용자 파일 유지 + vendor `.new` 보관 — 합치기
+#   과제 = 워커)·vendor-first(기동 필수 충돌 — vendor 본 우선 + 사용자본 보관 — 다시 입히기 = 워커 + 주인
+#   승인). 둘 다 C68 기한 제외가 **아니다**(과제가 남아 있다) — C62 는 판정 집합(WARN)에 넣는다.
 MERGE_LEDGER_KINDS = ("healed", "new-pending", "kept-drift", "merged",
-                      "conflicted", "quarantined", "adopted")
-# C68 기한 제외 kind — kept-drift·merged(at-rest 보존)·adopted(복권 확정 = 스윕 대기 정상 체류).
-C68_EXEMPT_KINDS = ("kept-drift", "merged", "adopted")
+                      "conflicted", "quarantined", "adopted",
+                      "user-kept", "vendor-first")
+# C68 기한 제외 kind — kept-drift·merged(at-rest 보존)·adopted(복권 확정 = 스윕 대기 정상 체류)·
+# ★0.15.0 user-kept(사용자가 이겼다 — 살아 있는 파일이 사용자 것이고 합치기 과제는 C62·부서당 과제 하나로 이미
+# 전달된다. 기한 초과를 이유로 master 를 날마다 깨우지 않는다 — RULINGS AC7).
+C68_EXEMPT_KINDS = ("kept-drift", "merged", "adopted", "user-kept")
 
 
 def pack_dir():
@@ -1219,6 +1380,34 @@ def resolve_registration_targets():
 #   ③파싱 실패 = 거부(빈 dict 로 대체 금지) ④최초 1회 백업 보존 ⑤mkstemp+replace 원자 교체.
 #   락 사용 불가(백엔드 부재)여도 **쓰기는 진행**한다 — 직렬화 상실은 열화이고, 등록 자체를
 #   포기하면 훅이 사라진다(가용성 우선·조용하지 않게 사유를 반환값에 싣지 않고 stderr 로 남긴다).
+def _strip_our_hook(data, event, script_name):
+    """data["hooks"][event] 에서 **우리 팩의** script_name 항목만 뺀다(남의 훅 보존 · 빈 블록 제거).
+    `_unregister_event_hook` 의 변형 본문과 같은 규칙 — 등록기가 잠금 안에서 묘비를 보고 등록 대신 해제할 때 쓴다.
+    반환 = 뺀 항목이 있었는가."""
+    prefix = (os.path.join(pack_dir(), "hooks") + os.sep).replace("\\", "/")
+    arr = data.get("hooks", {}).get(event)
+    if not isinstance(arr, list):
+        return False
+    out, removed = [], False
+    for entry in arr:
+        if not isinstance(entry, dict):
+            out.append(entry)
+            continue
+        hooks = [h for h in entry.get("hooks", [])
+                 if not (isinstance(h, dict)
+                         and _hook_entry_is_ours(h.get("command", ""), script_name, prefix))]
+        if len(hooks) == len(entry.get("hooks", [])):
+            out.append(entry)
+            continue
+        removed = True
+        if hooks:
+            e2 = dict(entry)
+            e2["hooks"] = hooks
+            out.append(e2)
+    data["hooks"][event] = out
+    return removed
+
+
 def _settings_rmw(settings_path, mutate, indent=2):
     """settings.json 을 락 아래에서 읽고-바꾸고-원자적으로 쓴다.
 
@@ -1421,11 +1610,33 @@ class Preflight:
         return False  # report 모드: 관찰만, 부작용 없음
 
     # ── 공용 수리: cys init-pack — 누락 항목 재설치 + 비수정 파일 신버전 갱신 + **수정된
-    #    system 파일은 제자리 보존(kept-drift — 벤더 미전진)·벤더 전진 시 자동 3-way 병합**(충돌 =
-    #    vendor 본 채택 + 수정본 <rel>.user 보존·C62 원장 보고). 보안 잠금(trusted-keys.json)만
-    #    즉시 치유. 불가침은 user-owned(디렉티브·soul·CLAUDE·schedule)·seed-once(memory/·round
-    #    상태)뿐이다.
+    #    system 파일은 제자리 보존(kept-drift — 벤더 미전진)·벤더 전진 시 자동 3-way 병합**(★0.15.0 M11:
+    #    충돌·기준본 없음 = 기동 필수가 아니면 내 파일 유지 + <rel>.new(user-kept) · 기동 필수면 vendor 본
+    #    우선 + 수정본 <rel>.user 보관(vendor-first) — C62 원장 보고). 장부에 기록된 삭제(묘비)는 되살리지
+    #    않는다(생명줄 제외). 보안 잠금(trusted-keys.json)만 즉시 치유. 불가침은 user-owned(디렉티브·soul·
+    #    CLAUDE·schedule)·seed-once(memory/·round 상태)뿐이다.
     #    (구 문구 "사용자 수정본 불가침"은 user-owned에만 참 — 오독이 실사고를 낳아 시정.) ──
+    # ── ★0.15.0 M11 마 — 18개 복구 지점의 묘비 인지(설계 §6-11 마 "점검 도구의 18개 복구 지점") ──
+    #   장부에 기록된 삭제(묘비)는 init-pack 이 되살리지 않는다 — 복구 지점이 그 파일을 '누락'으로 보고
+    #   매번 init-pack 을 다시 부르고 FAIL 을 내면 부트 게이트가 영영 READY 가 안 된다. 그래서 그 파일은
+    #   '그 수리가 부재를 유지한다'고 사실대로 적고(WARN) init-pack 을 부르지 않는다. 훅 묘비는 파일 복구
+    #   지점이 종류로 건너뛴다(RULINGS W3(b)) · 생명줄 훅 파일은 결코 묘비 대상이 아니다(`tombstoned_file`).
+    def _split_tombstoned(self, names, prefix=""):
+        """(진짜 누락 이름 목록, [(팩 상대 rel, 수리 번호)]) — 묘비가 부재를 유지하는 것을 가른다."""
+        real, tomb = [], []
+        for n in names:
+            r = tombstoned_file(prefix + n)
+            if r:
+                tomb.append((prefix + n, r))
+            else:
+                real.append(n)
+        return real, tomb
+
+    @staticmethod
+    def _tomb_note(tomb):
+        return ("장부에 기록된 삭제 %d건은 부재 유지(되살리지 않음): %s — 되살리려면 그 수리를 "
+                "`cys repair revert <번호>`" % (len(tomb), ", ".join("%s←%s" % t for t in tomb)))
+
     def repair_via_init_pack(self):
         if self._init_pack_ran is not None:
             return self._init_pack_ran
@@ -1467,16 +1678,24 @@ class Preflight:
             p = os.path.join(pack_dir(), "directives", f)
             if not (os.path.isfile(p) and os.path.getsize(p) > 0):
                 missing.append(f)
+        # ★M11 마: 부재(파일 없음)만 묘비 대상이다 — 빈 파일은 묘비가 설명하지 못한다.
+        absent = [f for f in missing if not os.path.exists(os.path.join(pack_dir(), "directives", f))]
+        _real_absent, tomb = self._split_tombstoned(absent, "directives/")
+        missing = [f for f in missing if f not in {r.split("/", 1)[1] for r, _ in tomb}]
         if missing and self.fix and self.repair_via_init_pack():
             missing = [
                 f for f in missing
                 if not os.path.isfile(os.path.join(pack_dir(), "directives", f))
             ]
             if not missing:
-                self.add(cid, FIXED, "누락 디렉티브 재설치 완료")
+                self.add(cid, FIXED if not tomb else WARN,
+                         "누락 디렉티브 재설치 완료" + (" · " + self._tomb_note(tomb) if tomb else ""))
                 return
         if missing:
-            self.add(cid, FAIL, "누락/빈 파일: %s" % ", ".join(missing))
+            self.add(cid, FAIL, "누락/빈 파일: %s" % ", ".join(missing)
+                     + (" · " + self._tomb_note(tomb) if tomb else ""))
+        elif tomb:
+            self.add(cid, WARN, self._tomb_note(tomb))
         else:
             self.add(cid, PASS, "4종 디렉티브 존재·비공백")
 
@@ -1852,6 +2071,9 @@ class Preflight:
         if self.skipped(cid):
             return
         p = os.path.join(pack_dir(), "soul.md")
+        if not os.path.isfile(p) and not os.path.exists(p) and tombstoned_file("soul.md"):
+            self.add(cid, WARN, self._tomb_note([("soul.md", tombstoned_file("soul.md"))]))
+            return
         if not os.path.isfile(p):
             if self.fix and self.repair_via_init_pack() and os.path.isfile(p):
                 pass  # 재설치됨 — 아래 호칭 검사로 계속
@@ -1905,6 +2127,9 @@ class Preflight:
         if self.skipped(cid):
             return
         p = os.path.join(pack_dir(), "agents.json")
+        if not os.path.exists(p) and tombstoned_file("agents.json"):
+            self.add(cid, WARN, self._tomb_note([("agents.json", tombstoned_file("agents.json"))]))
+            return
         if not os.path.isfile(p) and self.fix and self.repair_via_init_pack():
             pass
         fixed_broken = False
@@ -1946,8 +2171,12 @@ class Preflight:
             return
         problems = []
         fixed = []
+        tomb = []
         for f in ("acl.json", "schedule.json"):
             p = os.path.join(pack_dir(), f)
+            if not os.path.exists(p) and tombstoned_file(f):
+                tomb.append((f, tombstoned_file(f)))
+                continue
             if not os.path.isfile(p):
                 if self.fix and self.repair_via_init_pack() and os.path.isfile(p):
                     pass
@@ -1966,7 +2195,10 @@ class Preflight:
                         pass
                 problems.append("%s 파싱 실패: %s" % (f, e))
         if problems:
-            self.add(cid, FAIL, "; ".join(problems))
+            self.add(cid, FAIL, "; ".join(problems) + (" · " + self._tomb_note(tomb) if tomb else ""))
+        elif tomb:
+            self.add(cid, WARN, self._tomb_note(tomb)
+                     + (" · 파손 복원: %s" % ", ".join(fixed) if fixed else ""))
         elif fixed:
             self.add(cid, FIXED, "파손 복원: %s (.broken-preflight 백업)" % ", ".join(fixed))
         else:
@@ -1994,6 +2226,120 @@ class Preflight:
                 self.add(cid, WARN, "실행권한 없음 (sh 명시 호출이라 동작은 하나 권장 755)")
                 return
         self.add(cid, PASS, p)
+
+    # ── ★0.15.0 M11 마(RULINGS X1) — 생명줄이 아닌 훅의 등록 점검은 레인의 묘비와 **조정**한다 ──
+    #   묘비가 있는 훅 = 해제가 기대 상태 → 있으면 해제(`--fix` · 있을 때만 · 잠금 안에서 묘비 재확인),
+    #   없으면 그대로(=정상). 묘비가 없으면 지금처럼 등록. 생명줄 여섯은 묘비를 보지 않는다.
+    def _tombstone_unregister(self, pairs, script_name):
+        """[(settings, event)] 의 우리 훅을 묘비대로 해제 — 반환 (해제 문구, 경고 문구)."""
+        done, warn = [], []
+        for t, ev in pairs:
+            label = "%s/%s %s" % (os.path.basename(os.path.dirname(t)) or os.path.basename(t), ev,
+                                  script_name)
+            if not self.fix:
+                warn.append("%s — 장부에 기록된 해제(%s)인데 등록돼 있다(--fix 로 해제)"
+                            % (label, tombstoned_hook(ev, script_name)))
+                continue
+            err = self._unregister_event_hook(t, ev, script_name, require_tombstone=True)
+            if err:
+                warn.append("%s 해제 실패: %s" % (label, err))
+            else:
+                done.append("%s 해제(장부에 기록된 해제 %s 유지)" % (label, tombstoned_hook(ev, script_name)))
+        return done, warn
+
+    # ── ★0.15.0 M11 마 · RULINGS X1/Y2 — 좁은 모드 `--reconcile-hooks --json [--dry-run]` ──
+    #   등록 점검**만** 돈다(다른 점검 0 · init-pack 0 · repair.sweep 트리거 0). 데몬(T6
+    #   `apply::reconcile_hook_registrations`)이 묘비를 쓴 뒤(또는 지운 뒤) 그 레인 환경에서 이 모드를 돌려
+    #   등록을 조정하고, 출력(Y2(a))을 파싱해 자기가 지목한 훅만 판정한다. 등록 논리는 두 벌이 아니다 —
+    #   아래는 평소 점검이 쓰는 같은 등록기·같은 존재 술어를 부를 뿐이다. 훅 목록은 제품이 등록하는 목록
+    #   그대로다(새로 더하거나 빼지 않는다 — P1): C08·C32·C33·C28(능력 게이트 포함)·C27·C55.
+    #   능력 게이트는 생명줄이고 그 등록 조건(데몬 경보 ∧ 지침 표지 · 대상표 deny)은 C28 이 소유하므로
+    #   여기서는 **보고만** 한다(기대 상태 = 그 조건의 판정) — 묘비는 생명줄에 적용되지 않으니 조정할 일이 없다.
+    def _reconcile_hook_table(self):
+        """(event, script, structural_lifeline, kind, matcher, timeout) — 제품 등록 목록(기존 상수에서 유도)."""
+        rows = [("SessionStart", "session-start.sh", True, "c08", None, None),
+                ("statusLine", "cys-statusline.sh", True, "c32", None, None)]
+        for ev in self.EVENT_HOOK_EVENTS:
+            rows.append((ev, self.EVENT_HOOK, False, "event", "", None))
+        for script, events in SELFCORR_HOOKS:
+            for ev, m in events:
+                rows.append((ev, script, False, "event", m, hook_timeout_for(script, ev)))
+        for ev, m in CAPGATE_HOOK[1]:
+            rows.append((ev, CAPGATE_HOOK[0], True, "capgate", m,
+                         hook_timeout_for(CAPGATE_HOOK[0], ev)))
+        rows.append(("PreToolUse", APPBUILD_HOOK, False, "appbuild", "Edit|Write|NotebookEdit", None))
+        for name, ev, m in GRILL_HOOKS:
+            rows.append((ev, name, False, "event", m, None))
+        return rows
+
+    def _reg_state(self, t, event, script, kind):
+        """대상 settings 하나의 등록 상태 — registered | unregistered | refused:<사유>(등록기가 쓰기를 거부하는 대상)."""
+        if os.path.islink(t):
+            return "refused:symlink"
+        if os.path.exists(t):
+            data = _read_json_tolerant(t)
+            if not isinstance(data, dict):
+                return "refused:unparsable"
+        if kind == "c32":
+            return "registered" if self._statusline_registered(t) else "unregistered"
+        return "registered" if self._event_hook_present_any(t, event, script) else "unregistered"
+
+    def reconcile_hooks(self, dry_run):
+        """Y2(a) 보고서 — {"hooks": [{event, script, lifeline, desired, targets: [{path, state}]}], …}."""
+        targets, forbidden = resolve_registration_targets()
+        if forbidden and not targets:
+            targets = []
+        life = lane_lifeline_scripts()
+        raw_hook_tombs = lane_tombstones()[1]
+        cap_state = None
+        rows, missing, errors = [], set(), []
+        for event, script, structural, kind, matcher, timeout in self._reconcile_hook_table():
+            lifeline = bool(structural or (life is not None and script in life))
+            script_ok = os.path.isfile(os.path.join(pack_dir(), "hooks", script))
+            if not script_ok:
+                missing.add(script)
+            if kind == "capgate":
+                if cap_state is None:
+                    cap_state = self._capgate_gate()[0]
+                desired = {CAPGATE_ON: "registered", CAPGATE_OFF: "unregistered"}.get(cap_state,
+                                                                                      "unknown")
+            elif lifeline:
+                desired = "registered"
+            elif tombstoned_hook(event, script):
+                desired = "unregistered"
+            elif life is None and (event, script) in raw_hook_tombs:
+                desired = "unknown"      # 생명줄 목록을 못 읽어 묘비를 적용할 수 없다(지금 동작 유지)
+            else:
+                desired = "registered"
+            tstates = []
+            for t in targets:
+                state = self._reg_state(t, event, script, kind)
+                if (not dry_run and not state.startswith("refused:") and kind != "capgate"
+                        and desired in ("registered", "unregistered")):
+                    err = None
+                    if desired == "registered" and script_ok:
+                        if kind == "c08" and not self._hook_registered(t):
+                            err = self._register_hook(t)
+                        elif kind == "c32" and not self._statusline_registered(t):
+                            err = self._register_statusline(t)
+                        elif kind == "appbuild" and not self._appbuild_hook_registered(t):
+                            err = self._register_appbuild_hook(t, respect_tombstone=not lifeline)
+                        elif kind == "event" and not self._event_hook_registered(t, event, script,
+                                                                                  timeout):
+                            err = self._register_event_hook(t, event, script, matcher,
+                                                            timeout=timeout,
+                                                            respect_tombstone=not lifeline)
+                    elif desired == "unregistered" and state == "registered":
+                        # Y2(d): 항목이 **있을 때만** 해제 · 잠금 안에서 묘비 재확인.
+                        err = self._unregister_event_hook(t, event, script, require_tombstone=True)
+                    if err and err != _REG_TOMBSTONED:
+                        errors.append("%s %s/%s: %s" % (t, event, script, err))
+                    state = self._reg_state(t, event, script, kind)
+                tstates.append({"path": t, "state": state})
+            rows.append({"event": event, "script": script, "lifeline": lifeline,
+                         "desired": desired, "targets": tstates})
+        return {"hooks": rows, "dry_run": bool(dry_run), "pack_dir": pack_dir(),
+                "forbidden": forbidden, "missing_scripts": sorted(missing), "errors": errors}
 
     # ── C08 SessionStart hook 등록 (Claude 설정) ──
     def _hook_registered(self, settings_path):
@@ -2136,6 +2482,10 @@ class Preflight:
         if self.skipped(cid):
             return
         script = os.path.join(pack_dir(), "hooks", self.EVENT_HOOK)
+        _srel = "hooks/" + self.EVENT_HOOK
+        if not os.path.exists(script) and tombstoned_file(_srel):
+            self.add(cid, WARN, self._tomb_note([(_srel, tombstoned_file(_srel))]))
+            return
         if not os.path.isfile(script):
             if not (self.fix and self.repair_via_init_pack() and os.path.isfile(script)):
                 self.add(cid, WARN, "hooks/%s 없음 — `cys init-pack` 또는 --fix" % self.EVENT_HOOK)
@@ -2144,28 +2494,49 @@ class Preflight:
         if forbidden and not targets:
             self.add(cid, SKIP, "등록 대상 없음 — %s" % forbidden)
             return
+        # ★0.15.0 M11 마: 장부에 기록된 해제(묘비)가 있는 이벤트는 등록 대상이 아니라 해제 대상이다.
+        tomb_ev = {ev: tombstoned_hook(ev, self.EVENT_HOOK) for ev in self.EVENT_HOOK_EVENTS}
+        t_done, t_warn = self._tombstone_unregister(
+            [(t, ev) for t in targets for ev in self.EVENT_HOOK_EVENTS
+             if tomb_ev[ev] and self._event_hook_present_any(t, ev, self.EVENT_HOOK)],
+            self.EVENT_HOOK)
+        t_note = ""
+        if any(tomb_ev.values()):
+            t_note = " · 장부에 기록된 해제 유지: %s" % ", ".join(
+                "%s(%s)" % (ev, r) for ev, r in sorted(tomb_ev.items()) if r)
         # 프로필×이벤트 단위로 미등록 항목 수집
         pending = [(t, ev) for t in targets for ev in self.EVENT_HOOK_EVENTS
-                   if not self._event_hook_registered(t, ev, self.EVENT_HOOK)]
+                   if not tomb_ev[ev] and not self._event_hook_registered(t, ev, self.EVENT_HOOK)]
         if not pending:
-            self.add(cid, PASS,
-                     "%d개 프로필 PreToolUse/PostToolUse 이벤트 hook 등록됨 (claude 재시작 후 적용)"
-                     % len(targets))
+            if t_warn:
+                self.add(cid, WARN, "; ".join(t_warn) + t_note)
+            elif t_done:
+                self.add(cid, FIXED, "; ".join(t_done) + t_note)
+            else:
+                self.add(cid, PASS,
+                         "%d개 프로필 PreToolUse/PostToolUse 이벤트 hook 등록됨 (claude 재시작 후 적용)%s"
+                         % (len(targets), t_note))
             return
         if self.fix:
-            done, errs = [], []
+            done, errs = list(t_done), list(t_warn)
             for t, ev in pending:
-                err = self._register_event_hook(t, ev, self.EVENT_HOOK, matcher="")
+                err = self._register_event_hook(t, ev, self.EVENT_HOOK, matcher="",
+                                                respect_tombstone=True)
+                if err == _REG_TOMBSTONED:
+                    done.append("%s/%s 등록 대신 해제(장부에 기록된 해제)"
+                                % (os.path.basename(os.path.dirname(t)), ev))
+                    continue
                 errs.append("%s/%s: %s" % (os.path.basename(os.path.dirname(t)), ev, err)) \
                     if err else done.append("%s/%s" % (os.path.basename(os.path.dirname(t)), ev))
             if errs:
                 self.add(cid, WARN, "; ".join(errs)
-                         + (" | 등록 성공: %s" % ", ".join(done) if done else ""))
+                         + (" | 등록 성공: %s" % ", ".join(done) if done else "") + t_note)
             else:
-                self.add(cid, FIXED, "이벤트 hook 등록: %s — ★claude 재시작 후 적용" % ", ".join(done))
+                self.add(cid, FIXED, "이벤트 hook 등록: %s — ★claude 재시작 후 적용%s"
+                         % (", ".join(done), t_note))
         else:
-            self.add(cid, WARN, "이벤트 hook 미등록: %d건 — --fix로 설치(claude 재시작 후 적용)"
-                     % len(pending))
+            self.add(cid, WARN, "이벤트 hook 미등록: %d건 — --fix로 설치(claude 재시작 후 적용)%s"
+                     % (len(pending), ("; " + "; ".join(t_warn)) if t_warn else "") + t_note)
 
     # ── C56 dept-hook 누수 invariant (결정론 재발방지 — 예방 가드 _pack_is_dept의 짝) ──
     # invariant: 비-부서 글로벌 settings(discover_claude_settings 반환)에 pack-dept-* 훅은 0이어야.
@@ -2442,6 +2813,10 @@ class Preflight:
             p = os.path.join(pack_dir(), "round", f)
             if not os.path.isfile(p):
                 missing.append(f)
+        missing, tomb = self._split_tombstoned(missing, "round/")
+        if tomb and not missing:
+            self.add(cid, WARN, self._tomb_note(tomb))
+            return
         if missing and self.fix and self.repair_via_init_pack():
             missing = [
                 f for f in missing
@@ -2703,6 +3078,10 @@ class Preflight:
         if self.skipped(cid):
             return
         p = os.path.join(pack_dir(), "bin", "javis_report.py")
+        if not os.path.exists(p) and tombstoned_file("bin/javis_report.py"):
+            self.add(cid, WARN, self._tomb_note([("bin/javis_report.py",
+                                                  tombstoned_file("bin/javis_report.py"))]))
+            return
         if not os.path.isfile(p):
             if self.fix and self.repair_via_init_pack() and os.path.isfile(p):
                 self.add(cid, FIXED, "javis_report.py 재설치")
@@ -2763,8 +3142,7 @@ class Preflight:
                     for x in unwired:
                         x["command"] = gate_command_with_lane(x["command"], lane)
                     data["jobs"] = jobs
-                    open(p, "w", encoding="utf-8").write(
-                        json.dumps(data, ensure_ascii=False, indent=2))
+                    _write_json_lf_atomic(p, data)   # ★H6(2): 제자리 덮어쓰기 → 임시+원자 교체(LF)
                     self.add(cid, FIXED,
                              "게이트 잡 %d건에 레인 배선 삽입(%s=%s) — 데몬별 state 분리"
                              % (len(unwired), GATE_STATE_ENV, lane))
@@ -2795,8 +3173,7 @@ class Preflight:
                 "if_absent": "skip",
             })
             data["jobs"] = jobs
-            open(p, "w", encoding="utf-8").write(
-                json.dumps(data, ensure_ascii=False, indent=2))
+            _write_json_lf_atomic(p, data)   # ★H6(2): 제자리 덮어쓰기 → 임시+원자 교체(LF)
             self.add(cid, FIXED, "5분 보고 job(owner-progress-gate-5min·델타게이트) 추가")
         else:
             self.add(cid, FAIL, "5분 주기 master 보고 job 부재 — --fix로 추가 가능")
@@ -2807,6 +3184,12 @@ class Preflight:
         p = os.path.join(pack_dir(), "bin", fname)
         missing = [f for f in (fname,) + tuple(extra_files)
                    if not os.path.isfile(os.path.join(pack_dir(), "bin", f))]
+        missing, tomb = self._split_tombstoned(missing, "bin/")
+        if tomb:
+            # 묘비가 부재를 유지하는 도구는 자기검증할 것이 없다 — 사실대로 적고 판정을 멈춘다.
+            self.add(cid, WARN, self._tomb_note(tomb)
+                     + (" · 그 밖의 누락: %s" % ", ".join(missing) if missing else ""))
+            return None
         if missing and self.fix and self.repair_via_init_pack():
             missing = [f for f in missing
                        if not os.path.isfile(os.path.join(pack_dir(), "bin", f))]
@@ -3725,7 +4108,16 @@ class Preflight:
         cid = "C22.work-skills"
         if self.skipped(cid):
             return
-        problems = [pr for s in WORK_SKILLS if (pr := self._work_skill_problem(s))]
+        tomb = [("skills/%s/SKILL.md" % s, tombstoned_file("skills/%s/SKILL.md" % s))
+                for s in WORK_SKILLS
+                if not os.path.exists(os.path.join(pack_dir(), "skills", s, "SKILL.md"))
+                and tombstoned_file("skills/%s/SKILL.md" % s)]
+        tomb_names = {r.split("/")[1] for r, _ in tomb}
+        problems = [pr for s in WORK_SKILLS
+                    if s not in tomb_names and (pr := self._work_skill_problem(s))]
+        if tomb and not problems:
+            self.add(cid, WARN, self._tomb_note(tomb))
+            return
         repaired = []
         if problems and self.fix and self.repair_via_init_pack():
             still = [pr for s in WORK_SKILLS if (pr := self._work_skill_problem(s))]
@@ -3896,6 +4288,10 @@ class Preflight:
         fpath = os.path.join(mdir, AUTOPILOT_MEMORY_FILE)
         idx = os.path.join(mdir, "MEMORY.md")
         fixed = []
+        _mrel = "memory/%s" % AUTOPILOT_MEMORY_FILE
+        if not os.path.exists(fpath) and tombstoned_file(_mrel):
+            self.add(cid, WARN, self._tomb_note([(_mrel, tombstoned_file(_mrel))]))
+            return
         if not os.path.isfile(fpath):
             if self.fix and self.repair_via_init_pack() and os.path.isfile(fpath):
                 fixed.append("메모리 파일 재설치")
@@ -4069,11 +4465,18 @@ class Preflight:
                     return True
         return False
 
-    def _register_appbuild_hook(self, settings_path):
-        """PreToolUse(Edit|Write|NotebookEdit)로 게이트 hook 등록. 성공=None, 실패=사유."""
+    def _register_appbuild_hook(self, settings_path, respect_tombstone=False):
+        """PreToolUse(Edit|Write|NotebookEdit)로 게이트 hook 등록. 성공=None, 실패=사유.
+        ★0.15.0 M11 마: `respect_tombstone` 이면 잠금 안에서 묘비를 다시 읽고 묘비가 있으면 등록 대신 해제
+        (반환 `_REG_TOMBSTONED`)."""
         cmd = _cys_hook_cmd(APPBUILD_HOOK)
+        refused = []
 
         def _mutate(data):
+            if respect_tombstone and tombstoned_hook("PreToolUse", APPBUILD_HOOK, fresh=True):
+                _strip_our_hook(data, "PreToolUse", APPBUILD_HOOK)
+                refused.append(True)
+                return None
             arr = data.setdefault("hooks", {}).setdefault("PreToolUse", [])
             kept, have = _prune_stale_hook_entries(arr, APPBUILD_HOOK, cmd)
             if not have:
@@ -4081,7 +4484,10 @@ class Preflight:
                              "hooks": [{"type": "command", "command": cmd}]})
             arr[:] = kept
 
-        return _settings_rmw(settings_path, _mutate)   # G16: 락+mkstemp 단일 소유자
+        err = _settings_rmw(settings_path, _mutate)   # G16: 락+mkstemp 단일 소유자
+        if err is None and refused:
+            return _REG_TOMBSTONED
+        return err
 
     # ── C28 자기교정·영속성 hook 등록 헬퍼 (event 일반화) ──
     @staticmethod
@@ -4160,7 +4566,7 @@ class Preflight:
         return False
 
     def _register_event_hook(self, settings_path, event, script_name, matcher=None,
-                             timeout=None):
+                             timeout=None, respect_tombstone=False):
         """event 에 pack/hooks/script_name 등록. 성공=None, 실패=사유. 멱등은 호출부.
         _register_appbuild_hook 과 동일 규약(symlink 거부·파싱실패 거부·백업·원자적).
 
@@ -4169,8 +4575,16 @@ class Preflight:
         **매 프롬프트마다 훅이 2회 발화**한다(큐 폭주 방향). 그리고 `max(기존, 선언)` 이라
         사용자가 더 크게 잡아둔 값은 **내리지 않는다**(오살 금지 — 한 방향으로만 여는 축)."""
         cmd = _cys_hook_cmd(script_name)
+        refused = []
 
         def _mutate(data):
+            # ★0.15.0 M11 마(RULINGS X1 · Y2(e)): 생명줄이 아닌 훅은 **이 잠금 안에서, 결정 직전에** 레인의
+            #   묘비를 다시 읽는다 — 데몬이 묘비를 먼저 쓰고 조정하므로, 어떤 순서로 겹쳐도 묘비가 있는 훅은
+            #   해제된 채로 끝난다(등록 대신 우리 항목만 뺀다 · 남의 훅 보존). 생명줄 호출부는 이 인자를 주지 않는다.
+            if respect_tombstone and tombstoned_hook(event, script_name, fresh=True):
+                _strip_our_hook(data, event, script_name)
+                refused.append(True)
+                return None
             arr = data.setdefault("hooks", {}).setdefault(event, [])
             kept, have = _prune_stale_hook_entries(arr, script_name, cmd)
             if have and timeout is not None:
@@ -4194,9 +4608,12 @@ class Preflight:
                 kept.append(entry)
             arr[:] = kept
 
-        return _settings_rmw(settings_path, _mutate)   # G16: 락+mkstemp 단일 소유자
+        err = _settings_rmw(settings_path, _mutate)   # G16: 락+mkstemp 단일 소유자
+        if err is None and refused:
+            return _REG_TOMBSTONED
+        return err
 
-    def _unregister_event_hook(self, settings_path, event, script_name):
+    def _unregister_event_hook(self, settings_path, event, script_name, require_tombstone=False):
         """event 에서 **우리 팩의** script_name 훅을 제거한다. 성공=None(제거 0건도 성공) / 실패=사유.
 
         ★왜 필요한가(R1 major · 두 리뷰어): 조건부 등록은 조건이 거짓이 되면 **되돌려야** 한다.
@@ -4207,6 +4624,10 @@ class Preflight:
         prefix = (os.path.join(pack_dir(), "hooks") + os.sep).replace("\\", "/")
 
         def _mutate(data):
+            # ★0.15.0 M11 마(Y2(e)): 묘비를 근거로 해제하는 호출은 잠금 안에서 묘비를 다시 읽는다 — 그 사이
+            #   되돌리기가 묘비를 지웠으면(= 다시 등록돼야 한다) 아무것도 빼지 않는다.
+            if require_tombstone and not tombstoned_hook(event, script_name, fresh=True):
+                return None
             arr = data.get("hooks", {}).get(event)
             if not isinstance(arr, list):
                 return None
@@ -4287,13 +4708,24 @@ class Preflight:
                 warns.append("등록 대상 없음 — %s" % forbidden)
                 targets = []
             reg = 0
+            # ★0.15.0 M11 마: 장부에 기록된 해제가 있으면 등록 대신 해제(있을 때만)가 기대 상태다.
+            _atomb = tombstoned_hook("PreToolUse", APPBUILD_HOOK)
             for t in targets:
+                if _atomb:
+                    if self._event_hook_present_any(t, "PreToolUse", APPBUILD_HOOK):
+                        _d, _w = self._tombstone_unregister([(t, "PreToolUse")], APPBUILD_HOOK)
+                        fixed.extend(_d)
+                        warns.extend(_w)
+                    continue
                 if self._appbuild_hook_registered(t):
                     reg += 1
                     continue
                 if self.fix:
-                    err = self._register_appbuild_hook(t)
-                    if err:
+                    err = self._register_appbuild_hook(t, respect_tombstone=True)
+                    if err == _REG_TOMBSTONED:
+                        fixed.append("%s 게이트 hook 등록 대신 해제(장부에 기록된 해제)"
+                                     % os.path.basename(t))
+                    elif err:
                         warns.append("hook 등록 실패(%s): %s" % (os.path.basename(t), err))
                     else:
                         reg += 1
@@ -4421,6 +4853,9 @@ class Preflight:
         rels.append(os.path.join("bin", "javis_reflect.py"))
         for rel in rels:
             p = os.path.join(pack_dir(), rel)
+            if not os.path.exists(p) and tombstoned_file(rel):
+                warns.append(self._tomb_note([(rel.replace(os.sep, "/"), tombstoned_file(rel))]))
+                continue
             if not os.path.isfile(p):
                 if self.fix and self.repair_via_init_pack() and os.path.isfile(p):
                     pass
@@ -4435,6 +4870,9 @@ class Preflight:
         # (a-2) ★훅 **본체** 실재(부트 v2 A2 · 등록 대상 아님 — 위 HOOK_BODY_FILES 주석 참조)
         for _rel, _owner in HOOK_BODY_FILES:
             _p = os.path.join(pack_dir(), _rel)
+            if not os.path.exists(_p) and tombstoned_file(_rel):
+                warns.append(self._tomb_note([(_rel.replace(os.sep, "/"), tombstoned_file(_rel))]))
+                continue
             if not os.path.isfile(_p):
                 if self.fix and self.repair_via_init_pack() and os.path.isfile(_p):
                     pass
@@ -4645,7 +5083,15 @@ class Preflight:
                 if not os.path.isfile(os.path.join(pack_dir(), "hooks", script_name)):
                     continue
                 tier_fatal = script_name in AWAKENING_SCRIPTS
+                # ★0.15.0 M11 마: 생명줄(주입·저장·팀 기동)은 묘비를 보지 않는다 — 언제나 등록
+                #   (`tombstoned_hook` 이 생명줄을 거른다 — 묘비가 있을 때만 생명줄 목록을 묻는다).
                 for event, matcher in events:
+                    if tombstoned_hook(event, script_name):
+                        if self._event_hook_present_any(t, event, script_name):
+                            _d, _w = self._tombstone_unregister([(t, event)], script_name)
+                            fixed.extend(_d)
+                            warns.extend(_w)
+                        continue   # 해제가 기대 상태 — 미등록 경고도 등록도 하지 않는다
                     # ★U-21: 판정·쓰기 모두 **같은 선언값**을 본다(둘이 갈리면 매 런 재쓰기).
                     _to = hook_timeout_for(script_name, event)
                     # ★판정 2축을 **보고에서 가른다** — 두 사실은 다르다:
@@ -4660,8 +5106,11 @@ class Preflight:
                         continue
                     if self.fix:
                         err = self._register_event_hook(t, event, script_name, matcher,
-                                                        timeout=_to)
-                        if err:
+                                                        timeout=_to, respect_tombstone=True)
+                        if err == _REG_TOMBSTONED:
+                            fixed.append("%s/%s %s 등록 대신 해제(장부에 기록된 해제)"
+                                         % (os.path.basename(t), event, script_name))
+                        elif err:
                             (fails if (tier_fatal and not _cmd_ok) else warns).append(
                                 "%s/%s %s 실패: %s"
                                 % (os.path.basename(t), event,
@@ -4891,12 +5340,23 @@ class Preflight:
                     os.chmod(hook, mode | 0o755)
                     fixed.append("%s 실행권한" % hname)
             unreg = 0
+            # ★0.15.0 M11 마: 장부에 기록된 해제 → 등록 대신 해제(있을 때만) · 미등록 경고 없음.
+            _gtomb = tombstoned_hook(hevent, hname)
             for t in targets:
+                if _gtomb:
+                    if self._event_hook_present_any(t, hevent, hname):
+                        _d, _w = self._tombstone_unregister([(t, hevent)], hname)
+                        fixed.extend(_d)
+                        warns.extend(_w)
+                    continue
                 if self._event_hook_registered(t, hevent, hname):
                     continue
                 if self.fix:
-                    err = self._register_event_hook(t, hevent, hname, matcher=hmatcher)
-                    if err:
+                    err = self._register_event_hook(t, hevent, hname, matcher=hmatcher,
+                                                    respect_tombstone=True)
+                    if err == _REG_TOMBSTONED:
+                        fixed.append("%s 등록 대신 해제(장부에 기록된 해제)" % hname)
+                    elif err:
                         warns.append("%s 등록 실패(%s): %s"
                                      % (hname, os.path.basename(t), err))
                     else:
@@ -5672,10 +6132,28 @@ class Preflight:
                             if isinstance(v, dict) and v.get("kind") == "conflicted")
         quarantined = sorted(r for r, v in pending.items()
                              if isinstance(v, dict) and v.get("kind") == "quarantined")
-        if not healed and not newp and not conflicted and not quarantined:
+        # ★0.15.0 M11 가·나(O-C8-1): 업데이트가 보관한 사용자 수정 — 과제가 남은 상태라 판정 집합(WARN)이다.
+        user_kept = sorted(r + (" (주의: %s)" % v.get("caution") if v.get("caution") else "")
+                           for r, v in pending.items()
+                           if isinstance(v, dict) and v.get("kind") == "user-kept")
+        vendor_first = sorted(r for r, v in pending.items()
+                              if isinstance(v, dict) and v.get("kind") == "vendor-first")
+        self._parked_merge_wakes(pending)
+        if (not healed and not newp and not conflicted and not quarantined
+                and not user_kept and not vendor_first):
             self.add(cid, PASS, "병합 대기 0건")
             return
         parts = []
+        if user_kept:
+            parts.append("★사용자 파일 유지(user-kept) %d건 — 업데이트가 내 수정을 덮지 않았고 vendor 신버전은 "
+                         "<파일>.new 에 보관(합치기 = 워커 · 부서당 과제 하나): %s%s"
+                         % (len(user_kept), ", ".join(user_kept[:8]),
+                            " 외 %d건" % (len(user_kept) - 8) if len(user_kept) > 8 else ""))
+        if vendor_first:
+            parts.append("★기동 필수 vendor 우선(vendor-first) %d건 — vendor 본을 먼저 살리고 내 수정본은 "
+                         "<파일>.user 에 보관(다시 입히기 = 워커가 승인 절차로 · cys repair reapply): %s%s"
+                         % (len(vendor_first), ", ".join(vendor_first[:8]),
+                            " 외 %d건" % (len(vendor_first) - 8) if len(vendor_first) > 8 else ""))
         if healed:
             parts.append("★원복(healed) %d건 — 라이브 수정이 배포 원본으로 되돌려짐(수정본은 <파일>.user 보존): %s%s"
                          % (len(healed), ", ".join(healed[:8]),
@@ -5701,8 +6179,82 @@ class Preflight:
             parts.append("(at-rest) kept-drift %d건·merged %d건 — 조치 불요 보존 상태(정보 병기)"
                          % (atrest_kd, atrest_mg))
         self.add(cid, WARN, "; ".join(parts)
-                 + " — `cys pack-merge`로 검토(가치 있는 수정은 vendor 승격 제보)"
+                 + " — `cys pack-merge`로 검토(내 수정은 이 설치에서 유지·수리한다)"
                  + " · 방금 원복된 파일의 원커맨드 복원: `cys pack-rollback --file <파일>`")
+
+    # ── ★0.15.0 M11 가·나·차 — 부서당 과제 하나(설계 §4-11 가 "합치기는 부서당 과제 하나로 묶어 워커가",
+    #    차 "주인에게 목록을 한 번 보여 주고 … 과제는 부서당 하나") ──
+    # master 의 wakeup 큐에 **멱등 키**로 적재한다(키 = 레인 + 보관 집합 지문 — 같은 집합이면 몇 번 돌아도 1건,
+    # 부록 A-2 #15 깨우기 묶기). 집합이 바뀌어야 새 키가 생긴다. master 는 직접 병합하지 않고 워커에게
+    # 위임한다(지침). `--fix`(부트 ⓪ 표준 호출) ∧ 워크스페이스 루트 확정일 때만 — C68 과 같은 조건.
+    def _parked_merge_wakes(self, pending):
+        if not self.fix:
+            return
+        wakeup = os.path.join(pack_dir(), "bin", "javis_wakeup.py")
+        wk_root = os.environ.get("JAVIS_ROOT") or os.getcwd()
+        if not (os.path.isfile(wakeup) and os.path.isdir(os.path.join(wk_root, "_round"))):
+            return
+        lane = os.path.basename(os.path.normpath(pack_dir())) or "pack"
+        parked = sorted("%s:%s:%s" % (r, v.get("kind"), v.get("version", ""))
+                        for r, v in pending.items()
+                        if isinstance(v, dict) and v.get("kind") in ("user-kept", "vendor-first"))
+        legacy = sorted(r for r, v in pending.items()
+                        if isinstance(v, dict) and v.get("kind") in ("healed", "conflicted")
+                        and os.path.isfile(os.path.join(pack_dir(), r + ".user")))
+        jobs = []
+        fps = {}
+        if parked:
+            fp = hashlib.sha1("\n".join(parked).encode("utf-8")).hexdigest()[:16]
+            fps["parked-merge"] = fp
+            jobs.append(("parked-merge",
+                         "업데이트가 보관한 수정 %d건(%s) — 워커 1명에게 부서당 과제 하나로 맡겨라: "
+                         "user-kept 는 합치기(cys pack-merge), vendor-first 는 승인 절차로 다시 입히기"
+                         "(cys repair reapply · 주인 승인). master 직접 병합 금지"
+                         % (len(parked), lane),
+                         "parked-merge-%s-%s" % (lane, fp)))
+        if legacy:
+            fp = hashlib.sha1("\n".join(legacy).encode("utf-8")).hexdigest()[:16]
+            fps["legacy-user-list"] = fp
+            jobs.append(("legacy-user-list",
+                         "예전 업데이트가 .user 로 밀어낸 수정 %d건(%s) — 주인에게 목록(`cys pack-adopt`)을 "
+                         "한 번 보여 주고, 워커 1명에게 부서당 과제 하나로 평가를 맡겨라(진짜 수정만 수리 흐름으로 "
+                         "다시 입힘 · 기동 필수는 승인 절차 · 판독 불가는 UTF-8 로 바꿔서 · 무조건 되살리기 금지)"
+                         % (len(legacy), lane),
+                         "legacy-user-list-%s-%s" % (lane, fp)))
+        # ★RULINGS AC7: 같은 집합은 **한 번만** 보인다 — 배달한 지문을 레인 상태(`<팩>/state/`)에 둔다. 큐의 멱등 키는
+        #   대기 중일 때만 묶으므로, 지문 기록 없이는 배달 뒤 다음 점검이 같은 목록을 다시 적재한다. 집합이 바뀌면 새로
+        #   보이고, 집합이 비면 기록을 지운다(같은 수정이 나중에 다시 보관되면 다시 보인다). 적재가 실패하면 기록하지
+        #   않는다(다음 점검이 다시 시도).
+        state_p = os.path.join(pack_dir(), "state", "merge-notice-delivered.json")
+        try:
+            with open(state_p, encoding="utf-8") as f:
+                delivered = json.load(f)
+            if not isinstance(delivered, dict):
+                delivered = {}
+        except Exception:
+            delivered = {}
+        before = dict(delivered)
+        for task in list(delivered):
+            if task not in fps:
+                del delivered[task]
+        for task, reason, key in jobs:
+            if delivered.get(task) == fps[task]:
+                continue
+            try:
+                r = subprocess.run(
+                    [sys.executable, wakeup, "enqueue", "--to", "master", "--task", task,
+                     "--reason", reason, "--idempotency-key", key],
+                    capture_output=True, text=True, timeout=10, env=_utf8_env())
+                if r.returncode == 0:
+                    delivered[task] = fps[task]
+            except Exception:
+                pass   # 관측 채널 — 실패가 점검을 막지 않는다(C62 WARN 은 그대로 남는다)
+        if delivered != before:
+            try:
+                os.makedirs(os.path.dirname(state_p), exist_ok=True)
+                _write_json_lf_atomic(state_p, delivered, prefix=".merge-notice.")
+            except Exception:
+                pass
 
     # ── C68 병합 원장 체류 기한 게이트 (★W-D1 커스텀 생존 2026-07-17) ──
     # 고지 채널은 실측으로 반증됐다(원장 항목 9주 체류 — C62 WARN·init-pack 보고 줄이 있었는데도).
@@ -10590,6 +11142,34 @@ def _only_usage_exit(json_mode, mode, detail):
     return 2
 
 
+def _reconcile_hooks_main(argv):
+    """`javis_preflight.py --reconcile-hooks [--json] [--dry-run]` — ★RULINGS X1/Y2 좁은 모드(등록 점검만).
+    rc 0 = 보고서를 냈다(기대 상태 도달 여부는 각 대상의 state 로 판정 — 호출자 몫), rc 2 = 사용법 오류,
+    rc 125 = 관리 모드에서 쓰기 요청(관리 모드는 보고 전용 — `--dry-run` 만 허용)."""
+    ap = argparse.ArgumentParser(prog="javis_preflight.py --reconcile-hooks",
+                                 description="제품 훅 등록을 레인의 묘비와 조정한다(등록 점검만)")
+    ap.add_argument("--reconcile-hooks", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--json", action="store_true", help="JSON 출력(Y2(a) 스키마)")
+    ap.add_argument("--dry-run", action="store_true", help="쓰지 않고 보고만")
+    args = ap.parse_args(argv)
+    if _managed_active() and not args.dry_run:
+        print('managed preflight requires report mode', file=sys.stderr)
+        return 125
+    pf = Preflight(fix=not args.dry_run, skips=[], mode="report" if args.dry_run else "fix")
+    report = pf.reconcile_hooks(dry_run=args.dry_run)
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        for h in report["hooks"]:
+            states = ", ".join("%s=%s" % (os.path.basename(os.path.dirname(t["path"])) or t["path"],
+                                          t["state"]) for t in h["targets"]) or "(대상 없음)"
+            print("[%s] %s %s — 기대 %s · %s" % ("생명줄" if h["lifeline"] else "일반", h["event"],
+                                             h["script"], h["desired"], states))
+        for e in report["errors"]:
+            print("⚠ %s" % e)
+    return 0
+
+
 def main():
     if _managed_active() and any(x in sys.argv[1:] for x in ('--self-test', '--seed-trust')):
         print('managed preflight requires report mode', file=sys.stderr)
@@ -10602,6 +11182,9 @@ def main():
     #   직후·claude 기동 前 호출한다. 전체 체크 배터리를 돌리지 않는다(부트 핫패스 · 부작용 = 그 .claude.json 1개).
     if "--seed-trust" in sys.argv[1:]:
         return _seed_trust_main(sys.argv[1:])
+    # ★0.15.0 M11(RULINGS X1/Y2): 좁은 모드 — argparse 앞 가로채기(같은 관례 · 전체 점검을 돌리지 않는다).
+    if "--reconcile-hooks" in sys.argv[1:]:
+        return _reconcile_hooks_main(sys.argv[1:])
     ap = argparse.ArgumentParser(description="CYSJavis 결정론 부트 프리플라이트")
     ap.add_argument("--fix", action="store_true", help="수리 가능한 항목 자동 수리")
     # OPP-17: --fix 의 시스템 변경을 단일 Mutation 게이트로 수렴.
