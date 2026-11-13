@@ -2821,13 +2821,16 @@ type RelPredicate = Box<dyn Fn(&str) -> bool + Send + Sync>;
 /// 팩 상대경로 하나의 과거 출시 해시 목록 — 입력원의 표 칸.
 type RelHashes = Box<dyn Fn(&str) -> Vec<String> + Send + Sync>;
 
-/// ★T2f(RULINGS BD4 · BH6 · BC2): **"두 컴파일 목록 중 하나에 있는가"** — 팩 쓰기 동사(되살리기 · 합치기 ·
-/// 병합 되돌리기 · 되돌리기)가 출시본이 아닌 바이트를 넣지 못하는 파일의 단일 술어. 오늘은 기동 필수 목록
-/// (`boot_critical::entries()`)만 답한다 — **T5a 의 마지막 재기반 작업이 보호 목록의 행을 이 함수 안에 더한다**
-/// (BC2 · BD4). 업데이트의 충돌 처리는 이 술어를 쓰지 않는다: 보호 목록에만 있는 파일의 업데이트 충돌은 사용자
-/// 사본이 남는다(주인 결정 20 · AQ12) — 업데이트의 기동 필수 판정은 `boot_critical_rel` 그대로다.
+/// ★T2f(RULINGS BD4 · BH6 · BC2) · T5a 재기반 2단계: **"두 컴파일 목록 중 하나에 있는가"** — 팩 쓰기 동사(되살리기 ·
+/// 합치기 · 병합 되돌리기 · 되돌리기)가 출시본이 아닌 바이트를 넣지 못하는 파일의 단일 술어. 기동 필수 목록의 행
+/// (`boot_critical::boot_critical_entry`) **또는** 보호 목록의 행(`boot_critical::protection_entry`)이면 참이다 — 두
+/// 조회는 목록 자신의 대조 키(`rel_key`: `/` 구분자, 앞의 `./` 제거, T3c 의 `repair::types::fold_name` 으로 고정점까지
+/// 접기 — RULINGS BN1 · CD1)로 맞추므로, 같은 파일을 여는 어느 철자든 같은 답이다(호출자가 이미 접은 키를 넘겨도 같다).
+/// 업데이트의 충돌 처리는 이 술어를 쓰지 않는다: 보호 목록에만 있는 파일의 업데이트 충돌은 사용자 사본이 남는다(주인
+/// 결정 20 · AQ12) — 업데이트의 기동 필수 판정은 `boot_critical_rel` 그대로다.
 pub fn listed_in_compiled_lists(rel: &str) -> bool {
-    boot_critical_rel(rel)
+    crate::repair::boot_critical::boot_critical_entry(rel).is_some()
+        || crate::repair::boot_critical::protection_entry(rel).is_some()
 }
 
 /// ★T2f(RULINGS BO3): 이 바이트가 **출시본**인가 — 이 바이너리의 내장 vendor 본 또는 과거 출시 해시 표 중 하나와 같은
@@ -14713,9 +14716,9 @@ mod m11_tests {
         assert_eq!(rig.kind("bin/general.sh").as_deref(), Some("merged"));
     }
 
-    /// ★T2f(RULINGS BD4): 팩 쓰기 동사의 단일 술어 — 오늘은 기동 필수 목록(`boot_critical::entries()`)과 같고, 제품 입력원
-    /// (`none()` · `for_live_pack()`)은 이 함수를 그대로 쓴다(이음새로 바뀐 술어가 제품 경로에 남으면 빨갛다). T5a 의 마지막
-    /// 재기반 작업이 보호 목록의 행을 이 함수에 더하면 첫 단언을 그 합집합으로 바꾼다.
+    /// ★T2f(RULINGS BD4): 팩 쓰기 동사의 단일 술어 — 기동 필수 목록(`boot_critical::entries()`)과 보호 목록
+    /// (`boot_critical::protection_entries()`)의 합집합이고(T5a 재기반 2단계가 넓혔다 — 첫 단언이 그 합집합), 제품 입력원
+    /// (`none()` · `for_live_pack()`)은 이 함수를 그대로 쓴다(이음새로 바뀐 술어가 제품 경로에 남으면 빨갛다).
     #[test]
     fn t2f_one_predicate_for_every_pack_writer() {
         let rig = Rig::new("t2fpred");
@@ -14725,8 +14728,14 @@ mod m11_tests {
         let live = UpdateSources::for_live_pack(&rig.pack);
         let mut probes: Vec<&str> = PACK_ALL.iter().map(|(r, _)| *r).collect();
         probes.extend(crate::repair::boot_critical::entries().iter().map(|e| e.rel));
+        probes.extend(crate::repair::boot_critical::protection_entries().iter().map(|e| e.rel));
+        let protection_rel = |rel: &str| {
+            crate::repair::boot_critical::protection_entries()
+                .iter()
+                .any(|e| list_key(e.rel) == list_key(rel))
+        };
         for rel in probes {
-            assert_eq!(listed_in_compiled_lists(rel), boot_critical_rel(rel), "{rel}");
+            assert_eq!(listed_in_compiled_lists(rel), boot_critical_rel(rel) || protection_rel(rel), "{rel}");
             assert_eq!(none.is_listed(rel), listed_in_compiled_lists(rel), "none(): {rel}");
             assert_eq!(live.is_listed(rel), listed_in_compiled_lists(rel), "for_live_pack(): {rel}");
         }

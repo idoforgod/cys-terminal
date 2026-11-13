@@ -3496,6 +3496,51 @@ mod tests {
         );
     }
 
+    /// RULINGS CH6 — the rule documents (C10) and the two compiled lists are disjoint: a rule
+    /// document that becomes a row of a list fails the build and sends the question to the master;
+    /// the set is read from the daemon's own definition (`RULE_DOC_NAMES` + the `*_directive.md`
+    /// rule) — a missing or changed anchor fails too.
+    #[test]
+    fn rule_documents_and_the_lists_are_disjoint() {
+        let e = derive_edited(
+            &edit_one("src/bin/cysd/repair.rs", |t| {
+                t.replacen(
+                    "    \"soul.md\",\n",
+                    "    \"soul.md\",\n    \"inject-context.sh\",\n",
+                    1,
+                )
+            }),
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("CH6: `hooks/inject-context.sh` is a rule document") && e.contains("master"),
+            "{e}"
+        );
+        let e = derive_edited(
+            &edit_one("src/bin/cysd/repair.rs", |t| {
+                t.replace("const RULE_DOC_NAMES", "const RULE_DOCUMENT_NAMES")
+            }),
+            &[],
+        )
+        .unwrap_err();
+        assert!(e.contains("`const RULE_DOC_NAMES` not found"), "{e}");
+        let e = derive_edited(
+            &edit_one("src/bin/cysd/repair.rs", |t| {
+                t.replace(
+                    "folded.ends_with(\"_directive.md\")",
+                    "folded.ends_with(\"_rules.md\")",
+                )
+            }),
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("rule-document set") && e.contains("RULINGS CH6"),
+            "{e}"
+        );
+    }
+
     #[test]
     fn census_fails_on_a_new_registrar_def() {
         let e = derive_edited(

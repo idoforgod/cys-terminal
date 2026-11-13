@@ -58,6 +58,42 @@ pub struct Sources<'a> {
 pub const PACK_RS: &str = "src/pack.rs";
 pub const AGY_RS: &str = "src/agy_statusline.rs";
 pub const LIFELINE_RS: &str = "src/repair/boot_critical.rs";
+/// RULINGS CH6 — the definition of the rule documents (C10): `RULE_DOC_NAMES` and the
+/// `*_directive.md` rule of `rule_document_name` in the daemon's repair verbs. A binary-side source,
+/// so the build script does not watch it (like the proof files): a clean build always checks, and
+/// `compiled_table_equals_a_fresh_derivation` re-derives in every library test run.
+pub const RULE_DOCS_RS: &str = "src/bin/cysd/repair.rs";
+
+/// RULINGS CH6 — the rule-document set (C10) as the daemon defines it: (the fixed names, the
+/// suffix of the `*_directive.md` rule). A missing anchor is an error naming it.
+pub fn rule_documents(src: &Sources) -> Result<(Vec<String>, String), String> {
+    let text = (src.repo_file)(RULE_DOCS_RS)
+        .map(|t| lf(&t))
+        .ok_or_else(|| format!("anchor file `{RULE_DOCS_RS}` unreadable (RULINGS CH6)"))?;
+    let at = text.find("const RULE_DOC_NAMES: [&str; ").ok_or_else(|| {
+        format!("anchor {RULE_DOCS_RS}: `const RULE_DOC_NAMES` not found (RULINGS CH6)")
+    })?;
+    let open = text[at..].find("= [").map(|p| at + p + 3);
+    let close = open.and_then(|o| text[o..].find("];").map(|p| o + p));
+    let (Some(open), Some(close)) = (open, close) else {
+        return Err(format!(
+            "anchor {RULE_DOCS_RS}: `RULE_DOC_NAMES` has no `= [ … ];` body (RULINGS CH6)"
+        ));
+    };
+    let names: Vec<String> = text[open..close]
+        .split('"')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let rule = "ends_with(\"_directive.md\") && folded.len() > \"_directive.md\".len()";
+    if names.is_empty() || !text.contains(rule) {
+        return Err(format!(
+            "anchor {RULE_DOCS_RS}: the rule-document set (`RULE_DOC_NAMES` + the `*_directive.md` rule of `rule_document_name`) not found as known (RULINGS CH6)"
+        ));
+    }
+    Ok((names, "_directive.md".to_string()))
+}
 /// Pack rel of the preflight (registrars and hook constants).
 pub const PREFLIGHT: &str = "bin/javis_preflight.py";
 
@@ -2580,6 +2616,25 @@ pub fn derive(src: &Sources) -> Result<Vec<GenEntry>, String> {
             _ => errs.push(format!(
                 "STAGE5_HOOK_ROWS: `{rel}` is not a class-1 row (RULINGS BR1)"
             )),
+        }
+    }
+
+    // RULINGS CH6 — the rule documents (C10) and the two compiled lists are disjoint
+    match rule_documents(src) {
+        Err(e) => errs.push(e),
+        Ok((names, suffix)) => {
+            for rel in rows
+                .keys()
+                .cloned()
+                .chain(protection.iter().map(|e| e.rel.clone()))
+            {
+                let base = rel.rsplit('/').next().unwrap_or(&rel).to_ascii_lowercase();
+                if names.contains(&base) || (base.ends_with(&suffix) && base.len() > suffix.len()) {
+                    errs.push(format!(
+                        "CH6: `{rel}` is a rule document (C10) and a row of a compiled list — the rule documents and the two lists must stay disjoint (T4's rule-document branch guards them); bring the question to the master before listing it"
+                    ));
+                }
+            }
         }
     }
 
