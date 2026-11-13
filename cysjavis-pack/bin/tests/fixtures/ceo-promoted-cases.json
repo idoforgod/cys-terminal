@@ -1,0 +1,84 @@
+{
+  "_doc": "ONE meaning of 'promoted' (RULINGS CB1): promoted = MASTER_DIRECTIVE.md.pre-ceo exists OR the live MASTER_DIRECTIVE.md holds the generator's separator (scripts/gen_ceo_template.py SEPARATOR, LF or CRLF spelling). The content decides; the backup only widens what the overwrite guards protect. Read by cysjavis-pack/bin/tests/test_ceo_composition.py (javis_preflight, javis_org, cys-dept), src/bin/cys.rs (A12, cys::pack::ceo_promoted_in) and src-tauri/src/main.rs (the drift gate). md = null means the file does not exist.",
+  "separator": "\n---\n\n# [본문 — 표준 MASTER 운영 계약 전문]\n\n",
+  "cases": [
+    {
+      "name": "plain MASTER, no backup",
+      "md": "# MASTER\n본문\n",
+      "pre_ceo": false,
+      "promoted": false
+    },
+    {
+      "name": "plain MASTER, backup present (broad reading)",
+      "md": "# MASTER\n본문\n",
+      "pre_ceo": true,
+      "promoted": true
+    },
+    {
+      "name": "composed LF, no backup",
+      "md": "# CEO 머리말 (master of master · 단일소유 강제 · exit 7)\n\n---\n\n# [본문 — 표준 MASTER 운영 계약 전문]\n\n# MASTER\n본문\n",
+      "pre_ceo": false,
+      "promoted": true
+    },
+    {
+      "name": "composed LF, backup present",
+      "md": "# CEO 머리말 (master of master · 단일소유 강제 · exit 7)\n\n---\n\n# [본문 — 표준 MASTER 운영 계약 전문]\n\n# MASTER\n본문\n",
+      "pre_ceo": true,
+      "promoted": true
+    },
+    {
+      "name": "composed CRLF, no backup",
+      "md": "# CEO 머리말 (master of master · 단일소유 강제 · exit 7)\r\n\r\n---\r\n\r\n# [본문 — 표준 MASTER 운영 계약 전문]\r\n\r\n# MASTER\r\n본문\r\n",
+      "pre_ceo": false,
+      "promoted": true
+    },
+    {
+      "name": "separator line inside a never-promoted MASTER (content decides)",
+      "md": "# MASTER\n본문\n\n---\n\n# [본문 — 표준 MASTER 운영 계약 전문]\n\n더 쓴 줄\n",
+      "pre_ceo": false,
+      "promoted": true
+    },
+    {
+      "name": "only the heading line, no rule",
+      "md": "# MASTER\n본문\n# [본문 — 표준 MASTER 운영 계약 전문]\n",
+      "pre_ceo": false,
+      "promoted": false
+    },
+    {
+      "name": "rule and heading with a different blank-line shape",
+      "md": "# MASTER\n본문\n---\n# [본문 — 표준 MASTER 운영 계약 전문]\n",
+      "pre_ceo": false,
+      "promoted": false
+    },
+    {
+      "name": "separator-less v0.14 CEO copy, no backup",
+      "md": "# CEO (master of master)\n단일소유 강제 · exit 7\n",
+      "pre_ceo": false,
+      "promoted": false
+    },
+    {
+      "name": "separator-less v0.14 CEO copy, backup present",
+      "md": "# CEO (master of master)\n단일소유 강제 · exit 7\n",
+      "pre_ceo": true,
+      "promoted": true
+    },
+    {
+      "name": "empty file, no backup",
+      "md": "",
+      "pre_ceo": false,
+      "promoted": false
+    },
+    {
+      "name": "missing file, no backup",
+      "md": null,
+      "pre_ceo": false,
+      "promoted": false
+    },
+    {
+      "name": "missing file, backup present",
+      "md": null,
+      "pre_ceo": true,
+      "promoted": true
+    }
+  ]
+}

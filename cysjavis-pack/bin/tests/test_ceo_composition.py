@@ -172,6 +172,11 @@ class Rig(unittest.TestCase):
     def calls(self):
         return _slurp(self.log, encoding="utf-8") if os.path.exists(self.log) else ""
 
+    def pushes(self, title):
+        """그 제목으로 올린 feed push 수(스텁 cys 호출 기록)."""
+        return sum(1 for line in self.calls().splitlines()
+                   if line.startswith("cys feed push --title %s --body " % title))
+
     def captures(self, kind):
         return sorted(glob.glob(self.p("MASTER_DIRECTIVE.md.%s.*" % kind)))
 
@@ -272,6 +277,7 @@ class Composition(Rig):
         self.assertRegex(os.path.basename(caps[0]), r"\.before-compose\.\d{8}T\d{6}Z$")
         self.assertEqual(_slurp(caps[0], encoding="utf-8"), live, "보관 사본이 조립 전 바이트가 아니다")
         self.assert_receipt_for(HEADER_V2, USER + "USERFIX-E6-2\n", self.read("MASTER_DIRECTIVE.md"))
+        self.assertEqual(self.pushes("CEO 지침 머리말 — 고친 머리말 사본 보관"), 1, "보관 사본을 알리지 않았다")
 
     def test_template_advance_recomposes_header_only_without_capture(self):
         """생성된 머리말(영수증이 증명)은 사본 없이 새 머리말로 바뀌고, 본문은 그대로 · 재주입 1회."""
@@ -284,7 +290,7 @@ class Composition(Rig):
         self.assertEqual(rc, 0, out + err)
         self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER_V2 + SEP + USER + "USERFIX-E6-2\n")
         self.assertEqual(self.captures("before-compose"), [])
-        self.assertIn("머리말 다시 조립", out + err)
+        self.assertIn("CEO 지침 다시 조립", out + err)
         self.assertEqual(self.calls().count("cys status --json") - n_before, 1, "재조립 뒤 재주입 시도 1회")
 
     def test_post_verify_requires_valid_receipt(self):
@@ -409,6 +415,7 @@ class Composition(Rig):
         self.assertEqual(rc, 0, out + err)
         self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP)
         self.assertIn("강등 보류", err)
+        self.assertEqual(self.pushes("CEO 강등 보류(본부 지침 확인 필요)"), 1, "강등 보류가 stderr 에만 남았다(CB5)")
         self.assertEqual(self.leftovers(), [])
 
     def test_concurrent_promotion_lock_is_taken(self):
@@ -504,7 +511,9 @@ class Composition(Rig):
         self.assertIn("cys feed reply rid-r ceo-promoted", self.calls(), "해소 뒤 보류 알림이 남았다")
 
     def test_backup_invariant_for_the_overwrite_guard(self):
-        """A12·팩 갱신 가드 4 는 .pre-ceo 실재로 '승격 중'을 안다 — 조립 승격은 늘 백업을 남기고, 지워져도 다시 만든다."""
+        """조립 승격은 늘 백업(.pre-ceo)을 남기고, 지워지면 다음 승격 확인이 본문으로 다시 만든다. ★RULINGS CB1 이후 A12·
+        가드 4 는 백업에 기대지 않는다(구분선 ∨ .pre-ceo — `ceo_vendor_overwrite_rejection_truth_table` ⑥′ 이 고정) —
+        이 시험은 백업 자체(강등·이전 때의 사본)를 지킨다."""
         self.seed()
         self.assertEqual(self.run_dept("promote-ceo")[0], 0)
         self.assertTrue(os.path.exists(self.p("MASTER_DIRECTIVE.md.pre-ceo")))
@@ -517,26 +526,46 @@ class Composition(Rig):
 
 
 class LegacyShapes(Rig):
-    """0.14.x 에서 통째 복사로 승격된 기계 — 0.15.0 의 첫 승격 확인이 조립으로 옮긴다(잃는 바이트 없음)."""
+    """★RULINGS CB3 — 0.14.x 에서 통째 복사로 승격된 기계(영수증 .ceo-receipt.json 없음)의 첫 승격 확인.
+    본문 = .pre-ceo(사용자 자신의 승격 전 본부 지침). 살아 있는 옛 CEO 지침은 배포된 CEO 틀과 바이트까지 같지 않으면
+    (CEO 동안 고쳤거나 출처를 확인할 수 없으면) 통째로 시각 붙은 사본 + 알림 1건(자동으로 합치지 않음). .pre-ceo 가 없으면
+    본문 = 옛 지침의 구분선 뒤 + 같은 알림. 강등은 0.14.x 처럼 승격 전 본부 지침을 돌려준다.
+
+    | 시작 상태 | 본문 | 남는 것 | 알림 |
+    | 그대로인 복사본(0.14 영수증 == 지침) + .pre-ceo | .pre-ceo | — | 없음 |
+    | CEO 동안 고친 복사본 + .pre-ceo | .pre-ceo | 옛 지침 통째 사본 | 1건 |
+    | 0.14 영수증 없음(배포본 여부 모름) + .pre-ceo | .pre-ceo | 옛 지침 통째 사본 | 1건 |
+    | 지금 설치된 틀과 바이트 같음(영수증 없음) + .pre-ceo | .pre-ceo | — | 없음 |
+    | .pre-ceo 없음 | 옛 지침의 구분선 뒤 | 옛 지침 통째 사본 | 1건 |
+    | 구분선 없는 옛 사본(생성기 이전) + .pre-ceo | .pre-ceo | 옛 지침 통째 사본 | 1건 |
+    """
     OLD_HEADER = "# CEO 옛 머리말 (master of master · 단일소유 강제 · exit 7)\n"
     OLD_VENDOR = master_text("OLD-STANDARD-MASTER")
     USER_OLD = OLD_VENDOR + "USERFIX-OLD 승격 전에 고친 줄\n"
+    NOTICE = "CEO 지침 이전 — 옛 CEO 지침 사본 보관"
+
+    def migrate(self, md, pre=True, legacy_hash=None):
+        self.seed(md=md)
+        if pre:
+            _write(self.p("MASTER_DIRECTIVE.md.pre-ceo"), self.USER_OLD)
+        if legacy_hash:
+            _write(self.p(".ceo-template-applied"), legacy_hash + "\n")
+        rc, out, err = self.run_dept("promote-ceo")
+        self.assertEqual(rc, 0, out + err)
+        return out + err
 
     def test_unedited_whole_copy_takes_the_backup_as_body(self):
         old_copy = self.OLD_HEADER + SEP + self.OLD_VENDOR
-        self.seed(md=old_copy)
-        _write(self.p("MASTER_DIRECTIVE.md.pre-ceo"), self.USER_OLD)
-        _write(self.p(".ceo-template-applied"), sha(old_copy) + "\n")
-        rc, out, err = self.run_dept("promote-ceo")
-        self.assertEqual(rc, 0, out + err)
+        self.migrate(old_copy, legacy_hash=sha(old_copy))
         self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + self.USER_OLD,
                          "0.14.x 가 덮어쓴 사용자 본부 지침(백업)이 돌아오지 않았다")
-        self.assertEqual(self.captures("before-compose"), [], "그대로인 vendor 사본은 보관할 사용자 바이트가 없다")
+        self.assertEqual(self.captures("before-compose"), [], "배포본 그대로인 사본은 보관할 사용자 바이트가 없다")
+        self.assertEqual(self.pushes(self.NOTICE), 0)
         self.assertIsNone(self.read(".ceo-template-applied"))
         self.assert_receipt_for(HEADER, self.USER_OLD, HEADER + SEP + self.USER_OLD)
         rc, out, err = self.run_dept("down", "d0")
         self.assertEqual(rc, 0, out + err)
-        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), self.USER_OLD)
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), self.USER_OLD, "강등이 승격 전 본부 지침을 돌려주지 않았다")
 
     def test_unedited_whole_copy_demotes_to_the_backup(self):
         old_copy = self.OLD_HEADER + SEP + self.OLD_VENDOR
@@ -547,31 +576,65 @@ class LegacyShapes(Rig):
         self.assertEqual(rc, 0, out + err)
         self.assertEqual(self.read("MASTER_DIRECTIVE.md"), self.USER_OLD, "0.14.x 강등 결과와 달라졌다")
         self.assertIsNone(self.read("MASTER_DIRECTIVE.md.pre-ceo"))
+        self.assertEqual(self.captures("before-demote"), [])
 
-    def test_edited_whole_copy_keeps_the_live_body_and_captures(self):
+    def test_edited_while_ceo_body_is_the_backup_and_the_copy_is_kept(self):
         original = self.OLD_HEADER + SEP + self.OLD_VENDOR
         edited = original + "CEO-EDIT CEO 동안 고친 줄\n"
-        self.seed(md=edited)
-        _write(self.p("MASTER_DIRECTIVE.md.pre-ceo"), self.USER_OLD)
-        _write(self.p(".ceo-template-applied"), sha(original) + "\n")
-        rc, out, err = self.run_dept("promote-ceo")
-        self.assertEqual(rc, 0, out + err)
-        self.assertEqual(self.read("MASTER_DIRECTIVE.md"),
-                         HEADER + SEP + self.OLD_VENDOR + "CEO-EDIT CEO 동안 고친 줄\n", "살아 있는 본문이 바뀌었다")
+        self.migrate(edited, legacy_hash=sha(original))
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + self.USER_OLD, "본문이 승격 전 본부 지침이 아니다")
         caps = self.captures("before-compose")
-        self.assertEqual(len(caps), 1)
-        self.assertEqual(_slurp(caps[0], encoding="utf-8"), edited)
+        self.assertEqual([_slurp(c, encoding="utf-8") for c in caps], [edited], "옛 CEO 지침을 통째로 보관하지 않았다")
+        self.assertEqual(self.pushes(self.NOTICE), 1)
+        self.assertIn(os.path.basename(caps[0]), self.calls(), "알림이 보관 사본을 이름으로 가리키지 않는다")
         self.assertEqual(self.read("MASTER_DIRECTIVE.md.pre-ceo"), self.USER_OLD, "백업을 덮었다")
+        # 알림은 1건 — 데몬이 보관 중인 동종 알림이 있으면 다시 올리지 않는다(다음 이전이 있더라도).
+        _write(self.feedlist, "rid-m\t[pending]\tceo-notice\t%s\tdecision=-\n" % self.NOTICE)
+        self.assertEqual(self.run_dept("promote-ceo")[0], 0)
+        self.assertEqual(self.pushes(self.NOTICE), 1)
+        rc, out, err = self.run_dept("down", "d0")
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), self.USER_OLD)
+
+    def test_no_legacy_receipt_is_treated_as_edited(self):
+        old_copy = self.OLD_HEADER + SEP + self.OLD_VENDOR          # 그대로일 수도 있지만 증명할 길이 없다
+        self.migrate(old_copy)
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + self.USER_OLD)
+        self.assertEqual([_slurp(c, encoding="utf-8") for c in self.captures("before-compose")], [old_copy])
+        self.assertEqual(self.pushes(self.NOTICE), 1)
+
+    def test_copy_equal_to_the_installed_template_needs_no_copy(self):
+        self.migrate(TEMPLATE)                                       # 지금 설치된 틀과 바이트까지 같다(배포본)
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + self.USER_OLD)
+        self.assertEqual(self.captures("before-compose"), [])
+        self.assertEqual(self.pushes(self.NOTICE), 0)
+
+    def test_no_backup_body_is_the_part_after_the_separator(self):
+        edited = self.OLD_HEADER + SEP + self.OLD_VENDOR + "CEO-EDIT\n"
+        self.migrate(edited, pre=False)
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + self.OLD_VENDOR + "CEO-EDIT\n")
+        self.assertEqual([_slurp(c, encoding="utf-8") for c in self.captures("before-compose")], [edited])
+        self.assertEqual(self.pushes(self.NOTICE), 1)
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md.pre-ceo"), self.OLD_VENDOR + "CEO-EDIT\n")
+        rc, out, err = self.run_dept("down", "d0")
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), self.OLD_VENDOR + "CEO-EDIT\n")
+
+    def test_no_backup_demotion_before_migration(self):
+        edited = self.OLD_HEADER + SEP + self.OLD_VENDOR + "CEO-EDIT\n"
+        self.seed(md=edited)
+        rc, out, err = self.run_dept("down", "d0")
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), self.OLD_VENDOR + "CEO-EDIT\n")
+        self.assertEqual([_slurp(c, encoding="utf-8") for c in self.captures("before-demote")], [edited])
+        self.assertEqual(self.pushes(self.NOTICE), 1)
 
     def test_copy_without_separator_uses_backup_and_captures(self):
         six_kb = "# CEO (master of master) — 행동 규약\n단일소유 강제 · exit 7\n구분선 없는 옛 머리글 사본\n"
-        self.seed(md=six_kb)
-        _write(self.p("MASTER_DIRECTIVE.md.pre-ceo"), self.USER_OLD)
-        rc, out, err = self.run_dept("promote-ceo")
-        self.assertEqual(rc, 0, out + err)
+        self.migrate(six_kb)
         self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + self.USER_OLD)
-        caps = self.captures("before-compose")
-        self.assertEqual([_slurp(c, encoding="utf-8") for c in caps], [six_kb])
+        self.assertEqual([_slurp(c, encoding="utf-8") for c in self.captures("before-compose")], [six_kb])
+        self.assertEqual(self.pushes(self.NOTICE), 1)
         # 같은 형상의 강등(조립 전) — 백업으로 되돌리고 지금 파일은 보관.
         shutil.rmtree(self.dirs)
         self.seed(md=six_kb)
@@ -580,6 +643,119 @@ class LegacyShapes(Rig):
         self.assertEqual(rc, 0, out + err)
         self.assertEqual(self.read("MASTER_DIRECTIVE.md"), self.USER_OLD)
         self.assertEqual([_slurp(c, encoding="utf-8") for c in self.captures("before-demote")], [six_kb])
+
+
+class SeparatorWithoutEvidence(Rig):
+    """★RULINGS CB2 — 구분선 줄은 있는데 승격된 적이 있다는 증거(영수증·0.14 영수증·.pre-ceo·CEO 머리말 표지)가 없는
+    본부 지침은 보류된다: 바이트 무이동, rc 6, 알림 1건. 부트 표지 게이트도 건너뛰지 않는다. 강등도 잘라 내지 않는다."""
+    NEVER = VENDOR + "사용자가 붙여 넣은 문서 조각" + SEP + "그 아래 이어진 사용자 줄\n"
+    TITLE = "CEO 승격 보류(본부 지침에 조립 구분선 — 승격 기록 없음)"
+
+    def test_held_without_moving_a_byte(self):
+        self.seed(md=self.NEVER)
+        listing = lambda: sorted(f for f in os.listdir(self.dirs) if ".promote.lock" not in f)   # flock 락 파일은 종전대로
+        before = listing()
+        rc, out, err = self.run_dept("promote-ceo")
+        self.assertEqual(rc, 5, out + err)
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), self.NEVER, "증거 없는 구분선 파일을 바꿨다")
+        self.assertEqual(listing(), before, "파일이 생겼다(.pre-ceo·영수증·사본)")
+        self.assertEqual(self.pushes(self.TITLE), 1)
+        # 자동 경로(대기 틱)도 같은 보류 — 알림은 1건(dedupe).
+        _write(self.feedlist, "rid-u\t[pending]\tceo-notice\t%s\tdecision=-\n" % self.TITLE)
+        self.set_pending()
+        self.assertEqual(self.run_dept("promote-if-pending")[0], 0)
+        self.assertEqual(self.pushes(self.TITLE), 1)
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), self.NEVER)
+        # 사용자가 그 줄을 지우면 정상 승격 — 보류 알림은 닫힌다.
+        _write(self.p("MASTER_DIRECTIVE.md"), USER)
+        self.assertEqual(self.run_dept("promote-if-pending")[0], 0)
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), HEADER + SEP + USER)
+        self.assertIn("cys feed reply rid-u ceo-promoted", self.calls())
+
+    def test_boot_marker_gate_is_not_skipped(self):
+        self.seed(md=self.NEVER, marker=False)
+        rc, out, err = self.run_dept("promote-ceo")
+        self.assertEqual(rc, 5, out + err)
+        self.assertTrue(os.path.exists(self.pending_path()), "증거 없는 구분선 파일에 부트 게이트를 건너뛰었다")
+        self.assertIn("부트", out + err)
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), self.NEVER)
+
+    def test_demotion_does_not_strip_it(self):
+        self.seed(md=self.NEVER)
+        rc, out, err = self.run_dept("down", "d0")
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.read("MASTER_DIRECTIVE.md"), self.NEVER)
+        self.assertEqual(self.pushes("CEO 강등 보류(본부 지침 확인 필요)"), 1)
+
+
+class SymlinkedDirective(Rig):
+    """★RULINGS CB5 — 심볼릭 링크인 본부 지침(또는 백업)은 보류된다(rc 6 + 알림) — 일반 파일로 바꿔 쓰지 않는다."""
+
+    def setUp(self):
+        super().setUp()
+        if not hasattr(os, "symlink"):
+            self.skipTest("심볼릭 링크 없는 플랫폼")
+
+    def link_master(self):
+        target = os.path.join(self.tmp, "real-master.md")
+        _write(target, USER)
+        os.remove(self.p("MASTER_DIRECTIVE.md"))
+        os.symlink(target, self.p("MASTER_DIRECTIVE.md"))
+        return target
+
+    def test_promotion_holds_a_symlinked_master(self):
+        self.seed()
+        target = self.link_master()
+        rc, out, err = self.run_dept("promote-ceo")
+        self.assertEqual(rc, 5, out + err)
+        self.assertTrue(os.path.islink(self.p("MASTER_DIRECTIVE.md")), "링크를 일반 파일로 바꿨다")
+        self.assertEqual(_slurp(target, encoding="utf-8"), USER)
+        self.assertEqual(self.pushes("CEO 승격 보류(본부 지침 확인 필요)"), 1)
+
+    def test_demotion_holds_a_symlinked_master(self):
+        self.seed()
+        self.assertEqual(self.run_dept("promote-ceo")[0], 0)
+        composed = self.read("MASTER_DIRECTIVE.md")
+        target = os.path.join(self.tmp, "real-master.md")
+        _write(target, composed)
+        os.remove(self.p("MASTER_DIRECTIVE.md"))
+        os.symlink(target, self.p("MASTER_DIRECTIVE.md"))
+        rc, out, err = self.run_dept("down", "d0")
+        self.assertEqual(rc, 0, out + err)
+        self.assertTrue(os.path.islink(self.p("MASTER_DIRECTIVE.md")))
+        self.assertEqual(_slurp(target, encoding="utf-8"), composed)
+        self.assertEqual(self.pushes("CEO 강등 보류(본부 지침 확인 필요)"), 1)
+
+
+class OnePredicate(Rig):
+    """★RULINGS CB1 — '승격'의 한 뜻(.pre-ceo ∨ 구분선)을 파이썬 판독자 셋(정본 javis_preflight, javis_org, cys-dept)이
+    같은 픽스처 한 벌에 같은 답으로 낸다. Rust(A12 · `ceo_promoted_in`)와 앱은 같은 파일을 cargo 시험이 읽는다."""
+    FIXTURE = os.path.join(SELF, "fixtures", "ceo-promoted-cases.json")
+
+    def test_every_python_reader_agrees_with_the_fixture(self):
+        with open(self.FIXTURE, encoding="utf-8") as f:
+            fx = json.load(f)
+        self.assertEqual(fx["separator"], SEP)
+        spec = importlib.util.spec_from_file_location("javis_org_cb1", os.path.join(BIN, "javis_org.py"))
+        org = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(org)
+        funcs = extract_shell_function(_slurp(DEPT, encoding="utf-8"), "ceo_py")
+        self.assertGreaterEqual(len(fx["cases"]), 10)
+        for i, c in enumerate(fx["cases"]):
+            with self.subTest(case=c["name"]):
+                md_p = os.path.join(self.tmp, "fx%d" % i, "MASTER_DIRECTIVE.md")
+                os.makedirs(os.path.dirname(md_p))
+                md_b = None if c["md"] is None else c["md"].encode("utf-8")
+                if md_b is not None:
+                    _write(md_p, md_b)
+                if c["pre_ceo"]:
+                    _write(md_p + ".pre-ceo", "백업\n")
+                want = c["promoted"]
+                self.assertEqual(pf.Preflight._c03_ceo_promoted(md_b, c["pre_ceo"]), want, "preflight")
+                self.assertEqual(org._ceo_promoted(md_b, c["pre_ceo"]), want, "javis_org")
+                r = subprocess.run(["bash", "-c", funcs + 'ceo_py promoted "$1"\n', DEPT, md_p],
+                                   capture_output=True, text=True, encoding="utf-8", env=self.env, timeout=60)
+                self.assertEqual(r.stdout.strip(), "yes" if want else "no", "cys-dept: %s" % r.stderr)
 
 
 class HqDirectiveChain(Rig):
