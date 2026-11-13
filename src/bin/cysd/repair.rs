@@ -804,7 +804,10 @@ fn live_seats(daemon: &Daemon) -> Vec<(u64, String)> {
 /// the timeout are looked up by the exact spelling; this holds whether or not the file exists.
 /// The target is classified as `<pack_root>/<rel>` — the pack root of the lane the request is
 /// served for (`cys::pack::pack_dir()`, the value the verb's `Ctx::pack_dir` holds) — never as a
-/// relative path resolved against the daemon's working directory (BN2). Either list unavailable,
+/// relative path resolved against the daemon's working directory (BN2). A target whose live file is
+/// the same file as a listed row's under another rel is refused naming the row (AW3 (d) — the
+/// exported `boot_critical::refuse_identity_alias`, which `commit` step (3a) also calls). Either
+/// list unavailable,
 /// no absolute pack root, or a path that cannot be decided → an error: `begin` refuses (a
 /// boot-critical or protection file is never repaired as a general one). Rule documents are T4's
 /// gate.
@@ -840,6 +843,10 @@ fn production_classify(
         exact(rel, e.rel)?;
         return Ok(Classification::ProtectionRelated);
     }
+    // RULINGS AW3 (d): the live file is the SAME file (volume + file id) as a listed row's live file
+    // under another rel (a hard link …) — refused naming the row; an absent file is not compared
+    cys::repair::boot_critical::refuse_identity_alias(pack_root, [rel])
+        .map_err(RepairError::Precondition)?;
     // RULINGS BN2: the lane's pack root joined with the rel (absolute — no working directory on
     // this path); every lane root is a candidate as before, the request's own root included
     let mut roots = pack_roots();
@@ -1377,7 +1384,7 @@ mod ledger_verbs {
         }
         // RULINGS BN1: lifeline names compare after the full case fold (the protection lookup
         // below folds the same way through `rel_key`)
-        let fold = cys::repair::boot_critical::fold_name;
+        let fold = cys::repair::types::fold_name;
         if LIFELINE_HOOKS.iter().any(|l| fold(l) == fold(script)) {
             return Err(VerbError::new(
                 cys::repair::types::ERR_PRECONDITION,
@@ -2716,6 +2723,7 @@ mod ledger_verbs {
                 ));
             }
             path_rules(ctx, &rec, Some(states.as_slice()))?;
+            cys::repair::boot_critical::refuse_identity_alias(&ctx.pack_dir, file_targets(&rec).map(|f| f.rel.as_str())).map_err(|why| VerbError::new(cys::repair::types::ERR_PRECONDITION, why))?; // RULINGS AW3 (d)
             if current_states(ctx, &rec)? != states {
                 return Err(VerbError::new(
                     "target_changed",

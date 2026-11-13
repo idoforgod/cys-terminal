@@ -286,3 +286,66 @@ fn a_working_directory_inside_a_pack_does_not_change_the_classification() {
     drop(_back);
     let _ = std::fs::remove_dir_all(&pack);
 }
+
+/// RULINGS AW3 (d): a target whose live file is the SAME file (volume + file id) as a listed row's
+/// live file under another rel — a hard link — is refused naming the row's spelling, for a
+/// protection row and a boot-critical row; the row's own rel is classified by its own rule; the
+/// exported function `commit` step (3a) calls refuses the same set.
+#[test]
+fn a_hard_link_to_a_listed_file_is_refused_naming_the_row() {
+    use cys::repair::boot_critical::refuse_identity_alias;
+    let pack = scratch("aw3d-pack");
+    for d in ["hooks", "notes"] {
+        std::fs::create_dir_all(pack.join(d)).unwrap();
+    }
+    for (row, alias) in [
+        ("hooks/guard.sh", "notes/g.sh"),
+        ("hooks/inject-context.sh", "notes/ic.sh"),
+    ] {
+        std::fs::write(pack.join(row), "#!/bin/sh\n").unwrap();
+        std::fs::hard_link(pack.join(row), pack.join(alias)).unwrap();
+        let e = production_classify(alias, &pack).unwrap_err();
+        assert!(
+            format!("{e:?}").contains(&format!("`{row}`")),
+            "{alias}: {e:?}"
+        );
+    }
+    assert_eq!(
+        production_classify("hooks/guard.sh", &pack).unwrap(),
+        Classification::ProtectionRelated
+    );
+    assert_eq!(
+        production_classify("hooks/inject-context.sh", &pack).unwrap(),
+        Classification::BootCritical
+    );
+    std::fs::write(pack.join("notes/plain.sh"), "#!/bin/sh\n").unwrap();
+    assert_eq!(
+        production_classify("notes/plain.sh", &pack).unwrap(),
+        Classification::General
+    );
+    let e = refuse_identity_alias(&pack, ["notes/plain.sh", "notes/ic.sh"]).unwrap_err();
+    assert!(e.contains("`hooks/inject-context.sh`"), "{e}");
+    assert!(refuse_identity_alias(&pack, ["notes/plain.sh", "hooks/guard.sh"]).is_ok());
+    let _ = std::fs::remove_dir_all(&pack);
+}
+
+/// RULINGS AW3 (d): no false refusal — listed files absent (the path-rule row
+/// `state/hook-targets.json` included), or the target itself absent.
+#[test]
+fn an_absent_listed_file_gives_no_false_refusal() {
+    use cys::repair::boot_critical::refuse_identity_alias;
+    let pack = scratch("aw3d-absent");
+    std::fs::create_dir_all(pack.join("notes")).unwrap();
+    std::fs::write(pack.join("notes/x.json"), "{}\n").unwrap();
+    assert!(!pack.join("state/hook-targets.json").exists());
+    assert_eq!(
+        production_classify("notes/x.json", &pack).unwrap(),
+        Classification::General
+    );
+    assert_eq!(
+        production_classify("notes/not-there.sh", &pack).unwrap(),
+        Classification::General
+    );
+    assert!(refuse_identity_alias(&pack, ["notes/x.json", "notes/not-there.sh"]).is_ok());
+    let _ = std::fs::remove_dir_all(&pack);
+}

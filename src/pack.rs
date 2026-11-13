@@ -14536,6 +14536,39 @@ mod m11_tests {
         assert!(e.get("parked_at").is_some());
     }
 
+    /// RULINGS AC6 (T5a, approved test-only edit) — the pin on the REAL compiled list: the
+    /// boot-critical list is not empty and holds every lifeline hook file the contract lists (the
+    /// statusline script `cys-statusline.sh` is excluded from the list by O-C4-4 — a clear-procedure
+    /// file — and stays off it), and under the production seam (`UpdateSources::none()` =
+    /// `boot_critical_rel`, no stub) a conflicted lifeline hook file is `vendor-first`.
+    #[test]
+    fn ac6_real_list_makes_a_conflicted_lifeline_hook_vendor_first() {
+        let list = crate::repair::boot_critical::entries();
+        assert!(!list.is_empty(), "the compiled boot-critical list is empty");
+        for name in crate::repair::boot_critical::LIFELINE_HOOKS {
+            let rel = format!("hooks/{name}");
+            if name == "cys-statusline.sh" {
+                assert!(!boot_critical_rel(&rel), "{rel}: excluded by O-C4-4");
+                continue;
+            }
+            let e = list.iter().find(|e| e.rel == rel);
+            assert!(e.is_some_and(|e| e.lifeline), "{rel} is not a lifeline row of the compiled list");
+            assert!(boot_critical_rel(&rel));
+        }
+        let rel = "hooks/inject-context.sh";
+        let rig = Rig::new("ac6real");
+        let base = "#!/bin/bash\nx\n";
+        let mine = "#!/bin/bash\nMINE\n";
+        let vendor = "#!/bin/bash\nVENDOR\n";
+        rig.write(rel, mine.as_bytes());
+        rig.manifest(&[(rel, base)]);
+        rig.pristine(rel, base);
+        rig.install(&[(rel, vendor)], false, &UpdateSources::none());
+        assert_eq!(rig.read(rel).as_deref(), Some(vendor), "vendor first");
+        assert_eq!(rig.read("hooks/inject-context.sh.user").as_deref(), Some(mine));
+        assert_eq!(rig.entry(rel).unwrap()["kind"], "vendor-first");
+    }
+
     /// 아 + RULINGS AC1·AC4: 업데이트 전 스냅샷 — 버전이 바뀔 때만, **이번 설치가 덮거나 지울 파일만**(변하지 않는 파일·
     /// 사용자 파일 유지·seed-once 제외), 각 항목에 출시본 여부를 기록하고, 복원은 전부 검증한 뒤에만 쓴다(하나라도
     /// 어긋나면 아무것도 쓰지 않는다). system 파일은 출시본일 때만 되돌리고, 전체 복원은 user 소유를 되돌리지 않는다.

@@ -4,7 +4,7 @@
 //! (D:941 / C4 4.10), the path normalisation (4.6 — only in the binary) and the LOCAL query
 //! `cys repair boot-critical` (O-C4-2: no daemon request, so no autostart question — 4.7).
 
-use super::types::RepairError;
+use super::types::{fold_name, RepairError};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -102,16 +102,8 @@ pub fn provenance(entry: &Entry) -> Option<&'static str> {
         .and_then(|i| GENERATED_PROTECTION_WHY.get(i).copied())
 }
 
-/// RULINGS BN1 — the FULL case fold of a name: the std Unicode upper-then-lower mapping (U+212A
-/// KELVIN SIGN → `k`, U+017F LATIN SMALL LETTER LONG S → `s`, U+00DF → `ss`), the fold BJ3 gave the
-/// key file. LOCAL COPY, one line, of track T3c's `repair::types::fold_name` (not in this base yet):
-/// at T5a's final rebase this calls T3c's function and the copy is removed (one implementation).
-pub fn fold_name(s: &str) -> String {
-    s.to_uppercase().to_lowercase()
-}
-
 /// A pack-relative rel in comparison form: `/` separators, no leading `./`, FULLY case folded
-/// ([`fold_name`] — RULINGS BN1; APFS and NTFS are case-insensitive by default, and APFS also
+/// (T3c's [`fold_name`], the one fold BJ3 gave the key file — RULINGS BN1; APFS and NTFS are case-insensitive by default, and APFS also
 /// opens `hoo<U+212A>s/guard.sh` as `hooks/guard.sh`; folding can only make the answer "yes" for a
 /// spelling that names a listed file on such a volume — the conservative direction). It does not
 /// depend on the file existing.
@@ -133,6 +125,72 @@ pub fn boot_critical_entry(rel: &str) -> Option<&'static Entry> {
 pub fn protection_entry(rel: &str) -> Option<&'static Entry> {
     let k = rel_key(rel);
     GENERATED_PROTECTION.iter().find(|e| rel_key(e.rel) == k)
+}
+
+/// RULINGS AW3 (d) — the identity of a live file: (volume, file id). Unix: `st_dev`, `st_ino`;
+/// Windows: the volume serial number and the 64-bit file index of `GetFileInformationByHandle`.
+/// `None` = the file is absent or its identity cannot be read (no comparison is made).
+pub fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(path).ok()?;
+        Some((m.dev(), m.ino()))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        };
+        let f = std::fs::File::open(path).ok()?;
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        let ok = unsafe { GetFileInformationByHandle(f.as_raw_handle() as _, &mut info) };
+        if ok == 0 {
+            return None;
+        }
+        Some((
+            u64::from(info.dwVolumeSerialNumber),
+            (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        ))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// RULINGS AW3 (d) — the listed row (boot-critical or protection) whose live file in `pack_root`
+/// is the SAME file (volume + file id — a hard link, or a link followed to it) as the live file of
+/// `rel`, under a different rel (the fold of the spellings differs). `None` when `rel`'s file is
+/// absent, when no listed row's live file is the same file, or for the row's own rel (that is
+/// AP4's exact-spelling rule). The one implementation for `begin` (`production_classify`),
+/// `commit` (step 3a) and T6's apply.
+pub fn identity_alias(pack_root: &Path, rel: &str) -> Option<&'static Entry> {
+    let id = file_identity(&pack_root.join(rel))?;
+    let key = rel_key(rel);
+    GENERATED
+        .iter()
+        .chain(GENERATED_PROTECTION.iter())
+        .find(|e| rel_key(e.rel) != key && file_identity(&pack_root.join(e.rel)) == Some(id))
+}
+
+/// [`identity_alias`] over several targets, as the refusal sentence the verbs return (it names
+/// the row's spelling).
+pub fn refuse_identity_alias<'a>(
+    pack_root: &Path,
+    rels: impl IntoIterator<Item = &'a str>,
+) -> Result<(), String> {
+    for rel in rels {
+        if let Some(e) = identity_alias(pack_root, rel) {
+            return Err(format!(
+                "{rel}: 목록의 `{}` 과 같은 파일입니다(하드 링크 등 같은 파일의 다른 이름) — 그 표기로 다시 하세요(RULINGS AW3 (d))",
+                e.rel
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Answer of the boot-critical query (O-C4-2: exit 0 yes, 1 no, 2 cannot decide = fail-open).
@@ -1829,6 +1887,31 @@ mod tests {
             false,
         );
         assert_eq!(a.decision, Decision::Yes, "{a:?}");
+    }
+
+    /// RULINGS AW3 (d): the identity of a live file — a hard link is the same file, a copy is not;
+    /// an absent file has no identity; a row's own rel is never its own alias.
+    #[test]
+    fn identity_alias_sees_hard_links_only() {
+        let t = std::env::temp_dir().join(format!("t5a-ident-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&t);
+        std::fs::create_dir_all(t.join("hooks")).unwrap();
+        std::fs::create_dir_all(t.join("x")).unwrap();
+        std::fs::write(t.join("hooks/guard.sh"), "a\n").unwrap();
+        std::fs::hard_link(t.join("hooks/guard.sh"), t.join("x/link.sh")).unwrap();
+        std::fs::copy(t.join("hooks/guard.sh"), t.join("x/copy.sh")).unwrap();
+        assert!(file_identity(&t.join("hooks/guard.sh")).is_some());
+        assert_eq!(file_identity(&t.join("x/absent")), None);
+        assert_eq!(
+            identity_alias(&t, "x/link.sh").map(|e| e.rel),
+            Some("hooks/guard.sh")
+        );
+        assert_eq!(identity_alias(&t, "x/copy.sh"), None);
+        assert_eq!(identity_alias(&t, "x/absent"), None);
+        assert_eq!(identity_alias(&t, "hooks/guard.sh"), None);
+        let e = refuse_identity_alias(&t, ["x/copy.sh", "x/link.sh"]).unwrap_err();
+        assert!(e.contains("`hooks/guard.sh`"), "{e}");
+        let _ = std::fs::remove_dir_all(&t);
     }
 
     /// The query: exit codes 0 / 1 / 2, `--list --json` = the compiled table, plain lines.

@@ -281,30 +281,69 @@ pub const KNOWN_PREFLIGHT_DEFS: &[&str] = &[
     "_unregister_event_hook",
 ];
 
-/// The hook registrar call sites of the preflight, each exactly once (head = name + first args).
-pub const KNOWN_REGISTRAR_CALLS: &[(&str, &str)] = &[
-    ("self._register_hook(t)", "C08 session-start.sh"),
+/// The hook registrar call sites of the preflight, each EXACTLY as often as known (head = name +
+/// first args; RULINGS AI2 — the strictness is kept: a count that differs fails the build). T2's
+/// M11 narrow mode `--reconcile-hooks` (`reconcile_hooks`) calls the same registrars for the rows of
+/// `_reconcile_hook_table` — pinned by [`RECONCILE_TABLE`], built only from the constants this
+/// derivation already reads (no new hook, P1).
+pub const KNOWN_REGISTRAR_CALLS: &[(&str, &str, usize)] = &[
+    (
+        "self._register_hook(t)",
+        "C08 session-start.sh; M11 reconcile row c08",
+        2,
+    ),
     (
         "self._register_statusline(t)",
-        "C32 statusline (excluded, lifeline)",
+        "C32 statusline (excluded, lifeline); M11 reconcile row c32",
+        2,
     ),
     (
         "self._register_event_hook(t, ev, self.EVENT_HOOK",
         "C27 EVENT_HOOK",
+        1,
     ),
-    ("self._register_appbuild_hook(t)", "C33 APPBUILD_HOOK"),
+    (
+        "self._register_appbuild_hook(t, respect_tombstone=True)",
+        "C33 APPBUILD_HOOK",
+        1,
+    ),
     (
         "self._register_event_hook(t, _ev, CAPGATE_HOOK[0]",
         "capability gate CAPGATE_HOOK",
+        1,
     ),
     (
         "self._register_event_hook(t, event, script_name",
         "C28 loop over SELFCORR_HOOKS",
+        1,
     ),
     (
         "self._register_event_hook(t, hevent, hname",
         "C55 loop over GRILL_HOOKS",
+        1,
     ),
+    (
+        "self._register_appbuild_hook(t, respect_tombstone=not lifeline)",
+        "M11 reconcile row appbuild (APPBUILD_HOOK)",
+        1,
+    ),
+    (
+        "self._register_event_hook(t, event, script",
+        "M11 reconcile rows event (EVENT_HOOK · SELFCORR_HOOKS · GRILL_HOOKS)",
+        1,
+    ),
+];
+
+/// RULINGS AI2 — T2's reconcile table (`_reconcile_hook_table`, the rows `--reconcile-hooks`
+/// registers): every statement that builds a row, squashed. The table must hold exactly these
+/// (one `rows = [` and five `rows.append(`) — a row from anywhere else fails the build.
+pub const RECONCILE_TABLE: &[&str] = &[
+    "rows = [(\"SessionStart\", \"session-start.sh\", True, \"c08\", None, None), (\"statusLine\", \"cys-statusline.sh\", True, \"c32\", None, None)]",
+    "for ev in self.EVENT_HOOK_EVENTS: rows.append((ev, self.EVENT_HOOK, False, \"event\", \"\", None))",
+    "for script, events in SELFCORR_HOOKS: for ev, m in events: rows.append((ev, script, False, \"event\", m, hook_timeout_for(script, ev)))",
+    "for ev, m in CAPGATE_HOOK[1]: rows.append((ev, CAPGATE_HOOK[0], True, \"capgate\", m, hook_timeout_for(CAPGATE_HOOK[0], ev)))",
+    "rows.append((\"PreToolUse\", APPBUILD_HOOK, False, \"appbuild\", \"Edit|Write|NotebookEdit\", None))",
+    "for name, ev, m in GRILL_HOOKS: rows.append((ev, name, False, \"event\", m, None))",
 ];
 
 /// Texts that tie the two loop call sites to their constants.
@@ -1174,16 +1213,41 @@ pub fn preflight_census(pf: &str) -> Vec<String> {
             ));
         }
     }
-    for (head, what) in KNOWN_REGISTRAR_CALLS {
+    for (head, what, want) in KNOWN_REGISTRAR_CALLS {
         let n = heads.iter().filter(|(_, h)| h == head).count();
-        if n != 1 {
+        if n != *want {
             errs.push(format!(
-                "anchor {PREFLIGHT}: registrar call `{head}` ({what}) found {n} times (expected once)"
+                "anchor {PREFLIGHT}: registrar call `{head}` ({what}) found {n} times (expected {want})"
             ));
         }
     }
+    // RULINGS AI2 — the reconcile table holds exactly the pinned rows
+    match pf.find("    def _reconcile_hook_table(self):") {
+        None => errs.push(format!(
+            "anchor {PREFLIGHT}: `def _reconcile_hook_table` not found (the reconcile registrar lost its table)"
+        )),
+        Some(at) => {
+            let rest = &pf[at + 1..];
+            let end = rest.find("\n    def ").map_or(rest.len(), |e| e + 1);
+            let body = squash(&rest[..end]);
+            for row in RECONCILE_TABLE {
+                if !body.contains(row) {
+                    errs.push(format!(
+                        "anchor {PREFLIGHT}: `_reconcile_hook_table` no longer builds `{row}`"
+                    ));
+                }
+            }
+            let appends = body.matches("rows.append(").count();
+            let lists = body.matches("rows = [").count();
+            if appends != 5 || lists != 1 {
+                errs.push(format!(
+                    "census {PREFLIGHT}: `_reconcile_hook_table` builds {lists} list(s) and {appends} appended row kind(s) (expected 1 and 5) — a new registration must be read by the boot-critical derivation (T5a)"
+                ));
+            }
+        }
+    }
     for (no, h) in &heads {
-        if !KNOWN_REGISTRAR_CALLS.iter().any(|(k, _)| k == h) {
+        if !KNOWN_REGISTRAR_CALLS.iter().any(|(k, _, _)| k == h) {
             errs.push(format!(
                 "census {PREFLIGHT}:{no}: registrar call `{h}` outside the anchors — a new hook registration must be read by the boot-critical derivation (T5a)"
             ));
