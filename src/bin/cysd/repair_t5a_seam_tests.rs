@@ -349,3 +349,32 @@ fn an_absent_listed_file_gives_no_false_refusal() {
     assert!(refuse_identity_alias(&pack, ["notes/x.json", "notes/not-there.sh"]).is_ok());
     let _ = std::fs::remove_dir_all(&pack);
 }
+
+/// RULINGS CD1: the fold is a fixpoint — with the listed file ABSENT, the capital sharp s (U+1E9E,
+/// which one upper-then-lower pass turns only into `ß`) for "ss" in a boot-critical row is refused
+/// naming the row; the same through the `st` ligature (U+FB06) for a protection row and for the
+/// path-rule row (no protection row holds "ss"); a rule document folds the same way.
+#[test]
+fn a_capital_sharp_s_spelling_of_an_absent_row_is_refused_naming_the_row() {
+    let pack = pk();
+    for (spelled, row) in [
+        ("hooks/se\u{1E9E}ion-start.sh", "hooks/session-start.sh"),
+        ("hooks/teamtoken-i\u{1E9E}ue.sh", "hooks/teamtoken-issue.sh"),
+        ("bin/_owned_proce\u{1E9E}.py", "bin/_owned_process.py"),
+        ("bin/javis_mi\u{1E9E}ion.py", "bin/javis_mission.py"),
+        ("tru\u{FB06}ed-keys.json", "trusted-keys.json"),
+        ("\u{FB06}ate/hook-targets.json", "state/hook-targets.json"),
+    ] {
+        assert!(!pack.join(row).exists(), "{row} must be absent here");
+        let e = production_classify(spelled, &pack).unwrap_err();
+        assert!(
+            format!("{e:?}").contains(&format!("`{row}`")),
+            "{spelled}: {e:?}"
+        );
+    }
+    assert!(hook_allowed("se\u{1E9E}ion-start.sh").is_err(), "lifeline");
+    assert_eq!(
+        super::rule_document_name("directives/BO\u{1E9E}_DIRECTIVE.md").as_deref(),
+        Some("boss_directive.md")
+    );
+}

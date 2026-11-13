@@ -1237,6 +1237,29 @@ pub fn preflight_census(pf: &str) -> Vec<String> {
                     ));
                 }
             }
+            // RULINGS CD2 — every use of `rows` must be a pinned form; `extend`, `+=`, `insert`, a
+            // slice assignment or anything else that could add a row fails the build
+            let mut i = 0;
+            while let Some(p) = body[i..].find("rows") {
+                let at = i + p;
+                i = at + 4;
+                let before = body[..at].chars().last();
+                if before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    continue;
+                }
+                let rest = &body[at..];
+                let known = ["rows = [", "rows.append(", "rows\n"]
+                    .iter()
+                    .any(|k| rest.starts_with(k))
+                    || body[..at].ends_with("return ")
+                    || rest == "rows";
+                if !known {
+                    let form: String = rest.chars().take(16).collect();
+                    errs.push(format!(
+                        "census {PREFLIGHT}: `_reconcile_hook_table` uses `{form}` — a form of adding rows the census does not know (RULINGS CD2)"
+                    ));
+                }
+            }
             let appends = body.matches("rows.append(").count();
             let lists = body.matches("rows = [").count();
             if appends != 5 || lists != 1 {
@@ -2075,10 +2098,14 @@ fn without_file_tests(cmd: &str) -> String {
 /// RULINGS BM2 — the discarding forms the census knows: a whole simple command (not an `if` /
 /// `while` condition, not negated, not `exec`, not inside `$(…)`, no `&&` or pipe) whose first word
 /// is an interpreter (optionally after `cys_timeout_run <N>`) and which ends with `>/dev/null 2>&1`,
-/// optionally followed by `|| true`, `|| :` or `&`. The file must not run with `set -e`.
+/// optionally followed by `|| true` or `|| :`. NOT in the background (`&` — RULINGS CD2: its status
+/// can be read later through `wait`). The file must not run with `set -e` or an `ERR` trap.
 pub fn is_discarding_launch(cmd: &str) -> bool {
     let mut t = cmd.trim();
-    for tail in [" &", " || true", " || :"] {
+    if t.ends_with('&') && !t.ends_with("&&") {
+        return false;
+    }
+    for tail in [" || true", " || :"] {
         if let Some(h) = t.strip_suffix(tail) {
             t = h.trim_end();
         }
@@ -2150,15 +2177,51 @@ fn exit_status_reader(after: &[(usize, String)]) -> Option<&'static str> {
 }
 
 /// `set -e` (errexit) anywhere in a shell text.
-fn has_errexit(text: &str) -> bool {
-    text.lines().any(|l| {
-        let l = l.trim();
-        l == "set -e"
-            || l.starts_with("set -e ")
-            || l.starts_with("set -eu")
-            || l.starts_with("set -euo")
-            || l.contains("set -o errexit")
-    })
+/// RULINGS CD2: every `set` form that turns errexit on — a short-flag group holding `e` (`-e`,
+/// `-eE`, `-xe`, `-Eeuo pipefail`), `-o errexit` — in any command of the text (after `;`, `&&`, …
+/// too), and an interpreter flag group holding `e` on the shebang line (`#!/bin/bash -e`).
+pub fn has_errexit(text: &str) -> bool {
+    let flags_hold_e = |w: &str| {
+        w.len() > 1
+            && w.starts_with('-')
+            && !w.starts_with("--")
+            && w[1..].chars().all(|c| c.is_ascii_alphabetic())
+            && w[1..].contains('e')
+    };
+    if let Some(first) = text.lines().next().filter(|l| l.starts_with("#!")) {
+        if first.split_whitespace().skip(1).any(flags_hold_e) {
+            return true;
+        }
+    }
+    text.lines()
+        .map(|l| l.split('#').next().unwrap_or(""))
+        .flat_map(|l| {
+            l.split([';', '&', '|'])
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .any(|cmd| {
+            let words: Vec<&str> = cmd.split_whitespace().collect();
+            words.first() == Some(&"set")
+                && (words[1..].iter().any(|w| flags_hold_e(w))
+                    || words.windows(2).any(|p| p[0] == "-o" && p[1] == "errexit"))
+        })
+}
+
+/// RULINGS CD2: an `ERR` trap anywhere in the text (`trap '…' ERR`) — a failing command then runs
+/// the trap, so its exit status is not discarded.
+pub fn has_err_trap(text: &str) -> bool {
+    text.lines()
+        .map(|l| l.split('#').next().unwrap_or(""))
+        .flat_map(|l| {
+            l.split([';', '&', '|'])
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .any(|cmd| {
+            let words: Vec<&str> = cmd.split_whitespace().collect();
+            words.first() == Some(&"trap") && words.iter().skip(1).any(|w| *w == "ERR")
+        })
 }
 
 /// RULINGS BM2 — the census of the by-construction drops over the registered hooks and the class-1
@@ -2210,6 +2273,12 @@ pub fn by_construction_census(
                         .map(|t| has_errexit(&lf(&t)))
                         .unwrap_or(false)
                 });
+            let err_trap = has_err_trap(&text)
+                || sourced.iter().any(|r| {
+                    (src.pack_file)(r)
+                        .map(|t| has_err_trap(&lf(&t)))
+                        .unwrap_or(false)
+                });
             let cmds = shell_commands(&text);
             let fns = function_bodies(&text);
             for (k, (n, cmd)) in cmds.iter().enumerate() {
@@ -2219,6 +2288,8 @@ pub fn by_construction_census(
                 sites += 1;
                 let why = if errexit {
                     Some("the file runs with `set -e`")
+                } else if err_trap {
+                    Some("the file sets an `ERR` trap")
                 } else if !is_discarding_launch(cmd) {
                     Some("not a discarding form")
                 } else if fns.iter().any(|(a, b)| a <= n && n <= b) {

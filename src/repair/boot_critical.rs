@@ -1860,6 +1860,16 @@ mod tests {
             protection_entry("\u{17F}tate/hoo\u{212A}-targets.json").map(|e| e.rel),
             Some("state/hook-targets.json")
         );
+        // RULINGS CD1 — the capital sharp s (U+1E9E) for "ss" in every row that holds it
+        for row in [
+            "hooks/session-start.sh",
+            "hooks/teamtoken-issue.sh",
+            "bin/_owned_process.py",
+            "bin/javis_mission.py",
+        ] {
+            let v = row.replacen("ss", "\u{1E9E}", 1);
+            assert_eq!(boot_critical_entry(&v).map(|e| e.rel), Some(row), "{v}");
+        }
         for other in [
             "bin/caf\u{E9}.py",
             "bin/javi\u{17F}_phoenix.py",
@@ -3216,7 +3226,7 @@ mod tests {
             r#""$CYS_PY" "$(cys_native_path "$PACK/bin/x.py")" scan >/dev/null 2>&1"#,
             r#"python3 x.py >/dev/null 2>&1 || true"#,
             r#""$CYS_PY" x.py >/dev/null 2>&1 || :"#,
-            r#"cys_timeout_run 5 "$CYS_PY" x.py >/dev/null 2>&1 &"#,
+            r#"cys_timeout_run 5 "$CYS_PY" x.py >/dev/null 2>&1"#,
         ] {
             assert!(derive::is_discarding_launch(ok), "{ok}");
         }
@@ -3232,9 +3242,47 @@ mod tests {
             r#"exec "$CYS_PY" x.py >/dev/null 2>&1"#,
             r#". x.sh >/dev/null 2>&1"#,
             r#"X=1 "$CYS_PY" x.py >/dev/null 2>&1"#,
+            // RULINGS CD2: in the background its status can be read later through `wait`
+            r#"cys_timeout_run 5 "$CYS_PY" x.py >/dev/null 2>&1 &"#,
+            r#""$CYS_PY" x.py >/dev/null 2>&1 || true &"#,
         ] {
             assert!(!derive::is_discarding_launch(bad), "{bad}");
         }
+    }
+
+    /// RULINGS CD2 — the `set` forms that turn errexit on, and `ERR` traps.
+    #[test]
+    fn errexit_and_err_trap_forms() {
+        for on in [
+            "set -e",
+            "set -eE",
+            "set -xe",
+            "set -Eeuo pipefail",
+            "set -euo pipefail",
+            "set -o errexit",
+            "set -x -o errexit",
+            "  [ -n \"$X\" ] && set -e",
+            "#!/bin/bash -e\necho x",
+        ] {
+            assert!(derive::has_errexit(on), "{on:?}");
+        }
+        for off in [
+            "set +e",
+            "set -E",
+            "set -x",
+            "set -uo pipefail",
+            "set -f",
+            "set -- $x",
+            "# set -e",
+            "echo set -e is off",
+            "#!/bin/bash\nset +e",
+        ] {
+            assert!(!derive::has_errexit(off), "{off:?}");
+        }
+        assert!(derive::has_err_trap("trap 'echo failed' ERR"));
+        assert!(derive::has_err_trap("x=1; trap cleanup EXIT ERR"));
+        assert!(!derive::has_err_trap("trap 'rm -f \"$T\"' EXIT"));
+        assert!(!derive::has_err_trap("# trap x ERR"));
     }
 
     /// RULINGS BM2 (i)/(ii) — the census pins every launch site of a by-construction drop: the real
@@ -3283,10 +3331,24 @@ mod tests {
             |t| t.replacen(">/dev/null 2>&1\nfi\n", ">/dev/null 2>&1\nfi\nexit\n", 1),
             "a bare `exit`",
         );
-        // `set -e` in the hook
+        // `set -e` in the hook, in a combined form too (RULINGS CD2)
         fails_at_51(
             |t| t.replacen("set +e\n", "set -e\n", 1),
             "the file runs with `set -e`",
+        );
+        fails_at_51(
+            |t| t.replacen("set +e\n", "set -Eeuo pipefail\n", 1),
+            "the file runs with `set -e`",
+        );
+        // an `ERR` trap in the hook (RULINGS CD2)
+        fails_at_51(
+            |t| t.replacen("set +e\n", "set +e\ntrap 'echo failed >&2' ERR\n", 1),
+            "an `ERR` trap",
+        );
+        // in the background (RULINGS CD2)
+        fails_at_51(
+            |t| t.replacen(">/dev/null 2>&1\nfi\n", ">/dev/null 2>&1 &\nfi\n", 1),
+            "not a discarding form",
         );
         // a launch inside a function body (one line added above it: the site moves to :52)
         let e = derive_edited(
@@ -3383,6 +3445,41 @@ mod tests {
             e.contains("_reconcile_hook_table") && e.contains("expected 1 and 5"),
             "{e}"
         );
+        // RULINGS CD2 — rows added through a form the census does not pin fail the build
+        let grill = "        for name, ev, m in GRILL_HOOKS:\n            rows.append((ev, name, False, \"event\", m, None))\n";
+        for (form, extra) in [
+            (
+                "rows.extend(",
+                "        rows.extend([(\"Stop\", \"x.sh\", False, \"event\", \"\", None)])\n",
+            ),
+            (
+                "rows += [",
+                "        rows += [(\"Stop\", \"x.sh\", False, \"event\", \"\", None)]\n",
+            ),
+            (
+                "rows.insert(",
+                "        rows.insert(0, (\"Stop\", \"x.sh\", False, \"event\", \"\", None))\n",
+            ),
+        ] {
+            let e = derive_with(
+                &|p, t| {
+                    if p == "cysjavis-pack/bin/javis_preflight.py" {
+                        t.replacen(grill, &format!("{grill}{extra}"), 1)
+                    } else {
+                        t
+                    }
+                },
+                &[],
+                &[],
+            )
+            .unwrap_err();
+            assert!(
+                e.contains("_reconcile_hook_table")
+                    && e.contains(form)
+                    && e.contains("RULINGS CD2"),
+                "{form}: {e}"
+            );
+        }
         let e = derive_edited(
             &edit_one("cysjavis-pack/bin/javis_preflight.py", |t| {
                 format!("{t}\n    def _t5a(self, t):\n        return self._register_hook(t)\n")
