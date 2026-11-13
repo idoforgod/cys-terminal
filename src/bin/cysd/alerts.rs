@@ -780,10 +780,9 @@ pub enum PackCall {
     One { rel: String, sub: Option<String> },
 }
 
-/// This lane's pack-root spellings, built once per daemon: the daemon's own pack dir (and its Git Bash
-/// `/c/…` form, and its `~` / `$HOME` / `${HOME}` forms when it lies under the home), plus the seat's
-/// lane-scoped `$CYS_PACK_DIR` / `${CYS_PACK_DIR}` / `${CYS_PACK_DIR:-…}`. Another lane's pack, a copy
-/// in a test rig or any other directory is not this lane's pack.
+/// This lane's pack root as LITERAL path spellings (RULINGS BU1), built once per daemon: the daemon's own
+/// pack dir, its Git Bash `/c/…` form, and its `~/…` form when it lies under the home. A path holding a
+/// variable (`$CYS_PACK_DIR/…`, `${…}`), another lane's pack or any other directory is not this lane's pack.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PackRoots {
     prefixes: Vec<String>,
@@ -795,7 +794,7 @@ fn slash_path(p: &str) -> String {
 
 impl PackRoots {
     pub fn new(pack_dir: Option<&str>, home: Option<&str>) -> Self {
-        let mut prefixes = vec!["$CYS_PACK_DIR/".to_string(), "${CYS_PACK_DIR}/".to_string()];
+        let mut prefixes = Vec::new();
         if let Some(pd) = pack_dir.map(slash_path).filter(|p| p.len() > 1) {
             prefixes.push(format!("{pd}/"));
             let b = pd.as_bytes();
@@ -804,45 +803,24 @@ impl PackRoots {
             }
             if let Some(h) = home.map(slash_path).filter(|h| h.len() > 1) {
                 if let Some(rest) = pd.strip_prefix(&h).filter(|r| r.starts_with('/')) {
-                    for head in ["~", "$HOME", "${HOME}"] {
-                        prefixes.push(format!("{head}{rest}/"));
-                    }
+                    prefixes.push(format!("~{rest}/"));
                 }
             }
         }
         PackRoots { prefixes }
     }
 
-    /// The rel of `word` when it names a hook / script inside this lane's pack. Linear in the word.
-    fn rel_of(&self, word: &str, steps: &mut usize) -> Option<String> {
-        let w = word.replace('\\', "/");
-        *steps += w.len();
-        let rest = if let Some(after) = w.strip_prefix("${CYS_PACK_DIR:") {
-            // `${CYS_PACK_DIR:-<default>}/…` — the matching `}` of THIS word, then `/` (one pass)
-            let mut depth = 1usize;
-            let mut close = None;
-            for (k, c) in after.char_indices() {
-                match c {
-                    '{' => depth += 1,
-                    '}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            close = Some(k);
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            after[close? + 1..].strip_prefix('/')?.to_string()
-        } else {
-            let p = self.prefixes.iter().find(|p| w.starts_with(p.as_str()))?;
-            w[p.len()..].to_string()
-        };
-        if rest.contains(['$', '`', '(', ')', '{', '}', '*', '?', '[', ']']) {
-            return None;
-        }
-        let rel = cys::repair::intake::normalize_rel(&rest).ok()?;
+    /// The prefixes (the property test's reference reads the same data).
+    #[cfg(test)]
+    pub(crate) fn prefixes(&self) -> &[String] {
+        &self.prefixes
+    }
+
+    /// The rel of a LITERAL path inside this lane's pack that names a hook / script. Linear in the path.
+    fn literal_rel(&self, path: &str, steps: &mut usize) -> Option<String> {
+        *steps += path.len();
+        let p = self.prefixes.iter().find(|p| path.starts_with(p.as_str()))?;
+        let rel = cys::repair::intake::normalize_rel(&path[p.len()..]).ok()?;
         is_script_rel(&rel).then_some(rel)
     }
 }
@@ -884,282 +862,175 @@ fn is_script_rel(rel: &str) -> bool {
     }
 }
 
-/// `NAME=value` before a command (`FOO=1 python3 …`).
-fn is_env_assignment(w: &str) -> bool {
-    match w.split_once('=') {
-        Some((name, _)) => {
-            name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        }
-        None => false,
-    }
+// ── RULINGS BU1 — the CLOSED GRAMMAR of a call that gets an identity ─────────────────────────────────
+// text      := ONE line (no newline, no carriage return); tokens separated by spaces / tabs
+// command   := assign* ( script | interpreter flag* script ) word* redirection*
+// assign    := NAME '=' word-rest               (NAME = [A-Za-z_][A-Za-z0-9_]*, written bare)
+// word      := part+                            (not beginning with a bare '=')
+// part      := bare | '…' | "…"
+//   bare    := letters / digits (any script) and `_ @ % + = : , . / -`; `~` only as the word's first
+//              two characters `~/`
+//   '…'     := single-quoted, no `'` inside
+//   "…"     := double-quoted, none of `$` backtick `\` `!` `"` inside
+// script    := a word of bare parts only: a LITERAL path in THIS lane's pack (`PackRoots`)
+// interpreter := python | python3 | py | sh | bash | zsh | node | pwsh — bare, or a literal absolute
+//              path ending in one of them; its flags only from `INTERPRETER_FLAGS`
+// redirection := `2>&1` | `>/dev/null` | `1>/dev/null` | `2>/dev/null` | `&>/dev/null` (spaces allowed
+//              after `>`), only at the end
+// Anything else — every character or form not named here — gives NO identity (a stated miss).
+
+/// The interpreters of BU1 and, for each, the FIXED list of flags that take no argument and no code
+/// (`-c`, `-m`, `-e`, `-s`, `-W`, `-X`, `--rcfile` and every flag not listed → no identity).
+pub const INTERPRETER_FLAGS: &[(&str, &[&str])] = &[
+    ("python", &["-u", "-B", "-O", "-OO", "-q", "-b", "-bb"]),
+    ("python3", &["-u", "-B", "-O", "-OO", "-q", "-b", "-bb"]),
+    ("py", &["-u", "-B", "-O", "-OO", "-q", "-b", "-bb", "-3"]),
+    ("sh", &["-x", "-v"]),
+    ("bash", &["-x", "-v", "--norc", "--noprofile"]),
+    ("zsh", &["-x", "-v", "-f"]),
+    ("node", &["--no-warnings", "--no-deprecation", "--trace-warnings", "--trace-uncaught", "--enable-source-maps"]),
+    ("pwsh", &["-NoProfile", "-NonInteractive", "-NoLogo"]),
+];
+
+/// The FIXED list of trailing redirections (each with or without spaces after `>`).
+pub const REDIRECTIONS: &[&str] = &["2>&1", ">/dev/null", "1>/dev/null", "2>/dev/null", "&>/dev/null"];
+
+/// One token of the grammar.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Tok {
+    /// A word: its text (quotes removed), whether every part is bare, and its leading bare text.
+    Word { text: String, bare: bool, lead: String },
+    Redirection,
 }
 
-/// The words of the call when its WHOLE text is exactly ONE simple command (RULINGS BS1), read by ONE
-/// left-to-right pass (every char is visited at most once; `steps` counts the visits — RULINGS BF5).
-/// Quotes are removed from words (single quotes are literal); `${…}` stays inside its word. `None` — a
-/// stated MISS — for any control operator (`&&` `||` `;` `|` `|&` `&`, a newline between commands), a
-/// subshell or group parenthesis, any substitution (`$(`, `$((`, a backtick — inside double quotes
-/// too —, `<(`, `>(`), a heredoc, here-string or input redirection, an output redirection to anything
-/// but `/dev/null` or a descriptor copy (`2>&1`, `>&2`), and any reading that is not certain (an
-/// unterminated quote or `${`, a trailing backslash, a redirection without its target).
-fn single_simple_command(src: &str, steps: &mut usize) -> Option<Vec<String>> {
-    let cs: Vec<char> = src.chars().collect();
-    let n = cs.len();
-    let mut i = 0usize;
-    let mut words: Vec<String> = Vec::new();
-    let mut word = String::new();
-    let mut in_word = false;
-    let mut to_devnull = false; // the next word is an output redirection's target: only `/dev/null`
-    macro_rules! end_word {
-        () => {
-            if in_word {
-                let w = std::mem::take(&mut word);
-                if to_devnull {
-                    if w != "/dev/null" {
-                        return None;
-                    }
-                    to_devnull = false;
-                } else {
-                    words.push(w);
-                }
-                in_word = false;
-            }
-        };
-    }
-    while i < n {
-        let c = cs[i];
-        *steps += 1;
-        match c {
-            ' ' | '\t' | '\r' => {
-                end_word!();
-                i += 1;
-            }
-            '\n' => {
-                // only whitespace may follow: a newline BETWEEN commands is a second command
-                end_word!();
-                if cs[i..].iter().any(|d| !d.is_whitespace()) {
-                    return None;
-                }
-                *steps += n - i;
-                i = n;
-            }
-            '#' if !in_word => {
-                while i < n && cs[i] != '\n' {
-                    i += 1;
-                    *steps += 1;
-                }
-            }
-            '\\' => {
-                if i + 1 >= n {
-                    return None;
-                }
-                if cs[i + 1] != '\n' {
-                    word.push(cs[i + 1]);
-                    in_word = true;
-                }
-                i += 2;
-                *steps += 1;
-            }
-            '\'' => {
-                in_word = true;
-                i += 1;
-                while i < n && cs[i] != '\'' {
-                    word.push(cs[i]);
-                    i += 1;
-                    *steps += 1;
-                }
-                if i >= n {
-                    return None;
-                }
-                i += 1;
-            }
-            '"' => {
-                in_word = true;
-                i += 1;
-                while i < n && cs[i] != '"' {
-                    if cs[i] == '`' || (cs[i] == '$' && i + 1 < n && cs[i + 1] == '(') {
-                        return None;
-                    }
-                    if cs[i] == '\\' && i + 1 < n && matches!(cs[i + 1], '"' | '\\' | '$' | '`') {
-                        i += 1;
-                        *steps += 1;
-                    }
-                    word.push(cs[i]);
-                    i += 1;
-                    *steps += 1;
-                }
-                if i >= n {
-                    return None;
-                }
-                i += 1;
-            }
-            '$' if i + 1 < n && cs[i + 1] == '(' => return None,
-            '$' if i + 1 < n && cs[i + 1] == '{' => {
-                in_word = true;
-                word.push_str("${");
-                i += 2;
-                let mut depth = 1usize;
-                while i < n && depth > 0 {
-                    let d = cs[i];
-                    if d == '`' || (d == '$' && i + 1 < n && cs[i + 1] == '(') {
-                        return None;
-                    }
-                    if d == '{' {
-                        depth += 1;
-                    } else if d == '}' {
-                        depth -= 1;
-                    }
-                    word.push(d);
-                    i += 1;
-                    *steps += 1;
-                }
-                if depth > 0 {
-                    return None;
-                }
-            }
-            '&' if i + 1 < n && cs[i + 1] == '>' => {
-                // `&>` / `&>>`: both streams — to `/dev/null` only
-                end_word!();
-                if to_devnull {
-                    return None; // the previous redirection never got its target
-                }
-                i += 2;
-                if i < n && cs[i] == '>' {
-                    i += 1;
-                }
-                to_devnull = true;
-            }
-            '`' | ';' | '&' | '|' | '(' | ')' | '<' => return None,
-            '>' => {
-                // an fd number right before it (`2>`) belongs to the redirection
-                if in_word && !word.is_empty() && word.chars().all(|d| d.is_ascii_digit()) {
-                    word.clear();
-                    in_word = false;
-                }
-                end_word!();
-                if to_devnull {
-                    return None; // the previous redirection never got its target (`> 2>…`)
-                }
-                i += 1;
-                if i < n && cs[i] == '(' {
-                    return None; // `>(…)`
-                }
-                if i < n && (cs[i] == '>' || cs[i] == '|') {
-                    i += 1;
-                }
-                if i < n && cs[i] == '&' {
-                    // a descriptor copy: `>&2`, `2>&1` (digits only — `>&-` and `>&file` are not)
-                    i += 1;
-                    let start = i;
-                    while i < n && cs[i].is_ascii_digit() {
-                        i += 1;
-                        *steps += 1;
-                    }
-                    if i == start {
-                        return None;
-                    }
-                } else {
-                    to_devnull = true;
-                }
-            }
-            _ => {
-                in_word = true;
-                word.push(c);
-                i += 1;
-            }
-        }
-    }
-    if in_word {
-        if to_devnull {
-            return (word == "/dev/null" && !words.is_empty()).then_some(words);
-        }
-        words.push(word);
-    }
-    (!to_devnull && !words.is_empty()).then_some(words)
+/// A character of a bare part.
+fn is_bare_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '_' | '@' | '%' | '+' | '=' | ':' | ',' | '.' | '/' | '-')
 }
 
-/// The next word as a subcommand (`None` for a flag or nothing).
-fn sub_at(words: &[String], k: usize) -> Option<String> {
-    words
-        .get(k)
-        .filter(|w| !w.is_empty() && !w.starts_with('-'))
-        .map(|w| w.chars().take(64).collect())
-}
-
-/// The script operand of an interpreter at `words[k]` (`None` = runs inline code / a module / nothing).
-fn interpreter_operand(prog: &str, words: &[String], mut k: usize) -> Option<usize> {
-    let base = prog.rsplit('/').next().unwrap_or(prog);
-    let base = base.strip_suffix(".exe").or_else(|| base.strip_suffix(".EXE")).unwrap_or(base);
-    let is_python = base == "py"
-        || base
-            .strip_prefix("python")
-            .is_some_and(|v| v.chars().all(|c| c.is_ascii_digit() || c == '.'));
-    let is_shell = matches!(base, "sh" | "bash" | "zsh");
-    let is_node = base == "node";
-    let is_pwsh = base.eq_ignore_ascii_case("pwsh");
-    if !(is_python || is_shell || is_node || is_pwsh) {
-        return None;
-    }
-    while let Some(w) = words.get(k) {
-        if w == "--" {
-            return (k + 1 < words.len()).then_some(k + 1);
+/// The length (in chars) of a redirection of [`REDIRECTIONS`] starting at `cs[i]`, if one does —
+/// followed by a space, a tab or the end; spaces / tabs are allowed between `>` and `/dev/null`.
+fn redirection_at(cs: &[char], i: usize) -> Option<usize> {
+    let boundary = |j: usize| j == cs.len() || cs[j] == ' ' || cs[j] == '\t';
+    let starts = |j: usize, s: &str| s.chars().enumerate().all(|(k, c)| cs.get(j + k) == Some(&c));
+    for r in REDIRECTIONS {
+        let (op, target) = r.split_once("/dev/null").map_or((*r, ""), |(op, _)| (op, "/dev/null"));
+        if !starts(i, op) {
+            continue;
         }
-        let flag = w.starts_with('-') || (is_shell && w.starts_with('+'));
-        if !flag {
-            return Some(k);
+        let mut j = i + op.chars().count();
+        if !target.is_empty() {
+            while j < cs.len() && (cs[j] == ' ' || cs[j] == '\t') {
+                j += 1;
+            }
+            if !starts(j, target) {
+                continue;
+            }
+            j += target.len();
         }
-        let low = w.to_ascii_lowercase();
-        if is_python {
-            let letters = &w[1..];
-            if !w.starts_with("--") && (letters.contains('c') || letters.contains('m')) {
-                return None; // `-c code` / `-m module`
-            }
-            if w == "-W" || w == "-X" {
-                k += 1;
-            }
-        } else if is_shell {
-            if !w.starts_with("--") && w[1..].contains('c') {
-                return None; // `-c string`
-            }
-            if matches!(w.as_str(), "-o" | "+o" | "-O" | "+O") {
-                k += 1;
-            }
-        } else if is_node {
-            if matches!(
-                w.as_str(),
-                "-e" | "--eval" | "-p" | "--print" | "-r" | "--require" | "--import" | "--loader" | "--experimental-loader"
-            ) {
-                return None; // inline code or a preloaded module (RULINGS BS1: flags that take no code)
-            }
-            if matches!(w.as_str(), "-C" | "--conditions") {
-                k += 1;
-            }
-        } else {
-            if matches!(low.as_str(), "-file" | "-f") {
-                return (k + 1 < words.len()).then_some(k + 1);
-            }
-            if matches!(low.as_str(), "-command" | "-c" | "-encodedcommand" | "-e" | "-ec") {
-                return None;
-            }
-            if matches!(
-                low.as_str(),
-                "-executionpolicy" | "-ex" | "-ep" | "-workingdirectory" | "-wd" | "-configurationname" | "-outputformat" | "-of" | "-inputformat" | "-if" | "-windowstyle" | "-w" | "-version" | "-v" | "-settingsfile" | "-custompipename"
-            ) {
-                k += 1;
-            }
+        if boundary(j) {
+            return Some(j - i);
         }
-        k += 1;
     }
     None
 }
 
-/// The identity of a shell call (RULINGS BF1, BS1): given ONLY when the call's whole text is ONE simple
-/// command — optional `NAME=value` assignments (the value holding no `${`; `$(` and backticks are
-/// refused anywhere), optionally ONE interpreter (`python*` / `py` / `sh` / `bash` / `zsh` / `node` /
-/// `pwsh`, with flags that take no code), then a hook / script of THIS lane's pack and its arguments
-/// (`cys-dept` run through PATH is the pack's `bin/cys-dept`). Every compound call is a stated miss
-/// (`cd dir && <script>` included — DEFERRED #76). Linear in the command's length (RULINGS BF5).
+/// The tokens of a text that is entirely made of the grammar's words and redirections — ONE pass
+/// (`steps` counts the chars visited — RULINGS BF5); `None` at the first character or form outside it.
+fn grammar_tokens(src: &str, steps: &mut usize) -> Option<Vec<Tok>> {
+    let cs: Vec<char> = src.chars().collect();
+    let n = cs.len();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < n {
+        *steps += 1;
+        if cs[i] == ' ' || cs[i] == '\t' {
+            i += 1;
+            continue;
+        }
+        if let Some(len) = redirection_at(&cs, i) {
+            out.push(Tok::Redirection);
+            i += len;
+            *steps += len;
+            continue;
+        }
+        let start = i;
+        let (mut text, mut lead, mut bare) = (String::new(), String::new(), true);
+        while i < n && cs[i] != ' ' && cs[i] != '\t' {
+            *steps += 1;
+            match cs[i] {
+                '\'' => {
+                    bare = false;
+                    i += 1;
+                    while i < n && cs[i] != '\'' {
+                        text.push(cs[i]);
+                        i += 1;
+                        *steps += 1;
+                    }
+                    if i >= n {
+                        return None;
+                    }
+                    i += 1;
+                }
+                '"' => {
+                    bare = false;
+                    i += 1;
+                    while i < n && cs[i] != '"' {
+                        if matches!(cs[i], '$' | '`' | '\\' | '!') {
+                            return None;
+                        }
+                        text.push(cs[i]);
+                        i += 1;
+                        *steps += 1;
+                    }
+                    if i >= n {
+                        return None;
+                    }
+                    i += 1;
+                }
+                '~' if i == start && cs.get(i + 1) == Some(&'/') => {
+                    text.push('~');
+                    lead.push('~');
+                    i += 1;
+                }
+                c if is_bare_char(c) && !(c == '=' && i == start) => {
+                    text.push(c);
+                    if bare {
+                        lead.push(c);
+                    }
+                    i += 1;
+                }
+                _ => return None,
+            }
+        }
+        out.push(Tok::Word { text, bare, lead });
+    }
+    Some(out)
+}
+
+/// `NAME=` at the head of a word's bare text.
+fn is_assignment_lead(lead: &str) -> bool {
+    let Some((name, _)) = lead.split_once('=') else {
+        return false;
+    };
+    name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The flag list of a known interpreter word (bare name, or a literal absolute path ending in it).
+fn interpreter_flags(word: &str) -> Option<&'static [&'static str]> {
+    let absolute = word.starts_with('/') || (word.as_bytes().get(1) == Some(&b':') && word.as_bytes().get(2) == Some(&b'/'));
+    let name = if absolute { word.rsplit('/').next().unwrap_or(word) } else { word };
+    if !absolute && name != word {
+        return None;
+    }
+    INTERPRETER_FLAGS.iter().find(|(n, _)| *n == name).map(|(_, f)| *f)
+}
+
+/// The identity of a shell call (RULINGS BF1, BU1): given ONLY when the call's whole text parses under
+/// the closed grammar above — then the pack hook / script of THIS lane it runs and its first argument.
+/// Every other call is a stated miss (DEFERRED #76: compound calls, variable paths, globs, escapes,
+/// ANSI-C quotes …). Linear in the command's length (RULINGS BF5).
 pub fn pack_call(tool_input: &Value, roots: &PackRoots) -> PackCall {
     pack_call_counted(tool_input, roots).0
 }
@@ -1167,35 +1038,58 @@ pub fn pack_call(tool_input: &Value, roots: &PackRoots) -> PackCall {
 /// [`pack_call`] and the number of steps it took (the linear-cost pin of RULINGS BF5).
 pub fn pack_call_counted(tool_input: &Value, roots: &PackRoots) -> (PackCall, usize) {
     let mut steps = 0usize;
-    let Some(cmd) = shell_command(tool_input) else {
-        return (PackCall::None, steps);
-    };
-    let cmd = cut_at_char_boundary(&cmd, COMMAND_SCAN_MAX_BYTES);
-    let Some(words) = single_simple_command(cmd, &mut steps) else {
-        return (PackCall::None, steps);
-    };
+    let call = shell_command(tool_input)
+        .filter(|cmd| cmd.len() <= COMMAND_SCAN_MAX_BYTES) // never a prefix of a longer text
+        .and_then(|cmd| grammar_tokens(&cmd, &mut steps))
+        .and_then(|toks| parse_call(&toks, roots, &mut steps));
+    (call.unwrap_or(PackCall::None), steps)
+}
+
+/// The command rule of the grammar over its tokens.
+fn parse_call(toks: &[Tok], roots: &PackRoots, steps: &mut usize) -> Option<PackCall> {
+    let end = toks.iter().position(|t| *t == Tok::Redirection).unwrap_or(toks.len());
+    if toks[end..].iter().any(|t| *t != Tok::Redirection) {
+        return None; // a word after a redirection
+    }
+    let words: Vec<(&str, bool, &str)> = toks[..end]
+        .iter()
+        .filter_map(|t| match t {
+            Tok::Word { text, bare, lead } => Some((text.as_str(), *bare, lead.as_str())),
+            Tok::Redirection => None,
+        })
+        .collect();
     let mut k = 0;
-    while let Some(w) = words.get(k).filter(|w| is_env_assignment(w)) {
-        if w.contains("${") {
-            return (PackCall::None, steps); // an assignment that expands (RULINGS BS1)
-        }
+    while words.get(k).is_some_and(|(_, _, lead)| is_assignment_lead(lead)) {
         k += 1;
     }
-    let Some(prog) = words.get(k) else {
-        return (PackCall::None, steps);
-    };
-    if let Some(rel) = roots.rel_of(prog, &mut steps) {
-        return (PackCall::One { rel, sub: sub_at(&words, k + 1) }, steps);
-    }
-    if prog == "cys-dept" || prog.ends_with("/.local/bin/cys-dept") {
-        return (PackCall::One { rel: "bin/cys-dept".into(), sub: sub_at(&words, k + 1) }, steps);
-    }
-    if let Some(op) = interpreter_operand(prog, &words, k + 1) {
-        if let Some(rel) = roots.rel_of(&words[op], &mut steps) {
-            return (PackCall::One { rel, sub: sub_at(&words, op + 1) }, steps);
+    let script = |w: Option<&(&str, bool, &str)>, steps: &mut usize| -> Option<String> {
+        let (text, bare, _) = w?;
+        if !*bare {
+            return None;
         }
+        roots.literal_rel(text, steps)
+    };
+    let sub = |j: usize| -> Option<String> {
+        words
+            .get(j)
+            .map(|(t, _, _)| *t)
+            .filter(|t| !t.is_empty() && !t.starts_with('-'))
+            .map(|t| t.chars().take(64).collect())
+    };
+    let (prog, prog_bare, _) = *words.get(k)?;
+    if let Some(rel) = script(words.get(k), steps) {
+        return Some(PackCall::One { rel, sub: sub(k + 1) });
     }
-    (PackCall::None, steps)
+    let flags = prog_bare.then(|| interpreter_flags(prog)).flatten()?;
+    let mut j = k + 1;
+    while let Some((text, bare, _)) = words.get(j).filter(|(t, _, _)| t.starts_with('-')) {
+        if !*bare || !flags.contains(text) {
+            return None; // a flag outside the interpreter's fixed list
+        }
+        j += 1;
+    }
+    let rel = script(words.get(j), steps)?;
+    Some(PackCall::One { rel, sub: sub(j + 1) })
 }
 
 /// What one observation is, decided WITHOUT the detector's state (so it runs before the lock).
@@ -2263,51 +2157,368 @@ mod defect_intake_tests {
         out
     }
 
-    /// RULINGS BF1 / BS1 — positives: the identity is the pack script of THIS lane that a call made of
-    /// ONE simple command ran — bare, or through one interpreter, with assignments in front, with an
-    /// output redirection to `/dev/null` or a descriptor copy — spelled with any of the lane's pack roots.
+    /// RULINGS BU1 — the positive set GENERATED from the grammar: assignments × (script alone |
+    /// interpreter + its listed flags) × script × arguments × trailing redirections — every text of the
+    /// product is identified, with its rel and its first argument. Plus the Windows and department roots.
     #[test]
-    fn identity_is_the_executed_program() {
-        let pc = |c: &str| pack_call(&bash(c), &base());
-        // bare script
-        assert_eq!(pc("~/.cys/pack/bin/cys-dept status"), one("bin/cys-dept", Some("status")));
-        assert_eq!(pc("$CYS_PACK_DIR/bin/javis_x.py status"), one("bin/javis_x.py", Some("status")));
-        assert_eq!(pc("cys-dept create team-x"), one("bin/cys-dept", Some("create")));
-        // interpreter + script
-        assert_eq!(pc("python3 ~/.cys/pack/bin/javis_x.py check --json"), one("bin/javis_x.py", Some("check")));
-        assert_eq!(pc(r#"python3 "$HOME/.cys/pack/bin/javis_x.py""#), one("bin/javis_x.py", None));
-        assert_eq!(pc("python3 ${HOME}/.cys/pack/bin/javis_x.py run"), one("bin/javis_x.py", Some("run")));
-        assert_eq!(pc("python3 /Users/x/.cys/pack/bin/javis_x.py run"), one("bin/javis_x.py", Some("run")));
-        assert_eq!(pc(r#"sh "${CYS_PACK_DIR}/hooks/guard.sh""#), one("hooks/guard.sh", None));
-        assert_eq!(pc(r#"python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_x.py" check"#), one("bin/javis_x.py", Some("check")));
-        assert_eq!(pc("python3 ${CYS_PACK_DIR:-${HOME}/.cys/pack}/bin/javis_x.py"), one("bin/javis_x.py", None));
-        assert_eq!(pc("python3 -u -B -X importtime ~/.cys/pack/bin/javis_x.py run"), one("bin/javis_x.py", Some("run")));
-        assert_eq!(pc("bash -e ~/.cys/pack/hooks/sub/x.sh go"), one("hooks/sub/x.sh", Some("go")));
-        assert_eq!(pc("node ~/.cys/pack/bin/x.mjs"), one("bin/x.mjs", None));
-        assert_eq!(pc("python3 ~/.cys/pack/bin/javis_x.py 'a $(b) `c`; d'"), one("bin/javis_x.py", Some("a $(b) `c`; d")), "single quotes are literal");
-        // assignments + script
-        assert_eq!(pc("FOO=1 BAR=x python3 ~/.cys/pack/bin/javis_x.py run"), one("bin/javis_x.py", Some("run")));
-        assert_eq!(pc("A=1 ~/.cys/pack/bin/cys-dept list"), one("bin/cys-dept", Some("list")));
-        // redirections to /dev/null or a descriptor copy
-        assert_eq!(pc("python3 ~/.cys/pack/bin/javis_x.py run 2>&1"), one("bin/javis_x.py", Some("run")));
-        assert_eq!(pc("python3 ~/.cys/pack/bin/javis_x.py run >/dev/null"), one("bin/javis_x.py", Some("run")));
-        assert_eq!(pc("python3 ~/.cys/pack/bin/javis_x.py run > /dev/null 2>&1"), one("bin/javis_x.py", Some("run")));
-        assert_eq!(pc("python3 ~/.cys/pack/bin/javis_x.py run 2>/dev/null >&2"), one("bin/javis_x.py", Some("run")));
-        assert_eq!(pc("python3 ~/.cys/pack/bin/javis_x.py run &>/dev/null"), one("bin/javis_x.py", Some("run")));
-        // a trailing newline or comment is not a second command
-        assert_eq!(pc("python3 ~/.cys/pack/bin/javis_x.py run\n"), one("bin/javis_x.py", Some("run")));
-        assert_eq!(pc("cys-dept list   # the teams"), one("bin/cys-dept", Some("list")));
-        // Windows: the pack dir with a drive letter, its Git Bash `/c/…` form, `pwsh -File`
+    fn grammar_positives_are_identified() {
+        let assigns = ["", "A=1 ", "A=1 B='x y' ", "C=\"v w\" ", "D=é_1 "];
+        let mut heads: Vec<String> = vec![String::new()];
+        for (name, flags) in INTERPRETER_FLAGS {
+            heads.push(format!("{name} "));
+            heads.push(format!("{name} {} ", flags.join(" ")));
+            heads.push(format!("/usr/bin/{name} {} ", flags[0]));
+        }
+        let scripts = [("~/.cys/pack/bin/javis_x.py", "bin/javis_x.py"), ("/Users/x/.cys/pack/hooks/sub/g.sh", "hooks/sub/g.sh"), ("~/.cys/pack/bin/cys-dept", "bin/cys-dept")];
+        let args = [("", None), (" check", Some("check")), (" check --json 'a b' \"c d\" x=1 é@%+:,./- 日本", Some("check")), ("\t--flag=v", None)];
+        let redirs = ["", " 2>&1", " >/dev/null 2>&1", " > /dev/null", " &>/dev/null", " 1>/dev/null 2>/dev/null", " 2> /dev/null"];
+        let mut n = 0;
+        for a in assigns {
+            for h in &heads {
+                for (path, rel) in scripts {
+                    for (arg, sub) in args {
+                        for r in redirs {
+                            let text = format!("{a}{h}{path}{arg}{r}");
+                            assert_eq!(pack_call(&bash(&text), &base()), one(rel, sub), "{text:?}");
+                            n += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(n, assigns.len() * heads.len() * scripts.len() * args.len() * redirs.len());
+        assert!(n > 2_000, "{n}");
+        // Windows: the drive-letter pack dir and its Git Bash form; a department daemon: ITS pack
         let win = PackRoots::new(Some(r"C:\Users\x\.cys\pack"), Some(r"C:\Users\x"));
-        assert_eq!(pack_call(&bash(r#"python "C:\Users\x\.cys\pack\bin\javis_x.py" check"#), &win), one("bin/javis_x.py", Some("check")));
+        assert_eq!(pack_call(&bash("python C:/Users/x/.cys/pack/bin/javis_x.py check"), &win), one("bin/javis_x.py", Some("check")));
         assert_eq!(pack_call(&bash("python /c/Users/x/.cys/pack/bin/javis_x.py"), &win), one("bin/javis_x.py", None));
-        assert_eq!(pack_call(&bash("pwsh -NoProfile -File C:/Users/x/.cys/pack/bin/x.ps1"), &win), one("bin/x.ps1", None));
-        // a department daemon: ITS pack
+        assert_eq!(pack_call(&bash("pwsh -NoProfile ~/.cys/pack/bin/x.ps1"), &win), one("bin/x.ps1", None));
         let dept = PackRoots::new(Some("/Users/x/.cys/pack-dept-a"), Some("/Users/x"));
         assert_eq!(pack_call(&bash("python3 ~/.cys/pack-dept-a/bin/javis_x.py"), &dept), one("bin/javis_x.py", None));
-        assert_eq!(pack_call(&bash("python3 $CYS_PACK_DIR/bin/javis_x.py"), &dept), one("bin/javis_x.py", None));
-        // a list command
         assert_eq!(pack_call(&json!({"command": ["python3", "/Users/x/.cys/pack/bin/a.py", "x"]}), &base()), one("bin/a.py", Some("x")));
+    }
+
+    /// RULINGS BU1 — one negative per character and form the grammar leaves out, incl. the third
+    /// re-check's routes verbatim; each is also not counted as a call.
+    #[test]
+    fn grammar_negatives_one_per_character_and_form() {
+        let x = "python3 ~/.cys/pack/bin/javis_x.py";
+        let mut negatives: Vec<String> = Vec::new();
+        for c in ['*', '?', '[', ']', '{', '}', '$', '\\', '#', '!', '<', '>', '|', '&', ';', '(', ')', '`', '~', '^', '\'', '"'] {
+            negatives.push(format!("{x} a{c}b"));
+        }
+        negatives.extend(
+            [
+                // the re-check's routes, verbatim
+                format!("{x} --include=*.py"),
+                format!("{x} https://a/b?c=1"),
+                format!("{x} =word"),
+                format!("{x} ~nosuchuser"),
+                format!("{x} ${{VAR:?msg}}"),
+                "python3 ${CYS_PACK_DIR:?x}/bin/a.py".to_string(),
+                format!("{x} $'\\'' ; false # don't"),
+                format!("{x} a\r"),
+                format!("{x} >&9"),
+                // forms
+                format!("{x}\n"),
+                format!("{x} a\nb"),
+                "python3 $CYS_PACK_DIR/bin/a.py".to_string(),
+                "python3 ${CYS_PACK_DIR}/bin/a.py".to_string(),
+                "python3 $HOME/.cys/pack/bin/a.py".to_string(),
+                "python3 \"~/.cys/pack/bin/javis_x.py\"".to_string(),
+                "python3 '/Users/x/.cys/pack/bin/javis_x.py'".to_string(),
+                "python3 ~/.cys/pack/bin/javis_x.py\"\"".to_string(),
+                "python3 bin/javis_x.py".to_string(),
+                "python3 ./javis_x.py".to_string(),
+                "python3 /tmp/rig/.cys/pack/bin/javis_x.py".to_string(),
+                "python3 ~/.cys/pack-dept-a/bin/javis_x.py".to_string(),
+                "cys-dept create t".to_string(),
+                "python3.12 ~/.cys/pack/bin/javis_x.py".to_string(),
+                "bin/python3 ~/.cys/pack/bin/javis_x.py".to_string(),
+                "'python3' ~/.cys/pack/bin/javis_x.py".to_string(),
+                format!("{x} \"a $b\""),
+                format!("{x} \"a `b`\""),
+                format!("{x} \"a \\b\""),
+                format!("{x} \"a !b\""),
+                format!("{x} 'open"),
+                format!("{x} \"open"),
+                format!("{x} >&2"),
+                format!("{x} 2>&1x"),
+                format!("{x} > out.txt"),
+                format!("{x} 2>/dev/null x"),
+                format!("{x} >/dev/nullx"),
+                format!("{x} >> /dev/null"),
+                "A=~/x python3 ~/.cys/pack/bin/javis_x.py".to_string(),
+                "=x python3 ~/.cys/pack/bin/javis_x.py".to_string(),
+                "env A=1 python3 ~/.cys/pack/bin/javis_x.py".to_string(),
+                "~/.cys/pack/bin/javis_x.md".to_string(),
+                "python3 ~/.cys/pack/bin/".to_string(),
+            ]
+            .into_iter(),
+        );
+        // every flag outside the fixed lists, incl. the ruling's named ones
+        for (name, bad) in [
+            ("python3", "-c"), ("python3", "-m"), ("python3", "-W"), ("python3", "-X"), ("python3", "-s"), ("python3", "-I"),
+            ("python3", "-E"), ("python3", "-uB"), ("bash", "-c"), ("bash", "-e"), ("bash", "-s"), ("bash", "--rcfile"),
+            ("sh", "-c"), ("zsh", "-c"), ("node", "-e"), ("node", "-r"), ("node", "--require"), ("pwsh", "-Command"),
+            ("pwsh", "-File"), ("pwsh", "-noprofile"), ("py", "-c"),
+        ] {
+            negatives.push(format!("{name} {bad} ~/.cys/pack/bin/javis_x.py"));
+        }
+        // a text longer than the scan limit is never read as its prefix
+        negatives.push(format!("{x} {}", "a".repeat(COMMAND_SCAN_MAX_BYTES)));
+        for c in &negatives {
+            assert_eq!(pack_call(&bash(c), &base()), PackCall::None, "outside the grammar but identified: {c:?}");
+            assert_eq!(classify(&pre(&bash(c)), &base(), false), Classified::Ignored { failure: false }, "counted as a call: {c:?}");
+        }
+        assert_eq!(negatives.len(), 22 + 42 + 21 + 1);
+    }
+
+    /// The property test's reference — an INDEPENDENT, slow check of the grammar (RULINGS BU1): splits
+    /// the text on unquoted spaces / tabs with an explicit state machine, then validates each raw token
+    /// with string operations, then applies the command rule. Shares only data (the flag lists, the
+    /// redirections, the roots' prefixes) with the production parser.
+    fn reference_identity(text: &str, prefixes: &[String]) -> Option<(String, Option<String>)> {
+        if text.contains('\n') || text.contains('\r') || text.len() > COMMAND_SCAN_MAX_BYTES {
+            return None;
+        }
+        // 1. raw tokens
+        #[derive(PartialEq)]
+        enum St {
+            Out,
+            In,
+            Single,
+            Double,
+        }
+        let mut raw: Vec<String> = Vec::new();
+        let mut st = St::Out;
+        let mut cur = String::new();
+        for c in text.chars() {
+            st = match (st, c) {
+                (St::Out, ' ' | '\t') => St::Out,
+                (St::In, ' ' | '\t') => {
+                    raw.push(std::mem::take(&mut cur));
+                    St::Out
+                }
+                (St::Out | St::In, '\'') => {
+                    cur.push(c);
+                    St::Single
+                }
+                (St::Out | St::In, '"') => {
+                    cur.push(c);
+                    St::Double
+                }
+                (St::Out | St::In, _) => {
+                    cur.push(c);
+                    St::In
+                }
+                (St::Single, '\'') | (St::Double, '"') => {
+                    cur.push(c);
+                    St::In
+                }
+                (s, _) => {
+                    cur.push(c);
+                    s
+                }
+            };
+        }
+        match st {
+            St::Single | St::Double => return None,
+            St::In => raw.push(cur),
+            St::Out => {}
+        }
+        // 2. redirections at the end (`>` `1>` `2>` `&>` may stand apart from `/dev/null`)
+        let mut toks: Vec<Option<String>> = Vec::new(); // None = a redirection
+        let mut k = 0;
+        while k < raw.len() {
+            let r = raw[k].as_str();
+            if REDIRECTIONS.contains(&r) {
+                toks.push(None);
+            } else if [">", "1>", "2>", "&>"].contains(&r) && raw.get(k + 1).map(String::as_str) == Some("/dev/null") {
+                toks.push(None);
+                k += 1;
+            } else {
+                toks.push(Some(raw[k].clone()));
+            }
+            k += 1;
+        }
+        let first_redir = toks.iter().position(Option::is_none).unwrap_or(toks.len());
+        if toks[first_redir..].iter().any(Option::is_some) {
+            return None;
+        }
+        // 3. each word: parts by string operations
+        let bare_ok = |s: &str| s.chars().all(|c| c.is_alphanumeric() || "_@%+=:,./-".contains(c));
+        let mut words: Vec<(String, bool, String)> = Vec::new(); // (text, all bare, leading bare text)
+        for t in toks[..first_redir].iter().flatten() {
+            let mut rest = t.as_str();
+            let (mut text, mut lead, mut all_bare, mut first) = (String::new(), String::new(), true, true);
+            while !rest.is_empty() {
+                if let Some(r) = rest.strip_prefix('\'') {
+                    let close = r.find('\'')?;
+                    text.push_str(&r[..close]);
+                    rest = &r[close + 1..];
+                    all_bare = false;
+                } else if let Some(r) = rest.strip_prefix('"') {
+                    let close = r.find('"')?;
+                    if r[..close].contains(['$', '`', '\\', '!']) {
+                        return None;
+                    }
+                    text.push_str(&r[..close]);
+                    rest = &r[close + 1..];
+                    all_bare = false;
+                } else {
+                    let stop = rest.find(['\'', '"']).unwrap_or(rest.len());
+                    let mut seg = &rest[..stop];
+                    if first && seg.starts_with("~/") {
+                        text.push('~');
+                        if all_bare {
+                            lead.push('~');
+                        }
+                        seg = &seg[1..];
+                    }
+                    if !bare_ok(seg) || (first && seg.starts_with('=') && text.is_empty()) {
+                        return None;
+                    }
+                    text.push_str(seg);
+                    if all_bare {
+                        lead.push_str(seg);
+                    }
+                    rest = &rest[stop..];
+                }
+                first = false;
+            }
+            words.push((text, all_bare, lead));
+        }
+        // 4. the command rule
+        let assignment = |lead: &str| {
+            lead.find('=').is_some_and(|p| {
+                let name = &lead[..p];
+                !name.is_empty() && !name.starts_with(|c: char| c.is_ascii_digit()) && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+            })
+        };
+        let mut i = 0;
+        while i < words.len() && assignment(&words[i].2) {
+            i += 1;
+        }
+        let script_rel = |w: &(String, bool, String)| -> Option<String> {
+            if !w.1 {
+                return None;
+            }
+            let p = prefixes.iter().find(|p| w.0.starts_with(p.as_str()))?;
+            let rel = cys::repair::intake::normalize_rel(&w.0[p.len()..]).ok()?;
+            let file = rel.rsplit('/').next()?;
+            let ok = match file.rsplit_once('.') {
+                Some((stem, ext)) => !stem.is_empty() && ["py", "sh", "bash", "js", "mjs", "cjs", "ps1"].contains(&ext),
+                None => rel.starts_with("bin/") && rel.len() > 4,
+            };
+            ok.then_some(rel)
+        };
+        let sub = |j: usize| words.get(j).filter(|w| !w.0.is_empty() && !w.0.starts_with('-')).map(|w| w.0.chars().take(64).collect::<String>());
+        let prog = words.get(i)?;
+        if let Some(rel) = script_rel(prog) {
+            return Some((rel, sub(i + 1)));
+        }
+        if !prog.1 {
+            return None;
+        }
+        let name = if prog.0.starts_with('/') || prog.0.get(1..3) == Some(":/") { prog.0.rsplit('/').next()? } else { prog.0.as_str() };
+        let flags = INTERPRETER_FLAGS.iter().find(|(n, _)| *n == name)?.1;
+        let mut j = i + 1;
+        while let Some(w) = words.get(j).filter(|w| w.0.starts_with('-')) {
+            if !w.1 || !flags.contains(&w.0.as_str()) {
+                return None;
+            }
+            j += 1;
+        }
+        let rel = script_rel(words.get(j)?)?;
+        Some((rel, sub(j + 1)))
+    }
+
+    /// RULINGS BU1 — the PROPERTY test: for 5,000 pseudo-random texts (fixed seed) — half grammar-shaped
+    /// (assignment? interpreter+flags? script args* redirection*, with valid and invalid choices), half
+    /// random fragments — with arbitrary characters inserted into half of them (the full printable ASCII
+    /// set, tab, CR, LF, some non-ASCII letters), the production parser gives an identity EXACTLY when the
+    /// independent reference re-parses the text — and the same rel and first argument.
+    #[test]
+    fn property_identity_only_when_the_reference_reparses() {
+        let roots = base();
+        let mut state: u64 = 0x5eed_7a3b_0001;
+        let mut rnd = move |n: usize| -> usize {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % n as u64) as usize
+        };
+        let frags = [
+            "python3", "/usr/bin/python3", "py", "bash", "sh", "zsh", "node", "pwsh", "-u", "-B", "-x", "-f", "-3",
+            "--norc", "--no-warnings", "-NoProfile", "-c", "-m", "-e", "~/.cys/pack/bin/a.py", "/Users/x/.cys/pack/bin/javis_x.py",
+            "/Users/x/.cys/pack/hooks/g.sh", "~/.cys/pack/bin/cys-dept", "~/.cys/pack-dept-a/bin/a.py", "/tmp/x.py",
+            "$CYS_PACK_DIR/bin/a.py", "A=1", "B='x y'", "C=\"z\"", "'quoted arg'", "\"dq arg\"", "arg", "--flag=v", "2>&1",
+            ">/dev/null", ">", "/dev/null", "2>/dev/null", "&>/dev/null", "1>/dev/null", "check", "日本", "é", "~/x", "=x",
+        ];
+        let assigns = ["", "", "A=1", "B='x y'", "C=\"z\"", "1A=x", "A=$x"];
+        let heads = ["", "", "python3", "python3 -u -B", "/usr/bin/python3", "bash -x", "zsh -f", "node --no-warnings", "pwsh -NoProfile", "py -3", "python3 -c", "sh -s", "env"];
+        let scripts = ["~/.cys/pack/bin/a.py", "/Users/x/.cys/pack/bin/javis_x.py", "/Users/x/.cys/pack/hooks/g.sh", "~/.cys/pack/bin/cys-dept", "~/.cys/pack-dept-a/bin/a.py", "/tmp/x.py", "$CYS_PACK_DIR/bin/a.py", "\"~/.cys/pack/bin/a.py\""];
+        let redirs = ["", "", "2>&1", ">/dev/null", "> /dev/null", "2>/dev/null", "&>/dev/null", ">&2", "> out"];
+        let seps = [" ", " ", "\t", "  "];
+        let extra = ['ä', 'ß', 'λ', '日'];
+        let (mut positives, mut total) = (0usize, 0usize);
+        for _ in 0..5_000 {
+            let mut parts: Vec<&str> = Vec::new();
+            if rnd(2) == 0 {
+                for part in [assigns[rnd(assigns.len())], heads[rnd(heads.len())], scripts[rnd(scripts.len())]] {
+                    if !part.is_empty() {
+                        parts.push(part);
+                    }
+                }
+                for _ in 0..rnd(3) {
+                    parts.push(frags[rnd(frags.len())]);
+                }
+                for _ in 0..rnd(3) {
+                    let r = redirs[rnd(redirs.len())];
+                    if !r.is_empty() {
+                        parts.push(r);
+                    }
+                }
+            } else {
+                for _ in 0..1 + rnd(7) {
+                    parts.push(frags[rnd(frags.len())]);
+                }
+            }
+            let mut text = String::new();
+            for (k, part) in parts.iter().enumerate() {
+                if k > 0 {
+                    text.push_str(if rnd(8) == 0 { "" } else { seps[rnd(seps.len())] });
+                }
+                text.push_str(part);
+            }
+            let inserts = if rnd(2) == 0 { 0 } else { 1 + rnd(2) };
+            for _ in 0..inserts {
+                let c = match rnd(10) {
+                    0 => extra[rnd(extra.len())],
+                    1 => ['\t', '\r', '\n'][rnd(3)],
+                    _ => (0x20u8 + rnd(95) as u8) as char,
+                };
+                let mut chars: Vec<char> = text.chars().collect();
+                let at = rnd(chars.len() + 1);
+                chars.insert(at, c);
+                text = chars.into_iter().collect();
+            }
+            total += 1;
+            let got = pack_call(&bash(&text), &roots);
+            let want = reference_identity(&text, roots.prefixes());
+            match (&got, &want) {
+                (PackCall::One { rel, sub }, Some((r, s))) => {
+                    assert_eq!((rel, sub), (r, s), "{text:?}");
+                    positives += 1;
+                }
+                (PackCall::None, None) => {}
+                _ => panic!("parser and reference disagree on {text:?}: {got:?} vs {want:?}"),
+            }
+        }
+        eprintln!("[t3b-property] {total} texts, {positives} identified, {} refused", total - positives);
+        assert!(positives >= 100, "the generator rarely produces a grammar text ({positives}) — the property would be vacuous");
+        assert!(total - positives >= 1_000);
     }
 
     /// RULINGS BF1 — negatives: a MENTION is never an identity — an operand of another program, a user
@@ -2515,7 +2726,7 @@ mod defect_intake_tests {
             "#\n",
         ];
         for u in unit {
-            let reps = COMMAND_SCAN_MAX_BYTES / u.len() + 1;
+            let reps = COMMAND_SCAN_MAX_BYTES / u.len();
             let cmd = u.repeat(reps);
             let chars = cut_at_char_boundary(&cmd, COMMAND_SCAN_MAX_BYTES).chars().count();
             let (_, steps) = pack_call_counted(&bash(&cmd), &roots);
@@ -2552,8 +2763,10 @@ mod defect_intake_tests {
             "pub fn classify(",
             "pub fn record(",
             "pub fn pack_call_counted(",
-            "fn single_simple_command(",
-            "fn interpreter_operand(",
+            "fn grammar_tokens(",
+            "fn redirection_at(",
+            "fn parse_call(",
+            "fn interpreter_flags(",
             "pub fn detector_excluded(",
             "fn is_failure(",
             "fn bounded_error(",
@@ -2625,7 +2838,7 @@ mod defect_intake_tests {
     #[test]
     fn exclusions_need_positive_evidence_and_unnamed_failures_form_no_row() {
         let cfg_t = 1_800_000_000.0;
-        let dept = bash("cys-dept create team-x");
+        let dept = bash("~/.cys/pack/bin/cys-dept create team-x");
         let err127 = "Exit code 127\n/usr/bin/bash: line 1: cys-dept: command not found";
         // Windows: by design, never counted
         let mut d = Detector::default();
@@ -2877,14 +3090,14 @@ mod defect_intake_tests {
     }
 
     /// G4: two lanes that see the same failure keep one row EACH; the aggregation on read counts ONE
-    /// defect with both lanes. (Each lane runs its OWN pack: `$CYS_PACK_DIR` is lane-scoped.)
+    /// defect with both lanes. (Under test both daemons get the same fictional pack roots.)
     #[test]
     fn two_lanes_keep_their_own_rows() {
         let base_d = crate::team_gate_tests::tmp_daemon("t3b-lane-a", false);
         let dept_d = crate::team_gate_tests::tmp_daemon("t3b-lane-b", true);
         let root = tmp_root("lanes");
         for d in [&base_d, &dept_d] {
-            feed(d, "python3 $CYS_PACK_DIR/bin/a.py", "Exit code 1\nE: same", 500);
+            feed(d, "python3 ~/.cys/pack/bin/a.py", "Exit code 1\nE: same", 500);
             flush_defect_intake(d, &root, &AlertConfig::default(), crate::alert_route::Now::at(10.0));
         }
         let (la, lb) = (LaneKey::of_socket(&base_d.socket_path), LaneKey::of_socket(&dept_d.socket_path));
