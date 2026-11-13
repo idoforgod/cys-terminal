@@ -655,6 +655,89 @@ fn t3_request(cmd: &RepairCmd) -> Option<(&'static str, Value, bool)> {
     })
 }
 
+/// The daemon request of a T4 verb (C9 grant, C10 owner token): (wire method, params). `None` = not
+/// a T4 verb. `grant ask` / `owner-token ask` are their own requests (RULINGS Q1 / Q2).
+fn t4_request(cmd: &RepairCmd) -> Option<(&'static str, Value)> {
+    let path_of = |p: &PathBuf| p.to_string_lossy().to_string();
+    Some(match cmd {
+        RepairCmd::Grant {
+            mode: GrantMode::Ask,
+            ..
+        } => ("repair.grant_ask", json!({})),
+        RepairCmd::Grant { mode, daily_cap } => (
+            "repair.grant",
+            json!({"mode": if *mode == GrantMode::On { "on" } else { "off" }, "daily_cap": daily_cap}),
+        ),
+        RepairCmd::OwnerToken {
+            mode: Some(OwnerTokenMode::Ask),
+            path,
+            ..
+        } => ("repair.owner_token_ask", json!({"path": path_of(path)})),
+        RepairCmd::OwnerToken {
+            mode: None,
+            path,
+            repair,
+        } => (
+            "repair.owner_token",
+            json!({"path": path_of(path), "repair": repair}),
+        ),
+        RepairCmd::RuleDocAllowed { path } => {
+            ("repair.rule_doc_allowed", json!({"path": path_of(path)}))
+        }
+        _ => return None,
+    })
+}
+
+/// Writes the success of a T4 verb and returns the exit code: `rule-doc-allowed` exits 0 only when
+/// the daemon allows (the guard hook reads only the exit code), 95 otherwise with the reason on
+/// stderr and nothing on stdout.
+fn t4_print(cmd: &RepairCmd, out: &mut dyn Write, err: &mut dyn Write, v: &Value) -> i32 {
+    let r = match cmd {
+        RepairCmd::Grant {
+            mode: GrantMode::Ask,
+            ..
+        } => writeln!(
+            out,
+            "질문을 등록했습니다 — 이제 주인께 대화로 물으세요: \"자비스가 발견한 명백한 버그·오류를 스스로 고쳐도 될까요?\" (30분 안에 주인이 직접 친 첫 답만 셉니다)"
+        ),
+        RepairCmd::Grant { .. } => {
+            if v.get("grant") == Some(&json!("on")) {
+                writeln!(
+                    out,
+                    "자동 수리 허락: 켬 (하루 상한 {}건 · 주인의 입력이 있으면 30분 쉼)",
+                    s(v, "daily_cap")
+                )
+            } else {
+                writeln!(out, "자동 수리 허락: 끔")
+            }
+        }
+        RepairCmd::OwnerToken {
+            mode: Some(OwnerTokenMode::Ask),
+            ..
+        } => writeln!(
+            out,
+            "질문을 등록했습니다(규칙 문서 {}) — 주인께 이 문서를 고쳐도 되는지 물으세요(30분 안에 주인이 직접 친 첫 답만 셉니다)",
+            s(v, "path")
+        ),
+        RepairCmd::OwnerToken { .. } => writeln!(
+            out,
+            "{}\n이 표는 지금 한 번만 보입니다 — 유효 24시간 · 이 부서 워커의 티켓에 그대로 붙이세요(`cys repair begin --owner-token …`)",
+            s(v, "ticket_line")
+        ),
+        RepairCmd::RuleDocAllowed { .. } => {
+            if v.get("allowed") == Some(&Value::Bool(true)) {
+                writeln!(out, "허용: {} ({})", s(v, "path"), s(v, "repair"))
+            } else {
+                let _ = writeln!(err, "허용하지 않음: {} — {}", s(v, "path"), s(v, "reason"));
+                return cys::repair::types::EXIT_REPAIR_PRECONDITION;
+            }
+        }
+        _ => Ok(()),
+    };
+    let _ = r;
+    0
+}
+
 /// O-C1-8: `cys repair tombstones [--json]` — a LOCAL read of this lane's tombstone file (no daemon);
 /// the lane is the caller's socket (`CYS_SOCKET`, as `lane_key` does). An unreadable file → the
 /// sentence on stderr and exit 95, nothing on stdout (a reader then behaves as today: no tombstones).
@@ -721,8 +804,14 @@ fn run_with(cmd: &RepairCmd, out: &mut dyn Write, err: &mut dyn Write, rpc: Rpc<
             Err(e) => fail(err, &e),
         };
     }
-    // The verbs whose bodies belong to other tracks (T4 grant/owner-token/rule-doc-allowed ·
-    // T5a boot-critical · T5b submit/auth-helper · T6 revert/sweep/tick/reapply · T7b gate/recheck).
+    if let Some((method, params)) = t4_request(cmd) {
+        return match rpc(method, params) {
+            Ok(v) => t4_print(cmd, out, err, &v),
+            Err(e) => fail(err, &e),
+        };
+    }
+    // The verbs whose bodies belong to other tracks (T5a boot-critical · T5b submit/auth-helper ·
+    // T6 revert/sweep/tick/reapply · T7b gate/recheck).
     let _ = writeln!(
         err,
         "{}: cys repair {}",
@@ -972,6 +1061,10 @@ mod tests {
             "list",
             "status",
             "cleanup",
+            // T4 (rewrite: its daemon verbs left the stub set — an old daemon → 93 like T3's)
+            "grant",
+            "owner-token",
+            "rule-doc-allowed",
         ];
         let mut covered: Vec<&str> = Vec::new();
         for argv in calls {
@@ -1093,6 +1186,49 @@ mod tests {
                 "repair_cli.rs production code prints to stdout ({needle})"
             );
         }
+    }
+
+    /// T4: the wire requests of `grant on|off|ask`, `owner-token [ask]` and `rule-doc-allowed`, their
+    /// output, and `rule-doc-allowed`'s exit code (0 only when the daemon allows — the guard hook reads
+    /// nothing else; 95 with the reason on stderr and nothing on stdout otherwise).
+    #[test]
+    fn t4_requests_and_outputs() {
+        let seen = std::cell::RefCell::new(Vec::<(String, Value)>::new());
+        let reply = std::cell::RefCell::new(json!({}));
+        let rpc = |m: &str, p: Value| -> Result<Value, String> {
+            seen.borrow_mut().push((m.to_string(), p));
+            Ok(reply.borrow().clone())
+        };
+        let run = |argv: &[&str], r: Value| -> (i32, String, String) {
+            *reply.borrow_mut() = r;
+            let cmd = parse(argv).unwrap();
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = run_with(&cmd, &mut out, &mut err, &rpc);
+            (code, String::from_utf8(out).unwrap(), String::from_utf8(err).unwrap())
+        };
+        let (c, o, _) = run(&["grant", "on", "--daily-cap", "3"], json!({"grant": "on", "daily_cap": 3}));
+        assert_eq!((c, o.contains("켬") && o.contains("3건")), (0, true));
+        assert_eq!(seen.borrow().last().unwrap(), &("repair.grant".to_string(), json!({"mode": "on", "daily_cap": 3})));
+        let (c, o, _) = run(&["grant", "off"], json!({"grant": "off"}));
+        assert_eq!((c, o.trim()), (0, "자동 수리 허락: 끔"));
+        assert_eq!(seen.borrow().last().unwrap().1, json!({"mode": "off", "daily_cap": null}));
+        let (c, o, _) = run(&["grant", "ask"], json!({}));
+        assert!(c == 0 && o.contains("스스로 고쳐도 될까요?"));
+        assert_eq!(seen.borrow().last().unwrap(), &("repair.grant_ask".to_string(), json!({})));
+        let (c, _, _) = run(&["owner-token", "ask", "--path", "soul.md"], json!({"path": "soul.md"}));
+        assert_eq!(c, 0);
+        assert_eq!(seen.borrow().last().unwrap(), &("repair.owner_token_ask".to_string(), json!({"path": "soul.md"})));
+        let line = "주인 지시 표: ot-aaaaaaaaaaaaaaaaaaaaaaaaaa (규칙 문서 soul.md)";
+        let (c, o, _) = run(&["owner-token", "--path", "soul.md", "--repair", "R-2"], json!({"ticket_line": line}));
+        assert!(c == 0 && o.starts_with(line), "{o}");
+        assert_eq!(seen.borrow().last().unwrap(), &("repair.owner_token".to_string(), json!({"path": "soul.md", "repair": "R-2"})));
+        let (c, o, e) = run(&["rule-doc-allowed", "--path", "soul.md"], json!({"allowed": true, "path": "soul.md", "repair": "R-1"}));
+        assert_eq!((c, e.as_str()), (0, ""));
+        assert!(o.contains("R-1"));
+        assert_eq!(seen.borrow().last().unwrap(), &("repair.rule_doc_allowed".to_string(), json!({"path": "soul.md"})));
+        let (c, o, e) = run(&["rule-doc-allowed", "--path", "soul.md"], json!({"allowed": false, "path": "soul.md", "reason": "no"}));
+        assert_eq!((c, o.as_str()), (95, ""));
+        assert!(e.contains("허용하지 않음"));
     }
 
     /// O-C3-6 exit mapping (+ Z1), the old-daemon sentence, an unreachable daemon → 98, and a
