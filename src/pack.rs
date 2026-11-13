@@ -2805,13 +2805,15 @@ pub fn listed_in_compiled_lists(rel: &str) -> bool {
     boot_critical_rel(rel)
 }
 
-/// ★T2f: 이 바이트가 **출시본**인가 — 내장 vendor 본, 이 설치의 매니페스트(마지막에 적용한 vendor 본), 과거 출시
-/// 해시 표 중 하나와 같은 UTF-8 바이트. 팩 쓰기 동사가 등재 파일에 쓸 수 있는 유일한 바이트다.
-pub fn released_bytes(dir: &Path, rel: &str, bytes: &[u8], sources: &UpdateSources) -> bool {
+/// ★T2f(RULINGS BO3): 이 바이트가 **출시본**인가 — 이 바이너리의 내장 vendor 본 또는 과거 출시 해시 표 중 하나와 같은
+/// UTF-8 바이트. 이 판정은 **바이너리 자신의 지식**으로만 한다: 설치 매니페스트·`.new`·pack.prev 의 매니페스트처럼
+/// 일반 쓰기가 바꿀 수 있는 파일은 근거가 되지 않는다(매니페스트의 해시는 그 자체가 내장본·표의 해시일 때만 뜻이
+/// 있는데, 그때는 이미 위 두 근거에 든다). 팩 쓰기 동사가 등재 파일에 쓸 수 있는 유일한 바이트다. `dir` 은 쓰지
+/// 않는다(호출 모양을 바꾸지 않으려고 남겨 둔 인자 `_dir` — 판정에 디스크 파일을 읽지 않는다는 표시).
+pub fn released_bytes(_dir: &Path, rel: &str, bytes: &[u8], sources: &UpdateSources) -> bool {
     let Ok(text) = std::str::from_utf8(bytes) else { return false };
     let h = content_hash(text);
     PACK_ALL.iter().any(|(r, c)| *r == rel && content_hash(c) == h)
-        || load_manifest_state(dir).0.get(rel) == Some(&h)
         || sources.prev_vendor_for(rel).contains(&h)
 }
 
@@ -2855,9 +2857,23 @@ impl std::fmt::Debug for UpdateSources {
 /// (staging 경로는 팩 루트가 아니라 경로 질의가 '판정 불가'가 된다 — INFERRED 선택, 보고서 기재).
 /// T5a 병합 전에는 목록이 비어 늘 거짓 = '기동 필수 아님'(CONTRACTS C4 — 이음새: `with_boot_critical`).
 pub fn boot_critical_rel(rel: &str) -> bool {
+    let k = list_key(rel);
     crate::repair::boot_critical::entries()
         .iter()
-        .any(|e| e.rel == rel)
+        .any(|e| list_key(e.rel) == k)
+}
+
+/// ★T2f(RULINGS BO2 · BN1): 목록 대조용 키 — `/` 구분자, 앞의 `./` 제거, **전체 대소문자 접기**(유니코드
+/// 대문자화 후 소문자화 — U+212A → `k`, U+017F → `s`, `ß` → `ss`). APFS·NTFS 는 기본적으로 대소문자를 가리지 않으므로
+/// 그 철자들은 같은 파일을 연다 — 접기는 '목록에 있다' 쪽으로만 답을 바꾼다(보수 방향). T5a 의 목록 조회
+/// (`boot_critical::boot_critical_entry` · `protection_entry` 의 `rel_key`)와 같은 규칙의 지역 사본이다 — T5a 의 마지막
+/// 재기반 작업이 `listed_in_compiled_lists` 를 그 조회 함수로 바꿀 때 이 사본을 지운다(구현 하나).
+fn list_key(rel: &str) -> String {
+    let mut r = rel.replace('\\', "/");
+    while let Some(t) = r.strip_prefix("./") {
+        r = t.to_string();
+    }
+    r.trim_start_matches('/').to_uppercase().to_lowercase()
 }
 
 impl UpdateSources {
@@ -2937,9 +2953,10 @@ impl UpdateSources {
         self
     }
 
-    /// ★T2f: 이 파일이 두 컴파일 목록 중 하나에 있는가(`listed_in_compiled_lists` — 팩 쓰기 동사의 단일 술어).
+    /// ★T2f: 이 파일이 두 컴파일 목록 중 하나에 있는가(`listed_in_compiled_lists` — 팩 쓰기 동사의 단일 술어). 술어에는
+    /// 목록 대조 키(`list_key` — 구분자·`./`·전체 대소문자 접기)로 접은 철자를 넘긴다(BO2: 같은 파일을 여는 어느 철자든).
     pub fn is_listed(&self, rel: &str) -> bool {
-        (self.listed)(rel)
+        (self.listed)(&list_key(rel))
     }
 
     /// 과거 vendor 해시 표 이음새(시험 — 과거 릴리스 본문은 런타임에 없다).
@@ -3244,10 +3261,16 @@ pub fn decide_file_action_with(
             FileAction::UserKept { reason: base_reason }
         }
         UpdateClass::VendorFirst { .. } => {
-            if manifest_hash.is_some() && verified_base.is_some() {
-                return FileAction::Merge3;
-            }
-            FileAction::VendorFirst { reason: base_reason }
+            // ★RULINGS BO1(종전: 검증 base 가 있으면 먼저 `Merge3` — T2 가 유지했던 0.14.x 거동): 설치기는 기동 필수 파일에
+            // 병합 결과를 **쓰지 않는다** — 고친 기동 필수 파일을 vendor 가 전진시키면 언제나 vendor 우선(출시본이 살아
+            // 있고 고친 사본은 시각별 보관 · vendor-first 기록). 다시 입히기는 `cys repair reapply` — 워커가 합치고 예행·
+            // 검사·서명·주인 승인을 거친다(D:911, D:913). 일반 파일은 위 UserWins 의 설치 시 병합을 그대로 쓴다.
+            let reason = if manifest_hash.is_some() && verified_base.is_some() {
+                "vendor-advanced"
+            } else {
+                base_reason
+            };
+            FileAction::VendorFirst { reason }
         }
     }
 }
@@ -4634,6 +4657,7 @@ pub fn restore_update_snapshot(
     snap: &Path,
     pack_dir: &Path,
     only: Option<&[String]>,
+    sources: &UpdateSources,
 ) -> Result<Vec<String>, String> {
     let meta = read_update_snapshot_meta(snap)?;
     let scope = pack_scope_of(pack_dir);
@@ -4674,7 +4698,18 @@ pub fn restore_update_snapshot(
             }
             continue;
         }
-        verified.push((f, verify_snapshot_entry(snap, f)?));
+        let bytes = verify_snapshot_entry(snap, f)?;
+        // ★T2f(RULINGS BO5 · BD4): 기동 필수·보호 목록 파일은 쓰려는 바이트가 출시본일 때만(색인의 `released` 표시를
+        // 믿지 않고 다시 잰다 · 링크는 출시본이 아니다). 파일 단위 요청이면 거부, 전체 복원이면 그 항목만 건너뛴다.
+        if sources.is_listed(&f.rel)
+            && !(f.link_target.is_none() && released_bytes(pack_dir, &f.rel, &bytes, sources))
+        {
+            if only.is_some() {
+                return Err(listed_file_refusal(&f.rel, "update snapshot restore"));
+            }
+            continue;
+        }
+        verified.push((f, bytes));
     }
     // ② 쓰기.
     let mut restored = Vec::new();
@@ -5804,6 +5839,8 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                     kept += 1;
                     continue;
                 }
+                // ★RULINGS BO1: 판정 함수는 기동 필수 파일에 `Merge3` 를 내지 않는다 — 아래 갈래는 그 판정으로는 닿지 않는
+                // 방어용 폴백이다(누가 기동 필수 사실과 함께 `Merge3` 를 넘겨도 사본 없이 덮지 않고 vendor 우선으로 끝난다).
                 // ⑤ 나(기동 필수): vendor 본 우선 폴백 — 현행 healed 폴백 경로 동형 낙하(.user 보존 + vendor
                 //   기록 + 조상 사이드카 <rel>.base)이되 원장 kind 는 vendor-first(다시 입히기 = 워커 + 승인)이고
                 //   `.user` 를 쓰기 전에 이전 세대를 보존한다(사).
@@ -9003,7 +9040,9 @@ mod tests {
         let ec = pend_c.get(wc).unwrap();
         assert_eq!(ec["kind"].as_str(), Some("user-kept"), "[W-cap] 원장 user-kept");
         assert_eq!(ec["reason"].as_str(), Some("capture-failed"), "[W-cap] reason 토큰");
-        // 나(기동 필수): 종전 폴백 — vendor 본 + .user + .base + 원장 vendor-first{capture-failed}.
+        // ★RULINGS BO1 재작성(종전: "나(기동 필수): 종전 폴백 — vendor 본 + .user + .base + 원장
+        //   vendor-first{capture-failed}" — 설치기가 먼저 3-way 를 시도하다 캡처에 실패했다): 기동 필수 파일은 설치 때
+        //   병합하지 않으므로 캡처할 일도 없다 — vendor 본 + .user(사용자본) + 원장 vendor-first{vendor-advanced} · .base 없음.
         let wb = "skills/wcb/SKILL.md";
         {
             let p = pd2.join(wb);
@@ -9018,14 +9057,12 @@ mod tests {
         install_boot_critical(&pd2, &[(wb, e1)], "1.1.0");
         assert_eq!(std::fs::read_to_string(pd2.join(wb)).unwrap(), e1, "[W-cap] 나: vendor 본 기록");
         assert_eq!(std::fs::read_to_string(pd2.join(format!("{wb}.user"))).unwrap(), ours,
-                   "[W-cap] 나: .user=사용자본(캡처 실패 시에도 §2 원칙 4 보존)");
-        assert_eq!(std::fs::read_to_string(pd2.join(format!("{wb}.base"))).unwrap(), e_old,
-                   "[W-cap] 나: .base=조상 전문(사후 3-way 재료)");
+                   "[W-cap] 나: .user=사용자본(§2 원칙 4 보존)");
+        assert!(!pd2.join(format!("{wb}.base")).exists(), "[W-cap] BO1: 병합을 시도하지 않으므로 .base 없음");
         let eb = load_merge_pending(&pd2).get(wb).cloned().unwrap();
         assert_eq!(eb["kind"].as_str(), Some("vendor-first"), "[W-cap] 나: 원장 vendor-first");
-        assert_eq!(eb["reason"].as_str(), Some("capture-failed"), "[W-cap] 나: reason 토큰");
-        assert_eq!(eb["base_side"].as_str(), Some(format!("{wb}.base").as_str()),
-                   "[W-cap] 나: base_side 포인터");
+        assert_eq!(eb["reason"].as_str(), Some("vendor-advanced"), "[W-cap] BO1: reason = vendor 전진");
+        assert!(eb.get("parked_at").is_some(), "[W-cap] 나: 보관 시각");
 
         let _ = std::fs::remove_dir_all(&base_td);
         let _ = std::fs::remove_dir_all(&base2);
@@ -9122,12 +9159,15 @@ mod tests {
         let e = load_merge_pending(&pd).get(rel).cloned().unwrap();
         assert_eq!(e["kind"].as_str(), Some("quarantined"), "나: 원장 quarantined 전이(D11 동형)");
         assert_eq!(e["reason"].as_str(), Some("user-backup-failed"), "나: 이중 실패 사유 토큰");
-        // 회복 후 재스윕 = 동일 Merge3 판정 재도달 → 정상 병합 수렴(침묵 실패 0 · 손실 0).
+        // ★RULINGS BO1 재작성(종전: "회복 후 재스윕 = 동일 Merge3 판정 재도달 → 정상 병합 수렴" — 병합본
+        //   "head-new / common body / user-tail-delta" 이 살아 있는 파일이 됐다): 기동 필수 파일은 설치 때 병합하지 않는다 —
+        //   회복 후 재스윕은 vendor 우선(vendor 본 + .user = 사용자본 + 원장 vendor-first) · 침묵 실패 0 · 손실 0.
         std::fs::remove_file(base.join("pack-captures")).unwrap();
         std::fs::remove_dir_all(pd.join(format!("{rel}.user"))).unwrap();
         install_boot_critical(&pd, &[(rel, e1)], "1.1.0");
-        assert_eq!(std::fs::read_to_string(pd.join(rel)).unwrap(),
-                   "head-new\ncommon body\nuser-tail-delta\n", "나: 회복 후 정상 3-way 수렴");
+        assert_eq!(std::fs::read_to_string(pd.join(rel)).unwrap(), e1, "나: 회복 후 vendor 본(병합본 아님 — BO1)");
+        assert_eq!(std::fs::read_to_string(pd.join(format!("{rel}.user"))).unwrap(), ours, "나: 사용자본 보관");
+        assert_eq!(load_merge_pending(&pd).get(rel).and_then(|e| e["kind"].as_str()), Some("vendor-first"));
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -9209,7 +9249,9 @@ mod tests {
         let e = pend.get(rel).unwrap();
         assert_eq!(e["kind"].as_str(), Some("user-kept"), "[json-gate] 원장 user-kept");
         assert_eq!(e["reason"].as_str(), Some("json-gate"), "[json-gate] reason 토큰");
-        // 나(기동 필수): 종전 폴백 기계 그대로 — vendor 본 + .user + .base + 캡처 + 원장 vendor-first{json-gate}.
+        // ★RULINGS BO1 재작성(종전: "나(기동 필수): 종전 폴백 기계 그대로 — vendor 본 + .user + .base + 캡처 + 원장
+        //   vendor-first{json-gate}" — 설치기가 병합을 시도한 뒤 JSON 관문에서 떨어졌다): 기동 필수 파일은 설치 때 병합하지
+        //   않는다 — vendor 본 + .user(사용자본) + 원장 vendor-first{vendor-advanced} · 캡처·.base 없음.
         let _ = std::fs::remove_dir_all(&pd);
         std::fs::create_dir_all(&pd).unwrap();
         seed_merge3_shape(&pd, rel, ours, base);
@@ -9218,14 +9260,12 @@ mod tests {
             "[json-gate] 나: disk=vendor 보증");
         assert_eq!(std::fs::read_to_string(pd.join(format!("{rel}.user"))).unwrap(), ours,
             "[json-gate] 나: .user=사용자본 보존");
-        assert_eq!(std::fs::read_to_string(pd.join(format!("{rel}.base"))).unwrap(), base,
-            "[json-gate] 나: .base=조상 보존(사후 3-way 재료)");
-        assert_eq!(find_capture(&base_td.join("caps"), rel).as_deref(), Some(ours),
-            "[json-gate] 나: 캡처 보존(병합 시도 전 원본)");
+        assert!(!pd.join(format!("{rel}.base")).exists(), "[json-gate] BO1: .base 없음");
+        assert_eq!(find_capture(&base_td.join("caps"), rel), None, "[json-gate] BO1: 병합 시도 없음 = 캡처 없음");
         let pend = load_merge_pending(&pd);
         let e = pend.get(rel).unwrap();
         assert_eq!(e["kind"].as_str(), Some("vendor-first"), "[json-gate] 나: 원장 vendor-first");
-        assert_eq!(e["reason"].as_str(), Some("json-gate"), "[json-gate] 나: reason 토큰");
+        assert_eq!(e["reason"].as_str(), Some("vendor-advanced"), "[json-gate] BO1: reason = vendor 전진");
         let _ = std::fs::remove_dir_all(&base_td);
     }
 
@@ -9262,7 +9302,9 @@ mod tests {
             "[suspect] reason=순삭제 휴리스틱 토큰(실측: {reason})");
         assert!(e["caution"].as_str().unwrap_or("").starts_with("suspect:PureDeletionMajority"),
             "[suspect] 가: 주의 표시(caution)");
-        // 나(기동 필수): 종전 폴백 기계 — vendor 본 + .user + .base + 원장 vendor-first{suspect}.
+        // ★RULINGS BO1 재작성(종전: "나(기동 필수): 종전 폴백 기계 — vendor 본 + .user + .base + 원장
+        //   vendor-first{suspect}" — 병합을 시도한 뒤 손상 의심으로 떨어졌다): 기동 필수 파일은 설치 때 병합하지 않는다 —
+        //   vendor 본 + .user(사용자본) + 원장 vendor-first{vendor-advanced} · .base 없음(세탁된 병합이 살아날 길 자체가 없다).
         let _ = std::fs::remove_dir_all(&pd);
         std::fs::create_dir_all(&pd).unwrap();
         seed_merge3_shape(&pd, rel, ours, base);
@@ -9271,11 +9313,10 @@ mod tests {
             "[suspect] 나: disk=vendor 보증(세탁 clean 병합 차단)");
         assert_eq!(std::fs::read_to_string(pd.join(format!("{rel}.user"))).unwrap(), ours,
             "[suspect] 나: .user=사용자본 보존");
-        assert_eq!(std::fs::read_to_string(pd.join(format!("{rel}.base"))).unwrap(), base,
-            "[suspect] 나: .base=조상 보존");
+        assert!(!pd.join(format!("{rel}.base")).exists(), "[suspect] BO1: .base 없음");
         let e = load_merge_pending(&pd).get(rel).cloned().unwrap();
         assert_eq!(e["kind"].as_str(), Some("vendor-first"), "[suspect] 나: 원장 vendor-first");
-        assert!(e["reason"].as_str().unwrap_or("").starts_with("suspect:PureDeletionMajority"));
+        assert_eq!(e["reason"].as_str(), Some("vendor-advanced"), "[suspect] BO1: reason = vendor 전진");
         let _ = std::fs::remove_dir_all(&base_td);
     }
 
@@ -9360,22 +9401,19 @@ mod tests {
         let cap = e["capture"].as_str().expect("[pristine-fail] 가: 캡처 포인터(ours 원본 증거)").to_string();
         assert_eq!(std::fs::read_to_string(base_td.join("caps").join(cap)).unwrap(), ours,
             "[pristine-fail] 가: 캡처=ours 원본");
-        // 나(기동 필수): 종전 폴백 기계 — disk=vendor · .user=병합본 · 캡처=ours · pristine 미전진 · vendor-first.
+        // ★RULINGS BO1 재작성(종전: "나(기동 필수): 종전 폴백 기계 — disk=vendor · .user=병합본 · 캡처=ours · pristine
+        //   미전진 · vendor-first{pristine-write-failed}" — 병합본을 만든 뒤 pristine 실패로 떨어졌다): 기동 필수 파일은 설치 때
+        //   병합하지 않는다 — 병합본은 어디에도 없다. disk=vendor · .user=사용자본(ours) · 캡처 없음 · 원장 vendor-first{vendor-advanced}.
         run_arm(true);
         assert_eq!(std::fs::read_to_string(pd.join(rel)).unwrap(), theirs,
-            "[pristine-fail] 나: disk=vendor 보증(⑤ 강등 후 공용 레인)");
-        assert_eq!(std::fs::read_to_string(pd.join(format!("{rel}.user"))).unwrap(), merged,
-            "[pristine-fail] 나: .user=병합본(크래시표 2행 정합 — ours 원본은 캡처 보존)");
-        assert_eq!(find_capture(&base_td.join("caps"), rel).as_deref(), Some(ours),
-            "[pristine-fail] 나: 캡처=ours 원본");
-        assert_eq!(std::fs::read_to_string(pd.join(PRISTINE_DIR).join(rel)).unwrap(), base,
-            "[pristine-fail] 나: pristine 미전진(실패 격리)");
+            "[pristine-fail] 나: disk=vendor 보증");
+        assert_eq!(std::fs::read_to_string(pd.join(format!("{rel}.user"))).unwrap(), ours,
+            "[pristine-fail] BO1: .user=사용자본(병합본이 아니다)");
+        assert_eq!(find_capture(&base_td.join("caps"), rel), None, "[pristine-fail] BO1: 병합 시도 없음 = 캡처 없음");
         let pend = load_merge_pending(&pd);
         let e = pend.get(rel).unwrap();
         assert_eq!(e["kind"].as_str(), Some("vendor-first"), "[pristine-fail] 나: 원장 vendor-first");
-        assert_eq!(e["reason"].as_str(), Some("pristine-write-failed"), "[pristine-fail] reason 토큰");
-        assert_eq!(e["base_side"].as_str(), Some(format!("{rel}.base").as_str()),
-            "[pristine-fail] base_side 포인터");
+        assert_eq!(e["reason"].as_str(), Some("vendor-advanced"), "[pristine-fail] BO1: reason = vendor 전진");
         let _ = std::fs::remove_dir_all(&base_td);
     }
 
@@ -10118,9 +10156,11 @@ mod tests {
                        Some(e1h.as_str()), false, PackScope::Base, None, &bc),
                    VendorFirst { reason: "base-unverified" },
                    "★나: 기동 필수 L4 → vendor 우선");
+        // ★RULINGS BO1 재작성(종전: `Merge3` — "★나: 기동 필수도 검증 base 가 있으면 먼저 3-way(폴백이 vendor 우선)"):
+        //   설치기는 기동 필수 파일에 병합 결과를 쓰지 않는다 — 검증 base 가 있어도 vendor 우선.
         assert_eq!(super::decide_file_action_with("alerts-config.json", embed, true, Some("DRIFT"),
                        Some(e1h.as_str()), false, PackScope::Base, Some("E1"), &bc),
-                   Merge3, "★나: 기동 필수도 검증 base 가 있으면 먼저 3-way(폴백이 vendor 우선)");
+                   VendorFirst { reason: "vendor-advanced" }, "★BO1: 기동 필수 + 검증 base → 병합 없이 vendor 우선");
 
         // force 폴백: 판독 불가 heal 개정 + !exists 불변.
         assert_eq!(super::decide_file_action("alerts-config.json", embed, true, None,
@@ -14289,7 +14329,9 @@ mod m11_tests {
         assert!(e["caution"].as_str().unwrap_or("").starts_with("suspect:"), "caution 표시: {e}");
     }
 
-    /// 나(기동 필수 병합 충돌)의 폴백 기계 — vendor 본 + `.user`(이전 세대 보존) + `.base` 조상 + 원장 vendor-first.
+    /// 나(기동 필수 + vendor 전진) — vendor 본 + `.user`(이전 세대 보존) + 원장 vendor-first.
+    /// ★RULINGS BO1 재작성(종전: 병합을 먼저 시도해 충돌 → 폴백 기계 — `.base` 조상 사이드카 + reason `merge-conflict`):
+    /// 설치기는 기동 필수 파일을 병합하지 않으므로 `.base` 도 없고 reason 은 `vendor-advanced` 다.
     #[test]
     fn m11_boot_critical_merge_conflict_vendor_first_keeps_fallback_mechanics() {
         let rig = Rig::new("bcmerge");
@@ -14302,10 +14344,10 @@ mod m11_tests {
         rig.install(&[("hooks/h.sh", vendor)], false, &UpdateSources::none().with_boot_critical(bc_only(&["hooks/h.sh"])));
         assert_eq!(rig.read("hooks/h.sh").as_deref(), Some(vendor), "vendor 본 먼저");
         assert_eq!(rig.read("hooks/h.sh.user").as_deref(), Some(mine));
-        assert_eq!(rig.read("hooks/h.sh.base").as_deref(), Some(base));
+        assert!(!rig.pack.join("hooks/h.sh.base").exists(), "BO1: 병합 시도 없음 = .base 없음");
         let e = rig.entry("hooks/h.sh").unwrap();
         assert_eq!(e["kind"], "vendor-first");
-        assert_eq!(e["reason"], "merge-conflict");
+        assert_eq!(e["reason"], "vendor-advanced");
         assert!(e.get("parked_at").is_some());
     }
 
@@ -14376,11 +14418,11 @@ mod m11_tests {
         // 보관본 하나가 깨지면 아무것도 쓰지 않는다.
         std::fs::write(snap.join(UPDATE_SNAPSHOT_FILES).join("agents.json"), b"TAMPERED").unwrap();
         rig.write("agents.json", b"{\"a\":\"after\"}\n");
-        assert!(restore_update_snapshot(&snap, &rig.pack, Some(&["bin/a.sh".to_string(), "agents.json".to_string()])).is_err());
+        assert!(restore_update_snapshot(&snap, &rig.pack, Some(&["bin/a.sh".to_string(), "agents.json".to_string()]), &UpdateSources::none()).is_err());
         assert_eq!(rig.read("bin/a.sh").as_deref(), Some("#!/bin/bash\necho A2\n"), "검증 실패 → bin/a.sh 도 쓰지 않았다");
         std::fs::write(snap.join(UPDATE_SNAPSHOT_FILES).join("agents.json"), b"{\"a\":1}\n").unwrap();
         // 파일 단위 복원: 그 파일만.
-        let done = restore_update_snapshot(&snap, &rig.pack, Some(&["bin/a.sh".to_string()])).unwrap();
+        let done = restore_update_snapshot(&snap, &rig.pack, Some(&["bin/a.sh".to_string()]), &UpdateSources::none()).unwrap();
         assert_eq!(done, vec!["bin/a.sh".to_string()]);
         assert_eq!(rig.read("bin/a.sh").as_deref(), Some(a1));
         assert_eq!(rig.read("agents.json").as_deref(), Some("{\"a\":\"after\"}\n"), "다른 파일은 그대로");
@@ -14388,10 +14430,10 @@ mod m11_tests {
         assert_eq!(current_mode(&rig.pack.join("bin/a.sh")), Some(0o750), "기록된 권한");
         // AC1: 출시본이 아닌 system 항목(링크)은 파일 단위로 되돌리지 않는다.
         #[cfg(unix)]
-        assert!(restore_update_snapshot(&snap, &rig.pack, Some(&["bin/link".to_string()])).is_err(), "출시본 아님 → 거부");
+        assert!(restore_update_snapshot(&snap, &rig.pack, Some(&["bin/link".to_string()]), &UpdateSources::none()).is_err(), "출시본 아님 → 거부");
         // 전체 복원: 출시본 system 파일 + 버전 표시. 사용자 소유·상태·출시본 아닌 항목은 그대로.
         rig.write("bin/a.sh", b"#!/bin/bash\necho A2\n");
-        let done = restore_update_snapshot(&snap, &rig.pack, None).unwrap();
+        let done = restore_update_snapshot(&snap, &rig.pack, None, &UpdateSources::none()).unwrap();
         assert_eq!(done, vec!["bin/a.sh".to_string()], "전체 복원 = 출시본 system 항목만");
         assert_eq!(rig.read("bin/a.sh").as_deref(), Some(a1));
         assert_eq!(std::fs::read_to_string(rig.pack.join(PACK_VERSION_FILE)).unwrap(), "1.0.0", "버전 표시 = 파일과 일치");
@@ -14415,6 +14457,44 @@ mod m11_tests {
         assert_eq!(read_update_snapshot_meta(&newest).unwrap().pack_version, "4.0.0", "최신 = 마지막에 만든 스냅샷");
     }
 
+    /// ★RULINGS BO1: 고친 기동 필수 파일을 vendor 가 전진시키면 — 검증 base 가 있고 병합이 깨끗하게 될 경우라도 — 설치기는
+    /// 병합하지 않는다: vendor 본이 살아 있고, 고친 사본은 시각과 함께 보관되고, vendor-first 기록이 남고, 병합본은 어디에도
+    /// 살아 있지 않다. 같은 경우의 일반 파일은 종전대로 설치 때 병합된다. plan 버킷도 같은 답을 한다.
+    #[test]
+    fn m11_bo1_boot_critical_edit_is_never_merged_at_install() {
+        let rig = Rig::new("bo1");
+        let base = "#!/bin/bash\nline-1\nline-2\nline-3\n";
+        let mine = "#!/bin/bash\nline-1 MINE\nline-2\nline-3\n";
+        let vendor = "#!/bin/bash\nline-1\nline-2\nline-3 VENDOR\n";
+        let merged = "#!/bin/bash\nline-1 MINE\nline-2\nline-3 VENDOR\n";
+        for rel in ["hooks/boot.sh", "bin/general.sh"] {
+            rig.write(rel, mine.as_bytes());
+            rig.pristine(rel, base);
+        }
+        rig.manifest(&[("hooks/boot.sh", base), ("bin/general.sh", base)]);
+        let src = || UpdateSources::none().with_boot_critical(|r| r == "hooks/boot.sh");
+        let items = [("hooks/boot.sh", vendor), ("bin/general.sh", vendor)];
+        let plan = rig.plan(&items, false, &src());
+        assert_eq!(plan.vendor_first, vec!["hooks/boot.sh".to_string()], "plan: 기동 필수 = vendor 우선");
+        assert_eq!(plan.merge3, vec!["bin/general.sh".to_string()], "plan: 일반 파일 = 설치 때 병합");
+        rig.install(&items, false, &src());
+        // 기동 필수: vendor 본 · 사용자본 보관 · vendor-first · 병합본 없음.
+        assert_eq!(rig.read("hooks/boot.sh").as_deref(), Some(vendor), "기동 필수 = vendor 본(병합본 아님)");
+        assert_eq!(rig.read("hooks/boot.sh.user").as_deref(), Some(mine), "고친 사본 보관");
+        let e = rig.entry("hooks/boot.sh").unwrap();
+        assert_eq!(e["kind"], "vendor-first");
+        assert_eq!(e["reason"], "vendor-advanced");
+        assert!(e.get("parked_at").is_some(), "보관 시각");
+        assert!(!rig.pack.join("hooks/boot.sh.base").exists());
+        for f in std::fs::read_dir(rig.pack.join("hooks")).unwrap().flatten() {
+            assert_ne!(std::fs::read_to_string(f.path()).ok().as_deref(), Some(merged),
+                       "병합본이 살아 있는 자리에 없다: {}", f.path().display());
+        }
+        // 일반 파일: 종전대로 병합.
+        assert_eq!(rig.read("bin/general.sh").as_deref(), Some(merged), "일반 파일 = 설치 때 병합");
+        assert_eq!(rig.kind("bin/general.sh").as_deref(), Some("merged"));
+    }
+
     /// ★T2f(RULINGS BD4): 팩 쓰기 동사의 단일 술어 — 오늘은 기동 필수 목록(`boot_critical::entries()`)과 같고, 제품 입력원
     /// (`none()` · `for_live_pack()`)은 이 함수를 그대로 쓴다(이음새로 바뀐 술어가 제품 경로에 남으면 빨갛다). T5a 의 마지막
     /// 재기반 작업이 보호 목록의 행을 이 함수에 더하면 첫 단언을 그 합집합으로 바꾼다.
@@ -14433,8 +14513,16 @@ mod m11_tests {
             assert_eq!(live.is_listed(rel), listed_in_compiled_lists(rel), "for_live_pack(): {rel}");
         }
         // 이음새는 기동 필수 판정과 따로다(보호 목록에만 있는 파일 = 등재 ∧ 업데이트에서는 기동 필수 아님 — BC2).
-        let seam = UpdateSources::none().with_listed(|r| r == "bin/x.sh");
-        assert!(seam.is_listed("bin/x.sh") && !seam.is_boot_critical("bin/x.sh"));
+        let seam = UpdateSources::none().with_listed(|r| r == "hooks/guard.sh");
+        assert!(seam.is_listed("hooks/guard.sh") && !seam.is_boot_critical("hooks/guard.sh"));
+        // ★RULINGS BO2 · BO4: 술어에는 목록 대조 키로 접은 철자가 간다 — 같은 파일을 여는 철자(대소문자 · 앞의 `./` ·
+        //   역슬래시 · KELVIN SIGN)는 모두 등재로 답한다. 등재되지 않은 파일은 그대로 아니다.
+        for alias in ["hooks/guard.sh", "Hooks/Guard.SH", "./hooks/guard.sh", "hooks\\guard.sh", "hoo\u{212A}s/guard.sh"] {
+            assert!(seam.is_listed(alias), "철자 {alias:?} 도 등재");
+        }
+        assert!(!seam.is_listed("hooks/other.sh"));
+        assert_eq!(list_key("./Hooks\\X.SH"), "hooks/x.sh");
+        assert_eq!(list_key("stra\u{DF}e"), "strasse", "전체 접기(ß → ss)");
     }
 
     /// ★T2f: 출시본 바이트 = 내장 vendor 본 · 이 설치의 매니페스트 · 과거 출시 해시 표 중 하나와 같은 UTF-8 바이트.
@@ -14446,8 +14534,10 @@ mod m11_tests {
         assert!(released_bytes(&rig.pack, rel, embed.as_bytes(), &none), "내장 vendor 본");
         assert!(!released_bytes(&rig.pack, rel, b"MY EDIT\n", &none), "사용자 수정본");
         assert!(!released_bytes(&rig.pack, rel, &[0xffu8, 0xfe], &none), "비 UTF-8");
+        // ★RULINGS BO3 재작성(종전: "이 설치의 매니페스트" 의 해시도 출시본으로 셌다): 매니페스트는 일반 쓰기가 바꿀 수
+        //   있는 파일이라 근거가 아니다 — 내장본·과거 출시 표에 없는 바이트는 매니페스트에 적혀 있어도 출시본이 아니다.
         rig.manifest(&[(rel, "LAST APPLIED VENDOR\n")]);
-        assert!(released_bytes(&rig.pack, rel, b"LAST APPLIED VENDOR\n", &none), "이 설치의 매니페스트");
+        assert!(!released_bytes(&rig.pack, rel, b"LAST APPLIED VENDOR\n", &none), "매니페스트만으로는 출시본이 아니다");
         let h = content_hash("OLD RELEASE\n");
         let table = UpdateSources::none().with_prev_vendor(move |_| vec![h.clone()]);
         assert!(released_bytes(&rig.pack, rel, b"OLD RELEASE\n", &table), "과거 출시 해시 표");
@@ -14475,7 +14565,7 @@ mod m11_tests {
         // 업데이트가 링크를 파일로 바꿨다고 치고 되돌린다.
         std::fs::remove_file(rig.pack.join(rel)).unwrap();
         rig.write(rel, b"{\"vendor\":2}\n");
-        let done = restore_update_snapshot(&o.path, &rig.pack, Some(&[rel.to_string()])).unwrap();
+        let done = restore_update_snapshot(&o.path, &rig.pack, Some(&[rel.to_string()]), &UpdateSources::none()).unwrap();
         assert_eq!(done, vec![rel.to_string()]);
         let m = std::fs::symlink_metadata(rig.pack.join(rel)).unwrap();
         assert!(m.file_type().is_symlink(), "링크로 되살아나야 한다(파일 사본 아님)");
