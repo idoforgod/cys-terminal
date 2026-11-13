@@ -26593,6 +26593,21 @@ fn pack_rel_normal_form(rel: &str) -> Result<(), String> {
     }
 }
 
+/// ★T2f(RULINGS BO2 · BV3 · BV4): 팩 쓰기 동사의 rel 관문 — ① 정규형(`pack_rel_normal_form`) ② T3c 의 상위 경로 규칙
+/// (`repair::types::parent_chain_link` — RULINGS AW3 (b): 팩 루트와 대상 사이의 이미 있는 구성 요소에 링크·연결 지점·
+/// 재분석 지점이 있으면 거부; 구현은 그 하나뿐이고 여기에 사본을 두지 않는다). 술어(목록 대조)와 어떤 쓰기보다 **먼저**
+/// 부른다. Err = 거부 문장(상위 경로 규칙이면 그 규칙의 문장 그대로).
+fn pack_rel_gate(dir: &std::path::Path, rel: &str) -> Result<(), String> {
+    pack_rel_normal_form(rel)?;
+    cys::repair::types::parent_chain_link(dir, rel).map_err(|e| {
+        let why = match e {
+            cys::repair::types::RepairError::Precondition(m) => m,
+            other => format!("{other:?}"),
+        };
+        format!("⛔ 거부: {why} — 아무것도 쓰지 않았습니다")
+    })
+}
+
 /// ★T2f(RULINGS BO4): `pack-merge --ai` 의 순수 관문 — 기동 필수·보호 목록 파일이면 AI 를 부르기 **전에** 거부한다
 /// (AI 병합 결과는 출시본이 아니고, 무변경인지는 AI 를 돌려야만 알 수 있다). Some = 거부 문장.
 fn ai_merge_refusal(rel: &str, listed: bool) -> Option<String> {
@@ -26658,7 +26673,7 @@ fn run_pack_merge_with(
             eprintln!("--revert-merge 는 단독 사용(merged 원장 전용 가역화) — 다른 해소 플래그와 조합 불가");
             return 1;
         }
-        if let Err(e) = pack_rel_normal_form(&rrel) {
+        if let Err(e) = pack_rel_gate(&dir, &rrel) {
             eprintln!("{e}");
             return 1;
         }
@@ -26730,8 +26745,8 @@ fn run_pack_merge_with(
         }
         return 0;
     };
-    // ★T2f(RULINGS BO2): 정규형이 아닌 철자는 원장을 보기 전에 거부.
-    if let Err(e) = pack_rel_normal_form(&rel) {
+    // ★T2f(RULINGS BO2 · BV3): 정규형이 아닌 철자·링크를 거친 경로는 원장을 보기 전에 거부.
+    if let Err(e) = pack_rel_gate(&dir, &rel) {
         eprintln!("{e}");
         return 1;
     }
@@ -27577,7 +27592,7 @@ fn run_pack_adopt_with(
     let dir = cys::pack::pack_dir();
     // ★T2f(RULINGS BO2): 명령줄의 rel 은 정규형이어야 한다(목록 대조 전에).
     if let Some(r) = rel.as_deref() {
-        if let Err(e) = pack_rel_normal_form(r) {
+        if let Err(e) = pack_rel_gate(&dir, r) {
             eprintln!("{e}");
             return 1;
         }
@@ -27802,8 +27817,9 @@ fn adopt_one(
     yes: bool,
     sources: &cys::pack::UpdateSources,
 ) -> Result<(), String> {
-    // ★T2f(RULINGS BO2): 정규형이 아닌 철자는 무엇보다 먼저 거부(같은 파일을 여는 다른 철자가 목록 대조를 돌아가지 않게).
-    pack_rel_normal_form(rel)?;
+    // ★T2f(RULINGS BO2 · BV3): 정규형이 아닌 철자·링크를 거친 경로는 무엇보다 먼저 거부(같은 파일을 여는 다른 철자나
+    // 링크가 목록 대조를 돌아가지 않게).
+    pack_rel_gate(dir, rel)?;
     // ① 소스 결정 — read_to_string 실패(비UTF-8·부재) = 거부(수동 복구 안내).
     let (src_label, src_path) = match from {
         Some(p) => (p.to_string(), std::path::PathBuf::from(p)),
@@ -28282,8 +28298,8 @@ fn run_pack_rollback_with(
         }
         return 0;
     };
-    // ★T2f(RULINGS BO2): 정규형(수리 동사의 규칙)이 아닌 철자는 거부 — 종전의 `..`·절대 경로 거부를 포함한다.
-    if let Err(e) = pack_rel_normal_form(&rel) {
+    // ★T2f(RULINGS BO2 · BV3): 정규형(수리 동사의 규칙)이 아닌 철자·링크를 거친 경로는 거부 — 종전의 `..`·절대 경로 거부를 포함한다.
+    if let Err(e) = pack_rel_gate(&dir, &rel) {
         eprintln!("{e}");
         return 1;
     }
@@ -41724,6 +41740,54 @@ mod tests {
                 }
             }
         }
+        let _ = std::fs::remove_dir_all(td.parent().unwrap());
+    }
+
+    /// ★T2f(RULINGS BV3): 팩 안의 링크된 폴더(`h2 -> hooks`)를 거친 rel 은 되살리기·되돌리기 모두 거부 — 등재 파일이 있을 때와
+    /// 없을 때 모두, 아무것도 쓰지 않는다(T3c 의 상위 경로 규칙을 부른다). 링크 없는 평범한 경로는 영향이 없다.
+    #[cfg(unix)]
+    #[test]
+    fn t2f_a_linked_parent_is_refused_by_adopt_and_rollback() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (td, _rel, _embed, _env) = t4_system_fixture("t2fbv3");
+        let local = td.parent().unwrap().join("local");
+        let _l = cys::pack::EnvGuard::set("CYS_LOCAL_DIR", &local);
+        let listed = cys::pack::UpdateSources::none().with_listed(|r| r == "hooks/guard.sh");
+        std::fs::create_dir_all(td.join("hooks")).unwrap();
+        std::os::unix::fs::symlink(td.join("hooks"), td.join("h2")).unwrap();
+        let scratch = td.parent().unwrap().join("scratch-bv3.sh");
+        std::fs::write(&scratch, "#!/bin/sh\necho NOT RELEASED\n").unwrap();
+        // 되돌리기 원천(pack.prev)에 그 철자의 바이트 + 맞는 보존본 매니페스트 — 관문이 없으면 링크를 거쳐 쓰였을 형상.
+        let prev = cys::pack::pack_prev_dir(&td);
+        std::fs::create_dir_all(prev.join("h2")).unwrap();
+        std::fs::write(prev.join(".pack-version"), "0.14.56\n").unwrap();
+        std::fs::write(prev.join("h2/guard.sh"), "#!/bin/sh\necho PREV\n").unwrap();
+        let mut pm = std::collections::BTreeMap::new();
+        pm.insert("h2/guard.sh".to_string(), cys::pack::content_hash_pub("#!/bin/sh\necho PREV\n"));
+        std::fs::write(prev.join(cys::pack::INSTALL_MANIFEST), serde_json::to_string(&pm).unwrap()).unwrap();
+        assert!(pack_rel_gate(&td, "h2/guard.sh").unwrap_err().contains("링크"), "상위 경로 규칙의 문장");
+        for present in [true, false] {
+            if present {
+                std::fs::write(td.join("hooks/guard.sh"), "#!/bin/sh\necho LIVE\n").unwrap();
+            } else {
+                let _ = std::fs::remove_file(td.join("hooks/guard.sh"));
+            }
+            let rc = run_pack_adopt_with(Some("h2/guard.sh".into()), false, Some(scratch.display().to_string()), false, true, &listed);
+            assert_eq!(rc, 1, "adopt h2/guard.sh (present={present})");
+            assert_eq!(run_pack_rollback_with(Some("h2/guard.sh".into()), true, true, false, &listed), 1,
+                       "rollback h2/guard.sh (present={present})");
+            if present {
+                assert_eq!(std::fs::read_to_string(td.join("hooks/guard.sh")).unwrap(), "#!/bin/sh\necho LIVE\n");
+            } else {
+                assert!(!td.join("hooks/guard.sh").exists(), "링크를 거쳐 등재 파일을 만들었다");
+            }
+        }
+        // 평범한 경로: 관문 통과 · 자작 파일 되살리기는 종전대로 된다.
+        assert!(pack_rel_gate(&td, "hooks/guard.sh").is_ok());
+        assert!(pack_rel_gate(&td, "notes/new/x.md").is_ok(), "없는 상위 경로는 링크가 아니다");
+        assert!(!cys::pack::PACK_ALL.iter().any(|(r, _)| *r == "hooks/other.sh"));
+        assert_eq!(run_pack_adopt_with(Some("hooks/other.sh".into()), false, Some(scratch.display().to_string()), false, true, &listed), 0);
+        assert_eq!(std::fs::read_to_string(td.join("hooks/other.sh")).unwrap(), "#!/bin/sh\necho NOT RELEASED\n");
         let _ = std::fs::remove_dir_all(td.parent().unwrap());
     }
 
