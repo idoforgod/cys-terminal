@@ -6207,7 +6207,7 @@ class Preflight:
             fp = hashlib.sha1("\n".join(parked).encode("utf-8")).hexdigest()[:16]
             fps["parked-merge"] = fp
             jobs.append(("parked-merge",
-                         "업데이트가 보관한 수정 %d건(%s) — 워커 1명에게 부서당 과제 하나로 맡겨라: "
+                         "업데이트가 보관한 수정 %d건(%s) — 워커 1명에게 부서당 과제 하나로 배정하라: "
                          "user-kept 는 합치기(cys pack-merge), vendor-first 는 승인 절차로 다시 입히기"
                          "(cys repair reapply · 주인 승인). master 직접 병합 금지"
                          % (len(parked), lane),

@@ -221,7 +221,7 @@ async function runFeedbackModal(deps: FeedbackDeps): Promise<void> {
   /** 첨부 작업은 한 줄로 세운다(칸 번호 배정·합계 상한이 어긋나지 않게 — Rust 잠금과 이중). */
   const enqueue = (label: string, job: () => Promise<void>) => {
     if (done || submitting) {
-      setStatus("묶음을 이미 만들었습니다 — 새 첨부는 새 피드백으로 보내 주세요.", "error");
+      setStatus("묶음을 이미 만들었습니다 — 새 첨부는 피드백을 새로 작성해 담아 주세요.", "error");
       return;
     }
     pending++;

@@ -987,11 +987,11 @@ class DeferralFamiliesFG(unittest.TestCase):
     docstrings or dict keys). EX and the `--propose` identifier rule apply. Skill texts are swept by the scratch tool and
     ruled hit by hit by the grader (not asserted here); tests, fixtures and `scripts/` are out.
     KNOWN_OTHER_TRACKS lists the in-scope hits that remain in OTHER owners' texts (B96: corrected by their owners) —
-    every hit not on that list fails."""
+    one entry, T8's — every hit not on that list fails."""
     KNOWN_OTHER_TRACKS = {
+        # ★The ONLY allowed entry: T8's C03 cause line (`_c03_master_axis`, RULINGS AH4 (a)). Track T8 rewords the string
+        #   and removes this entry in the same commit — after that, nothing in the product's own voice may hit.
         ("cysjavis-pack/bin/javis_preflight.py", "핀 기준 선행(벤더 동기 필요·사용자 과실 아님)"): "T8 — RULINGS AH4 (a)",
-        ("cysjavis-pack/bin/javis_preflight.py", "워커 1명에게 부서당 과제 하나로 맡겨라"): "T2 — the parked-merge job line",
-        ("ui/src/feedbackmodal.ts", "새 첨부는 새 피드백으로 보내 주세요"): "the U6 feedback modal (no 0.15.0 track)",
     }
     ROOTS = ("cysjavis-pack", "src", os.path.join("src-tauri", "src"), os.path.join("ui", "src"))
 
