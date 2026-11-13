@@ -315,7 +315,12 @@ class M2DirectiveRewrite(unittest.TestCase):
         the author's name stays only as an authorship credit in the skill body, not in the index line that is
         composed into every master / CEO payload (design D:581)."""
         m = norm(self._t("MASTER_DIRECTIVE.md"))
-        self.assertIn("FAIL이 남아도 master 는 직접 고치지 않는다 — 남은 FAIL 은 `cys repair report` 로 접수하고", m)
+        self.assertIn("FAIL이 남아도 master 는 직접 고치지 않는다 — 남은 FAIL 은 ①(데몬 확인) 뒤에 "
+                      "`cys repair report --file <팩 기준 상대 경로> --error \"<FAIL 줄>\"` 로 접수하고", m)
+        # RULINGS AM4: the report call is the form track T3's clap accepts — `--file` and `--error` are both required
+        # there (`Report { file: String, error: String }`), so a FAIL that names no file is NOT filed with a missing
+        # argument (the parser would refuse it); it goes onto the worker ticket as it is.
+        self.assertIn("(파일을 가리키지 않는 FAIL 은 접수 없이 그 줄 그대로)", m)
         self.assertNotIn("출력의 지시대로 수리 후 재실행", m)
         orc = repo_text(os.path.join("cysjavis-pack", "bin", "javis_orchestra.py"))
         self.assertNotIn("추가 라운드 여부를 여쭈어라", orc)
