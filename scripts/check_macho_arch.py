@@ -576,7 +576,8 @@ class RecordCensus:
         if not (sf[11:12] == b" " and all(48 <= c <= 55 for c in sf[:11])):
             return self._stop("its size field %r is not eleven octal digits and a space (the measured form)" % sf)
         size = int(sf[:11], 8)
-        if kind != b"0" and size != 0:          # EI2 I1: every record that is not a regular file has size 0
+        known = kind in ALLOWED_KINDS or kind in (b"1", b"x", b"g")
+        if known and kind != b"0" and size != 0 and kind not in (b"x", b"g"):  # EI2 I1: non-regular records: size 0
             self.bad.append((self.records, label, "a %r record with size %d — every record that is not a regular file "
                              "has size 0 in the real archives" % (kind.decode("latin-1"), size)))
         if kind == b"1":                        # EB3: a hard link is proven wrong — seen here even where tarfile stops
@@ -722,8 +723,8 @@ def scan_tar(path, target_arch, out):
             dec.problem = dec.problem or "the gzip stream is corrupted (%s)" % e
         census.close()
         dec.close()
-        if dec.problem:
-            census.bad.append((census.records + 2, "(compression)", dec.problem))
+        if dec.problem:                  # the compression layer comes first: it is the cause of what follows
+            census.bad.append((-1, "(compression)", dec.problem))
         for name, target in census.hard:  # EB3: a hard link the raw records hold is proven wrong
             if all(name != n for n, _ in tree.hard):
                 tree.hard.append((name, target))
@@ -732,7 +733,8 @@ def scan_tar(path, target_arch, out):
     if library_error is not None and not census.bad:
         raise library_error             # unreadable — and no raw record names a reason: exit 2 as before
     for index, label, why in census.bad:  # EB1 — decided on the raw records: it comes first
-        tree.shape.append(((0, index), "record %d %s: not measurable — %s (RULINGS EB1, EI2)" % (index, label, why)))
+        where = "the compressed file" if index < 0 else "record %d %s" % (index, label)
+        tree.shape.append(((0, index), "%s: not measurable — %s (RULINGS EB1, EI2)" % (where, why)))
     out.append("  archive read in one pass: %d members, %d of %d compressed bytes"
                % (members, raw.read_bytes, os.path.getsize(path)))
     tree.finish()
