@@ -136,6 +136,26 @@ pub fn remove_for_repair_in(root: &Path, lane: &LaneKey, id: &RepairId) -> Resul
     write_file(root, lane, kept)
 }
 
+/// RULINGS DR7 (T6): removes ONE repair's HOOK tombstones from the lane's file (its re-registration
+/// is done); its FILE tombstones stay — each goes only when that file is restored.
+pub fn remove_hooks_for_repair_in(root: &Path, lane: &LaneKey, id: &RepairId) -> Result<(), RepairError> {
+    let lane_mutex = lane_mutex(root, lane);
+    let _lane_guard = lane_mutex.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(f) = read_file(root, lane)? else {
+        return Ok(());
+    };
+    let before = f.tombstones.len();
+    let kept: Vec<Tombstone> = f
+        .tombstones
+        .into_iter()
+        .filter(|t| !(t.repair == *id && matches!(t.kind, TombstoneKind::Hook { .. })))
+        .collect();
+    if kept.len() == before {
+        return Ok(());
+    }
+    write_file(root, lane, kept)
+}
+
 /// RULINGS AD3 / AK3: removes ONE repair's FILE tombstone of one path from the lane's file (that
 /// repair committed the path present again). Other repairs' tombstones and Hook tombstones are left
 /// alone. Missing file = nothing to remove.

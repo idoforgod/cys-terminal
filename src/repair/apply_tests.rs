@@ -2094,3 +2094,89 @@ fn a_committed_apply_is_completed_forward() {
     assert!(row.probation.is_some() && row.applied.len() == 2);
     assert_eq!(ledger::read_record_in(&r.root, &id).unwrap().unwrap().state, RepairState::Probation);
 }
+
+// ───────────────────────────── RULINGS DR7 — one revert = one recoverable unit ─────────────────────────────
+
+/// A committed general repair of two files in this lane (pre → post), in probation.
+fn two_file_general(r: &Rig, id: &RepairId) {
+    let mut changes = Vec::new();
+    let mut committed = Vec::new();
+    for (rel, pre, post) in [("hooks/v1.sh", b"PRE-1\n", b"POST-1\n"), ("hooks/v2.sh", b"PRE-2\n", b"POST-2\n")] {
+        r.put(rel, pre, 0o755);
+        let pre_img = ledger::copy_preimage_in(&r.root, id, &r.lane, rel, &r.pack.join(rel), 1.0).unwrap();
+        let post_state = r.put(rel, post, 0o755);
+        committed.push((rel.to_string(), post_state.canon()));
+        changes.push(FileChange { rel: rel.into(), kind: ChangeKind::Edit, pre: pre_img, post: post_state, diff: None });
+    }
+    let mut rec = record(r, id, Classification::General, changes, RepairState::Probation);
+    rec.committed = committed.clone();
+    ledger::write_record_in(&r.root, &rec).unwrap();
+    lane_row(r, id, committed, Vec::new());
+}
+
+/// DR7 (major I7): a revert interrupted after its first file — the next run completes the WHOLE
+/// revert from its intent (the restored file counted, the remaining file restored, record and row
+/// closed 되돌려짐), and so does a manual `revert` issued before that run. Without DR7 the later
+/// revert saw the restored file ≠ the row's state and closed the repair superseded, leaving the
+/// second file unreverted.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_revert_interrupted_between_its_files_is_completed_as_a_whole() {
+    for via_manual in [false, true] {
+        let r = rig("dr7revert");
+        let id = rid("R-47");
+        two_file_general(&r, &id);
+        let stop = StopOn { rel: "hooks/v2.sh", point: Point::AfterRecord, fired: Cell::new(false) };
+        assert!(revert_in(&r.env(&stop, ApplyForm::Exchange), &id, RevertCaller::Human, &no_hooks, &no_repair_lock).is_err());
+        assert_eq!(std::fs::read(r.pack.join("hooks/v1.sh")).unwrap(), b"PRE-1\n");
+        assert_eq!(std::fs::read(r.pack.join("hooks/v2.sh")).unwrap(), b"POST-2\n");
+        assert_eq!(read_revert_intent_in(&r.root, &id, &r.lane).unwrap().state, "reverting");
+        let calm = r.env(&NoFaults, ApplyForm::Exchange);
+        resume_interrupted_in(&calm).unwrap();
+        if via_manual {
+            let rep = revert_in(&calm, &id, RevertCaller::Human, &no_hooks, &no_repair_lock).unwrap();
+            assert_eq!(rep.outcome, ApplyOutcome::Applied, "{rep:?}");
+        } else {
+            let lines = recover_revert_intents_in(&calm, &no_hooks, &no_repair_lock);
+            assert_eq!(lines.len(), 1, "{lines:?}");
+        }
+        assert_eq!(std::fs::read(r.pack.join("hooks/v2.sh")).unwrap(), b"PRE-2\n", "via_manual={via_manual}: the remaining file restored");
+        assert_eq!(ledger::read_record_in(&r.root, &id).unwrap().unwrap().state, RepairState::Reverted);
+        assert_eq!(read_revert_intent_in(&r.root, &id, &r.lane).unwrap().state, "reverted");
+    }
+}
+
+/// DR7: the hook step removes only HOOK tombstones; a file's tombstone goes only when that file was
+/// restored — a revert whose file restoration fails while its re-registration succeeds keeps the
+/// file's tombstone. Without DR7 the hook step removed every tombstone of the repair.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_hook_step_removes_only_hook_tombstones() {
+    let r = rig("dr7tomb");
+    let id = rid("R-48");
+    r.put("hooks/gone.sh", b"WAS\n", 0o755);
+    let pre_img = ledger::copy_preimage_in(&r.root, &id, &r.lane, "hooks/gone.sh", &r.pack.join("hooks/gone.sh"), 1.0).unwrap();
+    std::fs::remove_file(r.pack.join("hooks/gone.sh")).unwrap();
+    let mut rec = record(&r, &id, Classification::General, vec![
+        FileChange { rel: "hooks/gone.sh".into(), kind: ChangeKind::Edit, pre: pre_img, post: TargetState::Absent, diff: None },
+        FileChange { rel: "settings:Stop:t.sh".into(), kind: ChangeKind::HookUnregister { event: "Stop".into(), script: "t.sh".into() }, pre: PreImage::Absent, post: TargetState::Absent, diff: None },
+    ], RepairState::Probation);
+    rec.committed = vec![("hooks/gone.sh".into(), "absent".into())];
+    ledger::write_record_in(&r.root, &rec).unwrap();
+    lane_row(&r, &id, vec![("hooks/gone.sh".into(), "absent".into())], Vec::new());
+    let file_t = crate::repair::tombstones::Tombstone { rel: "hooks/gone.sh".into(), kind: crate::repair::tombstones::TombstoneKind::File, repair: id.clone() };
+    let hook_t = crate::repair::tombstones::Tombstone { rel: "settings:Stop:t.sh".into(), kind: crate::repair::tombstones::TombstoneKind::Hook { event: "Stop".into(), script: "t.sh".into() }, repair: id.clone() };
+    crate::repair::tombstones::record_in(&r.root, &r.lane, &file_t).unwrap();
+    crate::repair::tombstones::record_in(&r.root, &r.lane, &hook_t).unwrap();
+    // another writer takes the deleted file's place before it can be put back
+    let inj = Inject::new(Point::AfterRecord, Action::ReplaceLive(b"SOMEONE\n".to_vec()), None, &r.pack);
+    let registrar = |_: &Path, _: bool| -> Result<String, RepairError> { Ok(report_json(&[("Stop", "t.sh", "registered", &[])])) };
+    let root = r.root.clone();
+    let pack = r.pack.clone();
+    let hooks = move |rid: &RepairId, lane: &LaneKey, step: HookStep| hook_lines_step_in(&root, &pack, rid, lane, step, &registrar, 9.0);
+    let rep = revert_in(&r.env(&inj, ApplyForm::Exchange), &id, RevertCaller::Human, &hooks, &no_repair_lock).unwrap();
+    assert!(!matches!(rep.outcome, ApplyOutcome::Applied), "{rep:?}");
+    let left = crate::repair::tombstones::load_in(&r.root, &r.lane).unwrap();
+    assert!(left.contains(&file_t), "the file was not restored: its tombstone stays: {left:?}");
+    assert!(!left.contains(&hook_t), "the hook tombstone is removed by the hook step: {left:?}");
+}

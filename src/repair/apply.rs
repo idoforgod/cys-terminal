@@ -1366,6 +1366,150 @@ pub fn pre_image_for(
     }
 }
 
+/// DX1 — THE definition of "revertible in this lane" (`revert_in` accepts exactly these; the app's
+/// "직전 수리 되돌리기" picks among them): the lane row still applies something (a file state or a
+/// hook line), it is not closed 되돌려짐 / 대체됨, and — in the origin lane — the record is in force or
+/// the row was left 충돌 by an apply / revert that could not finish (a probation closed 실패 included:
+/// its record stays in force); in another lane, its row is open or closed otherwise.
+pub fn revertible_here(rec: &RepairRecord, row: &ledger::LaneRecord, lane: &LaneKey) -> bool {
+    let has_hooks = ledger::hook_lines(rec).next().is_some();
+    let applies = !row.applied.is_empty() || has_hooks;
+    let closed_for_good = matches!(row.probation.as_ref().and_then(|p| p.closed.as_deref()), Some(c) if c.starts_with("되돌려짐") || c.starts_with("대체됨"));
+    if !applies || closed_for_good {
+        return false;
+    }
+    if rec.origin_lane == *lane {
+        matches!(rec.state, RepairState::Probation | RepairState::InUse) || row.state == LaneState::Conflict
+    } else {
+        true
+    }
+}
+
+/// One target of a revert intent (canon strings).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RevertTarget {
+    pub rel: String,
+    pub applied: String,
+    pub pre: String,
+}
+
+/// RULINGS DR7 — the repair-level intent of one revert in one lane, durable BEFORE the first
+/// restoring exchange (`<root>/R-<n>/intents/<lane>.revert.json`): `reverting` → `reverted` |
+/// `incomplete` | `superseded`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RevertIntent {
+    pub schema: u32,
+    pub repair: RepairId,
+    pub lane_key: LaneKey,
+    pub op_tag: String,
+    pub state: String,
+    pub targets: Vec<RevertTarget>,
+    pub has_hooks: bool,
+    pub pack_generation: Option<PackGeneration>,
+    pub by: String,
+    pub created_at: f64,
+    pub updated_at: f64,
+}
+
+pub fn revert_intent_path_in(root: &Path, id: &RepairId, lane: &LaneKey) -> PathBuf {
+    ledger::repair_dir_in(root, id).join("intents").join(format!("{}.revert.json", lane.0))
+}
+
+pub fn read_revert_intent_in(root: &Path, id: &RepairId, lane: &LaneKey) -> Option<RevertIntent> {
+    serde_json::from_slice(&std::fs::read(revert_intent_path_in(root, id, lane)).ok()?).ok()
+}
+
+fn write_revert_intent(root: &Path, ri: &RevertIntent) -> Result<(), RepairError> {
+    super::durable::write_json_durable(&revert_intent_path_in(root, &ri.repair, &ri.lane_key), ri)
+}
+
+/// DR7 recovery: every `reverting` intent of THIS lane no live operation owns is completed AS A
+/// WHOLE — files already restored, the remaining files, the hook step, the lane row and the record —
+/// bound to its generation (a different generation → nothing put back, closed superseded).
+pub fn recover_revert_intents_in(env: &OpEnv<'_>, hooks: &HookStepFn<'_>, locked: &RepairLock<'_>) -> Vec<String> {
+    let mut lines = Vec::new();
+    for id in ledger::list_ids_in(env.root) {
+        let Some(mut ri) = read_revert_intent_in(env.root, &id, env.lane) else {
+            continue;
+        };
+        if ri.state != "reverting" {
+            continue;
+        }
+        let Some(_owned) = wal::LiveOp::try_enter(&format!("revert:{}", ri.op_tag)) else {
+            continue;
+        };
+        let rec = match ledger::read_record_in(env.root, &id) {
+            Ok(Some(r)) => r,
+            Ok(None) => continue,
+            Err(e) => {
+                lines.push(format!("{}: 끊긴 되돌리기를 마치지 못했습니다(기록을 읽을 수 없음 — {e:?})", id.as_str()));
+                continue;
+            }
+        };
+        match recover_one_revert(env, &rec, &mut ri, hooks, locked) {
+            Ok(r) => lines.push(format!("{}: 끊긴 되돌리기를 마저 했습니다({:?})", id.as_str(), r.outcome)),
+            Err(e) => lines.push(format!("{}: 끊긴 되돌리기를 마치지 못했습니다 — 다음 차례에 다시({e:?})", id.as_str())),
+        }
+    }
+    lines
+}
+
+fn recover_one_revert(
+    env: &OpEnv<'_>,
+    rec: &RepairRecord,
+    ri: &mut RevertIntent,
+    hooks: &HookStepFn<'_>,
+    locked: &RepairLock<'_>,
+) -> Result<RevertReport, RepairError> {
+    if let Some(bound) = &ri.pack_generation {
+        if *bound != pack_generation(env.pack) {
+            let r = close_superseded(env, rec, "되돌리기 중에 끊긴 뒤 팩 세대가 바뀌었습니다 — 아무것도 더 되돌리지 않았습니다(새 버전 우선 · 워커 검토)", locked)?;
+            ri.state = "superseded".into();
+            ri.updated_at = env.now;
+            write_revert_intent(env.root, ri)?;
+            return Ok(r);
+        }
+    }
+    let mut files = Vec::new();
+    for t in &ri.targets {
+        let pre = parse_canon(&t.pre).ok_or_else(|| RepairError::Corrupt(format!("{}: 되돌리기 의도의 상태를 읽을 수 없습니다", t.rel)))?;
+        let applied = parse_canon(&t.applied).ok_or_else(|| RepairError::Corrupt(format!("{}: 되돌리기 의도의 상태를 읽을 수 없습니다", t.rel)))?;
+        let live_now = TargetState::read(&env.pack.join(&t.rel))?;
+        let outcome = if live_now == pre {
+            ApplyOutcome::Applied // restored before the crash
+        } else if live_now == applied {
+            let (_, holder) = pre_image_for(env.root, rec, env.lane, &t.rel)?;
+            run_op(
+                env,
+                &OpSpec {
+                    id: rec.id.clone(),
+                    rel: t.rel.clone(),
+                    kind: "revert".into(),
+                    expected: applied,
+                    incoming: pre,
+                    source: holder,
+                    generation: ri.pack_generation.clone(),
+                },
+            )?
+            .outcome
+        } else {
+            ApplyOutcome::Superseded(format!("{}: 살아 있는 것이 적용 결과도 적용 전도 아닙니다 — 그대로 둠", t.rel))
+        };
+        files.push((t.rel.clone(), outcome));
+    }
+    let by = ri.by.clone();
+    let report = finish_revert(env, rec, ri.targets.len(), files, ri.has_hooks, hooks, &by, locked)?;
+    ri.state = match &report.outcome {
+        ApplyOutcome::Applied => "reverted",
+        ApplyOutcome::Superseded(_) => "superseded",
+        ApplyOutcome::Declined(_) => "incomplete",
+    }
+    .into();
+    ri.updated_at = env.now;
+    write_revert_intent(env.root, ri)?;
+    Ok(report)
+}
+
 /// What a revert did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RevertReport {
@@ -1407,16 +1551,18 @@ pub fn revert_in(
         RepairError::Precondition(format!("{}: 이 부서에는 이 수리의 행이 없습니다", id.as_str()))
     })?;
     let has_hooks = ledger::hook_lines(&rec).next().is_some();
-    let closed_for_good = matches!(row.probation.as_ref().and_then(|p| p.closed.as_deref()), Some(c) if c.starts_with("되돌려짐") || c.starts_with("대체됨"));
-    // CT3 / CT4: a lane row 충돌 left by an apply or a revert that could not finish is revertible
-    let unfinished_here = row.state == LaneState::Conflict && !closed_for_good && (!row.applied.is_empty() || has_hooks);
-    let in_force = if rec.origin_lane == *env.lane {
-        matches!(rec.state, RepairState::Probation | RepairState::InUse) || unfinished_here
-    } else {
-        (!row.applied.is_empty() || has_hooks) && !closed_for_good
-    };
-    // CT7: a hook-only repair (no file state) is revertible — its re-registration is its state
-    if !in_force || (row.applied.is_empty() && !has_hooks) {
+    // DR7: an interrupted revert of this repair in this lane is completed first (never re-planned
+    // against a row an already-restored file no longer matches)
+    if let Some(mut ri) = read_revert_intent_in(env.root, id, env.lane) {
+        if ri.state == "reverting" {
+            if let Some(_owned) = wal::LiveOp::try_enter(&format!("revert:{}", ri.op_tag)) {
+                return recover_one_revert(env, &rec, &mut ri, hooks, locked);
+            }
+            return Err(RepairError::Locked(format!("{}: 이 수리의 되돌리기가 지금 진행 중입니다", id.as_str())));
+        }
+    }
+    // DX1 / CT7: ONE definition of "revertible here" (the app's picker asks the same predicate)
+    if !revertible_here(&rec, &row, env.lane) {
         return Err(RepairError::Precondition(format!(
             "{}: '{}' 상태라 되돌릴 것이 없습니다(시험 기간·사용 중인 수리만 되돌립니다)",
             id.as_str(),
@@ -1465,15 +1611,64 @@ pub fn revert_in(
             generation: bound.clone(),
         });
     }
+    let by_label = match by {
+        RevertCaller::Human => "사람".to_string(),
+        RevertCaller::TicketedWorker { seat } => format!("워커 좌석 {seat}"),
+        RevertCaller::DaemonAuto => "데몬(자동)".to_string(),
+    };
+    // DR7: the repair-level intent is durable BEFORE the first restoring exchange
+    let op_tag = wal::new_op_id(env.now, "revert");
+    let _live = wal::LiveOp::enter(&format!("revert:{op_tag}"));
+    let mut ri = RevertIntent {
+        schema: super::REPAIR_SCHEMA,
+        repair: id.clone(),
+        lane_key: env.lane.clone(),
+        op_tag: op_tag.clone(),
+        state: "reverting".into(),
+        targets: plan
+            .iter()
+            .map(|sp| RevertTarget { rel: sp.rel.clone(), applied: sp.expected.canon(), pre: sp.incoming.canon() })
+            .collect(),
+        has_hooks,
+        pack_generation: bound.clone(),
+        by: by_label.clone(),
+        created_at: env.now,
+        updated_at: env.now,
+    };
+    write_revert_intent(env.root, &ri)?;
     let mut files = Vec::new();
-    let mut all_applied = true;
     for spec in &plan {
         let r = run_op(env, spec)?;
-        if r.outcome != ApplyOutcome::Applied {
-            all_applied = false;
-        }
         files.push((spec.rel.clone(), r.outcome));
     }
+    let report = finish_revert(env, &rec, plan.len(), files, has_hooks, hooks, &by_label, locked)?;
+    ri.state = match &report.outcome {
+        ApplyOutcome::Applied => "reverted",
+        ApplyOutcome::Superseded(_) => "superseded",
+        ApplyOutcome::Declined(_) => "incomplete",
+    }
+    .into();
+    ri.updated_at = env.now;
+    write_revert_intent(env.root, &ri)?;
+    Ok(report)
+}
+
+/// The end of a revert (also its DR7 recovery): FILE tombstones of restored targets only, the hook
+/// step (which removes only hook tombstones, after its record), the measured outcome, the record
+/// and the lane row.
+#[allow(clippy::too_many_arguments)]
+fn finish_revert(
+    env: &OpEnv<'_>,
+    rec: &RepairRecord,
+    planned: usize,
+    files: Vec<(String, ApplyOutcome)>,
+    has_hooks: bool,
+    hooks: &HookStepFn<'_>,
+    by_label: &str,
+    locked: &RepairLock<'_>,
+) -> Result<RevertReport, RepairError> {
+    let id = &rec.id;
+    let all_applied = files.iter().all(|(_, o)| *o == ApplyOutcome::Applied);
     // this repair's FILE tombstones of the reverted targets; the hook step removes its own hook
     // tombstones AFTER its operation record (Y1's order — CU4)
     for (rel, o) in &files {
@@ -1492,7 +1687,7 @@ pub fn revert_in(
     let any_applied = files.iter().any(|(_, o)| *o == ApplyOutcome::Applied);
     let hook_failed = matches!(hook_step, Some(Err(_)));
     let complete = all_applied && !hook_failed;
-    let nothing_changed = !any_applied && hook_step.is_none() && !plan.is_empty();
+    let nothing_changed = !any_applied && hook_step.is_none() && planned > 0;
     let label = if complete {
         "되돌려짐"
     } else if nothing_changed {
@@ -1517,11 +1712,6 @@ pub fn revert_in(
         }
         note.push_str(&format!("훅 재등록 실패: {e}"));
     }
-    let by_label = match by {
-        RevertCaller::Human => "사람".to_string(),
-        RevertCaller::TicketedWorker { seat } => format!("워커 좌석 {seat}"),
-        RevertCaller::DaemonAuto => "데몬(자동)".to_string(),
-    };
     let lane = env.lane.clone();
     let now = env.now;
     let root = env.root.to_path_buf();
@@ -3545,7 +3735,9 @@ fn finish_hook_op(
                 )?;
             }
         }
-        _ => super::tombstones::remove_for_repair_in(root, &op.lane_key, &rec.id)?,
+        // DR7: the hook step removes only this repair's HOOK tombstones (a file's goes only when
+        // that file was restored — the file step)
+        _ => super::tombstones::remove_hooks_for_repair_in(root, &op.lane_key, &rec.id)?,
     }
     wal::set_step(root, op, "tombstoned", now)?;
     // (iii) the registrar, judged for the named hooks

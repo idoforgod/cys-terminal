@@ -183,6 +183,8 @@ pub fn run_tick(env: &JobEnv<'_>, force_sweep: bool) -> Result<TickReport, Repai
             }
         }
         lines.extend(apply::recover_apply_intents_in(&env.op, env.locked));
+        // DR7: interrupted reverts are completed as a whole
+        lines.extend(apply::recover_revert_intents_in(&env.op, env.hooks, env.locked));
         Ok((n, lines, faults))
     });
     match recovered {
