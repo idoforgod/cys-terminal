@@ -13,27 +13,76 @@ thread_local! {
     /// Test-only: how many full flushes (`F_FULLFSYNC` that succeeded) this thread issued — the
     /// E1 pin counts them so a regression to plain `fsync` fails a test.
     pub(crate) static FULL_FLUSHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Test-only (RULINGS CT2): the next full flushes of this thread fail with this errno, as many
+    /// times as the count says (`(errno, count)`; count 0 = off).
+    pub(crate) static INJECT_FLUSH_ERRNO: std::cell::Cell<(i32, u32)> = const { std::cell::Cell::new((0, 0)) };
 }
 
-fn io(p: &Path, e: impl std::fmt::Display) -> RepairError {
-    RepairError::Io(format!("{}: {e}", p.display()))
+#[cfg(test)]
+fn injected_errno() -> Option<i32> {
+    INJECT_FLUSH_ERRNO.with(|c| {
+        let (errno, n) = c.get();
+        (n > 0).then(|| {
+            c.set((errno, n - 1));
+            errno
+        })
+    })
 }
 
-/// The full flush of one open file or directory handle: `fcntl(F_FULLFSYNC)` on macOS (falls back
-/// to `sync_all` only when the volume refuses the call — e.g. a filesystem without the barrier),
-/// `sync_all` elsewhere.
+/// RULINGS CT2: the errno values by which a volume says "this flush is not supported here" — the
+/// ONLY failures of `F_FULLFSYNC` after which a plain `fsync` stands in: `ENOTSUP` (45 on macOS;
+/// what SMB / AFP mounts and some FUSE volumes answer — the same single value Go's runtime falls
+/// back on, `internal/poll/fd_fsync_darwin.go`) and `EOPNOTSUPP` (102 on macOS, its socket-layer
+/// twin some network filesystems pass up). `EINTR` is retried. Every other errno (`EIO`, `ENOSPC`,
+/// `EBADF`, `EROFS`, `EDQUOT`, …) is an error: the caller declines and keeps its evidence.
+#[cfg(target_os = "macos")]
+pub const FLUSH_NOT_SUPPORTED_ERRNOS: [i32; 2] = [libc::ENOTSUP, libc::EOPNOTSUPP];
+
+/// The full flush of one open file or directory handle: `fcntl(F_FULLFSYNC)` on macOS; a plain
+/// `fsync` stands in ONLY when the volume answers one of [`FLUSH_NOT_SUPPORTED_ERRNOS`] (RULINGS
+/// CT2 — fails closed on every other errno); `sync_all` elsewhere (`fsync` on Linux,
+/// `FlushFileBuffers` on Windows).
 pub fn full_flush_file(f: &std::fs::File) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
     {
         use std::os::unix::io::AsRawFd;
-        // SAFETY: fcntl on a descriptor borrowed for the duration of the call.
-        if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_FULLFSYNC) } == 0 {
+        loop {
             #[cfg(test)]
-            FULL_FLUSHES.with(|c| c.set(c.get() + 1));
-            return Ok(());
+            let injected = injected_errno();
+            #[cfg(not(test))]
+            let injected: Option<i32> = None;
+            // SAFETY: fcntl on a descriptor borrowed for the duration of the call.
+            let rc = match injected {
+                Some(_) => -1,
+                None => unsafe { libc::fcntl(f.as_raw_fd(), libc::F_FULLFSYNC) },
+            };
+            if rc == 0 {
+                #[cfg(test)]
+                FULL_FLUSHES.with(|c| c.set(c.get() + 1));
+                return Ok(());
+            }
+            let errno = injected.unwrap_or_else(|| std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
+            if errno == libc::EINTR {
+                continue;
+            }
+            if FLUSH_NOT_SUPPORTED_ERRNOS.contains(&errno) {
+                // SAFETY: fsync on a descriptor borrowed for the duration of the call.
+                return match unsafe { libc::fsync(f.as_raw_fd()) } {
+                    0 => Ok(()),
+                    _ => Err(std::io::Error::last_os_error()),
+                };
+            }
+            return Err(std::io::Error::from_raw_os_error(errno));
         }
     }
-    f.sync_all()
+    #[cfg(not(target_os = "macos"))]
+    {
+        #[cfg(test)]
+        if let Some(errno) = injected_errno() {
+            return Err(std::io::Error::from_raw_os_error(errno));
+        }
+        f.sync_all()
+    }
 }
 
 /// Full flush of a directory (unix). Windows has no directory flush (the rename is journaled by
@@ -149,6 +198,34 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
         assert_eq!(left, vec!["x.json".to_string()], "temporary sibling left: {left:?}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// RULINGS CT2: a failure of the mandatory full flush other than "not supported" is an ERROR —
+    /// the durable write fails, the target keeps its old bytes, no temporary sibling is left; a
+    /// "not supported" errno (ENOTSUP) lets a plain fsync stand in and the write succeeds.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn full_flush_failure_fails_closed_except_not_supported() {
+        let d = tmp("ct2");
+        let p = d.join("x.json");
+        write_durable(&p, b"old").unwrap();
+        INJECT_FLUSH_ERRNO.with(|c| c.set((libc::EIO, 1)));
+        let r = write_durable(&p, b"new");
+        INJECT_FLUSH_ERRNO.with(|c| c.set((0, 0)));
+        assert!(r.is_err(), "EIO on the full flush must fail the write");
+        assert_eq!(std::fs::read(&p).unwrap(), b"old", "the target keeps its bytes");
+        let left = std::fs::read_dir(&d).unwrap().count();
+        assert_eq!(left, 1, "no temporary sibling left");
+        for errno in FLUSH_NOT_SUPPORTED_ERRNOS {
+            INJECT_FLUSH_ERRNO.with(|c| c.set((errno, 1)));
+            let r = write_durable(&p, b"fallback");
+            INJECT_FLUSH_ERRNO.with(|c| c.set((0, 0)));
+            assert!(r.is_ok(), "errno {errno} = not supported → plain fsync stands in: {r:?}");
+        }
+        INJECT_FLUSH_ERRNO.with(|c| c.set((libc::EINTR, 1)));
+        assert!(write_durable(&p, b"intr").is_ok(), "EINTR is retried");
+        INJECT_FLUSH_ERRNO.with(|c| c.set((0, 0)));
         let _ = std::fs::remove_dir_all(&d);
     }
 

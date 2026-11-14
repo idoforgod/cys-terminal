@@ -1250,3 +1250,36 @@ fn failing_exchange_declines_and_closes_the_record() {
     assert_eq!(ops.len(), 1);
     assert_eq!((ops[0].finished, ops[0].outcome.as_deref()), (true, Some("declined")));
 }
+
+/// RULINGS CT2 at the operation level: the mandatory full flush fails (EIO) right after an exchange
+/// → the operation returns an ERROR (nothing reported applied), its record stays UNFINISHED with its
+/// evidence (the slot and both identities), and the next run, with the flush working again, finishes
+/// it from the record. Fails without CT2 when the flush error is swallowed.
+#[cfg(target_os = "macos")]
+#[test]
+fn flush_failure_after_the_exchange_keeps_the_evidence() {
+    struct FailFlushAfterExchange;
+    impl Faults for FailFlushAfterExchange {
+        fn at(&self, point: Point, _live: &Path, _slot: Option<&Slot>) -> bool {
+            if point == Point::AfterExchange {
+                crate::repair::durable::INJECT_FLUSH_ERRNO.with(|c| c.set((libc::EIO, 1000)));
+            }
+            false
+        }
+    }
+    let r = rig("ct2op");
+    let before = r.put("hooks/f.sh", b"OLD\n", 0o755);
+    let (src, incoming) = r.source("f-new", b"NEW\n", 0o755);
+    let spec = OpSpec { id: rid("R-6"), rel: "hooks/f.sh".into(), kind: "revert".into(), expected: before, incoming: incoming.clone(), source: Some(src), generation: None };
+    let faults = FailFlushAfterExchange;
+    let res = run_op(&r.env(&faults, ApplyForm::Exchange), &spec);
+    crate::repair::durable::INJECT_FLUSH_ERRNO.with(|c| c.set((0, 0)));
+    assert!(res.is_err(), "a failed full flush is an error, never an outcome: {res:?}");
+    let unfinished = wal::unfinished_for_lane(&r.root, &r.lane);
+    assert_eq!(unfinished.len(), 1, "the operation keeps its record");
+    assert!(unfinished[0].slot.is_some() && unfinished[0].slot_identity.is_some() && unfinished[0].live_identity.is_some());
+    resume_interrupted_in(&r.env(&NoFaults, ApplyForm::Exchange)).unwrap();
+    assert!(wal::unfinished_for_lane(&r.root, &r.lane).is_empty(), "finished from the record");
+    assert_eq!(r.live("hooks/f.sh"), incoming);
+    assert!(r.vault_bytes().contains(&b"OLD\n".to_vec()));
+}
