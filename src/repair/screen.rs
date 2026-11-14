@@ -1403,10 +1403,10 @@ fn screen_device(
                 }
             });
             for (k, j) in todo.iter().zip(got.iter()) {
-                if !j
-                    .iter()
-                    .any(|x| x.answer == Answer::Error && x.detail.starts_with("timeout"))
-                {
+                // only an answer that was really observed is kept for later screens: never one of the
+                // BL1 repeat (it runs WITHOUT the cache), never an ERROR (a time-out, a spawn failure,
+                // a run that left something or an output not observed whole is no reusable fact)
+                if r.use_cache && !j.iter().any(|x| x.answer == Answer::Error) {
                     cache_put(
                         (device, key.clone(), r.interp_key(), k.0, k.1, k.2),
                         j.clone(),
@@ -2567,7 +2567,8 @@ fn screen_i3(r: &Runner<'_>, v: &Variants, rels: &[String], results: &mut Vec<Pr
             }
         }
         let rows = run_i3(r, &keys[*g].1, &profiles, &template, *l, *s);
-        if rows.iter().all(|(_, _, st, _)| st.is_some()) {
+        // never kept from the BL1 repeat (which runs without the cache), never a not-measured row
+        if r.use_cache && rows.iter().all(|(_, _, st, _)| st.is_some()) {
             if let Ok(mut m) = i3_cache().lock() {
                 if m.len() > 2_000 {
                     m.clear();
