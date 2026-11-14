@@ -1224,7 +1224,7 @@ fn hook_step_timeout_and_resume_after_a_crash() {
     let rec = OpRecord {
         schema: 1, op: wal::new_op_id(2.0, "hook-unregister"), repair: id2.clone(), lane_key: r.lane.clone(),
         kind: "hook-unregister".into(), form: "hook".into(), rel: String::new(), pre_existed: false,
-        expected: String::new(), incoming: String::new(), pack_bound: Bound::now(&r.pack), slot: None, slot_identity: None,
+        expected: String::new(), incoming: String::new(), pack_generation: None, slot: None, slot_identity: None,
         live_identity: None, incoming_copy: None, incoming_copy_identity: None, step: "recorded".into(),
         hooks: vec![wal::HookLine { event: "Stop".into(), script: "z.sh".into(), targets: Vec::new() }],
         finished: false, outcome: None, note: String::new(), created_at: 2.0, updated_at: 2.0,
