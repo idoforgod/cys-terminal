@@ -6286,8 +6286,14 @@ pub fn pack_prev_dir(dir: &Path) -> PathBuf {
 /// 복사한다 — 종전 `fs::copy` 는 링크를 따라가 파일 링크를 사본으로 바꾸고, 대상이 없는 링크에서는
 /// 실패해 `init-pack` 이 exit 1 로 멈췄다(조사 손실 시나리오 20). 윈도우는 개발자 모드 없이 링크를 만들 수
 /// 없으므로 지금 동작 그대로다(운영체제 제약).
+/// ★T9a (RULINGS GN1 · S3): 폴더와 파일을 전부 **배타적으로** 만든다 — 대상(또는 그 안의 무엇이든)이 이미 있으면
+/// `AlreadyExists` 로 즉시 멈추고 아무것도 바꾸지 않는다(덮어쓰기 0). 호출자(첫 설치의 게시)는 그때 이미 있는 팩을
+/// 제자리 설치로 갱신한다. `dst` 의 상위 폴더는 필요하면 만든다.
 fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dst)?;
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::create_dir(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
         let ft = entry.file_type()?;
@@ -6301,13 +6307,22 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
         if ft.is_dir() {
             copy_dir_all(&from, &to)?;
         } else {
-            std::fs::copy(&from, &to)?;
+            copy_file_new(&from, &to)?;
         }
     }
     Ok(())
 }
 
-/// The rename every move of the pack swap goes through ([`atomic_swap_with`]). Production passes `std::fs::rename`;
+/// ★T9a (RULINGS GN1): 결코 바꾸지 않는 파일 복사 — 대상은 `create_new`(있으면 `AlreadyExists`)로 만들고, 원본의 권한을
+/// 입힌다(`fs::copy` 가 하던 대로).
+fn copy_file_new(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut input = std::fs::File::open(from)?;
+    let mut output = std::fs::OpenOptions::new().write(true).create_new(true).open(to)?;
+    std::io::copy(&mut input, &mut output)?;
+    std::fs::set_permissions(to, input.metadata()?.permissions())
+}
+
+/// The rename every move of the pack swap goes through ([`publish_staging_with`]). Production passes `std::fs::rename`;
 /// tests install a refusing one through [`swap_seam`] (RULINGS FS5).
 type SwapRename = dyn Fn(&Path, &Path) -> std::io::Result<()>;
 
@@ -6349,11 +6364,20 @@ mod swap_seam {
 /// ★T9a (RULINGS FS2 · GH1): `src` is ONLY ever the staging folder this install itself just wrote (a first install's
 /// publish) — the one place the copy-then-delete fallback remains. A live pack is never its source: an existing pack is
 /// updated in place by [`install_staged`] and never moved as a folder.
+/// ★T9a (RULINGS GN1 · S3): rename 이 실패했을 때 대상이 **그사이 생겼으면** 아무것도 복사하지 않고 `AlreadyExists` 를
+/// 돌려준다(다른 설치기 — 데몬의 기동 설치·다른 init-pack — 가 만든 팩 위에 분류 없이 덮어쓰지 않는다). 복사 fallback 은
+/// 대상이 아직 없을 때만이고, 그 복사도 배타적이다([`copy_dir_all`]).
 fn rename_dir_or_move(src: &Path, dst: &Path, rename: &SwapRename) -> std::io::Result<()> {
     if rename(src, dst).is_ok() {
         return Ok(());
     }
-    // rename 불가(cross-device 등) — copy 후 원본 삭제 fallback(src 부재면 여기서 loud Err).
+    if std::fs::symlink_metadata(dst).is_ok() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("{} 가 그사이 생겼습니다 — 복사하지 않습니다", dst.display()),
+        ));
+    }
+    // rename 불가(cross-device 등) — 아직 없는 대상에 배타적 copy 후 원본 삭제 fallback(src 부재면 여기서 loud Err).
     copy_dir_all(src, dst)?;
     std::fs::remove_dir_all(src)
 }
@@ -6366,23 +6390,44 @@ fn rename_dir_or_move(src: &Path, dst: &Path, rename: &SwapRename) -> std::io::R
 /// 반환 Err = 아무것도 바꾸지 않았거나(자리에 항목이 있음 · staging rename/copy 가 시작 전에 실패), staging 의 copy
 /// fallback 이 도중에 멈춰 pack_dir 자리에 staging 의 일부 사본이 남았다 — 그 폴더는 다음 실행이 제자리 설치로 채운다.
 pub fn atomic_swap(dir: &Path, staging: &Path) -> Result<(), String> {
-    #[cfg(test)]
-    if let Some(rename) = swap_seam::current() {
-        return atomic_swap_with(dir, staging, &*rename);
-    }
-    atomic_swap_with(dir, staging, &|src: &Path, dst: &Path| std::fs::rename(src, dst))
-}
-
-/// [`atomic_swap`] with the rename it uses — the test seam of RULINGS FS5 / GH2 (tests count the folder renames).
-fn atomic_swap_with(dir: &Path, staging: &Path, rename: &SwapRename) -> Result<(), String> {
-    if std::fs::symlink_metadata(dir).is_ok() {
-        return Err(format!(
+    publish_staging(dir, staging).map_err(|r| match r {
+        PublishRefused::Occupied => format!(
             "팩 자리에 이미 항목이 있습니다({}) — 살아 있는 팩은 폴더째 바꾸지 않습니다(기존 팩은 파일별 제자리 갱신) · \
              아무것도 바꾸지 않았습니다",
             dir.display()
-        ));
+        ),
+        PublishRefused::Failed(e) => e,
+    })
+}
+
+/// 첫 설치 게시가 일어나지 않은 이유.
+enum PublishRefused {
+    /// 팩 자리에 무엇이 있다(처음부터, 또는 rename 사이에 다른 설치기가 만들었다) — 아무것도 복사하지 않았다.
+    Occupied,
+    /// 그 밖의 실패(rename·배타 복사의 IO 오류).
+    Failed(String),
+}
+
+/// [`atomic_swap`] 의 본체 — 테스트 이음새(swap_seam)를 거친 rename 으로 게시한다.
+fn publish_staging(dir: &Path, staging: &Path) -> Result<(), PublishRefused> {
+    #[cfg(test)]
+    if let Some(rename) = swap_seam::current() {
+        return publish_staging_with(dir, staging, &*rename);
     }
-    rename_dir_or_move(staging, dir, rename).map_err(|e| format!("staging→pack_dir rename 실패: {e}"))
+    publish_staging_with(dir, staging, &|src: &Path, dst: &Path| std::fs::rename(src, dst))
+}
+
+/// [`publish_staging`] with the rename it uses — the test seam of RULINGS FS5 / GH2 / GN1 (tests count the folder renames
+/// and create the pack between the absence check and the rename).
+fn publish_staging_with(dir: &Path, staging: &Path, rename: &SwapRename) -> Result<(), PublishRefused> {
+    if std::fs::symlink_metadata(dir).is_ok() {
+        return Err(PublishRefused::Occupied);
+    }
+    match rename_dir_or_move(staging, dir, rename) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(PublishRefused::Occupied),
+        Err(e) => Err(PublishRefused::Failed(format!("staging→pack_dir rename 실패: {e}"))),
+    }
 }
 
 /// staging 검증(§3.1-2): 임베드 전 파일이 staging에 실재하는가(파일 수·존재). pack-update의
@@ -6434,7 +6479,8 @@ pub fn verify_staging_with(
 ///   아니다: 바꿀 수 없는 파일 하나(윈도우에서 쥐어진 파일)가 그 자리에서 실행을 Err 로 멈추고(앞 파일은 갱신됨 ·
 ///   `.pack-version` 은 그대로라 데몬의 설치 관문도 열린 채), 다음 실행이 마저 끝낸다. 지우는 것은 없다.
 /// - pack_dir 이 **없으면**(첫 설치) staging 전개 → install_into 반영 → 검증 → rename 하나로 게시([`atomic_swap`]) →
-///   config 격리 셋업. 게시 전 중단은 pack_dir 을 만들지 않는다.
+///   config 격리 셋업. 게시 전 중단은 pack_dir 을 만들지 않는다. ★RULINGS GN1: 그사이 다른 설치기가 팩을 만들었으면
+///   (rename 이 거부되고 대상이 이제 있다) 그 위에 아무것도 복사하지 않고 staging 을 버린 뒤 위의 제자리 갱신을 돈다.
 /// ★G3: `install_hooks=false`(init-pack --no-install-hook)면 마지막 config 격리 셋업에서 훅
 /// 병합·검증·개인 프로필 병합을 생략한다(라우터 시드는 유지) — 훅 억제의 의미론을 '모든 계급의
 /// 훅 등록 억제'로 통일(종전엔 ~/.claude 만 막고 격리 config dir 병합은 못 막던 비일관 해소).
@@ -6457,7 +6503,7 @@ pub fn install_staged(
     authorize_pack_write(&dir, auth)?;
     // ★T9a (RULINGS GH1): 있는 팩 = 제자리 파일별 설치(데몬의 기동 설치와 같은 호출 — 차이는 force·config 셋업 시점·
     // 존재 검증뿐) → 같은 존재 검증 → 같은 config 셋업. 폴더째 교체는 없다.
-    if dir.is_dir() {
+    let in_place = || -> Result<(usize, usize), String> {
         let items: Vec<(&str, &str)> = PACK_ALL.iter().map(|(r, c)| (*r, *c)).collect();
         let sources = UpdateSources::for_live_pack(&dir);
         let (written, kept) = install_into_with(
@@ -6475,7 +6521,10 @@ pub fn install_staged(
         verify_staging_with(&dir, &items, &sources.authorised_absent())
             .map_err(|e| format!("제자리 갱신 뒤 팩 검사 — {e}"))?;
         setup_isolated_config_dir(install_hooks);
-        return Ok((written, kept));
+        Ok((written, kept))
+    };
+    if dir.is_dir() {
+        return in_place();
     }
     let staging = init_staging_dir(&dir);
     // 잔여 staging(같은 pid 재사용·직전 실패) 선정리.
@@ -6511,10 +6560,25 @@ pub fn install_staged(
         let _ = std::fs::remove_dir_all(&staging);
         return Err(e);
     }
-    // ④ 게시(rename 하나 · 자리에 항목이 있으면 거부 · 실패 시 staging 정리).
-    if let Err(e) = atomic_swap(&dir, &staging) {
-        let _ = std::fs::remove_dir_all(&staging);
-        return Err(e);
+    // ④ 게시(rename 하나 · 실패 시 staging 정리). ★T9a (RULINGS GN1 · S3): 그사이 다른 설치기가 팩을 만들었으면 그 위에
+    //   아무것도 복사하지 않는다 — staging 을 버리고, 이제 있는 팩을 제자리 설치로 갱신한다(그 안의 모든 파일이 갱신
+    //   규칙을 거친다).
+    match publish_staging(&dir, &staging) {
+        Ok(()) => {}
+        Err(PublishRefused::Occupied) if dir.is_dir() => {
+            let _ = std::fs::remove_dir_all(&staging);
+            return in_place();
+        }
+        Err(refused) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(match refused {
+                PublishRefused::Occupied => format!(
+                    "팩 자리에 폴더가 아닌 항목이 있습니다({}) — 아무것도 바꾸지 않았습니다",
+                    dir.display()
+                ),
+                PublishRefused::Failed(e) => e,
+            });
+        }
     }
     // ⑤ 교체 후 실 pack_dir 기준 config 격리 셋업(pack_dir 형제 — staging 대상이 아니었다).
     setup_isolated_config_dir(install_hooks);
@@ -12809,6 +12873,97 @@ mod tests {
                 assert!(pd.join(PACK_VERSION_FILE).is_file());
                 assert!(!pack_prev_dir(&pd).exists(), "no pack.prev");
             });
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// GN1 (S3): a first install whose publishing rename fails because someone else created the pack meanwhile (the
+        /// daemon's start install, another init-pack) copies NOTHING over it — it discards its staging and runs the
+        /// in-place branch on the pack that now exists, so every file there meets the update rules: a user's edits made
+        /// in it survive and are classified. On 4c75b42e the copy fallback overwrote them with the staging's bytes.
+        #[test]
+        fn first_install_meeting_a_pack_created_meanwhile_copies_nothing_over_it() {
+            let _g = PACK_ENV_LOCK.lock().unwrap();
+            let base = scratch("raced");
+            let pd = base.join("pack");
+            with_pack(&pd, || {
+                let user_boot = "# edited in the pack another installer created\n";
+                let target = pd.clone();
+                let log: CallLog = Rc::new(RefCell::new(Vec::new()));
+                let seen = log.clone();
+                let seam = swap_seam::install(move |src: &Path, dst: &Path| {
+                    seen.borrow_mut().push((src.to_path_buf(), dst.to_path_buf()));
+                    if dst == target && std::fs::symlink_metadata(dst).is_err() {
+                        // Between the absence check and the rename: another installer publishes the pack in place,
+                        // and the user edits two files in it.
+                        crate::pack::install(false, None).unwrap();
+                        std::fs::write(dst.join(USER_OWNED), USER_AGENTS).unwrap();
+                        std::fs::write(dst.join(LISTED), user_boot).unwrap();
+                    }
+                    std::fs::rename(src, dst)
+                });
+                let r = crate::pack::install_staged(false, None, false);
+                drop(seam);
+                r.expect("the raced first install ends as an in-place update of the pack that now exists");
+                assert_eq!(std::fs::read_to_string(pd.join(USER_OWNED)).unwrap(), USER_AGENTS, "user-owned edit survives");
+                assert_eq!(std::fs::read_to_string(pd.join(LISTED)).unwrap(), user_boot, "listed edit survives");
+                assert_eq!(
+                    load_merge_pending(&pd).get(LISTED).and_then(|e| e["kind"].as_str()),
+                    Some("kept-drift"),
+                    "the listed edit met the update rules (vendor not advanced → kept in place, recorded)"
+                );
+                assert_eq!(log.borrow().len(), 1, "one publishing rename attempt, nothing else: {:?}", log.borrow());
+                let left: Vec<String> =
+                    entries(&base).into_iter().filter(|n| n.starts_with(".pack-staging")).collect();
+                assert!(left.is_empty(), "the staging was discarded: {left:?}");
+                assert!(!pack_prev_dir(&pd).exists());
+            });
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// GN1: the copy fallback (a cross-device staging) onto a destination that is still absent still publishes.
+        #[test]
+        fn first_install_cross_device_fallback_onto_an_absent_pack_still_publishes() {
+            let _g = PACK_ENV_LOCK.lock().unwrap();
+            let base = scratch("xdev");
+            let pd = base.join("pack");
+            with_pack(&pd, || {
+                let target = pd.clone();
+                let seam = swap_seam::install(move |src: &Path, dst: &Path| {
+                    if dst == target {
+                        return Err(std::io::Error::other("Invalid cross-device link (os error 18 — injected)"));
+                    }
+                    std::fs::rename(src, dst)
+                });
+                let r = crate::pack::install_staged(false, None, false);
+                drop(seam);
+                r.expect("the copy fallback publishes onto an absent pack");
+                for (rel, content) in PACK_ALL.iter().take(40) {
+                    assert_eq!(std::fs::read(pd.join(rel)).unwrap(), content.as_bytes(), "{rel}");
+                }
+                assert_eq!(
+                    std::fs::read_to_string(pd.join(PACK_VERSION_FILE)).unwrap().trim(),
+                    env!("CARGO_PKG_VERSION")
+                );
+                let left: Vec<String> =
+                    entries(&base).into_iter().filter(|n| n.starts_with(".pack-staging")).collect();
+                assert!(left.is_empty(), "the staging was consumed: {left:?}");
+            });
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// GN1: the copy creates every folder and file exclusively — onto an existing destination it stops at once
+        /// with `AlreadyExists` and replaces nothing. On 4c75b42e it overwrote the existing file.
+        #[test]
+        fn the_publish_copy_never_replaces_an_existing_file() {
+            let base = scratch("excl");
+            let src = base.join("src");
+            let dst = base.join("dst");
+            write_tree(&src, &[("agents.json", "{\"vendor\":1}"), ("bin/x.py", "x")]);
+            write_tree(&dst, &[("agents.json", "{\"user\":1}")]);
+            let err = copy_dir_all(&src, &dst).expect_err("an existing destination stops the copy");
+            assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists, "{err}");
+            assert_eq!(std::fs::read_to_string(dst.join("agents.json")).unwrap(), "{\"user\":1}", "nothing replaced");
+            assert!(!dst.join("bin").exists(), "nothing copied");
             let _ = std::fs::remove_dir_all(&base);
         }
 
