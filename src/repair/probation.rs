@@ -165,7 +165,7 @@ pub fn run_tick(env: &JobEnv<'_>, force_sweep: bool) -> Result<TickReport, Repai
     // pack-apply lock, TRIED — held means a writer is ACTIVE ("unfinished" is not "interrupted"):
     // this tick then does nothing at all and its job state is not written (due again next time);
     // the unfinished records are read only after the lock is taken
-    let recovered = crate::pack_apply_lock::try_with_apply_lock(env.apply_lock, || -> Result<(u32, Vec<String>), RepairError> {
+    let recovered = crate::pack_apply_lock::try_with_apply_lock(env.apply_lock, || -> Result<(u32, Vec<String>, Vec<(RepairId, String)>), RepairError> {
         let mut lines = Vec::new();
         let mut faults: Vec<(RepairId, String)> = Vec::new();
         let mut n = 0u32;
