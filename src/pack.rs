@@ -10689,10 +10689,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// ★T3(v2 §3 L0 · D11): 잠금 보안 자산(trusted-keys.json) — 백업 선행 시도하되, 백업 실패
-    /// 시에도 치유를 강행한다(무결성>보존 — §2 원칙 4 의 유일 예외). 원장 side 는 **실백업 성공
-    /// 시에만** 기록(실패 시 side 부재 + backup:"failed" — 존재하지 않는 .user 를 '보존됨'으로
-    /// 오보하지 않는다).
+    /// ★T3(v2 §3 L0 · D11) → ★T2i(RULINGS FP1): 잠금 보안 자산(trusted-keys.json) — 바이트 백업 선행. 백업이 실패하면 덮지 않고
+    /// 격리한다(종전의 '무결성 우선 치유 강행' 예외는 FP1 이 거뒀다). 원장 side 는 실백업 성공 시에만 `.user`.
     #[test]
     fn unreadable_locked_byte_backup() {
         let _g = PACK_ENV_LOCK.lock().unwrap();
@@ -10728,13 +10726,12 @@ mod tests {
             std::fs::write(pd2.join(rel), CP949).unwrap();
             std::fs::create_dir_all(pd2.join(format!("{rel}.user"))).unwrap(); // rename 결정론 실패
             install_from_iter([(rel, vendor)], false, "1.0.0", false, None).unwrap();
-            assert_eq!(std::fs::read_to_string(pd2.join(rel)).unwrap(), vendor,
-                       "②★L0: 백업 실패에도 치유 강행(무결성>보존)");
+            // ★T2i(RULINGS FP1 — 기대가 바뀜): 보관된 사본 없이는 살아 있는 파일을 덮지 않는다 — 잠금 파일도(종전: '무결성 우선'
+            //   치유 강행 + backup:"failed"). 이번 기동은 격리, 기록은 사본을 이름 대지 않는다.
+            assert_eq!(std::fs::read(pd2.join(rel)).unwrap(), CP949, "②★FP1: 백업 실패 → 덮지 않음");
             let p2 = load_merge_pending(&pd2);
-            assert_eq!(p2.get(rel).and_then(|e| e["kind"].as_str()), Some("healed"));
-            assert!(p2.get(rel).and_then(|e| e.get("side")).is_none(),
-                    "②side 부재 — 실패한 백업을 '보존됨'으로 오보 금지");
-            assert_eq!(p2.get(rel).and_then(|e| e["backup"].as_str()), Some("failed"));
+            assert_eq!(p2.get(rel).and_then(|e| e["kind"].as_str()), Some("quarantined"));
+            assert_eq!(p2.get(rel).and_then(|e| e["side"].as_str()), Some(rel), "②side = 그 파일 — 없는 사본을 이름 대지 않는다");
         }
         let _ = std::fs::remove_dir_all(&base1);
         let _ = std::fs::remove_dir_all(&base2);
