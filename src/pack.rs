@@ -4102,6 +4102,12 @@ fn anchor_dir(root: &Path, comps: &[&str], mkdirs: bool, rel_path: &str) -> std:
 /// 않으면(`EINVAL` · `ENOTSUP` · `ENOSYS`) `Unsupported` — 호출부는 놓지 않는다(보관 불가 갈래).
 #[cfg(unix)]
 fn no_replace_renameat(fd: libc::c_int, from: &std::ffi::CStr, to: &std::ffi::CStr) -> std::io::Result<()> {
+    #[cfg(test)]
+    {
+        if FAIL_NO_REPLACE_RENAME.with(|f| f.get()) {
+            return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "injected: no-replace rename unsupported"));
+        }
+    }
     #[cfg(target_os = "macos")]
     let r = unsafe { libc::renameatx_np(fd, from.as_ptr(), fd, to.as_ptr(), libc::RENAME_EXCL) };
     #[cfg(any(all(target_os = "linux", target_env = "gnu"), target_os = "android"))]
@@ -4126,6 +4132,40 @@ fn no_replace_renameat(fd: libc::c_int, from: &std::ffi::CStr, to: &std::ffi::CS
         ));
     }
     Err(e)
+}
+
+/// ★T2i(RULINGS FP1): 덮지 않는 놓기의 대체 길 — 닻 내린 폴더 기술자 안에서 마지막 이름을 배타 생성(O_CREAT | O_EXCL |
+/// O_NOFOLLOW)해 쓰고 내린다. 이미 있으면 AlreadyExists(아무것도 바뀌지 않음). 쓰기 · 내림이 실패하면 그 반쪽 파일은 남는다 —
+/// 자리의 사본으로 다음 보관이 옮긴다(지우지 않는다: 지우는 사이에 다른 쓰는 쪽이 같은 이름을 만들었을 수 있다).
+#[cfg(unix)]
+fn exclusive_create_at(d: &DirFd, leaf_c: &std::ffi::CStr, bytes: &[u8], mode: Option<u32>, exact: bool) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::io::FromRawFd;
+    #[cfg(test)]
+    {
+        if FAIL_EXCLUSIVE_FALLBACK.with(|f| f.get()) {
+            return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "injected: exclusive creation refused"));
+        }
+    }
+    let fd = unsafe {
+        libc::openat(
+            d.0,
+            leaf_c.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            mode.unwrap_or(0o644) as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
+    f.write_all(bytes)?;
+    if exact {
+        if let Some(m) = mode {
+            apply_mode_exact(&f, m)?;
+        }
+    }
+    f.sync_all()
 }
 
 /// ★T2i(RULINGS EC7 · EC2): 닻 내린 폴더 기술자의 fsync — 시험 주입(`FAIL_DIR_SYNC_FOR`, 마지막 이름 단위) · '지원하지 않음'만 Ok.
@@ -4196,8 +4236,13 @@ fn windows_move_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
         return Ok(());
     }
     let e = std::io::Error::last_os_error();
-    if matches!(e.raw_os_error(), Some(80) | Some(183)) {
+    // ★T2i(RULINGS FP5 m6): 대상 이름에 무엇이든(파일 · 폴더 · 재해석 지점) 있으면 '차 있음'(다음 세대 자리로).
+    if matches!(e.raw_os_error(), Some(80) | Some(183)) || std::fs::symlink_metadata(to).is_ok() {
         return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists));
+    }
+    // ★T2i(RULINGS FP1): ERROR_INVALID_FUNCTION(1) · ERROR_NOT_SUPPORTED(50) · ERROR_INVALID_PARAMETER(87) = 이 볼륨은 지원하지 않음.
+    if matches!(e.raw_os_error(), Some(1) | Some(50) | Some(87)) {
+        return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, e));
     }
     Err(e)
 }
@@ -4271,9 +4316,19 @@ pub fn beneath_write(
             }
         })();
         drop(f);
-        if let Err(e) = res {
-            unsafe { libc::unlinkat(d.0, tmp_c.as_ptr(), 0) };
-            return Err(e);
+        match res {
+            Ok(()) => {}
+            // ★T2i(RULINGS FP1): 덮지 않는 이름 바꾸기를 이 파일 시스템이 지원하지 않으면 — 다른 길의 덮지 않는 생성: 마지막
+            //   이름을 **배타적으로 만들고**(O_CREAT | O_EXCL | O_NOFOLLOW · 차 있으면 AlreadyExists) 그 자리에 쓰고 내린다. 쓰다 멈춘
+            //   사본은 자리의 사본(occupant)이 되어 다음 보관이 세대 자리로 옮긴다(살아 있는 파일은 보관이 끝난 뒤에만 바뀐다).
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported && place == Place::NoReplace => {
+                unsafe { libc::unlinkat(d.0, tmp_c.as_ptr(), 0) };
+                exclusive_create_at(&d, &leaf_c, bytes, mode, exact)?;
+            }
+            Err(e) => {
+                unsafe { libc::unlinkat(d.0, tmp_c.as_ptr(), 0) };
+                return Err(e);
+            }
         }
         if durable {
             sync_dir_fd(&d, leaf)?;
@@ -4314,9 +4369,20 @@ pub fn beneath_write(
             Place::Replace => std::fs::rename(&tmp, &dest),
             Place::NoReplace => windows_move_no_replace(&tmp, &dest),
         });
-        if let Err(e) = res {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e);
+        match res {
+            Ok(()) => {}
+            // ★T2i(RULINGS FP1): 덮지 않는 이동을 지원하지 않는 볼륨 — 마지막 이름을 배타 생성(CREATE_NEW)해 쓰고 내린다(핸들 증명 포함).
+            Err(e) if place == Place::NoReplace && e.kind() == std::io::ErrorKind::Unsupported => {
+                let _ = std::fs::remove_file(&tmp);
+                let mut g = create_tmp_with_mode(&dest, None)?;
+                windows_handle_sits_at(&g, root, &parts[..parts.len() - 1], leaf)?;
+                g.write_all(bytes)?;
+                g.sync_all()?;
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
         }
         let _ = (mode, exact, durable);
         Ok(())
@@ -4489,6 +4555,10 @@ thread_local! {
     /// ★T2i(RULINGS EC7) 시험 주입: 이 파일 이름의 영속 쓰기에서 부모 폴더 fsync 가 실패한 것으로 한다(스레드 단위 — 다른 시험과
     /// 섞이지 않는다).
     static FAIL_DIR_SYNC_FOR: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    /// ★T2i(RULINGS FP1) 시험 주입: 덮지 않는 이름 바꾸기가 '지원하지 않음'(EINVAL 같은 파일 시스템)인 것으로 한다.
+    static FAIL_NO_REPLACE_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// ★T2i(RULINGS FP1) 시험 주입: 그 대체 길(마지막 이름의 배타 생성)도 실패한 것으로 한다.
+    static FAIL_EXCLUSIVE_FALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// ★T2i(RULINGS EC7): 영속 쓰기의 부모 폴더 fsync — 실패를 돌려준다('지원하지 않음'만 Ok).
@@ -5049,6 +5119,9 @@ fn move_occupant_to_slot(
             Ok(()) => return Ok(Some(slot)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+                return Err(format!("기존 {rel}.user 를 덮지 않고 옮기는 것을 이 파일 시스템이 지원하지 않습니다({e})"))
+            }
             Err(e) => return Err(format!("기존 {rel}.user 세대 보존 실패({e})")),
         }
     }
@@ -5133,8 +5206,12 @@ fn park_copy_at(
             break;
         }
         hook(ParkStep::BeforeMove(attempt));
-        if let Some(slot) = move_occupant_to_slot(dir, rel, ts, &mut |_| {})? {
-            moved.push(slot);
+        match move_occupant_to_slot(dir, rel, ts, &mut |_| {}) {
+            Ok(Some(slot)) => moved.push(slot),
+            Ok(None) => {}
+            // ★T2i(RULINGS FP1): 덮지 않는 이동을 지원하지 않으면 자리의 사본은 그대로 두고, 이 사본을 자기 세대 자리에(배타 생성).
+            Err(e) if e.contains("지원하지 않") => break,
+            Err(e) => return Err(e),
         }
     }
     // 자리가 끝내 비지 않았다 — 자기 사본은 자기 세대 자리로, 겹침은 감사 원장에.
@@ -6818,11 +6895,12 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                 if let Some(d) = user_src.as_deref() {
                     let user_path = dir.join(format!("{rel}.user"));
                     if read_start_meta(&user_path).text().as_deref() != Some(d) {
-                        // ★T2i(RULINGS EC2): 덮지 않는 보관(차 있으면 세대 자리로 — 어느 사본도 덮이지 않는다).
-                        let backup = park_copy(&dir, rel, d.as_bytes(), false).map(|_| ());
+                        // ★T2i(RULINGS EC2 · FP5 m9 · FP1): 덮지 않는 보관 · vendor 우선이므로 영속 증명(EC7) · 보관이 안 되면
+                        //   캡처가 있든 없든 덮지 않는다(기록은 사본이 있을 때만 그 사본을 이름 댄다).
+                        let backup = park_copy(&dir, rel, d.as_bytes(), true).map(|_| ());
                         match backup {
                             Ok(()) => {}
-                            Err(e) if fallback_reason == "capture-failed" => {
+                            Err(e) => {
                                 // ★성찰 차단 수리 2R-5(v2 §2 원칙 4 — 백업 불가면 덮지 않는다):
                                 // capture-failed 레인은 ①캡처가 없어 .user 가 유일 보존본인데 그
                                 // 쓰기 실패가 best-effort 로 침묵 통과되면 아래 공용 레인의 vendor
@@ -6840,13 +6918,6 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                                 }
                                 kept += 1;
                                 continue;
-                            }
-                            Err(e) => {
-                                // 캡처 실재 레인(충돌·게이트·pristine 실패): 사용자 바이트는 ①캡처가
-                                // 이미 보존하므로 .user 는 이차 사본 — 종전 best-effort 유지하되
-                                // 침묵은 금지(v2 §2 원칙 5 · loud 경고 — 원장 side 는 기록되므로
-                                // doctor·사용자가 .user 부재를 관측·추적 가능).
-                                eprintln!("[init-pack] ⚠ {rel}: .user 백업 기록 실패({e}) — 사용자본은 병합 캡처에 보존(원장 capture 경로 참조)");
                             }
                         }
                     }
@@ -6889,8 +6960,18 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                     if let Some(d) = disk.as_deref() {
                         let user_path = dir.join(format!("{rel}.user"));
                         if read_start_meta(&user_path).text().as_deref() != Some(d) {
-                            // ★T2i(RULINGS EC2): 덮지 않는 보관.
-                            let _ = park_copy(&dir, rel, d.as_bytes(), false);
+                            // ★T2i(RULINGS EC2 · FP1): 덮지 않는 보관 — 보관이 안 되면 덮지 않는다(잠금 파일도: 이번 기동은 격리).
+                            if let Err(e) = park_copy(&dir, rel, d.as_bytes(), false) {
+                                eprintln!("[init-pack] ⚠ 격리(quarantined): {rel} — 사용자 수정본을 보관하지 못했습니다({e}). 파일 무접촉 보존 — 보관 가능 회복 후 재스윕 시 정상 치유 대상.");
+                                if let serde_json::Value::Object(entry) = serde_json::json!({
+                                    "kind": "quarantined", "reason": "backup-failed", "side": rel,
+                                    "version": target_version, "ts": now_ts,
+                                }) {
+                                    upsert_pending_v2(&mut pending, &mut pending_dirty, rel, entry);
+                                }
+                                kept += 1;
+                                continue;
+                            }
                         }
                         // ★T3(D7): healed upsert 는 계보 인지 헬퍼 경유 — 크래시 창 재스윕 healed 가
                         // 영속된 merged 항목의 capture 포인터를 지우는 창의 봉인(v2 §4 공통 적용 규칙).
@@ -6917,19 +6998,8 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                                     upsert_pending_v2(&mut pending, &mut pending_dirty, rel, entry);
                                 }
                             }
-                            Err(e) if system_locked(rel) => {
-                                // ★L0(v2 §3): 보안 자산은 백업 실패에도 치유 강행(무결성>보존 —
-                                // §2 원칙 4 의 명시 예외). 원장 side 는 **실백업 성공 시에만**
-                                // "{rel}.user" — 실패는 side 없이 backup:"failed" 기록(존재하지
-                                // 않는 .user 를 '보존됨'으로 오보하지 않는다 · D11).
-                                eprintln!("[init-pack] ⚠ 보안 자산 {rel}: 바이트 백업 실패({e}) — 무결성 우선으로 치유 강행(v2 §2 원칙 4 예외)");
-                                if let serde_json::Value::Object(entry) = serde_json::json!({
-                                    "kind": "healed", "backup": "failed",
-                                    "version": target_version, "ts": now_ts,
-                                }) {
-                                    upsert_pending_v2(&mut pending, &mut pending_dirty, rel, entry);
-                                }
-                            }
+                            // ★T2i(RULINGS FP1): 잠금 보안 자산도 보관 없이는 덮지 않는다(종전 '무결성 우선 치유 강행'
+                            //   예외를 거둔다) — 이번 기동은 격리 · 보관 가능 회복 후 재스윕이 치유한다.
                             Err(e) => {
                                 // ★D11 quarantined 전이(fail-closed): 백업 없이는 덮지 않는다 —
                                 // write/manifest.insert/ensure_pristine/written 증가 전부 스킵.
@@ -15281,6 +15351,72 @@ mod m11_tests {
         let e = beneath_write(&rig.pack, "hooks/n.sh", b"NEW", None, false, Place::NoReplace, false).unwrap_err();
         assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(rig.read("hooks/n.sh").as_deref(), Some("OLD"));
+    }
+
+    /// ★T2i(RULINGS FP1): 덮지 않는 이름 바꾸기를 파일 시스템이 지원하지 않아도(시험 주입) 사본은 다른 길로 보관된다 — 마지막 이름의
+    /// 배타 생성. 자리에 다른 사본이 있으면 그것은 그대로 두고 이 사본은 자기 세대 자리에(겹침 기록). 그 다른 길마저 막히면 아무것도
+    /// 덮지 않는다: vendor 우선 · 잠금 파일 치유의 두 갈래(판독 가능 · 판독 불가) 모두 격리, 사본을 이름 대는 기록 없음.
+    /// `--missing-only` 의 쓰기(`write_pack_file_beneath` · 덮지 않음)도 그 길로 만든다.
+    #[test]
+    fn fp1_without_the_no_replace_rename_the_copy_is_still_parked_and_nothing_live_is_overwritten_without_it() {
+        struct Inject;
+        impl Drop for Inject {
+            fn drop(&mut self) {
+                FAIL_NO_REPLACE_RENAME.with(|f| f.set(false));
+                FAIL_EXCLUSIVE_FALLBACK.with(|f| f.set(false));
+            }
+        }
+        let _reset = Inject;
+        let rig = Rig::new("fp1");
+        let rel = "hooks/x.sh";
+        // ① 이름 바꾸기 지원 없음 → 배타 생성으로 보관.
+        FAIL_NO_REPLACE_RENAME.with(|f| f.set(true));
+        let out = park_copy(&rig.pack, rel, b"W\n", false).unwrap();
+        assert_eq!((out.at.as_str(), out.overlap), ("hooks/x.sh.user", false));
+        assert_eq!(rig.read("hooks/x.sh.user").as_deref(), Some("W\n"));
+        // 자리에 다른 사본(U) → U 는 그대로, W2 는 자기 세대 자리에 + 겹침 기록.
+        let out = park_copy(&rig.pack, rel, b"W2\n", false).unwrap();
+        assert!(out.overlap, "{out:?}");
+        assert_eq!(rig.read("hooks/x.sh.user").as_deref(), Some("W\n"), "자리의 사본은 그대로");
+        assert_eq!(std::fs::read_to_string(rig.pack.join(&out.at)).unwrap(), "W2\n");
+        // `--missing-only` 의 쓰기: 없던 파일은 만들고, 있으면 차 있음(무변경).
+        write_pack_file_beneath(&rig.pack, "bin/fresh.py", b"print(1)\n", None, true, Place::NoReplace).unwrap();
+        assert_eq!(rig.read("bin/fresh.py").as_deref(), Some("print(1)\n"));
+        let e = write_pack_file_beneath(&rig.pack, "bin/fresh.py", b"X", None, true, Place::NoReplace).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(rig.read("bin/fresh.py").as_deref(), Some("print(1)\n"));
+        // ② 다른 길도 막힘 → 보관 실패.
+        FAIL_EXCLUSIVE_FALLBACK.with(|f| f.set(true));
+        assert!(park_copy(&rig.pack, "hooks/y.sh", b"Y\n", false).is_err());
+        assert!(!rig.pack.join("hooks/y.sh.user").exists());
+        // vendor 우선: 살아 있는 파일 무변경 · 격리 · 사본 없음.
+        let vf = "hooks/inject.sh";
+        rig.write(vf, b"#!/bin/bash\necho MINE\n");
+        rig.install(&[(vf, "#!/bin/bash\necho V1\n")], false, &UpdateSources::none().with_boot_critical(bc_only(&["hooks/inject.sh"])));
+        assert_eq!(rig.read(vf).as_deref(), Some("#!/bin/bash\necho MINE\n"), "vendor 우선: 보관 없이는 덮지 않는다");
+        assert_eq!(rig.kind(vf).as_deref(), Some("quarantined"));
+        assert!(!rig.pack.join(format!("{vf}.user")).exists(), "사본 없음");
+        // 잠금 파일(판독 가능): 보관 실패 → 덮지 않음 · 격리 · '.user' 를 이름 대는 기록 없음.
+        let locked = "trusted-keys.json";
+        rig.write(locked, b"{\"keys\": [\"MINE\"]}\n");
+        rig.manifest(&[(locked, "{\"keys\": []}\n")]);
+        rig.install(&[(locked, "{\"keys\": [\"VENDOR\"]}\n")], false, &UpdateSources::none());
+        assert_eq!(rig.read(locked).as_deref(), Some("{\"keys\": [\"MINE\"]}\n"), "잠금 파일도 보관 없이는 덮지 않는다");
+        let e = rig.entry(locked).unwrap();
+        assert_eq!(e["kind"], "quarantined", "{e}");
+        assert_ne!(e["side"], serde_json::json!(format!("{locked}.user")), "없는 사본을 이름 대지 않는다");
+        // 잠금 파일(판독 불가 — UTF-8 아님): 같은 규칙.
+        rig.write(locked, b"\xff\xfe\x00keys\n");
+        rig.install(&[(locked, "{\"keys\": [\"VENDOR\"]}\n")], false, &UpdateSources::none());
+        assert_eq!(std::fs::read(rig.pack.join(locked)).unwrap(), b"\xff\xfe\x00keys\n", "판독 불가 잠금 파일도 덮지 않는다");
+        assert_eq!(rig.kind(locked).as_deref(), Some("quarantined"));
+        // 주입을 풀면 같은 스윕이 보관하고 치유한다.
+        FAIL_NO_REPLACE_RENAME.with(|f| f.set(false));
+        FAIL_EXCLUSIVE_FALLBACK.with(|f| f.set(false));
+        rig.install(&[(locked, "{\"keys\": [\"VENDOR\"]}\n")], false, &UpdateSources::none());
+        assert_eq!(rig.read(locked).as_deref(), Some("{\"keys\": [\"VENDOR\"]}\n"));
+        assert_eq!(std::fs::read(rig.pack.join(format!("{locked}.user"))).unwrap(), b"\xff\xfe\x00keys\n", "사본이 있고 나서야 치유");
+        assert_eq!(rig.kind(locked).as_deref(), Some("healed"));
     }
 
     /// ★T2i(RULINGS EC7): vendor 우선의 선저장은 **영속이 증명돼야** 한다 — 원장 쓰기의 부모 폴더 fsync 가 실패하면(시험 주입)
