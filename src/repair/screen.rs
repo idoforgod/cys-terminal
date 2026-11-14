@@ -917,6 +917,7 @@ fn run_hook_probe_inner(
             ("SHELL".into(), "/bin/sh".into()),
             ("LANG".into(), "en_US.UTF-8".into()),
             ("LC_ALL".into(), "en_US.UTF-8".into()),
+            ("PYTHONDONTWRITEBYTECODE".into(), "1".into()),
             ("CYS_SURFACE_ID".into(), "7".into()),
             ("CYS_ROLE".into(), role_env.into()),
             (
@@ -1067,6 +1068,7 @@ fn run_backstop_probe(
                 ("SHELL".into(), "/bin/sh".into()),
                 ("LANG".into(), "en_US.UTF-8".into()),
                 ("LC_ALL".into(), "en_US.UTF-8".into()),
+                ("PYTHONDONTWRITEBYTECODE".into(), "1".into()),
                 ("CYS_SURFACE_ID".into(), "7".into()),
                 ("CYS_ROLE".into(), "worker".into()),
                 (
