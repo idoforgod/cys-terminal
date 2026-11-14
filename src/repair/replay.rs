@@ -223,10 +223,11 @@ pub fn write_stub_conf(dir: &Path, role: &str, status_holds: bool) -> Result<(),
         .map_err(|e| RepairError::Io(format!("{}: {e}", dir.display())))
 }
 
-/// The lines the stub logged (one per call).
+/// The lines the stub logged (one per call) — read through the bounded reader (RULINGS EL3 / EO4:
+/// candidate code could replace the log with a FIFO).
 pub fn stub_calls(dir: &Path) -> Vec<String> {
-    std::fs::read_to_string(dir.join("cys-calls.log"))
-        .map(|t| t.lines().map(str::to_string).collect())
+    read_bounded(&dir.join("cys-calls.log"))
+        .map(|b| String::from_utf8_lossy(&b).lines().map(str::to_string).collect())
         .unwrap_or_default()
 }
 
@@ -1103,7 +1104,7 @@ pub fn real_settings_targets(lane: &Path, home: &Path) -> Vec<PathBuf> {
 /// Opens `p` without following a link and without blocking (a FIFO swapped in cannot hang the
 /// thread — the class of RULINGS CW3); the caller re-checks the kind on the handle.
 #[cfg(unix)]
-fn open_nofollow_nonblock(p: &Path) -> std::io::Result<std::fs::File> {
+pub(crate) fn open_nofollow_nonblock(p: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     std::fs::OpenOptions::new()
         .read(true)
@@ -1112,7 +1113,7 @@ fn open_nofollow_nonblock(p: &Path) -> std::io::Result<std::fs::File> {
 }
 
 #[cfg(not(unix))]
-fn open_nofollow_nonblock(p: &Path) -> std::io::Result<std::fs::File> {
+pub(crate) fn open_nofollow_nonblock(p: &Path) -> std::io::Result<std::fs::File> {
     std::fs::File::open(p)
 }
 
@@ -1148,6 +1149,20 @@ const MAX_READ: u64 = 64 * 1024 * 1024;
 /// the SAME no-follow, non-blocking handle (a link is reported as a link from `lstat`; a missing
 /// path is absent; anything that is not a regular file on the opened handle is refused). Nothing is
 /// opened twice, so the bytes laid out, hashed and compared are the bytes that were stamped.
+/// RULINGS EL3 — THE way the screen and the replay read a file a candidate could have produced (the
+/// scratch settings, the templates, the stub's log, every other scratch file): [`read_stamped`] —
+/// no link followed, a non-blocking open, a regular file, a size cap — and anything else (a FIFO, a
+/// link, a missing file) is an error at once.
+pub fn read_bounded(p: &Path) -> Result<Vec<u8>, RepairError> {
+    match read_stamped(p)? {
+        (LaidSource::Bytes { bytes, .. }, _) => Ok(bytes),
+        _ => Err(RepairError::Precondition(format!(
+            "{}: not a regular file",
+            p.display()
+        ))),
+    }
+}
+
 pub fn read_stamped(p: &Path) -> Result<(LaidSource, String), RepairError> {
     let io = |e: std::io::Error| RepairError::Io(format!("{}: {e}", p.display()));
     let lmeta = match std::fs::symlink_metadata(p) {

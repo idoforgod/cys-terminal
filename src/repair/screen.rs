@@ -262,8 +262,8 @@ pub fn write_verdict_in(
     v.schema = SCREEN_SCHEMA;
     crate::atomic_write_json(&p, &v)
         .map_err(|e| RepairError::Io(format!("{}: {e}", p.display())))?;
-    let f =
-        std::fs::File::open(&p).map_err(|e| RepairError::Io(format!("{}: {e}", p.display())))?;
+    let f = replay::open_nofollow_nonblock(&p)
+        .map_err(|e| RepairError::Io(format!("{}: {e}", p.display())))?;
     super::ledger::full_flush_file(&f)
         .map_err(|e| RepairError::Io(format!("{}: {e}", p.display())))?;
     super::ledger::full_flush_dir(&super::ledger::repair_dir_in(root, id))
@@ -1975,7 +1975,7 @@ pub(crate) fn hook_runs_gate(h: &serde_json::Value, gate: &Path) -> bool {
 /// [`hook_runs_gate`])? `disableAllHooks: true` runs no hook at all. `None` = the file is not
 /// readable JSON.
 fn gate_registered(settings: &Path, pack: &Path) -> Option<bool> {
-    let text = std::fs::read(settings).ok()?;
+    let text = replay::read_bounded(settings).ok()?;
     let v: serde_json::Value = serde_json::from_slice(&text).ok()?;
     if v.get("disableAllHooks").and_then(|d| d.as_bool()) == Some(true) {
         return Some(false);
@@ -2021,7 +2021,7 @@ struct ExecCtx<'p> {
 /// or left something behind, and no deny elsewhere). The stub answers the probe's role during the
 /// probe and the registrar's again afterwards.
 fn gate_executes(r: &Runner<'_>, settings: &Path, x: &ExecCtx<'_>, registrar_stub: (&str, bool)) -> Option<bool> {
-    let text = std::fs::read(settings).ok()?;
+    let text = replay::read_bounded(settings).ok()?;
     let v: serde_json::Value = serde_json::from_slice(&text).ok()?;
     if v.get("disableAllHooks").and_then(|d| d.as_bool()) == Some(true) {
         return Some(false);
@@ -2389,7 +2389,7 @@ fn i3_template(r: &Runner<'_>, released: &Files) -> Option<String> {
             return None;
         }
         drop(sock);
-        let text = std::fs::read_to_string(&settings).ok()?;
+        let text = String::from_utf8(replay::read_bounded(&settings).ok()?).ok()?;
         Some(text.replace(&*pack.to_string_lossy(), PACK_PLACEHOLDER))
     })();
     // RULINGS CZ4: an unclean run gives no template (every I3 probe is then not measurable)
