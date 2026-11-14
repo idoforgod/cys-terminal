@@ -854,10 +854,14 @@ impl PackRoots {
     }
 
     /// The rel of a LITERAL path inside this lane's pack that names a hook / script. Linear in the path.
+    /// RULINGS DD2: the operand must already be in canonical form — the normalised rel equals the operand as
+    /// written (no empty, `.` or trailing component), so the file looked up is exactly the operand the
+    /// interpreter receives (`…/javis_task.py/` and `…/javis_task.py/.` are directories to it).
     fn literal_rel(&self, path: &str, steps: &mut usize) -> Option<String> {
         *steps += path.len();
         let p = self.prefixes.iter().find(|p| path.starts_with(p.as_str()))?;
-        let rel = cys::repair::intake::normalize_rel(&path[p.len()..]).ok()?;
+        let raw = &path[p.len()..];
+        let rel = cys::repair::intake::normalize_rel(raw).ok().filter(|rel| rel == raw)?;
         is_script_rel(&rel).then_some(rel)
     }
 
@@ -924,7 +928,11 @@ fn is_script_rel(rel: &str) -> bool {
 //              two characters `~/`
 //   '…'     := single-quoted, no `'` and no control character (newline, CR, NUL, ESC …) inside
 //   "…"     := double-quoted, none of `$` backtick `\` `!` `"` and no control character inside
-// script    := a word of bare parts only: a LITERAL path in THIS lane's pack (`PackRoots`)
+// script    := a word of bare parts only: a LITERAL path in THIS lane's pack (`PackRoots`), written in
+//              canonical form — no empty, `.` or trailing component (RULINGS DD2: the operand as given)
+// words     := none of them `--`, and after a FORWARDING script (`FORWARDERS` — it executes its arguments
+//              as a command) the first one is one of that script's own verbs (RULINGS DD2: only a failure
+//              that is the script's own; a call that hands its tail to another program is a miss)
 // interpreter := python | python3 | py | bash | node | pwsh — bare, or a literal absolute path ending
 //              in one of them; its flags only from its fixed list; it runs only its own script types:
 //              `.py` ← python / python3 / py · `.sh` `.bash` ← bash · `.js` `.mjs` `.cjs` ← node ·
@@ -971,6 +979,31 @@ impl Interpreter {
     fn runs(&self, rel: &str) -> bool {
         let file = rel.rsplit('/').next().unwrap_or(rel);
         file.rsplit_once('.').is_some_and(|(stem, ext)| !stem.is_empty() && self.scripts.contains(&ext))
+    }
+}
+
+/// RULINGS DD2 — the pack's FORWARDING scripts and their OWN verbs: called with anything else as the first
+/// argument they execute their arguments as a command, so the exit is the child's — `cys-dept <dept> [--]
+/// <command>` (`exec "$@"`, `cysjavis-pack/bin/cys-dept:4111–4147`; its verbs are its `case` arms
+/// `:3571–4110`), `_owned_process.py <command…>` (argparse `REMAINDER`, `bin/_owned_process.py:639` — no verb of
+/// its own). A forwarder gets an identity only with one of its own verbs as the first argument.
+pub const FORWARDERS: &[(&str, &[&str])] = &[
+    (
+        "bin/cys-dept",
+        &["launch", "allocate", "create", "down", "down-sock", "rotate", "reap", "promote-ceo", "promote-if-pending", "list", "cwd", "sock"],
+    ),
+    ("bin/_owned_process.py", &[]),
+];
+
+/// RULINGS DD2 — the call's failure is the script's OWN: no argument word `--` (it hands the rest of the call to
+/// another program), and a forwarder only with one of its own verbs first.
+fn owns_its_failure(rel: &str, args: &[(&str, bool)]) -> bool {
+    if args.iter().any(|(t, _)| *t == "--") {
+        return false;
+    }
+    match FORWARDERS.iter().find(|(r, _)| *r == rel) {
+        Some((_, verbs)) => args.first().is_some_and(|(t, _)| verbs.contains(t)),
+        None => true,
     }
 }
 
@@ -1153,6 +1186,9 @@ fn parse_call(toks: &[Tok], roots: &PackRoots, steps: &mut usize) -> Option<Pack
     // neither — it is no pack path and no interpreter name, so the call gets no identity
     let (prog, prog_bare) = *words.first()?;
     if let Some(rel) = script(words.first(), steps) {
+        if !owns_its_failure(&rel, &words[1..]) {
+            return None; // RULINGS DD2: the tail goes to another program
+        }
         return Some(PackCall::One { rel, sub: sub(1) });
     }
     let interp = prog_bare.then(|| interpreter_of(prog)).flatten()?;
@@ -1166,6 +1202,9 @@ fn parse_call(toks: &[Tok], roots: &PackRoots, steps: &mut usize) -> Option<Pack
     let rel = script(words.get(j), steps)?;
     if !interp.runs(&rel) {
         return None; // not the script's own interpreter (RULINGS BY1): the caller's choice
+    }
+    if !owns_its_failure(&rel, words.get(j + 1..).unwrap_or(&[])) {
+        return None; // RULINGS DD2: the tail goes to another program
     }
     Some(PackCall::One { rel, sub: sub(j + 1) })
 }
@@ -2297,7 +2336,7 @@ mod defect_intake_tests {
         ("/Users/x/.cys/pack/bin/x.cjs", "bin/x.cjs", Some("cjs")),
         ("~/.cys/pack/bin/x.ps1", "bin/x.ps1", Some("ps1")),
         ("/Users/x/.cys/pack/hooks/h.ps1", "hooks/h.ps1", Some("ps1")),
-        ("~/.cys/pack/bin/cys-dept", "bin/cys-dept", None),
+        ("~/.cys/pack/bin/cys-helper", "bin/cys-helper", None),
         ("/Users/x/.cys/pack/bin/tool", "bin/tool", None),
     ];
 
@@ -2483,6 +2522,9 @@ mod defect_intake_tests {
                 "node ~/.cys/pack/bin/a.py".to_string(),
                 "python3 ~/.cys/pack/hooks/x.sh".to_string(),
                 "bash ~/.cys/pack/bin/cys-dept".to_string(),
+                // RULINGS DD2 — the J7 verdict's two sequences, verbatim
+                "python3 ~/.cys/pack/bin/javis_task.py/".to_string(),
+                "~/.cys/pack/bin/cys-dept dept-1 -- /usr/bin/false".to_string(),
             ]
             .into_iter(),
         );
@@ -2503,7 +2545,7 @@ mod defect_intake_tests {
             assert_eq!(pack_call(&bash(c), &base()), PackCall::None, "outside the grammar but identified: {c:?}");
             assert_eq!(classify(&pre(&bash(c)), &base(), false), Classified::Ignored { failure: false }, "counted as a call: {c:?}");
         }
-        assert_eq!(negatives.len(), 22 + 65 + 26 + 1);
+        assert_eq!(negatives.len(), 22 + 67 + 26 + 1);
     }
 
     /// RULINGS CC2 — the named script must be a REAL file of this lane's pack when the call is
@@ -2526,7 +2568,7 @@ mod defect_intake_tests {
         let x = bash("python3 ~/.cys/pack/bin/javis_x.py check");
         assert_eq!(pack_call(&x, &roots), one("bin/javis_x.py", Some("check")));
         assert_eq!(pack_call(&bash(&format!("python3 {p}/bin/javis_x.py check")), &roots), one("bin/javis_x.py", Some("check")));
-        assert_eq!(pack_call(&bash(&format!("{p}/bin/cys-dept status")), &roots), one("bin/cys-dept", Some("status")));
+        assert_eq!(pack_call(&bash(&format!("{p}/bin/cys-dept list")), &roots), one("bin/cys-dept", Some("list")));
         assert_eq!(pack_call(&bash("bash ~/.cys/pack/hooks/guard.sh"), &roots), one("hooks/guard.sh", None));
         assert_eq!(classify(&pre(&x), &roots, false), Classified::Call { rel: "bin/javis_x.py".into() });
         assert!(matches!(classify(&fail(&x, Some("Exit code 1\nKeyError: 'k'")), &roots, false), Classified::Failure { .. }));
@@ -2557,6 +2599,56 @@ mod defect_intake_tests {
         std::fs::remove_file(pack.join("bin/javis_x.py")).unwrap();
         assert_eq!(pack_call(&x, &roots), PackCall::None);
         assert_eq!(classify(&pre(&x), &roots, false), Classified::Ignored { failure: false });
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// RULINGS DD2 (J7 I1, I2) — an identity only for the operand AS GIVEN, and never for a command that hands its
+    /// tail to another program: the verdict's two sequences verbatim (`python3 <pack>/bin/javis_task.py/`,
+    /// `<pack>/bin/cys-dept dept-1 -- /usr/bin/false`), the `/.` spelling, other non-canonical spellings, a `--`
+    /// passthrough of any script, `cys-dept <dept> <command>` without `--`, the pack's other forwarder; each also
+    /// with the production `PackRoots::new` on a temp pack where every named file EXISTS. Still identified:
+    /// `cys-dept`'s own verbs and the canonical operand.
+    #[test]
+    fn dd2_an_identity_only_for_the_operand_as_given_and_never_for_a_forwarded_command() {
+        let home = tmp_root("dd2");
+        let pack = home.join(".cys").join("pack");
+        for rel in ["bin/javis_task.py", "bin/cys-dept", "bin/javis_x.py", "bin/_owned_process.py"] {
+            let f = pack.join(rel);
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(&f, b"#\n").unwrap();
+        }
+        let roots = PackRoots::new(Some(&pack.to_string_lossy()), Some(&home.to_string_lossy()));
+        let p = pack.to_string_lossy().to_string();
+        let negatives = [
+            // the verdict's two sequences, verbatim
+            format!("python3 {p}/bin/javis_task.py/"),
+            format!("{p}/bin/cys-dept dept-1 -- /usr/bin/false"),
+            // directory-forcing and other non-canonical spellings of an existing script
+            format!("python3 {p}/bin/javis_task.py/."),
+            "python3 ~/.cys/pack/bin/javis_task.py/".to_string(),
+            format!("python3 {p}/bin//javis_x.py"),
+            format!("python3 {p}/bin/./javis_x.py"),
+            // a command that hands its tail to another program
+            format!("{p}/bin/cys-dept dept-1 /usr/bin/false"),
+            format!("~/.cys/pack/bin/cys-dept dept-1 -- python3 {p}/bin/javis_x.py"),
+            format!("python3 {p}/bin/javis_x.py run -- x"),
+            format!("python3 {p}/bin/javis_x.py run '--'"),
+            format!("python3 {p}/bin/_owned_process.py --budget 5 /usr/bin/false"),
+        ];
+        for c in &negatives {
+            let input = bash(c);
+            assert_eq!(pack_call(&input, &roots), PackCall::None, "identified: {c:?}");
+            assert_eq!(classify(&pre(&input), &roots, false), Classified::Ignored { failure: false }, "counted as a call: {c:?}");
+            assert_eq!(classify(&fail(&input, Some("Exit code 1\nE: x")), &roots, false), Classified::Ignored { failure: true }, "{c:?}");
+        }
+        // with the fictional base lane (scripts taken as present) the spelling alone refuses
+        for c in ["python3 ~/.cys/pack/bin/javis_task.py/", "python3 ~/.cys/pack/bin/javis_task.py/.", "~/.cys/pack/bin/cys-dept dept-1 -- /usr/bin/false", "~/.cys/pack/bin/cys-dept dept-1 /usr/bin/false"] {
+            assert_eq!(pack_call(&bash(c), &base()), PackCall::None, "identified: {c:?}");
+        }
+        // still identified: the wrapper's own verbs, the canonical operand
+        assert_eq!(pack_call(&bash(&format!("{p}/bin/cys-dept list")), &roots), one("bin/cys-dept", Some("list")));
+        assert_eq!(pack_call(&bash("~/.cys/pack/bin/cys-dept create team-x"), &roots), one("bin/cys-dept", Some("create")));
+        assert_eq!(pack_call(&bash(&format!("python3 {p}/bin/javis_task.py checkout 7")), &roots), one("bin/javis_task.py", Some("checkout")));
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -2726,7 +2818,11 @@ mod defect_intake_tests {
                 return None;
             }
             let p = prefixes.iter().find(|p| w.0.starts_with(p.as_str()))?;
-            let rel = cys::repair::intake::normalize_rel(&w.0[p.len()..]).ok()?;
+            let raw = &w.0[p.len()..];
+            let rel = cys::repair::intake::normalize_rel(raw).ok()?;
+            if rel != raw {
+                return None; // DD2: the operand as given
+            }
             let file = rel.rsplit('/').next()?;
             let ok = match file.rsplit_once('.') {
                 Some((stem, ext)) => !stem.is_empty() && ["py", "sh", "bash", "js", "mjs", "cjs", "ps1"].contains(&ext),
@@ -2735,9 +2831,15 @@ mod defect_intake_tests {
             ok.then_some(rel)
         };
         let sub = |j: usize| words.get(j).filter(|w| !w.0.is_empty() && !w.0.starts_with('-')).map(|w| w.0.chars().take(64).collect::<String>());
+        // DD2: no `--` among the script's arguments; a forwarder only with one of its own verbs first
+        let owned = |rel: &str, from: usize| -> bool {
+            let args = words.get(from..).unwrap_or(&[]);
+            !args.iter().any(|w| w.0 == "--")
+                && FORWARDERS.iter().find(|(r, _)| *r == rel).is_none_or(|(_, verbs)| args.first().is_some_and(|w| verbs.contains(&w.0.as_str())))
+        };
         let prog = words.get(i)?;
         if let Some(rel) = script_rel(prog) {
-            return Some((rel, sub(i + 1)));
+            return owned(&rel, i + 1).then(|| (rel.clone(), sub(i + 1)));
         }
         if !prog.1 {
             return None;
@@ -2753,7 +2855,7 @@ mod defect_intake_tests {
         }
         let rel = script_rel(words.get(j)?)?;
         let ext = rel.rsplit('/').next()?.rsplit_once('.').map(|(_, e)| e);
-        if !own(name, ext) {
+        if !own(name, ext) || !owned(&rel, j + 1) {
             return None;
         }
         Some((rel, sub(j + 1)))
@@ -2794,6 +2896,7 @@ mod defect_intake_tests {
             "$CYS_PACK_DIR/bin/a.py", "A=1", "B='x y'", "C=\"z\"", "'quoted arg'", "\"dq arg\"", "arg", "--flag=v", "2>&1",
             ">/dev/null", ">", "/dev/null", "2>/dev/null", "&>/dev/null", "1>/dev/null", "check", "日本", "é", "~/x", "=x",
             "'tab\there'", "\"nl\nhere\"", "UID=0", "PATH=/x", "~/.cys/pack/bin/x.js", "~/.cys/pack/bin/x.ps1",
+            "--", "list", "create", "~/.cys/pack/bin/a.py/", "~/.cys/pack/bin/./a.py",
         ];
         let assigns = ["", "", "", "", "", "A=1", "UID=0", "B='x y'", "PATH=/x", "1A=x", "A=$x"];
         let heads = ["", "", "python3", "python3 -u -B", "/usr/bin/python3", "bash", "bash -x", "zsh -f", "node", "node --no-warnings", "pwsh -NoProfile", "py -u", "py -3", "py -u -3", "python3 -c", "sh", "sh -s", "env"];
@@ -2801,7 +2904,7 @@ mod defect_intake_tests {
             "~/.cys/pack/bin/a.py", "/Users/x/.cys/pack/bin/javis_x.py", "/Users/x/.cys/pack/hooks/g.sh", "~/.cys/pack/bin/b.bash",
             "~/.cys/pack/bin/x.js", "/Users/x/.cys/pack/bin/x.mjs", "~/.cys/pack/bin/x.ps1", "~/.cys/pack/bin/cys-dept",
             "~/.cys/pack-dept-a/bin/a.py", "/tmp/x.py", "$CYS_PACK_DIR/bin/a.py", "\"~/.cys/pack/bin/a.py\"",
-            "~/.cys/pack/bin/gone.py",
+            "~/.cys/pack/bin/gone.py", "~/.cys/pack/bin/a.py/", "/Users/x/.cys/pack/bin//javis_x.py",
         ];
         let redirs = ["", "", "2>&1", ">/dev/null", "> /dev/null", "2>/dev/null", "&>/dev/null", ">&2", "> out"];
         let seps = [" ", " ", "\t", "  "];
@@ -3380,6 +3483,7 @@ mod defect_intake_tests {
             "fn withdraw_call(",
             "fn bounded_error(",
             "pub fn rejected_arguments(",
+            "fn owns_its_failure(",
         ] {
             let b = body(head);
             for n in io.iter().chain(send.iter()) {
