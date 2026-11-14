@@ -498,7 +498,56 @@ START_017768BF = ("exec \"$CYS_PY\" -B -s - <<'PYEOF'\nimport sys\n"
 START_DBEC50E0 = "exec \"$CYS_PY\" - <<'PYEOF'\n"
 
 
-class JudgeIsolation(_Env):
+class _PlantedVectors:
+    """RULINGS DY1 / ES1 — what a seat can put in an interpreter's environment or in a folder it can
+    write: each vector plants modules that append to a marker file when they run (no tests here)."""
+
+    def _planted(self, d, marker, tag, mods=("json", "hashlib", "tempfile", "re", "sitecustomize", "usercustomize")):
+        d.mkdir(parents=True, exist_ok=True)
+        for mod in mods:
+            (d / ("%s.py" % mod)).write_text("open(%r, 'a').write(%r)\nraise SystemExit(0)\n"
+                                            % (str(marker), "%s:%s\n" % (tag, mod)), encoding="utf-8")
+        return d
+
+    def vectors(self, marker):
+        """(name, extra env, working directory) — every folder below is inside the reviewer's allowed temp dir."""
+        t = self.tmpdir
+        ws = t / "review-ws"
+        ws.mkdir(exist_ok=True)
+        ver = "%d.%d" % sys.version_info[:2]
+        home = t / "home-plant"
+        # an interpreter that took this PYTHONHOME would import `encodings` from it first
+        self._planted(home / "lib" / ("python" + ver) / "encodings", marker, "PYTHONHOME", mods=("__init__",))
+        ub = t / "userbase"
+        r = subprocess.run([sys.executable, "-I", "-S", "-c", "import site; print(site.getusersitepackages())"],
+                           env=dict(self.env, PYTHONUSERBASE=str(ub)), capture_output=True, text=True, timeout=30)
+        usersite = Path(r.stdout.strip())
+        self.assertTrue(str(usersite).startswith(str(ub)), "user site does not follow PYTHONUSERBASE: %r" % r.stdout)
+        self._planted(usersite, marker, "PYTHONUSERBASE")
+        (usersite / "planted.pth").write_text("import os; open(%r, 'a').write('PYTHONUSERBASE:pth\\n')\n"
+                                              % str(marker), encoding="utf-8")
+        rel_cwd = t / "rel-cwd"
+        self._planted(rel_cwd / "ws", marker, "rel")
+        return [
+            ("absolute PYTHONPATH in a seat-writable folder",
+             {"PYTHONPATH": str(self._planted(t / "pp-abs", marker, "abs"))}, ws),
+            ("relative PYTHONPATH", {"PYTHONPATH": "ws"}, rel_cwd),
+            ("module in the current directory", {}, self._planted(t / "cwd-plant", marker, "cwd")),
+            ("PYTHONSTARTUP", {"PYTHONSTARTUP": str(self._planted(t / "startup", marker, "startup",
+                                                                   mods=("startup",)) / "startup.py")}, ws),
+            ("PYTHONHOME", {"PYTHONHOME": str(home)}, ws),
+            ("PYTHONUSERBASE", {"PYTHONUSERBASE": str(ub)}, ws),
+            ("sitecustomize.py alone on PYTHONPATH",
+             {"PYTHONPATH": str(self._planted(t / "pp-site", marker, "site", mods=("sitecustomize",)))}, ws),
+            ("usercustomize.py alone on PYTHONPATH",
+             {"PYTHONPATH": str(self._planted(t / "pp-user", marker, "user", mods=("usercustomize",)))}, ws),
+            ("PYTHONINSPECT", {"PYTHONINSPECT": "1"}, ws),
+            ("PYTHONIOENCODING", {"PYTHONIOENCODING": "utf-16"}, ws),
+            ("PYTHONUTF8 not 0/1", {"PYTHONUTF8": "x"}, ws),
+        ]
+
+
+class JudgeIsolation(_PlantedVectors, _Env):
     """RULINGS CX1 → DY1 — the judge's interpreter starts isolated: its one module source is the
     interpreter's own standard library, decided by start-up flags (`-I -S -B -X utf8`) before it starts.
     A module planted in an allowed (temporary) working directory is NOT executed, while a legitimate
@@ -582,51 +631,6 @@ class JudgeIsolation(_Env):
         self.assertTrue(marker.exists(), "the old start did not execute the planted module — the "
                         "regression above would not see the fault: %r %r" % (r.stdout, r.stderr[-300:]))
 
-
-    # ── RULINGS DY1 — what a seat can put in the judge's environment or in a folder it can write ──
-    def _planted(self, d, marker, tag, mods=("json", "hashlib", "tempfile", "re", "sitecustomize", "usercustomize")):
-        d.mkdir(parents=True, exist_ok=True)
-        for mod in mods:
-            (d / ("%s.py" % mod)).write_text("open(%r, 'a').write(%r)\nraise SystemExit(0)\n"
-                                            % (str(marker), "%s:%s\n" % (tag, mod)), encoding="utf-8")
-        return d
-
-    def vectors(self, marker):
-        """(name, extra env, working directory) — every folder below is inside the reviewer's allowed temp dir."""
-        t = self.tmpdir
-        ws = t / "review-ws"
-        ws.mkdir(exist_ok=True)
-        ver = "%d.%d" % sys.version_info[:2]
-        home = t / "home-plant"
-        # an interpreter that took this PYTHONHOME would import `encodings` from it first
-        self._planted(home / "lib" / ("python" + ver) / "encodings", marker, "PYTHONHOME", mods=("__init__",))
-        ub = t / "userbase"
-        r = subprocess.run([sys.executable, "-I", "-S", "-c", "import site; print(site.getusersitepackages())"],
-                           env=dict(self.env, PYTHONUSERBASE=str(ub)), capture_output=True, text=True, timeout=30)
-        usersite = Path(r.stdout.strip())
-        self.assertTrue(str(usersite).startswith(str(ub)), "user site does not follow PYTHONUSERBASE: %r" % r.stdout)
-        self._planted(usersite, marker, "PYTHONUSERBASE")
-        (usersite / "planted.pth").write_text("import os; open(%r, 'a').write('PYTHONUSERBASE:pth\\n')\n"
-                                              % str(marker), encoding="utf-8")
-        rel_cwd = t / "rel-cwd"
-        self._planted(rel_cwd / "ws", marker, "rel")
-        return [
-            ("absolute PYTHONPATH in a seat-writable folder",
-             {"PYTHONPATH": str(self._planted(t / "pp-abs", marker, "abs"))}, ws),
-            ("relative PYTHONPATH", {"PYTHONPATH": "ws"}, rel_cwd),
-            ("module in the current directory", {}, self._planted(t / "cwd-plant", marker, "cwd")),
-            ("PYTHONSTARTUP", {"PYTHONSTARTUP": str(self._planted(t / "startup", marker, "startup",
-                                                                   mods=("startup",)) / "startup.py")}, ws),
-            ("PYTHONHOME", {"PYTHONHOME": str(home)}, ws),
-            ("PYTHONUSERBASE", {"PYTHONUSERBASE": str(ub)}, ws),
-            ("sitecustomize.py alone on PYTHONPATH",
-             {"PYTHONPATH": str(self._planted(t / "pp-site", marker, "site", mods=("sitecustomize",)))}, ws),
-            ("usercustomize.py alone on PYTHONPATH",
-             {"PYTHONPATH": str(self._planted(t / "pp-user", marker, "user", mods=("usercustomize",)))}, ws),
-            ("PYTHONINSPECT", {"PYTHONINSPECT": "1"}, ws),
-            ("PYTHONIOENCODING", {"PYTHONIOENCODING": "utf-16"}, ws),
-            ("PYTHONUTF8 not 0/1", {"PYTHONUTF8": "x"}, ws),
-        ]
 
     def run_raw(self, hook, tool_input, cwd, extra):
         env = dict(self.env, CYS_ROLE="reviewer-codex", CYS_PACK_DIR=str(self.pack))
@@ -751,6 +755,276 @@ class JudgeIsolation(_Env):
                                        "content": "x"}, hook=walled, CYS_ROLE="worker", CYS_PY=str(refuses))
         self.assertEqual(r.returncode, 2, "the negative control did not reproduce the wall: rc=%d %r"
                          % (r.returncode, r.stderr[-300:]))
+
+
+# RULINGS ES1 — the two interpreter starts of `_lib.sh` (the --owned runner and the deadline wrapper), as
+# they are now and as they were at 288de708 (rebuilt in a copy for the negative controls)
+LIB_NEW_OWNED = '    "$CYS_PY" -I -S -B -X utf8 -c \'import os,runpy,sys\n'
+LIB_OLD_OWNED = '    "$CYS_PY" -B -c \'import sys\nsys.path[:]=[x for x in sys.path if x]\nimport os,runpy\n'
+LIB_NEW_FALLBACK = '    _cys_tr_mark=""\n    case "${OSTYPE:-}" in\n      msys*|cygwin*|win32*) ;;\n      *) _cys_tr_mark="${TMPDIR:-/tmp}/.cys-tr-${BASHPID:-$$}-${RANDOM:-0}${RANDOM:-0}"\n         { : > "$_cys_tr_mark"; } 2>/dev/null || _cys_tr_mark="" ;;\n    esac\n    "$CYS_PY" -I -S -B -X utf8 -c \'import os,sys\nif sys.argv[1]:\n    try:\n        os.unlink(sys.argv[1])\n    except OSError:\n        pass\nimport signal,subprocess\ntry:\n    p = subprocess.Popen(sys.argv[3:], start_new_session=True)\nexcept FileNotFoundError:\n    sys.exit(127)\nexcept Exception:\n    sys.exit(126)\ntry:\n    sys.exit(p.wait(timeout=float(sys.argv[2])))\nexcept subprocess.TimeoutExpired:\n    try:\n        os.killpg(os.getpgid(p.pid), signal.SIGKILL)\n    except Exception:\n        p.kill()\n    sys.exit(124)\' "$_cys_tr_mark" "$_cys_to" "$@"\n    _cys_tr_rc=$?\n    if [ -n "$_cys_tr_mark" ] && [ -e "$_cys_tr_mark" ]; then\n      rm -f "$_cys_tr_mark" 2>/dev/null\n      echo "cys_timeout_run: 실행기 인터프리터가 격리 기동(-I -S -B -X utf8)을 거부했거나 시작하지 못했다(rc=$_cys_tr_rc · ${CYS_PY}) — 명령은 실행되지 않았다" >&2\n      return 126\n    fi\n    return $_cys_tr_rc\n'
+LIB_OLD_FALLBACK = '    "$CYS_PY" -B -c \'import sys\nsys.path[:]=[x for x in sys.path if x]\nimport os,signal,subprocess\ntry:\n    p = subprocess.Popen(sys.argv[2:], start_new_session=True)\nexcept FileNotFoundError:\n    sys.exit(127)\nexcept Exception:\n    sys.exit(126)\ntry:\n    sys.exit(p.wait(timeout=float(sys.argv[1])))\nexcept subprocess.TimeoutExpired:\n    try:\n        os.killpg(os.getpgid(p.pid), signal.SIGKILL)\n    except Exception:\n        p.kill()\n    sys.exit(124)\' "$_cys_to" "$@"\n    return $?\n'
+LEAF = BIN / "_owned_process.py"
+
+
+def _is_stdlib(name):
+    """A top-level module name that comes with the interpreter (built in, frozen, or under its stdlib
+    folder — never site-packages). Windows-only modules count when this is not Windows."""
+    import importlib.util
+    import sysconfig
+    if name in getattr(sys, "stdlib_module_names", ()):
+        return True
+    if name in ("msvcrt", "winreg", "_winapi", "winsound", "_overlapped", "nt"):
+        return True
+    spec = importlib.util.find_spec(name)
+    if spec is None:
+        return False
+    origin = spec.origin or ""
+    if origin in ("built-in", "frozen") or not origin:
+        return True
+    roots = {os.path.realpath(sysconfig.get_paths()[k]) for k in ("stdlib", "platstdlib")}
+    o = os.path.realpath(origin)
+    return "site-packages" not in o and any(o.startswith(r + os.sep) for r in roots)
+
+
+def _imports(code):
+    import ast
+    out = set()
+    for n in ast.walk(ast.parse(code)):
+        if isinstance(n, ast.Import):
+            out |= {a.name.split(".")[0] for a in n.names}
+        elif isinstance(n, ast.ImportFrom) and n.level == 0 and n.module:
+            out.add(n.module.split(".")[0])
+    return out
+
+
+class RoleLookupIsolation(_PlantedVectors, _Env):
+    """RULINGS ES1 — the two interpreter starts of `_lib.sh` that feed a protection's decision start
+    isolated (`-I -S -B -X utf8`): the deadline wrapper of `cys_timeout_run` (the gate's role is the first
+    line it relays — on macOS, where no GNU `timeout` answers `--version`, every role lookup goes through
+    it) and the `--owned` runner. For each DY1 vector the planted code does not run and the answer is
+    whole; through the gate the role answered is the daemon's whatever a planted module prints; the
+    command a wrapper runs keeps exactly the environment it had; the wrappers import the standard
+    library only; an interpreter that refuses the flags is a broken wrapper, never the command's verdict.
+    Negative controls: a copy of `_lib.sh` with the starts of 288de708 runs the planted code."""
+
+    def setUp(self):
+        super().setUp()
+        # force the interpreter fallback of cys_timeout_run (as on macOS): no GNU timeout / gtimeout
+        for t in ("timeout", "gtimeout"):
+            p = self.fakebin / t
+            p.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            p.chmod(0o755)
+        self.answer = self.fakebin / "role-answer"
+        self.answer.write_text("#!/bin/sh\nprintf 'reviewer-codex\\n'\nexit \"${1:-0}\"\n", encoding="utf-8")
+        self.answer.chmod(0o755)
+
+    def lib_copy(self, tag, swaps):
+        src = LIB.read_text(encoding="utf-8")
+        for new, old in swaps:
+            self.assertEqual(src.count(new), 1, "a wrapper start is not in _lib.sh as expected")
+            src = src.replace(new, old)
+        d = self.root / ("lib-" + tag)
+        d.mkdir()
+        (d / "_lib.sh").write_text(src, encoding="utf-8")
+        shutil.copy(str(HOOK), str(d / "role-capability-gate.sh"))
+        return d
+
+    def old_lib(self):
+        return self.lib_copy("288de708", [(LIB_NEW_OWNED, LIB_OLD_OWNED), (LIB_NEW_FALLBACK, LIB_OLD_FALLBACK)])
+
+    def lib_run(self, args, extra, cwd, lib=None):
+        env = dict(self.env, _CYS_LIB_DEFINE_ONLY="1")
+        env.update(extra)
+        r = subprocess.run([SH, "-c", '. "$1"; shift; cys_timeout_run "$@"', "x", str(lib or LIB)] + [str(a) for a in args],
+                           cwd=str(cwd), env=env, stdin=subprocess.DEVNULL, capture_output=True, timeout=90)
+        return r.returncode, r.stdout, r.stderr.decode("utf-8", "replace")
+
+    @staticmethod
+    def owned_records(out, head):
+        rest = out[len(head):] if out.startswith(head) else b""
+        f = rest.split(b"\0")
+        return {f[i].decode("utf-8", "replace"): f[i + 1].decode("utf-8", "replace") for i in range(0, len(f) - 1, 2)}
+
+    OWNED = ["--owned", "30", str(LEAF), "--records", "--managed-command", "--",
+             "/bin/sh", "-c", "printf 'reviewer-codex\\n'", "sh"]
+
+    def wrapper_faults(self, vectors, marker, lib=None):
+        out = {}
+        for name, extra, cwd in vectors:
+            for kind in ("deadline wrapper", "--owned runner"):
+                if marker.exists():
+                    marker.unlink()
+                why = []
+                if kind == "deadline wrapper":
+                    rc, so, se = self.lib_run(["5", self.answer], extra, cwd, lib)
+                    if rc != 0 or so != b"reviewer-codex\n":
+                        why.append("rc=%d stdout=%r stderr=%r" % (rc, so[:120], se[-200:]))
+                else:
+                    rc, so, se = self.lib_run(self.OWNED, extra, cwd, lib)
+                    rec = self.owned_records(so, b"reviewer-codex\n")
+                    if rc != 0 or rec.get("_OWNED_RETURNED") != "1":
+                        why.append("rc=%d stdout=%r stderr=%r" % (rc, so[:160], se[-200:]))
+                if marker.exists():
+                    why.append("planted code RAN: %r" % marker.read_text(encoding="utf-8"))
+                out["%s / %s" % (kind, name)] = why
+        return out
+
+    def test_the_wrappers_start_isolated(self):
+        """ES1 negative controls on `_lib.sh` as it is: for every DY1 vector, neither wrapper's interpreter
+        runs the planted code (marker absent) and the answer is whole — the deadline wrapper relays the
+        command's line and exit code unchanged, the --owned runner completes (`_OWNED_RETURNED` 1)."""
+        marker = self.root / "PLANTED-RAN"
+        got = self.wrapper_faults(self.vectors(marker), marker)
+        bad = {k: v for k, v in got.items() if v}
+        self.assertEqual(bad, {}, "\n".join("%s: %s" % (k, " | ".join(v)) for k, v in bad.items()))
+        # the command's own exit codes pass unchanged (the DY1 mark must not eat a real 2)
+        for code in (2, 3, 77, 124):
+            rc, so, se = self.lib_run(["5", self.answer, code], {}, self.root)
+            self.assertEqual((rc, so), (code, b"reviewer-codex\n"), se[-200:])
+            self.assertNotIn("격리 기동", se)
+        self.assertEqual([n for n in os.listdir(str(self.tmpdir)) if n.startswith(".cys-tr-")], [],
+                         "a wrapper mark file was left behind")
+
+    def test_negative_control_the_old_wrappers_run_the_planted_code(self):
+        """The same table against a copy of `_lib.sh` with the starts of 288de708 (`-B -c` + '' removed):
+        an inherited module path (absolute, relative), sitecustomize / usercustomize on it, PYTHONUSERBASE,
+        PYTHONHOME, PYTHONINSPECT and an invalid PYTHONUTF8 each break the answer or run planted code."""
+        marker = self.root / "PLANTED-RAN"
+        got = self.wrapper_faults(self.vectors(marker), marker, lib=self.old_lib() / "_lib.sh")
+        caught = sorted(k for k, v in got.items() if v)
+        sys.stderr.write("ES1 negative control, _lib.sh of 288de708: fails %s; holds %s\n"
+                         % (caught, sorted(k for k, v in got.items() if not v)))
+        for kind in ("deadline wrapper", "--owned runner"):
+            for name in ("absolute PYTHONPATH in a seat-writable folder", "relative PYTHONPATH",
+                         "sitecustomize.py alone on PYTHONPATH", "usercustomize.py alone on PYTHONPATH",
+                         "PYTHONUSERBASE", "PYTHONHOME", "PYTHONINSPECT", "PYTHONUTF8 not 0/1"):
+                self.assertIn("%s / %s" % (kind, name), caught)
+
+    def gate_faults(self, vectors, marker, hook):
+        """Through the gate (role lookup = `cys surface-role` through the deadline wrapper): the daemon
+        answers `reviewer-codex`; a reviewer's forbidden write must be refused and its verdict write pass."""
+        self.fake("cys", 'case "$1" in surface-role) printf "reviewer-codex\\n"; exit 0 ;; esac\nexit 1\n')
+        (self.pack / "round" / "_reviews").mkdir(parents=True, exist_ok=True)
+        out = {}
+        for name, extra, cwd in vectors:
+            if marker.exists():
+                marker.unlink()
+            why = []
+            for tool_input, want_deny in (({"file_path": str(self.pack / "hooks" / "x.sh"), "content": "x"}, True),
+                                          ({"file_path": str(self.pack / "round" / "_reviews" / "v.md"), "content": "x"}, False)):
+                shutil.rmtree(str(self.tmpdir / "cys-role-authority.d"), ignore_errors=True)   # no cached role
+                kw = dict(extra, CYS_ROLE=None, CYS_SURFACE_ID="7")
+                r, _ = self.run_hook("Write", tool_input, cwd=cwd, hook=hook, **kw)
+                denied = r.returncode == 2 or self.decision(r)[0] == "deny"
+                if denied != want_deny:
+                    why.append("%s: rc=%d stdout=%r stderr=%r" % (os.path.basename(tool_input["file_path"]),
+                                                                  r.returncode, r.stdout[:120], r.stderr[-200:]))
+            if marker.exists():
+                why.append("planted code RAN: %r" % marker.read_text(encoding="utf-8"))
+            out[name] = why
+        return out
+
+    def role_printer(self, marker):
+        d = self.tmpdir / "pp-role"
+        d.mkdir(exist_ok=True)
+        (d / "sitecustomize.py").write_text(
+            "import sys\nopen(%r, 'a').write('role-printer\\n')\nsys.stdout.write('worker\\n')\nsys.stdout.flush()\n"
+            % str(marker), encoding="utf-8")
+        return ("a sitecustomize.py on PYTHONPATH that prints a role", {"PYTHONPATH": str(d)}, self.tmpdir / "review-ws")
+
+    def test_the_role_answered_is_the_daemons(self):
+        """ES1 end to end through the gate: whatever a planted module prints (the measured attack: a
+        sitecustomize printing `worker` before the daemon's line), the role is the daemon's — the
+        reviewer's forbidden write is refused and its verdict write passes; nothing planted runs."""
+        marker = self.root / "PLANTED-RAN"
+        vectors = self.vectors(marker) + [self.role_printer(marker)]
+        got = self.gate_faults(vectors, marker, HOOK)
+        bad = {k: v for k, v in got.items() if v}
+        self.assertEqual(bad, {}, "\n".join("%s: %s" % (k, " | ".join(v)) for k, v in bad.items()))
+
+    def test_negative_control_the_old_role_lookup_takes_the_planted_line(self):
+        marker = self.root / "PLANTED-RAN"
+        got = self.gate_faults([self.role_printer(marker)], marker, self.old_lib() / "role-capability-gate.sh")
+        self.assertTrue(got["a sitecustomize.py on PYTHONPATH that prints a role"],
+                        "the old role lookup did not take the planted line — the test above would not see it")
+
+    def env_lines(self, raw):
+        return sorted(x for x in raw.split(b"\0") if x)
+
+    def test_the_wrapped_command_keeps_its_environment(self):
+        """ES1 — only the wrapper's interpreter is isolated: the command it runs gets exactly the
+        environment the old wrapper gave it (byte for byte, the PYTHON* variables included), and nothing
+        the shell would give it directly is removed or changed (apart from `_`, the shell's last-command)."""
+        extra = {"PYTHONPATH": str(self.tmpdir / "pp-none"), "PYTHONSTARTUP": str(self.tmpdir / "none.py"),
+                 "PYTHONUSERBASE": str(self.tmpdir / "ub-none"), "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8",
+                 "PYTHONNOUSERSITE": "", "ES1_PROBE": "kept"}
+        env_cmd = ["/usr/bin/env", "-0"] if os.path.exists("/usr/bin/env") else ["env", "-0"]
+        old = self.old_lib() / "_lib.sh"
+        new_dl = self.env_lines(self.lib_run(["5"] + env_cmd, extra, self.root)[1])
+        old_dl = self.env_lines(self.lib_run(["5"] + env_cmd, extra, self.root, lib=old)[1])
+        self.assertEqual(new_dl, old_dl, "the deadline wrapper changed its command's environment")
+        owned = ["--owned", "30", str(LEAF), "--records", "--managed-command", "--", "/bin/sh", "-c",
+                 " ".join(env_cmd), "sh"]
+        cut = lambda raw: raw.split(b"_OWNED_STARTED\0", 1)[0]
+        new_ow = self.env_lines(cut(self.lib_run(owned, extra, self.root)[1]))
+        old_ow = self.env_lines(cut(self.lib_run(owned, extra, self.root, lib=old)[1]))
+        self.assertEqual(new_ow, old_ow, "the --owned runner changed its command's environment")
+        env = dict(self.env, _CYS_LIB_DEFINE_ONLY="1")
+        env.update(extra)
+        direct = self.env_lines(subprocess.run([SH, "-c", '"$@"', "x"] + env_cmd, env=env, cwd=str(self.root),
+                                               capture_output=True, timeout=30).stdout)
+        missing = [x for x in direct if not x.startswith(b"_=") and x not in new_dl]
+        self.assertEqual(missing, [], "removed or changed for the command")
+        self.assertIn(b"PYTHONPATH=" + str(self.tmpdir / "pp-none").encode(), new_dl)
+        self.assertIn(b"ES1_PROBE=kept", new_ow)
+
+    def test_the_wrappers_import_the_standard_library_only(self):
+        """ES1 — the code each isolated interpreter runs imports the standard library only: the two `-c`
+        bodies of `_lib.sh` and the leaf the --owned runner runs in-process (`bin/_owned_process.py`)."""
+        src = LIB.read_text(encoding="utf-8")
+        k = "\"$CYS_PY\" -I -S -B -X utf8 -c '"
+        self.assertEqual(src.count(k), 2, "the two isolated starts of _lib.sh")
+        i1 = src.index(k) + len(k)
+        j1 = src.index("' \"$_cys_owned_leaf\"", i1)
+        i2 = src.index(k, j1) + len(k)
+        j2 = src.index("' \"$_cys_tr_mark\"", i2)
+        bodies = [src[i1:j1], src[i2:j2]]
+        names = set()
+        for b in bodies + [LEAF.read_text(encoding="utf-8")]:
+            names |= _imports(b)
+        self.assertTrue({"os", "sys", "runpy", "signal", "subprocess"} <= names, sorted(names))
+        self.assertEqual(sorted(n for n in names if not _is_stdlib(n)), [], "a wrapper imports outside the stdlib")
+
+    def refusing_python(self, log):
+        p = self.fakebin / "python2-like"
+        p.write_text("#!/bin/sh\nprintf '%%s\\n' \"$*\" >> %s\n"
+                     "for a in \"$@\"; do [ \"$a\" = -I ] && { echo 'Unknown option: -I' >&2; exit 2; }; done\n"
+                     "exec %s \"$@\"\n" % (log, sys.executable), encoding="utf-8")
+        p.chmod(0o755)
+        return p
+
+    def test_an_interpreter_that_refuses_the_flags_is_a_broken_wrapper(self):
+        """ES1 / DY1 failure mode: with an interpreter that refuses `-I` (usage error, exit 2) the deadline
+        wrapper does NOT run the command and returns 126 with one line — never the interpreter's 2 as if
+        it were the command's (a Stop hook would block on it) — and ONE launch per call (no probe); the
+        --owned runner ends without records (the callers' existing 'unmeasured' branch, as for any broken
+        interpreter). Negative control: the same start without the mark returns the interpreter's 2."""
+        log = self.root / "launches.log"
+        py = self.refusing_python(log)
+        for code in (0, 2):
+            n0 = len(log.read_text().splitlines()) if log.exists() else 0
+            rc, so, se = self.lib_run(["5", self.answer, code], {"CYS_PY": str(py)}, self.root)
+            self.assertEqual((rc, so), (126, b""), se[-300:])
+            self.assertEqual(se.count("cys_timeout_run: 실행기 인터프리터가 격리 기동"), 1, se[-300:])
+            self.assertEqual(len(log.read_text().splitlines()) - n0, 1, "one interpreter launch per call")
+        self.assertEqual([n for n in os.listdir(str(self.tmpdir)) if n.startswith(".cys-tr-")], [])
+        rc, so, se = self.lib_run(self.OWNED, {"CYS_PY": str(py)}, self.root)
+        self.assertNotEqual(rc, 0)
+        self.assertNotIn(b"_OWNED_RETURNED", so)
+        nomark = self.lib_copy("no-mark", [('         { : > "$_cys_tr_mark"; } 2>/dev/null || _cys_tr_mark="" ;;',
+                                            '         _cys_tr_mark="" ;;')])
+        rc, so, se = self.lib_run(["5", self.answer, 0], {"CYS_PY": str(py)}, self.root, lib=nomark / "_lib.sh")
+        self.assertEqual(rc, 2, "the negative control did not reproduce the interpreter's 2 passing as a verdict")
 
 
 if __name__ == "__main__":

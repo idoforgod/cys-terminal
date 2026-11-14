@@ -328,12 +328,16 @@ cys_timeout_run() {
     fi
     # Bootstrap needs no external path converter. Drive-mounted MSYS paths
     # have a lexical native spelling; other paths retain ordinary semantics.
-    # -c puts '' (the session cwd = a project directory) first on sys.path, and runpy plus the leaf
-    # then import stdlib modules a project file can shadow (queue.py, json.py ...). Drop it before any
-    # import. Not -I: that implies -E and drops PYTHONHOME/PYTHONUTF8/PYTHONIOENCODING (PKG-3A M1).
-    "$CYS_PY" -B -c 'import sys
-sys.path[:]=[x for x in sys.path if x]
-import os,runpy
+    # RULINGS ES1 (0.15.0 · T5c — DY1 for every interpreter that feeds a protection's decision): this
+    # interpreter (the bootstrap + the leaf it runs in-process) starts ISOLATED, decided by its start-up
+    # flags before it starts, not by editing sys.path afterwards: -I (every PYTHON* variable ignored, no
+    # user site, neither the script folder nor the working directory on sys.path), -S (no site: no .pth,
+    # sitecustomize, usercustomize), -B (no bytecode), -X utf8 (the UTF-8 mode PYTHONUTF8=1 gave, given
+    # back explicitly; it replaces the PKG-3A M1 reason for not using -I). Bootstrap and leaf import the
+    # standard library only; the command the leaf runs gets this process's environment unchanged. An
+    # interpreter that refuses the flags exits 2 with no records: the caller's existing "phase owner
+    # ended without completion; unmeasured" branch, the one a broken interpreter takes today.
+    "$CYS_PY" -I -S -B -X utf8 -c 'import os,runpy,sys
 p=sys.argv[1]
 if os.name == "nt" and len(p)>3 and p[0]=="/" and p[2]=="/" and p[1].isalpha():
     p=p[1]+":"+p[2:]
@@ -357,25 +361,50 @@ runpy.run_path(p,run_name="__main__")' "$_cys_owned_leaf" --bounded "$_cys_owned
     # ★프로세스 **그룹** 종료: 대상만 죽이면 손자(대상이 띄운 자식)가 stdout 파이프를 계속 붙잡아
     #   호출측 `$(...)` 가 EOF 를 못 받고 그대로 행 걸린다(데드라인이 사실상 무효 — 실측 확인).
     #   그래서 새 세션으로 스폰하고 타임아웃 시 그룹 전체에 SIGKILL 을 보낸다.
-    #   '' (the cwd) leaves sys.path first, for the same reason as the --owned bootstrap above.
-    "$CYS_PY" -B -c 'import sys
-sys.path[:]=[x for x in sys.path if x]
-import os,signal,subprocess
+    # RULINGS ES1 (0.15.0 · T5c): the gate's role is the first line of what this wrapper relays, so its
+    #   interpreter starts ISOLATED with the --owned bootstrap's flags (-I -S -B -X utf8 — no PYTHON*
+    #   variable, no site, no working directory reaches it). It imports the standard library only, and
+    #   the command it runs inherits this process's environment UNCHANGED (no env= — only the wrapper's
+    #   interpreter is isolated). Failure mode (DY1): an interpreter that never ran this code (refused the
+    #   flags = usage error exit 2, or could not start) must not pass as the COMMAND's exit code — a Stop
+    #   hook's exit 2 blocks. The wrapper's first statement removes a mark file; a mark still there = the
+    #   command never ran → 126 and one line, the code a broken interpreter gives today; a command's own 2
+    #   stays 2. No mark (exit code passes as before) on MSYS / Cygwin — a native interpreter cannot open
+    #   a /tmp spelling — or when TMPDIR is not writable. No extra process: two file operations.
+    _cys_tr_mark=""
+    case "${OSTYPE:-}" in
+      msys*|cygwin*|win32*) ;;
+      *) _cys_tr_mark="${TMPDIR:-/tmp}/.cys-tr-${BASHPID:-$$}-${RANDOM:-0}${RANDOM:-0}"
+         { : > "$_cys_tr_mark"; } 2>/dev/null || _cys_tr_mark="" ;;
+    esac
+    "$CYS_PY" -I -S -B -X utf8 -c 'import os,sys
+if sys.argv[1]:
+    try:
+        os.unlink(sys.argv[1])
+    except OSError:
+        pass
+import signal,subprocess
 try:
-    p = subprocess.Popen(sys.argv[2:], start_new_session=True)
+    p = subprocess.Popen(sys.argv[3:], start_new_session=True)
 except FileNotFoundError:
     sys.exit(127)
 except Exception:
     sys.exit(126)
 try:
-    sys.exit(p.wait(timeout=float(sys.argv[1])))
+    sys.exit(p.wait(timeout=float(sys.argv[2])))
 except subprocess.TimeoutExpired:
     try:
         os.killpg(os.getpgid(p.pid), signal.SIGKILL)
     except Exception:
         p.kill()
-    sys.exit(124)' "$_cys_to" "$@"
-    return $?
+    sys.exit(124)' "$_cys_tr_mark" "$_cys_to" "$@"
+    _cys_tr_rc=$?
+    if [ -n "$_cys_tr_mark" ] && [ -e "$_cys_tr_mark" ]; then
+      rm -f "$_cys_tr_mark" 2>/dev/null
+      echo "cys_timeout_run: 실행기 인터프리터가 격리 기동(-I -S -B -X utf8)을 거부했거나 시작하지 못했다(rc=$_cys_tr_rc · ${CYS_PY}) — 명령은 실행되지 않았다" >&2
+      return 126
+    fi
+    return $_cys_tr_rc
   fi
   "$@"
   return $?
