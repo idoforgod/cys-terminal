@@ -3614,8 +3614,9 @@ mod ledger_verbs {
             Ok(keys) => json!(keys),
             Err(e) => json!({"unreadable": VerbError::from(e).message}),
         };
-        // RULINGS H3: the lane's catch-up fields (display only; T7b computes them).
-        match cys::repair::apply::catchup_status(&ctx.lane) {
+        // RULINGS H3: the lane's catch-up fields (display only; T7b computes them). RULINGS HH6: read
+        // from this daemon's own root (the one call — the same reader the gate uses).
+        match cys::repair::propagate::catchup_status_in(&ctx.root, &ctx.lane) {
             Ok(c) => {
                 out["initial_catchup_complete"] = json!(c.complete);
                 out["catchup_pending"] = json!(c.pending);
@@ -3627,6 +3628,11 @@ mod ledger_verbs {
                 out["catchup_conflict"] = Value::Null;
                 out["catchup_unavailable"] = json!(VerbError::from(e).message);
             }
+        }
+        // RULINGS HH7 (T7b): HQ's status carries the CEO's ONE summary line over every registered
+        // lane holding a 충돌 row of an in-force repair (null = none) — a pull, never sent
+        if ctx.lane.0 == "base" {
+            out["conflict_summary"] = json!(cys::repair::propagate::conflict_summary_line_in(&ctx.root, &ctx.registry));
         }
         Ok(out)
     }
@@ -3907,7 +3913,7 @@ pub(crate) mod seal_hooks {
 // Track T7b — `recheck` (H8, C3 · contract C11): the lane's re-evaluation after its worker's merge; the
 // body is the library's (`cys::repair::propagate::recheck_lane_in`). An inline module like
 // `apply_verbs`. ★Nothing here may panic; nothing here sends anything to a queue (F1).
-mod propagate_verbs {
+pub(crate) mod propagate_verbs {
     use super::{Caller, CheckReport, Ctx, VerbError};
     use cys::repair::apply::{CheckOutcome, NoFaults, OpEnv};
     use cys::repair::platform::ApplyForm;
@@ -3958,6 +3964,7 @@ mod propagate_verbs {
             Err(format!("{rel}: 다시 검사는 바이트를 들이지 않습니다"))
         };
         let lock_file = cys::pack_apply_lock::pack_apply_lock_path_for(&ctx.pack_dir);
+        let sources = cys::pack::UpdateSources::none();
         let env = cys::repair::propagate::LaneEnv {
             op: OpEnv {
                 root: &ctx.root,
@@ -3973,12 +3980,55 @@ mod propagate_verbs {
             locked: &locked,
             hooks: &hooks,
             result_bytes: &no_bytes,
+            sources: &sources,
             apply_lock: &lock_file,
             pass_stop: &|_| false,
         };
         let owner = ctx.owner(sid);
         let state = cys::repair::propagate::recheck_lane_in(&env, &id, sid, &owner, &ctx.incarnation, &note).map_err(VerbError::from)?;
         Ok(json!({"repair": id.as_str(), "lane": ctx.lane.0, "lane_state": state, "lane_state_label": state.label_ko()}))
+    }
+
+    /// RULINGS HH4 — this lane's propagation on the job thread (`repair_job::run_job`, after T6's
+    /// tick; K2: every tick after readiness). The production environment: T5b's check runner (as
+    /// T6's job), the compiled classifier over THIS lane's pack (protection asked first — BN2), the
+    /// daemon's per-repair mutex with EN5's scope (`repair_job::repair_lock`), T6's hook step, the
+    /// copy the origin sealed at its commit as the result bytes (HI2 / HJ2), a fresh pack-instance
+    /// id from the daemon's CSPRNG (no id → the tick is skipped, never a predictable one). Ledger
+    /// only — nothing is sent, queued or injected (F1).
+    pub(crate) fn run_on_job_thread(
+        daemon: &crate::state::Daemon,
+        root: &Path,
+        pack: &Path,
+    ) -> Result<cys::repair::propagate::TickReport, RepairError> {
+        let lane = cys::repair::types::LaneKey::of_socket(&daemon.socket_path);
+        let classify = |rel: &str| super::production_classify(rel, pack);
+        let locked = crate::repair_job::repair_lock(daemon);
+        let result_bytes = |rec: &cys::repair::ledger::RepairRecord, rel: &str| cys::repair::propagate::committed_copy_in(root, rec, rel);
+        let lock_file = cys::pack_apply_lock::pack_apply_lock_path_for(pack);
+        // HH1: known vendor content = the embedded copies + the compiled previous-release table
+        let sources = cys::pack::UpdateSources::none();
+        let env = cys::repair::propagate::LaneEnv {
+            op: OpEnv {
+                root,
+                pack,
+                lane: &lane,
+                now: cys::repair::ledger::now_epoch(),
+                form: cys::repair::platform::apply_form(),
+                faults: &NoFaults,
+                own_check: &crate::repair_job::own_check,
+            },
+            check: &cys::repair::apply::production_check,
+            classify: &classify,
+            locked: &locked,
+            hooks: &cys::repair::apply::hook_lines_step,
+            result_bytes: &result_bytes,
+            sources: &sources,
+            apply_lock: &lock_file,
+            pass_stop: &|_| false,
+        };
+        let fresh = crate::channels::random_token_hex().ok();
+        cys::repair::propagate::propagation_tick_in(&env, fresh.as_deref())
     }
 }
 
