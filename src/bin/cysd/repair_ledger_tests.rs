@@ -1107,6 +1107,10 @@ fn pick_up_of_in_force_and_revert_role() {
     // On its own rig, so the in-force repair below stays in force for the pick-up check.
     {
         let rr = rig("inforce-revert");
+        // GK4 / FI1: a repair is returned only when its pre-image's generation is the pack's now —
+        // this rig's pack states its generation (the T3 rig has none: every repair begun in it is
+        // "not returned automatically", which is not what this check is about)
+        std::fs::write(rr.pack.join(".pack-version"), "0.15.0\n").unwrap();
         let rid_ = committed_general(&rr);
         let before_lock = rr.record_of(&rid_).lock.clone();
         let v = rr
