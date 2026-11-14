@@ -31,7 +31,7 @@ pub const RULES_COMMON: &str = r#"■ 「스스로 해결」 제품 절대규칙
 4. 규칙 문서(soul.md·지침)는 주인이 고치라고 했을 때만 고친다. 실패하면 자비스가 켜지지 않을 수 있는 수정(기동 필수 목록)은 먼저 알리고 수정 최종 승인을 받는다.
 5. 고친 것은 반드시 수리 장부에 적는다. 파일 내용의 수리는 업데이트가 지우지 못하고, 파일 삭제와 생명줄이 아닌 훅의 해제는 장부에 적힌 것만 업데이트 뒤에도 유지되며, 내장 예약 작업과 생명줄 훅은 언제나 다시 보장된다.
 6. 고쳐지지 않으면 매번 다른 방법으로 열 번까지 시도하고(횟수·방법은 장부에 남는다), 그래도 남으면 시도한 것·남은 것·다음에 해볼 것을 사실대로 보고한다.
-7. 자비스 밖에 원인이 있으면(운영체제의 차단, 외부 서비스 장애) 우회해서 고칠 수 있는 데까지 고치고, 무엇이 막고 있고 주인이 무엇을 하면 풀리는지 사실대로 말한다. 운영체제의 보안 기능을 주인 모르게 끄지 않는다.
+7. 자비스 밖에 원인이 있으면(운영체제의 차단, 외부 서비스 장애) 우회해서 고칠 수 있는 데까지 고치고, 무엇이 막고 있고 주인이 무엇을 하면 풀리는지 사실대로 말한다. 이번 판이 못 고치는 본체(cysd·앱) 결함도 이와 같이 하고 장부에 적는다. 운영체제의 보안 기능을 주인 모르게 끄지 않는다.
 8. 다음 넷은 수리로도 없애지 않는다: 업데이트 서명 검사, 외부 발송·영구 삭제 전 주인 승인, 리뷰어가 검토 대상을 고치지 못하게 하는 장치, CSO의 파일 쓰기 제한.
 "#;
 
@@ -63,7 +63,9 @@ pub const RULES_REVIEWER: &str = r#"[리뷰어] 리뷰어1(reviewer-codex, 대�
 /// role, inside Claude Code's 2,000-character preview); this pin makes a text change that cannot fit
 /// fail here first. Derivation: 1,800 − head line (≤ 60 with a long role name) − guidance line without
 /// its paths (≈ 207) − ≈ 130 for the two paths of an ordinary install ≈ 1,400.
-pub const RULES_MAX_CHARS: usize = 1_400;
+/// ★RULINGS DH1 (0.15.0 T1e): rule 7 gained one sentence (the program-body defect release 1 cannot repair) — the cap
+/// moved 1,400 → 1,445 (master block 1,397 → 1,442); the binding hook check 23b stays inside its 1,800.
+pub const RULES_MAX_CHARS: usize = 1_445;
 
 /// The block printed for a role block: the common part followed by the role's own constant
 /// (`CommonOnly` = the common part alone, O-C6-3). The same text goes to all three places (C6 6.4).
