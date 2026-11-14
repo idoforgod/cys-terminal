@@ -535,7 +535,9 @@ fn seal_is_the_next_operation_after_every_exchange_and_move() {
     // EJ1 (REWRITTEN needles — old: the direct calls `exchange(live, &slot.payload())`,
     // `exchange(&live, &slot.payload())`, `place_no_replace(live, &slot.payload())`): every exchange
     // and move into a slot now goes through THE door
-    for needle in ["DoorAct::Exchange { payload: &slot.payload() }", "DoorAct::MoveOut { into: &slot.payload() }"] {
+    // GK2 (REWRITTEN needles — old: `DoorAct::Exchange { payload: &slot.payload() }`,
+    // `DoorAct::MoveOut { into: &slot.payload() }`): the acts carry the recorded expected state
+    for needle in ["DoorAct::Exchange { payload: &slot.payload(), expected: &spec.expected }", "DoorAct::MoveOut { into: &slot.payload(), expected: &spec.expected }"] {
         for (at, _) in prod.match_indices(needle) {
             seen += 1;
             // the statement after the call's error arm (which only closes the record and returns)
@@ -577,9 +579,12 @@ fn rule_one_never_renames_over_or_writes_live_in_place() {
     }
 }
 
-/// OQ-D7 / H6(1): another writer's bytes displaced instead of the expected ones are re-lived as a
-/// COPY by the same rule — but a writer caught between truncating and writing (an empty file that
-/// fails the file's own check) is never re-lived: the verified content stays live, superseded.
+/// OQ-D7 / H6(1) / GK2 (REWRITTEN — old expectations: the other writer's bytes, written between
+/// the record and the exchange, were displaced into the vault and re-lived as a copy; an empty one
+/// was left displaced with "the verified content" live; "both versions are in the vault"). Now the
+/// door verifies the RECORDED expected state at the moment it acts: the other writer's bytes — valid
+/// or an empty file caught mid-write — are never displaced; they stay live, the operation closes
+/// superseded, nothing of theirs enters the vault.
 #[cfg(target_os = "macos")]
 #[test]
 fn displaced_garbage_is_never_relived() {
@@ -601,13 +606,10 @@ fn displaced_garbage_is_never_relived() {
         })
         .unwrap();
         assert!(matches!(d.outcome, ApplyOutcome::Superseded(_)), "{:?}", d.outcome);
+        let _ = relived;
         let live = std::fs::read(r.pack.join("schedule.json")).unwrap();
-        if relived {
-            assert_eq!(live, other, "the other writer's bytes are live again (a copy)");
-        } else {
-            assert_eq!(live, b"{\"jobs\":[1]}\n", "the verified content stays live");
-        }
-        assert!(r.vault_bytes().contains(&other), "both versions are in the vault");
+        assert_eq!(live, other, "the other writer's bytes stay live, untouched");
+        assert!(!r.vault_bytes().contains(&other), "nothing of the other writer's was displaced");
     }
 }
 
@@ -831,7 +833,10 @@ fn windows_interruption_between_the_two_moves_resume_or_abandon() {
 
 /// The staged init-pack swap under an operation (the whole pack directory replaced between the
 /// record and the exchange) → the second install: the vault is outside the pack, every version
-/// survives; the operation closes superseded (worker review).
+/// survives; the operation closes superseded (worker review). GK2 (REWRITTEN — old expectation:
+/// "the bytes live at the exchange are in the vault" — the installed V2 was exchanged into a slot):
+/// the door verifies the recorded state first, so the installed V2 is never displaced — it stays
+/// live; the vault keeps the staged repair.
 #[cfg(target_os = "macos")]
 #[test]
 fn staged_pack_swap_during_an_operation_then_second_install() {
@@ -859,7 +864,7 @@ fn staged_pack_swap_during_an_operation_then_second_install() {
     // second install: the pack swapped again (pack.prev deleted by the installer)
     let _ = std::fs::remove_dir_all(r.base.join("pack.prev"));
     let vault = r.vault_bytes();
-    assert!(vault.contains(&b"V2-INSTALLED\n".to_vec()), "the bytes live at the exchange are in the vault");
+    assert_eq!(std::fs::read(r.pack.join("hooks/a.sh")).unwrap(), b"V2-INSTALLED\n", "the installed bytes stay live");
     assert!(vault.contains(&b"REPAIRED\n".to_vec()));
 }
 
@@ -1415,6 +1420,13 @@ fn flush_failure_after_the_exchange_keeps_the_evidence() {
 /// bytes return; the apply is declined, never "applied" or "reverted" on an unchecked outcome.
 /// Without CT3 the unapproved bytes stayed live while the reply said the change was put back.
 #[cfg(target_os = "macos")]
+/// CT3 / GK2 (REWRITTEN — old expectation: "the previous bytes are back, the unapproved ones are not
+/// live", by a CHECKED operation whose expected state was the live bytes read after the exchange).
+/// GK2: the engine replaces live bytes ONLY when they are exactly what its durable record says it
+/// placed — a payload rewritten by another writer between the record and the exchange put bytes live
+/// that no record vouches for: they are NOT exchanged back; the apply closes as conflict (never
+/// applied, the approval void), the pre-image stays in the vault, the lane row says 충돌 for the
+/// worker (and the hourly scan judges the file by its own check).
 #[test]
 fn unapproved_bytes_exchanged_in_are_put_back_by_a_checked_operation() {
     struct TamperSlotAfterRecord(Cell<bool>);
@@ -1450,8 +1462,10 @@ fn unapproved_bytes_exchanged_in_are_put_back_by_a_checked_operation() {
     let rep = apply_candidate_in(&env, &id, &[CandidateFile { rel: rel.into(), staged: staging, mode: 0o644 }], &|_, _, _| Ok(()), &pass_check, &pass_ref, &no_repair_lock).unwrap();
     assert!(faults.0.get(), "the tamper fired");
     assert!(matches!(rep.outcome, ApplyOutcome::Declined(_)), "{:?}", rep.outcome);
-    assert_eq!(std::fs::read(r.pack.join(rel)).unwrap(), b"PRE\n", "the previous bytes are back, the unapproved ones are not live");
-    assert!(r.vault_bytes().contains(&b"UNAPPROVED\n".to_vec()), "the unapproved entry is kept in a slot (rule one)");
+    assert_eq!(std::fs::read(r.pack.join(rel)).unwrap(), b"UNAPPROVED\n", "nothing exchanged back over bytes no record vouches for");
+    assert!(r.vault_bytes().contains(&b"PRE\n".to_vec()), "the vault keeps the displaced pre-image");
+    let row = ledger::read_lane_in(&r.root, &id, &r.lane).unwrap().unwrap();
+    assert_eq!(row.state, LaneState::Conflict, "the row says 충돌");
     let after = ledger::read_record_in(&r.root, &id).unwrap().unwrap();
     assert_ne!(after.state, RepairState::Probation, "never applied on an unchecked outcome");
     assert!(after.approval.as_ref().is_none_or(|a| !a.approved), "the approval is void");

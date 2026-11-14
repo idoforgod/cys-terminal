@@ -2142,7 +2142,9 @@ fn finish_revert(
     let any_applied = files.iter().any(|(_, o)| *o == ApplyOutcome::Applied);
     let hook_failed = matches!(hook_step, Some(Err(_)));
     let complete = all_applied && !hook_failed;
-    let nothing_changed = !any_applied && hook_step.is_none() && planned > 0;
+    // GK2: an operation closed as CONFLICT (declined — another writer's bytes left live) is not
+    // "nothing changed": the return could not finish (충돌, its report owed)
+    let nothing_changed = !any_applied && files.iter().all(|(_, o)| matches!(o, ApplyOutcome::Superseded(_))) && hook_step.is_none() && planned > 0;
     let label = if complete {
         CLOSED_REVERTED
     } else if nothing_changed {
