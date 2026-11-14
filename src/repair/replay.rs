@@ -831,11 +831,24 @@ fn open_nofollow_nonblock(p: &Path) -> std::io::Result<std::fs::File> {
     std::fs::File::open(p)
 }
 
-/// The change stamp of a compared item from its metadata (BL1).
+/// The change stamp of a compared item from its metadata (BL1 / RULINGS DE2): inode, change time AND
+/// modification time, each with nanoseconds. A write — the same bytes included — moves the
+/// modification time; a replacement moves the inode; a mode or owner change, a link count change or
+/// a write that resets the modification time moves the change time. (A system service that re-stamps
+/// files without writing — measured: the iCloud provider on a Desktop-backed folder — moves the
+/// change time too: the compared items are the lane's pack and the settings files, which are not
+/// synced; a repeat then judges whether the item was written AGAIN.)
 #[cfg(unix)]
 fn stamp_from(m: &std::fs::Metadata) -> String {
     use std::os::unix::fs::MetadataExt;
-    format!("ino={} mtime={}.{}", m.ino(), m.mtime(), m.mtime_nsec())
+    format!(
+        "ino={} ctime={}.{:09} mtime={}.{:09}",
+        m.ino(),
+        m.ctime(),
+        m.ctime_nsec(),
+        m.mtime(),
+        m.mtime_nsec()
+    )
 }
 
 #[cfg(not(unix))]
