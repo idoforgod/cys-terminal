@@ -5235,24 +5235,10 @@ async fn repair_approval_decide(request_id: String, decision: String, socket: Op
 #[tauri::command]
 async fn repair_revert_last(socket: Option<String>) -> Result<Value, String> {
     let sock = resolve_socket(&socket);
-    let list = rpc_full(&sock, "repair.list", json!({})).await.map_err(|e| {
+    let params = repair_revert_last_params(read_operator_token_for(&sock));
+    let resp = rpc_full(&sock, "repair.revert", params).await.map_err(|e| {
         format!("데몬에 닿지 못했습니다(앱은 데몬을 띄우지 않습니다) — 되돌리지 않았습니다: {e}")
     })?;
-    if list["ok"].as_bool() != Some(true) {
-        return Err(format!(
-            "{}: {}",
-            list["error"]["code"].as_str().unwrap_or("error"),
-            list["error"]["message"].as_str().unwrap_or("unknown error")
-        ));
-    }
-    let Some(id) = repair_revert_last_pick(&list["result"]) else {
-        return Err("되돌릴 수리가 없습니다(이 부서에 시험 기간·사용 중인 수리가 없습니다)".to_string());
-    };
-    let mut params = json!({"repair": id});
-    if let Some(tok) = read_operator_token_for(&sock) {
-        params["operator_token"] = json!(tok);
-    }
-    let resp = rpc_full(&sock, "repair.revert", params).await?;
     if resp["ok"].as_bool() == Some(true) {
         Ok(resp["result"].clone())
     } else {
@@ -5264,21 +5250,15 @@ async fn repair_revert_last(socket: Option<String>) -> Result<Value, String> {
     }
 }
 
-/// The repair '직전 수리 되돌리기' reverts (pure): among `repair.list`'s repairs in force (시험 기간 /
-/// 사용 중), the one with the highest number — this lane's own first (its origin lane = the list's
-/// lane), else any in force here.
-fn repair_revert_last_pick(list: &Value) -> Option<String> {
-    let lane = list["lane"].as_str().unwrap_or("");
-    let num = |r: &Value| -> u64 {
-        r["repair"].as_str().and_then(|s| s.strip_prefix("R-")).and_then(|n| n.parse().ok()).unwrap_or(0)
-    };
-    let in_force: Vec<&Value> = list["repairs"]
-        .as_array()
-        .map(|a| a.iter().filter(|r| matches!(r["state"].as_str(), Some("probation") | Some("in_use"))).collect())
-        .unwrap_or_default();
-    let own = in_force.iter().filter(|r| r["origin_lane"].as_str() == Some(lane)).max_by_key(|r| num(r));
-    own.or_else(|| in_force.iter().max_by_key(|r| num(r)))
-        .and_then(|r| r["repair"].as_str().map(str::to_string))
+/// The request '직전 수리 되돌리기' sends (pure; RULINGS CT11): the DAEMON chooses the most recently
+/// applied repair of this lane by the lane's own application evidence (`{"latest": true}`) — the app
+/// no longer picks by repair number or by origin.
+fn repair_revert_last_params(operator_token: Option<String>) -> Value {
+    let mut params = json!({"latest": true});
+    if let Some(tok) = operator_token {
+        params["operator_token"] = json!(tok);
+    }
+    params
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
@@ -19122,21 +19102,33 @@ mod repair_stub_tests {
     /// a closed one; none in force → no pick.
     #[test]
     fn repair_revert_last_picks_newest_in_force() {
-        let list = serde_json::json!({"lane": "base", "repairs": [
-            {"repair": "R-2", "state": "probation", "origin_lane": "base"},
-            {"repair": "R-10", "state": "in_use", "origin_lane": "base"},
-            {"repair": "R-11", "state": "reverted", "origin_lane": "base"},
-            {"repair": "R-12", "state": "probation", "origin_lane": "dept-x"},
-        ]});
-        assert_eq!(repair_revert_last_pick(&list).as_deref(), Some("R-10"));
-        let other = serde_json::json!({"lane": "base", "repairs": [{"repair": "R-12", "state": "probation", "origin_lane": "dept-x"}]});
-        assert_eq!(repair_revert_last_pick(&other).as_deref(), Some("R-12"));
-        let none = serde_json::json!({"lane": "base", "repairs": [{"repair": "R-1", "state": "reverted", "origin_lane": "base"}]});
-        assert_eq!(repair_revert_last_pick(&none), None);
+        // RULINGS CT11 — REWRITTEN. Old expectation: the app picked from `repair.list` by repair NUMBER,
+        // this lane's own first — `{R-2 probation base, R-10 in_use base, R-11 reverted base,
+        // R-12 probation dept-x}` → "R-10". Now the daemon chooses by this lane's application
+        // evidence; the app sends `{"latest": true}` (+ the operator token when it has one) and names
+        // no repair itself.
+        assert_eq!(repair_revert_last_params(None), serde_json::json!({"latest": true}));
+        assert_eq!(
+            repair_revert_last_params(Some("tok".into())),
+            serde_json::json!({"latest": true, "operator_token": "tok"})
+        );
     }
 
     /// Appendix A 1-16: the button's command never starts a daemon — it talks to the socket only
     /// (`rpc_full`); no `cys` sidecar, no launchctl, no daemon start in its body.
+    /// RULINGS CT11: the palette's confirmation says what each platform does — Windows: the two-move
+    /// deposit-first form, never "원자적 맞바꾸기" — and names the most recently APPLIED repair.
+    #[test]
+    fn repair_revert_last_sentences_are_platform_true() {
+        let ui = include_str!("../../ui/src/main.ts");
+        let at = ui.find("id: \"act:repair-revert-last\"").expect("the palette item");
+        let item = &ui[at..at + ui[at..].find("action:").unwrap()];
+        assert!(item.contains("body: IS_WINDOWS"), "the body depends on the platform");
+        let win = &item[item.find("? \"").unwrap()..item.find(": \"").unwrap()];
+        assert!(win.contains("두 번의 옮기기") && !win.contains("원자적 맞바꾸기"), "{win}");
+        assert!(item.contains("가장 최근에 적용된 수리"));
+    }
+
     #[test]
     fn repair_revert_last_never_autostarts() {
         let src = include_str!("main.rs");

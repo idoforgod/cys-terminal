@@ -8903,11 +8903,14 @@ async function buildPaletteItems(): Promise<PaletteItem[]> {
   items.push({
     id: "act:repair-revert-last",
     title: "직전 수리 되돌리기",
-    subtitle: "이 부서의 가장 최근 수리(시험 기간·사용 중) 한 건을 되돌립니다 — 고친 사본은 보관소에 남습니다",
+    subtitle: "이 부서에 가장 최근에 적용된 수리(시험 기간·사용 중) 한 건을 되돌립니다 — 고친 사본은 보관소에 남습니다",
     keywords: "repair revert 수리 되돌리기 직전 스스로 해결 롤백",
     confirm: {
       title: "직전 수리 되돌리기",
-      body: "이 부서에서 가장 최근에 적용된 수리 한 건을 적용 전 내용으로 되돌립니다. 되돌리기는 원자적 맞바꾸기로 하고, 고친 사본은 보관소에 남습니다(cys repair status 로 확인). 업데이트가 그 파일을 이미 바꿨으면 아무것도 바꾸지 않고 그 사실을 알립니다.",
+      // RULINGS CT11: the sentence says what THIS platform does (Windows: the two-move deposit-first form)
+      body: IS_WINDOWS
+        ? "이 부서에 가장 최근에 적용된 수리 한 건을 적용 전 내용으로 되돌립니다. 윈도우에서는 지금 파일을 먼저 보관소로 옮긴 뒤 비어 있는 자리에 적용 전 내용을 놓는 두 번의 옮기기로 하고(맞바꾸기가 아닙니다), 고친 사본은 보관소에 남습니다(cys repair status 로 확인). 업데이트가 그 파일을 이미 바꿨으면 아무것도 바꾸지 않고 그 사실을 알립니다."
+        : "이 부서에 가장 최근에 적용된 수리 한 건을 적용 전 내용으로 되돌립니다. 되돌리기는 원자적 맞바꾸기로 하고, 고친 사본은 보관소에 남습니다(cys repair status 로 확인). 업데이트가 그 파일을 이미 바꿨으면 아무것도 바꾸지 않고 그 사실을 알립니다.",
     },
     action: async () => {
       try {

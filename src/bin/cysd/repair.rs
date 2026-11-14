@@ -3637,6 +3637,24 @@ mod apply_verbs {
     /// CH3: a running repair may still CLOSE). The existing pack-apply lock is TRIED, never waited for
     /// in a request (the CLI waits 40 s): held by `cys pack-update` → refused, nothing changed.
     pub(crate) fn revert(ctx: &Ctx<'_>, caller: &Caller, p: &Value) -> Result<Value, VerbError> {
+        // CT11: `{"latest": true}` (the app's "직전 수리 되돌리기") — the most recently APPLIED repair
+        // of THIS lane, chosen by this lane's application evidence (the time its row records the
+        // apply here), never by repair number or by origin
+        let picked;
+        let p = if p.get("repair").is_none_or(|v| v.is_null()) && p.get("latest").and_then(|v| v.as_bool()) == Some(true) {
+            let Some(id) = latest_applied_here(ctx) else {
+                return Err(VerbError::new(
+                    cys::repair::types::ERR_PRECONDITION,
+                    "되돌릴 수리가 없습니다(이 부서에 적용된 시험 기간·사용 중인 수리가 없습니다)",
+                ));
+            };
+            let mut q = p.clone();
+            q["repair"] = json!(id.as_str());
+            picked = q;
+            &picked
+        } else {
+            p
+        };
         let rec = super::ledger_verbs::worker_lane_check(ctx, caller, p)?;
         let id = rec.id.clone();
         let by = match caller.seat() {
@@ -3669,7 +3687,7 @@ mod apply_verbs {
             return Err(VerbError::new(
                 cys::repair::types::ERR_LOCKED,
                 format!(
-                    "{}: 팩 업데이트가 진행 중이라 지금은 되돌리지 않습니다(아무것도 바꾸지 않았습니다) — 업데이트가 끝난 뒤 다시 하세요",
+                    "{}: 다른 적용이나 업데이트가 팩을 바꾸는 중이라 지금은 되돌리지 않습니다(아무것도 바꾸지 않았습니다) — 그 작업이 끝난 뒤 다시 하세요",
                     id.as_str()
                 ),
             ));
@@ -3682,6 +3700,36 @@ mod apply_verbs {
             "files": report.files.iter().map(|(rel, o)| { let mut v = outcome_json(o); v["rel"] = json!(rel); v }).collect::<Vec<_>>(),
             "hook_step": match &report.hook_step { None => Value::Null, Some(Ok(())) => json!("ok"), Some(Err(e)) => json!({"error": e}) },
         }))
+    }
+
+    /// CT11: the repair whose apply in THIS lane is the most recent (its row's `applied_at`) among
+    /// those revertible here — the row still applies something (a file state or a hook line) and its
+    /// probation is open, 사용 중, or left 충돌 by an unfinished apply / revert.
+    pub(crate) fn latest_applied_here(ctx: &Ctx<'_>) -> Option<RepairId> {
+        let mut best: Option<(f64, RepairId)> = None;
+        for id in ledger::list_ids_in(&ctx.root) {
+            let Ok(Some(row)) = ledger::read_lane_in(&ctx.root, &id, &ctx.lane) else {
+                continue;
+            };
+            let Some(p) = row.probation.as_ref() else {
+                continue;
+            };
+            let open = match p.closed.as_deref() {
+                None => true,
+                Some(c) => c.starts_with("사용 중") || c.starts_with("충돌"),
+            };
+            let Ok(Some(rec)) = ledger::read_record_in(&ctx.root, &id) else {
+                continue;
+            };
+            let applies = !row.applied.is_empty() || ledger::hook_lines(&rec).next().is_some();
+            if !open || !applies {
+                continue;
+            }
+            if best.as_ref().is_none_or(|(t, _)| p.applied_at > *t) {
+                best = Some((p.applied_at, id));
+            }
+        }
+        best.map(|(_, id)| id)
     }
 
     fn being_worked(s: RepairState) -> bool {

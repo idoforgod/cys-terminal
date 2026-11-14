@@ -420,3 +420,23 @@ fn hand_edit_route_begin_trigger_update_is_open() {
     let id = v["repair"].as_str().unwrap();
     assert_eq!(r.record_of(id).trigger, cys::repair::types::Trigger::Update);
 }
+
+/// CT11: `repair.revert {"latest": true}` reverts the repair most recently APPLIED in this lane by
+/// the lane's own application evidence (`applied_at` of its row) — not the highest repair number and
+/// not "this lane's own origin first". Without CT11 the app picked R-10 (number) / its own origin.
+#[test]
+fn revert_latest_is_chosen_by_this_lanes_application_time() {
+    let r = rig("ct11latest");
+    let newer_number = committed(&r, "hooks/n.sh", b"#!/bin/sh\necho n\n");
+    let applied_later = committed(&r, "hooks/l.sh", b"#!/bin/sh\necho l\n");
+    // the repair with the LOWER number was applied here later (e.g. a propagated repair)
+    let (lo, hi) = if newer_number < applied_later { (newer_number.clone(), applied_later.clone()) } else { (applied_later.clone(), newer_number.clone()) };
+    for (id, t) in [(&lo, T0 + 500.0), (&hi, T0 + 100.0)] {
+        let rid = cys::repair::types::RepairId::parse(id).unwrap();
+        let mut row = ledger::read_lane_in(&r.root, &rid, &r.lane).unwrap().unwrap();
+        row.probation.as_mut().unwrap().applied_at = t;
+        ledger::write_lane_in(&r.root, &row).unwrap();
+    }
+    let v = r.call(T0 + 600.0, &human(), "revert", json!({"latest": true})).unwrap();
+    assert_eq!(v["repair"], json!(lo), "the one applied here last, not the highest number: {v}");
+}
