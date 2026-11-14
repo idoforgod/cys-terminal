@@ -2814,6 +2814,10 @@ pub fn run_bounded(mut cmd: std::process::Command, deadline: Duration) -> Result
         .spawn()
         .map_err(|e| RepairError::Io(format!("등록기를 시작할 수 없습니다: {e}")))?;
     let pid = child.id();
+    // whether the child leads its own process group — measured NOW (spawn returns after exec, the
+    // session already made): once the child is reaped its pid no longer answers, but its group
+    // (the descendants) still exists under that id
+    let leads = leads_own_group(pid);
     let out = child.stdout.take();
     let (tx, rx) = std::sync::mpsc::channel::<String>();
     let _ = std::thread::Builder::new().name("cys-bounded-reader".into()).spawn(move || {
@@ -2834,7 +2838,7 @@ pub fn run_bounded(mut cmd: std::process::Command, deadline: Duration) -> Result
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
             Err(e) => {
-                kill_group_of(pid);
+                kill_group_of(pid, leads);
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(RepairError::Io(format!("등록기 상태를 읽을 수 없어 그 프로세스 그룹을 멈췄습니다: {e}")));
@@ -2855,7 +2859,7 @@ pub fn run_bounded(mut cmd: std::process::Command, deadline: Duration) -> Result
         return Ok(s);
     }
     // (3) termination of the whole group, reaping, and the rest of the output — within the deadline
-    kill_group_of(pid);
+    kill_group_of(pid, leads);
     let _ = child.kill();
     let reaped = child.wait().ok();
     if output.is_none() {
@@ -2882,23 +2886,37 @@ pub fn run_bounded(mut cmd: std::process::Command, deadline: Duration) -> Result
     )))
 }
 
-/// Kills the process group led by `pid` (unix, only when `pid` really leads its own group — never
-/// the daemon's group); elsewhere nothing (the caller kills the child itself).
-fn kill_group_of(pid: u32) {
+/// Whether `pid` leads its own process group (never the daemon's own group).
+fn leads_own_group(pid: u32) -> bool {
     #[cfg(unix)]
     {
         let Ok(p) = i32::try_from(pid) else {
-            return;
+            return false;
         };
-        // SAFETY: getpgid / killpg take plain integers; a group is signalled only when `pid` leads it.
-        unsafe {
-            if libc::getpgid(p) == p && p != libc::getpgrp() {
+        // SAFETY: getpgid / getpgrp take and return plain integers.
+        unsafe { libc::getpgid(p) == p && p != libc::getpgrp() }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// Kills the process group `pid` led at spawn (unix, only when it did — never the daemon's group);
+/// elsewhere nothing (the caller kills the child itself).
+fn kill_group_of(pid: u32, leads: bool) {
+    #[cfg(unix)]
+    if leads {
+        if let Ok(p) = i32::try_from(pid) {
+            // SAFETY: killpg takes plain integers; the group was measured to be the child's own.
+            unsafe {
                 libc::killpg(p, libc::SIGKILL);
             }
         }
     }
     #[cfg(not(unix))]
-    let _ = pid;
+    let _ = (pid, leads);
 }
 
 /// Parses the registrar's Y2(a) JSON into a report.
