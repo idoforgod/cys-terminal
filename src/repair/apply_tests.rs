@@ -2324,6 +2324,54 @@ fn a_failed_non_blocking_setup_does_not_run_the_child() {
     assert!(msg.contains("비차단") && msg.contains("멈췄습니다"), "{msg}");
 }
 
+/// FG7 (codex r4 M8): a read interrupted again and again (EINTR on every call) never keeps the
+/// runner: the interrupted read returns to the one loop, which looks at the deadline. Without FG7 the
+/// pump retried the read in its own loop and never returned — the runner ran forever (this test then
+/// fails on its own watchdog instead of hanging).
+#[cfg(unix)]
+#[test]
+fn a_read_interrupted_again_and_again_never_holds_the_runner() {
+    use crate::SpawnPolicy as _;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.arg("-c").arg("echo hi; sleep 30");
+        cmd.spawn_policy(crate::ChildLifetime::GroupScoped);
+        cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+        INJECT_EINTR.with(|c| c.set(true));
+        let t = std::time::Instant::now();
+        let res = run_bounded(cmd, Duration::from_secs(1));
+        INJECT_EINTR.with(|c| c.set(false));
+        let _ = tx.send((t.elapsed(), format!("{res:?}"), matches!(res, Err(RepairError::CheckTimeout(_)))));
+    });
+    let (took, msg, timed_out) = rx.recv_timeout(Duration::from_secs(8)).expect("the runner returned (no inner retry loop)");
+    assert!(took < Duration::from_secs(4), "returned at its deadline: {took:?}");
+    assert!(timed_out, "the child was stopped at the deadline: {msg}");
+}
+
+/// FG7 (codex r4 M8): after a failed non-blocking set-up, the reap of the killed child polls on the
+/// run's ONE deadline — a short deadline is a short wait. Without FG7 the reap polled a fixed 50 × 10
+/// ms of its own, past a 100 ms deadline.
+#[cfg(unix)]
+#[test]
+fn a_failed_setup_reaps_on_the_shared_deadline() {
+    use crate::SpawnPolicy as _;
+    let mut cmd = std::process::Command::new("/bin/sleep");
+    cmd.arg("30");
+    cmd.spawn_policy(crate::ChildLifetime::GroupScoped);
+    cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    FAIL_NONBLOCK.with(|c| c.set(true));
+    HOLD_REAP.with(|c| c.set(true));
+    let t = std::time::Instant::now();
+    let res = run_bounded(cmd, Duration::from_millis(100));
+    let took = t.elapsed();
+    HOLD_REAP.with(|c| c.set(false));
+    FAIL_NONBLOCK.with(|c| c.set(false));
+    assert!(took < Duration::from_millis(400), "the reap waited on the shared 100 ms deadline, not 500 ms: {took:?}");
+    let msg = format!("{res:?}");
+    assert!(msg.contains("비차단") && msg.contains("따로 거두게"), "{msg}");
+}
+
 // ───────────────────────────── RULINGS EJ4 — one ownership per repair ─────────────────────────────
 
 /// EJ4 through the real entry points: a revert (the owner) paused in its hook phase holds the

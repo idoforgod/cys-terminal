@@ -3490,13 +3490,22 @@ pub fn run_bounded(mut cmd: std::process::Command, deadline: Duration) -> Result
             if let Err(e) = child.kill() {
                 problems.push(format!("자식(pid {pid})을 멈추지 못했습니다: {e}"));
             }
-            let reaped = (0..50).any(|_| {
-                let done = matches!(child.try_wait(), Ok(Some(_)));
-                if !done {
-                    std::thread::sleep(Duration::from_millis(10));
+            // FG7: the reap polls on the ONE deadline of this run, never a fixed count of its own
+            let mut reaped = false;
+            loop {
+                #[cfg(test)]
+                let held = HOLD_REAP.with(|c| c.get());
+                #[cfg(not(test))]
+                let held = false;
+                if !held && matches!(child.try_wait(), Ok(Some(_))) {
+                    reaped = true;
+                    break;
                 }
-                done
-            });
+                if start.elapsed() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
             if !reaped {
                 let _ = std::thread::Builder::new().name("cys-bounded-reap".into()).spawn(move || {
                     let _ = child.wait();
@@ -3622,6 +3631,10 @@ pub const OUTPUT_KEEP_CAP: usize = 256 * 1024;
 thread_local! {
     /// Test-only (EJ2): setting a pipe non-blocking fails.
     pub(crate) static FAIL_NONBLOCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test-only (FG7): every read of a pipe is interrupted (EINTR).
+    pub(crate) static INJECT_EINTR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test-only (FG7): the reap after a failed set-up does not see the child's exit.
+    pub(crate) static HOLD_REAP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// One end of the child's output.
@@ -3723,23 +3736,31 @@ impl OutPipe {
                 return 0;
             };
             let mut chunk = vec![0u8; PIPE_TURN_BYTES];
-            loop {
-                match std::io::Read::read(p, &mut chunk) {
-                    Ok(0) => {
-                        self.eof = true;
-                        return 0;
-                    }
-                    Ok(n) => {
-                        let got = chunk[..n].to_vec();
-                        self.keep(&got);
-                        return n;
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return 0,
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(_) => {
-                        self.eof = true;
-                        return 0;
-                    }
+            #[cfg(test)]
+            let got = if INJECT_EINTR.with(|c| c.get()) {
+                Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+            } else {
+                std::io::Read::read(p, &mut chunk)
+            };
+            #[cfg(not(test))]
+            let got = std::io::Read::read(p, &mut chunk);
+            // FG7: ONE read per turn — an interrupted read is a turn that read nothing; the runner's
+            // one loop (which looks at the deadline) calls again
+            match got {
+                Ok(0) => {
+                    self.eof = true;
+                    0
+                }
+                Ok(n) => {
+                    let got = chunk[..n].to_vec();
+                    self.keep(&got);
+                    n
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => 0,
+                Err(_) => {
+                    self.eof = true;
+                    0
                 }
             }
         }
