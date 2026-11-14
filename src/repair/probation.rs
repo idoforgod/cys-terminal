@@ -413,7 +413,7 @@ pub fn start_time_pass(env: &JobEnv<'_>) -> Result<Vec<String>, RepairError> {
             if let Err(e) = (env.locked)(&rec.id, &mut || {
         let _mutex_scope = super::guard::MutexScope::enter();
                 if ledger::read_lane_in(&rootb, &idc, &lanec)?.is_none() {
-                    ledger::write_lane_in(&rootb, &new_row)?;
+                    ledger::write_lane_durable_in(&rootb, &new_row)?;
                 }
                 Ok(())
             }) {
@@ -626,7 +626,7 @@ fn close_row(env: &JobEnv<'_>, id: &RepairId, closed: &str, timeouts: &[(String,
                 }
             }
             row.updated_at = now;
-            ledger::write_lane_in(&root, &row)?;
+            ledger::write_lane_durable_in(&root, &row)?;
         }
         if let Some(st) = record_state {
             if let Some(mut r) = ledger::read_record_in(&root, &idc)? {
@@ -654,7 +654,7 @@ fn note_timeouts(env: &JobEnv<'_>, id: &RepairId, timeouts: &[(String, f64)]) ->
                     }
                 }
             }
-            ledger::write_lane_in(&root, &row)?;
+            ledger::write_lane_durable_in(&root, &row)?;
         }
         Ok(())
     })
@@ -721,7 +721,7 @@ fn close_failed(env: &JobEnv<'_>, id: &RepairId, why: &str) -> Result<(), Repair
                 }
             }
             row.updated_at = now;
-            ledger::write_lane_in(&root, &row)?;
+            ledger::write_lane_durable_in(&root, &row)?;
         }
         if let Some(mut r) = ledger::read_record_in(&root, &idc)? {
             if r.origin_lane == lane {

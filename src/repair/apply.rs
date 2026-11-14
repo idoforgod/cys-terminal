@@ -1917,7 +1917,7 @@ fn finish_revert(
                 }
             }
             row.updated_at = now;
-            ledger::write_lane_in(&root, &row)?;
+            ledger::write_lane_durable_in(&root, &row)?;
         }
         Ok(())
     })?;
@@ -1959,7 +1959,7 @@ fn close_superseded(
                 }
             }
             row.updated_at = now;
-            ledger::write_lane_in(&root, &row)?;
+            ledger::write_lane_durable_in(&root, &row)?;
         }
         if let Some(mut r) = ledger::read_record_in(&root, &id)? {
             if r.origin_lane == lane && matches!(r.state, RepairState::Probation | RepairState::InUse) {
@@ -2542,7 +2542,7 @@ fn recover_one_intent(env: &OpEnv<'_>, intent: &mut ApplyIntent, locked: &Repair
             // whether or not a row exists (an older row's applied subset, approval reference or
             // probation state is replaced); the lines of other events (merges, history) are kept
             let previous = ledger::read_lane_in(&root, &idc, &lane)?;
-            ledger::write_lane_in(
+            ledger::write_lane_durable_in(
                 &root,
                 &ledger::LaneRecord {
                     schema: super::REPAIR_SCHEMA,
@@ -3048,7 +3048,7 @@ pub fn apply_candidate_in(
             merge_attempt: 0,
             updated_at: now,
         };
-        ledger::write_lane_in(&root, &row)?;
+        ledger::write_lane_durable_in(&root, &row)?;
         Ok(())
     })?;
     // committed deletions are tombstoned in this lane (only real deletions — AD3)
@@ -3258,7 +3258,7 @@ fn mark_incomplete_apply(
             merge_attempt: 0,
             updated_at: now,
         };
-        ledger::write_lane_in(&root, &row)?;
+        ledger::write_lane_durable_in(&root, &row)?;
         if let Some(mut r) = ledger::read_record_in(&root, &idc)? {
             if let Some(a) = r.approval.as_mut() {
                 a.approved = false;
@@ -4211,7 +4211,7 @@ pub fn mark_lane_conflict(root: &Path, id: &RepairId, lane: &LaneKey, now: f64, 
         if let Some(mut row) = ledger::read_lane_in(&rootb, &idc, &lanec)? {
             row.state = LaneState::Conflict;
             row.updated_at = now;
-            ledger::write_lane_in(&rootb, &row)?;
+            ledger::write_lane_durable_in(&rootb, &row)?;
         }
         Ok(())
     });

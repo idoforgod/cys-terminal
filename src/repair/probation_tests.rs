@@ -1214,6 +1214,36 @@ fn a_failing_closure_write_then_a_restart_files_once() {
     assert_eq!(n(&filed), 1, "never filed twice");
 }
 
+// ───────────────────────────── RULINGS FG4 — the write that makes an event final is durable ─────────────────────────────
+
+/// FG4 (codex r4 M5) at the durable boundary: the lane-row writes that close a probation (`close_failed`
+/// — 충돌 / 실패; `close_row` — the 24-hour close) go through the durable writer: when the full flush
+/// fails the write fails AND the row on disk is NOT final (the old bytes stay); the next tick, with the
+/// flush working, makes it final. Without FG4 the row went through `atomic_write_json` (no flush) — it
+/// read as closed although never made durable.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_closure_whose_flush_fails_is_not_final() {
+    let r = rig("fg4durable");
+    let a = rid("R-1");
+    committed_general(&r, &a, "hooks/d.sh", Some(b"PRE\n"), Some(b"POST\n"));
+    let fails = |_: &str, _: &Path, _: Duration| outcome(CheckResult::Fail("bad".into()), 5);
+    let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| true };
+    let lock = r.base.join(".pack-apply.lock");
+    let env = job(&r, &d, ApplyForm::DepositFirst, NOW, &lock);
+    let not_final = |r: &Rig| ledger::read_lane_in(&r.root, &a, &r.lane).unwrap().unwrap().probation.unwrap().closed.is_none();
+    for which in ["close_failed", "close_row"] {
+        crate::repair::durable::INJECT_FLUSH_ERRNO.with(|c| c.set((libc::EIO, 1000)));
+        let res = if which == "close_failed" { close_failed(&env, &a, "bad") } else { close_row(&env, &a, "사용 중", &[], None) };
+        crate::repair::durable::INJECT_FLUSH_ERRNO.with(|c| c.set((0, 0)));
+        assert!(res.is_err(), "{which}: the failed flush fails the write");
+        assert!(not_final(&r), "{which}: the row on disk is not final");
+    }
+    let _ = run_tick(&job(&r, &d, ApplyForm::DepositFirst, NOW + 700.0, &lock), false);
+    let closed = ledger::read_lane_in(&r.root, &a, &r.lane).unwrap().unwrap().probation.unwrap().closed.unwrap();
+    assert!(closed.starts_with(crate::repair::apply::CLOSED_FAILED), "the next tick made it final: {closed}");
+}
+
 // ───────────────────────────── RULINGS EK2 — a failed re-check is a fact from the moment it is measured ─────────────────────────────
 
 /// EK2: a re-check fails while another apply / update holds the pack-apply lock — the failure is made
