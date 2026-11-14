@@ -595,11 +595,24 @@ fn census_ii_every_class_binds_on_released() {
         rep.notes,
         rep.refusals
     );
-    assert!(
-        rep.after_run.first.is_empty(),
-        "the screen changed the lane: {:?}",
-        rep.after_run.first
-    );
+    // the screen writes nothing of the lane: no compared item's STATE, inode or modification time
+    // moved. (A change-time-only move is no write by the screen: the harness's private HOME lies in a
+    // Desktop folder whose file provider re-stamps files' change time tens of seconds after they were
+    // laid out — measured in T5b-cz-c4: ctime +56 s, same inode, same mtime, same bytes. The product
+    // keeps ctime in its stamp — RULINGS DE2; the live pack is not such a folder.)
+    let without_ctime = |s: &str| {
+        s.split_whitespace()
+            .filter(|w| !w.starts_with("ctime="))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let written: Vec<&LiveDifference> = rep
+        .after_run
+        .first
+        .iter()
+        .filter(|d| without_ctime(&d.before) != without_ctime(&d.after))
+        .collect();
+    assert!(written.is_empty(), "the screen changed the lane: {written:?}");
     assert!(rep.after_run.leftover_processes.is_empty());
     cleanup(&root);
 }
@@ -1282,10 +1295,24 @@ fn extra_stdout_line_from_lib_refuses_every_gate_class() {
         .collect();
     let c = cfg(&root, Some(ids.clone()), Some(vec!["E-1"]), false);
     let rep = screen_with(&c, &cand, &lane, LONG).unwrap();
+    // the raw parser-arm classes deny by the BLOCKING EXIT CODE, which an extra stdout line does not
+    // touch (EL1: the exit code stays valid by itself) — they must stay DENY; every class whose deny is
+    // the JSON object must be refused
+    let raw: Vec<&str> = corpus::CORPUS_R
+        .iter()
+        .chain(corpus::CORPUS_C.iter())
+        .filter(|c| c.probes.iter().any(|p| p.raw))
+        .map(|c| c.id)
+        .collect();
     let mut bound = std::collections::BTreeSet::new();
     for p in rep.probes.iter().filter(|p| p.test == "R" || p.test == "C") {
+        let id = p.class.split('#').next().unwrap_or("");
         if p.released == Answer::Deny {
-            bound.insert(p.class.split('#').next().unwrap_or("").to_string());
+            if raw.contains(&id) {
+                assert_eq!(p.clean, Some(Answer::Deny), "exit 2 stays a deny: {p:#?}");
+                continue;
+            }
+            bound.insert(id.to_string());
             assert_eq!(p.decision, ProbeDecision::Refused, "{p:#?}");
         }
     }
