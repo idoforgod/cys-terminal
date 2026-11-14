@@ -3092,6 +3092,7 @@ pub fn resume_hook_steps_in(
     pack: &Path,
     lane: &LaneKey,
     registrar: &RegistrarFn<'_>,
+    locked: &RepairLock<'_>,
     now: f64,
 ) -> u32 {
     let mut n = 0;
@@ -3102,10 +3103,27 @@ pub fn resume_hook_steps_in(
         if finish_hook_op(root, pack, &rec, &mut op, registrar, now).is_ok() {
             n += 1;
         } else {
+            // CT7: a resumed hook operation that fails marks the lane 충돌 (as the first run would)
+            mark_lane_conflict(root, &rec.id, lane, now, locked);
             n += u32::from(op.finished);
         }
     }
     n
+}
+
+/// The lane row of `id` → 충돌 (a hook step that could not complete — CT7).
+pub fn mark_lane_conflict(root: &Path, id: &RepairId, lane: &LaneKey, now: f64, locked: &RepairLock<'_>) {
+    let rootb = root.to_path_buf();
+    let idc = id.clone();
+    let lanec = lane.clone();
+    let _ = locked(id, &mut || {
+        if let Some(mut row) = ledger::read_lane_in(&rootb, &idc, &lanec)? {
+            row.state = LaneState::Conflict;
+            row.updated_at = now;
+            ledger::write_lane_in(&rootb, &row)?;
+        }
+        Ok(())
+    });
 }
 
 /// RULINGS Y1: the ONE hook step (operation record first, tombstone, reconcile, record finished).

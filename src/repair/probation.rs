@@ -150,9 +150,42 @@ pub fn run_tick(env: &JobEnv<'_>, force_sweep: bool) -> Result<TickReport, Repai
         faults: env.op.faults,
         own_check: env.op.own_check,
     };
-    report.resumed = apply::resume_interrupted_in(&env.op)?
-        + apply::resume_hook_steps_in(root, env.op.pack, lane, env.registrar, now)
-        + if m10_root.exists() { apply::resume_interrupted_in(&m10_env)? } else { 0 };
+    // RULINGS CT5: recovery of unfinished operations (and of CT4's apply intents) runs under the
+    // pack-apply lock, TRIED — held means a writer is ACTIVE ("unfinished" is not "interrupted"):
+    // this tick then does nothing at all and its job state is not written (due again next time);
+    // the unfinished records are read only after the lock is taken
+    let recovered = crate::pack_apply_lock::try_with_apply_lock(env.apply_lock, || -> Result<(u32, Vec<String>), RepairError> {
+        let mut lines = Vec::new();
+        let mut n = 0u32;
+        let injected = |e: &RepairError| format!("{e:?}").contains(apply::INJECTED_STOP);
+        match apply::resume_interrupted_in(&env.op) {
+            Ok(k) => n += k,
+            Err(e) if injected(&e) => return Err(e),
+            Err(e) => lines.push(format!("끊긴 동작을 마저 하지 못했습니다 — 다음 차례에 다시({e:?})")),
+        }
+        n += apply::resume_hook_steps_in(root, env.op.pack, lane, env.registrar, env.locked, now);
+        if m10_root.exists() {
+            match apply::resume_interrupted_in(&m10_env) {
+                Ok(k) => n += k,
+                Err(e) if injected(&e) => return Err(e),
+                Err(e) => lines.push(format!("M10 의 끊긴 동작을 마저 하지 못했습니다 — 다음 차례에 다시({e:?})")),
+            }
+        }
+        lines.extend(apply::recover_apply_intents_in(&env.op, env.locked));
+        Ok((n, lines))
+    });
+    match recovered {
+        Ok(Some(r)) => {
+            let (n, lines) = r?;
+            report.resumed = n;
+            report.lines.extend(lines);
+        }
+        Ok(None) => {
+            report.lines.push("다른 적용이나 업데이트가 팩을 바꾸는 중 — 이번 차례는 아무것도 하지 않습니다".into());
+            return Ok(report);
+        }
+        Err(e) => return Err(RepairError::Io(e)),
+    }
     if d.first_of_incarnation {
         report.lines.extend(start_time_pass(env)?);
     }
@@ -771,6 +804,10 @@ pub fn m10_sweep(env: &JobEnv<'_>) -> Result<Vec<Finding>, RepairError> {
         if (env.excluded)(rel) {
             continue;
         }
+        // CT5: the binding is taken at sampling — the pack generation FIRST, then the live state and
+        // the source of the right bytes; it is revalidated under the pack-apply lock right before a
+        // put-back (any change → no put-back in this tick)
+        let bound_gen = apply::pack_generation(pack);
         let live = pack.join(rel);
         let Ok(m) = std::fs::symlink_metadata(&live) else {
             continue; // absent: not a changed file (the heal paths own a missing file)
@@ -892,6 +929,8 @@ pub fn m10_sweep(env: &JobEnv<'_>) -> Result<Vec<Finding>, RepairError> {
             continue;
         };
         // put back by rule one; the expected bytes are exactly what the check saw
+        let sampled_live = TargetState::File { sha256: sha.clone(), mode: live_mode };
+        let source_sha = sha_hex(&orig);
         let sub = m10_root_in(root, lane);
         std::fs::create_dir_all(&sub).map_err(|e| RepairError::Io(format!("{}: {e}", sub.display())))?;
         let src_file = sub.join(format!(".original-{}", super::wal::new_op_id(env.op.now, "orig")));
@@ -909,15 +948,45 @@ pub fn m10_sweep(env: &JobEnv<'_>) -> Result<Vec<Finding>, RepairError> {
             id: m10_bucket(),
             rel: rel.to_string(),
             kind: "m10-revert".into(),
-            expected: TargetState::File { sha256: sha.clone(), mode: live_mode },
-            incoming: TargetState::File { sha256: sha_hex(&orig), mode },
+            expected: sampled_live.clone(),
+            incoming: TargetState::File { sha256: source_sha.clone(), mode },
             source: Some(src_file.clone()),
-            generation: Some(apply::pack_generation(pack)),
+            generation: Some(bound_gen.clone()),
         };
-        let r = crate::pack_apply_lock::with_apply_lock(env.apply_lock, || apply::run_op(&sub_env, &spec))
-            .map_err(RepairError::Io)?;
+        let r = crate::pack_apply_lock::with_apply_lock(env.apply_lock, || -> Result<Option<apply::OpDone>, RepairError> {
+            // CT5: THE binding, revalidated under the lock — generation, live state, source of the bytes
+            if apply::pack_generation(pack) != bound_gen {
+                return Ok(None);
+            }
+            if TargetState::read(&live)? != sampled_live {
+                return Ok(None);
+            }
+            let source_now: Option<String> = match apply::approved_copy_source_in(root, pack, lane, rel) {
+                Some((TargetState::File { .. }, holder)) => std::fs::read(&holder).ok().map(|b| sha_hex(&b)),
+                Some(_) => None,
+                None => (env.original)(rel).map(|o| sha_hex(&o)),
+            };
+            if source_now.as_deref() != Some(source_sha.as_str()) {
+                return Ok(None);
+            }
+            apply::run_op(&sub_env, &spec).map(Some)
+        })
+        .map_err(RepairError::Io)?;
         let _ = std::fs::remove_file(&src_file); // our own source copy (the slot holds what went live)
-        let r = r?;
+        let Some(r) = r? else {
+            new_findings.push(Finding {
+                rel: rel.to_string(),
+                sha256: sha,
+                kind: "superseded".into(),
+                at: env.op.now,
+                notice: false,
+                notified: false,
+                slot: None,
+                kept_copy: None,
+                note: "검사와 되돌리기 사이에 팩 세대·살아 있는 파일·원본 중 하나가 바뀜 — 이번 차례에는 되돌리지 않음".into(),
+            });
+            continue;
+        };
         let (kind, note) = match &r.outcome {
             ApplyOutcome::Applied => ("reverted", format!("검사 결과: {why}")),
             ApplyOutcome::Superseded(m) => ("superseded", format!("검사와 되돌리기 사이에 바뀜 — 되돌리지 않고 다음 검사로: {m}")),

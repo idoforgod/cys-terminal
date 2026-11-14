@@ -1231,7 +1231,7 @@ fn hook_step_timeout_and_resume_after_a_crash() {
     };
     wal::write_in(&r.root, &rec).unwrap();
     let ok = |_: &Path, _: bool| -> Result<String, RepairError> { Ok(report_json(&[("Stop", "z.sh", "unregistered", &[("/s.json", "unregistered")])])) };
-    assert_eq!(resume_hook_steps_in(&r.root, &r.pack, &r.lane, &ok, 3.0), 1);
+    assert_eq!(resume_hook_steps_in(&r.root, &r.pack, &r.lane, &ok, &no_repair_lock, 3.0), 1);
     assert!(crate::repair::tombstones::load_in(&r.root, &r.lane).unwrap().iter().any(|t| t.rel == "settings:Stop:z.sh"));
     assert!(wal::unfinished_for_lane(&r.root, &r.lane).is_empty());
 }

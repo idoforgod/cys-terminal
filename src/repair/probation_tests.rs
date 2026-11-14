@@ -557,3 +557,81 @@ fn m10_each_put_back_takes_a_fresh_slot() {
     assert_eq!(slots, 2, "one slot per put-back, none removed");
     assert!(crate::repair::wal::unfinished_for_lane(&m10_root_in(&r.root, &r.lane), &r.lane).is_empty());
 }
+
+// ───────────────────────────── RULINGS CT5 — one binding, checked under the lock ─────────────────────────────
+
+/// CT5 (blocking 5): an update lands BETWEEN the scan's sampling and its put-back (here: inside the
+/// file's check — the pack generation changes and the file's bytes stay what was sampled). The
+/// binding (generation, live state, source of the right bytes) is revalidated under the pack-apply
+/// lock right before the exchange: it changed, so NOTHING is put back in this tick (a `superseded`
+/// finding, the live bytes untouched). Without CT5 the original resolved for the OLD generation was
+/// put back into the new one.
+#[cfg(target_os = "macos")]
+#[test]
+fn m10_put_back_revalidates_its_binding_under_the_lock() {
+    let Some(rel) = listed() else {
+        return;
+    };
+    let r = rig("ct5bind");
+    r.put(rel, b"#!/bin/bash\nbroken(\n", 0o755);
+    let pack = r.pack.clone();
+    let fails = move |x: &str, _: &Path, _: Duration| {
+        if x == rel {
+            // an update installs a new generation while the check runs
+            std::fs::write(pack.join(".pack-version"), "0.15.1\n").unwrap();
+            outcome(CheckResult::Fail("bad".into()), 5)
+        } else {
+            outcome(CheckResult::Pass, 5)
+        }
+    };
+    let orig_of = |_: &str| Some(b"#!/bin/bash\necho ok\n".to_vec());
+    let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| {}, excluded: &|_| false };
+    let lock = r.base.join(".pack-apply.lock");
+    let f = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
+    assert!(f.iter().any(|x| x.rel == rel && x.kind == "superseded"), "{f:?}");
+    assert!(!f.iter().any(|x| x.kind == "reverted"), "nothing put back: {f:?}");
+    assert_eq!(std::fs::read(r.pack.join(rel)).unwrap(), b"#!/bin/bash\nbroken(\n");
+}
+
+/// CT5 (major 6): while another writer holds the pack-apply lock, the tick's recovery does NOTHING —
+/// an unfinished operation is not resumed or abandoned (it may be a live writer's, not a crashed
+/// one), and the job state is not written (the tick stays due); once the lock is free the next tick
+/// resumes it. Without CT5 the recovery ran outside the lock.
+#[cfg(target_os = "macos")]
+#[test]
+fn recovery_waits_for_an_active_writer() {
+    let r = rig("ct5lock");
+    let before = r.put("hooks/w.sh", b"OLD\n", 0o755);
+    let (src, incoming) = r.source("w-new", b"NEW\n", 0o755);
+    struct StopAfterRecord;
+    impl crate::repair::apply::Faults for StopAfterRecord {
+        fn at(&self, p: crate::repair::apply::Point, _: &Path, _: Option<&crate::repair::vault::Slot>) -> bool {
+            p == crate::repair::apply::Point::AfterRecord
+        }
+    }
+    let spec = crate::repair::apply::OpSpec { id: rid("R-7"), rel: "hooks/w.sh".into(), kind: "revert".into(), expected: before, incoming, source: Some(src), generation: None };
+    assert!(crate::repair::apply::run_op(&r.env(&StopAfterRecord, ApplyForm::Exchange), &spec).is_err());
+    assert_eq!(crate::repair::wal::unfinished_for_lane(&r.root, &r.lane).len(), 1);
+    let lock = r.base.join(".pack-apply.lock");
+    let d = Doubles { check: &|_, _, _| outcome(CheckResult::Pass, 1), reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| {}, excluded: &|_| false };
+    let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let lock2 = lock.clone();
+    let holder = std::thread::spawn(move || {
+        crate::pack_apply_lock::with_apply_lock(&lock2, || {
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        })
+        .unwrap();
+    });
+    held_rx.recv().unwrap();
+    let rep = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), false).unwrap();
+    assert!(rep.lines.iter().any(|l| l.contains("아무것도 하지 않습니다")), "{:?}", rep.lines);
+    assert_eq!(crate::repair::wal::unfinished_for_lane(&r.root, &r.lane).len(), 1, "not touched while a writer is active");
+    assert!(read_job_state_in(&r.root, &r.lane).is_none(), "the tick stays due");
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    let rep = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), false).unwrap();
+    assert_eq!(rep.resumed, 1, "{:?}", rep.lines);
+    assert!(crate::repair::wal::unfinished_for_lane(&r.root, &r.lane).is_empty());
+}
