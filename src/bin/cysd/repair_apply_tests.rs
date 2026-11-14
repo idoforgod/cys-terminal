@@ -301,6 +301,7 @@ fn revert_accepted_while_grant_paused() {
             prompt_excerpt: String::new(),
             paused_at: None,
             resumed_at: None,
+            generation: 0,
         },
     )
     .unwrap();
