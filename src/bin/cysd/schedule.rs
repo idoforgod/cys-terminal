@@ -768,6 +768,21 @@ fn apply_builtin_jobs(
         //   whatever the stored entry holds (marker or not), logged once per restore. Every OTHER built-in
         //   keeps the rule below unchanged (a user may hold their ids).
         if id == REPAIR_JOB_ID {
+            // CU4: duplicate entries under this id — the first is restored below, the rest dropped
+            let mut seen = false;
+            let before = jobs.len();
+            jobs.retain(|j| {
+                if j.get("id").and_then(|v| v.as_str()) != Some(id.as_str()) {
+                    return true;
+                }
+                let keep = !seen;
+                seen = true;
+                keep
+            });
+            if jobs.len() != before {
+                eprintln!("[cysd] ensure_builtin_jobs: 내장 자가치유 작업 '{id}' 의 중복 항목 {}개를 지움(하나만 남김)", before - jobs.len());
+                changed = true;
+            }
             match jobs
                 .iter()
                 .position(|j| j.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
@@ -8112,5 +8127,26 @@ mod repair_job_schedule_tests {
         let mut js = jobs.clone();
         let (changed, _, _) = apply_builtin_jobs(&mut js);
         assert!(!changed);
+    }
+
+    /// CU4: a duplicate entry under the job's id (one edited, one intact) is restored ONCE and the
+    /// duplicates are dropped; every other job stays byte-identical.
+    #[test]
+    fn duplicate_entries_of_the_job_are_restored_once() {
+        let mut jobs: Vec<serde_json::Value> = Vec::new();
+        apply_builtin_jobs(&mut jobs);
+        let def = jobs.iter().find(|j| j["id"] == REPAIR_JOB_ID).unwrap().clone();
+        let mut broken = def.clone();
+        broken["every_minutes"] = json!(99999);
+        jobs.push(broken);
+        jobs.push(def.clone());
+        let others_before: Vec<serde_json::Value> = jobs.iter().filter(|j| j["id"] != REPAIR_JOB_ID).cloned().collect();
+        let (changed, _, _) = apply_builtin_jobs(&mut jobs);
+        assert!(changed);
+        let mine: Vec<&serde_json::Value> = jobs.iter().filter(|j| j["id"] == REPAIR_JOB_ID).collect();
+        assert_eq!(mine.len(), 1, "one entry");
+        assert_eq!(mine[0], &def, "the whole definition");
+        let others: Vec<serde_json::Value> = jobs.iter().filter(|j| j["id"] != REPAIR_JOB_ID).cloned().collect();
+        assert_eq!(others, others_before);
     }
 }

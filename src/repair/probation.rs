@@ -975,6 +975,27 @@ pub fn m10_sweep(env: &JobEnv<'_>) -> Result<Vec<Finding>, RepairError> {
             continue; // absent: not a changed file (the heal paths own a missing file)
         };
         if !m.file_type().is_file() {
+            // CU4: a boot-critical file replaced by a symbolic link (or anything not a regular file)
+            // is a FINDING — never skipped silently; nothing is followed or put back automatically
+            let what = if m.file_type().is_symlink() {
+                format!("심볼릭 링크 → {}", std::fs::read_link(&live).map(|t| t.display().to_string()).unwrap_or_default())
+            } else {
+                "일반 파일이 아님".to_string()
+            };
+            let key = sha_hex(what.as_bytes());
+            if !existing.iter().any(|f| f.rel == rel && f.kind == "not-a-file" && f.sha256 == key) {
+                new_findings.push(Finding {
+                    rel: rel.to_string(),
+                    sha256: key,
+                    kind: "not-a-file".into(),
+                    at: env.op.now,
+                    notice: true,
+                    notified: false,
+                    slot: None,
+                    kept_copy: None,
+                    note: format!("기동 필수 파일이 일반 파일이 아닙니다({what}) — 따라가거나 되돌리지 않았습니다(워커 검토)"),
+                });
+            }
             continue;
         }
         let Ok(bytes) = std::fs::read(&live) else {

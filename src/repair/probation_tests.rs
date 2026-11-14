@@ -897,3 +897,25 @@ fn the_scan_never_puts_back_less_than_the_approved_copy() {
         }
     }
 }
+
+/// CU4: a boot-critical file replaced by a symbolic link is a FINDING (noticed once), never skipped
+/// silently; nothing is followed or put back.
+#[cfg(unix)]
+#[test]
+fn a_boot_critical_symlink_is_a_finding() {
+    let Some(rel) = listed() else {
+        return;
+    };
+    let r = rig("cu4link");
+    let p = r.pack.join(rel);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    let _ = std::fs::remove_file(&p);
+    std::os::unix::fs::symlink("/nonexistent/elsewhere", &p).unwrap();
+    let d = Doubles { check: &|_, _, _| outcome(CheckResult::Pass, 1), reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| Some(b"x".to_vec()), intake: &|_, _| {}, excluded: &|_| false };
+    let lock = r.base.join(".pack-apply.lock");
+    let f = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
+    assert!(f.iter().any(|x| x.rel == rel && x.kind == "not-a-file" && x.notice), "{f:?}");
+    assert!(std::fs::symlink_metadata(&p).unwrap().file_type().is_symlink(), "left as it is");
+    let again = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW + 3600.0, &lock)).unwrap();
+    assert!(!again.iter().any(|x| x.kind == "not-a-file"), "noticed once");
+}
