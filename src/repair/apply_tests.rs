@@ -2417,3 +2417,21 @@ fn forward_completion_rebuilds_an_existing_row() {
     assert!(row.conflict_live.is_empty());
     assert!(row.probation.as_ref().unwrap().closed.is_none());
 }
+
+/// EJ6 (codex r3 I9): the interrupted revert's recovery sentence follows the measured outcome — a
+/// generation change before the recovery → "대체됨 — 아무것도 더 되돌리지 않았습니다", never "마저 했습니다".
+#[cfg(target_os = "macos")]
+#[test]
+fn the_revert_recovery_sentence_follows_the_outcome() {
+    let r = rig("ej6line");
+    let id = rid("R-54");
+    two_file_general(&r, &id);
+    let stop = StopOn { rel: "hooks/v2.sh", point: Point::AfterRecord, fired: Cell::new(false) };
+    assert!(revert_in(&r.env(&stop, ApplyForm::Exchange), &id, RevertCaller::Human, &no_hooks, &no_repair_lock).is_err());
+    std::fs::write(r.pack.join(".pack-version"), "0.15.1\n").unwrap();
+    let calm = r.env(&NoFaults, ApplyForm::Exchange);
+    resume_interrupted_in(&calm).unwrap();
+    let lines = recover_revert_intents_in(&calm, &no_hooks, &no_repair_lock);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("대체됨") && !lines[0].contains("마저 했습니다"), "{lines:?}");
+}

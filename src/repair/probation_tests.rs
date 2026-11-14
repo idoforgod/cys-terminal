@@ -1213,3 +1213,42 @@ fn a_failing_closure_write_then_a_restart_files_once() {
     let _ = run_tick(&job(&r, &d, ApplyForm::DepositFirst, NOW + 1400.0, &lock), false);
     assert_eq!(n(&filed), 1, "never filed twice");
 }
+
+// ───────────────────────────── RULINGS EK2 — a failed re-check is a fact from the moment it is measured ─────────────────────────────
+
+/// EK2: a re-check fails while another apply / update holds the pack-apply lock — the failure is made
+/// durable IN THAT TICK (the row closed `실패 — 되돌리기 남음 …`); the next tick, past the 24-hour mark
+/// and with the lock free, performs the owed return — never closes it 사용 중. Without EK2 the
+/// deferred failure lived only in memory and the 24-hour close said 사용 중.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_deferred_failed_recheck_is_never_closed_in_use() {
+    let r = rig("ek2owed");
+    let a = rid("R-1");
+    let rec = committed_general(&r, &a, "hooks/e2.sh", Some(b"PRE\n"), Some(b"POST\n"));
+    let fails = |_: &str, _: &Path, _: Duration| outcome(CheckResult::Fail("bad".into()), 5);
+    let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| true };
+    let lock = r.base.join(".pack-apply.lock");
+    let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let lock2 = lock.clone();
+    let holder = std::thread::spawn(move || {
+        crate::pack_apply_lock::with_apply_lock(&lock2, || {
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        })
+        .unwrap();
+    });
+    held_rx.recv().unwrap();
+    let row = ledger::read_lane_in(&r.root, &a, &r.lane).unwrap().unwrap();
+    let mut report = TickReport::default();
+    recheck_one(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), &rec, &row, &mut report).unwrap();
+    let closed = ledger::read_lane_in(&r.root, &a, &r.lane).unwrap().unwrap().probation.unwrap().closed.unwrap();
+    assert!(crate::repair::apply::closure_owes_return(&closed), "the failure is durable in that tick: {closed}");
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    let rep = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW + 2.0 * 86_400.0, &lock), false).unwrap();
+    assert!(rep.reverted.contains(&a), "the owed return was made: {:?}", rep.lines);
+    assert!(!rep.ended.contains(&a), "never 사용 중");
+    assert_eq!(ledger::read_record_in(&r.root, &a).unwrap().unwrap().state, RepairState::Reverted);
+}

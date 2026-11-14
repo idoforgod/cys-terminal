@@ -1471,6 +1471,15 @@ pub fn pre_image_for(
 pub const CLOSED_FAILED: &str = "실패";
 pub const CLOSED_REVERTED: &str = "되돌려짐";
 pub const BY_DAEMON_AUTO: &str = "데몬(자동)";
+/// RULINGS EK2 / EN7 — a failed re-check whose automatic return was deferred (the pack-apply lock
+/// held) is closed `실패 — 되돌리기 남음 · …` IN THAT TICK: the failure is a fact of the row from the
+/// moment it is measured; the return stays owed and is retried at later ticks (never 사용 중).
+pub const RETURN_OWED: &str = "되돌리기 남음";
+
+/// Whether a lane row's closure still owes the automatic return (EK2).
+pub fn closure_owes_return(closed: &str) -> bool {
+    closed.starts_with(&format!("{CLOSED_FAILED} — {RETURN_OWED}"))
+}
 
 /// Whether a lane row's closure is one that owes an intake row (EN1): the probation closed FAILED,
 /// or closed by the daemon's automatic return.
@@ -1560,7 +1569,12 @@ pub fn recover_revert_intents_in(env: &OpEnv<'_>, hooks: &HookStepFn<'_>, locked
             }
         };
         match recover_one_revert(env, &rec, &mut ri, hooks, locked) {
-            Ok(r) => lines.push(format!("{}: 끊긴 되돌리기를 마저 했습니다({:?})", id.as_str(), r.outcome)),
+            // EJ6: the sentence follows the measured outcome
+            Ok(r) => lines.push(match &r.outcome {
+                ApplyOutcome::Applied => format!("{}: 끊긴 되돌리기를 마저 했습니다(완료)", id.as_str()),
+                ApplyOutcome::Superseded(m) => format!("{}: 끊긴 되돌리기는 대체됨 — 아무것도 더 되돌리지 않았습니다({m})", id.as_str()),
+                ApplyOutcome::Declined(m) => format!("{}: 끊긴 되돌리기를 다 마치지 못했습니다 — 남은 것: {m}", id.as_str()),
+            }),
             Err(e) => lines.push(format!("{}: 끊긴 되돌리기를 마치지 못했습니다 — 다음 차례에 다시({e:?})", id.as_str())),
         }
     }

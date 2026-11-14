@@ -678,7 +678,7 @@ fn probation_pass(env: &JobEnv<'_>, report: &mut TickReport) {
         let Some(p) = row.probation.clone() else {
             continue;
         };
-        if p.closed.is_some() {
+        if p.closed.as_deref().is_some_and(|c| !apply::closure_owes_return(c)) {
             continue;
         }
         let rec = match ledger::read_record_in(root, &id) {
@@ -749,7 +749,26 @@ pub fn recheck_one(env: &JobEnv<'_>, rec: &RepairRecord, row: &LaneRecord, repor
     let Some(p) = row.probation.as_ref() else {
         return Ok(());
     };
-    if p.closed.is_some() {
+    if let Some(closed) = p.closed.as_deref() {
+        if !apply::closure_owes_return(closed) || env.op.form != ApplyForm::Exchange {
+            return Ok(());
+        }
+        // EK2: the owed return is retried (the recorded failure stands — nothing is re-measured)
+        drop(guard);
+        match crate::pack_apply_lock::try_with_apply_lock(env.apply_lock, || {
+            revert_in(&env.op, &rec.id, RevertCaller::DaemonAuto, env.hooks, env.locked)
+        }) {
+            Ok(Some(Ok(r))) if r.outcome == ApplyOutcome::Applied => {
+                report.reverted.push(rec.id.clone());
+                report.lines.push(format!("{}: 미뤄 둔 되돌리기를 했습니다(시험 기간 재검사 실패)", rec.id.as_str()));
+            }
+            Ok(Some(r)) => report.lines.push(format!("{}: 미뤄 둔 되돌리기를 하지 못했습니다 — 다음 차례에 다시({r:?})", rec.id.as_str())),
+            Ok(None) => {
+                report.deferred_probation = true;
+                report.lines.push(format!("{}: 미뤄 둔 되돌리기 — 팩이 아직 쓰이는 중(다음 차례에 다시)", rec.id.as_str()));
+            }
+            Err(e) => report.lines.push(format!("{}: 미뤄 둔 되돌리기 — 잠금을 확인할 수 없음({e})", rec.id.as_str())),
+        }
         return Ok(());
     }
     let id = &rec.id;
@@ -829,8 +848,12 @@ pub fn recheck_one(env: &JobEnv<'_>, rec: &RepairRecord, row: &LaneRecord, repor
             }) {
                 Ok(Some(r)) => r,
                 Ok(None) => {
+                    // EK2: the failure is made durable NOW (the closure; the return still owed)
+                    if !row.probation.as_ref().and_then(|p| p.closed.as_deref()).is_some_and(apply::closure_owes_return) {
+                        close_failed(env, id, &format!("{} · 재검사 실패, 다른 적용이나 업데이트가 팩을 바꾸는 중이라 되돌리기를 미룸 · {why}", apply::RETURN_OWED))?;
+                    }
                     report.deferred_probation = true;
-                    report.lines.push(format!("{}: 재검사 실패 — 다른 적용이나 업데이트가 팩을 바꾸는 중이라 이번 차례에는 되돌리지 않았습니다(다음 차례에 다시)", id.as_str()));
+                    report.lines.push(format!("{}: 재검사 실패 — 다른 적용이나 업데이트가 팩을 바꾸는 중이라 이번 차례에는 되돌리지 않았습니다(실패로 기록 · 다음 차례에 다시)", id.as_str()));
                     return Ok(());
                 }
                 Err(e) => Err(RepairError::Io(e)),
