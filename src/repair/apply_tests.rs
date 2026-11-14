@@ -2377,3 +2377,43 @@ fn recovery_leaves_a_repair_alone_while_its_owner_runs() {
         assert_eq!(called.get(), 0);
     });
 }
+
+/// EJ5 (codex r3 I8): forward completion REBUILDS the repair's lane row — an earlier incomplete apply
+/// left a 충돌 row (old applied subset, old approval reference); the fresh apply crashes after its
+/// record commit; the recovery replaces this repair's row fields from the record and the intent.
+/// Without EJ5 the existing row was skipped and kept its old subset and reference.
+#[cfg(target_os = "macos")]
+#[test]
+fn forward_completion_rebuilds_an_existing_row() {
+    let r = rig("ej5row");
+    let id = rid("R-53");
+    let files = two_target_candidate(&r, &id);
+    // the leftover of an earlier, incomplete apply
+    ledger::write_lane_in(&r.root, &LaneRecord {
+        schema: 1,
+        repair: id.clone(),
+        lane: r.lane.clone(),
+        state: LaneState::Conflict,
+        probation: Some(Probation { pack_generation: "0.15.0".into(), pro_revision: None, applied_at: 1.0, expected: vec![("hooks/a1.sh".into(), "absent".into())], closed: None, check_timings: Vec::new(), check_timeouts: Vec::new() }),
+        merge: None,
+        merge_history: Vec::new(),
+        approval_ref: Some("rqr-old".into()),
+        conflict_live: vec![("hooks/a1.sh".into(), "absent".into())],
+        applied: vec![("hooks/a1.sh".into(), "absent".into())],
+        applied_history: Vec::new(),
+        merge_base: Vec::new(),
+        merge_lock: None,
+        merge_attempt: 0,
+        updated_at: 1.0,
+    }).unwrap();
+    let stop = StopOn { rel: "hooks/a1.sh", point: Point::AfterRecordCommit, fired: Cell::new(false) };
+    assert!(apply_candidate_in(&r.env(&stop, ApplyForm::Exchange), &id, &files, &|_, _, _| Ok(()), &pass_check, &pass_ref, &no_repair_lock).is_err());
+    let calm = r.env(&NoFaults, ApplyForm::Exchange);
+    recover_apply_intents_in(&calm, &no_repair_lock);
+    let row = ledger::read_lane_in(&r.root, &id, &r.lane).unwrap().unwrap();
+    assert_eq!(row.state, LaneState::Verified);
+    assert_eq!(row.applied.len(), 2, "both targets: {:?}", row.applied);
+    assert_eq!(row.approval_ref.as_deref(), Some("rqr-1"), "the fresh approval's reference");
+    assert!(row.conflict_live.is_empty());
+    assert!(row.probation.as_ref().unwrap().closed.is_none());
+}

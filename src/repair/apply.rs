@@ -2432,36 +2432,38 @@ fn recover_one_intent(env: &OpEnv<'_>, intent: &mut ApplyIntent, locked: &Repair
         let now = env.now;
         locked(&id, &mut || {
         let _mutex_scope = super::guard::MutexScope::enter();
-            if ledger::read_lane_in(&root, &idc, &lane)?.is_none() {
-                ledger::write_lane_in(
-                    &root,
-                    &ledger::LaneRecord {
-                        schema: super::REPAIR_SCHEMA,
-                        repair: idc.clone(),
-                        lane: lane.clone(),
-                        state: LaneState::Verified,
-                        probation: Some(ledger::Probation {
-                            pack_generation: gen_version.clone(),
-                            pro_revision: gen_pro,
-                            applied_at,
-                            expected: committed.clone(),
-                            closed: None,
-                            check_timings: Vec::new(),
-                            check_timeouts: Vec::new(),
-                        }),
-                        merge: None,
-                        merge_history: Vec::new(),
-                        approval_ref: request.clone(),
-                        conflict_live: Vec::new(),
-                        applied: committed.clone(),
-                        applied_history: Vec::new(),
-                        merge_base: Vec::new(),
-                        merge_lock: None,
-                        merge_attempt: 0,
-                        updated_at: now,
-                    },
-                )?;
-            }
+            // EJ5: THIS repair's row fields are rebuilt from the committed record and the intent
+            // whether or not a row exists (an older row's applied subset, approval reference or
+            // probation state is replaced); the lines of other events (merges, history) are kept
+            let previous = ledger::read_lane_in(&root, &idc, &lane)?;
+            ledger::write_lane_in(
+                &root,
+                &ledger::LaneRecord {
+                    schema: super::REPAIR_SCHEMA,
+                    repair: idc.clone(),
+                    lane: lane.clone(),
+                    state: LaneState::Verified,
+                    probation: Some(ledger::Probation {
+                        pack_generation: gen_version.clone(),
+                        pro_revision: gen_pro,
+                        applied_at,
+                        expected: committed.clone(),
+                        closed: None,
+                        check_timings: Vec::new(),
+                        check_timeouts: Vec::new(),
+                    }),
+                    merge: previous.as_ref().and_then(|p| p.merge.clone()),
+                    merge_history: previous.as_ref().map(|p| p.merge_history.clone()).unwrap_or_default(),
+                    approval_ref: request.clone(),
+                    conflict_live: Vec::new(),
+                    applied: committed.clone(),
+                    applied_history: previous.as_ref().map(|p| p.applied_history.clone()).unwrap_or_default(),
+                    merge_base: previous.as_ref().map(|p| p.merge_base.clone()).unwrap_or_default(),
+                    merge_lock: previous.as_ref().and_then(|p| p.merge_lock.clone()),
+                    merge_attempt: previous.as_ref().map(|p| p.merge_attempt).unwrap_or(0),
+                    updated_at: now,
+                },
+            )?;
             Ok(())
         })?;
         set_intent_state(env.root, intent, "applied", "기록이 이미 시험 기간이었습니다 — 부서 행을 마저 쓰고 끝냄", env.now)?;
