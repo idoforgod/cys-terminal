@@ -1011,16 +1011,6 @@ fn safe_parts(rel: &str) -> Option<Vec<&str>> {
     Some(parts)
 }
 
-/// Reads into `buf`, retrying an interrupted read.
-fn read_some(input: &mut impl std::io::Read, buf: &mut [u8]) -> std::io::Result<usize> {
-    loop {
-        match std::io::Read::read(input, buf) {
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            other => return other,
-        }
-    }
-}
-
 /// SHA-256 (FIPS 180-4), streaming: this crate has no hashing dependency, and a copy is hashed while
 /// it is written (RULINGS DB2) and a kept copy re-hashed under the budget before it is reused (DB1).
 pub(crate) struct Sha256 {
@@ -1123,10 +1113,11 @@ pub(crate) enum CopyStop {
     Io(String),
 }
 
-/// RULINGS DB2 / DP1: copies at most `expected` bytes (the length the scan saw) in chunks of
-/// `COPY_CHUNK`, hashing them as they are written. The deadline and the abandon flag are checked before
-/// every read and before EVERY write call — after a read returns, between the partial writes of one
-/// chunk and before each retry of an interrupted write — so no write starts after the timeout. At
+/// RULINGS DB2 / DP1 / DW1: copies at most `expected` bytes (the length the scan saw) in chunks of
+/// `COPY_CHUNK`, hashing them as they are written. There is ONE place that starts a read call and ONE
+/// that starts a write call, and each asks the budget (deadline, abandon flag) immediately before the
+/// call — also before the retry of an interrupted read or write and between the partial writes of one
+/// chunk — so no read or write call starts after the timeout. At
 /// `expected` one more byte is read to see whether the source grew; that byte is never written and
 /// the copy ends `Grew`. Returns the bytes written — only what the write calls returned, however the
 /// copy ends, so the capture cap holds for what is really on disk — and the sha256 of the written
@@ -1137,13 +1128,16 @@ pub(crate) fn copy_stream(input: &mut impl std::io::Read, output: &mut impl std:
     let mut buf = vec![0u8; COPY_CHUNK];
     let mut written: u64 = 0;
     loop {
-        if let Err(h) = budget.check() {
-            return (written, Err(CopyStop::Halted(h)));
-        }
         let room = expected.saturating_sub(written).min(COPY_CHUNK as u64) as usize;
-        let n = match read_some(input, &mut buf[..room.max(1)]) {
-            Ok(n) => n,
-            Err(e) => return (written, Err(CopyStop::Io(e.to_string()))),
+        let n = loop {
+            if let Err(h) = budget.check() {
+                return (written, Err(CopyStop::Halted(h)));
+            }
+            match std::io::Read::read(input, &mut buf[..room.max(1)]) {
+                Ok(n) => break n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return (written, Err(CopyStop::Io(e.to_string()))),
+            }
         };
         if n == 0 {
             return (written, Ok(hasher.finish_hex()));
@@ -3409,6 +3403,58 @@ mod tests {
         let (written, result) = copy_stream(&mut &data[..], &mut w, data.len() as u64, &budget);
         assert!(matches!(&result, Err(CopyStop::Io(e)) if e.contains("the disk is full")), "{result:?}");
         assert_eq!((written, w.out.len(), w.calls), (4096, 4096, 2));
+    }
+
+    /// The test's reader: on its first call it lets the budget run out — sets the abandon flag, or waits
+    /// until the deadline has passed — and returns `Interrupted`; later calls return data. Counts calls.
+    struct InterruptedFirstRead<'a> {
+        flag: Option<&'a AtomicBool>,
+        until: Option<Instant>,
+        calls: usize,
+    }
+    impl std::io::Read for InterruptedFirstRead<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.calls += 1;
+            if self.calls > 1 {
+                buf.fill(5);
+                return Ok(buf.len());
+            }
+            if let Some(flag) = self.flag {
+                flag.store(true, Ordering::SeqCst);
+            }
+            if let Some(until) = self.until {
+                while Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            Err(std::io::ErrorKind::Interrupted.into())
+        }
+    }
+
+    /// DW1 (a): the retry of an interrupted read is a new read call and stands behind the same budget
+    /// check — the flag set during the first read means no second read and no write.
+    #[test]
+    fn dw1_no_read_retry_after_the_flag() {
+        let flag = AtomicBool::new(false);
+        let budget = Budget { deadline: Instant::now() + Duration::from_secs(3_600), abandon: &flag };
+        let mut r = InterruptedFirstRead { flag: Some(&flag), until: None, calls: 0 };
+        let mut w = ScriptedWriter { flag: &flag, per_call: COPY_CHUNK, steps: Vec::new(), calls: 0, out: Vec::new() };
+        let (written, result) = copy_stream(&mut r, &mut w, 1000, &budget);
+        assert_eq!((r.calls, w.calls, written), (1, 0, 0), "read calls, write calls, bytes written");
+        assert_eq!(result, Err(CopyStop::Halted(Halt::Abandoned)));
+    }
+
+    /// DW1 (b): the same when the deadline passes during the first read.
+    #[test]
+    fn dw1_no_read_retry_after_the_deadline() {
+        let calm = AtomicBool::new(false);
+        let deadline = Instant::now() + Duration::from_millis(20);
+        let budget = Budget { deadline, abandon: &calm };
+        let mut r = InterruptedFirstRead { flag: None, until: Some(deadline), calls: 0 };
+        let mut w = ScriptedWriter { flag: &calm, per_call: COPY_CHUNK, steps: Vec::new(), calls: 0, out: Vec::new() };
+        let (written, result) = copy_stream(&mut r, &mut w, 1000, &budget);
+        assert_eq!((r.calls, w.calls, written), (1, 0, 0), "read calls, write calls, bytes written");
+        assert_eq!(result, Err(CopyStop::Halted(Halt::Deadline)));
     }
 
     /// Between the scan and the copies the edited `site.py` grows by 3 MiB.
