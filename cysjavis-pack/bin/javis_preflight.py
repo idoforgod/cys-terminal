@@ -1190,6 +1190,39 @@ def is_dept_pack():
         return False
 
 
+def _hermetic_test():
+    """시험 전용 스위치(0.15.0 · T5a · RULINGS AN4 · AP1) — 실제 설치에서는 **켤 수 없다**.
+
+    참은 다음이 **전부** 성립할 때뿐이다: `CYS_PREFLIGHT_HERMETIC_TEST=1` · Windows 가 아니다 ·
+    root(uid 0 · euid 0)가 아니다 · `CYS_TEST_ISOLATED_HOME` 이 현재 HOME 과 **같은 디렉터리**다 · 그 HOME 이
+    **계정의 홈이 아니다**(비밀번호 데이터베이스 `pwd.getpwuid(os.getuid()).pw_dir` 와 비교 — 환경변수로
+    속일 수 없다). 같은지는 `os.path.samefile` 로 잰다(RULINGS BN3 (a) — 경로 문자열 비교는 대소문자만 다른
+    표기 `/users/x` 를 다른 곳으로 본다). 하나라도 없거나 판정 중 오류가 나면 거짓(검사는 제품 그대로
+    돈다). root 거부는 `sudo -E`(uid 0 · 계정의 HOME 유지 — root 의 pw_dir 은 /var/root)를 막는다.
+    켜지면 이 기계의 절대 경로에 손대지 않는다: C65 는 기계 고정 cys 후보(/Applications · /opt/homebrew)를
+    보지 않고, C11b 는 HOME 밖의 링크를 정리 후보로 삼지 않으며, C20 은 인터프리터 pip 설치
+    (`python -m pip install`)를 하지 않는다."""
+    try:
+        if os.environ.get("CYS_PREFLIGHT_HERMETIC_TEST") != "1":
+            return False
+        if os.name == "nt" or sys.platform.startswith("win"):
+            return False
+        if os.getuid() == 0 or os.geteuid() == 0:
+            return False
+        mark = os.environ.get("CYS_TEST_ISOLATED_HOME", "")
+        if not mark:
+            return False
+        home = os.path.expanduser("~")
+        if not os.path.samefile(mark, home):
+            return False
+        import pwd
+        account_home = pwd.getpwuid(os.getuid()).pw_dir
+        # an account home that does not exist cannot be this (existing) HOME
+        return not (os.path.exists(account_home) and os.path.samefile(account_home, home))
+    except Exception:                    # noqa: BLE001 — 판정 불능(없는 경로 포함)은 '꺼짐'이다
+        return False
+
+
 def _path_under_tempdir(p):
     """p 가 임시 디렉터리(/tmp·/private/tmp·$TMPDIR·/var/folders·/private/var/folders) 아래인가.
     임시 pack 예방 가드(discover_claude_settings)와 C57 temp-훅 청소기의 공용 술어.
@@ -3150,6 +3183,8 @@ class Preflight:
             if not cand:
                 continue
             cand = os.path.abspath(cand)
+            if _hermetic_test() and not cand.startswith(os.path.expanduser("~") + os.sep):
+                continue                 # T5a · AN4 시험 전용 스위치 — HOME 밖 링크는 정리 후보가 아니다
             if cand != link and cand not in seen:
                 seen.add(cand)
                 cands.append(cand)
@@ -3634,8 +3669,9 @@ class Preflight:
             candidates.append(["uv", "tool", "install", "--force", NLM_PIN])
         if shutil.which("pipx"):
             candidates.append(["pipx", "install", "--force", NLM_PIN])
-        candidates.append([sys.executable, "-m", "pip", "install", "--user",
-                           "--upgrade", NLM_PIN])
+        if not _hermetic_test():         # T5a · AN4 시험 전용 스위치 — 인터프리터 pip 설치 생략
+            candidates.append([sys.executable, "-m", "pip", "install", "--user",
+                               "--upgrade", NLM_PIN])
         for cmd in candidates:
             try:
                 if subprocess.run(cmd, capture_output=True, timeout=600).returncode == 0:
@@ -6575,12 +6611,13 @@ class Preflight:
         candidates = []
         if os.environ.get("CYS_BIN"):
             candidates.append(os.environ["CYS_BIN"])
-        candidates += [
-            "/Applications/cys.app/Contents/MacOS/cys",
-            os.path.expanduser("~/Applications/cys.app/Contents/MacOS/cys"),
-            os.path.expanduser("~/.local/bin/cys"),
-            "/opt/homebrew/bin/cys",
-        ]
+        if not _hermetic_test():         # T5a · AN4 시험 전용 스위치 — 기계 고정 후보 생략
+            candidates += [
+                "/Applications/cys.app/Contents/MacOS/cys",
+                os.path.expanduser("~/Applications/cys.app/Contents/MacOS/cys"),
+                os.path.expanduser("~/.local/bin/cys"),
+                "/opt/homebrew/bin/cys",
+            ]
         w = shutil.which("cys")
         if w:
             candidates.append(w)

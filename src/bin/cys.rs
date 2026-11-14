@@ -41488,8 +41488,20 @@ mod tests {
         let local = td.parent().unwrap().join("local");
         let _l = cys::pack::EnvGuard::set("CYS_LOCAL_DIR", &local);
         let root = local.join("update-snapshots");
-        let user_rel = "agents.json".to_string();
+        // ★T5a 재기반 2단계: user 파일 갈래의 검체는 두 컴파일 목록에 **없는** user 파일이다(종전 `agents.json` 은 T5a 의
+        //   실제 목록에서 기동 필수 행 — 등재 파일의 되돌리기 거부는 `t2f_*` 시험이 잰다).
+        let user_rel = cys::pack::PACK_ALL
+            .iter()
+            .map(|(r, _)| r.to_string())
+            .find(|r| {
+                // a user-owned JSON setting (not a constitution file — those have their own merge rules)
+                r.ends_with(".json")
+                    && cys::pack::ownership_name_scoped(r, &td) == "user"
+                    && !cys::pack::listed_in_compiled_lists(r)
+            })
+            .expect("an unlisted user-owned pack file");
         assert_eq!(cys::pack::ownership_name_scoped(&user_rel, &td), "user");
+        std::fs::create_dir_all(td.join(&user_rel).parent().unwrap()).unwrap();
         let none = |_: &str| Vec::<String>::new();
         let caps = (cys::pack::UPDATE_SNAPSHOT_FILE_CAP, cys::pack::UPDATE_SNAPSHOT_TOTAL_CAP);
         let old = "PREVIOUS RELEASE BYTES\n";
@@ -41623,7 +41635,9 @@ mod tests {
         // 술어는 목록 대조 키(접은 철자)를 받는다 — 이음새도 접은 키로 비교한다.
         let r1 = cys::pack::list_key(&rel);
         let listed = cys::pack::UpdateSources::none().with_listed(move |r| r == r1);
-        let plain = cys::pack::UpdateSources::none();
+        // ★T5a 재기반 2단계: 대조군은 '등재되지 않음'을 이음새로 명시한다 — T5a 의 실제 목록이 들어온 뒤
+        //   `UpdateSources::none()` 은 `agents.json`(기동 필수 3갈래) 같은 대조군 파일을 등재로 답한다.
+        let plain = cys::pack::UpdateSources::none().with_listed(|_| false);
         let mine = "MY UNAPPROVED BOOT EDIT\n";
         // ── pack-adopt <rel> / --from / --all ──
         std::fs::write(td.join(&rel), &embed).unwrap();
@@ -41789,8 +41803,10 @@ mod tests {
         std::fs::write(&stored, "TAMPERED\n").unwrap();
         assert_eq!(run_pack_rollback_with(Some(urel.clone()), true, true, false, &lu), 1, "등재 파일 강행 불가");
         assert_eq!(std::fs::read_to_string(td.join(&urel)).unwrap(), "AFTER\n");
-        // 대조군: 등재되지 않은 user 파일은 종전대로 강행한다.
-        assert_eq!(run_pack_rollback_with(Some(urel.clone()), true, true, false, &cys::pack::UpdateSources::none()), 0);
+        // 대조군: 등재되지 않은 user 파일은 종전대로 강행한다(★T5a 재기반 2단계: '등재 아님'을 이음새로 명시 — 실제
+        //   목록에서는 `agents.json` 이 기동 필수 행이다).
+        let unlisted = cys::pack::UpdateSources::none().with_listed(|_| false);
+        assert_eq!(run_pack_rollback_with(Some(urel.clone()), true, true, false, &unlisted), 0);
         assert_eq!(std::fs::read_to_string(td.join(&urel)).unwrap(), "TAMPERED\n");
         // (c) 색인이 `released: true` 라고 해도(색인 변조) 쓰려는 바이트가 출시본이 아니면 거부.
         std::fs::write(&stored, "SNAPSHOTTED\n").unwrap();
@@ -42025,6 +42041,132 @@ mod tests {
         assert_eq!(std::fs::read_to_string(td.join(&rel)).unwrap(), mine, "살아 있는 바이트 무변경");
         assert_eq!(t4_ledger_kind(&td, &rel), None, "병합 대기만 닫는다");
         let _ = std::fs::remove_dir_all(td.parent().unwrap());
+    }
+
+    /// ★T5a 재기반 2단계(RULINGS BC2 · BD4 · BH6): 넓힌 단일 술어 — 생성된 **보호 목록의 모든 행** × 팩 쓰기 동사의 모든
+    /// 형태를 **실제 술어**(`UpdateSources::none()` = `listed_in_compiled_lists`, 이음새 없음)로 잰다. 출시본이 아닌 바이트는
+    /// 거부되고 아무것도 쓰이지 않는다: 되살리기 `<rel>` · `--from`(등재 문장 그대로) · `--all` 건너뛰기, 3-way 합치기,
+    /// `--take-new`(BV2 문장), `--ai`(순수 관문 — 등재 문장 그대로), 병합 되돌리기, 되돌리기 스냅샷 원천(그대로 · 강행) ·
+    /// pack.prev 원천(강행). 살아 있는 바이트를 바꾸지 않는 `--keep-mine` 은 허용된다(BH6). 표는 생성된 보호 행에서 온다 —
+    /// 행이 늘면 이 시험을 고치지 않아도 덮인다.
+    #[test]
+    fn t5a_every_protection_row_is_refused_by_every_pack_writer() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let rows = cys::repair::boot_critical::protection_entries();
+        assert!(!rows.is_empty(), "the generated protection list is empty");
+        let real = cys::pack::UpdateSources::none();
+        let mut refusals = 0usize;
+        for (i, row) in rows.iter().enumerate() {
+            let rel = row.rel.to_string();
+            let (td, _sys, _embed, _env) = t4_system_fixture(&format!("t5aprot{i}"));
+            let base = td.parent().unwrap().to_path_buf();
+            assert!(real.is_listed(&rel), "{rel}: the widened predicate answers listed");
+            if let Some(p) = td.join(&rel).parent() {
+                std::fs::create_dir_all(p).unwrap();
+            }
+            let (b3, mine, theirs) = if rel.ends_with(".json") || rel.ends_with(".example") {
+                (
+                    "{\n  \"a\": 1,\n  \"b\": 2,\n  \"c\": 3\n}\n",
+                    "{\n  \"a\": 10,\n  \"b\": 2,\n  \"c\": 3\n}\n",
+                    "{\n  \"a\": 1,\n  \"b\": 2,\n  \"c\": 30\n}\n",
+                )
+            } else {
+                (
+                    "#!/bin/sh\nline-1\nline-2\nline-3\n",
+                    "#!/bin/sh\nline-1 MINE\nline-2\nline-3\n",
+                    "#!/bin/sh\nline-1\nline-2\nline-3 VENDOR\n",
+                )
+            };
+            let live = |td: &std::path::Path| std::fs::read_to_string(td.join(&rel)).ok();
+            // ── pack-adopt <rel> · --from · --all ──
+            std::fs::write(td.join(&rel), mine).unwrap();
+            std::fs::write(td.join(format!("{rel}.user")), theirs).unwrap();
+            let adopt_refusal = cys::pack::listed_file_refusal(&rel, "cys pack-adopt");
+            assert_eq!(adopt_one(&td, &rel, None, false, true, &real), Err(adopt_refusal.clone()), "adopt {rel}");
+            let ext = base.join("ext-copy");
+            std::fs::write(&ext, theirs).unwrap();
+            let ext_s = ext.display().to_string();
+            assert_eq!(adopt_one(&td, &rel, Some(ext_s.as_str()), false, true, &real), Err(adopt_refusal), "--from {rel}");
+            assert_eq!(run_pack_adopt_with(Some(rel.clone()), false, None, false, true, &real), 1, "adopt {rel}");
+            assert_eq!(adopt_list_line(&td, &rel, &real).1, Some("boot-critical"), "--all skips {rel}");
+            assert_eq!(live(&td).as_deref(), Some(mine), "adopt wrote nothing: {rel}");
+            refusals += 3;
+            // ── pack-merge: 3-way · --take-new · --ai (user-kept: my copy live, a vendor `.new`) ──
+            let park = |td: &std::path::Path| {
+                std::fs::write(td.join(&rel), mine).unwrap();
+                std::fs::write(td.join(format!("{rel}.new")), theirs).unwrap();
+                t4_pristine_set(td, &rel, b3);
+                t4_manifest_set(td, &rel, b3);
+                t4_write_ledger(
+                    td,
+                    &rel,
+                    serde_json::json!({"kind": "user-kept", "side": format!("{rel}.new"), "version": "x", "ts": 0}),
+                );
+            };
+            park(&td);
+            let yes = MergeFlags { yes: true, ..MergeFlags::default() };
+            assert_eq!(run_pack_merge_with(Some(rel.clone()), yes, None, &real), 1, "pack-merge {rel}");
+            assert_eq!(live(&td).as_deref(), Some(mine), "merge wrote nothing: {rel}");
+            assert_eq!(t4_ledger_kind(&td, &rel).as_deref(), Some("user-kept"), "{rel}");
+            let take = MergeFlags { yes: true, take_new: true, ..MergeFlags::default() };
+            assert_eq!(run_pack_merge_with(Some(rel.clone()), take, None, &real), 1, "--take-new {rel}");
+            assert_eq!(live(&td).as_deref(), Some(mine), "take-new wrote nothing: {rel}");
+            assert_eq!(
+                ai_merge_refusal(&rel, real.is_listed(&rel)),
+                Some(cys::pack::listed_file_refusal(&rel, "cys pack-merge --ai")),
+                "--ai {rel}"
+            );
+            refusals += 3;
+            // the no-op `--keep-mine` (my copy stays live) is allowed — it only closes the pending merge
+            let keep = MergeFlags { yes: true, keep_mine: true, ..MergeFlags::default() };
+            assert_eq!(run_pack_merge_with(Some(rel.clone()), keep, None, &real), 0, "--keep-mine {rel}");
+            assert_eq!(live(&td).as_deref(), Some(mine), "keep-mine changed no live byte: {rel}");
+            assert_eq!(t4_ledger_kind(&td, &rel), None, "{rel}");
+            // ── pack-merge --revert-merge: a capture that is not a released byte ──
+            let cap_rel = format!("seg-1/{rel}");
+            let cap = cys::pack::pack_captures_dir(&td).join(&cap_rel);
+            std::fs::create_dir_all(cap.parent().unwrap()).unwrap();
+            std::fs::write(&cap, theirs).unwrap();
+            std::fs::write(td.join(&rel), "MERGED NOW\n").unwrap();
+            t4_write_ledger(&td, &rel, serde_json::json!({"kind": "merged", "capture": cap_rel, "version": "x", "ts": 0}));
+            assert_eq!(run_pack_merge_with(None, yes, Some(rel.clone()), &real), 1, "revert-merge {rel}");
+            assert_eq!(live(&td).as_deref(), Some("MERGED NOW\n"), "revert-merge wrote nothing: {rel}");
+            refusals += 1;
+            // ── pack-rollback from pack.prev (no snapshot in this lane) — forced ──
+            let local_prev = base.join("local-prev");
+            let lp = cys::pack::EnvGuard::set("CYS_LOCAL_DIR", &local_prev);
+            let prev = cys::pack::pack_prev_dir(&td);
+            std::fs::create_dir_all(prev.join(&rel).parent().unwrap()).unwrap();
+            std::fs::write(prev.join(".pack-version"), "0.14.56\n").unwrap();
+            std::fs::write(prev.join(&rel), "UNRELEASED IN PACK.PREV\n").unwrap();
+            let mut pm = std::collections::BTreeMap::new();
+            pm.insert(rel.clone(), cys::pack::content_hash_pub("RELEASED 0.14.56\n"));
+            std::fs::write(prev.join(cys::pack::INSTALL_MANIFEST), serde_json::to_string(&pm).unwrap()).unwrap();
+            std::fs::write(td.join(&rel), mine).unwrap();
+            assert_eq!(run_pack_rollback_with(Some(rel.clone()), true, true, false, &real), 1, "pack.prev {rel}");
+            assert_eq!(live(&td).as_deref(), Some(mine), "pack.prev rollback wrote nothing: {rel}");
+            drop(lp);
+            refusals += 1;
+            // ── pack-rollback from the lane's update snapshot — plain and forced ──
+            let local = base.join("local-snap");
+            let ls = cys::pack::EnvGuard::set("CYS_LOCAL_DIR", &local);
+            let none_fn = |_: &str| Vec::<String>::new();
+            let caps = (cys::pack::UPDATE_SNAPSHOT_FILE_CAP, cys::pack::UPDATE_SNAPSHOT_TOTAL_CAP);
+            std::fs::write(td.join(&rel), theirs).unwrap();
+            let _snap = cys::pack::create_update_snapshot(
+                &td, &local.join("update-snapshots"), "base", "0.14.56", &std::collections::BTreeMap::new(),
+                &[rel.clone()], cys::pack::PackScope::Base, &none_fn, caps,
+            )
+            .unwrap();
+            std::fs::write(td.join(&rel), mine).unwrap();
+            assert_eq!(run_pack_rollback_with(Some(rel.clone()), true, false, false, &real), 1, "snapshot {rel}");
+            assert_eq!(run_pack_rollback_with(Some(rel.clone()), true, true, false, &real), 1, "snapshot forced {rel}");
+            assert_eq!(live(&td).as_deref(), Some(mine), "snapshot rollback wrote nothing: {rel}");
+            drop(ls);
+            refusals += 2;
+            let _ = std::fs::remove_dir_all(&base);
+        }
+        assert_eq!(refusals, rows.len() * 10, "every row × every verb form");
     }
 
     /// RULINGS AB1: `cys pack-plan` 의 버킷 목록이 설치 계획의 **모든** 버킷을 보인다 — 신설 세 버킷(user-kept ·
@@ -42826,6 +42968,9 @@ mod tests {
                     r.starts_with(prefix)
                         && cys::pack::ownership_name_scoped(r, &td) == "system"
                         && *r != "trusted-keys.json"
+                        // ★T5a 재기반 2단계: 사건 형상의 검체는 등재되지 않은 system 파일이다 — 등재 파일(기동 필수·보호
+                        //   목록)은 `--all` 이 건너뛴다(T2f BD4 · `t2f_every_pack_writer_refuses_a_listed_file` 가 잰다).
+                        && !cys::pack::listed_in_compiled_lists(r)
                 })
                 .skip(skip)
                 .take(n)

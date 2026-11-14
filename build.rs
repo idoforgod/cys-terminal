@@ -11,6 +11,9 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+#[path = "src/repair/boot_critical_derive.rs"]
+mod boot_critical_derive;
+
 fn main() {
     // cysjavis-pack 전체를 임베드한다. 소스 = git 인덱스(`git ls-files`) — 디렉터리 워크가
     // 아니라 추적 집합을 SOT로 삼아 gitignore 경계를 그대로 따른다. 어떤 파일이든 변경 시 재빌드.
@@ -149,6 +152,10 @@ fn main() {
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR 없음");
     fs::write(Path::new(&out_dir).join("pack_all.rs"), code).expect("pack_all.rs 생성 실패");
 
+    // ★T5a (0.15.0 · C4 4.1 · RULINGS B6): 기동 필수 목록 — 같은 추적 집합(rels)에서 기계로 뽑아
+    //   OUT_DIR/boot_critical.rs 로 낸다(src/repair/boot_critical.rs 가 include). 손목록 없음.
+    gen_boot_critical(&manifest_dir, &rels, &out_dir);
+
     // T1-2: 단일진실 enum → OUT_DIR/cys_kinds.json (스키마·검증기 파리티의 기준).
     // 기존 디렉터리스캔 코드젠 철학과 동형(손목록 드리프트 차단). enum 정의는 src/edit_kinds.rs가
     // 진실이나 build.rs는 컴파일 전이라 그 타입을 못 본다 → 리터럴 목록을 여기 둔다(serde_json
@@ -211,6 +218,46 @@ fn main() {
     //   macOS/Linux 호스트에선 winresource를 당기지도, 이 코드를 컴파일하지도 않아 바이트 무영향.
     #[cfg(target_os = "windows")]
     embed_windows_resources();
+}
+
+/// ★T5a — 기동 필수 목록 산출(C4 4.1–4.5, 4.10 · RULINGS B6 · W1/Y3: 파일만, 등록 항목 없음).
+/// 규칙·닻·전수 조사는 `src/repair/boot_critical_derive.rs` 한 곳에 있고 라이브러리 시험이 같은 파일을
+/// 다시 컴파일해 고정한다. Rust std 만 쓴다(새 build-dependency 없음) · 프로세스를 띄우지 않는다(파이썬
+/// 실행 없음) · CRLF 를 LF 로 접어 읽는다 · 닻이 없거나 닻 밖의 등록기가 나타나면 이름을 대며 빌드를 멈춘다.
+/// 등록기는 읽기만 한다(P1). 다시 돌리는 조건: 팩(위 `cysjavis-pack` 감시) + 라이브러리 닻 파일 셋.
+/// 바이너리 쪽 증명 파일(`src/bin/cys.rs`·`src/bin/cysd/schedule.rs`)은 감시하지 않는다 — 감시하면
+/// `cys.rs` 를 고칠 때마다 라이브러리가 다시 컴파일된다. 깨끗한 빌드(CI·발행)는 언제나 검사하고,
+/// 라이브러리 시험 `boot_critical::tests::compiled_table_equals_a_fresh_derivation` 이 매 시험에서 다시 잰다.
+fn gen_boot_critical(manifest_dir: &str, rels: &[String], out_dir: &str) {
+    for f in [
+        boot_critical_derive::PACK_RS,
+        boot_critical_derive::AGY_RS,
+        boot_critical_derive::LIFELINE_RS,
+    ] {
+        println!("cargo:rerun-if-changed={f}");
+    }
+    let root = Path::new(manifest_dir);
+    let pack_root = root.join("cysjavis-pack");
+    let pack_file = |rel: &str| fs::read_to_string(pack_root.join(rel)).ok();
+    let repo_file = |p: &str| fs::read_to_string(root.join(p)).ok();
+    let src = boot_critical_derive::Sources {
+        pack_rels: rels,
+        pack_file: &pack_file,
+        repo_file: &repo_file,
+    };
+    let entries = match boot_critical_derive::derive(&src) {
+        Ok(e) => e,
+        Err(msg) => panic!("기동 필수 목록 산출 실패(T5a · RULINGS B6) — 빌드 중단:\n{msg}"),
+    };
+    let inputs = match boot_critical_derive::protection_inputs(&src, &entries) {
+        Ok(i) => i,
+        Err(msg) => panic!("보호장치 시험 입력 산출 실패(T5a · RULINGS AU1) — 빌드 중단:\n{msg}"),
+    };
+    fs::write(
+        Path::new(out_dir).join("boot_critical.rs"),
+        boot_critical_derive::render(&entries, &inputs),
+    )
+    .expect("boot_critical.rs 생성 실패");
 }
 
 /// Windows PE 리소스(VERSIONINFO/manifest/icon)를 크레이트의 모든 bin(cys·cysd)에 임베드한다.

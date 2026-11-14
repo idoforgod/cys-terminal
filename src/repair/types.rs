@@ -451,11 +451,28 @@ pub fn system_locked_entry(rel: &str) -> Option<&'static str> {
         .find(|l| fold_name(l) == folded)
 }
 
-/// RULINGS BJ3 — the ONE name comparison of protected names: Unicode case folding approximated by
-/// upper- then lower-casing every character (`ſ` → `S` → `s`, the Kelvin sign `K` → `k`, `ß` →
-/// `ss`), so every spelling a case-insensitive file system opens as the same name compares equal.
+/// RULINGS BJ3 / CD1 — the ONE name comparison of protected names: Unicode case folding by
+/// upper- then lower-casing every character, REPEATED until the result no longer changes (a
+/// fixpoint: `ſ` → `S` → `s`, the Kelvin sign `K` → `k`, `ß` → `ss`, the `st` ligature U+FB06 →
+/// `st`, and the capital sharp s U+1E9E → `ß` → `ss`, which one pass leaves short), so every
+/// spelling a fully case-folding file system (APFS) opens as the same name compares equal.
+/// Stated limit (CD1): no canonical decomposition (NFD) of the input — the crate has no Unicode
+/// normalisation dependency (one would need a new `Cargo.toml` line). For the listed names (ASCII)
+/// NFD would add only canonical singletons that decompose to an ASCII character: U+212A (already
+/// folded to `k` here), U+037E (`;`) and U+1FEF (`` ` ``), which no listed name contains; it would
+/// otherwise matter only between two non-ASCII spellings of a non-ASCII name.
 pub fn fold_name(s: &str) -> String {
-    s.to_uppercase().to_lowercase()
+    let mut cur = s.to_uppercase().to_lowercase();
+    // the mapping settles in two passes for every code point (U+1E9E is the only letter one pass
+    // leaves short); the bound only guards against a future table that would not settle
+    for _ in 0..8 {
+        let next = cur.to_uppercase().to_lowercase();
+        if next == cur {
+            break;
+        }
+        cur = next;
+    }
+    cur
 }
 
 /// Whether a no-follow stat result is a link for the repair rules: a symbolic link, and on Windows
@@ -1123,6 +1140,31 @@ mod t3c_tests {
             assert_eq!(system_locked_entry(rel), Some("trusted-keys.json"), "{rel}");
         }
         assert_eq!(fold_name("Stra\u{00DF}e"), "strasse");
+        // RULINGS CD1 — the fold is a fixpoint: the capital sharp s (U+1E9E) folds to `ss` like
+        // U+00DF, the `st` ligature (U+FB06) to `st`
+        assert_eq!(fold_name("STRA\u{1E9E}E"), "strasse");
+        assert_eq!(fold_name("\u{1E9E}"), fold_name("\u{00DF}"));
+        assert_eq!(fold_name("\u{FB06}"), "st");
+        assert_eq!(
+            fold_name(&fold_name("A\u{1E9E}\u{FB06}\u{212A}")),
+            fold_name("A\u{1E9E}\u{FB06}\u{212A}")
+        );
+        // the key file through the ligature, and a rule document through each of the three
+        assert_eq!(
+            system_locked_entry("tru\u{FB06}ed-keys.json"),
+            Some("trusted-keys.json")
+        );
+        for spelled in [
+            "BO\u{1E9E}_DIRECTIVE.md",
+            "bo\u{00DF}_directive.md",
+            "Bo\u{1E9E}_Directive.MD",
+        ] {
+            assert_eq!(fold_name(spelled), "boss_directive.md", "{spelled}");
+        }
+        assert_eq!(
+            fold_name("vibecoding_con\u{FB06}itution.md"),
+            "vibecoding_constitution.md"
+        );
         for rel in ["bin/trusted-keys.json", "trusted-keys.json.bak", "bin/a.py"] {
             assert!(!is_system_locked(rel), "{rel}");
         }
