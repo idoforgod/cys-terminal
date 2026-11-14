@@ -7,13 +7,13 @@ use crate::repair::replay;
 use crate::repair::screen_corpus::{self as corpus, Device, CELLS, CENSUS_PINS};
 use std::sync::Arc;
 
-/// A private test root under HOME (the harness gives every suite a private HOME; never under a
-/// temporary folder — the registrar refuses a pack there).
+/// A private test root inside the replay's own scratch base (RULINGS DE6: no test writes outside its
+/// scratch directory; never under a temporary folder — the registrar refuses a pack there; a
+/// `.nosync` folder, so no file provider re-stamps what the after-run comparison watches).
 fn test_root(name: &str) -> PathBuf {
-    let home = dirs::home_dir().expect("HOME");
-    let p = home
-        .join("t5b-screen")
-        .join(format!("{name}-{}", replay::random_hex(4)));
+    let p = crate::repair::rehearsal::scratch_base()
+        .join("tests.nosync")
+        .join(format!("screen-{name}-{}", replay::random_hex(4)));
     std::fs::create_dir_all(&p).unwrap();
     p
 }
@@ -93,6 +93,22 @@ fn decisions<'a>(r: &'a ScreenReport, class: &str) -> Vec<&'a ProbeResult> {
 
 fn cleanup(root: &Path) {
     replay::remove_tree(root).expect("the test root is removed");
+}
+
+/// RULINGS DE6: no T5b test writes outside its scratch directory — every test folder and file lies in
+/// the replay's own scratch base (a plain `cargo test` must not write into the real HOME).
+#[test]
+fn t5b_tests_write_only_inside_their_scratch_base() {
+    let home_call = ["dirs::", "home_dir()"].concat();
+    for (name, src) in [
+        ("screen_tests.rs", include_str!("screen_tests.rs")),
+        ("rehearsal_tests.rs", include_str!("rehearsal_tests.rs")),
+        ("repair_approval_tests.rs", include_str!("../bin/cysd/repair_approval_tests.rs")),
+        ("repair_t5b_check_tests.rs", include_str!("../bin/cysd/repair_t5b_check_tests.rs")),
+    ] {
+        assert!(!src.contains(&home_call), "{name} builds a path from HOME");
+        assert!(src.contains("tests.nosync"), "{name} has no folder in the scratch base");
+    }
 }
 
 // ───────────────────────────── parity, census (i) and (iii) ─────────────────────────────
@@ -268,10 +284,12 @@ fn census_ii_every_class_binds_on_released() {
         "T5b MEASURED: the same screen again (answers cached in this process): {:.1} s wall",
         t1.elapsed().as_secs_f64()
     );
-    // the measurement is also kept in a file beside the test's private folder (a passing test's
-    // standard error is not shown by the runner)
-    let _ = std::fs::write(
-        dirs::home_dir().expect("HOME").join("t5b-screen-measured.txt"),
+    // the measurement is also kept in a file (a passing test's standard error is not shown by the
+    // runner) — RULINGS DE6: only inside the cargo target folder the run names (a build scratch
+    // folder), never in HOME; without one nothing is written
+    if let Some(dir) = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from) {
+        let _ = std::fs::write(
+            dir.join("t5b-screen-measured.txt"),
         format!(
             "full screen, released copies, no candidate change: {} probes, {:.1} s wall, {} threads, after-run repeat: {}\nsame screen again (answers cached in this process): {:.1} s wall\n",
             rep.probes.len(),
@@ -280,7 +298,8 @@ fn census_ii_every_class_binds_on_released() {
             !rep.after_run.first.is_empty(),
             t1.elapsed().as_secs_f64()
         ),
-    );
+        );
+    }
     assert_eq!(again.verdict, rep.verdict);
     assert_eq!(
         again
