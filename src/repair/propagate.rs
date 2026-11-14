@@ -542,11 +542,8 @@ fn full_reset(
     stopped(env, PassStep::AfterRowsDemoted)?;
     // (3)
     let idp = super::paths::pack_instance_path(env.pack);
-    match id_now {
-        FileRead::Value(_) | FileRead::Malformed(_) => remove_pack_instance(&idp)?,
-        FileRead::Absent | FileRead::ReadError(_) => {}
-    }
-    write_pack_instance(env.pack, &idp, fresh_id)?;
+    let present = matches!(id_now, FileRead::Value(_) | FileRead::Malformed(_));
+    replace_pack_instance(env.pack, &idp, present, fresh_id)?;
     stopped(env, PassStep::AfterIdWritten)?;
     // (4)
     st.pack_instance = Some(fresh_id.to_string());
@@ -558,21 +555,20 @@ fn full_reset(
     Ok(demoted)
 }
 
-/// I8 step (3): a present-but-different id file is unlinked (it is this mechanism's own bookkeeping
-/// file, not pack content).
-fn remove_pack_instance(idp: &Path) -> Result<(), RepairError> {
-    match std::fs::remove_file(idp) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(RepairError::Io(format!("{}: {e}", idp.display()))),
-    }
-}
-
-/// I8 step (3) / E1: the new id file created NEW (never over anything), flushed, and its folder
-/// flushed — the pass's only write inside the pack.
-fn write_pack_instance(pack: &Path, idp: &Path, fresh_id: &str) -> Result<(), RepairError> {
+/// I8 step (3) / E1 — the pass's ONLY write inside the pack (RULINGS HH9: one row of its own class
+/// in T6's write census): a present id file (a different or malformed one — this mechanism's own
+/// bookkeeping file, not pack content) is unlinked; the new one is created NEW (never over anything),
+/// flushed, and its folder flushed.
+fn replace_pack_instance(pack: &Path, idp: &Path, present: bool, fresh_id: &str) -> Result<(), RepairError> {
     use std::io::Write;
     let io = |e: std::io::Error| RepairError::Io(format!("{}: {e}", idp.display()));
+    if present {
+        match std::fs::remove_file(idp) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io(e)),
+        }
+    }
     let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(idp).map_err(io)?;
     f.write_all(format!("{fresh_id}\n").as_bytes()).map_err(io)?;
     durable::full_flush_file(&f).map_err(io)?;
@@ -597,6 +593,10 @@ pub struct LaneEnv<'a> {
     pub locked: &'a RepairLock<'a>,
     pub hooks: &'a HookStepFn<'a>,
     pub result_bytes: &'a ResultBytesFn<'a>,
+    /// RULINGS HH1: what "known vendor content" means for a deletion (C11 11.3) — only its embedded
+    /// copies and the compiled previous-release table are read (`pack::released_bytes`); production
+    /// passes `UpdateSources::none()`, which holds exactly those.
+    pub sources: &'a crate::pack::UpdateSources,
     /// The existing pack-apply lock file (TRIED, never waited for).
     pub apply_lock: &'a Path,
     /// Tests: a stop of the pass between its steps.
@@ -726,6 +726,9 @@ enum Position {
     AtResult,
     AtPre,
     AtPrevApplied,
+    /// RULINGS HH1 (C11 11.3): a DELETION whose live file is a known vendor version, byte for byte —
+    /// the state read once by `Recorded::released` (the door re-verifies it at the act).
+    AtVendor(Recorded),
     Other,
 }
 
@@ -1046,6 +1049,12 @@ fn decide_pending(
             Position::AtPre
         } else if prev.as_ref() == Some(st) && !prev_was_merge {
             Position::AtPrevApplied
+        } else if result == TargetState::Absent && matches!(st, TargetState::File { .. }) {
+            // HH1 / 11.3: delete only if byte-identical to known vendor content; anything else → 충돌
+            match Recorded::released(env.op.pack, rel, env.sources) {
+                Some(r) => Position::AtVendor(r),
+                None => Position::Other,
+            }
         } else {
             Position::Other
         };
@@ -1169,7 +1178,7 @@ fn copy_checked_bytes_of(src: &Path, dst: &Path, want: &TargetState) -> Result<(
     apply::write_new(dst, &bytes, *mode).map_err(|e| format!("{e:?}"))
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -1303,6 +1312,44 @@ pub fn seal_committed_copy_in(root: &Path, id: &RepairId, lane: &LaneKey, rel: &
     Ok(SealedCopy { rel: rel.to_string(), slot, state: TargetState::File { sha256, mode } })
 }
 
+/// RULINGS HI2 / P6 — the committed copies an in-force repair still depends on (every lane takes R's
+/// bytes from them): the slots whose write-once metadata names R, R's origin lane, `committed-copy`
+/// and R's committed state of that file (hash and mode). Metadata only — no payload is read. A slot
+/// whose metadata cannot be read is kept as well (never deleted on a doubt); a copy of other bytes
+/// (a refused or interrupted commit) is not needed and stays for `cleanup` like any other slot.
+pub fn committed_copy_slots_in(root: &Path, rec: &RepairRecord) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for s in ledger::list_slots_in(root, &rec.id) {
+        let v: serde_json::Value = match small_bytes(&s.dir.join("meta").join("pre.json"), JOB_STATE_MAX_BYTES) {
+            FileRead::Absent => continue, // no metadata (positive evidence): not a committed copy
+            FileRead::Value(b) => match serde_json::from_slice(&b) {
+                Ok(v) => v,
+                Err(_) => {
+                    out.push(s.dir.clone()); // unreadable metadata: kept
+                    continue;
+                }
+            },
+            FileRead::Malformed(_) | FileRead::ReadError(_) => {
+                out.push(s.dir.clone()); // unreadable metadata: kept
+                continue;
+            }
+        };
+        if v["kind"] != COMMITTED_COPY_KIND || v["repair"] != rec.id.as_str() || v["lane_key"] != rec.origin_lane.0.as_str() {
+            continue;
+        }
+        let sealed = match (v["rel"].as_str(), v["sha256"].as_str(), v["mode"].as_u64()) {
+            (Some(rel), Some(sha256), Some(mode)) => Some((rel, TargetState::File { sha256: sha256.to_string(), mode: mode as u32 })),
+            _ => None,
+        };
+        match sealed {
+            Some((rel, st)) if result_state(rec, rel).as_ref() == Ok(&st) => out.push(s.dir.clone()),
+            Some(_) => {}
+            None => out.push(s.dir.clone()), // a committed copy whose metadata lacks a field: kept
+        }
+    }
+    out
+}
+
 /// The file holding R's committed bytes of `rel`: a committed copy of R's vault whose write-once
 /// metadata names (R, the origin lane, `rel`, `committed-copy`) and whose bytes — read through the
 /// bounded path, from one handle — hash, with that handle's mode, to R's committed state of `rel`.
@@ -1400,6 +1447,7 @@ fn apply_general(
                 Some(Ok(r)) => r,
                 _ => return finish(env, stored, row, LaneState::Conflict, &format!("{rel}: 이전에 적용한 상태를 읽을 수 없습니다"), report),
             },
+            Position::AtVendor(r) => r.clone(),
             _ => Recorded::pre_of(rec, rel),
         };
         let source = match &result {

@@ -63,8 +63,13 @@ fn tick_before_ready_is_noop_and_keeps_first_check() {
 }
 
 /// C7 7.5: single flight — while a run is alive every tick answers `busy` and nothing new starts;
-/// the guard clears the flag on every exit of the job thread (a panic included); a tick with
-/// nothing due is `idle` (most ticks are cheap no-ops).
+/// the guard clears the flag on every exit of the job thread (a panic included).
+/// REWRITTEN by T7b under RULINGS HH4 (K2: the job — this lane's propagation — is due at EVERY tick
+/// after readiness). T6's old expectation, quoted: "a tick with nothing due is `idle` (most ticks are
+/// cheap no-ops)" — `assert_eq!(tick(..), "idle"); assert_eq!(spawned, 1);` for a job state of this
+/// incarnation checked just now. Now that tick STARTS the job (T6's own work inside it is still not
+/// due and returns at once, writing nothing — `probation::run_tick`); single flight is unchanged.
+/// The name keeps T6's.
 #[test]
 fn tick_single_flight_busy_idle_and_cleared() {
     let (daemon, root, pack) = rig("t6-flight");
@@ -96,10 +101,16 @@ fn tick_single_flight_busy_idle_and_cleared() {
         .to_string(),
     )
     .unwrap();
-    assert_eq!(tick(&daemon, &root, &pack, "tick", &spawned), "idle");
-    assert_eq!(spawned.load(Ordering::SeqCst), 1);
-    // the preflight's sweep is never idle (it forces the scan)
+    // HH4: nothing due for T6 — the tick still starts the job (old: "idle", spawned 1)
+    assert_eq!(tick(&daemon, &root, &pack, "tick", &spawned), "started");
+    assert_eq!(spawned.load(Ordering::SeqCst), 2);
+    // single flight still holds for the run just started
+    assert_eq!(tick(&daemon, &root, &pack, "tick", &spawned), "busy");
+    assert_eq!(spawned.load(Ordering::SeqCst), 2);
+    daemon.repair_tick_running.store(false, Ordering::SeqCst); // that run ended
+    // the preflight's sweep starts too (it forces the scan)
     assert_eq!(tick(&daemon, &root, &pack, "sweep", &spawned), "started");
+    assert_eq!(spawned.load(Ordering::SeqCst), 3);
     let _ = std::fs::remove_dir_all(root.parent().unwrap());
 }
 
