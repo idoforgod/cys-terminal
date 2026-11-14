@@ -1062,7 +1062,10 @@ class RoleLookupIsolation(_PlantedVectors, _Env):
 
         for tag, extra, prefix in cases:
             env = env_for(extra)
-            direct = set(self.env_lines(subprocess.run([SH, "-c", prefix + '"$@"', "x"] + env_cmd, env=env,
+            # `; :` keeps the command a FORKED child of a shell at the same level as in the wrapper runs below: as the
+            # last command of `bash -c` it would be exec'd instead, and bash 5.x then hands it a different SHLVL than
+            # it gives forked children (ubuntu-pack-suite, run 43632157608: "[b'SHLVL=1'] != []"; bash 3.2 does not)
+            direct = set(self.env_lines(subprocess.run([SH, "-c", prefix + '"$@"; :', "x"] + env_cmd, env=env,
                                                        cwd=str(self.root), capture_output=True, timeout=30).stdout))
             if prefix:
                 self.assertFalse(any(x.startswith(b"LC_CTYPE=") for x in direct), "fixture: %s" % tag)
