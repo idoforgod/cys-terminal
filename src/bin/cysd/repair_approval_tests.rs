@@ -204,6 +204,7 @@ struct Rec {
     applied: Mutex<Vec<Vec<String>>>,
     intake: Mutex<Vec<(String, String)>>,
     step3_fail: Mutex<Option<String>>,
+    step3_err: Mutex<Option<Step3Err>>,
     helper_exit: Mutex<Option<i32>>,
     apply_answer: Mutex<Option<cys::repair::apply::ApplyOutcome>>,
     /// DE4: the table and request whose state the apply observes while it runs
@@ -266,9 +267,12 @@ impl Effects for Rec {
             .clone()
             .unwrap_or(cys::repair::apply::ApplyOutcome::Applied))
     }
-    fn step3(&self, _s3: &Step3Input) -> Result<Step3Ok, String> {
+    fn step3(&self, _s3: &Step3Input) -> Result<Step3Ok, Step3Err> {
+        if let Some(e) = self.step3_err.lock().unwrap().clone() {
+            return Err(e);
+        }
         match self.step3_fail.lock().unwrap().clone() {
-            Some(why) => Err(why),
+            Some(why) => Err(why.into()),
             None => Ok(Step3Ok {
                 rehearsal_summary: "hooks/h.sh: 통과".into(),
                 screen_notes: vec![],
@@ -887,6 +891,64 @@ fn watchdog_sweep_and_threads_survive_panics() {
     assert!(sweep_fn.contains("guarded("), "the watchdog's sweep is panic-isolated");
     let gov = include_str!("governance.rs");
     assert!(gov.contains("crate::repair_approval::watchdog_sweep(&daemon);"));
+}
+
+/// RULINGS DE1: a refusal by the after-run comparison returns the candidate and files ONE intake row
+/// and the owner's one line — once, nothing per tick.
+#[test]
+fn comparison_refusal_files_one_intake_row_and_one_owner_line() {
+    let r = rig("de1");
+    r.signed_repair();
+    let t = Mutex::new(ApprovalTable::default());
+    let eff = effects();
+    *eff.step3_err.lock().unwrap() = Some(Step3Err {
+        why: "예행이 실제 환경의 항목을 다시 썼습니다(x)".into(),
+        intake: Some(("hooks/h.sh".into(), "예행이 실제 환경의 항목을 다시 썼습니다(x)".into())),
+        owner_line: Some("수리 R-1 … 돌려보냈습니다".into()),
+    });
+    let rid = pending(&r, &t, &eff, T0);
+    assert_eq!(state_of(&t, &rid), ReqState::Voided);
+    assert_eq!(eff.intake.lock().unwrap().len(), 1, "one intake row");
+    assert_eq!(eff.master.lock().unwrap().len(), 1, "one owner line");
+    sweep(&r.ctx(T0 + 60.0), &t, &eff);
+    sweep(&r.ctx(T0 + 2000.0), &t, &eff);
+    assert_eq!(eff.intake.lock().unwrap().len(), 1, "never again per tick");
+    assert_eq!(eff.master.lock().unwrap().len(), 1);
+}
+
+/// RULINGS CZ3: the rehearsal of step 3 runs INSIDE the scoped after-run comparison — a candidate hook
+/// whose replay writes a LIVE listed file of the lane (by its absolute path) on every run is found:
+/// the repeat writes it again → returned to the worker with one intake row and the owner's line,
+/// before any screen runs. (The old step 3 compared nothing around its rehearsal.)
+#[test]
+fn step3_finds_a_rehearsal_writing_the_live_lane() {
+    let r = rig("cz3");
+    let id = RepairId::parse("R-1").unwrap();
+    let live = r.pack.join("hooks/guard.sh");
+    std::fs::write(&live, b"#!/bin/sh\nexit 0\n").unwrap();
+    let rel = "hooks/appbuild-gate.sh";
+    let staged = ledger::staging_dir_in(&r.root, &id).join(rel);
+    std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+    std::fs::write(
+        &staged,
+        format!("#!/bin/sh\nprintf 'x\\n' >> '{}'\nexit 0\n", live.display()),
+    )
+    .unwrap();
+    cys::repair::replay::set_mode(&staged, 0o755);
+    let s3 = Step3Input {
+        root: r.root.clone(),
+        repair: id.clone(),
+        pack: r.pack.clone(),
+        states: vec![(rel.to_string(), TargetState::read(&staged).unwrap())],
+        windows: false,
+    };
+    let home = r.dir.join("realhome");
+    std::fs::create_dir_all(&home).unwrap();
+    let e = production_step3_with(&s3, &home).unwrap_err();
+    assert!(e.why.contains("다시 썼습니다"), "{}", e.why);
+    assert!(e.why.contains("guard.sh"), "{}", e.why);
+    assert_eq!(e.intake.as_ref().map(|(f, _)| f.as_str()), Some(rel));
+    assert!(e.owner_line.as_deref().is_some_and(|l| l.contains("R-1")));
 }
 
 /// RULINGS DF3: the report gate's set is the repairs the owner HAS A CARD for — not a request still
