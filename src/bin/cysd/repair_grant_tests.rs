@@ -967,32 +967,29 @@ fn ch3_owner_input_pauses_new_autonomous_starts_only() {
     let _ = std::fs::remove_dir_all(&r.root);
 }
 
-/// CH3 / CV3: app typing arrives in many small sends — one lane's mark is rewritten at most once per
-/// `grant::PAUSE_WRITE_COALESCE_SECS`, but every input moves the in-memory pause at once and each
-/// mark covers the window, so the pause never ends earlier than 30 minutes after the LAST input.
-/// (T4b rewrite — the verdict's T4-05: the old test fixed the defect as the expectation: after
-/// `note_owner_input_throttled(.., t + 1.0)` only `assert_eq!(read(), t, "within the gap: not
-/// rewritten")` — and admission then resumed at t + 1800, 30 minutes after the FIRST input.)
+/// CH3 / DK1: app typing arrives in many small sends — every input moves this daemon's latest
+/// input at once; the lane's mark is written whenever the latest input is not yet durable, at most
+/// once per second, with the CURRENT latest input; the pause ends exactly 30 minutes after the LAST
+/// input. (Round-3 rewrite. OLD expectations: round 0 — `assert_eq!(read(), t, "within the gap: not
+/// rewritten")` with admission resuming 30 minutes after the FIRST input (the verdict's T4-05);
+/// round 1 (CV3) — "coalesced within 5 s, each mark covers the window", resumed_at = input + 1805.)
 #[test]
 fn ch3_pause_mark_is_throttled_per_lane() {
     let r = rig("ch3-throttle");
     r.grant_on(5);
     let t = now0();
-    let gap = grant::PAUSE_WRITE_COALESCE_SECS;
     note_owner_input_throttled(&r.root, &r.lane, t);
     let read = || -> (f64, f64) {
         let v: Value = serde_json::from_slice(&std::fs::read(grant::pause_path_in(&r.root, &r.lane)).unwrap()).unwrap();
         (v["paused_at"].as_f64().unwrap(), v["resumed_at"].as_f64().unwrap())
     };
-    assert_eq!(read(), (t, t + 1_800.0 + gap));
+    assert_eq!(read(), (t, t + 1_800.0));
+    note_owner_input_throttled(&r.root, &r.lane, t + 0.4);
+    assert_eq!(read().0, t, "within the same second: no second write attempt");
+    assert!(grant::is_paused_in(&r.root, t + 0.4 + 1_799.9), "… but this daemon's pause follows the input");
+    assert!(!grant::is_paused_in(&r.root, t + 0.4 + 1_800.1));
     note_owner_input_throttled(&r.root, &r.lane, t + 4.0);
-    assert_eq!(read().0, t, "within the window: the write is coalesced");
-    // … but the pause ends 30 minutes after the SECOND input (memory), the mark covering it
-    assert!(read().1 >= t + 4.0 + 1_800.0);
-    assert!(grant::is_paused_in(&r.root, t + 4.0 + 1_799.9));
-    assert!(!grant::is_paused_in(&r.root, t + 1_800.0 + gap + 0.1));
-    note_owner_input_throttled(&r.root, &r.lane, t + gap + 1.0);
-    assert_eq!(read().0, t + gap + 1.0, "after the window: rewritten");
+    assert_eq!(read(), (t + 4.0, t + 1_804.0), "a second later: written with the latest input");
 }
 
 /// CH4: the owner says "끄라", a machine prompt arrives, then the master runs `grant off` — still
@@ -1324,14 +1321,12 @@ fn ci6b_grant_status_reads_the_state() {
     );
     note_owner_input_throttled(&r.root, &r.lane, t);
     let v = status(&seat(3, "worker"), t + 10.0).unwrap();
-    // CV3 (T4b): the mark covers the coalescing window (OLD expectations: `Some(t + 1_800.0)` and
-    // `status(&master(), t + 1_801.0)…["paused"] == false`)
-    let gap = grant::PAUSE_WRITE_COALESCE_SECS;
+    // DK1 (round 3): exactly 30 minutes again (round 1's CV3 expectations were t + 1805 / t + 1806)
     assert_eq!(
         (v["state"].clone(), v["paused"].clone(), v["paused_until"].as_f64()),
-        (json!("on"), json!(true), Some(t + 1_800.0 + gap))
+        (json!("on"), json!(true), Some(t + 1_800.0))
     );
-    assert_eq!(status(&master(), t + 1_801.0 + gap).unwrap()["paused"], false);
+    assert_eq!(status(&master(), t + 1_801.0).unwrap()["paused"], false);
     assert_eq!(
         r.call(t, &master(), "grant_status", json!({"daily_cap": 3}))
             .unwrap_err()
@@ -1731,29 +1726,30 @@ fn dg1_worker_master_worker_stays_refused_and_another_worker_picks_up() {
 
 // ───────────────────────────── RULINGS CV3 (T4b) ─────────────────────────────
 
-/// CV3 at the daemon: a pause write that fails (an unwritable pause directory) keeps `begin
-/// --trigger grant` paused and `grant status` paused — also long after 30 minutes — until a write
-/// succeeds; nothing is sent anywhere (stderr only).
+/// DK1 at the daemon: a pause write that keeps failing (a directory stands at the lane's mark path,
+/// so the write's rename fails while the pause directory itself stays readable) pauses THIS lane's
+/// daemon for 30 minutes after the input, from its memory — `begin --trigger grant` and `grant
+/// status` say paused — and NOT longer although the write still fails (no latched flag; round-1's
+/// CV3 version of this test held the pause past 60 minutes until a write succeeded — withdrawn).
 #[test]
 fn cv3_a_failed_pause_write_keeps_starts_paused() {
     let r = rig("cv3-d");
     r.grant_on(5);
     let t = now0();
-    std::fs::create_dir_all(&r.root).unwrap();
-    std::fs::write(r.root.join("grant-pause"), b"not a directory").unwrap();
+    std::fs::create_dir_all(grant::pause_path_in(&r.root, &r.lane)).unwrap();
     note_owner_input_throttled(&r.root, &r.lane, t);
     let w = seat(3, "worker");
     let e = r
-        .call(t + 3_600.0, &w, "begin", json!({"trigger": "grant", "files": ["bin/a.py"]}))
+        .call(t + 60.0, &w, "begin", json!({"trigger": "grant", "files": ["bin/a.py"]}))
         .unwrap_err();
     assert!(e.message.contains("일시정지"), "{}", e.message);
-    let st = r.call(t + 3_600.0, &master(), "grant_status", json!({})).unwrap();
+    let st = r.call(t + 60.0, &master(), "grant_status", json!({})).unwrap();
     assert_eq!(st["paused"], true, "{st}");
-    std::fs::remove_file(r.root.join("grant-pause")).unwrap();
+    assert!(grant::pause_path_in(&r.root, &r.lane).is_dir(), "the write still cannot succeed");
     let v = r
-        .call(t + 3_600.0, &w, "begin", json!({"trigger": "grant", "files": ["bin/a.py"]}))
+        .call(t + 1_801.0, &w, "begin", json!({"trigger": "grant", "files": ["bin/a.py"]}))
         .unwrap();
-    assert!(v["repair"].is_string(), "{v}");
+    assert!(v["repair"].is_string(), "not paused past 30 minutes because of a failed write: {v}");
 }
 
 /// RULINGS DG3 (c) at the daemon: the start time comes from the daemon's own incarnation (pinned

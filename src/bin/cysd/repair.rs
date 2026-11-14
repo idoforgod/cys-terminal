@@ -3826,8 +3826,8 @@ mod grant_verbs {
             return Err(VerbError::invalid(CAP_ON_ASK_ONLY_KO));
         }
         let d = grant::read_decision_in(&ctx.root)?;
-        // CV3: the later of this daemon's memory and the stored marks; a failed pause write or an
-        // unreadable pause directory = paused (DG3 (b)); the hold after this daemon's start (DG3 (c))
+        // DK1 (2): the later of this daemon's memory and the durable marks; an unreadable pause
+        // directory = paused for this read; the hold after this daemon's start (DG3 (c)). Writes nothing.
         let st = grant::pause_state_in(&ctx.root, ctx.now);
         let hold = grant::incarnation_started_at(&ctx.incarnation)
             .map(|s| s + grant::PAUSE_QUIET_SECS as f64)
@@ -3916,10 +3916,10 @@ mod grant_verbs {
 /// seen by THIS lane's daemon in the grant's pause file (only while the grant is on; nothing is sent
 /// to any queue). Called at the two places the daemon learns of owner input (`handlers.rs`): an
 /// owner-typed prompt in `hook.machine_origin` (STRICT judgment — CH2) and an operator-typed app send
-/// (`human_verified`). App typing arrives in many small sends: the in-memory pause moves with every
-/// one of them and the mark is rewritten at most once per `grant::PAUSE_WRITE_COALESCE_SECS`, each mark
-/// covering that window — the pause never ends earlier than 30 minutes after the very last input
-/// (RULINGS CV3; it may end up to that window later).
+/// (`human_verified`). App typing arrives in many small sends: RULINGS DK1 — every one of them moves
+/// this daemon's in-memory latest input first; the lane's mark is written (the later of the stored
+/// mark and the current latest input) whenever the latest input is not yet durable, at most once
+/// per second; this daemon's pause ends 30 minutes after the later of its memory and the marks.
 pub(crate) fn grant_note_owner_input(daemon: &Daemon) {
     let root = production_root(daemon);
     let lane = LaneKey::of_socket(&daemon.socket_path);
@@ -3947,12 +3947,13 @@ pub(crate) fn grant_note_app_typing(
     }
 }
 
-/// [`grant_note_owner_input`]'s body (root and clock explicit for the tests) — RULINGS CV3: the
-/// in-memory pause deadline moves at once, the write is coalesced, a failed write keeps the lane
-/// paused until a later write succeeds (stderr line; nothing to any queue).
+/// [`grant_note_owner_input`]'s body (root and clock explicit for the tests) — RULINGS DK1: the
+/// in-memory latest input moves at once; the write follows when the input is not yet durable (at
+/// most once per second); a failed write is one stderr line scoped to THIS lane's daemon (DK1 (6))
+/// and nothing is latched — the next asker tries again. Nothing to any queue.
 pub(crate) fn note_owner_input_throttled(root: &Path, lane: &LaneKey, now: f64) {
-    if let Err(e) = cys::repair::grant::note_owner_input_coalesced_in(root, lane, now) {
-        eprintln!("[cysd] repair grant: owner-input pause not recorded (autonomous starts stay paused until it is): {e:?}");
+    if let Err(e) = cys::repair::grant::note_owner_input_in(root, lane, now) {
+        eprintln!("{} ({e:?})", cys::repair::grant::PAUSE_WRITE_FAILED_KO);
     }
 }
 
