@@ -443,20 +443,15 @@ fn pass_different_instance_resets_rows_and_records_the_new_id() {
     for (id, rel) in [(&a, "bin/a.py"), (&b, "bin/b.py"), (&c, "bin/c.py")] {
         committed_in_hq(&r, id, Classification::General, rel, Some((b"old\n", 0o644)), Some((b"new\n", 0o644)));
     }
+    pack_instance_pass_in(&pass_env(&r, &l, DEPT, &no), &fid(1));
+    // rows of a lane that caught up, then the pack is replaced (another id)
     let m = MergeRecord { by_seat: 3, result: vec![("bin/a.py".into(), "x".into())], changed: true, note: "n".into(), via_repair: None };
     verified_row(&r, &a, DEPT, vec![("bin/a.py".into(), "x".into())], Some(m.clone()), LaneState::Verified);
     verified_row(&r, &b, DEPT, Vec::new(), None, LaneState::Conflict);
     verified_row(&r, &c, DEPT, Vec::new(), None, LaneState::Applied);
-    pack_instance_pass_in(&pass_env(&r, &l, DEPT, &no), &fid(1));
-    // a recorded catch-up, then the pack is replaced (another id)
     let mut st = r.job(DEPT);
     st.initial_catchup_complete = true;
     write_job_state(&r.root, &st).unwrap();
-    for (id, s) in [(&a, LaneState::Verified), (&b, LaneState::Conflict), (&c, LaneState::Applied)] {
-        let mut row = r.row(id, DEPT).unwrap();
-        row.state = s;
-        ledger::write_lane_durable_in(&r.root, &row).unwrap();
-    }
     std::fs::write(crate::repair::paths::pack_instance_path(&r.dept), format!("{}\n", fid(7))).unwrap();
     assert_eq!(pack_instance_pass_in(&pass_env(&r, &l, DEPT, &no), &fid(2)), PassOutcome::Reset { demoted: 3 });
     let st = r.job(DEPT);
