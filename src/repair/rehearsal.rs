@@ -148,9 +148,22 @@ fn tail(b: &[u8]) -> String {
     s[start..].to_string()
 }
 
+/// RULINGS CZ4 / DF5: a run that left a process or a held pipe behind did not end cleanly — the
+/// check fails, whatever the run printed.
+fn left_behind(o: &ChildOutcome, rel: &str, what: &str) -> Option<CheckResult> {
+    o.left_something().map(|why| {
+        CheckResult::Fail(format!(
+            "{rel}: {what} 이(가) 끝난 뒤에도 남긴 것이 있습니다 — {why}"
+        ))
+    })
+}
+
 fn outcome_result(o: &ChildOutcome, rel: &str, what: &str) -> CheckResult {
     if o.timed_out {
         return CheckResult::Timeout;
+    }
+    if let Some(f) = left_behind(o, rel, what) {
+        return f;
     }
     if let Some(e) = &o.spawn_error {
         return CheckResult::Fail(format!("{rel}: {what} 을(를) 시작하지 못했습니다 — {e}"));
@@ -399,6 +412,8 @@ fn run_in_copy(
     };
     let o = replay::run_child(&argv, &env, &work, &input, deadline);
     drop(sock);
+    // RULINGS CZ4: a scratch root that cannot be removed is returned (the check is not measured)
+    scratch.close()?;
     Ok(o)
 }
 
@@ -457,6 +472,9 @@ fn executed(
                 if o.timed_out {
                     return Ok(CheckResult::Timeout);
                 }
+                if let Some(f) = left_behind(&o, rel, "훅 재생") {
+                    return Ok(f);
+                }
                 if let Some(e) = &o.spawn_error {
                     return Ok(CheckResult::Fail(format!(
                         "{rel}: 훅을 시작하지 못했습니다 — {e}"
@@ -482,6 +500,9 @@ fn executed(
                         return Ok(CheckResult::Timeout);
                     }
                     let r = run_in_copy(root, rel, Some(rc), recorded.as_deref(), &exec, ev, left)?;
+                    if let Some(f) = left_behind(&r, rel, "출시본 훅 재생") {
+                        return Ok(f);
+                    }
                     if r.code == Some(0) || r.code == Some(2) {
                         let r_out = !String::from_utf8_lossy(&r.stdout).trim().is_empty();
                         let c_out = !String::from_utf8_lossy(&o.stdout).trim().is_empty();

@@ -737,6 +737,10 @@ fn answer_of(o: &replay::ChildOutcome) -> (Answer, String) {
     if o.timed_out {
         return (Answer::Error, "timeout".into());
     }
+    // RULINGS CZ4: a run that left a process or a held pipe behind is not measurable
+    if let Some(why) = o.left_something() {
+        return (Answer::Error, why);
+    }
     if let Some(e) = &o.spawn_error {
         return (Answer::Error, format!("spawn: {e}"));
     }
@@ -1016,8 +1020,9 @@ fn run_hook_probe_inner(
         }
         Ok(judged)
     })();
-    replay::remove_tree(&run);
-    res
+    // RULINGS CZ4: a cleanup error / a leftover scratch root makes the probe not measurable
+    let cleaned = replay::remove_tree(&run);
+    res.and_then(|j| cleaned.map(|()| j))
 }
 
 /// E-21 (BC3, BH1): the RELEASED guard.sh under its own no-Python switch with a variant's other
@@ -1129,8 +1134,9 @@ fn run_backstop_probe(
                 }
             })
         })();
-        replay::remove_tree(&run);
-        res
+        // RULINGS CZ4: a cleanup error / a leftover scratch root makes the probe not measurable
+        let cleaned = replay::remove_tree(&run);
+        res.and_then(|j| cleaned.map(|()| j))
     };
     go().unwrap_or_else(|e| Judged {
         suffix: "",
@@ -1996,16 +2002,19 @@ fn run_i3(
             ];
             for k in 1..=2 {
                 let o = r.run(&argv, &env, &work, b"");
-                let completed =
-                    !o.timed_out && o.spawn_error.is_none() && matches!(o.code, Some(0) | Some(1));
+                let completed = !o.timed_out
+                    && o.spawn_error.is_none()
+                    && o.left_something().is_none()
+                    && matches!(o.code, Some(0) | Some(1));
                 let why = if completed {
                     format!("exit {:?}", o.code)
                 } else {
                     format!(
-                        "registrar did not complete (exit {:?}, signal {:?}, timeout {}): {}",
+                        "registrar did not complete (exit {:?}, signal {:?}, timeout {}, left {:?}): {}",
                         o.code,
                         o.signal,
                         o.timed_out,
+                        o.left_something(),
                         String::from_utf8_lossy(&o.stderr)
                             .chars()
                             .rev()
@@ -2028,11 +2037,17 @@ fn run_i3(
             drop(sock);
             Ok(())
         })();
-        replay::remove_tree(&run);
-        res
+        // RULINGS CZ4: a cleanup error / a leftover scratch root makes every row of the run not
+        // measurable
+        let cleaned = replay::remove_tree(&run);
+        res.and(cleaned)
     })();
     if let Err(e) = go {
-        out.push((1, "*".into(), None, format!("layout: {e:?}")));
+        for row in out.iter_mut() {
+            row.2 = None;
+            row.3 = format!("{} — run not clean: {e:?}", row.3);
+        }
+        out.push((1, "*".into(), None, format!("layout / cleanup: {e:?}")));
     }
     out
 }
@@ -2082,7 +2097,7 @@ fn i3_template(r: &Runner<'_>, released: &Files) -> Option<String> {
         ];
         let o = r.run(&argv, &env, &work, b"");
         drop(sock);
-        if !matches!(o.code, Some(0) | Some(1)) {
+        if !matches!(o.code, Some(0) | Some(1)) || o.left_something().is_some() {
             return None;
         }
         let settings = home.join(".claude").join("settings.json");
@@ -2092,7 +2107,8 @@ fn i3_template(r: &Runner<'_>, released: &Files) -> Option<String> {
         let text = std::fs::read_to_string(&settings).ok()?;
         Some(text.replace(&*pack.to_string_lossy(), PACK_PLACEHOLDER))
     })();
-    replay::remove_tree(&run);
+    // RULINGS CZ4: an unclean run gives no template (every I3 probe is then not measurable)
+    replay::remove_tree(&run).ok()?;
     res
 }
 
@@ -2393,7 +2409,8 @@ fn run_all(
     let leftovers = r.leftovers.lock().map(|l| l.clone()).unwrap_or_default();
     let oot = r.out_of_time.load(Ordering::SeqCst);
     drop(r);
-    drop(scratch);
+    // RULINGS CZ4: a pass whose scratch root cannot be removed is no measured pass
+    scratch.close()?;
     Ok((results, leftovers, oot))
 }
 
