@@ -1237,6 +1237,35 @@ fn repeat_with_one_spawn_failure_is_incomplete() {
     cleanup(&root);
 }
 
+/// RULINGS EL1: an answer of the BL1 repeat — which runs without the cache — never enters the cache,
+/// and an ERROR answer never does: a screen after a repeat whose execution failed to start still
+/// observes G-1 in E-1 (in T5b-cz-c4 the injected failure was cached and a later screen read it).
+#[test]
+fn repeat_answers_never_enter_the_cache() {
+    let root = test_root("el1-cache");
+    let lane = lane_of(&root, &[]);
+    let cand = candidate_of(&root, &[]);
+    let mut c = cfg(&root, Some(vec!["G-1"]), Some(vec!["E-1"]), false);
+    let lib = lane.join("hooks/_lib.sh");
+    c.between_snapshots = Some(Arc::new(move |pass| {
+        if pass == 1 {
+            let mut t = std::fs::read_to_string(&lib).unwrap();
+            t.push_str("\n# written during the first pass\n");
+            std::fs::write(&lib, t).unwrap();
+        }
+    }));
+    c.fail_first_spawn_in_repeat = true;
+    let _ = screen_with(&c, &cand, &lane, LONG).unwrap();
+    let c2 = cfg(&root, Some(vec!["G-1"]), Some(vec!["E-1"]), false);
+    let lane2 = lane_of(&root.join("second"), &[]);
+    let rep = screen_with(&c2, &candidate_of(&root.join("second"), &[]), &lane2, LONG).unwrap();
+    for p in rep.probes.iter().filter(|p| p.class == "G-1") {
+        assert!(!p.detail.contains("injected spawn failure"), "{p:#?}");
+        assert_ne!(p.released, Answer::Error, "{p:#?}");
+    }
+    cleanup(&root);
+}
+
 /// RULINGS DF1 regression: a candidate `hooks/_lib.sh` that makes every hook print ONE extra stdout
 /// line keeps a deny object in the output — the loose reading still saw DENY; the strict one sees no
 /// decision, so every R / C class the released gate denies here is REFUSED.
