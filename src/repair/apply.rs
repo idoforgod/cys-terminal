@@ -1984,6 +1984,7 @@ pub fn unreadable_ledger_member(root: &Path, lane: &LaneKey) -> Option<String> {
         }
     }
     None
+}
 
 pub fn resolve_approved_copy_in(root: &Path, pack: &Path, lane: &LaneKey, rel: &str) -> ApprovedCopy {
     // EJ1 / EN4: NO APPROVAL only from a COMPLETE, readable ledger of this lane — absence is never
