@@ -394,6 +394,49 @@ CSO_DIRECTIVE_REV_MARKER = "<!-- cso-directive-rev: 2026-09-06-alert-inbox -->"
 CSO_DIRECTIVE_MARKER_MAX_LINE = 20      # 표지는 파일 첫 20행 안에 있어야 한다(P3 와 공유하는 계약)
 
 
+# ── ★T2i(RULINGS EF1 · EF2 · EF3) — 기록 없는 보관 사본 ─────────────────────────────────────────────
+# '보관 중'은 디스크의 사실이다: 되돌리기(`cys pack-rollback`)는 기동 필수·보호 목록 파일의 `<rel>.user` 가 있으면 원장
+# 기록이 있든 없든 그 파일을 건너뛴다. 원장 기록은 다른 쓰는 쪽의 원장 통째 저장으로 지워질 수 있고(`--take-new` 는 vendor
+# 본 유지를 확정하며 기록을 지우되 사본을 남긴다) — 그때 원장만 보는 목록은 그 사본을 숨긴다. 그래서 C62 는 원장이
+# 그 사본을 이름 대지 않는(`vendor-first`·`healed`·`conflicted` 가 아닌) `<rel>.user` 를 디스크에서 찾아 보인다.
+# 본 파일 `<rel>` 이 옆에 있는 사본만(팩이 관리하는 파일의 사본) · 링크는 따라가지 않는다 · 점 디렉터리(`.pristine` 등)는
+# 건너뛴다 · 방문 상한 `UNRECORDED_SCAN_CAP`(넘으면 거기까지 찾은 것만 — 부트 점검이 큰 팩에서 오래 걸리지 않게).
+UNRECORDED_SCAN_CAP = 100000
+_USER_SIDE_KINDS = ("vendor-first", "healed", "conflicted")
+
+
+def _unrecorded_parked_copies(root, pending):
+    out = []
+    seen = 0
+    for cur, dirs, files in os.walk(root, followlinks=False):
+        dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+        for name in sorted(files):
+            seen += 1
+            if seen > UNRECORDED_SCAN_CAP:
+                return sorted(out)
+            if not name.endswith(".user") or name == ".user":
+                continue
+            base = os.path.join(cur, name[:-len(".user")])
+            if not os.path.lexists(base):
+                continue
+            rel = os.path.relpath(base, root).replace(os.sep, "/")
+            v = pending.get(rel) if isinstance(pending, dict) else None
+            if isinstance(v, dict) and v.get("kind") in _USER_SIDE_KINDS:
+                continue
+            out.append(rel)
+    return sorted(out)
+
+
+def _unrecorded_copies_part(unrecorded):
+    return ("★기록 없는 보관 사본 %d건 — 병합 대기 기록 없이 디스크에 남은 내 수정본 <파일>.user(`--take-new` 로 vendor 본 "
+            "유지를 확정했거나 기록이 지워짐 · 기동 필수·보호 목록 파일이면 사본이 있는 동안 되돌리기가 그 파일을 건너뜀 · "
+            "다시 입히기 = 워커가 승인 절차로: 수리로 고친 파일이면 `cys repair reapply <수리번호>`, 직접 고친 파일이면 "
+            "`cys repair begin --files <파일> --trigger update` · 다시 입히지 않으려면 그 사본을 다른 이름으로 옮긴다"
+            "(지우지 않는다)): %s%s"
+            % (len(unrecorded), ", ".join(unrecorded[:8]),
+               " 외 %d건" % (len(unrecorded) - 8) if len(unrecorded) > 8 else ""))
+
+
 # ── ★0.15.0 M11 마 — 묘비(장부에 기록된 파일 삭제 · 생명줄이 아닌 훅 해제)의 읽기 창구 ──────────────
 # 정본은 수리 장부의 레인별 묘비 파일(`~/.cys/local/repairs/tombstones/<lane_key>.json`, 그 레인의 데몬만
 # 쓴다 — RULINGS B1)이고, 파이썬은 장부 파일을 직접 파싱하지 않는다: `cys repair tombstones --json`(CLI 의
@@ -6381,6 +6424,11 @@ class Preflight:
             return
         ledger = os.path.join(pack_dir(), ".merge-pending.json")
         if not os.path.isfile(ledger):
+            # ★T2i(RULINGS EF2 · EF3): 원장이 없어도 디스크의 보관 사본은 보인다('보관 중'은 디스크의 사실 — EF1).
+            unrecorded = _unrecorded_parked_copies(pack_dir(), {})
+            if unrecorded:
+                self.add(cid, WARN, _unrecorded_copies_part(unrecorded))
+                return
             self.add(cid, PASS, "병합 대기 0건 (원장 없음)")
             return
         try:
@@ -6411,9 +6459,11 @@ class Preflight:
                            if isinstance(v, dict) and v.get("kind") == "user-kept")
         vendor_first = sorted(r for r, v in pending.items()
                               if isinstance(v, dict) and v.get("kind") == "vendor-first")
+        # ★T2i(RULINGS EF2 · EF3): 기록 없는 보관 사본(디스크의 사실) — 판정 집합(WARN)이다.
+        unrecorded = _unrecorded_parked_copies(pack_dir(), pending)
         self._parked_merge_wakes(pending)
         if (not healed and not newp and not conflicted and not quarantined
-                and not user_kept and not vendor_first):
+                and not user_kept and not vendor_first and not unrecorded):
             self.add(cid, PASS, "병합 대기 0건")
             return
         parts = []
@@ -6430,6 +6480,8 @@ class Preflight:
                          "`cys repair begin --files <파일> --trigger update`): %s%s"
                          % (len(vendor_first), ", ".join(vendor_first[:8]),
                             " 외 %d건" % (len(vendor_first) - 8) if len(vendor_first) > 8 else ""))
+        if unrecorded:
+            parts.append(_unrecorded_copies_part(unrecorded))
         if healed:
             parts.append("★원복(healed) %d건 — 라이브 수정이 배포 원본으로 되돌려짐(수정본은 <파일>.user 보존): %s%s"
                          % (len(healed), ", ".join(healed[:8]),

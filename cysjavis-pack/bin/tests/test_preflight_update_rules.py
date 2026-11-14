@@ -154,6 +154,45 @@ class LedgerKinds(Rig):
                       "(다시 입히기 = 워커가 승인 절차로: 수리로 고친 파일이면 `cys repair reapply <수리번호>`, 직접 고친 "
                       "파일이면 `cys repair begin --files <파일> --trigger update`): hooks/b.sh", detail)
 
+    # ★T2i(RULINGS EF2 · EF3): 기록 없는 보관 사본은 원장이 없어도 · 원장이 다른 파일만 이름 대도 C62 의 목록에 보인다
+    #   (글자 그대로). 원장이 그 사본을 이름 대는 종류(vendor-first)면 그 줄에만 나온다. 본 파일 없는 `.user` · 점 디렉터리
+    #   안의 사본 · 링크 디렉터리 너머의 사본은 목록 밖이다.
+    def test_c62_lists_a_parked_copy_without_a_record(self):
+        os.makedirs(os.path.join(self.pack, "hooks"), exist_ok=True)
+        for name, body in (("hooks/guard.sh", "new"), ("hooks/guard.sh.user", "mine"), ("hooks/orphan.sh.user", "x")):
+            with open(os.path.join(self.pack, name), "w", encoding="utf-8") as f:
+                f.write(body)
+        os.makedirs(os.path.join(self.pack, ".pristine", "hooks"), exist_ok=True)
+        for name in (".pristine/hooks/guard.sh", ".pristine/hooks/guard.sh.user"):
+            with open(os.path.join(self.pack, name), "w", encoding="utf-8") as f:
+                f.write("p")
+        elsewhere = os.path.join(self.root, "elsewhere")
+        os.makedirs(elsewhere)
+        for name in ("x.sh", "x.sh.user"):
+            with open(os.path.join(elsewhere, name), "w", encoding="utf-8") as f:
+                f.write("e")
+        os.symlink(elsewhere, os.path.join(self.pack, "linked"))
+        want = ("★기록 없는 보관 사본 1건 — 병합 대기 기록 없이 디스크에 남은 내 수정본 <파일>.user(`--take-new` 로 vendor 본 "
+                "유지를 확정했거나 기록이 지워짐 · 기동 필수·보호 목록 파일이면 사본이 있는 동안 되돌리기가 그 파일을 건너뜀 · "
+                "다시 입히기 = 워커가 승인 절차로: 수리로 고친 파일이면 `cys repair reapply <수리번호>`, 직접 고친 파일이면 "
+                "`cys repair begin --files <파일> --trigger update` · 다시 입히지 않으려면 그 사본을 다른 이름으로 옮긴다"
+                "(지우지 않는다)): hooks/guard.sh")
+        st, detail = self.run_check("c62_pack_heal_ledger", "C62", fix=False)
+        self.assertEqual((st, detail), (WARN, want), "원장 없음")
+        self.ledger({"bin/other.py": {"kind": "kept-drift", "side": "bin/other.py", "version": "x", "ts": 0}})
+        st, detail = self.run_check("c62_pack_heal_ledger", "C62", fix=False)
+        self.assertEqual(st, WARN)
+        self.assertIn(want, detail, "원장이 다른 파일만 이름 댐")
+        self.ledger({"hooks/guard.sh": {"kind": "vendor-first", "side": "hooks/guard.sh.user", "version": "0.15.0", "ts": 1}})
+        st, detail = self.run_check("c62_pack_heal_ledger", "C62", fix=False)
+        self.assertEqual(st, WARN)
+        self.assertNotIn("기록 없는 보관 사본", detail, "기록이 이름 대면 그 줄에만")
+        self.assertIn("vendor-first) 1건", detail)
+        os.rename(os.path.join(self.pack, "hooks", "guard.sh.user"), os.path.join(self.pack, "hooks", "guard.sh.user.aside"))
+        os.remove(os.path.join(self.pack, ".merge-pending.json"))
+        st, detail = self.run_check("c62_pack_heal_ledger", "C62", fix=False)
+        self.assertEqual((st, detail), (PASS, "병합 대기 0건 (원장 없음)"), "사본을 옮기면 사라진다")
+
     def _wake_rig(self):
         wk = os.path.join(self.pack, "bin")
         os.makedirs(wk, exist_ok=True)
