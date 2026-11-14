@@ -30,6 +30,10 @@ mod grant_tests;
 #[cfg(test)]
 #[path = "repair_apply_tests.rs"]
 mod t6_tests;
+// Track T7b — daemon tests of `repair.recheck` and of the commit's seal (RULINGS HI2 / HJ2).
+#[cfg(test)]
+#[path = "repair_propagate_tests.rs"]
+mod t7b_tests;
 
 // Track T5b — the CM3 pin of `production_check` (a rel with a folder).
 #[cfg(test)]
@@ -101,6 +105,8 @@ pub(crate) const T4_VERBS: &[&str] = &[
 
 /// The sub-verbs whose bodies are track T6's (C3 `revert` / `reapply`, C7 `tick` / `sweep`).
 pub(crate) const T6_VERBS: &[&str] = &["revert", "reapply", "tick", "sweep"];
+/// The sub-verb whose body is track T7b's (H8).
+pub(crate) const T7B_VERBS: &[&str] = &["recheck"];
 
 /// M4 (★OWNER-REPORT with the other Windows limits): on Windows a seatless command line is not a
 /// human in 0.15.0 — the app's button is the path.
@@ -633,6 +639,8 @@ pub(crate) fn handle_with(
         // T6 (C3, design §4-9): revert by rule one; reapply starts R′ (RULINGS AQ5 / AR1)
         "revert" => apply_verbs::revert(ctx, caller, params),
         "reapply" => apply_verbs::reapply(ctx, caller, params),
+        // T7b (H8): the lane's re-evaluation after its worker's merge
+        "recheck" => propagate_verbs::recheck(ctx, caller, params),
         // T6: the trigger needs the daemon's readiness / single-flight state — `handle` answers it
         "tick" | "sweep" => Err(VerbError::new(
             cys::repair::types::ERR_PRECONDITION,
@@ -640,8 +648,8 @@ pub(crate) fn handle_with(
         )),
         _ => {
             debug_assert!(
-                !T3_VERBS.contains(&sub) && !T4_VERBS.contains(&sub) && !T6_VERBS.contains(&sub),
-                "a T3 / T4 / T6 verb fell through to the stub"
+                !T3_VERBS.contains(&sub) && !T4_VERBS.contains(&sub) && !T6_VERBS.contains(&sub) && !T7B_VERBS.contains(&sub),
+                "a T3 / T4 / T6 / T7b verb fell through to the stub"
             );
             not_implemented(sub)
         }
@@ -3167,6 +3175,25 @@ mod ledger_verbs {
         })?;
         // (2) the check children — the per-repair mutex is NOT held (AD10 / R3)
         let checked = run_checks(ctx, &states)?;
+        // T7b · RULINGS HI2 / HJ2: the result BYTES of every FILE target are sealed before the commit is
+        // published — one bounded read per target (`durable::RECORD_READ_CAP`), outside the mutex, only
+        // when the checks passed; compared with the verified states under the mutex in step (3a)
+        #[cfg(test)]
+        crate::repair::seal_hooks::run(&crate::repair::seal_hooks::BEFORE);
+        let sealed: Result<Vec<cys::repair::propagate::SealedCopy>, String> = if checked.is_ok() {
+            states
+                .iter()
+                .filter(|(_, st)| matches!(st, TargetState::File { .. }))
+                .map(|(rel, _)| {
+                    cys::repair::propagate::seal_committed_copy_in(&ctx.root, &id, &ctx.lane, rel, &live_path(ctx, rel), ctx.now)
+                        .map_err(|why| format!("{rel}: {why}"))
+                })
+                .collect()
+        } else {
+            Ok(Vec::new())
+        };
+        #[cfg(test)]
+        crate::repair::seal_hooks::run(&crate::repair::seal_hooks::AFTER);
         // (3a) re-take, re-read, abort if anything moved, then write the committed state durably
         let (before, written, timings, mut checks, lines) = ctx.locked(id.as_str(), || -> Result<CommitStep, VerbError> {
             let mut rec = load(ctx, &id)?;
@@ -3205,6 +3232,37 @@ mod ledger_verbs {
                     ));
                 }
             };
+            // T7b · HJ2: a copy that could not be made refuses the commit — nothing is published, the
+            // record stays as it was (the commit can be tried again); each sealed copy must hold
+            // EXACTLY the state verified above (the verified states are never replaced by what the
+            // copy saw)
+            let sealed = sealed.as_ref().map_err(|why| {
+                VerbError::new(
+                    cys::repair::types::ERR_PRECONDITION,
+                    format!(
+                        "{}: 확정하는 내용을 보관소에 남기지 못해 확정하지 않았습니다({}) — {why} · 아무것도 확정하지 않았습니다. 다시 `cys repair commit {}` 할 수 있습니다",
+                        id.as_str(),
+                        cys::repair::propagate::seal_limit_text(),
+                        id.as_str()
+                    ),
+                )
+            })?;
+            for c in sealed {
+                let verified = states.iter().find(|(r, _)| *r == c.rel).map(|(_, st)| st);
+                if verified != Some(&c.state) {
+                    return Err(VerbError::new(
+                        "target_changed",
+                        format!(
+                            "{}: {} 의 보관한 사본({})이 확정하려던 상태({})와 다릅니다 — 복사하는 동안 바뀌었습니다. 아무것도 확정하지 않았습니다(다시 `cys repair commit {}`)",
+                            id.as_str(),
+                            c.rel,
+                            c.state.canon(),
+                            verified.map(|s| s.canon()).unwrap_or_default(),
+                            id.as_str()
+                        ),
+                    ));
+                }
+            }
             let before = rec.clone();
             rec.committed = canon_list(&states);
             rec.checks = checks.clone();
@@ -3824,6 +3882,103 @@ mod ledger_verbs {
                 }
             });
         }
+    }
+}
+
+/// Track T7b — test-only seams around the commit's seal (RULINGS HJ2's tests: a change of the live
+/// file between the verification and the copy, and between the copy and the final validation).
+/// Compiled only for tests; the shipped binary has no such code.
+#[cfg(test)]
+pub(crate) mod seal_hooks {
+    use std::cell::RefCell;
+    thread_local! {
+        pub(crate) static BEFORE: RefCell<Option<Box<dyn Fn()>>> = const { RefCell::new(None) };
+        pub(crate) static AFTER: RefCell<Option<Box<dyn Fn()>>> = const { RefCell::new(None) };
+    }
+    pub(crate) fn run(k: &'static std::thread::LocalKey<RefCell<Option<Box<dyn Fn()>>>>) {
+        k.with(|h| {
+            if let Some(f) = h.borrow().as_ref() {
+                f();
+            }
+        });
+    }
+}
+
+// Track T7b — `recheck` (H8, C3 · contract C11): the lane's re-evaluation after its worker's merge; the
+// body is the library's (`cys::repair::propagate::recheck_lane_in`). An inline module like
+// `apply_verbs`. ★Nothing here may panic; nothing here sends anything to a queue (F1).
+mod propagate_verbs {
+    use super::{Caller, CheckReport, Ctx, VerbError};
+    use cys::repair::apply::{CheckOutcome, NoFaults, OpEnv};
+    use cys::repair::platform::ApplyForm;
+    use cys::repair::rehearsal::CheckResult;
+    use cys::repair::types::{RepairError, RepairId};
+    use serde_json::{json, Value};
+    use std::path::Path;
+
+    fn repair_id(p: &Value) -> Result<RepairId, VerbError> {
+        let raw = p
+            .get("repair")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| VerbError::invalid("수리 번호(R-<n>)가 필요합니다"))?;
+        RepairId::parse(raw)
+            .map_err(|_| VerbError::invalid(format!("수리 번호는 R-<숫자> 형식이어야 합니다: {raw:?}")))
+    }
+
+    /// T3's check runner (the live FILE path) as the library's `CheckFn` (a root holding `<rel>`).
+    fn outcome(r: CheckReport) -> CheckOutcome {
+        CheckOutcome {
+            result: if r.passed {
+                CheckResult::Pass
+            } else if r.timed_out {
+                CheckResult::Timeout
+            } else {
+                CheckResult::Fail(r.failure)
+            },
+            ms: r.check_ms,
+        }
+    }
+
+    /// `cys repair recheck <R-id>` (WORK — the role table admits only a worker seat; the body requires
+    /// this seat's merge lock on this lane's `충돌` row of a GENERAL repair).
+    pub(crate) fn recheck(ctx: &Ctx<'_>, caller: &Caller, p: &Value) -> Result<Value, VerbError> {
+        let id = repair_id(p)?;
+        let note = p.get("note").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let sid = caller
+            .seat()
+            .ok_or_else(|| VerbError::new(cys::repair::types::ERR_PRECONDITION, "합친 뒤의 다시 검사는 이 부서의 워커 좌석만 합니다"))?;
+        let check = |rel: &str, root: &Path, deadline: std::time::Duration| -> Result<CheckOutcome, RepairError> {
+            (ctx.check)(rel, &root.join(rel), deadline).map(outcome)
+        };
+        let locked = |rid: &RepairId, f: &mut dyn FnMut() -> Result<(), RepairError>| -> Result<(), RepairError> {
+            ctx.locked(rid.as_str(), f)
+        };
+        let hooks = |rid: &RepairId, lane: &cys::repair::types::LaneKey, step: cys::repair::apply::HookStep| (ctx.hook_step)(rid, lane, step);
+        let no_bytes = |_: &cys::repair::ledger::RepairRecord, rel: &str| -> Result<std::path::PathBuf, String> {
+            Err(format!("{rel}: 다시 검사는 바이트를 들이지 않습니다"))
+        };
+        let lock_file = cys::pack_apply_lock::pack_apply_lock_path_for(&ctx.pack_dir);
+        let env = cys::repair::propagate::LaneEnv {
+            op: OpEnv {
+                root: &ctx.root,
+                pack: &ctx.pack_dir,
+                lane: &ctx.lane,
+                now: ctx.now,
+                form: if ctx.windows { ApplyForm::DepositFirst } else { cys::repair::platform::apply_form() },
+                faults: &NoFaults,
+                own_check: &|_, _| None,
+            },
+            check: &check,
+            classify: ctx.classify,
+            locked: &locked,
+            hooks: &hooks,
+            result_bytes: &no_bytes,
+            apply_lock: &lock_file,
+            pass_stop: &|_| false,
+        };
+        let owner = ctx.owner(sid);
+        let state = cys::repair::propagate::recheck_lane_in(&env, &id, sid, &owner, &ctx.incarnation, &note).map_err(VerbError::from)?;
+        Ok(json!({"repair": id.as_str(), "lane": ctx.lane.0, "lane_state": state, "lane_state_label": state.label_ko()}))
     }
 }
 
