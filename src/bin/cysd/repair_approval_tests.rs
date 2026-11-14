@@ -33,10 +33,10 @@ impl Drop for Rig {
 
 fn rig(tag: &str) -> Rig {
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let home = dirs::home_dir().expect("HOME");
-    let dir = home
-        .join("t5b-approval")
-        .join(format!("{tag}-{}-{n}", std::process::id()));
+    // RULINGS DE6: inside the replay's own scratch base, never HOME
+    let dir = cys::repair::rehearsal::scratch_base()
+        .join("tests.nosync")
+        .join(format!("approval-{tag}-{}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let pack = dir.join("pack");
     std::fs::create_dir_all(pack.join("hooks")).unwrap();
