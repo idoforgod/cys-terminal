@@ -594,10 +594,17 @@ pub fn finish_seal_with(slot: &Slot, now: f64, hook: &mut PublishHook<'_>) -> Re
     let sealed = slot.sealed();
     let payload = slot.payload();
     discard_temps_in(&slot.dir.join("meta"), "sealed.json");
-    let (sealed_state, sealed_sha) = if std::fs::symlink_metadata(&sealed).is_ok() {
-        if let Ok(f) = std::fs::File::open(&sealed) {
-            full_flush_file(&f).map_err(|e| io(&sealed, e))?;
-        }
+    // FG1: the sealed copy probed with three answers — present (flushed: an open failure is an
+    // error, never "nothing to flush"); absent (only a LINK payload has no sealed copy); unreadable
+    let sealed_present = match std::fs::symlink_metadata(&sealed) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(io(&sealed, e)),
+    };
+    let (sealed_state, sealed_sha) = if sealed_present {
+        let f = std::fs::File::open(&sealed).map_err(|e| io(&sealed, e))?;
+        full_flush_file(&f).map_err(|e| io(&sealed, e))?;
+        drop(f);
         full_flush_dir(&slot.dir.join("sealed"))?;
         let st = TargetState::read(&sealed)?;
         let sha = match &st {
@@ -606,8 +613,13 @@ pub fn finish_seal_with(slot: &Slot, now: f64, hook: &mut PublishHook<'_>) -> Re
         };
         (st, sha)
     } else {
-        // a link payload: the link itself is the deposit
-        (TargetState::read(&payload)?, None)
+        // a link payload: the link itself is the deposit (a FILE payload without its sealed copy is
+        // never recorded as one)
+        let st = TargetState::read(&payload)?;
+        if matches!(st, TargetState::File { .. }) {
+            return Err(RepairError::Superseded(format!("{}: 봉인 사본이 없습니다", sealed.display())));
+        }
+        (st, None)
     };
     let meta = slot.meta_sealed();
     if std::fs::symlink_metadata(&meta).is_ok() {

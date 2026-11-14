@@ -51,18 +51,19 @@ pub enum ClaimRefused {
     Io(String),
 }
 
-fn numbers(dir: &Path) -> Vec<u32> {
-    let mut v: Vec<u32> = std::fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|e| {
-            let n = e.file_name().to_string_lossy().to_string();
-            n.strip_suffix(".json")?.parse::<u32>().ok()
-        })
-        .collect();
+/// FG1: the claim numbers present — `Err` when the folder or an entry cannot be read (never "none").
+fn numbers(dir: &Path) -> Result<Vec<u32>, String> {
+    let mut v = Vec::new();
+    for e in std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))? {
+        let e = e.map_err(|e| format!("{}: {e}", dir.display()))?;
+        let n = e.file_name().to_string_lossy().to_string();
+        // names that are not `<k>.json` (closure markers, temporary entries) are not claims
+        if let Some(k) = n.strip_suffix(".json").and_then(|s| s.parse::<u32>().ok()) {
+            v.push(k);
+        }
+    }
     v.sort_unstable();
-    v
+    Ok(v)
 }
 
 fn publish_json<T: serde::Serialize>(p: &Path, v: &T) -> Result<(), RepairError> {
@@ -76,8 +77,14 @@ pub fn read_claim_in(root: &Path, original: &RepairId, k: u32) -> Option<Claim> 
     serde_json::from_slice(&std::fs::read(claims_dir_in(root, original).join(format!("{k}.json"))).ok()?).ok()
 }
 
-pub fn is_closed(root: &Path, original: &RepairId, k: u32) -> bool {
-    claims_dir_in(root, original).join(format!("{k}.closed.json")).exists()
+/// Whether claim `k` is closed — FG1: `Err` when its marker cannot be probed (never "open").
+pub fn is_closed(root: &Path, original: &RepairId, k: u32) -> Result<bool, String> {
+    let p = claims_dir_in(root, original).join(format!("{k}.closed.json"));
+    match std::fs::symlink_metadata(&p) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("{}: {e}", p.display())),
+    }
 }
 
 /// Closes claim `k` (idempotent: an existing close stands).
@@ -102,9 +109,9 @@ pub fn claim_in(
     let io = |e: RepairError| ClaimRefused::Io(format!("{e:?}"));
     let dir = claims_dir_in(root, original);
     std::fs::create_dir_all(&dir).map_err(|e| ClaimRefused::Io(format!("{}: {e}", dir.display())))?;
-    let top = numbers(&dir).last().copied();
+    let top = numbers(&dir).map_err(ClaimRefused::Io)?.last().copied();
     if let Some(k) = top {
-        if !is_closed(root, original, k) {
+        if !is_closed(root, original, k).map_err(ClaimRefused::Io)? {
             // an unreadable claim is evidence that cannot be read: assume held
             let Some(c) = read_claim_in(root, original, k) else {
                 return Err(ClaimRefused::Held { holder: holder.clone() });
@@ -128,8 +135,9 @@ pub fn claim_in(
         Err(RepairError::Superseded(_)) => return Err(ClaimRefused::LostRace),
         Err(e) => return Err(io(e)),
     }
-    // AFTER placement: our own claim must not have been closed meanwhile
-    if is_closed(root, original, k) {
+    // AFTER placement: our own claim must not have been closed meanwhile (an unreadable marker is
+    // never "not closed")
+    if is_closed(root, original, k).map_err(ClaimRefused::Io)? {
         return Err(ClaimRefused::ClosedAfterPlacement { k });
     }
     Ok(k)
@@ -179,7 +187,7 @@ mod tests {
         assert_eq!(claim_in(&r, &orig, &b, &rid("R-30"), 101.0, &|_| Holder::Alive), Err(ClaimRefused::Held { holder: holder.clone() }));
         assert_eq!(claim_in(&r, &orig, &b, &rid("R-30"), 102.0, &|_| Holder::Unreadable), Err(ClaimRefused::Held { holder: holder.clone() }), "unreadable = assume held");
         assert_eq!(claim_in(&r, &orig, &b, &rid("R-30"), 103.0, &|_| Holder::Ended), Ok(2));
-        assert!(is_closed(&r, &orig, 1));
+        assert!(is_closed(&r, &orig, 1).unwrap());
         let _ = std::fs::remove_dir_all(&r);
     }
 

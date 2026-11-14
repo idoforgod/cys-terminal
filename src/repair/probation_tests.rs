@@ -1546,6 +1546,29 @@ fn an_unlistable_root_and_unreadable_acknowledgements_are_reported() {
     assert!(rep.lines.iter().any(|l| l.contains("접수 확인 기록을 읽을 수 없습니다")), "{:?}", rep.lines);
 }
 
+// ───────────────────────────── RULINGS FG1 — the scan never takes "could not read" for "absent" ─────────────────────────────
+
+/// FG1: a boot-critical file the scan cannot read is a FINDING (told once), never skipped as absent;
+/// nothing is put back. Without FG1 `let Ok(bytes) = read(..) else continue` skipped it silently.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_boot_critical_file_is_a_finding() {
+    let Some(rel) = listed() else {
+        return;
+    };
+    let r = rig("fg1m10read");
+    r.put(rel, b"#!/bin/bash\nchanged\n", 0o755);
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(r.pack.join(rel), std::fs::Permissions::from_mode(0o000)).unwrap();
+    let d = Doubles { check: &|_, _, _| outcome(CheckResult::Pass, 1), reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|x| x != rel };
+    let lock = r.base.join(".pack-apply.lock");
+    let found = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
+    std::fs::set_permissions(r.pack.join(rel), std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(found.iter().any(|f| f.rel == rel && f.kind == "unreadable" && f.notice), "{found:?}");
+    let again = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW + 3600.0, &lock));
+    assert!(again.is_ok());
+}
+
 // ───────────────────────────── RULINGS EK2 — a failed re-check is a fact from the moment it is measured ─────────────────────────────
 
 /// EK2: a re-check fails while another apply / update holds the pack-apply lock — the failure is made

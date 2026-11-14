@@ -582,6 +582,7 @@ fn supersede_older(
     let targets: Vec<String> = ledger::file_targets(newer).map(|f| f.rel.clone()).collect();
     let mut out = Vec::new();
     let mut deferred = Vec::new();
+    let mut failed: Vec<String> = Vec::new();
     for oid in ledger::list_ids_checked_in(root)?.into_iter().filter(|o| *o < newer.id).rev() {
         let Some(_older_guard) = super::guard::RepairGuard::try_take(root, &oid) else {
             deferred.push(oid);
@@ -589,10 +590,10 @@ fn supersede_older(
         };
         let mut changed = false;
         let rootb = root.to_path_buf();
-        let _ = locked(&oid, &mut || {
+        // CU1: one older record that cannot be read or written never stops the pass — FG1: it is SAID
+        if let Err(e) = locked(&oid, &mut || {
         let _mutex_scope = super::guard::MutexScope::enter();
-            // CU1: an unreadable older record is skipped (never stops the pass)
-            let Ok(Some(mut r)) = ledger::read_record_in(&rootb, &oid) else {
+            let Some(mut r) = ledger::read_record_in(&rootb, &oid)? else {
                 return Ok(());
             };
             if r.origin_lane == *lane && in_force(&r) && r.files.iter().any(|f| targets.contains(&f.rel)) {
@@ -601,10 +602,15 @@ fn supersede_older(
                 changed = true;
             }
             Ok(())
-        });
+        }) {
+            failed.push(format!("{}: {e:?}", oid.as_str()));
+        }
         if changed {
             out.push(oid);
         }
+    }
+    if !failed.is_empty() {
+        return Err(RepairError::Io(format!("더 오래된 수리를 대체됨으로 적지 못했습니다(대체된 것: {:?}) — {}", out, failed.join(" · "))));
     }
     Ok((out, deferred))
 }
@@ -1474,8 +1480,14 @@ fn m10_sweep_full(env: &JobEnv<'_>, report_deferred_sweep: &std::cell::Cell<bool
         // put-back (any change → no put-back in this tick)
         let bound = apply::Bound::now(pack);
         let live = pack.join(rel);
-        let Ok(m) = std::fs::symlink_metadata(&live) else {
-            continue; // absent: not a changed file (the heal paths own a missing file)
+        let m = match std::fs::symlink_metadata(&live) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue, // absent: the heal paths own a missing file
+            Err(e) => {
+                // FG1: a file that cannot be examined is a FINDING — never "absent"
+                unreadable_finding(&existing, &mut new_findings, rel, &format!("{e}"), env.op.now);
+                continue;
+            }
         };
         if !m.file_type().is_file() {
             // CU4: a boot-critical file replaced by a symbolic link (or anything not a regular file)
@@ -1501,8 +1513,12 @@ fn m10_sweep_full(env: &JobEnv<'_>, report_deferred_sweep: &std::cell::Cell<bool
             }
             continue;
         }
-        let Ok(bytes) = std::fs::read(&live) else {
-            continue;
+        let bytes = match std::fs::read(&live) {
+            Ok(b) => b,
+            Err(e) => {
+                unreadable_finding(&existing, &mut new_findings, rel, &format!("{e}"), env.op.now);
+                continue;
+            }
         };
         let sha = sha_hex(&bytes);
         let original = (env.original)(rel);
@@ -1634,13 +1650,14 @@ fn m10_sweep_full(env: &JobEnv<'_>, report_deferred_sweep: &std::cell::Cell<bool
             }
             continue;
         }
-        let live_mode = TargetState::read(&live)
-            .ok()
-            .and_then(|s| match s {
-                TargetState::File { mode, .. } => Some(mode),
-                _ => None,
-            })
-            .unwrap_or(0o644);
+        let live_mode = match TargetState::read(&live) {
+            Ok(TargetState::File { mode, .. }) => mode,
+            Ok(_) => continue, // changed kind since it was read — the next scan sees it
+            Err(e) => {
+                unreadable_finding(&existing, &mut new_findings, rel, &format!("{e:?}"), env.op.now);
+                continue;
+            }
+        };
         // the put-back content: the approved copy of the current generation, else our original of it
         let target: Option<(Vec<u8>, u32)> = match &approved {
             apply::ApprovedCopy::Approved { state: TargetState::File { mode, .. }, holder, .. } => std::fs::read(holder).ok().map(|b| (b, *mode)),
@@ -1789,6 +1806,25 @@ fn m10_sweep_full(env: &JobEnv<'_>, report_deferred_sweep: &std::cell::Cell<bool
     Ok(new_findings)
 }
 
+
+/// FG1: a boot-critical file the scan could not examine — ONE finding per (file, cause), told once.
+fn unreadable_finding(existing: &[Finding], new_findings: &mut Vec<Finding>, rel: &str, cause: &str, now: f64) {
+    let key = sha_hex(cause.as_bytes());
+    if existing.iter().chain(new_findings.iter()).any(|f| f.rel == rel && f.kind == "unreadable" && f.sha256 == key) {
+        return;
+    }
+    new_findings.push(Finding {
+        rel: rel.to_string(),
+        sha256: key,
+        kind: "unreadable".into(),
+        at: now,
+        notice: true,
+        notified: false,
+        slot: None,
+        kept_copy: None,
+        note: format!("기동 필수 파일을 살펴볼 수 없습니다({cause}) — 아무것도 바꾸지 않았습니다(워커 검토)"),
+    });
+}
 
 /// The resolved restore content of M10 for `rel` in a pack: the binary's embedded copy, only when
 /// the pack's generation is this binary's own (version = this build's version, free channel) —

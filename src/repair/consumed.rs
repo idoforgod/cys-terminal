@@ -31,10 +31,10 @@ pub fn approval_consumed_in(root: &Path, lane: &LaneKey, approval_ref: &str) -> 
             Ok(_) => {}
             Err(e) => return ApprovalUse::Unknown(format!("{}: 적용 의도를 읽을 수 없습니다({e})", id.as_str())),
         }
-        if let Ok(Some(row)) = super::ledger::read_lane_in(root, &id, lane) {
-            if row.approval_ref.as_deref() == Some(approval_ref) {
-                return ApprovalUse::Consumed;
-            }
+        match super::ledger::read_lane_in(root, &id, lane) {
+            Ok(Some(row)) if row.approval_ref.as_deref() == Some(approval_ref) => return ApprovalUse::Consumed,
+            Ok(_) => {}
+            Err(e) => return ApprovalUse::Unknown(format!("{}: 이 부서의 행을 읽을 수 없습니다({e:?})", id.as_str())),
         }
     }
     ApprovalUse::NotConsumed

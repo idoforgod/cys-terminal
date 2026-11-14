@@ -2503,6 +2503,54 @@ fn a_slot_without_its_generation_is_never_put_back() {
     assert_eq!(vault::slot_generation(&slot_dir).unwrap(), None, "an unreadable generation is never recorded as one");
 }
 
+// ───────────────────────────── RULINGS FG1 — the remaining reads of the engine ─────────────────────────────
+
+/// FG1: an interrupted operation whose recorded state cannot be read is a REPORTED recovery error —
+/// never resumed as if its expected state were `absent`; and an unreadable lane row makes the
+/// approval's use Unknown (never NotConsumed). Without FG1 `parse_canon(..).unwrap_or(Absent)`
+/// resumed the operation against an invented state and the row's read error was skipped.
+#[test]
+fn an_unreadable_recorded_state_is_an_error_never_absent() {
+    let r = rig("fg1canon");
+    let id = rid("R-21");
+    committed_general(&r, &id, "hooks/c.sh", Some(b"PRE\n"), Some(b"POST\n"));
+    let op = OpRecord {
+        schema: 1,
+        op: "20261114-apply-x".into(),
+        repair: id.clone(),
+        lane_key: r.lane.clone(),
+        kind: "apply".into(),
+        form: "exchange".into(),
+        rel: "hooks/c.sh".into(),
+        pre_existed: true,
+        expected: "file:garbage".into(),
+        incoming: "absent".into(),
+        pack_generation: None,
+        slot: None,
+        slot_identity: None,
+        live_identity: None,
+        incoming_copy: None,
+        incoming_copy_identity: None,
+        step: "staged".into(),
+        hooks: Vec::new(),
+        finished: false,
+        outcome: None,
+        note: String::new(),
+        created_at: 1.0,
+        updated_at: 1.0,
+        notice: None,
+    };
+    wal::write_in(&r.root, &op).unwrap();
+    let env = r.env(&NoFaults, ApplyForm::Exchange);
+    let (_, errors) = resume_interrupted_report_in(&env).unwrap();
+    assert!(errors.iter().any(|(i, why)| *i == id && why.contains("기록된 상태를 읽을 수 없습니다")), "{errors:?}");
+    assert!(!wal::read_in(&r.root, &id, &op.op).unwrap().unwrap().finished, "left unfinished (retried, reported)");
+    assert_eq!(std::fs::read(r.pack.join("hooks/c.sh")).unwrap(), b"POST\n", "nothing touched");
+    // an unreadable lane row: the approval's use is Unknown
+    std::fs::write(ledger::lane_path_in(&r.root, &id, &r.lane), b"{ broken").unwrap();
+    assert!(matches!(crate::repair::consumed::approval_consumed_in(&r.root, &r.lane, "rqr-x"), crate::repair::consumed::ApprovalUse::Unknown(_)));
+}
+
 // ───────────────────────────── RULINGS EJ4 — one ownership per repair ─────────────────────────────
 
 /// EJ4 through the real entry points: a revert (the owner) paused in its hook phase holds the

@@ -205,6 +205,31 @@ pub fn pack_generation(pack: &Path) -> PackGeneration {
     }
 }
 
+/// RULINGS FG1 — a recorded state string read with three answers: a state, or `Err` when it cannot
+/// be read (never taken as `absent`).
+fn canon_req(s: &str, rel: &str) -> Result<TargetState, RepairError> {
+    parse_canon(s).ok_or_else(|| RepairError::Corrupt(format!("{rel}: 기록된 상태를 읽을 수 없습니다({s})")))
+}
+
+/// FG1: an entry's identity with three answers — `Ok(Some)`; `Ok(None)` when the entry does not exist
+/// (positive evidence: not found); `Err` when it cannot be read (never "another entry").
+fn entry_identity_checked(p: &Path) -> Result<Option<(String, u64)>, RepairError> {
+    match std::fs::symlink_metadata(p) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(RepairError::Io(format!("{}: {e}", p.display()))),
+        Ok(_) => entry_identity(p).map(Some),
+    }
+}
+
+/// FG1: [`identity_of`] with the same three answers.
+fn identity_checked(p: &Path) -> Result<Option<Identity>, RepairError> {
+    match std::fs::symlink_metadata(p) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(RepairError::Io(format!("{}: {e}", p.display()))),
+        Ok(_) => identity_of(p).map(Some),
+    }
+}
+
 /// RULINGS EJ1 / EN3 — the BOUND generation of an operation: `Known`, or `Unknown`, which equals
 /// nothing. It is created ONCE, at the operation's birth (its first durable record — the apply
 /// intent, the revert intent from the lane row, the scan's sampling written into its operation
@@ -658,12 +683,12 @@ fn step4(
     depth: u8,
 ) -> Result<OpDone, RepairError> {
     let gen_ok = Bound::of(rec.pack_generation.clone()).equals_now(env.pack);
-    let expected = parse_canon(&rec.expected).unwrap_or(TargetState::Absent);
+    let expected = canon_req(&rec.expected, &rec.rel)?;
     if *deposit == expected && gen_ok {
         // CT3 — the outcome reported is the outcome measured: what is NOW live must be the state
         // this operation was to put live; otherwise that entry goes into a fresh slot by a CHECKED
         // operation (expected = what is actually live) and the previous bytes return
-        let incoming = parse_canon(&rec.incoming).unwrap_or(TargetState::Absent);
+        let incoming = canon_req(&rec.incoming, &rec.rel)?;
         let live_now = TargetState::read(live)?;
         if live_now != incoming {
             let mut note = format!(
@@ -832,7 +857,7 @@ fn after_seal_move_in(
     if env.faults.at(Point::AfterSeal, live, Some(slot)) {
         return Err(stop(Point::AfterSeal));
     }
-    let expected = parse_canon(&rec.expected).unwrap_or(TargetState::Absent);
+    let expected = canon_req(&rec.expected, &rec.rel)?;
     let gen_ok = Bound::of(rec.pack_generation.clone()).equals_now(env.pack);
     if facts.sealed_state == expected && gen_ok {
         if env.faults.at(Point::BeforeDone, live, Some(slot)) {
@@ -895,7 +920,7 @@ fn verify_placed(
     previous: (TargetState, Option<PathBuf>),
     depth: u8,
 ) -> Result<Option<String>, RepairError> {
-    let incoming = parse_canon(&rec.incoming).unwrap_or(TargetState::Absent);
+    let incoming = canon_req(&rec.incoming, &rec.rel)?;
     let live_now = TargetState::read(live)?;
     if live_now == incoming {
         return Ok(None);
@@ -1069,10 +1094,10 @@ fn second_move(
 ) -> Result<OpDone, RepairError> {
     let rel = rec.rel.clone();
     let deposit = vault::deposit_of(slot).map(|(s, _)| s);
-    let expected = parse_canon(&rec.expected).unwrap_or(TargetState::Absent);
+    let expected = canon_req(&rec.expected, &rec.rel)?;
     let gen_ok = Bound::of(rec.pack_generation.clone()).equals_now(env.pack);
     let copy_ok = match (&rec.incoming_copy, &rec.incoming_copy_identity) {
-        (Some(c), Some(want)) => identity_of(c).ok().as_ref() == Some(want),
+        (Some(c), Some(want)) => identity_checked(c)?.as_ref() == Some(want),
         _ => false,
     };
     let deposit_ok = deposit.as_ref().ok() == Some(&expected);
@@ -1088,7 +1113,8 @@ fn second_move(
                 if env.faults.at(Point::BeforeDone, live, Some(slot)) {
                     return Err(stop(Point::BeforeDone));
                 }
-                let previous = vault::deposit_of(slot).map(|(st, h)| (st, Some(h))).unwrap_or((TargetState::Absent, None));
+                // FG1: an unreadable deposit is an error — never "nothing to put back"
+                let previous = vault::deposit_of(slot).map(|(st, h)| (st, Some(h)))?;
                 if let Some(note) = verify_placed(env, rec, live, previous, 0)? {
                     wal::finish(env.root, rec, "declined", &note, env.now)?;
                     return Ok(done(ApplyOutcome::Declined(note), Some(rec)));
@@ -1161,13 +1187,15 @@ pub fn resume_op(env: &OpEnv<'_>, mut rec: OpRecord) -> Result<OpDone, RepairErr
         id: rec.repair.clone(),
         rel: rec.rel.clone(),
         kind: rec.kind.clone(),
-        expected: parse_canon(&rec.expected).unwrap_or(TargetState::Absent),
-        incoming: parse_canon(&rec.incoming).unwrap_or(TargetState::Absent),
+        expected: canon_req(&rec.expected, &rec.rel)?,
+        incoming: canon_req(&rec.incoming, &rec.rel)?,
         source: None,
         bound: Bound::of(rec.pack_generation.clone()),
     };
     let slot = rec.slot.as_ref().map(|d| Slot::at(d, &rec.rel));
-    let live_entry = entry_identity(&live).ok();
+    // FG1: an identity that cannot be read is an error of the recovery (retried, reported) — never
+    // "another writer's entry"
+    let live_entry = entry_identity_checked(&live)?;
     let abandon = |rec: &mut OpRecord, why: &str| -> Result<OpDone, RepairError> {
         wal::finish(env.root, rec, "abandoned", why, env.now)?;
         Ok(done(ApplyOutcome::Declined(why.to_string()), Some(rec)))
@@ -1181,7 +1209,7 @@ pub fn resume_op(env: &OpEnv<'_>, mut rec: OpRecord) -> Result<OpDone, RepairErr
             let (Some(slot), Some(staged)) = (slot.clone(), rec.slot_identity.clone()) else {
                 return supersede(&mut rec, "기록이 불완전합니다(칸·정체 없음) — 워커 검토");
             };
-            let payload_entry = entry_identity(&slot.payload()).ok();
+            let payload_entry = entry_identity_checked(&slot.payload())?;
             if live_entry.as_ref().is_some_and(|e| same_entry(&staged, e)) {
                 // the exchange happened: seal what is found (M2 recovery; CT1 — an unfinished
                 // temporary seal is discarded, a published one must agree with its record), then step 4
@@ -1217,7 +1245,7 @@ pub fn resume_op(env: &OpEnv<'_>, mut rec: OpRecord) -> Result<OpDone, RepairErr
             let (Some(slot), Some(was)) = (slot.clone(), rec.live_identity.clone()) else {
                 return supersede(&mut rec, "기록이 불완전합니다 — 워커 검토");
             };
-            let payload_entry = entry_identity(&slot.payload()).ok();
+            let payload_entry = entry_identity_checked(&slot.payload())?;
             if payload_entry.as_ref().is_some_and(|e| same_entry(&was, e)) {
                 // CT1: an unfinished temporary seal is discarded; a published seal or record that
                 // disagrees is never blessed — the deposit-first form then abandons (OQ-D8) and puts
@@ -1282,7 +1310,7 @@ pub fn resume_op(env: &OpEnv<'_>, mut rec: OpRecord) -> Result<OpDone, RepairErr
             let want = rec.incoming_copy_identity.clone();
             if want.as_ref().is_some_and(|w| live_entry.as_ref().is_some_and(|e| same_entry(w, e))) {
                 let previous = match (&rec.form[..], &slot) {
-                    ("deposit-first", Some(sl)) => vault::deposit_of(sl).map(|(st, h)| (st, Some(h))).unwrap_or((TargetState::Absent, None)),
+                    ("deposit-first", Some(sl)) => vault::deposit_of(sl).map(|(st, h)| (st, Some(h)))?,
                     _ => (TargetState::Absent, None),
                 };
                 if let Some(note) = verify_placed(env, &rec, &live, previous, 0)? {
@@ -1487,7 +1515,7 @@ pub fn pre_image_slot_for(
     rel: &str,
 ) -> Result<(TargetState, Option<PathBuf>, Option<PathBuf>), RepairError> {
     if let Some(op) = applied_op_for(root, &rec.id, lane, rel)? {
-        let want = parse_canon(&op.expected).unwrap_or(TargetState::Absent);
+        let want = canon_req(&op.expected, rel)?;
         if want == TargetState::Absent {
             return Ok((TargetState::Absent, None, None));
         }
@@ -2283,7 +2311,7 @@ fn f9_agreement(
         return Err("적용 작업이 묶인 팩 세대가 지금 세대와 다르거나 알 수 없습니다".into());
     }
     let incoming = parse_canon(&op.incoming).ok_or_else(|| "적용 작업의 상태를 읽을 수 없습니다".to_string())?;
-    let expected = parse_canon(&op.expected).unwrap_or(TargetState::Absent);
+    let expected = parse_canon(&op.expected).ok_or_else(|| "적용 작업의 기대 상태를 읽을 수 없습니다".to_string())?;
     if expected != TargetState::Absent {
         let dir = op.slot.as_deref().ok_or_else(|| "적용 작업에 보관 칸이 없습니다".to_string())?;
         let slot = Slot::at(dir, rel);
@@ -2430,13 +2458,8 @@ pub fn slots_needed_in_force_in(root: &Path, id: &RepairId) -> Result<Vec<PathBu
     let rec = ledger::read_record_in(root, id)?.ok_or_else(|| {
         RepairError::Precondition(format!("{}: 이 장부에서 수리 기록을 찾을 수 없습니다", id.as_str()))
     })?;
-    let (ops, broken) = wal::list_in(root, id);
-    if !broken.is_empty() {
-        return Err(RepairError::Corrupt(format!(
-            "{}: 읽을 수 없는 동작 기록이 있습니다",
-            id.as_str()
-        )));
-    }
+    let ops = wal::list_checked_in(root, id)
+        .map_err(|e| RepairError::Corrupt(format!("{}: 읽을 수 없는 동작 기록이 있습니다 — {e}", id.as_str())))?;
     let mut out: Vec<PathBuf> = Vec::new();
     for r in ops.iter().filter(|r| !r.finished) {
         if let Some(s) = &r.slot {
@@ -4094,14 +4117,20 @@ pub fn reconcile_hook_registrations(
     reconcile_hook_registrations_with(&crate::pack::pack_dir(), hooks, &run_registrar)
 }
 
-/// The settings entries as found (matcher / timeout) for one hook line — read only (Y1).
-fn found_matcher_timeout(settings: &Path, event: &str, script: &str) -> (Option<String>, Option<u64>) {
-    let Ok(bytes) = std::fs::read(settings) else {
-        return (None, None);
+/// The settings entries as found (matcher / timeout) for one hook line — read only (Y1). FG1: a
+/// settings file that does not exist has none; one that cannot be read or parsed is an `Err` (the
+/// hook step then declines — never records "no matcher" for an entry it could not see).
+fn found_matcher_timeout(settings: &Path, event: &str, script: &str) -> Result<(Option<String>, Option<u64>), String> {
+    let bytes = match std::fs::read(settings) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((None, None)),
+        Err(e) => return Err(format!("{}: {e}", settings.display())),
     };
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-        return (None, None);
-    };
+    let v = serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|e| format!("{}: {e}", settings.display()))?;
+    Ok(found_matcher_timeout_in(&v, event, script))
+}
+
+fn found_matcher_timeout_in(v: &serde_json::Value, event: &str, script: &str) -> (Option<String>, Option<u64>) {
     let Some(groups) = v.get("hooks").and_then(|h| h.get(event)).and_then(|e| e.as_array()) else {
         return (None, None);
     };
@@ -4154,28 +4183,20 @@ pub fn hook_lines_step_in(
                 id.as_str()
             ))
         })?;
-    let lines: Vec<wal::HookLine> = named
-        .iter()
-        .map(|(event, script)| wal::HookLine {
-            event: event.clone(),
-            script: script.clone(),
-            targets: dry
-                .hooks
-                .iter()
-                .filter(|h| h.event == *event && h.script == *script)
-                .flat_map(|h| h.targets.iter())
-                .map(|(path, state)| {
-                    let (matcher, timeout) = found_matcher_timeout(path, event, script);
-                    wal::HookTarget {
-                        path: path.clone(),
-                        state: state.clone(),
-                        matcher,
-                        timeout,
-                    }
-                })
-                .collect(),
-        })
-        .collect();
+    let mut lines: Vec<wal::HookLine> = Vec::new();
+    for (event, script) in &named {
+        let mut targets = Vec::new();
+        for (path, state) in dry.hooks.iter().filter(|h| h.event == *event && h.script == *script).flat_map(|h| h.targets.iter()) {
+            let (matcher, timeout) = found_matcher_timeout(path, event, script).map_err(|e| {
+                RepairError::CheckFailed(format!(
+                    "{}: 훅 설정을 읽을 수 없어 훅 단계를 하지 않았습니다(아무것도 바꾸지 않음) — {e}",
+                    id.as_str()
+                ))
+            })?;
+            targets.push(wal::HookTarget { path: path.clone(), state: state.clone(), matcher, timeout });
+        }
+        lines.push(wal::HookLine { event: event.clone(), script: script.clone(), targets });
+    }
     let kind = match step {
         HookStep::Unregister => "hook-unregister",
         HookStep::Reregister => "hook-reregister",
@@ -4295,8 +4316,13 @@ pub fn resume_hook_steps_report_in(
             }
         };
         for mut op in ops.into_iter().filter(|r| r.lane_key == *lane && !r.finished && r.form == "hook") {
-        let Ok(Some(rec)) = ledger::read_record_in(root, &op.repair) else {
-            continue;
+        let rec = match ledger::read_record_in(root, &op.repair) {
+            Ok(Some(rec)) => rec,
+            Ok(None) => continue,
+            Err(e) => {
+                errors.push((op.repair.clone(), format!("끊긴 훅 단계의 수리 기록을 읽을 수 없습니다({e:?})")));
+                continue;
+            }
         };
         match finish_hook_op(root, pack, &rec, &mut op, registrar, now) {
             Ok(_) => n += 1,
