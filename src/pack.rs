@@ -3338,11 +3338,17 @@ pub fn load_merge_pending(dir: &Path) -> serde_json::Map<String, serde_json::Val
         .unwrap_or_default()
 }
 
-/// 병합 대기 원장 저장(best-effort — 자문 메타데이터라 실패가 설치를 막지 않는다).
-pub fn save_merge_pending(dir: &Path, pending: &serde_json::Map<String, serde_json::Value>) {
-    if let Ok(json) = serde_json::to_string_pretty(&serde_json::Value::Object(pending.clone())) {
-        let _ = write_atomic(&dir.join(MERGE_PENDING_FILE), json.as_bytes());
-    }
+/// 병합 대기 원장 저장. ★T2h(RULINGS CW5): 실패를 돌려준다 — vendor 우선 기록의 선저장(RULINGS AC7)은 이 결과를 보고,
+/// 기록이 디스크에 남지 않으면 살아 있는 기동 필수 파일을 바꾸지 않는다(보관 실패와 같은 격리). 그 밖의 호출부는 자문
+/// 메타데이터라 종전대로 실패가 설치를 막지 않는다(호출부가 `let _ =` 로 명시한다).
+pub fn save_merge_pending(
+    dir: &Path,
+    pending: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(&serde_json::Value::Object(pending.clone()))
+        .map_err(|e| format!("병합 대기 원장 직렬화 실패: {e}"))?;
+    let p = dir.join(MERGE_PENDING_FILE);
+    write_atomic(&p, json.as_bytes()).map_err(|e| format!("병합 대기 원장 기록 실패 {}: {e}", p.display()))
 }
 
 /// ★G3-축3 감사 원장 1줄 append. 다중 프로세스 appender 전제라 O_APPEND + **라인당 단일
@@ -5639,7 +5645,19 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                         }
                         // ★RULINGS AC7: 원장을 vendor 바이트보다 **먼저** 저장한다 — 그 사이에 멈춰도 `.user` 가 기록
                         // 없는 고아가 되지 않는다(다음 스윕은 같은 판정으로 수렴한다).
-                        save_merge_pending(&dir, &pending);
+                        // ★T2h(RULINGS CW5): 저장이 **실패하면** 살아 있는 파일을 바꾸지 않는다 — 기록 없이 바뀐 기동 필수
+                        // 파일은 남기지 않는다(보관 실패와 같은 격리 · 기록 가능 회복 후 재스윕이 같은 판정으로 수렴한다).
+                        if let Err(e) = save_merge_pending(&dir, &pending) {
+                            eprintln!("[init-pack] ⚠ 격리(quarantined): {rel} — 기동 필수 파일의 vendor 우선 기록을 남기지 못했습니다({e}). 파일 무접촉 보존 — 기록 가능 회복 후 재스윕 시 vendor 본 우선 적용.");
+                            if let serde_json::Value::Object(entry) = serde_json::json!({
+                                "kind": "quarantined", "reason": "ledger-write-failed", "side": rel,
+                                "version": target_version, "ts": now_ts,
+                            }) {
+                                upsert_pending_v2(&mut pending, &mut pending_dirty, rel, entry);
+                            }
+                            kept += 1;
+                            continue;
+                        }
                     }
                     other => {
                         let why = match other {
@@ -5963,7 +5981,18 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                         upsert_pending_v2(&mut pending, &mut pending_dirty, rel, entry);
                     }
                     // ★RULINGS AC7: 원장을 vendor 바이트보다 먼저 저장(위 vendor 우선 가지와 같은 이유).
-                    save_merge_pending(&dir, &pending);
+                    // ★T2h(RULINGS CW5): 저장 실패 = 살아 있는 파일 무접촉(위 가지와 같은 격리).
+                    if let Err(e) = save_merge_pending(&dir, &pending) {
+                        eprintln!("[init-pack] ⚠ 격리(quarantined): {rel} — 기동 필수 파일의 vendor 우선 기록을 남기지 못했습니다({e}). 파일 무접촉 보존 — 기록 가능 회복 후 재스윕 시 vendor 본 우선 적용.");
+                        if let serde_json::Value::Object(entry) = serde_json::json!({
+                            "kind": "quarantined", "reason": "ledger-write-failed", "side": rel,
+                            "version": target_version, "ts": now_ts,
+                        }) {
+                            upsert_pending_v2(&mut pending, &mut pending_dirty, rel, entry);
+                        }
+                        kept += 1;
+                        continue;
+                    }
                 }
             }
             FileAction::Write { heal_user_copy } => {
@@ -6062,7 +6091,7 @@ pub fn install_into_with<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
         written += 1;
     }
     if pending_dirty {
-        save_merge_pending(&dir, &pending);
+        let _ = save_merge_pending(&dir, &pending);
     }
     // ★M11 가: 사용자 우선 폴백으로 불필요해진 이번 스윕의 병합 전 사본 정리(파일 → 빈 상위 디렉터리만).
     if !capture_cleanup.is_empty() {
@@ -9205,7 +9234,7 @@ mod tests {
         std::fs::write(pd.join(PRISTINE_DIR).join(rel), e_old).unwrap();
         std::fs::write(pd.join(INSTALL_MANIFEST),
             serde_json::json!({ rel: content_hash(e_old) }).to_string()).unwrap();
-        save_merge_pending(&pd, &serde_json::Map::new());
+        let _ = save_merge_pending(&pd, &serde_json::Map::new());
         let _ = std::fs::remove_dir_all(base.join("pack-captures")); // 가 회복 스윕이 만든 캡처 디렉터리
         std::fs::write(base.join("pack-captures"), "OCCUPIED").unwrap();
         std::fs::create_dir_all(pd.join(format!("{rel}.user"))).unwrap();
@@ -14199,6 +14228,31 @@ mod m11_tests {
         assert_eq!((p["m"]["kind"].as_str(), p["m"]["state"].as_str()), (Some("merged"), Some("at-rest")));
         upsert_pending_v2(&mut p, &mut dirty, "n", kd("n"));
         assert_eq!(p["n"]["kind"], "kept-drift");
+    }
+
+    /// ★T2h(RULINGS CW5 · 검토자 M1): vendor 우선의 '원장 선저장'은 저장이 **디스크에 남았을 때만** 살아 있는 파일을 바꾼다 —
+    /// `.merge-pending.json` 이 폴더(쓸 수 없는 원장)면 기동 필수 파일은 사용자 사본 그대로 남고(격리), 원장을 쓸 수 있게 되면
+    /// 다음 스윕이 같은 판정으로 수렴한다(vendor 본 · `.user` · 기록). 종전: 저장 실패를 버리고 vendor 본을 써 기록 없는
+    /// 보관본을 남겼다.
+    #[test]
+    fn t2h_cw5_vendor_first_never_replaces_the_live_file_without_its_record() {
+        let rig = Rig::new("cw5");
+        let rel = "hooks/inject.sh";
+        let src = || UpdateSources::none().with_boot_critical(bc_only(&["hooks/inject.sh"]));
+        let mine = "#!/bin/bash\necho USER-A\n";
+        let v1 = "#!/bin/bash\necho V1\n";
+        rig.write(rel, mine.as_bytes());
+        std::fs::create_dir_all(rig.pack.join(MERGE_PENDING_FILE)).unwrap();
+        assert!(save_merge_pending(&rig.pack, &serde_json::Map::new()).is_err(), "폴더인 원장 — 저장은 실패를 돌려준다");
+        rig.install(&[(rel, v1)], false, &src());
+        assert_eq!(rig.read(rel).as_deref(), Some(mine), "기록이 남지 않으면 살아 있는 파일을 바꾸지 않는다");
+        assert!(rig.pack.join(MERGE_PENDING_FILE).is_dir(), "원장 자리는 그대로");
+        // 원장을 쓸 수 있게 되면 다음 스윕이 수렴한다.
+        std::fs::remove_dir_all(rig.pack.join(MERGE_PENDING_FILE)).unwrap();
+        rig.install(&[(rel, v1)], false, &src());
+        assert_eq!(rig.read(rel).as_deref(), Some(v1), "기동 필수 = vendor 먼저");
+        assert_eq!(rig.read(&format!("{rel}.user")).as_deref(), Some(mine), "내 사본 보관");
+        assert_eq!(rig.kind(rel).as_deref(), Some("vendor-first"), "기록과 함께");
     }
 
     /// 부록 A-2 #4(백업이 없으면 덮지 않는다): 기동 필수 파일의 사용자본을 보관할 수 없으면 vendor 본을 쓰지 않고 격리.

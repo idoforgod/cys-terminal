@@ -26757,7 +26757,7 @@ fn run_pack_merge_with(
     // 원장·병치 파일 해소 공통부.
     let resolve = |pending: &mut serde_json::Map<String, serde_json::Value>, side_suffix: &str| {
         pending.remove(&rel);
-        cys::pack::save_merge_pending(&dir, pending);
+        let _ = cys::pack::save_merge_pending(&dir, pending);
         let _ = std::fs::remove_file(dir.join(format!("{rel}{side_suffix}")));
     };
     // ★G3-축3 감사 원장 — 해소·거부 사실의 append 기록. 기록 실패는 loud 경고 후 계속
@@ -27184,7 +27184,7 @@ fn run_pack_merge_with(
                     "'{rel}' — vendor 본 유지를 확정하고 다시 입히기 대기를 해소?(보관본 {rel}.user 는 지우지 않음)"
                 )) {
                     pending.remove(&rel);
-                    cys::pack::save_merge_pending(&dir, &pending);
+                    let _ = cys::pack::save_merge_pending(&dir, &pending);
                     let cur = std::fs::read_to_string(&target).unwrap_or_default();
                     audit(&merge_audit_entry(
                         &rel, "take-new", &cur, &cur, "n/a", &flag_list(&["vendor-first-confirm"]),
@@ -27398,7 +27398,7 @@ fn run_pack_heal(rel: &str, yes: bool) -> i32 {
     }) {
         cys::pack::upsert_pending_v2(&mut pending, &mut dirty, rel, entry);
     }
-    cys::pack::save_merge_pending(&dir, &pending);
+    let _ = cys::pack::save_merge_pending(&dir, &pending);
     // ⑧ 감사(기록 실패는 loud 경고 후 계속 — 관측이지 게이트가 아니다).
     let before = disk.unwrap_or_default();
     if let Err(e) = cys::pack::append_merge_audit(
@@ -27560,7 +27560,7 @@ fn run_pack_revert_merge(dir: &std::path::Path, rel: &str, yes: bool, sources: &
     }) {
         cys::pack::upsert_pending_v2(&mut pending, &mut dirty, rel, e);
     }
-    cys::pack::save_merge_pending(dir, &pending);
+    let _ = cys::pack::save_merge_pending(dir, &pending);
     if let Err(e) = cys::pack::append_merge_audit(
         dir,
         &merge_audit_entry(rel, "revert-merge", &merged_now, &captured, "n/a", &t4_flags(yes)),
@@ -27969,10 +27969,10 @@ fn adopt_one(
         }) {
             cys::pack::upsert_pending_v2(&mut pending, &mut dirty, rel, entry);
         }
-        cys::pack::save_merge_pending(dir, &pending);
+        let _ = cys::pack::save_merge_pending(dir, &pending);
     } else if pending.remove(rel).is_some() {
         // 구 바이너리가 남긴 custom adopted 잔존 정리(스팸 원천 소거).
-        cys::pack::save_merge_pending(dir, &pending);
+        let _ = cys::pack::save_merge_pending(dir, &pending);
     }
     // ⑧ .user 소스 개명 보존(--from 소스는 원위치 무접촉).
     if from.is_none() {
@@ -41568,7 +41568,7 @@ mod tests {
                 "version": env!("CARGO_PKG_VERSION"), "ts": 0,
             }),
         );
-        cys::pack::save_merge_pending(&td, &pending);
+        let _ = cys::pack::save_merge_pending(&td, &pending);
         (td, rel, embed, env)
     }
 
@@ -41683,7 +41683,7 @@ mod tests {
         if let serde_json::Value::Object(o) = entry {
             pending.insert(rel.to_string(), serde_json::Value::Object(o));
         }
-        cys::pack::save_merge_pending(td, &pending);
+        let _ = cys::pack::save_merge_pending(td, &pending);
     }
 
     fn t4_manifest_set(td: &std::path::Path, rel: &str, content: &str) {
@@ -43279,7 +43279,7 @@ mod tests {
         let mut pending = serde_json::Map::new();
         pending.insert("a.md".into(), json!({"kind": "user-kept", "side": "a.md.new", "version": "x", "ts": 0}));
         pending.insert("b.sh".into(), json!({"kind": "vendor-first", "side": "b.sh.user", "version": "x", "ts": 0}));
-        cys::pack::save_merge_pending(&ctx.pack_dir, &pending);
+        let _ = cys::pack::save_merge_pending(&ctx.pack_dir, &pending);
         let it = diag_pack_drift_with(&ctx, &src);
         assert!(it.detail.contains("user-kept 1·vendor-first 1"), "{}", it.detail);
         assert!(!it.detail.contains("미지"), "새 종류는 미지가 아니다: {}", it.detail);
@@ -43488,7 +43488,7 @@ mod tests {
                 "version": env!("CARGO_PKG_VERSION"), "ts": 0,
             }),
         );
-        cys::pack::save_merge_pending(&ctx.pack_dir, &pending);
+        let _ = cys::pack::save_merge_pending(&ctx.pack_dir, &pending);
 
         let it = diag_pack_drift(&ctx);
         assert_eq!(it.status, DiagStatus::Warn, "{}", it.detail);
@@ -44045,7 +44045,7 @@ mod tests {
                 }),
             );
         }
-        cys::pack::save_merge_pending(&td, &pending);
+        let _ = cys::pack::save_merge_pending(&td, &pending);
 
         // ① 원클릭 복구.
         assert_eq!(run_pack_adopt(None, true, None, false, true), 0, "adopt --all 성공");
@@ -56425,7 +56425,7 @@ mod p3r1_caller_tests {
                 rel.to_string(),
                 serde_json::json!({"kind":"healed","side":format!("{rel}.user"),"version":"1.0.0"}),
             );
-            cys::pack::save_merge_pending(&r.pack, &pending);
+            let _ = cys::pack::save_merge_pending(&r.pack, &pending);
 
             let dest = r.local.join(rel);
             if let Some(p) = dest.parent() {
