@@ -470,12 +470,35 @@ class GateWithBuiltBinary(_Env):
         self.assertNotEqual(self.decision(r)[0], "deny", "작업 사본 쓰기가 막혔다")
 
 
+NEW_START = "\"$CYS_PY\" -I -S -B -X utf8 - <<'PYEOF'\n"
+# the starts of the earlier heads, rebuilt in a copy of the hook (`exec` = the shell is replaced, so the
+# judge's own blocking exit must be 2 again in such a copy — see `_CG_RC_BLOCK`)
+START_017768BF = ("exec \"$CYS_PY\" -B -s - <<'PYEOF'\nimport sys\n"
+                  "sys.path[:] = [p for p in sys.path if p and (p[0] in \"/\\\\\" or p[1:3] in (\":\\\\\", \":/\"))]\n")
+START_DBEC50E0 = "exec \"$CYS_PY\" - <<'PYEOF'\n"
+
+
 class JudgeIsolation(_Env):
-    """RULINGS CX1 — the judge never imports from the seat's working directory: a module planted in an
-    allowed (temporary) working directory is NOT executed, while a legitimate verdict / own-TODO / temp
-    write still passes and a forbidden write is still refused — in the base lane, a department lane and
-    a custom pack dir. Negative control: the old start (`exec "$CYS_PY" -` without the path clean-up)
-    DOES execute it — the test sees the fault it guards against."""
+    """RULINGS CX1 → DY1 — the judge's interpreter starts isolated: its one module source is the
+    interpreter's own standard library, decided by start-up flags (`-I -S -B -X utf8`) before it starts.
+    A module planted in an allowed (temporary) working directory is NOT executed, while a legitimate
+    verdict / own-TODO / temp write still passes and a forbidden write is still refused — in the base
+    lane, a department lane and a custom pack dir. Negative controls: copies of the hook with the starts
+    of earlier heads DO run the planted code — the tests see the faults they guard against."""
+
+    def hook_with_start(self, start, tag):
+        """A copy of the hook (+ `_lib.sh`) whose interpreter start is `start` — the judge body unchanged."""
+        src = HOOK.read_text(encoding="utf-8")
+        self.assertEqual(src.count(NEW_START), 1, "the isolated start is not in the hook")
+        old = src.replace(NEW_START, start)
+        if start.startswith("exec "):
+            self.assertEqual(old.count("_CG_RC_BLOCK = 77\n"), 1)
+            old = old.replace("_CG_RC_BLOCK = 77\n", "_CG_RC_BLOCK = 2\n")
+        copy = self.root / ("hooks-" + tag)
+        copy.mkdir()
+        (copy / "role-capability-gate.sh").write_text(old, encoding="utf-8")
+        shutil.copy(str(LIB), str(copy / "_lib.sh"))
+        return copy / "role-capability-gate.sh"
 
     def plant(self):
         cwd = self.tmpdir / "review-ws"
@@ -509,9 +532,10 @@ class JudgeIsolation(_Env):
             self.assertFalse(marker.exists())
 
     def test_the_judge_starts_on_every_interpreter_the_hook_can_pick(self):
-        """CX1 — the isolated start (`-B -s -` + the path clean-up) starts and passes the built-in
-        self-test on every CPython 3 the hook can pick here (this interpreter, the system `python3`,
-        a Homebrew one); the self-test runs from the planted working directory and nothing planted runs."""
+        """DY1 — the isolated start (`-I -S -B -X utf8 -`) starts and passes the built-in self-test on
+        every CPython 3 the hook can pick here (this interpreter, the system `python3` = the macOS CLT
+        3.9, a Homebrew one); the self-test runs from the planted working directory and nothing planted
+        runs."""
         cwd, marker = self.plant()
         seen = set()
         for py in (sys.executable, "/usr/bin/python3", "/opt/homebrew/bin/python3", "/usr/local/bin/python3",
@@ -533,19 +557,180 @@ class JudgeIsolation(_Env):
 
     def test_negative_control_old_start_executes_the_planted_module(self):
         cwd, marker = self.plant()
-        src = HOOK.read_text(encoding="utf-8")
-        start = src.index("exec \"$CYS_PY\" ")
-        body = src.index("import hashlib, json", start)
-        old = src[:start] + "exec \"$CYS_PY\" - <<'PYEOF'\n" + src[body:]
-        self.assertNotEqual(old, src, "the isolated start is not in the hook")
-        copy = self.root / "hooks-copy"
-        copy.mkdir()
-        (copy / "role-capability-gate.sh").write_text(old, encoding="utf-8")
-        shutil.copy(str(LIB), str(copy / "_lib.sh"))
         r, _ = self.reviewer({"file_path": str(cwd / "notes.md"), "content": "x"}, cwd, self.pack,
-                             hook=copy / "role-capability-gate.sh")
+                             hook=self.hook_with_start(START_DBEC50E0, "dbec50e0"))
         self.assertTrue(marker.exists(), "the old start did not execute the planted module — the "
                         "regression above would not see the fault: %r %r" % (r.stdout, r.stderr[-300:]))
+
+
+    # ── RULINGS DY1 — what a seat can put in the judge's environment or in a folder it can write ──
+    def _planted(self, d, marker, tag, mods=("json", "hashlib", "tempfile", "re", "sitecustomize", "usercustomize")):
+        d.mkdir(parents=True, exist_ok=True)
+        for mod in mods:
+            (d / ("%s.py" % mod)).write_text("open(%r, 'a').write(%r)\nraise SystemExit(0)\n"
+                                            % (str(marker), "%s:%s\n" % (tag, mod)), encoding="utf-8")
+        return d
+
+    def vectors(self, marker):
+        """(name, extra env, working directory) — every folder below is inside the reviewer's allowed temp dir."""
+        t = self.tmpdir
+        ws = t / "review-ws"
+        ws.mkdir(exist_ok=True)
+        ver = "%d.%d" % sys.version_info[:2]
+        home = t / "home-plant"
+        # an interpreter that took this PYTHONHOME would import `encodings` from it first
+        self._planted(home / "lib" / ("python" + ver) / "encodings", marker, "PYTHONHOME", mods=("__init__",))
+        ub = t / "userbase"
+        r = subprocess.run([sys.executable, "-I", "-S", "-c", "import site; print(site.getusersitepackages())"],
+                           env=dict(self.env, PYTHONUSERBASE=str(ub)), capture_output=True, text=True, timeout=30)
+        usersite = Path(r.stdout.strip())
+        self.assertTrue(str(usersite).startswith(str(ub)), "user site does not follow PYTHONUSERBASE: %r" % r.stdout)
+        self._planted(usersite, marker, "PYTHONUSERBASE")
+        (usersite / "planted.pth").write_text("import os; open(%r, 'a').write('PYTHONUSERBASE:pth\\n')\n"
+                                              % str(marker), encoding="utf-8")
+        rel_cwd = t / "rel-cwd"
+        self._planted(rel_cwd / "ws", marker, "rel")
+        return [
+            ("absolute PYTHONPATH in a seat-writable folder",
+             {"PYTHONPATH": str(self._planted(t / "pp-abs", marker, "abs"))}, ws),
+            ("relative PYTHONPATH", {"PYTHONPATH": "ws"}, rel_cwd),
+            ("module in the current directory", {}, self._planted(t / "cwd-plant", marker, "cwd")),
+            ("PYTHONSTARTUP", {"PYTHONSTARTUP": str(self._planted(t / "startup", marker, "startup",
+                                                                   mods=("startup",)) / "startup.py")}, ws),
+            ("PYTHONHOME", {"PYTHONHOME": str(home)}, ws),
+            ("PYTHONUSERBASE", {"PYTHONUSERBASE": str(ub)}, ws),
+            ("sitecustomize.py alone on PYTHONPATH",
+             {"PYTHONPATH": str(self._planted(t / "pp-site", marker, "site", mods=("sitecustomize",)))}, ws),
+            ("usercustomize.py alone on PYTHONPATH",
+             {"PYTHONPATH": str(self._planted(t / "pp-user", marker, "user", mods=("usercustomize",)))}, ws),
+            ("PYTHONINSPECT", {"PYTHONINSPECT": "1"}, ws),
+            ("PYTHONIOENCODING", {"PYTHONIOENCODING": "utf-16"}, ws),
+            ("PYTHONUTF8 not 0/1", {"PYTHONUTF8": "x"}, ws),
+        ]
+
+    def run_raw(self, hook, tool_input, cwd, extra):
+        env = dict(self.env, CYS_ROLE="reviewer-codex", CYS_PACK_DIR=str(self.pack))
+        env.update(extra)
+        payload = {"session_id": "t5c", "tool_name": "Write", "tool_input": tool_input,
+                   "hook_event_name": "PreToolUse", "cwd": str(cwd)}
+        r = subprocess.run([SH, str(hook)], input=json.dumps(payload).encode(), env=env, cwd=str(cwd),
+                           capture_output=True, timeout=60)
+        return r.returncode, r.stdout.decode("utf-8", "replace"), r.stderr.decode("utf-8", "replace")
+
+    @staticmethod
+    def whole_stdout_one_deny(out):
+        try:
+            obj = json.loads(out)
+        except ValueError:
+            return False
+        return isinstance(obj, dict) and (obj.get("hookSpecificOutput") or {}).get("permissionDecision") == "deny"
+
+    def faults(self, hook, vectors, marker):
+        """Per vector: why the judge did NOT decide on its own (planted code ran / an allowed write did not
+        pass / a forbidden write was not refused) — an empty list = the vector holds."""
+        (self.pack / "round" / "_reviews").mkdir(parents=True, exist_ok=True)
+        out = {}
+        for name, extra, cwd in vectors:
+            if marker.exists():
+                marker.unlink()
+            why = []
+            for target in (self.pack / "round" / "_reviews" / "verdict-x.md",
+                           self.pack / "round" / "REVIEWER_CODEX_TODO.md"):
+                rc, so, se = self.run_raw(hook, {"file_path": str(target), "content": "x"}, cwd, extra)
+                if rc != 0 or self.whole_stdout_one_deny(so):
+                    why.append("allowed %s: rc=%d stdout=%r stderr=%r" % (target.name, rc, so[:120], se[-160:]))
+            rc, so, se = self.run_raw(hook, {"file_path": str(self.pack / "hooks" / "x.sh"), "content": "x"},
+                                      cwd, extra)
+            if not (rc == 2 or (rc == 0 and self.whole_stdout_one_deny(so))):
+                why.append("forbidden write not refused: rc=%d stdout=%r stderr=%r" % (rc, so[:120], se[-160:]))
+            if marker.exists():
+                why.append("planted code RAN: %r" % marker.read_text(encoding="utf-8"))
+            out[name] = why
+        return out
+
+    def test_no_python_variable_or_planted_module_reaches_the_judge(self):
+        """DY1 negative controls on the hook as it is: for each vector (an absolute / relative PYTHONPATH
+        into a seat-writable folder, a module in the current directory, PYTHONSTARTUP / PYTHONHOME /
+        PYTHONUSERBASE into a seat-writable folder, sitecustomize.py / usercustomize.py on those paths, and
+        PYTHONINSPECT / PYTHONIOENCODING / an invalid PYTHONUTF8 — three variables that, without isolation,
+        turn every decision into a non-blocking exit or unreadable output) the planted code does NOT run
+        (its marker file is absent) AND the decision is complete: the verdict and own-TODO writes pass,
+        the forbidden write gives exit 2 or, as the WHOLE stdout, one JSON
+        deny object with exit 0 (an allowed write: exit 0 and no deny)."""
+        marker = self.root / "PLANTED-RAN"
+        got = self.faults(HOOK, self.vectors(marker), marker)
+        bad = {k: v for k, v in got.items() if v}
+        self.assertEqual(bad, {}, "the judge did not decide on its own:\n%s"
+                         % "\n".join("%s: %s" % (k, " | ".join(v)) for k, v in bad.items()))
+
+    def test_negative_control_the_earlier_starts_fail_these_vectors(self):
+        """The same table against copies of the hook with the starts of the earlier heads — the faults the
+        test above guards against are real. `017768bf` (`-B -s -` + the first-statement path clean-up):
+        an absolute / relative PYTHONPATH, sitecustomize.py on it, PYTHONHOME, PYTHONINSPECT,
+        PYTHONIOENCODING and an invalid PYTHONUTF8. `dbec50e0` (plain `-`): additionally the module in
+        the current directory, PYTHONUSERBASE and usercustomize.py on PYTHONPATH. (PYTHONSTARTUP runs on
+        no head: the judge's stdin is not a terminal — it stays as a pin.)"""
+        marker = self.root / "PLANTED-RAN"
+        vectors = self.vectors(marker)
+        expected = {
+            "017768bf": {"absolute PYTHONPATH in a seat-writable folder", "relative PYTHONPATH",
+                         "sitecustomize.py alone on PYTHONPATH", "PYTHONHOME", "PYTHONINSPECT",
+                         "PYTHONIOENCODING", "PYTHONUTF8 not 0/1"},
+            "dbec50e0": {"module in the current directory", "PYTHONUSERBASE",
+                         "usercustomize.py alone on PYTHONPATH", "absolute PYTHONPATH in a seat-writable folder"},
+        }
+        for tag, start in (("017768bf", START_017768BF), ("dbec50e0", START_DBEC50E0)):
+            got = self.faults(self.hook_with_start(start, tag), vectors, marker)
+            caught = sorted(k for k, v in got.items() if v)
+            sys.stderr.write("DY1 negative control, start of %s: fails %s; holds %s\n"
+                             % (tag, caught, sorted(k for k, v in got.items() if not v)))
+            self.assertEqual(sorted(expected[tag] - set(caught)), [],
+                             "%s: these vectors did not fail on the old start — the test above would not "
+                             "see the fault: %r" % (tag, {k: got[k] for k in expected[tag]}))
+
+    def fake_python(self, name, body):
+        p = self.fakebin / name
+        p.write_text(body, encoding="utf-8")
+        p.chmod(0o755)
+        return p
+
+    def test_an_interpreter_that_refuses_the_flags_is_a_broken_gate_not_a_wall(self):
+        """DY1 failure mode (unchanged): an interpreter that refuses the isolation flags (a Python 2 /
+        pre-3.4 `-I` → usage error, exit 2) or cannot start (a dead `#!`) is a BROKEN gate = pass-through
+        with one stderr line from the gate — for every role, also for a write the judge would refuse;
+        never a blocking exit, never a deny; ONE interpreter launch per tool call (no probe); the
+        `--self-test` fails loudly. Negative control: the same isolated start under `exec` (no exit-code
+        mapping) blocks every tool call of every seat."""
+        log = self.root / "py-launches.log"
+        refuses = self.fake_python("python2-like", "#!/bin/sh\nprintf '%%s\\n' \"$*\" >> %s\n"
+                                   "for a in \"$@\"; do [ \"$a\" = -I ] && { echo 'Unknown option: -I' >&2; "
+                                   "echo 'usage: python [option] ... [-c cmd | -m mod | file | -] [arg] ...' >&2; "
+                                   "exit 2; }; done\nexec %s \"$@\"\n" % (log, sys.executable))
+        dead = self.fake_python("python-dead", "#!/nonexistent/interpreter/python3\n")
+        (self.pack / "round" / "_reviews").mkdir(parents=True, exist_ok=True)
+        forbidden = {"file_path": str(self.pack / "hooks" / "x.sh"), "content": "x"}
+        for py in (refuses, dead):
+            for role in ("reviewer-codex", "cso", "worker"):
+                n0 = len(log.read_text().splitlines()) if log.exists() else 0
+                r, _ = self.run_hook("Write", forbidden, CYS_ROLE=role, CYS_PY=str(py))
+                self.assertEqual(r.returncode, 0, "%s %s: a broken gate must not block: rc=%d %r"
+                                 % (py.name, role, r.returncode, r.stderr[-300:]))
+                self.assertEqual(r.stdout.strip(), "", "%s %s: a broken gate must not deny: %r" % (py.name, role, r.stdout))
+                self.assertEqual(r.stderr.count("role-capability-gate: 판정기 인터프리터가 격리 기동"), 1,
+                                 "%s %s: not the one stderr line: %r" % (py.name, role, r.stderr[-400:]))
+                if py == refuses:
+                    lines = log.read_text().splitlines()[n0:]
+                    self.assertEqual(len(lines), 1, "%s: one interpreter per tool call, got %r" % (role, lines))
+                    self.assertTrue(lines[0].startswith("-I -S -B -X utf8 -"), lines)
+            st = subprocess.run([SH, str(HOOK), "--self-test"], env=dict(self.env, CYS_PY=str(py)),
+                                capture_output=True, text=True, timeout=60)
+            self.assertEqual(st.returncode, 2, "%s: the self-test must fail loudly: %r" % (py.name, st.stderr[-300:]))
+        # negative control: `exec` with the same flags and no mapping → exit 2 = every tool call blocked
+        walled = self.hook_with_start("exec " + NEW_START, "exec-no-mapping")
+        r, _ = self.run_hook("Write", {"file_path": str(self.pack / "round" / "_reviews" / "v.md"),
+                                       "content": "x"}, hook=walled, CYS_ROLE="worker", CYS_PY=str(refuses))
+        self.assertEqual(r.returncode, 2, "the negative control did not reproduce the wall: rc=%d %r"
+                         % (r.returncode, r.stderr[-300:]))
 
 
 if __name__ == "__main__":
