@@ -26449,7 +26449,7 @@ fn advance_vendor_baseline(dir: &std::path::Path, rel: &str, content: &str) {
         .unwrap_or_default();
     m.insert(rel.to_string(), cys::pack::content_hash_pub(content));
     if let Ok(json) = serde_json::to_string_pretty(&m) {
-        let _ = cys::pack::write_atomic(&mpath, json.as_bytes());
+        let _ = cys::pack::write_beneath(dir, cys::pack::INSTALL_MANIFEST, json.as_bytes());
     }
     // ★T2h(RULINGS CW1 · 검토자 B1): `.pristine/<rel>` 은 닻 내린 쓰기 — 구성 요소가 링크면(검사 뒤에 바뀌었어도) 쓰지 않는다.
     //   (종전: `create_dir_all` + `write_atomic` 이 `.pristine/hooks` → `hooks` 링크를 따라 살아 있는 파일을 바꿨다.)
@@ -26897,7 +26897,7 @@ fn run_pack_merge_with(
                     let prior = cys::pack::current_mode(&target);
                     let sysent = cys::pack::is_system_manifest_entry(&dir, &rel);
                     if let Err(e) =
-                        cys::pack::write_pack_file(&target, theirs.as_bytes(), prior, sysent)
+                        cys::pack::write_pack_file_beneath(&dir, &rel, theirs.as_bytes(), prior, sysent, cys::pack::Place::Replace)
                     {
                         eprintln!("쓰기 실패: {e}");
                         return 1;
@@ -26973,7 +26973,7 @@ fn run_pack_merge_with(
                         let prior = cys::pack::current_mode(&target);
                         let sysent = cys::pack::is_system_manifest_entry(&dir, &rel);
                         if let Err(e) =
-                            cys::pack::write_pack_file(&target, m.as_bytes(), prior, sysent)
+                            cys::pack::write_pack_file_beneath(&dir, &rel, m.as_bytes(), prior, sysent, cys::pack::Place::Replace)
                         {
                             eprintln!("쓰기 실패: {e}");
                             return 1;
@@ -27033,8 +27033,9 @@ fn run_pack_merge_with(
                         //   0644→0755 복구 분기가 **사용자 파일의 mode 를 넓혔다**(H-08 자신의
                         //   정확 보존 규칙 위반 · 네이티브 재현됨). prior=None(첫 승격)은 그대로
                         //   내용에서 파생된다(`exec_mode_for`).
+                        // ★T2i(RULINGS EC4 (4)): 오버레이도 닻 내린 쓰기(로컬 루트에서 구성 요소마다 링크 비추종).
                         if let Err(e) =
-                            cys::pack::write_pack_file(&dest, content.as_bytes(), prior, false)
+                            cys::pack::write_pack_file_beneath(&local_root, &rel, content.as_bytes(), prior, false, cys::pack::Place::Replace)
                         {
                             eprintln!("오버레이 쓰기 실패: {e}");
                             return 1;
@@ -27047,8 +27048,13 @@ fn run_pack_merge_with(
                                 // 전진(shadowing 드리프트)을 결정론 감지하는 기준점. 사용자의 명시적
                                 // 승격 명령에 딸린 메타 기록이라 "업데이터의 local 불가침"과 무관.
                                 if let Some(embed) = embed_now {
-                                    let _ = cys::pack::write_atomic(
-                                        &skill_dir.join(".vendor-base"),
+                                    let vb = std::path::Path::new(&rel)
+                                        .parent()
+                                        .map(|p| format!("{}/.vendor-base", p.to_string_lossy().replace('\\', "/")))
+                                        .unwrap_or_else(|| ".vendor-base".to_string());
+                                    let _ = cys::pack::write_beneath(
+                                        &local_root,
+                                        &vb,
                                         cys::pack::content_hash_pub(embed).as_bytes(),
                                     );
                                 }
@@ -27416,7 +27422,8 @@ fn run_pack_heal(rel: &str, yes: bool) -> i32 {
         }
         // ⑤ 백업 선행 — 판독 가능=.user 전문 · 판독 불가(존재 시)=바이트 백업 · 실패=fail-closed 거부.
         if let Some(d) = disk.as_deref() {
-            cys::pack::write_atomic(&dir.join(format!("{rel}.user")), d.as_bytes())
+            // ★T2i(RULINGS EC4 (4)): 닻 내린 쓰기.
+            cys::pack::write_beneath(&dir, &format!("{rel}.user"), d.as_bytes())
                 .map_err(|e| format!("백업 쓰기 실패({e}) — fail-closed 거부(무변경)"))?;
         } else if target.exists() {
             cys::pack::byte_backup_user(&dir, rel, &target).map_err(|e| {
@@ -27433,7 +27440,7 @@ fn run_pack_heal(rel: &str, yes: bool) -> i32 {
     // H-08: 치유가 실행비트를 떨어뜨리지 않는다 — 쓰기 전 mode 를 읽어 규칙에 넘긴다.
     let prior = cys::pack::current_mode(&target);
     let sysent = cys::pack::is_system_manifest_entry(&dir, rel);
-    if let Err(e) = cys::pack::write_pack_file(&target, embed.as_bytes(), prior, sysent) {
+    if let Err(e) = cys::pack::write_pack_file_beneath(&dir, rel, embed.as_bytes(), prior, sysent, cys::pack::Place::Replace) {
         eprintln!("복원 쓰기 실패: {e}");
         return 1;
     }
@@ -27515,15 +27522,11 @@ fn run_pack_heal_missing_only_with(rel: &str, sources: &cys::pack::UpdateSources
         );
         return 0;
     }
-    if let Some(parent) = target.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            eprintln!("폴더 생성 실패({e}) — 무변경");
-            return 1;
-        }
-    }
     // H-08: 없던 파일이라 선행 mode 가 없다 — 내장본의 shebang 에서 파생한다(install 과 같은 규칙).
+    // ★T2i(RULINGS EC4): 닻 내린 쓰기 · **덮지 않는** 놓기 — 확인 뒤에 누가 그 이름을 만들었으면 아무것도 바꾸지 않는다
+    //   (없던 파일만 되살리는 동사의 뜻 그대로). 폴더도 닻 내린 기술자에서 만든다(링크를 거치지 않는다).
     let sysent = cys::pack::is_system_manifest_entry(&dir, rel);
-    if let Err(e) = cys::pack::write_pack_file(&target, embed.as_bytes(), None, sysent) {
+    if let Err(e) = cys::pack::write_pack_file_beneath(&dir, rel, embed.as_bytes(), None, sysent, cys::pack::Place::NoReplace) {
         eprintln!("복원 쓰기 실패: {e}");
         return 1;
     }
@@ -27589,7 +27592,8 @@ fn run_pack_revert_merge(dir: &std::path::Path, rel: &str, yes: bool, sources: &
     // (RULINGS EC1: 잠금을 새로 잡지 않는다 — 세대는 배타 자리 예약이 지킨다.)
     let step = (|| -> Result<Option<std::path::PathBuf>, String> {
         let prev = preserve_prior_user_generation(dir, rel, Some(merged_now.as_bytes()))?;
-        cys::pack::write_atomic(&dir.join(format!("{rel}.user")), merged_now.as_bytes())
+        // ★T2i(RULINGS EC4 (4)): 닻 내린 쓰기.
+        cys::pack::write_beneath(dir, &format!("{rel}.user"), merged_now.as_bytes())
             .map_err(|e| format!("백업 쓰기 실패({e})"))?;
         Ok(prev)
     })();
@@ -27604,7 +27608,7 @@ fn run_pack_revert_merge(dir: &std::path::Path, rel: &str, yes: bool, sources: &
     // H-08
     let prior = cys::pack::current_mode(&target);
     let sysent = cys::pack::is_system_manifest_entry(dir, rel);
-    if let Err(e) = cys::pack::write_pack_file(&target, captured.as_bytes(), prior, sysent) {
+    if let Err(e) = cys::pack::write_pack_file_beneath(dir, rel, captured.as_bytes(), prior, sysent, cys::pack::Place::Replace) {
         eprintln!("복원 쓰기 실패: {e}");
         return 1;
     }
@@ -28007,7 +28011,7 @@ fn adopt_one(
         // H-08: 복권은 치유가 0644 로 떨어뜨린 대상을 되살리는 경로다 — 쓰기 전 mode 를 읽는다.
         let prior = cys::pack::current_mode(&target);
         let sysent = cys::pack::is_system_manifest_entry(dir, rel);
-        cys::pack::write_pack_file(&target, source.as_bytes(), prior, sysent)
+        cys::pack::write_pack_file_beneath(dir, rel, source.as_bytes(), prior, sysent, cys::pack::Place::Replace)
             .map_err(|e| format!("복원 쓰기 실패: {e}"))?;
     }
     // ⑦ 원장 — pack rel 만 adopted 전환(conflicted 였으면 capture·base_side 승계 — .base 파일
@@ -28207,12 +28211,28 @@ const PACK_PROPOSE_NOTE: &str = "이 파일은 내 수정본과 기준본의 차
 
 /// diff -u 외부 명령으로 unified diff 생성(결정론) — 도구 부재·실행 실패면 None(호출측 폴백).
 fn unified_diff_via_cmd(vendor: &str, mine: &str, rel: &str) -> Option<String> {
-    let tmp = std::env::temp_dir().join(format!("cys-propose-{}", std::process::id()));
-    std::fs::create_dir_all(&tmp).ok()?;
+    // ★T2i(RULINGS EC4 (2)): 이미 있는 임시 이름을 열지 않는다 — 새 폴더를 배타적으로 만들고(있으면 다음 이름) 그 안의 파일도
+    //   배타 생성(create-new)으로만 쓴다.
+    let mut tmp = None;
+    for n in 0..16u32 {
+        let cand = std::env::temp_dir().join(format!("cys-propose-{}-{n}", std::process::id()));
+        if std::fs::create_dir(&cand).is_ok() {
+            tmp = Some(cand);
+            break;
+        }
+    }
+    let tmp = tmp?;
     let a = tmp.join("vendor");
     let b = tmp.join("mine");
-    std::fs::write(&a, vendor).ok()?;
-    std::fs::write(&b, mine).ok()?;
+    let create_new = |p: &std::path::Path, body: &str| -> Option<()> {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(p).ok()?;
+        f.write_all(body.as_bytes()).ok()
+    };
+    if create_new(&a, vendor).is_none() || create_new(&b, mine).is_none() {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return None;
+    }
     let out = std::process::Command::new("diff")
         .arg("-u")
         .arg("--label").arg(format!("vendor/{rel}"))
@@ -29182,10 +29202,8 @@ fn run_pack_rollback_with(
         println!("취소됨");
         return 0;
     }
+    // ★T2i(RULINGS EC4 (4)): 폴더는 닻 내린 쓰기가 만든다(링크를 따라 다른 곳에 폴더를 만들지 않는다).
     let dest = dir.join(&rel);
-    if let Some(parent) = dest.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
     // H-08: 보존본(원본)이 실행 가능하면 그 mode 가 권위다 — 대상은 이전 치유가 0644 로 망가뜨린
     //   사본일 수 있으므로 **source 를 먼저** 본다.
     let prior = snap_mode
@@ -29193,7 +29211,7 @@ fn run_pack_rollback_with(
         .filter(|m| m & 0o111 != 0)
         .or_else(|| cys::pack::current_mode(&dest));
     let sysent = cys::pack::is_system_manifest_entry(&dir, &rel);
-    if let Err(e) = cys::pack::write_pack_file(&dest, &content, prior, sysent) {
+    if let Err(e) = cys::pack::write_pack_file_beneath(&dir, &rel, &content, prior, sysent, cys::pack::Place::Replace) {
         eprintln!("복원 쓰기 실패: {e}");
         return 1;
     }
@@ -42924,6 +42942,85 @@ mod tests {
         untouched("pack.prev · not released");
         let _ = std::fs::remove_dir_all(&prev);
         let _ = std::fs::remove_dir_all(td.parent().unwrap());
+    }
+
+    /// ★T2i(RULINGS EC4): 쓰기 자리 조사(census) — 팩 동사와 그 쓰기 도구의 몸통에 '이미 있는 경로를 쓰려고 여는' 호출이 없다:
+    /// `std::fs::write(` · `File::create(` · `.truncate(true)` · `std::fs::copy(` 은 어디에도, 평범한 생성 `.create(true)` 는
+    /// 덧붙이기 원장(`append_merge_audit`) 하나에만. 팩 동사의 쓰기는 닻 내린 도구(`write_pack_file_beneath` · `write_beneath`)로만
+    /// — 경로로 쓰는 `cys::pack::write_pack_file(` · `cys::pack::write_atomic(` 은 없다.
+    #[test]
+    fn ec4_pack_verb_write_site_census() {
+        let cys_src = include_str!("cys.rs");
+        let pack_src = include_str!("../pack.rs");
+        let body_of = |src: &str, head: &str| -> String {
+            let at = src.find(head).unwrap_or_else(|| panic!("census: {head} not found"));
+            let rest = &src[at..];
+            let open = rest.find('{').unwrap();
+            let mut depth = 0i32;
+            for (i, ch) in rest[open..].char_indices() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return rest[..open + i + 1].to_string();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("census: {head} unbalanced")
+        };
+        let code = |b: &str, pat: &str| b.lines().any(|l| l.contains(pat) && !l.trim_start().starts_with("//"));
+        let verbs = [
+            "fn advance_vendor_baseline(",
+            "fn run_pack_merge_with(",
+            "fn run_pack_heal(",
+            "fn run_pack_heal_missing_only_with(",
+            "fn run_pack_revert_merge(",
+            "fn adopt_one(",
+            "fn run_pack_rollback_with(",
+            "fn unified_diff_via_cmd(",
+            "fn run_pack_propose(",
+        ];
+        let tools = [
+            "pub fn beneath_write(",
+            "pub fn write_pack_file_beneath(",
+            "fn preserve_prior_user_generation_at(",
+            "pub fn byte_backup_user(",
+            "pub fn save_merge_pending(",
+            "fn write_atomic_mode_inner(",
+            "pub fn append_merge_audit(",
+        ];
+        let never = ["std::fs::write(", "File::create(", ".truncate(true)", "std::fs::copy("];
+        let mut bad = Vec::new();
+        for head in verbs {
+            let b = body_of(cys_src, head);
+            for pat in never.iter().chain([".create(true)"].iter()) {
+                if code(&b, pat) {
+                    bad.push(format!("{head} {pat}"));
+                }
+            }
+            if head != "fn run_pack_propose(" {
+                for pat in ["cys::pack::write_pack_file(", "cys::pack::write_atomic("] {
+                    if code(&b, pat) {
+                        bad.push(format!("{head} {pat}"));
+                    }
+                }
+            }
+        }
+        for head in tools {
+            let b = body_of(pack_src, head);
+            for pat in never {
+                if code(&b, pat) {
+                    bad.push(format!("pack {head} {pat}"));
+                }
+            }
+            if head != "pub fn append_merge_audit(" && code(&b, ".create(true)") {
+                bad.push(format!("pack {head} .create(true)"));
+            }
+        }
+        assert!(bad.is_empty(), "pack-verb write sites that open an existing path: {bad:?}");
     }
 
     /// ★T2i(RULINGS EF1 · EF4): '보관 중'은 디스크의 사실이다 — 보고서 R3.2 의 다섯 걸음을 그대로: vendor-first 보관(기록 +

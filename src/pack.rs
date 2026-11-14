@@ -3549,6 +3549,24 @@ pub fn append_merge_audit(dir: &Path, entry: &serde_json::Value) -> Result<(), S
             return Err(format!("감사 원장 {} 이 다른 파일의 별칭(하드 링크)입니다 — 쓰지 않습니다", path.display()));
         }
     }
+    // ★T2i(RULINGS EC4 (3)): 윈도우에서도 링크 수는 **연 핸들**의 사실이다(`GetFileInformationByHandle` 의 `nNumberOfLinks`) —
+    //   하나가 아니면(보호 파일의 하드 링크) 쓰지 않는다. 그 질의가 실패해도 쓰지 않는다.
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(f.as_raw_handle() as _, &mut info) } == 0 {
+            return Err(format!(
+                "감사 원장 {} 의 링크 수를 핸들에서 확인할 수 없습니다({}) — 쓰지 않습니다",
+                path.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        if info.nNumberOfLinks != 1 {
+            return Err(format!("감사 원장 {} 이 다른 파일의 별칭(하드 링크)입니다 — 쓰지 않습니다", path.display()));
+        }
+    }
     f.write_all(line.as_bytes())
         .map_err(|e| format!("감사 원장 쓰기 실패 {}: {e}", path.display()))
 }
@@ -4002,94 +4020,326 @@ pub fn sidecar_path_gate(root: &Path, rel_path: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// ★T2h(RULINGS CW1): `root` 아래 `rel_path` 에 **닻을 내린** 원자 쓰기 — unix: 루트를 연 디렉터리 기술자에서 구성 요소마다
-/// `openat(O_DIRECTORY | O_NOFOLLOW)` 로 내려가고(없으면 `mkdirat`), 같은 기술자 안에서 임시 파일을 `O_CREAT | O_EXCL |
-/// O_NOFOLLOW` 로 만들어 쓰고 `fsync` 한 뒤 `renameat` 한다 — 검사와 쓰기 사이에 구성 요소가 링크로 바뀌어도 쓰기는 그 링크를
-/// 따라가지 않는다(바뀐 자리 = 실패). 마지막 성분이 링크면 그 링크 자체가 교체된다(가리키는 파일은 무접촉). windows: 같은 경로
-/// 규칙([`sidecar_path_gate`])을 쓰기 직전에 다시 재고 원자 쓰기 — 검사와 쓰기 사이의 창은 남는다(그 운영체제에 `openat` 이 없다).
+/// ★T2h(RULINGS CW1): `root` 아래 `rel_path` 에 **닻을 내린** 원자 쓰기(교체). 본문은 [`beneath_write`] 하나다(RULINGS EC4).
 pub fn write_beneath(root: &Path, rel_path: &str, bytes: &[u8]) -> std::io::Result<()> {
-    let bad = |m: String| std::io::Error::other(m);
+    beneath_write(root, rel_path, bytes, None, false, Place::Replace, false)
+}
+
+/// ★T2i(RULINGS EC2 · EC4): 닻을 내린 쓰기가 마지막 이름에 놓는 방식 — `Replace` = 원자 교체(마지막 성분이 링크면 링크
+/// 자체가 바뀐다), `NoReplace` = 그 이름이 비어 있을 때만(차 있으면 `AlreadyExists` · 아무것도 바뀌지 않음).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Place {
+    Replace,
+    NoReplace,
+}
+
+fn rel_parts(rel_path: &str) -> std::io::Result<Vec<&str>> {
     let parts: Vec<&str> = rel_path.split(['/', '\\']).filter(|p| !p.is_empty() && *p != ".").collect();
     if parts.is_empty() || parts.contains(&"..") {
-        return Err(bad(format!("쓰기 자리 {rel_path} 가 정규형이 아닙니다")));
+        return Err(std::io::Error::other(format!("쓰기 자리 {rel_path} 가 정규형이 아닙니다")));
     }
+    Ok(parts)
+}
+
+#[cfg(unix)]
+struct DirFd(libc::c_int);
+
+#[cfg(unix)]
+impl Drop for DirFd {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.0) };
+    }
+}
+
+#[cfg(unix)]
+fn c_name(s: &str) -> std::io::Result<std::ffi::CString> {
+    std::ffi::CString::new(s.as_bytes()).map_err(|e| std::io::Error::other(e.to_string()))
+}
+
+/// ★T2i(RULINGS EC4 (4)): unix — `root` 를 연 기술자에서 구성 요소마다 `openat(O_DIRECTORY | O_NOFOLLOW)` 로 내려간다(`mkdirs` 면
+/// 없는 폴더를 `mkdirat`). 사실(링크 아님 · 폴더임)은 연 기술자에서 나온다 — 검사와 쓰기 사이에 구성 요소가 링크로 바뀌면 실패.
+/// 없는 구성 요소(`mkdirs` 아님) = `NotFound`.
+#[cfg(unix)]
+fn anchor_dir(root: &Path, comps: &[&str], mkdirs: bool, rel_path: &str) -> std::io::Result<DirFd> {
+    use std::os::unix::ffi::OsStrExt;
+    let root_c = std::ffi::CString::new(root.as_os_str().as_bytes()).map_err(|e| std::io::Error::other(e.to_string()))?;
+    let fd = unsafe { libc::open(root_c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut d = DirFd(fd);
+    for comp in comps {
+        let c = c_name(comp)?;
+        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        let mut nfd = unsafe { libc::openat(d.0, c.as_ptr(), flags) };
+        let mut err = std::io::Error::last_os_error();
+        if nfd < 0 && mkdirs && err.raw_os_error() == Some(libc::ENOENT) {
+            let made = unsafe { libc::mkdirat(d.0, c.as_ptr(), 0o755 as libc::mode_t) };
+            if made != 0 {
+                let e = std::io::Error::last_os_error();
+                if e.raw_os_error() != Some(libc::EEXIST) {
+                    return Err(e);
+                }
+            }
+            nfd = unsafe { libc::openat(d.0, c.as_ptr(), flags) };
+            err = std::io::Error::last_os_error();
+        }
+        if nfd < 0 {
+            if err.raw_os_error() == Some(libc::ENOENT) {
+                return Err(err);
+            }
+            return Err(std::io::Error::other(format!(
+                "쓰기 자리 {rel_path} 의 구성 요소 {comp} 가 링크이거나 폴더가 아닙니다({err})"
+            )));
+        }
+        d = DirFd(nfd);
+    }
+    Ok(d)
+}
+
+/// ★T2i(RULINGS EC2): 같은 폴더 기술자 안의 **덮지 않는** 이름 바꾸기 — macOS `renameatx_np(RENAME_EXCL)`, 리눅스(glibc)·안드로이드
+/// `renameat2(RENAME_NOREPLACE)`. 대상 이름이 차 있으면 `AlreadyExists`(아무것도 바뀌지 않음). 파일 시스템·운영체제가 지원하지
+/// 않으면(`EINVAL` · `ENOTSUP` · `ENOSYS`) `Unsupported` — 호출부는 놓지 않는다(보관 불가 갈래).
+#[cfg(unix)]
+fn no_replace_renameat(fd: libc::c_int, from: &std::ffi::CStr, to: &std::ffi::CStr) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    let r = unsafe { libc::renameatx_np(fd, from.as_ptr(), fd, to.as_ptr(), libc::RENAME_EXCL) };
+    #[cfg(any(all(target_os = "linux", target_env = "gnu"), target_os = "android"))]
+    let r = unsafe { libc::renameat2(fd, from.as_ptr(), fd, to.as_ptr(), libc::RENAME_NOREPLACE) };
+    #[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu"), target_os = "android")))]
+    let r: libc::c_int = {
+        let _ = (fd, from, to);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "이 운영체제에서는 덮지 않는 이름 바꾸기를 쓸 수 없습니다",
+        ));
+    };
+    if r == 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    let c = e.raw_os_error();
+    if c == Some(libc::EINVAL) || c == Some(libc::ENOTSUP) || c == Some(libc::EOPNOTSUPP) || c == Some(libc::ENOSYS) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!("이 파일 시스템은 덮지 않는 이름 바꾸기를 지원하지 않습니다({e})"),
+        ));
+    }
+    Err(e)
+}
+
+/// ★T2i(RULINGS EC7 · EC2): 닻 내린 폴더 기술자의 fsync — 시험 주입(`FAIL_DIR_SYNC_FOR`, 마지막 이름 단위) · '지원하지 않음'만 Ok.
+#[cfg(unix)]
+fn sync_dir_fd(d: &DirFd, leaf: &str) -> std::io::Result<()> {
+    #[cfg(test)]
+    {
+        if FAIL_DIR_SYNC_FOR.with(|f| f.borrow().as_deref() == Some(leaf)) {
+            return Err(std::io::Error::other("injected directory flush failure"));
+        }
+    }
+    let _ = leaf;
+    if unsafe { libc::fsync(d.0) } == 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    if dir_sync_unsupported(&e) {
+        Ok(())
+    } else {
+        Err(e)
+    }
+}
+
+/// ★T2i(RULINGS EC4 (4) · 윈도우): 배타적으로 만든 파일의 **핸들**이 뜻한 자리에 있는가 — `GetFinalPathNameByHandleW` 의 답이
+/// `canonicalize(root)` + 구성 요소 + 이름과 같아야 한다(대소문자 무시). 중간 구성 요소가 연결 지점·재해석 지점이면 답이 달라져
+/// 거부된다(루트 자체의 연결은 canonicalize 가 풀므로 허용). `NtCreateFile` 의 핸들 상대 생성은 쓰지 않는다(RULINGS EF).
+#[cfg(windows)]
+fn windows_handle_sits_at(f: &std::fs::File, root: &Path, comps: &[&str], name: &str) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
+    let mut buf = vec![0u16; 1024];
+    loop {
+        let n = unsafe { GetFinalPathNameByHandleW(f.as_raw_handle() as _, buf.as_mut_ptr(), buf.len() as u32, 0) } as usize;
+        if n == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if n < buf.len() {
+            buf.truncate(n);
+            break;
+        }
+        buf.resize(n + 1, 0);
+    }
+    let got = String::from_utf16_lossy(&buf);
+    let mut want = std::fs::canonicalize(root)?;
+    for c in comps {
+        want.push(c);
+    }
+    want.push(name);
+    let norm = |s: &str| s.trim_start_matches(r"\\?\").replace('/', "\\").to_lowercase();
+    if norm(&got) != norm(&want.to_string_lossy()) {
+        return Err(std::io::Error::other(format!(
+            "만든 임시 파일이 뜻한 자리에 있지 않습니다({got}) — 연결 지점·재해석 지점을 거친 자리에는 쓰지 않습니다"
+        )));
+    }
+    Ok(())
+}
+
+/// ★T2i(RULINGS EC2 · 윈도우): `MoveFileExW` 덮지 않는 이동(`MOVEFILE_REPLACE_EXISTING` 없음 · `MOVEFILE_WRITE_THROUGH`) — 차 있으면
+/// `AlreadyExists`(ERROR_FILE_EXISTS 80 · ERROR_ALREADY_EXISTS 183).
+#[cfg(windows)]
+fn windows_move_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
+    let wide = |p: &Path| -> Vec<u16> { p.as_os_str().encode_wide().chain(std::iter::once(0)).collect() };
+    let (a, b) = (wide(from), wide(to));
+    let ok = unsafe { MoveFileExW(a.as_ptr(), b.as_ptr(), MOVEFILE_WRITE_THROUGH) };
+    if ok != 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    if matches!(e.raw_os_error(), Some(80) | Some(183)) {
+        return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists));
+    }
+    Err(e)
+}
+
+/// ★T2i(RULINGS EC4 · EC2): **팩 동사의 쓰기 하나** — (1) 새 바이트는 이 쓰는 쪽이 **배타적으로 만든**(create-new · 링크 비추종)
+/// 임시 파일에만 쓰고 마지막 이름에는 놓기로만 닿는다, (2) 이미 있는 임시 이름은 열지 않는다(다음 이름 · 고갈 = 거부), (4) 사실은
+/// 연 핸들에서: unix = 닻 내린 폴더 기술자([`anchor_dir`]) 안의 `openat(O_CREAT | O_EXCL | O_NOFOLLOW)` · `renameat` /
+/// [`no_replace_renameat`]; 윈도우 = 경로 규칙([`sidecar_path_gate`]) 뒤 배타 생성 → 핸들 증명([`windows_handle_sits_at`]) →
+/// 놓기(`Replace` = std 이름 바꾸기 · `NoReplace` = [`windows_move_no_replace`]). `mode` = 만들 때의 권한(`exact` 면 `fchmod` + 되읽기
+/// 검증 — H-08), `durable` = 놓은 뒤 부모 폴더 fsync 실패를 돌려준다(EC7). 실패하면 임시 파일을 지우고 아무것도 바꾸지 않는다.
+pub fn beneath_write(
+    root: &Path,
+    rel_path: &str,
+    bytes: &[u8],
+    mode: Option<u32>,
+    exact: bool,
+    place: Place,
+    durable: bool,
+) -> std::io::Result<()> {
+    let parts = rel_parts(rel_path)?;
+    let leaf = parts[parts.len() - 1];
     #[cfg(unix)]
     {
         use std::io::Write;
-        use std::os::unix::ffi::OsStrExt;
         use std::os::unix::io::FromRawFd;
-        let cstr = |b: &[u8]| std::ffi::CString::new(b).map_err(|e| bad(e.to_string()));
-        let errno = || std::io::Error::last_os_error();
-        let root_c = cstr(root.as_os_str().as_bytes())?;
-        let mut dfd = unsafe { libc::open(root_c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
-        if dfd < 0 {
-            return Err(errno());
-        }
-        for comp in &parts[..parts.len() - 1] {
-            let c = cstr(comp.as_bytes())?;
-            let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-            let mut nfd = unsafe { libc::openat(dfd, c.as_ptr(), flags) };
-            if nfd < 0 && errno().raw_os_error() == Some(libc::ENOENT) {
-                let made = unsafe { libc::mkdirat(dfd, c.as_ptr(), 0o755 as libc::mode_t) };
-                if made != 0 && errno().raw_os_error() != Some(libc::EEXIST) {
-                    let e = errno();
-                    unsafe { libc::close(dfd) };
-                    return Err(e);
-                }
-                nfd = unsafe { libc::openat(dfd, c.as_ptr(), flags) };
-            }
-            unsafe { libc::close(dfd) };
-            if nfd < 0 {
-                return Err(bad(format!(
-                    "쓰기 자리 {rel_path} 의 구성 요소 {comp} 가 링크이거나 폴더가 아닙니다({})",
-                    errno()
-                )));
-            }
-            dfd = nfd;
-        }
-        let leaf = parts[parts.len() - 1];
-        let leaf_c = cstr(leaf.as_bytes())?;
+        let d = anchor_dir(root, &parts[..parts.len() - 1], true, rel_path)?;
+        let leaf_c = c_name(leaf)?;
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp_c = cstr(format!(".{leaf}.tmp-{}-{n}", std::process::id()).as_bytes())?;
-        let tfd = unsafe {
-            libc::openat(
-                dfd,
-                tmp_c.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0o644 as libc::c_uint,
-            )
+        let mut made: Option<(libc::c_int, std::ffi::CString)> = None;
+        for _ in 0..crate::TMP_NAME_TRIES {
+            let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let tmp_c = c_name(&format!(".{leaf}.tmp-{}-{n}", std::process::id()))?;
+            let tfd = unsafe {
+                libc::openat(
+                    d.0,
+                    tmp_c.as_ptr(),
+                    libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    mode.unwrap_or(0o644) as libc::c_uint,
+                )
+            };
+            if tfd >= 0 {
+                made = Some((tfd, tmp_c));
+                break;
+            }
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(e);
+            }
+        }
+        let Some((tfd, tmp_c)) = made else {
+            return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "임시 이름 고갈 — 아무것도 쓰지 않았습니다"));
         };
-        if tfd < 0 {
-            let e = errno();
-            unsafe { libc::close(dfd) };
+        let mut f = unsafe { std::fs::File::from_raw_fd(tfd) };
+        let res = (|| -> std::io::Result<()> {
+            f.write_all(bytes)?;
+            if exact {
+                if let Some(m) = mode {
+                    apply_mode_exact(&f, m)?;
+                }
+            }
+            f.sync_all()?;
+            match place {
+                Place::Replace => {
+                    if unsafe { libc::renameat(d.0, tmp_c.as_ptr(), d.0, leaf_c.as_ptr()) } != 0 {
+                        Err(std::io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                }
+                Place::NoReplace => no_replace_renameat(d.0, &tmp_c, &leaf_c),
+            }
+        })();
+        drop(f);
+        if let Err(e) = res {
+            unsafe { libc::unlinkat(d.0, tmp_c.as_ptr(), 0) };
             return Err(e);
         }
-        let mut f = unsafe { std::fs::File::from_raw_fd(tfd) };
-        let wrote = f.write_all(bytes).and_then(|_| f.sync_all());
-        drop(f);
-        let res = wrote.and_then(|_| {
-            if unsafe { libc::renameat(dfd, tmp_c.as_ptr(), dfd, leaf_c.as_ptr()) } != 0 {
-                Err(errno())
-            } else {
-                Ok(())
-            }
-        });
-        if res.is_err() {
-            unsafe { libc::unlinkat(dfd, tmp_c.as_ptr(), 0) };
+        if durable {
+            sync_dir_fd(&d, leaf)?;
         }
-        unsafe { libc::close(dfd) };
-        res
+        Ok(())
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        sidecar_path_gate(root, rel_path).map_err(bad)?;
+        use std::io::Write;
+        sidecar_path_gate(root, rel_path).map_err(std::io::Error::other)?;
         let dest = parts.iter().fold(root.to_path_buf(), |p, c| p.join(c));
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
+        let parent = dest.parent().map(Path::to_path_buf).unwrap_or_else(|| root.to_path_buf());
+        std::fs::create_dir_all(&parent)?;
+        let mut made: Option<(PathBuf, std::fs::File)> = None;
+        for _ in 0..crate::TMP_NAME_TRIES {
+            let cand = crate::tmp_path_for(&parent, leaf);
+            match create_tmp_with_mode(&cand, None) {
+                Ok(f) => {
+                    made = Some((cand, f));
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
         }
-        write_atomic(&dest, bytes)
+        let Some((tmp, mut f)) = made else {
+            return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "임시 이름 고갈 — 아무것도 쓰지 않았습니다"));
+        };
+        let tmp_name = tmp.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let res = (|| -> std::io::Result<()> {
+            windows_handle_sits_at(&f, root, &parts[..parts.len() - 1], &tmp_name)?;
+            f.write_all(bytes)?;
+            f.sync_all()?;
+            Ok(())
+        })();
+        drop(f);
+        let res = res.and_then(|_| match place {
+            Place::Replace => std::fs::rename(&tmp, &dest),
+            Place::NoReplace => windows_move_no_replace(&tmp, &dest),
+        });
+        if let Err(e) = res {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        let _ = (mode, exact, durable);
+        Ok(())
     }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (root, bytes, mode, exact, place, durable, leaf);
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "닻 내린 쓰기를 이 운영체제에서 쓸 수 없습니다"))
+    }
+}
+
+/// ★T2i(RULINGS EC4 (4)): 팩 **대상** 파일의 닻 내린 쓰기 — [`write_pack_file`] 의 권한 규칙(H-08 `pack_target_mode` · 정확 적용)
+/// 그대로, 쓰기는 [`beneath_write`](`place` — 동사가 고른다: 교체 · `--missing-only` 는 덮지 않음).
+pub fn write_pack_file_beneath(
+    root: &Path,
+    rel_path: &str,
+    bytes: &[u8],
+    prior: Option<u32>,
+    system_manifest_entry: bool,
+    place: Place,
+) -> std::io::Result<()> {
+    let mode = pack_target_mode(prior, bytes, system_manifest_entry);
+    beneath_write(root, rel_path, bytes, mode, true, place, false)
 }
 
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -4621,8 +4871,6 @@ fn create_capture_segment(
 /// (치유 성공 후 L1 재도달 없음 — 재복사는 재손상 시에만).
 /// ★T4 CLI 동사 소비(pack-heal 판독 불가 파일 바이트 백업) — 재구현 금지.
 pub fn byte_backup_user(dir: &Path, rel: &str, src: &Path) -> Result<(), String> {
-    let dst = dir.join(format!("{rel}.user"));
-    let tmp = dir.join(format!("{rel}.user.tmp-{}", std::process::id()));
     // ★T2h(RULINGS CW3): 시작 경로에서 FIFO · 장치 · 상한 초과 파일을 읽지 않는다 — 막히지 않게 연 핸들이 일반 파일일 때만
     // 그 바이트를 백업한다(아니면 백업 실패 = 호출부의 격리 · 보안 자산은 종전 '무결성 우선' 예외 그대로).
     let bytes = match read_start_live(src) {
@@ -4630,14 +4878,10 @@ pub fn byte_backup_user(dir: &Path, rel: &str, src: &Path) -> Result<(), String>
         StartRead::Missing => return Err(format!("바이트 백업 원본 없음 {}", src.display())),
         StartRead::Unreadable(why) => return Err(format!("바이트 백업 원본 판독 불가 {}: {why}", src.display())),
     };
-    std::fs::write(&tmp, &bytes).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("바이트 백업 복사 실패 {}: {e}", tmp.display())
-    })?;
-    std::fs::rename(&tmp, &dst).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("바이트 백업 rename 실패 {}: {e}", dst.display())
-    })
+    // ★T2i(RULINGS EC4 (2)): 고정 임시 이름(`<rel>.user.tmp-<pid>` — 이미 있으면 따라가 자르고 썼다)을 쓰지 않는다 — 배타 임시
+    //   파일 + 놓기(닻 내린 쓰기).
+    beneath_write(dir, &format!("{rel}.user"), &bytes, None, false, Place::Replace, false)
+        .map_err(|e| format!("바이트 백업 실패 {rel}.user: {e}"))
 }
 
 /// ★T3(D9 · v2 §2 원칙 3): 검증 base lazy 로드 — `.pristine/<rel>` 을 읽어
@@ -14692,6 +14936,54 @@ mod m11_tests {
         assert_eq!(rig.read(rel).as_deref(), Some(v1), "기동 필수 = vendor 먼저");
         assert_eq!(rig.read(&format!("{rel}.user")).as_deref(), Some(mine), "내 사본 보관");
         assert_eq!(rig.kind(rel).as_deref(), Some("vendor-first"), "기록과 함께");
+    }
+
+    /// ★T2i(RULINGS EC4): 팩 동사는 이미 있는 경로를 쓰려고 열지 않는다 — 검토자의 두 순서: (a) 미리 심은 `<rel>.user.tmp-<pid>`
+    /// (보호 훅을 가리키는 링크 · 그 훅의 하드 링크) → 바이트 백업은 그 이름을 쓰지 않고(새 배타 임시 파일) 보호 훅은 그대로,
+    /// (b) 감사 원장이 보호 파일의 하드 링크 → 덧붙이지 않는다. (4) 구성 요소가 링크로 바뀐 자리: 닻 내린 쓰기는 거부하고 링크
+    /// 너머에 아무것도 만들지 않는다. 윈도우: 같은 규칙을 핸들의 사실로(링크 수 = `GetFileInformationByHandle`,
+    /// 자리 = `GetFinalPathNameByHandleW`) — 이 기계에서는 잴 수 없다(TW1).
+    #[cfg(unix)]
+    #[test]
+    fn ec4_a_planted_temp_or_a_linked_audit_never_writes_a_protected_file() {
+        let rig = Rig::new("ec4");
+        let guard = "hooks/guard.sh";
+        let guard_bytes = "#!/bin/sh\n# PROTECTED\n";
+        rig.write(guard, guard_bytes.as_bytes());
+        let rel = "hooks/x.sh";
+        let src: &[u8] = b"\xc7\xd1\xb1\xdb CP949\n";
+        rig.write(rel, src);
+        for form in ["symlink", "hardlink"] {
+            let planted = rig.pack.join(format!("{rel}.user.tmp-{}", std::process::id()));
+            let _ = std::fs::remove_file(&planted);
+            let _ = std::fs::remove_file(rig.pack.join(format!("{rel}.user")));
+            if form == "symlink" {
+                std::os::unix::fs::symlink(rig.pack.join(guard), &planted).unwrap();
+            } else {
+                std::fs::hard_link(rig.pack.join(guard), &planted).unwrap();
+            }
+            byte_backup_user(&rig.pack, rel, &rig.pack.join(rel)).unwrap();
+            assert_eq!(rig.read(guard).as_deref(), Some(guard_bytes), "{form}: the protected hook is untouched");
+            assert_eq!(std::fs::read(rig.pack.join(format!("{rel}.user"))).unwrap(), src, "{form}: the backup holds the source bytes");
+            assert!(std::fs::symlink_metadata(&planted).is_ok(), "{form}: the planted name is left alone, not reused");
+        }
+        let _ = std::fs::remove_file(rig.pack.join(MERGE_AUDIT_FILE));
+        std::fs::hard_link(rig.pack.join(guard), rig.pack.join(MERGE_AUDIT_FILE)).unwrap();
+        assert!(append_merge_audit(&rig.pack, &serde_json::json!({"action": "x", "file": rel})).is_err(), "hard-linked audit refused");
+        assert_eq!(rig.read(guard).as_deref(), Some(guard_bytes), "the protected file is untouched by the audit");
+        std::fs::remove_file(rig.pack.join(MERGE_AUDIT_FILE)).unwrap();
+        // (4) 구성 요소가 링크: `skills` → 팩 밖 폴더.
+        let elsewhere = rig.base.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, rig.pack.join("skills")).unwrap();
+        assert!(write_pack_file_beneath(&rig.pack, "skills/a.md", b"A", None, false, Place::Replace).is_err());
+        let left: Vec<String> = std::fs::read_dir(&elsewhere).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        assert!(left.is_empty(), "nothing created behind the link: {left:?}");
+        // 덮지 않는 놓기: 차 있으면 AlreadyExists · 무변경.
+        rig.write("hooks/n.sh", b"OLD");
+        let e = beneath_write(&rig.pack, "hooks/n.sh", b"NEW", None, false, Place::NoReplace, false).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(rig.read("hooks/n.sh").as_deref(), Some("OLD"));
     }
 
     /// ★T2i(RULINGS EC7): vendor 우선의 선저장은 **영속이 증명돼야** 한다 — 원장 쓰기의 부모 폴더 fsync 가 실패하면(시험 주입)
