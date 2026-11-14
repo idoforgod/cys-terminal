@@ -1806,32 +1806,12 @@ enum RowOutcome {
     Failed,
 }
 
-/// T3's per-file mutex for intake rows (`ledger_verbs::report` takes the same key in the same map):
-/// one writer per row file inside this daemon. RULINGS DD4 (J7 I5) — the detector RETAINS no entry: after
-/// its write it removes the entry when nobody else holds it (strong count 1 under the map lock — every
-/// holder, `repair.report` too, clones the entry under that lock, so a removed entry is held and awaited
-/// by nobody; an entry someone still has stays, and the exclusion with `repair.report` is kept). This is
-/// the ONE function the detector takes its row lock through: unit T3d's bounded lock set
-/// (`repair::intake_lock_for`) replaces its body — a one-function swap.
-fn with_row_mutex<T>(daemon: &Daemon, sig: &str, f: impl FnOnce() -> T) -> T {
-    let m = {
-        let mut map = daemon.repair_mutexes.lock().unwrap_or_else(|e| e.into_inner());
-        Arc::clone(
-            map.entry(format!("intake:{sig}"))
-                .or_insert_with(|| Arc::new(Mutex::new(()))),
-        )
-    };
-    let out = {
-        let _g = m.lock().unwrap_or_else(|e| e.into_inner());
-        f()
-    };
-    drop(m);
-    let key = format!("intake:{sig}");
-    let mut map = daemon.repair_mutexes.lock().unwrap_or_else(|e| e.into_inner());
-    if map.get(&key).is_some_and(|e| Arc::strong_count(e) == 1) {
-        map.remove(&key);
-    }
-    out
+/// The row lock of one intake row (RULINGS DO3 / DD4 / DA3): the SAME bounded lock set as `repair.report`
+/// — `repair::intake_lock_for(signature)`, one of `INTAKE_LOCK_SHARDS` (16) process-wide mutexes chosen by
+/// the signature. One writer per row file across both intake sources; no state per signature anywhere.
+fn with_row_mutex<T>(sig: &str, f: impl FnOnce() -> T) -> T {
+    let _row_lock = crate::repair::intake_lock_for(sig);
+    f()
 }
 
 /// ② Writes the rows the detector owes, under the intake's OWN quota. Runs on the flusher thread (and in
@@ -1854,7 +1834,7 @@ pub fn flush_defect_intake(daemon: &Arc<Daemon>, root: &std::path::Path, cfg: &A
     };
     for row in due {
         let path = row_path_in(root, &lane, &row.signature);
-        let outcome = with_row_mutex(daemon, &row.signature, || {
+        let outcome = with_row_mutex(&row.signature, || {
             let existing = match load_row(&path) {
                 Ok(x) => x,
                 Err(_) => return RowOutcome::Corrupt,
@@ -2838,30 +2818,42 @@ mod defect_intake_tests {
         eprintln!("[t3e-dd3] {} texts: {same} same signature, {declined} declined", texts.len());
     }
 
-    /// RULINGS DD4 (J7 I5) — the detector retains NO lock per signature: fresh batches of distinct signatures of a
-    /// qualifying script, flushed again and again (most rows held by the intake's hourly share), leave no
-    /// `intake:` entry of the detector behind in `daemon.repair_mutexes`; an entry another holder still has
-    /// (`repair.report` in flight) is never taken away from it.
+    /// RULINGS DO3 / DD4 (J7 I5, T3e round-2 I3) — ONE bounded lock set for both intake writers, no retained
+    /// state: in 6 cycles a "reporter" (another thread holding `repair::intake_lock_for(sig)` — the lock the
+    /// `report` verb takes) overlaps a detector flush of 40 fresh signatures of a qualifying script (most rows
+    /// held by the intake's hourly share); the flush waits for that row, writes it once, and afterwards no
+    /// intake entry exists in the per-signature mutex map (the detector never adds one); the set stays 16.
     #[test]
     fn dd4_the_detector_retains_no_lock_per_signature() {
+        assert_eq!(crate::repair::INTAKE_LOCK_SHARDS, 16);
         let daemon = crate::team_gate_tests::tmp_daemon("t3e-dd4", false);
         let root = tmp_root("dd4");
+        let lane = LaneKey::of_socket(&daemon.socket_path);
         let intake_keys = || daemon.repair_mutexes.lock().unwrap().keys().filter(|k| k.starts_with("intake:")).count();
         let x = bash("python3 ~/.cys/pack/bin/javis_x.py run");
-        let held_sig = intake::parse_report("bin/javis_x.py", "Exit code 1\nE0-0: x").unwrap().signature;
-        let held = Arc::new(Mutex::new(()));
-        daemon.repair_mutexes.lock().unwrap().insert(format!("intake:{held_sig}"), Arc::clone(&held));
-        for batch in 0..6 {
+        for cycle in 0..6 {
             for i in 0..40 {
                 observe_tool_event(&daemon, &pre(&x));
-                observe_tool_event(&daemon, &fail(&x, Some(&format!("Exit code 1\nE{batch}-{i}: x"))));
+                observe_tool_event(&daemon, &fail(&x, Some(&format!("Exit code 1\nE{cycle}-{i}: x"))));
             }
-            let rep = flush_defect_intake(&daemon, &root, &AlertConfig::default(), crate::alert_route::Now::at(10.0 + batch as f64));
+            let sig = intake::parse_report("bin/javis_x.py", &format!("Exit code 1\nE{cycle}-0: x")).unwrap().signature;
+            let (held_tx, held_rx) = std::sync::mpsc::channel();
+            let s2 = sig.clone();
+            let reporter = std::thread::spawn(move || {
+                let _g = crate::repair::intake_lock_for(&s2);
+                held_tx.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            });
+            held_rx.recv().unwrap();
+            let rep = flush_defect_intake(&daemon, &root, &AlertConfig::default(), crate::alert_route::Now::at(10.0 + cycle as f64));
+            reporter.join().unwrap();
             assert!(rep.due > 0, "{rep:?}");
-            assert_eq!(intake_keys(), 1, "batch {batch}: the detector left per-signature locks behind ({rep:?})");
+            assert_eq!(intake_keys(), 0, "cycle {cycle}: per-signature lock state retained ({rep:?})");
+            if cycle == 0 {
+                let row = intake::load_row(&intake::row_path_in(&root, &lane, &sig)).unwrap().expect("the overlapped row");
+                assert_eq!(row.count, 1, "the overlapped row was not written exactly once");
+            }
         }
-        let kept = daemon.repair_mutexes.lock().unwrap().get(&format!("intake:{held_sig}")).cloned();
-        assert!(kept.is_some_and(|k| Arc::ptr_eq(&k, &held)), "an entry another holder had was taken away");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3771,9 +3763,13 @@ mod defect_intake_tests {
                 assert!(!b.contains(n), "{head} sends through `{n}` — intake is data, never a message");
             }
         }
-        // the per-file mutex key is T3's (`ledger_verbs::report`) — one writer per row file
-        assert!(src.contains("map.entry(format!(\"intake:{sig}\"))"));
-        assert!(include_str!("repair.rs").contains("ctx.locked(&format!(\"intake:{}\", rep.signature)"), "T3's report verb changed its row mutex key");
+        // RULINGS DO3: both intake writers take the row lock from ONE bounded set (T3d's `intake_lock_for`) —
+        // was: `src.contains("map.entry(format!(\"intake:{sig}\"))")` and repair.rs
+        // `contains("ctx.locked(&format!(\"intake:{}\", rep.signature)")` (the per-signature map, removed by T3d / T3e)
+        assert!(body("fn with_row_mutex<").contains("crate::repair::intake_lock_for(sig)"), "the detector left the bounded lock set");
+        let production = src.split("\n#[cfg(test)]\nmod tests {").next().unwrap_or(src);
+        assert!(!production.contains("repair_mutexes"), "the detector touches the per-signature mutex map again");
+        assert!(include_str!("repair.rs").contains("super::intake_lock_for(&rep.signature)"), "the report verb left the bounded lock set");
         // the `usage.event` arm feeds the detector once
         let h = include_str!("handlers.rs");
         let arm = h.split("\"usage.event\" => {").nth(1).expect("usage.event arm");
