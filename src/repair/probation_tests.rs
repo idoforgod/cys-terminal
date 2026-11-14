@@ -1429,6 +1429,60 @@ fn a_partial_automatic_return_is_reported_until_acknowledged() {
     assert_eq!(n(), 1, "never twice");
 }
 
+/// HF1 (codex r7 M1): the normal end of probation closes the row 사용 중; another writer then
+/// changes the file in the same pack generation; a revert is asked → the row 충돌, the bytes stay,
+/// and the conflict's report is owed — rejected by the intake at the next tick, filed ONCE after a
+/// restart, never twice. Without HF1 `close_conflict` kept the 사용 중 closure (neither absent nor
+/// return-owed): no report was owed and the conflict was never filed.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_conflict_after_probation_ended_in_use_owes_its_report() {
+    let r = rig("hf1inuse");
+    let a = rid("R-1");
+    committed_general(&r, &a, "hooks/u.sh", Some(b"PRE\n"), Some(b"POST\n"));
+    let pass = |_: &str, _: &Path, _: Duration| outcome(CheckResult::Pass, 5);
+    let accept = std::cell::Cell::new(false);
+    let filed = RefCell::new(Vec::<String>::new());
+    let intake = |_: &str, line: &str| {
+        if accept.get() {
+            filed.borrow_mut().push(line.to_string());
+        }
+        accept.get()
+    };
+    let d = Doubles { check: &pass, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &intake, excluded: &|_| true };
+    let lock = r.base.join(".pack-apply.lock");
+    let day2 = NOW + 2.0 * 86_400.0;
+    // the normal end of probation
+    let rep = run_tick(&job(&r, &d, ApplyForm::Exchange, day2, &lock), false).unwrap();
+    assert_eq!(rep.ended, vec![a.clone()]);
+    let closed = ledger::read_lane_in(&r.root, &a, &r.lane).unwrap().unwrap().probation.unwrap().closed.unwrap();
+    assert!(closed.starts_with("사용 중"), "{closed}");
+    assert_eq!(ledger::read_record_in(&r.root, &a).unwrap().unwrap().state, RepairState::InUse);
+    // another writer, the same pack generation; then a revert is asked
+    std::fs::write(r.pack.join("hooks/u.sh"), b"FOREIGN\n").unwrap();
+    let rev = crate::repair::apply::revert_in(&r.env(&NoFaults, ApplyForm::Exchange), &a, crate::repair::apply::RevertCaller::Human, &no_hooks, &no_repair_lock).unwrap();
+    assert!(matches!(rev.outcome, crate::repair::apply::ApplyOutcome::Declined(_)), "{rev:?}");
+    assert_eq!(std::fs::read(r.pack.join("hooks/u.sh")).unwrap(), b"FOREIGN\n", "the bytes stay");
+    let row = ledger::read_lane_in(&r.root, &a, &r.lane).unwrap().unwrap();
+    assert_eq!(row.state, crate::repair::types::LaneState::Conflict);
+    let closed = row.probation.unwrap().closed.unwrap();
+    assert_eq!(crate::repair::apply::closure_report_class(&closed), Some("conflict"), "its report is owed: {closed}");
+    assert_eq!(ledger::read_record_in(&r.root, &a).unwrap().unwrap().state, RepairState::InUse, "still in force");
+    // the intake rejects it at the next tick; after a restart it is filed once, never twice
+    let _ = run_tick(&job(&r, &d, ApplyForm::Exchange, day2 + 700.0, &lock), false).unwrap();
+    assert!(filed.borrow().is_empty());
+    accept.set(true);
+    let mut env = job(&r, &d, ApplyForm::Exchange, day2 + 1400.0, &lock);
+    env.incarnation = "inc-3";
+    let _ = run_tick(&env, false).unwrap();
+    let n = || filed.borrow().iter().filter(|l| l.contains("충돌")).count();
+    assert_eq!(n(), 1, "filed once after the restart: {:?}", filed.borrow());
+    let mut env = job(&r, &d, ApplyForm::Exchange, day2 + 2100.0, &lock);
+    env.incarnation = "inc-3";
+    let _ = run_tick(&env, false).unwrap();
+    assert_eq!(n(), 1, "never twice");
+}
+
 /// FG3 (codex r4 M4): a hook operation that FINISHED declined (its step's terminal error) owes a
 /// report found again at every tick from its record — rejected by the intake, then a restart: filed
 /// ONCE. Without FG3 recovery selected only unfinished records and nothing found it again.

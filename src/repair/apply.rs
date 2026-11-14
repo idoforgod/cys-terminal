@@ -2276,7 +2276,10 @@ fn close_superseded(
 /// RULINGS GV1 — a revert that met ANOTHER writer's bytes before changing anything: the row → 충돌
 /// with the closure `충돌 — 되돌리기를 마치지 못했습니다(<by>) · <why>` (its report owed and
 /// re-derived — FG3), the bytes stay, the record keeps its state with a method line (it is still in
-/// force — a later revert may finish it).
+/// force — a later revert may finish it). RULINGS HF1 — the closure is written WHATEVER closure the
+/// row carried before (사용 중 after the normal end of probation included): the closure IS the duty
+/// to report, so keeping an earlier one would leave the conflict unreported (as the partial-return
+/// closure of `finish_revert` already does).
 fn close_conflict(
     env: &OpEnv<'_>,
     rec: &RepairRecord,
@@ -2294,9 +2297,7 @@ fn close_conflict(
         if let Some(mut row) = ledger::read_lane_in(&root, &id, &lane)? {
             row.state = LaneState::Conflict;
             if let Some(p) = row.probation.as_mut() {
-                if p.closed.as_deref().is_none_or(closure_owes_return) {
-                    p.closed = Some(closure.clone());
-                }
+                p.closed = Some(closure.clone());
             }
             row.updated_at = now;
             ledger::write_lane_durable_in(&root, &row)?;
