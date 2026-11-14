@@ -8161,6 +8161,13 @@ fn journal_text(path: &Path, what: &str) -> Result<String, String> {
 /// Returns `Ok(true)` when it rolled back or cleaned a journal. The T2g start-path readers are kept: every read here is
 /// bounded and never blocks (`journal_text` / `read_start_meta`).
 pub fn recover_pack_journal() -> Result<bool, String> {
+    recover_pack_journal_with(&mut || true)
+}
+
+/// ★T9 round 2 (RULINGS HB3 — test seam only, no rule): [`recover_pack_journal`] with `on_judged`, called right after
+/// a journal's writer was judged GONE and BEFORE anything acts on that journal (the window of reviewer1's finding);
+/// `false` stops there as a dying process would. Production passes `|| true`.
+fn recover_pack_journal_with(on_judged: &mut dyn FnMut() -> bool) -> Result<bool, String> {
     let pack = pack_dir();
     if let Some(notice) = legacy_pack_journal_notice(&pack) {
         if !LEGACY_JOURNAL_NAMED.swap(true, std::sync::atomic::Ordering::SeqCst) {
@@ -8200,6 +8207,9 @@ pub fn recover_pack_journal() -> Result<bool, String> {
             return Err(kept(format!("작성 프로세스(pid {})가 아직 실행 중", writer.pid)))
         }
         WriterLife::Unknown(why) => return Err(kept(why)),
+    }
+    if !on_judged() {
+        return Err("[pack-journal] recovery stopped after the writer was judged gone (seam)".to_string());
     }
     let Some(index) = index else {
         // 인덱스 없는 잔존 = 백업 미완(원본 미변경 — 팩 파일은 인덱스 뒤에야 쓰인다), 작성자 종료 → 통째 폐기.
@@ -14695,6 +14705,148 @@ mod tests {
             assert!(n.contains(&legacy.display().to_string()), "{n}");
             assert!(n.contains("팩 업데이트를 다시 실행"), "the remedy is missing: {n}");
         }
+    }
+
+    // ── T9 round 2 (RULINGS HB): the journal protocol — red first ───────────────────────────────────────────────────
+    /// Marks every journal of the current lane as written by a process that is gone (layout of the head under test).
+    fn t9_writers_gone() {
+        t9_finish_journal(&pack_journal_dir());
+    }
+
+    /// HB3 (1)/(2) — reviewer1's sequence (verdict-T9-r1-codex.json, blocking at src/pack.rs:8203 of 4afccd4a), run
+    /// deterministically on two threads ordered by channels (no sleep): J = an earlier update of the lane that crashed
+    /// (its writer gone) — before its commit marker (`j_committed == false`, the roll-back branch) or after it (the
+    /// clean-up branch). D = the lane's daemon starting: its recovery judges J's writer gone and is PAUSED there (seam
+    /// `recover_pack_journal_with`). K = a `cys pack-update` of the same lane: its ⓪ recovers J, then it writes its own
+    /// journal and applies; it is PAUSED right after ② (`TxStep::Installed` — the nearest stop of the real transaction to
+    /// "mid ②"). D resumes and finishes; then K resumes and finishes. Correct: D's resumption leaves K's journal and every
+    /// pack file exactly as K left them and reports nothing as recovered; K ends with the pack ENTIRELY new.
+    /// Returns the failures (empty = correct).
+    fn t9_r2_reviewer_sequence(tag: &str, j_committed: bool) -> Vec<String> {
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+        let mut failures: Vec<String> = Vec::new();
+        let items_j = m15da_v2_items(M15DA_BASE);
+        let st_j = test_free_state("0.15.1");
+        let mut items_k: Vec<(&str, &str)> = items_j.clone();
+        for it in items_k.iter_mut() {
+            match it.0 {
+                "bin/selfheal.sh" => it.1 = "#!/bin/sh\necho selfheal-v3\n",
+                "README.md" => it.1 = "README v3\n",
+                _ => {}
+            }
+        }
+        let st_k = test_free_state("0.15.2");
+        // The complete outcome: J rolled back (or committed), then K applied whole.
+        let ref_root = m15da_root(&format!("t9r2-{tag}-ref"));
+        let ref_pd = m15da_lane(&ref_root, "pack", "0.15.0", M15DA_BASE, &[], None);
+        let complete = {
+            let _e = set_pack_env(&ref_pd, ref_root.join("cfg"));
+            if j_committed {
+                apply_pack_transactional(&items_j, "0.15.1", &st_j, None, || Ok(())).expect("reference J");
+            }
+            apply_pack_transactional(&items_k, "0.15.2", &st_k, None, || Ok(())).expect("reference K");
+            m15da_state(&ref_pd)
+        };
+        let _ = std::fs::remove_dir_all(&ref_root);
+
+        let root = m15da_root(&format!("t9r2-{tag}"));
+        let pd = m15da_lane(&root, "pack", "0.15.0", M15DA_BASE, &[], None);
+        let _env = set_pack_env(&pd, root.join("cfg"));
+        let j_stop = if j_committed { TxStep::Committed } else { TxStep::Installed };
+        let _ = apply_pack_transactional_steps(&items_j, "0.15.1", &st_j, None, || Ok(()), &mut |s| s != j_stop);
+        t9_writers_gone();
+        let lane = pack_journal_dir();
+
+        // D: the daemon's recovery, paused right after it judged J's writer gone.
+        let (tx_judged, rx_judged) = channel::<()>();
+        let (tx_go, rx_go) = channel::<()>();
+        let daemon = std::thread::spawn(move || {
+            let mut on_judged = move || {
+                let _ = tx_judged.send(());
+                rx_go.recv_timeout(Duration::from_secs(60)).is_ok()
+            };
+            recover_pack_journal_with(&mut on_judged)
+        });
+        if rx_judged.recv_timeout(Duration::from_secs(60)).is_err() {
+            failures.push("the daemon's recovery never judged J's writer gone — the sequence was not exercised".into());
+        }
+        // K: the update of the same lane, paused right after ②; D resumes inside that pause.
+        let mut daemon = Some(daemon);
+        let mut tx_go = Some(tx_go);
+        let mut seen: Option<(M15daState, M15daState, M15daState, M15daState, Result<bool, String>)> = None;
+        let k = apply_pack_transactional_steps(&items_k, "0.15.2", &st_k, None, || Ok(()), &mut |s| {
+            if s == TxStep::Installed && seen.is_none() {
+                let lane_before = m15da_state(&lane);
+                let pack_before = m15da_state(&pd);
+                if let Some(tx) = tx_go.take() {
+                    let _ = tx.send(());
+                }
+                let d = daemon
+                    .take()
+                    .map(|h| h.join().unwrap_or_else(|_| Err("the daemon thread panicked".into())))
+                    .unwrap_or_else(|| Err("no daemon".into()));
+                seen = Some((lane_before, m15da_state(&lane), pack_before, m15da_state(&pd), d));
+            }
+            true
+        });
+        if let Some(h) = daemon.take() {
+            drop(tx_go.take());
+            let _ = h.join();
+        }
+        let after = m15da_state(&pd);
+        drop(_env);
+        let _ = std::fs::remove_dir_all(&root);
+
+        match seen {
+            None => failures.push(format!("K never reached the pause after ② ({k:?})")),
+            Some((lane_before, lane_after, pack_before, pack_after, d)) => {
+                if d == Ok(true) {
+                    failures.push(format!("the daemon reported a recovery after K had recovered J: {d:?}"));
+                }
+                let jd = m15da_diff(&lane_before, &lane_after);
+                if !jd.is_empty() {
+                    failures.push(format!("the daemon's resumption changed K's journal: {jd:?}"));
+                }
+                let pdiff = m15da_diff(&pack_before, &pack_after);
+                if !pdiff.is_empty() {
+                    failures.push(format!("the daemon's resumption changed the pack under the running K: {pdiff:?}"));
+                }
+                let k_id = lane_before
+                    .iter()
+                    .filter(|(rel, _)| rel.ends_with("index.json"))
+                    .filter_map(|(_, v)| serde_json::from_str::<JournalIndex>(&v.0).ok())
+                    .filter_map(|i| i.apply.map(|a| a.apply_id))
+                    .next();
+                if k.is_err() {
+                    failures.push(format!("K did not finish: {k:?}"));
+                }
+                let d_final = m15da_diff(&t9_without_marker(&complete), &t9_without_marker(&after));
+                let marker = t9_marker_of(&after).map(|m| m.apply_id);
+                if !d_final.is_empty() || marker.is_none() || marker != k_id {
+                    failures.push(format!(
+                        "the pack is not ENTIRELY new after K: marker={marker:?} K's id={k_id:?} diff vs the complete outcome={d_final:?}"
+                    ));
+                }
+            }
+        }
+        failures
+    }
+
+    #[test]
+    #[ignore = "T9 round 2 red (RULINGS HB3 1): FAILS on 4afccd4a by design — the daemon's recovery, resumed after K reused the lane's journal path, rolls the running K back and removes its journal; un-ignore with the HB2 protocol"]
+    fn t9_r2_daemon_judged_gone_then_update_reuses_the_path_rollback_branch() {
+        let _g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let f = t9_r2_reviewer_sequence("rb", false);
+        assert!(f.is_empty(), "HB3 (1):\n  {}", f.join("\n  "));
+    }
+
+    #[test]
+    #[ignore = "T9 round 2 red (RULINGS HB3 2): FAILS on 4afccd4a by design — the daemon's recovery, resumed after K reused the lane's journal path, takes K's journal for the committed J and removes it; un-ignore with the HB2 protocol"]
+    fn t9_r2_daemon_judged_gone_then_update_reuses_the_path_cleanup_branch() {
+        let _g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let f = t9_r2_reviewer_sequence("cl", true);
+        assert!(f.is_empty(), "HB3 (2):\n  {}", f.join("\n  "));
     }
 
     /// GX1: every lane's journal is its own folder under `.pack-journal.d`, never the legacy shared folder.
