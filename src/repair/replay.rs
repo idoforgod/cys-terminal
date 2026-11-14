@@ -453,19 +453,8 @@ pub(crate) fn deny_payload(stdout: &[u8]) -> bool {
     if body.first() != Some(&b'{') {
         return false;
     }
-    // a key twice is a shape the devices never print (a parser would keep one of them)
-    let text = String::from_utf8_lossy(body);
-    for key in [
-        "\"hookSpecificOutput\"",
-        "\"hookEventName\"",
-        "\"permissionDecision\"",
-        "\"permissionDecisionReason\"",
-    ] {
-        if text.matches(key).count() > 1 {
-            return false;
-        }
-    }
-    let Ok(serde_json::Value::Object(top)) = serde_json::from_slice::<serde_json::Value>(body) else {
+    // RULINGS GA6: a key twice — compared on the DECODED name — is a shape the devices never print
+    let Some(serde_json::Value::Object(top)) = parse_unique(body) else {
         return false;
     };
     if top.len() != 1 {
@@ -479,6 +468,70 @@ pub(crate) fn deny_payload(stdout: &[u8]) -> bool {
         && h.values().all(|v| v.is_string())
         && h.get("hookEventName").and_then(|v| v.as_str()) == Some("PreToolUse")
         && h.get("permissionDecision").and_then(|v| v.as_str()) == Some("deny")
+}
+
+/// RULINGS GA6 — a JSON document none of whose objects holds a key twice, the names compared DECODED
+/// (an escaped spelling such as `\u0070ermissionDecision` is the same key as `permissionDecision`;
+/// a key-like text inside a string value is no key). `None` = not such a document. serde_json — like
+/// the harness's parser — keeps the last of two equal keys; the grammar says "no key twice".
+pub fn parse_unique(bytes: &[u8]) -> Option<serde_json::Value> {
+    use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
+    struct Unique(serde_json::Value);
+    impl<'de> Deserialize<'de> for Unique {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            d.deserialize_any(Names).map(Unique)
+        }
+    }
+    struct Names;
+    impl<'de> Visitor<'de> for Names {
+        type Value = serde_json::Value;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a JSON value")
+        }
+        fn visit_bool<E: de::Error>(self, b: bool) -> Result<Self::Value, E> {
+            Ok(b.into())
+        }
+        fn visit_i64<E: de::Error>(self, n: i64) -> Result<Self::Value, E> {
+            Ok(n.into())
+        }
+        fn visit_u64<E: de::Error>(self, n: u64) -> Result<Self::Value, E> {
+            Ok(n.into())
+        }
+        fn visit_f64<E: de::Error>(self, n: f64) -> Result<Self::Value, E> {
+            Ok(serde_json::Number::from_f64(n).map_or(serde_json::Value::Null, serde_json::Value::Number))
+        }
+        fn visit_str<E: de::Error>(self, s: &str) -> Result<Self::Value, E> {
+            Ok(s.into())
+        }
+        fn visit_string<E: de::Error>(self, s: String) -> Result<Self::Value, E> {
+            Ok(s.into())
+        }
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(serde_json::Value::Null)
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut a: A) -> Result<Self::Value, A::Error> {
+            let mut out = Vec::new();
+            while let Some(Unique(x)) = a.next_element()? {
+                out.push(x);
+            }
+            Ok(serde_json::Value::Array(out))
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut a: A) -> Result<Self::Value, A::Error> {
+            let mut m = serde_json::Map::new();
+            while let Some(k) = a.next_key::<String>()? {
+                if m.contains_key(&k) {
+                    return Err(de::Error::custom(format!("key {k:?} twice")));
+                }
+                let Unique(v) = a.next_value()?;
+                m.insert(k, v);
+            }
+            Ok(serde_json::Value::Object(m))
+        }
+    }
+    let mut de = serde_json::Deserializer::from_slice(bytes);
+    let Unique(v) = Unique::deserialize(&mut de).ok()?;
+    de.end().ok()?;
+    Some(v)
 }
 
 /// RULINGS GA3 — THE completeness of a pass, in ONE place (the screen and the rehearsal both ask it):
