@@ -3760,7 +3760,12 @@ mod grant_verbs {
         }))
     }
 
-    /// `cys repair rule-doc-allowed --path <p>` (READ · O-C10-4): allowed only when the CALLING seat
+    /// RULINGS CV2: the refusal of a rule-document write asked by a seat that is not a worker now, or
+    /// whose role family changed (a master never implements).
+    pub(super) const RULE_DOC_WORKER_ONLY_KO: &str = "규칙 문서는 워커 좌석만 고칩니다 — 이 좌석은 지금 워커가 아니거나 처음과 다른 역할 가족으로 바뀌었습니다(역할을 바꾼 좌석은 자기가 시작한 수리의 쓰기 권한도 잃습니다 · 되돌리는 길: 이 창을 닫고 새 창에서 워커 역할을 받으세요)";
+
+    /// `cys repair rule-doc-allowed --path <p>` (READ · O-C10-4 · RULINGS CV2: allowed only for a
+    /// seat that is a worker now and bound to the worker family): allowed only when the CALLING seat
     /// holds this lane's live lock on a being-worked rule-document repair whose bound, unexpired
     /// token covers that path. Any other case → `allowed: false` (the hook keeps today's behaviour).
     pub(crate) fn rule_doc_allowed(
@@ -3775,6 +3780,15 @@ mod grant_verbs {
         let Some(sid) = caller.seat() else {
             return no("좌석이 아닌 호출자");
         };
+        // RULINGS CV2: a permission answer is not a plain read — the calling seat must be a worker
+        // NOW and bound to the worker family since this daemon first saw it (AD1 / AK1's line: a
+        // seat re-declared to another family keeps no write authorization of the repair it began)
+        let family_now = caller.role.as_deref().and_then(super::role_family);
+        if family_now != Some(super::RoleFamily::Worker)
+            || caller.bound_family != Some(super::RoleFamily::Worker)
+        {
+            return no(RULE_DOC_WORKER_ONLY_KO);
+        }
         let rel = match doc_rel(ctx, raw) {
             Ok(r) => r,
             Err(e) => return no(&e.message),

@@ -1511,3 +1511,82 @@ fn cj5_grant_ask_reply_names_the_limit() {
         "자비스가 발견한 명백한 버그·오류를 스스로 고쳐도 될까요? (하루 12건까지)"
     );
 }
+
+// ───────────────────────────── RULINGS CV2 (T4b) ─────────────────────────────
+
+/// CV2 end to end (the repair flow through the verbs): the owner names soul.md, the master obtains
+/// the token, a WORKER begins the token-backed rule-document repair and holds its lock → the
+/// guard's question is answered "allowed"; the same seat is re-declared master (the daemon's own
+/// binding calls, as `claim-role` makes them) → "not allowed", with the sentence; a seat that stays
+/// in the worker family (`worker-2`) keeps it; a seat first seen as master is never allowed.
+#[test]
+fn cv2_a_re_declared_seat_loses_the_rule_document_write() {
+    let mut r = rig("cv2");
+    r.lane = LaneKey(format!("cv2-{}", SEQ.fetch_add(1, Ordering::Relaxed)));
+    r.inc = "cv2-inc".into();
+    let (lane, inc) = (r.lane.0.clone(), r.inc.clone());
+    let t = now0();
+    let token = token_for(&r, "soul.md", t);
+    let sid = 77u64;
+    let worker = seat_caller(&lane, &inc, sid, Some("worker".into()));
+    let v = r
+        .call(t + 2.0, &worker, "begin", json!({"trigger": "owner_order", "files": ["soul.md"], "owner_token": token}))
+        .unwrap();
+    assert_eq!(v["owner_token_bound"], true);
+    let ask = |who: &Caller| r.call(t + 3.0, who, "rule_doc_allowed", json!({"path": "soul.md"})).unwrap();
+    assert_eq!(ask(&worker)["allowed"], true, "the worker that began it may write");
+    // same family: still allowed
+    record_role_claim(&lane, &inc, sid, Some("worker"), "worker-2");
+    assert_eq!(ask(&seat_caller(&lane, &inc, sid, Some("worker-2".into())))["allowed"], true);
+    // re-declared master: the seat keeps its lock, but not the write
+    record_role_claim(&lane, &inc, sid, Some("worker-2"), "master");
+    let master_now = seat_caller(&lane, &inc, sid, Some("master".into()));
+    assert_eq!(master_now.bound_family, Some(RoleFamily::Worker));
+    let v = ask(&master_now);
+    assert_eq!(v["allowed"], false, "{v}");
+    assert_eq!(v["reason"], rule_doc_allowed_worker_only_ko());
+    // a seat first seen as master, then claiming worker, is bound to master: never allowed
+    let other = 78u64;
+    let _ = seat_caller(&lane, &inc, other, Some("master".into()));
+    record_role_claim(&lane, &inc, other, Some("master"), "worker-3");
+    let v = ask(&seat_caller(&lane, &inc, other, Some("worker-3".into())));
+    assert_eq!(v["allowed"], false, "{v}");
+}
+
+fn rule_doc_allowed_worker_only_ko() -> &'static str {
+    grant_verbs::RULE_DOC_WORKER_ONLY_KO
+}
+
+/// CV2 through the daemon's REAL role change: a tmp daemon, a worker seat; the guard's question
+/// passes the role gate (refused only for want of a repair); `system.claim_role master` from the
+/// seat itself (handlers.rs — the role changes, the AD1 binding stays worker); the same question is
+/// then refused at the role gate with the sentence.
+#[test]
+fn cv2_the_real_claim_role_line_takes_the_write_away() {
+    use crate::handlers::{dispatch, Reply};
+    let d = crate::team_gate_tests::tmp_daemon("t4b-cv2", false);
+    let pid = 734_001u32;
+    let sid = crate::team_gate_tests::seat(&d, "worker", pid);
+    let ask = || -> Value {
+        match handle(&d, "rule_doc_allowed", &json!({"path": "soul.md"}), &json!(1), Some(sid), false, Some(pid)) {
+            Reply::Single(v) => v["result"].clone(),
+            _ => panic!("one reply"),
+        }
+    };
+    let v = ask();
+    assert_eq!(v["allowed"], false);
+    assert_ne!(v["reason"], rule_doc_allowed_worker_only_ko(), "a worker passes the role gate: {v}");
+    let req = cys::Request {
+        id: json!(2),
+        method: "system.claim_role".into(),
+        params: json!({"role": "master", "surface_id": sid}),
+    };
+    let Reply::Single(c) = dispatch(&d, req, Some(pid)) else {
+        panic!("one reply")
+    };
+    assert_eq!(c["ok"], json!(true), "claim_role master: {c}");
+    let v = ask();
+    assert_eq!(v["allowed"], false);
+    assert_eq!(v["reason"], rule_doc_allowed_worker_only_ko(), "{v}");
+    let _ = std::fs::remove_dir_all(production_root(&d));
+}
