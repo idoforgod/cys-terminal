@@ -1389,6 +1389,52 @@ fn deny_is_a_byte_grammar() {
     }
 }
 
+/// RULINGS GA6 — a key twice is refused on the DECODED name: an escaped spelling of a key already
+/// present (at either level) is a second key → not a deny; a key-like text inside a string value is
+/// no key → still a deny. (The old substring count missed the first and refused the second.)
+#[test]
+fn duplicate_keys_are_refused_on_the_decoded_name() {
+    let deny = r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"x"}}"#;
+    let rows: Vec<(String, bool)> = vec![
+        (deny.to_string(), true),
+        (
+            deny.replace(
+                r#""permissionDecision":"deny","#,
+                r#""permissionDecision":"allow","\u0070ermissionDecision":"deny","#,
+            ),
+            false,
+        ),
+        (
+            deny.replace(
+                r#""hookEventName":"PreToolUse","#,
+                r#""hookEventName":"PreToolUse","hook\u0045ventName":"PreToolUse","#,
+            ),
+            false,
+        ),
+        (
+            format!(
+                r#"{{"hookSpecificOutput":{{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"x"}},"\u0068ookSpecificOutput":{}}}"#,
+                &deny[22..deny.len() - 1]
+            ),
+            false,
+        ),
+        (
+            deny.replace(
+                r#""permissionDecisionReason":"x""#,
+                // the value's text ends in `"permissionDecision"` — quote, name, the string's own end
+                r#""permissionDecisionReason":"see \"permissionDecision""#,
+            ),
+            true,
+        ),
+    ];
+    for (out, want) in rows {
+        assert_eq!(replay::deny_payload(out.as_bytes()), want, "{out}");
+    }
+    // the same reader is the settings documents' (GA2): a document with a key twice is no document
+    assert!(replay::parse_unique(br#"{"a":1,"\u0061":1}"#).is_none());
+    assert!(replay::parse_unique(br#"{"a":"\"a\"","b":[{"a":1},{"a":2}]}"#).is_some());
+}
+
 /// RULINGS EL1, through the real runner: a deny object followed by white space up to past the capture
 /// limit and then plain text, exit 0 — the kept prefix parses, the WHOLE output does not: the answer
 /// is "not shown" (ERROR), never DENY.
