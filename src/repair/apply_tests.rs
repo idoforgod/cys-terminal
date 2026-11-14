@@ -1690,3 +1690,43 @@ fn an_escaped_descendant_cannot_hold_the_reader_past_the_deadline() {
     }
     assert!(res.is_err() && msg.contains("파이프"), "{msg}");
 }
+
+/// CT7: a resumed hook operation that fails marks the lane row 충돌 (as the first run's caller
+/// does). Without CT7 the resumed failure closed the record `declined` and the row stayed 검증됨.
+#[test]
+fn resumed_hook_step_failure_marks_the_lane_conflict() {
+    let r = rig("ct7resume");
+    let id = rid("R-34");
+    hook_record(&r, &id, "Stop", "q.sh");
+    lane_row(&r, &id, Vec::new(), Vec::new());
+    let op = OpRecord {
+        schema: 1,
+        op: wal::new_op_id(1.0, "hook-unregister"),
+        repair: id.clone(),
+        lane_key: r.lane.clone(),
+        kind: "hook-unregister".into(),
+        form: "hook".into(),
+        rel: String::new(),
+        pre_existed: false,
+        expected: String::new(),
+        incoming: String::new(),
+        pack_generation: Some(pack_generation(&r.pack)),
+        slot: None,
+        slot_identity: None,
+        live_identity: None,
+        incoming_copy: None,
+        incoming_copy_identity: None,
+        step: "recorded".into(),
+        hooks: vec![wal::HookLine { event: "Stop".into(), script: "q.sh".into(), targets: Vec::new() }],
+        finished: false,
+        outcome: None,
+        note: String::new(),
+        created_at: 1.0,
+        updated_at: 1.0,
+    };
+    wal::write_in(&r.root, &op).unwrap();
+    let failing = |_: &Path, _: bool| -> Result<String, RepairError> { Err(RepairError::CheckFailed("registrar down".into())) };
+    let _ = resume_hook_steps_in(&r.root, &r.pack, &r.lane, &failing, &no_repair_lock, 3.0);
+    let row = ledger::read_lane_in(&r.root, &id, &r.lane).unwrap().unwrap();
+    assert_eq!(row.state, LaneState::Conflict);
+}

@@ -635,3 +635,54 @@ fn recovery_waits_for_an_active_writer() {
     assert_eq!(rep.resumed, 1, "{:?}", rep.lines);
     assert!(crate::repair::wal::unfinished_for_lane(&r.root, &r.lane).is_empty());
 }
+
+// ───────────────────────────── RULINGS CT7 / CU4 — the start pass ─────────────────────────────
+
+/// CT7: a HOOK-ONLY repair committed durably, then a crash before its hook operation record — the
+/// start pass does not skip it because its committed file set is empty: the origin's row is written
+/// and the hook step runs. Without CT7 it was skipped for good.
+#[test]
+fn hook_only_commit_interrupted_before_its_hook_record_is_recovered() {
+    let r = rig("ct7start");
+    let id = rid("R-35");
+    let mut rec = crate::repair::apply::tests::record(&r, &id, crate::repair::types::Classification::General, vec![crate::repair::ledger::FileChange {
+        rel: "settings:Stop:k.sh".into(),
+        kind: crate::repair::ledger::ChangeKind::HookUnregister { event: "Stop".into(), script: "k.sh".into() },
+        pre: crate::repair::ledger::PreImage::Absent,
+        post: TargetState::Absent,
+        diff: None,
+    }], RepairState::Probation);
+    rec.committed = Vec::new();
+    ledger::write_record_in(&r.root, &rec).unwrap();
+    let calls = RefCell::new(Vec::new());
+    let hooks = |_: &RepairId, _: &LaneKey, step: HookStep| -> Result<ReconcileReport, RepairError> {
+        calls.borrow_mut().push(step);
+        Ok(ReconcileReport { hooks: Vec::new() })
+    };
+    let d = Doubles { check: &|_, _, _| outcome(CheckResult::Pass, 1), reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| {}, excluded: &|_| false };
+    let lock = r.base.join(".pack-apply.lock");
+    let env = JobEnv { hooks: &hooks, ..job(&r, &d, ApplyForm::Exchange, NOW, &lock) };
+    let lines = start_time_pass(&env).unwrap();
+    assert_eq!(*calls.borrow(), vec![HookStep::Unregister], "{lines:?}");
+    assert!(ledger::read_lane_in(&r.root, &id, &r.lane).unwrap().is_some(), "the origin's row is written");
+}
+
+/// CU4: the reconstructed origin row records the commit's generation only when it can be confirmed
+/// (the pack's generation files are older than the commit's durable record write); otherwise it is
+/// written closed 대체됨 — nothing is re-checked against a generation nobody can confirm.
+#[test]
+fn reconstructed_origin_row_is_closed_when_the_generation_cannot_be_confirmed() {
+    let r = rig("cu4row");
+    let id = rid("R-36");
+    let rec = committed_general(&r, &id, "hooks/g.sh", Some(b"PRE\n"), Some(b"POST\n"));
+    std::fs::remove_file(ledger::lane_path_in(&r.root, &id, &r.lane)).unwrap();
+    // an update rewrote the generation AFTER the commit's record
+    std::thread::sleep(Duration::from_millis(1100)); // wallclock: guard mtime granularity of the filesystem (1 s on some volumes)
+    std::fs::write(r.pack.join(".pack-version"), "0.15.1\n").unwrap();
+    let _ = rec;
+    let d = Doubles { check: &|_, _, _| outcome(CheckResult::Pass, 1), reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| {}, excluded: &|_| false };
+    let lock = r.base.join(".pack-apply.lock");
+    start_time_pass(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
+    let row = ledger::read_lane_in(&r.root, &id, &r.lane).unwrap().unwrap();
+    assert!(row.probation.as_ref().unwrap().closed.as_deref().is_some_and(|c| c.starts_with("대체됨")), "{:?}", row.probation);
+}

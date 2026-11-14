@@ -247,27 +247,17 @@ pub fn start_time_pass(env: &JobEnv<'_>) -> Result<Vec<String>, RepairError> {
                 }
             }
         }
-        if rec.origin_lane != *lane || rec.committed.is_empty() {
+        // CT7: a hook-only repair (no committed file) is recovered too — its hook step is its state
+        if rec.origin_lane != *lane || (rec.committed.is_empty() && ledger::hook_lines(rec).next().is_none()) {
             continue;
         }
-        // (b1) the hook step of the committed repair, when its unregistration never finished
-        if ledger::hook_lines(rec).next().is_some() {
-            let (ops, _) = super::wal::list_in(root, &rec.id);
-            let done = ops.iter().any(|o| o.kind == "hook-unregister" && o.finished);
-            if !done {
-                match (env.hooks)(&rec.id, lane, HookStep::Unregister) {
-                    Ok(_) => lines.push(format!("{}: 끊긴 확정의 훅 단계를 마쳤습니다", rec.id.as_str())),
-                    Err(e) => lines.push(format!("{}: 끊긴 확정의 훅 단계 실패 — 충돌로 남깁니다({e:?})", rec.id.as_str())),
-                }
-            }
-        }
-        // (b2) older in-force repairs on the same targets
-        for oid in supersede_older(root, lane, rec, env.locked)? {
-            lines.push(format!("{}: 같은 파일의 더 새 수리 {} 로 대체됨", oid.as_str(), rec.id.as_str()));
-        }
-        // (b3) the origin's own row
+        // (b3) the origin's own row FIRST (the hook step below marks it 충돌 when it cannot finish).
+        // CU4: it records the COMMIT's generation — confirmed when the pack's generation files are
+        // older than the record's durable commit write — else it is written closed 대체됨 (nothing is
+        // re-checked or reverted against bytes of a generation nobody can confirm)
         if row.is_none() {
             let gen = apply::pack_generation(env.op.pack);
+            let confirmed = generation_unchanged_since_commit(root, env.op.pack, &rec.id);
             let new_row = LaneRecord {
                 schema: super::REPAIR_SCHEMA,
                 repair: rec.id.clone(),
@@ -278,7 +268,7 @@ pub fn start_time_pass(env: &JobEnv<'_>) -> Result<Vec<String>, RepairError> {
                     pro_revision: gen.pro_revision,
                     applied_at: env.op.now,
                     expected: rec.committed.clone(),
-                    closed: None,
+                    closed: (!confirmed).then(|| "대체됨 — 확정 때의 팩 세대를 확인할 수 없어 시험 기간을 다시 열지 않습니다(워커 검토)".to_string()),
                     check_timings: Vec::new(),
                     check_timeouts: Vec::new(),
                 }),
@@ -302,10 +292,49 @@ pub fn start_time_pass(env: &JobEnv<'_>) -> Result<Vec<String>, RepairError> {
                 }
                 Ok(())
             })?;
-            lines.push(format!("{}: 끊긴 확정의 부서 행을 썼습니다", rec.id.as_str()));
+            lines.push(format!(
+                "{}: 끊긴 확정의 부서 행을 썼습니다{}",
+                rec.id.as_str(),
+                if confirmed { "" } else { "(세대를 확인할 수 없어 대체됨으로 닫음)" }
+            ));
+        }
+        // (b1) the hook step of the committed repair, when its unregistration never finished
+        if ledger::hook_lines(rec).next().is_some() {
+            let (ops, _) = super::wal::list_in(root, &rec.id);
+            let done = ops.iter().any(|o| o.kind == "hook-unregister" && o.finished && o.outcome.as_deref() == Some("applied"));
+            let attempted = ops.iter().any(|o| o.kind == "hook-unregister");
+            if !done && !attempted {
+                match (env.hooks)(&rec.id, lane, HookStep::Unregister) {
+                    Ok(_) => lines.push(format!("{}: 끊긴 확정의 훅 단계를 마쳤습니다", rec.id.as_str())),
+                    Err(e) => {
+                        apply::mark_lane_conflict(root, &rec.id, lane, env.op.now, env.locked);
+                        lines.push(format!("{}: 끊긴 확정의 훅 단계 실패 — 충돌로 남깁니다({e:?})", rec.id.as_str()));
+                    }
+                }
+            }
+        }
+        // (b2) older in-force repairs on the same targets
+        for oid in supersede_older(root, lane, rec, env.locked)? {
+            lines.push(format!("{}: 같은 파일의 더 새 수리 {} 로 대체됨", oid.as_str(), rec.id.as_str()));
         }
     }
     Ok(lines)
+}
+
+/// CU4: the pack generation is confirmed unchanged since a commit when the files that define it
+/// (`.pack-version`, the pack state) were last written BEFORE the record's durable commit write.
+fn generation_unchanged_since_commit(root: &Path, pack: &Path, id: &RepairId) -> bool {
+    let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let Some(committed_at) = mtime(&ledger::record_path_in(root, id)) else {
+        return false;
+    };
+    [pack.join(".pack-version"), pack.join(crate::pack::PACK_STATE_FILE)]
+        .iter()
+        .all(|p| match std::fs::symlink_metadata(p) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(_) => false,
+            Ok(_) => mtime(p).is_some_and(|t| t <= committed_at),
+        })
 }
 
 fn supersede_older(
