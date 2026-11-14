@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """check_macho_arch.py — every Mach-O file of a macOS bundle must carry the target architecture
-(0.15.0 · track T11 · RULINGS BQ1(b), CA1–CA2 · owner order addendum 11).
+(0.15.0 · tracks T11, T11b · RULINGS BQ1(b), CA1–CA2, DB4–DB5 · owner order addendum 11).
 
 Why: the Intel (x86_64) macOS leg is a CROSS build on an arm64 runner, the runtime tree
 (`src-tauri/runtime`: python, node, git, uv) is downloaded per target, and nothing checked the
@@ -12,8 +12,12 @@ fails, naming each file, when one cannot run on the target:
   · thin Mach-O of another architecture               → FAIL
   · universal (fat) with a slice of the target         → pass
   · universal (fat) without one                         → FAIL
+  · universal whose fat table and a slice's OWN header disagree (CPU or subtype) → FAIL (RULINGS DB4: the
+    loader picks a slice by the table and then loads what the slice holds; every slice header is read, in
+    file order, and its header and load commands must lie within the slice's own bounds)
   · not Mach-O (text, data, a Java class file that also starts with 0xCAFEBABE) → ignored
-  · a Mach-O whose header is cut short, or a fat slice that lies outside the file, an unreadable file or
+  · a Mach-O whose header is cut short, a fat slice that lies outside the file or overlaps another, a header,
+    load commands or one load command that run past the slice / file / sizeofcmds, an unreadable file or
     directory → CANNOT JUDGE (exit 2 — not measurable is not a pass)
 
 SUBTYPE RULE (RULINGS CA2(a)): the target is satisfied only by a slice every Mac of that kind can run —
@@ -39,6 +43,13 @@ streaming pass in archive order — never by seeking back in a compressed stream
 reads of the real 0.14.56 archive rewound the gzip ~3,864 times, ~35 minutes per pass). The output line
 `archive read in one pass: <members> members, <read> of <size> compressed bytes` is measured from the real
 reads (`read` can only exceed `size` if something rewound).
+Tar HARD-LINK members (RULINGS DB5) are resolved by tar's own rule — a hard link names an ALREADY archived
+member, and every extractor (Python tarfile, libarchive / bsdtar, GNU tar, the Rust `tar` crate) creates it
+from the file it already wrote: each hard link is recorded with whether its target had already streamed
+past, and resolved after the pass (the target's Mach-O result was recorded when its bytes went by — no
+second pass). A required entry point packed as a hard link is found through its target (chains followed);
+a hard link whose target is absent, or comes only after it (it would be missing after extraction), FAILs;
+a wrong-architecture target FAILs as that file.
 
 Reads bytes only: no `lipo`, `otool`, `file` or `vtool` (they are not on a stock Mac and not needed),
 no execution of anything it inspects, no network. Standard library only (python 3.8+).
@@ -104,8 +115,13 @@ def _decode_version(v):
     return "%d.%d.%d" % (major, minor, patch) if patch else "%d.%d" % (major, minor)
 
 
-def _thin(read, off, size):
-    """(arch name, minimum macOS or None) of the thin Mach-O at OFF; raises Unjudgeable when cut short."""
+def _thin(read, off, end, where):
+    """(cputype, subtype, minimum macOS or None) of the thin Mach-O at OFF whose bytes end at END (the end of the
+    file, or of the fat slice — RULINGS DB4; None = unknown); WHERE names that span in messages. Raises
+    Unjudgeable when cut short, or when the header, the load commands or one load command run past END /
+    sizeofcmds."""
+    if end is not None and off + 4 > end:
+        raise Unjudgeable("Mach-O magic runs past the end of %s" % where)
     magic_b = _exact(read, off, 4, "Mach-O magic")
     le = struct.unpack("<I", magic_b)[0]
     endian = "<" if le in (MH_MAGIC, MH_MAGIC_64) else ">"
@@ -113,28 +129,33 @@ def _thin(read, off, size):
     if magic not in (MH_MAGIC, MH_MAGIC_64):
         raise Unjudgeable("slice at offset %d does not start with a Mach-O magic" % off)
     hsize = 32 if magic == MH_MAGIC_64 else 28
+    if end is not None and off + hsize > end:
+        raise Unjudgeable("Mach-O header runs past the end of %s" % where)
     hdr = _exact(read, off, hsize, "Mach-O header")
     cputype, subtype = struct.unpack(endian + "II", hdr[4:12])
     ncmds, sizeofcmds = struct.unpack(endian + "II", hdr[16:24])
-    if size is not None and off + hsize + sizeofcmds > size:
-        raise Unjudgeable("load commands (%d bytes) run past the end of the file" % sizeofcmds)
+    if end is not None and off + hsize + sizeofcmds > end:
+        raise Unjudgeable("load commands (%d bytes) run past the end of %s" % (sizeofcmds, where))
     minos = None
     if sizeofcmds <= MAX_CMDS_BYTES:
         cmds = _exact(read, off + hsize, sizeofcmds, "load commands")
         pos = 0
-        for _ in range(ncmds):
+        for k in range(ncmds):
             if pos + 8 > len(cmds):
                 raise Unjudgeable("load commands end early")
             cmd, cmdsize = struct.unpack(endian + "II", cmds[pos:pos + 8])
             if cmdsize < 8:
                 raise Unjudgeable("load command of size %d" % cmdsize)
+            if pos + cmdsize > len(cmds):
+                raise Unjudgeable("load command %d (%d bytes) runs past sizeofcmds (%d bytes) in %s"
+                                  % (k, cmdsize, len(cmds), where))
             if cmd == LC_BUILD_VERSION and pos + 16 <= len(cmds):
                 minos = _decode_version(struct.unpack(endian + "I", cmds[pos + 12:pos + 16])[0])
                 break
             if cmd == LC_VERSION_MIN_MACOSX and pos + 12 <= len(cmds) and minos is None:
                 minos = _decode_version(struct.unpack(endian + "I", cmds[pos + 8:pos + 12])[0])
             pos += cmdsize
-    return arch_name(cputype, subtype), minos
+    return cputype, subtype, minos
 
 
 def inspect(read, size, target_arch):
@@ -146,8 +167,9 @@ def inspect(read, size, target_arch):
     le = struct.unpack("<I", head[:4])[0]
     be = struct.unpack(">I", head[:4])[0]
     if le in (MH_MAGIC, MH_MAGIC_64) or be in (MH_MAGIC, MH_MAGIC_64):
-        name, minos = _thin(read, 0, size)
-        return {"archs": [name], "ok": name in SATISFIES[target_arch], "minos": minos}
+        cputype, subtype, minos = _thin(read, 0, size, "the file")
+        name = arch_name(cputype, subtype)
+        return {"archs": [name], "ok": name in SATISFIES[target_arch], "minos": minos, "mismatch": []}
     if be not in (FAT_MAGIC, FAT_MAGIC_64):
         return None
     if len(head) < 8:
@@ -157,7 +179,7 @@ def inspect(read, size, target_arch):
         return None              # a Java class file (0xCAFEBABE + version >= 45) or other data — not Mach-O
     entry = 20 if be == FAT_MAGIC else 32
     table = _exact(read, 8, nfat * entry, "fat table")
-    slices = []
+    entries = []
     for i in range(nfat):
         e = table[i * entry:(i + 1) * entry]
         cputype, subtype = struct.unpack(">II", e[0:8])
@@ -167,12 +189,24 @@ def inspect(read, size, target_arch):
             offset, ssize = struct.unpack(">QQ", e[8:24])
         if size is not None and (offset < 8 + nfat * entry or offset + ssize > size):
             raise Unjudgeable("fat slice %d (offset %d, size %d) lies outside the file (%d bytes)" % (i, offset, ssize, size))
-        slices.append((arch_name(cputype, subtype), offset))
-    archs = [n for n, _ in slices]
-    good = [o for n, o in slices if n in SATISFIES[target_arch]]
-    off = good[0] if good else min(o for _, o in slices)
-    _, minos = _thin(read, off, size)
-    return {"archs": archs, "ok": bool(good), "minos": minos}
+        entries.append((offset, i, cputype, subtype, ssize))
+    # RULINGS DB4: every slice's OWN header, within the slice's own bounds, read in FILE order (a streamed member
+    # can only be read forward; the table may list the slices in any order)
+    own, mismatch, prev_end = {}, [], 0
+    for offset, i, cputype, subtype, ssize in sorted(entries):
+        if offset < prev_end:
+            raise Unjudgeable("fat slice %d (offset %d) overlaps the slice before it (which ends at %d)" % (i, offset, prev_end))
+        prev_end = offset + ssize
+        hcpu, hsub, minos = _thin(read, offset, offset + ssize, "fat slice %d" % i)
+        same = hcpu == cputype and (hsub & SUBTYPE_MASK) == (subtype & SUBTYPE_MASK)
+        if not same:
+            mismatch.append("fat table entry %d says %s but the slice's own header is %s"
+                            % (i, arch_name(cputype, subtype), arch_name(hcpu, hsub)))
+        own[i] = (arch_name(hcpu, hsub), same, minos)
+    archs = [own[i][0] for i in range(nfat)]
+    good = [own[i][2] for i in range(nfat) if own[i][1] and own[i][0] in SATISFIES[target_arch]]
+    minos = good[0] if good else own[0][2]
+    return {"archs": archs, "ok": bool(good), "minos": minos, "mismatch": mismatch}
 
 
 def _vtuple(v):
@@ -238,8 +272,9 @@ class CountingFile:
 
 
 def scan_dir(root, target_arch):
-    """→ (records, links, files, problems): records {rel: inspect() result} for Mach-O files; links {rel: target};
-    files = every regular file (Mach-O or not); problems [str] (cannot judge)."""
+    """→ (records, links, files, problems, hardlinks): records {rel: inspect() result} for Mach-O files; links
+    {rel: target}; files = every regular file (Mach-O or not); problems [str] (cannot judge); hardlinks {} (on a
+    directory tree a hard link is simply another regular file)."""
     records, links, files, problems = {}, {}, set(), []
     base = os.path.basename(os.path.normpath(root)) if root.rstrip("/").endswith(".app") else ""
 
@@ -272,7 +307,7 @@ def scan_dir(root, target_arch):
 
     if os.path.isfile(root) and not os.path.islink(root):
         one(root, os.path.basename(root))
-        return records, links, files, problems
+        return records, links, files, problems, {}
 
     def onerror(e):
         problems.append("%s: unreadable directory (%s)" % (rel_of(e.filename) if e.filename else root, e.strerror or e))
@@ -285,19 +320,31 @@ def scan_dir(root, target_arch):
             full = os.path.join(dirpath, d)
             if os.path.islink(full):
                 links[rel_of(full)] = os.readlink(full)
-    return records, links, files, problems
+    return records, links, files, problems, {}
+
+
+def _arc_rel(name):
+    return name[2:] if name.startswith("./") else name
 
 
 def scan_tar(path, target_arch, out):
-    """ONE streaming pass in archive order (CA1). → (records, links, files, problems)."""
-    records, links, files, problems = {}, {}, set(), []
+    """ONE streaming pass in archive order (CA1). → (records, links, files, problems, hardlinks): hardlinks
+    {rel: (target rel, whether the target had already been archived when the link came)} (RULINGS DB5)."""
+    records, links, files, problems, hardlinks = {}, {}, set(), [], {}
+    archived = set()                    # every member name met so far (tar: a hard link names an earlier member)
     raw = CountingFile(path)
     members = 0
     try:
         with tarfile.open(fileobj=raw, mode="r|*") as tar:
             for m in tar:
                 members += 1
-                rel = m.name[2:] if m.name.startswith("./") else m.name
+                rel = _arc_rel(m.name)
+                if m.islnk():
+                    target = _arc_rel(m.linkname)
+                    hardlinks[rel] = (target, target in archived)
+                    archived.add(rel)
+                    continue
+                archived.add(rel)
                 if m.issym():
                     links[rel] = m.linkname
                     continue
@@ -318,16 +365,29 @@ def scan_tar(path, target_arch, out):
         raw.close()
     out.append("  archive read in one pass: %d members, %d of %d compressed bytes"
                % (members, raw.read_bytes, os.path.getsize(path)))
-    return records, links, files, problems
+    return records, links, files, problems, hardlinks
 
 
-def _resolve(rel, links, records, files, seen=None):
-    """Follow links inside the tree → (resolved rel | None, why)."""
+def _resolve(rel, links, records, files, seen=None, hardlinks=None):
+    """Follow links inside the tree → (resolved rel | None, why). A tar hard link (RULINGS DB5) is the same file
+    as its target, an archive-root path that must have been archived BEFORE the link."""
     seen = seen or set()
+    hardlinks = hardlinks or {}
     if rel in records:
         return rel, ""
     if rel in files:
         return None, "not a Mach-O file"
+    if rel in hardlinks:
+        if rel in seen or len(seen) > 16:
+            return None, "link loop"
+        target, earlier = hardlinks[rel]
+        if not any(target in s for s in (records, files, links, hardlinks)):
+            return None, "dangling hard link (no member %s in the archive)" % target
+        if not earlier:
+            return None, ("hard link before its target %s — tar creates a hard link from a member it has already "
+                          "extracted, so this one would be missing after extraction" % target)
+        seen.add(rel)
+        return _resolve(target, links, records, files, seen, hardlinks)
     if rel not in links:
         return None, "missing"
     if rel in seen or len(seen) > 16:
@@ -337,7 +397,7 @@ def _resolve(rel, links, records, files, seen=None):
         return None, "absolute link outside the tree"
     nxt = posixpath.normpath(posixpath.join(posixpath.dirname(rel), target))
     seen.add(rel)
-    r, why = _resolve(nxt, links, records, files, seen)
+    r, why = _resolve(nxt, links, records, files, seen, hardlinks)
     return r, (why if why != "missing" else "dangling link")
 
 
@@ -348,9 +408,9 @@ def check_one(path, target_arch, requires, quiet, out):
     is_tar = os.path.isfile(path) and (path.endswith((".tar.gz", ".tgz", ".tar")) or tarfile.is_tarfile(path))
     try:
         if is_tar:
-            records, links, files, problems = scan_tar(path, target_arch, out)
+            records, links, files, problems, hardlinks = scan_tar(path, target_arch, out)
         else:
-            records, links, files, problems = scan_dir(path, target_arch)
+            records, links, files, problems, hardlinks = scan_dir(path, target_arch)
     except (tarfile.TarError, OSError, EOFError, zlib.error) as e:
         out.append("CANNOT JUDGE: %s unreadable (%s)" % (path, e))
         return EXIT_UNJUDGEABLE
@@ -362,22 +422,34 @@ def check_one(path, target_arch, requires, quiet, out):
         counts[key] = counts.get(key, 0) + 1
         if not info["ok"]:
             failures.append("%s: %s (no slice that runs on every %s Mac)" % (rel, key, target_arch))
+        for msg in info.get("mismatch", ()):
+            failures.append("%s: %s — a loader picks the slice by the table and then loads what the slice holds "
+                            "(RULINGS DB4)" % (rel, msg))
     entries = []
-    for rel in sorted(set([r for r in records if is_entry(r)] + [r for r in links if is_entry(r)])):
-        real, _ = _resolve(rel, links, records, files)
+    for rel in sorted(set([r for r in records if is_entry(r)] + [r for r in links if is_entry(r)]
+                          + [r for r in hardlinks if is_entry(r)])):
+        real, _ = _resolve(rel, links, records, files, None, hardlinks)
         entries.append((rel, real, records.get(real)))
+    required_hits = set()
     for req in requires:
         req = req.strip("/")
-        hits = sorted(r for r in set(records) | set(links) | files if r == req or r.endswith("/" + req))
+        hits = sorted(r for r in set(records) | set(links) | files | set(hardlinks) if r == req or r.endswith("/" + req))
         if not hits:
             failures.append("required entry point %s: missing" % req)
             continue
         for r in hits:
-            real, why = _resolve(r, links, records, files)
+            required_hits.add(r)
+            real, why = _resolve(r, links, records, files, None, hardlinks)
             if real is None:
                 failures.append("required entry point %s: %s" % (r, why))
             elif not records[real]["ok"]:
                 pass                                  # already named above with its architecture
+    for rel in sorted(hardlinks):                     # RULINGS DB5: every hard link must be extractable
+        if rel in required_hits:
+            continue                                  # already judged above as a required entry point
+        real, why = _resolve(rel, links, records, files, None, hardlinks)
+        if real is None and why != "not a Mach-O file":
+            failures.append("hard link %s: %s" % (rel, why))
     plist_min = None
     if label.endswith(".app") and not is_tar:
         try:
