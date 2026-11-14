@@ -1051,10 +1051,202 @@ fn i3_refuses_registrar_mutation(name: &str, from: &str, to: &str) {
         (Answer::Deny, Some(Answer::Allow), ProbeDecision::Refused),
         "{name}: {s3:#?}"
     );
+    // RULINGS GA2: the refusal says that in release 1 the registrar's output changes only by a vendor
+    // update
+    assert!(
+        rep.refusals.iter().any(|r| r.contains("공급사 업데이트로만")),
+        "{name}: {:?}",
+        rep.refusals
+    );
     cleanup(&root);
 }
 
 const REGISTRAR_FORM: &str = "    return \"sh \" + script";
+
+/// The line of the released registrar that builds the gate's new entry (s3: starts unregistered).
+const REGISTRAR_ENTRY: &str = "entry = {\"hooks\": [{\"type\": \"command\", \"command\": cmd}]}";
+
+/// RULINGS GA2 — the WHOLE settings document decides, not a projection of the gate's entries: each
+/// control differs from the released registrar's document and is refused; the same document written
+/// under another run root, in another key order and layout, is the same. `projection` lists the
+/// controls the EL2 projection (the gate's entries + the closed grammar — the code before GA2) still
+/// read as registered: those passed I3 before this rule.
+#[test]
+fn i3_compares_the_whole_settings_document() {
+    let root = test_root("ga2-unit");
+    let run_a = root.join("run-a");
+    let run_b = root.join("run-b");
+    let gate_cmd = |run: &Path| format!("sh {}/x/pack/hooks/{CAPGATE_SCRIPT}", run.display());
+    let other_cmd = |run: &Path| format!("sh {}/x/pack/hooks/session-start.sh", run.display());
+    let doc = |run: &Path| {
+        serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{"hooks": [{"type": "command", "command": gate_cmd(run), "timeout": 15}]}],
+                "SessionStart": [{"hooks": [{"type": "command", "command": other_cmd(run)}]}]
+            }
+        })
+    };
+    for run in [&run_a, &run_b] {
+        let gate = run.join("x/pack/hooks").join(CAPGATE_SCRIPT);
+        std::fs::create_dir_all(gate.parent().unwrap()).unwrap();
+        std::fs::write(&gate, "#!/bin/sh\nexit 0\n").unwrap();
+    }
+    let file_a = run_a.join("settings.json");
+    std::fs::write(&file_a, serde_json::to_string_pretty(&doc(&run_a)).unwrap()).unwrap();
+    let reference = settings_doc(&file_a, &run_a).expect("readable");
+    let file_b = run_b.join("settings.json");
+    // positive: the same document under another run root, compact, keys in another order
+    let same = format!(
+        "{{\"hooks\":{{\"SessionStart\":[{{\"hooks\":[{{\"command\":{},\"type\":\"command\"}}]}}],\"PreToolUse\":[{{\"hooks\":[{{\"timeout\":15,\"command\":{},\"type\":\"command\"}}]}}]}}}}",
+        serde_json::to_string(&other_cmd(&run_b)).unwrap(),
+        serde_json::to_string(&gate_cmd(&run_b)).unwrap()
+    );
+    std::fs::write(&file_b, &same).unwrap();
+    assert_eq!(
+        doc_difference(&reference, &settings_doc(&file_b, &run_b).unwrap()),
+        None,
+        "the same document is the same"
+    );
+    let gate_hook = serde_json::json!({"type": "command", "command": gate_cmd(&run_b), "timeout": 15});
+    let entry = serde_json::json!({"hooks": [gate_hook.clone()]});
+    let edit = |f: &dyn Fn(&mut serde_json::Value)| {
+        let mut v = doc(&run_b);
+        f(&mut v);
+        v
+    };
+    let controls: Vec<(&str, serde_json::Value)> = vec![
+        ("sibling hook", edit(&|v| v["hooks"]["PreToolUse"][0]["hooks"].as_array_mut().unwrap().push(serde_json::json!({"type": "command", "command": "sleep 600"})))),
+        ("duplicated entry", edit(&|v| v["hooks"]["PreToolUse"].as_array_mut().unwrap().push(entry.clone()))),
+        ("duplicated hook", edit(&|v| v["hooks"]["PreToolUse"][0]["hooks"].as_array_mut().unwrap().push(gate_hook.clone()))),
+        ("extra key at the top", edit(&|v| v["env"] = serde_json::json!({"CYS_ROLE": "master"}))),
+        ("extra key in hooks (another event)", edit(&|v| v["hooks"]["Stop"] = serde_json::json!([{"hooks": [{"type": "command", "command": "true"}]}]))),
+        ("extra key in the entry", edit(&|v| v["hooks"]["PreToolUse"][0]["if"] = serde_json::json!("never"))),
+        ("extra key in the hook", edit(&|v| v["hooks"]["PreToolUse"][0]["hooks"][0]["async"] = serde_json::json!(true))),
+        ("the gate's block under another event", edit(&|v| v["hooks"]["PostToolUse"] = serde_json::json!([entry.clone()]))),
+        ("a block added under another event", edit(&|v| v["hooks"]["SessionStart"].as_array_mut().unwrap().push(serde_json::json!({"hooks": [{"type": "command", "command": "sleep 600"}]})))),
+        ("top-level switch disableAllHooks", edit(&|v| v["disableAllHooks"] = serde_json::json!(true))),
+        ("order of the blocks", edit(&|v| {
+            let a = v["hooks"]["PreToolUse"].as_array_mut().unwrap();
+            a.insert(0, serde_json::json!({"hooks": [{"type": "command", "command": "true"}]}));
+        })),
+        ("a value of another type", edit(&|v| v["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"] = serde_json::json!("15"))),
+    ];
+    let expected = gate_entries(
+        &serde_json::from_str(&std::fs::read_to_string(&file_a).unwrap()).unwrap(),
+        &run_a.join("x/pack/hooks").join(CAPGATE_SCRIPT).to_string_lossy(),
+    )
+    .into_iter()
+    .next()
+    .unwrap();
+    let mut wrong = Vec::new();
+    let mut projection = Vec::new();
+    for (name, v) in &controls {
+        std::fs::write(&file_b, serde_json::to_string_pretty(v).unwrap()).unwrap();
+        let got = settings_doc(&file_b, &run_b).unwrap();
+        if doc_difference(&reference, &got).is_none() {
+            wrong.push(*name);
+        }
+        // the gate path of run B, the expected entry of run B (the placeholder put back)
+        let expected_b: serde_json::Value = serde_json::from_str(
+            &expected.to_string().replace(&*run_a.to_string_lossy(), &run_b.to_string_lossy()),
+        )
+        .unwrap();
+        let gate_b = run_b.join("x/pack/hooks").join(CAPGATE_SCRIPT);
+        if gate_entry_as_released(&file_b, &gate_b.to_string_lossy(), &expected_b) == Some(true)
+            && gate_registered(&file_b, &run_b.join("x/pack")) == Some(true)
+        {
+            projection.push(*name);
+        }
+    }
+    // not a JSON document, a link, an absent file: each differs from the document
+    std::fs::write(&file_b, "{ not json").unwrap();
+    if doc_difference(&reference, &settings_doc(&file_b, &run_b).unwrap()).is_none() {
+        wrong.push("not JSON");
+    }
+    std::fs::remove_file(&file_b).unwrap();
+    if doc_difference(&reference, &settings_doc(&file_b, &run_b).unwrap()).is_none() {
+        wrong.push("absent");
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&file_a, &file_b).unwrap();
+        if doc_difference(&reference, &settings_doc(&file_b, &run_b).unwrap()).is_none() {
+            wrong.push("a link to an equal document");
+        }
+    }
+    assert!(wrong.is_empty(), "read as the released document: {wrong:?}");
+    for name in [
+        "sibling hook",
+        "duplicated entry",
+        "duplicated hook",
+        "extra key at the top",
+        "extra key in hooks (another event)",
+        "the gate's block under another event",
+        "a block added under another event",
+        "order of the blocks",
+    ] {
+        assert!(projection.contains(&name), "the projection alone refused {name}: {projection:?}");
+    }
+    cleanup(&root);
+}
+
+/// RULINGS GA2 — the real registrar adds a sibling hook (`sleep 600`) to the gate's own entry: the
+/// gate's entry is untouched (the EL2 projection and the command's execution said registered) — the
+/// document differs → REFUSED.
+#[test]
+fn i3_refuses_registrar_adding_a_sibling_hook() {
+    i3_refuses_registrar_mutation(
+        "ga2-sibling",
+        REGISTRAR_ENTRY,
+        "entry = {\"hooks\": [{\"type\": \"command\", \"command\": cmd}, {\"type\": \"command\", \"command\": \"sleep 600\"}]}",
+    );
+}
+
+/// RULINGS GA2 — the real registrar writes a top-level key (`env` setting the seat's role for every
+/// session) beside an untouched gate entry → REFUSED.
+#[test]
+fn i3_refuses_registrar_writing_a_top_level_key() {
+    i3_refuses_registrar_mutation(
+        "ga2-toplevel",
+        REGISTRAR_ENTRY,
+        "entry = {\"hooks\": [{\"type\": \"command\", \"command\": cmd}]}; data[\"env\"] = {\"CYS_ROLE\": \"master\"}",
+    );
+}
+
+/// RULINGS GA2 — the POSITIVE control: a candidate registrar whose change does not change what it
+/// writes (a comment) is accepted — every I3 cell holds, nothing is refused.
+#[test]
+fn i3_accepts_a_registrar_whose_output_is_unchanged() {
+    let root = test_root("ga2-positive");
+    let lane = lane_of(&root, &[]);
+    let pf = released("bin/javis_preflight.py")
+        + "\n# a comment that changes nothing the registrar writes (RULINGS GA2 positive control)\n";
+    let cand = candidate_of(&root, &[("bin/javis_preflight.py", Some(pf))]);
+    let c = cfg(&root, Some(vec![]), Some(vec![]), true);
+    let rep = screen_with(&c, &cand, &lane, LONG).unwrap();
+    let i3: Vec<&ProbeResult> = rep.probes.iter().filter(|p| p.test == "I3").collect();
+    assert!(i3.len() >= 12, "{i3:#?}");
+    // held where the released registrar registers; unbound on the profiles its hook-target table
+    // denies (census (ii)) — never refused, never "not measurable"
+    for p in &i3 {
+        assert!(
+            matches!(p.decision, ProbeDecision::Held | ProbeDecision::Unbound),
+            "{p:#?}"
+        );
+        assert!(!p.detail.contains(I3_DOC_DIFFERS), "{p:#?}");
+    }
+    let s3 = i3
+        .iter()
+        .find(|p| p.cell == "L1/S3/run1" && p.class == "I3:.claude")
+        .unwrap();
+    assert_eq!(
+        (s3.released, s3.clean, s3.candidate),
+        (Answer::Deny, Some(Answer::Deny), Some(Answer::Deny)),
+        "{s3:#?}"
+    );
+    assert_eq!(rep.verdict, ScreenVerdict::Accepted, "{:?} {:?}", rep.refusals, rep.notes);
+    cleanup(&root);
+}
 
 #[test]
 fn i3_refuses_registrar_writing_a_comment() {
