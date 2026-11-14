@@ -6573,10 +6573,9 @@ pub fn install_staged(
         return Err(e);
     }
     // ④ 원자 교체(실패 시 pre-state 복구·staging 정리).
-    // ★T9a (RULINGS FS4): any tally the staged pass printed above describes the staging, which no Err path installs.
     if let Err(e) = atomic_swap(&dir, &staging) {
         let _ = std::fs::remove_dir_all(&staging);
-        return Err(format!("{e} — 이 실행이 위에 출력한 [init-pack] 집계(있다면)는 설치되지 않은 준비본의 것입니다(준비본은 버렸습니다)"));
+        return Err(e);
     }
     // ⑤ 교체 후 실 pack_dir 기준 config 격리 셋업(pack_dir 형제 — staging 대상이 아니었다).
     setup_isolated_config_dir(install_hooks);
@@ -12697,7 +12696,6 @@ mod tests {
 
             let err = r.expect_err("a refused live-pack rename fails the staged install");
             assert!(err.contains("교체 안 함"), "{err}");
-            assert!(err.contains("설치되지 않은 준비본"), "FS4: the answer disowns the staged pass's tally: {err}");
             assert_eq!(manifest(&pd), m_before, "FS2: the live pack is byte-identical after the refused swap");
             assert_eq!(manifest(&pack_prev_dir(&pd)), m_prev_before, "the previous generation is untouched");
             let left: Vec<String> =
