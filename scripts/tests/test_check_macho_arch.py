@@ -21,7 +21,10 @@ DL1 (3)–(4) (the closed form): ONE spelling — `python3 -> python3.12/.` / `p
 member fails; symbolic links resolved as the kernel does — 32 expansions resolve and 33 do not, a deep chain is "too
 many links" (no crash), a real loop, `marker/../python3.12` with `marker` a file or absent does not resolve, a target
 through a directory link resolves; a required entry point that stops at a not-measurable member is not measurable,
-never a FAIL; the checker's own failure is exit 2. A red case differs from its green control only in the planted
+never a FAIL; the checker's own failure is exit 2. RULINGS DU1–DU2 (the plain shape): a member of an unknown type
+(`Z`, holding an arm64 Mach-O) or a fifo is not measurable, never skipped; a member below a symbolic-link member (the
+link before or after it) is not measurable and the stale result at its real destination is not used; a refused member
+still proves its parent directories (no directory members, a required `python3 -> /usr/bin/python3`: exit 2). A red case differs from its green control only in the planted
 fact.
 
     python3 scripts/tests/test_check_macho_arch.py
@@ -686,6 +689,67 @@ class Gate(unittest.TestCase):
             self.assertEqual(rc, 2, out)
             self.assertIn("CANNOT JUDGE required entry point cys.app/Contents/Resources/runtime/python/bin/python3: not measurable", out)
             self.assertNotIn("FAIL", out)
+
+    # -- T11b · RULINGS DU1–DU2: the plain shape --
+    def test_a_member_of_another_type_is_not_measurable_never_skipped(self):
+        # DU1 (a), the reviewer's case: type flag `Z` holding an arm64 Mach-O (the tar crate writes it as a file)
+        for flag in (b"Z", tarfile.FIFOTYPE):
+            app = self.app()
+            arc = os.path.join(self.tmp, "type.tar.gz")
+            with tarfile.open(arc, "w:gz") as t:
+                t.add(app, arcname="cys.app")
+                data = thin(ARM64, minos="11.0")
+                ti = tarfile.TarInfo("cys.app/Contents/Resources/runtime/extra")
+                ti.type, ti.size, ti.mode = flag, len(data), 0o755
+                t.addfile(ti, io.BytesIO(data))
+            rc, out = self.gate("--target", "x86_64-apple-darwin", *REQUIRE_APP, arc)
+            self.assertEqual(rc, 2, flag.decode() + "\n" + out)
+            self.assertIn("the archive is not in the plain shape (RULINGS DU1) — cys.app/Contents/Resources/runtime/extra: "
+                          "not measurable — member type %r is not a directory, a regular file" % flag.decode(), out)
+            self.assertNotIn("RESULT: PASS", out)
+            shutil.rmtree(app)
+
+    def test_a_member_below_a_symbolic_link_member_is_not_measurable(self):
+        # DU1 (d), the reviewer's sequence: python3.12 (x86_64), python3 -> python3.12, runtime/py -> python, then a TEXT
+        # member runtime/py/bin/python3.12 — the extractor follows the link and replaces python3.12 — and the link LATER
+        for link_first in (True, False):
+            app = self.py_links([("python/bin/python3", "python3.12"), ("py", "python")])
+            arc = os.path.join(self.tmp, "below.tar.gz")
+            with tarfile.open(arc, "w:gz") as t:
+                def below():
+                    ti = tarfile.TarInfo("cys.app/Contents/Resources/runtime/py/bin/python3.12")
+                    ti.size, ti.mode = 10, 0o755
+                    t.addfile(ti, io.BytesIO(b"#!/bin/sh\n"))
+                if not link_first:
+                    below()
+                t.add(app, arcname="cys.app")
+                if link_first:
+                    below()
+            rc, out = self.gate("--target", "x86_64-apple-darwin", *REQUIRE_APP, arc)
+            self.assertEqual(rc, 2, out)
+            self.assertIn("cys.app/Contents/Resources/runtime/py/bin/python3.12: not measurable — its name passes through "
+                          "the symbolic-link member cys.app/Contents/Resources/runtime/py", out)
+            self.assertNotIn("FAIL", out)
+            self.assertNotRegex(out, r"python3 -> python3\.12\s+x86_64")     # the stale Mach-O result is not used
+            shutil.rmtree(app)
+
+    def test_a_refused_member_still_proves_its_parent_directories(self):
+        # DU2, the reviewer's case: NO directory members; cys.app/Contents/MacOS/cys and a required python3 ->
+        # /usr/bin/python3 — not measurable (exit 2), no "missing component" proven failure
+        arc = os.path.join(self.tmp, "nodirs.tar.gz")
+        with tarfile.open(arc, "w:gz") as t:
+            data = thin(X86_64, minos="10.13")
+            ti = tarfile.TarInfo("cys.app/Contents/MacOS/cys")
+            ti.size, ti.mode = len(data), 0o755
+            t.addfile(ti, io.BytesIO(data))
+            ti = tarfile.TarInfo("cys.app/Contents/Resources/runtime/python/bin/python3")
+            ti.type, ti.linkname = tarfile.SYMTYPE, "/usr/bin/python3"
+            t.addfile(ti)
+        rc, out = self.gate("--target", "x86_64-apple-darwin", "--require", RT + "python/bin/python3", arc)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("CANNOT JUDGE required entry point cys.app/Contents/Resources/runtime/python/bin/python3: not measurable", out)
+        self.assertNotIn("missing component", out)
+        self.assertNotIn("FAIL", out)
 
     def test_absolute_names_dotdot_and_odd_components_in_member_names_are_not_measurable(self):
         for name in ("cys.app/../evil", "/abs/evil", "cys.app//evil", "cys.app/./evil"):
