@@ -1661,85 +1661,115 @@ pub fn recheck_lane(id: &RepairId, lane: &LaneKey) -> Result<LaneState, RepairEr
 
 // ───────────────────────────── F9 · R2 · P6 ─────────────────────────────
 
-/// F9 (as widened by U1): the live state of `rel` in this lane is an approved copy of the CURRENT
-/// generation only when THREE daemon-written things agree — (1) a repair record of class
-/// boot-critical or protection-related with a daemon-written approval (approved) whose lane row is
-/// in force and bound to the current pack generation; (2) the FINISHED, applied operation record of
-/// that apply in this lane, whose incoming state is the live state now; (3) that apply's vault
-/// deposit (slot `meta/pre.json` naming this repair / lane / rel, the sealed copy matching
-/// `meta/sealed.json`). A ledger row alone is never enough.
-pub fn approved_copy_of_current_generation_in(
-    root: &Path,
-    pack: &Path,
-    lane: &LaneKey,
-    rel: &str,
-) -> Result<bool, RepairError> {
-    let live = TargetState::read(&pack.join(rel))?;
+/// RULINGS DR2 — THE one resolution of "the approved copy" of `rel` for the CURRENT generation in this
+/// lane; recognition (F9) and restoration (M10's source) both use it. Three answers:
+/// - `Approved` — the newest repair of this generation whose lane row claims the file is an approved
+///   boot-critical / protection-related repair that still stands (open, 사용 중, or closed 대체됨 by a
+///   later live change — CU2) AND the full F9 agreement holds: the approval's fingerprint equals the
+///   fingerprint of the operation set this lane applied (the row's applied states), the row's approval
+///   reference is that approval's, every applied operation's incoming state is the row's state of its
+///   file, the slot's `meta/pre.json` and the verified deposit agree with the operation's expected
+///   state and identity, and the approved copy slot verifies (identity + state) → that copy;
+/// - `NoApproval` — positively established: no row of this generation in this lane claims the file
+///   (rows of reverted / failed repairs and of general repairs do not count) → the release's original;
+/// - `Unknown` — any member unreadable or inconsistent (a corrupt lane row or record, an unreadable
+///   operation log, a missing operation, a changed fingerprint / reference / deposit metadata, an
+///   unverifiable copy) → NOTHING is put back, no check is skipped, a finding for the worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovedCopy {
+    Approved { id: RepairId, state: TargetState, holder: PathBuf },
+    NoApproval,
+    Unknown(String),
+}
+
+pub fn resolve_approved_copy_in(root: &Path, pack: &Path, lane: &LaneKey, rel: &str) -> ApprovedCopy {
     let gen = pack_generation(pack);
     for id in ledger::list_ids_in(root).into_iter().rev() {
-        let Ok(Some(rec)) = ledger::read_record_in(root, &id) else {
-            continue;
-        };
-        if !is_approval_class(rec.classification) {
-            continue;
-        }
-        if !rec.approval.as_ref().is_some_and(|a| a.approved) {
-            continue;
-        }
-        let Ok(Some(row)) = ledger::read_lane_in(root, &id, lane) else {
-            continue;
+        let row = match ledger::read_lane_in(root, &id, lane) {
+            Ok(Some(r)) => r,
+            Ok(None) => continue,
+            Err(e) => return ApprovedCopy::Unknown(format!("{}: 이 부서의 행을 읽을 수 없습니다({e:?})", id.as_str())),
         };
         let Some(p) = row.probation.as_ref() else {
             continue;
         };
-        if p.closed.as_deref().is_some_and(|c| !c.starts_with("사용 중"))
-            || p.pack_generation != gen.version
-            || p.pro_revision != gen.pro_revision
-        {
+        if p.pack_generation != gen.version || p.pro_revision != gen.pro_revision {
             continue;
         }
-        if !row.applied.iter().any(|(r, c)| r == rel && *c == live.canon()) {
+        if !row.applied.iter().any(|(r, _)| r == rel) {
             continue;
         }
-        // CT9 — the triple is an AGREEMENT: (i) the approval's fingerprint equals the fingerprint of
-        // the operation set this lane applied, (ii) the lane row's approval reference is that
-        // approval's, (iii) every applied operation's incoming state is the row's state of its file
-        let approval = rec.approval.as_ref().unwrap_or_else(|| unreachable!());
-        let applied_states: Option<Vec<(String, TargetState)>> =
-            row.applied.iter().map(|(r, c)| parse_canon(c).map(|st| (r.clone(), st))).collect();
-        let Some(applied_states) = applied_states else {
-            continue;
+        if p.closed.as_deref().is_some_and(|c| c.starts_with("되돌려짐") || c.starts_with("실패")) {
+            continue; // reverted or failed: it no longer defines the right bytes
+        }
+        let rec = match ledger::read_record_in(root, &id) {
+            Ok(Some(r)) => r,
+            Ok(None) => return ApprovedCopy::Unknown(format!("{}: 행은 이 파일을 말하는데 수리 기록이 없습니다", id.as_str())),
+            Err(e) => return ApprovedCopy::Unknown(format!("{}: 수리 기록을 읽을 수 없습니다({e:?})", id.as_str())),
         };
-        if super::types::fingerprint(&applied_states) != approval.fingerprint_sha256 {
+        if !is_approval_class(rec.classification) {
             continue;
         }
-        if row.approval_ref.as_deref() != Some(approval.request_id.as_str()) {
-            continue;
-        }
-        let ops_agree = row.applied.iter().all(|(r, c)| match applied_op_for(root, &id, lane, r) {
-            Some(o) => o.incoming == *c,
-            None => true, // a target the apply left unchanged has no operation
-        });
-        if !ops_agree {
-            continue;
-        }
-        let Some(op) = applied_op_for(root, &id, lane, rel) else {
-            continue;
+        return match f9_agreement(root, &rec, &row, lane, rel) {
+            Ok((state, holder)) => ApprovedCopy::Approved { id, state, holder },
+            Err(why) => ApprovedCopy::Unknown(format!("{}: {why}", id.as_str())),
         };
-        if parse_canon(&op.incoming) != Some(live.clone()) {
-            continue;
+    }
+    ApprovedCopy::NoApproval
+}
+
+/// The full F9 agreement of one claiming repair (DR2); Ok = the verified approved copy.
+fn f9_agreement(
+    root: &Path,
+    rec: &RepairRecord,
+    row: &ledger::LaneRecord,
+    lane: &LaneKey,
+    rel: &str,
+) -> Result<(TargetState, PathBuf), String> {
+    let id = &rec.id;
+    let approval = rec
+        .approval
+        .as_ref()
+        .filter(|a| a.approved)
+        .ok_or_else(|| "행은 이 파일을 말하는데 유효한 승인이 없습니다".to_string())?;
+    let applied_states: Option<Vec<(String, TargetState)>> =
+        row.applied.iter().map(|(r, c)| parse_canon(c).map(|st| (r.clone(), st))).collect();
+    let applied_states = applied_states.ok_or_else(|| "행의 상태를 읽을 수 없습니다".to_string())?;
+    if super::types::fingerprint(&applied_states) != approval.fingerprint_sha256 {
+        return Err("승인 지문이 이 부서가 적용한 상태와 다릅니다".into());
+    }
+    if row.approval_ref.as_deref() != Some(approval.request_id.as_str()) {
+        return Err("행의 승인 참조가 승인과 다릅니다".into());
+    }
+    let (ops, broken) = wal::list_in(root, id);
+    if !broken.is_empty() {
+        return Err(format!("작업 기록을 읽을 수 없습니다({})", broken.len()));
+    }
+    let applied_op = |r: &str| {
+        ops.iter()
+            .filter(|o| {
+                o.lane_key == *lane
+                    && o.rel == r
+                    && o.finished
+                    && o.outcome.as_deref() == Some("applied")
+                    && matches!(o.kind.as_str(), "apply" | "propagate")
+            })
+            .last()
+            .cloned()
+    };
+    for (r, c) in &row.applied {
+        if let Some(o) = applied_op(r) {
+            if o.incoming != *c {
+                return Err(format!("{r}: 적용 작업의 결과가 행의 상태와 다릅니다"));
+            }
         }
-        if op.expected == "absent" {
-            // a created target: the operation record is the evidence (nothing was displaced)
-            return Ok(true);
-        }
-        let Some(dir) = op.slot.as_deref() else {
-            continue;
-        };
+    }
+    let op = applied_op(rel).ok_or_else(|| "이 파일의 적용 작업 기록이 없습니다".to_string())?;
+    let incoming = parse_canon(&op.incoming).ok_or_else(|| "적용 작업의 상태를 읽을 수 없습니다".to_string())?;
+    let expected = parse_canon(&op.expected).unwrap_or(TargetState::Absent);
+    if expected != TargetState::Absent {
+        let dir = op.slot.as_deref().ok_or_else(|| "적용 작업에 보관 칸이 없습니다".to_string())?;
         let slot = Slot::at(dir, rel);
-        // (iv) the slot's metadata agrees with the operation's EXPECTED identity and state, and so
-        // does the verified deposit
-        let expected = parse_canon(&op.expected).unwrap_or(TargetState::Absent);
         let (want_sha, want_mode, want_link) = match &expected {
             TargetState::File { sha256, mode } => (sha256.clone(), *mode, serde_json::Value::Null),
             TargetState::Link { target } => (String::new(), 0, serde_json::json!(target)),
@@ -1756,88 +1786,48 @@ pub fn approved_copy_of_current_generation_in(
                     && v["mode"] == want_mode
                     && v["link_target"] == want_link
             });
-        let identity_ok = match (&op.live_identity, &expected) {
-            (Some(i), TargetState::File { sha256, .. }) => i.sha256 == *sha256,
-            _ => true,
-        };
-        if pre_ok && identity_ok && vault::deposit_of(&slot).is_ok_and(|(st, _)| st == expected) {
-            return Ok(true);
+        if !pre_ok {
+            return Err("보관 칸의 기록이 적용 작업의 기대 상태와 다릅니다".into());
         }
-    }
-    Ok(false)
-}
-
-/// What the hourly scan knows about the owner-approved copy of `rel` for the CURRENT generation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ApprovedCopy {
-    /// No approved repair of this generation applied `rel` in this lane.
-    None,
-    /// The verified payload of the last approved copy slot.
-    Found(TargetState, PathBuf),
-    /// An approved repair of this generation applied `rel` here, but its copy cannot be verified —
-    /// the scan then puts NOTHING back for the file (CU2).
-    Unverifiable(RepairId),
-}
-
-/// CU2 — the approved copy of the CURRENT generation for `rel` in this lane (§6-10 (2) "마지막
-/// 승인본 저장소"): the NEWEST approved boot-critical / protection-related repair whose row is bound
-/// to the current generation and applied `rel` here — in force, OR whose probation was closed as
-/// superseded by a later change of the live file (the owner's approval of this generation still
-/// stands); a repair that was reverted or failed no longer counts. Its applied operation's copy slot
-/// must verify (identity + state); otherwise `Unverifiable`.
-pub fn approved_copy_resolution_in(root: &Path, pack: &Path, lane: &LaneKey, rel: &str) -> ApprovedCopy {
-    let gen = pack_generation(pack);
-    for id in ledger::list_ids_in(root).into_iter().rev() {
-        let Ok(Some(rec)) = ledger::read_record_in(root, &id) else {
-            continue;
-        };
-        if !is_approval_class(rec.classification) || !rec.approval.as_ref().is_some_and(|a| a.approved) {
-            continue;
-        }
-        let Ok(Some(row)) = ledger::read_lane_in(root, &id, lane) else {
-            continue;
-        };
-        let Some(p) = row.probation.as_ref() else {
-            continue;
-        };
-        if p.pack_generation != gen.version || p.pro_revision != gen.pro_revision {
-            continue;
-        }
-        let stands = match p.closed.as_deref() {
-            None => matches!(rec.state, RepairState::Probation | RepairState::InUse),
-            Some(c) => c.starts_with("사용 중") || c.starts_with("대체됨"),
-        };
-        if !stands || !row.applied.iter().any(|(r, _)| r == rel) {
-            continue;
-        }
-        // a ledger row alone is never evidence (F9): without the daemon's finished apply operation the
-        // row is not an approved apply at all
-        let Some(op) = applied_op_for(root, &id, lane, rel) else {
-            continue;
-        };
-        let (Some(dir), Some(want)) = (op.incoming_copy.as_ref(), op.incoming_copy_identity.as_ref()) else {
-            return ApprovedCopy::Unverifiable(id);
-        };
-        let slot = Slot::at(dir, rel);
-        match TargetState::read(&slot.payload()) {
-            Ok(st) if identity_of(&slot.payload()).ok().as_ref() == Some(want) && parse_canon(&op.incoming) == Some(st.clone()) => {
-                return ApprovedCopy::Found(st, slot.payload());
+        if let (Some(i), TargetState::File { sha256, .. }) = (&op.live_identity, &expected) {
+            if i.sha256 != *sha256 {
+                return Err("적용 작업이 기록한 정체가 기대 상태와 다릅니다".into());
             }
-            _ => return ApprovedCopy::Unverifiable(id),
+        }
+        if !vault::deposit_of(&slot).is_ok_and(|(st, _)| st == expected) {
+            return Err("보관 칸의 내용을 확인할 수 없습니다".into());
         }
     }
-    ApprovedCopy::None
+    let (Some(dir), Some(want)) = (op.incoming_copy.as_ref(), op.incoming_copy_identity.as_ref()) else {
+        return Err("승인본 칸이 기록되어 있지 않습니다".into());
+    };
+    let copy = Slot::at(dir, rel);
+    match TargetState::read(&copy.payload()) {
+        Ok(st) if st == incoming && identity_of(&copy.payload()).ok().as_ref() == Some(want) => Ok((st, copy.payload())),
+        _ => Err("승인본 칸을 확인할 수 없습니다".into()),
+    }
 }
 
-/// [`approved_copy_resolution_in`] as the verified copy only.
+/// F9 recognition through THE resolution (DR2): the live state of `rel` IS the approved copy.
+pub fn approved_copy_of_current_generation_in(
+    root: &Path,
+    pack: &Path,
+    lane: &LaneKey,
+    rel: &str,
+) -> Result<bool, RepairError> {
+    let live = TargetState::read(&pack.join(rel))?;
+    Ok(matches!(resolve_approved_copy_in(root, pack, lane, rel), ApprovedCopy::Approved { state, .. } if state == live))
+}
+
+/// [`resolve_approved_copy_in`] as the verified copy only.
 pub fn approved_copy_source_in(
     root: &Path,
     pack: &Path,
     lane: &LaneKey,
     rel: &str,
 ) -> Option<(TargetState, PathBuf)> {
-    match approved_copy_resolution_in(root, pack, lane, rel) {
-        ApprovedCopy::Found(st, p) => Some((st, p)),
+    match resolve_approved_copy_in(root, pack, lane, rel) {
+        ApprovedCopy::Approved { state, holder, .. } => Some((state, holder)),
         _ => None,
     }
 }

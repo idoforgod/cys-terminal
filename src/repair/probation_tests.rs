@@ -345,7 +345,11 @@ fn m10_scan_rules() {
     assert_eq!(std::fs::read(r.pack.join(rel)).unwrap(), b"#!/bin/bash\nbroken(\n");
 }
 
-/// F9 at M10: a planted ledger row does NOT stop the revert of a failing file.
+/// F9 at M10 with a planted ledger row (REWRITTEN under RULINGS DR2 — old expectation: "a planted
+/// ledger row does NOT stop the revert of a failing file", `assert_eq!(live, orig)`). A row of this
+/// generation that claims the file without the daemon's operation log is INCONSISTENT evidence: the
+/// one resolution answers UNKNOWN — the row never makes the file approved (the check runs), and
+/// nothing is put back; a finding goes to the worker.
 #[cfg(target_os = "macos")]
 #[test]
 fn m10_planted_row_still_reverted() {
@@ -365,8 +369,9 @@ fn m10_planted_row_still_reverted() {
     let fails = |x: &str, _: &Path, _: Duration| if x == rel { outcome(CheckResult::Fail("bad".into()), 5) } else { outcome(CheckResult::Pass, 5) };
     let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| true, excluded: &|_| false };
     let lock = r.base.join(".pack-apply.lock");
-    m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
-    assert_eq!(std::fs::read(r.pack.join(rel)).unwrap(), orig);
+    let f = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
+    assert_ne!(std::fs::read(r.pack.join(rel)).unwrap(), orig, "nothing put back on unknown evidence");
+    assert!(f.iter().any(|x| x.rel == rel && x.kind == "approval-unknown"), "{f:?}");
 }
 
 /// D-11-08: the file changed between the check and the put-back → no exchange, the new bytes stay.
@@ -897,7 +902,8 @@ fn the_scan_never_puts_back_less_than_the_approved_copy() {
         let live = std::fs::read(r.pack.join(rel)).unwrap();
         if tamper {
             assert_eq!(live, b"#!/bin/bash\nbroken(\n", "nothing put back when the approved copy cannot be verified");
-            assert!(f.iter().any(|x| x.kind == "approved-copy-unverifiable"), "{f:?}");
+            // DR2 (old expectation of this CU2 test: kind "approved-copy-unverifiable"): UNKNOWN
+            assert!(f.iter().any(|x| x.kind == "approval-unknown"), "{f:?}");
         } else {
             assert_eq!(live, b"#!/bin/bash\necho approved\n", "the APPROVED copy, never the vendor original");
         }
@@ -1000,4 +1006,77 @@ fn a_finding_is_notified_once_for_ever() {
     assert_eq!(f.len(), 1, "{f:?}");
     let f = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW + 5.0 * 3600.0, &lock)).unwrap();
     assert!(f.is_empty(), "never again: {f:?}");
+}
+
+// ───────────────────────────── RULINGS DR2 — one resolution, three answers ─────────────────────────────
+
+/// DR2: starting from a genuine applied approved repair, each member of the agreement broken ON ITS
+/// OWN — the approval fingerprint, the approval reference, the deposit metadata, a corrupt record, a
+/// corrupt lane row, an unreadable operation log — makes the ONE resolution answer UNKNOWN on BOTH
+/// paths: recognition (the approved bytes live are not taken as approved — the check runs) and
+/// restoration (a failing file: nothing is put back, neither the approved copy nor the vendor
+/// original; a finding). Without DR2 the second resolver still returned the copy or fell open to
+/// the vendor original.
+#[cfg(target_os = "macos")]
+#[test]
+fn every_broken_member_makes_the_approved_copy_unknown_on_both_paths() {
+    let Some(rel) = listed() else {
+        return;
+    };
+    for member in ["fingerprint", "reference", "metadata", "record", "row", "oplog"] {
+        let r = rig("dr2member");
+        let id = rid("R-22");
+        crate::repair::apply::tests::approved_and_applied(&r, &id, rel, b"#!/bin/bash\necho vendor\n", b"#!/bin/bash\necho approved\n");
+        match member {
+            "fingerprint" => {
+                let mut rec = ledger::read_record_in(&r.root, &id).unwrap().unwrap();
+                rec.approval.as_mut().unwrap().fingerprint_sha256 = "0".repeat(64);
+                ledger::write_record_in(&r.root, &rec).unwrap();
+            }
+            "reference" => {
+                let mut row = ledger::read_lane_in(&r.root, &id, &r.lane).unwrap().unwrap();
+                row.approval_ref = Some("rqr-other".into());
+                ledger::write_lane_in(&r.root, &row).unwrap();
+            }
+            "metadata" => {
+                let (ops, _) = crate::repair::wal::list_in(&r.root, &id);
+                let op = ops.iter().find(|o| o.kind == "apply" && o.outcome.as_deref() == Some("applied")).unwrap();
+                let slot = crate::repair::vault::Slot::at(op.slot.as_ref().unwrap(), rel);
+                let mut pre: serde_json::Value = serde_json::from_slice(&std::fs::read(slot.meta_pre()).unwrap()).unwrap();
+                pre["sha256"] = serde_json::json!("f".repeat(64));
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(slot.meta_pre(), std::fs::Permissions::from_mode(0o644)).unwrap();
+                std::fs::write(slot.meta_pre(), serde_json::to_vec(&pre).unwrap()).unwrap();
+            }
+            "record" => std::fs::write(ledger::record_path_in(&r.root, &id), b"{ corrupt").unwrap(),
+            "row" => std::fs::write(ledger::lane_path_in(&r.root, &id, &r.lane), b"{ corrupt").unwrap(),
+            _ => {
+                let (ops, _) = crate::repair::wal::list_in(&r.root, &id);
+                let op = ops.iter().find(|o| o.kind == "apply" && o.outcome.as_deref() == Some("applied")).unwrap();
+                std::fs::write(crate::repair::wal::op_path_in(&r.root, &id, &op.op), b"{ unreadable").unwrap();
+            }
+        }
+        assert!(matches!(crate::repair::apply::resolve_approved_copy_in(&r.root, &r.pack, &r.lane, rel), crate::repair::apply::ApprovedCopy::Unknown(_)), "{member}");
+        // recognition: the approved bytes live are not "approved" — the check runs
+        assert!(!crate::repair::apply::approved_copy_of_current_generation_in(&r.root, &r.pack, &r.lane, rel).unwrap(), "{member}: recognised");
+        let checked = RefCell::new(0);
+        let pass = |x: &str, _: &Path, _: Duration| {
+            if x == rel {
+                *checked.borrow_mut() += 1;
+            }
+            outcome(CheckResult::Pass, 5)
+        };
+        let orig_of = |_: &str| Some(b"#!/bin/bash\necho vendor\n".to_vec());
+        let lock = r.base.join(".pack-apply.lock");
+        let d = Doubles { check: &pass, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| true, excluded: &|_| false };
+        m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW, &lock)).unwrap();
+        assert!(*checked.borrow() >= 1, "{member}: no check is skipped");
+        // restoration: a failing file — nothing put back
+        r.put(rel, b"#!/bin/bash\nbroken(\n", 0o755);
+        let fails = |x: &str, _: &Path, _: Duration| if x == rel { outcome(CheckResult::Fail("bad".into()), 5) } else { outcome(CheckResult::Pass, 5) };
+        let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &orig_of, intake: &|_, _| true, excluded: &|_| false };
+        let f = m10_sweep(&job(&r, &d, ApplyForm::Exchange, NOW + 3600.0, &lock)).unwrap();
+        assert_eq!(std::fs::read(r.pack.join(rel)).unwrap(), b"#!/bin/bash\nbroken(\n", "{member}: nothing put back");
+        assert!(f.iter().any(|x| x.rel == rel && x.kind == "approval-unknown"), "{member}: {f:?}");
+    }
 }
