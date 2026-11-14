@@ -165,6 +165,35 @@ fn hook_replay_judged_by_output_and_markers() {
     replay::remove_tree(&r).expect("the test's scratch folder is removed");
 }
 
+/// RULINGS GA1 — the rehearsal's hook replay reads its answer from THE judge: a hook whose standard
+/// output or standard error goes past the capture limit (a syntax-error line hidden behind the cut,
+/// exit 0) is not observed whole and FAILS. (The old replay read exit 0, found no marker in the kept
+/// prefix and passed both.)
+#[test]
+fn hook_replay_fails_on_output_not_observed_whole() {
+    let r = root("ga1-hook");
+    let lib = replay::released_text("hooks/_lib.sh").unwrap();
+    put(&r, "hooks/_lib.sh", lib);
+    let pad = replay::MAX_CAPTURE + 4096;
+    for (name, script) in [
+        (
+            "stdout",
+            format!("#!/bin/sh\ncat >/dev/null\nhead -c {pad} /dev/zero | tr '\\000' ' '\nprintf 'x'\nexit 0\n"),
+        ),
+        (
+            "stderr",
+            format!("#!/bin/sh\ncat >/dev/null\nhead -c {pad} /dev/zero | tr '\\000' ' ' >&2\necho 'line 9: syntax error: unexpected end of file' >&2\nexit 0\n"),
+        ),
+    ] {
+        put(&r, "hooks/role-capability-gate.sh", &script);
+        match run_check(&req(&r, "hooks/role-capability-gate.sh")).unwrap() {
+            CheckResult::Fail(m) => assert!(m.contains("끝까지 보지 못했습니다"), "{name}: {m}"),
+            other => panic!("{name}: a hook whose output was cut passed the replay: {other:?}"),
+        }
+    }
+    replay::remove_tree(&r).expect("the test's scratch folder is removed");
+}
+
 /// A child that outlives the deadline is killed with its whole process group and reaped.
 #[test]
 fn timeout_kills_and_reaps_the_group() {

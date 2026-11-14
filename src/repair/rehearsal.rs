@@ -382,14 +382,6 @@ fn broken_marker(stderr: &[u8]) -> Option<String> {
     None
 }
 
-fn hook_stdout_is_json(b: &[u8]) -> bool {
-    String::from_utf8_lossy(b)
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .all(|l| serde_json::from_str::<serde_json::Value>(l).is_ok())
-}
-
 /// One executed run of a hook / self-test inside a fresh copy of `root` (replay rules).
 fn run_in_copy(
     root: &Path,
@@ -519,14 +511,22 @@ fn executed(
                         "{rel}: 훅을 시작하지 못했습니다 — {e}"
                     )));
                 }
+                // RULINGS GA1: the answer is read by THE judge; an output not observed whole is no
+                // answer (a line in a cut standard error proves nothing either way)
+                let reading = replay::judge_hook(&o);
+                if !reading.stderr_whole || reading.printed.is_none() {
+                    return Ok(CheckResult::Fail(format!(
+                        "{rel}({ev}): 훅의 출력을 끝까지 보지 못했습니다(상한을 넘었거나 읽기 오류) — 확인할 수 없는 것은 통과가 아닙니다"
+                    )));
+                }
                 if let Some(m) = broken_marker(&o.stderr) {
                     return Ok(CheckResult::Fail(format!(
                         "{rel}({ev}): 훅이 깨졌습니다 — {m}"
                     )));
                 }
-                if !matches!(o.code, Some(0) | Some(2)) {
+                if let replay::HookAnswer::NotShown(why) = &reading.answer {
                     return Ok(CheckResult::Fail(format!(
-                        "{rel}({ev}): 훅이 비정상으로 끝났습니다(종료 {:?}) — {}",
+                        "{rel}({ev}): 훅이 비정상으로 끝났습니다(종료 {:?}: {why}) — {}",
                         o.code.or(o.signal),
                         tail(&o.stderr)
                     )));
@@ -542,18 +542,18 @@ fn executed(
                     if let Some(f) = left_behind(&r, rel, "출시본 훅 재생") {
                         return Ok(f);
                     }
-                    if r.code == Some(0) || r.code == Some(2) {
-                        let r_out = !String::from_utf8_lossy(&r.stdout).trim().is_empty();
-                        let c_out = !String::from_utf8_lossy(&o.stdout).trim().is_empty();
-                        if r_out && !c_out {
+                    // RULINGS GA1: both outputs as THE judge read them (the released run compared
+                    // only when it answered with an output observed whole)
+                    let rr = replay::judge_hook(&r);
+                    let answered = !matches!(rr.answer, replay::HookAnswer::NotShown(_));
+                    if let (true, Some(r_p), Some(c_p)) = (answered, rr.printed, reading.printed) {
+                        use replay::Printed as P;
+                        if r_p != P::Nothing && c_p == P::Nothing {
                             return Ok(CheckResult::Fail(format!(
                                 "{rel}({ev}): 기대한 출력이 없습니다(출시본은 같은 입력에 출력을 냅니다)"
                             )));
                         }
-                        if r_out
-                            && hook_stdout_is_json(&r.stdout)
-                            && !hook_stdout_is_json(&o.stdout)
-                        {
+                        if r_p == P::Json && c_p == P::Text {
                             return Ok(CheckResult::Fail(format!(
                                 "{rel}({ev}): 출력이 JSON 이 아닙니다(출시본은 JSON 을 냅니다)"
                             )));

@@ -850,77 +850,15 @@ fn probe_input(p: &Probe, map: &[(&str, String)], work: &Path) -> Vec<u8> {
     .into_bytes()
 }
 
-/// DENY = exit 2, or exit 0 with a deny payload; ALLOW = exit 0; ERROR = anything else (AY1, BD5).
+/// DENY = exit 2, or exit 0 with a deny payload; ALLOW = exit 0; ERROR = anything else (AY1, BD5) —
+/// RULINGS GA1: read by THE judge of every hook answer ([`replay::judge_hook`]), never here.
 fn answer_of(o: &replay::ChildOutcome) -> (Answer, String) {
-    if o.timed_out {
-        return (Answer::Error, "timeout".into());
+    match replay::judge_hook(o).answer {
+        replay::HookAnswer::Block => (Answer::Deny, "exit 2".into()),
+        replay::HookAnswer::DenyObject => (Answer::Deny, "exit 0 + deny payload".into()),
+        replay::HookAnswer::Pass => (Answer::Allow, "exit 0".into()),
+        replay::HookAnswer::NotShown(why) => (Answer::Error, why),
     }
-    // RULINGS CZ4: a run that left a process or a held pipe behind is not measurable
-    if let Some(why) = o.left_something() {
-        return (Answer::Error, why);
-    }
-    if let Some(e) = &o.spawn_error {
-        return (Answer::Error, format!("spawn: {e}"));
-    }
-    match o.code {
-        Some(2) => (Answer::Deny, "exit 2".into()),
-        Some(0) => {
-            // RULINGS EL1: an answer is judged only when it was observed WHOLE — an output that hit
-            // the cap or whose read failed is never a DENY-by-JSON, and it is no ALLOW either
-            if !o.stdout_whole() {
-                (Answer::Error, format!("exit 0, output not observed whole ({:?})", o.stdout_state))
-            } else if deny_payload(&o.stdout) {
-                (Answer::Deny, "exit 0 + deny payload".into())
-            } else {
-                (Answer::Allow, "exit 0".into())
-            }
-        }
-        Some(c) => (Answer::Error, format!("exit {c}")),
-        None => (Answer::Error, format!("signal {:?}", o.signal)),
-    }
-}
-
-/// RULINGS DF1 / EO1 — DENY-by-JSON is a BYTE GRAMMAR, not a trim: the output must be, byte for
-/// byte, optional JSON white space (0x20 0x09 0x0A 0x0D) + ONE object of exactly the shape the
-/// released devices print — the only top-level key `hookSpecificOutput`, an object whose keys are
-/// exactly `hookEventName` = `PreToolUse`, `permissionDecision` = `deny` and
-/// `permissionDecisionReason`, every value a string, no key twice — + optional JSON white space.
-/// Anything else (another white space such as U+0085, U+00A0 or U+FEFF, a second object, another
-/// key, another value type) is "not shown".
-pub(crate) fn deny_payload(stdout: &[u8]) -> bool {
-    let json_ws = |b: &u8| matches!(*b, b' ' | b'\t' | b'\n' | b'\r');
-    let start = stdout.iter().position(|b| !json_ws(b)).unwrap_or(stdout.len());
-    let end = stdout.iter().rposition(|b| !json_ws(b)).map_or(start, |i| i + 1);
-    let body = &stdout[start..end];
-    if body.first() != Some(&b'{') {
-        return false;
-    }
-    // a key twice is a shape the devices never print (a parser would keep one of them)
-    let text = String::from_utf8_lossy(body);
-    for key in [
-        "\"hookSpecificOutput\"",
-        "\"hookEventName\"",
-        "\"permissionDecision\"",
-        "\"permissionDecisionReason\"",
-    ] {
-        if text.matches(key).count() > 1 {
-            return false;
-        }
-    }
-    let Ok(serde_json::Value::Object(top)) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return false;
-    };
-    if top.len() != 1 {
-        return false;
-    }
-    let Some(serde_json::Value::Object(h)) = top.get("hookSpecificOutput") else {
-        return false;
-    };
-    let keys: BTreeSet<&str> = h.keys().map(String::as_str).collect();
-    keys == BTreeSet::from(["hookEventName", "permissionDecision", "permissionDecisionReason"])
-        && h.values().all(|v| v.is_string())
-        && h.get("hookEventName").and_then(|v| v.as_str()) == Some("PreToolUse")
-        && h.get("permissionDecision").and_then(|v| v.as_str()) == Some("deny")
 }
 
 /// The budget counter file the gate keeps for a session (`<state>/capgate/<sha256(sid)[:32]>.calls`,
@@ -1273,9 +1211,13 @@ fn run_backstop_probe(
             let o = r.run(&argv, &env, &work, &probe_input(probe, &map, &work));
             drop(sock);
             r.plan.record(replay::observed_whole(&o));
+            // RULINGS GA1: the answer from the judge; the marker lines only from a standard error the
+            // judge says was observed whole
+            let whole_err = replay::judge_hook(&o).stderr_whole;
             let err = String::from_utf8_lossy(&o.stderr).into_owned();
-            let marker_ok = active || err.lines().any(|l| l.trim_end() == BACKSTOP_MARKER);
-            let reason_ok = err.lines().any(|l| l.trim_end() == reason);
+            let marker_ok =
+                whole_err && (active || err.lines().any(|l| l.trim_end() == BACKSTOP_MARKER));
+            let reason_ok = whole_err && err.lines().any(|l| l.trim_end() == reason);
             let (a, d) = answer_of(&o);
             Ok(if marker_ok && reason_ok && a == Answer::Deny {
                 Judged {
