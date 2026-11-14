@@ -388,29 +388,16 @@ fn census_i_every_class_has_a_probe_in_every_cell() {
 /// released device's deny rules or environment branches without a table review fails here.
 #[test]
 fn census_iii_deny_rules_and_branches_pinned() {
-    let frees_of = |rel: &str| -> Vec<(&'static str, &'static str)> {
-        CENSUS_PINS
-            .iter()
-            .filter(|p| p.0 == rel && p.1 == "free")
-            .map(|p| (p.2, p.3))
-            .collect()
-    };
     let mut actual = Vec::new();
     let mut differs = Vec::new();
-    for (rel, kind, _, _, n, digest) in CENSUS_PINS {
-        if *kind != "pin" {
-            assert_eq!(*kind, "free", "{rel}: a row is a pin or a free region");
-            continue;
-        }
-        match corpus::census_pinned(&released(rel), &frees_of(rel)) {
-            Ok((an, ad)) => {
-                actual.push(format!("({rel:?}, {an}, {ad:?})"));
-                assert!(an > 100, "{rel}: only {an} pinned lines");
-                if (an, ad.as_str()) != (*n, *digest) {
-                    differs.push(format!("{rel} ({n} → {an} lines)"));
-                }
-            }
-            Err(e) => differs.push(format!("{rel}: {e}")),
+    for (rel, kind, start, end, n, digest) in CENSUS_PINS {
+        // RULINGS GA7: every row pins a WHOLE file — no free region (old: `kind` was "pin" or "free")
+        assert_eq!((*kind, *start, *end), ("pin", "", ""), "{rel}: a row pins the whole file");
+        let (an, ad) = corpus::census_pinned(&released(rel));
+        actual.push(format!("({rel:?}, {an}, {ad:?})"));
+        assert!(an > 100, "{rel}: only {an} pinned lines");
+        if (an, ad.as_str()) != (*n, *digest) {
+            differs.push(format!("{rel} ({n} → {an} lines)"));
         }
     }
     assert!(
@@ -420,13 +407,13 @@ fn census_iii_deny_rules_and_branches_pinned() {
         differs.join(", "),
         actual.join(", ")
     );
-    // every pinned device has its pin row; every free row's device has one too
+    // every pinned device has exactly one pin row
     for rel in ["hooks/guard.sh", "hooks/role-capability-gate.sh", "hooks/_lib.sh"] {
-        assert!(CENSUS_PINS.iter().any(|p| p.0 == rel && p.1 == "pin"), "{rel} unpinned");
+        assert_eq!(CENSUS_PINS.iter().filter(|p| p.0 == rel).count(), 1, "{rel} pinned once");
     }
-    // RULINGS EL6 / EO3 / CZ7 — mutation controls both ways
-    let digest = |rel: &str, text: &str| corpus::census_pinned(text, &frees_of(rel));
-    let cases: [(&str, &str, &str, bool); 11] = [
+    // RULINGS EL6 / EO3 / CZ7 / GA7 — mutation controls: every edit changes the digest
+    let digest = |_rel: &str, text: &str| corpus::census_pinned(text);
+    let cases: [(&str, &str, &str, bool); 12] = [
         // the gate's dispatch: main() replaced by pass — outside every named region before EL6
         ("hooks/role-capability-gate.sh", "    main()\nPYEOF", "    pass\nPYEOF", true),
         // the CAPGATE_SELF_TEST branch
@@ -487,12 +474,21 @@ fn census_iii_deny_rules_and_branches_pinned() {
             "# _lib.sh — cysjavis 훅 공용 머리말",
             true,
         ),
-        // the only free region: the gate's self-test body
+        // RULINGS GA7: the gate's self-test body is pinned too (old expectation: `false` — EL6's
+        // only free region)
         (
             "hooks/role-capability-gate.sh",
             "# ── ① reviewer/planner(종전 핀 · 무변경)",
             "# ── ① reviewer/planner(종전 핀)",
-            false,
+            true,
+        ),
+        // RULINGS GA7: a top-level statement at column 0 between the self-tests and the dispatch —
+        // the reviewer's mutation, which EL6's free region accepted
+        (
+            "hooks/role-capability-gate.sh",
+            "\nif os.environ.get(\"CAPGATE_SELF_TEST\"):",
+            "\nmain = lambda: None\nif os.environ.get(\"CAPGATE_SELF_TEST\"):",
+            true,
         ),
     ];
     for (rel, from, to, changes) in cases {
@@ -501,10 +497,11 @@ fn census_iii_deny_rules_and_branches_pinned() {
         let m = t.replacen(from, to, 1);
         assert_eq!(digest(rel, &t) != digest(rel, &m), changes, "{rel}: {from:?} → {to:?}");
     }
-    // a doubled free-region anchor is an error, never a guess
+    // (GA7: no anchors remain — old assertion: a doubled free-region anchor made `census_pinned` an
+    // error; the doubled line now simply changes the digest)
     let g = released("hooks/role-capability-gate.sh");
     let doubled = g.replacen("def self_test():", "def self_test():\ndef self_test():", 1);
-    assert!(corpus::census_pinned(&doubled, &frees_of("hooks/role-capability-gate.sh")).is_err());
+    assert_ne!(corpus::census_pinned(&doubled), corpus::census_pinned(&g));
 }
 
 /// RULINGS DF5: an I4 anchor that occurs twice gives no region (never the first copy's).
