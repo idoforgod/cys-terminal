@@ -54,7 +54,7 @@ hostinger-ftp.env·license.json)까지 파괴한다.
 ## 3. 대상 인벤토리 (2026-08-16 소스·실기기 전수 조사 근거)
 
 격리(Quarantine):
-- `~/.cys/`: pack, pack.prev, .pack-staging*, .pack-download, .pack-journal,
+- `~/.cys/`: pack, pack.prev, .pack-staging*, .pack-download, .pack-journal, .pack-journal.d,
   .pack-accepted.json, .pack-apply.lock, .pack-reinject-pending.json, pack-dept-*,
   claude, claude-*, state, state-generations, state-harness, _round, transfers, feedback,
   depts.json(+.lock), dept-catalog.json(+.lock), dept-missions, dept-snapshots,

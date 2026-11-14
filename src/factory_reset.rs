@@ -16,11 +16,12 @@ use std::path::{Path, PathBuf};
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// ~/.cys 직하에서 격리하는 정확 이름. (pack·조직 레지스트리·상태·마커·토글 전부)
-const CYS_BASE_EXACT: [&str; 27] = [
+const CYS_BASE_EXACT: [&str; 28] = [
     "pack",
     "pack.prev",
     ".pack-download",
     ".pack-journal",
+    ".pack-journal.d", // ★T9 stage 2 (RULINGS GX1/GX7): every lane's own pack-update journal (crate::pack::PACK_JOURNAL_ROOT)
     ".pack-accepted.json",
     ".pack-apply.lock",
     ".pack-reinject-pending.json",
@@ -2668,6 +2669,21 @@ mod tests {
         r
     }
 
+    /// ★T9 stage 2 (RULINGS GX7): a factory reset quarantines the lanes' journal folder like every known top-level name.
+    #[test]
+    fn t9_plan_quarantines_the_lane_journal_folder() {
+        let td = test_home("plan-journal-d");
+        let r = fake_roots(&td);
+        mk(&r.temp);
+        mk(&r.cys_base.join(".pack-journal.d/pack-dept-d1/files"));
+        let plan = build_plan(&r, &ResetOptions { purge_license: false, purge_local: false, purge_round: false });
+        let q: Vec<String> = plan.quarantine.iter().map(|i| norm(&i.path)).collect();
+        let k: Vec<String> = plan.keep.iter().map(|i| norm(&i.path)).collect();
+        let _ = std::fs::remove_dir_all(&td);
+        assert!(q.iter().any(|p| p.ends_with(".cys/.pack-journal.d")), "{q:?}");
+        assert!(!k.iter().any(|p| p.ends_with(".cys/.pack-journal.d")), "{k:?}");
+    }
+
     #[test]
     fn plan_quarantines_known_state_and_keeps_owner_files() {
         let td = test_home("plan-known");
@@ -3994,6 +4010,9 @@ mod r2f_dm_factory_reset {
             assert_eq!(set.len(), list.len(), "{label} 에 중복 이름이 있다");
         }
         assert!(CYS_BASE_EXACT.iter().all(|n| !CYS_BASE_EXACT2.contains(n)), "두 ~/.cys 정확 이름 목록이 겹친다");
+        // ★T9 stage 2 (RULINGS GX7): the lanes' own journal folder is a known top-level name (and the legacy one stays).
+        assert!(CYS_BASE_EXACT.contains(&crate::pack::PACK_JOURNAL_ROOT), "레인별 팩 저널 폴더가 기본 격리 목록에 없다");
+        assert!(CYS_BASE_EXACT.contains(&".pack-journal"), "옛 공유 팩 저널 폴더가 기본 격리 목록에 없다");
     }
 
     /// (0.14.56 X-8 CARRIER) the spool leg's two daemon records and their atomic-write residues are Windows state - a factory
