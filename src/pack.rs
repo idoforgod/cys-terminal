@@ -7770,7 +7770,7 @@ pub fn install_staged(
 /// ★M15-다 / GX4 (0.15.0 「스스로 해결」 T9): the journal location of binaries BEFORE 0.15.0 — ONE folder shared by every
 /// lane (`<pack parent>/.pack-journal`). A journal there names neither its lane nor its apply, so guessing its owner is
 /// the defect itself (a department's start rolled the base's bytes into its own pack — stage-1 tests `m15_da_*`). No
-/// lane reads it into a pack, moves it or deletes it.
+/// lane reads it into a pack, moves it or deletes it; [`legacy_pack_journal_notice`] names it with the remedy.
 const PACK_JOURNAL_DIR: &str = ".pack-journal";
 
 /// ★GX1: the parent of every lane's OWN journal folder — `<pack parent>/.pack-journal.d/<lane>/`. A new name, so no
@@ -7808,6 +7808,20 @@ pub fn legacy_pack_journal_dir_for(pack: &Path) -> PathBuf {
         .map(|p| p.join(PACK_JOURNAL_DIR))
         .unwrap_or_else(|| PathBuf::from(PACK_JOURNAL_DIR))
 }
+
+/// ★GX4: one line naming a legacy journal beside `pack` with the remedy; `None` when there is none. A stat only.
+pub fn legacy_pack_journal_notice(pack: &Path) -> Option<String> {
+    let p = legacy_pack_journal_dir_for(pack);
+    std::fs::symlink_metadata(&p).ok()?;
+    Some(format!(
+        "이전 버전이 남긴 팩 업데이트 복구 기록 {} — 어느 레인의 것인지 적혀 있지 않아 어떤 레인도 되돌리거나 \
+         옮기거나 지우지 않습니다(그대로 보존). 해결: 팩 업데이트를 다시 실행하십시오.",
+        p.display()
+    ))
+}
+
+/// The legacy notice is printed once per process (cysd's start, a pack update's two recovery calls).
+static LEGACY_JOURNAL_NAMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// ★GX3: who wrote a journal — pid + the process's native start time (µs since the epoch, as
 /// [`crate::process_observation`] reads it; `None` = it could not be read when the journal was written).
@@ -8133,7 +8147,7 @@ fn journal_text(path: &Path, what: &str) -> Result<String, String> {
 /// crash recovery(§7-⑤) of THIS lane's journal — called before a pack update and by cysd before its boot install
 /// (`src/bin/cysd/main.rs`, separate blocking pool, no lock — unchanged, OQ-H-11). ★M15-다 / 다-2 (0.15.0 T9, RULINGS
 /// GX1–GX5), in this order, and nothing ever waits:
-/// 1. GX4 — a legacy journal at the old shared location is never read, moved or deleted.
+/// 1. GX4 — a legacy journal at the old shared location is NAMED once (stderr) and never read, moved or deleted.
 /// 2. GX1 — only this lane's own folder is looked at; absent, or a folder with neither index nor writer (the writer
 ///    had not even recorded itself) = nothing to recover → `Ok(false)`, nothing touched.
 /// 3. GX3 — the writer (index, else `writer.json`) is observed once: still running, or liveness unknown → the journal
@@ -8148,6 +8162,11 @@ fn journal_text(path: &Path, what: &str) -> Result<String, String> {
 /// bounded and never blocks (`journal_text` / `read_start_meta`).
 pub fn recover_pack_journal() -> Result<bool, String> {
     let pack = pack_dir();
+    if let Some(notice) = legacy_pack_journal_notice(&pack) {
+        if !LEGACY_JOURNAL_NAMED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            eprintln!("[pack-journal] ⚠ {notice}");
+        }
+    }
     let jdir = pack_journal_dir_for(&pack);
     let index_path = jdir.join("index.json");
     let writer_path = jdir.join(JOURNAL_WRITER_FILE);
@@ -14626,6 +14645,56 @@ mod tests {
         assert_eq!(observe_writer(&me), WriterLife::Running);
         let gone = serde_json::from_value::<JournalWriter>(t9_finished_writer()).unwrap();
         assert_eq!(observe_writer(&gone), WriterLife::Gone);
+    }
+
+    /// GX4: a journal at the OLD shared location (an older binary's, no lane, no apply id) is touched by no lane — not
+    /// by the base's or a department's recovery, not by a new pack update — and both lanes name it with the remedy.
+    #[test]
+    fn t9_legacy_shared_journal_is_touched_by_no_lane_and_named() {
+        let _g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = m15da_root("t9-legacy");
+        let base = m15da_lane(&root, "pack", "0.15.0", M15DA_BASE, &[], None);
+        let dept = m15da_lane(&root, "pack-dept-d1", "0.15.0", M15DA_DEPT, M15DA_SIDECARS, None);
+        let legacy = root.join(PACK_JOURNAL_DIR);
+        std::fs::create_dir_all(legacy.join("files/bin")).unwrap();
+        std::fs::write(legacy.join("files/bin/selfheal.sh"), "#!/bin/sh\necho selfheal-v0\n").unwrap();
+        std::fs::write(
+            legacy.join("index.json"),
+            r#"{"target_version":"0.15.1","entries":[{"rel":"bin/selfheal.sh","existed":true},{"rel":"bin/new-in-v2.sh","existed":false}]}"#,
+        )
+        .unwrap();
+        let _env = set_pack_env(&base, root.join("cfg"));
+        let legacy_before = m15da_state(&legacy);
+        let base_before = m15da_state(&base);
+        let dept_before = m15da_state(&dept);
+        let base_rec = recover_pack_journal();
+        let dept_rec = {
+            let _e = EnvGuard::set(ENV_PACK_DIR, &dept);
+            recover_pack_journal()
+        };
+        let base_after_rec = m15da_state(&base);
+        let update = apply_pack_transactional(&m15da_v2_items(M15DA_BASE), "0.15.1", &test_free_state("0.15.1"), None, || Ok(()));
+        let legacy_after = m15da_state(&legacy);
+        let dept_after = m15da_state(&dept);
+        let notice_base = legacy_pack_journal_notice(&base);
+        let notice_dept = legacy_pack_journal_notice(&dept);
+        let base_new_journal = pack_journal_dir();
+        drop(_env);
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(base_rec, Ok(false), "the base's recovery must not act on the legacy journal");
+        assert_eq!(dept_rec, Ok(false), "the department's recovery must not act on the legacy journal");
+        assert!(m15da_diff(&base_before, &base_after_rec).is_empty(), "the base pack changed at recovery");
+        assert!(m15da_diff(&dept_before, &dept_after).is_empty(), "the department pack changed");
+        assert!(update.is_ok(), "a new pack update must still work beside a legacy journal: {update:?}");
+        assert_eq!(legacy_before, legacy_after, "the legacy journal was touched");
+        assert!(!legacy_after.is_empty());
+        assert_ne!(base_new_journal, legacy, "the new journal must not be the legacy folder");
+        for n in [&notice_base, &notice_dept] {
+            let n = n.as_deref().expect("the legacy journal must be named");
+            assert!(n.contains(&legacy.display().to_string()), "{n}");
+            assert!(n.contains("팩 업데이트를 다시 실행"), "the remedy is missing: {n}");
+        }
     }
 
     /// GX1: every lane's journal is its own folder under `.pack-journal.d`, never the legacy shared folder.

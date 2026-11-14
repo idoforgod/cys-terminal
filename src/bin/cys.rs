@@ -9221,6 +9221,22 @@ fn diag_pack_version(ctx: &DoctorCtx) -> DiagItem {
 }
 
 fn diag_pack_state(ctx: &DoctorCtx) -> DiagItem {
+    let mut item = diag_pack_state_row(ctx);
+    // ★T9 stage 2 (RULINGS GX4): a journal at the old shared location (an older version's interrupted update) is named
+    //   here — read-only (a stat), with the remedy; no lane recovers it. Ok → Warn (doctor's exit code follows Fail only).
+    if let Some(notice) = cys::pack::legacy_pack_journal_notice(&ctx.pack_dir) {
+        if item.status == DiagStatus::Ok {
+            item.status = DiagStatus::Warn;
+        }
+        item.detail = format!("{} · ⚠ {notice}", item.detail);
+        if item.action.is_empty() {
+            item.action = "팩 업데이트를 다시 실행하십시오(그 기록은 지우지 않고 그대로 둡니다)".into();
+        }
+    }
+    item
+}
+
+fn diag_pack_state_row(ctx: &DoctorCtx) -> DiagItem {
     match cys::pack::read_pack_state(&ctx.pack_dir) {
         cys::pack::PackStateRead::Absent => DiagItem {
             name: "pack-state",
@@ -37908,6 +37924,30 @@ mod tests {
             "시드 확인 후에도 공용 오염이 남았다"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn doctor_pack_state_names_a_legacy_journal() {
+        // ★T9 stage 2 (RULINGS GX4): the pack-state row names an older version's journal at the old shared location —
+        // read-only (the folder is still there afterwards), Ok → Warn with the remedy; without one the row is unchanged.
+        let base = std::env::temp_dir().join(format!("cys-doc-legacy-journal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let ctx = doctor_ctx_at(&base);
+        std::fs::create_dir_all(&ctx.pack_dir).unwrap();
+        let plain = diag_pack_state(&ctx);
+        let legacy = ctx.state_base.join(".pack-journal");
+        std::fs::create_dir_all(legacy.join("files")).unwrap();
+        std::fs::write(legacy.join("index.json"), r#"{"target_version":"0.15.1","entries":[]}"#).unwrap();
+        let named = diag_pack_state(&ctx);
+        let still_there = legacy.join("index.json").is_file();
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(plain.status, DiagStatus::Ok);
+        assert!(!plain.detail.contains(".pack-journal"), "{}", plain.detail);
+        assert_eq!(named.status, DiagStatus::Warn);
+        assert!(named.detail.contains(&legacy.display().to_string()), "{}", named.detail);
+        assert!(named.detail.contains("팩 업데이트를 다시 실행"), "{}", named.detail);
+        assert!(!named.action.is_empty());
+        assert!(still_there, "the doctor row must not touch the legacy journal");
     }
 
     #[test]
