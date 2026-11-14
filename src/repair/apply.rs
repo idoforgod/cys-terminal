@@ -1449,9 +1449,13 @@ fn is_approval_class(c: Classification) -> bool {
 
 /// The latest finished, applied apply/propagation operation of `lane` for `rel` in repair `id` —
 /// its slot holds what that apply displaced (the lane's pre-image for a revert).
-fn applied_op_for(root: &Path, id: &RepairId, lane: &LaneKey, rel: &str) -> Option<OpRecord> {
-    let (ops, _) = wal::list_in(root, id);
-    ops.into_iter()
+/// FG1: the lane's last applied operation on `rel` — `Err` when the operation log cannot be read
+/// (never "no operation": that would choose another copy to put back).
+fn applied_op_for(root: &Path, id: &RepairId, lane: &LaneKey, rel: &str) -> Result<Option<OpRecord>, RepairError> {
+    let ops = wal::list_checked_in(root, id)
+        .map_err(|e| RepairError::Corrupt(format!("{rel}: 동작 기록을 읽을 수 없어 되돌릴 내용을 정할 수 없습니다 — {e}")))?;
+    Ok(ops
+        .into_iter()
         .filter(|r| {
             r.lane_key == *lane
                 && r.rel == rel
@@ -1459,7 +1463,7 @@ fn applied_op_for(root: &Path, id: &RepairId, lane: &LaneKey, rel: &str) -> Opti
                 && r.outcome.as_deref() == Some("applied")
                 && matches!(r.kind.as_str(), "apply" | "propagate")
         })
-        .last()
+        .last())
 }
 
 /// The bytes (file holding them) and state a revert puts back for `rel`: the deposit of this lane's
@@ -1482,7 +1486,7 @@ pub fn pre_image_slot_for(
     lane: &LaneKey,
     rel: &str,
 ) -> Result<(TargetState, Option<PathBuf>, Option<PathBuf>), RepairError> {
-    if let Some(op) = applied_op_for(root, &rec.id, lane, rel) {
+    if let Some(op) = applied_op_for(root, &rec.id, lane, rel)? {
         let want = parse_canon(&op.expected).unwrap_or(TargetState::Absent);
         if want == TargetState::Absent {
             return Ok((TargetState::Absent, None, None));

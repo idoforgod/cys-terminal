@@ -1503,9 +1503,47 @@ fn m10_recovery_errors_have_their_own_key() {
     let d = Doubles { check: &pass, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| true };
     let lock = r.base.join(".pack-apply.lock");
     let _ = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), false).unwrap();
-    let acks = load_acks(&r.root, &r.lane);
+    let acks = load_acks_checked(&r.root, &r.lane).unwrap();
     assert!(acks.contains_key(&format!("m10:{}:recovery-error", r.lane.0)), "{acks:?}");
     assert!(acks.contains_key("R-1:recovery-error"), "the real repair's own report: {acks:?}");
+}
+
+// ───────────────────────────── RULINGS FG1 — the job's own reads ─────────────────────────────
+
+/// FG1 (codex r4 B2) in the job: an unlistable repairs root is never "no repairs" — the probation
+/// pass stops with ONE report (`ledger:<lane>:repairs-root`) and stays due; an unreadable
+/// acknowledgement file is said, the report is still filed, and nothing is written over that file.
+/// Without FG1 the pass listed nothing and marked the probation done, and the acknowledgement file
+/// read as empty was overwritten.
+#[test]
+fn an_unlistable_root_and_unreadable_acknowledgements_are_reported() {
+    let r = rig("fg1job");
+    let a = rid("R-1");
+    committed_general(&r, &a, "hooks/j.sh", Some(b"PRE\n"), Some(b"POST\n"));
+    let pass = |_: &str, _: &Path, _: Duration| outcome(CheckResult::Pass, 5);
+    let d = Doubles { check: &pass, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &|_, _| true, excluded: &|_| true };
+    let lock = r.base.join(".pack-apply.lock");
+    crate::repair::ledger::FAIL_LIST_IDS.with(|c| c.set(true));
+    let rep = run_tick(&job(&r, &d, ApplyForm::Exchange, NOW, &lock), false);
+    crate::repair::ledger::FAIL_LIST_IDS.with(|c| c.set(false));
+    let rep = rep.unwrap();
+    assert!(rep.deferred_probation, "the probation stays due: {:?}", rep.lines);
+    let acks = load_acks_checked(&r.root, &r.lane).unwrap();
+    assert!(acks.contains_key(&format!("ledger:{}:repairs-root", r.lane.0)), "{acks:?}");
+    // the acknowledgement file corrupt: a new duty is filed and the file is left as it is
+    let p = acks_path_in(&r.root, &r.lane);
+    std::fs::write(&p, b"{ broken").unwrap();
+    let filed = RefCell::new(0u32);
+    let intake = |_: &str, _: &str| {
+        *filed.borrow_mut() += 1;
+        true
+    };
+    let fails = |_: &str, _: &Path, _: Duration| outcome(CheckResult::Fail("bad".into()), 5);
+    let d = Doubles { check: &fails, reference: &|_, _| outcome(CheckResult::Pass, 1), original: &|_| None, intake: &intake, excluded: &|_| true };
+    let rep = run_tick(&job(&r, &d, ApplyForm::DepositFirst, NOW + 700.0, &lock), false).unwrap();
+    assert!(*filed.borrow() >= 1, "filed: {:?}", rep.lines);
+    assert_eq!(std::fs::read(&p).unwrap(), b"{ broken", "nothing written over it");
+    assert!(rep.lines.iter().any(|l| l.contains("접수 확인 기록을 읽을 수 없습니다")), "{:?}", rep.lines);
 }
 
 // ───────────────────────────── RULINGS EK2 — a failed re-check is a fact from the moment it is measured ─────────────────────────────

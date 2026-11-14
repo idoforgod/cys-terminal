@@ -182,7 +182,16 @@ pub fn run_tick(env: &JobEnv<'_>, force_sweep: bool) -> Result<TickReport, Repai
         let (hk, hook_errors) = apply::resume_hook_steps_report_in(root, env.op.pack, lane, env.registrar, env.locked, now);
         n += hk;
         faults.extend(hook_errors);
-        if m10_root.exists() {
+        // FG1: the sub-ledger folder probed with three answers (absent = nothing to recover there)
+        let m10_present = match std::fs::symlink_metadata(&m10_root) {
+            Ok(_) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => {
+                m10_faults.push(format!("{}: 확인할 수 없음({e})", m10_root.display()));
+                false
+            }
+        };
+        if m10_present {
             match apply::resume_interrupted_report_in(&m10_env) {
                 Ok((k, errors)) => {
                     n += k;
@@ -227,7 +236,11 @@ pub fn run_tick(env: &JobEnv<'_>, force_sweep: bool) -> Result<TickReport, Repai
     if d.first_of_incarnation {
         match start_time_pass(env) {
             Ok(lines) => report.lines.extend(lines),
-            Err(e) => report.lines.push(format!("시작 때 정리를 다 하지 못했습니다 — 다음 시작 때 다시({e:?})")),
+            Err(e) => {
+                let line = format!("시작 때 정리를 다 하지 못했습니다 — 다음 시작 때 다시({e:?})");
+                report.lines.push(line.clone());
+                file_once(env, &format!("start:{}:error", lane.0), "repairs", &format!("자체 해결 작업이 {line}"), &mut report);
+            }
         }
         let swept = super::vault::sweep_stale_temps(root);
         if !swept.is_empty() {
@@ -248,7 +261,12 @@ pub fn run_tick(env: &JobEnv<'_>, force_sweep: bool) -> Result<TickReport, Repai
         }
         match swept {
             Ok(f) => report.m10 = f,
-            Err(e) => report.lines.push(format!("미승인 변경 검사를 마치지 못했습니다 — 다음 차례에 다시({e:?})")),
+            Err(e) => {
+                let line = format!("미승인 변경 검사를 마치지 못했습니다 — 다음 차례에 다시({e:?})");
+                report.lines.push(line.clone());
+                // FG1: an unreadable view / acknowledgement file stops the scan — a REPORTED fault
+                file_once(env, &format!("m10:{}:sweep-error", lane.0), &format!("m10/{}.json", lane.0), &format!("자체 해결 작업의 {line}"), &mut report);
+            }
         }
     }
     // DX3: work skipped for the lock is not marked done — the next tick retries it
@@ -271,17 +289,27 @@ fn acks_path_in(root: &Path, lane: &LaneKey) -> PathBuf {
     root.join("lanes").join(format!("{}.job-acks.json", lane.0))
 }
 
-fn load_acks(root: &Path, lane: &LaneKey) -> std::collections::BTreeMap<String, f64> {
-    std::fs::read(acks_path_in(root, lane))
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
+/// FG1: the acknowledgements with three answers (absent on positive evidence = none yet).
+fn load_acks_checked(root: &Path, lane: &LaneKey) -> Result<std::collections::BTreeMap<String, f64>, RepairError> {
+    Ok(read_json_checked::<std::collections::BTreeMap<String, f64>>(&acks_path_in(root, lane))?.unwrap_or_default())
 }
 
 /// Files the intake row of one duty `key` unless already acknowledged — at most once per tick; the
-/// acknowledgement is written only AFTER the intake accepted it.
+/// acknowledgement is written only AFTER the intake accepted it. FG1: an unreadable acknowledgement
+/// file is said in a line; the row is filed (the intake merges a repeat) and nothing is written over
+/// that file.
 fn file_once(env: &JobEnv<'_>, key: &str, rel: &str, line: &str, report: &mut TickReport) {
-    if report.intake_tried.iter().any(|k| k == key) || load_acks(env.op.root, env.op.lane).contains_key(key) {
+    if report.intake_tried.iter().any(|k| k == key) {
+        return;
+    }
+    let acks = match load_acks_checked(env.op.root, env.op.lane) {
+        Ok(a) => Some(a),
+        Err(e) => {
+            report.lines.push(format!("{key}: 접수 확인 기록을 읽을 수 없습니다 — 보고는 하되 확인은 적지 않습니다({e:?})"));
+            None
+        }
+    };
+    if acks.as_ref().is_some_and(|a| a.contains_key(key)) {
         return;
     }
     report.intake_tried.push(key.to_string());
@@ -289,7 +317,9 @@ fn file_once(env: &JobEnv<'_>, key: &str, rel: &str, line: &str, report: &mut Ti
         report.lines.push(format!("{key}: 보고가 아직 접수되지 않았습니다(한도 초과나 오류) — 다음 차례에 다시"));
         return;
     }
-    let mut acks = load_acks(env.op.root, env.op.lane);
+    let Some(mut acks) = acks else {
+        return;
+    };
     acks.insert(key.to_string(), env.op.now);
     if let Err(e) = super::durable::write_json_durable(&acks_path_in(env.op.root, env.op.lane), &acks) {
         report.lines.push(format!("{key}: 접수 확인을 적지 못했습니다 — 다음 차례에 같은 보고가 합쳐집니다({e:?})"));
@@ -377,24 +407,42 @@ pub fn start_time_pass(env: &JobEnv<'_>) -> Result<Vec<String>, RepairError> {
     let root = env.op.root;
     let lane = env.op.lane;
     let mut lines = Vec::new();
-    let mut recs: Vec<RepairRecord> = ledger::list_ids_in(root)
-        .into_iter()
-        .filter_map(|id| ledger::read_record_in(root, &id).ok().flatten())
-        .collect();
+    // FG1: an unlistable root is an error of the pass (reported by the tick); an unreadable record is
+    // said and skipped — never taken as absent
+    let mut recs: Vec<RepairRecord> = Vec::new();
+    for id in ledger::list_ids_checked_in(root)? {
+        match ledger::read_record_in(root, &id) {
+            Ok(Some(r)) => recs.push(r),
+            Ok(None) => {}
+            Err(e) => lines.push(format!("{}: 수리 기록을 읽을 수 없어 시작 때 정리에서 건너뜁니다({e:?})", id.as_str())),
+        }
+    }
     recs.sort_by(|a, b| b.id.cmp(&a.id)); // newest first (AK4 supersedes the older ones)
     for listed in &recs {
         // EJ4: the guard first (held → this repair is left alone), then the record re-read
         let Some(_guard) = super::guard::RepairGuard::try_take(root, &listed.id) else {
             continue;
         };
-        let Ok(Some(fresh)) = ledger::read_record_in(root, &listed.id) else {
-            continue;
+        let fresh = match ledger::read_record_in(root, &listed.id) {
+            Ok(Some(f)) => f,
+            Ok(None) => continue,
+            Err(e) => {
+                lines.push(format!("{}: 수리 기록을 읽을 수 없어 시작 때 정리에서 건너뜁니다({e:?})", listed.id.as_str()));
+                continue;
+            }
         };
         let rec = &fresh;
         if !in_force(rec) {
             continue;
         }
-        let row = ledger::read_lane_in(root, &rec.id, lane).ok().flatten();
+        // FG1: an unreadable row is never "no row" (that would reconstruct one over it)
+        let row = match ledger::read_lane_in(root, &rec.id, lane) {
+            Ok(r) => r,
+            Err(e) => {
+                lines.push(format!("{}: 이 부서의 행을 읽을 수 없어 시작 때 정리에서 건너뜁니다({e:?})", rec.id.as_str()));
+                continue;
+            }
+        };
         // (a) tombstones of committed deletions
         let applied: Vec<(String, String)> = if rec.origin_lane == *lane {
             rec.committed.clone()
@@ -411,11 +459,13 @@ pub fn start_time_pass(env: &JobEnv<'_>) -> Result<Vec<String>, RepairError> {
                     kind: super::tombstones::TombstoneKind::File,
                     repair: rec.id.clone(),
                 };
-                if super::tombstones::load_in(root, lane).is_ok_and(|ts| !ts.contains(&t)) {
-                    match super::tombstones::record_in(root, lane, &t) {
+                match super::tombstones::load_in(root, lane) {
+                    Ok(ts) if !ts.contains(&t) => match super::tombstones::record_in(root, lane, &t) {
                         Ok(()) => lines.push(format!("{}: 확정된 삭제의 묘비를 다시 세웠습니다 — {rel}", rec.id.as_str())),
                         Err(e) => lines.push(format!("{}: 묘비를 다시 세우지 못했습니다 — {rel}({e:?})", rec.id.as_str())),
-                    }
+                    },
+                    Ok(_) => {}
+                    Err(e) => lines.push(format!("{}: 묘비 목록을 읽을 수 없어 다시 세우지 않았습니다 — {rel}({e:?})", rec.id.as_str())),
                 }
             }
         }
@@ -476,8 +526,19 @@ pub fn start_time_pass(env: &JobEnv<'_>) -> Result<Vec<String>, RepairError> {
             ));
         }
         // (b1) the hook step of the committed repair, when its unregistration never finished
-        if ledger::hook_lines(rec).next().is_some() {
-            let (ops, _) = super::wal::list_in(root, &rec.id);
+        // FG1: an unreadable log is never "never attempted" (that would run the step again)
+        let hook_ops = if ledger::hook_lines(rec).next().is_some() {
+            match super::wal::list_checked_in(root, &rec.id) {
+                Ok(ops) => Some(ops),
+                Err(e) => {
+                    lines.push(format!("{}: 동작 기록을 읽을 수 없어 끊긴 훅 단계를 확인하지 않았습니다({e})", rec.id.as_str()));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(ops) = hook_ops {
             let done = ops.iter().any(|o| o.kind == "hook-unregister" && o.finished && o.outcome.as_deref() == Some("applied"));
             let attempted = ops.iter().any(|o| o.kind == "hook-unregister");
             if !done && !attempted {
@@ -728,7 +789,18 @@ fn note_timeouts(env: &JobEnv<'_>, id: &RepairId, timeouts: &[(String, f64)]) ->
 fn probation_pass(env: &JobEnv<'_>, report: &mut TickReport) {
     let root = env.op.root;
     let lane = env.op.lane;
-    for id in ledger::list_ids_in(root) {
+    // FG1: an unlistable repairs root is never "no repairs" — the pass stops with ONE report
+    let ids = match ledger::list_ids_checked_in(root) {
+        Ok(ids) => ids,
+        Err(e) => {
+            let line = format!("수리 장부 목록을 읽을 수 없어 시험 기간 재검사를 하지 못했습니다({e:?})");
+            report.lines.push(line.clone());
+            report.deferred_probation = true;
+            file_once(env, &format!("ledger:{}:repairs-root", lane.0), "repairs", &format!("자체 해결 작업이 {line}"), report);
+            return;
+        }
+    };
+    for id in ids {
         let ledger_rel = format!("repairs/{}/record.json", id.as_str());
         let row = match ledger::read_lane_in(root, &id, lane) {
             Ok(Some(row)) => row,
