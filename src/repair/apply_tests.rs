@@ -1394,3 +1394,135 @@ fn flush_failure_after_the_exchange_keeps_the_evidence() {
     assert_eq!(r.live("hooks/f.sh"), incoming);
     assert!(r.vault_bytes().contains(&b"OLD\n".to_vec()));
 }
+
+// ───────────────────────────── RULINGS CT3 — measured outcomes ─────────────────────────────
+
+/// CT3 (blocking 3): the slot is rewritten by another writer AFTER its last validation, in the
+/// record → exchange window. What the exchange put live is then NOT the approved state: it is moved
+/// into a fresh slot by a checked operation (expected = what is actually live) and the previous
+/// bytes return; the apply is declined, never "applied" or "reverted" on an unchecked outcome.
+/// Without CT3 the unapproved bytes stayed live while the reply said the change was put back.
+#[cfg(target_os = "macos")]
+#[test]
+fn unapproved_bytes_exchanged_in_are_put_back_by_a_checked_operation() {
+    struct TamperSlotAfterRecord(Cell<bool>);
+    impl Faults for TamperSlotAfterRecord {
+        fn at(&self, point: Point, _live: &Path, slot: Option<&Slot>) -> bool {
+            if point == Point::AfterRecord && !self.0.get() {
+                if let Some(s) = slot {
+                    use std::os::unix::fs::PermissionsExt;
+                    self.0.set(true);
+                    let _ = std::fs::set_permissions(s.payload(), std::fs::Permissions::from_mode(0o755));
+                    let mut f = std::fs::OpenOptions::new().write(true).truncate(true).open(s.payload()).unwrap();
+                    std::io::Write::write_all(&mut f, b"UNAPPROVED\n").unwrap();
+                }
+            }
+            false
+        }
+    }
+    let r = rig("ct3tamper");
+    let id = rid("R-30");
+    let rel = "hooks/t.sh";
+    r.put(rel, b"PRE\n", 0o755);
+    let pre_img = ledger::copy_preimage_in(&r.root, &id, &r.lane, rel, &r.pack.join(rel), 1.0).unwrap();
+    let staging = ledger::staging_dir_in(&r.root, &id).join(rel);
+    std::fs::create_dir_all(staging.parent().unwrap()).unwrap();
+    std::fs::write(&staging, b"APPROVED\n").unwrap();
+    let st = TargetState::read(&staging).unwrap();
+    let fp = crate::repair::types::fingerprint(&[(rel.to_string(), st.clone())]);
+    let mut rec = record(&r, &id, Classification::BootCritical, vec![FileChange { rel: rel.into(), kind: ChangeKind::Edit, pre: pre_img, post: st, diff: None }], RepairState::AwaitingApproval);
+    rec.approval = Some(approval(&fp));
+    ledger::write_record_in(&r.root, &rec).unwrap();
+    let faults = TamperSlotAfterRecord(Cell::new(false));
+    let env = r.env(&faults, ApplyForm::Exchange);
+    let rep = apply_candidate_in(&env, &id, &[CandidateFile { rel: rel.into(), staged: staging, mode: 0o644 }], &|_, _, _| Ok(()), &pass_check, &pass_ref, &no_repair_lock).unwrap();
+    assert!(faults.0.get(), "the tamper fired");
+    assert!(matches!(rep.outcome, ApplyOutcome::Declined(_)), "{:?}", rep.outcome);
+    assert_eq!(std::fs::read(r.pack.join(rel)).unwrap(), b"PRE\n", "the previous bytes are back, the unapproved ones are not live");
+    assert!(r.vault_bytes().contains(&b"UNAPPROVED\n".to_vec()), "the unapproved entry is kept in a slot (rule one)");
+    let after = ledger::read_record_in(&r.root, &id).unwrap().unwrap();
+    assert_ne!(after.state, RepairState::Probation, "never applied on an unchecked outcome");
+    assert!(after.approval.as_ref().is_none_or(|a| !a.approved), "the approval is void");
+    assert!(wal::unfinished_for_lane(&r.root, &r.lane).is_empty());
+}
+
+/// CT3: a revert whose re-registration fails is NOT reported reverted — the outcome is incomplete,
+/// the lane row says 충돌 and keeps what is left (the hook part), the record keeps its state; the
+/// next revert finishes it (hook-only — CT7) and only then says 되돌려짐. Without CT3 the first
+/// revert answered `reverted: true` / 되돌려짐 with the failure only inside `hook_step`.
+#[cfg(target_os = "macos")]
+#[test]
+fn revert_with_a_failed_reregistration_is_incomplete_then_finished() {
+    let r = rig("ct3hook");
+    let id = rid("R-31");
+    let mut rec = committed_general(&r, &id, "hooks/x.sh", Some(b"PRE\n"), Some(b"POST\n"));
+    rec.files.push(FileChange {
+        rel: "settings:Stop:x.sh".into(),
+        kind: ChangeKind::HookUnregister { event: "Stop".into(), script: "x.sh".into() },
+        pre: PreImage::Absent,
+        post: TargetState::Absent,
+        diff: None,
+    });
+    ledger::write_record_in(&r.root, &rec).unwrap();
+    let failing = |_: &RepairId, _: &LaneKey, _: HookStep| -> Result<ReconcileReport, RepairError> {
+        Err(RepairError::CheckFailed("registrar down".into()))
+    };
+    let env = r.env(&NoFaults, ApplyForm::Exchange);
+    let first = revert_in(&env, &id, RevertCaller::Human, &failing, &no_repair_lock).unwrap();
+    assert!(matches!(first.outcome, ApplyOutcome::Declined(ref m) if m.contains("충돌")), "{:?}", first.outcome);
+    assert_eq!(std::fs::read(r.pack.join("hooks/x.sh")).unwrap(), b"PRE\n", "the file part is reverted");
+    let row = ledger::read_lane_in(&r.root, &id, &r.lane).unwrap().unwrap();
+    assert_eq!(row.state, LaneState::Conflict);
+    assert!(row.applied.is_empty(), "only the hook part is left");
+    assert_eq!(ledger::read_record_in(&r.root, &id).unwrap().unwrap().state, RepairState::Probation, "not 되돌려짐 on an incomplete revert");
+    let ok = |_: &RepairId, _: &LaneKey, _: HookStep| -> Result<ReconcileReport, RepairError> { Ok(ReconcileReport { hooks: Vec::new() }) };
+    let second = revert_in(&env, &id, RevertCaller::Human, &ok, &no_repair_lock).unwrap();
+    assert_eq!(second.outcome, ApplyOutcome::Applied, "{:?}", second.outcome);
+    assert_eq!(ledger::read_record_in(&r.root, &id).unwrap().unwrap().state, RepairState::Reverted);
+}
+
+/// CT7: a HOOK-ONLY repair (no file state) is revertible — its re-registration is its state.
+/// Without CT7 `revert` refused it ("되돌릴 것이 없습니다") before reaching the hook step.
+#[test]
+fn hook_only_repair_is_revertible() {
+    let r = rig("ct7revert");
+    let id = rid("R-32");
+    hook_record(&r, &id, "Stop", "y.sh");
+    lane_row(&r, &id, Vec::new(), Vec::new());
+    let called = Cell::new(0);
+    let hooks = |_: &RepairId, _: &LaneKey, step: HookStep| -> Result<ReconcileReport, RepairError> {
+        assert_eq!(step, HookStep::Reregister);
+        called.set(called.get() + 1);
+        Ok(ReconcileReport { hooks: Vec::new() })
+    };
+    let env = r.env(&NoFaults, ApplyForm::Exchange);
+    let rep = revert_in(&env, &id, RevertCaller::Human, &hooks, &no_repair_lock).unwrap();
+    assert_eq!(rep.outcome, ApplyOutcome::Applied, "{:?}", rep.outcome);
+    assert_eq!(called.get(), 1);
+    assert_eq!(ledger::read_record_in(&r.root, &id).unwrap().unwrap().state, RepairState::Reverted);
+}
+
+/// CT3: the hook step's dry run cannot be measured → the step DECLINES before anything is recorded
+/// or changed (no operation record, no tombstone, no real registrar run). Without CT3 the dry run's
+/// failure became an empty report and the real run went ahead.
+#[test]
+fn hook_step_declines_when_its_dry_run_cannot_be_measured() {
+    let r = rig("ct3dry");
+    let id = rid("R-33");
+    hook_record(&r, &id, "Stop", "z.sh");
+    let calls = RefCell::new(Vec::new());
+    let registrar = |_: &Path, dry: bool| -> Result<String, RepairError> {
+        calls.borrow_mut().push(dry);
+        if dry {
+            Err(RepairError::CheckTimeout("dry run hung".into()))
+        } else {
+            Ok(report_json(&[("Stop", "z.sh", "unregistered", &[])]))
+        }
+    };
+    let res = hook_lines_step_in(&r.root, &r.pack, &id, &r.lane, HookStep::Unregister, &registrar, 5.0);
+    assert!(res.is_err(), "{res:?}");
+    assert_eq!(*calls.borrow(), vec![true], "the real run never happened");
+    let (ops, _) = wal::list_in(&r.root, &id);
+    assert!(ops.is_empty(), "nothing recorded");
+    assert!(crate::repair::tombstones::load_in(&r.root, &r.lane).unwrap().is_empty(), "no tombstone");
+}

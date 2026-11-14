@@ -519,6 +519,48 @@ fn step4(
     let gen_ok = rec.pack_generation.as_ref() == Some(&gen_after);
     let expected = parse_canon(&rec.expected).unwrap_or(TargetState::Absent);
     if *deposit == expected && gen_ok {
+        // CT3 — the outcome reported is the outcome measured: what is NOW live must be the state
+        // this operation was to put live; otherwise that entry goes into a fresh slot by a CHECKED
+        // operation (expected = what is actually live) and the previous bytes return
+        let incoming = parse_canon(&rec.incoming).unwrap_or(TargetState::Absent);
+        let live_now = TargetState::read(live)?;
+        if live_now != incoming {
+            let mut note = format!(
+                "{}: 들인 뒤 살아 있는 것이 들일 상태가 아닙니다(지금 {} ≠ 들일 {})",
+                spec.rel,
+                live_now.canon(),
+                incoming.canon()
+            );
+            if depth == 0 {
+                let holder = if std::fs::symlink_metadata(slot.sealed()).is_ok() {
+                    slot.sealed()
+                } else {
+                    slot.payload()
+                };
+                let back = OpSpec {
+                    id: spec.id.clone(),
+                    rel: spec.rel.clone(),
+                    kind: "undo-mismatch".into(),
+                    expected: live_now,
+                    incoming: deposit.clone(),
+                    source: Some(holder),
+                    generation: None,
+                };
+                let r = run_op_depth(env, &back, depth + 1)?;
+                if r.outcome == ApplyOutcome::Applied {
+                    note.push_str(" — 그것을 새 보관 칸에 두고 이전 바이트를 되돌렸습니다");
+                } else {
+                    note.push_str(&format!(" — 이전 바이트를 되돌리지 못했습니다(충돌 · {:?})", r.outcome));
+                }
+            } else {
+                note.push_str(" — 겹친 동작이라 더 바꾸지 않습니다(워커 검토)");
+            }
+            if env.faults.at(Point::BeforeDone, live, Some(slot)) {
+                return Err(stop(Point::BeforeDone));
+            }
+            wal::finish(env.root, rec, "declined", &note, env.now)?;
+            return Ok(done(ApplyOutcome::Declined(note), Some(rec)));
+        }
         if env.faults.at(Point::BeforeDone, live, Some(slot)) {
             return Err(stop(Point::BeforeDone));
         }
@@ -692,6 +734,42 @@ fn after_seal_move_in(
     Ok(done(ApplyOutcome::Superseded(note), Some(rec)))
 }
 
+/// CT3 for a placement (place form, the Windows second move): what is NOW live must be the state
+/// the placement was to put there; otherwise that entry is moved into a fresh slot by a CHECKED
+/// operation (expected = what is actually live) and the place is empty again, as before. `None` =
+/// the measured state is the incoming one.
+fn verify_placed(env: &OpEnv<'_>, rec: &OpRecord, live: &Path, depth: u8) -> Result<Option<String>, RepairError> {
+    let incoming = parse_canon(&rec.incoming).unwrap_or(TargetState::Absent);
+    let live_now = TargetState::read(live)?;
+    if live_now == incoming {
+        return Ok(None);
+    }
+    let mut note = format!(
+        "{}: 놓은 뒤 살아 있는 것이 들일 상태가 아닙니다(지금 {} ≠ 들일 {})",
+        rec.rel,
+        live_now.canon(),
+        incoming.canon()
+    );
+    if depth == 0 && live_now != TargetState::Absent {
+        let back = OpSpec {
+            id: rec.repair.clone(),
+            rel: rec.rel.clone(),
+            kind: "undo-mismatch".into(),
+            expected: live_now,
+            incoming: TargetState::Absent,
+            source: None,
+            generation: None,
+        };
+        let r = run_op_depth(env, &back, depth + 1)?;
+        if r.outcome == ApplyOutcome::Applied {
+            note.push_str(" — 그것을 새 보관 칸으로 옮겨 그 자리를 이전처럼 비웠습니다");
+        } else {
+            note.push_str(&format!(" — 그 자리를 되돌리지 못했습니다(충돌 · {:?})", r.outcome));
+        }
+    }
+    Ok(Some(note))
+}
+
 fn op_place(
     env: &OpEnv<'_>,
     spec: &OpSpec,
@@ -752,6 +830,10 @@ fn op_place(
     wal::set_step(env.root, &mut rec, "placed", env.now)?;
     if env.faults.at(Point::BeforeDone, live, None) {
         return Err(stop(Point::BeforeDone));
+    }
+    if let Some(note) = verify_placed(env, &rec, live, 0)? {
+        wal::finish(env.root, &mut rec, "declined", &note, env.now)?;
+        return Ok(done(ApplyOutcome::Declined(note), Some(&rec)));
     }
     wal::finish(env.root, &mut rec, "applied", "", env.now)?;
     Ok(done(ApplyOutcome::Applied, Some(&rec)))
@@ -849,6 +931,10 @@ fn second_move(
                 wal::set_step(env.root, rec, "placed", env.now)?;
                 if env.faults.at(Point::BeforeDone, live, Some(slot)) {
                     return Err(stop(Point::BeforeDone));
+                }
+                if let Some(note) = verify_placed(env, rec, live, 0)? {
+                    wal::finish(env.root, rec, "declined", &note, env.now)?;
+                    return Ok(done(ApplyOutcome::Declined(note), Some(rec)));
                 }
                 wal::finish(env.root, rec, "applied", "", env.now)?;
                 return Ok(done(ApplyOutcome::Applied, Some(rec)));
@@ -1037,6 +1123,10 @@ pub fn resume_op(env: &OpEnv<'_>, mut rec: OpRecord) -> Result<OpDone, RepairErr
         ("place", "staged") | ("deposit-first", "placed") | ("place", "placed") => {
             let want = rec.incoming_copy_identity.clone();
             if want.as_ref().is_some_and(|w| live_entry.as_ref().is_some_and(|e| same_entry(w, e))) {
+                if let Some(note) = verify_placed(env, &rec, &live, 0)? {
+                    wal::finish(env.root, &mut rec, "declined", &note, env.now)?;
+                    return Ok(done(ApplyOutcome::Declined(note), Some(&rec)));
+                }
                 wal::finish(env.root, &mut rec, "applied", "끊긴 뒤 놓기가 끝나 있음을 확인", env.now)?;
                 return Ok(done(ApplyOutcome::Applied, Some(&rec)));
             }
@@ -1276,13 +1366,17 @@ pub fn revert_in(
     let row = ledger::read_lane_in(env.root, id, env.lane)?.ok_or_else(|| {
         RepairError::Precondition(format!("{}: 이 부서에는 이 수리의 행이 없습니다", id.as_str()))
     })?;
+    let has_hooks = ledger::hook_lines(&rec).next().is_some();
+    let closed_for_good = matches!(row.probation.as_ref().and_then(|p| p.closed.as_deref()), Some(c) if c.starts_with("되돌려짐") || c.starts_with("대체됨"));
+    // CT3 / CT4: a lane row 충돌 left by an apply or a revert that could not finish is revertible
+    let unfinished_here = row.state == LaneState::Conflict && !closed_for_good && (!row.applied.is_empty() || has_hooks);
     let in_force = if rec.origin_lane == *env.lane {
-        matches!(rec.state, RepairState::Probation | RepairState::InUse)
+        matches!(rec.state, RepairState::Probation | RepairState::InUse) || unfinished_here
     } else {
-        !row.applied.is_empty()
-            && !matches!(row.probation.as_ref().and_then(|p| p.closed.as_deref()), Some(c) if c.starts_with("되돌려짐") || c.starts_with("대체됨"))
+        (!row.applied.is_empty() || has_hooks) && !closed_for_good
     };
-    if !in_force || row.applied.is_empty() {
+    // CT7: a hook-only repair (no file state) is revertible — its re-registration is its state
+    if !in_force || (row.applied.is_empty() && !has_hooks) {
         return Err(RepairError::Precondition(format!(
             "{}: '{}' 상태라 되돌릴 것이 없습니다(시험 기간·사용 중인 수리만 되돌립니다)",
             id.as_str(),
@@ -1340,19 +1434,49 @@ pub fn revert_in(
         }
         files.push((spec.rel.clone(), r.outcome));
     }
-    let _ = super::tombstones::remove_for_repair_in(env.root, env.lane, id);
-    let hook_step = if ledger::hook_lines(&rec).next().is_some() {
+    // this repair's FILE tombstones of the reverted targets; the hook step removes its own hook
+    // tombstones AFTER its operation record (Y1's order — CU4)
+    for (rel, o) in &files {
+        if *o == ApplyOutcome::Applied {
+            let _ = super::tombstones::remove_file_rel_in(env.root, env.lane, rel, id);
+        }
+    }
+    let hook_step = if has_hooks {
         Some(hooks(id, env.lane, HookStep::Reregister).map(|_| ()).map_err(|e| format!("{e:?}")))
     } else {
         None
     };
-    let label = if all_applied { "되돌려짐" } else { "대체됨" };
-    let note = files
+    // CT3 — the outcome reported is the outcome measured: complete only when every file op AND the
+    // re-registration succeeded; nothing changed → 대체됨 (as before); anything in between → 충돌
+    // (the row keeps the targets not yet put back, so `revert` can finish it)
+    let any_applied = files.iter().any(|(_, o)| *o == ApplyOutcome::Applied);
+    let hook_failed = matches!(hook_step, Some(Err(_)));
+    let complete = all_applied && !hook_failed;
+    let nothing_changed = !any_applied && hook_step.is_none() && !plan.is_empty();
+    let label = if complete {
+        "되돌려짐"
+    } else if nothing_changed {
+        "대체됨"
+    } else {
+        "충돌"
+    };
+    let left_rels: Vec<String> = files
+        .iter()
+        .filter(|(_, o)| *o != ApplyOutcome::Applied)
+        .map(|(r, _)| r.clone())
+        .collect();
+    let mut note = files
         .iter()
         .filter(|(_, o)| *o != ApplyOutcome::Applied)
         .map(|(r, o)| format!("{r}: {o:?}"))
         .collect::<Vec<_>>()
         .join(" · ");
+    if let Some(Err(e)) = &hook_step {
+        if !note.is_empty() {
+            note.push_str(" · ");
+        }
+        note.push_str(&format!("훅 재등록 실패: {e}"));
+    }
     let by_label = match by {
         RevertCaller::Human => "사람".to_string(),
         RevertCaller::TicketedWorker { seat } => format!("워커 좌석 {seat}"),
@@ -1364,15 +1488,28 @@ pub fn revert_in(
     let idc = id.clone();
     locked(id, &mut || {
         if let Some(mut r) = ledger::read_record_in(&root, &idc)? {
-            if r.origin_lane == lane && matches!(r.state, RepairState::Probation | RepairState::InUse) {
-                r.state = if all_applied { RepairState::Reverted } else { RepairState::Superseded };
-                r.methods.push(format!("{label} — {by_label}{}", if note.is_empty() { String::new() } else { format!(" · {note}") }).chars().take(300).collect());
+            if r.origin_lane == lane {
+                let method: String = format!("{label} — {by_label}{}", if note.is_empty() { String::new() } else { format!(" · {note}") }).chars().take(300).collect();
+                if complete || nothing_changed {
+                    if matches!(r.state, RepairState::Probation | RepairState::InUse) {
+                        r.state = if complete { RepairState::Reverted } else { RepairState::Superseded };
+                    }
+                } // 충돌: the record keeps its state (truthful — not reverted), the row says 충돌
+                r.methods.push(method);
                 ledger::write_record_durable_in(&root, &r)?;
             }
         }
         if let Some(mut row) = ledger::read_lane_in(&root, &idc, &lane)? {
-            if let Some(p) = row.probation.as_mut() {
-                p.closed = Some(format!("{label} — {by_label}"));
+            if complete || nothing_changed {
+                if let Some(p) = row.probation.as_mut() {
+                    p.closed = Some(format!("{label} — {by_label}"));
+                }
+            } else {
+                row.state = LaneState::Conflict;
+                row.applied.retain(|(rel, _)| left_rels.contains(rel));
+                if let Some(p) = row.probation.as_mut() {
+                    p.closed = Some(format!("충돌 — 되돌리기를 마치지 못했습니다({by_label}) · {note}").chars().take(400).collect());
+                }
             }
             row.updated_at = now;
             ledger::write_lane_in(&root, &row)?;
@@ -1380,10 +1517,12 @@ pub fn revert_in(
         Ok(())
     })?;
     Ok(RevertReport {
-        outcome: if all_applied {
+        outcome: if complete {
             ApplyOutcome::Applied
-        } else {
+        } else if nothing_changed {
             ApplyOutcome::Superseded(note)
+        } else {
+            ApplyOutcome::Declined(format!("{}: 되돌리기를 마치지 못했습니다(충돌 — 다시 되돌리면 남은 것을 마저 합니다) · {note}", id.as_str()))
         },
         files,
         hook_step,
@@ -2001,9 +2140,32 @@ pub fn apply_candidate_in(
             break;
         }
     }
+    // CT3: every target this apply touched (the failed one included — its own measured undo may
+    // have failed) is put back by a CHECKED operation; what could not be put back is never reported
+    // as reverted: the lane row says 충돌 and `revert` can finish it
+    let attempted: Vec<OpSpec> = plan.iter().take(results.len()).map(|(s, _)| s.clone()).collect();
+    let _ = &applied;
+    let undo_then = |why: &str, files: Vec<(String, ApplyOutcome)>| -> Result<Option<ApplyReport>, RepairError> {
+        let left = undo_applied(env, &attempted, &rec)?;
+        if left.is_empty() {
+            return Ok(None);
+        }
+        let detail = left.iter().map(|(r, w)| format!("{r}: {w}")).collect::<Vec<_>>().join(" · ");
+        let msg = format!(
+            "{id}: 적용을 끝내지 못했고 바꾼 것을 다 되돌리지도 못했습니다(충돌 — cys repair revert {id} 로 되돌릴 수 있습니다) — {why} · {detail}",
+            id = id.as_str()
+        );
+        mark_incomplete_apply(env, id, &rec, &attempted, &msg, locked)?;
+        Ok(Some(ApplyReport {
+            outcome: ApplyOutcome::Declined(msg),
+            files,
+        }))
+    };
     if let Some(why) = failed {
         // put back what this apply already changed (rule one), then decline
-        undo_applied(env, &applied, &rec)?;
+        if let Some(r) = undo_then(&why, results.clone())? {
+            return Ok(r);
+        }
         return decline(format!("{}: 적용이 끝까지 가지 못해 바꾼 것을 되돌렸습니다 — {why}", id.as_str()));
     }
     // Q3: the live states reproduce the approved fingerprint
@@ -2012,7 +2174,9 @@ pub fn apply_candidate_in(
         live_states.push((rel.clone(), TargetState::read(&env.pack.join(rel))?));
     }
     if super::types::fingerprint(&live_states) != approval.fingerprint_sha256 {
-        undo_applied(env, &applied, &rec)?;
+        if let Some(r) = undo_then("적용 뒤 살아 있는 파일이 승인된 지문과 다릅니다", results.clone())? {
+            return Ok(r);
+        }
         return decline(format!(
             "{}: 적용 뒤 살아 있는 파일이 승인된 지문과 다릅니다 — 되돌렸습니다",
             id.as_str()
@@ -2039,7 +2203,9 @@ pub fn apply_candidate_in(
                     CheckResult::Fail(m) => m,
                     _ => "검사 시간 초과(적용 때의 시간 초과는 실패)".to_string(),
                 };
-                undo_applied(env, &applied, &rec)?;
+                if let Some(r) = undo_then(&format!("{rel}: 적용 직후 검사 실패 — {why}"), results.clone())? {
+                    return Ok(r);
+                }
                 mark_reverted_after_apply_check(env, id, &format!("{rel}: {why}"), locked)?;
                 return Ok(ApplyReport {
                     outcome: ApplyOutcome::Declined(format!(
@@ -2191,25 +2357,103 @@ fn exchange_prepared(
     after_seal_exchange(env, spec, &mut rec, slot, &live, 0)
 }
 
-/// Puts back (rule one) the targets an unfinished apply already changed.
-fn undo_applied(env: &OpEnv<'_>, applied: &[OpSpec], rec: &RepairRecord) -> Result<(), RepairError> {
+/// Puts back (rule one) the targets an unfinished apply already changed — each a CHECKED operation
+/// whose expected state is what is actually live now (CT3). Returns the targets that could NOT be
+/// put back (rel, why) — empty = every change undone.
+fn undo_applied(env: &OpEnv<'_>, applied: &[OpSpec], rec: &RepairRecord) -> Result<Vec<(String, String)>, RepairError> {
+    let mut left = Vec::new();
     for spec in applied.iter().rev() {
         let (pre, holder) = match pre_image_for(env.root, rec, env.lane, &spec.rel) {
             Ok(x) => x,
-            Err(_) => continue, // nothing more is changed; the case goes to a worker's review
+            Err(e) => {
+                left.push((spec.rel.clone(), format!("적용 전 내용을 확인할 수 없습니다({e:?})")));
+                continue;
+            }
         };
+        let live_now = TargetState::read(&env.pack.join(&spec.rel))?;
+        if live_now == pre {
+            continue; // already the pre-image (e.g. undone by the operation's own CT3 check)
+        }
         let back = OpSpec {
             id: spec.id.clone(),
             rel: spec.rel.clone(),
             kind: "revert".into(),
-            expected: spec.incoming.clone(),
+            expected: live_now,
             incoming: pre,
             source: holder,
             generation: None,
         };
-        let _ = run_op(env, &back)?;
+        let r = run_op(env, &back)?;
+        if r.outcome != ApplyOutcome::Applied {
+            left.push((spec.rel.clone(), format!("{:?}", r.outcome)));
+        }
     }
-    Ok(())
+    Ok(left)
+}
+
+/// CT3 / CT4: an approved apply that could not be completed NOR fully undone — the lane row says
+/// 충돌 with exactly the targets whose live state is the apply's (so `revert` can put them back),
+/// its probation block open and bound to this generation; the record keeps its state with a method
+/// line; the approval is void. Never reported as applied or reverted.
+fn mark_incomplete_apply(
+    env: &OpEnv<'_>,
+    id: &RepairId,
+    rec: &RepairRecord,
+    plan: &[OpSpec],
+    why: &str,
+    locked: &RepairLock<'_>,
+) -> Result<(), RepairError> {
+    let mut applied_now: Vec<(String, String)> = Vec::new();
+    for spec in plan {
+        let live_now = TargetState::read(&env.pack.join(&spec.rel))?;
+        if live_now == spec.incoming && spec.incoming != spec.expected {
+            applied_now.push((spec.rel.clone(), live_now.canon()));
+        }
+    }
+    let gen = pack_generation(env.pack);
+    let root = env.root.to_path_buf();
+    let lane = env.lane.clone();
+    let now = env.now;
+    let idc = id.clone();
+    let request = rec.approval.as_ref().map(|a| a.request_id.clone());
+    let why = why.to_string();
+    locked(id, &mut || {
+        let previous = ledger::read_lane_in(&root, &idc, &lane)?;
+        let row = ledger::LaneRecord {
+            schema: super::REPAIR_SCHEMA,
+            repair: idc.clone(),
+            lane: lane.clone(),
+            state: LaneState::Conflict,
+            probation: Some(ledger::Probation {
+                pack_generation: gen.version.clone(),
+                pro_revision: gen.pro_revision,
+                applied_at: now,
+                expected: applied_now.clone(),
+                closed: None,
+                check_timings: Vec::new(),
+                check_timeouts: Vec::new(),
+            }),
+            merge: None,
+            merge_history: previous.as_ref().map(|p| p.merge_history.clone()).unwrap_or_default(),
+            approval_ref: request.clone(),
+            conflict_live: applied_now.clone(),
+            applied: applied_now.clone(),
+            applied_history: previous.as_ref().map(|p| p.applied_history.clone()).unwrap_or_default(),
+            merge_base: Vec::new(),
+            merge_lock: None,
+            merge_attempt: 0,
+            updated_at: now,
+        };
+        ledger::write_lane_in(&root, &row)?;
+        if let Some(mut r) = ledger::read_record_in(&root, &idc)? {
+            if let Some(a) = r.approval.as_mut() {
+                a.approved = false;
+            }
+            r.methods.push(format!("충돌 — 적용을 끝내지도 다 되돌리지도 못했습니다(되돌리기 가능: cys repair revert {}) · {why}", idc.as_str()).chars().take(300).collect());
+            ledger::write_record_durable_in(&root, &r)?;
+        }
+        Ok(())
+    })
 }
 
 /// AY5: a declined apply in the origin — the approval is void and the repair returns to `진행 중`.
@@ -2574,8 +2818,15 @@ pub fn hook_lines_step_in(
     if named.is_empty() {
         return Ok(ReconcileReport { hooks: Vec::new() });
     }
-    // (i) the record first, with the targets of a dry run (matcher / timeout as found)
-    let dry = registrar(pack, true).and_then(|s| parse_reconcile(&s)).unwrap_or(ReconcileReport { hooks: Vec::new() });
+    // (i) the record first, with the targets of a dry run (matcher / timeout as found). CT3: a dry
+    // run that cannot be measured DECLINES before anything is recorded or changed (the caller marks
+    // the lane row 충돌; nothing was unregistered without the captured registration state)
+    let dry = registrar(pack, true).and_then(|s| parse_reconcile(&s)).map_err(|e| {
+        RepairError::CheckFailed(format!(
+            "{}: 훅 등록기의 예행을 측정할 수 없어 훅 단계를 하지 않았습니다(아무것도 바꾸지 않음) — {e:?}",
+            id.as_str()
+        ))
+    })?;
     let lines: Vec<wal::HookLine> = named
         .iter()
         .map(|(event, script)| wal::HookLine {
