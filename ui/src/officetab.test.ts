@@ -38,13 +38,17 @@ describe("planOfficeTab — 브리지가 없거나 느릴 때", () => {
       expect({ stage: p.stage, text: p.text, load: p.loadFrame, poll: p.nextPollMs, btn: p.buttonLabel }).toEqual({ stage: "preparing", text: OFFICE_TEXT_PREPARING, load: false, poll: 3000, btn: "" });
     }
   });
-  it("3분이 지나도 안 되면 긴 안내(컴퓨터를 다시 시작·자비스에게 증상을 말하면 스스로 고침) · 15초 간격 · 앱만 다시 켜라고 하지 않는다", () => {
+  it("3분이 지나도 안 되면 긴 안내(관찰한 것 · 컴퓨터를 다시 시작 · 자비스가 원인을 찾고 본체 결함은 이번 판 한계를 사실대로) · 15초 간격 · 앱만 다시 켜라고 하지 않는다", () => {
     const p = planOfficeTab({ ok: false }, ctx({ elapsedMs: OFFICE_POLL_FAST_WINDOW_MS }));
     expect({ stage: p.stage, text: p.text, poll: p.nextPollMs }).toEqual({ stage: "long", text: OFFICE_TEXT_LONG, poll: 15000 });
     expect(p.text.includes("컴퓨터를 다시 시작")).toBe(true);
     // ★0.15.0 「스스로 해결」(RULINGS BZ3): 마지막 길은 제품 자신의 수리다 — 피드백(제작자에게 알리기)으로 보내지 않는다.
-    expect(p.text.includes("자비스에게 이 증상을 말해")).toBe(true);
-    expect(p.text.includes("스스로 고칩니다")).toBe(true);
+    // ★RULINGS CX3 (CE2 적용): 원인이 정해지지 않았다(상태 확인 무응답·문제 — 프로그램 본체일 수도 있다) — 수리를 약속하지 않는다.
+    //   종전 기대(T1c): expect(p.text.includes("자비스에게 이 증상을 말해")).toBe(true); expect(p.text.includes("스스로 고칩니다")).toBe(true);
+    expect(p.text.includes("상태 확인이 답하지 않거나 문제를 알립니다")).toBe(true);
+    expect(p.text.includes("자비스에게 이 증상을 말하면 원인을 찾아")).toBe(true);
+    expect(p.text.includes("프로그램 본체의 결함이면 이번 판에서는 고치지 못한다")).toBe(true);
+    expect(p.text.includes("스스로 고칩니다")).toBe(false);
     expect(p.text.includes("피드백")).toBe(false);
     expect(p.text.includes("앱을 다시")).toBe(false);
   });
