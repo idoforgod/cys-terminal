@@ -26763,6 +26763,15 @@ fn run_pack_merge_with(
         return 1;
     };
     let kind = entry.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
+    // ★T2j(RULINGS HM1): `bin/` · `hooks/` 파일의 `--to-local` 은 어느 갈래에서든(그리고 `--propose` 보다 먼저) 아무것도 쓰거나 옮기거나
+    //   해소하기 전에 거부한다 — 그 사본은 읽는 곳이 없다. 종전 new-pending · user-kept 갈래는 이 플래그를 읽지 않아 아래 3-way
+    //   병합이 돌았다(침묵 무시).
+    if to_local {
+        if let Some(refusal) = to_local_no_reader_refusal(&rel, kind, sources.is_listed(&rel)) {
+            eprintln!("{refusal}");
+            return 1;
+        }
+    }
     let target = dir.join(&rel);
     let embed_now: Option<&str> = cys::pack::PACK_ALL
         .iter()
@@ -27037,11 +27046,6 @@ fn run_pack_merge_with(
         "healed" | "conflicted" => {
             let user_path = dir.join(format!("{rel}.user"));
             if to_local {
-                // ★T2j(RULINGS HM1): `bin/` · `hooks/` 파일이면 아무것도 쓰거나 해소하기 전에 거부(그 사본은 읽는 곳이 없다).
-                if let Some(refusal) = to_local_no_reader_refusal(&rel, kind, sources.is_listed(&rel)) {
-                    eprintln!("{refusal}");
-                    return 1;
-                }
                 // 스킬 등 system 파일의 사용자본을 오버레이로 승격 — vendor 무결성(치유)과 공존.
                 let local_root = cys::pack::local_dir();
                 let dest = local_root.join(&rel);
@@ -43463,6 +43467,52 @@ mod tests {
                 let rc = run_pack_merge_with(Some(rel.clone()), flags, None, sources);
                 assert_eq!(rc, 1, "{rel} ({kind}): bin/·hooks/ 의 --to-local 은 거부");
                 assert_eq!(t2j_state(&td, &local, &rel), before, "{rel} ({kind}): 아무것도 쓰거나 옮기거나 해소하지 않았다");
+                assert!(!local.exists(), "{rel} ({kind}): 오버레이 폴더조차 만들지 않았다");
+            }
+        }
+        let _ = std::fs::remove_dir_all(td.parent().unwrap());
+    }
+
+    /// ★T2j(RULINGS HM1): new-pending · user-kept 갈래 — 종전에는 `--to-local` 을 읽지 않아 플래그가 침묵으로 무시되고, 그 아래의
+    /// 3-way 병합이 돌아 `--yes` 면 병합본을 살아 있는 파일에 썼다. 이제 `bin/` · `hooks/` 파일이면 거부하고 아무것도 바꾸지 않는다.
+    /// 그 밖의 갈래(kept-drift · merged · vendor-first · adopted · quarantined)도 같은 거부다(쓰지 않는 것은 종전과 같다).
+    #[test]
+    fn t2j_to_local_refused_for_bin_and_hooks_every_other_arm() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (td, _rel, _embed, _env) = t4_system_fixture("t2j2");
+        let local = td.parent().unwrap().join("local");
+        let _l = cys::pack::EnvGuard::set("CYS_LOCAL_DIR", &local);
+        let plain = cys::pack::UpdateSources::none().with_listed(|_| false);
+        let flags = MergeFlags { to_local: true, yes: true, ..MergeFlags::default() };
+        // 깨끗하게 합쳐지는 세 쪽(관문이 없으면 병합본이 **실제로** 쓰이는 형상 — 이 시험이 재는 것).
+        let base = "line-1\nline-2\nline-3\n";
+        let ours = "line-1 MINE\nline-2\nline-3\n";
+        let theirs = "line-1\nline-2\nline-3 VENDOR\n";
+        for prefix in ["bin/", "hooks/"] {
+            let rel = t2j_rel(prefix, &td);
+            // `--propose` 와 함께여도 같은 거부다(종전: `--propose` 가 먼저 돌아 `--to-local` 을 침묵으로 무시하고 제안 파일을 썼다).
+            std::fs::write(td.join(&rel), ours).unwrap();
+            std::fs::write(td.join(format!("{rel}.new")), theirs).unwrap();
+            t4_pristine_set(&td, &rel, base);
+            t4_manifest_set(&td, &rel, base);
+            t4_write_ledger(&td, &rel, serde_json::json!({"kind": "user-kept", "side": format!("{rel}.new"), "version": "x", "ts": 0}));
+            let with_propose = MergeFlags { to_local: true, propose: true, ..MergeFlags::default() };
+            let before = t2j_state(&td, &local, &rel);
+            assert_eq!(run_pack_merge_with(Some(rel.clone()), with_propose, None, &plain), 1, "{rel}: --to-local --propose 거부");
+            assert_eq!(t2j_state(&td, &local, &rel), before, "{rel}: --to-local --propose 무변경");
+            assert!(!local.exists(), "{rel}: 제안 파일도 쓰지 않았다");
+            for kind in ["user-kept", "new-pending", "kept-drift", "merged", "vendor-first", "adopted", "quarantined"] {
+                std::fs::write(td.join(&rel), ours).unwrap();
+                std::fs::write(td.join(format!("{rel}.new")), theirs).unwrap();
+                std::fs::write(td.join(format!("{rel}.user")), "PARKED\n").unwrap();
+                t4_pristine_set(&td, &rel, base);
+                t4_manifest_set(&td, &rel, base);
+                let side = if matches!(kind, "user-kept" | "new-pending") { format!("{rel}.new") } else { format!("{rel}.user") };
+                t4_write_ledger(&td, &rel, serde_json::json!({"kind": kind, "side": side, "capture": format!("seg/{rel}"), "version": "x", "ts": 0}));
+                let before = t2j_state(&td, &local, &rel);
+                let rc = run_pack_merge_with(Some(rel.clone()), flags, None, &plain);
+                assert_eq!(rc, 1, "{rel} ({kind}): bin/·hooks/ 의 --to-local 은 거부(침묵 무시가 아니다)");
+                assert_eq!(t2j_state(&td, &local, &rel), before, "{rel} ({kind}): 병합본을 쓰지 않았고 아무것도 해소하지 않았다");
                 assert!(!local.exists(), "{rel} ({kind}): 오버레이 폴더조차 만들지 않았다");
             }
         }
