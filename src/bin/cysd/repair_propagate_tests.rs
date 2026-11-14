@@ -262,3 +262,85 @@ fn recheck_after_a_merge_through_the_dispatcher() {
     assert!(m.changed && m.by_seat == 3);
     assert!(row.merge_lock.is_none());
 }
+
+/// RULINGS HH4 — the job thread's propagation (`propagate_verbs::run_on_job_thread`, what `run_job`
+/// calls after T6's tick) in the production environment on an empty ledger: the first tick records
+/// the pack instance and the catch-up (the gate's reader answers OPEN); the next tick — nothing due
+/// for T6, nothing changed — writes nothing (the job-state and id-file bytes stay identical).
+#[test]
+fn the_job_threads_propagation_records_the_catchup_and_an_unchanged_tick_writes_nothing() {
+    use cys::repair::ledger::GateVerdict;
+    use cys::repair::propagate::{gate_verdict_in, job_state_path_in, read_job_state_checked, read_pack_instance, FileRead};
+    let r = rig("job");
+    std::fs::create_dir_all(&r.root).unwrap();
+    let daemon = crate::team_gate_tests::tmp_daemon("t7b-job", false);
+    crate::repair_job::mark_ready(&daemon);
+    let lane = LaneKey::of_socket(&daemon.socket_path);
+    let first = propagate_verbs::run_on_job_thread(&daemon, &r.root, &r.pack).unwrap();
+    assert!(first.catchup_completed, "{first:?}");
+    let FileRead::Value(st) = read_job_state_checked(&r.root, &lane) else { panic!("no job state") };
+    assert!(st.initial_catchup_complete);
+    assert_eq!(read_pack_instance(&r.pack), FileRead::Value(st.pack_instance.clone().unwrap()));
+    assert_eq!(gate_verdict_in(&r.root, &lane), GateVerdict::Open);
+    let js = std::fs::read(job_state_path_in(&r.root, &lane)).unwrap();
+    let id = std::fs::read(r.pack.join(".repair-pack-id")).unwrap();
+    let second = propagate_verbs::run_on_job_thread(&daemon, &r.root, &r.pack).unwrap();
+    assert!(!second.catchup_completed && second.rows.is_empty(), "{second:?}");
+    assert_eq!(std::fs::read(job_state_path_in(&r.root, &lane)).unwrap(), js);
+    assert_eq!(std::fs::read(r.pack.join(".repair-pack-id")).unwrap(), id);
+}
+
+/// RULINGS HH4 — pins on the job: `run_job` calls this lane's propagation AFTER T6's tick (both on
+/// the one single-flight thread); the production runner and the job send nothing (F1: no bus, queue,
+/// injection, alert or `cys send`).
+#[test]
+fn the_job_calls_the_propagation_after_t6s_tick_and_sends_nothing() {
+    let job = include_str!("repair_job.rs");
+    let job = &job[..job.find("#[cfg(test)]\n#[path").unwrap_or(job.len())];
+    let body = &job[job.find("fn run_job(").expect("run_job")..];
+    let t6 = body.find("probation::run_tick(&env").expect("T6's tick");
+    let mine = body.find("propagate_verbs::run_on_job_thread(").expect("the propagation");
+    assert!(t6 < mine, "the propagation runs after T6's tick");
+    let src = include_str!("repair.rs");
+    let verbs = &src[src.find("pub(crate) mod propagate_verbs {").unwrap()..src.find("\nmod apply_verbs {").unwrap()];
+    assert!(verbs.contains("fn run_on_job_thread("));
+    for (name, text) in [("repair_job.rs", job), ("repair.rs propagate_verbs", verbs)] {
+        for needle in ["bus.publish", "enqueue", "send_text", "alert_route", "inject(", "push_queued", "cys send"] {
+            assert!(!text.contains(needle), "{name} contains {needle:?}");
+        }
+    }
+}
+
+/// RULINGS HH6 + HH7 — T3's `status`: the catch-up fields read from the daemon's OWN root through
+/// T7b's reader (no "unavailable" any more); HQ's status carries the CEO's ONE summary line (null when
+/// no lane holds a 충돌 row of an in-force repair; the line names the lane and the repair when one
+/// does); a department's status carries no summary field.
+#[test]
+fn status_reads_the_catchup_from_its_root_and_hq_carries_the_summary_line() {
+    let r = rig("st");
+    std::fs::create_dir_all(&r.root).unwrap();
+    let who = seat(3, "worker");
+    let v = r.call(T0, &who, "status", json!({})).unwrap();
+    assert_eq!(v["initial_catchup_complete"], false, "{v}");
+    assert_eq!(v["catchup_pending"], 0, "{v}");
+    assert_eq!(v["catchup_conflict"], 0, "{v}");
+    assert!(v.get("catchup_unavailable").is_none(), "{v}");
+    assert!(v["conflict_summary"].is_null(), "HQ: the field is there, null with no conflict: {v}");
+    // an in-force repair whose HQ row is 충돌
+    let id = verified(&r, "bin/a.py", b"print('fixed')\n");
+    r.call(T0 + 3.0, &who, "commit", json!({"repair": id})).unwrap();
+    let rid = RepairId::parse(&id).unwrap();
+    let mut row = ledger::read_lane_in(&r.root, &rid, &r.lane).unwrap().unwrap();
+    row.state = LaneState::Conflict;
+    ledger::write_lane_in(&r.root, &row).unwrap();
+    let v = r.call(T0 + 4.0, &who, "status", json!({})).unwrap();
+    assert_eq!(v["catchup_conflict"], 1, "{v}");
+    let line = v["conflict_summary"].as_str().unwrap_or_else(|| panic!("no summary line: {v}"));
+    assert!(line.contains(&id) && line.contains("base"), "{line}");
+    // a department's status: no summary field
+    let mut d = rig("st-d");
+    d.lane = LaneKey("dept-x".into());
+    std::fs::create_dir_all(&d.root).unwrap();
+    let v = d.call(T0, &who, "status", json!({})).unwrap();
+    assert!(v.get("conflict_summary").is_none(), "{v}");
+}

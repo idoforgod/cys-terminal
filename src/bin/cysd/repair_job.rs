@@ -99,17 +99,11 @@ pub(crate) fn trigger_with(
         return json!({"tick": "not_ready"});
     }
     let lane = LaneKey::of_socket(&daemon.socket_path);
-    if !force_sweep {
-        let state = cys::repair::probation::read_job_state_in(root, &lane);
-        let due = cys::repair::probation::due(
-            state.as_ref(),
-            &daemon.incarnation,
-            cys::repair::ledger::now_epoch(),
-        );
-        if !due.anything() {
-            return json!({"tick": "idle"});
-        }
-    }
+    // RULINGS HH4 (T7b, K2): once the daemon is ready the job is due at EVERY tick — this lane's
+    // propagation runs each time (an "idle" answer is gone). T6's own work still decides its
+    // due-times inside `probation::run_tick` (nothing due there → it returns at once and writes
+    // nothing); single flight below is unchanged (a tick that finds the job alive is `busy`, never
+    // queued)
     if daemon
         .repair_tick_running
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -278,7 +272,40 @@ fn run_job(daemon: &Arc<Daemon>, force_sweep: bool) {
         }
         Err(e) => eprintln!("[cysd] repair tick: 이번 차례는 멈췄습니다(다음 차례에 다시) — {e:?}"),
     }
+    // RULINGS HH4 (T7b): this lane's propagation after T6's run, at every tick (K2) — its own rows
+    // only (K1), ledger only (nothing is sent), the pack-apply lock TRIED, never waited for
+    let prop_pack = propagation_pack(daemon, &pack);
+    match crate::repair::propagate_verbs::run_on_job_thread(daemon, &root, &prop_pack) {
+        Ok(r) => {
+            if !r.rows.is_empty() || !r.lines.is_empty() || r.catchup_completed {
+                eprintln!(
+                    "[cysd] repair propagation: {} row(s) decided, {} left, {} line(s), catch-up completed {}",
+                    r.rows.len(),
+                    r.left.len(),
+                    r.lines.len(),
+                    r.catchup_completed
+                );
+            }
+        }
+        Err(e) => eprintln!("[cysd] repair propagation: 이 부서의 전파는 이번 차례에 멈췄습니다 — {e:?}"),
+    }
     daemon.repair_last_tick.store(now_ms(), Ordering::SeqCst);
+}
+
+/// The pack this lane's propagation works on: the lane's own pack in production; in the test build a
+/// folder under this daemon's test root (the pass writes `<pack>/.repair-pack-id`, and one
+/// `CYS_PACK_DIR` serves a whole test binary — the pass must not write into it).
+fn propagation_pack(daemon: &Daemon, pack: &Path) -> PathBuf {
+    #[cfg(test)]
+    {
+        let _ = pack;
+        job_root(daemon).join(".propagation-test-pack")
+    }
+    #[cfg(not(test))]
+    {
+        let _ = daemon;
+        pack.to_path_buf()
+    }
 }
 
 #[cfg(test)]
