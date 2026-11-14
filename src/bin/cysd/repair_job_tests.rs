@@ -141,17 +141,22 @@ fn sweep_reply_carries_notices_once() {
     let spawn = |_: &Arc<Daemon>, _: bool| -> Result<(), String> { Ok(()) };
     let v = trigger_with(&daemon, "sweep", &root, &pack, &spawn);
     assert_eq!(v["notices"].as_array().unwrap().len(), 1, "{v}");
+    // GK3 (REWRITTEN — old expectation: the second sweep carried 0 notices "never twice" because the
+    // first reply marked them told): the reply marks nothing; the receiver confirms the key it took,
+    // and only then is the notice never carried again
+    let key = v["notices"][0]["key"].as_str().unwrap().to_string();
+    assert_eq!(confirm_notices(&daemon, &root, &[key])["confirmed"], 1);
     daemon.repair_tick_running.store(false, Ordering::SeqCst);
     let v = trigger_with(&daemon, "sweep", &root, &pack, &spawn);
-    assert_eq!(v["notices"].as_array().unwrap().len(), 0, "never twice: {v}");
+    assert_eq!(v["notices"].as_array().unwrap().len(), 0, "never twice once confirmed: {v}");
     let _ = std::fs::remove_dir_all(root.parent().unwrap());
 }
 
-/// RULINGS FG2 / FI3 (codex r4 M3) through the real trigger path: the due notices are acknowledged
-/// only once the job started and the reply carrying them is handed over — a failed spawn, then a
-/// failed acknowledgement (the M10 folder read-only), leave EVERY notice due; the next sweep carries
-/// all of them, the one after none. Without FG2 the notices were marked told BEFORE the spawn and a
-/// failed spawn lost them (the next reply carried none).
+/// RULINGS FG2 / FI3 / GK3 through the real trigger path (REWRITTEN — old expectations: a failed
+/// acknowledgement written by the trigger left the notices due and the fourth call carried none,
+/// "acknowledged once handed over"). Now the trigger never acknowledges: a failed spawn hands out
+/// nothing; a hand-out count that cannot be written (the M10 folder read-only) hands out nothing and
+/// says so; every later reply carries ALL due notices until their receiver confirms them.
 #[cfg(unix)]
 #[test]
 fn notices_survive_a_failed_spawn_and_a_failed_acknowledgement() {
@@ -174,19 +179,55 @@ fn notices_survive_a_failed_spawn_and_a_failed_acknowledgement() {
     let ok = |_: &Arc<Daemon>, _: bool| -> Result<(), String> { Ok(()) };
     let v = trigger_with(&daemon, "sweep", &root, &pack, &fail);
     assert_eq!(v["tick"], "busy", "{v}");
-    // the acknowledgement fails: the M10 folder cannot take the write
+    // the hand-out count cannot be written: nothing handed out, said
     let m10 = f.parent().unwrap().to_path_buf();
     std::fs::set_permissions(&m10, std::fs::Permissions::from_mode(0o555)).unwrap();
     let v = trigger_with(&daemon, "sweep", &root, &pack, &ok);
     std::fs::set_permissions(&m10, std::fs::Permissions::from_mode(0o755)).unwrap();
-    assert_eq!(v["notices"].as_array().unwrap().len(), 2, "both carried after the failed spawn: {v}");
-    assert!(v["notices_ack_error"].is_string(), "{v}");
+    assert_eq!(v["notices"].as_array().unwrap().len(), 0, "{v}");
+    assert!(v["notices_error"].is_string(), "{v}");
     daemon.repair_tick_running.store(false, Ordering::SeqCst);
     let v = trigger_with(&daemon, "sweep", &root, &pack, &ok);
-    assert_eq!(v["notices"].as_array().unwrap().len(), 2, "ALL still due after the failed acknowledgement: {v}");
+    assert_eq!(v["notices"].as_array().unwrap().len(), 2, "ALL still due: {v}");
+    let keys: Vec<String> = v["notices"].as_array().unwrap().iter().map(|n| n["key"].as_str().unwrap().to_string()).collect();
+    assert_eq!(confirm_notices(&daemon, &root, &keys)["confirmed"], 2);
     daemon.repair_tick_running.store(false, Ordering::SeqCst);
     let v = trigger_with(&daemon, "sweep", &root, &pack, &ok);
-    assert_eq!(v["notices"].as_array().unwrap().len(), 0, "acknowledged once handed over: {v}");
+    assert_eq!(v["notices"].as_array().unwrap().len(), 0, "confirmed by the receiver: {v}");
+    let _ = std::fs::remove_dir_all(root.parent().unwrap());
+}
+
+/// RULINGS GK3 (codex r5 M1): a stop between the reply and the receiver's confirmation leaves the
+/// notices due — the reply carries them with their keys and marks nothing; and a receiver that
+/// never confirms is handed the same notice at most three times: the fourth sweep hands out
+/// nothing, and the notice is listed as not confirmed (shown by `cys repair status`). Without GK3
+/// the trigger acknowledged the notices before its reply left the daemon.
+#[test]
+fn an_unconfirmed_notice_is_handed_out_three_times_then_closed() {
+    let (daemon, root, pack) = rig("t6-gk3");
+    mark_ready(&daemon);
+    let lane = LaneKey::of_socket(&daemon.socket_path);
+    let f = cys::repair::probation::findings_path_in(&root, &lane);
+    std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+    std::fs::write(
+        &f,
+        serde_json::json!({"schema": 1, "lane": lane.0, "findings": [
+            {"rel": "hooks/x.sh", "sha256": "ab", "kind": "kept", "at": 1.0, "notice": true, "notified": false, "slot": null, "note": "n"}
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    let ok = |_: &Arc<Daemon>, _: bool| -> Result<(), String> { Ok(()) };
+    for round in 1..=3 {
+        let v = trigger_with(&daemon, "sweep", &root, &pack, &ok);
+        assert_eq!(v["notices"].as_array().unwrap().len(), 1, "hand-out {round}: {v}");
+        assert!(v["notices"][0]["key"].is_string(), "{v}");
+        daemon.repair_tick_running.store(false, Ordering::SeqCst);
+    }
+    let v = trigger_with(&daemon, "sweep", &root, &pack, &ok);
+    assert_eq!(v["notices"].as_array().unwrap().len(), 0, "the fourth sweep hands out nothing: {v}");
+    let closed = cys::repair::probation::notices_not_confirmed_in(&root, &lane).unwrap();
+    assert_eq!(closed, vec!["f:hooks/x.sh:ab:kept".to_string()], "listed as not confirmed");
     let _ = std::fs::remove_dir_all(root.parent().unwrap());
 }
 

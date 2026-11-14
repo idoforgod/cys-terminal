@@ -59,11 +59,29 @@ pub(crate) fn job_root(daemon: &Daemon) -> PathBuf {
 /// `repair.tick` / `repair.sweep` (TRIGGER — any caller, the seatless scheduler included): answers at
 /// once. `sweep` (the preflight's trigger, M10) forces the scan and carries the findings not yet
 /// told to the owner — each exactly once.
-pub(crate) fn trigger(daemon: &Arc<Daemon>, sub: &str) -> Value {
+pub(crate) fn trigger(daemon: &Arc<Daemon>, sub: &str, params: &Value) -> Value {
     let root = job_root(daemon);
+    // RULINGS GK3: the receiver's SECOND call confirms the keys it took — only that call writes the
+    // acknowledgement; it starts nothing
+    if sub == "sweep" {
+        if let Some(keys) = params.get("confirm").and_then(|v| v.as_array()) {
+            let keys: Vec<String> = keys.iter().filter_map(|k| k.as_str().map(str::to_string)).collect();
+            return confirm_notices(daemon, &root, &keys);
+        }
+    }
     trigger_with(daemon, sub, &root, &cys::pack::pack_dir(), &|d, force| {
         spawn_job(d, force)
     })
+}
+
+/// RULINGS GK3 — the receiver confirms the notice keys it took: ONE durable write of the
+/// acknowledgement; nothing else.
+pub(crate) fn confirm_notices(daemon: &Arc<Daemon>, root: &Path, keys: &[String]) -> Value {
+    let lane = LaneKey::of_socket(&daemon.socket_path);
+    match cys::repair::probation::ack_notices_in(root, &lane, keys) {
+        Ok(()) => json!({"confirmed": keys.len()}),
+        Err(e) => json!({"confirmed": 0, "error": format!("{e:?}")}),
+    }
 }
 
 /// The decision of [`trigger`] with the root, the pack and the thread spawner injected (tests).
@@ -99,16 +117,17 @@ pub(crate) fn trigger_with(
     {
         return json!({"tick": "busy"});
     }
-    // RULINGS FG2 / FI3: reading the due notices and acknowledging them are TWO steps — read here
-    // (nothing marked), acknowledged only once the job started and the reply carrying them is handed
-    // over; an unreadable source is said in the reply, never an empty list
+    // RULINGS FG2 / GK3: the reply carries the due notices WITH their keys and marks nothing — the
+    // receiver confirms the keys in a second call (`confirm_notices`); each hand-out is counted
+    // durably, and a notice handed out three times without confirmation is closed "not confirmed";
+    // an unreadable source is said in the reply, never an empty list
     let (notices, keys, notices_error): (Vec<Value>, Vec<String>, Option<String>) = if force_sweep {
         match cys::repair::probation::due_notices_in(root, &lane) {
             Ok(due) => (
                 due.iter()
                     .map(|d| {
                         let f = &d.finding;
-                        json!({"rel": f.rel, "kind": f.kind, "sha256": f.sha256, "kept_copy": f.kept_copy, "note": f.note, "slot": f.slot})
+                        json!({"key": d.key, "rel": f.rel, "kind": f.kind, "sha256": f.sha256, "kept_copy": f.kept_copy, "note": f.note, "slot": f.slot})
                     })
                     .collect(),
                 due.iter().map(|d| d.key.clone()).collect(),
@@ -121,13 +140,15 @@ pub(crate) fn trigger_with(
     };
     match spawn(daemon, force_sweep) {
         Ok(()) => {
+            // GK3: the hand-out is counted BEFORE the notices go out — a count that cannot be written
+            // hands out nothing (the notices stay due; never an unbounded repeat)
+            let (notices, notices_error) = match cys::repair::probation::hand_out_notices_in(root, &lane, &keys) {
+                Ok(()) => (notices, notices_error),
+                Err(e) => (Vec::new(), Some(format!("알림을 건넨 횟수를 적지 못해 이번에는 건네지 않습니다 — 다음 확인 때 다시: {e:?}"))),
+            };
             let mut reply = json!({"tick": "started", "sweep": force_sweep, "notices": notices});
             if let Some(e) = notices_error {
                 reply["notices_error"] = json!(e);
-            }
-            if let Err(e) = cys::repair::probation::ack_notices_in(root, &lane, &keys) {
-                // all of them stay due: told again at the next sweep (twice, never lost)
-                reply["notices_ack_error"] = json!(format!("{e:?}"));
             }
             reply
         }

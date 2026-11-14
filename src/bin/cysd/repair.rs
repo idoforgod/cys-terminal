@@ -433,7 +433,7 @@ pub(crate) fn handle(
     // T6 (C7 O-C7-2 (a)): the appended job's trigger answers at once from the daemon's own state.
     if sub == "tick" || sub == "sweep" {
         return Reply::Single(match role_check(sub, &caller, cfg!(windows)) {
-            Ok(()) => ok_response(id, crate::repair_job::trigger(daemon, sub)),
+            Ok(()) => ok_response(id, crate::repair_job::trigger(daemon, sub, params)),
             Err(e) => err_response(id, &e.code, &format!("repair.{sub}: {}", e.message)),
         });
     }
@@ -3352,6 +3352,12 @@ mod ledger_verbs {
                 "waiting": r1.is_empty() || r2.is_empty(),
             },
         });
+        // T6 · RULINGS GK3: the owner notices closed "not confirmed" (handed out three times without
+        // their receiver's confirmation) stay visible here
+        out["notices_not_confirmed"] = match cys::repair::probation::notices_not_confirmed_in(&ctx.root, &ctx.lane) {
+            Ok(keys) => json!(keys),
+            Err(e) => json!({"unreadable": VerbError::from(e).message}),
+        };
         // RULINGS H3: the lane's catch-up fields (display only; T7b computes them).
         match cys::repair::apply::catchup_status(&ctx.lane) {
             Ok(c) => {

@@ -136,6 +136,18 @@ fn committed(r: &Rig, rel: &str, post: &[u8]) -> String {
     id
 }
 
+/// RULINGS GK3: a notice closed "not confirmed" (handed out three times without its receiver's
+/// confirmation) stays visible in `cys repair status`.
+#[test]
+fn status_lists_the_notices_not_confirmed() {
+    let r = rig("gk3status");
+    let p = cys::repair::probation::notices_handed_path_in(&r.root, &r.lane);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(&p, json!({"schema": 1, "lane": r.lane.0, "counts": {"f:hooks/x.sh:ab:kept": 3, "f:hooks/y.sh:cd:kept": 1}}).to_string()).unwrap();
+    let s = r.call(T0, &human(), "status", json!({})).unwrap();
+    assert_eq!(s["notices_not_confirmed"], json!(["f:hooks/x.sh:ab:kept"]), "{s}");
+}
+
 /// RULINGS GK4 (codex r5 M2) through the daemon's commit verb: the pack is updated BETWEEN `begin`
 /// (whose pre-image copy records its generation) and `commit` — the commit still succeeds, the row
 /// says the repair cannot be returned automatically, it is not offered to a revert, and nothing is

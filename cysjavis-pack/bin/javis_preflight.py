@@ -7789,6 +7789,14 @@ class Preflight:
             lines = ["%s — %s" % (n.get("rel", "?"), n.get("note", "")) for n in notices]
             self.add(cid, WARN, "승인 없이 바뀐 기동 필수 파일 %d건(이번에 처음 알림): %s · 훑기 요청 %s"
                      % (len(lines), " · ".join(lines), state))
+            # RULINGS GK3: the notices are taken (reported above) — only now are their keys confirmed,
+            # in a SECOND call; a notice never confirmed is handed out at most three times
+            keys = [str(n["key"]) for n in notices if n.get("key")]
+            if keys:
+                args = ["repair", "sweep", "--json"]
+                for k in keys:
+                    args += ["--confirm", k]
+                _cys_local_json(args, timeout=REPAIR_SWEEP_TIMEOUT_S)
         else:
             self.add(cid, PASS, "훑기 요청 %s — 새로 알릴 미승인 변경 없음" % state)
 

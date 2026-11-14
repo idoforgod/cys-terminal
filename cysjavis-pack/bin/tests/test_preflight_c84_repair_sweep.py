@@ -40,13 +40,23 @@ class C84RepairSweep(unittest.TestCase):
             pf._cys_local_json = orig
 
     def test_fix_mode_requests_the_sweep_and_reports_new_notices(self):
+        # GK3 (REWRITTEN — old expectation: exactly ONE call, `repair sweep --json`): the notices are
+        # reported, THEN their keys are confirmed in a second call (the daemon marks nothing itself)
         rows, calls = self.run_check("fix", {"tick": "started", "notices": [
-            {"rel": "hooks/inject-context.sh", "note": "승인 없이 바뀌었지만 자체 검사를 통과 — 그대로 둠", "kind": "kept"}]})
-        self.assertEqual(calls, [(["repair", "sweep", "--json"], pf.REPAIR_SWEEP_TIMEOUT_S)])
+            {"key": "f:hooks/inject-context.sh:ab:kept", "rel": "hooks/inject-context.sh",
+             "note": "승인 없이 바뀌었지만 자체 검사를 통과 — 그대로 둠", "kind": "kept"}]})
+        self.assertEqual(calls, [(["repair", "sweep", "--json"], pf.REPAIR_SWEEP_TIMEOUT_S),
+                                 (["repair", "sweep", "--json", "--confirm", "f:hooks/inject-context.sh:ab:kept"],
+                                  pf.REPAIR_SWEEP_TIMEOUT_S)])
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["id"], "C84.repair-sweep")
         self.assertEqual(rows[0]["status"], WARN)
         self.assertIn("hooks/inject-context.sh", rows[0]["detail"])
+
+    def test_nothing_is_confirmed_without_notices(self):
+        # GK3: no notice taken → no confirmation call
+        _, calls = self.run_check("fix", {"tick": "started", "notices": []})
+        self.assertEqual(len(calls), 1)
 
     def test_no_notice_is_pass(self):
         rows, _ = self.run_check("fix", {"tick": "busy", "notices": []})

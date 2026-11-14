@@ -188,6 +188,9 @@ pub(crate) enum RepairCmd {
     Sweep {
         #[arg(long)]
         json: bool,
+        /// RULINGS GK3: confirm the notice keys taken from an earlier sweep reply (repeatable)
+        #[arg(long, value_name = "KEY")]
+        confirm: Vec<String>,
     },
     /// 이 부서에서 합친 뒤 장부의 검사를 다시 돌리기(병합 잠금을 쥔 워커)
     Recheck {
@@ -674,6 +677,7 @@ fn t6_request(cmd: &RepairCmd) -> Option<(&'static str, Value)> {
     Some(match cmd {
         RepairCmd::Revert { repair } => ("repair.revert", json!({"repair": repair})),
         RepairCmd::Reapply { repair } => ("repair.reapply", json!({"repair": repair})),
+        RepairCmd::Sweep { confirm, .. } if !confirm.is_empty() => ("repair.sweep", json!({"confirm": confirm})),
         RepairCmd::Sweep { .. } => ("repair.sweep", json!({})),
         RepairCmd::Tick => ("repair.tick", json!({})),
         _ => return None,
@@ -683,7 +687,7 @@ fn t6_request(cmd: &RepairCmd) -> Option<(&'static str, Value)> {
 /// The printed result of a T6 verb (a refusal is the daemon's sentence on stderr — `fail`).
 fn t6_print(cmd: &RepairCmd, out: &mut dyn Write, v: &Value) -> i32 {
     let r = match cmd {
-        RepairCmd::Sweep { json: true } => writeln!(out, "{v}"),
+        RepairCmd::Sweep { json: true, .. } => writeln!(out, "{v}"),
         RepairCmd::Revert { .. } => {
             let id = s(v, "repair");
             if v.get("reverted") == Some(&Value::Bool(true)) {

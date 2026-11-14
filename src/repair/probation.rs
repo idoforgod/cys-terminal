@@ -1266,6 +1266,56 @@ fn load_notice_acks(root: &Path, lane: &LaneKey) -> Result<std::collections::BTr
     Ok(read_json_checked::<NoticeAcks>(&notices_acked_path_in(root, lane))?.map(|a| a.keys).unwrap_or_default())
 }
 
+/// RULINGS GK3 — how many times a notice may be handed out without its receiver's confirmation;
+/// after that it is closed "not confirmed": never handed out again, shown in `cys repair status`.
+pub const NOTICE_HAND_OUTS: u32 = 3;
+
+/// `<root>/m10/<lane>.notices-handed.json` — the hand-out count of each notice key (GK3).
+pub fn notices_handed_path_in(root: &Path, lane: &LaneKey) -> PathBuf {
+    root.join("m10").join(format!("{}.notices-handed.json", lane.0))
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+struct NoticeHandOuts {
+    schema: u32,
+    lane: String,
+    counts: std::collections::BTreeMap<String, u32>,
+}
+
+/// FG1 / GK3: the hand-out counts (absent on positive evidence = none handed out yet).
+fn load_hand_outs(root: &Path, lane: &LaneKey) -> Result<std::collections::BTreeMap<String, u32>, RepairError> {
+    Ok(read_json_checked::<NoticeHandOuts>(&notices_handed_path_in(root, lane))?.map(|h| h.counts).unwrap_or_default())
+}
+
+/// RULINGS GK3 — these notices were handed out in a reply: each key's count goes up by one, in ONE
+/// durable write (keys acknowledged meanwhile are dropped from the counts). Nothing is acknowledged.
+pub fn hand_out_notices_in(root: &Path, lane: &LaneKey, keys: &[String]) -> Result<(), RepairError> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let acked = load_notice_acks(root, lane)?;
+    let mut counts = load_hand_outs(root, lane)?;
+    counts.retain(|k, _| !acked.contains(k));
+    for k in keys {
+        *counts.entry(k.clone()).or_insert(0) += 1;
+    }
+    super::durable::write_json_durable(
+        &notices_handed_path_in(root, lane),
+        &NoticeHandOuts { schema: super::REPAIR_SCHEMA, lane: lane.0.clone(), counts },
+    )
+}
+
+/// RULINGS GK3 — the notices closed "not confirmed": handed out [`NOTICE_HAND_OUTS`] times without
+/// their receiver's confirmation (and not acknowledged since).
+pub fn notices_not_confirmed_in(root: &Path, lane: &LaneKey) -> Result<Vec<String>, RepairError> {
+    let acked = load_notice_acks(root, lane)?;
+    Ok(load_hand_outs(root, lane)?
+        .into_iter()
+        .filter(|(k, n)| *n >= NOTICE_HAND_OUTS && !acked.contains(k))
+        .map(|(k, _)| k)
+        .collect())
+}
+
 /// The acknowledgement key of a finding's notice (one per file, bytes and kind).
 pub fn notice_key_of_finding(f: &Finding) -> String {
     format!("f:{}:{}:{}", f.rel, f.sha256, f.kind)
@@ -1320,6 +1370,13 @@ fn save_findings(root: &Path, lane: &LaneKey, findings: &[Finding]) -> Result<()
 /// never an empty list (FG1).
 pub fn due_notices_in(root: &Path, lane: &LaneKey) -> Result<Vec<DueNotice>, RepairError> {
     let acked = load_notice_acks(root, lane)?;
+    // GK3: a notice handed out NOTICE_HAND_OUTS times without confirmation is closed — not due
+    let closed: std::collections::BTreeSet<String> = load_hand_outs(root, lane)?
+        .into_iter()
+        .filter(|(_, n)| *n >= NOTICE_HAND_OUTS)
+        .map(|(k, _)| k)
+        .collect();
+    let acked: std::collections::BTreeSet<String> = acked.union(&closed).cloned().collect();
     let mut out = Vec::new();
     for f in load_findings_checked(root, lane)? {
         let key = notice_key_of_finding(&f);
