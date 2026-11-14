@@ -553,29 +553,45 @@ pub fn pause_uncertain_in(root: &Path) -> bool {
 /// stored `resumed_at` honoured up to [`PAUSE_EXTENSION_MAX_SECS`] later; an unreadable mark counts
 /// with its modification time, or "now" — fail closed). `None` = no owner input known.
 pub fn pause_deadline_in(root: &Path, now: f64) -> Option<f64> {
+    pause_read_in(root, now).0
+}
+
+/// [`pause_deadline_in`] and whether the stored pause could not be read in full (RULINGS DG3 (b):
+/// a failure to list the pause directory other than "not found", or an unreadable directory entry,
+/// is uncertainty — no autonomous start).
+fn pause_read_in(root: &Path, now: f64) -> (Option<f64>, bool) {
+    let mut unreadable = false;
     let mut end: Option<f64> = read_decision_in(root)
         .ok()
         .flatten()
         .and_then(|d| d.paused_at.map(|p| mark_deadline(p, d.resumed_at)));
     let mut bump = |t: f64| end = Some(end.map_or(t, |l: f64| l.max(t)));
     let dir = root.join("grant-pause");
-    if let Ok(rd) = std::fs::read_dir(&dir) {
-        for e in rd.flatten() {
-            let p = e.path();
-            let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            if name.starts_with('.') || !name.ends_with(".json") {
-                continue; // a temporary file of a writer
-            }
-            match std::fs::read(&p)
-                .map_err(|e| corrupt(&p, e))
-                .and_then(|b| parse_versioned::<PauseMark>(&p, &b))
-            {
-                Ok(m) => bump(mark_deadline(m.paused_at, Some(m.resumed_at))),
-                Err(_) => bump(mtime_epoch(&p).unwrap_or(now) + PAUSE_QUIET_SECS as f64),
+    match std::fs::read_dir(&dir) {
+        Ok(rd) => {
+            for e in rd {
+                let Ok(e) = e else {
+                    unreadable = true; // DG3 (b)
+                    continue;
+                };
+                let p = e.path();
+                let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if name.starts_with('.') || !name.ends_with(".json") {
+                    continue; // a temporary file of a writer
+                }
+                match std::fs::read(&p)
+                    .map_err(|e| corrupt(&p, e))
+                    .and_then(|b| parse_versioned::<PauseMark>(&p, &b))
+                {
+                    Ok(m) => bump(mark_deadline(m.paused_at, Some(m.resumed_at))),
+                    Err(_) => bump(mtime_epoch(&p).unwrap_or(now) + PAUSE_QUIET_SECS as f64),
+                }
             }
         }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => unreadable = true, // DG3 (b): cannot list it → uncertain
     }
     for ((r, _), m) in pause_memory()
         .lock()
@@ -586,7 +602,7 @@ pub fn pause_deadline_in(root: &Path, now: f64) -> Option<f64> {
             bump(m.deadline);
         }
     }
-    end
+    (end, unreadable)
 }
 
 /// The time of the last owner input known to the grant (`grant.json.paused_at` written with the
@@ -632,19 +648,43 @@ impl PauseState {
     }
 }
 
-/// [`PauseState`] of `root` read now.
+/// [`PauseState`] of `root` read now: uncertain when a write failed in this process (CV3) or the
+/// stored pause could not be read in full (DG3 (b)).
 pub fn pause_state_in(root: &Path, now: f64) -> PauseState {
+    let (deadline, unreadable) = pause_read_in(root, now);
     PauseState {
-        uncertain: pause_uncertain_in(root),
-        deadline: pause_deadline_in(root, now),
+        uncertain: unreadable || pause_uncertain_in(root),
+        deadline,
     }
+}
+
+/// RULINGS DG3 (c) — the start time of the daemon an attempt runs in, from its incarnation
+/// (`"{started_at:x}-{pid:x}"` — `seat_token_generation` in the daemon's `state.rs`; the lock owner
+/// of every attempt carries it). `None` = not that shape (then no hold).
+pub fn incarnation_started_at(incarnation: &str) -> Option<f64> {
+    let (hex, pid) = incarnation.split_once('-')?;
+    if hex.is_empty()
+        || pid.is_empty()
+        || !hex.bytes().all(|b| b.is_ascii_hexdigit())
+        || !pid.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    u64::from_str_radix(hex, 16).ok().map(|s| s as f64)
+}
+
+/// RULINGS DG3 (c) — after a daemon start its lane holds AUTONOMOUS starts for the pause length:
+/// its memory of recent owner input (and of a failed pause write) is gone, so it waits as if an
+/// owner input had come at its start. The owner's own "고쳐라" (`owner_order`) never comes here.
+pub fn restart_hold_until(owner: &LockOwner) -> Option<f64> {
+    incarnation_started_at(&owner.incarnation).map(|s| s + PAUSE_QUIET_SECS as f64)
 }
 
 /// B4 / CV3: paused while the pause has not ended ([`pause_deadline_in`] — memory and file, the
 /// later wins), and while a pause write failed and has not succeeded since (fail closed). A clock
 /// set back keeps the pause on (the safe side).
 pub fn is_paused_in(root: &Path, now: f64) -> bool {
-    pause_uncertain_in(root) || pause_deadline_in(root, now).is_some_and(|d| now < d)
+    pause_state_in(root, now).paused_at(now)
 }
 
 /// The modification time of `p` in epoch seconds (`None` = cannot be read).
@@ -1132,7 +1172,8 @@ pub fn try_claim_in(
         return Ok(StartVerdict::Busy);
     }
     reconcile_pause_in(env.root, (env.clock)()); // CV3: a failed pause write is retried before admission
-    if is_paused_in(env.root, (env.clock)()) {
+    let held = |now: f64| restart_hold_until(owner).is_some_and(|h| now < h); // DG3 (c)
+    if is_paused_in(env.root, (env.clock)()) || held((env.clock)()) {
         return Ok(StartVerdict::Paused);
     }
     let (count, mine) = count_today(env, &snap, &day, id);
@@ -1193,7 +1234,7 @@ pub fn try_claim_in(
     let gen = |d: &Option<GrantDecision>| d.as_ref().map(|d| (d.state, d.generation));
     let on_now = is_on(d1.as_ref()) && is_on(d2.as_ref());
     let same = gen(&d1) == gen(&d2) && d2.as_ref().map(|d| d.generation) == Some(generation);
-    let paused = p1.paused_at(now) || p2.paused_at(now) || p1 != p2;
+    let paused = p1.paused_at(now) || p2.paused_at(now) || p1 != p2 || held(now);
     if !on_now || !same || paused {
         if let Err(e) = create_marker(env.root, target) {
             // stderr only (F1); the claim's lock is released below, so it is closable by any evaluator

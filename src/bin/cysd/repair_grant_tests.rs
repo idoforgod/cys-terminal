@@ -1755,3 +1755,36 @@ fn cv3_a_failed_pause_write_keeps_starts_paused() {
         .unwrap();
     assert!(v["repair"].is_string(), "{v}");
 }
+
+/// RULINGS DG3 (c) at the daemon: the start time comes from the daemon's own incarnation (pinned
+/// here against a real test daemon — no line on the daemon's start path); within 30 minutes of the
+/// start `begin --trigger grant` is held and `grant status` says paused, while the owner's own
+/// "고쳐라" (`--trigger owner_order`) is never held.
+#[test]
+fn dg3_after_a_daemon_start_autonomous_starts_wait_owner_orders_do_not() {
+    let d = crate::team_gate_tests::tmp_daemon("t4b-dg3", false);
+    assert_eq!(
+        grant::incarnation_started_at(&d.incarnation),
+        Some((d.started_at as u64) as f64),
+        "the incarnation carries the daemon's start time"
+    );
+    let mut r = rig("dg3c");
+    let t = now0();
+    r.inc = format!("{:x}-{:x}", (t - 60.0) as u64, std::process::id());
+    r.grant_on(5);
+    let w = seat(3, "worker");
+    let e = r
+        .call(t, &w, "begin", json!({"trigger": "grant", "files": ["bin/a.py"]}))
+        .unwrap_err();
+    assert!(e.message.contains("일시정지"), "{}", e.message);
+    let st = r.call(t, &master(), "grant_status", json!({})).unwrap();
+    assert_eq!(st["paused"], true, "{st}");
+    let v = r
+        .call(t, &w, "begin", json!({"trigger": "owner_order", "files": ["bin/b.py"]}))
+        .unwrap();
+    assert!(v["repair"].is_string(), "an owner order is never held: {v}");
+    let v = r
+        .call(t - 60.0 + 1_801.0, &seat(4, "worker-2"), "begin", json!({"trigger": "grant", "files": ["bin/a.py"]}))
+        .unwrap();
+    assert!(v["repair"].is_string(), "after 30 minutes the hold is over: {v}");
+}

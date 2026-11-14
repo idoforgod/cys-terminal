@@ -1237,3 +1237,45 @@ fn dg4_a_stored_pause_end_never_moves_back() {
     let m: PauseMark = serde_json::from_slice(&std::fs::read(pause_path_in(&r2, &lane)).unwrap()).unwrap();
     assert_eq!(m.paused_at, t + 7.0, "the latest input is stored whatever the completion order");
 }
+
+/// DG3 (b): a pause directory that cannot be listed (no permission) is uncertainty — paused, no
+/// autonomous start — and an ordinary absent directory is not.
+#[cfg(unix)]
+#[test]
+fn dg3_an_unreadable_pause_directory_is_uncertainty() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = root("dg3b");
+    grant_on(&r, 5);
+    let t = t0();
+    assert!(!is_paused_in(&r, t), "no directory = no input known");
+    let dir = r.join("grant-pause");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let listable = std::fs::read_dir(&dir).is_ok(); // running as root ignores the mode
+    if !listable {
+        assert!(pause_state_in(&r, t).uncertain);
+        assert!(is_paused_in(&r, t + 86_400.0));
+        let o = owner("base", 3, "inc-1");
+        assert_eq!(start_new(&r, t, D, &o).1.unwrap(), StartVerdict::Paused);
+    }
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(!is_paused_in(&r, t));
+}
+
+/// DG3 (c): after its daemon started, a lane holds AUTONOMOUS starts for the pause length (the start
+/// time comes from the attempt's lock owner — the daemon incarnation "{started_at:x}-{pid:x}");
+/// an incarnation of another shape (the tests' "inc-1") holds nothing.
+#[test]
+fn dg3_a_lane_holds_autonomous_starts_after_its_daemon_started() {
+    let r = root("dg3c");
+    grant_on(&r, 5);
+    let t = t0();
+    let started = (t - 100.0).floor();
+    let inc = format!("{:x}-{:x}", started as u64, 4242);
+    assert_eq!(incarnation_started_at(&inc), Some(started));
+    assert_eq!(incarnation_started_at("inc-1"), None);
+    assert_eq!(incarnation_started_at("abc"), None);
+    let o = owner("base", 3, &inc);
+    assert_eq!(start_new(&r, t, D, &o).1.unwrap(), StartVerdict::Paused, "held: started 100 s ago");
+    assert!(allowed(&start_new(&r, started + 1_800.5, D, &o).1), "the hold ends 30 min after the start");
+}

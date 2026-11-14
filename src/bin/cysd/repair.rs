@@ -3826,9 +3826,17 @@ mod grant_verbs {
             return Err(VerbError::invalid(CAP_ON_ASK_ONLY_KO));
         }
         let d = grant::read_decision_in(&ctx.root)?;
-        // CV3: the later of this daemon's memory and the stored marks; a failed pause write = paused
-        let paused = grant::is_paused_in(&ctx.root, ctx.now);
-        let until = grant::pause_deadline_in(&ctx.root, ctx.now).filter(|t| ctx.now < *t);
+        // CV3: the later of this daemon's memory and the stored marks; a failed pause write or an
+        // unreadable pause directory = paused (DG3 (b)); the hold after this daemon's start (DG3 (c))
+        let st = grant::pause_state_in(&ctx.root, ctx.now);
+        let hold = grant::incarnation_started_at(&ctx.incarnation)
+            .map(|s| s + grant::PAUSE_QUIET_SECS as f64)
+            .filter(|h| ctx.now < *h);
+        let paused = st.paused_at(ctx.now) || hold.is_some();
+        let until = [st.deadline.filter(|t| ctx.now < *t), hold]
+            .into_iter()
+            .flatten()
+            .reduce(f64::max);
         Ok(json!({
             "state": if grant::is_on(d.as_ref()) { "on" } else { "off" },
             "paused": paused,
