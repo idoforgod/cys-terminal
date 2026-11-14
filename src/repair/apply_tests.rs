@@ -1930,5 +1930,12 @@ fn a_stubborn_child_and_a_failing_kill_never_hold_the_runner() {
     FAIL_GROUP_KILL.with(|c| c.set(0));
     assert!(t.elapsed() < Duration::from_secs(4), "returns in every case");
     let msg = format!("{res:?}");
+    // leave nothing behind: stop the group this test kept alive, by its exact id from the report
+    if let Some(pgid) = msg.split("pgid ").nth(1).and_then(|t| t.split(|c: char| !c.is_ascii_digit()).next()).and_then(|p| p.parse::<i32>().ok()) {
+        // SAFETY: the test's own child's group.
+        unsafe {
+            libc::killpg(pgid, libc::SIGKILL);
+        }
+    }
     assert!(msg.contains("멈추지 못했습니다"), "the failed kill is reported: {msg}");
 }
