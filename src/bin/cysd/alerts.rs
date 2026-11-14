@@ -1263,41 +1263,17 @@ pub fn rejected_arguments(rel: &str, error: &str) -> bool {
         })
 }
 
-/// RULINGS DD3 — the hook CLI's cut of a long failure text (`src/bin/cys.rs` `bounded_hook_error`, pinned to its
-/// source by `dd3_the_cut_text_gives_the_whole_texts_signature_or_none`): a text longer than HEAD + TAIL arrives as
-/// its first HEAD bytes, the elision line, its last TAIL bytes (each cut at a char boundary).
-const CLI_CUT_HEAD_BYTES: usize = 2 * 1024;
-const CLI_CUT_TAIL_BYTES: usize = 8 * 1024;
-const CLI_CUT_ELISION: &str = "\n…\n";
+/// RULINGS DO2 (completes DD3) — the hook CLI's elision marker: the line `src/bin/cys.rs` puts between the head
+/// and the tail of a cut `error` (`HOOK_FAILURE_ERROR_ELISION`, pinned to the CLI's source by
+/// `dd3_the_cut_text_gives_the_whole_texts_signature_or_none`). A failure text that holds it — cut by the transport,
+/// or holding it by coincidence — may have lost its canonical line, so the detector gives it NO row (a stated miss;
+/// a manual `cys repair report` reads the whole text and is unaffected). No length arithmetic: no UTF-8 boundary
+/// can make a cut text look whole, and one defect never gets a second signature.
+const CLI_ELISION_MARKER: &str = "\n…\n";
 
-/// The forwarded tail of a text the hook CLI cut; `None` when the text arrived whole.
-fn cli_cut_tail(e: &str) -> Option<&str> {
-    if e.len() <= CLI_CUT_HEAD_BYTES + CLI_CUT_TAIL_BYTES {
-        return None;
-    }
-    // the head ends at the last char boundary at or before HEAD (at most 3 bytes back); the tail starts at the
-    // first char boundary at or after len − TAIL (at most 3 bytes on)
-    (CLI_CUT_HEAD_BYTES.saturating_sub(3)..=CLI_CUT_HEAD_BYTES).rev().find_map(|h| {
-        let tail = e.get(h..)?.strip_prefix(CLI_CUT_ELISION)?;
-        (CLI_CUT_TAIL_BYTES.saturating_sub(3)..=CLI_CUT_TAIL_BYTES).contains(&tail.len()).then_some(tail)
-    })
-}
-
-/// RULINGS DD3 — ONE signature per defect from both intake sources: the manual report reads the WHOLE text, the
-/// detector a cut one. `intake::stable_error_line` takes the last exception after the LAST traceback header, else
-/// the first output line. For a cut text that choice is the whole text's only when the last header and everything
-/// after it lie in the forwarded tail: the tail (its first, possibly partial, line left out) holds a header and an
-/// unindented line after the last one. Otherwise a header may sit in the omitted middle → the detector declines
-/// (neither a failure nor a call): it never files a second signature for one defect.
-fn canonical_line_survives_cut(error: &str) -> bool {
-    let Some(tail) = cli_cut_tail(error) else {
-        return true;
-    };
-    let lines: Vec<&str> = tail.lines().skip(1).collect();
-    let Some(j) = lines.iter().rposition(|l| l.trim_start().starts_with("Traceback (most recent call last)")) else {
-        return false;
-    };
-    lines[j + 1..].iter().any(|l| !l.trim().is_empty() && !l.starts_with(char::is_whitespace))
+/// The text holds the hook CLI's elision marker (RULINGS DO2).
+fn holds_cli_elision(error: &str) -> bool {
+    error.contains(CLI_ELISION_MARKER)
 }
 
 /// A post-call event that says the call did not end well (the shapes the CLI forwards — RULINGS BE1).
@@ -1368,8 +1344,8 @@ pub fn classify(o: &ToolObservation<'_>, roots: &PackRoots, windows: bool) -> Cl
     if rejected_arguments(&rel, &raw) {
         return Classified::NotCounted { rel }; // RULINGS CF1: the script refused the caller's arguments
     }
-    if !canonical_line_survives_cut(o.error.unwrap_or_default()) {
-        return Classified::NotCounted { rel }; // RULINGS DD3: the canonical line may have been cut — declined
+    if holds_cli_elision(o.error.unwrap_or_default()) {
+        return Classified::NotCounted { rel }; // RULINGS DO2: cut (or holding the CLI's marker) — no detector row
     }
     if let Some(reason) = detector_excluded(&rel, sub.as_deref(), &raw, windows) {
         return Classified::Excluded { reason };
@@ -2746,76 +2722,111 @@ mod defect_intake_tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// RULINGS DD3 (J7 I3) — one signature per defect from both intake sources: the hook CLI forwards a failure
-    /// text longer than 10 KiB as its first 2 KiB + "\n…\n" + its last 8 KiB (`src/bin/cys.rs`
-    /// `bounded_hook_error`, pinned to its source here), the manual report reads the whole text. For every
-    /// failure text — the reviewer's sequence (a traceback longer than the tail, its header in the omitted
-    /// middle), headers in the head / the middle / the tail, none, short texts — the detector either gives the
-    /// SAME signature as the manual report of the whole text, or declines; never a different one.
+    /// RULINGS DO2 / DD3 (J7 I3, T3e round-2 I2) — one signature per defect from both intake sources: the hook CLI
+    /// forwards a failure text longer than 10 KiB as its head + "\n…\n" + its tail (`bounded_hook_error` — the copy
+    /// below is checked line for line against `src/bin/cys.rs`, with its constants, its marker and the line that
+    /// applies it to `error`); the manual report reads the whole text. A text holding the marker — every cut text,
+    /// the verdict's two-boundary UTF-8 case (2,045 head + 5 + 8,189 tail = 10,239 bytes, i.e. NOT longer than 10 KiB),
+    /// the reviewer's first sequence, a text holding the marker by coincidence — gets NO detector row; a whole text
+    /// gets the manual report's signature.
     #[test]
     fn dd3_the_cut_text_gives_the_whole_texts_signature_or_none() {
-        fn cli_cut(e: &str) -> String {
-            const HEAD: usize = 2 * 1024;
-            const TAIL: usize = 8 * 1024;
-            if e.len() <= HEAD + TAIL {
+        const HOOK_FAILURE_ERROR_HEAD_BYTES: usize = 2 * 1024;
+        const HOOK_FAILURE_ERROR_TAIL_BYTES: usize = 8 * 1024;
+        const HOOK_FAILURE_ERROR_ELISION: &str = "\n…\n";
+        fn bounded_hook_error(e: &str) -> String {
+            if e.len() <= HOOK_FAILURE_ERROR_HEAD_BYTES + HOOK_FAILURE_ERROR_TAIL_BYTES {
                 return e.to_string();
             }
-            let mut h = HEAD;
-            while !e.is_char_boundary(h) {
-                h -= 1;
+            let mut head_end = HOOK_FAILURE_ERROR_HEAD_BYTES;
+            while !e.is_char_boundary(head_end) {
+                head_end -= 1;
             }
-            let mut t = e.len() - TAIL;
-            while !e.is_char_boundary(t) {
-                t += 1;
+            let mut tail_start = e.len() - HOOK_FAILURE_ERROR_TAIL_BYTES;
+            while !e.is_char_boundary(tail_start) {
+                tail_start += 1;
             }
-            format!("{}\n…\n{}", &e[..h], &e[t..])
+            format!("{}{HOOK_FAILURE_ERROR_ELISION}{}", &e[..head_end], &e[tail_start..])
         }
+        // the copy IS the CLI's conversion: its function, constants, marker and its use on `error`, line for line
         let cli = include_str!("../cys.rs");
+        let me = include_str!("alerts.rs");
+        let func = |src: &str, end: &str| -> String {
+            let from = src.find("fn bounded_hook_error(e: &str) -> String {").expect("bounded_hook_error");
+            let body = &src[from..];
+            body[..body.find(end).expect("end of bounded_hook_error")].lines().map(str::trim).collect::<Vec<_>>().join("\n")
+        };
+        assert_eq!(func(me, "\n        }\n"), func(cli, "\n}\n"), "the hook CLI's cut changed — this test's copy no longer matches");
         for pin in [
             "const HOOK_FAILURE_ERROR_HEAD_BYTES: usize = 2 * 1024;",
             "const HOOK_FAILURE_ERROR_TAIL_BYTES: usize = 8 * 1024;",
             "const HOOK_FAILURE_ERROR_ELISION: &str = \"\\n…\\n\";",
-            "format!(\"{}{HOOK_FAILURE_ERROR_ELISION}{}\", &e[..head_end], &e[tail_start..])",
+            "p[\"error\"] = json!(bounded_hook_error(e));",
         ] {
-            assert!(cli.contains(pin), "the hook CLI's cut changed — this test's copy no longer matches: {pin}");
+            assert!(cli.contains(pin), "the hook CLI's forwarding of `error` changed: {pin}");
         }
-        assert_eq!((CLI_CUT_HEAD_BYTES, CLI_CUT_TAIL_BYTES, CLI_CUT_ELISION), (2 * 1024, 8 * 1024, "\n…\n"), "the detector's copy of the cut");
+        assert_eq!(CLI_ELISION_MARKER, HOOK_FAILURE_ERROR_ELISION, "the detector's marker is not the CLI's");
         let x = bash("python3 ~/.cys/pack/bin/javis_x.py run");
         let frames = |n: usize| -> String {
             (0..n).map(|i| format!("  File \"/Users/x/.cys/pack/bin/javis_x.py\", line {i}, in step\n    run_step({i})\n")).collect()
         };
         let output = |n: usize| -> String { (0..n).map(|i| format!("step {i:04} ok\n")).collect() };
-        // the reviewer's sequence, verbatim in shape
-        let reviewer = format!("Exit code 1\nloading config\n{}Traceback (most recent call last):\n{}KeyError: 'k'", output(230), frames(130));
-        let mut texts = vec![reviewer.clone()];
-        for (pre_lines, frames_n, post) in [(0, 2, ""), (230, 130, ""), (40, 130, ""), (230, 2, ""), (900, 2, ""), (900, 0, ""), (10, 5, "\n  trailing indented"), (900, 130, "\nValueError: second")] {
+        let no_row = |text: &str, why: &str| {
+            assert!(matches!(classify(&fail(&x, Some(text)), &base(), false), Classified::NotCounted { .. }), "{why}: a detector row");
+        };
+        // ① the verdict's two-boundary UTF-8 case: a 4-byte char from byte 2,045, the header in the omitted middle,
+        //   another 4-byte char at len − 8,193, an ending KeyError
+        let head = format!("Exit code 1\nloading config\n{}", "a".repeat(2045 - "Exit code 1\nloading config\n".len()));
+        let middle = format!("𝄞\n{}Traceback (most recent call last):\n{}", output(200), frames(60));
+        let end = "KeyError: 'k'";
+        let mut tail = String::new();
+        while tail.len() + 64 < 8189 - end.len() {
+            tail.push_str("  File \"/x/javis_x.py\", line 9, in f\n");
+        }
+        tail.push_str(&" ".repeat(8189 - end.len() - tail.len() - 1));
+        tail.push('\n');
+        tail.push_str(end);
+        assert_eq!(tail.len(), 8189);
+        let raw = format!("{head}{middle}𝄞{tail}");
+        assert!(raw.len() < 32 * 1024);
+        assert_eq!((head.len(), raw.len() - 8193), (2045, raw.find('𝄞').map(|_| raw.rfind('𝄞').unwrap()).unwrap()));
+        let cut = bounded_hook_error(&raw);
+        assert_eq!(cut.len(), 2045 + 5 + 8189, "the verdict's arithmetic");
+        assert!(cut.len() <= 10 * 1024 && !cut.contains("Traceback (most recent call last)"), "precondition: looks whole by length, header gone");
+        assert_eq!(intake::parse_report("bin/javis_x.py", &raw).unwrap().first_line, end);
+        no_row(&cut, "the two-boundary UTF-8 cut");
+        // ② the reviewer's first sequence and every other cut text
+        let mut texts = vec![format!("Exit code 1\nloading config\n{}Traceback (most recent call last):\n{}KeyError: 'k'", output(230), frames(130))];
+        for (pre_lines, frames_n, post) in [(0, 2, ""), (230, 130, ""), (40, 130, ""), (230, 2, ""), (900, 2, ""), (900, 0, ""), (10, 5, "\n  trailing indented"), (900, 130, "\nValueError: second"), (900, 20, "")] {
             let tb = if frames_n == 0 { String::new() } else { format!("Traceback (most recent call last):\n{}KeyError: 'k{frames_n}'", frames(frames_n)) };
             texts.push(format!("Exit code 1\nloading config\n{}{tb}{post}", output(pre_lines)));
             texts.push(format!("Exit code 1\n{}\n{tb}{post}", "w".repeat(3000)));
         }
-        assert!(reviewer.len() > 10 * 1024 && reviewer.len() < 32 * 1024);
-        assert!(!cli_cut(&reviewer).contains("Traceback (most recent call last)"), "precondition: the header is in the omitted middle");
-        let (mut same, mut declined) = (0, 0);
-        for whole in &texts {
-            let manual = intake::parse_report("bin/javis_x.py", whole).unwrap();
-            let cut = cli_cut(whole);
-            assert_eq!(cli_cut_tail(&cut).is_some(), whole.len() > 10 * 1024, "the detector did not recognise the CLI's cut");
-            match classify(&fail(&x, Some(&cut)), &base(), false) {
-                Classified::Failure { report } => {
-                    assert_eq!(report.signature, manual.signature, "two signatures for one failure: {:?} (cut) vs {:?} (whole)", report.first_line, manual.first_line);
-                    same += 1;
+        let (mut whole, mut cut_n) = (0, 0);
+        for t in &texts {
+            let forwarded = bounded_hook_error(t);
+            if forwarded.contains(HOOK_FAILURE_ERROR_ELISION) {
+                // (was, DD3: a cut text whose traceback ends in the tail kept its row — RULINGS DO2: no cut text gets one)
+                no_row(&forwarded, "a cut text");
+                cut_n += 1;
+            } else {
+                let manual = intake::parse_report("bin/javis_x.py", t).unwrap();
+                match classify(&fail(&x, Some(&forwarded)), &base(), false) {
+                    Classified::Failure { report } => assert_eq!(report.signature, manual.signature, "two signatures for one failure"),
+                    other => panic!("a whole text lost its row: {other:?}"),
                 }
-                Classified::NotCounted { .. } => declined += 1,
-                other => panic!("{other:?}"),
+                whole += 1;
             }
         }
-        // a text that arrives whole (≤ 10 KiB) is never declined; a cut text whose traceback ends in the tail keeps its row
+        // ③ a short whole text → the same signature as `repair.report`; ④ the marker by coincidence → no row
         let short = format!("Exit code 1\nloading config\n{}Traceback (most recent call last):\n{}KeyError: 'k'", output(10), frames(5));
-        assert!(matches!(classify(&fail(&x, Some(&cli_cut(&short))), &base(), false), Classified::Failure { .. }));
-        let tail_tb = format!("Exit code 1\nloading config\n{}Traceback (most recent call last):\n{}KeyError: 'k'", output(900), frames(20));
-        assert!(tail_tb.len() > 10 * 1024 && cli_cut(&tail_tb).contains("Traceback (most recent call last)"));
-        assert!(matches!(classify(&fail(&x, Some(&cli_cut(&tail_tb))), &base(), false), Classified::Failure { .. }), "a traceback inside the tail lost its row");
-        eprintln!("[t3e-dd3] {} texts: {same} same signature, {declined} declined", texts.len());
+        assert_eq!(bounded_hook_error(&short), short);
+        match classify(&fail(&x, Some(&short)), &base(), false) {
+            Classified::Failure { report } => assert_eq!(report.signature, intake::parse_report("bin/javis_x.py", &short).unwrap().signature),
+            other => panic!("{other:?}"),
+        }
+        no_row("Exit code 1\nprinted an ellipsis\n…\nKeyError: 'k'", "the marker by coincidence");
+        eprintln!("[t3e-dd3] {} texts: {whole} whole (same signature), {cut_n} cut (no row) + the two-boundary UTF-8 case", texts.len());
     }
 
     /// RULINGS DO3 / DD4 (J7 I5, T3e round-2 I3) — ONE bounded lock set for both intake writers, no retained
@@ -3741,8 +3752,7 @@ mod defect_intake_tests {
             "fn withdraw_call(",
             "fn bounded_error(",
             "pub fn rejected_arguments(",
-            "fn cli_cut_tail(",
-            "fn canonical_line_survives_cut(",
+            "fn holds_cli_elision(",
             "fn owns_its_failure(",
             "fn ensure(",
         ] {
