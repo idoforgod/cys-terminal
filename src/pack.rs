@@ -2951,10 +2951,13 @@ pub fn is_lifeline_rel(rel: &str) -> bool {
         .is_some_and(|name| crate::repair::boot_critical::LIFELINE_HOOKS.contains(&name))
 }
 
-/// 셸 스크립트인가 — 라(CR 금지)의 대상. 확장자 `.sh`, `hooks/` 아래 파일, 또는 첫 줄이 셸
-/// 인터프리터(`#!…sh`)인 파일. 판정은 vendor 본(임베드) 기준이다(사용자본의 첫 줄은 깨져 있을 수 있다).
+/// 셸 스크립트인가 — 라(CR 금지)의 대상. 확장자 `.sh`, 또는 첫 줄이 셸 인터프리터(`#!…sh`)인 파일(★FT1: 폴더는 따지지 않는다).
+/// 판정은 vendor 본(임베드) 기준이다(사용자본의 첫 줄은 깨져 있을 수 있다).
 pub fn is_shell_script(rel: &str, vendor: &str) -> bool {
-    if rel.ends_with(".sh") || rel.starts_with("hooks/") {
+    // ★T2i(RULINGS FT1): '셸 스크립트'는 셸 스크립트다 — 이름이 `.sh` 로 끝나거나 vendor 첫 줄이 sh / bash / zsh shebang 일 때만.
+    //   폴더(`hooks/`)는 셸 스크립트를 만들지 않는다(종전: `hooks/` 아래 모든 파일 — README.md · inject_gate.py · Windows 배치
+    //   cys-agy-statusline.cmd 의 CR 이 지워졌고 원본은 어디에도 남지 않았다 · TW1 CW7-ENC).
+    if rel.ends_with(".sh") {
         return true;
     }
     let first = vendor.lines().next().unwrap_or("");
@@ -16599,6 +16602,42 @@ mod m11_tests {
         assert_eq!(rig.kind("hooks/clash.sh").as_deref(), Some("user-kept"), "같은 줄 충돌 → 사용자 우선");
         assert_eq!(rig.read("hooks/clash.sh").as_deref(), Some("#!/bin/bash\necho MINE\n"), "셸 보존 결과에도 CR 없음");
         assert!(!std::fs::read(rig.pack.join("hooks/clash.sh")).unwrap().contains(&b'\r'));
+    }
+
+    /// ★T2i(RULINGS FT1): 보존된 파일의 CR 제거는 진짜 셸 스크립트에만 — `hooks/` 아래의 `.md` · `.py` · `.cmd` 는 사용자의 바이트
+    /// 그대로(CRLF 유지)이고 원장에 "eol" 이 없다. `.sh` 와 shebang 파일(확장자 없음)은 종전대로 LF + "eol": "lf".
+    #[test]
+    fn ft1_only_a_real_shell_script_loses_its_cr_when_kept() {
+        let rig = Rig::new("ft1");
+        let cases: [(&str, &str, &[u8], bool); 5] = [
+            ("hooks/zz_note.md", "# note\nvendor\n", b"# note\r\nmine\r\n", false),
+            ("hooks/zz_gate.py", "#!/usr/bin/env python3\nprint('v')\n", b"#!/usr/bin/env python3\r\nprint('mine')\r\n", false),
+            ("hooks/zz_tool.cmd", "@echo off\r\necho vendor\r\n", b"@echo off\r\necho mine\r\n", false),
+            ("hooks/zz_run.sh", "#!/bin/bash\necho vendor\n", b"#!/bin/bash\r\necho mine\r\n", true),
+            ("bin/zz_tool", "#!/bin/bash\necho vendor\n", b"#!/bin/bash\r\necho mine\r\n", true),
+        ];
+        for (rel, _v, mine, _s) in cases.iter() {
+            rig.write(rel, mine);
+        }
+        let items: Vec<(&str, &str)> = cases.iter().map(|(r, v, _, _)| (*r, *v)).collect();
+        rig.install(&items, false, &UpdateSources::none());
+        for (rel, _v, mine, shell) in cases.iter() {
+            let live = std::fs::read(rig.pack.join(rel)).unwrap();
+            let e = rig.entry(rel);
+            if *shell {
+                let lf: Vec<u8> = mine.iter().copied().filter(|b| *b != b'\r').collect();
+                assert_eq!(live, lf, "{rel}: 셸 스크립트 = LF");
+                assert_eq!(e.as_ref().map(|e| e["eol"].clone()), Some(serde_json::json!("lf")), "{rel}: {e:?}");
+            } else {
+                assert_eq!(&live, mine, "{rel}: 사용자의 바이트 그대로(CR 포함)");
+                assert!(e.as_ref().is_none_or(|e| e.get("eol").is_none()), "{rel}: eol 없음 {e:?}");
+            }
+        }
+        assert!(!is_shell_script("hooks/README.md", "# x\n"));
+        assert!(!is_shell_script("hooks/cys-agy-statusline.cmd", "@echo off\r\n"));
+        assert!(!is_shell_script("hooks/inject_gate.py", "#!/usr/bin/env python3\n"));
+        assert!(is_shell_script("hooks/session-start.sh", ""));
+        assert!(is_shell_script("bin/cys-dept", "#!/usr/bin/env bash\n"));
     }
 
     /// 부록 A-2 #6(손상 의심 검사): 의심 병합은 받아들이지 않고 사용자 파일을 살린다 — 표시는 덮는 이유가 아니라
