@@ -8,6 +8,7 @@ use crate::repair::apply::{no_repair_lock, CheckOutcome, NoFaults, ReconcileRepo
 use crate::repair::boot_critical::CheckKind;
 use crate::repair::ledger::CheckTiming;
 use std::cell::RefCell;
+use std::time::Duration;
 
 fn no_hooks(_: &RepairId, _: &LaneKey, _: HookStep) -> Result<ReconcileReport, RepairError> {
     Ok(ReconcileReport { hooks: Vec::new() })

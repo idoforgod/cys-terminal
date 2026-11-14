@@ -218,7 +218,7 @@ impl Bound {
         matches!(self, Bound::Known(g) if g.pro_revision.is_none() && g.version == version)
     }
     /// The two probation fields a lane row stores for this binding (Unknown → "" — EN3).
-    pub fn row_fields(&self) -> (String, Option<u64>) {
+    pub fn row_fields(&self) -> (String, Option<u32>) {
         match self {
             Bound::Known(g) => (g.version.clone(), g.pro_revision),
             Bound::Unknown => (String::new(), None),

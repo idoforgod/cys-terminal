@@ -14,13 +14,12 @@ use super::apply::{
     self, check_deadline, check_kind_of, pre_image_for, revert_in, ApplyOutcome, CheckFn, CheckOutcome, HookStep, HookStepFn, OpEnv, OpSpec, ReferenceFn,
     RegistrarFn, RepairLock, RevertCaller,
 };
-use super::ledger::{self, JobState, LaneRecord, PackGeneration, PreImage, RepairRecord};
+use super::ledger::{self, JobState, LaneRecord, PreImage, RepairRecord};
 use super::platform::ApplyForm;
 use super::rehearsal::{CheckResult, REFERENCE_SLOWDOWN_PERMILLE};
 use super::types::{LaneKey, RepairError, RepairId, RepairState, TargetState};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 /// Everything the job needs (the daemon builds it; tests build it with doubles).
 pub struct JobEnv<'a> {
