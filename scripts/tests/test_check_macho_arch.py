@@ -14,13 +14,15 @@ gzip stream would read more; RULINGS CA1). T11b (RULINGS DB4): a universal file 
 slice's OWN header (CPU or subtype), a header / load commands that run past their slice, a load command past
 sizeofcmds, a table listed out of offset order inside a streamed archive; every load command checked, also after
 the version command and in a command area over 1 MiB (DI1); many small commands read with a bounded buffer, a bad last
-one still found, a command area over the 16 MiB cap not measurable (DL2). RULINGS DL1 (the closed form that replaces
-DB5, DI2–DI4): EVERY tar hard-link member fails — target before or after, `./` names, a chain, dangling, a
-wrong-architecture target; symbolic links resolved as the kernel does — 32 expansions resolve and 33 do not, a deep
-chain is "too many links" (no crash), a real loop, `marker/../python3.12` with `marker` a file or absent does not
-resolve, `.` / `//` / a directory link in a target resolve, member names with an inner `./` or `//` meet their link,
-absolute names and `..` in member / hard-link names are not measurable; the checker's own failure is exit 2. A red
-case differs from its green control only in the planted fact.
+one still found, a 16 MiB+ command area the old code could read refused by the cap (DL2, DN5). RULINGS DN1–DN4 with
+DL1 (3)–(4) (the closed form): ONE spelling — `python3 -> python3.12/.` / `python3.12/`, member names with an inner
+`./` or `//`, absolute names, `..` in a member name, an absolute link target: not measurable; ONE member per name
+(a Mach-O then a text member of the same name: not measurable; a repeated directory is fine); EVERY tar hard-link
+member fails; symbolic links resolved as the kernel does — 32 expansions resolve and 33 do not, a deep chain is "too
+many links" (no crash), a real loop, `marker/../python3.12` with `marker` a file or absent does not resolve, a target
+through a directory link resolves; a required entry point that stops at a not-measurable member is not measurable,
+never a FAIL; the checker's own failure is exit 2. A red case differs from its green control only in the planted
+fact.
 
     python3 scripts/tests/test_check_macho_arch.py
 """
@@ -567,14 +569,25 @@ class Gate(unittest.TestCase):
         self.assertEqual(rc, 1, out)
         self.assertIn("python/bin/python3: too many links: more than 32 link expansions", out)   # the kernel: ELOOP
 
-    def test_equivalent_spellings_and_a_directory_link_resolve(self):
-        # `.` and `//` inside a target, and a target through a symbolic-link DIRECTORY member (runtime/py → python)
-        app = self.py_links([("python/bin/python3", ".//./../bin//python3.12"), ("py", "python"),
+    def test_a_target_through_a_directory_link_resolves(self):
+        # a target through a symbolic-link DIRECTORY member (runtime/py → python), with `..` steps
+        app = self.py_links([("python/bin/python3", "../bin/python3.12"), ("py", "python"),
                              ("node/bin/node2", "../../py/bin/python3.12")])
         for arg in (app, self.make_tar("spell.tar.gz", app)):
             rc, out = self.gate("--target", "x86_64-apple-darwin", *REQUIRE_APP, "--require", RT + "node/bin/node2", arg)
             self.assertEqual(rc, 0, out)
             self.assertNotIn("dangling", out)
+
+    def test_a_link_target_with_a_dot_or_an_empty_component_is_not_measurable(self):
+        # DN1: `python3.12/.` and `python3.12/` would need python3.12 to be a directory — not normalised away
+        for target in ("python3.12/.", "python3.12/", ".//python3.12"):
+            app = self.py_links([("python/bin/python3", target)])
+            for arg in (app, self.make_tar("odd-target.tar.gz", app)):
+                rc, out = self.gate("--target", "x86_64-apple-darwin", *REQUIRE_APP, arg)
+                self.assertEqual(rc, 2, target + "\n" + out)
+                self.assertIn("python/bin/python3: not measurable — link target %r has an empty or `.` component" % target, out)
+                self.assertNotIn("FAIL", out)
+            shutil.rmtree(app)
 
     def test_a_target_climbing_above_the_root_fails_as_outside_the_archive(self):
         app = self.py_links([("python/bin/python3", "../../../../../../../outside/python3.12")])
@@ -619,47 +632,69 @@ class Gate(unittest.TestCase):
         self.assertEqual(rc, 1, out)
         self.assertIn("python/bin/python3: missing component: cys.app/Contents/Resources/runtime/python/bin/marker", out)
 
-    def test_member_names_with_an_inner_dot_or_a_double_slash_meet_their_link(self):
-        # DL1 (1): ONE normal form for member names and link targets alike
+    def odd_member_tar(self, name, data=None, keep_python=False):
+        """The fake app as a .tar.gz with one extra member NAME (python3.12 removed from the tree unless KEEP_PYTHON)."""
+        app = self.app()
+        if not keep_python:
+            os.remove(os.path.join(app, "Contents/Resources/runtime/python/bin/python3.12"))   # python3 still links to it
+        arc = os.path.join(self.tmp, "odd.tar.gz")
+        with tarfile.open(arc, "w:gz") as t:
+            t.add(app, arcname="cys.app")
+            data = thin(X86_64, minos="10.15") if data is None else data
+            ti = tarfile.TarInfo(name)
+            ti.size, ti.mode = len(data), 0o755
+            t.addfile(ti, io.BytesIO(data))
+        return app, arc
+
+    def test_member_names_with_an_inner_dot_or_a_double_slash_are_not_measurable(self):
+        # DN1: ONE spelling — the required python3 stops at a not-measurable place: exit 2, never a FAIL (DN4)
         for name in ("cys.app/Contents/Resources/runtime/python/bin/./python3.12",
                      "cys.app/Contents/Resources/runtime//python/bin/python3.12"):
-            app = self.app()
-            os.remove(os.path.join(app, "Contents/Resources/runtime/python/bin/python3.12"))   # python3 still links to it
-            arc = os.path.join(self.tmp, "odd.tar.gz")
-            with tarfile.open(arc, "w:gz") as t:
-                t.add(app, arcname="cys.app")
-                data = thin(X86_64, minos="10.15")
-                ti = tarfile.TarInfo(name)
-                ti.size, ti.mode = len(data), 0o755
-                t.addfile(ti, io.BytesIO(data))
+            app, arc = self.odd_member_tar(name)
             rc, out = self.gate("--target", "x86_64-apple-darwin", *REQUIRE_APP, arc)
-            self.assertEqual(rc, 0, name + "\n" + out)
-            self.assertRegex(out, r"runtime/python/bin/python3 -> python3\.12\s+x86_64\s+min 10\.15")
+            self.assertEqual(rc, 2, name + "\n" + out)
+            self.assertIn("%s: not measurable — member name %r has an empty or `.` component" % (name, name), out)
+            self.assertIn("CANNOT JUDGE required entry point cys.app/Contents/Resources/runtime/python/bin/python3: not measurable", out)
+            self.assertNotIn("FAIL", out)
             shutil.rmtree(app)
 
-    def test_absolute_names_and_dotdot_in_member_or_hard_link_names_are_not_measurable(self):
+    def test_one_member_per_name(self):
+        # DN2 (the reviewer's sequence): a Mach-O python3.12, then a TEXT member of the same name — the gate does not
+        # model which one the extractor leaves: not measurable, the stale Mach-O result is not used
+        app, arc = self.odd_member_tar("cys.app/Contents/Resources/runtime/python/bin/python3.12", b"#!/bin/sh\n", keep_python=True)
+        rc, out = self.gate("--target", "x86_64-apple-darwin", *REQUIRE_APP, arc)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("occurs more than once in the archive (one of them not a directory)", out)
+        self.assertNotIn("FAIL", out)
+        self.assertNotRegex(out, r"python3 -> python3\.12\s+x86_64")
+        shutil.rmtree(app)
+        # green control: a directory member repeated is fine
         app = self.app()
-        for label, ti in (("member", tarfile.TarInfo("cys.app/../evil")),
-                          ("absolute member", tarfile.TarInfo("/abs/evil")),
-                          ("absolute link target", None),
-                          ("hard-link name", None)):
-            arc = os.path.join(self.tmp, "names.tar.gz")
-            with tarfile.open(arc, "w:gz") as t:
-                t.add(app, arcname="cys.app")
-                if ti is None:
-                    ti = tarfile.TarInfo("cys.app/Contents/Resources/extra")
-                    if label == "absolute link target":
-                        ti.type, ti.linkname = tarfile.SYMTYPE, "/usr/bin/python3"
-                    else:
-                        ti.type, ti.linkname = tarfile.LNKTYPE, "cys.app/../outside"
-                    t.addfile(ti)
-                else:
-                    ti.size = 4
-                    t.addfile(ti, io.BytesIO(b"text"))
-            rc, out = self.gate("--target", "x86_64-apple-darwin", *REQUIRE_APP, arc)
-            self.assertEqual(rc, 2, label + "\n" + out)
-            self.assertIn("not measurable", out)
+        arc = os.path.join(self.tmp, "dirs.tar.gz")
+        with tarfile.open(arc, "w:gz") as t:
+            t.add(app, arcname="cys.app")
+            ti = tarfile.TarInfo("cys.app/Contents/Resources")
+            ti.type = tarfile.DIRTYPE
+            t.addfile(ti)
+        self.assertEqual(self.gate("--target", "x86_64-apple-darwin", *REQUIRE_APP, arc)[0], 0)
+
+    def test_a_required_link_to_an_absolute_path_is_not_measurable_never_a_fail(self):
+        # DN4 (the reviewer's sequence): the required python3 → /usr/bin/python3 — exit 2, not added to the failures
+        app = self.py_links([("python/bin/python3", "/usr/bin/python3")])
+        for arg in (app, self.make_tar("abs.tar.gz", app)):
+            rc, out = self.gate("--target", "x86_64-apple-darwin", *REQUIRE_APP, arg)
+            self.assertEqual(rc, 2, out)
+            self.assertIn("CANNOT JUDGE required entry point cys.app/Contents/Resources/runtime/python/bin/python3: not measurable", out)
             self.assertNotIn("FAIL", out)
+
+    def test_absolute_names_dotdot_and_odd_components_in_member_names_are_not_measurable(self):
+        for name in ("cys.app/../evil", "/abs/evil", "cys.app//evil", "cys.app/./evil"):
+            app, arc = self.odd_member_tar(name, b"text", keep_python=True)
+            rc, out = self.gate("--target", "x86_64-apple-darwin", *REQUIRE_APP, arc)
+            self.assertEqual(rc, 2, name + "\n" + out)
+            self.assertIn("not measurable — member name", out)
+            self.assertNotIn("FAIL", out)
+            shutil.rmtree(app)
 
     def test_the_checkers_own_failure_is_exit_2_never_1(self):
         # DL1 (4): recursion, memory, any unexpected exception — "cannot judge", never "FAIL"
@@ -700,10 +735,14 @@ class Gate(unittest.TestCase):
         self.assertIn("load command %d (16 bytes) runs past sizeofcmds" % (n - 1), out)
 
     def test_a_command_area_over_the_cap_is_not_measurable(self):
-        hdr = struct.pack("<IIIIIIII", 0xFEEDFACF, X86_64, 3, 2, 1, (16 << 20) + 8, 0, 0)
-        rc, out = self.one(hdr + b"\0" * 64)
+        # DN5: a VALID 16 MiB + 8 command area that the code without the cap reads to the end and passes — only the
+        # cap makes it exit 2
+        filler = (16 << 20) - 16
+        cmds = struct.pack("<IIIIII", LC_BUILD_VERSION, 24, 1, ver("10.15"), ver("15.0"), 0)
+        cmds += struct.pack("<II", 0x7FFFFF00, filler) + b"\0" * (filler - 8)
+        rc, out = self.one(struct.pack("<IIIIIIII", 0xFEEDFACF, X86_64, 3, 2, 2, len(cmds), 0, 0) + cmds)
         self.assertEqual(rc, 2, out)
-        self.assertIn("exceeds the checker's resource cap of 16777216 bytes — not measurable", out)
+        self.assertIn("a load-command area of 16777224 bytes exceeds the checker's resource cap of 16777216 bytes — not measurable", out)
 
     # -- cannot judge is never a pass --
     def test_cannot_judge_cases_exit_2(self):
